@@ -679,7 +679,14 @@ if [ -n "${REIMS_VGPU_WINDOW:-}" ]; then
   # per-login random suffix; override any of these in the environment if yours
   # differ (e.g. a different seat, DISPLAY, or Wayland socket).
   : "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"
-  : "${WAYLAND_DISPLAY:=wayland-0}"
+  # winit's Linux backend picks Wayland whenever WAYLAND_DISPLAY is a non-empty
+  # string, regardless of whether that socket actually exists (see winit
+  # platform_impl/linux/mod.rs EventLoop::new). Defaulting it unconditionally
+  # therefore forces Wayland (and a silent, unlogged EventLoopError) on
+  # X11-only hosts. Only default it when a real Wayland socket is present.
+  if [ -z "${WAYLAND_DISPLAY:-}" ] && [ -S "$XDG_RUNTIME_DIR/wayland-0" ]; then
+    WAYLAND_DISPLAY="wayland-0"
+  fi
   : "${DISPLAY:=:0}"
   # XAUTHORITY's suffix is a per-login random string, so it cannot be written
   # down: a hardcoded one goes stale at the next login and then points at a file
