@@ -2220,9 +2220,11 @@ pub(crate) unsafe fn execute_draw_inner(
     // reads them either way, so leaving them out of the layout is what makes
     // the read undefined. Images are written null below (nullDescriptor);
     // samplers get a default-state handle, which the feature does not cover.
+    let mut declared = (*caches.declared_slots(&req.vert_spirv)).clone();
+    declared.extend_from_slice(&caches.declared_slots(&req.frag_spirv));
     let declared_unprovided = add_declared_bindings(
         &mut layout_bindings,
-        &[&req.vert_spirv, &req.frag_spirv],
+        &declared,
         vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
     );
     layout_bindings.sort_by_key(|b| b.binding);
@@ -5511,37 +5513,30 @@ mod tests {
 }
 
 /// Adds a layout entry for every image/sampler slot the shaders declare that
-/// `layout_bindings` does not already carry. Set 0 only: the engine binds one
-/// set, and a decoration naming another set is not ours to satisfy.
+/// `layout_bindings` does not already carry.
 pub(super) fn add_declared_bindings(
     layout_bindings: &mut Vec<BindingSig>,
-    modules: &[&[u32]],
+    declared: &[(u32, super::spirv_declared::DeclaredKind)],
     stages: vk::ShaderStageFlags,
 ) -> Vec<(u32, super::spirv_declared::DeclaredKind)> {
-    use super::spirv_declared::{DeclaredKind, declared_descriptors};
+    use super::spirv_declared::DeclaredKind;
     let mut added = Vec::new();
-    if std::env::var_os("REIMS_NO_DECLARED_SCAN").is_some() {
-        return added;
-    }
-    for words in modules {
-        for (set, binding, kind) in declared_descriptors(words) {
-            if set != 0 || layout_bindings.iter().any(|b| b.binding == binding) {
-                continue;
-            }
-            if added.iter().any(|(b, _)| *b == binding) {
-                continue;
-            }
-            let ty = match kind {
-                DeclaredKind::SampledImage => vk::DescriptorType::SAMPLED_IMAGE,
-                DeclaredKind::Sampler => vk::DescriptorType::SAMPLER,
-            };
-            layout_bindings.push(BindingSig {
-                binding,
-                ty: ty.as_raw() as u32,
-                stages: stages.as_raw(),
-            });
-            added.push((binding, kind));
+    for (binding, kind) in declared {
+        if layout_bindings.iter().any(|b| b.binding == *binding)
+            || added.iter().any(|(b, _)| *b == *binding)
+        {
+            continue;
         }
+        let ty = match kind {
+            DeclaredKind::SampledImage => vk::DescriptorType::SAMPLED_IMAGE,
+            DeclaredKind::Sampler => vk::DescriptorType::SAMPLER,
+        };
+        layout_bindings.push(BindingSig {
+            binding: *binding,
+            ty: ty.as_raw() as u32,
+            stages: stages.as_raw(),
+        });
+        added.push((*binding, *kind));
     }
     added
 }

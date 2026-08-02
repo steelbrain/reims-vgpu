@@ -11,6 +11,7 @@ use std::sync::atomic::Ordering;
 use super::context::DeviceContext;
 use super::counters::EngineCounters;
 use super::digest::Digest128;
+use super::spirv_declared::DeclaredKind;
 use super::pools::{DeferredHandle, ResourcePools};
 use super::types::{
     BlendKey, ColorWriteMask, CullMode, DepthClipMode, DrawError, FillMode, PrimitiveTopology,
@@ -513,6 +514,10 @@ pub(crate) struct ObjectCaches {
     /// to, so a repeat bind of the same module does not walk it three times to
     /// find that out.
     shader_digests: ShaderDigestIndex,
+    /// Descriptor slots a module declares. Derived by parsing the SPIR-V, so
+    /// it is memoised on the same content digest the shader cache keys on —
+    /// the draw path asks once per draw and must not pay a parse for it.
+    declared_slots: ObjectCache<Digest128, std::sync::Arc<Vec<(u32, DeclaredKind)>>>,
 }
 
 impl ObjectCaches {
@@ -525,6 +530,7 @@ impl ObjectCaches {
             samplers: ObjectCache::new(),
             compute_pipelines: ObjectCache::new(),
             shader_digests: ShaderDigestIndex::default(),
+            declared_slots: ObjectCache::new(),
         }
     }
 
@@ -649,6 +655,28 @@ impl ObjectCaches {
         let (key, module) = self.get_or_create_shader(ctx, words, counters, pools)?;
         self.shader_digests.insert(words, key);
         Ok((key, module))
+    }
+
+    /// The image and sampler slots `words` declares, parsed once per module.
+    pub(crate) fn declared_slots(
+        &mut self,
+        words: &[u32],
+    ) -> std::sync::Arc<Vec<(u32, DeclaredKind)>> {
+        let key = Digest128::of_u32_words(words);
+        if let Some(v) = self.declared_slots.get(&key) {
+            return v.clone();
+        }
+        // Set 0 only: the engine binds one set, and a decoration naming
+        // another is not ours to satisfy.
+        let v = std::sync::Arc::new(
+            super::spirv_declared::declared_descriptors(words)
+                .into_iter()
+                .filter(|(set, _, _)| *set == 0)
+                .map(|(_, binding, kind)| (binding, kind))
+                .collect::<Vec<_>>(),
+        );
+        self.declared_slots.insert(key, v.clone());
+        v
     }
 
     pub(crate) unsafe fn get_or_create_shader(
