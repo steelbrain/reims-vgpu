@@ -1,0 +1,209 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [dev]
+
+# Least privilege: nothing here writes to the repository.
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event_name }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Fail the build on any rustc warning (unused imports, dead_code, ...).
+  RUSTFLAGS: -D warnings
+
+jobs:
+  preflight:
+    name: preflight
+    runs-on: ubuntu-26.04
+    outputs:
+      full: ${{ steps.classify.outputs.full }}
+      rust: ${{ steps.changes.outputs.rust }}
+      cargo: ${{ steps.changes.outputs.cargo }}
+      efi: ${{ steps.changes.outputs.efi }}
+      ci: ${{ steps.changes.outputs.ci }}
+      docs: ${{ steps.changes.outputs.docs }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - id: changes
+        uses: dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706 # v4.0.2
+        with:
+          filters: |
+            rust:
+              - 'crates/**/*.rs'
+              - 'crates/**/build.rs'
+              - '**/Cargo.toml'
+              - '**/Cargo.lock'
+              - 'rustfmt.toml'
+              - '.config/**'
+            cargo:
+              - '**/Cargo.toml'
+              - '**/Cargo.lock'
+            efi:
+              - 'crates/reims-vgpu-efi/**'
+            ci:
+              - '.github/workflows/**'
+            docs:
+              - '**/*.md'
+              - 'assets/**'
+              - 'LICENSE'
+      - id: classify
+        name: Classify changes
+        run: |
+          set -eufo pipefail
+          full=false
+          if [[ "${{ steps.changes.outputs.rust }}" == "true" \
+             || "${{ steps.changes.outputs.ci }}" == "true" ]]; then
+            full=true
+          fi
+          echo "full=$full" >> "$GITHUB_OUTPUT"
+          echo "full=$full"
+
+  fmt:
+    name: fmt
+    needs: [preflight]
+    if: needs.preflight.outputs.full == 'true'
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # merge-base against origin/master needs the full history of both.
+          fetch-depth: 0
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      # master mirrors upstream verbatim and carries formatting drift this fork
+      # does not own: `cargo fmt --all -- --check` reports 14 files, every one of
+      # them byte-identical to master. Reformatting them would add divergence to
+      # every future upstream merge, so the rule enforced here is the one that is
+      # actually ours — every .rs file this branch has touched is rustfmt-clean.
+      # skip_children keeps rustfmt from following `mod` declarations into
+      # untouched siblings and re-reporting that same upstream drift.
+      - name: Formatting (rustfmt, files this branch touches)
+        run: |
+          set -euo pipefail
+          base="$(git merge-base origin/master HEAD)"
+          mapfile -t files < <(git diff --name-only --diff-filter=ACMR "$base" HEAD -- '*.rs')
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "no Rust files changed against origin/master"
+            exit 0
+          fi
+          printf 'checking %s\n' "${files[@]}"
+          rustfmt --edition 2021 --config skip_children=true --check "${files[@]}"
+
+  clippy:
+    name: clippy
+    needs: [preflight]
+    if: needs.preflight.outputs.full == 'true'
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      # Default features select backend-metal, which crates/reims-vgpu/src/lib.rs
+      # rejects off Apple with a compile_error!. Every cargo invocation on Linux
+      # must therefore pass --no-default-features --features backend-vulkan.
+      - name: Clippy (warnings denied)
+        run: cargo clippy --workspace --all-targets --no-default-features --features backend-vulkan -- -D warnings
+
+  test:
+    name: test
+    needs: [preflight]
+    if: needs.preflight.outputs.full == 'true'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      # The unit tests and the three integration suites below are pure CPU
+      # decode/planning work and need no Vulkan driver. AGENTS.md requires the
+      # suite to run serially: GPU-touching tests are not parallel-safe.
+      - name: Test (unit)
+        run: cargo test --workspace --no-default-features --features backend-vulkan --lib -- --test-threads=1
+      - name: Test (host integration suites)
+        run: |
+          cargo test --workspace --no-default-features --features backend-vulkan \
+            --test golden_vectors --test reflection_adoption --test reflection_probe \
+            -- --test-threads=1
+
+  vulkan-suite:
+    name: vulkan-suite
+    needs: [preflight]
+    if: needs.preflight.outputs.full == 'true'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 45
+    # Advisory, not a merge gate. These three suites execute real Vulkan work.
+    # On a GPU-less runner with no ICD they self-skip (skip_if_no_gpu turns an
+    # init failure into a printed SKIP and returns ok), so they would prove
+    # nothing; with the lavapipe software ICD installed below they run for real,
+    # because caps/device_select.rs ranks PHYSICAL_DEVICE_TYPE_CPU last but does
+    # not reject it, and lavapipe clears the Vulkan 1.2 floor in caps/api_floor.rs.
+    # Whether they pass on llvmpipe has never been established on any host, and
+    # AGENTS.md documents them as order-dependent with a device-recreate ceiling.
+    # Promote this job to blocking (drop continue-on-error) after a green run.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Install Vulkan loader + lavapipe ICD
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y mesa-vulkan-drivers libvulkan1
+          # Fail setup early if the loader has nothing to bind, rather than
+          # letting every case report a confusing mid-suite init failure.
+          shopt -s nullglob
+          icds=(/usr/share/vulkan/icd.d/*.json /etc/vulkan/icd.d/*.json)
+          echo "Vulkan ICDs: ${icds[*]:-none}"
+          test "${#icds[@]}" -gt 0
+          # Pin the loader to lavapipe by discovery: the packaged basename is
+          # arch-suffixed (lvp_icd.x86_64.json) and must not be hardcoded.
+          lvp=(/usr/share/vulkan/icd.d/lvp_icd*.json)
+          test "${#lvp[@]}" -gt 0
+          echo "VK_DRIVER_FILES=${lvp[0]}" >> "$GITHUB_ENV"
+      - name: Test (Vulkan engine suites)
+        run: |
+          cargo test --workspace --no-default-features --features backend-vulkan \
+            --test vk_engine_parity --test vk_engine_compute --test vk_engine_batch \
+            -- --test-threads=1 --nocapture
+
+  efi-rom:
+    name: efi-rom
+    needs: [preflight]
+    if: needs.preflight.outputs.full == 'true' || needs.preflight.outputs.efi == 'true'
+    runs-on: ubuntu-26.04
+    # crates/reims-vgpu-efi is excluded from the root workspace, so the jobs
+    # above never compile it. It is a release artifact, so build it here.
+    defaults:
+      run:
+        working-directory: crates/reims-vgpu-efi
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-uefi
+          components: rustfmt
+      - name: Formatting (rustfmt)
+        run: cargo fmt --all -- --check
+      - name: Build UEFI option ROM payload
+        run: cargo build --release --target x86_64-unknown-uefi

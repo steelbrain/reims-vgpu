@@ -1,0 +1,108 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+# The release job publishes a GitHub Release, so it needs write access to
+# repository contents. Nothing else here does.
+permissions:
+  contents: read
+
+# Never cancel a half-finished release: a cancelled QEMU build would leave the
+# tag with a partial or missing artifact set.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: release
+    runs-on: ubuntu-26.04
+    # The vendored QEMU build dominates this job; the ROM is minutes.
+    timeout-minutes: 180
+    permissions:
+      contents: write
+    steps:
+      - name: Code checkout
+        uses: actions/checkout@v7
+        with:
+          # vendor/qemu is a submodule and is the product being built here.
+          # QEMU carries its own submodules (keycodemapdb and friends), so this
+          # has to be recursive.
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Install build dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          # libgcrypt20-dev backs --enable-gcrypt (VNC password auth needs DES).
+          # llvm provides llvm-dis, which the shader path shells out to at
+          # runtime and which the post-build device probes exercise.
+          sudo apt-get install -y \
+            build-essential pkg-config python3 python3-venv \
+            libglib2.0-dev libpixman-1-dev ninja-build meson \
+            libvulkan-dev libgcrypt20-dev nettle-dev llvm
+          command -v llvm-dis
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-uefi
+
+      # Cargo registry and the two Rust target dirs only. The QEMU build tree
+      # (vendor/qemu/build) is deliberately not cached: qemu-build.sh keys a
+      # reconfigure off build/qemu-build.stamp, and a restored tree from a
+      # different commit would be reused rather than rebuilt.
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: |
+            .
+            crates/reims-vgpu-efi
+
+      # Built first: it takes minutes and fails fast, ahead of the long build.
+      - name: Build EFI GOP option ROM
+        run: crates/reims-vgpu-efi/scripts/reims-vgpu-efi-rom/reims-vgpu-efi-rom.sh
+
+      # REIMS_VGPU_BACKEND must be set: without it qemu-build.sh picks the
+      # backend from the host OS, and backend-metal does not build off Apple.
+      # --backend vulkan passes the same value; both are set so neither the
+      # environment nor the argument can drift alone.
+      - name: Build patched QEMU (x86_64, Vulkan backend)
+        env:
+          REIMS_VGPU_BACKEND: vulkan
+        run: scripts/qemu-build/qemu-build.sh --target x86_64 --backend vulkan
+
+      - name: Collect artifacts and checksums
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp vendor/qemu/build/qemu-system-x86_64 dist/
+          cp crates/reims-vgpu-efi/out/reims-vgpu-gop.rom dist/
+          # Relative names so `sha256sum -c SHA256SUMS` works where downloaded.
+          (cd dist && sha256sum qemu-system-x86_64 reims-vgpu-gop.rom > SHA256SUMS)
+          cat dist/SHA256SUMS
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: reims-vgpu-x86_64-vulkan
+          path: dist/
+          if-no-files-found: error
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
+        with:
+          draft: false
+          generate_release_notes: true
+          files: |
+            dist/qemu-system-x86_64
+            dist/reims-vgpu-gop.rom
+            dist/SHA256SUMS
