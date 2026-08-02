@@ -164,11 +164,17 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
       - name: Cache cargo
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-      - name: Install Vulkan loader + lavapipe ICD
+      - name: Install Vulkan loader, lavapipe ICD and LLVM
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y mesa-vulkan-drivers libvulkan1
+          # llvm provides llvm-dis, which the MTLB -> AIR -> SPIR-V translate path
+          # shells out to. Without it the first case panics before it reaches
+          # Vulkan at all, and because that panic is taken while the shared
+          # engine lock is held, every later case in the same binary fails with
+          # PoisonError -- one missing tool reported as a whole-suite failure.
+          sudo apt-get install -y mesa-vulkan-drivers libvulkan1 llvm spirv-tools
+          command -v llvm-dis
           # Fail setup early if the loader has nothing to bind, rather than
           # letting every case report a confusing mid-suite init failure.
           shopt -s nullglob
