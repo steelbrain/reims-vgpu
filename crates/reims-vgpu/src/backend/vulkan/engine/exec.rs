@@ -2209,6 +2209,13 @@ pub(crate) unsafe fn execute_draw_inner(
             stages: (vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT).as_raw(),
         });
     }
+    if req.color_input {
+        layout_bindings.push(BindingSig {
+            binding: super::types::COLOR_INPUT_BINDING,
+            ty: vk::DescriptorType::INPUT_ATTACHMENT.as_raw() as u32,
+            stages: vk::ShaderStageFlags::FRAGMENT.as_raw(),
+        });
+    }
     // Slots the shaders declare but this request never provided: the shader
     // reads them either way, so leaving them out of the layout is what makes
     // the read undefined. Images are written null below (nullDescriptor);
@@ -2218,13 +2225,6 @@ pub(crate) unsafe fn execute_draw_inner(
         &[&req.vert_spirv, &req.frag_spirv],
         vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
     );
-    if req.color_input {
-        layout_bindings.push(BindingSig {
-            binding: super::types::COLOR_INPUT_BINDING,
-            ty: vk::DescriptorType::INPUT_ATTACHMENT.as_raw() as u32,
-            stages: vk::ShaderStageFlags::FRAGMENT.as_raw(),
-        });
-    }
     layout_bindings.sort_by_key(|b| b.binding);
     let layout_key = LayoutKey {
         bindings: layout_bindings,
@@ -5520,6 +5520,9 @@ pub(super) fn add_declared_bindings(
 ) -> Vec<(u32, super::spirv_declared::DeclaredKind)> {
     use super::spirv_declared::{DeclaredKind, declared_descriptors};
     let mut added = Vec::new();
+    if std::env::var_os("REIMS_NO_DECLARED_SCAN").is_some() {
+        return added;
+    }
     for words in modules {
         for (set, binding, kind) in declared_descriptors(words) {
             if set != 0 || layout_bindings.iter().any(|b| b.binding == binding) {

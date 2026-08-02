@@ -20,6 +20,8 @@ const OP_VARIABLE: u16 = 59;
 const DECORATION_BINDING: u32 = 33;
 const DECORATION_DESCRIPTOR_SET: u32 = 34;
 
+const DIM_SUBPASS_DATA: u32 = 6;
+
 const SPIRV_MAGIC: u32 = 0x0723_0203;
 const SPIRV_HEADER_WORDS: usize = 5;
 
@@ -68,7 +70,13 @@ pub(crate) fn declared_descriptors(words: &[u32]) -> Vec<(u32, u32, DeclaredKind
                 }
                 _ => {}
             },
-            OP_TYPE_IMAGE | OP_TYPE_SAMPLED_IMAGE if !operands.is_empty() => {
+            // Dim (operand 2) SubpassData means an input attachment, which the
+            // engine binds from the request's own color-input state — adding it
+            // here would declare binding 96 twice with two different types.
+            OP_TYPE_IMAGE if operands.len() >= 3 && operands[2] != DIM_SUBPASS_DATA => {
+                image_types.push(operands[0]);
+            }
+            OP_TYPE_SAMPLED_IMAGE if !operands.is_empty() => {
                 image_types.push(operands[0]);
             }
             OP_TYPE_SAMPLER if !operands.is_empty() => {
