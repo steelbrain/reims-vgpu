@@ -23,6 +23,7 @@ pub(crate) mod draw_validation;
 mod driver_breadcrumb;
 mod exec;
 mod exec_compute;
+mod spirv_declared;
 mod facade_decline;
 mod guest_scatter;
 mod host_ram;

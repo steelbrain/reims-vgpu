@@ -2209,6 +2209,15 @@ pub(crate) unsafe fn execute_draw_inner(
             stages: (vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT).as_raw(),
         });
     }
+    // Slots the shaders declare but this request never provided: the shader
+    // reads them either way, so leaving them out of the layout is what makes
+    // the read undefined. Images are written null below (nullDescriptor);
+    // samplers get a default-state handle, which the feature does not cover.
+    let declared_unprovided = add_declared_bindings(
+        &mut layout_bindings,
+        &[&req.vert_spirv, &req.frag_spirv],
+        vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+    );
     if req.color_input {
         layout_bindings.push(BindingSig {
             binding: super::types::COLOR_INPUT_BINDING,
@@ -2430,6 +2439,21 @@ pub(crate) unsafe fn execute_draw_inner(
         let h = caches.get_or_create_sampler(ctx, &s.state_key(), counters, pools)?;
         sampler_handles.push((s.binding, h));
     }
+    // A declared-but-unprovided sampler cannot be written null: nullDescriptor
+    // does not cover VK_DESCRIPTOR_TYPE_SAMPLER. Default state is what Metal
+    // gives an unbound sampler, and the cache makes it one handle for all.
+    for (binding, kind) in &declared_unprovided {
+        if *kind == super::spirv_declared::DeclaredKind::Sampler {
+            let h = caches.get_or_create_sampler(
+                ctx,
+                &super::types::SamplerStateKey::default(),
+                counters,
+                pools,
+            )?;
+            sampler_handles.push((*binding, h));
+        }
+    }
+
 
     phase.enter(super::draw_phase::Phase::Stage);
     // Vertex buffers (with Constant step shift), deduplicated by content:
@@ -3113,6 +3137,23 @@ pub(crate) unsafe fn execute_draw_inner(
                     .dst_binding(*binding)
                     .descriptor_type(vk::DescriptorType::SAMPLER)
                     .image_info(std::slice::from_ref(&sampler_infos[i])),
+            );
+        }
+        // Null writes for the declared-but-unprovided slots put in the layout
+        // above. A descriptor left merely unwritten stays undefined; written
+        // null under nullDescriptor it reads as zeros, which is what Metal
+        // gives the guest for the same draw.
+        let null_image_info = vk::DescriptorImageInfo::default();
+        for (binding, kind) in &declared_unprovided {
+            if *kind != super::spirv_declared::DeclaredKind::SampledImage {
+                continue;
+            }
+            writes.push(
+                vk::WriteDescriptorSet::default()
+                    .dst_set(dset)
+                    .dst_binding(*binding)
+                    .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                    .image_info(std::slice::from_ref(&null_image_info)),
             );
         }
         if req.color_input {
@@ -5467,6 +5508,39 @@ mod tests {
         assert_eq!(&bytes[..100], &backing[..100]);
         assert_eq!(&bytes[100..156], &backing[200..256]);
     }
+}
+
+/// Adds a layout entry for every image/sampler slot the shaders declare that
+/// `layout_bindings` does not already carry. Set 0 only: the engine binds one
+/// set, and a decoration naming another set is not ours to satisfy.
+pub(super) fn add_declared_bindings(
+    layout_bindings: &mut Vec<BindingSig>,
+    modules: &[&[u32]],
+    stages: vk::ShaderStageFlags,
+) -> Vec<(u32, super::spirv_declared::DeclaredKind)> {
+    use super::spirv_declared::{DeclaredKind, declared_descriptors};
+    let mut added = Vec::new();
+    for words in modules {
+        for (set, binding, kind) in declared_descriptors(words) {
+            if set != 0 || layout_bindings.iter().any(|b| b.binding == binding) {
+                continue;
+            }
+            if added.iter().any(|(b, _)| *b == binding) {
+                continue;
+            }
+            let ty = match kind {
+                DeclaredKind::SampledImage => vk::DescriptorType::SAMPLED_IMAGE,
+                DeclaredKind::Sampler => vk::DescriptorType::SAMPLER,
+            };
+            layout_bindings.push(BindingSig {
+                binding,
+                ty: ty.as_raw() as u32,
+                stages: stages.as_raw(),
+            });
+            added.push((binding, kind));
+        }
+    }
+    added
 }
 
 #[cfg(test)]

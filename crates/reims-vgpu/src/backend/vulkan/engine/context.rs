@@ -769,6 +769,14 @@ impl DeviceContext {
         crate::runtime::guest_ram_map::reset();
         let portability_subset = has_device_extension(vk::KHR_PORTABILITY_SUBSET_NAME);
         let vertex_attribute_divisor = has_device_extension(vk::KHR_VERTEX_ATTRIBUTE_DIVISOR_NAME);
+        // A guest draw may name a texture the request never provides, leaving a
+        // shader-declared descriptor with nothing written to it. Metal reads
+        // such a slot as zeros; Vulkan calls it undefined, and the two ICDs we
+        // run on disagree loudly — NVIDIA returns garbage, lavapipe faults on a
+        // null dereference and takes the process with it. nullDescriptor makes
+        // the read defined as zeros on both, which is the Metal behaviour the
+        // guest already expects.
+        let null_descriptor = has_device_extension(vk::EXT_ROBUSTNESS2_NAME);
         #[cfg(feature = "host-window")]
         let swapchain = has_device_extension(ash::khr::swapchain::NAME);
         // Combined depth-stencil format for the stencil-test path. The Vulkan
@@ -820,10 +828,15 @@ impl DeviceContext {
         if vertex_attribute_divisor {
             enabled_device_extensions.push(vk::KHR_VERTEX_ATTRIBUTE_DIVISOR_NAME.as_ptr());
         }
+        if null_descriptor {
+            enabled_device_extensions.push(vk::EXT_ROBUSTNESS2_NAME.as_ptr());
+        }
         #[cfg(feature = "host-window")]
         if swapchain {
             enabled_device_extensions.push(ash::khr::swapchain::NAME.as_ptr());
         }
+        let mut enabled_robustness2 =
+            vk::PhysicalDeviceRobustness2FeaturesEXT::default().null_descriptor(null_descriptor);
         let mut enabled_divisor_features =
             vk::PhysicalDeviceVertexAttributeDivisorFeaturesKHR::default()
                 .vertex_attribute_instance_rate_divisor(vertex_divisor.instance_rate_divisor)
@@ -846,6 +859,9 @@ impl DeviceContext {
             .enabled_features(&enabled)
             .enabled_extension_names(&enabled_device_extensions)
             .push_next(&mut enabled_vulkan12);
+        if null_descriptor {
+            dci = dci.push_next(&mut enabled_robustness2);
+        }
         if vertex_attribute_divisor {
             dci = dci.push_next(&mut enabled_divisor_features);
         }

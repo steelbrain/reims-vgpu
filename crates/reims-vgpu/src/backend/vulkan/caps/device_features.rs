@@ -129,6 +129,11 @@ pub struct DeviceFeatures {
     /// it has a packed 24/8 depth format will name one.
     pub d24_unorm_s8_attachment: bool,
     pub shader_int16: bool,
+    /// Metal AIR routinely lowers to 64-bit integer ops, so translated SPIR-V
+    /// declares the `Int64` capability. A device that was never told to enable
+    /// the matching feature compiles it anyway and is then free to do anything:
+    /// NVIDIA copes, lavapipe null-dereferences inside its shader JIT.
+    pub shader_int64: bool,
     pub storage_image_extended_formats: bool,
     pub storage_image_write_without_format: bool,
     /// `shaderStorageImageReadWithoutFormat`. The read half of the pair above:
@@ -280,6 +285,7 @@ impl DeviceFeatures {
             .robust_buffer_access(self.robust_buffer_access)
             .sampler_anisotropy(self.sampler_anisotropy)
             .shader_int16(self.shader_int16)
+            .shader_int64(self.shader_int64)
             .shader_storage_image_extended_formats(self.storage_image_extended_formats)
             .shader_storage_image_write_without_format(self.storage_image_write_without_format)
             .shader_storage_image_read_without_format(self.storage_image_read_without_format)
@@ -349,6 +355,7 @@ impl DeviceFeatures {
             max_sample_count,
             d24_unorm_s8_attachment,
             shader_int16,
+            shader_int64,
             storage_image_extended_formats,
             storage_image_write_without_format,
             storage_image_read_without_format,
@@ -390,7 +397,7 @@ impl DeviceFeatures {
              max_compute_workgroup_size={max_compute_workgroup_size:?} \
              max_compute_shared_memory_bytes={max_compute_shared_memory_bytes} \
              max_sample_count={max_sample_count} d24_unorm_s8_attachment={d24_unorm_s8_attachment} \
-             shader_int16={shader_int16} \
+             shader_int16={shader_int16} shader_int64={shader_int64} \
              storage_image_extended_formats={storage_image_extended_formats} \
              storage_image_write_without_format={storage_image_write_without_format} \
              storage_image_read_without_format={storage_image_read_without_format} \
@@ -544,6 +551,7 @@ pub unsafe fn query(
         max_sample_count,
         d24_unorm_s8_attachment,
         shader_int16: supported.shader_int16 == vk::TRUE,
+        shader_int64: supported.shader_int64 == vk::TRUE,
         storage_image_extended_formats: supported.shader_storage_image_extended_formats == vk::TRUE,
         storage_image_write_without_format: supported.shader_storage_image_write_without_format
             == vk::TRUE,
@@ -580,6 +588,7 @@ mod tests {
             max_sample_count: 8,
             d24_unorm_s8_attachment: true,
             shader_int16: true,
+            shader_int64: true,
             storage_image_extended_formats: true,
             storage_image_write_without_format: true,
             storage_image_read_without_format: true,

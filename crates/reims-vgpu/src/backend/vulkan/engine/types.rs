@@ -1043,7 +1043,7 @@ impl SamplerResource {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
 pub(crate) struct SamplerStateKey {
     pub min_filter: SamplerFilter,
     pub mag_filter: SamplerFilter,
