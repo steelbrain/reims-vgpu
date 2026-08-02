@@ -142,30 +142,42 @@ jobs:
             --test golden_vectors --test reflection_adoption --test reflection_probe \
             -- --test-threads=1
 
-  vulkan-suite:
-    name: vulkan-suite
+  # These suites execute real Vulkan work. With no ICD they self-skip
+  # (skip_if_no_gpu turns an init failure into a printed SKIP and returns ok)
+  # and would prove nothing; with the lavapipe software ICD installed below they
+  # run for real, because caps/device_select.rs ranks PHYSICAL_DEVICE_TYPE_CPU
+  # last but does not reject it, and lavapipe clears the Vulkan 1.2 floor in
+  # caps/api_floor.rs. Measured on this runner and independently reproduced on
+  # the x86 dev host (Mesa 25.2.8 / LLVM 20.1.2): zero skips on either.
+  #
+  # gate   -- vk_engine_batch 6/6 and vk_engine_compute 14/14, identical on both
+  #           hosts, so these block.
+  # parity -- 43 passed / 1 failed on both hosts. The failure is
+  #           framebuffer_fetch_reads_destination_via_input_attachment, reading
+  #           back (0,0,0,2) where the seeded (191,127,64,255) is due: an
+  #           input-attachment read llvmpipe does not serve the way hardware
+  #           does. Deterministic, not flaky. It is left failing rather than
+  #           excluded by name because that case guards the arm64 MoltenVK
+  #           GPU-address-fault class, and "llvmpipe's fault" is a claim two
+  #           lavapipe hosts cannot settle between them. Score it on a hardware
+  #           GPU runner, then drop continue-on-error.
+  vulkan:
+    name: vulkan (${{ matrix.suite }})
     needs: [preflight]
     if: needs.preflight.outputs.full == 'true'
     runs-on: ubuntu-26.04
     timeout-minutes: 45
-    # Advisory, not a merge gate. These three suites execute real Vulkan work.
-    # With no ICD they self-skip (skip_if_no_gpu turns an init failure into a
-    # printed SKIP and returns ok) and would prove nothing; with the lavapipe
-    # software ICD installed below they run for real, because
-    # caps/device_select.rs ranks PHYSICAL_DEVICE_TYPE_CPU last but does not
-    # reject it, and lavapipe clears the Vulkan 1.2 floor in caps/api_floor.rs.
-    #
-    # Measured on this runner: zero skip_if_no_gpu skips, so lavapipe executes
-    # the whole suite. vk_engine_batch 6/6 and vk_engine_compute 14/14 pass;
-    # vk_engine_parity is 43 passed / 1 failed. The one failure is
-    # framebuffer_fetch_reads_destination_via_input_attachment, which reads back
-    # (0,0,0,2) where the seeded destination (191,127,64,255) is due -- an
-    # input-attachment read that llvmpipe does not serve the way hardware does.
-    # It is left failing rather than excluded by name: that case is the arm64
-    # MoltenVK GPU-address-fault regression guard, and calling it a software
-    # rasterizer limitation is a claim no run on this runner can settle.
-    # Promote to blocking once it is scored on a hardware GPU runner.
-    continue-on-error: true
+    continue-on-error: ${{ matrix.advisory }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - suite: gate
+            tests: --test vk_engine_batch --test vk_engine_compute
+            advisory: false
+          - suite: parity
+            tests: --test vk_engine_parity
+            advisory: true
     steps:
       - uses: actions/checkout@v7
       - name: Install Rust toolchain
@@ -194,10 +206,14 @@ jobs:
           lvp=(/usr/share/vulkan/icd.d/lvp_icd*.json)
           test "${#lvp[@]}" -gt 0
           echo "VK_DRIVER_FILES=${lvp[0]}" >> "$GITHUB_ENV"
-      - name: Test (Vulkan engine suites)
+          # llvmpipe codegen decides the parity result above, so record what
+          # produced it: a Mesa or LLVM bump can move that verdict either way.
+          dpkg-query -W -f='mesa-vulkan-drivers ${Version}\n' mesa-vulkan-drivers
+          llvm-dis --version | head -2
+      - name: Test (${{ matrix.suite }})
         run: |
           cargo test --workspace --no-default-features --features backend-vulkan \
-            --test vk_engine_parity --test vk_engine_compute --test vk_engine_batch \
+            ${{ matrix.tests }} \
             -- --test-threads=1 --nocapture
 
   efi-rom:
