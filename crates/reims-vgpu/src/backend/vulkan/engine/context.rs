@@ -729,9 +729,6 @@ impl DeviceContext {
             features.storage_image_write_without_format_bgra();
         let sampled_linear_filter = features.sampled_linear_filter;
         let has16 = features.storage16;
-        let has8 = features.storage8;
-        let has_float16 = features.float16;
-        let has_int8 = features.int8;
         // Defined bounds-clamped behavior for out-of-range shader buffer access
         // is among these — the ONE feature the Vulkan spec requires every
         // implementation to support, so enabling it is portability-clean and
@@ -852,8 +849,6 @@ impl DeviceContext {
         // These three are built in `caps` too. They are bound to locals here
         // only because `push_next` borrows them for the lifetime of `dci`.
         let mut en16 = features.enabled_16bit_storage();
-        let mut en8 = features.enabled_8bit_storage();
-        let mut enfi = features.enabled_float16_int8();
         let mut dci = vk::DeviceCreateInfo::default()
             .queue_create_infos(&qci)
             .enabled_features(&enabled)
@@ -867,12 +862,6 @@ impl DeviceContext {
         }
         if has16 {
             dci = dci.push_next(&mut en16);
-        }
-        if has8 {
-            dci = dci.push_next(&mut en8);
-        }
-        if has_float16 || has_int8 {
-            dci = dci.push_next(&mut enfi);
         }
         let device = instance
             .create_device(pd, &dci, None)

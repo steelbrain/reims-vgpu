@@ -302,11 +302,17 @@ impl DeviceFeatures {
     /// rung; on [`MirrorClampToEdge::KhrExtension`] the extension string carries
     /// it instead, and on [`MirrorClampToEdge::Unsupported`] nothing is
     /// requested and the sampler path declines.
+    /// Carries float16/int8 and 8-bit storage as well: the spec forbids their
+    /// standalone structures in a pNext chain that already has this one, and
+    /// every field they set lives here from Vulkan 1.2 onward.
     pub fn enabled_vulkan12(&self) -> vk::PhysicalDeviceVulkan12Features<'static> {
         vk::PhysicalDeviceVulkan12Features::default()
             .shader_output_viewport_index(self.shader_output_viewport_index)
             .timeline_semaphore(self.timeline_semaphore)
             .sampler_mirror_clamp_to_edge(self.mirror_clamp_to_edge == MirrorClampToEdge::Core12)
+            .shader_float16(self.float16)
+            .shader_int8(self.int8)
+            .storage_buffer8_bit_access(self.storage8)
     }
 
     /// 16-bit storage-buffer access, for shaders that pack half-precision data.
