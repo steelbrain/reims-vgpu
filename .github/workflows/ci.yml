@@ -149,14 +149,22 @@ jobs:
     runs-on: ubuntu-26.04
     timeout-minutes: 45
     # Advisory, not a merge gate. These three suites execute real Vulkan work.
-    # On a GPU-less runner with no ICD they self-skip (skip_if_no_gpu turns an
-    # init failure into a printed SKIP and returns ok), so they would prove
-    # nothing; with the lavapipe software ICD installed below they run for real,
-    # because caps/device_select.rs ranks PHYSICAL_DEVICE_TYPE_CPU last but does
-    # not reject it, and lavapipe clears the Vulkan 1.2 floor in caps/api_floor.rs.
-    # Whether they pass on llvmpipe has never been established on any host, and
-    # AGENTS.md documents them as order-dependent with a device-recreate ceiling.
-    # Promote this job to blocking (drop continue-on-error) after a green run.
+    # With no ICD they self-skip (skip_if_no_gpu turns an init failure into a
+    # printed SKIP and returns ok) and would prove nothing; with the lavapipe
+    # software ICD installed below they run for real, because
+    # caps/device_select.rs ranks PHYSICAL_DEVICE_TYPE_CPU last but does not
+    # reject it, and lavapipe clears the Vulkan 1.2 floor in caps/api_floor.rs.
+    #
+    # Measured on this runner: zero skip_if_no_gpu skips, so lavapipe executes
+    # the whole suite. vk_engine_batch 6/6 and vk_engine_compute 14/14 pass;
+    # vk_engine_parity is 43 passed / 1 failed. The one failure is
+    # framebuffer_fetch_reads_destination_via_input_attachment, which reads back
+    # (0,0,0,2) where the seeded destination (191,127,64,255) is due -- an
+    # input-attachment read that llvmpipe does not serve the way hardware does.
+    # It is left failing rather than excluded by name: that case is the arm64
+    # MoltenVK GPU-address-fault regression guard, and calling it a software
+    # rasterizer limitation is a claim no run on this runner can settle.
+    # Promote to blocking once it is scored on a hardware GPU runner.
     continue-on-error: true
     steps:
       - uses: actions/checkout@v7
