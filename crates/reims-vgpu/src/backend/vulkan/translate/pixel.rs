@@ -126,6 +126,9 @@ pub fn translate(mtl: u16) -> Result<PixelFormat, TranslateReason> {
             ..linear(vk::Format::R8_UNORM, 1)
         },
         p::MTL_FORMAT_R8_UNORM => linear(vk::Format::R8_UNORM, 1),
+        p::MTL_FORMAT_R16_UNORM => linear(vk::Format::R16_UNORM, 2),
+        p::MTL_FORMAT_RG16_UNORM => linear(vk::Format::R16G16_UNORM, 4),
+        p::MTL_FORMAT_RG16_UINT => linear(vk::Format::R16G16_UINT, 4),
         p::MTL_FORMAT_R16_FLOAT => linear(vk::Format::R16_SFLOAT, 2),
         p::MTL_FORMAT_RG8_UNORM => linear(vk::Format::R8G8_UNORM, 2),
         p::MTL_FORMAT_R32_UINT => linear(vk::Format::R32_UINT, 4),
@@ -215,6 +218,9 @@ pub fn sampled_pixels(mtl: u16) -> Result<(TexelLayout, Option<TranslateReason>)
         // but the rail that emits it must confirm the host can filter it — see
         // `try_linear_sample_zero_copy`'s `supports_sampled_r32f_linear_filter`
         // gate — or the sample stays fail-visible.
+        vk::Format::R16_UNORM => TexelLayout::R16Unorm,
+        vk::Format::R16G16_UNORM => TexelLayout::Rg16Unorm,
+        vk::Format::R16G16_UINT => TexelLayout::Rg16Uint,
         vk::Format::R16_SFLOAT => TexelLayout::R16Float,
         vk::Format::R32_SFLOAT => TexelLayout::R32Float,
         _ => return Err(TranslateReason::NoSampledLayout(mtl)),
@@ -234,6 +240,9 @@ pub fn vk_texel_layout(layout: TexelLayout) -> vk::Format {
         TexelLayout::Bgra8 => vk::Format::B8G8R8A8_UNORM,
         TexelLayout::R8 => vk::Format::R8_UNORM,
         TexelLayout::Rg8 => vk::Format::R8G8_UNORM,
+        TexelLayout::R16Unorm => vk::Format::R16_UNORM,
+        TexelLayout::Rg16Unorm => vk::Format::R16G16_UNORM,
+        TexelLayout::Rg16Uint => vk::Format::R16G16_UINT,
         TexelLayout::R16Float => vk::Format::R16_SFLOAT,
         TexelLayout::R32Float => vk::Format::R32_SFLOAT,
     }
@@ -259,7 +268,10 @@ pub fn color_attachment(
     let f = translate(mtl)?;
     if !matches!(
         f.linear_vk,
-        vk::Format::R8G8B8A8_UNORM | vk::Format::B8G8R8A8_UNORM | vk::Format::R16G16_SFLOAT
+        vk::Format::R8G8B8A8_UNORM
+            | vk::Format::B8G8R8A8_UNORM
+            | vk::Format::R16G16_SFLOAT
+            | vk::Format::R16G16B16A16_SFLOAT
     ) {
         return Err(TranslateReason::NoColorAttachmentFormat(mtl));
     }
@@ -339,6 +351,9 @@ pub fn storage_image(mtl: u16) -> Result<StorageImageFormat, TranslateReason> {
         pf::MTL_FORMAT_R32_SINT => return Ok(StorageImageFormat::R32Sint),
         pf::MTL_FORMAT_R32_FLOAT => return Ok(StorageImageFormat::R32Float),
         pf::MTL_FORMAT_RGB9E5_FLOAT => return Ok(StorageImageFormat::Rgb9e5Ufloat),
+        pf::MTL_FORMAT_R16_UNORM => return Ok(StorageImageFormat::R16Unorm),
+        pf::MTL_FORMAT_RG16_UNORM => return Ok(StorageImageFormat::Rg16Unorm),
+        pf::MTL_FORMAT_RG16_UINT => return Ok(StorageImageFormat::Rg16Uint),
         _ => {}
     }
     let selector = pf::storage_selector(mtl).ok_or(TranslateReason::NoStorageImageFormat(mtl))?;
@@ -391,11 +406,16 @@ pub fn resident_color(bgra: bool) -> vk::Format {
 pub fn bytes_per_texel(format: vk::Format) -> Option<u32> {
     Some(match format {
         vk::Format::R8_UNORM | vk::Format::S8_UINT => 1,
-        vk::Format::R8G8_UNORM | vk::Format::R16_SFLOAT | vk::Format::D16_UNORM => 2,
+        vk::Format::R8G8_UNORM
+        | vk::Format::R16_SFLOAT
+        | vk::Format::R16_UNORM
+        | vk::Format::D16_UNORM => 2,
         vk::Format::R32_UINT
         | vk::Format::R32_SINT
         | vk::Format::R32_SFLOAT
         | vk::Format::R16G16_SFLOAT
+        | vk::Format::R16G16_UNORM
+        | vk::Format::R16G16_UINT
         | vk::Format::R8G8B8A8_UNORM
         | vk::Format::R8G8B8A8_SRGB
         | vk::Format::R8G8B8A8_UINT
@@ -432,6 +452,9 @@ pub fn vk_storage_image(format: StorageImageFormat) -> vk::Format {
         StorageImageFormat::R32Sint => vk::Format::R32_SINT,
         StorageImageFormat::R32Float => vk::Format::R32_SFLOAT,
         StorageImageFormat::Rgb9e5Ufloat => vk::Format::E5B9G9R9_UFLOAT_PACK32,
+        StorageImageFormat::R16Unorm => vk::Format::R16_UNORM,
+        StorageImageFormat::Rg16Unorm => vk::Format::R16G16_UNORM,
+        StorageImageFormat::Rg16Uint => vk::Format::R16G16_UINT,
     }
 }
 
@@ -888,6 +911,138 @@ mod tests {
     /// `UberCompositeFragment` display-profile pass arrive this way; before this
     /// rail carried the layout the draw resolved to nothing and the whole
     /// color-managed desktop composite failed with `draw_vk_nothing_stored`.
+    /// Every layout the sampled rail can bind must have a texel footprint the
+    /// draw validator recognises.
+    ///
+    /// These are two tables in two files. `vk_texel_layout` decides the Vulkan
+    /// format a sampled bind carries; `bytes_per_texel` is what
+    /// `validate_sampled_images` then measures the CPU-origin buffer against,
+    /// and a format missing from it is refused by name — which drops the whole
+    /// draw, not the one texture.
+    ///
+    /// Adding `R16_UNORM` to the first table without the second did exactly
+    /// that: the wallpaper's luma plane decoded, bound, and then died at
+    /// `vk_draw_validate_sampled_no_linear_texel_footprint binding=163
+    /// format=R16_UNORM` on a 1920x1088 full-screen quad. The two tables have to
+    /// be checked against each other rather than maintained in parallel by hand.
+    ///
+    /// `index_in_all` is exhaustive on purpose: a new `TexelLayout` variant
+    /// fails to compile there, which forces it into `ALL` and so into this
+    /// check.
+    #[test]
+    fn every_sampled_layout_has_a_texel_footprint_the_validator_knows() {
+        use crate::contract::pixel_format::TexelLayout;
+
+        const ALL: &[TexelLayout] = &[
+            TexelLayout::Rgba8,
+            TexelLayout::Bgra8,
+            TexelLayout::R8,
+            TexelLayout::Rg8,
+            TexelLayout::R16Float,
+            TexelLayout::R16Unorm,
+            TexelLayout::Rg16Unorm,
+            TexelLayout::Rg16Uint,
+            TexelLayout::R32Float,
+        ];
+
+        fn index_in_all(layout: TexelLayout) -> usize {
+            match layout {
+                TexelLayout::Rgba8 => 0,
+                TexelLayout::Bgra8 => 1,
+                TexelLayout::R8 => 2,
+                TexelLayout::Rg8 => 3,
+                TexelLayout::R16Float => 4,
+                TexelLayout::R16Unorm => 5,
+                TexelLayout::Rg16Unorm => 6,
+                TexelLayout::Rg16Uint => 7,
+                TexelLayout::R32Float => 8,
+            }
+        }
+
+        for (position, layout) in ALL.iter().copied().enumerate() {
+            assert_eq!(
+                index_in_all(layout),
+                position,
+                "ALL and index_in_all disagree about {layout:?}"
+            );
+            let format = vk_texel_layout(layout);
+            let footprint = bytes_per_texel(format).unwrap_or_else(|| {
+                panic!("{layout:?} binds as {format:?}, which the draw validator cannot size")
+            });
+            assert_eq!(
+                footprint,
+                layout.bytes_per_texel(),
+                "{layout:?} disagrees with {format:?} about its texel size"
+            );
+        }
+    }
+
+    /// `RG16Uint` samples as integer texels and never rides the colour rails.
+    ///
+    /// The guest shader settles the type twice over: its decoded argument type
+    /// and translated SPIR-V image type both require integer texels. A `_UNORM`
+    /// or `_SFLOAT` there would be an invalid descriptor.
+    ///
+    /// It is also fetch-only — every access is `OpImageFetch` or
+    /// `OpImageQuerySizeLod`, never `OpSampledImage` — so it needs no linear
+    /// filtering, which Vulkan does not offer for integer formats anyway.
+    #[test]
+    fn two_channel_uint_samples_as_integer_texels_and_never_as_colour() {
+        use crate::contract::pixel_format::{self as p, TexelLayout};
+
+        let (layout, _decline) =
+            sampled_pixels(p::MTL_FORMAT_RG16_UINT).expect("RG16Uint is sampled");
+        assert_eq!(layout, TexelLayout::Rg16Uint);
+        assert_eq!(vk_texel_layout(layout), vk::Format::R16G16_UINT);
+        assert_eq!(layout.bytes_per_texel(), 4);
+
+        // Distinct from the other two four-byte two-channel layouts: reading
+        // integer texels as unorm or float would be a different image.
+        assert_ne!(vk_texel_layout(layout), vk_texel_layout(TexelLayout::Rg16Unorm));
+        assert_ne!(vk_texel_layout(layout), vk_texel_layout(TexelLayout::R16Float));
+
+        // Kept off every rail that carries colour through 8-bit unorm LUTs. A
+        // 16-bit coordinate does not survive that round trip, and a named
+        // refusal is better than wrong pixels.
+        assert_eq!(p::render_target_bpp(p::MTL_FORMAT_RG16_UINT), None);
+        assert_eq!(p::texel_to_rgba8(p::MTL_FORMAT_RG16_UINT, &[0u8; 4]), None);
+        assert!(!p::rgba8_to_texel(
+            p::MTL_FORMAT_RG16_UINT,
+            [1, 2, 3, 4],
+            &mut [0u8; 4]
+        ));
+
+        // But its size is known, which is what the sampled bind needs: an
+        // unknown width is what made this format read as a bpp mismatch against
+        // itself (`base_fmt=0x3f view_fmt=0x3f`).
+        assert_eq!(p::bytes_per_pixel(p::MTL_FORMAT_RG16_UINT), Some(4));
+    }
+
+    /// `R16Unorm` reaches the GPU as one 16-bit channel, not as two 8-bit ones.
+    ///
+    /// It has no arm in the CPU `convert_row_to_rgba8` loader, so without a
+    /// native rail every bind of such a view is refused — measured as 387
+    /// `type5_view_convert` declines of a single 3840x2160 view in one logged-in
+    /// macOS session, the largest decline class in that boot.
+    ///
+    /// The layout it lands on decides how the GPU reads the texel, so the
+    /// distinction from the other two-byte layouts is the whole point.
+    #[test]
+    fn single_channel_unorm_samples_natively_and_not_as_two_bytes() {
+        use crate::contract::pixel_format::TexelLayout;
+
+        let (layout, _decline) =
+            sampled_pixels(p::MTL_FORMAT_R16_UNORM).expect("R16Unorm is sampled");
+        assert_eq!(layout, TexelLayout::R16Unorm);
+        assert_eq!(vk_texel_layout(layout), vk::Format::R16_UNORM);
+        // Two bytes per texel, like `Rg8` and `R16Float` — but a distinct layout,
+        // because `R8G8_UNORM` would read the same bytes as two channels.
+        assert_eq!(layout.bytes_per_texel(), 2);
+        assert_ne!(layout, TexelLayout::Rg8);
+        assert_ne!(vk_texel_layout(layout), vk_texel_layout(TexelLayout::Rg8));
+        assert_ne!(vk_texel_layout(layout), vk_texel_layout(TexelLayout::R16Float));
+    }
+
     #[test]
     fn single_channel_float_samples_natively_through_its_own_layout() {
         use crate::contract::pixel_format::TexelLayout;
@@ -991,6 +1146,12 @@ mod tests {
                 p::MTL_FORMAT_RGBA8_UNORM_SRGB,
                 p::MTL_FORMAT_BGRA8_UNORM,
                 p::MTL_FORMAT_BGRA8_UNORM_SRGB,
+                // Tahoe renders its glass material into RGBA16Float: every app
+                // icon and every Liquid Glass surface is a target of this
+                // format. Refusing it did not degrade those surfaces, it lost
+                // them — a blank rounded square where the icon is, and no
+                // material at all.
+                p::MTL_FORMAT_RGBA16_FLOAT,
             ]
         );
     }
@@ -1119,5 +1280,49 @@ mod tests {
             TranslateReason::SrgbDowngraded(0).slug(),
             crate::runtime::census::srgb_census::SRGB_DOWNGRADED_SLUG
         );
+    }
+}
+
+#[cfg(test)]
+mod sampled_only_storage_tests {
+    use super::*;
+    use crate::contract::pixel_format as pf;
+
+    /// The compute rails stage a sampled texture through the storage-image
+    /// enum, so a format with no storage selector still has to resolve here.
+    /// Without an answer the whole dispatch declines
+    /// (`mtl_format_unsupported`) and the guest's work is lost, which is what
+    /// happened to the 16-bit single- and two-channel formats.
+    #[test]
+    fn sixteen_bit_narrow_formats_resolve_for_sampled_staging() {
+        for (mtl, expected, bytes) in [
+            (pf::MTL_FORMAT_R16_UNORM, vk::Format::R16_UNORM, 2usize),
+            (pf::MTL_FORMAT_RG16_UNORM, vk::Format::R16G16_UNORM, 4),
+            (pf::MTL_FORMAT_RG16_UINT, vk::Format::R16G16_UINT, 4),
+        ] {
+            let resolved = storage_image(mtl)
+                .unwrap_or_else(|e| panic!("{mtl:#x} has no storage-image format: {e:?}"));
+            assert_eq!(vk_storage_image(resolved), expected, "{mtl:#x}");
+            assert_eq!(resolved.bytes_per_texel(), bytes, "{mtl:#x}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod rgba16f_attachment_tests {
+    use super::*;
+    use crate::contract::pixel_format as pf;
+
+    /// `MTLPixelFormatRGBA16Float` is what Tahoe renders its glass material
+    /// into — every app icon and every Liquid Glass surface is an RGBA16Float
+    /// target. Refusing it as a colour attachment does not degrade those
+    /// surfaces, it loses them: the icon is a blank rounded square and the
+    /// material never appears.
+    #[test]
+    fn rgba16_float_is_a_colour_attachment() {
+        let (format, _) = color_attachment(pf::MTL_FORMAT_RGBA16_FLOAT)
+            .expect("RGBA16Float has no colour attachment format");
+        assert_eq!(format, vk::Format::R16G16B16A16_SFLOAT);
+        assert_eq!(bytes_per_texel(format), Some(8));
     }
 }

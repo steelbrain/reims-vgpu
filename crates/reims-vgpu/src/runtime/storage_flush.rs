@@ -2487,6 +2487,43 @@ fn flush_render_one<M: HostMemory + HostOps>(
             }
         }
     };
+    if crate::observe::dump_flush_surfaces() {
+        // Opt-in census: the one thing the sink cannot say is what a surface
+        // actually contains. A blank icon and a missing material look identical
+        // from the decline side once nothing declines, and they separate here:
+        // an all-zero frame means the render produced nothing, a non-zero one
+        // means the loss is downstream of this read.
+        let nonzero = match &frame {
+            FlushFrame::Owned(bytes) => bytes.iter().filter(|b| **b != 0).count(),
+            FlushFrame::Leased(leased) => leased.bytes().iter().filter(|b| **b != 0).count(),
+        };
+        crate::observe::fail(format!(
+            "flush_surface_census mapping={} {}x{} fmt={:#x} bytes={} nonzero={nonzero}",
+            key.mapping_id,
+            key.width,
+            key.height,
+            key.pixel_format,
+            frame.len()
+        ));
+        // The count says how much was drawn; only the pixels say what. Small
+        // surfaces are the ones in question (icons, glass material) and cost
+        // nothing to keep, so land them raw beside the sinks for off-VM
+        // inspection.
+        if key.width <= 512 && key.height <= 512 {
+            let dir = crate::observe::log_dir();
+            let bytes: &[u8] = match &frame {
+                FlushFrame::Owned(bytes) => bytes.as_ref().as_slice(),
+                FlushFrame::Leased(leased) => leased.bytes(),
+            };
+            let _ = std::fs::write(
+                dir.join(format!(
+                    "flush-mid{}-{}x{}-fmt{:x}.bgra",
+                    key.mapping_id, key.width, key.height, key.pixel_format
+                )),
+                bytes,
+            );
+        }
+    }
     note_render_flush_over_guest_write(state, host, key);
     let write_started = std::time::Instant::now();
     let ok = match &frame {

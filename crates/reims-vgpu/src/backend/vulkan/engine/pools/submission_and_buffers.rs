@@ -8,6 +8,7 @@ impl ResourcePools {
 
     pub(crate) fn new() -> Self {
         Self {
+            depth_stencil_keep: None,
             staging_free: HashMap::new(),
             staging_live: Vec::new(),
             staging_hits: 0,

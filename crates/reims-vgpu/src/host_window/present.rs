@@ -477,7 +477,7 @@ pub fn run_main_thread(id: u64) -> Result<(), WindowError> {
 }
 
 /// Build an event loop that may run off the main thread (QEMU owns the main
-/// thread). X11 and Wayland both allow it via their platform extension.
+/// thread). X11, Wayland and Win32 each allow it via their platform extension.
 fn build_event_loop() -> Result<EventLoop<()>, WindowError> {
     let mut builder = EventLoop::builder();
     #[cfg(all(unix, not(target_os = "macos")))]
@@ -488,6 +488,15 @@ fn build_event_loop() -> Result<EventLoop<()>, WindowError> {
         // each sets its own backend's any-thread flag (only the active one runs).
         EventLoopBuilderExtX11::with_any_thread(&mut builder, true);
         EventLoopBuilderExtWayland::with_any_thread(&mut builder, true);
+    }
+    // Win32 refuses to build off the main thread without this, so the window
+    // would never come up at all rather than degrade. The message pump then
+    // belongs to the spawning thread, which is the model this rail already has:
+    // the window is created, run and torn down on the one thread `spawn` owns.
+    #[cfg(target_os = "windows")]
+    {
+        use winit::platform::windows::EventLoopBuilderExtWindows;
+        EventLoopBuilderExtWindows::with_any_thread(&mut builder, true);
     }
     builder
         .build()

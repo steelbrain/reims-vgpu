@@ -3056,6 +3056,34 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
             return ComputeStatus::MetalFailed("compute_vk_translate");
         }
     };
+    // An invalid module must not reach the driver.
+    //
+    // The translator can emit an `OpCompositeInsert` that puts an image handle
+    // into a struct, which the Logical addressing model has no representation
+    // for — the type at the indexed path is a pointer, never the handle's own
+    // type. `spirv-val` rejects it, and creating a shader module anyway is
+    // licence for the driver to do whatever it likes.
+    //
+    // It took that licence. Three consecutive boots of a macOS desktop stopped
+    // being served at the compute pipeline carrying exactly this instruction,
+    // and the disassembly of the module dumped from the third names it:
+    //
+    //     %193 = OpCompositeInsert %_struct_51 %84 %55 0 0
+    //
+    // Nothing else reported it. No panic, no `VkResult` error, no device loss,
+    // no host fault record, and a guest kernel log still healthy after the host
+    // process was gone. Declining costs this kernel's dispatches; not declining
+    // costs every dispatch after it, because the process is no longer there.
+    //
+    // The detector agreed with `spirv-val` on all 15 modules captured from a
+    // live boot, firing on the one it rejects and on none of the rest.
+    if kernel_shader.shape.opaque_in_composite {
+        crate::observe::fail(format!(
+            "compute_linux m2v_invalid_module reason=opaque_handle_in_composite              pipe={} tg=[{tg_x},{tg_y},{tg_z}]              (OpCompositeInsert/Extract of an image or sampler handle;               spirv-val rejects the module)",
+            acc.pipeline_ref
+        ));
+        return ComputeStatus::MetalFailed("compute_vk_invalid_module");
+    }
     let mut spirv = match spirv_words_le(&kernel_shader.spirv) {
         Ok(w) => w,
         Err(e) => {
@@ -3891,8 +3919,10 @@ fn guest_numeric_class(guest: crate::backend::vulkan::engine::StorageImageFormat
         | V::R8Unorm
         | V::Rg8Unorm
         | V::R32Float
+        | V::R16Unorm
+        | V::Rg16Unorm
         | V::Rgb9e5Ufloat => 0,
-        V::Rgba16Uint | V::Rgba8Uint | V::Rgba32Uint | V::R32Uint => 1,
+        V::Rgba16Uint | V::Rgba8Uint | V::Rgba32Uint | V::R32Uint | V::Rg16Uint => 1,
         V::Rgba8Sint | V::R32Sint => 2,
     }
 }
@@ -4001,7 +4031,16 @@ fn specialized_storage_image_format(
         // R32 sint/float and the packed Rgb9e5 stay sampled-only until a live
         // capture justifies enabling their storage path.
         V::R32Uint => (1, S::R32ui),
-        V::R32Sint | V::R32Float | V::Rgb9e5Ufloat => {
+        // The 16-bit single- and two-channel normalized/uint formats reach the
+        // engine only as sampled textures — they have no storage selector — so
+        // a shader declaring one as a storage image is refused here rather than
+        // given a view whose storage support was never established.
+        V::R32Sint
+        | V::R32Float
+        | V::Rgb9e5Ufloat
+        | V::R16Unorm
+        | V::Rg16Unorm
+        | V::Rg16Uint => {
             return Err("spirv_sampled_only_format_as_storage");
         }
         V::Rgba32Float => (0, S::Rgba32Float),

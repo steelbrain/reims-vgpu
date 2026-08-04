@@ -1670,6 +1670,14 @@ pub struct DeviceState {
     pub translation_order_hold_mask: u32,
     /// Distinct cross-FIFO hold episodes (retries of one episode do not grow it).
     pub translation_order_holds: u64,
+    /// When the drain worker last woke (`observe::elapsed_ms`). The stall
+    /// reporter compares this against now: a device with outstanding work whose
+    /// worker has not woken for seconds is wedged, and every wedge on this
+    /// device so far was silent until something external printed a snapshot.
+    pub last_drain_wake_ms: u64,
+    /// Last stall snapshot emission, so a wedge reports on a bounded cadence
+    /// instead of once per poll.
+    pub last_stall_report_ms: u64,
     /// Display transactions held while another channel remained blocked on
     /// translation after the transaction's rescue drains. This counts hold
     /// episodes, not poll retries of the same packet.
@@ -1678,6 +1686,16 @@ pub struct DeviceState {
     /// `translation_deferred_mask`. Suppresses fail-log flooding while the
     /// same head is retried and is cleared with channel lifecycle state.
     pub present_translation_hold_mask: u32,
+    /// When the current display-order hold began. The hold is correct but must
+    /// not be unbounded: the guest watchdogs its own ring, and a stall it
+    /// attributes to the device costs a `GPU Reset` that discards every frame
+    /// in flight, not just the one being ordered.
+    pub present_translation_hold_since: Option<std::time::Instant>,
+    /// When a render pipeline object was first found unreadable, keyed by
+    /// (task, ref). A draw whose pipeline the guest has not finished
+    /// publishing is retried rather than lost, and this is what stops that
+    /// retry from becoming a wait for something that will never arrive.
+    pub pipeline_unreadable_since: std::collections::HashMap<(u32, u32), std::time::Instant>,
     pub pending: PendingWork,
     pub child_rings: [ChannelRing; MAX_CHANNELS],
     pub tasks: [TaskEntry; MAX_TASKS],
@@ -1987,8 +2005,12 @@ impl DeviceState {
             translation_deferred_mask: 0,
             translation_order_hold_mask: 0,
             translation_order_holds: 0,
+            last_drain_wake_ms: 0,
+            last_stall_report_ms: 0,
             present_translation_holds: 0,
             present_translation_hold_mask: 0,
+            present_translation_hold_since: None,
+            pipeline_unreadable_since: std::collections::HashMap::new(),
             pending: PendingWork::default(),
             child_rings: std::array::from_fn(|_| ChannelRing::default()),
             tasks: std::array::from_fn(|_| TaskEntry::default()),

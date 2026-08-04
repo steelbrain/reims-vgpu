@@ -1917,9 +1917,18 @@ pub(super) fn load_type5_view_rgba<M: HostMemory + HostOps>(
     // RG8→(r,g,0,255), which is exactly what an R8_UNORM / R8G8_UNORM Vulkan
     // image samples to (`.r` / `.rg`, zero-filled tail). Skipping the CPU expand
     // and uploading native cuts 4×/2× the staging bytes with byte-exact texels.
+    // Formats with a native sampled rail upload their bytes verbatim; everything
+    // else expands per texel into RGBA8 below. A format that has neither an entry
+    // here nor an arm in `convert_row_to_rgba8` is refused at every bind, which
+    // is what `R16_UNORM` was — 387 refusals of one 3840x2160 view in a single
+    // logged-in session.
     let byte_format = match view.pixel_format {
         pixel_format::MTL_FORMAT_R8_UNORM => TexelLayout::R8,
         pixel_format::MTL_FORMAT_RG8_UNORM => TexelLayout::Rg8,
+        pixel_format::MTL_FORMAT_R16_UNORM => TexelLayout::R16Unorm,
+        pixel_format::MTL_FORMAT_RG16_UNORM => TexelLayout::Rg16Unorm,
+        pixel_format::MTL_FORMAT_RG16_UINT => TexelLayout::Rg16Uint,
+        pixel_format::MTL_FORMAT_R16_FLOAT => TexelLayout::R16Float,
         _ => TexelLayout::Rgba8,
     };
     let ok_line = |generation_source: &str, rgba: &[u8]| {
@@ -2371,6 +2380,9 @@ fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
         Ok((layout, decline))
             if layout.is_four_byte_color()
                 || layout == TexelLayout::R16Float
+                || layout == TexelLayout::R16Unorm
+                || layout == TexelLayout::Rg16Unorm
+                || layout == TexelLayout::Rg16Uint
                 || (layout == TexelLayout::R32Float
                     && engine::supports_sampled_r32f_linear_filter()) =>
         {
@@ -4096,7 +4108,57 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         )
     })?;
 
-    let Some((w, h)) = req.colors.first().map(|c0| (c0.width, c0.height)) else {
+    // Decline a relooper state machine before the driver is handed it.
+    //
+    // `vkCreateGraphicsPipelines` runs on the drain worker with the device lock
+    // held, so a driver that does not return does not merely lose this draw --
+    // it stops the device. The guest's rings stop being consumed and it reports
+    // `GPU hang: Name Display0` with the ring cursors frozen. Measured on an
+    // NVIDIA host: the WindowServer compositor's fragment module (2 731 blocks,
+    // 2 725 switch cases) held that call past 22 minutes at a full core with a
+    // flat working set, while every structured module in the same boot compiled
+    // in single-digit milliseconds.
+    //
+    // Checked here rather than in the engine because both stages' modules are in
+    // hand and the decline should name which stage carried the shape.
+    // An invalid module must not reach the driver, whichever stage carries it.
+    // The translator can emit an `OpCompositeInsert` that puts an image or
+    // sampler handle into a struct; the Logical addressing model has no
+    // representation for that, `spirv-val` rejects the module, and a driver
+    // handed an invalid one may do anything. Measured on the compute path, where
+    // it stopped the host process being served three boots running — the render
+    // path shares the translator, so it shares the exposure.
+    for (stage, shader) in [("vertex", &v_shader), ("fragment", &f_shader)] {
+        if shader.shape.opaque_in_composite {
+            crate::observe::fail(format!(
+                "linux_m2v_draw m2v_invalid_module reason=opaque_handle_in_composite                  pipe={} stage={stage}                  (OpCompositeInsert/Extract of an image or sampler handle;                   spirv-val rejects the module)",
+                req.pipeline_ref
+            ));
+            return Err(DrawError::Unsupported(
+                crate::backend::vulkan::engine::reason::DrawReason::InvalidTranslatedModule {
+                    pipeline_ref: req.pipeline_ref,
+                },
+            ));
+        }
+    }
+    for (stage, shader) in [("vertex", &v_shader), ("fragment", &f_shader)] {
+        if shader.shape.is_relooper_state_machine() {
+            let reason = crate::backend::vulkan::engine::reason::DrawReason::
+                UnstructuredStateMachineShader {
+                    blocks: shader.shape.blocks,
+                    switch_cases: shader.shape.max_switch_cases,
+                };
+            crate::observe::Emit::decline("linux_m2v_draw", &reason)
+                .field("pipe", req.pipeline_ref)
+                .field("stage", stage)
+                .fail_once(u64::from(req.pipeline_ref));
+            return Err(DrawError::Unsupported(reason));
+        }
+    }
+
+    let (w, h) = if let Some(c0) = req.colors.first() {
+        (c0.width, c0.height)
+    } else {
         return Ok(M2vDrawSpan::None);
     };
     // The bound is the device's own `maxImageDimension2D`, not a fixed number:
@@ -4351,14 +4413,37 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     .filter(|s| s.index < MAX_BIND_SLOTS && s.sampler_ref != 0)
                     .map(|s| s.index)
                     .collect();
+                // The declared side and the raw provided pairs, so a fire can be
+                // read without a reproduction: which Metal indices the shader
+                // wants (with kinds) and exactly what the guest bound where,
+                // refs included. A fire on the WindowServer composite showed
+                // `unbound=[tex0] provided_tex={3}` and nothing in the line
+                // could say whether the shader also declared tex3, or which
+                // texture the guest put there — the difference between "decode
+                // read the slot wrong" and "the guest binds this shader's
+                // second texture only".
+                let declared: Vec<String> = f_shader
+                    .reflection
+                    .bindings
+                    .iter()
+                    .map(|rb| format!("{:?}[{}]", rb.kind, rb.metal_index))
+                    .collect();
+                let tex_pairs: Vec<String> = req
+                    .fragment_textures
+                    .iter()
+                    .filter(|t| t.texture_ref != 0)
+                    .map(|t| format!("{}:{:#x}", t.index, t.texture_ref))
+                    .collect();
                 crate::observe::fail(format!(
                     "shader_resource_declared_unbound reason=frag_declared_descriptor_unbound \
                      pipe={} unbound=[{}] provided_buf={bufs:?} provided_tex={texs:?} \
-                     provided_smp={smps:?} {}x{}",
+                     provided_smp={smps:?} {}x{} declared=[{}] tex_pairs=[{}]",
                     req.pipeline_ref,
                     unbound.join(","),
                     w,
-                    h
+                    h,
+                    declared.join(","),
+                    tex_pairs.join(",")
                 ));
             }
             if !embedded.is_empty() {
@@ -4593,6 +4678,38 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 } else {
                     (tw, th)
                 };
+                // What a draw samples decides what it can draw. For a small
+                // float target — an icon canvas — an empty source and an empty
+                // result are the same picture, and only this separates them.
+                if crate::observe::dump_flush_surfaces() && w <= 160 && h <= 160 {
+                    let census = match &source {
+                        crate::backend::vulkan::engine::SampledSource::Bytes(b) => {
+                            format!("bytes={} nonzero={}", b.len(), b.iter().filter(|x| **x != 0).count())
+                        }
+                        crate::backend::vulkan::engine::SampledSource::Target(id) => {
+                            // Bound, ready and geometry-matched is not the same
+                            // as having content. Read it back so an empty mask
+                            // is distinguishable from a material that computes
+                            // nothing from a good one.
+                            match crate::backend::vulkan::engine::read_target(id) {
+                                Ok(rb) => {
+                                    let px = rb.into_bgra8();
+                                    format!(
+                                        "target_bytes={} target_nonzero={}",
+                                        px.len(),
+                                        px.iter().filter(|x| **x != 0).count()
+                                    )
+                                }
+                                Err(e) => format!("target_read_failed={e}"),
+                            }
+                        }
+                        other => format!("source={other:?}"),
+                    };
+                    crate::observe::fail(format!(
+                        "draw_sampled_census pipe={} target={}x{} bind={img_bind} ref={texture_ref} {tw}x{th} {census}",
+                        req.pipeline_ref, w, h
+                    ));
+                }
                 images.push(crate::backend::vulkan::engine::SampledImageResource {
                     binding: img_bind,
                     width: tw,
@@ -4619,6 +4736,82 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             }
             for t in &req.fragment_textures {
                 push_tex(t.index, t.texture_ref, true)?;
+            }
+            // Metal's unbound-texture rule, made explicit for Vulkan.
+            //
+            // A Metal fragment shader may declare a `[[texture(n)]]` the draw
+            // never binds; sampling it is defined to return zero. Vulkan has no
+            // equivalent: the engine derives its descriptor layout from provided
+            // resources alone, so a declared-but-unbound slot is both missing
+            // from the pipeline layout and undefined to read. A validation layer
+            // reports the pair on the same binding —
+            // `VUID-VkGraphicsPipelineCreateInfo-layout-07988` and
+            // `VUID-vkCmdDraw-None-08114` at `[Set 0, Binding 160]`, which is
+            // `TEXTURE_BINDING_BASE + 0`.
+            //
+            // Undefined is also what it looked like: the descriptor addressed
+            // whatever memory was there, usually the previous frame, so every
+            // window dragged a trail behind it.
+            //
+            // A one-texel zero image restores Metal's rule exactly. It costs
+            // four bytes per slot, needs no extension (so it holds on all four
+            // support-matrix cells rather than only where `nullDescriptor`
+            // exists), and a shader that samples it reads the zero Metal
+            // promised. The sampler side of this pair has always defaulted the
+            // same way (`SamplerResource::normalized_default` for `ref == 0`);
+            // only the texture side was missing.
+            for index in declared_fragment_texture_indices(&f_shader.reflection.bindings) {
+                if index >= MAX_BIND_SLOTS {
+                    continue;
+                }
+                if req
+                    .fragment_textures
+                    .iter()
+                    .any(|t| t.index == index && t.texture_ref != 0)
+                {
+                    continue;
+                }
+                let base_off = if separate_sampled {
+                    FRAG_SAMPLED_RESOURCE_BINDING_OFFSET
+                } else {
+                    0
+                };
+                let img_bind = TEXTURE_BINDING_BASE + index + base_off;
+                if images.iter().any(|i| i.binding == img_bind) {
+                    continue;
+                }
+                // The declared shape decides the placeholder's shape: a shader
+                // declaring a cube or an array must not be handed a plain 2D
+                // image, or the descriptor is the wrong type and the layout
+                // mismatch simply moves. An unsupported shape is left alone —
+                // the bound path already declines those by name.
+                use crate::runtime::spirv_bind::ReflectedSampledKind;
+                let kind = match crate::runtime::spirv_bind::reflected_sampled_kind(
+                    &f_shader.reflection,
+                    TEXTURE_BINDING_BASE + index,
+                ) {
+                    ReflectedSampledKind::Kind(k) => k,
+                    _ => continue,
+                };
+                let Some(shape) = sampled_image_shape(kind) else {
+                    continue;
+                };
+                images.push(crate::backend::vulkan::engine::SampledImageResource {
+                    binding: img_bind,
+                    width: 1,
+                    height: 1,
+                    layers: shape.layers,
+                    arrayed: shape.arrayed,
+                    volume: shape.volume,
+                    cube: shape.cube,
+                    one_dim: shape.one_dim,
+                    source: crate::backend::vulkan::engine::SampledSource::Bytes(
+                        std::sync::Arc::new(vec![0u8; 4 * shape.layers.max(1) as usize]),
+                    ),
+                    format: translate::pixel::vk_texel_layout(TexelLayout::Rgba8),
+                    identity: None,
+                    swizzle: Default::default(),
+                });
             }
         }
         {
@@ -4950,6 +5143,22 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             ),
             ..crate::backend::vulkan::engine::DrawRequest::default()
         };
+        // Geometry landing outside a small target is invisible in the sink: the
+        // draw reports success and the surface comes out empty but for whatever
+        // sliver fell inside. Record the two things that decide where it lands
+        // against the size of what it lands on.
+        if crate::observe::dump_flush_surfaces() && w <= 256 && h <= 256 {
+            crate::observe::fail(format!(
+                "draw_placement pipe={} {}x{} viewport={:?} scissor={:?} vtx={} inst={}",
+                req.pipeline_ref,
+                w,
+                h,
+                req.viewport,
+                req.scissor,
+                req.vertex_count,
+                req.instance_count
+            ));
+        }
         resources.viewport =
             req.viewport
                 .map(|vp| crate::backend::vulkan::engine::ViewportResource {
@@ -5359,8 +5568,16 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                                 write_enable: ds.depth_write_enabled,
                                 compare,
                                 clear_value,
-                                // Transient buffer: always CLEAR (see above).
-                                load: false,
+                                // The stencil belongs to the pass, not to the
+                                // draw: one draw writes a mask and the next
+                                // tests it, so only the first draw of the pass
+                                // clears and the rest load what it left.
+                                // Clearing every draw is what left Tahoe's icon
+                                // and glass surfaces an outline with no fill.
+                                // Depth alone keeps its per-draw clear — the
+                                // transient depth carries nothing between
+                                // draws and nothing asks it to.
+                                load: stencil.is_some() && !req.stencil_first_in_pass,
                                 stencil,
                             });
                         }

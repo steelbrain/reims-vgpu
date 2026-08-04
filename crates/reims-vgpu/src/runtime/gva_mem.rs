@@ -266,9 +266,27 @@ pub fn write_task_gva<M: HostMemory>(
 #[track_caller]
 fn via_caller() -> String {
     let loc = std::panic::Location::caller();
-    let file = loc.file();
-    let tail = file.rfind("/src/").map_or(file, |i| &file[i + 5..]);
-    format!("{tail}:{}", loc.line())
+    format!("{}:{}", via_file_tail(loc.file()), loc.line())
+}
+
+/// The tail of a `Location::file()` from the crate's `src/` onward, always
+/// spelled with `/`.
+///
+/// `file!()` carries the path separator of the host that compiled the crate, so
+/// a Windows build spells it `crates\reims-vgpu\src\runtime\gva_mem.rs`.
+/// Matching only `/src/` found nothing there and emitted the whole build path —
+/// precisely what the trimming exists to prevent, on the rail where the log line
+/// is the only evidence there is.
+///
+/// The result is normalised rather than merely trimmed so `via=` reads the same
+/// on every host: a grep or offline parser written against one boot's log keeps
+/// working on another's.
+fn via_file_tail(file: &str) -> String {
+    let norm = file.replace('\\', "/");
+    match norm.rfind("/src/") {
+        Some(i) => norm[i + 5..].to_string(),
+        None => norm,
+    }
 }
 
 /// Dedup key for the guest-memory censuses: two task ids **and** the call site.
@@ -1067,6 +1085,38 @@ mod tests {
         );
         let line: u32 = here.rsplit(':').next().unwrap().parse().unwrap();
         assert!(line > 0);
+    }
+
+    /// The trimming must not depend on which host compiled the crate.
+    ///
+    /// `file!()` carries the building host's separator, so on Windows this
+    /// field arrived as the full `crates\...` build path — the log line was
+    /// wide enough to push the load-bearing fields off the end, on the rail
+    /// where that line is the only evidence. Both spellings are fed in
+    /// explicitly so a Unix host still fails if the backslash arm is dropped.
+    #[test]
+    fn the_via_field_is_trimmed_whichever_separator_the_build_host_used() {
+        assert_eq!(
+            via_file_tail("/home/u/reims-vgpu/crates/reims-vgpu/src/runtime/gva_mem.rs"),
+            "runtime/gva_mem.rs"
+        );
+        assert_eq!(
+            via_file_tail(r"crates\reims-vgpu\src\runtime\gva_mem.rs"),
+            "runtime/gva_mem.rs"
+        );
+        assert_eq!(
+            via_file_tail(r"C:\Users\u\reims-vgpu\crates\reims-vgpu\src\runtime\gva_mem.rs"),
+            "runtime/gva_mem.rs"
+        );
+        // The deepest `src/` wins, so a checkout that itself lives under a
+        // directory called `src` does not swallow the crate-relative part.
+        assert_eq!(
+            via_file_tail("/src/reims-vgpu/crates/reims-vgpu/src/runtime/gva_mem.rs"),
+            "runtime/gva_mem.rs"
+        );
+        // Nothing to trim: pass it through rather than emitting an empty field,
+        // and still normalise the separator.
+        assert_eq!(via_file_tail(r"lib\thing.rs"), "lib/thing.rs");
     }
 
     /// The latch key must separate call sites, or the second site to reach a

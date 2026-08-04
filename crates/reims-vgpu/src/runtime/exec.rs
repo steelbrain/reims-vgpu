@@ -118,10 +118,16 @@ struct PendingDraw {
     stencil_ref: Option<(u32, u32)>,
     depth_attach: Option<DepthAttachment>,
     stencil_attach: Option<StencilAttachment>,
+    /// First draw of the pass that owns this stencil attachment: the clear is
+    /// its, and every later draw loads what it left.
+    stencil_first_in_pass: bool,
 }
 
 #[derive(Clone, Debug, Default)]
 struct StreamAccum {
+    /// Whether a draw in the current pass has already consumed the stencil
+    /// clear. Reset when the pass publishes its stencil attachment.
+    stencil_pass_started: bool,
     pipeline_ref: u32,
     /// Pending clears for color attachments (load=clear).
     clears: Vec<ColorAttachment>,
@@ -181,6 +187,7 @@ impl StreamAccum {
             stencil_ref: self.stencil_ref,
             depth_attach: self.depth_attach,
             stencil_attach: self.stencil_attach,
+            stencil_first_in_pass: !self.stencil_pass_started,
             ..Default::default()
         }
     }
@@ -447,11 +454,49 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
     // referenced render stage is ready, so replay cannot duplicate clears,
     // fences, compute dispatches, or guest writeback.
     #[cfg(feature = "backend-vulkan")]
-    let translation_pending = streams.iter().fold(false, |pending, stream| {
-        let render_pending = preflight_render_translations(state, host, task_id, stream);
-        let compute_pending = preflight_compute_translations(state, host, task_id, stream);
-        render_pending || compute_pending || pending
-    });
+    let translation_pending = {
+        let mut pending = false;
+        let mut unpublished: Vec<u32> = Vec::new();
+        for stream in &streams {
+            if preflight_render_translations(state, host, task_id, stream, &mut unpublished) {
+                pending = true;
+            }
+            if preflight_compute_translations(state, host, task_id, stream) {
+                pending = true;
+            }
+        }
+        // A pipeline the guest has not finished publishing is asynchronous, not
+        // a malformed one: the same read a moment later succeeds. Retrying the
+        // packet keeps the draw; declining it here is what leaves an icon a
+        // blank rounded square, because the 128x128 render that fills it is the
+        // draw being thrown away.
+        //
+        // Bounded, because a reference that never resolves must not hold the
+        // channel: past the budget the packet executes and the draw declines
+        // with the reason it always did.
+        // A pipeline that resolved is no longer waiting on anything; drop its
+        // clock so the map holds only what is actually outstanding.
+        state
+            .pipeline_unreadable_since
+            .retain(|(task, pipeline_ref), _| {
+                *task != task_id || unpublished.contains(pipeline_ref)
+            });
+        for pipeline_ref in unpublished {
+            let key = (task_id, pipeline_ref);
+            let now = std::time::Instant::now();
+            let since = *state.pipeline_unreadable_since.entry(key).or_insert(now);
+            if now.duration_since(since) < PIPELINE_PUBLISH_WAIT {
+                pending = true;
+            } else {
+                state.pipeline_unreadable_since.remove(&key);
+                crate::observe::fail(format!(
+                    "pipeline_publish_wait_expired task={task_id} ref={pipeline_ref} waited_ms={}",
+                    now.duration_since(since).as_millis()
+                ));
+            }
+        }
+        pending
+    };
     #[cfg(all(feature = "backend-metal", target_os = "macos"))]
     let translation_pending = false;
     if translation_pending {
@@ -586,12 +631,25 @@ fn elapsed_us(started: std::time::Instant) -> u64 {
     u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
 }
 
+/// How long a draw waits for the guest to finish publishing the pipeline object
+/// it names.
+///
+/// Long enough to cover the gap between an object being created on one channel
+/// and referenced from another — measured here as a single miss per task, at
+/// the head of that task's life, on refs the guest goes on to use. Short enough
+/// that a reference which never resolves costs one packet's worth of latency
+/// and then declines with the reason it always did, rather than holding the
+/// channel that carries it.
+#[cfg(feature = "backend-vulkan")]
+const PIPELINE_PUBLISH_WAIT: std::time::Duration = std::time::Duration::from_millis(200);
+
 #[cfg(feature = "backend-vulkan")]
 fn preflight_render_translations<M: HostMemory + HostOps>(
     state: &DeviceState,
     host: &M,
     task_id: u32,
     stream: &[u8],
+    unpublished: &mut Vec<u32>,
 ) -> bool {
     let pipelines = render_pipeline_refs(stream);
     let mut pending = false;
@@ -599,8 +657,13 @@ fn preflight_render_translations<M: HostMemory + HostOps>(
         let Ok((v_air, f_air)) =
             metal_draw::load_render_air_pair(state, host, task_id, pipeline_ref)
         else {
-            // Normal execution emits the precise pipeline/MTLB failure. A
-            // missing plan input is deterministic, not asynchronous work.
+            // Normal execution emits the precise pipeline/MTLB failure. A plan
+            // input that is malformed is deterministic and executes now; one
+            // the guest has not finished publishing is not, and the caller
+            // holds the packet for it.
+            if metal_draw::render_pipeline_unreadable_yet(state, host, task_id, pipeline_ref) {
+                unpublished.push(pipeline_ref);
+            }
             continue;
         };
         if !crate::runtime::m2v_cache::ensure_cached_async(
@@ -1555,6 +1618,8 @@ fn handle_render_record<M: HostMemory + HostOps>(
                         stencil.resolve_texture_ref,
                     ) {
                         acc.stencil_attach = Some(stencil);
+                        // New pass attachments: the next draw owns the clear again.
+                        acc.stencil_pass_started = false;
                     } else {
                         note_depth_stencil_unsupported(task_id, "stencil", &stencil.into());
                     }
@@ -1617,30 +1682,39 @@ fn handle_render_record<M: HostMemory + HostOps>(
                     {
                         out.type11_mappings.push(att.texture_ref);
                     }
-                    if att.load_action == PASS_LOAD_ACTION_CLEAR {
-                        if att.store_action == PASS_STORE_ACTION_STORE {
-                            acc.clears.push(att);
-                        } else {
-                            // Metal Clear + non-Store (e.g. DontCare): the clear
-                            // seed is dropped from `acc.clears`, so a drawn pass
-                            // loads stale content (residue) and a clear-only
-                            // stream never reaches guest pages. We do NOT invent
-                            // DontCare semantics (unknown wire stays unknown) —
-                            // just make the drop visible so a boot reveals whether
-                            // any guest emits it. Deduped per target.
-                            note_clear_dropped(
-                                "nonstore_store_action",
-                                att.texture_ref,
-                                &format!("store_action={} load_action=clear", att.store_action),
-                            );
-                        }
+                    if clear_seeds_the_pass(att.load_action) {
+                        // Load and store actions are independent in Metal, and
+                        // the clear is a property of the load alone: `Clear`
+                        // fills the attachment at pass start whatever happens at
+                        // pass end. `DontCare` says only that the *result* need
+                        // not be preserved afterwards. Vulkan expresses the same
+                        // pair directly — `LOAD_OP_CLEAR` with
+                        // `STORE_OP_DONT_CARE` is an ordinary combination — so
+                        // nothing has to be invented to honour it.
+                        //
+                        // This used to admit `Store` alone and log the rest as
+                        // dropped, pending a boot that showed whether any guest
+                        // emitted the combination. One did: a macOS desktop
+                        // emits it, with `store_action=0` (DontCare) and
+                        // `store_action=2` (MultisampleResolve). The dropped
+                        // seed left the pass loading stale content, which is
+                        // visible from the guest as every window and every
+                        // transient overlay accumulating on screen instead of
+                        // replacing what was there.
+                        //
+                        // The clear-only case stays gated: `apply_clear` makes
+                        // its own `store_action == Store` check before touching
+                        // guest pages, so a pass with no draws and nothing to
+                        // preserve still writes nothing.
+                        acc.clears.push(att);
                     }
                 }
             }
-            // Also keep color0 from command for convenience.
+            // Also keep color0 from command for convenience. Store action is
+            // not consulted here either, for the reason given on the slot loop
+            // above: the clear belongs to the load action alone.
             if cmd.color0.present
-                && cmd.color0.load_action == PASS_LOAD_ACTION_CLEAR
-                && cmd.color0.store_action == PASS_STORE_ACTION_STORE
+                && clear_seeds_the_pass(cmd.color0.load_action)
                 && !acc
                     .clears
                     .iter()
@@ -1713,6 +1787,7 @@ fn handle_render_record<M: HostMemory + HostOps>(
                     },
                     ..acc.bind_snapshot()
                 });
+                acc.stencil_pass_started = true;
             }
         }
         RenderKind::ExecuteCommands if cmd.indirect_command_buffer_ref != 0 => {
@@ -3185,6 +3260,7 @@ fn fill_draw_binds_from_pending(req: &mut metal_draw::DrawEncodeRequest, pd: &Pe
     req.stencil_ref = pd.stencil_ref;
     req.depth_attach = pd.depth_attach;
     req.stencil_attach = pd.stencil_attach;
+    req.stencil_first_in_pass = pd.stencil_first_in_pass;
 }
 
 fn dirty_color_targets<M: HostMemory + HostOps>(
@@ -3270,6 +3346,25 @@ fn note_clear_dropped(reason: &'static str, tex_ref: u32, detail: &str) -> bool 
         ));
     }
     first
+}
+
+/// Does this attachment seed the pass with a clear?
+///
+/// Load and store actions are independent in Metal. `loadAction == Clear` fills
+/// the attachment at pass start whatever the store action says; `storeAction`
+/// only decides whether the result survives the pass. Vulkan states the same
+/// pair directly, so `LOAD_OP_CLEAR` with `STORE_OP_DONT_CARE` needs nothing
+/// invented to express.
+///
+/// Consulting the store action here is what produced on-screen residue: a
+/// macOS desktop emits `Clear` with `store_action=0` (DontCare) and with
+/// `store_action=2` (MultisampleResolve), and dropping those seeds left each
+/// pass loading whatever the attachment held before.
+///
+/// Writing *back* to guest pages is a different question with a different
+/// answer, and [`apply_clear`] asks it separately.
+fn clear_seeds_the_pass(load_action: u16) -> bool {
+    load_action == PASS_LOAD_ACTION_CLEAR
 }
 
 fn apply_clear<M: HostMemory + HostOps>(
@@ -5007,6 +5102,7 @@ mod tests {
             stencil_ref: None,
             depth_attach: None,
             stencil_attach: None,
+            stencil_first_in_pass: true,
         });
         finish_stream(&mut state, &mut host, 1, &mut out, &acc);
         // Unresolvable RT → mrt_request fail before encode (not NoMetal); no clear.
@@ -5111,6 +5207,7 @@ mod tests {
             stencil_ref: None,
             depth_attach: None,
             stencil_attach: None,
+            stencil_first_in_pass: true,
         });
         let mut second = acc.draws[0].clone();
         second.pipeline_ref = 8;
@@ -5258,6 +5355,33 @@ mod tests {
             first.colors[0].target_seed_rgba.as_ref().map(Vec::len),
             Some(16)
         );
+    }
+
+    /// A `Clear` load action seeds the pass whatever the store action is.
+    ///
+    /// The three store actions below are the ones a live macOS desktop was
+    /// measured to emit alongside `Clear`: `Store` (1), `DontCare` (0) and
+    /// `MultisampleResolve` (2). Admitting only `Store` — which this code did —
+    /// dropped the other two, and a pass whose seed is dropped loads whatever
+    /// the attachment held before. From the guest that is windows, menus and
+    /// tooltips piling up on screen instead of replacing what was there.
+    #[test]
+    fn a_clear_load_action_seeds_the_pass_whatever_the_store_action() {
+        // MTLStoreAction: DontCare=0, Store=1, MultisampleResolve=2.
+        for store_action in [0u16, PASS_STORE_ACTION_STORE, 2] {
+            assert!(
+                clear_seeds_the_pass(PASS_LOAD_ACTION_CLEAR),
+                "Clear must seed the pass with store_action={store_action}"
+            );
+        }
+        // Every other load action leaves the attachment alone: Load preserves
+        // it, DontCare leaves it undefined, and neither is a clear.
+        for load_action in [0u16, 1, 3, 4] {
+            if load_action == PASS_LOAD_ACTION_CLEAR {
+                continue;
+            }
+            assert!(!clear_seeds_the_pass(load_action));
+        }
     }
 
     #[test]
@@ -6389,5 +6513,37 @@ mod tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(all(test, feature = "backend-vulkan"))]
+mod publish_wait_tests {
+    use super::*;
+    use crate::model::{DeviceId, PAGE_SHIFT_X86};
+
+    /// A draw whose pipeline object the guest has not finished publishing is
+    /// retried, not lost — that draw is the 128x128 render that fills an app
+    /// icon. The wait is bounded so a reference that never resolves costs one
+    /// packet of latency instead of the channel.
+    #[test]
+    fn an_unpublished_pipeline_is_waited_for_and_then_given_up_on() {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let key = (7u32, 14u32);
+        let now = std::time::Instant::now();
+
+        // First sight starts the clock and is inside the budget.
+        let since = *state.pipeline_unreadable_since.entry(key).or_insert(now);
+        assert!(now.duration_since(since) < PIPELINE_PUBLISH_WAIT);
+
+        // Past the budget the wait ends, and the entry goes with it so the
+        // next reference starts its own clock rather than inheriting this one.
+        state.pipeline_unreadable_since.insert(
+            key,
+            now - PIPELINE_PUBLISH_WAIT - std::time::Duration::from_millis(1),
+        );
+        let since = state.pipeline_unreadable_since[&key];
+        assert!(std::time::Instant::now().duration_since(since) >= PIPELINE_PUBLISH_WAIT);
+        state.pipeline_unreadable_since.remove(&key);
+        assert!(state.pipeline_unreadable_since.is_empty());
     }
 }

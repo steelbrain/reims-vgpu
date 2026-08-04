@@ -1082,6 +1082,12 @@ pub enum StorageImageFormat {
     R32Uint,
     R32Sint,
     R32Float,
+    /// Single- and two-channel 16-bit formats the guest samples but never
+    /// stores through: they have no storage selector, so they reach the engine
+    /// only as sampled textures staged through this enum.
+    R16Unorm,
+    Rg16Unorm,
+    Rg16Uint,
     /// Packed three-channel shared-exponent float; sampled-image only on the
     /// product path (`MTLPixelFormatRGB9E5Float`).
     Rgb9e5Ufloat,
@@ -1096,8 +1102,8 @@ impl StorageImageFormat {
         match self {
             Self::Rgba32Float | Self::Rgba32Uint => 16,
             Self::Rgba16Float | Self::Rgba16Uint => 8,
-            Self::Rg16Float => 4,
-            Self::R16Float | Self::Rg8Unorm => 2,
+            Self::Rg16Float | Self::Rg16Unorm | Self::Rg16Uint => 4,
+            Self::R16Float | Self::Rg8Unorm | Self::R16Unorm => 2,
             Self::R8Unorm => 1,
             Self::Rgba8Uint
             | Self::Rgba8Sint

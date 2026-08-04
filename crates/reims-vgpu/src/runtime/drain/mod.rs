@@ -888,6 +888,16 @@ fn process_root_packet<H: HostMemory + HostOps>(
                 let task_id = ld32(&packet.payload[SET_OBJECT_LIST_TASK_ID..]);
                 let pfn = ld32(&packet.payload[SET_OBJECT_LIST_PFN..]);
                 let count = ld32(&packet.payload[SET_OBJECT_LIST_COUNT..]);
+                // A list with entries but no page is not a list: every resolve
+                // on it computes an address out of the offset alone and the
+                // read is refused. Carry the payload so the field the page
+                // actually arrived in can be read off it.
+                if pfn == 0 && count != 0 {
+                    crate::observe::fail(format!(
+                        "set_object_list_no_page task={task_id} count={count} payload={:02x?}",
+                        &packet.payload[..packet.payload.len().min(32)]
+                    ));
+                }
                 let _ = state.set_object_list(task_id, pfn, count);
             }
         }
@@ -1557,6 +1567,49 @@ fn log_present_page_identity(state: &DeviceState, mapping: u32, w: u32, h: u32) 
     }
 }
 
+/// How long a display packet may be held for an earlier channel's shader
+/// translation before the hold is worth less than what it costs.
+///
+/// The ordering itself is right: publishing a present's retain ahead of the
+/// render packet it should follow shows the guest a frame that has not been
+/// drawn yet. But the guest watchdogs the ring it wrote, and a stall it blames
+/// on the device is a `GPU Reset` — measured on this rail as
+/// `Name Display0 written: 17360 read: 17320`, one 40-byte packet short, with
+/// `iconservicesagent`, `com.apple.dock.extra` and `Spotlight` aborting around
+/// it as their in-flight work was discarded. A frame out of order costs one
+/// frame; the reset costs every frame in flight and the processes waiting on
+/// them.
+///
+/// The budget is wall-clock rather than a poll count because what has to fit
+/// inside it is a translation: the compositor's uber shader takes seconds to
+/// structure on first sight, and a count of drains says nothing about that.
+/// Set well under a watchdog interval so the ring keeps moving while the
+/// translation finishes in the background.
+const PRESENT_ORDER_HOLD_BUDGET: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Has the current display-order hold outlived [`PRESENT_ORDER_HOLD_BUDGET`]?
+///
+/// Starts the clock on the first call of a hold. Says so once when the budget
+/// goes, because from then on presents pass in an order the guest did not ask
+/// for and that has to be visible rather than inferred from a frame that looks
+/// stale.
+fn present_order_hold_budget_spent(state: &mut DeviceState) -> bool {
+    let now = std::time::Instant::now();
+    let since = *state.present_translation_hold_since.get_or_insert(now);
+    if now.duration_since(since) < PRESENT_ORDER_HOLD_BUDGET {
+        return false;
+    }
+    if state.present_translation_hold_mask != 0 {
+        crate::observe::fail(format!(
+            "present_order_hold_expired reason=translation_still_pending              held_ms={} pending_mask={:#x} hold_mask={:#x}              (the ring keeps moving; this present publishes ahead of the render              packet it should have followed)",
+            now.duration_since(since).as_millis(),
+            state.translation_deferred_mask,
+            state.present_translation_hold_mask
+        ));
+        state.present_translation_hold_mask = 0;
+    }
+    true
+}
 /// Present a named mapping to the host console (DisplaySwap / x86 present op6/7).
 fn present_named_mapping<H: HostMemory + HostOps>(
     state: &mut DeviceState,
@@ -1610,7 +1663,7 @@ fn present_named_mapping<H: HostMemory + HostOps>(
     // packet is retried in order without blocking a vCPU or the QEMU main loop.
     let current_bit = 1u32.checked_shl(channel_id).unwrap_or(0);
     let deferred_other = state.translation_deferred_mask & !current_bit;
-    if deferred_other != 0 {
+    if deferred_other != 0 && !present_order_hold_budget_spent(state) {
         if state.present_translation_hold_mask & current_bit == 0 {
             state.present_translation_holds = state.present_translation_holds.saturating_add(1);
             state.present_translation_hold_mask |= current_bit;
@@ -1625,6 +1678,9 @@ fn present_named_mapping<H: HostMemory + HostOps>(
     }
     if state.present_translation_hold_mask & current_bit != 0 {
         state.present_translation_hold_mask &= !current_bit;
+        if state.present_translation_hold_mask == 0 {
+            state.present_translation_hold_since = None;
+        }
         crate::observe::off(format!(
             "present_order_release ch={channel_id} mid={mapping} pending_mask={:#x}",
             state.translation_deferred_mask
@@ -1644,6 +1700,9 @@ fn present_named_mapping<H: HostMemory + HostOps>(
         .map(|m| m.mapping_internal != 0)
         .unwrap_or(false);
     if force {
+        // Same reason as the mapper-request path: a resolve that moves pages
+        // strands any deferred window armed against the old ones.
+        let _ = crate::runtime::storage_flush::flush_mapping_for_guest_read(state, host, mapping);
         let _ = crate::runtime::mapper::resolve_mapping_backing(state, host, mapping);
     }
     // Paint only from the presented surface's own geom — never the
@@ -2872,6 +2931,19 @@ pub fn drain_iosfc<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mut 
                     if let Some(c) = cap {
                         if c.request_type == MAPPER_REQUEST_MAP {
                             let _ = crate::runtime::mapper::apply_capture(state, &c, mapping_id);
+                            // A resolve that re-points this surface at new
+                            // pages retires the ones a deferred render window's
+                            // pixels belong in, and the flush then drops the
+                            // frame outright (`deferred_flush_lost
+                            // reason=map_generation_drift`) rather than write a
+                            // framebuffer into whatever owns that memory now.
+                            // Measured losing icon-sized RGBA16Float surfaces
+                            // and the menu-bar strip that way. Land what is
+                            // pending first, while its pages are still ours; a
+                            // mapping with nothing armed pays nothing.
+                            let _ = crate::runtime::storage_flush::flush_mapping_for_guest_read(
+                                state, host, mapping_id,
+                            );
                             // Eager page-table + device-desc geometry when KVA works.
                             let _ = crate::runtime::mapper::resolve_mapping_backing(
                                 state, host, mapping_id,
@@ -5139,10 +5211,172 @@ pub fn publish_stranded_fifos<H: HostMemory + HostOps>(
         state.pending.iosfc = true;
         published = true;
     }
+    // A translation finishing is a producer advance with no doorbell behind it,
+    // which is the case this whole function exists for — only the producer is
+    // ours, not the guest's, so none of the tests above can see it.
+    //
+    // The packet that deferred is still at its channel's FIFO head, waiting to
+    // be retried. The guest has nothing left to send: it is blocked on the very
+    // work that packet represents, so it rings no doorbell. The async
+    // translation worker stores its result and returns, with no way to say the
+    // packet became runnable. If the channel is not republished here, the retry
+    // never happens and neither side moves again.
+    //
+    // Measured on the Windows rail: a 1.18 MB fragment shader took 9.3 s to
+    // translate, the FIFOs were parked meanwhile, and the guest then sat idle
+    // for thirteen minutes with the translation it was waiting for long since
+    // complete. Republishing costs one drain per poll while a deferral is
+    // outstanding, and stops as soon as the retry clears the mask.
+    if state.translation_deferred_mask != 0 {
+        state.pending.child_mask |= state.translation_deferred_mask;
+        published = true;
+    }
+    // Parked FIFOs need the same rescue, and for the same reason one step later.
+    // `release_translation_order_holds` runs only at the top of a drain, so a
+    // hold that outlives the deferral that caused it needs a drain scheduled to
+    // take it back down — and if the guest is quiet there is nothing to schedule
+    // one. Measured: 14 hold episodes against 7 releases, with the deferred mask
+    // already clear and every FIFO still parked.
+    //
+    // Bit 0 names the root FIFO rather than a channel, so it is routed to
+    // `main_drain`; putting it in `child_mask` would arm channel 0, which is not
+    // what that bit means.
+    if state.translation_order_hold_mask != 0 {
+        let held = state.translation_order_hold_mask;
+        if held & TRANSLATION_ROOT_FIFO_BIT != 0 {
+            state.pending.main_drain = true;
+        }
+        state.pending.child_mask |= held & !TRANSLATION_ROOT_FIFO_BIT;
+        published = true;
+    }
+    // A DisplaySwap parked on present backpressure is the third way to strand a
+    // FIFO, and on the host-window path it is a closed cycle.
+    //
+    // `enqueue_present_scanout` sets `host_action_yield`, which makes
+    // `drain_pending` return at its first line. On the window path the ack that
+    // clears it -- `note_present_paint_consumed` -- runs only inside
+    // `device_drain`, which is the very thing that will not run. There is no
+    // `ScanoutUpdate` on this path either, so `device_scanout_copy`, the other
+    // caller, never fires. Nothing else can lower the flag, and the guest cannot
+    // help: it is waiting for the present it already queued.
+    //
+    // Measured on the Windows rail: guest-side `GPU hang: Name Display0
+    // written: 504 read: 432` repeated 196 times with both ring pointers frozen
+    // at the same values, while `display_vbl` kept ticking and `drain_duty` had
+    // stopped entirely. The 72-byte gap is the DisplaySwap the entry gate is
+    // holding.
+    //
+    // Republishing the channel gets a drain scheduled; the ack inside it clears
+    // the yield and the hold, and the gate re-opens. Costs one drain per poll
+    // while a present is outstanding, which is bounded by
+    // `MAX_UNPAINTED_PRESENTS`.
+    if state.present.backpressure_hold_active || state.pending.host_action_yield {
+        state.pending.child_mask |= state.active_child_mask;
+        published = true;
+    }
     if published {
         host.schedule_bh();
     }
     published
+}
+
+/// How long a woken-less worker must sit on outstanding work before it is a
+/// stall. Present + GPU encode of one heavy frame stays well under this; every
+/// wedge measured so far sat for minutes.
+const STALL_REPORT_AFTER_MS: u64 = 5_000;
+/// One snapshot per this interval while the stall persists.
+const STALL_REPORT_EVERY_MS: u64 = 10_000;
+
+/// Emit a wait-state snapshot when the drain worker has not woken for
+/// [`STALL_REPORT_AFTER_MS`] while something is visibly outstanding.
+///
+/// Every wedge this device has had on the bring-up rail was silent: the worker
+/// stopped waking, the periodic censuses stopped with it (they are emitted
+/// *from* the worker), and the only signal left was a guest watchdog line on a
+/// serial console — or nothing, when the guest waited without a watchdog. A
+/// stall diagnosis needed a human to correlate three logs after the fact. This
+/// line is the device saying it itself, from the poll path, which keeps running
+/// precisely because it is not the thing that wedged.
+///
+/// A quiet worker with clean host-side state is still reported, because the
+/// disagreement that matters may live in guest memory: the guest advances a
+/// child ring's tail with a plain store, and if no doorbell follows, no host
+/// counter moves. The snapshot therefore reads each channel's guest-visible
+/// head/tail out of the root page's register blocks — two 4-byte reads per
+/// channel, the same reads a drain does, nowhere near executing work under the
+/// caller's lock. A guest watchdog said `written: 1240 read: 1208` while every
+/// host counter said "nothing outstanding"; the ring cursors are where that
+/// conflict is visible from our side.
+pub fn report_stall_if_wedged<H: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &H,
+    now_ms: u64,
+) {
+    if state.last_drain_wake_ms == 0
+        || now_ms.saturating_sub(state.last_drain_wake_ms) < STALL_REPORT_AFTER_MS
+        || now_ms.saturating_sub(state.last_stall_report_ms) < STALL_REPORT_EVERY_MS
+    {
+        return;
+    }
+    let fifo_read = state
+        .gfx
+        .fifo_read
+        .load(std::sync::atomic::Ordering::Acquire);
+    // Guest-visible child ring cursors, for every channel whose register block
+    // shows a live cursor pair. `tail != head` is guest work no host counter
+    // knows about.
+    let mut ring_lag = Vec::new();
+    if state.gfx.root_page != 0 {
+        for ch in 1..MAX_CHANNELS as u32 {
+            let Some(regs_off) = child_reg_block_offset(ch) else {
+                continue;
+            };
+            let regs_gpa = state.pfn_gpa(state.gfx.root_page) + regs_off;
+            let (Ok(tail), Ok(head)) = (
+                crate::runtime::host::read_u32(host, regs_gpa + CHILD_REG_TAIL),
+                crate::runtime::host::read_u32(host, regs_gpa + CHILD_REG_HEAD),
+            ) else {
+                continue;
+            };
+            if tail != head {
+                ring_lag.push(format!("ch{ch}:head={head} tail={tail}"));
+            }
+        }
+    }
+    let outstanding = fifo_read != state.gfx.fifo_written
+        || !ring_lag.is_empty()
+        || state.pending.main_drain
+        || state.pending.child_mask != 0
+        || state.pending.iosfc
+        || state.pending.host_action_yield
+        || state.present.backpressure_hold_active
+        || state.present.unpainted_presents != 0
+        || state.translation_deferred_mask != 0
+        || state.translation_order_hold_mask != 0;
+    if !outstanding {
+        return;
+    }
+    state.last_stall_report_ms = now_ms;
+    crate::observe::fail(format!(
+        "STALL drain_wedged idle_ms={} fifo={}..{} control_fifo={:#x} root_page={:#x} \
+         pending_main={} pending_child={:#x} iosfc={} yield={} backpressure={} unpainted={} \
+         deferred={:#x} held={:#x} active_children={:#x} rings=[{}]",
+        now_ms.saturating_sub(state.last_drain_wake_ms),
+        fifo_read,
+        state.gfx.fifo_written,
+        state.gfx.control_fifo,
+        state.gfx.root_page,
+        state.pending.main_drain,
+        state.pending.child_mask,
+        state.pending.iosfc,
+        state.pending.host_action_yield,
+        state.present.backpressure_hold_active,
+        state.present.unpainted_presents,
+        state.translation_deferred_mask,
+        state.translation_order_hold_mask,
+        state.active_child_mask,
+        ring_lag.join(" ")
+    ));
 }
 
 /// Run all pending drains (BH body).
@@ -5234,6 +5468,10 @@ pub(crate) fn fold_rung_child_doorbells(state: &mut DeviceState) {
 }
 
 pub fn drain_pending<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mut H) {
+    // Recorded before the yield check on purpose: the stall reporter separates
+    // "the worker never wakes" from "the worker wakes and cannot proceed", and
+    // a yield-parked wake is the second shape.
+    state.last_drain_wake_ms = crate::observe::elapsed_ms() as u64;
     // A queued present action is part of the ordered device timeline. QEMU
     // cannot paint it while this worker owns the device lock, so later worker
     // wakeups must leave guest work queued until scanout consumes the action.

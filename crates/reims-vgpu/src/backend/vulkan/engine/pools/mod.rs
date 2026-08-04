@@ -166,6 +166,12 @@ pub(crate) fn readback_leases_outstanding() -> usize {
     READBACK_LEASES_OUT.load(Ordering::Acquire)
 }
 
+/// Geometry and stencil-aspect of the kept depth-stencil attachment.
+pub(crate) type DepthStencilKey = (u32, u32, bool);
+/// The image, its memory and its view, as [`ResourcePools::acquire_depth_stencil`]
+/// hands them out.
+pub(crate) type DepthStencilParts = (vk::Image, vk::DeviceMemory, vk::ImageView);
+
 pub(crate) struct ResourcePools {
     /// Size-bucketed free host-visible buffers (TRANSFER_SRC | VERTEX | INDEX | STORAGE).
     staging_free: HashMap<u64, Vec<BufferSlot>>,
@@ -197,6 +203,16 @@ pub(crate) struct ResourcePools {
     /// second acquire, because either one lets a GPU copy overwrite bytes a
     /// live borrow is still reading.
     readback_leased: Vec<LeasedReadback>,
+    /// The depth-stencil attachment, kept across draws rather than built and
+    /// dropped per draw.
+    ///
+    /// A Metal render pass clears its stencil once and then relies on it: one
+    /// draw writes a mask, the next tests against it. Building a fresh image
+    /// for every draw makes that impossible — the second draw loads an image
+    /// that was never written, every fragment fails the test, and what reaches
+    /// the surface is an outline with no fill. Keyed by geometry and by whether
+    /// a stencil aspect is wanted; a change in either disposes the old one.
+    depth_stencil_keep: Option<(DepthStencilKey, DepthStencilParts)>,
     /// Transient sampled-image pool, keyed by exact image and view geometry.
     sampled_free: FreePool<SampledKey, SampledSlot>,
     sampled_live: Vec<SampledSlot>,

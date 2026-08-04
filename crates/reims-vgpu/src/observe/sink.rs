@@ -1,9 +1,11 @@
-//! Temporary bring-up log for metal/scanout (research). Append-only `/tmp/reims-vgpu-draw.log`.
+//! Temporary bring-up log for metal/scanout (research). Append-only
+//! `reims-vgpu-draw.log` under [`log_dir`] — `/tmp` on the Unix rails, the OS
+//! temp directory on Windows, `REIMS_VGPU_LOG_DIR` over both.
 //!
 //! Verbose lines: `REIMS_VGPU_DRAW_LOG=1` only — full-frame logging otherwise stalls the
 //! guest compositor. Failures always append (lightweight, fail-visible).
 //!
-//! ## Offline offline-analysis prefixes (`/tmp/reims-vgpu-fail.log`, always-on)
+//! ## Offline offline-analysis prefixes (`reims-vgpu-fail.log`, always-on)
 //!
 //! | Prefix | Meaning |
 //! | --- | --- |
@@ -53,6 +55,25 @@ static DRAW_FILE: Mutex<Option<File>> = Mutex::new(None);
 enum Sink {
     Fail,
     Draw,
+}
+
+/// Whether the deferred-flush surface census (`REIMS_VGPU_FLUSH_CENSUS=1`) is
+/// active.
+///
+/// Counts the non-zero bytes of each frame as it leaves the resident, which is
+/// the one question the decline side cannot answer: with nothing declining, a
+/// blank icon and an absent material are indistinguishable until you know
+/// whether the surface had any content to begin with.
+pub fn dump_flush_surfaces() -> bool {
+    static CENSUS_INIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    static CENSUS_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !CENSUS_INIT.swap(true, Ordering::Relaxed) {
+        let on = std::env::var_os("REIMS_VGPU_FLUSH_CENSUS")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        CENSUS_ON.store(on, Ordering::Relaxed);
+    }
+    CENSUS_ON.load(Ordering::Relaxed)
 }
 
 pub(crate) fn enabled() -> bool {
@@ -112,22 +133,68 @@ static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
 static FAIL_PATH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 static DRAW_PATH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
+/// Directory holding the always-on sinks and the other host-side artifact dumps
+/// that share their fate (GOP console proxy, compute-stall SPIR-V, the
+/// metal2vulkan handoff last resort).
+///
+/// `REIMS_VGPU_LOG_DIR` overrides, so a run can place the sinks anywhere without
+/// a rebuild. Otherwise the Unix rails keep `/tmp` **literally**: AGENTS.md names
+/// `/tmp/reims-vgpu-fail.log`, and the boot scripts and offline analysis open
+/// that exact path, so resolving through `TMPDIR` would move the log out from
+/// under them on macOS — where it points at a per-user directory a second tool
+/// does not find.
+///
+/// Windows has no `/tmp`. A path spelled that way is drive-relative there, so it
+/// lands on whichever drive the process happens to be on and every line is
+/// dropped when that directory does not exist — the one failure this file exists
+/// to prevent. The OS temp directory is the default there instead.
+pub(crate) fn log_dir() -> std::path::PathBuf {
+    match std::env::var_os("REIMS_VGPU_LOG_DIR") {
+        Some(dir) if !dir.is_empty() => std::path::PathBuf::from(dir),
+        _ => default_log_dir(),
+    }
+}
+
+// Spelled `target_os` rather than the shorter `windows` family predicate on
+// purpose: `crate::lib` states that every host gate is findable by grepping one
+// key, and `cfg(windows)` would not be found by it.
+#[cfg(target_os = "windows")]
+fn default_log_dir() -> std::path::PathBuf {
+    std::env::temp_dir()
+}
+
+#[cfg(not(target_os = "windows"))]
+fn default_log_dir() -> std::path::PathBuf {
+    std::path::PathBuf::from("/tmp")
+}
+
+/// [`log_dir`] joined with `name`, in the `String` form the sink paths are held
+/// in. Lossy conversion is correct here: a sink path that cannot round-trip
+/// through UTF-8 would be unusable by the log readers anyway, and an artifact
+/// written to a mangled name is still better evidence than no artifact.
+pub(crate) fn log_path(name: &str) -> String {
+    log_dir().join(name).to_string_lossy().into_owned()
+}
+
 fn test_path(kind: &str) -> String {
-    format!("/tmp/reims-vgpu-{kind}-test-{}.log", std::process::id())
+    log_path(&format!(
+        "reims-vgpu-{kind}-test-{}.log",
+        std::process::id()
+    ))
 }
 
 pub(crate) fn fail_log_path() -> &'static str {
     #[cfg(test)]
     return FAIL_PATH.get_or_init(|| test_path("fail"));
     #[cfg(not(test))]
-    FAIL_PATH.get_or_init(|| "/tmp/reims-vgpu-fail.log".to_string())
+    FAIL_PATH.get_or_init(|| log_path("reims-vgpu-fail.log"))
 }
 
 pub(crate) fn draw_log_path() -> &'static str {
     #[cfg(test)]
     return DRAW_PATH.get_or_init(|| test_path("draw"));
     #[cfg(not(test))]
-    DRAW_PATH.get_or_init(|| "/tmp/reims-vgpu-draw.log".to_string())
+    DRAW_PATH.get_or_init(|| log_path("reims-vgpu-draw.log"))
 }
 
 /// Test-harness support: point the always-on sinks at per-process files so a
@@ -276,12 +343,18 @@ mod writer {
     }
 
     fn open(path: &str) -> Option<BufWriter<std::fs::File>> {
-        std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .ok()
-            .map(BufWriter::new)
+        match std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            Ok(file) => Some(BufWriter::new(file)),
+            Err(e) => {
+                // The sink is the whole failure-visibility mechanism, so losing
+                // it is the one failure that cannot be reported through itself:
+                // every later decline would vanish and the boot would read as
+                // clean. stderr is the only channel left. Once per process —
+                // `open` is called once per sink from the writer thread.
+                eprintln!("reims-vgpu: cannot open log sink {path}: {e}");
+                None
+            }
+        }
     }
 
     fn writer_loop(rx: Receiver<Msg>, fail_path: String, draw_path: String) {
@@ -755,7 +828,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("clock after epoch")
             .as_nanos();
-        let path = format!("/tmp/reims-vgpu-draw-log-{nonce}.log");
+        let path = log_path(&format!("reims-vgpu-draw-log-{nonce}.log"));
         let moved = format!("{path}.moved");
         let file = Mutex::new(None);
 
@@ -783,10 +856,37 @@ mod tests {
             "fail() must append to the fail log"
         );
         assert_ne!(
-            path, "/tmp/reims-vgpu-fail.log",
+            path,
+            log_path("reims-vgpu-fail.log"),
             "test builds must not share the product fail log — a cargo test \
              run concurrent with a live boot corrupts A/B evidence"
         );
+    }
+
+    /// The always-on sinks are the whole failure-visibility mechanism, so the
+    /// directory they resolve to has to exist and accept a write on whichever
+    /// host is running. `/tmp` is spelled literally on the Unix rails because
+    /// AGENTS.md names `/tmp/reims-vgpu-fail.log`; on Windows that spelling is
+    /// drive-relative and silently swallows every line, which is why the default
+    /// moves to the OS temp directory there. This asserts the property both
+    /// defaults exist to provide, rather than either spelling.
+    #[test]
+    fn log_dir_resolves_to_a_writable_directory() {
+        let dir = log_dir();
+        assert!(dir.is_absolute(), "log dir must be absolute: {dir:?}");
+        assert!(dir.is_dir(), "log dir must already exist: {dir:?}");
+
+        let probe = log_path(&format!(
+            "reims-vgpu-logdir-probe-{}.log",
+            std::process::id()
+        ));
+        assert_eq!(
+            std::path::Path::new(&probe).parent(),
+            Some(dir.as_path()),
+            "log_path must compose onto log_dir"
+        );
+        fs::write(&probe, b"probe").expect("log dir must accept a write");
+        fs::remove_file(&probe).expect("probe cleanup");
     }
 
     #[test]

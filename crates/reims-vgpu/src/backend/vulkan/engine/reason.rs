@@ -37,10 +37,47 @@ pub enum DrawReason {
     GuestRunSampledNot2d { binding: u32 },
     /// More MRT secondary attachments than the render pass can carry.
     SecondaryAttachmentCap { requested: usize, cap: usize },
-    /// A depth test combined with MRT secondaries — the depth attachment is
-    /// appended after the secondaries and the two paths have not been proven
-    /// together.
-    DepthWithSecondaryAttachments,
+    /// The translated module is an unstructured state machine, which this
+    /// host's shader compiler cannot compile in bounded time.
+    ///
+    /// metal2vulkan structures control flow when it can and falls back to a
+    /// relooper state machine when it cannot: one function, one loop, and one
+    /// `OpSwitch` whose case count is the block count, with the next block index
+    /// written to a variable each iteration. Measured on an NVIDIA host, one
+    /// such module — the WindowServer compositor, 2 731 blocks, 2 725 cases —
+    /// held `vkCreateGraphicsPipelines` for over 22 minutes at a full core with
+    /// a flat working set, and never returned. The same driver compiles every
+    /// structured module in that boot in single-digit milliseconds.
+    ///
+    /// Declining costs this shader's draws. Not declining costs the device: the
+    /// call runs on the drain worker under the device lock, so the guest's rings
+    /// stop being consumed and it reports a GPU hang.
+    UnstructuredStateMachineShader { blocks: u32, switch_cases: u32 },
+    /// The translated module is not valid SPIR-V and must not reach the driver.
+    ///
+    /// Specifically: an `OpCompositeInsert` or `OpCompositeExtract` moves an
+    /// image or sampler handle through a composite, which the Logical addressing
+    /// model cannot represent. `spirv-val` rejects it, and a driver given an
+    /// invalid module is free to do anything — on the x86 rail it stopped
+    /// serving the guest entirely, with no other diagnostic anywhere.
+    ///
+    /// This is a translator defect, not a guest one. Declining names it instead
+    /// of letting the process die silently.
+    InvalidTranslatedModule { pipeline_ref: u32 },
+    /// The fragment shader declares a descriptor the draw never bound.
+    ///
+    /// Reading an undefined descriptor is undefined behaviour. The engine builds
+    /// its descriptor layout purely from provided resources, so such a draw both
+    /// samples whatever memory the descriptor happens to address and omits the
+    /// binding from the pipeline layout — reported by a validation layer as
+    /// `VUID-vkCmdDraw-None-08114` plus
+    /// `VUID-VkGraphicsPipelineCreateInfo-layout-07988` on the same binding.
+    ///
+    /// Measured on the x86 rail: windows dragged their previous contents behind
+    /// them and the process eventually faulted. The unbound indices themselves
+    /// are named by the `shader_resource_declared_unbound` line emitted with
+    /// this decline.
+    FragmentDescriptorUnbound { pipeline_ref: u32 },
     /// The device does not advertise `samplerAnisotropy` and the guest sampler
     /// asked for it.
     SamplerAnisotropyUnsupported,
@@ -122,7 +159,9 @@ impl crate::observe::Decline for DrawReason {
             Self::ResidentSampledNot2d { .. } => "resident_sampled_not_2d",
             Self::GuestRunSampledNot2d { .. } => "guest_run_sampled_not_2d",
             Self::SecondaryAttachmentCap { .. } => "secondary_attachment_cap",
-            Self::DepthWithSecondaryAttachments => "depth_with_secondary_attachments",
+            Self::UnstructuredStateMachineShader { .. } => "unstructured_state_machine_shader",
+            Self::InvalidTranslatedModule { .. } => "invalid_translated_module",
+            Self::FragmentDescriptorUnbound { .. } => "fragment_descriptor_unbound",
             Self::SamplerAnisotropyUnsupported => "sampler_anisotropy_unsupported",
             Self::SamplerMirrorClampToEdgeUnsupported => "sampler_mirror_clamp_to_edge_unsupported",
             Self::DualSourceBlendUnsupported => "dual_source_blend_unsupported",
@@ -166,6 +205,14 @@ impl std::fmt::Display for DrawReason {
             }
             Self::SecondaryAttachmentCap { requested, cap } => {
                 write!(f, " requested={requested} cap={cap}")
+            }
+            Self::UnstructuredStateMachineShader {
+                blocks,
+                switch_cases,
+            } => write!(f, " blocks={blocks} switch_cases={switch_cases}"),
+            Self::FragmentDescriptorUnbound { pipeline_ref }
+            | Self::InvalidTranslatedModule { pipeline_ref } => {
+                write!(f, " pipe={pipeline_ref}")
             }
             Self::VertexFormat(reason) => write!(f, " value={}", reason.value()),
             Self::InstanceRateDivisorUnsupported { step_rate } => write!(f, " rate={step_rate}"),
@@ -238,7 +285,12 @@ mod tests {
             requested: 0,
             cap: 0,
         },
-        DrawReason::DepthWithSecondaryAttachments,
+        DrawReason::UnstructuredStateMachineShader {
+            blocks: 0,
+            switch_cases: 0,
+        },
+        DrawReason::InvalidTranslatedModule { pipeline_ref: 0 },
+        DrawReason::FragmentDescriptorUnbound { pipeline_ref: 0 },
         DrawReason::SamplerAnisotropyUnsupported,
         DrawReason::SamplerMirrorClampToEdgeUnsupported,
         DrawReason::ConstantVertexAttribute,

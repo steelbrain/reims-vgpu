@@ -102,6 +102,13 @@ impl ResourcePools {
             device.destroy_image(s.slot.image, None);
         }
         self.sampled_cache_bytes = 0;
+        if let Some((_, (image, memory, view))) = self.depth_stencil_keep.take() {
+            device.destroy_image_view(view, None);
+            device.destroy_image(image, None);
+            if !self.slab.free_image(device, image) {
+                device.free_memory(memory, None);
+            }
+        }
         for s in self.storage_image_free.drain() {
             device.destroy_image_view(s.view, None);
             device.destroy_image(s.image, None);

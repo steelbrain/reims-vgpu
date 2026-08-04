@@ -236,6 +236,45 @@ fn cpu_portability_store_publishes_composite() {
     assert_eq!(state.present.early_front_mapping, mid);
 }
 
+/// Which fragment texture slots must the Vulkan path materialise?
+///
+/// Metal defines sampling an unbound `[[texture(n)]]` as returning zero; Vulkan
+/// has no such rule, and the engine builds its descriptor layout from provided
+/// resources alone. So every declared texture slot has to be enumerable
+/// independently of what the draw bound.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn declared_fragment_textures_are_enumerated_whatever_the_draw_bound() {
+    use metal2vulkan::reflect::ResourceKind as K;
+
+    let live_compositor = [
+        rb(K::Texture, 0),
+        rb(K::Buffer, 0),
+        rb(K::Sampler, 0),
+        rb(K::Buffer, 1),
+        rb(K::Texture, 3),
+        rb(K::StaticSampler, 1),
+    ];
+    assert_eq!(
+        declared_fragment_texture_indices(&live_compositor),
+        vec![0, 3],
+        "both declared textures must be enumerated, including the unbound one"
+    );
+
+    let mixed = [
+        rb(K::TextureArray, 2),
+        rb(K::EmbeddedArgBufferTexture, 9),
+        rb(K::ColorInput, 0),
+        rb(K::StorageImage, 4),
+    ];
+    assert_eq!(declared_fragment_texture_indices(&mixed), vec![2]);
+
+    let repeated = [rb(K::Texture, 5), rb(K::Texture, 1), rb(K::Texture, 5)];
+    assert_eq!(declared_fragment_texture_indices(&repeated), vec![1, 5]);
+
+    assert!(declared_fragment_texture_indices(&[]).is_empty());
+}
+
 #[cfg(feature = "backend-vulkan")]
 #[test]
 fn frag_unbound_scan_reports_missing_standard_kinds_and_embedded_textures() {

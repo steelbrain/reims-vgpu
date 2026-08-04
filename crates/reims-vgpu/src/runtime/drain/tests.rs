@@ -683,6 +683,152 @@ fn present_holds_for_translation_deferred_on_other_channel() {
     assert!(state.present.frame_flush_seen);
 }
 
+/// A finished translation must republish its channel, because nothing else
+/// will.
+///
+/// `publish_stranded_fifos` is the periodic rescue for a producer that advanced
+/// without ringing a doorbell. The async translation worker is exactly such a
+/// producer and the only one that is ours: the deferred packet sits at its FIFO
+/// head, the guest is blocked on it and sends nothing more, and the worker
+/// finishes with no way to say so. Without this the retry never runs and both
+/// sides wait forever — observed as a guest idle for thirteen minutes with the
+/// shader it wanted long since translated.
+///
+/// The guest side is left deliberately quiet here: no root FIFO advance, no
+/// active children, no iosfc work. That is the state the deadlock happens in,
+/// so it is the state the test asserts on.
+#[test]
+fn a_deferred_translation_republishes_its_channel_with_no_guest_activity() {
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    state.gfx.control_fifo = 0x1000;
+    state
+        .gfx
+        .fifo_read
+        .store(state.gfx.fifo_written, std::sync::atomic::Ordering::Release);
+    state.active_child_mask = 0;
+    state.iosfc.consumer = state.iosfc.producer;
+
+    assert!(
+        !publish_stranded_fifos(&mut state, &mut host),
+        "with nothing deferred and the guest quiet there is nothing to publish"
+    );
+
+    state.translation_deferred_mask = 1 << 1;
+    assert!(
+        publish_stranded_fifos(&mut state, &mut host),
+        "a deferred translation must be published even though the guest is quiet"
+    );
+    assert_eq!(
+        state.pending.child_mask & (1 << 1),
+        1 << 1,
+        "the deferred channel must be re-armed so its packet is retried"
+    );
+}
+
+/// A hold that outlives its deferral still needs a drain scheduled to release
+/// it.
+///
+/// `release_translation_order_holds` runs only at the top of a drain. Once the
+/// deferral clears, nothing is left to publish on the guest's behalf, so a quiet
+/// guest means no drain, no release, and FIFOs parked for good — measured as 14
+/// hold episodes against 7 releases with the deferred mask already empty.
+///
+/// Bit 0 is the root FIFO, not channel 0, so it must arrive as `main_drain`.
+#[test]
+fn a_hold_outliving_its_deferral_still_schedules_a_drain() {
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    state.gfx.control_fifo = 0x1000;
+    state
+        .gfx
+        .fifo_read
+        .store(state.gfx.fifo_written, std::sync::atomic::Ordering::Release);
+    state.active_child_mask = 0;
+    state.iosfc.consumer = state.iosfc.producer;
+
+    // The deferral is over; only the parking remains.
+    state.translation_deferred_mask = 0;
+    state.translation_order_hold_mask = TRANSLATION_ROOT_FIFO_BIT | (1 << 2);
+
+    assert!(
+        publish_stranded_fifos(&mut state, &mut host),
+        "a parked FIFO must be published even with nothing deferred"
+    );
+    assert!(
+        state.pending.main_drain,
+        "the root FIFO bit must arrive as main_drain, not as channel 0"
+    );
+    assert_eq!(
+        state.pending.child_mask & (1 << 2),
+        1 << 2,
+        "held child channels must be re-armed"
+    );
+    assert_eq!(
+        state.pending.child_mask & TRANSLATION_ROOT_FIFO_BIT,
+        0,
+        "the root bit must not be armed as a child channel"
+    );
+}
+
+/// A present held on backpressure must get a drain scheduled, or the ack that
+/// would release it can never run.
+///
+/// On the host-window path this is a closed cycle: `host_action_yield` makes
+/// `drain_pending` return immediately, and the only thing that clears it —
+/// `note_present_paint_consumed` — runs inside the drain that will not happen.
+/// The guest cannot break it either; it is waiting on the present it queued.
+/// Observed as a guest `GPU hang: Name Display0` repeating with both ring
+/// pointers frozen.
+#[test]
+fn a_present_held_on_backpressure_schedules_a_drain() {
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    state.gfx.control_fifo = 0x1000;
+    state
+        .gfx
+        .fifo_read
+        .store(state.gfx.fifo_written, std::sync::atomic::Ordering::Release);
+    state.iosfc.consumer = state.iosfc.producer;
+    state.translation_deferred_mask = 0;
+    state.translation_order_hold_mask = 0;
+    // `control_fifo` is zero here on purpose. That is the state the wedge was
+    // measured in: the guest has stopped touching the control ring entirely, so
+    // the `active_child_mask` branch above is unreachable and cannot mask the
+    // defect. With a live control FIFO this function republishes active children
+    // anyway and the test would pass without the fix, proving nothing.
+    state.gfx.control_fifo = 0;
+    state.active_child_mask = 1 << 3;
+    state.pending.child_mask = 0;
+
+    assert!(
+        !publish_stranded_fifos(&mut state, &mut host),
+        "nothing is outstanding yet, so nothing should be published"
+    );
+
+    // The yield alone is enough to wedge the drain, so it is enough to rescue.
+    state.pending.host_action_yield = true;
+    assert!(
+        publish_stranded_fifos(&mut state, &mut host),
+        "a present-yielded drain must be rescheduled"
+    );
+    assert_eq!(
+        state.pending.child_mask & (1 << 3),
+        1 << 3,
+        "the display channel must be re-armed so the ack can run"
+    );
+
+    // The entry-gate hold is the same wedge one step earlier.
+    state.pending.host_action_yield = false;
+    state.pending.child_mask = 0;
+    state.present.backpressure_hold_active = true;
+    assert!(
+        publish_stranded_fifos(&mut state, &mut host),
+        "a backpressure-held DisplaySwap must be rescheduled"
+    );
+    assert_eq!(state.pending.child_mask & (1 << 3), 1 << 3);
+}
+
 /// The currently executing display channel cannot be an overtaken sibling
 /// and is excluded from the proxy mask.
 #[test]
@@ -4061,4 +4207,31 @@ fn every_short_control_packet_names_itself() {
             "a short packet was dropped without naming itself: {reason}"
         );
     }
+}
+
+/// The display-order hold is correct but must not be unbounded.
+///
+/// While it holds, the guest's ring stops being consumed. The guest watchdogs
+/// that ring and calls the stall a device fault: the rail's `GPU Reset` reports
+/// name `Display0 written: 17360 read: 17320`, one packet short. A reset
+/// discards every frame in flight, so the hold has to give up while a frame out
+/// of order is still the cheaper answer.
+#[test]
+fn a_display_order_hold_gives_up_before_the_guest_calls_it_a_gpu_fault() {
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    state.translation_deferred_mask = 0b100;
+    state.present_translation_hold_mask = 0b010;
+
+    // A hold that just started is inside the budget and keeps ordering.
+    assert!(!present_order_hold_budget_spent(&mut state));
+    assert!(state.present_translation_hold_since.is_some());
+    assert_eq!(state.present_translation_hold_mask, 0b010);
+
+    // One that has outlived it gives up, and clears the hold so the release
+    // path does not later report a hold that was never honoured.
+    state.present_translation_hold_since = Some(
+        std::time::Instant::now() - PRESENT_ORDER_HOLD_BUDGET - std::time::Duration::from_millis(1),
+    );
+    assert!(present_order_hold_budget_spent(&mut state));
+    assert_eq!(state.present_translation_hold_mask, 0);
 }

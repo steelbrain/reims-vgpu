@@ -163,9 +163,137 @@ impl std::error::Error for M2vCacheDecline {}
 /// reflection is the single source of truth for stage-interface facts so the
 /// consumer never re-parses AIR or re-walks the emitted SPIR-V. `spirv` is the
 /// post-`repair_layout` module (byte-identical to what the plain cache returned).
+/// A module's basic-block count and the case count of its largest `OpSwitch`.
+///
+/// The pair identifies a relooper state machine, which is what metal2vulkan
+/// emits when it cannot structure a function's control flow: one loop, one
+/// switch, and one case per basic block, with the next block index written to a
+/// variable each iteration. In that shape the two numbers are equal; in
+/// structured code a switch has a handful of cases and many blocks belong to no
+/// switch at all. Measured on one boot's modules: the vertex shader was
+/// 13 blocks / 4 cases, the compositor fragment 2 731 / 2 725.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ModuleShape {
+    pub blocks: u32,
+    pub max_switch_cases: u32,
+    /// An `OpCompositeInsert` or `OpCompositeExtract` whose object is an opaque
+    /// handle — an image, a sampler or a sampled image.
+    ///
+    /// This is invalid SPIR-V, not a style question. Under the Logical
+    /// addressing model an opaque handle has no representation inside a
+    /// composite, so the type at the indexed path can never be the handle's own
+    /// type. `spirv-val` puts it plainly:
+    ///
+    /// ```text
+    /// The Object type (OpTypeImage) does not match the type that results from
+    /// indexing into the Composite (OpTypePointer).
+    ///   %193 = OpCompositeInsert %_struct_51 %84 %55 0 0
+    /// ```
+    ///
+    /// Creating a shader module from an invalid one is licence for the driver to
+    /// do anything, and here it did: three consecutive boots of a macOS desktop
+    /// stopped being served at the compute pipeline carrying exactly this
+    /// instruction, with no panic, no Vulkan error, no device loss and no host
+    /// crash record.
+    pub opaque_in_composite: bool,
+}
+
+impl ModuleShape {
+    /// Does this look like a relooper state machine rather than structured code?
+    ///
+    /// Two conditions, both needed. The switch must dispatch essentially every
+    /// block — that is the state machine's defining shape, and no structured
+    /// shader approaches it. And the module must be past the translator's own
+    /// relooper block cap, which is the size at which metal2vulkan itself
+    /// declines to structure; below it a large switch is a real guest switch and
+    /// compiles fine.
+    ///
+    /// Using the translator's cap rather than a number chosen here keeps the
+    /// threshold tied to the thing that produces the shape.
+    pub fn is_relooper_state_machine(&self) -> bool {
+        const RELOOPER_MAX_BLOCKS: u32 = 1024;
+        self.blocks > RELOOPER_MAX_BLOCKS
+            && self.max_switch_cases.saturating_mul(10) >= self.blocks.saturating_mul(9)
+    }
+}
+
+/// Count basic blocks and the largest `OpSwitch`'s case count.
+///
+/// Bounds-checked word walk over the little-endian SPIR-V stream, header
+/// skipped, in the same shape as [`spirv_uses_builtin`]. `OpLabel` is 248 and
+/// starts a basic block; `OpSwitch` is 251 and carries
+/// `[selector, default, (literal, label)...]`, so its case count is
+/// `(word_count - 3) / 2`.
+fn spirv_module_shape(words: &[u32]) -> ModuleShape {
+    let mut shape = ModuleShape::default();
+    // <id>s whose type is an opaque handle. Seeded from the type declarations
+    // and propagated through the few instructions that can carry one.
+    let mut opaque_types: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let mut i = 5; // skip header
+    while i < words.len() {
+        let word_count = (words[i] >> 16) as usize;
+        let opcode = words[i] & 0xffff;
+        if word_count == 0 || i + word_count > words.len() {
+            break;
+        }
+        match opcode {
+            // OpTypeImage / OpTypeSampler / OpTypeSampledImage: record the
+            // result <id> so the composite check below can recognise a handle
+            // of that type without a full type walk.
+            OP_TYPE_IMAGE..=OP_TYPE_SAMPLED_IMAGE if word_count >= 2 => {
+                opaque_types.insert(words[i + 1]);
+            }
+            // Every other type-declaring or value-producing instruction whose
+            // result type is opaque makes its result opaque too. Only the ones
+            // that can name an image are worth following: OpLoad (61),
+            // OpSampledImage (86), OpImage (100), OpCopyObject (83) and
+            // OpFunctionParameter (55) all carry `result-type, result-id`.
+            55 | 61 | 83 | 86 | 100
+                if word_count >= 3 && opaque_types.contains(&words[i + 1]) =>
+            {
+                opaque_types.insert(words[i + 2]);
+            }
+            248 => shape.blocks = shape.blocks.saturating_add(1),
+            251 if word_count >= 3 => {
+                let cases = ((word_count - 3) / 2) as u32;
+                shape.max_switch_cases = shape.max_switch_cases.max(cases);
+            }
+            // OpCompositeInsert: result-type, result-id, object, composite, ...
+            // The object is word 3.
+            OP_COMPOSITE_INSERT
+                if word_count >= 5 && opaque_types.contains(&words[i + 3]) =>
+            {
+                shape.opaque_in_composite = true;
+            }
+            // OpCompositeExtract: result-type, result-id, composite, ... — an
+            // opaque *result type* means a handle is being read back out of a
+            // composite it could never have been put into.
+            OP_COMPOSITE_EXTRACT
+                if word_count >= 4 && opaque_types.contains(&words[i + 1]) =>
+            {
+                shape.opaque_in_composite = true;
+            }
+            _ => {}
+        }
+        i += word_count;
+    }
+    shape
+}
+
+/// The three opaque-handle type declarations, contiguous in the SPIR-V core
+/// grammar: `OpTypeImage`, `OpTypeSampler`, `OpTypeSampledImage`.
+const OP_TYPE_IMAGE: u32 = 25;
+const OP_TYPE_SAMPLED_IMAGE: u32 = 27;
+/// `OpCompositeInsert`, from the SPIR-V core grammar.
+const OP_COMPOSITE_INSERT: u32 = 82;
+/// `OpCompositeExtract`, likewise.
+const OP_COMPOSITE_EXTRACT: u32 = 81;
+
 pub struct CachedShader {
     pub spirv: Vec<u8>,
     pub reflection: Arc<ShaderReflection>,
+    /// Block/switch shape, computed once when the module is cached.
+    pub shape: ModuleShape,
     /// The same module as u32 words, materialized once — draw paths clone the
     /// `Arc`, never re-collect per draw (was a full-module copy ×2 per draw).
     pub words: Arc<Vec<u32>>,
@@ -182,9 +310,11 @@ impl CachedShader {
             .chunks_exact(4)
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
+        let shape = spirv_module_shape(&words);
         Self {
             spirv,
             reflection,
+            shape,
             words: Arc::new(words),
             frag_reloc: Mutex::new(HashMap::new()),
         }
@@ -310,9 +440,17 @@ fn translate_air(air: &[u8], stage: Stage) -> M2vResult<CachedShader> {
     // Reflected translate: byte-identical SPIR-V PLUS the stage-interface facade.
     // `reflection.datalayout` carries the source `target datalayout` the sanitizer
     // strips, so the post-emit ABI reconciliation below no longer re-reads `k.ll`.
-    let (spirv, reflection) =
-        metal2vulkan::translate_reflected(path.to_str().unwrap_or(name), stage, &tmp)
-            .map_err(|e| translate_decline(stage, e.to_string()))?;
+    // Validated: `Ok` from the plain entry can carry bytes no tier validated, and
+    // those go straight to `vkCreate*Pipelines`. An NVIDIA driver segfaults on
+    // one and takes the process with it, with nothing in the validation log
+    // because the module never reaches a layer that would reject it.
+    let (spirv, reflection) = metal2vulkan::translate_reflected_validated(
+        path.to_str().unwrap_or(name),
+        stage,
+        &tmp,
+        metal2vulkan::passes::TransformOptions::default(),
+    )
+    .map_err(|e| translate_decline(stage, e.to_string()))?;
     finish_translated(spirv, reflection, stage)
 }
 
@@ -327,7 +465,7 @@ fn translate_kernel_air(air: &[u8], local_size: [u32; 3]) -> M2vResult<CachedSha
         kernel_local_size: local_size,
         ..Default::default()
     };
-    let (spirv, reflection) = metal2vulkan::translate_reflected_with_options(
+    let (spirv, reflection) = metal2vulkan::translate_reflected_validated(
         path.to_str().unwrap_or("k.air"),
         Stage::Kernel,
         &tmp,
@@ -750,6 +888,158 @@ pub fn reset_for_test() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build a SPIR-V word stream carrying `blocks` `OpLabel`s and one
+    /// `OpSwitch` with `cases` cases. Only the two opcodes the shape scanner
+    /// reads are emitted — this is a probe for the scanner, not a valid module.
+    fn shaped_module(blocks: u32, cases: u32) -> Vec<u32> {
+        const OP_LABEL: u32 = 248;
+        const OP_SWITCH: u32 = 251;
+        let mut w = vec![0x0723_0203, 0x0001_0500, 0, 1, 0]; // 5-word header
+        for _ in 0..blocks {
+            w.push((2 << 16) | OP_LABEL);
+            w.push(1);
+        }
+        if cases > 0 {
+            let word_count = 3 + cases * 2;
+            w.push((word_count << 16) | OP_SWITCH);
+            w.push(1); // selector
+            w.push(2); // default label
+            for c in 0..cases {
+                w.push(c);
+                w.push(3);
+            }
+        }
+        w
+    }
+
+    /// The scanner must read the two numbers the discriminator is built on.
+    #[test]
+    fn the_module_shape_scanner_counts_blocks_and_the_widest_switch() {
+        let shape = spirv_module_shape(&shaped_module(2731, 2725));
+        assert_eq!(shape.blocks, 2731);
+        assert_eq!(shape.max_switch_cases, 2725);
+
+        // A module with no switch at all still reports its blocks.
+        let plain = spirv_module_shape(&shaped_module(13, 0));
+        assert_eq!(plain.blocks, 13);
+        assert_eq!(plain.max_switch_cases, 0);
+
+        // Truncated stream: stop, do not read past the end.
+        let mut short = shaped_module(4, 0);
+        short.truncate(6);
+        assert!(spirv_module_shape(&short).blocks <= 4);
+    }
+
+    /// The discriminator separates the two real modules that motivated it, and
+    /// does not fire on a large *structured* switch.
+    ///
+    /// Both shapes are measured, from one boot of the x86 guest: the vertex
+    /// shader of pipe 48 and the compositor fragment shader that held
+    /// `vkCreateGraphicsPipelines` past 22 minutes.
+    /// An image handle inserted into a composite is spotted; ordinary composite
+    /// work is not.
+    ///
+    /// The positive case is the shape of the real instruction, taken from the
+    /// module a live macOS desktop was translating when the host process stopped
+    /// being served three boots in a row:
+    ///
+    /// ```text
+    /// %193 = OpCompositeInsert %_struct_51 %84 %55 0 0
+    /// ```
+    ///
+    /// where `%84` is an `OpLoad` of an `OpTypeImage` variable. `spirv-val`
+    /// rejects it — under the Logical addressing model an opaque handle has no
+    /// representation inside a composite — and a shader module built from an
+    /// invalid one lets the driver do anything.
+    ///
+    /// The negative case matters just as much: `OpCompositeInsert` is ordinary
+    /// and frequent, so a check that fired on all of it would decline nearly
+    /// every shader.
+    #[test]
+    fn an_opaque_handle_inside_a_composite_is_detected() {
+        // (opcode | word_count << 16), then operands.
+        fn op(opcode: u32, operands: &[u32]) -> Vec<u32> {
+            let mut out = vec![((operands.len() as u32 + 1) << 16) | opcode];
+            out.extend_from_slice(operands);
+            out
+        }
+        fn module(body: &[Vec<u32>]) -> Vec<u32> {
+            let mut words = vec![0x0723_0203, 0x0001_0300, 0, 1, 0];
+            for instruction in body {
+                words.extend_from_slice(instruction);
+            }
+            words
+        }
+
+        // %10 = OpTypeImage, %11 = OpTypePointer to it, %12 = OpVariable,
+        // %13 = OpLoad %10 %12  -> %13 is an image handle,
+        // %14 = OpCompositeInsert %20 %13 %21 0 0  -> the invalid instruction.
+        let with_image = module(&[
+            op(25, &[10, 1, 1, 0, 0, 0, 0, 1, 0]), // OpTypeImage
+            op(61, &[10, 13, 12]),                 // OpLoad, result type %10
+            op(82, &[20, 14, 13, 21, 0, 0]),       // OpCompositeInsert, object %13
+        ]);
+        assert!(spirv_module_shape(&with_image).opaque_in_composite);
+
+        // A sampler handle counts too, and so does reading one back out.
+        let extract_sampler = module(&[
+            op(26, &[10]),                   // OpTypeSampler
+            op(81, &[10, 14, 21, 0]),        // OpCompositeExtract, result type %10
+        ]);
+        assert!(spirv_module_shape(&extract_sampler).opaque_in_composite);
+
+        // Ordinary composite work on non-opaque types: must stay silent. Same
+        // instructions, but the object and result types are a plain float.
+        let ordinary = module(&[
+            op(25, &[10, 1, 1, 0, 0, 0, 0, 1, 0]), // OpTypeImage %10 (declared, unused)
+            op(22, &[30]),                         // OpTypeFloat %30
+            op(61, &[30, 31, 32]),                 // OpLoad %30 %31
+            op(82, &[33, 34, 31, 35, 0]),          // OpCompositeInsert of the float
+            op(81, &[30, 36, 35, 0]),              // OpCompositeExtract of a float
+        ]);
+        assert!(!spirv_module_shape(&ordinary).opaque_in_composite);
+
+        // An empty module declares nothing and inserts nothing.
+        assert!(!spirv_module_shape(&module(&[])).opaque_in_composite);
+    }
+
+    #[test]
+    fn only_a_relooper_state_machine_is_declined() {
+        // Measured: pipe 48 vertex, structured, compiled in milliseconds.
+        let vertex = ModuleShape {
+            blocks: 13,
+            max_switch_cases: 4,
+            ..ModuleShape::default()
+        };
+        assert!(!vertex.is_relooper_state_machine());
+
+        // Measured: pipe 48 fragment, the state machine that never compiled.
+        let compositor = ModuleShape {
+            blocks: 2731,
+            max_switch_cases: 2725,
+            ..ModuleShape::default()
+        };
+        assert!(compositor.is_relooper_state_machine());
+
+        // A genuinely large guest switch, but structured: most blocks are not
+        // cases. Must not be declined.
+        let big_structured = ModuleShape {
+            blocks: 4000,
+            max_switch_cases: 300,
+            ..ModuleShape::default()
+        };
+        assert!(!big_structured.is_relooper_state_machine());
+
+        // A small function that happens to be almost all switch: below the
+        // translator's relooper cap, so it was structured and compiles.
+        let small_dispatch = ModuleShape {
+            blocks: 200,
+            max_switch_cases: 199,
+            ..ModuleShape::default()
+        };
+        assert!(!small_dispatch.is_relooper_state_machine());
+    }
 
     fn test_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

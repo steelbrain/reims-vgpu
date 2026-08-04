@@ -201,6 +201,32 @@ fn frag_unbound_scan(
     (unbound, embedded)
 }
 
+/// The fragment texture slots the shader declares, in Metal index space.
+///
+/// A Metal shader may declare a `[[texture(n)]]` the draw never binds, and
+/// Metal defines that: sampling an unbound texture returns zero. Vulkan has no
+/// such rule — a descriptor the pipeline uses must exist in the layout and be
+/// valid, or the read is undefined. The Vulkan render path therefore has to
+/// materialise a zero texture for every declared-but-unbound slot, and this is
+/// the enumeration it fills from.
+///
+/// `EmbeddedArgBufferTexture` is deliberately excluded: it is not a directly
+/// bindable slot and the render path declines it by its own name.
+#[cfg(feature = "backend-vulkan")]
+fn declared_fragment_texture_indices(
+    bindings: &[metal2vulkan::reflect::ResourceBinding],
+) -> Vec<u32> {
+    use metal2vulkan::reflect::ResourceKind;
+    let mut out: Vec<u32> = bindings
+        .iter()
+        .filter(|rb| matches!(rb.kind, ResourceKind::Texture | ResourceKind::TextureArray))
+        .map(|rb| rb.metal_index)
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
 #[cfg(feature = "backend-vulkan")]
 fn reflected_sampled_binding_collision(
     vertex: &metal2vulkan::reflect::ShaderReflection,
@@ -364,6 +390,14 @@ pub struct DrawEncodeRequest {
     pub stencil_ref: Option<(u32, u32)>,
     pub depth_attach: Option<DepthAttachment>,
     pub stencil_attach: Option<StencilAttachment>,
+    /// First draw of the Metal render pass that owns this stencil attachment.
+    ///
+    /// A pass clears its stencil once and then relies on it: one draw writes a
+    /// mask, the next tests against it. Flattening the pass into per-draw
+    /// requests loses that ordering, so the pass load action alone would clear
+    /// before every draw and the mask would never survive to be tested. This
+    /// says which draw the clear belongs to; the rest load.
+    pub stencil_first_in_pass: bool,
     /// Records 2+ of a resident render-pass chain: load the prior record's
     /// content from the engine target instead of a CPU seed. Set by the exec
     /// chain loop (Vulkan rail only); default false.
@@ -775,17 +809,66 @@ fn load_render_pipeline<M: HostMemory + HostOps>(
     task_id: u32,
     pipeline_ref: u32,
 ) -> Option<RenderPipelineDescriptor> {
-    let entry = objects::lookup_list_entry(state, host, task_id, pipeline_ref)?;
+    // Five different losses used to share one `PipelineMissing` decline, which
+    // named the pipeline but not what about it could not be resolved. The draw
+    // is gone either way, so the reason is the only thing that separates "the
+    // guest has not published this object yet" from "we cannot read the object
+    // it published" — and those want opposite fixes.
+    let say = |why: &str| {
+        crate::observe::fail(format!(
+            "render_pipeline_unresolved reason={why} task={task_id} ref={pipeline_ref}"
+        ));
+        None::<RenderPipelineDescriptor>
+    };
+    let Some(entry) = objects::lookup_list_entry(state, host, task_id, pipeline_ref) else {
+        return say("object_list_entry_absent");
+    };
     // Live object-list: render pipeline is type-7 with subtype 0x0e.
     if entry.object_type != OBJECT_TYPE_TYPE7 {
-        return None;
+        return say("object_type_not_type7");
     }
-    let desc = objects::read_descriptor(state, host, task_id, &entry)?;
-    let p = decode_render_pipeline_descriptor(&desc).ok()?;
+    let Some(desc) = objects::read_descriptor(state, host, task_id, &entry) else {
+        return say("descriptor_read_failed");
+    };
+    let Ok(p) = decode_render_pipeline_descriptor(&desc) else {
+        return say("descriptor_decode_failed");
+    };
     if p.vertex_func_ref == 0 || p.fragment_func_ref == 0 {
+        crate::observe::fail(format!(
+            "render_pipeline_unresolved reason=function_ref_unbound task={task_id} ref={pipeline_ref} vtx={} frag={} object={} mesh={}",
+            p.vertex_func_ref, p.fragment_func_ref, p.object_func_ref, p.mesh_func_ref
+        ));
         return None;
     }
     Some(p)
+}
+
+/// Is this pipeline object merely not readable *yet*?
+///
+/// The five ways `load_render_pipeline` fails split in two. An entry that is
+/// absent from the task's object list, or a descriptor whose guest page is not
+/// mapped at this instant, is asynchronous: the guest is still publishing it,
+/// and the same read a moment later succeeds. An entry of the wrong type, a
+/// descriptor that will not decode, or one that decodes with no function bound
+/// is deterministic — waiting cannot change it.
+///
+/// The distinction decides whether the packet is retried or the draw is lost,
+/// so it is drawn from the same reads `load_render_pipeline` makes rather than
+/// from its collapsed `None`.
+#[cfg(feature = "backend-vulkan")]
+pub(crate) fn render_pipeline_unreadable_yet<M: HostMemory + HostOps>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    pipeline_ref: u32,
+) -> bool {
+    let Some(entry) = objects::lookup_list_entry(state, host, task_id, pipeline_ref) else {
+        return true;
+    };
+    if entry.object_type != OBJECT_TYPE_TYPE7 {
+        return false;
+    }
+    objects::read_descriptor(state, host, task_id, &entry).is_none()
 }
 
 /// Resolve immutable AIR inputs for a render pipeline before executing its

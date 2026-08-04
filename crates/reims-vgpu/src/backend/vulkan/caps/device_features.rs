@@ -139,10 +139,68 @@ pub struct DeviceFeatures {
     /// on it and otherwise leaves the sample fail-visible.
     pub sampled_r32f_linear_filter: bool,
     pub storage16: bool,
+    /// 16-bit types in shader `Input`/`Output` storage classes — i.e. half
+    /// varyings passed between stages.
+    ///
+    /// Part of the same `VkPhysicalDevice16BitStorageFeatures` struct as
+    /// [`Self::storage16`] and separately toggled, so asking for one does not
+    /// grant the other. Metal's `half` interpolants land here, and the guest
+    /// uses them: `vkCreateShaderModule(): SPIR-V contains a 16-bit OpVariable
+    /// with Output Storage Class, but storageInputOutput16 was not enabled`
+    /// (`VUID-RuntimeSpirv-storageInputOutput16-11162`).
+    pub storage_input_output16: bool,
     pub storage8: bool,
     pub float16: bool,
     pub int8: bool,
     pub shader_output_viewport_index: bool,
+    /// Fragment shaders may write storage buffers and images.
+    ///
+    /// Not spec-mandatory, and not requested until a validation layer said what
+    /// the guest was actually doing: `Set 0, Binding 104`,
+    /// `VK_DESCRIPTOR_TYPE_STORAGE_BUFFER`, written from
+    /// `VK_SHADER_STAGE_FRAGMENT_BIT` with the feature off — ten reports in one
+    /// boot (`VUID-RuntimeSpirv-NonWritable-06340/06341`). A fragment store
+    /// without it is undefined behaviour, which is the licence a driver needs to
+    /// do anything at all, including take the process down.
+    pub fragment_stores_and_atomics: bool,
+    /// Per-attachment blend state may differ between MRT attachments.
+    ///
+    /// Likewise measured rather than assumed: the guest's compositor builds a
+    /// pipeline whose `pAttachments[1]` differs from `pAttachments[0]`
+    /// (`VUID-VkPipelineColorBlendStateCreateInfo-pAttachments-00605`). Without
+    /// the feature Vulkan requires every attachment to carry identical blend
+    /// state, so the pipeline the guest asked for cannot be built honestly.
+    pub independent_blend: bool,
+    /// Vertex-stage shaders may write storage buffers and images.
+    ///
+    /// The vertex-stage twin of [`Self::fragment_stores_and_atomics`], and named
+    /// by the same measurement: `Set 0, Binding 0` and `Binding 1`, storage
+    /// buffers, written from `VK_SHADER_STAGE_VERTEX_BIT`
+    /// (`VUID-RuntimeSpirv-NonWritable-06341`).
+    pub vertex_pipeline_stores_and_atomics: bool,
+    /// 64-bit integers in shaders.
+    ///
+    /// The translated modules declare SPIR-V `Capability Int64`
+    /// (`VUID-VkShaderModuleCreateInfo-pCode-08740`), which AIR reaches for
+    /// through Metal's `long`/`ulong` and through 64-bit address arithmetic.
+    /// Declaring a capability the device was not asked for makes the module
+    /// invalid, and an invalid module is licence for the driver to do anything.
+    pub shader_int64: bool,
+    /// `VK_EXT_shader_demote_to_helper_invocation` is present and its feature
+    /// bit is supported.
+    ///
+    /// The translated modules declare SPIR-V `Capability
+    /// DemoteToHelperInvocation` — Metal's `discard_fragment()` lowers to it —
+    /// and a module declaring a capability the device was not asked for is
+    /// invalid (`VUID-VkShaderModuleCreateInfo-pCode-08740`, five reports in one
+    /// boot).
+    ///
+    /// Reached through the EXT rather than the Vulkan 1.3 core struct that
+    /// promoted it: the support matrix's baseline is 1.2, and `caps::gate`
+    /// enforces that no 1.3 core symbol appears in the crate. The EXT is the
+    /// 1.2-era spelling of the same capability, so nothing about the baseline
+    /// has to move.
+    pub shader_demote_to_helper_invocation: bool,
     pub mirror_clamp_to_edge: MirrorClampToEdge,
     /// `VkPhysicalDeviceFeatures::dualSrcBlend` — whether a pipeline may name
     /// the `SRC1_*` blend factors, which read the fragment shader's second
@@ -179,6 +237,19 @@ impl DeviceFeatures {
             .shader_storage_image_extended_formats(self.storage_image_extended_formats)
             .shader_storage_image_write_without_format(self.storage_image_write_without_format)
             .dual_src_blend(self.dual_src_blend)
+            .fragment_stores_and_atomics(self.fragment_stores_and_atomics)
+            .independent_blend(self.independent_blend)
+            .vertex_pipeline_stores_and_atomics(self.vertex_pipeline_stores_and_atomics)
+            .shader_int64(self.shader_int64)
+    }
+
+    /// `VK_EXT_shader_demote_to_helper_invocation`'s feature struct, chained
+    /// only when the device advertises the extension.
+    pub fn enabled_demote_to_helper(
+        &self,
+    ) -> vk::PhysicalDeviceShaderDemoteToHelperInvocationFeaturesEXT<'static> {
+        vk::PhysicalDeviceShaderDemoteToHelperInvocationFeaturesEXT::default()
+            .shader_demote_to_helper_invocation(self.shader_demote_to_helper_invocation)
     }
 
     /// The Vulkan 1.2 features to enable.
@@ -197,6 +268,7 @@ impl DeviceFeatures {
     pub fn enabled_16bit_storage(&self) -> vk::PhysicalDevice16BitStorageFeatures<'static> {
         vk::PhysicalDevice16BitStorageFeatures::default()
             .storage_buffer16_bit_access(self.storage16)
+            .storage_input_output16(self.storage_input_output16)
     }
 
     /// 8-bit storage-buffer access.
@@ -217,6 +289,9 @@ impl DeviceFeatures {
         let mut out = Vec::new();
         if self.mirror_clamp_to_edge == MirrorClampToEdge::KhrExtension {
             out.push(vk::KHR_SAMPLER_MIRROR_CLAMP_TO_EDGE_NAME.as_ptr());
+        }
+        if self.shader_demote_to_helper_invocation {
+            out.push(vk::EXT_SHADER_DEMOTE_TO_HELPER_INVOCATION_NAME.as_ptr());
         }
         out
     }
@@ -240,11 +315,19 @@ pub unsafe fn query(
     let mut supported_8 = vk::PhysicalDevice8BitStorageFeatures::default();
     let mut supported_f16i8 = vk::PhysicalDeviceShaderFloat16Int8Features::default();
     let mut supported_vulkan12 = vk::PhysicalDeviceVulkan12Features::default();
+    // Only chained when the device advertises the extension: querying a feature
+    // struct whose extension is absent is not a defined thing to ask.
+    let demote_ext = has_extension(vk::EXT_SHADER_DEMOTE_TO_HELPER_INVOCATION_NAME);
+    let mut supported_demote =
+        vk::PhysicalDeviceShaderDemoteToHelperInvocationFeaturesEXT::default();
     let mut features2 = vk::PhysicalDeviceFeatures2::default()
         .push_next(&mut supported_16)
         .push_next(&mut supported_8)
         .push_next(&mut supported_f16i8)
         .push_next(&mut supported_vulkan12);
+    if demote_ext {
+        features2 = features2.push_next(&mut supported_demote);
+    }
     unsafe { instance.get_physical_device_features2(pd, &mut features2) };
     let supported = features2.features;
     let props = unsafe { instance.get_physical_device_properties(pd) };
@@ -308,6 +391,9 @@ pub unsafe fn query(
         MirrorClampToEdge::Unsupported
     };
 
+    let demote_to_helper =
+        demote_ext && supported_demote.shader_demote_to_helper_invocation == vk::TRUE;
+
     DeviceFeatures {
         robust_buffer_access: supported.robust_buffer_access == vk::TRUE,
         sampler_anisotropy: supported.sampler_anisotropy == vk::TRUE,
@@ -335,10 +421,17 @@ pub unsafe fn query(
         bgra8_storage,
         sampled_r32f_linear_filter,
         storage16: supported_16.storage_buffer16_bit_access == vk::TRUE,
+        storage_input_output16: supported_16.storage_input_output16 == vk::TRUE,
         storage8: supported_8.storage_buffer8_bit_access == vk::TRUE,
         float16: supported_f16i8.shader_float16 == vk::TRUE,
         int8: supported_f16i8.shader_int8 == vk::TRUE,
         shader_output_viewport_index: supported_vulkan12.shader_output_viewport_index == vk::TRUE,
+        fragment_stores_and_atomics: supported.fragment_stores_and_atomics == vk::TRUE,
+        independent_blend: supported.independent_blend == vk::TRUE,
+        vertex_pipeline_stores_and_atomics: supported.vertex_pipeline_stores_and_atomics
+            == vk::TRUE,
+        shader_int64: supported.shader_int64 == vk::TRUE,
+        shader_demote_to_helper_invocation: demote_to_helper,
         mirror_clamp_to_edge,
     }
 }
@@ -365,9 +458,15 @@ mod tests {
             bgra8_storage: true,
             sampled_r32f_linear_filter: true,
             storage16: true,
+            storage_input_output16: true,
             storage8: true,
             float16: true,
             int8: true,
+            fragment_stores_and_atomics: true,
+            independent_blend: true,
+            vertex_pipeline_stores_and_atomics: true,
+            shader_int64: true,
+            shader_demote_to_helper_invocation: true,
             shader_output_viewport_index: true,
             mirror_clamp_to_edge: MirrorClampToEdge::Core12,
             dual_src_blend: true,
@@ -387,6 +486,8 @@ mod tests {
         assert_eq!(all_supported().enabled_features().dual_src_blend, vk::TRUE);
         let without = DeviceFeatures {
             dual_src_blend: false,
+            mirror_clamp_to_edge: MirrorClampToEdge::Unsupported,
+            shader_demote_to_helper_invocation: false,
             ..all_supported()
         };
         assert_eq!(without.enabled_features().dual_src_blend, vk::FALSE);
@@ -394,6 +495,21 @@ mod tests {
         // The default is "not supported", so a `DeviceFeatures` built without a
         // query never claims a capability it has not checked for.
         assert!(!DeviceFeatures::default().dual_src_blend);
+    }
+
+    /// Does the list contain the mirror-clamp extension? Asked by name rather
+    /// than by list length, because the list also carries extensions belonging
+    /// to unrelated features and a length assertion breaks whenever one is
+    /// added — which says nothing about the rung under test.
+    fn asks_for_mirror_clamp(caps: &DeviceFeatures) -> bool {
+        // Compared as strings, not pointers: the list holds raw `*const c_char`
+        // and two calls need not hand back the same address for the same name.
+        caps.required_extensions().into_iter().any(|name| {
+            // SAFETY: every entry is a pointer to one of ash's `'static` NUL-
+            // terminated extension-name constants.
+            let name = unsafe { std::ffi::CStr::from_ptr(name) };
+            name == vk::KHR_SAMPLER_MIRROR_CLAMP_TO_EDGE_NAME
+        })
     }
 
     /// The 1.2 rung sets the core feature bit and asks for no extension.
@@ -404,7 +520,7 @@ mod tests {
             caps.enabled_vulkan12().sampler_mirror_clamp_to_edge,
             vk::TRUE
         );
-        assert!(caps.required_extensions().is_empty());
+        assert!(!asks_for_mirror_clamp(&caps));
     }
 
     /// The extension rung is the mirror image: extension string, no core bit.
@@ -421,7 +537,7 @@ mod tests {
             caps.enabled_vulkan12().sampler_mirror_clamp_to_edge,
             vk::FALSE
         );
-        assert_eq!(caps.required_extensions().len(), 1);
+        assert!(asks_for_mirror_clamp(&caps));
     }
 
     /// Neither rung: nothing is requested. The sampler path must decline the
@@ -437,7 +553,7 @@ mod tests {
             caps.enabled_vulkan12().sampler_mirror_clamp_to_edge,
             vk::FALSE
         );
-        assert!(caps.required_extensions().is_empty());
+        assert!(!asks_for_mirror_clamp(&caps));
         assert!(!caps.mirror_clamp_to_edge.is_available());
     }
 
@@ -451,6 +567,28 @@ mod tests {
         assert_eq!(enabled.sampler_anisotropy, vk::FALSE);
         assert_eq!(enabled.shader_int16, vk::FALSE);
         assert_eq!(enabled.shader_storage_image_extended_formats, vk::FALSE);
+        assert_eq!(enabled.fragment_stores_and_atomics, vk::FALSE);
+        assert_eq!(enabled.independent_blend, vk::FALSE);
+        assert_eq!(enabled.vertex_pipeline_stores_and_atomics, vk::FALSE);
+        assert_eq!(enabled.shader_int64, vk::FALSE);
+    }
+
+    /// The two features the guest was measured to need are asked for when the
+    /// device offers them.
+    ///
+    /// Both were missing until a validation layer named them: the guest writes a
+    /// storage buffer from a fragment shader (`Set 0, Binding 104`,
+    /// `VUID-RuntimeSpirv-NonWritable-06340`) and builds a colour-blend state
+    /// whose second attachment differs from its first
+    /// (`VUID-VkPipelineColorBlendStateCreateInfo-pAttachments-00605`). Doing
+    /// either without the feature is undefined behaviour.
+    #[test]
+    fn the_features_the_guest_was_measured_to_need_are_requested() {
+        let enabled = all_supported().enabled_features();
+        assert_eq!(enabled.fragment_stores_and_atomics, vk::TRUE);
+        assert_eq!(enabled.independent_blend, vk::TRUE);
+        assert_eq!(enabled.vertex_pipeline_stores_and_atomics, vk::TRUE);
+        assert_eq!(enabled.shader_int64, vk::TRUE);
     }
 
     /// The BGRA composite path needs BOTH halves. Naming the pair once is what

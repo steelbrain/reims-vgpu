@@ -836,12 +836,28 @@ pub fn lookup_list_entry<M: HostMemory>(
         return None;
     }
     let task = &state.tasks[task_id as usize];
-    if !task.active || task.object_list_count == 0 {
+    if !task.active {
         return None;
     }
-    let off = list_object_entry_offset(ref_, task.object_list_count)?;
+    if task.object_list_count == 0 {
+        return None;
+    }
+    // A ref past the end of a published list is not a "not ready" miss; it is a
+    // stale count or bad ref and would otherwise hide the lost guest object.
+    let Some(off) = list_object_entry_offset(ref_, task.object_list_count) else {
+        crate::observe::fail(format!(
+            "object_list_miss reason=ref_beyond_count task={task_id} ref={ref_} count={}",
+            task.object_list_count
+        ));
+        return None;
+    };
     let entry_gva = ((task.object_list_pfn as u64) << state.page_shift).checked_add(off)?;
     let mut raw = [0u8; OBJECT_LIST_ENTRY_LEN];
+    // An unmapped entry page and an empty slot are BOTH expected: the guest
+    // allocates a sparse object list and maps only the pages it has filled, so
+    // a probe of an unpopulated ref is control flow, not a loss. Measured at
+    // 227k unreadable and 73k empty in one login — reporting either would drown
+    // the sink in the rail working correctly.
     gva_mem::read_task_gva_by_id(
         host,
         &state.tasks,
@@ -851,7 +867,12 @@ pub fn lookup_list_entry<M: HostMemory>(
         state.page_shift,
     )
     .ok()?;
-    let e = decode_list_object_entry(&raw).ok()?;
+    let Ok(e) = decode_list_object_entry(&raw) else {
+        crate::observe::fail(format!(
+            "object_list_miss reason=entry_undecodable task={task_id} ref={ref_}"
+        ));
+        return None;
+    };
     if e.descriptor_length == 0 || e.descriptor_gva == 0 {
         return None;
     }

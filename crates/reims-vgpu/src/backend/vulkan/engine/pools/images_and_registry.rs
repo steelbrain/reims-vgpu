@@ -1291,3 +1291,47 @@ mod pin_count_tests {
         );
     }
 }
+
+impl ResourcePools {
+    /// The depth-stencil attachment for this geometry, built once and kept.
+    ///
+    /// [`Self::create_transient_depth`] builds a fresh image every call, which
+    /// is right for a depth buffer a single draw clears and forgets and wrong
+    /// for a stencil: a Metal render pass clears its stencil once and then has
+    /// one draw write a mask and the next test against it. A per-draw image
+    /// cannot carry that, and the fill draw ends up testing against contents
+    /// nothing wrote.
+    ///
+    /// Keyed by geometry and by whether a stencil aspect is wanted, because
+    /// those are what change the image. A different key disposes the old one
+    /// through the deferred queue, so a submission still referencing it is not
+    /// pulled out from under the GPU.
+    pub(crate) unsafe fn acquire_depth_stencil(
+        &mut self,
+        ctx: &DeviceContext,
+        width: u32,
+        height: u32,
+        with_stencil: bool,
+        counters: &EngineCounters,
+    ) -> Result<(vk::Image, vk::DeviceMemory, vk::ImageView), DrawError> {
+        let key = (width, height, with_stencil);
+        if let Some((kept_key, parts)) = self.depth_stencil_keep {
+            if kept_key == key {
+                return Ok(parts);
+            }
+            let (image, memory, view) = parts;
+            self.dispose(
+                &ctx.device,
+                DeferredHandle::Image {
+                    image,
+                    view,
+                    memory,
+                },
+            );
+            self.depth_stencil_keep = None;
+        }
+        let parts = self.create_transient_depth(ctx, width, height, with_stencil, counters)?;
+        self.depth_stencil_keep = Some((key, parts));
+        Ok(parts)
+    }
+}
