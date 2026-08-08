@@ -28,8 +28,7 @@
 //! boundary.** A `u64` of nanoseconds is 584 years, so nothing here can
 //! overflow, and one truncation per second-long window is a rounding error
 //! rather than a per-item floor. The emitted field names stay in microseconds —
-//! every reader of the fail log, `scripts/constant-fields` among them, parses
-//! them that way.
+//! every reader of the fail log parses them that way.
 //!
 //! A conclusion taken with the truncating accumulator is not evidence. The
 //! attribute walk reading a flat zero is the one this crate had recorded, and

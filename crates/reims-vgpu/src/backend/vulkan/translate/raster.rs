@@ -11,7 +11,8 @@ use ash::vk;
 
 use super::reason::TranslateReason;
 use crate::backend::vulkan::engine::{
-    CullMode, IndexType, PrimitiveTopology, SamplerCompareFunction, StencilOp,
+    CullMode, DepthClipMode, FillMode, IndexType, PrimitiveTopology, SamplerCompareFunction,
+    StencilOp, VisibilityResultMode,
 };
 
 /// `MTLPrimitiveType` (SDK numeric values).
@@ -33,6 +34,24 @@ pub fn cull_mode(mtl: u32) -> Result<CullMode, TranslateReason> {
         1 => CullMode::Front,
         2 => CullMode::Back,
         other => return Err(TranslateReason::UnknownCullMode(other)),
+    })
+}
+
+/// `MTLTriangleFillMode` (SDK numeric values).
+pub fn fill_mode(mtl: u32) -> Result<FillMode, TranslateReason> {
+    Ok(match mtl {
+        0 => FillMode::Fill,
+        1 => FillMode::Lines,
+        other => return Err(TranslateReason::UnknownFillMode(other)),
+    })
+}
+
+/// `MTLDepthClipMode` (SDK numeric values).
+pub fn depth_clip_mode(mtl: u32) -> Result<DepthClipMode, TranslateReason> {
+    Ok(match mtl {
+        0 => DepthClipMode::Clip,
+        1 => DepthClipMode::Clamp,
+        other => return Err(TranslateReason::UnknownDepthClipMode(other)),
     })
 }
 
@@ -132,9 +151,138 @@ pub fn vk_index_type(index: IndexType) -> vk::IndexType {
     }
 }
 
+/// `MTLVisibilityResultMode` (SDK numeric values) → whether a draw arms an
+/// occlusion query, and what it counts.
+///
+/// `Ok(None)` is `MTLVisibilityResultModeDisabled`, the Metal default: the guest
+/// disarmed the query, so the draw runs without one. That is why this returns
+/// an `Option` inside the `Result` rather than folding `0` into the error arm —
+/// disarming is a thing the guest is entitled to ask for, and an unknown
+/// ordinal is not.
+pub fn visibility_result_mode(mtl: u32) -> Result<Option<VisibilityResultMode>, TranslateReason> {
+    use crate::contract::visibility::VISIBILITY_RESULT_MODE_DISABLED;
+    Ok(match mtl {
+        // The one arm that is a *meaning* rather than a mode, so it is the one
+        // arm spelled from the contract rather than as a literal beside its
+        // neighbours.
+        VISIBILITY_RESULT_MODE_DISABLED => None,
+        1 => Some(VisibilityResultMode::Boolean),
+        2 => Some(VisibilityResultMode::Counting),
+        other => return Err(TranslateReason::UnknownVisibilityResultMode(other)),
+    })
+}
+
+/// The query-control flags an armed mode records with.
+///
+/// `PRECISE` is what makes the result an exact sample count rather than a
+/// non-zero-if-any. It requires `VkPhysicalDeviceFeatures::occlusionQueryPrecise`;
+/// the caller gates on it, because the alternative — quietly recording without
+/// the bit — hands a counting guest a number that is neither the count nor
+/// recognisably wrong, which is the same failure `vk_polygon_mode` above
+/// refuses to make for wireframe.
+pub fn vk_query_control_flags(mode: VisibilityResultMode) -> vk::QueryControlFlags {
+    match mode {
+        VisibilityResultMode::Boolean => vk::QueryControlFlags::empty(),
+        VisibilityResultMode::Counting => vk::QueryControlFlags::PRECISE,
+    }
+}
+
+pub fn vk_cull_mode(mode: CullMode) -> vk::CullModeFlags {
+    match mode {
+        CullMode::None => vk::CullModeFlags::NONE,
+        CullMode::Front => vk::CullModeFlags::FRONT,
+        CullMode::Back => vk::CullModeFlags::BACK,
+    }
+}
+
+/// The polygon mode that rasterizes a Metal fill mode.
+///
+/// `LINE` requires `VkPhysicalDeviceFeatures::fillModeNonSolid`; the caller
+/// gates on it, because the alternative — quietly returning `FILL` — is the
+/// wireframe-rendered-solid bug this translation exists to prevent.
+pub fn vk_polygon_mode(mode: FillMode) -> vk::PolygonMode {
+    match mode {
+        FillMode::Fill => vk::PolygonMode::FILL,
+        FillMode::Lines => vk::PolygonMode::LINE,
+    }
+}
+
+/// Whether the pipeline sets `depthClampEnable`.
+///
+/// `true` requires `VkPhysicalDeviceFeatures::depthClamp`, gated at the caller
+/// for the same reason as [`vk_polygon_mode`].
+pub fn vk_depth_clamp_enable(mode: DepthClipMode) -> bool {
+    match mode {
+        DepthClipMode::Clip => false,
+        DepthClipMode::Clamp => true,
+    }
+}
+
+/// The Vulkan `FrontFace` that reproduces Metal front-face selection.
+///
+/// Metal evaluates winding in its window space (origin top-left, Y down) and its
+/// default front-facing winding is clockwise. This backend emulates Metal's Y-up
+/// NDC on Vulkan's Y-down NDC with a negative-height viewport, which makes the
+/// rasterized framebuffer image — and therefore the apparent triangle winding —
+/// match Metal's. The mapping is therefore direct: a Metal clockwise front is
+/// `FrontFace::CLOCKWISE`. Every draw on this rail is emitted Y-flipped (the
+/// guest is always Metal), so there is no un-flipped case in which the
+/// framebuffer would mirror and invert the effective winding. Verified on-GPU
+/// by the `cull_*` parity tests.
+pub fn vk_front_face(front_face_ccw: bool) -> vk::FrontFace {
+    if front_face_ccw {
+        vk::FrontFace::COUNTER_CLOCKWISE
+    } else {
+        vk::FrontFace::CLOCKWISE
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cull_flags_map_metal_modes() {
+        assert_eq!(vk_cull_mode(CullMode::None), vk::CullModeFlags::NONE);
+        assert_eq!(vk_cull_mode(CullMode::Front), vk::CullModeFlags::FRONT);
+        assert_eq!(vk_cull_mode(CullMode::Back), vk::CullModeFlags::BACK);
+    }
+
+    #[test]
+    fn front_face_matches_metal_under_yflip() {
+        // Every draw is emitted through a negative-height viewport, so the
+        // rasterized framebuffer winding matches Metal and the mapping is
+        // direct — Metal's clockwise default front maps to FrontFace::CLOCKWISE,
+        // CCW to CCW.
+        assert_eq!(
+            vk_front_face(false),
+            vk::FrontFace::CLOCKWISE,
+            "Metal CW front under Y-flip"
+        );
+        assert_eq!(
+            vk_front_face(true),
+            vk::FrontFace::COUNTER_CLOCKWISE,
+            "Metal CCW front under Y-flip"
+        );
+    }
+
+    /// Every primitive type this device *advertises* has an arm here.
+    ///
+    /// [`crate::contract::draw::EXECUTABLE_PRIMITIVE_TYPES`] is what the guest
+    /// reads as permission, so a bit set there without an arm here is a draw the
+    /// guest was invited to make and this rail refuses. Both directions are
+    /// asserted: an arm without the bit would be a type this device can execute
+    /// and has told the guest not to use.
+    #[test]
+    fn the_advertised_primitive_types_are_the_executable_ones() {
+        for mtl in 0..=8u32 {
+            assert_eq!(
+                primitive_topology(mtl).is_ok(),
+                crate::contract::draw::primitive_type_executable(mtl),
+                "primitive type {mtl}: advertisement and translation disagree"
+            );
+        }
+    }
 
     /// Every SDK value in range maps, and the first one past the end declines
     /// by its own slug rather than a shared one.
@@ -153,6 +301,15 @@ mod tests {
         assert_eq!(
             cull_mode(3).unwrap_err(),
             TranslateReason::UnknownCullMode(3)
+        );
+        for mtl in 0..=1u32 {
+            assert!(fill_mode(mtl).is_ok(), "fill {mtl}");
+            assert!(depth_clip_mode(mtl).is_ok(), "depth clip {mtl}");
+        }
+        assert_eq!(fill_mode(2).unwrap_err(), TranslateReason::UnknownFillMode(2));
+        assert_eq!(
+            depth_clip_mode(2).unwrap_err(),
+            TranslateReason::UnknownDepthClipMode(2)
         );
         assert!(!front_face_ccw(0).unwrap());
         assert!(front_face_ccw(1).unwrap());
@@ -179,7 +336,7 @@ mod tests {
     /// Injectivity below proves no two values collide; it does not prove the
     /// table is not *rotated*. A rotation still round-trips and still renders —
     /// it just inverts occlusion for every 3D draw — so the mapping is pinned
-    /// arm by arm. (Moved here from `runtime/metal_draw/mod.rs`, which held a second
+    /// arm by arm. (Moved here from `runtime/draw/mod.rs`, which held a second
     /// copy of this table; the assertion outlived the duplicate.)
     #[test]
     fn compare_function_matches_the_metal_abi_order() {
@@ -268,6 +425,55 @@ mod tests {
         assert_eq!(
             vk_topology(primitive_topology(4).unwrap()),
             vk::PrimitiveTopology::TRIANGLE_STRIP
+        );
+    }
+
+    /// The two rasterization modes whose non-default arm needs a device
+    /// feature. Metal's default is 0 in both, and 0 must map to the spelling
+    /// that needs nothing — a table rotated here would make every draw in the
+    /// tree ask for a feature the host may not have.
+    #[test]
+    fn the_metal_default_raster_mode_needs_no_device_feature() {
+        assert_eq!(fill_mode(0), Ok(FillMode::Fill));
+        assert_eq!(vk_polygon_mode(FillMode::Fill), vk::PolygonMode::FILL);
+        assert_eq!(vk_polygon_mode(FillMode::Lines), vk::PolygonMode::LINE);
+        assert_eq!(depth_clip_mode(0), Ok(DepthClipMode::Clip));
+        assert!(!vk_depth_clamp_enable(DepthClipMode::Clip));
+        assert!(vk_depth_clamp_enable(DepthClipMode::Clamp));
+        // `Default` is what a draw that bound neither record carries, so it has
+        // to be the same answer as the Metal default rather than merely the
+        // first variant.
+        assert_eq!(FillMode::default(), FillMode::Fill);
+        assert_eq!(DepthClipMode::default(), DepthClipMode::Clip);
+    }
+
+    /// One Apple enum, spelled once here and once in
+    /// `backend::metal::mtl_enum::visibility_result_mode`, with nothing in the
+    /// toolchain comparing them. A mode this arm records and that one refuses
+    /// is a guest that culls correctly on one host and reads a stale word on
+    /// the other, so both are held to [`crate::contract::visibility`] — this
+    /// one as a test, the Metal one as a `const` block, because its tests run
+    /// on no machine anybody edits from.
+    #[test]
+    fn the_recorded_visibility_modes_are_the_ones_the_contract_names() {
+        use crate::contract::visibility::{
+            visibility_result_mode_recordable, VISIBILITY_RESULT_MODE_DISABLED,
+            VISIBILITY_RESULT_MODE_SWEEP_END,
+        };
+        for mtl in 0..VISIBILITY_RESULT_MODE_SWEEP_END {
+            let recorded = matches!(visibility_result_mode(mtl), Ok(Some(_)));
+            assert_eq!(
+                recorded,
+                visibility_result_mode_recordable(mtl),
+                "ordinal {mtl}: this arm and the device contract disagree about \
+                 whether an occlusion query armed with it is recorded"
+            );
+        }
+        // The disarming ordinal is `Ok(None)` rather than a refusal: it is the
+        // absence of a query, which is a thing a stream legitimately says.
+        assert_eq!(
+            visibility_result_mode(VISIBILITY_RESULT_MODE_DISABLED),
+            Ok(None)
         );
     }
 

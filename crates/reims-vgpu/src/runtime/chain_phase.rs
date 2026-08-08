@@ -4,7 +4,7 @@
 //! # The hole this fills
 //!
 //! Two censuses already divide a draw and they do not meet. `drain_duty`'s
-//! `draw_us` brackets [`crate::runtime::metal_draw::encode_draw_chain`] from
+//! `draw_us` brackets [`crate::runtime::draw::encode_draw_chain`] from
 //! the drain worker; `draw_phase` brackets the Vulkan engine's own
 //! `execute_draw_request` from inside. On a driven x86/PCI boot, one second:
 //!

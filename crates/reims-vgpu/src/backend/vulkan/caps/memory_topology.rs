@@ -111,7 +111,7 @@ impl MemoryTopology {
     /// So coherence is the *last* preference rather than a requirement, and a
     /// caller that gets a non-coherent type owes
     /// `vkInvalidateMappedMemoryRanges` before it reads. [`MemoryRequest`] is
-    /// only a query; `Pools::create_readback_buffer` records which it got.
+    /// only a query; `ResourcePools::create_readback_buffer` records which it got.
     pub fn request(self, class: MemoryClass) -> MemoryRequest {
         use vk::MemoryPropertyFlags as F;
         let host = F::HOST_VISIBLE | F::HOST_COHERENT;

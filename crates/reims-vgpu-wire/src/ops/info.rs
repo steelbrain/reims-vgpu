@@ -99,14 +99,13 @@ pub const QUERY_TOTAL_LEN: u32 = 24;
 /// repository, and the ICB stub ships no `gpuAddress` accessor for the
 /// serializer to have called.
 ///
-/// Not yet corrected in `reims-vgpu`: the rail is dormant (`runtime::icb` reads
-/// 0.00% on a driven boot and `bind_icb_command_memory` returns
-/// `icb_bind_memory_no_vulkan_path` on the whole Vulkan arm), and the change is
-/// a behaviour change rather than a rename — the device never answers this query
-/// at all, so the repair is to decline it by name, not to bind a different
-/// buffer. `PGSerializerInfoCommandEncoder` is also in the divergence
+/// Corrected in `reims-vgpu`: `apply_icb_host_resource_info` now refuses by
+/// name rather than binding the reply pair as an ICB's command memory, and
+/// `IcbHostResourceInfo` carries these three field names pinned to these three
+/// offsets. `PGSerializerInfoCommandEncoder` is still in the divergence
 /// instrument's `UNCOVERED_CLASSES`, which is why the one class where the two
-/// crates provably disagree is the one it does not check.
+/// crates provably disagreed is the one it did not check — the disagreement was
+/// found by reading, not by the instrument.
 ///
 /// [`STUB_STAGING_REF`-shaped]: the oracle's `encoder.h` defines both constants.
 #[repr(C)]

@@ -10,7 +10,7 @@ use ash::vk;
 use super::reason::TranslateReason;
 use crate::backend::vulkan::engine::{BlendFactor, BlendOp, BlendStateResource};
 use crate::runtime::decode::resource::{
-    ColorWriteMask, MTL_COLOR_WRITE_MASK_ALPHA, MTL_COLOR_WRITE_MASK_BLUE,
+    ColorWriteMask, PipelineColorAttachment, MTL_COLOR_WRITE_MASK_ALPHA, MTL_COLOR_WRITE_MASK_BLUE,
     MTL_COLOR_WRITE_MASK_GREEN, MTL_COLOR_WRITE_MASK_RED,
 };
 
@@ -91,23 +91,23 @@ pub fn operation(mtl: u32) -> Result<BlendOp, TranslateReason> {
 /// Fails on the first unrepresentable component rather than substituting a
 /// default for it — a blend that silently becomes `ONE, ZERO` is a rendering
 /// bug with no log line.
-#[allow(clippy::too_many_arguments)]
+///
+/// Takes the decoded attachment rather than its six factor/op ordinals: both
+/// production callers hold one, the six are all `u32` and adjacent, and the RGB
+/// and alpha halves are three-for-three interchangeable — a swap between them
+/// produces a valid blend state that blends the wrong channel set, which no
+/// decline can report because nothing was out of contract.
 pub fn state(
-    src_rgb: u32,
-    dst_rgb: u32,
-    op_rgb: u32,
-    src_alpha: u32,
-    dst_alpha: u32,
-    op_alpha: u32,
+    a: &PipelineColorAttachment,
     constants: [f32; 4],
 ) -> Result<BlendStateResource, TranslateReason> {
     Ok(BlendStateResource {
-        src_color: factor(src_rgb)?,
-        dst_color: factor(dst_rgb)?,
-        color_op: operation(op_rgb)?,
-        src_alpha: factor(src_alpha)?,
-        dst_alpha: factor(dst_alpha)?,
-        alpha_op: operation(op_alpha)?,
+        src_color: factor(a.src_rgb)?,
+        dst_color: factor(a.dst_rgb)?,
+        color_op: operation(a.op_rgb)?,
+        src_alpha: factor(a.src_alpha)?,
+        dst_alpha: factor(a.dst_alpha)?,
+        alpha_op: operation(a.op_alpha)?,
         constants,
     })
 }
@@ -354,17 +354,57 @@ mod tests {
     /// surface that composites wrong for the rest of the boot.
     #[test]
     fn a_bad_component_fails_the_whole_descriptor() {
-        let ok = state(1, 5, 0, 1, 5, 0, [0.0; 4]).unwrap();
+        // One, OneMinusSrcAlpha, Add on both halves.
+        let attach =
+            |src_rgb, dst_rgb, op_rgb, src_alpha, dst_alpha, op_alpha| PipelineColorAttachment {
+                src_rgb,
+                dst_rgb,
+                op_rgb,
+                src_alpha,
+                dst_alpha,
+                op_alpha,
+                ..Default::default()
+            };
+        let ok = state(&attach(1, 5, 0, 1, 5, 0), [0.0; 4]).unwrap();
         assert_eq!(ok.src_color, BlendFactor::One);
         assert_eq!(ok.dst_color, BlendFactor::OneMinusSrcAlpha);
         assert_eq!(ok.color_op, BlendOp::Add);
         assert_eq!(
-            state(1, 99, 0, 1, 5, 0, [0.0; 4]).unwrap_err(),
+            state(&attach(1, 99, 0, 1, 5, 0), [0.0; 4]).unwrap_err(),
             TranslateReason::UnknownBlendFactor(99)
         );
         assert_eq!(
-            state(1, 5, 0, 1, 5, 77, [0.0; 4]).unwrap_err(),
+            state(&attach(1, 5, 0, 1, 5, 77), [0.0; 4]).unwrap_err(),
             TranslateReason::UnknownBlendOperation(77)
         );
+    }
+
+    /// The RGB and alpha halves land in the fields of their own names.
+    ///
+    /// The six ordinals are interchangeable `u32`s three-for-three, so a swap
+    /// between the halves yields a perfectly valid blend state that blends the
+    /// wrong channel set — no decline, no log line. Distinct factors on each
+    /// half is the only arrangement that can see it.
+    #[test]
+    fn the_rgb_and_alpha_halves_do_not_cross() {
+        let b = state(
+            &PipelineColorAttachment {
+                src_rgb: 1,   // One
+                dst_rgb: 5,   // OneMinusSrcAlpha
+                op_rgb: 0,    // Add
+                src_alpha: 4, // SrcAlpha
+                dst_alpha: 0, // Zero
+                op_alpha: 1,  // Subtract
+                ..Default::default()
+            },
+            [0.0; 4],
+        )
+        .unwrap();
+        assert_eq!(b.src_color, BlendFactor::One);
+        assert_eq!(b.dst_color, BlendFactor::OneMinusSrcAlpha);
+        assert_eq!(b.color_op, BlendOp::Add);
+        assert_eq!(b.src_alpha, BlendFactor::SrcAlpha);
+        assert_eq!(b.dst_alpha, BlendFactor::Zero);
+        assert_eq!(b.alpha_op, BlendOp::Subtract);
     }
 }

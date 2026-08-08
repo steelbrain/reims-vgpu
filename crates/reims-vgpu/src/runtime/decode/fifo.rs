@@ -1,25 +1,24 @@
-//! Root/child FIFO wire constants, and the two child commands decoded here.
+//! Child FIFO record layouts, and the two child commands decoded here.
 //!
 //! This module holds the parts of the FIFO contract the live drain path reads:
-//! the child opcode table, the resource-list / invalidate / synchronize record
-//! layout, the display-descriptor timing entries, and the `EXEC_INDIRECT2`
-//! header offsets. Packet framing itself — reading a ring, walking headers and
-//! stamps, writing back head — lives in `runtime/drain/mod.rs`, which does it
-//! against live guest memory and reports each failure as a `PacketFault`.
+//! the resource-list / invalidate / synchronize record layout, the
+//! display-descriptor timing entries, and the `EXEC_INDIRECT2` header offsets.
+//!
+//! The **opcodes** those records belong to are not here. [`crate::model::regs`]
+//! holds one table for the whole device — root and child together — and this
+//! module used to restate five of its child entries, four of them byte-identical
+//! declarations that nothing imported while the drain's dispatch matched on
+//! `regs`. A second table of the same numbers cannot be kept honest by anything
+//! in the toolchain: a correction to an opcode the RE got wrong reaches whichever
+//! copy its author was reading, and the other one keeps compiling.
+//!
+//! Packet framing itself — reading a ring, walking headers and stamps, writing
+//! back head — lives in `runtime/drain/mod.rs`, which does it against live guest
+//! memory and reports each failure as a `PacketFault`.
 
 use crate::contract::endian::{ld32, st16, st32};
 
-// --- child opcodes and record layout, as the PVG command table numbers them ---
-
-/// PVG table: CmdUnmapMemory (not map — MapMemory2 is `0x39`).
-pub const CHILD_OP_UNMAP_MEMORY: u16 = 0x22;
-/// PVG: CmdInvalidateResources.
-pub const CHILD_OP_INVALIDATE_RESOURCES: u16 = 0x34;
-/// PVG: CmdSynchronizeResources.
-pub const CHILD_OP_SYNCHRONIZE_RESOURCES: u16 = 0x35;
-/// PVG: CmdMapMemory2 (task GPU-VA map).
-pub const CHILD_OP_MAP_MEMORY2: u16 = 0x39;
-pub const CHILD_OP_CONFIG_40: u16 = 0x40;
+// --- child record layout, as the PVG command table numbers them ---
 
 /// CmdInvalidateResources / CmdSynchronizeResources shared header.
 pub const CHILD_RESOURCE_LIST_TASK_ID: u32 = 0x00;
@@ -40,8 +39,60 @@ pub const CHILD_REPLACE_PHYSICAL_LEN: u32 = 8;
 /// `clear_host_valid | set_host_valid | clear_guest_valid | set_guest_valid`.
 /// Pageon = clear hostValid + set guestValid (host cache stale; guest pages live).
 pub const CHILD_INVALIDATE_PAGEON_FLAGS: u32 = 0x0100_0001;
-/// Cap decoded list entries (guest pageBacking hardcodes count=1; generic parse).
-pub const CHILD_RESOURCE_LIST_MAX_COUNT: u32 = 256;
+/// Why a `CmdInvalidateResources` / `CmdSynchronizeResources` payload did not
+/// decode.
+///
+/// These two decoders returned a bare `Option`, and the drain's `None` arm could
+/// only say `decode_fail` with the first two words of the payload. Three
+/// different conditions reached it and a reader could not tell them apart —
+/// which matters here more than in most decoders, because of what each refusal
+/// costs. A dropped Invalidate leaves this device serving host-cached pixels for
+/// a resource the guest has just CPU-written; a dropped Synchronize lets the
+/// guest CPU-read pages whose deferred writeback never landed, which is the
+/// class the sibling handler still names "boot-25 black-wallpaper".
+///
+/// One of those three conditions was **not a malformed payload at all**. A
+/// `CHILD_RESOURCE_LIST_MAX_COUNT` of 256 sat above the length check and refused
+/// any list longer than that, on the stated basis that "guest pageBacking
+/// hardcodes count=1". It bounded nothing: the `Vec::with_capacity(count)` it
+/// appeared to protect runs *after* `payload.len() < need`, so the payload's own
+/// length is what caps the allocation, and `checked_mul` already covers the
+/// arithmetic. Its only effect was to refuse a well-formed 257-entry list the
+/// guest is entitled to send. It is gone, and this enum is what remains: the two
+/// conditions that are genuinely the payload disagreeing with itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResourceListDecodeError {
+    /// Shorter than the `{task_id, count}` header, so the count cannot be read.
+    ShortHeader { plen: usize },
+    /// The declared count needs more bytes than the payload carries. `need` is
+    /// header + `count` × record length, so `need` against `plen` says by how
+    /// much, and the record length distinguishes the two commands (8 vs 4).
+    Truncated {
+        count: u32,
+        plen: usize,
+        need: usize,
+    },
+}
+
+impl crate::observe::Decline for ResourceListDecodeError {
+    fn slug(&self) -> &'static str {
+        match self {
+            Self::ShortHeader { .. } => "resource_list_short_header",
+            Self::Truncated { .. } => "resource_list_truncated",
+        }
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        match *self {
+            Self::ShortHeader { plen } => vec![("plen", plen.to_string())],
+            Self::Truncated { count, plen, need } => vec![
+                ("count", count.to_string()),
+                ("plen", plen.to_string()),
+                ("need", need.to_string()),
+            ],
+        }
+    }
+}
 
 pub const DISPLAY_DESC_TIMING_BASE: u64 = 0x210;
 pub const DISPLAY_DESC_TIMING_STRIDE: u32 = 0x10;
@@ -209,23 +260,27 @@ pub struct SynchronizeResourcesCommand {
 /// Decode CmdInvalidateResources: header `{task_id, count}` + `count × {object_id, flags}`.
 ///
 /// Guest `pageBacking` always writes count=1 and flags=`0x1000001` on the observed
-/// guest driver; decoder still accepts count>1 when the payload is long enough
-/// (forward-compatible).
-pub fn decode_invalidate_resources(payload: &[u8]) -> Option<InvalidateResourcesCommand> {
-    if payload.len() < CHILD_RESOURCE_LIST_HEADER_LEN as usize {
-        return None;
+/// guest driver; the decoder accepts any count the payload is long enough to
+/// carry, which is what makes it forward-compatible with a serializer that
+/// batches. The payload's length is the only bound — see
+/// [`ResourceListDecodeError`] for the cap that used to sit above it and what
+/// that cap was actually doing.
+pub fn decode_invalidate_resources(
+    payload: &[u8],
+) -> Result<InvalidateResourcesCommand, ResourceListDecodeError> {
+    let plen = payload.len();
+    if plen < CHILD_RESOURCE_LIST_HEADER_LEN as usize {
+        return Err(ResourceListDecodeError::ShortHeader { plen });
     }
     let task_id = ld32(&payload[CHILD_RESOURCE_LIST_TASK_ID as usize..]);
     let count = ld32(&payload[CHILD_RESOURCE_LIST_COUNT as usize..]);
-    if count > CHILD_RESOURCE_LIST_MAX_COUNT {
-        return None;
+    let need = resource_list_need(count, CHILD_INVALIDATE_RECORD_LEN);
+    if plen < need {
+        return Err(ResourceListDecodeError::Truncated { count, plen, need });
     }
-    let need = (CHILD_RESOURCE_LIST_HEADER_LEN as u64)
-        .checked_add((count as u64).checked_mul(CHILD_INVALIDATE_RECORD_LEN as u64)?)?
-        as usize;
-    if payload.len() < need {
-        return None;
-    }
+    // Bounded by `need <= plen`, which was just checked: a declared count the
+    // payload cannot carry never reaches here, so this reserves at most one
+    // record per record's worth of bytes the guest actually sent.
     let mut records = Vec::with_capacity(count as usize);
     let mut off = CHILD_RESOURCE_LIST_HEADER_LEN as usize;
     for _ in 0..count {
@@ -238,11 +293,28 @@ pub fn decode_invalidate_resources(payload: &[u8]) -> Option<InvalidateResources
         });
         off += CHILD_INVALIDATE_RECORD_LEN as usize;
     }
-    Some(InvalidateResourcesCommand {
+    Ok(InvalidateResourcesCommand {
         task_id,
         count,
         records,
     })
+}
+
+/// Bytes a resource-list payload must carry for the count it declares.
+///
+/// Saturating rather than checked: `count` is a `u32` and `record_len` is 4 or
+/// 8, so the product fits `u64` and the sum cannot wrap — but the `as usize`
+/// that follows would truncate on a 32-bit host, and a truncated `need` reads as
+/// a payload that is long enough. Saturating there means an impossible length
+/// stays impossible instead of becoming a small one.
+///
+/// One spelling for both commands, because the only thing that differs between
+/// them is `record_len`, and a second copy of this arithmetic is how the two
+/// would come to disagree about what "long enough" means.
+fn resource_list_need(count: u32, record_len: u32) -> usize {
+    let bytes = u64::from(count).saturating_mul(u64::from(record_len));
+    let total = bytes.saturating_add(u64::from(CHILD_RESOURCE_LIST_HEADER_LEN));
+    usize::try_from(total).unwrap_or(usize::MAX)
 }
 
 /// One entry of the per-resource table an `EXEC_INDIRECT2` payload carries
@@ -338,28 +410,27 @@ pub fn decode_replace_physical(payload: &[u8]) -> Option<ReplacePhysicalCommand>
 /// Decode CmdSynchronizeResources: header `{task_id, count}` + `count × {object_id}`.
 ///
 /// Guest `synchronizeForUnwire` uses `getCommandBytes(4)` for the object cell (no flags).
-pub fn decode_synchronize_resources(payload: &[u8]) -> Option<SynchronizeResourcesCommand> {
-    if payload.len() < CHILD_RESOURCE_LIST_HEADER_LEN as usize {
-        return None;
+pub fn decode_synchronize_resources(
+    payload: &[u8],
+) -> Result<SynchronizeResourcesCommand, ResourceListDecodeError> {
+    let plen = payload.len();
+    if plen < CHILD_RESOURCE_LIST_HEADER_LEN as usize {
+        return Err(ResourceListDecodeError::ShortHeader { plen });
     }
     let task_id = ld32(&payload[CHILD_RESOURCE_LIST_TASK_ID as usize..]);
     let count = ld32(&payload[CHILD_RESOURCE_LIST_COUNT as usize..]);
-    if count > CHILD_RESOURCE_LIST_MAX_COUNT {
-        return None;
+    let need = resource_list_need(count, CHILD_SYNCHRONIZE_RECORD_LEN);
+    if plen < need {
+        return Err(ResourceListDecodeError::Truncated { count, plen, need });
     }
-    let need = (CHILD_RESOURCE_LIST_HEADER_LEN as u64)
-        .checked_add((count as u64).checked_mul(CHILD_SYNCHRONIZE_RECORD_LEN as u64)?)?
-        as usize;
-    if payload.len() < need {
-        return None;
-    }
+    // Bounded by the length check above; see `decode_invalidate_resources`.
     let mut object_ids = Vec::with_capacity(count as usize);
     let mut off = CHILD_RESOURCE_LIST_HEADER_LEN as usize;
     for _ in 0..count {
         object_ids.push(ld32(&payload[off..]));
         off += CHILD_SYNCHRONIZE_RECORD_LEN as usize;
     }
-    Some(SynchronizeResourcesCommand {
+    Ok(SynchronizeResourcesCommand {
         task_id,
         count,
         object_ids,
@@ -434,7 +505,7 @@ mod tests {
         assert_eq!(c.records[1].object_id, 11);
     }
 
-    /// The three descriptor offsets must tile the stride `exec.rs` uses to skip
+    /// The three descriptor offsets must tile the stride `exec` uses to skip
     /// the table. If they ever disagree, the decoded records and the cmdbuf
     /// section would be read from different places in the same payload.
     #[test]
@@ -536,6 +607,81 @@ mod tests {
         st32(&mut p[0..], 0);
         st32(&mut p[4..], 2);
         st32(&mut p[8..], 1);
-        assert!(decode_invalidate_resources(&p).is_none());
+        assert_eq!(
+            decode_invalidate_resources(&p),
+            Err(ResourceListDecodeError::Truncated {
+                count: 2,
+                plen: 12,
+                need: 24,
+            }),
+            "a count the payload cannot carry must name itself, not share a \
+             verdict with a short header"
+        );
+        assert_eq!(
+            decode_invalidate_resources(&[0u8; 4]),
+            Err(ResourceListDecodeError::ShortHeader { plen: 4 })
+        );
+    }
+
+    /// A list longer than the retired `CHILD_RESOURCE_LIST_MAX_COUNT` decodes.
+    ///
+    /// That cap was 256, it sat above the length check, and it bounded nothing
+    /// the length check did not already bound — so its only effect was to refuse
+    /// a well-formed list. Refusing an Invalidate leaves this device serving
+    /// host-cached pixels for a resource the guest has just CPU-written, so the
+    /// cost of that refusal was not a lost log line.
+    ///
+    /// 257 rather than a round number: one past the retired bound, so a
+    /// reinstated cap of any plausible size fails here.
+    #[test]
+    fn a_list_longer_than_the_retired_cap_decodes_when_the_payload_carries_it() {
+        const COUNT: u32 = 257;
+        let mut p = vec![
+            0u8;
+            CHILD_RESOURCE_LIST_HEADER_LEN as usize
+                + COUNT as usize * CHILD_INVALIDATE_RECORD_LEN as usize
+        ];
+        st32(&mut p[0..], 3);
+        st32(&mut p[4..], COUNT);
+        for i in 0..COUNT as usize {
+            let at = CHILD_RESOURCE_LIST_HEADER_LEN as usize
+                + i * CHILD_INVALIDATE_RECORD_LEN as usize;
+            st32(&mut p[at..], 0x100 + i as u32);
+            st32(&mut p[at + 4..], CHILD_INVALIDATE_PAGEON_FLAGS);
+        }
+        let c = decode_invalidate_resources(&p).expect("the payload carries every record");
+        assert_eq!(c.task_id, 3);
+        assert_eq!(c.records.len(), COUNT as usize);
+        assert_eq!(c.records[256].object_id, 0x100 + 256);
+
+        // Same for the sibling command, whose records are 4 bytes rather than 8
+        // — the one thing that differs between the two decoders.
+        let mut s = vec![
+            0u8;
+            CHILD_RESOURCE_LIST_HEADER_LEN as usize
+                + COUNT as usize * CHILD_SYNCHRONIZE_RECORD_LEN as usize
+        ];
+        st32(&mut s[4..], COUNT);
+        let c = decode_synchronize_resources(&s).expect("the payload carries every record");
+        assert_eq!(c.object_ids.len(), COUNT as usize);
+    }
+
+    /// The length a count needs cannot wrap into a small number.
+    ///
+    /// `u32::MAX` records of 8 bytes is 32 GiB, which no payload carries — the
+    /// point is that it stays impossible. Computed in `u64` and saturated into
+    /// `usize`, so a 32-bit host cannot truncate `need` into something a short
+    /// payload satisfies, which would turn a bound into an out-of-range read.
+    #[test]
+    fn a_count_that_cannot_fit_reports_truncated_rather_than_wrapping() {
+        let mut p = [0u8; 16];
+        st32(&mut p[4..], u32::MAX);
+        match decode_invalidate_resources(&p) {
+            Err(ResourceListDecodeError::Truncated { count, plen, need }) => {
+                assert_eq!((count, plen), (u32::MAX, 16));
+                assert!(need > plen, "need={need} must exceed the payload");
+            }
+            other => panic!("expected Truncated, got {other:?}"),
+        }
     }
 }

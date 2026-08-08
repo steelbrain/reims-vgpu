@@ -35,9 +35,11 @@
 //!
 //! # Rules for adding a translation
 //!
-//! * Put it here, not at the call site. `gate.rs` enforces that by scanning for
-//!   Vulkan state-enum *variants* outside this module and `caps`; a bare
-//!   `vk::Format` return type is fine, spelling a specific format is not.
+//! * Put it here, not at the call site. A bare `vk::Format` return type is fine
+//!   anywhere; spelling a specific *variant* outside this module and `caps` is
+//!   not. A source scan used to enforce this and is gone, so it is a review
+//!   rule now — a variant spelled at a call site is a translation that will be
+//!   missed the next time this table changes.
 //! * Make it total. No catch-all arm; add a [`TranslateReason`] variant with
 //!   its own slug instead.
 //! * Keep every co-varying property (byte size, texel size, aspect) in the same
@@ -53,5 +55,5 @@ pub mod sampler;
 pub mod support;
 pub mod vertex;
 
-pub use reason::TranslateReason;
-pub use support::{VertexBinding, VertexFormatSupport};
+pub(crate) use reason::TranslateReason;
+pub(crate) use support::VertexFormatSupport;

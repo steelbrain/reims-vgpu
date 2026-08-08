@@ -16,11 +16,12 @@ use crate::runtime::decode::resource::{
 /// execute tests below.
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 use crate::runtime::decode::resource::{
-    PIPELINE_TAG_KERNEL_FUNC, TYPE7_FIRST_TLVS, TYPE7_OBJECT_COMPUTE_PIPELINE,
+    OBJECT_TYPE_FUNCTION, PIPELINE_TAG_KERNEL_FUNC, TYPE7_FIRST_TLVS, TYPE7_OBJECT_COMPUTE_PIPELINE,
 };
 use crate::runtime::gva_mem;
 use crate::runtime::gva_mem::write_task_gva_arm64e;
 use crate::runtime::host::FakeHost;
+use reims_vgpu_wire::device_desc::Type5Builder;
 
 #[cfg(feature = "backend-vulkan")]
 #[test]
@@ -65,21 +66,6 @@ fn compute_spirv_declines_are_distinct_and_log_safe() {
             assert!(!value.contains(char::is_whitespace));
         }
     }
-}
-
-#[cfg(feature = "backend-vulkan")]
-#[test]
-fn compute_defer_readback_follows_gpu_only_content_gate() {
-    assert!(
-        compute_defer_readback_allowed(true, true, true),
-        "native Vulkan keeps the deferred storage-writeback rail"
-    );
-    assert!(
-        !compute_defer_readback_allowed(false, true, true),
-        "portability-subset storage output must write guest pages synchronously"
-    );
-    assert!(!compute_defer_readback_allowed(true, false, true));
-    assert!(!compute_defer_readback_allowed(true, true, false));
 }
 
 /// A type-5 view names its IOSurface plane on the wire (record `+0x20`, the
@@ -151,59 +137,14 @@ fn stage_texture_type5_plane_index_beats_the_ambiguous_geometry_scan() {
     // 56-byte type-5 blob: 8-byte head, then kind/blob_len/own_ref and a 0x24
     // record whose `+0x20` carries the plane index.
     let desc_gva = (4u64 + 2) << PAGE_SHIFT_ARM64E;
-    let mut type5_desc = vec![0u8; 8];
-    st32(&mut type5_desc[objects::TYPE5_SURFACE_ID..], sid);
-    type5_desc.extend_from_slice(&[
-        0x2f,
-        0,
-        0,
-        0, // kind
-        0x30,
-        0,
-        0,
-        0, // blob_len
-        10,
-        0,
-        0,
-        0, // own_ref
-        0x42,
-        0x01,
-        MTL_FORMAT_R8_UNORM as u8,
-        (MTL_FORMAT_R8_UNORM >> 8) as u8,
-        4,
-        0,
-        0,
-        0, // view width
-        4,
-        0,
-        0,
-        0, // view height
-        1,
-        0,
-        0,
-        0, // depth
-        1,
-        0,
-        1,
-        0,
-        1,
-        0,
-        0x10,
-        0, // trailer
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0, // reserved
-        2,
-        0,
-        0,
-        0, // IOSurface plane index = 2 (alpha)
-    ]);
-    write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, &type5_desc);
+    let type5_desc = Type5Builder::new(sid, 0, 10, 0x42)
+        .unknown(0x01)
+        .geometry(MTL_FORMAT_R8_UNORM, 4, 4, 1)
+        .trailer([1, 0, 1, 0, 1, 0, 0x10, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+        // IOSurface plane index = 2 (alpha)
+        .plane_index(2);
+    let type5_desc = type5_desc.bytes();
+    write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, type5_desc);
     let off = list_object_entry_offset(type5_ref, 32).unwrap();
     let mut list_entry = [0u8; OBJECT_LIST_ENTRY_LEN];
     let packed = (objects::OBJECT_TYPE_REF_TEXTURE as u32) | ((type5_desc.len() as u32) << 8);
@@ -245,8 +186,9 @@ fn compute_bind_overflow_drops_the_bind_but_keeps_in_cap_and_unbinds() {
     assert_eq!(acc.buffers[0].index, 5);
 
     // Over-cap buffer bind (index 40 > MAX_COMPUTE_BUFFER_SLOTS) is dropped —
-    // the drop is fail-visible via note_compute_bind_overflow (the log itself is
-    // a global sink, not asserted here). No new buffer slot appears.
+    // the drop is fail-visible via `ComputeBindOverflow` (the log itself is a
+    // global sink; the line's shape is asserted by
+    // `every_compute_bind_table_renders_its_own_slug`). No new buffer slot appears.
     acc.bind_buffers(
         MAX_COMPUTE_BUFFER_SLOTS + 9,
         &[BufferBinding {
@@ -295,13 +237,75 @@ fn compute_bind_overflow_drops_the_bind_but_keeps_in_cap_and_unbinds() {
     );
     assert_eq!(acc.buffers.len(), 2, "unbind (ref==0) adds no slot");
 
-    // Threadgroup memory over-cap with a real length is dropped (kept empty);
-    // a zero-length over-cap request is an unbind and stays silent.
-    acc.set_threadgroup_memory(MAX_THREADGROUP_MEMORY_SLOTS + 2, 256);
-    acc.set_threadgroup_memory(MAX_THREADGROUP_MEMORY_SLOTS + 3, 0);
-    assert!(
-        acc.threadgroup_memory.is_empty(),
-        "over-cap threadgroup memory must not be stored"
+    // Threadgroup memory has no cap here: the accumulator keeps whatever slot
+    // the guest names, and the one backend with an argument table refuses at its
+    // own encoder. A cap here would also have bound the Vulkan rail, which
+    // consumes none of these binds.
+    acc.set_threadgroup_memory(u32::MAX, 256);
+    acc.set_threadgroup_memory(64, 512);
+    assert_eq!(
+        acc.threadgroup_memory.len(),
+        2,
+        "a slot past any host table is still recorded, not dropped here"
+    );
+}
+
+/// Each argument table renders its own `reason=`, and the line keeps the shape
+/// the log has always carried.
+///
+/// The slugs used to live inside a `format!` string, where a later decline
+/// spelling one of them would have shared this path's `fail_once` latch and
+/// silenced one of the two for the boot, with nothing failing. They are
+/// `slug()` bodies now, where a reader looking for the vocabulary will find
+/// them; this pins that moving them did not change what a reader greps for, and
+/// that the three tables stay distinguishable.
+///
+/// There were four. The threadgroup-memory table left this enum when its cap
+/// did: it is bounded by a Metal argument table rather than by the protocol, so
+/// the refusal belongs to the encoder that owns the table and is named there.
+#[test]
+fn every_compute_bind_table_renders_its_own_slug() {
+    use crate::observe::Emit;
+    use crate::runtime::compute_exec::ComputeBindOverflow as O;
+
+    assert_eq!(
+        Emit::decline(
+            "compute_bind_overflow",
+            &O::Buffer {
+                index: 40,
+                arg: 9,
+                cap: MAX_COMPUTE_BUFFER_SLOTS,
+            },
+        )
+        .render(),
+        "compute_bind_overflow reason=buffer_index_overflow index=40 arg=9 cap=31"
+    );
+
+    let slugs: Vec<&str> = [
+        O::Buffer {
+            index: 0,
+            arg: 0,
+            cap: 0,
+        },
+        O::Texture {
+            index: 0,
+            arg: 0,
+            cap: 0,
+        },
+        O::Sampler {
+            index: 0,
+            arg: 0,
+            cap: 0,
+        },
+    ]
+    .iter()
+    .map(|o| crate::observe::Decline::slug(o))
+    .collect();
+    let unique: std::collections::BTreeSet<&str> = slugs.iter().copied().collect();
+    assert_eq!(
+        unique.len(),
+        slugs.len(),
+        "two tables sharing a slug would share fail_once's latch: {slugs:?}"
     );
 }
 
@@ -486,9 +490,79 @@ fn resolve_indirect_threadgroups_from_buffer() {
     cmd.indirect_buffer_ref = 7;
     cmd.indirect_buffer_offset = 0;
     cmd.threads_per_threadgroup = compute::Size3 { x: 8, y: 1, z: 1 };
-    let (gx, gy, gz, tx, ty, tz, threads) =
-        resolve_dispatch_dims(&mut state, &host, 1, &cmd).unwrap();
-    assert_eq!((gx, gy, gz, tx, ty, tz, threads), (2, 3, 1, 8, 1, 1, false));
+    let dims = resolve_dispatch_dims(&mut state, &host, 1, &cmd).unwrap();
+    // The grid comes from the indirect buffer and the threadgroup from the
+    // wire, which is the whole point of this arm — asserting them as one flat
+    // septuple could not say which source each half came from.
+    assert_eq!(dims.grid, Extent3 { x: 2, y: 3, z: 1 });
+    assert_eq!(dims.threadgroup, Extent3 { x: 8, y: 1, z: 1 });
+    assert!(!dims.dispatch_threads);
+}
+
+/// `DispatchThreadsIndirect` reads both extents from the buffer, at the two
+/// halves of `MTLDispatchThreadsIndirectArguments`.
+///
+/// Six distinct values, because this arm used to be six
+/// `u32_dim(ld32(&raw[N..]))` calls differing only by the literals
+/// `0, 4, 8, 12, 16, 20`. A transposition among those dispatches a valid grid
+/// of the wrong shape, which nothing downstream can tell from the right one —
+/// so every component here differs from every other, and `threads_per_threadgroup`
+/// on the wire is set to a value appearing nowhere in the buffer, because this
+/// arm must not read it.
+#[test]
+fn dispatch_threads_indirect_reads_both_extents_from_the_buffer() {
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
+    assert!(state.set_object_list(1, 0, 32));
+
+    // threadsPerGrid[3] then threadsPerThreadgroup[3], LE u32 each.
+    let args = [11u32, 22, 33, 44, 55, 66];
+    let arg_bytes: Vec<u8> = args.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let buf_gva = 5u64 << RESOURCE_PAGE_SHIFT;
+    write_task_gva_arm64e(&mut host, &state.tasks[1], buf_gva, &arg_bytes);
+    let mut bdesc = vec![0u8; 16];
+    st64(&mut bdesc[0..], 24);
+    st32(&mut bdesc[8..], 5);
+    let bdesc_gva = 0x180u64;
+    write_task_gva_arm64e(&mut host, &state.tasks[1], bdesc_gva, &bdesc);
+    {
+        let off = list_object_entry_offset(7, 32).unwrap();
+        let mut le = [0u8; OBJECT_LIST_ENTRY_LEN];
+        let packed = (OBJECT_TYPE_BUFFER as u32) | (16u32 << 8);
+        st32(&mut le[0..], packed);
+        le[4..12].copy_from_slice(&bdesc_gva.to_le_bytes());
+        write_task_gva_arm64e(&mut host, &state.tasks[1], off, &le);
+    }
+
+    let mut cmd = ComputeCommand::default();
+    cmd.kind = Kind::DispatchThreadsIndirect;
+    cmd.indirect_buffer_ref = 7;
+    cmd.indirect_buffer_offset = 0;
+    cmd.threads_per_threadgroup = compute::Size3 {
+        x: 99,
+        y: 99,
+        z: 99,
+    };
+
+    let dims = resolve_dispatch_dims(&mut state, &host, 1, &cmd).unwrap();
+    assert_eq!(
+        dims.grid,
+        Extent3 {
+            x: 11,
+            y: 22,
+            z: 33
+        }
+    );
+    assert_eq!(
+        dims.threadgroup,
+        Extent3 {
+            x: 44,
+            y: 55,
+            z: 66
+        }
+    );
+    assert!(dims.dispatch_threads);
 }
 
 /// The wire shape that used to be "recovered" is now a named refusal.
@@ -584,8 +658,14 @@ fn a_compute_refusal_names_its_check_and_ok_names_nothing() {
 }
 
 /// Two different buffer-staging checks, two different slugs — the property
-/// that a shared `MissingBuffer` could not express. `ref=0` never resolves,
-/// so both paths refuse on their first gate.
+/// that a shared `MissingBuffer` could not express.
+///
+/// The window path's assertion used to read `compute_buf_win_no_backing`, and
+/// this comment used to say `ref=0` made "both paths refuse on their first
+/// gate". Only one of them did. `no_backing` is the *last* of that path's four
+/// refusals and was returned for all four, so the slug named the fourth gate for
+/// a record that never reached the first — and this test asserted that as the
+/// intended behaviour. Each refusal now answers under its own name.
 #[test]
 fn the_buffer_paths_refuse_under_their_own_names() {
     use crate::observe::Refusal;
@@ -595,10 +675,23 @@ fn the_buffer_paths_refuse_under_their_own_names() {
     gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
     assert!(state.set_object_list(1, 0, 32));
 
+    // `ref=0` is the unbound sentinel, and the window path now says that rather
+    // than reporting the outcome of a resolution it never attempted.
     let window = read_buffer_window(&state, &host, 1, 0, 0, 4);
     assert_eq!(
         window.err().and_then(|e| e.refusal()),
-        Some("compute_buf_win_no_backing")
+        Some("compute_buf_win_ref_unbound")
+    );
+
+    // A bound-looking ref naming an empty list slot refuses on the first rung,
+    // under this rail's own role — distinct from both of the above.
+    let unresolvable = read_buffer_window(&state, &host, 1, 7, 0, 4);
+    assert_eq!(
+        unresolvable.err().and_then(|e| e.refusal()),
+        Some(crate::observe::ladder_slug!(
+            "compute_buf_win",
+            no_list_entry
+        ))
     );
 
     let bind = ComputeBufferBind {
@@ -611,7 +704,10 @@ fn the_buffer_paths_refuse_under_their_own_names() {
     let staged = stage_buffer(&state, &host, 1, &bind);
     assert_eq!(
         staged.err().and_then(|e| e.refusal()),
-        Some("compute_stage_buf_no_entry")
+        Some(crate::observe::ladder_slug!(
+            "compute_stage_buf",
+            no_list_entry
+        ))
     );
 }
 
@@ -722,6 +818,80 @@ fn dispatch_missing_pipeline_not_nometal() {
         st,
         ComputeStatus::MissingPipeline("compute_vk_pipeline_ref_zero")
     );
+}
+
+/// One condition, one line, one refusal slug — from every rail that asks.
+///
+/// Three sites used to ask whether a staged texture's format has a storage
+/// selector, and each answered with its own event name, its own `reason=` and
+/// its own `Unsupported(..)` string, dropping a different field apiece. A grep
+/// for any one of them found a third of the losses and could not say which rail
+/// it came from. The assertions below are on the line's shape, so a fourth
+/// spelling has to fail here before it can reach the log.
+#[test]
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+fn a_format_with_no_storage_selector_refuses_the_same_way_from_every_rail() {
+    use crate::runtime::compute_exec::{split_staged_textures, ComputeStatus, StagedTexture};
+
+    let mut no_selector = StagedTexture {
+        binding: 33,
+        texture_ref: 44,
+        // A sample-only format: `contract::pixel_format::storage_selector` has
+        // no entry for it by design, which is exactly the class this refuses.
+        pixel_format: crate::contract::pixel_format::MTL_FORMAT_R32_FLOAT,
+        storage_selector: None,
+        width: 4,
+        height: 4,
+        bytes: vec![0; 64],
+        is_storage: true,
+        #[cfg(feature = "backend-vulkan")]
+        residency: None,
+        #[cfg(feature = "backend-vulkan")]
+        seed_skipped: false,
+        #[cfg(feature = "backend-vulkan")]
+        sample_resident: None,
+        writeback: TextureWriteback::None,
+    };
+
+    assert_eq!(
+        no_selector.storage_selector_or_refuse(7, 9),
+        Err(ComputeStatus::Unsupported("compute_no_backend_selector")),
+        "the refusal slug is one string, not one per rail"
+    );
+    assert_eq!(
+        split_staged_textures(std::slice::from_mut(&mut no_selector), 7, 9).err(),
+        Some(ComputeStatus::Unsupported("compute_no_backend_selector")),
+        "the split refuses through the same helper, not a second copy of it"
+    );
+
+    let log = std::fs::read_to_string(crate::observe::fail_log_path()).expect("fail log");
+    let line = log
+        .lines()
+        .rev()
+        .find(|l| l.starts_with("compute_texture_format "))
+        .expect("a lost bind must name itself");
+    for field in [
+        "reason=no_backend_selector",
+        "task=7",
+        "pipe=9",
+        "bind=33",
+        "ref=44",
+        "storage=1",
+    ] {
+        assert!(
+            line.contains(field),
+            "the line must carry {field}; one of the three copies dropped it: {line}"
+        );
+    }
+
+    // And a format that does have a selector goes through.
+    let mut ok = StagedTexture {
+        storage_selector: Some(5),
+        ..no_selector
+    };
+    let (storage, sampled) =
+        split_staged_textures(std::slice::from_mut(&mut ok), 7, 9).expect("selector present");
+    assert_eq!((storage.len(), sampled.len()), (1, 0));
 }
 
 #[test]
@@ -863,7 +1033,7 @@ fn dispatch_missing_texture_fails() {
 }
 
 /// Live CI wallpaper: type-5 RefTexture → type-4 surface_id must stage via
-/// ensure_surface + mapping (same order as metal_draw sample). Without
+/// ensure_surface + mapping (same order as the `runtime::draw` sample). Without
 /// ensure, stage fell through to type-2/3 with the type-5 ref → always
 /// MissingTexture (`compute_stage_tex … ot=5`).
 #[test]
@@ -895,9 +1065,9 @@ fn stage_texture_type5_ref_resolves_surface_mapping() {
 
     // Object-list: type-5 at ref 10 → surface_id=3 (mapping already seeded).
     let desc_gva = (4u64 + 2) << PAGE_SHIFT_ARM64E; // data pfn base 4 + 2
-    let mut type5_desc = vec![0u8; 16];
-    st32(&mut type5_desc[objects::TYPE5_SURFACE_ID..], sid);
-    write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, &type5_desc);
+    let type5_desc = Type5Builder::new(sid, 0, 0, 0).with_len(16);
+    let type5_desc = type5_desc.bytes();
+    write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, type5_desc);
     let off = list_object_entry_offset(type5_ref, 32).unwrap();
     let mut list_entry = [0u8; OBJECT_LIST_ENTRY_LEN];
     let packed = (objects::OBJECT_TYPE_REF_TEXTURE as u32) | ((16u32) << 8);
@@ -949,47 +1119,12 @@ fn stage_texture_type5_record_reshapes_stageable_single_plane_surface() {
 
     // Same 16 bytes per logical row: 4 BGRA8 texels = one RGBA32Uint texel.
     let desc_gva = (4u64 + 2) << PAGE_SHIFT_ARM64E;
-    let mut type5_desc = vec![0u8; 8];
-    st32(&mut type5_desc[objects::TYPE5_SURFACE_ID..], sid);
-    type5_desc.extend_from_slice(&[
-        0x2f,
-        0,
-        0,
-        0,
-        0x30,
-        0,
-        0,
-        0,
-        10,
-        0,
-        0,
-        0, // kind, blob_len, own_ref
-        0x42,
-        0x02,
-        MTL_FORMAT_RGBA32_UINT as u8,
-        (MTL_FORMAT_RGBA32_UINT >> 8) as u8,
-        1,
-        0,
-        0,
-        0, // view width
-        4,
-        0,
-        0,
-        0, // view height
-        1,
-        0,
-        0,
-        0, // depth
-        1,
-        0,
-        1,
-        0,
-        1,
-        0,
-        0x10,
-        0, // trailer
-    ]);
-    write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, &type5_desc);
+    let type5_desc = Type5Builder::new(sid, 0, 10, 0x42)
+        .unknown(0x02)
+        .geometry(MTL_FORMAT_RGBA32_UINT, 1, 4, 1)
+        .trailer([1, 0, 1, 0, 1, 0, 0x10, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    let type5_desc = type5_desc.bytes();
+    write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, type5_desc);
     let off = list_object_entry_offset(type5_ref, 32).unwrap();
     let mut list_entry = [0u8; OBJECT_LIST_ENTRY_LEN];
     let packed = (objects::OBJECT_TYPE_REF_TEXTURE as u32) | ((type5_desc.len() as u32) << 8);
@@ -1027,11 +1162,11 @@ fn stage_texture_type5_record_reshapes_stageable_single_plane_surface() {
     // path), so `storage_selector` is populated — but it is inert here: this
     // view is staged sampled (`is_storage=false`, binding 32), and the
     // selector is only consulted on the storage-bind path.
-    let format_at = objects::TYPE5_ARG_RECORD + objects::TYPE5_RECORD_FORMAT;
-    type5_desc[format_at..format_at + 2].copy_from_slice(&MTL_FORMAT_R32_UINT.to_le_bytes());
-    let width_at = objects::TYPE5_ARG_RECORD + objects::TYPE5_RECORD_WIDTH;
-    st32(&mut type5_desc[width_at..], 4);
-    write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, &type5_desc);
+    let reshaped = Type5Builder::new(sid, 0, 10, 0x42)
+        .unknown(0x02)
+        .geometry(MTL_FORMAT_R32_UINT, 4, 4, 1)
+        .trailer([1, 0, 1, 0, 1, 0, 0x10, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, reshaped.bytes());
     let sampled = stage_texture_raw(&mut state, &mut host, 1, type5_ref, 32, false)
         .expect("sample-only R32Uint view must stage from the same IOSurface bytes");
     assert_eq!((sampled.width, sampled.height), (4, 4));
@@ -1108,16 +1243,12 @@ fn stage_texture_type5_record_stages_biplanar_y_plane() {
 
     // Type-5 descriptor: sid + args blob carrying the R8 16×8 plane record.
     let desc_gva = (4u64 + 2) << PAGE_SHIFT_ARM64E;
-    let mut type5_desc = vec![0u8; 8];
-    st32(&mut type5_desc[objects::TYPE5_SURFACE_ID..], sid);
-    type5_desc.extend_from_slice(&[
-        0x2f, 0, 0, 0, 0x30, 0, 0, 0, 10, 0, 0, 0, // kind, blob_len, own_ref
-        0x42, 0x01, 0x0a, 0x00, // tag, unk, fmt=R8
-        16, 0, 0, 0, // width
-        8, 0, 0, 0, // height
-        1, 0, 0, 0, // depth
-    ]);
-    write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, &type5_desc);
+    // tag, unk, fmt=R8
+    let type5_desc = Type5Builder::new(sid, 0, 10, 0x42)
+        .unknown(0x01)
+        .geometry(0x0a, 16, 8, 1);
+    let type5_desc = type5_desc.bytes();
+    write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, type5_desc);
     let off = list_object_entry_offset(type5_ref, 32).unwrap();
     let mut list_entry = [0u8; OBJECT_LIST_ENTRY_LEN];
     let packed = (objects::OBJECT_TYPE_REF_TEXTURE as u32) | ((type5_desc.len() as u32) << 8);
@@ -1191,9 +1322,9 @@ fn stage_texture_type5_multiplanar_without_record_fails_closed() {
 
     // Type-5 descriptor with sid but NO args record.
     let desc_gva = (4u64 + 2) << PAGE_SHIFT_ARM64E;
-    let mut type5_desc = vec![0u8; 8];
-    st32(&mut type5_desc[objects::TYPE5_SURFACE_ID..], sid);
-    write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, &type5_desc);
+    let type5_desc = Type5Builder::new(sid, 0, 0, 0).with_len(8);
+    let type5_desc = type5_desc.bytes();
+    write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, type5_desc);
     let off = list_object_entry_offset(type5_ref, 32).unwrap();
     let mut list_entry = [0u8; OBJECT_LIST_ENTRY_LEN];
     let packed = (objects::OBJECT_TYPE_REF_TEXTURE as u32) | ((type5_desc.len() as u32) << 8);
@@ -1346,6 +1477,8 @@ fn linear_writeback_retains_cache_when_guest_gva_is_unmapped() {
     let rgba = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
     let staged = StagedTexture {
         binding: 32,
+        #[cfg(all(feature = "backend-metal", target_os = "macos"))]
+        texture_ref: 44,
         pixel_format: MTL_FORMAT_RGBA8_UNORM,
         storage_selector: Some(5),
         width: 2,
@@ -1353,8 +1486,7 @@ fn linear_writeback_retains_cache_when_guest_gva_is_unmapped() {
         bytes: rgba.clone(),
         is_storage: true,
         residency: None,
-        seed_skipped: false,
-        sample_resident: None,
+        serve: None,
         writeback: TextureWriteback::Linear {
             pages: Default::default(),
             texture_ref,
@@ -1374,13 +1506,15 @@ fn linear_writeback_retains_cache_when_guest_gva_is_unmapped() {
     assert_eq!(
         surface_cache::get_linear_texture(
             &state,
-            task_id,
-            texture_ref,
-            gva,
-            MTL_FORMAT_RGBA8_UNORM,
-            2,
-            2,
-            8,
+            &surface_cache::LinearWindow {
+                task_id,
+                texture_ref,
+                gva,
+                pixel_format: MTL_FORMAT_RGBA8_UNORM,
+                width: 2,
+                height: 2,
+                row_stride: 8,
+            },
         ),
         Some(rgba.as_slice())
     );
@@ -1397,7 +1531,7 @@ fn linear_writeback_retains_cache_when_guest_gva_is_unmapped() {
 #[test]
 fn compute_stage_admits_full_screen_wide_gamut_without_cap() {
     use crate::contract::pixel_format::{bytes_per_pixel, MTL_FORMAT_RGBA16_FLOAT};
-    use crate::runtime::metal_draw::host_alloc_len;
+    use crate::runtime::draw::host_alloc_len;
     let bpp = bytes_per_pixel(MTL_FORMAT_RGBA16_FLOAT).expect("rgba16f bpp") as u64;
     let need = 1928u64 * 1920 * bpp;
     assert!(
@@ -1452,9 +1586,9 @@ fn stage_texture_type5_ignores_task_object_list_slot_collision() {
 
     // type-5 at ref 10 → surface_id 3
     let desc_gva = (4u64 + 2) << PAGE_SHIFT_ARM64E;
-    let mut type5_desc = vec![0u8; 16];
-    st32(&mut type5_desc[objects::TYPE5_SURFACE_ID..], sid);
-    write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, &type5_desc);
+    let type5_desc = Type5Builder::new(sid, 0, 0, 0).with_len(16);
+    let type5_desc = type5_desc.bytes();
+    write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, type5_desc);
     let off = list_object_entry_offset(type5_ref, 32).unwrap();
     let mut list_entry = [0u8; OBJECT_LIST_ENTRY_LEN];
     let packed = (objects::OBJECT_TYPE_REF_TEXTURE as u32) | ((16u32) << 8);
@@ -1485,9 +1619,9 @@ fn stage_texture_type5_without_surface_is_missing() {
     let type5_ref = 11u32;
     let sid = 99u32; // no mapping
     let desc_gva = (4u64 + 3) << PAGE_SHIFT_ARM64E;
-    let mut type5_desc = vec![0u8; 16];
-    st32(&mut type5_desc[objects::TYPE5_SURFACE_ID..], sid);
-    write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, &type5_desc);
+    let type5_desc = Type5Builder::new(sid, 0, 0, 0).with_len(16);
+    let type5_desc = type5_desc.bytes();
+    write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, type5_desc);
     let off = list_object_entry_offset(type5_ref, 32).unwrap();
     let mut list_entry = [0u8; OBJECT_LIST_ENTRY_LEN];
     let packed = (objects::OBJECT_TYPE_REF_TEXTURE as u32) | ((16u32) << 8);
@@ -1766,7 +1900,7 @@ fn setup_linear_task_x86(host: &mut FakeHost, state: &mut DeviceState, pfns: &[u
         st32(&mut pte, *pfn);
         host.write_gpa(root_gpa + (i as u64) * 4, &pte).unwrap();
     }
-    assert!(state.define_task(1, page, 2));
+    state.define_task(1, page, 2);
 }
 
 #[test]
@@ -1943,7 +2077,10 @@ fn bulk_linear_helpers_fall_back_on_fragmented_span() {
     ));
     // The fallback primitive still lands bytes across the fragmented span.
     let payload = [0xABu8; 8];
-    assert!(gva_mem::write_task_gva_product(&mut state, &mut host, 1, gva, &payload).is_ok());
+    assert!(
+        gva_mem::write_task_gva_product_within(&mut state, &mut host, 1, gva, &payload, None)
+            .is_ok()
+    );
 }
 
 /// A staged compute buffer records the pages it resolved to, and the writeback
@@ -1975,7 +2112,7 @@ fn a_staged_buffer_carries_the_pages_its_writeback_is_bounded_to() {
         st32(&mut pte, pfn);
         let _ = host.write_gpa(root_gpa + (i as u64) * 4, &pte);
     }
-    assert!(state.define_task(1, 0x1000, dir_pfn));
+    state.define_task(1, 0x1000, dir_pfn);
 
     let page = 1u64 << PAGE_SHIFT_ARM64E;
     let pages = staged_span_pages(&state, &host, 1, page, 0x100);
@@ -2013,4 +2150,309 @@ fn a_staged_buffer_carries_the_pages_its_writeback_is_bounded_to() {
     // so the writeback stays unbounded and the writer fails closed itself.
     assert!(staged_span_pages(&state, &host, 1, 0, 0x100).is_empty());
     assert!(staged_span_pages(&state, &host, 1, page, 0).is_empty());
+}
+
+/// The two halves of a resident answer partition; neither rail can see both.
+///
+/// `StagedTexture` used to carry this enum as a `bool` and an `Option` side by
+/// side, rebuilt independently by all three staging rails. Nothing then stopped
+/// a rail from setting both — and the two consumers read one field each, so a
+/// binding claiming to be seeded *and* sampled would have been dispatched as
+/// both a storage seed skip and a copy-on-sample, seeding one image from a
+/// placeholder. The state is unrepresentable now; this pins the accessors that
+/// replaced the two fields so a later variant cannot answer to both consumers
+/// or to neither.
+#[test]
+fn a_resident_answer_is_a_seed_or_a_sample_and_never_both() {
+    let key = crate::model::ComputeStorageResidencyKey {
+        mapping_id: 7,
+        map_generation: 3,
+        surface_offset: 0,
+        surface_bpr: 16,
+        span_end: 64,
+        width: 4,
+        height: 4,
+        pixel_format: 0x50,
+        texture_ref: 9,
+    };
+    for (serve, what) in [
+        (ResidentServe::Seed(11), "seed"),
+        (ResidentServe::Sample(key, 12), "sample"),
+    ] {
+        assert_eq!(
+            serve.seed_generation().is_some(),
+            serve.sample_source().is_none(),
+            "exactly one accessor must answer for the {what} variant"
+        );
+    }
+    assert_eq!(ResidentServe::Seed(11).seed_generation(), Some(11));
+    assert_eq!(
+        ResidentServe::Sample(key, 12).sample_source(),
+        Some((key, 12))
+    );
+
+    // And "no resident" answers neither, which is what makes `serve.is_none()`
+    // the one gate the rails use to decide they must read the guest window.
+    let none: Option<ResidentServe> = None;
+    assert!(none.and_then(ResidentServe::seed_generation).is_none());
+    assert!(none.and_then(ResidentServe::sample_source).is_none());
+}
+
+/// An `MTLDispatchType` the contract does not declare is named, counted, and
+/// substituted — and the two it does declare cross untouched and unremarked.
+///
+/// `WRITE_DESCRIPTOR` puts this ordinal on the wire unbounded: the decoder
+/// stores `d.dispatch_type.get()` with no range check, so whatever the guest
+/// wrote reaches the accumulator. What used to happen next was
+/// `if x == CONCURRENT { CONCURRENT } else { SERIAL }`, at the far end of the
+/// rail inside `execute_dispatch_metal` — so a guest asking for a dispatch type
+/// this device has no contract for got a *serial* encoder, silently, on the one
+/// arm that read the field at all.
+///
+/// Both halves are the test. A substitution nobody can see is the failure this
+/// commit exists to end; a line spent on the ordinary `Serial` and `Concurrent`
+/// records would be a flood on a per-segment path and would bury the one line
+/// that means something.
+#[test]
+fn an_undeclared_dispatch_type_is_named_and_counted_before_it_becomes_serial() {
+    use crate::contract::dispatch::{MTL_DISPATCH_TYPE_CONCURRENT, MTL_DISPATCH_TYPE_SERIAL};
+    use crate::runtime::drain::store_route_count;
+
+    let before = store_route_count("compute_dispatch_type_unknown");
+
+    let cap = crate::observe::FailCapture::start();
+    assert_eq!(
+        accepted_dispatch_type(3, MTL_DISPATCH_TYPE_SERIAL),
+        MTL_DISPATCH_TYPE_SERIAL
+    );
+    assert_eq!(
+        accepted_dispatch_type(3, MTL_DISPATCH_TYPE_CONCURRENT),
+        MTL_DISPATCH_TYPE_CONCURRENT
+    );
+    assert!(
+        cap.lines().is_empty(),
+        "a declared dispatch type must spend no line: {:?}",
+        cap.lines()
+    );
+    assert_eq!(
+        store_route_count("compute_dispatch_type_unknown"),
+        before,
+        "a declared dispatch type is not a substitution"
+    );
+    drop(cap);
+
+    // An ordinal outside the pair: substituted, named once, counted every time.
+    let cap = crate::observe::FailCapture::start();
+    for _ in 0..3 {
+        assert_eq!(
+            accepted_dispatch_type(3, 0x5e01),
+            MTL_DISPATCH_TYPE_SERIAL,
+            "an unrecognised dispatch type encodes Serial"
+        );
+    }
+    let line = cap.one("compute_dispatch_type");
+    assert!(
+        line.contains("reason=compute_dispatch_type_unknown")
+            && line.contains(" task=3 declared=24065"),
+        "the substitution must name the value that caused it: {line}"
+    );
+    assert_eq!(
+        store_route_count("compute_dispatch_type_unknown"),
+        before + 3,
+        "the line is deduped per value; the count is not"
+    );
+}
+
+/// A stage-input the decoder had to truncate must refuse its pipeline, not
+/// arrive as "this kernel declares no stage-input".
+///
+/// The two were one `None` for as long as the caps could be crossed. The
+/// consequence is not only a wrong Metal PSO: on the Vulkan arm
+/// `dispatch_compute_vulkan` refuses any pipeline whose `stage_input.is_some()`,
+/// so collapsing `OverCap` into `Absent` is what lets an unsupported dispatch
+/// through the one guard that exists for it.
+#[test]
+fn a_truncated_stage_input_is_not_the_same_as_an_absent_one() {
+    use crate::runtime::decode::resource::{ComputeStageInputAttribute, ComputeStageInputLayout};
+
+    assert_eq!(classify_stage_input(None), StageInputVerdict::Absent);
+
+    let empty = ComputeStageInputDescriptor::default();
+    assert_eq!(
+        classify_stage_input(Some(&empty)),
+        StageInputVerdict::Absent,
+        "a block naming nothing is a kernel with no stage-input"
+    );
+
+    let mut used = ComputeStageInputDescriptor::default();
+    used.attributes.push(ComputeStageInputAttribute::default());
+    used.layouts.push(ComputeStageInputLayout::default());
+    assert_eq!(classify_stage_input(Some(&used)), StageInputVerdict::Use);
+
+    let mut dropped_attr = used.clone();
+    dropped_attr.dropped_attributes = 1;
+    assert_eq!(
+        classify_stage_input(Some(&dropped_attr)),
+        StageInputVerdict::OverCap,
+        "a dropped attribute refuses the pipeline"
+    );
+
+    let mut dropped_layout = used.clone();
+    dropped_layout.dropped_layouts = 1;
+    assert_eq!(
+        classify_stage_input(Some(&dropped_layout)),
+        StageInputVerdict::OverCap,
+        "a dropped layout refuses the pipeline"
+    );
+
+    // Both together, and with the entry lists empty — the ordering matters, or
+    // an over-cap block whose kept entries are all beyond the cap reads as
+    // absent, which is the collapse this test exists to forbid.
+    let mut all_dropped = ComputeStageInputDescriptor::default();
+    all_dropped.dropped_attributes = 3;
+    all_dropped.dropped_layouts = 2;
+    assert_eq!(
+        classify_stage_input(Some(&all_dropped)),
+        StageInputVerdict::OverCap
+    );
+}
+
+/// A heap texture's residency mirror is never evicted by the per-mapping cap.
+///
+/// `compute_storage_residency` holds three keyings and only one of them has a
+/// guest fallback. A mapping-backed entry dropped by the cap costs the next read
+/// its resident and sends it back to that mapping's guest pages. A **heap**
+/// texture has no guest pages at all — it is host-only — so an absent entry
+/// stages `vec![0; need]` and the kernel reads a blank texture.
+///
+/// The two are kept apart by `note_storage_residency_writeback` returning before
+/// the cap runs, not by the cap's own filter: `ComputeStorageResidencyKey::heap`
+/// and `::linear` both set `mapping_id` to 0, so they would share one bucket if
+/// the eviction ever saw them. An audit that read the filter alone concluded
+/// heap textures were already being evicted into zero-filled binds. It was
+/// wrong, and it was wrong by one early return.
+///
+/// So drive well past `STORAGE_RESIDENCY_WINDOWS_PER_MAPPING` distinct heap
+/// textures and assert every one is still there. This fails the moment that
+/// early return moves.
+#[test]
+#[cfg(feature = "backend-vulkan")]
+fn a_heap_texture_mirror_outlives_the_per_mapping_cap() {
+    use super::{
+        note_storage_residency_writeback, ComputeStorageResidencyCandidate, StagedTexture,
+        TextureWriteback, STORAGE_RESIDENCY_WINDOWS_PER_MAPPING,
+    };
+    use crate::model::ComputeStorageResidencyKey;
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    // Four times the cap, so this stays a real margin if the cap is retuned.
+    const HEAP_TEXTURES: u32 = 4 * STORAGE_RESIDENCY_WINDOWS_PER_MAPPING as u32;
+
+    let staged = |key: ComputeStorageResidencyKey| StagedTexture {
+        binding: 33,
+        #[cfg(all(feature = "backend-metal", target_os = "macos"))]
+        texture_ref: key.texture_ref,
+        pixel_format: key.pixel_format,
+        storage_selector: Some(0),
+        width: key.width,
+        height: key.height,
+        bytes: Vec::new(),
+        // The mirror is only armed for a storage output, which is what makes a
+        // heap texture's engine copy the sole content.
+        is_storage: true,
+        residency: Some(ComputeStorageResidencyCandidate {
+            key,
+            seed_generation: 1,
+        }),
+        serve: None,
+        writeback: TextureWriteback::None,
+    };
+
+    for tex in 0..HEAP_TEXTURES {
+        let key = ComputeStorageResidencyKey::heap(1, tex, 16, 16, 0x50);
+        assert_eq!(
+            key.mapping_id, 0,
+            "a heap key sits in the same bucket a linear key does; that is the \
+             whole reason this test exists"
+        );
+        note_storage_residency_writeback(&mut state, &staged(key));
+    }
+
+    assert_eq!(
+        state.compute_storage_residency.len(),
+        HEAP_TEXTURES as usize,
+        "every heap texture's mirror is retained; the per-mapping cap must not \
+         reach a key whose loss stages a blank texture"
+    );
+    for tex in 0..HEAP_TEXTURES {
+        let key = ComputeStorageResidencyKey::heap(1, tex, 16, 16, 0x50);
+        assert!(
+            state.compute_storage_residency.contains_key(&key),
+            "heap texture {tex} lost its mirror"
+        );
+    }
+}
+
+/// A bind past the argument table refuses the dispatch, rather than letting it
+/// run with the guest's binding absent.
+///
+/// The bind walk has no dispatch to refuse, so it records instead, and
+/// `resolve_dispatch_dims_reported` — the one gate both executors pass through
+/// — is where the refusal lands. Driven through that function rather than
+/// asserting the field, because the field is bookkeeping and the refusal is the
+/// behaviour.
+///
+/// The dims themselves are deliberately resolvable here: a dispatch that would
+/// otherwise have succeeded is the only one that proves the refusal came from
+/// the bind and not from the grid.
+#[test]
+fn a_bind_past_the_argument_table_refuses_the_dispatch() {
+    let host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+
+    let mut cmd = ComputeCommand::default();
+    cmd.kind = Kind::DispatchThreadgroups;
+    cmd.grid = compute::Size3 { x: 4, y: 1, z: 1 };
+    cmd.threads_per_threadgroup = compute::Size3 { x: 8, y: 1, z: 1 };
+
+    let mut acc = ComputeAccum::default();
+    assert!(
+        resolve_dispatch_dims_reported(&mut state, &host, 1, &cmd, &acc).is_ok(),
+        "the dispatch resolves before any bind, so a later refusal is the bind's"
+    );
+
+    acc.bind_textures(MAX_COMPUTE_TEXTURE_SLOTS + 3, &[RefBinding { ref_: 9 }]);
+    assert!(
+        acc.textures.is_empty(),
+        "the slot is past the table, so there was nowhere to record it"
+    );
+    let refused = resolve_dispatch_dims_reported(&mut state, &host, 1, &cmd, &acc)
+        .expect_err("a dispatch missing a binding the guest asked for is refused");
+    assert_eq!(
+        refused,
+        ComputeStatus::Unsupported("compute_dispatch_bind_past_table")
+    );
+
+    // Sticky: the binding stays unrepresentable, so the next dispatch is
+    // refused too rather than quietly running without it.
+    assert!(
+        resolve_dispatch_dims_reported(&mut state, &host, 1, &cmd, &acc).is_err(),
+        "one refused bind refuses every dispatch that would have used it"
+    );
+
+    // ...until the guest clears that slot, which makes what this accumulator
+    // holds equal to what the guest asked for again.
+    acc.bind_textures(MAX_COMPUTE_TEXTURE_SLOTS + 3, &[RefBinding { ref_: 0 }]);
+    assert!(
+        resolve_dispatch_dims_reported(&mut state, &host, 1, &cmd, &acc).is_ok(),
+        "a nil bind at the refused slot retires the refusal with it"
+    );
+
+    // A clear at a different slot is not that slot, and must not lift it.
+    acc.bind_textures(MAX_COMPUTE_TEXTURE_SLOTS + 5, &[RefBinding { ref_: 9 }]);
+    acc.bind_textures(2, &[RefBinding { ref_: 0 }]);
+    assert!(
+        resolve_dispatch_dims_reported(&mut state, &host, 1, &cmd, &acc).is_err(),
+        "clearing an unrelated slot leaves the refused one refused"
+    );
 }

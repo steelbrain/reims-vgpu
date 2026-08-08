@@ -115,7 +115,7 @@ fn srgb(vk: vk::Format, linear_vk: vk::Format, bytes_per_texel: u32) -> PixelFor
 /// value declines by name rather than reaching a default. Depth/stencil arms
 /// are included because the same enum carries them on the wire — whether a
 /// given role (colour attachment, storage image, sampled) admits a format is a
-/// *contract* question answered by `render_target_class` / `storage_selector` /
+/// *contract* question answered by `render_target_bpp` / `storage_selector` /
 /// `sampled_class`, and a *device* question answered by the capability layer;
 /// neither is this function's job.
 pub fn translate(mtl: u16) -> Result<PixelFormat, TranslateReason> {

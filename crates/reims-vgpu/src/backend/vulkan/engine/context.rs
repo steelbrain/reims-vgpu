@@ -18,7 +18,19 @@ use crate::backend::vulkan::caps::memory_topology::{
 };
 use crate::backend::vulkan::caps::{DriverQuirk, HostGpuCaps};
 
-/// Max device recreates per process after DEVICE_LOST (named constant).
+/// Max device recreates **that produce no guest work between them**.
+///
+/// The bound is on a recreate *storm* — lost, rebuilt, lost again before
+/// anything ran — which is the case a device cannot get out of and where
+/// retrying forever is a spin. It is deliberately not a lifetime count. A GPU
+/// that resets is not a GPU that is finished, and a host driver that reset three
+/// times over a week of uptime would otherwise leave this device answering
+/// `RecreateCapExhausted` to every draw for as long as the guest ran, with hours
+/// of correct rendering between each of the three.
+///
+/// [`ContextOwner::note_work_completed`] is what makes the difference: one draw
+/// or dispatch that reaches the GPU on the rebuilt device says that recreate did
+/// its job, and the budget starts over. A storm never reaches it.
 pub const MAX_DEVICE_RECREATES: u32 = 3;
 
 /// Bounded fence wait (nanoseconds). Named constant — not env-gated.
@@ -257,6 +269,14 @@ pub(crate) struct DeviceContext {
     /// physical device, and the previous code re-queried it through the loader
     /// on every single allocation.
     pub memory_properties: vk::PhysicalDeviceMemoryProperties,
+    /// `VK_EXT_external_memory_host` entry points, loaded only where
+    /// [`HostGpuCaps::host_pointer`] resolved to `Supported` — which is also the
+    /// only rung on which the extension was enabled, so loading it on any other
+    /// would resolve entry points the device was never asked for.
+    ///
+    /// `None` is the answer on every host without the extension, and the import
+    /// site declines by name when it sees one.
+    pub external_memory_host: Option<ash::ext::external_memory_host::Device>,
     /// Queue family used for all engine submits (graphics draws + compute).
     pub gq: u32,
     /// True when `gq` supports both GRAPHICS and COMPUTE (required for engine compute).
@@ -274,6 +294,19 @@ pub(crate) struct DeviceContext {
     pub sampled_r32f_linear_filter: bool,
     pub pipeline_cache: vk::PipelineCache,
     pub vertex_divisor: VertexDivisorCapabilities,
+    /// Offset alignment a guest-window import must satisfy before a draw may
+    /// bind it directly as a vertex or storage buffer, taken from
+    /// `VkPhysicalDeviceLimits`.
+    ///
+    /// One number for both because the dedup in `stage_buffer_content` shares a
+    /// bound buffer between a stream that feeds vertex fetch and one that feeds
+    /// a storage binding, so a value legal for only one of them would be a
+    /// valid-usage violation the moment the same guest span is used twice.
+    /// `min*BufferOffsetAlignment` are the device's own answers; the 16 floor
+    /// covers vertex fetch, which the spec gives no queryable limit for and
+    /// which implementations may require to be component-aligned — 16 bytes is
+    /// the largest component-size any vertex format has.
+    pub guest_bind_offset_align: u64,
     /// Which vertex attribute formats this device accepts in a vertex buffer,
     /// probed once. Vulkan makes the three-component 8/16-bit formats optional,
     /// so a pipeline resolves each attribute through this rather than assuming
@@ -300,6 +333,15 @@ pub(crate) struct DeviceContext {
     /// caller cannot tell GPU work from the latency of asking. See
     /// [`TimestampProbe`].
     pub timestamps: Option<TimestampProbe>,
+    /// The thread that announces a GPU-written completion stamp, and the
+    /// timeline semaphore its submissions signal.
+    ///
+    /// `None` when the device does not advertise `timelineSemaphore` or the
+    /// thread would not start — the stamp rail then falls back to blocking the
+    /// drain worker, which is what every host did before this existed. See
+    /// [`super::stamp_completion`] for why the interrupt cannot be deferred to
+    /// anything that runs on a schedule.
+    pub stamp_completion: Option<super::stamp_completion::StampCompletion>,
     /// On-disk VkPipelineCache blob for this device (keyed by
     /// pipelineCacheUUID), or None when persistence is unavailable.
     pub pipeline_cache_path: Option<std::path::PathBuf>,
@@ -454,6 +496,31 @@ impl DeviceContext {
                 return Err(DrawError::Init(InitDecline::NoGraphicsQueueFamily));
             }
         };
+        // A queue family that transfers and does nothing else is a dedicated
+        // copy engine, and the reason to want one is that this device's largest
+        // remaining cost is bytes crossing the bus: a driven Safari drag moves
+        // ~2.7 GB of guest buffer runs into device-local memory and writes
+        // ~5.1 GB of rendered surface back to guest pages every second, all of
+        // it recorded into the draw's own command buffer, where it serialises
+        // against the rendering it feeds.
+        //
+        // Selected here and reported below, and nothing yet asks for a queue
+        // from it — the reading comes first, on every pathway, because most
+        // integrated parts have no such family and a rail built for one would
+        // then be a rail most hosts never take.
+        //
+        // Selected by what the family can do, never by device or driver name.
+        // `TRANSFER` alone is the whole test: `GRAPHICS` or `COMPUTE` implies
+        // transfer support, so a family carrying either is the one this device
+        // already submits draws to and moving copies there buys nothing.
+        // Sparse-binding and the video/optical-flow bits do not disqualify a
+        // family — they say what else the hardware block can do, not that it
+        // shares the graphics engine.
+        //
+        // `None` on a host with no such family, where everything stays on `gq`.
+        // That is not a fallback: it is the only arrangement most integrated
+        // parts offer.
+        let transfer_qf = dedicated_transfer_family(&qfs);
         let prio = [1.0f32];
         let qci = [vk::DeviceQueueCreateInfo::default()
             .queue_family_index(gq)
@@ -493,6 +560,28 @@ impl DeviceContext {
         // shader buffer access (index fetch, attachment access, and
         // encoder-level suspects remain open).
         let enabled = features.enabled_features();
+        // Whether guest RAM can reach this device as a host-pointer import over
+        // whole RAMBlocks, and at what granularity. Same shape as the query
+        // above and for the same reason: the answer is the only producer of the
+        // extension string it requires.
+        let host_pointer =
+            crate::backend::vulkan::caps::host_pointer::query(&instance, pd, &has_device_extension);
+        // Published for `runtime::guest_ram_map`, which builds the imports and
+        // has no device context to read the granularity from. A negative rung
+        // withdraws it rather than publishing zero, so the absence of a number
+        // is itself the gate and no site can act on a granularity from a device
+        // that declined the handle type.
+        match host_pointer.rung {
+            crate::backend::vulkan::caps::HostPointerImport::Supported => {
+                crate::runtime::guest_ram::latch_granularity(host_pointer.min_alignment);
+            }
+            _ => crate::runtime::guest_ram::forget_granularity(),
+        }
+        // Every import this process holds names a `VkDeviceMemory` that dies
+        // with the device below. Dropping them here, before the new one exists,
+        // is what makes a recreate rebuild against fresh identities instead of
+        // resolving a stale slice against a handle that is gone.
+        crate::runtime::guest_ram_map::reset();
         let portability_subset = has_device_extension(vk::KHR_PORTABILITY_SUBSET_NAME);
         let vertex_attribute_divisor = has_device_extension(vk::KHR_VERTEX_ATTRIBUTE_DIVISOR_NAME);
         #[cfg(feature = "host-window")]
@@ -559,6 +648,9 @@ impl DeviceContext {
         // pre-1.2 spelling of mirror-clamp-to-edge, on a device that has the
         // extension but not the core feature.
         enabled_device_extensions.extend(features.required_extensions());
+        // Only the `Supported` rung names `VK_EXT_external_memory_host`, so a
+        // host without it gets a device rather than a failed `vkCreateDevice`.
+        enabled_device_extensions.extend(host_pointer.rung.required_extensions());
         // These three are built in `caps` too. They are bound to locals here
         // only because `push_next` borrows them for the lifetime of `dci`.
         let mut en16 = features.enabled_16bit_storage();
@@ -611,14 +703,38 @@ impl DeviceContext {
                     .ok()
             })
             .flatten();
+        // Gated on the feature actually being enabled, not on the API version.
+        // `timelineSemaphore` is core in 1.2 and this backend's baseline is 1.2,
+        // so a device that declines it is out of spec — which is exactly why the
+        // answer is read from `features` rather than assumed: an assumption here
+        // is a `vkWaitSemaphores` into a driver that never implemented it.
+        let stamp_completion = features.timeline_semaphore
+            .then(|| super::stamp_completion::StampCompletion::start(&device))
+            .transpose()
+            .map_err(|e| {
+                crate::observe::Emit::decline(
+                    "vk_stamp_completion",
+                    &VkCall::new(VkOp::ContextCreateSemaphore, e),
+                )
+                .fail_once(0);
+            })
+            .ok()
+            .flatten();
         let memory_properties = instance.get_physical_device_memory_properties(pd);
         let caps = HostGpuCaps {
             memory: classify_memory(&memory_properties),
             quirks: DriverQuirk::for_portability_subset(portability_subset),
+            host_pointer,
             portability_subset,
             device_api_version: props.api_version,
             device_type: props.device_type,
         };
+        // Loaded from the same answer that enabled the extension, so the two
+        // cannot disagree about whether these entry points are legal to call.
+        let external_memory_host = caps
+            .host_pointer
+            .is_available()
+            .then(|| ash::ext::external_memory_host::Device::new(&instance, &device));
         let device_name = CStr::from_ptr(props.device_name.as_ptr())
             .to_string_lossy()
             .into_owned();
@@ -627,6 +743,23 @@ impl DeviceContext {
         // device without a copy. Load-bearing for portability debugging — "why
         // is this host slow / blank" starts here.
         crate::observe::off(caps.selection_line(&device_name));
+        // Beside `vk_caps` rather than inside it: the queue arrangement is a
+        // property of the device this engine created, and `HostGpuCaps` is
+        // built before any queue family is chosen. `transfer_family=none` is
+        // not a degraded reading — it is the arrangement, and it says this
+        // boot's copies share the queue its draws are submitted to.
+        crate::observe::off(format!(
+            "vk_queues families={} graphics_family={gq} compute_capable={compute_capable} transfer_family={}",
+            qfs.len(),
+            transfer_qf
+                .map(|q| q.to_string())
+                .unwrap_or_else(|| "none".to_owned()),
+        ));
+        // Whether this host could sample guest pages in place, which is what
+        // decides if the sampled cache is memoizing a copy that has to exist.
+        // Reported and never branched on — see the module doc for why a positive
+        // answer here is necessary and not sufficient.
+        crate::backend::vulkan::caps::linear_sampled::report(&instance, pd);
         // Fine-grained capabilities that do change what a draw can express.
         crate::observe::off(format!(
             "vk_device_select name={device_name:?} type={:?} depth_stencil_format={:?} bgra_storage_composite={} compute_capable={} quirks_no_deferred_batching={} quirks_guest_pages_authoritative={}",
@@ -686,18 +819,25 @@ impl DeviceContext {
             device,
             caps,
             memory_properties,
+            external_memory_host,
             gq,
             compute_capable,
             storage_image_write_without_format: storage_image_write_without_format_bgra,
             sampled_r32f_linear_filter,
             pipeline_cache,
             vertex_divisor,
+            guest_bind_offset_align: props
+                .limits
+                .min_storage_buffer_offset_alignment
+                .max(props.limits.min_uniform_buffer_offset_alignment)
+                .max(16),
             vertex_formats,
             max_sampler_anisotropy: features.max_sampler_anisotropy,
             sampler_anisotropy: features.sampler_anisotropy,
             features,
             depth_stencil_format,
             timestamps,
+            stamp_completion,
             pipeline_cache_path: Some(pipeline_cache_path),
             pipeline_cache_saved_len: AtomicUsize::new(initial_len),
             #[cfg(feature = "host-window")]
@@ -773,6 +913,12 @@ impl DeviceContext {
     }
 
     pub(crate) unsafe fn destroy(&mut self) {
+        // First, and before anything else this function touches: the completion
+        // thread holds a clone of `self.device` and is blocked inside it. Every
+        // line below is a use-after-free if it is still running.
+        if let Some(mut completion) = self.stamp_completion.take() {
+            unsafe { completion.stop(&self.device) };
+        }
         if let Some(probe) = self.timestamps.take() {
             self.device.destroy_query_pool(probe.pool, None);
         }
@@ -823,7 +969,8 @@ impl DeviceContext {
     }
 
     /// Escape hatch for a caller that has already built a [`MemoryRequest`]
-    /// (the dmabuf import path, which must match a foreign allocation).
+    /// (the host-pointer import path, which must intersect what
+    /// `vkGetMemoryHostPointerPropertiesEXT` named for the pointer).
     pub(crate) fn memory_type_with(&self, type_bits: u32, req: &MemoryRequest) -> Option<u32> {
         select_memory_type(&self.memory_properties, type_bits, req)
     }
@@ -840,6 +987,144 @@ impl DeviceContext {
     pub(crate) fn queue(&self) -> vk::Queue {
         unsafe { self.device.get_device_queue(self.gq, 0) }
     }
+
+}
+
+/// The index of a queue family that transfers and does nothing else — a copy
+/// engine that runs beside the graphics one rather than through it.
+///
+/// `TRANSFER` alone is the whole test. `GRAPHICS` and `COMPUTE` both imply
+/// transfer support, so a family carrying either is one this device already
+/// submits draws to, and moving a copy there would buy nothing. Sparse binding,
+/// video decode/encode and optical flow do **not** disqualify a family: they say
+/// what else that hardware block can do, not that it shares the graphics engine.
+///
+/// `None` where the host has no such family, which is most integrated parts.
+/// That is the arrangement rather than a degraded one, and the caller keeps
+/// every copy on the graphics queue.
+///
+/// # What a boot found, and what it is worth
+///
+/// This was added without ever being read on a live device. It has been now, on
+/// the x86/Vulkan pathway against an RTX 5080 Laptop:
+///
+/// ```text
+/// vk_queues families=6 graphics_family=0 compute_capable=true transfer_family=1
+/// ```
+///
+/// So the copy engine is there, and every byte this device moves is still going
+/// to family 0 with the draws. The size of that is measurable rather than
+/// arguable, because the guest-page writeback carries its own GPU timestamps: a
+/// driven Safari-drag second reports `gpu_us=167437` over `gpu=836` copies —
+/// **167 ms of GPU time per second at ~200 us a copy**, which for a 3.33 MB
+/// copy is a healthy ~16 GB/s and not a slow rail. Scaling the buffer gather by
+/// its share of the bytes (2.74 GB/s against the writeback's 5.19) puts total
+/// copy occupancy near 255 ms/s.
+///
+/// In the same second `draw_phase`'s `slot_us` is 245 ms/s — the drain worker
+/// blocked in `begin_entry` on a ring slot whose fence the GPU has not signalled.
+/// Those two numbers being within 5 % of each other is the reason to look here:
+/// the CPU's wait for the GPU is about the size of the GPU's copy work, and that
+/// work is serialised against the rendering only because it shares a queue.
+///
+/// # An ablation says the whole ceiling is this
+///
+/// The correspondence above is not a proof, so it was tested directly: a probe
+/// boot recorded the writeback's barriers, batch flush, stamp and every CPU-side
+/// bookkeeping step exactly as normal, and skipped only the
+/// `cmd_copy_image_to_buffer`/scatter commands themselves — the GPU work, and
+/// nothing else. The guest loses its frames that way, so it is an ablation and
+/// never a shipping arm; it is recorded here because of what it measured.
+///
+/// | | shipping | writeback GPU work removed |
+/// |---|---|---|
+/// | `present_hz` median | 72.7-76.4 | **104.0** |
+/// | seconds below 100 Hz | 24/24 | **4/25** |
+/// | `slot_us` | 245 750 us/s | **3 986 us/s** |
+/// | `drain_duty` `duty` | 0.81 | 0.59 |
+/// | `draw_us/draw` | 132-139 us | 78 us |
+/// | draws | 4 383-4 800/s | 5 916-6 407/s |
+///
+/// `slot_us` falls by a factor of 62. It was not ring depth, not submission
+/// overhead and not jitter: it was this device's own copies sitting in the queue
+/// ahead of the draws whose slots it was waiting for. Every earlier attempt on
+/// `slot_us` moved a number that was downstream of this one, which is why
+/// halving the submissions once bought no frames at all.
+///
+/// # The prize is not here, and a built rail measured that
+///
+/// It reads from the table above as if moving the copies off this queue were
+/// worth the gap between 76 Hz and 104 Hz. It is not, and the way to find that
+/// out was to build it: a second queue, a ring of transfer command buffers, two
+/// timeline semaphores, and the writeback's scatter submitted to the copy
+/// engine instead of appended to the draw batch. It ran, on the x86/Vulkan
+/// pathway against the same host, with `vk_queues transfer_family=1`.
+///
+/// The split was at the **scratch buffer**, not at the image, and that part of
+/// the design was right and stays recorded because it is the cheap answer to the
+/// ownership problem below. The detile (`vkCmdCopyImageToBuffer` into the
+/// device-local scratch) stayed on `gq`, so the render target never left its
+/// family and never gave up its lossless framebuffer compression. Only the
+/// scatter — `vkCmdCopyBuffer` out of the scratch into imported guest pages —
+/// crossed, and the only resources both queues saw were buffers, which are free
+/// to share `CONCURRENT`.
+///
+/// What four driven Safari-drag boots measured, against a 67.8 Hz baseline taken
+/// on the same tree and machine that hour:
+///
+/// | arrangement | `present_hz` med | `slot_us` | CPU wait on the copy engine |
+/// |---|---|---|---|
+/// | shipping — every copy on `gq` | 67.8 | 265 000 us/s | — |
+/// | scatter on the copy engine, 4-deep ring | 67.4 | **8 000 us/s** | 240 000 us/s |
+/// | same, 16-deep | 69.8 | 290 000 us/s | ~0 |
+/// | same, 64-deep | 69.0 | 230 000 us/s | ~0 |
+///
+/// `slot_us` really does collapse — by 33x, close to what the ablation
+/// predicted. And it buys nothing, because **the block is conserved**. At depth
+/// 4 the drain worker stops waiting for a ring slot and starts waiting for a
+/// transfer command buffer instead, for the same 240 ms a second. Deepening the
+/// ring removes that wait and the block reappears a third time, as the graphics
+/// submission's own write-after-read wait for the scratch buffer it is about to
+/// overwrite. Three arrangements, three different counters, one number.
+///
+/// # Because the wall is the bus, and every queue shares it
+///
+/// A narrower ablation says so directly. Skipping only the image read, with the
+/// scatter still running and still moving its bytes, gives **72.9 Hz** — four
+/// Hertz, not thirty. The earlier ablation reached 104 Hz because it removed the
+/// scatter too, and with it the bus traffic. A copy engine moves those same
+/// bytes over that same link.
+///
+/// The traffic is the finding: ~1 500 guest-page writebacks a second at ~3.34 MB
+/// each is **~5.0 GB/s into guest RAM**, sustained, at ~70 displayed frames a
+/// second. That is about **21 full-surface writebacks per frame the user sees**,
+/// spread over roughly six surfaces — and it is split across two rails, the
+/// render Store at ~613/s (`readback_split`'s `vouch`) and the GVA Store making
+/// up the rest of `guest_write_linear`.
+///
+/// So the route to 120 Hz is fewer bytes crossing, and nothing about which
+/// engine carries them. Do not rebuild this rail to chase frames. It is worth
+/// rebuilding only *after* the byte volume comes down, when a decoupled
+/// `slot_us` would have something left to convert into frames — and the shape it
+/// should take is the one above.
+///
+/// A copy engine is still not free, and anything built here has to answer three
+/// costs the shared queue does not pay: a cross-queue dependency needs a
+/// semaphore rather than a pipeline barrier, an image written by one family and
+/// read by another needs an ownership transfer or `CONCURRENT` sharing, and
+/// splitting a copy out of the batch it is currently appended to restores the
+/// second submission that appending it removed. Splitting at the scratch buffer
+/// answers the middle one for nothing, which is why that is where it belongs.
+fn dedicated_transfer_family(families: &[vk::QueueFamilyProperties]) -> Option<u32> {
+    families
+        .iter()
+        .position(|q| {
+            q.queue_flags.contains(vk::QueueFlags::TRANSFER)
+                && !q
+                    .queue_flags
+                    .intersects(vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE)
+        })
+        .map(|i| i as u32)
 }
 
 /// Process-global engine state ownership (device + recreate policy + init fail cache).
@@ -886,12 +1171,39 @@ impl ContextOwner {
             match unsafe { DeviceContext::create() } {
                 Ok(c) => self.ctx = Some(c),
                 Err(e) => {
-                    self.init_error = Some(e.clone());
+                    self.note_init_failure(&e);
                     return Err(e);
                 }
             }
         }
         Ok(self.ctx.as_ref().unwrap())
+    }
+
+    /// Decide whether a failed bring-up becomes the permanent answer.
+    ///
+    /// [`Self::ensure`] consults `init_error` before it consults anything else,
+    /// and nothing clears it, so whatever lands here answers every later draw
+    /// for the life of the process. That is right for the verdicts bring-up
+    /// reaches about the machine — no Vulkan loader, no physical device, none
+    /// above the API floor, no graphics queue — because a second attempt walks
+    /// the same host and reaches the same one.
+    ///
+    /// It is wrong for out of memory. `vkCreateInstance` and `vkCreateDevice`
+    /// both refuse with `ERROR_OUT_OF_HOST_MEMORY`, which describes what the
+    /// host had free at that instant; latching it would answer a draw a minute
+    /// later, after whatever was holding the memory had exited, from a machine
+    /// state that no longer exists. So it is returned to this caller — the
+    /// guest sees the refusal — and forgotten, and the next draw asks the
+    /// loader again.
+    ///
+    /// Split out from `ensure` so the rule is reachable without a Vulkan
+    /// device: it is the one part of bring-up that is a decision rather than a
+    /// driver call.
+    fn note_init_failure(&mut self, error: &DrawError) {
+        if error.out_of_memory() {
+            return;
+        }
+        self.init_error = Some(error.clone());
     }
 
     fn try_recreate(&mut self, counters: &EngineCounters) -> Result<(), DrawError> {
@@ -925,6 +1237,38 @@ impl ContextOwner {
     pub(crate) fn mark_device_lost(&mut self) {
         self.loss_events.fetch_add(1, Ordering::Relaxed);
         self.poisoned = true;
+    }
+
+    /// Guest work reached the GPU on the current device.
+    ///
+    /// This is the only evidence that a recreate *worked*, and it is what turns
+    /// [`MAX_DEVICE_RECREATES`] from a lifetime allowance into a bound on a
+    /// storm. A device that was rebuilt and then executed a draw has recovered;
+    /// if it is lost again an hour later that is a new incident, not the fourth
+    /// step of the old one, and refusing it because of three resets the guest
+    /// never noticed is this device deciding to stop being a GPU.
+    ///
+    /// One completed submission is the whole threshold, and that is on purpose —
+    /// any larger number would be tuned rather than derived. It leaves the
+    /// pathological case of a host that loses the device after every single
+    /// draw recreating indefinitely, which is the right trade: that guest sees
+    /// slow progress instead of a display that never comes back. The churn stays
+    /// measurable either way — `EngineCounters::recreates` and `device_lost` are
+    /// both in the `cumulative` group, so they count every incident across the
+    /// boot and this reset does not touch them.
+    ///
+    /// Called on the success arm of every draw and dispatch, so it is on the hot
+    /// path — hence the branch, which is false on every call of a healthy boot.
+    pub(crate) fn note_work_completed(&mut self) {
+        if self.recreate_count == 0 {
+            return;
+        }
+        crate::observe::fail(format!(
+            "vk_device_recreate_proven recreates={} (guest work ran on the rebuilt device; \
+             the storm budget starts over)",
+            self.recreate_count
+        ));
+        self.recreate_count = 0;
     }
 }
 
@@ -1204,5 +1548,249 @@ mod pipeline_cache_blob_tests {
             }
         }
         std::fs::remove_dir_all(&root).ok();
+    }
+}
+
+#[cfg(test)]
+mod transfer_family_tests {
+    use super::*;
+
+    fn family(flags: vk::QueueFlags) -> vk::QueueFamilyProperties {
+        vk::QueueFamilyProperties::default()
+            .queue_flags(flags)
+            .queue_count(1)
+    }
+
+    /// A family that also draws or dispatches is one this device already
+    /// submits to, so picking it would move nothing off the graphics engine
+    /// while adding an ownership transfer to every copy. Both bits disqualify,
+    /// and `TRANSFER` is often not even spelled on a graphics family — the spec
+    /// makes it implicit — so the test is over families that name it and
+    /// families that do not.
+    #[test]
+    fn a_family_that_also_draws_or_dispatches_is_not_a_copy_engine() {
+        use vk::QueueFlags as F;
+        for flags in [
+            F::GRAPHICS,
+            F::COMPUTE,
+            F::GRAPHICS | F::COMPUTE,
+            F::GRAPHICS | F::TRANSFER,
+            F::COMPUTE | F::TRANSFER,
+            F::GRAPHICS | F::COMPUTE | F::TRANSFER | F::SPARSE_BINDING,
+        ] {
+            assert_eq!(
+                dedicated_transfer_family(&[family(flags)]),
+                None,
+                "{flags:?} shares the engine this device already submits to"
+            );
+        }
+    }
+
+    /// The bits that say what *else* a copy engine can do must not disqualify
+    /// it. A discrete part commonly exposes several transfer-only families that
+    /// differ exactly in these, and refusing them would leave a host with a copy
+    /// engine reading as a host without one.
+    #[test]
+    fn the_other_bits_on_a_transfer_only_family_do_not_disqualify_it() {
+        use vk::QueueFlags as F;
+        for extra in [
+            F::empty(),
+            F::SPARSE_BINDING,
+            F::VIDEO_DECODE_KHR,
+            F::VIDEO_ENCODE_KHR,
+            F::OPTICAL_FLOW_NV,
+        ] {
+            assert_eq!(
+                dedicated_transfer_family(&[family(F::TRANSFER | extra)]),
+                Some(0),
+                "TRANSFER | {extra:?} is still a copy engine"
+            );
+        }
+    }
+
+    /// A family with no transfer bit at all is not one, and a host that offers
+    /// none answers `None` rather than falling to index zero — which would
+    /// submit copies to the graphics family under a name that says otherwise.
+    #[test]
+    fn a_host_with_no_copy_engine_answers_none_rather_than_the_first_family() {
+        use vk::QueueFlags as F;
+        assert_eq!(dedicated_transfer_family(&[]), None);
+        assert_eq!(
+            dedicated_transfer_family(&[family(F::GRAPHICS | F::COMPUTE | F::TRANSFER)]),
+            None,
+            "the single-family host every integrated part presents"
+        );
+        assert_eq!(
+            dedicated_transfer_family(&[
+                family(F::GRAPHICS | F::COMPUTE | F::TRANSFER),
+                family(F::TRANSFER | F::SPARSE_BINDING),
+            ]),
+            Some(1),
+            "the second family is the copy engine and the index must be its own"
+        );
+    }
+}
+
+#[cfg(test)]
+mod init_latch_tests {
+    use super::*;
+
+    /// Bring-up refusing for want of memory must not become the permanent
+    /// answer. `ensure` reads `init_error` before it reads anything else and
+    /// nothing clears it, so a latched one would answer every draw for the life
+    /// of the process from a host state that has since changed.
+    #[test]
+    fn an_out_of_memory_bring_up_is_not_latched() {
+        for decline in [
+            InitDecline::CreateInstance {
+                result: vk::Result::ERROR_OUT_OF_HOST_MEMORY,
+            },
+            InitDecline::CreateDevice {
+                result: vk::Result::ERROR_OUT_OF_HOST_MEMORY,
+            },
+            InitDecline::CreateDevice {
+                result: vk::Result::ERROR_OUT_OF_DEVICE_MEMORY,
+            },
+        ] {
+            let mut owner = ContextOwner::new();
+            let error = DrawError::Init(decline.clone());
+            assert!(error.out_of_memory(), "{decline:?} is the retryable class");
+            owner.note_init_failure(&error);
+            assert!(
+                owner.init_error.is_none(),
+                "{decline:?} must leave the next draw free to ask the loader again"
+            );
+        }
+    }
+
+    /// The converse, so the test above cannot pass by never latching at all. A
+    /// verdict about the machine is reached identically by the next attempt, so
+    /// it is worth keeping — and re-walking bring-up on every draw to rediscover
+    /// that the host has no Vulkan at all is the cost the latch exists to avoid.
+    #[test]
+    fn a_verdict_about_the_machine_is_still_latched() {
+        for decline in [
+            InitDecline::NoPhysicalDevice,
+            InitDecline::NoGraphicsQueueFamily,
+            InitDecline::LoadVulkanLoader {
+                detail: "no loader".to_string(),
+            },
+            InitDecline::BelowApiFloor {
+                minimum: vk::API_VERSION_1_2,
+                found: vec![vk::API_VERSION_1_0],
+            },
+            InitDecline::CreateDevice {
+                result: vk::Result::ERROR_EXTENSION_NOT_PRESENT,
+            },
+        ] {
+            let mut owner = ContextOwner::new();
+            let error = DrawError::Init(decline.clone());
+            assert!(!error.out_of_memory(), "{decline:?} is not about memory");
+            owner.note_init_failure(&error);
+            assert_eq!(
+                owner.init_error.as_ref(),
+                Some(&error),
+                "{decline:?} is reached again by the next attempt, so it is kept"
+            );
+        }
+    }
+
+    /// `out_of_memory` had to learn to look inside `Init` for any of this to
+    /// work; before it did, every arm above answered `false` and bring-up
+    /// latched unconditionally. Pin that it reads the result the variant
+    /// carries rather than the variant's identity.
+    #[test]
+    fn out_of_memory_reads_the_result_not_the_variant() {
+        let oom = DrawError::Init(InitDecline::CreatePipelineCache {
+            result: vk::Result::ERROR_OUT_OF_HOST_MEMORY,
+        });
+        let same_variant_other_result = DrawError::Init(InitDecline::CreatePipelineCache {
+            result: vk::Result::ERROR_INITIALIZATION_FAILED,
+        });
+        assert!(oom.out_of_memory());
+        assert!(!same_variant_other_result.out_of_memory());
+
+        // A check this device decides itself carries no result at all.
+        assert_eq!(InitDecline::NoPhysicalDevice.vk_result(), None);
+        assert_eq!(
+            InitDecline::CreateDevice {
+                result: vk::Result::ERROR_OUT_OF_DEVICE_MEMORY,
+            }
+            .vk_result(),
+            Some(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY)
+        );
+    }
+}
+
+#[cfg(test)]
+mod recreate_budget_tests {
+    use super::*;
+
+    /// A storm — lost, rebuilt, lost again with nothing run in between — still
+    /// terminates. This is the case the budget exists for, and `ensure` answers
+    /// it without touching Vulkan, which is why the test runs on any host.
+    #[test]
+    fn a_storm_that_produces_no_work_still_exhausts_the_budget() {
+        let mut owner = ContextOwner::new();
+        owner.poisoned = true;
+        owner.recreate_count = MAX_DEVICE_RECREATES;
+        let counters = EngineCounters::default();
+
+        match owner.ensure(&counters) {
+            Ok(_) => panic!("an exhausted storm budget must refuse"),
+            Err(error) => assert_eq!(
+                error,
+                DrawError::DeviceLost(DeviceLostDecline::RecreateCapExhausted {
+                    cap: MAX_DEVICE_RECREATES,
+                })
+            ),
+        }
+    }
+
+    /// A recreate followed by guest work is a recreate that *worked*, and must
+    /// not be held against the next incident.
+    ///
+    /// Before this, `recreate_count` only ever rose. Three device losses over a
+    /// week of uptime — each recovered, each with hours of correct rendering
+    /// after it — left the fourth refused and every draw after that refused with
+    /// it, for as long as the guest ran.
+    #[test]
+    fn work_on_the_rebuilt_device_clears_the_storm_budget() {
+        let mut owner = ContextOwner::new();
+        owner.recreate_count = MAX_DEVICE_RECREATES;
+
+        owner.note_work_completed();
+
+        assert_eq!(
+            owner.recreate_count, 0,
+            "a recreate the guest drew through must not count against the next storm"
+        );
+
+        // And the budget is genuinely available again: at the cap this refuses
+        // without touching Vulkan, so reaching past that branch is the proof.
+        owner.poisoned = true;
+        let counters = EngineCounters::default();
+        let refusal = owner.ensure(&counters).err();
+        assert_ne!(
+            refusal,
+            Some(DrawError::DeviceLost(
+                DeviceLostDecline::RecreateCapExhausted {
+                    cap: MAX_DEVICE_RECREATES,
+                }
+            )),
+            "the cap branch must no longer be taken"
+        );
+    }
+
+    /// The healthy path costs a branch and nothing else. Every draw and dispatch
+    /// calls this, so an emission here would be one fail-log line per draw.
+    #[test]
+    fn a_device_that_was_never_lost_is_left_alone() {
+        let mut owner = ContextOwner::new();
+        assert_eq!(owner.recreate_count, 0);
+        owner.note_work_completed();
+        assert_eq!(owner.recreate_count, 0);
+        assert!(!owner.poisoned, "noting work must not change device state");
+        assert!(owner.init_error.is_none());
     }
 }

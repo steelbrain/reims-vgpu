@@ -51,7 +51,7 @@
 //! object-ref space and not the mapping space, and that the trailing 16 bytes
 //! are zero — then went on recounting all three for every submission of every
 //! boot after. The findings live where they are acted on, in
-//! `runtime/exec.rs:consume_resource_table`; the only one that could still
+//! `runtime/exec::consume_resource_table`; the only one that could still
 //! change is a guest that starts populating the tail, and that is now a typed
 //! decline raised at the record, not a counter nobody reads.
 //!
@@ -71,10 +71,8 @@
 //! accumulated log it emitted exactly two distinct lines, differing only in
 //! `storage_peak` (1 vs 2) — every peak far under its cap, every `evicted` zero.
 //! That answer is recorded on the three constants. The alarm it was standing in
-//! for survives at each enforcing site, where it belongs: the GVA rail's forced
-//! landings are already `gva_deferred_flush trigger=window_cap`, the storage
-//! rail's are `compute_mirror_evicted`, and the surface rail now emits
-//! `surface_window_cap_evicted`. Those fire when a cap binds instead of
+//! for survives at each enforcing site, where it belongs: the storage rail's
+//! evictions are `compute_mirror_evicted`. Those fire when a cap binds instead of
 //! restating a level once a second forever.
 //!
 //! The test to apply: name the reading the next window could produce that the

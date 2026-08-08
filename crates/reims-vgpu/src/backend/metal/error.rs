@@ -184,16 +184,9 @@ impl Refusal for Status {
 /// `reims_vgpu_qemu_abi.h` states for every `(char *err, size_t err_cap)` pair
 /// crossing the boundary.
 pub unsafe fn write_err(err: *mut c_char, err_cap: usize, msg: &str) {
-    if err.is_null() || err_cap == 0 {
-        return;
-    }
-    unsafe {
-        let cap = err_cap.saturating_sub(1);
-        let bytes = msg.as_bytes();
-        let n = bytes.len().min(cap);
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), err.cast::<u8>(), n);
-        *err.add(n) = 0;
-    }
+    // SAFETY: forwarded unchanged — the caller's promise about `err` and
+    // `err_cap` is exactly what `write_c_str` asks for.
+    unsafe { crate::qemu::cstr::write_c_str(err, err_cap, msg) };
 }
 
 #[cfg(test)]

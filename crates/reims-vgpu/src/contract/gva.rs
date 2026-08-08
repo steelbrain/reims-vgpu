@@ -15,39 +15,38 @@
 
 use reims_vgpu_wire::page_table as wire;
 
-pub use wire::{MAX_DEPTH, PTE_FLAG_MASK, PTE_PFN_MASK, PTE_SIZE};
-
 /// Offsets within a task's directory page. Narrowed from the wire crate's `u64`
 /// because every consumer here indexes a `u32` field set.
 pub const DIRECTORY_ROOT_PFN: u32 = wire::DIRECTORY_ROOT_PFN as u32;
 pub const DIRECTORY_DEPTH: u32 = wire::DIRECTORY_DEPTH as u32;
 
-/// Largest span this device will resolve in one call.
-///
-/// A device policy bound rather than a property of the format, so it stays here:
-/// the guest's page table can describe more than this, and we decline instead.
-pub const MAX_SPAN_PAGES: u32 = 1 << 20;
+// No `MAX_SPAN_PAGES`. There was one, `1 << 20`, whose doc said the guest's page
+// table could describe a longer span and this device declined instead. No such
+// decline existed: the value was carried as a `Geometry` field, set from the
+// constant in both of the two geometries there are, compared against the same
+// constant by `validate_geometry`, and dropped by `wire_geometry` before the
+// walk ever saw it. A span of any length resolved, which is the faithful
+// behaviour — so the constant is gone rather than the behaviour, and this note
+// stands where a reader would otherwise "restore" a refusal that never ran.
 
 pub const PAGE_SHIFT_ARM64E: u32 = wire::ARM64E.page_shift;
 pub const PAGE_SIZE_ARM64E: u32 = wire::ARM64E.page_size() as u32;
-pub const ARM64E_PAGE_OFFSET_MASK: u32 = wire::ARM64E.page_offset_mask() as u32;
-pub const ARM64E_INDEX_BITS: u32 = wire::ARM64E.index_bits();
-pub const ARM64E_INDEX_MASK: u32 = wire::ARM64E.index_mask() as u32;
-pub const ARM64E_ENTRIES_PER_TABLE: u32 = wire::ARM64E.entries_per_table() as u32;
-pub const ARM64E_MAX_DEPTH: u32 = wire::ARM64E.max_depth;
 
 pub const PAGE_SHIFT_X86: u32 = wire::X86_64.page_shift;
 pub const PAGE_SIZE_X86: u32 = wire::X86_64.page_size() as u32;
-pub const X86_64_PAGE_OFFSET_MASK: u32 = wire::X86_64.page_offset_mask() as u32;
-pub const X86_64_INDEX_BITS: u32 = wire::X86_64.index_bits();
-pub const X86_64_INDEX_MASK: u32 = wire::X86_64.index_mask() as u32;
-pub const X86_64_ENTRIES_PER_TABLE: u32 = wire::X86_64.entries_per_table() as u32;
-pub const X86_64_MAX_DEPTH: u32 = wire::X86_64.max_depth;
+
+// No `*_INDEX_BITS`, `*_INDEX_MASK`, `*_ENTRIES_PER_TABLE`, `*_PAGE_OFFSET_MASK`
+// or `*_MAX_DEPTH`. Ten names, none of them read anywhere outside this file:
+// every consumer of a level index or a fan-out is inside the walk, which takes a
+// `wire::Geometry` and asks it. Re-exporting a derived value the device does not
+// name only gives a future caller a second way to spell what the geometry
+// already answers, at the arch it happens to be prefixed with rather than at the
+// one the device booted on — which is the cross-arch bug the prefixes exist to
+// prevent. Call the accessor on the geometry.
 
 // No bare `PAGE_SHIFT`, `PAGE_SIZE`, `INDEX_BITS`, `INDEX_MASK` or
 // `ENTRIES_PER_TABLE`. Every one of those silently meant arm64e and caused
 // cross-arch bugs. Use the arch-prefixed name or the device `page_shift`.
-pub const CACHE_WAYS: usize = 8;
 
 /// PFN → GPA at an explicit guest page shift (12 or 14). No default.
 ///
@@ -64,18 +63,20 @@ pub fn pfn_to_gpa(pfn: u32, page_shift: u32) -> u64 {
 mod tests {
     use super::*;
 
+    /// The two pathways do not share a page size.
+    ///
+    /// What is left of a test that also asserted each pathway's page size was
+    /// `1 << its shift`, its offset mask was `size - 1`, and its fan-out was
+    /// `1 << its index bits`. Every one of those compared two values computed
+    /// from the same `wire::Geometry` accessor, where the right-hand side *is*
+    /// the left-hand side's definition — they could not fail. This line can:
+    /// it is the one claim here about two different geometries, and a device
+    /// that let the pathways collapse onto one page size would resolve every
+    /// arm64e address at an x86 stride.
     #[test]
-    fn architecture_page_geometry_is_self_consistent() {
-        assert_eq!(PAGE_SIZE_ARM64E, 1 << PAGE_SHIFT_ARM64E);
-        assert_eq!(ARM64E_PAGE_OFFSET_MASK, PAGE_SIZE_ARM64E - 1);
-        assert_eq!(ARM64E_ENTRIES_PER_TABLE, 1 << ARM64E_INDEX_BITS);
-        assert_eq!(ARM64E_INDEX_MASK, ARM64E_ENTRIES_PER_TABLE - 1);
-
-        assert_eq!(PAGE_SIZE_X86, 1 << PAGE_SHIFT_X86);
-        assert_eq!(X86_64_PAGE_OFFSET_MASK, PAGE_SIZE_X86 - 1);
-        assert_eq!(X86_64_ENTRIES_PER_TABLE, 1 << X86_64_INDEX_BITS);
-        assert_eq!(X86_64_INDEX_MASK, X86_64_ENTRIES_PER_TABLE - 1);
+    fn the_two_pathways_do_not_share_a_page_size() {
         assert_ne!(PAGE_SIZE_ARM64E, PAGE_SIZE_X86);
+        assert_ne!(PAGE_SHIFT_ARM64E, PAGE_SHIFT_X86);
     }
 
     /// The wire crate states page geometry in `u64`; this module narrows it.

@@ -41,28 +41,6 @@ pub fn mtl_pixel_format_bpp(pixel_format: u32) -> Option<usize> {
     crate::contract::pixel_format::bytes_per_pixel(code).map(|bpp| bpp as usize)
 }
 
-/// Reinterpret a format code as `MTLPixelFormat`.
-///
-/// **This is the one member of the unchecked-Metal-enum class that
-/// [`crate::backend::metal::mtl_enum`] has not taken, and its safety comment
-/// used to claim more than it could.** "Callers only pass raw Metal enum values
-/// from the ABI contract" is not true of every caller: `depth.pixel_format` and
-/// `stencil.pixel_format` reach here from the guest's own attachment records,
-/// and `MTLPixelFormat` is by far the sparsest of these enums — a few dozen
-/// declared values scattered over 0..=255 — so an undeclared code is undefined
-/// behaviour rather than a format Metal will reject.
-///
-/// It was left for its own change because it is a different size of job from
-/// the other fifteen: twelve call sites, several of them (`configure_*_
-/// attachment`, `mipmap`) with no status channel to decline into, so closing it
-/// means deciding per site what a refused format does rather than adding one
-/// table. [`crate::contract::pixel_format::bytes_per_pixel`] already knows which
-/// codes this device recognises and is the natural place to start.
-pub fn pixel_format_from_u32(v: u32) -> MTLPixelFormat {
-    // SAFETY: not established for every caller — see the doc above.
-    unsafe { std::mem::transmute(v as u64) }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -145,9 +123,22 @@ mod tests {
         }
     }
 
+    /// The ABI value survives the conversion, and a code naming no format is
+    /// refused rather than reinterpreted.
+    ///
+    /// This used to assert only the first half, because the conversion was a
+    /// `transmute` and the second half had no answer — an undeclared ordinal
+    /// was undefined behaviour, not a value the test could ask about.
     #[test]
-    fn raw_pixel_format_conversion_preserves_the_abi_value() {
+    fn pixel_format_conversion_preserves_the_abi_value_and_refuses_the_rest() {
+        use crate::backend::metal::mtl_enum;
         let raw = MTLPixelFormat::BGRA8Unorm_sRGB as u32;
-        assert_eq!(pixel_format_from_u32(raw) as u64, raw as u64);
+        assert_eq!(
+            mtl_enum::pixel_format(raw).map(|f| f as u64),
+            Some(raw as u64)
+        );
+        // 556 is one past `BGR10_XR_SRGB`, the highest format `metal` declares.
+        assert_eq!(mtl_enum::pixel_format(556), None);
+        assert_eq!(mtl_enum::pixel_format(u32::MAX), None);
     }
 }

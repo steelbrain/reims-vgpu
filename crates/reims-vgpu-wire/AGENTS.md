@@ -46,7 +46,12 @@ These are load-bearing. A change that breaks one is wrong even if it compiles an
    and never `unwrap()` a view in library code.
 4. **No enums, `bool`, `char`, `NonZero*` or references in wire structs.** An out-of-range guest
    value in any of those is undefined behaviour, not a decode error. Store the raw scalar and expose
-   a fallible accessor.
+   a fallible accessor. A field is safe only if it is a `le` scalar, `u8`/`i8`, an array of those,
+   or another `Wire` type; anything else is unsafe until argued otherwise. A source scan used to
+   enforce this and is gone, so know what the compiler does and does not do for you here:
+   `ASSERT_ALIGN_1` already rejects a bare `u32`, a `char` and a `#[repr(u32)]` enum because those
+   are over-aligned, so the cases that reach this rule are the **align-1** ones — `bool`,
+   `NonZeroU8`, a `#[repr(u8)]` enum. All three compile, and nothing will stop you.
 5. **`unsafe impl Wire` needs a comment** naming why both requirements hold. The existing ones are
    the template.
 6. **Never widen a field to make a value fit.** If a value does not fit, the layout is wrong;
@@ -355,7 +360,7 @@ tiers, by what evidence is available.
 
 Everything the userspace serializer emits: the selectors in [`INVENTORY`], covering object creation
 (`PGSerializer`) and every encoder record (render, compute, blit, info). This is the bulk of
-`decode/{render,compute,blit,event,stream}.rs` plus the creation half of `decode/resource.rs`.
+`decode/{render,compute,blit,event,stream}.rs` plus the creation half of `decode/resource`.
 
 `runtime::exec` decodes exactly these, so this tier is where the crate earns its place. Follow
 "Adding an operation"; every entry gets a fixture.

@@ -1,0 +1,16 @@
+[package]
+name = "reims-vgpu-paging"
+version = "0.1.0"
+edition = "2021"
+description = "Guest address resolution above the wire page-table format: span walks, GPA run coalescing, window region planning"
+license = "GPL-2.0-or-later"
+
+[lib]
+name = "reims_vgpu_paging"
+
+# reims-vgpu-wire owns the page-table format and the descent; this crate owns
+# the allocation-bearing resolution algorithms above it and nothing else — no
+# host traits, no device model, no emission. The device maps this crate's typed
+# refusals onto its own failure channel.
+[dependencies]
+reims-vgpu-wire = { path = "../reims-vgpu-wire" }

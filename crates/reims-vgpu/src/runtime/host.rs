@@ -42,7 +42,7 @@ pub enum MemError {
     /// genuinely-unmapped GPA cases that also answer `Unmapped`. That is the
     /// "one status for N checks" shape the ground rules name by example, and it
     /// sat on the guest-memory hot path.
-    Unresolved(crate::contract::gva_resolve::ResolveStatus),
+    Unresolved(reims_vgpu_paging::resolve::ResolveStatus),
     /// The task is not active, or its directory PFN is zero, so there is no page
     /// table to walk. Distinct from [`Self::Unresolved`]: the walk never began.
     NoTaskDirectory,
@@ -98,7 +98,7 @@ impl MemError {
     pub fn is_guest_teardown(&self) -> bool {
         matches!(
             self,
-            Self::Unresolved(crate::contract::gva_resolve::ResolveStatus::ErrZeroPfn)
+            Self::Unresolved(reims_vgpu_paging::resolve::ResolveStatus::ErrZeroPfn)
         )
     }
 }
@@ -157,6 +157,12 @@ pub trait HostMemory {
 }
 
 /// Typed actions for the QEMU main loop (or FakeHost log).
+///
+/// `#[repr(u32)]` because this enum *is* the `kind` word of the C
+/// `ReimsVgpuHostAction` the BH pops — there is no second FFI spelling to drift
+/// against. Every discriminant is pinned to its `REIMS_VGPU_HOST_ACTION_*`
+/// header define by `the_abi_header_agrees_on_the_host_action_table`.
+#[repr(u32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HostActionKind {
     None = 0,
@@ -200,6 +206,14 @@ pub enum HostActionKind {
     WindowClosed = 11,
 }
 
+/// One queued action, in the exact layout the C `ReimsVgpuHostAction` declares.
+///
+/// `#[repr(C)]` so `reims_vgpu_qemu_device_pop_action` can write this type
+/// straight into the caller's out-pointer. The queue is write-only from Rust —
+/// the shim reads `kind` and dispatches — so no value the C side chose ever
+/// reaches [`HostActionKind`], and a `#[repr(u32)]` enum in the `kind` slot
+/// cannot be handed an out-of-range discriminant.
+#[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HostAction {
     pub kind: HostActionKind,
@@ -207,6 +221,18 @@ pub struct HostAction {
     pub a1: u64,
     pub a2: u64,
     pub a3: u64,
+}
+
+impl Default for HostAction {
+    fn default() -> Self {
+        Self {
+            kind: HostActionKind::None,
+            a0: 0,
+            a1: 0,
+            a2: 0,
+            a3: 0,
+        }
+    }
 }
 
 impl HostAction {
@@ -315,6 +341,76 @@ impl HostAction {
     }
 }
 
+/// Which check refused the guest-RAM span enumeration.
+///
+/// One variant per negative `REIMS_VGPU_GUEST_RAM_ERR_*` code in the shared ABI
+/// header, plus the failures that are Rust's own: a shim too old to offer the
+/// callback, a code this build does not recognise, and an answer that did not
+/// fit the array twice running.
+///
+/// This is the door to every guest-memory import, so a refusal here is not a
+/// slow path — it is the device running its copying rails for the whole boot.
+/// The variants stay distinct because they send a reader to different places: a
+/// missing callback is a shim/staticlib version mismatch, an empty address space
+/// is a machine wiring problem, and a short array is ours.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GuestRamRegionsError {
+    /// The shim offers no `guest_ram_regions`. Every pre-v17 shim, and every
+    /// fixture host.
+    CallbackMissing,
+    /// The shim rejected the arguments, or had more spans than its return value
+    /// could carry.
+    Args,
+    /// The system address space holds no writable RAM span. A machine with no
+    /// memory, or a call made before the board finished wiring its RAM up.
+    NoRam,
+    /// The shim reported more spans than the array we grew to hold them, twice
+    /// running. The retry sizes itself from the first answer, so this means the
+    /// span count changed underneath us — which for RAMBlock mappings it must
+    /// not.
+    StillTruncated { total: usize, capacity: usize },
+    /// A negative code this build has no name for, which means the shim is
+    /// newer than the staticlib. Carried rather than folded into another
+    /// variant so the number itself reaches the log.
+    UnknownCode(i32),
+}
+
+impl GuestRamRegionsError {
+    /// Map a negative shim return to the check it names.
+    pub fn from_code(code: i32) -> Self {
+        match code {
+            crate::qemu::abi::REIMS_VGPU_GUEST_RAM_ERR_ARGS => Self::Args,
+            crate::qemu::abi::REIMS_VGPU_GUEST_RAM_ERR_NO_RAM => Self::NoRam,
+            other => Self::UnknownCode(other),
+        }
+    }
+}
+
+impl crate::observe::Decline for GuestRamRegionsError {
+    fn slug(&self) -> &'static str {
+        match self {
+            Self::CallbackMissing => "guest_ram_regions_callback_missing",
+            Self::Args => "guest_ram_regions_args",
+            Self::NoRam => "guest_ram_regions_no_ram",
+            Self::StillTruncated { .. } => "guest_ram_regions_still_truncated",
+            Self::UnknownCode(_) => "guest_ram_regions_unknown_code",
+        }
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        match self {
+            Self::StillTruncated { total, capacity } => vec![
+                ("total", total.to_string()),
+                ("capacity", capacity.to_string()),
+            ],
+            Self::UnknownCode(code) => vec![("code", code.to_string())],
+            _ => Vec::new(),
+        }
+    }
+}
+
+crate::observe::decline::decline_display!(GuestRamRegionsError);
+
 /// Services the device cannot provide itself (time, wake, action enqueue,
 /// guest CPU / KVA access for the IOSurface mapper path).
 pub trait HostOps {
@@ -352,12 +448,10 @@ pub trait HostOps {
     /// [`HostOps::unmap_pages`] is a no-op, and the address is never recycled
     /// for unrelated memory.
     ///
-    /// Only a stable alias may be retained in a cached
-    /// `VK_EXT_external_memory_host` import window, which is what GPU-direct
-    /// present writeback needs: the GPU writes through that import after the
-    /// caller has already unmapped its view. Caching an import of a transient
-    /// view leaves the GPU DMAing into an address range the host has since
-    /// torn down or reused.
+    /// This is a claim about a CPU-side *view* only, and says nothing about the
+    /// GPU rail: guest RAM reaches the GPU by importing the spans
+    /// [`HostOps::guest_ram_regions`] names, which are QEMU's own RAMBlock
+    /// mappings and never a view this call built.
     ///
     /// Default `false` — the conservative answer, so a host that has not
     /// declared stability keeps the portable CPU writeback.
@@ -365,11 +459,84 @@ pub trait HostOps {
         false
     }
 
+    /// Where guest RAM lives in this process, as stable spans held for the VM's
+    /// lifetime.
+    ///
+    /// The whole guest-memory import rail starts here: the backend imports each
+    /// span once and every later reference is a
+    /// [`crate::runtime::guest_ram::GuestSlice`] inside one of them. Called at
+    /// device init and not again — the answer does not change, and re-importing
+    /// pays the driver's page pinning for an answer that is already known.
+    ///
+    /// Deliberately not [`HostOps::map_pages`] with a different return type.
+    /// That call answers about specific pages and on the sysbus shim may build a
+    /// transient `mach_vm_remap` view the caller has to release; this one never
+    /// allocates and never releases.
+    ///
+    /// Default: unavailable. A host that cannot answer says so by name, and the
+    /// caller runs the copying rails rather than reaching for `map_pages`.
+    fn guest_ram_regions(
+        &mut self,
+    ) -> Result<Vec<crate::runtime::guest_ram::GuestRamRegion>, GuestRamRegionsError> {
+        Err(GuestRamRegionsError::CallbackMissing)
+    }
+
     /// True if `gpa` is guest RAM (not MMIO / ROM / unmapped). Product QEMU
     /// implements via `address_space_translate` + `memory_region_is_ram`.
     /// Default: true (fixtures / NullHost without a RAM map).
+    ///
+    /// **Answers for one address.** A caller holding a span must ask
+    /// [`HostOps::first_non_ram_page`] instead — see the sampling trap recorded
+    /// there.
     fn is_ram_gpa(&self, _gpa: u64) -> bool {
         true
+    }
+
+    /// The first page of `[gpa, gpa + len)` that is not guest RAM, or `None`
+    /// when every page of it is.
+    ///
+    /// # Two endpoints are not a span
+    ///
+    /// [`HostOps::is_ram_gpa`] answers about a single address, and a caller that
+    /// wants to know whether a *range* is readable has to ask about every page
+    /// of it. Testing the first and last byte reads as thorough and is not: a
+    /// guest-physical range is a walk through whatever regions the machine
+    /// happens to lay out, and one non-RAM page anywhere between two RAM
+    /// endpoints is enough for `read_gpa` to refuse. The EFI console capture
+    /// held exactly that shape — two `is_ram_gpa` calls vouching for an 8 MB
+    /// framebuffer span — and a driven x86 boot refused a row 375 rows into it,
+    /// after 375 completed reads, with the endpoints both answering RAM.
+    ///
+    /// Returning the offending page rather than a `bool` is what lets a refusal
+    /// name it. A caller that only needs the verdict tests `.is_none()`.
+    ///
+    /// Walks at `page_size` because that is the granularity every other RAM
+    /// check in this crate uses (`map_pages` checks its page list the same way),
+    /// and because a memory region finer than a guest page cannot back a
+    /// mapping this device would read through. Short-circuits on the first
+    /// failure, so the common "this door is shut" case costs one call and not
+    /// one per page.
+    fn first_non_ram_page(&self, gpa: u64, len: u64, page_size: usize) -> Option<u64> {
+        if len == 0 || page_size == 0 {
+            return None;
+        }
+        let step = page_size as u64;
+        let last = gpa.saturating_add(len - 1);
+        // Modulo rather than a `!(step - 1)` mask: nothing here requires
+        // `page_size` to be a power of two, and a caller that passed one that
+        // is not would get a silently wrong base from the mask.
+        let last_page = last - (last % step);
+        let mut page = gpa - (gpa % step);
+        while page <= last_page {
+            if !self.is_ram_gpa(page) {
+                return Some(page);
+            }
+            // An overflow here means the walk reached the top of the address
+            // space with every page so far answering RAM, so `None` — no
+            // offending page — is the right answer and not a lost check.
+            page = page.checked_add(step)?;
+        }
+        None
     }
 
     /// Ask the host to observe writes this device does not make to `gpas`.
@@ -524,8 +691,23 @@ pub struct FakeHost {
     pub stable_map_pages: bool,
     /// Number of HostOps page-import attempts (test proxy for import amplification).
     pub map_pages_calls: u64,
+    /// Half-open GPA ranges this host reports as **not** guest RAM, so a test
+    /// can model device memory — a PCI BAR — and not only mapped vs unmapped.
+    ///
+    /// Empty by default, which is exactly the previous behaviour: `is_ram_gpa`
+    /// answered a flat `true`, so nothing could exercise a caller's non-RAM arm.
+    /// Arm it with [`FakeHost::mark_non_ram`] or, for a range that stops being
+    /// RAM partway through a loop, [`FakeHost::arm_unmap_on_read`].
+    ///
+    /// Interior-mutable for the second of those: the fixture has to be able to
+    /// change this answer from `&self`, because the loop that observes the
+    /// change holds the host immutably — which is also the product's position.
+    non_ram: std::cell::RefCell<Vec<(u64, u64)>>,
     /// Scripted guest page-table edits, armed by [`FakeHost::arm_rewire`].
     rewires: std::cell::RefCell<Vec<Rewire>>,
+    /// Scripted mid-loop retractions of guest RAM, armed by
+    /// [`FakeHost::arm_unmap_on_read`]: `(on_read_gpa, on_read_len, base, end)`.
+    unmap_on_read: std::cell::RefCell<Vec<(u64, u64, u64, u64)>>,
     /// How many armed rewires have fired, so a test can assert its trigger hit.
     rewires_fired: std::cell::Cell<u64>,
     /// Live [`HostOps::track_guest_writes`] sets, keyed by issued token.
@@ -668,10 +850,20 @@ impl Drop for FakeHost {
         #[cfg(not(target_os = "macos"))]
         {
             for r in self.ranges.drain(..) {
+                // The layout `alloc_block` allocated with, and no fallback.
+                // `dealloc` requires the *allocating* layout, so the `align = 1`
+                // fallback that used to sit here was undefined behaviour on the
+                // one path it could have run — and it could not run: alloc_block
+                // returns `None` when this exact layout cannot be built, so a
+                // block that exists proves it can. `unwrap_or` also evaluated
+                // that wrong layout on every drop, not only on failure.
                 let layout =
                     std::alloc::Layout::from_size_align(r.alloc_len, GUEST_PAGE_SIZE_ARM64E)
-                        .unwrap_or(std::alloc::Layout::from_size_align(r.alloc_len, 1).unwrap());
-                // SAFETY: ptr/alloc_len from alloc_block.
+                        .expect(
+                            "alloc_block built this layout; the block could not exist otherwise",
+                        );
+                // SAFETY: ptr and alloc_len come from alloc_block, and the
+                // layout is the one it allocated with.
                 unsafe { std::alloc::dealloc(r.ptr as *mut u8, layout) };
             }
         }
@@ -682,6 +874,39 @@ impl Drop for FakeHost {
 impl FakeHost {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Report `[base, base + len)` as device memory rather than guest RAM, so
+    /// [`HostOps::is_ram_gpa`] answers `false` inside it.
+    ///
+    /// Models a PCI BAR. Reads and writes still work through this fixture —
+    /// the point is the *classification*, which is what production QEMU refuses
+    /// on (`MemTxAttrs.memory`), not whether bytes happen to be reachable here.
+    pub fn mark_non_ram(&mut self, base: u64, len: u64) {
+        self.non_ram
+            .borrow_mut()
+            .push((base, base.saturating_add(len)));
+    }
+
+    /// Stop answering RAM for `[base, base + len)` once a read touches
+    /// `[on_read_gpa, on_read_gpa + on_read_len)`.
+    ///
+    /// The guest half of a race this device cannot close: a caller pre-flights a
+    /// span, finds it all RAM, and then copies it a row at a time while the
+    /// guest is free to unmap it underneath. A `Rewire` models the guest editing
+    /// its page tables mid-loop; this models it retracting the memory, which
+    /// `Rewire` cannot express because `non_ram` is not page-table bytes.
+    ///
+    /// Fires from `read_gpa`, the same point and for the same reason: it is the
+    /// one operation every guest-memory loop performs, so the change lands
+    /// between two iterations without the loop knowing.
+    pub fn arm_unmap_on_read(&mut self, on_read_gpa: u64, on_read_len: u64, base: u64, len: u64) {
+        self.unmap_on_read.borrow_mut().push((
+            on_read_gpa,
+            on_read_len,
+            base,
+            base.saturating_add(len),
+        ));
     }
 
     /// State that an agent outside this device wrote the page holding `gpa`,
@@ -765,6 +990,7 @@ impl FakeHost {
     /// performs — so the edit lands between two iterations without the loop
     /// knowing anything about it, which is exactly the guest's position.
     fn fire_rewires(&self, gpa: u64, len: usize) {
+        self.fire_unmaps(gpa, len);
         if self.rewires.borrow().is_empty() {
             return;
         }
@@ -786,6 +1012,29 @@ impl FakeHost {
             self.poke(r.pte_gpa, &r.bytes);
             self.rewires_fired.set(self.rewires_fired.get() + 1);
         }
+    }
+
+    /// Retract any armed range whose trigger window this read touches.
+    ///
+    /// Ordered *before* the read it triggers on rather than after, because the
+    /// case being modelled is a read that fails: the guest unmapped the page and
+    /// the caller's read of it is the operation that discovers so.
+    fn fire_unmaps(&self, gpa: u64, len: usize) {
+        if self.unmap_on_read.borrow().is_empty() {
+            return;
+        }
+        let end = gpa.saturating_add(len as u64);
+        let mut retracted: Vec<(u64, u64)> = Vec::new();
+        self.unmap_on_read
+            .borrow_mut()
+            .retain(|&(on_gpa, on_len, base, range_end)| {
+                let hit = gpa < on_gpa.saturating_add(on_len) && on_gpa < end;
+                if hit {
+                    retracted.push((base, range_end));
+                }
+                !hit
+            });
+        self.non_ram.borrow_mut().extend(retracted);
     }
 
     /// Write `bytes` at `gpa` through a live range, from `&self`.
@@ -963,6 +1212,16 @@ impl HostMemory for FakeHost {
         let mut done = 0usize;
         while done < buf.len() {
             let addr = gpa.checked_add(done as u64).ok_or(MemError::Overflow)?;
+            // A span this fixture calls non-RAM refuses the read, because that
+            // is what the product host does: the QEMU shim reads with
+            // `MemTxAttrs.memory` set, so an address-space read of device memory
+            // — this device's own BAR, most of all — fails closed by design.
+            // Answering bytes for one would let a test pass through a door the
+            // product keeps shut. `QemuReadGpaCallbackFailed` is the error the
+            // shim reports for it.
+            if !self.is_ram_gpa(addr) {
+                return Err(MemError::QemuReadGpaCallbackFailed(-1));
+            }
             // Bounce views alias guest pages until unmap.
             if let Some((bptr, off, max)) = self.bounce_slot(addr) {
                 let n = (buf.len() - done).min(max);
@@ -1036,6 +1295,17 @@ impl HostMemory for FakeHost {
 impl HostOps for FakeHost {
     fn mono_ns(&self) -> u64 {
         self.mono_ns
+    }
+
+    /// Everything is RAM unless a test said otherwise through
+    /// [`FakeHost::mark_non_ram`], which keeps the default identical to the
+    /// flat `true` this fixture answered before.
+    fn is_ram_gpa(&self, gpa: u64) -> bool {
+        !self
+            .non_ram
+            .borrow()
+            .iter()
+            .any(|&(start, end)| gpa >= start && gpa < end)
     }
 
     fn enqueue(&mut self, action: HostAction) {
@@ -1354,6 +1624,139 @@ pub fn read_u32<M: HostMemory>(mem: &M, gpa: u64) -> Result<u32, MemError> {
 mod tests {
     use super::*;
 
+    /// A span walk finds a hole its two endpoints cannot see.
+    ///
+    /// This is the whole reason [`HostOps::first_non_ram_page`] exists rather
+    /// than two [`HostOps::is_ram_gpa`] calls at the caller, and it is the shape
+    /// a driven boot hit: both ends of the EFI console framebuffer answered RAM
+    /// and a page 375 rows in did not.
+    #[test]
+    fn a_ram_span_with_an_interior_hole_is_not_vouched_for_by_its_endpoints() {
+        const PAGE: usize = 4096;
+        let base = 0x8000_0000u64;
+        let len = 64 * PAGE as u64;
+        let hole = base + 37 * PAGE as u64;
+
+        let mut host = FakeHost::new();
+        host.mark_non_ram(hole, PAGE as u64);
+
+        assert!(
+            host.is_ram_gpa(base) && host.is_ram_gpa(base + len - 1),
+            "the fixture must reproduce the trap: both endpoints answer RAM"
+        );
+        assert_eq!(
+            host.first_non_ram_page(base, len, PAGE),
+            Some(hole),
+            "the walk must find the interior page and name it"
+        );
+        assert_eq!(
+            host.first_non_ram_page(base, 37 * PAGE as u64, PAGE),
+            None,
+            "a span stopping short of the hole is entirely RAM"
+        );
+    }
+
+    /// The walk covers the page holding the last byte, and an unaligned base
+    /// does not shift the grid.
+    ///
+    /// A span ending one byte into a page still depends on that page, so an
+    /// off-by-one that stopped at the previous one would vouch for bytes it
+    /// never asked about.
+    #[test]
+    fn a_span_walk_covers_the_page_its_last_byte_falls_in() {
+        const PAGE: usize = 4096;
+        let base = 0x1_0000u64;
+        let mut host = FakeHost::new();
+        host.mark_non_ram(base + 2 * PAGE as u64, PAGE as u64);
+
+        assert_eq!(
+            host.first_non_ram_page(base, 2 * PAGE as u64 + 1, PAGE),
+            Some(base + 2 * PAGE as u64),
+            "one byte into the third page still needs the third page"
+        );
+        assert_eq!(
+            host.first_non_ram_page(base, 2 * PAGE as u64, PAGE),
+            None,
+            "stopping at the page boundary does not reach it"
+        );
+        assert_eq!(
+            host.first_non_ram_page(base + 8, 2 * PAGE as u64, PAGE),
+            Some(base + 2 * PAGE as u64),
+            "an unaligned base is floored to its own page and the span still \
+             ends where its last byte lands, so the same length now reaches one \
+             page further"
+        );
+        assert_eq!(
+            host.first_non_ram_page(base, 0, PAGE),
+            None,
+            "an empty span asks about nothing"
+        );
+    }
+
+    /// The ABI header's action table agrees with [`HostActionKind`], and still
+    /// leaves 7 retired.
+    ///
+    /// This is the discriminant both shims switch on in `apply_action`, and it
+    /// is the highest-stakes table crossing the boundary: a drift does not fail
+    /// the pop, it runs the *wrong handler* for a real action — an IRQ pulse
+    /// taken as a scanout, a window close taken as a cursor update. Nothing
+    /// compared the two spellings until this test.
+    ///
+    /// 7 is asserted absent rather than skipped. It named a pre-host-window
+    /// GL/dmabuf scanout action that exists on neither side now, and every
+    /// discriminant above it is written out precisely so removing it did not
+    /// renumber the wire. A header that quietly reuses 7 for something new would
+    /// reintroduce the renumbering this enum's comment exists to prevent.
+    #[test]
+    fn the_abi_header_agrees_on_the_host_action_table() {
+        use crate::qemu::abi::header_define as define;
+        for (name, kind) in [
+            ("REIMS_VGPU_HOST_ACTION_NONE", HostActionKind::None),
+            (
+                "REIMS_VGPU_HOST_ACTION_IRQ_GFX",
+                HostActionKind::IrqGfxPulse,
+            ),
+            (
+                "REIMS_VGPU_HOST_ACTION_IRQ_IOSFC",
+                HostActionKind::IrqIosfcPulse,
+            ),
+            (
+                "REIMS_VGPU_HOST_ACTION_SCANOUT",
+                HostActionKind::ScanoutUpdate,
+            ),
+            (
+                "REIMS_VGPU_HOST_ACTION_CURSOR",
+                HostActionKind::CursorUpdate,
+            ),
+            ("REIMS_VGPU_HOST_ACTION_TRACE", HostActionKind::Trace),
+            (
+                "REIMS_VGPU_HOST_ACTION_CURSOR_GLYPH",
+                HostActionKind::CursorGlyph,
+            ),
+            ("REIMS_VGPU_HOST_ACTION_INPUT_KEY", HostActionKind::InputKey),
+            (
+                "REIMS_VGPU_HOST_ACTION_INPUT_POINTER_MOVE",
+                HostActionKind::InputPointerMove,
+            ),
+            (
+                "REIMS_VGPU_HOST_ACTION_INPUT_POINTER_BUTTON",
+                HostActionKind::InputPointerButton,
+            ),
+            (
+                "REIMS_VGPU_HOST_ACTION_WINDOW_CLOSED",
+                HostActionKind::WindowClosed,
+            ),
+        ] {
+            assert_eq!(
+                define(name),
+                kind as u32,
+                "{name} has drifted from HostActionKind::{kind:?}; the shims \
+                 would run the wrong handler for this action"
+            );
+            assert_ne!(define(name), 7, "{name} took the retired wire value 7");
+        }
+    }
+
     /// A generation, not a consumed flag: reading it twice must not change the
     /// answer.
     ///
@@ -1605,7 +2008,7 @@ mod tests {
     /// happens to put it.
     #[test]
     fn only_a_zero_pfn_means_the_guest_tore_the_range_down() {
-        use crate::contract::gva_resolve::ResolveStatus as R;
+        use reims_vgpu_paging::resolve::ResolveStatus as R;
         const WALK: &[R] = &[
             R::Ok,
             R::ErrArgs,
@@ -1615,7 +2018,6 @@ mod tests {
             R::ErrZeroRootPfn,
             R::ErrZeroDepth,
             R::ErrDepthTooDeep,
-            R::ErrAddressOutOfRange,
             R::ErrPageTableRead,
             R::ErrZeroPfn,
             R::ErrMalformedPte,

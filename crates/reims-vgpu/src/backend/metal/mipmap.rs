@@ -3,10 +3,18 @@
 //! Builds a temporary Shared storage texture, uploads level 0 in the guest
 //! native pixel format, runs the Metal blit encoder filter, and reads back
 //! every level as tightly packed native rows.
+//!
+//! What is left here is exactly the part that needs a device. The request's
+//! argument ladder, the filterable-format set and [`MetalMipmapError`] itself
+//! are arithmetic over guest numbers, so they live in [`crate::contract::mipmap`]
+//! where they can be executed on a host with no Apple linker — which is where
+//! five of this module's six tests went with them. The one that stayed
+//! (`metal_generate_constant_rgba8_preserves_color`) asks Metal to filter real
+//! pixels and cannot be answered anywhere else.
 
-use crate::backend::metal::format::pixel_format_from_u32;
+use crate::backend::metal::mtl_enum;
 use crate::backend::metal::runtime::{system_device, thread_queue};
-use crate::contract::pixel_format::{self, bytes_per_pixel};
+use crate::contract::mipmap::{filterable_bpp, plan_level0, MetalMipmapError};
 use metal::{
     MTLCommandBufferStatus, MTLOrigin, MTLPixelFormat, MTLRegion, MTLSize, MTLStorageMode,
     MTLTextureType, MTLTextureUsage, TextureDescriptor,
@@ -20,116 +28,17 @@ pub struct MetalMipLevel {
     pub tight_bytes: Vec<u8>,
 }
 
-/// Exact failed checks for the Metal mipmap path.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MetalMipmapError {
-    NoDevice,
-    UnsupportedFormat {
-        format: u16,
-    },
-    WidthZero,
-    HeightZero,
-    LevelCountTooSmall {
-        levels: u32,
-    },
-    BaseSpanOverflow {
-        width: u32,
-        height: u32,
-        bpp: u32,
-    },
-    Level0TooShort {
-        len: usize,
-        expected: u64,
-    },
-    LevelCountRejected {
-        requested: u32,
-        actual: u64,
-    },
-    CommandBufferFailed,
-    LevelSpanOverflow {
-        level: u32,
-        row_bytes: u64,
-        height: u32,
-    },
-}
-
-impl crate::observe::Decline for MetalMipmapError {
-    fn slug(&self) -> &'static str {
-        match self {
-            Self::NoDevice => "metal_mipmap_device_unavailable",
-            Self::UnsupportedFormat { .. } => "metal_mipmap_format_unsupported",
-            Self::WidthZero => "metal_mipmap_width_zero",
-            Self::HeightZero => "metal_mipmap_height_zero",
-            Self::LevelCountTooSmall { .. } => "metal_mipmap_level_count_too_small",
-            Self::BaseSpanOverflow { .. } => "metal_mipmap_base_span_overflow",
-            Self::Level0TooShort { .. } => "metal_mipmap_level0_too_short",
-            Self::LevelCountRejected { .. } => "metal_mipmap_level_count_rejected",
-            Self::CommandBufferFailed => "metal_mipmap_command_buffer_failed",
-            Self::LevelSpanOverflow { .. } => "metal_mipmap_level_span_overflow",
-        }
-    }
-
-    fn fields(&self) -> Vec<(&'static str, String)> {
-        match self {
-            Self::NoDevice | Self::WidthZero | Self::HeightZero | Self::CommandBufferFailed => {
-                Vec::new()
-            }
-            Self::UnsupportedFormat { format } => vec![("format", format.to_string())],
-            Self::LevelCountTooSmall { levels } => vec![("levels", levels.to_string())],
-            Self::BaseSpanOverflow { width, height, bpp } => vec![
-                ("width", width.to_string()),
-                ("height", height.to_string()),
-                ("bpp", bpp.to_string()),
-            ],
-            Self::Level0TooShort { len, expected } => {
-                vec![("len", len.to_string()), ("expected", expected.to_string())]
-            }
-            Self::LevelCountRejected { requested, actual } => vec![
-                ("requested", requested.to_string()),
-                ("actual", actual.to_string()),
-            ],
-            Self::LevelSpanOverflow {
-                level,
-                row_bytes,
-                height,
-            } => vec![
-                ("level", level.to_string()),
-                ("row_bytes", row_bytes.to_string()),
-                ("height", height.to_string()),
-            ],
-        }
-    }
-}
-
-/// Guest MTL formats that Metal treats as filterable for `generateMipmapsForTexture:`.
+/// The `MTLPixelFormat` and bytes-per-pixel of a guest format Metal will filter.
 ///
-/// Integer formats are not filterable and must fail visibly.
+/// The filterability decision is [`filterable_bpp`]'s; this adds the one step
+/// that needs the `metal` crate. Every format that predicate accepts is one of
+/// this device's own named constants, so the conversion cannot decline here —
+/// it is written as a `?` rather than an unwrap because the caller's `None`
+/// already means "this device will not filter that format", which is the right
+/// answer for a code naming no format at all.
 pub fn filterable_format(format: u16) -> Option<(MTLPixelFormat, u32)> {
-    let bpp = bytes_per_pixel(format)?;
-    match format {
-        pixel_format::MTL_FORMAT_A8_UNORM
-        | pixel_format::MTL_FORMAT_R8_UNORM
-        | pixel_format::MTL_FORMAT_RG8_UNORM
-        | pixel_format::MTL_FORMAT_R16_FLOAT
-        | pixel_format::MTL_FORMAT_RG16_FLOAT
-        | pixel_format::MTL_FORMAT_RGBA8_UNORM
-        | pixel_format::MTL_FORMAT_RGBA8_UNORM_SRGB
-        | pixel_format::MTL_FORMAT_BGRA8_UNORM
-        | pixel_format::MTL_FORMAT_BGRA8_UNORM_SRGB
-        | pixel_format::MTL_FORMAT_RGBA16_FLOAT
-        | pixel_format::MTL_FORMAT_RGBA32_FLOAT => {
-            Some((pixel_format_from_u32(format as u32), bpp))
-        }
-        _ => None,
-    }
-}
-
-/// Metal's standard 2D mip dimension for `base` at `level` (floor divide by 2 each step).
-pub fn metal_mip_extent(base: u32, level: u32) -> u32 {
-    if base == 0 {
-        return 0;
-    }
-    (base >> level).max(1)
+    let bpp = filterable_bpp(format)?;
+    Some((mtl_enum::pixel_format(format as u32)?, bpp))
 }
 
 /// Upload L0, run Metal-filtered mip generation, return levels `[0..levels)`.
@@ -144,29 +53,16 @@ pub fn generate_mipmaps_filtered(
     levels: u32,
     level0: &[u8],
 ) -> Result<Vec<MetalMipLevel>, MetalMipmapError> {
-    if width == 0 {
-        return Err(MetalMipmapError::WidthZero);
-    }
-    if height == 0 {
-        return Err(MetalMipmapError::HeightZero);
-    }
-    if levels <= 1 {
-        return Err(MetalMipmapError::LevelCountTooSmall { levels });
-    }
-    let (mtl_fmt, bpp) =
+    // The whole argument ladder, in one call, so that its order stays a fact
+    // some host can execute rather than one only an Apple machine can.
+    let plan = plan_level0(format, width, height, levels, level0.len())?;
+    let bpp = plan.bpp;
+    // Re-asked only for the `MTLPixelFormat`: `plan_level0` has already accepted
+    // the format, so a `None` here is the enum table missing a code the
+    // filterable set names. That is this device disagreeing with itself, and
+    // `UnsupportedFormat` is the honest report of it — never a cast.
+    let (mtl_fmt, _) =
         filterable_format(format).ok_or(MetalMipmapError::UnsupportedFormat { format })?;
-    let tight0 = (width as u64)
-        .checked_mul(height as u64)
-        .and_then(|v| v.checked_mul(bpp as u64))
-        .ok_or(MetalMipmapError::BaseSpanOverflow { width, height, bpp })?;
-    if level0.len() < tight0 as usize {
-        return Err(MetalMipmapError::Level0TooShort {
-            len: level0.len(),
-            expected: tight0,
-        });
-    }
-    // Both factors are u32, so their product always fits in u64.
-    let bytes_per_row0 = (width as u64) * (bpp as u64);
 
     let device = system_device().ok_or(MetalMipmapError::NoDevice)?;
     let queue = thread_queue(device);
@@ -181,7 +77,16 @@ pub fn generate_mipmaps_filtered(
     // ShaderRead is the documented usage for filterable sampled textures;
     // generateMipmapsForTexture operates on filterable color textures.
     descriptor.set_usage(MTLTextureUsage::ShaderRead);
-    let texture = device.new_texture(&descriptor);
+    // Before the level-count check, not after: an unchecked nil answers
+    // `mipmapLevelCount` with 0, so an exhausted device used to be reported as
+    // one that rejected the level count.
+    let Some(texture) = crate::backend::metal::raw_metal::new_texture(device, &descriptor) else {
+        return Err(MetalMipmapError::TextureAllocationFailed {
+            width,
+            height,
+            levels,
+        });
+    };
     if texture.mipmap_level_count() < levels as u64 {
         return Err(MetalMipmapError::LevelCountRejected {
             requested: levels,
@@ -197,10 +102,13 @@ pub fn generate_mipmaps_filtered(
             depth: 1,
         },
     };
-    texture.replace_region(region0, 0, level0.as_ptr() as *const _, bytes_per_row0);
+    texture.replace_region(region0, 0, level0.as_ptr() as *const _, plan.bytes_per_row);
 
-    let command_buffer = queue.new_command_buffer().to_owned();
-    let blit = command_buffer.new_blit_command_encoder();
+    let command_buffer = crate::backend::metal::raw_metal::new_command_buffer(&queue)
+        .ok_or(MetalMipmapError::CommandBufferFailed)?
+        .to_owned();
+    let blit = crate::backend::metal::raw_metal::new_blit_command_encoder(&command_buffer)
+        .ok_or(MetalMipmapError::CommandBufferFailed)?;
     blit.generate_mipmaps(&texture);
     blit.end_encoding();
     command_buffer.commit();
@@ -211,8 +119,8 @@ pub fn generate_mipmaps_filtered(
 
     let mut out = Vec::with_capacity(levels as usize);
     for level in 0..levels {
-        let w = metal_mip_extent(width, level);
-        let h = metal_mip_extent(height, level);
+        let w = crate::contract::extent::mip_extent(width, level);
+        let h = crate::contract::extent::mip_extent(height, level);
         // Both factors are u32, so their product always fits in u64.
         let bpr = (w as u64) * (bpp as u64);
         let need = bpr
@@ -245,25 +153,6 @@ pub fn generate_mipmaps_filtered(
 mod tests {
     use super::*;
     use crate::contract::pixel_format::MTL_FORMAT_RGBA8_UNORM;
-    use crate::observe::Emit;
-
-    #[test]
-    fn filterable_accepts_unorm_rejects_uint() {
-        assert!(filterable_format(MTL_FORMAT_RGBA8_UNORM).is_some());
-        assert!(filterable_format(pixel_format::MTL_FORMAT_BGRA8_UNORM).is_some());
-        assert!(filterable_format(pixel_format::MTL_FORMAT_RGBA8_UINT).is_none());
-        assert!(filterable_format(pixel_format::MTL_FORMAT_RGBA16_UINT).is_none());
-    }
-
-    #[test]
-    fn metal_mip_extent_chain() {
-        assert_eq!(metal_mip_extent(8, 0), 8);
-        assert_eq!(metal_mip_extent(8, 1), 4);
-        assert_eq!(metal_mip_extent(8, 3), 1);
-        assert_eq!(metal_mip_extent(5, 1), 2);
-        assert_eq!(metal_mip_extent(5, 2), 1);
-        assert_eq!(metal_mip_extent(3, 1), 1);
-    }
 
     #[test]
     fn metal_generate_constant_rgba8_preserves_color() {
@@ -289,73 +178,5 @@ mod tests {
                 assert_eq!(px, &[200, 10, 20, 255], "mip {} color", level.width);
             }
         }
-    }
-
-    #[test]
-    fn metal_generate_rejects_single_level() {
-        let l0 = [1u8, 2, 3, 4];
-        let error = generate_mipmaps_filtered(MTL_FORMAT_RGBA8_UNORM, 1, 1, 1, &l0).unwrap_err();
-        assert_eq!(error, MetalMipmapError::LevelCountTooSmall { levels: 1 });
-        assert_eq!(
-            Emit::decline("metal_mipmap_test", &error).render(),
-            "metal_mipmap_test reason=metal_mipmap_level_count_too_small levels=1"
-        );
-    }
-
-    #[test]
-    fn metal_generate_rejects_uint() {
-        let l0 = [1u8, 2, 3, 4];
-        let error = generate_mipmaps_filtered(pixel_format::MTL_FORMAT_RGBA8_UINT, 1, 1, 2, &l0)
-            .unwrap_err();
-        assert_eq!(
-            error,
-            MetalMipmapError::UnsupportedFormat {
-                format: pixel_format::MTL_FORMAT_RGBA8_UINT
-            }
-        );
-        assert_eq!(
-            Emit::decline("metal_mipmap_test", &error).render(),
-            format!(
-                "metal_mipmap_test reason=metal_mipmap_format_unsupported format={}",
-                pixel_format::MTL_FORMAT_RGBA8_UINT
-            )
-        );
-    }
-
-    #[test]
-    fn metal_generate_reports_the_level_zero_byte_requirement() {
-        let error =
-            generate_mipmaps_filtered(MTL_FORMAT_RGBA8_UNORM, 2, 2, 2, &[0; 15]).unwrap_err();
-        assert_eq!(
-            error,
-            MetalMipmapError::Level0TooShort {
-                len: 15,
-                expected: 16
-            }
-        );
-        assert_eq!(
-            Emit::decline("metal_mipmap_test", &error).render(),
-            "metal_mipmap_test reason=metal_mipmap_level0_too_short len=15 expected=16"
-        );
-    }
-
-    #[test]
-    fn metal_generate_names_each_zero_axis_separately() {
-        let level0 = [0u8; 4];
-        let width =
-            generate_mipmaps_filtered(MTL_FORMAT_RGBA8_UNORM, 0, 1, 2, &level0).unwrap_err();
-        let height =
-            generate_mipmaps_filtered(MTL_FORMAT_RGBA8_UNORM, 1, 0, 2, &level0).unwrap_err();
-
-        assert_eq!(width, MetalMipmapError::WidthZero);
-        assert_eq!(height, MetalMipmapError::HeightZero);
-        assert_eq!(
-            Emit::decline("metal_mipmap_test", &width).render(),
-            "metal_mipmap_test reason=metal_mipmap_width_zero"
-        );
-        assert_eq!(
-            Emit::decline("metal_mipmap_test", &height).render(),
-            "metal_mipmap_test reason=metal_mipmap_height_zero"
-        );
     }
 }

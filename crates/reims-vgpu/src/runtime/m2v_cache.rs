@@ -7,9 +7,11 @@
 //! for `pmap_flush_tlbs` **IPI timeout** panics (WindowServer in
 //! `processExecIndirect` / `submitOnChannel`).
 //!
-//! Cache key is a content hash of the AIR blob + stage — not pipeline object
-//! id (ids recycle; AIR content is the stable unit of work). Measure-only
-//! hit/miss counters for fail-log census.
+//! The cache key is the AIR blob itself plus its stage — not the pipeline object
+//! id, which recycles, and not a hash of the AIR, which can collide. A content
+//! hash narrows the bucket and `Slot::is` decides the hit; `ShaderId` carries
+//! the argument for why the digest is not allowed to.
+//! Measure-only hit/miss counters for fail-log census.
 
 use std::collections::{HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
@@ -61,6 +63,74 @@ pub enum M2vCacheDecline {
     KernelLocalSizeZero {
         local_size: [u32; 3],
     },
+}
+
+impl M2vCacheDecline {
+    /// Whether a second attempt at the same AIR could answer differently.
+    ///
+    /// Every entry in this cache is keyed by the AIR blob's content, so a
+    /// refusal that is *about the AIR* is reached again by every later ask and
+    /// is worth remembering: a module whose datalayout is missing, whose layout
+    /// repair fails, or whose requested threadgroup is degenerate refuses the
+    /// same way forever.
+    ///
+    /// The scratch writes are not about the AIR. `translate_air` and
+    /// `translate_kernel_air` each begin by writing the blob to a fixed path
+    /// under [`tmp_dir`], and that write fails for reasons belonging to the host
+    /// filesystem at that instant — no space, no descriptors, a transient I/O
+    /// error. Remembering one turns "the host could not spare a scratch file
+    /// just then" into "this shader never renders again", and because the cache
+    /// is unbounded and nothing evicts, "again" means for the life of the
+    /// process. It is the same rule
+    /// [`crate::backend::vulkan::engine::types::DrawError::out_of_memory`]
+    /// states for the object caches.
+    ///
+    /// The translate declines are deliberately *not* here even though
+    /// metal2vulkan also touches the filesystem. Their detail is an opaque
+    /// string from the tool, so telling a disk failure from a malformed module
+    /// would mean matching on its prose — and re-running a full translation on
+    /// every draw of a genuinely untranslatable shader costs far more than the
+    /// scratch write does. The split is by what the variant *names*, not by what
+    /// its message happens to say.
+    fn is_transient(&self) -> bool {
+        match self {
+            Self::VertexScratchWrite { .. }
+            | Self::FragmentScratchWrite { .. }
+            | Self::KernelScratchWrite { .. } => true,
+            Self::VertexTranslate { .. }
+            | Self::FragmentTranslate { .. }
+            | Self::KernelTranslate { .. }
+            | Self::ReflectionDatalayoutMissing { .. }
+            | Self::LayoutRepair { .. }
+            | Self::TranslationPending { .. }
+            | Self::KernelLocalSizeZero { .. } => false,
+        }
+    }
+}
+
+/// Hand a stored failure to its caller, and drop it if a later ask could get a
+/// different answer.
+///
+/// This is where the retry is armed, and it is the only point in the cache's
+/// life cycle where arming one is safe. The async admission
+/// ([`ensure_cached_async_keyed`]) cannot do it: its caller re-polls the same
+/// guest packet until it answers `true`, so an arm that removed the entry and
+/// re-queued would translate, fail, remove, re-queue — and the packet at the
+/// channel head would never advance. Here the error is already on its way to
+/// the caller, so this draw fails whatever we do; all that changes is that the
+/// *next* draw finds no entry and translates again.
+///
+/// The cost while the host stays unable is one re-translation per draw of that
+/// shader. The alarm is fail-visible and `fail_once`-deduped by key, so a
+/// persistent one names itself once rather than per attempt.
+fn forget_if_transient(cache: &mut Cache, id: ShaderId<'_>, error: &M2vCacheDecline) {
+    if !error.is_transient() {
+        return;
+    }
+    cache.forget(id);
+    crate::observe::Emit::decline("m2v_transient_failure_forgotten", error)
+        .field("key", id.digest)
+        .fail_once(id.digest);
 }
 
 fn log_token(detail: &str) -> String {
@@ -177,11 +247,33 @@ pub struct CachedShader {
 }
 
 impl CachedShader {
+    /// Materialize a freshly translated module, in the device's binding
+    /// numbering rather than the translator's.
+    ///
+    /// [`crate::runtime::spirv_bind::widen_sampled_bands`] runs exactly here,
+    /// once per shader on the translate miss path, because this is the one point
+    /// every consumer of a module goes through — both `spirv` and `words`, and
+    /// therefore every fragment relocation variant derived from `words`. Doing it
+    /// per draw would be a module rewrite on the hot path; doing it in only one
+    /// of the two representations would let the compute rail (which reads
+    /// `spirv`) and the render rail (which reads `words`) disagree about what
+    /// binding a texture has.
+    ///
+    /// `spirv` is rebuilt from the widened words for that reason: it is no longer
+    /// byte-identical to what the translator returned, and the bytes and the
+    /// words must not be allowed to drift apart.
     pub fn new(spirv: Vec<u8>, reflection: Arc<ShaderReflection>) -> Self {
-        let words: Vec<u32> = spirv
+        let mut words: Vec<u32> = spirv
             .chunks_exact(4)
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
+        let widened = crate::runtime::spirv_bind::widen_sampled_bands(&mut words);
+        let spirv = if widened == 0 {
+            // Nothing moved, so the translator's bytes already are the device's.
+            spirv
+        } else {
+            words.iter().flat_map(|w| w.to_le_bytes()).collect()
+        };
         Self {
             spirv,
             reflection,
@@ -219,15 +311,32 @@ impl CachedShader {
     }
 }
 
-/// Cap entries so a long session cannot grow without bound (research host).
-const MAX_ENTRIES: usize = 256;
-
+/// Translated shaders, keyed by the content hash of the AIR the guest supplied.
+///
+/// **Deliberately unbounded.** The key is content, so the live entry count is the
+/// number of *distinct* shaders the guest has ever compiled — a property of the
+/// guest's own program set, not of how long the device has run. A driven x86
+/// boot with a window-drag probe against Safari settles at 75 and stays there
+/// for the rest of the run, read off the `object_cache_levels` census; an idle
+/// boot reaches the same. That is the same bound a real driver's pipeline cache
+/// has, and it is why no reclaim rule is needed here.
+///
+/// It used to hold 256 entries and evict in insertion order. Both halves were
+/// wrong for this workload. Insertion order makes the *first* shader compiled —
+/// the compositor's, drawn every frame for the life of the boot — the first
+/// victim, so crossing the cap evicts the hot set and nothing else. And a miss is
+/// not free: the module header above records why re-translating on the doorbell
+/// vCPU holds guest CPUs long enough to trip `pmap_flush_tlbs` IPI-timeout
+/// panics. A cap whose crossing degrades the guest is a failure mode bought for
+/// a bound the workload never approached.
 #[derive(Default)]
 struct Cache {
-    /// key = hash(stage_tag || air_bytes) → SPIR-V bytes
-    entries: HashMap<u64, Entry>,
-    /// Insertion order for crude eviction (FIFO).
-    order: Vec<u64>,
+    /// `hash(stage_tag || air_bytes)` → every shader filed under that digest.
+    ///
+    /// A bucket holds more than one entry only on a digest collision, and
+    /// [`Slot::is`] is what decides a hit — see [`ShaderId`] for why the digest
+    /// is not allowed to.
+    entries: HashMap<u64, Vec<Slot>>,
     hits: u64,
     misses: u64,
     async_queue: VecDeque<TranslationTask>,
@@ -241,12 +350,168 @@ enum Entry {
     Failed(M2vCacheDecline),
 }
 
+/// One cached translation and the identity it was filed under.
+///
+/// The AIR is retained. That is the whole cost of the identity compare, and it
+/// is a good deal smaller than [`Cache`]'s own doc once implied: a
+/// [`CachedShader`] already holds the module as `spirv` bytes *and* as `words`,
+/// plus a relocated word copy per fragment variant, so one copy of the AIR that
+/// produced them is a fraction of the entry rather than a doubling of it.
+struct Slot {
+    stage: u8,
+    /// `Some` for a kernel, whose LocalSize is baked into the SPIR-V, so one
+    /// AIR blob dispatched at two geometries is two shaders. `None` for a render
+    /// stage, which has no such parameter.
+    local_size: Option<[u32; 3]>,
+    air: Arc<[u8]>,
+    entry: Entry,
+}
+
+impl Slot {
+    /// The full identity compare. This alone decides a hit.
+    fn is(&self, id: ShaderId<'_>) -> bool {
+        self.stage == id.stage && self.local_size == id.local_size && *self.air == *id.air
+    }
+}
+
+/// What makes two translations the same translation: the whole of what the
+/// guest supplied, borrowed for a lookup.
+///
+/// # The digest narrows the bucket and decides nothing
+///
+/// [`Cache::entries`] used to be keyed on `digest` alone and hold no copy of the
+/// AIR, so a lookup that landed on an entry returned it — there was no
+/// confirmation step. Two distinct AIR blobs colliding would hand the guest a
+/// shader it never compiled, silently and with no failure line, which is a worse
+/// outcome than any eviction this device can make.
+///
+/// That was argued as acceptable against the birthday bound — `n² / 2^65` for
+/// the 75 distinct shaders a driven boot settles at, about `2e-16`. The argument
+/// is arithmetically right and it is the wrong shape: it prices a failure mode
+/// instead of removing one, and the price it quotes is not one this device is
+/// able to observe if it is ever wrong. Retaining the AIR removes the class
+/// outright, which is what the old doc itself named as the answer, and it is
+/// cheaper than a wider hash because a wider hash only moves the exponent.
+///
+/// It is also the shape the rest of this crate uses:
+/// [`crate::model::content_cache`] buckets by a `u64` prefilter and decides on
+/// `CacheEntry::matches`, and [`crate::backend::blob`] buckets a shader by its
+/// digest and decides on the retained bytes.
+///
+/// This doc used to close by calling itself "the one digest-keyed cache in the
+/// crate that trusted its key", on the strength of a sweep run when it was
+/// fixed. **The sweep was wrong by three, and how it went wrong is the useful
+/// part.** `backend::metal::cache`'s `BlobKey` was a digest beside the blob's
+/// *length*, and its own doc argued that carrying the length made it an
+/// identity — so a reader auditing for "digest alone" read the length as the
+/// confirming compare and moved on. It is not one. It makes a collision need
+/// equal lengths, which narrows the population by a factor and removes nothing.
+/// Three caches keyed on it. When auditing this class, the question is not
+/// whether the key has a second field; it is whether **anything retained the
+/// bytes**.
+///
+/// Borrowed rather than owned because a lookup happens per pipeline build and an
+/// owned key would allocate a copy of the AIR to throw away on every hit. Only
+/// [`Cache::put`] takes ownership, once per distinct shader.
+#[derive(Clone, Copy)]
+struct ShaderId<'a> {
+    digest: u64,
+    stage: u8,
+    local_size: Option<[u32; 3]>,
+    air: &'a [u8],
+}
+
+impl<'a> ShaderId<'a> {
+    fn render(stage: Stage, air: &'a [u8]) -> Self {
+        Self {
+            digest: air_key(stage, air),
+            stage: stage_tag(stage),
+            local_size: None,
+            air,
+        }
+    }
+
+    fn kernel(air: &'a [u8], local_size: [u32; 3]) -> Self {
+        Self {
+            digest: air_key_kernel(air, local_size),
+            stage: stage_tag(Stage::Kernel),
+            local_size: Some(local_size),
+            air,
+        }
+    }
+}
+
+impl Cache {
+    /// The entry filed under `id`, if this cache holds one.
+    fn find(&self, id: ShaderId<'_>) -> Option<&Entry> {
+        self.entries
+            .get(&id.digest)?
+            .iter()
+            .find(|s| s.is(id))
+            .map(|s| &s.entry)
+    }
+
+    /// File `entry` under `id`, replacing whatever that identity held.
+    ///
+    /// Replacing rather than pushing is the `Loading` -> `Ready`/`Failed`
+    /// transition, which is the common case: the admission puts `Loading` and
+    /// the worker puts the result under the same identity. Pushing there would
+    /// leave the `Loading` slot in front of the `Ready` one, where `find`
+    /// reaches it first and every later ask reports the translation still
+    /// pending.
+    fn put(&mut self, id: ShaderId<'_>, air: &Arc<[u8]>, entry: Entry) {
+        let bucket = self.entries.entry(id.digest).or_default();
+        match bucket.iter_mut().find(|s| s.is(id)) {
+            Some(slot) => slot.entry = entry,
+            None => bucket.push(Slot {
+                stage: id.stage,
+                local_size: id.local_size,
+                air: Arc::clone(air),
+                entry,
+            }),
+        }
+    }
+
+    /// Drop the entry filed under `id`, and the bucket with it if it was the
+    /// last — so a forgotten transient failure leaves nothing behind to walk.
+    fn forget(&mut self, id: ShaderId<'_>) {
+        let std::collections::hash_map::Entry::Occupied(mut bucket) = self.entries.entry(id.digest)
+        else {
+            return;
+        };
+        bucket.get_mut().retain(|s| !s.is(id));
+        if bucket.get().is_empty() {
+            bucket.remove();
+        }
+    }
+
+    /// Live entries across every bucket.
+    ///
+    /// The level `object_cache_levels` publishes. It sums rather than counting
+    /// buckets because those differ exactly when a digest collides, which is the
+    /// event this cache now survives and must not under-report.
+    fn len(&self) -> usize {
+        self.entries.values().map(Vec::len).sum()
+    }
+}
+
 struct TranslationTask {
-    key: u64,
     stage: Stage,
     kernel_local_size: Option<[u32; 3]>,
-    air: Vec<u8>,
+    /// Shared with the [`Slot`] the admission filed, so the identity the worker
+    /// completes under is the same bytes the admission was asked about and not a
+    /// second copy that could differ.
+    air: Arc<[u8]>,
     pipeline_ref: u32,
+}
+
+impl TranslationTask {
+    fn id(&self) -> ShaderId<'_> {
+        match self.kernel_local_size {
+            Some(local_size) => ShaderId::kernel(&self.air, local_size),
+            None => ShaderId::render(self.stage, &self.air),
+        }
+    }
 }
 
 fn global() -> &'static Mutex<Cache> {
@@ -262,6 +527,27 @@ fn stage_tag(stage: Stage) -> u8 {
     }
 }
 
+/// The bucket digest for a non-kernel shader: 64 bits of SipHash over stage +
+/// AIR.
+///
+/// # This narrows the search and decides nothing
+///
+/// It is not the cache key. [`ShaderId`] is, and [`Slot::is`] compares the AIR
+/// itself on every hit, so a collision here costs a two-entry walk and cannot
+/// cost correctness. Read [`ShaderId`] before changing this function: what it
+/// must be is *stable within one process*, and what it must not be is *trusted*.
+///
+/// This doc used to argue the opposite — that the digest was the identity, and
+/// that the birthday bound (`n² / 2^65`, about `2e-16` at the 75 distinct
+/// shaders a driven boot settles at) made the resulting wrong-shader hazard
+/// acceptable. The arithmetic was right. Pricing a silent failure this device
+/// cannot observe was not, and the same doc already named retaining the AIR as
+/// the answer.
+///
+/// `air.hash()` writes a length prefix before the bytes, per `Hash for [u8]`, so
+/// two blobs of different lengths are not merely unlikely to share a bucket —
+/// the length is in the digest too. That is now a statement about walk length
+/// rather than about correctness.
 fn air_key(stage: Stage, air: &[u8]) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     stage_tag(stage).hash(&mut h);
@@ -269,7 +555,15 @@ fn air_key(stage: Stage, air: &[u8]) -> u64 {
     h.finish()
 }
 
-/// Kernel cache key includes LocalSize (SPIR-V workgroup size is baked at translate).
+/// The bucket digest for a kernel, which includes LocalSize because the SPIR-V
+/// workgroup size is baked in at translate.
+///
+/// `local_size` is in the digest *and* in [`ShaderId`], and it has to be in both
+/// for different reasons: in the identity because one AIR blob dispatched at two
+/// geometries is genuinely two shaders, and in the digest so the two do not
+/// share a bucket and pay a walk on every hit. Leaving it out of the identity
+/// would be the wrong-shader hazard [`air_key`] describes, except reachable by a
+/// guest doing something entirely ordinary rather than by chance.
 fn air_key_kernel(air: &[u8], local_size: [u32; 3]) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     stage_tag(Stage::Kernel).hash(&mut h);
@@ -399,27 +693,12 @@ fn repair_layout(
     Ok(spirv)
 }
 
-fn evict_one(c: &mut Cache) {
-    if c.entries.len() < MAX_ENTRIES {
-        return;
-    }
-    if let Some(pos) = c
-        .order
-        .iter()
-        .position(|key| !matches!(c.entries.get(key), Some(Entry::Loading)))
-    {
-        let old = c.order.remove(pos);
-        c.entries.remove(&old);
-    }
-}
-
 /// Start translating a render stage without holding protocol state or the
 /// sole FIFO scheduler. Returns true when the content is already resolved
 /// (success or deterministic failure), false while the background worker owns
 /// it. Callers keep the guest packet at the channel head and retry on poll.
 pub fn ensure_cached_async(air: &[u8], stage: Stage, pipeline_ref: u32) -> bool {
-    let key = air_key(stage, air);
-    ensure_cached_async_keyed(air, stage, None, pipeline_ref, key)
+    ensure_cached_async_keyed(ShaderId::render(stage, air), stage, None, pipeline_ref)
 }
 
 /// Kernel counterpart to [`ensure_cached_async`]. LocalSize is part of both
@@ -429,34 +708,42 @@ pub fn ensure_cached_kernel_async(air: &[u8], local_size: [u32; 3], pipeline_ref
     if local_size.contains(&0) {
         return true;
     }
-    let key = air_key_kernel(air, local_size);
-    ensure_cached_async_keyed(air, Stage::Kernel, Some(local_size), pipeline_ref, key)
+    ensure_cached_async_keyed(
+        ShaderId::kernel(air, local_size),
+        Stage::Kernel,
+        Some(local_size),
+        pipeline_ref,
+    )
 }
 
 fn ensure_cached_async_keyed(
-    air: &[u8],
+    id: ShaderId<'_>,
     stage: Stage,
     kernel_local_size: Option<[u32; 3]>,
     pipeline_ref: u32,
-    key: u64,
 ) -> bool {
     let mut start_worker = false;
     {
         let mut c = global().lock().unwrap_or_else(|e| e.into_inner());
-        match c.entries.get(&key) {
+        match c.find(id) {
+            // A stored failure resolves the ask, transient or not, and that is
+            // load-bearing: the caller holds the guest packet at the channel
+            // head and re-polls until this answers `true`, so an arm that
+            // re-queued instead would never let the packet advance. The retry
+            // is armed where the error is *consumed* — see the `Entry::Failed`
+            // arm of [`translate_cached_reflected`] — which costs the failing
+            // draw its failure and leaves the next draw a clean cache.
             Some(Entry::Ready(_)) | Some(Entry::Failed(_)) => return true,
             Some(Entry::Loading) => return false,
             None => {}
         }
-        evict_one(&mut c);
-        c.entries.insert(key, Entry::Loading);
-        c.order.push(key);
+        let air: Arc<[u8]> = Arc::from(id.air);
+        c.put(id, &air, Entry::Loading);
         c.misses = c.misses.saturating_add(1);
         c.async_queue.push_back(TranslationTask {
-            key,
             stage,
             kernel_local_size,
-            air: air.to_vec(),
+            air,
             pipeline_ref,
         });
         if !c.async_worker_running {
@@ -472,7 +759,7 @@ fn ensure_cached_async_keyed(
     // failure (a shader that will not render).
     crate::observe::off(format!(
         "linux_m2v_async queued pipe={pipeline_ref} stage={stage:?}{dims} air={}",
-        air.len()
+        id.air.len()
     ));
     if start_worker {
         std::thread::spawn(async_worker);
@@ -537,11 +824,11 @@ fn async_worker() {
                             vb.uses_vertex_index as u8
                         ));
                     }
-                    c.entries.insert(task.key, Entry::Ready(Arc::new(shader)));
+                    c.put(task.id(), &task.air, Entry::Ready(Arc::new(shader)));
                     (format!("ok spv={len}"), None)
                 }
                 Err(e) => {
-                    c.entries.insert(task.key, Entry::Failed(e.clone()));
+                    c.put(task.id(), &task.air, Entry::Failed(e.clone()));
                     ("fail".to_string(), Some(e))
                 }
             };
@@ -561,7 +848,7 @@ fn async_worker() {
             if let Some([x, y, z]) = task.kernel_local_size {
                 emit = emit.field("tg_x", x).field("tg_y", y).field("tg_z", z);
             }
-            emit.fail_once(task.key);
+            emit.fail_once(task.id().digest);
         } else {
             let done = format!(
                 "linux_m2v_async done pipe={} stage={:?}{dims} {detail} hits={hits} misses={misses}",
@@ -613,10 +900,10 @@ pub fn translate_cached_reflected(
     stage: Stage,
     pipeline_ref: u32,
 ) -> M2vResult<Arc<CachedShader>> {
-    let key = air_key(stage, air);
+    let id = ShaderId::render(stage, air);
     {
         let mut c = global().lock().unwrap_or_else(|e| e.into_inner());
-        match c.entries.get(&key).cloned() {
+        match c.find(id).cloned() {
             Some(Entry::Ready(shader)) => {
                 c.hits = c.hits.saturating_add(1);
                 let hits = c.hits;
@@ -635,7 +922,10 @@ pub fn translate_cached_reflected(
                 }
                 return Ok(shader);
             }
-            Some(Entry::Failed(e)) => return Err(e),
+            Some(Entry::Failed(e)) => {
+                forget_if_transient(&mut c, id, &e);
+                return Err(e);
+            }
             Some(Entry::Loading) => {
                 return Err(M2vCacheDecline::TranslationPending {
                     stage: stage_name(stage),
@@ -650,9 +940,7 @@ pub fn translate_cached_reflected(
     {
         let mut c = global().lock().unwrap_or_else(|e| e.into_inner());
         c.misses = c.misses.saturating_add(1);
-        evict_one(&mut c);
-        c.entries.insert(key, Entry::Ready(Arc::clone(&shader)));
-        c.order.push(key);
+        c.put(id, &Arc::from(air), Entry::Ready(Arc::clone(&shader)));
         let hits = c.hits;
         let misses = c.misses;
         drop(c);
@@ -678,10 +966,10 @@ pub fn translate_cached_kernel_reflected(
     if local_size.contains(&0) {
         return Err(M2vCacheDecline::KernelLocalSizeZero { local_size });
     }
-    let key = air_key_kernel(air, local_size);
+    let id = ShaderId::kernel(air, local_size);
     {
         let mut c = global().lock().unwrap_or_else(|e| e.into_inner());
-        match c.entries.get(&key).cloned() {
+        match c.find(id).cloned() {
             Some(Entry::Ready(shader)) => {
                 c.hits = c.hits.saturating_add(1);
                 let hits = c.hits;
@@ -697,7 +985,10 @@ pub fn translate_cached_kernel_reflected(
                 }
                 return Ok(shader);
             }
-            Some(Entry::Failed(e)) => return Err(e),
+            Some(Entry::Failed(e)) => {
+                forget_if_transient(&mut c, id, &e);
+                return Err(e);
+            }
             Some(Entry::Loading) => {
                 return Err(M2vCacheDecline::TranslationPending { stage: "kernel" })
             }
@@ -710,9 +1001,7 @@ pub fn translate_cached_kernel_reflected(
     {
         let mut c = global().lock().unwrap_or_else(|e| e.into_inner());
         c.misses = c.misses.saturating_add(1);
-        evict_one(&mut c);
-        c.entries.insert(key, Entry::Ready(Arc::clone(&shader)));
-        c.order.push(key);
+        c.put(id, &Arc::from(air), Entry::Ready(Arc::clone(&shader)));
         let hits = c.hits;
         let misses = c.misses;
         drop(c);
@@ -732,7 +1021,7 @@ pub fn translate_cached_kernel_reflected(
 /// `#[cfg(test)]`: `tests/reflection_adoption.rs` is a separate crate.
 pub fn stats() -> (u64, u64, usize) {
     let c = global().lock().unwrap_or_else(|e| e.into_inner());
-    (c.hits, c.misses, c.entries.len())
+    (c.hits, c.misses, c.len())
 }
 
 /// Test isolation.
@@ -740,7 +1029,6 @@ pub fn stats() -> (u64, u64, usize) {
 pub fn reset_for_test() {
     let mut c = global().lock().unwrap_or_else(|e| e.into_inner());
     c.entries.clear();
-    c.order.clear();
     c.hits = 0;
     c.misses = 0;
     c.async_queue.clear();
@@ -786,53 +1074,76 @@ mod tests {
         ))
     }
 
+    /// `CachedShader::new` widens the translator's bands, and `fragment_words`
+    /// relocates on top of that — in that order, for every representation.
     #[test]
     fn fragment_words_variants_match_direct_relocation_and_cache() {
-        // Minimal module: 5-word header + three OpDecorate Binding instructions,
-        // one in the buffer band and the low/high edges exercised in the
-        // sampled band. Binding 95 is the maximum relocated source and proves
-        // the now-infallible addition tops out at 223.
+        use crate::runtime::spirv_bind::{
+            FRAG_BUFFER_BINDING_OFFSET, FRAG_SAMPLED_RESOURCE_BINDING_OFFSET,
+            M2V_SAMPLER_BINDING_BASE, M2V_TEXTURE_BINDING_BASE, SAMPLED_TAIL_WIDEN_OFFSET,
+        };
+
+        // Minimal module: 5-word header + three OpDecorate Binding instructions
+        // in the TRANSLATOR's numbering, which is what a fresh translate hands
+        // over. One buffer, one texture, and the top of the translator's sampler
+        // band — the maximum source the widen has to carry.
+        const TOP_SAMPLER: u32 = M2V_SAMPLER_BINDING_BASE + 31;
         let decorate = |id: u32, binding: u32| vec![(4u32 << 16) | 71, id, 33, binding];
         let mut words: Vec<u32> = vec![0x0723_0203, 0x0001_0000, 0, 100, 0];
         words.extend(decorate(7, 3));
-        words.extend(decorate(8, 40));
-        words.extend(decorate(9, 95));
+        words.extend(decorate(8, M2V_TEXTURE_BINDING_BASE + 8));
+        words.extend(decorate(9, TOP_SAMPLER));
         let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let shader = synth_shader(Stage::Fragment, bytes);
-        assert_eq!(*shader.words, words);
 
-        // No flags → the base Arc, unrelocated.
+        // The stored module is the widened one: the sampler moved out of the
+        // texture band's way, the buffer and texture did not move at all.
+        let mut widened = words.clone();
+        let moved = crate::runtime::spirv_bind::widen_sampled_bands(&mut widened);
+        assert_eq!(moved, 1, "only the sampler band moves");
+        assert_eq!(*shader.words, widened);
+        assert_eq!(shader.words[8], 3);
+        assert_eq!(shader.words[12], M2V_TEXTURE_BINDING_BASE + 8);
+        assert_eq!(shader.words[16], TOP_SAMPLER + SAMPLED_TAIL_WIDEN_OFFSET);
+        // The bytes must not be allowed to disagree with the words.
+        let from_bytes: Vec<u32> = shader
+            .spirv
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert_eq!(from_bytes, widened);
+
+        // No flags → the base Arc, un-relocated.
         let base = shader.fragment_words(false, false);
         assert!(Arc::ptr_eq(&base, &shader.words));
 
         // Both flags → sampled reloc first, then buffer band, matching the
         // historical per-draw mutation order.
-        let mut expect = words.clone();
+        let mut expect = widened.clone();
         let n = crate::runtime::spirv_bind::offset_fragment_sampled_resource_bindings(&mut expect);
         assert_eq!(n, 2);
         let n = crate::runtime::spirv_bind::offset_fragment_buffer_bindings(&mut expect);
         assert_eq!(n, 1);
         let both = shader.fragment_words(true, true);
         assert_eq!(*both, expect);
-        assert_eq!(
-            both[8],
-            3 + crate::runtime::spirv_bind::FRAG_BUFFER_BINDING_OFFSET
-        );
+        assert_eq!(both[8], 3 + FRAG_BUFFER_BINDING_OFFSET);
         assert_eq!(
             both[12],
-            40 + crate::runtime::spirv_bind::FRAG_SAMPLED_RESOURCE_BINDING_OFFSET
+            M2V_TEXTURE_BINDING_BASE + 8 + FRAG_SAMPLED_RESOURCE_BINDING_OFFSET
         );
         assert_eq!(
             both[16],
-            95 + crate::runtime::spirv_bind::FRAG_SAMPLED_RESOURCE_BINDING_OFFSET
+            TOP_SAMPLER + SAMPLED_TAIL_WIDEN_OFFSET + FRAG_SAMPLED_RESOURCE_BINDING_OFFSET
         );
-        assert_eq!(both[16], 223);
+        // Every relocated band stays clear of every un-relocated one.
+        assert!(both[8] > crate::runtime::spirv_bind::COLOR_INPUT_BINDING_BASE);
+        assert!(both[12] > both[8] && both[16] > both[12]);
 
         // Second call returns the cached variant (same allocation), and the
-        // base module is never mutated.
+        // stored (widened) module is never mutated by a relocation.
         let again = shader.fragment_words(true, true);
         assert!(Arc::ptr_eq(&both, &again));
-        assert_eq!(*shader.words, words);
+        assert_eq!(*shader.words, widened);
     }
 
     #[test]
@@ -844,6 +1155,231 @@ mod tests {
         assert_ne!(air_key_kernel(a, [16, 16, 1]), air_key_kernel(a, [8, 8, 1]));
     }
 
+    /// Each `local_size` component alone changes the kernel key.
+    ///
+    /// The assertion above varies two components at once, so a digest that fed
+    /// only `local_size[0]` would satisfy it. That matters here more than the
+    /// usual thoroughness argument: the translator bakes the workgroup size into
+    /// the SPIR-V, so a key blind to one axis returns a shader compiled for a
+    /// different one — the guest's dispatch runs, produces wrong results, and
+    /// nothing anywhere reports a miss, because it was a *hit*.
+    ///
+    /// Also pinned: the same triple keys the same, so this cannot pass by
+    /// accident on a key that simply changes every call.
+    #[test]
+    fn every_local_size_axis_is_in_the_kernel_key() {
+        let air = b"kernel-air";
+        let base = [8u32, 8, 8];
+        assert_eq!(air_key_kernel(air, base), air_key_kernel(air, base));
+        for axis in 0..3 {
+            let mut moved = base;
+            moved[axis] += 1;
+            assert_ne!(
+                air_key_kernel(air, base),
+                air_key_kernel(air, moved),
+                "local_size[{axis}] does not reach the key: {base:?} vs {moved:?}"
+            );
+        }
+    }
+
+    /// Every decline is classified, and the split is by what the variant names.
+    ///
+    /// The scratch writes are the host filesystem at one instant; everything
+    /// else is a property of the AIR blob this cache is keyed by, and is reached
+    /// again by every later ask.
+    #[test]
+    fn only_the_scratch_writes_are_transient() {
+        let detail = || "ENOSPC".to_string();
+        for transient in [
+            M2vCacheDecline::VertexScratchWrite { detail: detail() },
+            M2vCacheDecline::FragmentScratchWrite { detail: detail() },
+            M2vCacheDecline::KernelScratchWrite { detail: detail() },
+        ] {
+            assert!(transient.is_transient(), "{transient:?} is about the host");
+        }
+        for permanent in [
+            M2vCacheDecline::VertexTranslate { detail: detail() },
+            M2vCacheDecline::FragmentTranslate { detail: detail() },
+            M2vCacheDecline::KernelTranslate { detail: detail() },
+            M2vCacheDecline::ReflectionDatalayoutMissing { stage: "vertex" },
+            M2vCacheDecline::TranslationPending { stage: "vertex" },
+            M2vCacheDecline::KernelLocalSizeZero {
+                local_size: [0, 1, 1],
+            },
+        ] {
+            assert!(!permanent.is_transient(), "{permanent:?} is about the AIR");
+        }
+    }
+
+    /// A scratch-write failure fails the draw that met it and then gets out of
+    /// the way. The cache is unbounded and nothing evicts, so before this the
+    /// entry answered every later draw of that shader for the life of the
+    /// process — a full stop for one moment when the host had no room for a
+    /// temp file.
+    #[test]
+    fn a_transient_failure_is_forgotten_once_it_has_been_answered() {
+        let _guard = test_lock();
+        reset_for_test();
+        let air = b"air-whose-scratch-write-failed";
+        let id = ShaderId::render(Stage::Vertex, air);
+        let stored = M2vCacheDecline::VertexScratchWrite {
+            detail: "No space left on device".to_string(),
+        };
+        global()
+            .lock()
+            .unwrap()
+            .put(id, &Arc::from(&air[..]), Entry::Failed(stored.clone()));
+
+        // The admission still resolves, so the guest packet advances rather
+        // than re-polling a translation that keeps failing.
+        assert!(
+            ensure_cached_async(air, Stage::Vertex, 7),
+            "a stored failure must resolve the ask, or the packet never advances"
+        );
+
+        // This draw gets the real reason, unchanged.
+        let Err(err) = translate_cached_reflected(air, Stage::Vertex, 7) else {
+            panic!("a stored failure still fails its draw");
+        };
+        assert_eq!(err, stored);
+
+        // And the next draw finds a clean cache and translates again.
+        assert!(
+            global().lock().unwrap().find(id).is_none(),
+            "the transient failure outlived the instant it described"
+        );
+        reset_for_test();
+    }
+
+    /// Two shaders that land in one bucket each resolve to their own entry.
+    ///
+    /// The bucket is forced rather than found: this cache keys on a 64-bit
+    /// digest and nobody has a pair of AIR blobs that collide under it, so the
+    /// only way to drive the collision path is to file both under one digest and
+    /// then ask through the real lookup. That is exactly the state a natural
+    /// collision would produce.
+    ///
+    /// Before the AIR was retained, `find` returned on digest equality alone, so
+    /// the second ask here would have been answered with the first shader's
+    /// SPIR-V — a shader the guest never compiled, handed over silently and with
+    /// no failure line. The probability was small; the failure was
+    /// unobservable, which is the part no birthday bound prices.
+    #[test]
+    fn two_shaders_in_one_bucket_each_resolve_to_their_own() {
+        let _guard = test_lock();
+        reset_for_test();
+
+        let first = b"the-air-that-got-there-first";
+        let second = b"a-different-shader-entirely";
+        let id = ShaderId::render(Stage::Vertex, first);
+        // The second identity, forced into the first one's bucket. Everything
+        // but `digest` is the second shader's own.
+        let collided = ShaderId {
+            digest: id.digest,
+            ..ShaderId::render(Stage::Vertex, second)
+        };
+        assert_ne!(
+            ShaderId::render(Stage::Vertex, second).digest,
+            id.digest,
+            "the two blobs do not collide naturally; the bucket below is forced"
+        );
+
+        {
+            let mut c = global().lock().unwrap();
+            c.put(
+                id,
+                &Arc::from(&first[..]),
+                Entry::Ready(synth_shader(Stage::Vertex, vec![1, 1, 1, 1])),
+            );
+            c.put(
+                collided,
+                &Arc::from(&second[..]),
+                Entry::Ready(synth_shader(Stage::Vertex, vec![2, 2, 2, 2])),
+            );
+            assert_eq!(
+                c.entries.get(&id.digest).map(Vec::len),
+                Some(2),
+                "both are filed under one digest, which is the whole setup"
+            );
+            assert_eq!(c.len(), 2, "and the level counts entries, not buckets");
+        }
+
+        let got = |i| match global().lock().unwrap().find(i) {
+            Some(Entry::Ready(s)) => s.spirv.clone(),
+            other => panic!("expected a ready entry, got {}", other.is_some()),
+        };
+        assert_eq!(got(id), vec![1, 1, 1, 1], "the first blob got its own");
+        assert_eq!(
+            got(collided),
+            vec![2, 2, 2, 2],
+            "the second blob got its own, not the one sharing its digest"
+        );
+
+        // And forgetting one leaves the other where it is, rather than taking
+        // the whole bucket with it.
+        global().lock().unwrap().forget(id);
+        assert!(global().lock().unwrap().find(id).is_none());
+        assert_eq!(got(collided), vec![2, 2, 2, 2]);
+        reset_for_test();
+    }
+
+    /// The converse, so the test above cannot pass by forgetting everything. A
+    /// module that cannot be translated is reached again by every later ask, and
+    /// re-running metal2vulkan per draw to rediscover that would cost far more
+    /// than the answer is worth.
+    #[test]
+    fn a_failure_about_the_module_is_kept() {
+        let _guard = test_lock();
+        reset_for_test();
+        let air = b"air-that-cannot-be-translated";
+        let id = ShaderId::render(Stage::Vertex, air);
+        let stored = M2vCacheDecline::VertexTranslate {
+            detail: "unsupported instruction".to_string(),
+        };
+        global()
+            .lock()
+            .unwrap()
+            .put(id, &Arc::from(&air[..]), Entry::Failed(stored.clone()));
+
+        let Err(err) = translate_cached_reflected(air, Stage::Vertex, 7) else {
+            panic!("an untranslatable module still fails its draw");
+        };
+        assert_eq!(err, stored);
+        assert!(
+            matches!(
+                global().lock().unwrap().find(id),
+                Some(Entry::Failed(kept)) if *kept == stored
+            ),
+            "a verdict about the AIR is reached again, so it is kept"
+        );
+        reset_for_test();
+    }
+
+    /// The kernel lookup is a second copy of the same `Entry::Failed` arm, so it
+    /// gets the same question asked of it.
+    #[test]
+    fn the_kernel_lookup_forgets_a_transient_failure_too() {
+        let _guard = test_lock();
+        reset_for_test();
+        let air = b"kernel-air-whose-scratch-write-failed";
+        let local_size = [16u32, 16, 1];
+        let id = ShaderId::kernel(air, local_size);
+        let stored = M2vCacheDecline::KernelScratchWrite {
+            detail: "No space left on device".to_string(),
+        };
+        global()
+            .lock()
+            .unwrap()
+            .put(id, &Arc::from(&air[..]), Entry::Failed(stored.clone()));
+
+        let Err(err) = translate_cached_kernel_reflected(air, local_size, 7) else {
+            panic!("a stored failure still fails its dispatch");
+        };
+        assert_eq!(err, stored);
+        assert!(global().lock().unwrap().find(id).is_none());
+        reset_for_test();
+    }
+
     #[test]
     fn cache_hit_skips_second_lookup_path() {
         let _guard = test_lock();
@@ -851,15 +1387,14 @@ mod tests {
         // Inject without metal2vulkan: put entry then get_or via public API by
         // priming the map through the same key logic.
         let air = b"synthetic-air-for-cache-unit";
-        let key = air_key(Stage::Vertex, air);
         {
             let mut c = global().lock().unwrap();
             // fake SPIR-V magic-ish
-            c.entries.insert(
-                key,
+            c.put(
+                ShaderId::render(Stage::Vertex, air),
+                &Arc::from(&air[..]),
                 Entry::Ready(synth_shader(Stage::Vertex, vec![0x03, 0x02, 0x23, 0x07])),
             );
-            c.order.push(key);
         }
         // One hit total, carrying the bytes plus the (empty) reflection.
         let shader = translate_cached_reflected(air, Stage::Vertex, 99).expect("hit");
@@ -891,17 +1426,17 @@ mod tests {
         let _guard = test_lock();
         reset_for_test();
         let air = b"synthetic-async-cache-state";
-        let key = air_key(Stage::Fragment, air);
+        let id = ShaderId::render(Stage::Fragment, air);
         {
             let mut c = global().lock().unwrap();
-            c.entries.insert(key, Entry::Loading);
-            c.order.push(key);
+            c.put(id, &Arc::from(&air[..]), Entry::Loading);
         }
         assert!(!ensure_cached_async(air, Stage::Fragment, 7));
         assert!(global().lock().unwrap().async_queue.is_empty());
 
-        global().lock().unwrap().entries.insert(
-            key,
+        global().lock().unwrap().put(
+            id,
+            &Arc::from(&air[..]),
             Entry::Failed(M2vCacheDecline::FragmentTranslate {
                 detail: "synthetic failure".into(),
             }),
@@ -920,16 +1455,60 @@ mod tests {
         reset_for_test();
     }
 
+    /// The shader a boot compiles first is the compositor's, and it is drawn
+    /// every frame for the life of the boot. Under the entry cap this cache used
+    /// to carry it was also the first eviction victim, because the order was
+    /// insertion rather than use — so crossing the bound threw away exactly the
+    /// entry that was still hot. Drive far past the old 256-entry bound and
+    /// assert the first key is still resolved.
+    #[test]
+    fn a_hot_first_shader_survives_far_past_the_old_entry_cap() {
+        let _guard = test_lock();
+        reset_for_test();
+        let hot = b"the-compositor-shader-compiled-first".to_vec();
+        {
+            let mut c = global().lock().unwrap();
+            c.put(
+                ShaderId::render(Stage::Fragment, &hot),
+                &Arc::from(&hot[..]),
+                Entry::Ready(synth_shader(Stage::Fragment, vec![1, 2, 3, 4])),
+            );
+        }
+        // Four times the retired bound, so a cap of any nearby size would have
+        // reached the first key several times over.
+        for i in 0..1024u32 {
+            let air = format!("cold-shader-{i}").into_bytes();
+            let mut c = global().lock().unwrap();
+            c.put(
+                ShaderId::render(Stage::Fragment, &air),
+                &Arc::from(&air[..]),
+                Entry::Ready(synth_shader(Stage::Fragment, vec![0, 0, 0, 0])),
+            );
+        }
+        assert!(
+            ensure_cached_async(&hot, Stage::Fragment, 1),
+            "the first-compiled shader is still resolved after 1024 later ones"
+        );
+        assert_eq!(
+            global().lock().unwrap().len(),
+            1025,
+            "every distinct shader is retained; nothing is evicted for count"
+        );
+        reset_for_test();
+    }
+
     #[test]
     fn async_kernel_cache_uses_local_size_key() {
         let _guard = test_lock();
         reset_for_test();
         let air = b"synthetic-kernel-async-state";
-        let key = air_key_kernel(air, [16, 16, 1]);
         {
             let mut c = global().lock().unwrap();
-            c.entries.insert(key, Entry::Loading);
-            c.order.push(key);
+            c.put(
+                ShaderId::kernel(air, [16, 16, 1]),
+                &Arc::from(&air[..]),
+                Entry::Loading,
+            );
         }
         assert!(!ensure_cached_kernel_async(air, [16, 16, 1], 20));
         assert!(global().lock().unwrap().async_queue.is_empty());

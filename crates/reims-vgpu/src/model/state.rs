@@ -1,6 +1,6 @@
 //! Device-owned state: registers, rings, tasks, mapper, present, fail log.
 
-use crate::model::{LruBytesMemo, GFX_MMIO_SIZE, MAX_CHANNELS, MAX_MAPPINGS, MAX_TASKS};
+use crate::model::{LruBytesMemo, GFX_MMIO_SIZE, MAX_CHANNELS};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
@@ -47,6 +47,11 @@ pub enum PacketFault {
     ChildTailRead,
     /// Guest write failed: child ring head writeback.
     ChildHeadWriteback,
+    /// This device snapshotted less of the ring than the packet's own published
+    /// `total_size`. Unlike every other variant here this accuses the host, not
+    /// the guest, and it is a healthy zero — `packet_snapshot_len` cannot
+    /// produce a snapshot that reaches it.
+    ShortSnapshot,
 }
 
 impl PacketFault {
@@ -64,6 +69,7 @@ impl PacketFault {
             Self::ChildSnapRead => "packet_child_snap_read",
             Self::ChildTailRead => "packet_child_tail_read",
             Self::ChildHeadWriteback => "packet_child_head_writeback",
+            Self::ShortSnapshot => "packet_short_snapshot",
         }
     }
 }
@@ -83,12 +89,151 @@ impl ExecFault {
     }
 }
 
+/// A command the reference host dispatches to a handler, which this device
+/// decodes far enough to name but does not execute.
+///
+/// Kept apart from [`FailEvent::UnknownChildOpcode`] because the two say
+/// different things to whoever reads the log. An unknown opcode is a hole in
+/// this device's decode — nobody knows what the guest asked for. One of these is
+/// a command whose contract is known and whose effect this device has chosen not
+/// to implement, so the record names the command and the gap can be closed by
+/// writing the handler rather than by more reverse engineering.
+///
+/// The variants that carry no risk of losing guest work say so in their own
+/// docs. A reader ranking the fail log needs that distinction: the discard hints
+/// cost memory and the display-state commands cost a wrong panel state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnimplementedCommand {
+    /// `CmdDebug` (`0x00`). A host-side trace marker; nothing is owed.
+    Debug,
+    /// `CmdDeleteObject` (`0x28`). The guest is retiring one object named by a
+    /// serializer destroy record, and this device holds nothing that record can
+    /// name.
+    ///
+    /// The record's ref lives in the **serializer's per-kind ref space**: the
+    /// kind comes from the record's own opcode and each kind numbers its refs
+    /// independently. This device tracks no object in that space. Its object
+    /// table is keyed by the *kernel object-list* ref, a different namespace
+    /// reached through a different command (`0x33 CmdSetObjectList`), and the
+    /// caches that do hold the kinds this command names — samplers and pipeline
+    /// states — are keyed by the object's own *state*, not by any ref, so they
+    /// cannot be retired by one either.
+    ///
+    /// So nothing is owed and nothing leaks: acting on the ref would key the
+    /// object-list namespace with a number from the serializer's, and the two
+    /// overlap, so the only reachable effect is destroying an unrelated object
+    /// that happens to share the integer. Declining is the correct behaviour
+    /// until this device tracks serializer refs, not a gap to be closed by
+    /// wiring the existing teardown call to it.
+    DeleteObject,
+    /// `CmdDisplaySleepState` (`0x09`). The guest's panel is entering or leaving
+    /// sleep and this device's display model does not move with it.
+    DisplaySleepState,
+    /// `CmdDisplaySetProperties` (`0x0a`). A display property the guest set and
+    /// this device does not apply.
+    DisplaySetProperties,
+    /// `CmdDelay` (`0x3d`). The guest asked the channel to be held; this device
+    /// continues immediately, which reorders nothing but can race a guest that
+    /// used the delay for settling.
+    Delay,
+    /// `CmdDiscardResources` (`0x3f`). A hint that the named resources' contents
+    /// are no longer needed; ignoring it costs memory and never correctness.
+    /// Nothing of this command is executed.
+    DiscardResources,
+    /// The discard half of `CmdSynchronizeAndDiscardResources` (`0x3e`).
+    ///
+    /// Its own variant rather than a second use of [`Self::DiscardResources`],
+    /// because the two declines do not mean the same thing and a shared slug
+    /// cannot say which fired: on `0x3f` the whole command was dropped, while
+    /// here the synchronise half **did** run and only the discard hint was
+    /// ignored. A reader ranking the log needs that difference — the first is a
+    /// resource the guest expected to be released, the second is only memory
+    /// held longer than asked.
+    SynchronizeAndDiscardResources,
+    /// One of the reference host's retired opcodes. Its handler accepts the
+    /// packet and does nothing with the payload, so matching it is fidelity
+    /// rather than a gap — the record exists to say an old guest is still
+    /// emitting one.
+    Deprecated,
+}
+
+impl UnimplementedCommand {
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::Debug => "cmd_debug_unimplemented",
+            Self::DeleteObject => "cmd_delete_object_unimplemented",
+            Self::DisplaySleepState => "cmd_display_sleep_state_unimplemented",
+            Self::DisplaySetProperties => "cmd_display_set_properties_unimplemented",
+            Self::Delay => "cmd_delay_unimplemented",
+            Self::DiscardResources => "cmd_discard_resources_unimplemented",
+            Self::SynchronizeAndDiscardResources => {
+                "cmd_synchronize_and_discard_resources_discard_unimplemented"
+            }
+            Self::Deprecated => "cmd_deprecated",
+        }
+    }
+
+    /// Apple's own name for the command, so a reader can find it in the
+    /// dispatch table without going through this enum's spelling.
+    pub fn command(self) -> &'static str {
+        match self {
+            Self::Debug => "CmdDebug",
+            Self::DeleteObject => "CmdDeleteObject",
+            Self::DisplaySleepState => "CmdDisplaySleepState",
+            Self::DisplaySetProperties => "CmdDisplaySetProperties",
+            Self::Delay => "CmdDelay",
+            Self::DiscardResources => "CmdDiscardResources",
+            Self::SynchronizeAndDiscardResources => "CmdSynchronizeAndDiscardResources",
+            Self::Deprecated => "CmdDeprecated",
+        }
+    }
+}
+
 /// How many leading payload words an unknown child opcode echoes. Four covers
 /// every unknown packet a driven boot has produced whole (the largest is 76
 /// bytes of which 64 are payload) while bounding the line for a command that
 /// carries a large buffer; `plen` always reports the true length, so a reader
 /// can tell an echo that was cut from one that was complete.
-const UNKNOWN_OPCODE_ECHO_WORDS: usize = 4;
+///
+/// The `_MAX` says this is a cut and not a size: the echo stops here whether or
+/// not the record has run out, which is why `plen` carries the true length
+/// beside it.
+const UNKNOWN_OPCODE_ECHO_WORDS_MAX: usize = 4;
+
+/// The wire fields a child packet this device did not execute reports, shared by
+/// the unknown-opcode and unimplemented-command records.
+///
+/// One spelling on purpose: the two records get read side by side and diffed
+/// against each other, so a copied field list here would become the next
+/// divergence the moment one of them grows a field.
+fn packet_echo_fields(
+    channel: u32,
+    opcode: u16,
+    total_size: u32,
+    stamp_count: u16,
+    payload: &[u8],
+) -> Vec<(&'static str, String)> {
+    let mut fields = vec![
+        ("ch", channel.to_string()),
+        ("opcode", format!("{opcode:#x}")),
+        ("total_size", total_size.to_string()),
+        ("stamps", stamp_count.to_string()),
+        ("plen", payload.len().to_string()),
+    ];
+    // Whole words only, in wire order, so a reader can line the echo up against
+    // the packet layout. A trailing sub-word tail is reported by `plen` rather
+    // than zero-padded into a word that the guest never wrote.
+    let words = payload
+        .chunks_exact(4)
+        .take(UNKNOWN_OPCODE_ECHO_WORDS_MAX)
+        .map(|word| format!("{:#010x}", crate::contract::endian::ld32(word)))
+        .collect::<Vec<_>>()
+        .join(":");
+    if !words.is_empty() {
+        fields.push(("payload", words));
+    }
+    fields
+}
 
 /// Fail-visible protocol event (unknown/malformed). Never invents semantics.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -109,6 +254,20 @@ pub enum FailEvent {
     /// beside this arm already reports for the opcodes it does decode.
     UnknownChildOpcode {
         channel: u32,
+        opcode: u16,
+        total_size: u32,
+        stamp_count: u16,
+        payload: Vec<u8>,
+    },
+    /// A command this device names but does not execute. See
+    /// [`UnimplementedCommand`] for why this is not the unknown-opcode arm.
+    ///
+    /// Carries the same wire fields as its neighbour above, because the two get
+    /// read side by side and a reader comparing them should not have to hold two
+    /// field lists in their head.
+    UnimplementedChildCommand {
+        channel: u32,
+        command: UnimplementedCommand,
         opcode: u16,
         total_size: u32,
         stamp_count: u16,
@@ -144,6 +303,10 @@ impl crate::observe::Decline for FailEvent {
         match self {
             Self::UnknownRootOpcode { .. } => "unknown_root_opcode",
             Self::UnknownChildOpcode { .. } => "unknown_child_opcode",
+            // Delegates for the same reason the malformed variants do: the
+            // command *is* the reason, so one slug per command beats one coarse
+            // slug the reader then has to disambiguate from the fields.
+            Self::UnimplementedChildCommand { command, .. } => command.slug(),
             // The malformed variants delegate: the specific check *is* the
             // fault, so forwarding keeps one slug per check instead of two
             // coarse ones that the reader would then have to disambiguate by
@@ -168,29 +331,21 @@ impl crate::observe::Decline for FailEvent {
                 total_size,
                 stamp_count,
                 payload,
+            } => packet_echo_fields(*channel, *opcode, *total_size, *stamp_count, payload),
+            Self::UnimplementedChildCommand {
+                channel,
+                command,
+                opcode,
+                total_size,
+                stamp_count,
+                payload,
             } => {
-                let mut fields = vec![
-                    ("ch", channel.to_string()),
-                    ("opcode", format!("{opcode:#x}")),
-                    ("total_size", total_size.to_string()),
-                    ("stamps", stamp_count.to_string()),
-                    ("plen", payload.len().to_string()),
-                ];
-                // Whole words only, in wire order, so a reader can line the echo
-                // up against the packet layout. A trailing sub-word tail is
-                // reported by `plen` rather than zero-padded into a word that
-                // the guest never wrote.
-                if !payload.is_empty() {
-                    let words = payload
-                        .chunks_exact(4)
-                        .take(UNKNOWN_OPCODE_ECHO_WORDS)
-                        .map(|word| format!("{:#010x}", crate::contract::endian::ld32(word)))
-                        .collect::<Vec<_>>()
-                        .join(":");
-                    if !words.is_empty() {
-                        fields.push(("payload", words));
-                    }
-                }
+                let mut fields =
+                    packet_echo_fields(*channel, *opcode, *total_size, *stamp_count, payload);
+                // Ahead of the wire fields: the command name is what a reader is
+                // scanning for, and it is the one thing this record has that the
+                // unknown-opcode record does not.
+                fields.insert(0, ("cmd", command.command().to_string()));
                 fields
             }
             Self::MalformedRootPacket { head, .. } => vec![("head", head.to_string())],
@@ -334,21 +489,150 @@ pub struct TaskEntry {
     pub object_list_count: u32,
 }
 
+/// The device's tasks, keyed by the guest's own task id.
+///
+/// # It is a map because a task id is a `u32`
+///
+/// This was `[TaskEntry; MAX_TASKS]` with `MAX_TASKS = 256`, and the number was
+/// never derived from anything: a task id is a full `u32` on the wire —
+/// `decode_replace_physical` and every resource-list command read it with `ld32`
+/// — and past 256 `define_task` returned `false`, the task never existed, and
+/// every guest command that needed it was lost. The bound was defended by
+/// distance rather than by a derivation: [`DeviceState::max_task_id_seen`]
+/// measured a driven boot stopping at id 10, which is 25x of headroom and no
+/// answer at all to what a heavier guest does.
+///
+/// Absence and inactivity are the same state here, which is what makes the
+/// translation from the array safe. The array wrote `TaskEntry::default()` on
+/// delete — `active: false` — and every reader tested `active` before using an
+/// entry; this returns `None` for an id nothing defined, and those readers now
+/// get `None` where they used to get an inactive entry. There is no third state
+/// for one of them to have branched on.
+///
+/// The two full-range probes in `runtime::objects` are the visible win.
+/// `type4_claimant_tasks` walked all 256 ids and `type4_probe_order` chained
+/// `1..256`; both now walk the live ids, because the ids in between were
+/// refused by the liveness test at the probe and contributed nothing. Same
+/// answer, and the walk is the size of the guest's task set instead of a
+/// constant.
+#[derive(Clone, Debug, Default)]
+pub struct TaskTable(BTreeMap<u32, TaskEntry>);
+
+impl TaskTable {
+    pub const fn new() -> Self {
+        Self(BTreeMap::new())
+    }
+
+    /// The task `id` names, or `None` if the guest never defined it.
+    ///
+    /// Note the entry may still be present and inactive — `delete_task` removes
+    /// it, but a caller that cares about liveness should keep its own `active`
+    /// test rather than assume `Some` means live.
+    pub fn get(&self, id: u32) -> Option<&TaskEntry> {
+        self.0.get(&id)
+    }
+
+    pub fn get_mut(&mut self, id: u32) -> Option<&mut TaskEntry> {
+        self.0.get_mut(&id)
+    }
+
+    /// Whether `id` names a task this device will walk a page table for.
+    ///
+    /// The single spelling of the liveness test. It had a dozen copies as
+    /// `tasks[id].active` against an array that answered for every id in range,
+    /// and each of those is now a `get` that can also answer `None`.
+    pub fn is_active(&self, id: u32) -> bool {
+        self.get(id).is_some_and(|t| t.active)
+    }
+
+    /// Install a task under `id`, replacing whatever was there.
+    pub fn define(&mut self, id: u32, entry: TaskEntry) {
+        self.0.insert(id, entry);
+    }
+
+    pub fn remove(&mut self, id: u32) {
+        self.0.remove(&id);
+    }
+
+    /// Every live task with its id, ascending.
+    ///
+    /// Ascending because the array it replaced was walked in id order and two
+    /// probes in `runtime::objects` depend on that order deciding which of
+    /// several claimant tasks a surface resolves against.
+    pub fn live(&self) -> impl Iterator<Item = (u32, &TaskEntry)> {
+        self.0
+            .iter()
+            .filter(|(_, t)| t.active)
+            .map(|(&id, t)| (id, t))
+    }
+
+    /// [`Self::live`] without the entries.
+    pub fn live_ids(&self) -> impl Iterator<Item = u32> + '_ {
+        self.live().map(|(id, _)| id)
+    }
+
+    /// How many tasks are live. Not the size of the id space — there is none.
+    pub fn live_count(&self) -> usize {
+        self.live_ids().count()
+    }
+}
+
+/// `tasks[id]` for a task the caller has already defined. **Tests only.**
+///
+/// 167 test sites index a fixture's task 1, and rewriting each into
+/// `get(1).unwrap()` would trade the thing they are asserting for ceremony.
+/// Production has no such impl, deliberately: every id there comes off the wire,
+/// so it may name no task, and [`TaskTable::get`] is the accessor that says so.
+/// A panicking index reachable from a decode path is a guest-triggerable abort,
+/// which is why this is `#[cfg(test)]` rather than documented as "do not use".
+#[cfg(test)]
+impl std::ops::Index<u32> for TaskTable {
+    type Output = TaskEntry;
+
+    fn index(&self, id: u32) -> &TaskEntry {
+        self.get(id)
+            .unwrap_or_else(|| panic!("test indexed task {id}, which nothing defined"))
+    }
+}
+
+/// See [`TaskTable`]'s `Index`. Tests that mutate a fixture's task in place —
+/// clearing `active` or zeroing a directory to build the state a refusal path
+/// needs — reach through this.
+#[cfg(test)]
+impl std::ops::IndexMut<u32> for TaskTable {
+    fn index_mut(&mut self, id: u32) -> &mut TaskEntry {
+        self.get_mut(id)
+            .unwrap_or_else(|| panic!("test indexed task {id}, which nothing defined"))
+    }
+}
+
+/// Why a `DeviceState` mutator refused a decoded guest record.
+///
+/// # The `*IdSentinel` five were `*IdRange`
+///
+/// Five of these named a *range* check, because `is_mapping_id` used to be
+/// `id >= 1 && id < MAX_MAPPINGS` and one variant covered both halves. The
+/// ceiling is gone — `mappings` is a `BTreeMap` keyed by the full `u32`, so it
+/// refused ids its own storage would have held — and the only value these can
+/// now refuse is 0, the device-wide "no mapping" sentinel that `runtime::draw`
+/// reads as "this attachment is addressed by GVA".
+///
+/// So the slugs say `_id_sentinel`. A name that still said `_id_range` would
+/// tell a reader ranking the fail log that the guest overran a table, and send
+/// them looking for a bound that does not exist. Four sibling `*TaskIdRange`
+/// variants were deleted outright in the same move, for the same reason: the
+/// task table is a map too, and there is no id it refuses.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StateMutationDecline {
-    DefineTaskIdRange { task_id: u32 },
-    DeleteTaskIdRange { task_id: u32 },
-    SetObjectListTaskIdRange { task_id: u32 },
     SetObjectListTaskInactive { task_id: u32 },
-    InsertObjectTaskIdRange { task_id: u32, object_ref: u32 },
     InsertObjectTaskInactive { task_id: u32, object_ref: u32 },
-    MapSurfaceIdRange { mapping_id: u32 },
-    UnmapSurfaceIdRange { mapping_id: u32 },
-    AttachMappingIdRange { mapping_id: u32 },
+    MapSurfaceIdSentinel { mapping_id: u32 },
+    UnmapSurfaceIdSentinel { mapping_id: u32 },
+    AttachMappingIdSentinel { mapping_id: u32 },
     AttachMappingInternalZero { mapping_id: u32 },
-    MappingDeviceDescIdRange { mapping_id: u32 },
+    MappingDeviceDescIdSentinel { mapping_id: u32 },
     MappingDeviceDescEmpty { mapping_id: u32 },
-    MappingGeomIdRange { mapping_id: u32 },
+    MappingGeomIdSentinel { mapping_id: u32 },
     MappingGeomWidthZero { mapping_id: u32 },
     MappingGeomHeightZero { mapping_id: u32 },
     MappingGeomWidthRange { mapping_id: u32, width: u32 },
@@ -358,19 +642,15 @@ enum StateMutationDecline {
 impl crate::observe::Decline for StateMutationDecline {
     fn slug(&self) -> &'static str {
         match self {
-            Self::DefineTaskIdRange { .. } => "model_define_task_id_range",
-            Self::DeleteTaskIdRange { .. } => "model_delete_task_id_range",
-            Self::SetObjectListTaskIdRange { .. } => "model_set_object_list_task_id_range",
             Self::SetObjectListTaskInactive { .. } => "model_set_object_list_task_inactive",
-            Self::InsertObjectTaskIdRange { .. } => "model_insert_object_task_id_range",
             Self::InsertObjectTaskInactive { .. } => "model_insert_object_task_inactive",
-            Self::MapSurfaceIdRange { .. } => "model_map_surface_id_range",
-            Self::UnmapSurfaceIdRange { .. } => "model_unmap_surface_id_range",
-            Self::AttachMappingIdRange { .. } => "model_attach_mapping_id_range",
+            Self::MapSurfaceIdSentinel { .. } => "model_map_surface_id_sentinel",
+            Self::UnmapSurfaceIdSentinel { .. } => "model_unmap_surface_id_sentinel",
+            Self::AttachMappingIdSentinel { .. } => "model_attach_mapping_id_sentinel",
             Self::AttachMappingInternalZero { .. } => "model_attach_mapping_internal_zero",
-            Self::MappingDeviceDescIdRange { .. } => "model_mapping_device_desc_id_range",
+            Self::MappingDeviceDescIdSentinel { .. } => "model_mapping_device_desc_id_sentinel",
             Self::MappingDeviceDescEmpty { .. } => "model_mapping_device_desc_empty",
-            Self::MappingGeomIdRange { .. } => "model_mapping_geom_id_range",
+            Self::MappingGeomIdSentinel { .. } => "model_mapping_geom_id_sentinel",
             Self::MappingGeomWidthZero { .. } => "model_mapping_geom_width_zero",
             Self::MappingGeomHeightZero { .. } => "model_mapping_geom_height_zero",
             Self::MappingGeomWidthRange { .. } => "model_mapping_geom_width_range",
@@ -380,30 +660,23 @@ impl crate::observe::Decline for StateMutationDecline {
 
     fn fields(&self) -> Vec<(&'static str, String)> {
         let mut fields = match self {
-            Self::DefineTaskIdRange { task_id }
-            | Self::DeleteTaskIdRange { task_id }
-            | Self::SetObjectListTaskIdRange { task_id }
-            | Self::SetObjectListTaskInactive { task_id } => {
+            Self::SetObjectListTaskInactive { task_id } => {
                 vec![("task", task_id.to_string())]
             }
-            Self::InsertObjectTaskIdRange {
-                task_id,
-                object_ref,
-            }
-            | Self::InsertObjectTaskInactive {
+            Self::InsertObjectTaskInactive {
                 task_id,
                 object_ref,
             } => vec![
                 ("task", task_id.to_string()),
                 ("ref", object_ref.to_string()),
             ],
-            Self::MapSurfaceIdRange { mapping_id }
-            | Self::UnmapSurfaceIdRange { mapping_id }
-            | Self::AttachMappingIdRange { mapping_id }
+            Self::MapSurfaceIdSentinel { mapping_id }
+            | Self::UnmapSurfaceIdSentinel { mapping_id }
+            | Self::AttachMappingIdSentinel { mapping_id }
             | Self::AttachMappingInternalZero { mapping_id }
-            | Self::MappingDeviceDescIdRange { mapping_id }
+            | Self::MappingDeviceDescIdSentinel { mapping_id }
             | Self::MappingDeviceDescEmpty { mapping_id }
-            | Self::MappingGeomIdRange { mapping_id }
+            | Self::MappingGeomIdSentinel { mapping_id }
             | Self::MappingGeomWidthZero { mapping_id }
             | Self::MappingGeomHeightZero { mapping_id }
             | Self::MappingGeomWidthRange { mapping_id, .. }
@@ -630,9 +903,8 @@ pub struct RenderFlushWitness {
     /// one frame. The worker fell behind and caught up. At `duty` 0.85 it has
     /// almost no headroom to absorb anything, so a hitch is the flush rail's
     /// cost showing up as latency rather than a separate defect — and the only
-    /// remaining route to that cost is the one
-    /// [`crate::runtime::storage_flush::flush_mapping_windows_before_fence`]
-    /// names: making the undeclared guest read observable.
+    /// remaining route to that cost is making the undeclared guest read
+    /// observable.
     pub landed_us: u64,
 }
 
@@ -675,12 +947,11 @@ pub struct MappingEntry {
     /// draw — only whether a known-equal upload can be elided.
     pub surface_content_epoch: u32,
     /// Who has read what the last landed render flush of this mapping wrote.
-    /// See [`RenderFlushWitness`]; reported by
-    /// [`crate::runtime::storage_flush::note_render_flush_landed`].
+    /// See [`RenderFlushWitness`].
     pub render_flush: RenderFlushWitness,
     /// Bumped whenever the guest page list / map lifetime changes (MAP, UNMAP,
     /// ReplacePhysical, MappingInternal reattach, page-table refresh that
-    /// changes PFNs). Used as [`TargetIdentity`] generation for resident
+    /// changes PFNs). Used as `TargetIdentity` generation for resident
     /// import-present so a recycled mid never reuses a stale GPU target, and
     /// as a fail-closed check before zero-copy DMA into contig views.
     pub map_generation: u32,
@@ -773,6 +1044,27 @@ pub struct MappingEntry {
     /// entry right now: repeat this walk and you must get these entries back, or
     /// the guest has moved the surface underneath us without saying so.
     pub type4_walk: Option<Type4Walk>,
+}
+
+impl MappingEntry {
+    /// The cached `sIOSurfaceDeviceDescriptor`, but only when a whole one is
+    /// there — `None` while nothing has published one, so a caller falls back
+    /// on its own terms instead of reading a partial record.
+    ///
+    /// Three callers asked this in three spellings, two of which handed
+    /// `device_desc.as_slice()` whole while the third handed
+    /// `device_desc.get(..DEVICE_DESC_LEN)`. Those agree only because
+    /// `mapper::resolve` reads into a `[0u8; DEVICE_DESC_LEN]` and so caches
+    /// exactly that many bytes; `set_mapping_device_desc` enforces nothing but
+    /// non-emptiness. `device_desc_plane` bounds every plane read against the
+    /// slice it is handed and the plane table runs to `0x240`, past the record's
+    /// own `0x200`, so a longer cached blob would make the whole-slice spelling
+    /// decode an eighth plane the truncating one refuses. Truncation is the
+    /// answer for all three: it is what the record declares.
+    pub fn device_desc_complete(&self) -> Option<&[u8]> {
+        self.device_desc
+            .get(..crate::contract::iosurface_pages::DEVICE_DESC_LEN)
+    }
 }
 
 /// Exact protocol-backed compute storage-image view eligible for residency.
@@ -909,201 +1201,6 @@ impl crate::observe::Decline for PresentBacking {
     }
 }
 
-/// Which rail holds the authoritative pixels of a mapping-keyed deferred
-/// window, and therefore how a flush must read them.
-///
-/// Both kinds live in one map — [`DeviceState::compute_deferred_flush`] — and
-/// that is the point. The dangerous half of any deferred rail is the set of
-/// guest-page readers that must drain it first; a reader that misses one window
-/// makes the guest read stale pixels with nothing logged. Sharing the key type
-/// means both kinds share the range scan
-/// ([`DeviceState::take_deferred_flush_windows`]), the raw-GVA alias index
-/// ([`DeviceState::deferred_alias_pages`]), the teardown drop and every
-/// existing trigger, so a rail cannot be covered for one kind and missed for
-/// the other. A second map keyed the same way would have had to re-derive
-/// "does any window still name this mapping" in
-/// [`DeviceState::prune_alias_index`], and getting that wrong drops the alias
-/// index out from under a live window.
-///
-/// What genuinely differs is only where the pixels are. Everything else the
-/// flush needs — mapping id, geometry, format, guest byte range — is already in
-/// the key, which is why neither variant carries geometry of its own.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum DeferredOwner {
-    /// Compute rail: a *storage* resident keyed by this same
-    /// `ComputeStorageResidencyKey`, read with
-    /// `engine::read_resident_storage(key, generation)`. The generation is the
-    /// resident's **content** generation, unrelated to `key.map_generation`.
-    Storage {
-        generation: u32,
-        armed_stamp_seq: u64,
-    },
-    /// Type-11 render Store rail: the window **owns the frame it deferred**,
-    /// tight BGRA8 at `key.width x key.height`, shared with the
-    /// [`crate::runtime::surface_cache`] entry that was stored from the same
-    /// readback.
-    ///
-    /// Owning it is what makes the obligation landable. The flush used to source
-    /// its pixels from `surface_cache::get(mapping_id, key.width, key.height)`,
-    /// and that cache holds exactly **one** entry per mapping: a later Store at a
-    /// different geometry replaces it, and every window still armed at the old
-    /// geometry then misses and reports `deferred_flush_lost reason=cache_miss`.
-    /// One boot lost 15 whole layers that way — a 1920x1080 desktop surface, a
-    /// 1920x24 menu bar, several window-sized rects — which is a compositing
-    /// layer rendering solid black with the loss reported only after the fact.
-    /// An `Arc` clone costs nothing at arm time and cannot be orphaned.
-    ///
-    /// `source` is the one thing that varies, and it varies for a reason the
-    /// paragraph above states in the other direction: owning the bytes is free
-    /// *when the Store already read them back*. A Store that skips its readback
-    /// has no bytes to own, and the whole point of skipping it is that ~98 % of
-    /// these windows are never flushed at all — so that rail names the resident
-    /// and pays the readback only if someone asks. Everything else about the
-    /// window is identical, which is why this is a field and not a variant:
-    /// `matches!(owner, Render { .. })` still selects the rail for the population
-    /// cap, the alias index, the teardown drop and `owner_slug`, and only the
-    /// pixel read dispatches.
-    Render {
-        armed_seq: u64,
-        armed_stamp_seq: u64,
-        source: RenderWindowSource,
-    },
-}
-
-impl DeferredOwner {
-    /// [`DeviceState::completion_stamp_seq`] when this window was armed.
-    ///
-    /// Both rails carry it for the same reason [`GvaDeferredEntry::
-    /// armed_stamp_seq`] does: a window that lands after the guest was fenced
-    /// writes memory the guest was already entitled to reclaim, and no check
-    /// taken after the fence can tell that memory apart from the target it used
-    /// to be. Unlike the GVA rail, these windows are keyed by a
-    /// `ComputeStorageResidencyKey` that carries `map_generation`, so the flush
-    /// can already refuse a mapping incarnation the guest replaced — which is
-    /// why this rail is measured before it is changed rather than assumed to
-    /// share the GVA rail's verdict.
-    pub fn armed_stamp_seq(&self) -> u64 {
-        match self {
-            Self::Storage {
-                armed_stamp_seq, ..
-            }
-            | Self::Render {
-                armed_stamp_seq, ..
-            } => *armed_stamp_seq,
-        }
-    }
-}
-
-/// Where a [`DeferredOwner::Render`] window's frame lives.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum RenderWindowSource {
-    /// The window owns the frame, tight BGRA8 at `key.width x key.height`,
-    /// shared with the [`crate::runtime::surface_cache`] entry stored from the
-    /// same readback. Cannot be orphaned; see the variant's own note.
-    Owned(std::sync::Arc<Vec<u8>>),
-    /// The engine's `TargetIdentity::Surface` resident holds the frame and the
-    /// window holds a pin on it. `epoch` is the
-    /// [`MappingEntry::surface_content_epoch`] this window's pixels were
-    /// published at; the flush compares it against the resident's stamp
-    /// (`engine::resident_content_epoch`) and declines rather than writing a
-    /// frame it cannot vouch for.
-    ///
-    /// The identity is **reconstructed** at flush time from the key rather than
-    /// stored, exactly as `flush_gva_one` does: `key` already carries the mapping
-    /// id, the geometry and the `map_generation` that `surface_identity` keys on,
-    /// and the flush refuses on generation drift before it reads anything. Storing
-    /// it would put a backend type in the model and give the two spellings a way
-    /// to disagree.
-    Resident { epoch: u32 },
-}
-
-/// Everything a later flush needs to land a deferred **GVA render Store**
-/// (type-2/3 color0 with `target_gva != 0`): the engine resident
-/// `TargetIdentity::Gva { gva, width, height, generation: alloc_gen }` holds the
-/// authoritative pixels; guest pages + `host_gva_surfaces` are stale until a
-/// flush lands them. One window per `gva` — a newer Store at the same GVA
-/// supersedes (same geometry) or flushes (different geometry) the older one.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct GvaDeferredEntry {
-    pub task_id: u32,
-    pub texture_ref: u32,
-    /// Producer object type captured at defer time (the task/object list may
-    /// be gone by flush time) — `host_gva_surfaces` owner-gating input.
-    pub producer_object_type: u8,
-    pub width: u32,
-    pub height: u32,
-    /// Guest row stride the sync Store would have written with.
-    pub row_stride: u32,
-    pub format: u16,
-    /// Arm order for oldest-first flush when the window cap is hit.
-    pub armed_seq: u64,
-    /// [`DeviceState::completion_stamp_seq`] when this window was armed.
-    ///
-    /// The window's `pages` guard asks whether the GVA still resolves to the
-    /// pages it was armed on. That question is blind to the hazard this field
-    /// names: a guest that frees the render target and lets its own allocator
-    /// hand the same pages to something else keeps the translation identical, so
-    /// the guard passes and the flush writes pixels over whatever moved in. The
-    /// guest is entitled to do that from the moment it is stamped, so a landing
-    /// whose stamp counter has moved is a write the guest never agreed to.
-    pub armed_stamp_seq: u64,
-    /// Defer-time physical page GPAs of the guest window — raw task-GVA reads
-    /// aliasing these flush first (`storage_flush::flush_intersecting_task_gva`).
-    pub pages: std::collections::HashSet<u64>,
-    /// `generation` of the engine resident this window pinned — the page-set
-    /// hash the arming draw resolved (`DrawEncodeRequest::gva_alloc_gen`).
-    ///
-    /// Stored rather than recomputed. The window exists precisely because the
-    /// address may be handed to another allocation before the flush runs, and a
-    /// walk taken then would name *that* allocation: the registry lookup would
-    /// miss the slot this window is holding pinned, and the frame would be lost
-    /// to a `deferred_flush_lost` instead of landing. Every consumer that
-    /// rebuilds the identity from a window reads this field.
-    pub alloc_gen: u64,
-}
-
-/// Everything a later flush needs to land a deferred **linear compute-storage
-/// Store** (`ComputeStorageResidencyKey::linear` — a raw task GVA, `mapping_id`
-/// 0). The engine resident holds the authoritative pixels;
-/// `storage_flush::flush_linear_one` lands them into guest pages and
-/// `host_linear_textures`.
-///
-/// This window names an *address under a task*, exactly like
-/// [`GvaDeferredEntry`], and for the same reason: a type-2/3 linear texture has
-/// no mapping incarnation to name and the wire format carries no lifecycle
-/// notify for one. The mapping-keyed rails
-/// (`storage_flush::flush_render_one`/`flush_storage_one`) can refuse on
-/// `map_generation` drift because the guest must MAP/UNMAP/ReplacePhysical to
-/// reclaim an IOSurface's storage; nothing of the sort exists here, which is why
-/// this entry carries the same fence stamp the GVA rail carries.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LinearDeferredEntry {
-    /// Engine resident generation the window pinned — `read_resident_storage`'s
-    /// second argument, and the only thing that distinguishes two residents at
-    /// one key.
-    pub generation: u32,
-    /// [`DeviceState::completion_stamp_seq`] when this window was armed.
-    ///
-    /// Same hazard, same reading as [`GvaDeferredEntry::armed_stamp_seq`]: after
-    /// the stamp the guest may free this texture's memory and its own allocator
-    /// may hand those pages to anything without touching a page table, so
-    /// `storage_flush::deferred_pages_still_ours` still passes and the flush
-    /// writes a compute-storage image over whatever moved in.
-    pub armed_stamp_seq: u64,
-    /// Defer-time physical page GPAs of the guest window — raw task-GVA reads
-    /// aliasing these flush first
-    /// (`storage_flush::flush_intersecting_task_gva`), and the writer's own walk
-    /// is bounded to them.
-    pub pages: std::collections::HashSet<u64>,
-}
-
-impl GvaDeferredEntry {
-    /// Guest byte span the flush writes: `row_stride * height`.
-    pub fn span(&self) -> u64 {
-        (self.row_stride as u64).saturating_mul(self.height as u64)
-    }
-}
-
 /// HostOps view over a **task GVA range** (MapMemory2 / UnmapMemory lifecycle).
 ///
 /// Distinct from [`MappingEntry::contig_ptr`] (iosfc `mapping_id` page list).
@@ -1173,10 +1270,9 @@ pub struct HostSurface {
     pub height: u32,
     /// Tight BGRA8, stride = width * 4.
     ///
-    /// Shared rather than owned so a [`DeferredOwner::Render`] window can hold
-    /// the exact frame it deferred without copying it: the window and this entry
-    /// point at one allocation, and replacing the entry leaves the window's
-    /// pixels intact instead of orphaning them.
+    /// Shared rather than owned so a holder that took the frame keeps it across
+    /// a replacement of this entry: the two point at one allocation, and storing
+    /// a new frame leaves the holder's pixels intact instead of orphaning them.
     pub bgra: std::sync::Arc<Vec<u8>>,
     /// Generation of the store that produced these bytes, issued by
     /// [`DeviceState::next_sampled_content_generation`] (independent of guest
@@ -1203,6 +1299,44 @@ pub struct HostSurface {
     /// `None` on the surface_id/texture_ref caches (their key is not a guest
     /// virtual address) and on any GVA store whose walk did not resolve.
     pub backing: Option<GvaBacking>,
+    /// The target GVA the store that produced these bytes rendered into, for
+    /// texture_ref-keyed entries. Zero when the producer had none, and unused by
+    /// the GVA-keyed cache, whose key *is* that address.
+    ///
+    /// The ref cache is the fallback door of the colour LOAD seed, and a LOAD
+    /// seed is the attachment's *prior content* — so serving one produced at a
+    /// different address hands the pass another allocation's picture to
+    /// composite onto, and the Store writes the result back. That is a fixpoint:
+    /// the next frame loads what this one stored. This field is what lets the
+    /// serve site say whether that happened, which is the reading the door has
+    /// never had — `load_seed_ok_color` counts both doors as one.
+    pub source_gva: u64,
+    /// Whether the guest's own pages already hold these pixels.
+    ///
+    /// This is the field that decides whether the byte cap may evict the entry,
+    /// and it exists because two rules in this device were relying on each other
+    /// without either saying so.
+    ///
+    /// The render writeback stores into this cache on every outcome, because on
+    /// the ones that did not reach guest RAM it is what holds the authoritative
+    /// bytes. The page-ownership guard then argues that *refusing* a guest write is
+    /// safe — permitting one would land pixels in whatever now owns those pages,
+    /// which has been observed as guest heap corruption — and closes with "the
+    /// caller keeps the content either way … so nothing renderable is lost by
+    /// refusing".
+    ///
+    /// That closing clause is a claim about this map, and
+    /// `surface_cache::enforce_gva_cache_cap` was free to falsify it: an entry
+    /// that is the only copy of pixels the guest never received is an ordinary
+    /// eviction candidate to a cap that only counts bytes.
+    ///
+    /// So `false` marks an entry the cap must not take: evicting it is the loss
+    /// the refusal was allowed on the promise that it would not happen. `true`
+    /// means the guest's pages have the same bytes, a later read can re-derive
+    /// them from guest RAM, and eviction costs a re-read and nothing else.
+    ///
+    /// `true` for the surface_id and texture_ref caches, which have no cap.
+    pub guest_holds_bytes: bool,
     // No guest-CPU-write witness sits here, and that is a known gap rather
     // than an omission. `surface_cache::gva_backing_state` answers whether this
     // GVA still *names* these pages; nothing answers whether the guest CPU
@@ -1615,41 +1749,6 @@ pub struct GuestLinearMemo {
     pub generation: u64,
 }
 
-/// A map of deferred writeback windows — pixels this device still owes guest
-/// RAM, keyed by the rail that armed them.
-///
-/// Read-only outside this module: [`Deref`](std::ops::Deref) exposes the whole
-/// `BTreeMap` read API, and there is deliberately **no** `DerefMut`, so the
-/// inner map can only be mutated through the arm/disarm methods below. Arming
-/// stamps a window with the fence generation it was armed under and disarming
-/// hands the page set back to the caller that is about to write those pages;
-/// a site that inserted or removed a window directly would skip both, so the
-/// type refuses to let it compile.
-#[derive(Debug)]
-pub struct DeferredWindows<K, V>(BTreeMap<K, V>);
-
-impl<K, V> DeferredWindows<K, V> {
-    fn new() -> Self {
-        Self(BTreeMap::new())
-    }
-}
-
-impl<K, V> std::ops::Deref for DeferredWindows<K, V> {
-    type Target = BTreeMap<K, V>;
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-/// `for (k, v) in &windows`, which auto-deref does not reach on its own.
-impl<'a, K, V> IntoIterator for &'a DeferredWindows<K, V> {
-    type Item = (&'a K, &'a V);
-    type IntoIter = std::collections::btree_map::Iter<'a, K, V>;
-    fn into_iter(self) -> Self::IntoIter {
-        self.0.iter()
-    }
-}
-
 /// Full device model state (backend-independent).
 #[derive(Debug)]
 pub struct DeviceState {
@@ -1664,6 +1763,16 @@ pub struct DeviceState {
     /// remain untouched until retry, so this is scheduler state rather than a
     /// submitted async GPU job.
     pub translation_deferred_mask: u32,
+    /// FIFO timelines whose head packet is held on an unmet stamp wait. Bit 0
+    /// is the root FIFO and child channel N uses bit N, the same convention as
+    /// [`Self::translation_order_hold_mask`].
+    ///
+    /// Held rather than skipped: the head and the completion stamp stay
+    /// untouched, so a retry re-decodes the same packet and no side effect can
+    /// happen twice. The mask is what tells `drain_pending` which timelines to
+    /// re-offer while the pass is still publishing stamps, since another
+    /// timeline's stamp is the only thing that can satisfy one.
+    pub stamp_deferred_mask: u32,
     /// Root/child FIFO timelines held behind a cold-translation EXEC. Bit 0 is
     /// the root FIFO; child channel N uses bit N. This is diagnostic scheduler
     /// ownership, not a guest-visible protocol mask.
@@ -1680,7 +1789,28 @@ pub struct DeviceState {
     pub present_translation_hold_mask: u32,
     pub pending: PendingWork,
     pub child_rings: [ChannelRing; MAX_CHANNELS],
-    pub tasks: [TaskEntry; MAX_TASKS],
+    pub tasks: TaskTable,
+    /// Highest task id the guest has ever named.
+    ///
+    /// # It measured a bound, and the bound is gone
+    ///
+    /// This and [`Self::max_mapping_id_seen`] were added as reach censuses for
+    /// `MAX_TASKS` (256) and `MAX_MAPPINGS` (4096), because a refusal counter
+    /// alone cannot say whether a bound is close: a boot stopping at id 12 and
+    /// one stopping at 255 both report zero refusals, and only one of them says
+    /// there is room. What they measured was 25x and 97x of headroom, and
+    /// headroom is not a derivation — so both bounds were removed rather than
+    /// defended, and [`TaskTable`] and `mappings` are maps keyed by the guest's
+    /// own `u32`.
+    ///
+    /// So these are **occupancy readings** now, not distances to a refusal.
+    /// They are the only thing that says how far the guest spreads either id
+    /// space, which is worth publishing for a map with no removal path — but
+    /// there is no cap to read them against, and the census prints `none` where
+    /// it used to print one. Nothing should turn either back into a bound.
+    pub max_task_id_seen: u32,
+    /// See [`Self::max_task_id_seen`].
+    pub max_mapping_id_seen: u32,
     /// Count of MapMemory2/UnmapMemory packets (measure census).
     pub map_family_events: u64,
     /// Live object refs per task, as `(task_id, ref)`.
@@ -1764,6 +1894,19 @@ pub struct DeviceState {
     /// [`crate::runtime::gather_witness`] — it selects no behaviour.
     #[cfg(feature = "backend-vulkan")]
     pub gather_witness: crate::runtime::gather_witness::GatherWitness,
+    /// The GVA render targets a Store has stamped, and what the two write
+    /// witnesses said at the time. The GVA half of the type-11 witness that
+    /// licenses the attachment LOAD elision — see
+    /// [`crate::runtime::gva_store_witness`].
+    #[cfg(feature = "backend-vulkan")]
+    pub gva_store_witness: crate::runtime::gva_store_witness::GvaStoreWitness,
+    /// Draw-time buffer binds resolved once per reference and held. Reached
+    /// only through [`DeviceState::retire_bound_buffers_for_task`] and
+    /// [`DeviceState::retire_bound_buffers_in_range`] from the packet handlers,
+    /// so the retirement rules live in one place rather than at each opcode.
+    /// See [`crate::runtime::bound_buffers`].
+    #[cfg(feature = "backend-vulkan")]
+    pub bound_buffers: crate::runtime::bound_buffers::BoundBuffers,
     /// Monotonic source for every sampled-content generation this device
     /// hands the engine. Read only through
     /// [`DeviceState::next_sampled_content_generation`].
@@ -1817,30 +1960,47 @@ pub struct DeviceState {
     pub type11_memo: LruBytesMemo<(u32, u32, u32), GuestLinearMemo>,
     /// Reusable native BGRA read buffer for the type-11 memo re-read.
     pub type11_memo_scratch: Vec<u8>,
-    /// Measurement-only: last guest-visible generation produced by a compute
-    /// storage-image writeback for an exact type-11 view. This does not select
-    /// engine behavior; it measures safe residency opportunities.
+    /// Last guest-visible generation produced by a compute storage-image
+    /// writeback, keyed by the exact window it was produced for.
+    ///
+    /// **It selects behaviour.** `compute_exec`'s texture staging reads it to
+    /// decide whether the engine's resident answers a bind, and for a
+    /// [`ComputeStorageResidencyKey::heap`] texture that decision has no
+    /// fallback: a heap texture is host-only, so there is no guest window to
+    /// re-read. An entry present but unservable is refused by name
+    /// (`compute_stage_tex_heap_resident_lost`); an entry *absent* stages a
+    /// zero-filled texture, which is why what may remove one matters.
+    ///
+    /// This doc used to say "measurement-only … does not select engine
+    /// behavior", which was true of an earlier rail and invites exactly the two
+    /// wrong conclusions: that a bound on it is free, and that it can be cut.
+    ///
+    /// # What may remove an entry, and why the cap cannot reach the two that
+    /// # have no fallback
+    ///
+    /// Three keyings share this map, and only one of them is subject to the
+    /// per-mapping population cap in `compute_exec`:
+    ///
+    /// - **Mapping-backed** (`mapping_id != 0`) — the only kind the cap's
+    ///   sibling walk can select, because it filters on an equal `mapping_id`.
+    ///   Dropping one costs the next read its resident and sends it back to the
+    ///   mapping's guest pages, which is a cost and not a loss.
+    /// - **Linear** ([`ComputeStorageResidencyKey::linear`]) — `mapping_id` is
+    ///   0, and `note_storage_residency_writeback` returns before the insert:
+    ///   authority for these lives in the `host_linear_textures` entry's
+    ///   `resident_gen`, never here.
+    /// - **Heap** ([`ComputeStorageResidencyKey::heap`]) — `mapping_id` is also
+    ///   0, and that function inserts and returns *before* the cap runs.
+    ///
+    /// So the cap is genuinely per-mapping, and the two keyings with no guest
+    /// fallback are outside it — but only because of an early return two
+    /// modules away, not because the filter distinguishes them. Both set
+    /// `mapping_id` to 0, so they would share one bucket if the eviction ever
+    /// saw them. An audit read the filter alone and concluded heap textures
+    /// were being evicted into zero-filled binds; that is wrong today and would
+    /// be right the moment a caller reached the cap with a zero-keyed
+    /// candidate. Anything that changes when the cap runs must re-check this.
     pub compute_storage_residency: BTreeMap<ComputeStorageResidencyKey, u32>,
-    /// Deferred mapping-keyed writebacks: windows whose guest pages are STALE —
-    /// a pinned engine resident is the authoritative content. Every host-side
-    /// read or write of intersecting mapping bytes must flush first
-    /// (`runtime::storage_flush::flush_intersecting`). The value says which
-    /// rail owns the pixels; see [`DeferredOwner`].
-    pub compute_deferred_flush: BTreeMap<ComputeStorageResidencyKey, DeferredOwner>,
-    /// Arm order for [`DeferredOwner::Render`] windows, so the population cap
-    /// can evict oldest-first. Compute windows are bounded by the dispatches
-    /// that create them; render windows are armed once per composite Store and
-    /// each one pins a display-sized image, so they need their own bound.
-    pub surface_deferred_seq: u64,
-    /// Physical page bases of each mapping with live deferred windows, for the
-    /// raw task-GVA sampling guard (`storage_flush::flush_intersecting_task_gva`).
-    /// Built at defer time from the just-resolved `page_entries`
-    /// ([`Self::index_deferred_alias_pages`] — per-sample resolution cost the
-    /// boot-19 setup_us regression measured at ~1.4 s/boot); entries drop when
-    /// the mapping's last deferred window is taken. A stale entry after a PFN
-    /// change costs one spurious no-op flush call, never a wrong flush — the
-    /// windows map stays the single flush authority.
-    pub deferred_alias_pages: DeferredWindows<u32, std::collections::HashSet<u64>>,
     /// Mapping ids the fence-bound writeback has landed a render window on,
     /// for one measurement and nothing else: does the guest declare its CPU
     /// reads on the same surfaces this device writes back eagerly?
@@ -1898,23 +2058,10 @@ pub struct DeviceState {
     pub gva_host_views: Vec<GvaHostView>,
     /// Linear-window residency keys whose `host_linear_textures` entry died
     /// (task/object delete). `DeviceState` cannot reach the engine; the
-    /// runtime unpins these (`storage_flush::retire_linear_residents`) so the
+    /// runtime unpins these
+    /// ([`crate::runtime::render_writeback::retire_linear_residents`]) so the
     /// pinned images become LRU-evictable instead of leaking.
     pub retired_linear_residents: Vec<ComputeStorageResidencyKey>,
-    /// Deferred linear windows whose guest pages the superseded sync path
-    /// WOULD have written (GVA-mapped at defer time): generation + defer-time
-    /// page-GPA index. A raw task-GVA read aliasing these pages flushes the
-    /// resident into the cache entry and guest pages first
-    /// (`storage_flush::flush_intersecting_task_gva`). Cache-only-shaped
-    /// windows never enter — their sync path never wrote guest pages either.
-    pub linear_deferred_flush: DeferredWindows<ComputeStorageResidencyKey, LinearDeferredEntry>,
-    /// Deferred GVA render-Store windows (type-2/3 color0, `target_gva != 0`)
-    /// whose guest bytes + `host_gva_surfaces` encode the superseded sync path
-    /// WOULD have written. The engine resident `TargetIdentity::Gva` is the
-    /// authoritative content until `storage_flush::flush_gva_one` lands it.
-    pub gva_deferred_flush: DeferredWindows<u64, GvaDeferredEntry>,
-    /// Monotonic arm counter for [`Self::gva_deferred_flush`] oldest-first cap.
-    pub gva_deferred_seq: u64,
     /// GVA render target → a hash of the guest physical pages its engine
     /// resident was last armed over.
     ///
@@ -1943,10 +2090,6 @@ pub struct DeviceState {
     /// answer to the one question its page-set guard cannot ask: was the guest
     /// told this render was done before we wrote its bytes?
     pub completion_stamp_seq: u64,
-    /// GVA windows whose task died (`delete_task`) — the GVA walk is gone, so
-    /// the runtime lands these **cache-only** (no guest write) and unpins
-    /// (`storage_flush::retire_gva_windows`).
-    pub retired_gva_windows: Vec<(u64, GvaDeferredEntry)>,
     /// Total stale views the reuse verify caught (fail-logged as
     /// `gva_view_stale`; the view self-heals via retire + rebuild).
     pub view_stale_reads: u64,
@@ -1983,15 +2126,20 @@ impl DeviceState {
             page_shift,
             gfx: GfxRegs::default(),
             iosfc: IosfcRegs::default(),
+            #[cfg(feature = "backend-vulkan")]
+            gva_store_witness: Default::default(),
             active_child_mask: 0,
             translation_deferred_mask: 0,
+            stamp_deferred_mask: 0,
             translation_order_hold_mask: 0,
             translation_order_holds: 0,
             present_translation_holds: 0,
             present_translation_hold_mask: 0,
             pending: PendingWork::default(),
             child_rings: std::array::from_fn(|_| ChannelRing::default()),
-            tasks: std::array::from_fn(|_| TaskEntry::default()),
+            max_task_id_seen: 0,
+            max_mapping_id_seen: 0,
+            tasks: TaskTable::new(),
             map_family_events: 0,
             objects: std::collections::BTreeSet::new(),
             texture_to_mapping: BTreeMap::new(),
@@ -2006,10 +2154,7 @@ impl DeviceState {
             gva_eviction_witness: GvaEvictionWitness::default(),
             host_linear_textures: BTreeMap::new(),
             compute_storage_residency: BTreeMap::new(),
-            compute_deferred_flush: BTreeMap::new(),
             fence_flushed_mappings: std::collections::BTreeSet::new(),
-            surface_deferred_seq: 0,
-            deferred_alias_pages: DeferredWindows::new(),
             surface_write_kind: BTreeMap::new(),
             present: PresentState::default(),
             cursor: CursorState {
@@ -2027,15 +2172,13 @@ impl DeviceState {
             retired_views: Vec::new(),
             retired_guest_write_tokens: Vec::new(),
             retired_linear_residents: Vec::new(),
-            linear_deferred_flush: DeferredWindows::new(),
-            gva_deferred_flush: DeferredWindows::new(),
-            gva_deferred_seq: 0,
             completion_stamp_seq: 0,
             gva_resident_backing: std::collections::BTreeMap::new(),
-            retired_gva_windows: Vec::new(),
             guest_linear_memo: LruBytesMemo::new(GUEST_LINEAR_MEMO_BYTE_CAP),
             #[cfg(feature = "backend-vulkan")]
             gather_witness: crate::runtime::gather_witness::GatherWitness::default(),
+            #[cfg(feature = "backend-vulkan")]
+            bound_buffers: crate::runtime::bound_buffers::BoundBuffers::default(),
             sampled_content_gen: 0,
             host_writes: crate::runtime::host_writes::HostWrites::default(),
             guest_linear_scratch: Vec::new(),
@@ -2047,48 +2190,8 @@ impl DeviceState {
         }
     }
 
-    /// Arm (or re-arm) a deferred GVA render-Store window.
-    pub fn arm_gva_deferred_window(&mut self, gva: u64, entry: GvaDeferredEntry) {
-        self.gva_deferred_flush.0.insert(gva, entry);
-    }
 
-    /// Arm (or re-arm) a linear compute-storage deferred window.
-    pub fn arm_linear_deferred_window(
-        &mut self,
-        key: ComputeStorageResidencyKey,
-        generation: u32,
-        pages: std::collections::HashSet<u64>,
-    ) {
-        let armed_stamp_seq = self.completion_stamp_seq;
-        self.linear_deferred_flush.0.insert(
-            key,
-            LinearDeferredEntry {
-                generation,
-                armed_stamp_seq,
-                pages,
-            },
-        );
-    }
 
-    /// Disarm a linear compute-storage deferred window.
-    ///
-    /// Returns the whole window, so a caller about to write those guest pages
-    /// can check they still belong to this window (see
-    /// `runtime::storage_flush::deferred_pages_still_ours`) and can score the
-    /// landing against the fence the window was armed under
-    /// ([`LinearDeferredEntry::armed_stamp_seq`]). This used to return a bare
-    /// `bool` and drop the pages on the floor, which left the flush with no way
-    /// to tell that the guest had re-pointed the span since defer time — the
-    /// same hazard the GVA rail already guards. `Some` still means "an entry was
-    /// present", so the presence test is unchanged for callers that only want
-    /// that.
-    pub fn disarm_linear_deferred_window(
-        &mut self,
-        key: &ComputeStorageResidencyKey,
-    ) -> Option<LinearDeferredEntry> {
-        let entry = self.linear_deferred_flush.0.remove(key)?;
-        Some(entry)
-    }
 
     /// Detach `e`'s contiguous view for later unmap (page table changed).
     /// Returns the retired (ptr, len) to push into `retired_views`.
@@ -2139,6 +2242,8 @@ impl DeviceState {
         // them armed on the host forever.
         #[cfg(feature = "backend-vulkan")]
         tokens.extend(self.gather_witness.take_tokens());
+        #[cfg(feature = "backend-vulkan")]
+        tokens.extend(self.gva_store_witness.take_tokens());
         // Back onto the retired list rather than out through the return value:
         // the caller's contract is "invalidate backend aliases, then release
         // views", and a token release is neither. `flush_retired_views` drains
@@ -2291,7 +2396,70 @@ impl DeviceState {
             .unwrap_or(SurfaceWriteKind::Unknown)
     }
 
+    /// Drop every held bind resolution for one task.
+    ///
+    /// The answer for every packet after which a reference may name different
+    /// bytes: a new page-table root, a new object list, a deleted object, a
+    /// deleted task, and a replaced physical page. Each is rare against the
+    /// draw rate, so the whole task goes rather than the machinery that would
+    /// map an object id back to the references resolved through it.
+    ///
+    /// Ungated so the packet handlers stay free of `cfg`; on a build with no
+    /// Vulkan engine nothing can hold a resolution and this is a no-op.
+    /// Returns how many resolutions were dropped, so the caller can name the
+    /// cause on the census. A count, not an event: one `SetObjectList` that
+    /// retires forty entries and one that retires none read identically as
+    /// events, and it is the entries that become the re-walks.
+    pub fn retire_bound_buffers_for_task(&mut self, task_id: u32) -> usize {
+        #[cfg(feature = "backend-vulkan")]
+        {
+            self.bound_buffers.retire_task(task_id)
+        }
+        #[cfg(not(feature = "backend-vulkan"))]
+        {
+            let _ = task_id;
+            0
+        }
+    }
+
+    /// Drop the held bind resolutions for `task_id` covering `[gva, gva+len)`.
+    ///
+    /// The map/unmap answer, which names the exact range the guest moved. See
+    /// Drop the held bind resolutions for one reference, at every offset.
+    ///
+    /// The `CmdDeleteObject` rule. See
+    /// [`crate::runtime::bound_buffers::BoundBuffers::retire_ref`] for why this
+    /// is scoped to the reference rather than the task.
+    pub fn retire_bound_buffers_for_ref(&mut self, task_id: u32, ref_: u32) -> usize {
+        #[cfg(feature = "backend-vulkan")]
+        {
+            self.bound_buffers.retire_ref(task_id, ref_)
+        }
+        #[cfg(not(feature = "backend-vulkan"))]
+        {
+            let _ = (task_id, ref_);
+            0
+        }
+    }
+
+    /// [`Self::retire_bound_buffers_for_task`] for the gating.
+    pub fn retire_bound_buffers_in_range(&mut self, task_id: u32, gva: u64, len: u64) -> usize {
+        #[cfg(feature = "backend-vulkan")]
+        {
+            self.bound_buffers.retire_range(task_id, gva, len)
+        }
+        #[cfg(not(feature = "backend-vulkan"))]
+        {
+            let _ = (task_id, gva, len);
+            0
+        }
+    }
+
     pub fn reset(&mut self) {
+        // Held bind resolutions name guest addresses under a device that is
+        // going away; nothing about them survives a reset.
+        #[cfg(feature = "backend-vulkan")]
+        self.bound_buffers.clear();
         // A translation hold that is still standing here never resolved. The
         // hold itself is control flow — the FIFO is parked until an AIR module
         // finishes loading and the packet is retried, not consumed — so it is
@@ -2371,81 +2539,24 @@ impl DeviceState {
         }
     }
 
-    /// Deferred GVA render-Store windows lose their GVA walk with the task —
-    /// hand them to the runtime for a cache-only landing
-    /// (`storage_flush::retire_gva_windows`); never write guest pages from
-    /// teardown.
+    /// Install the guest's task under `task_id`, replacing any previous one.
     ///
-    /// Only this task's windows. Both sides of the comparison are slot ids:
-    /// `GvaDeferredEntry::task_id` is the word `task_slot::resolve_task_word`
-    /// accepted, and `DeleteTask` (`0x20`) carries a slot id too — its words
-    /// include `5`, `11` and `13`, odd and greater than one, which the
-    /// `DefineTask2` doubled space (`0x1`, then strictly even) does not contain,
-    /// and all 968 deletes measured across the boots on disk report `ok=1`
-    /// against a live slot.
-    ///
-    /// So a `task_id >> 1` arm here matched no window this task owns and did
-    /// match every window owned by slots `2 * task_id` and `2 * task_id + 1`.
-    /// Slots run densely from 0 out of [`MAX_TASKS`] = 256, and boots use ids
-    /// well past 14, so those are live tasks: deleting task 5 retired tasks 10
-    /// and 11's pending frames. Cache-only landing writes no guest pages, so the
-    /// effect was a live task silently losing rendered pixels out of guest RAM
-    /// and the guest compositing whatever those pages held before.
-    ///
-    /// Do not widen this back for symmetry with
-    /// [`crate::runtime::gva_view::task_matches`], which deliberately keeps an
-    /// aliased arm at its own overlap-retire site. The two are not the same
-    /// shape, and copying that pattern here without the asymmetry is how this
-    /// arrived. A *view* is a cached translation, so retiring one that did not
-    /// need retiring costs a re-walk and nothing else. A *window* is pixels this
-    /// device owes guest RAM, and retiring one lands it cache-only — the bytes
-    /// never reach the guest and nothing re-derives them. Widening is
-    /// conservative for the first and lossy for the second.
-    fn retire_task_gva_windows(&mut self, task_id: u32) {
-        let doomed: Vec<u64> = self
-            .gva_deferred_flush
-            .iter()
-            .filter(|(_, e)| e.task_id == task_id)
-            .map(|(&gva, _)| gva)
-            .collect();
-        for gva in doomed {
-            if let Some(entry) = self.gva_deferred_flush.0.remove(&gva) {
-                self.retired_gva_windows.push((gva, entry));
-            }
-        }
-    }
-
-    /// Take the deferred GVA window at exactly `gva`, if any.
-    pub fn take_gva_deferred_window(&mut self, gva: u64) -> Option<GvaDeferredEntry> {
-        let entry = self.gva_deferred_flush.0.remove(&gva)?;
-        Some(entry)
-    }
-
-    /// Take the oldest-armed deferred GVA window (window-cap eviction).
-    pub fn take_oldest_gva_deferred_window(&mut self) -> Option<(u64, GvaDeferredEntry)> {
-        let gva = self
-            .gva_deferred_flush
-            .iter()
-            .min_by_key(|(_, e)| e.armed_seq)
-            .map(|(&gva, _)| gva)?;
-        let entry = self.gva_deferred_flush.0.remove(&gva)?;
-        Some((gva, entry))
-    }
-
-    pub fn define_task(&mut self, task_id: u32, length: u64, directory_pfn: u32) -> bool {
-        if task_id as usize >= MAX_TASKS {
-            StateMutationDecline::DefineTaskIdRange { task_id }.emit(u64::from(task_id));
-            return false;
-        }
+    /// Returns nothing: it used to return `bool`, and the only `false` it could
+    /// produce was `task_id >= MAX_TASKS`. With the task table keyed by the
+    /// guest's own `u32` there is no id this can refuse, so a `bool` here would
+    /// be a value 81 call sites asserted on and none of them could ever see
+    /// false — the shape that makes a later real failure easy to add and easy to
+    /// ignore.
+    pub fn define_task(&mut self, task_id: u32, length: u64, directory_pfn: u32) {
+        self.max_task_id_seen = self.max_task_id_seen.max(task_id);
         // Drop objects for this task on redefine.
         self.objects.retain(|&(t, _)| t != task_id);
         self.retire_task_linear_residents(task_id);
-        self.retire_task_gva_windows(task_id);
         self.host_linear_textures.retain(|&(t, _), _| t != task_id);
         // New directory ⇒ old GVA HostOps views alias the wrong PT — retire.
         self.retire_task_gva_views(task_id);
-        self.tasks[task_id as usize] = TaskEntry::define(length, directory_pfn);
-        true
+        self.tasks
+            .define(task_id, TaskEntry::define(length, directory_pfn));
     }
 
     /// Retire every GVA HostOps view registered under `task_id`.
@@ -2454,7 +2565,8 @@ impl DeviceState {
     /// redefine and `delete_task` on teardown — owe exactly this: the views hold
     /// host pointers into pages the guest is about to recycle, so leaving one
     /// live is a read of memory that no longer belongs to the surface (the
-    /// WindowServer SIGSEGV class `write_span` documents). `retired_views` is
+    /// WindowServer SIGSEGV class [`crate::runtime::gva_view::write_span_within`]
+    /// documents). `retired_views` is
     /// drained by `mapper::flush_retired_views` through `HostOps::unmap_pages`.
     fn retire_task_gva_views(&mut self, task_id: u32) {
         let mut i = 0;
@@ -2473,16 +2585,12 @@ impl DeviceState {
     /// PVG `CmdDeleteTask` (op `0x20`): drop task directory + object list entries.
     /// Guest reuses task ids; leaving stale active tasks corrupts GVA walks.
     pub fn delete_task(&mut self, task_id: u32) -> bool {
-        if task_id as usize >= MAX_TASKS {
-            StateMutationDecline::DeleteTaskIdRange { task_id }.emit(u64::from(task_id));
-            return false;
-        }
-        if !self.tasks[task_id as usize].active {
+        self.max_task_id_seen = self.max_task_id_seen.max(task_id);
+        if !self.tasks.is_active(task_id) {
             return false;
         }
         self.objects.retain(|&(t, _)| t != task_id);
         self.retire_task_linear_residents(task_id);
-        self.retire_task_gva_windows(task_id);
         self.host_linear_textures.retain(|&(t, _), _| t != task_id);
         // Clear texture→mapping latches for this task.
         let doomed_refs: Vec<u32> = self
@@ -2501,35 +2609,25 @@ impl DeviceState {
         // HostOps views we held (does not touch host_gva_surfaces encode).
         // Runtime flushes retired_views via HostOps::unmap_pages.
         self.retire_task_gva_views(task_id);
-        self.tasks[task_id as usize] = TaskEntry::default();
+        self.tasks.remove(task_id);
         true
     }
 
     pub fn set_object_list(&mut self, task_id: u32, pfn: u32, count: u32) -> bool {
-        if task_id as usize >= MAX_TASKS {
-            StateMutationDecline::SetObjectListTaskIdRange { task_id }.emit(u64::from(task_id));
-            return false;
-        }
-        if !self.tasks[task_id as usize].active {
+        self.max_task_id_seen = self.max_task_id_seen.max(task_id);
+        let Some(task) = self.tasks.get_mut(task_id).filter(|t| t.active) else {
             StateMutationDecline::SetObjectListTaskInactive { task_id }.emit(u64::from(task_id));
             return false;
-        }
-        self.tasks[task_id as usize].object_list_pfn = pfn;
-        self.tasks[task_id as usize].object_list_count = count;
+        };
+        task.object_list_pfn = pfn;
+        task.object_list_count = count;
         true
     }
 
     pub fn insert_object(&mut self, task_id: u32, ref_: u32) -> bool {
         let discriminant = (u64::from(task_id) << 32) | u64::from(ref_);
-        if task_id as usize >= MAX_TASKS {
-            StateMutationDecline::InsertObjectTaskIdRange {
-                task_id,
-                object_ref: ref_,
-            }
-            .emit(discriminant);
-            return false;
-        }
-        if !self.tasks[task_id as usize].active {
+        self.max_task_id_seen = self.max_task_id_seen.max(task_id);
+        if !self.tasks.is_active(task_id) {
             StateMutationDecline::InsertObjectTaskInactive {
                 task_id,
                 object_ref: ref_,
@@ -2544,13 +2642,40 @@ impl DeviceState {
     pub fn delete_object(&mut self, task_id: u32, ref_: u32) -> bool {
         let removed = self.objects.remove(&(task_id, ref_));
         if removed {
-            self.host_texture_surfaces.remove(&ref_);
-            if let Some(e) = self.host_linear_textures.remove(&(task_id, ref_)) {
-                self.retire_linear_resident(task_id, ref_, &e);
-            }
+            self.invalidate_object_host_copies(task_id, ref_);
             self.texture_to_mapping.remove(&(task_id, ref_));
         }
         removed
+    }
+
+    /// Drop this device's ref-keyed host copies of an object's *contents*, for a
+    /// packet saying the guest memory under it has changed. Returns which of the
+    /// two held something, `(texture, linear)`.
+    ///
+    /// The two caches this covers are keyed by object-list ref rather than by
+    /// mapping id, and neither carries a page list, so nothing in them can
+    /// notice that the pages they were read from are no longer the object's.
+    /// `invalidate_mapping_pages` is the same obligation on the mapping rail; a
+    /// packet that reaches only one of the two rails still has to discharge it
+    /// on that one.
+    ///
+    /// Contents only. The object stays alive, and so does its `texture_to_mapping`
+    /// association — a re-point moves the bytes, it does not unname the resource.
+    /// [`Self::delete_object`] takes both halves and calls this for its first.
+    ///
+    /// A live linear resident goes through [`Self::retire_linear_resident`], so
+    /// it is unpinned and its deferred window dropped rather than left to write
+    /// pixels read from the old pages into the new ones.
+    pub fn invalidate_object_host_copies(&mut self, task_id: u32, ref_: u32) -> (bool, bool) {
+        let had_texture = self.host_texture_surfaces.remove(&ref_).is_some();
+        let had_linear = match self.host_linear_textures.remove(&(task_id, ref_)) {
+            Some(e) => {
+                self.retire_linear_resident(task_id, ref_, &e);
+                true
+            }
+            None => false,
+        };
+        (had_texture, had_linear)
     }
 
     /// Bump [`MappingEntry::map_generation`] (never 0 after first bump).
@@ -2574,108 +2699,38 @@ impl DeviceState {
         });
     }
 
-    /// How many deferred windows this mapping currently owes.
-    ///
-    /// Read before a drop so the drop can be counted: `drop_windows` reports
-    /// each window it takes on the fail path but returns nothing, and a rail
-    /// that needs to know whether it dropped anything must not re-derive the
-    /// answer from the log.
-    pub fn deferred_flush_window_count(&self, mapping_id: u32) -> u32 {
-        self.compute_deferred_flush
-            .keys()
-            .filter(|key| key.mapping_id == mapping_id)
-            .count() as u32
-    }
-
-    /// Remove one deferred window by exact key, pruning the alias index with it.
-    ///
-    /// For supersede: a writer that fully covers a window's guest range drops
-    /// the obligation instead of landing it, and must not disturb the
-    /// intersecting siblings [`Self::take_deferred_flush_windows`] would also
-    /// take. Going through here rather than `compute_deferred_flush.remove`
-    /// keeps the raw-GVA alias index in step — a mapping whose last window
-    /// leaves must lose its page refs, or the union index keeps counting pages
-    /// nothing defers on.
-    pub fn take_deferred_flush_window_exact(
-        &mut self,
-        key: &ComputeStorageResidencyKey,
-    ) -> Option<DeferredOwner> {
-        let owner = self.compute_deferred_flush.remove(key)?;
-        self.prune_alias_index(key.mapping_id);
-        Some(owner)
-    }
-
-    /// Remove and return every deferred-writeback window intersecting
-    /// `[lo, hi)` on this mapping. The caller owns flushing each returned
-    /// entry (or reporting the loss) — once taken, the map no longer names it.
-    pub fn take_deferred_flush_windows(
-        &mut self,
-        mapping_id: u32,
-        lo: u64,
-        hi: u64,
-    ) -> Vec<(ComputeStorageResidencyKey, DeferredOwner)> {
-        let keys: Vec<ComputeStorageResidencyKey> = self
-            .compute_deferred_flush
-            .keys()
-            .filter(|key| {
-                key.mapping_id == mapping_id && key.span_end > lo && key.surface_offset < hi
-            })
-            .cloned()
-            .collect();
-        let taken: Vec<(ComputeStorageResidencyKey, DeferredOwner)> = keys
-            .into_iter()
-            .filter_map(|key| {
-                self.compute_deferred_flush
-                    .remove(&key)
-                    .map(|owner| (key, owner))
-            })
-            .collect();
-        if !taken.is_empty() {
-            self.prune_alias_index(mapping_id);
-        }
-        taken
-    }
-
-    /// Record the physical page bases of `mapping_id` in the raw-GVA alias
-    /// index. Called at defer time, when `page_entries` are freshly resolved
-    /// (the Store/dispatch just targeted them) — never at sample time.
-    pub fn index_deferred_alias_pages(&mut self, mapping_id: u32) {
-        let page_shift = self.page_shift;
-        let page = self.page_size();
-        let Some(m) = self.mappings.get(&mapping_id) else {
-            return;
-        };
-        let set: std::collections::HashSet<u64> = m
-            .page_entries
-            .iter()
-            .filter_map(|&e| crate::contract::iosurface_pages::entry_gpa_shift(e, page_shift))
-            .map(|gpa| gpa & !(page - 1))
-            .collect();
-        if set.is_empty() {
-            self.deferred_alias_pages.0.remove(&mapping_id);
-        } else {
-            self.deferred_alias_pages.0.insert(mapping_id, set);
-        }
-    }
-
-    /// Drop the alias-index entry once no mapping-keyed deferred window names
-    /// this mapping anymore.
-    fn prune_alias_index(&mut self, mapping_id: u32) {
-        let live = self
-            .compute_deferred_flush
-            .keys()
-            .any(|k| k.mapping_id == mapping_id);
-        if !live {
-            self.deferred_alias_pages.0.remove(&mapping_id);
-        }
-    }
-
     /// Drop cached page list + contig view without unmapping the slot.
     ///
     /// Used on ReplacePhysical / rebind: guest may have recycled PFNs into the
     /// zone freelist; the next Store must re-resolve before any host write or
     /// import-present DMA (freelist `0xff000000ff000000` class).
     pub fn invalidate_mapping_pages(&mut self, mapping_id: u32) -> bool {
+        // The cached BGRA frame is a host-side copy of the pages this call is
+        // invalidating, and it is the only such copy whose key does not carry
+        // `map_generation`: the resident's does (`surface_identity`), the
+        // contiguous view and the guest-write token are retired below, and every
+        // armed window refuses on the generation check it already has. So the
+        // bump that disqualifies all of those leaves this entry addressable by
+        // `(mapping_id, geometry)` alone, still holding pixels read through the
+        // page list that just stopped being this surface's.
+        //
+        // Retiring the guest-write token is what makes that reachable rather
+        // than theoretical. The type-4 sampled ladder's host-cache rung serves
+        // its copy unless the witness reports `Wrote`, and a retired token
+        // reports `NoStamp` — deliberately not evidence, because "nobody armed
+        // this" is a statement about this device and not about the guest. The
+        // rung therefore reads the invalidation as *permission* to serve, and
+        // keeps serving until some later Store replaces the bytes. A surface
+        // composited once and then only sampled — a popup backdrop, a settings
+        // pane — never gets that Store, so the stale frame is held for the life
+        // of the guest.
+        //
+        // `condemn_surface_backing` already drops it for the same class of
+        // event, and the two sit in the same `if`/`else` in the ReplacePhysical
+        // teardown, so leaving it here made one arm of one decision correct.
+        if self.host_surfaces.remove(&mapping_id).is_some() {
+            crate::runtime::drain::note_store_route("invalidate_dropped_host_cache");
+        }
         let Some(e) = self.mappings.get_mut(&mapping_id) else {
             return false;
         };
@@ -2707,7 +2762,6 @@ impl DeviceState {
     pub fn condemn_surface_backing(&mut self, mapping_id: u32) -> bool {
         self.forget_compositor_mapping(mapping_id);
         self.host_surfaces.remove(&mapping_id);
-        self.deferred_alias_pages.0.remove(&mapping_id);
         let Some(e) = self.mappings.get_mut(&mapping_id) else {
             return false;
         };
@@ -2737,8 +2791,9 @@ impl DeviceState {
     }
 
     pub fn map_surface(&mut self, mapping_id: u32) -> bool {
-        if mapping_id as usize >= MAX_MAPPINGS {
-            StateMutationDecline::MapSurfaceIdRange { mapping_id }.emit(u64::from(mapping_id));
+        self.max_mapping_id_seen = self.max_mapping_id_seen.max(mapping_id);
+        if !crate::model::is_mapping_id(mapping_id) {
+            StateMutationDecline::MapSurfaceIdSentinel { mapping_id }.emit(u64::from(mapping_id));
             return false;
         }
         let e = self.mappings.entry(mapping_id).or_default();
@@ -2786,116 +2841,12 @@ impl DeviceState {
         true
     }
 
-    /// Tell [`crate::observe::footprint`] that a mapping's pages have stopped
-    /// being a surface's, so a later write into them is reportable.
-    ///
-    /// Only the guest's own Unmap calls this. The device's internal
-    /// invalidations — a resolve that failed, a condemned list awaiting a
-    /// fingerprint compare — are *this device* deciding it no longer trusts a
-    /// list, not the guest saying the memory is no longer a surface's, and the
-    /// reprieve path can hand the same list straight back. Retiring on those
-    /// would flag the reprieve's own legitimate writes, and a detector whose
-    /// first finding is its own bookkeeping gets switched off before it ever
-    /// reports a real one.
-    ///
-    /// Frames another live mapping still names are excluded: two mappings can
-    /// alias the same guest pages, and the survivor's writes are not a defect.
-    ///
-    /// # The condemned list is part of the doomed set, and reading only
-    /// `page_entries` made this dead code
-    ///
-    /// Both routes into [`Self::unmap_surface`] from a guest teardown arrive
-    /// with `page_entries` already **empty**, because the list was moved into
-    /// `condemned_entries` by the step before:
-    ///
-    /// - `DeleteIOSurfaceBacking2` first calls [`Self::condemn_surface_backing`],
-    ///   which does exactly that move. A second delete with no resolve between
-    ///   then takes the `mapping_backing_condemned` branch to `unmap_surface` —
-    ///   where the only list is the condemned one.
-    /// - The same delete falls through to `unmap_surface` directly when
-    ///   `condemn_surface_backing` returns `false`, and it returns `false`
-    ///   *precisely when* `page_entries` is empty.
-    /// - [`Self::map_surface`] moves the list the same way, so a fresh MAP
-    ///   followed by an Unmap is the third case.
-    ///
-    /// So an `is_empty()` bail on `page_entries` alone could never retire a page
-    /// on the delete path. Measured: a 600 s driven boot reported
-    /// `retire_scans=0`, which made its `write_after_retire=0` UNMEASURED rather
-    /// than clean — the failure direction this project's rules call out, a
-    /// detector reading zero because it never ran.
-    ///
-    /// Retiring the condemned list *here* is not the same as retiring at
-    /// condemn time, which would be wrong for the reason above: at condemn the
-    /// reprieve can still hand the list straight back. By the time this runs the
-    /// guest has said the backing is gone and no resolve has re-adopted it —
-    /// `resolve_mapping_backing` takes `condemned_entries` and calls
-    /// `note_pages_authorized` on whatever it adopts, so a reprieved list is
-    /// un-retired through the ordinary adoption path before it can be written.
-    ///
-    /// Other mappings' condemned lists count as still-held for the same reason,
-    /// in the conservative direction: a slot awaiting its fingerprint compare
-    /// may be reprieved, and its writes would then be legitimate.
-    fn note_mapping_pages_retired(&self, mapping_id: u32) {
-        let Some(doomed) = self.mappings.get(&mapping_id) else {
-            return;
-        };
-        let mut going: Vec<u32> = doomed.page_entries.clone();
-        going.extend_from_slice(doomed.condemned_entries.as_deref().unwrap_or(&[]));
-        self.retire_pages_no_live_mapping_holds(&going, Some(mapping_id));
-    }
-
-    /// Retire every page in `going` that no still-live mapping names.
-    ///
-    /// `skip` is the mapping whose own lists are the doomed ones and must not
-    /// therefore count as holding them. Pass `None` when the pages are being
-    /// abandoned by a mapping that is *still live under a new backing* — a
-    /// superseded incarnation — because there the mapping's current
-    /// `page_entries` are the new plan, and a page carried over into it is
-    /// genuinely still a surface's and must be kept out of the retired set.
-    ///
-    /// Other mappings' *condemned* lists count as held, deliberately in the
-    /// conservative direction: a slot awaiting its fingerprint compare may be
-    /// reprieved, and its writes would then be legitimate.
-    pub(crate) fn retire_pages_no_live_mapping_holds(&self, going: &[u32], skip: Option<u32>) {
-        if going.is_empty() {
-            return;
-        }
-        let shift = self.page_shift;
-        let gpas_of = |entries: &[u32]| -> Vec<u64> {
-            entries
-                .iter()
-                .filter_map(|&e| crate::contract::iosurface_pages::entry_gpa_shift(e, shift))
-                .collect()
-        };
-        let mut still_held: std::collections::HashSet<u64> = Default::default();
-        let mut walked = 0u64;
-        for (&other, m) in self.mappings.iter() {
-            if Some(other) == skip {
-                continue;
-            }
-            let condemned = m.condemned_entries.as_deref().unwrap_or(&[]);
-            walked += (m.page_entries.len() + condemned.len()) as u64;
-            still_held.extend(gpas_of(&m.page_entries));
-            still_held.extend(gpas_of(condemned));
-        }
-        // Reported rather than assumed small. This runs on the drain worker,
-        // which `drain_duty` already shows at 0.93-0.99, and the alias exclusion
-        // costs one pass over everything currently mapped per retire.
-        crate::observe::footprint::note_retire_scan(walked);
-        let retiring: Vec<u64> = gpas_of(going)
-            .into_iter()
-            .filter(|g| !still_held.contains(g))
-            .collect();
-        crate::observe::footprint::note_pages_retired(retiring, self.page_size());
-    }
-
     pub fn unmap_surface(&mut self, mapping_id: u32) -> bool {
-        if mapping_id as usize >= MAX_MAPPINGS {
-            StateMutationDecline::UnmapSurfaceIdRange { mapping_id }.emit(u64::from(mapping_id));
+        self.max_mapping_id_seen = self.max_mapping_id_seen.max(mapping_id);
+        if !crate::model::is_mapping_id(mapping_id) {
+            StateMutationDecline::UnmapSurfaceIdSentinel { mapping_id }.emit(u64::from(mapping_id));
             return false;
         }
-        // Before the list is cleared, while the pages are still nameable.
-        self.note_mapping_pages_retired(mapping_id);
         self.forget_compositor_mapping(mapping_id);
         if let Some(e) = self.mappings.get_mut(&mapping_id) {
             e.mapped = false;
@@ -2926,8 +2877,10 @@ impl DeviceState {
 
     /// Attach directed MappingInternal capture to a mapped slot.
     pub fn attach_mapping_internal(&mut self, mapping_id: u32, mapping_internal: u64) -> bool {
-        if mapping_id as usize >= MAX_MAPPINGS {
-            StateMutationDecline::AttachMappingIdRange { mapping_id }.emit(u64::from(mapping_id));
+        self.max_mapping_id_seen = self.max_mapping_id_seen.max(mapping_id);
+        if !crate::model::is_mapping_id(mapping_id) {
+            StateMutationDecline::AttachMappingIdSentinel { mapping_id }
+                .emit(u64::from(mapping_id));
             return false;
         }
         if mapping_internal == 0 {
@@ -2974,8 +2927,9 @@ impl DeviceState {
 
     /// Cache the 0x200-byte guest device descriptor for plane/surface sample windows.
     pub fn set_mapping_device_desc(&mut self, mapping_id: u32, desc: &[u8]) -> bool {
-        if mapping_id as usize >= MAX_MAPPINGS {
-            StateMutationDecline::MappingDeviceDescIdRange { mapping_id }
+        self.max_mapping_id_seen = self.max_mapping_id_seen.max(mapping_id);
+        if !crate::model::is_mapping_id(mapping_id) {
+            StateMutationDecline::MappingDeviceDescIdSentinel { mapping_id }
                 .emit(u64::from(mapping_id));
             return false;
         }
@@ -2995,26 +2949,29 @@ impl DeviceState {
         height: u32,
         format: u16,
     ) -> bool {
-        if mapping_id as usize >= MAX_MAPPINGS {
-            StateMutationDecline::MappingGeomIdRange { mapping_id }.emit(u64::from(mapping_id));
+        if !crate::model::is_mapping_id(mapping_id) {
+            StateMutationDecline::MappingGeomIdSentinel { mapping_id }.emit(u64::from(mapping_id));
             return false;
         }
-        if width == 0 {
-            StateMutationDecline::MappingGeomWidthZero { mapping_id }.emit(u64::from(mapping_id));
-            return false;
-        }
-        if height == 0 {
-            StateMutationDecline::MappingGeomHeightZero { mapping_id }.emit(u64::from(mapping_id));
-            return false;
-        }
-        if width > crate::model::MAX_SCANOUT_DIM {
-            StateMutationDecline::MappingGeomWidthRange { mapping_id, width }
-                .emit((u64::from(mapping_id) << 32) | u64::from(width));
-            return false;
-        }
-        if height > crate::model::MAX_SCANOUT_DIM {
-            StateMutationDecline::MappingGeomHeightRange { mapping_id, height }
-                .emit((u64::from(mapping_id) << 32) | u64::from(height));
+        // The bound itself lives once, in `regs::scanout_extent_fault`; this is
+        // the only caller that has to name which half of it broke, so it is the
+        // only one that reads the fault rather than the verdict.
+        if let Some(fault) = crate::model::scanout_extent_fault(width, height) {
+            use crate::model::ScanoutExtentFault as F;
+            match fault {
+                F::WidthZero => StateMutationDecline::MappingGeomWidthZero { mapping_id }
+                    .emit(u64::from(mapping_id)),
+                F::HeightZero => StateMutationDecline::MappingGeomHeightZero { mapping_id }
+                    .emit(u64::from(mapping_id)),
+                F::WidthAboveBound => {
+                    StateMutationDecline::MappingGeomWidthRange { mapping_id, width }
+                        .emit((u64::from(mapping_id) << 32) | u64::from(width))
+                }
+                F::HeightAboveBound => {
+                    StateMutationDecline::MappingGeomHeightRange { mapping_id, height }
+                        .emit((u64::from(mapping_id) << 32) | u64::from(height))
+                }
+            }
             return false;
         }
         let e = self.mappings.entry(mapping_id).or_default();
@@ -3166,6 +3123,111 @@ impl DeviceState {
         #[cfg(test)]
         self.fails.push(ev);
     }
+
+    /// [`Self::record_fail`], but the line is emitted only the first time this
+    /// `(reason, discriminant)` pair is seen this boot.
+    ///
+    /// For an event that repeats at the guest's own rate. A refusal the guest
+    /// re-triggers every frame does not become more true for being printed
+    /// thirty times a second; it becomes unreadable, and takes the rest of the
+    /// log with it. The caller pairs this with a route counter, because the
+    /// latch is what costs the rate.
+    ///
+    /// The in-memory vec is still appended on every call. It is the tests'
+    /// view, and a test asserting that a second packet was declined would
+    /// otherwise be asserting the latch instead.
+    pub fn record_fail_once(&mut self, ev: FailEvent, discriminant: u64) {
+        if crate::observe::first_sight(crate::observe::Decline::slug(&ev), discriminant) {
+            crate::observe::Emit::decline("fail_event", &ev).fail();
+        }
+        #[cfg(test)]
+        self.fails.push(ev);
+        #[cfg(not(test))]
+        let _ = ev;
+    }
+}
+
+#[cfg(test)]
+mod device_desc_tests {
+    use super::*;
+    use crate::contract::iosurface_pages::{
+        device_desc_plane, DEVICE_DESC_LEN, DEVICE_DESC_PLANES, DEVICE_PLANE_DESC_LEN,
+    };
+
+    fn entry_with_desc(len: usize) -> MappingEntry {
+        MappingEntry {
+            device_desc: vec![0u8; len],
+            ..Default::default()
+        }
+    }
+
+    /// The completeness rule is all-or-nothing, and what it hands back is the
+    /// record's own length rather than whatever was cached.
+    #[test]
+    fn a_partial_device_descriptor_is_no_descriptor() {
+        assert!(entry_with_desc(0).device_desc_complete().is_none());
+        assert!(
+            entry_with_desc(DEVICE_DESC_LEN - 1)
+                .device_desc_complete()
+                .is_none(),
+            "one byte short is not a record"
+        );
+        assert_eq!(
+            entry_with_desc(DEVICE_DESC_LEN)
+                .device_desc_complete()
+                .map(<[u8]>::len),
+            Some(DEVICE_DESC_LEN)
+        );
+        assert_eq!(
+            entry_with_desc(DEVICE_DESC_LEN * 2)
+                .device_desc_complete()
+                .map(<[u8]>::len),
+            Some(DEVICE_DESC_LEN),
+            "a longer cached blob is still truncated to the record"
+        );
+    }
+
+    /// Why the truncation is the answer and not an arbitrary choice between two
+    /// spellings that happen to agree.
+    ///
+    /// `device_desc_plane` bounds each plane read against the slice it is
+    /// handed, and the eighth plane's record ends past `DEVICE_DESC_LEN`. So a
+    /// caller that passed `device_desc.as_slice()` whole would decode an eighth
+    /// plane out of an over-long cached blob while a caller that truncated
+    /// refused it — two readers of one mapping disagreeing about how many planes
+    /// the surface has. Truncating everywhere removes the disagreement, and this
+    /// pins that the boundary the two spellings differ at is real.
+    #[test]
+    fn the_eighth_plane_lies_past_the_record_the_completeness_rule_hands_back() {
+        let eighth = DEVICE_DESC_PLANES + 7 * DEVICE_PLANE_DESC_LEN;
+        assert!(
+            eighth + DEVICE_PLANE_DESC_LEN > DEVICE_DESC_LEN,
+            "the plane table must actually overrun the record, or there is \
+             nothing for the two spellings to disagree about"
+        );
+
+        // A descriptor declaring eight planes, cached over-long.
+        let mut over = vec![0u8; eighth + DEVICE_PLANE_DESC_LEN];
+        over[crate::contract::iosurface_pages::DEVICE_DESC_PLANE_COUNT] = 8;
+        assert!(
+            device_desc_plane(&over, 7).is_some(),
+            "the whole-slice spelling would have found an eighth plane"
+        );
+
+        let e = MappingEntry {
+            device_desc: over,
+            ..Default::default()
+        };
+        let truncated = e.device_desc_complete().expect("a full record is cached");
+        assert!(
+            device_desc_plane(truncated, 7).is_none(),
+            "and the rule this crate now uses everywhere refuses it"
+        );
+        assert!(
+            device_desc_plane(truncated, 6).is_some(),
+            "without refusing the seventh, which does fit"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -3315,7 +3377,7 @@ mod fail_vocabulary_tests {
         assert!(long.contains("plen=40"), "{long}");
         assert_eq!(
             long.matches("0x").count(),
-            UNKNOWN_OPCODE_ECHO_WORDS + 1,
+            UNKNOWN_OPCODE_ECHO_WORDS_MAX + 1,
             "the echo is bounded, and the opcode is the one other hex field: {long}"
         );
 
@@ -3350,6 +3412,7 @@ mod fail_vocabulary_tests {
             PacketFault::ChildSnapRead,
             PacketFault::ChildTailRead,
             PacketFault::ChildHeadWriteback,
+            PacketFault::ShortSnapshot,
         ];
         let mut slugs: Vec<&str> = ALL.iter().map(|f| f.slug()).collect();
         slugs.sort_unstable();
@@ -3361,25 +3424,18 @@ mod fail_vocabulary_tests {
     #[test]
     fn every_state_mutation_check_has_its_own_registered_reason() {
         let declines = [
-            StateMutationDecline::DefineTaskIdRange { task_id: 64 },
-            StateMutationDecline::DeleteTaskIdRange { task_id: 64 },
-            StateMutationDecline::SetObjectListTaskIdRange { task_id: 64 },
             StateMutationDecline::SetObjectListTaskInactive { task_id: 1 },
-            StateMutationDecline::InsertObjectTaskIdRange {
-                task_id: 64,
-                object_ref: 3,
-            },
             StateMutationDecline::InsertObjectTaskInactive {
                 task_id: 1,
                 object_ref: 3,
             },
-            StateMutationDecline::MapSurfaceIdRange { mapping_id: 8192 },
-            StateMutationDecline::UnmapSurfaceIdRange { mapping_id: 8192 },
-            StateMutationDecline::AttachMappingIdRange { mapping_id: 8192 },
+            StateMutationDecline::MapSurfaceIdSentinel { mapping_id: 8192 },
+            StateMutationDecline::UnmapSurfaceIdSentinel { mapping_id: 8192 },
+            StateMutationDecline::AttachMappingIdSentinel { mapping_id: 8192 },
             StateMutationDecline::AttachMappingInternalZero { mapping_id: 1 },
-            StateMutationDecline::MappingDeviceDescIdRange { mapping_id: 8192 },
+            StateMutationDecline::MappingDeviceDescIdSentinel { mapping_id: 8192 },
             StateMutationDecline::MappingDeviceDescEmpty { mapping_id: 1 },
-            StateMutationDecline::MappingGeomIdRange { mapping_id: 8192 },
+            StateMutationDecline::MappingGeomIdSentinel { mapping_id: 8192 },
             StateMutationDecline::MappingGeomWidthZero { mapping_id: 1 },
             StateMutationDecline::MappingGeomHeightZero { mapping_id: 1 },
             StateMutationDecline::MappingGeomWidthRange {
@@ -3397,7 +3453,7 @@ mod fail_vocabulary_tests {
         }
         assert_eq!(
             slugs.len(),
-            17,
+            13,
             "every state mutation check has its own slug"
         );
         assert_eq!(
@@ -3414,12 +3470,13 @@ mod fail_vocabulary_tests {
         );
     }
 
+    /// A refused geometry must leave no entry behind — and a refusal is only ever
+    /// about the sentinel id or the extent, never about how large the id is.
     #[test]
-    fn invalid_mapping_geometry_cannot_create_an_out_of_range_slot() {
+    fn invalid_mapping_geometry_cannot_create_an_entry() {
         let mut state = DeviceState::new(DeviceId(1), crate::model::PAGE_SHIFT_X86);
-        let bad_mapping = MAX_MAPPINGS as u32;
-        assert!(!state.set_mapping_geom(bad_mapping, 64, 64, 0x50));
-        assert!(!state.mappings.contains_key(&bad_mapping));
+        assert!(!state.set_mapping_geom(0, 64, 64, 0x50));
+        assert!(!state.mappings.contains_key(&0));
         assert!(!state.set_mapping_geom(1, 0, 64, 0x50));
         assert!(!state.set_mapping_geom(1, 64, 0, 0x50));
         assert!(!state.mappings.contains_key(&1));
@@ -3444,6 +3501,122 @@ mod fail_vocabulary_tests {
             let now = state.host_writes.epoch();
             assert_ne!(now, epoch, "a host write into guest RAM went unannounced");
             epoch = now;
+        }
+    }
+}
+
+#[cfg(test)]
+mod slot_table_reach_tests {
+    use super::*;
+    use crate::model::{DeviceId, PAGE_SHIFT_X86};
+
+    /// No task id is out of range, and the mark records how far the guest went.
+    ///
+    /// This test used to assert the opposite: that `MAX_TASKS + 4096` was
+    /// *refused* and still moved the mark. The mark existed to say whether that
+    /// bound was close, because a refusal counter cannot — a boot stopping at id
+    /// 12 and one stopping at 255 both report zero refusals. The answer it gave
+    /// was 25x of headroom, which is not a derivation, and `DeviceState::tasks`
+    /// is a `TaskTable` over a map now. `u32::MAX` is the largest id the wire can
+    /// carry, so defining a task there is the strongest form of "nothing is out
+    /// of range".
+    ///
+    /// The mark stays, as an occupancy reading on that map rather than a
+    /// distance to a refusal.
+    #[test]
+    fn no_task_id_is_out_of_range() {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        assert_eq!(state.max_task_id_seen, 0);
+
+        state.define_task(12, 0x1000, 2);
+        assert!(state.tasks.is_active(12), "an ordinary id is accepted");
+        assert_eq!(state.max_task_id_seen, 12);
+
+        let past = u32::MAX;
+        state.define_task(past, 0x1000, 2);
+        assert!(
+            state.tasks.is_active(past),
+            "a task id is a full u32 on the wire and its storage is a map"
+        );
+        assert_eq!(state.max_task_id_seen, past);
+
+        // High-water, not last-seen: a later smaller id does not lower it.
+        state.define_task(3, 0x1000, 2);
+        assert_eq!(state.max_task_id_seen, past);
+        assert_eq!(
+            state.tasks.live_count(),
+            3,
+            "sparse ids do not create the entries between them"
+        );
+    }
+
+    /// The mapping id space has no ceiling, and this is the test that says so.
+    ///
+    /// It used to assert the opposite half of the same line — that one past
+    /// `MAX_MAPPINGS` was refused and still moved the reach mark. That bound
+    /// refused ids its own storage would have held: `mappings` is a `BTreeMap`.
+    /// `u32::MAX` is the largest id the wire can carry, so accepting it here is
+    /// the strongest form of "nothing is out of range", and a reinstated
+    /// ceiling fails on the first assertion.
+    ///
+    /// The mark still moves, because it is an occupancy reading on the map now
+    /// rather than a distance to a refusal.
+    #[test]
+    fn no_mapping_id_is_out_of_range() {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        assert_eq!(state.max_mapping_id_seen, 0);
+
+        assert!(state.map_surface(39), "an ordinary id is accepted");
+        assert_eq!(state.max_mapping_id_seen, 39);
+
+        assert!(
+            state.map_surface(u32::MAX),
+            "a mapping id is a full u32 on the wire and its storage is a map"
+        );
+        assert!(state.mappings.contains_key(&u32::MAX));
+        assert_eq!(state.max_mapping_id_seen, u32::MAX);
+
+        assert!(
+            !state.map_surface(0),
+            "0 is the unbound sentinel and is the one id that stays refused"
+        );
+        assert!(!state.mappings.contains_key(&0));
+    }
+
+    /// Every task mutator feeds the mark, not just the one that creates the
+    /// task — a guest that only ever calls `set_object_list` or `insert_object`
+    /// on a high id would otherwise be invisible.
+    ///
+    /// These three still refuse `past`, but for the reason they always should
+    /// have: no task is defined there. That is a liveness answer, not a range
+    /// one, and it is the same answer they would give for any undefined id.
+    #[test]
+    fn every_task_mutator_feeds_the_reach_mark() {
+        let past = u32::MAX;
+        for (name, mut state) in [
+            ("delete_task", DeviceState::new(DeviceId(1), PAGE_SHIFT_X86)),
+            (
+                "set_object_list",
+                DeviceState::new(DeviceId(1), PAGE_SHIFT_X86),
+            ),
+            (
+                "insert_object",
+                DeviceState::new(DeviceId(1), PAGE_SHIFT_X86),
+            ),
+        ] {
+            match name {
+                "delete_task" => assert!(!state.delete_task(past)),
+                "set_object_list" => assert!(!state.set_object_list(past, 1, 1)),
+                _ => assert!(!state.insert_object(past, 7)),
+            }
+            assert_eq!(
+                state.max_task_id_seen, past,
+                "{name} refused without recording the reach"
+            );
+            assert!(
+                !state.tasks.is_active(past),
+                "{name} must not have defined the task it refused"
+            );
         }
     }
 }

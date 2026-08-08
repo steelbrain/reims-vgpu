@@ -142,7 +142,7 @@ pub fn gfx_write<H: HostMemory + HostOps>(
         }
         GFX_REG_ROOT_PAGE => state.gfx.root_page = val,
         GFX_REG_CHILD_DOORBELL | GFX_REG_CHILD_REPLAY_DOORBELL => {
-            if val >= 1 && (val as usize) < MAX_CHANNELS {
+            if crate::model::accept_child_channel(val, "mmio_child_doorbell") {
                 state.active_child_mask |= 1u32 << val;
                 state.pending.child_mask |= 1u32 << val;
                 // Decode/execute belongs to the host BH, never the producer

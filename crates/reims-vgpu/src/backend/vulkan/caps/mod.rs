@@ -5,23 +5,32 @@
 //! either by a decision or by the one-shot `vk_caps` line. There is
 //! deliberately no derived taxonomy on top of it: a classification nothing
 //! branches on cannot be wrong in a way anyone notices, and the one that used to
-//! live here was wrong — it printed `handoff=dmabuf_fd handoff_declined=[]` on
-//! boots where the dmabuf arm was never entered, because the ladder that produced
-//! the string and the branch that picks the present path were separate pieces of
-//! code that had never been made to agree. The `dmabuf` bit itself went the same
-//! way once the export rail it described was deleted: nothing branched on it and
-//! nothing could.
+//! live here was wrong. It was a `vk_caps` field naming which handoff the
+//! present path would take, and it named an arm those boots never entered —
+//! because the ladder that produced the string and the branch that picks the
+//! path were separate pieces of code that had never been made to agree. A
+//! capability line reports what was measured; the moment it becomes a second
+//! implementation of a decision, it is free to disagree with the first and
+//! nothing will catch it.
 //!
 //! * [`memory_topology::MemoryTopology`] — `Unified` vs `Discrete` selects an
 //!   allocation *preference*, never a different observable result. Live: every
 //!   allocation names a [`MemoryClass`] and this module turns it into flags.
 //! * [`device_features`] — which optional device features are queried and
 //!   enabled, in one place, so no site can ask about one it did not request.
+//! * [`host_pointer::HostPointerImport`] — whether guest RAM can reach the GPU
+//!   as a host-pointer import over a whole RAMBlock, and at what granularity.
+//!   The one guest-memory rail on every host, because it is the only primitive
+//!   Linux, Windows and macOS all have — dma-buf is a Linux kernel object with
+//!   no equivalent on the other two. Same rule again: the
+//!   import site branches on it, and a negative rung names the check that
+//!   refused rather than reading as a slow host.
 //! * [`DriverQuirk`] — the only place driver identity may change behavior.
 //!
 //! **Vulkan 1.2 is the baseline on every supported host.** See [`api_floor`]
-//! for why the API version is a floor check and nothing more; `gate.rs` scans
-//! the crate to keep it true.
+//! for why the API version is a floor check and nothing more. Nothing enforces
+//! it automatically — a 1.3-core feature struct or promoted entry point must be
+//! caught in review.
 //!
 //! # Rules for adding a capability gate
 //!
@@ -37,12 +46,12 @@
 pub mod api_floor;
 pub mod device_features;
 pub mod device_select;
+pub mod host_pointer;
+pub mod linear_sampled;
 pub mod memory_topology;
 
-pub use device_select::{rank_physical_device, select_physical_device};
-pub use memory_topology::{
-    MappedMemoryKind, MemoryClass, MemoryProfile, MemoryTopology, TopologySignal,
-};
+pub(crate) use host_pointer::{HostPointerCaps, HostPointerImport};
+pub(crate) use memory_topology::{MappedMemoryKind, MemoryClass, MemoryProfile};
 
 use ash::vk;
 
@@ -79,6 +88,11 @@ impl DriverQuirk {
 pub struct HostGpuCaps {
     pub memory: MemoryProfile,
     pub quirks: DriverQuirk,
+    /// Whether guest RAM may be imported as `VkDeviceMemory` through a host
+    /// pointer over a whole RAMBlock, and at what granularity. Read by
+    /// `runtime::guest_ram_map` through the granularity latch, by the import
+    /// site, and by nothing else.
+    pub host_pointer: HostPointerCaps,
     /// `VK_KHR_portability_subset` was advertised. Kept for the selection log
     /// line and for constructing [`DriverQuirk`] — never gate behavior on it
     /// directly.
@@ -100,13 +114,15 @@ impl HostGpuCaps {
     /// something the device reported.
     pub fn selection_line(&self, device_name: &str) -> String {
         format!(
-            "vk_caps api={} baseline={} memory={} memory_signal={} device_local_mb={} host_visible_device_local_mb={} portability_subset={} type={:?} name={device_name:?}",
+            "vk_caps api={} baseline={} memory={} memory_signal={} device_local_mb={} host_visible_device_local_mb={} host_pointer_import={} host_pointer_align={} portability_subset={} type={:?} name={device_name:?}",
             api_floor::version_str(self.device_api_version),
             api_floor::version_str(api_floor::MIN_SUPPORTED_API),
             self.memory.topology.slug(),
             self.memory.signal.slug(),
             self.memory.device_local_bytes >> 20,
             self.memory.host_visible_device_local_bytes >> 20,
+            self.host_pointer.rung.slug(),
+            self.host_pointer.min_alignment,
             self.portability_subset,
             self.device_type,
         )
@@ -122,6 +138,10 @@ mod tests {
         HostGpuCaps {
             memory: memory_topology::classify_memory(props),
             quirks: DriverQuirk::default(),
+            host_pointer: HostPointerCaps {
+                rung: HostPointerImport::Supported,
+                min_alignment: 4096,
+            },
             portability_subset: false,
             device_api_version: api,
             device_type: vk::PhysicalDeviceType::DISCRETE_GPU,
@@ -141,6 +161,44 @@ mod tests {
         // The baseline is stated on every line so no reader mistakes the
         // device's reported version for a requirement.
         assert!(line.contains("baseline=1.2"), "{line}");
+    }
+
+    /// The host-pointer rung and its granularity are on the same line, and the
+    /// granularity is there because it is measured rather than assumed: a
+    /// MoltenVK device reports Apple's page size and a Linux driver may report
+    /// more, and "the import refused" and "the import ran at a granularity
+    /// nobody expected" are two different bug reports.
+    #[test]
+    fn the_selection_line_carries_the_host_pointer_rung_and_its_granularity() {
+        let line = caps(vk::API_VERSION_1_2, &fixtures::apple_m3_max()).selection_line("Apple");
+        assert!(line.contains("host_pointer_import=supported"), "{line}");
+        assert!(line.contains("host_pointer_align=4096"), "{line}");
+
+        let mut refused = caps(vk::API_VERSION_1_2, &fixtures::apple_m3_max());
+        refused.host_pointer = HostPointerCaps::default();
+        let line = refused.selection_line("Apple");
+        assert!(line.contains("host_pointer_import=unqueried"), "{line}");
+        // A refused rung carries no granularity, so the line cannot suggest one
+        // an import site could act on.
+        assert!(line.contains("host_pointer_align=0"), "{line}");
+    }
+
+    /// A host that cannot import guest RAM says so on the same line, naming the
+    /// check that refused rather than just the absence. "This host is slow" and
+    /// "this host cannot import guest RAM" are the same bug report, and this is
+    /// the field that separates them without a second boot.
+    #[test]
+    fn the_selection_line_names_the_rung_that_refused_the_import() {
+        let mut c = caps(vk::API_VERSION_1_2, &fixtures::apple_m3_max());
+        c.host_pointer = HostPointerCaps {
+            rung: HostPointerImport::NoHostPointerExtension,
+            min_alignment: 0,
+        };
+        let line = c.selection_line("Apple M3 Max");
+        assert!(
+            line.contains("host_pointer_import=no_host_pointer_extension"),
+            "{line}"
+        );
     }
 
     /// The API version does not change the classification. Getting this wrong is

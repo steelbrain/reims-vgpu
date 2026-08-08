@@ -36,7 +36,7 @@ impl crate::observe::Refusal for FenceStatus {
     /// genuinely-unbound case `AGENTS.md` carves out by name, and the guest polls
     /// it, so logging it would flood.
     ///
-    /// One caveat a reader needs: `exec.rs`'s blit-fence arm remaps
+    /// One caveat a reader needs: `exec`'s blit-fence arm remaps
     /// `BlitStatus::MissingResource` into `Missing`, which is a real failure
     /// rather than an unbound ref. That site logs it through the blit rail's own
     /// reason channel, so it is not silent — but the two meanings do share this

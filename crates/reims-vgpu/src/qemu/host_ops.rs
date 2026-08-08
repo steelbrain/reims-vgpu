@@ -2,9 +2,12 @@
 //!
 //! Pattern mirrors apple-gfx ↔ ParavirtualizedGraphics.framework:
 //! QEMU C owns only the host-service callbacks; Rust owns protocol + drain and
-//! enqueues [`ReimsVgpuHostAction`]s for a QEMU BH to apply on the main loop.
+//! enqueues [`crate::runtime::host::HostAction`]s for a QEMU BH to apply on
+//! the main loop.
 
-use crate::runtime::host::{HostAction, HostActionKind, HostMemory, HostOps, MemError};
+use crate::runtime::host::{
+    GuestRamRegionsError, HostAction, HostActionKind, HostMemory, HostOps, MemError,
+};
 use std::collections::VecDeque;
 use std::os::raw::{c_int, c_void};
 
@@ -46,6 +49,21 @@ pub struct ReimsVgpuHostOps {
     pub unmap_pages: Option<unsafe extern "C" fn(ctx: *mut c_void, ptr: *mut c_void, len: usize)>,
     /// 1 = guest RAM, 0 = not RAM. Optional (None → treat as RAM for unit fixtures).
     pub is_ram_gpa: Option<unsafe extern "C" fn(ctx: *mut c_void, gpa: u64) -> i32>,
+    /// Write at most `max` guest-RAM spans into `out` and return the total this
+    /// host has — a return greater than `max` says the array was short — or a
+    /// negative `REIMS_VGPU_GUEST_RAM_ERR_*`.
+    ///
+    /// The spans are the mappings QEMU already holds over its RAMBlocks, stable
+    /// for the VM's lifetime, so nothing is allocated and nothing is released.
+    /// That is what separates this from `map_pages`, which answers about
+    /// specific pages and on one shim builds a transient view the caller owns.
+    pub guest_ram_regions: Option<
+        unsafe extern "C" fn(
+            ctx: *mut c_void,
+            out: *mut crate::runtime::guest_ram::GuestRamRegion,
+            max: usize,
+        ) -> i32,
+    >,
     /// Schedule the HostAction-delivery BH (pop_action consumer). Safe from any
     /// thread. Distinct from `schedule_bh` (drain-worker wake): prompt actions
     /// (IRQ pulses, cursor moves) must be deliverable mid-drain.
@@ -61,12 +79,12 @@ pub struct ReimsVgpuHostOps {
     /// contiguous run gets the same direct HVA, but a fragmented one gets a
     /// packed `mach_vm_remap` view, and a bare pointer cannot say which it is.
     ///
-    /// This used to also license retaining the pointer inside a cached
-    /// `VK_EXT_external_memory_host` import, which is where the stronger
-    /// promise came from — MMIO could claim 1 only because it never released a
-    /// view at all, so every fragmented map leaked a VA reservation until
-    /// teardown. Nothing imports guest pages now, `unmap_pages` on that shim
-    /// really deallocates, and the flag is back to the narrow claim above.
+    /// It used to also license retaining the pointer inside a cached host-pointer
+    /// import, which is where the stronger promise came from — MMIO could claim
+    /// 1 only because it never released a view at all, so every fragmented map
+    /// leaked a VA reservation until teardown. The GPU rail does not read this
+    /// flag and must not: it imports the spans `guest_ram_regions` names, which
+    /// are RAMBlock mappings neither shim built and neither releases.
     pub map_pages_stable: c_int,
     /// Register `count` page-aligned GPAs as one guest-write-tracked set and
     /// return a non-zero opaque token, or 0 when the host has no dirty bitmap.
@@ -135,6 +153,7 @@ impl ReimsVgpuHostOps {
             guest_write_gen: None,
             guest_written_pages: None,
             is_ram_gpa: None,
+            guest_ram_regions: None,
             notify_actions: None,
         }
     }
@@ -223,61 +242,6 @@ impl crate::observe::Decline for QemuHostDecline {
 impl QemuHostDecline {
     fn emit(self, discriminant: u64) {
         crate::observe::Emit::decline("qemu_host_adapter", &self).fail_once(discriminant);
-    }
-}
-
-/// Typed actions Rust enqueues for the QEMU BH to perform on the main loop.
-///
-/// Discriminants match [`HostActionKind`] and `REIMS_VGPU_HOST_ACTION_*` in the header.
-#[repr(u32)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReimsVgpuHostActionKind {
-    None = 0,
-    IrqGfxPulse = 1,
-    IrqIosfcPulse = 2,
-    ScanoutUpdate = 3,
-    CursorUpdate = 4,
-    Trace = 5,
-    CursorGlyph = 6,
-    // 7 is retired (the removed GL/dmabuf scanout action); the values below are
-    // spelled out so its removal did not renumber the wire.
-    InputKey = 8,
-    InputPointerMove = 9,
-    InputPointerButton = 10,
-    WindowClosed = 11,
-}
-
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct ReimsVgpuHostAction {
-    pub kind: u32,
-    pub a0: u64,
-    pub a1: u64,
-    pub a2: u64,
-    pub a3: u64,
-}
-
-impl Default for ReimsVgpuHostAction {
-    fn default() -> Self {
-        Self {
-            kind: ReimsVgpuHostActionKind::None as u32,
-            a0: 0,
-            a1: 0,
-            a2: 0,
-            a3: 0,
-        }
-    }
-}
-
-impl From<HostAction> for ReimsVgpuHostAction {
-    fn from(a: HostAction) -> Self {
-        Self {
-            kind: a.kind as u32,
-            a0: a.a0,
-            a1: a.a1,
-            a2: a.a2,
-            a3: a.a3,
-        }
     }
 }
 
@@ -379,11 +343,7 @@ impl HostMemory for QemuHost<'_> {
             // does not mark: a fixture's writes are not this device's, and
             // counting them would put test addresses in a set whose entire
             // purpose is to be compared against a live guest's panic.
-            crate::observe::footprint::note_written_range(
-                crate::observe::footprint::Rail::Gpa,
-                gpa,
-                buf.len() as u64,
-            );
+            crate::observe::footprint::note_written_range(gpa, buf.len() as u64);
             Ok(())
         } else {
             Err(Self::callback_decline(
@@ -564,6 +524,51 @@ impl HostOps for QemuHost<'_> {
         self.ops.map_pages_stable != 0
     }
 
+    fn guest_ram_regions(
+        &mut self,
+    ) -> Result<Vec<crate::runtime::guest_ram::GuestRamRegion>, GuestRamRegionsError> {
+        /// Spans the first call asks for.
+        ///
+        /// An x86 machine with a PCI hole has two RAMBlocks and a vmapple one
+        /// has one, so this is already several times the answer. It is a first
+        /// guess and not a bound: a host with more spans reports its total and
+        /// gets asked again at that size, which is why nothing here is a cap
+        /// that could silently import part of the guest's memory.
+        const FIRST_TRY: usize = 8;
+
+        let f = self
+            .ops
+            .guest_ram_regions
+            .ok_or(GuestRamRegionsError::CallbackMissing)?;
+        let mut buf = vec![crate::runtime::guest_ram::GuestRamRegion::default(); FIRST_TRY];
+        // SAFETY: QEMU owns ctx and keeps it valid for the device lifetime;
+        // `buf` is valid for `len` writes of the shared `#[repr(C)]` struct for
+        // the duration of the call.
+        let mut rc = unsafe { f(self.ops.ctx, buf.as_mut_ptr(), buf.len()) };
+        if rc < 0 {
+            return Err(GuestRamRegionsError::from_code(rc));
+        }
+        let mut total = rc as usize;
+        if total > buf.len() {
+            buf.resize(total, crate::runtime::guest_ram::GuestRamRegion::default());
+            // SAFETY: as above, with the array the shim's own total sized.
+            rc = unsafe { f(self.ops.ctx, buf.as_mut_ptr(), buf.len()) };
+            if rc < 0 {
+                return Err(GuestRamRegionsError::from_code(rc));
+            }
+            let retried = rc as usize;
+            if retried > buf.len() {
+                return Err(GuestRamRegionsError::StillTruncated {
+                    total: retried,
+                    capacity: buf.len(),
+                });
+            }
+            total = retried;
+        }
+        buf.truncate(total);
+        Ok(buf)
+    }
+
     fn unmap_pages(&mut self, ptr: usize, len: usize) {
         if ptr == 0 || len == 0 {
             return;
@@ -729,6 +734,160 @@ mod tests {
         0
     }
 
+    /// How many spans [`counting_ram_regions`] claims, and how many times it has
+    /// been asked. Process-global, which the suite's serial convention
+    /// (`--test-threads=1`) makes safe; each test that uses them sets both.
+    static FAKE_RAM_SPANS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    static FAKE_RAM_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    /// A shim with [`FAKE_RAM_SPANS`] spans that honours `max` and reports its
+    /// true total — the contract the header states, including the case where
+    /// the total is larger than the array it was given.
+    unsafe extern "C" fn counting_ram_regions(
+        _ctx: *mut c_void,
+        out: *mut crate::runtime::guest_ram::GuestRamRegion,
+        max: usize,
+    ) -> i32 {
+        use std::sync::atomic::Ordering::Relaxed;
+        FAKE_RAM_CALLS.fetch_add(1, Relaxed);
+        let total = FAKE_RAM_SPANS.load(Relaxed);
+        for i in 0..total.min(max) {
+            // SAFETY: the caller's contract is that `out` is writable for `max`
+            // entries, and `i < max`.
+            unsafe {
+                *out.add(i) = crate::runtime::guest_ram::GuestRamRegion {
+                    gpa_base: (i as u64) << 32,
+                    host_va: 0x7f00_0000_0000 + ((i as u64) << 32),
+                    len: 0x1000,
+                };
+            }
+        }
+        total as i32
+    }
+
+    /// A shim that always claims one more span than it was asked for, whatever
+    /// the array size. The retry cannot converge against it.
+    unsafe extern "C" fn always_short_ram_regions(
+        _ctx: *mut c_void,
+        _out: *mut crate::runtime::guest_ram::GuestRamRegion,
+        max: usize,
+    ) -> i32 {
+        (max + 1) as i32
+    }
+
+    unsafe extern "C" fn no_ram_regions(
+        _ctx: *mut c_void,
+        _out: *mut crate::runtime::guest_ram::GuestRamRegion,
+        _max: usize,
+    ) -> i32 {
+        crate::qemu::abi::REIMS_VGPU_GUEST_RAM_ERR_NO_RAM
+    }
+
+    unsafe extern "C" fn future_code_ram_regions(
+        _ctx: *mut c_void,
+        _out: *mut crate::runtime::guest_ram::GuestRamRegion,
+        _max: usize,
+    ) -> i32 {
+        -99
+    }
+
+    fn ram_regions_with(
+        callback: Option<
+            unsafe extern "C" fn(
+                *mut c_void,
+                *mut crate::runtime::guest_ram::GuestRamRegion,
+                usize,
+            ) -> i32,
+        >,
+    ) -> Result<Vec<crate::runtime::guest_ram::GuestRamRegion>, GuestRamRegionsError> {
+        let mut ops = ReimsVgpuHostOps::null();
+        ops.guest_ram_regions = callback;
+        let mut actions = VecDeque::new();
+        let prompt = parking_lot::Mutex::new(VecDeque::new());
+        QemuHost::new(&ops, &mut actions, &prompt).guest_ram_regions()
+    }
+
+    /// A shim older than v17 has no such callback, and that is a named refusal
+    /// rather than an empty answer. An empty `Vec` would read as "this machine
+    /// has no RAM", which is a different thing to go fix.
+    #[test]
+    fn a_shim_without_the_callback_refuses_by_name() {
+        assert_eq!(
+            ram_regions_with(None),
+            Err(GuestRamRegionsError::CallbackMissing)
+        );
+    }
+
+    /// The ordinary machine: fewer spans than the first array, answered in one
+    /// call. Two calls here would be two address-space walks per boot for
+    /// nothing.
+    #[test]
+    fn a_machine_that_fits_the_first_array_is_asked_once() {
+        use std::sync::atomic::Ordering::Relaxed;
+        FAKE_RAM_SPANS.store(2, Relaxed);
+        FAKE_RAM_CALLS.store(0, Relaxed);
+        let regions = ram_regions_with(Some(counting_ram_regions)).expect("two spans");
+        assert_eq!(regions.len(), 2);
+        assert_eq!(FAKE_RAM_CALLS.load(Relaxed), 1);
+        assert_eq!(regions[0].gpa_base, 0);
+        assert_eq!(regions[1].gpa_base, 1 << 32);
+        assert_eq!(regions[1].host_va, 0x7f00_0000_0000 + (1 << 32));
+    }
+
+    /// More spans than the first array: the caller learns its array was short
+    /// from the total, grows to it, and comes back with every span.
+    ///
+    /// This is the case that must not silently truncate. A device that imported
+    /// the first eight spans and dropped the rest would run the copying rails
+    /// for part of the guest's RAM with nothing in the log saying which part —
+    /// the "no silent caps" rule in `AGENTS.md`, at the one call that decides
+    /// how much of guest memory the GPU can reach at all.
+    #[test]
+    fn a_machine_with_more_spans_than_the_first_array_still_gets_all_of_them() {
+        use std::sync::atomic::Ordering::Relaxed;
+        FAKE_RAM_SPANS.store(21, Relaxed);
+        FAKE_RAM_CALLS.store(0, Relaxed);
+        let regions = ram_regions_with(Some(counting_ram_regions)).expect("21 spans");
+        assert_eq!(regions.len(), 21, "the answer must not be capped");
+        assert_eq!(FAKE_RAM_CALLS.load(Relaxed), 2, "one probe, one full read");
+        assert_eq!(regions[20].gpa_base, 20 << 32);
+        assert!(
+            regions.iter().all(|r| r.len == 0x1000),
+            "the grown array must be filled, not left at its default"
+        );
+    }
+
+    /// A shim whose total keeps growing does not loop and does not truncate: it
+    /// refuses, naming both numbers. RAMBlock mappings do not change, so this is
+    /// a shim defect rather than a race to retry through.
+    #[test]
+    fn a_total_that_never_converges_is_refused_rather_than_retried() {
+        assert_eq!(
+            ram_regions_with(Some(always_short_ram_regions)),
+            // The probe of 8 was answered 9, the retry of 9 answered 10, and
+            // the second answer is where it stops. The numbers reported are the
+            // retry's, which is the pair that shows the total moved.
+            Err(GuestRamRegionsError::StillTruncated {
+                total: 10,
+                capacity: 9,
+            })
+        );
+    }
+
+    /// Each negative code keeps its own check, and a code this build has no name
+    /// for carries the number rather than being folded into a neighbour.
+    #[test]
+    fn each_refusal_code_keeps_its_own_check() {
+        assert_eq!(
+            ram_regions_with(Some(no_ram_regions)),
+            Err(GuestRamRegionsError::NoRam)
+        );
+        assert_eq!(
+            ram_regions_with(Some(future_code_ram_regions)),
+            Err(GuestRamRegionsError::UnknownCode(-99))
+        );
+    }
+
     #[test]
     fn enqueue_routes_prompt_kinds_to_prompt_queue() {
         let ops = ReimsVgpuHostOps::null();
@@ -885,42 +1044,5 @@ mod tests {
         let prompt = parking_lot::Mutex::new(VecDeque::new());
         let mut host = QemuHost::new(&ops, &mut actions, &prompt);
         assert_eq!(host.map_pages(&[0xc000], 0x4000), None);
-    }
-
-    /// The two parallel action-kind enums (runtime `HostActionKind`, consumed by
-    /// `From<HostAction>` via `as u32`, and the FFI `ReimsVgpuHostActionKind` that
-    /// mirrors the C `REIMS_VGPU_HOST_ACTION_*` constants) must share discriminants, or
-    /// a wire-value drift would mislabel actions to the C shim. Locks every kind.
-    #[test]
-    fn action_kind_discriminants_match_ffi_and_wire() {
-        use crate::runtime::host::HostActionKind as K;
-        let pairs = [
-            (K::None, ReimsVgpuHostActionKind::None, 0u32),
-            (K::IrqGfxPulse, ReimsVgpuHostActionKind::IrqGfxPulse, 1),
-            (K::IrqIosfcPulse, ReimsVgpuHostActionKind::IrqIosfcPulse, 2),
-            (K::ScanoutUpdate, ReimsVgpuHostActionKind::ScanoutUpdate, 3),
-            (K::CursorUpdate, ReimsVgpuHostActionKind::CursorUpdate, 4),
-            (K::Trace, ReimsVgpuHostActionKind::Trace, 5),
-            (K::CursorGlyph, ReimsVgpuHostActionKind::CursorGlyph, 6),
-            // 7 is a retired wire value (the removed GL/dmabuf scanout action).
-            // The jump from 6 to 8 is deliberate: the input kinds keep the
-            // values the C shim already dispatches on.
-            (K::InputKey, ReimsVgpuHostActionKind::InputKey, 8),
-            (
-                K::InputPointerMove,
-                ReimsVgpuHostActionKind::InputPointerMove,
-                9,
-            ),
-            (
-                K::InputPointerButton,
-                ReimsVgpuHostActionKind::InputPointerButton,
-                10,
-            ),
-            (K::WindowClosed, ReimsVgpuHostActionKind::WindowClosed, 11),
-        ];
-        for (k, ak, wire) in pairs {
-            assert_eq!(k as u32, wire);
-            assert_eq!(ak as u32, wire);
-        }
     }
 }

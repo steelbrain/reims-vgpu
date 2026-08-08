@@ -1,36 +1,61 @@
 //! Read task GPU-virtual addresses via the task page directory.
 //!
-//! Thin wrapper over [`crate::contract::gva_resolve`] + [`HostMemory`].
+//! The device's adapter over `reims_vgpu_paging`: the walk, the span cutting
+//! and the geometry table live there, and what this module adds is the three
+//! things that crate structurally cannot see — the device's [`TaskTable`], its
+//! [`HostMemory`] (as the [`HostPhys`] seam), and the mapping of the walk's
+//! typed refusals onto [`MemError`] and the failure channel.
+//!
 //! Geometry always requires an explicit create-time page_shift (12 = x86_64,
 //! 14 = arm64e). There is no arm-default overload — callers must choose.
 
-use crate::contract::gva_resolve::{
-    read_task_root, resolve_status_name, translate_root, Cache, Geometry, PhysReader,
-    ResolveStatus, Task, ARM64E_GEOMETRY, X86_64_GEOMETRY,
-};
-use crate::model::TaskEntry;
+use crate::model::{TaskEntry, TaskTable};
 use crate::runtime::host::{HostMemory, MemError};
+use reims_vgpu_paging::resolve::{
+    geometry_for_page_shift, read_task_root, resolve_status_name, translate_root, ResolveStatus,
+    Task,
+};
+use reims_vgpu_paging::span::{visit_span_chunks, walk_span, SpanRefusal};
+use reims_vgpu_wire::mem::GuestMemory;
 
-struct HostPhys<'a, M: HostMemory>(&'a M);
-
-impl<M: HostMemory> PhysReader for HostPhys<'_, M> {
-    fn read_phys(&self, gpa: u64, dst: &mut [u8]) -> bool {
-        self.0.read_gpa(gpa, dst).is_ok()
+/// A span refusal as this device's memory error.
+///
+/// One spelling, because every rail that reads or writes bytes across a span
+/// ends here and each would otherwise decide for itself which refusals mean
+/// "the directory did not read", which mean "the walk refused", and which mean
+/// "that address does not translate".
+///
+/// A [`SpanRefusal::Page`] is the last of those: the walk ran and the guest's
+/// own table had no mapping, so the status is about the address. A
+/// [`SpanRefusal::Setup`] is one of the first two, and which one is the whole
+/// content of that arm — `ErrZeroRootPfn` and `ErrZeroDepth` are the walk's
+/// answer about a directory it *could* read, and everything else there is a
+/// failure to get as far as the directory at all.
+pub(crate) fn span_refusal_error(refusal: SpanRefusal) -> MemError {
+    match refusal {
+        SpanRefusal::Setup(
+            status @ (ResolveStatus::ErrZeroRootPfn | ResolveStatus::ErrZeroDepth),
+        ) => MemError::Unresolved(status),
+        SpanRefusal::Setup(_) => MemError::TaskRootRead,
+        SpanRefusal::Page(status) => MemError::Unresolved(status),
     }
 }
 
-/// Select page-table geometry for a known guest page size.
+/// [`HostMemory`]'s guest-physical reads as the wire crate's guest-memory
+/// seam. One address space — guest-physical — per that trait's hard rule.
 ///
-/// Only 12 (x86_64) and 14 (arm64e) are valid. Unknown shifts return `None`
-/// (no silent arm fallback).
-#[inline]
-pub fn geometry_for_page_shift(page_shift: u32) -> Option<&'static Geometry> {
-    if page_shift == X86_64_GEOMETRY.page_shift {
-        Some(&X86_64_GEOMETRY)
-    } else if page_shift == ARM64E_GEOMETRY.page_shift {
-        Some(&ARM64E_GEOMETRY)
-    } else {
-        None
+/// The one spelling in the crate. There were two, and the second was declared
+/// inside a function body in `gva_view`, which is how it stayed invisible: a
+/// reader of either site saw a complete four-line adapter and no reason to look
+/// for another. They agreed, but nothing made them — and the seam they
+/// implement is the one place where "which address space is this" is decided,
+/// so a copy that grew a second method or read a different accessor would put
+/// two answers in the crate with no diff to catch it.
+pub(crate) struct HostPhys<'a, M: HostMemory>(pub &'a M);
+
+impl<M: HostMemory> GuestMemory for HostPhys<'_, M> {
+    fn read_at(&self, gpa: u64, dst: &mut [u8]) -> bool {
+        self.0.read_gpa(gpa, dst).is_ok()
     }
 }
 
@@ -56,28 +81,26 @@ pub fn read_task_gva<M: HostMemory>(
         active: true,
         directory_pfn: task.directory_pfn,
     };
-    let root = read_task_root(&reader, &gr_task, geom).map_err(|_| MemError::TaskRootRead)?;
-    let mut cache = Cache::default();
-    let mut filled = 0usize;
-    while filled < buf.len() {
-        let cur = gva.saturating_add(filled as u64);
-        let t = translate_root(
-            &reader,
-            geom,
-            root.root_pfn,
-            root.depth,
-            cur,
-            Some(&mut cache),
-        );
-        if t.status != ResolveStatus::Ok {
-            return Err(MemError::Unresolved(t.status));
+    // Streams rather than collecting the chunks first: this sits one level
+    // below per-row blit loops, and a read that resolves to a single page —
+    // which most of them do — would otherwise allocate a one-element Vec per
+    // row. The write path cannot do the same, because the walk holds the host
+    // shared and the write needs it exclusively.
+    let mut result: Result<(), MemError> = Ok(());
+    visit_span_chunks(&reader, geom, &gr_task, gva, buf.len(), &mut |chunk| {
+        match host.read_gpa(chunk.gpa, &mut buf[chunk.range()]) {
+            Ok(()) => true,
+            Err(e) => {
+                // The host's own error, not a walk status: the address resolved
+                // and the transaction is what failed, and which transaction it
+                // was is the finding.
+                result = Err(e);
+                false
+            }
         }
-        let page_left = geom.page_size as u64 - (cur & geom.page_offset_mask as u64);
-        let n = (buf.len() - filled).min(page_left as usize);
-        host.read_gpa(t.gpa, &mut buf[filled..filled + n])?;
-        filled += n;
-    }
-    Ok(())
+    })
+    .map_err(span_refusal_error)?;
+    result
 }
 
 /// Read `[gva, gva+len)` under the task the guest named. **That task, or an
@@ -105,22 +128,44 @@ pub fn read_task_gva<M: HostMemory>(
 #[track_caller]
 pub fn read_task_gva_by_id<M: HostMemory>(
     host: &M,
-    tasks: &[TaskEntry],
+    tasks: &TaskTable,
     task_id: u32,
     gva: u64,
     buf: &mut [u8],
     page_shift: u32,
 ) -> Result<(), MemError> {
-    let named = if (task_id as usize) < tasks.len() {
-        match read_task_gva(host, &tasks[task_id as usize], gva, buf, page_shift) {
-            Ok(()) => return Ok(()),
-            Err(e) => e,
-        }
-    } else {
-        MemError::NoSuchTask
+    let r = try_read_task_gva_by_id(host, tasks, task_id, gva, buf, page_shift);
+    if let Err(named) = r {
+        note_read_refusal(task_id, gva, named);
+    }
+    r
+}
+
+/// [`read_task_gva_by_id`] without the refusal line, for a caller whose miss is
+/// an **answer** rather than a failure.
+///
+/// There is exactly one such shape in this device and it is worth naming,
+/// because using the loud read for it put 18 lines per boot on the fail channel
+/// that meant nothing. `objects::type4_probe_order` walks the live tasks asking
+/// "does this one own surface N?", and a task that does not own it has no entry
+/// at that slot — so the walk *must* miss on every task before the owner. The
+/// miss is how the search works.
+///
+/// This is not a way to quieten a noisy path. The caller has to be able to say
+/// what the miss means, which is why it is a second function rather than a flag:
+/// a read whose failure the caller cannot interpret must stay on the loud one.
+pub fn try_read_task_gva_by_id<M: HostMemory>(
+    host: &M,
+    tasks: &TaskTable,
+    task_id: u32,
+    gva: u64,
+    buf: &mut [u8],
+    page_shift: u32,
+) -> Result<(), MemError> {
+    let Some(task) = tasks.get(task_id) else {
+        return Err(MemError::NoSuchTask);
     };
-    note_read_refusal(task_id, gva, named);
-    Err(named)
+    read_task_gva(host, task, gva, buf, page_shift)
 }
 
 /// Record a refused read, latched per `(reason, task, site)`.
@@ -156,6 +201,21 @@ fn note_read_refusal(task_id: u32, gva: u64, named: MemError) {
 /// this crate writes arm64e and treats a failed write as a broken fixture
 /// rather than a result, which is why the assertion lives here instead of at
 /// each call site.
+///
+/// # The `#[cfg(test)]` is the enforcement — do not remove it
+///
+/// "Product code must not call a helper with a page shift baked into its name"
+/// is not a rule a reader has to hold, and it is not something to go looking
+/// for: this gate and the one on [`define_task_pages_arm64e`] are the only two
+/// arch-fixed functions in the crate, and behind them a product call is a
+/// `cannot find function` from rustc rather than a finding. `contract::gva`
+/// exposes the arch-fixed *constants* ungated, which is fine — a shift is
+/// picked from `state.page_shift` at the call site, and a constant cannot
+/// silently walk a page table at the wrong stride the way a helper can.
+///
+/// Ungating either one to share it with an integration test would take the
+/// enforcement away and leave nothing, so a caller outside the crate is a
+/// reason to move the fixture, not to widen the gate.
 #[cfg(test)]
 #[track_caller]
 pub fn write_task_gva_arm64e<M: HostMemory>(host: &mut M, task: &TaskEntry, gva: u64, buf: &[u8]) {
@@ -203,7 +263,7 @@ pub fn define_task_pages_arm64e(
         st32(&mut pte, pfn);
         let _ = host.write_gpa(root_gpa + (i as u64) * 4, &pte);
     }
-    assert!(state.define_task(1, 0x1000, dir_pfn));
+    state.define_task(1, 0x1000, dir_pfn);
 }
 
 /// Translate `gva` under `task` and write `buf` into guest RAM via `write_gpa`.
@@ -229,32 +289,17 @@ pub fn write_task_gva<M: HostMemory>(
         active: true,
         directory_pfn: task.directory_pfn,
     };
-    let root = {
+    // Resolve first, then write: the walk borrows the host to read page tables
+    // and the writes need it mutably, so the two cannot interleave. The
+    // collecting form of the cutter has this one caller, so its import is here
+    // rather than at the module head where it would be dead on a product build.
+    use reims_vgpu_paging::span::span_chunks;
+    let chunks = {
         let reader = HostPhys(&*host);
-        read_task_root(&reader, &gr_task, geom).map_err(|_| MemError::TaskRootRead)?
+        span_chunks(&reader, geom, &gr_task, gva, buf.len()).map_err(span_refusal_error)?
     };
-    let mut cache = Cache::default();
-    let mut written = 0usize;
-    while written < buf.len() {
-        let cur = gva.saturating_add(written as u64);
-        let t = {
-            let reader = HostPhys(&*host);
-            translate_root(
-                &reader,
-                geom,
-                root.root_pfn,
-                root.depth,
-                cur,
-                Some(&mut cache),
-            )
-        };
-        if t.status != ResolveStatus::Ok {
-            return Err(MemError::Unresolved(t.status));
-        }
-        let page_left = geom.page_size as u64 - (cur & geom.page_offset_mask as u64);
-        let n = (buf.len() - written).min(page_left as usize);
-        host.write_gpa(t.gpa, &buf[written..written + n])?;
-        written += n;
+    for chunk in chunks {
+        host.write_gpa(chunk.gpa, &buf[chunk.range()])?;
     }
     Ok(())
 }
@@ -262,7 +307,9 @@ pub fn write_task_gva<M: HostMemory>(
 /// `file:line` of whoever called the `#[track_caller]` function above this one.
 ///
 /// Rendered as the repo-relative tail so the field stays short enough to sit on
-/// an always-on line: `runtime/blit_exec.rs:1039`.
+/// an always-on line: `runtime/blit_exec/mod.rs:1039`. The tail is whatever
+/// `Location::file()` gives after `/src/`, so a module that becomes a
+/// directory changes what this field reads — as `blit_exec` just did.
 #[track_caller]
 fn via_caller() -> String {
     let loc = std::panic::Location::caller();
@@ -300,26 +347,17 @@ fn latch_key(task_id: u32, other: u32, loc: &std::panic::Location<'_>) -> u64 {
 /// one translate rather than a walk of the whole span.
 pub fn any_task_gva_page_resolves<M: HostMemory>(
     host: &M,
-    tasks: &[TaskEntry],
+    tasks: &TaskTable,
     task_id: u32,
     gva: u64,
     span: u64,
     page_shift: u32,
 ) -> bool {
     let mut found = false;
-    visit_task_gva_page_gpas(
-        host,
-        tasks,
-        task_id,
-        gva,
-        span.max(1),
-        page_shift,
-        1,
-        &mut |_| {
-            found = true;
-            false
-        },
-    );
+    visit_task_gva_page_gpas(host, tasks, task_id, gva, span.max(1), page_shift, &mut |_| {
+        found = true;
+        false
+    });
     found
 }
 
@@ -329,7 +367,8 @@ pub fn any_task_gva_page_resolves<M: HostMemory>(
 /// packed GPA runs ([`crate::runtime::gva_view::write_span_within`]). Fails closed when
 /// any page is unmapped or a run cannot be mapped — that walk is the whole
 /// bound on this write. Always-on: `gva_write fail reason=…`, carrying the
-/// check `write_span` actually refused on rather than a reason chosen here.
+/// check `write_span_within` actually refused on rather than a reason chosen
+/// here.
 ///
 /// `#[track_caller]` so the always-on lines can name **which** of the fifteen
 /// product call sites issued the write. The reason and the writer were both
@@ -337,17 +376,6 @@ pub fn any_task_gva_page_resolves<M: HostMemory>(
 /// and a length, and finding the code that produced them meant guessing from
 /// the size. Reading `Location::caller()` keeps that a reading — the callee
 /// asks who called it, rather than each caller passing a label it chose.
-#[track_caller]
-pub fn write_task_gva_product<H: HostMemory + crate::runtime::host::HostOps>(
-    state: &mut crate::model::DeviceState,
-    host: &mut H,
-    task_id: u32,
-    gva: u64,
-    buf: &[u8],
-) -> Result<(), MemError> {
-    write_task_gva_product_within(state, host, task_id, gva, buf, None)
-}
-
 /// The guest pages a row loop's destination span resolves to, taken before the
 /// loop that writes them.
 ///
@@ -399,6 +427,36 @@ pub fn dest_window<M: HostMemory>(
 /// is executing. It is `Some` only where the write is landing content that was
 /// captured earlier against a page set, which is the one case where the live
 /// page table answers a different question from the one that matters.
+///
+/// # Every row loop passes `Some`, and there is no shorter way to say it
+///
+/// A loop that re-derives its destination on each row must capture
+/// [`dest_window`] once, before the loop, and pass it here every iteration. The
+/// pages `gva + 8000 * stride` names at the end of a full-screen copy need not
+/// be the pages that expression named at the start, and an unbounded write
+/// reports success while painting whatever the guest handed those pages to next
+/// — `a_blit_destination_is_bounded_against_a_guest_that_repoints_it_mid_copy`
+/// is that failure written down.
+///
+/// This function used to have a five-argument wrapper, `write_task_gva_product`,
+/// that supplied `None` for you. Two row loops drifted onto it — `blit_exec`'s
+/// staged texture-to-buffer arm and `mipmap`'s level writeback — each surrounded
+/// by siblings doing it right, because the two spellings were one suffix apart
+/// and the wrong one was shorter and invisible in review.
+///
+/// A `#[cfg(test)]` scan over four hand-listed module directories used to guard
+/// that. It was a source-grep scanner of the kind `AGENTS.md` bans, its own doc
+/// conceded the rule "cannot be spelled reliably from source", and its watched
+/// list could not see the callers outside those four modules at all. Deleting
+/// the wrapper is the structural replacement: no shorter spelling is left to
+/// drift onto, every call site states its authority as an argument, and the old
+/// spelling is now a compile error rather than a scan that a newly-added
+/// directory silently escapes.
+///
+/// What that does **not** do is prove a given `Some` names the right window, or
+/// that a loop captured it outside itself. That much is unenforced, and
+/// honestly so — which `AGENTS.md` prefers to a scanner reporting success over a
+/// population it cannot see.
 #[track_caller]
 pub fn write_task_gva_product_within<H: HostMemory + crate::runtime::host::HostOps>(
     state: &mut crate::model::DeviceState,
@@ -430,12 +488,10 @@ pub fn write_task_gva_product_within<H: HostMemory + crate::runtime::host::HostO
 /// same selection as [`read_task_gva_by_id`] and
 /// [`crate::runtime::gva_view::write_span_within`]'s resolver — and call `visit` with
 /// each page-aligned GPA. Stops early when `visit` returns `false`.
-/// `stride_pages` visits every Nth page plus always the last (1 = every page);
-/// callers trade probe density against walk cost.
 ///
 /// This is a lookup, not a validator: pages that fail to translate are
 /// skipped silently — the content read that follows fails (and fail-logs) on
-/// its own terms. One page-walk cache and one root read span the whole range.
+/// its own terms. One root read and one descent span the whole range.
 ///
 /// **The named task, or no pages.** This was the last of four sites that fell
 /// back to `task_id >> 1` when the named slot had no page table to walk. The
@@ -447,8 +503,8 @@ pub fn write_task_gva_product_within<H: HostMemory + crate::runtime::host::HostO
 /// some *other* live task whose table happens to have something mapped there.
 ///
 /// Here the substitution was invisible rather than merely wrong, because
-/// `storage_flush::deferred_pages_still_ours` — the drift guard that decides
-/// whether a deferred window may still be written to guest RAM — re-resolves
+/// the page-drift guard that decides whether a resolved span may still be
+/// written to guest RAM re-resolves
 /// through *this* function with the *same* task id the window was armed under.
 /// A window indexed under the neighbour's table was therefore re-indexed under
 /// the neighbour's table, the two sets matched, and the guard reported "still
@@ -458,44 +514,21 @@ pub fn write_task_gva_product_within<H: HostMemory + crate::runtime::host::HostO
 /// builder and the deferred-Store arm both compare the page count against the
 /// span and decline, and the compute rail reports its count as `pages=` on an
 /// always-on line.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the visitor API exposes task, span, page geometry, and callback state explicitly"
-)]
 pub fn visit_task_gva_page_gpas<M: HostMemory>(
     host: &M,
-    tasks: &[TaskEntry],
+    tasks: &TaskTable,
     task_id: u32,
     gva: u64,
     span: u64,
     page_shift: u32,
-    stride_pages: u64,
     visit: &mut dyn FnMut(u64) -> bool,
 ) {
-    visit_task_gva_pages(
-        host,
-        tasks,
-        task_id,
-        gva,
-        span,
-        page_shift,
-        stride_pages,
-        &mut |gpa| match gpa {
+    visit_task_gva_pages(host, tasks, task_id, gva, span, page_shift, &mut |gpa| {
+        match gpa {
             Some(gpa) => visit(gpa),
             None => true,
-        },
-    );
-}
-
-/// How many guest pages `[gva, gva+span)` touches, given `page_size`.
-///
-/// The `gva % page_size` term is the whole content: a span that starts
-/// mid-page reaches one page further than its length alone implies. Callers
-/// compare a walk's result against this to decide whether the *whole* span
-/// resolved, and getting it wrong reads as "fully covered" for exactly the
-/// windows that straddle a page boundary — which is most of them.
-pub fn pages_spanned(gva: u64, span: u64, page_size: u64) -> u64 {
-    ((gva % page_size) + span).div_ceil(page_size)
+        }
+    });
 }
 
 /// The resolved page GPAs of `[gva, gva+span)` under `task_id`'s page table, in
@@ -503,18 +536,19 @@ pub fn pages_spanned(gva: u64, span: u64, page_size: u64) -> u64 {
 ///
 /// The ordered form, for callers that walk the result as a window —
 /// neighbouring entries differing by exactly one page is what lets a gather
-/// coalesce them. Compare `len()` against [`pages_spanned`] to learn whether
+/// coalesce them. Compare `len()` against
+/// [`reims_vgpu_paging::span::pages_spanned`] to learn whether
 /// anything was dropped.
 pub fn task_gva_page_gpas<M: HostMemory>(
     host: &M,
-    tasks: &[TaskEntry],
+    tasks: &TaskTable,
     task_id: u32,
     gva: u64,
     span: u64,
     page_shift: u32,
 ) -> Vec<u64> {
     let mut out = Vec::new();
-    visit_task_gva_page_gpas(host, tasks, task_id, gva, span, page_shift, 1, &mut |gpa| {
+    visit_task_gva_page_gpas(host, tasks, task_id, gva, span, page_shift, &mut |gpa| {
         out.push(gpa);
         true
     });
@@ -526,49 +560,42 @@ pub fn task_gva_page_gpas<M: HostMemory>(
 /// The set form, for callers that only ask "is this page one of mine?" — the
 /// deferred-window page indexes and the blit/Store destination bounds. Order
 /// is not preserved and repeats collapse, so `len()` is a lower bound on the
-/// pages walked; that is what every caller compares against [`pages_spanned`].
+/// pages walked; that is what every caller compares against
+/// [`reims_vgpu_paging::span::pages_spanned`].
 pub fn task_gva_page_gpa_set<M: HostMemory>(
     host: &M,
-    tasks: &[TaskEntry],
+    tasks: &TaskTable,
     task_id: u32,
     gva: u64,
     span: u64,
     page_shift: u32,
 ) -> std::collections::HashSet<u64> {
     let mut out = std::collections::HashSet::new();
-    visit_task_gva_page_gpas(host, tasks, task_id, gva, span, page_shift, 1, &mut |gpa| {
+    visit_task_gva_page_gpas(host, tasks, task_id, gva, span, page_shift, &mut |gpa| {
         out.insert(gpa);
         true
     });
     out
 }
 
-/// Shared page-table walk behind [`visit_task_gva_page_gpas`]: one root read and
-/// one walk cache for the whole range, visiting every `stride_pages`-th page
-/// plus the exact last page. Reports an unresolved page as `None` rather than
-/// dropping it, which is what a caller recording *which* pages it read needs.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the visitor API exposes task, span, page geometry, and callback state explicitly"
-)]
+/// Shared page-table walk behind [`visit_task_gva_page_gpas`]: one root read
+/// and one descent for the whole range, visiting every page in order. Reports
+/// an unresolved page as `None` rather than dropping it, which is what a caller
+/// recording *which* pages it read needs.
 fn visit_task_gva_pages<M: HostMemory>(
     host: &M,
-    tasks: &[TaskEntry],
+    tasks: &TaskTable,
     task_id: u32,
     gva: u64,
     span: u64,
     page_shift: u32,
-    stride_pages: u64,
     visit: &mut dyn FnMut(Option<u64>) -> bool,
 ) {
-    if span == 0 || stride_pages == 0 {
-        return;
-    }
     let Some(geom) = geometry_for_page_shift(page_shift) else {
         return;
     };
     let reader = HostPhys(host);
-    let Some(task) = tasks.get(task_id as usize) else {
+    let Some(task) = tasks.get(task_id) else {
         return;
     };
     if !task.active || task.directory_pfn == 0 {
@@ -578,34 +605,43 @@ fn visit_task_gva_pages<M: HostMemory>(
         active: true,
         directory_pfn: task.directory_pfn,
     };
-    let Ok(root) = read_task_root(&reader, &gr_task, geom) else {
-        return;
-    };
-    let page = geom.page_size as u64;
-    let first = gva & !(page - 1);
-    let last = gva.saturating_add(span - 1) & !(page - 1);
-    let step = page.saturating_mul(stride_pages);
-    let mut cache = Cache::default();
-    let mut cur = first;
-    loop {
-        let t = translate_root(
-            &reader,
-            geom,
-            root.root_pfn,
-            root.depth,
-            cur,
-            Some(&mut cache),
-        );
-        let resolved = (t.status == ResolveStatus::Ok).then(|| t.gpa & !(page - 1));
-        if !visit(resolved) {
-            return;
-        }
-        if cur == last {
-            return;
-        }
-        // Always end on the exact last page so span tails are covered.
-        cur = cur.saturating_add(step).min(last);
-    }
+    // Every page of the run, which is the shape the licence check and the
+    // guest-run resolvers ask for. One descent is shared across the pages whose
+    // upper indices match, instead of `depth` guest reads per page.
+    //
+    // A setup refusal visits nothing and is dropped rather than reported: this
+    // function's contract is that a caller compares what it saw against what it
+    // expected, so it is the only one of the span readers for which "no pages"
+    // is an answer rather than an error.
+    let _ = walk_span(&reader, geom, &gr_task, gva, span, &mut |_, r| {
+        visit(r.ok())
+    });
+}
+
+/// Every page of `[gva, gva+span)` in order, resolved through one root read and
+/// one descent, with `None` for a page the table cannot translate.
+///
+/// [`visit_task_gva_page_gpas`] drops the unresolved pages; a caller checking a
+/// cached page list against the live table needs them, because "page 40 does not
+/// translate" and "page 40 translates elsewhere" are different findings and only
+/// one of them is about the guest. Stride is fixed at one page for the same
+/// reason: a check that samples cannot conclude anything about the pages it
+/// skipped.
+///
+/// The visitor stops when `visit` answers `false`, and it visits nothing at all
+/// for an inactive task, an absent directory or an unwalkable page geometry — so
+/// a caller must compare what it saw against what it expected rather than
+/// treating a quiet return as agreement.
+pub fn visit_task_gva_pages_in_order<M: HostMemory>(
+    host: &M,
+    tasks: &TaskTable,
+    task_id: u32,
+    gva: u64,
+    span: u64,
+    page_shift: u32,
+    visit: &mut dyn FnMut(Option<u64>) -> bool,
+) {
+    visit_task_gva_pages(host, tasks, task_id, gva, span, page_shift, visit);
 }
 
 /// Translate one GVA to a GPA under the task directory (single page).
@@ -624,12 +660,20 @@ pub fn translate_task_gva<M: HostMemory>(
         active: true,
         directory_pfn: task.directory_pfn,
     };
-    let root = read_task_root(&reader, &gr_task, geom).ok()?;
-    let t = translate_root(&reader, geom, root.root_pfn, root.depth, gva, None);
-    if t.status != ResolveStatus::Ok {
-        return None;
-    }
-    Some(t.gpa)
+    // A one-byte span, so the single chunk's `gpa` is this GVA's own address —
+    // page base plus its offset within the page. Going through the span cutter
+    // rather than `read_task_root` + `translate_root` by hand is what keeps the
+    // zero-root and zero-depth refusals here identical to the ones every other
+    // rail gets: written out at this call site they were a fifth copy, and this
+    // copy was the one that did not have them, reaching the same answer only
+    // because the descent refuses a zero root a second time further down.
+    let mut gpa = None;
+    visit_span_chunks(&reader, geom, &gr_task, gva, 1, &mut |chunk| {
+        gpa = Some(chunk.gpa);
+        false
+    })
+    .ok()?;
+    gpa
 }
 
 /// One-line walk diagnosis for a single task slot (measure-only; no product gates).
@@ -672,7 +716,7 @@ pub fn diagnose_task_slot<M: HostMemory>(
             );
         }
     };
-    let t = translate_root(&reader, geom, root.root_pfn, root.depth, gva, None);
+    let t = translate_root(&reader, geom, root.root_pfn, root.depth, gva);
     if t.status == ResolveStatus::Ok {
         format!(
             "tid={task_id} act=1 dir={:#x} root={:#x} depth={} st=ok gpa={:#x} leaf_pfn={:#x}",
@@ -697,7 +741,7 @@ pub fn diagnose_task_slot<M: HostMemory>(
 /// Compact multi-clause string for one fail-log line (MapMemory2 / stage Unmapped).
 pub fn diagnose_gva_walk<M: HostMemory>(
     host: &M,
-    tasks: &[TaskEntry],
+    tasks: &TaskTable,
     task_id: u32,
     gva: u64,
     page_shift: u32,
@@ -708,32 +752,28 @@ pub fn diagnose_gva_walk<M: HostMemory>(
         if !tried.insert(id) {
             return;
         }
-        if (id as usize) >= tasks.len() {
-            parts.push(format!("tid={id} st=oob"));
+        let Some(task) = tasks.get(id) else {
+            // No task under this id at all. `st=undefined` rather than the
+            // `st=oob` this printed against the old fixed array: there is no
+            // range to be outside of now, and the two say different things —
+            // one was "the id is too large", this is "the guest never defined
+            // it", which is the only way to reach here.
+            parts.push(format!("tid={id} st=undefined"));
             return;
-        }
-        parts.push(diagnose_task_slot(
-            host,
-            &tasks[id as usize],
-            id,
-            gva,
-            page_shift,
-        ));
+        };
+        parts.push(diagnose_task_slot(host, task, id, gva, page_shift));
     };
     try_id(task_id, &mut parts, &mut tried);
     try_id(task_id >> 1, &mut parts, &mut tried);
     // Peer scan: active tasks with a directory (cap 4 extras) — catches wrong-task walks.
-    let mut peers = 0u32;
-    for (i, t) in tasks.iter().enumerate() {
-        if peers >= 4 {
-            break;
-        }
-        let id = i as u32;
-        if tried.contains(&id) || !t.active || t.directory_pfn == 0 {
-            continue;
-        }
+    let peer_ids: Vec<u32> = tasks
+        .live()
+        .filter(|(id, t)| !tried.contains(id) && t.directory_pfn != 0)
+        .map(|(id, _)| id)
+        .take(4)
+        .collect();
+    for id in peer_ids {
         try_id(id, &mut parts, &mut tried);
-        peers += 1;
     }
     format!(
         "gva={gva:#x} page_shift={page_shift} | {}",
@@ -742,12 +782,9 @@ pub fn diagnose_gva_walk<M: HostMemory>(
 }
 
 /// Snapshot of active task directories (for periodic map census).
-pub fn format_active_tasks(tasks: &[TaskEntry]) -> String {
+pub fn format_active_tasks(tasks: &TaskTable) -> String {
     let mut bits = Vec::new();
-    for (i, t) in tasks.iter().enumerate() {
-        if !t.active {
-            continue;
-        }
+    for (i, t) in tasks.live() {
         bits.push(format!(
             "t{i}:dir={:#x},len={:#x},ol_pfn={:#x},ol_n={}",
             t.directory_pfn, t.length, t.object_list_pfn, t.object_list_count
@@ -766,73 +803,8 @@ mod tests {
     use crate::contract::endian::st32;
     use crate::observe::Decline;
 
-    /// Every guest writer that loops over rows takes [`dest_window`] first.
-    ///
-    /// The bounded/unbounded pair is one character apart at the call site, the
-    /// unbounded form is the shorter one, and the difference is invisible in
-    /// review: `a_blit_destination_is_bounded_against_a_guest_that_repoints_it_mid_copy`
-    /// shows what the unbounded arm does to a guest that re-points the range —
-    /// it reports success and paints a page the command never named. Two row
-    /// loops had drifted onto it (`blit_exec`'s staged texture-to-buffer arm and
-    /// `mipmap`'s level writeback), each surrounded by siblings doing it right.
-    ///
-    /// So this is a gate on the class rather than on those two: a loop writer is
-    /// a `write_task_gva_product` call whose enclosing file also re-derives a
-    /// destination per row, and there is no way to spell that reliably from
-    /// source. What is reliable is that the modules that own row loops must not
-    /// name the unbounded form at all. `drain` is not one of them — its three
-    /// calls are single completion stamps, authorised by the packet being
-    /// retired — and `gva_view`/`compute_exec` name it only from tests.
-    #[test]
-    fn row_loop_writers_take_the_bounded_form() {
-        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/runtime");
-        for relative in [
-            "blit_exec.rs",
-            "mipmap.rs",
-            "mapping_write.rs",
-            "storage_flush.rs",
-        ] {
-            let src = std::fs::read_to_string(root.join(relative))
-                .unwrap_or_else(|e| panic!("{relative}: {e}"));
-            // `_within` is the bounded form and shares this prefix, so match the
-            // open paren that only the unbounded form can present.
-            let unbounded = src.match_indices("write_task_gva_product(").count();
-            assert_eq!(
-                unbounded, 0,
-                "{relative} calls the unbounded write_task_gva_product; a row loop \
-                 that re-resolves its destination must capture dest_window once \
-                 up front and pass it to write_task_gva_product_within"
-            );
-        }
-    }
-
-    /// A span's page count is decided by where it *starts*, not only by how long
-    /// it is.
-    ///
-    /// Four rails compare a walk's page count against this to decide whether the
-    /// whole span resolved. Drop the offset term and a window that straddles a
-    /// page boundary — which is most of them, since a texture row rarely starts
-    /// page-aligned — reports fully covered while missing its last page. The
-    /// gather then hands the GPU a short buffer, which is a wrong frame.
-    #[test]
-    fn pages_spanned_counts_the_page_the_offset_pushes_a_span_into() {
-        const PAGE: u64 = 4096;
-        // Page-aligned: exactly what the length implies.
-        assert_eq!(pages_spanned(0, PAGE, PAGE), 1);
-        assert_eq!(pages_spanned(PAGE * 7, PAGE * 3, PAGE), 3);
-        // Offset by one byte: the same length now reaches one page further.
-        assert_eq!(pages_spanned(1, PAGE, PAGE), 2);
-        assert_eq!(pages_spanned(PAGE * 7 + 1, PAGE * 3, PAGE), 4);
-        // A span wholly inside one page stays at one, wherever it starts.
-        assert_eq!(pages_spanned(PAGE - 1, 1, PAGE), 1);
-        // …and one byte longer crosses.
-        assert_eq!(pages_spanned(PAGE - 1, 2, PAGE), 2);
-        // The arm64 pathway's 16 KiB pages take the same rule.
-        assert_eq!(pages_spanned(16384 * 3 + 5, 16384, 16384), 2);
-    }
-
-    /// The collapse this migration ended: nineteen distinct checks — the walk's
-    /// fifteen plus four of its own — all answered `MemError::Unmapped`, and
+    /// The collapse this migration ended: every distinct check — the walk's own
+    /// and four more here — answered `MemError::Unmapped`, and
     /// `MemError` reached the always-on log at no site in the crate. So a
     /// malformed PTE, a zero root PFN, an inactive task and a genuinely unmapped
     /// GPA were one value, invisibly, on the guest-memory hot path.
@@ -841,7 +813,7 @@ mod tests {
     /// one, because the property that matters is the absence of aliasing.
     #[test]
     fn no_two_guest_memory_checks_answer_with_the_same_reason() {
-        use crate::contract::gva_resolve::ResolveStatus as R;
+        use reims_vgpu_paging::resolve::ResolveStatus as R;
         const WALK: &[R] = &[
             R::ErrArgs,
             R::ErrInactiveTask,
@@ -850,7 +822,6 @@ mod tests {
             R::ErrZeroRootPfn,
             R::ErrZeroDepth,
             R::ErrDepthTooDeep,
-            R::ErrAddressOutOfRange,
             R::ErrPageTableRead,
             R::ErrZeroPfn,
             R::ErrMalformedPte,
@@ -887,7 +858,7 @@ mod tests {
             )
             .collect();
         let total = slugs.len();
-        assert_eq!(total, 32, "12 walk reasons + 20 memory reasons");
+        assert_eq!(total, 31, "11 walk reasons + 20 memory reasons");
         slugs.sort_unstable();
         slugs.dedup();
         assert_eq!(
@@ -930,8 +901,8 @@ mod tests {
         let mut pte = [0u8; 4];
         st32(&mut pte, 4);
         host.write_gpa(root_gpa, &pte).unwrap();
-        let mut tasks: [TaskEntry; 4] = std::array::from_fn(|_| TaskEntry::default());
-        tasks[1] = TaskEntry::define(0x1000, 2);
+        let mut tasks = TaskTable::default();
+        tasks.define(1, TaskEntry::define(0x1000, 2));
         let ok = diagnose_gva_walk(&host, &tasks, 1, 0, PAGE_SHIFT_X86);
         assert!(ok.contains("st=ok"), "{ok}");
         assert!(
@@ -966,7 +937,7 @@ mod tests {
         let _ = host.write_gpa(root_gpa, &d[..4]);
 
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        assert!(state.define_task(1, 0x1000, 2));
+        state.define_task(1, 0x1000, 2);
         let mut buf = [0u8; 4];
         assert!(read_task_gva(&host, &state.tasks[1], 0, &mut buf, PAGE_SHIFT_ARM64E).is_ok());
         assert_eq!(buf, [0xab; 4]);
@@ -996,7 +967,7 @@ mod tests {
         let _ = host.write_gpa(root_gpa, &d[..4]);
 
         let mut state = DeviceState::new(DeviceId(1), page_shift);
-        assert!(state.define_task(1, 0x1000, 2));
+        state.define_task(1, 0x1000, 2);
         let mut buf = [0u8; 4];
         assert!(read_task_gva(&host, &state.tasks[1], 0, &mut buf, page_shift).is_ok());
         assert_eq!(buf, [0xcd; 4]);
@@ -1028,7 +999,8 @@ mod tests {
         let page = 1u64 << PAGE_SHIFT_ARM64E;
 
         assert!(
-            write_task_gva_product(&mut state, &mut host, 1, page, &[1, 2, 3, 4]).is_ok(),
+            write_task_gva_product_within(&mut state, &mut host, 1, page, &[1, 2, 3, 4], None)
+                .is_ok(),
             "the range is mapped for the writing task, so the write lands \
              whatever the guest has or has not notified"
         );
@@ -1039,7 +1011,8 @@ mod tests {
         // its index to the entry count and `4096 * page` aliases index 0, which
         // would have made this assertion pass for the wrong reason.
         assert!(
-            write_task_gva_product(&mut state, &mut host, 1, 10 * page, &[1, 2, 3, 4]).is_err(),
+            write_task_gva_product_within(&mut state, &mut host, 1, 10 * page, &[1, 2, 3, 4], None)
+                .is_err(),
             "unmapped for this task, so the writer fails closed"
         );
     }
@@ -1117,8 +1090,8 @@ mod tests {
         host.write_gpa(root_gpa + 4, &pte).unwrap();
 
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
-        assert!(state.define_task(2, 0x1_0000, 2));
-        assert!(state.define_task(5, 0x1_0000, 9));
+        state.define_task(2, 0x1_0000, 2);
+        state.define_task(5, 0x1_0000, 9);
 
         // The donor really can serve it — otherwise this test would pass for
         // the wrong reason.
@@ -1145,8 +1118,8 @@ mod tests {
     /// the `>> 1` neighbour's table resolves the same address.
     ///
     /// This is the fourth and last `>> 1` arm, and the one whose substitution no
-    /// guard could see: `storage_flush::deferred_pages_still_ours` re-resolves an
-    /// armed window through this same function under the same task id, so a
+    /// guard could see: the page-drift guard re-resolves a resolved span
+    /// through this same function under the same task id, so a
     /// window indexed under the neighbour's table was re-indexed under the
     /// neighbour's table and the drift check reported the pages "still ours".
     ///
@@ -1171,45 +1144,27 @@ mod tests {
         host.write_gpa(root_gpa + 4, &pte).unwrap();
 
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
-        assert!(state.define_task(2, 0x1_0000, 2));
-        assert!(state.define_task(5, 0x1_0000, 0));
+        state.define_task(2, 0x1_0000, 2);
+        state.define_task(5, 0x1_0000, 0);
         assert!(
-            state.tasks[5].active,
+            state.tasks.is_active(5),
             "the slot is live; only the page table is missing"
         );
 
         // The donor really can serve it — otherwise this test would pass for the
         // wrong reason.
         let mut donor = Vec::new();
-        visit_task_gva_page_gpas(
-            &host,
-            &state.tasks,
-            2,
-            0x1000,
-            4,
-            PAGE_SHIFT_X86,
-            1,
-            &mut |gpa| {
-                donor.push(gpa);
-                true
-            },
-        );
+        visit_task_gva_page_gpas(&host, &state.tasks, 2, 0x1000, 4, PAGE_SHIFT_X86, &mut |gpa| {
+            donor.push(gpa);
+            true
+        });
         assert_eq!(donor, vec![data_gpa], "task 2 resolves GVA page 1");
 
         let mut pages = Vec::new();
-        visit_task_gva_page_gpas(
-            &host,
-            &state.tasks,
-            5,
-            0x1000,
-            4,
-            PAGE_SHIFT_X86,
-            1,
-            &mut |gpa| {
-                pages.push(gpa);
-                true
-            },
-        );
+        visit_task_gva_page_gpas(&host, &state.tasks, 5, 0x1000, 4, PAGE_SHIFT_X86, &mut |gpa| {
+            pages.push(gpa);
+            true
+        });
         assert!(
             pages.is_empty(),
             "no neighbour's pages may be indexed under task 5, got {pages:x?}"
@@ -1227,9 +1182,9 @@ mod tests {
     fn a_failed_fallback_read_carries_the_named_tasks_own_refusal() {
         let host = FakeHost::new();
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
-        assert!(state.define_task(6, 0x1_0000, 0));
+        state.define_task(6, 0x1_0000, 0);
         assert!(
-            state.tasks[6].active,
+            state.tasks.is_active(6),
             "the slot is live; only the walk fails"
         );
         let mut buf = [0u8; 4];
@@ -1242,16 +1197,81 @@ mod tests {
         );
     }
 
-    /// A word naming no slot at all still reports `NoSuchTask` — that one IS
+    /// A word naming no task at all still reports `NoSuchTask` — that one IS
     /// the check that refused.
+    ///
+    /// `u32::MAX` rather than "one past the table": there is no table to be past
+    /// now, and an undefined id is the only way to reach this. The largest id
+    /// the wire can carry is the strongest case, and it would have been refused
+    /// by a range check before, which is a different refusal wearing this one's
+    /// name.
+    /// The quiet read must return exactly what the loud one returns.
+    ///
+    /// `try_read_task_gva_by_id` exists so a speculative caller does not put a
+    /// line on the fail channel for a miss that is its answer. That is only
+    /// sound while the two agree on the answer itself — a quiet read that took
+    /// a different path would silence a real refusal instead of an expected
+    /// one, which is the failure this split could introduce and nothing else
+    /// would catch.
     #[test]
-    fn a_fallback_read_for_an_out_of_range_word_still_reports_no_such_task() {
+    fn the_quiet_read_answers_exactly_as_the_reporting_one_does() {
+        let mut host = FakeHost::new();
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let dir_gpa = 2u64 << PAGE_SHIFT_X86;
+        let root_gpa = 3u64 << PAGE_SHIFT_X86;
+        let data_gpa = 4u64 << PAGE_SHIFT_X86;
+        host.map_range(dir_gpa, 0x20, 0);
+        host.map_range(root_gpa, 0x1000, 0);
+        host.map_range(data_gpa, 0x1000, 0);
+        let mut d = [0u8; 8];
+        st32(&mut d[DIRECTORY_ROOT_PFN as usize..], 3);
+        st32(&mut d[DIRECTORY_DEPTH as usize..], 1);
+        host.write_gpa(dir_gpa, &d).unwrap();
+        let mut pte = [0u8; 4];
+        st32(&mut pte, 4);
+        host.write_gpa(root_gpa + 4, &pte).unwrap();
+        host.write_gpa(data_gpa, &[0xab; 8]).unwrap();
+        state.define_task(2, 0x1000, 2);
+
+        for (task, gva, what) in [
+            (2u32, 0x1000u64, "a page the task maps"),
+            (2, 0x2000, "a page the task does not map"),
+            (2, 0, "the null page"),
+            (77, 0x1000, "a task nothing defined"),
+        ] {
+            let mut loud = [0u8; 8];
+            let mut quiet = [0u8; 8];
+            let a = read_task_gva_by_id(&host, &state.tasks, task, gva, &mut loud, PAGE_SHIFT_X86);
+            let b =
+                try_read_task_gva_by_id(&host, &state.tasks, task, gva, &mut quiet, PAGE_SHIFT_X86);
+            assert_eq!(a, b, "verdicts differ on {what}");
+            assert_eq!(loud, quiet, "bytes differ on {what}");
+        }
+
+        // The fixture reads something, so the loop cannot pass by refusing
+        // everything identically.
+        let mut buf = [0u8; 8];
+        assert!(
+            try_read_task_gva_by_id(&host, &state.tasks, 2, 0x1000, &mut buf, PAGE_SHIFT_X86)
+                .is_ok()
+        );
+        assert_eq!(buf, [0xab; 8]);
+    }
+
+    #[test]
+    fn a_read_for_an_undefined_task_word_still_reports_no_such_task() {
         let host = FakeHost::new();
         let state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
         let mut buf = [0u8; 4];
-        let oob = state.tasks.len() as u32 + 4;
-        let err = read_task_gva_by_id(&host, &state.tasks, oob, 0x1000, &mut buf, PAGE_SHIFT_X86)
-            .unwrap_err();
+        let err = read_task_gva_by_id(
+            &host,
+            &state.tasks,
+            u32::MAX,
+            0x1000,
+            &mut buf,
+            PAGE_SHIFT_X86,
+        )
+        .unwrap_err();
         assert_eq!(err, MemError::NoSuchTask);
     }
 }

@@ -6,4 +6,5 @@
 //! Add an export here only when the shim's link line needs it.
 
 pub mod abi;
+pub(crate) mod cstr;
 pub mod host_ops;

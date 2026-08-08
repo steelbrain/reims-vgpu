@@ -34,7 +34,7 @@
 //! each face separately. Every case gives its face a value the other face does
 //! not hold, so a view that swapped them would report a value no case produced.
 //!
-//! `reims-vgpu`'s `decode/resource.rs` reads this record with the same offsets
+//! `reims-vgpu`'s `decode/resource` reads this record with the same offsets
 //! and the same bit assignments. It also names bits 4 and 5 of `depth_state`
 //! `front_stencil_enabled` and `back_stencil_enabled`; see
 //! [`DepthStencilBody::unidentified_state_bits`] for why this crate does not.

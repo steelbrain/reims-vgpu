@@ -15,14 +15,19 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use reims_vgpu::host_window::present::{spawn, Frame, FrameSlot, WindowConfig};
+use reims_vgpu::host_window::present::{spawn, Frame, FrameSlot, WindowConfig, WindowWaker};
 
 fn main() {
     let (w, h) = (960u32, 600u32);
     let frames: FrameSlot = Arc::new(Mutex::new(Some(Arc::new(gradient(w, h, 0)))));
+    // The window sleeps until something says a frame landed, so this stands in
+    // for the device's publisher — without it the gradient would advance only at
+    // the window's backstop rate rather than at the 62 Hz below.
+    let wake = WindowWaker::new();
 
     // Animate the gradient on a helper thread so the window shows live updates.
     let anim = frames.clone();
+    let anim_wake = Arc::clone(&wake);
     let _animator = std::thread::spawn(move || {
         let mut t = 0u32;
         loop {
@@ -30,6 +35,7 @@ fn main() {
             if let Ok(mut slot) = anim.lock() {
                 *slot = Some(Arc::new(gradient(w, h, t)));
             }
+            anim_wake.wake();
             std::thread::sleep(Duration::from_millis(16));
         }
     });
@@ -48,6 +54,7 @@ fn main() {
         on_input,
         frames,
         stop,
+        wake,
     );
     match handle.join() {
         Ok(Ok(())) => println!("window closed"),

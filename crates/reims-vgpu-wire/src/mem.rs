@@ -81,6 +81,27 @@ pub trait GuestMemory {
     }
 }
 
+/// A reference to a `GuestMemory` is one, including `&dyn GuestMemory`.
+///
+/// This is what lets a caller that holds the trait object — the layer above
+/// this crate erases the concrete host type — hand it to the generic walk
+/// without a forwarding wrapper. Every method forwards, including `slice_at`:
+/// dropping to the refusing default here would silently take the copy path for
+/// an implementation that can borrow.
+impl<T: GuestMemory + ?Sized> GuestMemory for &T {
+    fn read_at(&self, addr: u64, out: &mut [u8]) -> bool {
+        (**self).read_at(addr, out)
+    }
+
+    fn slice_at(&self, addr: u64, len: usize) -> Option<&[u8]> {
+        (**self).slice_at(addr, len)
+    }
+
+    fn u32_at(&self, addr: u64) -> Option<u32> {
+        (**self).u32_at(addr)
+    }
+}
+
 /// A `GuestMemory` over a plain byte slice, addressed from zero.
 ///
 /// This is the test double the walk is exercised against, and it is in the
@@ -159,6 +180,21 @@ mod tests {
         }
         assert!(CopyOnly.slice_at(0, 1).is_none());
         assert_eq!(CopyOnly.u32_at(0), Some(0x5a5a_5a5a));
+    }
+
+    /// The reference impl forwards `slice_at` rather than inheriting the
+    /// refusing default — a borrowable implementation must stay borrowable
+    /// through a `&dyn`.
+    #[test]
+    fn a_reference_forwards_all_three_methods() {
+        let backing = [1u8, 2, 3, 4];
+        let mem = SliceMemory::new(&backing);
+        let dyn_mem: &dyn GuestMemory = &mem;
+        let mut out = [0u8; 2];
+        assert!((&dyn_mem).read_at(1, &mut out));
+        assert_eq!(out, [2, 3]);
+        assert_eq!((&dyn_mem).slice_at(0, 4), Some(&backing[..]));
+        assert_eq!((&dyn_mem).u32_at(0), Some(u32::from_le_bytes(backing)));
     }
 
     #[test]

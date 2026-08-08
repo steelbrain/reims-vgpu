@@ -77,6 +77,41 @@ mod tests {
     use super::*;
     use crate::runtime::host::{HostAction, HostActionKind};
 
+    /// The ABI header's button table agrees with this enum, entry for entry.
+    ///
+    /// `shim.h` states the hazard in its own words — "a duplicated button table
+    /// is a table that can drift, and a drift between the two shims is a bug the
+    /// guest sees on exactly one pathway" — and this table is duplicated exactly
+    /// that way: Rust packs the code into `HostAction.a0`, the header names the
+    /// same nine numbers, and `reims_vgpu_shim_input_button` switches on them.
+    /// Nothing compared the two until this test.
+    ///
+    /// A drift does not fail anywhere. It sends a middle-click where the guest
+    /// user right-clicked, or a wheel notch in the wrong direction, and the only
+    /// symptom is a desktop that behaves oddly under the mouse.
+    #[test]
+    fn the_abi_header_agrees_on_the_button_table() {
+        use crate::qemu::abi::header_define as define;
+        for (name, button) in [
+            ("REIMS_VGPU_BUTTON_LEFT", ReimsVgpuButton::Left),
+            ("REIMS_VGPU_BUTTON_MIDDLE", ReimsVgpuButton::Middle),
+            ("REIMS_VGPU_BUTTON_RIGHT", ReimsVgpuButton::Right),
+            ("REIMS_VGPU_BUTTON_WHEEL_UP", ReimsVgpuButton::WheelUp),
+            ("REIMS_VGPU_BUTTON_WHEEL_DOWN", ReimsVgpuButton::WheelDown),
+            ("REIMS_VGPU_BUTTON_SIDE", ReimsVgpuButton::Side),
+            ("REIMS_VGPU_BUTTON_EXTRA", ReimsVgpuButton::Extra),
+            ("REIMS_VGPU_BUTTON_WHEEL_LEFT", ReimsVgpuButton::WheelLeft),
+            ("REIMS_VGPU_BUTTON_WHEEL_RIGHT", ReimsVgpuButton::WheelRight),
+        ] {
+            assert_eq!(
+                define(name),
+                button as u32,
+                "{name} has drifted from ReimsVgpuButton::{button:?}; the shim \
+                 would forward the wrong QEMU InputButton"
+            );
+        }
+    }
+
     /// Every `ReimsVgpuButton` round-trips through its wire value, and `from_wire`
     /// rejects an out-of-range code (no invented fallback button).
     #[test]

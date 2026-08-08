@@ -50,6 +50,7 @@
 #![no_std]
 #![forbid(unsafe_op_in_unsafe_fn)]
 
+pub mod device_desc;
 pub mod le;
 pub mod manifest;
 pub mod mem;

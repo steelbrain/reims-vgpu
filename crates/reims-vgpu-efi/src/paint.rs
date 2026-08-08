@@ -28,17 +28,51 @@ pub const BLT_VIDEO_TO_BUFFER: u32 = 1;
 pub const BLT_BUFFER_TO_VIDEO: u32 = 2;
 pub const BLT_VIDEO_TO_VIDEO: u32 = 3;
 
+/// The bit EFI sets in a `UINTN` to mark a status an error.
+///
+/// UEFI defines `EFI_ERROR` as the high bit of a `UINTN`, so the numeric value
+/// of every error code depends on the pointer width. Spelling
+/// `0x8000_0000_0000_0002` is therefore two mistakes in one number: it is wrong
+/// on a 32-bit firmware, and it is a second, silent copy of "the top bit means
+/// error" that no reader can tell from an arbitrary constant.
+const EFI_ERROR: usize = 1 << (usize::BITS - 1);
+
 /// Subset of EFI_STATUS used by paint (host-testable without the uefi crate).
-#[repr(usize)]
+///
+/// The numbers live in [`GopStatus::efi_code`] rather than in discriminants.
+/// They used to be discriminants of a `#[repr(usize)]` C-like enum, which was
+/// wrong twice: nothing in this crate ever casts the enum to an integer — the
+/// firmware boundary in `gop.rs` matches each variant to a `uefi::Status` by
+/// name — and a discriminant with the high `UINTN` bit set does not fit an
+/// `i32`, so the representation was unportable in service of a conversion that
+/// does not happen.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GopStatus {
-    Success = 0,
+    Success,
     /// EFI_INVALID_PARAMETER
-    InvalidParameter = 0x8000_0000_0000_0002usize,
+    InvalidParameter,
     /// EFI_UNSUPPORTED
-    Unsupported = 0x8000_0000_0000_0003usize,
+    Unsupported,
     /// EFI_DEVICE_ERROR
-    DeviceError = 0x8000_0000_0000_0007usize,
+    DeviceError,
+}
+
+impl GopStatus {
+    /// The `EFI_STATUS` value the UEFI spec gives this status, for the pointer
+    /// width being compiled for.
+    ///
+    /// Nothing in the shipping path calls this — `gop.rs` maps variant to
+    /// `uefi::Status` by name, which is what keeps the two vocabularies from
+    /// agreeing only numerically. It exists so the spec ordinals stay written
+    /// down next to the variants they belong to, and so a test can check them.
+    pub const fn efi_code(self) -> usize {
+        match self {
+            Self::Success => 0,
+            Self::InvalidParameter => EFI_ERROR | 2,
+            Self::Unsupported => EFI_ERROR | 3,
+            Self::DeviceError => EFI_ERROR | 7,
+        }
+    }
 }
 
 /// UEFI `EFI_GRAPHICS_OUTPUT_BLT_PIXEL` — BGRA memory order on little-endian.
@@ -112,10 +146,111 @@ fn rect_in_fb(x: usize, y: usize, w: usize, h: usize) -> bool {
         && h <= FB_H.saturating_sub(y)
 }
 
+/// One Blt's geometry: where it reads, where it writes, and how big.
+///
+/// UEFI passes these six as six arguments, and so does [`blt`], which mirrors
+/// the protocol entry point. Everything below `blt` takes this instead. The six
+/// are all `usize` and the two points are interchangeable at a call site, so
+/// every permutation type-checks — and the interior helpers took them in an
+/// order (`sx, sy, dx, dy, w, h`) that is not the order the protocol lists them
+/// (`sx, sy, dx, dy, w, h, delta` after the operation, but source and
+/// destination swap meaning per operation). Naming them once removes the
+/// permutation, and gives the two rules below somewhere to live.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BltRect {
+    pub source_x: usize,
+    pub source_y: usize,
+    pub destination_x: usize,
+    pub destination_y: usize,
+    pub width: usize,
+    pub height: usize,
+}
+
+impl BltRect {
+    /// Whether the source rectangle lies inside the framebuffer.
+    #[inline]
+    fn source_in_fb(&self) -> bool {
+        rect_in_fb(self.source_x, self.source_y, self.width, self.height)
+    }
+
+    /// Whether the destination rectangle lies inside the framebuffer.
+    #[inline]
+    fn destination_in_fb(&self) -> bool {
+        rect_in_fb(
+            self.destination_x,
+            self.destination_y,
+            self.width,
+            self.height,
+        )
+    }
+
+    /// The six values in the protocol's own order, for the row loops that want
+    /// them as locals. One destructure per helper rather than six parameters
+    /// per call is what removes the permutation.
+    #[inline]
+    fn corners(&self) -> (usize, usize, usize, usize, usize, usize) {
+        (
+            self.source_x,
+            self.source_y,
+            self.destination_x,
+            self.destination_y,
+            self.width,
+            self.height,
+        )
+    }
+
+    /// How many `BltPixel`s the BltBuffer must hold for this rect, given the
+    /// point that names the buffer side and the declared row pitch.
+    ///
+    /// The BltBuffer is the *source* for BltBufferToVideo and the *destination*
+    /// for VideoToBltBuffer, so this is one rule read from two ends. It used to
+    /// be written out at both, differing only in which pair of coordinates it
+    /// read — and the last index it computes is `(y + h - 1) * row_px +
+    /// (x + w - 1)`, which is exactly the arithmetic a copy gets subtly wrong.
+    #[inline]
+    pub fn buffer_pixels_needed(&self, buffer_x: usize, buffer_y: usize, row_px: usize) -> usize {
+        buffer_y
+            .saturating_add(self.height.saturating_sub(1))
+            .saturating_mul(row_px)
+            .saturating_add(buffer_x.saturating_add(self.width))
+    }
+}
+
 /// EFI GOP Blt on a linear BGRA8 framebuffer.
 ///
 /// `delta` is bytes per BltBuffer row (0 ⇒ `width * sizeof(BltPixel)`), used for
 /// VideoToBltBuffer and BltBufferToVideo only (UEFI Spec).
+/// The BltBuffer's row pitch in pixels, or `None` if `delta` cannot describe a
+/// row this wide.
+///
+/// UEFI states `Delta` in *bytes* and gives `0` the meaning "rows are exactly
+/// `Width` pixels", so three refusals live in one conversion: a delta that is
+/// not a whole number of pixels, a delta that describes a row narrower than the
+/// rectangle being copied, and — through the `width == 0` its callers check
+/// first — a pitch of zero.
+///
+/// It is a free function rather than a method because `gop::gop_blt` needs the
+/// same answer *before* it has a rectangle: it sizes the `BltBuffer` slice from
+/// the pitch, and it used to reach that number with its own copy of this
+/// conversion that omitted the `rp < width` refusal and papered over the
+/// zero-pitch case with a `.max(1)`.
+pub fn row_pitch_pixels(delta: usize, width: usize) -> Option<usize> {
+    if delta == 0 {
+        return Some(width);
+    }
+    if !delta.is_multiple_of(size_of::<BltPixel>()) {
+        return None;
+    }
+    let row_px = delta / size_of::<BltPixel>();
+    (row_px >= width).then_some(row_px)
+}
+
+// The parameter run mirrors `EFI_GRAPHICS_OUTPUT_PROTOCOL.Blt` — same names,
+// same order, `fb` where the protocol passes `This` — so that `gop_blt` can
+// forward its arguments without reordering them. Collapsing them into
+// `BltRect` here would put a translation between the firmware call and the
+// code that answers it; the rect starts one frame in, where the helpers are.
+#[allow(clippy::too_many_arguments)]
 pub fn blt(
     fb: &mut [u8],
     blt_buffer: Option<&mut [BltPixel]>,
@@ -136,17 +271,17 @@ pub fn blt(
         return GopStatus::DeviceError;
     }
 
-    let row_px = if delta == 0 {
-        width
-    } else {
-        if delta % size_of::<BltPixel>() != 0 {
-            return GopStatus::InvalidParameter;
-        }
-        let rp = delta / size_of::<BltPixel>();
-        if rp < width {
-            return GopStatus::InvalidParameter;
-        }
-        rp
+    let Some(row_px) = row_pitch_pixels(delta, width) else {
+        return GopStatus::InvalidParameter;
+    };
+
+    let rect = BltRect {
+        source_x,
+        source_y,
+        destination_x,
+        destination_y,
+        width,
+        height,
     };
 
     match op {
@@ -155,19 +290,10 @@ pub fn blt(
                 Some(b) if !b.is_empty() => b,
                 _ => return GopStatus::InvalidParameter,
             };
-            if !rect_in_fb(destination_x, destination_y, width, height) {
+            if !rect.destination_in_fb() {
                 return GopStatus::InvalidParameter;
             }
-            let color = buf[0].to_bgra_u32();
-            fill_rect(
-                fb,
-                destination_x,
-                destination_y,
-                width,
-                height,
-                color,
-                stats,
-            );
+            fill_rect(fb, &rect, buf[0].to_bgra_u32(), stats);
             GopStatus::Success
         }
         BLT_BUFFER_TO_VIDEO => {
@@ -175,30 +301,15 @@ pub fn blt(
                 Some(b) => b,
                 None => return GopStatus::InvalidParameter,
             };
-            if !rect_in_fb(destination_x, destination_y, width, height) {
+            if !rect.destination_in_fb() {
                 return GopStatus::InvalidParameter;
             }
-            // Source must fit in BltBuffer with the declared row pitch.
-            // Last index = (sy+h-1)*row_px + (sx+w-1); need = last+1.
-            let need = source_y
-                .saturating_add(height.saturating_sub(1))
-                .saturating_mul(row_px)
-                .saturating_add(source_x.saturating_add(width));
-            if need > buf.len() {
+            // The BltBuffer is the source here, so it is the source point that
+            // must fit within it at the declared row pitch.
+            if rect.buffer_pixels_needed(source_x, source_y, row_px) > buf.len() {
                 return GopStatus::InvalidParameter;
             }
-            copy_buffer_to_video(
-                fb,
-                buf,
-                source_x,
-                source_y,
-                destination_x,
-                destination_y,
-                width,
-                height,
-                row_px,
-                stats,
-            );
+            copy_buffer_to_video(fb, buf, &rect, row_px, stats);
             GopStatus::Success
         }
         BLT_VIDEO_TO_BUFFER => {
@@ -206,46 +317,21 @@ pub fn blt(
                 Some(b) => b,
                 None => return GopStatus::InvalidParameter,
             };
-            if !rect_in_fb(source_x, source_y, width, height) {
+            if !rect.source_in_fb() {
                 return GopStatus::InvalidParameter;
             }
-            let need = destination_y
-                .saturating_add(height.saturating_sub(1))
-                .saturating_mul(row_px)
-                .saturating_add(destination_x.saturating_add(width));
-            if need > buf.len() {
+            // Same rule, other end: the BltBuffer is the destination.
+            if rect.buffer_pixels_needed(destination_x, destination_y, row_px) > buf.len() {
                 return GopStatus::InvalidParameter;
             }
-            copy_video_to_buffer(
-                fb,
-                buf,
-                source_x,
-                source_y,
-                destination_x,
-                destination_y,
-                width,
-                height,
-                row_px,
-                stats,
-            );
+            copy_video_to_buffer(fb, buf, &rect, row_px, stats);
             GopStatus::Success
         }
         BLT_VIDEO_TO_VIDEO => {
-            if !rect_in_fb(source_x, source_y, width, height)
-                || !rect_in_fb(destination_x, destination_y, width, height)
-            {
+            if !rect.source_in_fb() || !rect.destination_in_fb() {
                 return GopStatus::InvalidParameter;
             }
-            copy_video_to_video(
-                fb,
-                source_x,
-                source_y,
-                destination_x,
-                destination_y,
-                width,
-                height,
-                stats,
-            );
+            copy_video_to_video(fb, &rect, stats);
             GopStatus::Success
         }
         _ => GopStatus::InvalidParameter,
@@ -259,15 +345,13 @@ fn bump_bulk(stats: Option<&mut PaintStats>, bytes: u64) {
     }
 }
 
-fn fill_rect(
-    fb: &mut [u8],
-    x: usize,
-    y: usize,
-    w: usize,
-    h: usize,
-    color: u32,
-    mut stats: Option<&mut PaintStats>,
-) {
+fn fill_rect(fb: &mut [u8], rect: &BltRect, color: u32, mut stats: Option<&mut PaintStats>) {
+    let (x, y, w, h) = (
+        rect.destination_x,
+        rect.destination_y,
+        rect.width,
+        rect.height,
+    );
     let row_bytes = w * FB_BPP;
     // Full-width row at FB origin x==0 and w==FB_W → one bulk span per row via word fill.
     if x == 0 && w == FB_W {
@@ -304,15 +388,11 @@ fn fill_rect(
 fn copy_buffer_to_video(
     fb: &mut [u8],
     buf: &[BltPixel],
-    sx: usize,
-    sy: usize,
-    dx: usize,
-    dy: usize,
-    w: usize,
-    h: usize,
+    rect: &BltRect,
     row_px: usize,
     mut stats: Option<&mut PaintStats>,
 ) {
+    let (sx, sy, dx, dy, w, h) = rect.corners();
     let row_bytes = w * FB_BPP;
     for row in 0..h {
         let src_i = (sy + row) * row_px + sx;
@@ -330,15 +410,11 @@ fn copy_buffer_to_video(
 fn copy_video_to_buffer(
     fb: &[u8],
     buf: &mut [BltPixel],
-    sx: usize,
-    sy: usize,
-    dx: usize,
-    dy: usize,
-    w: usize,
-    h: usize,
+    rect: &BltRect,
     row_px: usize,
     mut stats: Option<&mut PaintStats>,
 ) {
+    let (sx, sy, dx, dy, w, h) = rect.corners();
     let row_bytes = w * FB_BPP;
     for row in 0..h {
         let src_off = (sy + row) * FB_STRIDE + sx * FB_BPP;
@@ -352,16 +428,8 @@ fn copy_video_to_buffer(
     }
 }
 
-fn copy_video_to_video(
-    fb: &mut [u8],
-    sx: usize,
-    sy: usize,
-    dx: usize,
-    dy: usize,
-    w: usize,
-    h: usize,
-    mut stats: Option<&mut PaintStats>,
-) {
+fn copy_video_to_video(fb: &mut [u8], rect: &BltRect, mut stats: Option<&mut PaintStats>) {
+    let (sx, sy, dx, dy, w, h) = rect.corners();
     let row_bytes = w * FB_BPP;
     // Overlap-safe: if destination is below source, copy bottom-up.
     let reverse = dy > sy || (dy == sy && dx > sx);
@@ -584,6 +652,54 @@ mod tests {
         assert_eq!(query_mode_ok(1), GopStatus::InvalidParameter);
         assert_eq!(set_mode_ok(0), GopStatus::Success);
         assert_eq!(set_mode_ok(1), GopStatus::Unsupported);
+    }
+
+    /// The spec ordinals, and that every error carries the high `UINTN` bit.
+    ///
+    /// Written as `1 << (usize::BITS - 1)` rather than a 64-bit literal, so
+    /// this asserts the rule rather than restating one target's answer to it.
+    #[test]
+    fn every_error_status_carries_the_efi_error_bit() {
+        assert_eq!(GopStatus::Success.efi_code(), 0);
+        for (status, ordinal) in [
+            (GopStatus::InvalidParameter, 2),
+            (GopStatus::Unsupported, 3),
+            (GopStatus::DeviceError, 7),
+        ] {
+            let code = status.efi_code();
+            assert_eq!(code & EFI_ERROR, EFI_ERROR, "{status:?} is not an error");
+            assert_eq!(code & !EFI_ERROR, ordinal, "{status:?} ordinal");
+        }
+    }
+
+    /// The three refusals in the pitch conversion, and the `delta == 0` default.
+    ///
+    /// `gop::gop_blt` reads this same function to size the `BltBuffer` slice it
+    /// builds from a raw firmware pointer, so a divergence here would be a
+    /// slice length disagreeing with the check that guards it.
+    #[test]
+    fn a_row_pitch_is_whole_pixels_and_at_least_the_rect() {
+        assert_eq!(row_pitch_pixels(0, 64), Some(64), "delta 0 means width");
+        assert_eq!(
+            row_pitch_pixels(64 * size_of::<BltPixel>(), 64),
+            Some(64),
+            "an exact fit is a fit"
+        );
+        assert_eq!(
+            row_pitch_pixels(80 * size_of::<BltPixel>(), 64),
+            Some(80),
+            "a wider pitch than the rect is what delta is for"
+        );
+        assert_eq!(
+            row_pitch_pixels(size_of::<BltPixel>() + 1, 1),
+            None,
+            "a delta that is not whole pixels describes no row"
+        );
+        assert_eq!(
+            row_pitch_pixels(32 * size_of::<BltPixel>(), 64),
+            None,
+            "a pitch narrower than the rect cannot hold one of its rows"
+        );
     }
 
     #[test]

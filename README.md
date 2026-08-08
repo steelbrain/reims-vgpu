@@ -147,6 +147,23 @@ Arm bring-up is **in-tree**: Virtualization.framework via Homebrew **`macosvm`**
 - Device/backend work lives in `crates/reims-vgpu` + the thin shims in `vendor/qemu`; rebuild QEMU after
   product changes before claiming a live boot result.
 
+### Environment overrides
+
+Set on the boot command; every one is optional and every default is "let the device decide". The
+full list, with the parse, is `crates/reims-vgpu/src/env.rs`. Each accepts `1`/`on`/`true`/`yes` and
+`0`/`off`/`false`/`no`, case-insensitively.
+
+| Variable | Effect |
+|---|---|
+| `REIMS_VGPU_DMABUF=off` | Stop reaching guest pages through a dma-buf, even where the host can. Every guest-memory rail takes the copying path instead — which is what runs on any host without `VK_EXT_external_memory_dma_buf`, so this is how that half is exercised on a machine that has it. |
+| `REIMS_VGPU_DRAW_LOG=on` | Verbose per-draw detail on top of the always-on failure log. |
+
+An override can only **narrow** what the device does. There is no way to switch a rail *on* that the
+host reported it cannot run: capability is measured from the device at startup, and asking a driver
+for an extension it does not advertise fails device creation rather than degrading. `REIMS_VGPU_DMABUF`
+has no on direction for that reason — on a host without the extension it is already off, and the
+`vk_caps` line in `/tmp/reims-vgpu-fail.log` names which check said so.
+
 ## Repo layout
 
 ```text

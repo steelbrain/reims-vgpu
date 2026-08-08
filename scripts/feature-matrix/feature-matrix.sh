@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Compile every supported reims-vgpu arm, tests included.
+# Compile every supported reims-vgpu arm, tests included, plus the option ROM.
 #
 # The project supports three arms, one per host GPU API actually available:
 # Metal on Apple, Vulkan through MoltenVK on Apple, and Vulkan on a native
@@ -40,6 +40,10 @@ The three supported arms, one per host GPU API actually available:
   Vulkan / MoltenVK  --no-default-features
                        --features backend-vulkan,host-window      Apple
   Vulkan / native    same feature set                             Linux
+
+A fourth cell checks crates/reims-vgpu-efi, the PCI option ROM every x86 boot
+builds. It is a separate workspace targeting x86_64-unknown-uefi, so it is not
+a backend arm — but it ships, and nothing else in the repository checks it.
 
 The feature sets are exactly what vendor/qemu/hw/display/meson.build passes for
 REIMS_VGPU_BACKEND=metal and REIMS_VGPU_BACKEND=vulkan. An Apple host builds
@@ -118,8 +122,12 @@ FEATURES_VULKAN="--no-default-features --features backend-vulkan,host-window"
 FAILED=0
 RESULTS=()
 
+# label, target triple (empty for host), feature args, then three optionals for
+# a package that is not `reims-vgpu` in the workspace: its directory, its
+# `-p`/`--manifest-path` selector, and its target scope.
 run_cell() {
   local label="$1" target="$2" features="$3"
+  local dir="${4:-$WORKSPACE_DIR}" pkg="${5--p reims-vgpu}" scope="${6---all-targets}"
   local target_args=()
   [ -n "$target" ] && target_args=(--target "$target")
 
@@ -127,9 +135,11 @@ run_cell() {
   log="$(mktemp)"
   local status="PASS"
   # --all-targets is load-bearing: without it this compiles the product only,
-  # and every arm's test code goes unchecked.
-  # shellcheck disable=SC2086  # $features is an intentional argument list.
-  if ! (cd "$WORKSPACE_DIR" && cargo "$CARGO_CMD" --all-targets -p reims-vgpu \
+  # and every arm's test code goes unchecked. The option ROM is the one cell
+  # that cannot use it — its bin is `#![no_main]` with its own panic handler,
+  # so libtest's harness collides with `std`'s on any target that has one.
+  # shellcheck disable=SC2086  # $features, $pkg and $scope are argument lists.
+  if ! (cd "$dir" && cargo "$CARGO_CMD" $scope $pkg \
     ${target_args[@]+"${target_args[@]}"} \
     $features --message-format short) >"$log" 2>&1; then
     status="FAIL"
@@ -157,21 +167,31 @@ run_cell() {
 # Only natively-runnable arms can be counted; a cross-compiled binary does not
 # run on this host.
 COUNTS=()
+# label, feature args, then the same three optionals `run_cell` takes. A cell
+# whose `all_targets` enumeration cannot link — the option ROM's — passes
+# `--lib` as its scope and reports why rather than a misleading count.
 count_cell() {
   local label="$1" features="$2"
+  local dir="${3:-$WORKSPACE_DIR}" pkg="${4--p reims-vgpu}" scope="${5---all-targets}"
   [ "$COUNT_TESTS" -eq 1 ] || return 0
   local out lib total
   out="$(mktemp)"
-  # shellcheck disable=SC2086  # $features is an intentional argument list.
-  if ! (cd "$WORKSPACE_DIR" && cargo test -p reims-vgpu $features --lib -- --list) \
+  # shellcheck disable=SC2086  # $features and $pkg are argument lists.
+  if ! (cd "$dir" && cargo test $pkg $features --lib -- --list) \
     >"$out" 2>/dev/null; then
     COUNTS+=("$(printf '%-46s %s' "$label" "(could not enumerate)")")
     rm -f "$out"
     return 0
   fi
   lib="$(grep -c ': test$' "$out" || true)"
+  if [ "$scope" = "--lib" ]; then
+    COUNTS+=("$(printf '%-46s lib=%-5s all_targets=%s' "$label" "$lib" \
+      "(bin is UEFI-only)")")
+    rm -f "$out"
+    return 0
+  fi
   # shellcheck disable=SC2086
-  (cd "$WORKSPACE_DIR" && cargo test -p reims-vgpu $features -- --list) \
+  (cd "$dir" && cargo test $pkg $features -- --list) \
     >"$out" 2>/dev/null || true
   total="$(grep -c ': test$' "$out" || true)"
   COUNTS+=("$(printf '%-46s lib=%-5s all_targets=%s' "$label" "$lib" "$total")")
@@ -227,6 +247,26 @@ if [ "$CROSS_TARGET" != "$HOST_TRIPLE" ]; then
       "(cross-compiled — cannot run here)")")
   fi
 fi
+
+# Arm 4 — the PCI option ROM. Not a backend arm and not a workspace member: it
+# is its own workspace targeting x86_64-unknown-uefi, and `vm/boot-x86.sh`
+# rebuilds it before every x86 boot. It was invisible to this script and to
+# every command in AGENTS.md, which is the same gap that let the Metal arm rot
+# to 11 errors: a live crate nothing checks.
+#
+# `--all-targets` cannot be used here. The bin is `#![no_main]` with the `uefi`
+# crate's panic handler, so building its test harness collides with `std`'s —
+# on the UEFI target and on the host alike. The lib is where the logic is
+# (`paint`, the real Blt paths), and it does run on the host.
+EFI_DIR="$REPO/crates/reims-vgpu-efi"
+EFI_TARGET="x86_64-unknown-uefi"
+if rustup target list --installed 2>/dev/null | grep -qx "$EFI_TARGET"; then
+  run_cell "option-rom / $EFI_TARGET" "$EFI_TARGET" "" "$EFI_DIR" "" ""
+else
+  RESULTS+=("$(printf '%-4s %-46s %s' "SKIP" "option-rom / $EFI_TARGET" \
+    "(rustup target add $EFI_TARGET)")")
+fi
+count_cell "option-rom / host lib" "" "$EFI_DIR" "" "--lib"
 
 echo
 for line in "${RESULTS[@]}"; do

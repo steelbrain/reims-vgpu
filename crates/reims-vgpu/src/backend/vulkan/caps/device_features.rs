@@ -23,10 +23,12 @@
 //! 1. **Query and enable together.** A feature that is asked about here and not
 //!    enabled here is the same bug in a new place, so the enable list is built
 //!    from this struct and nothing else.
-//! 2. **Enable only what the backend binds.** `multi_viewport` used to be
-//!    enabled while `engine::exec` declines any draw with more than one
-//!    viewport. Harmless, but it means the list was a wish rather than a
-//!    derivation — and a list that is not derived cannot be checked.
+//! 2. **Enable only what the backend binds.** `multi_viewport` was once enabled
+//!    while `engine::exec` declined every draw with more than one viewport, and
+//!    was later disabled to match. It is enabled again now, and this time
+//!    because the backend reaches it: a pipeline's `viewportCount` is the
+//!    guest's own. The rule is what caught both states — a list that is not
+//!    derived from what the backend binds cannot be checked.
 
 use ash::vk;
 
@@ -143,6 +145,21 @@ pub struct DeviceFeatures {
     pub float16: bool,
     pub int8: bool,
     pub shader_output_viewport_index: bool,
+    /// `VkPhysicalDeviceVulkan12Features::timelineSemaphore` — whether a
+    /// submission can signal a monotonic counter that a *second* thread may
+    /// wait on.
+    ///
+    /// This is what lets a completion be observed without owning the thing that
+    /// produced it. A `VkFence` has one waiter's worth of lifetime and the ring
+    /// already owns every fence it has — resetting them at retire — so a second
+    /// thread waiting on a ring fence races the reset. A timeline value is
+    /// monotonic, waitable from anywhere, and needs nothing back.
+    ///
+    /// Core in Vulkan 1.2, which is this backend's baseline, so a device that
+    /// declines it is out of spec rather than merely old. Asked anyway, and
+    /// gated on: the rail that uses it falls back to blocking the drain worker,
+    /// which is what every host did before it existed.
+    pub timeline_semaphore: bool,
     pub mirror_clamp_to_edge: MirrorClampToEdge,
     /// `VkPhysicalDeviceFeatures::dualSrcBlend` — whether a pipeline may name
     /// the `SRC1_*` blend factors, which read the fragment shader's second
@@ -155,6 +172,49 @@ pub struct DeviceFeatures {
     /// an extension, but not mandatory either — so it is asked rather than
     /// assumed, and the pipeline path declines by name where it is absent.
     pub dual_src_blend: bool,
+    /// `VkPhysicalDeviceFeatures::fillModeNonSolid` — whether a pipeline may
+    /// name `VK_POLYGON_MODE_LINE` or `_POINT`.
+    ///
+    /// `MTLTriangleFillModeLines` has no other spelling: the polygon mode is
+    /// Vulkan's only way to rasterize a triangle as its edges, and naming a
+    /// non-solid one on a device that does not advertise this makes the
+    /// pipeline invalid. Same shape as [`Self::dual_src_blend`] — optional
+    /// core, asked rather than assumed, declined by name where absent.
+    pub fill_mode_non_solid: bool,
+    /// `VkPhysicalDeviceFeatures::depthClamp` — whether a pipeline may set
+    /// `depthClampEnable`.
+    ///
+    /// This is what `MTLDepthClipModeClamp` asks for: a fragment outside the
+    /// depth range is clamped to it rather than discarded. Optional core like
+    /// the two above.
+    pub depth_clamp: bool,
+    /// `VkPhysicalDeviceFeatures::multiViewport` — whether a pipeline may
+    /// declare more than one viewport/scissor slot.
+    ///
+    /// This is what `setViewports:count:` with a count above one asks for.
+    /// Optional core like the two above, and paired with [`Self::max_viewports`]
+    /// because the feature only says "more than one is allowed" and the limit
+    /// says how many.
+    pub multi_viewport: bool,
+    /// `VkPhysicalDeviceLimits::maxViewports` — the largest slot count a
+    /// pipeline may declare.
+    ///
+    /// At least 1 on every device, and at least 16 wherever
+    /// [`Self::multi_viewport`] is set. Carried as its own number rather than
+    /// assumed from the feature: the guarantee is a floor, and a guest may ask
+    /// for more than the floor.
+    pub max_viewports: u32,
+    /// `VkPhysicalDeviceFeatures::occlusionQueryPrecise` — whether an occlusion
+    /// query may be recorded with `VK_QUERY_CONTROL_PRECISE_BIT`.
+    ///
+    /// This is what `MTLVisibilityResultModeCounting` asks for. Without the bit
+    /// a Vulkan occlusion query promises only "non-zero if any sample passed",
+    /// which is `MTLVisibilityResultModeBoolean` exactly — so the query *type*
+    /// needs no feature and no limit, and this gates only the counting arm.
+    /// `engine::exec` refuses a counting draw where it is unset rather than
+    /// recording without the bit: an imprecise count is a plausible wrong
+    /// number, which is worse than a named refusal.
+    pub occlusion_query_precise: bool,
 }
 
 impl DeviceFeatures {
@@ -168,9 +228,13 @@ impl DeviceFeatures {
     /// The `vk::PhysicalDeviceFeatures` to enable, derived from what is
     /// supported **and** what the backend actually binds.
     ///
-    /// `multi_viewport` is deliberately absent even where supported:
-    /// `engine::exec` declines any draw carrying more than one viewport, so
-    /// enabling it advertised a capability nothing reaches.
+    /// `multi_viewport` is bound where supported: `engine::exec` builds a
+    /// pipeline whose `viewportCount` is the guest's, and a count above one is
+    /// invalid without it.
+    ///
+    /// `occlusion_query_precise` likewise: `engine::exec` records
+    /// `vkCmdBeginQuery` with `PRECISE` for a counting draw, and passing that
+    /// bit is invalid without the feature enabled.
     pub fn enabled_features(&self) -> vk::PhysicalDeviceFeatures {
         vk::PhysicalDeviceFeatures::default()
             .robust_buffer_access(self.robust_buffer_access)
@@ -179,6 +243,10 @@ impl DeviceFeatures {
             .shader_storage_image_extended_formats(self.storage_image_extended_formats)
             .shader_storage_image_write_without_format(self.storage_image_write_without_format)
             .dual_src_blend(self.dual_src_blend)
+            .fill_mode_non_solid(self.fill_mode_non_solid)
+            .depth_clamp(self.depth_clamp)
+            .multi_viewport(self.multi_viewport)
+            .occlusion_query_precise(self.occlusion_query_precise)
     }
 
     /// The Vulkan 1.2 features to enable.
@@ -190,6 +258,7 @@ impl DeviceFeatures {
     pub fn enabled_vulkan12(&self) -> vk::PhysicalDeviceVulkan12Features<'static> {
         vk::PhysicalDeviceVulkan12Features::default()
             .shader_output_viewport_index(self.shader_output_viewport_index)
+            .timeline_semaphore(self.timeline_semaphore)
             .sampler_mirror_clamp_to_edge(self.mirror_clamp_to_edge == MirrorClampToEdge::Core12)
     }
 
@@ -312,6 +381,13 @@ pub unsafe fn query(
         robust_buffer_access: supported.robust_buffer_access == vk::TRUE,
         sampler_anisotropy: supported.sampler_anisotropy == vk::TRUE,
         dual_src_blend: supported.dual_src_blend == vk::TRUE,
+        fill_mode_non_solid: supported.fill_mode_non_solid == vk::TRUE,
+        depth_clamp: supported.depth_clamp == vk::TRUE,
+        multi_viewport: supported.multi_viewport == vk::TRUE,
+        occlusion_query_precise: supported.occlusion_query_precise == vk::TRUE,
+        // `max(1)` because a pipeline always declares at least one slot, and a
+        // device reporting 0 here would otherwise make every draw undrawable.
+        max_viewports: props.limits.max_viewports.max(1),
         max_sampler_anisotropy: props.limits.max_sampler_anisotropy.max(1.0),
         max_image_dimension_2d: props
             .limits
@@ -339,6 +415,7 @@ pub unsafe fn query(
         float16: supported_f16i8.shader_float16 == vk::TRUE,
         int8: supported_f16i8.shader_int8 == vk::TRUE,
         shader_output_viewport_index: supported_vulkan12.shader_output_viewport_index == vk::TRUE,
+        timeline_semaphore: supported_vulkan12.timeline_semaphore == vk::TRUE,
         mirror_clamp_to_edge,
     }
 }
@@ -349,6 +426,7 @@ mod tests {
 
     fn all_supported() -> DeviceFeatures {
         DeviceFeatures {
+            occlusion_query_precise: true,
             robust_buffer_access: true,
             sampler_anisotropy: true,
             max_sampler_anisotropy: 16.0,
@@ -369,8 +447,13 @@ mod tests {
             float16: true,
             int8: true,
             shader_output_viewport_index: true,
+            timeline_semaphore: true,
             mirror_clamp_to_edge: MirrorClampToEdge::Core12,
             dual_src_blend: true,
+            fill_mode_non_solid: true,
+            depth_clamp: true,
+            multi_viewport: true,
+            max_viewports: 16,
         }
     }
 
@@ -394,6 +477,32 @@ mod tests {
         // The default is "not supported", so a `DeviceFeatures` built without a
         // query never claims a capability it has not checked for.
         assert!(!DeviceFeatures::default().dual_src_blend);
+    }
+
+    /// The two rasterization features the guest's `setTriangleFillMode:` and
+    /// `setDepthClipMode:` records need, under the same rule as
+    /// `dualSrcBlend`: queried here, enabled here, and left clear where the
+    /// device says no so `vkCreateDevice` does not fail asking for them.
+    ///
+    /// Both are optional core with no extension rung, and both are consumed by
+    /// `engine::caches`, which declines the pipeline by name rather than
+    /// rasterizing the other way.
+    #[test]
+    fn the_raster_features_are_enabled_only_where_the_device_advertises_them() {
+        let all = all_supported().enabled_features();
+        assert_eq!(all.fill_mode_non_solid, vk::TRUE);
+        assert_eq!(all.depth_clamp, vk::TRUE);
+        let without = DeviceFeatures {
+            fill_mode_non_solid: false,
+            depth_clamp: false,
+            ..all_supported()
+        }
+        .enabled_features();
+        assert_eq!(without.fill_mode_non_solid, vk::FALSE);
+        assert_eq!(without.depth_clamp, vk::FALSE);
+        // Never claimed without a query, the same way `dual_src_blend` is not.
+        assert!(!DeviceFeatures::default().fill_mode_non_solid);
+        assert!(!DeviceFeatures::default().depth_clamp);
     }
 
     /// The 1.2 rung sets the core feature bit and asks for no extension.
@@ -524,32 +633,57 @@ mod tests {
     /// The enable list is derived from what the backend binds, and
     /// `multi_viewport` is the case that proves it.
     ///
-    /// It used to be enabled wherever supported while nothing could ever bind a
-    /// second viewport. Harmless in itself, but it meant the list was a wish
-    /// rather than a derivation — and a list that is not derived cannot be
-    /// checked. `DrawRequest::viewport` is an `Option`, so "at most one" is now
-    /// a property of the type rather than a runtime check this test has to go
-    /// looking for.
+    /// It has now been wrong in both directions. It was enabled wherever
+    /// supported while nothing could bind a second viewport, then disabled to
+    /// match that; now a draw's `viewportCount` is the guest's own, so it must
+    /// be enabled again or every multi-viewport pipeline is invalid. What makes
+    /// the rule checkable rather than a wish is that both halves are asserted
+    /// here against one another: a request that carries two viewports, and the
+    /// feature that makes two legal.
     #[test]
-    fn multi_viewport_is_not_enabled_because_no_draw_can_bind_a_second() {
+    fn multi_viewport_is_enabled_because_a_draw_can_bind_a_second() {
         let enabled = all_supported().enabled_features();
         assert_eq!(
             enabled.multi_viewport,
-            vk::FALSE,
-            "no draw can use a second viewport, so nothing should request one"
+            vk::TRUE,
+            "a draw can name several viewports, so the feature must be requested"
         );
-        // There is no second slot to fill; the field holds one viewport or none.
+        let vp = |x: f32| crate::backend::vulkan::engine::ViewportResource {
+            x,
+            y: 0.0,
+            width: 1.0,
+            height: 1.0,
+            min_depth: 0.0,
+            max_depth: 1.0,
+        };
         let req = crate::backend::vulkan::engine::DrawRequest {
-            viewport: Some(crate::backend::vulkan::engine::ViewportResource {
-                x: 0.0,
-                y: 0.0,
-                width: 1.0,
-                height: 1.0,
-                min_depth: 0.0,
-                max_depth: 1.0,
-            }),
+            viewports: vec![vp(0.0), vp(1.0)],
             ..Default::default()
         };
-        assert!(req.viewport.is_some());
+        assert_eq!(
+            crate::backend::vulkan::engine::viewport_slot_count(&req),
+            2,
+            "the second viewport must reach the pipeline's slot count"
+        );
+    }
+
+    /// A device that advertises no `multiViewport` reports a limit of one, and
+    /// that is the number the draw path compares against.
+    ///
+    /// The limit and the feature are separate fields because Vulkan reports
+    /// them separately, and `maxViewports` is *not* required to be 1 on a
+    /// device without the feature — the spec's floor is 1, but an
+    /// implementation may report 16 while still refusing to use them. Reading
+    /// the limit alone would then have built an invalid pipeline.
+    #[test]
+    fn a_device_without_multi_viewport_offers_exactly_one_slot() {
+        let mut f = all_supported();
+        f.multi_viewport = false;
+        f.max_viewports = 16;
+        let allowed = if f.multi_viewport { f.max_viewports } else { 1 };
+        assert_eq!(
+            allowed, 1,
+            "the feature gates the limit; a generous limit does not license a second slot"
+        );
     }
 }

@@ -7,6 +7,7 @@
 
 #![allow(unsafe_op_in_unsafe_fn)]
 
+mod buffer_slab;
 mod caches;
 mod compute_execution;
 mod compute_validation;
@@ -18,13 +19,18 @@ mod digest;
 mod draw_execution;
 mod draw_phase;
 mod draw_preparation;
-mod draw_validation;
+pub(crate) mod draw_validation;
 mod exec;
 mod exec_compute;
 mod facade_decline;
-mod host_slab;
+mod host_ram;
 pub mod init_decline;
 mod pools;
+pub(crate) mod stamp_completion;
+/// The ceiling `registry_non_pinned_peak` is read against. Re-exported because
+/// `pools` is private and the census that reports the band lives outside this
+/// module: a peak with no cap beside it is a number, not a reading.
+pub(crate) use pools::IDLE_TARGET_AGE_MS;
 pub mod reason;
 mod slab;
 pub mod stage_phase;
@@ -33,33 +39,27 @@ pub mod vk_call;
 #[cfg(feature = "host-window")]
 mod window_present;
 
-pub use compute_execution::ComputeExecutionDecline;
-pub use compute_validation::ComputeValidationDecline;
-pub use context::{FENCE_TIMEOUT_NS, MAX_DEVICE_RECREATES};
-pub use counters::{CounterSnapshot, EngineCounters};
-pub use device_lost::{DeviceLostDecline, DeviceLostOp};
-pub use draw_execution::DrawExecutionDecline;
-pub use draw_phase::{take_window as draw_phase_window, DrawPhaseWindow};
-pub use draw_preparation::DrawPreparationDecline;
-pub use draw_validation::DrawValidationDecline;
-pub use facade_decline::EngineFacadeDecline;
-pub use init_decline::InitDecline;
-pub use reason::DrawReason;
+pub use context::MAX_DEVICE_RECREATES;
+pub(crate) use counters::{CounterSnapshot, EngineCounters};
+pub(crate) use draw_phase::take_window as draw_phase_window;
+pub(crate) use draw_preparation::DrawPreparationDecline;
+pub(crate) use facade_decline::EngineFacadeDecline;
+pub use types::viewport_slot_count;
 pub use types::{
-    BlendFactor, BlendOp, BlendStateResource, BufferContent, ColorWriteMask, ComputeBufferOutput,
-    ComputeBufferResource, ComputeOutput, ComputeRequest, ComputeResidentSampleBind,
-    ComputeSampledImageResource, ComputeStorageImageResource, ComputeStorageResidency, CullMode,
-    DepthState, DrawError, DrawOutput, DrawRequest, GuestRun, GuestRunSource, IndexType,
+    BlendFactor, BlendOp, BlendStateResource, BufferContent, ColorWriteMask, ComputeBufferResource,
+    ComputeOutput, ComputeRequest, ComputeResidentSampleBind, ComputeSampledImageResource,
+    ComputeStorageImageResource, ComputeStorageResidency, CullMode, DepthClipMode, DepthState,
+    DrawError, DrawOutput, DrawRequest, FillMode, GuestRun, GuestRunSource, IndexType,
     IndexedDrawResource, PrimitiveTopology, SampledContentIdentity, SampledImageResource,
     SampledSource, SamplerAddressMode, SamplerBorderColor, SamplerCompareFunction, SamplerFilter,
     SamplerMipFilter, SamplerResource, ScissorResource, SecondaryColorTarget, SeedOrder,
     StencilFaceOps, StencilOp, StencilState, StorageBufferResource, StorageImageFormat,
     TargetIdentity, VertexAttributeFormat, VertexAttributeResource, VertexStepFunction,
-    ViewportResource, WindowPresentSource, COLOR_INPUT_BINDING,
+    ViewportResource, VisibilityResultMode, WindowPresentSource, COLOR_INPUT_BINDING,
 };
-pub use vk_call::{VkCall, VkOp};
+pub(crate) use vk_call::{VkCall, VkOp};
 #[cfg(feature = "host-window")]
-pub use window_present::{WindowCpuFrame, WindowPresentOutcome};
+pub(crate) use window_present::{WindowCpuFrame, WindowPresentOutcome};
 
 use caches::ObjectCaches;
 use context::ContextOwner;
@@ -85,6 +85,87 @@ pub(crate) fn color_subresource_range() -> ash::vk::ImageSubresourceRange {
         level_count: 1,
         base_array_layer: 0,
         layer_count: 1,
+    }
+}
+
+/// Whether a registry resident of this format is a depth(-stencil) attachment
+/// rather than a colour one.
+///
+/// The two depth formats this device ever creates are
+/// [`crate::backend::vulkan::translate::pixel::TRANSIENT_DEPTH_FORMAT`] and
+/// whichever combined format `DeviceContext::depth_stencil_format` selected, and
+/// that second one is device-queried — so this asks the format's own aspect
+/// rather than comparing against a list a third format would not be on.
+pub(crate) fn format_is_depth(format: ash::vk::Format) -> bool {
+    matches!(
+        format,
+        ash::vk::Format::D16_UNORM
+            | ash::vk::Format::X8_D24_UNORM_PACK32
+            | ash::vk::Format::D32_SFLOAT
+            | ash::vk::Format::D16_UNORM_S8_UINT
+            | ash::vk::Format::D24_UNORM_S8_UINT
+            | ash::vk::Format::D32_SFLOAT_S8_UINT
+    )
+}
+
+/// Whether a format carries a stencil aspect as well as depth.
+pub(crate) fn format_has_stencil(format: ash::vk::Format) -> bool {
+    matches!(
+        format,
+        ash::vk::Format::D16_UNORM_S8_UINT
+            | ash::vk::Format::D24_UNORM_S8_UINT
+            | ash::vk::Format::D32_SFLOAT_S8_UINT
+            | ash::vk::Format::S8_UINT
+    )
+}
+
+/// The subresource range a registry resident's view is created with, derived
+/// from its format. See [`registry_target_usage`] for why these are functions of
+/// the format rather than parameters beside it.
+pub(crate) fn registry_subresource_range(
+    format: ash::vk::Format,
+) -> ash::vk::ImageSubresourceRange {
+    if !format_is_depth(format) {
+        return color_subresource_range();
+    }
+    let mut aspect = ash::vk::ImageAspectFlags::DEPTH;
+    if format_has_stencil(format) {
+        aspect |= ash::vk::ImageAspectFlags::STENCIL;
+    }
+    ash::vk::ImageSubresourceRange {
+        aspect_mask: aspect,
+        base_mip_level: 0,
+        level_count: 1,
+        base_array_layer: 0,
+        layer_count: 1,
+    }
+}
+
+/// The usage set a registry resident's image is created with, derived from its
+/// format.
+///
+/// **A function of the format, deliberately, and not a parameter.** The recycle
+/// free-list buckets displaced images by `(geometry, format)` and hands one back
+/// to the next resident of that bucket, so a bucket whose members disagree about
+/// usage would eventually bind an image to an attachment it was not created for
+/// — invalid, and invalid in the quiet way, because the image is real and the
+/// geometry matches. Deriving usage here makes "same bucket implies same usage"
+/// true by construction, so a fourth creation site cannot get it wrong and
+/// nothing has to scan for one that did.
+pub(crate) fn registry_target_usage(format: ash::vk::Format) -> ash::vk::ImageUsageFlags {
+    if format_is_depth(format) {
+        // A depth resident is only ever attachment N of an ad-hoc framebuffer.
+        // No SAMPLED and no TRANSFER: nothing in this device reads a depth
+        // buffer back or copies one, and asking for usage the host need not
+        // support for a depth format would refuse the image on hosts that
+        // support the attachment alone.
+        ash::vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT
+    } else {
+        ash::vk::ImageUsageFlags::COLOR_ATTACHMENT
+            | ash::vk::ImageUsageFlags::INPUT_ATTACHMENT
+            | ash::vk::ImageUsageFlags::TRANSFER_SRC
+            | ash::vk::ImageUsageFlags::TRANSFER_DST
+            | ash::vk::ImageUsageFlags::SAMPLED
     }
 }
 
@@ -500,7 +581,13 @@ pub fn execute_draw_request(req: &DrawRequest) -> Result<DrawOutput, DrawError> 
     } = &mut *guard;
     let result = unsafe { exec::execute_draw_inner(owner, caches, pools, counters, req) };
     match result {
-        Ok(out) => Ok(out),
+        Ok(out) => {
+            // Guest work reached the GPU, so any recreate that got us here did
+            // its job and the storm budget starts over. See
+            // `ContextOwner::note_work_completed`.
+            guard.owner.note_work_completed();
+            Ok(out)
+        }
         Err(DrawError::DeviceLost(decline)) => {
             guard.counters.device_lost.fetch_add(1, Ordering::Relaxed);
             guard.owner.mark_device_lost();
@@ -544,6 +631,445 @@ pub fn flush_batched_draws() {
     }
 }
 
+/// Wait until nothing this device has recorded will read guest RAM again.
+///
+/// Called from [`crate::runtime::drain::write_stamp`], immediately before the
+/// guest is told a packet finished. The stamp's own contract is that everything
+/// the packet named may be freed or repainted from that moment, and a draw that
+/// binds guest pages as a copy source reads them when its command buffer
+/// *executes* — which, on a device that acks before it runs, is otherwise after
+/// the guest was told it was safe.
+///
+/// A no-op unless a guest-reading command buffer was actually recorded, so a
+/// host that cannot import guest RAM never pays for it. See
+/// [`pools::ResourcePools::quiesce_guest_reads`] for why the wait retires the
+/// whole ring rather than the fences carrying the reads.
+/// Whether any guest-page writeback is submitted and not yet settled, readable
+/// without the engine lock.
+///
+/// [`quiesce_guest_writes`] is called from every host read or write of guest
+/// mapping bytes, which is a far hotter set of sites than the completion stamp
+/// its read-side twin serves. Taking the engine lock at each of them to discover
+/// there was nothing to settle would be the cost this change is removing, so the
+/// common answer is one relaxed-acquire load and no lock at all.
+///
+/// Set under the engine lock with `Release` after the copy is parked and before
+/// it is submitted; cleared under the same lock once the ring has retired. A
+/// thread that reads `false` therefore observed a point at which no writeback
+/// was outstanding.
+static GUEST_WRITE_DEBT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Which guest pages the outstanding writeback lands in, when it can be said.
+///
+/// [`GUEST_WRITE_DEBT`] answers "is anything outstanding", and every caller that
+/// reads guest bytes then blocks on the answer. But a writeback lands in one
+/// surface's pages and most of the readers asking are reading somewhere else
+/// entirely — a glyph atlas, a small linear texture, a uniform staging window —
+/// so the wait they take is for a write that will never touch a byte they read.
+/// A driven Safari-drag boot spent **11.5 s** in one such reader
+/// ([`crate::runtime::render_writeback::SettleSite::LinearMemoRead`]) alone.
+///
+/// This names the pages so a disjoint reader can be let through. The currency is
+/// the guest page address, because it is the only one the two sides share: the
+/// writer knows its destination as a page list from a walk, the reader knows its
+/// window as a task GVA it can walk to the same list, and
+/// [`GuestPageTarget::runs`] carries neither — a [`GuestRef`] deliberately does
+/// not expose an absolute position.
+///
+/// [`GuestRef`]: crate::runtime::guest_ram_map::GuestRef
+///
+/// # How many writebacks are named, and what happens past that
+///
+/// One destination's page list per armed-and-unsettled writeback, up to
+/// [`RING_DEPTH`] of them. The bound is the submission ring's, because that is
+/// what bounds writebacks in flight: a ninth submission blocks in `begin_entry`
+/// on the oldest fence rather than being recorded.
+///
+/// **The two drift, and overflow is routine.** [`GUEST_WRITE_DEBT`] is cleared
+/// only by an actual settle, never by the ring retiring a fence on its own, so
+/// an entry outlives the copy it names for as long as nothing blocks. A single
+/// entry measured `gwdebt_unnamed` 14 125 against 16 626 arms; the ring's worth
+/// still measured **3 499** overflows on a driven Safari-drag boot, and each one
+/// made every subsequent reader settle globally until the next clear —
+/// `settle_linear_memo_read_unnamed` 3 402 of that boot's 4 036 memo waits, at
+/// ~200 ms of blocking per second of drag.
+///
+/// So overflow is a **merge**, not a surrender: the ninth arm folds into the
+/// oldest entry and the ledger keeps naming every page it holds. A union of two
+/// destination page lists is exactly the set of pages both copies land in, so
+/// nothing is lost but the ability to retire one of them individually — and
+/// nothing retires individually, because [`clear_guest_write_pages`] clears all
+/// of them at once.
+///
+/// **Never by dropping an entry**: a footprint missing a page it holds would
+/// answer "disjoint" for a page a copy is landing in, which is a stale frame
+/// served as fresh. Merging is the opposite direction — it can only turn a
+/// `Disjoint` into an `Overlap`, never the reverse.
+///
+/// # Ordering
+///
+/// Armed under the engine lock immediately before [`GUEST_WRITE_DEBT`] is
+/// published, and cleared under the same lock immediately after it is cleared,
+/// so a reader that observes the flag set observes a footprint that already
+/// names the write, and a reader that observes it clear needs nothing. Readers
+/// take only this mutex and never the engine lock — taking that at every guest
+/// read is the cost the flag exists to avoid.
+static GUEST_WRITE_PAGES: std::sync::Mutex<GuestWriteFootprint> =
+    std::sync::Mutex::new(GuestWriteFootprint { armed: Vec::new() });
+
+/// The page lists behind [`GUEST_WRITE_PAGES`].
+struct GuestWriteFootprint {
+    /// One entry per outstanding writeback, each ascending and deduplicated.
+    /// Sorted at arm time — armed thousands of times a boot and asked tens of
+    /// thousands, so the ordering is paid on the rarer side and every ask is a
+    /// binary search.
+    ///
+    /// Kept as separate lists rather than merged into one, so a settle could
+    /// retire them individually later without re-deriving which page belonged to
+    /// which copy. Never longer than [`RING_DEPTH`]; past that, an arm folds
+    /// into entry zero, which gives up exactly that future retirement and
+    /// nothing else.
+    ///
+    /// There is no "gave up naming" flag beside this any more. It existed for
+    /// the overflow that is now a merge, and the only other way to lose the
+    /// ledger — a poisoned mutex — already answers `Unnamed` at every ask
+    /// without one.
+    armed: Vec<Vec<u64>>,
+}
+
+/// What the ledger can say about a reader's window.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GuestWriteReach {
+    /// Nothing outstanding lands in any of the pages asked about. The caller may
+    /// read them without settling.
+    Disjoint,
+    /// An outstanding writeback lands in one of them.
+    Overlap,
+    /// The ledger cannot say, so the caller must settle. Distinguished from
+    /// [`Self::Overlap`] because the two want opposite fixes: an overlap is a
+    /// wait genuinely owed and this is precision the ledger failed to keep.
+    Unnamed,
+}
+
+/// Record the guest pages a writeback about to be submitted will land in.
+///
+/// Called under the engine lock, beside the [`GUEST_WRITE_DEBT`] publish.
+fn arm_guest_write_pages(pages: &[u64]) {
+    let Ok(mut f) = GUEST_WRITE_PAGES.lock() else {
+        // A poisoned lock means nothing is recorded, and it stays poisoned, so
+        // `guest_writes_reaching` answers `Unnamed` for the rest of the boot.
+        // That is the safe direction and needs no flag here.
+        return;
+    };
+    let mut sorted = pages.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    // At the entry cap, fold into the oldest rather than give up naming. The
+    // `first_mut` cannot be `None` there — `RING_DEPTH` is non-zero — but the
+    // fallthrough is a push rather than an `expect`, because the only thing a
+    // panic here would protect is a bound this function does not own.
+    if f.armed.len() >= pools::RING_DEPTH {
+        if let Some(oldest) = f.armed.first_mut() {
+            oldest.extend_from_slice(&sorted);
+            oldest.sort_unstable();
+            oldest.dedup();
+            crate::runtime::drain::note_store_route("gwdebt_merged");
+            return;
+        }
+    }
+    f.armed.push(sorted);
+}
+
+/// Forget the outstanding writebacks' pages. Called under the engine lock, after
+/// the wait has landed and [`GUEST_WRITE_DEBT`] is cleared.
+fn clear_guest_write_pages() {
+    if let Ok(mut f) = GUEST_WRITE_PAGES.lock() {
+        f.armed.clear();
+    }
+}
+
+/// What the ledger can say about `pages` — see [`GuestWriteReach`].
+///
+/// [`GuestWriteReach::Unnamed`] is the safe answer and is returned whenever this
+/// cannot say otherwise, including a poisoned lock. A [`GuestWriteReach::Disjoint`]
+/// licenses the caller to read those guest pages without settling.
+///
+/// `pages` need not be sorted; it is the reader's window and is usually a
+/// handful of entries against a whole frame's worth here.
+pub fn guest_writes_reaching(pages: &[u64]) -> GuestWriteReach {
+    let Ok(f) = GUEST_WRITE_PAGES.lock() else {
+        return GuestWriteReach::Unnamed;
+    };
+    if f.armed.is_empty() {
+        // The flag said something was outstanding and the ledger names nothing:
+        // the settle that cleared it raced this ask. Nothing to rule out
+        // against, so nothing may be ruled out.
+        return GuestWriteReach::Unnamed;
+    }
+    let hit = pages
+        .iter()
+        .any(|p| f.armed.iter().any(|a| a.binary_search(p).is_ok()));
+    if hit {
+        GuestWriteReach::Overlap
+    } else {
+        GuestWriteReach::Disjoint
+    }
+}
+
+/// Wait until every guest-page writeback this device has recorded has landed in
+/// guest RAM.
+///
+/// The write-side twin of [`quiesce_guest_reads`], and the settle point for the
+/// fence `copy_target_to_guest_pages` no longer takes itself. Call it wherever a
+/// reader that is not this device's own command stream is about to observe those
+/// bytes: the completion stamp, and the host-side readers that call
+/// `runtime::render_writeback::settle_guest_writes` before touching guest
+/// mapping bytes.
+pub fn quiesce_guest_writes() {
+    use std::sync::atomic::Ordering;
+    if !GUEST_WRITE_DEBT.load(Ordering::Acquire) {
+        return;
+    }
+    let started = std::time::Instant::now();
+    let mut guard = lock_engine();
+    let EngineState {
+        ref mut owner,
+        ref mut pools,
+        ref counters,
+        ..
+    } = &mut *guard;
+    let Some(ctx) = owner.ctx.as_ref() else {
+        // No device, so nothing can be in flight and nothing can settle it.
+        GUEST_WRITE_DEBT.store(false, Ordering::Release);
+        clear_guest_write_pages();
+        return;
+    };
+    if let Err(e) = unsafe { pools.quiesce_guest_writes(ctx, counters) } {
+        // The wait failed, so this device cannot say the frame reached the
+        // guest's pages. Nothing here can hold the caller back — a stamp that
+        // never moves hangs the guest — so report it and let the lost device
+        // surface on the next draw.
+        crate::observe::Emit::decline("vk_guest_write_quiesce", &e).fail_once(0);
+    }
+    // Cleared whether the wait succeeded or failed, for the reason
+    // `ResourcePools::quiesce_guest_writes` takes its own debt before waiting:
+    // the slot stays pending either way and the next claimant re-waits, so the
+    // ordering survives without every later settle re-running a failing wait.
+    GUEST_WRITE_DEBT.store(false, Ordering::Release);
+    // Under the same lock as the flag it accompanies, so no reader can see the
+    // flag set beside a footprint that has already been forgotten.
+    clear_guest_write_pages();
+    // Reported as `ReadbackPhase::Fence` because it *is* that phase — the same
+    // block on the same fences, moved. Its count is now settles rather than
+    // windows, which is the whole of what this change did to the rail, so
+    // `fence` no longer tracks `submit` and a reading that assumes it does is
+    // reading the old shape.
+    crate::runtime::drain::note_readback_phase(
+        crate::runtime::drain::ReadbackPhase::Fence,
+        started.elapsed().as_micros() as u64,
+    );
+}
+
+/// Whether any guest-page writeback is submitted and not yet settled.
+///
+/// The same flag [`quiesce_guest_writes`] short-circuits on, exposed so a caller
+/// can ask whether there is anything to order behind *before* deciding how to
+/// order it. Reading it is one relaxed-acquire load.
+pub fn guest_writes_outstanding() -> bool {
+    GUEST_WRITE_DEBT.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Record the completion stamp's word into the GPU queue behind the writebacks
+/// this device still owes, and return without waiting for any of it.
+///
+/// # The ordering this buys, and the one it does not
+///
+/// The rule is unchanged: the guest may not observe the stamp until the frame is
+/// in its pages. [`quiesce_guest_writes`] enforces it by having this thread block
+/// until the copies have executed and then storing the word itself — one CPU
+/// round trip per stamp, measured at 1 368 us with only 628 us of it the copy.
+/// This records the word as a transfer into the same imported RAMBlock the
+/// copies write, behind a barrier that names every command submitted before it.
+///
+/// The barrier is the whole argument. A pipeline barrier applies to all commands
+/// submitted earlier in submission order on the same queue, not merely to the
+/// rest of its own command buffer — the property `copy_image_level0_to_buffer`'s
+/// image barrier already relies on to order a copy after draws recorded in an
+/// earlier submission. So `ALL_COMMANDS -> TRANSFER` here waits out every
+/// outstanding writeback *and* every outstanding guest read, which is what makes
+/// this rail subsume [`quiesce_guest_reads`] as well.
+///
+/// **It does not order the interrupt**, and that is not an oversight. The guest
+/// reads the stamp word directly and sleeps on it with a one-second deadline, so
+/// the interrupt is its wakeup rather than a hint. The submission signals a
+/// timeline value and `stamp_completion`'s thread raises the interrupt the
+/// moment it lands — see that module for what happens when this is deferred
+/// instead.
+///
+/// # Errors
+///
+/// Every error is a routing answer: the caller still owes the stamp and settles
+/// it the blocking way. Nothing is recorded and no timeline value is left
+/// outstanding — a reservation whose submit fails is signalled from the host so
+/// the completion thread does not block behind it.
+pub fn write_stamp_after_guest_writes(
+    guest_ref: &crate::runtime::guest_ram::GuestRef,
+    index: u32,
+    value: u32,
+) -> Result<(), DrawError> {
+    use host_ram::GuestWriteDecline;
+    let mut guard = lock_engine();
+    let EngineState {
+        ref mut owner,
+        ref mut pools,
+        ref counters,
+        ..
+    } = &mut *guard;
+    let ctx = owner.ensure(counters)?;
+    if !ctx.caps.host_pointer.is_available() {
+        return Err(DrawError::GuestPageWrite(GuestWriteDecline::Unsupported {
+            rung: ctx.caps.host_pointer.rung,
+        }));
+    }
+    let Some(completion) = ctx.stamp_completion.as_ref() else {
+        return Err(DrawError::GuestPageWrite(GuestWriteDecline::Unsupported {
+            rung: ctx.caps.host_pointer.rung,
+        }));
+    };
+    unsafe { pools.ensure_init(ctx, counters)? };
+    let bound = unsafe { pools.bind_guest_ram(ctx, guest_ref) }
+        .map_err(|inner| DrawError::GuestPageWrite(GuestWriteDecline::Import { inner }))?;
+    // Claimed before the reservation, because `begin_entry` can flush an open
+    // batch and a reservation held across that would be ordered behind work it
+    // does not describe.
+    let appended = pools.batch_open_recording();
+    let (cb, fence) = match appended {
+        Some(pair) => pair,
+        None => unsafe { pools.begin_entry(ctx, counters)? },
+    };
+    let record = || -> Result<(), DrawError> {
+        unsafe {
+            if appended.is_none() {
+                ctx.device
+                    .reset_command_buffer(cb, ash::vk::CommandBufferResetFlags::empty())
+                    .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::GuestWriteResetCb, e)))?;
+                ctx.device
+                    .begin_command_buffer(
+                        cb,
+                        &ash::vk::CommandBufferBeginInfo::default()
+                            .flags(ash::vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+                    )
+                    .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::GuestWriteBeginCb, e)))?;
+            }
+            // `ALL_COMMANDS` on the source side is not caution: what this must
+            // follow is the writeback copies (TRANSFER) *and* any draw still
+            // sourcing guest pages, and only the widest source stage covers both
+            // without this site having to know which are outstanding.
+            let owed = [ash::vk::MemoryBarrier::default()
+                .src_access_mask(
+                    ash::vk::AccessFlags::MEMORY_WRITE | ash::vk::AccessFlags::MEMORY_READ,
+                )
+                .dst_access_mask(ash::vk::AccessFlags::TRANSFER_WRITE)];
+            ctx.device.cmd_pipeline_barrier(
+                cb,
+                ash::vk::PipelineStageFlags::ALL_COMMANDS,
+                ash::vk::PipelineStageFlags::TRANSFER,
+                ash::vk::DependencyFlags::empty(),
+                &owed,
+                &[],
+                &[],
+            );
+            // Little-endian because `gpa_map::write_u32` is, and the guest reads
+            // one word either way this device writes it. `head` is the
+            // granularity rounding in front of the byte asked for, re-based
+            // exactly as the copy planners re-base.
+            ctx.device.cmd_update_buffer(
+                cb,
+                bound.buffer,
+                bound.offset + bound.head,
+                &value.to_le_bytes(),
+            );
+            // Released to the host so the vCPU's read of this word sees it.
+            // Guest RAM is ordinary system memory this process already has
+            // mapped and a PCIe write to it is snooped, so nothing is owed
+            // beyond the release.
+            let visible = [ash::vk::MemoryBarrier::default()
+                .src_access_mask(ash::vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(ash::vk::AccessFlags::HOST_READ)];
+            ctx.device.cmd_pipeline_barrier(
+                cb,
+                ash::vk::PipelineStageFlags::TRANSFER,
+                ash::vk::PipelineStageFlags::HOST,
+                ash::vk::DependencyFlags::empty(),
+                &visible,
+                &[],
+                &[],
+            );
+            Ok(())
+        }
+    };
+    record()?;
+    // Reserved after everything fallible that precedes the submit, so the only
+    // way to hold a value is to be about to submit it.
+    let (semaphore, timeline) = completion.reserve(index);
+    let submitted = unsafe {
+        if appended.is_some() {
+            pools.batch_flush_signalling(ctx, counters, semaphore, timeline)
+        } else {
+            ctx.device
+                .end_command_buffer(cb)
+                .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::GuestWriteEndCb, e)))
+                .and_then(|()| {
+                    let cbs = [cb];
+                    let sems = [semaphore];
+                    let vals = [timeline];
+                    let mut timeline_info = ash::vk::TimelineSemaphoreSubmitInfo::default()
+                        .signal_semaphore_values(&vals);
+                    let si = ash::vk::SubmitInfo::default()
+                        .command_buffers(&cbs)
+                        .signal_semaphores(&sems)
+                        .push_next(&mut timeline_info);
+                    ctx.device
+                        .queue_submit(ctx.queue(), &[si], fence)
+                        .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::GuestWriteSubmit, e)))
+                })
+                .map(|()| {
+                    let cleanup = pools.seal_entry(Vec::new(), Vec::new());
+                    pools.finish_entry_async(cleanup);
+                })
+        }
+    };
+    if let Err(e) = submitted {
+        // The value will never be signalled by the queue, and the completion
+        // thread is already waiting on it. Stand in for the submission so it
+        // does not block behind a value that is not coming — and with it, every
+        // later stamp.
+        unsafe { completion.abandon(&ctx.device, timeline) };
+        return Err(e);
+    }
+    counters.gpu_stamps.fetch_add(1, Ordering::Relaxed);
+    Ok(())
+}
+
+pub fn quiesce_guest_reads() {
+    let mut guard = lock_engine();
+    let EngineState {
+        ref mut owner,
+        ref mut pools,
+        ref counters,
+        ..
+    } = &mut *guard;
+    let Some(ctx) = owner.ctx.as_ref() else {
+        return;
+    };
+    if let Err(e) = unsafe { pools.quiesce_guest_reads(ctx, counters) } {
+        // The wait failed, so this device cannot say the guest's pages are done
+        // being read. Nothing here can hold the stamp back — the guest would
+        // hang — so report it and let the lost device surface on the next draw.
+        crate::observe::Emit::decline("vk_guest_read_quiesce", &e).fail_once(0);
+    }
+}
+
 /// Execute one compute dispatch against the persistent engine.
 pub fn execute_compute_request(req: &ComputeRequest) -> Result<ComputeOutput, ComputeError> {
     let mut guard = lock_engine();
@@ -557,7 +1083,11 @@ pub fn execute_compute_request(req: &ComputeRequest) -> Result<ComputeOutput, Co
     let result =
         unsafe { exec_compute::execute_compute_inner(owner, caches, pools, counters, req) };
     match result {
-        Ok(out) => Ok(out),
+        Ok(out) => {
+            // Same as the draw arm: a dispatch that ran proves the device.
+            guard.owner.note_work_completed();
+            Ok(out)
+        }
         Err(DrawError::DeviceLost(decline)) => {
             guard.counters.device_lost.fetch_add(1, Ordering::Relaxed);
             guard.owner.mark_device_lost();
@@ -601,12 +1131,73 @@ pub fn resident_presentable(identity: &TargetIdentity, width: u32, height: u32) 
         .is_some_and(|slot| pools::slot_presentable(slot, width, height))
 }
 
+/// Why this present cannot come from a resident, as a census route name, or
+/// `None` when it can.
+///
+/// The direct present is the point of owning the window on the engine's own
+/// device: the fallback copies the whole framebuffer through host memory every
+/// frame, so losing it is a throughput cliff. Four conditions collapsed into one
+/// `bool` here and the caller fell through without naming any of them, so a boot
+/// reading `direct_frac=0.00` in every census window — against a documented
+/// expectation of `1.00` — said only that it had stopped, never why.
+pub fn resident_present_decline_route(
+    identity: &TargetIdentity,
+    width: u32,
+    height: u32,
+) -> Option<&'static str> {
+    let guard = lock_engine();
+    let Some(slot) = guard.pools.registry_get(identity) else {
+        return Some("winpub_no_resident");
+    };
+    match pools::slot_present_decline(slot, width, height) {
+        None => None,
+        Some(pools::ResidentPresentDecline::ContentNotReady) => Some("winpub_content_not_ready"),
+        Some(pools::ResidentPresentDecline::ScanoutOrder) => Some("winpub_scanout_order"),
+        Some(pools::ResidentPresentDecline::Geometry) => Some("winpub_geometry"),
+    }
+}
+
 pub fn resident_content_ready(identity: &TargetIdentity) -> bool {
     let guard = lock_engine();
     guard
         .pools
         .registry_get(identity)
         .is_some_and(|s| s.content_ready)
+}
+
+/// Why this identity has no resident, when the reason is that this device
+/// destroyed one it was holding.
+///
+/// `Some` means the registry does not hold this identity **and** a reclaim
+/// record for it is still inside `RECLAIM_HISTORY`. `None` means either the
+/// resident is present, or this device has no record of ever having held one —
+/// which for a surface the guest has simply not been drawn into yet is the
+/// ordinary case and not a defect.
+///
+/// [`resident_content_ready`] cannot answer this: it is
+/// `is_some_and(content_ready)`, so it collapses "absent" and "held but not
+/// ready yet" into the same `false`. Those are opposite situations for a caller
+/// deciding whether falling through to the guest's pages is sound — a resident
+/// that is merely not ready still exists and can be merged from, and one this
+/// device destroyed cannot.
+///
+/// The second half of the pair is how many milliseconds ago the reclaim
+/// happened, which is what makes the reading uncensored: a resident read `since`
+/// ms after being destroyed had gone at least `IDLE_TARGET_AGE_MS + since`
+/// between uses, and that tail is invisible to `resident_resample_peak_ms`
+/// because the resident it would have been measured on no longer exists.
+pub fn resident_absent_after_reclaim(
+    identity: &TargetIdentity,
+) -> Option<(types::ResidentReclaim, u64)> {
+    let guard = lock_engine();
+    if guard.pools.registry_get(identity).is_some() {
+        return None;
+    }
+    let now = guard.pools.idle_clock_ms();
+    guard
+        .pools
+        .prior_reclaim_at(identity)
+        .map(|(why, at)| (why, now.saturating_sub(at)))
 }
 
 /// The mapping content epoch this resident's pixels were stamped with, or
@@ -638,8 +1229,8 @@ pub fn resident_content_epoch(identity: &TargetIdentity) -> Option<u32> {
 ///   surface says the resident no longer holds the frame this window promised.
 ///   Declining is correct; the newer pass owns the surface now.
 /// - [`ResidentContent::Absent`] is not. Nothing may evict a pinned slot —
-///   `evict_registry_to_cap` and the idle drain both skip pinned slots by design
-///   — so an identity that has gone missing between the arm and the fence means
+///   the allocation-failure reclaim and the idle drain both skip pinned slots by
+///   design — so an identity that has gone missing between the arm and the fence means
 ///   the two spellings of it disagree: the arm pinned one `TargetIdentity` and
 ///   the flush rebuilt another. That is a lost frame *and* a leaked pin, and it
 ///   is the same defect shape as `74748d2` and `021e64b`, which is why it must
@@ -674,6 +1265,17 @@ pub fn resident_content_state(identity: &TargetIdentity) -> ResidentContent {
 pub fn stamp_resident_content_epoch(identity: &TargetIdentity, epoch: u32) -> bool {
     let mut guard = lock_engine();
     guard.pools.registry_stamp_content_epoch(identity, epoch)
+}
+
+/// Record that this resident's pixels now exist somewhere that outlives the
+/// image, so the reclaim paths may take it. Returns whether a slot was found.
+///
+/// Call this only where the copy has actually landed. Not calling it costs
+/// retained VRAM; calling it wrongly costs the frame — see
+/// [`crate::backend::vulkan::engine::pools::ResidentTargetSlot::gpu_only_content`].
+pub fn note_resident_content_copied_out(identity: &TargetIdentity) -> bool {
+    let mut guard = lock_engine();
+    guard.pools.registry_note_content_copied_out(identity)
 }
 
 /// Whether this backend may leave guest-visible content only in GPU-resident
@@ -836,7 +1438,7 @@ fn engine_probe_decline(probe: EngineProbe, error: &DrawError) -> crate::observe
 pub fn compute_resident_storage_generation(
     identity: &crate::model::ComputeStorageResidencyKey,
 ) -> Option<u32> {
-    let guard = lock_engine();
+    let mut guard = lock_engine();
     guard.pools.compute_resident_generation(identity)
 }
 
@@ -852,7 +1454,7 @@ pub fn compute_resident_storage_generation(
 pub fn compute_resident_sample_source(
     identity: &crate::model::ComputeStorageResidencyKey,
 ) -> Option<(u32, StorageImageFormat)> {
-    let guard = lock_engine();
+    let mut guard = lock_engine();
     guard.pools.compute_resident_sample_source(identity)
 }
 
@@ -862,6 +1464,49 @@ pub fn compute_resident_sample_source(
 pub fn unpin_resident_storage(identity: &crate::model::ComputeStorageResidencyKey) {
     let mut guard = lock_engine();
     guard.pools.pin_resident_storage(identity, false);
+}
+
+/// Release a compute-storage resident's claim on being unreclaimable because the
+/// guest deleted the object its content belonged to.
+///
+/// Paired with `unpin_resident_storage` at the teardown sites only. An unpin
+/// alone stopped being enough once the reclaim paths learned to refuse a
+/// sole-copy resident: `retire_linear_residents` exists to keep a dead cache
+/// entry from leaking its pinned VRAM image for the boot, and without this the
+/// leak would simply change its name. Never call it on a live object — the whole
+/// point of the flag is that content nobody has copied out is not disposable.
+pub fn retire_resident_storage_content(identity: &crate::model::ComputeStorageResidencyKey) {
+    let mut guard = lock_engine();
+    guard.pools.note_compute_storage_content_retired(identity);
+}
+
+/// A synchronous compute writeback landed this resident's output in the guest's
+/// own pages, so the image has stopped being the only place that output exists
+/// and the reclaim paths may take it.
+///
+/// The deferred rail already had this edge — `read_resident_storage` clears the
+/// flag when its flush lands — but the **synchronous** rail did not, and it is
+/// the common one. `mark_resident_storage_image` sets `gpu_only_content` after
+/// every executed dispatch, and on this rail nothing ever cleared it again: the
+/// bytes were read back, handed to `writeback_texture` and written to guest
+/// pages, and the resident stayed flagged as unreproducible for the life of the
+/// guest.
+///
+/// Every reclaim path refuses a sole copy — the idle drain, and
+/// `reclaim_compute_storage_for_allocation_retry` — so those residents were
+/// unreclaimable by anything. The registry only grew, and an allocation failure
+/// found nothing to give back at the one moment it needed something. That is
+/// the shape of the leak `retire_resident_storage_content` was written to stop
+/// for a *dead* cache entry, arriving instead through the live path.
+///
+/// Called after the writeback rather than after the readback, which is the
+/// stricter of the two and deliberately so: the readback only moves the bytes
+/// into a host `Vec`, and it is `writeback_texture` returning `Ok` that says a
+/// later reader can find them. Clearing at the readback would open a window
+/// where a reclaim takes a resident whose output reached nowhere.
+pub fn note_resident_storage_copied_out(identity: &crate::model::ComputeStorageResidencyKey) {
+    let mut guard = lock_engine();
+    guard.pools.note_compute_storage_copied_out(identity);
 }
 
 /// True when the device supports format-less storage-image writes
@@ -915,7 +1560,7 @@ pub fn supports_sampled_r32f_linear_filter() -> bool {
 ///
 /// This is the resident-direct capture source: it performs only the GPU→host
 /// readback, with **no** guest-page scatter. `capture_present_frame`'s other
-/// source (`flush_intersecting` → `present_into_host_runs`) reads the same
+/// source — `flush_intersecting`, the deferred render-flush rail — reads the same
 /// resident but additionally scatters it into the fragmented guest pages — work
 /// the oracle does not need and which the deferred-writeback rail already
 /// performs on a genuine guest read. Errors (rather than swapping channels) on a
@@ -930,12 +1575,12 @@ pub fn read_resident_bgra(identity: &TargetIdentity, need: usize) -> Option<Vec<
     {
         let guard = lock_engine();
         let slot = guard.pools.registry_get(identity)?;
-        if !slot.content_ready || !slot.bgra {
+        if !slot.content_ready || !slot.scanout_order() {
             return None;
         }
     }
     let mut px = match read_target_inner(identity) {
-        // The `slot.bgra` gate above already established the order, so the
+        // The `scanout_order` gate above already established the order, so the
         // reported one cannot disagree and the bytes pass through untouched.
         Ok(rb) => rb.pixels,
         Err(e) => {
@@ -981,7 +1626,7 @@ struct ReadbackOps {
 /// Async ring advance (retires only the one slot it reuses), NOT a whole-ring
 /// quiesce: this reads content that is already ready, not an UNDEFINED-layout
 /// seed, so the `ALL_COMMANDS → TRANSFER` barrier below orders the copy after
-/// every prior-submitted draw. `begin_entry_sync` would block this guest-drain
+/// every prior-submitted draw. A whole-ring quiesce would block this guest-drain
 /// readback behind an unrelated in-flight heavy draw — the `finish_us` tail. We
 /// wait only our own `fence` after submit, and the slot stays pending for the
 /// ring to retire later.
@@ -1020,23 +1665,23 @@ enum ReadbackResult {
 /// read — nothing is borrowing it — but it strands the slot for the process
 /// lifetime and makes every later teardown wait out its whole quiesce budget,
 /// which presents as a hang rather than as a leak. One guard covers all six.
-struct ReadbackLeaseGuard(Option<(u64, usize)>);
+struct ReadbackLeaseGuard(Option<pools::ReadbackLease>);
 
 impl ReadbackLeaseGuard {
-    fn new(lease: Option<(u64, usize)>) -> Self {
+    fn new(lease: Option<pools::ReadbackLease>) -> Self {
         Self(lease)
     }
 
     /// Take the lease out, so the caller owns the obligation from here on.
-    fn disarm(&mut self) -> Option<(u64, usize)> {
+    fn disarm(&mut self) -> Option<pools::ReadbackLease> {
         self.0.take()
     }
 }
 
 impl Drop for ReadbackLeaseGuard {
     fn drop(&mut self) {
-        if let Some((token, _)) = self.0.take() {
-            pools::return_readback_lease(token);
+        if let Some(lease) = self.0.take() {
+            pools::return_readback_lease(lease.token);
         }
     }
 }
@@ -1115,7 +1760,37 @@ unsafe fn copy_image_level0_to_host_delivered(
     // frames the rail exists for. A live boot read `render_flush_copied`
     // outnumbering `render_flush_leased` 5:1 on a host whose readback memory is
     // cached, which is the only symptom that mis-ordering has.
-    let (cb, fence) = pools.begin_entry(ctx, counters)?;
+    //
+    // # Appending to an open batch instead of flushing it
+    //
+    // A readback used to be two submissions: `begin_entry` submits the open
+    // draw batch to get it out of the way, then this function submits its own
+    // command buffer behind it. A driven boot measured
+    // `batch_readback_joins` at 58.8 % of all batch flushes and the batches
+    // themselves at 1.77 draws against a ceiling of 8 — so nearly every readback
+    // was cutting a run of draws short to pay for a second submission.
+    //
+    // When a batch is recording, the copy is appended to *it* and the batch is
+    // submitted once. Queue order is unchanged: the copy is recorded after the
+    // draws it reads, which is the same order the two submissions produced. The
+    // barrier below is what makes that an actual dependency, and it is recorded
+    // either way.
+    //
+    // This also *removes* the staging-slot hazard the paragraph above describes
+    // rather than adding to it. The slot is acquired after the batch's cb is in
+    // hand and is sealed into the batch's own pending cleanup by
+    // `batch_flush` — so the fence that returns it to the free list is now the
+    // very fence this copy was submitted with, instead of one submitted earlier.
+    let appended = pools.batch_open_recording();
+    let (cb, fence) = match appended {
+        Some(pair) => {
+            counters
+                .batch_readback_joins
+                .fetch_add(1, Ordering::Relaxed);
+            pair
+        }
+        None => pools.begin_entry(ctx, counters)?,
+    };
     let readback = pools.acquire_readback(ctx, rb_size, counters)?;
     // Acquired here rather than beside the dispatch, for the ordering reason
     // above: every readback slot this submission owns must be claimed after
@@ -1131,16 +1806,21 @@ unsafe fn copy_image_level0_to_host_delivered(
     } else {
         None
     });
-    ctx.device
-        .reset_command_buffer(cb, ash::vk::CommandBufferResetFlags::empty())
-        .map_err(|e| DrawError::VkCall(VkCall::new(ops.reset_cb, e)))?;
-    ctx.device
-        .begin_command_buffer(
-            cb,
-            &ash::vk::CommandBufferBeginInfo::default()
-                .flags(ash::vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-        )
-        .map_err(|e| DrawError::VkCall(VkCall::new(ops.begin_cb, e)))?;
+    // Only for a command buffer this call owns. An appended-to batch is already
+    // recording and holds the draws the copy is about to read; resetting it
+    // would discard them and beginning it again is invalid.
+    if appended.is_none() {
+        ctx.device
+            .reset_command_buffer(cb, ash::vk::CommandBufferResetFlags::empty())
+            .map_err(|e| DrawError::VkCall(VkCall::new(ops.reset_cb, e)))?;
+        ctx.device
+            .begin_command_buffer(
+                cb,
+                &ash::vk::CommandBufferBeginInfo::default()
+                    .flags(ash::vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+            )
+            .map_err(|e| DrawError::VkCall(VkCall::new(ops.begin_cb, e)))?;
+    }
     // Unconditional, and the layout match is exactly why. A barrier is two
     // things — a layout transition and a dependency — and this rail needs the
     // second one whether or not it needs the first. Every render pass resolves
@@ -1210,9 +1890,26 @@ unsafe fn copy_image_level0_to_host_delivered(
         })];
     // The whole level, every time: nothing upstream tells this call which part
     // of the frame the draws touched. That is what the slots 1-2 span prices —
-    // on a discrete part this copy crosses the bus and is 87-91% of the fence,
-    // so `gpu_us` owning `fence_us` in `readback_split` is bytes and not
-    // latency, and bounding the region is the lever that would move it.
+    // on a discrete part this copy crosses the bus, so `gpu_us`'s share of
+    // `fence_us` in `readback_split` is bytes and not latency.
+    //
+    // **Bounding the region is not an available lever, and this used to say it
+    // was.** It needs a damage rect, and the device decodes no source for one.
+    // The draw stream's scissors are 100% of the attachment on 99.92% of armed
+    // windows, and the guest's own `renderTargetWidth`/`Height` — the remaining
+    // candidate, and the one `runtime::exec::note_pass_extent_coverage` was
+    // built to score — reads `pass_extent_full` on 11 826 of 11 827 scored
+    // passes. The guest states the attachment's geometry, not a sub-rect. Small
+    // numbers in the fail log are small *surfaces*.
+    //
+    // What the same boot does leave open is the other half of the fence. Per
+    // readback, 217.6 us divides as `bar_us` 1.16 + `gpu_us` 131.1 + 85.3
+    // unaccounted, and `bar_us` near zero proves the draws are already finished
+    // when the copy runs — so the 85.3 us is submission and wake latency. A
+    // readback is two submissions today, because `begin_entry` above flushes the
+    // open draw batch before claiming a slot (`batch_readback_joins` is 58.8%
+    // of all batch flushes). Collapsing those two is the lever; see
+    // `pools::BATCH_MAX_DRAWS`.
     ctx.device.cmd_copy_image_to_buffer(
         cb,
         image,
@@ -1228,17 +1925,25 @@ unsafe fn copy_image_level0_to_host_delivered(
             2,
         );
     }
-    ctx.device
-        .end_command_buffer(cb)
-        .map_err(|e| DrawError::VkCall(VkCall::new(ops.end_cb, e)))?;
-    let queue = ctx.queue();
-    let cbs = [cb];
-    let si = ash::vk::SubmitInfo::default().command_buffers(&cbs);
-    ctx.device
-        .queue_submit(queue, &[si], fence)
-        .map_err(|e| DrawError::VkCall(VkCall::new(ops.submit, e)))?;
-    let cleanup = pools.seal_entry(Vec::new(), Vec::new());
-    pools.finish_entry_async(cleanup);
+    if appended.is_some() {
+        // `batch_flush` ends the command buffer, submits it with the fence
+        // `batch_open_recording` handed back, and seals the batch's cleanup —
+        // which now carries this copy's staging slot. One submission for the
+        // draws and the copy together.
+        pools.batch_flush(ctx, counters)?;
+    } else {
+        ctx.device
+            .end_command_buffer(cb)
+            .map_err(|e| DrawError::VkCall(VkCall::new(ops.end_cb, e)))?;
+        let queue = ctx.queue();
+        let cbs = [cb];
+        let si = ash::vk::SubmitInfo::default().command_buffers(&cbs);
+        ctx.device
+            .queue_submit(queue, &[si], fence)
+            .map_err(|e| DrawError::VkCall(VkCall::new(ops.submit, e)))?;
+        let cleanup = pools.seal_entry(Vec::new(), Vec::new());
+        pools.finish_entry_async(cleanup);
+    }
     // Split three ways rather than timed as a whole: the submit and the copy
     // scale with the surface, the fence does not scale with anything we control,
     // and the fix for one is not the fix for the others.
@@ -1293,19 +1998,38 @@ unsafe fn copy_image_level0_to_host_delivered(
         // alone: the whole-frame memcpy the other arm pays is what the lease
         // exists to delete, and the phase reading near zero is how you tell it
         // happened.
-        Some((token, ptr)) => {
-            match pools::invalidate_slot_for_read(ctx, &readback, ops.invalidate) {
-                Ok(()) => Ok(ReadbackResult::Leased {
-                    token,
-                    ptr,
-                    len: rb_size as usize,
-                }),
-                Err(e) => {
-                    pools::return_readback_lease(token);
-                    Err(e)
-                }
-            }
+        // The lease's own extent decides whether it can be read in place. It
+        // is the third refusal alongside `mapped == 0` and `!cached`, and like
+        // both of those the answer is the copying path — which asks
+        // `slot_span_fits` again on its own arm — rather than a failure. It
+        // cannot fire: `acquire_readback` rounds `rb_size` up to a bucket and
+        // records that bucket as the slot's size. It is here because that is a
+        // property of a call three frames up, and `bytes()` builds a slice of
+        // `len` over this pointer on the strength of it.
+        Some(lease) if !pools::slot_span_fits(rb_size, lease.slot_size) => {
+            crate::observe::Emit::decline(
+                "vk_engine_readback",
+                &draw_execution::DrawExecutionDecline::LeaseBeyondSlot {
+                    len: rb_size,
+                    slot_size: lease.slot_size,
+                },
+            )
+            .fail_once(0);
+            pools::return_readback_lease(lease.token);
+            pools::read_back_slot(ctx, &readback, rb_size, ops.map, ops.invalidate)
+                .map(ReadbackResult::Copied)
         }
+        Some(lease) => match pools::invalidate_slot_for_read(ctx, &readback, ops.invalidate) {
+            Ok(()) => Ok(ReadbackResult::Leased {
+                token: lease.token,
+                ptr: lease.ptr,
+                len: rb_size as usize,
+            }),
+            Err(e) => {
+                pools::return_readback_lease(lease.token);
+                Err(e)
+            }
+        },
         None => pools::read_back_slot(ctx, &readback, rb_size, ops.map, ops.invalidate)
             .map(ReadbackResult::Copied),
     };
@@ -1454,7 +2178,7 @@ pub fn read_target_leased(identity: &TargetIdentity) -> Result<Option<LeasedFram
             target_readback_ops(),
             ReadbackDelivery::Lease,
         )?;
-        pools.registry_set_layout(identity, ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
+        pools.registry_note_access(identity, pools::ResidentAccess::TransferRead);
         counters.note_target_read(rb_size);
         Ok(match delivered {
             ReadbackResult::Leased { token, ptr, len } => Some(LeasedFrame {
@@ -1470,6 +2194,693 @@ pub fn read_target_leased(identity: &TargetIdentity) -> Result<Option<LeasedFram
             ReadbackResult::Copied(_) => None,
         })
     }
+}
+
+/// Where in the guest's own pages a resident's frame lands, as a bounded
+/// reference the engine can bind.
+///
+/// Built by the runtime, which is the only side that knows a mapping's page list
+/// and its row pitch; the engine takes it as given and checks only what it can
+/// see — that the resident matches the extent and that the range is long enough.
+pub struct GuestPageTarget {
+    /// The guest bytes the frame lands in, one bindable reference per
+    /// contiguous stretch, ascending and tiling the window exactly.
+    ///
+    /// A `Vec` because the guest backs a surface in 16 KiB granules that are
+    /// unrelated to each other, so a 1920x1080 window is ~507 stretches and one
+    /// range would name 1/507th of the frame. `references_for_runs` is the only
+    /// producer and it guarantees the tiling; see its doc for what that buys.
+    pub runs: Vec<crate::runtime::guest_ram_map::GuestWindowRun>,
+    /// Guest row pitch in **texels** (`bufferRowLength`). Rows past the first
+    /// start this far apart, which is how a padded guest pitch is honoured
+    /// without the inter-row bytes ever being written.
+    pub row_length_texels: u32,
+    pub width: u32,
+    pub height: u32,
+    /// Channel order the guest reads these bytes back in, from the format it
+    /// declared for this destination.
+    ///
+    /// The copy converts nothing, so this is the order the resident must
+    /// already hold; the engine checks the pair and refuses by name rather than
+    /// assuming either side. It lives here and not on the identity because it
+    /// is a property of the *destination* — the runtime is the only side that
+    /// knows what the guest declared, exactly as it is for the row pitch above.
+    pub bgra: bool,
+}
+
+impl GuestPageTarget {
+    /// One past the last byte the copy writes: the last texel of the last row.
+    ///
+    /// Padding after the final row is deliberately excluded. Those bytes belong
+    /// to the surface's plane but are not texels this call was given, and the
+    /// copying rail does not write them either — a bound that included them
+    /// would make the two rails land different guest memory for one frame.
+    fn extent_end(&self) -> u64 {
+        let pitch = u64::from(self.row_length_texels.max(self.width)) * 4;
+        let rows_before = u64::from(self.height.saturating_sub(1));
+        rows_before * pitch + u64::from(self.width) * 4
+    }
+
+    /// Guest bytes the runs actually name, summed.
+    ///
+    /// Each run's `requested` and not its `bound_len`: the latter is rounded
+    /// out to the import's granularity, so summing it would claim coverage of
+    /// bytes past the window and turn a short window into one that passes the
+    /// check below.
+    fn window_bytes(&self) -> u64 {
+        self.runs
+            .iter()
+            .map(|r| r.guest.requested())
+            .fold(0u64, u64::saturating_add)
+    }
+
+    /// Guest bytes between the starts of two consecutive rows.
+    fn pitch_bytes(&self) -> u64 {
+        u64::from(self.row_length_texels.max(self.width)) * 4
+    }
+
+    /// The window's byte layout, for planning copy rectangles.
+    fn geometry(&self) -> reims_vgpu_paging::regions::WindowGeometry {
+        reims_vgpu_paging::regions::WindowGeometry {
+            pitch_bytes: self.pitch_bytes(),
+            width_texels: self.width,
+            height_texels: self.height,
+        }
+    }
+
+    /// Whether the window's rows carry no padding, so every byte from the first
+    /// texel to the last is a texel byte.
+    ///
+    /// This is the precondition for the linear path, and it is a statement
+    /// about the *contract* rather than about a workload: when it holds, window
+    /// byte `o` is the frame's byte `o` under a tight packing, so a scratch
+    /// buffer detiled at that packing can be scattered by byte range with no
+    /// row or format arithmetic left to do. When it does not hold, a run's
+    /// bytes include padding that must not be written
+    /// (`reims_vgpu_paging::regions` states why), and a
+    /// `VkBufferCopy` has no way to skip it — so that window takes the
+    /// rectangle path, which does.
+    fn rows_are_dense(&self) -> bool {
+        self.pitch_bytes() == u64::from(self.width) * 4
+    }
+}
+
+/// Copy a resident target straight into the guest's pages, with no host copy of
+/// the frame at any point.
+///
+/// # What this replaces
+///
+/// The copying rail reads the resident into a `HOST_VISIBLE` staging buffer,
+/// waits, and then has the CPU scatter it row by row into guest RAM. Both halves
+/// move the whole frame — `readback_split` prices them at 0.83 ms of staging
+/// memcpy plus 2.68 ms of guest-page write in a 6.9 ms flush — and the GPU is
+/// already writing every one of those bytes once. Handing it the guest pages as
+/// the copy's destination deletes both, leaving the copy that always had to
+/// happen.
+///
+/// # Why this direction is sound where the read direction is not
+///
+/// Binding guest pages as a draw's *source* would have the GPU read them when
+/// the command buffer executes, and this device acks a command before its work
+/// runs — so the guest may repaint the pages first. Nothing here has that shape.
+/// The caller runs inside `flush_all_windows_before_fence`, which is ordered
+/// before the completion stamp, and [`quiesce_guest_writes`] sits between the
+/// two: the pages hold the frame before the guest is told anything.
+///
+/// # This call does not wait, and takes the pin
+///
+/// It returns once the copy is submitted. Two obligations follow from that and
+/// neither is the caller's to discharge by hand:
+///
+/// * The bytes are not in guest RAM yet. Anything about to *read* them —
+///   including the guest, via the stamp — must call [`quiesce_guest_writes`]
+///   first.
+/// * On `Ok`, `identity`'s registry pin is now held by the entry carrying the
+///   copy and released when its fence retires. **The caller must not unpin it**;
+///   unpinning here is what would let the reclaim take an image the GPU has not
+///   finished reading. An `Err` is a routing answer taken before anything was
+///   recorded, so the pin is untouched and the caller still owns it — which is
+///   what lets the copying arms below the decline unpin exactly as they always
+///   did.
+///
+/// # Errors
+///
+/// Every error is a routing answer — the caller still owes the frame, by the
+/// copying rail — except that a `VkCall` failure after the submit means the copy
+/// may have partly landed. That is the same exposure the copying rail carries
+/// for a partial scatter, and the caller reports it the same way.
+/// # `pages` is the ledger's currency, not the copy's
+///
+/// The copy is driven entirely by `dst`. `pages` is the same destination spelled
+/// as guest page addresses, which is the only spelling a later reader of those
+/// bytes can compare its own window against — see [`GUEST_WRITE_PAGES`]. Both
+/// callers walk it to build `dst.runs` and hand the walk's own output here, so
+/// the two cannot describe different memory.
+pub fn copy_target_to_guest_pages(
+    identity: &TargetIdentity,
+    dst: &GuestPageTarget,
+    pages: &[u64],
+) -> Result<(), DrawError> {
+    use host_ram::GuestWriteDecline;
+    let mut guard = lock_engine();
+    let EngineState {
+        ref mut owner,
+        ref mut pools,
+        ref counters,
+        ..
+    } = &mut *guard;
+    let ctx = owner.ensure(counters)?;
+    if !ctx.caps.host_pointer.is_available() {
+        return Err(DrawError::GuestPageWrite(GuestWriteDecline::Unsupported {
+            rung: ctx.caps.host_pointer.rung,
+        }));
+    }
+    unsafe { pools.ensure_init(ctx, counters)? };
+    let snap = resident_read_snapshot(pools, identity)?;
+    if snap.bgra != dst.bgra {
+        return Err(DrawError::GuestPageWrite(GuestWriteDecline::OrderMismatch {
+            resident_bgra: snap.bgra,
+            want_bgra: dst.bgra,
+        }));
+    }
+    if snap.width != dst.width || snap.height != dst.height {
+        return Err(DrawError::GuestPageWrite(
+            GuestWriteDecline::GeometryMoved {
+                resident_width: snap.width,
+                resident_height: snap.height,
+                want_width: dst.width,
+                want_height: dst.height,
+            },
+        ));
+    }
+    let need = dst.extent_end();
+    let have = dst.window_bytes();
+    if need > have {
+        return Err(DrawError::GuestPageWrite(
+            GuestWriteDecline::WindowTooSmall { need, have },
+        ));
+    }
+    unsafe {
+        // Dense rows are the common case and the cheap one; a padded pitch
+        // falls to the rectangle path, which is the only form that can leave
+        // the padding unwritten. Both land the same guest bytes.
+        let plan = if dst.rows_are_dense() {
+            let scratch = pools.acquire_guest_scratch(ctx, need, counters)?;
+            let scatter = plan_guest_linear_copies(ctx, pools, dst)?;
+            counters.guest_write_linear.fetch_add(1, Ordering::Relaxed);
+            GuestCopyPlan::Linear {
+                scratch,
+                // `buffer_row_length(0)` is Vulkan's "tightly packed", which is
+                // exactly what dense means. Passing `row_length_texels` would
+                // be the same number whenever it is set and an invalid one
+                // (below `width`) if the guest ever understated it.
+                detile: ash::vk::BufferImageCopy::default()
+                    .buffer_offset(0)
+                    .buffer_row_length(0)
+                    .buffer_image_height(0)
+                    .image_subresource(color_subresource_layers())
+                    .image_offset(ash::vk::Offset3D { x: 0, y: 0, z: 0 })
+                    .image_extent(ash::vk::Extent3D {
+                        width: dst.width,
+                        height: dst.height,
+                        depth: 1,
+                    }),
+                scatter,
+            }
+        } else {
+            let plan = GuestCopyPlan::Rectangles(plan_guest_copies(ctx, pools, dst)?);
+            counters.guest_write_rects.fetch_add(1, Ordering::Relaxed);
+            plan
+        };
+        counters
+            .guest_write_regions
+            .fetch_add(plan.regions(), Ordering::Relaxed);
+        copy_image_level0_to_buffer(ctx, pools, counters, &snap, &plan)?;
+        pools.registry_note_access(identity, pools::ResidentAccess::TransferRead);
+        counters.note_target_read(u64::from(dst.width) * u64::from(dst.height) * 4);
+    }
+    // Past the last fallible step, so this runs exactly when the copy is on the
+    // queue. The ledger takes the resident's pin itself here — the caller holds
+    // none, and `finish` clears `gpu_only_content` as soon as this returns, so
+    // between that and the settle the pin is all that keeps the reclaim off an
+    // image the submitted copy still reads. Safe to leave until the end rather
+    // than guarding every early return above, because the whole body runs under
+    // the engine lock and a reclaim needs the same lock: nothing can take the
+    // image while this function is running, only after it returns.
+    pools.note_guest_write_recorded(identity);
+    // Before the flag and under the same lock: a reader that observes the flag
+    // set must observe a footprint that already names this write, or it would be
+    // told "disjoint" about pages this copy is landing in.
+    arm_guest_write_pages(pages);
+    // Published after the ledger entry and while the engine lock is still held,
+    // so no thread can observe the flag clear while a copy is outstanding.
+    GUEST_WRITE_DEBT.store(true, std::sync::atomic::Ordering::Release);
+    Ok(())
+}
+
+/// How one frame gets from a resident image into the guest's stretches.
+///
+/// Two shapes, chosen by whether the guest's rows carry padding
+/// ([`GuestPageTarget::rows_are_dense`]), and they land byte-identical guest
+/// memory — the choice is a cost decision and never a visible one.
+enum GuestCopyPlan {
+    /// Straight from the image into guest RAM, as image-copy rectangles.
+    ///
+    /// The only form that can express "write these texels and not the padding
+    /// between their rows", which is why a padded window must take it.
+    Rectangles(Vec<(ash::vk::Buffer, Vec<ash::vk::BufferImageCopy>)>),
+    /// Detile the whole frame once into a device-local scratch, then scatter
+    /// it with plain byte ranges.
+    ///
+    /// # Why the extra hop is cheaper than the copy it removes
+    ///
+    /// The rectangle form makes the bus-crossing pass do two jobs at once:
+    /// detile an optimal-tiled image *and* write ~1500 part-row rectangles to
+    /// system memory, the largest of which is one 16 KiB stretch. Splitting
+    /// them lets each run at its own best shape — the detile is one rectangle
+    /// against device-local memory, and the crossing becomes ~507 linear reads
+    /// with no row or format semantics for the driver to interpret per region.
+    ///
+    /// The frame is written twice instead of once, but only one of those
+    /// writes crosses the bus, which is the one that was ever expensive on a
+    /// discrete host.
+    Linear {
+        scratch: ash::vk::Buffer,
+        /// The one rectangle that fills the scratch, tightly packed.
+        detile: ash::vk::BufferImageCopy,
+        /// One byte range per guest stretch, grouped by the buffer it lands in.
+        scatter: Vec<(ash::vk::Buffer, Vec<ash::vk::BufferCopy>)>,
+    },
+}
+
+impl GuestCopyPlan {
+    /// Copy regions this plan will submit, for the census.
+    ///
+    /// The detiling rectangle counts: it is a region the driver consumes, and
+    /// leaving it out would make the linear path's total read as exactly the
+    /// stretch count when it is one more than that.
+    fn regions(&self) -> u64 {
+        match self {
+            Self::Rectangles(groups) => groups.iter().map(|(_, r)| r.len() as u64).sum(),
+            Self::Linear { scatter, .. } => {
+                1 + scatter.iter().map(|(_, r)| r.len() as u64).sum::<u64>()
+            }
+        }
+    }
+}
+
+/// Bind every run and turn it into one byte range each, grouped by the buffer
+/// it lands in.
+///
+/// Only valid for a dense window: the caller has checked
+/// [`GuestPageTarget::rows_are_dense`], which is what makes window byte `o`
+/// and scratch byte `o` the same byte. Nothing in a `VkBufferCopy` carries row
+/// or format semantics, so that identity is the whole of the arithmetic here —
+/// which is why this planner has no geometry and no rectangles.
+///
+/// Grouped for the reason [`plan_guest_copies`] groups: two runs need not share
+/// an import, and one `vkCmdCopyBuffer` names exactly one destination buffer.
+unsafe fn plan_guest_linear_copies(
+    ctx: &context::DeviceContext,
+    pools: &mut pools::ResourcePools,
+    dst: &GuestPageTarget,
+) -> Result<Vec<(ash::vk::Buffer, Vec<ash::vk::BufferCopy>)>, DrawError> {
+    use host_ram::GuestWriteDecline;
+    let mut grouped: Vec<(ash::vk::Buffer, Vec<ash::vk::BufferCopy>)> = Vec::new();
+    for run in &dst.runs {
+        let bound = unsafe { pools.bind_guest_ram(ctx, &run.guest) }
+            .map_err(|inner| DrawError::GuestPageWrite(GuestWriteDecline::Import { inner }))?;
+        let copy = ash::vk::BufferCopy::default()
+            // `head` is what the granularity rounding added in front of the
+            // byte the caller asked for, so the run's first requested byte
+            // sits here — the same re-basing the rectangle path does.
+            .dst_offset(bound.offset + bound.head)
+            .src_offset(run.window_offset)
+            // `requested` and not `bound_len`: the latter is rounded out to the
+            // import's granularity, and copying it would write guest bytes
+            // either side of the window that this frame was never given.
+            .size(run.guest.requested());
+        group_by_buffer(&mut grouped, bound.buffer, copy);
+    }
+    Ok(grouped)
+}
+
+/// Add one stretch's copy to the group for `buffer`, opening a group if this is
+/// the first stretch to name it.
+///
+/// # Why every guest-memory planner groups
+///
+/// Two stretches of one window need not resolve against the same import: a
+/// window straddling two RAMBlocks gives two `VkBuffer`s, and one `vkCmdCopy*`
+/// names exactly one. Ordinary machines have one RAMBlock, so every group list
+/// is a single entry and a planner that ignored this would look correct on every
+/// host anyone runs — while landing, on a two-block machine, whichever part of
+/// the window happened to come first.
+///
+/// One implementation because there are now four planners (the writeback's
+/// rectangle and linear forms, the draw-time buffer gather, and any that
+/// follows) and this is precisely the shape `AGENTS.md` warns about: a rule
+/// written by hand N times, where the copies diverge in the arm nobody boots.
+/// Generic over the copy type — `VkBufferCopy` and `VkBufferImageCopy` group
+/// identically because the grouping is about the buffer, not the copy.
+pub(super) fn group_by_buffer<C>(
+    groups: &mut Vec<(ash::vk::Buffer, Vec<C>)>,
+    buffer: ash::vk::Buffer,
+    copy: C,
+) {
+    match groups.iter_mut().find(|(b, _)| *b == buffer) {
+        Some((_, copies)) => copies.push(copy),
+        None => groups.push((buffer, vec![copy])),
+    }
+}
+
+/// Bind every run and turn it into copy rectangles, grouped by the buffer they
+/// land in.
+///
+/// Grouped because two runs need not share an import: a window straddling two
+/// RAMBlocks resolves against two `VkBuffer`s, and one `vkCmdCopyImageToBuffer`
+/// names exactly one. Ordinary machines have one RAMBlock and this is a
+/// single-entry `Vec`, but the grouping is what makes the two-block case land
+/// the whole frame instead of the part that happened to be first.
+unsafe fn plan_guest_copies(
+    ctx: &context::DeviceContext,
+    pools: &mut pools::ResourcePools,
+    dst: &GuestPageTarget,
+) -> Result<Vec<(ash::vk::Buffer, Vec<ash::vk::BufferImageCopy>)>, DrawError> {
+    use host_ram::GuestWriteDecline;
+    let geom = dst.geometry();
+    let mut grouped: Vec<(ash::vk::Buffer, Vec<ash::vk::BufferImageCopy>)> = Vec::new();
+    for run in &dst.runs {
+        let bound = unsafe { pools.bind_guest_ram(ctx, &run.guest) }
+            .map_err(|inner| DrawError::GuestPageWrite(GuestWriteDecline::Import { inner }))?;
+        // `head` is what the granularity rounding added in front of the byte the
+        // caller asked for, so the run's first requested byte sits here.
+        let base = bound.offset + bound.head;
+        let start = run.window_offset;
+        let end = start.saturating_add(run.guest.requested());
+        for r in reims_vgpu_paging::regions::plan_regions(&geom, start, end) {
+            let region = ash::vk::BufferImageCopy::default()
+                // The rectangle's own offset is in window bytes; `- start`
+                // re-bases it onto this run, which is what `base` names.
+                .buffer_offset(base + (r.window_offset - start))
+                // In texels. This is the buffer-side row stride, and it is what
+                // makes a merged multi-row rectangle name consecutive guest
+                // rows — valid because within one run the guest bytes are
+                // contiguous, so consecutive rows really are `pitch` apart.
+                .buffer_row_length(dst.row_length_texels)
+                .image_subresource(color_subresource_layers())
+                .image_offset(ash::vk::Offset3D {
+                    x: r.x as i32,
+                    y: r.y as i32,
+                    z: 0,
+                })
+                .image_extent(ash::vk::Extent3D {
+                    width: r.width,
+                    height: r.height,
+                    depth: 1,
+                });
+            group_by_buffer(&mut grouped, bound.buffer, region);
+        }
+    }
+    Ok(grouped)
+}
+
+/// Record and submit one image→buffer copy of a resident's level 0, without
+/// waiting for it.
+///
+/// An `Ok` means the copy is on the queue; the caller owns everything that
+/// follows from it not having executed yet.
+///
+/// # Safety
+///
+/// `buffer` must be bound to memory covering `dst`'s extent, and `snap` must
+/// name a live image belonging to `ctx`.
+unsafe fn copy_image_level0_to_buffer(
+    ctx: &context::DeviceContext,
+    pools: &mut pools::ResourcePools,
+    counters: &counters::EngineCounters,
+    snap: &ResidentReadSnapshot,
+    plan: &GuestCopyPlan,
+) -> Result<(), DrawError> {
+    use crate::runtime::drain::{note_readback_phase, ReadbackPhase};
+    let submit_started = std::time::Instant::now();
+    // Before anything is recorded, and in particular before the reset below.
+    unsafe { publish_previous_writeback_timestamps(ctx) };
+    // Appended to a recording batch where there is one, for the reason
+    // `copy_image_level0_to_host_delivered` gives: `begin_entry` would submit
+    // that batch only to submit this copy behind it, and the copy has to be
+    // ordered after those draws either way.
+    let appended = pools.batch_open_recording();
+    let (cb, fence) = match appended {
+        Some(pair) => {
+            counters
+                .batch_readback_joins
+                .fetch_add(1, Ordering::Relaxed);
+            pair
+        }
+        None => pools.begin_entry(ctx, counters)?,
+    };
+    if appended.is_none() {
+        ctx.device
+            .reset_command_buffer(cb, ash::vk::CommandBufferResetFlags::empty())
+            .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::GuestWriteResetCb, e)))?;
+        ctx.device
+            .begin_command_buffer(
+                cb,
+                &ash::vk::CommandBufferBeginInfo::default()
+                    .flags(ash::vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+            )
+            .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::GuestWriteBeginCb, e)))?;
+    }
+    // The device's own clock, for the reason the readback rail takes it: `fence_us`
+    // is CPU wall clock and cannot tell "the GPU is copying eight megabytes across
+    // PCIe" from "the round trip costs more than the work". Those have opposite
+    // fixes — a damage rect shrinks the first and does nothing at all to the
+    // second — so the rail that is now most of a flush must not be read without
+    // this pair. Slot 0 stamps the command buffer's start, slot 1 the point after
+    // the barrier where the draws ahead are known done, slot 2 the end of the copy.
+    //
+    // The reset must be recorded into the same command buffer: a query pool's
+    // results are undefined until reset, and resetting on the host needs
+    // `hostQueryReset`, a Vulkan 1.2 feature this device does not ask for.
+    if let Some(probe) = ctx.timestamps.as_ref() {
+        ctx.device
+            .cmd_reset_query_pool(cb, probe.pool, 0, context::TimestampProbe::SLOTS);
+        ctx.device
+            .cmd_write_timestamp(cb, ash::vk::PipelineStageFlags::TOP_OF_PIPE, probe.pool, 0);
+    }
+    // Unconditional, for the reason `copy_image_level0_to_host_delivered` states
+    // at length: the barrier is a layout transition *and* a dependency, and this
+    // rail needs the dependency whether or not the layout already matches. A
+    // render pass leaves its attachment in TRANSFER_SRC_OPTIMAL, so the common
+    // case transitions nothing and still must order this copy after the draws
+    // that produced the pixels.
+    let barrier = [ash::vk::ImageMemoryBarrier::default()
+        .src_access_mask(RESIDENT_READ_SRC_ACCESS)
+        .dst_access_mask(ash::vk::AccessFlags::TRANSFER_READ)
+        .old_layout(snap.layout)
+        .new_layout(ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+        .image(snap.image)
+        .subresource_range(color_subresource_range())];
+    ctx.device.cmd_pipeline_barrier(
+        cb,
+        ash::vk::PipelineStageFlags::ALL_COMMANDS,
+        ash::vk::PipelineStageFlags::TRANSFER,
+        ash::vk::DependencyFlags::empty(),
+        &[],
+        &[],
+        &barrier,
+    );
+    if let Some(probe) = ctx.timestamps.as_ref() {
+        ctx.device
+            .cmd_write_timestamp(cb, ash::vk::PipelineStageFlags::TRANSFER, probe.pool, 1);
+    }
+    // One call per buffer, all of them into the same command buffer, so the
+    // whole frame is still one submission and one fence however many RAMBlocks
+    // it touched — and, on the linear plan, however many hops it takes.
+    match plan {
+        GuestCopyPlan::Rectangles(groups) => {
+            for (buffer, regions) in groups {
+                ctx.device.cmd_copy_image_to_buffer(
+                    cb,
+                    snap.image,
+                    ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    *buffer,
+                    regions,
+                );
+            }
+        }
+        GuestCopyPlan::Linear {
+            scratch,
+            detile,
+            scatter,
+        } => {
+            let one = [*detile];
+            ctx.device.cmd_copy_image_to_buffer(
+                cb,
+                snap.image,
+                ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                *scratch,
+                &one,
+            );
+            // The scatter reads what the detile just wrote, and both are
+            // transfer-stage work in one command buffer, where nothing orders
+            // them by itself. A global memory barrier rather than a buffer one
+            // because there is exactly one buffer in flight between the two
+            // and no other access to exclude.
+            let detiled = [ash::vk::MemoryBarrier::default()
+                .src_access_mask(ash::vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(ash::vk::AccessFlags::TRANSFER_READ)];
+            ctx.device.cmd_pipeline_barrier(
+                cb,
+                ash::vk::PipelineStageFlags::TRANSFER,
+                ash::vk::PipelineStageFlags::TRANSFER,
+                ash::vk::DependencyFlags::empty(),
+                &detiled,
+                &[],
+                &[],
+            );
+            for (buffer, regions) in scatter {
+                ctx.device.cmd_copy_buffer(cb, *scratch, *buffer, regions);
+            }
+        }
+    }
+    if let Some(probe) = ctx.timestamps.as_ref() {
+        ctx.device.cmd_write_timestamp(
+            cb,
+            ash::vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+            probe.pool,
+            2,
+        );
+    }
+    // The reader of these bytes is the guest's vCPU, which is a host reader as
+    // far as this device is concerned: the memory is guest RAM the driver
+    // imported, not device-local memory that owes a readback. So the write is
+    // released to `HOST` with `HOST_READ`, which is what makes it visible to a
+    // CPU access after the fence signals.
+    //
+    // Cache maintenance beyond that is the driver's. A host-pointer import
+    // names ordinary system pages this process already has mapped, and a PCIe
+    // write to system memory is snooped, so there is no invalidate for this
+    // side to issue.
+    let host_visible = [ash::vk::MemoryBarrier::default()
+        .src_access_mask(ash::vk::AccessFlags::TRANSFER_WRITE)
+        .dst_access_mask(ash::vk::AccessFlags::HOST_READ)];
+    ctx.device.cmd_pipeline_barrier(
+        cb,
+        ash::vk::PipelineStageFlags::TRANSFER,
+        ash::vk::PipelineStageFlags::HOST,
+        ash::vk::DependencyFlags::empty(),
+        &host_visible,
+        &[],
+        &[],
+    );
+    // The wait this rail no longer takes here.
+    //
+    // What the stamp needs is that every copy has landed before the guest is
+    // told anything, and that is not the same statement as "this copy has landed
+    // before this call returns" — which is what the wait that used to sit here
+    // asserted, once per window. The obligation is recorded instead and settled
+    // by `quiesce_guest_writes` at the two places where it stops being this
+    // device's own business: the completion stamp, and a host reader or writer
+    // arriving at the same guest bytes.
+    //
+    if appended.is_some() {
+        // Ends and submits the batch with the fence `batch_open_recording`
+        // returned, and seals the batch's cleanup — one submission carrying the
+        // draws and this copy together.
+        pools.batch_flush(ctx, counters)?;
+    } else {
+        ctx.device
+            .end_command_buffer(cb)
+            .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::GuestWriteEndCb, e)))?;
+        let cbs = [cb];
+        let si = ash::vk::SubmitInfo::default().command_buffers(&cbs);
+        ctx.device
+            .queue_submit(ctx.queue(), &[si], fence)
+            .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::GuestWriteSubmit, e)))?;
+        let cleanup = pools.seal_entry(Vec::new(), Vec::new());
+        pools.finish_entry_async(cleanup);
+    }
+    note_readback_phase(
+        ReadbackPhase::Submit,
+        submit_started.elapsed().as_micros() as u64,
+    );
+    Ok(())
+}
+
+/// Publish the timestamps of the previous guest-page writeback, if it has
+/// finished.
+///
+/// Taken here rather than after a fence wait because there is no longer a fence
+/// wait to take it after — but the pair it reads is the only thing that can
+/// separate "the GPU is copying megabytes across PCIe" from "the round trip
+/// costs more than the work", so losing it would blind the rail this change is
+/// aimed at.
+///
+/// Sound to read at this point and nowhere else: the reset that invalidates
+/// these results is *recorded* into the command buffer below and executes on the
+/// GPU strictly after the previous copy wrote them, so on the host, right before
+/// that recording, the pool still holds the previous copy's ticks. Never waits —
+/// `NOT_READY` means the previous copy is still running and that sample is
+/// simply skipped, which is the correct answer for a probe rather than a gate.
+///
+/// # Safety
+///
+/// `ctx`'s query pool must not be recording, which is what makes this a read of
+/// the previous copy's results rather than a race with the current one.
+unsafe fn publish_previous_writeback_timestamps(ctx: &context::DeviceContext) {
+    let Some(probe) = ctx.timestamps.as_ref() else {
+        return;
+    };
+    let mut ticks = [0u64; context::TimestampProbe::SLOTS as usize];
+    match unsafe { ctx.device.get_query_pool_results(
+        probe.pool,
+        0,
+        &mut ticks,
+        ash::vk::QueryResultFlags::TYPE_64,
+    ) } {
+        // In f64, not integer ticks-times-period: `timestampPeriod` is a
+        // float and drivers do report values below 1 ns, which an integer
+        // multiply would truncate to zero and report as "the GPU did nothing".
+        Ok(()) => {
+            let us = |from: usize, to: usize| {
+                (ticks[to].saturating_sub(ticks[from]) as f64 * probe.ns_per_tick.max(0.0) as f64
+                    / 1_000.0) as u64
+            };
+            crate::runtime::drain::note_readback_gpu_us(us(0, 1), us(1, 2));
+        }
+        // The previous copy has not finished, so there is nothing to read and
+        // nothing has gone wrong.
+        Err(ash::vk::Result::NOT_READY) => {}
+        Err(e) => crate::observe::Emit::decline(
+            "vk_timestamp_read",
+            &VkCall::new(VkOp::ContextGetQueryPoolResults, e),
+        )
+        .fail_once(0),
+    }
+}
+
+/// Guest memory the device can currently reach through host-pointer imports,
+/// and how many RAMBlocks that is.
+///
+/// # What the count is for
+///
+/// It is the only thing in the tree that can answer "how much guest RAM can the
+/// device reach right now", and the *count* is the reading that says whether the
+/// one-import-per-RAMBlock model held: it should be one or two for a whole boot,
+/// and a count that tracks the workload is the per-resource import the model
+/// exists to avoid.
+///
+/// Emitted every census window by `runtime::drain::census`'s
+/// `guest_import_levels`, which is where the polarity is documented: this is a
+/// level, flat is healthy, and a rise is the alarm. It is read every window
+/// rather than once at import time precisely because one line at import time
+/// cannot tell "imported once" from "imported once per window".
+pub fn guest_import_census() -> (u64, usize) {
+    let guard = lock_engine();
+    let (count, bytes) = guard.pools.host_ram_import_census();
+    (bytes, count)
 }
 
 /// The `srcAccessMask` a resident color target's readback must drain.
@@ -1524,8 +2935,8 @@ fn resident_read_snapshot(
         image: slot.image,
         width: slot.width,
         height: slot.height,
-        layout: slot.layout,
-        bgra: slot.bgra,
+        layout: slot.access.layout(),
+        bgra: slot.scanout_order(),
     })
 }
 
@@ -1554,7 +2965,7 @@ fn read_target_inner(identity: &TargetIdentity) -> Result<TargetReadback, DrawEr
             rb_size,
             target_readback_ops(),
         )?;
-        pools.registry_set_layout(identity, ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
+        pools.registry_note_access(identity, pools::ResidentAccess::TransferRead);
         counters.note_target_read(rb_size);
         Ok(TargetReadback {
             pixels: out,
@@ -1566,82 +2977,6 @@ fn read_target_inner(identity: &TargetIdentity) -> Result<TargetReadback, DrawEr
 /// Full-frame readback of a resident target (present / Synchronize / Map / Store boundary).
 pub fn read_target(identity: &TargetIdentity) -> Result<TargetReadback, DrawError> {
     read_target_inner(identity)
-}
-
-/// Flush read of a **pinned deferred-writeback resident storage image**: copy
-/// the GPU content to the host as tight `width*height*texel` bytes and unpin.
-///
-/// The caller (runtime deferred-flush) writes these bytes into the guest
-/// window and re-establishes its residency mirror. `expected_generation`
-/// guards against flushing content from a different chain step than the one
-/// the caller deferred — a mismatch (or an absent/evicted resident) is the
-/// named error the caller reports as `deferred_flush_lost`. Returns
-/// `(bytes, texel_size)`.
-pub fn read_resident_storage(
-    identity: &crate::model::ComputeStorageResidencyKey,
-    expected_generation: u32,
-) -> Result<(Vec<u8>, u32), DrawError> {
-    let mut guard = lock_engine();
-    let EngineState {
-        ref mut owner,
-        ref mut pools,
-        ref counters,
-        ..
-    } = &mut *guard;
-    let ctx = owner.ensure(counters)?;
-    unsafe { pools.ensure_init(ctx, counters)? };
-    let (image, key, generation, old_layout) =
-        pools.compute_resident_snapshot(identity).ok_or({
-            DrawError::Facade(EngineFacadeDecline::StorageReadResidentAbsent {
-                identity: *identity,
-            })
-        })?;
-    if generation != expected_generation {
-        return Err(DrawError::Facade(
-            EngineFacadeDecline::StorageReadGenerationMismatch {
-                identity: *identity,
-                actual_generation: generation,
-                expected_generation,
-            },
-        ));
-    }
-    let texel = key.format.bytes_per_texel() as u32;
-    let rb_size = (key.width as u64) * (key.height as u64) * texel as u64;
-    unsafe {
-        let out = copy_image_level0_to_host(
-            ctx,
-            pools,
-            counters,
-            image,
-            old_layout,
-            // A storage image is never a color attachment, so there is no
-            // `COLOR_ATTACHMENT_WRITE` to drain here.
-            ash::vk::AccessFlags::TRANSFER_WRITE | ash::vk::AccessFlags::SHADER_WRITE,
-            key.width,
-            key.height,
-            rb_size,
-            ReadbackOps {
-                reset_cb: VkOp::StorageReadResetCb,
-                begin_cb: VkOp::StorageReadBeginCb,
-                end_cb: VkOp::StorageReadEndCb,
-                submit: VkOp::StorageReadSubmit,
-                map: VkOp::StorageReadMap,
-                invalidate: VkOp::StorageReadInvalidate,
-            },
-        )?;
-        pools.set_resident_storage_layout(identity, ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
-        pools.pin_resident_storage(identity, false);
-        counters.note_compute_deferred_flush(rb_size);
-        Ok((out, texel))
-    }
-}
-
-/// The non-pinned resident-target slot cap. Exposed so a test that must blow
-/// past the LRU sweep derives its filler count from the live value instead of
-/// hard-coding one — `vk_engine_parity` previously fixed 70 fillers against a
-/// cap later retuned to 320, so no eviction fired and its assert could not hold.
-pub fn registry_cap() -> usize {
-    pools::REGISTRY_CAP
 }
 
 /// Advance the wall-clock resident-target idle-drain clock to `now_ms`, keep the
@@ -1665,6 +3000,14 @@ pub fn maintain_idle_residents(display: Option<&TargetIdentity>, now_ms: u64) {
 }
 
 /// Snapshot of create/alloc/hit-miss counters (for tests and thrash proxies).
+/// Live entries in each immutable-object cache:
+/// `(shaders, layouts, passes, pipelines, samplers, compute_pipelines)`.
+///
+/// See [`caches::ObjectCaches::levels`] for what reading it answers.
+pub fn object_cache_levels() -> [usize; 6] {
+    lock_engine().caches.levels()
+}
+
 pub fn counter_snapshot() -> CounterSnapshot {
     let eng = lock_engine();
     let mut snap = eng.counters.snapshot();
@@ -1680,6 +3023,19 @@ pub fn counter_snapshot() -> CounterSnapshot {
     snap.target_free_allocs = t_allocs;
     snap.target_recycle_admits = t_admits;
     snap.target_recycle_cap_drops = t_cap_drops;
+    let (reg_peak, reg_peak_bytes) = eng.pools.registry_pressure_stats();
+    snap.registry_non_pinned_peak = reg_peak;
+    snap.registry_non_pinned_peak_bytes = reg_peak_bytes;
+    let (sole_peak, sole_peak_bytes) = eng.pools.registry_sole_copy_stats();
+    snap.registry_sole_copy_peak = sole_peak;
+    snap.registry_sole_copy_peak_bytes = sole_peak_bytes;
+    let (cs_sole, cs_sole_bytes) = eng.pools.compute_storage_sole_copy_stats();
+    snap.compute_storage_sole_copy_peak = cs_sole;
+    snap.compute_storage_sole_copy_peak_bytes = cs_sole_bytes;
+    snap.resident_resample_peak_ms = eng.pools.resident_resample_peak_ms();
+    let (slab_held, slab_carved) = eng.pools.slab_held_bytes();
+    snap.slab_held_bytes = slab_held;
+    snap.slab_carved_bytes = slab_carved;
     snap
 }
 
@@ -1691,16 +3047,42 @@ pub fn reset_draw_counters() {
 /// Test-only: destroy device, clear recreate budget, rebuild on next draw.
 pub fn test_reset_engine() {
     let mut g = lock_engine();
+    // A healthy `DeviceContext` is kept across the reset; only the pools, the
+    // caches and the owner's flags are rebuilt.
+    //
+    // This used to destroy the `VkDevice` and the `VkInstance` too, so a suite
+    // creating an instance per test churned one per reset — and on this host's
+    // driver the churn has a ceiling: past it `vkEnumeratePhysicalDevices`
+    // returns `ERROR_INITIALIZATION_FAILED` and every later init fails
+    // permanently. The failure lands wherever the count happens to run out, so
+    // it read as one test being fragile and moved to a different test whenever
+    // another was added ahead of it. Nothing about the *reset* needed a new
+    // instance: a fresh registry, a fresh cache set and a cleared recreate
+    // budget are what a test wants, and this is also the shape production runs
+    // in — one instance for the life of the process.
+    //
+    // A poisoned context is the exception. That is what the device-loss tests
+    // leave behind, its device really is gone, and reusing it would hand every
+    // later test a dead one — so it is torn down and the next `ensure` builds a
+    // replacement.
+    let poisoned = g.owner.poisoned;
     if let Some(mut ctx) = g.owner.ctx.take() {
         unsafe {
             g.caches.destroy_all(&ctx.device);
             g.pools.destroy_all(&ctx.device);
-            ctx.destroy();
         }
+        if poisoned {
+            unsafe { ctx.destroy() };
+            g.owner = ContextOwner::new();
+        } else {
+            g.owner = ContextOwner::new();
+            g.owner.ctx = Some(ctx);
+        }
+    } else {
+        g.owner = ContextOwner::new();
     }
     g.caches = ObjectCaches::new();
     g.pools = ResourcePools::new();
-    g.owner = ContextOwner::new();
     g.counters.reset_all();
 }
 
@@ -1737,6 +3119,178 @@ pub fn test_poison_and_flush() {
     g.counters.device_lost.fetch_add(1, Ordering::Relaxed);
     g.owner.mark_device_lost();
     g.flush_device_derived();
+}
+
+#[cfg(test)]
+mod group_by_buffer_tests {
+    use super::*;
+    use ash::vk::Handle;
+
+    fn buffer(raw: u64) -> ash::vk::Buffer {
+        ash::vk::Buffer::from_raw(raw)
+    }
+
+    /// The case every host anyone develops on hides: a window whose stretches
+    /// resolve against two RAMBlocks needs two `vkCmdCopy*` calls, and a planner
+    /// that kept one region list would submit whichever import came first and
+    /// leave the rest of the window holding stale bytes.
+    ///
+    /// Order matters as much as the split. Regions inside one group must stay in
+    /// the order they were planned, because that order is the window's byte
+    /// order and a copy list is what reconstructs it.
+    #[test]
+    fn stretches_split_by_import_and_keep_their_order_inside_each() {
+        let mut groups: Vec<(ash::vk::Buffer, Vec<u32>)> = Vec::new();
+        // Interleaved on purpose: a real two-block window alternates as the
+        // guest's allocator walks across the boundary and back.
+        for (buf, region) in [(1, 10), (2, 20), (1, 11), (2, 21), (1, 12)] {
+            group_by_buffer(&mut groups, buffer(buf), region);
+        }
+        assert_eq!(groups.len(), 2, "two imports, two copy calls");
+        assert_eq!(groups[0].0, buffer(1), "groups appear in first-seen order");
+        assert_eq!(groups[0].1, vec![10, 11, 12]);
+        assert_eq!(groups[1].0, buffer(2));
+        assert_eq!(groups[1].1, vec![20, 21]);
+    }
+
+    /// The ordinary machine: one RAMBlock, one group, and no per-stretch call.
+    #[test]
+    fn one_import_stays_one_group() {
+        let mut groups: Vec<(ash::vk::Buffer, Vec<u32>)> = Vec::new();
+        for region in 0..5 {
+            group_by_buffer(&mut groups, buffer(7), region);
+        }
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].1.len(), 5);
+    }
+}
+
+#[cfg(test)]
+mod guest_write_footprint_tests {
+    use super::*;
+
+    /// The whole point: a reader whose window shares no page with the
+    /// outstanding writeback is let through, and one that shares a single page
+    /// is not. The wrong answer here is a stale frame, so the overlapping case
+    /// is asserted on a window that touches the footprint at exactly one page —
+    /// the case an envelope check or an off-by-one bound would wave past.
+    ///
+    /// Serialized against the rest of the suite by `--test-threads=1`, which the
+    /// global these exercise needs as much as the GPU tests do.
+    #[test]
+    fn a_disjoint_reader_is_let_through_and_a_touching_one_is_not() {
+        clear_guest_write_pages();
+        arm_guest_write_pages(&[0x4000, 0x9000, 0x2000]);
+        let reach = guest_writes_reaching;
+        assert_eq!(reach(&[0x1000, 0x3000, 0xa000]), GuestWriteReach::Disjoint);
+        assert_eq!(reach(&[0x1000, 0x9000]), GuestWriteReach::Overlap);
+        assert_eq!(reach(&[0x2000]), GuestWriteReach::Overlap);
+        // Unsorted input on both sides: the arm sorts, the ask does not have to.
+        assert_eq!(reach(&[0xf000, 0x4000, 0x1000]), GuestWriteReach::Overlap);
+        clear_guest_write_pages();
+    }
+
+    /// A second writeback is *also* named, up to the ring, and a page belonging
+    /// to any of them is an overlap. The single-entry version of this gave up
+    /// naming on 85 % of arms.
+    #[test]
+    fn every_writeback_up_to_the_ring_is_named() {
+        clear_guest_write_pages();
+        for i in 0..pools::RING_DEPTH as u64 {
+            arm_guest_write_pages(&[0x1000 * (i + 1)]);
+        }
+        assert_eq!(guest_writes_reaching(&[0x1000]), GuestWriteReach::Overlap);
+        assert_eq!(
+            guest_writes_reaching(&[0x1000 * pools::RING_DEPTH as u64]),
+            GuestWriteReach::Overlap
+        );
+        assert_eq!(
+            guest_writes_reaching(&[0x1000 * (pools::RING_DEPTH as u64 + 2)]),
+            GuestWriteReach::Disjoint
+        );
+        clear_guest_write_pages();
+    }
+
+    /// Past the entry cap the ledger keeps naming: the overflowing writeback
+    /// folds into the oldest entry instead of disabling the rail.
+    ///
+    /// Three assertions and each catches a different way to get this wrong.
+    /// **The overflowing page is named** — dropping the entry instead would
+    /// answer `Disjoint` for a page a copy is landing in, which is a stale frame
+    /// served as fresh. **The absorbing entry's own page is still named** — a
+    /// merge that overwrote rather than unioned would lose it just as quietly.
+    /// **A page nobody named is still `Disjoint`** — that is the whole point,
+    /// and it is what the old surrender got wrong 3 499 times on a driven boot,
+    /// each one making every later reader block globally.
+    #[test]
+    fn an_arm_past_the_ring_merges_and_still_names_every_page() {
+        clear_guest_write_pages();
+        for i in 0..pools::RING_DEPTH as u64 {
+            arm_guest_write_pages(&[0x1000 * (i + 1)]);
+        }
+        arm_guest_write_pages(&[0xdead_0000]);
+        assert_eq!(
+            guest_writes_reaching(&[0xdead_0000]),
+            GuestWriteReach::Overlap,
+            "the writeback that overflowed the cap must still be named"
+        );
+        assert_eq!(
+            guest_writes_reaching(&[0x1000]),
+            GuestWriteReach::Overlap,
+            "the entry it merged into must keep its own pages"
+        );
+        assert_eq!(
+            guest_writes_reaching(&[0x8000_0000]),
+            GuestWriteReach::Disjoint,
+            "a page no outstanding writeback names must still be let through"
+        );
+        // And it keeps holding past many more, since nothing retires an entry
+        // until a settle clears them all.
+        for i in 0..4 * pools::RING_DEPTH as u64 {
+            arm_guest_write_pages(&[0xbeef_0000 + 0x1000 * i]);
+        }
+        assert_eq!(
+            guest_writes_reaching(&[0xbeef_0000]),
+            GuestWriteReach::Overlap
+        );
+        assert_eq!(guest_writes_reaching(&[0x1000]), GuestWriteReach::Overlap);
+        assert_eq!(
+            guest_writes_reaching(&[0x8000_0000]),
+            GuestWriteReach::Disjoint
+        );
+        clear_guest_write_pages();
+    }
+
+    /// The settle that clears the debt flag clears the ledger with it, so the
+    /// next writeback is named against an empty slate rather than against every
+    /// page the boot has ever written back.
+    #[test]
+    fn a_settle_forgets_every_page_the_ledger_was_holding() {
+        clear_guest_write_pages();
+        for i in 0..=pools::RING_DEPTH as u64 {
+            arm_guest_write_pages(&[0x1000 * (i + 1)]);
+        }
+        assert_eq!(guest_writes_reaching(&[0x1000]), GuestWriteReach::Overlap);
+        clear_guest_write_pages();
+        arm_guest_write_pages(&[0x4000]);
+        assert_eq!(guest_writes_reaching(&[0x8000]), GuestWriteReach::Disjoint);
+        assert_eq!(
+            guest_writes_reaching(&[0x1000]),
+            GuestWriteReach::Disjoint,
+            "a page from before the settle is no longer outstanding"
+        );
+        clear_guest_write_pages();
+    }
+
+    /// With nothing armed there is nothing to rule out *against*, and the safe
+    /// answer is to settle. Callers only ask when the debt flag is set, so this
+    /// state is a race the answer has to be conservative about rather than a
+    /// path worth optimising.
+    #[test]
+    fn an_unarmed_footprint_rules_nothing_out() {
+        clear_guest_write_pages();
+        assert_eq!(guest_writes_reaching(&[0x1000]), GuestWriteReach::Unnamed);
+    }
 }
 
 #[cfg(test)]
@@ -1833,6 +3387,147 @@ mod engine_lock_census_tests {
             .and_then(|value| value.parse().ok())
             .expect("window_wait_us parses");
         assert!(waited >= 10_000, "waited only {waited} us: {line}");
+    }
+}
+
+#[cfg(test)]
+mod guest_page_target_tests {
+    use super::*;
+
+    /// A target over a synthetic import large enough that the bound under test
+    /// is the extent arithmetic and not the import's own length.
+    fn target(width: u32, height: u32, row_length_texels: u32) -> GuestPageTarget {
+        use crate::runtime::guest_ram::{GuestRamImport, GuestRamRegion, GuestRef};
+        let import = std::sync::Arc::new(
+            GuestRamImport::new(
+                GuestRamRegion {
+                    gpa_base: 0,
+                    host_va: 0x7f00_0000_0000,
+                    len: 1 << 30,
+                },
+                4096,
+            )
+            .expect("a plausible RAMBlock"),
+        );
+        let slice = import.slice(0, 1 << 20).expect("inside");
+        GuestPageTarget {
+            // One run covering the whole window: this fixture is about the
+            // extent arithmetic, and a contiguous window is exactly what
+            // `references_for_runs` returns a single run for.
+            runs: vec![crate::runtime::guest_ram_map::GuestWindowRun {
+                window_offset: 0,
+                guest: GuestRef::new(import, slice).expect("its own import"),
+            }],
+            row_length_texels,
+            width,
+            height,
+            // Immaterial to these tests: the order is checked against the
+            // resident's, and no fixture here reaches a resident.
+            bgra: true,
+        }
+    }
+
+    /// The bound stops at the last row's last texel, not at a whole row pitch
+    /// past it.
+    ///
+    /// Padding after the final row belongs to the surface's plane but is not a
+    /// texel this copy was given, and the copying rail does not write it either.
+    /// A bound that included it would make the two rails land different guest
+    /// memory for one frame — the same divergence
+    /// `write_full_rect_raw_staged_leaves_inter_row_padding_alone` guards on the
+    /// CPU side.
+    #[test]
+    fn the_write_bound_ends_at_the_last_texel_and_not_a_row_pitch_past_it() {
+        // 8 rows of 4 texels at a 16-texel pitch: 7 full pitches plus one packed
+        // row, not 8 full pitches.
+        let padded = target(4, 8, 16);
+        assert_eq!(padded.extent_end(), 7 * 16 * 4 + 4 * 4);
+        // A tight frame is the same expression with the pitch equal to the
+        // width, which reduces to the whole frame.
+        let tight = target(4, 8, 4);
+        assert_eq!(tight.extent_end(), 4 * 8 * 4);
+    }
+
+    /// A zero row length means tight rows, which is what `bufferRowLength`
+    /// itself means — so the bound must read it as the frame's own width rather
+    /// than as a zero pitch that collapses every row onto the first.
+    #[test]
+    fn a_zero_row_length_is_a_tight_pitch_and_not_a_zero_one() {
+        assert_eq!(
+            target(32, 4, 0).extent_end(),
+            target(32, 4, 32).extent_end()
+        );
+    }
+
+    /// The linear path is taken exactly when the window has no inter-row
+    /// padding, whichever way the guest spelt the pitch.
+    ///
+    /// A guest that understates the row length is the case to watch: the pitch
+    /// is `max(row_length, width)`, so such a window *is* dense, and the
+    /// detiling copy must therefore not pass `row_length_texels` through as
+    /// `bufferRowLength` — a value below `width` is invalid there. It passes
+    /// zero, which is Vulkan's own spelling of the tight packing this predicate
+    /// just established.
+    #[test]
+    fn a_window_is_dense_exactly_when_its_rows_carry_no_padding() {
+        assert!(target(64, 4, 64).rows_are_dense(), "pitch equal to width");
+        assert!(target(64, 4, 0).rows_are_dense(), "zero means tight");
+        assert!(
+            target(64, 4, 32).rows_are_dense(),
+            "an understated row length still yields a width pitch"
+        );
+        assert!(
+            !target(64, 4, 65).rows_are_dense(),
+            "one texel of padding per row is padding"
+        );
+    }
+
+    /// A dense window's texels fill it end to end, which is the identity the
+    /// linear path's arithmetic rests on: window byte `o` is scratch byte `o`
+    /// only if there is no byte in between that belongs to neither.
+    ///
+    /// Asserted as the relation `extent == pitch * height` rather than against
+    /// a literal, so it keeps holding whatever geometry a later reader adds.
+    #[test]
+    fn a_dense_window_is_exactly_its_rows_end_to_end() {
+        for (w, h) in [(64u32, 4u32), (1920, 1080), (1, 1)] {
+            let t = target(w, h, 0);
+            assert!(t.rows_are_dense());
+            assert_eq!(
+                t.extent_end(),
+                t.pitch_bytes() * u64::from(h),
+                "{w}x{h} leaves no gap between the last texel and the extent"
+            );
+        }
+        // The padded case is the contrast: its extent stops short of the last
+        // row's padding, so its bytes are *not* contiguous texels and a byte
+        // range over one would write bytes this frame was never given.
+        let padded = target(64, 4, 65);
+        assert!(padded.extent_end() < padded.pitch_bytes() * 4);
+    }
+
+    /// The census counts the detiling rectangle, because the driver consumes it
+    /// like any other region.
+    ///
+    /// Leaving it out would make a linear boot's `guest_write_regions` read as
+    /// exactly the stretch count, so the census would understate what this rail
+    /// submits by one, every frame — and that census is now the only account of
+    /// how wide a writeback gets, since nothing caps it.
+    #[test]
+    fn the_region_census_counts_every_region_a_plan_submits() {
+        let null = ash::vk::Buffer::null();
+        let rects = GuestCopyPlan::Rectangles(vec![
+            (null, vec![ash::vk::BufferImageCopy::default(); 3]),
+            (null, vec![ash::vk::BufferImageCopy::default(); 2]),
+        ]);
+        assert_eq!(rects.regions(), 5, "every group's rectangles, summed");
+
+        let linear = GuestCopyPlan::Linear {
+            scratch: null,
+            detile: ash::vk::BufferImageCopy::default(),
+            scatter: vec![(null, vec![ash::vk::BufferCopy::default(); 507])],
+        };
+        assert_eq!(linear.regions(), 508, "507 stretches plus the detile");
     }
 }
 

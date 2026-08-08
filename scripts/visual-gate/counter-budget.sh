@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# counter-budget.sh — read the six silent-loss classes out of one window of the
+# counter-budget.sh — read the eight silent-loss classes out of one window of the
 # fail log and hold each to its budget.
 #
 # Split out of `visual-gate.sh` so it can be tested against synthetic log text
@@ -12,7 +12,7 @@
 # 0 when every class is inside its budget, 1 when any is over, 2 when a file
 # cannot be read.
 #
-# Three classes are line families, keyed on the prefix their emitter writes at
+# Five classes are line families, keyed on the prefix their emitter writes at
 # the start of a line. Three are `note_store_route` counts, which arrive as
 # `key=value` fields on a `store_routes` line — that line is emitted once per
 # per-second window, so a class has to be summed across every such line in the
@@ -34,10 +34,22 @@ BASELINE="${2:-$SCRIPT_DIR/baseline.tsv}"
 # `deferred_flush_lost` — a guest render this device dropped.
 # `mapping_page_drift`  — the page list changed under an armed window.
 # `THRASH present_action_starvation` — one class spelled as two words.
+# `render_unimplemented` — a render opcode the decoder accepted and nothing
+#   executed. This is the class a green run hides best: `render::decode`
+#   returning `Ok` is not a decode, because `Kind::OtherAccepted` is the
+#   catch-all for "no arm claimed this", so the draw completes, the guest is
+#   stamped, and the only trace is this line. It is deduped to one per distinct
+#   opcode, so the count is a count of *kinds* lost, not of records.
+# `device_info truncated` — the device-info reply could not carry every
+#   capability key the guest's own parse ceiling admits. The guest asks once per
+#   boot and never re-asks, so a firing is a capability gone for that boot's
+#   life. Spelled as two words for the same reason the starvation class is.
 LINE_CLASSES=(
   'deferred_flush_lost|deferred_flush_lost '
   'mapping_page_drift|mapping_page_drift '
   'present_action_starvation|THRASH present_action_starvation '
+  'render_unimplemented|render_unimplemented '
+  'device_info_truncated|device_info truncated '
 )
 
 # `gw_audit_unsound` — the gather witness refuted itself; a stale image is being

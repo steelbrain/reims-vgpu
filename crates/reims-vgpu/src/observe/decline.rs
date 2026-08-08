@@ -13,16 +13,17 @@
 //!
 //! In the `slug()` arms, and nowhere else. This module used to carry a 2 700-line
 //! `#[cfg(test)]` `REGISTRY` restating every type's file, emission site and full
-//! slug list, plus a source scanner in `super::gate` whose whole job was checking
-//! that the restatement still matched the code. The table could only ever agree
-//! or disagree with the arms it copied, so it added no invariant the arms do not
-//! already carry — and it charged every deletion a second edit plus a hand-bumped
-//! `(types, slugs)` baseline, which is what made shrinking this crate expensive.
+//! slug list, plus a source scanner in a `super::gate` module whose whole job was
+//! checking that the restatement still matched the code. The table could only ever
+//! agree or disagree with the arms it copied, so it added no invariant the arms do
+//! not already carry — and it charged every deletion a second edit plus a
+//! hand-bumped `(types, slugs)` baseline, which is what made shrinking this crate
+//! expensive. Both went in `db80389`.
 //!
-//! `super::gate` now reads the `Decline`/`Refusal` impls directly for the one
-//! property that is genuinely crate-wide and not visible from any single impl:
-//! **no two checks share a slug**. That is a scan of the code, so it cannot drift
-//! from it.
+//! One property is genuinely crate-wide and not visible from any single impl:
+//! **no two checks share a slug**. A source scan over the `Decline`/`Refusal`
+//! impls used to check it and is gone, so it is now the author's obligation —
+//! prefix a slug with the rail that owns it and a collision stops being likely.
 //!
 //! # Adding a decline type
 //!

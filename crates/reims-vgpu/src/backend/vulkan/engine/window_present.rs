@@ -296,7 +296,7 @@ impl StagingImage {
 enum BlitSource {
     Resident {
         image: vk::Image,
-        layout: vk::ImageLayout,
+        access: super::pools::ResidentAccess,
         width: u32,
         height: u32,
     },
@@ -335,8 +335,8 @@ impl BlitSource {
         cmd: vk::CommandBuffer,
     ) -> vk::ImageLayout {
         match self {
-            Self::Resident { image, layout, .. } => {
-                transition_source(device, cmd, *image, *layout);
+            Self::Resident { image, access, .. } => {
+                super::exec::barrier_resident_for_transfer_read(device, cmd, *image, *access);
                 vk::ImageLayout::TRANSFER_SRC_OPTIMAL
             }
             Self::Staged {
@@ -929,7 +929,7 @@ impl WindowPresenter {
                 (
                     source.identity.clone(),
                     slot.image,
-                    slot.layout,
+                    slot.access,
                     slot.width,
                     slot.height,
                 )
@@ -948,7 +948,7 @@ impl WindowPresenter {
                 .map_or(CandidateState::default(), |slot| CandidateState {
                     resident: true,
                     content_ready: slot.content_ready,
-                    bgra: slot.bgra,
+                    bgra: slot.scanout_order(),
                     width: slot.width,
                     height: slot.height,
                 });
@@ -979,9 +979,9 @@ impl WindowPresenter {
         let blit = selected
             .as_ref()
             .map(
-                |(_, image, layout, base_width, base_height)| BlitSource::Resident {
+                |(_, image, access, base_width, base_height)| BlitSource::Resident {
                     image: *image,
-                    layout: *layout,
+                    access: *access,
                     width: *base_width,
                     height: *base_height,
                 },
@@ -1058,7 +1058,10 @@ impl WindowPresenter {
                     (vp.x, vp.y, vp.x + vp.width, vp.y + vp.height),
                 );
                 if let Some((identity, _, _, _, _)) = selected.as_ref() {
-                    pools.registry_set_layout(identity, vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
+                    pools.registry_note_access(
+                        identity,
+                        super::pools::ResidentAccess::TransferRead,
+                    );
                 }
             } else {
                 ctx.device.cmd_clear_color_image(
@@ -1520,50 +1523,6 @@ fn window_cadence_line(
          offered_hz={offered_hz:.1} direct_frac={direct_fraction:.2}",
         busy.total, busy.fence, busy.acquire
     )
-}
-
-/// Order the present blit's read of a guest-content source after every draw
-/// that produced it, and put it in `TRANSFER_SRC_OPTIMAL` if it is not there.
-///
-/// Unconditional, and the layout match is the reason rather than an exemption.
-/// A barrier is a layout transition *and* a dependency; a resident that a
-/// render pass just finished writing is already in `TRANSFER_SRC_OPTIMAL`,
-/// because that is the layout the pass resolves its primary attachment to. So
-/// gating on "a transition is needed" skipped the dependency on precisely the
-/// frames that had just been drawn — the direct-present path, reading a target
-/// whose draw may not have landed.
-///
-/// Nothing else orders it. The present records into its own command buffer and
-/// submits it separately; queue submission order starts command buffers in
-/// order but does not finish them in order, and is not a memory dependency. A
-/// render pass's implicit final subpass dependency ends at
-/// `dstStageMask = BOTTOM_OF_PIPE` with `dstAccessMask = 0`, so the colour
-/// writes are available and visible to nothing.
-///
-/// The failure this produces is not wrong pixels but a stale frame: the blit
-/// copies the resident as it stood before the draw, and the screen shows a
-/// composite missing what was just rendered into it until some later redraw
-/// publishes it. When the transition half is a no-op the barrier still does
-/// this job, which is the one that was missing.
-unsafe fn transition_source(
-    device: &ash::Device,
-    cmd: vk::CommandBuffer,
-    image: vk::Image,
-    old_layout: vk::ImageLayout,
-) {
-    image_barrier(
-        device,
-        cmd,
-        image,
-        old_layout,
-        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-        vk::AccessFlags::COLOR_ATTACHMENT_WRITE
-            | vk::AccessFlags::SHADER_WRITE
-            | vk::AccessFlags::TRANSFER_WRITE,
-        vk::AccessFlags::TRANSFER_READ,
-        vk::PipelineStageFlags::ALL_COMMANDS,
-        vk::PipelineStageFlags::TRANSFER,
-    );
 }
 
 #[allow(

@@ -5,27 +5,49 @@ use reims_vgpu_wire::ops::compute as wire;
 
 /// Shared serializer op-header length from `reims-vgpu-wire`.
 use reims_vgpu_wire::OP_HEADER_LEN;
-pub const SIZE3_SIZE: usize = 24;
 
-/// Residency on the compute rail, and the one pair here with no selector
-/// behind it.
+/// Residency on the compute rail.
 ///
-/// `PGSerializerComputeCommandEncoder` on `AppleParavirtGPUMetal` 64.4.7 ships
-/// **no `useHeaps:` or `useResources:` selector at all** — the class's 58
-/// selectors are enumerated in `reims_vgpu_wire::manifest`, and residency is
-/// not among them. So nothing in the userspace serializer produces these two
-/// numbers on this build, which is why `compute_noop_residency_hint` reads zero
-/// on a driven boot.
+/// # These are inherited, not unsupported
 ///
-/// That is a reason to leave the arm alone rather than to delete it: a decoded
-/// arm that never fires is contract fidelity, and this one is already visible
-/// through its counter. What it is *not* is a source for these numbers
-/// elsewhere. `runtime::decode::render` carried `0x86`/`0x87` as its residency
-/// pair until it was measured against the serializer, which emits `0x1b` and
-/// `0x89` for the render encoder's four residency selectors; the numbers here
-/// are the likeliest origin of that copy, and they have no more support than
-/// the ones it replaced. Do not propagate them to a third rail without a
-/// capture.
+/// This doc used to say the pair had **no selector behind it at all**: the
+/// compute encoder's own selector list carries no `useHeaps:`/`useResources:`,
+/// so — the argument went — nothing in the serializer can produce these two
+/// numbers, and `compute_noop_residency_hint` reading zero on a driven boot was
+/// that conclusion confirmed.
+///
+/// The premise is true and the conclusion does not follow. Residency is declared
+/// on the encoder base class, which every encoder derives from, in an
+/// unqualified `useHeaps:count:` / `useResources:count:usage:` pair; only the
+/// `stages:`-qualified overrides are declared on the render encoder, which is
+/// why those are the only ones that appear in
+/// [`reims_vgpu_wire::manifest`]. That manifest is built from each class's *own*
+/// method list and has no row for the base class, so a base-class selector is
+/// absent from it while being callable on every encoder — see the caveat in that
+/// module, which this is the worked example of.
+///
+/// So a compute encoder does answer `useHeaps:count:`, and these are the numbers
+/// it emits. The zero counter says this workload never issued one, which is the
+/// ordinary reading of a healthy zero, not evidence that the arm is unreachable.
+///
+/// The layouts agree independently: the emitted record for `useHeaps:count:` is
+/// a four-byte head and `count` four-byte refs, and for
+/// `useResources:count:usage:` an eight-byte head and the same refs — which is
+/// exactly [`COUNT_BASE`] and [`BIND_BASE`] below.
+///
+/// # The render rail is the one with the gap
+///
+/// `runtime::decode::render` carried `0x86`/`0x87` as its residency pair until a
+/// capture replaced them with `0x1b`/`0x89`. That replacement was right for the
+/// records it measured — those are the `stages:`-qualified forms — but it left
+/// the render rail knowing only half the family, because a render encoder
+/// inherits the unqualified pair too. An unqualified `useResources:count:usage:`
+/// on a render encoder therefore reaches no render arm and is reported as
+/// `render_unimplemented reason=accepted_without_executor` rather than counted
+/// with its siblings under `render_noop_residency_hint`. No guest work is lost —
+/// this device answers residency hints by doing nothing, for the reason
+/// `runtime::exec` states — but the counter that exists to price that argument
+/// sees only the qualified half.
 pub const OP_USE_HEAPS: u32 = 0x86;
 pub const OP_USE_RESOURCES: u32 = 0x87;
 
@@ -1010,14 +1032,19 @@ mod tests {
         assert_eq!(c.fence_ref, 0);
     }
 
-    /// No compute selector declares residency, so these two opcodes have no
-    /// producer in the serializer.
+    /// The compute encoder does not *declare* residency — it inherits it.
     ///
-    /// [`OP_USE_HEAPS`] and [`OP_USE_RESOURCES`] say so in prose; this is the
-    /// statement made executable, against the selector list Apple's runtime
-    /// hands over. If a future build adds `useResources:` to this class, the
-    /// assertion fails and the arm below it needs a capture rather than an
-    /// inherited number.
+    /// This asserts exactly one thing: no residency selector appears among the
+    /// compute encoder's own methods. That is all the manifest can say, because
+    /// it is built from each class's own method list and has no row for the
+    /// encoder base class where residency is declared.
+    ///
+    /// It used to be read as the stronger claim that these two opcodes have no
+    /// producer at all, and [`OP_USE_HEAPS`] records why that does not follow.
+    /// The assertion is unchanged and still worth keeping: if a future build
+    /// *overrides* residency on this class, the override may carry a different
+    /// record shape from the inherited one, and this fires before the arm below
+    /// decodes the new shape with the old layout.
     #[test]
     fn the_compute_encoder_declares_no_residency_selector() {
         let residency: Vec<&str> = reims_vgpu_wire::manifest::MANIFEST
@@ -1028,8 +1055,9 @@ mod tests {
             .collect();
         assert!(
             residency.is_empty(),
-            "the compute encoder now ships {residency:?}; OP_USE_HEAPS/\
-             OP_USE_RESOURCES may no longer be assumed"
+            "the compute encoder now declares {residency:?} of its own; an \
+             override may not share the inherited record shape, so the \
+             OP_USE_HEAPS/OP_USE_RESOURCES layouts need a fresh capture"
         );
         // The render encoder does ship them, and its opcodes are not these.
         use reims_vgpu_wire::ops::render as wire;
@@ -1041,12 +1069,12 @@ mod tests {
     /// the two this module names beyond them are named as exceptions.
     ///
     /// The render sibling of this test can assert plain set equality; this one
-    /// cannot, and the difference is the point. `0x86`/`0x87` have **no selector
-    /// at all** on this class, which is what
-    /// `the_compute_encoder_declares_no_residency_selector` states. They are
-    /// inherited numbers, and they are the pair `runtime::decode::render`
-    /// carried as its residency opcodes until a capture replaced them with
-    /// `0x1b`/`0x89`.
+    /// cannot, and the difference is the point. `0x86`/`0x87` are declared on
+    /// the encoder base class rather than on this one, which is what
+    /// `the_compute_encoder_declares_no_residency_selector` states and all it
+    /// states — the manifest is built per class from each class's own methods
+    /// and has no row for the base, so an inherited selector cannot appear in
+    /// the set this test compares against. See [`OP_USE_HEAPS`].
     ///
     /// # This list used to hold four, and the other two were a wrong claim
     ///
@@ -1065,7 +1093,7 @@ mod tests {
     /// Apple, and neither is a claim any single capability state can support.
     ///
     /// Keeping the remaining exception explicit is what stops a third from being
-    /// added silently, which is how `0x86`/`0x87` reached a second rail.
+    /// added silently.
     ///
     /// The gap direction is the one that costs guest work. An opcode Apple
     /// emits and this module does not name reaches no arm, and a compute record

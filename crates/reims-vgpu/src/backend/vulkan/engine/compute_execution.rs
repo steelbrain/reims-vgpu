@@ -52,6 +52,28 @@ pub enum ComputeExecutionDecline {
         height: u32,
         format: StorageImageFormat,
     },
+    /// A dispatch asked for this identity at a different image shape while the
+    /// resident holding it still owes a deferred writeback.
+    ///
+    /// One identity maps to one slot, so re-keying it means destroying the old
+    /// image — and a pinned resident's pixels exist only there, so that destroys
+    /// guest output that was accepted and never landed. Refusing is the faithful
+    /// half of the same choice every other removal in this registry already
+    /// makes by skipping pinned entries: refuse the request that cannot be
+    /// served, rather than serve it by discarding an earlier one.
+    ///
+    /// Self-clearing rather than terminal. The pin is dropped when the writeback
+    /// lands, and the next dispatch bearing this identity re-keys normally, so a
+    /// firing means the guest re-shaped a surface between a Store and its flush.
+    ResidentRekeyWouldDropPinned {
+        identity: ComputeStorageResidencyKey,
+        held_width: u32,
+        held_height: u32,
+        held_format: StorageImageFormat,
+        wanted_width: u32,
+        wanted_height: u32,
+        wanted_format: StorageImageFormat,
+    },
 }
 
 impl Decline for ComputeExecutionDecline {
@@ -72,6 +94,9 @@ impl Decline for ComputeExecutionDecline {
             }
             Self::ResidentAllocatorLiveSlotMissing { .. } => {
                 "vk_compute_exec_resident_allocator_live_slot_missing"
+            }
+            Self::ResidentRekeyWouldDropPinned { .. } => {
+                "vk_compute_exec_resident_rekey_would_drop_pinned"
             }
         }
     }
@@ -158,6 +183,26 @@ impl Decline for ComputeExecutionDecline {
                     ("resource_width", width.to_string()),
                     ("resource_height", height.to_string()),
                     ("format", format!("{format:?}")),
+                ]);
+                fields
+            }
+            Self::ResidentRekeyWouldDropPinned {
+                identity,
+                held_width,
+                held_height,
+                held_format,
+                wanted_width,
+                wanted_height,
+                wanted_format,
+            } => {
+                let mut fields = residency_fields(identity);
+                fields.extend([
+                    ("held_width", held_width.to_string()),
+                    ("held_height", held_height.to_string()),
+                    ("held_format", format!("{held_format:?}")),
+                    ("wanted_width", wanted_width.to_string()),
+                    ("wanted_height", wanted_height.to_string()),
+                    ("wanted_format", format!("{wanted_format:?}")),
                 ]);
                 fields
             }

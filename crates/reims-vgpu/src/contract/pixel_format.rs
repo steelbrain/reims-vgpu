@@ -144,6 +144,31 @@ impl TexelLayout {
     pub fn is_four_byte_color(self) -> bool {
         matches!(self, Self::Rgba8 | Self::Bgra8)
     }
+
+    /// Whether [`texel_to_rgba8`] carries an arm for this layout, so a rail
+    /// that declines has a CPU path to decline *to*.
+    ///
+    /// This is the question a performance threshold is really asking. A floor
+    /// that turns a small window away from a GPU gather is only a cost
+    /// decision when the CPU loader can serve it instead; for a layout with no
+    /// arm the same floor is a correctness gate wearing a threshold's clothes,
+    /// and the sample goes black or fail-visible rather than slow. The two
+    /// float layouts are colour-management LUTs, whose transfer curve unorm8
+    /// would quantize — which is why `texel_to_rgba8` deliberately has no arm
+    /// for them and why they must bypass any such floor.
+    ///
+    /// Spelled here rather than at the floors, because it is a property of the
+    /// layout and the loader, and a rail that re-lists the variants drifts the
+    /// first time one is added. It is deliberately **not** `is_four_byte_color`
+    /// even though the two agreed for as long as only four-byte colour reached
+    /// a floor: they answer different questions and diverge on `R8`/`Rg8`,
+    /// which have arms and are not four bytes.
+    pub fn has_cpu_loader_arm(self) -> bool {
+        match self {
+            Self::Rgba8 | Self::Bgra8 | Self::R8 | Self::Rg8 => true,
+            Self::R16Float | Self::R32Float => false,
+        }
+    }
 }
 
 #[repr(u8)]
@@ -316,51 +341,67 @@ pub fn depth_stencil_packing(format: u16) -> Option<DepthStencilPacking> {
     }
 }
 
+/// Selected texture aspect for a buffer↔texture / options-bearing copy.
+///
+/// Three states, and exactly three: `MTLBlitOption`'s depth and stencil bits
+/// are mutually exclusive, and
+/// [`crate::runtime::decode::blit::parse_blit_options`] refuses the pair with
+/// `ConflictingAspects` rather than producing one.
+///
+/// Lives here, below the decoder, because every consumer of the choice is a
+/// pure format question — which plane of a packed texel, and how wide. The
+/// decoder re-exports it under its own name.
+///
+/// This whole family used to travel as `(depth_aspect: bool, stencil_aspect:
+/// bool)`, which spells a fourth state the decoder cannot emit, and the five
+/// functions below did not agree on what it meant: two rejected `(true,
+/// true)`, one treated it as a repack, and two read it as depth. One enum is
+/// what makes that disagreement unwritable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlitAspect {
+    /// Full texel (options None / zero).
+    Full,
+    /// Depth plane of a depth or depth-stencil texture.
+    Depth,
+    /// Stencil plane of a stencil or depth-stencil texture.
+    Stencil,
+}
+
 /// Bytes per texel for a blit aspect selection.
 ///
 /// Pure depth/stencil formats: aspect matches full bpp (option is identity).
 /// Combined formats: Full uses packed `full_bpp`; depth plane is 4 B; stencil is 1 B.
-pub fn blit_aspect_bytes_per_pixel(
-    format: u16,
-    depth_aspect: bool,
-    stencil_aspect: bool,
-) -> Option<u32> {
-    if depth_aspect && stencil_aspect {
-        return None;
+pub fn blit_aspect_bytes_per_pixel(format: u16, aspect: BlitAspect) -> Option<u32> {
+    match aspect {
+        BlitAspect::Depth => {
+            if !format_has_depth_aspect(format) {
+                return None;
+            }
+            if let Some(p) = depth_stencil_packing(format) {
+                return (p.depth_plane_bpp != 0).then_some(p.depth_plane_bpp);
+            }
+            match format {
+                MTL_FORMAT_DEPTH16_UNORM => Some(2),
+                MTL_FORMAT_DEPTH32_FLOAT => Some(4),
+                _ => None,
+            }
+        }
+        BlitAspect::Stencil => {
+            if !format_has_stencil_aspect(format) {
+                return None;
+            }
+            if let Some(p) = depth_stencil_packing(format) {
+                return Some(p.stencil_plane_bpp);
+            }
+            Some(1)
+        }
+        BlitAspect::Full => bytes_per_pixel(format),
     }
-    if depth_aspect {
-        if !format_has_depth_aspect(format) {
-            return None;
-        }
-        if let Some(p) = depth_stencil_packing(format) {
-            return if p.depth_plane_bpp != 0 {
-                Some(p.depth_plane_bpp)
-            } else {
-                None
-            };
-        }
-        return Some(match format {
-            MTL_FORMAT_DEPTH16_UNORM => 2,
-            MTL_FORMAT_DEPTH32_FLOAT => 4,
-            _ => return None,
-        });
-    }
-    if stencil_aspect {
-        if !format_has_stencil_aspect(format) {
-            return None;
-        }
-        if let Some(p) = depth_stencil_packing(format) {
-            return Some(p.stencil_plane_bpp);
-        }
-        return Some(1);
-    }
-    // Full texel.
-    bytes_per_pixel(format)
 }
 
 /// Whether a plane extract/insert pass is required (combined DS + aspect option).
-pub fn blit_aspect_needs_repack(format: u16, depth_aspect: bool, stencil_aspect: bool) -> bool {
-    if !depth_aspect && !stencil_aspect {
+pub fn blit_aspect_needs_repack(format: u16, aspect: BlitAspect) -> bool {
+    if aspect == BlitAspect::Full {
         return false;
     }
     depth_stencil_packing(format).is_some()
@@ -369,12 +410,11 @@ pub fn blit_aspect_needs_repack(format: u16, depth_aspect: bool, stencil_aspect:
 /// Extract one plane from a packed depth-stencil texel into `dst` (plane-native size).
 pub fn extract_depth_stencil_plane(
     format: u16,
-    depth_aspect: bool,
-    stencil_aspect: bool,
+    aspect: BlitAspect,
     texel: &[u8],
     dst: &mut [u8],
 ) -> bool {
-    if depth_aspect == stencil_aspect {
+    if aspect == BlitAspect::Full {
         return false;
     }
     let Some(p) = depth_stencil_packing(format) else {
@@ -383,7 +423,7 @@ pub fn extract_depth_stencil_plane(
     if texel.len() < p.full_bpp as usize {
         return false;
     }
-    if depth_aspect {
+    if aspect == BlitAspect::Depth {
         if p.depth_plane_bpp == 0 || dst.len() < p.depth_plane_bpp as usize {
             return false;
         }
@@ -416,12 +456,11 @@ pub fn extract_depth_stencil_plane(
 /// `texel` holds the current full cell (updated in place). `src` is plane-native.
 pub fn insert_depth_stencil_plane(
     format: u16,
-    depth_aspect: bool,
-    stencil_aspect: bool,
+    aspect: BlitAspect,
     src: &[u8],
     texel: &mut [u8],
 ) -> bool {
-    if depth_aspect == stencil_aspect {
+    if aspect == BlitAspect::Full {
         return false;
     }
     let Some(p) = depth_stencil_packing(format) else {
@@ -430,7 +469,7 @@ pub fn insert_depth_stencil_plane(
     if texel.len() < p.full_bpp as usize {
         return false;
     }
-    if depth_aspect {
+    if aspect == BlitAspect::Depth {
         if p.depth_plane_bpp == 0 || src.len() < p.depth_plane_bpp as usize {
             return false;
         }
@@ -460,8 +499,7 @@ pub fn insert_depth_stencil_plane(
 /// Extract a tight plane row from a strided packed texture row.
 pub fn extract_plane_row(
     format: u16,
-    depth_aspect: bool,
-    stencil_aspect: bool,
+    aspect: BlitAspect,
     src_row: &[u8],
     width: u32,
     dst_plane: &mut [u8],
@@ -469,12 +507,10 @@ pub fn extract_plane_row(
     let Some(p) = depth_stencil_packing(format) else {
         return false;
     };
-    let plane_bpp = if depth_aspect {
-        p.depth_plane_bpp
-    } else if stencil_aspect {
-        p.stencil_plane_bpp
-    } else {
-        return false;
+    let plane_bpp = match aspect {
+        BlitAspect::Depth => p.depth_plane_bpp,
+        BlitAspect::Stencil => p.stencil_plane_bpp,
+        BlitAspect::Full => return false,
     } as usize;
     let full = p.full_bpp as usize;
     let w = width as usize;
@@ -490,7 +526,7 @@ pub fn extract_plane_row(
     for x in 0..w {
         let t = &src_row[x * full..x * full + full];
         let d = &mut dst_plane[x * plane_bpp..x * plane_bpp + plane_bpp];
-        if !extract_depth_stencil_plane(format, depth_aspect, stencil_aspect, t, d) {
+        if !extract_depth_stencil_plane(format, aspect, t, d) {
             return false;
         }
     }
@@ -500,8 +536,7 @@ pub fn extract_plane_row(
 /// Insert a tight plane row into a strided packed texture row (RMW per texel).
 pub fn insert_plane_row(
     format: u16,
-    depth_aspect: bool,
-    stencil_aspect: bool,
+    aspect: BlitAspect,
     src_plane: &[u8],
     width: u32,
     dst_row: &mut [u8],
@@ -509,12 +544,10 @@ pub fn insert_plane_row(
     let Some(p) = depth_stencil_packing(format) else {
         return false;
     };
-    let plane_bpp = if depth_aspect {
-        p.depth_plane_bpp
-    } else if stencil_aspect {
-        p.stencil_plane_bpp
-    } else {
-        return false;
+    let plane_bpp = match aspect {
+        BlitAspect::Depth => p.depth_plane_bpp,
+        BlitAspect::Stencil => p.stencil_plane_bpp,
+        BlitAspect::Full => return false,
     } as usize;
     let full = p.full_bpp as usize;
     let w = width as usize;
@@ -530,7 +563,7 @@ pub fn insert_plane_row(
     for x in 0..w {
         let s = &src_plane[x * plane_bpp..x * plane_bpp + plane_bpp];
         let t = &mut dst_row[x * full..x * full + full];
-        if !insert_depth_stencil_plane(format, depth_aspect, stencil_aspect, s, t) {
+        if !insert_depth_stencil_plane(format, aspect, s, t) {
             return false;
         }
     }
@@ -599,7 +632,7 @@ pub fn storage_selector(format: u16) -> Option<StorageImageSelector> {
 ///
 /// The match arms *are* the renderable set — the answer to "may a colour
 /// attachment be this format" is `.is_some()`, which is how
-/// `runtime/metal_draw` asks it. There used to be a `RenderTargetClass` enum
+/// `runtime/draw` asks it. There used to be a `RenderTargetClass` enum
 /// returned alongside the width, one variant per arm below; every caller
 /// discarded it, so it named the same six formats a second time and could
 /// disagree with this list without anything noticing.
@@ -612,6 +645,35 @@ pub fn render_target_bpp(format: u16) -> Option<u32> {
         MTL_FORMAT_BGRA8_UNORM | MTL_FORMAT_BGRA8_UNORM_SRGB => BGRA8_BPP,
         MTL_FORMAT_RGBA16_FLOAT => RGBA16F_BPP,
         MTL_FORMAT_RG16_FLOAT => RG16F_BPP,
+        _ => return None,
+    })
+}
+
+/// The channel order a render Store's destination stores its texels in, or
+/// `None` for a destination whose texel is not one of the two 8-bit RGBA
+/// permutations.
+///
+/// This is the whole admission rule for landing a resident render target in
+/// guest memory with an image→buffer copy: that copy moves bytes and converts
+/// nothing, so the destination's texel must be four bytes wide and its channel
+/// order must be the order the resident already holds. Say `Some(order)` and
+/// the caller compares it against its resident; say `None` and the only route
+/// left is [`convert_rgba8_to_row`], which is a CPU pass over the frame.
+///
+/// Named once because both writeback rails ask it — the type-11 mapping rail
+/// wants `Bgra8` specifically and the GVA rail takes whichever order its
+/// resident was built in — and a rail that re-lists the formats drifts the
+/// first time one is added. It is deliberately not [`render_target_bpp`]`
+/// .is_some()`: `RGBA16_FLOAT` is renderable and is not a byte-copy
+/// destination.
+///
+/// sRGB folds onto its linear sibling for the same reason [`sampled_class`]
+/// folds it: the qualifier describes how a sampler interprets the bytes, not
+/// how they are stored, and only the storage matters to a copy.
+pub fn store_texel_order(format: u16) -> Option<TexelLayout> {
+    Some(match format {
+        MTL_FORMAT_RGBA8_UNORM | MTL_FORMAT_RGBA8_UNORM_SRGB => TexelLayout::Rgba8,
+        MTL_FORMAT_BGRA8_UNORM | MTL_FORMAT_BGRA8_UNORM_SRGB => TexelLayout::Bgra8,
         _ => return None,
     })
 }
@@ -688,6 +750,52 @@ pub fn f64_to_unorm8(value: f64) -> u8 {
     } else {
         (value * f64::from(UNORM8_MAX) + 0.5) as u8
     }
+}
+
+/// A tightly-packed `w`×`h` RGBA8 image of one colour.
+///
+/// What this device hands back when it services a colour attachment's CLEAR
+/// itself, rather than encoding one. `clear` is the guest's `MTLClearColor`, so
+/// each channel goes through [`f64_to_unorm8`], which is where the out-of-range
+/// and NaN rules live.
+///
+/// # One definition, because the two it had disagreed
+///
+/// This was `runtime::exec::solid_rgba` and `runtime::draw::solid_rgba_local`,
+/// byte-identical bodies six call sites apart, and both carried the same defect:
+/// the buffer's length widened each axis before multiplying, so it cannot
+/// overflow on any host this runs on, while the fill counted texels in `u32` as
+/// `0..(w * h) as usize`, which overflows at 65536×65536. Only a zero
+/// axis is refused upstream of either; `MAX_SCANOUT_DIM` bounds the scanout
+/// registers and says nothing about a render target's geometry. A debug build
+/// panics there, taking the guest down; a release build wraps to a small count
+/// and returns a full-size buffer filled for a fraction of it — a clear that
+/// silently did not clear.
+///
+/// The fill therefore walks the buffer instead of counting texels. A
+/// `chunks_exact_mut` cannot describe a different image from the one that was
+/// allocated, where a second expression always can — the rule
+/// [`crate::contract::extent::tight_image_layout`] states for a length and its
+/// stride, one level down.
+///
+/// Here rather than in either caller because it is arithmetic both rails need
+/// and neither owns, and because `contract` is the tree that gets tested on
+/// every arm.
+pub fn solid_rgba8(w: u32, h: u32, clear: &[f64; 4]) -> Vec<u8> {
+    let px = [
+        f64_to_unorm8(clear[COMPONENT_R]),
+        f64_to_unorm8(clear[COMPONENT_G]),
+        f64_to_unorm8(clear[COMPONENT_B]),
+        f64_to_unorm8(clear[COMPONENT_A]),
+    ];
+    let n = (w as usize)
+        .saturating_mul(h as usize)
+        .saturating_mul(px.len());
+    let mut img = vec![0u8; n];
+    for texel in img.chunks_exact_mut(px.len()) {
+        texel.copy_from_slice(&px);
+    }
+    img
 }
 
 pub fn f16_to_f32(half_bits: u16) -> f32 {
@@ -1016,6 +1124,122 @@ pub fn convert_rgba8_to_row(format: u16, src_rgba: &[u8], pixels: u32, dst: &mut
 mod tests {
     use super::*;
 
+    /// [`TexelLayout::has_cpu_loader_arm`] answers for the loader it names.
+    ///
+    /// The two are separate spellings of one fact — a `match` over the layouts
+    /// and a `match` over the Metal formats — and nothing in the type system
+    /// holds them together, so this asks the loader directly rather than
+    /// re-listing the answer. A layout that gains a `texel_to_rgba8` arm, or
+    /// loses one, fails here instead of silently moving a zero-copy floor.
+    ///
+    /// The zero-copy sampled floor is the caller that cares: it may only turn a
+    /// window away when there is a CPU path to turn it away *to*, so a `true`
+    /// here that the loader does not honour is a black sample rather than a
+    /// slow one.
+    #[test]
+    fn the_cpu_loader_arm_predicate_agrees_with_the_loader() {
+        // One representative Metal format per layout, and a source buffer wide
+        // enough for the widest of them.
+        let cases = [
+            (TexelLayout::Rgba8, MTL_FORMAT_RGBA8_UNORM),
+            (TexelLayout::Bgra8, MTL_FORMAT_BGRA8_UNORM),
+            (TexelLayout::R8, MTL_FORMAT_R8_UNORM),
+            (TexelLayout::Rg8, MTL_FORMAT_RG8_UNORM),
+            (TexelLayout::R16Float, MTL_FORMAT_R16_FLOAT),
+            (TexelLayout::R32Float, MTL_FORMAT_R32_FLOAT),
+        ];
+        let src = [0u8; 8];
+        for (layout, mtl) in cases {
+            assert_eq!(
+                layout.has_cpu_loader_arm(),
+                texel_to_rgba8(mtl, &src).is_some(),
+                "{layout:?} ({mtl:#x}): the predicate and texel_to_rgba8 disagree"
+            );
+        }
+        // The case the predicate exists to separate: `Rg8` has an arm and is
+        // not four-byte colour, so the two questions genuinely differ. Without
+        // this the predicate could be `is_four_byte_color` and every assertion
+        // above would still pass on the layouts that reached a floor before.
+        assert!(TexelLayout::Rg8.has_cpu_loader_arm());
+        assert!(!TexelLayout::Rg8.is_four_byte_color());
+    }
+
+    /// `Rg8` guest bytes sample the same texel through the CPU loader and
+    /// through a native `R8G8_UNORM` image.
+    ///
+    /// This is the whole correctness argument for admitting `Rg8` to the
+    /// zero-copy linear gather, so it is asserted rather than described. The
+    /// CPU rail expands two guest bytes to `(r, g, 0, 255)`; Vulkan samples
+    /// `R8G8_UNORM` as `(r, g, 0, 1)`, which is that texel in unorm. Same for
+    /// `R8`. If the loader ever stopped writing an opaque alpha or started
+    /// filling blue, the gather and the fallback would paint differently
+    /// depending only on the window's size relative to the floor — the worst
+    /// shape a divergence can take, because it reproduces intermittently.
+    #[test]
+    fn the_two_byte_and_one_byte_layouts_sample_as_the_native_image_does() {
+        let rg = texel_to_rgba8(MTL_FORMAT_RG8_UNORM, &[0x11, 0x22]).expect("Rg8 has an arm");
+        assert_eq!(
+            rg,
+            [0x11, 0x22, UNORM8_MIN, UNORM8_MAX],
+            "R8G8_UNORM samples (r, g, 0, 1)"
+        );
+        let r = texel_to_rgba8(MTL_FORMAT_R8_UNORM, &[0x33]).expect("R8 has an arm");
+        assert_eq!(
+            r,
+            [0x33, UNORM8_MIN, UNORM8_MIN, UNORM8_MAX],
+            "R8_UNORM samples (r, 0, 0, 1)"
+        );
+    }
+
+    /// Every byte of the buffer is the colour, at a geometry with no square
+    /// root and no power of two, so an off-by-one in either axis shows.
+    ///
+    /// The property the two deleted copies could not state: length and fill are
+    /// one derivation, so "as long as `w`×`h`×4" and "filled end to end" cannot
+    /// come apart. A fill that counted texts separately would satisfy the first
+    /// assertion and fail the second the moment the two expressions disagreed.
+    #[test]
+    fn a_solid_clear_fills_every_texel_it_allocates() {
+        let img = solid_rgba8(37, 11, &[1.0, 0.0, 0.5, 1.0]);
+        assert_eq!(img.len(), 37 * 11 * RGBA8_BPP as usize);
+        let expect = [UNORM8_MAX, UNORM8_MIN, f64_to_unorm8(0.5), UNORM8_MAX];
+        assert!(
+            img.chunks_exact(RGBA8_BPP as usize).all(|t| t == expect),
+            "a texel was left unwritten, so the fill and the length disagree"
+        );
+        assert_eq!(
+            img.chunks_exact(RGBA8_BPP as usize).count(),
+            37 * 11,
+            "the buffer holds a whole number of texels and exactly w*h of them"
+        );
+    }
+
+    /// A zero axis is an empty image, not a one-texel one.
+    ///
+    /// Both callers reach this with a colour attachment's decoded geometry, and
+    /// `chunks_exact_mut` over an empty buffer yields nothing — so the zero case
+    /// needs no special arm and must not grow one.
+    #[test]
+    fn a_clear_with_a_zero_axis_is_empty() {
+        assert!(solid_rgba8(0, 64, &[1.0; 4]).is_empty());
+        assert!(solid_rgba8(64, 0, &[1.0; 4]).is_empty());
+        assert!(solid_rgba8(0, 0, &[1.0; 4]).is_empty());
+    }
+
+    /// The clear colour travels channel by channel, in RGBA order.
+    ///
+    /// Pins the ordering against a transposition: four `f64_to_unorm8` calls in
+    /// a row are exactly the shape where a swap compiles and looks right.
+    #[test]
+    fn a_clear_colour_keeps_its_channel_order() {
+        let img = solid_rgba8(1, 1, &[0.0, 1.0, 0.0, 0.0]);
+        assert_eq!(
+            img,
+            vec![UNORM8_MIN, UNORM8_MAX, UNORM8_MIN, UNORM8_MIN],
+            "only green was asked for"
+        );
+    }
+
     #[test]
     fn bytes_per_pixel_matrix() {
         let cases = [
@@ -1056,49 +1280,47 @@ mod tests {
     fn blit_aspect_bpp_depth_stencil() {
         // Pure depth + depth option.
         assert_eq!(
-            blit_aspect_bytes_per_pixel(MTL_FORMAT_DEPTH32_FLOAT, true, false),
+            blit_aspect_bytes_per_pixel(MTL_FORMAT_DEPTH32_FLOAT, BlitAspect::Depth),
             Some(4)
         );
         assert_eq!(
-            blit_aspect_bytes_per_pixel(MTL_FORMAT_DEPTH32_FLOAT, false, false),
+            blit_aspect_bytes_per_pixel(MTL_FORMAT_DEPTH32_FLOAT, BlitAspect::Full),
             Some(4)
         );
         // Pure depth cannot take stencil option.
         assert_eq!(
-            blit_aspect_bytes_per_pixel(MTL_FORMAT_DEPTH32_FLOAT, false, true),
+            blit_aspect_bytes_per_pixel(MTL_FORMAT_DEPTH32_FLOAT, BlitAspect::Stencil),
             None
         );
         // Pure stencil.
         assert_eq!(
-            blit_aspect_bytes_per_pixel(MTL_FORMAT_STENCIL8, false, true),
+            blit_aspect_bytes_per_pixel(MTL_FORMAT_STENCIL8, BlitAspect::Stencil),
             Some(1)
         );
         // Combined: depth plane 4 B, stencil 1 B, full = packing full_bpp.
         assert_eq!(
-            blit_aspect_bytes_per_pixel(MTL_FORMAT_DEPTH32_FLOAT_STENCIL8, true, false),
+            blit_aspect_bytes_per_pixel(MTL_FORMAT_DEPTH32_FLOAT_STENCIL8, BlitAspect::Depth),
             Some(4)
         );
         assert_eq!(
-            blit_aspect_bytes_per_pixel(MTL_FORMAT_DEPTH32_FLOAT_STENCIL8, false, true),
+            blit_aspect_bytes_per_pixel(MTL_FORMAT_DEPTH32_FLOAT_STENCIL8, BlitAspect::Stencil),
             Some(1)
         );
         assert_eq!(
-            blit_aspect_bytes_per_pixel(MTL_FORMAT_DEPTH32_FLOAT_STENCIL8, false, false),
+            blit_aspect_bytes_per_pixel(MTL_FORMAT_DEPTH32_FLOAT_STENCIL8, BlitAspect::Full),
             Some(8)
         );
         assert!(blit_aspect_needs_repack(
             MTL_FORMAT_DEPTH32_FLOAT_STENCIL8,
-            true,
-            false
+            BlitAspect::Depth
         ));
         assert!(!blit_aspect_needs_repack(
             MTL_FORMAT_DEPTH32_FLOAT,
-            true,
-            false
+            BlitAspect::Depth
         ));
         // Color cannot take DS options.
         assert_eq!(
-            blit_aspect_bytes_per_pixel(MTL_FORMAT_BGRA8_UNORM, true, false),
+            blit_aspect_bytes_per_pixel(MTL_FORMAT_BGRA8_UNORM, BlitAspect::Depth),
             None
         );
     }
@@ -1251,13 +1473,14 @@ mod tests {
     }
 
     /// The 128-byte-aligned IOSurface row lives in
-    /// [`crate::contract::iosurface_pages::sample_window`], which is the one the
-    /// mapper rail reads. A second `iosurface_row_bytes` here computed the same
-    /// rule from its own copy of the alignment and served nothing but this test.
+    /// [`crate::contract::iosurface_pages::packed_span_estimate`], which is the
+    /// one the mapper rail reads. A second `iosurface_row_bytes` here computed
+    /// the same rule from its own copy of the alignment and served nothing but
+    /// this test. At height 1 the estimate is exactly one aligned row.
     #[test]
     fn rows_and_image_size() {
-        use crate::contract::iosurface_pages::sample_window;
-        let bpr = |w, fmt| sample_window(0, fmt, w, 1).map(|(_, bpr, _)| bpr);
+        use crate::contract::iosurface_pages::packed_span_estimate;
+        let bpr = |w, fmt| packed_span_estimate(fmt, w, 1);
         assert_eq!(bpr(200, MTL_FORMAT_BGRA8_UNORM), Some(896));
         assert_eq!(bpr(64, MTL_FORMAT_BGRA8_UNORM), Some(256));
         assert_eq!(bpr(250, MTL_FORMAT_BGRA8_UNORM), Some(1024));
@@ -1443,6 +1666,55 @@ mod tests {
         }
     }
 
+    /// Every format [`store_texel_order`] admits must survive a raw byte copy.
+    ///
+    /// Exhaustive over `u16` rather than over a list, because the failure this
+    /// guards is a format being *added* to the admitted set whose texel is not
+    /// four bytes or whose channel order the CPU loaders read differently. Both
+    /// would land a frame in guest memory under the wrong layout, and neither
+    /// is visible at the copy — it converts nothing and cannot notice.
+    #[test]
+    fn a_byte_copy_destination_is_four_bytes_of_the_order_it_claims() {
+        for fmt in 0u16..=u16::MAX {
+            let Some(order) = store_texel_order(fmt) else {
+                continue;
+            };
+            assert!(
+                order.is_four_byte_color(),
+                "{fmt:#x} admitted as {order:?}, which is not a four-byte colour order"
+            );
+            assert_eq!(
+                bytes_per_pixel(fmt),
+                Some(order.bytes_per_texel()),
+                "{fmt:#x} stores a texel the copy would mis-stride"
+            );
+            assert_eq!(
+                render_target_bpp(fmt),
+                Some(order.bytes_per_texel()),
+                "{fmt:#x} is a Store destination this device will not render into"
+            );
+            // The sampled table is the independent statement of the same byte
+            // layout, so a disagreement here is one of the two being wrong.
+            assert_eq!(
+                sampled_class(fmt),
+                Some(match order {
+                    TexelLayout::Rgba8 => SampledClass::Rgba8Unorm,
+                    _ => SampledClass::Bgra8Unorm,
+                }),
+                "{fmt:#x} is read as one order by the sampler and copied as another"
+            );
+        }
+        // The renderable formats that are not byte-copy destinations, so a
+        // widening of the set above has to delete a line here to pass.
+        for fmt in [MTL_FORMAT_RGBA16_FLOAT, MTL_FORMAT_RG16_FLOAT] {
+            assert!(render_target_bpp(fmt).is_some());
+            assert!(
+                store_texel_order(fmt).is_none(),
+                "{fmt:#x} is wider than four bytes and cannot be handed to a copy"
+            );
+        }
+    }
+
     #[test]
     fn unsupported_fail_closed() {
         // Unknown formats fail closed. Depth/stencil families have bpp for blit
@@ -1479,32 +1751,100 @@ mod tests {
         texel[4] = 0xab;
         let mut depth = [0u8; 4];
         assert!(extract_depth_stencil_plane(
-            fmt, true, false, &texel, &mut depth
+            fmt,
+            BlitAspect::Depth,
+            &texel,
+            &mut depth
         ));
         assert_eq!(depth, 1.0f32.to_bits().to_le_bytes());
         let mut st = [0u8; 1];
         assert!(extract_depth_stencil_plane(
-            fmt, false, true, &texel, &mut st
+            fmt,
+            BlitAspect::Stencil,
+            &texel,
+            &mut st
         ));
         assert_eq!(st[0], 0xab);
         // Insert new depth, keep stencil.
         let mut t2 = texel;
         let new_d = 0.5f32.to_bits().to_le_bytes();
         assert!(insert_depth_stencil_plane(
-            fmt, true, false, &new_d, &mut t2
+            fmt,
+            BlitAspect::Depth,
+            &new_d,
+            &mut t2
         ));
         assert_eq!(t2[4], 0xab);
         let mut d2 = [0u8; 4];
-        assert!(extract_depth_stencil_plane(fmt, true, false, &t2, &mut d2));
+        assert!(extract_depth_stencil_plane(
+            fmt,
+            BlitAspect::Depth,
+            &t2,
+            &mut d2
+        ));
         assert_eq!(d2, new_d);
         // Row extract 2 pixels.
         let mut row = [0u8; 16];
         row[..8].copy_from_slice(&texel);
         row[8..16].copy_from_slice(&t2);
         let mut planes = [0u8; 8];
-        assert!(extract_plane_row(fmt, true, false, &row, 2, &mut planes));
+        assert!(extract_plane_row(
+            fmt,
+            BlitAspect::Depth,
+            &row,
+            2,
+            &mut planes
+        ));
         assert_eq!(&planes[0..4], &1.0f32.to_bits().to_le_bytes());
         assert_eq!(&planes[4..8], &new_d);
+    }
+
+    /// `Full` is not a plane, and every plane entry point refuses it.
+    ///
+    /// The aspect used to travel as `(depth: bool, stencil: bool)`, where
+    /// "neither" and "both" were two distinct values that had to be refused
+    /// separately — and the five functions did not agree on how. Two rejected
+    /// `(true, true)`, `blit_aspect_needs_repack` read it as a plane pass, and
+    /// the two row helpers read it as depth. Collapsing to three states makes
+    /// "both" unwritable; this pins the one refusal that is left.
+    #[test]
+    fn the_full_aspect_is_not_a_plane_at_any_entry_point() {
+        let fmt = MTL_FORMAT_DEPTH32_FLOAT_STENCIL8;
+        let texel = [0u8; 8];
+        let mut out = [0u8; 8];
+        assert!(!extract_depth_stencil_plane(
+            fmt,
+            BlitAspect::Full,
+            &texel,
+            &mut out
+        ));
+        let mut t = texel;
+        assert!(!insert_depth_stencil_plane(
+            fmt,
+            BlitAspect::Full,
+            &out,
+            &mut t
+        ));
+        let row = [0u8; 16];
+        let mut planes = [0u8; 8];
+        assert!(!extract_plane_row(
+            fmt,
+            BlitAspect::Full,
+            &row,
+            2,
+            &mut planes
+        ));
+        let mut dst_row = [0u8; 16];
+        assert!(!insert_plane_row(
+            fmt,
+            BlitAspect::Full,
+            &planes,
+            2,
+            &mut dst_row
+        ));
+        assert!(!blit_aspect_needs_repack(fmt, BlitAspect::Full));
+        // And `Full` is still the aspect that asks for the whole packed texel.
+        assert_eq!(blit_aspect_bytes_per_pixel(fmt, BlitAspect::Full), Some(8));
     }
 
     #[test]
@@ -1516,26 +1856,30 @@ mod tests {
         let texel = packed.to_le_bytes();
         let mut depth = [0u8; 4];
         assert!(extract_depth_stencil_plane(
-            fmt, true, false, &texel, &mut depth
+            fmt,
+            BlitAspect::Depth,
+            &texel,
+            &mut depth
         ));
         assert_eq!(u32::from_le_bytes(depth), depth24);
         let mut st = [0u8; 1];
         assert!(extract_depth_stencil_plane(
-            fmt, false, true, &texel, &mut st
+            fmt,
+            BlitAspect::Stencil,
+            &texel,
+            &mut st
         ));
         assert_eq!(st[0], 0x11);
         let mut t2 = [0u8; 4];
         assert!(insert_depth_stencil_plane(
             fmt,
-            false,
-            true,
+            BlitAspect::Stencil,
             &[0x22],
             &mut t2
         ));
         assert!(insert_depth_stencil_plane(
             fmt,
-            true,
-            false,
+            BlitAspect::Depth,
             &depth24.to_le_bytes(),
             &mut t2
         ));

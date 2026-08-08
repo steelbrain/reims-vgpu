@@ -51,37 +51,98 @@
 
 use metal::{
     MTLAttributeFormat, MTLBlendFactor, MTLBlendOperation, MTLCompareFunction, MTLCullMode,
-    MTLDepthClipMode, MTLIndexType, MTLLoadAction, MTLPrimitiveType, MTLSamplerAddressMode,
-    MTLSamplerBorderColor, MTLSamplerMinMagFilter, MTLSamplerMipFilter, MTLStencilOperation,
-    MTLStepFunction, MTLStoreAction, MTLTriangleFillMode, MTLVertexFormat, MTLVertexStepFunction,
-    MTLWinding,
+    MTLDepthClipMode, MTLIndexType, MTLLoadAction, MTLPixelFormat, MTLPrimitiveType,
+    MTLSamplerAddressMode, MTLSamplerBorderColor, MTLSamplerMinMagFilter, MTLSamplerMipFilter,
+    MTLStencilOperation, MTLStepFunction, MTLStoreAction, MTLTriangleFillMode, MTLVertexFormat,
+    MTLVertexStepFunction, MTLVisibilityResultMode, MTLWinding,
 };
 
-/// Define a checked ordinal to enum conversion plus its declared-variant table.
+/// Define a checked ordinal to enum conversion, and prove it at compile time.
 ///
-/// The table exists so the generated test can assert both directions without a
-/// second hand-written list: every declared variant converts back to itself, and
-/// nothing else in the surrounding range converts at all. A variant left out of
-/// the macro invocation therefore fails its own test rather than silently
-/// becoming a refusal.
+/// The generated `const` block asserts both directions against the variant list
+/// given here: every listed variant converts back to itself, and no ordinal that
+/// is *not* listed converts at all, sweeping to four past the highest listed
+/// discriminant so interior holes and the upper edge are both covered.
+///
+/// # The trailing `apple_numbers_them_from_zero;` clause
+///
+/// Everything above is stated in terms of `<$ty>::$variant as u32` and nothing
+/// else, so **it names no number.** It proves a table agrees with itself, which
+/// leaves the accepted *set* — the ordinals a guest may send — defined entirely
+/// by whatever discriminants the `metal` crate happens to assign. A crate bump
+/// that renumbers one of these enums keeps every assertion green while moving
+/// the set: the Metal arm would start refusing an ordinal Apple declares (and
+/// the Vulkan arm still accepts, since `translate::raster` spells Apple's
+/// numbers itself), and nothing in the tree would say so.
+///
+/// The clause closes that for the tables whose variants Apple numbers `0..n`
+/// with no holes, in the order they are listed here. It asserts each variant's
+/// discriminant equals its index, which is the whole accepted set stated as one
+/// claim. Add it only after reading the SDK header — it is an assertion about
+/// Apple's numbering that the compiler checks against `metal`'s, so writing it
+/// on a table with a hole (`vertex_format`, `attribute_format`) is false, and
+/// writing it on a table listed out of Apple's order pins the wrong thing.
+///
+/// # What this cannot catch
+///
+/// **A renaming.** The clause constrains discriminants, not names, and this
+/// crate version is measured to put six of `MTLStepFunction`'s nine names on
+/// the wrong numbers while numbering the enum `0..8` contiguously — so a table
+/// of it would satisfy the clause and still be wrong. That enum is converted
+/// through `STEP_FUNCTION_BY_ORDINAL` below for exactly this reason.
+///
+/// **A variant the `metal` crate declares and this invocation omits.** The list
+/// is the only statement of the accepted set, so an omitted variant is absent
+/// from the conversion and from the sweep alike: the ordinal reads as undeclared,
+/// `$fn_name` returns `None` for it, and the assertion that undeclared ordinals
+/// return `None` passes. The guest's value silently becomes a refusal.
+///
+/// This was verified by deleting `Half3` from `vertex_format`'s list and
+/// watching the build stay green. It is not fixable here — Rust cannot enumerate
+/// a foreign enum's variants — so the guard is the module doc above: the lists
+/// were read off `metal` 0.33's own declarations, and a crate bump means
+/// re-reading them. An earlier version of this doc claimed omission "fails its
+/// own test"; it never did.
 macro_rules! checked_ordinal {
     (
         $(#[$outer:meta])*
         fn $fn_name:ident -> $ty:ty;
-        const $variants:ident;
-        test $test_name:ident;
+        [ $($variant:ident),+ $(,)? ]
+        apple_numbers_them_from_zero;
+    ) => {
+        checked_ordinal! {
+            $(#[$outer])*
+            fn $fn_name -> $ty;
+            [ $($variant),+ ]
+        }
+
+        // Each variant sits at the number its position in the list claims, which
+        // for a hole-free enum listed in Apple's order is the accepted set
+        // stated once. Without it the set is whatever `metal` says it is, and a
+        // renumbering there is a silent cross-arm divergence rather than a build
+        // failure — see the macro's own doc.
+        const _: () = {
+            let declared = [ $(<$ty>::$variant as u32),+ ];
+            let mut index = 0usize;
+            while index < declared.len() {
+                assert!(
+                    declared[index] == index as u32,
+                    concat!(
+                        stringify!($fn_name),
+                        " has a variant off the number Apple assigned it",
+                    ),
+                );
+                index += 1;
+            }
+        };
+    };
+    (
+        $(#[$outer:meta])*
+        fn $fn_name:ident -> $ty:ty;
         [ $($variant:ident),+ $(,)? ]
     ) => {
-        /// Every variant the `metal` crate declares for this enum.
-        ///
-        /// Test-only: the conversion below does not read it, and its purpose is
-        /// to give the generated test the accepted set without a second
-        /// hand-written list that could disagree with the one above it.
-        #[cfg(test)]
-        const $variants: &[$ty] = &[$(<$ty>::$variant),+];
-
         $(#[$outer])*
-        pub(crate) fn $fn_name(ordinal: u32) -> Option<$ty> {
+        pub(crate) const fn $fn_name(ordinal: u32) -> Option<$ty> {
             $(
                 if ordinal == <$ty>::$variant as u32 {
                     return Some(<$ty>::$variant);
@@ -90,39 +151,62 @@ macro_rules! checked_ordinal {
             None
         }
 
-        // Compared as ordinals rather than as values: `metal` derives
-        // `PartialEq` on most of these enums and not on all of them
-        // (`MTLStoreAction` and `MTLLoadAction` have no derive at all), and the
-        // ordinal is what the assertion is actually about.
-        #[cfg(test)]
-        #[test]
-        fn $test_name() {
-            let declared: Vec<u32> = $variants.iter().map(|&v| v as u32).collect();
-            for &v in $variants {
-                assert_eq!(
-                    $fn_name(v as u32).map(|got| got as u32),
-                    Some(v as u32),
-                    "{} rejected its own variant {}",
-                    stringify!($fn_name),
-                    v as u32
-                );
-            }
-            // Everything up to four past the last declared variant, so the run's
-            // interior holes and its upper edge are both covered.
-            let ceiling = declared.iter().copied().max().unwrap_or(0).saturating_add(4);
-            for ordinal in 0..=ceiling {
-                if declared.contains(&ordinal) {
-                    continue;
-                }
+        // The same sweep the generated `#[test]` used to run, as a `const`
+        // block, and `$fn_name` is a `const fn` so that it can be. The reason is
+        // the one `super::constants` spells out: this module is
+        // `backend-metal`-gated, so a `#[cfg(test)]` test in it is compiled out
+        // of the Vulkan arm and its `--lib` suite runs on Apple hosts only.
+        // Seventeen tables' worth of "no undeclared ordinal converts" was
+        // therefore checked on no machine anybody edits this code from — and
+        // what it stands between is a guest `u32` and a `transmute` into a
+        // `#[repr(u64)]` enum, which is undefined behaviour rather than a decode
+        // error. `rustc` evaluates this on every arm that compiles the file,
+        // including the cross-compiled Metal clippy run `AGENTS.md` requires
+        // from Linux.
+        //
+        // Ordinals are compared rather than values: `metal` derives `PartialEq`
+        // on most of these enums and not all (`MTLStoreAction` and
+        // `MTLLoadAction` have no derive at all), and the ordinal is what the
+        // assertion is about.
+        const _: () = {
+            // Every declared variant converts back to itself.
+            $(
                 assert!(
-                    $fn_name(ordinal).is_none(),
-                    "{} accepted undeclared ordinal {}",
-                    stringify!($fn_name),
-                    ordinal
+                    match $fn_name(<$ty>::$variant as u32) {
+                        Some(got) => got as u32 == <$ty>::$variant as u32,
+                        None => false,
+                    },
+                    concat!(stringify!($fn_name), " rejected one of its own variants"),
                 );
+            )+
+
+            // Everything up to four past the last declared variant, so the
+            // run's interior holes and its upper edge are both covered.
+            let mut ceiling = 0u32;
+            $(
+                if (<$ty>::$variant as u32) > ceiling {
+                    ceiling = <$ty>::$variant as u32;
+                }
+            )+
+            ceiling = ceiling.saturating_add(4);
+
+            let mut ordinal = 0u32;
+            while ordinal <= ceiling {
+                let mut declared = false;
+                $(
+                    if ordinal == <$ty>::$variant as u32 {
+                        declared = true;
+                    }
+                )+
+                assert!(
+                    declared || $fn_name(ordinal).is_none(),
+                    concat!(stringify!($fn_name), " accepted an undeclared ordinal"),
+                );
+                ordinal += 1;
             }
+
             assert!($fn_name(u32::MAX).is_none());
-        }
+        };
     };
 }
 
@@ -132,8 +216,6 @@ checked_ordinal! {
     /// Declines 43 and 44 — the gap Apple left between `UChar4Normalized_BGRA`
     /// and `UChar` — and 54/55, which the SDK declares and `metal` does not.
     fn vertex_format -> MTLVertexFormat;
-    const VERTEX_FORMATS;
-    test every_declared_vertex_format_converts_and_nothing_else_does;
     [
         Invalid, UChar2, UChar3, UChar4, Char2, Char3, Char4,
         UChar2Normalized, UChar3Normalized, UChar4Normalized,
@@ -156,8 +238,6 @@ checked_ordinal! {
     /// declares the two enums separately and this device must not assume they
     /// stay in step.
     fn attribute_format -> MTLAttributeFormat;
-    const ATTRIBUTE_FORMATS;
-    test every_declared_attribute_format_converts_and_nothing_else_does;
     [
         Invalid, UChar2, UChar3, UChar4, Char2, Char3, Char4,
         UChar2Normalized, UChar3Normalized, UChar4Normalized,
@@ -176,10 +256,44 @@ checked_ordinal! {
 checked_ordinal! {
     /// `MTLVertexStepFunction` for a vertex-descriptor buffer layout.
     fn vertex_step_function -> MTLVertexStepFunction;
-    const VERTEX_STEP_FUNCTIONS;
-    test every_declared_vertex_step_function_converts_and_nothing_else_does;
     [Constant, PerVertex, PerInstance, PerPatch, PerPatchControlPoint]
+    apple_numbers_them_from_zero;
 }
+
+// The clause above pins the five discriminants to `0..=4`, and these five pin
+// them to the names the rest of the tree reads them by. Both are wanted: the
+// clause states the accepted *set* and would still hold if this list and
+// `contract::vertex_step` drifted apart together, which is the failure these
+// catch. The gap is not hypothetical — the sibling `MTLStepFunction` below is
+// measured to have six of its nine names on the wrong discriminants in this very
+// crate version, and `render.rs` used to express "no step function above
+// PerInstance" as `> MTLVertexStepFunction::PerInstance as u32`, a band whose
+// top was whatever the crate happened to say.
+//
+// The five ordinals come from `MTLVertexDescriptor.h` and are declared in
+// `contract::vertex_step`, where the shared step/rate rule reads them. Every
+// assertion here is evaluated on each arm that compiles the file, including the
+// cross-compiled Metal clippy run.
+const _: () = assert!(
+    MTLVertexStepFunction::Constant as u32
+        == crate::contract::vertex_step::MTL_VERTEX_STEP_FUNCTION_CONSTANT
+);
+const _: () = assert!(
+    MTLVertexStepFunction::PerVertex as u32
+        == crate::contract::vertex_step::MTL_VERTEX_STEP_FUNCTION_PER_VERTEX
+);
+const _: () = assert!(
+    MTLVertexStepFunction::PerInstance as u32
+        == crate::contract::vertex_step::MTL_VERTEX_STEP_FUNCTION_PER_INSTANCE
+);
+const _: () = assert!(
+    MTLVertexStepFunction::PerPatch as u32
+        == crate::contract::vertex_step::MTL_VERTEX_STEP_FUNCTION_PER_PATCH
+);
+const _: () = assert!(
+    MTLVertexStepFunction::PerPatchControlPoint as u32
+        == crate::contract::vertex_step::MTL_VERTEX_STEP_FUNCTION_PER_PATCH_CONTROL_POINT
+);
 
 /// `MTLStepFunction` by ordinal, indexed by Apple's numbering.
 ///
@@ -220,15 +334,22 @@ const STEP_FUNCTION_BY_ORDINAL: [MTLStepFunction; 9] = [
 ];
 
 /// `MTLStepFunction` for a compute stage-input buffer layout.
-pub(crate) fn step_function(ordinal: u32) -> Option<MTLStepFunction> {
-    STEP_FUNCTION_BY_ORDINAL.get(ordinal as usize).copied()
+///
+/// `const` so the pins below it are `const` assertions, checked on every arm
+/// that compiles this file rather than by a suite this pathway never runs.
+/// Spelled as an explicit bound rather than `get().copied()` because slice
+/// indexing is not available in a `const fn`.
+pub(crate) const fn step_function(ordinal: u32) -> Option<MTLStepFunction> {
+    if (ordinal as usize) < STEP_FUNCTION_BY_ORDINAL.len() {
+        Some(STEP_FUNCTION_BY_ORDINAL[ordinal as usize])
+    } else {
+        None
+    }
 }
 
 checked_ordinal! {
     /// `MTLBlendFactor` for one color attachment's blend state.
     fn blend_factor -> MTLBlendFactor;
-    const BLEND_FACTORS;
-    test every_declared_blend_factor_converts_and_nothing_else_does;
     [
         Zero, One, SourceColor, OneMinusSourceColor, SourceAlpha,
         OneMinusSourceAlpha, DestinationColor, OneMinusDestinationColor,
@@ -236,260 +357,341 @@ checked_ordinal! {
         BlendColor, OneMinusBlendColor, BlendAlpha, OneMinusBlendAlpha,
         Source1Color, OneMinusSource1Color, Source1Alpha, OneMinusSource1Alpha,
     ]
+    apple_numbers_them_from_zero;
 }
 
 checked_ordinal! {
     /// `MTLBlendOperation` for one color attachment's blend state.
     fn blend_operation -> MTLBlendOperation;
-    const BLEND_OPERATIONS;
-    test every_declared_blend_operation_converts_and_nothing_else_does;
     [Add, Subtract, ReverseSubtract, Min, Max]
+    apple_numbers_them_from_zero;
 }
 
 checked_ordinal! {
     /// `MTLCullMode` for the render encoder's raster state.
     fn cull_mode -> MTLCullMode;
-    const CULL_MODES;
-    test every_declared_cull_mode_converts_and_nothing_else_does;
     [None, Front, Back]
-}
-
-checked_ordinal! {
-    /// `MTLDepthClipMode` for the render encoder's raster state.
-    fn depth_clip_mode -> MTLDepthClipMode;
-    const DEPTH_CLIP_MODES;
-    test every_declared_depth_clip_mode_converts_and_nothing_else_does;
-    [Clip, Clamp]
+    apple_numbers_them_from_zero;
 }
 
 checked_ordinal! {
     /// `MTLWinding` for the render encoder's raster state.
     fn winding -> MTLWinding;
-    const WINDINGS;
-    test every_declared_winding_converts_and_nothing_else_does;
     [Clockwise, CounterClockwise]
+    apple_numbers_them_from_zero;
 }
 
 checked_ordinal! {
     /// `MTLTriangleFillMode` for the render encoder's raster state.
-    fn triangle_fill_mode -> MTLTriangleFillMode;
-    const TRIANGLE_FILL_MODES;
-    test every_declared_triangle_fill_mode_converts_and_nothing_else_does;
+    fn fill_mode -> MTLTriangleFillMode;
     [Fill, Lines]
+    apple_numbers_them_from_zero;
 }
+
+checked_ordinal! {
+    /// `MTLDepthClipMode` for the render encoder's raster state.
+    fn depth_clip_mode -> MTLDepthClipMode;
+    [Clip, Clamp]
+    apple_numbers_them_from_zero;
+}
+
+checked_ordinal! {
+    /// `MTLVisibilityResultMode` for an occlusion query armed on a draw.
+    ///
+    /// `Disabled` is listed because it is a declared variant and the ordinal a
+    /// guest sends to disarm; the render encoder decides what to do with it.
+    fn visibility_result_mode -> MTLVisibilityResultMode;
+    [Disabled, Boolean, Counting]
+    apple_numbers_them_from_zero;
+}
+// The modes this table converts are exactly the ones the device's contract says
+// both backends record, plus the disarming ordinal the render encoder refuses
+// by name.
+//
+// A `const` block rather than a `#[test]`, for the reason `checked_ordinal!`
+// states and `primitive_type` below relies on: this file's tests run on Apple
+// hosts only, and the cross-compiled Metal arm evaluates this one from Linux.
+// The Vulkan translator carries the same pin as a test, so the two spellings of
+// one Apple enum cannot drift apart on a host that can only build one of them.
+const _: () = {
+    use crate::contract::visibility::{
+        visibility_result_mode_recordable, VISIBILITY_RESULT_MODE_DISABLED,
+        VISIBILITY_RESULT_MODE_SWEEP_END,
+    };
+    let mut mtl = 0u32;
+    while mtl < VISIBILITY_RESULT_MODE_SWEEP_END {
+        let converts = visibility_result_mode(mtl).is_some();
+        let contract =
+            visibility_result_mode_recordable(mtl) || mtl == VISIBILITY_RESULT_MODE_DISABLED;
+        assert!(
+            converts == contract,
+            "the Metal visibility-mode table and the device contract disagree \
+             about which occlusion query modes exist",
+        );
+        mtl += 1;
+    }
+};
 
 checked_ordinal! {
     /// `MTLCompareFunction` for a depth or stencil test.
     fn compare_function -> MTLCompareFunction;
-    const COMPARE_FUNCTIONS;
-    test every_declared_compare_function_converts_and_nothing_else_does;
     [Never, Less, Equal, LessEqual, Greater, NotEqual, GreaterEqual, Always]
+    apple_numbers_them_from_zero;
 }
 
 checked_ordinal! {
     /// `MTLStencilOperation` for one stencil face.
     fn stencil_operation -> MTLStencilOperation;
-    const STENCIL_OPERATIONS;
-    test every_declared_stencil_operation_converts_and_nothing_else_does;
     [
         Keep, Zero, Replace, IncrementClamp, DecrementClamp, Invert,
         IncrementWrap, DecrementWrap,
     ]
+    apple_numbers_them_from_zero;
 }
 
 checked_ordinal! {
     /// `MTLLoadAction` for a render pass attachment.
     fn load_action -> MTLLoadAction;
-    const LOAD_ACTIONS;
-    test every_declared_load_action_converts_and_nothing_else_does;
     [DontCare, Load, Clear]
+    apple_numbers_them_from_zero;
 }
 
 checked_ordinal! {
     /// `MTLStoreAction` for a render pass attachment.
     fn store_action -> MTLStoreAction;
-    const STORE_ACTIONS;
-    test every_declared_store_action_converts_and_nothing_else_does;
     [
         DontCare, Store, MultisampleResolve, StoreAndMultisampleResolve,
         Unknown, CustomSampleDepthStore,
     ]
+    apple_numbers_them_from_zero;
 }
 
 checked_ordinal! {
     /// `MTLIndexType` for an indexed draw or a stage-input index buffer.
     fn index_type -> MTLIndexType;
-    const INDEX_TYPES;
-    test every_declared_index_type_converts_and_nothing_else_does;
     [UInt16, UInt32]
+    apple_numbers_them_from_zero;
 }
 
 checked_ordinal! {
     /// `MTLPrimitiveType` for a draw.
     fn primitive_type -> MTLPrimitiveType;
-    const PRIMITIVE_TYPES;
-    test every_declared_primitive_type_converts_and_nothing_else_does;
     [Point, Line, LineStrip, Triangle, TriangleStrip]
+    apple_numbers_them_from_zero;
 }
+// The primitive types this rail can encode are exactly the ones the device
+// tells the guest it may draw.
+//
+// `contract::draw::EXECUTABLE_PRIMITIVE_TYPES` leaves this device as
+// device-info key 11, which the guest reads as a *permission* mask — a bit set
+// there without an arm above is a draw the guest was invited to make and this
+// rail then refuses. A `const` block rather than a `#[test]` for the reason
+// stated inside `checked_ordinal!`: this file's tests run on Apple hosts only,
+// and the cross-compiled Metal arm evaluates this one from Linux. The Vulkan
+// translator carries the same pin as a test, because its arms are not `const`.
+const _: () = {
+    let mut mtl = 0u32;
+    while mtl <= 8 {
+        assert!(
+            primitive_type(mtl).is_some() == crate::contract::draw::primitive_type_executable(mtl),
+            "a primitive type this device advertises has no Metal arm, or vice versa",
+        );
+        mtl += 1;
+    }
+};
 
 checked_ordinal! {
     /// `MTLSamplerMinMagFilter` for a sampler's minification or magnification.
     fn sampler_min_mag_filter -> MTLSamplerMinMagFilter;
-    const SAMPLER_MIN_MAG_FILTERS;
-    test every_declared_sampler_min_mag_filter_converts_and_nothing_else_does;
     [Nearest, Linear]
+    apple_numbers_them_from_zero;
 }
 
 checked_ordinal! {
     /// `MTLSamplerMipFilter` for a sampler's mip selection.
     fn sampler_mip_filter -> MTLSamplerMipFilter;
-    const SAMPLER_MIP_FILTERS;
-    test every_declared_sampler_mip_filter_converts_and_nothing_else_does;
     [NotMipmapped, Nearest, Linear]
+    apple_numbers_them_from_zero;
 }
 
 checked_ordinal! {
     /// `MTLSamplerAddressMode` for one sampler axis.
     fn sampler_address_mode -> MTLSamplerAddressMode;
-    const SAMPLER_ADDRESS_MODES;
-    test every_declared_sampler_address_mode_converts_and_nothing_else_does;
     [
         ClampToEdge, MirrorClampToEdge, Repeat, MirrorRepeat, ClampToZero,
         ClampToBorderColor,
     ]
+    apple_numbers_them_from_zero;
 }
 
 checked_ordinal! {
     /// `MTLSamplerBorderColor` for a sampler clamping to a border.
     fn sampler_border_color -> MTLSamplerBorderColor;
-    const SAMPLER_BORDER_COLORS;
-    test every_declared_sampler_border_color_converts_and_nothing_else_does;
     [TransparentBlack, OpaqueBlack, OpaqueWhite]
+    apple_numbers_them_from_zero;
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The two format enums have a hole at 43 and 44, and that is the whole
-    /// reason this module exists rather than a `<= max` bound at each call site.
-    ///
-    /// Apple's `MTLVertexDescriptor.h` and `MTLStageInputOutputDescriptor.h` on
-    /// the macOS 26 SDK run `UChar4Normalized_BGRA = 42` straight to
-    /// `UChar = 45`, so a check that only rejects values above the last variant
-    /// lets two undefined discriminants through.
-    #[test]
-    fn the_format_enums_leave_forty_three_and_forty_four_undeclared() {
-        for ordinal in [43u32, 44] {
-            assert!(vertex_format(ordinal).is_none());
-            assert!(attribute_format(ordinal).is_none());
-        }
-        assert_eq!(
-            vertex_format(42),
-            Some(MTLVertexFormat::UChar4Normalized_BGRA)
-        );
-        assert_eq!(vertex_format(45), Some(MTLVertexFormat::UChar));
-        assert_eq!(
-            attribute_format(42),
-            Some(MTLAttributeFormat::UChar4Normalized_BGRA)
-        );
-        assert_eq!(attribute_format(45), Some(MTLAttributeFormat::UChar));
-    }
-
-    /// The four values the SDK declares and `metal` does not, pinned so the
-    /// narrowing this module's doc describes stays a measured fact.
-    ///
-    /// If a `metal` bump adds them these assertions flip, which is the signal to
-    /// add the variants above and delete this test rather than to relax it.
-    #[test]
-    fn the_values_metal_does_not_declare_are_declined_rather_than_transmuted() {
-        // MTLVertexFormatFloatRG11B10 / MTLVertexFormatFloatRGB9E5.
-        assert!(vertex_format(54).is_none());
-        assert!(vertex_format(55).is_none());
-        assert!(attribute_format(54).is_none());
-        assert!(attribute_format(55).is_none());
-        // MTLBlendFactorUnspecialized / MTLBlendOperationUnspecialized.
-        assert!(blend_factor(19).is_none());
-        assert!(blend_operation(5).is_none());
-    }
-
-    /// The step-function table carries Apple's numbering, and every entry's
-    /// own discriminant is its index.
-    ///
-    /// This is what pins `metal` 0.33's misnumbering rather than working around
-    /// it silently: if a crate bump renumbers the variants to match Apple, the
-    /// table above still produces the right ordinals and this test still
-    /// passes, but the misaligned-looking comments become wrong. If a bump
-    /// renumbers them some *other* way, this fails.
-    #[test]
-    fn the_step_function_table_maps_each_ordinal_to_the_variant_carrying_it() {
-        for (ordinal, &value) in STEP_FUNCTION_BY_ORDINAL.iter().enumerate() {
-            assert_eq!(value as u32, ordinal as u32);
-            assert_eq!(
-                step_function(ordinal as u32).map(|v| v as u32),
-                Some(ordinal as u32)
-            );
-        }
-        assert!(step_function(STEP_FUNCTION_BY_ORDINAL.len() as u32).is_none());
-        assert!(step_function(u32::MAX).is_none());
-    }
-
-    /// The names `metal` 0.33 gives the step function are not Apple's, and the
-    /// three that happen to agree are the only ones that may be used by name.
-    ///
-    /// Apple: `PerVertex` 1, `PerInstance` 2, `PerPatch` 3,
-    /// `PerPatchControlPoint` 4, `ThreadPositionInGridY` 6,
-    /// `ThreadPositionInGridXIndexed` 7.
-    #[test]
-    fn the_step_function_names_metal_declares_disagree_with_apples_numbering() {
-        assert_eq!(MTLStepFunction::Constant as u32, 0);
-        assert_eq!(MTLStepFunction::ThreadPositionInGridX as u32, 5);
-        assert_eq!(MTLStepFunction::ThreadPositionInGridYIndexed as u32, 8);
-        // Everything else is off, so naming it would rewrite the guest's value.
-        assert_ne!(MTLStepFunction::PerVertex as u32, 1);
-        assert_ne!(MTLStepFunction::PerInstance as u32, 2);
-        assert_ne!(MTLStepFunction::PerPatch as u32, 3);
-        assert_ne!(MTLStepFunction::PerPatchControlPoint as u32, 4);
-        assert_ne!(MTLStepFunction::ThreadPositionInGridY as u32, 6);
-        assert_ne!(MTLStepFunction::ThreadPositionInGridXIndexed as u32, 7);
-    }
-
-    /// Every conversion refuses the ordinal one past its own last variant.
-    ///
-    /// The per-enum tests the macro generates already sweep their own range;
-    /// this one exists so a table added later without its generated test still
-    /// gets an upper bound checked.
-    #[test]
-    fn no_conversion_accepts_the_ordinal_past_its_last_variant() {
-        macro_rules! past_end {
-            ($fn_name:ident, $variants:ident) => {{
-                let max = $variants.iter().map(|&v| v as u32).max().unwrap();
-                assert!(
-                    $fn_name(max + 1).is_none(),
-                    "{} accepted {}",
-                    stringify!($fn_name),
-                    max + 1
-                );
-            }};
-        }
-        past_end!(vertex_format, VERTEX_FORMATS);
-        past_end!(attribute_format, ATTRIBUTE_FORMATS);
-        past_end!(vertex_step_function, VERTEX_STEP_FUNCTIONS);
-        past_end!(blend_factor, BLEND_FACTORS);
-        past_end!(blend_operation, BLEND_OPERATIONS);
-        past_end!(cull_mode, CULL_MODES);
-        past_end!(depth_clip_mode, DEPTH_CLIP_MODES);
-        past_end!(winding, WINDINGS);
-        past_end!(triangle_fill_mode, TRIANGLE_FILL_MODES);
-        past_end!(compare_function, COMPARE_FUNCTIONS);
-        past_end!(stencil_operation, STENCIL_OPERATIONS);
-        past_end!(load_action, LOAD_ACTIONS);
-        past_end!(store_action, STORE_ACTIONS);
-        past_end!(index_type, INDEX_TYPES);
-        past_end!(primitive_type, PRIMITIVE_TYPES);
-        past_end!(sampler_min_mag_filter, SAMPLER_MIN_MAG_FILTERS);
-        past_end!(sampler_mip_filter, SAMPLER_MIP_FILTERS);
-        past_end!(sampler_address_mode, SAMPLER_ADDRESS_MODES);
-        past_end!(sampler_border_color, SAMPLER_BORDER_COLORS);
-    }
+/// Assert a conversion answers `ordinal` with exactly `variant`, at compile time.
+///
+/// `Option<MTL*>` cannot be compared with `==` in a `const` block — `metal`
+/// derives `PartialEq` on only some of these enums, and none of the derives are
+/// `const` — so the comparison is on the ordinal, through a `match`.
+macro_rules! const_converts {
+    ($fn_name:ident($ordinal:expr) == $ty:ty : $variant:ident) => {
+        const _: () = assert!(match $fn_name($ordinal) {
+            Some(got) => got as u32 == <$ty>::$variant as u32,
+            None => false,
+        });
+    };
 }
+
+// The two format enums have a hole at 43 and 44, and that is the whole reason
+// this module exists rather than a `<= max` bound at each call site. Apple's
+// `MTLVertexDescriptor.h` and `MTLStageInputOutputDescriptor.h` on the macOS 26
+// SDK run `UChar4Normalized_BGRA = 42` straight to `UChar = 45`, so a check that
+// only rejects values above the last variant lets two undefined discriminants
+// through.
+const _: () = assert!(vertex_format(43).is_none());
+const _: () = assert!(vertex_format(44).is_none());
+const _: () = assert!(attribute_format(43).is_none());
+const _: () = assert!(attribute_format(44).is_none());
+const_converts!(vertex_format(42) == MTLVertexFormat: UChar4Normalized_BGRA);
+const_converts!(vertex_format(45) == MTLVertexFormat: UChar);
+const_converts!(attribute_format(42) == MTLAttributeFormat: UChar4Normalized_BGRA);
+const_converts!(attribute_format(45) == MTLAttributeFormat: UChar);
+
+// The four values the SDK declares and `metal` does not, pinned so the narrowing
+// this module's doc describes stays a measured fact. If a `metal` bump adds them
+// these assertions flip, which is the signal to add the variants above and
+// delete these lines rather than to relax them.
+//
+// MTLVertexFormatFloatRG11B10 / MTLVertexFormatFloatRGB9E5.
+const _: () = assert!(vertex_format(54).is_none());
+const _: () = assert!(vertex_format(55).is_none());
+const _: () = assert!(attribute_format(54).is_none());
+const _: () = assert!(attribute_format(55).is_none());
+// MTLBlendFactorUnspecialized / MTLBlendOperationUnspecialized.
+const _: () = assert!(blend_factor(19).is_none());
+const _: () = assert!(blend_operation(5).is_none());
+
+// The step-function table carries Apple's numbering, and every entry's own
+// discriminant is its index.
+//
+// This is what pins `metal` 0.33's misnumbering rather than working around it
+// silently: if a crate bump renumbers the variants to match Apple, the table
+// above still produces the right ordinals and this still holds, but the
+// misaligned-looking comments become wrong. If a bump renumbers them some
+// *other* way, the build fails here.
+const _: () = {
+    let mut ordinal = 0usize;
+    while ordinal < STEP_FUNCTION_BY_ORDINAL.len() {
+        assert!(STEP_FUNCTION_BY_ORDINAL[ordinal] as u32 == ordinal as u32);
+        assert!(match step_function(ordinal as u32) {
+            Some(got) => got as u32 == ordinal as u32,
+            None => false,
+        });
+        ordinal += 1;
+    }
+};
+const _: () = assert!(step_function(STEP_FUNCTION_BY_ORDINAL.len() as u32).is_none());
+const _: () = assert!(step_function(u32::MAX).is_none());
+
+// The names `metal` 0.33 gives the step function are not Apple's, and the three
+// that happen to agree are the only ones that may be used by name.
+//
+// Apple: `PerVertex` 1, `PerInstance` 2, `PerPatch` 3, `PerPatchControlPoint` 4,
+// `ThreadPositionInGridY` 6, `ThreadPositionInGridXIndexed` 7.
+const _: () = assert!(MTLStepFunction::Constant as u32 == 0);
+const _: () = assert!(MTLStepFunction::ThreadPositionInGridX as u32 == 5);
+const _: () = assert!(MTLStepFunction::ThreadPositionInGridYIndexed as u32 == 8);
+// Everything else is off, so naming it would rewrite the guest's value.
+const _: () = assert!(MTLStepFunction::PerVertex as u32 != 1);
+const _: () = assert!(MTLStepFunction::PerInstance as u32 != 2);
+const _: () = assert!(MTLStepFunction::PerPatch as u32 != 3);
+const _: () = assert!(MTLStepFunction::PerPatchControlPoint as u32 != 4);
+const _: () = assert!(MTLStepFunction::ThreadPositionInGridY as u32 != 6);
+const _: () = assert!(MTLStepFunction::ThreadPositionInGridXIndexed as u32 != 7);
+
+checked_ordinal! {
+    /// `MTLPixelFormat` for a colour, depth or stencil attachment.
+    ///
+    /// The last member of this class, and the one that stayed a `transmute`
+    /// longest: this enum is by far the sparsest here — 139 declared values
+    /// scattered over `0..=555` — so "not above the last variant" admits
+    /// hundreds of codes that name nothing, and an undeclared one is undefined
+    /// behaviour rather than a format Metal will reject. Guest attachment
+    /// records reach it directly, so the ordinal really is arbitrary.
+    ///
+    /// No `apple_numbers_them_from_zero` clause: the numbering is not
+    /// contiguous and is not meant to be. The compressed families sit in blocks
+    /// Apple spaces apart, and the depth/stencil group starts at 250 with
+    /// `X32_Stencil8` and `X24_Stencil8` above the pair they alias.
+    ///
+    /// This lists everything `metal` 0.33 declares rather than the subset
+    /// `crate::contract::pixel_format` sizes. The two are different questions —
+    /// this one is "can the Rust type hold this value at all", and answering it
+    /// with the narrower table would refuse formats this device hands to Metal
+    /// unexamined today. What each call site does with a format it cannot size
+    /// stays that call site's decision.
+    fn pixel_format -> MTLPixelFormat;
+    [
+        Invalid, A8Unorm, R8Unorm, R8Unorm_sRGB, R8Snorm, R8Uint, R8Sint, R16Unorm,
+        R16Snorm, R16Uint, R16Sint, R16Float, RG8Unorm, RG8Unorm_sRGB, RG8Snorm,
+        RG8Uint, RG8Sint, B5G6R5Unorm, A1BGR5Unorm, ABGR4Unorm, BGR5A1Unorm, R32Uint,
+        R32Sint, R32Float, RG16Unorm, RG16Snorm, RG16Uint, RG16Sint, RG16Float,
+        RGBA8Unorm, RGBA8Unorm_sRGB, RGBA8Snorm, RGBA8Uint, RGBA8Sint, BGRA8Unorm,
+        BGRA8Unorm_sRGB, RGB10A2Unorm, RGB10A2Uint, RG11B10Float, RGB9E5Float,
+        BGR10A2Unorm, RG32Uint, RG32Sint, RG32Float, RGBA16Unorm, RGBA16Snorm,
+        RGBA16Uint, RGBA16Sint, RGBA16Float, RGBA32Uint, RGBA32Sint, RGBA32Float,
+        BC1_RGBA, BC1_RGBA_sRGB, BC2_RGBA, BC2_RGBA_sRGB, BC3_RGBA, BC3_RGBA_sRGB,
+        BC4_RUnorm, BC4_RSnorm, BC5_RGUnorm, BC5_RGSnorm, BC6H_RGBFloat,
+        BC6H_RGBUfloat, BC7_RGBAUnorm, BC7_RGBAUnorm_sRGB, PVRTC_RGB_2BPP,
+        PVRTC_RGB_2BPP_sRGB, PVRTC_RGB_4BPP, PVRTC_RGB_4BPP_sRGB, PVRTC_RGBA_2BPP,
+        PVRTC_RGBA_2BPP_sRGB, PVRTC_RGBA_4BPP, PVRTC_RGBA_4BPP_sRGB, EAC_R11Unorm,
+        EAC_R11Snorm, EAC_RG11Unorm, EAC_RG11Snorm, EAC_RGBA8, EAC_RGBA8_sRGB,
+        ETC2_RGB8, ETC2_RGB8_sRGB, ETC2_RGB8A1, ETC2_RGB8A1_sRGB, ASTC_4x4_sRGB,
+        ASTC_5x4_sRGB, ASTC_5x5_sRGB, ASTC_6x5_sRGB, ASTC_6x6_sRGB, ASTC_8x5_sRGB,
+        ASTC_8x6_sRGB, ASTC_8x8_sRGB, ASTC_10x5_sRGB, ASTC_10x6_sRGB, ASTC_10x8_sRGB,
+        ASTC_10x10_sRGB, ASTC_12x10_sRGB, ASTC_12x12_sRGB, ASTC_4x4_LDR, ASTC_5x4_LDR,
+        ASTC_5x5_LDR, ASTC_6x5_LDR, ASTC_6x6_LDR, ASTC_8x5_LDR, ASTC_8x6_LDR,
+        ASTC_8x8_LDR, ASTC_10x5_LDR, ASTC_10x6_LDR, ASTC_10x8_LDR, ASTC_10x10_LDR,
+        ASTC_12x10_LDR, ASTC_12x12_LDR, ASTC_4x4_HDR, ASTC_5x4_HDR, ASTC_5x5_HDR,
+        ASTC_6x5_HDR, ASTC_6x6_HDR, ASTC_8x5_HDR, ASTC_8x6_HDR, ASTC_8x8_HDR,
+        ASTC_10x5_HDR, ASTC_10x6_HDR, ASTC_10x8_HDR, ASTC_10x10_HDR, ASTC_12x10_HDR,
+        ASTC_12x12_HDR, GBGR422, BGRG422, Depth16Unorm, Depth32Float, Stencil8,
+        Depth24Unorm_Stencil8, Depth32Float_Stencil8, X32_Stencil8, X24_Stencil8,
+        BGRA10_XR, BGRA10_XR_SRGB, BGR10_XR, BGR10_XR_SRGB,
+    ]
+}
+
+// `pixel_format` cannot carry `apple_numbers_them_from_zero` — its numbering is
+// sparse by design — so the accepted set is otherwise whatever `metal` 0.33
+// assigns, and a crate bump that renumbered it would move the set with every
+// assertion above still green. That is exactly the hole the clause closes for
+// the contiguous tables. These pin the same thing for this one: the anchor of
+// each block, read off `MTLPixelFormat.h`. They are claims about Apple's
+// numbers that the compiler checks against `metal`'s.
+const _: () = {
+    assert!(MTLPixelFormat::Invalid as u32 == 0);
+    assert!(MTLPixelFormat::A8Unorm as u32 == 1);
+    // The uncompressed run, which is what this device actually serves.
+    assert!(MTLPixelFormat::R8Unorm as u32 == 10);
+    assert!(MTLPixelFormat::RGBA8Unorm as u32 == 70);
+    assert!(MTLPixelFormat::BGRA8Unorm as u32 == 80);
+    assert!(MTLPixelFormat::RGBA32Float as u32 == 125);
+    // First compressed block, and the YUV pair that ends them.
+    assert!(MTLPixelFormat::BC1_RGBA as u32 == 130);
+    assert!(MTLPixelFormat::GBGR422 as u32 == 240);
+    // Depth/stencil. `X32_Stencil8` and `X24_Stencil8` sit *above* the pair they
+    // alias, which is why this group is listed in declaration order rather than
+    // by aspect.
+    assert!(MTLPixelFormat::Depth16Unorm as u32 == 250);
+    assert!(MTLPixelFormat::Depth32Float as u32 == 252);
+    assert!(MTLPixelFormat::Stencil8 as u32 == 253);
+    assert!(MTLPixelFormat::Depth24Unorm_Stencil8 as u32 == 255);
+    assert!(MTLPixelFormat::Depth32Float_Stencil8 as u32 == 260);
+    assert!(MTLPixelFormat::X32_Stencil8 as u32 == 261);
+    assert!(MTLPixelFormat::X24_Stencil8 as u32 == 262);
+    // The tail the const sweep's ceiling is measured from.
+    assert!(MTLPixelFormat::BGR10_XR_SRGB as u32 == 555);
+};

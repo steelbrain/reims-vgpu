@@ -57,9 +57,12 @@ enum Sink {
 
 pub(crate) fn enabled() -> bool {
     if !INIT.swap(true, Ordering::Relaxed) {
-        let on = std::env::var_os("REIMS_VGPU_DRAW_LOG")
-            .map(|v| v == "1")
-            .unwrap_or(false);
+        // Through the shared parse, and read once. Nothing is emitted for an
+        // unrecognized value: this is the emit path itself, so a report from
+        // here would recurse into the sink that is being asked whether it is
+        // enabled. Such a value reads as off, which is what every
+        // non-affirmative value already did.
+        let on = crate::env::switch(crate::env::DRAW_LOG) == crate::env::Switch::On;
         ENABLED.store(on, Ordering::Relaxed);
     }
     ENABLED.load(Ordering::Relaxed)
@@ -378,7 +381,41 @@ pub(crate) struct FailCapture;
 
 #[cfg(test)]
 impl FailCapture {
+    /// Arm the capture, and drop every dedup latch first.
+    ///
+    /// The latches outlive individual tests — one process runs the whole suite —
+    /// so without this a test's emitter can decide it has already said its line
+    /// on behalf of a test that ran earlier and picked the same discriminant.
+    // A code span, not a link: `forget_all_latches` is `#[cfg(test)]` and
+    // rustdoc never documents a `cfg(test)` item, so a link to it cannot
+    // resolve on any arm and would read as rot in the intra-doc pass.
+    /// See `super::emit::forget_all_latches` for what that costs and why the
+    /// clearing belongs here rather than at each fixture.
     pub(crate) fn start() -> Self {
+        super::emit::forget_all_latches();
+        Self::arm()
+    }
+
+    /// Arm a further window in the *same* latched run, keeping what the windows
+    /// before it claimed.
+    ///
+    /// For the one shape [`FailCapture::start`] cannot serve: a test whose
+    /// subject is the dedup itself. Those walk a sequence of distinct events in
+    /// separate windows so each assertion names the line it is about, and then
+    /// open a last window, repeat every event, and require silence. Under
+    /// `start` that last window would clear the very latches it is checking and
+    /// see every line again, so the test would fail while the latch worked.
+    ///
+    /// Use this only when the latch state carried in is what is being asserted.
+    /// It reintroduces, deliberately and locally, exactly the cross-test
+    /// coupling `start` exists to remove — so a test that reaches for it is
+    /// claiming the earlier windows are its own, and it must open the sequence
+    /// with a `start`.
+    pub(crate) fn resume() -> Self {
+        Self::arm()
+    }
+
+    fn arm() -> Self {
         *CAPTURED.lock().unwrap_or_else(|p| p.into_inner()) = Some(Vec::new());
         Self
     }

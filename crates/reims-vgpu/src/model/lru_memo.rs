@@ -61,7 +61,15 @@ impl<K: Ord + Clone, V> LruBytesMemo<K, V> {
     }
 
     /// Kept because clippy requires it beside `len`, not because a caller
-    /// exists; `len_zero` is a hard error at `-D warnings` on this crate.
+    /// exists; `len_without_is_empty` is a hard error at `-D warnings` on this
+    /// crate.
+    ///
+    /// Removing the `allow` is not a way to delete this method; `len` has
+    /// callers, so deleting it fails the clippy arms instead.
+    #[allow(
+        dead_code,
+        reason = "exists to satisfy clippy::len_without_is_empty beside `len`, not for a caller"
+    )]
     pub fn is_empty(&self) -> bool {
         self.map.is_empty()
     }

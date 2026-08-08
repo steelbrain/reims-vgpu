@@ -177,7 +177,8 @@ pub fn draw_instanced_wide<'a>(op: &Op<'a>) -> Result<&'a DrawInstancedWide, Wir
 ///
 /// **`reims_vgpu::runtime::decode::render` has no constant for `0x05`.** Its
 /// table runs `0x00, 0x01, 0x03, 0x06, 0x07, 0x09`, and `opcode_supported`
-/// accepts everything up to `OP_ACCEPTED_LAST` (`0x98`), so a `0x05` record
+/// accepts everything up to [`OPCODE_SET_VERTEX_BUFFER_OFFSET_STRIDE`]
+/// (`0xa6`), so a `0x05` record
 /// reaches the catch-all and becomes `Kind::OtherAccepted` — accepted, reported
 /// once by `note_unimplemented_render_opcode`, and executed by nothing. The
 /// guest's draw does not happen.
@@ -1188,10 +1189,30 @@ pub const OPCODE_USE_HEAP: u32 = 0x1b;
 /// only an align-1 view can take. Fixture `render_use_heap` (the stub heap's
 /// ref 6565, stages 2).
 ///
+/// # The record is two bytes longer than it is written, and `+6` is still right
+///
+/// This is the one record here whose *length* disagrees with its layout. The
+/// serializer sizes it as `count * 4 + 8` — the shape its `usage`-bearing
+/// sibling has — and then writes `count` at `+0`, `stages` at `+4` and the refs
+/// from `+6`, leaving the last two bytes untouched. Deriving the head from the
+/// record length therefore yields 8 and starts the refs two bytes late, reading
+/// every heap ref straddling two entries.
+///
+/// So a length is an upper bound on a head, never a measurement of one, and this
+/// is the record that shows it. Do not "correct" `+6` to `+8` from a size.
+///
 /// Decode consumes these opcodes through [`use_heap`] / [`use_resource`]
-/// (`0x1b` / `0x89`). The historical `0x86`/`0x87` pair is not residency; those
-/// numbers remain only on `decode::compute` as local no-export placeholders
-/// with no serializer selector behind them.
+/// (`0x1b` / `0x89`).
+///
+/// **They are half the family.** `0x1b` and `0x89` are the `stages:`-qualified
+/// forms, which the render encoder declares itself. The unqualified
+/// `useHeaps:count:` / `useResources:count:usage:` are declared on the encoder
+/// base class and inherited by every encoder including this one; they emit
+/// `0x86` / `0x87`, with a four-byte and an eight-byte head respectively, and
+/// this module has no view for either. `runtime::decode::compute` does decode
+/// them; see the inheritance caveat in [`crate::manifest`] for why the coverage
+/// instrument cannot see the selectors behind them, and why a reader checking
+/// only the render encoder's own method list concludes they have none.
 #[repr(C)]
 #[derive(Debug)]
 pub struct UseHeap {
@@ -1206,6 +1227,84 @@ unsafe impl Wire for UseHeap {}
 pub fn use_heap<'a>(op: &Op<'a>) -> Result<(&'a UseHeap, &'a [RefBind]), WireError> {
     debug_assert_eq!(op.opcode(), OPCODE_USE_HEAP);
     let (head, rest) = crate::view::split::<UseHeap>(op.payload)?;
+    let refs = crate::view::view_slice::<RefBind>(rest, head.count.get() as usize)?;
+    Ok((head, refs))
+}
+
+// --- 0x86 / 0x87 the residency forms that take no `stages:` -----------------
+
+pub const OPCODE_USE_HEAPS_NO_STAGES: u32 = 0x86;
+pub const OPCODE_USE_RESOURCES_NO_STAGES: u32 = 0x87;
+
+/// `useHeaps:count:` — the residency form with no `stages:` argument.
+///
+/// # Why there are four residency opcodes and not two
+///
+/// `useHeap:stages:` and `useResource:usage:stages:` are declared on the render
+/// encoder itself and write [`OPCODE_USE_HEAP`] / [`OPCODE_USE_RESOURCE`]. The
+/// unqualified `useHeaps:count:` and `useResources:count:usage:` are declared
+/// one class up, on the encoder base class every encoder derives from, and write
+/// these two. A render encoder answers all four, so a decoder that knows only
+/// the qualified pair sees a guest's `useResources:count:usage:` as an
+/// unimplemented opcode — the same shape as the `0x7d`/`0xa5` split that
+/// [`BufferStrideBind`] warns about, one level up.
+///
+/// They are invisible to [`crate::manifest`], which is built per class from each
+/// class's own method list; see the inheritance caveat there.
+///
+/// # This head is a size, not a field map
+///
+/// The record is a four-byte head followed by `count` four-byte refs, and
+/// `count` is the only field this device reads — residency is answered by doing
+/// nothing, so the head exists here to make the refs start in the right place
+/// and to let `count` bound the record. No fixture on a non-Apple checkout pins
+/// it; what stands behind the size is the emitted record length, and a wrong one
+/// fails the `count == refs.len()` check in `runtime::decode::render` rather
+/// than silently reading a ref short.
+#[repr(C)]
+#[derive(Debug)]
+pub struct UseHeapsNoStages {
+    pub count: U32le,
+}
+
+// SAFETY: one align-1 all-bytes-valid `le` scalar.
+unsafe impl Wire for UseHeapsNoStages {}
+
+/// `useResources:count:usage:` — see [`UseHeapsNoStages`].
+///
+/// Eight-byte head against that record's four, the extra word being `usage`.
+/// Nothing reads it: the `stages:`-qualified [`UseResource`] carries `usage` as
+/// a `u16` beside `stages`, and whether this form widens it to `u32` or leaves
+/// two bytes unwritten is not settled here, because no case can tell them apart
+/// — `MTLResourceUsage` has no value above `0xffff`, which is the same argument
+/// that sized the qualified form's field. It is declared at the width that makes
+/// the head the size the record actually has.
+#[repr(C)]
+#[derive(Debug)]
+pub struct UseResourcesNoStages {
+    pub count: U32le,
+    pub usage: U32le,
+}
+
+// SAFETY: two align-1 all-bytes-valid `le` scalars.
+unsafe impl Wire for UseResourcesNoStages {}
+
+/// Head and the heap refs that follow it.
+pub fn use_heaps_no_stages<'a>(
+    op: &Op<'a>,
+) -> Result<(&'a UseHeapsNoStages, &'a [RefBind]), WireError> {
+    debug_assert_eq!(op.opcode(), OPCODE_USE_HEAPS_NO_STAGES);
+    let (head, rest) = crate::view::split::<UseHeapsNoStages>(op.payload)?;
+    let refs = crate::view::view_slice::<RefBind>(rest, head.count.get() as usize)?;
+    Ok((head, refs))
+}
+
+/// Head and the resource refs that follow it.
+pub fn use_resources_no_stages<'a>(
+    op: &Op<'a>,
+) -> Result<(&'a UseResourcesNoStages, &'a [RefBind]), WireError> {
+    debug_assert_eq!(op.opcode(), OPCODE_USE_RESOURCES_NO_STAGES);
+    let (head, rest) = crate::view::split::<UseResourcesNoStages>(op.payload)?;
     let refs = crate::view::view_slice::<RefBind>(rest, head.count.get() as usize)?;
     Ok((head, refs))
 }
@@ -1387,6 +1486,21 @@ pub struct MemoryBarrierScope {
     /// **What would settle it:** a scope with bit 8 set. Metal defines none, so
     /// on this API the question may have no answer — which is itself the
     /// finding, and is why the field is named rather than folded into `scope`.
+    ///
+    /// **What does not settle it, and looks as though it should:** the encoder
+    /// writes bytes `+0` and `+1` with a single 16-bit store, and `+2` and `+3`
+    /// with a byte store each. That is why this byte is reliably `0` here while
+    /// the compute sibling — which stores only two bytes of its four — leaves
+    /// ring residue in the rest, and it is the asymmetry
+    /// [`crate::ops::compute::MemoryBarrierScope`] describes. It is *not*
+    /// evidence of a `u16` field: a one-byte value zero-extended into a
+    /// two-byte store is the same instruction, and "declared `Q`, narrowed on
+    /// the wire" is what this whole record does. Do not fold the two on the
+    /// strength of the store width.
+    ///
+    /// Keeping it separate also keeps the alarm. The fixture asserts this byte
+    /// is still `0`; folded into `scope`, an Apple build that started using it
+    /// would be absorbed into a larger scope value with nothing to report.
     pub unidentified_u8: u8,
     /// `MTLRenderStages` the barrier waits on.
     pub after_stages: u8,

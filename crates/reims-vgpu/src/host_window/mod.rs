@@ -4,7 +4,7 @@
 //!
 //! Gated behind the `host-window` cargo feature, which implies `backend-vulkan`.
 //! It is the display path the x86 pathway is verified on, so the feature is
-//! enabled in every command under "Verification" in `AGENTS.md`.
+//! enabled in every `cargo` command `AGENTS.md` gives for the Vulkan arm.
 //!
 //! Three pieces:
 //! - [`input_map`] — winit event → neutral [`crate::runtime::HostAction`]. Pure

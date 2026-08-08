@@ -39,14 +39,63 @@ use winit::window::{Window, WindowId};
 use super::input_map;
 use crate::runtime::host::HostAction;
 
-// How often the window looks for a new guest frame.
+/// How long the loop may sleep when nothing has asked it to draw.
 ///
-/// 2 ms (500 Hz) is well above any guest refresh, so the poll adds at most one
-/// tick of latency to a frame the guest has already published, and a tick that
-/// finds no new seq costs a mutex lock and an integer compare. It is not a
-/// present rate: [`needs_engine_present`] decides that, and on a still screen
-/// nothing is presented at all.
-const ENGINE_WINDOW_REDRAW_POLL: std::time::Duration = std::time::Duration::from_millis(2);
+/// The loop is woken by [`WindowWaker`] on every publish, so this is not how a
+/// frame reaches the screen — it is the floor under the two things no publish
+/// announces: the `stop` flag the device sets at teardown, and the
+/// [`GUEST_RESIZE_WARN_AFTER`] alarm, which is a deadline this has to be able to
+/// observe. A tenth of that alarm keeps the age it reports within 10 % of the
+/// constant it is measured against, which is what fixes this value; it is not
+/// tuned against a frame rate and must not be read as one.
+///
+/// It also bounds the two outcomes that ask to be retried without a new frame:
+/// a `Busy` presenter, and a publish that arrives in the instant between the
+/// wake and the redraw. Both come back within one backstop rather than waiting
+/// for the guest's next frame.
+///
+/// # This replaced a 2 ms poll, and the poll was 98 % waste
+///
+/// The loop used to ask for a redraw every 2 ms and let [`needs_engine_present`]
+/// throw away whatever the seq gate rejected. Driven x86/PCI boot, window-drag
+/// probe, whole run:
+///
+/// ```text
+///   ticks          145675     (997/s — one wake per poll, one per redraw event)
+///   redraws_asked   72227     (494/s)
+///   draws_fresh      1269     (8.7/s)
+///   draws_stale     70961     (486/s — 98.2 % of every redraw asked for)
+/// ```
+///
+/// A stale draw costs no GPU work at all — [`App::draw`] returns at the seq gate
+/// before `window_present_frame` — so this was never the 510-presents/s spin the
+/// poll was introduced to kill. What it cost was host CPU on a machine the
+/// device shares: ~1000 event-loop wakes and ~486 frame-slot mutex acquisitions
+/// a second to find 8.7 frames. The publisher knows when it publishes; asking it
+/// to say so costs one channel send per frame at the 26 Hz this workload peaks
+/// at.
+///
+/// # After
+///
+/// Same probe and host, quiesced, on a guest running a heavier animation than
+/// the boot above — so read the rates against each other, not the frame counts:
+///
+/// ```text
+///                       poll     wake
+///   ticks/s              997      108
+///   redraws_asked/s      494     34.6
+///   draws_stale/s        486      2.6
+///   stale share       98.2 %    7.4 %
+/// ```
+///
+/// The poll asked 494 times a second whatever the guest was doing, because that
+/// is what a poll is. What is left is one ask per delivered frame (3317 asks,
+/// 3074 fresh draws) plus the handful the backstop contributes. 3582 publishes
+/// produced 3074 of those draws: the other 508 were superseded in the slot
+/// before the loop looked, which is latest-wins working rather than a frame
+/// lost.
+const ENGINE_WINDOW_REDRAW_BACKSTOP: std::time::Duration =
+    std::time::Duration::from_millis(GUEST_RESIZE_WARN_AFTER.as_millis() as u64 / 10);
 /// How long a guest-driven native resize request may stay unmatched by a
 /// winit `Resized` event before the always-on alarm names it. Live requests
 /// apply within single-digit milliseconds; one second means the window system
@@ -104,6 +153,77 @@ pub struct Frame {
 /// is `Arc`-wrapped so the window's per-vblank read is a refcount bump, not an
 /// 8 MiB deep copy of an unchanged frame.
 pub type FrameSlot = Arc<Mutex<Option<Arc<Frame>>>>;
+
+/// The one user event this window's loop takes: the device wrote a new frame
+/// into the [`FrameSlot`].
+///
+/// Carries nothing. The slot is latest-wins and the loop reads it under its own
+/// lock, so a payload here could only be a second, staler copy of what
+/// [`App::draw`] is about to read anyway.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FramePublished;
+
+/// How the device wakes the window's event loop when it publishes a frame.
+///
+/// The window used to find new frames by asking for a redraw every 2 ms and
+/// discarding 98 % of them at the seq gate — see
+/// [`ENGINE_WINDOW_REDRAW_BACKSTOP`] for that reading. This turns it round: the
+/// publisher already knows, so it says so, and the loop sleeps until it does.
+///
+/// # Why a proxy and not the window handle
+///
+/// `Window::request_redraw` would be the direct route, but the platforms
+/// disagree about calling it off the loop's own thread — and this device runs
+/// the loop on a dedicated thread on Linux and on the process main thread on
+/// macOS, so "the other thread" is a different thread on each. `EventLoopProxy`
+/// is winit's one cross-thread entry point and is the same shape on both.
+///
+/// # Why a `Mutex` and not a `OnceLock`
+///
+/// `EventLoopProxy` is `Send` but not `Sync` — the Wayland and X11 backends
+/// carry an `mpsc::Sender` — so it cannot be shared behind a `OnceLock`. The
+/// lock is uncontended and taken once per published frame, at the ~26 Hz this
+/// workload peaks at, against the publisher's own two existing locks.
+pub struct WindowWaker {
+    proxy: Mutex<Option<winit::event_loop::EventLoopProxy<FramePublished>>>,
+}
+
+/// A [`WindowWaker`] shared between the device's publisher and the window
+/// thread that arms it.
+pub type WindowWakeHandle = Arc<WindowWaker>;
+
+impl WindowWaker {
+    /// An unarmed waker. [`Self::wake`] is a no-op until the window thread has
+    /// built its event loop and called [`Self::arm`].
+    pub fn new() -> WindowWakeHandle {
+        Arc::new(Self {
+            proxy: Mutex::new(None),
+        })
+    }
+
+    /// Hand the loop's proxy over, once the loop exists to be woken.
+    fn arm(&self, proxy: winit::event_loop::EventLoopProxy<FramePublished>) {
+        if let Ok(mut slot) = self.proxy.lock() {
+            *slot = Some(proxy);
+        }
+    }
+
+    /// Ask the loop to look at the frame slot.
+    ///
+    /// Silent in all three failure modes, because none of them is a lost frame:
+    /// before the loop is armed and after it has closed there is nothing that
+    /// could present, and a poisoned lock means the window thread panicked. In
+    /// every case [`ENGINE_WINDOW_REDRAW_BACKSTOP`] still runs, so a wake that
+    /// does not land costs latency bounded by that constant rather than a frame
+    /// — which is the property that lets this be a wake and not a protocol.
+    pub fn wake(&self) {
+        if let Ok(slot) = self.proxy.lock() {
+            if let Some(proxy) = slot.as_ref() {
+                let _ = proxy.send_event(FramePublished);
+            }
+        }
+    }
+}
 
 /// Offer a published frame's CPU bytes to the engine presenter.
 ///
@@ -375,10 +495,11 @@ pub fn spawn(
     on_input: InputSink,
     frames: FrameSlot,
     stop: StopFlag,
+    wake: WindowWakeHandle,
 ) -> std::thread::JoinHandle<Result<(), WindowError>> {
     std::thread::Builder::new()
         .name("reims-vgpu-window".to_string())
-        .spawn(move || run(config, on_input, frames, stop))
+        .spawn(move || run(config, on_input, frames, stop, wake))
         .expect("spawn reims-vgpu-window thread")
 }
 
@@ -390,8 +511,10 @@ pub fn run(
     on_input: InputSink,
     frames: FrameSlot,
     stop: StopFlag,
+    wake: WindowWakeHandle,
 ) -> Result<(), WindowError> {
     let event_loop = build_event_loop()?;
+    wake.arm(event_loop.create_proxy());
     let mut app = App::new(config, on_input, frames, stop);
     event_loop
         .run_app(&mut app)
@@ -401,7 +524,7 @@ pub fn run(
 #[cfg(target_os = "macos")]
 struct MainThreadWindow {
     id: u64,
-    event_loop: EventLoop<()>,
+    event_loop: EventLoop<FramePublished>,
     app: App,
     exited: ExitedFlag,
 }
@@ -426,6 +549,7 @@ pub fn start_main_thread(
     frames: FrameSlot,
     stop: StopFlag,
     exited: ExitedFlag,
+    wake: WindowWakeHandle,
 ) -> Result<(), WindowError> {
     MAIN_THREAD_WINDOW.with(|cell| {
         let mut slot = cell.borrow_mut();
@@ -437,6 +561,7 @@ pub fn start_main_thread(
             };
         }
         let event_loop = build_event_loop()?;
+        wake.arm(event_loop.create_proxy());
         let app = App::new(config, on_input, frames, stop);
         *slot = Some(MainThreadWindow {
             id,
@@ -478,8 +603,11 @@ pub fn run_main_thread(id: u64) -> Result<(), WindowError> {
 
 /// Build an event loop that may run off the main thread (QEMU owns the main
 /// thread). X11 and Wayland both allow it via their platform extension.
-fn build_event_loop() -> Result<EventLoop<()>, WindowError> {
-    let mut builder = EventLoop::builder();
+///
+/// Carries [`FramePublished`] as its user event, which is what makes
+/// `create_proxy` a wake channel the device can hold — see [`WindowWaker`].
+fn build_event_loop() -> Result<EventLoop<FramePublished>, WindowError> {
+    let mut builder = EventLoop::with_user_event();
     #[cfg(all(unix, not(target_os = "macos")))]
     {
         use winit::platform::wayland::EventLoopBuilderExtWayland;
@@ -513,11 +641,14 @@ struct App {
     first_engine_present_logged: bool,
     first_engine_guest_logged: bool,
     engine_error_logged: bool,
-    /// When the event loop should next look for a new guest frame. The loop
-    /// sleeps until then rather than re-requesting a redraw immediately, which
-    /// is what made the window present continuously while the guest sat at a
-    /// handful of frames per second.
-    next_engine_redraw: std::time::Instant,
+    /// A [`FramePublished`] arrived (or a present asked to be repeated) and no
+    /// redraw has been requested for it yet. Consumed by `about_to_wait`, which
+    /// is the one place that talks to the platform about redraws.
+    frame_pending: bool,
+    /// The latest the loop may sleep to when nothing has asked it to draw. Pushed
+    /// forward by every redraw request, so a steady publish stream never lets it
+    /// fire; see [`ENGINE_WINDOW_REDRAW_BACKSTOP`] for what it is a floor under.
+    next_backstop: std::time::Instant,
     /// Frame seq the drawable currently holds, or `None` before the first
     /// present.
     last_engine_seq: Option<u64>,
@@ -554,8 +685,10 @@ struct LoopCensus {
     window_started: std::time::Instant,
     /// `about_to_wait` entries: how often the loop woke at all.
     ticks: u64,
-    /// Ticks that asked the platform for a redraw, which is capped by
-    /// [`ENGINE_WINDOW_REDRAW_POLL`] rather than by the tick rate.
+    /// Ticks that asked the platform for a redraw. Bounded by published frames
+    /// plus [`ENGINE_WINDOW_REDRAW_BACKSTOP`] ticks rather than by the tick
+    /// rate, which is what [`redraw_due`] is for — a run where this tracks
+    /// `ticks` instead is a loop that has fallen back to polling.
     redraws_asked: u64,
     /// `RedrawRequested` deliveries. A gap between this and `redraws_asked` is
     /// the platform coalescing or delaying them, which the loop cannot see any
@@ -612,7 +745,7 @@ impl LoopCensus {
     }
 }
 
-impl ApplicationHandler for App {
+impl ApplicationHandler<FramePublished> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
             return;
@@ -722,7 +855,7 @@ impl ApplicationHandler for App {
                 // Fresh swapchain images hold nothing; the seq gate would
                 // otherwise skip until the guest happened to produce a new
                 // frame, leaving the resized window blank.
-                self.engine_redraw_required = true;
+                self.force_redraw();
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 if let PhysicalKey::Code(code) = event.physical_key {
@@ -773,22 +906,28 @@ impl ApplicationHandler for App {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         self.loop_census.tick();
-        // The device sets `stop` on VM teardown. The loop wakes at least once
-        // per [`ENGINE_WINDOW_REDRAW_POLL`], so the request is picked up within
-        // one poll — then the loop exits and `exiting` releases the presenter's
-        // swapchain and surface on this thread before the device's join returns.
+        // The device sets `stop` on VM teardown. The loop wakes at least once per
+        // [`ENGINE_WINDOW_REDRAW_BACKSTOP`], so the request is picked up within
+        // one of those — then the loop exits and `exiting` releases the
+        // presenter's swapchain and surface on this thread before the device's
+        // join returns. Nothing publishes at teardown, so this is one of the two
+        // deadlines that constant exists for.
         if self.stop.load(Ordering::Relaxed) {
             event_loop.exit();
         }
-        // Pacing: wake on a fixed poll, ask for a redraw, and let `draw`'s seq
-        // gate decide whether anything is actually presented. The window used to
-        // re-request a redraw from inside
-        // `RedrawRequested`, which is a spin: measured on x86/Vulkan it held
-        // **510 presents/s** — a full-frame swapchain blit and submit each —
-        // while the guest was producing 4.5-8 frames/s. FIFO does not throttle
-        // it, and every one of those presents produced the picture already on
-        // screen.
-        if let Some(window) = self.window.as_ref() {
+        // Pacing: ask for a redraw when the device says it published one, and
+        // otherwise sleep to the backstop. Two earlier shapes are what this has
+        // to stay clear of. Re-requesting a redraw from inside `RedrawRequested`
+        // is a spin: measured on x86/Vulkan it held **510 presents/s** — a
+        // full-frame swapchain blit and submit each — while the guest produced
+        // 4.5-8 frames/s, and FIFO does not throttle it. Asking on a 2 ms poll
+        // instead stopped the presents but kept the wakes, at 494 redraws/s to
+        // find 8.7 frames. `draw`'s seq gate still decides what is presented;
+        // this decides only how often it is asked.
+        // Cloned rather than borrowed so the body can reach `&mut self` for
+        // `force_redraw`, which is the one place the two redraw flags are set
+        // together. An `Arc` clone per wake is a refcount bump.
+        if let Some(window) = self.window.clone() {
             if let Some(pending) = self.pending_guest_resize.as_ref() {
                 if pending.requested_at.elapsed() >= GUEST_RESIZE_WARN_AFTER {
                     let actual = window.inner_size();
@@ -800,20 +939,42 @@ impl ApplicationHandler for App {
                     // Drop the request so presentation resumes (letterboxed
                     // into whatever drawable exists) instead of holding.
                     self.pending_guest_resize = None;
-                    self.engine_redraw_required = true;
+                    self.force_redraw();
                 }
             }
             let now = std::time::Instant::now();
-            if now >= self.next_engine_redraw {
+            let pending = std::mem::take(&mut self.frame_pending);
+            if redraw_due(pending, now, self.next_backstop) {
                 window.request_redraw();
                 self.loop_census.redraws_asked += 1;
-                self.next_engine_redraw = now + ENGINE_WINDOW_REDRAW_POLL;
+                self.next_backstop = now + ENGINE_WINDOW_REDRAW_BACKSTOP;
             }
             event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
-                self.next_engine_redraw,
+                self.next_backstop,
             ));
         }
     }
+
+    /// A [`FramePublished`] from the device: the frame slot holds something the
+    /// loop has not looked at.
+    ///
+    /// Records the reason and returns. Requesting the redraw here instead would
+    /// put a second caller on the platform's redraw path, and the two would
+    /// disagree about the backstop — `about_to_wait` runs after this and after
+    /// every other event, so it is the one place that can hold that decision.
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: FramePublished) {
+        self.frame_pending = true;
+    }
+}
+
+/// Whether `about_to_wait` should ask the platform for a redraw on this wake.
+///
+/// The whole rule, and the reason the loop is allowed to sleep: a tick with no
+/// publish behind it and time left on the backstop asks for nothing. Under the
+/// 2 ms poll this was unconditionally true, which is how 98 % of the redraws
+/// this window asked for reached [`needs_engine_present`] only to be refused.
+fn redraw_due(frame_pending: bool, now: std::time::Instant, backstop: std::time::Instant) -> bool {
+    frame_pending || now >= backstop
 }
 
 impl App {
@@ -836,13 +997,35 @@ impl App {
             first_engine_present_logged: false,
             first_engine_guest_logged: false,
             engine_error_logged: false,
-            next_engine_redraw: std::time::Instant::now(),
+            // The first tick draws: `engine_redraw_required` is set and there is
+            // no publish behind the first frame, which is a clear rather than a
+            // guest frame.
+            frame_pending: true,
+            next_backstop: std::time::Instant::now(),
             last_engine_seq: None,
             engine_redraw_required: true,
             guest_extent: None,
             pending_guest_resize: None,
             loop_census: LoopCensus::new(),
         }
+    }
+
+    /// Force the next present and make sure a redraw is asked for to carry it.
+    ///
+    /// The two flags answer different questions — `engine_redraw_required`
+    /// opens [`needs_engine_present`]'s seq gate, `frame_pending` makes
+    /// `about_to_wait` talk to the platform — and every caller that wants one
+    /// wants both. Setting only the first is the shape that leaves a resized
+    /// window blank until the guest happens to publish, because under the
+    /// backstop nothing asks for the redraw the flag was waiting for.
+    ///
+    /// Deliberately not folded into [`redraw_due`]: a standing
+    /// `engine_redraw_required` that a `Busy` presenter cannot clear would then
+    /// re-request on every wake, which is the spin this loop has already been
+    /// bitten by twice. A one-shot flag cannot do that.
+    fn force_redraw(&mut self) {
+        self.engine_redraw_required = true;
+        self.frame_pending = true;
     }
 
     fn request_shutdown(&mut self) {
@@ -927,8 +1110,13 @@ impl App {
                 self.last_engine_seq = incoming_seq;
                 // A suboptimal present armed a swapchain recreation; redraw
                 // promptly so the corrected drawable replaces this one even if
-                // no new guest frame arrives for seconds.
+                // no new guest frame arrives for seconds. The assignment clears
+                // the flag on a healthy present, so this cannot become a
+                // self-feeding loop: one suboptimal buys exactly one more draw.
                 self.engine_redraw_required = suboptimal;
+                if suboptimal {
+                    self.force_redraw();
+                }
                 if !self.first_engine_present_logged {
                     eprintln!(
                         "reims-vgpu-window: first frame presented \
@@ -1033,7 +1221,8 @@ mod loop_census_tests {
     use super::*;
 
     /// A loop that has run for less than its window emits nothing and keeps
-    /// counting. Emitting on every tick would be one line per 2 ms poll.
+    /// counting. Emitting on every tick would be one line per wake, and a wake
+    /// is every publish, every input event and every backstop.
     #[test]
     fn a_partial_window_accumulates_rather_than_emitting() {
         let mut census = LoopCensus::new();
@@ -1075,6 +1264,106 @@ mod loop_census_tests {
         assert_eq!(
             census.draws,
             census.draws_fresh + census.draws_stale + census.draws_held
+        );
+    }
+}
+
+#[cfg(test)]
+mod wake_tests {
+    use super::*;
+
+    /// A wake that finds nothing armed is a no-op, not a panic and not a
+    /// refusal.
+    ///
+    /// The device builds the waker before the window thread has an event loop,
+    /// so every publish between those two moments lands here. The backstop is
+    /// what makes that safe, and this pins that the gap is quiet.
+    #[test]
+    fn an_unarmed_waker_takes_a_wake_and_does_nothing_with_it() {
+        let waker = WindowWaker::new();
+        waker.wake();
+        waker.wake();
+        assert!(
+            waker.proxy.lock().expect("fresh mutex").is_none(),
+            "nothing armed it, so there is nothing to send through"
+        );
+    }
+
+    /// The property the 2 ms poll did not have: a wake with no publish behind it
+    /// and time left on the backstop asks the platform for nothing.
+    ///
+    /// This is the whole change. On the boot that motivated it, 70 961 of the
+    /// 72 227 redraws this window asked for were refused by the seq gate — every
+    /// one of them a tick that reached here and said yes unconditionally.
+    #[test]
+    fn a_wake_with_no_publish_and_time_left_asks_for_no_redraw() {
+        let now = std::time::Instant::now();
+        let backstop = now + ENGINE_WINDOW_REDRAW_BACKSTOP;
+        assert!(
+            !redraw_due(false, now, backstop),
+            "an input event or a stray wake must not become a redraw"
+        );
+    }
+
+    /// A publish is answered on the wake it arrives on, whatever the backstop
+    /// says — the point of waking is that the frame does not wait for a timer.
+    #[test]
+    fn a_publish_is_answered_before_the_backstop() {
+        let now = std::time::Instant::now();
+        let backstop = now + ENGINE_WINDOW_REDRAW_BACKSTOP;
+        assert!(redraw_due(true, now, backstop));
+    }
+
+    /// With no publish at all the backstop still draws, which is what keeps a
+    /// missed or unarmed wake costing latency rather than the frame.
+    #[test]
+    fn the_backstop_draws_when_nothing_published() {
+        let now = std::time::Instant::now();
+        assert!(
+            redraw_due(false, now, now),
+            "a deadline that has arrived is a reason on its own"
+        );
+        assert!(redraw_due(false, now + ENGINE_WINDOW_REDRAW_BACKSTOP, now));
+    }
+
+    /// Over a second of the workload that motivated this, the loop asks for a
+    /// redraw once per published frame and not once per wake.
+    ///
+    /// This is the invariant, and it is the one a pacing rule can fail while
+    /// every other test here passes: the counts must be bounded by *frames*,
+    /// not by elapsed time. The measured boot woke this loop ~997 times a second
+    /// and asked 494 of those times to serve 26 published frames. Driving the
+    /// timeline rather than the truth table is deliberate, for the reason
+    /// [`tests::repeated_polls_of_one_frame_present_once`] gives.
+    #[test]
+    fn a_second_of_the_measured_workload_asks_once_per_frame_not_once_per_wake() {
+        let start = std::time::Instant::now();
+        let second = std::time::Duration::from_secs(1);
+        // 26 publishes/s (the driven boot's peak `present_hz`) against ~997
+        // wakes/s, which is what an input-carrying event loop actually sees.
+        let publishes = 26u32;
+        let wakes = 997u32;
+        let publish_every = wakes / publishes;
+        let mut backstop = start;
+        let mut requested = 0u32;
+        for wake in 1..=wakes {
+            let now = start + second * wake / wakes;
+            let published = wake % publish_every == 0;
+            if redraw_due(published, now, backstop) {
+                requested += 1;
+                backstop = now + ENGINE_WINDOW_REDRAW_BACKSTOP;
+            }
+        }
+        let backstop_ticks = (second.as_millis() / ENGINE_WINDOW_REDRAW_BACKSTOP.as_millis()) as u32;
+        assert!(
+            requested <= publishes + backstop_ticks,
+            "asked {requested} times for {publishes} frames — a pacing rule \
+             bounded by wakes rather than by frames"
+        );
+        assert!(
+            requested >= publishes,
+            "asked {requested} times for {publishes} frames — a frame that \
+             published and was never asked about is a dropped frame"
         );
     }
 }

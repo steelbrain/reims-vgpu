@@ -17,25 +17,59 @@
 //! # The widening fallback
 //!
 //! A declined three-component format is substituted by its four-component
-//! sibling, which is mandatory everywhere. This is exact, not approximate:
+//! sibling, which is mandatory everywhere. The first three components are exact:
+//! these formats are component-packed, so components 0..2 sit at identical byte
+//! offsets in both, and the three values the shader reads are the same bytes.
 //!
-//! * These formats are component-packed, so components 0..2 sit at identical
-//!   byte offsets in both. The three values the shader reads are the same bytes.
-//! * The shader's input variable is a three-component vector, and Vulkan
-//!   discards the extra component an attribute format supplies.
+//! **The fourth component is not, and that is the whole of the difficulty.**
+//! Vulkan supplies a vertex input's missing components from the constant vector
+//! `(0, 0, 0, 1)`, so a shader input declared `vec4` over the guest's own
+//! three-component format takes `(x, y, z, 1.0)`. Over the four-component
+//! substitute it takes `(x, y, z, <whatever those bytes hold>)` — the next
+//! attribute's data, or the vertex's padding — because the component is now
+//! *supplied* rather than defaulted. Nothing about the bytes is wrong; what
+//! changed is that Vulkan stopped filling in a default the guest was relying on.
 //!
-//! It is only *safe*, though, when the wider read stays inside the vertex
+//! This module used to assert the substitution was exact and give as its second
+//! reason that "the shader's input variable is a three-component vector". That
+//! is the condition, not a fact — nothing checked it, and a `vec4` reader is
+//! exactly the shape that makes it false. So `VertexFormatSupport::resolve` now asks
+//! [`crate::runtime::spirv_vertex_input`] what the shader declares at the
+//! attribute's location, and widens only where the answer makes the
+//! substitution invisible:
+//!
+//! | shader declares | verdict |
+//! |---|---|
+//! | 3 components or fewer | widen — Vulkan discards what the format oversupplies |
+//! | 4 components | refuse `vertex_format_widen_read_as_four` |
+//! | nothing at this location | widen — an input the shader never reads |
+//! | a type the walk cannot measure | refuse `vertex_format_widen_shader_unreadable` |
+//!
+//! Refusing rather than widening anyway is the choice `AGENTS.md` asks for: a
+//! GPU refuses a request it cannot represent, and a wrong `w` reaching a vertex
+//! shader is a geometry error with nothing downstream able to name it.
+//!
+//! Widening is also only safe when the wider read stays inside the vertex
 //! buffer. The widened attribute reads `bytes_wide` at `offset` within each
 //! vertex, so the last vertex's read runs past the buffer unless
 //! `offset + bytes_wide <= stride`. That condition is checked, and a substitution
 //! that would not fit declines by name instead — a read past the end of a
 //! vertex buffer is a Vulkan violation, not a degraded frame.
+//!
+//! # The cost is paid only where the fallback is reached
+//!
+//! `unsupported` is empty on every host this project has run on, so `resolve`
+//! returns the attribute's own format before it ever looks at a shader. The
+//! width is therefore passed as a closure rather than a value: a host that
+//! widens nothing never walks a SPIR-V module, and a host that widens walks it
+//! once per pipeline miss no matter how many attributes need it.
 
 use ash::vk;
 
 use super::reason::TranslateReason;
 use super::vertex::{self, VertexLayout};
 use crate::backend::vulkan::engine::VertexAttributeFormat;
+use crate::runtime::spirv_vertex_input::InputWidth;
 
 /// What the pipeline should bind for one vertex attribute on this device.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -99,11 +133,16 @@ impl VertexFormatSupport {
     ///
     /// `offset` and `stride` are the attribute's own placement in the vertex
     /// buffer and decide whether the widening fallback is in bounds.
+    ///
+    /// `shader_width` is called at most once, and only on the path that would
+    /// substitute a wider format — see this module's doc for why it is a
+    /// closure. It must answer for *this attribute's* `Location`.
     pub fn resolve(
         &self,
         format: VertexAttributeFormat,
         offset: u32,
         stride: u32,
+        shader_width: impl FnOnce() -> InputWidth,
     ) -> Result<VertexBinding, TranslateReason> {
         let layout = vertex::vertex_layout(format);
         if self.accepts(layout.vk) {
@@ -122,10 +161,37 @@ impl VertexFormatSupport {
         if !self.accepts(wide.vk) || !fits {
             return Err(TranslateReason::FormatNotVertexBuffer(layout.vk.as_raw()));
         }
-        Ok(VertexBinding {
-            format: wide.vk,
-            widened_from: Some(layout.vk),
-        })
+        // Asked last, so the two cheap structural questions above answer first
+        // and a module is walked only for an attribute that would really be
+        // substituted.
+        match widening_is_invisible(shader_width()) {
+            Ok(()) => Ok(VertexBinding {
+                format: wide.vk,
+                widened_from: Some(layout.vk),
+            }),
+            Err(reason) => Err(reason(layout.vk.as_raw())),
+        }
+    }
+}
+
+/// Whether substituting a four-component format changes what the shader reads.
+///
+/// One home for the rule the module doc tabulates, so a second caller cannot
+/// write a fourth version of it. Returns the constructor of the refusal rather
+/// than the refusal itself because the payload — the format the guest asked for
+/// — belongs to the caller.
+fn widening_is_invisible(width: InputWidth) -> Result<(), fn(i32) -> TranslateReason> {
+    match width {
+        // Vulkan discards components an attribute format supplies past the
+        // shader's declared width, so the oversupplied fourth is never read.
+        InputWidth::Components(n) if n <= 3 => Ok(()),
+        // The shader reads a component the guest's own format would have had
+        // Vulkan default to 1.0.
+        InputWidth::Components(_) => Err(TranslateReason::VertexFormatWidenReadAsFour),
+        // The vertex descriptor describes an attribute this shader does not
+        // declare. Nothing reads the substitute, so nothing can tell.
+        InputWidth::Absent => Ok(()),
+        InputWidth::Unreadable => Err(TranslateReason::VertexFormatWidenShaderUnreadable),
     }
 }
 
@@ -191,6 +257,13 @@ static ALL_ATTRIBUTE_FORMATS: std::sync::LazyLock<Vec<VertexAttributeFormat>> =
 mod tests {
     use super::*;
 
+    /// A shader that reads three components — the width that licenses the
+    /// substitution — for the tests below whose subject is the capability
+    /// question rather than the shader question.
+    fn three() -> InputWidth {
+        InputWidth::Components(3)
+    }
+
     /// The probe covers every format the attribute table can produce plus every
     /// widening substitute — a format missing from the probe would be assumed
     /// supported and fail at pipeline create instead of declining by name.
@@ -218,7 +291,7 @@ mod tests {
     fn a_permissive_device_widens_nothing() {
         let support = VertexFormatSupport::default();
         for format in ALL_ATTRIBUTE_FORMATS.iter() {
-            let binding = support.resolve(*format, 0, 64).unwrap();
+            let binding = support.resolve(*format, 0, 64, three).unwrap();
             assert_eq!(binding.format, vertex::vk_format(*format), "{format:?}");
             assert_eq!(binding.widened_from, None, "{format:?}");
         }
@@ -264,20 +337,20 @@ mod tests {
         ]);
         // Half3 is 6 bytes; the substitute is 8 and fits in a 16-byte stride.
         let binding = support
-            .resolve(VertexAttributeFormat::Half3, 0, 16)
+            .resolve(VertexAttributeFormat::Half3, 0, 16, three)
             .unwrap();
         assert_eq!(binding.format, vk::Format::R16G16B16A16_SFLOAT);
         assert_eq!(binding.widened_from, Some(vk::Format::R16G16B16_SFLOAT));
 
         let binding = support
-            .resolve(VertexAttributeFormat::UChar3Normalized, 4, 12)
+            .resolve(VertexAttributeFormat::UChar3Normalized, 4, 12, three)
             .unwrap();
         assert_eq!(binding.format, vk::Format::R8G8B8A8_UNORM);
         assert_eq!(binding.widened_from, Some(vk::Format::R8G8B8_UNORM));
 
         // An untouched format on the same device still resolves natively.
         let binding = support
-            .resolve(VertexAttributeFormat::Float4, 0, 16)
+            .resolve(VertexAttributeFormat::Float4, 0, 16, three)
             .unwrap();
         assert_eq!(binding.format, vk::Format::R32G32B32A32_SFLOAT);
         assert_eq!(binding.widened_from, None);
@@ -292,26 +365,26 @@ mod tests {
         // Stride exactly the narrow size: no room for the 8-byte substitute.
         assert_eq!(
             support
-                .resolve(VertexAttributeFormat::Half3, 0, 6)
+                .resolve(VertexAttributeFormat::Half3, 0, 6, three)
                 .unwrap_err(),
             TranslateReason::FormatNotVertexBuffer(vk::Format::R16G16B16_SFLOAT.as_raw())
         );
         // Fits by width but the attribute sits too late in the vertex.
         assert_eq!(
             support
-                .resolve(VertexAttributeFormat::Half3, 10, 16)
+                .resolve(VertexAttributeFormat::Half3, 10, 16, three)
                 .unwrap_err(),
             TranslateReason::FormatNotVertexBuffer(vk::Format::R16G16B16_SFLOAT.as_raw())
         );
         // Stride 0 (single tightly-packed element) leaves nothing to widen into.
         assert_eq!(
             support
-                .resolve(VertexAttributeFormat::Half3, 0, 0)
+                .resolve(VertexAttributeFormat::Half3, 0, 0, three)
                 .unwrap_err(),
             TranslateReason::FormatNotVertexBuffer(vk::Format::R16G16B16_SFLOAT.as_raw())
         );
         // Exactly enough room is enough.
-        assert!(support.resolve(VertexAttributeFormat::Half3, 0, 8).is_ok());
+        assert!(support.resolve(VertexAttributeFormat::Half3, 0, 8, three).is_ok());
     }
 
     /// A declined format with no wider sibling declines by name rather than
@@ -324,7 +397,7 @@ mod tests {
         ]);
         assert_eq!(
             support
-                .resolve(VertexAttributeFormat::Int1010102Normalized, 0, 32)
+                .resolve(VertexAttributeFormat::Int1010102Normalized, 0, 32, three)
                 .unwrap_err(),
             TranslateReason::FormatNotVertexBuffer(vk::Format::A2B10G10R10_SNORM_PACK32.as_raw())
         );
@@ -336,9 +409,113 @@ mod tests {
         ]);
         assert_eq!(
             support
-                .resolve(VertexAttributeFormat::Half3, 0, 32)
+                .resolve(VertexAttributeFormat::Half3, 0, 32, three)
                 .unwrap_err(),
             TranslateReason::FormatNotVertexBuffer(vk::Format::R16G16B16_SFLOAT.as_raw())
         );
+    }
+
+    /// The reason this module stopped calling the substitution exact. A shader
+    /// reading four components takes the fourth from the vertex buffer under
+    /// the substitute and from Vulkan's `(0, 0, 0, 1)` default under the format
+    /// the guest asked for, so the two are different geometry and the pipeline
+    /// is refused rather than built.
+    #[test]
+    fn a_shader_reading_four_components_refuses_the_substitution() {
+        let support = VertexFormatSupport::with_unsupported(&[vk::Format::R16G16B16_SFLOAT]);
+        assert_eq!(
+            support
+                .resolve(VertexAttributeFormat::Half3, 0, 16, || {
+                    InputWidth::Components(4)
+                })
+                .unwrap_err(),
+            TranslateReason::VertexFormatWidenReadAsFour(vk::Format::R16G16B16_SFLOAT.as_raw())
+        );
+    }
+
+    /// Every width the substitution *is* invisible to still widens: Vulkan
+    /// discards components the format oversupplies past the shader's declared
+    /// width, and an attribute the shader does not declare is read by nothing.
+    #[test]
+    fn every_width_the_shader_cannot_observe_still_widens() {
+        let support = VertexFormatSupport::with_unsupported(&[vk::Format::R16G16B16_SFLOAT]);
+        for width in [
+            InputWidth::Components(1),
+            InputWidth::Components(2),
+            InputWidth::Components(3),
+            InputWidth::Absent,
+        ] {
+            let binding = support
+                .resolve(VertexAttributeFormat::Half3, 0, 16, || width)
+                .unwrap_or_else(|e| panic!("{width:?} refused with {e}"));
+            assert_eq!(binding.format, vk::Format::R16G16B16A16_SFLOAT, "{width:?}");
+            assert_eq!(
+                binding.widened_from,
+                Some(vk::Format::R16G16B16_SFLOAT),
+                "{width:?}"
+            );
+        }
+    }
+
+    /// A width the walk could not measure refuses, and under its own slug: the
+    /// permissive reading would widen under a shader that might read the fourth
+    /// component, and the repair for this one is to teach the walk the shape it
+    /// met rather than to accept a wrong `w`.
+    #[test]
+    fn an_unreadable_shader_refuses_under_its_own_name() {
+        let support = VertexFormatSupport::with_unsupported(&[vk::Format::R8G8B8_UNORM]);
+        let err = support
+            .resolve(VertexAttributeFormat::UChar3Normalized, 0, 8, || {
+                InputWidth::Unreadable
+            })
+            .unwrap_err();
+        assert_eq!(
+            err,
+            TranslateReason::VertexFormatWidenShaderUnreadable(vk::Format::R8G8B8_UNORM.as_raw())
+        );
+        assert_ne!(
+            crate::observe::Decline::slug(&err),
+            crate::observe::Decline::slug(&TranslateReason::VertexFormatWidenReadAsFour(0))
+        );
+    }
+
+    /// The shader is asked only where the answer can change the outcome. A
+    /// permissive device resolves every format natively, and a device that
+    /// declines a format with no substitute refuses before asking — so the
+    /// SPIR-V walk is never paid for on a host that widens nothing.
+    #[test]
+    fn the_shader_is_not_consulted_unless_a_substitution_is_on_the_table() {
+        let asked = std::cell::Cell::new(0u32);
+        let ask = || {
+            asked.set(asked.get() + 1);
+            InputWidth::Components(3)
+        };
+
+        let permissive = VertexFormatSupport::default();
+        for format in ALL_ATTRIBUTE_FORMATS.iter() {
+            permissive.resolve(*format, 0, 64, ask).unwrap();
+        }
+        assert_eq!(asked.get(), 0, "a permissive device consulted the shader");
+
+        // Declined with no wider sibling: refused before the shader is asked.
+        let no_sibling =
+            VertexFormatSupport::with_unsupported(&[vk::Format::A2B10G10R10_SNORM_PACK32]);
+        no_sibling
+            .resolve(VertexAttributeFormat::Int1010102Normalized, 0, 32, ask)
+            .unwrap_err();
+        assert_eq!(asked.get(), 0);
+
+        // Declined and the substitute would not fit: also refused before.
+        let too_tight = VertexFormatSupport::with_unsupported(&[vk::Format::R16G16B16_SFLOAT]);
+        too_tight
+            .resolve(VertexAttributeFormat::Half3, 0, 6, ask)
+            .unwrap_err();
+        assert_eq!(asked.get(), 0);
+
+        // Declined, substitutable and in bounds — now the answer matters.
+        too_tight
+            .resolve(VertexAttributeFormat::Half3, 0, 16, ask)
+            .unwrap();
+        assert_eq!(asked.get(), 1);
     }
 }

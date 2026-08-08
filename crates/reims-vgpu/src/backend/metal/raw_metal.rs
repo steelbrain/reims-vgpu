@@ -1,11 +1,39 @@
-//! Narrow raw `msg_send` for Metal APIs missing from metal-0.33.
+//! Narrow raw `msg_send` for Metal APIs missing from metal-0.33 — and for the
+//! ones it has that cannot report a failed allocation.
+//!
+//! # Why an allocator metal-0.33 already exposes is re-spelled here
+//!
+//! `Device::new_texture` is `msg_send![self, newTextureWithDescriptor: d]` with
+//! the return typed as `metal::Texture`, and `foreign_types` 0.5 declares that
+//! as `struct Texture(NonNull<MTLTexture>)`. `newTextureWithDescriptor:` returns
+//! **nil when the allocation fails**, which is what a Metal device does when its
+//! VRAM is full — so the failing case writes a null pointer into a `NonNull`
+//! field. That is an invalid value, and therefore undefined behaviour, rather
+//! than a `Texture` the caller could test. The same holds for every
+//! `new_buffer*`.
+//!
+//! It is the same class as [`super::mtl_enum`]'s: a value that has no legal
+//! representation in the Rust type must be checked *before* it becomes one, and
+//! the check cannot be moved after the conversion. So the pointer is taken raw,
+//! tested, and only then wrapped — exactly what [`new_texture_view_swizzled`]
+//! below has always done, because that one API is missing from metal-0.33 and so
+//! had to be hand-written. The allocators in this section exist to give the ones
+//! metal-0.33 *does* expose the same treatment; nothing about the swizzled view
+//! made it special except that writing it out forced the question.
+//!
+//! `None` is a real answer here, not a defensive one: it is the device saying it
+//! has no memory left, which every caller turns into a typed refusal. That is
+//! what a GPU does with an allocation it cannot serve.
 
-use foreign_types::ForeignType;
+use foreign_types::{ForeignType, ForeignTypeRef};
 use metal::{
-    BufferRef, ComputeCommandEncoderRef, ComputePipelineState, DeviceRef, FunctionRef,
-    IndirectCommandBufferRef, IndirectComputeCommandRef, IndirectRenderCommandRef, MTLIndexType,
-    MTLPixelFormat, MTLPrimitiveType, MTLRegion, MTLSize, MTLTextureType, NSInteger, NSRange,
-    NSUInteger, RenderPipelineDescriptorRef, Texture, TextureRef,
+    ArgumentEncoder, BlitCommandEncoderRef, Buffer, BufferRef, CommandBufferRef, CommandQueueRef,
+    ComputeCommandEncoderRef, ComputePipelineState, DeviceRef, FunctionRef,
+    IndirectCommandBuffer, IndirectCommandBufferDescriptorRef, IndirectCommandBufferRef,
+    IndirectComputeCommandRef, IndirectRenderCommandRef, MTLDispatchType,
+    MTLIndexType, MTLPixelFormat, MTLPrimitiveType, MTLRegion, MTLResourceOptions, MTLSize,
+    MTLTextureType, NSInteger, NSRange, NSUInteger, RenderCommandEncoderRef,
+    RenderPassDescriptorRef, RenderPipelineDescriptorRef, Texture, TextureDescriptorRef, TextureRef,
 };
 use objc::runtime::{Object, BOOL, NO, YES};
 use objc::{msg_send, sel, sel_impl};
@@ -291,6 +319,178 @@ pub fn texture_swizzle_channels(swizzle: [u8; 4]) -> Option<MtlTextureSwizzleCha
     })
 }
 
+/// `newTextureWithDescriptor:`, with the nil an exhausted device returns.
+///
+/// The checked replacement for `metal::Device::new_texture`. See this module's
+/// own doc for why that one cannot be used: its return type cannot hold the
+/// failure.
+pub fn new_texture(device: &DeviceRef, descriptor: &TextureDescriptorRef) -> Option<Texture> {
+    unsafe {
+        let ptr: *mut Object = msg_send![device, newTextureWithDescriptor: descriptor];
+        (!ptr.is_null()).then(|| Texture::from_ptr(ptr as *mut _))
+    }
+}
+
+/// `newBufferWithLength:options:`, with the nil an exhausted device returns.
+pub fn new_buffer(
+    device: &DeviceRef,
+    length: NSUInteger,
+    options: MTLResourceOptions,
+) -> Option<Buffer> {
+    unsafe {
+        let ptr: *mut Object = msg_send![device, newBufferWithLength: length options: options];
+        (!ptr.is_null()).then(|| Buffer::from_ptr(ptr as *mut _))
+    }
+}
+
+/// `newBufferWithBytes:length:options:`, with the nil an exhausted device
+/// returns.
+///
+/// # Safety
+///
+/// `bytes` must point to at least `length` readable bytes for the duration of
+/// the call. Metal copies them before returning, so the caller owes nothing
+/// afterwards — this is the copying constructor, not the no-copy one.
+pub unsafe fn new_buffer_with_data(
+    device: &DeviceRef,
+    bytes: *const std::ffi::c_void,
+    length: NSUInteger,
+    options: MTLResourceOptions,
+) -> Option<Buffer> {
+    unsafe {
+        let ptr: *mut Object =
+            msg_send![device, newBufferWithBytes: bytes length: length options: options];
+        (!ptr.is_null()).then(|| Buffer::from_ptr(ptr as *mut _))
+    }
+}
+
+/// `newBufferWithBytesNoCopy:length:options:deallocator:`, with the nil an
+/// exhausted device returns.
+///
+/// The deallocator is always nil: this device keeps every no-copy buffer's bytes
+/// alive for the command buffer's lifetime itself, which is the contract
+/// [`super::runtime::new_buffer_from_host`] states for its caller.
+///
+/// # Safety
+///
+/// `bytes` must point to `length` readable bytes that stay alive, unmoved, for
+/// as long as the returned buffer is in use by the GPU. Metal does **not** copy
+/// them. `bytes` and `length` must both be page-aligned or Metal returns nil,
+/// which this reports as `None` rather than as a `Buffer` that is not one.
+///
+/// Aliasing guest RAM through this call is permitted: it is the Metal-direct
+/// spelling of the host-pointer import, and MoltenVK implements
+/// `VK_EXT_external_memory_host` over exactly this message. What bounds such a
+/// caller is [`crate::runtime::guest_ram`]'s type pair, not this function —
+/// which is why the safety contract above is the whole of what this one
+/// promises, and callers passing guest bytes owe that module's rules on top.
+pub unsafe fn new_buffer_no_copy(
+    device: &DeviceRef,
+    bytes: *mut std::ffi::c_void,
+    length: NSUInteger,
+    options: MTLResourceOptions,
+) -> Option<Buffer> {
+    unsafe {
+        let ptr: *mut Object = msg_send![
+            device,
+            newBufferWithBytesNoCopy: bytes
+            length: length
+            options: options
+            deallocator: std::ptr::null::<Object>()
+        ];
+        (!ptr.is_null()).then(|| Buffer::from_ptr(ptr as *mut _))
+    }
+}
+
+/// `[MTLCommandQueue commandBuffer]`, with the nil it can answer.
+///
+/// **Borrowed, exactly as metal-0.33 returns it.** The object is autoreleased,
+/// so ownership is taken by the caller's `.to_owned()` (which retains); handing
+/// back an owned `CommandBuffer` from `from_ptr` here would take ownership
+/// without retaining and over-release at drop.
+///
+/// A nil is the queue declining to issue another command buffer — a resource
+/// limit, and one of the few Metal refusals that is genuinely about pressure
+/// rather than about the request.
+pub fn new_command_buffer(queue: &CommandQueueRef) -> Option<&CommandBufferRef> {
+    unsafe {
+        let ptr: *mut Object = msg_send![queue, commandBuffer];
+        (!ptr.is_null()).then(|| CommandBufferRef::from_ptr(ptr as *mut _))
+    }
+}
+
+/// `[MTLCommandBuffer renderCommandEncoderWithDescriptor:]`, with the nil an
+/// invalid pass descriptor answers.
+///
+/// Borrowed for the same reason as [`new_command_buffer`]. The lifetime ties the
+/// encoder to the command buffer that vended it, which is what metal-0.33's
+/// signature does and what Metal's ownership actually is.
+pub fn new_render_command_encoder<'a>(
+    command_buffer: &'a CommandBufferRef,
+    descriptor: &RenderPassDescriptorRef,
+) -> Option<&'a RenderCommandEncoderRef> {
+    unsafe {
+        let ptr: *mut Object =
+            msg_send![command_buffer, renderCommandEncoderWithDescriptor: descriptor];
+        (!ptr.is_null()).then(|| RenderCommandEncoderRef::from_ptr(ptr as *mut _))
+    }
+}
+
+/// `[MTLCommandBuffer blitCommandEncoder]`, with its nil.
+pub fn new_blit_command_encoder(
+    command_buffer: &CommandBufferRef,
+) -> Option<&BlitCommandEncoderRef> {
+    unsafe {
+        let ptr: *mut Object = msg_send![command_buffer, blitCommandEncoder];
+        (!ptr.is_null()).then(|| BlitCommandEncoderRef::from_ptr(ptr as *mut _))
+    }
+}
+
+/// `[MTLCommandBuffer computeCommandEncoderWithDispatchType:]`, with its nil.
+pub fn new_compute_command_encoder_with_dispatch_type(
+    command_buffer: &CommandBufferRef,
+    dispatch_type: MTLDispatchType,
+) -> Option<&ComputeCommandEncoderRef> {
+    unsafe {
+        let ptr: *mut Object =
+            msg_send![command_buffer, computeCommandEncoderWithDispatchType: dispatch_type];
+        (!ptr.is_null()).then(|| ComputeCommandEncoderRef::from_ptr(ptr as *mut _))
+    }
+}
+
+/// `newIndirectCommandBufferWithDescriptor:maxCommandCount:options:`, with the
+/// nil an exhausted device returns.
+///
+/// This one is sized by the guest's own `maxCommandCount`, so its nil is
+/// squarely the out-of-memory case.
+pub fn new_indirect_command_buffer(
+    device: &DeviceRef,
+    descriptor: &IndirectCommandBufferDescriptorRef,
+    max_command_count: NSUInteger,
+    options: MTLResourceOptions,
+) -> Option<IndirectCommandBuffer> {
+    unsafe {
+        let ptr: *mut Object = msg_send![
+            device,
+            newIndirectCommandBufferWithDescriptor: descriptor
+            maxCommandCount: max_command_count
+            options: options
+        ];
+        (!ptr.is_null()).then(|| IndirectCommandBuffer::from_ptr(ptr as *mut _))
+    }
+}
+
+/// `[MTLFunction newArgumentEncoderWithBufferIndex:]`, with its nil.
+pub fn new_argument_encoder(
+    function: &FunctionRef,
+    buffer_index: NSUInteger,
+) -> Option<ArgumentEncoder> {
+    unsafe {
+        let ptr: *mut Object = msg_send![function, newArgumentEncoderWithBufferIndex: buffer_index];
+        (!ptr.is_null()).then(|| ArgumentEncoder::from_ptr(ptr as *mut _))
+    }
+}
+
 pub fn new_texture_view_swizzled(
     texture: &TextureRef,
     pixel_format: MTLPixelFormat,
@@ -490,18 +690,6 @@ pub fn execute_commands_in_buffer_indirect(
             indirectBuffer: indirect
             indirectBufferOffset: offset
         ];
-    }
-}
-
-pub fn set_line_width(encoder: &Object, width: f32) -> bool {
-    unsafe {
-        let sel = sel!(setLineWidth:);
-        let responds: BOOL = msg_send![encoder, respondsToSelector: sel];
-        if responds == NO {
-            return false;
-        }
-        let _: () = msg_send![encoder, setLineWidth: width];
-        true
     }
 }
 
@@ -743,9 +931,19 @@ pub fn reflection_bindings(reflection: *mut Object) -> Vec<BindingInfo> {
     }
 }
 
-pub fn render_reflection_sampler_mask(reflection: *mut Object, vertex: bool) -> u32 {
+/// Which sampler slots one stage of a built PSO actually samples, as a bit per
+/// slot, from Metal's own pipeline reflection.
+///
+/// `Ok(0)` where there is no reflection to read — no argument info was
+/// requested, or the stage has no bindings — which is a stage that samples
+/// nothing and not a failure. `Err` only where the reflection names a slot
+/// outside the argument table, which is the alarm described at the check.
+pub fn render_reflection_sampler_mask(
+    reflection: *mut Object,
+    vertex: bool,
+) -> Result<u32, MetalSamplerMaskOverflow> {
     if reflection.is_null() {
-        return 0;
+        return Ok(0);
     }
     unsafe {
         let bindings: *mut Object = if vertex {
@@ -754,7 +952,7 @@ pub fn render_reflection_sampler_mask(reflection: *mut Object, vertex: bool) -> 
             msg_send![reflection, fragmentBindings]
         };
         if bindings.is_null() {
-            return 0;
+            return Ok(0);
         }
         let count: NSUInteger = msg_send![bindings, count];
         let mut mask = 0u32;
@@ -772,13 +970,60 @@ pub fn render_reflection_sampler_mask(reflection: *mut Object, vertex: bool) -> 
                 continue;
             }
             let index: NSUInteger = msg_send![b, index];
-            if index < 16 {
-                mask |= 1u32 << index;
+            let index = index as usize;
+            if !crate::backend::metal::util::valid_sampler_index(index) {
+                // A healthy zero: Metal's sampler argument table is what this
+                // bound *is*, so its own reflection should never name a slot
+                // outside it. A firing means this backend's idea of the table
+                // has parted from the driver's.
+                //
+                // Refused rather than skipped. Dropping the bit built a mask
+                // that says the shader does not sample that slot, so the slot
+                // never receives its default sampler and the shader reads an
+                // undefined one — a wrong frame with nothing to explain it. The
+                // sibling `bind_compute_samplers` has always refused on this
+                // same bound, one file away, and there is no reason the two
+                // stages should answer differently.
+                crate::observe::Emit::decline(
+                    "metal_render_reflection",
+                    &MetalSamplerMaskOverflow { index, vertex },
+                )
+                .fail_once(index as u64);
+                return Err(MetalSamplerMaskOverflow { index, vertex });
             }
+            mask |= 1u32 << index;
         }
-        mask
+        Ok(mask)
     }
 }
+
+/// Metal's own pipeline reflection named a used sampler at a slot the sampler
+/// argument table does not have.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MetalSamplerMaskOverflow {
+    /// The slot the reflection reported.
+    pub index: usize,
+    /// Which stage's binding list it came from.
+    pub vertex: bool,
+}
+
+impl crate::observe::Decline for MetalSamplerMaskOverflow {
+    fn slug(&self) -> &'static str {
+        "metal_reflection_sampler_index_past_table"
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        vec![
+            ("index", self.index.to_string()),
+            (
+                "stage",
+                if self.vertex { "vertex" } else { "fragment" }.to_string(),
+            ),
+        ]
+    }
+}
+
+crate::observe::decline_display!(MetalSamplerMaskOverflow);
 
 /// Helper: MTLSize constructor.
 pub fn mtl_size(x: u64, y: u64, z: u64) -> MTLSize {

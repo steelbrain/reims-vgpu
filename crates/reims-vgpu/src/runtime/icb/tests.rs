@@ -5,26 +5,31 @@ use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
 /// as the compute-pipeline block below.
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+use crate::contract::pass_action::MTL_STORE_ACTION_STORE;
 use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
 use crate::model::{DeviceId, PAGE_SHIFT_ARM64E};
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-use crate::runtime::decode::render::PASS_STORE_ACTION_STORE;
 use crate::runtime::decode::resource::{
     compute_only_icb_layout, encode_icb_command_layout, list_object_entry_offset,
     render_icb_layout, ICB_DESC_FLAGS, ICB_DESC_LAYOUT, ICB_DESC_LEN, ICB_DESC_MAX_COMMAND_COUNT,
     ICB_DESC_MAX_FRAGMENT_BINDS, ICB_DESC_MAX_KERNEL_BINDS, ICB_DESC_MAX_VERTEX_BINDS,
     ICB_DESC_OPTIONS, ICB_FLAG_INHERIT_BUFFERS, ICB_LAYOUT_LEN,
     MTL_INDIRECT_CMD_CONCURRENT_DISPATCH, MTL_INDIRECT_CMD_DRAW, MTL_INDIRECT_CMD_DRAW_INDEXED,
-    OBJECT_LIST_ENTRY_LEN, OBJECT_TYPE_TYPE7, PIPELINE_TAG_FRAGMENT_FUNC, PIPELINE_TAG_VERTEX_FUNC,
+    OBJECT_LIST_ENTRY_LEN, OBJECT_TYPE_BUFFER, OBJECT_TYPE_TYPE7, PIPELINE_TAG_FRAGMENT_FUNC,
+    PIPELINE_TAG_VERTEX_FUNC,
     RESOURCE_PAGE_SHIFT, TYPE7_OBJECT_ICB, TYPE7_OBJECT_RENDER_PIPELINE,
 };
-/// Compute-pipeline and buffer-object descriptor constants, used only by the
+/// Compute-pipeline and function descriptor constants, used only by the
 /// Metal-arm execute tests below. Kept in their own gated `use` so the Vulkan arm
 /// does not carry unused imports.
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 use crate::runtime::decode::resource::{
-    OBJECT_TYPE_BUFFER, OBJECT_TYPE_FUNCTION, PIPELINE_TAG_KERNEL_FUNC, TYPE7_FIRST_TLVS,
+    OBJECT_TYPE_FUNCTION, PIPELINE_TAG_KERNEL_FUNC, TYPE7_FIRST_TLVS,
     TYPE7_OBJECT_COMPUTE_PIPELINE,
+};
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+use crate::runtime::draw::{
+    encode_icb_execute_and_writeback, BufferBind, ColorRtRequest, DrawEncodeRequest, EncodeStatus,
 };
 use crate::runtime::gva_mem;
 use crate::runtime::host::FakeHost;
@@ -32,10 +37,6 @@ use crate::runtime::host::FakeHost;
 /// test needs this same set; it was spelled inside 29 test bodies before.
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 use crate::runtime::mapping_write;
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-use crate::runtime::metal_draw::{
-    encode_icb_execute_and_writeback, BufferBind, ColorRtRequest, DrawEncodeRequest, EncodeStatus,
-};
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -68,7 +69,7 @@ fn an_icb_refusal_keeps_its_slug_on_the_compute_rail() {
 
 /// The `0x1d1` backing-info decoder names which of its two checks refused.
 ///
-/// `exec.rs` used to fold both into a bare `icb_backing_fail` counter, so an
+/// `exec` used to fold both into a bare `icb_backing_fail` counter, so an
 /// ICB whose command memory never bound was indistinguishable from one whose
 /// record was truncated. These are the two slugs that counter now carries.
 #[test]
@@ -123,7 +124,7 @@ fn setup_task(host: &mut FakeHost, state: &mut DeviceState) {
         st32(&mut pte, pfn);
         let _ = host.write_gpa(root_gpa + (i as u64) * 4, &pte);
     }
-    assert!(state.define_task(1, 0x1000, dir_pfn));
+    state.define_task(1, 0x1000, dir_pfn);
     assert!(state.set_object_list(1, 0, 32));
 }
 
@@ -717,7 +718,17 @@ fn assert_target_texels(
 ) {
     let mut back = vec![0u8; 4 * 4 * 4];
     assert!(mapping_write::read_rect_raw(
-        state, host, mapping_id, 0, 0, 4, 4, &mut back, 16
+        state,
+        host,
+        mapping_id,
+        mapping_write::Rect {
+            origin_x: 0,
+            origin_y: 0,
+            width: 4,
+            height: 4
+        },
+        &mut back,
+        16
     ));
     let near = |g: u8, w: u8| (g as i32 - w as i32).abs() <= tol;
     for (p, px) in back.chunks_exact(4).enumerate() {
@@ -751,7 +762,7 @@ fn draw_request(mapping_id: u32) -> DrawEncodeRequest {
             width: 4,
             height: 4,
             format: crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM,
-            store_action: PASS_STORE_ACTION_STORE,
+            store_action: MTL_STORE_ACTION_STORE,
             target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
             ..Default::default()
         }],
@@ -785,9 +796,9 @@ fn put_function_object(
 
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 /// Publish an encoded ICB command-memory `slot` at `cmd_handle`'s page, wrap it
-/// in buffer object 10, and associate that buffer with ICB object 9 through
-/// opcode 0x1d1 — the sequence `execute` performs before any fill, spelled in
-/// thirteen test bodies before this.
+/// in buffer object 10, and associate that buffer with ICB object 9 — the
+/// sequence `execute` performs before any fill, spelled in thirteen test bodies
+/// before this.
 ///
 /// `cmd_handle` is the caller's because it is the slot's GVA page index and must
 /// not collide with the other fixtures a given test has already placed; refs 9
@@ -807,17 +818,13 @@ fn associate_icb_command_memory(
     put_object(host, state, 10, OBJECT_TYPE_BUFFER, 0x1a0, &cmd_bdesc);
     // `&*host`, not `host`: this takes `&M` while `put_object` above needs
     // `&mut FakeHost`, and the reborrow is what lets one binding serve both.
-    apply_icb_host_resource_info(
-        state,
-        &*host,
-        1,
-        &IcbHostResourceInfo {
-            icb_ref: 9,
-            buffer_ref: 10,
-            gpu_address: 0,
-        },
-    )
-    .expect("0x1d1 associate ICB command memory");
+    //
+    // Straight to the association rather than through `0x1d1`. That record is a
+    // query this device refuses — see `apply_icb_host_resource_info` — so
+    // routing every ICB fixture through it would have made this helper the one
+    // thing keeping the old misreading alive.
+    associate_icb_backing_buffer_ref(state, &*host, 1, 9, 10)
+        .expect("associate ICB command memory");
 }
 
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
@@ -2009,8 +2016,8 @@ fn icb_host_resource_info_decode_and_apply() {
     st64(&mut p[8..], 0x4000);
     let info = decode_icb_host_resource_info(&p).unwrap();
     assert_eq!(info.icb_ref, 9);
-    assert_eq!(info.buffer_ref, 10);
-    assert_eq!(info.gpu_address, 0x4000);
+    assert_eq!(info.reply_buffer_ref, 10);
+    assert_eq!(info.reply_offset, 0x4000);
     // Full record form
     let mut rec = [0u8; 24];
     st32(&mut rec[0..], INFO_OP_ICB_HOST_RESOURCE);
@@ -2020,9 +2027,23 @@ fn icb_host_resource_info_decode_and_apply() {
     assert_eq!(info2, info);
 }
 
+/// `0x1d1` is a query, and answering it by binding its reply pair was worse
+/// than refusing it.
+///
+/// The record names an ICB and a scratch `(buffer, offset)` pair for the two
+/// `u64`s the guest is waiting to be handed. This device used to read that pair
+/// as the ICB's command backing, so a guest whose stream allocator returned a
+/// resolvable type-1 ref would have had its own reply staging area bound as an
+/// ICB's command slots — and the next `executeCommandsInBuffer:` would have
+/// decoded whatever sat there and run it as real work.
+///
+/// The fixture is built to be exactly that trap: object 11 is a well-formed
+/// type-1 buffer whose pages hold a *valid* encoded command slot, so the old
+/// code path succeeds on it. Both halves are asserted, because the refusal
+/// alone would still pass if the bind happened first and the error came later:
+/// the call refuses, **and** the ICB still has no command memory afterwards.
 #[test]
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-fn apply_0x1d1_auto_binds_backing() {
+fn a_0x1d1_query_is_refused_and_binds_nothing() {
     let _guard = icb_test_guard();
     let (mut host, state) = icb_device();
 
@@ -2030,6 +2051,9 @@ fn apply_0x1d1_auto_binds_backing() {
     let icb_desc = make_icb_desc_bytes(1, 1, false);
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
     put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
+    // Record the create body, as `execute` would, so the decode below refuses
+    // for want of command memory rather than for want of the ICB itself.
+    resolve_icb_record(&state, &host, 1, 9).expect("record the ICB create body");
 
     let slot = encode_compute_command_slot(
         &layout,
@@ -2052,19 +2076,25 @@ fn apply_0x1d1_auto_binds_backing() {
     let bdesc_gva = 0x200u64;
     put_object(&mut host, &state, 11, OBJECT_TYPE_BUFFER, bdesc_gva, &bdesc);
 
-    let mem = apply_icb_host_resource_info(
+    let refused = apply_icb_host_resource_info(
         &state,
         &host,
         1,
         &IcbHostResourceInfo {
             icb_ref: 9,
-            buffer_ref: 11,
-            gpu_address: 0,
+            reply_buffer_ref: 11,
+            reply_offset: 0,
         },
     )
-    .expect("0x1d1 apply");
-    assert_eq!(mem.gva, cmd_gva);
-    assert_eq!(mem.byte_len, layout.command_size as u64);
+    .expect_err("0x1d1 is a query this device does not answer");
+    assert_eq!(refused, IcbStatus::Unsupported("icb_info_query_unanswered"));
+
+    // The trap: object 11 resolves and its pages hold a decodable slot, so the
+    // old reading would have bound it here and this walk would have returned a
+    // command the guest never put in an ICB.
+    let after = decode_icb_command_range(&state, &host, 1, 9, 0, 1)
+        .expect_err("the query must not have bound the reply buffer as command memory");
+    assert_eq!(after, IcbStatus::Missing("icb_fill_no_command_memory"));
 }
 
 /// Product DrawIndexed ICB fill + execute: oracle fullscreen triangle via
@@ -3409,8 +3439,9 @@ fn inherit_buffers_encoder_fragment_color() {
             index: 0,
             buffer_ref: 13,
             offset: 0,
+                attribute_stride: None,
         }],
-        viewport: Some([0.0, 0.0, 4.0, 4.0, 0.0, 1.0]),
+        viewports: vec![[0.0, 0.0, 4.0, 4.0, 0.0, 1.0]],
         ..draw_request(mapping_id)
     };
     assert_eq!(
@@ -3488,7 +3519,7 @@ fn inherit_pipeline_encoder_fragment_color() {
 
     // Stream-style pipeline on the encode request (parent encoder).
     let req = DrawEncodeRequest {
-        viewport: Some([0.0, 0.0, 4.0, 4.0, 0.0, 1.0]),
+        viewports: vec![[0.0, 0.0, 4.0, 4.0, 0.0, 1.0]],
         ..draw_request(mapping_id)
     };
     assert_eq!(
@@ -4272,28 +4303,21 @@ fn put_type2_texture(
 /// Minimal type-7 sampler (36 B): clamp-to-edge, nearest, normalized coords.
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn put_type7_sampler(host: &mut FakeHost, state: &DeviceState, obj_ref: u32, normalized: bool) {
-    use crate::runtime::decode::resource::{
-        SAMPLER_DESC_DECLARED_LEN, SAMPLER_DESC_ID, SAMPLER_DESC_LEN, SAMPLER_DESC_LOD_MAX,
-        SAMPLER_DESC_STATE_BITS, SAMPLER_DESC_TAG, SAMPLER_DESC_WORD16, SAMPLER_DESC_WORD20,
-        TYPE7_OBJECT_SAMPLER,
-    };
-    let mut desc = vec![0u8; SAMPLER_DESC_LEN];
-    st32(&mut desc[SAMPLER_DESC_TAG..], TYPE7_OBJECT_SAMPLER);
-    st32(
-        &mut desc[SAMPLER_DESC_DECLARED_LEN..],
-        SAMPLER_DESC_LEN as u32,
-    );
-    st32(&mut desc[SAMPLER_DESC_ID..], obj_ref);
+    use crate::runtime::decode::resource::{sampler_desc as off, TYPE7_OBJECT_SAMPLER};
+    let mut desc = vec![0u8; off::LEN];
+    st32(&mut desc[off::TAG..], TYPE7_OBJECT_SAMPLER);
+    st32(&mut desc[off::DECLARED_LEN..], off::LEN as u32);
+    st32(&mut desc[off::ID..], obj_ref);
     // Address modes ClampToEdge=0 at bits 8/12/16; filters nearest=0.
     // Normalized coords bit 31 when requested.
     let mut bits = 0u32;
     if normalized {
         bits |= 0x8000_0000;
     }
-    st32(&mut desc[SAMPLER_DESC_STATE_BITS..], bits);
-    st32(&mut desc[SAMPLER_DESC_WORD16..], 0);
-    st32(&mut desc[SAMPLER_DESC_WORD20..], 0f32.to_bits()); // lod min
-    st32(&mut desc[SAMPLER_DESC_LOD_MAX..], f32::MAX.to_bits());
+    st32(&mut desc[off::STATE_BITS..], bits);
+    st32(&mut desc[off::FLAGS..], 0);
+    st32(&mut desc[off::LOD_MIN..], 0f32.to_bits());
+    st32(&mut desc[off::LOD_MAX..], f32::MAX.to_bits());
     let desc_gva = 0x300u64 + (obj_ref as u64) * 0x40;
     put_object(host, state, obj_ref, OBJECT_TYPE_TYPE7, desc_gva, &desc);
 }
@@ -4854,4 +4878,135 @@ fn buffer_backed_nonzero_wire_va_offset() {
     );
 
     assert_stagein_solid(&mut state, &mut host, mapping_id, sid, "wire_va offset");
+}
+
+/// Each render bind stage is bounded by its own field of the create descriptor.
+///
+/// The four maxima are decoded separately and handed to Metal separately, so
+/// mapping them onto one bound would report the wrong table for three stages out
+/// of four — the failure mode `8ad945e` found on the type-1 buffer span.
+#[test]
+fn a_render_icb_bind_is_bounded_by_the_count_its_own_stage_declared() {
+    use crate::observe::Decline;
+
+    let desc = IndirectCommandBufferDescriptor {
+        max_vertex_buffer_bind_count: 4,
+        max_fragment_buffer_bind_count: 2,
+        max_object_buffer_bind_count: 3,
+        max_mesh_buffer_bind_count: 1,
+        ..Default::default()
+    };
+
+    // The last in-range index of each stage is accepted, and the first
+    // out-of-range one is refused under that stage's own slug.
+    for (stage, declared, slug) in [
+        (
+            IcbRenderBindStage::Vertex,
+            4u32,
+            "icb_frc_vertex_bind_index_past_max",
+        ),
+        (
+            IcbRenderBindStage::Fragment,
+            2,
+            "icb_frc_fragment_bind_index_past_max",
+        ),
+        (
+            IcbRenderBindStage::Object,
+            3,
+            "icb_frc_object_bind_index_past_max",
+        ),
+        (
+            IcbRenderBindStage::Mesh,
+            1,
+            "icb_frc_mesh_bind_index_past_max",
+        ),
+    ] {
+        assert!(
+            refuse_render_bind_past_declared_max(stage, declared - 1, &desc).is_ok(),
+            "{stage:?} refused its own last declared index"
+        );
+        let refusal = refuse_render_bind_past_declared_max(stage, declared, &desc)
+            .expect_err("index past the declared count must refuse");
+        assert_eq!(refusal.slug(), slug);
+    }
+}
+
+/// A stage the guest declared no binds for admits no index at all, including 0.
+///
+/// `max_* == 0` is the common case for stages a pipeline does not use, and `0`
+/// is the index a zeroed fill record carries, so this is the arm a malformed
+/// record reaches first.
+#[test]
+fn a_render_icb_stage_declaring_no_binds_refuses_index_zero() {
+    let desc = IndirectCommandBufferDescriptor::default();
+    for stage in [
+        IcbRenderBindStage::Vertex,
+        IcbRenderBindStage::Fragment,
+        IcbRenderBindStage::Object,
+        IcbRenderBindStage::Mesh,
+    ] {
+        assert_eq!(stage.declared_bind_count(&desc), 0, "{stage:?}");
+        assert!(refuse_render_bind_past_declared_max(stage, 0, &desc).is_err());
+    }
+}
+
+/// An execute that filled no slots says so, and one that met a different
+/// refusal still forwards it.
+///
+/// The rule this pins used to be a wildcard — `Err(IcbStatus::Missing(_)) => {}`
+/// — copied into the render arm and the compute arm. It swallowed both slugs
+/// `decode_icb_command_range` raises under `Missing`, and only one of them had
+/// been argued for. The four cases below are the whole vocabulary that reaches
+/// this function: filled, unfilled, the other `Missing`, and everything else.
+#[test]
+fn an_icb_execute_that_filled_no_slots_is_counted_and_not_swallowed() {
+    use crate::runtime::drain::store_route_count;
+    const ROUTE: &str = "icb_executed_without_command_memory";
+
+    let quiet = store_route_count(ROUTE);
+    assert_eq!(
+        icb_fill_outcome(Ok(()), 1, 9),
+        Ok(()),
+        "a filled ICB is carried on from"
+    );
+    assert_eq!(
+        store_route_count(ROUTE),
+        quiet,
+        "a filled ICB costs the guest nothing and must not count"
+    );
+
+    // The unfilled case: control flow is unchanged so the caller still does its
+    // writeback, but the lost commands are now counted.
+    assert_eq!(
+        icb_fill_outcome(
+            Err(IcbStatus::Missing(ICB_FILL_NO_COMMAND_MEMORY)),
+            1,
+            9
+        ),
+        Ok(()),
+        "an empty execute is a no-op, not a reason to skip the writeback"
+    );
+    assert_eq!(
+        store_route_count(ROUTE),
+        quiet + 1,
+        "the commands the guest encoded into this ICB were lost, and it says so"
+    );
+
+    // The other `Missing` slug, and a variant from another class. Both forward,
+    // so the caller declines by the name of the check that actually refused.
+    for other in [
+        IcbStatus::Missing("icb_fill_not_cached"),
+        IcbStatus::Args("icb_fill_zero_command_size"),
+    ] {
+        assert_eq!(
+            icb_fill_outcome(Err(other), 1, 9),
+            Err(other),
+            "{other:?} names a different loss and must not be swallowed"
+        );
+    }
+    assert_eq!(
+        store_route_count(ROUTE),
+        quiet + 1,
+        "a forwarded refusal is not an empty execute"
+    );
 }

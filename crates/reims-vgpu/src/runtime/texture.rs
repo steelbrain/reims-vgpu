@@ -4,8 +4,8 @@
 //! on the mapping when a texture descriptor is resolved. Device-desc geom
 //! (mapper path) and texture-path geom share [`DeviceState::set_mapping_geom`].
 
-use crate::contract::iosurface_pages::{decode_texture_descriptor, TEXTURE_DESC_MIN_LEN};
-use crate::model::{DeviceState, MAX_MAPPINGS};
+use crate::contract::iosurface_pages::decode_texture_descriptor;
+use crate::model::{is_mapping_id, DeviceState};
 use crate::runtime::decode::resource::{decode_descriptor, Descriptor};
 
 /// Register geometry from a decoded type-11 / IOSurface texture descriptor.
@@ -16,7 +16,7 @@ pub fn register_type11_geom(
     height: u32,
     format: u16,
 ) -> bool {
-    if mapping_id == 0 || mapping_id as usize >= MAX_MAPPINGS {
+    if !is_mapping_id(mapping_id) {
         return false;
     }
     if let Some(m) = state.mappings.get(&mapping_id) {
@@ -35,18 +35,13 @@ pub fn register_from_descriptor_bytes(
 ) -> bool {
     // Also accept the raw iosurface texture layout without a type byte.
     let headerless = |state: &mut DeviceState| {
-        if desc.len() >= TEXTURE_DESC_MIN_LEN {
-            if let Ok(t) = decode_texture_descriptor(desc) {
-                return register_type11_geom(
-                    state,
-                    t.mapping_id,
-                    t.width,
-                    t.height,
-                    t.pixel_format,
-                );
-            }
+        // No length test here: `decode_texture_descriptor`'s own first line is
+        // `bytes.len() < TYPE11_DESC_MIN_LEN`, so a copy of it one call above
+        // could only ever disagree with the arm it is guarding.
+        match decode_texture_descriptor(desc) {
+            Ok(t) => register_type11_geom(state, t.mapping_id, t.width, t.height, t.pixel_format),
+            Err(_) => false,
         }
-        false
     };
     match decode_descriptor(object_type, desc) {
         Ok(Descriptor::IOSurfaceTexture {
@@ -106,5 +101,44 @@ mod tests {
         assert_eq!(m.width, 100);
         assert_eq!(m.height, 50);
         assert_eq!(m.format, 0x73);
+    }
+
+    /// A headerless blob one byte short of the record latches nothing, and does
+    /// so through the decoder rather than through a length test above it.
+    ///
+    /// The removed guard was `desc.len() >= TYPE11_DESC_MIN_LEN` immediately
+    /// before `decode_texture_descriptor`, whose own first line is the same
+    /// comparison. This pins that the refusal survived the removal, at exactly
+    /// the boundary the two shared: `TYPE11_DESC_MIN_LEN - 1` refuses and
+    /// `TYPE11_DESC_MIN_LEN` does not.
+    #[test]
+    fn a_short_headerless_descriptor_is_refused_by_the_decoder_alone() {
+        let min = crate::contract::iosurface_pages::TYPE11_DESC_MIN_LEN;
+        let mut s = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+
+        let mut short = vec![0u8; min - 1];
+        st32(&mut short[0..], 9);
+        assert!(
+            !register_from_descriptor_bytes(&mut s, 0xff, &short),
+            "a descriptor one byte short of the record must latch no geometry"
+        );
+        assert!(
+            !s.mappings.contains_key(&9),
+            "and must not open a mapping slot on the way"
+        );
+
+        let mut exact = vec![0u8; min];
+        st32(&mut exact[0..], 9);
+        st16(&mut exact[0x16..], 0x73);
+        st32(&mut exact[0x18..], 8);
+        st32(&mut exact[0x1c..], 4);
+        assert!(
+            register_from_descriptor_bytes(&mut s, 0xff, &exact),
+            "the shortest legal record must still be accepted"
+        );
+        assert_eq!(
+            s.mappings.get(&9).map(|m| (m.width, m.height)),
+            Some((8, 4))
+        );
     }
 }

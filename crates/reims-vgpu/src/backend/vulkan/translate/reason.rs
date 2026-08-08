@@ -10,6 +10,43 @@
 //! [`TranslateReason::slug`]. The offending numeric value
 //! rides along so the fail-visible line carries the load-bearing field, and
 //! [`std::fmt::Display`] renders both.
+//!
+//! # Two classes of variant, and only one of them is this device's fault
+//!
+//! Several variants below already say they are "distinct from
+//! `UnknownPixelFormat`" — the format is understood, this rail just does not
+//! carry it. That distinction is the whole taxonomy, and it decides what the
+//! repair is:
+//!
+//! - **The value is out of contract.** `Unknown*` — an ordinal Apple's
+//!   serializer never emits. A real device rejects it too, so the refusal *is*
+//!   the correct behaviour and there is nothing to implement.
+//! - **The value is in contract and this backend has no path for it.**
+//!   `NoSampledLayout`, `NoColorAttachmentFormat`, `NoStorageImageFormat`,
+//!   `VertexStepFunctionPerPatch`, `FormatNotVertexBuffer`. The guest asked for
+//!   something legal and lost the work. These are gaps, and the repair is to
+//!   build the path — never to stop advertising the capability, unless *no host*
+//!   could ever serve it. [`crate::model::DEVICE_INFO_KEY_FRAMEBUFFER_READ`]
+//!   carries that rule and the pair of cases that establish it.
+//! - **The value is in contract, this backend has a path, and the path would
+//!   answer something else.** `VertexFormatWidenReadAsFour`,
+//!   `VertexFormatWidenShaderUnreadable` — the only two, and both belong to the
+//!   vertex-format widening fallback in [`super::support`]. What makes them a
+//!   class of their own is that the alternative to refusing is not losing the
+//!   work, it is *executing a different command*: the substitute format binds
+//!   fine and hands the shader a fourth component the guest's own format would
+//!   have defaulted to 1.0. Refusing is the faithful answer, and the repair is
+//!   not to widen the fallback but to narrow when it applies.
+//!
+//! **None of the second or third class has fired on any archived boot of this
+//! rig** — x86/PCI/Vulkan, driven under the window-drag and web-content probes
+//! as well as idle. For the second, each names a real Metal feature this
+//! workload does not reach, which is the reading that makes leaving them open a
+//! measurement rather than a bet. For the third the zero is structural on this
+//! rig and says less: no host here declines a three-component vertex format, so
+//! the fallback is never entered and neither variant is reachable. It says
+//! nothing about the arm64 pathway, which this checkout cannot boot, and a
+//! firing is the signal that one has become worth building.
 
 use crate::observe::Decline;
 
@@ -91,6 +128,10 @@ pub enum TranslateReason {
     UnknownCullMode(u32),
     /// `MTLWinding` value outside the SDK enum.
     UnknownWinding(u32),
+    /// `MTLTriangleFillMode` value outside the SDK enum.
+    UnknownFillMode(u32),
+    /// `MTLDepthClipMode` value outside the SDK enum.
+    UnknownDepthClipMode(u32),
     /// `MTLSamplerMinMagFilter` value outside the SDK enum.
     UnknownSamplerFilter(u32),
     /// `MTLSamplerMipFilter` value outside the SDK enum.
@@ -105,6 +146,29 @@ pub enum TranslateReason {
     /// buffer format, and no portable substitute exists for it.
     /// Payload is the `VkFormat` raw value.
     FormatNotVertexBuffer(i32),
+    /// The device declined a three-component vertex format, its four-component
+    /// substitute would fit, **and the shader reads all four components** — so
+    /// binding the substitute would supply a fourth component out of the vertex
+    /// buffer where the guest's own format defaults it to 1.0.
+    ///
+    /// Distinct from [`Self::FormatNotVertexBuffer`]: there a substitute does
+    /// not exist or does not fit, here it exists and fits and is still the
+    /// wrong answer. Payload is the `VkFormat` raw value the guest asked for.
+    VertexFormatWidenReadAsFour(i32),
+    /// The same substitution, declined because the shader's declared width
+    /// could not be read: an input type that is not a scalar or a vector, or a
+    /// module whose instruction stream did not parse.
+    ///
+    /// Its own slug because the repair is different. A firing of
+    /// [`Self::VertexFormatWidenReadAsFour`] is this device correctly refusing
+    /// something it cannot represent; a firing of this one means
+    /// [`crate::runtime::spirv_vertex_input`] met a module shape it does not
+    /// handle, and the repair is to teach it that shape.
+    VertexFormatWidenShaderUnreadable(i32),
+    /// `MTLVisibilityResultMode` value outside the SDK enum. Note that `0`
+    /// (`Disabled`) is **not** one of these: it is the guest disarming the
+    /// query, which translates to "no query" rather than to a refusal.
+    UnknownVisibilityResultMode(u32),
 }
 
 impl crate::observe::Decline for TranslateReason {
@@ -137,12 +201,17 @@ impl crate::observe::Decline for TranslateReason {
             Self::UnknownStencilOperation(_) => "unknown_stencil_operation",
             Self::UnknownCullMode(_) => "unknown_cull_mode",
             Self::UnknownWinding(_) => "unknown_winding",
+            Self::UnknownFillMode(_) => "unknown_fill_mode",
+            Self::UnknownDepthClipMode(_) => "unknown_depth_clip_mode",
             Self::UnknownSamplerFilter(_) => "unknown_sampler_filter",
             Self::UnknownSamplerMipFilter(_) => "unknown_sampler_mip_filter",
             Self::UnknownSamplerAddressMode(_) => "unknown_sampler_address_mode",
             Self::UnknownSamplerBorderColor(_) => "unknown_sampler_border_color",
             Self::UnknownSwizzleSelector(_) => "unknown_swizzle_selector",
             Self::FormatNotVertexBuffer(_) => "format_not_vertex_buffer",
+            Self::VertexFormatWidenReadAsFour(_) => "vertex_format_widen_read_as_four",
+            Self::VertexFormatWidenShaderUnreadable(_) => "vertex_format_widen_shader_unreadable",
+            Self::UnknownVisibilityResultMode(_) => "unknown_visibility_result_mode",
         }
     }
 
@@ -173,12 +242,17 @@ impl TranslateReason {
             | Self::UnknownStencilOperation(v)
             | Self::UnknownCullMode(v)
             | Self::UnknownWinding(v)
+            | Self::UnknownFillMode(v)
+            | Self::UnknownDepthClipMode(v)
             | Self::UnknownSamplerFilter(v)
             | Self::UnknownSamplerMipFilter(v)
             | Self::UnknownSamplerAddressMode(v)
-            | Self::UnknownSamplerBorderColor(v) => v,
+            | Self::UnknownSamplerBorderColor(v)
+            | Self::UnknownVisibilityResultMode(v) => v,
             Self::UnknownSwizzleSelector(v) => u32::from(v),
-            Self::FormatNotVertexBuffer(v) => v as u32,
+            Self::FormatNotVertexBuffer(v)
+            | Self::VertexFormatWidenReadAsFour(v)
+            | Self::VertexFormatWidenShaderUnreadable(v) => v as u32,
         }
     }
 }
@@ -220,12 +294,17 @@ mod tests {
         TranslateReason::UnknownStencilOperation(0),
         TranslateReason::UnknownCullMode(0),
         TranslateReason::UnknownWinding(0),
+        TranslateReason::UnknownFillMode(0),
+        TranslateReason::UnknownDepthClipMode(0),
         TranslateReason::UnknownSamplerFilter(0),
         TranslateReason::UnknownSamplerMipFilter(0),
         TranslateReason::UnknownSamplerAddressMode(0),
         TranslateReason::UnknownSamplerBorderColor(0),
         TranslateReason::UnknownSwizzleSelector(0),
         TranslateReason::FormatNotVertexBuffer(0),
+        TranslateReason::VertexFormatWidenReadAsFour(0),
+        TranslateReason::VertexFormatWidenShaderUnreadable(0),
+        TranslateReason::UnknownVisibilityResultMode(0),
     ];
 
     /// [`ALL`] really does hold every variant, exactly once.
@@ -259,12 +338,17 @@ mod tests {
                 TranslateReason::UnknownStencilOperation(_) => 13,
                 TranslateReason::UnknownCullMode(_) => 14,
                 TranslateReason::UnknownWinding(_) => 15,
-                TranslateReason::UnknownSamplerFilter(_) => 16,
-                TranslateReason::UnknownSamplerMipFilter(_) => 17,
-                TranslateReason::UnknownSamplerAddressMode(_) => 18,
-                TranslateReason::UnknownSamplerBorderColor(_) => 19,
-                TranslateReason::UnknownSwizzleSelector(_) => 20,
-                TranslateReason::FormatNotVertexBuffer(_) => 21,
+                TranslateReason::UnknownFillMode(_) => 16,
+                TranslateReason::UnknownDepthClipMode(_) => 17,
+                TranslateReason::UnknownSamplerFilter(_) => 18,
+                TranslateReason::UnknownSamplerMipFilter(_) => 19,
+                TranslateReason::UnknownSamplerAddressMode(_) => 20,
+                TranslateReason::UnknownSamplerBorderColor(_) => 21,
+                TranslateReason::UnknownSwizzleSelector(_) => 22,
+                TranslateReason::FormatNotVertexBuffer(_) => 23,
+                TranslateReason::VertexFormatWidenReadAsFour(_) => 24,
+                TranslateReason::VertexFormatWidenShaderUnreadable(_) => 25,
+                TranslateReason::UnknownVisibilityResultMode(_) => 26,
             }
         }
         let mut seen: Vec<usize> = ALL.iter().map(|r| index(*r)).collect();

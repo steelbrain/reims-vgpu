@@ -96,8 +96,12 @@ scripts/wire-oracle/wire-oracle.sh --all
 cargo test -p reims-vgpu-wire -- --test-threads=1
 ```
 
-With no fixtures present the oracle tests skip and say so. Set
-`REIMS_WIRE_FIXTURES_REQUIRED=1` on any Apple host to make that skip a failure.
+With no fixtures present the oracle tests report `ignored`, one line each, with
+the command that regenerates them. That is a build-time decision (`build.rs`
+sets a `wire_fixtures` cfg), so a fixture-less run cannot read as coverage — it
+used to print `ok` for 34 tests that returned on their first line. Set
+`REIMS_WIRE_FIXTURES_REQUIRED=1` on any Apple host to make their absence fail
+the build instead.
 
 ## Fixtures are not committed
 

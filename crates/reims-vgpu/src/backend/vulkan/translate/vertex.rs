@@ -215,7 +215,7 @@ pub fn attribute_format(mtl: u32) -> Result<F, TranslateReason> {
     })
 }
 
-/// A decoded `MTLVertexStepFunction` plus its presence bit → engine step mode.
+/// A layout entry's declared `MTLVertexStepFunction` → engine step mode.
 ///
 /// The serializer omits the field for Metal's default `PerVertex` behavior, so
 /// absence is part of this translation rather than a caller-side fallback.
@@ -225,16 +225,31 @@ pub fn attribute_format(mtl: u32) -> Result<F, TranslateReason> {
 /// (`PerPatchControlPoint`) decline, but under their own reason rather than as
 /// unrecognised values. They are recognised; this backend builds no
 /// tessellation pipeline for them to belong to.
-pub fn step_function(is_present: bool, mtl: u32) -> Result<VertexStepFunction, TranslateReason> {
-    if !is_present {
+pub fn step_function(declared: Option<u32>) -> Result<VertexStepFunction, TranslateReason> {
+    let Some(mtl) = declared else {
         return Ok(VertexStepFunction::PerVertex);
-    }
+    };
     match mtl {
         0 => Ok(VertexStepFunction::Constant),
         1 => Ok(VertexStepFunction::PerVertex),
         2 => Ok(VertexStepFunction::PerInstance),
         3 | 4 => Err(TranslateReason::VertexStepFunctionPerPatch(mtl)),
         other => Err(TranslateReason::UnknownVertexStepFunction(other)),
+    }
+}
+
+/// `VertexStepFunction` → the Vulkan input rate the binding is created with.
+///
+/// `Constant` has no Vulkan spelling of its own: Metal advances a constant-rate
+/// attribute per instance with a divisor, so it lowers to `INSTANCE` and the
+/// divisor carries the rest. The divisor is chosen beside the binding it
+/// belongs to; this decides only the rate.
+pub fn vk_input_rate(step: VertexStepFunction) -> vk::VertexInputRate {
+    match step {
+        VertexStepFunction::PerVertex => vk::VertexInputRate::VERTEX,
+        VertexStepFunction::Constant | VertexStepFunction::PerInstance => {
+            vk::VertexInputRate::INSTANCE
+        }
     }
 }
 
@@ -330,26 +345,50 @@ mod tests {
 
     #[test]
     fn every_vertex_step_function_maps_and_absence_is_per_vertex() {
+        assert_eq!(step_function(None).unwrap(), VertexStepFunction::PerVertex);
         assert_eq!(
-            step_function(false, 99).unwrap(),
-            VertexStepFunction::PerVertex
-        );
-        assert_eq!(
-            step_function(true, 0).unwrap(),
+            step_function(Some(0)).unwrap(),
             VertexStepFunction::Constant
         );
         assert_eq!(
-            step_function(true, 1).unwrap(),
+            step_function(Some(1)).unwrap(),
             VertexStepFunction::PerVertex
         );
         assert_eq!(
-            step_function(true, 2).unwrap(),
+            step_function(Some(2)).unwrap(),
             VertexStepFunction::PerInstance
         );
         assert_eq!(
-            step_function(true, 5).unwrap_err(),
+            step_function(Some(5)).unwrap_err(),
             TranslateReason::UnknownVertexStepFunction(5)
         );
+    }
+
+    /// Every ordinal this backend accepts survives the round trip back to the
+    /// wire value it came from.
+    ///
+    /// [`VertexStepFunction::mtl_ordinal`] exists so a rule stated over the
+    /// guest's ordinal can be asked on this side — the step/rate pair in
+    /// `contract::vertex_step` is the one that does — and a rule asked through
+    /// an inverse that is not an inverse is a rule asked about a different
+    /// attribute. The three accepted ordinals are named from the contract here
+    /// rather than spelled again, so this also pins that the `match` above
+    /// agrees with the declaration.
+    #[test]
+    fn an_accepted_step_function_round_trips_to_its_own_ordinal() {
+        use crate::contract::vertex_step as step;
+        for ordinal in [
+            step::MTL_VERTEX_STEP_FUNCTION_CONSTANT,
+            step::MTL_VERTEX_STEP_FUNCTION_PER_VERTEX,
+            step::MTL_VERTEX_STEP_FUNCTION_PER_INSTANCE,
+        ] {
+            let translated = step_function(Some(ordinal)).expect("an accepted ordinal");
+            assert_eq!(
+                translated.mtl_ordinal(),
+                ordinal,
+                "{translated:?} came from {ordinal}"
+            );
+        }
     }
 
     /// The two tessellation step rates decline under their own reason, and the
@@ -367,7 +406,7 @@ mod tests {
     fn the_two_tessellation_step_rates_decline_by_their_own_name() {
         for mtl in [3u32, 4] {
             assert_eq!(
-                step_function(true, mtl).unwrap_err(),
+                step_function(Some(mtl)).unwrap_err(),
                 TranslateReason::VertexStepFunctionPerPatch(mtl),
                 "MTLVertexStepFunction {mtl}"
             );
@@ -381,12 +420,9 @@ mod tests {
             TranslateReason::VertexStepFunctionPerPatch(3).slug(),
             TranslateReason::UnknownVertexStepFunction(5).slug()
         );
-        // Absence still means `PerVertex` whatever the word holds, so a record
-        // that never carried the field cannot reach either refusal.
-        assert_eq!(
-            step_function(false, 3).unwrap(),
-            VertexStepFunction::PerVertex
-        );
+        // Absence is its own state now rather than a flag beside a word, so a
+        // record that never carried the field cannot reach either refusal.
+        assert_eq!(step_function(None).unwrap(), VertexStepFunction::PerVertex);
     }
 
     /// **L2's co-location invariant.** The byte size must equal the Vulkan

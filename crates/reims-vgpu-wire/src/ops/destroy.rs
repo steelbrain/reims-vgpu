@@ -33,7 +33,7 @@
 //! # The device does not decode any of them
 //!
 //! `reims_vgpu::runtime::decode` has no arm anywhere in this range. The device's
-//! object teardown runs at the FIFO layer instead (`CHILD_OP_DELETE_OBJECT`),
+//! object teardown runs at the FIFO layer instead (`CHILD_OP_DELETE_RESOURCE`),
 //! which is the kernel's protocol rather than the serializer's — so these are
 //! records the guest emits into the command stream that nothing on the host
 //! reads. Whether that matters is a question for a driven boot, not for this

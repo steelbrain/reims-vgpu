@@ -54,6 +54,23 @@ pub enum VkOp {
     /// `vkInvalidateMappedMemoryRanges` of the readback buffer.
     ReadbackInvalidate,
 
+    // ---- mod.rs `copy_target_to_guest_pages` — the GPU-direct writeback rail,
+    //      which copies a resident straight into imported guest pages ----
+    /// `vkResetCommandBuffer` before recording the guest-page copy.
+    GuestWriteResetCb,
+    /// `vkBeginCommandBuffer` for the guest-page copy.
+    GuestWriteBeginCb,
+    /// `vkEndCommandBuffer` closing the guest-page copy.
+    GuestWriteEndCb,
+    /// `vkQueueSubmit` of the guest-page copy.
+    GuestWriteSubmit,
+    /// `vkCreateBuffer` of the device-local detiling scratch.
+    GuestScratchCreate,
+    /// `vkAllocateMemory` for the detiling scratch.
+    GuestScratchAlloc,
+    /// `vkBindBufferMemory` of the detiling scratch.
+    GuestScratchBind,
+
     // ---- mod.rs `read_resident_storage` — the pinned deferred-writeback
     //      storage-image flush rail (GPU→host tight copy, then unpin) ----
     /// `vkResetCommandBuffer` before recording the storage flush copy.
@@ -91,6 +108,9 @@ pub enum VkOp {
     ContextPipelineCacheGetData,
     /// `vkCreateQueryPool` for the readback's two-slot timestamp probe.
     ContextCreateQueryPool,
+    /// The timeline semaphore a GPU-written completion stamp signals, so the
+    /// completion thread can wait it without owning a ring fence.
+    ContextCreateSemaphore,
     /// `vkGetQueryPoolResults` reading that probe after its fence signalled.
     ContextGetQueryPoolResults,
 
@@ -119,6 +139,11 @@ pub enum VkOp {
     /// whenever `MemoryClass::Readback` landed on a host-cached type that is
     /// not also coherent.
     ExecInvalidateReadback,
+    /// `vkCreateQueryPool` for a draw that armed an occlusion query.
+    ExecCreateQueryPool,
+    /// `vkGetQueryPoolResults` reading that draw's sample count, after its
+    /// fence signalled.
+    ExecGetQueryPoolResults,
 
     // ---- exec_compute.rs — the compute command-buffer record/submit/readback
     //      rail (a distinct queue submission from the draw rail above) ----
@@ -173,6 +198,8 @@ pub enum VkOp {
     PoolsCreateStaging,
     /// `vkAllocateMemory` for a staging slot.
     PoolsAllocStaging,
+    PoolsCreateGuestGather,
+    PoolsBindGuestGather,
     /// `vkBindBufferMemory` for a staging slot.
     PoolsBindStaging,
     /// `vkMapMemory` of a staging slot to upload guest bytes.
@@ -335,6 +362,14 @@ impl Decline for VkCall {
             VkOp::ReadbackMap => "vk_readback_map",
             VkOp::ReadbackInvalidate => "vk_readback_invalidate",
 
+            VkOp::GuestWriteResetCb => "vk_guest_write_reset_cb",
+            VkOp::GuestWriteBeginCb => "vk_guest_write_begin_cb",
+            VkOp::GuestWriteEndCb => "vk_guest_write_end_cb",
+            VkOp::GuestWriteSubmit => "vk_guest_write_submit",
+            VkOp::GuestScratchCreate => "vk_guest_scratch_create",
+            VkOp::GuestScratchAlloc => "vk_guest_scratch_alloc",
+            VkOp::GuestScratchBind => "vk_guest_scratch_bind",
+
             VkOp::StorageReadResetCb => "vk_storage_read_reset_cb",
             VkOp::StorageReadBeginCb => "vk_storage_read_begin_cb",
             VkOp::StorageReadEndCb => "vk_storage_read_end_cb",
@@ -352,6 +387,7 @@ impl Decline for VkCall {
 
             VkOp::ContextPipelineCacheGetData => "vk_context_pipeline_cache_get_data",
             VkOp::ContextCreateQueryPool => "vk_context_create_query_pool",
+            VkOp::ContextCreateSemaphore => "vk_context_create_semaphore",
             VkOp::ContextGetQueryPoolResults => "vk_context_get_query_pool_results",
 
             VkOp::DescArenaCreatePool => "vk_desc_arena_create_pool",
@@ -365,6 +401,8 @@ impl Decline for VkCall {
             VkOp::ExecSubmit => "vk_exec_submit",
             VkOp::ExecMapReadback => "vk_exec_map_readback",
             VkOp::ExecInvalidateReadback => "vk_exec_invalidate_readback",
+            VkOp::ExecCreateQueryPool => "vk_exec_create_query_pool",
+            VkOp::ExecGetQueryPoolResults => "vk_exec_get_query_pool_results",
 
             VkOp::ComputeExecResetCb => "vk_compute_exec_reset_cb",
             VkOp::ComputeExecBeginCb => "vk_compute_exec_begin_cb",
@@ -393,6 +431,8 @@ impl Decline for VkCall {
             VkOp::PoolsSubmitBatch => "vk_pools_submit_batch",
             VkOp::PoolsCreateStaging => "vk_pools_create_staging",
             VkOp::PoolsAllocStaging => "vk_pools_alloc_staging",
+            VkOp::PoolsCreateGuestGather => "vk_pools_create_guest_gather",
+            VkOp::PoolsBindGuestGather => "vk_pools_bind_guest_gather",
             VkOp::PoolsBindStaging => "vk_pools_bind_staging",
             VkOp::PoolsMapStaging => "vk_pools_map_staging",
             VkOp::PoolsCreateReadback => "vk_pools_create_readback",
@@ -500,6 +540,13 @@ mod tests {
         VkOp::ReadbackSubmit,
         VkOp::ReadbackMap,
         VkOp::ReadbackInvalidate,
+        VkOp::GuestWriteResetCb,
+        VkOp::GuestWriteBeginCb,
+        VkOp::GuestWriteEndCb,
+        VkOp::GuestWriteSubmit,
+        VkOp::GuestScratchCreate,
+        VkOp::GuestScratchAlloc,
+        VkOp::GuestScratchBind,
         VkOp::StorageReadResetCb,
         VkOp::StorageReadBeginCb,
         VkOp::StorageReadEndCb,
@@ -515,6 +562,7 @@ mod tests {
         VkOp::CachesCreateComputePipelines,
         VkOp::ContextPipelineCacheGetData,
         VkOp::ContextCreateQueryPool,
+        VkOp::ContextCreateSemaphore,
         VkOp::ContextGetQueryPoolResults,
         VkOp::DescArenaCreatePool,
         VkOp::DescArenaAllocSets,
@@ -526,6 +574,8 @@ mod tests {
         VkOp::ExecSubmit,
         VkOp::ExecMapReadback,
         VkOp::ExecInvalidateReadback,
+        VkOp::ExecCreateQueryPool,
+        VkOp::ExecGetQueryPoolResults,
         VkOp::ComputeExecResetCb,
         VkOp::ComputeExecBeginCb,
         VkOp::ComputeExecEndCb,
@@ -548,6 +598,8 @@ mod tests {
         VkOp::PoolsSubmitBatch,
         VkOp::PoolsCreateStaging,
         VkOp::PoolsAllocStaging,
+        VkOp::PoolsCreateGuestGather,
+        VkOp::PoolsBindGuestGather,
         VkOp::PoolsBindStaging,
         VkOp::PoolsMapStaging,
         VkOp::PoolsCreateReadback,
@@ -603,6 +655,10 @@ mod tests {
         VkOp::WindowSubmitPresent,
         VkOp::WindowQueuePresent,
         VkOp::WindowDestroyQueueWaitIdle,
+        VkOp::WindowCreateStagingImage,
+        VkOp::WindowAllocateStagingMemory,
+        VkOp::WindowBindStagingMemory,
+        VkOp::WindowMapStagingMemory,
     ];
 
     /// Two calls sharing a slug means a grep of the fail log cannot tell which

@@ -32,6 +32,8 @@
 //! [`super::line`] is invisible on a normal boot and does not satisfy I2.
 
 use super::decline::{Decline, Refusal};
+use std::collections::{HashMap, HashSet};
+use std::sync::{Mutex, OnceLock};
 
 /// A single always-on log line, under construction.
 ///
@@ -149,14 +151,20 @@ impl Emit {
 /// that latch here must then send with [`Emit::fail`], not [`Emit::fail_once`]:
 /// this call consumes the latch.
 pub fn first_sight(reason: &'static str, discriminant: u64) -> bool {
-    use std::collections::HashSet;
-    use std::sync::{Mutex, OnceLock};
-    static SEEN: OnceLock<Mutex<HashSet<(&'static str, u64)>>> = OnceLock::new();
     SEEN.get_or_init(|| Mutex::new(HashSet::new()))
         .lock()
         .map(|mut s| s.insert((reason, discriminant)))
         .unwrap_or(true)
 }
+
+/// Every `(reason, discriminant)` [`first_sight`] has been asked about.
+///
+// A code span below, not a link: `forget_all_latches` is `#[cfg(test)]`, and
+// rustdoc documents no `cfg(test)` item, so a link to it cannot resolve on any
+// arm and reads as rot in the intra-doc pass.
+/// A file-level static rather than a `fn`-local one so `forget_all_latches`
+/// can reach it. Nothing outside this module touches it directly.
+static SEEN: OnceLock<Mutex<HashSet<(&'static str, u64)>>> = OnceLock::new();
 
 /// `true` when `state` differs from the last state recorded for `subject` under
 /// `reason`. Records it either way, and is `true` on the first sighting.
@@ -169,13 +177,54 @@ pub fn first_sight(reason: &'static str, discriminant: u64) -> bool {
 /// path floods instead. A transition report is bounded by the number of real
 /// changes, which is what makes it cheap enough to leave on.
 pub fn state_changed(reason: &'static str, subject: u64, state: u64) -> bool {
-    use std::collections::HashMap;
-    use std::sync::{Mutex, OnceLock};
-    static LAST: OnceLock<Mutex<HashMap<(&'static str, u64), u64>>> = OnceLock::new();
     LAST.get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
         .map(|mut m| m.insert((reason, subject), state) != Some(state))
         .unwrap_or(true)
+}
+
+/// The last state [`state_changed`] recorded for each `(reason, subject)`.
+///
+/// File-level for the same reason as [`SEEN`].
+static LAST: OnceLock<Mutex<HashMap<(&'static str, u64), u64>>> = OnceLock::new();
+
+/// Drop everything [`first_sight`] and [`state_changed`] remember.
+///
+/// # Why this exists
+///
+/// Both registries are process-global and live for the whole boot, which is
+/// exactly right in a device and exactly wrong in a test binary: one process
+/// runs the entire suite, so a latch a test claims is still claimed for every
+/// test that runs after it. The failure is silent in the worst way — the second
+/// test's emitter runs, decides it has already said this, and returns; the test
+/// then asserts on a line that was never printed and reports "expected exactly
+/// one line, got []" while pointing at code that is working.
+///
+/// Two tests collide whenever they compute the same discriminant, which for
+/// keys built from fixture values (a mapping id and a PFN, a task id, a texture
+/// ref) is as easy as picking the same round number. Whether they collide
+/// depends on which runs first, and libtest orders by name — so the suite's
+/// greenness rested on the alphabet. Renaming `runtime::metal_draw` to
+/// `runtime::draw` moved several hundred tests from after `runtime::mapper` to
+/// before it and turned one such pair red.
+///
+/// [`crate::observe::sink::FailCapture::start`] calls this, so any test that
+/// captures the sink starts from an empty latch and is order-independent by
+/// construction. That is the whole cure: it is not possible to write the bug
+/// above in a capturing test, and no fixture needs a value chosen to dodge
+/// another test's.
+///
+/// A test that wants a latch *claimed* — to prove an emitter stays quiet, or
+/// that two namespaces do not suppress each other — claims it after `start()`
+/// rather than before.
+#[cfg(test)]
+pub(crate) fn forget_all_latches() {
+    if let Some(s) = SEEN.get() {
+        s.lock().unwrap_or_else(|p| p.into_inner()).clear();
+    }
+    if let Some(m) = LAST.get() {
+        m.lock().unwrap_or_else(|p| p.into_inner()).clear();
+    }
 }
 
 #[cfg(test)]
@@ -248,6 +297,35 @@ mod tests {
         assert!(
             state_changed("flip_other", 1, 100),
             "a different reason keeps its own state"
+        );
+    }
+
+    /// Arming a capture must hand the test an empty latch, for both registries.
+    ///
+    /// Without this, a capturing test inherits whatever the tests before it
+    /// claimed, and its emitter goes quiet on a key it has never itself seen.
+    /// The symptom is `cap.one(..)` finding no line while the code under test
+    /// is correct, and whether it happens at all depends on libtest's
+    /// name ordering — which is why it stayed hidden until a module rename
+    /// reshuffled the suite. Asserted here rather than in `sink.rs` because the
+    /// registries live here and a future reader adding a third one needs to
+    /// find this test next to them.
+    #[test]
+    fn arming_a_capture_hands_back_an_unclaimed_latch() {
+        assert!(first_sight("capture_reset_reason", 0x99));
+        assert!(!first_sight("capture_reset_reason", 0x99));
+        assert!(state_changed("capture_reset_flip", 1, 7));
+        assert!(!state_changed("capture_reset_flip", 1, 7));
+
+        let _cap = crate::observe::sink::FailCapture::start();
+
+        assert!(
+            first_sight("capture_reset_reason", 0x99),
+            "the capture must not inherit an earlier test's first-sight claim"
+        );
+        assert!(
+            state_changed("capture_reset_flip", 1, 7),
+            "nor an earlier test's recorded state, which suppresses the same way"
         );
     }
 }

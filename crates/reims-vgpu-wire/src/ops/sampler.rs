@@ -37,7 +37,7 @@
 //! written extent is measured rather than eyeballed — see the crate's
 //! `AGENTS.md` on the two-fill capture.
 //!
-//! `reims-vgpu`'s `decode/resource.rs` reads this record with the same offsets
+//! `reims-vgpu`'s `decode/resource` reads this record with the same offsets
 //! and the same bit assignments, arrived at independently from a ported C
 //! header with no derivation recorded. The two agree everywhere, which is worth
 //! stating because it was not known before these fixtures existed.

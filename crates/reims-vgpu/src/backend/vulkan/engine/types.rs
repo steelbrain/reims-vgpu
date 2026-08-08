@@ -11,7 +11,8 @@ pub use crate::runtime::decode::resource::ColorWriteMask;
 /// Named engine failure. Stable prefixes for observe greps (`vk_engine_*`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DrawError {
-    /// Init / ICD / device selection failed (negative-cached).
+    /// Init / ICD / device selection failed. Latched by `ContextOwner`, except
+    /// when it is out of memory — see `ContextOwner::note_init_failure`.
     Init(super::init_decline::InitDecline),
     /// Understood but declined — a capability this device or this engine does
     /// not have. Typed so each distinct check carries its own `reason=` slug;
@@ -34,6 +35,10 @@ pub enum DrawError {
     /// A resident-target readback could not find its content.
     /// See [`super::reason::TargetReadDecline`].
     TargetRead(super::reason::TargetReadDecline),
+    /// A resident's frame could not be copied straight into the guest's pages,
+    /// so the flush owes the CPU route instead.
+    /// See [`super::host_ram::GuestWriteDecline`].
+    GuestPageWrite(super::host_ram::GuestWriteDecline),
     /// A specific Vulkan call that returned an error, typed by *(rail,
     /// operation)*. Former `Vulkan(String)` sites move here so the log names
     /// which call refused.
@@ -48,6 +53,45 @@ pub enum DrawError {
     DeviceLost(super::device_lost::DeviceLostDecline),
 }
 
+impl DrawError {
+    /// Whether this refusal is the device saying it has no memory left, as
+    /// opposed to refusing for any other reason.
+    ///
+    /// The one class worth retrying: it is a statement about how much memory is
+    /// in use at this instant rather than about the request, so giving memory
+    /// back can change the answer. Every other `DrawError` describes something
+    /// about the request or the driver that a second identical attempt would
+    /// meet again.
+    ///
+    /// Both Vulkan out-of-memory results count. `ERROR_OUT_OF_HOST_MEMORY` is
+    /// included because this device's pools hold host allocations too — the
+    /// HOST_VISIBLE staging and readback rings — so the same reclaim is the
+    /// right response to either. `ERROR_DEVICE_LOST` deliberately is not: it has
+    /// its own variant and is answered by recreating the context, and retrying
+    /// an allocation against a lost device would only fail again.
+    ///
+    /// [`Self::Init`] answers here too, and it is the arm with the widest blast
+    /// radius. `vkCreateInstance` and `vkCreateDevice` both refuse with
+    /// `ERROR_OUT_OF_HOST_MEMORY`, and bring-up is latched by
+    /// `ContextOwner::init_error` — so a host that was momentarily short of RAM
+    /// at the first draw would otherwise take the whole Vulkan engine down for
+    /// the life of the process. The bring-up checks this device decides itself
+    /// (no loader, no device, no graphics queue, below the API floor) carry no
+    /// result and are correctly permanent.
+    pub fn out_of_memory(&self) -> bool {
+        let result = match self {
+            Self::VkCall(c) => Some(c.result),
+            Self::Init(d) => d.vk_result(),
+            _ => None,
+        };
+        matches!(
+            result,
+            Some(ash::vk::Result::ERROR_OUT_OF_DEVICE_MEMORY)
+                | Some(ash::vk::Result::ERROR_OUT_OF_HOST_MEMORY)
+        )
+    }
+}
+
 impl std::fmt::Display for DrawError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -60,6 +104,7 @@ impl std::fmt::Display for DrawError {
             Self::ComputeValidation(d) => write!(f, "vk_engine_compute_validation: {d}"),
             Self::ComputeExecution(d) => write!(f, "vk_engine_compute_execution: {d}"),
             Self::TargetRead(d) => write!(f, "vk_engine_target_read: {d}"),
+            Self::GuestPageWrite(d) => write!(f, "vk_engine_guest_page_write: {d}"),
             Self::VkCall(c) => write!(f, "vk_engine_vk: {c}"),
             Self::Slab(d) => write!(f, "vk_engine_slab: {d}"),
             Self::FenceTimeout => write!(f, "vk_engine_fence_timeout"),
@@ -76,6 +121,7 @@ impl crate::observe::Decline for DrawError {
     fn slug(&self) -> &'static str {
         match self {
             Self::TargetRead(d) => d.slug(),
+            Self::GuestPageWrite(d) => d.slug(),
             Self::Unsupported(r) => r.slug(),
             // Delegates like the two typed variants above: the call names itself,
             // so one event has one name whether it is read here or on `VkCall`.
@@ -96,6 +142,7 @@ impl crate::observe::Decline for DrawError {
     fn fields(&self) -> Vec<(&'static str, String)> {
         match self {
             Self::TargetRead(d) => d.fields(),
+            Self::GuestPageWrite(d) => d.fields(),
             Self::Unsupported(r) => r.fields(),
             Self::VkCall(c) => c.fields(),
             Self::Slab(d) => d.fields(),
@@ -118,6 +165,29 @@ impl From<DrawError> for String {
     }
 }
 
+/// What an armed occlusion query counts (Metal `MTLVisibilityResultMode`).
+///
+/// `MTLVisibilityResultModeDisabled` is deliberately **not** a variant. It means
+/// "no query", which is what the `Option` in [`DrawRequest::occlusion_query`]
+/// already says, and a second spelling of the same fact is a state two readers
+/// can disagree about. [`crate::backend::vulkan::translate::raster::visibility_result_mode`]
+/// is where the guest's `0` becomes that `None`.
+///
+/// The two arms are not equally cheap. Vulkan's occlusion query is imprecise by
+/// default — it promises only "non-zero if any sample passed", which is exactly
+/// [`Self::Boolean`] — and an exact count needs `VK_QUERY_CONTROL_PRECISE_BIT`,
+/// which is gated on the `occlusionQueryPrecise` device feature. So a host that
+/// lacks the feature can still serve `Boolean` and must **refuse** `Counting`:
+/// an imprecise query answering a counting guest is a plausible wrong number,
+/// which is the one outcome worse than a named refusal.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum VisibilityResultMode {
+    /// `MTLVisibilityResultModeBoolean` — did anything pass.
+    Boolean,
+    /// `MTLVisibilityResultModeCounting` — how many samples passed.
+    Counting,
+}
+
 /// Face-culling mode (Metal `MTLCullMode`). The macOS 2D compositor issues no
 /// draw that binds a cull mode, so `None` (the default) keeps the whole UI path
 /// byte-identical to the pre-cull engine — the raster state stays `CULL_NONE`.
@@ -129,13 +199,60 @@ pub enum CullMode {
     Back,
 }
 
+/// Triangle rasterization mode (Metal `MTLTriangleFillMode`).
+///
+/// Metal has two: fill the interior, or rasterize the edges as lines. Vulkan
+/// spells the second as `VK_POLYGON_MODE_LINE`, which is gated on the
+/// `fillModeNonSolid` device feature — so unlike [`CullMode`] the non-default
+/// arm can be refused by the host, and `engine::caches` declines the pipeline
+/// rather than filling a wireframe.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Default)]
+pub enum FillMode {
+    #[default]
+    Fill,
+    Lines,
+}
+
+/// What happens to a fragment outside the depth range (Metal
+/// `MTLDepthClipMode`).
+///
+/// `Clip` discards it, which is Metal's default and Vulkan's unconditional
+/// behaviour with `depthClampEnable` clear. `Clamp` pins its depth to the near
+/// or far plane and keeps it — Vulkan's `depthClampEnable`, gated on the
+/// `depthClamp` device feature. A shadow-map or skybox pass that asked for
+/// `Clamp` and got `Clip` loses the geometry nearest the camera, so the absent
+/// feature is a refusal rather than a fallback.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Default)]
+pub enum DepthClipMode {
+    #[default]
+    Clip,
+    Clamp,
+}
+
 /// Per-draw depth-test state (Metal `MTLDepthStencilState` + depth attachment).
-/// When a `DrawRequest` carries `Some`, the engine attaches a transient
-/// D32_SFLOAT depth buffer to the pass and enables the depth test; `None` (the
-/// default) means no depth attachment at all — byte-identical to the pre-depth
-/// engine, which is the whole macOS 2D UI path (it binds no depth-stencil).
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// When a `DrawRequest` carries `Some`, the engine attaches a depth buffer to
+/// the pass and enables the depth test; `None` (the default) means no depth
+/// attachment at all — byte-identical to the pre-depth engine, which is the
+/// whole macOS 2D UI path (it binds no depth-stencil).
+#[derive(Clone, Debug, PartialEq)]
 pub struct DepthState {
+    /// The guest texture this depth attachment names, when the render pass
+    /// descriptor named one.
+    ///
+    /// The depth buffer is **the guest's resource**, not this device's scratch:
+    /// the guest allocated a depth texture and bound it, and
+    /// [`crate::runtime::decode::render::DepthAttachment::texture_ref`] is its
+    /// ref. Carrying it lets the engine resolve one resident per guest texture
+    /// out of the registry, which is what makes the depth allocation live as
+    /// long as the guest's texture does instead of as long as one draw.
+    ///
+    /// `None` is a draw that bound a non-trivial `MTLDepthStencilState` with no
+    /// depth attachment in its pass descriptor. There is no guest resource to
+    /// key on, so the engine falls back to a per-draw transient buffer. The two
+    /// rails are counted apart in the `vk_alloc_sites` census — `depth_resident`
+    /// against `transient_depth` — so the fallback's share is a reading rather
+    /// than an assumption.
+    pub identity: Option<TargetIdentity>,
     /// `false` disables the test (draw always passes) — used only when a bound
     /// depth-stencil is non-trivial in some *other* way (e.g. a write with
     /// compare Always); the plain trivial state never reaches here.
@@ -226,14 +343,30 @@ pub struct DrawRequest {
     /// Metal baseInstance / Vulkan firstInstance. Constant step-function shift uses this.
     pub base_instance: u32,
     pub primitive_topology: PrimitiveTopology,
-    /// The guest's viewport, when it bound one. At most one: Metal's
-    /// `setViewports:` array reaches us as a single decoded viewport per draw,
-    /// and the engine binds exactly `cmd_set_viewport(.., &[one])`. `None`
-    /// takes the full-target default.
-    pub viewport: Option<ViewportResource>,
-    /// The guest's scissor rect, when it bound one, on the same terms as
-    /// [`Self::viewport`].
-    pub scissor: Option<ScissorResource>,
+    /// Every viewport the guest bound, in its order. Empty takes the
+    /// full-target default, and so does any slot past the end of this list when
+    /// [`Self::scissors`] is longer — the two counts are independent in Metal
+    /// and must be one number in a Vulkan pipeline, so the shorter list is
+    /// defaulted per slot rather than the longer one truncated.
+    pub viewports: Vec<ViewportResource>,
+    /// Every scissor rect the guest bound, in its order, on the same terms as
+    /// [`Self::viewports`]. Slot `i` clips viewport `i`.
+    pub scissors: Vec<ScissorResource>,
+    // `viewport_slot_count` below is the one reader that turns the two lists
+    // above into the single number Vulkan wants.
+    /// The occlusion query this draw is armed with, or `None` for a draw the
+    /// guest left unarmed — either because the pass bound no visibility result
+    /// buffer or because the encoder state is `MTLVisibilityResultModeDisabled`.
+    ///
+    /// Where the guest's *offset* into that buffer went is deliberately not
+    /// here. This engine begins and ends one render pass per request and Vulkan
+    /// requires a query to begin and end inside one subpass, so a Metal pass
+    /// whose counter spans several draws becomes several queries whose results
+    /// the caller sums into one offset. The engine answers "how many samples
+    /// did *this* draw pass"; which guest word that accumulates into is the
+    /// caller's question, and splitting it that way is what keeps the sum in
+    /// one place instead of once per backend.
+    pub occlusion_query: Option<VisibilityResultMode>,
     pub indexed: Option<IndexedDrawResource>,
     pub vertex_attributes: Vec<VertexAttributeResource>,
     pub storage_buffers: Vec<StorageBufferResource>,
@@ -248,8 +381,8 @@ pub struct DrawRequest {
     pub target_rgba8: Option<std::sync::Arc<Vec<u8>>>,
     /// Byte order of the CPU seed above, relative to the attachment it seeds.
     ///
-    /// The attachment is BGRA when [`DrawRequest::output_bgra`] and RGBA
-    /// otherwise. When the two disagree the exchange is folded into the copy
+    /// The attachment's order is [`TargetIdentity::is_bgra`] and nothing else.
+    /// When the two disagree the exchange is folded into the copy
     /// into the mapped staging span, which has to happen regardless — so a
     /// caller whose pixels are already in guest scanout order never has to
     /// materialize a converted frame to seed a draw with them.
@@ -267,20 +400,31 @@ pub struct DrawRequest {
     /// Load the live GPU image for [`DrawRequest::target_identity`] instead of
     /// seeding the attachment from the CPU. Requires that resident to exist.
     ///
-    /// This and `target_rgba8` are the whole load action, and they are ordered:
-    /// `load_from_target` wins, else a seed is uploaded, else the attachment
-    /// clears to transparent black. There is no third spelling — the primary
-    /// attachment's `VkClearValue` is `[0, 0, 0, 0]` unconditionally, so a
-    /// "clear to these floats" request could never have been honoured.
+    /// This, `target_rgba8` and [`DrawRequest::target_clear`] are the whole
+    /// load action, and they are ordered: `load_from_target` wins, else a seed
+    /// is uploaded, else the attachment clears to `target_clear`.
     pub load_from_target: bool,
+    /// Clear value for the primary colour attachment, in semantic float
+    /// channels — the same shape [`SecondaryColorTarget::clear`] has carried all
+    /// along, and consulted only when the pass resolves to `loadOp = CLEAR`.
+    ///
+    /// This used to not exist. The primary's `VkClearValue` was `[0, 0, 0, 0]`
+    /// unconditionally, so a `MTLLoadActionClear` with a colour could not be
+    /// expressed — and the runtime met the contract by allocating a
+    /// whole-attachment RGBA8 bitmap of that solid colour on the CPU, handing it
+    /// over as `target_rgba8`, and paying a channel exchange and a staged upload
+    /// to put a constant into every texel. That also forced the pass key to a
+    /// LOAD pass, because a present seed is what `load_seed` means, so a draw
+    /// that asked to discard its attachment loaded it instead.
+    ///
+    /// Floats rather than the unorm8 the seed quantised to, which is what the
+    /// contract says: an sRGB attachment takes its clear in linear space and the
+    /// driver encodes it, where the byte path wrote pre-quantised values past
+    /// the encode entirely.
+    pub target_clear: [f32; 4],
     /// When true, skip full-frame readback (non-Store / ticket path). Content
     /// remains on the GPU under `target_identity` when provided.
     pub skip_readback: bool,
-    /// When true, render into a B8G8R8A8_UNORM resident target so the stored
-    /// bytes are already in guest scanout order — enables zero-copy
-    /// import-present (no CPU RGBA→BGRA swizzle). Honored only with
-    /// `target_identity` (the pooled path stays RGBA).
-    pub output_bgra: bool,
     /// Present-boundary GPU seed: copy this READY resident target's content
     /// into the draw target before the pass (which then runs with LOAD),
     /// eliding the CPU front-frame read + full-frame seed upload. Requires
@@ -300,15 +444,24 @@ pub struct DrawRequest {
     /// Face culling (Metal `MTLCullMode`). `None` (default) draws both faces —
     /// the 2D UI path. `Front`/`Back` reproduce Metal culling; which winding is
     /// "front" is `front_face_ccw`, mapped to a Vulkan winding by
-    /// [`crate::backend::vulkan::engine::caches::metal_front_face`].
+    /// [`crate::backend::vulkan::translate::raster::vk_front_face`].
     pub cull_mode: CullMode,
     /// Metal front-facing winding: `true` = counter-clockwise (`MTLWinding`
     /// CounterClockwise), `false` = the Metal default clockwise. Only affects
     /// rasterization when `cull_mode` culls a face.
     pub front_face_ccw: bool,
+    /// Triangle fill mode (Metal `setTriangleFillMode:`). `Fill` (the default)
+    /// is Metal's own and needs no device feature; `Lines` names
+    /// `VK_POLYGON_MODE_LINE` and is refused where `fillModeNonSolid` is not
+    /// advertised.
+    pub fill_mode: FillMode,
+    /// Depth clip mode (Metal `setDepthClipMode:`). `Clip` (the default) is
+    /// Metal's own; `Clamp` sets `depthClampEnable` and is refused where the
+    /// `depthClamp` feature is not advertised.
+    pub depth_clip: DepthClipMode,
     /// Depth test + transient depth attachment. `None` (default) = no depth
     /// buffer, byte-identical to the pre-depth 2D path. Set only for a draw that
-    /// bound a non-trivial `MTLDepthStencilState` (see `metal_draw`).
+    /// bound a non-trivial `MTLDepthStencilState` (see `runtime::draw`).
     pub depth: Option<DepthState>,
     /// Fragment shader reads its destination pixel (Metal framebuffer fetch:
     /// an `air.render_target` INPUT param, translated as a `SubpassData` image
@@ -319,11 +472,37 @@ pub struct DrawRequest {
     pub color_input: bool,
 }
 
+/// How many viewport/scissor slots one draw rasterizes into.
+///
+/// The single number a Vulkan pipeline declares and `vkCmdSetViewport` /
+/// `vkCmdSetScissor` must then bind exactly. It exists as a function rather
+/// than as two `len()` calls at two sites because those two sites are the
+/// pipeline key and the dynamic bind: if they ever disagree the draw is
+/// invalid, and the disagreement would be a validation-layer message rather
+/// than a compile error.
+///
+/// The maximum, not either count alone. Metal lets a guest set three viewports
+/// and one scissor rect; Vulkan requires `scissorCount == viewportCount`, so
+/// the shorter list is defaulted per slot in the bind rather than the longer
+/// one truncated — truncating would drop a viewport the guest set, which is the
+/// thing this list exists to stop doing.
+///
+/// Never zero: a pipeline with no viewport rasterizes nothing, and an empty
+/// list means "the guest bound none", which takes the full-target default.
+pub fn viewport_slot_count(req: &DrawRequest) -> usize {
+    req.viewports.len().max(req.scissors.len()).max(1)
+}
+
 /// Descriptor binding of the attachment-0 framebuffer-fetch input attachment.
-/// This is the metal2vulkan ColorInput band base (`dest_N` → `96+N`; only
-/// `dest_0` is supported — see `runtime::spirv_bind::COLOR_INPUT_BINDING_BASE`,
-/// kept equal by a unit test there). Both fragment relocations preserve it.
-pub const COLOR_INPUT_BINDING: u32 = 96;
+///
+/// This is the *device's* ColorInput band base, not the translator's: the band
+/// moved up when the texture band was widened to Metal's 128 entries
+/// (`runtime::spirv_bind::widen_sampled_bands` rewrites `dest_N` from the
+/// translator's `96+N` to `192+N`). Only `dest_0` is supported. Kept equal to
+/// `runtime::spirv_bind::COLOR_INPUT_BINDING_BASE` by a unit test there, because
+/// the two constants live on opposite sides of the runtime/engine layering.
+/// Both fragment relocations preserve it.
+pub const COLOR_INPUT_BINDING: u32 = 192;
 
 /// One MRT color attachment beyond the primary (slot 0). Persisted as its own
 /// registry resident so a later draw can sample it.
@@ -375,6 +554,20 @@ pub struct DrawOutput {
     /// is the same rule the typed-decline work applies to a `reason=`: the side
     /// that performed the operation says what it did.
     pub pixels_bgra: bool,
+    /// Samples this draw passed, for a draw that armed an occlusion query.
+    ///
+    /// `None` where no query was armed, and never `Some(0)` standing in for it:
+    /// a draw that armed a query and passed nothing is a real, useful answer —
+    /// it is the whole point of an occlusion test — and folding it into the
+    /// unarmed case would make "fully occluded" indistinguishable from "never
+    /// asked". Same rule as [`Self::pixels_bgra`] above: the side that performed
+    /// the operation says what it did.
+    ///
+    /// For `Boolean` this is still a count rather than a 0/1, because Vulkan
+    /// reports one either way and narrowing it here would throw away
+    /// information the caller may want; the guest sees whatever its own mode
+    /// asked for once the caller writes it back.
+    pub occlusion_samples: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -545,6 +738,24 @@ pub enum VertexStepFunction {
     PerInstance,
 }
 
+impl VertexStepFunction {
+    /// The `MTLVertexStepFunction` ordinal this engine step came from.
+    ///
+    /// The inverse of [`translate::vertex::step_function`], which is where the
+    /// three accepted ordinals are chosen and where the round trip is pinned.
+    /// It exists so a rule stated over the *wire* value — the step/rate pair in
+    /// [`crate::contract::vertex_step`] — can be asked on this side without a
+    /// second copy of the mapping.
+    pub fn mtl_ordinal(self) -> u32 {
+        use crate::contract::vertex_step as step;
+        match self {
+            Self::Constant => step::MTL_VERTEX_STEP_FUNCTION_CONSTANT,
+            Self::PerVertex => step::MTL_VERTEX_STEP_FUNCTION_PER_VERTEX,
+            Self::PerInstance => step::MTL_VERTEX_STEP_FUNCTION_PER_INSTANCE,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct VertexAttributeResource {
     pub location: u32,
@@ -602,11 +813,26 @@ impl BufferContent {
     /// out of guest RAM (same freshness as the CPU staging path's encode-time
     /// read).
     ///
-    /// Every `GuestRuns` bind is a CPU gather now — the GPU has no way to reach
-    /// guest pages — but the hot path does that gather straight into mapped
-    /// staging with `write_staging_from_runs`, which is what avoids the
-    /// intermediate heap `Vec` this builds. Callers here are diagnostics and
-    /// coverage proofs, which want the bytes as a slice.
+    /// **Nothing in the product calls this.** Both call sites are `#[cfg(test)]`,
+    /// and that is the whole story of the method: it materializes a fragmented
+    /// gather into one contiguous `Vec` so a test can compare it against what
+    /// the guest laid out. It is not a rail, and the heap `Vec` it builds is
+    /// not a cost the device pays.
+    ///
+    /// It claimed the opposite until the host-pointer import landed — "every
+    /// `GuestRuns` bind is a CPU gather now, the GPU has no way to reach guest
+    /// pages". That was true when written and is now contradicted by the
+    /// `GuestRuns` doc a few lines above, on this same type: a draw-time buffer
+    /// bind is gathered by `vkCmdCopyBuffer` inside the draw's own command
+    /// buffer and never crosses the CPU. `write_staging_from_runs` does still
+    /// exist, but on the sampled rail, where `stage_phase` records it as zero
+    /// on a host that can import.
+    ///
+    /// Two doc comments on one type disagreeing is the divergence class
+    /// `AGENTS.md` warns about. This one earns a paragraph rather than a
+    /// deletion because the false half was the one a reader met first on
+    /// arriving at the method, and what it told them was that the gather does
+    /// not exist.
     pub fn cpu_bytes(&self) -> std::borrow::Cow<'_, [u8]> {
         match self {
             Self::Bytes(b) => std::borrow::Cow::Borrowed(b.as_slice()),
@@ -960,18 +1186,12 @@ pub struct ComputeOutput {
     /// device→host boundary after dispatch.
     pub buffers: Vec<ComputeBufferOutput>,
     /// Image readbacks in request order (same length as `storage_images`).
-    /// Empty only for a deferred image (see `images_deferred`).
     ///
     /// A third case used to leave this empty too: the dispatch copied into an
     /// imported view of the caller's guest window and `images_direct` said so,
     /// so the caller skipped its own writeback. That window is gone, and with
     /// it the flag — every non-deferred image now comes back through here.
     pub images: Vec<Vec<u8>>,
-    /// Per image (request order): true when the readback was deferred — the
-    /// pinned resident storage image is authoritative, no bytes crossed the
-    /// device→host boundary, and the caller owns flushing it to guest pages
-    /// before any host-side access of that window (`read_resident_storage`).
-    pub images_deferred: Vec<bool>,
 }
 
 #[derive(Debug)]
@@ -1009,14 +1229,6 @@ pub struct ComputeStorageImageResource {
     /// visibly (never seed the zero placeholder) if the resident image is
     /// gone by acquire time.
     pub seed_skipped: bool,
-    /// Deferred writeback: skip the post-dispatch GPU→host readback entirely —
-    /// the resident storage image (requires `residency`) stays the
-    /// authoritative copy, pinned against LRU eviction until the caller
-    /// flushes it to guest pages via [`read_resident_storage`]
-    /// (`crate::backend::vulkan::engine::read_resident_storage`). The matching
-    /// `ComputeOutput::images` entry stays empty with `images_deferred` true.
-    /// Ignored (conservative readback) when `residency` is `None`.
-    pub defer_readback: bool,
 }
 
 /// Bind request for a sampled input whose window content the engine already
@@ -1131,6 +1343,18 @@ pub enum TargetIdentity {
         width: u32,
         height: u32,
         generation: u64,
+        /// Whether this resident carries a stencil aspect beside its depth one.
+        ///
+        /// **Part of the key because it selects the image's format**, and the
+        /// registry's reuse test compares formats: a depth texture drawn into
+        /// with the stencil test on and then off would otherwise retire and
+        /// recreate its resident on every alternation — one allocation per draw
+        /// again, and arrived at by a path that looks like reuse. The two are
+        /// genuinely different images, so they are two residents, each stable.
+        ///
+        /// Always `false` for a colour target, which is what every non-depth
+        /// constructor of this variant passes.
+        stencil: bool,
     },
     /// Guest-VA surface namespace.
     Gva {
@@ -1138,9 +1362,49 @@ pub enum TargetIdentity {
         width: u32,
         height: u32,
         generation: u64,
+        /// Channel order of this target's resident, from the pixel format the
+        /// guest declared for the attachment. See [`TargetIdentity::is_bgra`]
+        /// for why an order has to be part of the key rather than a per-draw
+        /// argument, and why this namespace is the one that carries it: a
+        /// surface is BGRA by its own contract and a pooled target has no
+        /// declaration to follow, but a GVA render target's declaration is the
+        /// whole answer.
+        bgra: bool,
     },
     /// Anonymous / no protocol identity (oracle / one-shot draws).
     Anonymous { slot: u64 },
+}
+
+/// What this device last did with a resident it no longer holds.
+///
+/// A draw that samples a missing resident cannot say, on its own, whether the
+/// pixels were taken from under it or never existed: both read as an absent
+/// registry entry. Those are different defects with different repairs — one is a
+/// reclaim policy that counted an actively-read resident as idle, the other is a
+/// target the guest never rendered into — and telling them apart is the whole
+/// value of recording this.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResidentReclaim {
+    /// The idle drain aged it out. A terminal destroy, not a recycle.
+    IdleDrained,
+    /// An allocation was refused and the reclaim retry gave it back, because it
+    /// was neither pinned nor the only copy of its pixels. A terminal destroy of
+    /// the image, but not of the pixels — the guest's own pages still hold them,
+    /// which is the predicate `ResourcePools::recoverable_residents` selects on.
+    AllocationReclaimed,
+    /// `registry_ensure` replaced it for the same identity at a new geometry,
+    /// generation or format.
+    Recreated,
+}
+
+impl ResidentReclaim {
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::IdleDrained => "idle_drained",
+            Self::AllocationReclaimed => "allocation_reclaimed",
+            Self::Recreated => "recreated",
+        }
+    }
 }
 
 pub type PresentRect = (u32, u32, u32, u32);
@@ -1196,23 +1460,44 @@ impl TargetIdentity {
 
     /// Physical channel order of the resident image behind this identity.
     ///
-    /// A `Surface` resident backs a type-11 guest IOSurface, whose pages are
-    /// BGRA8 — so rendering it as `B8G8R8A8_UNORM` makes a raw image→buffer
-    /// readback land in guest scanout order and deletes the whole-frame CPU
-    /// swizzle the Store used to pay. Every other namespace stays RGBA.
+    /// The rule is one sentence: **a resident holds the bytes its destination
+    /// stores.** Rendering it that way makes a raw image→buffer copy land the
+    /// frame in guest memory unchanged, which is what deletes the whole-frame
+    /// CPU swizzle and the blocking readback in front of it.
+    ///
+    /// Each namespace answers it from what it knows:
+    ///
+    /// * `Surface` backs a type-11 guest IOSurface, whose pages are BGRA8 by
+    ///   that resource's own contract. Always BGRA.
+    /// * `Gva` is a render target the guest declared a pixel format for, and
+    ///   that declaration is the answer — carried in the key, from
+    ///   `pixel_format::store_texel_order`. Two allocations at one address
+    ///   declaring different formats are two keys and therefore two slots,
+    ///   which is what stops them recreating one image between them.
+    /// * `Texture` and `Anonymous` have no destination to follow — nothing
+    ///   copies them out to guest memory byte-for-byte — so they stay RGBA.
     ///
     /// This is a property of the *identity*, not of the draw, and that is the
     /// whole point: `ResourcePools::registry` is keyed by identity and
     /// `registry_ensure` destroys and recreates the image whenever a draw's
     /// requested order disagrees with the slot's. Several runtime paths render
-    /// into one surface identity in a frame — a composite Store, a chain
-    /// intermediate, an MRT primary — and deriving the order from the key they
-    /// already agree on is what makes them agree here too. A per-path
-    /// predicate would let one of them recreate the image every frame, which
-    /// reads as `target_evicts` climbing and costs a fresh allocation plus a
-    /// lost `content_ready` per composite.
+    /// into one identity in a frame — a composite Store, a chain intermediate,
+    /// an MRT primary — and deriving the order from the key they already agree
+    /// on is what makes them agree here too. A per-path predicate would let one
+    /// of them recreate the image every frame, which reads as `target_evicts`
+    /// climbing and costs a fresh allocation plus a lost `content_ready` per
+    /// composite.
+    ///
+    /// Nothing downstream of here assumes either order: the seed upload folds
+    /// an exchange into the staging copy when the seed and the attachment
+    /// disagree, and every readback reports the order it copied. The identity
+    /// is the only place the answer was pinned to a namespace.
     pub fn is_bgra(&self) -> bool {
-        matches!(self, Self::Surface { .. })
+        match self {
+            Self::Surface { .. } => true,
+            Self::Gva { bgra, .. } => *bgra,
+            Self::Texture { .. } | Self::Anonymous { .. } => false,
+        }
     }
 }
 
@@ -1243,11 +1528,18 @@ pub enum SampledSource {
     Target(TargetIdentity),
     /// Zero-copy guest origin: the GPU gathers the texel bytes from imported
     /// guest RAM inside the draw's own command buffer (two-hop: imported
-    /// buffer → pooled scratch → image). No CPU read, no hash, no sampled
-    /// cache — the copy re-executes every draw, so guest CPU writes are
-    /// observed at execute time (at least as fresh as the CPU path's
+    /// buffer → pooled scratch → image). No CPU read and no hash — guest CPU
+    /// writes are observed at execute time (at least as fresh as the CPU path's
     /// encode-time read).
-    GuestRuns(GuestRunSource),
+    ///
+    /// The gather is elided where a retained image already answers to the bind's
+    /// identity, which is what [`crate::runtime::gather_witness::GatherVouch`]
+    /// says is possible. `Fresh` means the identity was minted this bind and no
+    /// retained image can match it, so the copy runs and the result is retained
+    /// for the next bind to hit; carrying it lets the engine report *why* a
+    /// gather happened instead of inferring it from the identity being present,
+    /// which it always is.
+    GuestRuns(GuestRunSource, crate::runtime::gather_witness::GatherVouch),
 }
 
 /// One packed-contiguous guest-RAM span (a direct RAMBlock alias from
@@ -1265,9 +1557,10 @@ pub struct GuestRun {
 /// tight (`total_len == tight_row_bytes * height`); a nonzero value gives
 /// the guest row stride in texels for padded layouts, and the window then
 /// spans `(height-1) * stride_bytes + tight_row_bytes` (the final row needs
-/// only its texels — padding past the last row may not be mapped). The
-/// caller must have verified import coverage via `ensure_host_imports` for
-/// every run.
+/// only its texels — padding past the last row may not be mapped). Every run's
+/// [`GuestRun::host_ptr`]`..+`[`len`](GuestRun::len) must already be a live
+/// `HostOps::map_pages` alias when the source is built: the gather reads it
+/// directly and has nothing to check it against.
 #[derive(Clone, Debug)]
 pub struct GuestRunSource {
     pub runs: std::sync::Arc<Vec<GuestRun>>,
@@ -1275,6 +1568,34 @@ pub struct GuestRunSource {
     /// Guest row stride in texels for the buffer→image copy
     /// (`bufferRowLength`); 0 = tight rows.
     pub row_length_texels: u32,
+    /// The same bytes [`Self::runs`] cover, as bounded references into this
+    /// process's import of the RAMBlock behind them — one per maximal
+    /// GPA-contiguous stretch, ascending, tiling the window exactly.
+    ///
+    /// Separate from [`GuestRun`] because a run is a *host-pointer* span the CPU
+    /// gather walks, while these are offsets the GPU binds or copies from.
+    /// Keeping both lets one source feed either without reconstructing the
+    /// other's view.
+    ///
+    /// # Why a list and not one reference
+    ///
+    /// It was one, and a driven boot found the consequence: the guest backs a
+    /// surface in 16 KiB physically-contiguous granules, so a draw-time buffer
+    /// window is 9-32 stretches 98.5 % of the time and **never** one. A single
+    /// reference could therefore only ever be `None`, and every bind on a host
+    /// whose `vk_caps` said `host_pointer_import=supported` still fell to the
+    /// CPU gather — 371 422 of them against 0 imports. A one-element list is
+    /// still the direct bind, and a longer one is a GPU copy per stretch, which
+    /// is what [`crate::backend::vulkan::engine::exec`] does with it.
+    ///
+    /// `None` is the honest answer for a synthetic source — a test fixture over
+    /// a host `Vec` has no guest pages — and for a host that cannot import at
+    /// all. The CPU gather path needs only [`GuestRun::host_ptr`] and is
+    /// unaffected either way.
+    ///
+    /// `Arc` because a source is cloned per bind and these are shared, immutable
+    /// and never rebuilt.
+    pub pages: Option<std::sync::Arc<Vec<crate::runtime::guest_ram_map::GuestWindowRun>>>,
 }
 
 /// Producer-assigned identity + generation for CPU-sourced sampled content.
@@ -1413,20 +1734,23 @@ mod tests {
         assert!(compute.storage_images.is_empty());
     }
 
-    /// The order is a property of the identity's namespace, and the two halves
-    /// matter for different reasons.
+    /// The order is a property of the identity, and the three answers matter for
+    /// different reasons.
     ///
-    /// `Surface` must be BGRA: every CPU consumer of a type-11 composite Store is
-    /// declared in guest scanout order, so an RGBA resident costs a whole-frame
-    /// exchange per Store.
+    /// `Surface` must be BGRA whatever else is true: every CPU consumer of a
+    /// type-11 composite Store is declared in guest scanout order, so an RGBA
+    /// resident costs a whole-frame exchange per Store.
     ///
-    /// Everything else must *not* be, and that is the half a future edit is
-    /// likely to get wrong. `Gva` residents are read by
-    /// `storage_flush::flush_gva_one` into `write_gva_rgba8`, and `Anonymous`
-    /// covers the pooled path the parity suite uses as its semantic control —
-    /// flipping either silently exchanges R and B on a whole rail.
+    /// `Gva` must answer from its own field and from nothing else. That is the
+    /// half a future edit is likely to get wrong in either direction — pinning
+    /// it to `false` sends every BGRA-declared render target back through the
+    /// blocking readback, and pinning it to `true` silently exchanges R and B
+    /// on every RGBA-declared one.
+    ///
+    /// `Texture` and `Anonymous` must not be, and `Anonymous` in particular is
+    /// the pooled path the parity suite uses as its semantic control.
     #[test]
-    fn only_a_surface_identity_carries_guest_scanout_order() {
+    fn a_targets_order_follows_its_own_namespace() {
         assert!(TargetIdentity::Surface {
             id: 1,
             width: 8,
@@ -1434,22 +1758,52 @@ mod tests {
             generation: 0,
         }
         .is_bgra());
-        for other in [
-            TargetIdentity::Gva {
+        for bgra in [false, true] {
+            let gva = TargetIdentity::Gva {
                 gva: 0x1000,
                 width: 8,
                 height: 8,
                 generation: 0,
-            },
+                bgra,
+            };
+            assert_eq!(gva.is_bgra(), bgra, "{gva:?} must answer from its key");
+        }
+        for other in [
             TargetIdentity::Texture {
                 ref_: 2,
                 width: 8,
                 height: 8,
                 generation: 0,
+                stencil: false,
             },
             TargetIdentity::Anonymous { slot: 0 },
         ] {
             assert!(!other.is_bgra(), "{other:?} must stay semantic RGBA");
         }
+    }
+
+    /// Two allocations at one address declaring different formats are two keys.
+    ///
+    /// The order has to be *in* the key, not beside it. If it were not, both
+    /// would hash to one registry slot whose image can only be built one way,
+    /// and `registry_ensure` answers a requested order that disagrees with the
+    /// slot's by destroying and recreating the image — every frame, for as long
+    /// as both keep drawing.
+    #[test]
+    fn a_gva_targets_order_separates_it_from_the_same_address_in_the_other_order() {
+        let at = |bgra| TargetIdentity::Gva {
+            gva: 0x4000,
+            width: 64,
+            height: 64,
+            generation: 7,
+            bgra,
+        };
+        assert_ne!(at(true), at(false));
+        let mut seen = std::collections::HashSet::new();
+        assert!(seen.insert(at(true)));
+        assert!(
+            seen.insert(at(false)),
+            "the two orders must not collide in the registry's key space"
+        );
     }
 }

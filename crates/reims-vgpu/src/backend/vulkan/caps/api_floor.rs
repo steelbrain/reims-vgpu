@@ -32,8 +32,12 @@
 //!
 //! A capability promoted into 1.3 core must therefore be reached through its
 //! `KHR`/`EXT` form, gated on runtime presence, with the 1.2 path still
-//! implemented and tested. `super::gate` fails the build if a 1.3 core feature
-//! struct or promoted entry point appears in the crate.
+//! implemented and tested. A source scan used to fail when a 1.3-core feature
+//! struct or promoted entry point appeared in the crate; it is gone, so this is
+//! a review obligation now. One trap it could never see anyway, and neither can
+//! a reader skimming for `vk::` names: ash gives the
+//! `synchronization2` family one token for both spellings, so only the entry
+//! points separate correct extension use from 1.3-core use there.
 
 use ash::vk;
 

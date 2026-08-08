@@ -15,7 +15,7 @@ use reims_vgpu::backend::vulkan::engine::{
     SampledSource, SamplerCompareFunction, SamplerResource, ScissorResource, SecondaryColorTarget,
     StencilFaceOps, StencilOp, StencilState, StorageBufferResource, TargetIdentity,
     VertexAttributeFormat, VertexAttributeResource, VertexStepFunction, ViewportResource,
-    MAX_DEVICE_RECREATES,
+    VisibilityResultMode, MAX_DEVICE_RECREATES,
 };
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
@@ -61,9 +61,19 @@ fn translate_words(name: &str, stage: Stage) -> Vec<u32> {
     assert!(path.exists(), "missing reims-vgpu AIR fixture: {name}");
     let spv = metal2vulkan::translate(path.to_str().unwrap(), stage, &tmp)
         .unwrap_or_else(|e| panic!("translate {name}: {e}"));
-    spv.chunks_exact(4)
+    let mut words: Vec<u32> = spv
+        .chunks_exact(4)
         .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect()
+        .collect();
+    // The translator emits its own narrow bands; the device uses wider ones so
+    // the texture band can hold Metal's whole 128-entry argument table. In the
+    // product every translation reaches the engine through
+    // `m2v_cache::CachedShader::new`, which applies this once per shader. This
+    // helper calls the translator directly, so it has to apply it too — without
+    // this the module says binding 96 for a framebuffer-fetch input while the
+    // engine binds the input attachment at 192, and the shader reads zero.
+    reims_vgpu::runtime::spirv_bind::widen_sampled_bands(&mut words);
+    words
 }
 
 fn triangle_spirv() -> (Vec<u32>, Vec<u32>) {
@@ -163,27 +173,242 @@ fn plain_triangle_known_color() {
     }
 }
 
+/// The whole `DrawOutput`, for a case whose answer is not pixels.
+///
+/// [`draw_or_skip`] returns only the normalized colour bytes, which is right
+/// for every case that asserts what was drawn. An occlusion count is a second
+/// thing the same draw produced, so these ask for the record rather than for
+/// the picture.
+fn draw_out_or_skip(label: &str, req: &DrawRequest) -> Option<engine::DrawOutput> {
+    match engine::execute_draw_request(req) {
+        Ok(o) => Some(o),
+        Err(e) => {
+            let s = e.to_string();
+            if skip_if_no_gpu(&s) {
+                eprintln!("SKIP {label}: no GPU ({s})");
+                None
+            } else if s.contains("visibility_counting_unsupported") {
+                // The refusal under test elsewhere. A host without
+                // `occlusionQueryPrecise` is a supported host, not a broken
+                // one, and it cannot answer a counting query — so these two
+                // skip rather than fail, exactly as a host with no ICD does.
+                eprintln!("SKIP {label}: host offers no precise occlusion ({s})");
+                None
+            } else {
+                panic!("{label}: {s}");
+            }
+        }
+    }
+}
+
+/// A counting occlusion query reports the sample count the scissor admits, on
+/// real hardware.
+///
+/// The number is what makes this a proof rather than a smoke test. The fixture
+/// triangle covers the whole clip volume — `assert_fullscreen_fragment_color`
+/// asserts exactly that elsewhere — and this engine rasterizes at one sample
+/// per pixel, so the samples that pass are precisely the scissor's area. Every
+/// plausible wrong implementation lands somewhere else: a query never begun
+/// reads `None` or `Some(0)`, a query that ignored the scissor reads the target
+/// area 1024, and a pool used without `vkCmdResetQueryPool` reads whatever the
+/// driver left there.
+#[test]
+fn an_occlusion_query_counts_the_samples_the_scissor_admits() {
+    let _g = engine_test_session();
+    let (v, f) = triangle_spirv();
+    let mut req = engine_req(&v, &f, 32, 32);
+    req.scissors = vec![ScissorResource {
+        x: 8,
+        y: 8,
+        width: 8,
+        height: 8,
+    }];
+    req.occlusion_query = Some(VisibilityResultMode::Counting);
+    if let Some(out) = draw_out_or_skip("occlusion_counting", &req) {
+        assert_eq!(
+            out.occlusion_samples,
+            Some(8 * 8),
+            "a counting query over an 8x8 scissor passes 64 samples"
+        );
+    }
+}
+
+/// A second query in the same process reports its own scissor's area.
+///
+/// The pair is what pins the reset. One case alone cannot tell a pool that is
+/// reset per draw from one that is never reset and happens to read the right
+/// number once; a second query whose answer differs is only correct if the
+/// first one's result was cleared. It also fixes the count as a function of the
+/// scissor rather than a constant that matched by luck.
+#[test]
+fn a_second_occlusion_query_counts_its_own_scissor() {
+    let _g = engine_test_session();
+    let (v, f) = triangle_spirv();
+    let mut req = engine_req(&v, &f, 32, 32);
+    req.scissors = vec![ScissorResource {
+        x: 0,
+        y: 0,
+        width: 16,
+        height: 16,
+    }];
+    req.occlusion_query = Some(VisibilityResultMode::Counting);
+    if let Some(out) = draw_out_or_skip("occlusion_counting_16", &req) {
+        assert_eq!(out.occlusion_samples, Some(16 * 16));
+    }
+}
+
+/// A draw that arms no query says so, rather than reporting a count of zero.
+///
+/// `None` and `Some(0)` are different answers — the second is a draw that was
+/// asked and passed nothing, which is what an occlusion test exists to find —
+/// and a reader that cannot tell them apart cannot use either.
+#[test]
+fn a_draw_with_no_query_reports_no_count() {
+    let _g = engine_test_session();
+    let (v, f) = triangle_spirv();
+    let req = engine_req(&v, &f, 16, 16);
+    if let Some(out) = draw_out_or_skip("occlusion_unarmed", &req) {
+        assert_eq!(out.occlusion_samples, None);
+    }
+}
+
+/// A boolean query needs no device feature, and still reports what passed.
+///
+/// Vulkan's occlusion query is imprecise unless `VK_QUERY_CONTROL_PRECISE_BIT`
+/// is set, and imprecise is `MTLVisibilityResultModeBoolean` exactly — so this
+/// arm is servable on every host and is asserted as non-zero rather than as an
+/// exact count, which is all an imprecise query promises.
+#[test]
+fn a_boolean_occlusion_query_needs_no_precise_feature() {
+    let _g = engine_test_session();
+    let (v, f) = triangle_spirv();
+    let mut req = engine_req(&v, &f, 32, 32);
+    req.occlusion_query = Some(VisibilityResultMode::Boolean);
+    if let Some(out) = draw_out_or_skip("occlusion_boolean", &req) {
+        let n = out.occlusion_samples.expect("boolean query reports a result");
+        assert!(n > 0, "a fullscreen triangle passes something; got {n}");
+    }
+}
+
 #[test]
 fn viewport_scissor_known_color() {
     let _g = engine_test_session();
     let (v, f) = triangle_spirv();
     let mut req = engine_req(&v, &f, 32, 32);
-    req.viewport = Some(ViewportResource {
+    req.viewports = vec![ViewportResource {
         x: 0.0,
         y: 0.0,
         width: 32.0,
         height: 32.0,
         min_depth: 0.0,
         max_depth: 1.0,
-    });
-    req.scissor = Some(ScissorResource {
+    }];
+    req.scissors = vec![ScissorResource {
         x: 0,
         y: 0,
         width: 32,
         height: 32,
-    });
+    }];
     if let Some(px) = draw_or_skip("viewport_scissor", &req) {
         assert_fullscreen_fragment_color("viewport_scissor", &px, 32, 32);
+    }
+}
+
+/// A draw carrying several viewports builds a pipeline that declares as many,
+/// and binds exactly that many — on real hardware.
+///
+/// This is the pair that has to agree and that nothing else here can catch.
+/// `VkPipelineViewportStateCreateInfo::viewportCount` is **not** dynamic below
+/// `vkCmdSetViewportWithCount`, which is core in 1.3 while this device's floor
+/// is 1.2 — so the count is baked into the pipeline and `vkCmdSetViewport` must
+/// bind that same number. If the pipeline key and the bind ever compute it
+/// differently the draw is invalid, and the symptom is a validation-layer
+/// message or a driver-defined result rather than a compile error. Both sides
+/// call `engine::viewport_slot_count`; this runs them against a GPU.
+///
+/// Slot 0 covers the target and slot 1 is a quarter of it. With no
+/// `ViewportIndex` written by the fixture's vertex shader every primitive goes
+/// to slot 0, so the pixels must be exactly what the single-viewport test above
+/// produces: the second slot changes what the pipeline declares without
+/// changing what this geometry rasterizes.
+///
+/// Where the host advertises no `multiViewport` the engine declines by name and
+/// `draw_or_skip` yields nothing, which is the contract rather than a failure.
+#[test]
+fn two_viewports_build_and_bind_a_two_slot_pipeline() {
+    let _g = engine_test_session();
+    let (v, f) = triangle_spirv();
+    let (w, h) = (32u32, 32u32);
+    let mut req = engine_req(&v, &f, w, h);
+    let vp = |width: f32, height: f32| ViewportResource {
+        x: 0.0,
+        y: 0.0,
+        width,
+        height,
+        min_depth: 0.0,
+        max_depth: 1.0,
+    };
+    req.viewports = vec![vp(w as f32, h as f32), vp((w / 2) as f32, (h / 2) as f32)];
+    req.scissors = vec![
+        ScissorResource {
+            x: 0,
+            y: 0,
+            width: w,
+            height: h,
+        },
+        ScissorResource {
+            x: 0,
+            y: 0,
+            width: w / 2,
+            height: h / 2,
+        },
+    ];
+    assert_eq!(
+        reims_vgpu::backend::vulkan::engine::viewport_slot_count(&req),
+        2,
+        "both lists are two long, so the pipeline must declare two slots"
+    );
+    if let Some(px) = draw_or_skip("two_viewports", &req) {
+        assert_fullscreen_fragment_color("two_viewports", &px, w, h);
+    }
+}
+
+/// The two lists need not be the same length, and the shorter one is defaulted
+/// per slot rather than the longer one truncated.
+///
+/// Metal lets a guest set two viewports and one scissor rect; Vulkan requires
+/// `scissorCount == viewportCount`. Truncating to the shorter list would drop a
+/// viewport the guest set, which is the loss this rail was widened to stop — so
+/// the count is the maximum and the missing scissor falls back to the full
+/// target.
+#[test]
+fn a_shorter_scissor_list_is_defaulted_rather_than_truncating_the_viewports() {
+    let _g = engine_test_session();
+    let (v, f) = triangle_spirv();
+    let (w, h) = (32u32, 32u32);
+    let mut req = engine_req(&v, &f, w, h);
+    let vp = |width: f32, height: f32| ViewportResource {
+        x: 0.0,
+        y: 0.0,
+        width,
+        height,
+        min_depth: 0.0,
+        max_depth: 1.0,
+    };
+    req.viewports = vec![vp(w as f32, h as f32), vp(4.0, 4.0)];
+    req.scissors = vec![ScissorResource {
+        x: 0,
+        y: 0,
+        width: w,
+        height: h,
+    }];
+    assert_eq!(
+        reims_vgpu::backend::vulkan::engine::viewport_slot_count(&req),
+        2,
+        "the longer list decides the count; the single scissor does not truncate it"
+    );
+    if let Some(px) = draw_or_skip("uneven_viewport_scissor", &req) {
+        assert_fullscreen_fragment_color("uneven_viewport_scissor", &px, w, h);
     }
 }
 
@@ -318,6 +543,9 @@ fn depth_test_honored_compare_and_clear_wired() {
         });
         req.samplers.push(SamplerResource::normalized_default(64));
         req.depth = Some(DepthState {
+            // Parity fixtures bind no guest depth texture, so they exercise the
+            // transient rail rather than the registry-resident one.
+            identity: None,
             test_enable: true,
             write_enable: true,
             compare,
@@ -365,7 +593,7 @@ fn depth_test_honored_compare_and_clear_wired() {
 /// Same depth wiring proof as `depth_test_honored_compare_and_clear_wired`, but
 /// through the RESIDENT target path — the product Store path (`target_identity`
 /// with `skip_readback` and `read_target`, which builds its own ad-hoc [color,depth]
-/// framebuffer in the registry_ensure branch (exec.rs) separate from the pooled
+/// framebuffer in the registry_ensure branch (exec) separate from the pooled
 /// path exercised above. Without this, the resident depth branch was reachable
 /// only in production; a dispose-order or framebuffer bug there (the exact class
 /// that caused the MRT/depth device-lost fixes) would surface as a device loss
@@ -417,7 +645,6 @@ fn depth_test_honored_on_resident_target_path() {
         let mut req = engine_req(&vert, &frag, w, h);
         req.vertex_count = 6;
         req.target_identity = Some(identity.clone());
-        req.output_bgra = true;
         req.skip_readback = true;
         req.storage_buffers.push(StorageBufferResource {
             binding: 0,
@@ -443,6 +670,9 @@ fn depth_test_honored_on_resident_target_path() {
         });
         req.samplers.push(SamplerResource::normalized_default(64));
         req.depth = Some(DepthState {
+            // Parity fixtures bind no guest depth texture, so they exercise the
+            // transient rail rather than the registry-resident one.
+            identity: None,
             test_enable: true,
             write_enable: true,
             compare,
@@ -575,6 +805,9 @@ fn stencil_test_honored_compare_ref_and_clear_wired() {
         });
         req.samplers.push(SamplerResource::normalized_default(64));
         req.depth = Some(DepthState {
+            // Parity fixtures bind no guest depth texture, so they exercise the
+            // transient rail rather than the registry-resident one.
+            identity: None,
             test_enable: true,
             write_enable: false,
             compare: SamplerCompareFunction::Always,
@@ -1182,12 +1415,21 @@ fn warm_non_store_zero_readback_seed_create_alloc() {
     assert_fullscreen_fragment_color("read_target", &px, 16, 16);
 }
 
-/// Deferred render Stores pin their resident target: the registry LRU sweep
-/// must skip a pinned slot even when the cap forces evictions, and the pin
-/// must refuse absent identities (the runtime then falls back to the
-/// synchronous Store).
+/// The resident registry retains every admitted target past the slot count that
+/// used to bound it, and a pin still refuses an absent identity.
+///
+/// This is a device-level regression test for the property that retired
+/// `REGISTRY_CAP`: the population is bounded by the allocator refusing, not by a
+/// count, so admitting more targets than the old cap allowed must destroy
+/// nothing. It used to assert the opposite half — that the LRU sweep evicted the
+/// oldest *unpinned* target while rotating over the pinned one — and the pinned
+/// half of that is preserved here, now as one case of "nothing is evicted"
+/// rather than as the exception to a sweep.
+///
+/// Fails against the retired walk: with a cap of 320 the `unpinned` target is
+/// the oldest non-pinned entry and is swept before the fillers run out.
 #[test]
-fn pinned_resident_target_survives_registry_cap_sweep() {
+fn every_admitted_resident_survives_past_the_retired_slot_cap() {
     let _g = engine_test_session();
     let (v, f) = triangle_spirv();
 
@@ -1230,15 +1472,14 @@ fn pinned_resident_target_survives_registry_cap_sweep() {
     make2.target_identity = Some(unpinned.clone());
     engine::execute_draw_request(&make2).expect("unpinned target draw");
 
-    // Blow past the non-pinned REGISTRY_CAP: the LRU sweep must evict the
-    // unpinned early target (the oldest non-pinned) but rotate over the pinned
-    // one. Derive the count from the LIVE cap rather than hard-coding it — this
-    // test previously fixed 70 fillers against a cap that was later retuned
-    // 64 -> 320, so no eviction ever fired and the "unpinned was evicted" assert
-    // below could not hold. `+16` clears the cap with margin so the oldest
-    // non-pinned is definitely swept.
-    let cap = engine::registry_cap() as u32;
-    for i in 0..(cap + 16) {
+    // Admit more distinct 16x16 targets than the retired count permitted. 320 was
+    // the last value that count held, and the walk ran on *admission*, so 336
+    // clears it with the margin that used to guarantee the oldest non-pinned
+    // entry was swept. At this geometry the whole set is a few MiB, so no real
+    // allocation failure is in play and the only thing that could remove one of
+    // these is a count.
+    const FILLERS: u32 = 336;
+    for i in 0..FILLERS {
         let mut filler = engine_req(&v, &f, 16, 16);
         filler.target_identity = Some(TargetIdentity::Surface {
             id: 0x700 + i,
@@ -1250,23 +1491,34 @@ fn pinned_resident_target_survives_registry_cap_sweep() {
     }
     assert!(
         engine::resident_content_ready(&pinned),
-        "pinned target evicted by the cap sweep"
+        "a pinned resident must survive any admission"
     );
     assert!(
-        !engine::resident_content_ready(&unpinned),
-        "unpinned early target should have been LRU-evicted"
+        engine::resident_content_ready(&unpinned),
+        "the oldest unpinned resident is still here: nothing evicts on a count"
     );
+    // Every filler is still resident too — the assert above alone would pass a
+    // walk that spared only the two named identities.
+    for i in 0..FILLERS {
+        let filler = TargetIdentity::Surface {
+            id: 0x700 + i,
+            width: 16,
+            height: 16,
+            generation: 1,
+        };
+        assert!(
+            engine::resident_content_ready(&filler),
+            "filler {i} was destroyed by something other than an allocation failure"
+        );
+    }
 
-    // Unpin → a further sweep may evict it (no assert on timing; just verify
-    // the unpin API keeps the slot registered right now).
     engine::unpin_resident_target(&pinned);
     assert!(engine::resident_content_ready(&pinned));
 }
 
 /// A `output_bgra` + `skip_readback` resident draw leaves content that
-/// [`engine::read_target`] can read back twice with the same answer — the
-/// property the deleted dmabuf-export case used as its precondition, kept
-/// because nothing else in this suite reads the same resident twice.
+/// [`engine::read_target`] can read back twice with the same answer — asserted
+/// here because nothing else in this suite reads the same resident twice.
 /// A `TargetIdentity::Surface` resident renders and reads back in guest scanout
 /// order **without the caller asking**, and says so; a pooled target does not.
 ///
@@ -1368,7 +1620,6 @@ fn a_bgra_resident_draw_reads_back_identically_twice() {
     };
     let mut req = engine_req(&v, &f, w, h);
     req.target_identity = Some(identity.clone());
-    req.output_bgra = true;
     req.skip_readback = true;
     match engine::execute_draw_request(&req) {
         Ok(_) => {}
@@ -1487,7 +1738,6 @@ fn sampled_rgba_upload_to_bgra_target_preserves_semantic_channels() {
     let mut req = engine_req(&vert, &frag, w, h);
     req.vertex_count = 6;
     req.target_identity = Some(identity.clone());
-    req.output_bgra = true;
     req.skip_readback = true;
 
     let positions: [[f32; 4]; 6] = [
@@ -1688,7 +1938,7 @@ fn reflected_static_sampler_descriptor_samples_texture() {
         swizzle: Default::default(),
     });
     req.samplers.push(
-        reims_vgpu::runtime::metal_draw::reflected_static_sampler_resource(
+        reims_vgpu::runtime::draw::reflected_static_sampler_resource(
             "fragment",
             descriptor.binding
                 + reims_vgpu::runtime::spirv_bind::FRAG_SAMPLED_RESOURCE_BINDING_OFFSET,
@@ -1760,7 +2010,6 @@ fn sampled_bgra8_bytes_upload_matches_rgba8_semantic_color() {
         let mut req = engine_req(&vert, &frag, w, h);
         req.vertex_count = 6;
         req.target_identity = Some(identity.clone());
-        req.output_bgra = true;
         req.skip_readback = true;
         req.storage_buffers.push(StorageBufferResource {
             binding: 0,
@@ -1881,7 +2130,6 @@ fn a_view_swizzle_is_performed_by_the_image_view_not_the_cpu() {
         let mut req = engine_req(&vert, &frag, w, h);
         req.vertex_count = 6;
         req.target_identity = Some(identity.clone());
-        req.output_bgra = true;
         req.skip_readback = true;
         req.storage_buffers.push(StorageBufferResource {
             binding: 0,
@@ -1963,15 +2211,14 @@ fn partial_draw_preserves_rgba_seed_on_bgra_target() {
     let seed_rgba = [17u8, 91, 203, 255];
     let mut req = engine_req(&vert, &frag, w, h);
     req.target_identity = Some(identity.clone());
-    req.output_bgra = true;
     req.skip_readback = true;
     req.target_rgba8 = Some(std::sync::Arc::new(seed_rgba.repeat((w * h) as usize)));
-    req.scissor = Some(ScissorResource {
+    req.scissors = vec![ScissorResource {
         x: 0,
         y: 0,
         width: 1,
         height: 1,
-    });
+    }];
 
     match engine::execute_draw_request(&req) {
         Ok(_) => {}
@@ -2098,12 +2345,12 @@ fn a_bgra_ordered_seed_lands_the_same_pixels_as_the_rgba_ordered_one() {
         req.skip_readback = true;
         req.target_rgba8 = Some(std::sync::Arc::new(bytes.repeat((w * h) as usize)));
         req.target_seed_order = order;
-        req.scissor = Some(ScissorResource {
+        req.scissors = vec![ScissorResource {
             x: 0,
             y: 0,
             width: 1,
             height: 1,
-        });
+        }];
         match engine::execute_draw_request(&req) {
             Ok(_) => {}
             Err(e) if skip_if_no_gpu(&e.to_string()) => {
@@ -2179,8 +2426,7 @@ fn premult_one_omsa_gpu_blend_matches_software_oracle() {
     let over_black = engine::execute_draw_request(&black)
         .expect("over black")
         .pixels;
-    let (soft, _) =
-        reims_vgpu::runtime::metal_draw::load_composite_premult_one_omsa(&over_black, &seed);
+    let (soft, _) = reims_vgpu::runtime::draw::load_composite_premult_one_omsa(&over_black, &seed);
     // Allow ±1 LSB for unorm rounding differences between GPU blend and CPU composite.
     assert_eq!(gpu_px.len(), soft.len());
     for (i, (g, s)) in gpu_px.iter().zip(soft.iter()).enumerate() {
@@ -2196,7 +2442,6 @@ fn premult_one_omsa_gpu_blend_matches_software_oracle() {
 /// progressive multi-pass content stays on the resident image. Engine Clear
 /// (the default when neither `load_from_target` nor `target_rgba8` is set)
 /// would black the target.
-/// Product choice is also locked by `type11_load_ready_uses_resident_not_clear`.
 #[test]
 fn skip_readback_store_then_load_from_target_preserves_content() {
     let _g = engine_test_session();
@@ -2356,7 +2601,7 @@ fn load_from_target_after_a_readback_matches_the_cpu_seed_chain() {
     // corner, read back, re-upload those pixels as the next pass's seed.
     let mut d1 = engine_req(&v, &f, w, h);
     d1.target_rgba8 = Some(std::sync::Arc::new(prior.clone()));
-    d1.scissor = Some(dot(0, 0));
+    d1.scissors = vec![dot(0, 0)];
     let p1 = match engine::execute_draw_request(&d1) {
         Ok(o) => semantic_rgba(&o),
         Err(e) if skip_if_no_gpu(&e.to_string()) => {
@@ -2367,7 +2612,7 @@ fn load_from_target_after_a_readback_matches_the_cpu_seed_chain() {
     };
     let mut d2_cpu = engine_req(&v, &f, w, h);
     d2_cpu.target_rgba8 = Some(std::sync::Arc::new(p1.clone()));
-    d2_cpu.scissor = Some(dot(8, 8));
+    d2_cpu.scissors = vec![dot(8, 8)];
     let p2_cpu =
         semantic_rgba(&engine::execute_draw_request(&d2_cpu).expect("cpu seed after readback"));
 
@@ -2392,7 +2637,7 @@ fn load_from_target_after_a_readback_matches_the_cpu_seed_chain() {
     let mut g1 = engine_req(&v, &f, w, h);
     g1.target_identity = Some(identity.clone());
     g1.target_rgba8 = Some(std::sync::Arc::new(prior));
-    g1.scissor = Some(dot(0, 0));
+    g1.scissors = vec![dot(0, 0)];
     g1.skip_readback = false;
     let p1_resident =
         semantic_rgba(&engine::execute_draw_request(&g1).expect("resident store with readback"));
@@ -2406,7 +2651,7 @@ fn load_from_target_after_a_readback_matches_the_cpu_seed_chain() {
     g2.target_identity = Some(identity.clone());
     g2.load_from_target = true;
     g2.target_rgba8 = None;
-    g2.scissor = Some(dot(8, 8));
+    g2.scissors = vec![dot(8, 8)];
     g2.skip_readback = false;
     let p2_gpu = semantic_rgba(
         &engine::execute_draw_request(&g2).expect("load from a target that was read back"),
@@ -2453,6 +2698,7 @@ fn gva_chain_resident_single_readback_matches_cpu_seed_chain() {
         width: 16,
         height: 16,
         generation: 0,
+        bgra: false,
     };
     engine::reset_draw_counters();
     let before = engine::counter_snapshot();
@@ -2514,6 +2760,7 @@ fn gva_deferred_store_flush_read_matches_sync_store() {
         width: 16,
         height: 16,
         generation: 0,
+        bgra: false,
     };
     engine::reset_draw_counters();
     let before = engine::counter_snapshot();
@@ -2604,13 +2851,16 @@ fn device_loss_named_and_recreate_bounded() {
         snap.device_lost
     );
 
-    // The cap is a permanent give-up: the engine this test leaves behind refuses
-    // every draw. Suite independence therefore rests entirely on
-    // `test_reset_engine` clearing the budget, which is what
-    // [`engine_test_session`] does for every other case. Pin that here, at the
-    // one site that manufactures the exhausted state — if the reset ever stops
-    // clearing it, the whole suite goes order-dependent, and it fails as a
-    // single unrelated case rather than as anything named "reset".
+    // The cap bounds a *storm* — losses with no guest work between them — and a
+    // draw that completes clears it (`ContextOwner::note_work_completed`), so
+    // the count this loop leaves behind depends on whether its last iteration
+    // drew successfully. Either way the engine can be left at the cap, refusing
+    // every draw, and suite independence rests on `test_reset_engine` clearing
+    // the budget, which is what [`engine_test_session`] does for every other
+    // case. Pin that here, at the one site that manufactures the exhausted state
+    // — if the reset ever stops clearing it, the whole suite goes
+    // order-dependent, and it fails as a single unrelated case rather than as
+    // anything named "reset".
     engine::test_reset_engine();
     assert_eq!(
         engine::device_recreate_count(),
@@ -2878,6 +3128,7 @@ fn mrt_rg16float_secondary_builds_and_renders() {
         width: 32,
         height: 32,
         generation: 0,
+        bgra: false,
     };
     let mut mrt = engine_req(&v, &f, 32, 32);
     mrt.target_identity = Some(primary.clone());
@@ -2937,6 +3188,7 @@ fn single_rt_draw_unaffected_by_mrt_path() {
         width: 16,
         height: 16,
         generation: 0,
+        bgra: false,
     };
     assert!(!engine::resident_content_ready(&never));
 }

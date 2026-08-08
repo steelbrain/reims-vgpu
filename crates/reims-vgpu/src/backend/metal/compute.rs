@@ -1,13 +1,14 @@
 //! Compute encode path: PSO cache, binds, dispatch core, reflection.
 
+use crate::backend::blob::BlobKey;
+use crate::backend::hash::hash_bytes;
 use crate::backend::metal::abi::*;
 use crate::backend::metal::cache::{
-    compute_pso_insert, compute_pso_lookup, reflect_insert, reflect_lookup,
+    compute_pso_insert, compute_pso_lookup, reflect_insert, reflect_lookup, ComputePsoKey,
 };
 use crate::backend::metal::constants::*;
 use crate::backend::metal::format::storage_image_format;
 use crate::backend::metal::function::load_only_function;
-use crate::backend::metal::hash::hash_bytes;
 use crate::backend::metal::raw_metal::{
     command_buffer_error_description, mtl_size, new_compute_pso_with_function_reflection,
     new_texture_view_swizzled, reflection_bindings, set_buffer_with_attribute_stride,
@@ -21,9 +22,10 @@ use crate::backend::metal::stage_input::{
     has_indexed_layout, layout_for_buffer, make_compute_stage_input_descriptor,
 };
 use crate::backend::metal::util::{
-    bytes_of, clear_err, f32_from_bits, image_len, sampler_index, set_err, texture_index,
-    valid_buffer_binding, ErrOut, Status,
+    bytes_of, clear_err, sampler_index, set_err, texture_index, valid_buffer_binding,
+    valid_threadgroup_memory_index, ErrOut, Status,
 };
+use crate::contract::extent::{tight_image_bytes, Extent3};
 use metal::*;
 use std::ptr;
 
@@ -67,20 +69,16 @@ pub fn new_compute_pipeline_state(
     stage_input: Option<&ReimsVgpuComputeStageInputDescriptor>,
     err: ErrOut<'_>,
 ) -> Result<ComputePipelineState, Status> {
-    let mtlb_hash = hash_bytes(mtlb);
-    let stage_hash = hash_compute_stage_input(stage_input);
-    let has_stage = if stage_input.is_some() { 1u8 } else { 0u8 };
-    if let Some(hit) = compute_pso_lookup(mtlb_hash, mtlb.len(), stage_hash, has_stage) {
+    let key = ComputePsoKey {
+        mtlb: BlobKey::new(mtlb),
+        stage_hash: hash_compute_stage_input(stage_input),
+        stage_input,
+    };
+    if let Some(hit) = compute_pso_lookup(&key) {
         return Ok(hit);
     }
     let pso = new_compute_pipeline_state_uncached(device, function, stage_input, err)?;
-    Ok(compute_pso_insert(
-        mtlb_hash,
-        mtlb.len(),
-        stage_hash,
-        has_stage,
-        pso,
-    ))
+    Ok(compute_pso_insert(&key, pso))
 }
 
 fn compute_buffer_backing(buffer: &ReimsVgpuBuffer) -> Result<(*mut u8, usize, usize), Status> {
@@ -269,7 +267,8 @@ fn bind_compute_buffers(
 
     if let Some(indexed_stage_input) = stage_input.filter(|_| needs_index) {
         let idx = indexed_stage_input.index_buffer_index as usize;
-        if idx >= REIMS_VGPU_METAL_MAX_BUFFERS || !seen[idx] {
+        // `valid_buffer_binding` first: it is what keeps `seen[idx]` in range.
+        if !valid_buffer_binding(indexed_stage_input.index_buffer_index) || !seen[idx] {
             set_err(
                 err,
                 format!("missing compute stageInputDescriptor index buffer {idx}"),
@@ -310,7 +309,7 @@ pub(crate) fn bind_storage_images(
                 .field("binding", image.binding)
                 .field("format", image.format);
         };
-        let Some(expected_len) = image_len(image.width, image.height, bpp) else {
+        let Some(expected_len) = tight_image_bytes(image.width, image.height, bpp) else {
             set_err(
                 err,
                 format!("invalid storage image binding {}", image.binding),
@@ -356,7 +355,14 @@ pub(crate) fn bind_storage_images(
         descriptor.set_height(image.height as u64);
         descriptor.set_storage_mode(MTLStorageMode::Shared);
         descriptor.set_usage(MTLTextureUsage::ShaderRead | MTLTextureUsage::ShaderWrite);
-        let texture = device.new_texture(&descriptor);
+        let Some(texture) = crate::backend::metal::raw_metal::new_texture(device, &descriptor)
+        else {
+            set_err(err, "failed to allocate storage image texture");
+            return Status::execute("metal_compute_storage_texture_alloc_failed")
+                .field("binding", image.binding)
+                .field("width", image.width)
+                .field("height", image.height);
+        };
         let region = MTLRegion::new_2d(0, 0, image.width as u64, image.height as u64);
         texture.replace_region(
             region,
@@ -399,7 +405,7 @@ pub(crate) fn bind_compute_sampled_images(
                 .field("binding", image.binding)
                 .field("format", image.format);
         };
-        let Some(expected_len) = image_len(image.width, image.height, bpp) else {
+        let Some(expected_len) = tight_image_bytes(image.width, image.height, bpp) else {
             set_err(
                 err,
                 format!("invalid sampled compute image binding {}", image.binding),
@@ -465,7 +471,14 @@ pub(crate) fn bind_compute_sampled_images(
             usage |= MTLTextureUsage::PixelFormatView;
         }
         descriptor.set_usage(usage);
-        let texture = device.new_texture(&descriptor);
+        let Some(texture) = crate::backend::metal::raw_metal::new_texture(device, &descriptor)
+        else {
+            set_err(err, "failed to allocate compute sampled image texture");
+            return Status::execute("metal_compute_sampled_texture_alloc_failed")
+                .field("binding", image.binding)
+                .field("width", image.width)
+                .field("height", image.height);
+        };
         let region = MTLRegion::new_2d(0, 0, image.width as u64, image.height as u64);
         texture.replace_region(
             region,
@@ -543,7 +556,7 @@ pub(crate) fn bind_compute_samplers(
             encoder.set_sampler_state_with_lod(
                 index as u64,
                 Some(&sampler),
-                f32_from_bits(s.clamp_lod_min_bits)..f32_from_bits(s.clamp_lod_max_bits),
+                f32::from_bits(s.clamp_lod_min_bits)..f32::from_bits(s.clamp_lod_max_bits),
             );
         } else {
             encoder.set_sampler_state(index as u64, Some(&sampler));
@@ -552,10 +565,27 @@ pub(crate) fn bind_compute_samplers(
     Status::OK
 }
 
-fn bind_threadgroup_memory(encoder: &ComputeCommandEncoderRef, tg: &[ReimsVgpuThreadgroupMemory]) {
+/// Bind the dispatch's threadgroup-memory allocations.
+///
+/// The one bind path where an out-of-range index is not a wrong result but a
+/// **process abort**: Metal answers an index at or past
+/// `maxComputeLocalMemorySizes` by throwing, and there is no status to catch.
+/// So this refuses first, by name, and the dispatch is declined rather than the
+/// VM taken down — which is also what the accumulator no longer does, having
+/// carried an unjustified 16 for the same job.
+fn bind_threadgroup_memory(
+    encoder: &ComputeCommandEncoderRef,
+    tg: &[ReimsVgpuThreadgroupMemory],
+) -> Status {
     for entry in tg {
+        if !valid_threadgroup_memory_index(entry.index) {
+            return Status::args("metal_compute_threadgroup_memory_index_over_table")
+                .field("index", entry.index)
+                .field("limit", REIMS_VGPU_METAL_MAX_THREADGROUP_MEMORY as u32);
+        }
         encoder.set_threadgroup_memory_length(entry.index as u64, entry.length);
     }
+    Status::OK
 }
 
 fn bind_stage_in_region(
@@ -580,23 +610,34 @@ fn bind_stage_in_region(
     set_stage_in_region(encoder, metal_region);
 }
 
+/// `Status` rather than `()` because the allocation below can refuse, and a
+/// dispatch whose indirect stage-in region never reached the encoder reads its
+/// threads from whatever the encoder held before.
 fn bind_stage_in_region_indirect(
     device: &Device,
     encoder: &ComputeCommandEncoderRef,
     retained: &mut Vec<Buffer>,
     arguments: Option<&ReimsVgpuComputeStageInRegionIndirectArguments>,
-) {
+) -> Status {
     let Some(arguments) = arguments else {
-        return;
+        return Status::OK;
     };
     let bytes = bytes_of(arguments);
-    let indirect = device.new_buffer_with_data(
-        bytes.as_ptr() as *const _,
-        bytes.len() as u64,
-        MTLResourceOptions::StorageModeShared,
-    );
+    let indirect = unsafe {
+        crate::backend::metal::raw_metal::new_buffer_with_data(
+            device,
+            bytes.as_ptr() as *const _,
+            bytes.len() as u64,
+            MTLResourceOptions::StorageModeShared,
+        )
+    };
+    let Some(indirect) = indirect else {
+        return Status::execute("metal_compute_stage_in_indirect_buffer_alloc_failed")
+            .field("len", bytes.len());
+    };
     retained.push(indirect.clone());
     set_stage_in_region_indirect(encoder, &indirect, 0);
+    Status::OK
 }
 
 fn mtl_dispatch_type(raw: u32) -> Option<MTLDispatchType> {
@@ -638,15 +679,27 @@ pub fn compute_encode_on_encoder(
     stage_in_region_indirect: Option<&ReimsVgpuComputeStageInRegionIndirectArguments>,
     imageblock_dimensions: Option<&ReimsVgpuComputeImageblockDimensions>,
     stage_input: Option<&ReimsVgpuComputeStageInputDescriptor>,
-    dispatch_kind: u32,
-    grid_x: u32,
-    grid_y: u32,
-    grid_z: u32,
-    tg_x: u32,
-    tg_y: u32,
-    tg_z: u32,
+    // `dispatchThreads:` when true, `dispatchThreadgroups:` when false.
+    //
+    // A `bool` rather than the `REIMS_VGPU_COMPUTE_DISPATCH_KIND_*` ordinal the
+    // archived C header spells, because the only producer already holds a
+    // `bool` — `resolve_dispatch_dims_reported` returns one — and widening it
+    // to a `{0, 1}` ordinal to cross this call put it next to `dispatch_type`,
+    // which is also `{0, 1}`. Transposing that pair compiled, passed both
+    // validators, and changed whether the grid counts threads or threadgroups
+    // *and* whether Metal may overlap the segment. Two types cannot be
+    // transposed, so the `match` that used to guard the ordinal is gone with
+    // it: the state it refused is no longer representable.
+    dispatch_threads: bool,
+    grid: Extent3,
+    threadgroup: Extent3,
     err: ErrOut<'_>,
 ) -> Result<ComputeEncodeRetain, Status> {
+    // Unpacked once, here, so the body below keeps reading the six names it
+    // always did. The pair crosses the call as two extents because that is
+    // where a transposition stops being a compile error.
+    let (grid_x, grid_y, grid_z) = (grid.x, grid.y, grid.z);
+    let (tg_x, tg_y, tg_z) = (threadgroup.x, threadgroup.y, threadgroup.z);
     if grid_x == 0 {
         set_err(
             err,
@@ -689,14 +742,6 @@ pub fn compute_encode_on_encoder(
         );
         return Err(Status::args("metal_compute_threadgroup_z_zero"));
     }
-    let dispatch_threads = match dispatch_kind {
-        REIMS_VGPU_COMPUTE_DISPATCH_KIND_THREADS => true,
-        REIMS_VGPU_COMPUTE_DISPATCH_KIND_THREADGROUPS => false,
-        other => {
-            set_err(err, format!("invalid compute dispatch kind {other}"));
-            return Err(Status::args("metal_compute_dispatch_kind_invalid").field("kind", other));
-        }
-    };
 
     let function = load_only_function(device, mtlb, "compute", err)?;
     let pso = new_compute_pipeline_state(device, &function, mtlb, stage_input, err)?;
@@ -736,15 +781,25 @@ pub fn compute_encode_on_encoder(
     if !rc.is_ok() {
         return Err(rc);
     }
-    bind_threadgroup_memory(encoder, threadgroup_memory);
+    let rc = bind_threadgroup_memory(encoder, threadgroup_memory);
+    if !rc.is_ok() {
+        set_err(
+            err,
+            "threadgroup memory index past the Metal argument table",
+        );
+        return Err(rc);
+    }
     bind_stage_in_region(encoder, stage_in_region);
     let mut retained_indirect = Vec::new();
-    bind_stage_in_region_indirect(
+    let rc = bind_stage_in_region_indirect(
         device,
         encoder,
         &mut retained_indirect,
         stage_in_region_indirect,
     );
+    if !rc.is_ok() {
+        return Err(rc);
+    }
     if let Some(dims) = imageblock_dimensions {
         set_imageblock_width_height(encoder, dims.width as u64, dims.height as u64);
     }
@@ -851,14 +906,12 @@ pub fn compute_core(
     stage_in_region_indirect: Option<&ReimsVgpuComputeStageInRegionIndirectArguments>,
     imageblock_dimensions: Option<&ReimsVgpuComputeImageblockDimensions>,
     stage_input: Option<&ReimsVgpuComputeStageInputDescriptor>,
-    dispatch_kind: u32,
+    // A `bool`, and forwarded as one — see `compute_encode_on_encoder`, which
+    // consumes it. It sits beside `dispatch_type` here, which is why.
+    dispatch_threads: bool,
     dispatch_type: u32,
-    grid_x: u32,
-    grid_y: u32,
-    grid_z: u32,
-    tg_x: u32,
-    tg_y: u32,
-    tg_z: u32,
+    grid: Extent3,
+    threadgroup: Extent3,
     err: ErrOut<'_>,
 ) -> Status {
     let Some(metal_dispatch_type) = mtl_dispatch_type(dispatch_type) else {
@@ -876,8 +929,18 @@ pub fn compute_core(
     };
 
     let queue = thread_queue(device);
-    let command_buffer = queue.new_command_buffer().to_owned();
-    let encoder = command_buffer.compute_command_encoder_with_dispatch_type(metal_dispatch_type);
+    let Some(command_buffer) = crate::backend::metal::raw_metal::new_command_buffer(&queue) else {
+        return Status::execute("metal_compute_command_buffer_unavailable");
+    };
+    let command_buffer = command_buffer.to_owned();
+    let Some(encoder) =
+        crate::backend::metal::raw_metal::new_compute_command_encoder_with_dispatch_type(
+            &command_buffer,
+            metal_dispatch_type,
+        )
+    else {
+        return Status::execute("metal_compute_encoder_unavailable");
+    };
 
     let retain = match compute_encode_on_encoder(
         device,
@@ -892,13 +955,9 @@ pub fn compute_core(
         stage_in_region_indirect,
         imageblock_dimensions,
         stage_input,
-        dispatch_kind,
-        grid_x,
-        grid_y,
-        grid_z,
-        tg_x,
-        tg_y,
-        tg_z,
+        dispatch_threads,
+        grid,
+        threadgroup,
         err,
     ) {
         Ok(r) => r,
@@ -923,75 +982,67 @@ pub fn compute_core(
     rc
 }
 
+/// The texture bindings a compute kernel's own reflection declares, as a list
+/// this function owns.
+///
+/// # Why the caller does not size this
+///
+/// This used to take `(*mut usage, usage_cap, *out_count)` and refuse with
+/// `..._capacity_exceeded` once the reflection named more bindings than the
+/// caller's buffer held. Both callers sized that buffer with a bare `32`, so a
+/// kernel declaring a 33rd texture had its whole dispatch refused — while
+/// [`REIMS_VGPU_METAL_MAX_TEXTURES`] is 128 and
+/// [`crate::runtime::draw::MAX_TEXTURE_BIND_SLOTS`] tells the rest of the device
+/// that 128 is bindable. That is a cap the guest cannot see, below the one it is
+/// told about, and losing a dispatch to it is not a limit any GPU has.
+///
+/// Nothing here crosses the C boundary — no shim names this function or
+/// `ReimsVgpuComputeTextureUsage` — so the out-pointer shape bought nothing, and
+/// the entry is already built as a `Vec` for [`reflect_insert`] regardless.
+/// Returning it leaves exactly one bound on this path: Metal's own 128-entry
+/// texture table, refused per *index* below.
 pub fn reflect_compute_textures_mtlb(
     mtlb: &[u8],
-    usages: *mut ReimsVgpuComputeTextureUsage,
-    usage_cap: usize,
-    out_usage_count: *mut usize,
     err: ErrOut<'_>,
-) -> Status {
-    if out_usage_count.is_null() {
-        set_err(err, "invalid compute texture reflection output");
-        return Status::args("metal_compute_reflection_count_output_missing");
-    }
-    if usages.is_null() && usage_cap != 0 {
-        set_err(err, "invalid compute texture reflection output");
-        return Status::args("metal_compute_reflection_usage_output_missing")
-            .field("usage_cap", usage_cap);
-    }
-    unsafe {
-        *out_usage_count = 0;
-    }
+) -> Result<Vec<ReimsVgpuComputeTextureUsage>, Status> {
     if mtlb.is_empty() {
         set_err(err, "compute MTLB is empty");
-        return Status::args("metal_compute_reflection_mtlb_empty");
+        return Err(Status::args("metal_compute_reflection_mtlb_empty"));
     }
 
-    let mtlb_hash = hash_bytes(mtlb);
-    if let Some(cached) = reflect_lookup(mtlb_hash, mtlb.len()) {
-        if cached.len() > usage_cap {
-            set_err(err, "too many compute texture bindings");
-            return Status::args("metal_compute_reflection_cached_capacity_exceeded")
-                .field("count", cached.len())
-                .field("capacity", usage_cap);
-        }
-        if !usages.is_null() && !cached.is_empty() {
-            unsafe {
-                ptr::copy_nonoverlapping(cached.as_ptr(), usages, cached.len());
-            }
-        }
-        unsafe {
-            *out_usage_count = cached.len();
-        }
+    let key = BlobKey::new(mtlb);
+    if let Some(cached) = reflect_lookup(&key) {
         clear_err(err);
-        return Status::OK;
+        return Ok(cached);
     }
 
     let Some(device) = system_device() else {
         set_err(err, "MTLCreateSystemDefaultDevice returned nil");
-        return Status::execute("metal_compute_reflection_device_unavailable");
+        return Err(Status::execute(
+            "metal_compute_reflection_device_unavailable",
+        ));
     };
-    let function = match load_only_function(device, mtlb, "compute", err) {
-        Ok(f) => f,
-        Err(st) => return st,
-    };
+    let function = load_only_function(device, mtlb, "compute", err)?;
 
     // MTLPipelineOptionArgumentInfo == BindingInfo == 1
     let (pso, reflection) = match new_compute_pso_with_function_reflection(device, &function, 1) {
         Ok(v) => v,
         Err(e) => {
             crate::observe::Emit::decline("metal_compute_reflection_pso", &e)
-                .field("mtlb_hash", format!("{mtlb_hash:#x}"))
-                .fail_once(mtlb_hash);
+                .field("mtlb_hash", format!("{:#x}", key.hash))
+                .fail_once(key.hash);
             set_err(err, format!("compute reflection PSO failed: {e}"));
-            return Status::execute("metal_compute_reflection_pso_create_failed")
-                .field("mtlb_hash", mtlb_hash);
+            return Err(
+                Status::execute("metal_compute_reflection_pso_create_failed")
+                    .field("mtlb_hash", key.hash),
+            );
         }
     };
     if reflection.is_null() {
         set_err(err, "compute pipeline reflection unavailable");
-        return Status::execute("metal_compute_reflection_unavailable")
-            .field("mtlb_hash", mtlb_hash);
+        return Err(
+            Status::execute("metal_compute_reflection_unavailable").field("mtlb_hash", key.hash)
+        );
     }
 
     let bindings = reflection_bindings(reflection);
@@ -1012,8 +1063,10 @@ pub fn reflect_compute_textures_mtlb(
             BINDING_ACCESS_WRITE_ONLY => REIMS_VGPU_COMPUTE_TEXTURE_ACCESS_WRITE,
             other => {
                 set_err(err, format!("unsupported compute texture access {other}"));
-                return Status::args("metal_compute_reflection_texture_access_unsupported")
-                    .field("access", other);
+                return Err(
+                    Status::args("metal_compute_reflection_texture_access_unsupported")
+                        .field("access", other),
+                );
             }
         };
         for elem in 0..b.array_length {
@@ -1023,26 +1076,28 @@ pub fn reflect_compute_textures_mtlb(
                     err,
                     format!("compute texture index {texture_index} exceeds backend cap"),
                 );
-                return Status::args("metal_compute_reflection_texture_index_exceeded")
-                    .field("index", texture_index)
-                    .field("base", b.index)
-                    .field("limit", REIMS_VGPU_METAL_MAX_TEXTURES);
+                return Err(
+                    Status::args("metal_compute_reflection_texture_index_exceeded")
+                        .field("index", texture_index)
+                        .field("base", b.index)
+                        .field("limit", REIMS_VGPU_METAL_MAX_TEXTURES),
+                );
             }
             if seen[texture_index as usize] {
                 set_err(
                     err,
                     format!("duplicate compute texture binding {texture_index}"),
                 );
-                return Status::args("metal_compute_reflection_texture_binding_duplicate")
-                    .field("index", texture_index);
+                return Err(
+                    Status::args("metal_compute_reflection_texture_binding_duplicate")
+                        .field("index", texture_index),
+                );
             }
-            if local.len() >= REIMS_VGPU_METAL_MAX_TEXTURES || local.len() >= usage_cap {
-                set_err(err, "too many compute texture bindings");
-                return Status::args("metal_compute_reflection_texture_capacity_exceeded")
-                    .field("count", local.len())
-                    .field("backend_limit", REIMS_VGPU_METAL_MAX_TEXTURES)
-                    .field("caller_capacity", usage_cap);
-            }
+            // No length check on `local`: the index band above admits only
+            // `texture_index < REIMS_VGPU_METAL_MAX_TEXTURES` and `seen` refuses
+            // a repeat, so one push per distinct in-band index bounds this list
+            // at the table width by construction. The check that used to sit
+            // here compared the same width a second time and could not fire.
             seen[texture_index as usize] = true;
             local.push(ReimsVgpuComputeTextureUsage {
                 binding: REIMS_VGPU_BINDING_TEXTURE_BASE + texture_index as u32,
@@ -1051,18 +1106,10 @@ pub fn reflect_compute_textures_mtlb(
         }
     }
 
-    reflect_insert(mtlb_hash, mtlb.len(), local.clone());
-    if !usages.is_null() && !local.is_empty() {
-        unsafe {
-            ptr::copy_nonoverlapping(local.as_ptr(), usages, local.len());
-        }
-    }
-    unsafe {
-        *out_usage_count = local.len();
-    }
+    reflect_insert(&key, local.clone());
     clear_err(err);
     let _ = pso;
-    Status::OK
+    Ok(local)
 }
 
 unsafe fn msg_send_release(obj: *mut objc::runtime::Object) {
@@ -1122,6 +1169,42 @@ mod tests {
         assert_eq!(
             backing_refusal(&span),
             "metal_compute_test reason=metal_compute_backing_span_out_of_range class=args binding=7 len=5 offset=4 backing_len=8"
+        );
+    }
+
+    /// A reflection wider than any caller-side buffer is served whole.
+    ///
+    /// `reflect_compute_textures_mtlb` took an out-pointer and a capacity, and
+    /// both call sites passed a bare `32`; a kernel declaring a 33rd texture lost
+    /// its entire dispatch to `..._capacity_exceeded`, against the 128 the device
+    /// tells every other rail it binds. Drive the cached arm — which returns
+    /// before the function needs an `MTLDevice`, so this runs anywhere — with a
+    /// list well past the retired 32 and assert every entry comes back.
+    #[test]
+    fn a_reflection_past_the_retired_caller_capacity_is_served_whole() {
+        // Distinct from any real kernel blob, so this cannot collide with an
+        // entry another test in this process inserted.
+        let mtlb: Vec<u8> = (0..64u8).map(|b| b ^ 0xa5).collect();
+        let wide: Vec<ReimsVgpuComputeTextureUsage> = (0..REIMS_VGPU_METAL_MAX_TEXTURES as u32)
+            .map(|i| ReimsVgpuComputeTextureUsage {
+                binding: REIMS_VGPU_BINDING_TEXTURE_BASE + i,
+                access: REIMS_VGPU_COMPUTE_TEXTURE_ACCESS_READ,
+            })
+            .collect();
+        reflect_insert(&BlobKey::new(&mtlb), wide.clone());
+
+        let mut err_buf = [0i8; 256];
+        let served = reflect_compute_textures_mtlb(&mtlb, (err_buf.as_mut_ptr(), err_buf.len()))
+            .expect("a cached reflection is served without a device");
+        assert_eq!(
+            served.len(),
+            REIMS_VGPU_METAL_MAX_TEXTURES,
+            "every reflected binding is returned, not the first 32"
+        );
+        assert_eq!(
+            served.last().map(|u| u.binding),
+            wide.last().map(|u| u.binding),
+            "and the entries past the retired capacity are the ones reflected"
         );
     }
 }

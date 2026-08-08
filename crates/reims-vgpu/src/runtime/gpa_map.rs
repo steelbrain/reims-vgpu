@@ -66,11 +66,7 @@ pub fn write_bytes<H: HostMemory + HostOps>(
     // window covering one of them would mean the guest was sampling its own
     // doorbell region. That is the whole of the justification, and it is the one
     // guest-write rail outside that account.
-    crate::observe::footprint::note_written_range(
-        crate::observe::footprint::Rail::Gpa,
-        gpa,
-        buf.len() as u64,
-    );
+    crate::observe::footprint::note_written_range(gpa, buf.len() as u64);
     host.unmap_pages(ptr, total);
     Ok(())
 }

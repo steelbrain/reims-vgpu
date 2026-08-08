@@ -45,11 +45,14 @@
 //! emitters, and the silence it produced had already been written up as a
 //! finding about the device before the collision was noticed.
 //!
-//! A scan of every `Decline::slug` body reads 609 distinct slugs and no
-//! duplicate. That is a measurement of one tree state, not a guarantee about
-//! the next one; a `gate` module that checked it by scanning source text was
-//! removed in `db80389` because the check was over text rather than behaviour,
-//! and it has not been replaced.
+//! **Nothing checks this.** A source scan over every `slug()` and `refusal()`
+//! body used to, and it went with the rest of them; a `gate` module before that
+//! checked it alongside a 2 700-line restatement of the vocabulary and was
+//! removed whole in `db80389`. Two shapes are the defect, at different radii:
+//! one slug claimed by two impls, and one slug returned by two arms of the same
+//! impl. Prefix every slug with the rail that owns it — that is what makes a
+//! collision unlikely by construction, since the audit that would catch one is
+//! gone.
 //!
 //! The judgement no gate can make stays with the author: do **not** log
 //! speculative returns (a resolver legitimately answering "not ready yet" every
@@ -58,6 +61,8 @@
 pub mod decline;
 pub mod emit;
 pub mod footprint;
+pub mod ladder;
+pub mod panic;
 pub mod phase_clock;
 pub mod sink;
 
@@ -65,14 +70,19 @@ pub mod sink;
 /// next to the trait it implements, rather than reaching into the submodule.
 pub(crate) use decline::decline_display;
 pub use decline::{Decline, Refusal};
-pub use emit::{first_sight, state_changed, Emit};
+pub(crate) use emit::{first_sight, state_changed, Emit};
+/// The fail line a loader whose event name carries the domain emits for a rung.
+pub(crate) use ladder::RungReport;
+/// The four object-list resolution rungs, so a rail spells the condition the
+/// same way every other rail does. See [`ladder`] for why it is a macro.
+pub(crate) use ladder::{ladder_slug, ladder_slugs};
 
 // The sink's surface is re-exported flat so call sites read `observe::fail(…)`
-// rather than `observe::sink::fail(…)`. `sink` stays public for the gate and
-// for readers who want the machinery.
+// rather than `observe::sink::fail(…)`. `sink` stays public for readers who
+// want the machinery.
 pub use sink::{
-    bgra_present_stats, bgra_present_stats_scalar, bgra_rgb_stats, fail, line, nonzero_stats, off,
-    redirect_logs_for_tests, rgba_rgb_stats,
+    bgra_present_stats, bgra_rgb_stats, fail, line, nonzero_stats, off, redirect_logs_for_tests,
+    rgba_rgb_stats,
 };
 pub(crate) use sink::{draw_log_enabled, elapsed_ms, elapsed_us};
 

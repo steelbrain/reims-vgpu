@@ -177,7 +177,16 @@ fi
 # --- Configure ------------------------------------------------------------------
 # Target + backend choice are read at configure. If an existing build used a
 # different stamp, force reconfigure.
-STAMP_WANTED="${QEMU_TARGET}:${REIMS_VGPU_BACKEND}:reims-vgpu-crates"
+#
+# `REIMS_VGPU_COVERAGE` belongs in the stamp for the same reason the backend
+# does: `hw/display/meson.build` reads it with `run_command` and turns it into a
+# `--whole-archive` link argument, which is a configure-time decision. Without
+# it here, a tree already configured without coverage skipped configure and
+# linked no profile writer, so `scripts/runtime-dead` booted an instrumented
+# staticlib whose counters nothing ever wrote out — and reported every function
+# in the crate as never having run. The path and not just a flag, because a
+# different clang major is a different archive.
+STAMP_WANTED="${QEMU_TARGET}:${REIMS_VGPU_BACKEND}:reims-vgpu-crates:cov=${REIMS_VGPU_COVERAGE:-off}"
 if [ -f "build/build.ninja" ]; then
   prev=""
   if [ -f "build/qemu-build.stamp" ]; then
@@ -192,6 +201,14 @@ if [ -f "build/build.ninja" ]; then
   fi
 fi
 
+# The backend travels as a meson option and not only as an exported variable.
+# Meson re-runs its build files whenever ninja finds them out of date, and that
+# regeneration inherits ninja's environment rather than this script's — so a
+# tree configured here for Vulkan silently became a Metal one the next time any
+# meson.build changed, and the boot that followed died in twenty Rust errors
+# from an Apple-only arm on a Linux host. An option is stored in the build
+# directory and survives regeneration.
+REIMS_VGPU_MESON_OPT="-Dreims_vgpu_backend=$REIMS_VGPU_BACKEND"
 if [ ! -f "build/build.ninja" ]; then
   case "$QEMU_TARGET" in
     aarch64)
@@ -203,7 +220,8 @@ if [ ! -f "build/build.ninja" ]; then
         --disable-docs \
         --disable-bsd-user \
         --disable-linux-user \
-        --disable-tools
+        --disable-tools \
+        "$REIMS_VGPU_MESON_OPT"
       ;;
     x86_64)
       echo "[qemu-build] configuring (x86_64-softmmu, no hvf/cocoa) ..."
@@ -214,7 +232,8 @@ if [ ! -f "build/build.ninja" ]; then
         --disable-docs \
         --disable-bsd-user \
         --disable-linux-user \
-        --disable-tools
+        --disable-tools \
+        "$REIMS_VGPU_MESON_OPT"
       ;;
   esac
 else

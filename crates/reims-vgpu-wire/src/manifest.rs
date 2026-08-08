@@ -14,6 +14,29 @@
 //! [`Coverage::Unimplemented`], which is honest; silence is not an option,
 //! because a selector missing from the manifest entirely is indistinguishable
 //! from one that does not exist.
+//!
+//! # Absent from here does not mean absent from the class
+//!
+//! `class_copyMethodList` returns the methods a class **declares itself**. It
+//! does not walk superclasses, and the encoder classes have one: they all derive
+//! from a shared `PGSerializerCommandEncoder` that [`INVENTORY`] has no row for.
+//! So a selector defined only on that base is invisible here while being
+//! callable on every encoder, and the rule above — missing means non-existent —
+//! does not hold for it.
+//!
+//! This is not hypothetical; it has already produced two wrong conclusions in
+//! this workspace. Residency is declared on the base class in two forms, an
+//! unqualified `useHeaps:count:` / `useResources:count:usage:` pair and their
+//! singular siblings, with only the `stages:`-qualified overrides declared on the
+//! render encoder. Reading "residency is not among the compute encoder's
+//! selectors" as "a compute encoder cannot receive a residency call" is exactly
+//! the inference this hole invites, and `runtime::decode::compute` drew it —
+//! concluding that its own opcodes had no producer when the base class inherits
+//! them one.
+//!
+//! Until the base class has an [`INVENTORY`] row and rows here, treat a selector
+//! that is absent as *untriaged with respect to inheritance*, and check the base
+//! class before concluding a call cannot reach an encoder.
 
 /// What this crate has done about a selector.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -112,6 +135,59 @@ pub const INVENTORY: &[ClassInventory] = &[
 /// encoder and abort. The oracle catches that, records the selector under
 /// `unsupported`, and carries on, so the exclusion is evidence rather than an
 /// assumption and is re-checked on every capture.
+///
+/// # It is the weakest of the three reasons, for the same cause twice
+///
+/// An assertion is a refusal by the *capability state the capture ran in*, not
+/// by Apple. `runtime::decode::compute` records the first instance: `0xe3`/`0xe6`
+/// sat here as refused, and both selectors emit the moment their gate is on.
+///
+/// The render encoder carries a second, larger instance, and this doc is where
+/// it is written down because nothing executable catches it yet. **Fifteen**
+/// selectors on it are structured as *"if the serializer supports OpenGL, emit;
+/// otherwise assert"* — the assertion the oracle observed is the else-branch of
+/// a capability test — and behind the gate each has a fixed opcode and a fixed
+/// body:
+///
+/// | opcode | selector | body |
+/// |---|---|---|
+/// | `0x8a` | `setAlphaTestReferenceValue:` | 4 |
+/// | `0x8b` | `setPointSize:` | 4 |
+/// | `0x8c` | `setClipPlane:p2:p3:p4:atIndex:` | 20 |
+/// | `0x8d` | `setVertexSamplerState:lodMinClamp:lodMaxClamp:lodBias:atIndex:` | 20 |
+/// | `0x8e` | `setFragmentSamplerState:lodMinClamp:lodMaxClamp:lodBias:atIndex:` | 20 |
+/// | `0x8f` | `setViewportTransformEnabled:` | 4 |
+/// | `0x90` | `setProvokingVertexMode:` | 4 |
+/// | `0x91` | `setPrimitiveRestartEnabled:index:` | 8 |
+/// | `0x92` | `setTriangleFrontFillMode:backFillMode:` | 4 |
+/// | `0x93` | `setTransformFeedbackState:` | 4 |
+/// | `0x94` | `setDepthCleared` | 0 |
+/// | `0x95` | `setStencilCleared` | 0 |
+/// | `0x96` | `setColorResolveTexture:slice:depthPlane:level:yInvert:atIndex:` | 16 |
+/// | `0x97` | `setDepthResolveTexture:slice:depthPlane:level:yInvert:` | 12 |
+/// | `0x98` | `setStencilResolveTexture:slice:depthPlane:level:yInvert:` | 12 |
+///
+/// A prior version of this paragraph listed eight. The seven it missed are the
+/// ones whose row is absent from `INVENTORY` for the reason this module's own
+/// doc now states — the manifest cannot see a selector, and its rule is that
+/// absent means non-existent.
+///
+/// They stay `Excluded` here rather than being promoted on that reading: this
+/// crate's rule is that a row's opcode comes from a capture, and no capture has
+/// run with that gate on. What the reading does establish is that the *reason*
+/// is wrong — these are gated, not refused — so
+/// `every_capability_gated_selector_names_the_flag_that_unlocks_it` cannot see
+/// them.
+///
+/// **The gate is on.** The flag is the serializer's feature version, which the
+/// device publishes as `reims_vgpu::model::DEVICE_INFO_KEY_SERIALIZER_VERSION`
+/// and which unlocks OpenGL at rung 6; this device sends 8. So these fifteen are
+/// records a guest on an OpenGL-compatibility path *will* send and this device
+/// does not decode. Four of them change what a draw produces — primitive
+/// restart, two-sided fill mode, and the two sampler binds that carry an LOD
+/// bias — and three more name multisample resolve targets. They reach
+/// `runtime::exec`'s unimplemented-opcode report rather than vanish, which is
+/// the one part of this that is already right.
 pub const REFUSED_BY_SERIALIZER: &str =
     "the serializer fails an assertion instead of emitting an operation";
 

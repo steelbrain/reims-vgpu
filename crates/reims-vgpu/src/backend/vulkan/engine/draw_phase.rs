@@ -6,7 +6,8 @@
 //! separate the two shapes a slow draw comes in, and they need opposite work:
 //!
 //! - **Bytes.** `stage` and `readback` dominate → the fix is to move less, which
-//!   is the deferred-rail and `output_bgra` family.
+//!   is the guest-page writeback family: render into the order the destination
+//!   stores and copy straight into its pages, so no byte crosses host memory.
 //! - **Latency.** `wait` dominates → the fix is to stop round-tripping the GPU
 //!   per draw, and moving bytes faster buys nothing.
 //!
@@ -123,6 +124,15 @@
 //!   scans a `SAMPLED_CACHE_CAP`-bounded list of **64** entries and moves one to
 //!   the back. That cannot be the ~100 us per bind the arithmetic demands.
 //!
+//! **Do not read the third bullet as "the content path never fires".** A later
+//! driven x86/Vulkan boot under a 30 s Safari *drag*, 42 census windows, reads
+//! `sampled_cache_hits=26697` against `sampled_identity_hits=75994` — the
+//! content fallback carries about a quarter of all hits, moving 277 MB at
+//! ~10 KB a hit. The windows above and these are different workloads, and both
+//! readings stand; what does not stand is concluding from the zeros here that
+//! the content rail is dead and can go. It is load-bearing, and
+//! `ResidentSampledSlot::content` is what makes taking it safe.
+//!
 //! What is left is `SampledSource::GuestRuns`, and the reason it was invisible
 //! is that it incremented no counter of its own. That arm calls
 //! `acquire_sampled`, then `acquire_staging`, then `write_staging_from_runs` —
@@ -147,24 +157,53 @@
 //!
 //! The bytes are the finding. **842 MB/s of guest memory read into staging, at
 //! 2.34 MB per bind**, every second, for a Safari page that is only animating.
-//! `AGENTS.md` calls the render deferred-flush writeback "the single largest
-//! cost in the device" at ~1 GB/s into guest pages; this is a second rail of
-//! the same order running the other way, and it was undocumented because the
-//! arm that drives it was uncounted.
+//! The render deferred-flush writeback is this device's largest single cost at
+//! ~1 GB/s into guest pages — `AGENTS.md` says as much where it explains what
+//! retires that rail. This is a second rail of the same order running the other
+//! way, and it was undocumented because the arm that drives it was uncounted.
 //!
 //! Note what the constancy says: 360 and 842.4 MB repeat to the digit across
 //! all eight windows, so this is the *same* content re-gathered every frame
-//! rather than a changing working set. The gather path has no content cache at
-//! all — `find_cached_sampled` serves the `Bytes` arm (420 identity hits a
-//! second in these same windows) and nothing serves this one.
+//! rather than a changing working set.
 //!
-//! That makes the repair shape clear, and it is a shape this tree has already
-//! used: a gather may be skipped when the guest has not written the source
-//! pages since the last one, which is what `guest_write_gen` /
-//! `mapping_guest_write_verdict` answer for the type-11 seed elision — the rung
-//! that took `type11_seed_uploaded` from 242 to 23. It is *not* established here
-//! that the same witness covers these run lists, which are task-GVA spans rather
-//! than mapping ids; that is the first thing to check before building on this.
+//! ## That repair was built, and it is the cache half that fails
+//!
+//! The paragraph this replaces said the gather path had no content cache at all
+//! and that it was *not* established whether the type-11 seed witness could
+//! cover these run lists, "the first thing to check before building on this".
+//! Both are answered. [`crate::runtime::gather_witness`] covers them —
+//! `GatherWindow` carries the window's `gpas` alongside its `runs`, so the
+//! page-set question the witness needs is asked in the address space it needs —
+//! and a vouch becomes a `GatheredIdentity` the engine binds a retained image
+//! on with nothing read and nothing compared. `sampled_gather_skips` counts it
+//! working.
+//!
+//! Which half fails is **not yet established**. A driven x86/PCI drag over 73
+//! windows read `sampled_gather_unvouched` at **0** against
+//! `sampled_gather_unretained` at 6296, and that was taken to mean every gather
+//! had a vouch it could not spend — so the lever was retention rather than the
+//! witness. The zero was structural: the emitter was handed
+//! `resource.identity.is_some()`, and the producer names every window the
+//! witness is asked about, so the arm could not fire on any bind of any boot.
+//! The counter now takes the witness's own
+//! [`crate::runtime::gather_witness::GatherVouch`], which makes the question
+//! answerable for the first time; see
+//! [`super::counters::EngineCounters::sampled_gather_unvouched`].
+//!
+//! The boot that answered it put the split at **5389 compulsory against 2524
+//! retention losses** — 68/32, the reverse of the reading above. Two thirds of
+//! this rail cannot be reached by any cache, because the witness had spent the
+//! generation and no retained image could have matched. And what spends it is
+//! this device: `gw_refused_host_write` 5156 against `gw_refused_guest_store`
+//! 14 on the same boot. The deferred writeback puts a render target into guest
+//! pages and this rail gathers those same pages back at 1.4 MB a bind.
+//!
+//! So the lever here is neither the witness nor the cache. It is that a window
+//! this device just wrote is re-read from guest RAM instead of bound from the
+//! image it was written out of — which is what `SampledSource::Target` is for,
+//! and that arm is never taken. See
+//! [`super::counters::EngineCounters::sampled_gather_unvouched`] for the full
+//! reading and its qualifiers.
 //!
 //! # And none of it holds when the guest is quiet
 //!
@@ -239,21 +278,73 @@ const STALL_REPORT_CAP: u64 = 256;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Phase {
     Prep = 0,
-    Pipeline = 1,
-    Stage = 2,
-    StagePass = 3,
-    Acquire = 4,
-    AcquireSampled = 5,
-    SampledUpload = 6,
-    AcquireReadback = 7,
-    Descriptors = 8,
-    Record = 9,
-    Submit = 10,
-    Wait = 11,
-    Readback = 12,
+    /// Claiming the submission ring slot — `begin_entry`, or a batch joiner
+    /// taking the open batch's slot.
+    ///
+    /// Split out of [`Phase::Prep`] because it is the one part of that span
+    /// that **blocks on the GPU**: `begin_entry` advances onto the next slot and
+    /// waits when its fence is still unsignaled. `ring_retire_blocks` counts
+    /// those, and a count cannot rank them — 18 000 blocks of one microsecond
+    /// and 18 000 of four hundred read identically, and only the second says the
+    /// ring is the cap. The comment at the claim site has promised a
+    /// `retire_wait_us` for a long time; this is it.
+    ///
+    /// # It was all of it
+    ///
+    /// First reading, driven Safari drag: `prep_us` **2 525 us/s** against
+    /// `slot_us` **314 491 us/s** over 3 845 draws. So the 111 -> 306 ms/s rise
+    /// in `prep_us` that followed the resident rungs was not preparation getting
+    /// slower by any amount — preparation is free, and the whole column is this
+    /// wait. With `ring_retire_blocks` at 17 863 that is roughly **425 us per
+    /// block**, which is not the jitter a deeper ring absorbs.
+    ///
+    /// What that says about `RING_DEPTH` is: probably not the lever. Eight slots
+    /// against ~2 100 submissions a second (`batch_flushes` 53 451 over the
+    /// boot) gives each submission 3.8 ms to retire, and something is exceeding
+    /// it. Doubling the ring doubles that budget once; halving the submissions
+    /// would do the same and keep the latency.
+    ///
+    /// The submission count was the more promising end, and splitting the join
+    /// rule by refusing term found it: `!samples_own_target` alone forced
+    /// 29.7 % of all draws into their own command buffer, and it was standing
+    /// in for a barrier rather than for a real ordering constraint. Dropping it
+    /// took `batch_flushes` 55 334 -> 33 538 on the same probe.
+    ///
+    /// # What that bought, and what it did not
+    ///
+    /// `slot_us` 6 870 ms -> 5 640 ms and `ring_retire_blocks` 17 533 ->
+    /// 14 565 across the boot, so the ring does block less. The frame rate did
+    /// not move: 63/s before and after, 24 of 24 seconds below 100 Hz.
+    ///
+    /// A 39 % cut in submissions buying an 18 % cut in the blocking and no
+    /// frames says the ring was not queued behind submission *overhead*. In
+    /// the same second the device moves 4.46 GB of guest buffer runs into
+    /// device-local memory and writes 4.33 GB of rendered surface back to
+    /// guest pages — 8.8 GB/s across the bus on a discrete host, against a
+    /// worker that holds the engine lock 671 ms of every second. Look there
+    /// before shortening this span again.
+    Slot = 1,
+    Pipeline = 2,
+    Stage = 3,
+    StagePass = 4,
+    Acquire = 5,
+    AcquireSampled = 6,
+    SampledUpload = 7,
+    AcquireReadback = 8,
+    Descriptors = 9,
+    Record = 10,
+    Submit = 11,
+    Wait = 12,
+    Readback = 13,
 }
 
-const PHASES: usize = 13;
+impl Phase {
+    /// Highest ordinal, so [`PHASES`] is derived from the enum rather than
+    /// hand-counted beside it.
+    const LAST: Phase = Phase::Readback;
+}
+
+const PHASES: usize = Phase::LAST as usize + 1;
 
 /// Nanoseconds, per [`crate::observe::phase_clock`]. `prep_us` and
 /// `pipeline_us` are single-digit microseconds over a whole draw, so the spans
@@ -265,9 +356,36 @@ static STALLS: AtomicU64 = AtomicU64::new(0);
 static STALL_LINES: AtomicU64 = AtomicU64::new(0);
 
 /// One window of the split, as taken by the per-second census.
+///
+/// # These phases account for less than a third of `draw_us`
+///
+/// Read against `drain_duty` from the same second and the fields below sum to
+/// far less than the draw time they sit inside. One driven Safari window-drag
+/// second, 1 902 draws: `draw_us=152641` on the `drain_duty` line, against
+/// 45 800 us summed here — `record_us=20475`, `pipeline_us=10251`,
+/// `stage_us=7501`, `prep_us=2157`, `descriptors_us=1892`, `submit_us=1188`,
+/// `acquire_sampled_us=1136`, `sampled_upload_us=596`, `acquire_us=528`, and
+/// `wait_us` and `readback_us` both zero. 24 us of the 80 us a draw costs.
+///
+/// The other 56 us is real and it is not missing from the clock: `draw_us`
+/// brackets the whole of `draw::encode_draw_chain`, and every span here is
+/// inside the engine call at the end of it. What no field names is the work
+/// before that call — binding resolution, the Metal-to-Vulkan translate,
+/// texture and buffer resolution, the guest-memory walks. So the largest
+/// unowned cost in this device, once the writeback rail's per-window fence was
+/// removed, is in `encode_draw_chain` ahead of the engine, and **no phase here
+/// can be ranked against it**.
+///
+/// Which is the point of writing it down rather than acting on it. Naming a
+/// suspect inside those 56 us would be a guess, and the ranking above is exactly
+/// the shape that makes a guess look informed — `record_us` is the biggest
+/// number on the line and it is 13 % of a draw. Add a span to the pre-engine
+/// work before optimising any of it.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct DrawPhaseWindow {
     pub prep_us: u64,
+    /// Blocked claiming a ring slot. See [`Phase::Slot`].
+    pub slot_us: u64,
     pub pipeline_us: u64,
     pub stage_us: u64,
     pub stage_pass_us: u64,
@@ -291,6 +409,7 @@ pub fn take_window() -> Option<DrawPhaseWindow> {
     let draws = DRAWS.swap(0, Ordering::Relaxed);
     let w = DrawPhaseWindow {
         prep_us: to_us(ACC[Phase::Prep as usize].swap(0, Ordering::Relaxed)),
+        slot_us: to_us(ACC[Phase::Slot as usize].swap(0, Ordering::Relaxed)),
         pipeline_us: to_us(ACC[Phase::Pipeline as usize].swap(0, Ordering::Relaxed)),
         stage_us: to_us(ACC[Phase::Stage as usize].swap(0, Ordering::Relaxed)),
         stage_pass_us: to_us(ACC[Phase::StagePass as usize].swap(0, Ordering::Relaxed)),
@@ -379,13 +498,14 @@ impl Drop for DrawTimer {
             ""
         };
         crate::observe::off(format!(
-            "draw_stall us={} prep_us={} pipeline_us={} stage_us={} stage_pass_us={} \
+            "draw_stall us={} prep_us={} slot_us={} pipeline_us={} stage_us={} stage_pass_us={} \
              acquire_us={} acquire_sampled_us={} sampled_upload_us={} acquire_readback_us={} \
              descriptors_us={} \
              record_us={} submit_us={} wait_us={} readback_us={} geom={w}x{h} \
              readback_bytes={} exit={:?}{latched}",
             to_us(total),
             to_us(self.ns[Phase::Prep as usize]),
+            to_us(self.ns[Phase::Slot as usize]),
             to_us(self.ns[Phase::Pipeline as usize]),
             to_us(self.ns[Phase::Stage as usize]),
             to_us(self.ns[Phase::StagePass as usize]),
@@ -429,6 +549,54 @@ mod tests {
         assert_eq!(w.submit_us, 0);
     }
 
+    /// The ring claim is charged apart from the bookkeeping above it.
+    ///
+    /// [`Phase::Slot`] exists because it is the only part of [`Phase::Prep`]
+    /// that blocks on the GPU, and the whole point is that a boot can tell the
+    /// two apart. A `Slot` whose time landed in `prep_us` would read exactly
+    /// like a draw that got more expensive to prepare, and those want opposite
+    /// repairs — a deeper ring against less work per draw.
+    ///
+    /// Walks the ordinals too. They are array indices into [`ACC`], and
+    /// inserting a variant renumbers every one below it; a phase left pointing
+    /// at its old slot would silently add its time to a neighbour's column.
+    #[test]
+    fn the_ring_claim_is_charged_apart_from_preparing_the_draw() {
+        let _ = take_window();
+        {
+            let mut t = DrawTimer::start();
+            t.enter(Phase::Slot);
+            std::thread::sleep(std::time::Duration::from_millis(3));
+            t.enter(Phase::Pipeline);
+        }
+        let w = take_window().expect("a dropped timer counts a draw");
+        assert!(w.slot_us >= 2_000, "{w:?}");
+        assert_eq!(w.prep_us, 0, "the claim's wait may not read as prepare time");
+
+        // Every ordinal distinct and contiguous from zero, so `PHASES` covers
+        // them and no two share an accumulator.
+        let all = [
+            Phase::Prep,
+            Phase::Slot,
+            Phase::Pipeline,
+            Phase::Stage,
+            Phase::StagePass,
+            Phase::Acquire,
+            Phase::AcquireSampled,
+            Phase::SampledUpload,
+            Phase::AcquireReadback,
+            Phase::Descriptors,
+            Phase::Record,
+            Phase::Submit,
+            Phase::Wait,
+            Phase::Readback,
+        ];
+        assert_eq!(all.len(), PHASES);
+        for (want, phase) in all.iter().enumerate() {
+            assert_eq!(*phase as usize, want, "{phase:?} indexes the wrong slot");
+        }
+    }
+
     /// Holding the render target and holding the sampled images are separate
     /// accumulators, so a draw that spends its time in the sampled loop cannot
     /// be read as an expensive target.
@@ -467,8 +635,20 @@ mod tests {
         );
         // The remainder belongs to the phase that was open. `Acquire` closed
         // when the sampled loop opened, so it must not have absorbed it.
-        assert_eq!(
-            w.acquire_us, 0,
+        //
+        // A ceiling, not zero. `Acquire` was genuinely open across one `enter`
+        // call, so its slot legitimately carries however long that took — under
+        // a microsecond in a warm process, but 8 µs the first time this test ran
+        // as the only test in a cold one. `== 0` was therefore an assertion a
+        // correct implementation could fail, and it passed only because the rest
+        // of the suite warmed the process first. The bound is half the sleep, so
+        // it is derived from the one constant here and cannot be satisfied by a
+        // slot that absorbed it: an `Acquire` that swallowed the sampled loop
+        // reads the full `SAMPLED_SLEEP`, and one that merely timed an `enter`
+        // cannot approach half of it.
+        let absorbed_the_sleep = (SAMPLED_SLEEP.as_micros() / 2) as u64;
+        assert!(
+            w.acquire_us < absorbed_the_sleep,
             "target acquisition charged time the sampled loop spent: {w:?}"
         );
         // Nor may the readback buffer, which is the slot the sampled loop's own

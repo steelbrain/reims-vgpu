@@ -100,6 +100,6 @@ Verify against them with:
 
   cargo test -p reims-vgpu-wire -- --test-threads=1
 
-A run with no fixtures present skips the oracle tests and says so; set
-REIMS_WIRE_FIXTURES_REQUIRED=1 to turn that skip into a failure.
+A run with no fixtures present reports the oracle tests as ignored, one line
+each; set REIMS_WIRE_FIXTURES_REQUIRED=1 to make their absence fail the build.
 EOF

@@ -124,9 +124,8 @@ use crate::runtime::host::{FakeHost, HostActionKind};
 /// `kb/pvg-display-contract.md` §8.1 measured every op6 payload as trailer-only.
 ///
 /// Every present test built this same eight-field `Packet` by hand; only the
-/// opcode and the named mapping ever differed. The one test that does not use
-/// this is `display_txn_probe_distinguishes_trailer_only_from_prefixed_payload`,
-/// which varies the payload length on purpose.
+/// opcode and the named mapping ever differed. A test that varies the payload
+/// length on purpose builds its own rather than calling this.
 fn present_packet(opcode: u16, mapping: u32) -> Packet {
     let len = display_txn_trailer_len(opcode);
     let mut payload = vec![0u8; len];
@@ -134,7 +133,7 @@ fn present_packet(opcode: u16, mapping: u32) -> Packet {
     payload[off..off + 4].copy_from_slice(&mapping.to_le_bytes());
     Packet {
         opcode,
-        stamp_count: 0,
+        stamp_waits: Vec::new(),
         total_size: PACKET_HEADER_LEN + len as u32,
         completion_stamp: 0,
         payload,
@@ -156,10 +155,92 @@ fn packet_bytes(opcode: u16, stamp_value: u32, payload: &[u8]) -> Vec<u8> {
 #[test]
 fn decode_basic_packet() {
     let p = packet_bytes(ROOT_OP_DEFINE_FIFO, 7, &1u32.to_le_bytes());
-    let dec = decode_packet(&p, 0, p.len() as u32).unwrap();
+    let dec = decode_packet(&p, 0, p.len() as u32, RING).unwrap();
     assert_eq!(dec.opcode, ROOT_OP_DEFINE_FIFO);
     assert_eq!(dec.completion_stamp, 7);
     assert_eq!(dec.next_head, p.len() as u32);
+}
+
+/// A ring capacity comfortably larger than any packet these tests build, so a
+/// `BadSize` in one of them is about the packet and never about the ring.
+const RING: u32 = 4096;
+
+/// A packet the producer has not finished publishing is control flow, and a
+/// size the ring could never hold is a fault. The two must not answer alike.
+///
+/// `packet_snapshot_len` deliberately snaps only the header when the packet is
+/// still being written, so measuring the declared `total_size` against the
+/// *snapshot* said "bad size" for a perfectly well-formed packet whose producer
+/// was mid-write — a `packet_bad_size` line on the always-on channel for a
+/// healthy guest, and `Incomplete` unreachable behind it. The ring's capacity is
+/// what bounds a sane size, so that is what it is measured against.
+#[test]
+fn a_packet_still_being_written_is_incomplete_and_an_impossible_one_is_a_fault() {
+    let full = packet_bytes(ROOT_OP_DEFINE_FIFO, 7, &1u32.to_le_bytes());
+
+    // What the drain loop actually holds for a mid-write packet: the header
+    // alone, because that is all `packet_snapshot_len` lets it read.
+    let header_only = &full[..PACKET_HEADER_LEN as usize];
+    let published = PACKET_HEADER_LEN; // the producer stopped after the header
+    assert_eq!(
+        packet_snapshot_len(header_only, published, RING),
+        PACKET_HEADER_LEN,
+        "an unpublished packet may only be snapped as far as its header"
+    );
+    let err = decode_packet(header_only, 0, published, RING).unwrap_err();
+    assert_eq!(err, PacketError::Incomplete);
+    assert_eq!(
+        err.fault(),
+        None,
+        "a producer mid-write must not reach the always-on failure channel"
+    );
+
+    // A declared size the ring itself could never hold is the guest's error,
+    // and still reads as one.
+    let mut impossible = full.clone();
+    impossible[PACKET_TOTAL_SIZE..PACKET_TOTAL_SIZE + 4].copy_from_slice(&(RING + 1).to_le_bytes());
+    assert_eq!(
+        packet_snapshot_len(&impossible, RING, RING),
+        PACKET_HEADER_LEN,
+        "a size past the ring is never snapped at face value"
+    );
+    let err = decode_packet(&impossible, 0, RING, RING).unwrap_err();
+    assert_eq!(err, PacketError::BadSize);
+    assert_eq!(err.fault(), Some(PacketFault::BadSize));
+
+    // And the whole packet, published, still decodes.
+    assert_eq!(
+        packet_snapshot_len(&full, full.len() as u32, RING),
+        full.len() as u32
+    );
+    assert!(decode_packet(&full, 0, full.len() as u32, RING).is_ok());
+}
+
+/// Both rings decide how much to snapshot with the same function.
+///
+/// They used to decide it inline, and the two copies had already parted — the
+/// root ring's carried an extra arm its own caller made unreachable. A
+/// divergence here is not visible in a boot: both spellings return the same
+/// length for every packet a healthy guest writes, and differ only on the
+/// malformed ones nothing produces.
+#[test]
+fn the_snapshot_rule_reads_the_same_for_both_rings() {
+    let full = packet_bytes(ROOT_OP_DEFINE_FIFO, 3, &[0u8; 16]);
+    let total = full.len() as u32;
+    for available in [0, PACKET_HEADER_LEN, total - 1, total, total + 8] {
+        for capacity in [PACKET_HEADER_LEN, total - 1, total, RING] {
+            let want = if total <= capacity && available >= total {
+                total
+            } else {
+                PACKET_HEADER_LEN
+            };
+            assert_eq!(
+                packet_snapshot_len(&full, available, capacity),
+                want,
+                "available={available} capacity={capacity}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -360,7 +441,7 @@ fn clear_only_present_captures_the_surface_the_transaction_names() {
         &mut state,
         &mut host,
         5,
-        &present_packet(CHILD_OP_PRESENT_X86, 2),
+        &present_packet(CHILD_OP_DISPLAY_TRANSACTION2, 2),
     );
 
     assert_eq!(state.present.present_mapping, 2, "guest names mid 2");
@@ -390,21 +471,24 @@ fn clear_only_present_captures_the_surface_the_transaction_names() {
 fn delete_task_root_clears_active_task() {
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
-    assert!(state.define_task(3, 0x1000, 2));
+    state.define_task(3, 0x1000, 2);
     assert!(state.tasks[3].active);
     process_root_packet(
         &mut state,
         &mut host,
         &Packet {
             opcode: ROOT_OP_DELETE_TASK,
-            stamp_count: 0,
+            stamp_waits: Vec::new(),
             total_size: PACKET_HEADER_LEN + 4,
             completion_stamp: 0,
             payload: 3u32.to_le_bytes().to_vec(),
             next_head: 0,
         },
     );
-    assert!(!state.tasks[3].active, "DeleteTask must deactivate task 3");
+    assert!(
+        !state.tasks.is_active(3),
+        "DeleteTask must leave no live task 3"
+    );
     assert!(
         !state
             .fails
@@ -449,7 +533,7 @@ fn replace_physical_drops_the_cached_page_list() {
     payload[4..8].copy_from_slice(&7u32.to_le_bytes()); // {task 0, object 7}
     let pkt = Packet {
         opcode: CHILD_OP_REPLACE_PHYSICAL,
-        stamp_count: 0,
+        stamp_waits: Vec::new(),
         total_size: PACKET_HEADER_LEN + 8,
         completion_stamp: 0,
         payload,
@@ -482,6 +566,94 @@ fn replace_physical_drops_the_cached_page_list() {
     );
 }
 
+/// A re-point naming an object this device holds no *mapping* for still names
+/// something: a type-11 texture, through the object-list ref its task registered
+/// it under. That fallback is the packet family the arm used to drop entirely —
+/// 57 % of the re-points on a driven boot found no mapping under `object_id` —
+/// and dropping it leaves the texture's page list trusted while it names pages
+/// that back something else.
+///
+/// The fallback is safe here and only here, because the direct reading found
+/// nothing: there is no surface under this id to misroute the packet away from.
+/// [`replace_physical_drops_the_cached_page_list`] holds the other half — when
+/// the direct reading *does* answer, the ref-keyed map must not be consulted at
+/// all.
+#[test]
+fn replace_physical_routes_through_the_texture_ref_when_no_mapping_owns_the_id() {
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    // Mapping 41 backs a type-11 texture the guest registered at object-list
+    // ref 12 of task 3. Nothing is mapped under id 12.
+    state.map_surface(41);
+    {
+        let m = state.mappings.get_mut(&41).unwrap();
+        m.mapped = true;
+        m.page_entries = vec![0x51, 0x52];
+    }
+    state.texture_to_mapping.insert((3, 12), 41);
+    let generation_before = state.mappings.get(&41).unwrap().map_generation;
+
+    let mut payload = vec![0u8; 8];
+    payload[0..4].copy_from_slice(&3u32.to_le_bytes()); // task 3
+    payload[4..8].copy_from_slice(&12u32.to_le_bytes()); // object 12
+    let pkt = Packet {
+        opcode: CHILD_OP_REPLACE_PHYSICAL,
+        stamp_waits: Vec::new(),
+        total_size: PACKET_HEADER_LEN + 8,
+        completion_stamp: 0,
+        payload,
+        next_head: 0,
+    };
+    process_child_packet(&mut state, &mut host, 2, &pkt);
+
+    let m = state.mappings.get(&41).unwrap();
+    assert!(
+        m.page_entries.is_empty(),
+        "a re-point that names a texture ref must reach the mapping behind it"
+    );
+    assert_ne!(
+        m.map_generation, generation_before,
+        "the incarnation must move, or a resident gathered from the old pages \
+         stays eligible"
+    );
+}
+
+/// The ref-keyed fallback must not fire when the direct reading found a mapping
+/// but that mapping happened to have no resolved pages. "Nothing to drop" is not
+/// "nobody owns this id", and treating it as one would walk into exactly the
+/// misroute [`replace_physical_drops_the_cached_page_list`] guards.
+#[test]
+fn replace_physical_does_not_fall_back_when_the_named_mapping_is_merely_empty() {
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    state.map_surface(7); // exists, no page_entries
+    state.map_surface(99);
+    {
+        let m = state.mappings.get_mut(&99).unwrap();
+        m.mapped = true;
+        m.page_entries = vec![0xaa];
+    }
+    state.texture_to_mapping.insert((0, 7), 99);
+
+    let mut payload = vec![0u8; 8];
+    payload[4..8].copy_from_slice(&7u32.to_le_bytes()); // {task 0, object 7}
+    let pkt = Packet {
+        opcode: CHILD_OP_REPLACE_PHYSICAL,
+        stamp_waits: Vec::new(),
+        total_size: PACKET_HEADER_LEN + 8,
+        completion_stamp: 0,
+        payload,
+        next_head: 0,
+    };
+    process_child_packet(&mut state, &mut host, 2, &pkt);
+
+    assert_eq!(
+        state.mappings.get(&99).unwrap().page_entries,
+        vec![0xaa],
+        "an empty mapping still owns its id; the ref-keyed map must stay unread"
+    );
+}
+
 /// A short 0x3c is a lost invalidation, not a no-op: the device would keep
 /// writing through pages the guest has re-pointed. It must be named, and it
 /// must not silently drop a list it could not identify.
@@ -497,7 +669,7 @@ fn a_short_replace_physical_is_reported_and_drops_nothing() {
     }
     let pkt = Packet {
         opcode: CHILD_OP_REPLACE_PHYSICAL,
-        stamp_count: 0,
+        stamp_waits: Vec::new(),
         total_size: PACKET_HEADER_LEN + 4,
         completion_stamp: 0,
         payload: vec![0u8; 4],
@@ -530,7 +702,7 @@ fn delete_iosurface_backing_condemns_then_second_delete_tears_down() {
             2,
             &Packet {
                 opcode: CHILD_OP_DELETE_IOSURFACE_BACKING2,
-                stamp_count: 0,
+                stamp_waits: Vec::new(),
                 total_size: PACKET_HEADER_LEN + payload.len() as u32,
                 completion_stamp: 0,
                 payload,
@@ -610,7 +782,7 @@ fn composite_named_present_captures_the_named_member_however_far_it_lags() {
     state.present.height = h;
 
     let present_named = |state: &mut DeviceState, host: &mut FakeHost, mid: u32| {
-        process_child_packet(state, host, 5, &present_packet(CHILD_OP_PRESENT_X86, mid));
+        process_child_packet(state, host, 5, &present_packet(CHILD_OP_DISPLAY_TRANSACTION2, mid));
     };
 
     // Healthy alternation: both members publish, the named member is captured.
@@ -751,7 +923,7 @@ fn translation_deferred_holds_sibling_unmap_head_and_stamp() {
     assert_eq!(state.translation_order_hold_mask, sibling_bit);
     assert_eq!(state.translation_order_holds, 1, "poll retries coalesce");
 
-    note_translation_order_hold(&mut state, TRANSLATION_ROOT_FIFO_BIT);
+    note_translation_order_hold(&mut state, ROOT_FIFO_BIT);
     assert_eq!(
         state.translation_order_holds, 1,
         "new timeline bits in one ownership interval remain one episode"
@@ -784,7 +956,7 @@ fn free_fifo_clears_translation_scheduler_state() {
         &mut host,
         &Packet {
             opcode: ROOT_OP_FREE_FIFO,
-            stamp_count: 0,
+            stamp_waits: Vec::new(),
             total_size: PACKET_HEADER_LEN + 4,
             completion_stamp: 0,
             payload: 1u32.to_le_bytes().to_vec(),
@@ -816,7 +988,7 @@ fn composite_present_sets_frame_flush_boundary() {
     }
     state.note_surface_composite(4);
 
-    let pkt = present_packet(CHILD_OP_PRESENT_X86, 4);
+    let pkt = present_packet(CHILD_OP_DISPLAY_TRANSACTION2, 4);
     process_child_packet(&mut state, &mut host, 5, &pkt);
     assert!(state.present.frame_flush_seen);
     assert_coalesced_paint_action(&host, "composite sets flush boundary");
@@ -881,7 +1053,7 @@ fn present_x86_op6_paints_surface_id_mapping() {
         &mut state,
         &mut host,
         5,
-        &present_packet(CHILD_OP_PRESENT_X86, 5),
+        &present_packet(CHILD_OP_DISPLAY_TRANSACTION2, 5),
     );
     assert_eq!(state.present.present_mapping, 5);
     assert!(state.present.frame_flush_seen);
@@ -1096,11 +1268,11 @@ fn child_drain_yields_after_present_for_display_consumer() {
     assert!(state.map_surface(4));
     assert!(state.set_mapping_geom(4, 2, 2, MTL_FORMAT_BGRA8_UNORM));
 
-    let mut payload = vec![0u8; display_txn_trailer_len(CHILD_OP_PRESENT_X86)];
-    payload[PRESENT_X86_SURFACE_ID..PRESENT_X86_SURFACE_ID + 4]
+    let mut payload = vec![0u8; display_txn_trailer_len(CHILD_OP_DISPLAY_TRANSACTION2)];
+    payload[DISPLAY_TRANSACTION2_SURFACE_ID..DISPLAY_TRANSACTION2_SURFACE_ID + 4]
         .copy_from_slice(&4u32.to_le_bytes());
-    let first = packet_bytes(CHILD_OP_PRESENT_X86, 21, &payload);
-    let second = packet_bytes(CHILD_OP_PRESENT_X86, 22, &payload);
+    let first = packet_bytes(CHILD_OP_DISPLAY_TRANSACTION2, 21, &payload);
+    let second = packet_bytes(CHILD_OP_DISPLAY_TRANSACTION2, 22, &payload);
     let mut ring = first.clone();
     ring.extend_from_slice(&second);
     host.write_gpa(ring_gpa, &ring).unwrap();
@@ -1677,7 +1849,7 @@ fn display_lifecycle_events_are_always_logged() {
     payload[CHILD_SHARED_STATE_PFN..CHILD_SHARED_STATE_PFN + 4].copy_from_slice(&pfn.to_le_bytes());
     let setup = Packet {
         opcode: CHILD_OP_SETUP_SHARED_STATE,
-        stamp_count: 0,
+        stamp_waits: Vec::new(),
         total_size: PACKET_HEADER_LEN + CHILD_SHARED_STATE_LEN as u32,
         completion_stamp: 0,
         payload,
@@ -1689,7 +1861,7 @@ fn display_lifecycle_events_are_always_logged() {
     // Guest ack.
     let ack = Packet {
         opcode: CHILD_OP_ONLINE_ACK,
-        stamp_count: 0,
+        stamp_waits: Vec::new(),
         total_size: PACKET_HEADER_LEN,
         completion_stamp: 0,
         payload: vec![],
@@ -1730,6 +1902,141 @@ fn display_lifecycle_events_are_always_logged() {
     assert!(
         log.contains(&format!("display_online_signal index={index}")),
         "first ONLINE signal must be logged"
+    );
+}
+
+/// Both ways the ONLINE handshake can end without a display say so.
+///
+/// The rail has one success line (`display_online_signal`, on the first pulse)
+/// and two silent exits, and the silent ones are the states a user actually
+/// notices: a desktop that never appears. Neither is expected control flow —
+/// the guest published the shared page in both cases — so both are on the fail
+/// channel, and both are latched because each recurs on every poll for the rest
+/// of the boot.
+///
+/// The third exit, `mask & ONLINE == 0`, has its own test below. It used to be
+/// described here as "deliberately absent from this test and from the log",
+/// and the second half of that stopped being true when it gained a bounded
+/// report of its own.
+#[test]
+fn the_two_ways_online_gives_up_are_both_fail_visible() {
+    let index = 3u32;
+
+    // Exhaustion. This case sets `online_tries` to the cap directly, and what
+    // that models is a guest that **enabled** the display and acked none of the
+    // 150 ONLINE pulses — not, as this comment used to say, one that never
+    // enabled. The increment sits past the enable-mask check, so a guest that
+    // never enables cannot reach this branch at all, which is what
+    // `a_guest_that_never_enables_cannot_reach_the_online_cap` pins.
+    {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let mut host = FakeHost::new();
+        let gpa = 0x7c000000u64;
+        host.map_range(gpa, PAGE_SIZE_ARM64E as usize, 0);
+        state.display.shared_gpa = gpa;
+        state.display.display_index = index;
+        state.display.online_tries = DISPLAY_ONLINE_MAX_TRIES;
+        try_display_online(&mut state, &mut host);
+        assert!(
+            host.actions.is_empty(),
+            "past the cap nothing is asserted; only the reason is new"
+        );
+    }
+
+    // The enable mask itself unreadable: every try is spent against nothing,
+    // and at the cap that is indistinguishable from the case above.
+    //
+    // The address is chosen so the 4-byte read walks off the end of the address
+    // space and `read_gpa` answers `MemError::Overflow`. `FakeHost` returns
+    // zeroes for an address that is merely unmapped, which is a *readable* mask
+    // with no bits set — the third exit, not this one — so an unmapped GPA
+    // would test the wrong thing.
+    let unreadable = u64::MAX - DISPLAY_SHARED_ENABLE_MASK - 1;
+    {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let mut host = FakeHost::new();
+        state.display.shared_gpa = unreadable;
+        state.display.display_index = index;
+        state.display.poll_ctr = DISPLAY_ONLINE_POLL_DIVISOR - 1;
+        try_display_online(&mut state, &mut host);
+        assert!(host.actions.is_empty());
+        assert_eq!(
+            state.display.online_tries, 0,
+            "an unreadable mask is not an assert"
+        );
+    }
+
+    let log = std::fs::read_to_string(crate::observe::fail_log_path()).expect("fail log");
+    assert!(
+        log.contains(&format!(
+            "display_online_abandoned index={index} tries={DISPLAY_ONLINE_MAX_TRIES}"
+        )),
+        "giving up on ONLINE for the rest of the boot must name itself"
+    );
+    assert!(
+        log.contains(&format!(
+            "display_online_mask_unreadable gpa={:#x}",
+            unreadable + DISPLAY_SHARED_ENABLE_MASK
+        )),
+        "an unreadable enable mask must not look like a guest that declined"
+    );
+}
+
+/// A guest that publishes the display shared page and never enables it cannot
+/// reach the ONLINE cap, and now says so on its own.
+///
+/// This is the case `display_online_abandoned` was worded as covering and
+/// structurally cannot: `online_tries` is incremented at the tail of
+/// `try_display_online`, past the enable-mask check, so a guest sitting at that
+/// check leaves the counter at zero however long it polls. Before the report
+/// below it emitted nothing at all — no `signal`, no `abandoned` — so the state
+/// a user sees as a black screen was the one state with a clean log.
+///
+/// Both halves are asserted because each fails differently. The counter staying
+/// at zero is what makes the *old* wording impossible; the line appearing is
+/// what makes the state visible. A fix that only did the second would leave the
+/// abandon line still able to mean two things.
+#[test]
+fn a_guest_that_never_enables_cannot_reach_the_online_cap() {
+    // Its own display index: the report is latched per index by `first_sight`,
+    // so sharing one with another test would consume the latch and leave this
+    // asserting on a line some earlier test emitted.
+    let index = 21u32;
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    let gpa = 0x7d000000u64;
+    // Mapped and readable, and left as zeroes: a readable mask with the enable
+    // bit clear is exactly the state under test, and an *unmapped* page would
+    // take the unreadable arm instead.
+    host.map_range(gpa, PAGE_SIZE_ARM64E as usize, 0);
+    state.display.shared_gpa = gpa;
+    state.display.display_index = index;
+
+    // Past the reporting bound, so the next acted poll is the one that reports.
+    // Poll the full divisor so the cadence gate is crossed rather than assumed.
+    state.display.poll_ctr = DISPLAY_ONLINE_MAX_TRIES * DISPLAY_ONLINE_POLL_DIVISOR + 1;
+    for _ in 0..DISPLAY_ONLINE_POLL_DIVISOR {
+        try_display_online(&mut state, &mut host);
+    }
+
+    assert_eq!(
+        state.display.online_tries, 0,
+        "no ONLINE pulse was sent, so the cap can never be reached this way — \
+         which is why the abandon line cannot mean what it used to say"
+    );
+    assert!(
+        host.actions.is_empty(),
+        "and nothing was asserted at the guest"
+    );
+
+    let log = std::fs::read_to_string(crate::observe::fail_log_path()).expect("fail log");
+    assert!(
+        log.contains(&format!("display_online_never_enabled index={index}")),
+        "a display that never comes online must not leave a clean log"
+    );
+    assert!(
+        !log.contains(&format!("display_online_abandoned index={index}")),
+        "and it must not borrow the other exit's name"
     );
 }
 
@@ -1971,6 +2278,13 @@ fn the_readback_split_divides_a_round_trip_from_the_bytes_it_carried() {
     c.note_readback(ReadbackPhase::Fence, 9_000);
     c.note_readback(ReadbackPhase::Map, 750);
     c.note_readback(ReadbackPhase::Write, 640);
+    // The two host-side halves the GPU rail leaves behind when it stops moving
+    // bytes. Reported here so a phase added to the enum without a slot in the
+    // census arrays fails this test rather than panicking the emitter on a live
+    // boot — which is where the `[_; 4]` that outlived a six-variant enum showed
+    // up, on the reporting path, after every compile check had passed.
+    c.note_readback(ReadbackPhase::Vouch, 300);
+    c.note_readback(ReadbackPhase::Resolve, 90);
     assert!(c.note(0, 0, 6_100).is_some(), "a full window must report");
 
     let split = c
@@ -1981,6 +2295,8 @@ fn the_readback_split_divides_a_round_trip_from_the_bytes_it_carried() {
     assert!(split.contains("fence_us=14400 fence=2"), "{split}");
     assert!(split.contains("map_us=1550 map=2"), "{split}");
     assert!(split.contains("write_us=1240 write=2"), "{split}");
+    assert!(split.contains("vouch_us=300 vouch=1"), "{split}");
+    assert!(split.contains("resolve_us=90 resolve=1"), "{split}");
     // The tail matters for the same reason it does on the rail above: a mean
     // fence of 7.2 ms and a worst of 9 ms is a steady tax, not a hitch.
     assert!(split.contains("fence_max_us=9000"), "{split}");
@@ -2071,10 +2387,10 @@ fn a_fragmented_writeback_stages_nothing_when_the_staged_frame_is_the_source() {
     // is invisible against a frame of identical bytes.
     let frame: Vec<u8> = (0..need).map(|i| (i % 251) as u8).collect();
     // Drain whatever earlier tests in this binary left in the shared census.
-    let _ = super::SURFACE_WRITE.take(0);
+    let _ = super::census::SURFACE_WRITE.take(0);
     assert!(write_bgra8(&mut state, &mut host, 9, &frame, stride, w, h));
 
-    let line = super::SURFACE_WRITE
+    let line = super::census::SURFACE_WRITE
         .take(1_000)
         .expect("a writeback must report");
     assert!(
@@ -2432,7 +2748,8 @@ fn the_vcpu_lock_census_reports_the_blocked_side_and_separates_free_acquisitions
 /// measures.
 #[test]
 fn the_doorbell_census_separates_a_deferred_apply_from_a_direct_one() {
-    use crate::runtime::drain::{DoorbellCensus, UNCONTENDED_POLL};
+    use crate::runtime::drain::census::UNCONTENDED_POLL;
+    use crate::runtime::drain::DoorbellCensus;
     let c = DoorbellCensus::default();
     assert!(
         c.note_queued(0x100c, 1, 5_000).is_none(),
@@ -2500,7 +2817,8 @@ fn the_doorbell_census_separates_a_deferred_apply_from_a_direct_one() {
 /// `uncontended`) is something the log can actually say.
 #[test]
 fn the_vcpu_lock_census_reports_a_window_that_never_blocked() {
-    use crate::runtime::drain::{VcpuLockCensus, UNCONTENDED_POLL};
+    use crate::runtime::drain::census::UNCONTENDED_POLL;
+    use crate::runtime::drain::VcpuLockCensus;
     let c = VcpuLockCensus::default();
     let mut line = None;
     // The clock is only read at a poll, so the window spans exactly one poll
@@ -2741,7 +3059,7 @@ fn acked_stale_online_bit_is_suppressed_not_redelivered() {
 fn unmap_memory_retains_gva_host_cache_for_sample() {
     use crate::contract::endian::{st32, st64};
     use crate::model::GvaHostView;
-    use crate::runtime::decode::fifo::CHILD_OP_UNMAP_MEMORY;
+    use crate::model::CHILD_OP_UNMAP_MEMORY;
     use crate::runtime::surface_cache;
 
     let page_shift = PAGE_SHIFT_X86;
@@ -2758,7 +3076,7 @@ fn unmap_memory_retains_gva_host_cache_for_sample() {
         px[2] = 81;
         px[3] = 255;
     }
-    surface_cache::store_gva_owned(&mut state, gva, w, h, bgra, 0, None);
+    surface_cache::store_gva_owned(&mut state, gva, w, h, bgra, 0, None, true);
     // Simulated HostOps view of the same GVA (zero-copy import substrate).
     state.gva_host_views.push(GvaHostView {
         task_id: 1,
@@ -2784,7 +3102,7 @@ fn unmap_memory_retains_gva_host_cache_for_sample() {
     st64(&mut unmap_pl[12..20], 0x10000);
     let unmap = Packet {
         opcode: CHILD_OP_UNMAP_MEMORY,
-        stamp_count: 0,
+        stamp_waits: Vec::new(),
         total_size: PACKET_HEADER_LEN + 20,
         completion_stamp: 0,
         payload: unmap_pl,
@@ -2805,9 +3123,8 @@ fn unmap_memory_retains_gva_host_cache_for_sample() {
 #[test]
 fn invalidate_resources_bumps_mapping_content_generation() {
     use crate::contract::endian::st32;
-    use crate::runtime::decode::fifo::{
-        CHILD_INVALIDATE_PAGEON_FLAGS, CHILD_OP_INVALIDATE_RESOURCES,
-    };
+    use crate::model::CHILD_OP_INVALIDATE_RESOURCES;
+    use crate::runtime::decode::fifo::CHILD_INVALIDATE_PAGEON_FLAGS;
 
     let mut host = FakeHost::new();
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
@@ -2827,7 +3144,7 @@ fn invalidate_resources_bumps_mapping_content_generation() {
         4,
         &Packet {
             opcode: CHILD_OP_INVALIDATE_RESOURCES,
-            stamp_count: 0,
+            stamp_waits: Vec::new(),
             total_size: PACKET_HEADER_LEN + 16,
             completion_stamp: 0,
             payload: pl,
@@ -2843,7 +3160,7 @@ fn invalidate_resources_bumps_mapping_content_generation() {
 fn map_memory2_does_not_flush_gva_host_cache_on_wire() {
     use crate::contract::endian::{st32, st64};
     use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
-    use crate::runtime::decode::fifo::CHILD_OP_MAP_MEMORY2;
+    use crate::model::CHILD_OP_MAP_MEMORY2;
     use crate::runtime::surface_cache;
 
     let page_shift = PAGE_SHIFT_X86;
@@ -2862,14 +3179,14 @@ fn map_memory2_does_not_flush_gva_host_cache_on_wire() {
     let _ = host.write_gpa(root_gpa + 4, &d[..4]);
 
     let mut state = DeviceState::new(DeviceId(1), page_shift);
-    assert!(state.define_task(1, 0x1000, 2));
+    state.define_task(1, 0x1000, 2);
     let gva = 1u64 << page_shift;
     let mut bgra = vec![0u8; 16];
     bgra[0] = 185;
     bgra[1] = 126;
     bgra[2] = 81;
     bgra[3] = 255;
-    surface_cache::store_gva_owned(&mut state, gva, 2, 2, bgra, 0, None);
+    surface_cache::store_gva_owned(&mut state, gva, 2, 2, bgra, 0, None, true);
 
     let mut pl = vec![0u8; 20];
     st32(&mut pl[0..], 1);
@@ -2881,7 +3198,7 @@ fn map_memory2_does_not_flush_gva_host_cache_on_wire() {
         2,
         &Packet {
             opcode: CHILD_OP_MAP_MEMORY2,
-            stamp_count: 0,
+            stamp_waits: Vec::new(),
             total_size: PACKET_HEADER_LEN + 20,
             completion_stamp: 0,
             payload: pl,
@@ -2903,7 +3220,7 @@ fn synchronize_resources_does_not_write_guest_pages() {
     use crate::contract::endian::st32;
     use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
     use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
-    use crate::runtime::decode::fifo::CHILD_OP_SYNCHRONIZE_RESOURCES;
+    use crate::model::CHILD_OP_SYNCHRONIZE_RESOURCES;
     use crate::runtime::surface_cache;
 
     let page_shift = PAGE_SHIFT_X86;
@@ -2941,7 +3258,7 @@ fn synchronize_resources_does_not_write_guest_pages() {
         4,
         &Packet {
             opcode: CHILD_OP_SYNCHRONIZE_RESOURCES,
-            stamp_count: 0,
+            stamp_waits: Vec::new(),
             total_size: PACKET_HEADER_LEN + 12,
             completion_stamp: 0,
             payload: pl,
@@ -2961,7 +3278,7 @@ fn synchronize_resources_does_not_write_guest_pages() {
 #[test]
 fn invalidate_without_clr_host_does_not_bump_generation() {
     use crate::contract::endian::st32;
-    use crate::runtime::decode::fifo::CHILD_OP_INVALIDATE_RESOURCES;
+    use crate::model::CHILD_OP_INVALIDATE_RESOURCES;
 
     let mut host = FakeHost::new();
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
@@ -2982,7 +3299,7 @@ fn invalidate_without_clr_host_does_not_bump_generation() {
         4,
         &Packet {
             opcode: CHILD_OP_INVALIDATE_RESOURCES,
-            stamp_count: 0,
+            stamp_waits: Vec::new(),
             total_size: PACKET_HEADER_LEN + 16,
             completion_stamp: 0,
             payload: pl,
@@ -3277,15 +3594,15 @@ fn the_display_flush_fence_is_a_named_command_and_not_a_defect() {
     let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
     let mut host = FakeHost::new();
     let fence = |plen: usize| Packet {
-        opcode: CHILD_OP_FLUSH_CHANNEL_EVENT,
-        stamp_count: 0,
+        opcode: CHILD_OP_NOP,
+        stamp_waits: Vec::new(),
         total_size: PACKET_HEADER_LEN + plen as u32,
         completion_stamp: 0,
         payload: vec![0u8; plen],
         next_head: 0,
     };
 
-    let n = store_route_count("child_flush_channel_event");
+    let n = store_route_count("child_nop");
     let disposition = process_child_packet(&mut state, &mut host, 4, &fence(0));
     assert_eq!(
         disposition,
@@ -3293,7 +3610,7 @@ fn the_display_flush_fence_is_a_named_command_and_not_a_defect() {
         "the stamps must retire, or the guest waits on this fence forever"
     );
     assert_eq!(
-        store_route_count("child_flush_channel_event"),
+        store_route_count("child_nop"),
         n + 1,
         "the command is counted like every other decoded one"
     );
@@ -3301,7 +3618,7 @@ fn the_display_flush_fence_is_a_named_command_and_not_a_defect() {
         !state.fails.iter().any(|e| matches!(
             e,
             FailEvent::UnknownChildOpcode {
-                opcode: CHILD_OP_FLUSH_CHANNEL_EVENT,
+                opcode: CHILD_OP_NOP,
                 ..
             }
         )),
@@ -3310,7 +3627,7 @@ fn the_display_flush_fence_is_a_named_command_and_not_a_defect() {
 
     // A payload is the one thing that would falsify the stamps-only reading.
     process_child_packet(&mut state, &mut host, 4, &fence(4));
-    assert_eq!(store_route_count("child_flush_channel_event"), n + 2);
+    assert_eq!(store_route_count("child_nop"), n + 2);
 }
 
 /// A display-transaction command longer than its declared trailer must alarm,
@@ -3330,7 +3647,7 @@ fn an_overlong_display_transaction_alarms_once_per_shape() {
     let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
     let packet = |opcode: u16, plen: usize| Packet {
         opcode,
-        stamp_count: 0,
+        stamp_waits: Vec::new(),
         total_size: PACKET_HEADER_LEN + plen as u32,
         completion_stamp: 0,
         payload: vec![0u8; plen],
@@ -3339,8 +3656,8 @@ fn an_overlong_display_transaction_alarms_once_per_shape() {
 
     // Every command at exactly its declared trailer is conformant and silent.
     let quiet = store_route_count("display_txn_payload_overlong");
-    note_display_txn_payload(&mut state, 5, &packet(CHILD_OP_PRESENT_X86, 0x0c));
-    note_display_txn_payload(&mut state, 5, &packet(CHILD_OP_PRESENT_GAMMA_X86, 0x24));
+    note_display_txn_payload(&mut state, 5, &packet(CHILD_OP_DISPLAY_TRANSACTION2, 0x0c));
+    note_display_txn_payload(&mut state, 5, &packet(CHILD_OP_DISPLAY_TRANSACTION3, 0x24));
     note_display_txn_payload(&mut state, 4, &packet(CHILD_OP_DISPLAY_SWAP, 0x0c));
     assert_eq!(
         store_route_count("display_txn_payload_overlong"),
@@ -3351,7 +3668,7 @@ fn an_overlong_display_transaction_alarms_once_per_shape() {
 
     // A payload past the trailer is the one thing that falsifies the decode.
     for _ in 0..8 {
-        note_display_txn_payload(&mut state, 5, &packet(CHILD_OP_PRESENT_X86, 64));
+        note_display_txn_payload(&mut state, 5, &packet(CHILD_OP_DISPLAY_TRANSACTION2, 64));
     }
     assert_eq!(
         store_route_count("display_txn_payload_overlong"),
@@ -3366,7 +3683,7 @@ fn an_overlong_display_transaction_alarms_once_per_shape() {
 
     // The gamma variant's trailer is larger, so 0x24 is conformant there while
     // the same length would be overlong for op6 - the sizes are per command.
-    note_display_txn_payload(&mut state, 5, &packet(CHILD_OP_PRESENT_X86, 0x24));
+    note_display_txn_payload(&mut state, 5, &packet(CHILD_OP_DISPLAY_TRANSACTION2, 0x24));
     assert_eq!(
         state.display.txn_payload_samples.len(),
         2,
@@ -3392,7 +3709,7 @@ fn the_overlong_alarm_dumps_the_tail_and_explains_the_right_command() {
     let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_ARM64E);
     let packet = |opcode: u16, payload: Vec<u8>| Packet {
         opcode,
-        stamp_count: 0,
+        stamp_waits: Vec::new(),
         total_size: PACKET_HEADER_LEN + payload.len() as u32,
         completion_stamp: 0,
         payload,
@@ -3436,7 +3753,7 @@ fn the_overlong_alarm_dumps_the_tail_and_explains_the_right_command() {
     // op6 does serialize a transaction, so the plane-list reading is its own
     // and must survive. Same alarm, different explanation.
     let cap = crate::observe::FailCapture::start();
-    note_display_txn_payload(&mut state, 5, &packet(CHILD_OP_PRESENT_X86, vec![7u8; 64]));
+    note_display_txn_payload(&mut state, 5, &packet(CHILD_OP_DISPLAY_TRANSACTION2, vec![7u8; 64]));
     let lines = cap.lines();
     let line = lines
         .iter()
@@ -3454,7 +3771,7 @@ fn the_overlong_alarm_dumps_the_tail_and_explains_the_right_command() {
     note_display_txn_payload(
         &mut state,
         5,
-        &packet(CHILD_OP_PRESENT_X86, vec![0u8; 4096]),
+        &packet(CHILD_OP_DISPLAY_TRANSACTION2, vec![0u8; 4096]),
     );
     let lines = cap.lines();
     let line = lines
@@ -3483,12 +3800,12 @@ fn the_overlong_alarm_dumps_the_tail_and_explains_the_right_command() {
 fn display_txn_trailer_slots_follow_the_emitting_command() {
     // command 6: [pipe][surface][task] — surface in slot 1, task in slot 2.
     assert_eq!(
-        display_txn_trailer_slots(CHILD_OP_PRESENT_X86),
+        display_txn_trailer_slots(CHILD_OP_DISPLAY_TRANSACTION2),
         (1, Some(2))
     );
     // command 7: [pipe][task][surface][gamma…] — the two are swapped.
     assert_eq!(
-        display_txn_trailer_slots(CHILD_OP_PRESENT_GAMMA_X86),
+        display_txn_trailer_slots(CHILD_OP_DISPLAY_TRANSACTION3),
         (2, Some(1))
     );
     // command 8 `CmdDisplaySwapMapping` is not a transaction at all: it names
@@ -3501,8 +3818,8 @@ fn display_txn_trailer_slots_follow_the_emitting_command() {
     );
     // The present path reads the same field the census does, for every command.
     for (op, off) in [
-        (CHILD_OP_PRESENT_X86, PRESENT_X86_SURFACE_ID),
-        (CHILD_OP_PRESENT_GAMMA_X86, PRESENT_GAMMA_X86_SURFACE_ID),
+        (CHILD_OP_DISPLAY_TRANSACTION2, DISPLAY_TRANSACTION2_SURFACE_ID),
+        (CHILD_OP_DISPLAY_TRANSACTION3, DISPLAY_TRANSACTION3_SURFACE_ID),
         (CHILD_OP_DISPLAY_SWAP, DISPLAY_SWAP_MAPPING),
     ] {
         let mut p = vec![0u8; display_txn_trailer_len(op)];
@@ -3525,7 +3842,7 @@ fn display_txn_trailer_slots_follow_the_emitting_command() {
     gamma.extend_from_slice(&0x2au32.to_le_bytes()); // surface
     gamma.resize(0x24, 0);
     assert_eq!(
-        present_surface_id(CHILD_OP_PRESENT_GAMMA_X86, &gamma),
+        present_surface_id(CHILD_OP_DISPLAY_TRANSACTION3, &gamma),
         Some(0x2a),
         "gamma's surface is the third word; the second is its task"
     );
@@ -3536,7 +3853,7 @@ fn display_txn_trailer_slots_follow_the_emitting_command() {
     plain.extend_from_slice(&9u32.to_le_bytes()); // task
     plain.resize(0x0c, 0);
     assert_eq!(
-        present_surface_id(CHILD_OP_PRESENT_X86, &plain),
+        present_surface_id(CHILD_OP_DISPLAY_TRANSACTION2, &plain),
         Some(0x2a),
         "the plain command's surface is the second word; the third is its task"
     );
@@ -3550,21 +3867,21 @@ fn display_txn_trailer_slots_follow_the_emitting_command() {
 /// payload that does carry an inline plane list would still look trailer-only.
 #[test]
 fn display_txn_trailer_width_matches_the_emitting_command() {
-    assert_eq!(display_txn_trailer_len(CHILD_OP_PRESENT_X86), 0x0c);
-    assert_eq!(display_txn_trailer_len(CHILD_OP_PRESENT_GAMMA_X86), 0x24);
+    assert_eq!(display_txn_trailer_len(CHILD_OP_DISPLAY_TRANSACTION2), 0x0c);
+    assert_eq!(display_txn_trailer_len(CHILD_OP_DISPLAY_TRANSACTION3), 0x24);
     assert_eq!(display_txn_trailer_len(CHILD_OP_DISPLAY_SWAP), 0x0c);
 }
 
-/// A present the dmabuf carried is not a black present.
+/// A present a resident carried is not a black present.
 ///
-/// Route B skips the full-frame GPU→CPU readback on purpose, so `frame_bgra` is
-/// empty by design and any `max_rgb == 0` test reports black on every present —
-/// a live boot logged 1338 `present_black_retain` records against 1312 presents.
-/// An always-on failure sink that fires on every healthy frame cannot surface the
-/// unhealthy one, so "no pixels" must be its own verdict rather than folded into
-/// "black".
+/// When the window presents the engine's own resident, the capture skips the
+/// full-frame GPU→CPU readback on purpose, so `frame_bgra` is empty by design and
+/// any `max_rgb == 0` test reports black on every present — a live boot logged
+/// 1338 `present_black_retain` records against 1312 presents. An always-on
+/// failure sink that fires on every healthy frame cannot surface the unhealthy
+/// one, so "no pixels" must be its own verdict rather than folded into "black".
 #[test]
-fn a_dmabuf_carried_present_is_unsampled_not_black() {
+fn a_resident_carried_present_is_unsampled_not_black() {
     assert_eq!(
         present_content_verdict(&[], 0),
         PresentContentVerdict::Unsampled,
@@ -3583,340 +3900,9 @@ fn a_dmabuf_carried_present_is_unsampled_not_black() {
     );
 }
 
-/// The guest's fence drains BOTH raw-address deferred rails, not just the GVA
-/// render one.
-///
-/// `write_stamp` is this device's only statement that work is finished, and from
-/// the instant it lands the guest may free everything it allocated for that work.
-/// `flush_gva_windows_before_fence` put the GVA render rail inside that
-/// boundary; the linear compute-storage rail names a raw task GVA too
-/// (`ComputeStorageResidencyKey::linear` — `mapping_id` 0, task id parked in
-/// `map_generation`), so it has no mapping incarnation to refuse on and belongs
-/// inside the same boundary. Measured at one landing per ten minutes and 1 019
-/// fences late, so the ordering costs nothing and the window is real.
-///
-/// Asserted at `write_stamp` rather than on the flush helper because the
-/// contract is about the fence, not about a function: a future stamp path that
-/// forgets to drain would pass a helper-level test.
-#[cfg(feature = "backend-vulkan")]
-#[test]
-fn a_completion_stamp_drains_the_linear_rail_as_well_as_the_gva_rail() {
-    use crate::model::{ComputeStorageResidencyKey, DeviceId, GvaDeferredEntry};
-    use crate::runtime::host::FakeHost;
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
-    let mut host = FakeHost::new();
-    // A FIFO base page the stamp write can land in; without it `write_stamp`
-    // returns before doing anything and the test would pass vacuously.
-    let fifo_pfn = 0x40u32;
-    host.map_range((fifo_pfn as u64) << PAGE_SHIFT_X86, 0x1000, 0);
-    state.gfx.fifo_base_page = fifo_pfn;
 
-    let page = 0x9000u64;
-    state.arm_gva_deferred_window(
-        0x5000,
-        GvaDeferredEntry {
-            task_id: 3,
-            texture_ref: 11,
-            producer_object_type: 0,
-            width: 8,
-            height: 8,
-            row_stride: 32,
-            format: 0x50,
-            armed_seq: 1,
-            armed_stamp_seq: 0,
-            pages: [page].into_iter().collect(),
-            alloc_gen: 0,
-        },
-    );
-    let lin = ComputeStorageResidencyKey::linear(3, 52, 0x39f000, 512, 0x1000, 128, 135, 0x46);
-    state.arm_linear_deferred_window(lin, 1, [page + 0x1000].into_iter().collect());
-    assert!(!state.gva_deferred_flush.is_empty());
-    assert!(!state.linear_deferred_flush.is_empty());
 
-    write_stamp(&mut state, &mut host, 0, 7);
-
-    assert!(
-        state.gva_deferred_flush.is_empty(),
-        "the GVA rail must not survive the fence"
-    );
-    assert!(
-        state.linear_deferred_flush.is_empty(),
-        "the linear rail writes a raw task GVA too and must not survive the fence"
-    );
-    assert_eq!(
-        state.completion_stamp_seq, 1,
-        "the stamp counter advances once the guest has been told"
-    );
-}
-
-/// The guest's fence lands a type-11 render window's pixels in guest RAM, and
-/// lands them *whole*.
-///
-/// The mapping-keyed rail is inside the fence for a different reason from the
-/// two raw-address rails above. It can refuse a mapping incarnation the guest
-/// replaced (`map_generation`), so free-then-reuse is not its hazard. Its hazard
-/// is that the writeback covers the full attachment extent while the guest holds
-/// the same IOSurface mapped and writes it: one measured boot landed 12 343
-/// windows and reported 8 968 of them as `deferred_flush_clobber`, each one the
-/// device replacing bytes the guest itself had stored after the Store.
-///
-/// So this asserts both halves. The window must not survive the stamp — that is
-/// the ordering — and the guest pages must hold the window's own frame
-/// afterwards, because a rail that satisfied the first by dropping the
-/// obligation would be a silent frame loss and would pass an emptiness check.
-///
-/// Asserted at `write_stamp` rather than on the flush helper for the same reason
-/// the linear test is: the contract belongs to the fence, and a future stamp path
-/// that forgot to drain would pass a helper-level test.
-#[cfg(feature = "backend-vulkan")]
-#[test]
-fn a_completion_stamp_lands_a_type11_render_window_in_guest_memory() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::model::{ComputeStorageResidencyKey, DeviceId};
-    use crate::runtime::host::{FakeHost, HostMemory};
-
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
-    let mut host = FakeHost::new();
-    let page = 1usize << PAGE_SHIFT_X86;
-    // A FIFO base page for the stamp write, and a separate page for the surface.
-    let fifo_pfn = 0x40u32;
-    host.map_range((fifo_pfn as u64) << PAGE_SHIFT_X86, page, 0);
-    state.gfx.fifo_base_page = fifo_pfn;
-    let gpa = 0x4400_0000u64;
-    host.map_range(gpa, page, 0);
-
-    state.map_surface(9);
-    {
-        let m = state.mappings.get_mut(&9).unwrap();
-        m.mapped = true;
-        m.map_generation = 1;
-        m.has_geom = true;
-        m.width = 4;
-        m.height = 4;
-        m.format = crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
-        m.page_entries =
-            vec![(((gpa >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
-    }
-    let key = ComputeStorageResidencyKey {
-        mapping_id: 9,
-        map_generation: 1,
-        surface_offset: 0,
-        surface_bpr: 16,
-        span_end: 256,
-        width: 4,
-        height: 4,
-        pixel_format: crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM,
-        texture_ref: 0,
-    };
-    let frame = vec![0xA7u8; 4 * 4 * 4];
-    state.compute_deferred_flush.insert(
-        key,
-        crate::model::DeferredOwner::Render {
-            armed_seq: 1,
-            // Armed at the stamp this fence completes, which is the only case the
-            // rail is *allowed* to defer across; anything later is already late.
-            armed_stamp_seq: 0,
-            source: crate::model::RenderWindowSource::Owned(std::sync::Arc::new(frame.clone())),
-        },
-    );
-
-    write_stamp(&mut state, &mut host, 0, 7);
-
-    assert!(
-        state.compute_deferred_flush.is_empty(),
-        "a mapping-keyed window must not survive the fence that says its work is done"
-    );
-    // The guest side is row-strided at the mapping's own bytes-per-row, so read
-    // it the way the writeback wrote it.
-    let (base_off, bpr, _) = {
-        let m = state.mappings.get(&9).unwrap();
-        crate::runtime::mapping_write::type11_sample_window(
-            m,
-            9,
-            4,
-            4,
-            crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM,
-        )
-        .expect("the mapping has a type-11 sample window")
-    };
-    for y in 0..4u64 {
-        let mut row = [0u8; 4 * 4];
-        host.read_gpa(gpa + base_off + y * bpr as u64, &mut row)
-            .unwrap();
-        assert_eq!(
-            &row[..],
-            &frame[(y as usize) * 16..(y as usize) * 16 + 16],
-            "row {y} must hold the deferred frame: the fence lands the window, it does not drop it"
-        );
-    }
-}
-
-/// The **root** completion stamp is a fence too, and the deferred rails have to
-/// land at it.
-///
-/// `write_stamp` writes the child stamp slots and drains every rail first. The
-/// root stamp does not go through it: `drain_main_fifo` writes slot 0 itself, and
-/// that slot is what a root packet's submitter waits on. A rail bound only to
-/// `write_stamp` is therefore not bound at all on the highest-traffic completion
-/// path in the device — the guest is told the work finished, is free to release
-/// the render target, and its allocator may hand those pages to a kalloc element
-/// or another process's heap before the window lands. That is the write-after-free
-/// the guest's own poison check reports as `element modified after free
-/// (val:0xffffffffffffffff)`: a window's worth of opaque white pixels landing in
-/// memory that stopped being a render target.
-///
-/// The counter matters as much as the flush. `armed_stamp_seq` is compared
-/// against `completion_stamp_seq`, and only `write_stamp` used to move it, so a
-/// window that sat through hundreds of root completions scored as punctual — the
-/// measurement that reports this rail healthy and the repair that would have
-/// bound it shared one blind spot. Asserting the counter here is what stops a
-/// future flush-only fix from being unmeasurable.
-#[cfg(feature = "backend-vulkan")]
-#[test]
-fn the_root_completion_stamp_lands_the_deferred_rails_and_moves_the_counter() {
-    use crate::model::{DeviceId, GvaDeferredEntry};
-    use crate::runtime::host::FakeHost;
-
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
-    let mut host = FakeHost::new();
-    let page_size = 1usize << PAGE_SHIFT_X86;
-
-    // Slot 0 lives at the FIFO base page; the ring starts one page further in, so
-    // the stamp write and the packet read do not alias.
-    let fifo_pfn = 0x40u32;
-    let fifo_gpa = (fifo_pfn as u64) << PAGE_SHIFT_X86;
-    host.map_range(fifo_gpa, 3 * page_size, 0);
-    state.gfx.fifo_base_page = fifo_pfn;
-    state.gfx.fifo_start = page_size as u32;
-    state.gfx.fifo_length = 2 * page_size as u32;
-
-    // One minimal root packet: header only, no stamps, carrying the completion
-    // value the guest will read out of slot 0.
-    const ROOT_STAMP: u32 = 0x1234_5678;
-    let mut packet = [0u8; PACKET_HEADER_LEN as usize];
-    st16(&mut packet[PACKET_OPCODE..], 0);
-    st16(&mut packet[PACKET_STAMP_COUNT..], 0);
-    st32(&mut packet[PACKET_TOTAL_SIZE..], PACKET_HEADER_LEN);
-    st32(&mut packet[PACKET_COMPLETION_STAMP..], ROOT_STAMP);
-    gpa_map::write_bytes(&mut host, fifo_gpa + page_size as u64, &packet, page_size)
-        .expect("seed the root ring");
-    state
-        .gfx
-        .fifo_read
-        .store(0, std::sync::atomic::Ordering::Release);
-    state.gfx.fifo_written = PACKET_HEADER_LEN;
-
-    // A window owed to guest RAM, armed before the completion the guest waits on.
-    state.arm_gva_deferred_window(
-        0x5000,
-        GvaDeferredEntry {
-            task_id: 3,
-            texture_ref: 11,
-            producer_object_type: 0,
-            width: 8,
-            height: 8,
-            row_stride: 32,
-            format: 0x50,
-            armed_seq: 1,
-            armed_stamp_seq: 0,
-            pages: [0x9000u64].into_iter().collect(),
-            alloc_gen: 0,
-        },
-    );
-    assert!(!state.gva_deferred_flush.is_empty());
-
-    drain_main_fifo(&mut state, &mut host);
-
-    let mut slot0 = [0u8; 4];
-    crate::runtime::host::HostMemory::read_gpa(&host, fifo_gpa, &mut slot0)
-        .expect("root stamp slot");
-    assert_eq!(
-        ld32(&slot0),
-        ROOT_STAMP,
-        "the packet must actually have completed, or the test proves nothing"
-    );
-    assert!(
-        state.gva_deferred_flush.is_empty(),
-        "a deferred window must not survive the root completion stamp"
-    );
-    assert_eq!(
-        state.completion_stamp_seq, 1,
-        "the root stamp is a fence, so it must advance the counter every rail's \
-         armed_stamp_seq is measured against"
-    );
-}
-
-/// Deleting a task retires that task's deferred windows and nobody else's.
-///
-/// `retire_task_gva_windows` matched `e.task_id >> 1 == task_id` as well, on a
-/// doc-stated premise — "walks try `task_id` then `task_id >> 1`" — that the
-/// walk fallbacks it named were deleted from (`gva_view::resolve`,
-/// `gva_mem`, `task_slot::resolve_task_word`); the only surviving halving is
-/// `diagnose_gva_walk`, which builds a log string.
-///
-/// Both sides of that comparison are slot ids. `GvaDeferredEntry::task_id` is
-/// the word `resolve_task_word` accepted, and `DeleteTask` (`0x20`) carries a
-/// slot id too: its words include 5, 11 and 13 — odd and greater than one, which
-/// the `DefineTask2` doubled space (`0x1`, then strictly even) does not contain —
-/// and all 968 deletes in the boots on disk report `ok=1` against a live slot.
-///
-/// So the arm never matched a window the dying task owned, and always matched
-/// every window owned by slots `2 * task_id` and `2 * task_id + 1`. With 256
-/// slots running densely from 0 and boots using ids past 14, those are live
-/// tasks. Their windows were then landed *cache-only* — `retire_gva_windows`
-/// passes `write_guest = false` — so a live task lost a rendered frame out of
-/// guest RAM with no write and no refusal, and the guest kept compositing
-/// whatever those pages held before. That is silent loss of guest work, and it
-/// persists until something re-renders the region.
-#[cfg(feature = "backend-vulkan")]
-#[test]
-fn deleting_a_task_retires_its_own_deferred_windows_and_not_its_doubles() {
-    use crate::model::{DeviceId, GvaDeferredEntry};
-
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
-    let window = |task_id: u32| GvaDeferredEntry {
-        task_id,
-        texture_ref: 11,
-        producer_object_type: 0,
-        width: 8,
-        height: 8,
-        row_stride: 32,
-        format: 0x50,
-        armed_seq: task_id as u64,
-        armed_stamp_seq: 0,
-        pages: [0x9000u64 + u64::from(task_id) * 0x1000]
-            .into_iter()
-            .collect(),
-        alloc_gen: 0,
-    };
-    // Task 5 is the one deleted; 10 and 11 are its doubles and 2 is its half.
-    for id in [2u32, 5, 10, 11] {
-        assert!(state.define_task(id, 0x1_0000, 2), "slot {id} must be live");
-        state.arm_gva_deferred_window(u64::from(id) << 16, window(id));
-    }
-    assert_eq!(state.gva_deferred_flush.len(), 4);
-
-    assert!(state.delete_task(5), "task 5 is live and must delete");
-
-    let left: Vec<u32> = state
-        .gva_deferred_flush
-        .iter()
-        .map(|entry| entry.1.task_id)
-        .collect();
-    assert_eq!(
-        left,
-        vec![2, 10, 11],
-        "only task 5's window may be retired; 10 and 11 are live tasks whose \
-         pixels would never reach guest RAM, and 2 is unrelated"
-    );
-    assert_eq!(
-        state.retired_gva_windows.len(),
-        1,
-        "exactly one window is owed a cache-only landing"
-    );
-    assert_eq!(state.retired_gva_windows[0].1.task_id, 5);
-}
 
 /// Root and child `DefineTask2` decode one wire field one way.
 ///
@@ -3945,6 +3931,194 @@ fn a_define_task_length_is_the_full_eight_byte_field_on_both_arms() {
     );
 }
 
+/// Send a device-info request and read back the pairs the guest would parse.
+///
+/// `max_key` is exclusive and `count` is a pair capacity — the two words the
+/// reply is bound by. Returns the reply page as (key, value) pairs, stopping at
+/// the zero terminator the way the guest's own walker does.
+#[cfg(test)]
+fn device_info_reply(max_key: u32, count: u32) -> Vec<(u32, u32)> {
+    const REPLY_PFN: u32 = 0x40;
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+
+    let mut payload = vec![0u8; DEVICE_INFO_TAHOE_REPLY_PFN + 4];
+    st32(&mut payload[DEVICE_INFO_TAHOE_KEY_TABLE_LEN..], max_key);
+    st32(&mut payload[DEVICE_INFO_TAHOE_COUNT..], count);
+    st32(&mut payload[DEVICE_INFO_TAHOE_REPLY_PFN..], REPLY_PFN);
+    process_root_packet(
+        &mut state,
+        &mut host,
+        &Packet {
+            opcode: ROOT_OP_DEVICE_INFO_TAHOE,
+            stamp_waits: Vec::new(),
+            total_size: PACKET_HEADER_LEN + payload.len() as u32,
+            completion_stamp: 0,
+            payload,
+            next_head: 0,
+        },
+    );
+
+    let page_size = 1usize << PAGE_SHIFT_ARM64E;
+    let gpa = pfn_to_gpa(REPLY_PFN, PAGE_SHIFT_ARM64E);
+    let mut out = Vec::new();
+    for i in 0..count.min((page_size / DEVICE_INFO_REPLY_PAIR_LEN) as u32) {
+        let mut pair = [0u8; DEVICE_INFO_REPLY_PAIR_LEN];
+        host.read_gpa(
+            gpa + u64::from(i) * DEVICE_INFO_REPLY_PAIR_LEN as u64,
+            &mut pair,
+        )
+        .expect("reply page is readable");
+        let key = ld32(&pair[0..4]);
+        if key == 0 {
+            break;
+        }
+        out.push((key, ld32(&pair[4..8])));
+    }
+    out
+}
+
+/// The guest's first request word is its key-table *length*, not a highest key.
+///
+/// It writes `highest_key_it_parses + 1` — 18, against a walker whose jump table
+/// runs `case 0` through `case 17` — so a key at or above it is discarded on
+/// arrival. The word used to be read as an opcode and never consulted, so the
+/// reply named every key in the table whatever the guest said it could take,
+/// spending a pair slot per key on a reply the guest asks for exactly once.
+///
+/// Read as a maximum rather than a length it invents a key that does not exist,
+/// which is why the boundary is the assertion: drive a length of 4 and the reply
+/// must stop at key 3, not key 4.
+#[test]
+fn the_device_info_reply_stops_below_the_guests_key_table_length() {
+    const PAIRS_PER_PAGE: u32 = (PAGE_SIZE_ARM64E as usize / DEVICE_INFO_REPLY_PAIR_LEN) as u32;
+    let keys: Vec<u32> = device_info_reply(4, PAIRS_PER_PAGE)
+        .into_iter()
+        .map(|p| p.0)
+        .collect();
+    assert_eq!(
+        keys,
+        vec![1, 2, 3],
+        "a table of four arms is cases 0..=3, so key 3 is the last one worth \
+         sending; a key 4 here would be the length read as a maximum"
+    );
+
+    let full: Vec<u32> =
+        device_info_reply(DEVICE_INFO_KEY_BUFFER_WITH_IOSURFACE + 1, PAIRS_PER_PAGE)
+            .into_iter()
+            .map(|p| p.0)
+            .collect();
+    assert_eq!(
+        full.last().copied(),
+        Some(DEVICE_INFO_KEY_BUFFER_WITH_IOSURFACE),
+        "the length this guest sends admits every key its walker has an arm for"
+    );
+    assert!(
+        !full.contains(&(DEVICE_INFO_KEY_BUFFER_WITH_IOSURFACE + 1)),
+        "and nothing at or above it: the guest discards those on arrival"
+    );
+}
+
+/// `CmdGetComputeInfo` carries the same word and it means the same thing.
+///
+/// Its guest sends 5 against a walker of `case 0` through `case 4`, so the reply
+/// may name keys 1..=4 and no more — there is no key 5, and reading that 5 as a
+/// maximum is how "the guest asked about five keys, we answer three" becomes a
+/// two-key gap when it is a one-key one.
+///
+/// That one key is 2, `SupportsIndirectCommandBuffers`, left out on purpose:
+/// nothing in either Metal plugin reads the word the guest stores it in. Pinned
+/// here so the absence stays a decision instead of looking like an oversight.
+#[test]
+fn the_compute_info_reply_answers_three_of_the_guests_four_keys() {
+    let answered: Vec<u32> = compute_info_caps().iter().map(|&(k, _)| k).collect();
+    assert_eq!(
+        answered,
+        vec![
+            COMPUTE_INFO_KEY_MAX_TOTAL_THREADS,
+            COMPUTE_INFO_KEY_THREAD_EXECUTION_WIDTH,
+            COMPUTE_INFO_KEY_STATIC_THREADGROUP_MEMORY,
+        ],
+        "key 2 is deliberately absent; adding it means answering it 0, never 1"
+    );
+
+    // Under the guest's own table length every answered key is sendable, and one
+    // arm shorter drops the last of them. An inclusive read would keep it.
+    let sendable = |table_len: u32| -> Vec<u32> {
+        answered
+            .iter()
+            .copied()
+            .filter(|&key| key < table_len)
+            .collect()
+    };
+    assert_eq!(
+        sendable(COMPUTE_INFO_KEY_STATIC_THREADGROUP_MEMORY + 1),
+        answered
+    );
+    assert_eq!(
+        sendable(COMPUTE_INFO_KEY_STATIC_THREADGROUP_MEMORY),
+        vec![
+            COMPUTE_INFO_KEY_MAX_TOTAL_THREADS,
+            COMPUTE_INFO_KEY_THREAD_EXECUTION_WIDTH
+        ]
+    );
+}
+
+/// A device-info reply the guest's own `count` cut short says which keys it lost.
+///
+/// `count` is how many pairs the guest's buffer holds and it bounds the reply.
+/// Ask for fewer than the table offers and the tail is simply not written — and
+/// the guest issues this command once, frees the buffer, and answers every later
+/// reader from what it parsed, so there is no second, larger ask. Every key still
+/// offered at that point is the guest's own key-table length says it parses, so a key dropped
+/// here is a capability it spends the rest of the boot without.
+///
+/// The loss used to be silent, which read exactly like a table with nothing more
+/// to say.
+#[test]
+fn a_device_info_reply_cut_short_by_the_guests_count_names_the_keys_it_lost() {
+    const CEILING: u32 = 18;
+    const ASKED: u32 = 5;
+    let carried = device_info_reply(CEILING, ASKED);
+    assert_eq!(
+        carried.len(),
+        ASKED as usize,
+        "a five-pair buffer carries five pairs"
+    );
+
+    // What the reply could not carry, derived rather than spelled out so this
+    // stays true when a key is added to either end of the table.
+    let dropped: Vec<u32> = DEVICE_INFO_CAPS
+        .iter()
+        .map(|&(key, _)| key)
+        .filter(|&key| key < CEILING)
+        .skip(ASKED as usize)
+        .collect();
+    assert!(
+        !dropped.is_empty(),
+        "a five-pair ask must drop keys the guest parses, or this proves nothing"
+    );
+
+    // The fail log is process-global and appended to by every test in this
+    // binary, so match this reply's own bound as well as the reason — a bare
+    // `find` on the reason returns whichever test emitted first.
+    let log = std::fs::read_to_string(crate::observe::fail_log_path()).expect("fail log");
+    let line = log
+        .lines()
+        .rfind(|l| {
+            l.contains("reason=reply_pairs_exhausted") && l.contains(&format!("count={ASKED}"))
+        })
+        .expect("a truncated device-info reply names itself, and the count that bound it");
+    assert!(
+        line.contains(&format!("wrote={ASKED}")),
+        "and how many pairs it managed: {line}"
+    );
+    assert!(
+        line.contains(&format!("dropped={dropped:?}")),
+        "and every key it could not carry: {line}"
+    );
+}
+
 /// `CmdGetComputeInfo` answers the keys the guest asked about, and its
 /// threadgroup limits are the host's rather than a fixed pair.
 ///
@@ -3957,6 +4131,12 @@ fn a_define_task_length_is_the_full_eight_byte_field_on_both_arms() {
 /// Key 4, `staticThreadgroupMemoryLength`, is a property of the pipeline and
 /// not of the device, so no device limit answers it and it stays 0 — asserted
 /// so that stops being silent.
+///
+/// Read the name of this test narrowly. A device limit is the *right* answer for
+/// key 3 and the *available* one for key 1; `compute_info_caps`'s own doc
+/// records that key 1 is per-pipeline in Metal too, so the device number
+/// over-promises on that arm. What is asserted below is the pair of invariants
+/// that hold whichever number lands there.
 #[test]
 fn the_compute_info_reply_answers_device_limits_not_a_fixed_triple() {
     let caps = compute_info_caps();
@@ -4004,7 +4184,7 @@ fn every_short_control_packet_names_itself() {
     let mut host = FakeHost::new();
     let short = |opcode: u16, len: usize| Packet {
         opcode,
-        stamp_count: 0,
+        stamp_waits: Vec::new(),
         total_size: PACKET_HEADER_LEN + len as u32,
         completion_stamp: 0,
         payload: vec![0u8; len],
@@ -4032,9 +4212,12 @@ fn every_short_control_packet_names_itself() {
 
     for (opcode, need) in [
         (CHILD_OP_SET_OBJECT_LIST, SET_OBJECT_LIST_LEN),
-        (CHILD_OP_DELETE_OBJECT, 8),
+        (CHILD_OP_DELETE_RESOURCE, 8),
         (CHILD_OP_CURSOR_SHOW, 8),
         (CHILD_OP_SETUP_SHARED_STATE, CHILD_SHARED_STATE_LEN),
+        // Both FIFOs carry DEFINE_TASK2 and one function handles both, so the
+        // root case above does not cover the child site.
+        (CHILD_OP_DEFINE_TASK2, DEFINE_TASK_LEN),
     ] {
         process_child_packet(&mut state, &mut host, 4, &short(opcode, need - 1));
     }
@@ -4052,13 +4235,1249 @@ fn every_short_control_packet_names_itself() {
         "reason=set_object_list_short site=root",
         "reason=define_task2_short site=root",
         "reason=set_object_list_short site=ch4",
-        "reason=delete_object_short site=ch4",
+        // `0x25` is `CmdDeleteResource`. The slug must not say `delete_object`:
+        // that is `0x28`, a different command with a different payload, and a
+        // reader triaging this line would otherwise chase the wrong opcode.
+        "reason=delete_resource_short site=ch4",
         "reason=cursor_show_short site=ch4",
         "reason=setup_shared_state_short site=ch4",
+        "reason=define_task2_short site=ch4",
     ] {
         assert!(
             log.contains(reason),
             "a short packet was dropped without naming itself: {reason}"
         );
     }
+}
+
+/// Opcode 1 on the root channel is `CmdDisplaySetSharedStatePage`, the same
+/// command it is on a child channel, and its payload is read as that command's.
+///
+/// These two tests replace a pair that pinned the opposite: that the arm read
+/// the first payload word as a nested opcode and dispatched on its low half.
+/// There is no wrapper command in this protocol — see
+/// `ROOT_OP_SETUP_SHARED_STATE` — so what the old arm dispatched on was a
+/// display pipe index.
+#[test]
+fn root_opcode_one_sets_up_the_display_shared_state() {
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+
+    // `{u32 pipe index, u32 shared-state page PFN}`.
+    let mut payload = 2u32.to_le_bytes().to_vec();
+    payload.extend_from_slice(&0x40u32.to_le_bytes());
+    process_root_packet(
+        &mut state,
+        &mut host,
+        &Packet {
+            opcode: ROOT_OP_SETUP_SHARED_STATE,
+            stamp_waits: Vec::new(),
+            total_size: PACKET_HEADER_LEN + CHILD_SHARED_STATE_LEN as u32,
+            completion_stamp: 0,
+            payload,
+            next_head: 0,
+        },
+    );
+
+    assert_eq!(state.display.display_index, 2, "the pipe index latched");
+    assert_eq!(
+        state.display.shared_gpa,
+        state.pfn_gpa(0x40),
+        "and the shared-state page, from the same payload the child arm reads"
+    );
+    assert!(
+        !state
+            .fails
+            .iter()
+            .any(|e| matches!(e, FailEvent::UnknownRootOpcode { .. })),
+        "opcode 1 has a handler on the root channel"
+    );
+}
+
+/// The first payload word is this command's own data, and the old arm's reading
+/// of it as an opcode is what this pins shut.
+///
+/// A pipe index of `ROOT_OP_DELETE_TASK` is an ordinary index — Apple's own
+/// numbering has no reason to avoid it — and under the old arm it deleted a
+/// task instead of registering a display. The task is defined here so the
+/// wrong behaviour would be *visible* rather than a no-op: if this ever
+/// regresses, the task is gone and the display never latched.
+#[test]
+fn a_pipe_index_that_looks_like_an_opcode_is_still_a_pipe_index() {
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    state.define_task(3, 0x1000, 2);
+
+    let mut payload = u32::from(ROOT_OP_DELETE_TASK).to_le_bytes().to_vec();
+    payload.extend_from_slice(&3u32.to_le_bytes());
+    process_root_packet(
+        &mut state,
+        &mut host,
+        &Packet {
+            opcode: ROOT_OP_SETUP_SHARED_STATE,
+            stamp_waits: Vec::new(),
+            total_size: PACKET_HEADER_LEN + CHILD_SHARED_STATE_LEN as u32,
+            completion_stamp: 0,
+            payload,
+            next_head: 0,
+        },
+    );
+
+    assert_eq!(
+        state.display.display_index,
+        u32::from(ROOT_OP_DELETE_TASK),
+        "the word is a pipe index and latched as one"
+    );
+    assert_eq!(
+        state.display.shared_gpa,
+        state.pfn_gpa(3),
+        "and the second word is the page, not a task id"
+    );
+}
+
+/// A packet whose stamp wait is unmet is held, not run: the head does not move,
+/// no completion stamp is written, and the same packet runs once the awaited
+/// slot reaches its value.
+///
+/// Both halves are the test. Only asserting the hold would pass for a device
+/// that dropped the packet, and only asserting the release would pass for one
+/// that never held. The measured workload is 44 % held, so a release that never
+/// fires is a hang rather than a slow path.
+#[test]
+fn a_packet_whose_stamp_wait_is_unmet_is_held_until_the_slot_reaches_it() {
+    use crate::model::DeviceId;
+    use crate::runtime::host::FakeHost;
+
+    const AWAITED_SLOT: u32 = 5;
+    const AWAITED_VALUE: u32 = 7;
+    const ROOT_STAMP: u32 = 0xABC;
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut host = FakeHost::new();
+    let page_size = 1usize << PAGE_SHIFT_X86;
+
+    let fifo_pfn = 0x40u32;
+    let fifo_gpa = (fifo_pfn as u64) << PAGE_SHIFT_X86;
+    host.map_range(fifo_gpa, 3 * page_size, 0);
+    state.gfx.fifo_base_page = fifo_pfn;
+    state.gfx.fifo_start = page_size as u32;
+    state.gfx.fifo_length = 2 * page_size as u32;
+
+    // One root packet carrying a single wait record, and nothing else: the
+    // payload is empty so the only thing that can move is the head.
+    let total = PACKET_HEADER_LEN + PACKET_STAMP_LEN;
+    let mut packet = vec![0u8; total as usize];
+    st16(&mut packet[PACKET_OPCODE..], 0);
+    st16(&mut packet[PACKET_STAMP_COUNT..], 1);
+    st32(&mut packet[PACKET_TOTAL_SIZE..], total);
+    st32(&mut packet[PACKET_COMPLETION_STAMP..], ROOT_STAMP);
+    st32(&mut packet[PACKET_HEADER_LEN as usize..], AWAITED_SLOT);
+    st32(&mut packet[PACKET_HEADER_LEN as usize + 4..], AWAITED_VALUE);
+    gpa_map::write_bytes(&mut host, fifo_gpa + page_size as u64, &packet, page_size)
+        .expect("seed the root ring");
+    state
+        .gfx
+        .fifo_read
+        .store(0, std::sync::atomic::Ordering::Release);
+    state.gfx.fifo_written = total;
+
+    let slot_gpa = |slot: u32| fifo_gpa + stamp_slot_offset(slot, page_size as u64).unwrap();
+    let read_slot = |host: &FakeHost, slot: u32| {
+        let mut v = [0u8; 4];
+        crate::runtime::host::HostMemory::read_gpa(host, slot_gpa(slot), &mut v).expect("slot");
+        ld32(&v)
+    };
+
+    // Slot 5 stands at 0, so the wait is seven short of satisfied.
+    drain_main_fifo(&mut state, &mut host);
+
+    assert_eq!(
+        state
+            .gfx
+            .fifo_read
+            .load(std::sync::atomic::Ordering::Acquire),
+        0,
+        "the head must not move past a packet the device has not run, or the \
+         retry would skip it entirely"
+    );
+    assert_eq!(
+        read_slot(&host, 0),
+        0,
+        "and no completion stamp may be written, or the guest is told a packet \
+         finished that never started"
+    );
+    assert_ne!(
+        state.stamp_deferred_mask & ROOT_FIFO_BIT,
+        0,
+        "the hold has to be recorded, or nothing re-offers this timeline"
+    );
+    assert!(
+        state.pending.main_drain,
+        "a held root head is unfinished work: clearing the flag would leave the \
+         retry to whichever later doorbell happened to set it again"
+    );
+
+    // A second drain with nothing changed must hold again rather than give up.
+    drain_main_fifo(&mut state, &mut host);
+    assert_eq!(
+        state
+            .gfx
+            .fifo_read
+            .load(std::sync::atomic::Ordering::Acquire),
+        0,
+        "a retry that still cannot satisfy the wait holds again"
+    );
+
+    // Another timeline publishes the awaited stamp.
+    gpa_map::write_u32(&mut host, slot_gpa(AWAITED_SLOT), AWAITED_VALUE, page_size)
+        .expect("publish the awaited stamp");
+    drain_main_fifo(&mut state, &mut host);
+
+    assert_eq!(
+        state
+            .gfx
+            .fifo_read
+            .load(std::sync::atomic::Ordering::Acquire),
+        total,
+        "once the slot reaches the awaited value the same packet runs"
+    );
+    assert_eq!(
+        read_slot(&host, 0),
+        ROOT_STAMP,
+        "and its completion stamp lands exactly once, from the run that happened"
+    );
+    assert_eq!(
+        state.stamp_deferred_mask & ROOT_FIFO_BIT,
+        0,
+        "the hold bit describes the last drain, so a drain that ran clears it"
+    );
+    assert!(
+        !state.pending.main_drain,
+        "and a drained ring is not pending work"
+    );
+}
+
+/// A wait naming a slot past the stamp page runs the packet rather than holding
+/// it, and says why.
+///
+/// This is the one case where running unordered is the better answer, and the
+/// asymmetry is the reason: an ordering slip loses one packet's ordering, while
+/// a timeline parked on a wait nothing can ever satisfy loses the guest. No
+/// drain writes a slot outside the page — `write_stamp` returns early on the
+/// same `stamp_slot_offset` that refuses here — so the hold would be permanent.
+#[test]
+fn a_stamp_wait_naming_a_slot_that_cannot_exist_runs_rather_than_parking() {
+    use crate::model::DeviceId;
+    use crate::runtime::host::FakeHost;
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut host = FakeHost::new();
+    let page_size = 1usize << PAGE_SHIFT_X86;
+
+    let fifo_pfn = 0x40u32;
+    let fifo_gpa = (fifo_pfn as u64) << PAGE_SHIFT_X86;
+    host.map_range(fifo_gpa, 3 * page_size, 0);
+    state.gfx.fifo_base_page = fifo_pfn;
+    state.gfx.fifo_start = page_size as u32;
+    state.gfx.fifo_length = 2 * page_size as u32;
+
+    // One past the last slot the guest page can hold, which `stamp_slot_offset`
+    // refuses and `stamp_slot_index`'s mask does not fold back into range.
+    let bad_slot = stamp_slot_count(page_size as u64);
+    assert!(
+        stamp_slot_offset(bad_slot, page_size as u64).is_none(),
+        "the test's premise: this slot has no offset in the stamp page"
+    );
+
+    const ROOT_STAMP: u32 = 0xFEED;
+    let total = PACKET_HEADER_LEN + PACKET_STAMP_LEN;
+    let mut packet = vec![0u8; total as usize];
+    st16(&mut packet[PACKET_OPCODE..], 0);
+    st16(&mut packet[PACKET_STAMP_COUNT..], 1);
+    st32(&mut packet[PACKET_TOTAL_SIZE..], total);
+    st32(&mut packet[PACKET_COMPLETION_STAMP..], ROOT_STAMP);
+    st32(&mut packet[PACKET_HEADER_LEN as usize..], bad_slot);
+    st32(&mut packet[PACKET_HEADER_LEN as usize + 4..], 0xFFFF);
+    gpa_map::write_bytes(&mut host, fifo_gpa + page_size as u64, &packet, page_size)
+        .expect("seed the root ring");
+    state
+        .gfx
+        .fifo_read
+        .store(0, std::sync::atomic::Ordering::Release);
+    state.gfx.fifo_written = total;
+
+    drain_main_fifo(&mut state, &mut host);
+
+    assert_eq!(
+        state
+            .gfx
+            .fifo_read
+            .load(std::sync::atomic::Ordering::Acquire),
+        total,
+        "an undecidable wait must not stop the timeline, because nothing will \
+         ever decide it"
+    );
+    assert_eq!(
+        state.stamp_deferred_mask & ROOT_FIFO_BIT,
+        0,
+        "and no hold is recorded, so nothing re-offers a packet that already ran"
+    );
+
+    // A packet carrying both an ordinary unmet wait and an undecidable one still
+    // runs: holding for the first would park the timeline forever on the second.
+    let mut both = vec![0u8; (PACKET_HEADER_LEN + 2 * PACKET_STAMP_LEN) as usize];
+    st16(&mut both[PACKET_OPCODE..], 0);
+    st16(&mut both[PACKET_STAMP_COUNT..], 2);
+    st32(
+        &mut both[PACKET_TOTAL_SIZE..],
+        PACKET_HEADER_LEN + 2 * PACKET_STAMP_LEN,
+    );
+    st32(&mut both[PACKET_HEADER_LEN as usize..], 6);
+    st32(&mut both[PACKET_HEADER_LEN as usize + 4..], 0x99);
+    st32(
+        &mut both[(PACKET_HEADER_LEN + PACKET_STAMP_LEN) as usize..],
+        bad_slot,
+    );
+    st32(
+        &mut both[(PACKET_HEADER_LEN + PACKET_STAMP_LEN) as usize + 4..],
+        1,
+    );
+    let decoded = decode_packet(&both, 0, both.len() as u32, RING).expect("two records decode");
+    assert_eq!(
+        note_packet_stamp_waits(&state, &host, None, &decoded),
+        StampVerdict::Unevaluable,
+        "Unevaluable outranks Hold, or the packet parks forever on the wait that \
+         cannot clear while waiting for the one that could"
+    );
+}
+
+/// `retry_stamp_held_timelines` stops when a round publishes no stamp, so a wait
+/// nothing in the ring can satisfy costs one extra round and not a spin.
+///
+/// This is the property that lets the loop have no iteration cap. A cap would be
+/// a bound on how far ordering is honoured; the progress condition is not, and
+/// this pins that it actually terminates.
+#[test]
+fn a_stamp_hold_nothing_can_satisfy_costs_one_round_and_returns() {
+    use crate::model::DeviceId;
+    use crate::runtime::host::FakeHost;
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut host = FakeHost::new();
+    let page_size = 1usize << PAGE_SHIFT_X86;
+
+    let fifo_pfn = 0x40u32;
+    let fifo_gpa = (fifo_pfn as u64) << PAGE_SHIFT_X86;
+    host.map_range(fifo_gpa, 3 * page_size, 0);
+    state.gfx.fifo_base_page = fifo_pfn;
+    state.gfx.fifo_start = page_size as u32;
+    state.gfx.fifo_length = 2 * page_size as u32;
+
+    // The awaited slot is one this ring's only packet cannot advance, because
+    // the packet is the one waiting on it.
+    let total = PACKET_HEADER_LEN + PACKET_STAMP_LEN;
+    let mut packet = vec![0u8; total as usize];
+    st16(&mut packet[PACKET_OPCODE..], 0);
+    st16(&mut packet[PACKET_STAMP_COUNT..], 1);
+    st32(&mut packet[PACKET_TOTAL_SIZE..], total);
+    st32(&mut packet[PACKET_HEADER_LEN as usize..], 9);
+    st32(&mut packet[PACKET_HEADER_LEN as usize + 4..], 0x1000);
+    gpa_map::write_bytes(&mut host, fifo_gpa + page_size as u64, &packet, page_size)
+        .expect("seed the root ring");
+    state
+        .gfx
+        .fifo_read
+        .store(0, std::sync::atomic::Ordering::Release);
+    state.gfx.fifo_written = total;
+
+    state.stamp_deferred_mask = ROOT_FIFO_BIT;
+    let seq_before = state.completion_stamp_seq;
+
+    // Terminating at all is the assertion: a loop without the progress
+    // condition never returns from here.
+    retry_stamp_held_timelines(&mut state, &mut host);
+
+    assert_eq!(
+        state.completion_stamp_seq, seq_before,
+        "nothing ran, so no fence moved"
+    );
+    assert_ne!(
+        state.stamp_deferred_mask & ROOT_FIFO_BIT,
+        0,
+        "and the timeline is handed back still held, which is what a later \
+         doorbell re-offers rather than a drop"
+    );
+}
+
+/// A stamp wait is decided by a signed wrapping difference, so a slot that has
+/// wrapped past `u32::MAX` still satisfies the waits behind it.
+///
+/// Every assertion here that mentions the wrap is one a plain `current >= value`
+/// gets backwards, and getting it backwards is not a slow path: it reports every
+/// wait on the far side of the wrap as unmet forever, because the slot only ever
+/// climbs further away. A slot ticking once per submission reaches the wrap on a
+/// long-lived channel, so this is a property of running for a while rather than
+/// of any unusual guest.
+#[test]
+fn a_stamp_wait_is_decided_by_a_signed_wrapping_difference() {
+    let wait = |value| StampWait { index: 1, value };
+
+    assert!(wait(5).satisfied_by(5), "reaching the value satisfies it");
+    assert!(wait(5).satisfied_by(6), "and so does passing it");
+    assert!(!wait(5).satisfied_by(4), "one short does not");
+
+    // The slot has wrapped; the awaited value has not. `4 >= 0xFFFF_FFFE` is
+    // false, and the wait is nonetheless long satisfied.
+    assert!(
+        wait(0xFFFF_FFFE).satisfied_by(4),
+        "a slot six ticks past the wrap satisfies a wait two before it"
+    );
+    assert!(
+        !wait(4).satisfied_by(0xFFFF_FFFE),
+        "and the reverse pair is still unsatisfied, which a plain unsigned \
+         compare also gets backwards"
+    );
+
+    // The window the signed difference is correct over, at both ends.
+    assert!(
+        wait(0).satisfied_by(0x7FFF_FFFF),
+        "just inside the window ahead"
+    );
+    assert!(
+        !wait(0).satisfied_by(0x8000_0000),
+        "and 2^31 ahead reads as behind, which is the documented limit rather \
+         than a bug: the protocol has no way to tell that apart from 2^31 behind"
+    );
+}
+
+/// The stamp records between a packet's header and its payload are decoded in
+/// order, and the payload the decoder hands on begins after them rather than at
+/// `+0x0C`.
+///
+/// Both halves matter and they fail differently. A record read at the wrong
+/// stride yields a wait naming a slot nobody writes, which
+/// `note_packet_stamp_waits` reports as permanently unmet forever after; a
+/// payload that began at `+0x0C` would hand every handler the record bytes as
+/// its first words.
+#[test]
+fn a_packets_stamp_records_are_decoded_and_the_payload_starts_after_them() {
+    const STAMPS: u16 = 3;
+    let payload = [0xAAu32, 0xBB];
+    let stamps_len = STAMPS as usize * PACKET_STAMP_LEN as usize;
+    let total = PACKET_HEADER_LEN as usize + stamps_len + payload.len() * 4;
+
+    let mut v = vec![0u8; total];
+    v[0..2].copy_from_slice(&ROOT_OP_DEFINE_FIFO.to_le_bytes());
+    v[2..4].copy_from_slice(&STAMPS.to_le_bytes());
+    v[4..8].copy_from_slice(&(total as u32).to_le_bytes());
+    v[8..12].copy_from_slice(&9u32.to_le_bytes());
+    // Distinguishable record bytes: if the payload slice began at +0x0C these
+    // would show up as the payload's first words.
+    for i in 0..stamps_len / 4 {
+        let at = PACKET_HEADER_LEN as usize + i * 4;
+        v[at..at + 4].copy_from_slice(&(0xF0u32 + i as u32).to_le_bytes());
+    }
+    for (i, w) in payload.iter().enumerate() {
+        let at = PACKET_HEADER_LEN as usize + stamps_len + i * 4;
+        v[at..at + 4].copy_from_slice(&w.to_le_bytes());
+    }
+
+    let dec = decode_packet(&v, 0, total as u32, RING).unwrap();
+    assert_eq!(
+        dec.stamp_count(),
+        STAMPS,
+        "the count is carried, not consumed"
+    );
+    assert_eq!(
+        dec.stamp_waits,
+        vec![
+            StampWait {
+                index: 0xF0,
+                value: 0xF1
+            },
+            StampWait {
+                index: 0xF2,
+                value: 0xF3
+            },
+            StampWait {
+                index: 0xF4,
+                value: 0xF5
+            },
+        ],
+        "each record is one {{index, value}} pair read at an 8-byte stride"
+    );
+    assert_eq!(
+        dec.payload.len(),
+        payload.len() * 4,
+        "the payload excludes the records"
+    );
+    assert_eq!(
+        ld32(&dec.payload[0..]),
+        0xAA,
+        "and starts at the first byte after them, not at +0x0C"
+    );
+
+    // A packet declaring more records than it has room for is the guest's
+    // error, not a short read of ours.
+    let mut liar = v.clone();
+    liar[2..4].copy_from_slice(&u16::MAX.to_le_bytes());
+    assert_eq!(
+        decode_packet(&liar, 0, total as u32, RING).unwrap_err(),
+        PacketError::BadSize,
+        "a stamp count the packet cannot hold is refused before any record is \
+         reached, which is what bounds the skip without a constant"
+    );
+}
+
+/// Every command the reference host dispatches names itself when this device
+/// declines it, instead of arriving as an undecodable opcode.
+///
+/// The host's FIFO drain bounds the header opcode at [`CHILD_OP_MAX`] and
+/// indexes one flat table, so each of these numbers reaches a real handler with
+/// a real contract. Landing them in the unknown-opcode arm said the opposite —
+/// that this device could not tell what the guest had asked for — and for
+/// `CmdDeleteObject` it said nothing at all, because that arm was a silent
+/// no-op named for a present it never performed.
+///
+/// The assertion is the pair: the typed record names the command, *and* no
+/// unknown-opcode record is raised for the same packet. Only checking the first
+/// would pass on a device that raised both.
+#[test]
+fn a_dispatched_command_this_device_declines_names_itself() {
+    let mut host = FakeHost::new();
+    // Every packet here is conformant for its own opcode, so what is being
+    // tested is the decline and not the shape. The floor differs by command:
+    // eight bytes for most, twelve for `CmdDeleteObject`, whose payload is a
+    // task id plus a self-describing record that has to reach the decline rather
+    // than being refused for its shape on the way there.
+    let plain = || {
+        let mut payload = vec![0u8; 8];
+        st32(&mut payload[0..], 0x11);
+        st32(&mut payload[4..], 0x22);
+        payload
+    };
+    let conformant_delete_object = || {
+        let mut payload = vec![0u8; 4 + reims_vgpu_wire::ops::destroy::DELETE_TOTAL_LEN as usize];
+        st32(&mut payload[0..], 0x11);
+        st32(
+            &mut payload[4..],
+            reims_vgpu_wire::ops::destroy::OPCODE_DELETE_SAMPLER_STATE,
+        );
+        st32(
+            &mut payload[8..],
+            reims_vgpu_wire::ops::destroy::DELETE_TOTAL_LEN,
+        );
+        st32(&mut payload[12..], 0x20);
+        payload
+    };
+    for (opcode, expected, payload) in [
+        (CHILD_OP_DEBUG, UnimplementedCommand::Debug, plain()),
+        (
+            CHILD_OP_DELETE_OBJECT,
+            UnimplementedCommand::DeleteObject,
+            conformant_delete_object(),
+        ),
+        (
+            CHILD_OP_DISPLAY_SLEEP_STATE,
+            UnimplementedCommand::DisplaySleepState,
+            plain(),
+        ),
+        (
+            CHILD_OP_DISPLAY_SET_PROPERTIES,
+            UnimplementedCommand::DisplaySetProperties,
+            plain(),
+        ),
+        (CHILD_OP_DELAY, UnimplementedCommand::Delay, plain()),
+    ] {
+        let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
+        let plen = payload.len() as u32;
+        let pkt = Packet {
+            opcode,
+            stamp_waits: Vec::new(),
+            total_size: PACKET_HEADER_LEN + plen,
+            completion_stamp: 0,
+            payload,
+            next_head: 0,
+        };
+        assert_eq!(
+            process_child_packet(&mut state, &mut host, 2, &pkt),
+            ChildPacketDisposition::Complete,
+            "{opcode:#x}: the stamps still retire, or the guest waits forever"
+        );
+        assert!(
+            state.fails.iter().any(|e| matches!(
+                e,
+                FailEvent::UnimplementedChildCommand { command, opcode: op, .. }
+                    if *command == expected && *op == opcode
+            )),
+            "{opcode:#x} must be reported as {} and not swallowed; got {:?}",
+            expected.command(),
+            state.fails
+        );
+        assert!(
+            !state
+                .fails
+                .iter()
+                .any(|e| matches!(e, FailEvent::UnknownChildOpcode { .. })),
+            "{opcode:#x} is a command with a handler in the host's table, so it \
+             must not also read as undecodable"
+        );
+    }
+}
+
+/// A `CmdDeleteObject` packet is bounded before its record is read at all.
+///
+/// The command carries `{u32 task}` then a record that states its own byte
+/// length at offset 8, so a conformant packet is at least twelve bytes and the
+/// record must fit in what follows the id. A packet failing either bound is
+/// corrupt: nothing may be retired on the strength of it, and the record must
+/// not even be parsed — the bound is what stands between a corrupt length and a
+/// read past the payload.
+///
+/// "Was the record reached" is measured by whether any decline from the *record*
+/// path fired. Every exit from that path emits one of the `delete_object_…`
+/// reasons, and the bound sits upstream of all of them, so a packet the bound
+/// should have refused must produce none. Measuring it this way rather than
+/// through a teardown counter is deliberate: this arm retires nothing, so a
+/// counter of retirements reads zero whether the bound held or not, and the gate
+/// would pass on an implementation that had no bound at all.
+#[test]
+fn a_delete_object_record_must_fit_the_payload_that_carries_it() {
+    let mut host = FakeHost::new();
+    let packet = |payload: Vec<u8>| Packet {
+        opcode: CHILD_OP_DELETE_OBJECT,
+        stamp_waits: Vec::new(),
+        total_size: PACKET_HEADER_LEN + payload.len() as u32,
+        completion_stamp: 0,
+        payload,
+        next_head: 0,
+    };
+    // Every exit from the record path, and only those. The packet-shape
+    // refusals are `delete_object_short` and `delete_object_record_short`, which
+    // share a prefix with these — hence the exact names rather than a prefix
+    // test, which would match the very refusals the bound is supposed to raise.
+    const RECORD_PATH_REASONS: [&str; 3] = [
+        "delete_object_record_malformed",
+        "delete_object_not_a_destroy_record",
+        "delete_object_ref_unreadable",
+    ];
+
+    // One byte under the floor: there is no length word to read at offset 8.
+    let under_floor = vec![0u8; 11];
+    // At the floor, with a record claiming one byte more than the payload can
+    // hold. `9 + 4 = 13 > 12`, so the record overruns by exactly one byte —
+    // the off-by-one a `>=` in place of a `>` would let through.
+    let mut overrun = vec![0u8; 12];
+    st32(&mut overrun[0..], 0x11);
+    st32(&mut overrun[8..], 9);
+    // A `u32` length whose `+ 4` would wrap. The bound must still refuse it
+    // rather than wrapping to a small number and reading the record as valid.
+    let mut wrapping = vec![0u8; 12];
+    st32(&mut wrapping[0..], 0x11);
+    st32(&mut wrapping[8..], u32::MAX);
+
+    for (what, payload) in [
+        ("a payload under the floor", under_floor),
+        ("a record overrunning by one byte", overrun),
+        ("a record length whose bound arithmetic overflows", wrapping),
+    ] {
+        let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
+        let cap = crate::observe::FailCapture::start();
+        let disposition = process_child_packet(&mut state, &mut host, 3, &packet(payload));
+        let lines = cap.lines();
+        drop(cap);
+        assert_eq!(
+            disposition,
+            ChildPacketDisposition::Complete,
+            "{what}: a malformed packet must still retire its stamps, or the guest waits forever"
+        );
+        assert!(
+            !lines.iter().any(|l| RECORD_PATH_REASONS
+                .iter()
+                .any(|r| l.contains(&format!("reason={r}")))),
+            "{what}: the bound must refuse it before the record is read; got {lines:?}"
+        );
+    }
+
+    // Exactly filling the payload is conformant: `8 + 4 = 12`. This is the
+    // boundary on the accepting side, so a bound written one too tight would
+    // refuse it — and the record path must be reached. The record is an
+    // eight-byte one whose opcode is not a destroy, so the exit is the counter
+    // for a record this arm will not retire on.
+    let mut exact = vec![0u8; 12];
+    st32(&mut exact[0..], 0x11);
+    st32(&mut exact[8..], 8);
+    let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
+    let cap = crate::observe::FailCapture::start();
+    process_child_packet(&mut state, &mut host, 3, &packet(exact));
+    let lines = cap.lines();
+    drop(cap);
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("reason=delete_object_not_a_destroy_record")),
+        "a record that exactly fills the payload is well formed and must be read, \
+         then refused for its own opcode rather than for the packet's shape; got {lines:?}"
+    );
+
+    let log = std::fs::read_to_string(crate::observe::fail_log_path()).expect("fail log");
+    for reason in [
+        "reason=delete_object_short site=ch3",
+        "reason=delete_object_record_short site=ch3",
+    ] {
+        assert!(
+            log.contains(reason),
+            "a malformed CmdDeleteObject was dropped without naming itself: {reason}"
+        );
+    }
+}
+
+/// `CmdDeleteObject` must not retire an object-table entry, however exactly its
+/// record's ref matches one.
+///
+/// This is the arm's load-bearing safety property, and it is a property about
+/// **namespaces** rather than about arithmetic. The record's ref belongs to the
+/// serializer's per-kind ref space; the object table is keyed by the kernel
+/// object-list ref. Both are small integers allocated from zero, so they collide
+/// constantly, and a collision is the *only* way the object table can be reached
+/// from here — a hit would necessarily be destroying an unrelated object.
+///
+/// The test therefore rigs the collision deliberately: every ref the packets
+/// name is also a live object-table entry under the same task. An implementation
+/// that keys the table with the record's ref passes nothing here; it deletes all
+/// four and fails on the first assertion.
+///
+/// The kinds are exercised across the family — a texture record and a
+/// sampler-state record — because the kind lives in the record's opcode and an
+/// arm that branched on kind could be safe for one and not the other.
+#[test]
+fn a_delete_object_never_retires_an_object_table_entry_its_ref_collides_with() {
+    use reims_vgpu_wire::ops::destroy::{
+        DELETE_TOTAL_LEN, OPCODE_DELETE_SAMPLER_STATE, OPCODE_DELETE_TEXTURE,
+    };
+    let mut host = FakeHost::new();
+    let destroy_packet = |task: u32, record_opcode: u32, object_ref: u32| {
+        let mut payload = vec![0u8; 4 + DELETE_TOTAL_LEN as usize];
+        st32(&mut payload[0..], task);
+        st32(&mut payload[4..], record_opcode);
+        st32(&mut payload[8..], DELETE_TOTAL_LEN);
+        st32(&mut payload[12..], object_ref);
+        Packet {
+            opcode: CHILD_OP_DELETE_OBJECT,
+            stamp_waits: Vec::new(),
+            total_size: PACKET_HEADER_LEN + payload.len() as u32,
+            completion_stamp: 0,
+            payload,
+            next_head: 0,
+        }
+    };
+
+    let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
+    state.define_task(2, 0x2000, 9);
+    assert!(state.set_object_list(2, 3, 64));
+    for ref_ in [10, 11, 12, 14] {
+        assert!(state.insert_object(2, ref_));
+    }
+
+    // Same task, same number, well-formed record: the collision that an arm
+    // keying the object table would act on.
+    assert_eq!(
+        process_child_packet(
+            &mut state,
+            &mut host,
+            4,
+            &destroy_packet(2, OPCODE_DELETE_TEXTURE, 10)
+        ),
+        ChildPacketDisposition::Complete,
+        "the stamps must retire, or the guest waits forever"
+    );
+    assert!(
+        state.objects.contains(&(2, 10)),
+        "the record's ref is a serializer ref; keying the object table with it \
+         destroys an unrelated object that merely shares the integer"
+    );
+
+    process_child_packet(
+        &mut state,
+        &mut host,
+        4,
+        &destroy_packet(2, OPCODE_DELETE_SAMPLER_STATE, 11),
+    );
+    assert!(
+        state.objects.contains(&(2, 11)),
+        "a second kind must be declined the same way"
+    );
+
+    // The unclaimed number inside the destroy span is refused before the ref is
+    // even read, so it must also leave the table alone.
+    process_child_packet(&mut state, &mut host, 4, &destroy_packet(2, 0x3ec, 14));
+    assert!(
+        state.objects.contains(&(2, 14)),
+        "0x3ec is unclaimed inside the destroy span and names no destroy at all"
+    );
+
+    assert!(
+        state.objects.contains(&(2, 12)),
+        "a ref no packet named must be untouched"
+    );
+}
+
+/// The kind is decoded off the record and counted per kind.
+///
+/// The kind lives in the record's own opcode and nowhere else, so a counter that
+/// did not read it there would be counting the packet rather than the object.
+/// The distribution across kinds is the open question this arm leaves behind —
+/// one merged counter cannot say whether a guest is retiring the one kind this
+/// device holds by ref (fences) or the kinds it holds by content (samplers,
+/// pipeline states) — so the split is the measurement, not decoration.
+#[test]
+fn a_delete_object_counts_the_kind_its_record_names() {
+    use crate::runtime::drain::store_route_count;
+    use reims_vgpu_wire::ops::destroy::{
+        DELETE_TOTAL_LEN, OPCODE_DELETE_FENCE, OPCODE_DELETE_SAMPLER_STATE,
+    };
+    let mut host = FakeHost::new();
+    let destroy_packet = |record_opcode: u32| {
+        let mut payload = vec![0u8; 4 + DELETE_TOTAL_LEN as usize];
+        st32(&mut payload[0..], 2);
+        st32(&mut payload[4..], record_opcode);
+        st32(&mut payload[8..], DELETE_TOTAL_LEN);
+        st32(&mut payload[12..], 40);
+        Packet {
+            opcode: CHILD_OP_DELETE_OBJECT,
+            stamp_waits: Vec::new(),
+            total_size: PACKET_HEADER_LEN + payload.len() as u32,
+            completion_stamp: 0,
+            payload,
+            next_head: 0,
+        }
+    };
+
+    let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
+    state.define_task(2, 0x2000, 9);
+
+    let sampler_before = store_route_count("child_delete_object_sampler_state");
+    let fence_before = store_route_count("child_delete_object_fence");
+
+    process_child_packet(
+        &mut state,
+        &mut host,
+        4,
+        &destroy_packet(OPCODE_DELETE_SAMPLER_STATE),
+    );
+    assert_eq!(
+        store_route_count("child_delete_object_sampler_state"),
+        sampler_before + 1,
+        "the sampler-state kind must be counted under its own name"
+    );
+    assert_eq!(
+        store_route_count("child_delete_object_fence"),
+        fence_before,
+        "a sampler-state record must not move another kind's counter"
+    );
+
+    // The one kind this device holds anything by ref for. Its counter reading
+    // above zero on a boot is the signal that would justify a handler.
+    process_child_packet(&mut state, &mut host, 4, &destroy_packet(OPCODE_DELETE_FENCE));
+    assert_eq!(
+        store_route_count("child_delete_object_fence"),
+        fence_before + 1,
+        "the fence kind must be counted apart, since it is the one that could leak"
+    );
+}
+
+/// The host's retired slots are reported as retired, not as undecodable.
+///
+/// Fifteen opcodes share one deprecated handler on the reference host: it
+/// accepts the packet, ignores the payload and retires the stamps. A guest still
+/// emitting one is an old guest, which is a different thing from a guest sending
+/// something this device cannot decode — and the two used to produce the same
+/// record.
+///
+/// Driven off [`CHILD_DEPRECATED_OPS`] rather than a second list, so a slot
+/// added there cannot be left without an arm.
+#[test]
+fn a_retired_slot_is_reported_as_retired_and_not_as_undecodable() {
+    let mut host = FakeHost::new();
+    for opcode in CHILD_DEPRECATED_OPS {
+        let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
+        let pkt = Packet {
+            opcode,
+            stamp_waits: Vec::new(),
+            total_size: PACKET_HEADER_LEN,
+            completion_stamp: 0,
+            payload: Vec::new(),
+            next_head: 0,
+        };
+        assert_eq!(
+            process_child_packet(&mut state, &mut host, 2, &pkt),
+            ChildPacketDisposition::Complete
+        );
+        assert!(
+            state.fails.iter().any(|e| matches!(
+                e,
+                FailEvent::UnimplementedChildCommand {
+                    command: UnimplementedCommand::Deprecated,
+                    opcode: op,
+                    ..
+                } if *op == opcode
+            )),
+            "{opcode:#x} is one of the host's retired slots; got {:?}",
+            state.fails
+        );
+        assert!(
+            !state
+                .fails
+                .iter()
+                .any(|e| matches!(e, FailEvent::UnknownChildOpcode { .. })),
+            "{opcode:#x} has a handler on the host, so it is not undecodable"
+        );
+    }
+}
+
+/// `CmdSynchronizeAndDiscardResources` and `CmdDiscardResources` carry the same
+/// record layout as `CmdSynchronizeResources`, and this device reads all three
+/// with one decoder.
+///
+/// The reference host validates the three with byte-for-byte the same check —
+/// `{u32 task, u32 count}` then `count` four-byte object ids — so a payload that
+/// is well-formed for one is well-formed for all of them. The way to prove these
+/// two reach that decoder rather than being waved through is to hand them a
+/// payload that *fails* it: a count the packet has no room for. A swallowed
+/// command would report nothing.
+///
+/// The synchronise half of `0x3e` is not asserted here because it is a no-op
+/// when no writeback is outstanding, which is every unit test; what is asserted
+/// is that the packet went through the arm that performs it.
+#[test]
+fn the_discarding_commands_share_the_synchronize_record_layout() {
+    use crate::runtime::decode::fifo::ResourceListDecodeError;
+    let mut host = FakeHost::new();
+    // One record: header plus a single four-byte object id.
+    let mut good = vec![0u8; 12];
+    st32(&mut good[0..], 7); // task
+    st32(&mut good[4..], 1); // count
+    st32(&mut good[8..], 0x2a); // object id
+    // The same header claiming four records in a packet that holds one.
+    let mut liar = good.clone();
+    st32(&mut liar[4..], 4);
+
+    // The two share a record layout and are declined for *different* reasons:
+    // `0x3f` drops the whole command, while `0x3e`'s synchronise half runs and
+    // only its discard hint is ignored. One slug for both could not say which
+    // fired, which is the defect the split reason exists to prevent.
+    for (opcode, expected) in [
+        (
+            CHILD_OP_SYNCHRONIZE_AND_DISCARD_RESOURCES,
+            UnimplementedCommand::SynchronizeAndDiscardResources,
+        ),
+        (
+            CHILD_OP_DISCARD_RESOURCES,
+            UnimplementedCommand::DiscardResources,
+        ),
+    ] {
+        assert_ne!(
+            expected.slug(),
+            if expected == UnimplementedCommand::DiscardResources {
+                UnimplementedCommand::SynchronizeAndDiscardResources.slug()
+            } else {
+                UnimplementedCommand::DiscardResources.slug()
+            },
+            "the two discard declines must not share a slug"
+        );
+        let packet = |payload: &Vec<u8>| Packet {
+            opcode,
+            stamp_waits: Vec::new(),
+            total_size: PACKET_HEADER_LEN + payload.len() as u32,
+            completion_stamp: 0,
+            payload: payload.clone(),
+            next_head: 0,
+        };
+
+        let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
+        assert_eq!(
+            process_child_packet(&mut state, &mut host, 2, &packet(&good)),
+            ChildPacketDisposition::Complete
+        );
+        assert!(
+            state.fails.iter().any(|e| matches!(
+                e,
+                FailEvent::UnimplementedChildCommand { command, .. } if *command == expected
+            )),
+            "{opcode:#x}: the discard this device does not act on must be visible, \
+             under its own reason and not the other opcode's"
+        );
+        assert!(
+            !state
+                .fails
+                .iter()
+                .any(|e| matches!(e, FailEvent::UnknownChildOpcode { .. })),
+            "{opcode:#x} has a handler on the host and a decoder here"
+        );
+
+        // The malformed one proves the payload reached the decoder.
+        let cap = crate::observe::FailCapture::start();
+        let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
+        process_child_packet(&mut state, &mut host, 2, &packet(&liar));
+        let line = cap.one("map_family");
+        assert!(
+            line.contains(&format!(
+                "reason={}",
+                crate::observe::Decline::slug(&ResourceListDecodeError::Truncated {
+                    count: 4,
+                    plen: 12,
+                    need: 24,
+                })
+            )),
+            "{opcode:#x}: a record layout the guest and this device disagree on \
+             must name the check that refused; got {line}"
+        );
+    }
+}
+
+/// Each member of the map/lifecycle family is dispatched under its own identity.
+///
+/// Six opcodes share one body, and the member is bound at the dispatch arm
+/// rather than re-read from the packet inside that body. That makes a dead
+/// branch a compile error, but it moves the risk to the binding: an arm naming
+/// the wrong member compiles, and the packet then silently runs another
+/// command's branch. Nothing in the toolchain sees that, so it is asserted here
+/// by the effect each branch has and no other has.
+///
+/// `CmdMapMemory2` and `CmdUnmapMemory` are deliberately absent. They share one
+/// branch and this device does not yet do anything different for the two, so
+/// there is no effect that separates them — asserting one would be asserting the
+/// log string, not the behaviour. The pair's shared branch is covered by
+/// `map_memory2_does_not_flush_gva_host_cache_on_wire` and the view-retire tests.
+#[test]
+fn each_map_family_command_takes_its_own_branch() {
+    use crate::contract::endian::st32;
+    use crate::runtime::decode::fifo::CHILD_INVALIDATE_PAGEON_FLAGS;
+
+    const MAPPING: u32 = 0x2a;
+
+    // `{u32 task, u32 count}` then one 8-byte validity record: the invalidate
+    // layout. The synchronise family reads the same header and 4-byte ids, so
+    // this payload is well-formed for either and the opcode is the only thing
+    // that decides which decoder sees it.
+    let mut invalidate = vec![0u8; 16];
+    st32(&mut invalidate[4..], 1);
+    st32(&mut invalidate[8..], MAPPING);
+    st32(&mut invalidate[12..], CHILD_INVALIDATE_PAGEON_FLAGS);
+    // `{u32 task, u32 count}` then one 4-byte object id.
+    let mut synchronize = vec![0u8; 12];
+    st32(&mut synchronize[4..], 1);
+    st32(&mut synchronize[8..], MAPPING);
+    // `{u32 object_id, u32 task_id}`.
+    let mut delete_backing = vec![0u8; 8];
+    st32(&mut delete_backing[0..], MAPPING);
+
+    // Each row is a payload and the two effects that tell this branch from its
+    // five neighbours: whether the named mapping's content generation moved, and
+    // whether the command reported itself unimplemented.
+    for (opcode, payload, bumps_generation, declined) in [
+        (
+            CHILD_OP_INVALIDATE_RESOURCES,
+            &invalidate,
+            true,
+            None,
+        ),
+        (
+            CHILD_OP_SYNCHRONIZE_RESOURCES,
+            &synchronize,
+            false,
+            None,
+        ),
+        (
+            CHILD_OP_SYNCHRONIZE_AND_DISCARD_RESOURCES,
+            &synchronize,
+            false,
+            Some(UnimplementedCommand::SynchronizeAndDiscardResources),
+        ),
+        (
+            CHILD_OP_DELETE_IOSURFACE_BACKING2,
+            &delete_backing,
+            false,
+            None,
+        ),
+    ] {
+        let mut host = FakeHost::new();
+        let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
+        assert!(state.map_surface(MAPPING));
+        state.mappings.get_mut(&MAPPING).unwrap().content_generation = 7;
+
+        assert_eq!(
+            process_child_packet(
+                &mut state,
+                &mut host,
+                4,
+                &Packet {
+                    opcode,
+                    stamp_waits: Vec::new(),
+                    total_size: PACKET_HEADER_LEN + payload.len() as u32,
+                    completion_stamp: 0,
+                    payload: payload.clone(),
+                    next_head: 0,
+                },
+            ),
+            ChildPacketDisposition::Complete,
+            "{opcode:#x}: the guest is waiting on the stamp whatever the branch did"
+        );
+
+        // `CmdInvalidateResources` is the only member that reads validity
+        // records, so the generation bump is its signature. A mis-bound arm
+        // either loses the bump or produces one for a command that never
+        // invalidates anything.
+        let generation = state.mappings.get(&MAPPING).map(|m| m.content_generation);
+        if bumps_generation {
+            assert_eq!(
+                generation,
+                Some(8),
+                "{opcode:#x}: this command clears host validity, so the mapping's \
+                 content generation must move"
+            );
+        } else {
+            assert_ne!(
+                generation,
+                Some(8),
+                "{opcode:#x}: this command does not touch validity, so a bump means \
+                 it ran the invalidate branch"
+            );
+        }
+
+        // `CmdDeleteIOSurfaceBacking2` is the only member that ends a backing's
+        // lifetime, and with no resolved pages there is nothing a stale delete
+        // could hurt, so it unmaps outright. The slot survives — the id can be
+        // reused — so what separates it is the mapped bit, not the entry.
+        assert_eq!(
+            state.mappings[&MAPPING].mapped,
+            opcode != CHILD_OP_DELETE_IOSURFACE_BACKING2,
+            "{opcode:#x}: only the backing delete unmaps the surface"
+        );
+
+        let reported = state.fails.iter().find_map(|e| match e {
+            FailEvent::UnimplementedChildCommand { command, .. } => Some(*command),
+            _ => None,
+        });
+        assert_eq!(
+            reported, declined,
+            "{opcode:#x}: the half of this command that is not implemented must be \
+             named, and a fully-handled one must report nothing"
+        );
+    }
+}
+
+/// An opcode above the host's dispatch ceiling is reported apart from one that
+/// is merely unassigned.
+///
+/// Both leave the guest's work undone, and both raise the unknown-opcode record,
+/// so on their own they read identically. They are not the same event: an
+/// unassigned slot in range is a guest asking for a command this host generation
+/// does not have, while a value the reference host refuses before it indexes its
+/// table means the header itself is wrong — a desynced ring or a corrupt packet,
+/// which is a transport bug and not a missing feature.
+#[test]
+fn an_opcode_past_the_dispatch_ceiling_is_reported_apart_from_an_unassigned_slot() {
+    let mut host = FakeHost::new();
+    let packet = |opcode: u16| Packet {
+        opcode,
+        stamp_waits: Vec::new(),
+        total_size: PACKET_HEADER_LEN,
+        completion_stamp: 0,
+        payload: Vec::new(),
+        next_head: 0,
+    };
+
+    // 0x0b is inside the ceiling and has no handler on the reference host.
+    let cap = crate::observe::FailCapture::start();
+    let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
+    process_child_packet(&mut state, &mut host, 2, &packet(0x0b));
+    assert!(
+        state
+            .fails
+            .iter()
+            .any(|e| matches!(e, FailEvent::UnknownChildOpcode { opcode: 0x0b, .. })),
+        "an unassigned in-range slot is still an unknown opcode"
+    );
+    assert!(
+        !cap.lines()
+            .iter()
+            .any(|l| l.starts_with("child_opcode_out_of_range")),
+        "an in-range opcode is not a malformed header; got {:?}",
+        cap.lines()
+    );
+    drop(cap);
+
+    let cap = crate::observe::FailCapture::start();
+    let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
+    process_child_packet(&mut state, &mut host, 2, &packet(CHILD_OP_MAX + 1));
+    let line = cap.one("child_opcode_out_of_range");
+    assert!(
+        line.contains(&format!("opcode={:#x}", CHILD_OP_MAX + 1))
+            && line.contains(&format!("max={CHILD_OP_MAX:#x}")),
+        "the line has to carry both the value and the ceiling it broke; got {line}"
+    );
+    assert!(
+        state
+            .fails
+            .iter()
+            .any(|e| matches!(e, FailEvent::UnknownChildOpcode { .. })),
+        "the guest's work is still lost, so the record it shares with an \
+         unassigned slot is still raised"
+    );
+}
+
+/// A declined command says its piece once and is counted every time.
+///
+/// A command the guest re-issues every frame would put a line per packet into
+/// the always-on log — and a flood is how the refusals around it stop being
+/// read. The latch is what makes the record survivable; the route counter is
+/// what keeps the rate knowable, because emitters dedupe and counters do not,
+/// and quoting one as the other is the mistake this pair exists to prevent.
+///
+/// Driven off `CmdDelay` rather than off `CmdDeleteObject`, whose per-frame rate
+/// is what made the latch necessary in the first place — a driven boot sends
+/// about 1 990 of those in 25 s. `CmdDelay` reaches the same latch through a
+/// packet whose shape is a single fixed floor, so the test is about the latch
+/// and not about a record layout.
+#[test]
+fn a_declined_command_is_latched_in_the_log_and_counted_in_the_census() {
+    use crate::runtime::drain::store_route_count;
+    let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
+    let mut host = FakeHost::new();
+    let mut payload = vec![0u8; 8];
+    st32(&mut payload[0..], 0x11);
+    let pkt = Packet {
+        opcode: CHILD_OP_DELAY,
+        stamp_waits: Vec::new(),
+        total_size: PACKET_HEADER_LEN + payload.len() as u32,
+        completion_stamp: 0,
+        payload,
+        next_head: 0,
+    };
+
+    let route = UnimplementedCommand::Delay.slug();
+    let before = store_route_count(route);
+    let cap = crate::observe::FailCapture::start();
+    for _ in 0..3 {
+        process_child_packet(&mut state, &mut host, 2, &pkt);
+    }
+    let lines: Vec<String> = cap
+        .lines()
+        .into_iter()
+        .filter(|l| l.contains(&format!("reason={route}")))
+        .collect();
+    assert_eq!(
+        lines.len(),
+        1,
+        "three identical declines are one line, or the guest's frame rate sets \
+         the log's line rate; got {lines:?}"
+    );
+    drop(cap);
+    assert_eq!(
+        store_route_count(route) - before,
+        3,
+        "the census counts every packet, which is the rate the latched line \
+         cannot carry"
+    );
 }

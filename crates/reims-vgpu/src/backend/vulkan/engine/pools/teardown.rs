@@ -1,3 +1,15 @@
+//! `destroy_all` — the one ordered driver that takes every pool down.
+//!
+//! Kept apart from the two chapters that fill the pools because the order is
+//! the contract: quiesce the in-flight fences, fold each slot's owed transients
+//! back into the live lists, then destroy in an order no acquire path has any
+//! say in. A second teardown path would be a second order, so there is one.
+//!
+//! `use super::*` is the seam. This is an `impl` chapter of the module that
+//! declares `ResourcePools` and owns its fields, not a layer beneath it.
+
+use super::*;
+
 impl ResourcePools {
     pub(crate) unsafe fn destroy_all(&mut self, device: &ash::Device) {
         // An open (never-submitted) batch dies with the pool: its CB belongs
@@ -22,6 +34,7 @@ impl ResourcePools {
                 // move the owed transients into the live lists so the drains
                 // below destroy them.
                 self.staging_live.extend(pending.staging);
+                self.gather_live.extend(pending.gather);
                 self.readback_multi_live.extend(pending.readback);
                 self.sampled_live.extend(pending.sampled);
                 self.storage_image_live.extend(pending.storage_images);
@@ -34,22 +47,36 @@ impl ResourcePools {
         self.release_graveyard(device, SlotMask::MAX);
         for list in self.staging_free.values_mut() {
             for s in list.drain(..) {
-                release_buffer_slot(device, &mut self.host_slab, s);
+                release_buffer_slot(device, &mut self.slabs, s);
             }
         }
         for s in self.staging_live.drain(..) {
-            release_buffer_slot(device, &mut self.host_slab, s);
+            release_buffer_slot(device, &mut self.slabs, s);
+        }
+        for list in self.gather_free.values_mut() {
+            for s in list.drain(..) {
+                release_buffer_slot(device, &mut self.slabs, s);
+            }
+        }
+        for s in self.gather_live.drain(..) {
+            release_buffer_slot(device, &mut self.slabs, s);
         }
         for list in self.readback_free.values_mut() {
             for s in list.drain(..) {
-                release_buffer_slot(device, &mut self.host_slab, s);
+                release_buffer_slot(device, &mut self.slabs, s);
             }
         }
         if let Some(s) = self.readback_live.take() {
-            release_buffer_slot(device, &mut self.host_slab, s);
+            release_buffer_slot(device, &mut self.slabs, s);
         }
         for s in self.readback_multi_live.drain(..) {
-            release_buffer_slot(device, &mut self.host_slab, s);
+            release_buffer_slot(device, &mut self.slabs, s);
+        }
+        // Device-local and never mapped, so nothing can be mid-read through it
+        // the way a leased readback can: the only reader is the GPU, and the
+        // wait above has already retired every submission that named it.
+        if let Some(s) = self.guest_scratch.take() {
+            release_buffer_slot(device, &mut self.slabs, s);
         }
         // Leased slots are the one class here whose memory a live borrow may
         // still be reading, and freeing it unmaps that borrow's pointer — a
@@ -79,7 +106,7 @@ impl ResourcePools {
         }
         self.reclaim_returned_readback_leases();
         for l in self.readback_leased.drain(..) {
-            release_buffer_slot(device, &mut self.host_slab, l.slot);
+            release_buffer_slot(device, &mut self.slabs, l.slot);
         }
         // Sampled / target / registry images are slab-backed: destroy the image
         // + view handles here, but their memory belongs to shared blocks freed
@@ -130,12 +157,17 @@ impl ResourcePools {
             device.destroy_image(t.image, None);
         }
         self.registry_order.clear();
+        // Every fence above was waited, so nothing can still be reading or
+        // writing an imported RAMBlock. Freeing the memory is what ends the
+        // GPU's access to guest RAM, so it runs on every teardown path
+        // including the ones that are otherwise giving up.
+        self.host_ram_imports.destroy_all(device);
         // Free every slab block now that all slab-backed images are destroyed.
         self.slab.destroy_all(device);
         // Same for the HOST_VISIBLE upload blocks: every staging buffer bound
         // into one was destroyed above, so nothing can still reference the
         // block mappings this drops.
-        self.host_slab.destroy_all(device);
+        self.slabs.destroy_all(device);
         for slot in self.slots.drain(..) {
             device.destroy_fence(slot.fence, None);
         }

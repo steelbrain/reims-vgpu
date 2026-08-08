@@ -13,8 +13,8 @@ use super::counters::EngineCounters;
 use super::digest::Digest128;
 use super::pools::{DeferredHandle, ResourcePools};
 use super::types::{
-    BlendKey, ColorWriteMask, CullMode, DrawError, PrimitiveTopology, SamplerStateKey,
-    VertexAttributeFormat, VertexStepFunction,
+    BlendKey, ColorWriteMask, CullMode, DepthClipMode, DrawError, FillMode, PrimitiveTopology,
+    SamplerStateKey, VertexAttributeFormat, VertexStepFunction,
 };
 use super::vk_call::{VkCall, VkOp};
 
@@ -49,8 +49,7 @@ impl crate::observe::Decline for VertexFormatWidenDecline {
     }
 }
 use crate::backend::vulkan::translate;
-
-const CAP_DEFAULT: usize = 1024;
+use crate::runtime::spirv_vertex_input::VertexInputWidths;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub(crate) struct AttrKey {
@@ -75,9 +74,26 @@ pub(crate) struct LayoutKey {
     pub bindings: Vec<BindingSig>,
 }
 
-/// Max secondary color attachments (MRT slot 1..). Metal caps color
-/// attachments at 8, so 7 beyond the primary slot 0.
+/// Max secondary color attachments (MRT slot 1..): every colour slot Apple's
+/// serialized render pass can carry, less the primary at slot 0.
+///
+/// The fourth spelling of one number, and the last one to be pinned. The wire
+/// record's colour-slot array is the truth,
+/// [`crate::runtime::decode::render::PASS_MAX_COLOR_ATTACHMENTS`] derives from
+/// it, and `backend::metal::REIMS_VGPU_METAL_MAX_COLOR_RTS` is held equal to it
+/// by an assertion beside itself. This one is that bound minus one, on the arm
+/// the other assertion cannot reach — `REIMS_VGPU_METAL_MAX_COLOR_RTS` is behind
+/// `feature = "backend-metal"`, so nothing in a Vulkan build compared the two.
+///
+/// A drift here is refused rather than lost: `execute_draw_inner` returns
+/// [`super::reason::DrawReason::SecondaryAttachmentCap`] for a request past this
+/// count, so a shortfall costs the whole draw and says so. That makes the
+/// failure loud and still wrong — a guest sending the eighth colour slot the
+/// wire format allows would have every MRT draw refused — which is what this
+/// assertion is for.
 pub(crate) const MAX_SECONDARY_ATTACH: usize = 7;
+const _: () =
+    assert!(1 + MAX_SECONDARY_ATTACH == crate::runtime::decode::render::PASS_MAX_COLOR_ATTACHMENTS);
 
 /// A secondary MRT attachment's contribution to the render-pass / pipeline key.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Default)]
@@ -166,8 +182,16 @@ pub(crate) struct PipelineKey {
     /// its own pipeline rather than aliasing the no-cull one.
     pub cull_mode: CullMode,
     /// Metal front-facing winding (`true` = counter-clockwise), mapped to a
-    /// Vulkan `FrontFace` by [`metal_front_face`].
+    /// Vulkan `FrontFace` by [`crate::backend::vulkan::translate::raster::vk_front_face`].
     pub front_face_ccw: bool,
+    /// Metal `MTLTriangleFillMode`, mapped to a `VkPolygonMode`. In the key
+    /// because Vulkan has no dynamic polygon mode below
+    /// `VK_EXT_extended_dynamic_state3`: a wireframe draw and a filled draw
+    /// sharing shaders need different pipelines.
+    pub fill_mode: FillMode,
+    /// Metal `MTLDepthClipMode`, mapped to `depthClampEnable`. In the key for
+    /// the same reason as [`Self::fill_mode`].
+    pub depth_clip: DepthClipMode,
     /// Depth-test pipeline state. Meaningful only when `pass.depth.is_some()`;
     /// otherwise all-default (test/write off) and no depth-stencil state is
     /// attached, so the color-only pipeline is byte-identical to the pre-depth
@@ -180,6 +204,18 @@ pub(crate) struct PipelineKey {
     /// distinct references reuse one pipeline. `None` keeps the depth-only /
     /// no-depth pipelines byte-identical to the pre-stencil engine.
     pub stencil: Option<StencilKey>,
+    /// How many viewport/scissor slots the pipeline declares.
+    ///
+    /// In the key because `VkPipelineViewportStateCreateInfo::viewportCount` is
+    /// **not** dynamic below `VK_EXT_extended_dynamic_state`
+    /// (`vkCmdSetViewportWithCount`), which is core in 1.3 and this device's
+    /// floor is 1.2. So the count is baked, `vkCmdSetViewport` must bind exactly
+    /// that many, and two draws sharing shaders and pass shape but rasterizing
+    /// into different numbers of viewports need different pipelines. It is one
+    /// number for both counts because Vulkan requires `scissorCount` to equal
+    /// `viewportCount`; [`super::viewport_slot_count`] is the only place that
+    /// decides it.
+    pub viewport_slots: u32,
     pub layout: LayoutKey,
 }
 
@@ -191,34 +227,6 @@ pub(crate) struct StencilKey {
     pub back: super::types::StencilFaceOps,
 }
 
-/// Map a Metal cull mode to Vulkan raster flags.
-pub(crate) fn metal_cull_flags(mode: CullMode) -> vk::CullModeFlags {
-    match mode {
-        CullMode::None => vk::CullModeFlags::NONE,
-        CullMode::Front => vk::CullModeFlags::FRONT,
-        CullMode::Back => vk::CullModeFlags::BACK,
-    }
-}
-
-/// Pick the Vulkan `FrontFace` that reproduces Metal front-face selection.
-///
-/// Metal evaluates winding in its window space (origin top-left, Y down) and its
-/// default front-facing winding is clockwise. We emulate Metal's Y-up NDC on
-/// Vulkan (Y-down NDC) with a negative-height viewport, which makes the
-/// rasterized framebuffer image — and therefore the apparent triangle winding —
-/// match Metal's. The mapping is therefore direct: a Metal clockwise front is
-/// `FrontFace::CLOCKWISE`. Every draw on this rail is emitted Y-flipped (the
-/// guest is always Metal), so there is no un-flipped case in which the
-/// framebuffer would mirror and invert the effective winding. Verified on-GPU
-/// by the `cull_*` parity tests.
-pub(crate) fn metal_front_face(front_face_ccw: bool) -> vk::FrontFace {
-    if front_face_ccw {
-        vk::FrontFace::COUNTER_CLOCKWISE
-    } else {
-        vk::FrontFace::CLOCKWISE
-    }
-}
-
 /// Lc: compute pipeline cache key — SPIR-V content digest + entry name + layout.
 /// Never funcId / pipeline ref.
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
@@ -228,32 +236,82 @@ pub(crate) struct ComputePipelineKey {
     pub layout: LayoutKey,
 }
 
-struct FifoCache<K, V> {
+/// How many distinct never-creatable keys a cache remembers the refusal for.
+///
+/// This bounds the **negative** map only, and it is the one bound in this file
+/// that is not a fidelity question: an evicted negative entry costs a re-attempt
+/// of a create that has already been measured to fail, never a dropped guest
+/// object. The positive maps are deliberately unbounded — see [`ObjectCache`].
+const NEGATIVE_CAP: usize = 1024;
+
+/// A content-keyed cache of immutable Vulkan objects, plus the typed refusal for
+/// keys whose create failed.
+///
+/// **The positive map is unbounded, and that is the contract.** Every key here
+/// is a content digest or a full descriptor of guest-decoded state — a shader's
+/// SPIR-V digest, a pipeline's complete key, a sampler's state. So the live
+/// entry count is the number of *distinct* objects the guest has asked for,
+/// which is a property of its own program and state set rather than of how long
+/// the device has run.
+///
+/// It used to hold 1024 (64 for render passes) and evict in **insertion** order.
+/// Insertion order is the worst possible choice here for the same reason it was
+/// in `runtime::m2v_cache`: the first pipeline a boot creates is the
+/// compositor's, and it is bound on every frame until the guest shuts down, so
+/// the first thing a cap crossing discards is the entry that is still hot. The
+/// re-create is `vkCreateGraphicsPipelines` — a driver-side shader compile, not
+/// a lookup — so a thrashing cache pays one compile per frame per evicted
+/// pipeline, forever.
+///
+/// The bound also never engaged on this arm. A driven x86 boot, window-drag
+/// probe against Safari, settles at `pipelines=92 shaders=75 layouts=33
+/// passes=4 samplers=14 compute_pipelines=16` — read directly off
+/// [`ObjectCaches::levels`], which is what the `object_cache_levels` census
+/// publishes. Every level is flat from roughly 38 s in through the end of the
+/// run, including across the drag probe's compositing, so the caps only stood
+/// ready to evict the hot set on a heavier guest.
+///
+/// Two of those numbers matter beyond this arm. `passes=4` against the 64 this
+/// cache carried is the widest margin here; and `pipelines=92` is *above* the
+/// 64-slot render-pipeline table the Metal arm carried, which is how that arm's
+/// cap was shown to be binding — see [`crate::model::content_cache`].
+///
+/// Unbounded is also the faithful failure mode. When a guest really does ask for
+/// more distinct pipelines than the host can hold, the create itself returns
+/// `VK_ERROR_OUT_OF_DEVICE_MEMORY` and that is reported as a typed [`DrawError`].
+/// That is a GPU refusing because its memory is full — the behavior we are
+/// emulating — rather than a device that silently forgets an object the guest
+/// still has bound. It is deliberately *not* remembered; see
+/// [`ObjectCache::insert_negative`] for why a refusal about this instant must not
+/// outlive the instant.
+struct ObjectCache<K, V> {
     map: HashMap<K, V>,
-    order: VecDeque<K>,
-    cap: usize,
     negative: HashMap<K, DrawError>,
-    /// FIFO order for `negative`, bounded by the same `cap` as the positive
-    /// map. Negative entries are only added on genuine create failures — a
-    /// Vulkan create call refusing (a typed [`VkCall`]) or a device-capability
-    /// refusal (`DrawError::Unsupported`, e.g. an unsupported vertex divisor) —
-    /// empty on a healthy boot, but a guest that keeps submitting distinct
+    /// FIFO order for `negative`, bounded by [`NEGATIVE_CAP`]. Negative entries
+    /// are only added on create failures that a second identical attempt would
+    /// meet again — a Vulkan create call refusing for a reason inherent to the
+    /// request (a typed [`VkCall`]) or a device-capability refusal
+    /// (`DrawError::Unsupported`, e.g. an unsupported vertex divisor) — empty on
+    /// a healthy boot, but a guest that keeps submitting distinct
     /// never-creatable objects would grow `negative` without limit if it were
-    /// unbounded. Evicting the oldest negative entry only means the next attempt
-    /// re-tries the (cheap) create. The value is the exact typed [`DrawError`]
-    /// the create refused with, so the cheap re-attempt replays that reason —
-    /// slug and all — rather than a re-formatted `Vulkan(String)` that dropped it.
+    /// unbounded. The value is the exact typed [`DrawError`] the create refused
+    /// with, so the cheap re-attempt replays that reason — slug and all — rather
+    /// than a re-formatted `Vulkan(String)` that dropped it.
     negative_order: VecDeque<K>,
+    negative_cap: usize,
 }
 
-impl<K: Clone + Eq + std::hash::Hash, V> FifoCache<K, V> {
-    fn new(cap: usize) -> Self {
+impl<K: Clone + Eq + std::hash::Hash, V> ObjectCache<K, V> {
+    fn new() -> Self {
+        Self::with_negative_cap(NEGATIVE_CAP)
+    }
+
+    fn with_negative_cap(negative_cap: usize) -> Self {
         Self {
             map: HashMap::new(),
-            order: VecDeque::new(),
-            cap,
             negative: HashMap::new(),
             negative_order: VecDeque::new(),
+            negative_cap,
         }
     }
 
@@ -265,33 +323,50 @@ impl<K: Clone + Eq + std::hash::Hash, V> FifoCache<K, V> {
         self.negative.get(k).cloned()
     }
 
-    /// Insert; returns any FIFO-evicted value so the caller can destroy the Vulkan object.
+    /// Insert. Returns the value a *replace* displaced, so the caller can
+    /// destroy the Vulkan object it owned; a fresh key returns `None`. Nothing
+    /// is ever displaced for capacity.
     fn insert(&mut self, k: K, v: V) -> Option<V> {
-        if let Some(existing) = self.map.get_mut(&k) {
-            *existing = v;
-            return None;
-        }
-        let mut evicted = None;
-        if self.order.len() >= self.cap {
-            if let Some(old) = self.order.pop_front() {
-                evicted = self.map.remove(&old);
-            }
-        }
         self.negative.remove(&k);
-        self.order.push_back(k.clone());
-        self.map.insert(k, v);
-        evicted
+        self.map.insert(k, v)
     }
 
+    /// Remember a create failure so the next identical ask replays it without
+    /// paying the driver call again.
+    ///
+    /// **A refusal about this instant is not remembered at all.** Out of memory
+    /// describes how much the device is holding right now, not anything about
+    /// the request — the guest can free a texture atlas and ask for the very
+    /// same pipeline a frame later, and by then the create succeeds. Memoizing
+    /// one turns a GPU that refuses while full into a GPU that refuses forever,
+    /// which is the failure a real one does not have: nothing here can clear a
+    /// negative entry short of device teardown, because the lookup consults
+    /// `negative` before the create and so the create that would displace it
+    /// never runs.
+    ///
+    /// The predicate is [`DrawError::out_of_memory`], the crate's single
+    /// statement of which refusals a second attempt could answer differently;
+    /// the resident image and command-buffer allocators already reclaim and
+    /// retry on it. Deciding it here rather than at the call sites is
+    /// deliberate — thirteen of them insert negatives, and a rule spread over
+    /// thirteen sites is a rule that will be half-applied.
+    ///
+    /// Declining to memoize costs a repeated failing create while the device
+    /// stays full. That is the same bargain the resident allocators take, and
+    /// it is bounded by the guest's own retry rate rather than by anything
+    /// here.
     fn insert_negative(&mut self, k: K, err: DrawError) {
+        if err.out_of_memory() {
+            return;
+        }
         if self.negative.insert(k.clone(), err).is_some() {
             // Already tracked (error refreshed); order stays as-is.
             return;
         }
         self.negative_order.push_back(k);
-        // Bound the negative map by `cap`, oldest-first. Pops skip stale order
-        // entries (keys since promoted into the positive map by `insert`).
-        while self.negative.len() > self.cap {
+        // Bound the negative map, oldest-first. Pops skip stale order entries
+        // (keys since promoted into the positive map by `insert`).
+        while self.negative.len() > self.negative_cap {
             match self.negative_order.pop_front() {
                 Some(old) => {
                     self.negative.remove(&old);
@@ -301,21 +376,23 @@ impl<K: Clone + Eq + std::hash::Hash, V> FifoCache<K, V> {
         }
         // Compact the order deque if promotions left many stale entries, so it
         // can never itself grow unbounded (rare; error path only).
-        if self.negative_order.len() > self.cap.saturating_mul(2) {
+        if self.negative_order.len() > self.negative_cap.saturating_mul(2) {
             self.negative_order
                 .retain(|key| self.negative.contains_key(key));
         }
     }
 
+    fn len(&self) -> usize {
+        self.map.len()
+    }
+
     fn clear(&mut self) {
         self.map.clear();
-        self.order.clear();
         self.negative.clear();
         self.negative_order.clear();
     }
 
     fn take_all(&mut self) -> Vec<V> {
-        self.order.clear();
         self.negative.clear();
         self.negative_order.clear();
         self.map.drain().map(|(_, v)| v).collect()
@@ -323,24 +400,24 @@ impl<K: Clone + Eq + std::hash::Hash, V> FifoCache<K, V> {
 }
 
 pub(crate) struct ObjectCaches {
-    shaders: FifoCache<Digest128, vk::ShaderModule>,
-    layouts: FifoCache<LayoutKey, (vk::DescriptorSetLayout, vk::PipelineLayout)>,
-    passes: FifoCache<PassKey, vk::RenderPass>,
-    pipelines: FifoCache<PipelineKey, vk::Pipeline>,
-    samplers: FifoCache<SamplerStateKey, vk::Sampler>,
+    shaders: ObjectCache<Digest128, vk::ShaderModule>,
+    layouts: ObjectCache<LayoutKey, (vk::DescriptorSetLayout, vk::PipelineLayout)>,
+    passes: ObjectCache<PassKey, vk::RenderPass>,
+    pipelines: ObjectCache<PipelineKey, vk::Pipeline>,
+    samplers: ObjectCache<SamplerStateKey, vk::Sampler>,
     /// Lc: compute pipelines (content digest + entry + layout).
-    compute_pipelines: FifoCache<ComputePipelineKey, vk::Pipeline>,
+    compute_pipelines: ObjectCache<ComputePipelineKey, vk::Pipeline>,
 }
 
 impl ObjectCaches {
     pub(crate) fn new() -> Self {
         Self {
-            shaders: FifoCache::new(CAP_DEFAULT),
-            layouts: FifoCache::new(CAP_DEFAULT),
-            passes: FifoCache::new(64),
-            pipelines: FifoCache::new(CAP_DEFAULT),
-            samplers: FifoCache::new(CAP_DEFAULT),
-            compute_pipelines: FifoCache::new(CAP_DEFAULT),
+            shaders: ObjectCache::new(),
+            layouts: ObjectCache::new(),
+            passes: ObjectCache::new(),
+            pipelines: ObjectCache::new(),
+            samplers: ObjectCache::new(),
+            compute_pipelines: ObjectCache::new(),
         }
     }
 
@@ -366,6 +443,26 @@ impl ObjectCaches {
         for s in self.samplers.take_all() {
             device.destroy_sampler(s, None);
         }
+    }
+
+    /// Live entries in each cache, in the order
+    /// `(shaders, layouts, passes, pipelines, samplers, compute_pipelines)`.
+    ///
+    /// Published because [`ObjectCache`] is unbounded on the argument that its
+    /// entry count is the guest's distinct object set and therefore plateaus.
+    /// That is a claim about a running guest, and this is the reading that can
+    /// falsify it: a level that climbs for the life of a boot instead of
+    /// settling means some key is carrying per-frame state and the argument is
+    /// wrong for that cache. Levels, not deltas — the census line says so.
+    pub(crate) fn levels(&self) -> [usize; 6] {
+        [
+            self.shaders.len(),
+            self.layouts.len(),
+            self.passes.len(),
+            self.pipelines.len(),
+            self.samplers.len(),
+            self.compute_pipelines.len(),
+        ]
     }
 
     pub(crate) fn clear_logical(&mut self) {
@@ -752,7 +849,10 @@ impl ObjectCaches {
             self.samplers.insert_negative(*key, err.clone());
             return Err(err);
         }
-        let max_anisotropy = (key.max_anisotropy.max(1) as f32).min(ctx.max_sampler_anisotropy);
+        // Not floored here: every producer of this key either writes a literal
+        // 1 (the reflected static sampler) or carries a decoded
+        // `SamplerDescriptor`, which `decode_sampler_descriptor` already floors.
+        let max_anisotropy = (key.max_anisotropy as f32).min(ctx.max_sampler_anisotropy);
         let sampler = ctx
             .device
             .create_sampler(
@@ -800,6 +900,10 @@ impl ObjectCaches {
         ctx: &DeviceContext,
         key: &PipelineKey,
         vert_module: vk::ShaderModule,
+        // The post-relocation words `vert_module` was built from. Read only to
+        // answer how wide this shader's stage-in reads are, and only on a host
+        // that substitutes a vertex format; see the resolution loop below.
+        vert_spirv: &[u32],
         frag_module: vk::ShaderModule,
         pipeline_layout: vk::PipelineLayout,
         render_pass: vk::RenderPass,
@@ -842,31 +946,75 @@ impl ObjectCaches {
             }
         }
 
+        // `MTLTriangleFillModeLines` and `MTLDepthClipModeClamp` are the two
+        // rasterization states whose non-default arm Vulkan makes optional:
+        // `VK_POLYGON_MODE_LINE` needs `fillModeNonSolid` and
+        // `depthClampEnable` needs `depthClamp`, and naming either without its
+        // feature makes the pipeline invalid. Same shape as the two checks
+        // above — capability question, typed decline, cached negatively.
+        //
+        // Refused rather than rasterized the other way, because the other way
+        // is a whole pass rendered wrong with nothing to say so: a wireframe
+        // filled in, or the geometry a clamped pass wanted kept discarded at
+        // the near plane.
+        if key.fill_mode != FillMode::default() && !ctx.features.fill_mode_non_solid {
+            let reason = super::reason::DrawReason::FillModeNonSolidUnsupported;
+            crate::observe::Emit::decline("vk_engine_pipeline", &reason).fail();
+            let err = DrawError::Unsupported(reason);
+            self.pipelines.insert_negative(key.clone(), err.clone());
+            return Err(err);
+        }
+        if key.depth_clip != DepthClipMode::default() && !ctx.features.depth_clamp {
+            let reason = super::reason::DrawReason::DepthClampUnsupported;
+            crate::observe::Emit::decline("vk_engine_pipeline", &reason).fail();
+            let err = DrawError::Unsupported(reason);
+            self.pipelines.insert_negative(key.clone(), err.clone());
+            return Err(err);
+        }
+
         // Resolve every attribute against what this device accepts as a vertex
         // buffer format. Vulkan makes the three-component 8/16-bit formats
         // optional, so the format the guest decoded is not automatically
         // bindable; `translate::support` either confirms it, substitutes the
         // mandatory wider sibling, or declines by name.
+        //
+        // A substitution is only invisible to a shader that does not read the
+        // component it oversupplies, so `resolve` asks what this shader
+        // declares at the attribute's location. Walked at most once per
+        // pipeline miss and only when some attribute really needs substituting:
+        // on a host that accepts every format — every host this project has run
+        // on — `vert_spirv` is never read at all.
+        let mut shader_inputs: Option<VertexInputWidths> = None;
         let mut attribute_formats = Vec::with_capacity(key.attrs.len());
         for attr in &key.attrs {
-            let binding = match ctx
-                .vertex_formats
-                .resolve(attr.format, attr.offset, attr.stride)
-            {
-                Ok(binding) => binding,
-                Err(translate_reason) => {
-                    let err = DrawError::Unsupported(super::reason::DrawReason::VertexFormat(
-                        translate_reason,
-                    ));
-                    self.pipelines.insert_negative(key.clone(), err.clone());
-                    return Err(err);
-                }
-            };
+            let binding =
+                match ctx
+                    .vertex_formats
+                    .resolve(attr.format, attr.offset, attr.stride, || {
+                        shader_inputs
+                            .get_or_insert_with(|| VertexInputWidths::from_spirv(vert_spirv))
+                            .at(attr.location)
+                    }) {
+                    Ok(binding) => binding,
+                    Err(translate_reason) => {
+                        let err = DrawError::Unsupported(super::reason::DrawReason::VertexFormat(
+                            translate_reason,
+                        ));
+                        crate::observe::Emit::decline("vk_engine_vertex_format", &translate_reason)
+                            .fail_once(
+                                (u64::from(attr.location) << 32)
+                                    | u64::from(translate_reason.value()),
+                            );
+                        self.pipelines.insert_negative(key.clone(), err.clone());
+                        return Err(err);
+                    }
+                };
             if let Some(narrow) = binding.widened_from {
-                // Fail-visible because a widened attribute is a real difference
-                // from what the guest asked for, even though it reads the same
-                // bytes: without this line a device-specific substitution is
-                // invisible in a bug report from a host nobody here owns.
+                // Fail-visible because a widened attribute is a device-specific
+                // difference from what the guest asked for, even though
+                // `resolve` has just established that no shader input can
+                // observe it: without this line a substitution is invisible in
+                // a bug report from a host nobody here owns.
                 let decline = VertexFormatWidenDecline {
                     from: narrow,
                     to: binding.format,
@@ -932,12 +1080,7 @@ impl ObjectCaches {
                 vk::VertexInputBindingDescription::default()
                     .binding(attribute.binding)
                     .stride(attribute.stride)
-                    .input_rate(match attribute.step_function {
-                        VertexStepFunction::PerVertex => vk::VertexInputRate::VERTEX,
-                        VertexStepFunction::Constant | VertexStepFunction::PerInstance => {
-                            vk::VertexInputRate::INSTANCE
-                        }
-                    })
+                    .input_rate(translate::vertex::vk_input_rate(attribute.step_function))
             })
             .collect();
         let vertex_binding_divisors: Vec<_> = key
@@ -992,27 +1135,39 @@ impl ObjectCaches {
         }
         let dynamic_state =
             vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
+        // Both counts are the key's one number: the viewports and scissors
+        // themselves are dynamic, but how many of them there are is not, and
+        // Vulkan requires the two counts to be equal.
         let vp_state = vk::PipelineViewportStateCreateInfo::default()
-            .viewport_count(1)
-            .scissor_count(1);
-        // Cull mode and winding come from the guest. `polygon_mode(FILL)` does
-        // not: `MTLTriangleFillMode` is not decoded, so a guest asking for
-        // Lines renders filled. That is a recorded gap, not an assertion that
-        // the guest asked for FILL — `translate::coverage` lists
-        // `setTriangleFillMode:` as `NotOnTheWire` with what it would take to
-        // close (polygonMode LINE, gated on the `fillModeNonSolid` feature).
-        // Same for depth clipping, which has no `depth_clamp_enable` here.
+            .viewport_count(key.viewport_slots)
+            .scissor_count(key.viewport_slots);
+        // Cull mode, winding, fill mode and depth clip mode all come from the
+        // guest; the last two were refused above where the host cannot spell
+        // them, so reaching here means both are bindable.
         let raster = vk::PipelineRasterizationStateCreateInfo::default()
-            .polygon_mode(vk::PolygonMode::FILL)
-            .cull_mode(metal_cull_flags(key.cull_mode))
-            .front_face(metal_front_face(key.front_face_ccw))
+            .polygon_mode(translate::raster::vk_polygon_mode(key.fill_mode))
+            .depth_clamp_enable(translate::raster::vk_depth_clamp_enable(key.depth_clip))
+            .cull_mode(translate::raster::vk_cull_mode(key.cull_mode))
+            .front_face(translate::raster::vk_front_face(key.front_face_ccw))
             .line_width(1.0);
-        // Likewise pinned rather than known: the pipeline sample count is not
-        // on the wire, and every render target this backend allocates is
-        // single-sampled, so decoding it would also need the attachment path to
-        // carry it. `translate::coverage` records `rasterSampleCount`, and a
-        // test there forbids that field from ever claiming to be honoured while
-        // this line stays a constant.
+        // Pinned rather than unknown, and every render target this backend
+        // allocates is single-sampled, so honouring a count would need the
+        // attachment path to carry one too.
+        //
+        // `rasterSampleCount` is a property of `MTLRenderPipelineDescriptor`,
+        // so it reaches this device inside the type-7 pipeline's own
+        // compact-TLV block, which is the *only* route to it: the render-pass
+        // attachment record on the wire carries a resolve ref and no count, and
+        // the texture objects are met through the kernel's object list, whose
+        // descriptor has no such field either. That tag is now read —
+        // `PIPELINE_TAG_RASTER_SAMPLE_COUNT` — and a count this line cannot
+        // meet is named as `pipeline_raster_sample_count_degraded` rather than
+        // defaulted in silence. So the demand for multisampled attachments is
+        // now measurable, which is what widening this would need first.
+        //
+        // A pass that states a sample count *without* an attachment carrying
+        // one — `defaultRasterSampleCount` — is refused rather than rasterized
+        // here, as `StreamDrawDrop::PassRasterSampleCountUnsupported`.
         let multisample = vk::PipelineMultisampleStateCreateInfo::default()
             .rasterization_samples(vk::SampleCountFlags::TYPE_1);
         // One blend attachment state per color attachment; Vulkan requires the
@@ -1179,7 +1334,7 @@ impl ObjectCaches {
 }
 
 #[cfg(test)]
-mod fifo_cache_tests {
+mod object_cache_tests {
     use super::*;
 
     #[test]
@@ -1187,7 +1342,9 @@ mod fifo_cache_tests {
         use crate::observe::Decline as _;
         let narrow = translate::vertex::vertex_layout(VertexAttributeFormat::UChar3Normalized).vk;
         let binding = translate::VertexFormatSupport::with_unsupported(&[narrow])
-            .resolve(VertexAttributeFormat::UChar3Normalized, 12, 32)
+            .resolve(VertexAttributeFormat::UChar3Normalized, 12, 32, || {
+                crate::runtime::spirv_vertex_input::InputWidth::Components(3)
+            })
             .unwrap();
         let decline = VertexFormatWidenDecline {
             from: binding.widened_from.unwrap(),
@@ -1209,7 +1366,7 @@ mod fifo_cache_tests {
         // Negative entries (create failures) must not grow without bound: a
         // guest submitting endless distinct never-creatable objects would
         // otherwise leak one entry per distinct key forever.
-        let mut c: FifoCache<u32, u32> = FifoCache::new(4);
+        let mut c: ObjectCache<u32, u32> = ObjectCache::with_negative_cap(4);
         for k in 0..100u32 {
             c.insert_negative(
                 k,
@@ -1232,11 +1389,49 @@ mod fifo_cache_tests {
         assert!(c.get_negative(&0).is_none(), "oldest negative evicted");
     }
 
+    /// The first pipeline a boot creates is the compositor's, and it stays bound
+    /// for the life of the guest. Under the retired insertion-order cap it was
+    /// also the first thing a cap crossing threw away. Drive far past every cap
+    /// this file used to carry (1024, and 64 for render passes) and assert the
+    /// first key is still served and nothing was displaced for capacity.
+    #[test]
+    fn the_first_key_survives_far_past_every_retired_capacity() {
+        let mut c: ObjectCache<u32, u32> = ObjectCache::new();
+        c.insert(0, 0xC0FFEE);
+        for k in 1..4096u32 {
+            assert!(
+                c.insert(k, k).is_none(),
+                "a fresh key displaces nothing: {k}"
+            );
+        }
+        assert_eq!(
+            c.get(&0),
+            Some(&0xC0FFEE),
+            "the hot first entry is still served after 4095 later ones"
+        );
+        assert_eq!(c.map.len(), 4096, "every distinct key retained");
+    }
+
+    /// A replace hands the displaced handle back so the caller can destroy it.
+    /// The retired implementation overwrote in place and returned `None`, which
+    /// leaked the Vulkan object it had just dropped the last reference to.
+    #[test]
+    fn replacing_a_key_returns_the_displaced_value_to_destroy() {
+        let mut c: ObjectCache<u32, u32> = ObjectCache::new();
+        assert_eq!(c.insert(1, 10), None);
+        assert_eq!(
+            c.insert(1, 20),
+            Some(10),
+            "the displaced handle comes back for disposal"
+        );
+        assert_eq!(c.get(&1), Some(&20));
+    }
+
     #[test]
     fn positive_insert_clears_negative_for_the_key() {
         // A key that failed then later succeeds must not keep serving the stale
         // negative error.
-        let mut c: FifoCache<u32, u32> = FifoCache::new(4);
+        let mut c: ObjectCache<u32, u32> = ObjectCache::with_negative_cap(4);
         c.insert_negative(
             7,
             DrawError::VkCall(VkCall::new(
@@ -1252,48 +1447,104 @@ mod fifo_cache_tests {
 
     #[test]
     fn reinserting_same_negative_does_not_duplicate_order() {
-        let mut c: FifoCache<u32, u32> = FifoCache::new(4);
+        // Both results here are inherent to the request, so both are remembered.
+        // They used to be the two out-of-memory results, which no longer reach
+        // the map at all — see `an_out_of_memory_refusal_is_never_remembered`.
+        let mut c: ObjectCache<u32, u32> = ObjectCache::with_negative_cap(4);
         let a = DrawError::VkCall(VkCall::new(
             VkOp::CachesCreateShaderModule,
-            vk::Result::ERROR_OUT_OF_HOST_MEMORY,
+            vk::Result::ERROR_UNKNOWN,
         ));
         let b = DrawError::VkCall(VkCall::new(
             VkOp::CachesCreateShaderModule,
-            vk::Result::ERROR_OUT_OF_DEVICE_MEMORY,
+            vk::Result::ERROR_INITIALIZATION_FAILED,
         ));
         c.insert_negative(1, a);
         c.insert_negative(1, b.clone());
         assert_eq!(c.negative_order.len(), 1, "same key tracked once");
         assert_eq!(c.get_negative(&1), Some(b), "error refreshed");
     }
-}
 
-#[cfg(test)]
-mod cull_mapping_tests {
-    use super::*;
-
+    /// Out of memory says what the device holds *now*. The lookup consults
+    /// `negative` before the create, so a remembered one is never displaced by a
+    /// later success — the create that would displace it never runs. Remembering
+    /// it turns "refused while full" into "refused forever", which is the failure
+    /// mode a real GPU does not have.
     #[test]
-    fn cull_flags_map_metal_modes() {
-        assert_eq!(metal_cull_flags(CullMode::None), vk::CullModeFlags::NONE);
-        assert_eq!(metal_cull_flags(CullMode::Front), vk::CullModeFlags::FRONT);
-        assert_eq!(metal_cull_flags(CullMode::Back), vk::CullModeFlags::BACK);
+    fn an_out_of_memory_refusal_is_never_remembered() {
+        for result in [
+            vk::Result::ERROR_OUT_OF_DEVICE_MEMORY,
+            vk::Result::ERROR_OUT_OF_HOST_MEMORY,
+        ] {
+            let mut c: ObjectCache<u32, u32> = ObjectCache::with_negative_cap(4);
+            let err = DrawError::VkCall(VkCall::new(VkOp::CachesCreateGraphicsPipelines, result));
+            assert!(err.out_of_memory(), "{result:?} is the retryable class");
+            c.insert_negative(1, err);
+            assert_eq!(
+                c.get_negative(&1),
+                None,
+                "{result:?} must not short-circuit the next create"
+            );
+            assert!(c.negative.is_empty(), "{result:?} left no entry");
+            assert!(c.negative_order.is_empty(), "{result:?} left no order slot");
+        }
     }
 
+    /// The converse, so the test above cannot pass by disabling the map. A
+    /// refusal inherent to the request — malformed SPIR-V, or a capability this
+    /// host does not have — is worth remembering, because a second identical
+    /// attempt meets it again.
     #[test]
-    fn front_face_matches_metal_under_yflip() {
-        // Every draw is emitted through a negative-height viewport, so the
-        // rasterized framebuffer winding matches Metal and the mapping is
-        // direct — Metal's clockwise default front maps to FrontFace::CLOCKWISE,
-        // CCW to CCW.
-        assert_eq!(
-            metal_front_face(false),
-            vk::FrontFace::CLOCKWISE,
-            "Metal CW front under Y-flip"
+    fn a_refusal_inherent_to_the_request_is_still_remembered() {
+        let mut c: ObjectCache<u32, u32> = ObjectCache::with_negative_cap(4);
+
+        let bad_shader = DrawError::VkCall(VkCall::new(
+            VkOp::CachesCreateShaderModule,
+            vk::Result::ERROR_INVALID_SHADER_NV,
+        ));
+        assert!(!bad_shader.out_of_memory());
+        c.insert_negative(1, bad_shader.clone());
+        assert_eq!(c.get_negative(&1), Some(bad_shader));
+
+        let unsupported = DrawError::Unsupported(
+            super::super::reason::DrawReason::InstanceRateDivisorUnsupported { step_rate: 3 },
         );
-        assert_eq!(
-            metal_front_face(true),
-            vk::FrontFace::COUNTER_CLOCKWISE,
-            "Metal CCW front under Y-flip"
+        assert!(!unsupported.out_of_memory());
+        c.insert_negative(2, unsupported.clone());
+        assert_eq!(c.get_negative(&2), Some(unsupported));
+    }
+
+    /// A pipeline the guest still wants is asked for again after the memory it
+    /// needed came back. This is the whole point of the rule, written as the
+    /// sequence a guest actually produces: create fails while an atlas is
+    /// resident, the guest frees the atlas, the guest re-binds the same
+    /// pipeline. Before the rule, step three replayed a stale error and the
+    /// driver was never asked.
+    #[test]
+    fn a_key_that_ran_out_of_memory_is_created_on_the_next_ask() {
+        let mut c: ObjectCache<u32, u32> = ObjectCache::with_negative_cap(4);
+        let key = 0xB0BAu32;
+
+        // Frame N: the create refuses because the device is full.
+        c.insert_negative(
+            key,
+            DrawError::VkCall(VkCall::new(
+                VkOp::CachesCreateGraphicsPipelines,
+                vk::Result::ERROR_OUT_OF_DEVICE_MEMORY,
+            )),
         );
+
+        // Frame N+1: the guest asks again. Nothing short-circuits it, so the
+        // caller reaches its create.
+        assert_eq!(
+            c.get_negative(&key),
+            None,
+            "the second ask must reach the driver"
+        );
+        assert_eq!(c.get(&key), None, "and it is still a miss, not a stale hit");
+
+        // The memory came back, so this time the create succeeds.
+        c.insert(key, 0x5EED);
+        assert_eq!(c.get(&key), Some(&0x5EED));
     }
 }

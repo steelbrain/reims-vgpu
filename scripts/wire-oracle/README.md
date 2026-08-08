@@ -33,9 +33,13 @@ instantiated.
 REIMS_WIRE_FIXTURES_REQUIRED=1 cargo test -p reims-vgpu-wire -- --test-threads=1
 ```
 
-Without that variable a missing fixture set makes the oracle tests skip with a
-printed reason. With it, a missing set is a failure — set it on any Apple host,
-where there is no excuse for not having them.
+Without that variable a missing fixture set makes the oracle tests report
+`ignored`, one line each, naming the command that regenerates them. With it, a
+missing set fails the build — set it on any Apple host, where there is no excuse
+for not having them.
+
+`inventory.json` gates separately from `fixtures.json`, so a run that has one
+and not the other stands down only the tests that read the missing half.
 
 The procedure for turning a new capture into a checked view is in
 `crates/reims-vgpu-wire/AGENTS.md`.

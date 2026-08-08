@@ -2,13 +2,14 @@
 //!
 //! These checks happen before [`super::DrawRequest`] validation: resolving the
 //! pipeline and its stage libraries, extracting AIR, and translating each stage.
-//! They therefore do not belong to [`super::DrawValidationDecline`], which owns
+//! They therefore do not belong to
+//! [`super::draw_validation::DrawValidationDecline`], which owns
 //! invariants of an already-built engine request.
 
 use crate::backend::vulkan::translate::TranslateReason;
 use crate::observe::Decline;
+use crate::runtime::draw::IndexLoadReason;
 use crate::runtime::m2v_cache::M2vCacheDecline;
-use crate::runtime::metal_draw::IndexLoadReason;
 use crate::runtime::mtlb::MtlbDecline;
 
 /// A specific pipeline/stage preparation failure before engine request validation.
@@ -45,6 +46,28 @@ pub enum DrawPreparationDecline {
     GeometryUnsupported {
         width: u32,
         height: u32,
+    },
+    /// A live bind names a slot past its class's argument table, so no encoder
+    /// of this backend has anywhere to put it. See
+    /// [`crate::runtime::draw::first_bind_past_table`] for why the whole draw is
+    /// refused rather than the one bind dropped.
+    BindSlotPastTable {
+        pipeline_ref: u32,
+        bind: crate::runtime::draw::PastTableBind,
+    },
+    /// The guest's colour list names more than one render target and one of the
+    /// secondary attachments cannot be built, so the whole draw is refused.
+    ///
+    /// The alternative is what this device used to do: drop every secondary and
+    /// execute the draw against slot 0 alone. That writes a frame the guest has
+    /// no way to know is wrong — a fragment shader's `location` 1.. outputs go
+    /// nowhere and a later pass sampling that attachment reads whatever was
+    /// there before. See
+    /// [`crate::runtime::census::present_proxy::MrtDrop`] for which checks bail
+    /// and why the Metal arm is the one that settled it.
+    SecondaryTargetUnbuildable {
+        pipeline_ref: u32,
+        refusal: crate::runtime::census::present_proxy::SecondaryMrtRefusal,
     },
     VertexBufferMissing {
         index: u32,
@@ -229,6 +252,14 @@ impl Decline for DrawPreparationDecline {
                 reason.slug()
             }
             Self::GeometryUnsupported { .. } => "draw_prepare_geometry_unsupported",
+            Self::BindSlotPastTable { .. } => "draw_prepare_bind_slot_past_table",
+            // One slug for all five `MrtDrop` reasons, with the reason carried
+            // as a field. Delegating to `reason.slug()` the way the AIR-extract
+            // arms do would make this refusal share `fail_once`'s latch with the
+            // `note_secondary_mrt_drop` census that emits the same five slugs,
+            // and the census fires first — so the refusal would be silent for
+            // exactly the geometry the census had already reported.
+            Self::SecondaryTargetUnbuildable { .. } => "draw_prepare_secondary_target_unbuildable",
             Self::VertexBufferMissing { .. } => "draw_prepare_vertex_buffer_missing",
             Self::FragmentBufferMissing { .. } => "draw_prepare_fragment_buffer_missing",
             Self::VertexAttributeFormat { .. } => "draw_prepare_vertex_attribute_format",
@@ -277,9 +308,15 @@ impl Decline for DrawPreparationDecline {
             Self::ChainResidentIdentityMissing { .. } => {
                 "draw_prepare_chain_resident_identity_missing"
             }
-            Self::SamplerEntryMissing { .. } => "draw_prepare_sampler_entry_missing",
-            Self::SamplerObjectType { .. } => "draw_prepare_sampler_object_type",
-            Self::SamplerDescriptorMissing { .. } => "draw_prepare_sampler_descriptor_missing",
+            Self::SamplerEntryMissing { .. } => {
+                crate::observe::ladder_slug!("draw_prepare_sampler", no_list_entry)
+            }
+            Self::SamplerObjectType { .. } => {
+                crate::observe::ladder_slug!("draw_prepare_sampler", wrong_type)
+            }
+            Self::SamplerDescriptorMissing { .. } => {
+                crate::observe::ladder_slug!("draw_prepare_sampler", desc_read)
+            }
             Self::SamplerDescriptorShort { .. } => "draw_prepare_sampler_descriptor_short",
             Self::SamplerDescriptorUnknownType { .. } => {
                 "draw_prepare_sampler_descriptor_unknown_type"
@@ -334,6 +371,24 @@ impl Decline for DrawPreparationDecline {
             } => vec![
                 ("task_id", task_id.to_string()),
                 ("pipeline_ref", pipeline_ref.to_string()),
+            ],
+            Self::SecondaryTargetUnbuildable {
+                pipeline_ref,
+                refusal,
+            } => vec![
+                ("pipeline_ref", pipeline_ref.to_string()),
+                ("slot", refusal.slot.to_string()),
+                // The census slug, so one grep finds both the refusal and the
+                // `note_secondary_mrt_drop` line that reports the same check.
+                ("mrt_reason", refusal.reason.slug().to_string()),
+            ],
+            Self::BindSlotPastTable { pipeline_ref, bind } => vec![
+                ("pipeline_ref", pipeline_ref.to_string()),
+                ("class", bind.class.name().to_string()),
+                ("stage", bind.stage_name().to_string()),
+                ("index", bind.index.to_string()),
+                ("table", bind.class.table().to_string()),
+                ("ref", bind.resource_ref.to_string()),
             ],
             Self::VertexMtlbMissing {
                 task_id,
@@ -687,6 +742,13 @@ mod tests {
                 width: 8192,
                 height: 4096,
             },
+            DrawPreparationDecline::SecondaryTargetUnbuildable {
+                pipeline_ref: 2,
+                refusal: crate::runtime::census::present_proxy::SecondaryMrtRefusal {
+                    slot: 1,
+                    reason: crate::runtime::census::present_proxy::MrtDrop::GeometryMismatch,
+                },
+            },
             DrawPreparationDecline::VertexBufferMissing {
                 index: 1,
                 buffer_ref: 5,
@@ -876,13 +938,13 @@ mod tests {
         slugs.sort_unstable();
         let before = slugs.len();
         slugs.dedup();
-        assert_eq!(before, 41, "the draw-preparation reason census moved");
+        assert_eq!(before, 42, "the draw-preparation reason census moved");
         assert_eq!(before, slugs.len(), "duplicate draw-preparation slug");
     }
 
     #[test]
     fn index_load_preserves_the_shared_reason_and_fields() {
-        use crate::runtime::metal_draw::IndexLoadReason;
+        use crate::runtime::draw::IndexLoadReason;
 
         let decline = DrawPreparationDecline::IndexLoad {
             reason: IndexLoadReason::OutOfBounds,

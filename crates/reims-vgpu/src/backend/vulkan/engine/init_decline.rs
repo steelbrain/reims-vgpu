@@ -42,6 +42,33 @@ impl InitDecline {
     fn squash(value: impl std::fmt::Display) -> String {
         value.to_string().replace(char::is_whitespace, "_")
     }
+
+    /// The driver's `vk::Result`, for the checks that are a Vulkan call
+    /// refusing; `None` for the checks this device decided itself.
+    ///
+    /// The four that answer `None` are judgements rather than calls — no
+    /// loader, no device, no graphics queue, every device below the API floor —
+    /// and none of them carries a result to report. Every arm is spelled out so
+    /// a new variant has to choose a side rather than defaulting into one.
+    ///
+    /// Read by [`super::types::DrawError::out_of_memory`], which is why the
+    /// grouping matches [`Decline::fields`]'s: both answer "did a Vulkan call
+    /// refuse, and with what".
+    pub(crate) fn vk_result(&self) -> Option<vk::Result> {
+        match self {
+            Self::EnumerateInstanceVersion { result }
+            | Self::EnumerateInstanceExtensions { result }
+            | Self::CreateInstance { result }
+            | Self::EnumeratePhysicalDevices { result }
+            | Self::EnumerateDeviceExtensions { result }
+            | Self::CreateDevice { result }
+            | Self::CreatePipelineCache { result } => Some(*result),
+            Self::LoadVulkanLoader { .. }
+            | Self::NoPhysicalDevice
+            | Self::BelowApiFloor { .. }
+            | Self::NoGraphicsQueueFamily => None,
+        }
+    }
 }
 
 impl Decline for InitDecline {

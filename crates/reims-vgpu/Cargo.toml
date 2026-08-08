@@ -42,6 +42,9 @@ parking_lot = "0.12"
 # Wire-format views inferred from macOS Oracles.
 # `no_std`, no allocation, no build script — it adds no runtime dependency.
 reims-vgpu-wire = { path = "../reims-vgpu-wire" }
+# Guest address resolution above the wire page-table format: span walks, GPA
+# run coalescing, window region planning. `no_std` + alloc, no host traits.
+reims-vgpu-paging = { path = "../reims-vgpu-paging" }
 ash = { version = "0.38", optional = true }
 # Always available for Linux MTLB→AIR→SPIR-V (encode path + probes).
 metal2vulkan = { git = "https://github.com/steelbrain/metal2vulkan.git", rev = "f9832cec3fe55d28069e3c8aa4bd307a7c0296c9" }

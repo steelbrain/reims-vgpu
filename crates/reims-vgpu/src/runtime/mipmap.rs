@@ -15,20 +15,35 @@ use crate::runtime::decode::resource::{
     decode_texture_descriptor, OBJECT_TYPE_TEXTURE, OBJECT_TYPE_TEXTURE_VARIANT,
     TEXTURE_MAX_MIP_LEVELS,
 };
+use crate::runtime::draw::host_alloc_len;
 use crate::runtime::gva_mem;
 use crate::runtime::host::{HostMemory, HostOps};
-use crate::runtime::metal_draw::host_alloc_len;
 use crate::runtime::objects;
 
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 use crate::backend::metal::mipmap as metal_mip;
+// The refusal type is portable data and lives in `contract::mipmap` so its
+// checks can be executed on a host with no Apple linker. The import still
+// carries this gate, because only this arm can produce one.
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+use crate::contract::mipmap::MetalMipmapError;
 
 /// Outcome of a generateMipmaps attempt.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MipmapStatus {
     Ok,
-    /// Missing object, wrong kind, short descriptor, or zero base ref.
+    /// The base ref resolved to no usable texture: absent from the object
+    /// list, holding some other kind, or naming a descriptor that would not
+    /// read or decode. Which one is named separately on the fail channel by
+    /// [`resolve_multi_mip_texture`]; this class is what the caller acts on.
     MissingTexture,
+    /// The blit named base ref 0, so there is no texture to generate from.
+    ///
+    /// Split out of [`Self::MissingTexture`] because it is a different
+    /// statement — nothing was bound, as against something bound that would not
+    /// resolve — and because the dispatch site reports every non-`Ok` status, so
+    /// an unbound ref was reaching the log as a missing texture.
+    UnboundTexture,
     /// `mipmapLevelCount <= 1` — not a valid Metal no-op.
     SingleLevel,
     /// Level layouts incomplete / out of range / zero geometry.
@@ -41,7 +56,7 @@ pub enum MipmapStatus {
     GuestIo,
     /// The exact Metal-side check that rejected generation.
     #[cfg(all(feature = "backend-metal", target_os = "macos"))]
-    Metal(metal_mip::MetalMipmapError),
+    Metal(MetalMipmapError),
 }
 
 impl crate::observe::Refusal for MipmapStatus {
@@ -56,6 +71,7 @@ impl crate::observe::Refusal for MipmapStatus {
         Some(match self {
             Self::Ok => return None,
             Self::MissingTexture => "mipmap_missing_texture",
+            Self::UnboundTexture => "mipmap_texture_ref_zero",
             Self::SingleLevel => "mipmap_single_level",
             Self::IncompleteLayout => "mipmap_incomplete_layout",
             Self::UnsupportedFormat => "mipmap_unsupported_format",
@@ -153,18 +169,30 @@ fn resolve_multi_mip_texture<M: HostMemory + HostOps>(
     texture_ref: u32,
 ) -> Result<ResolvedTexture, MipmapStatus> {
     if texture_ref == 0 {
-        return Err(MipmapStatus::MissingTexture);
+        return Err(MipmapStatus::UnboundTexture);
     }
-    let Some(entry) = objects::lookup_list_entry(state, host, task_id, texture_ref) else {
-        return Err(MipmapStatus::MissingTexture);
-    };
-    if entry.object_type != OBJECT_TYPE_TEXTURE && entry.object_type != OBJECT_TYPE_TEXTURE_VARIANT
-    {
-        return Err(MipmapStatus::MissingTexture);
-    }
-    let Some(desc_bytes) = objects::read_descriptor(state, host, task_id, &entry) else {
-        return Err(MipmapStatus::MissingTexture);
-    };
+    // The three rungs still collapse into one coarse *status*, because the
+    // caller's four surrounding checks do too and nothing downstream would act
+    // differently on them. What they no longer share is a *name*: the rung is
+    // reported here, so the fail log distinguishes a ref the guest never bound
+    // from one holding a buffer from one whose descriptor would not read. That
+    // costs nothing on a healthy guest — a driven boot of 177 746 draws fired no
+    // rung at all — so a line from here is an event, not noise.
+    let (_entry, desc_bytes) = objects::resolve_descriptor(
+        state,
+        host,
+        task_id,
+        texture_ref,
+        &[OBJECT_TYPE_TEXTURE, OBJECT_TYPE_TEXTURE_VARIANT],
+    )
+    .map_err(|rung| {
+        crate::observe::RungReport::new("mipmap_resolve", "tex_ref").rung(
+            task_id,
+            texture_ref,
+            rung,
+        );
+        MipmapStatus::MissingTexture
+    })?;
     let tex = match decode_texture_descriptor(&desc_bytes) {
         Ok(t) => t,
         Err(e) => {
@@ -180,7 +208,7 @@ fn resolve_multi_mip_texture<M: HostMemory + HostOps>(
             return Err(MipmapStatus::MissingTexture);
         }
     };
-    if !tex.has_pixel_format {
+    if tex.declared_pixel_format().is_none() {
         return Err(MipmapStatus::UnsupportedFormat);
     }
     let levels = if tex.mipmap_level_count > 0 {
@@ -202,8 +230,8 @@ fn resolve_multi_mip_texture<M: HostMemory + HostOps>(
     let l0 = tex.levels[0];
     for level in 0..levels {
         let layout = &tex.levels[level];
-        let exp_w = metal_mip_extent_local(l0.width, level as u32);
-        let exp_h = metal_mip_extent_local(l0.height, level as u32);
+        let exp_w = crate::contract::extent::mip_extent(l0.width, level as u32);
+        let exp_h = crate::contract::extent::mip_extent(l0.height, level as u32);
         if layout.width != exp_w
             || layout.height != exp_h
             || layout.width == 0
@@ -213,21 +241,6 @@ fn resolve_multi_mip_texture<M: HostMemory + HostOps>(
         }
     }
     Ok(ResolvedTexture { tex, levels, fmt })
-}
-
-fn metal_mip_extent_local(base: u32, level: u32) -> u32 {
-    #[cfg(all(feature = "backend-metal", target_os = "macos"))]
-    {
-        metal_mip::metal_mip_extent(base, level)
-    }
-    #[cfg(feature = "backend-vulkan")]
-    {
-        if base == 0 {
-            0
-        } else {
-            (base >> level).max(1)
-        }
-    }
 }
 
 /// Load one level as tightly packed native-format bytes.
@@ -360,7 +373,7 @@ fn generate_via_metal(
     height: u32,
     levels: u32,
     level0: &[u8],
-) -> Result<Vec<(u32, u32, Vec<u8>)>, metal_mip::MetalMipmapError> {
+) -> Result<Vec<(u32, u32, Vec<u8>)>, MetalMipmapError> {
     metal_mip::generate_mipmaps_filtered(fmt, width, height, levels, level0).map(|chain| {
         chain
             .into_iter()
@@ -411,8 +424,8 @@ fn generate_via_box_filter(
     let mut prev_w = width;
     let mut prev_h = height;
     for level in 1..levels {
-        let dw = metal_mip_extent_local(width, level as u32);
-        let dh = metal_mip_extent_local(height, level as u32);
+        let dw = crate::contract::extent::mip_extent(width, level as u32);
+        let dh = crate::contract::extent::mip_extent(height, level as u32);
         let Some(next_rgba) = downsample_rgba8_box(&prev, prev_w, prev_h, dw, dh) else {
             return Err(MipmapStatus::IncompleteLayout);
         };
@@ -467,7 +480,7 @@ pub fn generate_mipmaps_linear<M: HostMemory + HostOps>(
     #[cfg(all(feature = "backend-metal", target_os = "macos"))]
     let chain = match generate_via_metal(fmt, l0_w, l0_h, levels as u32, &level0) {
         Ok(chain) => chain,
-        Err(error @ metal_mip::MetalMipmapError::NoDevice) => {
+        Err(error @ MetalMipmapError::NoDevice) => {
             // Correct but slower: retain the CPU box-filter fallback, and make
             // the missing Metal device visible as a typed degradation.
             crate::observe::Emit::decline("mipmap_metal_fallback", &error)
@@ -522,6 +535,7 @@ mod tests {
         const ALL: &[MipmapStatus] = &[
             MipmapStatus::Ok,
             MipmapStatus::MissingTexture,
+            MipmapStatus::UnboundTexture,
             MipmapStatus::SingleLevel,
             MipmapStatus::IncompleteLayout,
             MipmapStatus::UnsupportedFormat,
@@ -538,7 +552,7 @@ mod tests {
 
         #[cfg(all(feature = "backend-metal", target_os = "macos"))]
         {
-            let status = MipmapStatus::Metal(metal_mip::MetalMipmapError::Level0TooShort {
+            let status = MipmapStatus::Metal(MetalMipmapError::Level0TooShort {
                 len: 15,
                 expected: 16,
             });
@@ -549,6 +563,48 @@ mod tests {
                 "the runtime wrapper must retain the Metal leaf's structured facts"
             );
         }
+    }
+
+    /// The two ways a base ref yields no texture are different statements, and
+    /// the fail channel now says which.
+    ///
+    /// `ref == 0` is the guest binding nothing; a ref naming an empty object-list
+    /// slot is the guest naming something that is not there. Both used to answer
+    /// `MissingTexture`, and the dispatch site reports every non-`Ok` status, so
+    /// an unbound ref reached the log claiming a texture was missing. The rung is
+    /// reported separately from the status, so the coarse class the caller acts
+    /// on is unchanged.
+    #[test]
+    fn an_unbound_base_ref_is_not_a_missing_texture() {
+        use crate::model::{DeviceId, PAGE_SHIFT_X86};
+        use crate::runtime::host::FakeHost;
+
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let mut host = FakeHost::new();
+
+        let cap = crate::observe::FailCapture::start();
+        assert_eq!(
+            generate_mipmaps_linear(&mut state, &mut host, 1, 0),
+            MipmapStatus::UnboundTexture
+        );
+        assert!(
+            cap.lines().is_empty(),
+            "an unbound ref resolves nothing, so it reports no rung: {:?}",
+            cap.lines()
+        );
+        drop(cap);
+
+        // A bound-looking ref against an empty task: the first rung refuses, and
+        // says so under this rail's own event.
+        let cap = crate::observe::FailCapture::start();
+        assert_eq!(
+            generate_mipmaps_linear(&mut state, &mut host, 1, 9),
+            MipmapStatus::MissingTexture
+        );
+        assert_eq!(
+            cap.one("mipmap_resolve"),
+            "mipmap_resolve fail reason=no_list_entry task=1 tex_ref=9"
+        );
     }
 
     #[test]
@@ -623,39 +679,5 @@ mod tests {
         assert_eq!(chain[2].0, 1);
         assert_eq!(chain[2].1, 1);
         assert_eq!(chain[2].2, vec![100, 150, 200, 255]);
-    }
-
-    /// Regression guard for `metal_mip_extent_local` (the Vulkan-build mip
-    /// sizing formula). This computes each level's expected dimension and the
-    /// resolver rejects any layout whose stored extent disagrees, so a wrong
-    /// formula either falsely rejects valid mip chains (IncompleteLayout) or
-    /// accepts a mismatched layout that then samples out of bounds. Lock the
-    /// Metal contract `max(1, base >> level)` with the base==0 degenerate case.
-    #[test]
-    fn metal_mip_extent_local_halves_and_floors_at_one() {
-        // Degenerate base stays zero (an empty axis has no levels).
-        assert_eq!(metal_mip_extent_local(0, 0), 0);
-        assert_eq!(metal_mip_extent_local(0, 3), 0);
-
-        // Power-of-two base halves each level and floors at 1, never 0.
-        assert_eq!(metal_mip_extent_local(8, 0), 8);
-        assert_eq!(metal_mip_extent_local(8, 1), 4);
-        assert_eq!(metal_mip_extent_local(8, 2), 2);
-        assert_eq!(metal_mip_extent_local(8, 3), 1);
-        assert_eq!(
-            metal_mip_extent_local(8, 4),
-            1,
-            "past the last level clamps to 1"
-        );
-        assert_eq!(
-            metal_mip_extent_local(8, 20),
-            1,
-            "huge level never underflows to 0"
-        );
-
-        // Non-power-of-two base uses integer right-shift (floor), matching Metal.
-        assert_eq!(metal_mip_extent_local(100, 1), 50);
-        assert_eq!(metal_mip_extent_local(100, 2), 25);
-        assert_eq!(metal_mip_extent_local(100, 3), 12);
     }
 }

@@ -5,8 +5,12 @@ use reims_vgpu_wire::ops::blit as wire_blit;
 
 pub const U32_SIZE: usize = 4;
 pub const U64_SIZE: usize = 8;
-pub const OPCODE_OFFSET: usize = 0;
-pub const LENGTH_OFFSET: usize = 4;
+/// The serializer op header's own two fields. This decoder frames records no
+/// capture has driven — the event encoder is the one segment family
+/// `reims-vgpu-wire` deliberately does not name — but the *header* around them
+/// is the one every other record carries, so it comes from the same place.
+pub const OPCODE_OFFSET: usize = core::mem::offset_of!(reims_vgpu_wire::OpHeader, opcode);
+pub const LENGTH_OFFSET: usize = core::mem::offset_of!(reims_vgpu_wire::OpHeader, length);
 /// Shared serializer op-header length from `reims-vgpu-wire`.
 use reims_vgpu_wire::OP_HEADER_LEN;
 

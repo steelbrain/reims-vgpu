@@ -21,6 +21,27 @@
 //! thrash (which would itself cause the hitches the project fights). Growth is
 //! a rare event (zero under normal load); the block count is the steady-state
 //! cap-pressure signal.
+//!
+//! # Which of the two budgets a driver actually enforces
+//!
+//! `max_sets` and the per-type descriptor counts are not equally real. Measured
+//! on the NVIDIA proprietary driver this repository's Linux host runs:
+//! `max_sets` is enforced exactly — `arena_grows_on_exhaustion_and_frees_route_correctly`
+//! drives past it and gets `ERROR_OUT_OF_POOL_MEMORY`, which is what makes that
+//! test's growth assertion real — while the per-type counts are not enforced at
+//! all. A pool declaring 64 `STORAGE_BUFFER` serves a set asking for 65, and for
+//! 65 536, and a pool declaring no `UNIFORM_BUFFER` whatsoever still serves one:
+//! descriptors come from a general heap. Mesa's RADV and ANV do account per
+//! type.
+//!
+//! So [`DESC_BLOCK_PER_TYPE`] binds nothing on this host and cannot be measured
+//! here, and the module's own "each sampled image consumes one of the 64
+//! `SAMPLED_IMAGE` descriptors, so under a heavy many-4K-video tab the ceiling
+//! is reachable" holds only on a driver that counts. The consequence that
+//! matters is the other way round: a bound that is invisible on the host used
+//! for development is exactly the one that regresses unnoticed, which is why
+//! `MAX_SET_DESCRIPTORS_PER_TYPE` is a compile-time assertion rather than a
+//! runtime reading.
 
 use ash::vk;
 use ash::vk::Handle as _;
@@ -32,16 +53,68 @@ fn free_sets_call(result: Result<(), vk::Result>) -> Result<(), VkCall> {
     result.map_err(|error| VkCall::new(VkOp::DescArenaFreeSets, error))
 }
 
+/// A descriptor set a freshly-created, entirely empty block still refused.
+///
+/// The generic allocation error alone reads as pool pressure, which is the one
+/// thing this is not: growing has already been tried and the new block was
+/// empty. It means the set wants more descriptors of some type than a block
+/// carries, so no amount of growth serves it and the draw is lost every time it
+/// is retried. Reported with the block's budgets because they are what would
+/// have to change.
+struct SetExceedsBlock;
+
+impl crate::observe::Decline for SetExceedsBlock {
+    fn slug(&self) -> &'static str {
+        "desc_set_exceeds_block_budget"
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        Vec::new()
+    }
+}
+
 /// Per-block `max_sets`. One block sustains a full ring of batched draws
 /// (`RING_DEPTH` × `BATCH_MAX_DRAWS` single-binding sets); heavier per-set
 /// binding counts or concurrent compute simply grow another block rather than
 /// dropping the draw.
 pub(crate) const DESC_BLOCK_MAX_SETS: u32 = 64;
-/// Per-type descriptor budget within one block, matched to `DESC_BLOCK_MAX_SETS`
-/// so a block of single-binding sets exhausts `max_sets` and per-type budget
-/// together. A draw that binds N sampled images consumes N of this type's
-/// budget; exhausting it before `max_sets` still triggers a clean grow.
-const DESC_BLOCK_PER_TYPE: u32 = 64;
+/// The most descriptors of one type a single descriptor set can ask for.
+///
+/// A set is allocated whole from one block, so a set wanting more of a type than
+/// a block holds cannot be served by *any* block — growing does not help, and
+/// before the check in [`DescriptorArena::allocate`] the arena appended a fresh
+/// block per attempt and abandoned it. So this is not a tuning knob; it is a
+/// lower bound the bind tables set, and it is stated here because the value that
+/// has to clear it is the one below.
+///
+/// One render set merges both stages: `exec` builds a single binding list from
+/// `req.storage_buffers`, `req.sampled_images` and `req.samplers`, and each
+/// stage binds at most that class's own bound of each. So the worst case is two
+/// stages' worth of [`crate::runtime::draw::MAX_ANY_BIND_SLOTS`], the widest of
+/// the three, since a descriptor type is served by exactly one class and this
+/// budget is per type. The compute path is single-stage and its three slot caps
+/// are all at or below these, so it stays under this.
+const MAX_SET_DESCRIPTORS_PER_TYPE: u32 = 2 * crate::runtime::draw::MAX_ANY_BIND_SLOTS;
+/// Per-type descriptor budget within one block.
+///
+/// It used to be `DESC_BLOCK_MAX_SETS`, so a block of single-binding sets
+/// exhausted `max_sets` and per-type budget together. It cannot be any more: one
+/// set may now ask for [`MAX_SET_DESCRIPTORS_PER_TYPE`] = 256 sampled images (two
+/// stages × a 128-entry texture table), and a set that wants more of a type than
+/// a block holds cannot be served by *any* block — growing does not help, and the
+/// draw is dropped. So the budget follows the bind tables, and the tidy equality
+/// with `DESC_BLOCK_MAX_SETS` is what gives way.
+///
+/// The cost is per-block pool size, not per-draw work: a `VkDescriptorPool` sized
+/// for 256 descriptors of each type instead of 64. A draw that binds N sampled
+/// images still consumes exactly N of this type's budget, and exhausting it
+/// before `max_sets` still triggers a clean grow.
+const DESC_BLOCK_PER_TYPE: u32 = MAX_SET_DESCRIPTORS_PER_TYPE;
+/// Widening a bind table without widening a block is a dropped draw, not a
+/// slower one, so it fails the build here instead — and it did: raising the
+/// texture table to Apple's 128 tripped this assertion before it could drop a
+/// draw at runtime, which is the whole reason it is a `const` and not a comment.
+const _: () = assert!(DESC_BLOCK_PER_TYPE >= MAX_SET_DESCRIPTORS_PER_TYPE);
 
 /// A growable set of same-sized descriptor-pool blocks. `blocks[0]` is created
 /// eagerly at engine init; later blocks appear only on allocation exhaustion.
@@ -123,14 +196,39 @@ impl DescriptorArena {
         // Every existing block is full (or the arena is empty pre-init and this
         // is the first allocation) — grow.
         let pool = Self::create_block(device)?;
-        self.blocks.push(pool);
         let info = vk::DescriptorSetAllocateInfo::default()
             .descriptor_pool(pool)
             .set_layouts(&layouts);
-        let sets = device
-            .allocate_descriptor_sets(&info)
-            .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::DescArenaAllocSetsGrown, e)))?;
-        Ok((sets[0], pool, true))
+        match device.allocate_descriptor_sets(&info) {
+            Ok(sets) => {
+                self.blocks.push(pool);
+                Ok((sets[0], pool, true))
+            }
+            Err(error) => {
+                // A set an *empty* block cannot hold will not fit any block this
+                // arena makes, so keeping this one would leave a pool that can
+                // serve nothing and grow another on the next identical draw —
+                // host memory climbing per draw while every one of them is still
+                // dropped. Destroying it bounds the arena by what a block can
+                // actually satisfy. `MAX_SET_DESCRIPTORS_PER_TYPE` is the
+                // compile-time half of the same rule; this is the half that
+                // survives a driver whose own per-set limit is lower than ours.
+                device.destroy_descriptor_pool(pool, None);
+                if matches!(
+                    error,
+                    vk::Result::ERROR_OUT_OF_POOL_MEMORY | vk::Result::ERROR_FRAGMENTED_POOL
+                ) {
+                    crate::observe::Emit::decline("desc_arena_alloc", &SetExceedsBlock)
+                        .field("per_type", DESC_BLOCK_PER_TYPE)
+                        .field("max_sets", DESC_BLOCK_MAX_SETS)
+                        .fail_once(0);
+                }
+                Err(DrawError::VkCall(VkCall::new(
+                    VkOp::DescArenaAllocSetsGrown,
+                    error,
+                )))
+            }
+        }
     }
 
     /// Free a batch of `(set, owning_pool)` pairs, grouping by owning pool so
@@ -264,6 +362,77 @@ mod device_tests {
     use super::*;
     use crate::backend::vulkan::engine::context::DeviceContext;
     use ash::vk::Handle;
+
+    /// A set no block can serve must be refused *without* growing the arena.
+    ///
+    /// Growth is the right answer to a full block and the wrong one to a set an
+    /// empty block already refuses: the retry fails for the reason the first
+    /// attempt did, so the arena used to append a pool it could never allocate
+    /// from and do it again on the next identical draw — host memory climbing
+    /// per draw with every one of those draws still dropped. Retried below so a
+    /// single retained block cannot pass as none.
+    ///
+    /// The set asks for a type the block carries no budget for at all, which is
+    /// the cheapest way to make a fresh block refuse. **Whether it does is
+    /// driver-dependent**, and per-type budgets are advisory in practice: on the
+    /// NVIDIA proprietary driver this repository's Linux host runs, descriptors
+    /// are sub-allocated from a general heap and every one of these allocations
+    /// succeeds — a pool declaring no `UNIFORM_BUFFER` at all still serves one.
+    /// Mesa's RADV and ANV do account per type. So this asserts the invariant
+    /// only once the driver has produced the condition, and says plainly when it
+    /// did not; it is a live gate on a strict driver and inert on a lenient one.
+    #[test]
+    fn a_set_no_block_can_serve_is_refused_without_growing_the_arena() {
+        crate::observe::redirect_logs_for_tests();
+        let mut ctx = match unsafe { DeviceContext::create() } {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("SKIP desc arena unservable set: no device ({e})");
+                return;
+            }
+        };
+        // A type `create_block` declares no budget for.
+        let bindings = [vk::DescriptorSetLayoutBinding::default()
+            .binding(0)
+            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::COMPUTE)];
+        let dsl = unsafe {
+            ctx.device.create_descriptor_set_layout(
+                &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
+                None,
+            )
+        }
+        .expect("create unservable descriptor set layout");
+
+        let mut arena = DescriptorArena::empty();
+        unsafe { arena.create_first_block(&ctx.device) }.expect("first block");
+        assert_eq!(arena.block_count(), 1);
+
+        let mut refusals = 0;
+        for _ in 0..4 {
+            if unsafe { arena.allocate(&ctx.device, dsl) }.is_err() {
+                refusals += 1;
+                assert_eq!(
+                    arena.block_count(),
+                    1,
+                    "a refused allocation must keep no block"
+                );
+            }
+        }
+        if refusals == 0 {
+            eprintln!(
+                "SKIP desc arena unservable set: this driver does not enforce \
+                 per-type pool budgets, so the condition cannot be produced"
+            );
+        }
+
+        unsafe {
+            ctx.device.destroy_descriptor_set_layout(dsl, None);
+            arena.destroy(&ctx.device);
+            ctx.destroy();
+        }
+    }
 
     /// The growth mechanism against a real driver: exhausting a block's
     /// `max_sets` must append a fresh block and keep allocating (not drop the

@@ -16,14 +16,21 @@
 //!   [`PTE_PFN_MASK`], used raw with no further shift.
 //! - **Zero is the sole not-present encoding**: an absent entry reads zero, and
 //!   a removed one is cleared back to zero.
-//! - A frame number never has bit 31 set, and physical page zero is never
-//!   mapped.
+//! - A frame number never has bit 31 set, and the flag is only ever written
+//!   together with a frame number — the guest builds an entry by OR-ing the two,
+//!   never the flag alone.
 //!
 //! Those last two points are why [`WalkError::MalformedPte`] is a distinct error
-//! rather than a pedantic split of [`WalkError::NotPresent`]. A working guest
-//! cannot produce a nonzero entry whose frame-number field is zero. Reading one
-//! means the page holding the table was corrupted, and collapsing the two arms
-//! would discard that signal to save a branch.
+//! rather than a pedantic split of [`WalkError::NotPresent`]. Together they say
+//! the only entry with a zero frame-number field and a nonzero word is
+//! [`PTE_FLAG_MASK`] exactly, which is a value the guest has no way to write.
+//! Reading one means the page holding the table was corrupted, and collapsing
+//! the two arms would discard that signal to save a branch.
+//!
+//! The argument deliberately does not rest on "physical page zero is never
+//! mapped". That is true of the platform rather than of this format, nothing in
+//! the guest's own construction enforces it, and it is not needed: the flag
+//! never travelling alone is what closes the case.
 //!
 //! The fan-out is 1024 entries per node and byte lengths convert to pages with a
 //! 12-bit shift. Both are the x86 pathway's values and both agree with
@@ -66,35 +73,74 @@ pub const DIRECTORY_ROOT_PFN: u64 = 0x00;
 /// to say 3, but the field exists and a hardcoded depth would be a guess.
 pub const DIRECTORY_DEPTH: u64 = 0x04;
 
-/// Upper bound on tree depth, as a sanity bound rather than the depth itself.
+/// Upper bound on the tree depth read from a task's directory page.
+///
+/// Not the depth itself — that is [`DIRECTORY_DEPTH`], read per task. This is
+/// the bound a corrupt or hostile directory word is refused against, and it is
+/// derived from the address space rather than picked: a walk of `d` levels
+/// resolves `d * index_bits + page_shift` bits of guest virtual address, and
+/// `index_bits` is `page_shift - 2` because a node is one page of four-byte
+/// entries ([`Geometry::index_bits`]).
+///
+/// | geometry | index bits | depth 3 | depth 4 | depth 5 |
+/// |---|---|---|---|---|
+/// | x86_64, `page_shift` 12 | 10 | 42 bits | **52 bits** | 62 bits |
+/// | arm64e, `page_shift` 14 | 12 | 50 bits | **62 bits** | 74 bits |
+///
+/// Four is the first depth that covers a 48-bit virtual address on **both**
+/// geometries, which is the whole address space either guest can form: macOS
+/// user VAs are 47-bit and the wire carries a `u64` that no guest fills. Depth 3
+/// does not reach it on x86 (42 bits), so the bound cannot be lowered to the
+/// only depth either guest has been observed to declare; depth 5 could not
+/// describe an address the guest can construct, so nothing is lost by refusing
+/// it.
+///
+/// Observed: a driven x86 boot reads `depth=3` on every task directory it walks
+/// (32 of 32), and `WalkError::DepthTooDeep` has never been seen. The headroom
+/// is one level, and it is the level that separates "enough for the address
+/// space" from "enough for the guest we have measured".
 pub const MAX_DEPTH: u32 = 4;
+
+// The derivation above, as a build gate. Depth `MAX_DEPTH` must reach a 48-bit
+// address on both pathways, and `MAX_DEPTH - 1` must not — the first half is the
+// property the bound exists for, and the second is what keeps it the *smallest*
+// such depth rather than a number that merely happens to be large enough.
+const _: () = {
+    const VA_BITS: u32 = 48;
+    const fn reach(page_shift: u32, depth: u32) -> u32 {
+        depth * (page_shift - 2) + page_shift
+    }
+    assert!(reach(12, MAX_DEPTH) >= VA_BITS);
+    assert!(reach(14, MAX_DEPTH) >= VA_BITS);
+    assert!(reach(12, MAX_DEPTH - 1) < VA_BITS);
+};
 
 /// Page-table shape for one guest pathway.
 ///
-/// Only two numbers are stored. Everything else about the shape — entries per
+/// **One number is stored.** Everything else about the shape — entries per
 /// table, index mask, page size — is derived, because they are not independent:
 /// a node is exactly one page of four-byte entries, so the fan-out is fixed by
-/// the page size. Storing them separately invites a struct whose fields
+/// the page size. Storing any of them separately invites a struct whose fields
 /// disagree, which is what [`Geometry::validate`] would then have to catch.
+///
+/// [`MAX_DEPTH`] used to be a field here, and it is the worked example of that
+/// hazard: both pathway constants set it to `MAX_DEPTH`, nothing ever
+/// constructed a `Geometry` with anything else, and half of `validate` existed
+/// to catch a disagreement only a hand-built struct could create. The depth
+/// bound is a property of the address space, not of a page size — its
+/// derivation is the `const` assertion at its own declaration — so it is read
+/// from there directly and there is no second copy to keep honest.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Geometry {
     /// Guest page shift: 12 on x86_64, 14 on arm64e. Never defaulted.
     pub page_shift: u32,
-    /// Bound on the depth read from the task directory.
-    pub max_depth: u32,
 }
 
 /// x86_64 macOS guest: 4 KiB pages, 1024 entries per node, ten index bits.
-pub const X86_64: Geometry = Geometry {
-    page_shift: 12,
-    max_depth: MAX_DEPTH,
-};
+pub const X86_64: Geometry = Geometry { page_shift: 12 };
 
 /// arm64e macOS guest: 16 KiB pages, 4096 entries per node, twelve index bits.
-pub const ARM64E: Geometry = Geometry {
-    page_shift: 14,
-    max_depth: MAX_DEPTH,
-};
+pub const ARM64E: Geometry = Geometry { page_shift: 14 };
 
 impl Geometry {
     /// Bytes per guest page.
@@ -149,9 +195,6 @@ impl Geometry {
         if self.page_shift != 12 && self.page_shift != 14 {
             return Err(WalkError::UnsupportedGeometry);
         }
-        if self.max_depth == 0 || self.max_depth > MAX_DEPTH {
-            return Err(WalkError::UnsupportedGeometry);
-        }
         Ok(())
     }
 }
@@ -165,7 +208,7 @@ pub enum WalkError {
     ZeroRootPfn,
     /// The task's directory reported depth zero.
     ZeroDepth,
-    /// The task's directory reported a depth past [`Geometry::max_depth`].
+    /// The task's directory reported a depth past [`MAX_DEPTH`].
     DepthTooDeep,
     /// A page holding part of the tree could not be read.
     TableRead,
@@ -263,7 +306,7 @@ pub fn walk<M: GuestMemory>(
     if depth == 0 {
         return Err(fail(WalkError::ZeroDepth));
     }
-    if depth > geometry.max_depth {
+    if depth > MAX_DEPTH {
         return Err(fail(WalkError::DepthTooDeep));
     }
 
@@ -312,6 +355,214 @@ pub fn walk<M: GuestMemory>(
         page_index,
         raw_pte,
     })
+}
+
+/// Deepest-level entries fetched per guest read by [`walk_run`].
+///
+/// The buffer is a stack array, so this is the only thing bounding it: 64
+/// entries is 256 bytes, and it turns the one-read-per-page the level-reuse
+/// leaves behind into one read per 64 pages. Raising it costs stack in every
+/// frame that walks a run and buys a shrinking fraction of the reads that are
+/// left; lowering it gives the per-page cost back.
+///
+/// It is not a limit on anything the guest can express — a run longer than a
+/// batch simply takes several, and a run shorter than one reads only the words
+/// its node has left. Nothing observable changes with this number, which is
+/// why the equivalence test against [`walk`] is what holds it.
+const LEAF_BATCH: usize = 64;
+
+/// Walk a run of consecutive pages, re-reading only the levels whose entry
+/// index changed.
+///
+/// A run of `pages` pages starting at `first_gva` shares every level of the tree
+/// except the deepest for `1 << index_bits` pages at a time, so walking each one
+/// with [`walk`] re-reads the same upper entries `depth - 1` times per page. On
+/// a guest with a four-level tree that is four guest-memory reads per page where
+/// one is needed, and the caller that motivates this — a licence check over a
+/// 1080p surface's page list — pays it 2 025 times a flush.
+///
+/// The visitor is called once per page in ascending order with the page's index
+/// within the run, and stops the walk by answering `false`. A failure is
+/// reported for the page it happened on and does not stop the run: a caller
+/// checking a cached list against the live table needs to know *which* pages
+/// disagree, and a walk that stopped at the first would report a shorter
+/// disagreement than there is.
+///
+/// # What the reuse assumes
+///
+/// That the tree does not change under the walk. It is the same assumption
+/// [`walk`] makes within one descent, extended to the run — a guest that
+/// rewrites an upper entry midway through is a guest editing a page table this
+/// device is reading, and neither form of walk can be atomic against that.
+/// A caller needing a coherent snapshot needs one from the hypervisor, not from
+/// a re-read here.
+///
+/// The deepest level is read [`LEAF_BATCH`] entries at a time, which widens
+/// that same assumption from the levels above a page to the `LEAF_BATCH` pages
+/// either side of it. It does not introduce it.
+pub fn walk_run<M: GuestMemory>(
+    mem: &M,
+    geometry: Geometry,
+    root_pfn: u32,
+    depth: u32,
+    first_gva: u64,
+    pages: u64,
+    visit: &mut dyn FnMut(u64, Result<Walk, WalkFailure>) -> bool,
+) {
+    let fail = |error| WalkFailure {
+        error,
+        level: 0,
+        entry_index: 0,
+        raw_pte: 0,
+    };
+    if let Err(f) = geometry.validate().map_err(fail) {
+        visit(0, Err(f));
+        return;
+    }
+    if root_pfn == 0 {
+        visit(0, Err(fail(WalkError::ZeroRootPfn)));
+        return;
+    }
+    if depth == 0 {
+        visit(0, Err(fail(WalkError::ZeroDepth)));
+        return;
+    }
+    if depth > MAX_DEPTH {
+        visit(0, Err(fail(WalkError::DepthTooDeep)));
+        return;
+    }
+
+    // The entry index taken at each level of the previous page's descent, and
+    // the frame that entry named. `held` is how many *leading* levels of that
+    // record are still true: a level whose index differs invalidates itself and
+    // everything under it, which is why one prefix length is enough and a
+    // per-level valid bit is not.
+    let mut seen_index = [0u32; MAX_DEPTH as usize];
+    let mut seen_next = [0u32; MAX_DEPTH as usize];
+    let mut held = 0usize;
+
+    // The deepest level's entry index advances by one per page, so consecutive
+    // pages read consecutive words of one node. Those are fetched a batch at a
+    // time: the upper levels are already elided by `held`, which leaves one
+    // guest read per page, and a batch turns 64 of them into one.
+    //
+    // `leaf_node` is the node the buffer holds words from — never zero for a
+    // live batch, because PFN zero is not a page the format can name, so a zero
+    // here means empty. A batch never crosses a node: it is clamped to the
+    // words left in this one, which is also what keeps `leaf_first + leaf_len`
+    // inside the node's own page.
+    let mut leaf_buf = [0u8; LEAF_BATCH * PTE_SIZE as usize];
+    let mut leaf_node = 0u32;
+    let mut leaf_first = 0u32;
+    let mut leaf_len = 0usize;
+    // A node whose batch read failed. One unreadable byte fails a whole span,
+    // so a batch cannot say *which* word was bad; without this the walk would
+    // retry the failing batch for every page of the node before falling back.
+    let mut leaf_unbatchable = 0u32;
+
+    let first_page = first_gva >> geometry.page_shift;
+    for i in 0..pages {
+        let page_index = first_page + i;
+        let gva = (page_index << geometry.page_shift) | (first_gva & geometry.page_offset_mask());
+        let page_off = gva & geometry.page_offset_mask();
+        let mut current_pfn = root_pfn;
+        let mut raw_pte = 0u32;
+        let mut failure = None;
+        for level in 0..depth {
+            let shift = (depth - 1 - level) * geometry.index_bits();
+            let entry_index = ((page_index >> shift) & geometry.index_mask()) as u32;
+            let lv = level as usize;
+            if lv < held && seen_index[lv] == entry_index {
+                current_pfn = seen_next[lv];
+                continue;
+            }
+            let entry_addr =
+                geometry.pfn_to_addr(current_pfn) + (entry_index as u64) * PTE_SIZE as u64;
+            let at = |error, raw_pte| WalkFailure {
+                error,
+                level,
+                entry_index,
+                raw_pte,
+            };
+            let read = if level + 1 == depth {
+                // Refill when this word is not one the buffer already holds.
+                if leaf_node != current_pfn
+                    || entry_index < leaf_first
+                    || (entry_index - leaf_first) as usize >= leaf_len
+                {
+                    leaf_len = 0;
+                    if leaf_unbatchable != current_pfn {
+                        let left = geometry.entries_per_table() - entry_index as u64;
+                        let want = (left as usize).min(LEAF_BATCH);
+                        if mem.read_at(entry_addr, &mut leaf_buf[..want * PTE_SIZE as usize]) {
+                            leaf_node = current_pfn;
+                            leaf_first = entry_index;
+                            leaf_len = want;
+                        } else {
+                            leaf_unbatchable = current_pfn;
+                        }
+                    }
+                }
+                if leaf_len == 0 {
+                    // Batching is off for this node, so read the one word and
+                    // let its own failure be attributed to its own page.
+                    mem.u32_at(entry_addr)
+                } else {
+                    let off = (entry_index - leaf_first) as usize * PTE_SIZE as usize;
+                    Some(u32::from_le_bytes([
+                        leaf_buf[off],
+                        leaf_buf[off + 1],
+                        leaf_buf[off + 2],
+                        leaf_buf[off + 3],
+                    ]))
+                }
+            } else {
+                mem.u32_at(entry_addr)
+            };
+            let Some(pte) = read else {
+                failure = Some(at(WalkError::TableRead, 0));
+                break;
+            };
+            raw_pte = pte;
+            let next_pfn = pte & PTE_PFN_MASK;
+            if next_pfn == 0 {
+                failure = Some(at(
+                    if pte == 0 {
+                        WalkError::NotPresent
+                    } else {
+                        WalkError::MalformedPte
+                    },
+                    pte,
+                ));
+                break;
+            }
+            seen_index[lv] = entry_index;
+            seen_next[lv] = next_pfn;
+            held = lv + 1;
+            current_pfn = next_pfn;
+        }
+        let result = match failure {
+            // A failed descent leaves the record describing a tree the walk did
+            // not finish reading, so the next page starts from the root.
+            Some(f) => {
+                held = 0;
+                Err(f)
+            }
+            None => {
+                let addr_page = geometry.pfn_to_addr(current_pfn);
+                Ok(Walk {
+                    leaf_pfn: current_pfn,
+                    addr_page,
+                    addr: addr_page + page_off,
+                    page_index,
+                    raw_pte,
+                })
+            }
+        };
+        if !visit(i, result) {
+            return;
+        }
+    }
 }
 
 /// Builds page tables the way the guest does.
@@ -472,10 +723,7 @@ mod tests {
     #[test]
     fn a_geometry_off_either_pathway_is_refused_rather_than_walked() {
         for shift in [0, 11, 13, 15, 16] {
-            let g = Geometry {
-                page_shift: shift,
-                max_depth: MAX_DEPTH,
-            };
+            let g = Geometry { page_shift: shift };
             assert_eq!(g.validate(), Err(WalkError::UnsupportedGeometry));
         }
         assert_eq!(X86_64.validate(), Ok(()));
@@ -510,6 +758,178 @@ mod tests {
                 assert_eq!(w.addr, geometry.pfn_to_addr(leaf) + off);
             }
         }
+    }
+
+    /// `walk_run` and `walk` must answer identically for every page of a run,
+    /// including the pages that do not resolve.
+    ///
+    /// This is the whole of `walk_run`'s contract. It exists only to avoid
+    /// re-reading upper levels, so the moment it answers differently from the
+    /// walk it optimises it is not an optimisation but a second, weaker walker —
+    /// and the way it would fail is by carrying a stale upper level across an
+    /// index boundary, which the run below crosses deliberately.
+    #[test]
+    fn a_run_walk_agrees_with_the_single_walk_on_every_page() {
+        for geometry in [X86_64, ARM64E] {
+            for depth in 1..=MAX_DEPTH {
+                let mut buf = [0u8; IMAGE];
+                let mut b = Builder::new(geometry, &mut buf);
+                // Two pages whose indices differ above the deepest level, so the
+                // run has to notice the upper entry changed, plus their
+                // neighbours, which must reuse it.
+                let stride = 1u64 << geometry.index_bits();
+                let root = b.map(depth, 0, 0x11);
+                b.map_into(root, depth, 1, 0x12);
+                if depth > 1 {
+                    b.map_into(root, depth, stride, 0x21);
+                    b.map_into(root, depth, stride + 1, 0x22);
+                }
+                let mem = SliceMemory::new(b.bytes());
+
+                // Covers both mapped clusters, the hole between them, and the
+                // unmapped tail past the second.
+                let pages = if depth > 1 { stride + 3 } else { 4 };
+                let mut seen = 0u64;
+                walk_run(&mem, geometry, root, depth, 0, pages, &mut |i, got| {
+                    let gva = i << geometry.page_shift;
+                    let want = walk(&mem, geometry, root, depth, gva);
+                    match (&got, &want) {
+                        (Ok(a), Ok(e)) => assert_eq!(a, e, "page {i} depth {depth}"),
+                        (Err(a), Err(e)) => assert_eq!(a, e, "page {i} depth {depth}"),
+                        _ => panic!("page {i} depth {depth}: {got:?} vs {want:?}"),
+                    }
+                    seen += 1;
+                    true
+                });
+                assert_eq!(seen, pages, "every page of the run is visited, in order");
+            }
+        }
+    }
+
+    /// A run fetches its deepest level a batch at a time, so the guest-read
+    /// count falls far below one per page.
+    ///
+    /// The proxy for the batching itself. `a_run_walk_agrees_with_the_single_walk_on_every_page`
+    /// already pins the answers across batch and node boundaries — it walks
+    /// 1027 pages on the x86 geometry — so what is unproven without counting is
+    /// whether the batch is *taken*. A refill bug that re-read per page would
+    /// answer identically and cost what the batch exists to save.
+    #[test]
+    fn a_long_run_reads_its_deepest_level_in_batches() {
+        struct Counting<'a> {
+            inner: SliceMemory<'a>,
+            reads: core::cell::Cell<usize>,
+        }
+        impl GuestMemory for Counting<'_> {
+            fn read_at(&self, addr: u64, out: &mut [u8]) -> bool {
+                self.reads.set(self.reads.get() + 1);
+                self.inner.read_at(addr, out)
+            }
+        }
+
+        const PAGES: u64 = 4 * LEAF_BATCH as u64;
+        let geometry = X86_64;
+        let mut buf = [0u8; IMAGE];
+        let mut b = Builder::new(geometry, &mut buf);
+        // One node, every entry of the run mapped to a distinct frame, so a
+        // batch that mixed neighbouring words up would be caught below.
+        let root = b.map(1, 0, 0x100);
+        for i in 1..PAGES {
+            b.map_into(root, 1, i, 0x100 + i as u32);
+        }
+        let mem = Counting {
+            inner: SliceMemory::new(b.bytes()),
+            reads: core::cell::Cell::new(0),
+        };
+
+        let mut seen = 0u64;
+        walk_run(&mem, geometry, root, 1, 0, PAGES, &mut |i, got| {
+            assert_eq!(
+                got.map(|w| w.leaf_pfn),
+                Ok(0x100 + i as u32),
+                "page {i} took the wrong word of its batch"
+            );
+            seen += 1;
+            true
+        });
+        assert_eq!(seen, PAGES);
+        assert_eq!(
+            mem.reads.get() as u64,
+            PAGES.div_ceil(LEAF_BATCH as u64),
+            "one read per batch, not one per page"
+        );
+    }
+
+    /// A node whose batch read is refused falls back to one read per word, and
+    /// still answers what the single walk answers.
+    ///
+    /// One unreadable byte fails a whole span, so a batch cannot report *which*
+    /// word was bad. Falling back is what keeps a failure attributed to the page
+    /// that owns it — and on a host that refuses the wide read for its own
+    /// reasons, what keeps the run answering at all.
+    #[test]
+    fn a_node_that_refuses_a_wide_read_falls_back_to_one_word_at_a_time() {
+        struct NarrowOnly<'a> {
+            inner: SliceMemory<'a>,
+            reads: core::cell::Cell<usize>,
+        }
+        impl GuestMemory for NarrowOnly<'_> {
+            fn read_at(&self, addr: u64, out: &mut [u8]) -> bool {
+                self.reads.set(self.reads.get() + 1);
+                out.len() <= PTE_SIZE as usize && self.inner.read_at(addr, out)
+            }
+        }
+
+        const PAGES: u64 = 8;
+        let geometry = X86_64;
+        let mut buf = [0u8; IMAGE];
+        let mut b = Builder::new(geometry, &mut buf);
+        let root = b.map(2, 0, 0x11);
+        for i in 1..PAGES {
+            // Page 3 is left unmapped, so the fallback carries a refusal as
+            // well as the frames either side of it.
+            if i != 3 {
+                b.map_into(root, 2, i, 0x11 + i as u32);
+            }
+        }
+        let mem = NarrowOnly {
+            inner: SliceMemory::new(b.bytes()),
+            reads: core::cell::Cell::new(0),
+        };
+
+        let mut seen = 0u64;
+        walk_run(&mem, geometry, root, 2, 0, PAGES, &mut |i, got| {
+            let want = walk(&mem, geometry, root, 2, i << geometry.page_shift);
+            assert_eq!(got, want, "page {i}");
+            seen += 1;
+            true
+        });
+        assert_eq!(seen, PAGES);
+        assert!(
+            mem.reads.get() >= PAGES as usize,
+            "the fallback reads at least once per page"
+        );
+    }
+
+    /// The visitor stops the run by answering `false`, and no page past it is
+    /// walked. A caller checking a page list against the live table stops at the
+    /// first disagreement it cares about, and a run that kept reading would cost
+    /// the guest-memory reads the stop exists to avoid.
+    #[test]
+    fn a_run_walk_stops_when_the_visitor_says_so() {
+        let geometry = X86_64;
+        let mut buf = [0u8; IMAGE];
+        let mut b = Builder::new(geometry, &mut buf);
+        let root = b.map(2, 0, 0x11);
+        b.map_into(root, 2, 1, 0x12);
+        let mem = SliceMemory::new(b.bytes());
+
+        let mut visited = 0;
+        walk_run(&mem, geometry, root, 2, 0, 64, &mut |_, _| {
+            visited += 1;
+            visited < 2
+        });
+        assert_eq!(visited, 2);
     }
 
     #[test]

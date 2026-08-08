@@ -1145,9 +1145,17 @@ dependencies = [
  "once_cell",
  "parking_lot",
  "raw-window-handle",
+ "reims-vgpu-paging",
  "reims-vgpu-wire",
  "serde_json",
  "winit",
+]
+
+[[package]]
+name = "reims-vgpu-paging"
+version = "0.1.0"
+dependencies = [
+ "reims-vgpu-wire",
 ]
 
 [[package]]

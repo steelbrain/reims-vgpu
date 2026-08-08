@@ -71,8 +71,6 @@ impl ValiditySite {
 pub struct ValidityOutcome {
     /// Mappings whose `content_generation` this record advanced.
     pub bumped: u32,
-    /// Deferred windows dropped because the guest's copy supersedes ours.
-    pub windows_dropped: u32,
     /// The record named no mapping this device holds.
     pub missed: bool,
 }
@@ -109,12 +107,9 @@ pub fn apply(
         }
         hit = true;
         if ops.clear_host_valid != 0 {
-            // The guest wrote these pages after our last render into them. Our
-            // copy is stale by the guest's own statement, so a pending window
-            // must not land, and the next read must re-take the guest pages.
-            out.windows_dropped = out
-                .windows_dropped
-                .saturating_add(drop_stale_windows(state, id, site));
+            // The guest wrote these pages after our last render into them, so
+            // our copy is stale by the guest's own statement and the next read
+            // must re-take the guest pages.
             let seq = state.next_validity_seq();
             if let Some(m) = state.mappings.get_mut(&id) {
                 m.content_generation = m.content_generation.saturating_add(1);
@@ -185,8 +180,9 @@ pub enum WritebackLicence {
 /// last publish, never a latch on `host_valid`. See [`ResourceValidity`] for the
 /// measurement that forced that distinction.
 ///
-/// Pure — the counting is [`note_writeback_licence`]'s job, so a caller that
-/// only wants to attribute a write does not inflate the flush census.
+/// Pure — the counting is [`writeback_refused`]'s job, which is the caller that
+/// stamps `note_store_route`, so a caller that only wants to attribute a write
+/// does not inflate the flush census.
 fn writeback_licence(state: &DeviceState, mapping_id: u32) -> WritebackLicence {
     licence_of(
         state
@@ -252,23 +248,6 @@ pub fn writeback_refused(state: &DeviceState, mapping_id: u32) -> bool {
     licence == WritebackLicence::Superseded
 }
 
-/// Take the mapping's pending windows, reporting how many were taken.
-fn drop_stale_windows(state: &mut DeviceState, mapping_id: u32, site: ValiditySite) -> u32 {
-    let pending = state.deferred_flush_window_count(mapping_id);
-    if pending == 0 {
-        return 0;
-    }
-    crate::runtime::drain::note_store_route_n("validity_windows_dropped", pending as u64);
-    crate::runtime::storage_flush::drop_windows(
-        state,
-        mapping_id,
-        match site {
-            ValiditySite::ExecTable => "guest_wrote_resource_exec",
-            ValiditySite::InvalidateResources => "guest_wrote_resource_inv",
-        },
-    );
-    pending
-}
 
 #[cfg(test)]
 mod tests {
@@ -314,56 +293,24 @@ mod tests {
         assert!(after.host_stated && after.guest_stated);
     }
 
-    /// The whole point of consuming `clear_host_valid`: a mapping the guest says
-    /// it wrote must not keep a deferred window that would replay stale pixels
-    /// over the guest's bytes.
-    #[test]
-    fn clearing_host_valid_drops_the_mappings_pending_windows() {
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
-        let m = state.mappings.entry(9).or_default();
-        m.mapped = true;
-        m.width = 64;
-        m.height = 64;
-        arm_one_window(&mut state, 9);
-        assert_eq!(state.deferred_flush_window_count(9), 1);
 
-        let before_gen = state.mappings[&9].content_generation;
-        let out = apply(&mut state, 0, 9, quad(1, 0, 0, 0), ValiditySite::ExecTable);
-        assert_eq!(out.windows_dropped, 1);
-        assert_eq!(out.bumped, 1);
-        assert!(!out.missed);
-        assert_eq!(state.deferred_flush_window_count(9), 0);
-        assert_eq!(state.mappings[&9].content_generation, before_gen + 1);
-        assert!(state.mappings[&9].validity.host_stated);
-        assert!(!state.mappings[&9].validity.host_valid);
-    }
 
-    /// A licence with no `clear_host_valid` must leave the pending window in
-    /// place: the submission is about to render into this resource, and dropping
-    /// its window would throw away the frame the device already produced.
-    #[test]
-    fn a_set_host_record_keeps_the_pending_window() {
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
-        state.mappings.entry(9).or_default().mapped = true;
-        arm_one_window(&mut state, 9);
-        let out = apply(&mut state, 0, 9, quad(0, 1, 0, 0), ValiditySite::ExecTable);
-        assert_eq!(out.windows_dropped, 0);
-        assert_eq!(state.deferred_flush_window_count(9), 1);
-        assert!(state.mappings[&9].validity.host_valid);
-    }
-
-    /// A texture ref and the mapping it resolves to are one guest resource. A
-    /// statement about the ref that stopped at the ref would leave the mapping's
-    /// window armed, which is the case this whole path exists to prevent.
+    /// A texture ref and the mapping it resolves to are one guest resource, so a
+    /// statement about the ref has to land on the mapping. One that stopped at
+    /// the ref would leave the mapping still claiming host-valid bytes the guest
+    /// has just overwritten.
     #[test]
     fn a_statement_about_a_texture_ref_reaches_its_mapping() {
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
         state.mappings.entry(77).or_default().mapped = true;
+        state.mappings.entry(77).or_default().validity.host_valid = true;
         state.texture_to_mapping.insert((4, 12), 77);
-        arm_one_window(&mut state, 77);
         let out = apply(&mut state, 4, 12, quad(1, 0, 0, 0), ValiditySite::ExecTable);
-        assert_eq!(out.windows_dropped, 1);
-        assert_eq!(state.deferred_flush_window_count(77), 0);
+        assert_eq!(out.bumped, 1, "the ref must resolve to its mapping");
+        assert!(
+            !state.mappings[&77].validity.host_valid,
+            "clear_host_valid must reach the mapping the ref names"
+        );
     }
 
     /// An id no registry answers for is reported, not silently skipped.
@@ -462,29 +409,4 @@ mod tests {
         );
     }
 
-    fn arm_one_window(state: &mut DeviceState, mapping_id: u32) {
-        let key = crate::model::ComputeStorageResidencyKey {
-            mapping_id,
-            map_generation: 0,
-            surface_offset: 0,
-            surface_bpr: 64 * 4,
-            span_end: 64 * 64 * 4,
-            width: 64,
-            height: 64,
-            pixel_format: 0x50,
-            texture_ref: 0,
-        };
-        state.compute_deferred_flush.insert(
-            key,
-            crate::model::DeferredOwner::Render {
-                armed_seq: 0,
-                armed_stamp_seq: 0,
-                source: crate::model::RenderWindowSource::Owned(std::sync::Arc::new(vec![
-                    0u8;
-                    64 * 64
-                        * 4
-                ])),
-            },
-        );
-    }
 }

@@ -28,11 +28,36 @@ use crate::observe::Decline;
 /// A request the engine understood and declined.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DrawReason {
-    /// More than one viewport/scissor in a draw. Metal's multi-viewport
-    /// rasterization is not modelled.
     /// A resident target bound as a sampled image must be a plain 2D image;
     /// arrayed and volume residents have no bind path.
     ResidentSampledNot2d { binding: u32 },
+    /// The draw rasterizes into more viewport/scissor slots than the host can
+    /// declare in a pipeline.
+    ///
+    /// `limit` is `maxViewports` where `multiViewport` is advertised and `1`
+    /// where it is not, which is why both travel: "the host refused 4" reads
+    /// very differently from "the host refused 4 because it offers no multiple
+    /// viewports at all", and only the second is a whole missing feature.
+    ViewportSlotsUnsupported {
+        requested: u32,
+        limit: u32,
+        multi_viewport: bool,
+    },
+    /// The draw arms `MTLVisibilityResultModeCounting` and the host cannot
+    /// record an exact occlusion count.
+    ///
+    /// Only the counting arm reaches here. `VK_QUERY_TYPE_OCCLUSION` itself
+    /// needs no feature, and an imprecise query is `Boolean` exactly — so
+    /// `Boolean` is served on every device and this refusal names the one thing
+    /// that is genuinely missing. It carries the feature bit as well as the ask
+    /// for the reason `ViewportSlotsUnsupported` above carries
+    /// `multi_viewport`: "refused a counting query" and "refused it because
+    /// this host offers no precise occlusion at all" are different findings.
+    ///
+    /// Refusing rather than degrading is the point. Recording without
+    /// `PRECISE` would answer a counting guest with a number that is neither
+    /// the count nor recognisably wrong.
+    VisibilityCountingUnsupported { occlusion_query_precise: bool },
     /// Same for a zero-copy guest-run sampled bind.
     GuestRunSampledNot2d { binding: u32 },
     /// More MRT secondary attachments than the render pass can carry.
@@ -65,10 +90,33 @@ pub enum DrawReason {
     /// including the ones that support it. Now it translates, and only a host
     /// that genuinely cannot run it declines — here, by name.
     DualSourceBlendUnsupported,
+    /// The guest asked for `MTLTriangleFillModeLines` and this device does not
+    /// advertise `VkPhysicalDeviceFeatures::fillModeNonSolid`, so no pipeline
+    /// on it can name `VK_POLYGON_MODE_LINE`.
+    ///
+    /// The alternative is rasterizing the wireframe filled, which is a whole
+    /// pass of wrong pixels the guest is never told about. Same reading as
+    /// [`Self::DualSourceBlendUnsupported`]: optional core feature, asked for
+    /// at device creation, declined by name where the host says no.
+    FillModeNonSolidUnsupported,
+    /// The guest asked for `MTLDepthClipModeClamp` and this device does not
+    /// advertise `VkPhysicalDeviceFeatures::depthClamp`, so no pipeline on it
+    /// can set `depthClampEnable`.
+    ///
+    /// Clipping instead discards every fragment the guest asked to keep at the
+    /// near and far planes, which is missing geometry rather than shifted
+    /// geometry — the sibling of the fill-mode refusal above.
+    DepthClampUnsupported,
     /// The device declines this vertex attribute format and no portable
     /// substitute fits. Carries the translation-layer reason so the two log
     /// lines agree on why.
     VertexFormat(TranslateReason),
+    /// The guest's `MTLVisibilityResultMode` is outside the SDK enum.
+    ///
+    /// Delegates its slug for the same reason [`Self::VertexFormat`] does: the
+    /// translation layer already named the exact problem, and a second slug
+    /// here would make one check answer to two names.
+    VisibilityResultMode(TranslateReason),
     /// A constant-rate vertex attribute (`divisor == 0`) on a device without
     /// `vertexAttributeInstanceRateZeroDivisor`.
     ConstantVertexAttribute,
@@ -101,6 +149,10 @@ pub enum DrawReason {
     NoDeviceLocalMemoryForMrtSecondary { memory_type_bits: u32 },
     /// No device-local memory type for a depth attachment image.
     NoDeviceLocalMemoryForDepth { memory_type_bits: u32 },
+    /// No device-local memory type for the guest writeback's detiling scratch.
+    NoDeviceLocalMemoryForGuestScratch { memory_type_bits: u32 },
+    /// No device-local memory type for a draw-time guest gather destination.
+    NoDeviceLocalMemoryForGuestGather { memory_type_bits: u32 },
     /// `VK_KHR_swapchain` is not enabled on the engine device.
     SwapchainUnavailable,
     /// The engine's queue family cannot present to the host window's surface.
@@ -122,14 +174,18 @@ impl crate::observe::Decline for DrawReason {
             Self::ResidentSampledNot2d { .. } => "resident_sampled_not_2d",
             Self::GuestRunSampledNot2d { .. } => "guest_run_sampled_not_2d",
             Self::SecondaryAttachmentCap { .. } => "secondary_attachment_cap",
+            Self::ViewportSlotsUnsupported { .. } => "viewport_slots_unsupported",
+            Self::VisibilityCountingUnsupported { .. } => "visibility_counting_unsupported",
             Self::DepthWithSecondaryAttachments => "depth_with_secondary_attachments",
             Self::SamplerAnisotropyUnsupported => "sampler_anisotropy_unsupported",
             Self::SamplerMirrorClampToEdgeUnsupported => "sampler_mirror_clamp_to_edge_unsupported",
             Self::DualSourceBlendUnsupported => "dual_source_blend_unsupported",
+            Self::FillModeNonSolidUnsupported => "fill_mode_non_solid_unsupported",
+            Self::DepthClampUnsupported => "depth_clamp_unsupported",
             // Deliberately delegates: the translation layer already named the
             // exact format problem, and inventing a second slug here would make
             // the two log lines disagree about one event.
-            Self::VertexFormat(reason) => reason.slug(),
+            Self::VertexFormat(reason) | Self::VisibilityResultMode(reason) => reason.slug(),
             Self::ConstantVertexAttribute => "constant_vertex_attribute",
             Self::InstanceRateDivisorUnsupported { .. } => "instance_rate_divisor_unsupported",
             Self::InstanceRateDivisorOverLimit { .. } => "instance_rate_divisor_over_limit",
@@ -145,6 +201,12 @@ impl crate::observe::Decline for DrawReason {
                 "no_device_local_memory_for_mrt_secondary"
             }
             Self::NoDeviceLocalMemoryForDepth { .. } => "no_device_local_memory_for_depth",
+            Self::NoDeviceLocalMemoryForGuestScratch { .. } => {
+                "no_device_local_memory_for_guest_scratch"
+            }
+            Self::NoDeviceLocalMemoryForGuestGather { .. } => {
+                "no_device_local_memory_for_guest_gather"
+            }
             Self::SwapchainUnavailable => "swapchain_unavailable",
             Self::QueueCannotPresent { .. } => "queue_cannot_present",
             Self::SwapchainLacksTransferDst => "swapchain_lacks_transfer_dst",
@@ -167,7 +229,25 @@ impl std::fmt::Display for DrawReason {
             Self::SecondaryAttachmentCap { requested, cap } => {
                 write!(f, " requested={requested} cap={cap}")
             }
-            Self::VertexFormat(reason) => write!(f, " value={}", reason.value()),
+            Self::ViewportSlotsUnsupported {
+                requested,
+                limit,
+                multi_viewport,
+            } => write!(
+                f,
+                " requested={requested} limit={limit} multi_viewport={}",
+                u8::from(*multi_viewport)
+            ),
+            Self::VisibilityCountingUnsupported {
+                occlusion_query_precise,
+            } => write!(
+                f,
+                " occlusion_query_precise={}",
+                u8::from(*occlusion_query_precise)
+            ),
+            Self::VertexFormat(reason) | Self::VisibilityResultMode(reason) => {
+                write!(f, " value={}", reason.value())
+            }
             Self::InstanceRateDivisorUnsupported { step_rate } => write!(f, " rate={step_rate}"),
             Self::InstanceRateDivisorOverLimit { step_rate, limit } => {
                 write!(f, " rate={step_rate} limit={limit}")
@@ -178,7 +258,9 @@ impl std::fmt::Display for DrawReason {
             | Self::NoDeviceLocalMemoryForStorageImage { memory_type_bits }
             | Self::NoDeviceLocalMemoryForSlab { memory_type_bits }
             | Self::NoDeviceLocalMemoryForMrtSecondary { memory_type_bits }
-            | Self::NoDeviceLocalMemoryForDepth { memory_type_bits } => {
+            | Self::NoDeviceLocalMemoryForDepth { memory_type_bits }
+            | Self::NoDeviceLocalMemoryForGuestScratch { memory_type_bits }
+            | Self::NoDeviceLocalMemoryForGuestGather { memory_type_bits } => {
                 write!(f, " memory_type_bits={memory_type_bits:#x}")
             }
             Self::QueueCannotPresent { queue_family } => write!(f, " queue_family={queue_family}"),
@@ -238,6 +320,15 @@ mod tests {
             requested: 0,
             cap: 0,
         },
+        DrawReason::ViewportSlotsUnsupported {
+            requested: 0,
+            limit: 0,
+            multi_viewport: false,
+        },
+        DrawReason::VisibilityCountingUnsupported {
+            occlusion_query_precise: false,
+        },
+        DrawReason::VisibilityResultMode(TranslateReason::UnknownVisibilityResultMode(0)),
         DrawReason::DepthWithSecondaryAttachments,
         DrawReason::SamplerAnisotropyUnsupported,
         DrawReason::SamplerMirrorClampToEdgeUnsupported,
@@ -274,6 +365,9 @@ mod tests {
         DrawReason::SwapchainLacksTransferDst,
         DrawReason::SwapchainNoSurfaceFormat,
         DrawReason::SwapchainNoCompositeAlpha,
+        DrawReason::DualSourceBlendUnsupported,
+        DrawReason::FillModeNonSolidUnsupported,
+        DrawReason::DepthClampUnsupported,
     ];
 
     /// The rule this enum exists to enforce: two checks sharing a slug means a

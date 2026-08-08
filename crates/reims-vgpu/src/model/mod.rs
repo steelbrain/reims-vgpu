@@ -3,20 +3,24 @@
 //! Registers, rings, tasks/objects, mapper, present/cursor, stamps — the
 //! ApplePV-shaped model. No parsing of wire bytes here; no backend execution.
 
+pub(crate) mod content_cache;
 mod lru_memo;
 mod regs;
 mod state;
 
-pub use lru_memo::LruBytesMemo;
-pub use regs::*;
+pub(crate) use lru_memo::LruBytesMemo;
+pub(crate) use regs::*;
+// `GfxRegs` has no in-crate importer and is here for the five doc comments
+// that link `model::GfxRegs::child_doorbell_rung`. `state` is a private
+// `mod`, so this is the only path those links can name — and rustc's
+// unused-import lint cannot see a doc link, so it will call this dead.
 pub use state::{
-    ChannelRing, ComputeStorageResidencyKey, CursorState, DeferredOwner, DeviceId, DeviceState,
-    DisplayHandshake, ExecFault, FailEvent, GfxRegs, GuestLinearMemo, GvaBacking, GvaDeferredEntry,
-    GvaEvictionWitness, GvaHostView, HostLinearTexture, HostSurface, IosfcRegs,
-    LinearDeferredEntry, MapperCapture, MappingEntry, PacketFault, PendingWork, PresentBacking,
-    PresentState, RenderFlushWitness, RenderWindowSource, ResourceValidity, SurfaceWriteKind,
-    TaskEntry, Type4Walk, FENCE_DOMAIN_BLIT, FENCE_DOMAIN_COMPUTE, FENCE_DOMAIN_EVENT,
-    FENCE_DOMAIN_RENDER, GVA_ENCODE_CACHE_BYTE_CAP, GVA_EVICTION_WITNESS_KEYS,
+    ChannelRing, ComputeStorageResidencyKey, DeviceId, DeviceState, ExecFault,
+    FailEvent, GfxRegs, GuestLinearMemo, GvaBacking, GvaEvictionWitness,
+    GvaHostView, HostLinearTexture, HostSurface, MapperCapture, MappingEntry,
+    PacketFault, PresentBacking, PresentState, RenderFlushWitness, ResourceValidity, SurfaceWriteKind, TaskEntry, TaskTable, Type4Walk, UnimplementedCommand, FENCE_DOMAIN_BLIT,
+    FENCE_DOMAIN_COMPUTE, FENCE_DOMAIN_EVENT, FENCE_DOMAIN_RENDER, GVA_ENCODE_CACHE_BYTE_CAP,
+    GVA_EVICTION_WITNESS_KEYS,
 };
 
 use crate::backend::Backend;
@@ -96,7 +100,7 @@ impl<B: Backend> Device<B> {
     /// BH body: drain pending work.
     ///
     /// `state.texture_to_mapping` is the authoritative type-11 ref → mapping
-    /// table and is read directly by `runtime/metal_draw`. This used to also
+    /// table and is read directly by `runtime/draw`. This used to also
     /// copy it into the backend on every drain, into a map nothing ever read.
     pub fn drain<H: runtime::host::HostMemory + HostOps>(&mut self, host: &mut H) {
         runtime::drain::drain_pending(&mut self.state, host);
@@ -115,7 +119,8 @@ mod tests {
     use super::*;
     use crate::backend::NullBackend;
     use crate::contract::endian::st32;
-    use crate::runtime::{FakeHost, HostActionKind, HostMemory};
+    use crate::runtime::host::{HostActionKind, HostMemory};
+    use crate::runtime::FakeHost;
 
     #[test]
     fn stamp_slot_offset_respects_guest_page_size() {
@@ -358,9 +363,21 @@ mod tests {
             0xee,
         );
         let mut payload = vec![0u8; 12];
-        st32(&mut payload[0..], 0);
-        st32(&mut payload[4..], 4);
-        st32(&mut payload[8..], reply_pfn);
+        // The word at 0 is the guest's parse ceiling, exclusive; this is what a
+        // 13.7.8 guest writes. It read 0 here for as long as the offset was
+        // thought to be unused, and a ceiling of 0 admits no key at all.
+        st32(
+            &mut payload[DEVICE_INFO_TAHOE_KEY_TABLE_LEN..],
+            DEVICE_INFO_KEY_BUFFER_WITH_IOSURFACE + 1,
+        );
+        // A whole page of pair slots, as the guest sends. A short count here
+        // would make this test emit the reply-truncated alarm every run, and a
+        // standing false alarm in the suite's own log is one nobody reads.
+        st32(
+            &mut payload[DEVICE_INFO_TAHOE_COUNT..],
+            (PAGE_SIZE_ARM64E as usize / DEVICE_INFO_REPLY_PAIR_LEN) as u32,
+        );
+        st32(&mut payload[DEVICE_INFO_TAHOE_REPLY_PFN..], reply_pfn);
         write_main_packet(&mut h, 0, ROOT_OP_DEVICE_INFO_TAHOE, 3, &payload);
         d.state
             .gfx
@@ -399,7 +416,9 @@ mod tests {
         });
         d.reset();
         assert_eq!(d.gfx_read(GFX_REG_VERSION, MMIO_U32), 0);
-        assert!(!d.state.tasks[1].active);
+        // A reset removes the task entirely rather than clearing a slot in
+        // place, so the question is liveness and not a flag on a resident entry.
+        assert!(!d.state.tasks.is_active(1));
         assert!(d.state.mappings.is_empty());
         assert!(d.fails().is_empty());
     }
@@ -407,7 +426,7 @@ mod tests {
     #[test]
     fn resource_lifecycle() {
         let mut d = dev();
-        assert!(d.state.define_task(2, 0x2000, 9));
+        d.state.define_task(2, 0x2000, 9);
         assert!(d.state.set_object_list(2, 3, 64));
         assert!(d.state.insert_object(2, 10));
         assert!(d.state.objects.contains(&(2, 10)));

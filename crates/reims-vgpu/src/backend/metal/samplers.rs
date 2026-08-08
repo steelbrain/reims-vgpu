@@ -1,10 +1,10 @@
 //! Explicit + default sampler construction with content-hash cache.
 
 use crate::backend::metal::abi::ReimsVgpuSampler;
-use crate::backend::metal::cache::{sampler_insert, sampler_key_hash, sampler_lookup};
+use crate::backend::metal::cache::{sampler_insert, sampler_lookup, SamplerDescriptorKey};
 use crate::backend::metal::mtl_enum;
 use crate::backend::metal::runtime::cached_default_sampler;
-use crate::backend::metal::util::{f32_from_bits, set_err, ErrOut, Status};
+use crate::backend::metal::util::{set_err, ErrOut, Status};
 use metal::{
     Device, MTLCompareFunction, MTLSamplerAddressMode, MTLSamplerBorderColor,
     MTLSamplerMinMagFilter, MTLSamplerMipFilter, SamplerDescriptor, SamplerState,
@@ -153,8 +153,8 @@ pub fn make_explicit_sampler(
             sampler.compare_function,
         ));
     };
-    let key = sampler_key_hash(sampler);
-    if let Some(hit) = sampler_lookup(key, sampler) {
+    let key = SamplerDescriptorKey::new(sampler);
+    if let Some(hit) = sampler_lookup(&key) {
         return Ok(hit);
     }
 
@@ -169,13 +169,13 @@ pub fn make_explicit_sampler(
     descriptor.set_compare_function(compare);
     descriptor.set_max_anisotropy(sampler.max_anisotropy as u64);
     descriptor.set_normalized_coordinates(sampler.unnormalized == 0);
-    descriptor.set_lod_min_clamp(f32_from_bits(sampler.lod_min_bits));
-    descriptor.set_lod_max_clamp(f32_from_bits(sampler.lod_max_bits));
+    descriptor.set_lod_min_clamp(f32::from_bits(sampler.lod_min_bits));
+    descriptor.set_lod_max_clamp(f32::from_bits(sampler.lod_max_bits));
     descriptor.set_lod_average(sampler.lod_average != 0);
     descriptor.set_support_argument_buffers(sampler.support_argument_buffers != 0);
 
     let state = device.new_sampler(&descriptor);
-    Ok(sampler_insert(key, sampler, state))
+    Ok(sampler_insert(key, state))
 }
 
 #[cfg(test)]

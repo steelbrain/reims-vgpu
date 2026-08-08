@@ -1,23 +1,29 @@
 //! Render encode path: PSO cache, stage-in, textured, fixed-function state.
 
+use crate::backend::blob::BlobKey;
+use crate::backend::hash::hash_bytes;
 use crate::backend::metal::abi::*;
 use crate::backend::metal::cache::{
-    depth_stencil_insert, depth_stencil_lookup, render_pso_insert, render_pso_lookup, RenderPsoKey,
+    depth_stencil_insert, depth_stencil_lookup, render_pso_insert, render_pso_lookup,
+    DepthStencilKey,
 };
 use crate::backend::metal::constants::*;
-use crate::backend::metal::format::{mtl_pixel_format_bpp, pixel_format_from_u32};
+use crate::backend::metal::format::mtl_pixel_format_bpp;
 use crate::backend::metal::function::load_only_function;
-use crate::backend::metal::hash::{hash_bytes, hash_u64};
 use crate::backend::metal::mtl_enum;
 use crate::backend::metal::raw_metal::{
-    command_buffer_error_description, render_reflection_sampler_mask, set_line_width,
+    command_buffer_error_description, render_reflection_sampler_mask,
 };
 use crate::backend::metal::runtime::{new_buffer_from_host, system_device, thread_queue};
 use crate::backend::metal::samplers::{make_default_sampler, make_explicit_sampler};
 use crate::backend::metal::util::{
-    bytes_of, clear_err, f32_from_bits, image_len, rgba_len, sampler_index, set_err, texture_index,
-    valid_buffer_binding, ErrOut, Status,
+    bytes_of, clear_err, sampler_index, set_err, texture_index, valid_buffer_binding, ErrOut,
+    Status,
 };
+use crate::backend::render_pso_key::{RenderPsoKey, RenderPsoLookup};
+use crate::contract::extent::tight_image_bytes;
+use crate::contract::vertex_step::{step_rate_in_contract, MTL_VERTEX_STEP_FUNCTION_PER_INSTANCE};
+use crate::runtime::decode::resource::MTL_COLOR_WRITE_MASK_ALL;
 use foreign_types::ForeignType;
 use metal::*;
 use std::ptr;
@@ -112,8 +118,8 @@ fn apply_raster_state(
         return Status::OK;
     };
     // Convert every word the record carries before touching the encoder, the
-    // way the four range checks this replaced all ran first: a refusal on the
-    // fill mode must not leave the cull mode already applied.
+    // way the range checks this replaced all ran first: a refusal on the
+    // winding must not leave the cull mode already applied.
     //
     // Each `has_` flag guards its own conversion, so a word the guest never set
     // is not read at all — converting unconditionally would refuse a raster
@@ -140,13 +146,6 @@ fn apply_raster_state(
         "metal_render_cull_mode_unsupported",
         "cull_mode"
     );
-    let depth_clip = optional!(
-        has_depth_clip_mode,
-        depth_clip_mode,
-        depth_clip_mode,
-        "metal_render_depth_clip_mode_unsupported",
-        "depth_clip_mode"
-    );
     let front_facing = optional!(
         has_front_facing_winding,
         front_facing_winding,
@@ -155,36 +154,34 @@ fn apply_raster_state(
         "winding"
     );
     let fill = optional!(
-        has_triangle_fill_mode,
-        triangle_fill_mode,
-        triangle_fill_mode,
+        has_fill_mode,
+        fill_mode,
+        fill_mode,
         "metal_render_fill_mode_unsupported",
         "fill_mode"
+    );
+    let depth_clip = optional!(
+        has_depth_clip_mode,
+        depth_clip_mode,
+        depth_clip_mode,
+        "metal_render_depth_clip_mode_unsupported",
+        "depth_clip_mode"
     );
     if let Some(cull) = cull {
         encoder.set_cull_mode(cull);
     }
-    if let Some(depth_clip) = depth_clip {
-        encoder.set_depth_clip_mode(depth_clip);
-    }
     if let Some(front_facing) = front_facing {
         encoder.set_front_facing_winding(front_facing);
     }
+    // Neither of these carries a host capability the way their Vulkan
+    // spellings do: `MTLTriangleFillMode` and `MTLDepthClipMode` are plain
+    // encoder state on every Metal device, so a converted value always
+    // applies.
     if let Some(fill) = fill {
         encoder.set_triangle_fill_mode(fill);
     }
-    if raster.has_line_width != 0 {
-        // RenderCommandEncoder is a Message object.
-        let ok = unsafe {
-            set_line_width(
-                &*(encoder as *const RenderCommandEncoderRef as *const objc::runtime::Object),
-                raster.line_width,
-            )
-        };
-        if !ok {
-            set_err(err, "Metal encoder lacks setLineWidth:");
-            return Status::execute("metal_render_line_width_api_unavailable");
-        }
+    if let Some(depth_clip) = depth_clip {
+        encoder.set_depth_clip_mode(depth_clip);
     }
     Status::OK
 }
@@ -263,8 +260,11 @@ fn apply_depth_stencil_state(
                 .field("depth_fail", ds.back_face.depth_failure_operation)
                 .field("pass", ds.back_face.depth_stencil_pass_operation);
         };
-        let ds_key = hash_bytes(bytes_of(ds));
-        let state = if let Some(hit) = depth_stencil_lookup(ds_key, ds) {
+        let ds_key = DepthStencilKey {
+            hash: hash_bytes(bytes_of(ds)),
+            desc: *ds,
+        };
+        let state = if let Some(hit) = depth_stencil_lookup(&ds_key) {
             hit
         } else {
             let descriptor = DepthStencilDescriptor::new();
@@ -281,7 +281,7 @@ fn apply_depth_stencil_state(
                 descriptor.set_back_face_stencil(Some(&face));
             }
             let state = device.new_depth_stencil_state(&descriptor);
-            depth_stencil_insert(ds_key, *ds, state)
+            depth_stencil_insert(ds_key, state)
         };
         encoder.set_depth_stencil_state(&state);
     }
@@ -366,30 +366,11 @@ fn find_or_add_attr_slot(
             .field("location", attr.location)
             .field("buffer", attr.buffer_index));
     }
-    let step_function = if attr.has_step_function != 0 {
-        attr.step_function
-    } else {
-        MTLVertexStepFunction::PerVertex as u32
-    };
-    let step_rate = if attr.has_step_rate != 0 {
-        attr.step_rate
-    } else {
-        1
-    };
-    if step_function > MTLVertexStepFunction::PerInstance as u32 {
-        set_err(err, "unsupported vertex attribute step state");
-        return Err(
-            Status::args("metal_render_vertex_step_function_unsupported")
-                .field("location", attr.location)
-                .field("step", step_function),
-        );
-    }
-    if step_rate == 0 {
-        set_err(err, "unsupported vertex attribute step state");
-        return Err(
-            Status::args("metal_render_vertex_step_rate_zero").field("location", attr.location)
-        );
-    }
+    // The step pair is admitted by the caller, for every attribute rather than
+    // only the ones with host bytes: this function returns above when the
+    // attribute carries none, and the descriptor is built from all of them.
+    let step_function = attr.step_function;
+    let step_rate = attr.step_rate;
     for s in slots.iter() {
         if s.index == attr.buffer_index as u64
             && s.data == attr.data
@@ -472,7 +453,7 @@ fn make_vertex_descriptor(
                     .field("limit", REIMS_VGPU_METAL_MAX_ATTRS),
             );
         }
-        if attr.buffer_index as usize >= REIMS_VGPU_METAL_MAX_BUFFERS {
+        if !valid_buffer_binding(attr.buffer_index) {
             set_err(
                 err,
                 format!(
@@ -501,11 +482,7 @@ fn make_vertex_descriptor(
                     .field("format", attr.format),
             );
         };
-        let step_ordinal = if attr.has_step_function != 0 {
-            attr.step_function
-        } else {
-            MTLVertexStepFunction::PerVertex as u32
-        };
+        let step_ordinal = attr.step_function;
         let Some(step) = mtl_enum::vertex_step_function(step_ordinal) else {
             set_err(
                 err,
@@ -517,6 +494,34 @@ fn make_vertex_descriptor(
                     .field("step", step_ordinal),
             );
         };
+        // Recognised, and this pipeline is not one they belong to. `PerPatch`
+        // and `PerPatchControlPoint` describe a post-tessellation vertex
+        // function; `MTLRenderPipelineDescriptor` validation rejects a vertex
+        // descriptor that names one without a tessellation stage, so the draw is
+        // lost either way and the only question is whether the log says which
+        // kind of loss it was. It is a separate slug from the conversion refusal
+        // above for the reason `translate::vertex` gives on the Vulkan arm,
+        // where the same split already exists: one reads "the guest ran a
+        // tessellation pipeline", the other "something is wrong upstream".
+        if step_ordinal > MTL_VERTEX_STEP_FUNCTION_PER_INSTANCE {
+            set_err(err, "unsupported vertex attribute step state");
+            return Err(Status::args("metal_render_vertex_step_function_per_patch")
+                .field("location", attr.location)
+                .field("step", step_ordinal));
+        }
+        // A rate of zero is legal for exactly one step function and required by
+        // it, which `contract::vertex_step` states beside the ordinals. Under
+        // any other, a zero rate advances nothing and `MTLVertexDescriptor`
+        // validation rejects the descriptor, so refuse it here by name instead.
+        // Asked here rather than where the buffer slot is allocated, because
+        // that runs only for an attribute carrying host bytes while every
+        // attribute reaches `set_step_function` below.
+        if !step_rate_in_contract(step_ordinal, attr.step_rate) {
+            set_err(err, "unsupported vertex attribute step state");
+            return Err(Status::args("metal_render_vertex_step_rate_zero")
+                .field("location", attr.location)
+                .field("step", step_ordinal));
+        }
         // Optional host bytes → Metal buffer slot for encode-time bind.
         find_or_add_attr_slot(device, &mut slots, attr, err)?;
         if let Some(a) = descriptor.attributes().object_at(attr.location as u64) {
@@ -527,12 +532,7 @@ fn make_vertex_descriptor(
         if let Some(layout) = descriptor.layouts().object_at(attr.buffer_index as u64) {
             layout.set_stride(attr.stride as u64);
             layout.set_step_function(step);
-            let rate = if attr.has_step_rate != 0 {
-                attr.step_rate
-            } else {
-                1
-            };
-            layout.set_step_rate(rate as u64);
+            layout.set_step_rate(attr.step_rate as u64);
         }
         any_layout = true;
     }
@@ -555,12 +555,14 @@ pub struct ColorRtKey {
 
 // Every argument is one component of the pipeline-state key, and the point of
 // the function is that the key is built from exactly these and nothing else.
-#[allow(clippy::too_many_arguments)]
+//
+// The two shader modules are not among them any more. They used to arrive here
+// as slices and leave as four `(hash, len)` words folded into the key, which is
+// the shape `backend::render_pso_key` explains was wrong: a digest with no
+// retained bytes decides two pipelines are one. They now travel to the cache as
+// `BlobKey`s beside this descriptor, so there is no pairing left for this
+// function to get wrong and no reason for it to see a shader at all.
 fn fill_render_pso_key(
-    vert_hash: u64,
-    vert_len: usize,
-    frag_hash: u64,
-    frag_len: usize,
     attrs: &[ReimsVgpuVertexAttr],
     blend: Option<&ReimsVgpuBlendState>,
     color_rts: &[ColorRtKey],
@@ -568,13 +570,49 @@ fn fill_render_pso_key(
     stencil_pixel_format: u32,
 ) -> RenderPsoKey {
     use crate::backend::metal::constants::REIMS_VGPU_METAL_MAX_COLOR_RTS;
+    // Exhaustive rather than `..Default::default()`, which is the difference
+    // between a field added to `RenderPsoKey` being a compile error here and
+    // being silently filled with a zero. The second is not a missing
+    // discriminator — it is worse: the stored key would carry the default while
+    // every later lookup key carried the same default, so the two would agree
+    // and two pipelines differing only in the new field would share one
+    // `MTLRenderPipelineState`. `RenderPsoKeyClone::clone_key` is exhaustive for
+    // the same reason.
     let mut key = RenderPsoKey {
-        vert_hash,
-        frag_hash,
-        vert_len,
-        frag_len,
+        // Overwritten at the bottom with the fold over every field below. Zero
+        // here would be a bucket, not a key, if that fold were ever removed.
+        key_hash: 0,
+        // Untruncated on purpose; see `REIMS_VGPU_METAL_MAX_ATTRS`.
         attr_count: attrs.len() as u32,
-        ..Default::default()
+        attr_location: [0; REIMS_VGPU_METAL_MAX_ATTRS],
+        attr_format: [0; REIMS_VGPU_METAL_MAX_ATTRS],
+        attr_offset: [0; REIMS_VGPU_METAL_MAX_ATTRS],
+        attr_buffer_index: [0; REIMS_VGPU_METAL_MAX_ATTRS],
+        attr_stride: [0; REIMS_VGPU_METAL_MAX_ATTRS],
+        attr_step_function: [0; REIMS_VGPU_METAL_MAX_ATTRS],
+        attr_step_rate: [0; REIMS_VGPU_METAL_MAX_ATTRS],
+        blend_enable: 0,
+        blend_src_rgb: 0,
+        blend_dst_rgb: 0,
+        blend_op_rgb: 0,
+        blend_src_alpha: 0,
+        blend_dst_alpha: 0,
+        blend_op_alpha: 0,
+        color_count: 0,
+        color_formats: [0; REIMS_VGPU_METAL_MAX_COLOR_RTS],
+        color_slot: [0; REIMS_VGPU_METAL_MAX_COLOR_RTS],
+        color_blend_enable: [0; REIMS_VGPU_METAL_MAX_COLOR_RTS],
+        color_blend_src_rgb: [0; REIMS_VGPU_METAL_MAX_COLOR_RTS],
+        color_blend_dst_rgb: [0; REIMS_VGPU_METAL_MAX_COLOR_RTS],
+        color_blend_op_rgb: [0; REIMS_VGPU_METAL_MAX_COLOR_RTS],
+        color_blend_src_alpha: [0; REIMS_VGPU_METAL_MAX_COLOR_RTS],
+        color_blend_dst_alpha: [0; REIMS_VGPU_METAL_MAX_COLOR_RTS],
+        color_blend_op_alpha: [0; REIMS_VGPU_METAL_MAX_COLOR_RTS],
+        // Every slot writes every channel until a `ColorRtKey` says otherwise;
+        // a zero here would describe a pipeline that writes no channel at all.
+        color_write_mask: [MTL_COLOR_WRITE_MASK_ALL; REIMS_VGPU_METAL_MAX_COLOR_RTS],
+        depth_pixel_format: 0,
+        stencil_pixel_format: 0,
     };
     for (i, attr) in attrs.iter().enumerate().take(REIMS_VGPU_METAL_MAX_ATTRS) {
         key.attr_location[i] = attr.location;
@@ -582,9 +620,7 @@ fn fill_render_pso_key(
         key.attr_offset[i] = attr.offset;
         key.attr_buffer_index[i] = attr.buffer_index;
         key.attr_stride[i] = attr.stride;
-        key.attr_has_step_function[i] = if attr.has_step_function != 0 { 1 } else { 0 };
         key.attr_step_function[i] = attr.step_function;
-        key.attr_has_step_rate[i] = if attr.has_step_rate != 0 { 1 } else { 0 };
         key.attr_step_rate[i] = attr.step_rate;
     }
     // Global blend (stream blend color path / color0 fallback).
@@ -632,46 +668,7 @@ fn fill_render_pso_key(
     key.depth_pixel_format = depth_pixel_format;
     key.stencil_pixel_format = stencil_pixel_format;
 
-    let mut h = 0xcbf29ce484222325u64;
-    h = hash_u64(h, vert_hash);
-    h = hash_u64(h, frag_hash);
-    h = hash_u64(h, vert_len as u64);
-    h = hash_u64(h, frag_len as u64);
-    h = hash_u64(h, key.attr_count as u64);
-    for i in 0..key.attr_count as usize {
-        h = hash_u64(h, key.attr_location[i] as u64);
-        h = hash_u64(h, key.attr_format[i] as u64);
-        h = hash_u64(h, key.attr_offset[i] as u64);
-        h = hash_u64(h, key.attr_buffer_index[i] as u64);
-        h = hash_u64(h, key.attr_stride[i] as u64);
-        h = hash_u64(h, key.attr_step_function[i] as u64);
-        h = hash_u64(h, key.attr_step_rate[i] as u64);
-        h = hash_u64(h, key.attr_has_step_function[i] as u64);
-        h = hash_u64(h, key.attr_has_step_rate[i] as u64);
-    }
-    h = hash_u64(h, key.blend_enable as u64);
-    h = hash_u64(h, key.blend_src_rgb as u64);
-    h = hash_u64(h, key.blend_dst_rgb as u64);
-    h = hash_u64(h, key.blend_op_rgb as u64);
-    h = hash_u64(h, key.blend_src_alpha as u64);
-    h = hash_u64(h, key.blend_dst_alpha as u64);
-    h = hash_u64(h, key.blend_op_alpha as u64);
-    h = hash_u64(h, key.color_count as u64);
-    for i in 0..key.color_count as usize {
-        h = hash_u64(h, key.color_slot[i] as u64);
-        h = hash_u64(h, key.color_formats[i] as u64);
-        h = hash_u64(h, key.color_blend_enable[i] as u64);
-        h = hash_u64(h, key.color_blend_src_rgb[i] as u64);
-        h = hash_u64(h, key.color_blend_dst_rgb[i] as u64);
-        h = hash_u64(h, key.color_blend_op_rgb[i] as u64);
-        h = hash_u64(h, key.color_blend_src_alpha[i] as u64);
-        h = hash_u64(h, key.color_blend_dst_alpha[i] as u64);
-        h = hash_u64(h, key.color_blend_op_alpha[i] as u64);
-        h = hash_u64(h, key.color_write_mask[i] as u64);
-    }
-    h = hash_u64(h, key.depth_pixel_format as u64);
-    h = hash_u64(h, key.stencil_pixel_format as u64);
-    key.key_hash = h;
+    key.rehash();
     key
 }
 
@@ -680,12 +677,13 @@ fn get_render_pipeline_state(
     vertex: &Function,
     fragment: &Function,
     vertex_descriptor: Option<&VertexDescriptor>,
-    key: &RenderPsoKey,
+    lookup: &RenderPsoLookup<'_>,
     err: ErrOut<'_>,
 ) -> Result<(RenderPipelineState, u32, u32), Status> {
-    if let Some(hit) = render_pso_lookup(key) {
+    if let Some(hit) = render_pso_lookup(lookup) {
         return Ok(hit);
     }
+    let key = lookup.desc;
 
     let pipeline_descriptor = RenderPipelineDescriptor::new();
     pipeline_descriptor.set_vertex_function(Some(vertex));
@@ -696,7 +694,16 @@ fn get_render_pipeline_state(
     for i in 0..key.color_count as usize {
         let slot = key.color_slot[i] as u64;
         if let Some(color) = pipeline_descriptor.color_attachments().object_at(slot) {
-            color.set_pixel_format(pixel_format_from_u32(key.color_formats[i]));
+            let Some(format) = mtl_enum::pixel_format(key.color_formats[i]) else {
+                set_err(
+                    err,
+                    format!("unknown color pixel format {}", key.color_formats[i]),
+                );
+                return Err(Status::args("metal_render_pso_color_format_undeclared")
+                    .field("slot", slot)
+                    .field("format", key.color_formats[i]));
+            };
+            color.set_pixel_format(format);
             let slot_blend = if key.color_blend_enable[i] != 0 {
                 Some(ReimsVgpuBlendState {
                     enable: 1,
@@ -726,12 +733,26 @@ fn get_render_pipeline_state(
         }
     }
     if key.depth_pixel_format != 0 {
-        pipeline_descriptor
-            .set_depth_attachment_pixel_format(pixel_format_from_u32(key.depth_pixel_format));
+        let Some(format) = mtl_enum::pixel_format(key.depth_pixel_format) else {
+            set_err(
+                err,
+                format!("unknown depth pixel format {}", key.depth_pixel_format),
+            );
+            return Err(Status::args("metal_render_pso_depth_format_undeclared")
+                .field("format", key.depth_pixel_format));
+        };
+        pipeline_descriptor.set_depth_attachment_pixel_format(format);
     }
     if key.stencil_pixel_format != 0 {
-        pipeline_descriptor
-            .set_stencil_attachment_pixel_format(pixel_format_from_u32(key.stencil_pixel_format));
+        let Some(format) = mtl_enum::pixel_format(key.stencil_pixel_format) else {
+            set_err(
+                err,
+                format!("unknown stencil pixel format {}", key.stencil_pixel_format),
+            );
+            return Err(Status::args("metal_render_pso_stencil_format_undeclared")
+                .field("format", key.stencil_pixel_format));
+        };
+        pipeline_descriptor.set_stencil_attachment_pixel_format(format);
     }
 
     let (pso, reflection) = device
@@ -745,62 +766,28 @@ fn get_render_pipeline_state(
         })?;
 
     let reflection_ptr = reflection.as_ptr() as *mut objc::runtime::Object;
-    let vert_mask = render_reflection_sampler_mask(reflection_ptr, true);
-    let frag_mask = render_reflection_sampler_mask(reflection_ptr, false);
+    // A reflection naming a sampler slot the argument table does not have
+    // refuses the PSO. Building it anyway would cache a mask claiming the shader
+    // does not sample that slot, and every later draw through this PSO would
+    // sample an undefined sampler with nothing to say why.
+    let sampler_mask = |vertex: bool| {
+        render_reflection_sampler_mask(reflection_ptr, vertex).map_err(|overflow| {
+            set_err(
+                err,
+                format!(
+                    "render reflection sampler slot {} past table",
+                    overflow.index
+                ),
+            );
+            Status::execute("metal_render_reflection_sampler_past_table")
+                .field("index", overflow.index)
+                .field("vertex", vertex)
+        })
+    };
+    let vert_mask = sampler_mask(true)?;
+    let frag_mask = sampler_mask(false)?;
 
-    Ok(render_pso_insert(
-        key.clone_key(),
-        pso,
-        vert_mask,
-        frag_mask,
-    ))
-}
-
-// RenderPsoKey is not Clone by default with arrays — add helper.
-trait RenderPsoKeyClone {
-    fn clone_key(&self) -> RenderPsoKey;
-}
-
-impl RenderPsoKeyClone for RenderPsoKey {
-    fn clone_key(&self) -> RenderPsoKey {
-        RenderPsoKey {
-            key_hash: self.key_hash,
-            vert_hash: self.vert_hash,
-            frag_hash: self.frag_hash,
-            vert_len: self.vert_len,
-            frag_len: self.frag_len,
-            attr_count: self.attr_count,
-            attr_location: self.attr_location,
-            attr_format: self.attr_format,
-            attr_offset: self.attr_offset,
-            attr_buffer_index: self.attr_buffer_index,
-            attr_stride: self.attr_stride,
-            attr_step_function: self.attr_step_function,
-            attr_step_rate: self.attr_step_rate,
-            attr_has_step_function: self.attr_has_step_function,
-            attr_has_step_rate: self.attr_has_step_rate,
-            blend_enable: self.blend_enable,
-            blend_src_rgb: self.blend_src_rgb,
-            blend_dst_rgb: self.blend_dst_rgb,
-            blend_op_rgb: self.blend_op_rgb,
-            blend_src_alpha: self.blend_src_alpha,
-            blend_dst_alpha: self.blend_dst_alpha,
-            blend_op_alpha: self.blend_op_alpha,
-            color_count: self.color_count,
-            color_formats: self.color_formats,
-            color_slot: self.color_slot,
-            color_blend_enable: self.color_blend_enable,
-            color_blend_src_rgb: self.color_blend_src_rgb,
-            color_blend_dst_rgb: self.color_blend_dst_rgb,
-            color_blend_op_rgb: self.color_blend_op_rgb,
-            color_blend_src_alpha: self.color_blend_src_alpha,
-            color_blend_dst_alpha: self.color_blend_dst_alpha,
-            color_blend_op_alpha: self.color_blend_op_alpha,
-            color_write_mask: self.color_write_mask,
-            depth_pixel_format: self.depth_pixel_format,
-            stencil_pixel_format: self.stencil_pixel_format,
-        }
-    }
+    Ok(render_pso_insert(lookup, pso, vert_mask, frag_mask))
 }
 
 fn bind_storage_buffers(
@@ -873,6 +860,34 @@ fn bind_storage_buffers(
         };
         if fragment_stage {
             encoder.set_fragment_buffer(buffer.binding as u64, Some(&mtl_buffer), 0);
+        } else if buffer.has_attribute_stride != 0 {
+            // `setVertexBuffer:offset:attributeStride:atIndex:` is only legal
+            // where the pipeline's `MTLVertexBufferLayoutDescriptor.stride` for
+            // this index is `MTLBufferLayoutStrideDynamic`, exactly as the
+            // compute rail's `metal_compute_attribute_stride_without_dynamic_layout`
+            // states for `MTLBufferLayoutDescriptor`. This rail's vertex
+            // descriptor is built from the type-7 attribute block and never
+            // declares a dynamic layout, so the selector would raise an
+            // NSException — a process abort, not an error return.
+            //
+            // Refused by name rather than bound with the pipeline's own stride.
+            // A guest that sent this negotiated `supportsDynamicAttributeStride`
+            // and built a pipeline whose layout stride is the sentinel, so
+            // fetching at that stride is not "close enough": it is wrong
+            // geometry the guest is never told about. Closing this means the
+            // render pipeline declaring the dynamic layout, at which point the
+            // bind becomes `raw_metal`'s render sibling of the compute setter.
+            set_err(
+                err,
+                format!(
+                    "vertex buffer {} carries an attributeStride and this rail's \
+                     vertex descriptor declares no dynamic layout",
+                    buffer.binding
+                ),
+            );
+            return Status::args("metal_render_attribute_stride_without_dynamic_layout")
+                .field("binding", buffer.binding)
+                .field("stride", buffer.attribute_stride);
         } else {
             encoder.set_vertex_buffer(buffer.binding as u64, Some(&mtl_buffer), 0);
         }
@@ -1010,9 +1025,27 @@ fn bind_sampled_images(
                     .field("len", image.data_len)
                     .field("required", need);
             }
-            (pixel_format_from_u32(image.pixel_format), image.data, bpr)
+            let Some(format) = mtl_enum::pixel_format(image.pixel_format) else {
+                set_err(
+                    err,
+                    format!(
+                        "native {} sampled image names no pixel format, binding {}",
+                        if fragment_stage { "fragment" } else { "vertex" },
+                        image.binding
+                    ),
+                );
+                return Status::args("metal_render_sampled_native_format_undeclared")
+                    .field("fragment", fragment_stage)
+                    .field("binding", image.binding)
+                    .field("format", image.pixel_format);
+            };
+            (format, image.data, bpr)
         } else {
-            let Some(expected_len) = rgba_len(image.width, image.height) else {
+            let Some(expected_len) = tight_image_bytes(
+                image.width,
+                image.height,
+                crate::contract::pixel_format::RGBA8_BPP as usize,
+            ) else {
                 set_err(
                     err,
                     format!(
@@ -1069,7 +1102,15 @@ fn bind_sampled_images(
         descriptor.set_height(image.height as u64);
         descriptor.set_storage_mode(MTLStorageMode::Shared);
         descriptor.set_usage(MTLTextureUsage::ShaderRead);
-        let texture = device.new_texture(&descriptor);
+        let Some(texture) = crate::backend::metal::raw_metal::new_texture(device, &descriptor)
+        else {
+            set_err(err, "failed to allocate sampled image texture");
+            return Status::execute("metal_render_sampled_texture_alloc_failed")
+                .field("fragment", fragment_stage)
+                .field("binding", image.binding)
+                .field("width", image.width)
+                .field("height", image.height);
+        };
         let region = MTLRegion {
             origin: MTLOrigin { x: 0, y: 0, z: 0 },
             size: MTLSize {
@@ -1131,7 +1172,7 @@ fn bind_samplers(
         };
         seen[index] = true;
         if s.has_lod_clamp != 0 {
-            let lod = f32_from_bits(s.clamp_lod_min_bits)..f32_from_bits(s.clamp_lod_max_bits);
+            let lod = f32::from_bits(s.clamp_lod_min_bits)..f32::from_bits(s.clamp_lod_max_bits);
             if fragment_stage {
                 encoder.set_fragment_sampler_state_with_lod(index as u64, Some(&sampler), lod);
             } else {
@@ -1144,11 +1185,13 @@ fn bind_samplers(
         }
     }
 
-    for (index, seen) in seen
-        .iter_mut()
-        .enumerate()
-        .take(REIMS_VGPU_METAL_MAX_SAMPLERS)
-    {
+    // `seen` is already exactly the argument table's width, so its own length is
+    // the bound — the `.take(REIMS_VGPU_METAL_MAX_SAMPLERS)` that used to sit
+    // here re-stated that in a second place while truncating nothing, and read
+    // as though the mask could name a slot this loop declines to serve. It
+    // cannot: `render_reflection_sampler_mask` sets no bit outside the table and
+    // says so fail-visibly if the reflection ever asks it to.
+    for (index, seen) in seen.iter_mut().enumerate() {
         if (sampler_mask & (1u32 << index)) == 0 || *seen {
             continue;
         }
@@ -1238,7 +1281,7 @@ fn validate_depth_attachment(
         return Err(Status::args("metal_render_depth_store_action_unsupported")
             .field("store_action", depth.store_action));
     };
-    let Some(depth_len) = image_len(width, height, std::mem::size_of::<f32>()) else {
+    let Some(depth_len) = tight_image_bytes(width, height, std::mem::size_of::<f32>()) else {
         set_err(err, "invalid depth attachment dimensions");
         return Err(Status::args("metal_render_depth_geometry_invalid")
             .field("width", width)
@@ -1316,7 +1359,7 @@ fn validate_stencil_attachment(
                 .field("store_action", stencil.store_action),
         );
     };
-    let Some(stencil_len) = image_len(width, height, 1) else {
+    let Some(stencil_len) = tight_image_bytes(width, height, 1) else {
         set_err(err, "invalid stencil attachment dimensions");
         return Err(Status::args("metal_render_stencil_geometry_invalid")
             .field("width", width)
@@ -1348,6 +1391,16 @@ fn validate_stencil_attachment(
     Ok(AttachmentActions { load, store })
 }
 
+/// `Ok(None)` is "the guest attached no depth buffer"; `Err` is "it attached one
+/// this device will not build". Those were the same answer while this returned a
+/// bare `Option`, and they must not be: a draw that silently loses its depth
+/// attachment renders with no depth test rather than refusing, which is guest
+/// work quietly executed wrong.
+///
+/// `validate_depth_attachment` pins the format to `DEPTH32_FLOAT` before the
+/// caller gets here, so the refusal below cannot fire today. It is the channel
+/// that matters — with it, relaxing that check upstream turns an unbuildable
+/// format into a named refusal instead of a missing attachment.
 fn configure_depth_attachment(
     device: &Device,
     pass: &RenderPassDescriptorRef,
@@ -1356,16 +1409,30 @@ fn configure_depth_attachment(
     width: u32,
     height: u32,
     actions: AttachmentActions,
-) -> Option<Texture> {
-    let depth = depth?;
+) -> Result<Option<Texture>, Status> {
+    let Some(depth) = depth else {
+        return Ok(None);
+    };
+    let Some(format) = mtl_enum::pixel_format(depth.pixel_format) else {
+        return Err(
+            Status::args("metal_render_depth_attachment_format_undeclared")
+                .field("format", depth.pixel_format),
+        );
+    };
     let descriptor = TextureDescriptor::new();
     descriptor.set_texture_type(MTLTextureType::D2);
-    descriptor.set_pixel_format(pixel_format_from_u32(depth.pixel_format));
+    descriptor.set_pixel_format(format);
     descriptor.set_width(width as u64);
     descriptor.set_height(height as u64);
     descriptor.set_storage_mode(MTLStorageMode::Shared);
     descriptor.set_usage(MTLTextureUsage::RenderTarget | MTLTextureUsage::ShaderRead);
-    let texture = device.new_texture(&descriptor);
+    let Some(texture) = crate::backend::metal::raw_metal::new_texture(device, &descriptor) else {
+        return Err(
+            Status::execute("metal_render_depth_attachment_alloc_failed")
+                .field("width", width)
+                .field("height", height),
+        );
+    };
     if depth.load_action == REIMS_VGPU_MTL_LOAD_ACTION_LOAD {
         let region = MTLRegion {
             origin: MTLOrigin { x: 0, y: 0, z: 0 },
@@ -1389,9 +1456,12 @@ fn configure_depth_attachment(
         att.set_clear_depth(depth.clear_depth);
         att.set_store_action(actions.store);
     }
-    Some(texture)
+    Ok(Some(texture))
 }
 
+/// Same split as [`configure_depth_attachment`]: `Ok(None)` is no stencil
+/// attachment, `Err` is one this device will not build.
+/// `validate_stencil_attachment` pins the format to `STENCIL8` upstream.
 fn configure_stencil_attachment(
     device: &Device,
     pass: &RenderPassDescriptorRef,
@@ -1400,16 +1470,30 @@ fn configure_stencil_attachment(
     width: u32,
     height: u32,
     actions: AttachmentActions,
-) -> Option<Texture> {
-    let stencil = stencil?;
+) -> Result<Option<Texture>, Status> {
+    let Some(stencil) = stencil else {
+        return Ok(None);
+    };
+    let Some(format) = mtl_enum::pixel_format(stencil.pixel_format) else {
+        return Err(
+            Status::args("metal_render_stencil_attachment_format_undeclared")
+                .field("format", stencil.pixel_format),
+        );
+    };
     let descriptor = TextureDescriptor::new();
     descriptor.set_texture_type(MTLTextureType::D2);
-    descriptor.set_pixel_format(pixel_format_from_u32(stencil.pixel_format));
+    descriptor.set_pixel_format(format);
     descriptor.set_width(width as u64);
     descriptor.set_height(height as u64);
     descriptor.set_storage_mode(MTLStorageMode::Shared);
     descriptor.set_usage(MTLTextureUsage::RenderTarget | MTLTextureUsage::ShaderRead);
-    let texture = device.new_texture(&descriptor);
+    let Some(texture) = crate::backend::metal::raw_metal::new_texture(device, &descriptor) else {
+        return Err(
+            Status::execute("metal_render_stencil_attachment_alloc_failed")
+                .field("width", width)
+                .field("height", height),
+        );
+    };
     if stencil.load_action == REIMS_VGPU_MTL_LOAD_ACTION_LOAD {
         let region = MTLRegion {
             origin: MTLOrigin { x: 0, y: 0, z: 0 },
@@ -1428,7 +1512,7 @@ fn configure_stencil_attachment(
         att.set_clear_stencil(stencil.clear_stencil);
         att.set_store_action(actions.store);
     }
-    Some(texture)
+    Ok(Some(texture))
 }
 
 /// One color render target for MRT encode (host RGBA8 seed/readback by default).
@@ -1452,6 +1536,31 @@ pub struct ColorRt<'a> {
     /// Per-slot `MTLColorWriteMask` from the same section. `0xf` (all) is the
     /// value for an attachment whose entry omits the tag.
     pub write_mask: u32,
+}
+
+/// The occlusion query a draw is armed with, and the answer the pass recorded.
+///
+/// In and out in one struct because the two halves are one question — "how was
+/// this draw armed, and what did the hardware count" — and the shape a caller
+/// gets wrong is passing the mode and forgetting to read the answer back.
+///
+/// The offset the guest gave stays with the caller. This pass writes into a
+/// host buffer of its own at offset 0 and hands the scalar back, because
+/// `render_core_mrt` encodes exactly one draw per pass: a Metal pass spanning
+/// several draws that share one guest offset becomes N of these, summed above
+/// the backends, the same way the Vulkan rail's per-`DrawRequest` query pool
+/// does.
+pub struct VisibilityQuery {
+    /// `MTLVisibilityResultMode` as the guest sent it. `Disabled` (`0`) is
+    /// refused rather than executed: a query struct exists only where the
+    /// stream armed one, so a disarming ordinal here is a caller defect and
+    /// running the pass unarmed would report a count of zero for a draw that
+    /// was never asked about.
+    pub mode: u32,
+    /// Out: samples the draw passed, or `None` where the pass did not run to
+    /// completion. Never written on any refusal path, so a caller that keeps
+    /// `None` knows the query is unanswered rather than answered zero.
+    pub samples: Option<u64>,
 }
 
 /// Resolve Metal loadAction for a color attachment. Archive
@@ -1565,11 +1674,7 @@ pub fn render_core_mrt(
     frag_mtlb: &[u8],
     width: u32,
     height: u32,
-    vertex_count: usize,
-    first_vertex: usize,
-    instance_count: usize,
-    base_instance: usize,
-    primitive_type: u32,
+    draw: crate::contract::draw::DrawArgs,
     primitive_indirect: Option<&ReimsVgpuPrimitiveIndirectDraw>,
     indexed: Option<&ReimsVgpuIndexedDraw>,
     attrs: &[ReimsVgpuVertexAttr],
@@ -1589,9 +1694,20 @@ pub fn render_core_mrt(
     stencil_attachment: Option<&mut ReimsVgpuStencilAttachment>,
     blend: Option<&ReimsVgpuBlendState>,
     colors: &mut [ColorRt<'_>],
+    visibility: Option<&mut VisibilityQuery>,
     err: ErrOut<'_>,
 ) -> Status {
     use crate::backend::metal::constants::REIMS_VGPU_METAL_MAX_COLOR_RTS;
+    // Widened here rather than at the call, so the `as usize` on each of these
+    // happens once and the caller passes the decoded draw whole. These were five
+    // positional parameters, four of them `usize`; the sole caller reached them
+    // through `mrt_draw_request`, which took the same five values in a different
+    // order.
+    let vertex_count = draw.vertex_count as usize;
+    let first_vertex = draw.first_vertex as usize;
+    let instance_count = draw.instance_count as usize;
+    let base_instance = draw.base_instance as usize;
+    let primitive_type = draw.primitive_type;
     let indexed_indirect = indexed.map(|i| !i.indirect.is_null()).unwrap_or(false);
     if colors.is_empty() {
         set_err(err, "invalid color render target count");
@@ -1663,7 +1779,13 @@ pub fn render_core_mrt(
                     .field("expected", need);
             }
         }
-        color_meta.push((c.slot, fmt, bpp, pixel_format_from_u32(fmt)));
+        let Some(mtl_format) = mtl_enum::pixel_format(fmt) else {
+            set_err(err, format!("color RT names no pixel format {fmt}"));
+            return Status::args("metal_render_color_format_undeclared")
+                .field("slot", c.slot)
+                .field("format", fmt);
+        };
+        color_meta.push((c.slot, fmt, bpp, mtl_format));
     }
 
     if primitive_indirect.is_none() && !indexed_indirect && vertex_count == 0 {
@@ -1746,10 +1868,6 @@ pub fn render_core_mrt(
         })
         .collect();
     let pso_key = fill_render_pso_key(
-        hash_bytes(vert_mtlb),
-        vert_mtlb.len(),
-        hash_bytes(frag_mtlb),
-        frag_mtlb.len(),
         attrs,
         blend,
         &color_rt_keys,
@@ -1762,12 +1880,19 @@ pub fn render_core_mrt(
             .map(|s| s.pixel_format)
             .unwrap_or(0),
     );
+    // The shaders join the descriptor here rather than inside it: the cache
+    // retains their bytes and compares them, so they must reach it as bytes.
+    let pso_lookup = RenderPsoLookup {
+        desc: &pso_key,
+        vert: BlobKey::new(vert_mtlb),
+        frag: BlobKey::new(frag_mtlb),
+    };
     let (pso, vert_sampler_mask, frag_sampler_mask) = match get_render_pipeline_state(
         device,
         &vertex,
         &fragment,
         vertex_descriptor.as_ref(),
-        &pso_key,
+        &pso_lookup,
         err,
     ) {
         Ok(v) => v,
@@ -1786,7 +1911,14 @@ pub fn render_core_mrt(
         target_descriptor.set_height(height as u64);
         target_descriptor.set_storage_mode(MTLStorageMode::Shared);
         target_descriptor.set_usage(MTLTextureUsage::RenderTarget | MTLTextureUsage::ShaderRead);
-        let target = device.new_texture(&target_descriptor);
+        let Some(target) =
+            crate::backend::metal::raw_metal::new_texture(device, &target_descriptor)
+        else {
+            return Status::execute("metal_render_color_target_alloc_failed")
+                .field("slot", slot)
+                .field("width", width)
+                .field("height", height);
+        };
         // Archive reims_vgpu_backend_metal: upload target_rgba8 before Load
         // (fresh RT every job; NULL seed → Clear invent below).
         if let Some(seed) = c.seed_rgba8 {
@@ -1834,7 +1966,10 @@ pub fn render_core_mrt(
         }
     }
 
-    let depth_texture = configure_depth_attachment(
+    // Both builders now separate "no attachment" from "an attachment this
+    // device will not build", and this function's channel is a bare `Status`,
+    // so the refusal is matched out rather than carried by `?`.
+    let depth_texture = match configure_depth_attachment(
         device,
         pass,
         &mut retained_tex,
@@ -1842,8 +1977,11 @@ pub fn render_core_mrt(
         width,
         height,
         depth_actions,
-    );
-    let stencil_texture = configure_stencil_attachment(
+    ) {
+        Ok(texture) => texture,
+        Err(status) => return status,
+    };
+    let stencil_texture = match configure_stencil_attachment(
         device,
         pass,
         &mut retained_tex,
@@ -1851,12 +1989,79 @@ pub fn render_core_mrt(
         width,
         height,
         stencil_actions,
-    );
+    ) {
+        Ok(texture) => texture,
+        Err(status) => return status,
+    };
+
+    // Armed before the encoder exists, because `visibilityResultBuffer` is a
+    // property of the pass descriptor and Metal reads it when the encoder is
+    // created. Both refusals below are therefore reachable without an encoder
+    // to end.
+    let visibility_mode = match visibility.as_ref() {
+        None => None,
+        Some(q) => {
+            let Some(mode) = mtl_enum::visibility_result_mode(q.mode) else {
+                set_err(err, format!("unsupported visibility result mode {}", q.mode));
+                return Status::args("metal_render_visibility_result_mode_unsupported")
+                    .field("mode", q.mode);
+            };
+            // A **healthy-zero alarm**, not a guest-reachable refusal: no guest
+            // action takes this path. `runtime::exec`'s
+            // `SetVisibilityResultMode` arm builds a `VisibilityArming` only
+            // where the decoded mode is non-zero, so a query struct exists
+            // exactly where the stream armed one. A firing means that invariant
+            // stopped holding above this backend, and running the pass unarmed
+            // instead would report zero fragments visible for a draw nobody
+            // asked about — the one wrong answer occlusion culling acts on.
+            //
+            // So it is not a never-taken branch to delete: it is the thing that
+            // says the caller broke.
+            if mode == MTLVisibilityResultMode::Disabled {
+                set_err(err, "visibility query armed with the disabling mode");
+                return Status::args("metal_render_visibility_result_mode_disabled");
+            }
+            Some(mode)
+        }
+    };
+    // One `u64` at offset 0: this pass encodes one draw, so the buffer holds
+    // exactly the one result the guest asked for. Shared so the CPU can read it
+    // after the command buffer completes without a blit.
+    let visibility_buffer = match visibility_mode {
+        None => None,
+        Some(_) => {
+            let Some(buffer) = crate::backend::metal::raw_metal::new_buffer(
+                device,
+                core::mem::size_of::<u64>() as u64,
+                MTLResourceOptions::StorageModeShared,
+            ) else {
+                return Status::execute("metal_render_visibility_buffer_alloc_failed")
+                    .field("len", core::mem::size_of::<u64>());
+            };
+            Some(buffer)
+        }
+    };
+    if let Some(buffer) = visibility_buffer.as_ref() {
+        // Metal does not document the buffer as zeroed, and the count is an
+        // accumulation the GPU adds into.
+        unsafe { core::ptr::write_bytes(buffer.contents() as *mut u8, 0, size_of::<u64>()) };
+        pass.set_visibility_result_buffer(Some(buffer));
+    }
 
     let queue = thread_queue(device);
-    let command_buffer = queue.new_command_buffer().to_owned();
-    let encoder = command_buffer.new_render_command_encoder(pass);
+    let Some(command_buffer) = crate::backend::metal::raw_metal::new_command_buffer(&queue) else {
+        return Status::execute("metal_render_command_buffer_unavailable");
+    };
+    let command_buffer = command_buffer.to_owned();
+    let Some(encoder) =
+        crate::backend::metal::raw_metal::new_render_command_encoder(&command_buffer, pass)
+    else {
+        return Status::execute("metal_render_encoder_unavailable");
+    };
     encoder.set_render_pipeline_state(&pso);
+    if let Some(mode) = visibility_mode {
+        encoder.set_visibility_result_mode(mode, 0);
+    }
     apply_blend_color(encoder, blend);
     let rc = apply_raster_state(encoder, raster, err);
     if !rc.is_ok() {
@@ -1934,11 +2139,19 @@ pub fn render_core_mrt(
                 .field("len", pi.arguments_len)
                 .field("required", need);
         }
-        let indirect = device.new_buffer_with_data(
-            pi.arguments as *const _,
-            pi.arguments_len as u64,
-            MTLResourceOptions::StorageModeShared,
-        );
+        let indirect = unsafe {
+            crate::backend::metal::raw_metal::new_buffer_with_data(
+                device,
+                pi.arguments as *const _,
+                pi.arguments_len as u64,
+                MTLResourceOptions::StorageModeShared,
+            )
+        };
+        let Some(indirect) = indirect else {
+            encoder.end_encoding();
+            return Status::execute("metal_render_indirect_buffer_alloc_failed")
+                .field("len", pi.arguments_len);
+        };
         retained_buf.push(indirect.clone());
         encoder.draw_primitives_indirect(prim, &indirect, 0);
     } else if let Some(ix) = indexed {
@@ -2038,19 +2251,35 @@ pub fn render_core_mrt(
                     .field("indices_len", ix.indices_len);
             }
         }
-        let index_buffer = device.new_buffer_with_data(
-            ix.indices as *const _,
-            ix.indices_len as u64,
-            MTLResourceOptions::StorageModeShared,
-        );
+        let index_buffer = unsafe {
+            crate::backend::metal::raw_metal::new_buffer_with_data(
+                device,
+                ix.indices as *const _,
+                ix.indices_len as u64,
+                MTLResourceOptions::StorageModeShared,
+            )
+        };
+        let Some(index_buffer) = index_buffer else {
+            encoder.end_encoding();
+            return Status::execute("metal_render_index_buffer_alloc_failed")
+                .field("len", ix.indices_len);
+        };
         retained_buf.push(index_buffer.clone());
         if indexed_indirect {
             let ind = unsafe { &*ix.indirect };
-            let indirect = device.new_buffer_with_data(
-                ind.arguments as *const _,
-                ind.arguments_len as u64,
-                MTLResourceOptions::StorageModeShared,
-            );
+            let indirect = unsafe {
+                crate::backend::metal::raw_metal::new_buffer_with_data(
+                    device,
+                    ind.arguments as *const _,
+                    ind.arguments_len as u64,
+                    MTLResourceOptions::StorageModeShared,
+                )
+            };
+            let Some(indirect) = indirect else {
+                encoder.end_encoding();
+                return Status::execute("metal_render_indexed_indirect_buffer_alloc_failed")
+                    .field("len", ind.arguments_len);
+            };
             retained_buf.push(indirect.clone());
             encoder.draw_indexed_primitives_indirect(
                 prim,
@@ -2098,6 +2327,14 @@ pub fn render_core_mrt(
         let detail = command_buffer_error_description(&command_buffer);
         set_err(err, format!("Metal command buffer failed: {detail}"));
         return Status::execute("metal_render_command_buffer_failed");
+    }
+
+    // Read after the completion check, not before it: a command buffer that
+    // errored ran no query, and answering the guest out of an untouched Shared
+    // buffer would report zero fragments visible for a draw that never
+    // rasterized — the one wrong answer occlusion culling acts on.
+    if let (Some(query), Some(buffer)) = (visibility, visibility_buffer.as_ref()) {
+        query.samples = Some(unsafe { core::ptr::read_unaligned(buffer.contents() as *const u64) });
     }
 
     for (i, c) in colors.iter_mut().enumerate() {

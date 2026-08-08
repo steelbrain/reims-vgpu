@@ -54,7 +54,7 @@ macOS sheet dimming every region to exactly half.
 
 Probes see what they drive. The other half of a silent loss is the device saying
 so in the fail log and nobody reading it, so the gate marks the log by byte
-offset before the first probe and applies six classes over its own window only —
+offset before the first probe and applies eight classes over its own window only —
 never the accumulated log, which spans builds.
 
 | counter | meaning |
@@ -72,7 +72,7 @@ a `PASS` reading `deferred_flush_lost=2/4` is never mistaken for nothing lost.
 Two of these are standing alarms that read zero across the whole accumulated
 log; a zero is the working state, so do not delete them for being constant.
 
-**Zero is the default, and four of the six keep it. Two do not, and the first
+**Zero is the default, and six of the eight keep it. Two do not, and the first
 full run on unmodified HEAD is what said so.** The plan that specified this gate
 asserted all six read zero. `deferred_flush_lost` and `mapping_page_drift` read
 1 and then 2 over two consecutive full windows of one x86/PCI boot, five over
@@ -91,7 +91,7 @@ unwatched.
 
 `counter-budget.sh` does the parsing and `self-test.sh` tests it against
 synthetic log text with no guest, no QEMU and no GPU. That split is deliberate:
-a parser that matches nothing prints the same six zeros a clean run does, so
+a parser that matches nothing prints the same eight zeros a clean run does, so
 without those cases a green gate would mean nothing and there would be no way to
 tell from its output. The cases are mutation-checked — dropping the `^` anchor
 on the line families, or matching route fields by prefix instead of exactly,

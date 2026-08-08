@@ -20,13 +20,13 @@ fn pixel_format_c_matrix_rows() {
     // IOSurface row expectations, from the deleted C pixel-format matrix, read
     // through the mapper rail's own row-bytes rule rather than a second copy of
     // it that only this vector reached.
-    use reims_vgpu::contract::iosurface_pages::sample_window;
+    use reims_vgpu::contract::iosurface_pages::packed_span_estimate;
     assert_eq!(
-        sample_window(0, pixel_format::MTL_FORMAT_BGRA8_UNORM, 200, 1).map(|(_, bpr, _)| bpr),
+        packed_span_estimate(pixel_format::MTL_FORMAT_BGRA8_UNORM, 200, 1),
         Some(896)
     );
     assert_eq!(
-        sample_window(0, pixel_format::MTL_FORMAT_RGBA16_FLOAT, 200, 1).map(|(_, bpr, _)| bpr),
+        packed_span_estimate(pixel_format::MTL_FORMAT_RGBA16_FLOAT, 200, 1),
         Some(1664)
     );
 }

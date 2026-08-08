@@ -1,6 +1,6 @@
 //! Off-VM compute regression suite for the internal Vulkan engine.
 //!
-//! Drives `engine::execute_compute` (the shipped entry) and asserts
+//! Drives `engine::execute_compute_request` (the shipped entry) and asserts
 //! **known-correct** buffer/image results (no external compute executor). Also
 //! locks warm-dispatch zero create/alloc. Requires a Vulkan ICD; skips cleanly
 //! if init fails.
@@ -15,7 +15,6 @@ use reims_vgpu::backend::vulkan::engine::{
     StorageImageFormat,
 };
 use reims_vgpu::model::ComputeStorageResidencyKey;
-use reims_vgpu::observe::Decline;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
@@ -477,7 +476,6 @@ fn compute_storage_image_rgba8unorm_known_result() {
                 output_generation: 2,
             }),
             seed_skipped: false,
-            defer_readback: false,
         }],
     };
     let Some(out) = engine_or_skip("simg_rgba8", &req) else {
@@ -517,7 +515,6 @@ fn compute_storage_image_rgba8unorm_known_result() {
                 output_generation: 3,
             }),
             seed_skipped: false,
-            defer_readback: false,
         }],
     };
     let hit = engine::execute_compute_request(&hit_req).expect("resident compute hit");
@@ -549,7 +546,6 @@ fn compute_storage_image_rgba8unorm_known_result() {
                 output_generation: 10,
             }),
             seed_skipped: false,
-            defer_readback: false,
         }],
     };
     let mismatch = engine::execute_compute_request(&mismatch_req).expect("generation mismatch");
@@ -563,6 +559,99 @@ fn compute_storage_image_rgba8unorm_known_result() {
     );
     let reset = engine::reset_guest_state();
     assert_eq!(reset.storage_images, 1, "resident image is guest state");
+}
+
+/// The compute-storage registry retains every admitted resident past the slot
+/// count that used to bound it.
+///
+/// A device-level regression test for the property that retired
+/// `COMPUTE_STORAGE_REGISTRY_CAP = 64`: that population is bounded by the
+/// allocation refusing, not by a count, so admitting more identities than the old
+/// count allowed must destroy none of them. This registry's losses were the worse
+/// of the two — nothing recreates a compute-storage resident's contents, so one
+/// taken here costs a refused dispatch rather than a re-upload.
+///
+/// The observable is `compute_storage_seed_uploads`. A dispatch whose
+/// `seed_generation` matches the resident's `output_generation` skips the seed
+/// upload entirely; a dispatch that finds no resident must upload. So a zero here
+/// on the *first* identity admitted — the one an LRU sweep takes first — is the
+/// resident still being there after 79 later admissions.
+///
+/// Fails against the retired walk: the sweep starts at 64 admissions and the
+/// first identity is its first victim, so the re-dispatch uploads its seed.
+#[test]
+fn every_admitted_compute_storage_resident_survives_past_the_retired_slot_cap() {
+    let _g = engine_test_session();
+    let spvasm = &storage_image_write_red_kernel("Rgba8");
+    let Some(words) = assemble_spvasm(spvasm, "simg_retain") else {
+        return;
+    };
+    let (w, h) = (4u32, 4u32);
+    let seed = vec![0u8; (w * h * 4) as usize];
+    // 64 was the last value that count held, and it swept on *admission*, so 80
+    // clears it with margin. At 4x4 the whole set is a few hundred KiB, so no
+    // real allocation failure is in play and the only thing that could remove one
+    // of these is a count.
+    const ADMITS: u32 = 80;
+    let identity = |i: u32| ComputeStorageResidencyKey {
+        mapping_id: 0x900 + i,
+        map_generation: 3,
+        surface_offset: 0,
+        surface_bpr: w * 4,
+        span_end: (w * h * 4) as u64,
+        width: w,
+        height: h,
+        pixel_format: 0x46,
+        texture_ref: 0,
+    };
+    let request = |i: u32, seed_generation: u32| ComputeRequest {
+        spirv: words.clone(),
+        entry: "main".into(),
+        grid: [w, h, 1],
+        storage_buffers: vec![],
+        sampled_images: vec![],
+        samplers: vec![],
+        storage_images: vec![ComputeStorageImageResource {
+            binding: 0,
+            format: StorageImageFormat::Rgba8Unorm,
+            width: w,
+            height: h,
+            bytes: seed.clone(),
+            residency: Some(ComputeStorageResidency {
+                identity: identity(i),
+                seed_generation,
+                output_generation: 2,
+            }),
+            seed_skipped: false,
+        }],
+    };
+
+    if engine_or_skip("compute_storage_retention", &request(0, 1)).is_none() {
+        return;
+    }
+    // The runtime takes this edge after `writeback_texture` lands the output in
+    // the guest's pages; this suite drives the engine directly, so it takes it
+    // here. Without it every resident stays flagged as the only copy of its
+    // contents, no reclaim path may select one, and the assertions below hold
+    // against *any* policy — including a slot count — which is exactly the
+    // vacuous pass this call removes.
+    engine::note_resident_storage_copied_out(&identity(0));
+    for i in 1..ADMITS {
+        engine::execute_compute_request(&request(i, 1)).expect("filler dispatch");
+        engine::note_resident_storage_copied_out(&identity(i));
+    }
+
+    // Every one of them, oldest first. The first assertion alone would pass a
+    // sweep that happened to spare the identity it was asked about.
+    for i in 0..ADMITS {
+        engine::reset_draw_counters();
+        engine::execute_compute_request(&request(i, 2)).expect("resident re-dispatch");
+        assert_eq!(
+            engine::counter_snapshot().compute_storage_seed_uploads,
+            0,
+            "resident {i} was destroyed by something other than an allocation failure"
+        );
+    }
 }
 
 /// Regression lock for the BGRA storage-composite R/B fix: a guest `BGRA8Unorm`
@@ -622,7 +711,6 @@ fn compute_storage_image_bgra8unorm_is_not_channel_swapped() {
                 output_generation: 2,
             }),
             seed_skipped: false,
-            defer_readback: false,
         }],
     };
     let Some(out) = engine_or_skip("simg_bgra8", &req) else {
@@ -685,7 +773,6 @@ fn compute_storage_image_seed_skip_and_lost_resident() {
                     output_generation,
                 }),
                 seed_skipped: skipped,
-                defer_readback: false,
             }],
         }
     };
@@ -722,121 +809,6 @@ fn compute_storage_image_seed_skip_and_lost_resident() {
     );
 }
 
-/// Deferred writeback contract: a resident storage dispatch with
-/// `defer_readback` crosses zero bytes device→host (empty `images` entry,
-/// `images_deferred` true, `readbacks == 0`); `read_resident_storage` then
-/// flush-reads the exact dispatch content, and a stale generation or evicted
-/// resident is the named error — never silent stale bytes.
-#[test]
-fn compute_storage_image_deferred_readback_and_flush_read() {
-    let _g = engine_test_session();
-    // Same red-fill kernel as compute_storage_image_seed_skip_and_lost_resident.
-    let spvasm = &storage_image_write_red_kernel("Rgba8");
-    let Some(words) = assemble_spvasm(spvasm, "deferred_wb_fill") else {
-        return;
-    };
-    let w = 4u32;
-    let h = 4u32;
-    let identity = ComputeStorageResidencyKey {
-        mapping_id: 95,
-        map_generation: 1,
-        surface_offset: 0,
-        surface_bpr: w * 4,
-        span_end: (w * h * 4) as u64,
-        width: w,
-        height: h,
-        pixel_format: 0x46,
-        texture_ref: 0,
-    };
-    let make_req = |seed_generation: u32, output_generation: u32| ComputeRequest {
-        spirv: words.clone(),
-        entry: "main".into(),
-        grid: [w, h, 1],
-        storage_buffers: vec![],
-        sampled_images: vec![],
-        samplers: vec![],
-        storage_images: vec![ComputeStorageImageResource {
-            binding: 0,
-            format: StorageImageFormat::Rgba8Unorm,
-            width: w,
-            height: h,
-            bytes: vec![0u8; (w * h * 4) as usize],
-            residency: Some(ComputeStorageResidency {
-                identity,
-                seed_generation,
-                output_generation,
-            }),
-            seed_skipped: false,
-            defer_readback: true,
-        }],
-    };
-    let req = make_req(1, 2);
-    let Some(out) = engine_or_skip("deferred_wb_fill", &req) else {
-        return;
-    };
-    assert_eq!(out.images.len(), 1);
-    assert!(
-        out.images[0].is_empty(),
-        "deferred image must not read back"
-    );
-    assert_eq!(out.images_deferred, vec![true]);
-    let snap = engine::counter_snapshot();
-    assert_eq!(snap.readbacks, 0, "no device→host copy on the stamp path");
-    assert_eq!(snap.readback_bytes, 0);
-    assert_eq!(snap.compute_deferred_writebacks, 1);
-    assert_eq!(snap.compute_deferred_writeback_bytes, (w * h * 4) as u64);
-    assert_eq!(
-        snap.compute_post_wait_skips, 1,
-        "all-deferred dispatch must skip the post-submit fence wait"
-    );
-
-    // Flush read while the dispatch CB may still be in flight (post-wait
-    // skipped): read_resident_storage waits the shared fence first, so this
-    // returns the exact dispatch content, tight rows, texel size 4.
-    let (bytes, texel) =
-        engine::read_resident_storage(&identity, 2).expect("flush read of pinned resident");
-    assert_eq!(texel, 4);
-    assert_eq!(bytes.len(), (w * h * 4) as usize);
-    for p in bytes.chunks_exact(4) {
-        assert!(
-            p[0] >= 254 && p[1] == 0 && p[2] == 0 && p[3] >= 254,
-            "flush must return the dispatch output: {p:?}"
-        );
-    }
-    let snap = engine::counter_snapshot();
-    assert_eq!(snap.compute_deferred_flushes, 1);
-    assert_eq!(snap.compute_deferred_flush_bytes, (w * h * 4) as u64);
-
-    // A second all-deferred dispatch drains the first one's owed cleanup at
-    // entry (descriptor set + pool recycles) and skips its own wait too.
-    let req2 = make_req(2, 3);
-    let Some(out2) = engine_or_skip("deferred_wb_fill_2", &req2) else {
-        return;
-    };
-    assert_eq!(out2.images_deferred, vec![true]);
-    let snap = engine::counter_snapshot();
-    assert_eq!(
-        snap.compute_post_wait_skips, 2,
-        "second all-deferred dispatch must skip as well"
-    );
-    let (bytes2, _) =
-        engine::read_resident_storage(&identity, 3).expect("flush read after drained cleanup");
-    for p in bytes2.chunks_exact(4) {
-        assert!(
-            p[0] >= 254 && p[1] == 0 && p[2] == 0 && p[3] >= 254,
-            "second flush must return the dispatch output: {p:?}"
-        );
-    }
-
-    // Stale generation must be the named error, never stale bytes.
-    let err = engine::read_resident_storage(&identity, 9).expect_err("stale generation");
-    assert_eq!(err.slug(), "vk_engine_storage_read_generation_mismatch");
-
-    // Evicted resident must be the named error too.
-    engine::reset_guest_state();
-    let err = engine::read_resident_storage(&identity, 2).expect_err("absent resident");
-    assert_eq!(err.slug(), "vk_engine_storage_read_resident_absent");
-}
 
 /// Copy-on-sample contract: a sampled input bound to a generation-matching
 /// resident storage image is seeded by a device-local copy (zero-placeholder
@@ -891,7 +863,6 @@ fn compute_sampled_resident_copy_and_lost_resident() {
                 output_generation: 2,
             }),
             seed_skipped: false,
-            defer_readback: false,
         }],
     };
     let Some(fill) = engine_or_skip("resident_sample_fill", &fill_req) else {
@@ -967,123 +938,6 @@ fn compute_sampled_resident_copy_and_lost_resident() {
     );
 }
 
-/// Linear-window residency chain (the live fade blur-pyramid class): a
-/// deferred storage dispatch under a **linear** identity
-/// (`ComputeStorageResidencyKey::linear`, mapping_id == 0) skips readback and
-/// post-wait like a surface window, a follow-up sampled dispatch consumes it
-/// by copy-on-sample without any host bytes, and a flush read returns the
-/// exact content. Locks the engine's key-kind agnosticism end-to-end.
-#[test]
-fn compute_linear_resident_deferred_chain() {
-    let _g = engine_test_session();
-    // Same red-fill + fetch kernels as compute_sampled_resident_copy_and_lost_resident.
-    let fill_spvasm = &storage_image_write_red_kernel("Rgba8");
-    let fetch_spvasm = SAMPLED_IMAGE_FETCH_KERNEL;
-    let Some(fill_words) = assemble_spvasm(fill_spvasm, "linear_resident_fill") else {
-        return;
-    };
-    let Some(fetch_words) = assemble_spvasm(fetch_spvasm, "linear_resident_fetch") else {
-        return;
-    };
-    let w = 4u32;
-    let h = 4u32;
-    let identity =
-        ComputeStorageResidencyKey::linear(6, 21, 0x30_2000, w * 4, (w * h * 4) as u64, w, h, 0x46);
-    assert!(identity.is_linear());
-    let fill_req = ComputeRequest {
-        spirv: fill_words,
-        entry: "main".into(),
-        grid: [w, h, 1],
-        storage_buffers: vec![],
-        sampled_images: vec![],
-        samplers: vec![],
-        storage_images: vec![ComputeStorageImageResource {
-            binding: 0,
-            format: StorageImageFormat::Rgba8Unorm,
-            width: w,
-            height: h,
-            bytes: vec![0u8; (w * h * 4) as usize],
-            residency: Some(ComputeStorageResidency {
-                identity,
-                seed_generation: 1,
-                output_generation: 2,
-            }),
-            seed_skipped: false,
-            defer_readback: true,
-        }],
-    };
-    let Some(fill) = engine_or_skip("linear_resident_fill", &fill_req) else {
-        return;
-    };
-    assert_eq!(fill.images_deferred, vec![true]);
-    assert!(
-        fill.images[0].is_empty(),
-        "deferred linear must not read back"
-    );
-    let snap = engine::counter_snapshot();
-    assert_eq!(snap.readbacks, 0);
-    assert_eq!(snap.compute_post_wait_skips, 1);
-    assert_eq!(
-        engine::compute_resident_storage_generation(&identity),
-        Some(2)
-    );
-
-    // Copy-on-sample consume of the deferred linear resident (the live
-    // pipe=17 → pipe=22 blur chain shape).
-    engine::reset_draw_counters();
-    let fetch_req = ComputeRequest {
-        spirv: fetch_words,
-        entry: "main".into(),
-        grid: [1, 1, 1],
-        storage_buffers: vec![ComputeBufferResource {
-            binding: 0,
-            bytes: vec![0; 16],
-            writable: true,
-        }],
-        sampled_images: vec![ComputeSampledImageResource {
-            binding: 32,
-            format: StorageImageFormat::Rgba8Unorm,
-            width: w,
-            height: h,
-            bytes: vec![0u8; (w * h * 4) as usize],
-            resident_bind: Some(ComputeResidentSampleBind {
-                identity,
-                generation: 2,
-            }),
-        }],
-        samplers: vec![],
-        storage_images: vec![],
-    };
-    let hit = engine::execute_compute_request(&fetch_req).expect("linear resident sample");
-    let got: Vec<u32> = hit.buffers[0]
-        .bytes
-        .chunks_exact(4)
-        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect();
-    assert_eq!(
-        got,
-        vec![
-            1.0f32.to_bits(),
-            0.0f32.to_bits(),
-            0.0f32.to_bits(),
-            1.0f32.to_bits()
-        ],
-        "sampled texel must be the deferred linear resident's red"
-    );
-    let snap = engine::counter_snapshot();
-    assert_eq!(snap.compute_sampled_uploads, 0, "no host bytes ever move");
-    assert_eq!(snap.compute_sampled_resident_copies, 1);
-
-    // Flush read (the compute_linear_flush choke point) returns the content.
-    let (bytes, texel) = engine::read_resident_storage(&identity, 2).expect("linear flush read");
-    assert_eq!(texel, 4);
-    for p in bytes.chunks_exact(4) {
-        assert!(
-            p[0] >= 254 && p[1] == 0 && p[2] == 0 && p[3] >= 254,
-            "flush must return the dispatch output: {p:?}"
-        );
-    }
-}
 
 /// Sampled inputs must use SAMPLED_IMAGE descriptors and remain input-only.
 #[test]
@@ -1323,7 +1177,6 @@ fn compute_storage_image_r16float_if_supported() {
             bytes: seed,
             residency: None,
             seed_skipped: false,
-            defer_readback: false,
         }],
     };
     match engine::execute_compute_request(&req) {

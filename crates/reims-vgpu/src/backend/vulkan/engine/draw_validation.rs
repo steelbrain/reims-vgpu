@@ -2,7 +2,7 @@
 //!
 //! These checks run before context creation or GPU work. They used to be the
 //! largest single `DrawError::Invalid(String)` cluster: 41 constructors in
-//! `exec.rs`, with buffer and descriptor roles collapsed into identical prose.
+//! `exec`, with buffer and descriptor roles collapsed into identical prose.
 //! The typed vocabulary makes each request invariant enumerable and preserves
 //! the geometry/binding/range values needed to reproduce it.
 
@@ -138,6 +138,22 @@ pub enum DrawValidationDecline {
         actual: usize,
         expected: usize,
     },
+    /// The tightly-packed length this geometry implies does not fit a `usize`,
+    /// so no buffer can be that long and no comparison against one would mean
+    /// anything.
+    ///
+    /// Reached only from a decoded geometry, and it must be a refusal rather
+    /// than a clamp: the length is what the *next* check compares a buffer
+    /// against, and a wrapped one would let a short buffer match. It used to be
+    /// neither — the product was taken unchecked, which panics in a debug build
+    /// from inside the function whose whole job is to survive a malformed
+    /// request.
+    UnrepresentableImageBytes {
+        width: u32,
+        height: u32,
+        layers: u32,
+        bytes_per_texel: u32,
+    },
     ResidentSampleGeometry {
         binding: u32,
         resident_width: u32,
@@ -223,6 +239,9 @@ impl Decline for DrawValidationDecline {
                 "vk_draw_validate_sampled_no_linear_texel_footprint"
             }
             Self::SampledBytesLength { .. } => "vk_draw_validate_sampled_bytes_length",
+            Self::UnrepresentableImageBytes { .. } => {
+                "vk_draw_validate_unrepresentable_image_bytes"
+            }
             Self::ResidentSampleGeometry { .. } => "vk_draw_validate_resident_sample_geometry",
             Self::GuestSampleRowStride { .. } => "vk_draw_validate_guest_sample_row_stride",
             Self::GuestSampleLength { .. } => "vk_draw_validate_guest_sample_length",
@@ -367,6 +386,17 @@ impl Decline for DrawValidationDecline {
                 ("binding", binding.to_string()),
                 ("actual", actual.to_string()),
                 ("expected", expected.to_string()),
+            ],
+            Self::UnrepresentableImageBytes {
+                width,
+                height,
+                layers,
+                bytes_per_texel,
+            } => vec![
+                ("width", width.to_string()),
+                ("height", height.to_string()),
+                ("layers", layers.to_string()),
+                ("bytes_per_texel", bytes_per_texel.to_string()),
             ],
             Self::ResidentSampleGeometry {
                 binding,
@@ -543,6 +573,12 @@ mod tests {
                 actual: 3,
                 expected: 4,
             },
+            DrawValidationDecline::UnrepresentableImageBytes {
+                width: 32,
+                height: 32,
+                layers: 32,
+                bytes_per_texel: 32,
+            },
             DrawValidationDecline::ResidentSampleGeometry {
                 binding: 32,
                 resident_width: 8,
@@ -588,7 +624,7 @@ mod tests {
         slugs.sort_unstable();
         let before = slugs.len();
         slugs.dedup();
-        assert_eq!(before, 43, "the validator's reason census moved");
+        assert_eq!(before, 44, "the validator's reason census moved");
         assert_eq!(before, slugs.len(), "duplicate draw-validation slug");
     }
 

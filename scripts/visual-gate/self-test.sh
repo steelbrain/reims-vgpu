@@ -2,7 +2,7 @@
 # self-test.sh — does the counter budget actually read the log?
 #
 # The gate's whole value is that a silent loss stops being silent. A parser that
-# matches nothing prints the same six zeros a clean boot does, so "the gate
+# matches nothing prints the same eight zeros a clean boot does, so "the gate
 # passed" would mean nothing and there would be no way to tell from the output.
 # These cases fail without the parser and pass with it.
 #
@@ -73,6 +73,30 @@ EOF
 
 check 'present starvation fails' 1 'present_action_starvation	1	' <<'EOF'
 THRASH present_action_starvation reason=pending_frames_cap ch=0 head=4 tail=9 unpainted=8 episode=1
+EOF
+
+# `render::decode` returning `Ok` is not a decode: `Kind::OtherAccepted` is the
+# catch-all for "no arm claimed this", so the draw completes and the guest is
+# stamped for work nothing executed. This line is the only trace, and it is
+# deduped to one per distinct opcode.
+check 'a render opcode with no executor fails' 1 'render_unimplemented	1	' <<'EOF'
+render_unimplemented reason=accepted_without_executor task=6 opcode=0x8a len=4 target_refs=[24] pipeline=9 vbufs=1 fbufs=1 ftex=2 hex=8a00040000000000
+EOF
+
+# The guest issues the device-info command once, frees the reply buffer and
+# answers every later reader from what it parsed, so a key this reply could not
+# carry is a capability gone for the boot's life.
+check 'a truncated device-info reply fails' 1 'device_info_truncated	1	' <<'EOF'
+device_info truncated reason=reply_pairs_exhausted key_table_len=18 count=5 max_pairs=512 wrote=5 have=17 dropped=[6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]
+EOF
+
+# Both new classes are `fail()` lines, and the off channel prefixes its own with
+# the literal `OFF `. A prefix match that ignored the channel would count a
+# census line as a loss — which is the inversion AGENTS.md warns about when
+# ranking `reason=` slugs.
+check 'an off-channel lookalike is not a loss' 0 'render_unimplemented	0	' <<'EOF'
+OFF render_unimplemented this is the off channel and carries no loss
+OFF device_info truncated nor does this
 EOF
 
 # The route classes are the ones a naive parser gets wrong: they are fields on a
@@ -165,10 +189,10 @@ fi
 # Every class is reported on every run, so a reader can tell "this class read
 # zero" from "this class is no longer parsed".
 n=$("$BUDGET" /dev/null "$STRICT" | wc -l)
-if [ "$n" = 6 ]; then
-  echo "self-test: ok all six classes are reported"
+if [ "$n" = 8 ]; then
+  echo "self-test: ok all eight classes are reported"
 else
-  echo "self-test: FAIL only $n classes reported, wanted 6" >&2
+  echo "self-test: FAIL only $n classes reported, wanted 8" >&2
   fails=$((fails + 1))
 fi
 

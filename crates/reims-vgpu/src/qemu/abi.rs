@@ -16,7 +16,8 @@
     reason = "the shared QEMU C ABI safety contract is documented at module scope"
 )]
 
-use crate::qemu::host_ops::{ReimsVgpuHostAction, ReimsVgpuHostOps};
+use crate::qemu::host_ops::ReimsVgpuHostOps;
+use crate::runtime::host::HostAction;
 use crate::{
     backend_name, device_console_feed, device_create, device_cursor_glyph_copy,
     device_cursor_glyph_info, device_destroy, device_drain, device_efi_console_copy,
@@ -63,7 +64,7 @@ use std::slice;
 /// [[host-window]]). The symbol is always present; when the staticlib was built
 /// without the `host-window` feature it returns `REIMS_VGPU_QEMU_ERR_STATE` so the C
 /// shim falls back to QEMU's own display.
-pub const REIMS_VGPU_QEMU_ABI_VERSION: u32 = 15;
+pub const REIMS_VGPU_QEMU_ABI_VERSION: u32 = 18;
 
 #[repr(C)]
 pub struct ReimsVgpuQemuCreateInfo {
@@ -89,6 +90,16 @@ pub const REIMS_VGPU_QEMU_ERR_PANIC: c_int = 3;
 /// pop_action: queue empty (not a hard failure).
 pub const REIMS_VGPU_QEMU_EMPTY: c_int = 4;
 
+/// Why `guest_ram_regions` refused, when it did. Negative so one return carries
+/// both a span count and a named refusal.
+///
+/// Same two-copies problem as everything else crossing this boundary, and
+/// `the_abi_header_agrees_on_the_guest_ram_codes` is the only comparison. A
+/// drift here reads as "this machine has no RAM" for what was an argument bug,
+/// on exactly one pathway.
+pub const REIMS_VGPU_GUEST_RAM_ERR_ARGS: c_int = -1;
+pub const REIMS_VGPU_GUEST_RAM_ERR_NO_RAM: c_int = -2;
+
 fn copy_host_ops(ops: *const ReimsVgpuHostOps) -> Option<ReimsVgpuHostOps> {
     if ops.is_null() {
         return None;
@@ -111,6 +122,7 @@ pub unsafe extern "C" fn reims_vgpu_qemu_device_create(
     out: *mut ReimsVgpuQemuDevice,
 ) -> c_int {
     unwind_safe(
+        "reims_vgpu_qemu_device_create",
         || {
             if out.is_null() {
                 return REIMS_VGPU_QEMU_ERR_ARGS;
@@ -159,6 +171,7 @@ pub unsafe extern "C" fn reims_vgpu_qemu_device_create(
 #[no_mangle]
 pub unsafe extern "C" fn reims_vgpu_qemu_device_reset(handle: u64) -> c_int {
     unwind_safe(
+        "reims_vgpu_qemu_device_reset",
         || {
             if handle == 0 {
                 return REIMS_VGPU_QEMU_ERR_ARGS;
@@ -177,6 +190,7 @@ pub unsafe extern "C" fn reims_vgpu_qemu_device_reset(handle: u64) -> c_int {
 #[no_mangle]
 pub unsafe extern "C" fn reims_vgpu_qemu_device_destroy(handle: u64) -> c_int {
     unwind_safe(
+        "reims_vgpu_qemu_device_destroy",
         || {
             if handle == 0 {
                 return REIMS_VGPU_QEMU_ERR_ARGS;
@@ -211,6 +225,7 @@ pub unsafe extern "C" fn reims_vgpu_qemu_window_start(
     height: u32,
 ) -> c_int {
     unwind_safe(
+        "reims_vgpu_qemu_window_start",
         || {
             if handle == 0 {
                 return REIMS_VGPU_QEMU_ERR_ARGS;
@@ -234,6 +249,7 @@ pub unsafe extern "C" fn reims_vgpu_qemu_window_start(
 #[no_mangle]
 pub unsafe extern "C" fn reims_vgpu_qemu_window_run_main(handle: u64) -> c_int {
     unwind_safe(
+        "reims_vgpu_qemu_window_run_main",
         || {
             if handle == 0 {
                 return REIMS_VGPU_QEMU_ERR_ARGS;
@@ -256,6 +272,7 @@ pub unsafe extern "C" fn reims_vgpu_qemu_window_run_main(handle: u64) -> c_int {
 #[no_mangle]
 pub unsafe extern "C" fn reims_vgpu_qemu_window_stop(handle: u64) -> c_int {
     unwind_safe(
+        "reims_vgpu_qemu_window_stop",
         || {
             if handle == 0 {
                 return REIMS_VGPU_QEMU_ERR_ARGS;
@@ -286,6 +303,7 @@ pub unsafe extern "C" fn reims_vgpu_qemu_window_set_early_fb(
     height: u32,
 ) -> c_int {
     unwind_safe(
+        "reims_vgpu_qemu_window_set_early_fb",
         || {
             if handle == 0 || ptr.is_null() {
                 return REIMS_VGPU_QEMU_ERR_ARGS;
@@ -305,17 +323,13 @@ pub unsafe extern "C" fn reims_vgpu_qemu_window_set_early_fb(
 #[no_mangle]
 pub unsafe extern "C" fn reims_vgpu_qemu_backend_name(buf: *mut c_char, buf_len: usize) -> c_int {
     unwind_safe(
+        "reims_vgpu_qemu_backend_name",
         || {
             if buf.is_null() || buf_len == 0 {
                 return REIMS_VGPU_QEMU_ERR_ARGS;
             }
-            let name = backend_name().as_bytes();
-            let n = name.len().min(buf_len - 1);
-            // SAFETY: buf valid for buf_len.
-            unsafe {
-                std::ptr::copy_nonoverlapping(name.as_ptr(), buf as *mut u8, n);
-                *buf.add(n) = 0;
-            }
+            // SAFETY: the header requires `buf` valid for `buf_len` bytes.
+            unsafe { crate::qemu::cstr::write_c_str(buf, buf_len, backend_name()) };
             REIMS_VGPU_QEMU_OK
         },
         REIMS_VGPU_QEMU_ERR_PANIC,
@@ -325,7 +339,11 @@ pub unsafe extern "C" fn reims_vgpu_qemu_backend_name(buf: *mut c_char, buf_len:
 /// ABI version getter (no allocation).
 #[no_mangle]
 pub unsafe extern "C" fn reims_vgpu_qemu_abi_version() -> u32 {
-    unwind_safe(|| REIMS_VGPU_QEMU_ABI_VERSION, 0)
+    unwind_safe(
+        "reims_vgpu_qemu_abi_version",
+        || REIMS_VGPU_QEMU_ABI_VERSION,
+        0,
+    )
 }
 
 /// Gfx MMIO read. SAFETY: out_val non-null.
@@ -337,6 +355,7 @@ pub unsafe extern "C" fn reims_vgpu_qemu_gfx_read(
     out_val: *mut u64,
 ) -> c_int {
     unwind_safe(
+        "reims_vgpu_qemu_gfx_read",
         || {
             if handle == 0 || out_val.is_null() {
                 return REIMS_VGPU_QEMU_ERR_ARGS;
@@ -365,6 +384,7 @@ pub unsafe extern "C" fn reims_vgpu_qemu_gfx_write(
     size: u32,
 ) -> c_int {
     unwind_safe(
+        "reims_vgpu_qemu_gfx_write",
         || {
             if handle == 0 {
                 return REIMS_VGPU_QEMU_ERR_ARGS;
@@ -388,6 +408,7 @@ pub unsafe extern "C" fn reims_vgpu_qemu_iosfc_read(
     out_val: *mut u64,
 ) -> c_int {
     unwind_safe(
+        "reims_vgpu_qemu_iosfc_read",
         || {
             if handle == 0 || out_val.is_null() {
                 return REIMS_VGPU_QEMU_ERR_ARGS;
@@ -415,6 +436,7 @@ pub unsafe extern "C" fn reims_vgpu_qemu_iosfc_write(
     size: u32,
 ) -> c_int {
     unwind_safe(
+        "reims_vgpu_qemu_iosfc_write",
         || {
             if handle == 0 {
                 return REIMS_VGPU_QEMU_ERR_ARGS;
@@ -434,6 +456,7 @@ pub unsafe extern "C" fn reims_vgpu_qemu_iosfc_write(
 #[no_mangle]
 pub unsafe extern "C" fn reims_vgpu_qemu_device_drain(handle: u64) -> c_int {
     unwind_safe(
+        "reims_vgpu_qemu_device_drain",
         || {
             if handle == 0 {
                 return REIMS_VGPU_QEMU_ERR_ARGS;
@@ -453,6 +476,7 @@ pub unsafe extern "C" fn reims_vgpu_qemu_device_drain(handle: u64) -> c_int {
 #[no_mangle]
 pub unsafe extern "C" fn reims_vgpu_qemu_device_poll(handle: u64) -> c_int {
     unwind_safe(
+        "reims_vgpu_qemu_device_poll",
         || {
             if handle == 0 {
                 return REIMS_VGPU_QEMU_ERR_ARGS;
@@ -473,9 +497,10 @@ pub unsafe extern "C" fn reims_vgpu_qemu_device_poll(handle: u64) -> c_int {
 #[no_mangle]
 pub unsafe extern "C" fn reims_vgpu_qemu_device_pop_action(
     handle: u64,
-    out: *mut ReimsVgpuHostAction,
+    out: *mut HostAction,
 ) -> c_int {
     unwind_safe(
+        "reims_vgpu_qemu_device_pop_action",
         || {
             if handle == 0 || out.is_null() {
                 return REIMS_VGPU_QEMU_ERR_ARGS;
@@ -518,6 +543,7 @@ pub unsafe extern "C" fn reims_vgpu_qemu_console_feed(
     out_generation: *mut u32,
 ) -> c_int {
     unwind_safe(
+        "reims_vgpu_qemu_console_feed",
         || {
             if handle == 0 || out_kind.is_null() {
                 return REIMS_VGPU_QEMU_ERR_ARGS;
@@ -580,6 +606,7 @@ pub unsafe extern "C" fn reims_vgpu_qemu_scanout_may_paint(
     out_may: *mut u32,
 ) -> c_int {
     unwind_safe(
+        "reims_vgpu_qemu_scanout_may_paint",
         || {
             if handle == 0 || out_may.is_null() {
                 return REIMS_VGPU_QEMU_ERR_ARGS;
@@ -611,6 +638,7 @@ pub unsafe extern "C" fn reims_vgpu_qemu_efi_console_copy(
     height: u32,
 ) -> c_int {
     unwind_safe(
+        "reims_vgpu_qemu_efi_console_copy",
         || {
             if handle == 0 || dst.is_null() || width == 0 || height == 0 {
                 return REIMS_VGPU_QEMU_ERR_ARGS;
@@ -648,6 +676,7 @@ pub unsafe extern "C" fn reims_vgpu_qemu_scanout_copy(
 ) -> c_int {
     use crate::runtime::scanout::ScanoutCopyResult;
     unwind_safe(
+        "reims_vgpu_qemu_scanout_copy",
         || {
             if handle == 0 || dst.is_null() || width == 0 || height == 0 || dst_stride == 0 {
                 return REIMS_VGPU_QEMU_ERR_ARGS;
@@ -677,6 +706,7 @@ pub unsafe extern "C" fn reims_vgpu_qemu_cursor_glyph_info(
     out: *mut CursorGlyphInfo,
 ) -> c_int {
     unwind_safe(
+        "reims_vgpu_qemu_cursor_glyph_info",
         || {
             if handle == 0 || out.is_null() {
                 return REIMS_VGPU_QEMU_ERR_ARGS;
@@ -704,6 +734,7 @@ pub unsafe extern "C" fn reims_vgpu_qemu_cursor_glyph_copy(
     count: usize,
 ) -> c_int {
     unwind_safe(
+        "reims_vgpu_qemu_cursor_glyph_copy",
         || {
             if handle == 0 || out_argb.is_null() || count == 0 {
                 return REIMS_VGPU_QEMU_ERR_ARGS;
@@ -719,15 +750,43 @@ pub unsafe extern "C" fn reims_vgpu_qemu_cursor_glyph_copy(
     )
 }
 
-/// Read `#define NAME <decimal>[u]` out of the shared ABI header.
+/// Read `#define NAME <decimal|0xhex>[u]` out of the shared ABI header.
 ///
 /// Test-only, and the only thing in the toolchain that reads the header at all:
 /// Rust does not include it and the shims do not read Rust, so every constant
 /// crossing the boundary exists as two copies with nothing comparing them. Each
 /// caller is the sole check that one of them has not drifted. Takes the first
 /// token after the name, because several of these carry a trailing `/* ... */`.
+///
+/// Hex is accepted because a register-window size is spelled `0x4000` on both
+/// sides and restating it in decimal on one of them would be a second
+/// transcription for a reader to get wrong — which is the defect this whole
+/// function exists to catch.
 #[cfg(test)]
 pub(crate) fn header_define(name: &str) -> u32 {
+    const HEADER: &str = include_str!("../../include/reims_vgpu_qemu_abi.h");
+    let tok = HEADER
+        .lines()
+        .find_map(|l| l.strip_prefix(&format!("#define {name} ")))
+        .unwrap_or_else(|| panic!("the shared ABI header must define {name}"))
+        .split_whitespace()
+        .next()
+        .unwrap_or_else(|| panic!("{name} must have a value"))
+        .trim_end_matches('u');
+    match tok.strip_prefix("0x") {
+        Some(hex) => u32::from_str_radix(hex, 16),
+        None => tok.parse(),
+    }
+    .unwrap_or_else(|e| panic!("{name} must be a plain decimal or 0x-hex literal: {e}"))
+}
+
+/// [`header_define`] for a `#define NAME <signed decimal>`.
+///
+/// The refusal codes are negative so one return value can carry both an owned
+/// fd and a named refusal, and `u32::from_str` cannot read them. Same job and
+/// same reason: these constants exist twice with nothing comparing them.
+#[cfg(test)]
+pub(crate) fn header_define_i32(name: &str) -> i32 {
     const HEADER: &str = include_str!("../../include/reims_vgpu_qemu_abi.h");
     HEADER
         .lines()
@@ -736,9 +795,8 @@ pub(crate) fn header_define(name: &str) -> u32 {
         .split_whitespace()
         .next()
         .unwrap_or_else(|| panic!("{name} must have a value"))
-        .trim_end_matches('u')
         .parse()
-        .unwrap_or_else(|e| panic!("{name} must be a plain decimal literal: {e}"))
+        .unwrap_or_else(|e| panic!("{name} must be a plain signed decimal literal: {e}"))
 }
 
 #[cfg(test)]
@@ -746,6 +804,61 @@ mod tests {
 
     use super::*;
     use crate::model::{PAGE_SHIFT_ARM64E, PAGE_SHIFT_X86};
+
+    /// `reims_vgpu_qemu_device_pop_action` writes a Rust [`HostAction`] straight
+    /// through the caller's `ReimsVgpuHostAction *`, so the two declarations are
+    /// one struct and the header is the only other place it is written down.
+    ///
+    /// There used to be a third: a `#[repr(C)] ReimsVgpuHostAction` beside a
+    /// `#[repr(u32)] ReimsVgpuHostActionKind`, both mirroring the runtime pair,
+    /// with a test that compared the two *Rust* spellings to each other. That
+    /// test could not see the header, which is the copy that can actually drift
+    /// away from the compiled shim. The mirrors are gone and this checks what
+    /// they were standing in for: the field names, their order, and the C types
+    /// the shim's compiler lays out from.
+    ///
+    /// The `u32` kind followed by four `u64`s is why `size_of` is 40 and not 36
+    /// — both compilers pad `kind` out to the 8-byte alignment `a0` demands.
+    #[test]
+    fn the_abi_header_agrees_on_the_host_action_layout() {
+        const HEADER: &str = include_str!("../../include/reims_vgpu_qemu_abi.h");
+        let body = HEADER
+            .split_once("typedef struct ReimsVgpuHostAction {")
+            .expect("the header must declare ReimsVgpuHostAction")
+            .1
+            .split_once('}')
+            .expect("the declaration must be closed")
+            .0;
+        let fields: Vec<&str> = body
+            .split(';')
+            .map(str::trim)
+            .filter(|f| !f.is_empty())
+            .collect();
+        assert_eq!(
+            fields,
+            vec![
+                "uint32_t kind",
+                "uint64_t a0",
+                "uint64_t a1",
+                "uint64_t a2",
+                "uint64_t a3",
+            ],
+            "the C declaration must stay the one Rust's #[repr(C)] HostAction lays out"
+        );
+
+        assert_eq!(std::mem::size_of::<HostAction>(), 40);
+        assert_eq!(std::mem::align_of::<HostAction>(), 8);
+        assert_eq!(std::mem::offset_of!(HostAction, kind), 0);
+        assert_eq!(std::mem::offset_of!(HostAction, a0), 8);
+        assert_eq!(std::mem::offset_of!(HostAction, a1), 16);
+        assert_eq!(std::mem::offset_of!(HostAction, a2), 24);
+        assert_eq!(std::mem::offset_of!(HostAction, a3), 32);
+        assert_eq!(
+            std::mem::size_of::<crate::runtime::host::HostActionKind>(),
+            4,
+            "the kind word is the u32 the shim switches on"
+        );
+    }
 
     /// The version is the handshake itself: `copy_host_ops` refuses an ops table
     /// whose `abi_version` is not this exact number, so a header and a staticlib
@@ -760,6 +873,138 @@ mod tests {
             REIMS_VGPU_QEMU_ABI_VERSION,
             "the shim header and the staticlib disagree on the ABI version"
         );
+    }
+
+    /// The five entry-point return codes agree with the shim header.
+    ///
+    /// `REIMS_VGPU_QEMU_OK` is the one that matters most and reads the most
+    /// harmless. Both shims' `deliver_actions` drain the action queue with
+    /// `while (rc = pop_action(..)) == REIMS_VGPU_QEMU_OK`, so a drift there does
+    /// not misreport anything — the loop simply never runs, every HostAction the
+    /// device queues is silently left in it, and IRQ pulses, scanout updates and
+    /// window input all stop reaching the guest with no failure on any channel.
+    /// `_EMPTY` is its partner: the value that legitimately ends that loop.
+    ///
+    /// All five rather than the two the shims name today, on the same reasoning
+    /// as the guest-page family — the error codes are what a new entry point
+    /// reaches for next, and pinning only what is read now leaves the rest to
+    /// drift until something depends on them.
+    #[test]
+    fn the_abi_header_agrees_on_the_entry_point_return_codes() {
+        for (name, ours) in [
+            ("REIMS_VGPU_QEMU_OK", REIMS_VGPU_QEMU_OK),
+            ("REIMS_VGPU_QEMU_ERR_ARGS", REIMS_VGPU_QEMU_ERR_ARGS),
+            ("REIMS_VGPU_QEMU_ERR_STATE", REIMS_VGPU_QEMU_ERR_STATE),
+            ("REIMS_VGPU_QEMU_ERR_PANIC", REIMS_VGPU_QEMU_ERR_PANIC),
+            ("REIMS_VGPU_QEMU_EMPTY", REIMS_VGPU_QEMU_EMPTY),
+        ] {
+            assert_eq!(
+                header_define_i32(name),
+                ours,
+                "{name} has drifted from the staticlib's value"
+            );
+        }
+    }
+
+    /// Both guest-RAM refusal codes exist twice and nothing in the build
+    /// compares them. A drift makes the shim say "bad arguments" and the
+    /// staticlib hear "this machine has no RAM" — which is the difference
+    /// between a caller bug on this build and a board that was never given
+    /// memory, and it would send a reader to the wrong half of the tree.
+    ///
+    /// The consequence is larger than for most codes on this boundary: this
+    /// call is the door to every guest-memory import, so a refusal it
+    /// misattributes is the device running its copying rails for a whole boot
+    /// with the wrong explanation in the log.
+    #[test]
+    fn the_abi_header_agrees_on_the_guest_ram_codes() {
+        for (name, ours) in [
+            (
+                "REIMS_VGPU_GUEST_RAM_ERR_ARGS",
+                REIMS_VGPU_GUEST_RAM_ERR_ARGS,
+            ),
+            (
+                "REIMS_VGPU_GUEST_RAM_ERR_NO_RAM",
+                REIMS_VGPU_GUEST_RAM_ERR_NO_RAM,
+            ),
+        ] {
+            assert_eq!(
+                header_define_i32(name),
+                ours,
+                "{name} has drifted from the staticlib's value"
+            );
+        }
+    }
+
+    /// The shim writes `ReimsVgpuGuestRamRegion`s straight through the caller's
+    /// array, so the C declaration and Rust's `#[repr(C)] GuestRamRegion` are
+    /// one struct written down twice.
+    ///
+    /// A field reordered on one side is not a decode error here — it is a host
+    /// address read as a length and imported as a span, which is the one
+    /// failure the bound in `runtime::guest_ram` cannot catch, because the
+    /// numbers it checks would all be self-consistent. Hence the field names
+    /// and their order, not just the size.
+    #[test]
+    fn the_abi_header_agrees_on_the_guest_ram_region_layout() {
+        use crate::runtime::guest_ram::GuestRamRegion;
+
+        const HEADER: &str = include_str!("../../include/reims_vgpu_qemu_abi.h");
+        let body = HEADER
+            .split_once("typedef struct ReimsVgpuGuestRamRegion {")
+            .expect("the header must declare ReimsVgpuGuestRamRegion")
+            .1
+            .split_once('}')
+            .expect("the declaration must be closed")
+            .0;
+        let fields: Vec<&str> = body
+            .split(';')
+            .map(str::trim)
+            .filter(|f| !f.is_empty())
+            .collect();
+        assert_eq!(
+            fields,
+            vec!["uint64_t gpa_base", "uint64_t host_va", "uint64_t len"],
+            "the C declaration must stay the one Rust's #[repr(C)] GuestRamRegion lays out"
+        );
+
+        assert_eq!(std::mem::size_of::<GuestRamRegion>(), 24);
+        assert_eq!(std::mem::align_of::<GuestRamRegion>(), 8);
+        assert_eq!(std::mem::offset_of!(GuestRamRegion, gpa_base), 0);
+        assert_eq!(std::mem::offset_of!(GuestRamRegion, host_va), 8);
+        assert_eq!(std::mem::offset_of!(GuestRamRegion, len), 16);
+    }
+
+
+    /// Every code the header defines maps to its own variant. A code that fell
+    /// through to `UnknownCode` would still log a number, but the reader would
+    /// be told the shim is newer than the staticlib when in fact the mapping
+    /// simply forgot an arm.
+    #[test]
+    fn every_guest_ram_code_maps_to_its_own_named_check() {
+        use crate::observe::Decline as _;
+        use crate::runtime::host::GuestRamRegionsError;
+        let mut slugs = Vec::new();
+        for code in [
+            REIMS_VGPU_GUEST_RAM_ERR_ARGS,
+            REIMS_VGPU_GUEST_RAM_ERR_NO_RAM,
+        ] {
+            let mapped = GuestRamRegionsError::from_code(code);
+            assert!(
+                !matches!(mapped, GuestRamRegionsError::UnknownCode(_)),
+                "{code} has no named arm"
+            );
+            slugs.push(mapped.slug());
+        }
+        let count = slugs.len();
+        slugs.sort_unstable();
+        slugs.dedup();
+        assert_eq!(slugs.len(), count, "two guest-RAM codes share a slug");
+        // A code past the end is the one case that *should* be unknown, and it
+        // must carry the number rather than swallow it.
+        let future = GuestRamRegionsError::from_code(-99);
+        assert_eq!(future, GuestRamRegionsError::UnknownCode(-99));
+        assert!(future.to_string().contains("code=-99"));
     }
 
     #[test]
@@ -873,7 +1118,7 @@ mod tests {
             unsafe { reims_vgpu_qemu_device_drain(dev.handle) },
             REIMS_VGPU_QEMU_OK
         );
-        let mut action = ReimsVgpuHostAction::default();
+        let mut action = HostAction::default();
         assert_eq!(
             unsafe { reims_vgpu_qemu_device_pop_action(dev.handle, &mut action) },
             REIMS_VGPU_QEMU_EMPTY

@@ -1,47 +1,47 @@
 //! Blit command decoder (port of `host/utils/reims-vgpu-blit-decode`).
+//!
+//! # The three indirect-command-buffer records, which this decoder reads and no
+//! executor applies
+//!
+//! **Apple's serializer emits all three**, so calling them "rejected" -- which
+//! this module did -- was a claim about Apple that the serializer contradicts:
+//! `copyIndirectCommandBuffer:sourceRange:destination:destinationIndex:` writes
+//! `0x131`, `optimizeIndirectCommandBuffer:withRange:` writes `0x138` and
+//! `resetCommandsInBuffer:withRange:` writes `0x139`, each pinned by a fixture
+//! in `reims_vgpu_wire::ops::blit` (`CopyIcb`, `IcbRange`).
+//!
+//! They sit inside this encoder's opcode space, between `0x12c` and `0x13e`, so
+//! they are not a foreign encoder's numbers arriving in a blit segment either.
+//!
+//! They used to be refused whole, under one shared reason. Refusing them said
+//! three different things with one word, and the three are not equivalent:
+//! `0x138` is Metal's *optimization hint*, so skipping it is semantically
+//! correct and costs only speed, while `0x139` leaves commands live that the
+//! guest asked to be reset and `0x131` leaves a destination buffer holding
+//! whatever it held before. Two of the three are lost work and one is not.
+//! Decoding them lets `runtime::exec` say which; see the arms there.
+//!
+//! # The five records `-setSupportsBlitEncoderSPI:` gates
+//!
+//! This encoder's opcode run does not stop at `0x13e`. It was read that way for
+//! as long as the wire capture drove the class with every capability at its
+//! default, and all sixteen of those default off -- so five real records looked
+//! like selectors Apple never emits, and this decoder answered every one of
+//! them with `ErrUnknownOpcode`.
+//!
+//! Each is pinned by a fixture in [`reims_vgpu_wire::ops::blit`], and the three
+//! fills are writes to guest-visible memory: dropping one leaves the
+//! destination holding whatever it held before, which the guest then reads back
+//! as content it believes it just wrote.
+//!
+//! `0x142` and `0x143` are the [`wire::Ref`] and [`wire::RefSliceLevel`] shapes
+//! exactly, and this module deliberately does **not** fold them into the arms
+//! that already decode those shapes: those arms end in the executor's
+//! unconditional no-op, and a compressed-texture invalidate that silently
+//! joined them would be indistinguishable from a `synchronizeTexture:` that
+//! genuinely needs nothing done.
 
 use reims_vgpu_wire::ops::blit as wire;
-
-/// The three indirect-command-buffer records, which this decoder reads and no
-/// executor applies.
-///
-/// **Apple's serializer emits all three**, so calling them "rejected" -- which
-/// this module did -- was a claim about Apple that the serializer contradicts:
-/// `copyIndirectCommandBuffer:sourceRange:destination:destinationIndex:` writes
-/// `0x131`, `optimizeIndirectCommandBuffer:withRange:` writes `0x138` and
-/// `resetCommandsInBuffer:withRange:` writes `0x139`, each pinned by a fixture
-/// in `reims_vgpu_wire::ops::blit` (`CopyIcb`, `IcbRange`).
-///
-/// They sit inside this encoder's opcode space, between `0x12c` and `0x13e`, so
-/// they are not a foreign encoder's numbers arriving in a blit segment either.
-///
-/// They used to be refused whole, under one shared reason. Refusing them said
-/// three different things with one word, and the three are not equivalent:
-/// `0x138` is Metal's *optimization hint*, so skipping it is semantically
-/// correct and costs only speed, while `0x139` leaves commands live that the
-/// guest asked to be reset and `0x131` leaves a destination buffer holding
-/// whatever it held before. Two of the three are lost work and one is not.
-/// Decoding them lets `runtime::exec` say which; see the arms there.
-
-/// The five records `-setSupportsBlitEncoderSPI:` gates.
-///
-/// This encoder's opcode run does not stop at `0x13e`. It was read that way for
-/// as long as the wire capture drove the class with every capability at its
-/// default, and all sixteen of those default off -- so five real records looked
-/// like selectors Apple never emits, and this decoder answered every one of
-/// them with `ErrUnknownOpcode`.
-///
-/// Each is pinned by a fixture in [`reims_vgpu_wire::ops::blit`], and the three
-/// fills are writes to guest-visible memory: dropping one leaves the
-/// destination holding whatever it held before, which the guest then reads back
-/// as content it believes it just wrote.
-///
-/// `0x142` and `0x143` are the [`wire::Ref`] and [`wire::RefSliceLevel`] shapes
-/// exactly, and this module deliberately does **not** fold them into the arms
-/// that already decode those shapes: those arms end in the executor's
-/// unconditional no-op, and a compressed-texture invalidate that silently
-/// joined them would be indistinguishable from a `synchronizeTexture:` that
-/// genuinely needs nothing done.
 
 // MTLBlitOption (Metal.framework Headers/MTLBlitCommandEncoder.h).
 pub const MTL_BLIT_OPTION_NONE: u32 = 0;
@@ -54,15 +54,12 @@ pub const MTL_BLIT_OPTION_KNOWN_MASK: u32 = MTL_BLIT_OPTION_DEPTH_FROM_DEPTH_STE
     | MTL_BLIT_OPTION_ROW_LINEAR_PVRTC;
 
 /// Selected texture aspect for a buffer↔texture / options-bearing copy.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BlitAspect {
-    /// Full texel (options None / zero).
-    Full,
-    /// Depth plane of a depth or depth-stencil texture.
-    Depth,
-    /// Stencil plane of a stencil or depth-stencil texture.
-    Stencil,
-}
+///
+/// Defined in [`crate::contract::pixel_format`], which is where every consumer
+/// of the choice lives, and re-exported here because this is where it is
+/// produced. One type, so the decoder's refusal of depth+stencil is the only
+/// place that state is ever considered.
+pub(crate) use crate::contract::pixel_format::BlitAspect;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BlitOptionError {

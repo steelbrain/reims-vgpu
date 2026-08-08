@@ -3,12 +3,11 @@
 //! Protocol handlers are thin UEFI adapters over [`reims_vgpu_efi::paint`] —
 //! unit tests drive those paint paths on the host without boot services.
 
-use core::mem::size_of;
 use core::ptr;
 use core::slice;
 use reims_vgpu_efi::paint::{
-    self, BltPixel, GopStatus, BLT_BUFFER_TO_VIDEO, BLT_VIDEO_FILL, BLT_VIDEO_TO_BUFFER, FB_BYTES,
-    FB_H, FB_W, PIXEL_BGR,
+    self, BltPixel, BltRect, GopStatus, BLT_BUFFER_TO_VIDEO, BLT_VIDEO_FILL, BLT_VIDEO_TO_BUFFER,
+    FB_BYTES, FB_H, FB_W, PIXEL_BGR,
 };
 use uefi::prelude::*;
 use uefi::{boot, guid};
@@ -146,7 +145,24 @@ unsafe extern "efiapi" fn gop_blt(
     }
     let fb = slice::from_raw_parts_mut(ctx.fb, FB_BYTES);
 
-    // Bound BltBuffer for ops that need it. Delta 0 ⇒ width pitch.
+    // An empty rectangle is refused before anything is derived from it. `paint`
+    // states the same rule and would refuse too, but the pitch and the buffer
+    // span are both computed from `width`/`height` on the way there, and a zero
+    // pitch is what the `.max(1)` this replaces was hiding.
+    if width == 0 || height == 0 {
+        return Status::INVALID_PARAMETER;
+    }
+
+    let rect = BltRect {
+        source_x,
+        source_y,
+        destination_x,
+        destination_y,
+        width,
+        height,
+    };
+
+    // Bound BltBuffer for ops that need it.
     let needs_buf = matches!(
         blt_operation,
         BLT_VIDEO_FILL | BLT_BUFFER_TO_VIDEO | BLT_VIDEO_TO_BUFFER
@@ -156,24 +172,21 @@ unsafe extern "efiapi" fn gop_blt(
         if blt_buffer.is_null() {
             return Status::INVALID_PARAMETER;
         }
-        let row_px = if delta == 0 {
-            width
-        } else if delta % size_of::<BltPixel>() != 0 {
+        let Some(row_px) = paint::row_pitch_pixels(delta, width) else {
             return Status::INVALID_PARAMETER;
-        } else {
-            delta / size_of::<BltPixel>()
         };
-        // Conservative upper bound so paint can re-check precisely.
+        // The length is *exactly* what the operation reaches, because the UEFI
+        // Blt signature carries no buffer size: the caller's rectangle and
+        // `Delta` are the only statement of how large the BltBuffer is, and the
+        // spec requires it to be at least this large. `paint::blt` re-checks
+        // the same span against `buf.len()`, which on this path can only ever
+        // compare the number to itself — that check exists for the crate's own
+        // host tests, which pass a real slice. Both spans come from
+        // `BltRect::buffer_pixels_needed` so the two cannot disagree.
         let n = match blt_operation {
             BLT_VIDEO_FILL => 1usize,
-            BLT_BUFFER_TO_VIDEO => source_y
-                .saturating_add(height.saturating_sub(1))
-                .saturating_mul(row_px.max(1))
-                .saturating_add(source_x.saturating_add(width)),
-            BLT_VIDEO_TO_BUFFER => destination_y
-                .saturating_add(height.saturating_sub(1))
-                .saturating_mul(row_px.max(1))
-                .saturating_add(destination_x.saturating_add(width)),
+            BLT_BUFFER_TO_VIDEO => rect.buffer_pixels_needed(source_x, source_y, row_px),
+            BLT_VIDEO_TO_BUFFER => rect.buffer_pixels_needed(destination_x, destination_y, row_px),
             _ => 0,
         };
         if n == 0 {

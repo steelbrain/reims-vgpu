@@ -8,9 +8,6 @@
 pub mod abi;
 mod constants;
 pub mod error;
-mod hash;
-
-pub use hash::{hash_bytes, hash_u64};
 
 // ---------------------------------------------------------------------------
 // Apple: real Metal encode
@@ -18,6 +15,11 @@ pub use hash::{hash_bytes, hash_u64};
 
 #[cfg(target_os = "macos")]
 mod cache;
+/// Live entries in each compiled-object cache. See
+/// [`cache::cache_levels`] — re-exported because `cache` is private to this
+/// module and the census that publishes the reading is in `runtime::drain`.
+#[cfg(target_os = "macos")]
+pub(crate) use cache::cache_levels;
 #[cfg(target_os = "macos")]
 pub(crate) mod compute;
 #[cfg(target_os = "macos")]
@@ -44,4 +46,4 @@ mod stage_input;
 pub(crate) mod util;
 
 #[cfg(target_os = "macos")]
-pub use device::{system_device_name, MetalBackend, MetalRuntime};
+pub(crate) use device::MetalBackend;

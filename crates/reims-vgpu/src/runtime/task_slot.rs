@@ -34,7 +34,7 @@
 //! densely from 0, so `raw >> 1` is usually *also* live — that is a dense table,
 //! not an ambiguity, and there is nothing for a census to decide.
 
-use crate::model::TaskEntry;
+use crate::model::TaskTable;
 
 /// Which command carried the task word. Distinguishes otherwise identical
 /// decodes so a per-site set difference is possible.
@@ -78,10 +78,7 @@ impl crate::observe::Decline for TaskWordDecode {
     }
 }
 
-/// True when `id` indexes an active slot.
-fn slot_live(tasks: &[TaskEntry], id: u32) -> bool {
-    (id as usize) < tasks.len() && tasks[id as usize].active
-}
+
 
 /// Resolve the wire task word to the slot this crate will act on. **The word,
 /// or nothing.**
@@ -98,9 +95,9 @@ fn slot_live(tasks: &[TaskEntry], id: u32) -> bool {
 /// The latch is taken before the line is built. `Emit::field` renders eagerly
 /// and this sits on the command path, so building and dropping the strings on
 /// every decode would make the probe cost scale with the traffic it measures.
-pub(crate) fn resolve_task_word(tasks: &[TaskEntry], site: TaskWordSite, raw: u32) -> Option<u32> {
+pub(crate) fn resolve_task_word(tasks: &TaskTable, site: TaskWordSite, raw: u32) -> Option<u32> {
     use crate::observe::Decline;
-    if slot_live(tasks, raw) {
+    if tasks.is_active(raw) {
         return Some(raw);
     }
     let decode = TaskWordDecode::Dead;
@@ -118,10 +115,16 @@ pub(crate) fn resolve_task_word(tasks: &[TaskEntry], site: TaskWordSite, raw: u3
 mod tests {
     use super::*;
 
-    fn table(active: &[u32]) -> Vec<TaskEntry> {
-        let mut tasks = vec![TaskEntry::default(); 16];
+    fn table(active: &[u32]) -> TaskTable {
+        let mut tasks = TaskTable::default();
         for &id in active {
-            tasks[id as usize].active = true;
+            tasks.define(
+                id,
+                crate::model::TaskEntry {
+                    active: true,
+                    ..Default::default()
+                },
+            );
         }
         tasks
     }

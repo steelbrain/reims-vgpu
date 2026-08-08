@@ -35,29 +35,31 @@
 //! ask different questions, but a second copy of the opcode table is how one of
 //! them quietly stops covering a record the other learned about.
 //!
-//! Fixtures are not committed. With none present this skips and says so; set
-//! `REIMS_WIRE_FIXTURES_REQUIRED=1` (any Apple host, and CI) to make the skip a
-//! failure. Regenerate with `scripts/wire-oracle/wire-oracle.sh`.
+//! Fixtures are not committed. With none present both tests are `ignored`,
+//! decided at build time by `build.rs` — see `../../reims-vgpu-wire/oracle/
+//! fixture_presence.rs` for why that is a `cfg` and not a runtime early-return.
+//! Regenerate with `scripts/wire-oracle/wire-oracle.sh`;
+//! `REIMS_WIRE_FIXTURES_REQUIRED=1` (any Apple host, and CI) makes their
+//! absence fail the build rather than stand the tests down.
 
 use reims_vgpu::runtime::decode::{blit, compute, render};
 use serde_json::Value;
 
-fn fixtures() -> Option<Value> {
+/// Apple's captured records.
+///
+/// Only reachable when `wire_fixtures` is set, so absence here means the
+/// capture was deleted between building the test and running it.
+fn fixtures() -> Value {
     let dir = std::env::var("REIMS_WIRE_FIXTURES_DIR")
         .unwrap_or_else(|_| format!("{}/../reims-vgpu-wire/fixtures", env!("CARGO_MANIFEST_DIR")));
     let path = format!("{dir}/fixtures.json");
-    match std::fs::read_to_string(&path) {
-        Ok(s) => Some(serde_json::from_str(&s).expect("fixtures.json is valid JSON")),
-        Err(_) => {
-            let required = std::env::var("REIMS_WIRE_FIXTURES_REQUIRED").is_ok();
-            let msg = format!(
-                "no fixtures at {path}; regenerate with scripts/wire-oracle/wire-oracle.sh"
-            );
-            assert!(!required, "REIMS_WIRE_FIXTURES_REQUIRED is set but {msg}");
-            eprintln!("SKIP: {msg}");
-            None
-        }
-    }
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+        panic!(
+            "{path} was present when this test was built and is not now ({e}); \
+             regenerate with scripts/wire-oracle/wire-oracle.sh"
+        )
+    });
+    serde_json::from_str(&text).expect("fixtures.json is valid JSON")
 }
 
 fn unhex(s: &str) -> Vec<u8> {
@@ -483,8 +485,9 @@ fn carries_a_guest_opcode(selector: &str) -> bool {
 }
 
 #[test]
+#[cfg_attr(not(wire_fixtures), ignore = "run scripts/wire-oracle/wire-oracle.sh")]
 fn no_record_apples_serializer_produced_is_refused_for_its_shape() {
-    let Some(root) = fixtures() else { return };
+    let root = fixtures();
 
     let mut decoded = 0usize;
     let mut gaps: std::collections::BTreeMap<(u32, &str), usize> =
@@ -596,8 +599,9 @@ fn repaint_unwritten(bytes: &[u8], mask: &[u8], one: bool) -> Vec<u8> {
 /// that had something to poison is asserted non-zero: a mask that arrived empty
 /// would make this test pass by testing nothing.
 #[test]
+#[cfg_attr(not(wire_fixtures), ignore = "run scripts/wire-oracle/wire-oracle.sh")]
 fn no_decoder_reads_a_bit_apples_serializer_never_wrote() {
-    let Some(root) = fixtures() else { return };
+    let root = fixtures();
 
     let mut poisoned = 0usize;
     let mut fully_written = 0usize;

@@ -11,9 +11,8 @@
 //! happen now: guest runs are gathered by the CPU out of the mapped span, so
 //! there is no import to lose.
 
-use ash::vk;
 
-use super::types::TargetIdentity;
+use super::types::{ResidentReclaim, TargetIdentity};
 use crate::observe::Decline;
 
 /// A specific failure while preparing or executing a validated draw.
@@ -54,6 +53,11 @@ pub enum DrawExecutionDecline {
     SampledResidentMissing {
         binding: u32,
         identity: TargetIdentity,
+        /// What this device last did with this identity's resident, or `None`
+        /// if it has no record inside its history window. This is what separates
+        /// a resident reclaimed out from under an active reader from one the
+        /// guest never rendered into — the same log line otherwise.
+        prior: Option<ResidentReclaim>,
     },
     SampledResidentNotReady {
         binding: u32,
@@ -67,8 +71,50 @@ pub enum DrawExecutionDecline {
         resource_width: u32,
         resource_height: u32,
     },
-    UnsupportedTrackedLayout {
-        layout: vk::ImageLayout,
+    /// A staging write asked for more bytes than the slot it is writing into
+    /// holds.
+    ///
+    /// Every staging write reaches the mapped span through `staging_write_ptr`,
+    /// which has two arms. The `vkMapMemory` arm cannot exceed the allocation —
+    /// Vulkan refuses a map longer than the memory object — so for as long as
+    /// that was the only arm, the bound was the driver's and no code here had to
+    /// state it. The persistent-mapping arm is a field read and inherits no such
+    /// check, so the same call that used to fail now hands back a pointer good
+    /// for fewer bytes than the caller asked for, and the caller writes past the
+    /// slot's memory into whatever the slab put next to it.
+    ///
+    /// This is that bound written down, so both arms answer the same. It is a
+    /// device-side invariant rather than anything a guest can reach: every
+    /// caller acquires its slot for the size it is about to write.
+    StagingWriteBeyondSlot {
+        size: u64,
+        slot_size: u64,
+    },
+    /// A readback asked for more bytes than the slot it is reading from holds.
+    ///
+    /// The mirror of [`Self::StagingWriteBeyondSlot`], and the same hole in the
+    /// same shape: `read_back_slot`'s `vkMapMemory` arm is bounded by the
+    /// driver and its persistent-mapping arm is not. It is the worse of the two
+    /// to leave unchecked — the bytes past the slot belong to whatever the host
+    /// slab carved next in the shared block, and the read copies them into a
+    /// `Vec` that leaves this device.
+    ReadBackBeyondSlot {
+        len: u64,
+        slot_size: u64,
+    },
+    /// A readback lease would have been read for more bytes than the slot it
+    /// lends holds.
+    ///
+    /// The third of the family, and the one furthest from its pointer. A lease
+    /// hands a caller the slot's host address to read *after* the engine lock
+    /// is dropped, and `LeasedFrame::bytes` builds a slice of the caller's
+    /// `len` over it. Its own slug rather than
+    /// [`Self::ReadBackBeyondSlot`]'s, because `fail_once` latches per reason
+    /// and these are two checks on two rails: sharing one would silence
+    /// whichever fired second.
+    LeaseBeyondSlot {
+        len: u64,
+        slot_size: u64,
     },
 }
 
@@ -94,7 +140,9 @@ impl Decline for DrawExecutionDecline {
             Self::SampledResidentGeometryMismatch { .. } => {
                 "vk_draw_exec_sampled_resident_geometry_mismatch"
             }
-            Self::UnsupportedTrackedLayout { .. } => "vk_draw_exec_unsupported_tracked_layout",
+            Self::StagingWriteBeyondSlot { .. } => "vk_draw_exec_staging_write_beyond_slot",
+            Self::ReadBackBeyondSlot { .. } => "vk_draw_exec_read_back_beyond_slot",
+            Self::LeaseBeyondSlot { .. } => "vk_draw_exec_lease_beyond_slot",
         }
     }
 
@@ -145,8 +193,20 @@ impl Decline for DrawExecutionDecline {
                 ]);
                 fields
             }
-            Self::SampledResidentMissing { binding, identity }
-            | Self::SampledResidentNotReady { binding, identity } => {
+            Self::SampledResidentMissing {
+                binding,
+                identity,
+                prior,
+            } => {
+                let mut fields = vec![("binding", binding.to_string())];
+                fields.extend(identity_fields(identity));
+                fields.push((
+                    "prior",
+                    prior.map_or("no_record", ResidentReclaim::slug).to_string(),
+                ));
+                fields
+            }
+            Self::SampledResidentNotReady { binding, identity } => {
                 let mut fields = vec![("binding", binding.to_string())];
                 fields.extend(identity_fields(identity));
                 fields
@@ -169,9 +229,18 @@ impl Decline for DrawExecutionDecline {
                 ]);
                 fields
             }
-            Self::UnsupportedTrackedLayout { layout } => {
-                vec![("layout", format!("{layout:?}"))]
-            }
+            Self::StagingWriteBeyondSlot { size, slot_size } => vec![
+                ("size", size.to_string()),
+                ("slot_size", slot_size.to_string()),
+            ],
+            Self::ReadBackBeyondSlot { len, slot_size } => vec![
+                ("len", len.to_string()),
+                ("slot_size", slot_size.to_string()),
+            ],
+            Self::LeaseBeyondSlot { len, slot_size } => vec![
+                ("len", len.to_string()),
+                ("slot_size", slot_size.to_string()),
+            ],
         }
     }
 }
@@ -195,24 +264,30 @@ pub(super) fn identity_fields(identity: &TargetIdentity) -> Vec<(&'static str, S
             width,
             height,
             generation,
+            stencil,
         } => vec![
             ("identity_kind", "texture".into()),
             ("identity_ref", ref_.to_string()),
             ("identity_width", width.to_string()),
             ("identity_height", height.to_string()),
             ("identity_generation", generation.to_string()),
+            ("identity_stencil", u8::from(*stencil).to_string()),
         ],
         TargetIdentity::Gva {
             gva,
             width,
             height,
             generation,
+            bgra,
         } => vec![
             ("identity_kind", "gva".into()),
             ("identity_gva", format!("{gva:#x}")),
             ("identity_width", width.to_string()),
             ("identity_height", height.to_string()),
             ("identity_generation", generation.to_string()),
+            // Part of the key, so two slots at one address differ by it and a
+            // decline naming only the address would not say which.
+            ("identity_order", if *bgra { "bgra" } else { "rgba" }.into()),
         ],
         TargetIdentity::Anonymous { slot } => vec![
             ("identity_kind", "anonymous".into()),
@@ -271,6 +346,7 @@ mod tests {
             DrawExecutionDecline::SampledResidentMissing {
                 binding: 32,
                 identity: identity(),
+                prior: Some(ResidentReclaim::IdleDrained),
             },
             DrawExecutionDecline::SampledResidentNotReady {
                 binding: 32,
@@ -283,9 +359,6 @@ mod tests {
                 resident_height: 16,
                 resource_width: 64,
                 resource_height: 32,
-            },
-            DrawExecutionDecline::UnsupportedTrackedLayout {
-                layout: vk::ImageLayout::UNDEFINED,
             },
         ]
     }
@@ -309,7 +382,13 @@ mod tests {
         // between the runtime's pre-check and the bind", and guest runs are now
         // gathered by the CPU out of the mapped span, so there is no import to
         // lose and no refusal to make.
-        assert_eq!(before, 12, "the draw executor's reason census moved");
+        //
+        // Down again to 11: `*_unsupported_tracked_layout` guarded a hand-written
+        // layout-to-scope table against a layout the registry should never hold.
+        // The registry now holds a `ResidentAccess`, which has no state outside
+        // the four the device puts a resident in, so the refusal has nothing
+        // left to fire on and no arm can reach it.
+        assert_eq!(before, 11, "the draw executor's reason census moved");
         assert_eq!(before, slugs.len(), "duplicate draw-execution slug");
     }
 
@@ -347,6 +426,7 @@ mod tests {
                     width: 80,
                     height: 60,
                     generation: 11,
+                    stencil: false,
                 },
                 "texture",
                 ("identity_ref", "8"),
@@ -357,6 +437,7 @@ mod tests {
                     width: 80,
                     height: 60,
                     generation: 11,
+                    bgra: false,
                 },
                 "gva",
                 ("identity_gva", "0x1234"),

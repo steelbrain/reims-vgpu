@@ -23,6 +23,19 @@
 #                  NEW immutable snapshot and `current` is repointed to it.
 #                  Existing snapshots (incl. the base) are never touched.
 #
+# AUDIO is class-compliant USB, not HD Audio. An emulated ich9-intel-hda does
+# reach the guest's PCI bus (pci8086,293e, pciclass,040300), but QEMU's codec
+# advertises subsystem 1af4:1100 and AppleHDA binds only codecs it carries a
+# profile for, so AppleHDAController stays loaded with zero references and
+# CoreAudio enumerates no device. AppleUSBAudio ships in the guest and binds a
+# class-compliant device with no kext work, which is why this rail is USB.
+# virtio is not an option either: macOS has no virtio-sound driver.
+#
+# The audiodev is named on the device rather than left implicit — any `-audiodev`
+# on the command line clears QEMU's default-backend list, and a sound device
+# without `audiodev=` then refuses to realize ("no default audio driver
+# available"), which kills the boot before OVMF.
+#
 # Launch configuration is CLI flags / env here (this is the boot script, not
 # device/backend code) — never an env sniff inside the device.
 #
@@ -310,8 +323,8 @@ QEMU_ARGS=(
   -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE"
   -drive "if=pflash,format=raw,file=$OVMF_VARS"
   -smbios type=2
-  -device ich9-intel-hda
-  -device hda-duplex
+  -audiodev sdl,id=audio0
+  -device usb-audio,bus=xhci.0,audiodev=audio0
   -device ich9-ahci,id=sata
   -drive "id=OpenCoreBoot,if=none,format=qcow2,file=$OPENCORE"
   -device ide-hd,bus=sata.2,drive=OpenCoreBoot

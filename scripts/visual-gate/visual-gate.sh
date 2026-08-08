@@ -14,7 +14,7 @@
 # What was missing is that none of them gated anything.
 #
 # This is the one entry point. It runs all three, applies a counter budget over
-# the six silent-loss classes for its own window of the fail log, and exits
+# the eight silent-loss classes for its own window of the fail log, and exits
 # non-zero if any part failed.
 #
 #   scripts/visual-gate/visual-gate.sh [--quick] [--keep DIR] [--host GUEST]
@@ -177,14 +177,14 @@ else
   : >"$WINDOW"
 fi
 
-# The six silent-loss classes, each held to the budget `baseline.tsv` records
+# The eight silent-loss classes, each held to the budget `baseline.tsv` records
 # for it. Zero is the default and four of them keep it; the two that do not
 # carry their measurement and their argument in that file, because a non-zero
 # budget is an admission about the device rather than a setting.
 #
 # The parsing lives in its own script so `self-test.sh` can exercise it against
 # synthetic log text without a boot: a parser that matches nothing prints the
-# same six zeros a clean run does.
+# same eight zeros a clean run does.
 set +e
 "$SCRIPT_DIR/counter-budget.sh" "$WINDOW" >"$WORK/counters"
 budget_rc=$?

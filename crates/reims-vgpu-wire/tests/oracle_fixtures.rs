@@ -7,9 +7,11 @@
 //! Metal was asked for — can say the layout is right.
 //!
 //! Fixtures are not committed; regenerate with `scripts/wire-oracle/wire-oracle.sh`.
-//! With none present these tests skip and say so. Set
-//! `REIMS_WIRE_FIXTURES_REQUIRED=1` on hosts that must have them (any Apple
-//! host, and CI) to make the skip a failure instead.
+//! With none present these tests are `ignored` rather than passing — the
+//! decision is `build.rs`'s, so libtest prints one `ignored` line per test
+//! instead of 34 green ones that measured nothing. See
+//! `oracle/fixture_presence.rs`. `REIMS_WIRE_FIXTURES_REQUIRED=1` on hosts that
+//! must have them (any Apple host, and CI) makes their absence fail the build.
 
 use reims_vgpu_wire::manifest::{self, Coverage};
 use reims_vgpu_wire::op::op;
@@ -23,22 +25,30 @@ use serde_json::Value;
 /// rather than asserted, so a newer host runs the tests instead of refusing.
 const DERIVED_AGAINST_BUNDLE_VERSION: &str = "64.4.7";
 
-fn fixtures() -> Option<Value> {
+/// Apple's captured records.
+///
+/// Only reachable when `wire_fixtures` is set, so a failure to read here means
+/// the capture was deleted between building this test and running it.
+fn fixtures() -> Value {
+    read_oracle_output("fixtures.json", "")
+}
+
+/// Read one of the oracle's outputs, or say what regenerates it.
+///
+/// `build.rs` already decided this file exists — every caller sits behind the
+/// `cfg` that decision sets — so anything that goes wrong here is the capture
+/// being removed mid-run, not the ordinary fixture-less checkout.
+fn read_oracle_output(file: &str, regenerate_args: &str) -> Value {
     let dir = std::env::var("REIMS_WIRE_FIXTURES_DIR")
         .unwrap_or_else(|_| format!("{}/fixtures", env!("CARGO_MANIFEST_DIR")));
-    let path = format!("{dir}/fixtures.json");
-    match std::fs::read_to_string(&path) {
-        Ok(s) => Some(serde_json::from_str(&s).expect("fixtures.json is valid JSON")),
-        Err(_) => {
-            let required = std::env::var("REIMS_WIRE_FIXTURES_REQUIRED").is_ok();
-            let msg = format!(
-                "no fixtures at {path}; regenerate with scripts/wire-oracle/wire-oracle.sh"
-            );
-            assert!(!required, "REIMS_WIRE_FIXTURES_REQUIRED is set but {msg}");
-            eprintln!("SKIP: {msg}");
-            None
-        }
-    }
+    let path = format!("{dir}/{file}");
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+        panic!(
+            "{path} was present when this test was built and is not now ({e}); \
+             regenerate with scripts/wire-oracle/wire-oracle.sh{regenerate_args}"
+        )
+    });
+    serde_json::from_str(&text).unwrap_or_else(|e| panic!("{path} is not valid JSON: {e}"))
 }
 
 fn unhex(s: &str) -> Vec<u8> {
@@ -250,8 +260,9 @@ fn expects_wide_encoding(case: &Value) -> bool {
 }
 
 #[test]
+#[cfg_attr(not(wire_fixtures), ignore = "run scripts/wire-oracle/wire-oracle.sh")]
 fn every_texture_fixture_reads_back_what_metal_was_asked_for() {
-    let Some(root) = fixtures() else { return };
+    let root = fixtures();
 
     let got = root["provenance"]["bundle_version"].as_str().unwrap_or("?");
     if got != DERIVED_AGAINST_BUNDLE_VERSION {
@@ -500,10 +511,11 @@ fn every_texture_fixture_reads_back_what_metal_was_asked_for() {
 /// `reims-vgpu`'s heap size-and-align query as a third reader of that struct.
 /// This is what stops the three drifting.
 #[test]
+#[cfg_attr(not(wire_fixtures), ignore = "run scripts/wire-oracle/wire-oracle.sh")]
 fn the_heap_sizing_query_carries_the_texture_creation_record_minus_its_ref() {
     use reims_vgpu_wire::ops::texture;
 
-    let Some(root) = fixtures() else { return };
+    let root = fixtures();
     let cases = root["cases"].as_array().expect("cases array");
 
     let find = |name: &str| {
@@ -557,12 +569,13 @@ fn the_heap_sizing_query_carries_the_texture_creation_record_minus_its_ref() {
 }
 
 #[test]
+#[cfg_attr(not(wire_fixtures), ignore = "run scripts/wire-oracle/wire-oracle.sh")]
 fn the_texture_record_carries_no_compression_type() {
     // A measured absence, and the reason it is a test rather than a comment: a
     // later serializer that starts carrying `compressionType` would otherwise
     // add a field nothing decodes, silently. The two cases differ only in that
     // property, so any byte that moves is the property moving.
-    let Some(root) = fixtures() else { return };
+    let root = fixtures();
     let mut baseline = None;
     let mut lossy = None;
     for case in root["cases"].as_array().expect("cases array") {
@@ -598,6 +611,7 @@ fn the_texture_record_carries_no_compression_type() {
 }
 
 #[test]
+#[cfg_attr(not(wire_fixtures), ignore = "run scripts/wire-oracle/wire-oracle.sh")]
 fn the_unidentified_flag_nibble_still_reads_what_it_always_has() {
     // Bits [5:4] have never moved under any perturbation. That is a claim about
     // Apple's serializer, so it belongs here rather than in a synthesized unit
@@ -613,7 +627,7 @@ fn the_unidentified_flag_nibble_still_reads_what_it_always_has() {
     // nibble because it writes bit 7, so folding the two together would compare
     // a field to a differently-shaped one and could only ever fire on the first
     // wide case.
-    let Some(root) = fixtures() else { return };
+    let root = fixtures();
     let mut narrow = None;
     let mut wide = None;
     for case in root["cases"].as_array().expect("cases array") {
@@ -1132,8 +1146,9 @@ fn describe_holes(holes: &[(usize, u8)]) -> String {
 /// `TextureDescriptorBody`'s layout exactly, field for field, which is an
 /// independent derivation of a struct that was arrived at by perturbation.
 #[test]
+#[cfg_attr(not(wire_fixtures), ignore = "run scripts/wire-oracle/wire-oracle.sh")]
 fn the_second_texture_descriptor_layout_does_not_reach_the_wire() {
-    let Some(root) = fixtures() else { return };
+    let root = fixtures();
 
     let find = |name: &str| -> Vec<u8> {
         let case = root["cases"]
@@ -1174,8 +1189,9 @@ fn the_second_texture_descriptor_layout_does_not_reach_the_wire() {
 }
 
 #[test]
+#[cfg_attr(not(wire_fixtures), ignore = "run scripts/wire-oracle/wire-oracle.sh")]
 fn the_capability_defaults_are_recorded_and_every_one_is_off() {
-    let Some(root) = fixtures() else { return };
+    let root = fixtures();
 
     let defaults = root["capability_defaults"]
         .as_object()
@@ -1205,8 +1221,9 @@ fn the_capability_defaults_are_recorded_and_every_one_is_off() {
 }
 
 #[test]
+#[cfg_attr(not(wire_fixtures), ignore = "run scripts/wire-oracle/wire-oracle.sh")]
 fn every_fixture_carries_a_measured_written_mask() {
-    let Some(root) = fixtures() else { return };
+    let root = fixtures();
 
     // A case with no mask is a case whose two passes disagreed about something
     // other than the fill, and the oracle says which. Reported rather than
@@ -1248,8 +1265,9 @@ fn every_fixture_carries_a_measured_written_mask() {
 }
 
 #[test]
+#[cfg_attr(not(wire_fixtures), ignore = "run scripts/wire-oracle/wire-oracle.sh")]
 fn no_view_reads_a_bit_the_serializer_never_wrote() {
-    let Some(root) = fixtures() else { return };
+    let root = fixtures();
 
     // Union the measured masks per (class, record): a bit set here was written
     // by at least one fixture of that record, which is the weakest claim that
@@ -1330,11 +1348,12 @@ fn no_view_reads_a_bit_the_serializer_never_wrote() {
 }
 
 #[test]
+#[cfg_attr(not(wire_inventory), ignore = "run wire-oracle.sh --inventory")]
 fn the_selector_inventory_matches_what_the_manifest_believes() {
     // Guards against the manifest silently going stale when the host OS ships a
     // serializer with a different surface: coverage is only meaningful against
     // the right denominator.
-    let Some(root) = inventory() else { return };
+    let root = inventory();
 
     for class in root["classes"].as_array().expect("classes array") {
         let name = class["class"].as_str().expect("class name");
@@ -1375,26 +1394,14 @@ fn the_selector_inventory_matches_what_the_manifest_believes() {
     }
 }
 
-/// Read the inventory, or skip under the same rule the fixtures use.
-fn inventory() -> Option<Value> {
-    let dir = std::env::var("REIMS_WIRE_FIXTURES_DIR")
-        .unwrap_or_else(|_| format!("{}/fixtures", env!("CARGO_MANIFEST_DIR")));
-    let path = format!("{dir}/inventory.json");
-    match std::fs::read_to_string(&path) {
-        Ok(text) => Some(serde_json::from_str(&text).expect("inventory.json is valid JSON")),
-        Err(_) => {
-            let required = std::env::var("REIMS_WIRE_FIXTURES_REQUIRED").is_ok();
-            assert!(
-                !required,
-                "REIMS_WIRE_FIXTURES_REQUIRED is set but no inventory at {path}"
-            );
-            eprintln!(
-                "SKIP: no inventory at {path}; regenerate with \
-                 scripts/wire-oracle/wire-oracle.sh --inventory"
-            );
-            None
-        }
-    }
+/// The selector inventory, gated on its own `cfg`.
+///
+/// Separate from [`fixtures`] because the two outputs are regenerated by
+/// different runs of the capture: having one without the other is a normal
+/// intermediate state, and it should stand down only the tests that read the
+/// half that is missing.
+fn inventory() -> Value {
+    read_oracle_output("inventory.json", " --inventory")
 }
 
 /// The Objective-C type encoding Apple ships for one selector.
@@ -1438,11 +1445,12 @@ fn type_encoding(root: &Value, class: &str, selector: &str) -> String {
 /// encoding settles *signedness* instead, which the second half of this test
 /// uses.
 #[test]
+#[cfg_attr(not(wire_inventory), ignore = "run wire-oracle.sh --inventory")]
 fn the_type_encodings_agree_with_the_widths_the_views_read() {
     use reims_vgpu_wire::ops::render;
     use std::mem::size_of;
 
-    let Some(root) = inventory() else { return };
+    let root = inventory();
     const ENC: &str = "PGSerializerRenderCommandEncoder";
 
     for (selector, fragment, body, total) in [
@@ -1535,8 +1543,9 @@ fn the_type_encodings_agree_with_the_widths_the_views_read() {
 /// `unsupported` and fails here, and a row that quietly loses its evidence
 /// fails here too.
 #[test]
+#[cfg_attr(not(wire_fixtures), ignore = "run scripts/wire-oracle/wire-oracle.sh")]
 fn every_excluded_row_that_claims_a_refusal_still_gets_one() {
-    let Some(root) = fixtures() else { return };
+    let root = fixtures();
     let refused: std::collections::BTreeSet<&str> = root["unsupported"]
         .as_array()
         .expect("fixtures.json has no `unsupported` list; it predates schema 2, regenerate it")
@@ -1590,8 +1599,9 @@ fn every_excluded_row_that_claims_a_refusal_still_gets_one() {
 /// set; this one cannot — `getType` is silent on the blit encoder and is a
 /// selector name several classes ship.
 #[test]
+#[cfg_attr(not(wire_fixtures), ignore = "run scripts/wire-oracle/wire-oracle.sh")]
 fn every_silent_selector_is_silent_under_every_capability() {
-    let Some(root) = fixtures() else { return };
+    let root = fixtures();
 
     let set = |key: &str| -> std::collections::BTreeSet<(String, String)> {
         root[key]
@@ -1675,8 +1685,9 @@ fn every_silent_selector_is_silent_under_every_capability() {
 /// do. It is reported, because a conjunction is worth knowing about before
 /// someone spends an afternoon on the single-flag case.
 #[test]
+#[cfg_attr(not(wire_fixtures), ignore = "run scripts/wire-oracle/wire-oracle.sh")]
 fn every_capability_gated_selector_names_the_flag_that_unlocks_it() {
-    let Some(root) = fixtures() else { return };
+    let root = fixtures();
 
     let set = |key: &str| -> std::collections::BTreeSet<(String, String)> {
         root[key]
@@ -1906,8 +1917,9 @@ const KNOWN_CAPABILITY_DELTAS: &[KnownDelta] = &[
 /// that is not would mean a *conjunction* of flags changes a record, which no
 /// single-flag pass can find.
 #[test]
+#[cfg_attr(not(wire_fixtures), ignore = "run scripts/wire-oracle/wire-oracle.sh")]
 fn no_capability_changes_what_a_record_contains() {
-    let Some(root) = fixtures() else { return };
+    let root = fixtures();
 
     let deltas = root["capability_content_deltas"].as_array().expect(
         "fixtures.json has no `capability_content_deltas` list; regenerate it \
@@ -1996,8 +2008,9 @@ fn no_capability_changes_what_a_record_contains() {
 }
 
 #[test]
+#[cfg_attr(not(wire_fixtures), ignore = "run scripts/wire-oracle/wire-oracle.sh")]
 fn every_excluded_row_that_claims_silence_still_gets_it() {
-    let Some(root) = fixtures() else { return };
+    let root = fixtures();
     let silent: std::collections::BTreeSet<(&str, &str)> = root["silent"]
         .as_array()
         .expect("fixtures.json has no `silent` list; regenerate it with the current oracle")
@@ -2141,10 +2154,11 @@ fn coverage_is_reported_every_run_so_the_gap_stays_visible() {
 /// right for the crate to be usable — and it is the one that caught the 12-byte
 /// header, because these records carry no object ref to hide the boundary.
 #[test]
+#[cfg_attr(not(wire_fixtures), ignore = "run scripts/wire-oracle/wire-oracle.sh")]
 fn every_render_fixture_reads_back_what_metal_was_asked_for() {
     use reims_vgpu_wire::ops::{render, render_pass, tile};
 
-    let Some(root) = fixtures() else { return };
+    let root = fixtures();
     let mut checked = 0usize;
     let mut draw_opcodes_seen = std::collections::BTreeSet::new();
 
@@ -3353,10 +3367,11 @@ fn blit_record_len_for(opcode: u32) -> Option<u32> {
 }
 
 #[test]
+#[cfg_attr(not(wire_fixtures), ignore = "run scripts/wire-oracle/wire-oracle.sh")]
 fn every_blit_fixture_reads_back_what_metal_was_asked_for() {
     use reims_vgpu_wire::ops::blit;
 
-    let Some(root) = fixtures() else { return };
+    let root = fixtures();
     let mut checked = 0usize;
     // The `command:` argument of the three generic emitters, and the opcode
     // Apple wrote when it was passed. Collected rather than asserted per case,
@@ -3682,10 +3697,11 @@ fn check_texture_region(
 /// type from a constant, and if a future capture made them agree the derivation
 /// would be gone while every per-field assertion still passed.
 #[test]
+#[cfg_attr(not(wire_fixtures), ignore = "run scripts/wire-oracle/wire-oracle.sh")]
 fn every_segment_header_fixture_reads_back_what_the_encoder_wrote() {
     use reims_vgpu_wire::ops::segment;
 
-    let Some(root) = fixtures() else { return };
+    let root = fixtures();
     let mut by_class: std::collections::BTreeMap<&str, u8> = std::collections::BTreeMap::new();
     let mut checked = 0usize;
     let mut envelope_payloads: std::collections::BTreeSet<u64> = Default::default();
@@ -3863,10 +3879,11 @@ fn compute_record_len_for(opcode: u32) -> Option<u32> {
 }
 
 #[test]
+#[cfg_attr(not(wire_fixtures), ignore = "run scripts/wire-oracle/wire-oracle.sh")]
 fn every_compute_fixture_reads_back_what_metal_was_asked_for() {
     use reims_vgpu_wire::ops::compute;
 
-    let Some(root) = fixtures() else { return };
+    let root = fixtures();
     let mut checked = 0usize;
 
     for case in root["cases"].as_array().expect("cases array") {
@@ -4204,10 +4221,11 @@ fn expect_f64(case: &Value, key: &str) -> f64 {
 /// checked non-zero as well as equal, because a stream that declined would hand
 /// back `(nil, 0)` and produce a record that agreed with a zeroed expectation.
 #[test]
+#[cfg_attr(not(wire_fixtures), ignore = "run scripts/wire-oracle/wire-oracle.sh")]
 fn every_info_fixture_reads_back_what_metal_was_asked_for() {
     use reims_vgpu_wire::ops::info;
 
-    let Some(root) = fixtures() else { return };
+    let root = fixtures();
     let mut checked = 0usize;
     // `mapCoordinateInternal:…command:` writes its `command:` argument into the
     // opcode field, so its records carry opcodes this crate never named.
@@ -4460,10 +4478,11 @@ fn every_info_fixture_reads_back_what_metal_was_asked_for() {
 /// an object, and a manifest that gave two kinds one opcode would send a delete
 /// to the wrong table.
 #[test]
+#[cfg_attr(not(wire_fixtures), ignore = "run scripts/wire-oracle/wire-oracle.sh")]
 fn every_destroy_fixture_reads_back_the_ref_the_serializer_allocated() {
     use reims_vgpu_wire::ops::destroy;
 
-    let Some(root) = fixtures() else { return };
+    let root = fixtures();
     let mut opcodes: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
     let mut refs: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
     let mut checked = 0usize;
@@ -4544,8 +4563,9 @@ fn every_destroy_fixture_reads_back_the_ref_the_serializer_allocated() {
 /// picks one — but an opcode Apple *did* write and the row does not name is a
 /// row describing a record that is not the one the selector emits.
 #[test]
+#[cfg_attr(not(wire_fixtures), ignore = "run scripts/wire-oracle/wire-oracle.sh")]
 fn every_covered_row_lists_the_opcode_apple_wrote() {
-    let Some(root) = fixtures() else { return };
+    let root = fixtures();
 
     let mut observed: std::collections::BTreeMap<(&str, &str), std::collections::BTreeSet<u32>> =
         std::collections::BTreeMap::new();
@@ -4602,8 +4622,9 @@ fn every_covered_row_lists_the_opcode_apple_wrote() {
 /// never contain is a selector the manifest calls `Covered`, because at least
 /// one of that selector's records has no fixture behind it.
 #[test]
+#[cfg_attr(not(wire_fixtures), ignore = "run scripts/wire-oracle/wire-oracle.sh")]
 fn a_selector_whose_records_went_uncaptured_is_not_claimed_covered() {
-    let Some(root) = fixtures() else { return };
+    let root = fixtures();
     let multi: std::collections::BTreeSet<(&str, &str)> = root["multi"]
         .as_array()
         .expect("fixtures.json has no `multi` list; regenerate it with the current oracle")
@@ -4644,8 +4665,9 @@ fn a_selector_whose_records_went_uncaptured_is_not_claimed_covered() {
 /// fault as an exclusion would be claiming a measurement nobody made, and a row
 /// that claimed `Covered` would be claiming a fixture that does not exist.
 #[test]
+#[cfg_attr(not(wire_fixtures), ignore = "run scripts/wire-oracle/wire-oracle.sh")]
 fn a_selector_that_faulted_the_harness_claims_nothing() {
-    let Some(root) = fixtures() else { return };
+    let root = fixtures();
     let crashed: std::collections::BTreeSet<(&str, &str)> = root["crashed"]
         .as_array()
         .expect("fixtures.json has no `crashed` list; regenerate it with the current oracle")
@@ -4678,10 +4700,11 @@ fn a_selector_that_faulted_the_harness_claims_nothing() {
 }
 
 #[test]
+#[cfg_attr(not(wire_fixtures), ignore = "run scripts/wire-oracle/wire-oracle.sh")]
 fn every_sampler_fixture_reads_back_what_metal_was_asked_for() {
     use reims_vgpu_wire::ops::sampler::{self, new_sampler};
 
-    let Some(root) = fixtures() else { return };
+    let root = fixtures();
     let mut checked = 0usize;
     for case in root["cases"].as_array().expect("cases array") {
         let name = case["name"].as_str().expect("case name");
@@ -4802,10 +4825,11 @@ fn every_sampler_fixture_reads_back_what_metal_was_asked_for() {
 }
 
 #[test]
+#[cfg_attr(not(wire_fixtures), ignore = "run scripts/wire-oracle/wire-oracle.sh")]
 fn every_depth_stencil_fixture_reads_back_what_metal_was_asked_for() {
     use reims_vgpu_wire::ops::depth_stencil::{self, new_depth_stencil};
 
-    let Some(root) = fixtures() else { return };
+    let root = fixtures();
     let mut checked = 0usize;
     for case in root["cases"].as_array().expect("cases array") {
         let name = case["name"].as_str().expect("case name");
@@ -4898,11 +4922,12 @@ fn every_depth_stencil_fixture_reads_back_what_metal_was_asked_for() {
 }
 
 #[test]
+#[cfg_attr(not(wire_fixtures), ignore = "run scripts/wire-oracle/wire-oracle.sh")]
 fn a_nil_stencil_face_produces_the_record_a_default_one_does() {
     // The negative result behind `unidentified_state_bits`, kept as a test so
     // the experiment is not re-run by hand. If a later Metal stops substituting
     // a default face, these records diverge and the two bits become derivable.
-    let Some(root) = fixtures() else { return };
+    let root = fixtures();
     let mut by_name = std::collections::BTreeMap::new();
     for case in root["cases"].as_array().expect("cases array") {
         by_name.insert(case["name"].as_str().expect("case name"), case);
@@ -4944,10 +4969,11 @@ fn a_nil_stencil_face_produces_the_record_a_default_one_does() {
 }
 
 #[test]
+#[cfg_attr(not(wire_fixtures), ignore = "run scripts/wire-oracle/wire-oracle.sh")]
 fn the_fence_fixture_is_a_header_and_the_ref_the_serializer_allocated() {
     use reims_vgpu_wire::ops::fence::{self, new_fence};
 
-    let Some(root) = fixtures() else { return };
+    let root = fixtures();
     let mut checked = 0usize;
     for case in root["cases"].as_array().expect("cases array") {
         let name = case["name"].as_str().expect("case name");
@@ -4986,10 +5012,11 @@ fn the_fence_fixture_is_a_header_and_the_ref_the_serializer_allocated() {
 }
 
 #[test]
+#[cfg_attr(not(wire_fixtures), ignore = "run scripts/wire-oracle/wire-oracle.sh")]
 fn every_heap_texture_fixture_reads_back_what_metal_was_asked_for() {
     use reims_vgpu_wire::ops::heap_texture::{self, new_heap_texture};
 
-    let Some(root) = fixtures() else { return };
+    let root = fixtures();
     let mut checked = 0usize;
     let mut saw_both_flags = (false, false);
     for case in root["cases"].as_array().expect("cases array") {
@@ -5128,10 +5155,11 @@ fn every_heap_texture_fixture_reads_back_what_metal_was_asked_for() {
 }
 
 #[test]
+#[cfg_attr(not(wire_fixtures), ignore = "run scripts/wire-oracle/wire-oracle.sh")]
 fn every_texture_view_fixture_reads_back_what_metal_was_asked_for() {
     use reims_vgpu_wire::ops::texture_view as tv;
 
-    let Some(root) = fixtures() else { return };
+    let root = fixtures();
     let mut seen: std::collections::BTreeSet<u32> = Default::default();
     for case in root["cases"].as_array().expect("cases array") {
         let name = case["name"].as_str().expect("case name");
@@ -5299,10 +5327,11 @@ fn assert_ranges(
 }
 
 #[test]
+#[cfg_attr(not(wire_fixtures), ignore = "run scripts/wire-oracle/wire-oracle.sh")]
 fn every_backed_texture_fixture_reads_back_what_metal_was_asked_for() {
     use reims_vgpu_wire::ops::backed_texture as bt;
 
-    let Some(root) = fixtures() else { return };
+    let root = fixtures();
     let mut buffer_cases = 0usize;
     let mut planes: std::collections::BTreeSet<u64> = Default::default();
 
@@ -5503,10 +5532,11 @@ fn assert_desc(case: &Value, name: &str, d: &reims_vgpu_wire::ops::texture::Text
 /// throughout: a 4x3 layer inside a 320x200 screen cannot have its width read
 /// as its height, or either read as the layer count.
 #[test]
+#[cfg_attr(not(wire_fixtures), ignore = "run scripts/wire-oracle/wire-oracle.sh")]
 fn every_rate_map_fixture_reads_back_what_metal_was_asked_for() {
     use reims_vgpu_wire::ops::rate_map;
 
-    let Some(root) = fixtures() else { return };
+    let root = fixtures();
     let mut checked = 0usize;
     let mut lengths: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
 
@@ -5641,10 +5671,11 @@ fn every_rate_map_fixture_reads_back_what_metal_was_asked_for() {
 /// stated as a test because a future serializer that starts carrying it would
 /// otherwise be a silent contract change.
 #[test]
+#[cfg_attr(not(wire_fixtures), ignore = "run scripts/wire-oracle/wire-oracle.sh")]
 fn every_icb_fixture_reads_back_what_metal_was_asked_for() {
     use reims_vgpu_wire::ops::icb;
 
-    let Some(root) = fixtures() else { return };
+    let root = fixtures();
     let mut checked = 0usize;
     let mut refs: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
     let mut unidentified: Option<u16> = None;
@@ -5833,10 +5864,11 @@ fn every_icb_fixture_reads_back_what_metal_was_asked_for() {
 /// who took this for a cap on how many entries may be bound would size the
 /// table at 20 for a range of 20 and read twelve entries of whatever followed.
 #[test]
+#[cfg_attr(not(wire_fixtures), ignore = "run scripts/wire-oracle/wire-oracle.sh")]
 fn a_plural_bind_is_truncated_at_the_argument_table_size() {
     use reims_vgpu_wire::ops::bind_limit;
 
-    let Some(root) = fixtures() else { return };
+    let root = fixtures();
     let cases = root["cases"].as_array().expect("cases array");
 
     // Each case names the class it exercises and the limit that class stops at.

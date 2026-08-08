@@ -9,7 +9,7 @@ use crate::backend::metal::constants::{
     MTL_BUFFER_LAYOUT_STRIDE_DYNAMIC, REIMS_VGPU_METAL_MAX_ATTRS, REIMS_VGPU_METAL_MAX_BUFFERS,
 };
 use crate::backend::metal::mtl_enum;
-use crate::backend::metal::util::{set_err, ErrOut, Status};
+use crate::backend::metal::util::{set_err, valid_buffer_binding, ErrOut, Status};
 use metal::{MTLAttributeFormat, StageInputOutputDescriptor};
 
 // Apple Metal.framework MTLStepFunction raw values (MTLStageInputOutputDescriptor.h).
@@ -22,7 +22,7 @@ const MTL_STEP_THREAD_POS_IN_GRID_Y: u32 = 6;
 const MTL_STEP_THREAD_POS_IN_GRID_X_INDEXED: u32 = 7;
 const MTL_STEP_THREAD_POS_IN_GRID_Y_INDEXED: u32 = 8;
 
-pub fn step_supported(step_function: u32) -> bool {
+pub const fn step_supported(step_function: u32) -> bool {
     matches!(
         step_function,
         MTL_STEP_THREAD_POS_IN_GRID_X
@@ -32,12 +32,49 @@ pub fn step_supported(step_function: u32) -> bool {
     )
 }
 
-pub fn step_indexed(step_function: u32) -> bool {
+pub const fn step_indexed(step_function: u32) -> bool {
     matches!(
         step_function,
         MTL_STEP_THREAD_POS_IN_GRID_X_INDEXED | MTL_STEP_THREAD_POS_IN_GRID_Y_INDEXED
     )
 }
+
+// The two lists of `MTLStepFunction` in this crate, related.
+//
+// `make_compute_stage_input_descriptor` runs `step_supported` and then converts
+// through [`mtl_enum::step_function`], and it carries a distinct refusal
+// (`metal_stage_input_step_function_unconvertible`) for the case where the first
+// admits an ordinal the second cannot convert — a divergence between two lists
+// of one enum rather than a guest sending something unsupported. That refusal is
+// a healthy-zero alarm and stays, because the conversion returns an `Option` and
+// something must handle `None`. But the property it watches for does not need a
+// boot to observe: both functions are `const`, so the implication is decidable
+// here, on every arm that compiles the file.
+//
+// The four ordinals above are Apple's, read off `MTLStageInputOutputDescriptor.h`
+// because `metal` 0.33's names for them are wrong. Nothing else in the tree
+// relates them to `STEP_FUNCTION_BY_ORDINAL`, which is indexed by those same
+// Apple numbers — so an edit to that table's length or contents could move the
+// convertible set out from under this one silently.
+//
+// Swept past the top of the enum rather than over the four: the implication is
+// what is being pinned, and a fifth ordinal added to `step_supported` without a
+// table entry is exactly the mistake it exists to catch.
+const _: () = {
+    let mut ordinal = 0u32;
+    while ordinal <= 64 {
+        assert!(
+            !step_supported(ordinal) || mtl_enum::step_function(ordinal).is_some(),
+            "step_supported admits a step function mtl_enum cannot convert",
+        );
+        assert!(
+            !step_indexed(ordinal) || step_supported(ordinal),
+            "an indexed step function must be a supported one",
+        );
+        ordinal += 1;
+    }
+    assert!(!step_supported(u32::MAX));
+};
 
 pub fn has_indexed_layout(stage_input: Option<&ReimsVgpuComputeStageInputDescriptor>) -> bool {
     let Some(stage_input) = stage_input else {
@@ -104,7 +141,7 @@ pub fn make_compute_stage_input_descriptor(
 
     for i in 0..stage_input.layout_count as usize {
         let layout = &stage_input.layouts[i];
-        if layout.buffer_index as usize >= REIMS_VGPU_METAL_MAX_BUFFERS {
+        if !valid_buffer_binding(layout.buffer_index) {
             set_err(
                 err,
                 format!(
@@ -158,6 +195,14 @@ pub fn make_compute_stage_input_descriptor(
         // `step_supported` above already narrows to the four compute forms, so
         // this cannot be `None`; it is converted rather than transmuted so the
         // two are not a cross-function soundness invariant.
+        //
+        // Its own slug, and not the one that guard uses: the two ask different
+        // questions and this one firing means they *disagree* — an ordinal
+        // `step_supported` admitted that `mtl_enum`'s table cannot convert,
+        // which is a divergence between two lists of the same enum rather than
+        // a guest sending something unsupported. Sharing a slug with the guard
+        // also shared `fail_once`'s latch, so whichever fired first silenced the
+        // other for that pipeline.
         let Some(step) = mtl_enum::step_function(layout.step_function) else {
             set_err(
                 err,
@@ -166,8 +211,10 @@ pub fn make_compute_stage_input_descriptor(
                     layout.step_function
                 ),
             );
-            return Err(Status::args("metal_stage_input_step_function_unsupported")
-                .field("step", layout.step_function));
+            return Err(
+                Status::args("metal_stage_input_step_function_unconvertible")
+                    .field("step", layout.step_function),
+            );
         };
         metal_layout.set_step_function(step);
         metal_layout.set_step_rate(layout.step_rate as u64);
@@ -186,7 +233,7 @@ pub fn make_compute_stage_input_descriptor(
             return Err(Status::args("metal_stage_input_index_type_unsupported")
                 .field("index_type", stage_input.index_type));
         };
-        if stage_input.index_buffer_index as usize >= REIMS_VGPU_METAL_MAX_BUFFERS {
+        if !valid_buffer_binding(stage_input.index_buffer_index) {
             set_err(
                 err,
                 format!(
@@ -228,7 +275,7 @@ pub fn make_compute_stage_input_descriptor(
             return Err(Status::args("metal_stage_input_attribute_duplicate")
                 .field("location", attr.location));
         }
-        if attr.buffer_index as usize >= REIMS_VGPU_METAL_MAX_BUFFERS {
+        if !valid_buffer_binding(attr.buffer_index) {
             set_err(
                 err,
                 format!(

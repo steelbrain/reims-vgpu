@@ -39,11 +39,25 @@ struct ThrashState {
     stale_online_logged: bool,
 }
 
-/// Which multi-RT build check bailed, degrading the draw to single-RT.
+/// Which multi-RT build check refused a secondary attachment on the Vulkan arm.
 ///
-/// The driving case is a vibrancy tile whose slot-1 RG16Float coverage mask is
-/// dropped: a later material draw samples that mask GVA, finds no rendered
-/// resident, and reads zero alpha — the see-through frosted-material class.
+/// The driving case is a vibrancy tile whose slot-1 RG16Float coverage mask
+/// cannot be built: a later material draw samples that mask GVA, and if the
+/// draw had run without the attachment it would find no rendered resident and
+/// read zero alpha — the see-through frosted-material class.
+///
+/// **This used to degrade the draw to single-RT and execute it**, which is why
+/// the class above was reachable. It now refuses the whole draw through
+/// [`crate::backend::vulkan::engine::DrawPreparationDecline::SecondaryTargetUnbuildable`],
+/// so a guest that asks for N render targets never gets 1 without being told.
+/// What settled it was the other arm: `backend::metal::render` attaches every
+/// entry of the same colour list by its own slot number, so Metal already
+/// rendered what Vulkan was dropping, and the divergence — not a fresh argument
+/// about what Vulkan ought to do — is the finding.
+///
+/// The reasons are still reported through [`note_secondary_mrt_drop`] as well
+/// as carried in the refusal, because the census answers a question the decline
+/// cannot: which check bails, at what geometry, across a whole boot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MrtDrop {
     /// The requested slots are not a contiguous run from 0.
@@ -56,6 +70,20 @@ pub enum MrtDrop {
     NoIdentity,
     /// The secondary resolves to the primary's own resident.
     AliasesPrimary,
+}
+
+/// Which secondary colour attachment this device could not build, and why.
+///
+/// A type rather than a `(u32, MrtDrop)` pair because both halves travel
+/// together from the producer to the refusal that names them, and the slot is
+/// the field a reader needs first: `mrt_drop_geometry_mismatch` says what
+/// failed and `slot=1` says which attachment of the guest's list it was.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SecondaryMrtRefusal {
+    /// The Metal colour-attachment slot the guest named for this attachment.
+    pub slot: u32,
+    /// Which build check refused it.
+    pub reason: MrtDrop,
 }
 
 impl crate::observe::Decline for MrtDrop {
@@ -107,7 +135,7 @@ static STATE: Mutex<ThrashState> = Mutex::new(ThrashState::new());
 ///
 /// `reason` is a stable slug for WHICH build check bailed; deduped on
 /// `(reason, w, h)` so it fires once per distinct combination per boot (never per
-/// frame). Runs on the render/drain worker (metal_draw), never the QEMU main loop.
+/// frame). Runs on the render/drain worker (`runtime::draw`), never the QEMU main loop.
 /// Measure-only — it does NOT change the fallback behavior, only reports it.
 pub fn note_secondary_mrt_drop(reason: MrtDrop, width: u32, height: u32) {
     let mut st = STATE.lock().unwrap_or_else(|e| e.into_inner());

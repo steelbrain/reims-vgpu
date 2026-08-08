@@ -98,10 +98,24 @@ impl ComputeSession {
             } else {
                 MTLDispatchType::Serial
             };
-            let command_buffer = queue.new_command_buffer().to_owned();
-            let encoder = command_buffer
-                .compute_command_encoder_with_dispatch_type(metal_dt)
-                .to_owned();
+            let Some(command_buffer) = crate::backend::metal::raw_metal::new_command_buffer(&queue)
+            else {
+                return Err(ComputeStatus::MetalFailed(
+                    "compute_session_command_buffer_unavailable",
+                ));
+            };
+            let command_buffer = command_buffer.to_owned();
+            let Some(encoder) =
+                crate::backend::metal::raw_metal::new_compute_command_encoder_with_dispatch_type(
+                    &command_buffer,
+                    metal_dt,
+                )
+            else {
+                return Err(ComputeStatus::MetalFailed(
+                    "compute_session_encoder_unavailable",
+                ));
+            };
+            let encoder = encoder.to_owned();
             Ok(Self {
                 device: device.to_owned(),
                 command_buffer,
@@ -153,11 +167,17 @@ impl ComputeSession {
                     0,
                     end as usize,
                 )?;
-                let mtl = this.device.new_buffer_with_data(
-                    bytes.as_ptr() as *const _,
-                    bytes.len() as u64,
-                    MTLResourceOptions::StorageModeShared,
-                );
+                let mtl = unsafe {
+                    crate::backend::metal::raw_metal::new_buffer_with_data(
+                        &this.device,
+                        bytes.as_ptr() as *const _,
+                        bytes.len() as u64,
+                        MTLResourceOptions::StorageModeShared,
+                    )
+                }
+                .ok_or(ComputeStatus::MetalFailed(
+                    "compute_session_control_buffer_alloc_failed",
+                ))?;
                 this.retained.push(mtl.clone());
                 Ok((mtl, offset))
             };
@@ -280,7 +300,6 @@ impl ComputeSession {
             use crate::runtime::compute_exec::read_buffer_window;
             use crate::runtime::icb::{
                 export_icb_writeback_job, fill_icb_from_command_memory, resolve_metal_icb,
-                IcbStatus,
             };
             use metal::MTLResourceOptions;
 
@@ -302,12 +321,15 @@ impl ComputeSession {
                         return ComputeStatus::Unsupported("icb_range_exceeds_size");
                     }
                     // Buffer-backed fills: re-decode guest ICB command memory into host slots.
-                    // Missing command memory is ok (empty ICB / host-API fills already applied).
-                    match fill_icb_from_command_memory(state, host, task_id, icb_ref, loc, len) {
-                        // `Missing` here is the empty-shell case the comment
-                        // above describes, so it stays control flow and out of
-                        // the log; everything else forwards its own reason.
-                        Ok(()) | Err(IcbStatus::Missing(_)) => {}
+                    // `icb_fill_outcome` owns what an unfilled ICB costs and
+                    // which outcomes an execute carries on from; the render arm
+                    // in `runtime::draw::metal_icb` asks the same function.
+                    match crate::runtime::icb::icb_fill_outcome(
+                        fill_icb_from_command_memory(state, host, task_id, icb_ref, loc, len),
+                        task_id,
+                        icb_ref,
+                    ) {
+                        Ok(()) => {}
                         Err(e) => return e.into(),
                     }
                     // Parent-encoder inheritance after slot fill, before execute
@@ -347,11 +369,18 @@ impl ComputeSession {
                         Ok(b) => b,
                         Err(e) => return e,
                     };
-                    let mtl = self.device.new_buffer_with_data(
-                        raw.as_ptr() as *const _,
-                        raw.len() as u64,
-                        MTLResourceOptions::StorageModeShared,
-                    );
+                    let Some(mtl) = (unsafe {
+                        crate::backend::metal::raw_metal::new_buffer_with_data(
+                            &self.device,
+                            raw.as_ptr() as *const _,
+                            raw.len() as u64,
+                            MTLResourceOptions::StorageModeShared,
+                        )
+                    }) else {
+                        return ComputeStatus::MetalFailed(
+                            "compute_session_icb_buffer_alloc_failed",
+                        );
+                    };
                     self.retained.push(mtl.clone());
                     // Indirect range size unknown until GPU reads it — apply inheritance
                     // with parent-encoder binds only (no ICB slot patch of AB buffer).
@@ -532,9 +561,8 @@ fn apply_icb_compute_encoder_inheritance<M: HostMemory + HostOps>(
     range_length: u64,
 ) -> Result<Option<compute_exec::NestedDispatchJob>, ComputeStatus> {
     use crate::backend::metal::abi::{
-        ReimsVgpuComputeSampledImage, ReimsVgpuSampler, ReimsVgpuStorageImage,
-        REIMS_VGPU_BINDING_SAMPLER_BASE, REIMS_VGPU_BINDING_TEXTURE_BASE,
-        REIMS_VGPU_COMPUTE_TEXTURE_ACCESS_READ, REIMS_VGPU_COMPUTE_TEXTURE_ACCESS_READ_WRITE,
+        texture_binds_as_storage, ReimsVgpuSampler, REIMS_VGPU_BINDING_SAMPLER_BASE,
+        REIMS_VGPU_BINDING_TEXTURE_BASE,
     };
     use crate::backend::metal::compute::{
         bind_compute_sampled_images, bind_compute_samplers, bind_storage_images,
@@ -547,16 +575,18 @@ fn apply_icb_compute_encoder_inheritance<M: HostMemory + HostOps>(
     };
     use crate::backend::metal::runtime::new_buffer_from_host;
     use crate::backend::metal::samplers::make_explicit_sampler;
-    use crate::backend::metal::util::{image_len, valid_buffer_binding};
+    use crate::backend::metal::util::valid_buffer_binding;
     use crate::contract::endian::ld32;
+    use crate::contract::extent::tight_image_bytes;
     use crate::runtime::compute_exec::{
-        load_compute_pipeline, load_mtlb, nested_job_from_icb_resources, stage_buffer,
+        load_compute_pipeline, nested_job_from_icb_resources, split_staged_textures, stage_buffer,
         stage_texture_raw,
     };
     use crate::runtime::decode::resource::{
         decode_sampler_descriptor, OBJECT_TYPE_TYPE7, TYPE7_OBJECT_SAMPLER,
     };
     use crate::runtime::icb::new_icb_compute_pso;
+    use crate::runtime::mtlb::{load_mtlb, AirLoadRail};
     use crate::runtime::objects;
     use metal::{
         MTLRegion, MTLResourceUsage, MTLStorageMode, MTLTextureType, MTLTextureUsage,
@@ -573,8 +603,14 @@ fn apply_icb_compute_encoder_inheritance<M: HostMemory + HostOps>(
         let pipeline = load_compute_pipeline(state, host, task_id, acc.pipeline_ref).ok_or(
             ComputeStatus::MissingPipeline("compute_icb_inherit_pipeline_load"),
         )?;
-        let mtlb = load_mtlb(state, host, task_id, pipeline.kernel_func_ref)
-            .ok_or(ComputeStatus::MissingMtlb("compute_icb_inherit_mtlb_load"))?;
+        let mtlb = load_mtlb(
+            state,
+            host,
+            task_id,
+            pipeline.kernel_func_ref,
+            AirLoadRail::Compute,
+        )
+        .ok_or(ComputeStatus::MissingMtlb("compute_icb_inherit_mtlb_load"))?;
         let pso = new_icb_compute_pso(&session.device, &mtlb).map_err(ComputeStatus::from)?;
         session.encoder.set_compute_pipeline_state(&pso);
         session.retained_psos.push(pso);
@@ -598,8 +634,9 @@ fn apply_icb_compute_encoder_inheritance<M: HostMemory + HostOps>(
             //
             // The three sibling bind paths all gate on this limit already: direct
             // compute through `valid_buffer_binding`, and both render paths
-            // (direct draw and ICB inheritance) through `MAX_BIND_SLOTS`, which is
-            // the same 31. This path had no device-limit gate at all — only the
+            // (direct draw and ICB inheritance) through
+            // `draw::MAX_BUFFER_BIND_SLOTS`, which a `const` assertion beside
+            // `REIMS_VGPU_METAL_MAX_BUFFERS` pins equal to it. This path had no device-limit gate at all — only the
             // descriptor check below, which the guest disables outright by leaving
             // `max_kernel_buffer_bind_count` at 0.
             if !valid_buffer_binding(b.index) {
@@ -655,9 +692,16 @@ fn apply_icb_compute_encoder_inheritance<M: HostMemory + HostOps>(
         let pipeline = load_compute_pipeline(state, host, task_id, acc.pipeline_ref).ok_or(
             ComputeStatus::MissingPipeline("compute_icb_inherit_tex_pipeline_load"),
         )?;
-        let mtlb = load_mtlb(state, host, task_id, pipeline.kernel_func_ref).ok_or(
-            ComputeStatus::MissingMtlb("compute_icb_inherit_tex_mtlb_load"),
-        )?;
+        let mtlb = load_mtlb(
+            state,
+            host,
+            task_id,
+            pipeline.kernel_func_ref,
+            AirLoadRail::Compute,
+        )
+        .ok_or(ComputeStatus::MissingMtlb(
+            "compute_icb_inherit_tex_mtlb_load",
+        ))?;
 
         let library = session
             .device
@@ -714,17 +758,7 @@ fn apply_icb_compute_encoder_inheritance<M: HostMemory + HostOps>(
                 let staged =
                     stage_texture_raw(state, host, task_id, st.texture_ref, binding, is_storage)?;
                 // Materialize Metal texture (not set_texture on encoder — only AB).
-                let Some(selector) = staged.storage_selector else {
-                    crate::observe::fail(format!(
-                        "compute_icb_texture fail reason=metal_selector_missing task={task_id} pipe={} bind={} ref={} fmt={:#x} storage={}",
-                        acc.pipeline_ref,
-                        binding,
-                        st.texture_ref,
-                        staged.pixel_format,
-                        is_storage as u8
-                    ));
-                    return Err(ComputeStatus::Unsupported("icb_texture_selector_missing"));
-                };
+                let selector = staged.storage_selector_or_refuse(task_id, acc.pipeline_ref)?;
                 let Some((pixel_format, bpp)) = storage_image_format(selector) else {
                     crate::observe::fail(format!(
                         "compute_icb_texture fail reason=metal_selector_unsupported task={task_id} pipe={} bind={} ref={} fmt={:#x} selector={selector}",
@@ -734,7 +768,7 @@ fn apply_icb_compute_encoder_inheritance<M: HostMemory + HostOps>(
                         "icb_texture_selector_unsupported",
                     ));
                 };
-                let Some(expected_len) = image_len(staged.width, staged.height, bpp) else {
+                let Some(expected_len) = tight_image_bytes(staged.width, staged.height, bpp) else {
                     return Err(ComputeStatus::Unsupported("icb_texture_image_len_overflow"));
                 };
                 if staged.bytes.len() < expected_len {
@@ -751,7 +785,10 @@ fn apply_icb_compute_encoder_inheritance<M: HostMemory + HostOps>(
                     usage |= MTLTextureUsage::ShaderWrite;
                 }
                 td.set_usage(usage);
-                let tex = session.device.new_texture(&td);
+                let tex = crate::backend::metal::raw_metal::new_texture(&session.device, &td)
+                    .ok_or(ComputeStatus::MetalFailed(
+                        "compute_session_inherit_texture_alloc_failed",
+                    ))?;
                 let region = MTLRegion {
                     origin: metal::MTLOrigin { x: 0, y: 0, z: 0 },
                     size: metal::MTLSize {
@@ -784,27 +821,31 @@ fn apply_icb_compute_encoder_inheritance<M: HostMemory + HostOps>(
             // Samplers for AB.
             let mut mtl_samps: Vec<metal::SamplerState> = Vec::new();
             for s in &stream_samp {
-                let entry = objects::lookup_list_entry(state, host, task_id, s.sampler_ref).ok_or(
-                    ComputeStatus::MissingSampler("compute_icb_inherit_ab_sampler_no_entry"),
-                )?;
-                if entry.object_type != OBJECT_TYPE_TYPE7 {
-                    return Err(ComputeStatus::MissingSampler(
-                        "compute_icb_inherit_ab_sampler_wrong_type",
-                    ));
-                }
-                let desc_bytes = objects::read_descriptor(state, host, task_id, &entry).ok_or(
-                    ComputeStatus::MissingSampler("compute_icb_inherit_ab_sampler_no_desc"),
-                )?;
+                let (_entry, desc_bytes) = objects::resolve_descriptor(
+                    state,
+                    host,
+                    task_id,
+                    s.sampler_ref,
+                    &[OBJECT_TYPE_TYPE7],
+                )
+                .map_err(|rung| {
+                    ComputeStatus::MissingSampler(crate::observe::ladder_slugs!(
+                        "compute_icb_inherit_ab_sampler"
+                    )(rung))
+                })?;
                 if desc_bytes.len() < 4 || ld32(&desc_bytes) != TYPE7_OBJECT_SAMPLER {
                     return Err(ComputeStatus::MissingSampler(
                         "compute_icb_inherit_ab_sampler_bad_tag",
                     ));
                 }
                 let sd = decode_sampler_descriptor(&desc_bytes).map_err(|_| {
-                    ComputeStatus::MissingSampler("compute_icb_inherit_ab_sampler_decode")
+                    ComputeStatus::MissingSampler(crate::observe::ladder_slug!(
+                        "compute_icb_inherit_ab_sampler",
+                        desc_decode
+                    ))
                 })?;
                 // AB-resident samplers must support argument buffers.
-                let reims_vgpu = crate::runtime::metal_draw::sampler_record(
+                let reims_vgpu = crate::runtime::draw::sampler_record(
                     REIMS_VGPU_BINDING_SAMPLER_BASE + s.index,
                     &sd,
                     s.has_lod_clamp.then_some((s.lod_min_bits, s.lod_max_bits)),
@@ -821,16 +862,27 @@ fn apply_icb_compute_encoder_inheritance<M: HostMemory + HostOps>(
             }
 
             // Encode argument buffer.
-            let arg_enc = function.new_argument_encoder(ab_layout.buffer_index);
+            let arg_enc = crate::backend::metal::raw_metal::new_argument_encoder(
+                &function,
+                ab_layout.buffer_index,
+            )
+            .ok_or(ComputeStatus::MetalFailed(
+                "compute_session_argument_encoder_unavailable",
+            ))?;
             let ab_len = arg_enc.encoded_length();
             if ab_len == 0 {
                 return Err(ComputeStatus::MetalFailed(
                     "compute_icb_inherit_ab_zero_len",
                 ));
             }
-            let ab = session
-                .device
-                .new_buffer(ab_len, metal::MTLResourceOptions::StorageModeShared);
+            let ab = crate::backend::metal::raw_metal::new_buffer(
+                &session.device,
+                ab_len,
+                metal::MTLResourceOptions::StorageModeShared,
+            )
+            .ok_or(ComputeStatus::MetalFailed(
+                "compute_session_argument_buffer_alloc_failed",
+            ))?;
             arg_enc.set_argument_buffer(&ab, 0);
             for (tex, abm) in mtl_texs.iter().zip(ab_layout.textures.iter()) {
                 arg_enc.set_texture(abm.argument_index, tex.as_ref());
@@ -865,42 +917,21 @@ fn apply_icb_compute_encoder_inheritance<M: HostMemory + HostOps>(
         } else {
             // --- Direct encoder binds (non-AB kernels; ICB-capable buffer-only PSO) ---
             if !acc.textures.is_empty() {
-                let mut usages = vec![
-                    crate::backend::metal::abi::ReimsVgpuComputeTextureUsage {
-                        binding: 0,
-                        access: 0,
-                    };
-                    32
-                ];
-                let mut usage_count = 0usize;
                 let mut err_buf = [0i8; 256];
-                let st = reflect_compute_textures_mtlb(
+                let usages = match reflect_compute_textures_mtlb(
                     &mtlb,
-                    usages.as_mut_ptr(),
-                    usages.len(),
-                    &mut usage_count,
                     (err_buf.as_mut_ptr(), err_buf.len()),
-                );
-                if !st.is_ok() {
-                    return Err(ComputeStatus::MetalBackend(st));
-                }
-                usages.truncate(usage_count);
-                let access_for = |binding: u32| -> Option<u32> {
-                    usages
-                        .iter()
-                        .find(|u| u.binding == binding)
-                        .map(|u| u.access)
+                ) {
+                    Ok(u) => u,
+                    Err(st) => return Err(ComputeStatus::MetalBackend(st)),
                 };
-
                 let mut staged_tex = Vec::new();
                 for t in &acc.textures {
                     if t.texture_ref == 0 {
                         continue;
                     }
                     let binding = REIMS_VGPU_BINDING_TEXTURE_BASE + t.index;
-                    let access =
-                        access_for(binding).unwrap_or(REIMS_VGPU_COMPUTE_TEXTURE_ACCESS_READ_WRITE);
-                    let is_storage = access != REIMS_VGPU_COMPUTE_TEXTURE_ACCESS_READ;
+                    let is_storage = texture_binds_as_storage(&usages, binding);
                     staged_tex.push(stage_texture_raw(
                         state,
                         host,
@@ -911,41 +942,8 @@ fn apply_icb_compute_encoder_inheritance<M: HostMemory + HostOps>(
                     )?);
                 }
 
-                let mut storage: Vec<ReimsVgpuStorageImage> = Vec::new();
-                let mut sampled: Vec<ReimsVgpuComputeSampledImage> = Vec::new();
-                for t in &mut staged_tex {
-                    let Some(selector) = t.storage_selector else {
-                        crate::observe::fail(format!(
-                            "compute_icb_texture fail reason=metal_selector_missing task={task_id} pipe={} bind={} fmt={:#x} storage={}",
-                            acc.pipeline_ref,
-                            t.binding,
-                            t.pixel_format,
-                            t.is_storage as u8
-                        ));
-                        return Err(ComputeStatus::Unsupported("icb_storage_selector_missing"));
-                    };
-                    if t.is_storage {
-                        storage.push(ReimsVgpuStorageImage {
-                            binding: t.binding,
-                            format: selector,
-                            width: t.width,
-                            height: t.height,
-                            data: t.bytes.as_mut_ptr(),
-                            len: t.bytes.len(),
-                        });
-                    } else {
-                        sampled.push(ReimsVgpuComputeSampledImage {
-                            binding: t.binding,
-                            format: selector,
-                            width: t.width,
-                            height: t.height,
-                            data: t.bytes.as_mut_ptr(),
-                            len: t.bytes.len(),
-                            has_swizzle: 0,
-                            swizzle: [0; 4],
-                        });
-                    }
-                }
+                let (mut storage, sampled) =
+                    split_staged_textures(&mut staged_tex, task_id, acc.pipeline_ref)?;
 
                 let mut err_buf = [0i8; 256];
                 let err = (err_buf.as_mut_ptr(), err_buf.len());
@@ -997,27 +995,30 @@ fn apply_icb_compute_encoder_inheritance<M: HostMemory + HostOps>(
                     if s.sampler_ref == 0 {
                         continue;
                     }
-                    let entry = objects::lookup_list_entry(state, host, task_id, s.sampler_ref)
-                        .ok_or(ComputeStatus::MissingSampler(
-                            "compute_icb_inherit_sampler_no_entry",
-                        ))?;
-                    if entry.object_type != OBJECT_TYPE_TYPE7 {
-                        return Err(ComputeStatus::MissingSampler(
-                            "compute_icb_inherit_sampler_wrong_type",
-                        ));
-                    }
-                    let desc_bytes = objects::read_descriptor(state, host, task_id, &entry).ok_or(
-                        ComputeStatus::MissingSampler("compute_icb_inherit_sampler_no_desc"),
-                    )?;
+                    let (_entry, desc_bytes) = objects::resolve_descriptor(
+                        state,
+                        host,
+                        task_id,
+                        s.sampler_ref,
+                        &[OBJECT_TYPE_TYPE7],
+                    )
+                    .map_err(|rung| {
+                        ComputeStatus::MissingSampler(crate::observe::ladder_slugs!(
+                            "compute_icb_inherit_sampler"
+                        )(rung))
+                    })?;
                     if desc_bytes.len() < 4 || ld32(&desc_bytes) != TYPE7_OBJECT_SAMPLER {
                         return Err(ComputeStatus::MissingSampler(
                             "compute_icb_inherit_sampler_bad_tag",
                         ));
                     }
                     let sd = decode_sampler_descriptor(&desc_bytes).map_err(|_| {
-                        ComputeStatus::MissingSampler("compute_icb_inherit_sampler_decode")
+                        ComputeStatus::MissingSampler(crate::observe::ladder_slug!(
+                            "compute_icb_inherit_sampler",
+                            desc_decode
+                        ))
                     })?;
-                    reims_vgpu_samplers.push(crate::runtime::metal_draw::sampler_record(
+                    reims_vgpu_samplers.push(crate::runtime::draw::sampler_record(
                         REIMS_VGPU_BINDING_SAMPLER_BASE + s.index,
                         &sd,
                         s.has_lod_clamp.then_some((s.lod_min_bits, s.lod_max_bits)),
