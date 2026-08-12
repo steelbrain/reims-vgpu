@@ -127,6 +127,15 @@ pub fn apply(
     }
     out.missed = !hit;
     if ops.clear_host_valid != 0 {
+        // The statement this device used to decode and drop. A buffer has no
+        // mapping, so the loop above skipped it and the guest's account of its
+        // own write went nowhere — which is the one signal the draw-time buffer
+        // gather has no substitute for. Recorded only on the miss, because an
+        // object with a mapping already carries `content_generation` and a
+        // second spelling of one fact is a divergence waiting to happen.
+        if !hit {
+            state.buffer_write_gen.note_write(task_id, object_id);
+        }
         crate::runtime::drain::note_store_route(site.clear_host_route());
     }
     out

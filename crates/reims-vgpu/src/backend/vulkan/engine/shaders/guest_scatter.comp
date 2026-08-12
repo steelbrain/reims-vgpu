@@ -1,0 +1,25 @@
+#version 450
+// Scatter a tightly-packed frame from a device-local staging buffer into the
+// guest's physically-discontiguous pages, as one dispatch instead of one
+// transfer region per run.
+//
+// One workgroup per run. Each workgroup strides its run in 4-byte words, so a
+// run's cost is its length and the dispatch's cost is the total bytes, with no
+// per-region descriptor for the driver or the copy engine to process.
+layout(local_size_x = 256) in;
+
+layout(std430, set = 0, binding = 0) readonly  buffer Src  { uint src[]; };
+layout(std430, set = 0, binding = 1) writeonly buffer Dst  { uint dst[]; };
+// x = first word in `src`, y = first word in `dst`, z = word count, w = unused.
+layout(std430, set = 0, binding = 2) readonly  buffer Runs { uvec4 runs[]; };
+
+layout(push_constant) uniform Push { uint run_count; } pc;
+
+void main() {
+    uint r = gl_WorkGroupID.x;
+    if (r >= pc.run_count) { return; }
+    uvec4 run = runs[r];
+    for (uint i = gl_LocalInvocationID.x; i < run.z; i += gl_WorkGroupSize.x) {
+        dst[run.y + i] = src[run.x + i];
+    }
+}

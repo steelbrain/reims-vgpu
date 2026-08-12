@@ -114,7 +114,7 @@ impl HostGpuCaps {
     /// something the device reported.
     pub fn selection_line(&self, device_name: &str) -> String {
         format!(
-            "vk_caps api={} baseline={} memory={} memory_signal={} device_local_mb={} host_visible_device_local_mb={} host_pointer_import={} host_pointer_align={} portability_subset={} type={:?} name={device_name:?}",
+            "vk_caps api={} baseline={} memory={} memory_signal={} device_local_mb={} host_visible_device_local_mb={} host_pointer_import={} host_pointer_align={} host_pointer_heap_mb={} portability_subset={} type={:?} name={device_name:?}",
             api_floor::version_str(self.device_api_version),
             api_floor::version_str(api_floor::MIN_SUPPORTED_API),
             self.memory.topology.slug(),
@@ -123,6 +123,7 @@ impl HostGpuCaps {
             self.memory.host_visible_device_local_bytes >> 20,
             self.host_pointer.rung.slug(),
             self.host_pointer.min_alignment,
+            self.host_pointer.heap_budget >> 20,
             self.portability_subset,
             self.device_type,
         )
@@ -141,6 +142,7 @@ mod tests {
             host_pointer: HostPointerCaps {
                 rung: HostPointerImport::Supported,
                 min_alignment: 4096,
+                heap_budget: 8 << 30,
             },
             portability_subset: false,
             device_api_version: api,
@@ -173,6 +175,10 @@ mod tests {
         let line = caps(vk::API_VERSION_1_2, &fixtures::apple_m3_max()).selection_line("Apple");
         assert!(line.contains("host_pointer_import=supported"), "{line}");
         assert!(line.contains("host_pointer_align=4096"), "{line}");
+        // The heap ceiling is on the line because it is half of the reported
+        // `radv`/`amdgpu` failure: an operator whose guest is larger than this
+        // number has a host that cannot import it, and no other field says so.
+        assert!(line.contains("host_pointer_heap_mb=8192"), "{line}");
 
         let mut refused = caps(vk::API_VERSION_1_2, &fixtures::apple_m3_max());
         refused.host_pointer = HostPointerCaps::default();
@@ -181,6 +187,7 @@ mod tests {
         // A refused rung carries no granularity, so the line cannot suggest one
         // an import site could act on.
         assert!(line.contains("host_pointer_align=0"), "{line}");
+        assert!(line.contains("host_pointer_heap_mb=0"), "{line}");
     }
 
     /// A host that cannot import guest RAM says so on the same line, naming the
@@ -193,6 +200,7 @@ mod tests {
         c.host_pointer = HostPointerCaps {
             rung: HostPointerImport::NoHostPointerExtension,
             min_alignment: 0,
+            heap_budget: 0,
         };
         let line = c.selection_line("Apple M3 Max");
         assert!(

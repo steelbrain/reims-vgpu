@@ -185,6 +185,79 @@ impl crate::observe::Decline for ComputeBindOverflow {
     }
 }
 
+/// The sampled-image bindings that need a neutral texture: those the module
+/// statically uses and `bound` does not cover.
+///
+/// Vulkan requires the pipeline layout to contain a descriptor for every
+/// resource the module statically uses, and the layout this device builds is
+/// assembled from what the guest bound — so a texture the kernel samples and the
+/// guest left empty is absent from the layout entirely, not an unwritten slot in
+/// it. Besides being undefined by the specification, that hole is fatal on one
+/// of the two iGPU vendors this device supports: Mesa's Intel driver scores each
+/// used binding as `(use_count << 7) / array_size` over an array it sized to
+/// `max_binding + 1` and zero-filled, so it divides by zero and the host process
+/// dies of `SIGFPE` inside `vkCreateComputePipelines`.
+///
+/// Only [`DescriptorUse::Used`] is returned, which is the bar the specification
+/// actually sets. A declared-and-never-referenced variable is legal to omit and
+/// must stay omitted, or the census that separated those two populations cannot
+/// tell them apart any more. `Ambiguous` — two variables on one binding — is its
+/// own defect and is not repaired by picking one of them.
+#[cfg(feature = "backend-vulkan")]
+fn neutral_sampled_image_bindings(spirv: &[u32], bound: &[u32]) -> Vec<u32> {
+    crate::runtime::spirv_bind::sampled_image_bindings(spirv)
+        .into_iter()
+        .filter(|binding| {
+            !bound.contains(binding)
+                && crate::runtime::spirv_bind::descriptor_static_use(spirv, *binding).is_violation()
+        })
+        .collect()
+}
+
+/// Side length of the texture substituted for a sampled image the kernel
+/// samples and the guest never bound.
+///
+/// One texel, because there is nothing to derive a size from: the guest supplied
+/// no texture, and any larger extent would be a number chosen to look plausible.
+/// A kernel that asks this image its size gets 1×1 and that is reported, rather
+/// than a guess that reads as data.
+#[cfg(feature = "backend-vulkan")]
+const NEUTRAL_SAMPLED_IMAGE_EXTENT: u32 = 1;
+
+/// A sampled image the kernel statically uses and the guest never bound, given a
+/// neutral transparent texture so the pipeline layout can describe it.
+///
+/// **A repair that succeeded, not a success**, which is why it goes to the fail
+/// channel: the kernel samples a texture whose contents this device invented, and
+/// the reliance has to stay measurable so a later session can find out whether
+/// the guest ever depended on what was in it. Nothing here claims the read did
+/// not matter.
+///
+/// Omitting the binding instead is not the cheaper option. It is a specification
+/// violation, and on Mesa's Intel driver it is a `SIGFPE` that kills the host
+/// process — see the walk in [`crate::runtime::spirv_bind::sampled_image_bindings`].
+#[cfg(feature = "backend-vulkan")]
+struct NeutralSampledImage {
+    binding: u32,
+    width: u32,
+    height: u32,
+}
+
+#[cfg(feature = "backend-vulkan")]
+impl crate::observe::Decline for NeutralSampledImage {
+    fn slug(&self) -> &'static str {
+        "compute_neutral_sampled_image_unbound"
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        vec![
+            ("binding", self.binding.to_string()),
+            ("width", self.width.to_string()),
+            ("height", self.height.to_string()),
+        ]
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct ComputeBufferBind {
     pub index: u32,
@@ -1214,7 +1287,15 @@ pub(crate) struct StagedTexture {
     pub pixel_format: u16,
     /// Product storage-selector ABI when this Metal format is storage-capable.
     /// Sample-only formats such as RGB9E5Float intentionally have no selector.
-    pub storage_selector: Option<u32>,
+    /// The contract's storage-image selector for this texture's format, or
+    /// `None` for a format that is not a storage image.
+    ///
+    /// Carried as the enum rather than as its `u32` ordinal. It used to be
+    /// narrowed to `u32` the moment `pixel_format::storage_selector` produced
+    /// it, at three staging sites, which pushed the coverage question past every
+    /// compiler that could have answered it: both backends then matched raw
+    /// integers, and the Metal one had silently been missing a member.
+    pub storage_selector: Option<pixel_format::StorageImageSelector>,
     pub width: u32,
     pub height: u32,
     pub bytes: Vec<u8>,
@@ -1261,7 +1342,7 @@ impl StagedTexture {
         &self,
         task_id: u32,
         pipeline_ref: u32,
-    ) -> Result<u32, ComputeStatus> {
+    ) -> Result<pixel_format::StorageImageSelector, ComputeStatus> {
         self.storage_selector.ok_or_else(|| {
             crate::observe::fail(format!(
                 "compute_texture_format fail reason=no_backend_selector task={task_id} \
@@ -1698,7 +1779,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             ));
             return Err(ComputeStatus::Unsupported("compute_heap_fmt_bytes"));
         };
-        let storage_selector = pixel_format::storage_selector(format).map(|s| s as u32);
+        let storage_selector = pixel_format::storage_selector(format);
         if is_storage && storage_selector.is_none() {
             crate::observe::fail(format!(
                 "compute_stage_tex heap_fail reason=fmt_storage ref={texture_ref} heap={heap_ref} fmt={format:#x} {width}x{height}"
@@ -1965,13 +2046,28 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             return Err(ComputeStatus::MissingTexture("compute_stage_tex_zero_geom"));
         }
         // sRGB color-renderable surfaces stage as unorm storage (same bpp).
-        let Some(view_format) =
-            crate::runtime::draw::effective_view_sample_format(format, view_pixel_format)
-        else {
-            crate::observe::fail(format!(
-                "compute_stage_tex view_fail reason=format_incompatible ref={texture_ref} base={stage_ref} base_fmt={format:#x} view_fmt={view_pixel_format:?} mapping={mapping_id}"
-            ));
-            return Err(ComputeStatus::Unsupported("compute_view_format"));
+        let view_format = match crate::runtime::draw::effective_view_sample_format_reasoned(
+            format,
+            view_pixel_format,
+        ) {
+            Ok(view_format) => view_format,
+            Err(refusal) => {
+                // `term=` is what says whether this is a gap in this crate's
+                // format table or the guest asking for something Metal forbids,
+                // and `role=` says which rail would have had to take it — the
+                // two questions the next reader has, and the two the old
+                // `format_incompatible` could not answer. The bind dies here,
+                // before the storage check, so without `role=` the log cannot
+                // say whether the missing rail is a sampled layout or a storage
+                // selector.
+                crate::observe::fail(format!(
+                    "compute_stage_tex view_fail reason=format_incompatible term={refusal} \
+                     role={} ref={texture_ref} base={stage_ref} base_fmt={format:#x} \
+                     view_fmt={view_pixel_format:?} {width}x{height} mapping={mapping_id}",
+                    if is_storage { "storage" } else { "sampled" }
+                ));
+                return Err(ComputeStatus::Unsupported("compute_view_format"));
+            }
         };
         let stage_fmt = match view_format {
             pixel_format::MTL_FORMAT_BGRA8_UNORM_SRGB => pixel_format::MTL_FORMAT_BGRA8_UNORM,
@@ -1987,7 +2083,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
                 return Err(ComputeStatus::Unsupported("stage_tex_fmt_bytes"));
             }
         };
-        let storage_selector = pixel_format::storage_selector(stage_fmt).map(|s| s as u32);
+        let storage_selector = pixel_format::storage_selector(stage_fmt);
         if is_storage && storage_selector.is_none() {
             crate::observe::fail(format!(
                 "compute_stage_tex type11_fail reason=fmt_storage mapping={mapping_id} {width}x{height} fmt={format:#x}"
@@ -2266,7 +2362,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             format!("fmt={stage_format:#x}"),
         );
     };
-    let storage_selector = pixel_format::storage_selector(stage_format).map(|s| s as u32);
+    let storage_selector = pixel_format::storage_selector(stage_format);
     if is_storage && storage_selector.is_none() {
         return linear_fail(
             ComputeStatus::Unsupported("linear_tex_fmt_storage"),
@@ -2393,6 +2489,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
     } else {
         // The bulk/row reads below walk raw task GVAs; a Store's
         // guest-page write is submitted and not waited on.
+        crate::runtime::writeback_debt::pay_for_texture(state, host, task_id, texture_ref);
         crate::runtime::render_writeback::settle_guest_writes(
             crate::runtime::render_writeback::SettleSite::ComputeStageTexture,
         );
@@ -3563,17 +3660,11 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
             ));
             return ComputeStatus::Unsupported("storage_no_selector_specialize");
         };
-        let Some(guest_fmt) = simg_u32_to_engine_storage(selector) else {
-            crate::observe::fail(format!(
-                "compute_linux unsupported storage_format reason=selector_unknown pipe={} bind={} simg={selector} fmt={:#x}",
-                acc.pipeline_ref, t.binding, t.pixel_format
-            ));
-            return ComputeStatus::Unsupported("storage_selector_unknown_specialize");
-        };
+        let guest_fmt = selector_to_engine_storage(selector);
         let Some(shader_decl) = crate::runtime::spirv_bind::image_format(&spirv, t.binding) else {
             crate::observe::fail(format!(
                 "compute_linux storage_format fail reason=spirv_format_missing pipe={} bind={} guest={guest_fmt:?} simg={}",
-                acc.pipeline_ref, t.binding, selector
+                acc.pipeline_ref, t.binding, selector as u32
             ));
             return ComputeStatus::Unsupported("storage_spirv_format_missing");
         };
@@ -3588,7 +3679,7 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
                         "compute_linux storage_format fail reason={reason} pipe={} bind={} spirv={shader_decl:?} guest={guest_fmt:?} simg={} guest_bpp={} shader_bpp={}",
                         acc.pipeline_ref,
                         t.binding,
-                        selector,
+                        selector as u32,
                         guest_fmt.bytes_per_texel(),
                         spirv_image_format_to_engine_storage(shader_decl)
                             .map(|format| format.bytes_per_texel())
@@ -3640,20 +3731,14 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
                 ));
                 return ComputeStatus::Unsupported("storage_no_selector_writeback");
             };
-            let Some(guest_fmt) = simg_u32_to_engine_storage(selector) else {
-                crate::observe::fail(format!(
-                    "compute_linux unsupported storage_format reason=selector_unknown pipe={} bind={} simg={selector} fmt={:#x}",
-                    acc.pipeline_ref, t.binding, t.pixel_format
-                ));
-                return ComputeStatus::Unsupported("storage_selector_unknown_writeback");
-            };
+            let guest_fmt = selector_to_engine_storage(selector);
             let Some((_, _, shader_decl, specialized)) = storage_formats
                 .iter()
                 .find(|(binding, _, _, _)| *binding == t.binding)
             else {
                 crate::observe::fail(format!(
                     "compute_linux storage_format fail reason=spirv_format_specialize_internal pipe={} bind={} simg={}",
-                    acc.pipeline_ref, t.binding, selector
+                    acc.pipeline_ref, t.binding, selector as u32
                 ));
                 return ComputeStatus::Unsupported("storage_format_specialize_internal");
             };
@@ -3679,7 +3764,7 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
                 let Some(fmt) = spirv_image_format_to_engine_storage(*specialized) else {
                     crate::observe::fail(format!(
                         "compute_linux storage_format fail reason=spirv_storage_format_unsupported pipe={} bind={} spirv={specialized:?} guest={guest_fmt:?} simg={}",
-                        acc.pipeline_ref, t.binding, selector
+                        acc.pipeline_ref, t.binding, selector as u32
                     ));
                     return ComputeStatus::Unsupported("storage_spirv_format_unsupported");
                 };
@@ -3706,7 +3791,7 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
                     "compute_linux storage_format_specialize pipe={} bind={} spirv={shader_decl:?} specialized={specialized:?} engine={shader_fmt:?} guest={guest_fmt:?} simg={} guest_bpp={} shader_bpp={}",
                     acc.pipeline_ref,
                     t.binding,
-                    selector,
+                    selector as u32,
                     guest_fmt.bytes_per_texel(),
                     spirv_image_format_to_engine_storage(*shader_decl)
                         .map(|format| format.bytes_per_texel())
@@ -3754,6 +3839,49 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
                 ),
             });
         }
+    }
+
+    // Vulkan requires the pipeline layout to contain a descriptor for every
+    // resource the module *statically uses*. The layout this device builds is
+    // assembled from what the guest bound, so a texture the kernel samples and
+    // the guest left empty is absent from the layout entirely — not an unwritten
+    // slot in it. That is undefined behaviour by the specification and it is
+    // worse than that in practice: Mesa's Intel driver sizes its binding array
+    // to `max_binding + 1`, zero-fills every number nothing declared, and scores
+    // each used binding as `(use_count << 7) / array_size` when it picks
+    // binding-table slots. A hole under a used binding divides by zero, so the
+    // whole process dies of `SIGFPE` inside `vkCreateComputePipelines` with no
+    // error for this device to decline on. Fill it the way the sampler class
+    // below already fills its own.
+    //
+    // Only `Used` is filled. A declared-and-unused variable is legal to omit and
+    // must stay omitted, or the census that separated those two populations
+    // cannot tell them apart any more; `Ambiguous` is two variables on one
+    // binding, which is its own defect and is not repaired by picking one.
+    let bound: Vec<u32> = sampled_images.iter().map(|img| img.binding).collect();
+    for binding in neutral_sampled_image_bindings(&spirv, &bound) {
+        crate::observe::Emit::decline(
+            "compute_linux_sampled",
+            &NeutralSampledImage {
+                binding,
+                width: NEUTRAL_SAMPLED_IMAGE_EXTENT,
+                height: NEUTRAL_SAMPLED_IMAGE_EXTENT,
+            },
+        )
+        .field("pipe", acc.pipeline_ref)
+        .fail_once((u64::from(acc.pipeline_ref) << 32) | u64::from(binding));
+        sampled_images.push(ComputeSampledImageResource {
+            binding,
+            format: crate::backend::vulkan::engine::StorageImageFormat::Rgba8Unorm,
+            width: NEUTRAL_SAMPLED_IMAGE_EXTENT,
+            height: NEUTRAL_SAMPLED_IMAGE_EXTENT,
+            bytes: pixel_format::solid_rgba8(
+                NEUTRAL_SAMPLED_IMAGE_EXTENT,
+                NEUTRAL_SAMPLED_IMAGE_EXTENT,
+                &[0.0; 4],
+            ),
+            resident_bind: None,
+        });
     }
 
     let mut samplers = Vec::new();
@@ -3989,17 +4117,29 @@ fn spirv_words_le(bytes: &[u8]) -> Result<Vec<u32>, ComputeSpirvDecline> {
 /// `if let Some(..)` / `let Some(..) else`, so the adapters keep that shape; the
 /// decision itself now happens in exactly one place.
 #[cfg(feature = "backend-vulkan")]
-fn simg_u32_to_engine_storage(
-    simg: u32,
-) -> Option<crate::backend::vulkan::engine::StorageImageFormat> {
-    crate::backend::vulkan::translate::pixel::storage_image_from_selector(simg).ok()
+/// The engine's storage format for a contract selector.
+///
+/// Total, because the translate layer's map is. It used to take the selector's
+/// `u32` ordinal and hand back an `Option`, and both of its call sites carried a
+/// `reason=selector_unknown` refusal for the `None` — a decline that could only
+/// have fired if two enums in this crate had drifted, which is not a thing the
+/// guest can cause and not a thing a run-time check should be watching for.
+/// Those two refusals are gone with the `Option`.
+fn selector_to_engine_storage(
+    selector: pixel_format::StorageImageSelector,
+) -> crate::backend::vulkan::engine::StorageImageFormat {
+    crate::backend::vulkan::translate::pixel::storage_image_from_selector(selector)
 }
 
 #[cfg(feature = "backend-vulkan")]
 fn mtl_to_engine_sampled(
     format: u16,
 ) -> Option<crate::backend::vulkan::engine::StorageImageFormat> {
-    crate::backend::vulkan::translate::pixel::storage_image(format).ok()
+    // The *sampled* admission, not the storage one. Asking `storage_image` here
+    // cost macOS 14 and macOS 15 a whole `DispatchThreadgroups` a boot on
+    // `MTLPixelFormatR16Unorm`, which is sampleable everywhere and is not a
+    // storage format — see `translate::pixel::sampled_image`.
+    crate::backend::vulkan::translate::pixel::sampled_image(format).ok()
 }
 
 #[cfg(feature = "backend-vulkan")]
@@ -4047,7 +4187,10 @@ fn guest_numeric_class(guest: crate::backend::vulkan::engine::StorageImageFormat
         | V::R8Unorm
         | V::Rg8Unorm
         | V::R32Float
-        | V::Rgb9e5Ufloat => 0,
+        | V::Rgb9e5Ufloat
+        | V::R16Unorm
+        | V::Rg16Unorm
+        | V::Rgba16Unorm => 0,
         V::Rgba16Uint | V::Rgba8Uint | V::Rgba32Uint | V::R32Uint => 1,
         V::Rgba8Sint | V::R32Sint => 2,
     }
@@ -4157,7 +4300,7 @@ fn specialized_storage_image_format(
         // R32 sint/float and the packed Rgb9e5 stay sampled-only until a live
         // capture justifies enabling their storage path.
         V::R32Uint => (1, S::R32ui),
-        V::R32Sint | V::R32Float | V::Rgb9e5Ufloat => {
+        V::R32Sint | V::R32Float | V::Rgb9e5Ufloat | V::R16Unorm | V::Rg16Unorm | V::Rgba16Unorm => {
             return Err("spirv_sampled_only_format_as_storage");
         }
         V::Rgba32Float => (0, S::Rgba32Float),

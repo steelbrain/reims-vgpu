@@ -1,0 +1,128 @@
+<!doctype html>
+<!--
+  A sustained, full-rate compositor load for the guest, served from the HOST.
+
+  Why this page exists: `hammer.sh` drives the window server in bursts and sleeps
+  between them, so ~60 % of its wall clock has zero draws and its `present_hz`
+  median reads 2.8 Hz on a device that sustains ~79. A frame-rate test page run
+  by hand showed that; this is that workload made reproducible — no internet, no
+  page that can change under the measurement, and a fixed amount of work per
+  frame so two boots are comparable.
+
+  Everything is deterministic: the step is per *frame*, never per wall-clock
+  millisecond, so a slow boot and a fast boot draw the same content per frame and
+  differ only in how many frames they get through. Nothing here reads the clock
+  except the on-screen counter, which is display only.
+-->
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>reims-vgpu sustained animation</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #101014; overflow: hidden; }
+  /* Full-viewport bands, each a separately composited layer, so the window
+     server composites N surfaces per frame rather than repainting one. That is
+     the shape this device serves.
+
+     Promotion is forced, not hinted. `will-change: transform` alone is advisory
+     and the compositor may decline it: ten boots of one binary split into two
+     tight clusters, ~420 draws per presented frame and ~268, with a 24 %
+     `present_hz` gap between them and nothing in between — larger than any
+     device effect measured against this probe. The collapsed cluster is bands
+     repainted into their parent instead of composited. `backface-visibility`
+     here plus the 3D transform in `tick()` take the promotion out of the
+     compositor's discretion. Both halves are required: this rule cannot carry a
+     `transform`, because `tick()` overwrites the inline one every frame. */
+  .band {
+    position: absolute; left: 0; width: 100%; height: 11%;
+    will-change: transform;
+    backface-visibility: hidden;
+  }
+  .box {
+    position: absolute; top: 8%; height: 84%; width: 12vh;
+    border-radius: 12px;
+  }
+  #fps {
+    position: absolute; right: 12px; bottom: 8px; z-index: 10;
+    font: 16px -apple-system, Helvetica, sans-serif; color: #9f9;
+  }
+  canvas { position: absolute; left: 0; bottom: 12%; width: 100%; height: 22%; }
+</style>
+<body>
+<canvas id="c" width="1024" height="192"></canvas>
+<div id="fps">warming up</div>
+<script>
+// Eight bands of moving boxes. Each band is its own composited layer and moves
+// at its own rate, so no two frames are a repeat of an earlier pair and the
+// compositor cannot elide one.
+const BANDS = 8;
+const BOXES_PER_BAND = 6;
+const bands = [];
+for (let b = 0; b < BANDS; b++) {
+  const el = document.createElement('div');
+  el.className = 'band';
+  el.style.top = (b * 12 + 1) + '%';
+  for (let i = 0; i < BOXES_PER_BAND; i++) {
+    const box = document.createElement('div');
+    box.className = 'box';
+    box.style.left = (i * 100 / BOXES_PER_BAND) + '%';
+    box.style.background = `hsl(${(b * 45 + i * 7) % 360} 80% 55%)`;
+    el.appendChild(box);
+  }
+  document.body.appendChild(el);
+  bands.push(el);
+}
+
+// A canvas repainted every frame, so the guest also uploads texture content
+// rather than only re-compositing existing surfaces. Both rails matter and a
+// pure-transform page exercises only one.
+const ctx = document.getElementById('c').getContext('2d');
+
+const fpsEl = document.getElementById('fps');
+let frame = 0;
+let windowStart = performance.now();
+let windowFrames = 0;
+
+function tick() {
+  frame++;
+
+  // Per-frame step, not per-millisecond: identical content per frame number on
+  // every boot. 360 frames is one full traversal at 1/360th of the width.
+  const phase = (frame % 360) / 360;
+  for (let b = 0; b < BANDS; b++) {
+    // Alternating direction, and a per-band multiplier that is coprime with the
+    // band count so the layers never line up into one repeating composite.
+    const dir = b % 2 === 0 ? 1 : -1;
+    const x = dir * ((phase * (b + 3)) % 1) * 100;
+    // `translate3d` and not `translateX`: the 3D form is what keeps the band on
+    // the composited path every frame. See the `.band` rule above.
+    bands[b].style.transform = `translate3d(${x}%, 0, 0)`;
+  }
+
+  const w = ctx.canvas.width, h = ctx.canvas.height;
+  ctx.fillStyle = '#101014';
+  ctx.fillRect(0, 0, w, h);
+  ctx.lineWidth = 3;
+  for (let i = 0; i < 24; i++) {
+    ctx.strokeStyle = `hsl(${(frame * 2 + i * 15) % 360} 90% 60%)`;
+    ctx.beginPath();
+    for (let x = 0; x <= w; x += 16) {
+      const y = h / 2 + Math.sin((x / w) * 6.283 * 3 + (frame + i * 9) / 12) * (h / 2 - 8);
+      if (x === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+  }
+
+  // Display only. The device-side census is the measurement; this is here so a
+  // human watching the VM can see the page is live.
+  windowFrames++;
+  const now = performance.now();
+  if (now - windowStart >= 1000) {
+    fpsEl.textContent = (windowFrames * 1000 / (now - windowStart)).toFixed(1) +
+                        ' fps · frame ' + frame;
+    windowStart = now; windowFrames = 0;
+  }
+  requestAnimationFrame(tick);
+}
+requestAnimationFrame(tick);
+</script>
+</body>

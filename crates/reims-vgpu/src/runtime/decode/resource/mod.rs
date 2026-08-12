@@ -2248,11 +2248,14 @@ const MESH_PIPELINE_TAGS_CONSUMED: [u8; 5] = [
 /// Tags [`decode_compute_pipeline_descriptor`] reads out of a compute
 /// pipeline's own compact-TLV block.
 ///
-/// One. Listed apart from its render sibling rather than merged into a union,
+/// Two. Listed apart from its render sibling rather than merged into a union,
 /// because a union would report a render tag as *consumed* on a compute
 /// pipeline that has no reader for it — an instrument built to find unread
 /// fields must not hide one behind a tag its other caller reads.
-const COMPUTE_PIPELINE_TAGS_CONSUMED: [u8; 1] = [PIPELINE_TAG_KERNEL_FUNC];
+const COMPUTE_PIPELINE_TAGS_CONSUMED: [u8; 2] = [
+    PIPELINE_TAG_KERNEL_FUNC,
+    PIPELINE_TAG_COMPUTE_STAGE_INPUT_OFFSET,
+];
 
 /// `MTLRenderPipelineDescriptor.label`, a four-byte reference into the record's
 /// string area.
@@ -2270,6 +2273,57 @@ const COMPUTE_PIPELINE_TAG_THREADGROUP_MULTIPLE: u8 = 0x01;
 /// [`RENDER_PIPELINE_TAG_LABEL`] at a different index, for the reason that
 /// constant's doc gives.
 const COMPUTE_PIPELINE_TAG_LABEL: u8 = 0x02;
+/// `MTLComputePipelineDescriptor.stageInputDescriptor` — a byte offset from the
+/// end of the 16-byte type-7 header to a nested property list, in the same units
+/// as [`PIPELINE_TAG_VERTEX_DESCRIPTOR_OFFSET`] and
+/// [`PIPELINE_TAG_COLOR_ATTACH_OFFSET`]. `COMPUTE_PIPELINE_TAG_LABEL` is the same
+/// kind of offset, to a NUL-terminated string.
+///
+/// **Zero is a legal value and means nil.** The serializer reserves the property
+/// slot and patches an offset into it, leaving zero when the property is nil, so
+/// a descriptor may carry this tag and still have no stage input. See
+/// `parse_compute_stage_input_section`, which must not read zero as a position.
+///
+/// **A descriptor without the tag has no stage-input descriptor at all**, rather
+/// than one whose offset went missing — the same reading as its render sibling.
+/// The property is *not* new in any release: the serializer emits it whenever
+/// the descriptor's `stageInputDescriptor` is non-nil and not `isEqual:` a fresh
+/// descriptor's, which is the omit-defaults rule
+/// [`PIPELINE_TAG_RASTER_SAMPLE_COUNT`] states. So the three x86 rails differ in
+/// what their window servers build, not in what their serializers can say:
+/// macOS 11.7.11 and macOS 13.7.8 leave it nil and send neither tag nor section,
+/// while every macOS 12.7.6 compute pipeline sends both.
+///
+/// # The section is a vertex-descriptor-shaped record, and that is not a coincidence
+///
+/// The offset points at one compact-TLV entry whose first two properties are the
+/// same two, in the same order, as `MTLVertexDescriptor`'s: `0x00` is the offset
+/// to the attribute array and `0x01` the offset to the layout array, both
+/// relative to the entry, each array beginning with its `u32` element count.
+/// That is [`VERTEX_DESC_TAGS_CONSUMED`], reused rather than redeclared, because
+/// `MTLStageInputOutputDescriptor` *is* `attributes` plus `layouts` — the two
+/// Metal types differ in what they may contain, not in their shape, and one
+/// serializer emits both. Its remaining two properties are `indexType` (`0x02`)
+/// and `indexBufferIndex` (`0x03`), which describe how an indexed stage-in
+/// fetch reads its index buffer.
+///
+/// **The offset is not derivable from the block length and must be read.** For
+/// the two-field record it happens to equal the property list rounded up to four
+/// (13 → 16), but a descriptor carrying a label puts the label's string between
+/// the property list and this section: two observed records with a 25-byte
+/// property list name offsets 40 and 44, for names of thirteen and sixteen
+/// characters.
+///
+/// It is **not** the bit-packed form [`parse_compute_stage_input_block`] reads.
+/// That reader has never had this record to eat — no x86 rail sends a block for
+/// it — so the two encodings are not alternatives to choose between here, and
+/// this tag's absence still takes the old path.
+///
+/// Every macOS 12 pipeline observed declares **zero attributes and zero
+/// layouts**: `stageInputDescriptor` is set but empty, which is a kernel taking
+/// no per-thread input, which is [`None`]. A section that declares entries is
+/// refused rather than emptied — see `parse_compute_stage_input_section`.
+pub const PIPELINE_TAG_COMPUTE_STAGE_INPUT_OFFSET: u8 = 0x03;
 
 /// Tags this decoder deliberately does not read, and which cost the guest
 /// nothing.
@@ -2436,10 +2490,31 @@ const COMPUTE_PIPELINE_TAGS_BENIGN: [u8; 2] = [
 /// sample count would emit once per distinct count for no extra information.
 /// The refusal itself is outside that latch — the line names a tag once, the
 /// pipeline is refused every time.
+///
+/// # It carries the first value seen, and that is what identifies the property
+///
+/// Naming a tag is the work this line exists to prompt, and a tag number alone
+/// does not do it. A macOS 12 guest sent compute tag `0x03` on every compute
+/// pipeline it built and this device refused all 264 of them; the line said
+/// `tag=0x03 len=4` and a reader could not tell a section offset from a thread
+/// count from a boolean without pulling the guest's own serializer apart. The
+/// value distinguishes them at a glance: an offset lands near the end of the TLV
+/// block, a count is a round number, a `BOOL` is 0 or 1.
+///
+/// **First value seen, not every value**, and the field says `first_value=` so
+/// nobody reads it as the only one. Widening the latch to `(tag, len, value)`
+/// would answer the further question of whether the property varies between
+/// pipelines, and it is deliberately not done: [`crate::observe::first_sight`]
+/// remembers every discriminant it is asked about in an unbounded set, so a
+/// per-value latch on a field that turns out to be a per-pipeline reference
+/// grows without limit on exactly the boot where the field is most unexpected.
+/// A field of more than four bytes has no `first_value=` at all rather than a
+/// truncation.
 struct PipelineFieldDropped {
     kind: &'static str,
     tag: u8,
     len: u8,
+    first_value: Option<u32>,
 }
 
 impl crate::observe::Decline for PipelineFieldDropped {
@@ -2448,11 +2523,15 @@ impl crate::observe::Decline for PipelineFieldDropped {
     }
 
     fn fields(&self) -> Vec<(&'static str, String)> {
-        vec![
+        let mut out = vec![
             ("kind", self.kind.to_string()),
             ("tag", format!("0x{:02x}", self.tag)),
             ("len", self.len.to_string()),
-        ]
+        ];
+        if let Some(v) = self.first_value {
+            out.push(("first_value", format!("{v:#x}")));
+        }
+        out
     }
 }
 
@@ -2526,7 +2605,9 @@ fn note_pipeline_tlv_fields(
     let unknown = report_tlv_shape(
         kind,
         fields.len(),
-        fields.iter().map(|f| (f.tag, f.length)),
+        fields
+            .iter()
+            .map(|f| (f.tag, f.length, f.has_u32.then_some(f.value_u32))),
         consumed_tags,
         benign_tags,
     );
@@ -2562,7 +2643,7 @@ fn note_entry_tlv_fields(kind: &'static str, bytes: &[u8], entry: usize, consume
     let Some(&field_count) = bytes.get(entry) else {
         return;
     };
-    let mut seen: Vec<(u8, u8)> = Vec::with_capacity(field_count as usize);
+    let mut seen: Vec<(u8, u8, Option<u32>)> = Vec::with_capacity(field_count as usize);
     let mut p = entry + 1;
     for _ in 0..field_count {
         if p + 2 > bytes.len() {
@@ -2572,7 +2653,11 @@ fn note_entry_tlv_fields(kind: &'static str, bytes: &[u8], entry: usize, consume
         if p + 2 + len as usize > bytes.len() {
             return;
         }
-        seen.push((tag, len));
+        // Four bytes exactly, the same width `CompactTlv::has_u32` reports on the
+        // pipeline block's own fields, so the two callers describe a value the
+        // same way or not at all.
+        let value = (len as usize == 4).then(|| ld32(&bytes[p + 2..]));
+        seen.push((tag, len, value));
         p += 2 + len as usize;
     }
     // No benign list: see this function's doc for why it refuses nothing.
@@ -2595,7 +2680,7 @@ fn note_entry_tlv_fields(kind: &'static str, bytes: &[u8], entry: usize, consume
 fn report_tlv_shape(
     kind: &'static str,
     field_count: usize,
-    fields: impl Iterator<Item = (u8, u8)>,
+    fields: impl Iterator<Item = (u8, u8, Option<u32>)>,
     consumed_tags: &[u8],
     benign_tags: &[u8],
 ) -> usize {
@@ -2605,8 +2690,8 @@ fn report_tlv_shape(
     let mut shape = String::new();
     let mut shape_key = kind_key;
     let mut dropped: Vec<(u8, u8)> = Vec::new();
-    let mut unknown: Vec<(u8, u8)> = Vec::new();
-    for (tag, len) in fields {
+    let mut unknown: Vec<(u8, u8, Option<u32>)> = Vec::new();
+    for (tag, len, value) in fields {
         let consumed = consumed_tags.contains(&tag);
         let sep = if shape.is_empty() { "" } else { "," };
         // `*` keeps its old meaning — this decoder does not read the tag — so
@@ -2631,7 +2716,7 @@ fn report_tlv_shape(
         if !consumed {
             dropped.push((tag, len));
             if !benign_tags.contains(&tag) {
-                unknown.push((tag, len));
+                unknown.push((tag, len, value));
             }
         }
     }
@@ -2647,9 +2732,18 @@ fn report_tlv_shape(
     // expected control flow with a written argument behind it, and `AGENTS.md`
     // asks that expected control flow stay quiet; the shape line above is where
     // it stays visible.
-    for &(tag, len) in &unknown {
-        crate::observe::Emit::decline("type7_pipeline", &PipelineFieldDropped { kind, tag, len })
-            .fail_once(kind_key.rotate_left(16) ^ (u64::from(tag) << 8) ^ u64::from(len));
+    for &(tag, len, first_value) in &unknown {
+        crate::observe::Emit::decline(
+            "type7_pipeline",
+            &PipelineFieldDropped {
+                kind,
+                tag,
+                len,
+                first_value,
+            },
+        )
+        // The value is deliberately out of the key — see `PipelineFieldDropped`.
+        .fail_once(kind_key.rotate_left(16) ^ (u64::from(tag) << 8) ^ u64::from(len));
     }
     unknown.len()
 }
@@ -3794,6 +3888,82 @@ fn section_ranges_overlap(a_start: u64, a_len: u64, b_start: u64, b_len: u64) ->
     a_start < b_end && b_start < a_end
 }
 
+/// Read the stage-input descriptor a compute pipeline located with
+/// [`PIPELINE_TAG_COMPUTE_STAGE_INPUT_OFFSET`].
+///
+/// `section` is absolute in `bytes`, already resolved from the tag's
+/// header-relative offset by the caller.
+///
+/// # Empty is [`None`]; populated is a refusal
+///
+/// Every macOS 12 compute pipeline observed sets `stageInputDescriptor` to an
+/// object with no attributes and no layouts, and a kernel that fetches nothing
+/// per thread is exactly what `stage_input: None` means to the rest of this
+/// device. So the empty case is not a degradation — it is the same pipeline the
+/// guest asked for.
+///
+/// A section that declares entries is refused, and the refusal is the point.
+/// This device has never seen one, so nothing here knows how a compute
+/// stage-input attribute's format enumerates or how its layout steps, and the
+/// alternative to refusing is building the pipeline with its stage-in fetch
+/// silently absent. `ComputePipelineDescriptor`'s own `classify_stage_input`
+/// makes that argument for the sibling encoding's over-cap case, and it applies
+/// unchanged here: a dropped stage-input is indistinguishable downstream from a
+/// kernel that declared none, and on the Vulkan arm it walks straight past a
+/// refusal that exists to catch it.
+///
+/// Structural damage is refused rather than treated as absence, for the reason
+/// [`parse_compute_stage_input_block`] gives: the guest named this offset, so
+/// nothing behind it is optional.
+fn parse_compute_stage_input_section(
+    bytes: &[u8],
+    declared_offset: u32,
+) -> Result<Option<ComputeStageInputDescriptor>, DecodeStatus> {
+    // Zero is a legal value of this property and means nil, not "the section is
+    // at the start of the property list". The serializer patches a nested
+    // object's offset into a reserved slot and leaves it zero when the property
+    // is nil, so a descriptor may carry the tag and still have no stage input.
+    // Reading zero as an offset lands on the property list's own field count and
+    // decodes it as a stage-input entry.
+    if declared_offset == 0 {
+        return Ok(None);
+    }
+    let section = TYPE7_FIRST_TLVS.saturating_add(declared_offset as usize);
+    if section >= bytes.len() {
+        return Err(DecodeStatus::ErrShort("res_compute_stage_input_off_oob"));
+    }
+    // Same two tags as the render pipeline's vertex descriptor — see
+    // `PIPELINE_TAG_COMPUTE_STAGE_INPUT_OFFSET` for why one set serves both.
+    note_entry_tlv_fields(
+        "compute_stage_input",
+        bytes,
+        section,
+        &VERTEX_DESC_TAGS_CONSUMED,
+    );
+    let attr_off = entry_tag_u32(bytes, section, VERTEX_DESC_TAG_ATTRIBUTES, u32::MAX);
+    let layout_off = entry_tag_u32(bytes, section, VERTEX_DESC_TAG_LAYOUTS, u32::MAX);
+    if attr_off == u32::MAX || layout_off == u32::MAX {
+        return Err(DecodeStatus::ErrShort("res_compute_stage_input_no_sections"));
+    }
+    // Each array starts with its own `u32` count, at an offset relative to the
+    // entry rather than to the record — which is what makes the two values
+    // identical across pipelines whose sections sit at three different places.
+    let count_at = |rel: u32| -> Option<u32> {
+        let at = section.checked_add(rel as usize)?;
+        let end = at.checked_add(4)?;
+        (end <= bytes.len()).then(|| ld32(&bytes[at..]))
+    };
+    let (Some(attr_count), Some(layout_count)) = (count_at(attr_off), count_at(layout_off)) else {
+        return Err(DecodeStatus::ErrShort("res_compute_stage_input_count_oob"));
+    };
+    if attr_count != 0 || layout_count != 0 {
+        return Err(DecodeStatus::ErrUnsupported(
+            "res_compute_stage_input_populated",
+        ));
+    }
+    Ok(None)
+}
+
 /// Parse optional MetalSerializer compute stage-input block after first TLVs.
 ///
 /// Returns `Ok(None)` when no valid block is present (short / length mismatch).
@@ -3969,8 +4139,15 @@ pub fn decode_compute_pipeline_descriptor(
         &COMPUTE_PIPELINE_TAGS_BENIGN,
         &fields,
     )?;
-    let first_tlv_end = TYPE7_FIRST_TLVS + consumed;
-    let stage_input = parse_compute_stage_input_block(bytes, first_tlv_end)?;
+    // A descriptor that says where its stage-input descriptor is is read there,
+    // and one that says nothing has none — see
+    // `PIPELINE_TAG_COMPUTE_STAGE_INPUT_OFFSET`. The inferring path below stays
+    // for the bit-packed encoding, which no x86 rail produces and which this tag
+    // therefore does not replace.
+    let stage_input = match compact_tlv_u32(&fields, PIPELINE_TAG_COMPUTE_STAGE_INPUT_OFFSET) {
+        Some(off) => parse_compute_stage_input_section(bytes, off)?,
+        None => parse_compute_stage_input_block(bytes, TYPE7_FIRST_TLVS + consumed)?,
+    };
     Ok(ComputePipelineDescriptor {
         kernel_func_ref: compact_tlv_u32(&fields, PIPELINE_TAG_KERNEL_FUNC).unwrap_or(0),
         stage_input,

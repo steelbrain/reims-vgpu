@@ -73,11 +73,19 @@ impl crate::observe::Decline for SetExceedsBlock {
     }
 }
 
-/// Per-block `max_sets`. One block sustains a full ring of batched draws
-/// (`RING_DEPTH` × `BATCH_MAX_DRAWS` single-binding sets); heavier per-set
-/// binding counts or concurrent compute simply grow another block rather than
-/// dropping the draw.
-pub(crate) const DESC_BLOCK_MAX_SETS: u32 = 64;
+/// Per-block `max_sets`. One block sustains a full ring of batched draws;
+/// heavier per-set binding counts or concurrent compute simply grow another
+/// block rather than dropping the draw.
+///
+/// **Derived, not chosen.** It was written as `64` beside a comment saying it
+/// was `RING_DEPTH × BATCH_MAX_DRAWS`, which was true when the batch cap was 8
+/// and silently stopped being true when the cap was swept to 32 — the sentence
+/// stayed and the number did not follow it. Deriving it is what makes a change
+/// to either input reach this without a second edit, and it is the reason this
+/// is not a `const _: () = assert!(..)` against a hand-copied 64: asserting a
+/// copy equals its original is not a check, per `AGENTS.md`.
+pub(crate) const DESC_BLOCK_MAX_SETS: u32 =
+    super::pools::RING_DEPTH as u32 * super::pools::BATCH_MAX_DRAWS as u32;
 /// The most descriptors of one type a single descriptor set can ask for.
 ///
 /// A set is allocated whole from one block, so a set wanting more of a type than

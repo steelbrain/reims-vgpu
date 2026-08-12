@@ -85,18 +85,6 @@ pub const REIMS_VGPU_COMPUTE_TEXTURE_ACCESS_READ: u32 = 0;
 pub const REIMS_VGPU_COMPUTE_TEXTURE_ACCESS_READ_WRITE: u32 = 1;
 pub const REIMS_VGPU_COMPUTE_TEXTURE_ACCESS_WRITE: u32 = 2;
 
-pub const REIMS_VGPU_SIMG_RGBA8_UINT: u32 = 0;
-pub const REIMS_VGPU_SIMG_RGBA8_SINT: u32 = 1;
-pub const REIMS_VGPU_SIMG_RGBA16_UINT: u32 = 2;
-pub const REIMS_VGPU_SIMG_RGBA16_FLOAT: u32 = 3;
-pub const REIMS_VGPU_SIMG_RGBA32_FLOAT: u32 = 4;
-pub const REIMS_VGPU_SIMG_RGBA8_UNORM: u32 = 5;
-pub const REIMS_VGPU_SIMG_BGRA8_UNORM: u32 = 6;
-pub const REIMS_VGPU_SIMG_R16_FLOAT: u32 = 7;
-pub const REIMS_VGPU_SIMG_RG16_FLOAT: u32 = 8;
-pub const REIMS_VGPU_SIMG_R8_UNORM: u32 = 9;
-pub const REIMS_VGPU_SIMG_RG8_UNORM: u32 = 10;
-pub const REIMS_VGPU_SIMG_RGBA32_UINT: u32 = 11;
 
 pub const REIMS_VGPU_TEXTURE_SWIZZLE_ZERO: u8 = 0;
 pub const REIMS_VGPU_TEXTURE_SWIZZLE_ONE: u8 = 1;
@@ -199,7 +187,11 @@ const _: () = assert!(offset_of!(ReimsVgpuBuffer, backing_offset) == 56);
 #[derive(Clone, Copy, Debug)]
 pub struct ReimsVgpuStorageImage {
     pub binding: u32,
-    pub format: u32,
+    /// The contract's selector, not its ordinal. `StorageImageSelector` is
+    /// `#[repr(u32)]`, so this occupies the same four bytes the `u32` did and
+    /// the layout assertions below are unchanged — but the consumer can no
+    /// longer be handed a value it has no arm for.
+    pub format: crate::contract::pixel_format::StorageImageSelector,
     pub width: u32,
     pub height: u32,
     pub data: *mut u8,
@@ -213,7 +205,8 @@ const _: () = assert!(offset_of!(ReimsVgpuStorageImage, data) == 16);
 #[derive(Clone, Copy, Debug)]
 pub struct ReimsVgpuComputeSampledImage {
     pub binding: u32,
-    pub format: u32,
+    /// The contract's selector, for [`ReimsVgpuStorageImage::format`]'s reason.
+    pub format: crate::contract::pixel_format::StorageImageSelector,
     pub width: u32,
     pub height: u32,
     pub data: *const u8,
@@ -239,7 +232,7 @@ impl ReimsVgpuComputeSampledImage {
     /// disagree about.
     pub fn unswizzled(
         binding: u32,
-        format: u32,
+        format: crate::contract::pixel_format::StorageImageSelector,
         width: u32,
         height: u32,
         data: *const u8,

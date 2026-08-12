@@ -280,6 +280,43 @@ pub fn read_directory<M: GuestMemory>(
     Ok((root_pfn, depth))
 }
 
+/// The node pages one descent reads, root first.
+///
+/// Every element is an **interior** page of the tree — a page whose contents are
+/// page-table entries — and the leaf the walk resolves to is deliberately not
+/// among them. That is the distinction the whole type exists to make: a caller
+/// asking "is this guest page part of a page table?" must not be told yes about
+/// the data page the table points at.
+///
+/// The capacity is [`MAX_DEPTH`] and the push is bounded by it, so a path can
+/// never name more nodes than a walk can descend. `depth` is validated against
+/// the same constant before the descent starts, which is what makes the bound
+/// unreachable rather than merely checked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct NodePath {
+    pfns: [u32; MAX_DEPTH as usize],
+    len: u32,
+}
+
+impl NodePath {
+    /// The nodes descended through, root first, in descent order.
+    ///
+    /// Short on a failed walk: a walk that refused at level 2 has read levels 0
+    /// and 1, and those two are real nodes whether or not the address resolved.
+    pub fn pfns(&self) -> &[u32] {
+        &self.pfns[..self.len as usize]
+    }
+
+    /// Record one node. Silently keeps the first [`MAX_DEPTH`] and no more.
+    fn push(&mut self, pfn: u32) {
+        let at = self.len as usize;
+        if at < self.pfns.len() {
+            self.pfns[at] = pfn;
+            self.len += 1;
+        }
+    }
+}
+
 /// Walk `gva` from `root_pfn` down `depth` levels.
 ///
 /// Every level reads one entry and descends into the page frame it names; the
@@ -292,6 +329,26 @@ pub fn walk<M: GuestMemory>(
     root_pfn: u32,
     depth: u32,
     gva: u64,
+) -> Result<Walk, WalkFailure> {
+    walk_recording_nodes(mem, geometry, root_pfn, depth, gva, &mut NodePath::default())
+}
+
+/// [`walk`], additionally reporting the interior nodes the descent read.
+///
+/// One descent serves both, rather than a second walker that would have to be
+/// held to this one: the caller that wants the node set wants it *for the tree
+/// this walk just read*, and a re-read could see a different tree.
+///
+/// `nodes` is filled as the walk descends, so a refusal still reports the levels
+/// that were read before it. It is not cleared first — a caller reusing a path
+/// across walks is accumulating deliberately.
+pub fn walk_recording_nodes<M: GuestMemory>(
+    mem: &M,
+    geometry: Geometry,
+    root_pfn: u32,
+    depth: u32,
+    gva: u64,
+    nodes: &mut NodePath,
 ) -> Result<Walk, WalkFailure> {
     let fail = |error| WalkFailure {
         error,
@@ -316,6 +373,10 @@ pub fn walk<M: GuestMemory>(
     let mut raw_pte = 0;
 
     for level in 0..depth {
+        // `current_pfn` is the page this level reads its entry *out of*, so it
+        // is an interior node by construction and the leaf never reaches here —
+        // the loop ends before the frame the last entry names is recorded.
+        nodes.push(current_pfn);
         // The root indexes by the most significant slice of the page index, so
         // the shift shrinks as the walk descends.
         let shift = (depth - 1 - level) * geometry.index_bits();
@@ -758,6 +819,117 @@ mod tests {
                 assert_eq!(w.addr, geometry.pfn_to_addr(leaf) + off);
             }
         }
+    }
+
+    /// The reported node path is exactly the interior pages the descent read,
+    /// root first, and the leaf is never one of them.
+    ///
+    /// The leaf half is the load-bearing one. A caller uses this set to decide
+    /// that a guest page holds page-table entries and must not be written; if
+    /// the leaf leaked into it, every data page the tree maps would be declared
+    /// part of the table, which is the direction that reads as a thorough guard
+    /// and refuses the device's ordinary work.
+    #[test]
+    fn the_nodes_a_walk_reports_are_its_interiors_and_never_its_leaf() {
+        for geometry in [X86_64, ARM64E] {
+            for depth in 1..=MAX_DEPTH {
+                let mut buf = [0u8; IMAGE];
+                let mut b = Builder::new(geometry, &mut buf);
+                let leaf = 0x2bc;
+                let page_index = (0..depth)
+                    .map(|l| ((l as u64) + 1) << (l * geometry.index_bits()))
+                    .fold(0, |a, b| a | b);
+                let root = b.map(depth, page_index, leaf);
+
+                // The same chain, walked with the builder's own reader, so the
+                // expectation is derived from the tree rather than restated.
+                let mut expected = [0u32; MAX_DEPTH as usize];
+                let mut node = root;
+                for level in 0..depth {
+                    expected[level as usize] = node;
+                    let shift = (depth - 1 - level) * geometry.index_bits();
+                    let index = ((page_index >> shift) & geometry.index_mask()) as u32;
+                    node = b.child_of(node, index);
+                }
+                assert_eq!(node, leaf, "the chain must end at the leaf");
+
+                let mem = SliceMemory::new(b.bytes());
+                let gva = page_index << geometry.page_shift;
+                let mut nodes = NodePath::default();
+                let w = walk_recording_nodes(&mem, geometry, root, depth, gva, &mut nodes)
+                    .expect("mapped");
+
+                assert_eq!(nodes.pfns(), &expected[..depth as usize]);
+                assert_eq!(nodes.pfns()[0], root, "the root is always the first node");
+                assert!(
+                    !nodes.pfns().contains(&w.leaf_pfn),
+                    "the leaf is not an interior node: {:?} contains {}",
+                    nodes.pfns(),
+                    w.leaf_pfn
+                );
+                // And the plain walk agrees about everything else.
+                assert_eq!(walk(&mem, geometry, root, depth, gva), Ok(w));
+            }
+        }
+    }
+
+    /// A walk that refuses still reports the nodes it read before refusing.
+    ///
+    /// Those levels were really read, and a caller collecting the tree's pages
+    /// wants them: an address that does not resolve is the *common* case while a
+    /// guest is tearing a task down, which is exactly when the question is asked.
+    #[test]
+    fn a_refused_walk_still_reports_the_nodes_it_read() {
+        let geometry = X86_64;
+        let depth = 3;
+        let bits = geometry.index_bits();
+        let mut buf = [0u8; IMAGE];
+        let mut b = Builder::new(geometry, &mut buf);
+        let mapped = (1u64 << (2 * bits)) | (1u64 << bits) | 1;
+        let root = b.map(depth, mapped, 0x2bc);
+        let level1 = b.child_of(root, 1);
+        let mem = SliceMemory::new(b.bytes());
+
+        // Differs in the root's own slice: nothing below the root was read.
+        let elsewhere = (2u64 << (2 * bits)) | (1u64 << bits) | 1;
+        let mut nodes = NodePath::default();
+        let r = walk_recording_nodes(
+            &mem,
+            geometry,
+            root,
+            depth,
+            elsewhere << geometry.page_shift,
+            &mut nodes,
+        );
+        assert_eq!(r.unwrap_err().level, 0);
+        assert_eq!(nodes.pfns(), &[root]);
+
+        // Shares the root's slice and differs below it: two nodes were read.
+        let deeper = (1u64 << (2 * bits)) | (2u64 << bits) | 1;
+        let mut nodes = NodePath::default();
+        let r = walk_recording_nodes(
+            &mem,
+            geometry,
+            root,
+            depth,
+            deeper << geometry.page_shift,
+            &mut nodes,
+        );
+        assert_eq!(r.unwrap_err().level, 1);
+        assert_eq!(nodes.pfns(), &[root, level1]);
+    }
+
+    /// A path cannot name more nodes than a walk can descend, however many times
+    /// it is pushed — the bound is the array's own length and not a check a new
+    /// caller could forget.
+    #[test]
+    fn a_node_path_never_grows_past_the_deepest_walk() {
+        let mut path = NodePath::default();
+        for pfn in 1..=(MAX_DEPTH * 3) {
+            path.push(pfn);
+        }
+        assert_eq!(path.pfns().len(), MAX_DEPTH as usize);
+        assert_eq!(path.pfns(), &[1, 2, 3, 4]);
     }
 
     /// `walk_run` and `walk` must answer identically for every page of a run,

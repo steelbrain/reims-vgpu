@@ -709,17 +709,84 @@ pub const CHILD_SHARED_STATE_LEN: usize = 8;
 
 pub const DISPLAY_SHARED_PENDING: u64 = 0x100;
 pub const DISPLAY_SHARED_ENABLE_MASK: u64 = 0x104;
-/// VBL pending bit (`signalVBLInterrupt`).:
-/// ~60 Hz vblank = page+0x100 bit0 + 0x1014 + MSI so the compositor keeps
-/// presenting. Without this the guest can stick presenting clear-only flip
-/// buffers while content lands on intermediate mids.
+
+// The display shared page carries a two-word event mailbox: a *pending* word the
+// device ORs bits into, and an *enable* word the guest owns. The guest's display
+// ISR is one atomic read-and-clear followed by a fixed dispatch:
+//
+//     enable  = *(page + 0x104)
+//     old     = atomic { p = *(page + 0x100); *(page + 0x100) = p & ~enable; p }
+//     claimed = old & enable
+//     bit0 -> signalVBLInterrupt          bit2 -> the online  event source
+//     bit1 -> signalTransactionInterrupt  bit3 -> the offline event source
+//
+// Two consequences govern every writer in this crate, and both are load-bearing:
+//
+// 1. **The clear is `pending &= ~enable`, so a bit set for a class the guest has
+//    disabled is never cleared.** It is not inert: every later read-modify-write
+//    of the pending word carries it forward for the life of the boot. A writer
+//    must therefore consult the enable word before setting a bit, not merely
+//    before raising the interrupt — see [`super::super::runtime::drain`]'s
+//    `display_event_enabled`, which is the single reader both arms share.
+// 2. **The guest arms and disarms each class independently and at will.** A
+//    class being disabled at any given sample is normal, not a fault, and the
+//    enable word lives in guest RAM and is never trapped — only polled. Nothing
+//    reconciles the pending word when the guest changes the mask.
+//
+// The four bits below are the complete set: the guest's dispatch has no default
+// arm, so a bit outside 0..=3 is claimed by nobody and would sit in the pending
+// word forever. This device signals bits 0, 1 and 2 and must never signal bit 3.
+
+/// VBL pending bit — the guest's `signalVBLInterrupt`.
+///
+/// Armed by the guest's `enableVBLInterrupt` (`lock or $1` on the enable word)
+/// and disarmed by `disableVBLInterrupt` (`lock and $~1`). VBL is what paces the
+/// compositor: WindowServer produces a frame off its display-link callback, so
+/// the rate delivered here is a ceiling on guest frame rate. Without it the
+/// guest can stick presenting clear-only flip buffers while content lands on
+/// intermediate mids.
 pub const DISPLAY_VBL_EVENT_MASK: u32 = 1 << 0;
-/// Present-complete pending bit (PVG `_presentMappedSurface` completion block:
-/// set bit 1 at `sharedState+0x100`, read `+0x104`, `displayPokePort:` when
-/// the guest asked to be notified). Guest `handleHostInterrupt` read-clears
-/// the pending word; bit index convention matches ONLINE (bit 2).
+/// Display-transaction completion — the guest's `signalTransactionInterrupt`.
+///
+/// Armed by `enableTransactionInterrupt` (`lock or $2`) and disarmed by
+/// `disableTransactionInterrupt`. This is the edge that wakes a display-pipe
+/// transaction waiter so it re-tests its completion event; the wait re-checks on
+/// its own 1 s timeout regardless, so a missed edge costs latency rather than
+/// liveness, and a *wrongly withheld* one costs a second per frame.
+///
+/// The device sets it from the present-completion block — after the presented
+/// surface is retained, not after the host encode — which is the same edge under
+/// its host-side name. The two names describe one event from opposite ends, and
+/// the guest-side one is what a reader chasing a stalled compositor will find in
+/// the guest's own log, so both are recorded here.
+///
+/// Whether a guest arms this class is a per-generation decision, not a constant.
 pub const DISPLAY_PRESENT_EVENT_MASK: u32 = 1 << 1;
+/// Display became available — dispatched to the guest's online event source.
 pub const DISPLAY_ONLINE_EVENT_MASK: u32 = 1 << 2;
+/// Display went away — dispatched to the guest's *offline* event source.
+///
+/// **Nothing in this device may signal this bit, and nothing does.** It is named
+/// because the alternative was worse: an enable word of `0xe` reads as "the
+/// guest enabled a bit we have no name for", which is how bit 3 came to be
+/// suspected of being the thing a wedged display pipe was waiting on. It is the
+/// opposite — a guest that enables it is asking to be told when the display
+/// disappears, which is ordinary, and signalling it would tear down a live
+/// display pipe.
+///
+/// A real hot-unplug would set it. This device has no such event: the scanout is
+/// created once and lives for the VM, so the honest state of this bit is always
+/// clear.
+pub const DISPLAY_OFFLINE_EVENT_MASK: u32 = 1 << 3;
+
+/// The event classes the guest's display ISR dispatches, as one word.
+///
+/// Every bit the guest can claim, and therefore every bit it can *clear*. A bit
+/// outside this mask that reached the pending word would never be consumed.
+pub const DISPLAY_EVENT_MASK_ALL: u32 = DISPLAY_VBL_EVENT_MASK
+    | DISPLAY_PRESENT_EVENT_MASK
+    | DISPLAY_ONLINE_EVENT_MASK
+    | DISPLAY_OFFLINE_EVENT_MASK;
 /// Cursor position / show in the display shared-state page (GPA).
 pub const DISPLAY_SHARED_CURSOR_POS: u64 = 0xe00;
 pub const DISPLAY_SHARED_CURSOR_SHOW: u64 = 0xe04;
@@ -1166,6 +1233,26 @@ pub fn device_info_caps(limits: &DeviceInfoLimits, version: u32) -> Vec<(u32, u3
 /// fewer pairs than the count without terminating leaves the walk reading
 /// whatever the page already held.
 ///
+/// # The oldest rail parses the same keys with the same numbering
+///
+/// The macOS 11 guest driver takes the low prefix of this table and nothing
+/// else: it parses keys 1..=6 into six consecutive `u32` fields of one struct in
+/// key order, terminates its walk on key 0, and discards every key above 6. Its
+/// request declares a parse ceiling of 7, so the six keys it understands are
+/// exactly the six this device sends it.
+///
+/// Two things follow, and both are why this paragraph is here rather than in a
+/// session note. First, the key *numbering* is shared across the rails rather
+/// than being a macOS 13 convention — key 1 is the max sample count on both, so
+/// renumbering an entry at or below 6 to suit one guest silently feeds the other
+/// a threadgroup limit where it expects a sample count. Second, the zero
+/// terminator is load-bearing on the oldest rail too, so the paragraph above is
+/// a two-rail statement and not a one-rail one.
+///
+/// A rail between these two has not been checked, and the ceiling each sends is
+/// the only thing that says what it parses — read the `key_table_len` field in
+/// that boot's own `device_info` line rather than assuming this prefix.
+///
 /// # Every key at or below 17 is named, and that is a rule rather than tidiness
 ///
 /// The guest's walker is a jump table with one arm per key, and each arm stores
@@ -1177,9 +1264,25 @@ pub fn device_info_caps(limits: &DeviceInfoLimits, version: u32) -> Vec<(u32, u3
 /// authorised four primitive types both backends refuse, and nothing said so
 /// because the entry was a pair of integers.
 ///
-/// A new entry at or below 17 therefore gets a `DEVICE_INFO_KEY_*` constant
-/// whose doc says what the guest does with it. Above 17 the guest discards the
-/// pair, so a bare number there promises nothing.
+/// A new entry therefore gets a `DEVICE_INFO_KEY_*` constant whose doc says what
+/// the guest does with it.
+///
+/// **That rule used to stop at 17, on the grounds that "above 17 the guest
+/// discards the pair, so a bare number there promises nothing". That is false on
+/// any rail newer than macOS 13, and it is why keys 18..44 sat here as bare
+/// integers.** macOS 13 declares a parse ceiling of 7 and does discard the rest;
+/// macOS 15 declares 42 and macOS 26 declares 45, and every key below their
+/// ceiling has its own dispatch arm storing into its own capability field. So
+/// the entries above 17 are instructions to those guests in exactly the sense
+/// the paragraph above describes, and they are the *only* instructions macOS 26
+/// gets that macOS 15 does not — the sender filters on the ceiling, so keys 42
+/// and 44 reach Tahoe alone.
+///
+/// The names below are decoded from the guests' own walkers and cross-checked
+/// against six values in this table that are self-describing under that reading
+/// (key 18 `0x20007` a packed 2.7, key 28 `7` exactly three declared bits, key
+/// 33 `4095` exactly twelve, key 37 `1009` an `MTLGPUFamily`, key 40 `256` an
+/// alignment, key 41 `7` three rounding modes).
 ///
 /// **Key 0 is not a key.** It terminates the walk and discards every remaining
 /// pair, so an entry keyed 0 would silently truncate this table at its position.
@@ -1213,28 +1316,240 @@ pub const DEVICE_INFO_CAPS: &[(u32, u32)] = &[
     (DEVICE_INFO_KEY_HEAP_BUFFER_GRANULARITY, 32),
     (DEVICE_INFO_KEY_HEAP_TEXTURES, 1),
     (DEVICE_INFO_KEY_BUFFER_WITH_IOSURFACE, 1),
-    (18, 131079),
-    (19, 1),
-    (21, 1),
-    (23, 1),
-    (24, 1),
-    (25, 1),
-    (26, 1),
-    (27, 1),
-    (28, 7),
-    (29, 1024),
-    (30, 32768),
-    (31, 32768),
-    (32, 16),
-    (33, 4095),
-    (34, 8),
-    (35, 2048),
-    (36, 16),
-    (37, 1009),
-    (40, 256),
-    (41, 7),
-    (42, 2),
-    (44, 127),
+    (DEVICE_INFO_KEY_MAX_MSL_VERSION, DEVICE_INFO_AIR_VERSION),
+    (DEVICE_INFO_KEY_SHARED_TEXTURES, 1),
+    (DEVICE_INFO_KEY_PROGRAMMABLE_SAMPLE_POSITIONS, 1),
+    (DEVICE_INFO_KEY_TILE_SHADERS, 1),
+    (DEVICE_INFO_KEY_IMAGEBLOCKS, 1),
+    (DEVICE_INFO_KEY_RASTER_ORDER_GROUPS, 1),
+    (DEVICE_INFO_KEY_MEMORY_ORDER_ATOMICS, 1),
+    (DEVICE_INFO_KEY_LARGE_MRT, 1),
+    (DEVICE_INFO_KEY_SUPPORT_FLAGS_2023, 7),
+    (DEVICE_INFO_KEY_MAX_COMPUTE_THREADS, 1024),
+    (DEVICE_INFO_KEY_MAX_COMPUTE_LOCAL_MEMORY, 32768),
+    (DEVICE_INFO_KEY_MAX_COMPUTE_TG_MEMORY, 32768),
+    (DEVICE_INFO_KEY_COMPUTE_TG_MEMORY_ALIGN, 16),
+    (DEVICE_INFO_KEY_SUPPORT_FLAGS_2024, 4095),
+    (DEVICE_INFO_KEY_GPU_CORE_COUNT, 8),
+    (DEVICE_INFO_KEY_MAX_TEXTURE_LAYERS, 2048),
+    (DEVICE_INFO_KEY_MAX_PREDICATED_NESTING, 16),
+    (DEVICE_INFO_KEY_GPU_FAMILY_CLAMPED, DEVICE_INFO_GPU_FAMILY),
+    (DEVICE_INFO_KEY_MIN_LINEAR_TEXTURE_ALIGN, 256),
+    (DEVICE_INFO_KEY_TEXTURE_WRITE_ROUNDING, 7),
+    (DEVICE_INFO_KEY_SUPPORT_FLAGS_2025, 2),
+    (DEVICE_INFO_KEY_HOST_GPU_FAMILIES, DEVICE_INFO_GPU_FAMILY_SET),
+];
+
+/// Wire key 18 — the **AIR version** this device's compiler targets, packed as
+/// `(major << 16) | minor`. The served `131079` is `0x20007`, i.e. AIR 2.7.
+///
+/// The guest's capability struct spells the field `MaxMetalShaderVersion` and
+/// stores it as two `u32` halves, which is what makes the packed form the wire
+/// carries look like a Metal Shading Language version. It is not one: there is
+/// no MSL 2.7. It is the AIR version, and the guest says so in its own words —
+/// a driven macOS 26 boot logs `MTLCompiler upgrade pass forced to use air
+/// version 2.7` 243 times and never logs another value.
+///
+/// The path is direct: the guest's Metal plugin reads both halves as one eight
+/// byte quantity and hands them to the Metal compiler as its target data. The
+/// major half is a floor rather than a preference — the plugin constructs no
+/// compiler at all when it is below 2 — so this key is load-bearing for
+/// *whether the guest can compile at all*, not only for what it compiles.
+///
+/// # Do not narrow this to match keys 37 and 44
+///
+/// A previous commit did, and it was wrong; it is reverted. The reasoning was
+/// that a sibling Metal plugin maps this pair to a device type as
+/// `minor + 4`, whose range (5..=11) coincides with the `Apple5`..`Apple11`
+/// generations [`DEVICE_INFO_KEY_HOST_GPU_FAMILIES`] names — so the minor looked
+/// like a third, contradicting spelling of the GPU family.
+///
+/// Two things kill that reading, and the second is the general lesson:
+///
+/// * the running guest calls the value an AIR version, in a log line, 243 times;
+/// * **the plugin that mapping lives in is not the plugin this rail loads.**
+///   The accelerator publishes one plugin name, the crashing processes' image
+///   lists agree with it 23 out of 23, and the loaded bundle contains no such
+///   mapping. A derivation read out of the wrong binary is not evidence about
+///   this pathway.
+///
+/// Narrowing it would take a real capability away — an AIR version is what the
+/// guest's compiler *emits against* — to satisfy an invariant that does not
+/// exist.
+///
+/// # The guest's own window, which is why [`DEVICE_INFO_AIR_VERSION`] is bounded
+///
+/// The value does not reach the plugin as sent. The guest kernel driver's
+/// device-info parser post-processes this key alone, before any plugin sees it:
+/// an **undefined** key 18 becomes `0x20002`, and a value **at or above
+/// `0x20008` is clamped down to `0x20007`**. No floor is applied — anything
+/// below `0x20001` passes through unchanged. It then splits the packed word
+/// into the two `u32` halves the capability struct carries.
+///
+/// So `0x20007` is the ceiling of what any guest on this pathway can be told,
+/// and this device already sends exactly that. Raising it is not a way to offer
+/// a newer AIR; it is a way to send a number the guest silently rewrites.
+/// [`DEVICE_INFO_AIR_VERSION`] carries a `const` assertion for the window so a
+/// future edit fails the build instead of being quietly clamped.
+pub const DEVICE_INFO_KEY_MAX_MSL_VERSION: u32 = 18;
+pub const DEVICE_INFO_KEY_SHARED_TEXTURES: u32 = 19;
+pub const DEVICE_INFO_KEY_MAX_VERTEX_AMPLIFICATION: u32 = 20;
+pub const DEVICE_INFO_KEY_PROGRAMMABLE_SAMPLE_POSITIONS: u32 = 21;
+pub const DEVICE_INFO_KEY_RASTERIZATION_RATE_LAYERS: u32 = 22;
+pub const DEVICE_INFO_KEY_TILE_SHADERS: u32 = 23;
+pub const DEVICE_INFO_KEY_IMAGEBLOCKS: u32 = 24;
+pub const DEVICE_INFO_KEY_RASTER_ORDER_GROUPS: u32 = 25;
+pub const DEVICE_INFO_KEY_MEMORY_ORDER_ATOMICS: u32 = 26;
+pub const DEVICE_INFO_KEY_LARGE_MRT: u32 = 27;
+/// Bit 0 `Apple5`, bit 1 `DynamicAttributeStride`, bit 2 `Texture2DMultisampleArray`.
+pub const DEVICE_INFO_KEY_SUPPORT_FLAGS_2023: u32 = 28;
+pub const DEVICE_INFO_KEY_MAX_COMPUTE_THREADS: u32 = 29;
+pub const DEVICE_INFO_KEY_MAX_COMPUTE_LOCAL_MEMORY: u32 = 30;
+pub const DEVICE_INFO_KEY_MAX_COMPUTE_TG_MEMORY: u32 = 31;
+pub const DEVICE_INFO_KEY_COMPUTE_TG_MEMORY_ALIGN: u32 = 32;
+/// Twelve bits: `LargeUserTasks`, `LargeKernelTasks`, `CommandBufferJump`,
+/// `RangeBuffer`, `SharedMemoryHeap`, `ArgumentBuffers`, `SIMDReduction`,
+/// `Float16BCubicFiltering`, `SIMDShuffleAndFill`, `ConditionalLoadStore`,
+/// `ComputeCompressedTextureWrite`, `SharedTexturePlacement`.
+pub const DEVICE_INFO_KEY_SUPPORT_FLAGS_2024: u32 = 33;
+pub const DEVICE_INFO_KEY_GPU_CORE_COUNT: u32 = 34;
+pub const DEVICE_INFO_KEY_MAX_TEXTURE_LAYERS: u32 = 35;
+pub const DEVICE_INFO_KEY_MAX_PREDICATED_NESTING: u32 = 36;
+/// A single raw `MTLGPUFamily` ordinal — the family the guest reports as *the*
+/// one this device is. Must not disagree with
+/// [`DEVICE_INFO_KEY_HOST_GPU_FAMILIES`], which is a set containing it.
+pub const DEVICE_INFO_KEY_GPU_FAMILY_CLAMPED: u32 = 37;
+pub const DEVICE_INFO_KEY_ARGUMENT_BUFFERS_TIER: u32 = 38;
+pub const DEVICE_INFO_KEY_ARGUMENT_BUFFERS_MAX_SAMPLERS: u32 = 39;
+pub const DEVICE_INFO_KEY_MIN_LINEAR_TEXTURE_ALIGN: u32 = 40;
+pub const DEVICE_INFO_KEY_TEXTURE_WRITE_ROUNDING: u32 = 41;
+/// Bit 0 `IndirectCommandBuffers`, bit 1 `ArgumentBuffers2025`, bit 2
+/// `EnhancedRenderICBs`. Reaches macOS 26 and no older rail.
+pub const DEVICE_INFO_KEY_SUPPORT_FLAGS_2025: u32 = 42;
+/// Bits 0..7 are `supportsFamily` for Apple 5, 6, 7, 8, 9, 9b, 10, 11 — a *set*,
+/// where [`DEVICE_INFO_KEY_GPU_FAMILY_CLAMPED`] is a single member of it.
+/// Reaches macOS 26 and no older rail.
+pub const DEVICE_INFO_KEY_HOST_GPU_FAMILIES: u32 = 44;
+
+/// `MTLGPUFamily.Apple1`. The Apple family ordinals are `1000 + n`, so this is
+/// the base every family value in this file is expressed against rather than a
+/// number chosen to fit one of them.
+pub const MTL_GPU_FAMILY_APPLE1: u32 = 1001;
+
+/// The single `MTLGPUFamily` this device presents itself as.
+///
+/// Apple9. It is the value key 37 has always carried; naming it is what lets the
+/// family *set* below be derived from it instead of written beside it.
+/// The value served for [`DEVICE_INFO_KEY_MAX_MSL_VERSION`]: AIR 2.7, packed
+/// `(major << 16) | minor`.
+///
+/// Named rather than left as `131079` in the table because the guest treats it
+/// as a bounded quantity and this device sits at the top of that bound. See the
+/// key's own doc for what the guest driver does to an out-of-window value; the
+/// assertions below are the enforceable half of it.
+pub const DEVICE_INFO_AIR_VERSION: u32 = 0x0002_0007;
+
+/// The lowest packed AIR version the guest accepts without falling back.
+///
+/// Below this the guest driver applies no correction, so the value reaches the
+/// Metal plugin as sent and lands on the plugin's out-of-range arm, which
+/// substitutes a fixed device type and driver version rather than deriving them
+/// from the AIR version. That is a silent downgrade, not a refusal.
+pub const DEVICE_INFO_AIR_VERSION_MIN: u32 = 0x0002_0001;
+
+/// The highest packed AIR version the guest honours.
+///
+/// At or above `0x20008` the guest driver clamps to this value, so sending more
+/// changes nothing the guest can observe while making this table disagree with
+/// what the guest actually holds.
+pub const DEVICE_INFO_AIR_VERSION_MAX: u32 = 0x0002_0007;
+
+const _: () = assert!(
+    DEVICE_INFO_AIR_VERSION >= DEVICE_INFO_AIR_VERSION_MIN
+        && DEVICE_INFO_AIR_VERSION <= DEVICE_INFO_AIR_VERSION_MAX,
+    "the served AIR version must sit inside the window the guest honours, or the guest \
+     silently rewrites it and this table stops describing what the guest holds"
+);
+
+pub const DEVICE_INFO_GPU_FAMILY: u32 = 1009;
+
+/// The `supportsFamily` set implied by [`DEVICE_INFO_GPU_FAMILY`].
+///
+/// Metal's Apple families are cumulative — a device that is Apple9 answers yes
+/// to Apple5 through Apple9 — so the set is exactly the bits at or below the
+/// family this device claims to be, and it is *computed* from it. Two spellings
+/// of one fact is what this avoids: the table used to carry `127` here beside
+/// `1009` at key 37, which claims Apple9 as the device and Apple10 as a
+/// supported family in the same reply.
+///
+/// That mattered because these two keys reach **macOS 26 and no older rail**, so
+/// a contradiction between them is invisible on every rail that renders
+/// correctly. Narrowing rather than widening is also the only safe direction:
+/// each bit is an instruction about what the guest may build, and Apple10 and
+/// Apple9b name feature sets no backend here implements.
+///
+/// Bit `n` is family `Apple(5 + n)`, so Apple9 is bit 4 and the set is bits
+/// 0..=4.
+pub const DEVICE_INFO_GPU_FAMILY_SET: u32 = {
+    let family_index = DEVICE_INFO_GPU_FAMILY - MTL_GPU_FAMILY_APPLE1; // 8 for Apple9
+    let bit = family_index - 4; // Apple5 is bit 0
+    (1u32 << (bit + 1)) - 1
+};
+
+// The set must contain the family it was derived from, and must not claim any
+// family above it. Both directions are asserted because the shift arithmetic
+// above is the only thing keeping them true, and a future family bump edits one
+// constant.
+const _: () = assert!(
+    DEVICE_INFO_GPU_FAMILY_SET & (1 << (DEVICE_INFO_GPU_FAMILY - MTL_GPU_FAMILY_APPLE1 - 4)) != 0,
+    "the family set must contain the family this device says it is"
+);
+const _: () = assert!(
+    DEVICE_INFO_GPU_FAMILY_SET >> (DEVICE_INFO_GPU_FAMILY - MTL_GPU_FAMILY_APPLE1 - 3) == 0,
+    "the family set must not claim a family above the one this device says it is"
+);
+
+/// Keys inside a guest's parse ceiling that its walker has **no arm for**.
+///
+/// Key 43 is a gap in Apple's own numbering: macOS 26 declares a ceiling of 45
+/// and its 45-entry jump table sends key 43 straight to the loop increment, so
+/// the pair is read and discarded. The capability struct has 43 keyed fields —
+/// keys 1..42 and 44 — and no forty-fourth.
+///
+/// This exists so the hole report does not name it. A hole is meant to read as
+/// "the guest has a field here and this device never fills it"; a key with no
+/// arm is not that, and reporting one sends the next reader looking for a value
+/// to send that the guest would throw away. It cost this investigation a boot.
+pub const DEVICE_INFO_DEAD_KEYS: &[u32] = &[43];
+
+/// Keys the guest has a real arm for that this device deliberately does not
+/// answer, and what each one's absence tells the guest.
+///
+/// These are the true holes — the ones the report should keep naming. Every
+/// entry leaves its field zero with its `Defined` byte clear, and the guest's
+/// accessors turn that into a specific refusal rather than into a zero:
+///
+/// * 20 `MaxVertexAmplificationCount` — `supportsVertexAmplificationCount:`
+///   then answers yes only for 1, so the guest builds no amplified passes.
+///   Correct: no rail here amplifies.
+/// * 22 `RasterizationRateLayerCount` —
+///   `supportsRasterizationRateMapWithLayerCount:` answers no, so the guest
+///   builds no variable-rate maps. Correct for the same reason.
+/// * 38 `ArgumentBuffersTier` and 39 `ArgumentBuffersMaxSamplerCount` — no
+///   consumer was found in either guest Metal plugin or the guest kernel
+///   driver; the plugin derives the tier from
+///   [`DEVICE_INFO_KEY_SUPPORT_FLAGS_2024`] instead. Answering them is believed
+///   inert, which is why they are listed rather than filled in.
+///
+/// All four are holes on macOS 15 as well as macOS 26, and macOS 15 renders a
+/// correct dock — so **none of them can explain a Tahoe-only defect.** That is
+/// the reasoning this constant exists to hold, because it is the reasoning a
+/// future session is most likely to redo from the hole report alone.
+pub const DEVICE_INFO_UNANSWERED_KEYS: &[u32] = &[
+    DEVICE_INFO_KEY_MAX_VERTEX_AMPLIFICATION,
+    DEVICE_INFO_KEY_RASTERIZATION_RATE_LAYERS,
+    DEVICE_INFO_KEY_ARGUMENT_BUFFERS_TIER,
+    DEVICE_INFO_KEY_ARGUMENT_BUFFERS_MAX_SAMPLERS,
 ];
 
 #[inline]

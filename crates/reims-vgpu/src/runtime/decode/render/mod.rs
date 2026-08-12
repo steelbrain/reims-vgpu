@@ -582,12 +582,32 @@ impl From<ColorAttachment> for AttachSubresource {
     }
 }
 
+/// Whether the arm asking [`attachment_subresource_is_bindable`] can render into
+/// a mip level other than zero.
+///
+/// The arms genuinely differ, which is why this is a parameter rather than a
+/// second predicate. The colour rail materializes a level's own plane inside the
+/// guest allocation — `TextureDescriptor::level_gva` gives its address, stride
+/// and geometry, and `render_target`'s linear rung has rendered into one since
+/// type-8 mip views existed. The depth/stencil rail has no such rung: it would
+/// bind level 0 and the guest would read a level it never wrote.
+///
+/// Making it an enum rather than a `bool` is the point — an arm has to say which
+/// it is, and it cannot say it by accident.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LevelSupport {
+    /// This arm renders into level 0 and nothing else.
+    LevelZeroOnly,
+    /// This arm resolves the named level's own plane.
+    AnyLevel,
+}
+
 /// Whether this device can honour an attachment's subresource as decoded.
 ///
-/// Only the whole texture at level 0, slice 0, plane 0 with no multisample
-/// resolve. `slice` and `depth_plane` joined the test when they became
-/// decodable: a depth buffer bound at slice 5 was previously read as slice 0 and
-/// silently accepted.
+/// Slice 0, plane 0, no multisample resolve, and a level the caller's rail can
+/// reach. `slice` and `depth_plane` joined the test when they became decodable:
+/// a depth buffer bound at slice 5 was previously read as slice 0 and silently
+/// accepted.
 ///
 /// It lives beside the structs it reads because four arms apply it — the stream
 /// decode that admits an attachment into a pass, once per aspect, and the Metal
@@ -603,8 +623,12 @@ impl From<ColorAttachment> for AttachSubresource {
 ///
 /// That is why it takes [`AttachSubresource`] rather than any one attachment
 /// type: a fifth arm gets the whole rule or does not compile.
-pub fn attachment_subresource_is_bindable(s: AttachSubresource) -> bool {
-    s.level == 0 && s.slice == 0 && s.depth_plane == 0 && s.resolve_texture_ref == 0
+pub fn attachment_subresource_is_bindable(s: AttachSubresource, levels: LevelSupport) -> bool {
+    let level_ok = match levels {
+        LevelSupport::LevelZeroOnly => s.level == 0,
+        LevelSupport::AnyLevel => true,
+    };
+    level_ok && s.slice == 0 && s.depth_plane == 0 && s.resolve_texture_ref == 0
 }
 
 /// Stencil attachment from a render-pass descriptor (slot @0x28).

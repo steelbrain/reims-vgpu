@@ -2283,7 +2283,10 @@ pub fn write_mapping_bytes_only<H: HostMemory + HostOps>(
     }
     // Deferred-writeback flush-on-access: land any pending resident content
     // in these pages first so this write applies on top of it, not under it.
-    crate::runtime::render_writeback::settle_guest_writes(
+    crate::runtime::writeback_debt::settle_for_mapping(
+        state,
+        host,
+        mapping_id,
         crate::runtime::render_writeback::SettleSite::MappingBytesWrite,
     );
     // Exact-window residency invalidation: guest pages in this range no
@@ -2330,7 +2333,36 @@ pub fn read_mapping_bytes<H: HostMemory + HostOps>(
     }
     // Deferred-writeback flush-on-access: this read must observe the resident
     // content, not the stale pre-dispatch guest bytes.
-    crate::runtime::render_writeback::settle_guest_writes(
+    //
+    // Narrowed to this mapping's own pages. Unnarrowed, this wait silently
+    // defeated the narrowing its callers had already done: `scanout::paint_mapping`
+    // rules the outstanding writeback disjoint from the very same mapping and
+    // skips its `ScanoutPaint` settle, then reaches here and waits for that same
+    // writeback anyway. An inner gate that is wider than the outer one makes the
+    // outer one decorative.
+    //
+    // Measured on driven macos-13 Apple Maps drags, three boots per arm,
+    // alternating pinned binaries on a quiesced host. The site was 31-34 waits a
+    // boot costing 153-287 ms, ~5 ms each; after narrowing it is **zero**, and the
+    // outcome counters say every one of those waits was `_disjoint` with no
+    // `_overlap` and no `_unnamed` — not one was owed. `fence_us/fence` and
+    // `sampled_us` both fall ~3x with clean separation between the arms.
+    //
+    // **No throughput claim.** End-to-end per-chain time does not separate at
+    // n=3: the `seed_us` and `engine_us` controls, which this cannot touch,
+    // drifted upward by more than the total moved down. ~34 waits of ~5 ms in a
+    // 25 s window is 0.7 % of wall clock concentrated in ~34 of ~1000 chains, so
+    // this is a tail effect and a median is the wrong instrument for it.
+    //
+    // Correctness is unchanged in the direction that matters: the skip needs the
+    // engine to *prove* the pending writeback lands nowhere in the page set, and
+    // an unnameable set (`None`) settles exactly as before. The page set comes
+    // from the same `mapping_reach_pages` the writeback's own destination is
+    // named with, so both ends of the comparison are one rule.
+    crate::runtime::writeback_debt::settle_for_mapping_unless_disjoint(
+        state,
+        host,
+        mapping_id,
         crate::runtime::render_writeback::SettleSite::MappingBytesRead,
     );
     copy_mapping_runs(

@@ -98,6 +98,50 @@ fn window_publish_key_advances_for_in_place_present() {
     );
 }
 
+/// A lazy type-11 Store publishes new pixels without writing a guest page, so
+/// the mapping's `content_generation` holds still across frames that genuinely
+/// differ — and the host window's publish key must move anyway.
+///
+/// Ungated, unlike its `present_epoch` sibling above: that term is macOS-only
+/// and this one is not, and the arm that measured the defect is x86/Vulkan.
+/// Without `frame_content_epoch` in the key, a driven macos-13 boot with
+/// `REIMS_VGPU_LAZY_WRITEBACK=on` published 60 fresh frames a second against 314
+/// `same_key`, where the eager arm published 81 against 131 — real frames
+/// discarded as unchanged, and the guest halved its own draw rate to match the
+/// vblank that follows the present.
+#[cfg(feature = "host-window")]
+#[test]
+fn window_publish_key_moves_for_a_lazy_store_that_wrote_no_guest_page() {
+    use super::window_publish::window_frame_key;
+    let mut state = crate::model::DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_ARM64E);
+    state.set_mapping_geom(7, 8, 4, 0x1e);
+
+    fn publish(state: &mut crate::model::DeviceState) {
+        let epoch = state.note_surface_content_published(7);
+        let generation = state.mappings.get(&7).expect("mapping 7").content_generation;
+        state.present.frame_generation = generation;
+        state.present.frame_content_epoch = epoch;
+    }
+
+    state.present.frame_mapping = 7;
+    publish(&mut state);
+    let first = window_frame_key(&state.present);
+    let generation = state.present.frame_generation;
+
+    publish(&mut state);
+
+    assert_eq!(
+        state.present.frame_generation, generation,
+        "a lazy Store writes no guest page, so the page stamp must not move — \
+         which is what makes the pixel stamp the only term that can"
+    );
+    assert_ne!(
+        window_frame_key(&state.present),
+        first,
+        "two lazy Stores into one surface are two frames and must publish twice"
+    );
+}
+
 /// The guest ISR read of the read-to-clear interrupt-status registers
 /// must observe live bits (and clear them) even while the drain worker
 /// owns the device lock — a stale cached mask loses stamp signals.

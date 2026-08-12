@@ -38,11 +38,31 @@
 //!   have defaulted to 1.0. Refusing is the faithful answer, and the repair is
 //!   not to widen the fallback but to narrow when it applies.
 //!
-//! **None of the second or third class has fired on any archived boot of this
-//! rig** — x86/PCI/Vulkan, driven under the window-drag and web-content probes
-//! as well as idle. For the second, each names a real Metal feature this
-//! workload does not reach, which is the reading that makes leaving them open a
-//! measurement rather than a bet. For the third the zero is structural on this
+//! **`NoSampledLayout` fires in the hundreds of thousands, and the zero that
+//! used to be recorded here was an artifact of where it was sampled.** The
+//! linear sampled zero-copy rung matched `Err(_)` and threw the reason away,
+//! emitting a route name of its own instead, so the slug reached no fail line
+//! however often the check refused — 22 270 declines in one driven macos-26
+//! boot, against 8 975 on macos-13. The reading "this class has never fired"
+//! was taken from the fail log and the fail log could not see it. Any future
+//! claim of that shape has to name the site that would emit, not just the
+//! absence of a grep hit.
+//!
+//! There was briefly a fourth pixel-format variant here,
+//! `SampledComponentsNotIdentity`, for a format whose Metal channels need a
+//! swizzle to sit on their Vulkan ones. It existed to size that class against
+//! the others, it did — `A8Unorm`, 9 198 declines a boot on macos-13 — and the
+//! repair it pointed at then removed the decline entirely, because
+//! `sampled_pixels` now hands the format's plan back instead of refusing over
+//! it. It is gone rather than kept as a healthy zero: nothing can construct it,
+//! and a reason with no producer is a claim the taxonomy cannot keep.
+//!
+//! **The rest of the second class, and all of the third, still read zero on
+//! archived boots of this rig** — x86/PCI/Vulkan, driven under the window-drag
+//! and web-content probes as well as idle. For the second, each names a real
+//! Metal feature this workload does not reach, which is the reading that makes
+//! leaving them open a measurement rather than a bet. For the third the zero is
+//! structural on this
 //! rig and says less: no host here declines a three-component vertex format, so
 //! the fallback is never entered and neither variant is reachable. It says
 //! nothing about the arm64 pathway, which this checkout cannot boot, and a
@@ -78,12 +98,6 @@ pub enum TranslateReason {
     /// storage-image layout for it. Same shape as [`Self::NoSampledLayout`]:
     /// the format is understood, this rail just does not carry it.
     NoStorageImageFormat(u16),
-    /// A `StorageImageSelector` ordinal outside the contract enum. Distinct
-    /// from [`Self::NoStorageImageFormat`] — that one starts from a Metal
-    /// format, this one from an already-narrowed selector, so a mismatch here
-    /// means the two vocabularies have drifted apart rather than that a format
-    /// is unsupported.
-    UnknownStorageSelector(u32),
     /// `MTLVertexFormat` value outside the SDK enum.
     UnknownVertexFormat(u32),
     /// `MTLVertexStepFunction` value outside the SDK enum.
@@ -187,7 +201,6 @@ impl crate::observe::Decline for TranslateReason {
         match self {
             Self::UnknownPixelFormat(_) => "unknown_pixel_format",
             Self::NoStorageImageFormat(_) => "no_storage_image_format",
-            Self::UnknownStorageSelector(_) => "unknown_storage_selector",
             Self::SrgbDowngraded(_) => "srgb_downgraded",
             Self::NoSampledLayout(_) => "no_sampled_layout",
             Self::NoColorAttachmentFormat(_) => "no_color_attachment_format",
@@ -234,7 +247,6 @@ impl TranslateReason {
             Self::UnknownVertexFormat(v)
             | Self::UnknownVertexStepFunction(v)
             | Self::VertexStepFunctionPerPatch(v)
-            | Self::UnknownStorageSelector(v)
             | Self::UnknownPrimitiveType(v)
             | Self::UnknownBlendFactor(v)
             | Self::UnknownBlendOperation(v)
@@ -283,7 +295,6 @@ mod tests {
         TranslateReason::NoSampledLayout(0),
         TranslateReason::NoColorAttachmentFormat(0),
         TranslateReason::NoStorageImageFormat(0),
-        TranslateReason::UnknownStorageSelector(0),
         TranslateReason::UnknownVertexFormat(0),
         TranslateReason::UnknownVertexStepFunction(0),
         TranslateReason::VertexStepFunctionPerPatch(0),
@@ -327,28 +338,27 @@ mod tests {
                 TranslateReason::NoSampledLayout(_) => 2,
                 TranslateReason::NoColorAttachmentFormat(_) => 3,
                 TranslateReason::NoStorageImageFormat(_) => 4,
-                TranslateReason::UnknownStorageSelector(_) => 5,
-                TranslateReason::UnknownVertexFormat(_) => 6,
-                TranslateReason::UnknownVertexStepFunction(_) => 7,
-                TranslateReason::VertexStepFunctionPerPatch(_) => 8,
-                TranslateReason::UnknownPrimitiveType(_) => 9,
-                TranslateReason::UnknownBlendFactor(_) => 10,
-                TranslateReason::UnknownBlendOperation(_) => 11,
-                TranslateReason::UnknownCompareFunction(_) => 12,
-                TranslateReason::UnknownStencilOperation(_) => 13,
-                TranslateReason::UnknownCullMode(_) => 14,
-                TranslateReason::UnknownWinding(_) => 15,
-                TranslateReason::UnknownFillMode(_) => 16,
-                TranslateReason::UnknownDepthClipMode(_) => 17,
-                TranslateReason::UnknownSamplerFilter(_) => 18,
-                TranslateReason::UnknownSamplerMipFilter(_) => 19,
-                TranslateReason::UnknownSamplerAddressMode(_) => 20,
-                TranslateReason::UnknownSamplerBorderColor(_) => 21,
-                TranslateReason::UnknownSwizzleSelector(_) => 22,
-                TranslateReason::FormatNotVertexBuffer(_) => 23,
-                TranslateReason::VertexFormatWidenReadAsFour(_) => 24,
-                TranslateReason::VertexFormatWidenShaderUnreadable(_) => 25,
-                TranslateReason::UnknownVisibilityResultMode(_) => 26,
+                TranslateReason::UnknownVertexFormat(_) => 5,
+                TranslateReason::UnknownVertexStepFunction(_) => 6,
+                TranslateReason::VertexStepFunctionPerPatch(_) => 7,
+                TranslateReason::UnknownPrimitiveType(_) => 8,
+                TranslateReason::UnknownBlendFactor(_) => 9,
+                TranslateReason::UnknownBlendOperation(_) => 10,
+                TranslateReason::UnknownCompareFunction(_) => 11,
+                TranslateReason::UnknownStencilOperation(_) => 12,
+                TranslateReason::UnknownCullMode(_) => 13,
+                TranslateReason::UnknownWinding(_) => 14,
+                TranslateReason::UnknownFillMode(_) => 15,
+                TranslateReason::UnknownDepthClipMode(_) => 16,
+                TranslateReason::UnknownSamplerFilter(_) => 17,
+                TranslateReason::UnknownSamplerMipFilter(_) => 18,
+                TranslateReason::UnknownSamplerAddressMode(_) => 19,
+                TranslateReason::UnknownSamplerBorderColor(_) => 20,
+                TranslateReason::UnknownSwizzleSelector(_) => 21,
+                TranslateReason::FormatNotVertexBuffer(_) => 22,
+                TranslateReason::VertexFormatWidenReadAsFour(_) => 23,
+                TranslateReason::VertexFormatWidenShaderUnreadable(_) => 24,
+                TranslateReason::UnknownVisibilityResultMode(_) => 25,
             }
         }
         let mut seen: Vec<usize> = ALL.iter().map(|r| index(*r)).collect();

@@ -419,7 +419,7 @@ impl SlabPool {
             self.granularity = props.limits.buffer_image_granularity.max(1);
         }
         let mem_type = ctx
-            .memory_type_for(ireq.memory_type_bits, MemoryClass::DeviceLocal)
+            .memory_type_for(ireq.memory_type_bits, ireq.size, MemoryClass::DeviceLocal)
             .ok_or({
                 super::types::DrawError::Unsupported(
                     super::reason::DrawReason::NoDeviceLocalMemoryForSlab {

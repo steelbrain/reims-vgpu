@@ -11,6 +11,13 @@ pub mod blit_exec;
 /// guest moves the addresses under them.
 #[cfg(feature = "backend-vulkan")]
 pub mod bound_buffers;
+/// Whether the gathers the buffer rail repeats land on bytes the guest declared
+/// it changed. Gated with the rail it measures: it folds a
+/// `backend::vulkan::engine::GuestRun`, which the Metal arm has no equivalent
+/// of, and the producer it charges is the Vulkan draw path.
+#[cfg(feature = "backend-vulkan")]
+pub mod buffer_gather_freshness;
+pub mod buffer_write_gen;
 /// Always-on proxies and censuses, one per measured bug class.
 pub mod census;
 /// Where a draw chain's wall clock goes on the runtime side of the engine
@@ -78,17 +85,26 @@ pub mod input;
 /// Process-global metal2vulkan SPIR-V cache (AIR content hash → SPIR-V).
 pub mod m2v_cache;
 /// IOSurface mapper capture + page-table resolve.
+pub mod map_audit;
 pub mod mapper;
 /// Write host BGRA into guest mapping pages (render writeback).
 pub mod mapping_write;
 /// generateMipmaps for multi-mip type-2/3 linear textures.
 pub mod mipmap;
+pub mod node_guard;
+/// Whether a range's page-table entries are in the state the guest's own next
+/// edit of them requires — the direction that is ordered is the map.
+pub mod range_coverage;
+pub mod released_pages;
 pub mod mmio;
 /// MTLB container → wrapped-AIR carve for metal2vulkan.
 pub mod mtlb;
 /// Object-list lookup and type-11 registration.
 pub mod objects;
 pub mod plan;
+/// A draw's pipeline and both its shaders, resolved once per pipeline object.
+#[cfg(feature = "backend-vulkan")]
+pub mod pipeline_resolve;
 /// The resident identity a type-11 guest surface renders into.
 #[cfg(feature = "backend-vulkan")]
 pub mod present_identity;
@@ -111,6 +127,8 @@ pub mod surface_cache;
 pub mod task_slot;
 /// Texture / type-11 geometry registration.
 pub mod texture;
+/// Owe a type-11 surface's guest pages a frame, and pay when something reads.
+pub mod writeback_debt;
 
 /// The unit-test host double, gated with its definition. An ungated re-export
 /// would keep it reachable and so keep it in the staticlib.

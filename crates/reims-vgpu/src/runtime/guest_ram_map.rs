@@ -21,7 +21,8 @@
 //! Neither side has both, and the device context deliberately does not take a
 //! host — see the module doc on [`crate::qemu::host_ops`] for why the runtime
 //! keeps it. So the granularity is published by the backend through
-//! [`crate::runtime::guest_ram::latch_granularity`] and the spans are fetched
+//! [`crate::runtime::guest_ram::latch_import_limits`] — together with the
+//! largest import that backend's heaps could hold — and the spans are fetched
 //! here, on the first guest-memory reference of a boot.
 //!
 //! Building lazily rather than eagerly also gets the ordering right for free:
@@ -38,7 +39,9 @@
 //! statement about the host rather than a loss, so it is reported once on the
 //! off channel rather than as a failure per reference.
 
-use crate::runtime::guest_ram::{granularity, GuestRamError, GuestRamImport, GuestRef};
+use crate::runtime::guest_ram::{
+    granularity, import_budget, GuestRamError, GuestRamImport, GuestRef,
+};
 use crate::runtime::host::{GuestRamRegionsError, HostOps};
 use std::sync::Arc;
 
@@ -57,6 +60,56 @@ pub enum MapRefusal {
     /// granule. Distinct from [`Self::HostRefused`] because the host answered
     /// fine and it is our own bound that rejected every span.
     NoUsableRegion { spans: usize },
+    /// The spans are importable and this guest is larger than the roomiest heap
+    /// on the host's GPU, so nothing may import any of them.
+    ///
+    /// # Why the whole map refuses rather than the block that does not fit
+    ///
+    /// An import is a `VkDeviceMemory` charged to one heap, and a submission
+    /// that names it makes the driver keep all of it resident. On a part whose
+    /// heaps are a fraction of the guest — an APU with a few gigabytes of
+    /// carve-out against a `-m 16G` guest — the kernel refuses to validate the
+    /// allocation and the submission fails, which arrives as a **lost device**
+    /// and a dead guest rather than as a slow rail. That has been reported from
+    /// the field on `radv`/`amdgpu` (`Not enough memory for command submission`,
+    /// then a lost context), and the reporter's own fix was to set
+    /// [`crate::env::GUEST_IMPORT`] off by hand. This makes the device reach the
+    /// same state without being told to.
+    ///
+    /// Refusing the whole map rather than the oversized block is what makes it
+    /// safe: the copying rails are selected by a page having no [`GuestRef`], and
+    /// a *partial* import would leave the writeback paths holding references
+    /// into one RAMBlock and none into another, which is a hard error at those
+    /// sites and not a fallback. All or nothing keeps the boot on the one arm
+    /// that is tested end to end.
+    ///
+    /// The comparison is against the sum, because every import is live at once
+    /// for the VM's lifetime and a submission may name any of them.
+    ///
+    /// This is a heap-*capacity* test and not a residency one, so it is a lower
+    /// bound: a host that passes it can still be too full to import. It catches
+    /// the direction that has been seen to kill a guest.
+    ///
+    /// # What would give such a host the fast rail back
+    ///
+    /// Not this refusal, which only makes the host work. The import is one
+    /// `VkDeviceMemory` per RAMBlock because that is the coarsest thing a bound
+    /// can be sized to, and nothing about the rail requires it: a window already
+    /// resolves against whichever import backs its GPA, and one straddling two of
+    /// them already groups into two `VkBuffer` sources. So a RAMBlock could be
+    /// imported in granularity-aligned chunks instead, imported on the first
+    /// reference into each, and then only the chunks a submission names have to
+    /// be resident — which is the guest's working set rather than its RAM.
+    ///
+    /// Two things make that more than a `flat_map` in [`resolve`], and both have
+    /// to be answered before it is worth building. The lookup is a linear
+    /// `find` over the imports, which is right for two and is not right for a
+    /// hundred. And a chunk imported and never released is only a *slower* way
+    /// to reach this same refusal, so a small-heap host needs the chunks to be
+    /// evictable — against this module's own standing advice, which is sound
+    /// only while every import fits. Neither can be measured on a host whose
+    /// roomiest heap is four times its guest.
+    ImportExceedsHeap { needed: u64, budget: u64 },
     /// The address is not inside any imported span. Guest RAM the GPU can reach
     /// exists, and this address is not in it — a device MMIO address, a hole,
     /// or a page the guest named that this machine does not back.
@@ -113,6 +166,7 @@ impl crate::observe::Decline for MapRefusal {
             Self::NoBackendImport => "guest_ram_map_no_backend_import",
             Self::HostRefused(_) => "guest_ram_map_host_refused",
             Self::NoUsableRegion { .. } => "guest_ram_map_no_usable_region",
+            Self::ImportExceedsHeap { .. } => "guest_ram_map_import_exceeds_heap",
             Self::GpaNotInAnyImport { .. } => "guest_ram_map_gpa_not_in_any_import",
             Self::Scattered { .. } => "guest_ram_map_scattered",
             // The inner reason is the diagnosis; this wrapper only says where
@@ -130,6 +184,10 @@ impl crate::observe::Decline for MapRefusal {
                 f
             }
             Self::NoUsableRegion { spans } => vec![("spans", spans.to_string())],
+            Self::ImportExceedsHeap { needed, budget } => vec![
+                ("needed_mb", (needed >> 20).to_string()),
+                ("budget_mb", (budget >> 20).to_string()),
+            ],
             Self::GpaNotInAnyImport { gpa } => vec![("gpa", format!("{gpa:#x}"))],
             Self::Scattered { pages, runs, first } => vec![
                 ("pages", pages.to_string()),
@@ -235,6 +293,61 @@ pub fn imports() -> Vec<Arc<GuestRamImport>> {
         .as_ref()
         .map(|r| r.imports.clone())
         .unwrap_or_default()
+}
+
+/// Take the whole guest-RAM import now, so the guest's first draw does not pay
+/// for it.
+///
+/// # Two steps, and only the second one costs
+///
+/// Asking the host where its RAMBlocks are ([`resolve`]) is a handful of shim
+/// calls. Handing each of those mappings to the GPU is `vkAllocateMemory` with
+/// a host pointer chained, which is where a driver that pins takes a reference
+/// on every page of guest RAM — seconds, proportional to the RAM the VM was
+/// given, and measured per block by
+/// [`crate::backend::vulkan::engine::warm_guest_ram_imports`].
+///
+/// Both were lazy and both landed on the guest's first `gather`, inside its
+/// first draw, inside a display transaction the guest abandons after 1000 ms.
+/// Moving only the first one bought nothing measurable, which is the finding
+/// that located the second: `guest_ram_span` moved a second earlier and
+/// `gather_us` did not move at all. Called from the guest driver's
+/// protocol-version handshake, both now run before the guest has a display pipe
+/// to arm a watchdog on, and every later caller finds the answer already there.
+///
+/// **It must never cache a negative.** [`resolve`] answers `NoBackendImport`
+/// when no backend has published a granularity yet, and that answer is latched
+/// in `MAP` for the rest of the boot — so warming before the backend is up
+/// would turn a capable host into one that refuses every window, which is the
+/// opposite of the intent and would look like a host that lacks the extension.
+/// The guard is the same question `resolve` asks first, and asking it here
+/// leaves the lazy path to handle a backend that is genuinely late.
+///
+/// The device-side half is Vulkan-only because only Vulkan has a device-side
+/// half: the Metal-direct arm builds a `newBufferWithBytesNoCopy` per call
+/// against unified memory and holds no per-RAMBlock import to warm.
+pub fn warm<H: HostOps + ?Sized>(host: &mut H) {
+    if granularity().is_none() {
+        return;
+    }
+    let already = MAP.lock().unwrap_or_else(|p| p.into_inner()).is_some();
+    if !already {
+        with_map(host, |_| ());
+    }
+    #[cfg(feature = "backend-vulkan")]
+    {
+        let imports = imports();
+        if !imports.is_empty() {
+            let (warmed, bytes) =
+                crate::backend::vulkan::engine::warm_guest_ram_imports(&imports);
+            if warmed > 0 {
+                crate::observe::off(format!(
+                    "guest_ram_warm blocks={warmed} bytes={bytes} spans={}",
+                    imports.len()
+                ));
+            }
+        }
+    }
 }
 
 /// Resolve on the first call of a boot, then run `body` against the result.
@@ -429,6 +542,53 @@ pub fn reference_for_pages<H: HostOps + ?Sized>(
 
 /// Ask the host where guest RAM lives and bound every span to the backend's
 /// granularity.
+///
+/// # This used to run on the guest's first draw, and it is NOT the two seconds
+///
+/// It was lazy — the first `reference_for_pages` triggered it — and it now runs
+/// at the guest driver's protocol handshake instead ([`warm`]). **That move was
+/// measured and it did not shift the stall**, which is what located the real
+/// one: asking the host where its RAM is costs nothing, and handing those
+/// mappings to the GPU costs everything. The evidence is one timestamp —
+/// `guest_ram_span`, emitted once per boot by this function, moved from t=56453
+/// to t=55342 while `gather_us` on the first frame stayed at 2 180 583 over the
+/// same six gathers.
+///
+/// The seconds are `vkAllocateMemory` with the host pointer chained, measured
+/// per RAMBlock at [`crate::backend::vulkan::engine::warm_guest_ram_imports`],
+/// which is now also warmed from [`warm`]. The table below is the state before
+/// that, kept because its second row is what ruled out a per-byte cost and sent
+/// the search to one-time setup:
+///
+/// ```text
+///                 draw_stall     stage_us     gather_us  gather_n  gather_b
+/// macos-11 first   2 028 844    2 022 252     2 022 259         6   1 176 768
+/// macos-11 later           —            —            75        61  13 545 376
+/// macos-13 first   1 959 875    1 951 567     1 951 562         4     523 904
+/// macos-13 later           —            —           105       104  15 318 048
+/// ```
+///
+/// Six gathers of 1.1 MB taking two seconds and sixty-one gathers of 13 MB
+/// taking 75 µs is not a gather cost; it is one-time setup charged to whoever
+/// arrives first. The same boots report it as a `sync_exec_lock_hold` of
+/// ~2 000 000 µs over one to three draws.
+///
+/// **The guest has a one-second watchdog behind this.** Its display pipe waits
+/// on a submitted display transaction and gives up after 1000 ms, so a first
+/// frame that takes two seconds blows it on every boot of every rail. Both
+/// rails measured here do blow it; the macos-13 guest recovers and the macos-11
+/// guest does not, and on macos-11 that is the whole visible failure — the
+/// transaction stays pending, WindowServer stops answering, and the session
+/// never starts.
+///
+/// The same driven boot then timed the two halves of the import separately and
+/// read `probe_us=0` beside `alloc_us=2 493 029` for a 15 032 385 536-byte
+/// RAMBlock and `alloc_us=309 796` for a 2 146 435 072-byte one — the whole
+/// stall, in the one call the first gather was the first to reach. That is what
+/// [`warm`] now takes at the handshake.
+///
+/// Timings above are wall clock on a shared host and are upper bounds; the
+/// counts and byte totals are not.
 fn resolve<H: HostOps + ?Sized>(host: &mut H) -> Resolved {
     let Some(align) = granularity() else {
         return Resolved {
@@ -454,6 +614,19 @@ fn resolve<H: HostOps + ?Sized>(host: &mut H) -> Resolved {
         .into_iter()
         .filter_map(|span| GuestRamImport::new(span, align).ok().map(Arc::new))
         .collect();
+    // Every import is live for the VM's lifetime and any submission may name any
+    // of them, so what has to fit is the sum and not the largest block. A guest
+    // that does not fit takes the copying rails whole rather than in part — see
+    // [`MapRefusal::ImportExceedsHeap`] for why a partial import is the one
+    // outcome that is worse than either.
+    let needed: u64 = imports.iter().map(|i| i.len()).sum();
+    let over_budget = import_budget().filter(|budget| needed > *budget);
+    if let Some(budget) = over_budget {
+        return Resolved {
+            imports: Vec::new(),
+            refusal: Some(MapRefusal::ImportExceedsHeap { needed, budget }),
+        };
+    }
     let refusal = imports
         .is_empty()
         .then_some(MapRefusal::NoUsableRegion { spans: count });
@@ -502,7 +675,20 @@ fn report_once(refusal: MapRefusal) -> MapRefusal {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::guest_ram::{forget_granularity, latch_granularity, GuestRamRegion};
+    use crate::runtime::guest_ram::{forget_import_limits, latch_import_limits, GuestRamRegion};
+
+    /// A budget no test span can exceed, so a test about the granularity is not
+    /// also a test about the heap. The budget tests name their own.
+    const UNBOUNDED: u64 = u64::MAX;
+
+    /// Latch a granularity with a budget that admits everything.
+    fn latch_granularity(align: u64) {
+        latch_import_limits(align, UNBOUNDED);
+    }
+
+    fn forget_granularity() {
+        forget_import_limits();
+    }
 
     /// The whole module is process-global, and so is the granularity latch.
     /// Every test here takes this and restores both.
@@ -563,6 +749,135 @@ mod tests {
         reset();
         forget_granularity();
         out
+    }
+
+    /// Run `body` with a granularity and an explicit heap budget latched.
+    fn with_budget<R>(align: u64, budget: u64, body: impl FnOnce() -> R) -> R {
+        let _guard = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        reset();
+        latch_import_limits(align, budget);
+        let out = body();
+        reset();
+        forget_import_limits();
+        out
+    }
+
+    /// The bytes [`two_spans`] asks this device to keep resident. Derived from
+    /// the spans rather than written out, so a change to either stays one number.
+    fn two_spans_bytes() -> u64 {
+        two_spans().0.iter().map(|r| r.len).sum()
+    }
+
+    /// A guest larger than the roomiest heap on the host's GPU must not import
+    /// at all.
+    ///
+    /// This is the reported `radv`/`amdgpu` failure: the import succeeds, and
+    /// every submission that names it then fails validation in the kernel with
+    /// `Not enough memory for command submission`, which arrives as a lost
+    /// device. The copying rails are the working configuration on such a host and
+    /// this is how the device reaches them without an operator setting a variable.
+    #[test]
+    fn a_guest_larger_than_every_heap_takes_the_copying_rails() {
+        let needed = two_spans_bytes();
+        with_budget(0x1000, needed - 1, || {
+            let mut host = two_spans();
+            assert_eq!(
+                standing_refusal(&mut host),
+                Some(MapRefusal::ImportExceedsHeap {
+                    needed,
+                    budget: needed - 1,
+                }),
+                "a guest past the budget must refuse by name"
+            );
+            assert_eq!(
+                imports().len(),
+                0,
+                "and must not leave a partial import behind"
+            );
+        });
+    }
+
+    /// The bound is `>`, not `>=`: a guest that exactly fills the roomiest heap
+    /// is admitted, because nothing in the contract says an allocation the size
+    /// of its heap cannot be made. Pinned because an off-by-one in the safe
+    /// direction here silently costs every host whose heap equals its guest.
+    #[test]
+    fn a_guest_that_exactly_fills_the_roomiest_heap_still_imports() {
+        let needed = two_spans_bytes();
+        with_budget(0x1000, needed, || {
+            let mut host = two_spans();
+            assert_eq!(standing_refusal(&mut host), None);
+            assert_eq!(imports().len(), 2);
+        });
+    }
+
+    /// A backend that publishes a granularity beside a zero budget has published
+    /// nothing: the pair is withdrawn, and the map reads it as a host that cannot
+    /// import. Without this, a zero budget would refuse every guest by name and
+    /// blame the guest's size for a backend that answered badly.
+    #[test]
+    fn a_zero_budget_withdraws_the_granularity_rather_than_refusing_every_guest() {
+        with_budget(0x1000, 0, || {
+            let mut host = two_spans();
+            assert_eq!(
+                standing_refusal(&mut host),
+                Some(MapRefusal::NoBackendImport),
+                "a zero budget is a backend that cannot import, not a guest that is too big"
+            );
+        });
+    }
+
+    /// Warming before a backend has published a granularity must leave the
+    /// resolution untaken, so the import a late backend enables is still
+    /// available.
+    ///
+    /// This is the whole hazard in moving the import off the guest's first
+    /// draw. `resolve` answers `NoBackendImport` when there is no granularity
+    /// and that answer is latched in `MAP` for the rest of the boot, so a warm
+    /// taken one instant too early does not merely fail to help — it converts a
+    /// host that can import into one that refuses every window for the life of
+    /// the VM, and reports it as a host lacking the extension.
+    #[test]
+    fn warming_before_the_backend_publishes_a_granularity_latches_nothing() {
+        with_granularity(None, || {
+            let mut host = two_spans();
+            warm(&mut host);
+            assert!(
+                MAP.lock().unwrap_or_else(|p| p.into_inner()).is_none(),
+                "a warm with no granularity must not latch a refusal"
+            );
+
+            // The backend comes up late; the import must still be available.
+            latch_granularity(0x1000);
+            warm(&mut host);
+            assert_eq!(
+                standing_refusal(&mut host),
+                None,
+                "the late backend's import must still resolve"
+            );
+            assert_eq!(imports().len(), 2, "both spans import once warmed");
+        });
+    }
+
+    /// Warming is what the first reference would have done, and doing it twice
+    /// changes nothing — the guest's handshake may be replayed, and every later
+    /// caller has to find the same answer.
+    #[test]
+    fn warming_is_idempotent_and_equals_what_the_lazy_path_would_resolve() {
+        let lazy = with_granularity(Some(0x1000), || {
+            let mut host = two_spans();
+            let refusal = standing_refusal(&mut host);
+            (refusal, imports().len())
+        });
+        let warmed = with_granularity(Some(0x1000), || {
+            let mut host = two_spans();
+            warm(&mut host);
+            warm(&mut host);
+            let refusal = standing_refusal(&mut host);
+            (refusal, imports().len())
+        });
+        assert_eq!(warmed, lazy);
+        assert_eq!(warmed.1, 2);
     }
 
     /// An address in either span resolves, and the offset it resolves to is the

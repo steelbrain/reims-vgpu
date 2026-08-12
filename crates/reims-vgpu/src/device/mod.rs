@@ -120,6 +120,10 @@ struct BoundDevice {
     vbl_shared_gpa: AtomicU64,
     vbl_display_index: AtomicU32,
     vbl_online: AtomicBool,
+    /// Guest page size, published with the rest of the lock-free VBL snapshot.
+    /// The refresh tick's pending write is page-bounded like every other write
+    /// into the shared page, and this arm has no `DeviceState` to ask.
+    vbl_page_size: AtomicU64,
     /// Wall-clock ms of the last VBL claimed by either the locked or contended
     /// poll path. One shared limiter keeps guest pacing independent of which
     /// path happens to win the device lock.
@@ -261,6 +265,7 @@ pub fn device_create(ops: Option<ReimsVgpuHostOps>, page_shift: u32) -> Option<u
             vbl_shared_gpa: AtomicU64::new(0),
             vbl_display_index: AtomicU32::new(0),
             vbl_online: AtomicBool::new(false),
+            vbl_page_size: AtomicU64::new(0),
             vbl_last_us: AtomicU64::new(0),
             ops,
             #[cfg(feature = "host-window")]
@@ -346,6 +351,17 @@ pub fn device_reset(id: u64) -> bool {
         slot.present_action_pending.store(false, Ordering::Release);
         slot.present_boundary_seen.store(false, Ordering::Release);
         crate::runtime::census::present_proxy::reset_for_device();
+        // The pipeline memo is keyed by `(task_id, pipeline_ref)`, which are the
+        // *guest's* names and mean nothing across a reset: the next guest to
+        // boot names its own task 1 and its own pipeline 9, and an entry left
+        // over from the last one would be checked against object-list entries
+        // read out of the new guest's memory. Those could match by coincidence
+        // — the entry is 12 bytes and a fresh guest lays its object list out the
+        // same way — and a coincidence there serves the previous boot's shader.
+        // Unlike the translate cache underneath it, this map is not
+        // content-keyed and so cannot survive the identity of its keys changing.
+        #[cfg(feature = "backend-vulkan")]
+        crate::runtime::pipeline_resolve::forget_all();
         true
     } else {
         false
@@ -546,13 +562,30 @@ pub fn device_drain(id: u64) -> bool {
     // Both hold the device lock, and which one owns the worker's wall clock is
     // the question `drain_duty` exists to answer.
     let tranche_started = std::time::Instant::now();
+    // The same instant on the crate's own clock, so a lookup inside the drain
+    // can say how late in this tranche it happened without threading a start
+    // time through every call. See `census::tranche_elapsed_us`.
+    crate::runtime::drain::note_tranche_started(crate::observe::elapsed_us());
     device.drain(&mut host);
+    // The tail is timed apart from `Device::drain` because it is inside
+    // `drain_us` and inside no `DrainPhase`, and that residue is a third of the
+    // drain worker's wall clock on every workload measured — 933 ms a second of
+    // `drain_us` against 604 of `draw_us` on a driven `blur=40` boot. A gap that
+    // size on the one thread every guest packet serializes through cannot be
+    // left to inference.
+    let tail_started = std::time::Instant::now();
     // Submit any deferred draw batch before the worker sleeps: consumers
     // inside the tranche flush on their own (engine begin_entry), this bounds
     // only the idle-tail latency of the last same-target run.
     #[cfg(feature = "backend-vulkan")]
     crate::backend::vulkan::engine::flush_batched_draws();
+    let tail_us = tail_started.elapsed().as_micros() as u64;
+    let boundary_started = std::time::Instant::now();
     publish_present_boundary(&slot, device.state.present.frame_flush_seen);
+    crate::runtime::drain::note_drain_tail(
+        tail_us,
+        boundary_started.elapsed().as_micros() as u64,
+    );
     let drain_us = tranche_started.elapsed().as_micros() as u64;
     let publish_started = std::time::Instant::now();
     // Push the finished present frame to the host-owned window (if running).
@@ -566,6 +599,16 @@ pub fn device_drain(id: u64) -> bool {
     // Same one-second cadence, so the cache trend lines up row-for-row with
     // `store_routes` and `drain_duty`. Measure-only; see `note_cache_levels`.
     crate::runtime::surface_cache::note_cache_levels(&device.state, &host);
+    // Per tranche rather than per census window, unlike the levels above: this
+    // measures how long a slot the guest named takes to appear, so the sampling
+    // interval is the resolution of the answer. Returns immediately when nothing
+    // is watched, which is every tranche on every rail but macos-26.
+    crate::runtime::objects::slot_recheck::sweep(&device.state, &host);
+    // Beside it and on the same cadence: a page the guest released is judged
+    // against the write census, which only moves when this device writes. Also
+    // returns immediately when nothing is watched.
+    crate::runtime::released_pages::sweep(&mut device.state);
+    crate::runtime::released_pages::note_levels(&device.state);
     // The bind registry's own levels, on that same cadence and read against the
     // `bb_retire_*` routes: what the retirements dropped, and what the survivors
     // look like.
@@ -611,6 +654,12 @@ pub fn device_drain(id: u64) -> bool {
 /// Enqueues HostActions (gfx IRQ / scanout); QEMU must deliver actions after
 /// this call.
 pub fn device_poll(id: u64) -> bool {
+    // Before the lock, and before the `device_slot` miss can return: this is the
+    // only periodic callback that runs on a thread other than the drain worker,
+    // so it is the only place that can report a driver call the drain worker is
+    // still inside. See `observe::driver_watch` for what that failure looks like
+    // from the log (it looks like nothing at all).
+    crate::observe::driver_watch::note_tick();
     let Some(slot) = device_slot(id) else {
         return false;
     };
@@ -646,6 +695,8 @@ pub fn device_poll(id: u64) -> bool {
         .store(device.state.display.display_index, Ordering::Release);
     slot.vbl_online
         .store(device.state.display.online_acked, Ordering::Release);
+    slot.vbl_page_size
+        .store(device.state.page_size(), Ordering::Release);
     // Census both source polls and the independently time-gated VBL rate.
     // Drive the resident idle-drain off the poll heartbeat, which ticks even when
     // the guest stops compositing (a static page means no publishes at all).
@@ -696,7 +747,6 @@ pub fn device_poll(id: u64) -> bool {
 /// clear the acked ONLINE bit, so a torn write cannot resurrect it — far better
 /// than dropping ~90% of VBLs, which is the pre-fix behaviour under load.
 fn vbl_contended_pulse(slot: &BoundDevice) {
-    use crate::runtime::host::HostMemory;
     let gpa = slot.vbl_shared_gpa.load(Ordering::Acquire);
     let now = crate::observe::elapsed_ms() as u64;
     if gpa == 0 || !slot.vbl_online.load(Ordering::Acquire) {
@@ -706,41 +756,31 @@ fn vbl_contended_pulse(slot: &BoundDevice) {
     let Some(ops) = slot.ops else {
         return;
     };
-    // Both poll paths share one limiter, so both have to report into one census
-    // or the delivered rate reads low by whatever share of polls found the
-    // device lock contended.
-    if !crate::runtime::drain::claim_display_vbl(&slot.vbl_last_us, crate::observe::elapsed_us()) {
-        crate::runtime::drain::note_vbl(crate::runtime::drain::VBL_NOT_CLAIMED, now);
+    let page_size = slot.vbl_page_size.load(Ordering::Acquire);
+    if page_size == 0 {
+        // The locked poll publishes this with the rest of the snapshot, so a
+        // zero means no locked poll has run since bind. Nothing is owed yet.
+        crate::runtime::drain::note_vbl(crate::runtime::drain::VBL_NOT_ONLINE, now);
         return;
     }
-    crate::runtime::drain::note_vbl(crate::runtime::drain::VBL_DELIVERED, now);
     let mut scratch = VecDeque::new();
     let mut host = QemuHost::new(&ops, &mut scratch, &slot.prompt_actions);
-    let mut buf = [0u8; 4];
-    if host
-        .read_gpa(gpa + crate::model::DISPLAY_SHARED_PENDING, &mut buf)
-        .is_err()
-    {
-        return;
-    }
-    // ONLINE is acked here (vbl_online), so a lingering bit2 is stale — drop it
-    // (mirrors signal_display_vbl's post-ack masking) and OR in the VBL bit.
-    let pending = u32::from_le_bytes(buf);
-    let next =
-        (pending & !crate::model::DISPLAY_ONLINE_EVENT_MASK) | crate::model::DISPLAY_VBL_EVENT_MASK;
-    if host
-        .write_gpa(
-            gpa + crate::model::DISPLAY_SHARED_PENDING,
-            &next.to_le_bytes(),
-        )
-        .is_err()
-    {
-        return;
-    }
-    let idx = slot.vbl_display_index.load(Ordering::Acquire);
-    slot.intr_disp
-        .fetch_or(1u32 << (idx & 0x1f), Ordering::AcqRel);
-    host.enqueue(HostAction::irq_gfx());
+    // One body decides what a refresh tick writes, and both poll arms call it.
+    // This arm used to carry its own copy, and the copy had already lost a term:
+    // it never read the enable word at all, so it set a pending bit the guest's
+    // ISR would never clear and counted the write as `delivered`.
+    //
+    // The shared limiter lives in there too, so both arms report into one census
+    // and neither can spend a grid slot on a tick that found the guest disarmed.
+    crate::runtime::drain::signal_display_refresh_classes(
+        &mut host,
+        gpa,
+        slot.vbl_display_index.load(Ordering::Acquire),
+        &slot.intr_disp,
+        page_size as usize,
+        &slot.vbl_last_us,
+        crate::observe::elapsed_us(),
+    );
 }
 
 /// Pop one HostAction for the QEMU BH. Returns false if the queue is empty.

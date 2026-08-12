@@ -2,14 +2,14 @@
 //!
 //! # The vocabulary is declared once
 //!
-//! [`engine_counters!`] takes the counter names and generates the five things
+//! [`engine_counters!`] takes the counter names and generates the six things
 //! that used to spell them out separately: the atomic [`EngineCounters`], the
-//! plain-`u64` [`CounterSnapshot`], and the three whole-vocabulary walks
-//! [`EngineCounters::snapshot`], [`EngineCounters::reset`] and
-//! [`CounterSnapshot::delta_since`].
+//! plain-`u64` [`CounterSnapshot`], and the four whole-vocabulary walks
+//! [`EngineCounters::snapshot`], [`EngineCounters::reset`],
+//! [`CounterSnapshot::delta_since`] and [`CounterSnapshot::delta_fields`].
 //!
-//! Writing seventy names five times is how a counter silently stops working, and
-//! neither failure mode is a compile error or a log line:
+//! Writing a hundred names six times is how a counter silently stops working,
+//! and none of the failure modes is a compile error or a log line:
 //!
 //! * missing from `reset` — the counter reports a lifetime total into a reader
 //!   that asked for a window, so a per-second rate reads as monotonically rising;
@@ -17,22 +17,39 @@
 //!   is indistinguishable from "this path never ran". That is the
 //!   "an event count is not a state" trap in `AGENTS.md` with the count itself
 //!   broken.
+//! * missing from the emitted line — the counter is correct and nobody can read
+//!   it, which is the same thing from the outside. This is the one that actually
+//!   happened: `engine_delta` named its fields by hand and had fallen **35
+//!   counters** behind the vocabulary, so a run built to read four of them
+//!   measured nothing and reported a clean zero. `delta_fields` is generated for
+//!   that reason, and the emitter now walks it instead of naming anything.
 //!
 //! All five lists were checked against each other before this collapse and all
 //! five agreed, so the macro changes no behaviour. What it changes is that they
 //! can no longer disagree.
 //!
-//! The three groups are a real distinction, not a formatting one. `windowed` is
+//! The four groups are a real distinction, not a formatting one. `windowed` is
 //! zeroed by `reset()`; `cumulative` deliberately survives it, because a
 //! device-loss count is a fact about the boot and not about the measurement
 //! window, and only `reset_all()` clears it; `pool_sourced` has no atomic at all
 //! and is merged in from `ResourcePools` by `engine::counter_snapshot`.
 //!
+//! `pool_levels` is merged in the same way as `pool_sourced` but is not a rate:
+//! every field in it is an absolute high-water or an instantaneous level, so
+//! subtracting two readings of one yields nonsense that reads as a plausible
+//! zero. That is why the group exists rather than a comment saying so —
+//! `delta_since` carries these through unchanged, `delta_fields` omits them, and
+//! `census::emit_registry_pressure` prints them absolute beside the prose that
+//! says how each is read. Putting a level in the wrong group is now the only way
+//! to get it onto the per-interval line, and that is a visible edit rather than
+//! an omission.
+//!
 //! # A field with no named reader is not dead
 //!
-//! [`CounterSnapshot`] is consumed only by the integration tests in `tests/`.
-//! No product code reads it and no log line emits it, so a sweep for "fields
-//! nobody references" reports most of this struct. Twenty-seven of the
+//! [`CounterSnapshot`] is named field-by-field only by the integration tests in
+//! `tests/`; the census reaches it through the generated `delta_fields`, which
+//! mentions no name. So a sweep for "fields nobody references" still reports
+//! most of this struct. Twenty-seven of the
 //! seventy-one came back that way. Do not act on that sweep: the struct derives
 //! `Debug` and every assertion in those tests prints the *whole* snapshot on
 //! failure (`"...: {d:?}"`), so the unasserted fields are the diagnostic context
@@ -90,6 +107,7 @@ macro_rules! engine_counters {
         windowed { $($(#[$wm:meta])* $win:ident,)* }
         cumulative { $($(#[$cm:meta])* $cum:ident,)* }
         pool_sourced { $($(#[$pm:meta])* $pool:ident,)* }
+        pool_levels { $($(#[$lm:meta])* $lvl:ident,)* }
     ) => {
         /// Process-wide product-path counters (resettable for tests).
         #[derive(Debug, Default)]
@@ -105,6 +123,7 @@ macro_rules! engine_counters {
             $($(#[$wm])* pub $win: u64,)*
             $($(#[$cm])* pub $cum: u64,)*
             $($(#[$pm])* pub $pool: u64,)*
+            $($(#[$lm])* pub $lvl: u64,)*
         }
 
         impl EngineCounters {
@@ -116,6 +135,7 @@ macro_rules! engine_counters {
                     $($win: self.$win.load(Ordering::Relaxed),)*
                     $($cum: self.$cum.load(Ordering::Relaxed),)*
                     $($pool: 0,)*
+                    $($lvl: 0,)*
                 }
             }
 
@@ -135,12 +155,46 @@ macro_rules! engine_counters {
             /// This reading minus an earlier one, field by field. Saturating
             /// because a `reset` between the two readings makes `earlier`
             /// larger, and a window of "no work" must read 0 rather than wrap.
+            ///
+            /// `pool_levels` fields are **carried through unchanged**, not
+            /// subtracted: a high-water mark minus an earlier high-water mark is
+            /// not a high-water mark, and it reads as 0 for the rest of a boot
+            /// once the true maximum is behind the window. So the difference of
+            /// two readings still holds the level, and a caller that prints one
+            /// gets the answer rather than a plausible zero.
             pub fn delta_since(&self, earlier: &CounterSnapshot) -> CounterSnapshot {
                 CounterSnapshot {
                     $($win: self.$win.saturating_sub(earlier.$win),)*
                     $($cum: self.$cum.saturating_sub(earlier.$cum),)*
                     $($pool: self.$pool.saturating_sub(earlier.$pool),)*
+                    $($lvl: self.$lvl,)*
                 }
+            }
+
+            /// Every field that is a **rate** — one `(name, value)` pair per
+            /// counter that means "this many since the last reading", in
+            /// declaration order.
+            ///
+            /// This is what `runtime::drain::census` prints as `engine_delta`,
+            /// and it exists so that line cannot drift from the vocabulary. It
+            /// used to be a hand-written format string naming its fields twice,
+            /// and it had silently fallen 35 counters behind: a name added to
+            /// this macro got a field, a reset and a delta, and then printed
+            /// nowhere. That reads exactly like a path that never runs, which is
+            /// the same trap this module's docs describe for a missing
+            /// `delta_since` arm, one step further along — and it cost a
+            /// twelve-boot A/B run that could not answer its own question,
+            /// because the four counters it was built to read were among them.
+            ///
+            /// `pool_levels` is excluded on purpose. Those are absolute
+            /// high-waters, they are not per-interval, and `registry_pressure`
+            /// prints them beside the prose that says how to read each one.
+            pub fn delta_fields(&self) -> Vec<(&'static str, u64)> {
+                vec![
+                    $((stringify!($win), self.$win),)*
+                    $((stringify!($cum), self.$cum),)*
+                    $((stringify!($pool), self.$pool),)*
+                ]
             }
         }
     };
@@ -152,6 +206,33 @@ engine_counters! {
         allocs,
         shader_hits,
         shader_misses,
+        /// SPIR-V words walked by [`super::caches::Caches::get_or_create_shader`]
+        /// before it can look anything up, summed over every call including the
+        /// hits.
+        ///
+        /// Keying a module by its contents means the key costs a pass over the
+        /// contents, and this device asks for two of them — the storage-image
+        /// capability derivation and the digest — on every draw, for both stages,
+        /// whether or not the module is already cached. `shader_hits` alone reads
+        /// as a working cache and says nothing about that, the same way
+        /// `sampled_cache_hits` read as working until `sampled_cache_hit_bytes`
+        /// priced it: a hit over a 2 KiB module and a hit over an 88 KiB one are
+        /// the same count and forty times the work.
+        ///
+        /// Divided by the census window this is a bandwidth, which is the form
+        /// that can be compared against what a hashing pass over memory costs.
+        shader_hash_words,
+        /// `shader_hits` that never walked the module at all, because
+        /// `get_or_create_shader_memoized` recognised the allocation its words
+        /// live in and already knew the digest.
+        ///
+        /// Read as a *fraction of* `shader_hits`, which is the only form that
+        /// says anything: the two together are the front index's hit rate, and
+        /// `shader_hash_words` beside them is what the walks that remain cost.
+        /// A boot where this sits well below `shader_hits` has a draw path
+        /// handing the walking form an allocation it does not hold — which is a
+        /// correctness-neutral regression that nothing else would report.
+        shader_digest_hits,
         layout_hits,
         layout_misses,
         pass_hits,
@@ -396,6 +477,26 @@ engine_counters! {
         buffer_guest_gathers,
         buffer_guest_gather_bytes,
         buffer_guest_gather_regions,
+        /// Compute dispatches the buffer gather issued in place of those
+        /// regions, and the plans that could not become one.
+        ///
+        /// **`buffer_guest_gather_regions` above counts regions *planned*, not
+        /// issued**, because it is charged where the window is planned and
+        /// before either form is chosen. A dispatch boot therefore still reports
+        /// ~245 000 of them while issuing none — do not read that column as
+        /// transfer traffic. It is a property of the workload (how scattered the
+        /// guest's buffers are) and stays comparable across the two arms and
+        /// across builds, which is what makes it useful; it is simply not the
+        /// column that says which form ran.
+        ///
+        /// **This one is.** `dispatches > 0` means the dispatch path ran for the
+        /// whole batch; `declined > 0` means a window's arithmetic was refused
+        /// and every gather in that command buffer took the transfer regions,
+        /// which is all-or-nothing because the two forms need different
+        /// barriers. Both zero on a boot with gathers means the switch is off or
+        /// the host cannot import.
+        buffer_gather_dispatches,
+        buffer_gather_declined,
         /// Buffer binds served from a copy the command buffer being recorded
         /// already holds — see `ResourcePools::cb_bound_buffers`.
         ///
@@ -407,6 +508,25 @@ engine_counters! {
         /// buffer if it is taken against a boot's `batch_flush_draws /
         /// batch_flushes`, which says how many draws there were to reuse over.
         buffer_bind_reuses,
+        /// Graphics state a draw did **not** record because the command buffer
+        /// it joined was already carrying exactly it — see
+        /// `ResourcePools::CbGraphicsState`.
+        ///
+        /// Every draw asks all four questions, so each of these is out of
+        /// `chain_phase chains` and none can exceed it. `dynstate_pipeline_held`
+        /// is the one to read first: a pipeline change clears the other three by
+        /// construction, so it is the ceiling on them and a boot where it is
+        /// near zero is a boot where consecutive draws never share a pipeline
+        /// and this whole cache is inert.
+        ///
+        /// `dynstate_stencil_held` is out of the *stencil* draws rather than all
+        /// of them — a draw with no stencil state asks nothing and counts
+        /// nowhere — so it is the one that does not belong to the same
+        /// denominator.
+        dynstate_pipeline_held,
+        dynstate_viewport_held,
+        dynstate_scissor_held,
+        dynstate_stencil_held,
         sampled_cache_hits,
         sampled_identity_hits,
         sampled_cache_hit_bytes,
@@ -486,6 +606,24 @@ engine_counters! {
         /// window is ~507 stretches, so ~507 here means every frame took the
         /// linear path and ~1500 means none did.
         guest_write_regions,
+        /// Compute dispatches submitted by the linear path's scatter, one per
+        /// destination buffer.
+        ///
+        /// Read against `guest_write_linear`, which it equals on an ordinary
+        /// one-RAMBlock machine where every linear writeback dispatched. The
+        /// pair with `guest_write_regions` is the whole reading: a boot on the
+        /// dispatch reads ~1 region per linear writeback (the detile) and ~1
+        /// dispatch, where one on the transfer scatter reads ~507 regions and
+        /// zero.
+        guest_write_dispatches,
+        /// Linear writebacks that planned a dispatch, could not, and took the
+        /// transfer regions.
+        ///
+        /// A healthy zero. Any firing is a run whose geometry the kernel cannot
+        /// express or a window wider than the driver binds, and each one is a
+        /// whole frame on the expensive path — the fail-channel record names
+        /// which check refused.
+        guest_write_scatter_declined,
     }
 
     cumulative {
@@ -520,6 +658,9 @@ engine_counters! {
         target_free_allocs,
         target_recycle_admits,
         target_recycle_cap_drops,
+    }
+
+    pool_levels {
         /// High-water mark of the non-pinned resident population, in slots.
         ///
         /// The demand, with no ceiling to read it against: this population is

@@ -50,9 +50,36 @@ measure them.
 - `crates/reims-vgpu-wire` - derived wire-format views, with their own `AGENTS.md`. Where that file
   is stricter than this one, it wins.
 - `vm/` - snapshot-revert boot scripts for arm64 and x86 guests.
+- `bugs/` - gitignored. One directory per defect that belongs to `metal2vulkan` rather than here.
 
 Start with the owning source modules and nearby tests when changing device, decode, present, or
 backend behavior. Keep durable design facts in code comments close to the behavior they explain.
+
+### A translator defect is packaged, not described
+
+Some of what looks like a device bug is a `metal2vulkan` bug, and the only useful handoff is one the
+translator's own agent can act on without this repository, without a VM, and without asking a
+question. So when a defect is upstream, write it into `bugs/<defect-name>/` before doing anything
+else with it:
+
+| File | Contents |
+|---|---|
+| `README.md` | What the guest loses, the defect, where it lives, what has been ruled out |
+| `input-*.air` | The AIR that reproduces, one file per distinct reproducing blob |
+| `failure.txt` | Verbatim validator output **and the per-tier retry trace** |
+| `repro.sh` | Runs every input and prints the verdict |
+
+Name the directory after the defect, not the symptom and not the shader. Two inputs failing the same
+way are one bug; two failing differently are two, however alike the device-level refusal looks.
+`bugs/README.md` carries the rest — how to recover AIR from a boot's scratch directory, and why the
+tier trace is the part worth capturing.
+
+`bugs/` is gitignored because every payload in it is Apple's AIR, and third-party bytes stay local
+under the rule at the top of `## Commit Guidelines`. Hand a directory over by copying it.
+
+**Check the pin before diagnosing.** `git ls-remote` on the dependency costs a second. Two sessions
+here diagnosed a translator defect down to a function and a line number without running it, and the
+arm that made the repair reachable was already sitting one commit ahead of what we pinned.
 
 ## Operating Principles
 
@@ -244,13 +271,24 @@ guest work in four ways — an entry evicted, an entry never recorded, a run rea
 **bitmask standing in for a set**, where `mask |= 1u32 << index` bounds the membership to 32 with
 nothing declared anywhere and a shift past the width *wraps* in release rather than failing. A fifth
 has no number at all: **a slot holding one decoded record**, where `acc.x = Some(rec)` in a decode
-arm is a capacity of one and the second record the guest sends drops the first.
+arm is a capacity of one and the second record the guest sends drops the first. A sixth is **an enum
+narrowed to its ordinal at the producer**: write `selector as u32` and every consumer downstream must
+match integers, which `rustc` cannot check for coverage, so a table that is silently one member short
+compiles and reads as complete. That is not hypothetical — it cost the arm64 pathway every `R32Uint`
+storage bind, against a selector the contract declared and the x86 pathway ran.
 
 None of these is found reliably by looking for them, which is why the scanners that used to be
 listed here are gone. Make them unrepresentable instead: put the bound in the type that carries the
 collection, give the mask a width pinned by a `const` assertion against the table it indexes, and
 where a latch must not be overwritten, make the second write a typed refusal rather than an
 assignment. Then a new site cannot be added without meeting the rule, and nothing has to go hunting.
+
+**Where a selector, opcode or class tag is this crate's own vocabulary rather than a guest value,
+carry the type and not the integer.** A guest value is arbitrary and must be parsed once, at the
+boundary, into something total; after that boundary the ordinal has no job left. Keeping it costs the
+exhaustiveness check on every consumer, and buys nothing a `Display` impl or an `as u32` at the one
+log site would not. This is the same rule as "derive, don't duplicate and compare", one step earlier:
+the second spelling you avoid is the integer.
 
 Prefer an instrument over a reading, where an instrument that is not a source grep exists. Reading
 an audit against itself cannot see an opcode that is simply the wrong number, a length four bytes
@@ -294,6 +332,15 @@ success hides a whole family of lost records behind a green run.
 
 ### Reading the fail log
 
+- **A log that stops is a different failure from a log that complains.** Every census here —
+  `drain_duty`, `store_routes`, `engine_delta` — is written at the *end* of a drain tranche, so a
+  drain thread that never returns produces no line at all while `display_vbl` and `host_window_loop`
+  keep ticking from other threads. The boot then reads as healthy. Two lines say otherwise and both
+  come from outside the drain: `driver_call reason=driver_call_outstanding` (a host driver call past
+  its deadline, once at 10 s and then once a minute) and `driver_quarantine` (a call a previous
+  process died inside, refused rather than made again). If the censuses stopped and neither line is
+  there, the stall is somewhere they do not reach — attach a debugger, remembering that
+  `yama/ptrace_scope=1` means gdb has to be an *ancestor* of the QEMU process.
 - **Count the boots before ranking anything.** The device appends and never truncates, so a log you
   did not just create may hold several boots of several builds. `grep -c vk_caps` is the boot count:
   one line per device creation. This is not the check below for "a boot's log and not the test
@@ -382,8 +429,12 @@ capability at `caps::host_pointer`, and the reference at `runtime/guest_ram_map.
 by name when no backend published a granularity.
 
 **Page recycling is unchanged and still load-bearing.** The guest reassigning a GPA to a different
-allocation while we hold a reference over it is the PTE-corruption class
-`runtime/storage_flush/guards.rs` exists for. It applied to the dma-buf and it applies here.
+allocation while we hold a reference over it is the PTE-corruption class. It applied to the dma-buf
+and it applies here. Three modules carry it now: `runtime/guest_ram.rs` for the surface
+page-ownership guards, `runtime/render_writeback.rs`, whose doc walks the four hazards the retired
+deferred-flush window carried and says why each cannot arise in the direct path, and
+`runtime/node_guard.rs`, the alarm for the worst end of it — a host write landing on a page that
+holds the guest's own page-table entries.
 
 **The pinning difference is real; do not gloss it.** A udmabuf fd made the pages it named
 unswappable and unmigratable, and closing it revoked the GPU's access. `VK_EXT_external_memory_host`
@@ -397,14 +448,17 @@ Guest RAM is not **fd-backed**: the import is over an ordinary mapping, so `vm/b
 plain `-m` allocation. `memory-backend-memfd,share=on` outlived the dma-buf rail it was for, on the
 grounds that a shared memfd is what makes uffd minor-fault mode applicable; it is gone, because uffd
 needs a privilege QEMU does not have on the dev host anyway. Restoring the backing is a
-prerequisite for ever wanting uffd here — `storage_flush/fence.rs` keeps what changes — but it buys
-nothing alone.
+prerequisite for ever wanting uffd here, but it buys nothing alone.
 
-So the deferred-flush rail — the device's largest cost — is retired by writing into guest pages
-directly, which is what `storage_flush` always said would retire it. Read that module's own
-qualifier and the routes that are *not* blocked before assuming a window is safe to skip. Note that
-`runtime/gva_view.rs::ensure_gva_view` hands back a host pointer but is not a window resolver — it
-requires the span to be one contiguous page run and returns `None` otherwise.
+So the deferred-flush rail — the device's largest cost — is retired, by writing into guest pages
+directly. **`runtime/storage_flush/` went with it and no longer exists**; do not go looking for it,
+and do not read a reference to it in an older commit body or `kb/` entry as a live path. Its two
+halves are now `runtime/render_writeback.rs`, whose module doc lists the four hazards the deferred
+window carried and why each cannot arise in the direct path, and `runtime/host_writes.rs`, the
+per-page record of which guest pages this device has written. Read `render_writeback`'s doc before
+assuming a landing is safe to skip. Note that `runtime/gva_view.rs::ensure_gva_view` hands back a
+host pointer but is not a window resolver — it requires the span to be one contiguous page run and
+returns `None` otherwise.
 
 ### Environment overrides
 
@@ -425,10 +479,90 @@ hardware that lacks the extension.
 
 Pick the pathway your change affects.
 
+Then pick the **rail** — one guest OS line, `macos-11` … `macos-26`, each with its own snapshot
+history under `vm/disks/rails/<rail>/` (x86) or `vm/guest/rails/<rail>/` (arm64). `--rail NAME`
+selects it, `--snapshot LABEL` selects within it, and a boot with neither follows `rails/current`.
+`--list-rails` says what exists. **Name the rail in any result you report**: a macOS 11 guest and a
+macOS 26 guest are two measurements of two guest drivers, and the `rail=` field in the boot's own log
+line is what says which one a reading came from. The same rule as the pathway table above applies —
+do not generalize from one rail to another.
+
 - Arm64: `vm/boot-arm64.sh --device reims-vgpu-mmio --testing`, then
   `scripts/screenshot-when-macos-host/screenshot-when-macos-host.sh /tmp/screen.png`
 - x86: `vm/boot-x86.sh --device reims-vgpu-pci --testing`, then
   `scripts/screenshot-when-kde-plasma-host/screenshot-when-kde-plasma-host.sh -o /tmp/screen.png`
+
+### Run `vm/guest-authorize.sh` after an x86 boot, before any probe
+
+Every probe under `scripts/` reaches the guest as `ssh -o BatchMode=yes macos-vm`, which is key auth
+and nothing else. Only `macos-13` was provisioned with that key; the other rails authenticate by
+password, and `BatchMode=yes` turns that into a silent failure that reads as "the guest is not up
+yet". `vm/guest-authorize.sh` waits for sshd, installs the key into the running clone, and verifies
+`ssh macos-vm` before returning. It is idempotent and needs no password on a rail that already has
+the key, so a harness may call it unconditionally.
+
+It also forgets the host-key pin for `127.0.0.1:2222`, which is a different machine on every rail —
+without that, whichever rail booted first wins and every later rail fails the host-key check.
+
+**Bound every guest-side command with `timeout` on the host side.** An unattended harness cannot
+tell a wedged guest command from a wedged boot. `system_profiler SPDisplaysDataType` has been
+observed hanging indefinitely on a macos-11 guest, and a `sudo` that wedges after authenticating
+holds its timestamp lock, so every later `sudo` — including `sudo true` — queues behind it forever.
+A host-side `timeout` does not kill the remote process, so root steps in particular must be issued
+once and never retried after one times out.
+
+### Drive a probe from the host, not from inside the guest
+
+**macOS 26 has no command line developer tools and no working `screencapture`.** A probe that
+compiles C on the guest (`window-drag-probe`'s `drag.c`) cannot build there at all, and
+`scripts/lib/guest-display.sh`'s `guest_display_size` returns nothing because `screencapture` fails
+with "could not create image from display". Both `osascript` desktop-bounds routes are empty too — a
+fresh ssh session holds no Apple Events consent. So a guest-side probe does not silently degrade on
+that rail; it does not run, and it reports a *build* or *permission* failure that reads like noise.
+
+Reach for the host side first. It works identically on all six rails and needs no guest tooling, no
+consent and no permission — and no ssh, which matters on a rail that panics during a third of driven
+boots:
+
+| want | use |
+|---|---|
+| pointer / keyboard | `scripts/qmp/qmp.py` — `move`, `click`, `drag`, `key`, `type`, `wheel` (QMP `input-send-event` to the machine's usb-tablet/usb-kbd) |
+| guest display size | `scripts/qmp/qmp.py size` |
+| a screenshot | the host helper (`screenshot-when-kde-plasma-host`), **never** QMP `shot` |
+
+QMP `shot`/`screendump` stays disabled on purpose: with the host-owned window and QEMU at
+`-display none` the frame never crosses into QEMU's address space, so a screendump shows something
+other than what the window shows. Sizing is exempt because the DisplaySurface still carries the right
+dimensions, which is all the input helpers ever used it for.
+
+Do not add a guest-side fallback "for the rails that have clang". A second path that works on five of
+six rails rots, and the rail it skips is the one with the open defects. `dock-hover-probe`'s
+`hover.c` was deleted rather than kept for exactly this reason. Where a probe genuinely needs guest
+state — a process list, a log — ssh remains the only route, but bound it with `timeout` and never
+read its absence as a device result.
+
+**sshd answers well before the desktop composites.** A probe started when port 2222 opens
+photographs the Apple logo and the boot progress bar. Wait for `pgrep -x Dock` over ssh, then give
+the dock and wallpaper a few seconds to settle.
+
+### `probe exit=0` is not a clean boot — grep the boot's own stdout for a panic
+
+A guest kernel panic can land **after** the probe has finished and reported success, so the two
+signals every sweep here has been judged on — `probe exit=0` and `dev=1` — both read green on a boot
+whose guest died. That is not hypothetical: on macos-26 it is roughly one driven boot in three, and
+it went unrecorded for as long as rails were judged that way.
+
+`vm/boot-x86.sh` already prints `capture-then-revert (guest kernel panic)` and keeps the serial log,
+so the check is one grep of the boot's own stdout and it is the verdict that outranks the probe's:
+
+```sh
+grep -q 'guest kernel panic' "$OUT/boot-stdout.log" && echo PANIC || echo ok
+```
+
+Report it per rail alongside `dev=` and the probe's exit. A rail that panics on a third of its boots
+is not a rail that passes, and one clean boot of it is not evidence — **band a suspected panic over
+at least six boots before believing a rate**, in both directions. A single green run says nothing,
+and so does a single red one.
 
 ### A boot on a capable host does not exercise the copying rails
 
@@ -439,6 +573,77 @@ change touching guest-memory upload, writeback or bind needs the boot a second t
 `host_pointer_import=disabled_by_env`, and `OFF guest_ram_map reason=guest_ram_map_no_backend_import`
 appears once. Nothing may then report a bound import — a non-zero import count means a bind ran past
 a closed gate.
+
+### `present_hz` tracks `offered_hz` exactly, so read the pair and never one alone
+
+The x86/Vulkan host window presenter used to clamp at **~41 frames a second
+whatever it was offered**, because `WindowPresenter` allowed one present in
+flight. It now runs `PRESENT_IN_FLIGHT` of them and the clamp is gone. Eight
+driven macos-13 sustained-animation boots across the two arms of
+`REIMS_VGPU_PRESENT_DEPTH`:
+
+| arm | `presents`/`offered` per boot | `busy_fence` per boot |
+|---|---|---|
+| depth 3 (shipping) | **1.000** on all five | 0, 0, 0, 0, 0 |
+| depth 1 (`=off`) | 0.828, 0.822, 0.853 | 411, 421, 372 |
+
+Every shipping boot presented **exactly** what it was offered, including two
+whose offered rate was ~56 Hz rather than ~49 — so this is not a new clamp
+sitting a little higher, and it holds across both compositing regimes.
+
+At n=3 vs n=3 after regime exclusion, `presents_s` rose **16.2 %** with the arms
+disjoint at 3.6x their own spread, while `offered_hz`, `draws_s` and
+`kib_per_draw` all *overlapped* — the device did identical work and only the
+presenter changed. So `present_hz` is now a real reading, and the old advice to
+ignore it is retired.
+
+**But it is a reading of two things, and the pair is what says which.** The
+presenter now passes everything, so `present_hz` equals `offered_hz`, and
+`offered_hz` is the device's own publish rate. A device change that raises
+frames raises *both*. Always quote them together:
+
+- both rose — the device published more, which is the win.
+- `offered` rose and `present` did not — the presenter has become a ceiling
+  again. Check `busy_fence` and `busy_acquire`; on the shipping depth they are 0.
+- neither moved — the change bought no frames, whatever else it bought.
+
+**In the fast population `present_hz` is the score, and it is sharper than
+`us/draw`.** A fast-latching macos-13 guest free-runs on a zero frame period, so
+its rate is *work-limited*: whatever this device stops doing per draw, the guest
+spends on more frames. Twenty-four interleaved boots pushed the device 20.6 %
+the wrong way (`REIMS_VGPU_COMPUTE_GATHER=off`), scored over their fast boots
+only:
+
+| arm | n fast | `present_hz` mean (range) | `us/draw` mean (range) |
+|---|---|---|---|
+| shipping | 5 | **113.2** (109.8-116.3) | 13.21 (12.66-14.02) |
+| 20.6 % more GPU work/draw | 9 | **105.5** (101.4-107.7) | 15.07 (13.92-16.16) |
+
+The `present_hz` arms are **disjoint** — the slowest shipping boot beats the
+fastest slowed one — while `us/draw` *overlaps* on the same fourteen boots. So
+the frame rate is the more sensitive instrument of the two, not the noisier one,
+and a per-draw saving that cannot be seen in `present_hz` over five fast boots an
+arm is smaller than it looks. Elasticity for sizing a candidate: about **0.35
+frames per unit of per-draw GPU work**, so a 10 % per-draw saving is worth
+looking for and a 2 % one is not measurable here.
+
+`drain_duty draws` and anything normalized per draw stay the right way to
+*attribute* a change — which phase paid — but they are no longer the way to rank
+one.
+
+**Quote the presents, never the drop percentage.** This survives the fix and is
+the trap that cost a session a wrong call. With a *clamped* presenter the drop
+read 4.9 % on one boot and 17.3 % on another because all the variation was in
+the denominator: a guest offering 44 loses 5 % and one offering 50 loses 17 %,
+and both presented 41. That session quoted 4.9-5.7 % from three consecutive
+low-offering boots and concluded the presenter was "worth at most ~5 %, not the
+lever it looked like". It was worth 17.8 %.
+
+This also retired a standing puzzle. Several CPU wins here "bought microseconds
+and zero frames" — a bounded pipeline cache, −39 % submissions, −20x `stage_us`.
+None of them could have bought frames through a presenter already at its
+ceiling, and a per-draw saving measured before this fix is **owed a re-run**
+rather than believed to have been worthless.
 
 ### An undriven boot measures an idle device
 
@@ -460,6 +665,68 @@ scripts/window-drag-probe/window-drag-probe.sh --seconds 25 --app Safari
 That produces real window-server compositing, against 0 draws/s idle. The probe refuses a verdict if
 the window never moved, so a run that produced no motion cannot be mistaken for a slow device.
 
+### A bursty driven boot measures the gaps between its bursts
+
+Driving is not enough. A probe built out of discrete interactions — a Mission Control round, a
+Launchpad round, a drag — spends most of its wall clock waiting for guest animations, and whole
+seconds of it have **zero** draws. Nothing in the capture says so: the counters are self-consistent
+and the log is well-formed. One such probe put `present_hz` at a median of 2.8 Hz on a device
+sustaining 78.8 Hz minutes later in the same VM.
+
+The damage is not a scale factor, it is a different **ranking**. On one build, one rail and one
+quiesced host, the bursty probe put `chain_phase`'s `engine` at 49 % and `store` at 10 %; the
+sustained one puts `store` at 35 % and `engine` at 28 %. Decisively, the drain worker's duty is 0.00
+median on the bursty probe and 0.91 on the sustained one — so **only the sustained arm can turn a
+per-draw CPU saving into frames**, and three separate CPU wins measured against the bursty one each
+bought real microseconds and no frames at all.
+
+So a throughput, caching or cadence change needs
+`scripts/sustained-animation-probe/sustained-animation-probe.sh` as well as an interaction probe.
+Name which probe a number came from, the same way a rail is named: they are two populations of draws
+and a change can help one and hurt the other.
+
+**Classify the boot before comparing two of them.** A macos-13 boot presents either ~60 frames a
+second or ~95-117 for its whole life, tightly, with nothing in between, and the guest picks per boot.
+`present_hz`, `draws/s` and `fresh` are all halved on a slow boot, so none of them is comparable
+across the two. Mixing boots from both populations is how a real 17 % effect ends up buried under a
+2x artifact. `present_hz` alone is the discriminator — the gap between 61 and 94 is empty on every
+boot on record.
+
+**`us/draw` is not comparable across the populations either, and it reads like it should be.** A slow
+boot asks the GPU for half the work, the governor clocks down, and every GPU microsecond gets more
+expensive: over 16 boots with `nvidia-smi` sampled alongside, slow boots read **10.3 % higher
+`us/draw`** than fast ones on one binary (15.68 against 14.22), and `us/draw` against the driven-window
+clock correlates at r=-0.89. So an arm that happens to draw more slow boots reads slower per draw for
+a reason that has nothing to do with the change. Score per-draw numbers within the fast population
+only.
+
+Within that population `us/draw` has a **coefficient of variation of 3.4 %** and a 12 % max-to-min
+spread over twelve boots, so a per-draw change under ~5 % needs several boots an arm and a single
+pair proves nothing. Do not try to correct for the clock arithmetically: dividing by the SM clock
+makes the spread *worse* (12 % to 22 %), because the gather is bandwidth-bound and the memory clock
+swings 405-14001 MHz independently.
+
+**A run's slow rate is a Bernoulli draw, and its base rate drifts.** Over 40 interleaved boots it was
+12 slow in 40; two runs later the same binary read 7 in 12, twice. So a slow rate is comparable only
+**within one interleaved run**, never against a number from an earlier one, and a change claiming to
+move it needs about twenty boots an arm — twelve cannot separate 0.4 from 0.7. This is a different
+rule from classifying a boot: that one is about which population a reading came from, this one is
+about the population *rate* being unstable across time on one host.
+
+**The split is not about VBL delivery, and six hypotheses that assumed it was all came back null.**
+The guest's compositor paces on a period the kernel hands it, which is initialised to a synthesised
+1/60 s and only corrected from the `IOFBCurrentPixelClock`/`IOFBCurrentPixelCount` framebuffer
+properties — and the paravirtual framebuffer driver suppresses those, on every boot, confirmed by
+`ioreg` on eleven. A boot therefore latches either 16 666 666 ns (paced, **exactly** 60 Hz) or 0
+(free-running, work-limited 95-117 Hz), once, for its life. That is why the slow population is a
+constant and the fast one is a 22 Hz spread, and it means the *fast* boots are the ones where the
+guest never learned a period. Do not "fix" it by forcing a second display-mode change: that would
+set the period on every boot and take the good 70 % down to 60 Hz. Full chain and the live
+confirmation are in `VBL_REPORT_EARLY` beside `runtime::drain::census::VblCensus`. Read `VBL_REPORT_EARLY` beside
+`runtime::drain::census::VblCensus` before spending boots on a new theory: a run of eight holds one
+or two slow boots and so cannot tell a cause from a coincidence, which has already produced one
+confident wrong answer here.
+
 **Bracket one character of every `pkill -f` pattern**, as `x86_6[4]` does above and as
 `reims_vgp[u]-` does further down. `pkill -f` matches against whole command lines, and the shell
 running the `pkill` has the pattern in *its* command line, so an unbracketed pattern matches the
@@ -467,6 +734,14 @@ process issuing it and the shell kills itself before `pkill` ever reaches QEMU. 
 the pattern text without changing what it matches. The failure is easy to misread as "the command
 worked": the shell dies with status 144 and the surviving QEMU then holds `localhost:2222`, so the
 *next* boot dies on the `hostfwd` rule for the reason described below. Two symptoms, one cause.
+
+**The bracket protects only the shell that issues the `pkill`. Every ancestor is still a match**, so
+a pinned QEMU path must cross as an **exported variable and never as argv**. Any command line that
+names `.../reims-vgpu/…/qemu-system-x86_64-pin-whatever` matches `qemu-system-x86_6[4].*reims-vgpu`,
+and a chain runner that takes two pins as arguments is killed by the first boot it starts. That
+failure reads as success twice over: the runner prints its first "round 1 arm A" line and then
+simply stops, and the harness it launched under reports the unit as finished. An environment
+variable never appears in `/proc/pid/cmdline`, which is the whole fix.
 
 **Wait on the fail log, not on SSH alone.** The previous boot's QEMU outlives its script by long
 enough to still hold `localhost:2222`, and a new boot that loses that race dies on the `hostfwd` rule
@@ -546,8 +821,9 @@ with `scripts/wire-oracle/wire-oracle.sh` on an Apple host, and set `REIMS_WIRE_
 there so their absence fails the build.
 
 **The `backend-metal` `--lib` arm is expected to be green.** It used to carry six standing failures
-in `runtime::storage_flush::tests`, and this file used to tell you to expect them; they were
-Vulkan-rail tests compiled unconditionally, and they now carry the gate. A red there is a real
+in a module that has since been deleted outright, and this file used to tell you to expect them;
+they were Vulkan-rail tests compiled unconditionally, and they carried the gate before the module
+went. A red there is a real
 result again — do not restore the exception, and do not silence a new one by weakening what it
 asserts.
 

@@ -186,22 +186,55 @@ impl HostRamImports {
         let range = guest_ref
             .bound()
             .map_err(|inner| HostRamDecline::Bound { inner })?;
-        let import = guest_ref.import();
-        let key = import.id().get();
-        let live = match self.live.get(&key) {
-            Some(live) => *live,
-            None => {
-                let made = unsafe { import_ramblock(ctx, import) }?;
-                self.live.insert(key, made);
-                made
-            }
-        };
+        let (live, _) = unsafe { self.ensure(ctx, guest_ref.import()) }?;
         Ok(BoundGuestRam {
             buffer: live.buffer,
             offset: range.offset,
             len: range.len,
             head: guest_ref.head(),
         })
+    }
+
+    /// Import `import`'s RAMBlock now, if it is not imported already.
+    ///
+    /// [`Self::bind`] does this on whatever draw happens to reference the block
+    /// first, and on a discrete host that draw pays seconds for it — see
+    /// [`import_ramblock`]'s own note. This is the same work with no reference
+    /// to name, so a caller that knows the RAMBlocks before the guest asks for
+    /// any of their bytes can pay it where nothing is waiting on a frame.
+    ///
+    /// Returns whether an import was made, so the caller can tell a warm that
+    /// did work from one that found the answer already there.
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::bind`].
+    pub(crate) unsafe fn warm(
+        &mut self,
+        ctx: &super::context::DeviceContext,
+        import: &GuestRamImport,
+    ) -> Result<bool, HostRamDecline> {
+        unsafe { self.ensure(ctx, import) }.map(|(_, made)| made)
+    }
+
+    /// The one place a RAMBlock becomes an import, so "have we imported this
+    /// block" is asked once and cannot be answered two ways.
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::bind`].
+    unsafe fn ensure(
+        &mut self,
+        ctx: &super::context::DeviceContext,
+        import: &GuestRamImport,
+    ) -> Result<(ImportedHostRam, bool), HostRamDecline> {
+        let key = import.id().get();
+        if let Some(live) = self.live.get(&key) {
+            return Ok((*live, false));
+        }
+        let made = unsafe { import_ramblock(ctx, import) }?;
+        self.live.insert(key, made);
+        Ok((made, true))
     }
 
     /// Release every import. Called on device teardown, before the device goes.
@@ -230,6 +263,17 @@ impl HostRamImports {
 
 /// Import one RAMBlock's whole host mapping.
 ///
+/// # Cost, and why it is timed
+///
+/// This is the only expensive step on the whole guest-memory rail, and it is
+/// paid once per RAMBlock per device. Which of its two halves costs what is not
+/// a thing a reader can assume: `vkGetMemoryHostPointerPropertiesEXT` asks the
+/// driver about a pointer and `vkAllocateMemory` is where a driver that pins
+/// takes its `get_user_pages` over every page of a multi-gigabyte mapping. The
+/// two are timed separately and emitted once per import, because the first draw
+/// of a boot pays whichever of them is slow, and a display transaction the
+/// guest abandons after 1000 ms is what that draw sits inside.
+///
 /// # Safety
 ///
 /// As [`HostRamImports::bind`].
@@ -238,6 +282,7 @@ unsafe fn import_ramblock(
     import: &GuestRamImport,
 ) -> Result<ImportedHostRam, HostRamDecline> {
     use crate::backend::vulkan::caps::host_pointer::GUEST_IMPORT_USAGE;
+    use std::time::Instant;
 
     let Some(loader) = ctx.external_memory_host.as_ref() else {
         return Err(HostRamDecline::Unsupported {
@@ -259,18 +304,38 @@ unsafe fn import_ramblock(
     // exactly what that preference describes. On a discrete host the selector
     // will land on a host-visible type, and the copy into VRAM is a separate
     // decision made by the caller, not by this import.
+    //
+    // The RAMBlock's whole length goes with the request, and for this call site
+    // that is the load-bearing argument rather than a detail. An imported host
+    // pointer's pages do not move — the memory type cannot relocate a mapping
+    // this process already holds — so the only thing the pick decides is which
+    // heap the driver charges a multi-gigabyte allocation to. `Upload` on a
+    // `Unified` classification prefers `DEVICE_LOCAL`, and on a part whose
+    // device-local heap is a carve-out smaller than the guest (an APU with 2 GiB
+    // against a 16 GiB guest) that preference asks the driver to keep the entire
+    // guest resident in a pool with no room for it.
     let req = ctx
         .caps
         .memory_request(crate::backend::vulkan::caps::MemoryClass::Upload);
-    let memory_type_index = unsafe {
+    let probe_started = Instant::now();
+    let picked = unsafe {
         crate::backend::vulkan::caps::host_pointer::import_memory_type(
             loader,
             &ctx.memory_properties,
             host_base as *const std::ffi::c_void,
             &req,
+            size,
         )
-    }
-    .ok_or(HostRamDecline::NoImportableMemoryType { host_base })?;
+    };
+    let probe_us = probe_started.elapsed().as_micros() as u64;
+    let pick = picked.ok_or(HostRamDecline::NoImportableMemoryType { host_base })?;
+    ctx.report_oversized_allocation(
+        crate::backend::vulkan::caps::MemoryClass::Upload,
+        size,
+        pick,
+    );
+    let memory_type_index = pick.index;
+    let alloc_started = Instant::now();
 
     let mut external = vk::ExternalMemoryBufferCreateInfo::default().handle_types(HANDLE_TYPE);
     let create = vk::BufferCreateInfo::default()
@@ -326,19 +391,23 @@ unsafe fn import_ramblock(
     if bound.is_err() {
         unsafe { ctx.device.destroy_buffer(buffer, None) };
     }
+    // The heap is on this line and not just the type index, because "which type"
+    // is not answerable from the index alone on an unfamiliar device and the
+    // heap is what a report of a slow host turns on. `fits=0` here is the whole
+    // diagnosis for a guest larger than the pool its import was charged to.
+    crate::observe::off(format!(
+        "host_ram_import id={} bytes={size} mtype={memory_type_index} heap={} heap_mb={} \
+         fits={} probe_us={probe_us} alloc_us={} ok={}",
+        import.id().get(),
+        pick.heap_index,
+        pick.heap_bytes >> 20,
+        pick.fits,
+        alloc_started.elapsed().as_micros() as u64,
+        bound.is_ok(),
+    ));
     bound
 }
 
-/// Channel order as a decline field reads, so the two sides of an
-/// [`GuestWriteDecline::OrderMismatch`] name themselves rather than printing
-/// `true`/`false` a reader has to know the polarity of.
-fn order_name(bgra: bool) -> &'static str {
-    if bgra {
-        "bgra"
-    } else {
-        "rgba"
-    }
-}
 
 /// A check that stopped a resident's frame from being copied straight into the
 /// guest's own pages, so the flush took the CPU route instead.
@@ -364,7 +433,14 @@ pub enum GuestWriteDecline {
     /// are guest scanout order and a GVA render target's are whatever the guest
     /// declared for it. A rail that spelled the rule as one fixed order refused
     /// every RGBA destination it could have served unchanged.
-    OrderMismatch { resident_bgra: bool, want_bgra: bool },
+    /// Two whole formats and not two orders: an order stopped being a complete
+    /// description of a resident once a render target could be wider than eight
+    /// bits per channel, and this copy converts nothing, so a half-float
+    /// destination over an eight-bit resident must be caught here.
+    ResidentFormatMismatch {
+        held: ash::vk::Format,
+        want: ash::vk::Format,
+    },
     /// The resident's geometry is not the geometry the window promised the
     /// guest. Copying anyway would land one extent's pixels under another's row
     /// pitch.
@@ -391,7 +467,7 @@ impl Decline for GuestWriteDecline {
     fn slug(&self) -> &'static str {
         match self {
             Self::Unsupported { .. } => "gpu_writeback_unsupported",
-            Self::OrderMismatch { .. } => "gpu_writeback_order_mismatch",
+            Self::ResidentFormatMismatch { .. } => "gpu_writeback_resident_format_mismatch",
             Self::GeometryMoved { .. } => "gpu_writeback_geometry_moved",
             Self::WindowTooSmall { .. } => "gpu_writeback_window_too_small",
             // The inner decline's own slug, so a driver that refuses the pointer
@@ -404,12 +480,9 @@ impl Decline for GuestWriteDecline {
     fn fields(&self) -> Vec<(&'static str, String)> {
         match self {
             Self::Unsupported { rung } => vec![("rung", rung.slug().to_string())],
-            Self::OrderMismatch {
-                resident_bgra,
-                want_bgra,
-            } => vec![
-                ("resident", order_name(*resident_bgra).to_string()),
-                ("want", order_name(*want_bgra).to_string()),
+            Self::ResidentFormatMismatch { held, want } => vec![
+                ("resident", format!("{held:?}")),
+                ("want", format!("{want:?}")),
             ],
             Self::GeometryMoved {
                 resident_width,
@@ -481,6 +554,88 @@ mod tests {
         let outer = HostRamDecline::Bound { inner };
         assert_eq!(outer.slug(), inner.slug());
         assert_eq!(outer.fields(), inner.fields());
+    }
+
+    /// The guest's handshake, and not the guest's first frame, is what pays for
+    /// the import.
+    ///
+    /// This is the whole point of the warm rail, and it is asserted end to end —
+    /// through [`crate::runtime::guest_ram_map::warm`], which is what the
+    /// protocol-version handshake calls — because the mechanism being present
+    /// proves nothing about it being wired. Left unwired the import lands on the
+    /// first `gather` of the first draw, and on a discrete host that is seconds
+    /// inside a display transaction the guest abandons after one.
+    ///
+    /// Skips when this host has no device or no import capability: there the
+    /// copying rails are the only rails and there is nothing to warm.
+    #[test]
+    fn the_handshake_warm_imports_before_any_draw_references_a_byte() {
+        // A device first, because it is device creation that publishes the
+        // import granularity `guest_ram_map::warm` refuses without.
+        {
+            let mut guard = super::super::lock_engine();
+            let super::super::EngineState {
+                ref mut owner,
+                ref counters,
+                ..
+            } = &mut *guard;
+            let Ok(ctx) = owner.ensure(counters) else {
+                eprintln!("skip: no Vulkan device");
+                return;
+            };
+            if !ctx.caps.host_pointer.is_available() {
+                eprintln!("skip: no host-pointer import on this device");
+                return;
+            }
+        }
+
+        // Stand-in for a RAMBlock: an allocation this process owns and never
+        // frees. An import outlives this test — it is released at device
+        // teardown — so freeing at the end of the test would leave the device
+        // holding a buffer over memory that is no longer ours. Page-aligned
+        // because that is what the import granularity asks of a base.
+        const LEN: usize = 16 << 20;
+        let layout = std::alloc::Layout::from_size_align(LEN, 4096).expect("valid layout");
+        let base = unsafe { std::alloc::alloc_zeroed(layout) };
+        assert!(!base.is_null(), "allocation for the stand-in RAMBlock");
+
+        struct OneBlock(u64);
+        impl crate::runtime::host::HostOps for OneBlock {
+            fn mono_ns(&self) -> u64 {
+                0
+            }
+            fn enqueue(&mut self, _action: crate::runtime::host::HostAction) {}
+            fn schedule_bh(&mut self) {}
+            fn guest_ram_regions(
+                &mut self,
+            ) -> Result<
+                Vec<crate::runtime::guest_ram::GuestRamRegion>,
+                crate::runtime::host::GuestRamRegionsError,
+            > {
+                Ok(vec![crate::runtime::guest_ram::GuestRamRegion {
+                    gpa_base: 0,
+                    host_va: self.0,
+                    len: LEN as u64,
+                }])
+            }
+        }
+
+        crate::runtime::guest_ram_map::reset();
+        let before = super::super::guest_import_census().0;
+        let mut host = OneBlock(base as u64);
+        crate::runtime::guest_ram_map::warm(&mut host);
+        let after = super::super::guest_import_census().0;
+        assert_eq!(
+            after - before,
+            LEN as u64,
+            "the handshake warm must import the whole block"
+        );
+
+        // And it is once. A warm that re-imported per call would be the
+        // per-RAMBlock model turning into a per-call one.
+        crate::runtime::guest_ram_map::warm(&mut host);
+        assert_eq!(super::super::guest_import_census().0, after);
+        crate::runtime::guest_ram_map::reset();
     }
 
     /// A fresh map holds nothing and reports nothing imported. The count is the

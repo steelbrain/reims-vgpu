@@ -24,6 +24,10 @@
 //!
 //! - [`decline`] — the [`Decline`] and [`Refusal`] traits every subsystem
 //!   names its refusals through.
+//! - [`driver_watch`] — the one failure a census cannot report, because a census
+//!   line is written at the end of a drain tranche and this one is a tranche
+//!   that never ends: a host driver call that does not return while the drain
+//!   thread holds the device lock.
 //! - [`emit`] — the one builder that renders `reason=<slug> k=v …`, and cannot
 //!   produce a line without a reason.
 //!
@@ -59,6 +63,7 @@
 //! poll, a genuinely-unbound `ref==0`). Those flood the log.
 
 pub mod decline;
+pub mod driver_watch;
 pub mod emit;
 pub mod footprint;
 pub mod ladder;

@@ -74,6 +74,23 @@ pub enum ComputeExecutionDecline {
         wanted_height: u32,
         wanted_format: StorageImageFormat,
     },
+    /// The module statically uses a `set = 0` binding the descriptor set layout
+    /// this dispatch built does not contain.
+    ///
+    /// A specification violation — Vulkan requires the pipeline layout to
+    /// describe every resource the shader statically uses — and the one layout
+    /// defect that cannot be reported from any later point. Mesa's Intel driver
+    /// scores each used binding as `(use_count << 7) / array_size` over an array
+    /// it sized to `max_binding + 1` and zero-filled, so the absent binding
+    /// divides by zero and `vkCreateComputePipelines` kills the process with
+    /// `SIGFPE` instead of returning. Refusing one dispatch is the only outcome
+    /// left that keeps the VM alive and says why.
+    ///
+    /// Expected to stay at zero: `runtime::compute_exec` provisions a neutral
+    /// sampler and a neutral sampled image for every binding of those classes
+    /// the guest left empty, so a firing is a class those passes do not cover
+    /// and is worth reading as a real gap.
+    UsedBindingAbsentFromLayout { binding: u32 },
 }
 
 impl Decline for ComputeExecutionDecline {
@@ -97,6 +114,9 @@ impl Decline for ComputeExecutionDecline {
             }
             Self::ResidentRekeyWouldDropPinned { .. } => {
                 "vk_compute_exec_resident_rekey_would_drop_pinned"
+            }
+            Self::UsedBindingAbsentFromLayout { .. } => {
+                "vk_compute_exec_used_binding_absent_from_layout"
             }
         }
     }
@@ -205,6 +225,9 @@ impl Decline for ComputeExecutionDecline {
                     ("wanted_format", format!("{wanted_format:?}")),
                 ]);
                 fields
+            }
+            Self::UsedBindingAbsentFromLayout { binding } => {
+                vec![("binding", binding.to_string())]
             }
         }
     }

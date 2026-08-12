@@ -1105,6 +1105,146 @@ fn compute_pipeline_stage_input_fixture() {
     assert_eq!(si.dropped_layouts, 0);
 }
 
+/// Build a compute pipeline descriptor in the shape macOS 12 sends: a first TLV
+/// block naming the kernel function and the offset of a stage-input section,
+/// and a section in the vertex-descriptor grammar declaring `attrs` attributes
+/// and `layouts` layouts.
+///
+/// Constructed from the layout constants rather than pasted as a byte blob, so
+/// it says what each field is and a moved offset breaks the build rather than
+/// the assertion. It reproduces the record a live macOS 12.7.6 guest sends: 56
+/// bytes, section at 32, both counts zero.
+fn macos12_shaped_compute_pipeline(kernel_ref: u32, attrs: u32, layouts: u32) -> Vec<u8> {
+    // Two fields of `[tag][len][u32]` behind a one-byte count, then padding to
+    // the section's four-byte alignment.
+    const TLV_TWO_FIELDS: usize = 1 + 2 * (1 + 1 + 4);
+    let section = (TYPE7_FIRST_TLVS + TLV_TWO_FIELDS).next_multiple_of(4);
+    // The section's own two fields, then its two arrays, each a `u32` count.
+    let attr_rel = (TLV_TWO_FIELDS).next_multiple_of(4);
+    let layout_rel = attr_rel + 4;
+    let total = section + layout_rel + 4;
+
+    let mut b = vec![0u8; total];
+    st32(&mut b[0..], TYPE7_OBJECT_COMPUTE_PIPELINE);
+    st32(&mut b[4..], total as u32);
+    st32(&mut b[8..], kernel_ref + 1);
+    st32(&mut b[12..], (total - TYPE7_FIRST_TLVS) as u32);
+
+    b[TYPE7_FIRST_TLVS] = 2;
+    let mut p = TYPE7_FIRST_TLVS + 1;
+    for (tag, value) in [
+        (
+            PIPELINE_TAG_COMPUTE_STAGE_INPUT_OFFSET,
+            (section - TYPE7_FIRST_TLVS) as u32,
+        ),
+        (PIPELINE_TAG_KERNEL_FUNC, kernel_ref),
+    ] {
+        b[p] = tag;
+        b[p + 1] = 4;
+        st32(&mut b[p + 2..], value);
+        p += 6;
+    }
+
+    b[section] = 2;
+    let mut q = section + 1;
+    for (tag, value) in [
+        (VERTEX_DESC_TAG_ATTRIBUTES, attr_rel as u32),
+        (VERTEX_DESC_TAG_LAYOUTS, layout_rel as u32),
+    ] {
+        b[q] = tag;
+        b[q + 1] = 4;
+        st32(&mut b[q + 2..], value);
+        q += 6;
+    }
+    st32(&mut b[section + attr_rel..], attrs);
+    st32(&mut b[section + layout_rel..], layouts);
+    b
+}
+
+/// macOS 12 states where its stage-input descriptor is, and this device reads it
+/// there instead of refusing the pipeline for a property it could not name.
+///
+/// Every compute pipeline that guest builds carries the offset tag, so before it
+/// was identified the whole compute path was refused — 264 pipelines and 22 lost
+/// dispatches on a boot that only reached the desktop.
+#[test]
+fn a_compute_pipeline_that_states_its_stage_input_offset_decodes() {
+    let b = macos12_shaped_compute_pipeline(9, 0, 0);
+    // The shape the live guest sends, so a layout change here is visible.
+    assert_eq!(b.len(), 56, "the observed macOS 12 record is 56 bytes");
+
+    let cap = crate::observe::FailCapture::start();
+    let cp = decode_compute_pipeline_descriptor(&b)
+        .expect("a stage-input offset is a property this decoder reads");
+    assert_eq!(cp.kernel_func_ref, 9);
+    assert!(
+        cp.stage_input.is_none(),
+        "an empty stageInputDescriptor is a kernel taking no per-thread input"
+    );
+    let lines = cap.lines();
+    let dropped: Vec<&String> = lines
+        .iter()
+        .filter(|l| l.contains("reason=pipeline_descriptor_field_dropped"))
+        .collect();
+    assert!(
+        dropped.is_empty(),
+        "a consumed tag is not a dropped field: {dropped:?}"
+    );
+}
+
+/// The counterweight: a section that declares entries is refused, not emptied.
+///
+/// Nothing here knows how a compute stage-input attribute's format enumerates,
+/// and building the pipeline anyway would give it `stage_input: None` — which is
+/// indistinguishable downstream from a kernel that declared none, and is the
+/// silent-loss class the whole decline machinery exists to stop.
+#[test]
+fn a_populated_compute_stage_input_section_refuses_the_pipeline() {
+    for (attrs, layouts) in [(1, 0), (0, 1), (2, 3)] {
+        assert_eq!(
+            decode_compute_pipeline_descriptor(&macos12_shaped_compute_pipeline(9, attrs, layouts))
+                .unwrap_err(),
+            DecodeStatus::ErrUnsupported("res_compute_stage_input_populated"),
+            "attrs={attrs} layouts={layouts} must refuse rather than decode as empty"
+        );
+    }
+}
+
+/// An offset the record cannot contain is a refusal too. The guest named this
+/// section, so nothing behind it is optional and "absent" is the wrong reading.
+///
+/// **Zero is the exception, and it is not damage.** The serializer reserves this
+/// property's slot and patches an offset into it, so zero is what a nil
+/// `stageInputDescriptor` leaves behind. Read as a position it lands on the
+/// property list's own field count and decodes that as a stage-input entry, so
+/// the two cases are asserted together — a reader that treats zero as an offset
+/// passes neither.
+#[test]
+fn a_compute_stage_input_offset_is_bounds_checked_and_zero_means_nil() {
+    // The offset field sits at the start of the first TLV entry's value.
+    let off_at = TYPE7_FIRST_TLVS + 1 + 2;
+    assert_eq!(
+        macos12_shaped_compute_pipeline(9, 0, 0)[TYPE7_FIRST_TLVS + 1],
+        PIPELINE_TAG_COMPUTE_STAGE_INPUT_OFFSET,
+        "the builder emits the offset tag first"
+    );
+
+    let mut past = macos12_shaped_compute_pipeline(9, 0, 0);
+    let len = past.len() as u32;
+    st32(&mut past[off_at..], len);
+    assert_eq!(
+        decode_compute_pipeline_descriptor(&past).unwrap_err(),
+        DecodeStatus::ErrShort("res_compute_stage_input_off_oob")
+    );
+
+    let mut nil = macos12_shaped_compute_pipeline(9, 0, 0);
+    st32(&mut nil[off_at..], 0);
+    let cp = decode_compute_pipeline_descriptor(&nil)
+        .expect("a nil stageInputDescriptor is not a malformed one");
+    assert_eq!(cp.kernel_func_ref, 9);
+    assert!(cp.stage_input.is_none());
+}
+
 /// The widest stage-input the wire can state survives decode whole.
 ///
 /// `header0` carries both counts in 5-bit fields, so 31 attributes and 31
@@ -1649,6 +1789,22 @@ fn an_unidentified_pipeline_descriptor_field_refuses_the_pipeline() {
         "and which pipeline kind dropped it, because the two decoders read \
          different tag sets: {}",
         drops[0]
+    );
+    // The two fields carry different values, so this cannot pass by reporting
+    // some constant. A tag number alone does not identify a property: a macOS 12
+    // guest refused every compute pipeline it built on one unnamed tag, and the
+    // value is what separates a section offset from a count from a boolean.
+    assert!(
+        drops
+            .iter()
+            .any(|l| l.contains("tag=0x6d") && l.contains("first_value=0x4")),
+        "the decline carries the value of the field it dropped: {drops:?}"
+    );
+    assert!(
+        drops
+            .iter()
+            .any(|l| l.contains("tag=0x6e") && l.contains("first_value=0x1")),
+        "each decline carries its own field's value: {drops:?}"
     );
 
     // The lines are latched; the refusal is not. `resume`, not `start`: the

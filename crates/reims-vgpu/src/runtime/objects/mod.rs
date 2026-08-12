@@ -29,6 +29,8 @@ use crate::runtime::gva_mem;
 use crate::runtime::host::HostMemory;
 use crate::runtime::texture;
 
+pub mod slot_recheck;
+
 /// Fail-visible, de-duplicated per `(task_id, ref)`, for the type-11 resolve
 /// blind spot: an object ref that IS a type-11 IOSurface texture but whose
 /// descriptor cannot be read, cannot register a Metal/Vulkan texture, or carries
@@ -1147,6 +1149,120 @@ pub enum ListLookup {
     Probe,
 }
 
+/// Which of the eight checks in an object-list lookup came back empty.
+///
+/// They used to be eight `None`s behind one `reason=no_list_entry`, and only the
+/// unreadable arm said anything at all. That is why a macos-26 boot losing ~40
+/// draws to this refusal could not say which of two opposite things had
+/// happened: the device cleared the task's list under the guest
+/// ([`Self::NoObjectList`] — `define_task` resets `object_list_pfn`/`count` and
+/// macOS 26 re-issues `define_task` for a live tid with a new page-table root,
+/// which macOS 13 never does), or the guest had simply not published the object
+/// into a list this device read perfectly well ([`Self::SlotEmpty`]). The first
+/// is a device defect and the second is a wait; they share a reason string and
+/// nothing else.
+///
+/// The routes are counted only for a ref the guest **named** — see
+/// [`ListLookup`], whose `Probe` arm misses by design on every task that does
+/// not own the ref.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ListMiss {
+    /// No task under this id at all.
+    NoTask,
+    /// The task exists and has been torn down or not activated.
+    TaskInactive,
+    /// The task has no object list registered. Either none was ever set, or one
+    /// was set and a later `define_task` for the same id reset it.
+    NoObjectList,
+    /// The ref is past the count the guest declared for the list.
+    RefBeyondList,
+    /// `pfn << page_shift` plus the slot offset does not fit a `u64`.
+    AddressOverflow,
+    /// The slot's guest address did not read, carrying **which** of the walk's
+    /// checks refused.
+    ///
+    /// The payload is the same distinction [`crate::runtime::host::MemError`]
+    /// draws for every other guest read, and the reason it is here is
+    /// [`slot_recheck`]: a slot that read and decoded cleanly at miss time
+    /// cannot later be genuinely unmapped, rooted at a zero PFN and outside the
+    /// address space all at once, so on a re-read the check that refused *is*
+    /// the finding. It was the whole of a driven macos-26 boot's terminal
+    /// verdicts while it was still one bare value.
+    ///
+    /// `object_list_entry_unreadable` stays alongside it, because that line
+    /// names the three inputs the address was built from, which the walk's own
+    /// refusal cannot see.
+    Unreadable(crate::runtime::host::MemError),
+    /// The sixteen bytes read and are not an object-list entry.
+    Undecodable,
+    /// The slot read and is zero: the list is where the guest said and this
+    /// entry has not been written yet. Not a device failure — a race with the
+    /// guest publishing the object.
+    SlotEmpty,
+}
+
+impl ListMiss {
+    /// Every variant, for the distinctness check below.
+    ///
+    /// [`Self::route`]'s match is exhaustive, so a new variant cannot skip
+    /// having a route — but it can skip this list. Add it here too, or the
+    /// distinctness test stops covering the population it names.
+    #[cfg(test)]
+    const ALL: [Self; 8] = [
+        Self::NoTask,
+        Self::TaskInactive,
+        Self::NoObjectList,
+        Self::RefBeyondList,
+        Self::AddressOverflow,
+        Self::Unreadable(crate::runtime::host::MemError::Unmapped),
+        Self::Undecodable,
+        Self::SlotEmpty,
+    ];
+
+    pub fn route(self) -> &'static str {
+        match self {
+            Self::NoTask => "list_miss_no_task",
+            Self::TaskInactive => "list_miss_task_inactive",
+            Self::NoObjectList => "list_miss_no_object_list",
+            Self::RefBeyondList => "list_miss_ref_beyond_list",
+            Self::AddressOverflow => "list_miss_address_overflow",
+            Self::Unreadable(_) => "list_miss_unreadable",
+            Self::Undecodable => "list_miss_undecodable",
+            Self::SlotEmpty => "list_miss_slot_empty",
+        }
+    }
+
+    /// The same eight checks, seen a tranche later by
+    /// [`slot_recheck`](self::slot_recheck).
+    ///
+    /// A second table rather than a prefix swap on [`Self::route`], because both
+    /// are matched exhaustively and a new variant therefore cannot be added
+    /// without giving it a name on both cadences. It sits here rather than in
+    /// `slot_recheck` for the same reason the first one does: the two spellings
+    /// of one check belong next to each other, where a divergence is visible.
+    ///
+    /// The recheck's first version collapsed four of these into one
+    /// `slot_recheck_unreadable`, and the first driven boot put **20** readings
+    /// in it — the whole of that boot's terminal verdicts, and unreadable in
+    /// exactly the sense that it could not say which check refused. That is the
+    /// failure [`ListMiss`] itself exists to have fixed once.
+    pub fn recheck_route(self) -> &'static str {
+        match self {
+            Self::NoTask => "slot_recheck_no_task",
+            Self::TaskInactive => "slot_recheck_task_inactive",
+            Self::NoObjectList => "slot_recheck_no_object_list",
+            Self::RefBeyondList => "slot_recheck_ref_beyond_list",
+            Self::AddressOverflow => "slot_recheck_address_overflow",
+            Self::Unreadable(_) => "slot_recheck_unreadable",
+            Self::Undecodable => "slot_recheck_undecodable",
+            // Not terminal: the watch survives to be asked again. Named anyway
+            // so the table is total and the residue has a spelling if a caller
+            // ever wants to report it.
+            Self::SlotEmpty => "slot_recheck_still_empty",
+        }
+    }
+}
+
 /// Lookup one object-list slot for `task_id` / `ref_`, reporting a miss.
 ///
 /// For a ref the guest named. A speculative caller wants [`probe_list_entry`];
@@ -1183,12 +1299,169 @@ fn list_entry<M: HostMemory>(
     ref_: u32,
     lookup: ListLookup,
 ) -> Option<ListObjectEntry> {
-    let task = state.tasks.get(task_id)?;
-    if !task.active || task.object_list_count == 0 {
-        return None;
+    let found = list_entry_or_miss(state, host, task_id, ref_, lookup);
+    match found {
+        Ok(entry) => {
+            // Only a ref the guest named: a probe's success is the search
+            // finding an owner, which says nothing about what this task's own
+            // list once held. One atomic bit — see `slot_recheck::ResolvedBits`
+            // for why this path cannot take a lock.
+            if lookup == ListLookup::Named {
+                slot_recheck::note_ref_resolved(task_id, ref_);
+                // The control for the banding below, and the reason it is worth
+                // reading: a miss skewing late says nothing unless the hits do
+                // not. See `census::note_list_lookup_age`.
+                crate::runtime::drain::note_list_lookup_age(
+                    true,
+                    crate::runtime::drain::tranche_elapsed_us(),
+                );
+            }
+            Some(entry)
+        }
+        Err(miss) => {
+            // Only for a ref the guest named. A probe misses on every task that
+            // does not own the ref, which is how it finds the one that does —
+            // counting those would bury the named misses under the search.
+            if lookup == ListLookup::Named {
+                crate::runtime::drain::note_store_route(miss.route());
+                // How late in its tranche this lookup happened. The guest clears
+                // a slot by writing its own memory, so a slot found cleared
+                // should be one read late — if these band like the hits do, that
+                // story is wrong however good the totals look.
+                crate::runtime::drain::note_list_lookup_age(
+                    false,
+                    crate::runtime::drain::tranche_elapsed_us(),
+                );
+                if miss == ListMiss::SlotEmpty {
+                    note_slot_empty_claimants(state, host, task_id, ref_);
+                    // The unconfounded half of the same question — see
+                    // `slot_recheck` for why the claimant search above cannot
+                    // settle it and this can.
+                    slot_recheck::note_slot_empty(state, host, task_id, ref_);
+                }
+            }
+            None
+        }
     }
-    let off = list_object_entry_offset(ref_, task.object_list_count)?;
-    let entry_gva = ((task.object_list_pfn as u64) << state.page_shift).checked_add(off)?;
+}
+
+/// For a named ref whose own task's slot is empty: how many *other* live tasks
+/// hold a real object at that slot, against how many there are?
+///
+/// [`ListMiss::SlotEmpty`] is the only miss a macos-26 boot produces and the
+/// whole of that rail's lost draws. "Does anyone else have it" looked like the
+/// question, and a first boot answered *every* miss with yes — which is when the
+/// confound became obvious. **Every task registers its object list at the same
+/// `pfn = 1`**, and refs are small and dense, so "another task has something at
+/// slot 3" is close to a tautology on a busy guest and says nothing about
+/// ownership.
+///
+/// So the reading is the *fraction*, and it is emitted banded against the live
+/// task count rather than as a yes/no:
+///
+/// - **nowhere** — nobody has published it. The guest named a ref before writing
+///   the slot, and the answer is for the packet to wait rather than for the draw
+///   to be dropped.
+/// - **one** — exactly one other task has it. That is a real ownership signal:
+///   the object exists in a list this device did not look in.
+/// - **many / all** — the slot index is simply populated across the guest's
+///   tasks, and this search cannot tell ownership from coincidence. Anything
+///   built on it would be built on the confound.
+///
+/// Costs one probe read per live task, on a miss only.
+fn note_slot_empty_claimants<M: HostMemory>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    ref_: u32,
+) {
+    let live = state.tasks.live_count();
+    let claimants: Vec<(u32, ListObjectEntry)> = state
+        .tasks
+        .live_ids()
+        .filter(|&other| other != task_id)
+        .filter_map(|other| probe_list_entry(state, host, other, ref_).map(|e| (other, e)))
+        .collect();
+    crate::runtime::drain::note_store_route(slot_empty_claim_route(claimants.len(), live));
+    // The band was built when these lists were believed dense, where naming the
+    // claimants would have been naming most of the guest. They are not: a driven
+    // boot reads 4 to 18 occupied slots in a 341-entry first page, so a claim is
+    // ~2 % likely by coincidence and *which* tasks claim is now a reading rather
+    // than noise. Latched per `(task, ref)` — the band above is per miss and this
+    // is per slot, which is also why the two counts differ.
+    if !crate::observe::first_sight(
+        "slot_empty_claimants",
+        (u64::from(task_id) << 32) | u64::from(ref_),
+    ) {
+        return;
+    }
+    // Occupancy first, because it disqualifies most claims outright: a task
+    // holding 316 of 341 slots claims every ref there is. A driven boot found
+    // task 1 doing exactly that.
+    //
+    // Occupancy alone does not qualify the survivors, though. A sparse list
+    // grows from index 0, so low refs are more likely occupied in *any* task,
+    // and the missing refs here are 3, 4, 9, 10, 14 — the low end. `type=` is
+    // the reading that position cannot fake: if the claimant's slot holds an
+    // object of a kind the guest's command could not have meant, the claim is
+    // coincidence however sparse the claimant is.
+    let detail: Vec<String> = claimants
+        .iter()
+        .map(|&(other, entry)| {
+            let held = slot_recheck::first_page_population(state, host, other)
+                .map_or(-1i64, |p| p.populated as i64);
+            format!("{other}:holds={held}:type={}", entry.object_type)
+        })
+        .collect();
+    crate::observe::off(format!(
+        "slot_empty_claimants task={task_id} ref={ref_} live={live} claimants=[{}] \
+         (other live tasks holding a real object at this ref, each with how many objects \
+          it holds in all and the object type it has here)",
+        detail.join(" ")
+    ));
+}
+
+/// Band a claimant count against the live task count.
+///
+/// Split out from the walk so the banding is testable without a guest: the walk
+/// is a page-table read per task and the band is the only part that can be
+/// wrong in a way that changes what the next session believes.
+fn slot_empty_claim_route(claimants: usize, live_tasks: usize) -> &'static str {
+    // `live_tasks` counts the asking task too, so the most that can claim is
+    // one fewer. Comparing against that rather than against `live_tasks` is what
+    // makes "all" mean all of them.
+    let others = live_tasks.saturating_sub(1);
+    match claimants {
+        0 => "list_miss_slot_empty_claimed_nowhere",
+        1 => "list_miss_slot_empty_claimed_by_one",
+        n if others > 0 && n >= others => "list_miss_slot_empty_claimed_by_all",
+        _ => "list_miss_slot_empty_claimed_by_many",
+    }
+}
+
+/// The lookup proper, naming the check that refused.
+///
+/// Split from [`list_entry`] so the eight ways a slot comes back empty are eight
+/// values rather than eight `None`s. See [`ListMiss`] for why that mattered.
+fn list_entry_or_miss<M: HostMemory>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    ref_: u32,
+    lookup: ListLookup,
+) -> Result<ListObjectEntry, ListMiss> {
+    let task = state.tasks.get(task_id).ok_or(ListMiss::NoTask)?;
+    if !task.active {
+        return Err(ListMiss::TaskInactive);
+    }
+    if task.object_list_count == 0 {
+        return Err(ListMiss::NoObjectList);
+    }
+    let off = list_object_entry_offset(ref_, task.object_list_count)
+        .ok_or(ListMiss::RefBeyondList)?;
+    let entry_gva = ((task.object_list_pfn as u64) << state.page_shift)
+        .checked_add(off)
+        .ok_or(ListMiss::AddressOverflow)?;
     let mut raw = [0u8; OBJECT_LIST_ENTRY_LEN];
     let read = match lookup {
         ListLookup::Named => gva_mem::read_task_gva_by_id(
@@ -1208,17 +1481,17 @@ fn list_entry<M: HostMemory>(
             state.page_shift,
         ),
     };
-    if read.is_err() {
+    if let Err(why) = read {
         if lookup == ListLookup::Named {
             note_list_entry_unreadable(task_id, ref_, task, entry_gva);
         }
-        return None;
+        return Err(ListMiss::Unreadable(why));
     }
-    let e = decode_list_object_entry(&raw).ok()?;
+    let e = decode_list_object_entry(&raw).map_err(|_| ListMiss::Undecodable)?;
     if e.descriptor_length == 0 || e.descriptor_gva == 0 {
-        return None;
+        return Err(ListMiss::SlotEmpty);
     }
-    Some(e)
+    Ok(e)
 }
 
 /// Read the descriptor blob for a list entry.

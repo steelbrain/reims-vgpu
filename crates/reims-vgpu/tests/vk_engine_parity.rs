@@ -17,6 +17,15 @@ use reims_vgpu::backend::vulkan::engine::{
     VertexAttributeFormat, VertexAttributeResource, VertexStepFunction, ViewportResource,
     VisibilityResultMode, MAX_DEVICE_RECREATES,
 };
+/// The resident format every `TargetIdentity::Surface` in this file is built at.
+///
+/// These tests predate the namespace carrying a format, and each was written
+/// against a resident in guest scanout order — several assert on the byte order
+/// of what they read back. Naming the constant once keeps that premise in one
+/// place and makes a test that wants a different format say so.
+const SURFACE_TEST_FORMAT: ash::vk::Format =
+    reims_vgpu::backend::vulkan::translate::pixel::SCANOUT_FORMAT;
+
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
@@ -116,8 +125,9 @@ fn near(got: u8, want: u8) -> bool {
 /// read back in.
 ///
 /// The engine picks the attachment format from the resolved target — a
-/// `TargetIdentity::Surface` resident is `B8G8R8A8_UNORM` so a type-11 composite
-/// Store's readback lands in guest scanout order with no CPU pass — and reports
+/// `TargetIdentity::Surface` resident is the format its mapping declared, which
+/// is `SURFACE_TEST_FORMAT` for every identity in this file, so a type-11
+/// composite Store's readback lands in guest scanout order with no CPU pass — and reports
 /// which it used in `DrawOutput::pixels_bgra`. These cases assert *colour*, not
 /// byte layout, so they normalize here from the reported order rather than
 /// assuming one. The physical contract has its own case
@@ -641,6 +651,7 @@ fn depth_test_honored_on_resident_target_path() {
             width: w,
             height: h,
             generation: 1,
+            format: SURFACE_TEST_FORMAT,
         };
         let mut req = engine_req(&vert, &frag, w, h);
         req.vertex_count = 6;
@@ -1096,6 +1107,7 @@ fn resident_sample_bind_avoids_roundtrip_and_remains_loadable() {
         width: 16,
         height: 16,
         generation: 1,
+        format: SURFACE_TEST_FORMAT,
     };
 
     let mut make_source = engine_req(&v, &f, 16, 16);
@@ -1161,6 +1173,7 @@ fn resident_sample_alias_uses_gpu_snapshot_without_roundtrip() {
         width: 16,
         height: 16,
         generation: 1,
+        format: SURFACE_TEST_FORMAT,
     };
     let mut cold = engine_req(&v, &f, 16, 16);
     cold.target_identity = Some(identity.clone());
@@ -1368,6 +1381,7 @@ fn warm_non_store_zero_readback_seed_create_alloc() {
         width: 16,
         height: 16,
         generation: 1,
+        format: SURFACE_TEST_FORMAT,
     };
     // Cold: seed import + draw with readback so we can verify content, mark ready.
     let mut cold = engine_req(&v, &f, 16, 16);
@@ -1438,6 +1452,7 @@ fn every_admitted_resident_survives_past_the_retired_slot_cap() {
         width: 16,
         height: 16,
         generation: 1,
+        format: SURFACE_TEST_FORMAT,
     };
     assert!(
         !engine::pin_resident_target(&absent),
@@ -1449,6 +1464,7 @@ fn every_admitted_resident_survives_past_the_retired_slot_cap() {
         width: 16,
         height: 16,
         generation: 1,
+        format: SURFACE_TEST_FORMAT,
     };
     let mut make = engine_req(&v, &f, 16, 16);
     make.target_identity = Some(pinned.clone());
@@ -1467,6 +1483,7 @@ fn every_admitted_resident_survives_past_the_retired_slot_cap() {
         width: 16,
         height: 16,
         generation: 1,
+        format: SURFACE_TEST_FORMAT,
     };
     let mut make2 = engine_req(&v, &f, 16, 16);
     make2.target_identity = Some(unpinned.clone());
@@ -1486,6 +1503,7 @@ fn every_admitted_resident_survives_past_the_retired_slot_cap() {
             width: 16,
             height: 16,
             generation: 1,
+            format: SURFACE_TEST_FORMAT,
         });
         engine::execute_draw_request(&filler).expect("filler draw");
     }
@@ -1505,6 +1523,7 @@ fn every_admitted_resident_survives_past_the_retired_slot_cap() {
             width: 16,
             height: 16,
             generation: 1,
+            format: SURFACE_TEST_FORMAT,
         };
         assert!(
             engine::resident_content_ready(&filler),
@@ -1519,8 +1538,9 @@ fn every_admitted_resident_survives_past_the_retired_slot_cap() {
 /// A `output_bgra` + `skip_readback` resident draw leaves content that
 /// [`engine::read_target`] can read back twice with the same answer — asserted
 /// here because nothing else in this suite reads the same resident twice.
-/// A `TargetIdentity::Surface` resident renders and reads back in guest scanout
-/// order **without the caller asking**, and says so; a pooled target does not.
+/// A `TargetIdentity::Surface` resident declared at guest scanout order renders
+/// and reads back in it **without the caller asking**, and says so; a pooled
+/// target does not.
 ///
 /// This is the contract the type-11 composite Store rests on. That Store's
 /// consumers are all defined in BGRA — `mapping_write::write_bgra8`,
@@ -1556,6 +1576,7 @@ fn a_surface_resident_reads_back_in_guest_scanout_order() {
         width: w,
         height: h,
         generation: 1,
+        format: SURFACE_TEST_FORMAT,
     });
     let out = match engine::execute_draw_request(&resident) {
         Ok(o) => o,
@@ -1617,6 +1638,7 @@ fn a_bgra_resident_draw_reads_back_identically_twice() {
         width: w,
         height: h,
         generation: 1,
+        format: SURFACE_TEST_FORMAT,
     };
     let mut req = engine_req(&v, &f, w, h);
     req.target_identity = Some(identity.clone());
@@ -1671,6 +1693,7 @@ fn a_skipped_draw_readback_and_a_resident_read_are_counted_apart() {
         width: w,
         height: h,
         generation: 1,
+        format: SURFACE_TEST_FORMAT,
     };
     let mut req = engine_req(&v, &f, w, h);
     req.target_identity = Some(identity.clone());
@@ -1734,6 +1757,7 @@ fn sampled_rgba_upload_to_bgra_target_preserves_semantic_channels() {
         width: w,
         height: h,
         generation: 1,
+        format: SURFACE_TEST_FORMAT,
     };
     let mut req = engine_req(&vert, &frag, w, h);
     req.vertex_count = 6;
@@ -2006,6 +2030,7 @@ fn sampled_bgra8_bytes_upload_matches_rgba8_semantic_color() {
             width: w,
             height: h,
             generation: 1,
+            format: SURFACE_TEST_FORMAT,
         };
         let mut req = engine_req(&vert, &frag, w, h);
         req.vertex_count = 6;
@@ -2126,6 +2151,7 @@ fn a_view_swizzle_is_performed_by_the_image_view_not_the_cpu() {
             width: w,
             height: h,
             generation: 1,
+            format: SURFACE_TEST_FORMAT,
         };
         let mut req = engine_req(&vert, &frag, w, h);
         req.vertex_count = 6;
@@ -2207,6 +2233,7 @@ fn partial_draw_preserves_rgba_seed_on_bgra_target() {
         width: w,
         height: h,
         generation: 1,
+        format: SURFACE_TEST_FORMAT,
     };
     let seed_rgba = [17u8, 91, 203, 255];
     let mut req = engine_req(&vert, &frag, w, h);
@@ -2339,6 +2366,7 @@ fn a_bgra_ordered_seed_lands_the_same_pixels_as_the_rgba_ordered_one() {
             width: w,
             height: h,
             generation: 1,
+            format: SURFACE_TEST_FORMAT,
         };
         let mut req = engine_req(&vert, &frag, w, h);
         req.target_identity = Some(identity.clone());
@@ -2451,6 +2479,7 @@ fn skip_readback_store_then_load_from_target_preserves_content() {
         width: 16,
         height: 16,
         generation: 1,
+        format: SURFACE_TEST_FORMAT,
     };
     // Pass 1: product zero-copy Store shape — resident path uses skip_readback
     // so no CPU pixels land in host_cache.
@@ -2496,6 +2525,7 @@ fn guest_reset_evicts_resident_targets_without_destroying_context() {
         width: 16,
         height: 16,
         generation: 1,
+        format: SURFACE_TEST_FORMAT,
     };
     let mut draw = engine_req(&v, &f, 16, 16);
     draw.target_identity = Some(identity.clone());
@@ -2542,6 +2572,7 @@ fn chain_load_from_target_byte_parity_vs_cpu_seed() {
         width: 16,
         height: 16,
         generation: 1,
+        format: SURFACE_TEST_FORMAT,
     };
     let mut g1 = engine_req(&v, &f, 16, 16);
     g1.target_identity = Some(identity.clone());
@@ -2633,6 +2664,7 @@ fn load_from_target_after_a_readback_matches_the_cpu_seed_chain() {
         width: w,
         height: h,
         generation: 1,
+        format: SURFACE_TEST_FORMAT,
     };
     let mut g1 = engine_req(&v, &f, w, h);
     g1.target_identity = Some(identity.clone());
@@ -2698,7 +2730,7 @@ fn gva_chain_resident_single_readback_matches_cpu_seed_chain() {
         width: 16,
         height: 16,
         generation: 0,
-        bgra: false,
+        format: reims_vgpu::backend::vulkan::translate::pixel::RESIDENT_RGBA_FORMAT,
     };
     engine::reset_draw_counters();
     let before = engine::counter_snapshot();
@@ -2760,7 +2792,7 @@ fn gva_deferred_store_flush_read_matches_sync_store() {
         width: 16,
         height: 16,
         generation: 0,
-        bgra: false,
+        format: reims_vgpu::backend::vulkan::translate::pixel::RESIDENT_RGBA_FORMAT,
     };
     engine::reset_draw_counters();
     let before = engine::counter_snapshot();
@@ -2874,13 +2906,20 @@ fn device_loss_named_and_recreate_bounded() {
     }
 }
 
-/// In-flight ring lock (3-deep): consecutive no-readback resident draws land
-/// on separate ring slots without retiring each other; only the entry that
-/// wraps onto a still-pending slot pays the retire (ring_retire_blocks). A
-/// boundary read then retires everything and sees the exact final content.
-/// If RING_DEPTH changes, the wrap arithmetic below must follow.
+/// Consecutive no-readback resident draws stay in flight: none of them waits on
+/// its own submission, and a boundary read retires everything and sees the
+/// exact final content of both targets.
+///
+/// It used to assert the ring *wrap* as well — "the first three occupy every
+/// slot, the fourth wraps onto the first and pays the retire" — and that
+/// arithmetic has been unreachable from four draws since `RING_DEPTH` went to
+/// 8. It is doubly unreachable now that the four alternating draws share one
+/// command buffer: they are one submission, not four. Driving a real wrap would
+/// take `RING_DEPTH * BATCH_MAX_DRAWS` draws and would then assert
+/// `ring_retire_blocks`, which is a race against how fast the host GPU retires
+/// a 16x16 draw. What is left here is not that, and the name says so.
 #[test]
-fn ring_overlaps_in_flight_no_readback_draws() {
+fn alternating_target_no_readback_draws_stay_in_flight_and_read_back_exact() {
     let _g = engine_test_session();
     let (v, f) = triangle_spirv();
     let id_a = TargetIdentity::Surface {
@@ -2888,12 +2927,14 @@ fn ring_overlaps_in_flight_no_readback_draws() {
         width: 16,
         height: 16,
         generation: 1,
+        format: SURFACE_TEST_FORMAT,
     };
     let id_b = TargetIdentity::Surface {
         id: 92,
         width: 16,
         height: 16,
         generation: 1,
+        format: SURFACE_TEST_FORMAT,
     };
     // Cold sync draws mark both targets ready (content verified).
     for (label, identity) in [("ring_cold_a", &id_a), ("ring_cold_b", &id_b)] {
@@ -2919,8 +2960,7 @@ fn ring_overlaps_in_flight_no_readback_draws() {
     engine::read_target(&id_a).expect("ring quiesce");
     engine::reset_draw_counters();
     let before = engine::counter_snapshot();
-    // Four async draws: the first three occupy every slot in flight; the
-    // fourth wraps onto the first slot and must retire it.
+    // Four async draws alternating between two targets.
     for (n, identity) in [&id_a, &id_b, &id_a, &id_b].into_iter().enumerate() {
         let mut warm = engine_req(&v, &f, 16, 16);
         warm.target_identity = Some((*identity).clone());
@@ -2933,16 +2973,15 @@ fn ring_overlaps_in_flight_no_readback_draws() {
         d.render_post_wait_skips, 4,
         "all four draws must skip the post-submit wait: {d:?}"
     );
-    // Deferred submit: each alternating-target draw opens its own batch; the
-    // next draw's begin_entry flushes it (submit), so three flushes land in
-    // the window and the fourth batch is still open (flushed by the boundary
-    // read below). Same-target runs sharing one CB are covered by
-    // vk_engine_batch.rs.
-    assert_eq!(d.batch_opens, 4, "each draw opens a batch: {d:?}");
-    assert_eq!(d.batch_joins, 0, "alternating targets never join: {d:?}");
+    // Deferred submit: the target does not key the batch, so all four land in
+    // one command buffer and nothing has submitted it yet — the boundary read
+    // below is what flushes it. Under `REIMS_VGPU_BATCH_MIXED_TARGETS=off` this
+    // reads 4/0/3 instead, which is what it read before that key was dropped.
+    assert_eq!(d.batch_opens, 1, "one batch carries all four draws: {d:?}");
+    assert_eq!(d.batch_joins, 3, "three of them joined it: {d:?}");
     assert_eq!(
-        d.batch_flushes, 3,
-        "each subsequent draw flushes its predecessor's batch: {d:?}"
+        d.batch_flushes, 0,
+        "nothing consumed either target inside the window: {d:?}"
     );
     // Boundary reads retire the in-flight work and see the final content.
     let px = engine::read_target(&id_a)
@@ -2968,12 +3007,14 @@ fn seed_from_target_gpu_copies_front_frame() {
         width: 16,
         height: 16,
         generation: 1,
+        format: SURFACE_TEST_FORMAT,
     };
     let back = TargetIdentity::Surface {
         id: 72,
         width: 16,
         height: 16,
         generation: 1,
+        format: SURFACE_TEST_FORMAT,
     };
     // Render known content into the "front frame" resident.
     let mut cold = engine_req(&v, &f, 16, 16);
@@ -3016,6 +3057,7 @@ fn seed_from_target_gpu_copies_front_frame() {
         width: 16,
         height: 16,
         generation: 9,
+        format: SURFACE_TEST_FORMAT,
     };
     let mut missing = engine_req(&v, &f, 16, 16);
     missing.target_identity = Some(back.clone());
@@ -3037,12 +3079,14 @@ fn mrt_secondary_attachment_becomes_sampleable_resident() {
         width: 16,
         height: 16,
         generation: 1,
+        format: SURFACE_TEST_FORMAT,
     };
     let secondary = TargetIdentity::Surface {
         id: 0x61,
         width: 16,
         height: 16,
         generation: 1,
+        format: SURFACE_TEST_FORMAT,
     };
 
     let mut mrt = engine_req(&v, &f, 16, 16);
@@ -3082,6 +3126,7 @@ fn mrt_secondary_attachment_becomes_sampleable_resident() {
         width: 16,
         height: 16,
         generation: 1,
+        format: SURFACE_TEST_FORMAT,
     };
     let mut consume = engine_req(&v, &f, 16, 16);
     consume.target_identity = Some(consumer_target);
@@ -3122,13 +3167,14 @@ fn mrt_rg16float_secondary_builds_and_renders() {
         width: 32,
         height: 32,
         generation: 1,
+        format: SURFACE_TEST_FORMAT,
     };
     let mask = TargetIdentity::Gva {
         gva: 0x3cf5000,
         width: 32,
         height: 32,
         generation: 0,
-        bgra: false,
+        format: reims_vgpu::backend::vulkan::translate::pixel::RESIDENT_RGBA_FORMAT,
     };
     let mut mrt = engine_req(&v, &f, 32, 32);
     mrt.target_identity = Some(primary.clone());
@@ -3159,6 +3205,93 @@ fn mrt_rg16float_secondary_builds_and_renders() {
     );
 }
 
+/// Depth and MRT in the same pass: a draw carrying both a secondary colour
+/// attachment and a depth attachment renders through one framebuffer holding
+/// all three, in the order the render pass declares them.
+///
+/// The engine used to refuse this shape by name and lose the whole draw. macOS
+/// 26 issues it nine times in a driven boot and macOS 14 once, each refusal
+/// paired with a `draw_vk_nothing_stored` on the same pipe and task.
+///
+/// Depth is the discriminator on purpose, and it separates the two ways the
+/// combination can be wrong. If the depth view were left out of the framebuffer
+/// the pass and the framebuffer would disagree on attachment count and neither
+/// variant would render at all; if the depth *state* were dropped instead, both
+/// variants would cover. Only a pass that carries both attachments and tests
+/// against the depth one gives Never≠Always. The secondary is then asserted to
+/// have survived as a resident, which is what says it was not displaced by the
+/// depth attachment appended after it.
+#[test]
+fn depth_and_mrt_secondary_render_in_one_pass() {
+    let _g = engine_test_session();
+    let (v, f) = triangle_spirv();
+    let (w, h) = (16u32, 16u32);
+    let mut surface_id = 0x70u32;
+    let mut variant = |compare: SamplerCompareFunction| -> Option<(bool, TargetIdentity)> {
+        surface_id += 2;
+        let primary = TargetIdentity::Surface {
+            id: surface_id,
+            width: w,
+            height: h,
+            generation: 1,
+            format: SURFACE_TEST_FORMAT,
+        };
+        let secondary = TargetIdentity::Surface {
+            id: surface_id + 1,
+            width: w,
+            height: h,
+            generation: 1,
+            format: SURFACE_TEST_FORMAT,
+        };
+        let mut req = engine_req(&v, &f, w, h);
+        req.target_identity = Some(primary);
+        req.secondary_targets.push(SecondaryColorTarget {
+            identity: secondary.clone(),
+            width: w,
+            height: h,
+            format: ash::vk::Format::R8G8B8A8_UNORM,
+            clear: [0.0, 0.0, 1.0, 1.0],
+            load: false,
+            blend: None,
+            color_write_mask: Default::default(),
+        });
+        req.depth = Some(DepthState {
+            // Parity fixtures bind no guest depth texture, so this is the
+            // transient rail — the one that owns its image and so the one whose
+            // dispose order a shared framebuffer would get wrong.
+            identity: None,
+            test_enable: true,
+            write_enable: true,
+            compare,
+            clear_value: 1.0,
+            load: false,
+            stencil: None,
+        });
+        match engine::execute_draw_request(&req) {
+            Ok(o) => Some((triangle_covered(&semantic_rgba(&o), w, h), secondary)),
+            Err(e) if skip_if_no_gpu(&e.to_string()) => {
+                eprintln!("SKIP depth+mrt: {e}");
+                None
+            }
+            Err(e) => panic!("depth + MRT secondary draw: {e}"),
+        }
+    };
+
+    let Some((never, _)) = variant(SamplerCompareFunction::Never) else {
+        return; // no GPU
+    };
+    assert!(
+        !never,
+        "compare=Never must discard every fragment, so the depth attachment is live"
+    );
+    let (always, secondary) = variant(SamplerCompareFunction::Always).unwrap();
+    assert!(always, "compare=Always must keep every fragment");
+    assert!(
+        engine::resident_content_ready(&secondary),
+        "the secondary attachment must still be a ready resident alongside depth"
+    );
+}
+
 /// Firewall: an empty `secondary_targets` leaves the classic single-attachment
 /// path untouched — same fragment color, zero MRT residents created.
 #[test]
@@ -3170,6 +3303,7 @@ fn single_rt_draw_unaffected_by_mrt_path() {
         width: 16,
         height: 16,
         generation: 1,
+        format: SURFACE_TEST_FORMAT,
     };
     let mut req = engine_req(&v, &f, 16, 16);
     req.target_identity = Some(target.clone());
@@ -3188,7 +3322,7 @@ fn single_rt_draw_unaffected_by_mrt_path() {
         width: 16,
         height: 16,
         generation: 0,
-        bgra: false,
+        format: reims_vgpu::backend::vulkan::translate::pixel::RESIDENT_RGBA_FORMAT,
     };
     assert!(!engine::resident_content_ready(&never));
 }
@@ -3338,6 +3472,7 @@ fn resident_content_state_separates_an_absent_slot_from_an_unstamped_one() {
         width: 16,
         height: 16,
         generation: 1,
+        format: SURFACE_TEST_FORMAT,
     };
     assert_eq!(
         engine::resident_content_state(&absent),
@@ -3351,6 +3486,7 @@ fn resident_content_state_separates_an_absent_slot_from_an_unstamped_one() {
         width: 16,
         height: 16,
         generation: 1,
+        format: SURFACE_TEST_FORMAT,
     };
     let mut make = engine_req(&v, &f, 16, 16);
     make.target_identity = Some(live.clone());

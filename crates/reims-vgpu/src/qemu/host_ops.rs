@@ -378,10 +378,22 @@ impl HostOps for QemuHost<'_> {
                 let mut q = prompt.lock();
                 // Coalesce: an undelivered pulse of the same kind already
                 // covers this one (status bits accumulate in the r2c regs).
-                if !q.iter().any(|a| a.kind == action.kind) {
+                //
+                // That reasoning holds for a *status* the guest reads back. It
+                // does not hold for an event the guest **timestamps**: a VBL
+                // pulse that coalesces into an undelivered one is a vblank the
+                // guest never sees, so the interval it measures between vblanks
+                // is two grid periods rather than one. This counter says how
+                // often it happens; `note_irq_coalesced`'s doc says why that
+                // number decides a boot's frame rate.
+                let coalesced = q.iter().any(|a| a.kind == action.kind);
+                if !coalesced {
                     q.push_back(action);
                 }
                 drop(q);
+                if coalesced {
+                    crate::runtime::drain::note_irq_coalesced(action.kind);
+                }
                 self.notify_actions();
                 return;
             }

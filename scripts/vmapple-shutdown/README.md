@@ -3,7 +3,7 @@
 Cleanly stop the running vmapple guest.
 
 The clean path is an **in-guest `shutdown -h now` over SSH**: macOS halts, issues an ARM PSCI
-SYSTEM_OFF, and QEMU exits on its own (rc=0) — which is what lets `vm/boot-arm64.sh --snapshot` capture.
+SYSTEM_OFF, and QEMU exits on its own (rc=0) — which is what lets `vm/boot-arm64.sh --capture` capture.
 QMP `system_powerdown` does **not** work on vmapple (it is an ACPI power-button event and Apple's
 platform has no ACPI, so the macOS guest never sees it — verified: 90s no-op vs. `shutdown -h now`
 exiting QEMU in ~5s).

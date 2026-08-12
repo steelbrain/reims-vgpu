@@ -795,17 +795,23 @@ fn plan_guest_window(
     span_end: u64,
     bpr: u32,
     width: u32,
+    texel: u32,
 ) -> Result<GuestWindowPlan, GpuWritebackDecline> {
     // `bufferRowLength` is in texels, so a pitch that is not a whole number of
     // them has no spelling. Checked rather than assumed: the value comes from
     // the guest's own device descriptor.
+    //
+    // In *this destination's* texels and not in four bytes. A half-float plane
+    // states its pitch in eight-byte texels, so dividing by four would report
+    // twice as many of them — a `bufferRowLength` that reads as a valid padded
+    // stride and lands every row at half its true spacing.
     //
     // The second half is a Vulkan validity rule rather than an arithmetic one:
     // `bufferRowLength` must be zero or at least `imageExtent.width`, so a pitch
     // narrower than the frame is an invalid copy and not a tight one. It cannot
     // happen for a well-formed plane, which is exactly why nothing would notice
     // if it did.
-    if !bpr.is_multiple_of(RGBA8_BPP) || bpr / RGBA8_BPP < width {
+    if texel == 0 || !bpr.is_multiple_of(texel) || bpr / texel < width {
         return Err(GpuWritebackDecline::PitchNotTexels { bpr });
     }
     if span_end <= base_off || page_size == 0 {
@@ -824,14 +830,14 @@ fn plan_guest_window(
     // requires and what a guest pitch in texels already implies for every row
     // but the first.
     let in_page = base_off % page_size;
-    if !in_page.is_multiple_of(u64::from(RGBA8_BPP)) {
+    if !in_page.is_multiple_of(u64::from(texel)) {
         return Err(GpuWritebackDecline::OffsetNotTexelAligned { in_page });
     }
     Ok(GuestWindowPlan {
         first_page,
         last_page,
         in_page,
-        row_length_texels: bpr / RGBA8_BPP,
+        row_length_texels: bpr / texel,
     })
 }
 
@@ -892,19 +898,25 @@ pub fn write_bgra8_from_resident_gpu<M: HostMemory + HostOps>(
             frame_height: height,
         });
     }
-    // A buffer→image copy moves bytes and converts nothing, so the mapping's
-    // format has to be the one the resident already holds. `into_bgra8` on the
-    // copying rail is where a semantic-RGBA resident is exchanged, and the
-    // engine refuses a mismatched pair on its own account too.
+    // An image→buffer copy moves bytes and converts nothing, so this rail can
+    // only serve a mapping whose declared format has a linear Vulkan texel to
+    // name. A compressed or planar declaration has none, and the copying rail's
+    // row converter is the only thing that can land it.
     //
-    // `Bgra8` specifically, and not merely "some order this rail could copy":
-    // a type-11 resident is built in guest scanout order by
-    // `TargetIdentity::is_bgra`, so an RGBA mapping format here is a
-    // disagreement rather than a second rail, and the engine would refuse it a
-    // few lines later anyway.
-    if pixel_format::store_texel_order(format) != Some(pixel_format::TexelLayout::Bgra8) {
+    // Not a check that the resident *holds* that format. The identity carries
+    // the format its image was created with and takes it from
+    // `mapping_store_format`, the same function `mapping_write_geometry` above
+    // reads — so asking here whether the two agree would be asking one input
+    // whether it equals itself. The question is asked once, on the authoritative
+    // pair, by `copy_target_to_guest_pages`: it compares the destination's
+    // format against the resident image's own and refuses by name. That is the
+    // comparison that can actually fail, because a mapping can redeclare its
+    // format under a resident minted before it did.
+    let Some(layout) = pixel_format::store_texel_order(format) else {
         return Err(GpuWritebackDecline::FormatNeedsConversion { format });
-    }
+    };
+    let dst_format = crate::backend::vulkan::translate::pixel::vk_texel_layout(layout);
+    let texel = layout.bytes_per_texel();
     let Some((base_off, bpr, span_end)) = type11_sample_window(m, mw, mh, format) else {
         return Err(GpuWritebackDecline::WindowUnresolved {
             width: mw,
@@ -969,7 +981,15 @@ pub fn write_bgra8_from_resident_gpu<M: HostMemory + HostOps>(
     let Some(m) = state.mappings.get(&mapping_id) else {
         return Err(GpuWritebackDecline::NotWritable);
     };
-    let plan = plan_guest_window(m.page_entries.len(), page_size, base_off, span_end, bpr, mw)?;
+    let plan = plan_guest_window(
+        m.page_entries.len(),
+        page_size,
+        base_off,
+        span_end,
+        bpr,
+        mw,
+        texel,
+    )?;
     let mut gpas = Vec::with_capacity(plan.pages());
     for (i, &entry) in m.page_entries[plan.first_page..=plan.last_page]
         .iter()
@@ -986,8 +1006,8 @@ pub fn write_bgra8_from_resident_gpu<M: HostMemory + HostOps>(
     // row belongs to the surface's plane but is not texels this call was given,
     // and the copying rail does not write it either — a request that included
     // it would let the two rails land different guest memory for one frame.
-    let pitch = u64::from(plan.row_length_texels.max(mw)) * 4;
-    let extent = u64::from(mh.saturating_sub(1)) * pitch + u64::from(mw) * 4;
+    let pitch = u64::from(plan.row_length_texels.max(mw)) * u64::from(texel);
+    let extent = u64::from(mh.saturating_sub(1)) * pitch + u64::from(mw) * u64::from(texel);
     // Every run, not one range. The guest backs a surface in 16 KiB granules
     // with no relation to each other, so a full-screen window is ~507 stretches
     // and asking for a single contiguous reference refused every 1080p flush of
@@ -1005,9 +1025,11 @@ pub fn write_bgra8_from_resident_gpu<M: HostMemory + HostOps>(
         row_length_texels: plan.row_length_texels,
         width: mw,
         height: mh,
-        // Checked above: this rail only reaches here for a mapping whose
-        // declared format is guest scanout order.
-        bgra: true,
+        // The guest's own declaration for this plane, which is what the guest
+        // will read these bytes back as. Every byte offset planned above came
+        // from its width, and the engine refuses the copy outright if the
+        // resident does not hold exactly this.
+        format: dst_format,
     };
     // Both witnesses before the copy rather than after it, matching
     // `contig_for_write`: a refused write costs a spurious bump, which makes a
@@ -1045,17 +1067,31 @@ pub fn write_bgra8_from_resident_gpu<M: HostMemory + HostOps>(
 /// would leave exactly the windows the write is about to land on.
 fn mapping_write_geometry(m: &MappingEntry, width: u32, height: u32) -> (u32, u32, u16) {
     if m.has_geom {
-        (
-            m.width,
-            m.height,
-            if m.format != 0 {
-                m.format
-            } else {
-                MTL_FORMAT_BGRA8_UNORM
-            },
-        )
+        (m.width, m.height, mapping_store_format(m))
     } else {
         (width, height, MTL_FORMAT_BGRA8_UNORM)
+    }
+}
+
+/// The Metal pixel format a Store into this mapping's plane must land in.
+///
+/// A mapping that has declared its own geometry owns this, and a zero format
+/// there means guest scanout order — the format every type-11 plane had before
+/// any of them declared otherwise, so it is the contract's default and not a
+/// guess. A mapping that has declared no geometry has declared no format either.
+///
+/// Public because the *resident* has to agree with it. A render target's
+/// identity carries the format its image is created with, and for this namespace
+/// that answer is this one — so
+/// [`crate::runtime::present_identity::surface_identity`] reads it here rather
+/// than deriving a second copy from the same fields. Two derivations agreeing
+/// only because they share an input is precisely how the primary attachment's
+/// format used to be decided, and it did not stay agreed.
+pub fn mapping_store_format(m: &MappingEntry) -> u16 {
+    if m.has_geom && m.format != 0 {
+        m.format
+    } else {
+        MTL_FORMAT_BGRA8_UNORM
     }
 }
 
@@ -1124,7 +1160,10 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
     };
     // Deferred-writeback flush-on-access: land pending resident content in
     // these pages before touching them.
-    crate::runtime::render_writeback::settle_guest_writes(
+    crate::runtime::writeback_debt::settle_for_mapping(
+        state,
+        host,
+        mapping_id,
         crate::runtime::render_writeback::SettleSite::MappingBgra8Write,
     );
     // Taken after the flush, because the flush can invalidate this mapping, and
@@ -1553,7 +1592,10 @@ pub fn write_rgba8_image_changed<M: HostMemory + HostOps>(
     // contiguous, and landing after puts an older frame on top of this one —
     // which `mapper::write_mapping_bytes_only` states as its own reason for
     // flushing here.
-    crate::runtime::render_writeback::settle_guest_writes(
+    crate::runtime::writeback_debt::settle_for_mapping(
+        state,
+        host,
+        mapping_id,
         crate::runtime::render_writeback::SettleSite::MappingRgba8Write,
     );
     // One proof for the whole image: the changed-span loop below writes each
@@ -1752,7 +1794,10 @@ pub fn write_raw_rows<M: HostMemory + HostOps>(
     }
     // Deferred-writeback flush-on-access (coarse: whole mapping — this entry
     // resolves its window only later and is off the hot compute path).
-    crate::runtime::render_writeback::settle_guest_writes(
+    crate::runtime::writeback_debt::settle_for_mapping(
+        state,
+        host,
+        mapping_id,
         crate::runtime::render_writeback::SettleSite::MappingRawRowsWrite,
     );
     let Some(m) = state.mappings.get(&mapping_id) else {
@@ -1836,7 +1881,10 @@ pub fn read_raw_rows<M: HostMemory + HostOps>(
     }
     // Deferred-writeback flush-on-access (coarse: whole mapping — this entry
     // resolves its window only later and is off the hot compute path).
-    crate::runtime::render_writeback::settle_guest_writes(
+    crate::runtime::writeback_debt::settle_for_mapping(
+        state,
+        host,
+        mapping_id,
         crate::runtime::render_writeback::SettleSite::MappingRawRowsRead,
     );
     let Some(m) = state.mappings.get(&mapping_id) else {
@@ -2012,7 +2060,10 @@ pub fn read_rect_raw_at<M: HostMemory + HostOps>(
     // `flush_intersecting` returns immediately when nothing is armed, so this
     // costs a map-empty check per read. It must also precede `contig_for_span`:
     // the flush writes through the mapping and can retire the cached view.
-    crate::runtime::render_writeback::settle_guest_writes(
+    crate::runtime::writeback_debt::settle_for_mapping(
+        state,
+        host,
+        mapping_id,
         crate::runtime::render_writeback::SettleSite::MappingRectRead,
     );
     let Some(m) = state.mappings.get(&mapping_id) else {
@@ -2322,7 +2373,10 @@ fn write_rect_raw_at_impl<M: HostMemory + HostOps>(
     // surfaces only. Safe to call from inside a flush — the storage rail reaches
     // this function through `write_full_rect_raw_at`, and `flush_intersecting`
     // removes intersecting windows up front so the nested call finds nothing.
-    crate::runtime::render_writeback::settle_guest_writes(
+    crate::runtime::writeback_debt::settle_for_mapping(
+        state,
+        host,
+        mapping_id,
         crate::runtime::render_writeback::SettleSite::MappingRectWrite,
     );
     let Some(vouched) = vouch_for_write(state, host, mapping_id, "rect_raw") else {

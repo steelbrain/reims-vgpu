@@ -159,6 +159,49 @@ pub fn read_task_root(
     })
 }
 
+/// The most interior nodes one descent can read, which is the tree's depth.
+pub const MAX_TREE_NODES: usize = wire_page_table::MAX_DEPTH as usize;
+
+/// The guest-physical pages holding page-table entries that `gva` descends
+/// through under `task`, written into `out`, returning how many were read.
+///
+/// **Interior pages only.** The page the walk resolves *to* is data and is
+/// deliberately absent, so a caller may read this as "these pages must not be
+/// written" without that claim swallowing every page the tree maps.
+///
+/// Short, or empty, whenever the walk refused early — a task with no directory
+/// reads zero, and an address that stops being mapped mid-teardown reads only
+/// the levels above where it stopped. Those levels were really read and really
+/// are nodes, so they are reported rather than discarded; a caller must not read
+/// a short answer as "the tree has no more nodes than this".
+pub fn task_node_gpas(
+    mem: &dyn GuestMemory,
+    geometry: Geometry,
+    task: &Task,
+    gva: u64,
+    out: &mut [u64; MAX_TREE_NODES],
+) -> usize {
+    let Ok(root) = read_task_root(mem, task, geometry) else {
+        return 0;
+    };
+    let mut nodes = wire_page_table::NodePath::default();
+    // The walk's own verdict is discarded on purpose: an unresolvable address
+    // still descended through real nodes, and those are the answer here.
+    let _ = wire_page_table::walk_recording_nodes(
+        &mem,
+        geometry,
+        root.root_pfn,
+        root.depth,
+        gva,
+        &mut nodes,
+    );
+    let pfns = nodes.pfns();
+    for (slot, &pfn) in out.iter_mut().zip(pfns) {
+        *slot = geometry.pfn_to_addr(pfn);
+    }
+    pfns.len()
+}
+
 pub fn translate_root(
     mem: &dyn GuestMemory,
     geometry: Geometry,
@@ -249,6 +292,102 @@ pub fn translate_root_run(
     );
 }
 
+/// What a range's leaf entries looked like, page by page.
+///
+/// Counts rather than a verdict: this module answers what the tree says and the
+/// caller decides what that means. See [`range_coverage`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct RangeCoverage {
+    /// Pages the walk was asked for.
+    pub pages: u64,
+    /// Pages whose descent reached a leaf entry naming a frame.
+    pub present: u64,
+    /// Pages whose descent stopped on a **zero** entry, at any level.
+    pub absent: u64,
+    /// Pages whose descent could not be answered — a table page that would not
+    /// read, or an entry the format cannot produce. Neither present nor absent.
+    pub undecidable: u64,
+    /// Index within the run of the first absent page, meaningful when
+    /// [`Self::absent`] is non-zero.
+    pub first_absent_index: u64,
+    /// Level the first absent page's descent stopped at, zero-based from the
+    /// root. `first_absent_level + 1 == depth` is a **leaf** entry that is zero;
+    /// anything shallower is a whole absent subtree.
+    pub first_absent_level: u32,
+    /// The tree's depth, as the task's own directory declares it.
+    pub depth: u32,
+}
+
+/// Walk `pages` consecutive pages from `first_gva` under `task` and count what
+/// the tree holds for each.
+///
+/// # What this is for
+///
+/// One guest line's page-table teardown asserts, per page of the range it is
+/// given, that the leaf entry is **not already zero** — and takes the whole
+/// guest down when it is not. The range it tears down is the range it named on
+/// the wire, and it tears it down after this device has replied. So walking the
+/// range at that moment answers whether the guest is about to assert, before it
+/// does, using a tree this device is already entitled to read.
+///
+/// The level is carried because it separates two different guest assertions: a
+/// zero at the deepest level is a leaf entry the teardown refuses to clear, and
+/// a zero above it is a missing interior node the same teardown refuses to
+/// descend through. Both end the guest; they are not the same defect.
+///
+/// `None` when the task has no readable root — an inactive task, a task with no
+/// directory, or a directory page that would not read. That is not a coverage
+/// answer and must not be counted as one.
+///
+/// The cost is [`wire_page_table::walk_run`]'s: the upper levels are read once
+/// per subtree rather than once per page, and the deepest level a batch at a
+/// time. The guest's own teardown walks every one of these pages, so the reach
+/// asked for here is never more than the reach the guest has already committed
+/// to; bounding it is the caller's decision and not this function's.
+pub fn range_coverage(
+    mem: &dyn GuestMemory,
+    geometry: Geometry,
+    task: &Task,
+    first_gva: u64,
+    pages: u64,
+) -> Option<RangeCoverage> {
+    let root = read_task_root(mem, task, geometry).ok()?;
+    if root.root_pfn == 0 || root.depth == 0 {
+        return None;
+    }
+    let mut out = RangeCoverage {
+        pages,
+        depth: root.depth,
+        ..RangeCoverage::default()
+    };
+    wire_page_table::walk_run(
+        &mem,
+        geometry,
+        root.root_pfn,
+        root.depth,
+        first_gva,
+        pages,
+        &mut |index, walked| {
+            match walked {
+                Ok(_) => out.present += 1,
+                // `NotPresent` is the entry reading zero, which is the whole
+                // question. Every other refusal is a read this walk could not
+                // complete and says nothing about what the guest will find.
+                Err(f) if f.error == wire_page_table::WalkError::NotPresent => {
+                    if out.absent == 0 {
+                        out.first_absent_index = index;
+                        out.first_absent_level = f.level;
+                    }
+                    out.absent += 1;
+                }
+                Err(_) => out.undecidable += 1,
+            }
+            true
+        },
+    );
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -330,6 +469,93 @@ mod tests {
         assert_eq!(root.directory_pfn, 2);
         assert_eq!(root.root_pfn, 1);
         assert_eq!(root.depth, 1);
+    }
+
+    /// The node GPAs are the pages the descent read entries out of, and the
+    /// page the address resolves to is not one of them.
+    ///
+    /// Written against a two-level tree so "interior" and "root" are not the
+    /// same page: at depth 1 a walker that reported the leaf instead of the root
+    /// would still return one address and could pass by accident.
+    #[test]
+    fn the_node_gpas_are_the_tables_and_not_the_page_they_map() {
+        let mut r = MapReader::new();
+        // depth 2, root pfn 1: root[0] -> pfn 3, and pfn 3's entry 0 -> pfn 9.
+        let dir_gpa = 2u64 << PAGE_SHIFT_ARM64E;
+        r.put_u32(dir_gpa + DIRECTORY_ROOT_PFN, 1);
+        r.put_u32(dir_gpa + DIRECTORY_DEPTH, 2);
+        r.put_u32(1u64 << PAGE_SHIFT_ARM64E, 3);
+        r.put_u32(3u64 << PAGE_SHIFT_ARM64E, 9);
+        let task = Task {
+            active: true,
+            directory_pfn: 2,
+        };
+
+        let mut out = [0u64; MAX_TREE_NODES];
+        let n = task_node_gpas(&r, ARM64E, &task, 0x40, &mut out);
+        assert_eq!(n, 2, "one node per level walked");
+        assert_eq!(
+            &out[..n],
+            &[1u64 << PAGE_SHIFT_ARM64E, 3u64 << PAGE_SHIFT_ARM64E]
+        );
+
+        // The address really does resolve into pfn 9, and pfn 9 is not a node.
+        let t = translate_root(&r, ARM64E, 1, 2, 0x40);
+        assert_eq!(t.status, ResolveStatus::Ok);
+        assert_eq!(t.leaf_pfn, 9);
+        assert!(!out[..n].contains(&(9u64 << PAGE_SHIFT_ARM64E)));
+    }
+
+    /// A task the walk cannot even start on reports no nodes rather than a
+    /// stale or invented one.
+    #[test]
+    fn a_task_with_no_directory_reports_no_nodes() {
+        let r = MapReader::new();
+        let mut out = [0u64; MAX_TREE_NODES];
+        for task in [
+            Task {
+                active: false,
+                directory_pfn: 2,
+            },
+            Task {
+                active: true,
+                directory_pfn: 0,
+            },
+        ] {
+            assert_eq!(task_node_gpas(&r, ARM64E, &task, 0x40, &mut out), 0);
+        }
+    }
+
+    /// An address that stops resolving still reports the levels above where it
+    /// stopped — which is the case the guard exists for, because a guest tearing
+    /// a task down unmaps from the bottom.
+    #[test]
+    fn an_unresolvable_address_still_reports_the_nodes_above_it() {
+        let mut r = MapReader::new();
+        let dir_gpa = 2u64 << PAGE_SHIFT_ARM64E;
+        r.put_u32(dir_gpa + DIRECTORY_ROOT_PFN, 1);
+        r.put_u32(dir_gpa + DIRECTORY_DEPTH, 2);
+        // The root's entry names pfn 3, and pfn 3's own entry is written as the
+        // format's not-present encoding — a real zero rather than a hole in the
+        // reader, so the walk refuses on the guest's table and not on the test.
+        r.put_u32(1u64 << PAGE_SHIFT_ARM64E, 3);
+        r.put_u32(3u64 << PAGE_SHIFT_ARM64E, 0);
+        let task = Task {
+            active: true,
+            directory_pfn: 2,
+        };
+
+        assert_eq!(
+            translate_root(&r, ARM64E, 1, 2, 0x40).status,
+            ResolveStatus::ErrZeroPfn
+        );
+        let mut out = [0u64; MAX_TREE_NODES];
+        let n = task_node_gpas(&r, ARM64E, &task, 0x40, &mut out);
+        assert_eq!(
+            &out[..n],
+            &[1u64 << PAGE_SHIFT_ARM64E, 3u64 << PAGE_SHIFT_ARM64E],
+            "both levels were read before the walk refused"
+        );
     }
 
     #[test]
@@ -467,5 +693,145 @@ mod tests {
         );
         let t = translate_root(&r, ARM64E, 0, 1, 0);
         assert_eq!(t.status, ResolveStatus::ErrZeroRootPfn);
+    }
+
+    /// A one-level tree whose directory says so, with `entries` written into the
+    /// root table starting at index 0. A zero entry is written as a real zero
+    /// word rather than left out, because an absent byte reads as an unreadable
+    /// table and that is a different answer from an entry that says nothing is
+    /// mapped.
+    fn one_level_task(entries: &[u32]) -> (MapReader, Task) {
+        let mut r = MapReader::new();
+        let dir_gpa = (2u64) << PAGE_SHIFT_ARM64E;
+        r.put_u32(dir_gpa + DIRECTORY_ROOT_PFN, 1);
+        r.put_u32(dir_gpa + DIRECTORY_DEPTH, 1);
+        let table_gpa = (1u64) << PAGE_SHIFT_ARM64E;
+        for (i, &e) in entries.iter().enumerate() {
+            r.put_u32(table_gpa + i as u64 * PTE_SIZE as u64, e);
+        }
+        (
+            r,
+            Task {
+                active: true,
+                directory_pfn: 2,
+            },
+        )
+    }
+
+    /// A range every one of whose pages is mapped reports no absence, and the
+    /// counts add up to the pages asked for.
+    #[test]
+    fn a_fully_mapped_range_is_covered() {
+        let (r, task) = one_level_task(&[5, 6, 7, 8]);
+        let c = range_coverage(&r, ARM64E, &task, 0, 4).unwrap();
+        assert_eq!(c.pages, 4);
+        assert_eq!(c.present, 4);
+        assert_eq!(c.absent, 0);
+        assert_eq!(c.undecidable, 0);
+        assert_eq!(c.depth, 1);
+    }
+
+    /// A range whose leaf entries all read zero reports every page absent, and
+    /// says the zero is at the deepest level.
+    ///
+    /// That level is the discriminator the caller needs: this is the shape whose
+    /// guest teardown refuses to clear an entry that is already zero, and it is
+    /// not the same defect as a subtree that is not there at all.
+    #[test]
+    fn a_range_of_zero_leaf_entries_is_absent_at_the_deepest_level() {
+        let (r, task) = one_level_task(&[0, 0, 0]);
+        let c = range_coverage(&r, ARM64E, &task, 0, 3).unwrap();
+        assert_eq!(c.present, 0);
+        assert_eq!(c.absent, 3);
+        assert_eq!(c.first_absent_index, 0);
+        assert_eq!(c.first_absent_level + 1, c.depth);
+    }
+
+    /// One zero among live entries is found, counted once, and located.
+    ///
+    /// The scattered shape and the wholly-absent shape are different guest
+    /// stories — a mapping that was never fully wired against a range torn down
+    /// twice — so a scan that only answered "some page is missing" would merge
+    /// them.
+    #[test]
+    fn a_single_hole_is_located_within_a_live_range() {
+        let (r, task) = one_level_task(&[5, 6, 0, 8, 9]);
+        let c = range_coverage(&r, ARM64E, &task, 0, 5).unwrap();
+        assert_eq!(c.present, 4);
+        assert_eq!(c.absent, 1);
+        assert_eq!(c.first_absent_index, 2);
+        assert_eq!(c.first_absent_level + 1, c.depth);
+    }
+
+    /// A zero entry above the leaf reports the level it stopped at, which is not
+    /// the leaf level.
+    #[test]
+    fn an_absent_subtree_reports_the_level_it_stopped_at() {
+        let mut r = MapReader::new();
+        let dir_gpa = (2u64) << PAGE_SHIFT_ARM64E;
+        r.put_u32(dir_gpa + DIRECTORY_ROOT_PFN, 1);
+        r.put_u32(dir_gpa + DIRECTORY_DEPTH, 2);
+        // The root's entry 0 reads a real zero: the whole subtree under it is
+        // gone, so no page of the range has a leaf entry to be zero.
+        r.put_u32((1u64) << PAGE_SHIFT_ARM64E, 0);
+        let task = Task {
+            active: true,
+            directory_pfn: 2,
+        };
+        let c = range_coverage(&r, ARM64E, &task, 0, 4).unwrap();
+        assert_eq!(c.absent, 4);
+        assert_eq!(c.depth, 2);
+        assert_eq!(c.first_absent_level, 0);
+        assert!(
+            c.first_absent_level + 1 < c.depth,
+            "an absent subtree is shallower than a zero leaf entry"
+        );
+    }
+
+    /// A task with no readable root has no coverage answer at all, which is not
+    /// the same as a range that is fully absent.
+    #[test]
+    fn a_task_with_no_root_has_no_coverage_answer() {
+        let (r, _) = one_level_task(&[5]);
+        for task in [
+            Task {
+                active: false,
+                directory_pfn: 2,
+            },
+            Task {
+                active: true,
+                directory_pfn: 0,
+            },
+            Task {
+                active: true,
+                directory_pfn: 9999,
+            },
+        ] {
+            assert_eq!(range_coverage(&r, ARM64E, &task, 0, 4), None);
+        }
+    }
+
+    /// A table page that will not read is undecidable, and is counted apart from
+    /// absence.
+    ///
+    /// Merging the two is the failure that matters: an unreadable table would
+    /// otherwise be reported as a range the guest is about to assert on, and the
+    /// alarm this feeds costs a session when it is wrong.
+    #[test]
+    fn an_unreadable_table_is_undecidable_and_not_absence() {
+        let mut r = MapReader::new();
+        let dir_gpa = (2u64) << PAGE_SHIFT_ARM64E;
+        r.put_u32(dir_gpa + DIRECTORY_ROOT_PFN, 1);
+        r.put_u32(dir_gpa + DIRECTORY_DEPTH, 1);
+        // Nothing at all is written for the root table, so every entry read
+        // fails rather than returning a word.
+        let task = Task {
+            active: true,
+            directory_pfn: 2,
+        };
+        let c = range_coverage(&r, ARM64E, &task, 0, 4).unwrap();
+        assert_eq!(c.absent, 0);
+        assert_eq!(c.present, 0);
+        assert_eq!(c.undecidable, 4);
     }
 }

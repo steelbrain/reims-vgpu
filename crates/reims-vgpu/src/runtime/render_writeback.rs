@@ -1,8 +1,44 @@
-//! Land a render Store's frame in the guest's pages, at the Store.
+//! Land a render Store's frame in the guest's pages.
 //!
 //! A type-11 render Store names a mapping and a resident image the draw just
 //! rendered into. This module copies the one into the other and returns. There
 //! is no window, no pin held across the call, and nothing to land later.
+//!
+//! # The type-11 rail can now be asked to owe the copy instead
+//!
+//! [`crate::runtime::writeback_debt`] is the rail this doc spent four sections
+//! designing and one section burying, built in the one shape the four guest
+//! panics do not rule out: nothing resolved is held, and a payment re-derives
+//! the identity and re-walks the page tables at the moment it runs. Read that
+//! module's doc first if you are here about deferral; what follows is the
+//! measurement it stands on, and three of its numbers are now known to be wrong
+//! in the ways below.
+//!
+//! Twelve driven macos-13 sustained-animation boots, six an arm: **90 % of
+//! type-11 Stores are superseded before anything reads their pages**, `store_us`
+//! falls 0.89 against 9.56 us a chain, `draw_us` 14.62 against 26.52, and five
+//! of six on-arm boots present at 105.8-109.2 Hz against a 77.2-78.6 Hz
+//! baseline. `store_gva_frame` below is **not** deferred and still writes its
+//! ~850 frames a second eagerly.
+//!
+//! ## What that rail corrected here
+//!
+//! * **"Six reads a second" is the wrong denominator, the same way
+//!   `target_reads` was.** Every `settle_*` counter quoted below counts settles
+//!   that *waited*; the settle *calls* are three orders larger.
+//!   `draw::vulkan::load_linear_guest_memoized` alone reaches its settle ~1 700
+//!   times a second and reads the guest pages every one of them. The prize was
+//!   never 1 556-to-6.
+//! * **Those readers are nameable, so the deferral does not need the seam this
+//!   doc calls hard.** They walk raw task GVAs, but they hold a texture
+//!   reference and a debt is keyed by a mapping id, so
+//!   `writeback_debt::pay_for_texture` resolves one to the other through the two
+//!   tables `resource_validity::apply` already uses. `settle_guest_writes`'s
+//!   signature never had to change.
+//! * **The redundancy is not "supersession across rails and frames" in the sense
+//!   below.** It is supersession within *one* rail across frames — which the two
+//!   censuses further down could not see, because both measured the spacing of
+//!   Stores rather than the spacing of reads.
 //!
 //! # Why the frame is written here rather than deferred
 //!
@@ -44,6 +80,40 @@
 //! the wrong denominator for a per-surface-rail ratio by about 2.4x. Use the
 //! route counter for the rail being reasoned about.
 //!
+//! # And the redundancy is supersession, never identical bytes
+//!
+//! There is a cheaper repair than any deferral — refuse the copy when the guest's
+//! pages already hold these exact pixels — and the witness for it is already
+//! built and already maintained from both ends. `finish` stamps the resident
+//! with the mapping's `surface_content_epoch` after every Store, and
+//! `registry_mark_ready` clears that stamp on every draw that renders into the
+//! resident, so `resident_content_epoch(identity) == m.surface_content_epoch` at
+//! the top of a Store means nothing has changed the pixels since the last one.
+//! It is the same comparison the type-11 attachment LOAD already elides its CPU
+//! seed on, read from the writing side.
+//!
+//! **It is zero, and not nearly zero.** A census partitioning every
+//! `surface_flush` four ways over two driven macos-13 sustained-animation boots:
+//!
+//! ```text
+//! boot 1   surface_flush 30 239   current 0   stale 0   unstamped 30 239   absent 0
+//! boot 2   surface_flush 29 164   current 0   stale 0   unstamped 29 164   absent 0
+//! ```
+//!
+//! 59 403 Stores and not one of them found a resident still stamped. That is
+//! structural rather than a property of this workload: a Store is what a draw
+//! chain ends in, so a draw has always just rendered into the resident and
+//! always just cleared the stamp. The `absent` column reading zero says the
+//! sampling is sound — every Store did find its slot to ask.
+//!
+//! So do not build the identity elision, and do not read the ~5 GB/s as
+//! containing duplicate frames. What the traffic contains is **superseded**
+//! frames: this rail writes ~414 full surfaces a second into guest pages that
+//! only ~18 non-stamp settles a second ever read, and of those only ~7 overlap
+//! the pages they are settling for. Every frame written between two reads of a
+//! surface is replaced before anything looks at it. That is what a deferral
+//! collapses and what an identity check cannot see.
+//!
 //! So there is no burst of redundant Stores to collapse *inside* this rail, and
 //! the deferred window would still have nothing to coalesce. What is left is the
 //! rail's own cost at the rate the guest asks for it, and that cost is this
@@ -70,6 +140,124 @@
 //! which is what the two censuses above were each measuring. Whatever removes it
 //! has to look across the rails and across frames, not at the spacing of Stores
 //! inside one.
+//!
+//! ## But "traffic" is regions, not bytes, and that is a different lever
+//!
+//! The host GPU runs **86-91 % busy at 3-4 % memory utilization** under this
+//! load. A rail that were bandwidth bound could not produce those two numbers
+//! together; this one is bound by the *number of copy operations* it issues.
+//!
+//! The count comes from the guest's own allocator. It backs a surface in 16 KiB
+//! physically-contiguous granules, so a 1920x1080 window is 2 025 pages in **507
+//! runs** (see [`crate::runtime::guest_ram_map::references_for_runs`]), and the
+//! `Linear` plan's scatter is one `VkBufferCopy` region per run. At ~414 Stores a
+//! second that is ~210 000 regions a second from this rail alone. The runs cannot
+//! be merged — non-adjacent in GPA means non-adjacent in the import — so the
+//! count is a property of guest memory layout and not of anything this device
+//! chooses.
+//!
+//! Which is what makes the two ablations in
+//! `backend::vulkan::engine::context`'s `dedicated_transfer_family` read the way
+//! they do: removing the copies entirely was worth ~30 Hz, and skipping only the
+//! image *read* while the bytes still crossed was worth 4 Hz of it. The 26 Hz is
+//! in the scatter, and the scatter is where the regions are.
+//!
+//! ## Measured, by making it worse on purpose
+//!
+//! That reading was tested directly, and the controlled form is the useful one:
+//! [`crate::env::SCATTER_SPLIT`] cuts every scatter run into four contiguous
+//! sub-ranges that tile it exactly. The guest bytes written are byte-for-byte
+//! identical; only the region count changes. Eight driven macos-13 boots, four
+//! per arm, one binary:
+//!
+//! ```text
+//! regions/writeback   present_hz per boot        draw_us   duty   slot_us
+//! 203 (shipping)      49.15 49.45 56.45 56.40    34-42     0.76-0.88   143-244 ms/s
+//! 806 (4x)            26.90 23.80 23.00 23.70    50-63     0.93        365-489 ms/s
+//! ```
+//!
+//! **Four times the regions for the same bytes halves the frame rate** — 49.95
+//! to 24.37 median `frames_s`, disjoint at 7x the arms' own spread, eight boots
+//! for eight with no overlap. `draws_s` falls 46 %. And it lands exactly where
+//! the mechanism predicts: `slot_us` roughly doubles, which is the drain worker
+//! blocking longer on a ring fence the GPU takes longer to signal.
+//!
+//! **The cost is on the GPU, not in the driver's recording of it**, and that is
+//! the part which decides what can fix it. Per draw, across the same boots:
+//!
+//! ```text
+//!               slot_us        record_us
+//! shipping      10.40  11.54   2.12  2.07
+//! 4x regions    24.69  29.07   2.72  2.10
+//! ```
+//!
+//! `record_us` — building the region arrays and calling `vkCmdCopyBuffer` — does
+//! not move, while the wait for the GPU nearly triples. Four times the
+//! `VkBufferCopy` structs cost almost nothing to write down and a great deal to
+//! execute. So a fix has to remove GPU-side per-region work; batching the same
+//! regions into fewer calls would not touch this.
+//!
+//! So this rail is bound by the **number of copy regions it issues**, and the
+//! bytes are close to free. That is the opposite of what the ~5.0 GB/s figure
+//! above suggests on its face, and it is why every attempt aimed at the bytes —
+//! a second queue, damage rects, the parked deferral — either measured nothing
+//! or cost more than it saved.
+//!
+//! The lever it points at carries none of the deferral's hazards: **issue the
+//! scatter as one compute dispatch over a run table instead of ~200 transfer
+//! regions.** Same bytes, same destination, byte-identical result, nothing held
+//! across any window. That is what `backend::vulkan::engine::guest_scatter` now
+//! does — a private module, so this names it rather than links it — and the
+//! paragraphs below are its measurement rather than the expected value they used
+//! to be.
+//!
+//! ## What it was worth: +48 % frames, measured
+//!
+//! Eight driven macos-13 sustained-animation boots, interleaved arms of
+//! `REIMS_VGPU_COMPUTE_SCATTER`, three excluded by the standing regime rule.
+//! Exact Mann-Whitney over the survivors (on n=3, off n=2):
+//!
+//! ```text
+//!                        on        off      delta   separation
+//! frames/s            74.92      50.51    +48.3 %       7.1x  disjoint
+//! presents/s          76.08      51.74    +47.1 %      10.8x  disjoint
+//! draws/s          26 655.9   21 123.0    +26.2 %      15.3x  disjoint
+//! regions/writeback     1.0      187                    (the mechanism)
+//! ```
+//!
+//! `p` floors at 0.20 for n=3 vs n=2 and reads that way; the separations are
+//! what carry it. Three independent things say the reading is not an artifact:
+//! the off arm reproduces the 49.95 Hz baseline recorded above from a different
+//! session and a different probe, `present_hz` equals `offered_hz` on both arms
+//! so the presenter is not the thing that moved, and the on arm lands between
+//! the prediction below and the ablation ceiling above it.
+//!
+//! The prediction it replaces is kept because it was *right*, which is the part
+//! worth trusting next time. Fitting `frame_time = fixed + k * regions` through
+//! the two ablation arms — 203 regions at 49.95 Hz and 806 at 24.37 Hz — gave
+//! ~35 us of frame time per region, a region-free floor of 12.94 ms, and **~77
+//! Hz against 50**: the region count was 35 % of frame time at the shipping
+//! ~200. Measured 74.9. Two straight lines through two points is the weakest
+//! kind of model and this one landed within 3 %.
+//!
+//! It was bracketed above as well as below. The ablation in
+//! `backend::vulkan::engine::context` that removed this rail's GPU work
+//! *entirely* — regions, detile and bytes — reached 104 Hz, so a model putting
+//! the region-free point above that would have been refuted on its face. The
+//! 74.9 to 104 Hz that remains is the detile and the traffic the compute path
+//! still has to do, and is where the next reading of this rail starts.
+//!
+//! ## The two gates a compute scatter needs, both already open
+//!
+//! * The imported guest buffer must be bindable as a storage buffer. It already
+//!   is: `caps::host_pointer::GUEST_IMPORT_USAGE` includes `STORAGE_BUFFER`, and
+//!   that is the exact usage set the capability query asks the driver about — so
+//!   a host that admits the import admits this.
+//! * The offsets must be addressable in 4-byte units. Run offsets and lengths are
+//!   texel-aligned, which is 4 bytes for the eight-bit-per-channel formats this
+//!   rail serves, but it is *not* guaranteed for a narrower texel. That is a
+//!   check, not an assumption: a run that fails it falls back to the transfer
+//!   regions, which stay as the path for it and for any host that declines.
 //!
 //! # The contract does not ask for this copy at all
 //!
@@ -147,6 +335,72 @@
 //! the same thing from the other side: 3 796 disjointness checks a second, of
 //! which **six** found a read overlapping an outstanding write.
 //!
+//! # The deferral below was built, and it corrupts the guest's page tables
+//!
+//! **Read this before building what the next four sections describe.** They are
+//! kept because their reasoning about the seam and the land point is sound and
+//! was confirmed; what they underestimate is one hazard and overestimate is the
+//! prize.
+//!
+//! It was implemented as specified — the plan resolved and parked at the Store,
+//! landed at every settle site except the three completion stamps, replaced on a
+//! second Store into the same pages, dropped on `clear_host_valid`, pinned and
+//! page-armed at the arm rather than at the record. It ran, and the mechanism
+//! worked: one boot armed 2 951 plans, replaced 865, landed 2 782 and lost none.
+//!
+//! Four driven macos-13 boots, and a fifth on the **same binary** with the rail
+//! switched off:
+//!
+//! ```text
+//! rail on    PANIC  "hitting assertion" @AppleParavirtPageTable.cpp:200
+//! rail on    PANIC  PTE Corruption detected: ptep ...
+//! rail on    PANIC  Possible memory corruption: pmap_pv_remove(...)
+//! rail on    PANIC  "hitting assertion" @AppleParavirtPageTable.cpp:200
+//! rail off   ok
+//! ```
+//!
+//! Four for four, against eighteen clean macos-13 boots of the same probe that
+//! day, and the off arm of the same binary clean. This is the **page recycling**
+//! hazard, which the list below names third and treats as one of four: the guest
+//! reassigns a surface's backing inside the park-to-land window — its own
+//! `MappingEntry::page_entries` doc measures id recycling at ~20 ms under scroll,
+//! and that window is ~55 ms — and the landed copy writes a full surface into
+//! whatever now owns those pages. Here that was the guest's page tables.
+//! `gpuwb_pages_not_ours` fires on the same boot, which is this device saying so
+//! from the other side.
+//!
+//! Landing at the Store is what makes that hazard *not exist*: the pages cannot
+//! move inside one call, which is the fourth bullet under "What the window cost
+//! that this cannot" and is load-bearing rather than incidental. Any future
+//! attempt needs a page-ownership guard held **across** the window — the
+//! re-validation at the land has to be that the pages still belong to the
+//! mapping, and neither `arm_guest_write_pages` nor the registry pin is that.
+//!
+//! **And the prize is not the one computed below.** That estimate divides the
+//! Stores by the settles that *waited* (~6 a second) and gets ~36 copies a second
+//! against 1 556. The land has to run on every settle **call** at a landing site,
+//! not on the ones that block, and those are far more frequent. Measured over the
+//! four boots, copies actually removed were **27 %, 65 %, 66 %, 65 %** — a factor
+//! of about 2.9 at best, not 43. Worth having, and not worth what it cost here.
+//!
+//! ## Defer the decision, not the plan
+//!
+//! The hazard is not deferral as such — it is that a *parked plan* holds guest
+//! page references resolved at a moment that has passed. A shape that keeps the
+//! saving and cannot have the bug: skip the copy at the Store, and at the settle
+//! do a **fresh** Store — re-walk the mapping's page tables *then*, resolve runs
+//! *then*, copy from the resident *then*. Nothing stale is held across the
+//! window, so a surface whose backing the guest recycled is either gone (skip) or
+//! re-resolves to the pages it now owns, which is what a Store landing at that
+//! moment would have written anyway.
+//!
+//! What that costs is the thing the seam analysis below already identifies as
+//! hard, and it is now the *only* hard part: the land needs `DeviceState` and
+//! `HostMemory`, and [`settle_guest_writes`] takes a [`SettleSite`] and nothing
+//! else. Threading both through its call sites is the work. It is untested — no
+//! boot has run it — and it is recorded here because it is the one variant the
+//! four panics above do not rule out.
+//!
 //! # What a deferral has to answer, and where the seam is
 //!
 //! Arming instead of writing is the easy half, and a second Store into one
@@ -204,6 +458,13 @@
 //! distinct surfaces and landing at a settle is therefore of order **36 copies a
 //! second instead of 1 556** — the same territory the ablation measured at 86 Hz,
 //! reached without losing a frame the guest asked for.
+//!
+//! **That last arithmetic is wrong and the rail that was built measured it.**
+//! `settle_linear_memo_read` reading 6 is six settles that *waited*; the site is
+//! called ~1 700 times a second and reads the guest's pages every time. The
+//! delivered figure is ~3 300 copies a second against ~21 000, not 36 against
+//! 1 556 — a factor of six rather than forty-three, and still worth 45 % of the
+//! per-draw cost. See [`crate::runtime::writeback_debt`].
 //!
 //! **That factor is only available if the three stamp sites do not land parked
 //! plans**, and it is a contract statement rather than a shortcut. A completion
@@ -586,8 +847,40 @@ pub fn store_render_frame<M: HostMemory + HostOps>(
     // teaching the lease to rewrite memory it does not own.
     let bpr = width.saturating_mul(4);
     let write_started = std::time::Instant::now();
-    let (ok, frame_len) = match crate::backend::vulkan::engine::read_target_leased(identity) {
-        Ok(Some(leased)) if leased.bgra => {
+    // A refused lease is a *routing* answer, never a loss. The lease is an
+    // elision of one whole-frame copy and nothing else, so whatever it declines
+    // for, the copying rail below can still serve — and it is strictly the
+    // better place to find out that the frame is unreadable, because it is the
+    // rail that owns the loss report.
+    //
+    // Collapsing the refusal into `None` rather than enumerating which refusals
+    // are recoverable. That enumeration is what would go stale: the lease
+    // refuses a resident wider than four bytes a texel (it hands out a pointer
+    // into the slot and so has nowhere to narrow one), and reading that
+    // particular `Err` as fatal would lose exactly the frames `read_target`
+    // exists to quantize. Any future refusal of a rail that is an optimisation
+    // has the same answer.
+    //
+    // Measured, and only reachable one way. On a host that can import guest RAM
+    // every Store lands GPU-direct and this whole tail runs zero times — six
+    // driven rails, `render_flush_copied` and `render_flush_leased` exactly zero
+    // on all of them. With `REIMS_VGPU_GUEST_IMPORT=off`, macos-26 produces
+    // **34 lease refusals and 34 copies, one to one, and zero
+    // `render_store_lost`**: every one a Surface resident too wide for the lease
+    // to lend. Reading the `Err` as fatal cost 34 frames a boot on exactly the
+    // host class that has no second rail, and no boot of a capable host could
+    // have shown it.
+    let leased = match crate::backend::vulkan::engine::read_target_leased(identity) {
+        Ok(leased) => leased,
+        Err(decline) => {
+            crate::observe::off(format!(
+                "render_flush_lease_declined mapping={mapping_id} {width}x{height} err={decline}"
+            ));
+            None
+        }
+    };
+    let (ok, frame_len) = match leased {
+        Some(leased) if leased.bgra => {
             crate::runtime::drain::note_store_route("render_flush_leased");
             let len = leased.bytes().len();
             let ok = crate::runtime::mapping_write::write_bgra8_uncached(
@@ -606,11 +899,11 @@ pub fn store_render_frame<M: HostMemory + HostOps>(
             drop(leased);
             (ok, len)
         }
-        // Either the pool declined the lease (uncached readback memory, where
-        // reading the mapping in place is the slower shape) or the resident is
-        // not in scanout order. Drop any leased frame first so its slot is back
-        // in the pool before the second readback asks for one.
-        Ok(leased) => {
+        // The pool declined the lease (uncached readback memory, where reading
+        // the mapping in place is the slower shape), or it refused outright, or
+        // the resident is not in scanout order. Drop any leased frame first so
+        // its slot is back in the pool before the second readback asks for one.
+        leased => {
             drop(leased);
             crate::runtime::drain::note_store_route("render_flush_copied");
             match crate::backend::vulkan::engine::read_target(identity) {
@@ -634,13 +927,6 @@ pub fn store_render_frame<M: HostMemory + HostOps>(
                     return false;
                 }
             }
-        }
-        Err(e) => {
-            crate::observe::fail(format!(
-                "render_store_lost mapping={mapping_id} {width}x{height} \
-                 reason=resident_read err={e}"
-            ));
-            return false;
         }
     };
     crate::runtime::drain::note_readback_phase(
@@ -706,15 +992,37 @@ fn finish(
 #[cfg(feature = "backend-vulkan")]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GvaWritebackDecline {
-    /// The guest declared a destination format whose texel is not four bytes of
-    /// colour, so no image→buffer copy can produce it. A `RGBA16_FLOAT` render
-    /// target lands here and always will; `convert_rgba8_to_row` is its only
-    /// route.
+    /// The guest declared a destination format that [`crate::contract::pixel_format::store_texel_order`] does
+    /// not admit as a byte-copy destination, so no image→buffer copy can produce
+    /// it and `convert_rgba8_to_row` is the only route.
+    ///
+    /// This used to say "not four bytes of colour", and to name `RGBA16_FLOAT`
+    /// as landing here *always*. Both went stale together: a resident now
+    /// carries the format the guest declared rather than always being eight bits
+    /// per channel, so a half-float destination can be the same bytes as the
+    /// image, and `RGBA16_FLOAT` is an admitted eight-byte member of that table.
+    /// The rule was never a width — it is whether the destination's texel and
+    /// the resident's are one layout, which is [`crate::contract::pixel_format::store_texel_order`]'s question
+    /// and not this doc's to restate.
+    ///
+    /// `R16_FLOAT` is what lands here now, twice on a driven macos-26 boot: it
+    /// is renderable but deliberately not a byte-copy destination, for the
+    /// reason `store_texel_order`'s own doc gives for `RG16_FLOAT`.
     FormatNeedsConversion { format: u16 },
-    /// The resident's channel order is not the order the destination stores.
-    /// Distinct from the engine's own check of the same pair: this one is asked
-    /// before the walk, so a mismatch costs no page-table work.
-    OrderMismatch { resident_bgra: bool, want_bgra: bool },
+    /// The resident's format is not the format the destination stores, so a
+    /// byte copy would land the wrong texel. Distinct from the engine's own
+    /// check of the same pair: this one is asked before the walk, so a mismatch
+    /// costs no page-table work.
+    ///
+    /// Whole formats and not channel orders. The two differ once a render
+    /// target may be wider than eight bits per channel: `RGBA16_FLOAT` and
+    /// `RGBA8_UNORM` share an order and are four bytes per texel apart, and this
+    /// is the arm that catches a half-float destination whose resident fell back
+    /// to eight bits because the host cannot render to the wider format.
+    ResidentFormatMismatch {
+        held: ash::vk::Format,
+        want: ash::vk::Format,
+    },
     /// The guest's row pitch is not a whole number of texels, or is narrower
     /// than the frame, so there is no `bufferRowLength` that describes it.
     PitchNotTexels { row_stride: u32 },
@@ -750,7 +1058,7 @@ impl crate::observe::Decline for GvaWritebackDecline {
     fn slug(&self) -> &'static str {
         match self {
             Self::FormatNeedsConversion { .. } => "gvawb_format_needs_conversion",
-            Self::OrderMismatch { .. } => "gvawb_order_mismatch",
+            Self::ResidentFormatMismatch { .. } => "gvawb_resident_format_mismatch",
             Self::PitchNotTexels { .. } => "gvawb_pitch_not_texels",
             Self::OffsetNotTexelAligned { .. } => "gvawb_offset_not_texel_aligned",
             Self::Unlicensed => "gvawb_unlicensed",
@@ -764,12 +1072,9 @@ impl crate::observe::Decline for GvaWritebackDecline {
         match self {
             Self::Unlicensed | Self::SpanIncomplete => Vec::new(),
             Self::FormatNeedsConversion { format } => vec![("fmt", format!("{format:#x}"))],
-            Self::OrderMismatch {
-                resident_bgra,
-                want_bgra,
-            } => vec![
-                ("resident", if *resident_bgra { "bgra" } else { "rgba" }.to_string()),
-                ("want", if *want_bgra { "bgra" } else { "rgba" }.to_string()),
+            Self::ResidentFormatMismatch { held, want } => vec![
+                ("resident", format!("{held:?}")),
+                ("want", format!("{want:?}")),
             ],
             Self::PitchNotTexels { row_stride } => vec![("bpr", row_stride.to_string())],
             Self::OffsetNotTexelAligned { in_page } => vec![("in_page", in_page.to_string())],
@@ -822,26 +1127,31 @@ pub(crate) fn store_gva_frame<M: HostMemory + HostOps>(
     texture_ref: u32,
     pages: Option<&crate::runtime::draw::StoreTargetPages>,
 ) -> Result<u64, GvaWritebackDecline> {
-    use crate::contract::pixel_format::{store_texel_order, TexelLayout};
-    // The destination's channel order, and the whole reason this rail can exist
+    use crate::contract::pixel_format::store_texel_order;
+    // The destination's texel layout, and the whole reason this rail can exist
     // at all: a copy converts nothing, so the guest must already read these
-    // bytes in the order the resident holds them.
+    // bytes exactly as the resident holds them.
     let Some(order) = store_texel_order(c0.format) else {
         return Err(GvaWritebackDecline::FormatNeedsConversion { format: c0.format });
     };
-    let want_bgra = order == TexelLayout::Bgra8;
-    let resident_bgra = identity.is_bgra();
+    // Compared as whole formats, not as channel orders.
+    //
+    // While every resident was eight bits per channel an order was a complete
+    // description of one, so `is_bgra() != (order == Bgra8)` decided this. It is
+    // not any more: `RGBA16_FLOAT` and `RGBA8_UNORM` are both RGBA-ordered and
+    // are four bytes per texel apart, so an order comparison would admit a
+    // half-float destination over an eight-bit resident and copy a frame of the
+    // wrong size and the wrong texel into the guest's pages.
+    let want = crate::backend::vulkan::translate::pixel::vk_texel_layout(order);
+    let held = identity.resident_format();
     // A healthy zero on the rail as it stands: `gva_chain_identity` builds the
     // key from this same `c0.format`, so the two agree by construction and this
-    // arm is the alarm for an identity that came from somewhere else. Kept
-    // rather than asserted because the answer it protects — whether the bytes
-    // about to be copied are the bytes the guest reads — is not one to take on
-    // trust from a caller.
-    if resident_bgra != want_bgra {
-        return Err(GvaWritebackDecline::OrderMismatch {
-            resident_bgra,
-            want_bgra,
-        });
+    // arm is the alarm for an identity that came from somewhere else. It is also
+    // the arm that catches the honest disagreement — a guest format whose
+    // resident fell back to eight bits because the host cannot render to it —
+    // and sends that Store down the CPU conversion rail where it belongs.
+    if held != want {
+        return Err(GvaWritebackDecline::ResidentFormatMismatch { held, want });
     }
     let bpt = u64::from(order.bytes_per_texel());
     let row_stride = u64::from(c0.row_stride);
@@ -877,7 +1187,7 @@ pub(crate) fn store_gva_frame<M: HostMemory + HostOps>(
         row_length_texels: (row_stride / bpt) as u32,
         width: c0.width,
         height: c0.height,
-        bgra: want_bgra,
+        format: want,
     };
     // This device is about to write these guest pages, and the hypervisor's
     // dirty bitmap is defined not to see it. Without this record a reader

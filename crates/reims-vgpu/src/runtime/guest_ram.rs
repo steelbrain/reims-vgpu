@@ -164,6 +164,11 @@ pub enum GuestRamError {
     /// rounded-up base is already past its end. This is the
     /// `AlignmentUnsatisfiable` capability rung arriving as a refusal.
     AlignmentUnsatisfiable { align: u64, len: u64 },
+    /// A backend published a granularity beside a zero import budget: it says it
+    /// can import guest RAM and that no heap on it can hold any. Broken rather
+    /// than restrictive, and refused so the copying rails run instead of a rail
+    /// whose every import is over budget.
+    ImportBudgetEmpty,
     /// A zero-length slice. Nothing binds a zero-length range, and admitting one
     /// would make `offset == len` a legal reference to the byte past the end.
     SliceEmpty,
@@ -198,6 +203,7 @@ impl Decline for GuestRamError {
             Self::RegionWraps { .. } => "guest_ram_region_wraps",
             Self::AlignmentNotPowerOfTwo { .. } => "guest_ram_alignment_not_power_of_two",
             Self::AlignmentUnsatisfiable { .. } => "guest_ram_alignment_unsatisfiable",
+            Self::ImportBudgetEmpty => "guest_ram_import_budget_empty",
             Self::SliceEmpty => "guest_ram_slice_empty",
             Self::SliceOverflow { .. } => "guest_ram_slice_overflow",
             Self::SliceEndPastImport { .. } => "guest_ram_slice_end_past_import",
@@ -209,7 +215,10 @@ impl Decline for GuestRamError {
 
     fn fields(&self) -> Vec<(&'static str, String)> {
         match *self {
-            Self::RegionEmpty | Self::RegionUnmapped | Self::SliceEmpty => Vec::new(),
+            Self::RegionEmpty
+            | Self::RegionUnmapped
+            | Self::SliceEmpty
+            | Self::ImportBudgetEmpty => Vec::new(),
             Self::RegionWraps { host_va, len } => {
                 vec![("host_va", format!("{host_va:#x}")), ("len", len.to_string())]
             }
@@ -568,29 +577,67 @@ impl GuestSlice {
 /// publish, so the absence of a number is itself the gate.
 static GRANULARITY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Publish the granularity a freshly created device resolved to.
+/// The largest import the active backend said it could hold, or 0 before any
+/// backend has created a device that can import at all.
+///
+/// Published and withdrawn with [`GRANULARITY`] and never on its own — see
+/// [`latch_import_limits`] for why the two are one call.
+static IMPORT_BUDGET: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Publish the import limits a freshly created device resolved to: the
+/// granularity every import must meet, and the largest single import the device
+/// could hold.
 ///
 /// Called once per device creation, including each recreate, so a rebuilt
 /// device republishes rather than leaving the previous one's answer standing. A
-/// backend whose capability rung refused must call [`forget_granularity`]
+/// backend whose capability rung refused must call [`forget_import_limits`]
 /// instead — publishing a number from a device that declined the handle type is
 /// how the map would build imports nothing can bind.
 ///
+/// **One call for both numbers**, because they have one lifetime and the failure
+/// mode of two calls is a budget left standing from the previous device beside a
+/// granularity from this one. A caller cannot publish half an answer.
+///
 /// Refuses a granularity that is not a power of two: every alignment
 /// computation here masks with `align - 1`, and a non-power-of-two would make
-/// those masks name arbitrary bytes rather than refusing.
-pub fn latch_granularity(align: u64) {
+/// those masks name arbitrary bytes rather than refusing. A zero `budget` is
+/// refused with it: a device that can import guest RAM and holds nothing is not
+/// a device this rail can run on, and the honest answer is the copying rails.
+pub fn latch_import_limits(align: u64, budget: u64) {
     if align == 0 || !align.is_power_of_two() {
         Emit::decline(EVENT, &GuestRamError::AlignmentNotPowerOfTwo { align }).fail();
-        forget_granularity();
+        forget_import_limits();
+        return;
+    }
+    if budget == 0 {
+        Emit::decline(EVENT, &GuestRamError::ImportBudgetEmpty).fail();
+        forget_import_limits();
         return;
     }
     GRANULARITY.store(align, std::sync::atomic::Ordering::Relaxed);
+    IMPORT_BUDGET.store(budget, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Withdraw the published granularity: no device can import guest RAM.
-pub fn forget_granularity() {
+/// Withdraw the published limits: no device can import guest RAM.
+pub fn forget_import_limits() {
     GRANULARITY.store(0, std::sync::atomic::Ordering::Relaxed);
+    IMPORT_BUDGET.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The largest single import the active backend can hold, or `None` when no
+/// backend can import.
+///
+/// This is a **capacity** bound and not a residency one: a heap large enough to
+/// hold an import can still be too full of this device's own images to admit it.
+/// The direction it does catch is unambiguous, and it is the one that has been
+/// observed killing a guest — an import charged to a heap that could not hold it
+/// empty makes every submission referencing it fail validation in the kernel,
+/// which surfaces as a lost device rather than as a slow one.
+pub fn import_budget() -> Option<u64> {
+    match IMPORT_BUDGET.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => None,
+        budget => Some(budget),
+    }
 }
 
 /// The published granularity, or `None` when no backend can import.

@@ -300,15 +300,7 @@ pub(crate) fn bind_storage_images(
             return Status::args("metal_compute_storage_binding_invalid")
                 .field("binding", image.binding);
         };
-        let Some((pixel_format, bpp)) = storage_image_format(image.format) else {
-            set_err(
-                err,
-                format!("invalid storage image binding {}", image.binding),
-            );
-            return Status::args("metal_compute_storage_format_unsupported")
-                .field("binding", image.binding)
-                .field("format", image.format);
-        };
+        let (pixel_format, bpp) = storage_image_format(image.format);
         let Some(expected_len) = tight_image_bytes(image.width, image.height, bpp) else {
             set_err(
                 err,
@@ -396,15 +388,7 @@ pub(crate) fn bind_compute_sampled_images(
             return Status::args("metal_compute_sampled_binding_invalid")
                 .field("binding", image.binding);
         };
-        let Some((pixel_format, bpp)) = storage_image_format(image.format) else {
-            set_err(
-                err,
-                format!("invalid sampled compute image binding {}", image.binding),
-            );
-            return Status::args("metal_compute_sampled_format_unsupported")
-                .field("binding", image.binding)
-                .field("format", image.format);
-        };
+        let (pixel_format, bpp) = storage_image_format(image.format);
         let Some(expected_len) = tight_image_bytes(image.width, image.height, bpp) else {
             set_err(
                 err,
@@ -503,7 +487,7 @@ pub(crate) fn bind_compute_sampled_images(
                     );
                     return Status::execute("metal_compute_sampled_swizzle_view_create_failed")
                         .field("binding", image.binding)
-                        .field("format", image.format);
+                        .field("format", image.format as u32);
                 }
             }
         } else {
@@ -871,15 +855,7 @@ pub fn compute_writeback_from_mtl(
         }
     }
     for (i, image) in images.iter().enumerate() {
-        let Some((_, bpp)) = storage_image_format(image.format) else {
-            set_err(
-                err,
-                format!("invalid storage image format {}", image.format),
-            );
-            return Status::args("metal_compute_writeback_storage_format_unsupported")
-                .field("binding", image.binding)
-                .field("format", image.format);
-        };
+        let (_, bpp) = storage_image_format(image.format);
         let texture = &mtl_images[i];
         let region = MTLRegion::new_2d(0, 0, image.width as u64, image.height as u64);
         texture.get_bytes(

@@ -31,6 +31,25 @@
 //! one it wanted). Nothing in the engine may branch on topology in a way that
 //! changes what the guest observes; that invariant is asserted by the tests at
 //! the bottom of this file.
+//!
+//! ## Flags are not the whole selection: capacity is the other axis
+//!
+//! A preference expressed in flags cannot see how much of a pool there is, and
+//! on a part whose `DEVICE_LOCAL` heap is a carve-out the two answers disagree.
+//! The APU shape in [`fixtures::amd_apu_host_heap`] is the worked case: a 2 GiB
+//! device-local carve-out beside 14 GiB of system RAM, classified `Unified`, so
+//! `MemoryClass::Upload` prefers `DEVICE_LOCAL` and the whole-RAMBlock
+//! guest-memory import — 16 GiB on a 16 GiB guest — is charged to the 2 GiB
+//! pool. Nothing moves as a result: an imported host pointer's pages are where
+//! the host mapping put them, and the memory type only decides which heap the
+//! driver accounts them to and manages residency against.
+//!
+//! So [`select_memory_type`] takes the allocation's size and tries every
+//! preference against heaps that could hold it before it tries any of them
+//! against a heap that could not. It never refuses on capacity —
+//! [`MemoryTypePick::fits`] reports the condition instead, and the engine emits
+//! it fail-visibly, because "this allocation has nowhere to live" is a fact a
+//! log from an unfamiliar machine has to carry.
 
 use ash::vk;
 
@@ -237,29 +256,99 @@ pub fn classify_memory(props: &vk::PhysicalDeviceMemoryProperties) -> MemoryProf
     }
 }
 
-/// Pick a memory type index satisfying `req` within `type_bits`.
+/// A selected memory type, together with the heap behind it.
 ///
-/// Tries each `preferred` set best-first, then the required flags alone. The
-/// required-only fallback is what makes a topology misclassification a
-/// performance bug rather than an allocation failure.
+/// The heap travels with the index because the index alone cannot say whether
+/// the allocation about to be made has anywhere to live: two types carrying
+/// identical flags can sit on a 2 GiB carve-out and a 14 GiB pool, and picking
+/// the wrong one is invisible in every log that prints only the index.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MemoryTypePick {
+    /// Index into `VkPhysicalDeviceMemoryProperties::memoryTypes`.
+    pub index: u32,
+    /// The heap that type draws from.
+    pub heap_index: u32,
+    /// `VkMemoryHeap::size` for that heap.
+    pub heap_bytes: u64,
+    /// The heap is at least as large as the allocation asked for.
+    ///
+    /// **This is a capacity statement, not a residency one.** `VkMemoryHeap::size`
+    /// is the heap's total, not what is free, so `true` does not promise the
+    /// allocation will succeed or stay resident. `false` is the useful direction
+    /// and it is unambiguous: the driver is being asked to place an allocation in
+    /// a pool that could not hold it even if it were the only tenant.
+    pub fits: bool,
+}
+
+/// Pick a memory type satisfying `req` within `type_bits`, for an allocation of
+/// `bytes`.
+///
+/// Tries each `preferred` set best-first and then the required flags alone,
+/// **restricted at every step to heaps that can hold `bytes`**; only if no such
+/// type exists at all does it fall back to the largest heap satisfying the
+/// required flags. So a topology misclassification, or a device whose only
+/// capable heap is too small, is still a performance bug rather than an
+/// allocation failure — this function returns `None` only when nothing in
+/// `type_bits` carries the required flags.
+///
+/// # Why the size is a parameter and not an afterthought
+///
+/// Flags say what a memory type *is*; they say nothing about how much of it
+/// there is. An AMD APU advertises a `DEVICE_LOCAL|HOST_VISIBLE|HOST_CACHED`
+/// type over a 2 GiB VRAM carve-out and a plain `HOST_VISIBLE|HOST_COHERENT`
+/// type over 14 GiB of system RAM; classified `Unified`, `MemoryClass::Upload`
+/// prefers `DEVICE_LOCAL` and lands every upload — including the whole-RAMBlock
+/// guest-memory import, which on a 16 GiB guest is 16 GiB — in the 2 GiB pool.
+/// The pages cannot move there: an imported host pointer's placement is fixed by
+/// the host mapping, so the only thing the choice changes is which heap the
+/// driver charges the allocation to and how it then manages residency against
+/// everything else that needs that heap.
+///
+/// Passing `0` means "no size constraint", which is exactly true of a zero-byte
+/// allocation and is what a caller asking a pure flags question wants.
 pub fn select_memory_type(
     props: &vk::PhysicalDeviceMemoryProperties,
     type_bits: u32,
     req: &MemoryRequest,
-) -> Option<u32> {
+    bytes: u64,
+) -> Option<MemoryTypePick> {
+    let heap_index = |index: u32| props.memory_types[index as usize].heap_index;
+    let heap_bytes = |index: u32| {
+        props
+            .memory_heaps
+            .get(heap_index(index) as usize)
+            .map_or(0, |h| h.size)
+    };
     let carries = |index: u32, flags: vk::MemoryPropertyFlags| {
         (type_bits & (1u32 << index)) != 0
             && props.memory_types[index as usize]
                 .property_flags
                 .contains(flags)
     };
-    let find = |flags: vk::MemoryPropertyFlags| {
-        (0..props.memory_type_count).find(|&index| carries(index, flags))
+    let find_fitting = |flags: vk::MemoryPropertyFlags| {
+        (0..props.memory_type_count)
+            .find(|&index| carries(index, flags) && heap_bytes(index) >= bytes)
     };
-    req.preferred
+    // Nothing this device offers can hold the allocation. The flags preferences
+    // have nothing left to rank, so rank by the only quantity that still
+    // differs: take the roomiest heap that satisfies the requirement.
+    let largest_required = || {
+        (0..props.memory_type_count)
+            .filter(|&index| carries(index, req.required))
+            .max_by_key(|&index| heap_bytes(index))
+    };
+    let index = req
+        .preferred
         .iter()
-        .find_map(|bonus| find(req.required | *bonus))
-        .or_else(|| find(req.required))
+        .find_map(|bonus| find_fitting(req.required | *bonus))
+        .or_else(|| find_fitting(req.required))
+        .or_else(largest_required)?;
+    Some(MemoryTypePick {
+        index,
+        heap_index: heap_index(index),
+        heap_bytes: heap_bytes(index),
+        fits: heap_bytes(index) >= bytes,
+    })
 }
 
 /// The host-side cost properties of a selected memory type, for a caller that
@@ -444,6 +533,17 @@ mod tests {
     use super::fixtures::*;
     use super::*;
 
+    /// The flags half of [`select_memory_type`], for the tests that are about
+    /// which *properties* a class lands on. Zero bytes fits every heap, so the
+    /// capacity stage is a no-op and these read as they did before it existed.
+    fn pick_index(
+        props: &vk::PhysicalDeviceMemoryProperties,
+        type_bits: u32,
+        req: &MemoryRequest,
+    ) -> Option<u32> {
+        select_memory_type(props, type_bits, req, 0).map(|p| p.index)
+    }
+
     /// Every unified-memory device in the matrix classifies unified, and the
     /// signal that fired is recorded.
     #[test]
@@ -541,7 +641,7 @@ mod tests {
         for (name, props, topology) in devices {
             let req = topology.request(MemoryClass::Readback);
             let index =
-                select_memory_type(&props, !0, &req).unwrap_or_else(|| panic!("{name}: no type"));
+                pick_index(&props, !0, &req).unwrap_or_else(|| panic!("{name}: no type"));
             let kind = MappedMemoryKind::of(&props, index);
             assert!(
                 kind.cached,
@@ -564,7 +664,7 @@ mod tests {
     fn a_readback_type_may_be_cached_without_being_coherent() {
         let intel = intel_igpu();
         let req = MemoryTopology::Unified.request(MemoryClass::Readback);
-        let index = select_memory_type(&intel, !0, &req).expect("intel readback type");
+        let index = pick_index(&intel, !0, &req).expect("intel readback type");
         assert_eq!(index, 1, "the first cached type, not the coherent type 0");
         assert_eq!(
             MappedMemoryKind::of(&intel, index),
@@ -576,7 +676,7 @@ mod tests {
         );
 
         let apple = apple_m3_max();
-        let index = select_memory_type(&apple, !0, &req).expect("apple readback type");
+        let index = pick_index(&apple, !0, &req).expect("apple readback type");
         assert_eq!(
             MappedMemoryKind::of(&apple, index),
             MappedMemoryKind {
@@ -605,7 +705,7 @@ mod tests {
         );
         for topology in [MemoryTopology::Unified, MemoryTopology::Discrete] {
             let req = topology.request(MemoryClass::Readback);
-            let index = select_memory_type(&props, !0, &req).expect("host-visible type exists");
+            let index = pick_index(&props, !0, &req).expect("host-visible type exists");
             assert_eq!(
                 MappedMemoryKind::of(&props, index),
                 MappedMemoryKind {
@@ -638,7 +738,7 @@ mod tests {
     fn selection_takes_best_preference_first() {
         let props = apple_m3_max();
         let req = MemoryTopology::Unified.request(MemoryClass::Readback);
-        assert_eq!(select_memory_type(&props, !0, &req), Some(1));
+        assert_eq!(pick_index(&props, !0, &req), Some(1));
     }
 
     /// On a discrete device, readback lands in the HOST_CACHED system-RAM type
@@ -647,7 +747,7 @@ mod tests {
     fn discrete_readback_avoids_the_bar_window() {
         let props = nvidia_discrete_rebar();
         let req = MemoryTopology::Discrete.request(MemoryClass::Readback);
-        assert_eq!(select_memory_type(&props, !0, &req), Some(2));
+        assert_eq!(pick_index(&props, !0, &req), Some(2));
     }
 
     /// THE load-bearing invariant: a topology misclassification never fails an
@@ -673,7 +773,7 @@ mod tests {
             for topology in [MemoryTopology::Unified, MemoryTopology::Discrete] {
                 for class in classes {
                     let req = topology.request(class);
-                    let picked = select_memory_type(props, !0, &req);
+                    let picked = pick_index(props, !0, &req);
                     assert!(
                         picked.is_some(),
                         "{name} under {topology:?} must resolve {class:?}"
@@ -695,9 +795,9 @@ mod tests {
         let props = apple_m3_max();
         let req = MemoryTopology::Unified.request(MemoryClass::Readback);
         // Mask out type 1 (the only host-visible type) → no candidate at all.
-        assert_eq!(select_memory_type(&props, 0b101, &req), None);
+        assert_eq!(pick_index(&props, 0b101, &req), None);
         // Allow it again and it is chosen.
-        assert_eq!(select_memory_type(&props, 0b010, &req), Some(1));
+        assert_eq!(pick_index(&props, 0b010, &req), Some(1));
     }
 
     /// Every memory class resolves a type on every device family the support
@@ -725,10 +825,120 @@ mod tests {
             ] {
                 let req = profile.topology.request(class);
                 assert!(
-                    select_memory_type(&props, !0, &req).is_some(),
+                    pick_index(&props, !0, &req).is_some(),
                     "{name}/{class:?} must resolve a memory type"
                 );
             }
         }
+    }
+
+    /// A guest-sized allocation does not land in a device-local carve-out that
+    /// could not hold it while a larger pool with the required flags exists.
+    ///
+    /// This is the whole-RAMBlock guest-memory import on an APU, and it is the
+    /// shape behind "with the import on, the machine crawls unless VRAM is
+    /// bigger than the guest". The APU fixture is `Unified` by signal B, so
+    /// `MemoryClass::Upload` prefers `DEVICE_LOCAL` — and the only type carrying
+    /// it draws from a 2 GiB carve-out. An imported host pointer's pages cannot
+    /// move there: the choice does not place the memory, it only tells the
+    /// driver which pool to charge and keep resident.
+    ///
+    /// Asserted at three sizes because the interesting behaviour is the
+    /// crossover: under the carve-out the preference is still honoured, over it
+    /// the larger pool wins, and past *every* pool the pick is the roomiest heap
+    /// rather than a refusal.
+    #[test]
+    fn an_allocation_larger_than_a_heap_does_not_get_charged_to_it() {
+        const GIB: u64 = 1 << 30;
+        let props = amd_apu_host_heap();
+        let req = classify_memory(&props).topology.request(MemoryClass::Upload);
+
+        // Under the 2 GiB carve-out: the device-local preference still wins.
+        let small = select_memory_type(&props, !0, &req, GIB).expect("a type");
+        assert_eq!(small.index, 2, "the DEVICE_LOCAL type is still preferred");
+        assert_eq!(small.heap_index, 0);
+        assert!(small.fits);
+
+        // Over it, and under the 14 GiB host heap: the preference loses to the
+        // pool that can actually hold the allocation.
+        let mid = select_memory_type(&props, !0, &req, 4 * GIB).expect("a type");
+        assert_eq!(mid.index, 1, "the 14 GiB host heap, not the 2 GiB carve-out");
+        assert_eq!(mid.heap_index, 1);
+        assert!(mid.fits);
+
+        // Larger than every heap — a 16 GiB guest on this part. Still a valid
+        // type, still the roomiest one, and `fits` says the machine is over
+        // its own head so a log can name it.
+        let over = select_memory_type(&props, !0, &req, 16 * GIB).expect("a type");
+        assert_eq!(over.index, 1, "the roomiest heap satisfying the requirement");
+        assert!(!over.fits, "nothing on this device could hold 16 GiB");
+        assert_eq!(over.heap_bytes, 14 * GIB);
+    }
+
+    /// Capacity never turns a resolvable request into a refusal, on any device
+    /// family, for any class, at any size. This is the same load-bearing
+    /// invariant as `misclassification_degrades_to_a_valid_type_never_a_failure`
+    /// applied to the axis that was added after it: a heap check that can return
+    /// `None` would turn a slow host into a host with no allocation at all.
+    #[test]
+    fn a_size_no_heap_can_hold_still_resolves_a_type() {
+        for (name, props) in [
+            ("apple_m3_max", apple_m3_max()),
+            ("intel_igpu", intel_igpu()),
+            ("amd_apu_host_heap", amd_apu_host_heap()),
+            ("nvidia_discrete", nvidia_discrete()),
+            ("nvidia_discrete_rebar", nvidia_discrete_rebar()),
+            ("llvmpipe", llvmpipe()),
+        ] {
+            let profile = classify_memory(&props);
+            for class in [
+                MemoryClass::Upload,
+                MemoryClass::Readback,
+                MemoryClass::DeviceLocal,
+                MemoryClass::DeviceLocalPreferred,
+            ] {
+                let req = profile.topology.request(class);
+                let pick = select_memory_type(&props, !0, &req, u64::MAX)
+                    .unwrap_or_else(|| panic!("{name}/{class:?} must still resolve"));
+                assert!(
+                    props.memory_types[pick.index as usize]
+                        .property_flags
+                        .contains(req.required),
+                    "{name}/{class:?} must still satisfy the required flags"
+                );
+                assert!(!pick.fits, "{name}/{class:?}: no heap holds u64::MAX");
+                // And it is the roomiest candidate, which is the only ranking
+                // left once no heap can hold the allocation.
+                let roomiest = (0..props.memory_type_count)
+                    .filter(|&i| {
+                        props.memory_types[i as usize]
+                            .property_flags
+                            .contains(req.required)
+                    })
+                    .map(|i| props.memory_heaps[props.memory_types[i as usize].heap_index as usize].size)
+                    .max()
+                    .unwrap_or(0);
+                assert_eq!(pick.heap_bytes, roomiest, "{name}/{class:?}");
+            }
+        }
+    }
+
+    /// The pick names the heap the selected type actually draws from. The index
+    /// alone is not a diagnosis on an unfamiliar device — two types with
+    /// identical flags can sit on pools three orders of magnitude apart — and
+    /// this is the field the `host_ram_import` and `vk_memory_type_pick` lines
+    /// carry so a report from a machine nobody here owns is readable.
+    #[test]
+    fn the_pick_carries_the_heap_it_came_from() {
+        let props = nvidia_discrete();
+        let req = MemoryTopology::Discrete.request(MemoryClass::DeviceLocal);
+        let pick = select_memory_type(&props, !0, &req, 1 << 20).expect("a device-local type");
+        let t = props.memory_types[pick.index as usize];
+        assert_eq!(pick.heap_index, t.heap_index);
+        assert_eq!(
+            pick.heap_bytes,
+            props.memory_heaps[t.heap_index as usize].size
+        );
+        assert!(pick.fits);
     }
 }

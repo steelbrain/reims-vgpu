@@ -63,17 +63,18 @@ ssh -o ConnectTimeout=8 -o BatchMode=yes "$SSH_HOST" true 2>/dev/null || {
 
 # The guest's own idea of its display, so the point->pixel scale below is read
 # rather than assumed. A guest whose display is not the size the host window
-# captures would otherwise silently shift every rectangle.
-GUEST_W=$(ssh -o BatchMode=yes "$SSH_HOST" \
-  "system_profiler SPDisplaysDataType 2>/dev/null | sed -n 's/.*Resolution: *\([0-9]*\) x \([0-9]*\).*/\1/p' | head -1")
-GUEST_H=$(ssh -o BatchMode=yes "$SSH_HOST" \
-  "system_profiler SPDisplaysDataType 2>/dev/null | sed -n 's/.*Resolution: *\([0-9]*\) x \([0-9]*\).*/\2/p' | head -1")
+# captures would otherwise silently shift every rectangle. See
+# scripts/lib/guest-display.sh for why the question is asked the way it is.
+# shellcheck source=../lib/guest-display.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)/guest-display.sh"
+read -r GUEST_W GUEST_H < <(guest_display_size "$SSH_HOST") || {
+  say "guest reported no display resolution" >&2; exit 2; }
 [ -n "$GUEST_W" ] && [ -n "$GUEST_H" ] || { say "guest reported no display resolution" >&2; exit 2; }
 say "guest display ${GUEST_W}x${GUEST_H}"
 
 set_appearance() {
-  ssh -o BatchMode=yes "$SSH_HOST" \
-    "osascript -e 'tell application \"System Events\" to tell appearance preferences to set dark mode to $1'" \
+  guest_osa "$SSH_HOST" \
+    "tell application \"System Events\" to tell appearance preferences to set dark mode to $1" \
     >/dev/null 2>&1 || true
 }
 

@@ -65,24 +65,20 @@ WORK="${KEEP:-$(mktemp -d)}"
 mkdir -p "$WORK"
 [ -n "$KEEP" ] || trap 'rm -rf "$WORK"' EXIT
 say() { echo "wallpaper-probe: $*"; }
-osa() { ssh -o BatchMode=yes "$GUEST" "osascript -e '$1'" 2>/dev/null; }
+# shellcheck source=../lib/guest-display.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)/guest-display.sh"
+osa() { guest_osa "$GUEST" "$1"; }
 
 ssh -o ConnectTimeout=8 -o BatchMode=yes "$GUEST" true 2>/dev/null || {
   say "no guest at $GUEST" >&2; exit 2; }
 
 # Read the screen from the guest rather than assuming it: the probe image has to
 # be exactly the desktop's size or macOS scales it and every bar boundary moves.
-#
-# Not from Finder. `tell application "Finder" to get bounds of window of desktop`
-# is the obvious spelling and it answers `AppleEvent timed out (-1712)` on this
-# guest, which as a first step reads like the guest being wedged rather than like
-# one scripting target being unavailable.
-RES=$(ssh -o BatchMode=yes "$GUEST" \
-  "system_profiler SPDisplaysDataType 2>/dev/null | grep -m1 -i 'Resolution:'" || true)
-SCR_W=$(echo "$RES" | sed -n 's/.*Resolution: *\([0-9]*\) *x *\([0-9]*\).*/\1/p')
-SCR_H=$(echo "$RES" | sed -n 's/.*Resolution: *\([0-9]*\) *x *\([0-9]*\).*/\2/p')
+# See scripts/lib/guest-display.sh for why the question is asked the way it is.
+read -r SCR_W SCR_H < <(guest_display_size "$GUEST") || {
+  say "could not read the desktop size from the guest" >&2; exit 2; }
 case "${SCR_W:-}${SCR_H:-}" in
-  ''|*[!0-9]*) say "could not read the desktop size from the guest (got '$RES')" >&2; exit 2 ;;
+  ''|*[!0-9]*) say "could not read the desktop size from the guest" >&2; exit 2 ;;
 esac
 say "guest desktop ${SCR_W}x${SCR_H}, $((${#PATTERN})) bars of $((SCR_W * 100 / ${#PATTERN}))/100 px"
 

@@ -8,23 +8,45 @@
 # The vmapple machine creates exactly one device at the fixed Reims vGPU GFX/IOSFC
 # addresses — do not add a second display via -device.
 #
-# Snapshot revert: snapshots form an
-# IMMUTABLE HISTORY under `vm/guest/snapshots/<label>/{disk.img,aux.img.trimmed}`
-# (each read-only, never overwritten). `vm/guest/snapshots/current` is a symlink
-# naming the active one. EVERY boot starts from a byte-identical APFS clone of
-# `current` (clonefile: instant, COW) and discards that clone on exit, so a harsh
-# kill or a wedge costs nothing and poisons nothing. A snapshot is never booted
-# directly.
+# RAILS. A rail is one guest OS line with a history of its own. Rails are
+# siblings under `vm/guest/rails/`, and `rails/current` is a symlink naming the
+# one a boot gets when `--rail` is not given:
+#
+#   vm/guest/rails/<rail>/snapshots/<label>/{disk.img,aux.img.trimmed}
+#   vm/guest/rails/<rail>/snapshots/current -> <label>
+#   vm/guest/rails/<rail>/vm.json            (optional; else the bundle's)
+#   vm/guest/rails/current -> <rail>
+#
+# Snapshots are per-rail because they are not comparable across rails: two guest
+# OS lines share no history, and a single flat namespace makes `current` mean
+# "whichever guest was captured last", which is how a measurement ends up
+# attributed to the wrong OS. Two coordinates, `--rail` and `--snapshot`, each
+# with its own `current`, keep that from being expressible.
+#
+# A rail may carry its own `vm.json`. The ECID in it identifies the machine the
+# guest was personalized against, so a second provisioned guest is a second
+# vm.json, not a second disk under the first one's identity. When the rail ships
+# one it wins over `$GUEST_DIR/vm.json`; a single-guest tree ships none and uses
+# the bundle's, exactly as before.
+#
+# SNAPSHOT-REVERT: within a rail, snapshots form an IMMUTABLE HISTORY (each file
+# read-only, never overwritten). EVERY boot starts from a byte-identical APFS
+# clone of the selected snapshot (clonefile: instant, COW) and discards that
+# clone on exit, so a harsh kill or a wedge costs nothing and poisons nothing.
+# A snapshot is never booted directly.
+#
+# Selection by either coordinate is per-boot and repoints no `current` symlink.
 #
 # Boot classes:
 #   --testing      agent-driven measurement (default): GUI + serial-to-file,
 #                  SSH-driven, 7-minute hard kill + capture-then-revert. Reverts.
 #   --interactive  human/GUI boot, no time limit. Reverts (nothing persists).
-#   --snapshot     boot writable to CAPTURE A NEW snapshot: on a clean guest
+#   --capture      boot writable to CAPTURE A NEW snapshot: on a clean guest
 #                  shutdown the modified disk/aux are saved as a NEW immutable
 #                  snapshot and `current` is repointed to it. Existing snapshots
 #                  (incl. the base) are never touched. Roll back by repointing
 #                  `current` (see scripts/vmapple-snapshot).
+#                  A bare `--snapshot` (no label) still means this.
 #
 # Launch configuration is CLI flags / env here, not device/backend code.
 set -euo pipefail
@@ -35,9 +57,12 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 # --- Configuration (override via env or flags) ----------------------------------
 # Guest bundle provisioned by scripts/vmapple-provision (large + private, gitignored).
 GUEST_DIR="${GUEST_DIR:-$REPO_ROOT/vm/guest}"
-# Immutable snapshot history; `current` symlinks the active snapshot to revert to.
-SNAPSHOTS_DIR="${SNAPSHOTS_DIR:-$GUEST_DIR/snapshots}"
+# Guest OS lines, each with its own immutable snapshot history.
+RAILS_DIR="${RAILS_DIR:-$GUEST_DIR/rails}"
 # Per-boot scratch (clones + logs). Same APFS volume as GUEST_DIR for clonefile.
+# Shared across rails on purpose: the clones are stamped and thrown away, and
+# `run/qmp.sock` is the one path every driver script resolves. Splitting it per
+# rail would leave those scripts pointing at whichever rail booted last.
 RUN_DIR="${RUN_DIR:-$GUEST_DIR/run}"
 
 QEMU_BIN_DEFAULT="$REPO_ROOT/vendor/qemu/build/qemu-system-aarch64"
@@ -55,26 +80,38 @@ TESTING_TIMEOUT="${TESTING_TIMEOUT:-420}" # 7-minute hard kill for testing boots
 # saved network service valid across reverts.
 GUEST_MAC="${GUEST_MAC:-52:54:00:76:61:70}"
 
-BOOT_CLASS="testing"     # testing | interactive | snapshot
+BOOT_CLASS="testing"     # testing | interactive | capture
+RAIL_LABEL="${RAIL:-}"   # empty = follow rails/current; else a rail name
+SNAPSHOT_LABEL=""        # empty = follow the rail's snapshots/current
+LIST_RAILS=0
+LIST_SNAPSHOTS=0
 GFX_DEVICE="apple-gfx-mmio"  # apple-gfx-mmio | reims-vgpu-mmio
 
 usage() {
   cat <<EOF
-usage: vm/boot-arm64.sh [--device apple-gfx-mmio|reims-vgpu-mmio] [--testing|--interactive|--snapshot]
+usage: vm/boot-arm64.sh [--device apple-gfx-mmio|reims-vgpu-mmio] [--testing|--interactive|--capture]
+                        [--rail NAME] [--snapshot LABEL]
 
   --device NAME          Reims vGPU slot backend (default: apple-gfx-mmio)
                          apple-gfx-mmio  Apple PVG framework (reference)
                          reims-vgpu-mmio    product (reims-vgpu Rust path)
   --testing              agent boot (default): GUI, ${TESTING_TIMEOUT}s hard kill, reverts
   --interactive          human/GUI boot, no time limit, reverts
-  --snapshot             boot writable; a clean guest shutdown CAPTURES a new snapshot
-                         (also bootstraps the first snapshot on a fresh guest)
+  --capture              boot writable; a clean guest shutdown CAPTURES a new snapshot
+                         into the selected rail (also bootstraps an empty rail)
+  --rail NAME            guest OS line to boot. Default: whatever \`rails/current\` names.
+  --snapshot LABEL       snapshot WITHIN that rail. Default: the rail's own
+                         \`snapshots/current\`. A bare --snapshot (no label) is
+                         the old spelling of --capture.
+  --list-rails           print the rails and exit
+  --list-snapshots       print the selected rail's snapshots and exit
 
-Every boot reverts to the current snapshot:
-  $SNAPSHOTS_DIR/current -> <label>/{disk.img,aux.img.trimmed}
+Both selections are per-boot and repoint no \`current\`. Layout:
+  $RAILS_DIR/<rail>/snapshots/<label>/{disk.img,aux.img.trimmed}
+Change the default rail with:  ln -sfn <rail> $RAILS_DIR/current
 Always builds reims-vgpu-efi and reims-vgpu before boot. In-tree QEMU is rebuilt
 unless QEMU_BIN is set to something other than the default path.
-Env: GUEST_DIR SNAPSHOTS_DIR RUN_DIR QEMU_BIN AVPBOOTER RAM CPUS SSH_PORT REIMS_VGPU_BACKEND
+Env: GUEST_DIR RAILS_DIR RAIL RUN_DIR QEMU_BIN AVPBOOTER RAM CPUS SSH_PORT REIMS_VGPU_BACKEND
      (vulkan default for reims-vgpu-mmio; metal default for apple-gfx-mmio)
      TESTING_TIMEOUT QMP_DUMP_TIMEOUT GUEST_MAC
      NET=user (SLIRP, default) | NET=none (no NIC — one-time offline Setup Assistant bootstrap)
@@ -85,34 +122,51 @@ Env: GUEST_DIR SNAPSHOTS_DIR RUN_DIR QEMU_BIN AVPBOOTER RAM CPUS SSH_PORT REIMS_
 EOF
 }
 
+# `--device NAME` and `--device=NAME` differ only in where the value comes from,
+# so the accepted set and its error string live here once. Written out per arm,
+# adding a device means editing two `case`s and two message strings, and the arm
+# that gets missed is the spelling nobody on this pathway happens to type.
+set_gfx_device() {
+  GFX_DEVICE="$1"
+  case "$GFX_DEVICE" in
+    apple-gfx-mmio|reims-vgpu-mmio) ;;
+    *)
+      echo "boot-arm64.sh: invalid --device '$GFX_DEVICE' (apple-gfx-mmio | reims-vgpu-mmio)" >&2
+      exit 64
+      ;;
+  esac
+}
+
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --device)
       shift
-      GFX_DEVICE="${1:-}"
-      case "$GFX_DEVICE" in
-        apple-gfx-mmio|reims-vgpu-mmio) ;;
-        *)
-          echo "boot-arm64.sh: invalid --device '$GFX_DEVICE' (apple-gfx-mmio | reims-vgpu-mmio)" >&2
-          exit 64
-          ;;
-      esac
+      set_gfx_device "${1:-}"
       shift
       ;;
     --device=*)
-      GFX_DEVICE="${1#--device=}"
-      case "$GFX_DEVICE" in
-        apple-gfx-mmio|reims-vgpu-mmio) ;;
-        *)
-          echo "boot-arm64.sh: invalid --device '$GFX_DEVICE' (apple-gfx-mmio | reims-vgpu-mmio)" >&2
-          exit 64
-          ;;
-      esac
+      set_gfx_device "${1#--device=}"
       shift
       ;;
     --testing) BOOT_CLASS="testing"; shift ;;
     --interactive) BOOT_CLASS="interactive"; shift ;;
-    --snapshot) BOOT_CLASS="snapshot"; shift ;;
+    --capture) BOOT_CLASS="capture"; shift ;;
+    --rail) shift; RAIL_LABEL="${1:-}"; [ -n "$RAIL_LABEL" ] || { echo "boot-arm64.sh: --rail needs a name" >&2; exit 64; }; shift ;;
+    --rail=*) RAIL_LABEL="${1#--rail=}"; shift ;;
+    # `--snapshot` carries two meanings, kept apart by whether a label follows.
+    # With a label it SELECTS a snapshot within the rail; bare it is the old
+    # capture class, which every existing invocation in this repo's docs and
+    # helper scripts still spells that way. A following `--flag` is the next
+    # option, not a label.
+    --snapshot)
+      case "${2:-}" in
+        ""|-*) BOOT_CLASS="capture"; shift ;;
+        *) SNAPSHOT_LABEL="$2"; shift 2 ;;
+      esac
+      ;;
+    --snapshot=*) SNAPSHOT_LABEL="${1#--snapshot=}"; shift ;;
+    --list-rails) LIST_RAILS=1; shift ;;
+    --list-snapshots) LIST_SNAPSHOTS=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "boot-arm64.sh: unknown arg: $1" >&2; usage >&2; exit 64 ;;
   esac
@@ -120,6 +174,115 @@ done
 
 # --- Preflight ------------------------------------------------------------------
 die() { echo "boot-arm64.sh: $*" >&2; exit 1; }
+
+# Directory children of a dir; a `current` symlink is -type l, so it is skipped
+# and never lists itself as one of the things it points at. BSD find has no
+# -printf, so the label is taken with basename.
+list_dir_labels() {
+  find "$1" -mindepth 1 -maxdepth 1 -type d 2>/dev/null \
+    | while IFS= read -r d; do basename "$d"; done | sort
+}
+list_rail_labels() { list_dir_labels "$RAILS_DIR"; }
+list_snapshot_labels() { list_dir_labels "$RAILS_DIR/$RAIL_NAME/snapshots"; }
+
+# A label names one directory directly under its parent. Refusing a path keeps
+# both histories flat, and keeps `--rail ../../elsewhere` from putting a capture
+# outside the tree.
+require_plain_label() {
+  case "$2" in
+    */*|.|..|"") die "$1 takes a plain label, not a path: '$2'" ;;
+  esac
+}
+
+# --- Resolve the rail ------------------------------------------------------------
+# Answered before anything is built — these are questions about the disk tree.
+if [ "$LIST_RAILS" -eq 1 ]; then
+  echo "rails under $RAILS_DIR (current -> $(readlink "$RAILS_DIR/current" 2>/dev/null || echo '(unset)')):"
+  list_rail_labels | while IFS= read -r label; do echo "  $label"; done
+  exit 0
+fi
+
+# A tree from before rails keeps its history one level too high. Say so with the
+# move that fixes it rather than migrating it here: this is the user's only copy
+# of a provisioned guest, and a boot script is the wrong thing to have silently
+# rearranged it when the next thing it does is fail for an unrelated reason.
+if [ ! -d "$RAILS_DIR" ] && [ -d "$GUEST_DIR/snapshots" ]; then
+  die "pre-rail layout found at $GUEST_DIR/snapshots.
+Snapshots are now per-rail. Move that history into a rail — name it for the guest OS line it holds:
+  mkdir -p $RAILS_DIR/<rail>
+  mv $GUEST_DIR/snapshots $RAILS_DIR/<rail>/snapshots
+  ln -sfn <rail> $RAILS_DIR/current"
+fi
+
+if [ -n "$RAIL_LABEL" ]; then
+  require_plain_label --rail "$RAIL_LABEL"
+  RAIL_NAME="$RAIL_LABEL"
+else
+  RAIL_NAME="$(readlink "$RAILS_DIR/current" 2>/dev/null || true)"
+  [ -n "$RAIL_NAME" ] || die \
+    "no default rail: $RAILS_DIR/current is unset.
+Pick one per boot with --rail NAME, or set the default:  ln -sfn <rail> $RAILS_DIR/current
+available: $(list_rail_labels | tr '\n' ' ')"
+  # `current` is allowed to be an absolute symlink; reduce it to a name so the
+  # rail reads the same in the log line whichever way it was written.
+  RAIL_NAME="$(basename "$RAIL_NAME")"
+fi
+RAIL_DIR="$RAILS_DIR/$RAIL_NAME"
+SNAPSHOTS_DIR="$RAIL_DIR/snapshots"
+# An unknown rail is always an error. Only an EMPTY one may bootstrap, and only
+# under --capture: a typo'd name would otherwise create the rail on capture and
+# the boot would quietly become a different guest line.
+[ -d "$RAIL_DIR" ] || die \
+  "no rail '$RAIL_NAME' at $RAIL_DIR
+available: $(list_rail_labels | tr '\n' ' ')
+(start a new guest line by creating the directory first:  mkdir -p $RAIL_DIR
+ then bootstrap it with:  vm/boot-arm64.sh --rail $RAIL_NAME --capture)"
+
+# The ECID identifies the machine this guest was personalized against, so it
+# belongs to the rail when the rail has its own. A single-guest tree has none
+# and uses the bundle's, which is the pre-rail behavior unchanged.
+VM_JSON="$GUEST_DIR/vm.json"
+[ -f "$RAIL_DIR/vm.json" ] && VM_JSON="$RAIL_DIR/vm.json"
+
+# --- Resolve the snapshot within that rail ---------------------------------------
+# When the rail has none, only --capture can bootstrap it: it boots the freshly
+# provisioned disk WRITE-THROUGH so you can finish Setup Assistant + config, and
+# a clean guest shutdown captures the rail's first immutable snapshot.
+CURRENT="$SNAPSHOTS_DIR/current"
+if [ "$LIST_SNAPSHOTS" -eq 1 ]; then
+  echo "rail '$RAIL_NAME' snapshots under $SNAPSHOTS_DIR (current -> $(readlink "$CURRENT" 2>/dev/null || echo '(unset)')):"
+  list_snapshot_labels | while IFS= read -r label; do echo "  $label"; done
+  exit 0
+fi
+
+if [ -n "$SNAPSHOT_LABEL" ]; then
+  require_plain_label --snapshot "$SNAPSHOT_LABEL"
+  SNAPSHOT_SRC="$SNAPSHOTS_DIR/$SNAPSHOT_LABEL"
+  SNAPSHOT_NAME="$SNAPSHOT_LABEL"
+else
+  SNAPSHOT_SRC="$CURRENT"
+  SNAPSHOT_NAME="$(readlink "$CURRENT" 2>/dev/null || echo current)"
+fi
+HAVE_SNAPSHOT=0
+if [ -e "$SNAPSHOT_SRC" ] && [ -f "$SNAPSHOT_SRC/disk.img" ] && [ -f "$SNAPSHOT_SRC/aux.img.trimmed" ]; then
+  HAVE_SNAPSHOT=1
+fi
+if [ "$HAVE_SNAPSHOT" -eq 0 ]; then
+  # A named snapshot that is missing or half-populated is an error in every
+  # class. Falling through to the bootstrap path here would silently boot the
+  # provisioned bundle — a different guest than the one that was asked for, and
+  # under --capture it would then repoint the rail's `current` at it.
+  [ -z "$SNAPSHOT_LABEL" ] || die \
+    "rail '$RAIL_NAME' has no usable snapshot '$SNAPSHOT_LABEL' at $SNAPSHOT_SRC
+(needs disk.img and aux.img.trimmed)
+available: $(list_snapshot_labels | tr '\n' ' ')"
+  [ "$BOOT_CLASS" = "capture" ] || die \
+    "rail '$RAIL_NAME' has no snapshot yet — bootstrap it with:  vm/boot-arm64.sh --rail $RAIL_NAME --capture
+(boots the provisioned disk writable for Setup Assistant + config; a clean guest shutdown then
+captures the rail's first immutable snapshot. --testing/--interactive need a snapshot to revert to.)"
+  [ -f "$GUEST_DIR/disk.img" ] && [ -f "$GUEST_DIR/aux.img.trimmed" ] \
+    || die "no provisioned bundle at $GUEST_DIR (run scripts/vmapple-provision first)"
+fi
 
 # metal2vulkan spawns `llvm-dis` and `spirv-val` on every uncached shader
 # translate, and QEMU inherits this script's PATH — resolve them here so a
@@ -143,6 +306,19 @@ require_shader_toolchain() {
     "llvm-dis not found in PATH (install the LLVM tools, e.g. brew install llvm, then put \"\$(brew --prefix llvm)/bin\" on PATH)"
   command -v spirv-val >/dev/null 2>&1 || die \
     "spirv-val not found in PATH (ships in SPIRV-Tools, not LLVM: brew install spirv-tools)"
+}
+
+# APFS clonefile: instant and COW, which is what makes a per-boot revert free.
+# `cp -c` fails on a non-APFS volume (or a cross-volume copy), so fall back to a
+# real copy rather than leaving the boot without a disk. Written out at each of
+# the four call sites, one of them eventually loses the fallback and a guest
+# bundle on an external volume stops booting for a reason nothing prints.
+clone_file() {
+  local src="$1" dst="$2"
+  if cp -c "$src" "$dst" 2>/dev/null; then
+    return 0
+  fi
+  cp -f "$src" "$dst"
 }
 
 ensure_rust_tools() {
@@ -181,30 +357,12 @@ fi
 
 [ -x "$QEMU_BIN" ] || die "QEMU not available: $QEMU_BIN"
 [ -f "$AVPBOOTER" ] || die "AVPBooter ROM not found: $AVPBOOTER"
-[ -f "$GUEST_DIR/vm.json" ] || die "guest vm.json not found: $GUEST_DIR/vm.json (provision first)"
-
-# Snapshot state. When none exists yet, only --snapshot can bootstrap it: it
-# boots the freshly provisioned disk WRITE-THROUGH so you can finish Setup
-# Assistant + config, and a clean guest shutdown captures the first immutable
-# snapshot. --testing/--interactive need a snapshot to revert to.
-CURRENT="$SNAPSHOTS_DIR/current"
-HAVE_SNAPSHOT=0
-if [ -e "$CURRENT" ] && [ -f "$CURRENT/disk.img" ] && [ -f "$CURRENT/aux.img.trimmed" ]; then
-  HAVE_SNAPSHOT=1
-fi
-if [ "$HAVE_SNAPSHOT" -eq 0 ]; then
-  [ "$BOOT_CLASS" = "snapshot" ] || die \
-    "no snapshot yet — bootstrap it with:  vm/boot-arm64.sh --snapshot
-(boots the provisioned disk writable for Setup Assistant + config; a clean guest shutdown then
-captures the first immutable snapshot. --testing/--interactive need a snapshot to revert to.)"
-  [ -f "$GUEST_DIR/disk.img" ] && [ -f "$GUEST_DIR/aux.img.trimmed" ] \
-    || die "no provisioned bundle at $GUEST_DIR (run scripts/vmapple-provision first)"
-fi
+[ -f "$VM_JSON" ] || die "guest vm.json not found: $VM_JSON (provision first)"
 
 # ECID/UUID: vmapple's uuid= is the ECID from the bundle's machineId (== macosvm
 # contrib/vmapple/uuid.sh). Extract it from vm.json.
-UUID="$(plutil -extract machineId raw "$GUEST_DIR/vm.json" | base64 -d | plutil -extract ECID raw -)"
-[ -n "$UUID" ] || die "could not extract ECID/UUID from $GUEST_DIR/vm.json"
+UUID="$(plutil -extract machineId raw "$VM_JSON" | base64 -d | plutil -extract ECID raw -)"
+[ -n "$UUID" ] || die "could not extract ECID/UUID from $VM_JSON"
 
 # --- Choose the boot disk: revert-clone, or bootstrap write-through -------------
 mkdir -p "$RUN_DIR"
@@ -240,16 +398,17 @@ if [ "$TRACE" = "1" ]; then
 fi
 
 if [ "$HAVE_SNAPSHOT" -eq 0 ]; then
-  # Bootstrap (--snapshot only): boot the provisioned master write-through so
+  # Bootstrap (--capture only): boot the provisioned master write-through so
   # Setup Assistant + config persist; a clean shutdown captures snapshot #1.
   DISK="$GUEST_DIR/disk.img"; AUX="$GUEST_DIR/aux.img.trimmed"; IS_CLONE=0
-  echo "boot-arm64.sh: bootstrap — booting provisioned disk write-through (no snapshot yet) ..."
+  SNAPSHOT_NAME="(bootstrap)"
+  echo "boot-arm64.sh: rail '$RAIL_NAME' — bootstrap; booting provisioned disk write-through (rail is empty) ..."
 else
-  # Revert: clone the current snapshot into a throwaway working copy.
+  # Revert: clone the selected snapshot into a throwaway working copy.
   DISK="$RUN_DIR/disk-$STAMP.img"; AUX="$RUN_DIR/aux-$STAMP.img"; IS_CLONE=1
-  echo "boot-arm64.sh: reverting to snapshot '$(readlink "$CURRENT" 2>/dev/null || echo current)' ..."
-  cp -c "$CURRENT/disk.img" "$DISK" 2>/dev/null || cp "$CURRENT/disk.img" "$DISK"
-  cp -c "$CURRENT/aux.img.trimmed" "$AUX" 2>/dev/null || cp "$CURRENT/aux.img.trimmed" "$AUX"
+  echo "boot-arm64.sh: rail '$RAIL_NAME' — reverting to snapshot '$SNAPSHOT_NAME' ($SNAPSHOT_SRC) ..."
+  clone_file "$SNAPSHOT_SRC/disk.img" "$DISK"
+  clone_file "$SNAPSHOT_SRC/aux.img.trimmed" "$AUX"
   chmod u+w "$DISK" "$AUX"   # snapshots are read-only; the working clone must be writable
 fi
 
@@ -323,7 +482,7 @@ if [ "$GFX_DEVICE" = "reims-vgpu-mmio" ]; then
   esac
 fi
 
-echo "boot-arm64.sh: device=$GFX_DEVICE class=$BOOT_CLASS uuid=$UUID"
+echo "boot-arm64.sh: device=$GFX_DEVICE class=$BOOT_CLASS rail=$RAIL_NAME snapshot=$SNAPSHOT_NAME uuid=$UUID"
 echo "boot-arm64.sh: display=$DISPLAY_KIND"
 echo "boot-arm64.sh: ssh → localhost:$SSH_PORT   serial → $SERIAL_LOG   qmp → $QMP_SOCK"
 [ -n "$TRACE_LOG" ] && echo "boot-arm64.sh: trace → $TRACE_LOG ($TRACE_SPEC)"
@@ -343,24 +502,31 @@ discard_clone() {
 }
 
 promote_to_snapshot() {
-  # Save this boot's (modified) disk/aux as a NEW immutable snapshot and repoint
-  # `current` to it. Existing snapshots (incl. the base) are never overwritten.
-  # Called only after a clean guest shutdown in --snapshot mode.
+  # Save this boot's (modified) disk/aux as a NEW immutable snapshot in the
+  # SELECTED rail, and repoint only that rail's `current`. Existing snapshots
+  # (incl. the base) are never overwritten, and `rails/current` is not touched:
+  # capturing on one guest line must not silently move what the next bare boot
+  # gets, which is the failure a flat snapshot namespace made easy.
+  # Called only after a clean guest shutdown in --capture mode.
   local label new_dir
-  if [ "$HAVE_SNAPSHOT" -eq 0 ]; then label="$(date +%Y-%m-%d-%H%M%S)-base"; else label="$(date +%Y-%m-%d-%H%M%S)-snap"; fi
+  if [ "$HAVE_SNAPSHOT" -eq 0 ]; then
+    label="$(date +%Y-%m-%d-%H%M%S)-base"
+  else
+    label="$(date +%Y-%m-%d-%H%M%S)-snap"
+  fi
   new_dir="$SNAPSHOTS_DIR/$label"
-  echo "boot-arm64.sh: capturing new immutable snapshot '$label' ..."
+  echo "boot-arm64.sh: rail '$RAIL_NAME' — capturing new immutable snapshot '$label' ..."
   mkdir -p "$new_dir"
-  cp -c "$DISK" "$new_dir/disk.img" 2>/dev/null || cp "$DISK" "$new_dir/disk.img"
-  cp -c "$AUX" "$new_dir/aux.img.trimmed" 2>/dev/null || cp "$AUX" "$new_dir/aux.img.trimmed"
+  clone_file "$DISK" "$new_dir/disk.img"
+  clone_file "$AUX" "$new_dir/aux.img.trimmed"
   chmod 444 "$new_dir/disk.img" "$new_dir/aux.img.trimmed"
   ln -sfn "$label" "$CURRENT"
   discard_clone
-  echo "boot-arm64.sh: snapshot '$label' captured; current -> $label"
+  echo "boot-arm64.sh: snapshot '$label' captured; rail '$RAIL_NAME' current -> $label"
 }
 
-# --- Interactive / snapshot: foreground GUI, no time limit ----------------------
-if [ "$BOOT_CLASS" = "interactive" ] || [ "$BOOT_CLASS" = "snapshot" ]; then
+# --- Interactive / capture: foreground GUI, no time limit -----------------------
+if [ "$BOOT_CLASS" = "interactive" ] || [ "$BOOT_CLASS" = "capture" ]; then
   if [ "$DISPLAY_KIND" = "reims-host-window" ]; then
     QEMU_ARGS+=(-display none -serial mon:stdio)
   else
@@ -368,10 +534,10 @@ if [ "$BOOT_CLASS" = "interactive" ] || [ "$BOOT_CLASS" = "snapshot" ]; then
   fi
   rc=0
   "$QEMU_BIN" "${QEMU_ARGS[@]}" || rc=$?
-  if [ "$BOOT_CLASS" = "snapshot" ] && [ "$rc" -eq 0 ]; then
+  if [ "$BOOT_CLASS" = "capture" ] && [ "$rc" -eq 0 ]; then
     promote_to_snapshot
   else
-    [ "$BOOT_CLASS" = "snapshot" ] && echo "boot-arm64.sh: qemu exited rc=$rc (not clean) — snapshot NOT updated"
+    [ "$BOOT_CLASS" = "capture" ] && echo "boot-arm64.sh: qemu exited rc=$rc (not clean) — snapshot NOT updated"
     discard_clone
   fi
   exit "$rc"

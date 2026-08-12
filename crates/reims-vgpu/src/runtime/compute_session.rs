@@ -759,15 +759,7 @@ fn apply_icb_compute_encoder_inheritance<M: HostMemory + HostOps>(
                     stage_texture_raw(state, host, task_id, st.texture_ref, binding, is_storage)?;
                 // Materialize Metal texture (not set_texture on encoder — only AB).
                 let selector = staged.storage_selector_or_refuse(task_id, acc.pipeline_ref)?;
-                let Some((pixel_format, bpp)) = storage_image_format(selector) else {
-                    crate::observe::fail(format!(
-                        "compute_icb_texture fail reason=metal_selector_unsupported task={task_id} pipe={} bind={} ref={} fmt={:#x} selector={selector}",
-                        acc.pipeline_ref, binding, st.texture_ref, staged.pixel_format
-                    ));
-                    return Err(ComputeStatus::Unsupported(
-                        "icb_texture_selector_unsupported",
-                    ));
-                };
+                let (pixel_format, bpp) = storage_image_format(selector);
                 let Some(expected_len) = tight_image_bytes(staged.width, staged.height, bpp) else {
                     return Err(ComputeStatus::Unsupported("icb_texture_image_len_overflow"));
                 };

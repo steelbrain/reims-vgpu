@@ -11,13 +11,13 @@ use std::time::Instant;
 
 use super::buffer_slab::{BufferSlabToken, BUFFER_SLAB_IDLE_KEEP_EMPTY};
 use super::compute_execution::ComputeExecutionDecline;
-use super::context::{DeviceContext, FENCE_TIMEOUT_NS};
+use super::context::{DeviceContext, DrawSpanProbe, FENCE_TIMEOUT_NS};
 use super::counters::EngineCounters;
 use super::desc_arena::{DescriptorArena, DESC_BLOCK_MAX_SETS};
 use super::device_lost::{DeviceLostDecline, DeviceLostOp};
 use super::types::{DrawError, ResidentReclaim, StorageImageFormat, TargetIdentity};
 use super::vk_call::{VkCall, VkOp};
-use super::{buffer_slab, color_subresource_range, host_ram, reason, slab, types};
+use super::{buffer_slab, color_subresource_range, gpu_span, host_ram, reason, slab, types};
 use crate::backend::vulkan::caps::{MappedMemoryKind, MemoryClass};
 use crate::backend::vulkan::translate;
 use crate::model::ComputeStorageResidencyKey;
@@ -231,6 +231,9 @@ pub(crate) struct ResourcePools {
     /// the correctness edge: a bind after a Store into the same pages must see
     /// what the Store wrote, and reusing a copy taken before it would not.
     cb_bound_buffers: HashMap<(usize, u64), super::exec::BoundBuffer>,
+    /// Graphics state the command buffer now recording already carries — see
+    /// [`CbGraphicsState`].
+    cb_graphics: CbGraphicsState,
     /// Staging free-list hits / misses and the miss bucket histogram; see
     /// `note_staging_miss`. Measure-only.
     staging_hits: u64,
@@ -248,15 +251,6 @@ pub(crate) struct ResourcePools {
     readback_live: Option<BufferSlot>,
     /// Extra live readbacks (compute multi-image / multi-buffer).
     readback_multi_live: Vec<BufferSlot>,
-    /// Device-local buffer the guest-page writeback detiles a frame into before
-    /// scattering it into the guest's stretches.
-    ///
-    /// One slot, not a pool keyed by size: this rail writes one frame at a time
-    /// inside a single command buffer, and a boot's frames are all the same
-    /// geometry until the display mode changes. It is grown and never shrunk,
-    /// so a mode change up costs one reallocation and a mode change down costs
-    /// nothing. `None` until the first frame that takes the linear path.
-    guest_scratch: Option<BufferSlot>,
     /// Readback slots handed to a reader that is consuming their mapping with
     /// the engine unlocked; see [`ResourcePools::lease_readback`].
     ///
@@ -273,6 +267,10 @@ pub(crate) struct ResourcePools {
     /// candidates only; a hit always requires full byte equality.
     sampled_cache: Vec<ResidentSampledSlot>,
     sampled_cache_bytes: usize,
+    /// What [`SAMPLED_CACHE_CAP`] and [`SAMPLED_CACHE_BYTE_CAP`] have thrown
+    /// away, most recently evicted at the front, carrying no images — see
+    /// [`SampledVictim`].
+    sampled_victims: std::collections::VecDeque<SampledVictim>,
     /// Storage-image pool for compute.
     storage_image_free: FreePool<StorageImageKey, StorageImageSlot>,
     storage_image_live: Vec<StorageImageSlot>,
@@ -397,6 +395,52 @@ pub(crate) struct ResourcePools {
     /// block on exhaustion instead of hard-failing the draw; sets are freed
     /// per entry, paired with their owning block. See [`DescriptorArena`].
     desc_arena: DescriptorArena,
+    /// The device's own guest-scatter pipeline, built on first use.
+    ///
+    /// Lazy rather than part of [`ResourcePools::ensure_init`] so a driver that
+    /// refuses our SPIR-V costs this rail its dispatch and nothing else: the
+    /// writeback falls back to the transfer regions and every other rail on the
+    /// device is untouched. See [`crate::backend::vulkan::engine::guest_scatter`].
+    scatter: Option<crate::backend::vulkan::engine::guest_scatter::ScatterPipeline>,
+    /// Whether a `scatter` build has already been tried and failed, so the
+    /// fallback costs one flag rather than a `vkCreateComputePipelines` per
+    /// writeback on a host that will never serve one.
+    scatter_refused: bool,
+    /// Descriptor sets a guest-scatter dispatch has allocated and not yet
+    /// handed to a fence.
+    ///
+    /// Held here rather than returned to the writeback because the writeback has
+    /// two seal points — its own [`ResourcePools::seal_entry`] and the
+    /// [`ResourcePools::batch_flush`] it takes when it joined an open batch —
+    /// and threading the sets through both is how one of them ends up double
+    /// -freeing or leaking. [`ResourcePools::seal_entry`] drains this, and both
+    /// paths reach it. A writeback that allocated a set and then failed before
+    /// submitting anything leaves it here for the next seal, which is correct:
+    /// no submitted command buffer ever named it, so any later fence will do.
+    scatter_dsets: Vec<(vk::DescriptorSet, vk::DescriptorPool)>,
+    /// Guest-scatter descriptor sets whose fence has retired, ready to be
+    /// rewritten and handed out again.
+    ///
+    /// Every set here was allocated against the one [`guest_scatter`] layout, so
+    /// unlike a draw's — which are keyed by a per-pipeline binding signature —
+    /// they are interchangeable, and a `vkAllocateDescriptorSets` per use buys
+    /// nothing. The draw-time gather issues ~40 000 dispatches a second on a
+    /// driven macos-13 boot and an allocate plus its matching free is two driver
+    /// calls apiece, which is the larger half of the per-dispatch cost that kept
+    /// the compute gather switched off. Recycling makes the steady state zero of
+    /// both.
+    ///
+    /// A set returns here only from `drain_cleanup`, which runs after the fence
+    /// of the submission that named it — the same rule the staging and gather
+    /// free lists keep, and the reason a rewrite cannot race a dispatch still
+    /// reading the old bindings.
+    ///
+    /// Bounded by construction rather than by a cap: nothing enters that was not
+    /// already allocated and retired, so the high-water is the peak number of
+    /// dispatches in flight at once and never more.
+    ///
+    /// [`guest_scatter`]: crate::backend::vulkan::engine::guest_scatter
+    scatter_dset_free: Vec<(vk::DescriptorSet, vk::DescriptorPool)>,
     /// N-deep in-flight ring: each slot is one CB + fence + the cleanup it
     /// owes. Entries rotate through slots; a slot is reused only after its
     /// fence retires (begin_entry blocks on the oldest when the ring is full).
@@ -428,6 +472,12 @@ pub(crate) struct ResourcePools {
     /// treat it as in flight; every path that claims a slot or quiesces the
     /// ring flushes it first ([`Self::batch_flush`]).
     open_batch: Option<OpenBatch>,
+    /// The render pass the last recorded draw opened — see [`PassEcho`].
+    ///
+    /// Observation only: nothing branches on it. It exists because "could this
+    /// draw have continued the previous one's pass" is not answerable from any
+    /// counter this device had, and the answer is the size of the merge.
+    last_pass: Option<PassEcho>,
     /// Offset suballocator for DEVICE_LOCAL optimal images (targets, sampled,
     /// storage, resident registry). Sub-allocates many image binds from a few
     /// large `VkDeviceMemory` blocks to collapse the per-image
@@ -504,14 +554,16 @@ pub(crate) struct ResourcePools {
 ///
 /// One value rather than four parameters, because these four decide two
 /// different things in two places — whether a draw may join the open batch
-/// (`batch_slot`) and what the batch records when one opens (`batch_append`) —
+/// (`batch_fit`) and what the batch records when one opens (`batch_append`) —
 /// and they were spelled out at both. Two of them are adjacent `u32`s, so a
 /// `width`/`height` transposition between the question and the answer compiles
 /// and produces a batch that admits draws of the wrong shape.
 ///
-/// Derived `PartialEq` is the join test, so the fields it turns on cannot drift
-/// from the fields the batch carries: adding one here makes it decide joins
-/// without a second edit.
+/// Derived `PartialEq` is the *narrowed* join test — the arm
+/// [`crate::env::BATCH_MIXED_TARGETS`]`=off` selects — so the fields it turns on
+/// cannot drift from the fields the batch carries: adding one here makes it
+/// decide joins without a second edit. The default arm does not compare it at
+/// all; see [`BatchFit`].
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct BatchTarget {
     pub identity: TargetIdentity,
@@ -520,15 +572,140 @@ pub(crate) struct BatchTarget {
     pub bgra: bool,
 }
 
+/// Whether a draw can append to the open batch, and when it cannot, why.
+///
+/// Total rather than an `Option`, because the three refusals want three
+/// different next moves and the census cannot rank them if they share a name:
+/// [`None`](Self::None) is a batch that has already been submitted and is the
+/// floor a workload cannot go below, [`Full`](Self::Full) says
+/// `BATCH_MAX_DRAWS` is the binding constraint, and
+/// [`OtherTarget`](Self::OtherTarget) can only appear on the narrowed arm and is
+/// what that arm costs.
+#[derive(Clone, Copy)]
+pub(crate) enum BatchFit {
+    /// Nothing is recording.
+    None,
+    /// A batch is recording and already holds `BATCH_MAX_DRAWS` draws.
+    Full,
+    /// A batch is recording on a different [`BatchTarget`], and
+    /// [`crate::env::BATCH_MIXED_TARGETS`] is off.
+    OtherTarget,
+    /// Room in the recording batch: its command buffer and the fence its flush
+    /// will submit with.
+    Open(vk::CommandBuffer, vk::Fence),
+}
+
+/// The render pass instance the previously recorded draw opened, and the
+/// command buffer it opened it in.
+///
+/// Instrument for the merge this device has not taken: every batched draw
+/// begins and ends its own render pass, so a joiner whose pass is identical to
+/// its predecessor's *and* which records nothing between the two could have
+/// stayed inside the open one. `pass` and `fb` are what make two passes the same
+/// instance — a `CLEAR` joiner gets a different `pass` from a `LOAD` one, which
+/// is why the handle is compared rather than the target identity that decides
+/// batching. `area` is the render area, which must agree for the same reason.
+///
+/// `cb` is carried because a command buffer handle is recycled: an echo left
+/// behind by the previous user of this handle names a pass that was ended and
+/// submitted. Every path that resets or submits a CB clears the echo, and the
+/// handle comparison is the second lock on the same door.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PassEcho {
+    pub(crate) cb: vk::CommandBuffer,
+    pub(crate) pass: vk::RenderPass,
+    pub(crate) fb: vk::Framebuffer,
+    pub(crate) area: (u32, u32),
+}
+
+/// Graphics state a recording command buffer already carries, so a draw that
+/// wants the state its predecessor left does not record the call again.
+///
+/// # Why this is sound, and the one rule that makes it so
+///
+/// Pipeline binding and dynamic state are properties of a **command buffer's
+/// recording**, not of a render pass instance: Vulkan invalidates them at
+/// `vkBeginCommandBuffer` and nowhere else on this path, so a draw that ends its
+/// pass and begins another has not disturbed either. That is what makes the skip
+/// legal at all — every batched draw here opens and closes its own pass.
+///
+/// The hazard it does *not* clear is static pipeline state. When a pipeline
+/// declaring some state statically is bound, that state stops being dynamic, and
+/// a later pipeline declaring it dynamic leaves it undefined until set again.
+/// This device does not build every pipeline with the same dynamic-state list —
+/// `VK_DYNAMIC_STATE_STENCIL_REFERENCE` is listed only by pipelines with a
+/// stencil — so a cached dynamic value is not safe across a pipeline change.
+///
+/// **So a pipeline change clears the dynamic half.** That is the whole rule, it
+/// is one line in [`Self::bind_pipeline`], and it makes the question "which
+/// states did which pipeline declare dynamic" one nobody has to answer.
+///
+/// `cb` is carried for the reason [`PassEcho`] carries it: a command buffer
+/// handle is recycled, and state left by the previous user of the handle names
+/// bindings a `vkBeginCommandBuffer` has since made undefined. Every field is
+/// dropped together when the handle differs, so there is no path that clears one
+/// and keeps another.
+#[derive(Default)]
+pub(crate) struct CbGraphicsState {
+    /// The command buffer every other field is an assertion about.
+    cb: Option<vk::CommandBuffer>,
+    /// The graphics pipeline last bound into `cb`.
+    pipeline: Option<vk::Pipeline>,
+    /// The viewport array last handed to `vkCmdSetViewport`, and the scissor
+    /// array last handed to `vkCmdSetScissor`.
+    viewports: Vec<vk::Viewport>,
+    scissors: Vec<vk::Rect2D>,
+    /// The front/back references last handed to `vkCmdSetStencilReference`.
+    stencil: Option<(u32, u32)>,
+    /// Scratch the next draw builds into, so the comparison costs no allocation.
+    /// Swapped with the bound array when they differ rather than cloned.
+    vp_scratch: Vec<vk::Viewport>,
+    sc_scratch: Vec<vk::Rect2D>,
+}
+
+/// Whether two viewport arrays are the value the driver already has.
+///
+/// Field by field on the bit pattern, not `==` on the float: the question is
+/// "are these the bytes already sent", which is exactly bitwise equality, and it
+/// is also what keeps `clippy::float_cmp` quiet without an `allow` that would
+/// hide a real float comparison later. `VkViewport` is a fixed Vulkan structure
+/// of six floats and cannot grow a seventh.
+fn viewports_match(a: &[vk::Viewport], b: &[vk::Viewport]) -> bool {
+    a.len() == b.len()
+        && a.iter().zip(b).all(|(x, y)| {
+            x.x.to_bits() == y.x.to_bits()
+                && x.y.to_bits() == y.y.to_bits()
+                && x.width.to_bits() == y.width.to_bits()
+                && x.height.to_bits() == y.height.to_bits()
+                && x.min_depth.to_bits() == y.min_depth.to_bits()
+                && x.max_depth.to_bits() == y.max_depth.to_bits()
+        })
+}
+
+/// Whether two scissor arrays are the value the driver already has.
+fn scissors_match(a: &[vk::Rect2D], b: &[vk::Rect2D]) -> bool {
+    a.len() == b.len()
+        && a.iter().zip(b).all(|(x, y)| {
+            x.offset.x == y.offset.x
+                && x.offset.y == y.offset.y
+                && x.extent.width == y.extent.width
+                && x.extent.height == y.extent.height
+        })
+}
+
 pub(crate) struct OpenBatch {
     cb: vk::CommandBuffer,
     fence: vk::Fence,
+    /// Only the narrowed arm reads this; see [`BatchFit::OtherTarget`].
     target: BatchTarget,
     draws: u64,
     /// Per-draw descriptor sets paired with the arena block they were allocated
     /// from, so the flush-time free routes each set to its owning pool.
     dsets: Vec<(vk::DescriptorSet, vk::DescriptorPool)>,
-    sampled_retains: Vec<SampledRetain>,
+    // No sampled retains: a batch's draws hand their images to the content
+    // cache at `batch_append`, while the batch is still recording, because the
+    // next draw of the same batch looks for them before this CB is submitted.
+    // The absence of the field is what stops one being accumulated again.
 }
 
 /// One in-flight ring slot: a primary CB, its fence (created unsignaled;
@@ -538,6 +715,10 @@ struct CmdSlot {
     cmd_buf: vk::CommandBuffer,
     fence: vk::Fence,
     pending: Option<PendingGpuCleanup>,
+    /// Whether this slot's GPU timestamp pair has been written, and how far.
+    /// Read and cleared when the slot retires, which is the first moment the
+    /// fence makes the queries readable. See [`super::gpu_span`].
+    span: gpu_span::SlotSpan,
 }
 
 /// In-flight ring depth: the next draw/dispatch records + submits while
@@ -654,18 +835,38 @@ impl ResourcePools {
 }
 
 /// Cleanup owed by an entry that skipped its post-submit fence wait: the
-/// descriptor set, every transient pool slot the CB references (moved out of
-/// the live lists at seal time so a concurrent entry cannot recycle them),
-/// and the render path's sampled-content cache admissions — deferred because
-/// admission can EVICT (destroy) cache images the in-flight CB may sample.
+/// descriptor set and every transient pool slot the CB references, moved out of
+/// the live lists at seal time so a concurrent entry cannot recycle them.
+///
+/// **The sampled images this entry filled are not here.** They leave the seal in
+/// [`SealedEntry::admissions`] and enter the content cache at submit, not at
+/// retire — see [`ResourcePools::finish_entry_async`] for why, and note that the
+/// absence of a field is the enforcement: nothing that reaches this struct can
+/// still be owed to the cache.
 pub(crate) struct PendingGpuCleanup {
     dsets: Vec<(vk::DescriptorSet, vk::DescriptorPool)>,
+    /// The guest-scatter sets, kept apart from `dsets` because they recycle
+    /// rather than free — see [`ResourcePools::scatter_dset_free`].
+    scatter_dsets: Vec<(vk::DescriptorSet, vk::DescriptorPool)>,
     staging: Vec<BufferSlot>,
     gather: Vec<BufferSlot>,
     readback: Vec<BufferSlot>,
     sampled: Vec<SampledSlot>,
     storage_images: Vec<StorageImageSlot>,
-    sampled_retains: Vec<SampledRetain>,
+}
+
+/// What one sealed entry hands back: the cleanup its ring slot owes once the
+/// fence signals, and the sampled images whose fill the CB about to be parked
+/// carries — which the content cache takes immediately.
+///
+/// The two halves are separated here rather than at retire because they are due
+/// at different times, and putting them in one bag is what made every admission
+/// a fence-length late.
+pub(crate) struct SealedEntry {
+    pub(crate) cleanup: PendingGpuCleanup,
+    /// Each entry pairs the image the CB fills with what names it. Empty for
+    /// every non-render entry (compute, present, sync helpers).
+    admissions: Vec<(SampledSlot, SampledRetain)>,
 }
 
 pub(crate) struct SampledSlot {
@@ -752,6 +953,11 @@ impl SampledSlot {
         }
     }
 
+    /// A second reference to the same image, view and memory — **not** a second
+    /// image. Deliberately named rather than `Clone`: exactly one holder owns
+    /// the slot and is responsible for recycling or destroying it, and a derive
+    /// would make an ownership duplicate look like a copy of a value. Every
+    /// caller is handing a binding something to sample.
     fn handles(&self) -> Self {
         Self {
             image: self.image,
@@ -768,6 +974,26 @@ impl SampledSlot {
             swizzle: self.swizzle,
         }
     }
+}
+
+/// The name a gathered sampled window is findable under.
+///
+/// Both halves are required and neither is sufficient. The key is a *shape* —
+/// extent, image and view type, format, swizzle — and two different windows
+/// routinely share one. The identity says which content the producer put there
+/// and carries its generation, but names no image, so it cannot pick between
+/// two geometries of one surface across a resize.
+///
+/// It exists so that "is this the same window?" is asked once rather than
+/// spelled out per site. [`ResourcePools::find_gathered_sampled`]'s lookup and
+/// the admit's dedup still carry their own conjunctions because each also tests
+/// a fingerprint; the twin counter is named through this type, and any new site
+/// should be. A site that dropped the identity term would bind one surface's
+/// pixels for another's, and only this type's own test would notice.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct GatheredName {
+    pub(crate) key: SampledKey,
+    pub(crate) identity: crate::backend::vulkan::engine::SampledContentIdentity,
 }
 
 /// How a retained sampled image can be recognised again.
@@ -789,7 +1015,9 @@ pub(crate) enum SampledFingerprint {
     Gathered,
 }
 
-/// One sampled image a retired submission owes the content cache.
+/// One sampled image a submission owes the content cache — paid at
+/// [`ResourcePools::finish_entry_async`], when the CB that fills it reaches the
+/// queue, and not at the fence.
 pub(crate) struct SampledRetain {
     pub(crate) image: vk::Image,
     /// The bytes to fingerprint, where the source had any. A guest gather has
@@ -1711,6 +1939,76 @@ const RECLAIM_HISTORY: usize = 256;
 /// qualifiers, and prefer removing the write to enlarging the cache.
 const SAMPLED_CACHE_CAP: usize = 64;
 const SAMPLED_CACHE_BYTE_CAP: usize = 128 * 1024 * 1024;
+/// How far back the victim ledger remembers what the caps threw away.
+///
+/// Derived from the count cap rather than written down, so the bands in
+/// [`sampled_reach_bands`] keep meaning "twice the cache", "four times" and
+/// "eight times" whatever the cap becomes. Eight times is the whole ledger, so
+/// there is no band past it — a miss the ledger cannot see reports
+/// `sampled_reach_beyond_ledger` and says so.
+const SAMPLED_VICTIM_LEDGER: usize = SAMPLED_CACHE_CAP * 8;
+
+/// One entry [`SAMPLED_CACHE_CAP`] or [`SAMPLED_CACHE_BYTE_CAP`] evicted,
+/// remembered without its image.
+///
+/// The eviction *route* has been banded for a while and it answers a different
+/// question: which cap fired, not how much cache the workload wanted. Nothing
+/// counted the second, and `sampled_evict_route`'s own doc says so in as many
+/// words — "nothing yet counts how many distinct `(key, identity)` windows the
+/// workload wants live at once, and that is the number `AGENTS.md` requires
+/// before a bound moves".
+///
+/// This is that count, taken the only way it can be taken from one run: the LRU
+/// stack distance. A bind that misses and finds its window here would have hit
+/// in a cache `distance + 1` entries larger, and the bytes carried alongside say
+/// what holding it that long would have cost. Reading the two together is the
+/// point — the eviction-route doc warns that a count cap raised without the byte
+/// cap hands every eviction straight to the other route, and a distance series
+/// with no byte series cannot see that coming.
+///
+/// It holds no `SampledSlot` and therefore no Vulkan handle: a ledger of images
+/// would be the cache, at eight times the size, which is the thing being
+/// measured rather than a measurement of it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SampledVictim {
+    key: SampledKey,
+    identity: crate::backend::vulkan::engine::SampledContentIdentity,
+    content_len: usize,
+    route: SampledVictimRoute,
+}
+
+/// Which of the two things that empty the sampled cache took this entry.
+///
+/// They want opposite fixes and a reach series that folded them together would
+/// point at the wrong one: a window lost to the caps says the cache is too
+/// small for the workload's reuse distance, and a window lost to the idle drain
+/// says `IDLE_TARGET_AGE_MS` is shorter than the interval the guest re-binds at.
+/// The first was the only path the ledger recorded when it was written, so an
+/// aged-out window reported `sampled_reach_beyond_ledger` — the same answer as a
+/// window the cache had genuinely never held.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SampledVictimRoute {
+    /// [`SAMPLED_CACHE_CAP`] or [`SAMPLED_CACHE_BYTE_CAP`] was over budget.
+    Cap,
+    /// The entry went untouched past `IDLE_TARGET_AGE_MS`.
+    Aged,
+    /// The whole cache was discarded because a submission that had already
+    /// published entries into it never reached the queue, so nothing in it could
+    /// be trusted to hold what its name claimed. Not a capacity signal and not
+    /// an age one — a reading here means look at why a submit failed, not at any
+    /// cache bound.
+    Discarded,
+}
+
+impl SampledVictimRoute {
+    fn route(self) -> &'static str {
+        match self {
+            Self::Cap => "sampled_reach_lost_to_cap",
+            Self::Aged => "sampled_reach_lost_to_age",
+            Self::Discarded => "sampled_reach_lost_to_discard",
+        }
+    }
+}
 /// Max recycled sampled slots retained per geometry key in `sampled_free`. A
 /// content-changing input only needs a few live at once (the CB ring is 3-deep
 /// plus the one being acquired); beyond that a recycled slot is destroyed so a
@@ -1959,17 +2257,65 @@ const IDLE_RECYCLE_TRIM_PER_PASS: usize = 8;
 /// climbs and the buffers drain to zero within a few hundred ms of settling.
 const SETTLED_PASSES_FOR_BUFFER_TRIM: u32 = 3;
 
-/// Empty slab blocks retained at idle. `slab::SLAB_KEEP_EMPTY` (2) is the churn
-/// buffer the hot release path keeps mid-burst; at *settled* idle the drain
-/// trims all the way to zero so no empty `SLAB_SIZE` block sits resident for a
-/// long idle desktop. The hot-path buffer still absorbs active churn (blocks
-/// full of live content are never empty, so this never frees a working block);
-/// only a block that has genuinely gone empty and stayed empty across the drain
-/// interval is returned. Re-allocating on the next burst is measured hitch-free
-/// (block allocation during a quad-4K load never moved the per-frame hitch
-/// proxy), and at true idle no burst reuses a spare — so a retained spare is
-/// pure waste. Minimising idle VRAM is the explicit goal.
+/// Empty image-slab blocks retained once idle has **settled**.
+/// `slab::SLAB_KEEP_EMPTY` (2) is the churn buffer the hot release path keeps
+/// mid-burst; at settled idle the drain trims all the way to zero so no empty
+/// `SLAB_SIZE` block sits resident for a long idle desktop. At true idle no
+/// burst reuses a spare, so a retained spare is pure waste, and minimising idle
+/// VRAM is the explicit goal.
+///
+/// **The settled gate is what makes zero safe, and it was missing.** The drain
+/// fires every `IDLE_DRAIN_INTERVAL_MS` (100 ms) whenever the poll heartbeat
+/// ticks, which is *most of the time* on any workload that does not saturate the
+/// drain worker — and it used to trim to zero on every one of those passes,
+/// overriding the hot path's budget between two frames of a live animation. A
+/// driven macos-13 boot of the load probe's WebGL dial read 257 block
+/// allocations and 162 idle trims of a 64 MiB block in 25 seconds, alternating
+/// one for one about eight times a second, against 39 in the same window of a
+/// compositing load the drain could not keep up with. The trims were not
+/// reclaiming an idle desktop's VRAM; they were handing back the block the next
+/// frame re-allocated, at `vk_alloc_sites slab_block` ~1.2 ms each plus the free.
+///
+/// So the trim now runs under the same `trim_buffers` gate as the HOST_VISIBLE
+/// buffer pools, whose own doc reached this conclusion first
+/// ([`SETTLED_PASSES_FOR_BUFFER_TRIM`]): a pass that saw a staging acquire or
+/// drained a resident is not idle, whatever the drain worker's duty says, and
+/// only a run of genuinely quiet passes returns the blocks.
 const IDLE_SLAB_KEEP_EMPTY: usize = 0;
+
+/// Whether the settled gate applies to the image slab, for this process.
+///
+/// Read once: the arms differ in how many `vkAllocateMemory` calls a workload
+/// makes, so a boot that flipped it midway would be two devices in one log.
+fn slab_retain_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let (state, value) = crate::env::read(crate::env::SLAB_RETAIN);
+        let on = !matches!(state, crate::env::Switch::Off);
+        crate::observe::off(format!(
+            "slab_retain on={on} switch={state:?} value={}",
+            value.unwrap_or_else(|| "<unset>".into())
+        ));
+        on
+    })
+}
+
+/// How many empty image-slab blocks per size class this idle pass may leave
+/// behind, or `None` when the pass must not touch them at all.
+///
+/// `None` is what stops the 100 ms drain interval from overriding the hot
+/// release path's own churn budget between two frames of a live animation. The
+/// pass has nothing to do in that case: the hot path already returns every block
+/// past [`slab::SLAB_KEEP_EMPTY`] as it empties, so an unsettled pass can only
+/// trim *below* a budget that was chosen to absorb exactly this churn.
+fn idle_slab_trim_keep(settled: bool) -> Option<usize> {
+    if settled || !slab_retain_enabled() {
+        Some(IDLE_SLAB_KEEP_EMPTY)
+    } else {
+        None
+    }
+}
 
 /// Pop one entry from the LARGEST non-empty bucket of a size-keyed recycle pool.
 ///
@@ -2085,7 +2431,58 @@ const STAGING_MISS_EMIT_EVERY: u64 = 512;
 ///
 /// Before changing this constant, read `batch_flush_draws / batch_flushes`
 /// against it — while the ratio sits far below, the ceiling is not the bound.
-const BATCH_MAX_DRAWS: u64 = 8;
+/// # The bursty probe could not see this constant, and a sustained one can
+///
+/// Everything above was measured on a window-server probe that sleeps between
+/// its phases, and on that workload the paragraph above is right: batches end at
+/// a readback and the ceiling never binds. Under a *sustained* full-rate
+/// animation (`scripts/sustained-animation-probe`) the same build reads
+/// `batch_readback_joins` at 34 % of flushes rather than 91 %, the ratio this
+/// doc says to check sits at 6.24 against a ceiling of 8, and
+/// `nojoin_batch_full` — the refusal that had no name of its own until the
+/// target key was dropped — is the **largest** refusal in the ladder at 10.7 %
+/// of all draws. The precondition stated above is met on that workload, so the
+/// constant was swept against it.
+///
+/// Ten driven macos-13 boots, one pinned binary, the cap read from a temporary
+/// environment probe so no arm is a rebuild, host quiesced, stock GPU clocks.
+/// The guest turns out to have two compositing regimes across boots — 418-429
+/// draws per presented frame, or 268 — and they are not comparable to each
+/// other, so this is the six boots that landed in the first (n=3 at 8, n=3 at
+/// 32, n=1 at 24 and at 64), medianed:
+///
+/// ```text
+/// cap   gather KiB/draw   slot us/draw   record us/draw   draws/CB   ring blocks   present Hz
+///   8            262.74          12.91             2.83       6.24        38 649        40.70
+///  24            223.13          11.56             2.44      11.42        19 554        39.65
+///  32            217.80          11.33             2.21      12.86        17 478        40.60
+///  64            210.95          10.39             2.33      15.63        12 548        35.10
+/// ```
+///
+/// Within one regime these are near-deterministic: the three boots at 8 read
+/// 262.65/263.28/262.74 KiB per draw and the three at 32 read
+/// 217.80/217.80/217.70. `present_hz` is the one noisy column (±3 % boot to
+/// boot) and it is flat.
+///
+/// So 32 buys **17 % fewer guest bytes copied per draw**, 55 % fewer ring
+/// blocks, 12 % less blocking in [`Phase::Slot`] and 22 % less command
+/// recording, and the device serves **10 % more guest draws** in the same forty
+/// seconds at three points lower duty (0.91 -> 0.88). The frame rate does not
+/// move, and saying it does would be reading noise: what moved is headroom.
+///
+/// The gain is reuse, not batching for its own sake. `cb_bound_buffers` is
+/// scoped to one command buffer, so doubling the draws in one doubles the span
+/// over which a guest window gathered once can be bound again — with no change
+/// in what any draw observes, because a command buffer executes as one unit and
+/// two draws in it have always read guest RAM at the same instant.
+///
+/// **64 is past the cliff** the paragraph above describes, and it fails exactly
+/// as predicted: it keeps saving bytes and loses 14 % of the frames. 32 is
+/// chosen over 24 for the byte saving and over 64 for that. `desc_pool_grow`
+/// stayed 0 and creates-per-frame stayed flat (39.40 -> 39.16) at 32, so
+/// neither the descriptor arena nor the staging free lists is the next thing to
+/// give.
+pub(crate) const BATCH_MAX_DRAWS: u64 = 32;
 
 /// 128-bit content fingerprint for the sampled cache.
 ///
@@ -2160,19 +2557,21 @@ pub(crate) enum AllocSite {
     Readback,
     ReadbackMulti,
     SlabBlock,
-    /// The guest-page writeback's device-local detiling scratch. One
-    /// allocation per geometry for the life of the device, so a count above a
-    /// handful means the frame size is changing every flush and the grow rule
-    /// is thrashing rather than settling.
-    GuestScratch,
     /// A DEVICE_LOCAL block the draw-time guest gather carves its destinations
     /// from, not one destination. Same relationship to `guest_gather` binds that
     /// [`Self::StagingBlock`] has to staging ones, and read the same way: a
     /// single-digit count for a whole boot is the allocator working.
+    ///
+    /// It also backs the guest-page writeback's detiling buffer, which used to
+    /// have a site of its own (`guest_scratch`) because it had a slot of its
+    /// own. It no longer does: that slot was a singleton reused and grown
+    /// across submissions, and this pool is what makes the buffer fence-ordered.
+    /// So a boot's `guest_gather_block` figure now covers both users, and is
+    /// not comparable with one taken before that merge.
     GuestGatherBlock,
 }
 
-const ALLOC_SITE_N: usize = 10;
+const ALLOC_SITE_N: usize = 9;
 
 impl AllocSite {
     const fn idx(self) -> usize {
@@ -2185,8 +2584,7 @@ impl AllocSite {
             AllocSite::Readback => 5,
             AllocSite::ReadbackMulti => 6,
             AllocSite::SlabBlock => 7,
-            AllocSite::GuestScratch => 8,
-            AllocSite::GuestGatherBlock => 9,
+            AllocSite::GuestGatherBlock => 8,
         }
     }
 }
@@ -2200,7 +2598,6 @@ const ALLOC_SITE_NAMES: [&str; ALLOC_SITE_N] = [
     "readback",
     "readback_multi",
     "slab_block",
-    "guest_scratch",
     "guest_gather_block",
 ];
 
@@ -2327,7 +2724,9 @@ impl Drop for SlowStagingWrite {
     }
 }
 
+pub mod buffer_gather_working_set;
 mod images_and_registry;
+pub mod sampled_working_set;
 mod submission_and_buffers;
 /// The lease's own extent travels with its pointer; see [`ReadbackLease`].
 pub(crate) use submission_and_buffers::ReadbackLease;
@@ -3137,5 +3536,140 @@ mod resident_reuse_tests {
             !s.reusable_for(64, 32, 7, translate::pixel::resident_color(true)),
             "format still separates the two bgra orders"
         );
+    }
+}
+
+#[cfg(test)]
+mod idle_slab_trim_tests {
+    use super::{idle_slab_trim_keep, IDLE_SLAB_KEEP_EMPTY};
+
+    /// An idle pass that is not settled must leave the image slab alone.
+    ///
+    /// This is the whole of the policy, and the case it protects is not idle at
+    /// all: the drain fires every `IDLE_DRAIN_INTERVAL_MS` whenever the poll
+    /// heartbeat ticks, so a workload with 100 ms gaps between frames reaches it
+    /// between every pair of them. Trimming there returns the block the next
+    /// frame re-allocates — measured at 257 allocations against 162 trims of a
+    /// 64 MiB block in one 25 s driven window.
+    ///
+    /// Fails without the gate: the trim ran on every fired pass, so this would
+    /// read `Some(0)` for both arguments.
+    ///
+    /// It cannot reach the `off` arm of [`crate::env::SLAB_RETAIN`], which
+    /// reads the environment through a `OnceLock` shared with every other test
+    /// in this binary. That arm is the A/B's, verified on a boot.
+    #[test]
+    fn an_unsettled_idle_pass_does_not_trim_the_image_slab() {
+        // The environment this test suite runs in leaves the switch unset, which
+        // is the retaining arm.
+        assert_eq!(
+            idle_slab_trim_keep(true),
+            Some(IDLE_SLAB_KEEP_EMPTY),
+            "a settled pass returns the blocks, which is what the drain is for"
+        );
+        assert_eq!(
+            idle_slab_trim_keep(false),
+            None,
+            "an unsettled pass leaves the hot path's churn budget in place"
+        );
+    }
+}
+
+#[cfg(test)]
+mod dynamic_state_match_tests {
+    use super::{scissors_match, viewports_match};
+    use ash::vk;
+
+    fn vp(x: f32, y: f32, w: f32, h: f32, near: f32, far: f32) -> vk::Viewport {
+        vk::Viewport {
+            x,
+            y,
+            width: w,
+            height: h,
+            min_depth: near,
+            max_depth: far,
+        }
+    }
+
+    fn rect(x: i32, y: i32, w: u32, h: u32) -> vk::Rect2D {
+        vk::Rect2D {
+            offset: vk::Offset2D { x, y },
+            extent: vk::Extent2D {
+                width: w,
+                height: h,
+            },
+        }
+    }
+
+    /// Every field has to be compared, and the test is per field because the
+    /// failure of a missed one is silent: the draw renders through the previous
+    /// draw's viewport, which is wrong pixels with no error anywhere.
+    ///
+    /// `height` is negative on this device — Metal NDC is Y-up and Vulkan's is
+    /// Y-down, so every viewport is emitted flipped — which is why the base here
+    /// carries a negative height rather than a tidy positive one.
+    #[test]
+    fn one_differing_viewport_field_is_enough_to_resend() {
+        let base = [vp(1.0, 600.0, 800.0, -600.0, 0.0, 1.0)];
+        assert!(viewports_match(&base, &base.clone()));
+        for other in [
+            vp(2.0, 600.0, 800.0, -600.0, 0.0, 1.0),
+            vp(1.0, 601.0, 800.0, -600.0, 0.0, 1.0),
+            vp(1.0, 600.0, 801.0, -600.0, 0.0, 1.0),
+            vp(1.0, 600.0, 800.0, -601.0, 0.0, 1.0),
+            vp(1.0, 600.0, 800.0, -600.0, 0.5, 1.0),
+            vp(1.0, 600.0, 800.0, -600.0, 0.0, 0.5),
+        ] {
+            assert!(!viewports_match(&base, &[other]), "{other:?}");
+        }
+    }
+
+    /// A different count is a different bind whatever the shared prefix says.
+    /// The count is what the pipeline declared, so serving a two-slot draw from
+    /// a one-slot cache would leave slot 1 holding the previous pipeline's.
+    #[test]
+    fn a_shorter_or_longer_array_never_matches() {
+        let one = [vp(0.0, 0.0, 8.0, -8.0, 0.0, 1.0)];
+        let two = [one[0], one[0]];
+        assert!(!viewports_match(&one, &two));
+        assert!(!viewports_match(&two, &one));
+        assert!(!scissors_match(&[rect(0, 0, 8, 8)], &[]));
+    }
+
+    /// Bit patterns, not `==`: `-0.0 == 0.0` is true for floats and false for
+    /// "these are the bytes the driver already has". Resending is always safe
+    /// and never wrong, so the comparison is allowed to be stricter than
+    /// equality and must not be looser.
+    #[test]
+    fn negative_zero_is_a_different_viewport() {
+        let pos = [vp(0.0, 0.0, 8.0, -8.0, 0.0, 1.0)];
+        let neg = [vp(-0.0, 0.0, 8.0, -8.0, 0.0, 1.0)];
+        assert_eq!(pos[0].x, neg[0].x, "float equality says these are the same");
+        assert!(!viewports_match(&pos, &neg), "bit equality must not");
+    }
+
+    /// The same, per field, for the integer rectangles.
+    #[test]
+    fn one_differing_scissor_field_is_enough_to_resend() {
+        let base = [rect(4, 5, 800, 600)];
+        assert!(scissors_match(&base, &base.clone()));
+        for other in [
+            rect(5, 5, 800, 600),
+            rect(4, 6, 800, 600),
+            rect(4, 5, 801, 600),
+            rect(4, 5, 800, 601),
+        ] {
+            assert!(!scissors_match(&base, &[other]), "{other:?}");
+        }
+    }
+
+    /// An empty pair matches, which is what a freshly reset command buffer's
+    /// cache holds — and it must not make the first draw skip its bind. The
+    /// first draw always has at least one slot (`viewport_slot_count` never
+    /// returns zero), so an empty cache can never match it.
+    #[test]
+    fn an_empty_cache_matches_only_an_empty_request() {
+        assert!(viewports_match(&[], &[]));
+        assert!(!viewports_match(&[vp(0.0, 0.0, 1.0, -1.0, 0.0, 1.0)], &[]));
     }
 }

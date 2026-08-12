@@ -15,6 +15,7 @@ GUI helpers (usb-kbd + usb-tablet on the vmapple machine; cocoa is observability
   scripts/qmp/qmp.py drag X1 Y1 X2 Y2 [X3 Y3 ...]  # left-button rubber-band drag through points
       QMP_DRAG_STEPS=N    sub-moves interpolated per segment (default 8)
       QMP_DRAG_HOLD_S=F   seconds between sub-moves (default 0.02)
+  scripts/qmp/qmp.py size                     # "WIDTH HEIGHT" of the guest display
   scripts/qmp/qmp.py key NAME[+NAME...] ...   # e.g. key ret, key meta_l+q
   scripts/qmp/qmp.py wheel [up|down] [N] [dt] # N wheel ticks, dt seconds apart (one connection)
   scripts/qmp/qmp.py type TEXT                # ASCII (shift combos handled)
@@ -281,6 +282,22 @@ def main(argv: list[str]) -> int:
         reply = qmp.execute(args[0], req_args)
         print(json.dumps(reply, indent=2))
         return 0 if "return" in reply else 1
+
+    # Sizing is not capture, which is why this is allowed where `shot` is not.
+    # A screendump of the host-owned window shows the wrong *pixels*, but the
+    # DisplaySurface it reads still carries the right dimensions — and that is
+    # all `click`/`move`/`drag` have ever used it for, as the note in
+    # CAPTURE_DISABLED says. Exposing it means a host-side probe can place a
+    # pointer in guest coordinates without asking the guest anything.
+    #
+    # The guest-side alternatives are all unavailable on at least one rail:
+    # `screencapture` fails outright on macOS 26 ("could not create image from
+    # display"), and the `osascript` desktop-bounds routes need Apple Events
+    # consent that a fresh ssh session does not have.
+    if mode == "size":
+        w, h = display_size(qmp)
+        print(f"{w} {h}")
+        return 0
 
     if mode in ("click", "move"):
         if len(args) < 2:

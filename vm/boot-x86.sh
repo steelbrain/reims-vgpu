@@ -6,22 +6,44 @@
 #   vmware-svga      default console (OSX-KVM mainstream)
 #   reims-vgpu-pci   product Reims VGPU (thin C → reims-vgpu); -vga none + secondary bus
 #
-# SNAPSHOT-REVERT (same model as vm/boot-arm64.sh): snapshots form an IMMUTABLE
-# HISTORY under `vm/disks/snapshots/<label>/{macos.img,OpenCore.qcow2,OVMF_VARS.fd}`
-# (each read-only, never overwritten). `vm/disks/snapshots/current` is a symlink
-# naming the active one. EVERY boot starts from a byte-identical COW clone of
-# `current` (btrfs reflink when available) and discards that clone on exit, so a
-# harsh kill or a wedge costs nothing and poisons nothing. A snapshot is never
-# booted directly.
+# RAILS. A rail is one guest OS line — `macos-11` … `macos-26` — with a history
+# of its own. Rails are siblings under `vm/disks/rails/`, and `rails/current` is
+# a symlink naming the one a boot gets when `--rail` is not given:
+#
+#   vm/disks/rails/<rail>/snapshots/<label>/{macos.img,OpenCore.qcow2,OVMF_VARS.fd}
+#   vm/disks/rails/<rail>/snapshots/current -> <label>
+#   vm/disks/rails/current -> <rail>
+#
+# Snapshots are per-rail because they are not comparable across rails: a macOS 15
+# disk and a macOS 11 disk share no history, and a single flat namespace makes
+# `current` mean "whichever guest was captured last", which is how a measurement
+# ends up attributed to the wrong OS. Two coordinates, `--rail` and `--snapshot`,
+# each with its own `current`, keep that from being expressible.
+#
+# SNAPSHOT-REVERT (same model as vm/boot-arm64.sh): within a rail, snapshots form
+# an IMMUTABLE HISTORY (each file read-only, never overwritten). EVERY boot starts
+# from a byte-identical COW clone of the selected snapshot (btrfs reflink when
+# available) and discards that clone on exit, so a harsh kill or a wedge costs
+# nothing and poisons nothing. A snapshot is never booted directly.
+#
+# Selection by either coordinate is per-boot and repoints no `current` symlink.
+#
+# A snapshot may carry its own `OVMF_CODE.fd`. macOS releases are installed under
+# whatever OVMF build their installer ran on, and the NVRAM in `OVMF_VARS.fd`
+# only means anything to the code half it was written by — a split OVMF pair is
+# a matched set, not two independent files. When the snapshot ships one it wins
+# over `$OVMF_DIR/OVMF_CODE_4M.fd`; when it does not, the tree default is used
+# and the pair is whatever it has always been.
 #
 # Boot classes:
 #   --testing      agent-driven measurement (default): GUI + serial-to-file,
 #                  SSH-driven, 7-minute hard kill + capture-then-revert. Reverts.
 #   --interactive  human/GUI boot, no time limit. Reverts (nothing persists).
-#   --snapshot     boot writable to CAPTURE A NEW snapshot: on a clean guest
+#   --capture      boot writable to CAPTURE A NEW snapshot: on a clean guest
 #                  shutdown the modified disk/OpenCore/OVMF_VARS are saved as a
 #                  NEW immutable snapshot and `current` is repointed to it.
 #                  Existing snapshots (incl. the base) are never touched.
+#                  A bare `--snapshot` (no label) still means this.
 #
 # AUDIO is class-compliant USB, not HD Audio. An emulated ich9-intel-hda does
 # reach the guest's PCI bus (pci8086,293e, pciclass,040300), but QEMU's codec
@@ -36,6 +58,25 @@
 # without `audiodev=` then refuses to realize ("no default audio driver
 # available"), which kills the boot before OVMF.
 #
+# WHICH audiodev is chosen at run time, native-host-backend first, because the
+# backends are not interchangeable under load. QEMU refills the backend from
+# `audio_run_out` on its main loop at `timer-period` (10 ms), so every backend
+# is exposed to main-loop jitter; what differs is what happens when the refill
+# is late:
+#
+#   - `sdl` holds `4 * 11610 us` and its callback fills the shortfall with
+#     zeroes. Zeroes in the middle of a waveform is what a click is, and it
+#     neither logs nor counts them, so the symptom reaches the user and nothing
+#     else. It is last in the preference order for that reason, not for quality.
+#   - `pipewire` and `pa` each run their own thread with their own ring
+#     (PipeWire's is a fixed 1 MiB) and default to 46440 us; PipeWire reports an
+#     underrun when it does happen.
+#   - `alsa` has an xrun trace (`alsa_xrun_out`).
+#
+# `AUDIODEV=` forces one. `AUDIO_BUFFER_US` and `AUDIO_USB_BUFFER` set the two
+# buffers explicitly so the jitter budget is stated rather than inherited.
+# `scripts/audio-crackle-probe` is what turns "it crackles" into a number.
+#
 # Launch configuration is CLI flags / env here (this is the boot script, not
 # device/backend code) — never an env sniff inside the device.
 #
@@ -48,7 +89,11 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 # --- Configuration (override via env or flags) ----------------------------------
 DISKS_DIR="${DISKS_DIR:-$SCRIPT_DIR/disks}"
 OVMF_DIR="${OVMF_DIR:-$SCRIPT_DIR/ovmf}"
-SNAPSHOTS_DIR="${SNAPSHOTS_DIR:-$DISKS_DIR/snapshots}"
+RAILS_DIR="${RAILS_DIR:-$DISKS_DIR/rails}"
+# Per-boot scratch is shared across rails on purpose: the clones are stamped and
+# thrown away, and `run/qmp.sock` is the one path every driver script resolves.
+# Splitting it per rail would give each rail its own qmp.sock and leave those
+# scripts pointing at whichever rail booted last.
 RUN_DIR="${RUN_DIR:-$DISKS_DIR/run}"
 
 # In-tree QEMU is rebuilt every boot unless QEMU_BIN is overridden. The boot
@@ -71,7 +116,12 @@ RUN_DIR="${RUN_DIR:-$DISKS_DIR/run}"
 QEMU_BIN_DEFAULT="$REPO_ROOT/vendor/qemu/build/qemu-system-x86_64"
 QEMU_BIN="${QEMU_BIN:-$QEMU_BIN_DEFAULT}"
 REIMS_VGPU_EFI_ROM_SCRIPT="$REPO_ROOT/crates/reims-vgpu-efi/scripts/reims-vgpu-efi-rom/reims-vgpu-efi-rom.sh"
-OVMF_CODE="${OVMF_CODE:-$OVMF_DIR/OVMF_CODE_4M.fd}"
+# A snapshot's own OVMF_CODE.fd overrides this default (see the header), but an
+# explicitly-exported OVMF_CODE outranks both — same DEFAULT-sentinel shape as
+# QEMU_BIN above, because `${VAR:-fallback}` cannot tell "set to the default"
+# from "not set" once it has run.
+OVMF_CODE_DEFAULT="$OVMF_DIR/OVMF_CODE_4M.fd"
+OVMF_CODE="${OVMF_CODE:-$OVMF_CODE_DEFAULT}"
 OVMF_VARS_MASTER="${OVMF_VARS_MASTER:-$OVMF_DIR/OVMF_VARS-1920x1080.fd}"
 OPENCORE_MASTER="${OPENCORE_MASTER:-$DISKS_DIR/OpenCore.qcow2}"
 DISK_MASTER="${DISK_MASTER:-$DISKS_DIR/macos.img}"
@@ -88,11 +138,34 @@ GUEST_MAC="${GUEST_MAC:-52:54:00:c9:18:27}"
 CPU_MODEL="${CPU_MODEL:-Skylake-Client}"
 CPU_OPTIONS="${CPU_OPTIONS:-+ssse3,+sse4.2,+popcnt,+avx,+avx2,+aes,+xsave,+xsaveopt,check}"
 
-BOOT_CLASS="testing"          # testing | interactive | snapshot
+# Audio backend. `AUDIODEV` names a QEMU audiodev driver explicitly; unset picks
+# the first one this build has that is native to the host — see the AUDIO note
+# in the header for why SDL is the last resort rather than the default, and
+# scripts/audio-crackle-probe for the measurement.
+AUDIODEV="${AUDIODEV:-}"
+# How much audio QEMU's backend holds, in microseconds. The mixer that refills
+# it runs on QEMU's main loop at `timer-period`, so this is the jitter the host
+# may show before the guest's sound has a hole in it. 46440 us is what the
+# PipeWire and PulseAudio backends default to on their own; it is stated here so
+# the number is the same on every backend rather than 11610 on one of them.
+AUDIO_BUFFER_US="${AUDIO_BUFFER_US:-46440}"
+# Bytes of guest-supplied audio the `usb-audio` device rings before the backend
+# takes it. QEMU's default is 32 packets — 6144 bytes, about 32 ms at 48 kHz
+# stereo — and `streambuf_put` drops a whole packet, silently, whenever the ring
+# is full when an isochronous transfer lands. 64 KiB is ~340 ms, which is the
+# other half of the same jitter budget and costs only latency nobody in a VM
+# notices.
+AUDIO_USB_BUFFER="${AUDIO_USB_BUFFER:-65536}"
+
+BOOT_CLASS="testing"          # testing | interactive | capture
+RAIL_LABEL="${RAIL:-}"        # empty = follow rails/current; else a rail name
+SNAPSHOT_LABEL=""             # empty = follow the rail's snapshots/current
+LIST_RAILS=0
+LIST_SNAPSHOTS=0
 # Default to the product device: it is the whole point of this tree, and its
 # host-owned Vulkan window (REIMS_VGPU_WINDOW=1, present + input) is what a human
 # expects to see. The legacy vmware-svga console is opt-in via --device — a bare
-# `--snapshot`/`--interactive` under vmware-svga shows QEMU's gtk window with NO
+# `--capture`/`--interactive` under vmware-svga shows QEMU's gtk window with NO
 # GPU output (the guest renders only through reims-vgpu-pci), which reads as a dead
 # window. Agents pass --device explicitly anyway, so this only fixes the bare
 # human invocation.
@@ -100,7 +173,8 @@ GFX_DEVICE="reims-vgpu-pci"  # reims-vgpu-pci | vmware-svga
 
 usage() {
   cat <<EOF
-usage: vm/boot-x86.sh [--device reims-vgpu-pci|vmware-svga] [--testing|--interactive|--snapshot]
+usage: vm/boot-x86.sh [--device reims-vgpu-pci|vmware-svga] [--testing|--interactive|--capture]
+                      [--rail NAME] [--snapshot LABEL]
 
   --device NAME          primary VGA (default: reims-vgpu-pci)
                          reims-vgpu-pci   product Reims VGPU (PCI thin shim → reims-vgpu),
@@ -109,14 +183,22 @@ usage: vm/boot-x86.sh [--device reims-vgpu-pci|vmware-svga] [--testing|--interac
                                             no GPU output once the guest uses Reims vGPU)
   --testing              agent boot (default): GUI, ${TESTING_TIMEOUT}s hard kill, reverts
   --interactive          human/GUI boot, no time limit, reverts
-  --snapshot             boot writable; a clean guest shutdown CAPTURES a new snapshot
-                         (also bootstraps the first snapshot on a fresh guest)
+  --capture              boot writable; a clean guest shutdown CAPTURES a new snapshot
+                         into the selected rail (also bootstraps an empty rail)
+  --rail NAME            guest OS line to boot, e.g. --rail macos-11.
+                         Default: whatever \`rails/current\` names.
+  --snapshot LABEL       snapshot WITHIN that rail. Default: the rail's own
+                         \`snapshots/current\`. A bare --snapshot (no label) is
+                         the old spelling of --capture.
+  --list-rails           print the rails and exit
+  --list-snapshots       print the selected rail's snapshots and exit
 
-Every boot reverts to the current snapshot:
-  $SNAPSHOTS_DIR/current -> <label>/{macos.img,OpenCore.qcow2,OVMF_VARS.fd}
+Both selections are per-boot and repoint no \`current\`. Layout:
+  $RAILS_DIR/<rail>/snapshots/<label>/{macos.img,OpenCore.qcow2,OVMF_VARS.fd[,OVMF_CODE.fd]}
+Change the default rail with:  ln -sfn <rail> $RAILS_DIR/current
 Always builds reims-vgpu-efi and reims-vgpu before boot. In-tree QEMU is rebuilt
 unless QEMU_BIN is set to something other than the default path.
-Env: DISKS_DIR OVMF_DIR SNAPSHOTS_DIR RUN_DIR QEMU_BIN OVMF_CODE OVMF_VARS_MASTER
+Env: DISKS_DIR OVMF_DIR RAILS_DIR RAIL RUN_DIR QEMU_BIN OVMF_CODE OVMF_VARS_MASTER
      OPENCORE_MASTER DISK_MASTER RAM CPU_SOCKETS CPU_CORES CPU_THREADS CPU_MODEL
      CPU_OPTIONS SSH_PORT TESTING_TIMEOUT QMP_DUMP_TIMEOUT GUEST_MAC REIMS_VGPU_BACKEND
      (metal|vulkan for qemu-build)
@@ -155,7 +237,23 @@ while [ "$#" -gt 0 ]; do
       ;;
     --testing) BOOT_CLASS="testing"; shift ;;
     --interactive) BOOT_CLASS="interactive"; shift ;;
-    --snapshot) BOOT_CLASS="snapshot"; shift ;;
+    --capture) BOOT_CLASS="capture"; shift ;;
+    --rail) shift; RAIL_LABEL="${1:-}"; [ -n "$RAIL_LABEL" ] || { echo "boot-x86.sh: --rail needs a name" >&2; exit 64; }; shift ;;
+    --rail=*) RAIL_LABEL="${1#--rail=}"; shift ;;
+    # `--snapshot` carries two meanings, kept apart by whether a label follows.
+    # With a label it SELECTS a snapshot within the rail; bare it is the old
+    # capture class, which every existing invocation in this repo's docs and
+    # helper scripts still spells that way. A following `--flag` is the next
+    # option, not a label.
+    --snapshot)
+      case "${2:-}" in
+        ""|-*) BOOT_CLASS="capture"; shift ;;
+        *) SNAPSHOT_LABEL="$2"; shift 2 ;;
+      esac
+      ;;
+    --snapshot=*) SNAPSHOT_LABEL="${1#--snapshot=}"; shift ;;
+    --list-rails) LIST_RAILS=1; shift ;;
+    --list-snapshots) LIST_SNAPSHOTS=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "boot-x86.sh: unknown arg: $1" >&2; usage >&2; exit 64 ;;
   esac
@@ -163,6 +261,106 @@ done
 
 # --- Preflight ------------------------------------------------------------------
 die() { echo "boot-x86.sh: $*" >&2; exit 1; }
+
+# Directory children of a dir; a `current` symlink is -type l, so it is skipped
+# and never lists itself as one of the things it points at.
+list_dir_labels() {
+  find "$1" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | sort
+}
+list_rail_labels() { list_dir_labels "$RAILS_DIR"; }
+list_snapshot_labels() { list_dir_labels "$RAILS_DIR/$RAIL_NAME/snapshots"; }
+
+# A label names one directory directly under its parent. Refusing a path keeps
+# both histories flat, and keeps `--rail ../../elsewhere` from putting a capture
+# outside the tree.
+require_plain_label() {
+  case "$2" in
+    */*|.|..|"") die "$1 takes a plain label, not a path: '$2'" ;;
+  esac
+}
+
+# --- Resolve the rail ------------------------------------------------------------
+# Answered before anything is built — these are questions about the disk tree.
+if [ "$LIST_RAILS" -eq 1 ]; then
+  echo "rails under $RAILS_DIR (current -> $(readlink "$RAILS_DIR/current" 2>/dev/null || echo '(unset)')):"
+  list_rail_labels | while IFS= read -r label; do echo "  $label"; done
+  exit 0
+fi
+
+if [ -n "$RAIL_LABEL" ]; then
+  require_plain_label --rail "$RAIL_LABEL"
+  RAIL_NAME="$RAIL_LABEL"
+else
+  RAIL_NAME="$(readlink "$RAILS_DIR/current" 2>/dev/null || true)"
+  [ -n "$RAIL_NAME" ] || die \
+    "no default rail: $RAILS_DIR/current is unset.
+Pick one per boot with --rail NAME, or set the default:  ln -sfn <rail> $RAILS_DIR/current
+available: $(list_rail_labels | tr '\n' ' ')"
+  # `current` is allowed to be an absolute symlink; reduce it to a name so the
+  # rail reads the same in the log line whichever way it was written.
+  RAIL_NAME="$(basename "$RAIL_NAME")"
+fi
+RAIL_DIR="$RAILS_DIR/$RAIL_NAME"
+SNAPSHOTS_DIR="$RAIL_DIR/snapshots"
+# An unknown rail is always an error. Only an EMPTY one may bootstrap, and only
+# under --capture: a typo'd name would otherwise create the rail on capture and
+# the boot would quietly become a different guest line.
+[ -d "$RAIL_DIR" ] || die \
+  "no rail '$RAIL_NAME' at $RAIL_DIR
+available: $(list_rail_labels | tr '\n' ' ')
+(start a new guest line by creating the directory first:  mkdir -p $RAIL_DIR
+ then bootstrap it with:  vm/boot-x86.sh --rail $RAIL_NAME --capture)"
+
+# --- Resolve the snapshot within that rail ---------------------------------------
+CURRENT="$SNAPSHOTS_DIR/current"
+if [ "$LIST_SNAPSHOTS" -eq 1 ]; then
+  echo "rail '$RAIL_NAME' snapshots under $SNAPSHOTS_DIR (current -> $(readlink "$CURRENT" 2>/dev/null || echo '(unset)')):"
+  list_snapshot_labels | while IFS= read -r label; do echo "  $label"; done
+  exit 0
+fi
+
+if [ -n "$SNAPSHOT_LABEL" ]; then
+  require_plain_label --snapshot "$SNAPSHOT_LABEL"
+  SNAPSHOT_SRC="$SNAPSHOTS_DIR/$SNAPSHOT_LABEL"
+  SNAPSHOT_NAME="$SNAPSHOT_LABEL"
+else
+  SNAPSHOT_SRC="$CURRENT"
+  SNAPSHOT_NAME="$(readlink "$CURRENT" 2>/dev/null || echo current)"
+fi
+
+HAVE_SNAPSHOT=0
+if [ -e "$SNAPSHOT_SRC" ] && \
+   [ -f "$SNAPSHOT_SRC/macos.img" ] && \
+   [ -f "$SNAPSHOT_SRC/OpenCore.qcow2" ] && \
+   [ -f "$SNAPSHOT_SRC/OVMF_VARS.fd" ]; then
+  HAVE_SNAPSHOT=1
+fi
+if [ "$HAVE_SNAPSHOT" -eq 0 ]; then
+  # A named snapshot that is missing or half-populated is an error in every
+  # class. Falling through to the bootstrap path here would silently boot the
+  # provisioned masters — a different guest than the one that was asked for,
+  # and under --capture it would then repoint the rail's `current` at it.
+  [ -z "$SNAPSHOT_LABEL" ] || die \
+    "rail '$RAIL_NAME' has no usable snapshot '$SNAPSHOT_LABEL' at $SNAPSHOT_SRC
+(needs macos.img, OpenCore.qcow2 and OVMF_VARS.fd; OVMF_CODE.fd is optional)
+available: $(list_snapshot_labels | tr '\n' ' ')"
+  [ "$BOOT_CLASS" = "capture" ] || die \
+    "rail '$RAIL_NAME' has no snapshot yet — bootstrap it with:  vm/boot-x86.sh --rail $RAIL_NAME --capture
+(boots the provisioned disk/OpenCore/OVMF_VARS writable for Setup Assistant + config; a clean
+guest shutdown then captures the rail's first immutable snapshot. --testing/--interactive need a
+snapshot to revert to.)"
+  [ -f "$DISK_MASTER" ] || die "no provisioned disk at $DISK_MASTER"
+  [ -f "$OPENCORE_MASTER" ] || die "no OpenCore image at $OPENCORE_MASTER"
+  [ -f "$OVMF_VARS_MASTER" ] || die "no OVMF_VARS master at $OVMF_VARS_MASTER"
+else
+  # The code half of a split OVMF pair belongs to the snapshot that wrote the
+  # vars half. Only adopt it when OVMF_CODE was left at the tree default: an
+  # exported OVMF_CODE is an explicit override and outranks the snapshot.
+  if [ "$OVMF_CODE" = "$OVMF_CODE_DEFAULT" ] && [ -f "$SNAPSHOT_SRC/OVMF_CODE.fd" ]; then
+    OVMF_CODE="$SNAPSHOT_SRC/OVMF_CODE.fd"
+  fi
+fi
+[ -f "$OVMF_CODE" ] || die "OVMF_CODE not found: $OVMF_CODE"
 
 # metal2vulkan spawns `llvm-dis` and `spirv-val` on every uncached shader
 # translate, and QEMU inherits this script's PATH — resolve them here so a
@@ -221,27 +419,7 @@ else
   echo "boot-x86.sh: QEMU_BIN pinned ($QEMU_BIN) — not building; the staticlib is already linked in"
 fi
 [ -x "$QEMU_BIN" ] || die "QEMU not available: $QEMU_BIN"
-[ -f "$OVMF_CODE" ] || die "OVMF_CODE not found: $OVMF_CODE"
 [ -r /dev/kvm ] || die "KVM not available (/dev/kvm); is kvm loaded and are you in the kvm group?"
-
-CURRENT="$SNAPSHOTS_DIR/current"
-HAVE_SNAPSHOT=0
-if [ -e "$CURRENT" ] && \
-   [ -f "$CURRENT/macos.img" ] && \
-   [ -f "$CURRENT/OpenCore.qcow2" ] && \
-   [ -f "$CURRENT/OVMF_VARS.fd" ]; then
-  HAVE_SNAPSHOT=1
-fi
-if [ "$HAVE_SNAPSHOT" -eq 0 ]; then
-  [ "$BOOT_CLASS" = "snapshot" ] || die \
-    "no snapshot yet — bootstrap it with:  vm/boot-x86.sh --snapshot
-(boots the provisioned disk/OpenCore/OVMF_VARS writable for Setup Assistant + config; a clean
-guest shutdown then captures the first immutable snapshot. --testing/--interactive need a
-snapshot to revert to.)"
-  [ -f "$DISK_MASTER" ] || die "no provisioned disk at $DISK_MASTER"
-  [ -f "$OPENCORE_MASTER" ] || die "no OpenCore image at $OPENCORE_MASTER"
-  [ -f "$OVMF_VARS_MASTER" ] || die "no OVMF_VARS master at $OVMF_VARS_MASTER"
-fi
 
 # --- Choose the boot disk: revert-clone, or bootstrap write-through -------------
 mkdir -p "$RUN_DIR"
@@ -275,16 +453,17 @@ if [ "$HAVE_SNAPSHOT" -eq 0 ]; then
   OPENCORE="$OPENCORE_MASTER"
   OVMF_VARS="$OVMF_VARS_MASTER"
   IS_CLONE=0
-  echo "boot-x86.sh: bootstrap — booting provisioned masters write-through (no snapshot yet) ..."
+  SNAPSHOT_NAME="(bootstrap)"
+  echo "boot-x86.sh: rail '$RAIL_NAME' — bootstrap; booting provisioned masters write-through (rail is empty) ..."
 else
   DISK="$RUN_DIR/macos-$STAMP.img"
   OPENCORE="$RUN_DIR/OpenCore-$STAMP.qcow2"
   OVMF_VARS="$RUN_DIR/OVMF_VARS-$STAMP.fd"
   IS_CLONE=1
-  echo "boot-x86.sh: reverting to snapshot '$(readlink "$CURRENT" 2>/dev/null || echo current)' ..."
-  clone_file "$CURRENT/macos.img" "$DISK"
-  clone_file "$CURRENT/OpenCore.qcow2" "$OPENCORE"
-  clone_file "$CURRENT/OVMF_VARS.fd" "$OVMF_VARS"
+  echo "boot-x86.sh: rail '$RAIL_NAME' — reverting to snapshot '$SNAPSHOT_NAME' ($SNAPSHOT_SRC) ..."
+  clone_file "$SNAPSHOT_SRC/macos.img" "$DISK"
+  clone_file "$SNAPSHOT_SRC/OpenCore.qcow2" "$OPENCORE"
+  clone_file "$SNAPSHOT_SRC/OVMF_VARS.fd" "$OVMF_VARS"
   chmod u+w "$DISK" "$OPENCORE" "$OVMF_VARS"
 fi
 
@@ -307,6 +486,28 @@ if [ "$GFX_DEVICE" = "reims-vgpu-pci" ]; then
   fi
 fi
 
+# --- Pick the audio backend -----------------------------------------------------
+# Preference order, first that this build has. Native host backends come first
+# because each runs its own thread with its own ring, so a late QEMU main loop
+# costs latency there instead of silence; SDL is last because its callback fills
+# the gap with zeroes and says nothing. See the AUDIO note in the header.
+if [ -z "$AUDIODEV" ]; then
+  case "$(uname -s)" in
+    Darwin) AUDIO_PREFERENCE="coreaudio sdl none" ;;
+    *)      AUDIO_PREFERENCE="pipewire pa alsa sdl none" ;;
+  esac
+  AUDIO_AVAILABLE="$("$QEMU_BIN" -audiodev help 2>/dev/null)"
+  for candidate in $AUDIO_PREFERENCE; do
+    if printf '%s\n' "$AUDIO_AVAILABLE" | grep -qx "  *$candidate" \
+       || printf '%s\n' "$AUDIO_AVAILABLE" | grep -qx "$candidate"; then
+      AUDIODEV="$candidate"
+      break
+    fi
+  done
+  # `none` is always compiled in, so this only fires if the query itself failed.
+  AUDIODEV="${AUDIODEV:-none}"
+fi
+
 # --- Build the QEMU command line ------------------------------------------------
 # q35 + OVMF + AppleSMC + SATA OpenCore/HDD. Display is attached below.
 QEMU_ARGS=(
@@ -323,8 +524,8 @@ QEMU_ARGS=(
   -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE"
   -drive "if=pflash,format=raw,file=$OVMF_VARS"
   -smbios type=2
-  -audiodev sdl,id=audio0
-  -device usb-audio,bus=xhci.0,audiodev=audio0
+  -audiodev "$AUDIODEV,id=audio0,out.buffer-length=$AUDIO_BUFFER_US"
+  -device "usb-audio,bus=xhci.0,audiodev=audio0,buffer=$AUDIO_USB_BUFFER"
   -device ich9-ahci,id=sata
   -drive "id=OpenCoreBoot,if=none,format=qcow2,file=$OPENCORE"
   -device ide-hd,bus=sata.2,drive=OpenCoreBoot
@@ -399,7 +600,8 @@ else
   QEMU_ARGS+=(-nic none)
 fi
 
-echo "boot-x86.sh: device=$GFX_DEVICE class=$BOOT_CLASS cpu=$CPU_MODEL smp=${CPU_THREADS},cores=${CPU_CORES} mem=$RAM reboot=${QEMU_REBOOT_ACTION}"
+echo "boot-x86.sh: device=$GFX_DEVICE class=$BOOT_CLASS rail=$RAIL_NAME snapshot=$SNAPSHOT_NAME cpu=$CPU_MODEL smp=${CPU_THREADS},cores=${CPU_CORES} mem=$RAM reboot=${QEMU_REBOOT_ACTION}"
+echo "boot-x86.sh: audiodev=$AUDIODEV out.buffer-length=${AUDIO_BUFFER_US}us usb-audio buffer=${AUDIO_USB_BUFFER}"
 echo "boot-x86.sh: ssh → localhost:$SSH_PORT   serial → $SERIAL_LOG   qmp → $QMP_SOCK"
 [ -n "$TRACE_LOG" ] && echo "boot-x86.sh: trace → $TRACE_LOG ($TRACE_SPEC)"
 
@@ -419,6 +621,10 @@ discard_clone() {
   fi
 }
 
+# Captures land in the SELECTED rail, next to the snapshot they descend from,
+# and repoint only that rail's `current`. Nothing here touches `rails/current`:
+# capturing on one guest line must not silently move what the next bare boot
+# gets, which is the failure a flat snapshot namespace made easy.
 promote_to_snapshot() {
   local label new_dir
   if [ "$HAVE_SNAPSHOT" -eq 0 ]; then
@@ -427,18 +633,25 @@ promote_to_snapshot() {
     label="$(date +%Y-%m-%d-%H%M%S)-snap"
   fi
   new_dir="$SNAPSHOTS_DIR/$label"
-  echo "boot-x86.sh: capturing new immutable snapshot '$label' ..."
+  echo "boot-x86.sh: rail '$RAIL_NAME' — capturing new immutable snapshot '$label' ..."
   mkdir -p "$new_dir"
   clone_file "$DISK" "$new_dir/macos.img"
   clone_file "$OPENCORE" "$new_dir/OpenCore.qcow2"
   clone_file "$OVMF_VARS" "$new_dir/OVMF_VARS.fd"
   chmod 444 "$new_dir/macos.img" "$new_dir/OpenCore.qcow2" "$new_dir/OVMF_VARS.fd"
+  # Carry the code half forward whenever it is not the tree default: the vars
+  # just captured are only meaningful to the OVMF build that wrote them, and a
+  # descendant that inherited only the vars would boot against the wrong pair.
+  if [ "$OVMF_CODE" != "$OVMF_CODE_DEFAULT" ]; then
+    clone_file "$OVMF_CODE" "$new_dir/OVMF_CODE.fd"
+    chmod 444 "$new_dir/OVMF_CODE.fd"
+  fi
   ln -sfn "$label" "$CURRENT"
   discard_clone
-  echo "boot-x86.sh: snapshot '$label' captured; current -> $label"
+  echo "boot-x86.sh: snapshot '$label' captured; rail '$RAIL_NAME' current -> $label"
 }
 
-# --- Interactive / snapshot: foreground GUI, no time limit ----------------------
+# --- Interactive / capture: foreground GUI, no time limit -----------------------
 # Display backend: the supported reims-vgpu-pci path is the custom Rust host
 # window (REIMS_VGPU_WINDOW=1), so QEMU defaults to `-display none` and owns no UI
 # window. The older QEMU `gtk,gl=on` display path is deprecated for product work;
@@ -515,16 +728,16 @@ else
   REIMS_VGPU_DISPLAY="${REIMS_VGPU_DISPLAY:-gtk}"
 fi
 
-if [ "$BOOT_CLASS" = "interactive" ] || [ "$BOOT_CLASS" = "snapshot" ]; then
+if [ "$BOOT_CLASS" = "interactive" ] || [ "$BOOT_CLASS" = "capture" ]; then
   # gtk display + serial multiplexed with the monitor on stdio (Apple EB logs on console).
   QEMU_ARGS+=(-display "$REIMS_VGPU_DISPLAY" -serial mon:stdio)
   rc=0
   "$QEMU_BIN" "${QEMU_ARGS[@]}" || rc=$?
-  if [ "$BOOT_CLASS" = "snapshot" ] && [ "$rc" -eq 0 ]; then
+  if [ "$BOOT_CLASS" = "capture" ] && [ "$rc" -eq 0 ]; then
     # mon:stdio does not fill SERIAL_LOG; promote on clean QEMU exit.
     promote_to_snapshot
   else
-    [ "$BOOT_CLASS" = "snapshot" ] && echo "boot-x86.sh: qemu exited rc=$rc (not clean) — snapshot NOT updated"
+    [ "$BOOT_CLASS" = "capture" ] && echo "boot-x86.sh: qemu exited rc=$rc (not clean) — snapshot NOT updated"
     discard_clone
   fi
   exit "$rc"
@@ -650,6 +863,27 @@ BOOT_ABORT_RE='#\[EB\|STOP\]|Boot failed - Aborted'
 PANIC_RE='Debugger called: <panic>'
 PANIC_KEEP_DIR="${PANIC_KEEP_DIR:-/tmp/reims-vgpu-panics}"
 
+# A panic is reachable from two places — the poll loop below, and the path after
+# QEMU exits on its own, because `-action reboot=shutdown` turns the panic reboot
+# into an exit that otherwise reads as a clean guest shutdown. Both say the same
+# thing about the same log, so both go through these two functions. They were
+# written out twice, and a second copy of a report is exactly where the keep-dir,
+# the exit code or the `-A2` drift apart without either arm looking wrong.
+serial_has_panic() {
+  [ -s "$SERIAL_LOG" ] && grep -qF "$PANIC_RE" "$SERIAL_LOG" 2>/dev/null
+}
+
+report_panic_and_revert() {
+  local kept
+  kept="$PANIC_KEEP_DIR/$(basename "$SERIAL_LOG")"
+  echo "boot-x86.sh: $1"
+  grep -A2 -F "$PANIC_RE" "$SERIAL_LOG" 2>/dev/null | head -6
+  mkdir -p "$PANIC_KEEP_DIR"
+  cp -f "$SERIAL_LOG" "$kept" 2>/dev/null || true
+  echo "boot-x86.sh: serial log kept at $kept"
+  capture_then_revert "guest kernel panic"
+}
+
 elapsed=0
 while kill -0 "$QEMU_PID" 2>/dev/null; do
   if [ "$elapsed" -ge "$TESTING_TIMEOUT" ]; then
@@ -663,13 +897,8 @@ while kill -0 "$QEMU_PID" 2>/dev/null; do
     capture_then_revert "boot.efi aborted — firmware boot failure, not a device wedge"
     exit 125
   fi
-  if [ -s "$SERIAL_LOG" ] && grep -qF "$PANIC_RE" "$SERIAL_LOG" 2>/dev/null; then
-    echo "boot-x86.sh: GUEST KERNEL PANIC."
-    grep -A2 -F "$PANIC_RE" "$SERIAL_LOG" 2>/dev/null | head -6
-    mkdir -p "$PANIC_KEEP_DIR"
-    cp -f "$SERIAL_LOG" "$PANIC_KEEP_DIR/$(basename "$SERIAL_LOG")" 2>/dev/null || true
-    echo "boot-x86.sh: serial log kept at $PANIC_KEEP_DIR/$(basename "$SERIAL_LOG")"
-    capture_then_revert "guest kernel panic"
+  if serial_has_panic; then
+    report_panic_and_revert "GUEST KERNEL PANIC."
     exit 126
   fi
   sleep 5
@@ -680,13 +909,8 @@ wait "$QEMU_PID" 2>/dev/null || true
 # QEMU exiting on its own is normally a guest shutdown, but `-action
 # reboot=shutdown` makes a panic reboot look identical. Check before saying
 # nothing happened.
-if [ -s "$SERIAL_LOG" ] && grep -qF "$PANIC_RE" "$SERIAL_LOG" 2>/dev/null; then
-  echo "boot-x86.sh: GUEST KERNEL PANIC (qemu exited on the panic reboot)."
-  grep -A2 -F "$PANIC_RE" "$SERIAL_LOG" 2>/dev/null | head -6
-  mkdir -p "$PANIC_KEEP_DIR"
-  cp -f "$SERIAL_LOG" "$PANIC_KEEP_DIR/$(basename "$SERIAL_LOG")" 2>/dev/null || true
-  echo "boot-x86.sh: serial log kept at $PANIC_KEEP_DIR/$(basename "$SERIAL_LOG")"
-  capture_then_revert "guest kernel panic"
+if serial_has_panic; then
+  report_panic_and_revert "GUEST KERNEL PANIC (qemu exited on the panic reboot)."
   exit 126
 fi
 capture_then_revert "qemu exited"

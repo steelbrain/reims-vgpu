@@ -32,6 +32,8 @@
 
 use ash::vk;
 
+use crate::contract::pixel_format::TexelLayout;
+
 /// How this device can satisfy `MTLSamplerAddressModeMirrorClampToEdge`.
 ///
 /// Three rungs rather than a bool, because *how* it is available decides what
@@ -129,17 +131,55 @@ pub struct DeviceFeatures {
     pub shader_int16: bool,
     pub storage_image_extended_formats: bool,
     pub storage_image_write_without_format: bool,
+    /// `shaderStorageImageReadWithoutFormat`. The read half of the pair above:
+    /// an `OpImageRead` from an `Unknown`-format storage image needs it, and a
+    /// translated kernel may contain one whether or not this device asked for
+    /// the format-less view. Requested so the SPIR-V capability can be declared
+    /// when a module turns out to need it.
+    pub storage_image_read_without_format: bool,
     /// `B8G8R8A8_UNORM` usable as a storage image with optimal tiling. **Not**
     /// spec-mandatory — only `R8G8B8A8_UNORM` is — so the BGRA composite path
     /// needs this *and* `storage_image_write_without_format`.
     pub bgra8_storage: bool,
-    /// `R32_SFLOAT` usable as a sampled image with **linear** filtering under
-    /// optimal tiling. Single-channel float32 color-management LUTs
-    /// (`UberCompositeFragment` display-profile pass) are sampled with linear
-    /// interpolation; unlike `R16_SFLOAT`, this feature is *not* spec-mandatory
-    /// and is absent on Apple GPUs, so the native float32 sampled rail is gated
-    /// on it and otherwise leaves the sample fail-visible.
-    pub sampled_r32f_linear_filter: bool,
+    /// For each [`TexelLayout`], indexed by [`TexelLayout::index`], whether its
+    /// Vulkan format is usable as a sampled image with **linear** filtering
+    /// under optimal tiling.
+    ///
+    /// The native sampled rails bind a guest texel layout straight to an image
+    /// and let the sampler read it, with interpolation, so a layout the host
+    /// cannot filter is one those rails must decline. This used to be a single
+    /// `bool` for `R32_SFLOAT` — the one layout then known to be optional —
+    /// and every other layout was admitted on the reading that the spec's
+    /// mandatory-format table covered it. That reading is an API-version
+    /// assumption of exactly the kind `AGENTS.md` says to replace with a
+    /// capability, and it does not even hold for the set already here:
+    /// `R16_UNORM`'s linear-filter feature is optional too.
+    ///
+    /// Asking per layout also makes the gate impossible to forget. A new
+    /// [`TexelLayout`] gets an entry because the array is sized by
+    /// `TexelLayout::ALL.len()`, rather than needing someone to remember to add
+    /// a second `bool`.
+    pub sampled_linear_filter: [bool; TexelLayout::ALL.len()],
+    /// For each [`TexelLayout`], indexed by [`TexelLayout::index`], whether its
+    /// Vulkan format is usable as a **colour attachment that blends** under
+    /// optimal tiling.
+    ///
+    /// A render target's resident is created at the format the guest declared
+    /// for the attachment, so a layout this host cannot render to — or can
+    /// render to but not blend into — is one that must fall back to the
+    /// engine's eight-bit resident rather than be attempted. Both feature bits
+    /// are required together because a colour attachment that cannot blend is
+    /// not a usable render target for a compositor, and admitting one on the
+    /// strength of the other trades a fidelity loss for a `vkCreateImage` that
+    /// fails or a pipeline the driver refuses.
+    ///
+    /// Asked per layout for the same reason as [`Self::sampled_linear_filter`]
+    /// directly above: the array is sized by `ALL.len()`, so a new
+    /// [`TexelLayout`] cannot reach a render target without getting a probe.
+    /// `R16G16B16A16_SFLOAT` is in Vulkan's mandatory format table for both
+    /// bits, but AGENTS.md is explicit that a capability comes from the device
+    /// and not from a reading of the spec's table.
+    pub color_attachment_blend: [bool; TexelLayout::ALL.len()],
     pub storage16: bool,
     pub storage8: bool,
     pub float16: bool,
@@ -242,6 +282,7 @@ impl DeviceFeatures {
             .shader_int16(self.shader_int16)
             .shader_storage_image_extended_formats(self.storage_image_extended_formats)
             .shader_storage_image_write_without_format(self.storage_image_write_without_format)
+            .shader_storage_image_read_without_format(self.storage_image_read_without_format)
             .dual_src_blend(self.dual_src_blend)
             .fill_mode_non_solid(self.fill_mode_non_solid)
             .depth_clamp(self.depth_clamp)
@@ -278,6 +319,91 @@ impl DeviceFeatures {
         vk::PhysicalDeviceShaderFloat16Int8Features::default()
             .shader_float16(self.float16)
             .shader_int8(self.int8)
+    }
+
+    /// One line naming every feature and limit this backend resolved against the
+    /// bound device, so a boot says what it turned on and what it did without.
+    ///
+    /// # Why this destructures instead of reading fields
+    ///
+    /// A report built from field accesses goes stale the moment a field is
+    /// added: the new capability is queried, gates a rail, and is invisible in
+    /// every log — which is the same silence `device_features` was created to
+    /// end, one level up. A `let Self { .. }` pattern with no rest binding makes
+    /// the compiler refuse to build until the new field is named here, so the
+    /// line cannot fall behind the struct. Do not add `..` to it.
+    ///
+    /// The two per-layout arrays are reported as the layouts that came back
+    /// **false**, because that is the actionable set and it is usually empty; a
+    /// bitfield per layout would be denser and unreadable in a bug report.
+    pub fn report_line(&self) -> String {
+        let Self {
+            robust_buffer_access,
+            sampler_anisotropy,
+            max_sampler_anisotropy,
+            max_image_dimension_2d,
+            max_compute_workgroup_invocations,
+            subgroup_size,
+            max_compute_workgroup_size,
+            max_compute_shared_memory_bytes,
+            max_sample_count,
+            d24_unorm_s8_attachment,
+            shader_int16,
+            storage_image_extended_formats,
+            storage_image_write_without_format,
+            storage_image_read_without_format,
+            bgra8_storage,
+            sampled_linear_filter,
+            color_attachment_blend,
+            storage16,
+            storage8,
+            float16,
+            int8,
+            shader_output_viewport_index,
+            timeline_semaphore,
+            mirror_clamp_to_edge,
+            dual_src_blend,
+            fill_mode_non_solid,
+            depth_clamp,
+            multi_viewport,
+            max_viewports,
+            occlusion_query_precise,
+        } = self;
+        let missing = |probes: &[bool; TexelLayout::ALL.len()]| {
+            let names: Vec<String> = TexelLayout::ALL
+                .iter()
+                .filter(|l| !probes[l.index()])
+                .map(|l| format!("{l:?}"))
+                .collect();
+            if names.is_empty() {
+                "none".to_owned()
+            } else {
+                names.join(",")
+            }
+        };
+        format!(
+            "vk_features robust_buffer_access={robust_buffer_access} \
+             sampler_anisotropy={sampler_anisotropy} max_sampler_anisotropy={max_sampler_anisotropy} \
+             max_image_dimension_2d={max_image_dimension_2d} \
+             max_compute_workgroup_invocations={max_compute_workgroup_invocations} \
+             subgroup_size={subgroup_size} \
+             max_compute_workgroup_size={max_compute_workgroup_size:?} \
+             max_compute_shared_memory_bytes={max_compute_shared_memory_bytes} \
+             max_sample_count={max_sample_count} d24_unorm_s8_attachment={d24_unorm_s8_attachment} \
+             shader_int16={shader_int16} \
+             storage_image_extended_formats={storage_image_extended_formats} \
+             storage_image_write_without_format={storage_image_write_without_format} \
+             storage_image_read_without_format={storage_image_read_without_format} \
+             bgra8_storage={bgra8_storage} no_linear_filter={} no_blendable_attachment={} \
+             storage16={storage16} storage8={storage8} float16={float16} int8={int8} \
+             shader_output_viewport_index={shader_output_viewport_index} \
+             timeline_semaphore={timeline_semaphore} mirror_clamp_to_edge={mirror_clamp_to_edge:?} \
+             dual_src_blend={dual_src_blend} fill_mode_non_solid={fill_mode_non_solid} \
+             depth_clamp={depth_clamp} multi_viewport={multi_viewport} max_viewports={max_viewports} \
+             occlusion_query_precise={occlusion_query_precise}",
+            missing(sampled_linear_filter),
+            missing(color_attachment_blend),
+        )
     }
 
     /// Device extension names this feature set requires, beyond the ones the
@@ -334,13 +460,26 @@ pub unsafe fn query(
     .optimal_tiling_features
     .contains(vk::FormatFeatureFlags::STORAGE_IMAGE);
 
-    // R32_SFLOAT linear filtering is optional (absent on Apple/MoltenVK); ask
-    // rather than assume, so the native float32 sampled LUT rail can decline
-    // where the host cannot filter it.
-    let sampled_r32f_linear_filter =
-        unsafe { instance.get_physical_device_format_properties(pd, vk::Format::R32_SFLOAT) }
-            .optimal_tiling_features
-            .contains(vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR);
+    // One probe per sampled texel layout, so the native rails decline a layout
+    // this host cannot filter instead of sampling it wrong. Derived from
+    // `TexelLayout::ALL`, so adding a layout adds its probe.
+    let mut sampled_linear_filter = [false; TexelLayout::ALL.len()];
+    // The same derivation for the render-target side: a resident is created at
+    // the guest's declared format, so a layout has to be renderable *and*
+    // blendable before one may be.
+    let mut color_attachment_blend = [false; TexelLayout::ALL.len()];
+    for &layout in TexelLayout::ALL {
+        let format = crate::backend::vulkan::translate::pixel::vk_texel_layout(layout);
+        let features =
+            unsafe { instance.get_physical_device_format_properties(pd, format) }
+                .optimal_tiling_features;
+        sampled_linear_filter[layout.index()] =
+            features.contains(vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR);
+        color_attachment_blend[layout.index()] = features.contains(
+            vk::FormatFeatureFlags::COLOR_ATTACHMENT
+                | vk::FormatFeatureFlags::COLOR_ATTACHMENT_BLEND,
+        );
+    }
 
     // The guest is handed ONE sample-count answer and uses it for colour
     // attachments, depth attachments and sampled images alike, so the honest
@@ -408,8 +547,11 @@ pub unsafe fn query(
         storage_image_extended_formats: supported.shader_storage_image_extended_formats == vk::TRUE,
         storage_image_write_without_format: supported.shader_storage_image_write_without_format
             == vk::TRUE,
+        storage_image_read_without_format: supported.shader_storage_image_read_without_format
+            == vk::TRUE,
         bgra8_storage,
-        sampled_r32f_linear_filter,
+        sampled_linear_filter,
+        color_attachment_blend,
         storage16: supported_16.storage_buffer16_bit_access == vk::TRUE,
         storage8: supported_8.storage_buffer8_bit_access == vk::TRUE,
         float16: supported_f16i8.shader_float16 == vk::TRUE,
@@ -440,8 +582,10 @@ mod tests {
             shader_int16: true,
             storage_image_extended_formats: true,
             storage_image_write_without_format: true,
+            storage_image_read_without_format: true,
             bgra8_storage: true,
-            sampled_r32f_linear_filter: true,
+            sampled_linear_filter: [true; TexelLayout::ALL.len()],
+            color_attachment_blend: [true; TexelLayout::ALL.len()],
             storage16: true,
             storage8: true,
             float16: true,
@@ -665,6 +809,48 @@ mod tests {
             2,
             "the second viewport must reach the pipeline's slot count"
         );
+    }
+
+    /// The boot line reports a feature that came back **false** as false rather
+    /// than omitting it.
+    ///
+    /// This is the whole reason the line exists beside `vk_device_select`: a rail
+    /// that declines by name and a rail that was never asked for read the same in
+    /// a log that only prints what was enabled, and they are different bug
+    /// reports. Both directions are asserted, because a line that printed only
+    /// the false ones would have the same defect mirrored.
+    #[test]
+    fn the_feature_line_reports_both_directions() {
+        let on = all_supported().report_line();
+        assert!(on.starts_with("vk_features "), "{on}");
+        assert!(on.contains("depth_clamp=true"), "{on}");
+        assert!(on.contains("timeline_semaphore=true"), "{on}");
+        assert!(on.contains("subgroup_size=64"), "{on}");
+        // The layout probes report the *missing* set, which is empty here.
+        assert!(on.contains("no_linear_filter=none"), "{on}");
+        assert!(on.contains("no_blendable_attachment=none"), "{on}");
+
+        let off = DeviceFeatures::default().report_line();
+        assert!(off.contains("depth_clamp=false"), "{off}");
+        assert!(off.contains("timeline_semaphore=false"), "{off}");
+        assert!(
+            off.contains("mirror_clamp_to_edge=Unsupported"),
+            "the rung, not a bool: which spelling a device has decides what is \
+             requested at create time — {off}"
+        );
+    }
+
+    /// A layout the host cannot filter is named on the line, so "the sampled rail
+    /// declined" is answerable from one boot's log rather than from a second run
+    /// with a probe.
+    #[test]
+    fn the_feature_line_names_the_layouts_a_host_cannot_serve() {
+        let mut f = all_supported();
+        f.sampled_linear_filter[TexelLayout::R32Float.index()] = false;
+        let line = f.report_line();
+        assert!(line.contains("no_linear_filter=R32Float"), "{line}");
+        // The other array is independent and must not be dragged along.
+        assert!(line.contains("no_blendable_attachment=none"), "{line}");
     }
 
     /// A device that advertises no `multiViewport` reports a limit of one, and

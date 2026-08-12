@@ -206,7 +206,7 @@ impl ResourcePools {
         counters.note_create();
         let req = ctx.device.get_image_memory_requirements(image);
         let mt = ctx
-            .memory_type_for(req.memory_type_bits, MemoryClass::DeviceLocal)
+            .memory_type_for(req.memory_type_bits, req.size, MemoryClass::DeviceLocal)
             .ok_or({
                 DrawError::Unsupported(reason::DrawReason::NoDeviceLocalMemoryForStorageImage {
                     memory_type_bits: req.memory_type_bits,
@@ -928,13 +928,17 @@ impl ResourcePools {
         height: u32,
         render_pass: vk::RenderPass,
         generation: u64,
-        bgra: bool,
+        format: vk::Format,
         counters: &EngineCounters,
     ) -> Result<&ResidentTargetSlot, DrawError> {
+        // The format arrives resolved rather than as a channel-order flag, and
+        // from the same variable that built `render_pass`'s key — an image and
+        // the pass it is attached to must name one format, and deriving it
+        // twice from a shared input is how they drift apart.
+        //
         // Compatible geometry + gen + format: reuse image; rebuild FB if pass
         // changed. A format change must recreate the image, not just the
         // framebuffer — an RGBA image under a BGRA pass is invalid.
-        let format = translate::pixel::resident_color(bgra);
         if let Some(slot) = self.registry.get(&identity) {
             if slot.reusable_for(width, height, generation, format) {
                 if slot.render_pass == render_pass {
@@ -1213,7 +1217,7 @@ impl ResourcePools {
             counters.note_create();
             let ireq = ctx.device.get_image_memory_requirements(image);
             let imt = ctx
-                .memory_type_for(ireq.memory_type_bits, MemoryClass::DeviceLocal)
+                .memory_type_for(ireq.memory_type_bits, ireq.size, MemoryClass::DeviceLocal)
                 .ok_or_else(|| {
                     ctx.device.destroy_image(image, None);
                     DrawError::Unsupported(reason::DrawReason::NoDeviceLocalMemoryForMrtSecondary {
@@ -1421,7 +1425,7 @@ impl ResourcePools {
         counters.note_create();
         let ireq = ctx.device.get_image_memory_requirements(image);
         let imt = ctx
-            .memory_type_for(ireq.memory_type_bits, MemoryClass::DeviceLocal)
+            .memory_type_for(ireq.memory_type_bits, ireq.size, MemoryClass::DeviceLocal)
             .ok_or_else(|| {
                 ctx.device.destroy_image(image, None);
                 DrawError::Unsupported(reason::DrawReason::NoDeviceLocalMemoryForDepth {
@@ -2270,6 +2274,7 @@ pub(super) mod pin_count_tests {
             width: 16,
             height: 16,
             generation: 0,
+            format: translate::pixel::SCANOUT_FORMAT,
         }
     }
 
@@ -2421,6 +2426,7 @@ pub(super) mod pin_count_tests {
             width: 16,
             height: 16,
             generation: 1,
+            format: translate::pixel::SCANOUT_FORMAT,
         }
     }
 

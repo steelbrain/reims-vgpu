@@ -17,6 +17,7 @@ use crate::backend::vulkan::caps::memory_topology::{
     classify_memory, select_memory_type, MappedMemoryKind, MemoryClass, MemoryRequest,
 };
 use crate::backend::vulkan::caps::{DriverQuirk, HostGpuCaps};
+use crate::contract::pixel_format::TexelLayout;
 
 /// Max device recreates **that produce no guest work between them**.
 ///
@@ -40,6 +41,43 @@ pub const FENCE_TIMEOUT_NS: u64 = 5_000_000_000; // 5s
 /// Header): u32 headerSize, u32 headerVersion, u32 vendorID, u32 deviceID,
 /// u8[16] pipelineCacheUUID — all integers little-endian.
 const PIPELINE_CACHE_HEADER_ONE_LEN: usize = 32;
+
+/// Largest warm-start blob worth handing the driver, and largest worth writing
+/// back.
+///
+/// A `VkPipelineCache` has no eviction: `vkGetPipelineCacheData` returns every
+/// entry it ever accumulated, and this device saves that snapshot to disk and
+/// reloads it next boot. Across many boots of many builds the blob therefore
+/// only grows, and the save policy below orders snapshots by length on the
+/// explicit assumption that a longer one is a better one.
+///
+/// That assumption is false past a few megabytes, and the cost is not small.
+/// Four driven macos-13 hammer boots, identical snapshot and probe, host
+/// quiesced, differing only in the blob on disk:
+///
+/// ```text
+/// loaded      pipeline_misses   pl_compile_us   per compile
+///  30.82 MB        229              0.946 s       4.13 ms
+///  30.82 MB        236              0.932 s       3.95 ms
+///   0.00 MB        220              0.309 s       1.41 ms
+///   3.85 MB        220              0.161 s       0.73 ms
+/// ```
+///
+/// The miss count barely moves — the in-memory `ObjectCache` is empty at boot
+/// either way, so the same ~220 `vkCreateGraphicsPipelines` calls happen. What
+/// changes is what each one costs, and an oversized blob makes it **5.7x** what
+/// a right-sized one costs and **2.9x** what no blob at all costs. A warm cache
+/// is worth having; an unbounded one is worse than none.
+///
+/// Why a large blob costs more per compile is the driver's business and is not
+/// measured here. Size is the observable, so size is what this bounds.
+///
+/// 16 MiB is four times the ~3.9 MB a boot of this workload settles at, so a
+/// workload several times richer still warms fully, and it is half the 30.8 MB
+/// at which the penalty was measured. Growth at steady state is ~0.1 MB a boot
+/// (3.85 -> 3.95 across two boots), so this is ~120 boots of headroom before the
+/// bound is reached and the blob is rebuilt from one boot.
+const PIPELINE_CACHE_MAX_WARM_BYTES: usize = 16 * 1024 * 1024;
 
 /// On-disk pipeline-cache blob location for a device, keyed by its
 /// pipelineCacheUUID (hex) so blobs from other GPUs/driver versions land in
@@ -74,6 +112,15 @@ enum PipelineCacheDecline {
     },
     Incompatible {
         bytes: usize,
+    },
+    /// The blob is well-formed and this device's, but larger than
+    /// [`PIPELINE_CACHE_MAX_WARM_BYTES`], so warming from it would cost more per
+    /// compile than starting cold. Declined by name rather than silently
+    /// ignored: this boot pays real cold-start compiles, and the next boot sees
+    /// a rebuilt blob, so a reader has to be able to tell that from a first boot.
+    TooLarge {
+        bytes: usize,
+        cap: usize,
     },
     WarmCreate {
         result: vk::Result,
@@ -116,6 +163,7 @@ impl crate::observe::Decline for PipelineCacheDecline {
         match self {
             Self::Read { .. } => "vk_pipeline_cache_read",
             Self::Incompatible { .. } => "vk_pipeline_cache_incompatible",
+            Self::TooLarge { .. } => "vk_pipeline_cache_too_large",
             Self::WarmCreate { .. } => "vk_pipeline_cache_warm_create",
             Self::Write { .. } => "vk_pipeline_cache_write",
             Self::Rename { .. } => "vk_pipeline_cache_rename",
@@ -134,6 +182,9 @@ impl crate::observe::Decline for PipelineCacheDecline {
                 ("io_kind", format!("{kind:?}")),
             ],
             Self::Incompatible { bytes } => vec![("bytes", bytes.to_string())],
+            Self::TooLarge { bytes, cap } => {
+                vec![("bytes", bytes.to_string()), ("cap", cap.to_string())]
+            }
             Self::WarmCreate { result } => vec![(
                 "vk_result",
                 result.to_string().replace(char::is_whitespace, "_"),
@@ -196,6 +247,14 @@ fn read_pipeline_cache_blob(
     props: &vk::PhysicalDeviceProperties,
 ) -> Result<Option<Vec<u8>>, PipelineCacheDecline> {
     match std::fs::read(path) {
+        // Size is checked before compatibility only so the larger, cheaper-to-
+        // decide refusal wins the report; both are cold starts either way.
+        Ok(blob) if blob.len() > PIPELINE_CACHE_MAX_WARM_BYTES => {
+            Err(PipelineCacheDecline::TooLarge {
+                bytes: blob.len(),
+                cap: PIPELINE_CACHE_MAX_WARM_BYTES,
+            })
+        }
         Ok(blob) if pipeline_cache_blob_compatible(&blob, props) => Ok(Some(blob)),
         Ok(blob) => Err(PipelineCacheDecline::Incompatible { bytes: blob.len() }),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -256,6 +315,49 @@ impl TimestampProbe {
     pub const SLOTS: u32 = 3;
 }
 
+/// A timestamp pair per submission ring slot: the top of a draw command buffer
+/// and its bottom.
+///
+/// Why a pair per *slot* and not one pair shared: up to
+/// [`super::pools::RING_DEPTH`] command buffers are in flight at once, and a
+/// shared pair would be overwritten by the next submission long before the first
+/// one's fence made it readable. The slot is the natural key because the slot's
+/// fence is exactly the event that makes its pair readable, and the ring already
+/// retires a slot before reusing it — see [`super::gpu_span::SlotSpan`].
+pub(crate) struct DrawSpanProbe {
+    pub pool: vk::QueryPool,
+    /// `VkPhysicalDeviceLimits::timestampPeriod` — nanoseconds per tick.
+    pub ns_per_tick: f32,
+    /// The low `timestampValidBits` of a query result, as a mask.
+    ///
+    /// Vulkan permits a queue family to write fewer than 64 meaningful bits and
+    /// leaves the rest **undefined**, so a raw subtraction of two results is not
+    /// the elapsed ticks on such a host — it is a difference of two numbers whose
+    /// high halves are whatever the driver left there. Masking both operands
+    /// first is the whole fix, and a counter that wraps within the mask is then a
+    /// wrapping subtract rather than a garbage one. 32 valid bits at a 1 ns tick
+    /// wraps every 4.3 s, which a per-second census crosses regularly.
+    pub valid_mask: u64,
+}
+
+impl DrawSpanProbe {
+    /// Queries per ring slot: the top stamp and the bottom stamp.
+    pub const PER_SLOT: u32 = 2;
+
+    /// First query index belonging to ring slot `slot`.
+    pub const fn base(slot: usize) -> u32 {
+        slot as u32 * Self::PER_SLOT
+    }
+
+    /// Elapsed nanoseconds between two raw query results, masked to the bits the
+    /// queue family actually writes and treating a wrap within that width as a
+    /// wrap rather than as an enormous negative.
+    pub fn elapsed_ns(&self, top: u64, bottom: u64) -> u64 {
+        let span = (bottom & self.valid_mask).wrapping_sub(top & self.valid_mask) & self.valid_mask;
+        (span as f64 * self.ns_per_tick as f64) as u64
+    }
+}
+
 pub(crate) struct DeviceContext {
     pub _entry: ash::Entry,
     pub instance: ash::Instance,
@@ -289,9 +391,24 @@ pub(crate) struct DeviceContext {
     /// storage surface without an R/B swap (SPIR-V has no `Bgra8` storage
     /// format). Universally present on desktop NVIDIA / Mesa ANV / RADV.
     pub storage_image_write_without_format: bool,
-    /// `R32_SFLOAT` usable as a linearly-filtered sampled image; gates the
-    /// native float32 color-LUT sampled rail (see [`DeviceFeatures`]).
-    pub sampled_r32f_linear_filter: bool,
+    /// The raw `shaderStorageImageWriteWithoutFormat` /
+    /// `shaderStorageImageReadWithoutFormat` /
+    /// `shaderStorageImageExtendedFormats` features, unmixed with any surface
+    /// question.
+    ///
+    /// [`Self::storage_image_write_without_format`] above is the *BGRA compositing*
+    /// answer — it also requires a BGRA8 storage surface — so it is the wrong
+    /// gate for "may this module declare the capability". Declaring one whose
+    /// feature was not enabled at device creation is invalid usage, and an
+    /// invalid module is undefined behaviour inside a driver rather than an
+    /// error it returns, so the two questions get two fields.
+    pub spirv_storage_write_without_format: bool,
+    pub spirv_storage_read_without_format: bool,
+    pub spirv_storage_extended_formats: bool,
+    /// For each [`crate::contract::pixel_format::TexelLayout`], whether this
+    /// host can sample its Vulkan format with linear filtering; gates the
+    /// native sampled rails (see [`DeviceFeatures::sampled_linear_filter`]).
+    pub sampled_linear_filter: [bool; TexelLayout::ALL.len()],
     pub pipeline_cache: vk::PipelineCache,
     pub vertex_divisor: VertexDivisorCapabilities,
     /// Offset alignment a guest-window import must satisfy before a draw may
@@ -307,6 +424,15 @@ pub(crate) struct DeviceContext {
     /// which implementations may require to be component-aligned — 16 bytes is
     /// the largest component-size any vertex format has.
     pub guest_bind_offset_align: u64,
+    /// The widest span this device will bind as one storage buffer, from
+    /// `VkPhysicalDeviceLimits::maxStorageBufferRange`.
+    ///
+    /// Read rather than assumed because a guest RAMBlock is routinely wider than
+    /// it — a 16 GiB guest against a limit that is a `uint32_t` — so the
+    /// guest-scatter kernel binds a window over the block rather than the block,
+    /// and this is the bound that window is checked against. See
+    /// [`super::guest_scatter::build_run_table`].
+    pub max_storage_buffer_range: u64,
     /// Which vertex attribute formats this device accepts in a vertex buffer,
     /// probed once. Vulkan makes the three-component 8/16-bit formats optional,
     /// so a pipeline resolves each attribute through this rather than assuming
@@ -333,6 +459,18 @@ pub(crate) struct DeviceContext {
     /// caller cannot tell GPU work from the latency of asking. See
     /// [`TimestampProbe`].
     pub timestamps: Option<TimestampProbe>,
+    /// Two timestamps per ring slot, for the GPU execution time of a draw
+    /// submission. `None` on the same two capability answers as
+    /// [`Self::timestamps`], and additionally when [`crate::env::GPU_SPANS`] is
+    /// off — which is the whole of how that switch narrows, because a `None` here
+    /// means no query is ever reset, written or read.
+    ///
+    /// Separate from [`Self::timestamps`] rather than a wider pool because the two
+    /// are indexed by different things: the readback's three queries are safe to
+    /// share for the device's life precisely because that path is serialized,
+    /// while a draw's pair belongs to the ring slot whose fence will make it
+    /// readable. See [`super::gpu_span`].
+    pub draw_spans: Option<DrawSpanProbe>,
     /// The thread that announces a GPU-written completion stamp, and the
     /// timeline semaphore its submissions signal.
     ///
@@ -466,6 +604,50 @@ impl DeviceContext {
                 (props.api_version, props.device_type, p)
             })
             .collect();
+        // One line per enumerated device, emitted **before** the selection so the
+        // list survives a boot where nothing clears the floor and there is no
+        // winner to hang it off.
+        //
+        // A hybrid laptop enumerates two GPUs and this device silently binds one
+        // of them; until this line existed, a report from such a host could not
+        // say which, nor that the other existed, nor why it lost. The rank is on
+        // the line because the rank *is* the policy — a reader who disagrees with
+        // the choice can see the number that made it — and the driver identity is
+        // there because `DriverQuirk` is the one place driver identity may change
+        // behavior and a quirk report needs the driver's own name for itself
+        // rather than the marketing name of the silicon.
+        //
+        // `VkPhysicalDeviceDriverProperties` is Vulkan 1.2 core and 1.2 is the
+        // baseline, so it is answerable on every device that could be selected.
+        // A device *below* the floor may not answer it; the struct is
+        // zero-initialised, so such a device reports empty strings next to
+        // `above_floor=false`, which reads correctly.
+        for (index, (api, device_type, candidate)) in candidates.iter().enumerate() {
+            let props = instance.get_physical_device_properties(*candidate);
+            let name = CStr::from_ptr(props.device_name.as_ptr()).to_string_lossy();
+            let mut driver = vk::PhysicalDeviceDriverProperties::default();
+            let mut props2 = vk::PhysicalDeviceProperties2::default().push_next(&mut driver);
+            instance.get_physical_device_properties2(*candidate, &mut props2);
+            let driver_name = CStr::from_ptr(driver.driver_name.as_ptr()).to_string_lossy();
+            let driver_info = CStr::from_ptr(driver.driver_info.as_ptr()).to_string_lossy();
+            let profile =
+                classify_memory(&instance.get_physical_device_memory_properties(*candidate));
+            crate::observe::off(format!(
+                "vk_device_candidate index={index} of={} name={name:?} type={device_type:?} \
+                 api={} above_floor={} rank={} driver_id={:?} driver={driver_name:?} \
+                 driver_info={driver_info:?} memory={} device_local_mb={} \
+                 vendor_id={:#06x} device_id={:#06x}",
+                candidates.len(),
+                api_floor::version_str(*api),
+                api_floor::meets_floor(*api),
+                crate::backend::vulkan::caps::device_select::rank_physical_device(*device_type),
+                driver.driver_id,
+                profile.topology.slug(),
+                profile.device_local_bytes >> 20,
+                props.vendor_id,
+                props.device_id,
+            ));
+        }
         let (pd, _chosen_api_version) = select_physical_device(&candidates).map_err(|found| {
             let decline = if found.is_empty() {
                 InitDecline::NoPhysicalDevice
@@ -545,7 +727,7 @@ impl DeviceContext {
         );
         let storage_image_write_without_format_bgra =
             features.storage_image_write_without_format_bgra();
-        let sampled_r32f_linear_filter = features.sampled_r32f_linear_filter;
+        let sampled_linear_filter = features.sampled_linear_filter;
         let has16 = features.storage16;
         let has8 = features.storage8;
         let has_float16 = features.float16;
@@ -567,15 +749,18 @@ impl DeviceContext {
         let host_pointer =
             crate::backend::vulkan::caps::host_pointer::query(&instance, pd, &has_device_extension);
         // Published for `runtime::guest_ram_map`, which builds the imports and
-        // has no device context to read the granularity from. A negative rung
-        // withdraws it rather than publishing zero, so the absence of a number
-        // is itself the gate and no site can act on a granularity from a device
-        // that declined the handle type.
+        // has no device context to read the granularity or the heap sizes from.
+        // A negative rung withdraws them rather than publishing zeroes, so the
+        // absence of a number is itself the gate and no site can act on a
+        // granularity from a device that declined the handle type.
         match host_pointer.rung {
             crate::backend::vulkan::caps::HostPointerImport::Supported => {
-                crate::runtime::guest_ram::latch_granularity(host_pointer.min_alignment);
+                crate::runtime::guest_ram::latch_import_limits(
+                    host_pointer.min_alignment,
+                    host_pointer.heap_budget,
+                );
             }
-            _ => crate::runtime::guest_ram::forget_granularity(),
+            _ => crate::runtime::guest_ram::forget_import_limits(),
         }
         // Every import this process holds names a `VkDeviceMemory` that dies
         // with the device below. Dropping them here, before the new one exists,
@@ -703,12 +888,46 @@ impl DeviceContext {
                     .ok()
             })
             .flatten();
+        // The same two capability answers as above, plus the switch. Both halves
+        // matter: a queue family that writes no timestamps must get no probe, and
+        // a `valid_bits` of 64 has to become an all-ones mask rather than a shift
+        // that overflows.
+        let valid_bits = qfs[gq as usize].timestamp_valid_bits;
+        let draw_spans = (valid_bits > 0
+            && props.limits.timestamp_period > 0.0
+            && crate::env::read(crate::env::GPU_SPANS).0 != crate::env::Switch::Off)
+            .then(|| {
+                let ci = vk::QueryPoolCreateInfo::default()
+                    .query_type(vk::QueryType::TIMESTAMP)
+                    .query_count(DrawSpanProbe::PER_SLOT * super::pools::RING_DEPTH as u32);
+                device
+                    .create_query_pool(&ci, None)
+                    .map(|pool| DrawSpanProbe {
+                        pool,
+                        ns_per_tick: props.limits.timestamp_period,
+                        valid_mask: if valid_bits >= u64::BITS {
+                            u64::MAX
+                        } else {
+                            (1u64 << valid_bits) - 1
+                        },
+                    })
+                    .map_err(|e| {
+                        crate::observe::Emit::decline(
+                            "vk_draw_span_pool",
+                            &VkCall::new(VkOp::ContextCreateQueryPool, e),
+                        )
+                        .fail_once(0);
+                    })
+                    .ok()
+            })
+            .flatten();
         // Gated on the feature actually being enabled, not on the API version.
         // `timelineSemaphore` is core in 1.2 and this backend's baseline is 1.2,
         // so a device that declines it is out of spec — which is exactly why the
         // answer is read from `features` rather than assumed: an assumption here
         // is a `vkWaitSemaphores` into a driver that never implemented it.
-        let stamp_completion = features.timeline_semaphore
+        let stamp_completion = features
+            .timeline_semaphore
             .then(|| super::stamp_completion::StampCompletion::start(&device))
             .transpose()
             .map_err(|e| {
@@ -770,6 +989,17 @@ impl DeviceContext {
             caps.quirks.no_deferred_draw_batching,
             caps.quirks.guest_pages_stay_authoritative,
         ));
+        // Every optional feature and limit this backend resolved, on one line.
+        // `vk_device_select` above names the handful a draw's *expressiveness*
+        // turns on; this names the whole resolved set, including the ones that
+        // came back false. The two are not redundant: a rail declining by name
+        // and a rail never asked for look identical in a log that only reports
+        // what was enabled.
+        crate::observe::off(features.report_line());
+        // What the operator set. A boot whose rails were narrowed from outside
+        // the process reads as a slow device unless the narrowing is on the
+        // same page as the capabilities.
+        crate::observe::off(crate::env::report_line());
         // Warm-start the pipeline cache from the previous boot's blob. Cold
         // pipeline compiles are the remaining pre-convergence stall class
         // (~256 ms first use per pipeline); the blob is keyed by the device's
@@ -823,7 +1053,10 @@ impl DeviceContext {
             gq,
             compute_capable,
             storage_image_write_without_format: storage_image_write_without_format_bgra,
-            sampled_r32f_linear_filter,
+            spirv_storage_write_without_format: features.storage_image_write_without_format,
+            spirv_storage_read_without_format: features.storage_image_read_without_format,
+            spirv_storage_extended_formats: features.storage_image_extended_formats,
+            sampled_linear_filter,
             pipeline_cache,
             vertex_divisor,
             guest_bind_offset_align: props
@@ -831,12 +1064,14 @@ impl DeviceContext {
                 .min_storage_buffer_offset_alignment
                 .max(props.limits.min_uniform_buffer_offset_alignment)
                 .max(16),
+            max_storage_buffer_range: u64::from(props.limits.max_storage_buffer_range),
             vertex_formats,
             max_sampler_anisotropy: features.max_sampler_anisotropy,
             sampler_anisotropy: features.sampler_anisotropy,
             features,
             depth_stencil_format,
             timestamps,
+            draw_spans,
             stamp_completion,
             pipeline_cache_path: Some(pipeline_cache_path),
             pipeline_cache_saved_len: AtomicUsize::new(initial_len),
@@ -865,6 +1100,21 @@ impl DeviceContext {
                 return;
             }
         };
+        // Never write back a blob the next boot would refuse to load. Without
+        // this the bound above still self-heals — one cold boot rebuilds a small
+        // blob — but every boot in between pays a 30 MB write to produce a file
+        // whose only use is to be declined.
+        if data.len() > PIPELINE_CACHE_MAX_WARM_BYTES {
+            crate::observe::Emit::decline(
+                "vk_pipeline_cache_save",
+                &PipelineCacheDecline::TooLarge {
+                    bytes: data.len(),
+                    cap: PIPELINE_CACHE_MAX_WARM_BYTES,
+                },
+            )
+            .fail_once(0);
+            return;
+        }
         // Growth debounce: byte length is the proxy for "a new pipeline
         // landed" (equal-length different-content saves are lost, which only
         // costs a warm-start miss on that one pipeline next boot).
@@ -922,6 +1172,9 @@ impl DeviceContext {
         if let Some(probe) = self.timestamps.take() {
             self.device.destroy_query_pool(probe.pool, None);
         }
+        if let Some(probe) = self.draw_spans.take() {
+            self.device.destroy_query_pool(probe.pool, None);
+        }
         self.device
             .destroy_pipeline_cache(self.pipeline_cache, None);
         self.device.destroy_device(None);
@@ -938,8 +1191,18 @@ impl DeviceContext {
     ///
     /// Returns `None` only when no type in `type_bits` carries the class's
     /// *required* flags — the caller must then decline with a named reason.
-    pub(crate) fn memory_type_for(&self, type_bits: u32, class: MemoryClass) -> Option<u32> {
-        let picked = self.memory_type_with(type_bits, &self.caps.memory_request(class));
+    ///
+    /// `bytes` is the allocation this pick is for, and every caller has it in the
+    /// `VkMemoryRequirements` it just queried. It is what keeps a large
+    /// allocation out of a heap that could not hold it — see
+    /// [`select_memory_type`].
+    pub(crate) fn memory_type_for(
+        &self,
+        type_bits: u32,
+        bytes: u64,
+        class: MemoryClass,
+    ) -> Option<u32> {
+        let picked = self.memory_type_with(type_bits, bytes, &self.caps.memory_request(class));
         // Once per class per boot. What a class *asks* for is in
         // `MemoryTopology::request` and readable from source; what it *gets* is
         // not, because it depends on this device's memory-type table, and the
@@ -949,30 +1212,72 @@ impl DeviceContext {
         // size is a difference in which heap the pick landed in. Naming the
         // index and its flags is what turns that from an inference into a
         // reading.
-        if let Some(i) = picked {
+        if let Some(pick) = picked {
             // Keyed on the class and the index together, so a device whose
             // table makes the pick differ between call sites says so instead of
             // latching the first answer for the boot.
-            let key = ((class as u64) << 32) | i as u64;
+            let key = ((class as u64) << 32) | pick.index as u64;
             if crate::observe::first_sight("vk_memory_type_pick", key) {
-                let t = self.memory_properties.memory_types[i as usize];
+                let t = self.memory_properties.memory_types[pick.index as usize];
                 crate::observe::off(format!(
-                    "vk_memory_type_pick class={class:?} index={i} heap={} flags={:?} \
-                     heap_bytes={}",
-                    t.heap_index,
-                    t.property_flags,
-                    self.memory_properties.memory_heaps[t.heap_index as usize].size,
+                    "vk_memory_type_pick class={class:?} index={} heap={} flags={:?} \
+                     heap_bytes={} bytes={bytes} fits={}",
+                    pick.index, pick.heap_index, t.property_flags, pick.heap_bytes, pick.fits,
                 ));
             }
+            self.report_oversized_allocation(class, bytes, pick);
         }
-        picked
+        picked.map(|p| p.index)
     }
 
     /// Escape hatch for a caller that has already built a [`MemoryRequest`]
     /// (the host-pointer import path, which must intersect what
     /// `vkGetMemoryHostPointerPropertiesEXT` named for the pointer).
-    pub(crate) fn memory_type_with(&self, type_bits: u32, req: &MemoryRequest) -> Option<u32> {
-        select_memory_type(&self.memory_properties, type_bits, req)
+    pub(crate) fn memory_type_with(
+        &self,
+        type_bits: u32,
+        bytes: u64,
+        req: &MemoryRequest,
+    ) -> Option<crate::backend::vulkan::caps::memory_topology::MemoryTypePick> {
+        select_memory_type(&self.memory_properties, type_bits, req, bytes)
+    }
+
+    /// Report, once per (class, heap), an allocation charged to a heap that could
+    /// not hold it even empty.
+    ///
+    /// Fail-visible rather than off-channel, and it is not a loss of guest work:
+    /// the allocation is still attempted and usually succeeds. What it says is
+    /// that this device has asked its driver to keep something resident in a pool
+    /// with no room for it, which is the condition under which a driver's
+    /// residency manager evicts the rest of the working set on every submission.
+    /// That reads from the outside as "the whole machine got slow", and until
+    /// this line existed there was nothing in a boot's log that named it.
+    ///
+    /// [`MemoryTypePick::fits`] is a heap-capacity test and not a residency one,
+    /// so this is a lower bound: a heap large enough to hold the allocation can
+    /// still be too full to. The direction it does catch is unambiguous.
+    pub(crate) fn report_oversized_allocation(
+        &self,
+        class: MemoryClass,
+        bytes: u64,
+        pick: crate::backend::vulkan::caps::memory_topology::MemoryTypePick,
+    ) {
+        if pick.fits {
+            return;
+        }
+        let key = ((class as u64) << 32) | pick.heap_index as u64;
+        if !crate::observe::first_sight("vk_memory_heap_too_small", key) {
+            return;
+        }
+        crate::observe::fail(format!(
+            "vk_memory_heap_too_small reason=vk_memory_heap_too_small class={class:?} \
+             index={} heap={} heap_mb={} bytes_mb={} (the allocation is charged to a heap that \
+             could not hold it empty; expect driver-side eviction of the working set)",
+            pick.index,
+            pick.heap_index,
+            pick.heap_bytes >> 20,
+            bytes >> 20,
+        ));
     }
 
     /// Whether a selected memory type is host-cached and whether it is coherent.
@@ -987,7 +1292,6 @@ impl DeviceContext {
     pub(crate) fn queue(&self) -> vk::Queue {
         unsafe { self.device.get_device_queue(self.gq, 0) }
     }
-
 }
 
 /// The index of a queue family that transfers and does nothing else — a copy
@@ -1422,6 +1726,64 @@ mod pipeline_cache_blob_tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// A blob past [`PIPELINE_CACHE_MAX_WARM_BYTES`] is refused as a cold start,
+    /// and refused for being oversized rather than for being malformed — the two
+    /// have opposite meanings for whoever reads the boot, because an oversized
+    /// blob is this device's own well-formed output and a rebuilt one is the
+    /// expected next state.
+    ///
+    /// Written against a blob that is otherwise perfectly loadable, so it fails
+    /// if the size gate is ever moved after the compatibility gate.
+    #[test]
+    fn an_oversized_pipeline_cache_blob_is_declined_by_size_not_by_shape() {
+        use crate::observe::Decline as _;
+        let root = std::env::temp_dir().join(format!(
+            "reims-vgpu-pcap-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let props = vk::PhysicalDeviceProperties::default();
+
+        // A header this device would otherwise accept, padded past the cap.
+        let mut blob = Vec::with_capacity(PIPELINE_CACHE_MAX_WARM_BYTES + 1);
+        blob.extend_from_slice(&(PIPELINE_CACHE_HEADER_ONE_LEN as u32).to_le_bytes());
+        blob.extend_from_slice(
+            &(vk::PipelineCacheHeaderVersion::ONE.as_raw() as u32).to_le_bytes(),
+        );
+        blob.extend_from_slice(&props.vendor_id.to_le_bytes());
+        blob.extend_from_slice(&props.device_id.to_le_bytes());
+        blob.extend_from_slice(&props.pipeline_cache_uuid);
+        assert!(
+            pipeline_cache_blob_compatible(&blob, &props),
+            "the fixture must be loadable before it is padded, or this proves nothing"
+        );
+        blob.resize(PIPELINE_CACHE_MAX_WARM_BYTES + 1, 0);
+
+        let path = root.join("oversized.bin");
+        std::fs::write(&path, &blob).unwrap();
+        let decline = read_pipeline_cache_blob(&path, &props).unwrap_err();
+        assert_eq!(decline.slug(), "vk_pipeline_cache_too_large");
+        assert_eq!(
+            decline.fields(),
+            vec![
+                ("bytes", (PIPELINE_CACHE_MAX_WARM_BYTES + 1).to_string()),
+                ("cap", PIPELINE_CACHE_MAX_WARM_BYTES.to_string()),
+            ]
+        );
+
+        // One byte under the cap is still a warm start, so the bound is a bound
+        // and not a ban on warming.
+        blob.truncate(PIPELINE_CACHE_MAX_WARM_BYTES);
+        std::fs::write(&path, &blob).unwrap();
+        assert_eq!(
+            read_pipeline_cache_blob(&path, &props).unwrap(),
+            Some(blob),
+            "a blob at exactly the cap warms"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     /// The path is UUID-keyed: distinct devices never share a blob file.
     #[test]
     fn disk_path_keyed_by_uuid() {
@@ -1792,5 +2154,75 @@ mod recreate_budget_tests {
         assert_eq!(owner.recreate_count, 0);
         assert!(!owner.poisoned, "noting work must not change device state");
         assert!(owner.init_error.is_none());
+    }
+}
+
+#[cfg(test)]
+mod draw_span_probe_tests {
+    use super::*;
+
+    fn probe(valid_bits: u32, ns_per_tick: f32) -> DrawSpanProbe {
+        DrawSpanProbe {
+            pool: vk::QueryPool::null(),
+            ns_per_tick,
+            valid_mask: if valid_bits >= u64::BITS {
+                u64::MAX
+            } else {
+                (1u64 << valid_bits) - 1
+            },
+        }
+    }
+
+    /// The ordinary case: a full-width counter, a tick that is not one
+    /// nanosecond, and a delta that does not wrap.
+    #[test]
+    fn a_full_width_counter_scales_its_delta_by_the_tick() {
+        let p = probe(64, 2.5);
+        assert_eq!(p.elapsed_ns(1_000, 1_400), 1_000);
+    }
+
+    /// A queue family that writes 32 meaningful bits leaves the rest
+    /// **undefined**, so the high halves of the two results may differ by
+    /// anything. Masking both operands is what makes the subtraction the elapsed
+    /// ticks rather than a difference of two drivers' scratch bits — and this is
+    /// the case a raw `bottom - top` reports as a span of years.
+    #[test]
+    fn undefined_high_bits_do_not_reach_the_answer() {
+        let p = probe(32, 1.0);
+        let top = 0xdead_beef_0000_0100u64;
+        let bottom = 0x1234_5678_0000_0300u64;
+        assert_eq!(p.elapsed_ns(top, bottom), 0x200);
+    }
+
+    /// 32 valid bits at a one-nanosecond tick wraps every 4.3 seconds, which a
+    /// per-second census crosses several times a boot. A wrap is a wrap and not a
+    /// negative: without the mask on the result this reads as ~18 000 000 000 µs
+    /// and would own every column it is quoted beside.
+    #[test]
+    fn a_wrap_within_the_valid_width_is_a_wrap() {
+        let p = probe(32, 1.0);
+        assert_eq!(p.elapsed_ns(0xffff_ff00, 0x0000_00ff), 0x1ff);
+    }
+
+    /// Each ring slot owns a disjoint pair, because the slot's fence is what makes
+    /// its pair readable and two slots are in flight at once.
+    #[test]
+    fn every_ring_slot_gets_its_own_disjoint_pair() {
+        let bases: Vec<u32> = (0..super::super::pools::RING_DEPTH)
+            .map(DrawSpanProbe::base)
+            .collect();
+        for w in bases.windows(2) {
+            assert_eq!(
+                w[1] - w[0],
+                DrawSpanProbe::PER_SLOT,
+                "slot bases must tile the pool: {bases:?}"
+            );
+        }
+        let last = bases.last().expect("the ring is not empty");
+        assert_eq!(
+            last + DrawSpanProbe::PER_SLOT,
+            DrawSpanProbe::PER_SLOT * super::super::pools::RING_DEPTH as u32,
+            "the pool is exactly as large as the ring needs"
+        );
     }
 }

@@ -29,6 +29,8 @@ __pycache__/
 /vm/*
 !/vm/boot-arm64.sh
 !/vm/boot-x86.sh
+!/vm/guest-authorize.sh
+!/vm/rail-debug-posture.sh
 vm/debug/
 vm/logs/
 # OVMF firmware blobs (CODE/VARS .fd) — large binary runtime, never commit
@@ -45,6 +47,9 @@ Vulkan-Headers/
 /kb/
 /journal/
 /m2v-handoff/
+# Packaged metal2vulkan defects: a README plus the Apple AIR that reproduces each.
+# Apple bytes, so local only — hand a directory over by copying it. See AGENTS.md.
+/bugs/
 
 # vendor/qemu is a git submodule (steelbrain/qemu-reims-vgpu, branch host-reims-vgpu-vmapple).
 # Its own build/ output is ignored by QEMU's own .gitignore.

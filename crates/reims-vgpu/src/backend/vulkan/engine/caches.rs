@@ -119,9 +119,21 @@ pub(crate) struct DepthAttachKey {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub(crate) struct PassKey {
     pub load_seed: bool, // LOAD vs CLEAR (slot 0)
-    /// Slot-0 attachment format: true = B8G8R8A8_UNORM (guest scanout order for
-    /// zero-copy import-present), false = R8G8B8A8_UNORM.
-    pub bgra: bool,
+    /// Slot-0 attachment format, as a format rather than a channel-order flag.
+    ///
+    /// This used to be `bgra: bool`, meaning `B8G8R8A8_UNORM` or
+    /// `R8G8B8A8_UNORM` and nothing else, which made slot 0 the only attachment
+    /// in this key that could not name a format — [`SecondaryAttachKey`] has
+    /// carried a real [`ash::vk::Format`] since MRT landed. The asymmetry was
+    /// not cosmetic: it is the reason a render target's resident is always
+    /// eight bits per channel whatever the guest declared, because the *only*
+    /// thing downstream could reconstruct from the flag was one of those two.
+    ///
+    /// It must stay part of the key. A render pass and a pipeline are both
+    /// compiled against the attachment's format, so two draws differing only
+    /// here need two of each; a key that omitted it would hand the second draw
+    /// a pipeline built for the first one's format.
+    pub color0_format: ash::vk::Format,
     /// Secondary color attachments (slot 1..). `secondary_count == 0` ⇒ the
     /// classic single-attachment pass, byte-identical to the pre-MRT engine.
     pub secondary: [SecondaryAttachKey; MAX_SECONDARY_ATTACH],
@@ -139,10 +151,10 @@ pub(crate) struct PassKey {
 
 impl PassKey {
     /// Single-color-attachment pass (the pre-MRT constructor).
-    pub(crate) fn single(load_seed: bool, bgra: bool) -> Self {
+    pub(crate) fn single(load_seed: bool, color0_format: ash::vk::Format) -> Self {
         Self {
             load_seed,
-            bgra,
+            color0_format,
             secondary: [SecondaryAttachKey::default(); MAX_SECONDARY_ATTACH],
             secondary_count: 0,
             depth: None,
@@ -234,6 +246,17 @@ pub(crate) struct ComputePipelineKey {
     pub spirv: Digest128,
     pub entry: String,
     pub layout: LayoutKey,
+}
+
+/// A shader module and the words the driver compiles from it.
+///
+/// They travel together because a pipeline create needs the handle and the
+/// crash breadcrumb needs the source, and two parameters is how a caller ends
+/// up passing one shader's handle beside another's words.
+#[derive(Clone, Copy)]
+pub(crate) struct ShaderModuleSource<'a> {
+    pub module: vk::ShaderModule,
+    pub spirv: &'a [u32],
 }
 
 /// How many distinct never-creatable keys a cache remembers the refusal for.
@@ -399,6 +422,85 @@ impl<K: Clone + Eq + std::hash::Hash, V> ObjectCache<K, V> {
     }
 }
 
+/// Entries the front index holds before it starts over.
+///
+/// Each entry is an address, a `Digest128` and an `Arc` clone — tens of bytes,
+/// plus the words the `Arc` keeps alive, which the runtime owns for the
+/// shader's lifetime anyway. A driven macos-13 boot binds a few hundred
+/// distinct modules, so this is a ceiling with an order of magnitude of
+/// headroom and `shader_digest_reset` firing is the boot saying the guest's
+/// module set is not what that assumed.
+const SHADER_DIGEST_ENTRIES: usize = 4096;
+
+/// `Arc<Vec<u32>>` allocation address → the digest that module finally hashes
+/// to, so a repeat bind can skip three whole-module walks.
+///
+/// # Why an address is a sound key
+///
+/// Only because the entry holds the `Arc`. While it does, the allocation cannot
+/// be freed, so nothing else can be given that address and the key cannot come
+/// to mean a different module. Drop the `Arc` from the entry and this becomes a
+/// use-after-free dressed as a cache hit.
+///
+/// `usize` rather than `*const Vec<u32>` because a raw pointer is not `Send` and
+/// `Caches` is held behind the engine lock and moved between threads. The
+/// address is never dereferenced — it is compared, and the `Arc` beside it is
+/// what keeps it meaningful.
+///
+/// # What it skips, and why that is safe
+///
+/// [`ObjectCaches::get_or_create_shader`] walks the module three times before it
+/// can look anything up: `required_image_capabilities`, the digest, and (on the
+/// patch path) a rebuild. All three are pure functions of the words, and the
+/// words behind an `Arc<Vec<u32>>` cannot change. So the digest recorded here is
+/// the *final* one — after any capability patch — and a hit is the same answer
+/// those three walks would have produced.
+///
+/// A hit still consults [`ObjectCaches::shaders`], positive and negative. That
+/// keeps this index from depending on `ObjectCache` never evicting, which is a
+/// property it happens to have and does not promise: a miss there simply falls
+/// through to the full path, which recomputes and re-inserts.
+#[derive(Default)]
+struct ShaderDigestIndex {
+    map: std::collections::HashMap<usize, (std::sync::Arc<Vec<u32>>, Digest128)>,
+}
+
+impl ShaderDigestIndex {
+    /// The digest this allocation's module hashes to, if it has been walked
+    /// before.
+    fn get(&self, words: &std::sync::Arc<Vec<u32>>) -> Option<Digest128> {
+        self.map
+            .get(&(std::sync::Arc::as_ptr(words) as usize))
+            .map(|(_, digest)| *digest)
+    }
+
+    /// Record what a full walk of this allocation produced.
+    ///
+    /// The bound is enforced here because this is the only way in: past
+    /// [`SHADER_DIGEST_ENTRIES`] the whole index is dropped rather than evicting
+    /// one entry, because there is no recency to evict *by* — every entry is
+    /// equally cheap to rebuild, and a boot that reaches the bound is reporting
+    /// something rather than asking for a policy.
+    fn insert(&mut self, words: &std::sync::Arc<Vec<u32>>, digest: Digest128) {
+        if self.map.len() >= SHADER_DIGEST_ENTRIES {
+            crate::observe::off(format!(
+                "shader_digest_reset entries={} words={}",
+                self.map.len(),
+                words.len()
+            ));
+            self.map.clear();
+        }
+        self.map.insert(
+            std::sync::Arc::as_ptr(words) as usize,
+            (std::sync::Arc::clone(words), digest),
+        );
+    }
+
+    fn clear(&mut self) {
+        self.map.clear();
+    }
+}
+
 pub(crate) struct ObjectCaches {
     shaders: ObjectCache<Digest128, vk::ShaderModule>,
     layouts: ObjectCache<LayoutKey, (vk::DescriptorSetLayout, vk::PipelineLayout)>,
@@ -407,6 +509,10 @@ pub(crate) struct ObjectCaches {
     samplers: ObjectCache<SamplerStateKey, vk::Sampler>,
     /// Lc: compute pipelines (content digest + entry + layout).
     compute_pipelines: ObjectCache<ComputePipelineKey, vk::Pipeline>,
+    /// The allocation a shader's words live in → the digest its module hashes
+    /// to, so a repeat bind of the same module does not walk it three times to
+    /// find that out.
+    shader_digests: ShaderDigestIndex,
 }
 
 impl ObjectCaches {
@@ -418,6 +524,7 @@ impl ObjectCaches {
             pipelines: ObjectCache::new(),
             samplers: ObjectCache::new(),
             compute_pipelines: ObjectCache::new(),
+            shader_digests: ShaderDigestIndex::default(),
         }
     }
 
@@ -466,12 +573,82 @@ impl ObjectCaches {
     }
 
     pub(crate) fn clear_logical(&mut self) {
+        // Before the modules it indexes, so no window exists where a front-index
+        // hit names a digest whose module has already gone.
+        self.shader_digests.clear();
         self.shaders.clear();
         self.layouts.clear();
         self.passes.clear();
         self.pipelines.clear();
         self.samplers.clear();
         self.compute_pipelines.clear();
+    }
+
+    /// Report a driver call this device refused to repeat, and hand back the
+    /// error every one of the three call sites caches negatively.
+    ///
+    /// One place rather than three so the three cannot drift into three
+    /// different accounts of the same event — and so the line always carries
+    /// both the key (which identifies the call) and what the dead process called
+    /// it (which is the only human-readable thing about it).
+    fn note_quarantined(
+        &self,
+        site: &'static str,
+        hit: &super::driver_breadcrumb::quarantine::Quarantined,
+    ) -> DrawError {
+        let reason = super::reason::DrawReason::DriverCallQuarantined;
+        crate::observe::Emit::decline("driver_quarantine", &reason)
+            .field("site", site)
+            .field("key", &hit.key)
+            .field("previously", &hit.previously)
+            .field(
+                "list",
+                super::driver_breadcrumb::quarantine::list_path().display(),
+            )
+            .fail();
+        DrawError::Unsupported(reason)
+    }
+
+    /// [`Self::get_or_create_shader`] with the three whole-module walks skipped
+    /// for an allocation that has been through it before.
+    ///
+    /// The draw path is the caller that needs this: it binds two modules a draw
+    /// at ~30 000 draws a second, from `Arc`s the runtime holds for each
+    /// shader's lifetime, into a cache that on a driven macos-13 boot reports
+    /// `shader_misses=0`. `pl_shader_us` was **63 ms of every second** — the
+    /// largest single item inside `engine_us` — spent deriving a key for a
+    /// module already in hand.
+    ///
+    /// The compute path calls the walking form directly and deliberately: its
+    /// `spirv` is an owned `Vec` with no stable allocation to key on, and a
+    /// dispatch is three orders rarer than a draw.
+    pub(crate) unsafe fn get_or_create_shader_memoized(
+        &mut self,
+        ctx: &DeviceContext,
+        words: &std::sync::Arc<Vec<u32>>,
+        counters: &EngineCounters,
+        pools: &mut ResourcePools,
+    ) -> Result<(Digest128, vk::ShaderModule), DrawError> {
+        if let Some(key) = self.shader_digests.get(words) {
+            // Negative before positive, in the order the walking form asks them:
+            // a module this device refused is refused again without being
+            // rebuilt, and without the front index quietly promoting it.
+            if let Some(err) = self.shaders.get_negative(&key) {
+                counters.shader_misses.fetch_add(1, Ordering::Relaxed);
+                return Err(err);
+            }
+            if let Some(&module) = self.shaders.get(&key) {
+                counters.shader_hits.fetch_add(1, Ordering::Relaxed);
+                counters.shader_digest_hits.fetch_add(1, Ordering::Relaxed);
+                return Ok((key, module));
+            }
+            // The module was evicted or destroyed under a digest this index
+            // still names. Falling through re-walks and re-creates it, which is
+            // why the index may hold a digest the cache does not.
+        }
+        let (key, module) = self.get_or_create_shader(ctx, words, counters, pools)?;
+        self.shader_digests.insert(words, key);
+        Ok((key, module))
     }
 
     pub(crate) unsafe fn get_or_create_shader(
@@ -481,6 +658,67 @@ impl ObjectCaches {
         counters: &EngineCounters,
         pools: &mut ResourcePools,
     ) -> Result<(Digest128, vk::ShaderModule), DrawError> {
+        // Declare the storage-image capabilities this module's own contents
+        // require, before it is keyed or validated.
+        //
+        // This is the only place every module from every path passes through, so
+        // it is the only place the question can be asked once. It used to be
+        // asked at one producer instead, and phrased as provenance — "did *this
+        // device* retarget a binding to `Unknown`?" — which is a claim about how
+        // a module came to need the capability rather than whether it does. The
+        // translator emits `Unknown`-format storage images and extended formats
+        // of its own accord; those modules arrived here undeclared and were
+        // rejected, losing the dispatch. Both x86 rails lose compute work to it.
+        //
+        // A capability whose Vulkan feature was not enabled at device creation
+        // cannot be declared — that is invalid usage, and an invalid module is
+        // undefined behaviour inside a driver rather than an error it returns —
+        // so an unsupported requirement is a named decline instead.
+        // Both passes below walk the whole module, and so does the digest, so the
+        // charge is levied once here on the words the caller handed over rather
+        // than at each walk.
+        counters
+            .shader_hash_words
+            .fetch_add(words.len() as u64, Ordering::Relaxed);
+        let need = crate::runtime::spirv_bind::required_image_capabilities(words);
+        let mut patched;
+        let words: &[u32] = if need.any() {
+            let missing = (need.extended_formats && !ctx.spirv_storage_extended_formats)
+                || (need.write_without_format && !ctx.spirv_storage_write_without_format)
+                || (need.read_without_format && !ctx.spirv_storage_read_without_format);
+            if missing {
+                let err = DrawError::Unsupported(super::reason::DrawReason::SpirvInvalid);
+                crate::observe::fail(format!(
+                    "spirv_capability reason=host_lacks_feature words={} \
+                     need_extended={} need_write={} need_read={} \
+                     have_extended={} have_write={} have_read={}",
+                    words.len(),
+                    need.extended_formats,
+                    need.write_without_format,
+                    need.read_without_format,
+                    ctx.spirv_storage_extended_formats,
+                    ctx.spirv_storage_write_without_format,
+                    ctx.spirv_storage_read_without_format,
+                ));
+                let key = Digest128::of_u32_words(words);
+                self.shaders.insert_negative(key, err.clone());
+                return Err(err);
+            }
+            patched = words.to_vec();
+            let added = crate::runtime::spirv_bind::ensure_image_capabilities(&mut patched, &need);
+            if added.any() {
+                crate::observe::off(format!(
+                    "spirv_capability added extended={} write={} read={} words={}",
+                    added.extended_formats,
+                    added.write_without_format,
+                    added.read_without_format,
+                    patched.len()
+                ));
+            }
+            &patched
+        } else {
+            words
+        };
         let key = Digest128::of_u32_words(words);
         if let Some(err) = self.shaders.get_negative(&key) {
             counters.shader_misses.fetch_add(1, Ordering::Relaxed);
@@ -491,9 +729,53 @@ impl ObjectCaches {
             return Ok((key, m));
         }
         counters.shader_misses.fetch_add(1, Ordering::Relaxed);
+        // Last gate before the driver, and the only place every module from
+        // every path passes through exactly once. An invalid module is
+        // undefined behaviour inside a driver rather than an error it returns,
+        // and one has been observed ending the VM process — so it becomes a
+        // negative cache entry here and the guest's work is declined by name.
+        // See `crate::runtime::spirv_bind::validate`.
+        if let crate::runtime::spirv_bind::SpirvValidation::Rejected(why) =
+            crate::runtime::spirv_bind::validate(words)
+        {
+            let err = DrawError::Unsupported(super::reason::DrawReason::SpirvInvalid);
+            // Print what the capability derivation saw alongside the
+            // validator's complaint. When the two disagree the difference is
+            // the whole bug, and neither one alone says which walk is wrong.
+            crate::observe::fail(format!(
+                "spirv_validate reason=module_rejected words={} need={:?} imgs={:?} detail={why}",
+                words.len(),
+                crate::runtime::spirv_bind::required_image_capabilities(words),
+                crate::runtime::spirv_bind::image_type_census(words),
+            ));
+            // The complaint above names instructions by result id, which cannot
+            // be read without the module they belong to. Keep it.
+            super::driver_breadcrumb::keep_rejected_module(
+                &format!("{:016x}{:016x}", key.a, key.b),
+                words,
+            );
+            self.shaders.insert_negative(key, err.clone());
+            return Err(err);
+        }
+        // The driver parses SPIR-V here, so this is one of the three calls that
+        // can end the process on a module this device assembled — the other two
+        // being the compute and graphics pipeline compiles below. See
+        // `driver_breadcrumb` for why the words go to disk across it.
+        let breadcrumb = match super::driver_breadcrumb::DriverBreadcrumb::arm(
+            "create_shader_module",
+            &[("module", words)],
+        ) {
+            Ok(breadcrumb) => breadcrumb,
+            Err(hit) => {
+                let err = self.note_quarantined("create_shader_module", &hit);
+                self.shaders.insert_negative(key, err.clone());
+                return Err(err);
+            }
+        };
         let created = ctx
             .device
             .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(words), None);
+        breadcrumb.disarm();
         let module = created.map_err(|e| {
             let err = DrawError::VkCall(VkCall::new(VkOp::CachesCreateShaderModule, e));
             self.shaders.insert_negative(key, err.clone());
@@ -596,7 +878,7 @@ impl ObjectCaches {
             return Ok(rp);
         }
         counters.pass_misses.fetch_add(1, Ordering::Relaxed);
-        let target_format = translate::pixel::resident_color(key.bgra);
+        let target_format = key.color0_format;
         let (load_op, initial) = if key.load_seed {
             (
                 vk::AttachmentLoadOp::LOAD,
@@ -905,6 +1187,10 @@ impl ObjectCaches {
         // that substitutes a vertex format; see the resolution loop below.
         vert_spirv: &[u32],
         frag_module: vk::ShaderModule,
+        // Read only by the driver breadcrumb: a graphics compile consumes both
+        // stages and nothing outside the driver can say which one it choked on,
+        // so both go to disk across the call.
+        frag_spirv: &[u32],
         pipeline_layout: vk::PipelineLayout,
         render_pass: vk::RenderPass,
         counters: &EngineCounters,
@@ -1260,9 +1546,30 @@ impl ObjectCaches {
         if key.pass.depth.is_some() {
             gpci = gpci.depth_stencil_state(&depth_stencil);
         }
+        // The third call that compiles a module this device assembled, and the
+        // only one that compiles two at once. A macOS 15 guest's CoreAnimation
+        // uber fragment shader has been observed keeping NVIDIA's compiler in
+        // here for over ten minutes with the device lock held; see
+        // `crate::observe::driver_watch`, which this arming also starts.
+        let breadcrumb = match super::driver_breadcrumb::DriverBreadcrumb::arm(
+            &format!(
+                "create_graphics_pipelines vert_words={} frag_words={}",
+                vert_spirv.len(),
+                frag_spirv.len()
+            ),
+            &[("vert", vert_spirv), ("frag", frag_spirv)],
+        ) {
+            Ok(breadcrumb) => breadcrumb,
+            Err(hit) => {
+                let err = self.note_quarantined("create_graphics_pipelines", &hit);
+                self.pipelines.insert_negative(key.clone(), err.clone());
+                return Err(err);
+            }
+        };
         let created = ctx
             .device
             .create_graphics_pipelines(ctx.pipeline_cache, &[gpci], None);
+        breadcrumb.disarm();
         let pipe = created.map_err(|(_, e)| {
             let err = DrawError::VkCall(VkCall::new(VkOp::CachesCreateGraphicsPipelines, e));
             self.pipelines.insert_negative(key.clone(), err.clone());
@@ -1282,7 +1589,7 @@ impl ObjectCaches {
         &mut self,
         ctx: &DeviceContext,
         key: &ComputePipelineKey,
-        module: vk::ShaderModule,
+        shader: ShaderModuleSource<'_>,
         pipeline_layout: vk::PipelineLayout,
         counters: &EngineCounters,
         pools: &mut ResourcePools,
@@ -1309,20 +1616,34 @@ impl ObjectCaches {
         })?;
         let stage = vk::PipelineShaderStageCreateInfo::default()
             .stage(vk::ShaderStageFlags::COMPUTE)
-            .module(module)
+            .module(shader.module)
             .name(&entry_c);
         let cpci = vk::ComputePipelineCreateInfo::default()
             .stage(stage)
             .layout(pipeline_layout);
-        let pipe = ctx
+        // The other call that compiles the module, and the one an NVIDIA driver
+        // has been observed dying inside on a macos-14 guest's first dispatch.
+        let breadcrumb = match super::driver_breadcrumb::DriverBreadcrumb::arm(
+            &format!("create_compute_pipelines entry={}", key.entry),
+            &[("kernel", shader.spirv)],
+        ) {
+            Ok(breadcrumb) => breadcrumb,
+            Err(hit) => {
+                let err = self.note_quarantined("create_compute_pipelines", &hit);
+                self.compute_pipelines.insert_negative(key.clone(), err.clone());
+                return Err(err);
+            }
+        };
+        let created = ctx
             .device
-            .create_compute_pipelines(ctx.pipeline_cache, &[cpci], None)
-            .map_err(|(_, e)| {
-                let err = DrawError::VkCall(VkCall::new(VkOp::CachesCreateComputePipelines, e));
-                self.compute_pipelines
-                    .insert_negative(key.clone(), err.clone());
-                err
-            })?[0];
+            .create_compute_pipelines(ctx.pipeline_cache, &[cpci], None);
+        breadcrumb.disarm();
+        let pipe = created.map_err(|(_, e)| {
+            let err = DrawError::VkCall(VkCall::new(VkOp::CachesCreateComputePipelines, e));
+            self.compute_pipelines
+                .insert_negative(key.clone(), err.clone());
+            err
+        })?[0];
         counters.note_create();
         // Same warm-start persistence as the graphics path.
         ctx.persist_pipeline_cache();
@@ -1546,5 +1867,83 @@ mod object_cache_tests {
         // The memory came back, so this time the create succeeds.
         c.insert(key, 0x5EED);
         assert_eq!(c.get(&key), Some(&0x5EED));
+    }
+
+    /// The index is keyed on the *allocation*, not on the contents, and that is
+    /// the whole of its soundness argument: it holds the `Arc`, so the address
+    /// cannot be reused while the entry lives.
+    ///
+    /// Two `Arc`s over identical words are two allocations and therefore two
+    /// entries. That is not a miss to fix — a content key is what the digest
+    /// already is, and rederiving it is what this index exists to avoid.
+    #[test]
+    fn the_shader_digest_index_keys_the_allocation_and_not_the_contents() {
+        let mut index = ShaderDigestIndex::default();
+        let words = std::sync::Arc::new(vec![0x0723_0203u32, 0x0001_0000, 0x000d_000b]);
+        let twin = std::sync::Arc::new((*words).clone());
+        let digest = Digest128 { a: 0xA1, b: 0xB2, len: 3 };
+
+        assert_eq!(index.get(&words), None, "nothing walked yet");
+        index.insert(&words, digest);
+
+        assert_eq!(index.get(&words), Some(digest));
+        assert_eq!(
+            index.get(&twin),
+            None,
+            "identical words in a second allocation are a second entry"
+        );
+        let alias = std::sync::Arc::clone(&words);
+        assert_eq!(
+            index.get(&alias),
+            Some(digest),
+            "a clone of the same Arc is the same allocation and the same entry"
+        );
+    }
+
+    /// A dropped module's address may be handed to the next allocation, and the
+    /// index must not answer for it. It cannot: the entry holds an `Arc`, so
+    /// while it lives the allocation is not freed and the address is not
+    /// available to hand out.
+    ///
+    /// This asserts the mechanism rather than the hazard — a test that freed an
+    /// allocation and hoped for the address back would be testing the allocator.
+    #[test]
+    fn a_shader_digest_entry_keeps_its_words_alive() {
+        let mut index = ShaderDigestIndex::default();
+        let words = std::sync::Arc::new(vec![1u32, 2, 3]);
+        index.insert(&words, Digest128 { a: 1, b: 2, len: 3 });
+        assert_eq!(
+            std::sync::Arc::strong_count(&words),
+            2,
+            "the index holds one, which is what makes its key an address"
+        );
+        index.clear();
+        assert_eq!(std::sync::Arc::strong_count(&words), 1, "and releases it");
+    }
+
+    /// The bound is the container's and it starts over rather than evicting,
+    /// because every entry is equally cheap to rebuild and there is no recency
+    /// to evict by.
+    #[test]
+    fn the_shader_digest_index_starts_over_at_its_bound() {
+        let mut index = ShaderDigestIndex::default();
+        let held: Vec<std::sync::Arc<Vec<u32>>> = (0..SHADER_DIGEST_ENTRIES)
+            .map(|i| std::sync::Arc::new(vec![i as u32]))
+            .collect();
+        for (i, words) in held.iter().enumerate() {
+            index.insert(words, Digest128 { a: i as u64, b: 0, len: 1 });
+        }
+        assert_eq!(index.map.len(), SHADER_DIGEST_ENTRIES);
+        assert!(index.get(&held[0]).is_some());
+
+        let one_more = std::sync::Arc::new(vec![0xFFFF_FFFFu32]);
+        index.insert(&one_more, Digest128 { a: 9, b: 9, len: 1 });
+
+        assert_eq!(index.map.len(), 1, "the bound holds by starting over");
+        assert_eq!(index.get(&one_more), Some(Digest128 { a: 9, b: 9, len: 1 }));
+        assert!(
+            index.get(&held[0]).is_none(),
+            "and the reset is total, so nothing survives to be answered stale"
+        );
     }
 }

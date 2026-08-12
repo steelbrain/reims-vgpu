@@ -16,14 +16,14 @@
 use std::collections::{HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use metal2vulkan::passes::Stage;
 use metal2vulkan::reflect::ShaderReflection;
 
 use crate::observe::Decline;
 
-type FragmentRelocationCache = HashMap<(bool, bool), Arc<Vec<u32>>>;
+type FragmentRelocationCache = HashMap<(bool, bool), Arc<ShaderVariant>>;
 type M2vResult<T> = Result<T, M2vCacheDecline>;
 
 /// A specific failure while caching, translating, or post-processing AIR.
@@ -239,11 +239,82 @@ pub struct CachedShader {
     /// The same module as u32 words, materialized once — draw paths clone the
     /// `Arc`, never re-collect per draw (was a full-module copy ×2 per draw).
     pub words: Arc<Vec<u32>>,
+    /// The module in the translator's own binding numbering, and what a walk of
+    /// it answers. Separate from `words` only because `words` predates
+    /// [`ShaderVariant`] and half the crate reads it.
+    base: OnceLock<Arc<ShaderVariant>>,
     /// Fragment binding-relocation variants keyed by
     /// `(separate_sampled, buf_collide)` — the relocation is a pure function of
     /// the module and those two flags, so each variant is computed once per
     /// shader lifetime instead of mutating a fresh copy per draw.
     frag_reloc: Mutex<FragmentRelocationCache>,
+}
+
+/// One binding numbering of a translated module, beside the answers derived
+/// from *that* numbering.
+///
+/// The pair is one struct because the second is only true of the first.
+/// Relocation renumbers a module's descriptor bindings, so
+/// `spirv_bind::sampler_bindings` taken over the unrelocated words is a wrong
+/// answer for a draw that relocated them — and the way to make that
+/// unrepresentable is for the words and the walk of them to be reachable only
+/// together, from one key. A caller cannot pass one set of flags to the words
+/// and another to the walk, because there is only one call.
+pub struct ShaderVariant {
+    /// The module, in this variant's numbering.
+    pub words: Arc<Vec<u32>>,
+    /// The descriptor bindings this module declares an `OpTypeSampler` at,
+    /// sorted and deduplicated — [`crate::runtime::spirv_bind::sampler_bindings`]
+    /// over [`Self::words`].
+    ///
+    /// Derived here rather than at the draw because it is a full walk of every
+    /// instruction in the module for an answer that depends on nothing else,
+    /// and the draw path ran it twice a draw. It is the larger half of what
+    /// `sampled_phase`'s `Part::Reflect` brackets, measured at 10 486 us/s over
+    /// 29 944 draws — 0.35 us a draw — on a driven macos-13 boot.
+    ///
+    /// # What it removed
+    ///
+    /// Twelve interleaved driven macos-13 sustained-animation boots, two pinned
+    /// binaries differing only by this and by
+    /// [`crate::runtime::pipeline_resolve::VertexBindPlan`], scored over the
+    /// fast population. Per draw, median over busy census windows, then mean and
+    /// range across boots:
+    ///
+    /// ```text
+    ///                before (n=4)              after (n=6)
+    /// reflect_us     0.340 [0.332..0.345]      0.021 [0.020..0.021]
+    /// sampled_us     1.911 [1.861..1.972]      1.640 [1.574..1.691]
+    /// engine_us      6.235 [6.065..6.338]      6.208 [6.033..6.283]
+    /// ```
+    ///
+    /// `reflect_us` is **−94 %** and `sampled_us` **−14 %**, both fully
+    /// disjoint. `engine_us` — a phase neither change touches — does not move,
+    /// which is the control that says the two arms are comparable at all.
+    ///
+    /// `draw_us/draw` overall reads 13.33 [13.05..13.61] against 13.03
+    /// [12.82..13.44]: −2.3 %, ranges overlapping. `present_hz` is 114.25
+    /// against 114.16 — no movement, which is exactly what a 2 % per-draw change
+    /// is supposed to look like here. **This bought a phase, not a frame**, and
+    /// the elasticity beside `crate::runtime::drain::census::VBL_REPORT_EARLY`
+    /// says it could not have bought a frame at that size.
+    ///
+    /// A first attempt at this reading ran the two pins in sequence rather than
+    /// interleaved, and reported `engine_us` **+18 %** with `gpu occupancy` up
+    /// and `present_hz` down — the GPU clocking down between the two groups,
+    /// with nothing in the log to say so. Interleaving is not optional for a pin
+    /// comparison on this host.
+    pub sampler_bindings: Arc<[u32]>,
+}
+
+impl ShaderVariant {
+    fn of(words: Arc<Vec<u32>>) -> Arc<Self> {
+        let sampler_bindings = crate::runtime::spirv_bind::sampler_bindings(&words).into();
+        Arc::new(Self {
+            words,
+            sampler_bindings,
+        })
+    }
 }
 
 impl CachedShader {
@@ -278,17 +349,26 @@ impl CachedShader {
             spirv,
             reflection,
             words: Arc::new(words),
+            base: OnceLock::new(),
             frag_reloc: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Fragment words with stage-collision binding relocations applied.
+    /// This module in the binding numbering the two stage-collision flags name,
+    /// with the walks of that numbering beside it — see [`ShaderVariant`].
+    ///
     /// `separate_sampled` relocates sampled-resource bindings first (archive
     /// order), then `buf_collide` relocates the buffer band — matching the
-    /// historical per-draw mutation order exactly. Cached per variant.
-    pub fn fragment_words(&self, separate_sampled: bool, buf_collide: bool) -> Arc<Vec<u32>> {
+    /// historical per-draw mutation order exactly. Cached per variant, and
+    /// `(false, false)` is a variant like any other rather than a short-circuit,
+    /// because it is the one a vertex shader always takes and its walk is worth
+    /// caching for exactly the same reason.
+    pub fn variant(&self, separate_sampled: bool, buf_collide: bool) -> Arc<ShaderVariant> {
         if !separate_sampled && !buf_collide {
-            return self.words.clone();
+            return self
+                .base
+                .get_or_init(|| ShaderVariant::of(self.words.clone()))
+                .clone();
         }
         let mut cache = self.frag_reloc.lock().unwrap_or_else(|e| e.into_inner());
         cache
@@ -305,7 +385,7 @@ impl CachedShader {
                     let n = crate::runtime::spirv_bind::offset_fragment_buffer_bindings(&mut w);
                     crate::observe::line(format!("linux_m2v frag_buf_reloc n={n}"));
                 }
-                Arc::new(w)
+                ShaderVariant::of(Arc::new(w))
             })
             .clone()
     }
@@ -1044,6 +1124,62 @@ mod tests {
         LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// A variant's `sampler_bindings` must be the walk of *that variant's*
+    /// words, on every variant.
+    ///
+    /// This is the invariant [`ShaderVariant`] exists to make unrepresentable,
+    /// and it is worth a test because the failure it replaces was silent: the
+    /// draw path used to walk `f_words` at one point in the function and take
+    /// the relocation flags at another, so a variant's answer and its numbering
+    /// only agreed because two call sites happened to be passed the same pair.
+    /// A relocated module renumbers its descriptor bindings, so an answer taken
+    /// for the wrong variant is a real sampler bound at the wrong number.
+    #[test]
+    fn every_variants_sampler_bindings_are_a_walk_of_that_variants_words() {
+        let words = crate::runtime::spirv_bind::test_module_with_samplers(&[3, 7, 11]);
+        let spirv: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let shader = synth_shader(Stage::Fragment, spirv);
+
+        // The fixture is only useful if the walk finds something in it. Not
+        // asserted against the numbers the fixture was built with:
+        // `CachedShader::new` runs `widen_sampled_bands` over every module, so
+        // the base variant is already in the device's numbering rather than the
+        // translator's, and that is the numbering every consumer sees.
+        assert_eq!(
+            shader.variant(false, false).sampler_bindings.len(),
+            3,
+            "the fixture's three samplers survive band widening"
+        );
+
+        for (separate_sampled, buf_collide) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let v = shader.variant(separate_sampled, buf_collide);
+            assert_eq!(
+                &*v.sampler_bindings,
+                &crate::runtime::spirv_bind::sampler_bindings(&v.words)[..],
+                "variant({separate_sampled}, {buf_collide})"
+            );
+        }
+    }
+
+    /// A variant is computed once and handed out by pointer after that, which is
+    /// what makes the walk a per-shader cost rather than a per-draw one.
+    #[test]
+    fn a_variant_is_memoized_rather_than_rewalked() {
+        let words = crate::runtime::spirv_bind::test_module_with_samplers(&[5]);
+        let spirv: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let shader = synth_shader(Stage::Fragment, spirv);
+        for (separate_sampled, buf_collide) in [(false, false), (true, true)] {
+            let first = shader.variant(separate_sampled, buf_collide);
+            let again = shader.variant(separate_sampled, buf_collide);
+            assert!(
+                Arc::ptr_eq(&first, &again),
+                "variant({separate_sampled}, {buf_collide}) was rebuilt"
+            );
+        }
+    }
+
     /// A minimal `CachedShader` wrapping raw bytes with an empty reflection —
     /// enough to prime the cache in unit tests that never call metal2vulkan.
     fn synth_shader(stage: Stage, spirv: Vec<u8>) -> Arc<CachedShader> {
@@ -1074,10 +1210,10 @@ mod tests {
         ))
     }
 
-    /// `CachedShader::new` widens the translator's bands, and `fragment_words`
+    /// `CachedShader::new` widens the translator's bands, and `variant`
     /// relocates on top of that — in that order, for every representation.
     #[test]
-    fn fragment_words_variants_match_direct_relocation_and_cache() {
+    fn variant_words_match_direct_relocation_and_cache() {
         use crate::runtime::spirv_bind::{
             FRAG_BUFFER_BINDING_OFFSET, FRAG_SAMPLED_RESOURCE_BINDING_OFFSET,
             M2V_SAMPLER_BINDING_BASE, M2V_TEXTURE_BINDING_BASE, SAMPLED_TAIL_WIDEN_OFFSET,
@@ -1114,7 +1250,7 @@ mod tests {
         assert_eq!(from_bytes, widened);
 
         // No flags → the base Arc, un-relocated.
-        let base = shader.fragment_words(false, false);
+        let base = shader.variant(false, false).words.clone();
         assert!(Arc::ptr_eq(&base, &shader.words));
 
         // Both flags → sampled reloc first, then buffer band, matching the
@@ -1124,7 +1260,7 @@ mod tests {
         assert_eq!(n, 2);
         let n = crate::runtime::spirv_bind::offset_fragment_buffer_bindings(&mut expect);
         assert_eq!(n, 1);
-        let both = shader.fragment_words(true, true);
+        let both = shader.variant(true, true).words.clone();
         assert_eq!(*both, expect);
         assert_eq!(both[8], 3 + FRAG_BUFFER_BINDING_OFFSET);
         assert_eq!(
@@ -1141,7 +1277,7 @@ mod tests {
 
         // Second call returns the cached variant (same allocation), and the
         // stored (widened) module is never mutated by a relocation.
-        let again = shader.fragment_words(true, true);
+        let again = shader.variant(true, true).words.clone();
         assert!(Arc::ptr_eq(&both, &again));
         assert_eq!(*shader.words, widened);
     }

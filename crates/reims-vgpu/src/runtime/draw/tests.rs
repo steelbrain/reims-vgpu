@@ -92,6 +92,7 @@ fn rb(
         param_index: None,
         address_space: None,
         declared_size: None,
+        extent: None,
         type_layout: None,
         type_name: None,
         texture_shape: None,
@@ -142,6 +143,77 @@ fn sampled_zero_copy_floor_separates_video_from_small_binds() {
     // The buffer floor is a distinct, lower crossover (small per-draw
     // uniform/vertex buffers); it is not the sampled floor and stays 16 KiB.
     assert!(ZERO_COPY_BUFFER_MIN_BYTES < ZERO_COPY_SAMPLED_MIN_BYTES);
+}
+
+/// A shader extent may narrow the gather rail only while the bind stays on it.
+///
+/// This is the rule that keeps the extent rail from costing what it saves, and
+/// the arithmetic is the whole of it: `load_buffer_content` drops any cap below
+/// [`ZERO_COPY_BUFFER_MIN_BYTES`], because a cap under the floor moves the bind
+/// off the gather rail and therefore out of the held-resolution registry, which
+/// three driven macos-13 Maps boots measured as a ~50 % rise in `binds_us/chain`
+/// against no change in `draw_us/draw`.
+///
+/// The filter is asserted here rather than through a draw because a draw cannot
+/// reach it without a live device, and the property is arithmetic on one
+/// constant. What a boot measures is the *consequence*; what this pins is that
+/// the gate is on the floor and not on some other number.
+///
+/// Vulkan-arm only: the floor it reads is a `backend-vulkan` constant, and the
+/// gather rail it gates does not exist on the Metal-direct arm.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn an_extent_cap_below_the_gather_floor_is_not_applied_to_the_gather_rail() {
+    use super::vulkan::gather_cap_for;
+
+    // The population today's shaders actually declare: 60 captured AIR blobs ran
+    // median 64 bytes, max 512, and a driven boot reads 1.03 million `Object`
+    // verdicts a boot between 65 and 512 bytes against 79 above 64 KiB. None of
+    // these may reach the gather rail on the default arm.
+    for cap in [4u64, 64, 288, 512, ZERO_COPY_BUFFER_MIN_BYTES - 1] {
+        assert_eq!(
+            gather_cap_for(Some(cap), false),
+            None,
+            "cap {cap} must not narrow the gather by default"
+        );
+    }
+    // A declared object at or above the floor still narrows: the bind stays on
+    // the rail, keeps its registry entry, and gathers less.
+    for cap in [ZERO_COPY_BUFFER_MIN_BYTES, ZERO_COPY_BUFFER_MIN_BYTES + 1] {
+        assert_eq!(gather_cap_for(Some(cap), false), Some(cap), "cap {cap}");
+    }
+    // A bind with no declared object has nothing to narrow by on either arm.
+    assert_eq!(gather_cap_for(None, false), None);
+    assert_eq!(gather_cap_for(None, true), None);
+}
+
+/// `REIMS_VGPU_EXTENT_NARROW=on` keeps the caps the floor drops, which is the
+/// whole of the arm.
+///
+/// The one that matters is the population above: 512 bytes and under is where
+/// essentially every declared object sits, so an arm that kept only the caps
+/// already above 16 KiB would be the default arm with extra steps and would
+/// measure as no change — which is exactly how a switch gets called neutral.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn the_narrowing_arm_keeps_the_caps_the_floor_drops() {
+    use super::vulkan::gather_cap_for;
+
+    for cap in [4u64, 64, 288, 512, ZERO_COPY_BUFFER_MIN_BYTES - 1] {
+        assert_eq!(
+            gather_cap_for(Some(cap), true),
+            Some(cap),
+            "cap {cap} is the population this arm exists for"
+        );
+    }
+    // And it changes nothing about the caps that already cleared the floor.
+    for cap in [ZERO_COPY_BUFFER_MIN_BYTES, 1 << 20] {
+        assert_eq!(
+            gather_cap_for(Some(cap), true),
+            gather_cap_for(Some(cap), false),
+            "cap {cap} must not depend on the arm"
+        );
+    }
 }
 
 /// The window math the three sampled zero-copy rails now share.
@@ -249,7 +321,12 @@ fn cpu_portability_store_publishes_composite() {
 #[cfg(feature = "backend-vulkan")]
 #[test]
 fn frag_unbound_scan_reports_missing_standard_kinds_and_embedded_textures() {
+    use crate::runtime::draw::{FragUnbound, FragUnboundClass};
     use metal2vulkan::reflect::ResourceKind as K;
+    let gap = |class, metal_index| FragUnbound { class, metal_index };
+    let tex = |i| gap(FragUnboundClass::Texture, i);
+    let buf = |i| gap(FragUnboundClass::Buffer, i);
+    let smp = |i| gap(FragUnboundClass::Sampler, i);
     // Shader declares buffer 1+2, texture 3, sampler 0, an embedded arg-buffer
     // texture (index 9), plus other synthetic kinds (color input, threadgroup
     // buffer, storage image, constexpr sampler) that reach the shader by other
@@ -268,22 +345,50 @@ fn frag_unbound_scan_reports_missing_standard_kinds_and_embedded_textures() {
     // All standard resources bound → `unbound` empty; the embedded texture is
     // always reported (render path cannot source it) regardless of binding.
     let (unbound, embedded) =
-        frag_unbound_scan(&bindings, |i| [1, 2].contains(&i), |i| i == 3, |i| i == 0);
+        frag_unbound_scan(&bindings, |i| [1, 2].contains(&i), |i| i == 3, |i| i == 0, |_| true);
     assert!(unbound.is_empty());
     assert_eq!(embedded, vec![9]);
 
     // Drop the texture bind → exactly tex3 reported (synthetics stay silent).
-    let (unbound, _) = frag_unbound_scan(&bindings, |i| [1, 2].contains(&i), |_| false, |i| i == 0);
-    assert_eq!(unbound, vec!["tex3".to_string()]);
+    let (unbound, _) = frag_unbound_scan(&bindings, |i| [1, 2].contains(&i), |_| false, |i| i == 0, |_| true);
+    assert_eq!(unbound, vec![tex(3)]);
 
     // Drop buffer 2 + sampler 0 → both reported, ordered by declaration.
-    let (unbound, _) = frag_unbound_scan(&bindings, |i| i == 1, |i| i == 3, |_| false);
-    assert_eq!(unbound, vec!["buf2".to_string(), "smp0".to_string()]);
+    let (unbound, _) = frag_unbound_scan(&bindings, |i| i == 1, |i| i == 3, |_| false, |_| true);
+    assert_eq!(unbound, vec![buf(2), smp(0)]);
 
     // A reflection with no embedded texture returns an empty embedded list.
     let standard_only = [rb(K::Buffer, 1), rb(K::Texture, 3), rb(K::Sampler, 0)];
-    let (_, embedded) = frag_unbound_scan(&standard_only, |_| true, |_| true, |_| true);
+    let (_, embedded) = frag_unbound_scan(&standard_only, |_| true, |_| true, |_| true, |_| true);
     assert!(embedded.is_empty());
+
+    // An unprovided texture the translated module never declares is NOT a gap:
+    // the reflection comes from the AIR signature, so a `[[texture(n)]]` the
+    // shader never samples produces an entry for a descriptor the SPIR-V does
+    // not carry. Reporting it was a false alarm on three rails.
+    let (unbound, _) = frag_unbound_scan(
+        &bindings,
+        |i| [1, 2].contains(&i),
+        |_| false,
+        |i| i == 0,
+        |_| false,
+    );
+    assert!(
+        unbound.is_empty(),
+        "an undeclared texture is not an unbound descriptor: {unbound:?}"
+    );
+
+    // ...but a buffer and a sampler are still reported, because the module
+    // predicate is asked of textures only.
+    let (unbound, _) = frag_unbound_scan(&bindings, |i| i == 1, |i| i == 3, |_| false, |_| false);
+    assert_eq!(unbound, vec![buf(2), smp(0)]);
+
+    // The class survives the scan as a type, so a consumer that needs the SPIR-V
+    // binding relocation does not have to parse it back out of a formatted
+    // string. `Display` is the only place the prefix exists.
+    assert_eq!(tex(3).to_string(), "tex3");
+    assert_eq!(buf(2).to_string(), "buf2");
+    assert_eq!(smp(0).to_string(), "smp0");
 }
 
 #[cfg(feature = "backend-vulkan")]
@@ -800,8 +905,8 @@ fn metal_icb_inheritance_line_keeps_pipeline_and_sanitized_driver_detail() {
 #[cfg(feature = "backend-vulkan")]
 fn shader_pull_reflection(bindings: &[u32]) -> metal2vulkan::reflect::ShaderReflection {
     use metal2vulkan::reflect::{
-        DescriptorLocation, ResourceBinding, ResourceKind, ShaderReflection, ShaderStage,
-        VertexBuiltins, REFLECTION_VERSION,
+        BufferExtent, DescriptorLocation, ResourceBinding, ResourceKind, ShaderReflection,
+        ShaderStage, VertexBuiltins, REFLECTION_VERSION,
     };
     ShaderReflection {
         reflection_version: REFLECTION_VERSION,
@@ -816,6 +921,9 @@ fn shader_pull_reflection(bindings: &[u32]) -> metal2vulkan::reflect::ShaderRefl
                 param_index: None,
                 address_space: None,
                 declared_size: None,
+                // What the translator emits for a buffer carrying neither an
+                // object size nor a type name: the class that forbids narrowing.
+                extent: Some(BufferExtent::Unknown),
                 type_layout: None,
                 type_name: None,
                 texture_shape: None,
@@ -965,7 +1073,7 @@ fn gva_chain_identity_rules() {
             width: 16,
             height: 16,
             generation: 0,
-            bgra: false,
+            format: crate::backend::vulkan::translate::pixel::RESIDENT_RGBA_FORMAT,
         }),
         "color0 declares the extent"
     );
@@ -1022,7 +1130,7 @@ fn render_chain_identity_covers_type11_and_gva_targets() {
             width: 64,
             height: 32,
             generation: 0,
-            bgra: false,
+            format: crate::backend::vulkan::translate::pixel::RESIDENT_RGBA_FORMAT,
         })
     );
 }
@@ -2834,6 +2942,92 @@ fn view_format_reinterprets_bgra_storage_as_rgba() {
     assert_eq!(out, [10, 20, 30, 40]);
 }
 
+/// A solid landing puts the same bytes in the guest's pages as the full-image
+/// one it replaced.
+///
+/// The repeated-row writer converts once and copies that conversion to every
+/// destination row, where the full-image writer converted each of its identical
+/// rows. Those are two spellings of one result and this asserts they agree, over
+/// a destination whose row stride is wider than its tight row — the case where a
+/// stride mistake in the repeated path would write the right bytes to the wrong
+/// offsets and a tight-stride test would not see it.
+///
+/// Fails without the change only in the direction that matters: it is the
+/// equivalence, not the speed, that a future edit to `SourceRows` could break.
+#[test]
+fn a_solid_gva_landing_matches_the_full_image_landing_it_replaced() {
+    use crate::contract::endian::st32;
+    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+    use crate::contract::pixel_format::{solid_rgba8, MTL_FORMAT_BGRA8_UNORM};
+    use crate::runtime::host::FakeHost;
+
+    // Two identical guests, so the two writers land into two byte-for-byte
+    // equal address spaces and the comparison is of the writes alone.
+    fn guest(page_shift: u32) -> (FakeHost, DeviceState) {
+        let mut host = FakeHost::new();
+        let dir_gpa = 2u64 << page_shift;
+        let root_gpa = 3u64 << page_shift;
+        host.map_range(dir_gpa, 0x20, 0);
+        host.map_range(root_gpa, 1 << page_shift, 0);
+        // Eight data pages, contiguous, so the destination span resolves whole.
+        for p in 0..8u64 {
+            host.map_range((5 + p) << page_shift, 1 << page_shift, 0);
+        }
+        let mut d = [0u8; 8];
+        st32(&mut d[DIRECTORY_ROOT_PFN as usize..], 3);
+        st32(&mut d[DIRECTORY_DEPTH as usize..], 1);
+        let _ = host.write_gpa(dir_gpa, &d);
+        for p in 0..8u64 {
+            st32(&mut d[..4], (5 + p) as u32);
+            let _ = host.write_gpa(root_gpa + (1 + p) * 4, &d[..4]);
+        }
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        state.page_shift = page_shift;
+        state.define_task(1, 0x1000, 2);
+        (host, state)
+    }
+
+    let page_shift = PAGE_SHIFT_X86;
+    let gva = 1u64 << page_shift;
+    let (w, h) = (7u32, 5u32);
+    let bpr = 64u32; // wider than the 28-byte tight row, on purpose
+    let clear = [0.2_f64, 0.4, 0.6, 1.0];
+
+    let (mut h1, mut s1) = guest(page_shift);
+    assert!(
+        write_gva_solid8(&mut s1, &mut h1, 1, gva, w, h, bpr, MTL_FORMAT_BGRA8_UNORM, &clear)
+            .is_ok(),
+        "the solid landing must succeed"
+    );
+
+    let (mut h2, mut s2) = guest(page_shift);
+    let full = solid_rgba8(w, h, &clear);
+    assert!(
+        write_gva_rgba8(
+            &mut s2,
+            &mut h2,
+            1,
+            gva,
+            w,
+            h,
+            bpr,
+            MTL_FORMAT_BGRA8_UNORM,
+            &full
+        )
+        .is_ok(),
+        "the full-image landing must succeed"
+    );
+
+    let span = (h as usize) * (bpr as usize);
+    let mut a = vec![0u8; span];
+    let mut b = vec![0u8; span];
+    assert!(gva_mem::read_task_gva(&h1, &s1.tasks[1], gva, &mut a, page_shift).is_ok());
+    assert!(gva_mem::read_task_gva(&h2, &s2.tasks[1], gva, &mut b, page_shift).is_ok());
+    assert_eq!(a, b, "the two landings must be byte-identical");
+    // …and not both empty, which would make the assertion above vacuous.
+    assert!(a.iter().any(|&x| x != 0), "the landing wrote something");
+}
+
 /// Regression: type-2/3 GVA Stores must walk with device page_shift (x86=12).
 /// Using the arm64e-default fallback made every `linux_m2v_store gva=… ok=0`
 /// on Ventura/Tahoe x86 product boots.
@@ -4298,7 +4492,7 @@ fn a_secondary_mrt_slot_binds_its_own_blend() {
         width: 64,
         height: 64,
         generation: 0,
-        bgra: false,
+        format: crate::backend::vulkan::translate::pixel::RESIDENT_RGBA_FORMAT,
     };
 
     let mut host = crate::runtime::host::FakeHost::new();
@@ -4382,7 +4576,7 @@ fn an_unbuildable_secondary_refuses_the_draw_rather_than_dropping_to_single_rt()
         width: 64,
         height: 64,
         generation: 0,
-        bgra: false,
+        format: crate::backend::vulkan::translate::pixel::RESIDENT_RGBA_FORMAT,
     };
     let slot0 = ColorRtRequest {
         slot: 0,
@@ -4893,6 +5087,96 @@ fn a_synchronous_gva_store_is_bounded_to_the_pages_the_command_named() {
     assert!(
         sync_store_allowed_pages(&state, &host, 1, Some(&no_gva), true).is_none(),
         "no GVA target, nothing to bound"
+    );
+}
+
+/// A draw the engine never attempted is counted, with the vertices it cost.
+///
+/// `encode_draw_chain`'s skipped-draw tail spends one `linux_clear_store
+/// draws_skipped` line per `(pipeline, slug)`, so a pipeline refused every frame
+/// reports one line for however many draws it lost. The two census counters do
+/// not dedupe, and they are therefore the only readings that can be summed into
+/// "what did this refusal cost the guest". A bare zero from them has to mean no
+/// draw was skipped, never that nobody was counting.
+///
+/// Both are asserted because they fail differently. Dropping the draw count
+/// loses the rate; wiring the vertex count to a neighbouring field of
+/// `DrawEncodeRequest` — `instance_count` and `first_vertex` sit beside
+/// `vertex_count` and every one of them is a `u32` — still moves a counter, and
+/// only a magnitude check separates a skipped six-vertex quad from a skipped
+/// fifty-four-vertex pass. The delta form is deliberate: the census map is
+/// process-global and the rest of the suite shares it.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn a_draw_skipped_after_an_engine_refusal_is_counted_with_the_vertices_it_cost() {
+    use crate::runtime::drain::store_route_count;
+
+    const DRAWS: &str = "draws_skipped_after_engine_refusal";
+    const VERTICES: &str = "draws_skipped_after_engine_refusal_vertices";
+    /// Not 1, 3 or 6: a count that could be confused with an instance count, a
+    /// triangle or a full-screen quad cannot show the vertex counter reading
+    /// the wrong field.
+    const VERTEX_COUNT: u32 = 54;
+
+    let rig = StoreRig::new(8);
+    let (mut host, mut state) = (rig.host, rig.state);
+
+    let mut req = DrawEncodeRequest {
+        task_id: 1,
+        // No pipeline, so the engine draw is never attempted at all — the
+        // cheapest way to the tail, and the arm whose refusal the emitter has
+        // to name itself because there is no engine slug to borrow.
+        pipeline_ref: 0,
+        vertex_count: VERTEX_COUNT,
+        instance_count: 1,
+        primitive_type: 3,
+        first_vertex: 0,
+        colors: vec![ColorRtRequest {
+            slot: 0,
+            texture_ref: 7,
+            // 64x64 BGRA8 at a tight stride is exactly one 16 KiB page of the
+            // rig's walkable task, so the CLEAR seed Store lands and the tail's
+            // `any_store` precondition is met.
+            target_gva: StoreRig::gva(1),
+            row_stride: 64 * 4,
+            width: 64,
+            height: 64,
+            format: crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM,
+            load_action: MTL_LOAD_ACTION_CLEAR,
+            store_action: MTL_STORE_ACTION_STORE,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+
+    let draws_before = store_route_count(DRAWS);
+    let vertices_before = store_route_count(VERTICES);
+
+    let cap = crate::observe::FailCapture::start();
+    let st = encode_draw_chain(&mut state, &mut host, &mut req, true, false).0;
+    let lines = cap.lines();
+    drop(cap);
+
+    assert!(
+        matches!(st, EncodeStatus::Ok),
+        "the CLEAR seed Store landed, so the record stored: {st:?}"
+    );
+    assert!(
+        lines.iter().any(|l| {
+            l.contains("reason=draws_skipped_after_engine_refusal")
+                && l.contains("refused_by=engine_draw_not_attempted")
+        }),
+        "the counted skip is the one the tail names: {lines:?}"
+    );
+    assert_eq!(
+        store_route_count(DRAWS),
+        draws_before + 1,
+        "one skipped draw is one count, whatever the line dedup did with it"
+    );
+    assert_eq!(
+        store_route_count(VERTICES),
+        vertices_before + u64::from(VERTEX_COUNT),
+        "the vertices banded beside the draw are the draw's own vertex count"
     );
 }
 
@@ -5629,4 +5913,41 @@ fn a_depth_attachment_is_keyed_on_the_guest_texture_the_pass_bound() {
         None,
         "and neither does a pass with no depth attachment at all"
     );
+}
+
+/// Only a texture gap the fragment module statically uses is substituted for.
+///
+/// The three narrowings are the whole content of the rule and each one fails in
+/// a different direction. Filling a `DeclaredUnused` gap pays a descriptor for a
+/// variable nothing references and destroys the census that separated it from a
+/// real violation; filling an `Ambiguous` one picks between two variables on a
+/// binding, which is a guess; filling a buffer or sampler gap invents a resource
+/// where the caller either has its own default or has no neutral at all. Leaving
+/// a `Used` texture gap alone is the one that kills the host process, because
+/// Mesa's Intel driver divides `(use_count << 7)` by the array size its own
+/// zero-fill gave the binding the layout never declared.
+#[test]
+#[cfg(feature = "backend-vulkan")]
+fn only_a_statically_used_texture_gap_is_given_a_neutral_image() {
+    use crate::runtime::spirv_bind::DescriptorUse;
+
+    let gap = |class, metal_index| FragUnbound { class, metal_index };
+    let uses = vec![
+        (gap(FragUnboundClass::Texture, 3), DescriptorUse::Used),
+        (
+            gap(FragUnboundClass::Texture, 4),
+            DescriptorUse::DeclaredUnused,
+        ),
+        (gap(FragUnboundClass::Texture, 5), DescriptorUse::Ambiguous),
+        (gap(FragUnboundClass::Texture, 6), DescriptorUse::NotDeclared),
+        // Both other classes answer `Used` unconditionally from
+        // `frag_unbound_static_use`, so they are exactly the case that would slip
+        // through a filter written on the verdict alone.
+        (gap(FragUnboundClass::Buffer, 7), DescriptorUse::Used),
+        (gap(FragUnboundClass::Sampler, 8), DescriptorUse::Used),
+    ];
+
+    assert_eq!(frag_unbound_textures_to_neutralize(&uses), vec![3]);
+    // Nothing flagged, nothing substituted — the hot path.
+    assert!(frag_unbound_textures_to_neutralize(&[]).is_empty());
 }

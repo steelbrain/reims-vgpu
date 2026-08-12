@@ -25,7 +25,7 @@ use super::*;
 /// input back-channel is the window thread's `InputSink`, not stored here — it
 /// pushes onto `prompt_actions` directly.
 #[cfg(feature = "host-window")]
-type WindowFrameKey = (u32, u32, u64);
+type WindowFrameKey = (u32, u32, u32, u64);
 
 /// `pub(super)` for `device::tests::window_publish_key_advances_for_in_place_present`,
 /// which is `cfg`-ed to macOS + `host-window` — a combination no Linux arm
@@ -40,6 +40,11 @@ pub(super) fn window_frame_key(present: &crate::model::PresentState) -> WindowFr
     (
         present.frame_mapping,
         present.frame_generation,
+        // The pixel stamp beside the page stamp. A lazy type-11 Store publishes
+        // a new frame without writing a guest page, so `frame_generation` holds
+        // still across frames that genuinely differ and this is the only term
+        // that moves — see `PresentState::frame_content_epoch`.
+        present.frame_content_epoch,
         present_epoch,
     )
 }
@@ -56,7 +61,8 @@ pub(crate) struct WindowLink {
     /// the only thing that knows a frame exists, so it is the only thing that
     /// can end the polling.
     wake: crate::host_window::present::WindowWakeHandle,
-    /// `(mapping_id, generation, present_epoch)` of the last frame published.
+    /// `(mapping_id, generation, content_epoch, present_epoch)` of the last
+    /// frame published.
     ///
     /// The resource generation alone is insufficient: the guest can update a
     /// resident in place and present it again without changing that identity.
@@ -192,7 +198,7 @@ pub fn device_window_start(id: u64, width: u32, height: u32) -> bool {
     *link = Some(WindowLink {
         frames,
         wake,
-        last: (u32::MAX, u32::MAX, u64::MAX),
+        last: (u32::MAX, u32::MAX, u32::MAX, u64::MAX),
         seq: 0,
         bgra_short_geom: None,
         stop,

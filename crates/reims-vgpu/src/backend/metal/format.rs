@@ -1,23 +1,41 @@
 //! Pixel-format helpers matching ObjC `reims_vgpu_storage_image_format` / `reims_vgpu_mtl_pixel_format_bpp`.
 
-use crate::backend::metal::abi::*;
+use crate::contract::pixel_format::StorageImageSelector;
 use metal::MTLPixelFormat;
 
-pub fn storage_image_format(format: u32) -> Option<(MTLPixelFormat, usize)> {
-    match format {
-        REIMS_VGPU_SIMG_RGBA8_UINT => Some((MTLPixelFormat::RGBA8Uint, 4)),
-        REIMS_VGPU_SIMG_RGBA8_SINT => Some((MTLPixelFormat::RGBA8Sint, 4)),
-        REIMS_VGPU_SIMG_RGBA16_UINT => Some((MTLPixelFormat::RGBA16Uint, 8)),
-        REIMS_VGPU_SIMG_RGBA16_FLOAT => Some((MTLPixelFormat::RGBA16Float, 8)),
-        REIMS_VGPU_SIMG_RGBA32_FLOAT => Some((MTLPixelFormat::RGBA32Float, 16)),
-        REIMS_VGPU_SIMG_RGBA8_UNORM => Some((MTLPixelFormat::RGBA8Unorm, 4)),
-        REIMS_VGPU_SIMG_BGRA8_UNORM => Some((MTLPixelFormat::BGRA8Unorm, 4)),
-        REIMS_VGPU_SIMG_R16_FLOAT => Some((MTLPixelFormat::R16Float, 2)),
-        REIMS_VGPU_SIMG_RG16_FLOAT => Some((MTLPixelFormat::RG16Float, 4)),
-        REIMS_VGPU_SIMG_R8_UNORM => Some((MTLPixelFormat::R8Unorm, 1)),
-        REIMS_VGPU_SIMG_RG8_UNORM => Some((MTLPixelFormat::RG8Unorm, 2)),
-        REIMS_VGPU_SIMG_RGBA32_UINT => Some((MTLPixelFormat::RGBA32Uint, 16)),
-        _ => None,
+/// The Metal pixel format and texel width for a contract [`StorageImageSelector`].
+///
+/// **Total, and it has to be.** This used to match the selector's `u32` ordinal
+/// against a list of `REIMS_VGPU_SIMG_*` constants that were hand-copied from the
+/// enum's discriminants, returning `None` for anything absent — and it had
+/// already drifted: `StorageImageSelector::R32Uint` existed in the contract with
+/// no constant and no arm here, so every `R32Uint` storage bind on the whole
+/// arm64 pathway refused as `metal_selector_unsupported` while the Vulkan
+/// pathway ran it. Nothing could see the gap, because a `u32` match has no
+/// coverage for a compiler to check.
+///
+/// Taking the enum makes the arms exhaustive, so the drift is now a build
+/// failure on the Metal arm — which the cross-compiled clippy run reaches from a
+/// Linux host, and is the only tool here that does. The `REIMS_VGPU_SIMG_*`
+/// constants are gone rather than derived: they were a second spelling of the
+/// discriminants with no other reader, and a second spelling that can still be
+/// assembled eventually is.
+pub fn storage_image_format(selector: StorageImageSelector) -> (MTLPixelFormat, usize) {
+    use StorageImageSelector as S;
+    match selector {
+        S::Rgba8Uint => (MTLPixelFormat::RGBA8Uint, 4),
+        S::Rgba8Sint => (MTLPixelFormat::RGBA8Sint, 4),
+        S::Rgba16Uint => (MTLPixelFormat::RGBA16Uint, 8),
+        S::Rgba16Float => (MTLPixelFormat::RGBA16Float, 8),
+        S::Rgba32Float => (MTLPixelFormat::RGBA32Float, 16),
+        S::Rgba8Unorm => (MTLPixelFormat::RGBA8Unorm, 4),
+        S::Bgra8Unorm => (MTLPixelFormat::BGRA8Unorm, 4),
+        S::R16Float => (MTLPixelFormat::R16Float, 2),
+        S::Rg16Float => (MTLPixelFormat::RG16Float, 4),
+        S::R8Unorm => (MTLPixelFormat::R8Unorm, 1),
+        S::Rg8Unorm => (MTLPixelFormat::RG8Unorm, 2),
+        S::Rgba32Uint => (MTLPixelFormat::RGBA32Uint, 16),
+        S::R32Uint => (MTLPixelFormat::R32Uint, 4),
     }
 }
 
@@ -45,32 +63,49 @@ pub fn mtl_pixel_format_bpp(pixel_format: u32) -> Option<usize> {
 mod tests {
     use super::*;
 
+    /// Every selector's Metal format and texel width, written out rather than
+    /// derived from the table under test.
+    ///
+    /// The widths are checked against [`crate::contract::pixel_format`] rather
+    /// than only against this list, because the width is the number a staging
+    /// buffer is sized by and two tables disagreeing about it is a short read.
     #[test]
     fn storage_image_formats_report_their_metal_format_and_texel_size() {
+        use crate::contract::pixel_format as pf;
+        use StorageImageSelector as S;
+
         let cases = [
-            (REIMS_VGPU_SIMG_RGBA8_UINT, MTLPixelFormat::RGBA8Uint, 4),
-            (REIMS_VGPU_SIMG_RGBA8_SINT, MTLPixelFormat::RGBA8Sint, 4),
-            (REIMS_VGPU_SIMG_RGBA16_UINT, MTLPixelFormat::RGBA16Uint, 8),
-            (REIMS_VGPU_SIMG_RGBA16_FLOAT, MTLPixelFormat::RGBA16Float, 8),
-            (
-                REIMS_VGPU_SIMG_RGBA32_FLOAT,
-                MTLPixelFormat::RGBA32Float,
-                16,
-            ),
-            (REIMS_VGPU_SIMG_RGBA8_UNORM, MTLPixelFormat::RGBA8Unorm, 4),
-            (REIMS_VGPU_SIMG_BGRA8_UNORM, MTLPixelFormat::BGRA8Unorm, 4),
-            (REIMS_VGPU_SIMG_R16_FLOAT, MTLPixelFormat::R16Float, 2),
-            (REIMS_VGPU_SIMG_RG16_FLOAT, MTLPixelFormat::RG16Float, 4),
-            (REIMS_VGPU_SIMG_R8_UNORM, MTLPixelFormat::R8Unorm, 1),
-            (REIMS_VGPU_SIMG_RG8_UNORM, MTLPixelFormat::RG8Unorm, 2),
-            (REIMS_VGPU_SIMG_RGBA32_UINT, MTLPixelFormat::RGBA32Uint, 16),
+            (S::Rgba8Uint, MTLPixelFormat::RGBA8Uint, 4, pf::MTL_FORMAT_RGBA8_UINT),
+            (S::Rgba8Sint, MTLPixelFormat::RGBA8Sint, 4, pf::MTL_FORMAT_RGBA8_SINT),
+            (S::Rgba16Uint, MTLPixelFormat::RGBA16Uint, 8, pf::MTL_FORMAT_RGBA16_UINT),
+            (S::Rgba16Float, MTLPixelFormat::RGBA16Float, 8, pf::MTL_FORMAT_RGBA16_FLOAT),
+            (S::Rgba32Float, MTLPixelFormat::RGBA32Float, 16, pf::MTL_FORMAT_RGBA32_FLOAT),
+            (S::Rgba8Unorm, MTLPixelFormat::RGBA8Unorm, 4, pf::MTL_FORMAT_RGBA8_UNORM),
+            (S::Bgra8Unorm, MTLPixelFormat::BGRA8Unorm, 4, pf::MTL_FORMAT_BGRA8_UNORM),
+            (S::R16Float, MTLPixelFormat::R16Float, 2, pf::MTL_FORMAT_R16_FLOAT),
+            (S::Rg16Float, MTLPixelFormat::RG16Float, 4, pf::MTL_FORMAT_RG16_FLOAT),
+            (S::R8Unorm, MTLPixelFormat::R8Unorm, 1, pf::MTL_FORMAT_R8_UNORM),
+            (S::Rg8Unorm, MTLPixelFormat::RG8Unorm, 2, pf::MTL_FORMAT_RG8_UNORM),
+            (S::Rgba32Uint, MTLPixelFormat::RGBA32Uint, 16, pf::MTL_FORMAT_RGBA32_UINT),
+            // Present in the contract with no arm here until 2026-08-10, which
+            // cost the arm64 pathway every `R32Uint` storage bind.
+            (S::R32Uint, MTLPixelFormat::R32Uint, 4, pf::MTL_FORMAT_R32_UINT),
         ];
-        for (wire, metal, bytes) in cases {
-            let (actual, actual_bytes) = storage_image_format(wire).expect("mapped format");
+        for (selector, metal, bytes, mtl) in cases {
+            let (actual, actual_bytes) = storage_image_format(selector);
             assert_eq!(actual as u64, metal as u64);
             assert_eq!(actual_bytes, bytes);
+            assert_eq!(
+                pf::bytes_per_pixel(mtl),
+                Some(bytes as u32),
+                "{selector:?} and the pixel table disagree on the texel width"
+            );
+            assert_eq!(
+                pf::storage_selector(mtl),
+                Some(selector),
+                "{mtl:#x} does not select {selector:?}"
+            );
         }
-        assert_eq!(storage_image_format(u32::MAX), None);
         assert_eq!(mtl_pixel_format_bpp(u32::MAX), None);
     }
 

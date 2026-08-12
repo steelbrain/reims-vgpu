@@ -6,6 +6,34 @@
 //! - explicit status codes
 //! - catch_unwind on every entry
 //!
+//! # Which thread arrives at each entry point
+//!
+//! This is the boundary QEMU's threads cross, so it is the only place the map
+//! is true for both shims at once. Nothing here enforces it — it is what the two
+//! shims do, and it is why [`crate::backend::vulkan::engine`]'s lock census
+//! separates `worker` from `device`.
+//!
+//! | Work | x86 / PCI | arm64 / MMIO |
+//! |---|---|---|
+//! | Guest command execution (`device_drain`) | dedicated `reims-vgpu-pci-drain` thread | **the vCPU thread, inside its MMIO store** |
+//! | `HostAction` delivery (`device_pop_action`) | main-loop BH | main-loop BH |
+//! | Poll / re-drive (`device_poll`) | 4 ms heartbeat thread | 4 ms main-loop timer |
+//! | Window event loop and `vkQueuePresentKHR` | dedicated `reims-vgpu-window` thread | **process main thread** (AppKit) |
+//!
+//! **No pathway executes guest GPU work on QEMU's main loop**, and neither of
+//! the two exceptions above is an oversight:
+//!
+//! * The arm64 drain runs on the vCPU because the mapper rail resolves guest
+//!   *virtual* addresses, and `reims_vgpu_shim_read_kva` needs `current_cpu`
+//!   set. Moving it to a worker would have to fall back to `first_cpu` or
+//!   `do_run_on_cpu`, and the shim header records why that is an AB-BA hang
+//!   rather than a slower answer. The cost is real and is the guest's own: a
+//!   tranche stalls the vCPU that handed it over, and `engine_lock`'s `device`
+//!   counters are what price it.
+//! * The macOS window loop runs on the process main thread because AppKit
+//!   requires it. QEMU's Darwin wrapper has already moved emulation off that
+//!   thread by then, so the two do not share.
+//!
 //! # Safety
 //! Every exported unsafe entry point is called through the matching C header.
 //! Opaque device pointers must come from `reims_vgpu_device_create`; input buffers must
@@ -461,6 +489,13 @@ pub unsafe extern "C" fn reims_vgpu_qemu_device_drain(handle: u64) -> c_int {
             if handle == 0 {
                 return REIMS_VGPU_QEMU_ERR_ARGS;
             }
+            // Before the drain, so the first tranche's engine-lock acquires are
+            // already attributed to the worker. Entering this function is the
+            // only property that distinguishes the drain thread from a vCPU
+            // inside an MMIO store, and telling those apart is what makes a
+            // stalled guest attributable — see `EngineLockSite`.
+            #[cfg(feature = "backend-vulkan")]
+            crate::backend::vulkan::engine::mark_drain_thread();
             if device_drain(handle) {
                 REIMS_VGPU_QEMU_OK
             } else {

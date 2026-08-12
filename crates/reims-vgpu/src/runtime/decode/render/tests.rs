@@ -612,21 +612,34 @@ fn a_scissor_covers_its_target_only_when_every_term_says_so() {
 /// the Metal rail. This drives each field on its own, from both shapes, so
 /// a consumer that reconstructs three of the four fails here rather than at
 /// a guest that binds an array layer.
+///
+/// `level` is driven from both [`LevelSupport`] arms, because it is the one
+/// field whose answer depends on which rail is asking: a colour attachment's
+/// level resolves to its own plane in the guest allocation and a depth
+/// attachment's does not. Every other field must refuse on both arms — an arm
+/// that reads `AnyLevel` as "anything goes" fails here.
 #[test]
 fn every_field_of_the_attachment_prefix_decides_bindability() {
+    for levels in [LevelSupport::LevelZeroOnly, LevelSupport::AnyLevel] {
+        assert!(
+            attachment_subresource_is_bindable(AttachSubresource::default(), levels),
+            "{levels:?}: the whole texture at level 0, slice 0, plane 0 with no resolve is bindable"
+        );
+    }
+    let mip = AttachSubresource {
+        level: 1,
+        ..AttachSubresource::default()
+    };
     assert!(
-        attachment_subresource_is_bindable(AttachSubresource::default()),
-        "the whole texture at level 0, slice 0, plane 0 with no resolve is bindable"
+        !attachment_subresource_is_bindable(mip, LevelSupport::LevelZeroOnly),
+        "a rail that only renders level 0 must refuse a level the guest named"
+    );
+    assert!(
+        attachment_subresource_is_bindable(mip, LevelSupport::AnyLevel),
+        "a rail that resolves the named level's own plane must admit it"
     );
 
     for (name, sub) in [
-        (
-            "level",
-            AttachSubresource {
-                level: 1,
-                ..AttachSubresource::default()
-            },
-        ),
         (
             "slice",
             AttachSubresource {
@@ -649,10 +662,12 @@ fn every_field_of_the_attachment_prefix_decides_bindability() {
             },
         ),
     ] {
-        assert!(
-            !attachment_subresource_is_bindable(sub),
-            "a non-default {name} must refuse the attachment on its own"
-        );
+        for levels in [LevelSupport::LevelZeroOnly, LevelSupport::AnyLevel] {
+            assert!(
+                !attachment_subresource_is_bindable(sub, levels),
+                "{levels:?}: a non-default {name} must refuse the attachment on its own"
+            );
+        }
     }
 
     // And both shapes hand all four to the rule: a field a conversion drops

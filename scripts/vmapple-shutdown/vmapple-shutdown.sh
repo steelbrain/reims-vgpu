@@ -13,7 +13,7 @@
 # sometimes does, sometimes leaves QEMU wedged (CPU halted, process alive). So
 # after the in-guest halt we wait a short GRACE for a self-exit and otherwise
 # QMP `quit` to terminate it. Because macOS has already synced/halted by then,
-# that quit still lands a clean disk (and `vm/boot-arm64.sh --snapshot` captures on the
+# that quit still lands a clean disk (and `vm/boot-arm64.sh --capture` captures on the
 # rc=0 exit). Every boot reverts to a snapshot anyway, so a slightly-early quit is
 # harmless.
 #

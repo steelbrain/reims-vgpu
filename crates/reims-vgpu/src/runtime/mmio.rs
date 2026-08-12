@@ -174,6 +174,15 @@ pub fn gfx_write<H: HostMemory + HostOps>(
                 ));
             }
             state.gfx.version = negotiated;
+            // Take the guest-RAM import here rather than letting the first
+            // gather take it. This handshake is the guest driver's first act
+            // and its display pipe does not exist yet, so the seconds the
+            // import costs on a multi-gigabyte RAMBlock are spent where nothing
+            // is timing them. Left lazy it lands inside the first draw, inside
+            // a display transaction the guest abandons after 1000 ms — see
+            // `guest_ram_map::warm` for both halves of the cost and why neither
+            // may run before the backend has published a granularity.
+            crate::runtime::guest_ram_map::warm(host);
         }
         GFX_REG_EFI_DISPLAY => state.gfx.efi_display = val,
         GFX_REG_EFI_MODE_SELECT => state.gfx.efi_mode_select = val,

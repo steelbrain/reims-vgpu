@@ -38,7 +38,8 @@ current bundle must survive until the new one proves bootable.
 ## Step 3 — finish the golden image (one bootstrap boot)
 
 ```sh
-vm/boot-arm64.sh --snapshot        # no snapshot yet → boots the provisioned disk write-through
+mkdir -p vm/guest/rails/<rail>              # a rail is one guest OS line
+vm/boot-arm64.sh --rail <rail> --capture    # rail is empty → boots the provisioned disk write-through
 ```
 
 Complete Setup Assistant (create the user), enable Remote Login

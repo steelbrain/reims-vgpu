@@ -92,6 +92,16 @@ pub struct GvaTargetKey {
     pub generation: u64,
     pub width: u32,
     pub height: u32,
+    /// Channel order of the resident this key was taken from.
+    ///
+    /// It is an order and not the resident's whole format because this key
+    /// names a **guest span**, and every format the identity can hold today
+    /// maps onto one of the two orders one-for-one. That stops being true the
+    /// moment a render target may be wider than eight bits per channel: RGBA8
+    /// and half-float RGBA are one order and two residents, and they would
+    /// share a key here. Whoever widens
+    /// [`crate::backend::vulkan::engine::TargetIdentity::resident_format`]'s
+    /// range widens this with it.
     pub bgra: bool,
 }
 
@@ -111,13 +121,13 @@ impl GvaTargetKey {
                 width,
                 height,
                 generation,
-                bgra,
+                format,
             } if generation != 0 && gva != 0 => Some(Self {
                 gva,
                 generation,
                 width,
                 height,
-                bgra,
+                bgra: format == crate::backend::vulkan::translate::pixel::SCANOUT_FORMAT,
             }),
             _ => None,
         }
@@ -341,8 +351,7 @@ impl GvaWriteReach {
             Self::Host(HostWriteVerdict::Quiet) => "gvaw_host_quiet",
             Self::Host(HostWriteVerdict::Overlap) => "gvaw_host_overlap",
             Self::Host(HostWriteVerdict::Unnamed) => "gvaw_host_unnamed",
-            Self::Host(HostWriteVerdict::Aged) => "gvaw_host_aged",
-            Self::Host(HostWriteVerdict::Unresolvable) => "gvaw_host_unresolvable",
+            Self::Host(HostWriteVerdict::Forgotten) => "gvaw_host_forgotten",
         }
     }
 
@@ -371,7 +380,7 @@ pub fn reach<H: HostOps>(state: &DeviceState, host: &H, key: GvaTargetKey) -> Gv
     }
     let host_verdict = state
         .host_writes
-        .wrote_any_since(state, e.host_epoch_at_store, &e.gpas);
+        .wrote_any_since(e.host_epoch_at_store, &e.gpas);
     match host_verdict {
         HostWriteVerdict::Quiet => GvaWriteReach::Quiet,
         other => GvaWriteReach::Host(other),
@@ -475,11 +484,10 @@ mod tests {
         );
     }
 
-    /// A writer that could not name its pages invalidates everything older, and
-    /// an aged-out record cannot rule anything out. Both must refuse: reading
-    /// either as quiet is the wrong-frame direction.
+    /// A writer that could not name its pages invalidates everything older —
+    /// reading that as quiet is the wrong-frame direction.
     #[test]
-    fn an_unnamed_or_aged_host_write_refuses_rather_than_reading_quiet() {
+    fn an_unnamed_host_write_refuses_rather_than_reading_quiet() {
         let mut state = device();
         let mut host = FakeHost::new();
         let pages = [3 * PAGE];
@@ -489,16 +497,41 @@ mod tests {
             reach(&state, &host, key(0xabc)),
             GvaWriteReach::Host(HostWriteVerdict::Unnamed)
         );
+    }
 
-        // And the aged case, which is the one a Store-to-LOAD interval will
-        // actually hit: push the ring past what it remembers.
+    /// A Store-to-LOAD interval is the longest reach in the device, and it is
+    /// now answered **exactly** rather than refused for age.
+    ///
+    /// This used to assert `Aged` — the ring's horizon was what a deep reach
+    /// hit, and refusing was the only safe answer available. The page-keyed
+    /// record has no horizon, so depth alone no longer costs a re-gather. The
+    /// half that must not change is the second one: a deep reach that really did
+    /// land in these pages still refuses.
+    #[test]
+    fn a_reach_past_the_rings_horizon_is_answered_by_the_pages_and_not_by_its_depth() {
+        let mut state = device();
+        let mut host = FakeHost::new();
+        let pages = [3 * PAGE];
+
         armed(&mut state, &mut host, key(0xabc), &pages);
         for i in 0..256u64 {
             state.note_host_wrote_pages(vec![(100 + i) * PAGE]);
         }
         assert_eq!(
             reach(&state, &host, key(0xabc)),
-            GvaWriteReach::Host(HostWriteVerdict::Aged)
+            GvaWriteReach::Quiet,
+            "256 writes to other pages do not touch this window"
+        );
+
+        armed(&mut state, &mut host, key(0xabc), &pages);
+        state.note_host_wrote_pages(vec![3 * PAGE]);
+        for i in 0..256u64 {
+            state.note_host_wrote_pages(vec![(100 + i) * PAGE]);
+        }
+        assert_eq!(
+            reach(&state, &host, key(0xabc)),
+            GvaWriteReach::Host(HostWriteVerdict::Overlap),
+            "and a write that did land here is not forgotten behind 256 later ones"
         );
     }
 

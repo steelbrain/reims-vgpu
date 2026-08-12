@@ -20,17 +20,30 @@ mod draw_execution;
 mod draw_phase;
 mod draw_preparation;
 pub(crate) mod draw_validation;
+mod driver_breadcrumb;
 mod exec;
 mod exec_compute;
 mod facade_decline;
+mod guest_scatter;
 mod host_ram;
 pub mod init_decline;
 mod pools;
+mod scatter_shader;
 pub(crate) mod stamp_completion;
+/// The requested draw-time buffer-gather working set. Re-exported for the same
+/// reason: `pools` is private, and the number this reports is what a content
+/// cache on that rail would have to be sized from.
+pub use pools::buffer_gather_working_set::census as buffer_gather_working_set_census;
+/// The requested sampled working set, re-exported for the same reason and to
+/// the same place: `pools` is private, and this line is only interpretable
+/// beside the eviction routes the census already emits.
+pub use pools::sampled_working_set::census as sampled_working_set_census;
 /// The ceiling `registry_non_pinned_peak` is read against. Re-exported because
 /// `pools` is private and the census that reports the band lives outside this
 /// module: a peak with no cap beside it is a number, not a reading.
 pub(crate) use pools::IDLE_TARGET_AGE_MS;
+pub mod gather_phase;
+pub mod gpu_span;
 pub mod reason;
 mod slab;
 pub mod stage_phase;
@@ -229,11 +242,35 @@ static ENGINE: Lazy<Mutex<EngineState>> = Lazy::new(|| Mutex::new(EngineState::n
 /// throughput it can make up, while a window delayed by the worker drops the
 /// frame it was about to show. `engine_lock` cannot say which side paid without
 /// the two being named apart, so every acquire declares itself.
+///
+/// # Why there are three and not two
+///
+/// [`Self::Worker`] used to mean "the drain worker **and** every entry point
+/// QEMU reaches that is not the window", which is three populations on one
+/// counter and the one reading nobody could take from it. The drain worker owns
+/// the lock for a whole tranche — 28-45 ms on a driven x86 boot, 117 ms at the
+/// tail — and the threads that queue behind it are not peers of each other:
+///
+/// * The **drain worker** blocking is throughput it makes up on the next
+///   tranche.
+/// * A **vCPU** blocking is the guest stopped dead inside an MMIO store, and
+///   every other emulated device's timing goes with it. That is the population
+///   an audio underrun or a late timer is a symptom of.
+/// * QEMU's **main loop** blocking inside the action BH stalls every device in
+///   the process, not just this one.
+///
+/// The last two are both [`Self::Device`]: this crate cannot tell a vCPU thread
+/// from the main loop without QEMU telling it, and the actionable split is
+/// "the render tranche" against "everything QEMU needed while it ran".
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum EngineLockSite {
-    /// The drain worker executing guest commands, and every entry point QEMU
-    /// reaches that is not the window's own event loop.
+    /// The drain worker executing guest commands. Recognised by the thread
+    /// having entered [`crate::qemu::abi::reims_vgpu_qemu_device_drain`] at
+    /// least once, which is a property no other thread has.
     Worker,
+    /// Every other entry point QEMU reaches: a vCPU inside an MMIO store, the
+    /// main loop inside the action BH, poll, reset, teardown.
+    Device,
     /// The host window's event loop: present, attach, resize, detach.
     Window,
 }
@@ -242,18 +279,46 @@ impl EngineLockSite {
     fn index(self) -> usize {
         match self {
             Self::Worker => 0,
-            Self::Window => 1,
+            Self::Device => 1,
+            Self::Window => 2,
         }
     }
 
     fn label(self) -> &'static str {
         match self {
             Self::Worker => "worker",
+            Self::Device => "device",
             Self::Window => "window",
         }
     }
 
-    const ALL: [Self; 2] = [Self::Worker, Self::Window];
+    const ALL: [Self; 3] = [Self::Worker, Self::Device, Self::Window];
+}
+
+thread_local! {
+    /// Whether this thread has ever run a drain.
+    ///
+    /// Latched rather than scoped: a thread that has drained once is the drain
+    /// worker for the process's life on both shims, and a scoped marker would
+    /// have to be restored on every early return out of a `?`-heavy call tree.
+    /// A test process that drains from its own thread labels that thread the
+    /// worker, which is what it is for the duration.
+    static IS_DRAIN_THREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Mark the calling thread as the drain worker. Called by the drain entry point
+/// before it takes the lock, so the first tranche is attributed correctly.
+pub(crate) fn mark_drain_thread() {
+    IS_DRAIN_THREAD.with(|c| c.set(true));
+}
+
+/// Which site a `lock_engine()` acquire belongs to, from the calling thread.
+fn calling_site() -> EngineLockSite {
+    if IS_DRAIN_THREAD.with(std::cell::Cell::get) {
+        EngineLockSite::Worker
+    } else {
+        EngineLockSite::Device
+    }
 }
 
 /// Wait-to-acquire and hold time on `ENGINE`, split by [`EngineLockSite`].
@@ -267,15 +332,15 @@ impl EngineLockSite {
 #[derive(Default)]
 struct EngineLockCensus {
     /// Acquires that took the mutex with no wait, per site.
-    uncontended: [std::sync::atomic::AtomicU64; 2],
+    uncontended: [std::sync::atomic::AtomicU64; EngineLockSite::ALL.len()],
     /// Acquires that found it held and had to block, per site.
-    contended: [std::sync::atomic::AtomicU64; 2],
+    contended: [std::sync::atomic::AtomicU64; EngineLockSite::ALL.len()],
     /// Wall clock blocked on the mutex, summed over `contended`.
-    wait_us: [std::sync::atomic::AtomicU64; 2],
-    wait_max_us: [std::sync::atomic::AtomicU64; 2],
+    wait_us: [std::sync::atomic::AtomicU64; EngineLockSite::ALL.len()],
+    wait_max_us: [std::sync::atomic::AtomicU64; EngineLockSite::ALL.len()],
     /// Wall clock from acquire to release, over every acquire.
-    hold_us: [std::sync::atomic::AtomicU64; 2],
-    hold_max_us: [std::sync::atomic::AtomicU64; 2],
+    hold_us: [std::sync::atomic::AtomicU64; EngineLockSite::ALL.len()],
+    hold_max_us: [std::sync::atomic::AtomicU64; EngineLockSite::ALL.len()],
 }
 
 static ENGINE_LOCK: EngineLockCensus = EngineLockCensus::new();
@@ -286,12 +351,12 @@ impl EngineLockCensus {
 
     const fn new() -> Self {
         Self {
-            uncontended: [Self::ZERO; 2],
-            contended: [Self::ZERO; 2],
-            wait_us: [Self::ZERO; 2],
-            wait_max_us: [Self::ZERO; 2],
-            hold_us: [Self::ZERO; 2],
-            hold_max_us: [Self::ZERO; 2],
+            uncontended: [Self::ZERO; EngineLockSite::ALL.len()],
+            contended: [Self::ZERO; EngineLockSite::ALL.len()],
+            wait_us: [Self::ZERO; EngineLockSite::ALL.len()],
+            wait_max_us: [Self::ZERO; EngineLockSite::ALL.len()],
+            hold_us: [Self::ZERO; EngineLockSite::ALL.len()],
+            hold_max_us: [Self::ZERO; EngineLockSite::ALL.len()],
         }
     }
 
@@ -409,9 +474,14 @@ fn lock_engine_at(site: EngineLockSite) -> EngineGuard {
 
 /// [`lock_engine_at`] for the drain worker and the QEMU entry points, which is
 /// every caller but the host window's event loop.
+///
+/// Which of the two it is comes from the calling thread rather than from the
+/// call site: the same functions are reached from a drain tranche and from a
+/// vCPU's MMIO store, so no fixed site could name both correctly. See
+/// [`EngineLockSite`] for why telling them apart is the whole point.
 #[inline]
 fn lock_engine() -> EngineGuard {
-    lock_engine_at(EngineLockSite::Worker)
+    lock_engine_at(calling_site())
 }
 
 /// Device-reset proxy: guest-derived Vulkan objects evicted at the lifetime boundary.
@@ -948,19 +1018,19 @@ pub fn write_stamp_after_guest_writes(
         Some(pair) => pair,
         None => unsafe { pools.begin_entry(ctx, counters)? },
     };
-    let record = || -> Result<(), DrawError> {
+    // `mut` because the recording now arms the slot's GPU timestamp pair, which is
+    // state on `pools`. The closure is called once, immediately below, and never
+    // held across the submit that follows.
+    let mut record = || -> Result<(), DrawError> {
         unsafe {
             if appended.is_none() {
-                ctx.device
-                    .reset_command_buffer(cb, ash::vk::CommandBufferResetFlags::empty())
-                    .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::GuestWriteResetCb, e)))?;
-                ctx.device
-                    .begin_command_buffer(
-                        cb,
-                        &ash::vk::CommandBufferBeginInfo::default()
-                            .flags(ash::vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-                    )
-                    .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::GuestWriteBeginCb, e)))?;
+                pools.begin_slot_recording(
+                    ctx,
+                    cb,
+                    gpu_span::Kind::Stamp,
+                    VkOp::GuestWriteResetCb,
+                    VkOp::GuestWriteBeginCb,
+                )?;
             }
             // `ALL_COMMANDS` on the source side is not caution: what this must
             // follow is the writeback copies (TRANSFER) *and* any draw still
@@ -1017,6 +1087,7 @@ pub fn write_stamp_after_guest_writes(
         if appended.is_some() {
             pools.batch_flush_signalling(ctx, counters, semaphore, timeline)
         } else {
+            pools.gpu_span_seal_current(ctx, cb);
             ctx.device
                 .end_command_buffer(cb)
                 .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::GuestWriteEndCb, e)))
@@ -1035,8 +1106,8 @@ pub fn write_stamp_after_guest_writes(
                         .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::GuestWriteSubmit, e)))
                 })
                 .map(|()| {
-                    let cleanup = pools.seal_entry(Vec::new(), Vec::new());
-                    pools.finish_entry_async(cleanup);
+                    let sealed = pools.seal_entry(Vec::new(), Vec::new());
+                    pools.finish_entry_async(&ctx.device, sealed);
                 })
         }
     };
@@ -1286,6 +1357,36 @@ pub fn note_resident_content_copied_out(identity: &TargetIdentity) -> bool {
 /// device recreate drops that registry before guest pages are updated. See
 /// [`crate::backend::vulkan::caps::DriverQuirk`] for what the quirk covers and
 /// how to retire it.
+/// Whether a render target's resident may be created at this texel layout's
+/// format, rather than at the engine's neutral eight-bit one.
+///
+/// The two eight-bit orders answer `true` without asking. They are the engine's
+/// own resident colour formats — every render target this device has ever
+/// created is one of them — so a query could only ever confirm them, and
+/// gating them behind one would make a target's format depend on whether a
+/// device had been resolved when the identity was minted. An identity that
+/// changes format under the same guest allocation is a registry recreate, so
+/// the answer for those two has to be constant.
+///
+/// Anything wider is a real question and is asked of the device:
+/// [`crate::backend::vulkan::caps::device_features::DeviceFeatures::color_attachment_blend`]
+/// holds one probe per [`TexelLayout`] for `COLOR_ATTACHMENT` *and*
+/// `COLOR_ATTACHMENT_BLEND` under optimal tiling. No device yet resolved
+/// answers `false`, which narrows to the format the target would have had
+/// anyway — an override or an unresolved device may never widen what the
+/// device does.
+pub fn render_target_layout_supported(layout: crate::contract::pixel_format::TexelLayout) -> bool {
+    use crate::contract::pixel_format::TexelLayout;
+    if matches!(layout, TexelLayout::Rgba8 | TexelLayout::Bgra8) {
+        return true;
+    }
+    lock_engine()
+        .owner
+        .ctx
+        .as_ref()
+        .is_some_and(|ctx| ctx.features.color_attachment_blend[layout.index()])
+}
+
 pub fn deferred_gpu_only_content_allowed() -> bool {
     lock_engine()
         .owner
@@ -1405,14 +1506,14 @@ pub fn touch_resident_target(identity: Option<&TargetIdentity>, now_ms: u64) {
 #[derive(Clone, Copy, Debug)]
 enum EngineProbe {
     StorageWriteWithoutFormat,
-    SampledR32fLinearFilter,
+    SampledLayoutLinearFilter,
 }
 
 impl EngineProbe {
     fn name(self) -> &'static str {
         match self {
             Self::StorageWriteWithoutFormat => "storage_write_without_format",
-            Self::SampledR32fLinearFilter => "sampled_r32f_linear_filter",
+            Self::SampledLayoutLinearFilter => "sampled_layout_linear_filter",
         }
     }
 
@@ -1421,7 +1522,7 @@ impl EngineProbe {
     fn discriminant(self) -> u64 {
         match self {
             Self::StorageWriteWithoutFormat => 7,
-            Self::SampledR32fLinearFilter => 9,
+            Self::SampledLayoutLinearFilter => 9,
         }
     }
 }
@@ -1533,13 +1634,21 @@ pub fn supports_storage_image_write_without_format() -> bool {
     }
 }
 
-/// Whether the bound device can sample an `R32_SFLOAT` image with **linear**
-/// filtering. Gates the native single-channel float32 sampled rail (color
-/// LUTs): `R16_SFLOAT` linear filtering is spec-mandatory and needs no gate,
-/// but `R32_SFLOAT`'s is optional and absent on Apple/MoltenVK. Returns `false`
-/// (declining the rail, leaving the sample fail-visible) if the engine cannot
-/// initialize.
-pub fn supports_sampled_r32f_linear_filter() -> bool {
+/// Whether the bound device can sample this guest texel layout's Vulkan format
+/// with **linear** filtering.
+///
+/// Gates every native sampled rail — those bind the guest's own bytes and let
+/// the sampler interpolate them, so a layout the host cannot filter must be
+/// declined rather than bound. Asked per layout rather than for the one format
+/// once known to be optional, because the mandatory-format table is an
+/// API-version assumption and does not cover the set: `R32_SFLOAT` is absent on
+/// Apple/MoltenVK and `R16_UNORM`'s linear filtering is optional too.
+///
+/// Returns `false` — declining the rail, leaving the sample fail-visible — if
+/// the engine cannot initialize.
+pub fn supports_sampled_layout_linear_filter(
+    layout: crate::contract::pixel_format::TexelLayout,
+) -> bool {
     let mut guard = lock_engine();
     let EngineState {
         ref mut owner,
@@ -1547,10 +1656,10 @@ pub fn supports_sampled_r32f_linear_filter() -> bool {
         ..
     } = &mut *guard;
     match owner.ensure(counters) {
-        Ok(ctx) => ctx.sampled_r32f_linear_filter,
+        Ok(ctx) => ctx.sampled_linear_filter[layout.index()],
         Err(error) => {
-            engine_probe_decline(EngineProbe::SampledR32fLinearFilter, &error)
-                .fail_once(EngineProbe::SampledR32fLinearFilter.discriminant());
+            engine_probe_decline(EngineProbe::SampledLayoutLinearFilter, &error)
+                .fail_once(EngineProbe::SampledLayoutLinearFilter.discriminant());
             false
         }
     }
@@ -1564,26 +1673,36 @@ pub fn supports_sampled_r32f_linear_filter() -> bool {
 /// source — `flush_intersecting`, the deferred render-flush rail — reads the same
 /// resident but additionally scatters it into the fragmented guest pages — work
 /// the oracle does not need and which the deferred-writeback rail already
-/// performs on a genuine guest read. Errors (rather than swapping channels) on a
-/// non-BGRA resident: the caller's frame buffer is BGRA8, and an RGBA resident
-/// would hand the proxies channel-swapped pixels.
+/// performs on a genuine guest read.
+///
+/// **Converts rather than refusing.** The caller's frame buffer is BGRA8 and
+/// this is the only source the present capture has left — a refusal here is not
+/// a fallback, it is the host window holding its previous retain until some
+/// later frame happens to be readable. That was survivable while every resident
+/// this could name was created in guest scanout order; it stopped being so once
+/// a type-11 mapping's resident follows the format the mapping declares, because
+/// a scanout plane declared at anything else would have frozen the window
+/// outright. So the readback's own reported order decides, and a resident that
+/// is not already BGRA8 pays one exchange — [`read_target`]'s rail has already
+/// narrowed a wide one to four bytes by then, so the exchange is always over
+/// RGBA8.
 ///
 /// Returns `None` for every *expected* absence — unknown identity, no ready
-/// content, non-BGRA resident, or a short/oversized readback — so the caller can
-/// fall back silently. These are speculative conditions on a normal boot (a cold
-/// mid has no resident yet), not failures worth a fail-log line.
+/// content, or a short/oversized readback — so the caller can fall back
+/// silently. These are speculative conditions on a normal boot (a cold mid has
+/// no resident yet), not failures worth a fail-log line.
 pub fn read_resident_bgra(identity: &TargetIdentity, need: usize) -> Option<Vec<u8>> {
     {
         let guard = lock_engine();
         let slot = guard.pools.registry_get(identity)?;
-        if !slot.content_ready || !slot.scanout_order() {
+        if !slot.content_ready {
             return None;
         }
     }
     let mut px = match read_target_inner(identity) {
-        // The `scanout_order` gate above already established the order, so the
-        // reported one cannot disagree and the bytes pass through untouched.
-        Ok(rb) => rb.pixels,
+        // `into_bgra8` is a no-op for a resident already in scanout order, which
+        // is every one this rail sees on a boot measured so far.
+        Ok(rb) => rb.into_bgra8(),
         Err(e) => {
             let mut emit = crate::observe::Emit::decline("present_capture", &e);
             for (key, value) in draw_execution::identity_fields(identity) {
@@ -1811,16 +1930,15 @@ unsafe fn copy_image_level0_to_host_delivered(
     // recording and holds the draws the copy is about to read; resetting it
     // would discard them and beginning it again is invalid.
     if appended.is_none() {
-        ctx.device
-            .reset_command_buffer(cb, ash::vk::CommandBufferResetFlags::empty())
-            .map_err(|e| DrawError::VkCall(VkCall::new(ops.reset_cb, e)))?;
-        ctx.device
-            .begin_command_buffer(
+        unsafe {
+            pools.begin_slot_recording(
+                ctx,
                 cb,
-                &ash::vk::CommandBufferBeginInfo::default()
-                    .flags(ash::vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-            )
-            .map_err(|e| DrawError::VkCall(VkCall::new(ops.begin_cb, e)))?;
+                gpu_span::Kind::Readback,
+                ops.reset_cb,
+                ops.begin_cb,
+            )?
+        };
     }
     // Unconditional, and the layout match is exactly why. A barrier is two
     // things — a layout transition and a dependency — and this rail needs the
@@ -1933,6 +2051,7 @@ unsafe fn copy_image_level0_to_host_delivered(
         // draws and the copy together.
         pools.batch_flush(ctx, counters)?;
     } else {
+        unsafe { pools.gpu_span_seal_current(ctx, cb) };
         ctx.device
             .end_command_buffer(cb)
             .map_err(|e| DrawError::VkCall(VkCall::new(ops.end_cb, e)))?;
@@ -1942,8 +2061,8 @@ unsafe fn copy_image_level0_to_host_delivered(
         ctx.device
             .queue_submit(queue, &[si], fence)
             .map_err(|e| DrawError::VkCall(VkCall::new(ops.submit, e)))?;
-        let cleanup = pools.seal_entry(Vec::new(), Vec::new());
-        pools.finish_entry_async(cleanup);
+        let sealed = pools.seal_entry(Vec::new(), Vec::new());
+        pools.finish_entry_async(&ctx.device, sealed);
     }
     // Split three ways rather than timed as a whole: the submit and the copy
     // scale with the surface, the fence does not scale with anything we control,
@@ -2163,8 +2282,20 @@ pub fn read_target_leased(identity: &TargetIdentity) -> Result<Option<LeasedFram
     } = &mut *guard;
     let ctx = owner.ensure(counters)?;
     unsafe { pools.ensure_init(ctx, counters)? };
-    let snap = resident_read_snapshot(pools, identity)?;
-    let rb_size = (snap.width as u64) * (snap.height as u64) * 4;
+    // The leased rail hands the caller a pointer into the mapped readback slot,
+    // so unlike `read_target_inner` it has nowhere to narrow a wide resident to
+    // — the bytes the caller reads are the slot's. Bounded rather than
+    // converted, and named so a firing says which rail could not serve.
+    let (snap, layout) = readback_snapshot(pools, identity)?;
+    if layout.bytes_per_texel() != RESIDENT_READ_BYTES_PER_TEXEL {
+        return Err(DrawError::TargetRead(
+            reason::TargetReadDecline::TexelNotFourBytes {
+                format: snap.format,
+            },
+        ));
+    }
+    let rb_size =
+        (snap.width as u64) * (snap.height as u64) * u64::from(RESIDENT_READ_BYTES_PER_TEXEL);
     unsafe {
         let delivered = copy_image_level0_to_host_delivered(
             ctx,
@@ -2186,7 +2317,7 @@ pub fn read_target_leased(identity: &TargetIdentity) -> Result<Option<LeasedFram
                 token,
                 ptr,
                 len,
-                bgra: snap.bgra,
+                bgra: snap.bgra(),
             }),
             // The slot had no mapping to lend, so the readback fell back to a
             // copy. Drop it and let the caller take its own copying path rather
@@ -2218,15 +2349,21 @@ pub struct GuestPageTarget {
     pub row_length_texels: u32,
     pub width: u32,
     pub height: u32,
-    /// Channel order the guest reads these bytes back in, from the format it
-    /// declared for this destination.
+    /// The format the guest reads these bytes back as, from what it declared
+    /// for this destination.
     ///
-    /// The copy converts nothing, so this is the order the resident must
+    /// The copy converts nothing, so this is the format the resident must
     /// already hold; the engine checks the pair and refuses by name rather than
     /// assuming either side. It lives here and not on the identity because it
     /// is a property of the *destination* — the runtime is the only side that
     /// knows what the guest declared, exactly as it is for the row pitch above.
-    pub bgra: bool,
+    ///
+    /// A whole format and not a channel order, because it also fixes how wide a
+    /// texel is, and every byte offset below is computed from that. While every
+    /// resident was eight bits per channel that width was a constant `4`
+    /// written into each of them; a destination four bytes per texel wider
+    /// would have had its rows overlap at half their true pitch.
+    pub format: ash::vk::Format,
 }
 
 impl GuestPageTarget {
@@ -2237,9 +2374,23 @@ impl GuestPageTarget {
     /// copying rail does not write them either — a bound that included them
     /// would make the two rails land different guest memory for one frame.
     fn extent_end(&self) -> u64 {
-        let pitch = u64::from(self.row_length_texels.max(self.width)) * 4;
         let rows_before = u64::from(self.height.saturating_sub(1));
-        rows_before * pitch + u64::from(self.width) * 4
+        rows_before * self.pitch_bytes() + u64::from(self.width) * self.bytes_per_texel()
+    }
+
+    /// Bytes one texel of the destination occupies.
+    ///
+    /// `copy_target_to_guest_pages` has already refused a format this cannot
+    /// answer for — it compares the destination's format against the resident's,
+    /// and a resident exists only at a format these tables know — so the
+    /// fallback is unreachable. It is the four this code used to assume rather
+    /// than a panic, because being wrong here costs a mis-planned copy and not a
+    /// lost boot.
+    fn bytes_per_texel(&self) -> u64 {
+        u64::from(
+            crate::backend::vulkan::translate::pixel::bytes_per_texel(self.format)
+                .unwrap_or(RESIDENT_READ_BYTES_PER_TEXEL),
+        )
     }
 
     /// Guest bytes the runs actually name, summed.
@@ -2257,7 +2408,7 @@ impl GuestPageTarget {
 
     /// Guest bytes between the starts of two consecutive rows.
     fn pitch_bytes(&self) -> u64 {
-        u64::from(self.row_length_texels.max(self.width)) * 4
+        u64::from(self.row_length_texels.max(self.width)) * self.bytes_per_texel()
     }
 
     /// The window's byte layout, for planning copy rectangles.
@@ -2282,7 +2433,7 @@ impl GuestPageTarget {
     /// `VkBufferCopy` has no way to skip it — so that window takes the
     /// rectangle path, which does.
     fn rows_are_dense(&self) -> bool {
-        self.pitch_bytes() == u64::from(self.width) * 4
+        self.pitch_bytes() == u64::from(self.width) * self.bytes_per_texel()
     }
 }
 
@@ -2358,11 +2509,17 @@ pub fn copy_target_to_guest_pages(
     }
     unsafe { pools.ensure_init(ctx, counters)? };
     let snap = resident_read_snapshot(pools, identity)?;
-    if snap.bgra != dst.bgra {
-        return Err(DrawError::GuestPageWrite(GuestWriteDecline::OrderMismatch {
-            resident_bgra: snap.bgra,
-            want_bgra: dst.bgra,
-        }));
+    // Whole formats, not channel orders. Two formats sharing an order are four
+    // bytes per texel apart once a render target may be wider than eight bits,
+    // and this copy converts nothing — so an order comparison would admit a
+    // half-float destination over an eight-bit resident.
+    if snap.format != dst.format {
+        return Err(DrawError::GuestPageWrite(
+            GuestWriteDecline::ResidentFormatMismatch {
+                held: snap.format,
+                want: dst.format,
+            },
+        ));
     }
     if snap.width != dst.width || snap.height != dst.height {
         return Err(DrawError::GuestPageWrite(
@@ -2386,11 +2543,43 @@ pub fn copy_target_to_guest_pages(
         // falls to the rectangle path, which is the only form that can leave
         // the padding unwritten. Both land the same guest bytes.
         let plan = if dst.rows_are_dense() {
-            let scratch = pools.acquire_guest_scratch(ctx, need, counters)?;
-            let scatter = plan_guest_linear_copies(ctx, pools, dst)?;
+            // The same pool the draw-time gather draws from, and for the same
+            // reason: this buffer is device-local, is written and then read by
+            // transfer commands in one submission, and must not be reused or
+            // freed until that submission's fence retires. A slot from here is
+            // held in `gather_live` and returned by the ring, so both of those
+            // are properties of the pool rather than of a caller's promise.
+            //
+            // Sized by `have` and not `need`. The detile writes `need` bytes
+            // from offset 0, but the scatter below reads one range per run and
+            // those sum to `have` — and the check above only establishes
+            // `need <= have`, so `need` is the smaller of the two. They are in
+            // fact equal wherever this branch is taken, because dense rows make
+            // `extent_end` the same tight frame `references_for_runs` tiled;
+            // that is a coincidence of two separately-derived numbers, not a
+            // stated relation, and sizing by the one the copies actually read
+            // costs nothing and does not depend on it holding.
+            let scratch = pools.acquire_guest_gather(
+                ctx,
+                have,
+                ash::vk::BufferUsageFlags::empty(),
+                counters,
+            )?;
+            // The dispatch first, falling back to the regions it replaces —
+            // which is the only ordering that keeps the transfer form reachable
+            // on every host and for every run shape it still has to serve.
+            let scatter = match compute_scatter_enabled() {
+                true => plan_guest_scatter_dispatches(ctx, pools, counters, dst, &scratch)?
+                    .map(ScatterForm::Dispatches),
+                false => None,
+            };
+            let scatter = match scatter {
+                Some(form) => form,
+                None => ScatterForm::Regions(plan_guest_linear_copies(ctx, pools, dst)?),
+            };
             counters.guest_write_linear.fetch_add(1, Ordering::Relaxed);
             GuestCopyPlan::Linear {
-                scratch,
+                scratch: scratch.buffer,
                 // `buffer_row_length(0)` is Vulkan's "tightly packed", which is
                 // exactly what dense means. Passing `row_length_texels` would
                 // be the same number whenever it is set and an invalid one
@@ -2416,6 +2605,9 @@ pub fn copy_target_to_guest_pages(
         counters
             .guest_write_regions
             .fetch_add(plan.regions(), Ordering::Relaxed);
+        counters
+            .guest_write_dispatches
+            .fetch_add(plan.dispatches(), Ordering::Relaxed);
         copy_image_level0_to_buffer(ctx, pools, counters, &snap, &plan)?;
         pools.registry_note_access(identity, pools::ResidentAccess::TransferRead);
         counters.note_target_read(u64::from(dst.width) * u64::from(dst.height) * 4);
@@ -2469,9 +2661,35 @@ enum GuestCopyPlan {
         scratch: ash::vk::Buffer,
         /// The one rectangle that fills the scratch, tightly packed.
         detile: ash::vk::BufferImageCopy,
-        /// One byte range per guest stretch, grouped by the buffer it lands in.
-        scatter: Vec<(ash::vk::Buffer, Vec<ash::vk::BufferCopy>)>,
+        /// How the scratch reaches the guest's stretches.
+        scatter: ScatterForm,
     },
+}
+
+/// The two ways a detiled frame gets from the scratch into the guest's pages.
+///
+/// They write the same bytes to the same addresses — the kernel copies `uint`s
+/// and carries no format, row or texel semantics — so which one runs is a cost
+/// decision and never a visible one, exactly as the choice above it is.
+enum ScatterForm {
+    /// One `VkBufferCopy` per guest stretch, grouped by the buffer it lands in.
+    ///
+    /// The only form on a host without the guest-RAM import, the form for a run
+    /// the dispatch cannot express, and the A/B baseline. See
+    /// [`crate::env::COMPUTE_SCATTER`].
+    Regions(Vec<(ash::vk::Buffer, Vec<ash::vk::BufferCopy>)>),
+    /// One compute dispatch per destination buffer, over a run table.
+    ///
+    /// This rail is bound by the number of copy regions it issues rather than by
+    /// the bytes in them, which is what makes replacing ~200 regions with one
+    /// dispatch the repair — see [`guest_scatter`].
+    Dispatches(Vec<ScatterGroup>),
+}
+
+/// One dispatch: every run of this writeback that lands in one guest buffer.
+struct ScatterGroup {
+    set: ash::vk::DescriptorSet,
+    run_count: u32,
 }
 
 impl GuestCopyPlan {
@@ -2480,14 +2698,51 @@ impl GuestCopyPlan {
     /// The detiling rectangle counts: it is a region the driver consumes, and
     /// leaving it out would make the linear path's total read as exactly the
     /// stretch count when it is one more than that.
+    /// A dispatch contributes none: it is a grid, not a region list, and
+    /// counting one as a region would hide the very thing this counter exists to
+    /// show. A linear plan that dispatched therefore reads as exactly 1 — the
+    /// detile — which is the reading that says the scatter left the copy engine.
     fn regions(&self) -> u64 {
         match self {
             Self::Rectangles(groups) => groups.iter().map(|(_, r)| r.len() as u64).sum(),
-            Self::Linear { scatter, .. } => {
-                1 + scatter.iter().map(|(_, r)| r.len() as u64).sum::<u64>()
-            }
+            Self::Linear { scatter, .. } => match scatter {
+                ScatterForm::Regions(groups) => {
+                    1 + groups.iter().map(|(_, r)| r.len() as u64).sum::<u64>()
+                }
+                ScatterForm::Dispatches(_) => 1,
+            },
         }
     }
+
+    /// Dispatches this plan will submit, for the census. Zero on every other
+    /// form, which is what makes the pair a share rather than two counts.
+    fn dispatches(&self) -> u64 {
+        match self {
+            Self::Rectangles(_) => 0,
+            Self::Linear { scatter, .. } => match scatter {
+                ScatterForm::Regions(_) => 0,
+                ScatterForm::Dispatches(groups) => groups.len() as u64,
+            },
+        }
+    }
+}
+
+/// How many contiguous sub-ranges the scatter probe cuts each run into.
+///
+/// Four rather than two so the effect is well clear of boot-to-boot spread, and
+/// not more because the sub-ranges have to stay large enough that the answer is
+/// about region count rather than about having made every copy tiny.
+const SCATTER_SPLIT_PARTS: u64 = 4;
+
+/// Whether the scatter probe is on. See its use site.
+fn scatter_split_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            crate::env::read(crate::env::SCATTER_SPLIT).0,
+            crate::env::Switch::On
+        )
+    })
 }
 
 /// Bind every run and turn it into one byte range each, grouped by the buffer
@@ -2521,9 +2776,261 @@ unsafe fn plan_guest_linear_copies(
             // import's granularity, and copying it would write guest bytes
             // either side of the window that this frame was never given.
             .size(run.guest.requested());
+        // PROBE — `REIMS_VGPU_SCATTER_SPLIT=on`. Cuts each run into
+        // `SCATTER_SPLIT_PARTS` contiguous sub-ranges that tile it exactly, so
+        // the guest bytes written are identical and only the region *count*
+        // changes. It exists to separate "this rail is bound by the bytes it
+        // moves" from "it is bound by the number of copy regions it issues" —
+        // the two predict opposite things about a compute scatter, and the host
+        // GPU sitting at 86-91 % busy on 3-4 % memory utilization says it is not
+        // the bytes. Default off; delete once the question is answered.
+        if scatter_split_enabled() {
+            let total = copy.size;
+            let part = total / SCATTER_SPLIT_PARTS;
+            if part != 0 {
+                for i in 0..SCATTER_SPLIT_PARTS {
+                    // The last part takes the remainder, so the sub-ranges tile
+                    // the run exactly rather than losing `total % PARTS` bytes.
+                    let len = if i == SCATTER_SPLIT_PARTS - 1 {
+                        total - part * (SCATTER_SPLIT_PARTS - 1)
+                    } else {
+                        part
+                    };
+                    let off = part * i;
+                    group_by_buffer(
+                        &mut grouped,
+                        bound.buffer,
+                        ash::vk::BufferCopy::default()
+                            .dst_offset(copy.dst_offset + off)
+                            .src_offset(copy.src_offset + off)
+                            .size(len),
+                    );
+                }
+                continue;
+            }
+        }
         group_by_buffer(&mut grouped, bound.buffer, copy);
     }
     Ok(grouped)
+}
+
+/// Whether the compute scatter is on. See [`crate::env::COMPUTE_SCATTER`].
+fn compute_scatter_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            crate::env::read(crate::env::COMPUTE_SCATTER).0,
+            crate::env::Switch::Off
+        )
+    })
+}
+
+/// Bind every run and turn the set into one compute dispatch per destination
+/// buffer, or `Ok(None)` when this writeback has to take the transfer regions.
+///
+/// `Ok(None)` is a routing answer and never a loss: the caller falls back to
+/// [`plan_guest_linear_copies`], which lands the identical bytes. Every reason
+/// for one is named through [`guest_scatter::ScatterDecline`] so a boot quietly
+/// running on the expensive path is visible rather than inferred from a frame
+/// rate.
+///
+/// # Why the run table is host memory the shader reads in place
+///
+/// It is ~200 `uvec4`s — 3.2 KiB, past every push-constant limit and far below
+/// anything worth a staging copy. A staging slot is host-visible, coherent and
+/// already carries `STORAGE_BUFFER` usage, so writing it and binding it costs
+/// this rail no copy region at all, which is the resource the whole change is
+/// about.
+unsafe fn plan_guest_scatter_dispatches(
+    ctx: &context::DeviceContext,
+    pools: &mut pools::ResourcePools,
+    counters: &counters::EngineCounters,
+    dst: &GuestPageTarget,
+    scratch: &pools::BufferSlot,
+) -> Result<Option<Vec<ScatterGroup>>, DrawError> {
+    use guest_scatter::{build_run_tables, ScatterRun};
+    use host_ram::GuestWriteDecline;
+    let Some(pipeline) = (unsafe { pools.scatter_pipeline(ctx) }) else {
+        return Ok(None);
+    };
+    let mut grouped: Vec<(ash::vk::Buffer, Vec<ScatterRun>)> = Vec::new();
+    for run in &dst.runs {
+        let bound = unsafe { pools.bind_guest_ram(ctx, &run.guest) }
+            .map_err(|inner| DrawError::GuestPageWrite(GuestWriteDecline::Import { inner }))?;
+        group_by_buffer(
+            &mut grouped,
+            bound.buffer,
+            ScatterRun {
+                src: run.window_offset,
+                // The same re-basing every planner here does: `head` is what the
+                // granularity rounding put in front of the byte asked for.
+                dst: bound.offset + bound.head,
+                len: run.guest.requested(),
+            },
+        );
+    }
+    // Planned for every group before anything is allocated, so a refusal in the
+    // last group does not leave the first one's staging slot and descriptor set
+    // sitting on the pools for a dispatch that will not be recorded.
+    let mut tables = Vec::with_capacity(grouped.len());
+    for (buffer, runs) in &grouped {
+        match build_run_tables(
+            runs,
+            ctx.guest_bind_offset_align,
+            ctx.max_storage_buffer_range,
+            // The window's own byte count and not the slot's, which is rounded
+            // up to a power-of-two bucket. Both bound the memory soundly; this
+            // is the tighter, and it is the one that catches a run reaching past
+            // what the detile actually wrote rather than merely past the slot.
+            dst.window_bytes(),
+        ) {
+            Ok(built) => tables.extend(built.into_iter().map(|t| (*buffer, t))),
+            Err(decline) => {
+                counters
+                    .guest_write_scatter_declined
+                    .fetch_add(1, Ordering::Relaxed);
+                crate::observe::Emit::decline("scatter_plan", &decline).fail_once(0);
+                return Ok(None);
+            }
+        }
+    }
+    // One staging slot for every table this writeback needs; see
+    // [`stage_run_tables`]. This rail issues far fewer dispatches than the draw
+    // -time gather does, so the saving is small here — it shares the arena
+    // because a second copy of the placement arithmetic is a second place to
+    // name a descriptor offset the driver will not accept.
+    let words: Vec<&[u32]> = tables.iter().map(|(_, t)| &t.words[..]).collect();
+    let (runs_slot, places) = unsafe { stage_run_tables(ctx, pools, counters, &words) }?;
+    let mut groups = Vec::with_capacity(tables.len());
+    for ((buffer, table), place) in tables.iter().zip(&places) {
+        let set =
+            unsafe { pools.alloc_scatter_descriptor_set(&ctx.device, pipeline.dsl, counters) }?;
+        unsafe {
+            guest_scatter::ScatterPipeline::write_set(
+                &ctx.device,
+                set,
+                // The scratch is bound whole; the guest import is the windowed
+                // side, because a RAMBlock is wider than `maxStorageBufferRange`.
+                (scratch.buffer, 0, scratch.size),
+                (*buffer, table.bind_offset, table.bind_range),
+                (runs_slot.buffer, place.bind_offset, place.bind_range),
+            );
+        }
+        groups.push(ScatterGroup {
+            set,
+            run_count: table.run_count,
+        });
+    }
+    Ok(Some(groups))
+}
+
+/// A run table's `u32`s as the bytes a staging write takes.
+///
+/// Shared by both directions — the writeback's scatter and the buffer gather —
+/// because it is the same table and the same staging write either way.
+///
+/// A local reinterpret rather than a dependency: `u32` has no padding and no
+/// invalid bit patterns, and the destination is a `*mut u8` memcpy either way.
+/// The endianness is the host's, which is the guest's, which is what the shader
+/// reads — the same reasoning `write_stamp_after_guest_writes` states for its
+/// one word, one layer up.
+pub(crate) fn run_table_bytes(words: &[u32]) -> &[u8] {
+    // SAFETY: `u32` is `Copy` with no padding, so any `[u32]` is a valid `[u8]`
+    // of four times the length, and the borrow keeps the source alive.
+    unsafe { std::slice::from_raw_parts(words.as_ptr().cast::<u8>(), std::mem::size_of_val(words)) }
+}
+
+/// Where each of a submission's run tables sits inside the one staging slot they
+/// share: byte offset and byte length, in the order they were given.
+///
+/// `bind_offset` is a multiple of `minStorageBufferOffsetAlignment` by
+/// construction, which is what makes it legal as a `VkDescriptorBufferInfo`
+/// offset; `bind_range` is the table's own length and not the padded stride, so
+/// the shader's bound range never covers a neighbour's words.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RunTablePlace {
+    bind_offset: u64,
+    bind_range: u64,
+}
+
+/// Lay `tables` end to end at `align` and produce the arena's bytes, along with
+/// each table's place inside them.
+///
+/// Split out from [`stage_run_tables`] because it is the whole of the layout —
+/// the arithmetic *and* which bytes land where — and it needs no device, so a
+/// test can walk both. What is left in the caller is an acquire and a write.
+fn pack_run_tables(tables: &[&[u32]], align: u64) -> (Vec<u8>, Vec<RunTablePlace>) {
+    let align = align.max(1);
+    let mut cursor = 0u64;
+    let places: Vec<RunTablePlace> = tables
+        .iter()
+        .map(|words| {
+            // `max(4)` because a zero-length table would give a descriptor a
+            // zero range, which Vulkan refuses. It cannot arise — every planner
+            // declines an empty table before it gets here — but the bound
+            // belongs where the range is chosen rather than in a comment on the
+            // planners.
+            let len = (std::mem::size_of_val(*words) as u64).max(4);
+            let place = RunTablePlace {
+                bind_offset: cursor,
+                bind_range: len,
+            };
+            // Pad to the next legal descriptor offset. `align` is a power of two
+            // (Vulkan requires it of `minStorageBufferOffsetAlignment`), so this
+            // is the round-up and not an approximation of one.
+            cursor += len.div_ceil(align) * align;
+            place
+        })
+        .collect();
+    let mut packed = vec![0u8; cursor.max(4) as usize];
+    for (place, words) in places.iter().zip(tables) {
+        let at = place.bind_offset as usize;
+        let bytes = run_table_bytes(words);
+        packed[at..at + bytes.len()].copy_from_slice(bytes);
+    }
+    (packed, places)
+}
+
+/// Write a whole submission's run tables into **one** staging slot, each at an
+/// offset a storage-buffer descriptor may name.
+///
+/// This is the arena that made the draw-time compute gather affordable. Each
+/// dispatch used to take a staging slot of its own for a ~200-byte table, which
+/// is an `acquire_staging` and a `write_staging` apiece — ~40 000 of each a
+/// second on a driven macos-13 boot, against ~2 200 command buffers. Sharing one
+/// slot makes it one of each per command buffer, and the descriptor's own
+/// `offset` field is what tells a dispatch which table is its own, so nothing in
+/// the kernel changes.
+///
+/// The writeback's scatter shares it for the same reason it shares
+/// [`run_table_bytes`]: it is the same table and the same staging write, and a
+/// second copy of the padding arithmetic is a second place to get a descriptor
+/// offset wrong.
+///
+/// # Safety
+///
+/// `ctx` must be the device `pools` belongs to.
+unsafe fn stage_run_tables(
+    ctx: &context::DeviceContext,
+    pools: &mut pools::ResourcePools,
+    counters: &counters::EngineCounters,
+    tables: &[&[u32]],
+) -> Result<(pools::BufferSlot, Vec<RunTablePlace>), types::DrawError> {
+    // One host-side buffer laid out exactly as the slot wants it, so the slot
+    // takes one `write_staging`. A whole command buffer's tables come to a few
+    // kilobytes, which is why this is cheaper than the per-table slots it
+    // replaces even with the extra copy.
+    let (packed, places) = pack_run_tables(tables, ctx.guest_bind_offset_align);
+    let slot = unsafe {
+        pools.acquire_staging(
+            ctx,
+            packed.len() as u64,
+            ash::vk::BufferUsageFlags::empty(),
+            counters,
+        )
+    }?;
+    unsafe { pools.write_staging(ctx, &slot, &packed) }?;
+    Ok((slot, places))
 }
 
 /// Add one stretch's copy to the group for `buffer`, opening a group if this is
@@ -2642,16 +3149,15 @@ unsafe fn copy_image_level0_to_buffer(
         None => pools.begin_entry(ctx, counters)?,
     };
     if appended.is_none() {
-        ctx.device
-            .reset_command_buffer(cb, ash::vk::CommandBufferResetFlags::empty())
-            .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::GuestWriteResetCb, e)))?;
-        ctx.device
-            .begin_command_buffer(
+        unsafe {
+            pools.begin_slot_recording(
+                ctx,
                 cb,
-                &ash::vk::CommandBufferBeginInfo::default()
-                    .flags(ash::vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-            )
-            .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::GuestWriteBeginCb, e)))?;
+                gpu_span::Kind::Store,
+                VkOp::GuestWriteResetCb,
+                VkOp::GuestWriteBeginCb,
+            )?
+        };
     }
     // The device's own clock, for the reason the readback rail takes it: `fence_us`
     // is CPU wall clock and cannot tell "the GPU is copying eight megabytes across
@@ -2724,25 +3230,59 @@ unsafe fn copy_image_level0_to_buffer(
                 *scratch,
                 &one,
             );
-            // The scatter reads what the detile just wrote, and both are
-            // transfer-stage work in one command buffer, where nothing orders
-            // them by itself. A global memory barrier rather than a buffer one
-            // because there is exactly one buffer in flight between the two
-            // and no other access to exclude.
-            let detiled = [ash::vk::MemoryBarrier::default()
-                .src_access_mask(ash::vk::AccessFlags::TRANSFER_WRITE)
-                .dst_access_mask(ash::vk::AccessFlags::TRANSFER_READ)];
-            ctx.device.cmd_pipeline_barrier(
-                cb,
-                ash::vk::PipelineStageFlags::TRANSFER,
-                ash::vk::PipelineStageFlags::TRANSFER,
-                ash::vk::DependencyFlags::empty(),
-                &detiled,
-                &[],
-                &[],
-            );
-            for (buffer, regions) in scatter {
-                ctx.device.cmd_copy_buffer(cb, *scratch, *buffer, regions);
+            // The scatter reads what the detile just wrote, and nothing in one
+            // command buffer orders the two by itself. A global memory barrier
+            // rather than a buffer one because there is exactly one buffer in
+            // flight between them and no other access to exclude.
+            match scatter {
+                ScatterForm::Regions(groups) => {
+                    let detiled = [ash::vk::MemoryBarrier::default()
+                        .src_access_mask(ash::vk::AccessFlags::TRANSFER_WRITE)
+                        .dst_access_mask(ash::vk::AccessFlags::TRANSFER_READ)];
+                    ctx.device.cmd_pipeline_barrier(
+                        cb,
+                        ash::vk::PipelineStageFlags::TRANSFER,
+                        ash::vk::PipelineStageFlags::TRANSFER,
+                        ash::vk::DependencyFlags::empty(),
+                        &detiled,
+                        &[],
+                        &[],
+                    );
+                    for (buffer, regions) in groups {
+                        ctx.device.cmd_copy_buffer(cb, *scratch, *buffer, regions);
+                    }
+                }
+                ScatterForm::Dispatches(groups) => {
+                    // Two dependencies in one barrier because they have the same
+                    // destination: the detile's write to the scratch, and the
+                    // host's write of the run tables, which happened before this
+                    // submission and so needs `HOST` named on the source side.
+                    let ready = [ash::vk::MemoryBarrier::default()
+                        .src_access_mask(
+                            ash::vk::AccessFlags::TRANSFER_WRITE | ash::vk::AccessFlags::HOST_WRITE,
+                        )
+                        .dst_access_mask(ash::vk::AccessFlags::SHADER_READ)];
+                    ctx.device.cmd_pipeline_barrier(
+                        cb,
+                        ash::vk::PipelineStageFlags::TRANSFER | ash::vk::PipelineStageFlags::HOST,
+                        ash::vk::PipelineStageFlags::COMPUTE_SHADER,
+                        ash::vk::DependencyFlags::empty(),
+                        &ready,
+                        &[],
+                        &[],
+                    );
+                    // Looked up rather than carried in the plan: the plan holds
+                    // only what a dispatch needs that is per-writeback, and the
+                    // pipeline is a fixture of the device. It is already built —
+                    // the plan could not have been made otherwise.
+                    if let Some(pipeline) = pools.scatter_pipeline(ctx) {
+                        // One bind for the whole run; the handle never changes.
+                        pipeline.bind(&ctx.device, cb);
+                        for group in groups {
+                            pipeline.dispatch(&ctx.device, cb, group.set, group.run_count);
+                        }
+                    }
+                }
             }
         }
     }
@@ -2764,12 +3304,31 @@ unsafe fn copy_image_level0_to_buffer(
     // names ordinary system pages this process already has mapped, and a PCIe
     // write to system memory is snooped, so there is no invalidate for this
     // side to issue.
+    //
+    // The source scope is the stage that actually wrote the guest's pages, which
+    // is the dispatch on the compute scatter and the copy on every other form.
+    // Naming `TRANSFER` alone against a dispatch would release the detile and
+    // leave the writes the guest is about to read unordered — the one place in
+    // this rail where the two forms are not interchangeable.
+    let (wrote_stage, wrote_access) = match plan {
+        GuestCopyPlan::Linear {
+            scatter: ScatterForm::Dispatches(_),
+            ..
+        } => (
+            ash::vk::PipelineStageFlags::COMPUTE_SHADER,
+            ash::vk::AccessFlags::SHADER_WRITE,
+        ),
+        _ => (
+            ash::vk::PipelineStageFlags::TRANSFER,
+            ash::vk::AccessFlags::TRANSFER_WRITE,
+        ),
+    };
     let host_visible = [ash::vk::MemoryBarrier::default()
-        .src_access_mask(ash::vk::AccessFlags::TRANSFER_WRITE)
+        .src_access_mask(wrote_access)
         .dst_access_mask(ash::vk::AccessFlags::HOST_READ)];
     ctx.device.cmd_pipeline_barrier(
         cb,
-        ash::vk::PipelineStageFlags::TRANSFER,
+        wrote_stage,
         ash::vk::PipelineStageFlags::HOST,
         ash::vk::DependencyFlags::empty(),
         &host_visible,
@@ -2792,6 +3351,7 @@ unsafe fn copy_image_level0_to_buffer(
         // draws and this copy together.
         pools.batch_flush(ctx, counters)?;
     } else {
+        unsafe { pools.gpu_span_seal_current(ctx, cb) };
         ctx.device
             .end_command_buffer(cb)
             .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::GuestWriteEndCb, e)))?;
@@ -2800,8 +3360,8 @@ unsafe fn copy_image_level0_to_buffer(
         ctx.device
             .queue_submit(ctx.queue(), &[si], fence)
             .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::GuestWriteSubmit, e)))?;
-        let cleanup = pools.seal_entry(Vec::new(), Vec::new());
-        pools.finish_entry_async(cleanup);
+        let sealed = pools.seal_entry(Vec::new(), Vec::new());
+        pools.finish_entry_async(&ctx.device, sealed);
     }
     note_readback_phase(
         ReadbackPhase::Submit,
@@ -2835,12 +3395,14 @@ unsafe fn publish_previous_writeback_timestamps(ctx: &context::DeviceContext) {
         return;
     };
     let mut ticks = [0u64; context::TimestampProbe::SLOTS as usize];
-    match unsafe { ctx.device.get_query_pool_results(
-        probe.pool,
-        0,
-        &mut ticks,
-        ash::vk::QueryResultFlags::TYPE_64,
-    ) } {
+    match unsafe {
+        ctx.device.get_query_pool_results(
+            probe.pool,
+            0,
+            &mut ticks,
+            ash::vk::QueryResultFlags::TYPE_64,
+        )
+    } {
         // In f64, not integer ticks-times-period: `timestampPeriod` is a
         // float and drivers do report values below 1 ns, which an integer
         // multiply would truncate to zero and report as "the GPU did nothing".
@@ -2860,6 +3422,78 @@ unsafe fn publish_previous_writeback_timestamps(ctx: &context::DeviceContext) {
         )
         .fail_once(0),
     }
+}
+
+/// Import every RAMBlock in `imports` now, and report how many that took.
+///
+/// # Why the device does this before the guest asks
+///
+/// `vkAllocateMemory` with a host pointer chained is where a driver that pins
+/// takes its reference on every page of the mapping, and the mapping is the
+/// whole of guest RAM. A driven x86 boot on a discrete NVIDIA host measured
+/// **2 493 029 µs for a 15 032 385 536-byte RAMBlock and 309 796 µs for a
+/// 2 146 435 072-byte one**, with the properties query that precedes both at
+/// 0 µs. Left to the first `gather` that references a block, that is ~2.8 s
+/// charged to the guest's first frame — and the guest's display pipe abandons a
+/// submitted transaction after 1000 ms, so the first frame of every boot missed
+/// its own watchdog by a factor of three.
+///
+/// So the cost is not removed; it is moved to a caller that is not a frame. The
+/// per-page work is the extension's, it is proportional to guest RAM, and
+/// nothing this device does makes it cheaper — importing sub-ranges instead
+/// would be the per-resource import [`host_ram`] exists to avoid.
+///
+/// # What the move bought, measured
+///
+/// Both x86 rails boot with all four of their RAMBlocks imported inside the
+/// handshake, `guest_ram_warm blocks=4 bytes=17196384256` landing in the same
+/// millisecond as the last `host_ram_import`. The first frame's `gather_us`
+/// then reads **1 088 µs over 67 gathers and 14 722 144 bytes** on macos-11,
+/// against 2 022 259 µs over 6 gathers and 1 176 768 bytes before — three
+/// orders of magnitude less time for twelve times the bytes, which is what says
+/// the gather itself never cost anything.
+///
+/// It does not cost the working rail: a macos-13 x86/PCI boot after the move
+/// reaches its desktop with Dock and Finder running and the console owned by
+/// the login user.
+///
+/// **It did not fix the macos-11 rail**, whose WindowServer still stops after
+/// one composite. That guest does blow its 1000 ms display-transaction watchdog
+/// with or without this, and it is now known not to be why it wedges.
+///
+/// Returns `(warmed, bytes)`: how many blocks this call actually imported and
+/// how many bytes they covered. Zero blocks means either they were already
+/// imported or the device is not up yet, and neither is a failure — a host with
+/// no import capability never reaches this at all, because the resolution that
+/// produces `imports` refuses first.
+pub fn warm_guest_ram_imports(
+    imports: &[std::sync::Arc<crate::runtime::guest_ram::GuestRamImport>],
+) -> (usize, u64) {
+    let mut guard = lock_engine();
+    let EngineState {
+        ref mut owner,
+        ref mut pools,
+        ..
+    } = &mut *guard;
+    let Some(ctx) = owner.ctx.as_ref() else {
+        return (0, 0);
+    };
+    let mut warmed = 0usize;
+    let mut bytes = 0u64;
+    for import in imports {
+        match unsafe { pools.warm_guest_ram(ctx, import) } {
+            Ok(true) => {
+                warmed += 1;
+                bytes = bytes.saturating_add(import.len());
+            }
+            Ok(false) => {}
+            // The draw path asks again and declines there with the same reason,
+            // so this is reported and not propagated: a warm that could not
+            // import must not be the thing that decides the rail is off.
+            Err(inner) => crate::observe::Emit::decline("vk_guest_ram_warm", &inner).fail_once(0),
+        }
+    }
+    (warmed, bytes)
 }
 
 /// Guest memory the device can currently reach through host-pointer imports,
@@ -2882,6 +3516,74 @@ pub fn guest_import_census() -> (u64, usize) {
     let guard = lock_engine();
     let (count, bytes) = guard.pools.host_ram_import_census();
     (bytes, count)
+}
+
+/// Bytes per texel a resident target readback delivers.
+///
+/// Not a property of the resident — of the *readback*. Its buffer is sized from
+/// this and every consumer of the bytes reads them as RGBA8, so it is the one
+/// number `resident_read_snapshot` admits a resident's format against. Naming
+/// it once is what keeps the check and the buffer size the same number, rather
+/// than two `4`s that a later widening could move apart.
+const RESIDENT_READ_BYTES_PER_TEXEL: u32 = 4;
+
+/// Bytes an image→buffer copy of one texel of `format` writes.
+///
+/// The single place a readback slot's size is decided, for both rails that size
+/// one. `vkCmdCopyImageToBuffer` names an image extent and reads the *image's*
+/// texel width per pixel, so a slot sized by any other number is either short —
+/// which is a device-side write past the slot, not a truncated read — or larger
+/// than the copy fills. The seed path answers the same question in the other
+/// direction and states the same reason.
+///
+/// The fallback is unreachable for a real resident (an image exists only at a
+/// format these tables know) and is the four this code used to assume rather
+/// than a panic, on the same grounds as [`GuestPageTarget::bytes_per_texel`].
+fn readback_bytes_per_texel(format: ash::vk::Format) -> u32 {
+    crate::backend::vulkan::translate::pixel::bytes_per_texel(format)
+        .unwrap_or(RESIDENT_READ_BYTES_PER_TEXEL)
+}
+
+/// Bring a readback taken at the attachment's own texel width down to the RGBA8
+/// every consumer of drawn pixels speaks.
+///
+/// Both rails that read a colour target back share this: the standalone
+/// [`read_target`] and the tail of a draw that could not defer its Store. They
+/// used to be one narrowing and one four-byte assumption, and the assumption was
+/// the older of the two — which is what made a wide attachment a buffer overrun
+/// on one rail and a quantized frame on the other, for the same resident.
+///
+/// Narrowing rather than refusing, because both callers are the fallback a Store
+/// takes when the GPU could not land the frame in guest pages directly. Refusing
+/// loses the frame outright, where before a render target could be wide the same
+/// frame was merely quantized on its way through an eight-bit resident.
+///
+/// Returns the bytes and the channel order they are in — `narrow_texel_to_rgba8`
+/// produces semantic RGBA8 whatever the resident's order was, so a narrowed
+/// frame owes no exchange and says so.
+fn narrow_readback_to_rgba8(
+    out: Vec<u8>,
+    layout: crate::contract::pixel_format::TexelLayout,
+    format: ash::vk::Format,
+    pixels: u64,
+    bgra: bool,
+) -> Result<(Vec<u8>, bool), DrawError> {
+    if layout.bytes_per_texel() == RESIDENT_READ_BYTES_PER_TEXEL {
+        return Ok((out, bgra));
+    }
+    let count = u32::try_from(pixels).unwrap_or(u32::MAX);
+    let mut narrowed = vec![0u8; (pixels * u64::from(RESIDENT_READ_BYTES_PER_TEXEL)) as usize];
+    if !crate::contract::pixel_format::narrow_texel_to_rgba8(layout, &out, count, &mut narrowed) {
+        return Err(DrawError::TargetRead(
+            reason::TargetReadDecline::TexelNotFourBytes { format },
+        ));
+    }
+    // Visible, because it is a fidelity loss and not just a slow path: the
+    // frame this returns carries eight bits of a channel the guest asked for
+    // sixteen of. A non-zero reading names the population that would be
+    // repaired by teaching this rail's consumers the wider texel.
+    crate::runtime::drain::note_store_route("target_read_narrowed");
+    Ok((narrowed, false))
 }
 
 /// The `srcAccessMask` a resident color target's readback must drain.
@@ -2907,19 +3609,34 @@ fn target_readback_ops() -> ReadbackOps {
     }
 }
 
-/// What a resident target's readback copies, and the channel order it is in.
+/// What a resident target's copy moves, and the format it is in.
 struct ResidentReadSnapshot {
     image: ash::vk::Image,
     width: u32,
     height: u32,
     layout: ash::vk::ImageLayout,
-    bgra: bool,
+    /// The resident image's own format. A channel order used to be enough here
+    /// because every resident was eight bits per channel; it is not once a
+    /// render target may be wider, and `copy_target_to_guest_pages` compares
+    /// this against the destination's format to decide whether a byte copy
+    /// lands the right texel.
+    format: ash::vk::Format,
+}
+
+impl ResidentReadSnapshot {
+    /// Whether these texels are already in guest scanout order.
+    fn bgra(&self) -> bool {
+        self.format == crate::backend::vulkan::translate::pixel::SCANOUT_FORMAT
+    }
 }
 
 /// The registry slot's copy geometry, or the typed reason it cannot be read.
 ///
-/// Shared by both readback entry points so that "is this target readable" is
-/// decided once and answered with one vocabulary.
+/// Shared by all three rails that copy out of a resident — the two host
+/// readbacks and the GPU-direct guest-page write — so that "is this target
+/// copyable" is decided once and answered with one vocabulary. It deliberately
+/// does **not** bound the texel width: that is the readbacks' constraint, not
+/// the resident's, and `readback_snapshot` below is where it is applied.
 fn resident_read_snapshot(
     pools: &pools::ResourcePools,
     identity: &TargetIdentity,
@@ -2937,8 +3654,38 @@ fn resident_read_snapshot(
         width: slot.width,
         height: slot.height,
         layout: slot.access.layout(),
-        bgra: slot.scanout_order(),
+        format: slot.color_format,
     })
+}
+
+/// [`resident_read_snapshot`] plus what the **host readback** rails need on top
+/// of it: how many bytes to ask the GPU for, and how to get RGBA8 out of them.
+///
+/// Both rails hand their bytes to consumers that only speak RGBA8 —
+/// `TargetReadback::into_rgba8` exchanges channels in `chunks_exact_mut(4)`, and
+/// the CPU Store rail converts from RGBA8 a row at a time — so a resident wider
+/// than four bytes a texel has to be read at its own width and then narrowed.
+///
+/// Separate from the shared snapshot because the third caller —
+/// `copy_target_to_guest_pages` — needs neither: it copies the resident's own
+/// bytes into guest pages and never interprets them.
+fn readback_snapshot(
+    pools: &pools::ResourcePools,
+    identity: &TargetIdentity,
+) -> Result<
+    (
+        ResidentReadSnapshot,
+        crate::contract::pixel_format::TexelLayout,
+    ),
+    DrawError,
+> {
+    let snap = resident_read_snapshot(pools, identity)?;
+    let layout = crate::backend::vulkan::translate::pixel::texel_layout_of(snap.format).ok_or(
+        DrawError::TargetRead(reason::TargetReadDecline::TexelNotFourBytes {
+            format: snap.format,
+        }),
+    )?;
+    Ok((snap, layout))
 }
 
 fn read_target_inner(identity: &TargetIdentity) -> Result<TargetReadback, DrawError> {
@@ -2951,8 +3698,12 @@ fn read_target_inner(identity: &TargetIdentity) -> Result<TargetReadback, DrawEr
     } = &mut *guard;
     let ctx = owner.ensure(counters)?;
     unsafe { pools.ensure_init(ctx, counters)? };
-    let snap = resident_read_snapshot(pools, identity)?;
-    let rb_size = (snap.width as u64) * (snap.height as u64) * 4;
+    let (snap, layout) = readback_snapshot(pools, identity)?;
+    // Asked for at the resident's own width — the copy is a raw image→buffer
+    // move and reads the image format's texel — and narrowed below if that is
+    // not what the caller can read.
+    let pixels = (snap.width as u64) * (snap.height as u64);
+    let rb_size = pixels * u64::from(layout.bytes_per_texel());
     unsafe {
         let out = copy_image_level0_to_host(
             ctx,
@@ -2968,10 +3719,11 @@ fn read_target_inner(identity: &TargetIdentity) -> Result<TargetReadback, DrawEr
         )?;
         pools.registry_note_access(identity, pools::ResidentAccess::TransferRead);
         counters.note_target_read(rb_size);
-        Ok(TargetReadback {
-            pixels: out,
-            bgra: snap.bgra,
-        })
+        // A wide resident is quantized here rather than refused; see
+        // `narrow_readback_to_rgba8` for why that direction is the safe one.
+        let (pixels, bgra) =
+            narrow_readback_to_rgba8(out, layout, snap.format, pixels, snap.bgra())?;
+        Ok(TargetReadback { pixels, bgra })
     }
 }
 
@@ -3007,6 +3759,17 @@ pub fn maintain_idle_residents(display: Option<&TargetIdentity>, now_ms: u64) {
 /// See [`caches::ObjectCaches::levels`] for what reading it answers.
 pub fn object_cache_levels() -> [usize; 6] {
     lock_engine().caches.levels()
+}
+
+/// How many draws one deferred-submit command buffer accepts before it refuses
+/// joiners — [`pools::BATCH_MAX_DRAWS`], for the integration test that drives
+/// past it.
+///
+/// Exported rather than restated in the test: the number is chosen by a live
+/// sweep and has already moved once, and a test carrying its own copy asserts
+/// the sweep's old answer against the new one and fails as if the device broke.
+pub fn batch_max_draws() -> u64 {
+    pools::BATCH_MAX_DRAWS
 }
 
 pub fn counter_snapshot() -> CounterSnapshot {
@@ -3120,6 +3883,56 @@ pub fn test_poison_and_flush() {
     g.counters.device_lost.fetch_add(1, Ordering::Relaxed);
     g.owner.mark_device_lost();
     g.flush_device_derived();
+}
+
+#[cfg(test)]
+mod engine_lock_site_tests {
+    use super::*;
+
+    /// A thread that has not run a drain is not the drain worker, and one that
+    /// has is.
+    ///
+    /// The whole value of the split is that a vCPU stalled inside an MMIO store
+    /// is countable apart from the tranche that stalled it, and the only thing
+    /// separating those two threads is this latch. Asserted on a fresh thread
+    /// because the marker is thread-local: running it on the test's own thread
+    /// would pass whatever the latch did, since the test would be both.
+    #[test]
+    fn a_thread_is_the_worker_only_after_it_has_drained() {
+        let seen = std::thread::spawn(|| {
+            let before = calling_site();
+            mark_drain_thread();
+            (before, calling_site())
+        })
+        .join()
+        .expect("probe thread");
+        assert_eq!(seen.0, EngineLockSite::Device, "before any drain");
+        assert_eq!(seen.1, EngineLockSite::Worker, "after one drain");
+
+        // And the latch does not leak across threads: a second thread that has
+        // not drained still reports `Device`, however many have.
+        let other = std::thread::spawn(calling_site).join().expect("probe two");
+        assert_eq!(other, EngineLockSite::Device);
+    }
+
+    /// Every site has its own label and its own census slot. Two sharing either
+    /// would put a stalled vCPU and the tranche that stalled it on one counter,
+    /// which is the state this split exists to leave.
+    #[test]
+    fn every_site_has_its_own_slot_and_label() {
+        let mut labels: Vec<_> = EngineLockSite::ALL.iter().map(|s| s.label()).collect();
+        let count = labels.len();
+        labels.sort_unstable();
+        labels.dedup();
+        assert_eq!(labels.len(), count, "two sites share a label");
+        let mut indices: Vec<_> = EngineLockSite::ALL.iter().map(|s| s.index()).collect();
+        indices.sort_unstable();
+        assert_eq!(
+            indices,
+            (0..count).collect::<Vec<_>>(),
+            "indices must tile the census arrays exactly"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -3422,9 +4235,10 @@ mod guest_page_target_tests {
             row_length_texels,
             width,
             height,
-            // Immaterial to these tests: the order is checked against the
-            // resident's, and no fixture here reaches a resident.
-            bgra: true,
+            // The format is checked against the resident's and no fixture here
+            // reaches a resident, so only its texel width matters — these cases
+            // are all four-byte extent arithmetic.
+            format: crate::backend::vulkan::translate::pixel::SCANOUT_FORMAT,
         }
     }
 
@@ -3526,9 +4340,96 @@ mod guest_page_target_tests {
         let linear = GuestCopyPlan::Linear {
             scratch: null,
             detile: ash::vk::BufferImageCopy::default(),
-            scatter: vec![(null, vec![ash::vk::BufferCopy::default(); 507])],
+            scatter: ScatterForm::Regions(vec![(null, vec![ash::vk::BufferCopy::default(); 507])]),
         };
         assert_eq!(linear.regions(), 508, "507 stretches plus the detile");
+        assert_eq!(linear.dispatches(), 0, "the transfer form dispatches none");
+    }
+
+    /// The same 507 stretches as a dispatch must read as one region and one
+    /// dispatch, because the pair is the only account of which form a boot took.
+    ///
+    /// Counting the dispatch as a region would make the two forms
+    /// indistinguishable in the census — 508 either way — which is the reading
+    /// the whole change exists to move.
+    #[test]
+    fn a_dispatched_scatter_reads_as_one_region_and_one_dispatch() {
+        let dispatched = GuestCopyPlan::Linear {
+            scratch: ash::vk::Buffer::null(),
+            detile: ash::vk::BufferImageCopy::default(),
+            scatter: ScatterForm::Dispatches(vec![ScatterGroup {
+                set: ash::vk::DescriptorSet::null(),
+                run_count: 507,
+            }]),
+        };
+        assert_eq!(dispatched.regions(), 1, "the detile, and nothing else");
+        assert_eq!(dispatched.dispatches(), 1, "one destination buffer");
+    }
+}
+
+#[cfg(test)]
+mod readback_width_tests {
+    use super::*;
+    use crate::contract::pixel_format::TexelLayout;
+
+    /// The slot a readback is taken into and the narrowing that consumes it must
+    /// derive their texel width from the same place.
+    ///
+    /// This is the pair that was one function and one literal `4`. A readback
+    /// slot is filled by `vkCmdCopyImageToBuffer`, which names an image extent
+    /// and reads the *image's* texel per pixel, so a slot sized narrower than
+    /// the attachment is a device-side write past it — the failure is a GPU
+    /// overrun, not a truncated frame, and no reading of the pixels can see it.
+    ///
+    /// The property asserted is that **no layout is ever refused for being
+    /// short-sized**. Some layouts have no narrowing to RGBA8 at all — a
+    /// single-channel or two-channel texel is not a frame a `DrawOutput`
+    /// consumer can read — and those refuse whatever they are handed. Telling
+    /// the two apart is the whole test: a refusal that a *larger* buffer would
+    /// have satisfied is the sizer being wrong, and that is the bug. Driving it
+    /// off `TexelLayout::ALL` means a layout added to the contract is swept the
+    /// moment it exists.
+    #[test]
+    fn no_readback_layout_is_refused_for_being_short_sized() {
+        const W: u64 = 7;
+        const H: u64 = 5;
+        const PIXELS: u64 = W * H;
+        for &layout in TexelLayout::ALL {
+            let format = crate::backend::vulkan::translate::pixel::vk_texel_layout(layout);
+            let sized = (PIXELS * u64::from(readback_bytes_per_texel(format))) as usize;
+            match narrow_readback_to_rgba8(vec![0u8; sized], layout, format, PIXELS, true) {
+                Ok((pixels, bgra)) => {
+                    assert_eq!(
+                        pixels.len(),
+                        (PIXELS * u64::from(RESIDENT_READ_BYTES_PER_TEXEL)) as usize,
+                        "{layout:?}: a consumer of drawn pixels reads RGBA8"
+                    );
+                    // A four-byte layout is handed back untouched, so it keeps
+                    // the order it was read in; a narrowed one is semantic RGBA8
+                    // and owes no exchange. Both rails pass this straight on.
+                    assert_eq!(
+                        bgra,
+                        layout.bytes_per_texel() == RESIDENT_READ_BYTES_PER_TEXEL,
+                        "{layout:?}: reported the wrong channel order for its rail"
+                    );
+                }
+                Err(_) => {
+                    // Refused. It must be the layout and not the size, so hand
+                    // the same narrowing a buffer no sizing error could make too
+                    // small and require the same answer.
+                    let mut dst = vec![0u8; (PIXELS * 4) as usize];
+                    assert!(
+                        !crate::contract::pixel_format::narrow_texel_to_rgba8(
+                            layout,
+                            &vec![0u8; sized * 8],
+                            PIXELS as u32,
+                            &mut dst,
+                        ),
+                        "{layout:?}: a bigger buffer was accepted, so the slot was sized short"
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -3541,11 +4442,114 @@ mod probe_visibility_tests {
         let error = vk_call::exec_submit_device_lost_fixture();
         for probe in [
             EngineProbe::StorageWriteWithoutFormat,
-            EngineProbe::SampledR32fLinearFilter,
+            EngineProbe::SampledLayoutLinearFilter,
         ] {
             let line = engine_probe_decline(probe, &error).render();
             assert!(line.starts_with("vk_engine_probe reason=vk_exec_submit "));
             assert!(line.ends_with(&format!(" probe={}", probe.name())));
         }
+    }
+}
+
+#[cfg(test)]
+mod run_table_arena_tests {
+    use super::*;
+
+    /// `minStorageBufferOffsetAlignment` on the three hosts this rail runs:
+    /// 16 on Apple/MoltenVK, 32 on the NVIDIA proprietary driver, 256 on the
+    /// several drivers that report the Vulkan maximum-permitted value.
+    const ALIGNS: [u64; 3] = [16, 32, 256];
+
+    fn table(runs: usize, seed: u32) -> Vec<u32> {
+        (0..runs as u32 * 4).map(|w| w ^ seed).collect()
+    }
+
+    /// A descriptor offset the driver refuses is the whole failure mode this
+    /// arena introduced, so it is the first thing asserted.
+    #[test]
+    fn every_place_starts_at_a_legal_descriptor_offset() {
+        for align in ALIGNS {
+            let words: Vec<Vec<u32>> = (1..=9).map(|n| table(n, n as u32)).collect();
+            let borrowed: Vec<&[u32]> = words.iter().map(|w| &w[..]).collect();
+            let (_, places) = pack_run_tables(&borrowed, align);
+            for place in &places {
+                assert_eq!(
+                    place.bind_offset % align,
+                    0,
+                    "align {align}: offset {} is not a multiple",
+                    place.bind_offset
+                );
+            }
+        }
+    }
+
+    /// A range reaching into the next table would let a dispatch read runs that
+    /// belong to another gather — a wrong window, not a slow one.
+    #[test]
+    fn no_places_bound_range_reaches_its_neighbour() {
+        for align in ALIGNS {
+            let words: Vec<Vec<u32>> = (1..=9).map(|n| table(n, n as u32)).collect();
+            let borrowed: Vec<&[u32]> = words.iter().map(|w| &w[..]).collect();
+            let (packed, places) = pack_run_tables(&borrowed, align);
+            for pair in places.windows(2) {
+                assert!(
+                    pair[0].bind_offset + pair[0].bind_range <= pair[1].bind_offset,
+                    "align {align}: {:?} overlaps {:?}",
+                    pair[0],
+                    pair[1]
+                );
+            }
+            let last = places.last().expect("nine tables");
+            assert!(
+                last.bind_offset + last.bind_range <= packed.len() as u64,
+                "align {align}: last place reaches past the arena"
+            );
+        }
+    }
+
+    /// The bytes a dispatch reads at its own place must be its own table's, in
+    /// order. This is the property the per-table staging slots gave for free and
+    /// the arena has to earn.
+    #[test]
+    fn each_table_reads_back_its_own_words_at_its_own_place() {
+        for align in ALIGNS {
+            let words: Vec<Vec<u32>> = (1..=9)
+                .map(|n| table(n * 3, 0xa5a5_0000 + n as u32))
+                .collect();
+            let borrowed: Vec<&[u32]> = words.iter().map(|w| &w[..]).collect();
+            let (packed, places) = pack_run_tables(&borrowed, align);
+            for (place, want) in places.iter().zip(&words) {
+                let at = place.bind_offset as usize;
+                let bytes = &packed[at..at + std::mem::size_of_val(&want[..])];
+                assert_eq!(bytes, run_table_bytes(want), "align {align}");
+                assert_eq!(
+                    place.bind_range,
+                    std::mem::size_of_val(&want[..]) as u64,
+                    "align {align}: a range wider than the table would bind padding"
+                );
+            }
+        }
+    }
+
+    /// One table is the writeback's ordinary case and it must not pay for the
+    /// arena: its place is the buffer's own start, exactly as the per-table slot
+    /// it replaces was.
+    #[test]
+    fn a_lone_table_sits_at_offset_zero() {
+        let words = table(7, 1);
+        let (packed, places) = pack_run_tables(&[&words[..]], 256);
+        assert_eq!(places.len(), 1);
+        assert_eq!(places[0].bind_offset, 0);
+        assert_eq!(places[0].bind_range, 7 * 4 * 4);
+        assert_eq!(packed.len(), 256, "rounded up to the alignment stride");
+    }
+
+    /// `acquire_staging` and `VkDescriptorBufferInfo` both refuse a zero size,
+    /// and a caller with nothing to stage would otherwise reach both with one.
+    #[test]
+    fn no_tables_still_asks_for_a_buffer_a_descriptor_could_name() {
+        let (packed, places) = pack_run_tables(&[], 256);
+        assert!(places.is_empty());
+        assert_eq!(packed.len(), 4);
     }
 }

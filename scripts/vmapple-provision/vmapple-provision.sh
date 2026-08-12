@@ -80,7 +80,8 @@ vmapple-provision: DONE. Golden-image bundle at $GUEST_DIR
   disk.img / aux.img / aux.img.trimmed / vm.json   (ECID/uuid=$UUID)
 
 Next (one bootstrap boot to finish the golden image):
-  1. vm/boot-arm64.sh --snapshot             # boots write-through; complete Setup Assistant (create the user)
+  1. mkdir -p vm/guest/rails/<rail>          # a rail is one guest OS line; name it for the OS
+     vm/boot-arm64.sh --rail <rail> --capture # rail is empty → boots write-through; complete Setup Assistant
   2. In the guest: enable Remote Login (sudo systemsetup -setremotelogin on), then run
      scripts/vmapple-guest-config (sleep off, SSH kept on)
   3. Shut the guest down cleanly — that captures the first immutable snapshot

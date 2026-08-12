@@ -1908,3 +1908,71 @@ fn a_repoint_of_an_object_this_device_holds_nothing_for_touches_no_neighbour() {
         "the same ref in a different task is a different object"
     );
 }
+
+/// Each way an object-list lookup comes back empty gets its own route.
+///
+/// The whole reason [`super::ListMiss`] exists is that eight causes shared one
+/// `reason=no_list_entry`, so a boot losing draws could not say whether this
+/// device had cleared a task's list under the guest or the guest had not
+/// published the object yet. Two variants sharing a route string — the obvious
+/// copy-paste when a ninth is added — rebuilds exactly that, and rebuilds it
+/// invisibly, because a merged population still reads as a clean count.
+#[test]
+fn every_object_list_miss_names_a_different_check() {
+    let routes: Vec<&'static str> = super::ListMiss::ALL.iter().map(|m| m.route()).collect();
+    let mut unique = routes.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(
+        unique.len(),
+        routes.len(),
+        "two object-list misses share a route, so their counts add up as one: {routes:?}"
+    );
+    assert!(
+        routes.iter().all(|r| r.starts_with("list_miss_")),
+        "the family shares a prefix so a boot can rank it in one grep: {routes:?}"
+    );
+}
+
+/// The claimant banding must separate a real ownership signal from the confound
+/// that nearly buried it.
+///
+/// Every task registers its object list at the same `pfn = 1`, so on a busy
+/// guest "some other task has something at slot 3" is close to a tautology. The
+/// first version of this instrument was a yes/no and answered yes to every miss
+/// on macos-26, which reads as a finding and is not one. The band against the
+/// live task count is what makes the difference visible, so each boundary is
+/// pinned here:
+///
+/// - nobody has it — the guest has not published it, and the fix is to wait;
+/// - exactly one other task has it — a real ownership signal, the object is in
+///   a list this device did not look in;
+/// - all of the others have it — the slot index is just populated everywhere and
+///   this search cannot tell ownership from coincidence.
+///
+/// The asking task is excluded from the count, so "all" must compare against
+/// `live - 1`. Comparing against `live` would make "all" unreachable and silently
+/// demote every genuine all-claim to "many".
+#[test]
+fn a_claimant_count_is_banded_against_the_tasks_that_could_have_claimed() {
+    use super::slot_empty_claim_route as band;
+
+    assert_eq!(band(0, 8), "list_miss_slot_empty_claimed_nowhere");
+    assert_eq!(band(1, 8), "list_miss_slot_empty_claimed_by_one");
+    assert_eq!(band(4, 8), "list_miss_slot_empty_claimed_by_many");
+    assert_eq!(
+        band(7, 8),
+        "list_miss_slot_empty_claimed_by_all",
+        "seven others out of eight live tasks is every task that could have claimed"
+    );
+
+    // Two tasks total: the one asking and one other. That other claiming is
+    // both "one" and "all", and "one" is the reading that matters — it is the
+    // ownership signal, while "all" only ever means the search is uninformative.
+    assert_eq!(band(1, 2), "list_miss_slot_empty_claimed_by_one");
+
+    // A single live task has nobody else to claim, and must not be reported as
+    // a unanimous claim over an empty population.
+    assert_eq!(band(0, 1), "list_miss_slot_empty_claimed_nowhere");
+    assert_eq!(band(0, 0), "list_miss_slot_empty_claimed_nowhere");
+}

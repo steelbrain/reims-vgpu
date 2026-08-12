@@ -1,0 +1,339 @@
+<!doctype html>
+<!--
+  A guest workload with a dial on each of this device's three big rails, served
+  from the HOST.
+
+  Why this exists, and why it is not just `anim.html` with more boxes.
+  `sustained-animation-probe` is a compositing load, and on a macos-13 rail it
+  has **saturated**: the guest produces ~26 800 draws a second and ~76 presented
+  frames whatever the device does underneath. Three consecutive device changes
+  measured against it — a 3.9 us/chain pipeline saving among them — moved
+  `draws_s` by less than 0.1 %, because the drain worker sits at duty 0.83 and
+  spends the time it saves waiting for guest work rather than doing more of it.
+  A probe a device cannot fall behind cannot rank a device change.
+
+  So this page is built to be *heavier per frame* rather than to ask for more
+  frames. The guest's frame rate is capped by its own display cadence and no
+  page can raise it; what a page can raise is what each of those frames costs.
+
+  Three axes, dialled independently by query string, because they land on three
+  different rails and a change that helps one can hurt another:
+
+    ?layers=N     N separately composited full-width bands. Each is a surface
+                  the window server composites and this device writes back, so
+                  this is the `store` / `render_writeback` rail — the one the
+                  compute scatter serves.
+
+    ?verts=K      A WebGL canvas that re-uploads a K-vertex buffer every frame
+                  and draws it. This is the **guest buffer gather** rail:
+                  `buffer_guest_gather_bytes` and `buffer_guest_gather_regions`,
+                  which on a compositing load is 5.8 GB/s over 427 000 transfer
+                  regions a second and is the largest GPU cost left in the
+                  device. A CSS load barely touches it; nothing else here does.
+
+    ?tex=W        A 2D canvas of W x W repainted every frame, so the guest
+                  uploads fresh texture content — the sampled-image rail.
+
+    ?gldraws=N    Split the WebGL canvas's frame into N `drawArrays` calls,
+                  each preceded by a uniform write. This is the **command
+                  stream** axis: what a paravirtualized GPU costs is per draw
+                  — decode, bind resolution, descriptor build, recording — and
+                  every other dial here raises bytes or fragments instead.
+                  Needs `verts`; the vertex range is divided between the calls,
+                  so `gldraws` alone changes the shape of a frame and not its
+                  size. No JavaScript per call beyond the uniform.
+
+    ?fragcost=K   K loop iterations in the WebGL fragment shader. Pure GPU
+                  intensity with no guest cost at all, so it moves `slot_us`
+                  (ring backpressure) and nothing else. Use it to ask whether a
+                  reading is bounded by this device's CPU or by the GPU behind
+                  it: a dial that raises frame time here and nowhere else says
+                  the device had headroom.
+
+    ?blur=R       R-pixel `backdrop-filter` blur on every band. The window
+                  server, not the page, pays it, and it pays on the GPU — so
+                  this drives heavy compositor fragment work through the same
+                  surfaces the `layers` dial creates, without adding a single
+                  JavaScript operation per frame.
+
+  Defaults are the *light* end of each, so a caller always states the load it
+  asked for and a boot's URL is the record of what it measured.
+
+  Determinism, same rule as `anim.html` and for the same reason: every step is
+  per *frame* and nothing in the content reads the clock, so a slow boot and a
+  fast boot draw identical content per frame and differ only in how many frames
+  they get through. The on-screen counter is display only and is excluded from
+  the geometry.
+-->
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>reims-vgpu gpu load</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #08080c; overflow: hidden; }
+  /* Promotion is forced, not hinted — `will-change` alone is advisory and the
+     compositor declines it often enough to split boots of one binary into two
+     clusters with a 24 % present-rate gap. `backface-visibility` here plus the
+     3D transform the tick applies take it out of the compositor's discretion.
+     This rule cannot carry a `transform`: the tick overwrites the inline one
+     every frame. See `sustained-animation-probe/anim.html`, which found this. */
+  .band {
+    position: absolute; left: 0; width: 100%;
+    will-change: transform;
+    backface-visibility: hidden;
+  }
+  .box { position: absolute; top: 6%; height: 88%; border-radius: 10px; }
+  #hud {
+    position: absolute; right: 10px; bottom: 6px; z-index: 20;
+    font: 14px -apple-system, Helvetica, sans-serif; color: #9f9;
+  }
+  #backdrop {
+    position: absolute; inset: 0; z-index: -1;
+    background:
+      repeating-linear-gradient(45deg, #123 0 24px, #7ad 24px 48px),
+      repeating-linear-gradient(-45deg, #431 0 31px, #fa7 31px 62px);
+    background-blend-mode: difference;
+  }
+  #gl, #tex { position: absolute; left: 0; top: 0; width: 100%; height: 100%; }
+  #tex { opacity: 0.35; }
+</style>
+<body>
+<canvas id="gl"></canvas>
+<canvas id="tex"></canvas>
+<div id="hud">warming up</div>
+<script>
+const P = new URLSearchParams(location.search);
+
+// ------------------------------------------------------------------ scan ----
+// `?scan=a=1,b=2;c=3&legsecs=S` walks a list of dial sets, one document each,
+// `S` seconds apart. A boot costs minutes and a leg costs seconds, so a
+// question about the *shape* of a load — which dial moves which rail — is
+// answered far more cheaply by one boot than by one boot per dial set.
+//
+// It navigates rather than opening tabs or iframes, so exactly one document is
+// ever live and no earlier leg is still animating behind the current one. Each
+// leg announces itself by fetching a URL the host's server has no file for; the
+// 404 in the server's own log is the leg boundary, timestamped by the host
+// clock, which is the clock the device's census is on. `;` and `,` stand in for
+// `&` because the whole list has to survive being one query parameter.
+const SCAN = (P.get('scan') || '').split(';').filter(s => s.length > 0);
+const LEGSECS = Math.max(1, parseInt(P.get('legsecs') ?? '25', 10) || 25);
+const LEGNO = parseInt(P.get('leg') ?? '0', 10) || 0;
+function gotoLeg(rest, n) {
+  const dials = rest[0].split(',').join('&');
+  const tail = rest.slice(1).join(';');
+  location.replace(`load.html?${dials}&scan=${encodeURIComponent(tail)}` +
+                   `&legsecs=${LEGSECS}&leg=${n}&legstarted=1`);
+}
+if (SCAN.length > 0 && !P.has('legstarted')) {
+  // The first document of a scan carries only the list, so it hands straight
+  // over to leg 0 rather than drawing a leg of its own with default dials.
+  fetch(`leg-begin-${LEGNO}?dials=${encodeURIComponent(SCAN[0])}`)
+    .catch(() => {}).finally(() => gotoLeg(SCAN, LEGNO));
+} else if (SCAN.length > 0) {
+  // The last leg's document carries an empty list and so falls out of both
+  // arms: it runs until the probe's own window ends, which is what makes the
+  // scan's total time the caller's to choose rather than the list's.
+  setTimeout(() => {
+    fetch(`leg-end-${LEGNO}`).catch(() => {}).finally(() => gotoLeg(SCAN, LEGNO + 1));
+  }, LEGSECS * 1000);
+}
+
+const num = (k, d) => Math.max(0, parseInt(P.get(k) ?? d, 10) || 0);
+const LAYERS = num('layers', 8);
+const BOXES  = num('boxes', 6);
+const VERTS  = num('verts', 0);
+const TEX    = num('tex', 0);
+const GLDRAWS  = Math.max(1, num('gldraws', 1));
+const FRAGCOST = num('fragcost', 0);
+const BLUR     = num('blur', 0);
+
+// ---------------------------------------------------------------- layers ----
+// Each band is its own composited surface moving at its own rate, so no two
+// frames repeat an earlier pair and the compositor cannot elide one.
+// A blurred backdrop has to have something to blur: over a flat body the
+// compositor can satisfy the filter with a constant and the pass costs nothing.
+// This is the pattern the boxes are read through, and it never moves, so no
+// part of its cost is per frame except the blur itself.
+if (BLUR > 0) {
+  const bg = document.createElement('div');
+  bg.id = 'backdrop';
+  document.body.appendChild(bg);
+}
+const bands = [];
+for (let b = 0; b < LAYERS; b++) {
+  const el = document.createElement('div');
+  el.className = 'band';
+  el.style.top = (b * (100 / Math.max(LAYERS, 1))) + '%';
+  el.style.height = (100 / Math.max(LAYERS, 1)) + '%';
+  for (let i = 0; i < BOXES; i++) {
+    const box = document.createElement('div');
+    box.className = 'box';
+    box.style.left = (i * 100 / Math.max(BOXES, 1)) + '%';
+    box.style.width = (80 / Math.max(BOXES, 1)) + '%';
+    if (BLUR > 0) {
+      // Translucent, or the filter has no visible consequence and is a
+      // candidate for elision by a compositor that can prove the element
+      // opaque.
+      box.style.background = `hsla(${(b * 37 + i * 11) % 360} 80% 55% / 0.35)`;
+      box.style.backdropFilter = `blur(${BLUR}px)`;
+      box.style.webkitBackdropFilter = `blur(${BLUR}px)`;
+    } else {
+      box.style.background = `hsl(${(b * 37 + i * 11) % 360} 80% 55%)`;
+    }
+    el.appendChild(box);
+  }
+  document.body.appendChild(el);
+  bands.push(el);
+}
+
+// ------------------------------------------------------------------ webgl ---
+// The point of this axis is the **buffer upload**, not the shading: a fresh
+// `bufferData` every frame is what makes the guest hand this device a large
+// buffer window it has to gather into device-local memory. The shader is
+// deliberately trivial so the cost lands on the gather and not on fragments.
+let gl = null, glBuf = null, glData = null, glCount = 0, glTint = null;
+if (VERTS > 0) {
+  const c = document.getElementById('gl');
+  c.width = 1024; c.height = 768;
+  gl = c.getContext('webgl', { antialias: false, depth: false, alpha: false });
+}
+if (gl) {
+  const vs = gl.createShader(gl.VERTEX_SHADER);
+  gl.shaderSource(vs, 'attribute vec2 p;varying vec3 v;void main(){v=vec3(p*0.5+0.5,0.6);gl_Position=vec4(p,0.0,1.0);}');
+  gl.compileShader(vs);
+  const fs = gl.createShader(gl.FRAGMENT_SHADER);
+  // `fragcost` is a literal in the source rather than a uniform because a WebGL
+  // 1 loop bound must be constant, and because a shader whose cost is a uniform
+  // is one pipeline the guest keeps while a shader whose cost is a literal is a
+  // different program per dial — which is what a caller comparing two dials
+  // wants, since each is then its own compiled pipeline exactly as two real
+  // programs would be.
+  gl.shaderSource(fs,
+    'precision highp float;varying vec3 v;uniform vec4 tint;void main(){' +
+    'vec3 c=v;' +
+    (FRAGCOST > 0
+      ? `for(int i=0;i<${FRAGCOST};i++){c=fract(c*1.11+vec3(0.013,0.017,0.019))+c*0.0001;}`
+      : '') +
+    'gl_FragColor=vec4(c*0.5+tint.rgb*0.5,1.0);}');
+  gl.compileShader(fs);
+  const prog = gl.createProgram();
+  gl.attachShader(prog, vs); gl.attachShader(prog, fs); gl.linkProgram(prog);
+  gl.useProgram(prog);
+  glCount = VERTS - (VERTS % 3);      // whole triangles only
+  // Built once. The per-frame cost has to be the upload and not the fill —
+  // see the tick, which explains what rebuilding it cost.
+  glData = new Float32Array(glCount * 2);
+  for (let i = 0; i < glCount; i++) {
+    glData[i * 2]     = (((i * 7) % 2048) / 1024) - 1;
+    glData[i * 2 + 1] = (((i * 13) % 2048) / 1024) - 1;
+  }
+  glBuf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, glBuf);
+  const loc = gl.getAttribLocation(prog, 'p');
+  gl.enableVertexAttribArray(loc);
+  gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+  glTint = gl.getUniformLocation(prog, 'tint');
+  gl.viewport(0, 0, 1024, 768);
+  // Report which renderer the guest bound this context to, the same way the
+  // scan reports a leg boundary: a fetch the host's server has no file for, so
+  // the answer lands in its log with a host timestamp. There is no other way to
+  // learn it — the guest has no developer tools, and a device-side counter
+  // cannot see a decision the guest made before it ever reached this device.
+  //
+  // It is the question this dial's collapse turns on. `verts=60000` produces six
+  // presented frames a second while the guest burns ~1.1 cores across its vCPUs
+  // and this device is idle seven eighths of the time, and a renderer string
+  // naming a software rasteriser and one naming the paravirtualised GPU are two
+  // completely different bugs.
+  const dbg = gl.getExtension('WEBGL_debug_renderer_info');
+  const q = (e) => { try { return String(gl.getParameter(e)); } catch (_) { return '?'; } };
+  fetch('webgl-renderer' +
+        `?vendor=${encodeURIComponent(q(gl.VENDOR))}` +
+        `&renderer=${encodeURIComponent(q(gl.RENDERER))}` +
+        `&unmasked=${encodeURIComponent(dbg ? q(dbg.UNMASKED_RENDERER_WEBGL) : 'no-ext')}` +
+        `&version=${encodeURIComponent(q(gl.VERSION))}` +
+        `&maxtex=${q(gl.MAX_TEXTURE_SIZE)}`).catch(() => {});
+} else {
+  const c = document.getElementById('gl');
+  if (c) c.style.display = 'none';
+}
+
+// -------------------------------------------------------------- texture -----
+let tctx = null;
+if (TEX > 0) {
+  const c = document.getElementById('tex');
+  c.width = TEX; c.height = TEX;
+  tctx = c.getContext('2d');
+} else {
+  const c = document.getElementById('tex');
+  if (c) c.style.display = 'none';
+}
+
+// ----------------------------------------------------------------- tick -----
+let frame = 0;
+function tick() {
+  frame++;
+  // Bands. `translate3d` keeps the layer promoted; the per-band rate is a
+  // different integer per band so the set never repeats.
+  for (let b = 0; b < bands.length; b++) {
+    const x = ((frame * (b + 3)) % 400) - 200;
+    bands[b].style.transform = `translate3d(${x}px,0,0)`;
+  }
+
+  if (gl) {
+    // Hand the whole buffer over again every frame — that is this axis — but
+    // do **not** rebuild it in JavaScript first.
+    //
+    // The first version of this page rewrote all `glCount * 2` floats per
+    // frame. At verts=90000 that made the *guest* the bottleneck rather than
+    // the device: a driven boot fell to 1 329 draws a second at drain duty
+    // 0.12, against 26 800 at 0.83 on the far lighter CSS-only probe. A probe
+    // that starves the device measures the guest's JavaScript engine, which is
+    // the exact failure it was written to fix, one layer further out.
+    //
+    // Mutating a few entries is enough: `bufferData` re-uploads the whole array
+    // regardless, so the device sees the same traffic, and the touched entries
+    // stop a browser from proving the contents constant and eliding the call.
+    for (let k = 0; k < 8; k++) {
+      const i = (frame * 7 + k * 251) % glCount;
+      glData[i * 2] = (((i * 13 + frame) % 2048) / 1024) - 1;
+    }
+    gl.bufferData(gl.ARRAY_BUFFER, glData, gl.DYNAMIC_DRAW);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    // One call, or `gldraws` of them over the same vertices. The uniform write
+    // between calls is what stops the guest's driver from merging them, and it
+    // is also the smallest state change a real frame carries, so a draw here
+    // costs this device what a draw costs anywhere.
+    const per = Math.max(3, Math.floor(glCount / GLDRAWS / 3) * 3);
+    let first = 0;
+    for (let d = 0; d < GLDRAWS && first < glCount; d++) {
+      if (glTint) {
+        const h = (d * 0.137 + frame * 0.01) % 1;
+        gl.uniform4f(glTint, h, 1 - h, (h * 3) % 1, 1);
+      }
+      gl.drawArrays(gl.TRIANGLES, first, Math.min(per, glCount - first));
+      first += per;
+    }
+  }
+
+  if (tctx) {
+    // Two fills rather than the twenty-five the first version drew, for the
+    // reason above: the *upload* is the load on this axis and it is `TEX * TEX`
+    // either way, so anything more elaborate is guest paint time bought at the
+    // device's expense.
+    const s = TEX;
+    tctx.fillStyle = `hsl(${frame % 360} 60% 30%)`;
+    tctx.fillRect(0, 0, s, s);
+    tctx.fillStyle = `hsl(${(frame * 5) % 360} 85% 60%)`;
+    tctx.fillRect((frame * 3) % s, 0, s / 4, s);
+  }
+
+  if ((frame & 63) === 0) {
+    document.getElementById('hud').textContent =
+      `f=${frame} layers=${LAYERS}x${BOXES} verts=${glCount}x${GLDRAWS} ` +
+      `frag=${FRAGCOST} tex=${TEX} blur=${BLUR}`;
+  }
+  requestAnimationFrame(tick);
+}
+requestAnimationFrame(tick);
+</script>

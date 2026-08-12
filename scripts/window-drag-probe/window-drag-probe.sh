@@ -75,7 +75,9 @@ WORK="${KEEP:-$(mktemp -d)}"
 mkdir -p "$WORK"
 [ -n "$KEEP" ] || trap 'rm -rf "$WORK"' EXIT
 say() { echo "window-drag-probe: $*"; }
-osa() { ssh -o BatchMode=yes "$GUEST" "osascript -e '$1'" 2>/dev/null; }
+# shellcheck source=../lib/guest-display.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)/guest-display.sh"
+osa() { guest_osa "$GUEST" "$1"; }
 
 ssh -o ConnectTimeout=8 -o BatchMode=yes "$GUEST" true 2>/dev/null || {
   say "no guest at $GUEST" >&2; exit 2; }
@@ -101,23 +103,63 @@ esac
 # A window that fills the screen leaves the compositor almost nothing to
 # recomposite behind it, and one that is tiny damages almost nothing. Half the
 # screen, placed off-centre so the drag path stays on-screen throughout.
-ssh -o BatchMode=yes "$GUEST" "open -a '$APP' about:blank" >/dev/null 2>&1 || true
+# A local blank file rather than `about:blank`: macOS 11's `open` resolves a
+# bare argument as a path before it considers it a URL, so `open -a Safari
+# about:blank` fails with "the file ~/about:blank does not exist", Safari never
+# launches, and the frame read below reports an empty window rather than a
+# missing app. A file also keeps the network out of a compositing measurement.
+ssh -o BatchMode=yes "$GUEST" \
+  "printf '<html><body style=\"background:#fff\"></body></html>' > /tmp/reims-blank.html
+   open -a '$APP' /tmp/reims-blank.html" >/dev/null 2>&1 || true
 sleep 5
-osa "tell application \"System Events\" to tell process \"$APP\" to set position of window 1 to {320, 180}" >/dev/null || true
-osa "tell application \"System Events\" to tell process \"$APP\" to set size of window 1 to {1000, 640}" >/dev/null || true
+
+# Scripting the app at all needs this session consented to send it Apple Events,
+# and the panel that asks is modal on the guest's own screen. Answer it here
+# rather than letting the frame read below hang and report an empty window.
+guest_apple_events_consent "$GUEST" "$APP" || {
+  say "cannot script $APP on this guest — see above" >&2; exit 2; }
+
+# The app's own Standard Suite, not System Events: `bounds of front window` needs
+# only the consent just obtained, while the System Events route needs assistive
+# access that five of six rails do not have. `bounds` is {l,t,r,b}.
+#
+# Consent-aware rather than a bare `osa`, because the panel does not always
+# arrive during the consent step above: a cold app can take longer to accept its
+# first event than that step waits, in which case the first call to raise the
+# panel is one of these. Every one of them is a short query, so a retry is cheap.
+appwin() { guest_osa_consenting "$GUEST" "$APP" "tell application \"$APP\" to $1"; }
+
+# Launching is not having a window. Give a cold app on a slow rail room to open
+# one before deciding it never did.
+BOUNDS=""
+for _ in 1 2 3 4 5 6; do
+  BOUNDS=$(appwin "get bounds of front window" || true)
+  case "$BOUNDS" in [0-9-]*) break ;; esac
+  sleep 5
+done
+
+appwin "set bounds of front window to {320, 180, 1320, 820}" >/dev/null || true
 sleep 2
 
-# Grab the title bar. Read the window's real frame rather than assuming the
-# reposition took: if the app refused it, dragging at the assumed point grabs
-# the desktop and the run measures nothing.
-POS=$(osa "tell application \"System Events\" to tell process \"$APP\" to get position of window 1" || true)
-SIZ=$(osa "tell application \"System Events\" to tell process \"$APP\" to get size of window 1" || true)
-WX=$(echo "$POS" | awk -F', *' '{print $1}')
-WY=$(echo "$POS" | awk -F', *' '{print $2}')
-WW=$(echo "$SIZ" | awk -F', *' '{print $1}')
-case "${WX:-}${WY:-}${WW:-}" in
-  ''|*[!0-9-]*) say "could not read $APP's window frame (pos '$POS' size '$SIZ')" >&2; exit 2 ;;
+# Read the window's real frame rather than assuming the resize took: if the app
+# refused it, dragging at the assumed point grabs the desktop and the run
+# measures nothing.
+BOUNDS=$(appwin "get bounds of front window" || true)
+WX=$(echo "$BOUNDS" | awk -F', *' '{print $1}')
+WY=$(echo "$BOUNDS" | awk -F', *' '{print $2}')
+WR=$(echo "$BOUNDS" | awk -F', *' '{print $3}')
+case "${WX:-}${WY:-}${WR:-}" in
+  ''|*[!0-9-]*)
+    # Two failures read as an unreadable frame and they need different fixes:
+    # the app never launched, or it launched with no window.
+    if ! appwin "get name" >/dev/null 2>&1; then
+      say "$APP did not answer an Apple Event — it is not running on the guest." >&2
+    else
+      say "$APP is running but has no front window (bounds '$BOUNDS')" >&2
+    fi
+    exit 2 ;;
 esac
+WW=$((WR - WX))
 # Middle of the title bar. 14 px down is inside the bar for every macOS window
 # style and clear of the traffic lights, which sit at the left.
 GX=$((WX + WW / 2))
@@ -125,8 +167,8 @@ GY=$((WY + 14))
 if [ "$MOTION" = drag ]; then
   say "motion=drag on $APP window 1 at ($GX,$GY) for ${SECONDS_RUN}s at ${HZ} Hz"
 else
-  say "motion=reposition on $APP window 1 for ${SECONDS_RUN}s (--hz does not \
-apply: System Events sets the rate, and the run reports what it achieved)"
+  say "motion=reposition on $APP front window for ${SECONDS_RUN}s (--hz does not \
+apply: the Apple Event round trip sets the rate, and the run reports what it achieved)"
 fi
 
 # Mark the fail log so only lines the drag produced are read. Byte offset rather
@@ -137,23 +179,34 @@ if [ "$MOTION" = drag ]; then
   ssh -o BatchMode=yes "$GUEST" \
     "/tmp/reims-drag $GX $GY $SECONDS_RUN $HZ 180 90" >"$WORK/drag.json" 2>"$WORK/drag.err" &
 else
-  # The accessibility route cannot pace itself — each `set position` is a
-  # synchronous round trip through System Events — so it runs for the duration
-  # and reports the rate it achieved. `--hz` has no meaning here and the harness
-  # says so above rather than appearing to honour it.
-  ssh -o BatchMode=yes "$GUEST" \
-    "python3 -c \"
-import subprocess, time, json
-t0 = time.time()
-r = subprocess.run(['osascript', '/tmp/reims-reposition.applescript',
-                    '$APP', '$GX', '$WY', '$SECONDS_RUN', '180', '90'],
-                   capture_output=True, text=True)
-el = time.time() - t0
-n = int((r.stdout or '0').strip() or 0)
-print(json.dumps({'posted': n, 'elapsed': round(el, 3),
-                  'posted_hz': round(n / el, 1) if el else 0.0,
-                  'late': 0, 'worst_late_s': 0.0, 'stderr': r.stderr[-200:]}))
-\"" >"$WORK/drag.json" 2>"$WORK/drag.err" &
+  # The Apple Events route cannot pace itself — each `set bounds` is a
+  # synchronous round trip to the app — so it runs for the duration and reports
+  # the rate it achieved. `--hz` has no meaning here and the harness says so
+  # above rather than appearing to honour it.
+  #
+  # Timed on the host, not in the guest. The obvious spelling wraps the
+  # `osascript` in a guest-side `python3` to get a sub-second clock, and that
+  # interpreter is not part of macOS: on a rail without the Command Line Tools
+  # `/usr/bin/python3` is a stub that raises an install dialog and exits, and
+  # from 12.3 there is no system python3 to install into at all. The guest step
+  # is therefore `osascript` and nothing else, and the round trip's own latency
+  # is counted into the elapsed time — which understates the achieved rate
+  # slightly and never overstates it.
+  ( t0=$(date +%s.%N)
+    steps=$(ssh -o BatchMode=yes "$GUEST" \
+      "osascript /tmp/reims-reposition.applescript '$APP' $GX $WY $SECONDS_RUN 180 90" \
+      2>"$WORK/drag.err") || steps=""
+    t1=$(date +%s.%N)
+    awk -v s="${steps:-0}" -v a="$t0" -v b="$t1" 'BEGIN {
+      el = b - a
+      printf "{\"posted\": %d, \"elapsed\": %.3f, \"posted_hz\": %.1f, \"late\": 0, \"worst_late_s\": 0.0}\n",
+             s + 0, el, (el > 0 ? s / el : 0)
+    }'
+    # An osascript that failed still leaves a well-formed zero-step record, so
+    # the failure has to travel as an exit status or the caller reads a run that
+    # never happened as a run that achieved nothing.
+    case "${steps:-}" in ''|*[!0-9]*) exit 1 ;; esac
+  ) >"$WORK/drag.json" &
 fi
 DRAG_PID=$!
 
@@ -164,7 +217,8 @@ DRAG_PID=$!
 # page pass as a churn test this morning. So sample the window's real position
 # mid-drag and require it to have left where it started.
 sleep 3
-MID=$(osa "tell application \"System Events\" to tell process \"$APP\" to get position of window 1" || true)
+MID_BOUNDS=$(appwin "get bounds of front window" || true)
+MID=$(echo "$MID_BOUNDS" | awk -F', *' '{print $1 ", " $2}')
 wait "$DRAG_PID" || {
   say "the drag did not run — see $WORK/drag.err:" >&2
   sed 's/^/  /' "$WORK/drag.err" >&2; exit 2; }

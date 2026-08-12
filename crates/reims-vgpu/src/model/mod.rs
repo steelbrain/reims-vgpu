@@ -403,6 +403,215 @@ mod tests {
         );
     }
 
+    /// The AIR version the guest actually receives sits inside the window the
+    /// guest honours, read out of the reply page rather than out of the table.
+    ///
+    /// The `const` assertion beside [`DEVICE_INFO_AIR_VERSION`] already binds
+    /// the table entry. This binds the other end: key 18 is served through the
+    /// same reduction every other key goes through, so a future change that
+    /// routes it through a host-dependent floor — as the GPU-dependent keys are
+    /// — could deliver a value the constant never sees. The guest's driver
+    /// rewrites an out-of-window value silently in both directions (undefined
+    /// becomes 2.2, at-or-above 2.8 clamps to 2.7), so a wrong value here does
+    /// not fail, it just stops being what this table says it is.
+    ///
+    /// Driven at macOS 26's declared ceiling of 45, which is the rail that has a
+    /// consumer for this key.
+    #[test]
+    fn the_air_version_the_guest_receives_is_inside_the_window_the_guest_honours() {
+        let mut d = dev();
+        let mut h = FakeHost::new();
+        setup_boot_regs(&mut d, &mut h);
+        let reply_pfn = 0x20u32;
+        h.map_range(
+            pfn_to_gpa(reply_pfn, PAGE_SHIFT_ARM64E),
+            PAGE_SIZE_ARM64E as usize,
+            0xee,
+        );
+        let mut payload = vec![0u8; 12];
+        st32(&mut payload[DEVICE_INFO_TAHOE_KEY_TABLE_LEN..], 45);
+        st32(
+            &mut payload[DEVICE_INFO_TAHOE_COUNT..],
+            (PAGE_SIZE_ARM64E as usize / DEVICE_INFO_REPLY_PAIR_LEN) as u32,
+        );
+        st32(&mut payload[DEVICE_INFO_TAHOE_REPLY_PFN..], reply_pfn);
+        write_main_packet(&mut h, 0, ROOT_OP_DEVICE_INFO_TAHOE, 3, &payload);
+        d.state
+            .gfx
+            .fifo_read
+            .store(0, std::sync::atomic::Ordering::Release);
+        d.state.gfx.fifo_written = PACKET_HEADER_LEN + 12;
+        d.state.pending.main_drain = true;
+        d.drain(&mut h);
+
+        // Walk the reply the way the guest does: pairs until the zero
+        // terminator. Reading a fixed slot instead would pin the key's position
+        // in the table, which is not what is under test here.
+        let base = pfn_to_gpa(reply_pfn, PAGE_SHIFT_ARM64E);
+        let mut served = None;
+        for slot in 0..(PAGE_SIZE_ARM64E as usize / DEVICE_INFO_REPLY_PAIR_LEN) {
+            let at = base + (slot * DEVICE_INFO_REPLY_PAIR_LEN) as u64;
+            let key = h.get_u32(at);
+            if key == 0 {
+                break;
+            }
+            if key == DEVICE_INFO_KEY_MAX_MSL_VERSION {
+                served = Some(h.get_u32(at + 4));
+                break;
+            }
+        }
+
+        let served = served.expect("key 18 is inside macOS 26's ceiling, so the reply carries it");
+        assert!(
+            (DEVICE_INFO_AIR_VERSION_MIN..=DEVICE_INFO_AIR_VERSION_MAX).contains(&served),
+            "the guest was told AIR {served:#x}, outside the window \
+             {DEVICE_INFO_AIR_VERSION_MIN:#x}..={DEVICE_INFO_AIR_VERSION_MAX:#x} it honours — \
+             it will rewrite the value and hold something this table does not describe"
+        );
+    }
+
+    /// A key the guest parses and this device never answers is counted, and the
+    /// two ways that happens are counted apart.
+    ///
+    /// The reply already reported `above_ceiling` — keys this device sends that
+    /// the guest discards, which costs nothing. The opposite direction was
+    /// silent, and it is the one that can cost guest work: the guest's walker
+    /// has an arm per key, so a key that never arrives leaves that field at
+    /// whatever the capability struct was initialised to, and
+    /// [`DEVICE_INFO_CAPS`]'s doc is explicit that a value here is an
+    /// instruction to the guest about what it may build.
+    ///
+    /// Driven at the two ceilings real rails declare, measured on driven boots:
+    /// macOS 26 sends 45 and macOS 15 sends 42. The rails disagreeing is the
+    /// point — a guest that parses further must report more holes, which is
+    /// what fails if the ceiling stops feeding the computation.
+    #[test]
+    fn the_keys_a_guest_parses_and_this_device_never_answers_are_counted() {
+        use crate::runtime::drain::store_route_count;
+
+        /// Drive one device-info request at `key_table_len` and return the
+        /// `(holes, tail)` this reply contributed.
+        fn ask(key_table_len: u32) -> (u64, u64) {
+            let mut d = dev();
+            let mut h = FakeHost::new();
+            setup_boot_regs(&mut d, &mut h);
+            let reply_pfn = 0x20u32;
+            h.map_range(
+                pfn_to_gpa(reply_pfn, PAGE_SHIFT_ARM64E),
+                PAGE_SIZE_ARM64E as usize,
+                0xee,
+            );
+            let mut payload = vec![0u8; 12];
+            st32(&mut payload[DEVICE_INFO_TAHOE_KEY_TABLE_LEN..], key_table_len);
+            st32(
+                &mut payload[DEVICE_INFO_TAHOE_COUNT..],
+                (PAGE_SIZE_ARM64E as usize / DEVICE_INFO_REPLY_PAIR_LEN) as u32,
+            );
+            st32(&mut payload[DEVICE_INFO_TAHOE_REPLY_PFN..], reply_pfn);
+            write_main_packet(&mut h, 0, ROOT_OP_DEVICE_INFO_TAHOE, 3, &payload);
+            d.state
+                .gfx
+                .fifo_read
+                .store(0, std::sync::atomic::Ordering::Release);
+            d.state.gfx.fifo_written = PACKET_HEADER_LEN + 12;
+            d.state.pending.main_drain = true;
+            let before = (
+                store_route_count("device_info_key_holes"),
+                store_route_count("device_info_key_tail"),
+            );
+            d.drain(&mut h);
+            (
+                store_route_count("device_info_key_holes") - before.0,
+                store_route_count("device_info_key_tail") - before.1,
+            )
+        }
+
+        let table_top = DEVICE_INFO_CAPS
+            .iter()
+            .map(|&(key, _)| key)
+            .max()
+            .expect("the table is not empty");
+
+        // The three sets partition the guest's parse range, and the partition is
+        // derived here rather than written down twice. Adding a key to the table
+        // without dropping it from the unanswered list — or the reverse — fails
+        // this, which is the only thing stopping that list from decaying into a
+        // comment that used to be true.
+        let answered: std::collections::BTreeSet<u32> =
+            DEVICE_INFO_CAPS.iter().map(|&(key, _)| key).collect();
+        let derived_unanswered: Vec<u32> = (1..=table_top)
+            .filter(|k| !answered.contains(k))
+            .filter(|k| !DEVICE_INFO_DEAD_KEYS.contains(k))
+            .collect();
+        assert_eq!(
+            derived_unanswered, DEVICE_INFO_UNANSWERED_KEYS,
+            "DEVICE_INFO_UNANSWERED_KEYS must be exactly the keys below the \
+             table top that this device neither answers nor knows to be dead"
+        );
+        for dead in DEVICE_INFO_DEAD_KEYS {
+            assert!(
+                !answered.contains(dead),
+                "key {dead} is sent and also declared dead — the guest would \
+                 discard it, so one of the two is wrong"
+            );
+        }
+
+        // A guest that parses nothing has no unanswered key of either kind:
+        // key 0 terminates the walk and is not a key, so a ceiling of 1 admits
+        // none. This is what catches an off-by-one that counts key 0 as a hole
+        // on every boot of every rail.
+        assert_eq!(ask(1), (0, 0), "a ceiling of 1 admits no key at all");
+
+        // Tail is pure arithmetic and independently checkable: keys beyond
+        // anything this device has ever been asked for.
+        assert_eq!(
+            ask(table_top + 1).1,
+            0,
+            "a guest that stops at the table's top asks nothing new"
+        );
+        assert_eq!(
+            ask(table_top + 9).1,
+            8,
+            "eight keys past the table's top are eight tail keys"
+        );
+
+        // The two real rails. The holes are the keys below each ceiling that
+        // the table skips; deriving the expectation from `DEVICE_INFO_CAPS`
+        // rather than writing the numbers keeps this from pinning today's gaps.
+        let gaps_below = |ceiling: u32| -> u64 {
+            (1..ceiling.min(table_top + 1))
+                .filter(|key| !DEVICE_INFO_CAPS.iter().any(|&(k, _)| k == *key))
+                .filter(|key| !DEVICE_INFO_DEAD_KEYS.contains(key))
+                .count() as u64
+        };
+        let macos_15 = ask(42).0;
+        let macos_26 = ask(45).0;
+        assert_eq!(macos_15, gaps_below(42), "macOS 15 parses keys 1..=41");
+        assert_eq!(macos_26, gaps_below(45), "macOS 26 parses keys 1..=44");
+
+        // **The two rails have the same holes, and that is the finding.** The
+        // only key macOS 26 parses that macOS 15 does not and this device does
+        // not answer is 43, which the guest's own walker has no arm for. Once it
+        // stops being counted, the hole sets are identical — so no hole can
+        // explain a defect that appears on macOS 26 and not on macOS 15. This
+        // assertion used to read `macos_26 > macos_15` and passed for exactly
+        // the wrong reason: it was counting the dead key.
+        assert_eq!(
+            macos_26, macos_15,
+            "the extra keys macOS 26 parses are answered (42, 44) or dead (43), \
+             so parsing further must find no additional hole"
+        );
+
+        // Ceiling sensitivity still has to hold, or the report could be a
+        // constant. Key 22 is a real hole, so a ceiling above it must find one
+        // more than a ceiling at it.
+        assert_eq!(
+            ask(23).0,
+            ask(22).0 + 1,
+            "raising the ceiling past the hole at key 22 must report it"
+        );
+    }
+
     #[test]
     fn reset_clears_state() {
         let mut d = dev();

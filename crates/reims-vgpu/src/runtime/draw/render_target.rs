@@ -223,6 +223,15 @@ pub(super) enum RenderTargetCause {
     /// The type-8 view chain ended at ref 0 — the view names no base texture.
     ViewBaseUnbound,
 
+    /// The view's own level base plus the level the pass named does not fit a
+    /// `u32`. A healthy zero: both are mip indices and a real texture has at
+    /// most [`TEXTURE_MAX_MIP_LEVELS`](crate::runtime::decode::resource::TEXTURE_MAX_MIP_LEVELS)
+    /// of them. It exists so the sum is never a wrapped small level, which would
+    /// render into the wrong plane of a real allocation.
+    LevelOverflow {
+        view_level: u32,
+        attachment_level: u32,
+    },
     /// A mip>0 view of an IOSurface. Type-11 sample windows carry planes, not
     /// mip levels, so this geometry has no contract behind it.
     Type11MipView { level: u32 },
@@ -346,6 +355,7 @@ impl crate::observe::Decline for RenderTargetRefusal {
         match self.cause {
             C::ViewSwizzled => "rt_view_swizzled",
             C::ViewBaseUnbound => "rt_view_base_unbound",
+            C::LevelOverflow { .. } => "rt_level_overflow",
             C::Type11MipView { .. } => "rt_type11_mip_view",
             C::Type11Unresolved => "rt_type11_unresolved",
             C::Type11NoMapping { .. } => "rt_type11_no_mapping",
@@ -386,6 +396,13 @@ impl crate::observe::Decline for RenderTargetRefusal {
         match self.cause {
             C::Type11MipView { level } | C::LinearLevelGva { level } => {
                 v.push(("level", level.to_string()))
+            }
+            C::LevelOverflow {
+                view_level,
+                attachment_level,
+            } => {
+                v.push(("view_level", view_level.to_string()));
+                v.push(("attachment_level", attachment_level.to_string()));
             }
             C::Type11NoMapping { mapping_id } => v.push(("mid", mapping_id.to_string())),
             C::Type11Geometry {
@@ -529,12 +546,13 @@ pub(super) fn lookup_render_target<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &M,
     task_id: u32,
-    texture_ref: u32,
+    att: crate::runtime::decode::render::ColorAttachment,
 ) -> Option<ResolvedRenderTarget> {
+    let texture_ref = att.texture_ref;
     if texture_ref == 0 {
         return None;
     }
-    match resolve_render_target(state, host, task_id, texture_ref) {
+    match resolve_render_target(state, host, task_id, att) {
         Ok(rt) => Some(rt),
         Err(refusal) => {
             // Per attachment, per check: the guest re-issues the same pass every
@@ -562,9 +580,10 @@ fn resolve_render_target<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &M,
     task_id: u32,
-    texture_ref: u32,
+    att: crate::runtime::decode::render::ColorAttachment,
 ) -> Result<ResolvedRenderTarget, RenderTargetRefusal> {
     use RenderTargetCause as C;
+    let texture_ref = att.texture_ref;
     // Type-8 view → base (archive resource_resolve_texture view chain).
     let (resolved_ref, view_fmt_override, view_level) =
         if let Some(view) = resolve_texture_view(state, host, task_id, texture_ref) {
@@ -578,6 +597,19 @@ fn resolve_render_target<M: HostMemory + HostOps>(
         } else {
             (texture_ref, None, 0)
         };
+    // The level the pass names is relative to the texture it names, so a pass
+    // rendering into level 1 of a view whose own range starts at level 2 lands
+    // on the base texture's level 3. Both halves reach every rung below as one
+    // number, which is what keeps the type-11 and type-4 rungs — neither of
+    // which has a mip layout — refusing an attachment level as loudly as they
+    // already refuse a view level.
+    let level = view_level
+        .checked_add(att.level)
+        .ok_or(C::LevelOverflow {
+            view_level,
+            attachment_level: att.level,
+        }
+        .at(resolved_ref))?;
     if resolved_ref == 0 {
         return Err(C::ViewBaseUnbound.at(resolved_ref));
     }
@@ -607,8 +639,8 @@ fn resolve_render_target<M: HostMemory + HostOps>(
     if try_type11 {
         // Type-11 sample windows carry planes, not mip levels — a mip>0 view
         // of an IOSurface has no contract-backed layout; fail visibly.
-        if view_level != 0 {
-            return Err(C::Type11MipView { level: view_level }.at(resolved_ref));
+        if level != 0 {
+            return Err(C::Type11MipView { level }.at(resolved_ref));
         }
         // Live list is source of truth for mapping_id when the entry is type-11.
         // Latch is only a fallback when the list entry is transiently missing
@@ -696,12 +728,8 @@ fn resolve_render_target<M: HostMemory + HostOps>(
         _ => None,
     };
     if let Some(surface_id) = type4_sid {
-        if view_level != 0 {
-            return Err(C::Type4MipView {
-                surface_id,
-                level: view_level,
-            }
-            .at(resolved_ref));
+        if level != 0 {
+            return Err(C::Type4MipView { surface_id, level }.at(resolved_ref));
         }
         if !objects::resolve_type4_surface(state, host, surface_id) {
             return Err(C::Type4Unresolved {
@@ -787,10 +815,10 @@ fn resolve_render_target<M: HostMemory + HostOps>(
     // Mip>0 view of a linear texture: the RT is that level's plane inside the
     // base allocation (archive collapses view mip into linear geometry —
     // compositor blur/backdrop pyramids render into successive levels).
-    let (gva, w, h, bpr) = if view_level != 0 {
+    let (gva, w, h, bpr) = if level != 0 {
         let (level_gva, layout) = tex
-            .level_gva(view_level, state.page_shift)
-            .ok_or(C::LinearLevelGva { level: view_level }.at(resolved_ref))?;
+            .level_gva(level, state.page_shift)
+            .ok_or(C::LinearLevelGva { level }.at(resolved_ref))?;
         if layout.row_stride > u32::MAX as u64 {
             return Err(C::LinearLevelStride {
                 row_stride: layout.row_stride,
@@ -1003,7 +1031,7 @@ mod tests {
         let host = FakeHost::new();
 
         let cap = crate::observe::FailCapture::start();
-        assert!(lookup_render_target(&mut state, &host, /*task*/ 4, /*ref*/ 0).is_none());
+        assert!(lookup_render_target(&mut state, &host, /*task*/ 4, attach(0)).is_none());
         assert!(
             cap.lines().is_empty(),
             "an unbound colour attachment must spend no line: {:?}",
@@ -1014,7 +1042,7 @@ mod tests {
         // Nothing under the ref: no object list on this task at all, which is
         // the ladder's least specific refusal and still names itself.
         let cap = crate::observe::FailCapture::start();
-        assert!(lookup_render_target(&mut state, &host, 4, 0x5c1).is_none());
+        assert!(lookup_render_target(&mut state, &host, 4, attach(0x5c1)).is_none());
         assert_eq!(
             cap.one("rt_resolve"),
             "rt_resolve reason=rt_no_list_entry base=1473 task=4 ref=1473"
@@ -1045,7 +1073,7 @@ mod tests {
         state.texture_to_mapping.insert((4, tex_ref), 77);
 
         let cap = crate::observe::FailCapture::start();
-        assert!(lookup_render_target(&mut state, &host, 4, tex_ref).is_none());
+        assert!(lookup_render_target(&mut state, &host, 4, attach(tex_ref)).is_none());
         let line = cap.one("rt_resolve");
         assert!(
             line.starts_with("rt_resolve reason=rt_type11_geometry "),
@@ -1055,6 +1083,16 @@ mod tests {
             line.contains(" mid=77 has_geom=false dims=0x0"),
             "the refusal must carry the mapping it measured: {line}"
         );
+    }
+
+    /// A colour attachment naming `texture_ref` at level 0 — the shape every
+    /// case below is about, so that a case that means to vary the subresource
+    /// has to say so.
+    fn attach(texture_ref: u32) -> crate::runtime::decode::render::ColorAttachment {
+        crate::runtime::decode::render::ColorAttachment {
+            texture_ref,
+            ..Default::default()
+        }
     }
 
     /// A refusal is reported once per attachment per check, not once per draw.
@@ -1071,13 +1109,128 @@ mod tests {
 
         let cap = crate::observe::FailCapture::start();
         for _ in 0..8 {
-            assert!(lookup_render_target(&mut state, &host, 4, tex_ref).is_none());
+            assert!(lookup_render_target(&mut state, &host, 4, attach(tex_ref)).is_none());
         }
         assert_eq!(
             cap.lines().len(),
             1,
             "eight draws against one unresolvable attachment must spend one line: {:?}",
             cap.lines()
+        );
+    }
+
+    /// A colour attachment naming mip level 1 resolves to that level's own
+    /// plane — its guest VA, its stride and its geometry — not to level 0's.
+    ///
+    /// macOS 26's compositor renders a blur pyramid level by level, and until
+    /// this the whole class was refused at decode as an unbindable subresource.
+    /// The rung it reaches was already here for a type-8 *view* that carries a
+    /// level; what was missing was the pass's own `level` field reaching it.
+    ///
+    /// Every assertion names a number that differs between the two levels, so a
+    /// resolve that quietly answered for level 0 fails all four rather than
+    /// returning a plausible target. That is the failure this replaces: level 1
+    /// used to land on level 0's bytes, overwriting the image the guest samples
+    /// at LOD 0.
+    #[test]
+    fn a_colour_attachment_at_mip_one_resolves_that_levels_own_plane() {
+        use crate::contract::endian::{st16, st32, st64};
+        use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+        use crate::model::PAGE_SHIFT_ARM64E;
+        use crate::runtime::decode::resource::{
+            list_object_entry_offset, LINEAR_DESC_HANDLE, LINEAR_DESC_SIZE, OBJECT_LIST_ENTRY_LEN,
+            TEXTURE_DESC_BASE_LEN, TEXTURE_DESC_HEIGHT, TEXTURE_DESC_LEVEL_RECORDS,
+            TEXTURE_DESC_MIPMAP_LEVEL_COUNT, TEXTURE_DESC_MIP_LEVEL_RECORD_LEN,
+            TEXTURE_DESC_PIXEL_FORMAT, TEXTURE_DESC_ROW_STRIDE, TEXTURE_DESC_WIDTH,
+            TEXTURE_LEVEL_HEIGHT, TEXTURE_LEVEL_OFFSET, TEXTURE_LEVEL_ROW_STRIDE,
+            TEXTURE_LEVEL_SIZE, TEXTURE_LEVEL_WIDTH,
+        };
+        use crate::runtime::gva_mem::{self, write_task_gva_arm64e};
+
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let mut host = FakeHost::new();
+        gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 16);
+        assert!(state.set_object_list(1, 0, 256));
+
+        // A two-level BGRA8 pyramid: 64x32 at stride 256, then 32x16 at stride
+        // 128 starting one level-0 span in.
+        let (tex_ref, w0, h0, bpr0) = (200u32, 64u32, 32u32, 256u32);
+        let (w1, h1, bpr1) = (32u32, 16u32, 128u32);
+        let l1_offset = (bpr0 as u64) * (h0 as u64);
+        let alloc = l1_offset + (bpr1 as u64) * (h1 as u64);
+        let handle = 8u32;
+
+        // Long enough for the level records AND for the format trailer, which
+        // a multi-mip body shifts one record along.
+        let body = (TEXTURE_DESC_LEVEL_RECORDS + TEXTURE_DESC_MIP_LEVEL_RECORD_LEN)
+            .max(TEXTURE_DESC_BASE_LEN)
+            .max(TEXTURE_DESC_PIXEL_FORMAT + TEXTURE_DESC_MIP_LEVEL_RECORD_LEN + 2);
+        let mut desc = vec![0u8; body];
+        st64(&mut desc[LINEAR_DESC_SIZE..], alloc);
+        st32(&mut desc[LINEAR_DESC_HANDLE..], handle);
+        st32(&mut desc[TEXTURE_DESC_ROW_STRIDE..], bpr0);
+        st32(&mut desc[TEXTURE_DESC_WIDTH..], w0);
+        st32(&mut desc[TEXTURE_DESC_HEIGHT..], h0);
+        st16(&mut desc[TEXTURE_DESC_MIPMAP_LEVEL_COUNT..], 2);
+        let rec = TEXTURE_DESC_LEVEL_RECORDS;
+        st64(&mut desc[rec + TEXTURE_LEVEL_OFFSET..], l1_offset);
+        st64(
+            &mut desc[rec + TEXTURE_LEVEL_SIZE..],
+            (bpr1 as u64) * (h1 as u64),
+        );
+        st64(&mut desc[rec + TEXTURE_LEVEL_ROW_STRIDE..], bpr1 as u64);
+        st32(&mut desc[rec + TEXTURE_LEVEL_WIDTH..], w1);
+        st32(&mut desc[rec + TEXTURE_LEVEL_HEIGHT..], h1);
+        // The format trailer shifts by one record for a two-level body.
+        st16(
+            &mut desc[TEXTURE_DESC_PIXEL_FORMAT + TEXTURE_DESC_MIP_LEVEL_RECORD_LEN..],
+            MTL_FORMAT_BGRA8_UNORM,
+        );
+
+        let desc_gva = 0x280u64;
+        write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, &desc);
+        let off = list_object_entry_offset(tex_ref, 256).expect("ref is inside the list");
+        let mut list_entry = [0u8; OBJECT_LIST_ENTRY_LEN];
+        st32(
+            &mut list_entry[0..],
+            (OBJECT_TYPE_TEXTURE as u32) | ((desc.len() as u32) << 8),
+        );
+        list_entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
+        write_task_gva_arm64e(&mut host, &state.tasks[1], off, &list_entry);
+
+        let base = (handle as u64) << PAGE_SHIFT_ARM64E;
+        let level0 = lookup_render_target(&mut state, &host, 1, attach(tex_ref))
+            .expect("level 0 of a two-level texture still resolves");
+        assert_eq!(
+            (
+                level0.target_gva,
+                level0.width,
+                level0.height,
+                level0.row_stride
+            ),
+            (base, w0, h0, bpr0),
+            "level 0 must be unchanged by the pyramid above it"
+        );
+
+        let mut at_level_1 = attach(tex_ref);
+        at_level_1.level = 1;
+        let cap = crate::observe::FailCapture::start();
+        let level1 = lookup_render_target(&mut state, &host, 1, at_level_1)
+            .expect("a pass naming mip level 1 must resolve, not be refused");
+        assert!(
+            cap.lines().is_empty(),
+            "resolving a named level is not a refusal: {:?}",
+            cap.lines()
+        );
+        assert_eq!(
+            (
+                level1.target_gva,
+                level1.width,
+                level1.height,
+                level1.row_stride
+            ),
+            (base + l1_offset, w1, h1, bpr1),
+            "level 1 must render into its own plane, at its own geometry"
         );
     }
 
@@ -1130,7 +1283,7 @@ mod tests {
         write_task_gva_arm64e(&mut host, &state.tasks[1], off, &list_entry);
 
         let cap = crate::observe::FailCapture::start();
-        assert!(lookup_render_target(&mut state, &host, 1, tex_ref).is_none());
+        assert!(lookup_render_target(&mut state, &host, 1, attach(tex_ref)).is_none());
         let line = cap.one("rt_resolve");
         assert!(
             line.starts_with("rt_resolve reason=rt_row_stride "),

@@ -24,6 +24,17 @@
 
 /// SPIR-V `OpDecorate` opcode.
 const OP_DECORATE: u16 = 71;
+/// The declarations that name a variable id without referencing it, which
+/// [`descriptor_static_use`] must skip. `OpEntryPoint` is the one that matters:
+/// from SPIR-V 1.4 its interface list carries every global variable in the
+/// module, so counting it would make every declared descriptor read as used.
+const OP_NAME: u16 = 5;
+const OP_MEMBER_NAME: u16 = 6;
+const OP_ENTRY_POINT: u16 = 15;
+const OP_MEMBER_DECORATE: u16 = 72;
+const OP_DECORATE_ID: u16 = 332;
+const OP_DECORATE_STRING: u16 = 5632;
+const OP_MEMBER_DECORATE_STRING: u16 = 5633;
 const OP_TYPE_IMAGE: u16 = 25;
 const OP_TYPE_SAMPLER: u16 = 26;
 const OP_TYPE_SAMPLED_IMAGE: u16 = 27;
@@ -75,9 +86,49 @@ const OP_RETURN_VALUE: u16 = 254;
 const OP_ATOMIC_FLAG_TEST_AND_SET: u16 = 318;
 const OP_ATOMIC_FLAG_CLEAR: u16 = 319;
 const OP_CAPABILITY: u16 = 17;
+// The three storage-image capability numbers, from SPIR-V's `Capability` enum.
+//
+// **These are the numbers the validator checks, and one of them was wrong for a
+// long time without anything noticing.** `StorageImageWriteWithoutFormat` was
+// spelled `34`, which is `ImageCubeArray` — so the splice that existed to make
+// a format-less write legal declared an unrelated capability, the module was
+// rejected exactly as if nothing had been spliced, and the rejection named the
+// capability that was supposedly just added. Both x86 rails lost compute work to
+// it on every boot.
+//
+// The test over that splice could not see it: it asserted the spliced word
+// equalled `CAPABILITY_STORAGE_IMAGE_WRITE_WITHOUT_FORMAT`, which is the
+// constant compared against itself. Only the validator knows these numbers, so
+// the only real check is a module that reaches it — which is what
+// `required_image_capabilities` plus a driven boot now provides.
+//
 /// SPIR-V `Capability StorageImageWriteWithoutFormat` (writes to an `Unknown`
 /// format storage image). Paired with the Vulkan feature of the same name.
-const CAPABILITY_STORAGE_IMAGE_WRITE_WITHOUT_FORMAT: u32 = 34;
+const CAPABILITY_STORAGE_IMAGE_WRITE_WITHOUT_FORMAT: u32 = 56;
+/// SPIR-V `Capability StorageImageReadWithoutFormat` (reads from an `Unknown`
+/// format storage image). Paired with the Vulkan feature of the same name.
+const CAPABILITY_STORAGE_IMAGE_READ_WITHOUT_FORMAT: u32 = 55;
+/// SPIR-V `Capability StorageImageExtendedFormats`, required by any storage
+/// image whose declared format is outside the core set. Paired with the Vulkan
+/// feature `shaderStorageImageExtendedFormats`.
+const CAPABILITY_STORAGE_IMAGE_EXTENDED_FORMATS: u32 = 49;
+
+// The three are distinct and none is `Shader` (1), which is the one every module
+// already declares. A collision here would make a splice a silent no-op.
+const _: () = assert!(
+    CAPABILITY_STORAGE_IMAGE_WRITE_WITHOUT_FORMAT != CAPABILITY_STORAGE_IMAGE_READ_WITHOUT_FORMAT
+        && CAPABILITY_STORAGE_IMAGE_WRITE_WITHOUT_FORMAT
+            != CAPABILITY_STORAGE_IMAGE_EXTENDED_FORMATS
+        && CAPABILITY_STORAGE_IMAGE_READ_WITHOUT_FORMAT
+            != CAPABILITY_STORAGE_IMAGE_EXTENDED_FORMATS
+);
+/// `OpTypeImage`'s `Sampled` operand value for "used as a storage image".
+///
+/// Operand 7 of `OpTypeImage`; 1 means sampled, 2 means storage, 0 means either.
+/// Only a storage image's format operand carries a capability requirement, so
+/// this is what keeps a sampled image with an exotic format from being read as
+/// one.
+const IMAGE_SAMPLED_STORAGE: u32 = 2;
 /// SPIR-V `Decoration Binding`.
 const DECORATION_BINDING: u32 = 33;
 const HEADER_WORDS: usize = 5;
@@ -326,6 +377,17 @@ pub enum ImageFormatSpecializeError {
     MalformedModule,
     MissingBinding(u32),
     AmbiguousBinding(u32),
+    /// An `OpLoad` still declares a type its variable no longer points at, so
+    /// the module this device assembled is not valid SPIR-V.
+    ///
+    /// Only reachable through the clone path — see `specialize_image_formats`
+    /// — and only if something there consumed a repointed variable in a way
+    /// the retype pass does not know how to follow. It is a refusal rather than
+    /// a repair because the alternative is handing the driver a module it may
+    /// not survive: an NVIDIA SPIR-V compiler segmentation-faults inside
+    /// `vkCreateComputePipelines` on exactly this defect, which ends the VM
+    /// process. A guest authors its own kernels, so this must be a decline.
+    LoadTypeMismatch { pointer: u32, declared: u32 },
 }
 
 impl crate::observe::Decline for ImageFormatSpecializeError {
@@ -338,6 +400,7 @@ impl crate::observe::Decline for ImageFormatSpecializeError {
             Self::MalformedModule => "spirv_format_specialize_malformed",
             Self::MissingBinding(_) => "spirv_format_specialize_missing_binding",
             Self::AmbiguousBinding(_) => "spirv_format_specialize_ambiguous_binding",
+            Self::LoadTypeMismatch { .. } => "spirv_format_specialize_load_type_mismatch",
         }
     }
 
@@ -347,6 +410,10 @@ impl crate::observe::Decline for ImageFormatSpecializeError {
             Self::MissingBinding(b) | Self::AmbiguousBinding(b) => {
                 vec![("binding", b.to_string())]
             }
+            Self::LoadTypeMismatch { pointer, declared } => vec![
+                ("pointer", pointer.to_string()),
+                ("declared", declared.to_string()),
+            ],
         }
     }
 }
@@ -495,6 +562,139 @@ fn descriptor_root(
     } else {
         Root::One { id, bound }
     })
+}
+
+/// Whether the module actually declares a descriptor variable at `binding`.
+///
+/// The reflection is derived from the AIR entry point's signature, not from the
+/// translated module, so a Metal function that names `[[texture(n)]]` and never
+/// samples it produces a reflection entry for a descriptor the SPIR-V may not
+/// declare at all. The render path's declared-but-unprovided scan reported those
+/// as gaps, which is a false alarm: nothing references the binding, so nothing
+/// is unbound.
+///
+/// This is the question that separates the two, asked of the module rather than
+/// of the signature. `false` means the reflection named a resource the shader
+/// does not carry, and there is nothing to bind. `true` means the module has a
+/// variable on that binding and a draw that leaves it out of the descriptor
+/// layout is building a pipeline whose module references a binding its layout
+/// does not contain.
+///
+/// Deliberately narrower than "is it sampled": a declared-and-unused variable
+/// still participates in layout consistency, so declaration is the right bar for
+/// the question the caller is asking.
+pub fn declares_descriptor(words: &[u32], binding: u32) -> bool {
+    let Some(instrs) = instructions(words) else {
+        return false;
+    };
+    descriptor_root(words, &instrs, binding, STORAGE_CLASS_UNIFORM_CONSTANT).is_some()
+}
+
+/// Whether a declared descriptor is *statically used*, which is the bar Vulkan
+/// actually sets.
+///
+/// [`declares_descriptor`] answers the weaker question, and the two are not the
+/// same rule. Vulkan requires the pipeline layout to contain a descriptor for
+/// every resource the shader **statically uses**; a variable that is declared
+/// and never referenced is legal to omit. So a draw whose module declares a
+/// binding its layout does not contain is a specification violation only if this
+/// says [`DescriptorUse::Used`], and a fail line that does not separate the two
+/// is reporting a population it cannot tell apart.
+///
+/// "Statically used" here is the spec's own wording — the variable is referenced
+/// by an instruction — and the test is the direct one: does the root id appear as
+/// an operand anywhere outside the declarations that necessarily name it?
+///
+/// The exclusion list is the whole subtlety. `OpVariable` declares the id,
+/// `OpDecorate`/`OpMemberDecorate` and their `Id`/`String` forms carry its
+/// binding, `OpName`/`OpMemberName` carry its debug name, and from SPIR-V 1.4
+/// **`OpEntryPoint` lists every global variable in its interface** whether or not
+/// the body touches it. Counting any of those as a reference would make every
+/// declared descriptor read as used, which is the failure that looks like
+/// thoroughness. Everything else counts, including an `OpAccessChain` or an
+/// `OpImageTexelPointer` that never gets loaded, because those reference the
+/// variable and the spec asks about references rather than about loads.
+pub fn descriptor_static_use(words: &[u32], binding: u32) -> DescriptorUse {
+    let Some(instrs) = instructions(words) else {
+        return DescriptorUse::NotDeclared;
+    };
+    let root = match descriptor_root(words, &instrs, binding, STORAGE_CLASS_UNIFORM_CONSTANT) {
+        None => return DescriptorUse::NotDeclared,
+        Some(Root::Ambiguous) => return DescriptorUse::Ambiguous,
+        Some(Root::One { id, .. }) => id as u32,
+    };
+    for &Instruction {
+        opcode,
+        word_count,
+        at: i,
+    } in &instrs
+    {
+        if matches!(
+            opcode,
+            OP_VARIABLE
+                | OP_DECORATE
+                | OP_MEMBER_DECORATE
+                | OP_DECORATE_ID
+                | OP_DECORATE_STRING
+                | OP_MEMBER_DECORATE_STRING
+                | OP_NAME
+                | OP_MEMBER_NAME
+                | OP_ENTRY_POINT
+        ) {
+            continue;
+        }
+        // Word 0 is the opcode/length header; every operand after it is a
+        // candidate reference. A result id cannot collide with the root, because
+        // the root's own result id belongs to the `OpVariable` skipped above.
+        if words[i + 1..i + word_count].contains(&root) {
+            return DescriptorUse::Used;
+        }
+    }
+    DescriptorUse::DeclaredUnused
+}
+
+/// What [`descriptor_static_use`] found for one binding.
+///
+/// Four states rather than a `bool` because three of them mean "do not report a
+/// violation" for three different reasons, and a caller that collapses them
+/// cannot say which population it is looking at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DescriptorUse {
+    /// No variable in the module carries this binding. The reflection named a
+    /// resource the translated shader does not have.
+    NotDeclared,
+    /// The module declares the variable and no instruction references it. Legal
+    /// to leave out of the pipeline layout.
+    DeclaredUnused,
+    /// An instruction references the variable, so the layout must contain it.
+    Used,
+    /// More than one variable carries this binding, so "the" root is not a
+    /// single id. Fails closed: treated as a reason not to claim either answer.
+    Ambiguous,
+}
+
+impl DescriptorUse {
+    /// A stable name for the fail channel and the `store_routes` counter.
+    ///
+    /// One spelling for both, so the reason and the census cannot drift.
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::NotDeclared => "frag_unbound_not_declared",
+            Self::DeclaredUnused => "frag_unbound_declared_unused",
+            Self::Used => "frag_declared_descriptor_unbound",
+            Self::Ambiguous => "frag_unbound_ambiguous_binding",
+        }
+    }
+
+    /// Whether omitting this binding from the pipeline layout violates the
+    /// specification.
+    ///
+    /// Only [`Self::Used`]. [`Self::Ambiguous`] deliberately does **not** count:
+    /// it means the module has two variables on one binding, which is its own
+    /// defect and must not be reported under a name that says something else.
+    pub fn is_violation(self) -> bool {
+        matches!(self, Self::Used)
+    }
 }
 
 /// Mark every id whose value derives from an already-marked id, to a fixpoint.
@@ -744,6 +944,97 @@ pub fn storage_image_access(words: &[u32], wanted_binding: u32) -> Option<Storag
     })
 }
 
+/// What a validator said about a module this device was about to hand a driver.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SpirvValidation {
+    /// The module is valid as far as the validator can tell — including the
+    /// case where no validator is installed, which is not evidence of anything
+    /// and must not become a refusal.
+    Accepted,
+    /// The validator rejected it. Carries its first line, which names the
+    /// instruction.
+    Rejected(String),
+}
+
+/// Ask a validator whether `words` is a module a driver can be given.
+///
+/// # Why this is not the driver's job
+///
+/// It is, and that is the problem. A Vulkan driver is entitled to undefined
+/// behaviour on invalid SPIR-V, and NVIDIA's takes it: a module `metal2vulkan`
+/// produced for a macOS 14 guest's compositor kernel segmentation-faults inside
+/// its SPIR-V compiler and ends the QEMU process — the guest, the device and
+/// every other rail with it. A guest authors its own kernels, so "the module
+/// was invalid" has to be a declined dispatch and can never be a dead VM.
+///
+/// `metal2vulkan`'s library entry point says so itself: it returns assembled
+/// words and states that the caller validates. This device is that caller, and
+/// it validates *after* its own edits — the format specialization and the
+/// capability injection both rewrite the module after the translator has
+/// finished with it, so validating the translator's output would leave this
+/// device's own contribution unchecked.
+///
+/// # When there is no validator
+///
+/// The check is external (`spirv-val`, from SPIRV-Tools, which
+/// `vm/boot-x86.sh` already requires and which `metal2vulkan` spawns during
+/// translation). A host without it gets [`SpirvValidation::Accepted`] and one
+/// fail-log line: an absent instrument is not a verdict, and refusing every
+/// dispatch because a developer tool is missing would be the widening this
+/// device is not allowed to do in either direction.
+pub fn validate(words: &[u32]) -> SpirvValidation {
+    let mut bytes = Vec::with_capacity(words.len() * 4);
+    for word in words {
+        bytes.extend_from_slice(&word.to_le_bytes());
+    }
+    // A private directory per call, because `spirv_val_bytes` writes a **fixed**
+    // file name inside whatever directory it is given. Handed the shared
+    // `/tmp`, two concurrent validations — this device's, or one of
+    // `metal2vulkan`'s own async translations — write and delete the same path,
+    // and the loser validates bytes it did not produce or finds no file at all.
+    // Measured: three modules on a working macos-13 boot rejected that way,
+    // which would have cost the guest three shaders to fix a crash on a
+    // different rail.
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!(
+        "reims-vgpu-spirv-val-{}-{seq}",
+        std::process::id()
+    ));
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        if crate::observe::first_sight("spirv_val_no_tmp", 0) {
+            crate::observe::fail(format!("spirv_validate reason=validator_unavailable detail={e}"));
+        }
+        return SpirvValidation::Accepted;
+    }
+    let verdict = metal2vulkan::tools::spirv_val_bytes(&bytes, &dir);
+    let _ = std::fs::remove_dir_all(&dir);
+    match verdict {
+        Ok(()) => SpirvValidation::Accepted,
+        Err(why) => {
+            // A missing or unrunnable tool reads as an error from the same call
+            // as a rejected module, and the two must not be confused: one is a
+            // module that would take the process down, the other is a laptop
+            // without SPIRV-Tools installed.
+            if why.contains("No such file") || why.contains("spawn") || why.contains("not found") {
+                if crate::observe::first_sight("spirv_val_absent", 0) {
+                    crate::observe::fail(format!(
+                        "spirv_validate reason=validator_unavailable detail={}",
+                        why.lines().next().unwrap_or("")
+                    ));
+                }
+                return SpirvValidation::Accepted;
+            }
+            // The whole message on one line. Its first line is the wrapper's
+            // own "spirv-val failed:" and the validator's diagnosis — the part
+            // that names the instruction — is on the ones after it, so keeping
+            // only the first is how a rejection reads as having no reason.
+            let flattened: Vec<&str> = why.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+            SpirvValidation::Rejected(flattened.join(" | "))
+        }
+    }
+}
+
 /// Reflect the explicit texel format for one image descriptor binding.
 ///
 /// The SPIR-V image-format operand is structural shader ABI. It is independent
@@ -914,6 +1205,9 @@ pub fn specialize_image_formats(
     let mut changed = 0;
     let mut next_id = bound as u32;
     let mut extra = Vec::new();
+    // Variables whose pointer type was cloned, and the image type they now
+    // name. Their loads are repaired once at the end, after the splice.
+    let mut retyped = std::collections::BTreeMap::<u32, u32>::new();
     for image_type in touched_image_types {
         let at = image_format_word[image_type].expect("validated image type");
         let original = ImageFormat::from_raw(words[at]);
@@ -985,6 +1279,7 @@ pub fn specialize_image_formats(
                 let type_word = variable_type_word[variable]
                     .ok_or(ImageFormatSpecializeError::MalformedModule)?;
                 words[type_word] = pointer_clones[&pointer];
+                retyped.insert(variable as u32, new_image);
             }
         }
     }
@@ -993,12 +1288,100 @@ pub fn specialize_image_formats(
         words.splice(at..at, extra);
         words[3] = next_id;
     }
+    // A variable that moved to a cloned image type takes its loads with it. An
+    // `OpLoad`'s result type must be the pointee of its pointer, so leaving the
+    // loads alone is what makes the module invalid rather than merely
+    // differently typed — and this pass is why the clone path is usable at all.
+    retype_loads(words, &retyped);
+    verify_load_types(words)?;
     for &(binding, format) in requested {
         if image_format(words, binding) != Some(format) {
             return Err(ImageFormatSpecializeError::MissingBinding(binding));
         }
     }
     Ok(changed)
+}
+
+/// Point every `OpLoad` of a retyped variable at that variable's new type.
+///
+/// `retyped` maps a global `OpVariable` id to the `OpTypeImage` its pointer now
+/// names. Nothing else in the module refers to the *variable's* type by id, so
+/// the loads are the whole repair — `OpImageWrite` and `OpImageRead` take the
+/// loaded object and declare no type of their own.
+fn retype_loads(words: &mut [u32], retyped: &std::collections::BTreeMap<u32, u32>) {
+    if retyped.is_empty() {
+        return;
+    }
+    let mut i = HEADER_WORDS;
+    while i < words.len() {
+        let word_count = (words[i] >> 16) as usize;
+        if word_count == 0 || i + word_count > words.len() {
+            return;
+        }
+        if (words[i] & 0xffff) as u16 == OP_LOAD && word_count >= 4 {
+            if let Some(&image) = retyped.get(&words[i + 3]) {
+                words[i + 1] = image;
+            }
+        }
+        i += word_count;
+    }
+}
+
+/// Refuse a module whose loads and pointees disagree.
+///
+/// The SPIR-V rule is that an `OpLoad`'s result type is the type its pointer
+/// points at. Checked here rather than left to the driver because the driver
+/// that finds it may not survive it: an NVIDIA SPIR-V compiler
+/// segmentation-faults inside `vkCreateComputePipelines` on this defect and
+/// takes the VM process with it. Only loads through a global `OpVariable` are
+/// checked, which is every load this function's clone path can have moved.
+fn verify_load_types(words: &[u32]) -> Result<(), ImageFormatSpecializeError> {
+    let bound = *words
+        .get(3)
+        .ok_or(ImageFormatSpecializeError::MalformedModule)? as usize;
+    let mut pointer_pointee = vec![None; bound];
+    let mut variable_type = vec![None; bound];
+    let mut i = HEADER_WORDS;
+    while i < words.len() {
+        let word_count = (words[i] >> 16) as usize;
+        let opcode = (words[i] & 0xffff) as u16;
+        if word_count == 0 || i + word_count > words.len() {
+            return Err(ImageFormatSpecializeError::MalformedModule);
+        }
+        match opcode {
+            OP_TYPE_POINTER if word_count >= 4 => {
+                let id = words[i + 1] as usize;
+                if id < bound {
+                    pointer_pointee[id] = Some(words[i + 3]);
+                }
+            }
+            OP_VARIABLE if word_count >= 4 => {
+                let id = words[i + 2] as usize;
+                if id < bound {
+                    variable_type[id] = Some(words[i + 1] as usize);
+                }
+            }
+            OP_LOAD if word_count >= 4 => {
+                let pointer = words[i + 3] as usize;
+                let pointee = variable_type
+                    .get(pointer)
+                    .copied()
+                    .flatten()
+                    .and_then(|p| pointer_pointee.get(p).copied().flatten());
+                if let Some(pointee) = pointee {
+                    if pointee != words[i + 1] {
+                        return Err(ImageFormatSpecializeError::LoadTypeMismatch {
+                            pointer: words[i + 3],
+                            declared: words[i + 1],
+                        });
+                    }
+                }
+            }
+            _ => {}
+        }
+        i += word_count;
+    }
+    Ok(())
 }
 
 /// Ensure the module declares `OpCapability StorageImageWriteWithoutFormat`.
@@ -1013,6 +1396,15 @@ pub fn specialize_image_formats(
 /// 5-word header), so the new instruction is spliced immediately after the last
 /// existing `OpCapability`. Returns `true` if it inserted the capability.
 pub fn ensure_storage_write_without_format_capability(words: &mut Vec<u32>) -> bool {
+    ensure_capability(words, CAPABILITY_STORAGE_IMAGE_WRITE_WITHOUT_FORMAT)
+}
+
+/// Splice `OpCapability <cap>` into a module that does not already declare it.
+///
+/// Capabilities occupy the module's first section, immediately after the 5-word
+/// header, so the instruction goes after the last existing `OpCapability`.
+/// Idempotent; returns `true` if it inserted one.
+fn ensure_capability(words: &mut Vec<u32>, cap: u32) -> bool {
     if words.len() < HEADER_WORDS {
         return false;
     }
@@ -1027,18 +1419,206 @@ pub fn ensure_storage_write_without_format_capability(words: &mut Vec<u32>) -> b
         if opcode != OP_CAPABILITY {
             break;
         }
-        if word_count >= 2 && words[i + 1] == CAPABILITY_STORAGE_IMAGE_WRITE_WITHOUT_FORMAT {
+        if word_count >= 2 && words[i + 1] == cap {
             return false;
         }
         i += word_count;
         insert_at = i;
     }
-    let instr = [
-        (2u32 << 16) | OP_CAPABILITY as u32,
-        CAPABILITY_STORAGE_IMAGE_WRITE_WITHOUT_FORMAT,
-    ];
+    let instr = [(2u32 << 16) | OP_CAPABILITY as u32, cap];
     words.splice(insert_at..insert_at, instr);
     true
+}
+
+/// The storage-image capabilities a finished module's own contents require.
+///
+/// Every field is `true` only if some instruction in the module cannot be
+/// validated without the matching `OpCapability`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RequiredImageCapabilities {
+    /// A storage image declares a format outside SPIR-V's core set.
+    pub extended_formats: bool,
+    /// An `OpImageWrite` targets a storage image whose format is `Unknown`.
+    pub write_without_format: bool,
+    /// An `OpImageRead` targets a storage image whose format is `Unknown`.
+    pub read_without_format: bool,
+}
+
+impl RequiredImageCapabilities {
+    pub fn any(&self) -> bool {
+        self.extended_formats || self.write_without_format || self.read_without_format
+    }
+}
+
+/// Whether a SPIR-V storage-image format needs `StorageImageExtendedFormats`.
+///
+/// The core set — usable with `Shader` alone — is `Unknown`, the four `Rgba*32/16`
+/// and `R32` float/int/uint widths, `Rgba8`/`Rgba8Snorm`, and the 8-bit `Rgba8i`
+/// / `Rgba8ui` forms. Anything narrower than four channels below 32 bits, which
+/// is where `Rg16f`, `R16f`, `Rg8` and `R8` all live, is extended.
+///
+/// Written as an explicit list of the core values rather than a range, because
+/// the core set is not contiguous in the enum and a `<=` test would silently
+/// admit the two-channel formats sitting between the four-channel ones.
+fn storage_format_is_extended(raw: u32) -> bool {
+    !matches!(
+        raw,
+        0     // Unknown
+        | 1   // Rgba32f
+        | 2   // Rgba16f
+        | 3   // R32f
+        | 4   // Rgba8
+        | 5   // Rgba8Snorm
+        | 21  // Rgba32i
+        | 22  // Rgba16i
+        | 23  // Rgba8i
+        | 24  // R32i
+        | 30  // Rgba32ui
+        | 31  // Rgba16ui
+        | 32  // Rgba8ui
+        | 33 // R32ui
+    )
+}
+
+/// Derive which storage-image capabilities a module needs, from the module.
+///
+/// # Why this is derived and not tracked
+///
+/// The device used to add `StorageImageWriteWithoutFormat` when *it* had
+/// retargeted a binding to `Unknown`, on the reasoning that this was the only
+/// way a module could come to need it. That is a claim about provenance, and it
+/// was wrong in the direction that reads as careful: the translator emits
+/// `Unknown`-format storage images of its own accord, and those modules reached
+/// the validator without the capability and were **rejected**, losing the
+/// dispatch. Both x86 rails measured here lose compute work to exactly that —
+/// including the rail that otherwise renders correctly, which is why it went
+/// unnoticed.
+///
+/// Asking the module what it contains cannot go stale that way. A new source of
+/// extended-format or format-less storage images — another translator version, a
+/// new specialization, a guest that simply emits one — is covered without anyone
+/// remembering to add a case, which is the property the provenance test did not
+/// have.
+///
+/// # Why it over-approximates on purpose
+///
+/// The format requirement is exact: a storage image's declared format is right
+/// there in its `OpTypeImage`. The *format-less* requirement is not attributed
+/// to a specific write. This walk asks "does the module declare an
+/// `Unknown`-format storage image, and does it contain any `OpImageWrite`",
+/// rather than proving that some particular write targets that image.
+///
+/// That is deliberate, and the first version of this function did it the other
+/// way. Resolving the write's image operand back through
+/// `OpTypePointer`/`OpVariable`/`OpLoad` attributed most writes correctly and
+/// **missed three modules per boot** — the def-use chain reached them through a
+/// shape the walk did not follow, and the only symptom was the same rejection
+/// the function existed to prevent. Every shape it misses fails closed in the
+/// direction that loses guest work, and there is no bound on how many shapes a
+/// translator can emit.
+///
+/// Over-approximating cannot fail that way, and it costs nothing real:
+/// declaring a capability a module does not use is valid SPIR-V, and the caller
+/// has already established that the device enabled the matching feature. The
+/// exchange is a capability that is occasionally redundant for a class of bug
+/// that is silent and recurring.
+///
+/// The walk is structural throughout and never looks at debug names or guest
+/// object ids.
+pub fn required_image_capabilities(words: &[u32]) -> RequiredImageCapabilities {
+    let mut need = RequiredImageCapabilities::default();
+    if words.len() < HEADER_WORDS {
+        return need;
+    }
+    let mut has_unknown_storage_image = false;
+    let mut has_image_write = false;
+    let mut has_image_read = false;
+
+    let mut i = HEADER_WORDS;
+    while i < words.len() {
+        let word_count = (words[i] >> 16) as usize;
+        let opcode = (words[i] & 0xffff) as u16;
+        if word_count == 0 || i + word_count > words.len() {
+            break;
+        }
+        match opcode {
+            OP_TYPE_IMAGE if word_count >= 9 => {
+                // [7] = Sampled, [8] = Image Format. Sampled 0 means "either",
+                // so it is a possible storage use and counts.
+                let sampled = words[i + 7];
+                let format = words[i + 8];
+                if sampled == IMAGE_SAMPLED_STORAGE || sampled == 0 {
+                    if storage_format_is_extended(format) {
+                        need.extended_formats = true;
+                    }
+                    if format == 0 {
+                        has_unknown_storage_image = true;
+                    }
+                }
+            }
+            OP_IMAGE_WRITE => has_image_write = true,
+            OP_IMAGE_READ => has_image_read = true,
+            _ => {}
+        }
+        i += word_count;
+    }
+    need.write_without_format = has_unknown_storage_image && has_image_write;
+    need.read_without_format = has_unknown_storage_image && has_image_read;
+    need
+}
+
+/// Every `OpTypeImage` in a module, as `(sampled, format)` pairs.
+///
+/// Diagnostic only. When the validator refuses a module for a capability the
+/// derivation above did not ask for, the disagreement is between what
+/// `spirv-val` sees and what this walk sees, and the only way to settle it is to
+/// print what the walk found. Ordered as encountered, deduplicated.
+pub fn image_type_census(words: &[u32]) -> Vec<(u32, u32)> {
+    let mut out: Vec<(u32, u32)> = Vec::new();
+    if words.len() < HEADER_WORDS {
+        return out;
+    }
+    let mut i = HEADER_WORDS;
+    while i < words.len() {
+        let word_count = (words[i] >> 16) as usize;
+        let opcode = (words[i] & 0xffff) as u16;
+        if word_count == 0 || i + word_count > words.len() {
+            break;
+        }
+        if opcode == OP_TYPE_IMAGE && word_count >= 9 {
+            let pair = (words[i + 7], words[i + 8]);
+            if !out.contains(&pair) {
+                out.push(pair);
+            }
+        }
+        i += word_count;
+    }
+    out
+}
+
+/// Add every capability [`required_image_capabilities`] found missing.
+///
+/// Returns what it added. Declaring a capability whose Vulkan feature the device
+/// did not enable is invalid usage, so the caller must gate on the features and
+/// decline by name rather than hand the driver a module it may not survive.
+pub fn ensure_image_capabilities(
+    words: &mut Vec<u32>,
+    need: &RequiredImageCapabilities,
+) -> RequiredImageCapabilities {
+    let mut added = RequiredImageCapabilities::default();
+    if need.extended_formats {
+        added.extended_formats =
+            ensure_capability(words, CAPABILITY_STORAGE_IMAGE_EXTENDED_FORMATS);
+    }
+    if need.write_without_format {
+        added.write_without_format =
+            ensure_capability(words, CAPABILITY_STORAGE_IMAGE_WRITE_WITHOUT_FORMAT);
+    }
+    if need.read_without_format {
+        added.read_without_format =
+            ensure_capability(words, CAPABILITY_STORAGE_IMAGE_READ_WITHOUT_FORMAT);
+    }
+    added
 }
 
 /// Reflect every set-0 sampler descriptor binding declared by a SPIR-V module.
@@ -1089,6 +1669,244 @@ pub fn sampler_bindings(words: &[u32]) -> Vec<u32> {
     let mut bindings: Vec<u32> = decorations
         .into_iter()
         .filter_map(|(id, binding)| sampler_vars.contains(&id).then_some(binding))
+        .collect();
+    bindings.sort_unstable();
+    bindings.dedup();
+    bindings
+}
+
+/// A module carrying two set-0 sampled images: one referenced by an `OpLoad`,
+/// one declared and never touched.
+///
+/// Lives here, out of any one `mod tests`, because three modules need the same
+/// fixture and because the opcode numbers it is built from are already constants
+/// in this file — a copy elsewhere would be those numbers spelled a second time,
+/// which is the duplication that goes stale silently.
+///
+/// Both halves are the point. Only the referenced variable is what Vulkan calls
+/// *statically used*, so a caller that cannot tell the two apart either refuses
+/// dispatches that are legal or admits the one that makes a driver divide by
+/// zero.
+#[cfg(test)]
+pub(crate) fn test_module_with_two_sampled_images(used: u32, declared_unused: u32) -> Vec<u32> {
+    const IMAGE_TY: u32 = 10;
+    const POINTER_TY: u32 = 11;
+    const USED_VAR: u32 = 12;
+    const UNUSED_VAR: u32 = 13;
+
+    let mut w = vec![
+        0x0723_0203,       // magic
+        0x0001_0600,       // version
+        0,                 // generator
+        32,                // bound
+        0,                 // schema
+        (2u32 << 16) | 17, // OpCapability
+        1,                 // Shader
+        (3u32 << 16) | 14, // OpMemoryModel
+        0,                 // Logical
+        1,                 // GLSL450
+    ];
+    for (var, binding) in [(USED_VAR, used), (UNUSED_VAR, declared_unused)] {
+        w.extend_from_slice(&[
+            (4u32 << 16) | OP_DECORATE as u32,
+            var,
+            DECORATION_BINDING,
+            binding,
+        ]);
+    }
+    // OpTypeImage %IMAGE_TY %2 2D 0 0 0 1 Unknown — `Sampled` 1 is the
+    // separate-image form, which is what makes these SAMPLED_IMAGE rather than
+    // the storage class that shares the opcode.
+    w.extend_from_slice(&[
+        (9u32 << 16) | OP_TYPE_IMAGE as u32,
+        IMAGE_TY,
+        2, // sampled type id
+        1, // Dim2D
+        0, // depth
+        0, // arrayed
+        0, // MS
+        IMAGE_SAMPLED_WITH_SAMPLER,
+        0, // Unknown format
+    ]);
+    w.extend_from_slice(&[
+        (4u32 << 16) | OP_TYPE_POINTER as u32,
+        POINTER_TY,
+        STORAGE_CLASS_UNIFORM_CONSTANT,
+        IMAGE_TY,
+    ]);
+    for var in [USED_VAR, UNUSED_VAR] {
+        w.extend_from_slice(&[
+            (4u32 << 16) | OP_VARIABLE as u32,
+            POINTER_TY,
+            var,
+            STORAGE_CLASS_UNIFORM_CONSTANT,
+        ]);
+    }
+    // The reference that makes `USED_VAR` statically used, and the only
+    // difference between the two variables.
+    w.extend_from_slice(&[(4u32 << 16) | OP_LOAD as u32, IMAGE_TY, 20, USED_VAR]);
+    w
+}
+
+/// A module carrying one set-0 `OpTypeSampler` variable at each of `bindings`.
+///
+/// Beside [`test_module_with_two_sampled_images`] and for the same reason: the
+/// opcode numbers are constants in this file, so a copy in another module's test
+/// would be those numbers spelled a second time.
+///
+/// A *sampler*, not a sampled image — [`sampler_bindings`] partitions set 0 by
+/// the pointee type, so a fixture built out of images answers its question with
+/// an empty vector and would make any test over it vacuous.
+#[cfg(test)]
+pub(crate) fn test_module_with_samplers(bindings: &[u32]) -> Vec<u32> {
+    const SAMPLER_TY: u32 = 10;
+    const POINTER_TY: u32 = 11;
+    const FIRST_VAR: u32 = 12;
+
+    let mut w = vec![
+        0x0723_0203,       // magic
+        0x0001_0600,       // version
+        0,                 // generator
+        64,                // bound
+        0,                 // schema
+        (2u32 << 16) | 17, // OpCapability
+        1,                 // Shader
+        (3u32 << 16) | 14, // OpMemoryModel
+        0,                 // Logical
+        1,                 // GLSL450
+    ];
+    for (i, binding) in bindings.iter().enumerate() {
+        w.extend_from_slice(&[
+            (4u32 << 16) | OP_DECORATE as u32,
+            FIRST_VAR + i as u32,
+            DECORATION_BINDING,
+            *binding,
+        ]);
+    }
+    w.extend_from_slice(&[(2u32 << 16) | OP_TYPE_SAMPLER as u32, SAMPLER_TY]);
+    w.extend_from_slice(&[
+        (4u32 << 16) | OP_TYPE_POINTER as u32,
+        POINTER_TY,
+        STORAGE_CLASS_UNIFORM_CONSTANT,
+        SAMPLER_TY,
+    ]);
+    for i in 0..bindings.len() as u32 {
+        w.extend_from_slice(&[
+            (4u32 << 16) | OP_VARIABLE as u32,
+            POINTER_TY,
+            FIRST_VAR + i,
+            STORAGE_CLASS_UNIFORM_CONSTANT,
+        ]);
+    }
+    w
+}
+
+/// Every distinct `Binding` decoration in the module, whatever it decorates.
+///
+/// Deliberately class-blind and deliberately cheap: this is the candidate list
+/// for "does the pipeline layout describe everything the module uses", and the
+/// question of *what* each binding is has already been answered by the walks
+/// that build the layout. Pair it with [`descriptor_static_use`], which answers
+/// `NotDeclared` for anything that is not a `UniformConstant` descriptor and so
+/// narrows this to the population that walk can reason about exactly.
+pub fn declared_binding_numbers(words: &[u32]) -> Vec<u32> {
+    let mut bindings = Vec::new();
+    let mut i = HEADER_WORDS;
+    while i < words.len() {
+        let word0 = words[i];
+        let word_count = (word0 >> 16) as usize;
+        let opcode = (word0 & 0xffff) as u16;
+        if word_count == 0 || i + word_count > words.len() {
+            break;
+        }
+        if opcode == OP_DECORATE && word_count >= 4 && words[i + 2] == DECORATION_BINDING {
+            bindings.push(words[i + 3]);
+        }
+        i += word_count;
+    }
+    bindings.sort_unstable();
+    bindings.dedup();
+    bindings
+}
+
+/// SPIR-V `OpTypeImage` `Sampled` operand value 1 — "will be used with a
+/// sampler". 2 is the storage-image form, which is a different descriptor type,
+/// and 0 means "either", which cannot be given a descriptor type without a guess.
+const IMAGE_SAMPLED_WITH_SAMPLER: u32 = 1;
+
+/// Set-0 `Binding` decorations carried by a *sampled image* variable.
+///
+/// The texture analogue of [`sampler_bindings`], and it exists for the same
+/// reason. The descriptor set layout this device builds is assembled from what
+/// the guest bound, so a binding the module carries and the guest left empty is
+/// absent from the layout entirely — not an unwritten slot in it.
+///
+/// Vulkan requires the pipeline layout to contain a descriptor for every
+/// resource the module *statically uses*, and a driver is entitled to assume it.
+/// Mesa's Intel driver indexes its own binding array by binding number, sizes it
+/// to `max_binding + 1`, zero-fills every number nothing declared, and then
+/// scores each used binding as `(use_count << 7) / array_size` when it decides
+/// which descriptors get a binding-table slot. A hole under a *used* binding
+/// therefore divides by zero: the process dies of `SIGFPE` inside
+/// `vkCreateComputePipelines`, with no error for the caller to see and no
+/// validation layer involved. That is why this is a hard requirement here and
+/// not a tidiness rule — see [`descriptor_static_use`] for the "used" bar, which
+/// is the only population that must be filled.
+///
+/// The class is read from the SPIR-V type, never from the binding number, for
+/// the reason [`BindingClass`] states. `Sampled` 1 is the separate-image form
+/// this device's translator emits; the storage form is a different descriptor
+/// type and is deliberately not returned here, and `SubpassData` is the
+/// framebuffer-fetch image the engine binds at its un-relocated number.
+pub fn sampled_image_bindings(words: &[u32]) -> Vec<u32> {
+    use std::collections::HashSet;
+
+    let mut image_types = HashSet::new();
+    let mut image_ptrs = HashSet::new();
+    let mut image_vars = HashSet::new();
+    let mut decorations = Vec::new();
+    let mut i = HEADER_WORDS;
+    while i < words.len() {
+        let word0 = words[i];
+        let word_count = (word0 >> 16) as usize;
+        let opcode = (word0 & 0xffff) as u16;
+        if word_count == 0 || i + word_count > words.len() {
+            break;
+        }
+        match opcode {
+            // OpTypeImage: result, sampled type, Dim, Depth, Arrayed, MS,
+            // Sampled, Format — so `Dim` is operand 3 and `Sampled` operand 7.
+            OP_TYPE_IMAGE
+                if word_count >= 9
+                    && words[i + 3] != DIM_SUBPASS_DATA
+                    && words[i + 7] == IMAGE_SAMPLED_WITH_SAMPLER =>
+            {
+                image_types.insert(words[i + 1]);
+            }
+            OP_TYPE_POINTER if word_count >= 4 => {
+                if words[i + 2] == STORAGE_CLASS_UNIFORM_CONSTANT
+                    && image_types.contains(&words[i + 3])
+                {
+                    image_ptrs.insert(words[i + 1]);
+                }
+            }
+            OP_VARIABLE if word_count >= 4 => {
+                if image_ptrs.contains(&words[i + 1])
+                    && words[i + 3] == STORAGE_CLASS_UNIFORM_CONSTANT
+                {
+                    image_vars.insert(words[i + 2]);
+                }
+            }
+            OP_DECORATE if word_count >= 4 && words[i + 2] == DECORATION_BINDING => {
+                decorations.push((words[i + 1], words[i + 3]));
+            }
+            _ => {}
+        }
+        i += word_count;
+    }
+    let mut bindings: Vec<u32> = decorations
+        .into_iter()
+        .filter_map(|(id, binding)| image_vars.contains(&id).then_some(binding))
         .collect();
     bindings.sort_unstable();
     bindings.dedup();
@@ -1280,7 +2098,7 @@ fn relocate_by_class(
 ///
 /// # Neither relocation ran on a driven x86/PCI boot
 ///
-/// `m2v_cache::fragment_words` returns the unrelocated words when both
+/// `m2v_cache::CachedShader::variant` returns the unrelocated words when both
 /// `separate_sampled` and `buf_collide` are false, and on a driven boot
 /// (web-content probe, 10 captures, 494 draws in a census window) that was every
 /// shader: 160 `linux_m2v_async` lines and **zero** `frag_sampled_reloc` or
@@ -1407,7 +2225,7 @@ pub fn offset_fragment_sampled_resource_bindings(words: &mut [u32]) -> usize {
 
 use metal2vulkan::meta::{TextureDimension, TextureShape};
 use metal2vulkan::reflect::{
-    ResourceAccess, ResourceKind, ShaderReflection, ShaderStage, REFLECTION_VERSION,
+    BufferExtent, ResourceAccess, ResourceKind, ShaderReflection, ShaderStage, REFLECTION_VERSION,
     RESOURCE_DESCRIPTOR_SET,
 };
 
@@ -1455,6 +2273,294 @@ fn is_texture_kind(kind: ResourceKind) -> bool {
             | ResourceKind::StorageImage
             | ResourceKind::EmbeddedArgBufferTexture
     )
+}
+
+/// Whether [`crate::env::BUFFER_EXTENT`] is switched off, read once per process.
+///
+/// Latched because this sits on the per-bind path and `std::env::var_os` is a
+/// lock and an allocation; the variable is read at the first bind of the boot
+/// and cannot change under a running device. The refusal is named once, on the
+/// off channel, so a boot whose gather volume is being compared says in its own
+/// log which arm it ran rather than relying on the operator's shell history.
+fn buffer_extent_disabled() -> bool {
+    use std::sync::OnceLock;
+    static OFF: OnceLock<bool> = OnceLock::new();
+    *OFF.get_or_init(|| {
+        let (state, value) = crate::env::read(crate::env::BUFFER_EXTENT);
+        match state {
+            crate::env::Switch::Off => {
+                crate::observe::off("buffer_extent reason=buffer_extent_disabled_by_env");
+                true
+            }
+            // An unrecognized spelling is named rather than silently read as the
+            // default, which is the one way an operator concludes a switch does
+            // not work. It still takes the default arm: this switch may only
+            // turn a rail off, and a value nobody can parse is not that.
+            crate::env::Switch::Unrecognized => {
+                crate::observe::fail(format!(
+                    "buffer_extent reason=buffer_extent_env_unrecognized value={}",
+                    value.unwrap_or_default()
+                ));
+                false
+            }
+            crate::env::Switch::On | crate::env::Switch::Unset => false,
+        }
+    })
+}
+
+/// The byte extent reflection proves a `[[buffer(n)]]` bind cannot be read past,
+/// or `None` when the bind must keep the whole window the guest declared.
+///
+/// A guest buffer bind names an allocation and an offset, never a length, so the
+/// widest safe answer — and until this existed, the only answer — is "the rest of
+/// the allocation". `try_buffer_zero_copy_resolved`'s doc records what that cost:
+/// 67.5 % of a driven boot's gathered bytes are vertex-stage constant buffers no
+/// vertex descriptor bounds, and narrowing them on `declared_size` alone was
+/// closed because a `constant T&` (whose declared size *is* the bound) could not
+/// be told from a `device T*` (whose declared size is one element the shader may
+/// index far past). [`BufferExtent`] is the translator answering exactly that
+/// question, so this is the reopening of that rail.
+///
+/// **Only [`BufferExtent::Object`] may narrow.** `Unbounded` says AIR carries an
+/// element size but no length, `Unknown` says the metadata cannot separate the
+/// two, and a binding this shader does not declare at all gets no answer here —
+/// all three return `None` and keep the full window. The asymmetry is the whole
+/// safety argument: an over-wide window costs bus bytes, and an under-wide one
+/// hands the GPU a short buffer, which is a silent wrong-pixels bug with no error
+/// anywhere. The translator states the same rule on `BufferExtent` itself.
+///
+/// The kind is checked as well as the index because `metal_index` is only unique
+/// within a resource family — a `[[texture(2)]]` and a `[[buffer(2)]]` both
+/// report `metal_index` 2 — and because a threadgroup `[[buffer(n)]]` consumes no
+/// descriptor and binds no guest memory to narrow.
+pub fn reflected_buffer_extent(reflection: &ShaderReflection, metal_index: u32) -> Option<u64> {
+    if buffer_extent_disabled() {
+        return None;
+    }
+    // Which answer this bind got, counted at the one place the field is read.
+    //
+    // # Why a census and not a comment
+    //
+    // Both narrowing counters — `zc_buffer_extent_narrowed` on the gather rail
+    // and `cpu_buffer_extent_narrowed` on the staging one — read **zero for a
+    // whole driven macos-13 boot**, across 2.57 million buffer binds. A rail
+    // built to reopen 67.5 % of this device's gathered bytes is firing no times,
+    // and nothing else in the boot says so: a narrowing counter at zero is the
+    // same reading whether every bind is genuinely unbounded, the translator
+    // reports nothing, or the lookup never finds the binding at all.
+    //
+    // These four separate those, and only the first is a workload fact:
+    //
+    // * `bext_unbounded` — AIR carries an element size and no length. Nothing to
+    //   do; a `device T*` may be indexed anywhere.
+    // * `bext_unknown` — the metadata cannot separate a bounded reference from a
+    //   pointer. A translator gap, and the one that would be worth packaging.
+    // * `bext_absent` — no `Buffer` binding at this index. Expected for a
+    //   `[[stage_in]]` attribute source, which is bounded by the vertex
+    //   descriptor's stride rather than by a declared argument.
+    // * `bext_object` — the answer that may narrow, with the bytes it declares
+    //   banded so a reader can tell "narrowable and tiny" from "narrowable and
+    //   already the whole allocation".
+    //
+    // `bext_object` firing while both `*_narrowed` counters stay at zero would
+    // mean the caps are being dropped between here and the rails, which is a
+    // different bug from the translator not answering and would otherwise look
+    // identical.
+    let found = reflection.bindings.iter().find_map(|b| {
+        (b.kind == ResourceKind::Buffer && b.metal_index == metal_index)
+            .then_some(b.extent)
+            .flatten()
+    });
+    let Some(extent) = found else {
+        crate::runtime::drain::note_store_route("bext_absent");
+        return None;
+    };
+    match extent {
+        BufferExtent::Object { bytes } => {
+            crate::runtime::drain::note_store_route("bext_object");
+            crate::runtime::drain::note_store_route(band_declared_object(bytes));
+            Some(u64::from(bytes))
+        }
+        BufferExtent::Unbounded => {
+            crate::runtime::drain::note_store_route("bext_unbounded");
+            None
+        }
+        BufferExtent::Unknown => {
+            crate::runtime::drain::note_store_route("bext_unknown");
+            None
+        }
+    }
+}
+
+/// Band a declared object size, because what decides whether narrowing is worth
+/// anything is the order of magnitude and not the byte.
+///
+/// The floor matters: a cap that does not clear `ZERO_COPY_BUFFER_MIN_BYTES` is
+/// dropped by the gather rail and applied by the staging one, so a population
+/// sitting entirely in the smallest band says the narrowing lands on the CPU
+/// path and never on the rail that moves the bytes. A survey of 60 captured AIR
+/// blobs ran a median declared size of 64 bytes and a maximum of 512, so the
+/// bands are placed around that rather than spread evenly.
+fn band_declared_object(bytes: u32) -> &'static str {
+    match bytes {
+        0..=64 => "bext_object_le64",
+        65..=512 => "bext_object_le512",
+        513..=4096 => "bext_object_le4k",
+        4097..=65536 => "bext_object_le64k",
+        _ => "bext_object_gt64k",
+    }
+}
+
+/// What reflection says a `[[buffer(n)]]` bind is *for*, as a total answer.
+///
+/// The translator's [`ResourceAccess`] is parsed here, at the one boundary that
+/// reads it, so no consumer downstream matches on an `Option` of a foreign enum
+/// and silently gains a fourth case when the translator declares one.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReflectedBufferAccess {
+    /// The specialized entry point does not dereference this buffer. Its
+    /// descriptor may still have to be bound, but no guest bytes are read
+    /// through it, so nothing needs staging for this draw.
+    Unused = 0,
+    /// Reflection declares the bind and says the shader touches it —
+    /// `ReadOnly`, `WriteOnly`, `ReadWrite`, or an image class at this index.
+    Dereferenced = 1,
+    /// Reflection carries no `Buffer` at this index, or carries one with no
+    /// access recorded. Both mean *no answer*, which is not the same as
+    /// [`Self::Unused`] and must never be treated as one.
+    Undeclared = 2,
+}
+
+/// Bytes in the neutral page a [`ReflectedBufferAccess::Unused`] bind is given
+/// in place of the guest's.
+///
+/// Nothing reads it — that is the entire premise of the rail — so the only
+/// requirements on the size are that it be non-zero, so the bind is a valid
+/// descriptor and does not trip the empty-content check the stage-in path uses
+/// as a "stream bound nothing" signal, and that it be *one* size, so every
+/// neutral bind in a command buffer shares one allocation and the engine's
+/// `cb_bound_buffer` reuse collapses them into a single upload.
+///
+/// One 4 KiB page is comfortably above the largest bounded buffer object any
+/// shader observed here declares: a survey of 60 captured AIR blobs ran a median
+/// of 64 bytes and a maximum of 512. Sizing it above that costs one page of host
+/// memory for the life of the process and means a driver that does look at the
+/// descriptor's range sees one wider than any declared block, rather than
+/// narrower.
+const NEUTRAL_BIND_BYTES: usize = 4096;
+
+/// The one neutral page, shared by every bind that gets one.
+///
+/// Shared deliberately rather than allocated per bind. The engine keys its
+/// per-command-buffer bind reuse on `(Arc::as_ptr, len)`, so one `Arc` means the
+/// first neutral bind in a command buffer uploads 4 KiB and every later one is a
+/// `buffer_bind_reuses` hit costing nothing. Allocating per bind would defeat
+/// the rail by replacing a guest gather with a fresh staging upload.
+static NEUTRAL_BIND: std::sync::OnceLock<std::sync::Arc<Vec<u8>>> = std::sync::OnceLock::new();
+
+/// The neutral page to bind for a buffer the shader does not dereference.
+///
+/// Zeroed, and that is not a "safe default" so much as the only value with no
+/// meaning: the premise is that no invocation loads through this descriptor, so
+/// any contents would do, and zeros are what a reader who does not believe the
+/// premise will find easiest to recognise in a capture.
+pub fn neutral_bind_bytes() -> std::sync::Arc<Vec<u8>> {
+    NEUTRAL_BIND
+        .get_or_init(|| std::sync::Arc::new(vec![0u8; NEUTRAL_BIND_BYTES]))
+        .clone()
+}
+
+/// Whether [`crate::env::UNUSED_BINDS`] is switched off, read once per process.
+///
+/// Same shape as [`buffer_extent_disabled`], and read once for the same reason:
+/// this sits in the per-draw path at tens of thousands of binds a second, and an
+/// environment read there would cost more than the rail saves.
+fn unused_binds_disabled() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| {
+        let (state, value) = crate::env::read(crate::env::UNUSED_BINDS);
+        match state {
+            crate::env::Switch::Off => {
+                crate::observe::off("unused_binds reason=unused_binds_disabled_by_env");
+                true
+            }
+            crate::env::Switch::Unrecognized => {
+                crate::observe::fail(format!(
+                    "unused_binds reason=unused_binds_env_unrecognized value={}",
+                    value.unwrap_or_default()
+                ));
+                false
+            }
+            crate::env::Switch::Unset | crate::env::Switch::On => false,
+        }
+    })
+}
+
+/// Whether this bind may be served the neutral page instead of the guest's bytes.
+///
+/// Two conditions, and the second is not redundant. Reflection must say
+/// [`ReflectedBufferAccess::Unused`] — nothing weaker, per that type's doc — and
+/// the caller must confirm the index is not also feeding `[[stage_in]]`.
+///
+/// The stage-in condition is the one that would cost geometry. A vertex buffer
+/// bound at index *n* is read twice on this path: once as a declared argument,
+/// which is what reflection is describing, and once as the byte source for every
+/// vertex attribute naming buffer *n*, which reflection is not describing at all.
+/// The translator lists no `Buffer` at a pure stage-in index, so in principle
+/// such a bind classifies `Undeclared` and never reaches here — but "in
+/// principle" is the wrong strength of argument for a substitution that would
+/// hand the vertex shader a page of zeros as its vertex stream and draw nothing
+/// visible while declining nothing. The caller checks the attribute list it
+/// already has.
+pub fn may_serve_neutral(access: ReflectedBufferAccess, feeds_stage_in: bool) -> bool {
+    matches!(access, ReflectedBufferAccess::Unused)
+        && !feeds_stage_in
+        && !unused_binds_disabled()
+}
+
+/// How reflection describes a `[[buffer(n)]]` bind's use by this stage.
+///
+/// The asymmetry is the same one [`reflected_buffer_extent`] states, and for a
+/// sharper reason. Reading `Unused` where the shader does dereference the buffer
+/// hands the GPU stale or absent bytes — silent wrong pixels, no error anywhere
+/// — so only an explicit [`ResourceAccess::Unused`] may answer
+/// [`ReflectedBufferAccess::Unused`]. A bind reflection never mentions, and one
+/// it mentions without an access, are both [`ReflectedBufferAccess::Undeclared`].
+///
+/// Deliberately not gated on [`crate::env::BUFFER_EXTENT`]. That switch governs
+/// narrowing a bind's byte window, which is a different question from whether
+/// the bind is read at all, and folding the two would make one switch silently
+/// answer for two rails.
+///
+/// The kind is checked as well as the index for the reason
+/// [`reflected_buffer_extent`] gives: `metal_index` is unique only within a
+/// resource family, so a `[[texture(2)]]` would otherwise answer for
+/// `[[buffer(2)]]`.
+pub fn reflected_buffer_access(
+    reflection: &ShaderReflection,
+    metal_index: u32,
+) -> ReflectedBufferAccess {
+    // `find_map` here yields `Option<Option<ResourceAccess>>` on purpose: the
+    // outer level says whether reflection declares a Buffer at this index at
+    // all, the inner says whether that declaration carries an access. Flattening
+    // them would merge "not declared" into "declared, access unrecorded", and
+    // this function exists to keep those apart.
+    let Some(access) = reflection.bindings.iter().find_map(|b| {
+        (b.kind == ResourceKind::Buffer && b.metal_index == metal_index).then_some(b.access)
+    }) else {
+        return ReflectedBufferAccess::Undeclared;
+    };
+    match access {
+        Some(ResourceAccess::Unused) => ReflectedBufferAccess::Unused,
+        Some(
+            ResourceAccess::ReadOnly
+            | ResourceAccess::WriteOnly
+            | ResourceAccess::ReadWrite
+            | ResourceAccess::Sampled
+            | ResourceAccess::Storage,
+        ) => ReflectedBufferAccess::Dereferenced,
+        None => ReflectedBufferAccess::Undeclared,
+    }
 }
 
 /// How reflection describes descriptor `binding` for the sampled render path.
@@ -1744,7 +2850,13 @@ mod tests {
         // The new capability is spliced after the last OpCapability, before the
         // OpMemoryModel section (capabilities must precede everything else).
         assert_eq!(words[7], (2u32 << 16) | 17);
-        assert_eq!(words[8], CAPABILITY_STORAGE_IMAGE_WRITE_WITHOUT_FORMAT);
+        // Spelled literally, not as the constant. `assert_eq!(x, X)` where the
+        // splice wrote `X` proves the splice ran and nothing about *what it
+        // wrote*, and that is precisely how this word sat at 34
+        // (`ImageCubeArray`) through every run of this test. The number is
+        // SPIR-V's, so the literal is the only side of the comparison that
+        // carries information.
+        assert_eq!(words[8], 56, "SPIR-V Capability StorageImageWriteWithoutFormat");
         assert_eq!(
             words[9] & 0xffff,
             14,
@@ -1753,6 +2865,341 @@ mod tests {
         // Idempotent: a second call is a no-op.
         assert!(!ensure_storage_write_without_format_capability(&mut words));
         assert_eq!(words.len(), before + 2);
+    }
+
+    /// A fragment module declaring one `UniformConstant` variable on `binding`,
+    /// named by `OpEntryPoint`'s interface list the way SPIR-V 1.4 requires, and
+    /// referenced by an `OpLoad` only when `loaded`.
+    ///
+    /// The entry point is not decoration: from 1.4 its interface list carries
+    /// every global variable whether the body touches it or not, so a module
+    /// without it would not exercise the one exclusion that decides this
+    /// function's answer.
+    fn module_with_descriptor(binding: u32, loaded: bool) -> Vec<u32> {
+        const VAR: u32 = 10;
+        const FN: u32 = 11;
+        let mut body = vec![
+            // OpEntryPoint Fragment %FN "m" %VAR
+            (5u32 << 16) | OP_ENTRY_POINT as u32,
+            4,
+            FN,
+            u32::from_le_bytes([b'm', 0, 0, 0]),
+            VAR,
+            // OpName %VAR "t"
+            (3u32 << 16) | OP_NAME as u32,
+            VAR,
+            u32::from_le_bytes([b't', 0, 0, 0]),
+            // OpDecorate %VAR Binding <binding>
+            (4u32 << 16) | OP_DECORATE as u32,
+            VAR,
+            DECORATION_BINDING,
+            binding,
+            // %VAR = OpVariable %2 UniformConstant
+            (4u32 << 16) | OP_VARIABLE as u32,
+            2,
+            VAR,
+            STORAGE_CLASS_UNIFORM_CONSTANT,
+        ];
+        if loaded {
+            // %12 = OpLoad %2 %VAR
+            body.extend_from_slice(&[(4u32 << 16) | OP_LOAD as u32, 2, 12, VAR]);
+        }
+        module_with(&body)
+    }
+
+    /// Declaration and static use are different questions, and only the second
+    /// one is what Vulkan requires of a pipeline layout.
+    ///
+    /// This is the discriminator the `frag_declared_descriptor_unbound` firings
+    /// on macos-14, macos-15 and macos-26 were missing: the guard proved the
+    /// module declares the binding, which is not the bar, and the fail line read
+    /// identically for a real violation and for a variable nothing references.
+    #[test]
+    fn a_descriptor_is_used_only_when_something_references_it() {
+        let unused = module_with_descriptor(96, false);
+        let used = module_with_descriptor(96, true);
+
+        assert!(declares_descriptor(&unused, 96));
+        assert!(declares_descriptor(&used, 96));
+
+        assert_eq!(
+            descriptor_static_use(&unused, 96),
+            DescriptorUse::DeclaredUnused,
+            "OpEntryPoint's interface list and OpDecorate/OpName name the variable \
+             without referencing it; counting them makes every descriptor read as used"
+        );
+        assert!(!descriptor_static_use(&unused, 96).is_violation());
+
+        assert_eq!(descriptor_static_use(&used, 96), DescriptorUse::Used);
+        assert!(descriptor_static_use(&used, 96).is_violation());
+
+        assert_eq!(
+            descriptor_static_use(&used, 97),
+            DescriptorUse::NotDeclared,
+            "a binding no variable carries is not a use of anything"
+        );
+    }
+
+    /// Two variables on one binding is its own defect and must not be reported
+    /// as a layout violation, which would name the wrong thing.
+    #[test]
+    fn two_variables_on_one_binding_fail_closed_rather_than_pick_one() {
+        let mut body = vec![
+            (4u32 << 16) | OP_DECORATE as u32,
+            20,
+            DECORATION_BINDING,
+            5,
+            (4u32 << 16) | OP_VARIABLE as u32,
+            2,
+            20,
+            STORAGE_CLASS_UNIFORM_CONSTANT,
+            (4u32 << 16) | OP_DECORATE as u32,
+            21,
+            DECORATION_BINDING,
+            5,
+        ];
+        body.extend_from_slice(&[
+            (4u32 << 16) | OP_VARIABLE as u32,
+            2,
+            21,
+            STORAGE_CLASS_UNIFORM_CONSTANT,
+        ]);
+        let words = module_with(&body);
+        assert_eq!(descriptor_static_use(&words, 5), DescriptorUse::Ambiguous);
+        assert!(
+            !descriptor_static_use(&words, 5).is_violation(),
+            "an ambiguous binding is not evidence that the layout is missing a descriptor"
+        );
+    }
+
+    /// Every verdict carries its own name, so a census cannot collapse two.
+    #[test]
+    fn every_descriptor_use_has_its_own_slug() {
+        let all = [
+            DescriptorUse::NotDeclared,
+            DescriptorUse::DeclaredUnused,
+            DescriptorUse::Used,
+            DescriptorUse::Ambiguous,
+        ];
+        let slugs: std::collections::BTreeSet<&str> = all.iter().map(|u| u.slug()).collect();
+        assert_eq!(slugs.len(), all.len());
+    }
+
+    /// Build a minimal module: header, `OpCapability Shader`, `OpMemoryModel`,
+    /// then whatever body words are given.
+    fn module_with(body: &[u32]) -> Vec<u32> {
+        let mut words = vec![
+            0x0723_0203,       // magic
+            0x0001_0600,       // version
+            0,                 // generator
+            64,                // bound
+            0,                 // schema
+            (2u32 << 16) | 17, // OpCapability
+            1,                 // Shader
+            (3u32 << 16) | 14, // OpMemoryModel
+            0,
+            1,
+        ];
+        words.extend_from_slice(body);
+        words
+    }
+
+    /// `OpTypeImage %result %sampled_ty 2D 0 0 0 <sampled> <format>` (9 words).
+    fn op_type_image(result: u32, sampled: u32, format: u32) -> [u32; 9] {
+        [
+            (9u32 << 16) | OP_TYPE_IMAGE as u32,
+            result,
+            2, // sampled type id (unused by the walk)
+            1, // Dim2D
+            0, // depth
+            0, // arrayed
+            0, // MS
+            sampled,
+            format,
+        ]
+    }
+
+    /// A storage image declaring an extended format needs the capability, and
+    /// this is the exact shape a macOS 11 guest's kernel was rejected for:
+    /// `%1138 = OpTypeImage %float 2D 0 0 0 2 Rg16f`.
+    #[test]
+    fn an_extended_storage_format_requires_its_capability() {
+        let words = module_with(&op_type_image(10, IMAGE_SAMPLED_STORAGE, 7));
+        let need = required_image_capabilities(&words);
+        assert!(need.extended_formats, "Rg16f is outside the core set");
+        assert!(!need.write_without_format);
+        assert!(!need.read_without_format);
+    }
+
+    /// Every core storage format is admitted without a capability.
+    ///
+    /// Swept rather than sampled because the core set is **not contiguous** in
+    /// the enum — the two- and one-channel formats sit between the four-channel
+    /// ones — so a `<=` style bound reads as thorough and would quietly demand
+    /// the capability for half of them, or waive it for formats that need it.
+    #[test]
+    fn the_core_storage_formats_need_no_capability() {
+        for raw in [0u32, 1, 2, 3, 4, 5, 21, 22, 23, 24, 30, 31, 32, 33] {
+            assert!(
+                !storage_format_is_extended(raw),
+                "format {raw} is in SPIR-V's core storage set"
+            );
+        }
+        // A representative span of the extended ones, including the neighbours
+        // of core values, which is where an off-by-one would hide.
+        for raw in [6u32, 7, 8, 9, 13, 15, 20, 25, 29, 34, 39] {
+            assert!(
+                storage_format_is_extended(raw),
+                "format {raw} needs StorageImageExtendedFormats"
+            );
+        }
+    }
+
+    /// A *sampled* image is not a storage image, so its format asks for nothing.
+    #[test]
+    fn a_sampled_image_format_does_not_demand_the_storage_capability() {
+        let words = module_with(&op_type_image(10, 1, 7));
+        assert!(!required_image_capabilities(&words).extended_formats);
+    }
+
+    /// The candidate list is class-blind and the use test is not, which is the
+    /// division the layout backstop is built on.
+    ///
+    /// [`declared_binding_numbers`] must return both variables — it is the
+    /// cheap sweep that decides what gets asked about — while
+    /// [`descriptor_static_use`] separates the one Vulkan requires a descriptor
+    /// for from the one it is legal to omit. Asserting them together is what
+    /// says the pair partitions; either alone reads correct while the caller
+    /// built from them refuses legal work or admits the divide-by-zero.
+    #[test]
+    fn the_binding_sweep_is_class_blind_and_the_use_test_narrows_it() {
+        let words = test_module_with_two_sampled_images(33, 34);
+        assert_eq!(declared_binding_numbers(&words), vec![33, 34]);
+        assert_eq!(descriptor_static_use(&words, 33), DescriptorUse::Used);
+        assert_eq!(
+            descriptor_static_use(&words, 34),
+            DescriptorUse::DeclaredUnused
+        );
+        // Both are sampled images all the same — "declared and unused" is a
+        // statement about references, not about class.
+        assert_eq!(sampled_image_bindings(&words), vec![33, 34]);
+        // A binding no variable carries is not invented.
+        assert_eq!(descriptor_static_use(&words, 99), DescriptorUse::NotDeclared);
+    }
+
+    /// A module in the shape of the compositor kernel that killed a host: a
+    /// storage image, several sampled images and a sampler, all on set 0.
+    ///
+    /// The three walks must **partition** the bindings, which is why this
+    /// asserts all three rather than only the new one. Each returns a descriptor
+    /// type, and a binding that lands in two of them would be given two
+    /// conflicting layout entries; a binding that lands in none is the hole that
+    /// makes Mesa's Intel driver divide by zero. Reading either walk alone
+    /// cannot see that, because both look correct in isolation.
+    #[test]
+    fn the_sampled_image_walk_and_the_sampler_walk_partition_set_zero() {
+        const STORAGE_IMAGE_TY: u32 = 10;
+        const SAMPLED_IMAGE_TY: u32 = 11;
+        const SAMPLER_TY: u32 = 12;
+        const STORAGE_VAR: u32 = 30;
+        const SAMPLER_VAR: u32 = 33;
+
+        let mut body = Vec::new();
+        // Decorations first, the order a real module carries them in.
+        for (var, binding) in [(STORAGE_VAR, 32u32), (31, 33), (32, 34), (SAMPLER_VAR, 160)] {
+            body.extend_from_slice(&[
+                (4u32 << 16) | OP_DECORATE as u32,
+                var,
+                DECORATION_BINDING,
+                binding,
+            ]);
+        }
+        body.extend_from_slice(&op_type_image(STORAGE_IMAGE_TY, IMAGE_SAMPLED_STORAGE, 0));
+        body.extend_from_slice(&op_type_image(
+            SAMPLED_IMAGE_TY,
+            IMAGE_SAMPLED_WITH_SAMPLER,
+            0,
+        ));
+        body.extend_from_slice(&[(2u32 << 16) | OP_TYPE_SAMPLER as u32, SAMPLER_TY]);
+        for (ptr, pointee) in [(20, STORAGE_IMAGE_TY), (21, SAMPLED_IMAGE_TY), (22, SAMPLER_TY)] {
+            body.extend_from_slice(&[
+                (4u32 << 16) | OP_TYPE_POINTER as u32,
+                ptr,
+                STORAGE_CLASS_UNIFORM_CONSTANT,
+                pointee,
+            ]);
+        }
+        for (ptr, var) in [(20, STORAGE_VAR), (21, 31), (21, 32), (22, SAMPLER_VAR)] {
+            body.extend_from_slice(&[
+                (4u32 << 16) | OP_VARIABLE as u32,
+                ptr,
+                var,
+                STORAGE_CLASS_UNIFORM_CONSTANT,
+            ]);
+        }
+        let words = module_with(&body);
+
+        // The two sampled images, and neither the storage image nor the sampler.
+        assert_eq!(sampled_image_bindings(&words), vec![33, 34]);
+        // The sampler alone — the walk that already existed is unchanged.
+        assert_eq!(sampler_bindings(&words), vec![160]);
+        // The storage image belongs to neither walk — it is bound from the
+        // guest's own storage table, as a STORAGE_IMAGE descriptor.
+        assert!(!sampled_image_bindings(&words).contains(&32));
+        assert!(!sampler_bindings(&words).contains(&32));
+    }
+
+    /// An `Unknown`-format storage image plus a write demands
+    /// `StorageImageWriteWithoutFormat`.
+    ///
+    /// The pointer/variable/load words in the body are the shape the translator
+    /// emits around such a write. They are deliberately *not* what the check
+    /// depends on — see `required_image_capabilities` on why attributing the
+    /// write to its image was tried and abandoned — but they belong in the
+    /// fixture so it stays a realistic module rather than two instructions.
+    #[test]
+    fn a_write_to_an_unknown_format_image_requires_its_capability() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&op_type_image(10, IMAGE_SAMPLED_STORAGE, 0));
+        // OpTypePointer %11 UniformConstant %10
+        body.extend_from_slice(&[(4u32 << 16) | OP_TYPE_POINTER as u32, 11, 0, 10]);
+        // OpVariable %11 %12 UniformConstant
+        body.extend_from_slice(&[(4u32 << 16) | OP_VARIABLE as u32, 11, 12, 0]);
+        // OpLoad %10 %13 %12
+        body.extend_from_slice(&[(4u32 << 16) | OP_LOAD as u32, 10, 13, 12]);
+        // OpImageWrite %13 %20 %21
+        body.extend_from_slice(&[(4u32 << 16) | OP_IMAGE_WRITE as u32, 13, 20, 21]);
+        let words = module_with(&body);
+
+        let need = required_image_capabilities(&words);
+        assert!(need.write_without_format, "write to an Unknown-format image");
+        assert!(!need.extended_formats, "Unknown is in the core set");
+
+        // And the splice puts it in, once.
+        let mut patched = words.clone();
+        let added = ensure_image_capabilities(&mut patched, &need);
+        assert!(added.write_without_format);
+        assert_eq!(patched.len(), words.len() + 2);
+        assert!(!ensure_image_capabilities(&mut patched, &need).any());
+        assert_eq!(patched.len(), words.len() + 2);
+        // The splice lands in the capability section, before OpMemoryModel — a
+        // capability declared after it is as invalid as a missing one.
+        assert_eq!(patched[7] & 0xffff, OP_CAPABILITY as u32);
+        assert_eq!(patched[8], 56, "SPIR-V Capability StorageImageWriteWithoutFormat");
+        assert_eq!(patched[9] & 0xffff, 14, "OpMemoryModel follows");
+    }
+
+    /// A write to a *declared*-format image asks for nothing.
+    #[test]
+    fn a_write_to_a_declared_format_image_needs_no_capability() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&op_type_image(10, IMAGE_SAMPLED_STORAGE, 4)); // Rgba8
+        body.extend_from_slice(&[(4u32 << 16) | OP_TYPE_POINTER as u32, 11, 0, 10]);
+        body.extend_from_slice(&[(4u32 << 16) | OP_VARIABLE as u32, 11, 12, 0]);
+        body.extend_from_slice(&[(4u32 << 16) | OP_LOAD as u32, 10, 13, 12]);
+        body.extend_from_slice(&[(4u32 << 16) | OP_IMAGE_WRITE as u32, 13, 20, 21]);
+        let words = module_with(&body);
+        assert!(!required_image_capabilities(&words).any());
     }
 
     #[test]
@@ -1788,6 +3235,220 @@ mod tests {
         }
     }
 
+    fn buffer_binding(metal_index: u32, extent: Option<BufferExtent>) -> ResourceBinding {
+        ResourceBinding {
+            kind: ResourceKind::Buffer,
+            metal_index,
+            descriptor: Some(DescriptorLocation {
+                set: RESOURCE_DESCRIPTOR_SET,
+                binding: metal_index,
+            }),
+            param_index: None,
+            address_space: None,
+            declared_size: None,
+            extent,
+            type_layout: None,
+            type_name: None,
+            texture_shape: None,
+            embedded_source: None,
+            access: None,
+            static_sampler: None,
+        }
+    }
+
+    /// Only `Object` narrows a bind; every other answer keeps the whole window.
+    ///
+    /// The asymmetry is the safety argument for the whole narrowing rail, and it
+    /// is the direction with no alarm behind it: too wide a window costs bus
+    /// bytes and nothing else, too narrow a one hands the GPU a short buffer and
+    /// draws whatever follows it. So each of the four ways to *not* know an
+    /// extent is asserted separately rather than as one "not Object" case —
+    /// `Unbounded`, `Unknown`, a binding this shader does not declare, and a
+    /// binding present but carrying no extent at all.
+    #[test]
+    fn only_a_bounded_object_extent_narrows_a_buffer_bind() {
+        let mut r = empty_reflection(ShaderStage::Vertex);
+        r.bindings = vec![
+            buffer_binding(0, Some(BufferExtent::Object { bytes: 288 })),
+            buffer_binding(1, Some(BufferExtent::Unbounded)),
+            buffer_binding(2, Some(BufferExtent::Unknown)),
+            buffer_binding(3, None),
+        ];
+
+        assert_eq!(reflected_buffer_extent(&r, 0), Some(288), "a bounded object");
+        assert_eq!(reflected_buffer_extent(&r, 1), None, "an unbounded pointer");
+        assert_eq!(reflected_buffer_extent(&r, 2), None, "an undecided extent");
+        assert_eq!(reflected_buffer_extent(&r, 3), None, "no extent carried");
+        assert_eq!(reflected_buffer_extent(&r, 9), None, "not declared at all");
+    }
+
+    /// A `metal_index` is unique only within a resource family, so the lookup
+    /// must not read a texture's or a threadgroup buffer's slot as a bind it may
+    /// narrow. A `[[texture(0)]]` and a `[[buffer(0)]]` both report index 0, and
+    /// a threadgroup `[[buffer(n)]]` binds no guest memory at all.
+    #[test]
+    fn a_buffer_extent_is_not_read_off_another_resource_family() {
+        let mut r = empty_reflection(ShaderStage::Fragment);
+        let mut threadgroup = buffer_binding(0, Some(BufferExtent::Object { bytes: 16 }));
+        threadgroup.kind = ResourceKind::ThreadgroupBuffer;
+        let mut texture = buffer_binding(1, Some(BufferExtent::Object { bytes: 32 }));
+        texture.kind = ResourceKind::Texture;
+        r.bindings = vec![threadgroup, texture];
+
+        assert_eq!(reflected_buffer_extent(&r, 0), None, "threadgroup buffer");
+        assert_eq!(reflected_buffer_extent(&r, 1), None, "texture");
+    }
+
+    /// Only an explicit `Unused` answers `Unused`, and every other way of not
+    /// knowing answers `Undeclared`.
+    ///
+    /// Asserted case by case rather than as one "not Unused" arm, for the reason
+    /// `only_a_bounded_object_extent_narrows_a_buffer_bind` gives about the
+    /// extent: this is the direction with no alarm behind it. A bind wrongly
+    /// read as unused would have its guest bytes withheld, and the shader would
+    /// read whatever the descriptor happened to point at — wrong pixels, no
+    /// error anywhere. Reading a genuinely unused bind as `Dereferenced` only
+    /// costs the copy we already pay.
+    #[test]
+    fn only_an_explicit_unused_access_answers_unused() {
+        use metal2vulkan::reflect::ResourceAccess;
+
+        let mut r = empty_reflection(ShaderStage::Fragment);
+        let with = |index: u32, access: Option<ResourceAccess>| {
+            let mut b = buffer_binding(index, None);
+            b.access = access;
+            b
+        };
+        r.bindings = vec![
+            with(0, Some(ResourceAccess::Unused)),
+            with(1, Some(ResourceAccess::ReadOnly)),
+            with(2, Some(ResourceAccess::WriteOnly)),
+            with(3, Some(ResourceAccess::ReadWrite)),
+            with(4, None),
+        ];
+
+        assert_eq!(
+            reflected_buffer_access(&r, 0),
+            ReflectedBufferAccess::Unused,
+            "the one class that may withhold bytes"
+        );
+        for index in 1..=3 {
+            assert_eq!(
+                reflected_buffer_access(&r, index),
+                ReflectedBufferAccess::Dereferenced,
+                "index {index} is touched by the shader"
+            );
+        }
+        assert_eq!(
+            reflected_buffer_access(&r, 4),
+            ReflectedBufferAccess::Undeclared,
+            "declared, but carrying no access"
+        );
+        assert_eq!(
+            reflected_buffer_access(&r, 9),
+            ReflectedBufferAccess::Undeclared,
+            "not declared at all — not a synonym for unused"
+        );
+    }
+
+    /// The same family rule the extent lookup obeys. A `[[texture(0)]]` marked
+    /// unused must not answer for `[[buffer(0)]]`, or a bind the shader does
+    /// read would have its bytes withheld on a texture's say-so.
+    #[test]
+    fn a_buffer_access_is_not_read_off_another_resource_family() {
+        use metal2vulkan::reflect::ResourceAccess;
+
+        let mut r = empty_reflection(ShaderStage::Fragment);
+        let mut threadgroup = buffer_binding(0, None);
+        threadgroup.kind = ResourceKind::ThreadgroupBuffer;
+        threadgroup.access = Some(ResourceAccess::Unused);
+        let mut texture = buffer_binding(1, None);
+        texture.kind = ResourceKind::Texture;
+        texture.access = Some(ResourceAccess::Unused);
+        r.bindings = vec![threadgroup, texture];
+
+        assert_eq!(
+            reflected_buffer_access(&r, 0),
+            ReflectedBufferAccess::Undeclared,
+            "threadgroup buffer"
+        );
+        assert_eq!(
+            reflected_buffer_access(&r, 1),
+            ReflectedBufferAccess::Undeclared,
+            "texture"
+        );
+    }
+
+    /// Only an unused bind that feeds no stage-in attribute may be substituted.
+    ///
+    /// Both terms are asserted, because both failures are silent and one of them
+    /// is catastrophic: substituting a stage-in buffer hands the vertex shader a
+    /// page of zeros as its vertex stream, which draws nothing and declines
+    /// nothing. The other two classes must never be substituted at all.
+    #[test]
+    fn only_an_unused_bind_that_feeds_no_stage_in_may_be_neutralized() {
+        assert!(
+            may_serve_neutral(ReflectedBufferAccess::Unused, false),
+            "unused and not a vertex stream"
+        );
+        assert!(
+            !may_serve_neutral(ReflectedBufferAccess::Unused, true),
+            "an index the attribute list names keeps its guest bytes"
+        );
+        for class in [
+            ReflectedBufferAccess::Dereferenced,
+            ReflectedBufferAccess::Undeclared,
+        ] {
+            for feeds_stage_in in [false, true] {
+                assert!(
+                    !may_serve_neutral(class, feeds_stage_in),
+                    "{class:?} is never substituted (stage_in={feeds_stage_in})"
+                );
+            }
+        }
+    }
+
+    /// The neutral page is one shared, non-empty allocation.
+    ///
+    /// Non-empty because the stage-in path reads empty content as "the stream
+    /// bound nothing" and declines on it, and shared because the engine keys its
+    /// per-command-buffer bind reuse on the pointer — a fresh allocation per
+    /// bind would replace a guest gather with a staging upload and defeat the
+    /// rail.
+    #[test]
+    fn the_neutral_page_is_one_shared_non_empty_allocation() {
+        let a = neutral_bind_bytes();
+        let b = neutral_bind_bytes();
+        assert!(!a.is_empty(), "an empty bind reads as 'nothing was bound'");
+        assert_eq!(a.len(), NEUTRAL_BIND_BYTES);
+        assert!(
+            std::sync::Arc::ptr_eq(&a, &b),
+            "every neutral bind shares one allocation, so the engine reuses it"
+        );
+        assert!(a.iter().all(|&byte| byte == 0), "zeroed");
+    }
+
+    /// The classification must not answer differently because the *extent* rail
+    /// was switched off. They are two questions about one binding and one switch
+    /// must not silently answer for both.
+    #[test]
+    fn the_access_class_does_not_follow_the_extent_switch() {
+        use metal2vulkan::reflect::ResourceAccess;
+
+        let mut r = empty_reflection(ShaderStage::Vertex);
+        let mut b = buffer_binding(0, Some(BufferExtent::Object { bytes: 288 }));
+        b.access = Some(ResourceAccess::Unused);
+        r.bindings = vec![b];
+
+        // Whatever `buffer_extent_disabled()` reads from the environment on this
+        // host, the access answer is the same one.
+        assert_eq!(
+            reflected_buffer_access(&r, 0),
+            ReflectedBufferAccess::Unused,
+            "access is not gated on the extent switch"
+        );
+    }
+
     fn texture_binding(binding: u32, shape: TextureShape) -> ResourceBinding {
         ResourceBinding {
             kind: ResourceKind::Texture,
@@ -1796,6 +3457,7 @@ mod tests {
             param_index: None,
             address_space: None,
             declared_size: None,
+            extent: None,
             type_layout: None,
             type_name: None,
             texture_shape: Some(shape),
@@ -1824,6 +3486,7 @@ mod tests {
             param_index: None,
             address_space: None,
             declared_size: None,
+            extent: None,
             type_layout: None,
             type_name: None,
             texture_shape: None,
@@ -2452,6 +4115,224 @@ mod tests {
             Some(StorageImageAccess::ReadWrite),
             "the variable being decorated and listed as an interface is not an escape"
         );
+    }
+
+    /// Every `OpLoad` in `words` whose pointer is a global `OpVariable` must
+    /// declare the pointee of that variable's pointer type as its result type.
+    ///
+    /// This is a SPIR-V validity rule — "Result Type must be the same as the
+    /// type pointed to by Pointer" — and it is the one that a format
+    /// specialization can break without touching a single instruction inside
+    /// the function: repointing a variable at a cloned image type leaves every
+    /// load of it declaring the type the variable no longer has. Asserted
+    /// structurally rather than by shelling out to `spirv-val`, so it runs on
+    /// every arm and needs nothing installed.
+    fn loads_agree_with_their_pointees(words: &[u32]) -> Result<(), String> {
+        let bound = words[3] as usize;
+        let mut pointer_pointee = vec![None; bound];
+        let mut variable_type = vec![None; bound];
+        let mut i = HEADER_WORDS;
+        while i < words.len() {
+            let count = (words[i] >> 16) as usize;
+            let opcode = (words[i] & 0xffff) as u16;
+            assert!(count > 0 && i + count <= words.len(), "malformed module");
+            match opcode {
+                OP_TYPE_POINTER if count >= 4 => {
+                    pointer_pointee[words[i + 1] as usize] = Some(words[i + 3] as usize)
+                }
+                OP_VARIABLE if count >= 4 => {
+                    variable_type[words[i + 2] as usize] = Some(words[i + 1] as usize)
+                }
+                _ => {}
+            }
+            i += count;
+        }
+        let mut i = HEADER_WORDS;
+        while i < words.len() {
+            let count = (words[i] >> 16) as usize;
+            let opcode = (words[i] & 0xffff) as u16;
+            if opcode == OP_LOAD && count >= 4 {
+                let result_type = words[i + 1] as usize;
+                let pointer = words[i + 3] as usize;
+                let pointee = variable_type
+                    .get(pointer)
+                    .copied()
+                    .flatten()
+                    .and_then(|p| pointer_pointee.get(p).copied().flatten());
+                if let Some(pointee) = pointee {
+                    if pointee != result_type {
+                        return Err(format!(
+                            "OpLoad of %{pointer} declares %{result_type} but the variable now points at %{pointee}"
+                        ));
+                    }
+                }
+            }
+            i += count;
+        }
+        Ok(())
+    }
+
+    /// Two storage images sharing one `OpTypeImage`, only one of them
+    /// specialized, each loaded and written in the function body.
+    ///
+    /// The clone path is the only one that changes a variable's *type*, and it
+    /// is the shape a real kernel takes: `metal2vulkan` emits one `OpTypeImage`
+    /// per (sampled type, dimension, format) tuple, so two
+    /// `texture2d<float, access::write>` parameters share it, and the device
+    /// specializes only the binding the guest bound a surface to.
+    ///
+    /// Left unrepaired, the resulting module is invalid and the NVIDIA driver's
+    /// SPIR-V compiler segmentation-faults inside `vkCreateComputePipelines` —
+    /// taking QEMU with it. That is what the macos-14 rail did on its first
+    /// compute dispatch, and a guest can author any kernel, so a module this
+    /// device assembled must never be one the driver cannot survive.
+    #[test]
+    fn a_cloned_image_type_carries_its_loads_with_it() {
+        // %99 float, %1 OpTypeImage(float, format R32f), %2 pointer to %1,
+        // %3/%4 variables at bindings 34/35, then a function that loads both.
+        let mut words = vec![0x0723_0203, 0x0001_0000, 0, 10, 0];
+        words.extend([(9u32 << 16) | OP_TYPE_IMAGE as u32, 1, 99, 1, 0, 0, 0, 2, 3]);
+        words.extend([(4u32 << 16) | OP_TYPE_POINTER as u32, 2, 0, 1]);
+        words.extend([(4u32 << 16) | OP_VARIABLE as u32, 2, 3, 0]);
+        words.extend([(4u32 << 16) | OP_DECORATE as u32, 3, DECORATION_BINDING, 34]);
+        words.extend([(4u32 << 16) | OP_VARIABLE as u32, 2, 4, 0]);
+        words.extend([(4u32 << 16) | OP_DECORATE as u32, 4, DECORATION_BINDING, 35]);
+        words.extend([(5u32 << 16) | OP_FUNCTION as u32, 98, 5, 0, 97]);
+        words.extend([(4u32 << 16) | OP_LOAD as u32, 1, 6, 3]);
+        words.extend([(4u32 << 16) | OP_LOAD as u32, 1, 7, 4]);
+
+        assert!(loads_agree_with_their_pointees(&words).is_ok(), "premise");
+        assert_eq!(
+            specialize_image_formats(&mut words, &[(34, ImageFormat::Rgba16Float)]),
+            Ok(1)
+        );
+        assert_eq!(image_format(&words, 34), Some(ImageFormat::Rgba16Float));
+        assert_eq!(image_format(&words, 35), Some(ImageFormat::R32Float));
+        if let Err(why) = loads_agree_with_their_pointees(&words) {
+            panic!("specialization left the module invalid: {why}");
+        }
+    }
+
+    /// The smallest module a Vulkan validator accepts: an empty `GLCompute`
+    /// entry point with a declared local size.
+    fn minimal_compute_module() -> Vec<u32> {
+        const OP_CAPABILITY: u32 = 17;
+        const OP_MEMORY_MODEL: u32 = 14;
+        const OP_ENTRY_POINT: u32 = 15;
+        const OP_EXECUTION_MODE: u32 = 16;
+        const OP_TYPE_VOID: u32 = 19;
+        const OP_TYPE_FUNCTION: u32 = 33;
+        const OP_FUNCTION: u32 = 54;
+        const OP_FUNCTION_END: u32 = 56;
+        const OP_LABEL: u32 = 248;
+        const OP_RETURN: u32 = 253;
+        let mut w = vec![0x0723_0203, 0x0001_0000, 0, 5, 0];
+        w.extend([(2 << 16) | OP_CAPABILITY, 1]); // Shader
+        w.extend([(3 << 16) | OP_MEMORY_MODEL, 0, 1]); // Logical GLSL450
+        w.extend([(5 << 16) | OP_ENTRY_POINT, 5, 3, 0x6E69_616D, 0]); // GLCompute %3 "main"
+        w.extend([(6 << 16) | OP_EXECUTION_MODE, 3, 17, 1, 1, 1]); // LocalSize 1 1 1
+        w.extend([(2 << 16) | OP_TYPE_VOID, 1]);
+        w.extend([(3 << 16) | OP_TYPE_FUNCTION, 2, 1]);
+        w.extend([(5 << 16) | OP_FUNCTION, 1, 3, 0, 2]);
+        w.extend([(2 << 16) | OP_LABEL, 4]);
+        w.extend([1 << 16 | OP_RETURN]);
+        w.extend([1 << 16 | OP_FUNCTION_END]);
+        w
+    }
+
+    /// The gate that stands between a guest's shader and undefined behaviour
+    /// inside a driver.
+    ///
+    /// A valid module passes and an invalid one is named, which is the whole
+    /// contract — the device declines the dispatch rather than handing the
+    /// driver something it is entitled to crash on, and one driver does.
+    ///
+    /// Skips where SPIRV-Tools is not installed, because there the function is
+    /// specified to accept: an absent instrument is not a verdict.
+    #[test]
+    fn a_module_a_validator_rejects_never_reaches_a_driver() {
+        let good = minimal_compute_module();
+        if validate(&good) != SpirvValidation::Accepted {
+            eprintln!("skip: no usable spirv-val, or it rejects the minimal module");
+            return;
+        }
+        // Point the function's return type at the function id instead of at
+        // %void, which is a type error no driver has to survive.
+        let mut bad = good.clone();
+        let at = bad
+            .iter()
+            .position(|w| *w == (5 << 16) | 54)
+            .expect("OpFunction");
+        bad[at + 1] = 3;
+        match validate(&bad) {
+            SpirvValidation::Rejected(why) => assert!(!why.is_empty(), "the refusal must say why"),
+            SpirvValidation::Accepted => panic!("a type-broken module was accepted"),
+        }
+    }
+
+    /// Concurrent validations do not answer for each other.
+    ///
+    /// The validator wrapper writes a fixed file name inside the directory it
+    /// is handed, so a shared directory makes two callers race over one path
+    /// and the loser gets a verdict about bytes it did not submit. That is not
+    /// hypothetical: it rejected three good modules on a working macos-13 boot,
+    /// where the concurrency comes from this device's drain thread and
+    /// `metal2vulkan`'s own async translations sharing `/tmp`.
+    ///
+    /// Skips where SPIRV-Tools is absent, where every answer is `Accepted` and
+    /// the test could not fail.
+    #[test]
+    fn concurrent_validations_do_not_collide() {
+        let good = minimal_compute_module();
+        if validate(&good) != SpirvValidation::Accepted {
+            eprintln!("skip: no usable spirv-val");
+            return;
+        }
+        let verdicts: Vec<_> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    let words = good.clone();
+                    scope.spawn(move || validate(&words))
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        for verdict in &verdicts {
+            assert_eq!(*verdict, SpirvValidation::Accepted, "{verdicts:?}");
+        }
+    }
+
+    /// The guard refuses rather than trusting the repair.
+    ///
+    /// `retype_loads` handles the shape the clone path produces; the check is
+    /// what makes anything it did not handle a decline instead of a module
+    /// handed to a driver that may not survive it. Fed a module broken the way
+    /// an unrepaired clone breaks one, it names the load.
+    #[test]
+    fn a_load_that_disagrees_with_its_pointee_is_refused_by_name() {
+        let mut words = vec![0x0723_0203, 0x0001_0000, 0, 10, 0];
+        words.extend([(9u32 << 16) | OP_TYPE_IMAGE as u32, 1, 99, 1, 0, 0, 0, 2, 3]);
+        words.extend([(9u32 << 16) | OP_TYPE_IMAGE as u32, 8, 99, 1, 0, 0, 0, 2, 2]);
+        words.extend([(4u32 << 16) | OP_TYPE_POINTER as u32, 2, 0, 8]);
+        words.extend([(4u32 << 16) | OP_VARIABLE as u32, 2, 3, 0]);
+        // The variable points at %8 and the load still declares %1.
+        words.extend([(4u32 << 16) | OP_LOAD as u32, 1, 6, 3]);
+
+        assert_eq!(
+            verify_load_types(&words),
+            Err(ImageFormatSpecializeError::LoadTypeMismatch {
+                pointer: 3,
+                declared: 1
+            })
+        );
+        assert_eq!(
+            crate::observe::Decline::slug(&verify_load_types(&words).unwrap_err()),
+            "spirv_format_specialize_load_type_mismatch"
+        );
+        // And it passes once the load names what the variable points at.
+        let at = words.len() - 3;
+        words[at] = 8;
+        assert_eq!(verify_load_types(&words), Ok(()));
     }
 
     #[test]

@@ -461,14 +461,88 @@ fn vertex_buffer_needs_storage_binding(v_words: &[u32], idx: u32, is_stage_in: b
     !is_stage_in || crate::runtime::spirv_bind::buffer_access(v_words, idx).is_some()
 }
 
+/// Which directly-bound Metal resource class a [`FragUnbound`] names.
+///
+/// Carried as a type rather than as the `buf`/`tex`/`smp` prefix this used to be
+/// formatted into, because the class decides the SPIR-V binding relocation and a
+/// consumer that wants it back out of a string has to parse one. `Display` is the
+/// only place the prefix exists now.
+#[cfg(feature = "backend-vulkan")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FragUnboundClass {
+    Buffer,
+    Texture,
+    Sampler,
+}
+
+#[cfg(feature = "backend-vulkan")]
+impl std::fmt::Display for FragUnboundClass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Buffer => "buf",
+            Self::Texture => "tex",
+            Self::Sampler => "smp",
+        })
+    }
+}
+
+/// One directly-bound fragment resource the shader declares and the draw did not
+/// provide.
+#[cfg(feature = "backend-vulkan")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FragUnbound {
+    pub class: FragUnboundClass,
+    /// The Metal argument index, before any SPIR-V binding relocation.
+    pub metal_index: u32,
+}
+
+#[cfg(feature = "backend-vulkan")]
+impl std::fmt::Display for FragUnbound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}{}", self.class, self.metal_index)
+    }
+}
+
+/// The fragment textures a draw must substitute a neutral image for: the gaps
+/// the scan flagged that are textures and that the module *statically uses*.
+///
+/// Vulkan requires the pipeline layout to contain a descriptor for every
+/// statically-used resource, and `engine/exec.rs` builds that layout from
+/// provided resources alone — so one of these left alone is not an unwritten
+/// descriptor, it is a binding the layout does not mention. Mesa's Intel driver
+/// scores each used binding as `(use_count << 7) / array_size` over an array it
+/// sized to `max_binding + 1` and zero-filled, so the omission divides by zero
+/// and kills the host process inside pipeline creation rather than returning an
+/// error. That is why this population has to be filled rather than only counted.
+///
+/// Three narrowings, each load-bearing:
+///
+/// - **Textures only.** The sampler class provisions its own default where it
+///   binds, and a storage buffer has no neutral this device can invent; both are
+///   still reported by the caller.
+/// - **[`DescriptorUse::Used`] only.** A declared-and-never-referenced variable
+///   is legal to omit and must stay omitted, or the census that separated those
+///   two populations cannot tell them apart any more.
+/// - **Not `Ambiguous`.** Two variables on one binding is its own defect and is
+///   not repaired by picking one of them; `is_violation` already excludes it.
+#[cfg(feature = "backend-vulkan")]
+fn frag_unbound_textures_to_neutralize(
+    uses: &[(FragUnbound, crate::runtime::spirv_bind::DescriptorUse)],
+) -> Vec<u32> {
+    uses.iter()
+        .filter(|(gap, use_)| use_.is_violation() && gap.class == FragUnboundClass::Texture)
+        .map(|(gap, _)| gap.metal_index)
+        .collect()
+}
+
 /// One pass over the fragment reflection classifying the two bind gaps the render
 /// path cannot recover from. Returns `(unbound, embedded)`:
 /// - **`unbound`** — standard directly-bound kinds (`[[buffer(n)]]` /
 ///   `[[texture(n)]]` / `[[sampler(n)]]`) the shader DECLARES but the draw never
 ///   provided (per the caller's membership predicates). Each names a descriptor the
 ///   translated SPIR-V references yet the Vulkan engine leaves unbound — an
-///   undefined read that paints garbage. Entries are prefixed `buf`/`tex`/`smp` +
-///   index. `ColorInput` / `ThreadgroupBuffer` / `StorageImage` reach the shader by
+///   undefined read that paints garbage. `ColorInput` / `ThreadgroupBuffer` /
+///   `StorageImage` reach the shader by
 ///   other paths (validated by `census_reflection_wellformed`) and are skipped.
 /// - **`embedded`** — `EmbeddedArgBufferTexture` synthetic indices: textures
 ///   metal2vulkan flattened out of an `air.indirect_buffer` argument. The compute
@@ -484,26 +558,84 @@ fn frag_unbound_scan(
     has_buf: impl Fn(u32) -> bool,
     has_tex: impl Fn(u32) -> bool,
     has_smp: impl Fn(u32) -> bool,
-) -> (Vec<String>, Vec<u32>) {
+    tex_declared_in_module: impl Fn(u32) -> bool,
+) -> (Vec<FragUnbound>, Vec<u32>) {
     use metal2vulkan::reflect::ResourceKind;
-    let mut unbound: Vec<String> = Vec::new();
+    let mut unbound: Vec<FragUnbound> = Vec::new();
     let mut embedded: Vec<u32> = Vec::new();
     for rb in bindings {
         let (cls, provided) = match rb.kind {
-            ResourceKind::Buffer => ("buf", has_buf(rb.metal_index)),
-            ResourceKind::Texture | ResourceKind::TextureArray => ("tex", has_tex(rb.metal_index)),
-            ResourceKind::Sampler => ("smp", has_smp(rb.metal_index)),
+            ResourceKind::Buffer => (FragUnboundClass::Buffer, has_buf(rb.metal_index)),
+            ResourceKind::Texture | ResourceKind::TextureArray => {
+                (FragUnboundClass::Texture, has_tex(rb.metal_index))
+            }
+            ResourceKind::Sampler => (FragUnboundClass::Sampler, has_smp(rb.metal_index)),
             ResourceKind::EmbeddedArgBufferTexture => {
                 embedded.push(rb.metal_index);
                 continue;
             }
             _ => continue,
         };
-        if !provided {
-            unbound.push(format!("{cls}{}", rb.metal_index));
+        if provided {
+            continue;
         }
+        // A texture the reflection names but the module never declares is not a
+        // gap. The reflection comes from the AIR entry point's signature, so a
+        // Metal function that lists `[[texture(n)]]` and never samples it
+        // produces an entry for a descriptor the translated SPIR-V does not
+        // carry — nothing references the binding, so nothing is unbound.
+        //
+        // Asked of textures only, because that is the class observed firing and
+        // the binding relocation for it is the one this caller can compute. A
+        // buffer or sampler reported here is still worth reading as before.
+        if matches!(rb.kind, ResourceKind::Texture | ResourceKind::TextureArray)
+            && !tex_declared_in_module(rb.metal_index)
+        {
+            continue;
+        }
+        unbound.push(FragUnbound {
+            class: cls,
+            metal_index: rb.metal_index,
+        });
     }
     (unbound, embedded)
+}
+
+/// Ask the specification's own question of one reported gap: does the module
+/// *statically use* the descriptor its layout does not contain?
+///
+/// The scan above stops at declaration because that is what it can answer per
+/// draw for the price of a decoration walk. Declaration is not the bar: Vulkan
+/// requires the pipeline layout to contain a descriptor for every resource the
+/// shader references, and a declared-and-never-referenced variable is legal to
+/// omit. So this is the difference between a specification violation and a
+/// harmless reflection artefact, and until it is asked the fail line is naming a
+/// population it cannot tell apart.
+///
+/// Textures only, and the reason is the same one the declaration check gives:
+/// the caller can compute the SPIR-V binding for a texture, and the relocation
+/// for the other two classes is not this function's to guess. A buffer or a
+/// sampler gap answers [`spirv_bind::DescriptorUse::Used`] unexamined, which
+/// keeps them reported exactly as loudly as before rather than quietly
+/// downgrading a class nobody has measured.
+#[cfg(feature = "backend-vulkan")]
+fn frag_unbound_static_use(
+    gap: &FragUnbound,
+    f_words: &[u32],
+    separate_sampled: bool,
+) -> crate::runtime::spirv_bind::DescriptorUse {
+    use crate::runtime::spirv_bind::{
+        self, DescriptorUse, FRAG_SAMPLED_RESOURCE_BINDING_OFFSET, TEXTURE_BINDING_BASE,
+    };
+    if gap.class != FragUnboundClass::Texture {
+        return DescriptorUse::Used;
+    }
+    let base_off = if separate_sampled {
+        FRAG_SAMPLED_RESOURCE_BINDING_OFFSET
+    } else {
+        0
+    };
+    spirv_bind::descriptor_static_use(f_words, TEXTURE_BINDING_BASE + gap.metal_index + base_off)
 }
 
 #[cfg(feature = "backend-vulkan")]
@@ -1150,7 +1282,20 @@ impl crate::observe::Decline for IndexLoadReason {
 /// same boot. So this is a rail that succeeds, not one that was failing quietly,
 /// and a line from it is worth reading. See `runtime::mtlb` for the same
 /// measurement on the loader one level down.
-fn load_render_pipeline<M: HostMemory + HostOps>(
+///
+/// **That zero is per-guest-line, and macOS 26 is not on it.** Every driven
+/// macos-26 boot measured so far emits 36-40 fail lines from here, all of them
+/// `no_list_entry`, while a driven macos-15 boot of the same binary emits none.
+/// The macOS 26 population has a measured mechanism and is not a regression to
+/// re-derive: the guest clears the object-list slot it named while the packet
+/// that named it is still undrained, so the slot reads zero when this device
+/// gets to it. The deduped counters behind those lines run several times higher
+/// than the lines themselves, so the two are not interchangeable.
+///
+/// Read a count here against the same rail's previous boot. Read it against the
+/// paragraph above instead and macOS 26's standing behaviour arrives looking
+/// like a fresh defect, which is a mistake this doc has already cost once.
+pub(crate) fn load_render_pipeline<M: HostMemory + HostOps>(
     state: &DeviceState,
     host: &M,
     task_id: u32,
@@ -1193,11 +1338,42 @@ fn load_render_pipeline<M: HostMemory + HostOps>(
     Some(p)
 }
 
-/// Resolve immutable AIR inputs for a render pipeline before executing its
-/// packet. The Linux scheduler uses this read-only plan step to translate on a
-/// background thread while unrelated child FIFOs continue draining.
+/// The two MTLB containers a render pipeline's stages live in, without
+/// extracting or copying the AIR out of them.
+///
+/// This replaced a `load_render_air_pair` that did the same three resolves and
+/// then `to_vec`'d both blobs — named in prose rather than linked, because it no
+/// longer exists. Its consumer is `m2v_cache::ensure_cached_async`, which takes
+/// `&[u8]`, digests it, and retains nothing unless the lookup misses; on a boot
+/// where every shader is already translated both copies were waste, at
+/// **12 650-12 786 pipeline refs a second**. The preflight was its only caller,
+/// so there was no second consumer needing owned bytes and nothing to keep it
+/// for.
+///
+/// # It bought 5 %, not 71 %, and that is the useful part of the reading
+///
+/// Two driven macos-13 boots either side of the change, same rail and probe,
+/// with `refs` and `cache` as controls — both unchanged, so the delta is
+/// attributable to this rather than to the two builds differing elsewhere:
+///
+/// ```text
+///                  with copies    borrowed
+/// air_us/pipe      4.34 / 4.30   4.06 / 4.17    -4.7 %
+/// refs_us/call     0.41 / 0.40   0.41 / 0.42    control
+/// cache_us/pipe    1.30 / 1.31   1.33 / 1.36    control
+/// ```
+///
+/// So **two allocations and two memcpys of a shader blob are ~0.2 us of a 4.3 us
+/// resolve.** The other 4.1 us is the three guest-memory resolves this function
+/// still does — the pipeline descriptor, then a descriptor and a blob read for
+/// each of the two stages. Anyone shortening this path should aim there, and not
+/// at the copies again.
+///
+/// The remaining ~50 ms/s comes off only by not calling this at all. See
+/// [`crate::runtime::drain::PreflightPart`] for the memo that would do it, and
+/// for the fact that makes it soundable: the m2v cache never evicts.
 #[cfg(feature = "backend-vulkan")]
-pub(crate) fn load_render_air_pair<M: HostMemory + HostOps>(
+pub(crate) fn load_render_mtlb_pair<M: HostMemory + HostOps>(
     state: &DeviceState,
     host: &M,
     task_id: u32,
@@ -1226,19 +1402,7 @@ pub(crate) fn load_render_air_pair<M: HostMemory + HostOps>(
         task_id,
         function_ref: pd.fragment_func_ref,
     })?;
-    let v_air = crate::runtime::mtlb::extract_air(&v_mtlb)
-        .map_err(|reason| DrawPreparationDecline::VertexAirExtract {
-            function_ref: pd.vertex_func_ref,
-            reason,
-        })?
-        .to_vec();
-    let f_air = crate::runtime::mtlb::extract_air(&f_mtlb)
-        .map_err(|reason| DrawPreparationDecline::FragmentAirExtract {
-            function_ref: pd.fragment_func_ref,
-            reason,
-        })?
-        .to_vec();
-    Ok((v_air, f_air))
+    Ok((v_mtlb, f_mtlb))
 }
 
 /// Resolve type-1 buffer object → guest bytes starting at `offset`.
@@ -1336,12 +1500,23 @@ fn resolve_buffer_backing<M: HostMemory>(
 /// Narrowed on the buffer's own span, so the vertex and index reads that reach
 /// here — none of which a render Store ever writes — do not start paying for a
 /// wait they never owed.
+///
+/// `extent_cap` is the shader's proven reach, exactly as
+/// `try_buffer_zero_copy_resolved` takes it, and it is not optional polish here.
+/// This is where a narrowed bind *lands*: capping the span drops it under the
+/// zero-copy floor, so the rail declines and the bind falls through to this
+/// read. A cap applied only on the rail above therefore converts a whole-window
+/// GPU gather into a whole-window CPU read, which a driven macos-13 boot
+/// measured at 11x the bind cost — `binds_us/chain` 2.79 us -> 31.33 us — for a
+/// rail whose point was to move fewer bytes. Both arms take the cap or neither
+/// does.
 fn read_buffer_bytes_resolved<M: HostMemory>(
     state: &DeviceState,
     host: &M,
     task_id: u32,
     backing: &BufferBacking,
     offset: u64,
+    extent_cap: Option<u64>,
 ) -> Option<Vec<u8>> {
     let (gva, size) = (backing.gva, backing.size);
     if offset >= size {
@@ -1350,9 +1525,25 @@ fn read_buffer_bytes_resolved<M: HostMemory>(
         ));
         return None;
     }
-    let avail = size - offset;
+    // The allocation still bounds the read when the two disagree: a declared
+    // object larger than what is left of the allocation is the shader and the
+    // guest contradicting each other, and only one of them owns these pages.
+    let full = size - offset;
+    let avail = match extent_cap {
+        Some(cap) => full.min(cap),
+        None => full,
+    };
+    if avail < full {
+        crate::runtime::drain::note_store_route("cpu_buffer_extent_narrowed");
+        crate::runtime::drain::note_store_route_n("cpu_buffer_extent_saved_bytes", full - avail);
+    }
     let want = host_alloc_len(avail).filter(|&n| n > 0)?;
     let (read_gva, read_span) = (gva + offset, want as u64);
+    // The one reader that holds `DeviceState` shared and so cannot pay an owed
+    // frame. It reads a *buffer*, which is a different guest allocation from a
+    // type-11 surface — counted rather than argued away; see
+    // `runtime::writeback_debt::note_unpaid_buffer_read`.
+    crate::runtime::writeback_debt::note_unpaid_buffer_read(state);
     let (tasks, page_shift, page_size) = (&state.tasks, state.page_shift, state.page_size());
     crate::runtime::render_writeback::settle_guest_writes_unless_disjoint(
         crate::runtime::render_writeback::SettleSite::BufferGuestRead,
@@ -1393,7 +1584,10 @@ fn load_buffer_bytes<M: HostMemory>(
     offset: u64,
 ) -> Option<Vec<u8>> {
     let backing = resolve_buffer_backing(state, host, task_id, buffer_ref)?;
-    read_buffer_bytes_resolved(state, host, task_id, &backing, offset)
+    // No shader in scope here — these callers read a buffer outside a draw's
+    // bind set, so there is no reflection to bound them and the whole span is
+    // the only answer.
+    read_buffer_bytes_resolved(state, host, task_id, &backing, offset, None)
 }
 
 /// If `texture_ref` is a type-8 object whose descriptor is a buffer-backed
@@ -3841,12 +4035,49 @@ pub(crate) fn publish_surface_store<M: HostMemory + HostOps>(
     );
 }
 
+/// Which of the three chain breaks sent a packet to the recovery rail.
+///
+/// `land_chain_before_abandon`'s doc has always named these three, and each one
+/// emits its own line where it is decided. That was not enough to read a boot:
+/// those lines dedupe per pipeline (`fail_once`) while the recovery does not, so
+/// a driven macOS 26 boot shows 32 recoveries against 10 candidate causes and no
+/// way to pair them. Carrying the cause into the recovery line makes the
+/// expensive event name its own origin, which is the only form of it that
+/// survives `first_sight`.
+///
+/// Ordinal-free on purpose: this is a label, never a wire value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChainAbandonCause {
+    /// An intermediate record encoded `Ok` and returned no colour0, so every
+    /// later draw in the packet would composite against a missing seed.
+    NoColor0,
+    /// The `NoMetal` carrier — this build has no host encode path for the
+    /// record. On the Vulkan arm this is where `executeCommandsInBuffer:` and
+    /// the other Metal-only records land.
+    NoMetal,
+    /// A typed terminal refusal from encode, already named by
+    /// `note_draw_encode_fail`.
+    TerminalRefusal,
+}
+
+impl ChainAbandonCause {
+    /// The `cause=` token. Stable text: it is grepped out of boot logs.
+    pub fn tag(self) -> &'static str {
+        match self {
+            Self::NoColor0 => "no_color0",
+            Self::NoMetal => "no_metal",
+            Self::TerminalRefusal => "terminal_refusal",
+        }
+    }
+}
+
 pub fn writeback_chain_rgba<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     task_id: u32,
     color_slots: &[(u32, crate::runtime::decode::render::ColorAttachment)],
     rgba: &[u8],
+    cause: ChainAbandonCause,
 ) -> bool {
     // This whole function is the recovery rail for an abandoned chain, so a
     // refusal here is the last frame being lost outright. Every arm names
@@ -3858,8 +4089,9 @@ pub fn writeback_chain_rgba<M: HostMemory + HostOps>(
     let lost = |why: &'static str| -> bool {
         crate::runtime::drain::note_store_route("chain_land_refused");
         crate::observe::fail(format!(
-            "writeback_chain_rgba fail reason={why} task={task_id} slots={} bytes={} \
+            "writeback_chain_rgba fail reason={why} cause={} task={task_id} slots={} bytes={} \
              (the abandoned chain's last frame is not landing; guest pages keep stale bytes)",
+            cause.tag(),
             color_slots.len(),
             rgba.len()
         ));
@@ -3881,7 +4113,7 @@ pub fn writeback_chain_rgba<M: HostMemory + HostOps>(
         height: h,
         row_stride: bpr,
         format: fmt,
-    }) = lookup_render_target(state, host, task_id, att.texture_ref)
+    }) = lookup_render_target(state, host, task_id, *att)
     else {
         return lost("render_target_unresolved");
     };
@@ -3919,7 +4151,8 @@ pub fn writeback_chain_rgba<M: HostMemory + HostOps>(
     // Store, and keep the degradation fail-visible.
     crate::observe::fail(format!(
         "writeback_chain_rgba reason=resident_chain_abandoned_cpu_recovery \
-         mid={mapping_id} {w}x{h} fmt={fmt:#x}"
+         cause={} mid={mapping_id} {w}x{h} fmt={fmt:#x}",
+        cause.tag()
     ));
     let wrote = mapping_write::write_rgba8_image_changed(state, host, mapping_id, rgba, None, w, h);
     if wrote {
@@ -3965,7 +4198,7 @@ pub fn color_target_request<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &M,
     task_id: u32,
-    color_texture_ref: u32,
+    color: crate::runtime::decode::render::ColorAttachment,
     pipeline_ref: u32,
     vertex_count: u32,
     instance_count: u32,
@@ -3973,7 +4206,8 @@ pub fn color_target_request<M: HostMemory + HostOps>(
     first_vertex: u32,
     base_instance: u32,
 ) -> Option<DrawEncodeRequest> {
-    let rt = lookup_render_target(state, host, task_id, color_texture_ref)?;
+    let color_texture_ref = color.texture_ref;
+    let rt = lookup_render_target(state, host, task_id, color)?;
     let c0 = ColorRtRequest {
         slot: 0,
         texture_ref: color_texture_ref,
@@ -4041,7 +4275,7 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
             height: mh,
             row_stride: bpr,
             format: mfmt,
-        }) = lookup_render_target(state, host, task_id, att.texture_ref)
+        }) = lookup_render_target(state, host, task_id, att)
         else {
             // One unresolvable color attachment drops the whole pass (Metal
             // would not form the encoder with a null RT).
@@ -4393,6 +4627,107 @@ pub(crate) fn write_gva_rgba8_within<M: HostMemory + HostOps>(
     rgba: &[u8],
     allowed: crate::runtime::gva_view::WindowPages<'_>,
 ) -> Result<(), crate::runtime::host::MemError> {
+    write_gva_rows_within(
+        state,
+        host,
+        task_id,
+        gva,
+        width,
+        height,
+        bpr,
+        format,
+        rgba,
+        SourceRows::Distinct,
+        allowed,
+    )
+}
+
+/// Land a solid colour into a GVA render target.
+///
+/// One tight RGBA8 row is built and handed to the same writer every full-image
+/// landing uses, with [`SourceRows::Repeated`] — so the format conversion runs
+/// once for the whole surface instead of once per row, and the caller never
+/// materialises an image at all.
+///
+/// This is the CLEAR seed's whole path. Everything it lands is `w * h` copies of
+/// one word; the previous route built that word into a full-surface buffer,
+/// re-converted each of its identical rows into the destination format, and
+/// copied them one at a time. `clear_seed_gva_us` measured **118 ms a second for
+/// 175 MB** on the load probe's `blur=40` dial, which is 0.7 GB/s for a copy.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the same target GVA and native row geometry every GVA writer takes"
+)]
+// The CLEAR seed at the head of a draw chain is the only caller, and it is the
+// Vulkan rail's; the Metal rail seeds through its own encoder.
+#[cfg_attr(not(feature = "backend-vulkan"), allow(dead_code))]
+pub(crate) fn write_gva_solid8<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    gva: u64,
+    width: u32,
+    height: u32,
+    bpr: u32,
+    format: u16,
+    clear: &[f64; 4],
+) -> Result<(), crate::runtime::host::MemError> {
+    let row = pixel_format::solid_rgba8(width, 1, clear);
+    write_gva_rows_within(
+        state,
+        host,
+        task_id,
+        gva,
+        width,
+        height,
+        bpr,
+        format,
+        &row,
+        SourceRows::Repeated,
+        None,
+    )
+}
+
+/// Whether the source buffer holds one row per destination row, or a single row
+/// every destination row is a copy of.
+///
+/// The distinction is worth a type because it decides how many *format
+/// conversions* the write performs, and that is the whole cost of a solid
+/// landing: a CLEAR seed converts one 7 KiB row and then converts it again for
+/// every one of a thousand identical rows. Measured on the load probe's
+/// `blur=40` dial, `clear_seed_gva_us` was **118 ms a second for 175 MB** —
+/// 0.7 GB/s, where the copy alone would be an order of magnitude faster.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SourceRows {
+    /// `height` rows of `width` RGBA8 texels, one per destination row.
+    Distinct,
+    /// One row of `width` RGBA8 texels, written to every destination row.
+    ///
+    /// Constructed only by [`write_gva_solid8`], which the Metal rail does not
+    /// reach — the two arms seed a CLEAR through different encoders.
+    #[cfg_attr(not(feature = "backend-vulkan"), allow(dead_code))]
+    Repeated,
+}
+
+/// [`write_gva_rgba8_within`] and [`write_gva_solid8_within`] share this body;
+/// [`SourceRows`] is the only difference between them.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the archive writer mirrors the target GVA and native row geometry"
+)]
+fn write_gva_rows_within<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    gva: u64,
+    width: u32,
+    height: u32,
+    bpr: u32,
+    format: u16,
+    rgba: &[u8],
+    rows: SourceRows,
+    allowed: crate::runtime::gva_view::WindowPages<'_>,
+) -> Result<(), crate::runtime::host::MemError> {
     use crate::runtime::host::MemError;
     if gva == 0 || width == 0 || height == 0 || bpr == 0 {
         return Err(MemError::BadArgs);
@@ -4404,12 +4739,26 @@ pub(crate) fn write_gva_rgba8_within<M: HostMemory + HostOps>(
         return Err(MemError::BadArgs);
     }
     let rgba_row = (width as usize).saturating_mul(RGBA8_BPP as usize);
-    let need = rgba_row.saturating_mul(height as usize);
+    // A repeated source is one row however tall the destination is, which is
+    // also what makes its conversion a one-off below.
+    let src_stride = match rows {
+        SourceRows::Distinct => rgba_row,
+        SourceRows::Repeated => 0,
+    };
+    let need = match rows {
+        SourceRows::Distinct => rgba_row.saturating_mul(height as usize),
+        SourceRows::Repeated => rgba_row,
+    };
     if rgba.len() < need {
         return Err(MemError::BadArgs);
     }
     let span = (height as u64).saturating_mul(bpr as u64);
     let mut row = vec![0u8; tight as usize];
+    // A repeated source converts once and every destination row is that same
+    // conversion; a distinct source converts per row. Tracked rather than
+    // branched on inside the loop so the two forms cannot answer differently
+    // about *which* row is in `row` at any point.
+    let mut converted = false;
     // Guest writes resolve through a fresh PT walk at write time — never a
     // cached view (stale-view heap-corruption class; see
     // `gva_view::write_span_within`) —
@@ -4421,10 +4770,14 @@ pub(crate) fn write_gva_rgba8_within<M: HostMemory + HostOps>(
         let (base, avail) = (span_map.ptr, span_map.avail);
         let mut res = Ok(());
         for y in 0..height as usize {
-            let src = &rgba[y * rgba_row..y * rgba_row + rgba_row];
-            if !pixel_format::convert_rgba8_to_row(format, src, width, &mut row) {
-                res = Err(MemError::BadArgs);
-                break;
+            if !converted || src_stride != 0 {
+                let at = y * src_stride;
+                let src = &rgba[at..at + rgba_row];
+                if !pixel_format::convert_rgba8_to_row(format, src, width, &mut row) {
+                    res = Err(MemError::BadArgs);
+                    break;
+                }
+                converted = true;
             }
             let off = y.saturating_mul(bpr as usize);
             if off + row.len() > avail {
@@ -4441,9 +4794,13 @@ pub(crate) fn write_gva_rgba8_within<M: HostMemory + HostOps>(
     }
     // Fragmented GVA: multi-import each converted row via `write_span_within`.
     for y in 0..height as usize {
-        let src = &rgba[y * rgba_row..y * rgba_row + rgba_row];
-        if !pixel_format::convert_rgba8_to_row(format, src, width, &mut row) {
-            return Err(MemError::BadArgs);
+        if !converted || src_stride != 0 {
+            let at = y * src_stride;
+            let src = &rgba[at..at + rgba_row];
+            if !pixel_format::convert_rgba8_to_row(format, src, width, &mut row) {
+                return Err(MemError::BadArgs);
+            }
+            converted = true;
         }
         let row_gva = gva.saturating_add((y as u64).saturating_mul(bpr as u64));
         if let Err(err) = crate::runtime::gva_view::write_span_within(
@@ -5225,7 +5582,8 @@ mod memo_scratch_tests {
             &mut host,
             1,
             &[],
-            &[1u8; 4]
+            &[1u8; 4],
+            super::ChainAbandonCause::NoMetal,
         ));
         assert_eq!(
             store_route_count("chain_land_refused"),
@@ -5244,8 +5602,67 @@ mod memo_scratch_tests {
             &mut host,
             1,
             &[(0, att)],
-            &[1u8; 4]
+            &[1u8; 4],
+            super::ChainAbandonCause::TerminalRefusal,
         ));
         assert_eq!(store_route_count("chain_land_refused"), n + 1);
+    }
+
+    /// The refusal carries which break abandoned the chain.
+    ///
+    /// Three call sites reach this rail and each already emits its own line
+    /// where it decides — but those dedupe per pipeline and this one does not,
+    /// so a boot with 32 recoveries and 10 candidate causes cannot pair them.
+    /// Reading the line back is the only way to assert the cause survives the
+    /// hop: the tag is formatted into text, and a caller that passed a constant
+    /// would still typecheck.
+    #[test]
+    fn the_chain_recovery_refusal_says_which_break_abandoned_it() {
+        let mut state =
+            crate::model::DeviceState::new(crate::model::DeviceId(1), crate::model::PAGE_SHIFT_X86);
+        let mut host = crate::runtime::host::FakeHost::new();
+
+        let before = std::fs::read_to_string(crate::observe::fail_log_path())
+            .unwrap_or_default()
+            .len();
+        for cause in [
+            super::ChainAbandonCause::NoColor0,
+            super::ChainAbandonCause::NoMetal,
+            super::ChainAbandonCause::TerminalRefusal,
+        ] {
+            assert!(!super::writeback_chain_rgba(
+                &mut state,
+                &mut host,
+                1,
+                &[],
+                &[1u8; 4],
+                cause,
+            ));
+        }
+        let log = std::fs::read_to_string(crate::observe::fail_log_path()).unwrap_or_default();
+        let added = &log[before.min(log.len())..];
+        for cause in [
+            super::ChainAbandonCause::NoColor0,
+            super::ChainAbandonCause::NoMetal,
+            super::ChainAbandonCause::TerminalRefusal,
+        ] {
+            assert!(
+                added.contains(&format!("cause={}", cause.tag())),
+                "the {:?} refusal did not name its cause:\n{added}",
+                cause
+            );
+        }
+        // Three distinct tags, so a boot's recoveries can be banded by origin.
+        let mut tags: Vec<&str> = [
+            super::ChainAbandonCause::NoColor0,
+            super::ChainAbandonCause::NoMetal,
+            super::ChainAbandonCause::TerminalRefusal,
+        ]
+        .iter()
+        .map(|c| c.tag())
+        .collect();
+        tags.sort_unstable();
+        tags.dedup();
+        assert_eq!(tags.len(), 3, "two causes share a tag and cannot be told apart");
     }
 }

@@ -81,31 +81,46 @@ macOS 13 Ventura is the recommended guest release for bring-up.
    Finish install in the guest: enable Remote Login, install your SSH key, turn off sleep/screensaver
    as you like. Host SSH is typically `localhost:2222` → guest `:22` (see `vm/boot-x86.sh`).
 
-4. **Capture the first immutable snapshot.** From a clean guest state (logged in, network/SSH
-   known-good), shut down cleanly while booting in snapshot-capture mode:
+4. **Capture the first immutable snapshot.** Guests are organised into **rails** — one rail per guest
+   OS line (`macos-11` … `macos-26`), each with a snapshot history of its own under
+   `vm/disks/rails/<rail>/snapshots/`. Create the rail's directory, then from a clean guest state
+   (logged in, network/SSH known-good) shut down cleanly while booting in capture mode:
 
    ```bash
-   vm/boot-x86.sh --snapshot --device vmware-svga
-   # clean shutdown from inside the guest → new label under vm/disks/snapshots/
-   # and snapshots/current points at it
+   mkdir -p vm/disks/rails/macos-15
+   vm/boot-x86.sh --rail macos-15 --capture --device vmware-svga
+   # clean shutdown from inside the guest → new label under
+   # vm/disks/rails/macos-15/snapshots/, and that rail's snapshots/current points at it
    ```
 
-   Every later boot clones `snapshots/current` (COW when possible) and **throws the clone away** on
-   exit, so wedges and hard kills never poison the golden image.
+   Every later boot clones the selected rail's `snapshots/current` (COW when possible) and **throws
+   the clone away** on exit, so wedges and hard kills never poison the golden image.
+
+   Importing a guest built elsewhere is the same shape without the boot — drop
+   `{macos.img,OpenCore.qcow2,OVMF_VARS.fd}` (plus `OVMF_CODE.fd` if that guest was installed under
+   a different OVMF build) into `vm/disks/rails/<rail>/snapshots/base/`, `chmod 444` them, and
+   `ln -sfn base vm/disks/rails/<rail>/snapshots/current`. Use `cp --reflink=auto` on btrfs and the
+   import costs no disk.
 
 5. **Day-to-day boots.**
 
    ```bash
+   vm/boot-x86.sh --list-rails                  # what guest lines exist (* = default)
+   vm/boot-x86.sh --rail macos-15 --list-snapshots
+
    # Console only (mainstream OSX-KVM-style VGA) while you debug the host stack
    vm/boot-x86.sh --testing --device vmware-svga
 
    # Product Reims VGPU device (needs in-tree QEMU + reims-vgpu Vulkan)
    REIMS_VGPU_BACKEND=vulkan scripts/qemu-build/qemu-build.sh --target x86_64
-   vm/boot-x86.sh --testing --device reims-vgpu-pci
+   vm/boot-x86.sh --testing --device reims-vgpu-pci --rail macos-15
 
    # Host-window screenshot on the Linux/Plasma host
    scripts/screenshot-when-kde-plasma-host/screenshot-when-kde-plasma-host.sh -o /tmp/screen.png
    ```
+
+   Without `--rail` a boot follows `vm/disks/rails/current`; change it with
+   `ln -sfn <rail> vm/disks/rails/current`. Neither `--rail` nor `--snapshot` repoints anything.
 
 ### arm64 guest on Apple Silicon (HVF / vmapple)
 
@@ -124,8 +139,8 @@ Arm bring-up is **in-tree**: Virtualization.framework via Homebrew **`macosvm`**
 
 3. Configure the guest once: enable Remote Login, run `scripts/vmapple-guest-config/` for no-sleep
    settings, and optionally enable auto-login by hand in System Settings. Capture a golden under
-   `vm/guest/snapshots/` with the snapshot helpers (`scripts/vmapple-snapshot/`, or
-   `vm/boot-arm64.sh --snapshot` once the disk is ready).
+   `vm/guest/rails/<rail>/snapshots/` with the snapshot helpers (`scripts/vmapple-snapshot/`, or
+   `vm/boot-arm64.sh --rail <rail> --capture` once the disk is ready).
 
 4. Boot:
 
@@ -141,7 +156,9 @@ Arm bring-up is **in-tree**: Virtualization.framework via Homebrew **`macosvm`**
 
 - Prefer **`--testing`** for agent/measurement boots (time-bounded, always reverts).
 - Use **`--interactive`** when you need an open-ended GUI session (still reverts unless you are in
-  `--snapshot` capture mode).
+  `--capture` mode).
+- Say which rail a result came from. A number from `macos-11` and a number from `macos-26` are two
+  measurements, not one — that separation is the whole reason snapshots are per-rail.
 - Never commit disks, IPSWs, or OpenCore/OVMF runtime under `vm/`.
 - Device/backend work lives in `crates/reims-vgpu` + the thin shims in `vendor/qemu`; rebuild QEMU after
   product changes before claiming a live boot result.

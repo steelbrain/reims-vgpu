@@ -174,6 +174,17 @@ pub fn capture_present_frame(
     if need == 0 {
         return false;
     }
+    // "These are different pixels", which `generation` cannot say for a lazy
+    // type-11 Store: it leaves the frame in the engine resident and writes no
+    // guest page, so `content_generation` holds still while the pixels move.
+    // Read from the entry here rather than threaded in, because the caller
+    // resolved `generation` from that same entry and a second parameter is a
+    // second chance for the two to name different mappings.
+    let content_epoch = state
+        .mappings
+        .get(&mapping_id)
+        .map(|m| m.surface_content_epoch)
+        .unwrap_or(0);
     state.advance_present_epoch();
     // --- Capture readback elision ---
     // When the previous present's window publish handed the window an engine
@@ -228,6 +239,7 @@ pub fn capture_present_frame(
         state.present.frame_width = width;
         state.present.frame_height = height;
         state.present.frame_generation = generation;
+        state.present.frame_content_epoch = content_epoch;
         state.present.frame_valid = true;
         // First host paint after a present blits +0x188 (mirror the full path).
         state.present.frame_encode_pending = true;
@@ -345,6 +357,7 @@ pub fn capture_present_frame(
     state.present.frame_width = width;
     state.present.frame_height = height;
     state.present.frame_generation = generation;
+    state.present.frame_content_epoch = content_epoch;
     state.present.frame_valid = true;
     // Force the next host paint to blit +0x188. Early pre-boundary paints may
     // have latched painted_mapping/generation (live type-11 paint_mapping or
@@ -890,19 +903,14 @@ fn paint_mapping<M: HostMemory + crate::runtime::host::HostOps>(
     // Narrowed on this mapping's own pages, which unlike every other narrowed
     // site here costs no walk at all: `page_entries` already *is* the page list,
     // and the writeback rail that lands in them built its own destination from
-    // the same field. A mapping with no page list, or one holding an entry that
-    // names no backing, cannot be ruled out and settles.
-    let (mappings, shift) = (&state.mappings, state.page_shift);
-    crate::runtime::render_writeback::settle_guest_writes_unless_disjoint(
+    // the same field — literally, via `DeviceState::mapping_reach_pages`, which
+    // is also what names the write. A mapping with no page list, or one holding
+    // an entry that names no backing, cannot be ruled out and settles.
+    crate::runtime::writeback_debt::settle_for_mapping_unless_disjoint(
+        state,
+        host,
+        mapping_id,
         crate::runtime::render_writeback::SettleSite::ScanoutPaint,
-        || {
-            let m = mappings.get(&mapping_id)?;
-            (!m.page_entries.is_empty()).then_some(())?;
-            m.page_entries
-                .iter()
-                .map(|&e| crate::contract::iosurface_pages::entry_gpa_shift(e, shift))
-                .collect::<Option<Vec<u64>>>()
-        },
     );
 
     let Some(m) = state.mappings.get(&mapping_id) else {

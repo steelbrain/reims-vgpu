@@ -50,6 +50,20 @@ pub enum DrawExecutionDecline {
         resident_bgra: bool,
         draw_bgra: bool,
     },
+    /// A CPU `MTLLoadActionLoad` seed was offered for a colour attachment whose
+    /// texel this device cannot write a seed as.
+    ///
+    /// The seed is eight bits per channel and a buffer→image copy converts
+    /// nothing, so it has to be restated as the attachment's own texels before
+    /// it is staged. `pixel_format::expand_rgba8_to_texel` names the layouts
+    /// that can be, and this is the refusal for one that cannot — a wiring
+    /// error rather than a guest condition, since a render target is only ever
+    /// created at a layout that rail covers.
+    ///
+    /// Refused rather than staged short: staging an RGBA8 seed under a wider
+    /// attachment reads past the slot and seeds the frame with whatever the
+    /// pool put after it.
+    SeedFormatUnwritable { format: ash::vk::Format },
     SampledResidentMissing {
         binding: u32,
         identity: TargetIdentity,
@@ -135,6 +149,7 @@ impl Decline for DrawExecutionDecline {
             Self::SeedResidentNotReady { .. } => "vk_draw_exec_seed_resident_not_ready",
             Self::SeedGeometryMismatch { .. } => "vk_draw_exec_seed_geometry_mismatch",
             Self::SeedFormatMismatch { .. } => "vk_draw_exec_seed_format_mismatch",
+            Self::SeedFormatUnwritable { .. } => "vk_draw_exec_seed_format_unwritable",
             Self::SampledResidentMissing { .. } => "vk_draw_exec_sampled_resident_missing",
             Self::SampledResidentNotReady { .. } => "vk_draw_exec_sampled_resident_not_ready",
             Self::SampledResidentGeometryMismatch { .. } => {
@@ -192,6 +207,9 @@ impl Decline for DrawExecutionDecline {
                     ("draw_bgra", draw_bgra.to_string()),
                 ]);
                 fields
+            }
+            Self::SeedFormatUnwritable { format } => {
+                vec![("format", format!("{format:?}"))]
             }
             Self::SampledResidentMissing {
                 binding,
@@ -252,12 +270,18 @@ pub(super) fn identity_fields(identity: &TargetIdentity) -> Vec<(&'static str, S
             width,
             height,
             generation,
+            format,
         } => vec![
             ("identity_kind", "surface".into()),
             ("identity_id", id.to_string()),
             ("identity_width", width.to_string()),
             ("identity_height", height.to_string()),
             ("identity_generation", generation.to_string()),
+            // Part of the key here for the same reason it is in the `Gva` arm
+            // below: one mapping that redeclares its plane's format is two
+            // slots, and a decline naming only the mapping id could not say
+            // which of them refused.
+            ("identity_format", format!("{format:?}")),
         ],
         TargetIdentity::Texture {
             ref_,
@@ -278,7 +302,7 @@ pub(super) fn identity_fields(identity: &TargetIdentity) -> Vec<(&'static str, S
             width,
             height,
             generation,
-            bgra,
+            format,
         } => vec![
             ("identity_kind", "gva".into()),
             ("identity_gva", format!("{gva:#x}")),
@@ -286,8 +310,11 @@ pub(super) fn identity_fields(identity: &TargetIdentity) -> Vec<(&'static str, S
             ("identity_height", height.to_string()),
             ("identity_generation", generation.to_string()),
             // Part of the key, so two slots at one address differ by it and a
-            // decline naming only the address would not say which.
-            ("identity_order", if *bgra { "bgra" } else { "rgba" }.into()),
+            // decline naming only the address would not say which. Named as the
+            // format rather than as a channel order, because two formats
+            // sharing an order — eight-bit RGBA and half-float RGBA — are two
+            // slots an order alone would print identically.
+            ("identity_format", format!("{format:?}")),
         ],
         TargetIdentity::Anonymous { slot } => vec![
             ("identity_kind", "anonymous".into()),
@@ -308,6 +335,7 @@ mod tests {
             width: 64,
             height: 32,
             generation: 9,
+            format: crate::backend::vulkan::translate::pixel::SCANOUT_FORMAT,
         }
     }
 
@@ -416,6 +444,7 @@ mod tests {
                     width: 80,
                     height: 60,
                     generation: 11,
+                    format: crate::backend::vulkan::translate::pixel::SCANOUT_FORMAT,
                 },
                 "surface",
                 ("identity_id", "7"),
@@ -437,7 +466,7 @@ mod tests {
                     width: 80,
                     height: 60,
                     generation: 11,
-                    bgra: false,
+                    format: crate::backend::vulkan::translate::pixel::RESIDENT_RGBA_FORMAT,
                 },
                 "gva",
                 ("identity_gva", "0x1234"),

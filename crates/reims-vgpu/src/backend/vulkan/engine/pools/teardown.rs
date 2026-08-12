@@ -16,6 +16,7 @@ impl ResourcePools {
         // to cmd_pool (destroyed below) and its dsets to desc_pool; the
         // accumulated transients are already in the live lists.
         self.open_batch = None;
+        self.forget_pass_echo();
         // Best-effort quiesce: wait every in-flight fence so no CB references
         // what we are about to destroy. On device loss the waits fail — the
         // teardown proceeds regardless, matching the recreate path.
@@ -70,12 +71,6 @@ impl ResourcePools {
             release_buffer_slot(device, &mut self.slabs, s);
         }
         for s in self.readback_multi_live.drain(..) {
-            release_buffer_slot(device, &mut self.slabs, s);
-        }
-        // Device-local and never mapped, so nothing can be mid-read through it
-        // the way a leased readback can: the only reader is the GPU, and the
-        // wait above has already retired every submission that named it.
-        if let Some(s) = self.guest_scratch.take() {
             release_buffer_slot(device, &mut self.slabs, s);
         }
         // Leased slots are the one class here whose memory a live borrow may
@@ -172,6 +167,19 @@ impl ResourcePools {
             device.destroy_fence(slot.fence, None);
         }
         self.cur = 0;
+        // After the fences above, so nothing submitted can still name it, and
+        // before the arena because its sets were allocated against this layout.
+        // Freed before the arena that owns their blocks. Anything still here was
+        // never submitted, or its fence has already retired above.
+        let mut owed = std::mem::take(&mut self.scatter_dsets);
+        // The recycle list holds only sets from entries whose fence retired,
+        // which is the same "nothing can still name it" state this relies on.
+        owed.append(&mut self.scatter_dset_free);
+        self.desc_arena.free(device, &owed);
+        if let Some(scatter) = self.scatter.take() {
+            scatter.destroy(device);
+        }
+        self.scatter_refused = false;
         self.desc_arena.destroy(device);
         if self.cmd_pool != vk::CommandPool::null() {
             device.destroy_command_pool(self.cmd_pool, None);

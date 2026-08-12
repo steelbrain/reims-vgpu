@@ -70,14 +70,29 @@
 //! reference. Anyone weighing the rekey should read `bound_buffers` levels from
 //! a driven boot rather than this paragraph.
 //!
+//! # Why the key also carries the shader's extent cap
+//!
+//! The three fields above all describe the *bind*. The fourth describes the
+//! **shader**: how far reflection proved this draw's shader can read into the
+//! buffer, which is what lets the resolution cover less than the rest of the
+//! allocation. A resolution walked under a narrow cap covers fewer bytes than a
+//! shader with a wider one needs, and serving it across would hand the GPU a
+//! short buffer — wrong pixels, no error. So the cap is part of the identity of
+//! the resolution rather than a property of it, and [`Key`] says the rest.
+//!
 //! # No capacity
 //!
 //! There is no cap and no eviction. The population is one entry per live
-//! `(task, reference, offset)` a draw has actually bound, which the guest bounds
-//! by its own working set, and every entry leaves through one of the retirement
-//! rules above or through [`BoundBuffers::clear`] at device reset. A capacity
-//! here would be a second, invisible reason for a resolution to disappear, and
-//! the miss it caused would read as a mapping change that never happened.
+//! `(task, reference, offset, extent cap)` a draw has actually bound, which the
+//! guest bounds by its own working set, and every entry leaves through one of
+//! the retirement rules above or through [`BoundBuffers::clear`] at device
+//! reset. A capacity here would be a second, invisible reason for a resolution
+//! to disappear, and the miss it caused would read as a mapping change that
+//! never happened.
+//!
+//! The extent cap widens that population only where two shaders declare
+//! different extents over one bind; the retirement rules are all keyed on task
+//! and reference and so are indifferent to it.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -118,8 +133,28 @@ impl BoundBuffer {
     }
 }
 
-/// `(task, reference, offset)` — see the module doc on why the offset is here.
-type Key = (u32, u32, u64);
+/// `(task, reference, offset, extent cap)` — see the module doc on why the
+/// offset is here.
+///
+/// The cap is in the key because it is not a property of the bind: it is what
+/// the *shader on this draw* proved about how far it can read
+/// ([`crate::runtime::spirv_bind::reflected_buffer_extent`]). Two shaders may
+/// bind one allocation at one offset and declare different extents, and a
+/// resolution walked for the narrower one covers fewer bytes than the wider one
+/// needs. Keyed without the cap, that resolution would be handed to the wider
+/// shader as a hit and the GPU would read a short buffer — no error, wrong
+/// pixels. Keyed with it, the two coexist and each pays its own walk.
+///
+/// `None` — the uncapped whole-allocation resolution — is a distinct key from
+/// any capped one, which is what keeps the pre-existing behaviour reachable and
+/// unchanged for every bind reflection does not bound.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct Key {
+    task: u32,
+    buffer_ref: u32,
+    offset: u64,
+    cap: Option<u64>,
+}
 
 /// What [`BoundBuffers::shape`] measures. Levels, not per-interval counts.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -181,13 +216,39 @@ pub struct BoundBuffers {
 
 impl BoundBuffers {
     /// The resolution for this bind, if one is held.
-    pub fn get(&self, task_id: u32, buffer_ref: u32, offset: u64) -> Option<&BoundBuffer> {
-        self.held.get(&(task_id, buffer_ref, offset))
+    pub fn get(
+        &self,
+        task_id: u32,
+        buffer_ref: u32,
+        offset: u64,
+        cap: Option<u64>,
+    ) -> Option<&BoundBuffer> {
+        self.held.get(&Key {
+            task: task_id,
+            buffer_ref,
+            offset,
+            cap,
+        })
     }
 
     /// Hold a freshly walked resolution.
-    pub fn insert(&mut self, task_id: u32, buffer_ref: u32, offset: u64, bound: BoundBuffer) {
-        self.held.insert((task_id, buffer_ref, offset), bound);
+    pub fn insert(
+        &mut self,
+        task_id: u32,
+        buffer_ref: u32,
+        offset: u64,
+        cap: Option<u64>,
+        bound: BoundBuffer,
+    ) {
+        self.held.insert(
+            Key {
+                task: task_id,
+                buffer_ref,
+                offset,
+                cap,
+            },
+            bound,
+        );
     }
 
     /// Drop everything held for one task.
@@ -197,7 +258,7 @@ impl BoundBuffers {
     /// different bytes, and which references is not knowable from the packet.
     pub fn retire_task(&mut self, task_id: u32) -> usize {
         let before = self.held.len();
-        self.held.retain(|(t, _, _), _| *t != task_id);
+        self.held.retain(|k, _| k.task != task_id);
         before - self.held.len()
     }
 
@@ -229,7 +290,7 @@ impl BoundBuffers {
     pub fn retire_ref(&mut self, task_id: u32, buffer_ref: u32) -> usize {
         let before = self.held.len();
         self.held
-            .retain(|(t, r, _), _| *t != task_id || *r != buffer_ref);
+            .retain(|k, _| k.task != task_id || k.buffer_ref != buffer_ref);
         before - self.held.len()
     }
 
@@ -239,7 +300,7 @@ impl BoundBuffers {
     pub fn retire_range(&mut self, task_id: u32, gva: u64, len: u64) -> usize {
         let before = self.held.len();
         self.held
-            .retain(|(t, _, _), b| *t != task_id || !b.overlaps(gva, len));
+            .retain(|k, b| k.task != task_id || !b.overlaps(gva, len));
         before - self.held.len()
     }
 
@@ -272,8 +333,8 @@ impl BoundBuffers {
     /// the guest's live working set rather than anything unbounded.
     pub fn shape(&self) -> RegistryShape {
         let mut per_pair: HashMap<(u32, u32), u32> = HashMap::new();
-        for (task, buffer_ref, _) in self.held.keys() {
-            *per_pair.entry((*task, *buffer_ref)).or_default() += 1;
+        for k in self.held.keys() {
+            *per_pair.entry((k.task, k.buffer_ref)).or_default() += 1;
         }
         RegistryShape {
             entries: self.held.len(),
@@ -307,11 +368,49 @@ mod tests {
     #[test]
     fn a_resolution_is_found_only_by_its_own_key() {
         let mut b = BoundBuffers::default();
-        b.insert(7, 3, 0, bound(0x1000, 0x2000));
-        assert!(b.get(7, 3, 0).is_some());
-        assert!(b.get(7, 3, 0x100).is_none(), "a different offset");
-        assert!(b.get(7, 4, 0).is_none(), "a different reference");
-        assert!(b.get(8, 3, 0).is_none(), "a different task");
+        b.insert(7, 3, 0, None, bound(0x1000, 0x2000));
+        assert!(b.get(7, 3, 0, None).is_some());
+        assert!(b.get(7, 3, 0x100, None).is_none(), "a different offset");
+        assert!(b.get(7, 4, 0, None).is_none(), "a different reference");
+        assert!(b.get(8, 3, 0, None).is_none(), "a different task");
+    }
+
+    /// A resolution walked under one shader's extent cap is never served to a
+    /// shader that proved a different one.
+    ///
+    /// This is the corruption guard for the narrowing rail, and it fails in the
+    /// direction that has no other alarm: a 64-byte resolution handed to a
+    /// shader entitled to 4096 does not error, it reads whatever the GPU finds
+    /// past the end of a short buffer and draws it. The uncapped entry is a
+    /// fourth distinct key rather than a wildcard, so a bind reflection could
+    /// not bound never picks up a neighbour's narrowing either.
+    #[test]
+    fn a_resolution_is_never_served_across_a_different_extent_cap() {
+        let mut b = BoundBuffers::default();
+        b.insert(1, 1, 0, Some(64), bound(0x1000, 64));
+
+        assert!(b.get(1, 1, 0, Some(64)).is_some(), "its own cap");
+        assert!(
+            b.get(1, 1, 0, Some(4096)).is_none(),
+            "a shader entitled to more must not get the 64-byte walk"
+        );
+        assert!(
+            b.get(1, 1, 0, None).is_none(),
+            "an unbounded bind must not get a capped walk"
+        );
+
+        // The three coexist rather than evicting one another, so neither shader
+        // re-walks on every draw because the other one ran in between.
+        b.insert(1, 1, 0, Some(4096), bound(0x1000, 4096));
+        b.insert(1, 1, 0, None, bound(0x1000, 0x10000));
+        assert_eq!(b.len(), 3);
+        assert_eq!(b.get(1, 1, 0, Some(64)).map(|r| r.span), Some(64));
+        assert_eq!(b.get(1, 1, 0, Some(4096)).map(|r| r.span), Some(4096));
+        assert_eq!(b.get(1, 1, 0, None).map(|r| r.span), Some(0x10000));
+
+        // A retirement is keyed on task and reference, so it takes all three.
+        assert_eq!(b.retire_ref(1, 1), 3);
+        assert!(b.is_empty());
     }
 
     /// A map/unmap notify retires exactly the resolutions whose bytes moved,
@@ -319,11 +418,11 @@ mod tests {
     #[test]
     fn a_range_retire_takes_the_overlapping_resolutions_only() {
         let mut b = BoundBuffers::default();
-        b.insert(1, 1, 0, bound(0x1000, 0x1000)); // [0x1000,0x2000)
-        b.insert(1, 2, 0, bound(0x2000, 0x1000)); // [0x2000,0x3000)
-        b.insert(1, 3, 0, bound(0x9000, 0x1000)); // far away
+        b.insert(1, 1, 0, None, bound(0x1000, 0x1000)); // [0x1000,0x2000)
+        b.insert(1, 2, 0, None, bound(0x2000, 0x1000)); // [0x2000,0x3000)
+        b.insert(1, 3, 0, None, bound(0x9000, 0x1000)); // far away
         assert_eq!(b.retire_range(1, 0x1800, 0x1000), 2, "spans the first two");
-        assert!(b.get(1, 3, 0).is_some(), "the far one survives");
+        assert!(b.get(1, 3, 0, None).is_some(), "the far one survives");
         assert_eq!(b.len(), 1);
     }
 
@@ -332,10 +431,10 @@ mod tests {
     #[test]
     fn a_range_retire_does_not_cross_tasks() {
         let mut b = BoundBuffers::default();
-        b.insert(1, 1, 0, bound(0x1000, 0x1000));
-        b.insert(2, 1, 0, bound(0x1000, 0x1000));
+        b.insert(1, 1, 0, None, bound(0x1000, 0x1000));
+        b.insert(2, 1, 0, None, bound(0x1000, 0x1000));
         assert_eq!(b.retire_range(1, 0x1000, 0x1000), 1);
-        assert!(b.get(2, 1, 0).is_some());
+        assert!(b.get(2, 1, 0, None).is_some());
     }
 
     /// A zero-length notify names no bytes and must retire nothing — otherwise
@@ -343,7 +442,7 @@ mod tests {
     #[test]
     fn a_zero_length_range_retires_nothing() {
         let mut b = BoundBuffers::default();
-        b.insert(1, 1, 0, bound(0x1000, 0x1000));
+        b.insert(1, 1, 0, None, bound(0x1000, 0x1000));
         assert_eq!(b.retire_range(1, 0x1000, 0), 0);
         assert_eq!(b.len(), 1);
     }
@@ -353,7 +452,7 @@ mod tests {
     #[test]
     fn abutting_ranges_do_not_overlap() {
         let mut b = BoundBuffers::default();
-        b.insert(1, 1, 0, bound(0x1000, 0x1000)); // [0x1000,0x2000)
+        b.insert(1, 1, 0, None, bound(0x1000, 0x1000)); // [0x1000,0x2000)
         assert_eq!(b.retire_range(1, 0x2000, 0x1000), 0, "starts where it ends");
         assert_eq!(b.retire_range(1, 0x0000, 0x1000), 0, "ends where it starts");
         assert_eq!(b.len(), 1);
@@ -371,19 +470,19 @@ mod tests {
     fn a_reference_retire_takes_every_offset_of_that_reference_only() {
         let mut b = BoundBuffers::default();
         for off in [0u64, 0x400, 0x1000, 0x9000] {
-            b.insert(1, 7, off, bound(0x1000 + off, 0x400));
+            b.insert(1, 7, off, None, bound(0x1000 + off, 0x400));
         }
         // A neighbouring reference on the same task, and the same reference
         // under another task: neither is named by this packet.
-        b.insert(1, 8, 0, bound(0x8000, 0x400));
-        b.insert(2, 7, 0, bound(0x1000, 0x400));
+        b.insert(1, 8, 0, None, bound(0x8000, 0x400));
+        b.insert(2, 7, 0, None, bound(0x1000, 0x400));
         assert_eq!(b.len(), 6);
 
         assert_eq!(b.retire_ref(1, 7), 4, "every offset of reference 7");
-        assert!(b.get(1, 7, 0).is_none());
-        assert!(b.get(1, 7, 0x9000).is_none());
-        assert!(b.get(1, 8, 0).is_some(), "a sibling reference survives");
-        assert!(b.get(2, 7, 0).is_some(), "another task's survives");
+        assert!(b.get(1, 7, 0, None).is_none());
+        assert!(b.get(1, 7, 0x9000, None).is_none());
+        assert!(b.get(1, 8, 0, None).is_some(), "a sibling reference survives");
+        assert!(b.get(2, 7, 0, None).is_some(), "another task's survives");
         assert_eq!(b.len(), 2);
 
         // A reference nothing is held for is not an error, and takes nothing.
@@ -402,22 +501,22 @@ mod tests {
         assert_eq!(b.shape(), RegistryShape::default(), "empty");
 
         // One reference at one offset each: the two keys would agree.
-        b.insert(1, 1, 0, bound(0x1000, 0x1000));
-        b.insert(1, 2, 0, bound(0x2000, 0x1000));
+        b.insert(1, 1, 0, None, bound(0x1000, 0x1000));
+        b.insert(1, 2, 0, None, bound(0x2000, 0x1000));
         let s = b.shape();
         assert_eq!((s.entries, s.pairs), (2, 2));
         assert_eq!((s.multi_offset_pairs, s.max_offsets), (0, 1));
 
         // The same reference at a second offset is a second entry and not a
         // second pair — exactly the divergence from Apple's key.
-        b.insert(1, 1, 0x400, bound(0x1400, 0x400));
+        b.insert(1, 1, 0x400, None, bound(0x1400, 0x400));
         let s = b.shape();
         assert_eq!((s.entries, s.pairs), (3, 2), "one pair now holds two");
         assert_eq!((s.multi_offset_pairs, s.max_offsets), (1, 2));
 
         // The same reference under another task is a different pair, because a
         // GVA has no meaning apart from the table it resolves against.
-        b.insert(2, 1, 0, bound(0x1000, 0x1000));
+        b.insert(2, 1, 0, None, bound(0x1000, 0x1000));
         let s = b.shape();
         assert_eq!((s.entries, s.pairs), (4, 3));
         assert_eq!(s.multi_offset_pairs, 1);
@@ -428,11 +527,11 @@ mod tests {
     #[test]
     fn a_task_retire_takes_the_whole_task() {
         let mut b = BoundBuffers::default();
-        b.insert(1, 1, 0, bound(0x1000, 0x1000));
-        b.insert(1, 2, 0x40, bound(0x8000, 0x1000));
-        b.insert(2, 1, 0, bound(0x1000, 0x1000));
+        b.insert(1, 1, 0, None, bound(0x1000, 0x1000));
+        b.insert(1, 2, 0x40, None, bound(0x8000, 0x1000));
+        b.insert(2, 1, 0, None, bound(0x1000, 0x1000));
         assert_eq!(b.retire_task(1), 2);
         assert_eq!(b.len(), 1);
-        assert!(b.get(2, 1, 0).is_some());
+        assert!(b.get(2, 1, 0, None).is_some());
     }
 }

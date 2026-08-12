@@ -168,6 +168,23 @@ pub struct HostPointerCaps {
     /// assumed to be 4096: MoltenVK reports Apple's page size, and a Linux
     /// driver may report more than either.
     pub min_alignment: u64,
+    /// The largest `VkMemoryHeap::size` this device reports, which is the
+    /// ceiling on any single import it could hold.
+    ///
+    /// An import is a `VkDeviceMemory` and every `VkDeviceMemory` is charged to
+    /// one heap, so an import longer than the roomiest heap on the device cannot
+    /// be resident in any of them — whatever memory type the pointer turns out
+    /// to accept. That is a statement about the device alone, which is why it is
+    /// answerable here with no pointer in hand.
+    ///
+    /// The roomiest heap and not the one an import would land on: the memory
+    /// type is a property of the *pointer* and is resolved per RAMBlock at
+    /// import time. Taking the maximum makes this the widest true bound, so it
+    /// refuses only what no heap could have held.
+    ///
+    /// Zero on every rung but [`HostPointerImport::Supported`], where no import
+    /// may be made at all.
+    pub heap_budget: u64,
 }
 
 impl HostPointerCaps {
@@ -176,6 +193,7 @@ impl HostPointerCaps {
         Self {
             rung,
             min_alignment: 0,
+            heap_budget: 0,
         }
     }
 
@@ -262,14 +280,27 @@ pub unsafe fn query(
         return HostPointerCaps::refused(HostPointerImport::AlignmentUnsatisfiable);
     }
 
+    // Core since Vulkan 1.0 and needs no extension, which is why the bound is
+    // taken from heap sizes rather than from `VK_EXT_memory_budget`: a heap's
+    // size is what no allocation charged to it can exceed on any host, and a
+    // budget is a second, optional answer that would leave hosts without the
+    // extension unbounded.
+    let props = unsafe { instance.get_physical_device_memory_properties(pd) };
+    let heap_budget = props.memory_heaps[..props.memory_heap_count as usize]
+        .iter()
+        .map(|h| h.size)
+        .max()
+        .unwrap_or(0);
+
     HostPointerCaps {
         rung: HostPointerImport::Supported,
         min_alignment,
+        heap_budget,
     }
 }
 
-/// Which memory type an import of `host_ptr` must use, or `None` when the
-/// device accepts none that also meet `req`.
+/// Which memory type an import of `bytes` at `host_ptr` must use, or `None` when
+/// the device accepts none that also meet `req`.
 ///
 /// `vkGetMemoryHostPointerPropertiesEXT` answers with a `memoryTypeBits` mask
 /// that is a property of the *pointer*, not of the device, so it cannot be
@@ -277,6 +308,11 @@ pub unsafe fn query(
 /// [`super::memory_topology::select_memory_type`] rather than being ranked here:
 /// a second selection site is a second policy, and the two would diverge on the
 /// first host where the ranking mattered.
+///
+/// `bytes` is the whole RAMBlock, and it is the parameter that keeps a
+/// multi-gigabyte import out of a small device-local carve-out — see
+/// [`super::memory_topology::select_memory_type`] for why an imported pointer's
+/// memory type is an accounting choice rather than a placement one.
 ///
 /// # Safety
 ///
@@ -289,7 +325,8 @@ pub unsafe fn import_memory_type(
     memory_props: &vk::PhysicalDeviceMemoryProperties,
     host_ptr: *const std::ffi::c_void,
     req: &super::memory_topology::MemoryRequest,
-) -> Option<u32> {
+    bytes: u64,
+) -> Option<super::memory_topology::MemoryTypePick> {
     let mut ptr_props = vk::MemoryHostPointerPropertiesEXT::default();
     // `ash` 0.38 wraps this extension as raw function pointers only, so the
     // call goes through `fp()` rather than a checked method.
@@ -308,7 +345,7 @@ pub unsafe fn import_memory_type(
     if rc != vk::Result::SUCCESS {
         return None;
     }
-    super::memory_topology::select_memory_type(memory_props, ptr_props.memory_type_bits, req)
+    super::memory_topology::select_memory_type(memory_props, ptr_props.memory_type_bits, req, bytes)
 }
 
 #[cfg(test)]

@@ -28,6 +28,28 @@ use crate::observe::Decline;
 /// A request the engine understood and declined.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DrawReason {
+    /// A validator rejected the SPIR-V module this device assembled, so it was
+    /// never handed to the driver.
+    ///
+    /// The validator's prose lives in the `spirv_validate` fail line rather
+    /// than in this variant, which is `Copy` and compared by value at every
+    /// cache. Unlike its neighbours this is not a capability refusal — it is
+    /// this device declining to risk the process on undefined behaviour inside
+    /// a driver, and it costs the guest the whole dispatch.
+    SpirvInvalid,
+    /// A previous process died inside the driver call this request would make,
+    /// with these exact modules, so this device will not make it again.
+    ///
+    /// Distinct from [`Self::SpirvInvalid`] in what it knows: that one is a
+    /// module a validator said was malformed, this one is a module a validator
+    /// accepted and a driver could not survive. Nothing about the module says
+    /// so — the evidence is a breadcrumb the dead process left on disk. See
+    /// `driver_breadcrumb::quarantine` for why that is the only admissible
+    /// input and how to clear it.
+    ///
+    /// Fieldless because the variant is `Copy` and compared by value at every
+    /// negative cache; the key and the call's description ride the fail line.
+    DriverCallQuarantined,
     /// A resident target bound as a sampled image must be a plain 2D image;
     /// arrayed and volume residents have no bind path.
     ResidentSampledNot2d { binding: u32 },
@@ -62,10 +84,6 @@ pub enum DrawReason {
     GuestRunSampledNot2d { binding: u32 },
     /// More MRT secondary attachments than the render pass can carry.
     SecondaryAttachmentCap { requested: usize, cap: usize },
-    /// A depth test combined with MRT secondaries — the depth attachment is
-    /// appended after the secondaries and the two paths have not been proven
-    /// together.
-    DepthWithSecondaryAttachments,
     /// The device does not advertise `samplerAnisotropy` and the guest sampler
     /// asked for it.
     SamplerAnisotropyUnsupported,
@@ -149,8 +167,6 @@ pub enum DrawReason {
     NoDeviceLocalMemoryForMrtSecondary { memory_type_bits: u32 },
     /// No device-local memory type for a depth attachment image.
     NoDeviceLocalMemoryForDepth { memory_type_bits: u32 },
-    /// No device-local memory type for the guest writeback's detiling scratch.
-    NoDeviceLocalMemoryForGuestScratch { memory_type_bits: u32 },
     /// No device-local memory type for a draw-time guest gather destination.
     NoDeviceLocalMemoryForGuestGather { memory_type_bits: u32 },
     /// `VK_KHR_swapchain` is not enabled on the engine device.
@@ -171,12 +187,13 @@ impl crate::observe::Decline for DrawReason {
     /// check, never shared.
     fn slug(&self) -> &'static str {
         match self {
+            Self::SpirvInvalid => "spirv_module_invalid",
+            Self::DriverCallQuarantined => "driver_call_quarantined",
             Self::ResidentSampledNot2d { .. } => "resident_sampled_not_2d",
             Self::GuestRunSampledNot2d { .. } => "guest_run_sampled_not_2d",
             Self::SecondaryAttachmentCap { .. } => "secondary_attachment_cap",
             Self::ViewportSlotsUnsupported { .. } => "viewport_slots_unsupported",
             Self::VisibilityCountingUnsupported { .. } => "visibility_counting_unsupported",
-            Self::DepthWithSecondaryAttachments => "depth_with_secondary_attachments",
             Self::SamplerAnisotropyUnsupported => "sampler_anisotropy_unsupported",
             Self::SamplerMirrorClampToEdgeUnsupported => "sampler_mirror_clamp_to_edge_unsupported",
             Self::DualSourceBlendUnsupported => "dual_source_blend_unsupported",
@@ -201,9 +218,6 @@ impl crate::observe::Decline for DrawReason {
                 "no_device_local_memory_for_mrt_secondary"
             }
             Self::NoDeviceLocalMemoryForDepth { .. } => "no_device_local_memory_for_depth",
-            Self::NoDeviceLocalMemoryForGuestScratch { .. } => {
-                "no_device_local_memory_for_guest_scratch"
-            }
             Self::NoDeviceLocalMemoryForGuestGather { .. } => {
                 "no_device_local_memory_for_guest_gather"
             }
@@ -259,7 +273,6 @@ impl std::fmt::Display for DrawReason {
             | Self::NoDeviceLocalMemoryForSlab { memory_type_bits }
             | Self::NoDeviceLocalMemoryForMrtSecondary { memory_type_bits }
             | Self::NoDeviceLocalMemoryForDepth { memory_type_bits }
-            | Self::NoDeviceLocalMemoryForGuestScratch { memory_type_bits }
             | Self::NoDeviceLocalMemoryForGuestGather { memory_type_bits } => {
                 write!(f, " memory_type_bits={memory_type_bits:#x}")
             }
@@ -292,6 +305,20 @@ pub enum TargetReadDecline {
     UnknownIdentity,
     /// The readback's resident has never had content written.
     NoReadyContent,
+    /// The readback's resident does not hold four-byte texels.
+    ///
+    /// Every consumer of a [`super::TargetReadback`] speaks RGBA8 —
+    /// `into_rgba8` exchanges channels in `chunks_exact_mut(4)`, and the CPU
+    /// Store rail converts from RGBA8 a row at a time — and the readback buffer
+    /// is sized `w * h * 4` for the same reason. A wider resident delivered
+    /// through here would be read as the wrong texel with nothing to say so.
+    ///
+    /// A refusal rather than a conversion, because these rails are the
+    /// *fallback* for a target whose frame the GPU could not write into guest
+    /// pages directly. A resident wide enough to trip this is one the direct
+    /// rail handles, so the honest answer is to name the gap rather than to
+    /// narrow the frame on the way through it.
+    TexelNotFourBytes { format: ash::vk::Format },
 }
 
 impl Decline for TargetReadDecline {
@@ -299,6 +326,14 @@ impl Decline for TargetReadDecline {
         match self {
             Self::UnknownIdentity => "read_target_unknown_identity",
             Self::NoReadyContent => "read_target_no_ready_content",
+            Self::TexelNotFourBytes { .. } => "read_target_texel_not_four_bytes",
+        }
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        match self {
+            Self::UnknownIdentity | Self::NoReadyContent => Vec::new(),
+            Self::TexelNotFourBytes { format } => vec![("format", format!("{format:?}"))],
         }
     }
 }
@@ -329,7 +364,6 @@ mod tests {
             occlusion_query_precise: false,
         },
         DrawReason::VisibilityResultMode(TranslateReason::UnknownVisibilityResultMode(0)),
-        DrawReason::DepthWithSecondaryAttachments,
         DrawReason::SamplerAnisotropyUnsupported,
         DrawReason::SamplerMirrorClampToEdgeUnsupported,
         DrawReason::ConstantVertexAttribute,

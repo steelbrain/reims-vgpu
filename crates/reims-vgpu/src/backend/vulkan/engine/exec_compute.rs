@@ -209,6 +209,41 @@ fn resident_sample_exact(
     Ok(())
 }
 
+/// The lowest `set = 0` binding the module statically uses and `layout` does not
+/// describe, if there is one.
+///
+/// This is the one descriptor-layout defect that cannot be reported from any
+/// later point, which is why it is checked before the layout is built rather
+/// than inferred from a result code afterwards. Vulkan requires the pipeline
+/// layout to contain a descriptor for every resource the shader statically uses.
+/// Mesa's Intel driver sizes its own binding array to `max_binding + 1`,
+/// zero-fills every number the layout did not declare, and then scores each used
+/// binding as `(use_count << 7) / array_size` when it picks binding-table slots.
+/// A binding the module uses and the layout omits therefore divides by zero:
+/// `vkCreateComputePipelines` does not return an error, the host process dies of
+/// `SIGFPE` inside it, and the VM goes with it. There is no validation layer in
+/// this tree and no status to inspect, so refusing the dispatch here is the only
+/// outcome left that keeps the device alive and says why.
+///
+/// **Expected to return `None` always.** The two repairable classes are filled
+/// before the request is built — `runtime::compute_exec` provisions a neutral
+/// sampler and a neutral sampled image for every binding of those classes the
+/// guest left empty — so this is the backstop for a class those passes do not
+/// cover, and a firing names a real gap rather than noise.
+///
+/// [`crate::runtime::spirv_bind::descriptor_static_use`] answers `NotDeclared`
+/// for anything that is not a `UniformConstant` descriptor, so a storage buffer,
+/// whose root this walk cannot resolve, is never refused on a guess.
+fn used_binding_absent_from_layout(spirv: &[u32], layout: &[BindingSig]) -> Option<u32> {
+    crate::runtime::spirv_bind::declared_binding_numbers(spirv)
+        .into_iter()
+        .find(|binding| {
+            !layout.iter().any(|b| b.binding == *binding)
+                && crate::runtime::spirv_bind::descriptor_static_use(spirv, *binding)
+                    .is_violation()
+        })
+}
+
 pub(crate) unsafe fn execute_compute_inner(
     owner: &mut ContextOwner,
     caches: &mut ObjectCaches,
@@ -264,6 +299,13 @@ pub(crate) unsafe fn execute_compute_inner(
         });
     }
     layout_bindings.sort_by_key(|b| b.binding);
+
+    if let Some(binding) = used_binding_absent_from_layout(&req.spirv, &layout_bindings) {
+        return Err(DrawError::ComputeExecution(
+            ComputeExecutionDecline::UsedBindingAbsentFromLayout { binding },
+        ));
+    }
+
     let layout_key = LayoutKey {
         bindings: layout_bindings,
     };
@@ -279,7 +321,10 @@ pub(crate) unsafe fn execute_compute_inner(
     let pipeline = caches.get_or_create_compute_pipeline(
         ctx,
         &cpipe_key,
-        module,
+        super::caches::ShaderModuleSource {
+            module,
+            spirv: &req.spirv,
+        },
         pipeline_layout,
         counters,
         pools,
@@ -534,16 +579,15 @@ pub(crate) unsafe fn execute_compute_inner(
 
     // The ring slot's CB retired at begin_entry and its fence is unsignaled —
     // no pre-record wait remains (pre_record_wait_us stays 0 on this path).
-    ctx.device
-        .reset_command_buffer(cb, vk::CommandBufferResetFlags::empty())
-        .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::ComputeExecResetCb, e)))?;
-    ctx.device
-        .begin_command_buffer(
+    unsafe {
+        pools.begin_slot_recording(
+            ctx,
             cb,
-            &vk::CommandBufferBeginInfo::default()
-                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-        )
-        .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::ComputeExecBeginCb, e)))?;
+            super::gpu_span::Kind::Compute,
+            VkOp::ComputeExecResetCb,
+            VkOp::ComputeExecBeginCb,
+        )?
+    };
 
     // Seed sampled images (staging upload or resident device copy)
     // → SHADER_READ_ONLY_OPTIMAL.
@@ -846,6 +890,7 @@ pub(crate) unsafe fn execute_compute_inner(
         );
     }
 
+    unsafe { pools.gpu_span_seal_current(ctx, cb) };
     ctx.device
         .end_command_buffer(cb)
         .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::ComputeExecEndCb, e)))?;
@@ -889,8 +934,8 @@ pub(crate) unsafe fn execute_compute_inner(
     // failed wait below leaves the slot pending, so no path ever reuses an
     // unretired fence. The readback maps below stay valid: the BufferSlot
     // handles are held by value and nothing else runs under the engine lock.
-    let cleanup = pools.seal_entry(dset.zip(dset_pool).into_iter().collect(), Vec::new());
-    pools.finish_entry_async(cleanup);
+    let sealed = pools.seal_entry(dset.zip(dset_pool).into_iter().collect(), Vec::new());
+    pools.finish_entry_async(&ctx.device, sealed);
 
     if all_writeback_deferred {
         counters
@@ -981,6 +1026,35 @@ mod tests {
     };
     use crate::model::ComputeStorageResidencyKey;
     use crate::observe::Decline;
+
+    /// A dispatch whose layout omits a binding its module samples is refused by
+    /// number, and one that only omits an unreferenced binding is not.
+    ///
+    /// This is the shape that killed a host: Mesa's Intel driver divides
+    /// `(use_count << 7)` by the absent binding's `array_size`, which its own
+    /// zero-fill made zero, so `vkCreateComputePipelines` raises `SIGFPE`
+    /// instead of returning. Refusing one dispatch is the only outcome that
+    /// keeps the VM alive, and the second half of this test is what keeps the
+    /// refusal from swallowing legal dispatches with it.
+    #[test]
+    fn a_used_binding_the_layout_omits_is_refused_and_a_declared_unused_one_is_not() {
+        let spirv = crate::runtime::spirv_bind::test_module_with_two_sampled_images(33, 34);
+        let sig = |binding| BindingSig {
+            binding,
+            ty: vk::DescriptorType::SAMPLED_IMAGE.as_raw() as u32,
+            stages: vk::ShaderStageFlags::COMPUTE.as_raw(),
+        };
+
+        assert_eq!(used_binding_absent_from_layout(&spirv, &[]), Some(33));
+        assert_eq!(used_binding_absent_from_layout(&spirv, &[sig(34)]), Some(33));
+        // Covering the used binding is sufficient: 34 is declared and never
+        // referenced, so leaving it out is legal and must not be reported.
+        assert_eq!(used_binding_absent_from_layout(&spirv, &[sig(33)]), None);
+        assert_eq!(
+            used_binding_absent_from_layout(&spirv, &[sig(33), sig(34)]),
+            None
+        );
+    }
 
     fn residency_identity() -> ComputeStorageResidencyKey {
         ComputeStorageResidencyKey {

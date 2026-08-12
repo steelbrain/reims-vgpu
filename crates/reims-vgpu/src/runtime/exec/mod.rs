@@ -27,6 +27,7 @@ use crate::runtime::decode::fifo::{
 };
 use crate::runtime::decode::render::{
     self, attachment_subresource_is_bindable, decode_color_attachment, decode_depth_attachment,
+    LevelSupport,
     decode_stencil_attachment, ColorAttachment, DepthAttachment, Kind as RenderKind, ScissorRect,
     Stage, StencilAttachment, PASS_MAX_COLOR_ATTACHMENTS,
 };
@@ -124,7 +125,13 @@ struct PendingDraw {
 #[derive(Clone, Debug, Default)]
 struct StreamAccum {
     pipeline_ref: u32,
-    /// Pending clears for color attachments (load=clear).
+    /// Every colour attachment whose `load_action` is `Clear`, in stream order.
+    ///
+    /// Membership is the **load** action alone, because this is the pass's
+    /// CLEAR seed and `MTLLoadActionClear` means the attachment starts at the
+    /// record's clear value whatever becomes of it afterwards. Use
+    /// [`StreamAccum::clears_reaching_guest_pages`] — not this — wherever the
+    /// clear colour would be written into the guest's own pages.
     clears: Vec<ColorAttachment>,
     /// Color targets as (pass slot index, attachment). Slot maps to Metal color(i).
     color_slots: Vec<(u32, ColorAttachment)>,
@@ -207,6 +214,26 @@ struct StreamAccum {
 }
 
 impl StreamAccum {
+    /// The subset of [`Self::clears`] whose colour the guest may read back, so
+    /// writing it into the guest's pages is publishing the pass's result rather
+    /// than inventing one.
+    ///
+    /// `MTLStoreActionDontCare` says the pass's result for that attachment is
+    /// dropped. Landing the clear colour in guest memory anyway would be this
+    /// device deciding what the guest sees where the guest said it does not
+    /// care — a content invention, and the exact thing the seed list must not
+    /// be used for.
+    ///
+    /// One method rather than the predicate written at each `apply_clear` loop,
+    /// because there are two of them — the clear-only stream and the draw-failure
+    /// fallback — and they have to agree about what "the guest can read this"
+    /// means.
+    fn clears_reaching_guest_pages(&self) -> impl Iterator<Item = &ColorAttachment> {
+        self.clears
+            .iter()
+            .filter(|att| att.store_action == MTL_STORE_ACTION_STORE)
+    }
+
     /// The stream's bind state as a `PendingDraw`, or what makes it
     /// unrepresentable.
     ///
@@ -589,6 +616,10 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
     let n_cb = cmdbuf_count as usize;
     let page_shift = state.page_shift;
     let mut streams = Vec::with_capacity(n_cb);
+    // This call's measured spans, summed, so `Header` can be the leftover. The
+    // census's own totals cover the whole window and cannot answer for one call.
+    let mut measured_ns = 0u64;
+    let load_started = std::time::Instant::now();
     for i in 0..n_cb {
         // `need` already pinned the whole table: i < n_cb <= cmdbuf_count, so
         // off + DESC_LEN = cbufs_off + (i + 1) * DESC_LEN <= need <=
@@ -626,21 +657,35 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
         out.streams_loaded += 1;
         streams.push(stream);
     }
+    let load_ns = load_started.elapsed().as_nanos() as u64;
+    measured_ns += load_ns;
+    crate::runtime::drain::note_exec_phase(crate::runtime::drain::ExecPhase::Load, load_ns);
 
     // Plan before execute: cold AIR translation is immutable CPU work and can
     // run without protocol ownership. Keep the packet unconsumed until every
     // referenced render stage is ready, so replay cannot duplicate clears,
     // fences, compute dispatches, or guest writeback.
     #[cfg(feature = "backend-vulkan")]
-    let translation_pending = streams.iter().fold(false, |pending, stream| {
-        let render_pending = preflight_render_translations(state, host, task_id, stream);
-        let compute_pending = preflight_compute_translations(state, host, task_id, stream);
-        render_pending || compute_pending || pending
-    });
+    let translation_pending = {
+        let preflight_started = std::time::Instant::now();
+        let pending = streams.iter().fold(false, |pending, stream| {
+            let render_pending = preflight_render_translations(state, host, task_id, stream);
+            let compute_pending = preflight_compute_translations(state, host, task_id, stream);
+            render_pending || compute_pending || pending
+        });
+        let preflight_ns = preflight_started.elapsed().as_nanos() as u64;
+        measured_ns += preflight_ns;
+        crate::runtime::drain::note_exec_phase(
+            crate::runtime::drain::ExecPhase::Preflight,
+            preflight_ns,
+        );
+        pending
+    };
     #[cfg(all(feature = "backend-metal", target_os = "macos"))]
     let translation_pending = false;
     if translation_pending {
         out.deferred = true;
+        note_exec_header(exec_started, measured_ns);
         return out;
     }
 
@@ -653,11 +698,43 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
 
     for stream in streams {
         let mut acc = StreamAccum::default();
+        let walk_started = std::time::Instant::now();
         walk_stream(state, host, task_id, &stream, &mut out, &mut acc);
+        let walk_ns = walk_started.elapsed().as_nanos() as u64;
+        measured_ns += walk_ns;
+        crate::runtime::drain::note_exec_phase(crate::runtime::drain::ExecPhase::Walk, walk_ns);
+        let finish_started = std::time::Instant::now();
         finish_stream(state, host, task_id, &mut out, &acc);
+        let finish_ns = finish_started.elapsed().as_nanos() as u64;
+        measured_ns += finish_ns;
+        crate::runtime::drain::note_exec_phase(crate::runtime::drain::ExecPhase::Finish, finish_ns);
     }
+    note_exec_header(exec_started, measured_ns);
     out.total_us = elapsed_us(exec_started);
     out
+}
+
+/// Close the [`ExecPhase`] tiling of `process_exec_indirect2` at one of its
+/// return points.
+///
+/// [`ExecPhase::Header`] is the **leftover**, not a span: it is the function's
+/// own elapsed time minus the four that measured themselves, so the five sum to
+/// the opcode's `op0x37_us` whatever path the call took. Deriving it rather than
+/// wrapping the header parse is what makes the tiling closed — a cost in a
+/// corner nobody thought to list still lands here instead of vanishing, which is
+/// the property that made the child-FIFO tiling answer on one boot.
+///
+/// `measured_ns` is **this call's** four spans summed, not the census's running
+/// totals: the census accumulates across every packet in the window, so
+/// subtracting it from one call's clock would be subtracting the whole second.
+/// The subtraction is saturating anyway, because an underflow would print as a
+/// colossal `header_us` rather than as the zero it means.
+fn note_exec_header(exec_started: std::time::Instant, measured_ns: u64) {
+    let total = exec_started.elapsed().as_nanos() as u64;
+    crate::runtime::drain::note_exec_phase(
+        crate::runtime::drain::ExecPhase::Header,
+        total.saturating_sub(measured_ns),
+    );
 }
 
 /// Apply every record of one submission's resource table.
@@ -778,29 +855,62 @@ fn preflight_render_translations<M: HostMemory + HostOps>(
     task_id: u32,
     stream: &[u8],
 ) -> bool {
+    use crate::runtime::drain::{note_preflight_part, note_preflight_pipe, PreflightPart};
+    let refs_started = std::time::Instant::now();
     let pipelines = render_pipeline_refs(stream);
+    note_preflight_part(PreflightPart::Refs, refs_started.elapsed().as_nanos() as u64);
     let mut pending = false;
     for pipeline_ref in pipelines {
-        let Ok((v_air, f_air)) = draw::load_render_air_pair(state, host, task_id, pipeline_ref)
-        else {
+        note_preflight_pipe();
+        // The draw path's own memo already knows whether these two shaders are
+        // translated, and answers for ~0.6 us against the 4.3 us of guest
+        // resolves below. `translations_ready` states why that is not a weaker
+        // answer — chiefly that the translate cache never evicts, so a shader
+        // this memo saw translated is still translated.
+        if crate::runtime::pipeline_resolve::translations_ready(
+            state,
+            host,
+            task_id,
+            pipeline_ref,
+        ) {
+            continue;
+        }
+        let air_started = std::time::Instant::now();
+        // The MTLB containers, not owned copies of the AIR inside them: the two
+        // `ensure_cached_async` calls below borrow, digest and drop, so copying
+        // first would allocate twice per pipeline ref for bytes nothing keeps.
+        let pair = draw::load_render_mtlb_pair(state, host, task_id, pipeline_ref);
+        note_preflight_part(PreflightPart::Air, air_started.elapsed().as_nanos() as u64);
+        let Ok((v_mtlb, f_mtlb)) = pair else {
             // Normal execution emits the precise pipeline/MTLB failure. A
             // missing plan input is deterministic, not asynchronous work.
             continue;
         };
+        // A container whose AIR will not extract is the same "deterministic
+        // missing plan input" as one that would not load: normal execution
+        // reports it precisely, and there is no asynchronous work to await.
+        let (Ok(v_air), Ok(f_air)) = (
+            crate::runtime::mtlb::extract_air(&v_mtlb),
+            crate::runtime::mtlb::extract_air(&f_mtlb),
+        ) else {
+            continue;
+        };
+        let cache_started = std::time::Instant::now();
         if !crate::runtime::m2v_cache::ensure_cached_async(
-            &v_air,
+            v_air,
             metal2vulkan::passes::Stage::Vertex,
             pipeline_ref,
         ) {
             pending = true;
         }
         if !crate::runtime::m2v_cache::ensure_cached_async(
-            &f_air,
+            f_air,
             metal2vulkan::passes::Stage::Fragment,
             pipeline_ref,
         ) {
             pending = true;
         }
+        note_preflight_part(PreflightPart::Cache, cache_started.elapsed().as_nanos() as u64);
     }
     pending
 }
@@ -847,26 +957,36 @@ fn preflight_compute_translations<M: HostMemory + HostOps>(
     task_id: u32,
     stream: &[u8],
 ) -> bool {
+    use crate::runtime::drain::{note_preflight_part, note_preflight_pipe, PreflightPart};
+    let refs_started = std::time::Instant::now();
+    let inputs = compute_translation_inputs(stream);
+    note_preflight_part(PreflightPart::Refs, refs_started.elapsed().as_nanos() as u64);
     let mut pending = false;
-    for (pipeline_ref, local_size) in compute_translation_inputs(stream) {
-        let Some(pipeline) =
-            compute_exec::load_compute_pipeline(state, host, task_id, pipeline_ref)
-        else {
-            continue;
-        };
-        let Some(mtlb) = crate::runtime::mtlb::load_mtlb(
-            state,
-            host,
-            task_id,
-            pipeline.kernel_func_ref,
-            crate::runtime::mtlb::AirLoadRail::Compute,
-        ) else {
+    for (pipeline_ref, local_size) in inputs {
+        note_preflight_pipe();
+        let air_started = std::time::Instant::now();
+        let loaded = compute_exec::load_compute_pipeline(state, host, task_id, pipeline_ref)
+            .and_then(|pipeline| {
+                crate::runtime::mtlb::load_mtlb(
+                    state,
+                    host,
+                    task_id,
+                    pipeline.kernel_func_ref,
+                    crate::runtime::mtlb::AirLoadRail::Compute,
+                )
+            });
+        note_preflight_part(PreflightPart::Air, air_started.elapsed().as_nanos() as u64);
+        let Some(mtlb) = loaded else {
             continue;
         };
         let Ok(air) = crate::runtime::mtlb::extract_air(&mtlb) else {
             continue;
         };
-        if !crate::runtime::m2v_cache::ensure_cached_kernel_async(air, local_size, pipeline_ref) {
+        let cache_started = std::time::Instant::now();
+        let cached =
+            crate::runtime::m2v_cache::ensure_cached_kernel_async(air, local_size, pipeline_ref);
+        note_preflight_part(PreflightPart::Cache, cache_started.elapsed().as_nanos() as u64);
+        if !cached {
             pending = true;
         }
     }
@@ -1796,7 +1916,10 @@ fn handle_render_record<M: HostMemory + HostOps>(
                 // guest that wanted none also produces.
                 let depth = decode_depth_attachment(payload);
                 if depth.texture_ref != 0 {
-                    if attachment_subresource_is_bindable(depth.into()) {
+                    if attachment_subresource_is_bindable(
+                        depth.into(),
+                        LevelSupport::LevelZeroOnly,
+                    ) {
                         acc.depth_attach = Some(depth);
                     } else {
                         let drop = note_depth_stencil_unsupported(task_id, "depth", &depth.into());
@@ -1805,7 +1928,10 @@ fn handle_render_record<M: HostMemory + HostOps>(
                 }
                 let stencil = decode_stencil_attachment(payload);
                 if stencil.texture_ref != 0 {
-                    if attachment_subresource_is_bindable(stencil.into()) {
+                    if attachment_subresource_is_bindable(
+                        stencil.into(),
+                        LevelSupport::LevelZeroOnly,
+                    ) {
                         acc.stencil_attach = Some(stencil);
                     } else {
                         let drop =
@@ -1819,35 +1945,35 @@ fn handle_render_record<M: HostMemory + HostOps>(
                         continue;
                     }
                     let slot = i as u32;
-                    // Every consumer of a colour attachment binds the texture
-                    // whole, so a subresource the guest named is rendered past
-                    // rather than into. This used to be reported and then
-                    // rendered anyway, on the argument that dropping the pass
-                    // "would trade wrong pixels for none, which is worse". That
-                    // argument does not survive asking *whose* pixels: the pass
-                    // does not land in the guest's mip 3 and come out blurry, it
-                    // lands in **base level 0 of the same texture**, overwriting
-                    // the image the guest is sampling at LOD 0 and every other
-                    // level's source. A cube face becomes face 0 every time.
-                    // That is wrong content written over right content, which is
-                    // worse than none — and unlike none it also corrupts a
-                    // resource the guest did not name in this pass.
+                    // A slice, a depth plane or a multisample resolve target is
+                    // rendered past rather than into, and the pass is refused
+                    // for it. This used to be reported and then rendered anyway,
+                    // on the argument that dropping the pass "would trade wrong
+                    // pixels for none, which is worse". That argument does not
+                    // survive asking *whose* pixels: the pass does not land in
+                    // the guest's slice 3 and come out wrong, it lands in
+                    // **slice 0 of the same texture**, overwriting the image the
+                    // guest is sampling there. A cube face becomes face 0 every
+                    // time. That is wrong content written over right content,
+                    // which is worse than none — and unlike none it also
+                    // corrupts a resource the guest did not name in this pass.
                     //
-                    // Refusing costs a measured zero: `render_color_subresource_
-                    // unsupported` and the sibling `render_pass_array_length_
-                    // dropped` are absent from every driven boot recorded here,
-                    // while `render_pass_target_extent_unapplied` — decoded from
-                    // the same record — fires in the thousands, so the fields are
-                    // being read and are genuinely zero rather than unreached.
+                    // A **mip level** is the one coordinate that is not in that
+                    // class, which is why this arm passes `AnyLevel`: the linear
+                    // rung of `render_target` resolves the named level's own
+                    // plane out of the guest allocation, so the pass renders
+                    // into it rather than over level 0. macOS 26's compositor
+                    // renders a blur pyramid level by level and every one of
+                    // those passes was being dropped here.
                     //
-                    // Through the shared predicate rather than a fourth term
-                    // written out here, which is what this arm used to carry and
-                    // is how `resolve_texture_ref` went untested: a colour
-                    // attachment with `resolveTexture` set is a multisample
-                    // colour pass, and this device rendered it single-sampled
-                    // into the attachment and never wrote the resolve target the
-                    // guest goes on to read.
-                    if !attachment_subresource_is_bindable(att.into()) {
+                    // Through the shared predicate rather than terms written out
+                    // here, which is what this arm used to carry and is how
+                    // `resolve_texture_ref` went untested: a colour attachment
+                    // with `resolveTexture` set is a multisample colour pass, and
+                    // this device rendered it single-sampled into the attachment
+                    // and never wrote the resolve target the guest goes on to
+                    // read.
+                    if !attachment_subresource_is_bindable(att.into(), LevelSupport::AnyLevel) {
                         let drop = note_color_subresource_unsupported(task_id, slot, &att);
                         acc.unrepresentable.get_or_insert(StreamRefusal::Pass(drop));
                     }
@@ -1883,23 +2009,25 @@ fn handle_render_record<M: HostMemory + HostOps>(
                             out.type11_mappings.push(att.texture_ref);
                         }
                     }
+                    // The load action decides this, and only the load action.
+                    //
+                    // A `Clear` + non-`Store` attachment used to be dropped from
+                    // this list entirely, which conflated the two jobs the list
+                    // does: it is the pass's CLEAR **seed** for the draws, and
+                    // it is the set whose colour may be **published** to guest
+                    // pages. `MTLStoreAction` governs only the second. Dropping
+                    // it from both meant a drawn pass began on the attachment's
+                    // stale contents — wrong for anything that blends, depth-
+                    // tests, or draws less than the full extent — and the store
+                    // action never licensed that.
+                    //
+                    // macOS 26 asks for the pair 23 times in a 25 s drag and
+                    // macOS 14 twice, against zero on 11/12/13; the branch was
+                    // written as a healthy-zero alarm and those are firings.
+                    // `clears_reaching_guest_pages` is where the store action is
+                    // honoured instead.
                     if att.load_action == MTL_LOAD_ACTION_CLEAR {
-                        if att.store_action == MTL_STORE_ACTION_STORE {
-                            acc.clears.push(att);
-                        } else {
-                            // Metal Clear + non-Store (e.g. DontCare): the clear
-                            // seed is dropped from `acc.clears`, so a drawn pass
-                            // loads stale content (residue) and a clear-only
-                            // stream never reaches guest pages. We do NOT invent
-                            // DontCare semantics (unknown wire stays unknown) —
-                            // just make the drop visible so a boot reveals whether
-                            // any guest emits it. Deduped per target.
-                            note_clear_dropped(
-                                "nonstore_store_action",
-                                att.texture_ref,
-                                &format!("store_action={} load_action=clear", att.store_action),
-                            );
-                        }
+                        acc.clears.push(att);
                     }
                 }
             }
@@ -2924,7 +3052,7 @@ fn finish_stream<M: HostMemory + HostOps>(
     // guest store that would expose intermediate pixels to DisplaySwap.
     let will_draw = acc.saw_draw && !acc.color_slots.is_empty() && !acc.draws.is_empty();
     if !will_draw {
-        for att in &acc.clears {
+        for att in acc.clears_reaching_guest_pages() {
             if apply_clear(state, host, task_id, att) {
                 out.clears_applied += 1;
             }
@@ -3331,7 +3459,10 @@ fn finish_stream<M: HostMemory + HostOps>(
                                 acc,
                                 &req,
                                 &mut chain_rgba,
-                                resident_chain,
+                                ChainEnd {
+                                    cause: draw::ChainAbandonCause::NoColor0,
+                                    resident: resident_chain,
+                                },
                             );
                             break;
                         }
@@ -3347,7 +3478,10 @@ fn finish_stream<M: HostMemory + HostOps>(
                             acc,
                             &req,
                             &mut chain_rgba,
-                            resident_chain,
+                            ChainEnd {
+                                cause: draw::ChainAbandonCause::NoMetal,
+                                resident: resident_chain,
+                            },
                         );
                         break;
                     }
@@ -3369,7 +3503,10 @@ fn finish_stream<M: HostMemory + HostOps>(
                             acc,
                             &req,
                             &mut chain_rgba,
-                            resident_chain,
+                            ChainEnd {
+                                cause: draw::ChainAbandonCause::TerminalRefusal,
+                                resident: resident_chain,
+                            },
                         );
                         break;
                     }
@@ -3384,7 +3521,7 @@ fn finish_stream<M: HostMemory + HostOps>(
         // class, not only NoMetal: mrt_request fail used to skip this and left
         // mid pages empty → nz_swing thrash on x86 Linux product.
         if out.metal_draws_ok == 0 && !acc.clears.is_empty() {
-            for att in &acc.clears {
+            for att in acc.clears_reaching_guest_pages() {
                 if apply_clear(state, host, task_id, att) {
                     out.clears_applied = out.clears_applied.saturating_add(1);
                 }
@@ -3816,6 +3953,17 @@ fn dirty_color_targets<M: HostMemory + HostOps>(
     }
 }
 
+/// How a packet's chain ended: which break stopped it, and whether the last
+/// record left its pixels on the engine-resident target rather than in guest
+/// memory. Both are answers to "what state was the chain in when it broke", and
+/// the recovery rail needs each for a different reason — `resident` decides
+/// whether a readback is owed at all, `cause` is what the refusal reports.
+#[derive(Clone, Copy)]
+struct ChainEnd {
+    cause: draw::ChainAbandonCause,
+    resident: bool,
+}
+
 /// Land the chain image this packet has produced before abandoning it.
 ///
 /// Three records break a multi-draw chain: a typed terminal refusal, the
@@ -3835,16 +3983,17 @@ fn land_chain_before_abandon<M: HostMemory + HostOps>(
     acc: &StreamAccum,
     req: &draw::DrawEncodeRequest,
     chain_rgba: &mut Option<Vec<u8>>,
-    resident_chain: bool,
+    end: ChainEnd,
 ) {
     #[cfg(feature = "backend-vulkan")]
-    if resident_chain && chain_rgba.is_none() {
+    if end.resident && chain_rgba.is_none() {
         *chain_rgba = draw::read_resident_chain(state, req);
     }
     #[cfg(not(feature = "backend-vulkan"))]
-    let _ = (req, resident_chain);
+    let _ = (req, end.resident);
     if let Some(rgba) = chain_rgba.take() {
-        let _ = draw::writeback_chain_rgba(state, host, task_id, &acc.color_slots, &rgba);
+        let _ =
+            draw::writeback_chain_rgba(state, host, task_id, &acc.color_slots, &rgba, end.cause);
     }
     dirty_color_targets(state, host, task_id, &acc.color_targets);
 }
@@ -3862,7 +4011,7 @@ fn apply_clear<M: HostMemory + HostOps>(
     let Some(req) =
         // A clear-only pass: no pipeline and no geometry, so every draw
         // argument including the base instance is zero by construction.
-        draw::color_target_request(state, host, task_id, att.texture_ref, 0, 0, 1, 0, 0, 0)
+        draw::color_target_request(state, host, task_id, *att, 0, 0, 1, 0, 0, 0)
     else {
         // A clear whose color target cannot resolve (mapping unresolved, geometry
         // missing) is dropped here with no other trace — the "background didn't

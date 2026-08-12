@@ -89,6 +89,7 @@ mod tests {
             width: 64,
             height: 32,
             generation: 9,
+            format: crate::backend::vulkan::translate::pixel::SCANOUT_FORMAT,
         }
     }
 
@@ -157,6 +158,13 @@ mod tests {
                 ("identity_width", "64".into()),
                 ("identity_height", "32".into()),
                 ("identity_generation", "9".into()),
+                (
+                    "identity_format",
+                    format!(
+                        "{:?}",
+                        crate::backend::vulkan::translate::pixel::SCANOUT_FORMAT
+                    )
+                ),
             ]
         );
     }

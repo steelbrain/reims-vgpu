@@ -367,7 +367,7 @@ impl BufferSlabPool {
         counters: &EngineCounters,
     ) -> Result<BufferSlabToken, DrawError> {
         let mem_type = ctx
-            .memory_type_for(req.memory_type_bits, self.kind.memory_class())
+            .memory_type_for(req.memory_type_bits, req.size, self.kind.memory_class())
             .ok_or_else(|| self.kind.no_memory_type(req.memory_type_bits))?;
         let size = req.size;
         if size == 0 {

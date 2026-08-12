@@ -16,6 +16,15 @@ use reims_vgpu::backend::vulkan::engine::{
     SampledImageResource, SampledSource, SamplerResource, ScissorResource, StorageBufferResource,
     TargetIdentity,
 };
+/// The resident format every `TargetIdentity::Surface` in this file is built at.
+///
+/// These tests predate the namespace carrying a format, and each was written
+/// against a resident in guest scanout order — several assert on the byte order
+/// of what they read back. Naming the constant once keeps that premise in one
+/// place and makes a test that wants a different format say so.
+const SURFACE_TEST_FORMAT: ash::vk::Format =
+    reims_vgpu::backend::vulkan::translate::pixel::SCANOUT_FORMAT;
+
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
@@ -130,6 +139,7 @@ fn batched_draws_compose_and_flush_on_read() {
         width: W,
         height: H,
         generation: 1,
+        format: SURFACE_TEST_FORMAT,
     };
 
     let before = engine::counter_snapshot();
@@ -175,10 +185,20 @@ fn batched_draws_compose_and_flush_on_read() {
     }
 }
 
-/// A draw to a DIFFERENT target must not join; claiming its slot flushes the
-/// open batch first, so the first target's content is complete when read.
+/// A draw to a DIFFERENT target joins the open batch, and both targets still
+/// receive exactly their own draw's pixels.
+///
+/// This is the whole of what dropping the target from the join key has to be
+/// true for. Every batched draw begins and ends its own render pass, so the two
+/// passes recorded here name two different attachments and neither may write
+/// the other — but nothing in Vulkan says so on its own, and a batch that
+/// carried the target for a reason nobody had written down would fail here as a
+/// wrong half of a wrong image rather than as a counter.
+///
+/// It read `batch_opens=2, batch_joins=0, batch_flushes=1` while the key
+/// existed, on a rail where that refusal alone was 26 % of all draws.
 #[test]
-fn cross_target_draw_flushes_open_batch() {
+fn cross_target_draws_share_one_command_buffer_and_land_in_their_own_images() {
     let _guard = engine_test_lock().lock().unwrap();
     let (vert, frag) = triangle_spirv();
     let a = TargetIdentity::Surface {
@@ -186,12 +206,14 @@ fn cross_target_draw_flushes_open_batch() {
         width: W,
         height: H,
         generation: 1,
+        format: SURFACE_TEST_FORMAT,
     };
     let b = TargetIdentity::Surface {
         id: 990_202,
         width: W,
         height: H,
         generation: 1,
+        format: SURFACE_TEST_FORMAT,
     };
 
     let before = engine::counter_snapshot();
@@ -207,17 +229,17 @@ fn cross_target_draw_flushes_open_batch() {
             panic!("opener draw: {msg}");
         }
     }
-    // Different identity: not joinable — begin_entry flushes A's batch, and
-    // this draw opens a batch of its own.
+    // Different identity, and the *opposite* half of the frame: if the two
+    // passes were not independent, whichever image lost would read as its own
+    // half cleared and the other half painted.
     let other = batch_req(&vert, &frag, &b, false, half_scissor(false));
     engine::execute_draw_request(&other).expect("cross-target draw");
     let mid = engine::counter_snapshot().delta_since(&before);
-    assert_eq!(mid.batch_opens, 2, "each target opened its own batch");
-    assert_eq!(mid.batch_joins, 0, "cross-target draws never join");
-    assert_eq!(mid.batch_flushes, 1, "claiming B's slot flushed A's batch");
+    assert_eq!(mid.batch_opens, 1, "one batch carries both targets");
+    assert_eq!(mid.batch_joins, 1, "the second target joined it");
+    assert_eq!(mid.batch_flushes, 0, "and nothing has consumed either yet");
 
-    // A: left half colored, right half untouched clear — single-draw batch
-    // content is exact after its flush.
+    // A drew the left half; the read is what flushes the shared batch.
     let px = engine::read_target(&a).expect("read A").into_rgba8();
     let left = ((10 * W + 8) * 4) as usize;
     let right = ((10 * W + W / 2 + 8) * 4) as usize;
@@ -229,6 +251,19 @@ fn cross_target_draw_flushes_open_batch() {
     assert!(
         is_zero(&px[right..right + 4]),
         "A right half = {:?}",
+        &px[right..right + 4]
+    );
+
+    // B drew the right half, out of the same command buffer.
+    let px = engine::read_target(&b).expect("read B").into_rgba8();
+    assert!(
+        is_zero(&px[left..left + 4]),
+        "B left half = {:?}",
+        &px[left..left + 4]
+    );
+    assert!(
+        is_frag_color(&px[right..right + 4]),
+        "B right half = {:?}",
         &px[right..right + 4]
     );
 }
@@ -245,6 +280,7 @@ fn prefetch_arm_flushes_open_batch() {
         width: W,
         height: H,
         generation: 1,
+        format: SURFACE_TEST_FORMAT,
     };
 
     let before = engine::counter_snapshot();
@@ -265,9 +301,15 @@ fn prefetch_arm_flushes_open_batch() {
     assert_eq!(mid.batch_flushes, 0, "batch still open before the arm");
 }
 
-/// A batch refuses joiners at BATCH_MAX_DRAWS (8): draw 9 flushes + reopens,
-/// draw 10 joins the second batch. Keeps the GPU fed and the staging pool
-/// recycling instead of hoarding a whole run in one pending ring entry.
+/// A batch refuses joiners at `BATCH_MAX_DRAWS`: the draw after a full batch
+/// flushes and reopens, and the one after that joins the second batch. Keeps
+/// the GPU fed and the staging pool recycling instead of hoarding a whole run
+/// in one pending ring entry.
+///
+/// The cap is read from the engine rather than written here. It is chosen by a
+/// live sweep and has moved once already (8 -> 32); a test carrying its own
+/// copy asserts the sweep's old answer against its new one and fails as though
+/// the device had broken.
 #[test]
 fn batch_length_cap_flushes_and_reopens() {
     let _guard = engine_test_lock().lock().unwrap();
@@ -277,6 +319,7 @@ fn batch_length_cap_flushes_and_reopens() {
         width: W,
         height: H,
         generation: 1,
+        format: SURFACE_TEST_FORMAT,
     };
 
     let before = engine::counter_snapshot();
@@ -292,19 +335,26 @@ fn batch_length_cap_flushes_and_reopens() {
             panic!("opener draw: {msg}");
         }
     }
-    for n in 1..10 {
+    // `cap + 1` joiners after the opener is `cap + 2` draws: the first `cap`
+    // fill batch one, the next opens batch two and the last joins it — so the
+    // reopen is not the last thing that happened.
+    let cap = engine::batch_max_draws();
+    for n in 1..=cap + 1 {
         let joiner = batch_req(&vert, &frag, &identity, true, half_scissor(n % 2 == 0));
         engine::execute_draw_request(&joiner).unwrap_or_else(|e| panic!("draw #{n}: {e}"));
     }
     let d = engine::counter_snapshot().delta_since(&before);
-    assert_eq!(d.batch_opens, 2, "cap at 8 forces a second batch: {d:?}");
     assert_eq!(
-        d.batch_joins, 8,
-        "7 join the first batch, 1 the second: {d:?}"
+        d.batch_opens, 2,
+        "the cap forces a second batch at {cap}: {d:?}"
+    );
+    assert_eq!(
+        d.batch_joins, cap,
+        "cap-1 join the first batch, 1 the second: {d:?}"
     );
     assert_eq!(d.batch_flushes, 1, "the cap flushed exactly once: {d:?}");
     assert_eq!(
-        d.batch_flush_draws, 8,
+        d.batch_flush_draws, cap,
         "the full first batch flushed: {d:?}"
     );
     engine::test_quiesce_ring();
@@ -326,6 +376,7 @@ fn batched_guest_runs_buffer_snapshots_at_record() {
         width: W,
         height: H,
         generation: 1,
+        format: SURFACE_TEST_FORMAT,
     };
 
     let before = engine::counter_snapshot();
@@ -416,6 +467,7 @@ fn sampled_guest_runs_land_the_guest_bytes_the_shader_samples() {
         width: W,
         height: H,
         generation: 1,
+        format: SURFACE_TEST_FORMAT,
     };
 
     // One x86 guest page holding a uniform 2x2 RGBA8 texture, written as two
@@ -577,6 +629,7 @@ fn a_scattered_guest_buffer_window_is_gathered_by_the_gpu_in_one_region_per_stre
         width: W,
         height: H,
         generation: 1,
+        format: SURFACE_TEST_FORMAT,
     };
 
     // The device publishes the import granularity when it is created, and it is
@@ -786,6 +839,7 @@ void main() {{
         width: W,
         height: H,
         generation: 1,
+        format: SURFACE_TEST_FORMAT,
     };
 
     // The device publishes the import granularity when it is created, so one
@@ -966,6 +1020,7 @@ void main() {{
         width: W,
         height: H,
         generation: 1,
+        format: SURFACE_TEST_FORMAT,
     };
 
     let (warm_vert, warm_frag) = triangle_spirv();
@@ -1136,6 +1191,7 @@ void main() {{
         width: W,
         height: H,
         generation: 1,
+        format: SURFACE_TEST_FORMAT,
     };
 
     let (warm_vert, warm_frag) = triangle_spirv();

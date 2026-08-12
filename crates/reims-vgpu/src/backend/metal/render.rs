@@ -1668,6 +1668,53 @@ mod attachment_decline_tests {
 }
 
 /// Multi-render-target encode: one Metal pass with color attachments at given slots.
+///
+/// # This encodes, submits and **blocks**, once per draw
+///
+/// Read the tail of this function before proposing anything about the arm64
+/// pathway's throughput. One call is one `MTLCommandBuffer`, one
+/// `MTLRenderCommandEncoder`, one `commit`, and one `waitUntilCompleted` — and
+/// [`crate::runtime::draw`] calls it once per decoded draw. So a guest frame of
+/// N draws is N GPU round trips with the drain thread stopped inside each one,
+/// and no draw's encoding overlaps any other draw's execution.
+///
+/// The Vulkan arm decoding the same guest stream does none of those three. It
+/// batches: a driven macos-13 sustained-animation boot reads
+/// `engine_delta batch_flush_draws / batch_flushes` = **14.6 draws per command
+/// buffer**, submitted once, with no wait at all on the recording thread (its
+/// `draw_phase wait_us` is 0). It still opens a render pass per draw, which is
+/// its own known cost — see `PassObstacles` in
+/// `crate::backend::vulkan::engine::exec` — but that is one of the three gaps
+/// here and the smallest.
+///
+/// Why this is stated as a gap and not fixed here: it is a claim about the arm64
+/// pathway and **this repository has no Apple host to boot**, so there is no
+/// number for it and nothing under `backend/metal/` is even test-executed on a
+/// Linux checkout (`AGENTS.md`, "Rust tests"). What can be said without a boot
+/// is only what the code shape guarantees, and it is worth saying because the
+/// three costs are not equally sized and a session with a Mac should attack them
+/// in this order:
+///
+/// 1. **The `waitUntilCompleted`.** A round trip is microseconds of latency the
+///    CPU cannot fill, and it serialises the whole device: nothing else in this
+///    process is encoding while it blocks. Removing it means the callers that
+///    read a result out of the pass — the visibility query below, and the
+///    writeback [`crate::runtime::draw`] performs on the strength of this having
+///    completed — need a completion handler or a fence instead of a return
+///    value, which is the real work.
+/// 2. **The per-draw command buffer.** Metal's own guidance is tens to hundreds
+///    of encodes per buffer; one draw per buffer pays the driver's per-commit
+///    cost at draw rate.
+/// 3. **The per-draw pass.** Apple Silicon is a tile-based deferred renderer, so
+///    each pass loads the attachment into tile memory and stores it back out at
+///    `endEncoding` whatever the draw touched. That is the cost this pathway
+///    pays that a discrete immediate-mode GPU does not: `REIMS_VGPU_LAYOUT_CHURN`
+///    measured a full-attachment layout move as free on an NVIDIA host and that
+///    reading says nothing here.
+///
+/// None of the three is a decode or contract change. The guest stream is the
+/// same; only when this device chooses to end an encoder and hand it to the GPU
+/// would move.
 #[allow(clippy::too_many_arguments)]
 pub fn render_core_mrt(
     vert_mtlb: &[u8],

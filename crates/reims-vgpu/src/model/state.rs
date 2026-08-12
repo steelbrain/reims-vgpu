@@ -1465,6 +1465,18 @@ pub struct PresentState {
     pub frame_width: u32,
     pub frame_height: u32,
     pub frame_generation: u32,
+    /// `MappingEntry::surface_content_epoch` of the captured frame — "these are
+    /// different pixels", where `frame_generation` is "the guest's pages hold
+    /// something different".
+    ///
+    /// The two came apart when the lazy type-11 Store
+    /// ([`crate::runtime::writeback_debt`]) started leaving a frame in the engine
+    /// resident and owing the pages a copy: the pixels move every frame and the
+    /// generation does not. Anything asking "is this a new frame to show" has to
+    /// read this one — `device::window_publish::window_frame_key` is the caller
+    /// that found out the hard way, discarding 20 % of a driven boot's frames as
+    /// unchanged.
+    pub frame_content_epoch: u32,
     pub frame_valid: bool,
     /// True only when DisplaySwap capture failed; first host paint retries.
     pub frame_encode_pending: bool,
@@ -1813,6 +1825,34 @@ pub struct DeviceState {
     pub max_mapping_id_seen: u32,
     /// Count of MapMemory2/UnmapMemory packets (measure census).
     pub map_family_events: u64,
+    /// Per-task live guest-VA mappings, for the map/unmap pairing audit.
+    ///
+    /// Observation only — see [`crate::runtime::map_audit`] for what it watches
+    /// and why the wire is entitled to answer it. Keyed separately from
+    /// [`Self::tasks`] because a map packet may name a task id this device has
+    /// no entry for, and that case is itself worth counting rather than
+    /// dropping.
+    pub map_audit: std::collections::BTreeMap<u32, crate::runtime::map_audit::MapIntervals>,
+    /// Per-task page-table node pages, for the host-write guard.
+    ///
+    /// Observation only — see [`crate::runtime::node_guard`]. Keyed and dropped
+    /// exactly as [`Self::map_audit`] is, and for the same reason: these pages
+    /// belong to the task's address space, so a reused id inheriting them would
+    /// be watching memory that is now somebody else's.
+    pub node_guard: std::collections::BTreeMap<u32, crate::runtime::node_guard::NodeWatch>,
+    /// Guest pages the guest has released, for the post-release write guard.
+    ///
+    /// Observation only — see [`crate::runtime::released_pages`], which exists
+    /// because [`Self::node_guard`] cannot see a write that lands on a page
+    /// *before* that page becomes part of a page table.
+    ///
+    /// **Not keyed by task, unlike the two ledgers above it, and that is the
+    /// point.** A guest page is guest-physical and more than one task can map
+    /// it, so a per-task watch reports the legitimate write that arrives through
+    /// another task's live mapping. Keyed globally, any task mapping the page
+    /// disarms it. For the same reason it is not dropped on task teardown: the
+    /// page stays released whatever happens to the task that let it go.
+    pub released_pages: crate::runtime::released_pages::ReleasedPages,
     /// Live object refs per task, as `(task_id, ref)`.
     ///
     /// Membership only — deliberately carries no descriptor payload. Every
@@ -1907,6 +1947,14 @@ pub struct DeviceState {
     /// See [`crate::runtime::bound_buffers`].
     #[cfg(feature = "backend-vulkan")]
     pub bound_buffers: crate::runtime::bound_buffers::BoundBuffers,
+    /// When the guest last declared a write to each **buffer** object.
+    ///
+    /// The half of the validity quad `resource_validity::apply` has nowhere to
+    /// put: a buffer has no mapping, so its `content_generation` does not exist
+    /// and the statement was being decoded and dropped. Ungated, because the
+    /// producer is the decoder rather than a backend. See
+    /// [`crate::runtime::buffer_write_gen`].
+    pub buffer_write_gen: crate::runtime::buffer_write_gen::BufferWriteGens,
     /// Monotonic source for every sampled-content generation this device
     /// hands the engine. Read only through
     /// [`DeviceState::next_sampled_content_generation`].
@@ -2062,6 +2110,13 @@ pub struct DeviceState {
     /// ([`crate::runtime::render_writeback::retire_linear_residents`]) so the
     /// pinned images become LRU-evictable instead of leaking.
     pub retired_linear_residents: Vec<ComputeStorageResidencyKey>,
+    /// Type-11 surfaces whose latest frame is still only in the engine resident,
+    /// because nothing has read their guest pages since the Store that produced
+    /// it. See [`crate::runtime::writeback_debt`], which owns every transition.
+    ///
+    /// Empty unless [`crate::env::LAZY_WRITEBACK`] is on, and empty on the
+    /// `backend-metal` arm, which arms nothing.
+    pub pending_writebacks: crate::runtime::writeback_debt::PendingWritebacks,
     /// GVA render target → a hash of the guest physical pages its engine
     /// resident was last armed over.
     ///
@@ -2141,6 +2196,9 @@ impl DeviceState {
             max_mapping_id_seen: 0,
             tasks: TaskTable::new(),
             map_family_events: 0,
+            map_audit: std::collections::BTreeMap::new(),
+            node_guard: std::collections::BTreeMap::new(),
+            released_pages: crate::runtime::released_pages::ReleasedPages::default(),
             objects: std::collections::BTreeSet::new(),
             texture_to_mapping: BTreeMap::new(),
             mappings: BTreeMap::new(),
@@ -2172,6 +2230,7 @@ impl DeviceState {
             retired_views: Vec::new(),
             retired_guest_write_tokens: Vec::new(),
             retired_linear_residents: Vec::new(),
+            pending_writebacks: crate::runtime::writeback_debt::PendingWritebacks::default(),
             completion_stamp_seq: 0,
             gva_resident_backing: std::collections::BTreeMap::new(),
             guest_linear_memo: LruBytesMemo::new(GUEST_LINEAR_MEMO_BYTE_CAP),
@@ -2179,6 +2238,7 @@ impl DeviceState {
             gather_witness: crate::runtime::gather_witness::GatherWitness::default(),
             #[cfg(feature = "backend-vulkan")]
             bound_buffers: crate::runtime::bound_buffers::BoundBuffers::default(),
+            buffer_write_gen: crate::runtime::buffer_write_gen::BufferWriteGens::default(),
             sampled_content_gen: 0,
             host_writes: crate::runtime::host_writes::HostWrites::default(),
             guest_linear_scratch: Vec::new(),
@@ -2411,6 +2471,10 @@ impl DeviceState {
     /// retires forty entries and one that retires none read identically as
     /// events, and it is the entries that become the re-walks.
     pub fn retire_bound_buffers_for_task(&mut self, task_id: u32) -> usize {
+        // Ungated and unconditional: a task's object ids stop naming its objects
+        // whatever backend is compiled in, and a stamp that outlived its task
+        // would read as quiet for whatever the next task puts at that id.
+        self.buffer_write_gen.retire_task(task_id);
         #[cfg(feature = "backend-vulkan")]
         {
             self.bound_buffers.retire_task(task_id)
@@ -2549,8 +2613,32 @@ impl DeviceState {
     /// ignore.
     pub fn define_task(&mut self, task_id: u32, length: u64, directory_pfn: u32) {
         self.max_task_id_seen = self.max_task_id_seen.max(task_id);
+        // Redefining a *live* task is the one shape here that can lose published
+        // guest state: the objects below are dropped, and if the new directory
+        // roots a different physical page at the list's own GVA then everything
+        // the guest published into the old one reads back as zero. macOS 13 does
+        // not do this and macOS 26 does, which is why it is counted separately
+        // from a first definition rather than folded into one route.
+        if self.tasks.is_active(task_id) {
+            let same_root = self
+                .tasks
+                .get(task_id)
+                .is_some_and(|t| t.directory_pfn == directory_pfn);
+            crate::runtime::drain::note_store_route(if same_root {
+                "define_task_redefined_live_same_root"
+            } else {
+                "define_task_redefined_live_new_root"
+            });
+        }
         // Drop objects for this task on redefine.
         self.objects.retain(|&(t, _)| t != task_id);
+        // A deleted task's whole address space goes with it, so its live
+        // mappings are not leaks and a reused id must not inherit them.
+        self.map_audit.remove(&task_id);
+        // Same lifetime, same reason: the watched pages were nodes of the tree
+        // this id is losing, and after a redefine they describe whatever the
+        // guest has since done with them.
+        self.node_guard.remove(&task_id);
         self.retire_task_linear_residents(task_id);
         self.host_linear_textures.retain(|&(t, _), _| t != task_id);
         // New directory ⇒ old GVA HostOps views alias the wrong PT — retire.
@@ -2609,6 +2697,15 @@ impl DeviceState {
         // HostOps views we held (does not touch host_gva_surfaces encode).
         // Runtime flushes retired_views via HostOps::unmap_pages.
         self.retire_task_gva_views(task_id);
+        // The two observation ledgers keyed by task id go with it, exactly as
+        // they do on a redefine. Both were reachable only through `define_task`
+        // before, which cleaned them up whenever an id came back — so a task the
+        // guest deletes and never redefines left its record behind for the life
+        // of the process. Neither ledger is read for a task that does not exist,
+        // so this costs no behaviour; it stops an id the guest is done with from
+        // holding a page set that describes memory it has given back.
+        self.map_audit.remove(&task_id);
+        self.node_guard.remove(&task_id);
         self.tasks.remove(task_id);
         true
     }
@@ -3009,16 +3106,52 @@ impl DeviceState {
         self.host_writes.note_pages(pages);
     }
 
+    /// Every guest page a mapping covers, or `None` when the set cannot be
+    /// named exactly.
+    ///
+    /// This is the page set the guest-write **reach** test is decided on, from
+    /// both ends: [`Self::note_host_wrote_mapping`] names a writeback's
+    /// destination with it, and the readers that ask
+    /// `render_writeback::settle_guest_writes_unless_disjoint` whether they may
+    /// skip the wait name their source with it. Those two answers are compared
+    /// against each other, so they must come from one rule — a writer that
+    /// named pages by a slightly different rule than the reader would make a
+    /// genuine overlap read as disjoint, and skipping *that* wait is a stale
+    /// frame. Hence one function rather than the three hand-written copies this
+    /// replaced.
+    ///
+    /// All-or-nothing on purpose: `collect` into an `Option` so a single
+    /// unresolvable entry makes the whole set unnamed rather than partially
+    /// named. A short list is the one wrong answer that costs a frame, because
+    /// it licenses skipping a wait for a page it silently omitted. `None` always
+    /// settles.
+    ///
+    /// Cheap by construction — no revalidation, no host round trip, no
+    /// `map_pages`. `page_entries` already *is* the list. That matters because
+    /// the settle closure runs on the hot path whenever a writeback is
+    /// outstanding. The revalidating cousin is
+    /// [`crate::runtime::mapper::mapping_page_gpas`], which needs a `&mut host`
+    /// and is for callers about to *map* the pages, not merely name them.
+    pub fn mapping_reach_pages(&self, mapping_id: u32) -> Option<Vec<u64>> {
+        let m = self.mappings.get(&mapping_id)?;
+        if m.page_entries.is_empty() {
+            return None;
+        }
+        let shift = self.page_shift;
+        m.page_entries
+            .iter()
+            .map(|&e| crate::contract::iosurface_pages::entry_gpa_shift(e, shift))
+            .collect()
+    }
+
     /// The same, for a writer that knows which mapping's pages it is landing in.
     pub fn note_host_wrote_mapping(&mut self, mapping_id: u32) {
-        // A mapping with no page list cannot have its write ruled out later, so
-        // it is recorded as an unnamed one rather than as an empty page set.
-        match self.mappings.get(&mapping_id) {
-            Some(m) if !m.page_entries.is_empty() => {
-                let generation = m.map_generation;
-                self.host_writes.note_mapping(mapping_id, generation);
-            }
-            _ => self.host_writes.note_unknown(),
+        // A mapping whose pages cannot be named exactly cannot have its write
+        // ruled out later, so it is recorded as an unnamed one rather than as an
+        // empty (or short) page set.
+        match self.mapping_reach_pages(mapping_id) {
+            Some(pages) => self.host_writes.note_mapping(Some(&pages)),
+            None => self.host_writes.note_unknown(),
         }
     }
 
@@ -3081,12 +3214,37 @@ impl DeviceState {
         self.validity_seq
     }
 
-    /// Advance [`MappingEntry::surface_content_epoch`] for a publish that
-    /// changed the mapping's pixels *without* writing its guest pages — the
-    /// deferred type-11 Store, which stores the frame into `surface_cache` and
-    /// arms a window. Returns the new epoch so the caller can stamp the
-    /// resident that holds those pixels in the same breath; the two must not be
-    /// separable, or the stamp records a currency that already moved.
+    /// Advance a mapping's content stamps for a publish that changed its pixels
+    /// *without* writing its guest pages — the lazy type-11 Store of
+    /// [`crate::runtime::writeback_debt`], which leaves the frame in the engine
+    /// resident and owes the pages a copy.
+    ///
+    /// Returns the new [`MappingEntry::surface_content_epoch`] so the caller can
+    /// stamp the resident that holds those pixels in the same breath; the two
+    /// must not be separable, or the stamp records a currency that already moved.
+    ///
+    /// # Why it moves two of [`Self::mark_mapping_written`]'s three stamps
+    ///
+    /// It is the same statement as that one — "this mapping's pixels are now
+    /// different" — differing only in where the pixels are, and the difference is
+    /// exactly `content_generation`. That field means *the guest's pages hold
+    /// something new*, and its consumers re-read those pages when it moves; a
+    /// lazy Store wrote no page, so moving it would send the compute rail to
+    /// re-seed bytes that did not change.
+    ///
+    /// The other two mean *the pixels are new*, wherever they are, and both move:
+    /// `surface_content_epoch` licenses the attachment LOAD elision, which is what
+    /// keeps a lazy Store from being read straight back off guest pages, and
+    /// `host_published_seq` orders this frame against the guest's own later
+    /// `clear_host_valid`, which is what
+    /// [`crate::runtime::resource_validity::licence_of`] answers at the payment.
+    ///
+    /// Anything else that has to notice a lazy Store belongs on the epoch and not
+    /// on the generation. The host window's publish key is the worked example:
+    /// it keyed on the generation, so a driven macos-13 boot with the lazy rail on
+    /// published 60 fresh frames a second against 314 `same_key` where the eager
+    /// arm published 81 against 131 — real frames discarded as unchanged. It now
+    /// carries `PresentState::frame_content_epoch` beside the generation.
     pub fn note_surface_content_published(&mut self, mapping_id: u32) -> u32 {
         let seq = self.next_validity_seq();
         let Some(m) = self.mappings.get_mut(&mapping_id) else {
@@ -3480,6 +3638,51 @@ mod fail_vocabulary_tests {
         assert!(!state.set_mapping_geom(1, 0, 64, 0x50));
         assert!(!state.set_mapping_geom(1, 64, 0, 0x50));
         assert!(!state.mappings.contains_key(&1));
+    }
+
+    /// The reach set is every page or no pages, never a short list.
+    ///
+    /// This is the one property the disjoint-settle skip rests on. Both ends of
+    /// that comparison — the writeback naming its destination, and a reader
+    /// asking whether it may skip the wait — come from
+    /// [`DeviceState::mapping_reach_pages`], so a set that silently dropped an
+    /// unresolvable entry would let a reader skip a settle for a page the
+    /// writeback is about to land in. That is a stale frame with no error
+    /// anywhere, which is why the failure direction is asserted and not just the
+    /// success one.
+    #[test]
+    fn a_mapping_reach_set_is_every_page_or_none() {
+        use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+        let shift = crate::model::PAGE_SHIFT_X86;
+        let mut state = DeviceState::new(DeviceId(1), shift);
+        assert!(state.set_mapping_geom(3, 64, 64, 0x50));
+
+        assert_eq!(
+            state.mapping_reach_pages(3),
+            None,
+            "a mapping with no page list can rule nothing out"
+        );
+        assert_eq!(
+            state.mapping_reach_pages(99),
+            None,
+            "a mapping that does not exist can rule nothing out"
+        );
+
+        let valid = |pfn: u32| (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
+        state.mappings.get_mut(&3).unwrap().page_entries = vec![valid(4), valid(5), valid(6)];
+        assert_eq!(
+            state.mapping_reach_pages(3),
+            Some(vec![4u64 << shift, 5u64 << shift, 6u64 << shift]),
+            "every entry resolves, so the whole set is named"
+        );
+
+        // The middle entry carries no VALID bit, so it names no backing.
+        state.mappings.get_mut(&3).unwrap().page_entries = vec![valid(4), 0, valid(6)];
+        assert_eq!(
+            state.mapping_reach_pages(3),
+            None,
+            "one unresolvable entry must unname the set, not shorten it"
+        );
     }
 
     /// Every one of the three entry points must reach the record, whatever it can

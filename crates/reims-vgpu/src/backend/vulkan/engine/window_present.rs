@@ -47,11 +47,10 @@ const fn guest_frame_budget_ns(refresh_hz: u32) -> Option<u64> {
     }
 }
 
-const ACQUIRE_RETRY_BUDGET_NS: u64 =
-    match guest_frame_budget_ns(crate::model::DISPLAY_REFRESH_HZ) {
-        Some(timeout) => timeout,
-        None => 0,
-    };
+const ACQUIRE_RETRY_BUDGET_NS: u64 = match guest_frame_budget_ns(crate::model::DISPLAY_REFRESH_HZ) {
+    Some(timeout) => timeout,
+    None => 0,
+};
 const _: () = assert!(ACQUIRE_RETRY_BUDGET_NS > 0);
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -472,6 +471,13 @@ pub(crate) fn swapchain_plan(
     }
 }
 
+/// The MAILBOX floor: one image queued, one being drawn, one to replace with.
+///
+/// Named rather than written inline because [`PRESENT_IN_FLIGHT`] is bounded by
+/// it, and a bound that restates a literal from another function is the kind
+/// that stops being true silently.
+const MAILBOX_MIN_IMAGES: u32 = 3;
+
 /// Swapchain image count for a mode, inside the surface's own bounds.
 ///
 /// `min + 1` is the usual one-spare rule. MAILBOX needs a third image to have
@@ -481,7 +487,7 @@ pub(crate) fn swapchain_plan(
 pub(crate) fn swapchain_image_count(caps_min: u32, caps_max: u32, mode: vk::PresentModeKHR) -> u32 {
     let mut count = caps_min.saturating_add(1);
     if mode == vk::PresentModeKHR::MAILBOX {
-        count = count.max(3);
+        count = count.max(MAILBOX_MIN_IMAGES);
     }
     if caps_max != 0 {
         count = count.min(caps_max);
@@ -548,12 +554,21 @@ pub(crate) struct WindowPresenter {
     /// never falls back never allocates it.
     staging: Option<StagingImage>,
     cmd_pool: vk::CommandPool,
-    cmd: vk::CommandBuffer,
-    image_available: vk::Semaphore,
+    /// One render-complete semaphore per swapchain image. Reacquiring an image
+    /// proves presentation has finished waiting on that image's semaphore;
+    /// retiring a submit fence alone does not.
     render_finished: PerSwapchainImage<vk::Semaphore>,
-    in_flight: vk::Fence,
-    submitted: bool,
-    pinned: Vec<TargetIdentity>,
+    /// One entry per present that may be in flight at once, used round-robin.
+    ///
+    /// Every field in [`PresentFrame`] is per-present and none may be shared: a
+    /// second present recording into the first's command buffer is a
+    /// use-after-submit the validation layers this device does not run would be
+    /// the only thing to catch. The render-finished semaphores are the deliberate
+    /// exception above: presentation lifetime makes those per swapchain image.
+    frames: Vec<PresentFrame>,
+    /// Which entry the next present will use. Advances only on a successful
+    /// submit, so a `Busy` return does not burn a slot.
+    frame_ix: usize,
     cadence_started: Instant,
     cadence_presents: u64,
     cadence_direct: u64,
@@ -581,7 +596,112 @@ pub(crate) struct WindowPresenter {
     cadence_acquire_rescued: u64,
 }
 
+/// Everything one in-flight present owns for as long as its blit is running.
+struct PresentFrame {
+    cmd: vk::CommandBuffer,
+    image_available: vk::Semaphore,
+    in_flight: vk::Fence,
+    /// Whether this entry's blit has been submitted and not yet retired.
+    submitted: bool,
+    /// Resident targets pinned for this present, released when its fence
+    /// retires. Per entry because two in-flight presents may pin different
+    /// surfaces and the earlier one's pins must not be dropped by the later
+    /// one's retire.
+    pinned: Vec<TargetIdentity>,
+}
+
+/// How many presents may be in flight at once.
+///
+/// # Why this is not 1
+///
+/// It was 1, and that made the presenter a hard ceiling rather than a pacer.
+/// Twelve driven macos-13 boots across three builds put `presents` at 1599-1696
+/// — a 5 % spread — while the device *published* 1760-2015 frames to it. Around
+/// 15 % of every boot's frames were built and thrown away, `busy_acquire` 0
+/// throughout, so the swapchain always had an image free and every refusal was
+/// the previous blit's fence still running.
+///
+/// The blit shares a queue with every guest draw, so that fence retires behind
+/// whatever guest work is queued rather than behind the copy itself — ~24 ms at
+/// the observed rate, against a blit of one surface. That is latency, and depth
+/// is what hides latency.
+///
+/// # Why the swapchain's floor and not more
+///
+/// A present past the image count cannot acquire an image, so it would refuse on
+/// `acquire` rather than on the fence — trading a wait we can see for one that
+/// reports as the display's pacing. Depth past what the swapchain serves buys
+/// nothing and moves the evidence.
+///
+/// A surface that caps `max_image_count` below this leaves the last entry
+/// unable to acquire. That is safe and self-limiting — it refuses as
+/// `busy_acquire`, which is exactly the counter that says so — and it is why
+/// this is a ceiling on ambition rather than a promise about the surface.
+///
+/// # It is transparent on every x86 rail, at every rate they offer
+///
+/// The depth was measured on macos-13 and shipped for all of them, so the other
+/// rails were owed a boot each. One driven boot per rail, same binary:
+///
+/// ```text
+/// rail       present_hz  offered_hz  busy_fence  busy_acquire  panic
+/// macos-11        45.20       45.20           0             0  no
+/// macos-12        47.20       47.20           0             0  no
+/// macos-14        45.60       45.60           0             0  no
+/// macos-15        14.45       14.45           0             0  no
+/// macos-26        40.00       40.00           0             0  no
+/// macos-26        21.05       21.05           0             0  no
+/// macos-26        36.20       36.20           0             0  no
+/// ```
+///
+/// `presents == offered` exactly on all seven boots, with both refusal counters
+/// at zero. Two readings carry it. macos-15 offers **14 Hz**, a third of what
+/// macos-13 does, and is equally transparent; and macos-26 was booted three
+/// times, landing at 40, 21 and 36 Hz, and tracked its own offer each time. So
+/// this is not a clamp that happens to sit above what these guests ask for — a
+/// clamp shows as the two columns diverging at the top of the range, and nothing
+/// here diverges at any rate between 14 and 47 Hz.
+///
+/// The macos-26 boots did not panic, which is worth stating precisely: that rail
+/// panics on roughly a third of driven boots for reasons of its own, three clean
+/// boots is an unremarkable draw from that rate, and this says nothing about
+/// whether the rate moved. It is the presenter that was being measured.
+const PRESENT_IN_FLIGHT: usize = MAILBOX_MIN_IMAGES as usize;
+
+/// At least as deep as the single-flight presenter this replaced, so indexing
+/// `frames` is always valid, and no deeper than the swapchain's own floor.
+/// Both ends are relations against values derived elsewhere rather than
+/// restatements of this line.
+const _: () = assert!(PRESENT_IN_FLIGHT >= 1 && PRESENT_IN_FLIGHT <= MAILBOX_MIN_IMAGES as usize);
+
 impl WindowPresenter {
+    /// How deep to run, after the environment has had its say.
+    ///
+    /// `REIMS_VGPU_PRESENT_DEPTH=off` returns 1, which is exactly the
+    /// single-flight presenter this replaced. It narrows — one present in flight
+    /// is strictly less concurrency, never more — so it obeys the rule that a
+    /// switch may only turn a rail off.
+    fn present_depth() -> usize {
+        static DEPTH: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *DEPTH.get_or_init(|| {
+            let (state, value) = crate::env::read(crate::env::PRESENT_DEPTH);
+            match state {
+                crate::env::Switch::Off => {
+                    crate::observe::off("present_depth reason=present_depth_disabled_by_env");
+                    1
+                }
+                crate::env::Switch::Unrecognized => {
+                    crate::observe::fail(format!(
+                        "present_depth reason=present_depth_env_unrecognized value={}",
+                        value.unwrap_or_default()
+                    ));
+                    PRESENT_IN_FLIGHT
+                }
+                crate::env::Switch::Unset | crate::env::Switch::On => PRESENT_IN_FLIGHT,
+            }
+        })
+    }
+
     pub(crate) unsafe fn create(
         ctx: &DeviceContext,
         display: RawDisplayHandle,
@@ -627,13 +747,14 @@ impl WindowPresenter {
                 )));
             }
         };
-        let cmd = match ctx.device.allocate_command_buffers(
+        let depth = Self::present_depth();
+        let cmds = match ctx.device.allocate_command_buffers(
             &vk::CommandBufferAllocateInfo::default()
                 .command_pool(cmd_pool)
                 .level(vk::CommandBufferLevel::PRIMARY)
-                .command_buffer_count(1),
+                .command_buffer_count(depth as u32),
         ) {
-            Ok(buffers) => buffers[0],
+            Ok(buffers) => buffers,
             Err(error) => {
                 ctx.device.destroy_command_pool(cmd_pool, None);
                 surface_loader.destroy_surface(surface, None);
@@ -643,35 +764,48 @@ impl WindowPresenter {
                 )));
             }
         };
-        let image_available = match ctx
-            .device
-            .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
-        {
-            Ok(semaphore) => semaphore,
-            Err(error) => {
-                ctx.device.destroy_command_pool(cmd_pool, None);
-                surface_loader.destroy_surface(surface, None);
-                return Err(DrawError::VkCall(VkCall::new(
-                    VkOp::WindowCreateAcquireSemaphore,
-                    error,
-                )));
+        // One set of per-present objects per entry. Built in a loop that unwinds
+        // everything already made on any failure, because a half-built presenter
+        // is returned as an error and never dropped — nothing else would free
+        // the entries that did succeed.
+        let mut frames: Vec<PresentFrame> = Vec::with_capacity(cmds.len());
+        let mut build = || -> Result<(), (VkOp, vk::Result)> {
+            for &cmd in &cmds {
+                let image_available = ctx
+                    .device
+                    .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
+                    .map_err(|e| (VkOp::WindowCreateAcquireSemaphore, e))?;
+                // Created signaled: the first present through each entry finds
+                // it retired rather than waiting on a fence nothing submitted.
+                let in_flight = match ctx.device.create_fence(
+                    &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
+                    None,
+                ) {
+                    Ok(fence) => fence,
+                    Err(error) => {
+                        ctx.device.destroy_semaphore(image_available, None);
+                        return Err((VkOp::WindowCreateFence, error));
+                    }
+                };
+                frames.push(PresentFrame {
+                    cmd,
+                    image_available,
+                    in_flight,
+                    submitted: false,
+                    pinned: Vec::new(),
+                });
             }
+            Ok(())
         };
-        let in_flight = match ctx.device.create_fence(
-            &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
-            None,
-        ) {
-            Ok(fence) => fence,
-            Err(error) => {
-                ctx.device.destroy_semaphore(image_available, None);
-                ctx.device.destroy_command_pool(cmd_pool, None);
-                surface_loader.destroy_surface(surface, None);
-                return Err(DrawError::VkCall(VkCall::new(
-                    VkOp::WindowCreateFence,
-                    error,
-                )));
+        if let Err((op, error)) = build() {
+            for frame in frames.drain(..) {
+                ctx.device.destroy_fence(frame.in_flight, None);
+                ctx.device.destroy_semaphore(frame.image_available, None);
             }
-        };
+            ctx.device.destroy_command_pool(cmd_pool, None);
+            surface_loader.destroy_surface(surface, None);
+            return Err(DrawError::VkCall(VkCall::new(op, error)));
+        }
 
         let mut presenter = Self {
             surface_loader,
@@ -692,12 +826,9 @@ impl WindowPresenter {
             slate_covered: false,
             staging: None,
             cmd_pool,
-            cmd,
-            image_available,
             render_finished: PerSwapchainImage::new(Vec::new()),
-            in_flight,
-            submitted: false,
-            pinned: Vec::new(),
+            frames,
+            frame_ix: 0,
             cadence_started: Instant::now(),
             cadence_presents: 0,
             cadence_direct: 0,
@@ -728,26 +859,65 @@ impl WindowPresenter {
         self.desired_extent = requested;
     }
 
+    /// Release every entry whose blit has finished, and say whether the entry
+    /// the next present would use is free.
+    ///
+    /// Sweeping all of them rather than only the next one matters for the pins:
+    /// an entry that completed is holding resident targets off the reclaim path,
+    /// and with several in flight the round-robin might not revisit it for
+    /// another two presents. The return value is still about one entry, because
+    /// that is the only one the caller is about to record into.
     unsafe fn retire(
         &mut self,
         ctx: &DeviceContext,
         pools: &mut ResourcePools,
     ) -> Result<bool, DrawError> {
-        if !self.submitted {
-            return Ok(true);
+        for ix in 0..self.frames.len() {
+            if !self.frames[ix].submitted {
+                continue;
+            }
+            let signaled = ctx
+                .device
+                .get_fence_status(self.frames[ix].in_flight)
+                .map_err(|error| DrawError::VkCall(VkCall::new(VkOp::WindowFenceStatus, error)))?;
+            if !signaled {
+                continue;
+            }
+            let pinned = std::mem::take(&mut self.frames[ix].pinned);
+            for identity in pinned {
+                let _ = pools.pin_resident_target(&identity, false);
+            }
+            self.frames[ix].submitted = false;
         }
-        let signaled = ctx
-            .device
-            .get_fence_status(self.in_flight)
-            .map_err(|error| DrawError::VkCall(VkCall::new(VkOp::WindowFenceStatus, error)))?;
-        if !signaled {
-            return Ok(false);
+        Ok(!self.frames[self.frame_ix].submitted)
+    }
+
+    /// Block until every submitted entry's blit has finished.
+    ///
+    /// Only the CPU-fallback staging path needs this, and only because that one
+    /// image is shared by every entry. The `submitted` latches are left alone:
+    /// clearing them is [`Self::retire`]'s job because that is where the pins
+    /// are released, and doing it in two places would let a pin outlive the
+    /// entry that took it.
+    ///
+    /// A wait failure is reported and swallowed rather than propagated. The
+    /// caller is already on a degraded path, and the honest options at that
+    /// point are "present a stale frame" or "abort the whole draw chain over a
+    /// fence" — the first is what a lost device is going to produce anyway.
+    unsafe fn wait_for_in_flight(&mut self, ctx: &DeviceContext) {
+        let fences: Vec<vk::Fence> = self
+            .frames
+            .iter()
+            .filter(|frame| frame.submitted)
+            .map(|frame| frame.in_flight)
+            .collect();
+        if fences.is_empty() {
+            return;
         }
-        for identity in self.pinned.drain(..) {
-            let _ = pools.pin_resident_target(&identity, false);
+        if let Err(error) = ctx.device.wait_for_fences(&fences, true, u64::MAX) {
+            let decline = VkCall::new(VkOp::WindowFenceStatus, error);
+            crate::observe::Emit::decline("host_window_staging_wait", &decline).fail_once(0);
         }
-        self.submitted = false;
-        Ok(true)
     }
 
     unsafe fn recreate_swapchain(&mut self, ctx: &DeviceContext) -> Result<(), DrawError> {
@@ -885,19 +1055,29 @@ impl WindowPresenter {
         // invalid to reuse on the new swapchain's first acquire. Created before
         // the old set is destroyed so a failure leaves the presenter
         // consistent.
-        let image_available = match ctx
-            .device
-            .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
-        {
-            Ok(semaphore) => semaphore,
-            Err(error) => {
-                self.swapchain_loader.destroy_swapchain(swapchain, None);
-                return Err(DrawError::VkCall(VkCall::new(
-                    VkOp::WindowCreateAcquireSemaphore,
-                    error,
-                )));
+        // Every entry gets a fresh acquire semaphore, not just the one about to be used. The
+        // queue idled above, so no entry has work outstanding — but an entry
+        // whose acquire succeeded and whose submit then failed still holds an
+        // unconsumed signal on its `image_available`, and that is invalid to
+        // reuse against the new swapchain whichever entry it belongs to.
+        let mut fresh_acquire = Vec::with_capacity(self.frames.len());
+        let mut make = || -> Result<(), (VkOp, vk::Result)> {
+            for _ in 0..self.frames.len() {
+                let image_available = ctx
+                    .device
+                    .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
+                    .map_err(|e| (VkOp::WindowCreateAcquireSemaphore, e))?;
+                fresh_acquire.push(image_available);
             }
+            Ok(())
         };
+        if let Err((op, error)) = make() {
+            for image_available in fresh_acquire {
+                ctx.device.destroy_semaphore(image_available, None);
+            }
+            self.swapchain_loader.destroy_swapchain(swapchain, None);
+            return Err(DrawError::VkCall(VkCall::new(op, error)));
+        }
         let mut render_finished = Vec::with_capacity(images.len());
         for _ in 0..images.len() {
             match ctx
@@ -909,7 +1089,9 @@ impl WindowPresenter {
                     for semaphore in render_finished.drain(..) {
                         ctx.device.destroy_semaphore(semaphore, None);
                     }
-                    ctx.device.destroy_semaphore(image_available, None);
+                    for image_available in fresh_acquire {
+                        ctx.device.destroy_semaphore(image_available, None);
+                    }
                     self.swapchain_loader.destroy_swapchain(swapchain, None);
                     return Err(DrawError::VkCall(VkCall::new(
                         VkOp::WindowCreateRenderSemaphore,
@@ -918,12 +1100,17 @@ impl WindowPresenter {
                 }
             }
         }
-        ctx.device.destroy_semaphore(self.image_available, None);
         for semaphore in self.render_finished.drain() {
             ctx.device.destroy_semaphore(semaphore, None);
         }
-        self.image_available = image_available;
         self.render_finished = PerSwapchainImage::new(render_finished);
+        for (frame, image_available) in self.frames.iter_mut().zip(fresh_acquire) {
+            ctx.device.destroy_semaphore(frame.image_available, None);
+            frame.image_available = image_available;
+            // The queue idled, so nothing is outstanding regardless of what the
+            // latch said before.
+            frame.submitted = false;
+        }
         self.swapchain = swapchain;
         self.images = images;
         self.extent = extent;
@@ -966,11 +1153,16 @@ impl WindowPresenter {
         if self.swapchain == vk::SwapchainKHR::null() || self.recreate_pending {
             self.recreate_swapchain(ctx)?;
         }
+        // Bound after any swapchain recreation above, which resets every latch.
+        let frame_ix = self.frame_ix;
+        let frame_cmd = self.frames[frame_ix].cmd;
+        let frame_image_available = self.frames[frame_ix].image_available;
+        let frame_in_flight = self.frames[frame_ix].in_flight;
         let (acquire, retry) = acquire_with_bounded_retry(|timeout| {
             self.swapchain_loader.acquire_next_image(
                 self.swapchain,
                 timeout,
-                self.image_available,
+                frame_image_available,
                 vk::Fence::null(),
             )
         });
@@ -1070,16 +1262,16 @@ impl WindowPresenter {
 
         let submit_result = (|| {
             ctx.device
-                .reset_fences(&[self.in_flight])
+                .reset_fences(&[frame_in_flight])
                 .map_err(|error| DrawError::VkCall(VkCall::new(VkOp::WindowResetFence, error)))?;
             ctx.device
-                .reset_command_buffer(self.cmd, vk::CommandBufferResetFlags::empty())
+                .reset_command_buffer(frame_cmd, vk::CommandBufferResetFlags::empty())
                 .map_err(|error| {
                     DrawError::VkCall(VkCall::new(VkOp::WindowResetCommandBuffer, error))
                 })?;
             ctx.device
                 .begin_command_buffer(
-                    self.cmd,
+                    frame_cmd,
                     &vk::CommandBufferBeginInfo::default()
                         .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
                 )
@@ -1094,7 +1286,7 @@ impl WindowPresenter {
             let dst = self.images[image_index as usize];
             image_barrier(
                 &ctx.device,
-                self.cmd,
+                frame_cmd,
                 dst,
                 vk::ImageLayout::UNDEFINED,
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
@@ -1118,7 +1310,7 @@ impl WindowPresenter {
                     // Letterbox bars: clear the whole image first so stale
                     // swapchain pixels never frame the guest content.
                     ctx.device.cmd_clear_color_image(
-                        self.cmd,
+                        frame_cmd,
                         dst,
                         vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                         &vk::ClearColorValue {
@@ -1127,10 +1319,10 @@ impl WindowPresenter {
                         &[color_range],
                     );
                 }
-                let src_layout = blit.record_read_barrier(&ctx.device, self.cmd);
+                let src_layout = blit.record_read_barrier(&ctx.device, frame_cmd);
                 blit_rect(
                     &ctx.device,
-                    self.cmd,
+                    frame_cmd,
                     blit.image(),
                     dst,
                     src_layout,
@@ -1138,14 +1330,12 @@ impl WindowPresenter {
                     (vp.x, vp.y, vp.x + vp.width, vp.y + vp.height),
                 );
                 if let Some((identity, _, _, _, _)) = selected.as_ref() {
-                    pools.registry_note_access(
-                        identity,
-                        super::pools::ResidentAccess::TransferRead,
-                    );
+                    pools
+                        .registry_note_access(identity, super::pools::ResidentAccess::TransferRead);
                 }
             } else {
                 ctx.device.cmd_clear_color_image(
-                    self.cmd,
+                    frame_cmd,
                     dst,
                     vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                     &vk::ClearColorValue {
@@ -1156,7 +1346,7 @@ impl WindowPresenter {
             }
             image_barrier(
                 &ctx.device,
-                self.cmd,
+                frame_cmd,
                 dst,
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                 vk::ImageLayout::PRESENT_SRC_KHR,
@@ -1165,14 +1355,14 @@ impl WindowPresenter {
                 vk::PipelineStageFlags::TRANSFER,
                 vk::PipelineStageFlags::BOTTOM_OF_PIPE,
             );
-            ctx.device.end_command_buffer(self.cmd).map_err(|error| {
+            ctx.device.end_command_buffer(frame_cmd).map_err(|error| {
                 DrawError::VkCall(VkCall::new(VkOp::WindowEndCommandBuffer, error))
             })?;
-            let waits = [self.image_available];
+            let waits = [frame_image_available];
             let wait_stages = [vk::PipelineStageFlags::TRANSFER];
             let render_finished = *self.render_finished.for_acquired(image_index);
             let signals = [render_finished];
-            let commands = [self.cmd];
+            let commands = [frame_cmd];
             ctx.device
                 .queue_submit(
                     ctx.queue(),
@@ -1181,7 +1371,7 @@ impl WindowPresenter {
                         .wait_dst_stage_mask(&wait_stages)
                         .command_buffers(&commands)
                         .signal_semaphores(&signals)],
-                    self.in_flight,
+                    frame_in_flight,
                 )
                 .map_err(|error| DrawError::VkCall(VkCall::new(VkOp::WindowSubmitPresent, error)))
         })();
@@ -1191,8 +1381,11 @@ impl WindowPresenter {
             }
             return Err(error);
         }
-        self.pinned = pinned;
-        self.submitted = true;
+        self.frames[frame_ix].pinned = pinned;
+        self.frames[frame_ix].submitted = true;
+        // Only a successful submit advances the ring; a `Busy` return above
+        // leaves the slot for the next attempt.
+        self.frame_ix = (frame_ix + 1) % self.frames.len();
         if matches!(blit, Some(BlitSource::Staged { .. })) {
             // The barrier that leaves the staging image in GENERAL is now
             // queued. Recorded only after the submit succeeds: a failed submit
@@ -1271,6 +1464,20 @@ impl WindowPresenter {
         ctx: &DeviceContext,
         frame: WindowCpuFrame<'_>,
     ) -> Option<BlitSource> {
+        // The staging image is **one allocation shared by every entry**, written
+        // here by the CPU and read by the blit the caller is about to record. So
+        // before touching it, drain any other present still in flight: with a
+        // depth of one that was free, and `ensure_staging`'s doc relies on it
+        // (a geometry change destroys the previous image, which is only safe
+        // while nothing queued still reads it).
+        //
+        // Waiting rather than refusing, because refusing here would mean
+        // returning `Busy` after the swapchain image is already acquired, and
+        // that leaves an unconsumed signal on `image_available` — the exact
+        // state `recreate_swapchain` documents as invalid to reuse. Waiting is
+        // affordable precisely here: this is the failure path taken when no
+        // resident can carry the present, and it never runs on a good frame.
+        self.wait_for_in_flight(ctx);
         if let Err(error) = self.ensure_staging(ctx, frame.width, frame.height) {
             // A host that cannot allocate staging cannot allocate it next frame
             // either, so this latches to one line per boot rather than one per
@@ -1346,6 +1553,7 @@ impl WindowPresenter {
         let req = ctx.device.get_image_memory_requirements(image);
         let Some(mem_type) = ctx.memory_type_for(
             req.memory_type_bits,
+            req.size,
             crate::backend::vulkan::caps::MemoryClass::Upload,
         ) else {
             ctx.device.destroy_image(image, None);
@@ -1512,10 +1720,12 @@ impl WindowPresenter {
     }
 
     pub(crate) fn release_pins_after_idle(&mut self, pools: &mut ResourcePools) {
-        for identity in self.pinned.drain(..) {
-            let _ = pools.pin_resident_target(&identity, false);
+        for frame in &mut self.frames {
+            for identity in frame.pinned.drain(..) {
+                let _ = pools.pin_resident_target(&identity, false);
+            }
+            frame.submitted = false;
         }
-        self.submitted = false;
     }
 
     pub(crate) unsafe fn destroy(
@@ -1528,21 +1738,29 @@ impl WindowPresenter {
             crate::observe::Emit::decline("host_window_destroy", &decline).fail_once(0);
         }
         if let Some(pools) = pools {
-            for identity in self.pinned.drain(..) {
-                let _ = pools.pin_resident_target(&identity, false);
+            for frame in &mut self.frames {
+                for identity in frame.pinned.drain(..) {
+                    let _ = pools.pin_resident_target(&identity, false);
+                }
             }
         } else {
-            self.pinned.clear();
+            for frame in &mut self.frames {
+                frame.pinned.clear();
+            }
         }
-        self.submitted = false;
         if let Some(staging) = self.staging.take() {
             staging.destroy(&ctx.device);
         }
-        ctx.device.destroy_fence(self.in_flight, None);
         for semaphore in self.render_finished.drain() {
             ctx.device.destroy_semaphore(semaphore, None);
         }
-        ctx.device.destroy_semaphore(self.image_available, None);
+        // Drained rather than iterated, so a second `destroy` — `create` calls
+        // it on a failed `recreate_swapchain`, and the caller may call it again
+        // — cannot double-free a handle.
+        for frame in self.frames.drain(..) {
+            ctx.device.destroy_fence(frame.in_flight, None);
+            ctx.device.destroy_semaphore(frame.image_available, None);
+        }
         ctx.device.destroy_command_pool(self.cmd_pool, None);
         if self.swapchain != vk::SwapchainKHR::null() {
             self.swapchain_loader
@@ -2119,5 +2337,43 @@ mod tests {
         let capped = swapchain_plan(1, 2, &[fifo, mailbox]);
         assert_eq!(capped.present_mode, mailbox);
         assert_eq!(capped.image_count, 2);
+    }
+
+    /// The present depth must be servable by the swapchain the plan asks for.
+    ///
+    /// The two numbers are derived from one constant now, so this cannot drift
+    /// by a rename — but it can drift by someone raising [`PRESENT_IN_FLIGHT`]
+    /// for its own sake. An entry past the image count cannot acquire, so it
+    /// would refuse as `busy_acquire` forever: the presenter would look like it
+    /// had depth while permanently wasting its last slot, and the counter that
+    /// says so is the one nobody reads when `busy_fence` is the suspect.
+    ///
+    /// The capped case is asserted too, and asserted as *tolerated* rather than
+    /// as correct: a surface that will only give two images leaves the third
+    /// entry unusable, and that is safe and self-reporting rather than a bug.
+    #[test]
+    fn the_present_depth_is_servable_by_the_swapchain_it_asks_for() {
+        use super::{swapchain_plan, MAILBOX_MIN_IMAGES, PRESENT_IN_FLIGHT};
+        let fifo = vk::PresentModeKHR::FIFO;
+        let mailbox = vk::PresentModeKHR::MAILBOX;
+
+        assert_eq!(
+            PRESENT_IN_FLIGHT, MAILBOX_MIN_IMAGES as usize,
+            "the depth is the swapchain's own floor, not a number of its own"
+        );
+        let plan = swapchain_plan(1, 0, &[fifo, mailbox]);
+        assert_eq!(plan.present_mode, mailbox);
+        assert!(
+            plan.image_count as usize >= PRESENT_IN_FLIGHT,
+            "a MAILBOX swapchain must be able to serve every in-flight present: \
+             {} images against depth {PRESENT_IN_FLIGHT}",
+            plan.image_count
+        );
+
+        let capped = swapchain_plan(1, 2, &[fifo, mailbox]);
+        assert!(
+            (capped.image_count as usize) < PRESENT_IN_FLIGHT,
+            "a surface capped at two is the case the depth cannot be served in"
+        );
     }
 }

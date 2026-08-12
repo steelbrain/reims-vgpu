@@ -1188,7 +1188,16 @@ fn display_swap_signals_present_complete_on_shared_page() {
         "display IRQ status must name display 0"
     );
 
-    // Enable mask without the present bit: pending still set, no IRQ.
+    // Enable mask without the present bit: NEITHER the pending bit nor the IRQ.
+    //
+    // The pending half of this used to assert the opposite — that the bit is
+    // written whether or not the guest asked for the class. The guest's own
+    // interrupt handler is what makes that wrong: it read-clears
+    // `pending & enable_mask` and leaves every other bit exactly where it found
+    // it, so a bit set for a disabled class is never cleared by anyone. It is
+    // then carried forward by every later read-modify-write of the word, which
+    // is what a live macOS 13 guest showed — `+0x100` reading `0x3` against an
+    // enable mask of `0xc`, both bits set by this device and neither wanted.
     state
         .gfx
         .interrupt_status_disp
@@ -1199,7 +1208,11 @@ fn display_swap_signals_present_complete_on_shared_page() {
     assert!(host
         .read_gpa(shared + DISPLAY_SHARED_PENDING, &mut le)
         .is_ok());
-    assert_ne!(u32::from_le_bytes(le) & DISPLAY_PRESENT_EVENT_MASK, 0);
+    assert_eq!(
+        u32::from_le_bytes(le) & DISPLAY_PRESENT_EVENT_MASK,
+        0,
+        "a present bit the guest disabled is a bit nothing will ever clear"
+    );
     assert_eq!(
         state
             .gfx
@@ -1207,6 +1220,20 @@ fn display_swap_signals_present_complete_on_shared_page() {
             .load(std::sync::atomic::Ordering::Acquire),
         0,
         "no display IRQ when the guest did not ask for present events"
+    );
+
+    // An unreadable enable mask must not be read as permission. The guest
+    // published this page's address itself, so a read of it the host cannot
+    // perform is not a reason to start signalling classes nobody asked for.
+    state.display.shared_gpa = 0xdead_0000_0000;
+    signal_display_present_complete(&mut state, &mut host);
+    assert_eq!(
+        state
+            .gfx
+            .interrupt_status_disp
+            .load(std::sync::atomic::Ordering::Acquire),
+        0,
+        "an unreadable enable mask must not authorise a present event"
     );
 }
 
@@ -2055,6 +2082,11 @@ fn a_guest_that_never_enables_cannot_reach_the_online_cap() {
 /// - `not_online` and `not_claimed` stay separate, because "the display never
 ///   came up" and "the 8 ms limiter is working correctly at 125 Hz" are opposite
 ///   conclusions from the same low delivered count.
+///
+/// The head of each arm reports at the finer `VBL_REPORT_EARLY` cadence, so the
+/// first assertion below counts sixteen lines rather than one. Both cadences
+/// measure the window they cover, which is what keeps the rate comparable across
+/// the boundary between them.
 #[test]
 fn the_vbl_census_reports_window_rate_and_separates_the_silent_arms() {
     use crate::runtime::drain::{VblCensus, VBL_DELIVERED, VBL_NOT_CLAIMED, VBL_NOT_ONLINE};
@@ -2066,20 +2098,23 @@ fn the_vbl_census_reports_window_rate_and_separates_the_silent_arms() {
         assert!(c.note(VBL_NOT_CLAIMED, i).is_none());
     }
 
-    // 1024 deliveries at the 8 ms grid: one report, and the rate is the grid.
+    // 1024 deliveries at the 8 ms grid. The head of an arm reports every 64 so
+    // the display-link latch window is visible at all, so that is 16 lines, and
+    // each covers 64 deliveries over 512 ms — still the grid rate, because the
+    // window and the step are the same quantity.
     let mut lines = Vec::new();
     for i in 1..=1024u64 {
         if let Some(l) = c.note(VBL_DELIVERED, i * 8) {
             lines.push(l);
         }
     }
-    assert_eq!(lines.len(), 1, "exactly one report per 1024 deliveries");
-    let line = &lines[0];
-    assert!(line.contains("delivered=1024"), "{line}");
+    assert_eq!(lines.len(), 16, "one report per 64 deliveries over the head");
     assert!(
-        line.contains("window_hz=125.0"),
-        "1024 deliveries spanning 8192 ms is 125 Hz: {line}"
+        lines.iter().all(|l| l.contains("window_hz=125.0")),
+        "every early window is 64 deliveries over 512 ms: {lines:?}"
     );
+    let line = lines.last().expect("the head reports");
+    assert!(line.contains("delivered=1024"), "{line}");
     assert!(
         line.contains("not_online=5000") && line.contains("not_claimed=5000"),
         "the silent arms must stay separable and counted: {line}"
@@ -2858,6 +2893,11 @@ fn signal_display_vbl_after_online_uses_shared_time_limiter() {
     state.display.shared_gpa = gpa;
     state.display.display_index = 0;
     state.display.online_acked = true;
+    // This test is about the limiter, so it models a guest that asked for VBL.
+    // Without the bit the path declines before the limiter is reached and every
+    // count below reads zero — see
+    // `signal_display_vbl_declines_a_class_the_guest_did_not_enable`.
+    host.put_u32(gpa + DISPLAY_SHARED_ENABLE_MASK, DISPLAY_VBL_EVENT_MASK);
 
     // Microseconds: the base must exceed one grid interval from the zero the
     // limiter starts at, or the very first claim is refused as too early.
@@ -2903,6 +2943,98 @@ fn signal_display_vbl_after_online_uses_shared_time_limiter() {
             & 1,
         0
     );
+}
+
+/// A guest that has not enabled VBL in the shared page's mask gets no VBL:
+/// no pending bit, no interrupt.
+///
+/// The guest's interrupt handler read-clears `pending & enable_mask` and leaves
+/// every other bit exactly where it found it, so a bit this device sets for a
+/// disabled class is one that nothing will ever clear. It is not an ignored
+/// notification; it is a permanent residue in a word this device keeps
+/// read-modify-writing.
+///
+/// Both x86 rails measured here disable VBL: a macOS 11 guest published mask
+/// `0xe` and a macOS 13 guest `0xc`, and each left `+0x100` holding precisely
+/// the bits this device had set and the guest had not asked for — `0x1` and
+/// `0x3`. Meanwhile the census reported `delivered=13312 window_hz=120.0`,
+/// describing a 120 Hz display link to a guest that had asked for none of it.
+///
+/// The mask is re-read per tick rather than latched: `enableVBLInterrupt` and
+/// `disableVBLInterrupt` are a `lock or` and a `lock and` on that same word, so
+/// the guest may turn the class on or off at any moment and expects the next
+/// tick to honour it.
+#[test]
+fn signal_display_vbl_declines_a_class_the_guest_did_not_enable() {
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    let last_ms = std::sync::atomic::AtomicU64::new(0);
+    let gpa = 0x7c000000u64;
+    host.map_range(gpa, PAGE_SIZE_ARM64E as usize, 0);
+    state.display.shared_gpa = gpa;
+    state.display.display_index = 0;
+    state.display.online_acked = true;
+
+    // The two masks a real x86 guest was measured publishing. Neither carries
+    // the VBL bit, so neither is owed a VBL pending bit — but `0x0e` carries the
+    // *transaction* class (macOS 11 arms that instead of VBL), and the tick owes
+    // that guest an interrupt for it. `0x0c` carries only online and offline,
+    // neither of which a refresh tick signals, so nothing at all is owed there.
+    //
+    // `owes_irq` is what separates "this device declined a class" from "this
+    // device went quiet": both masks decline VBL and only one of them means the
+    // guest hears nothing.
+    for (mask, owes_irq) in [(0x0eu32, true), (0x0cu32, false)] {
+        host.put_u32(gpa + DISPLAY_SHARED_ENABLE_MASK, mask);
+        host.put_u32(gpa + DISPLAY_SHARED_PENDING, 0);
+        host.actions.clear();
+        state
+            .gfx
+            .interrupt_status_disp
+            .store(0, std::sync::atomic::Ordering::Release);
+        // Well past one grid interval, so the limiter is not what refuses.
+        last_ms.store(0, std::sync::atomic::Ordering::Release);
+        signal_display_vbl_at(&mut state, &mut host, &last_ms, 5_000_000);
+
+        let mut pending = [0u8; 4];
+        host.read_gpa(gpa + DISPLAY_SHARED_PENDING, &mut pending)
+            .unwrap();
+        assert_eq!(
+            ld32(&pending) & DISPLAY_VBL_EVENT_MASK,
+            0,
+            "mask {mask:#x} does not carry VBL, so the pending bit must stay clear"
+        );
+        assert_eq!(
+            host.actions.len(),
+            usize::from(owes_irq),
+            "mask {mask:#x}: interrupt owed = {owes_irq}"
+        );
+        assert_eq!(
+            state
+                .gfx
+                .interrupt_status_disp
+                .load(std::sync::atomic::Ordering::Acquire)
+                != 0,
+            owes_irq,
+            "mask {mask:#x}: display IRQ status owed = {owes_irq}"
+        );
+    }
+
+    // And the same tick delivers once the guest turns the class on, which is
+    // what says the decline above is the mask and not some other refusal.
+    host.put_u32(gpa + DISPLAY_SHARED_ENABLE_MASK, 0x0e | DISPLAY_VBL_EVENT_MASK);
+    host.actions.clear();
+    last_ms.store(0, std::sync::atomic::Ordering::Release);
+    signal_display_vbl_at(&mut state, &mut host, &last_ms, 5_000_000);
+    let mut pending = [0u8; 4];
+    host.read_gpa(gpa + DISPLAY_SHARED_PENDING, &mut pending)
+        .unwrap();
+    assert_ne!(
+        ld32(&pending) & DISPLAY_VBL_EVENT_MASK,
+        0,
+        "the guest enabled VBL, so the pending bit is owed"
+    );
+    assert_eq!(host.actions.len(), 1, "the guest enabled VBL, so an IRQ is owed");
 }
 
 /// The VBL limiter is phase-locked to a fixed interval grid so poll jitter
@@ -2993,6 +3125,161 @@ fn claim_display_vbl_long_stall_resyncs_without_burst() {
     // steady single-VBL cadence, not a burst.
     assert!(claim_display_vbl(&last, now + interval));
     assert!(!claim_display_vbl(&last, now + interval)); // same instant: no double
+}
+
+/// Stand up a display whose shared page is mapped and whose ONLINE is acked, so
+/// `signal_display_vbl_at` reaches the enable-mask read.
+#[cfg(test)]
+fn one_shot_display() -> (DeviceState, FakeHost, u64) {
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    let gpa = 0x7c000000u64;
+    host.map_range(gpa, PAGE_SIZE_ARM64E as usize, 0);
+    state.display.shared_gpa = gpa;
+    state.display.display_index = 0;
+    state.display.online_acked = true;
+    (state, host, gpa)
+}
+
+#[cfg(test)]
+fn set_enable_mask(host: &mut FakeHost, gpa: u64, mask: u32) {
+    let mut m = [0u8; 4];
+    st32(&mut m, mask);
+    host.write_gpa(gpa + DISPLAY_SHARED_ENABLE_MASK, &m).unwrap();
+}
+
+/// Did this tick hand the guest a VBL? Consumes the pending bit the way the
+/// guest's ISR does, so the next tick starts from a clean word.
+#[cfg(test)]
+fn took_vbl(host: &mut FakeHost, gpa: u64) -> bool {
+    let mut pending = [0u8; 4];
+    host.read_gpa(gpa + DISPLAY_SHARED_PENDING, &mut pending)
+        .unwrap();
+    let got = ld32(&pending) & DISPLAY_VBL_EVENT_MASK != 0;
+    let mut zero = [0u8; 4];
+    st32(&mut zero, 0);
+    host.write_gpa(gpa + DISPLAY_SHARED_PENDING, &zero).unwrap();
+    got
+}
+
+/// A tick that samples the guest mid-turnaround must not spend the grid slot the
+/// guest is about to ask for.
+///
+/// macOS 13 arms VBL one shot at a time — it clears bit 0 inside its handler and
+/// sets it again when it next wants a frame — so a poll is as likely to find the
+/// mask disarmed as armed. While the claim happened *before* the mask read, that
+/// disarmed sample advanced the grid timestamp, and the guest's re-arm a
+/// millisecond later then waited a further full interval. Its delivery rate
+/// aliased to every other grid point, which is the 60-vs-120 boot-to-boot split.
+#[test]
+fn a_disarmed_tick_does_not_spend_the_grid_slot() {
+    use std::sync::atomic::AtomicU64;
+    let interval = DISPLAY_VBL_MIN_INTERVAL_US;
+    let (mut state, mut host, gpa) = one_shot_display();
+    let last = AtomicU64::new(0);
+
+    // The guest arms, and one interval in it is served.
+    set_enable_mask(&mut host, gpa, DISPLAY_VBL_EVENT_MASK | DISPLAY_ONLINE_EVENT_MASK);
+    signal_display_vbl_at(&mut state, &mut host, &last, interval);
+    assert!(took_vbl(&mut host, gpa), "an armed guest is served");
+
+    // It disarms inside its handler. The next grid point finds nothing armed.
+    set_enable_mask(&mut host, gpa, DISPLAY_ONLINE_EVENT_MASK);
+    signal_display_vbl_at(&mut state, &mut host, &last, 2 * interval);
+    assert!(!took_vbl(&mut host, gpa), "a disarmed guest is owed nothing");
+
+    // It re-arms a millisecond later. A full interval has now passed since the
+    // last *delivery*, so it must be served on the very next poll rather than
+    // waiting out another interval it already waited.
+    set_enable_mask(&mut host, gpa, DISPLAY_VBL_EVENT_MASK | DISPLAY_ONLINE_EVENT_MASK);
+    signal_display_vbl_at(&mut state, &mut host, &last, 2 * interval + 1_000);
+    assert!(
+        took_vbl(&mut host, gpa),
+        "the disarmed tick spent this guest's slot — the 60-Hz latch"
+    );
+}
+
+/// Reading the mask before claiming must not let the guest outrun the refresh
+/// rate the timing table advertises.
+///
+/// This is the direction the fix could have widened: the limiter is the only
+/// thing standing between a 240 Hz poll and a guest that holds VBL armed
+/// continuously, and it now runs after a read that succeeds far more often.
+#[test]
+fn a_continuously_armed_guest_is_still_capped_at_the_advertised_rate() {
+    use std::sync::atomic::AtomicU64;
+    let interval = DISPLAY_VBL_MIN_INTERVAL_US;
+    let (mut state, mut host, gpa) = one_shot_display();
+    let last = AtomicU64::new(0);
+    set_enable_mask(&mut host, gpa, DISPLAY_VBL_EVENT_MASK | DISPLAY_ONLINE_EVENT_MASK);
+
+    // Poll far faster than the grid, the way the 4 ms PCI heartbeat oversamples
+    // an 8333 us interval, and never disarm.
+    let step = interval / 8;
+    let polls = 400u64;
+    let mut delivered = 0u64;
+    for i in 1..=polls {
+        signal_display_vbl_at(&mut state, &mut host, &last, i * step);
+        if took_vbl(&mut host, gpa) {
+            delivered += 1;
+        }
+    }
+    let grid = polls * step / interval;
+    assert!(
+        delivered <= grid,
+        "delivered {delivered} exceeds the {grid} the advertised rate allows"
+    );
+    assert!(
+        delivered >= grid - 1,
+        "delivered {delivered} falls short of the grid {grid}"
+    );
+}
+
+/// Both reporting arms measure their own window, and neither resets the other's.
+///
+/// A guest that arms VBL one shot at a time keeps `delivered` and `not_enabled`
+/// both live, so both report — and they shared one `last_report` pair, which made
+/// every window wrong precisely on the boots worth reading. The symptom in a real
+/// log is `window_hz=0.0`: an arm reaching its own 1024 subtracted the other
+/// arm's 1024 and got a zero-length count.
+#[test]
+fn the_two_reporting_vbl_arms_do_not_share_one_window() {
+    use crate::runtime::drain::{VblCensus, VBL_DELIVERED, VBL_NOT_ENABLED};
+    let c = VblCensus::default();
+
+    // A one-shot guest takes both arms on the same timeline — a tick either
+    // found it armed or did not — so both cross 1024 over one 8 ms grid and both
+    // report at the same instant. Each is 1024 events over its own 8192 ms, so
+    // both lines must read 125 Hz; with one shared pair whichever reports second
+    // subtracts the first's count and prints the `window_hz=0.0` that a real
+    // driven boot is full of.
+    let mut served = None;
+    let mut declined = None;
+    for i in 1..=1024u64 {
+        if let Some(l) = c.note(VBL_DELIVERED, i * 8) {
+            served = Some(l);
+        }
+        if let Some(l) = c.note(VBL_NOT_ENABLED, i * 8) {
+            declined = Some(l);
+        }
+    }
+    for (line, arm) in [
+        (served.expect("delivered reports at its own 1024"), "delivered"),
+        (
+            declined.expect("not_enabled reports at its own 1024"),
+            "not_enabled",
+        ),
+    ] {
+        assert!(line.contains(&format!("arm={arm}")), "{line}");
+        assert!(
+            !line.contains("window_hz=0.0"),
+            "{arm} had the other arm's count subtracted from it: {line}"
+        );
+        assert!(
+            line.contains("window_hz=125.0"),
+            "{arm} saw 1024 events over 8192 ms, which is 125 Hz: {line}"
+        );
+    }
 }
 
 /// After online is acked, a stale ONLINE bit (bit2) left in pending is
@@ -4544,7 +4831,7 @@ fn a_stamp_wait_naming_a_slot_that_cannot_exist_runs_rather_than_parking() {
     );
     let decoded = decode_packet(&both, 0, both.len() as u32, RING).expect("two records decode");
     assert_eq!(
-        note_packet_stamp_waits(&state, &host, None, &decoded),
+        note_packet_stamp_waits(&state, &host, None, &decoded, None),
         StampVerdict::Unevaluable,
         "Unevaluable outranks Hold, or the packet parks forever on the wait that \
          cannot clear while waiting for the one that could"
@@ -5479,5 +5766,315 @@ fn a_declined_command_is_latched_in_the_log_and_counted_in_the_census() {
         3,
         "the census counts every packet, which is the rate the latched line \
          cannot carry"
+    );
+}
+
+/// No display signal path may set a pending bit for a class the guest has not
+/// enabled — swept over every possible enable word.
+///
+/// This is the invariant behind the whole two-word mailbox, and it is the one a
+/// second reader of the enable mask broke: the guest's ISR clears
+/// `pending &= ~enable`, so a bit set outside the mask is not an ignored
+/// notification but a word it will never clear, carried forward by every later
+/// read-modify-write for the life of the boot.
+///
+/// The sweep is over all 16 masks rather than the two the x86 rails happen to
+/// publish, because "which classes a guest arms" is a per-generation decision
+/// and a rail this device has not booted yet is exactly where a missing check
+/// would first cost guest work. Both signal paths run under each mask against a
+/// zeroed pending word, so anything left set outside the mask came from a path
+/// that did not consult it.
+#[test]
+fn no_display_signal_path_sets_a_bit_the_guest_did_not_enable() {
+    use crate::model::DISPLAY_EVENT_MASK_ALL;
+    for mask in 0..=DISPLAY_EVENT_MASK_ALL {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let mut host = FakeHost::new();
+        let gpa = 0x7c000000u64;
+        host.map_range(gpa, PAGE_SIZE_ARM64E as usize, 0);
+        state.display.shared_gpa = gpa;
+        state.display.display_index = 0;
+        state.display.online_acked = true;
+        host.put_u32(gpa + DISPLAY_SHARED_ENABLE_MASK, mask);
+        host.put_u32(gpa + DISPLAY_SHARED_PENDING, 0);
+
+        let last_us = std::sync::atomic::AtomicU64::new(0);
+        signal_display_vbl_at(&mut state, &mut host, &last_us, 5_000_000);
+        signal_display_present_complete(&mut state, &mut host);
+
+        let mut pending = [0u8; 4];
+        host.read_gpa(gpa + DISPLAY_SHARED_PENDING, &mut pending)
+            .unwrap();
+        let set = ld32(&pending);
+        assert_eq!(
+            set & !mask,
+            0,
+            "enable=0x{mask:x} left pending=0x{set:x}: bit(s) 0x{:x} are outside \
+             the guest's mask and its ISR will never clear them",
+            set & !mask
+        );
+    }
+}
+
+/// The display-offline class is never signalled, whatever the guest enables.
+///
+/// Bit 3 dispatches to the guest's *offline* event source: signalling it tells a
+/// healthy guest its display went away. This device creates the scanout once and
+/// keeps it for the life of the VM, so the honest state of that bit is always
+/// clear — and a guest arming it is ordinary, not a request. The distinction
+/// matters because an enable word of `0xe` reads as "the guest wants something
+/// we do not send", which is true and harmless, rather than as a missing signal.
+#[test]
+fn display_offline_is_never_signalled_even_when_the_guest_arms_it() {
+    use crate::model::{DISPLAY_EVENT_MASK_ALL, DISPLAY_OFFLINE_EVENT_MASK};
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    let gpa = 0x7c000000u64;
+    host.map_range(gpa, PAGE_SIZE_ARM64E as usize, 0);
+    state.display.shared_gpa = gpa;
+    state.display.display_index = 0;
+    state.display.online_acked = true;
+    // Everything armed, including offline: the most permissive guest there is.
+    host.put_u32(gpa + DISPLAY_SHARED_ENABLE_MASK, DISPLAY_EVENT_MASK_ALL);
+    host.put_u32(gpa + DISPLAY_SHARED_PENDING, 0);
+
+    let last_us = std::sync::atomic::AtomicU64::new(0);
+    signal_display_vbl_at(&mut state, &mut host, &last_us, 5_000_000);
+    signal_display_present_complete(&mut state, &mut host);
+
+    let mut pending = [0u8; 4];
+    host.read_gpa(gpa + DISPLAY_SHARED_PENDING, &mut pending)
+        .unwrap();
+    assert_eq!(
+        ld32(&pending) & DISPLAY_OFFLINE_EVENT_MASK,
+        0,
+        "a signalled offline bit tears down a live display pipe"
+    );
+}
+
+/// A guest that arms only the transaction class still gets a refresh tick.
+///
+/// The two x86 rails measured here disagree about which event class carries
+/// "the frame you were showing is done with": a macOS 13 guest arms VBL and
+/// never arms the transaction class, a macOS 11 guest does the exact opposite.
+/// The tick has to honour whichever one the guest published, because the guest
+/// side of the transaction class retires the *live* transaction and then
+/// consumes the ring — a per-refresh edge, not a per-present one.
+///
+/// Getting this wrong is a hang and not a slowdown. The wait it feeds (the
+/// window server's transaction-queue drain) sleeps with no deadline, so a device
+/// that raises the class only when a present happens rings it once, the frame
+/// goes live, and nothing ever retires it.
+#[test]
+fn the_refresh_tick_signals_the_transaction_class_when_that_is_what_the_guest_armed() {
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    let gpa = 0x7c000000u64;
+    host.map_range(gpa, PAGE_SIZE_ARM64E as usize, 0);
+    state.display.shared_gpa = gpa;
+    state.display.display_index = 0;
+    state.display.online_acked = true;
+    // Exactly what a macOS 11 guest publishes: transaction + online + offline,
+    // and no VBL for the life of the boot.
+    host.put_u32(
+        gpa + DISPLAY_SHARED_ENABLE_MASK,
+        DISPLAY_PRESENT_EVENT_MASK | DISPLAY_ONLINE_EVENT_MASK | 0x8,
+    );
+    host.put_u32(gpa + DISPLAY_SHARED_PENDING, 0);
+
+    let last_us = std::sync::atomic::AtomicU64::new(0);
+    signal_display_vbl_at(&mut state, &mut host, &last_us, 5_000_000);
+
+    let mut pending = [0u8; 4];
+    host.read_gpa(gpa + DISPLAY_SHARED_PENDING, &mut pending)
+        .unwrap();
+    assert_ne!(
+        ld32(&pending) & DISPLAY_PRESENT_EVENT_MASK,
+        0,
+        "the tick must raise the class the guest armed, or its queue drain never wakes"
+    );
+    assert_eq!(
+        ld32(&pending) & DISPLAY_VBL_EVENT_MASK,
+        0,
+        "VBL was not armed and must not be written"
+    );
+    assert_eq!(
+        host.actions.len(),
+        1,
+        "one tick raises at most one interrupt, whatever it signalled"
+    );
+    assert_eq!(host.actions[0].kind, HostActionKind::IrqGfxPulse);
+}
+
+/// Arming both classes still costs one interrupt and one pending write.
+///
+/// Nothing observed arms both, but the tick reads a guest-owned word and must
+/// not turn a mask it did not expect into a doubled doorbell rate.
+#[test]
+fn a_refresh_tick_that_signals_both_classes_raises_one_interrupt() {
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    let gpa = 0x7c000000u64;
+    host.map_range(gpa, PAGE_SIZE_ARM64E as usize, 0);
+    state.display.shared_gpa = gpa;
+    state.display.display_index = 0;
+    state.display.online_acked = true;
+    host.put_u32(
+        gpa + DISPLAY_SHARED_ENABLE_MASK,
+        DISPLAY_VBL_EVENT_MASK | DISPLAY_PRESENT_EVENT_MASK,
+    );
+    host.put_u32(gpa + DISPLAY_SHARED_PENDING, 0);
+
+    let last_us = std::sync::atomic::AtomicU64::new(0);
+    signal_display_vbl_at(&mut state, &mut host, &last_us, 5_000_000);
+
+    let mut pending = [0u8; 4];
+    host.read_gpa(gpa + DISPLAY_SHARED_PENDING, &mut pending)
+        .unwrap();
+    assert_eq!(
+        ld32(&pending),
+        DISPLAY_VBL_EVENT_MASK | DISPLAY_PRESENT_EVENT_MASK
+    );
+    assert_eq!(host.actions.len(), 1);
+}
+
+/// The interval audit is counted on every verdict, not only on a finding.
+///
+/// This is the difference between "the audit ran and found nothing" and "the
+/// audit never ran", and a dozen panicking macos-26 boots were read as the
+/// first when the log could only support the second: the fail line fires for a
+/// finding and is deduped on top of that, so silence was the expected output of
+/// both. Only the census can say a clean pairing was actually observed.
+#[test]
+fn the_map_interval_audit_counts_a_clean_pairing_and_not_only_a_finding() {
+    use crate::runtime::drain::store_route_count;
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut host = FakeHost::new();
+
+    // task@0 u32, gva@4 u64, length@12 u64 — the layout `apply_map_family`
+    // decodes and the one the guest's own allocator receives.
+    let payload = |task: u32, gva: u64, len: u64| {
+        let mut p = vec![0u8; 20];
+        p[0..4].copy_from_slice(&task.to_le_bytes());
+        p[4..12].copy_from_slice(&gva.to_le_bytes());
+        p[12..20].copy_from_slice(&len.to_le_bytes());
+        p
+    };
+    let packet = |opcode: u16, payload: Vec<u8>| Packet {
+        opcode,
+        stamp_waits: Vec::new(),
+        total_size: PACKET_HEADER_LEN + payload.len() as u32,
+        completion_stamp: 0,
+        payload,
+        next_head: 0,
+    };
+
+    let clean = store_route_count("map_audit_consistent");
+    let bad = store_route_count("map_audit_unmap_of_unmapped");
+
+    let gva = 0x4000_0000u64;
+    let len = 4u64 << PAGE_SHIFT_X86;
+    process_child_packet(
+        &mut state,
+        &mut host,
+        7,
+        &packet(CHILD_OP_MAP_MEMORY2, payload(3, gva, len)),
+    );
+    process_child_packet(
+        &mut state,
+        &mut host,
+        7,
+        &packet(CHILD_OP_UNMAP_MEMORY, payload(3, gva, len)),
+    );
+    assert_eq!(
+        store_route_count("map_audit_consistent"),
+        clean + 2,
+        "a matched map and unmap must leave a positive reading; without one, an \
+         audit that never ran reads exactly like an audit that found nothing"
+    );
+
+    // The second release of the same range is the shape the guest asserts on,
+    // and it must be counted under its own name rather than absorbed.
+    process_child_packet(
+        &mut state,
+        &mut host,
+        7,
+        &packet(CHILD_OP_UNMAP_MEMORY, payload(3, gva, len)),
+    );
+    assert_eq!(store_route_count("map_audit_unmap_of_unmapped"), bad + 1);
+    assert_eq!(
+        store_route_count("map_audit_consistent"),
+        clean + 2,
+        "a finding must not also be counted as a clean pairing"
+    );
+}
+
+/// The coalesced stamp keeps the **greatest** value a drain latched, in the same
+/// wrapping-signed order a wait is compared in.
+///
+/// Not "the last one seen". For a well-formed guest the two agree, and the whole
+/// point of taking the maximum is that a regressing stamp arriving from the
+/// guest cannot make this device publish a slot going backwards — which would
+/// unsatisfy a wait the guest had already been told was met.
+#[test]
+fn a_coalesced_stamp_keeps_the_latest_value_across_the_u32_wrap() {
+    let mut pending = PendingStamp::default();
+    assert_eq!(pending.owed(), None, "a drain that stamped nothing owes nothing");
+
+    pending.latch(7);
+    pending.latch(9);
+    assert_eq!(pending.owed(), Some(9), "the later of two ascending stamps");
+
+    pending.latch(8);
+    assert_eq!(
+        pending.owed(),
+        Some(9),
+        "a stamp behind the one held must not pull the slot backwards"
+    );
+
+    // Across the wrap: 0xffff_fff0 then 4. The signed difference is +20, so 4 is
+    // *later*, and a plain `>=` would keep 0xffff_fff0 and stall every wait on
+    // the far side of the wrap.
+    let mut wrapped = PendingStamp::default();
+    wrapped.latch(0xffff_fff0);
+    wrapped.latch(4);
+    assert_eq!(
+        wrapped.owed(),
+        Some(4),
+        "the wrap is a signed difference, not a magnitude comparison"
+    );
+}
+
+/// A wait on the slot the drain is holding is answered from the latch.
+///
+/// Without this the packet reads the stale word out of guest RAM, returns
+/// `Hold`, and parks the channel against a stamp this device is itself sitting
+/// on — a deadlock introduced by the coalescing rather than by the guest.
+#[test]
+fn a_pending_stamp_discharges_a_wait_on_its_own_slot_and_no_other() {
+    const SLOT: u32 = 3;
+    let mut pending = PendingStamp::default();
+    pending.latch(20);
+
+    let met = StampWait { index: SLOT, value: 20 };
+    assert!(
+        pending.discharges(SLOT, met),
+        "a wait at exactly the latched value is discharged"
+    );
+    assert!(
+        pending.discharges(SLOT, StampWait { index: SLOT, value: 12 }),
+        "and so is one behind it"
+    );
+    assert!(
+        !pending.discharges(SLOT, StampWait { index: SLOT, value: 21 }),
+        "a wait past the latched value is not discharged by it"
+    );
+    assert!(
+        !pending.discharges(SLOT, StampWait { index: SLOT + 1, value: 1 }),
+        "a wait on another slot is not this drain's to answer"
+    );
+    assert!(
+        !PendingStamp::default().discharges(SLOT, met),
+        "a drain that has latched nothing discharges nothing"
     );
 }
