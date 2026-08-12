@@ -599,8 +599,9 @@ pub fn window_present_resize(width: u32, height: u32) {
 }
 
 /// Present the current compositor resident through the engine-owned swapchain,
-/// falling back to `cpu` for presents no resident carries. Acquire is
-/// nonblocking, so a vblank wait never holds `ENGINE`.
+/// falling back to `cpu` for presents no resident carries. Acquire probes
+/// without waiting; an exhausted swapchain gets at most one guest frame budget
+/// to dispatch WSI releases while `ENGINE` is held.
 #[cfg(feature = "host-window")]
 pub fn window_present_frame(
     source: Option<&WindowPresentSource>,
