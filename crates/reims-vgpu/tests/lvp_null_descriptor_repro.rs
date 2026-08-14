@@ -11,8 +11,8 @@
 
 use metal2vulkan::passes::Stage;
 use reims_vgpu::backend::vulkan::engine::{
-    self, DrawRequest, LoadOp, PrimitiveTopology, SampledImageResource, SampledSource,
-    SamplerResource, StorageBufferResource,
+    self, DrawRequest, PrimitiveTopology, SampledImageResource, SampledSource, SamplerResource,
+    StorageBufferResource,
 };
 use std::path::PathBuf;
 
@@ -72,14 +72,17 @@ fn base_request_px(with_texture: bool, with_sampler: bool, px: [u8; 4], dim: u32
         width: 64,
         height: 64,
         vertex_count: 6,
-        flip_viewport_y: true,
         first_vertex: 0,
         instance_count: Some(1),
         base_instance: 0,
         primitive_topology: PrimitiveTopology::Triangle,
+        // Default `target_clear` is `[0.0; 4]` and no seed/load-from-target is
+        // set, so the pass clears to transparent black — the same load action
+        // this request spelled explicitly before `LoadOp` was retired in favor
+        // of `target_clear` + the load-source fields it now shares the struct
+        // with (see `DrawRequest::target_clear`'s doc).
         ..Default::default()
     };
-    req.load_op = Some(LoadOp::Clear([0.0, 0.0, 0.0, 0.0]));
     req.storage_buffers.push(StorageBufferResource {
         binding: 0,
         content: encode_f32(&quad.into_iter().flatten().collect::<Vec<_>>()).into(),
