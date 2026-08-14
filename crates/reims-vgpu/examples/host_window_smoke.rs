@@ -50,6 +50,9 @@ fn main() {
             title: "reims_vgpu host-window smoke".to_string(),
             width: w,
             height: h,
+            // A smoke test stays windowed: it is a present-path check, and a
+            // fullscreen mode change would only add a window-system interaction.
+            fullscreen: false,
         },
         on_input,
         frames,

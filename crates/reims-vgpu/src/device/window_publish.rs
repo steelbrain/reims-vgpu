@@ -164,6 +164,7 @@ pub fn device_window_start(id: u64, width: u32, height: u32) -> bool {
         } else {
             height
         },
+        fullscreen: crate::env::switch(crate::env::FULLSCREEN) == crate::env::Switch::On,
     };
     let stop: crate::host_window::present::StopFlag =
         Arc::new(std::sync::atomic::AtomicBool::new(false));

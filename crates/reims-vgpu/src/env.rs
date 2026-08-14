@@ -859,6 +859,25 @@ pub const PASS_CHURN: &str = "REIMS_VGPU_PASS_CHURN";
 /// settle it, and the arm and its `bext_*` census stay so that they can.
 pub const EXTENT_NARROW: &str = "REIMS_VGPU_EXTENT_NARROW";
 
+/// `on` opens the host presentation window borderless fullscreen instead of
+/// windowed, on the monitor winit picks.
+///
+/// A host-side presentation preference and nothing else. It changes the
+/// geometry of the window the device presents into — never the frames it
+/// presents, never a rail the guest observes, never what the device is
+/// capable of. The guest framebuffer, the pointer mapping and the
+/// `WindowConfig` size all stay exactly what they would be in a window; the
+/// window system just places the window over the whole display, without
+/// decorations.
+///
+/// It is read by `host_window::present` at window creation, which is why it
+/// is the only variable here that names a presentation mode rather than a
+/// device rail. Default off, because a windowed window is the state an
+/// operator can inspect and leave alone; `on` is the state a VM is *used*
+/// in. Like every on-switch in this module it adds host-side work (a
+/// fullscreen mode change) and can never grant the device a capability.
+pub const FULLSCREEN: &str = "REIMS_VGPU_FULLSCREEN";
+
 /// What one variable says, including the two ways it says nothing usable.
 ///
 /// Four states rather than a `bool` because "unset", "explicitly on" and
@@ -932,7 +951,7 @@ pub fn switch(name: &str) -> Switch {
 /// Nothing enforces that a new `pub const` above is added to this list; the rule
 /// is stated and honestly unenforced. What keeps it small is that the list is
 /// next to the constants, and [`report_line`] is the only consumer.
-pub const ALL: [&str; 20] = [
+pub const ALL: [&str; 21] = [
     LAZY_WRITEBACK,
     SLAB_RETAIN,
     CLEAR_SEED,
@@ -958,6 +977,7 @@ pub const ALL: [&str; 20] = [
     LAYOUT_CHURN,
     PASS_CHURN,
     EXTENT_NARROW,
+    FULLSCREEN,
 ];
 
 /// The state of every variable in [`ALL`], for the one-shot boot line.

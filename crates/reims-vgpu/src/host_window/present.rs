@@ -34,7 +34,7 @@ use winit::application::ApplicationHandler;
 use winit::event::{ElementState, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::PhysicalKey;
-use winit::window::{Window, WindowId};
+use winit::window::{Fullscreen, Window, WindowId};
 
 use super::input_map;
 use crate::runtime::host::HostAction;
@@ -110,6 +110,11 @@ pub struct WindowConfig {
     pub title: String,
     pub width: u32,
     pub height: u32,
+    /// Ask winit for a borderless fullscreen window (`REIMS_VGPU_FULLSCREEN`).
+    /// A presentation-mode preference only: the window system places the
+    /// window over the display, and nothing about the frames, the guest or
+    /// the pointer mapping changes.
+    pub fullscreen: bool,
 }
 
 impl Default for WindowConfig {
@@ -118,7 +123,22 @@ impl Default for WindowConfig {
             title: "Reims vGPU".to_string(),
             width: 1280,
             height: 800,
+            fullscreen: false,
         }
+    }
+}
+
+/// The fullscreen request this config asks winit for: borderless on the
+/// current monitor when [`WindowConfig::fullscreen`] is set, nothing
+/// otherwise.
+///
+/// Split out from `resumed` so the decision is testable without an event
+/// loop, and so the two spellings (windowed / fullscreen) cannot drift.
+fn fullscreen_request(config: &WindowConfig) -> Option<Fullscreen> {
+    if config.fullscreen {
+        Some(Fullscreen::Borderless(None))
+    } else {
+        None
     }
 }
 
@@ -755,7 +775,8 @@ impl ApplicationHandler<FramePublished> for App {
             .with_inner_size(winit::dpi::PhysicalSize::new(
                 self.config.width,
                 self.config.height,
-            ));
+            ))
+            .with_fullscreen(fullscreen_request(&self.config));
         let window = match event_loop.create_window(attrs) {
             Ok(w) => Arc::new(w),
             Err(e) => {
@@ -1673,5 +1694,29 @@ mod tests {
     #[test]
     fn a_resize_with_nothing_pending_is_not_an_answer() {
         assert_eq!(guest_resize_settled(None, (1920, 1080)), None);
+    }
+
+    /// The fullscreen preference maps to exactly one winit request: borderless
+    /// on the current monitor, or nothing at all. A windowed config that asks
+    /// for a fullscreen mode, or a fullscreen config that asks for none, is
+    /// the branch inverted — and the windowed spelling is the one every
+    /// default boot takes.
+    #[test]
+    fn a_fullscreen_config_requests_borderless_fullscreen_and_only_then() {
+        let mut config = WindowConfig::default();
+        assert!(
+            fullscreen_request(&config).is_none(),
+            "the default window must not request fullscreen"
+        );
+        config.fullscreen = true;
+        assert!(
+            matches!(
+                fullscreen_request(&config),
+                Some(Fullscreen::Borderless(None))
+            ),
+            "a fullscreen config must request borderless on the current monitor"
+        );
+        config.fullscreen = false;
+        assert!(fullscreen_request(&config).is_none());
     }
 }
