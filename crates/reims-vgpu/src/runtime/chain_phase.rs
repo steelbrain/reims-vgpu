@@ -408,6 +408,13 @@ mod tests {
     /// another's name, which is worse than not splitting at all because it
     /// still looks like an answer. The three sleeps are different lengths so a
     /// crossed pair cannot pass.
+    ///
+    /// Each band is its own sleep +/- half of it, which is what makes a crossed
+    /// pair impossible to pass -- 2, 4 and 6 ms are further apart than that --
+    /// and is deliberately not tighter. `thread::sleep` guarantees a floor and
+    /// nothing else; a macOS host overshoots the 6 ms one to ~7.5 ms, which a
+    /// 7 500 us ceiling failed on every run of this test on Apple Silicon while
+    /// reading exactly like a real attribution bug.
     #[test]
     fn each_assemble_sub_phase_is_carved_out_and_lands_in_its_own_field() {
         let _ = take_window();
@@ -427,11 +434,11 @@ mod tests {
             "the 2 ms sleep charged the target rails and only them: {w:?}"
         );
         assert!(
-            (3_000..5_500).contains(&w.assemble_depth_us),
+            (3_000..6_000).contains(&w.assemble_depth_us),
             "the 4 ms sleep charged the depth load and only it: {w:?}"
         );
         assert!(
-            (5_000..7_500).contains(&w.assemble_trail_us),
+            (5_000..9_000).contains(&w.assemble_trail_us),
             "the 6 ms sleep charged the trail and only it: {w:?}"
         );
         assert!(
