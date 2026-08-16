@@ -55,6 +55,24 @@ pub fn is_declared_load_action(raw: u16) -> bool {
     raw <= MTL_LOAD_ACTION_CLEAR
 }
 
+/// Which band of colour attachments a census reading is about.
+///
+/// The band and not the slot. Eight slots times three actions times two
+/// counters is forty-eight `&'static str`s to answer a question nobody asks per
+/// slot, and the split that carries information is this one: slot 0 is the
+/// attachment that aliases guest memory, carries the LOAD seed, and reaches the
+/// present path, while slots 1..N are ordinary residents. A reading that
+/// separates those two answers "did a *secondary* declare this", which is the
+/// question a divergence between the two producers makes worth asking; a
+/// reading per slot answers nothing further.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AttachmentBand {
+    /// The primary colour attachment, Metal slot 0.
+    Color0,
+    /// Any MRT colour attachment beyond the primary, Metal slots 1 and up.
+    Color1Plus,
+}
+
 /// A colour attachment's load action in this device's own vocabulary rather than
 /// the guest's ordinal.
 ///
@@ -70,13 +88,24 @@ pub fn is_declared_load_action(raw: u16) -> bool {
 /// catch-all silently carries both DontCare and a corrupt ordinal, and where
 /// `rustc` cannot say that a fourth arm is missing. Matching this enum is
 /// checked.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// # `Default` is `Clear`, which is not the ordinal-zero member
+///
+/// Nothing on the wire is ever defaulted — [`Self::from_declared`] is the only
+/// boundary parse and it is total, so this impl is reached exclusively by a
+/// `..Default::default()` on a backend request struct, i.e. by a producer that
+/// said nothing. An attachment whose action nobody stated must be given
+/// *defined* contents: `DontCare` is a licence to leave whatever was in the tile
+/// memory, and handing that out to a caller who simply forgot the field is a
+/// silent loss of the kind this crate refuses to ship. `Clear` costs a write and
+/// cannot lose anything.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
 pub enum LoadAction {
     /// The attachment's prior contents may be discarded.
     DontCare,
     /// The pass composites onto the attachment's contents.
     Load,
     /// The attachment starts at the record's clear value.
+    #[default]
     Clear,
 }
 
@@ -101,12 +130,35 @@ impl LoadAction {
     /// its dozens of full-screen ones. Named together here so the pair cannot
     /// drift apart, and returned rather than emitted so this module keeps no
     /// dependency on the census.
+    ///
+    /// Banded by [`AttachmentBand`] because the two producers of this device's
+    /// colour attachments are separate code, and for a while only one of them
+    /// had a census at all — so a boot could say how many *primary* attachments
+    /// declared each action and nothing whatever about the secondaries. A
+    /// question that can only be asked of half the population is how a
+    /// divergence between two arms over one wire form stays theoretical.
     #[must_use]
-    pub fn census_routes(self) -> (&'static str, &'static str) {
-        match self {
-            Self::DontCare => ("color0_declared_dontcare", "color0_declared_dontcare_px"),
-            Self::Load => ("color0_declared_load", "color0_declared_load_px"),
-            Self::Clear => ("color0_declared_clear", "color0_declared_clear_px"),
+    pub fn census_routes(self, band: AttachmentBand) -> (&'static str, &'static str) {
+        match (band, self) {
+            (AttachmentBand::Color0, Self::DontCare) => {
+                ("color0_declared_dontcare", "color0_declared_dontcare_px")
+            }
+            (AttachmentBand::Color0, Self::Load) => {
+                ("color0_declared_load", "color0_declared_load_px")
+            }
+            (AttachmentBand::Color0, Self::Clear) => {
+                ("color0_declared_clear", "color0_declared_clear_px")
+            }
+            (AttachmentBand::Color1Plus, Self::DontCare) => (
+                "color1plus_declared_dontcare",
+                "color1plus_declared_dontcare_px",
+            ),
+            (AttachmentBand::Color1Plus, Self::Load) => {
+                ("color1plus_declared_load", "color1plus_declared_load_px")
+            }
+            (AttachmentBand::Color1Plus, Self::Clear) => {
+                ("color1plus_declared_clear", "color1plus_declared_clear_px")
+            }
         }
     }
 }
@@ -224,22 +276,55 @@ mod tests {
         }
     }
 
-    /// The six census route names are distinct, and each count is paired with
-    /// its own area counter.
+    /// The twelve census route names are distinct, and each count is paired
+    /// with its own area counter.
     ///
     /// A copied line here reads as a working census and silently adds one
     /// action's records to another's — the failure that makes a boot's ranking
-    /// wrong in the direction that looks like a finding.
+    /// wrong in the direction that looks like a finding. With a band the copy is
+    /// easier to make and harder to see: `color1plus`'s three arms are the
+    /// obvious paste of `color0`'s, and a paste that forgot to change the prefix
+    /// would file every secondary's declaration under the primary's counter, so
+    /// the two producers would be indistinguishable in exactly the reading that
+    /// exists to tell them apart.
     #[test]
-    fn every_load_action_has_its_own_pair_of_census_routes() {
+    fn every_load_action_has_its_own_pair_of_census_routes_in_each_band() {
         let mut seen = std::collections::BTreeSet::new();
-        for action in [LoadAction::DontCare, LoadAction::Load, LoadAction::Clear] {
-            let (n, px) = action.census_routes();
-            assert_eq!(px, format!("{n}_px"), "the area route names its own count");
-            assert!(seen.insert(n), "{n} is already another action's count");
-            assert!(seen.insert(px), "{px} is already another action's area");
+        for band in [AttachmentBand::Color0, AttachmentBand::Color1Plus] {
+            let prefix = match band {
+                AttachmentBand::Color0 => "color0_",
+                AttachmentBand::Color1Plus => "color1plus_",
+            };
+            for action in [LoadAction::DontCare, LoadAction::Load, LoadAction::Clear] {
+                let (n, px) = action.census_routes(band);
+                assert_eq!(px, format!("{n}_px"), "the area route names its own count");
+                assert!(
+                    n.starts_with(prefix),
+                    "{n} is filed under a band it did not come from"
+                );
+                assert!(seen.insert(n), "{n} is already another route's count");
+                assert!(seen.insert(px), "{px} is already another route's area");
+            }
         }
-        assert_eq!(seen.len(), 6);
+        assert_eq!(seen.len(), 12);
+    }
+
+    /// An unstated load action is `Clear`, not the ordinal-zero `DontCare`.
+    ///
+    /// The two differ by whether a producer that forgot the field gets defined
+    /// contents or undefined ones, and the derive would have picked the first
+    /// variant. Pinned so that reordering the enum to put `DontCare` first --
+    /// which is the order the Metal ordinals are in, and therefore the tempting
+    /// order -- cannot silently hand every defaulted request a licence to leave
+    /// the attachment full of whatever was there.
+    #[test]
+    fn an_unstated_load_action_is_the_one_that_cannot_lose_content() {
+        assert_eq!(LoadAction::default(), LoadAction::Clear);
+        assert_ne!(
+            LoadAction::default(),
+            LoadAction::from_declared(MTL_LOAD_ACTION_DONT_CARE),
+            "defaulting must not be a way to spell DontCare without declaring it"
+        );
     }
 
     /// Neither predicate can see the two adjacent words swapped.

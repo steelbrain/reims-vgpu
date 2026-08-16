@@ -3053,49 +3053,6 @@ pub(crate) fn load_action_in_contract(pipeline_ref: u32, load_action: u16) -> bo
     false
 }
 
-/// Report an *in-contract* `MTLLoadActionDontCare`, which the Vulkan arm cannot
-/// spell and raises to a clear.
-///
-/// [`load_action_in_contract`] only speaks for the fourth value and above. The
-/// three inside the set are where the two encode arms part:
-///
-/// - `backend::metal::render`'s `color_rt_load_action` has a DontCare arm and
-///   passes it through, so Metal gets the attachment the guest asked for and
-///   skips the load entirely.
-/// - The Vulkan engine's render-pass key carries `load_seed: bool`, derived from
-///   whether a seed was *resolved* rather than from the guest's ordinal, so
-///   DontCare and Clear reach `caches.rs` as the same key and both become
-///   `vk::AttachmentLoadOp::CLEAR` against the record's clear colour.
-///   `vk::AttachmentLoadOp::DONT_CARE` is unreachable for a colour or depth
-///   attachment on that arm.
-///
-/// Clearing satisfies DontCare — the contract permits any contents — so this is
-/// not lost guest work and the line is on the OFF channel. What it is not is
-/// free: the substitution costs a full-surface clear per pass, and it replaces
-/// Metal's undefined contents with one specific value, which a guest that only
-/// partly covers the attachment would see.
-///
-/// Nothing is changed here, deliberately. Plumbing the ordinal through to the
-/// pass key is a behaviour change on the pathway that renders, and the first
-/// thing needed is a reading of whether a guest sends DontCare at all — the same
-/// answer [`store_action_in_contract`]'s doc asks for on the adjacent wire word.
-/// A non-zero count here is the argument for widening the key; a zero says the
-/// bool was always enough.
-///
-/// Latched on `(pipeline, slug)` like its siblings: a guest that means DontCare
-/// means it every frame, and repetition would carry nothing the first line did
-/// not.
-#[cfg(feature = "backend-vulkan")]
-pub(crate) fn note_load_action_dont_care(pipeline_ref: u32, width: u32, height: u32) {
-    if degrade_log_first(pipeline_ref, "load_action_dont_care_cleared") {
-        crate::observe::off(format!(
-            "pass_load_action reason=load_action_dont_care_cleared \
-             pipe={pipeline_ref} geom={width}x{height} \
-             (MTLLoadActionDontCare has no PassKey spelling; raised to CLEAR)"
-        ));
-    }
-}
-
 /// Whether a decoded store action is one of the named values this wire form
 /// carries, reporting an unknown value.
 ///
@@ -5872,53 +5829,6 @@ mod load_action_contract_tests {
         );
     }
 
-    /// The third in-contract value gets its own reading, on the OFF channel.
-    ///
-    /// `load_action_in_contract` above answers only for the fourth value and up,
-    /// so the substitution the Vulkan arm makes *inside* the set — DontCare
-    /// reaching `caches.rs` as the same pass key as Clear, and resolving to
-    /// `AttachmentLoadOp::CLEAR` — had no reading at all while its out-of-set
-    /// sibling had one. The channel is the claim: clearing satisfies DontCare,
-    /// so this is a report and not a loss.
-    #[test]
-    fn an_in_contract_dont_care_reports_that_it_became_a_clear() {
-        let path = crate::observe::fail_log_path();
-        let count = || {
-            std::fs::read_to_string(path)
-                .unwrap_or_default()
-                .matches("reason=load_action_dont_care_cleared")
-                .count()
-        };
-        let before = count();
-
-        super::note_load_action_dont_care(0xD0C1, 1920, 1080);
-        assert_eq!(count(), before + 1, "the first sighting reports");
-        // Latched per (pipeline, slug): a guest that means DontCare means it
-        // every frame, so repetition must carry nothing the first line did not.
-        super::note_load_action_dont_care(0xD0C1, 1920, 1080);
-        super::note_load_action_dont_care(0xD0C1, 640, 480);
-        assert_eq!(count(), before + 1, "the same pipeline does not re-report");
-        // A different pipeline is a different episode.
-        super::note_load_action_dont_care(0xD0C2, 1920, 1080);
-        assert_eq!(count(), before + 2);
-
-        let log = std::fs::read_to_string(path).expect("fail log");
-        let line = log
-            .lines()
-            .rev()
-            .find(|l| {
-                l.contains("reason=load_action_dont_care_cleared") && l.contains("pipe=53442")
-            })
-            .expect("the substitution must name itself");
-        assert!(
-            line.starts_with("OFF pass_load_action "),
-            "a contract-conformant substitution belongs on the OFF channel: {line}"
-        );
-        assert!(
-            line.contains("geom=1920x1080"),
-            "the line must carry the geometry the clear was paid for: {line}"
-        );
-    }
 }
 
 #[cfg(all(test, feature = "backend-vulkan"))]

@@ -146,8 +146,53 @@ const _: () = assert!(MAX_SECONDARY_ATTACH < u8::BITS as usize);
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Default)]
 pub(crate) struct SecondaryAttachKey {
     pub format: ash::vk::Format,
-    /// true = LOAD existing content, false = CLEAR.
-    pub load: bool,
+    /// What this pass does with the attachment's prior contents.
+    ///
+    /// All three of Metal's load actions, because Vulkan has all three and this
+    /// device decodes all three. It was a `bool` meaning LOAD-or-CLEAR, and the
+    /// producer narrowed the guest's ordinal with
+    /// `c.load_action == MTL_LOAD_ACTION_LOAD` — which sent DontCare to CLEAR
+    /// *and to the descriptor's own `clearColor`*, a field
+    /// `MTLRenderPass.h` says is consulted only when the action is Clear. So a
+    /// guest that declared its secondary's contents undefined got them filled
+    /// with a colour it never asked to be applied, at full attachment area,
+    /// with `storeOp = STORE` writing the fabrication back out.
+    pub load: crate::contract::pass_action::LoadAction,
+}
+
+/// The `VkAttachmentLoadOp` and `initialLayout` a colour attachment's load
+/// action asks for.
+///
+/// Written once and called for both the primary and every secondary, because
+/// the two spelled this by hand and the hand-written pair is where the third
+/// value went missing. It is also the whole translation: `MTLLoadAction` and
+/// `VkAttachmentLoadOp` are the same three cases, which is why this device
+/// never needed to fabricate anything here and why MoltenVK maps our
+/// `DONT_CARE` straight back to `MTLLoadActionDontCare` on the arm64 host --
+/// the guest's own word reaches Apple's own driver unchanged.
+///
+/// The layout half is not a second decision. `LOAD` must name the layout the
+/// previous pass left the attachment in, because a pass that names a layout its
+/// image is not in is undefined behaviour; `CLEAR` and `DONT_CARE` both promise
+/// to read nothing, so both take `UNDEFINED` and let the driver skip whatever
+/// transition it likes. Returning the pair together is what stops a future
+/// third case from getting one half right.
+fn vk_color_load_op(
+    action: crate::contract::pass_action::LoadAction,
+    load_initial_layout: ash::vk::ImageLayout,
+) -> (ash::vk::AttachmentLoadOp, ash::vk::ImageLayout) {
+    use crate::contract::pass_action::LoadAction;
+    match action {
+        LoadAction::Load => (ash::vk::AttachmentLoadOp::LOAD, load_initial_layout),
+        LoadAction::Clear => (
+            ash::vk::AttachmentLoadOp::CLEAR,
+            ash::vk::ImageLayout::UNDEFINED,
+        ),
+        LoadAction::DontCare => (
+            ash::vk::AttachmentLoadOp::DONT_CARE,
+            ash::vk::ImageLayout::UNDEFINED,
+        ),
+    }
 }
 
 /// A depth attachment's contribution to the render-pass key. `None` on `PassKey`
@@ -165,7 +210,26 @@ pub(crate) struct DepthAttachKey {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub(crate) struct PassKey {
-    pub load_seed: bool, // LOAD vs CLEAR (slot 0)
+    /// What this pass does with colour slot 0's prior contents.
+    ///
+    /// This was `load_seed: bool`, and the name was the defect: it meant "a seed
+    /// was resolved", so the *engine* decided the load action by looking at
+    /// whether the runtime had handed it bytes. Four request fields were the
+    /// inputs to that reconstruction — `target_rgba8`, `target_guest_seed`,
+    /// `seed_from_target`, `load_from_target` — and [`super::types::DrawRequest`]
+    /// said so in as many words. A layer that assembles a rule out of its
+    /// caller's inputs has reconstructed a decision its caller already made,
+    /// which is the same violation the QEMU shims are held to; the caller now
+    /// exports the answer as [`super::types::DrawRequest::color0_load`] and the
+    /// seed fields are inputs to *content*, not to the action.
+    ///
+    /// Three values and not two because Metal has three and Vulkan has three.
+    /// The narrowing spent a whole `MTLLoadActionDontCare` on CLEAR, which on
+    /// this pathway is a full-plane write at memory bandwidth — a quarter of
+    /// these attachments are `VK_IMAGE_TILING_LINEAR` over guest RAM with no
+    /// fast clear — and, worse, a *defined* colour where the guest declared the
+    /// contents undefined.
+    pub color0_load: crate::contract::pass_action::LoadAction,
     /// Slot 0 aliases memory the host may modify between submissions.
     ///
     /// A linear image is host-accessible only in `PREINITIALIZED` or `GENERAL`.
@@ -216,9 +280,12 @@ pub(crate) struct PassKey {
 
 impl PassKey {
     /// Single-color-attachment pass (the pre-MRT constructor).
-    pub(crate) fn single(load_seed: bool, color0_format: ash::vk::Format) -> Self {
+    pub(crate) fn single(
+        color0_load: crate::contract::pass_action::LoadAction,
+        color0_format: ash::vk::Format,
+    ) -> Self {
         Self {
-            load_seed,
+            color0_load,
             host_accessible_color0: false,
             color0_format,
             secondary: [SecondaryAttachKey::default(); MAX_SECONDARY_ATTACH],
@@ -261,9 +328,13 @@ impl PassKey {
     /// image is not in.
     pub(crate) fn compatibility(self) -> PassCompatibilityKey {
         let mut key = self;
-        key.load_seed = false;
+        // Erased to one canonical member. Which member is arbitrary -- nothing
+        // downstream reads it -- but it must be written the same way in all
+        // three places below, or two passes that differ only in load action stop
+        // comparing equal and the compatibility key silently stops being one.
+        key.color0_load = crate::contract::pass_action::LoadAction::Clear;
         for secondary in &mut key.secondary {
-            secondary.load = false;
+            secondary.load = crate::contract::pass_action::LoadAction::Clear;
         }
         if let Some(depth) = &mut key.depth {
             depth.load = false;
@@ -412,7 +483,7 @@ impl PassCompatibilityKey {
         let PassKey {
             // Load actions are erased by `PassKey::compatibility`, so they are
             // equal here by construction and cannot be a difference.
-            load_seed: _,
+            color0_load: _,
             host_accessible_color0,
             color0_format,
             secondary,
@@ -1746,11 +1817,7 @@ impl ObjectCaches {
         // second spelling here would make that skip a missing transition the
         // first time somebody changed one of them.
         let color0_final = key.color_final_layout(0);
-        let (load_op, initial) = if key.load_seed {
-            (vk::AttachmentLoadOp::LOAD, color0_final)
-        } else {
-            (vk::AttachmentLoadOp::CLEAR, vk::ImageLayout::UNDEFINED)
-        };
+        let (load_op, initial) = vk_color_load_op(key.color0_load, color0_final);
         // Slot 0 (primary) and the secondary attachments (slot 1..) now exit the
         // same way, at [`color0_pass_exit_layout`], and for the same reason: a
         // consumer's barrier is what establishes the dependency, so leaving the
@@ -1783,11 +1850,7 @@ impl ObjectCaches {
         {
             let attachment_index = i + 1;
             let final_layout = key.color_final_layout(attachment_index);
-            let (sload, sinitial) = if sec.load {
-                (vk::AttachmentLoadOp::LOAD, final_layout)
-            } else {
-                (vk::AttachmentLoadOp::CLEAR, vk::ImageLayout::UNDEFINED)
-            };
+            let (sload, sinitial) = vk_color_load_op(sec.load, final_layout);
             attachments.push(
                 vk::AttachmentDescription::default()
                     .format(sec.format)
@@ -2614,8 +2677,67 @@ impl ObjectCaches {
 }
 
 #[cfg(test)]
+mod color_load_op_tests {
+    use super::vk_color_load_op;
+    use crate::contract::pass_action::LoadAction;
+    use ash::vk;
+
+    /// Three Metal load actions become three *different* Vulkan load ops.
+    ///
+    /// This is the whole defect, stated as a property. While the key was a
+    /// `bool`, DontCare and Clear were one value and produced one op, so the
+    /// guest's "the prior contents are undefined" and its "fill the attachment
+    /// with this colour" were indistinguishable by the time a `VkRenderPass` was
+    /// built — and the colour that got filled in was whatever the producer had
+    /// left in its clear field. Distinctness is the invariant that cannot hold
+    /// on a two-valued key, so a regression to one would fail here rather than
+    /// on a screenshot.
+    #[test]
+    fn the_three_load_actions_resolve_to_three_distinct_vulkan_ops() {
+        let ops: Vec<vk::AttachmentLoadOp> =
+            [LoadAction::Load, LoadAction::Clear, LoadAction::DontCare]
+                .into_iter()
+                .map(|a| vk_color_load_op(a, vk::ImageLayout::GENERAL).0)
+                .collect();
+        assert_eq!(
+            ops,
+            vec![
+                vk::AttachmentLoadOp::LOAD,
+                vk::AttachmentLoadOp::CLEAR,
+                vk::AttachmentLoadOp::DONT_CARE
+            ]
+        );
+        let distinct: std::collections::BTreeSet<i32> = ops.iter().map(|o| o.as_raw()).collect();
+        assert_eq!(distinct.len(), 3, "two actions collapsed onto one op: {ops:?}");
+    }
+
+    /// Only `LOAD` names a layout; the other two promise to read nothing and
+    /// take `UNDEFINED`.
+    ///
+    /// The pair is returned together precisely so these cannot drift, and the
+    /// direction that matters is the unsafe one: a pass that names
+    /// `initialLayout` for an attachment it does not load is claiming the image
+    /// is in a layout nothing put it in, which is undefined behaviour rather
+    /// than a stale read. `DONT_CARE` reaching here with `GENERAL` would be that
+    /// bug, and it is the plausible copy-paste from the `LOAD` arm above it.
+    #[test]
+    fn only_a_loading_attachment_names_the_layout_it_expects() {
+        let named = vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
+        assert_eq!(vk_color_load_op(LoadAction::Load, named).1, named);
+        for discards in [LoadAction::Clear, LoadAction::DontCare] {
+            assert_eq!(
+                vk_color_load_op(discards, named).1,
+                vk::ImageLayout::UNDEFINED,
+                "{discards:?} reads nothing, so it must claim nothing about the layout"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod object_cache_tests {
     use super::*;
+    use crate::contract::pass_action::LoadAction;
 
     #[derive(Clone)]
     struct CountingKey {
@@ -2692,11 +2814,11 @@ mod object_cache_tests {
     /// attachment formats and subpass shape.
     #[test]
     fn pass_compatibility_ignores_only_load_actions() {
-        let mut clear = PassKey::single(false, vk::Format::B8G8R8A8_UNORM);
+        let mut clear = PassKey::single(LoadAction::Clear, vk::Format::B8G8R8A8_UNORM);
         clear.secondary_count = 1;
         clear.secondary[0] = SecondaryAttachKey {
             format: vk::Format::R16G16_SFLOAT,
-            load: false,
+            load: LoadAction::Clear,
         };
         clear.depth = Some(DepthAttachKey {
             load: false,
@@ -2704,8 +2826,8 @@ mod object_cache_tests {
         });
 
         let mut load = clear;
-        load.load_seed = true;
-        load.secondary[0].load = true;
+        load.color0_load = LoadAction::Load;
+        load.secondary[0].load = LoadAction::Load;
         load.depth.as_mut().unwrap().load = true;
         assert_eq!(clear.compatibility(), load.compatibility());
 
@@ -2734,11 +2856,11 @@ mod object_cache_tests {
     /// per field, and it is made in both directions.
     #[test]
     fn every_compatibility_difference_is_named_and_equal_keys_name_none() {
-        let mut base = PassKey::single(false, vk::Format::B8G8R8A8_UNORM);
+        let mut base = PassKey::single(LoadAction::Clear, vk::Format::B8G8R8A8_UNORM);
         base.secondary_count = 1;
         base.secondary[0] = SecondaryAttachKey {
             format: vk::Format::R16G16_SFLOAT,
-            load: false,
+            load: LoadAction::Clear,
         };
         base.depth = Some(DepthAttachKey {
             load: false,
@@ -2758,8 +2880,8 @@ mod object_cache_tests {
         type Mutation = (&'static str, fn(&mut PassKey), Option<PassCompatField>);
         let mutations: &[Mutation] = &[
             ("load actions", |k| {
-                k.load_seed = true;
-                k.secondary[0].load = true;
+                k.color0_load = LoadAction::Load;
+                k.secondary[0].load = LoadAction::Load;
                 k.depth.as_mut().unwrap().load = true;
             }, None),
             ("color0 format", |k| k.color0_format = vk::Format::R8G8B8A8_UNORM,
@@ -2808,9 +2930,9 @@ mod object_cache_tests {
     /// must not.
     #[test]
     fn framebuffer_compatibility_ignores_transport_and_dependency_state() {
-        let plain = PassKey::single(false, vk::Format::B8G8R8A8_UNORM);
+        let plain = PassKey::single(LoadAction::Clear, vk::Format::B8G8R8A8_UNORM);
         let mut transported = plain;
-        transported.load_seed = true;
+        transported.color0_load = LoadAction::Load;
         transported.host_accessible_color0 = true;
         transported.feedback_colors = 1;
 
@@ -3457,7 +3579,7 @@ mod object_cache_tests {
 
     #[test]
     fn a_host_accessible_primary_stays_general_between_every_pass_shape() {
-        let mut key = PassKey::single(true, vk::Format::R8G8B8A8_UNORM);
+        let mut key = PassKey::single(LoadAction::Load, vk::Format::R8G8B8A8_UNORM);
         key.host_accessible_color0 = true;
         for color_input in [false, true] {
             for feedback in [false, true] {
@@ -3492,7 +3614,7 @@ mod object_cache_tests {
     /// which is undefined behaviour reported nowhere.
     #[test]
     fn feedback_attachment_layout_is_derived_consistently_from_the_mask() {
-        let mut key = PassKey::single(true, vk::Format::R8G8B8A8_UNORM);
+        let mut key = PassKey::single(LoadAction::Load, vk::Format::R8G8B8A8_UNORM);
         key.color_input = true;
         key.feedback_colors = (1 << 0) | (1 << 3);
 
@@ -3547,7 +3669,7 @@ mod object_cache_tests {
     /// `VUID-VkRenderPassBeginInfo-renderPass-00904` on a driven Maps boot.
     #[test]
     fn the_dependency_count_does_not_move_with_anything_the_framebuffer_key_erases() {
-        let base = PassKey::single(true, vk::Format::R8G8B8A8_UNORM);
+        let base = PassKey::single(LoadAction::Load, vk::Format::R8G8B8A8_UNORM);
         for feedback in [0u8, 1, (1 << 0) | (1 << 3)] {
             for host_accessible in [false, true] {
                 let mut key = base;
@@ -3597,7 +3719,7 @@ mod object_cache_tests {
     /// sampled read of an attachment it is writing with no feedback loop enabled.
     #[test]
     fn feedback_leaves_pass_compatibility_without_leaving_the_pipeline() {
-        let plain = PassKey::single(true, vk::Format::R8G8B8A8_UNORM);
+        let plain = PassKey::single(LoadAction::Load, vk::Format::R8G8B8A8_UNORM);
         let mut feeds = plain;
         feeds.feedback_colors = 1;
 
@@ -3653,7 +3775,7 @@ mod object_cache_tests {
     /// `COLOR_ATTACHMENT_OPTIMAL` beside a feedback arm that derived.
     #[test]
     fn an_ordinary_colour_slot_enters_and_leaves_a_pass_at_one_layout() {
-        let key = PassKey::single(true, vk::Format::B8G8R8A8_UNORM);
+        let key = PassKey::single(LoadAction::Load, vk::Format::B8G8R8A8_UNORM);
         for index in 0..=MAX_SECONDARY_ATTACH {
             assert_eq!(key.color_layout(index), color0_pass_exit_layout(), "{index}");
             assert_eq!(

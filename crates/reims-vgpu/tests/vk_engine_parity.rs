@@ -11,7 +11,8 @@
 use metal2vulkan::passes::Stage;
 use reims_vgpu::backend::vulkan::engine::{
     self, BlendFactor, BlendOp, BlendStateResource, BufferContent, CullMode, DepthState, DrawRequest,
-    IndexType, IndexedDrawResource, PrimitiveTopology, SampledContentIdentity, SampledImageResource,
+    IndexType, IndexedDrawResource, LoadAction, PrimitiveTopology, SampledContentIdentity,
+    SampledImageResource,
     SampledSource, SamplerCompareFunction, SamplerResource, ScissorResource, SecondaryColorTarget,
     StencilFaceOps, StencilOp, StencilState, StorageBufferResource, TargetIdentity,
     VertexAttributeFormat, VertexAttributeResource, VertexStepFunction, ViewportResource,
@@ -3461,7 +3462,7 @@ fn mrt_secondary_attachment_becomes_sampleable_resident() {
         height: 16,
         format: ash::vk::Format::R8G8B8A8_UNORM,
         clear: [0.0, 0.0, 1.0, 1.0],
-        load: false,
+        load: LoadAction::Clear,
         // Unblended: this parity case checks the attachment is written at
         // all, not how it composites.
         blend: None,
@@ -3552,7 +3553,7 @@ fn mrt_rg16float_secondary_builds_and_renders() {
         height: 32,
         format: ash::vk::Format::R16G16_SFLOAT,
         clear: [1.0, 0.5, 0.0, 0.0],
-        load: false,
+        load: LoadAction::Clear,
         // Unblended: this is the vibrancy coverage-mask shape, and a mask is a
         // raw store. Which is exactly why every secondary used to be forced
         // unblended — one real case generalized into a rule for all of them.
@@ -3619,7 +3620,7 @@ fn depth_and_mrt_secondary_render_in_one_pass() {
             height: h,
             format: ash::vk::Format::R8G8B8A8_UNORM,
             clear: [0.0, 0.0, 1.0, 1.0],
-            load: false,
+            load: LoadAction::Clear,
             blend: None,
             color_write_mask: Default::default(),
         });

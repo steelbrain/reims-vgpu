@@ -2585,6 +2585,44 @@ fn guest_store_footprint_to_record(
     (requested && guest_backed).then_some(footprint).flatten()
 }
 
+/// What colour slot 0's render pass does with the attachment's prior contents,
+/// from the guest's declaration and whether this device found the contents.
+///
+/// Two questions, answered separately, because the guest's declaration and this
+/// device's ability to honour it are different facts — the same split the depth
+/// attachment makes, where its doc puts it as "the guest asked to load" and
+/// "there is something to load" being two questions with only the second one
+/// about this device.
+///
+/// They were one question, and that is where `MTLLoadActionDontCare` went: the
+/// pass key's `load_seed: bool` was `content.is_some()` over four request
+/// fields, so DontCare and Clear both arrived as `false` and both became
+/// `AttachmentLoadOp::CLEAR`. A boolean cannot hold three answers, and the third
+/// one is the guest telling this device it may skip a full-plane write.
+///
+/// The three arms:
+///
+/// * **Content present wins outright.** A seed exists only because a `Load` arm
+///   of the runtime resolved one, so a pass that has the prior frame and then
+///   declares it undefined would drop it.
+/// * **No content, declared DontCare** — Vulkan's own `DONT_CARE`, which is
+///   what the guest asked for and what MoltenVK hands back to Metal verbatim.
+/// * **No content, anything else** — `Clear`. A declared `Load` lands here, and
+///   deliberately: it is the `load_seed_lost` case, reported by name upstream,
+///   and promoting a loss to a licence to render over whatever the tile holds
+///   would replace a counted failure with an uncounted one.
+fn color0_pass_load(
+    declared: crate::contract::pass_action::LoadAction,
+    has_content: bool,
+) -> crate::contract::pass_action::LoadAction {
+    use crate::contract::pass_action::LoadAction;
+    match (has_content, declared) {
+        (true, _) => LoadAction::Load,
+        (false, LoadAction::DontCare) => LoadAction::DontCare,
+        (false, LoadAction::Load | LoadAction::Clear) => LoadAction::Clear,
+    }
+}
+
 pub(crate) unsafe fn execute_draw_inner(
     owner: &mut ContextOwner,
     caches: &mut ObjectCaches,
@@ -2943,11 +2981,12 @@ pub(crate) unsafe fn execute_draw_inner(
     } else {
         req.target_rgba8.as_ref().map(|v| v.as_slice())
     };
+    let color0_has_content = load_uses_gpu_content
+        || seed_bytes.is_some()
+        || req.target_guest_seed.is_some()
+        || req.seed_from_target.is_some();
     let mut pass_key = PassKey::single(
-        load_uses_gpu_content
-            || seed_bytes.is_some()
-            || req.target_guest_seed.is_some()
-            || req.seed_from_target.is_some(),
+        color0_pass_load(req.color0_load, color0_has_content),
         color0_format,
     );
     pass_key.host_accessible_color0 = req.guest_target_memory.is_some();
@@ -3443,7 +3482,7 @@ pub(crate) unsafe fn execute_draw_inner(
     let ordinary_ad_hoc_framebuffer = is_mrt || req.depth.is_some() || req.color_input;
     let ad_hoc_framebuffer = ordinary_ad_hoc_framebuffer || req.multisample_resolve;
     let (primary_pass, primary_pass_compatibility) = if ad_hoc_framebuffer {
-        let mut color_only = PassKey::single(pass_key.load_seed, pass_key.color0_format);
+        let mut color_only = PassKey::single(pass_key.color0_load, pass_key.color0_format);
         color_only.host_accessible_color0 = pass_key.host_accessible_color0;
         (
             caches.get_or_create_pass(ctx, color_only, counters, pools)?,
@@ -5011,10 +5050,15 @@ pub(crate) unsafe fn execute_draw_inner(
         // outside-pass command closes whatever the predecessor left open.
         unsafe { pools.close_open_pass(&ctx.device, cb) };
         crate::runtime::drain::note_store_route(pass_begin_area_band(req.width, req.height));
-        crate::runtime::drain::note_store_route(if pass_key.load_seed {
-            "passbegin_load"
-        } else {
-            "passbegin_clear"
+        // Three routes for three actions. `passbegin_clear` used to carry the
+        // DontCare passes as well as the Clear ones, which is how the fold
+        // stayed invisible from a boot log: the arithmetic
+        // `passbegin_clear == color0_declared_clear + color0_declared_dontcare`
+        // held exactly, and read as a working census.
+        crate::runtime::drain::note_store_route(match pass_key.color0_load {
+            crate::contract::pass_action::LoadAction::Load => "passbegin_load",
+            crate::contract::pass_action::LoadAction::Clear => "passbegin_clear",
+            crate::contract::pass_action::LoadAction::DontCare => "passbegin_dontcare",
         });
         // Whether this pass's colour0 names guest backing at all, which is the
         // denominator every reading of `REIMS_VGPU_SHARED_TARGET` needs:
@@ -5890,7 +5934,16 @@ unsafe fn ad_hoc_attachment_views(
         // Read before `registry_ensure_attachment` rather than after, because
         // ensuring is what creates the resident: asking afterwards cannot tell a
         // slot born in this call from one the guest has been rendering into.
-        if sec.load && !prior.is_some_and(|s| s.content_ready) {
+        //
+        // `== Load` and not "not Clear": DontCare declares the prior contents
+        // undefined, so a recycled image's texels are exactly what the guest
+        // said it did not care about, and this guard has nothing to refuse. It
+        // reads them no more than a Clear does -- `AttachmentLoadOp::DONT_CARE`
+        // names `initialLayout = UNDEFINED`, so the pass makes no claim about
+        // what is there.
+        if sec.load == crate::contract::pass_action::LoadAction::Load
+            && !prior.is_some_and(|s| s.content_ready)
+        {
             return Err(DrawError::DrawExecution(
                 DrawExecutionDecline::LoadSecondaryContentNotReady {
                     identity: sec.identity.clone(),
@@ -6144,6 +6197,50 @@ pub(super) unsafe fn barrier_resident_for_transfer_read(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every `(declared, has_content)` pair colour slot 0 can present, pinned.
+    ///
+    /// Four rows and only one of them is new, which is the point: the three that
+    /// are not new are what the `load_seed: bool` already did, so a table that
+    /// omitted them would pass on the old code too. The row that fails without
+    /// the change is the third — a guest-declared `DontCare` over an attachment
+    /// this device has no content for, which used to be indistinguishable from
+    /// row four and became a full-plane fill of the producer's clear colour.
+    #[test]
+    fn colour_slot_zero_answers_the_declaration_and_the_content_separately() {
+        use crate::contract::pass_action::LoadAction;
+        let table = [
+            (LoadAction::DontCare, true, LoadAction::Load),
+            (LoadAction::Clear, true, LoadAction::Load),
+            (LoadAction::DontCare, false, LoadAction::DontCare),
+            (LoadAction::Clear, false, LoadAction::Clear),
+        ];
+        for (declared, has_content, want) in table {
+            assert_eq!(
+                color0_pass_load(declared, has_content),
+                want,
+                "declared={declared:?} has_content={has_content}"
+            );
+        }
+    }
+
+    /// A `Load` this device could not seed becomes `Clear`, never `DontCare`.
+    ///
+    /// The tempting reading of the change is "carry the guest's word across
+    /// unchanged", and this is the case where that is wrong. A declared `Load`
+    /// with nothing to load is a loss this device already counts by name; making
+    /// it `DontCare` would hand the pass a licence to render over undefined tile
+    /// contents and turn a counted failure into an uncounted one, which is the
+    /// silent-failure shape the crate refuses.
+    #[test]
+    fn a_load_this_device_cannot_honour_does_not_become_permission_to_skip() {
+        use crate::contract::pass_action::LoadAction;
+        assert_eq!(
+            color0_pass_load(LoadAction::Load, false),
+            LoadAction::Clear
+        );
+        assert_eq!(color0_pass_load(LoadAction::Load, true), LoadAction::Load);
+    }
 
     fn sampled_identity() -> TargetIdentity {
         TargetIdentity::Surface {
@@ -7274,7 +7371,7 @@ mod tests {
             height: 16,
             format: crate::backend::vulkan::translate::pixel::SCANOUT_FORMAT,
             clear,
-            load: false,
+            load: crate::contract::pass_action::LoadAction::Clear,
             blend: None,
             color_write_mask: Default::default(),
         }

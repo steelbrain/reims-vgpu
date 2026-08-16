@@ -6317,13 +6317,24 @@ pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
                 reason: crate::runtime::census::present_proxy::MrtDrop::AliasesPrimary,
             });
         }
-        // Same three-into-two collapse as the primary slot below: a secondary
-        // attachment's DontCare reaches the engine as "no seed", which its pass
-        // key spells as CLEAR.
-        if c.load_action == MTL_LOAD_ACTION_DONT_CARE {
-            super::note_load_action_dont_care(pipeline.object_id, c.width, c.height);
-        }
-        let load = c.load_action == MTL_LOAD_ACTION_LOAD;
+        // This slot's declared load action, carried rather than narrowed. The
+        // census is the primary's, banded, and it is the instrument this arm
+        // never had: slot 0 has reported its three declarations for as long as
+        // `LoadAction` has existed, and the secondaries reported nothing, so a
+        // boot could not say whether this arm ever saw a DontCare at all.
+        let load = crate::contract::pass_action::LoadAction::from_declared(c.load_action);
+        let (declared_n, declared_area) =
+            load.census_routes(crate::contract::pass_action::AttachmentBand::Color1Plus);
+        crate::runtime::drain::note_store_route(declared_n);
+        crate::runtime::drain::note_store_route_n(
+            declared_area,
+            u64::from(c.width).saturating_mul(u64::from(c.height)),
+        );
+        // Read whatever the action is; the engine consults it only under
+        // `Clear`, which is Metal's own rule for `clearColor`. Reading it here
+        // unconditionally is what a plain struct field means -- the narrowing
+        // that mattered was making the *action* two-valued, which sent DontCare
+        // into the arm that applies this colour.
         let clear = [
             c.clear_color[0] as f32,
             c.clear_color[1] as f32,
@@ -7676,6 +7687,12 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         let mut target_rgba8: Option<std::sync::Arc<Vec<u8>>> = None;
         let mut target_guest_seed = None;
         let mut target_clear = [0.0f32; 4];
+        // Slot 0's declared action, travelling beside the seed rather than being
+        // reconstructed from whether one arrived. `Clear` until a colour
+        // attachment says otherwise, which is the same reason the type defaults
+        // that way: a draw with no colour record at all has declared nothing,
+        // and nothing must not mean "discard".
+        let mut color0_load = crate::contract::pass_action::LoadAction::Clear;
         let mut seed_order = crate::backend::vulkan::engine::SeedOrder::Rgba8;
         let gpu_only_content_allowed =
             crate::backend::vulkan::engine::deferred_gpu_only_content_allowed();
@@ -7849,14 +7866,18 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             } else {
                 MTL_LOAD_ACTION_DONT_CARE
             };
+            color0_load = crate::contract::pass_action::LoadAction::from_declared(load_action);
             // The declared load action of slot 0, as a population **and** as
-            // pixels, before the three-into-two collapse below erases the
-            // difference.
+            // pixels.
             //
-            // `passbegin_load` / `passbegin_clear` are counted in the engine and
-            // cannot separate a Clear from a DontCare: by then both have become
-            // "no seed", which `caches::get_or_create_pass` spells
-            // `AttachmentLoadOp::CLEAR`. The two cost very different amounts —
+            // This is now the *declaration* beside the engine's
+            // `passbegin_load` / `passbegin_clear` / `passbegin_dontcare`, which
+            // is what this device resolved it to; the two differ exactly when a
+            // declared Load arrived with no content, and reading them side by
+            // side is the only way that case is visible as a count. Until the
+            // engine grew a third route, `passbegin_clear` carried the Clears
+            // and the DontCares together and the sum matched, so the collapse
+            // read as a working census. The two cost very different amounts —
             // a CLEAR writes every texel of the attachment, and on this
             // pathway a quarter of all attachments are `VK_IMAGE_TILING_LINEAR`
             // over guest RAM with no fast clear and no colour compression, so
@@ -7872,7 +7893,8 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             // out of contract, so this fold is exact and the two spellings
             // cannot disagree.
             let (declared_n, declared_area) =
-                crate::contract::pass_action::LoadAction::from_declared(load_action).census_routes();
+                crate::contract::pass_action::LoadAction::from_declared(load_action)
+                    .census_routes(crate::contract::pass_action::AttachmentBand::Color0);
             crate::runtime::drain::note_store_route(declared_n);
             crate::runtime::drain::note_store_route_n(declared_area, declared_px);
             match load_action {
@@ -7954,15 +7976,15 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     );
                 }
                 // DontCare: the guest declared the prior contents undefined, so
-                // arriving with no seed is the contract rather than a loss. It
-                // is still not what the guest asked for — no seed makes this
-                // pass key indistinguishable from a Clear, and `caches.rs`
-                // resolves that key to `AttachmentLoadOp::CLEAR`. Its own arm,
-                // so the third value of a three-valued enum stops sharing the
-                // catch-all with the out-of-contract one two lines above.
-                MTL_LOAD_ACTION_DONT_CARE => {
-                    super::note_load_action_dont_care(req.pipeline_ref, w, h);
-                }
+                // arriving with no seed is the contract rather than a loss, and
+                // it now *reaches* the engine as such —
+                // `DrawRequest::color0_load` carries the word and the pass is
+                // begun with `AttachmentLoadOp::DONT_CARE`. Its own arm, so the
+                // third value of a three-valued enum stops sharing the catch-all
+                // with the out-of-contract one two lines above; there is nothing
+                // left for it to do, because leaving `target_rgba8` and
+                // `target_clear` alone is exactly what DontCare means.
+                MTL_LOAD_ACTION_DONT_CARE => {}
                 _ => {}
             }
         }
@@ -8175,6 +8197,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         resources.target_rgba8 = target_rgba8;
         resources.target_guest_seed = target_guest_seed;
         resources.target_clear = target_clear;
+        resources.color0_load = color0_load;
         resources.target_seed_order = seed_order;
         // A Store reads back; anything else skips it.
         //

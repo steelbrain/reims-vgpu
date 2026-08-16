@@ -6,6 +6,7 @@
 use ash::vk;
 
 use crate::backend::vulkan::translate;
+pub use crate::contract::pass_action::LoadAction;
 pub use crate::runtime::decode::resource::ColorWriteMask;
 
 /// Named engine failure. Stable prefixes for observe greps (`vk_engine_*`).
@@ -489,10 +490,32 @@ pub struct DrawRequest {
     /// seeding the attachment from the CPU. Requires that resident to exist.
     ///
     /// This, [`Self::target_rgba8`], [`Self::target_guest_seed`] and
-    /// [`DrawRequest::target_clear`] are the whole load action, and they are
-    /// ordered: `load_from_target` wins, else exactly one seed is copied, else
-    /// the attachment clears to `target_clear`.
+    /// [`Self::seed_from_target`] are the four ways slot 0's prior contents can
+    /// arrive, and they are ordered: `load_from_target` wins, else exactly one
+    /// seed is copied.
+    ///
+    /// They used to be described here as "the whole load action", and the engine
+    /// read them that way -- `PassKey::load_seed` was `any of these four is
+    /// set`. They are not the action; they are what a `Load` action was able to
+    /// find. The action itself is [`Self::color0_load`], and the two questions
+    /// are answered separately because they have different answers: a guest can
+    /// declare `Load` and this device can arrive with nothing, which is a loss
+    /// (`load_seed_lost`) rather than a `Clear`.
     pub load_from_target: bool,
+    /// The guest's declared `MTLLoadAction` for colour slot 0.
+    ///
+    /// Exported by the runtime rather than reconstructed here from the seed
+    /// fields above. That reconstruction is what made `MTLLoadActionDontCare`
+    /// unreachable: no seed and no clear is indistinguishable from a `Clear`
+    /// once the only thing crossing the boundary is "did bytes arrive", and the
+    /// engine duly cleared -- to `target_clear`, which for the DontCare arm of
+    /// the producer was left at its `[0.0; 4]` initializer, i.e. **transparent
+    /// black**. A menu whose backing the guest declared undefined therefore
+    /// arrived with alpha 0 across the whole attachment.
+    ///
+    /// `Default` is [`LoadAction::Clear`]; see that type for why an unstated
+    /// action must not be the one that discards.
+    pub color0_load: LoadAction,
     /// Clear value for the primary colour attachment, in semantic float
     /// channels — the same shape [`SecondaryColorTarget::clear`] has carried all
     /// along, and consulted only when the pass resolves to `loadOp = CLEAR`.
@@ -708,10 +731,27 @@ pub struct SecondaryColorTarget {
     /// by construction and an sRGB attachment is expressible the day the rail
     /// flips.
     pub format: vk::Format,
-    /// Clear value used when `load` is false (semantic float channels).
+    /// Clear value, consulted only when [`Self::load`] is
+    /// [`LoadAction::Clear`] (semantic float channels).
+    ///
+    /// "Only when Clear" is Metal's rule, not a local one:
+    /// `MTLRenderPassAttachmentDescriptor.clearColor` is documented as read if
+    /// and only if `loadAction == MTLLoadActionClear`. This field used to be
+    /// consulted for DontCare as well, because `load` was a bool and DontCare
+    /// fell into its false arm -- so a guest that declared these contents
+    /// undefined got them filled with the descriptor's clear colour, which under
+    /// Metal's own `MTLClearColorMake(0, 0, 0, 1)` default is *opaque black*.
     pub clear: [f32; 4],
-    /// true ⇒ LOAD the existing resident content; false ⇒ CLEAR to `clear`.
-    pub load: bool,
+    /// What this pass does with the attachment's prior contents.
+    ///
+    /// The guest's declared `MTLLoadAction`, folded through
+    /// [`LoadAction::from_declared`] and otherwise unchanged. A `bool` here
+    /// could not express DontCare and the runtime narrowed it away at the
+    /// producer, which is the far side of the same collapse
+    /// [`DrawRequest::color0_load`] describes -- except that the two arms
+    /// fabricated *different colours* out of it, so one wire value produced
+    /// transparent black on slot 0 and opaque black here.
+    pub load: LoadAction,
     /// This slot's own blend state, from the pipeline's per-attachment blend
     /// descriptor. `None` ⇒ the slot writes unblended.
     ///
@@ -2267,7 +2307,7 @@ mod tests {
             height: 64,
             format: vk::Format::B8G8R8A8_UNORM,
             clear: [0.0; 4],
-            load: false,
+            load: crate::contract::pass_action::LoadAction::Clear,
             blend: None,
             color_write_mask: ColorWriteMask::default(),
         });

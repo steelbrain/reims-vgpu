@@ -66,6 +66,7 @@ pub use types::{
     ComputeStorageImageResource, ComputeStorageResidency, CullMode, DepthClipMode, DepthState,
     DrawError, DrawOutput, DrawRequest, FillMode, GuestRun, GuestRunSource, GuestSampledBacking,
     GuestTargetBacking, GuestTargetMemory, GuestTargetSeed, IndexType, IndexedDrawResource,
+    LoadAction,
     PipelineObjectIdentity, PrimitiveTopology, SampledByteOrigin, SampledContentIdentity,
     SampledImageResource, SampledSource, SamplerAddressMode, SamplerBorderColor,
     SamplerCompareFunction, SamplerFilter, SamplerMipFilter, SamplerResource, ScissorResource,
