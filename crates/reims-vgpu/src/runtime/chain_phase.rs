@@ -409,12 +409,27 @@ mod tests {
     /// still looks like an answer. The three sleeps are different lengths so a
     /// crossed pair cannot pass.
     ///
-    /// Each band is its own sleep +/- half of it, which is what makes a crossed
-    /// pair impossible to pass -- 2, 4 and 6 ms are further apart than that --
-    /// and is deliberately not tighter. `thread::sleep` guarantees a floor and
-    /// nothing else; a macOS host overshoots the 6 ms one to ~7.5 ms, which a
-    /// 7 500 us ceiling failed on every run of this test on Apple Silicon while
-    /// reading exactly like a real attribution bug.
+    /// **No assertion here has a wall-clock ceiling, and that is the design.**
+    /// `thread::sleep` guarantees a floor and nothing else, so a ceiling asserts
+    /// a promise the platform never made. This test had two and both failed on
+    /// Apple Silicon while reading exactly like an attribution bug: under load a
+    /// macOS host overshoots all three sleeps by about half again -- 2, 4 and 6
+    /// ms arriving as 3.0, 6.0 and 9.0 -- and widening a band only moves the
+    /// next failure, because the overshoot scales with contention and the bands
+    /// do not. A test whose verdict depends on how busy the machine is cannot be
+    /// evidence about this device.
+    ///
+    /// The three properties below are scale-invariant, so a uniform overshoot
+    /// cannot break them, and between them they still catch every way the
+    /// carving can be wrong:
+    ///
+    /// * **Floors.** A sleep charged to the wrong field leaves the robbed field
+    ///   under its own sleep, which no amount of overshoot can disguise.
+    /// * **Order.** A crossed pair is caught even when both floors are met,
+    ///   which is why the sleeps are three different lengths.
+    /// * **The sum against the chain's own total.** A sub-phase that
+    ///   double-counts another's sleep pushes the three past the elapsed time
+    ///   they were carved out of -- the one failure floors and order both miss.
     #[test]
     fn each_assemble_sub_phase_is_carved_out_and_lands_in_its_own_field() {
         let _ = take_window();
@@ -429,17 +444,27 @@ mod tests {
             enter(Phase::Store);
         }
         let w = take_window().expect("one chain ran");
+        for (field, got, slept_us) in [
+            ("assemble_target_us", w.assemble_target_us, 2_000),
+            ("assemble_depth_us", w.assemble_depth_us, 4_000),
+            ("assemble_trail_us", w.assemble_trail_us, 6_000),
+        ] {
+            assert!(
+                got >= slept_us,
+                "{field} is under the sleep it was given, so that sleep was \
+                 charged somewhere else: {w:?}"
+            );
+        }
         assert!(
-            (1_000..3_500).contains(&w.assemble_target_us),
-            "the 2 ms sleep charged the target rails and only them: {w:?}"
+            w.assemble_target_us < w.assemble_depth_us
+                && w.assemble_depth_us < w.assemble_trail_us,
+            "the three sleeps ascend, so their fields must: {w:?}"
         );
+        let carved = w.assemble_target_us + w.assemble_depth_us + w.assemble_trail_us;
         assert!(
-            (3_000..6_000).contains(&w.assemble_depth_us),
-            "the 4 ms sleep charged the depth load and only it: {w:?}"
-        );
-        assert!(
-            (5_000..9_000).contains(&w.assemble_trail_us),
-            "the 6 ms sleep charged the trail and only it: {w:?}"
+            carved <= w.max_us,
+            "the sub-phases together outlast the chain they were carved out of, \
+             so at least one counted another's time as well as its own: {w:?}"
         );
         assert!(
             w.assemble_us < 1_000,
