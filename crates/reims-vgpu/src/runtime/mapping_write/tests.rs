@@ -737,6 +737,16 @@ fn writing_guest_pages_moves_the_host_write_record_and_reading_them_does_not() {
 /// The debt is superseded instead: the caller is about to land the same
 /// surface's newer content at the same geometry, which `GeometryMoved` already
 /// enforces, so the owed frame is replaced rather than lost.
+///
+/// Vulkan-only, and the gate is the rail's shape rather than a convenience. Both
+/// sites that arm a surface debt are the type-11 Store in `draw::vulkan`, so on
+/// an arm without that module nothing ever arms one and
+/// `writeback_debt::pay` is a documented no-op stub. This test arms directly, so
+/// it walks past the emptiness check the stub's doc relies on and then asserts a
+/// payment route the stub cannot emit — it failed on `backend-metal` for that
+/// reason and for no device reason at all. The supersede half is gated with it
+/// because `supersede_for_mapping` only counts when a debt was there to take.
+#[cfg(feature = "backend-vulkan")]
 #[test]
 fn a_skipping_write_supersedes_the_debt_instead_of_paying_it_over_the_skip() {
     use crate::model::PAGE_SHIFT_X86;
