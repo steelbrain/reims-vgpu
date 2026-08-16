@@ -132,9 +132,21 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
             if !crate::contract::pass_action::store_action_publishes_single_sample(c.store_action) {
                 continue;
             }
-            if c.load_action != MTL_LOAD_ACTION_CLEAR && c.load_action != MTL_LOAD_ACTION_DONT_CARE
-            {
-                // Load/composite needs real encode (metal2vulkan) — skip Store.
+            // This loop lands `clear_color`, so only the action that names the
+            // clear value may take it. `Load` wants the surface's prior
+            // contents, which needs real encode (metal2vulkan) rather than a
+            // solid; `DontCare` wants them left alone, and seeding it here
+            // painted Metal's default opaque black over the whole guest
+            // surface. See `LoadAction::seeds_clear_value`.
+            //
+            // The refusal carries its own route rather than reusing
+            // `census_routes`, whose counters the declaration census already
+            // owns: a second emitter on those names would inflate them, and the
+            // reading that says how many records declared each action would
+            // silently become a different quantity.
+            let declared = crate::contract::pass_action::LoadAction::from_declared(c.load_action);
+            if let crate::contract::pass_action::ClearSeed::Decline(route) = declared.clear_seed() {
+                crate::runtime::drain::note_store_route(route);
                 continue;
             }
             if c.width == 0 || c.height == 0 {

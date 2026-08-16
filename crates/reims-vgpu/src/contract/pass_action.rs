@@ -98,6 +98,18 @@ pub enum AttachmentBand {
 /// memory, and handing that out to a caller who simply forgot the field is a
 /// silent loss of the kind this crate refuses to ship. `Clear` costs a write and
 /// cannot lose anything.
+/// What a writer that lands a record's `clearColor` must do for a given
+/// [`LoadAction`], from [`LoadAction::clear_seed`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClearSeed {
+    /// The action names the clear value; land it.
+    Land,
+    /// The action does not name the clear value. The payload is the census
+    /// route for this refusal, so the population that stopped being painted
+    /// stays countable rather than merely disappearing.
+    Decline(&'static str),
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
 pub enum LoadAction {
     /// The attachment's prior contents may be discarded.
@@ -118,6 +130,38 @@ impl LoadAction {
             MTL_LOAD_ACTION_LOAD => Self::Load,
             MTL_LOAD_ACTION_CLEAR => Self::Clear,
             _ => Self::DontCare,
+        }
+    }
+
+    /// Whether landing this record's `clearColor` into the attachment is what
+    /// the action asks for, and the census route naming the refusal when it is
+    /// not.
+    ///
+    /// `MTLRenderPass.h` states the rule as a conditional on exactly one member:
+    /// *"The clear color to be used **if** the loadAction property is
+    /// MTLLoadActionClear."* So one of the three consults the clear value and
+    /// the other two must not, and a seed is not a cheap approximation of
+    /// either of them — `Load` needs the surface's prior contents, and
+    /// `DontCare` is a licence to leave them alone, which a seed spends.
+    ///
+    /// Named here rather than spelled at the call site because the seed path is
+    /// where getting it wrong is *invisible*: that writer lands solid pixels
+    /// straight into the guest's own pages, so a wrongly-admitted action is not
+    /// a refused command but a surface the guest keeps and composites. The
+    /// spelling this replaced admitted `DontCare` beside `Clear`, which landed
+    /// Metal's own default `MTLClearColorMake(0, 0, 0, 1)` — opaque black —
+    /// across every attachment whose guest never set a clear value.
+    ///
+    /// The decision and the refusal's name are one answer rather than two
+    /// methods, so a caller cannot decline on one rule and report the other.
+    /// Returned rather than emitted, following [`Self::census_routes`], so this
+    /// module keeps no dependency on the census.
+    #[must_use]
+    pub fn clear_seed(self) -> ClearSeed {
+        match self {
+            Self::Clear => ClearSeed::Land,
+            Self::Load => ClearSeed::Decline("clear_seed_declined_load"),
+            Self::DontCare => ClearSeed::Decline("clear_seed_declined_dontcare"),
         }
     }
 
@@ -188,6 +232,55 @@ pub fn store_action_publishes_single_sample(raw: u16) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only the action that names the clear value may have it landed.
+    ///
+    /// Swept from the decoded ordinal rather than from the enum, because that is
+    /// the hop the seed writer actually makes and the one that was wrong: it
+    /// admitted ordinal 0 (`DontCare`) beside ordinal 2 (`Clear`) and painted
+    /// Metal's default opaque black across the guest's own surface. An
+    /// out-of-contract ordinal folds to `DontCare`, so it must decline too.
+    #[test]
+    fn only_clear_lands_the_clear_value_into_the_guest_surface() {
+        assert_eq!(
+            LoadAction::from_declared(MTL_LOAD_ACTION_CLEAR).clear_seed(),
+            ClearSeed::Land
+        );
+        for raw in [MTL_LOAD_ACTION_DONT_CARE, MTL_LOAD_ACTION_LOAD] {
+            assert!(
+                matches!(
+                    LoadAction::from_declared(raw).clear_seed(),
+                    ClearSeed::Decline(_)
+                ),
+                "ordinal {raw} does not name the clear value, so it must not be seeded with it"
+            );
+        }
+        for raw in (MTL_LOAD_ACTION_CLEAR + 1)..=64u16 {
+            assert!(
+                matches!(
+                    LoadAction::from_declared(raw).clear_seed(),
+                    ClearSeed::Decline(_)
+                ),
+                "out-of-contract ordinal {raw} folds to DontCare and must not be seeded"
+            );
+        }
+    }
+
+    /// Each declining action names a distinct route, so the census can tell the
+    /// two refusals apart. A shared name would report the `DontCare` population
+    /// and the `Load` population as one number.
+    #[test]
+    fn the_two_declining_actions_do_not_share_a_census_route() {
+        let names: Vec<&'static str> = [LoadAction::DontCare, LoadAction::Load]
+            .into_iter()
+            .map(|a| match a.clear_seed() {
+                ClearSeed::Decline(route) => route,
+                ClearSeed::Land => panic!("{a:?} must decline the clear seed"),
+            })
+            .collect();
+        assert_eq!(names.len(), 2);
+        assert_ne!(names[0], names[1], "the two refusals collapsed onto one route");
+    }
 
     /// The accepted load set is exactly the three declared ordinals.
     ///
