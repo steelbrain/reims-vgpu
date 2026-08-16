@@ -1,21 +1,55 @@
 #!/usr/bin/env bash
-# Capture a screenshot of the "Reims vGPU" window on macOS.
+# Capture a screenshot of the guest's display window on macOS.
 #
 # Usage:
-#   ./screenshot-when-macos-host.sh [output-path]
+#   ./screenshot-when-macos-host.sh [output-path] [--window NAME]
 #
 # If no output path is given, saves to /tmp as:
 #   /tmp/Reims-vGPU-YYYYMMDD-HHMMSS.png
+#
+# WHICH WINDOW. `vm/boot-arm64.sh --device` decides which of two host windows a
+# boot produces, and they are titled differently:
+#
+#   reims-vgpu-mmio   host-owned window,   title "Reims vGPU"  (display=reims-host-window)
+#   apple-gfx-mmio    QEMU's cocoa window, title "QEMU"        (display=cocoa)
+#
+# So both are tried, in that order, and the one that matched is printed. This
+# script used to name only the first, which left the *reference* device — Apple's
+# own ParavirtualizedGraphics, and the only thing in this tree that can say
+# whether a pixel is supposed to look the way it does — with no capture route at
+# all. Two visual defects were being argued from our own output alone for want of
+# the one command that photographs Apple's.
+#
+# `--window NAME` pins an exact title when a host has both up at once.
 #
 # Requires Screen & System Audio Recording permission for Terminal (or the app
 # running this script).
 
 set -euo pipefail
 
-WINDOW_NAME="Reims vGPU"
+# Tab-separated because a window title may contain spaces; the Swift below splits
+# on the tab. Order is the search order.
+WINDOW_NAMES="${REIMS_WINDOW_NAME:-$(printf 'Reims vGPU\tQEMU')}"
 # Optional process name hint (QEMU guest display). Exact title still wins.
 PROCESS_HINT="${REIMS_PROCESS_HINT:-qemu-system}"
-OUTPUT="${1:-}"
+OUTPUT=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --window)
+      [[ $# -ge 2 ]] || { echo "error: --window needs a title" >&2; exit 64; }
+      WINDOW_NAMES="$2"
+      shift 2
+      ;;
+    -h|--help)
+      sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'
+      exit 0
+      ;;
+    *)
+      OUTPUT="$1"
+      shift
+      ;;
+  esac
+done
 
 if [[ -z "$OUTPUT" ]]; then
   timestamp="$(date +%Y%m%d-%H%M%S)"
@@ -37,7 +71,7 @@ fi
 # a session being read as "the VM never came up".
 set +e
 window_id="$(
-  /usr/bin/swift - "$WINDOW_NAME" "$PROCESS_HINT" "$OUTPUT" <<'SWIFT'
+  /usr/bin/swift - "$WINDOW_NAMES" "$PROCESS_HINT" "$OUTPUT" <<'SWIFT'
 import Foundation
 import AppKit
 import CoreGraphics
@@ -51,7 +85,9 @@ guard args.count == 3 else {
     exit(64)
 }
 
-let targetName = args[0]
+// Search order, not a set: the product window wins when both are up, so a
+// harness that captures without asking still photographs the device under test.
+let targetNames = args[0].components(separatedBy: "\t").filter { !$0.isEmpty }
 let processHint = args[1]
 let outputURL = URL(fileURLWithPath: args[2])
 
@@ -84,21 +120,37 @@ func capture() async throws -> CGWindowID {
         false,
         onScreenWindowsOnly: false
     )
-    let matches = content.windows.filter {
-        $0.title == targetName && $0.windowLayer == 0
+    // First title with a match wins outright — a later title is not consulted,
+    // so "both are up" resolves by the order the caller gave rather than by
+    // whichever window the system happened to list first.
+    var found: SCWindow?
+    var foundName = ""
+    for name in targetNames {
+        let matches = content.windows.filter {
+            $0.title == name && $0.windowLayer == 0
+        }
+        if let window = matches.first(where: {
+            $0.owningApplication?.applicationName.range(
+                of: processHint,
+                options: .caseInsensitive
+            ) != nil
+        }) ?? matches.first {
+            found = window
+            foundName = name
+            break
+        }
     }
-    guard let window = matches.first(where: {
-        $0.owningApplication?.applicationName.range(
-            of: processHint,
-            options: .caseInsensitive
-        ) != nil
-    }) ?? matches.first else {
+    guard let window = found else {
         throw NSError(
             domain: "screenshot-when-macos-host",
             code: 1,
-            userInfo: [NSLocalizedDescriptionKey: "window not found: \(targetName)"]
+            userInfo: [
+                NSLocalizedDescriptionKey:
+                    "window not found: \(targetNames.joined(separator: ", "))"
+            ]
         )
     }
+    FileHandle.standardError.write(Data("matched window: \(foundName)\n".utf8))
 
     let filter = SCContentFilter(desktopIndependentWindow: window)
 
@@ -177,8 +229,9 @@ set -e
 case "$status" in
   0) ;;
   66)
-    echo "error: no window named \"${WINDOW_NAME}\" is open" >&2
+    echo "error: no window titled $(printf '%s' "$WINDOW_NAMES" | tr '\t' '/') is open" >&2
     echo "hint: the boot has not reached the host window yet, or QEMU is not running" >&2
+    echo "hint: reims-vgpu-mmio titles its window \"Reims vGPU\"; apple-gfx-mmio is cocoa, titled \"QEMU\"" >&2
     exit 1
     ;;
   77)
@@ -202,5 +255,5 @@ if [[ ! "$window_id" =~ ^[0-9]+$ ]]; then
   exit 1
 fi
 
-echo "Saved screenshot of \"${WINDOW_NAME}\" (window id ${window_id})"
+echo "Saved screenshot (window id ${window_id}); the matched title is on stderr above"
 echo "  → ${OUTPUT}"
