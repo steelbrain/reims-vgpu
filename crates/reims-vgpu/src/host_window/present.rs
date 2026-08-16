@@ -221,6 +221,26 @@ pub struct Frame {
     pub bgra: Vec<u8>,
     /// Engine-resident source for same-device MoltenVK presentation.
     pub resident: Option<crate::backend::vulkan::engine::WindowPresentSource>,
+    /// Guest (macOS) hardware cursor at publish time, or `None` when the guest
+    /// has no visible cursor. Populated only when `REIMS_VGPU_CURSOR` is set;
+    /// the presenter composites it at the guest-reported position so it stays
+    /// correct even when host input is passed through to the guest instead of
+    /// driving the host pointer. See [`CursorOverlay`].
+    pub cursor: Option<CursorOverlay>,
+}
+
+/// A snapshot of the guest hardware cursor to composite over the presented
+/// frame. `pixels` is `0xAARRGGBB`, `width * height` entries; the sprite's
+/// top-left in guest pixels is `(x - hot_x, y - hot_y)`.
+#[derive(Clone)]
+pub struct CursorOverlay {
+    pub x: u16,
+    pub y: u16,
+    pub width: u16,
+    pub height: u16,
+    pub hot_x: u16,
+    pub hot_y: u16,
+    pub pixels: std::sync::Arc<Vec<u32>>,
 }
 
 /// Shared slot the device writes and the window reads (latest-wins). The frame
@@ -884,6 +904,12 @@ impl ApplicationHandler<FramePublished> for App {
                 self.engine_attached = true;
                 // Kick the first frame; RedrawRequested re-arms each subsequent
                 // one, so without this the window would never draw.
+                // With the guest cursor composited into the frame, hide the host
+                // pointer so the two don't both show. If the overlay is off, the
+                // host cursor stays as the visible pointer.
+                if std::env::var_os("REIMS_VGPU_CURSOR").is_some() {
+                    window.set_cursor_visible(false);
+                }
                 window.request_redraw();
                 self.window = Some(window);
             }
@@ -1271,6 +1297,7 @@ impl App {
         let result = crate::backend::vulkan::engine::window_present_frame(
             frame.as_ref().and_then(|frame| frame.resident.as_ref()),
             frame.as_deref().map(window_cpu_frame),
+            frame.as_deref().and_then(|frame| frame.cursor.as_ref()),
         );
         match result {
             Ok(crate::backend::vulkan::engine::WindowPresentOutcome::Busy) => {}

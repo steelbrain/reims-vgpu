@@ -591,6 +591,15 @@ pub fn device_drain(id: u64) -> bool {
     let publish_started = std::time::Instant::now();
     // Push the finished present frame to the host-owned window (if running).
     // Off the QEMU main loop; a small dedicated mutex, never the render lock.
+    // Refresh the guest cursor position before publishing. The protocol only
+    // updates it on CURSOR_SHOW / CURSOR_GLYPH and on the display-IRQ doorbell,
+    // so a pointer that moves without changing shape can leave x/y stale and the
+    // window overlay then appears to track only shape changes. One 4-byte guest
+    // read per tranche, and only when a window is actually consuming frames.
+    #[cfg(feature = "host-window")]
+    if device.state.present.window_active {
+        crate::runtime::drain::sample_cursor_position(&mut device.state, &host);
+    }
     #[cfg(feature = "host-window")]
     window_publish::publish_window_frame(&slot, &mut device.state);
     crate::runtime::drain::note_drain_tranche(
@@ -728,6 +737,33 @@ pub fn device_poll(id: u64) -> bool {
     {
         let now_ns = host.mono_ns();
         window_publish::publish_window_early_frame(&slot, &device.state, &host, now_ns);
+    }
+
+    // Track the cursor from the 4 ms poll heartbeat, not only from the drain.
+    //
+    // The guest updates its hardware-cursor position in the shared page as the
+    // pointer moves but does not doorbell every move, so the position is only
+    // noticed when something reads that page. `device_drain` reads it (and
+    // republishes the overlay) once per tranche — but on an idle macOS desktop
+    // the guest produces almost no FIFO traffic, so drains run at ~15/s and the
+    // cursor visibly steps at that rate. Dragging a window or crossing the dock
+    // makes the guest draw continuously, the drain runs at full rate, and the
+    // same cursor is smooth: the tell that this is drain cadence, not the
+    // overlay.
+    //
+    // The poll runs at 4 ms regardless of guest activity, so sampling and
+    // publishing here lets the overlay track at up to 250 Hz on an idle screen.
+    // On a static frame `publish_window_frame` takes its unchanged-key path: a
+    // 4-byte guest read, a key compare, and — only when the cursor fingerprint
+    // moved — one Arc-clone republish with no pixel copy. The poll holds `inner`
+    // here, so this cannot race the drain worker's own publish.
+    #[cfg(feature = "host-window")]
+    {
+        device.state.present.window_active = slot.window.lock().is_some();
+        if device.state.present.window_active {
+            crate::runtime::drain::sample_cursor_position(&mut device.state, &host);
+            window_publish::publish_window_frame(&slot, &mut device.state);
+        }
     }
     true
 }
