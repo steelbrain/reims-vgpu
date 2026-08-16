@@ -126,6 +126,20 @@ pub(super) enum MetalIcbInheritanceDecline {
     },
 }
 
+/// How many checks [`MetalIcbInheritanceDecline`] declares.
+///
+/// The fixture behind
+/// [`every_metal_icb_inheritance_check_is_unique_namespaced_and_log_safe`](super::tests)
+/// must carry one value per variant, or a check ships with nothing asserting
+/// its slug is namespaced, distinct, and free of whitespace. `rustc` cannot
+/// count an enum's variants on stable, so the number is written by hand — but
+/// it is written *here*, beside the variants, because the same number spelled
+/// in the test file went stale by five the day six per-class bind variants
+/// became [`MetalIcbInheritanceDecline::BindSlotPastTable`], and nothing was
+/// red until the next Apple host ran that arm.
+#[cfg(test)]
+pub(super) const METAL_ICB_INHERITANCE_CHECKS: usize = 21;
+
 impl crate::observe::Decline for MetalIcbInheritanceDecline {
     fn slug(&self) -> &'static str {
         match self {

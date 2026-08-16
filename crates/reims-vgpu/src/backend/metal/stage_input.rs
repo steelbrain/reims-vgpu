@@ -362,20 +362,36 @@ mod tests {
             .render()
     }
 
+    // Both caps are derived from the decoder's own count mask, so the expected
+    // lines are spelled from the constants rather than from the numbers they
+    // happen to hold. Written as literals, this test asserted `limit=16` and
+    // went red the day the wire's 5-bit count field widened the cap to 31 — the
+    // failure was the test's own second spelling and not a refusal that had
+    // stopped naming its limit.
     #[test]
     fn stage_input_attribute_and_layout_caps_have_distinct_reasons() {
+        let attr_cap = REIMS_VGPU_COMPUTE_STAGE_INPUT_MAX_ATTRIBUTES;
         let mut attributes = empty_descriptor();
-        attributes.attribute_count = REIMS_VGPU_COMPUTE_STAGE_INPUT_MAX_ATTRIBUTES as u32 + 1;
+        attributes.attribute_count = attr_cap as u32 + 1;
         assert_eq!(
             refused_line(&attributes),
-            "metal_stage_input_test reason=metal_stage_input_attribute_count_exceeded class=args attributes=17 limit=16"
+            format!(
+                "metal_stage_input_test reason=metal_stage_input_attribute_count_exceeded \
+                 class=args attributes={} limit={attr_cap}",
+                attr_cap + 1
+            )
         );
 
+        let layout_cap = REIMS_VGPU_COMPUTE_STAGE_INPUT_MAX_LAYOUTS;
         let mut layouts = empty_descriptor();
-        layouts.layout_count = REIMS_VGPU_COMPUTE_STAGE_INPUT_MAX_LAYOUTS as u32 + 1;
+        layouts.layout_count = layout_cap as u32 + 1;
         assert_eq!(
             refused_line(&layouts),
-            "metal_stage_input_test reason=metal_stage_input_layout_count_exceeded class=args layouts=17 limit=16"
+            format!(
+                "metal_stage_input_test reason=metal_stage_input_layout_count_exceeded \
+                 class=args layouts={} limit={layout_cap}",
+                layout_cap + 1
+            )
         );
     }
 }

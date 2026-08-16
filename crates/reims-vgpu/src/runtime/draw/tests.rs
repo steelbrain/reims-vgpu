@@ -950,7 +950,12 @@ fn encode_status_renders_its_check_beside_the_class_it_collapsed_to() {
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 #[test]
 fn explicit_metal_sampler_and_depth_binds_return_typed_missing_entry_declines() {
-    use crate::observe::Emit;
+    // Both slugs come from `ladder_slug!`, so the expectations are spelled
+    // through it rather than copied out of it. Written as literals, these read
+    // `metal_sampler_entry_missing` and went red when the rung-named spellings
+    // landed — a failure that was this test's own second copy of the name and
+    // not a refusal that had stopped naming its rung.
+    use crate::observe::{ladder_slug, Emit};
 
     let state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let host = FakeHost::new();
@@ -970,8 +975,11 @@ fn explicit_metal_sampler_and_depth_binds_return_typed_missing_entry_declines() 
             .field("pipe", 19)
             .field("stage", "fragment")
             .render(),
-        "metal_draw_sampler_fallback reason=metal_sampler_entry_missing \
-             sampler_ref=77 index=3 task=4 pipe=19 stage=fragment"
+        format!(
+            "metal_draw_sampler_fallback reason={} \
+             sampler_ref=77 index=3 task=4 pipe=19 stage=fragment",
+            ladder_slug!("metal_sampler", no_list_entry)
+        )
     );
 
     let depth = load_depth_stencil_state(&state, &host, 4, 88)
@@ -987,8 +995,10 @@ fn explicit_metal_sampler_and_depth_binds_return_typed_missing_entry_declines() 
             .field("task", 4)
             .field("pipe", 19)
             .render(),
-        "metal_draw_depth_stencil_fallback reason=metal_depth_stencil_entry_missing \
-             depth_stencil_ref=88 task=4 pipe=19"
+        format!(
+            "metal_draw_depth_stencil_fallback reason={} depth_stencil_ref=88 task=4 pipe=19",
+            ladder_slug!("metal_depth_stencil", no_list_entry)
+        )
     );
 }
 
@@ -1107,7 +1117,11 @@ fn every_metal_icb_inheritance_check_is_unique_namespaced_and_log_safe() {
     ];
 
     let mut slugs = all.iter().map(Decline::slug).collect::<Vec<_>>();
-    assert_eq!(slugs.len(), 26, "the fixture must cover every check");
+    assert_eq!(
+        slugs.len(),
+        crate::runtime::draw::metal_icb::METAL_ICB_INHERITANCE_CHECKS,
+        "the fixture must cover every check"
+    );
     for decline in &all {
         assert!(decline.slug().starts_with("metal_icb_inherit_"));
         for (key, value) in decline.fields() {
