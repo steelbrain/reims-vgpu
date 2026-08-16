@@ -7096,3 +7096,140 @@ fn the_buffer_backed_texture_rail_pays_for_its_texture_reference() {
         "the sampled bind never asked the ledger what its texture reference owed"
     );
 }
+
+/// A type-8 view over a type-11 mapping is checked against the format the
+/// mapping declared, and an override may only reinterpret bytes the capture
+/// left alone.
+///
+/// Both halves used to be answered by one hard-coded `MTL_FORMAT_BGRA8_UNORM`
+/// standing in for the base, which describes the buffer the loader fills rather
+/// than the texture the guest is viewing. The two agree only when the mapping
+/// declares BGRA8, and this device sees `MTLPixelFormatRGBA16Float` type-11
+/// front buffers on every macos-13 boot -- so against those the stand-in
+/// refused every legal 8-byte view (`base_bpp=4` against `view_bpp=8`) and
+/// admitted every illegal 4-byte one, both without a word in the log.
+///
+/// The last two rows are the ones that fail against the old spelling: it
+/// answered `Err(WidthMismatch)` for the legal view and `Ok` for the illegal
+/// one, which is this check inverted on exactly the format it was blind to.
+#[test]
+fn a_type11_view_is_checked_against_the_format_the_mapping_declared() {
+    use crate::contract::pixel_format::{
+        MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_BGRA8_UNORM_SRGB, MTL_FORMAT_RGBA16_FLOAT,
+        MTL_FORMAT_RGBA8_UNORM,
+    };
+    use crate::runtime::draw::texture_view::ViewSampleRefusal;
+    use crate::runtime::draw::{type11_raw_read_format, Type11ViewRefusal};
+
+    struct Case {
+        base: u16,
+        view: Option<u16>,
+        want: Result<u16, Type11ViewRefusal>,
+        why: &'static str,
+    }
+    let case = |base, view, want, why| Case {
+        base,
+        view,
+        want,
+        why,
+    };
+
+    let cases = [
+        case(
+            MTL_FORMAT_BGRA8_UNORM,
+            None,
+            Ok(MTL_FORMAT_BGRA8_UNORM),
+            "no override reads the rows as what the capture wrote",
+        ),
+        case(
+            MTL_FORMAT_RGBA16_FLOAT,
+            None,
+            Ok(MTL_FORMAT_BGRA8_UNORM),
+            "the rows are BGRA8 however wide the base texel is",
+        ),
+        case(
+            MTL_FORMAT_BGRA8_UNORM,
+            Some(MTL_FORMAT_RGBA8_UNORM),
+            Ok(MTL_FORMAT_RGBA8_UNORM),
+            "over a BGRA8 base the capture is verbatim, so the view reinterprets real storage",
+        ),
+        case(
+            MTL_FORMAT_BGRA8_UNORM_SRGB,
+            Some(MTL_FORMAT_BGRA8_UNORM),
+            Ok(MTL_FORMAT_BGRA8_UNORM),
+            "the other verbatim spelling is verbatim too",
+        ),
+        case(
+            MTL_FORMAT_RGBA16_FLOAT,
+            Some(MTL_FORMAT_RGBA16_FLOAT),
+            Err(Type11ViewRefusal::Normalised {
+                base: MTL_FORMAT_RGBA16_FLOAT,
+                view: MTL_FORMAT_RGBA16_FLOAT,
+            }),
+            "Metal allows this view; the normalised rows are what this device cannot serve it from",
+        ),
+        case(
+            MTL_FORMAT_RGBA16_FLOAT,
+            Some(MTL_FORMAT_BGRA8_UNORM),
+            Err(Type11ViewRefusal::Incompatible(
+                ViewSampleRefusal::WidthMismatch {
+                    base_bpp: 8,
+                    view_bpp: 4,
+                },
+            )),
+            "Metal forbids viewing 8 bytes of storage as 4, and so must this",
+        ),
+    ];
+
+    for Case {
+        base,
+        view,
+        want,
+        why,
+    } in cases
+    {
+        assert_eq!(
+            type11_raw_read_format(base, view),
+            want,
+            "base={base:#x} view={view:?}: {why}"
+        );
+    }
+}
+
+/// Each refusal names its own check, and both carry the formats that caused it.
+#[test]
+fn a_type11_view_refusal_names_its_check_and_carries_both_formats() {
+    use crate::contract::pixel_format::{MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_RGBA16_FLOAT};
+    use crate::observe::Decline;
+    use crate::runtime::draw::texture_view::ViewSampleRefusal;
+    use crate::runtime::draw::Type11ViewRefusal;
+
+    let normalised = Type11ViewRefusal::Normalised {
+        base: MTL_FORMAT_RGBA16_FLOAT,
+        view: MTL_FORMAT_BGRA8_UNORM,
+    };
+    let incompatible = Type11ViewRefusal::Incompatible(ViewSampleRefusal::WidthMismatch {
+        base_bpp: 8,
+        view_bpp: 4,
+    });
+    assert_ne!(
+        normalised.slug(),
+        incompatible.slug(),
+        "two checks sharing a slug is the defect the decline vocabulary exists to prevent"
+    );
+
+    let line = crate::observe::Emit::decline("sample_type11_view", &normalised)
+        .field("mapping", 7u32)
+        .render();
+    assert!(line.contains("reason=type11_view_over_normalised_bytes"), "{line}");
+    assert!(line.contains("base=0x73"), "{line}");
+    assert!(line.contains("view=0x50"), "{line}");
+    assert!(line.contains("mapping=7"), "{line}");
+
+    let line = crate::observe::Emit::decline("sample_type11_view", &incompatible).render();
+    assert!(line.contains("reason=type11_view_incompatible"), "{line}");
+    assert!(
+        line.contains("base_bpp=8") && line.contains("view_bpp=4"),
+        "a refusal without the widths that refused is half a diagnostic: {line}"
+    );
+}

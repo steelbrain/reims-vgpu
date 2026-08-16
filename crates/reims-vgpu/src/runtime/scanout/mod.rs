@@ -41,6 +41,24 @@ fn is_front_buffer_format(fmt: u16) -> bool {
     )
 }
 
+/// Does [`read_mapping_bgra8`] hand back the guest's stored bytes unaltered?
+///
+/// [`paint_mapping`] normalises every mapping to BGRA8, so for most formats the
+/// bytes it produces are this device's rewrite of the guest's and no longer the
+/// guest's own. For the two BGRA8 spellings the conversion is the identity and
+/// the copy is verbatim.
+///
+/// The distinction is load-bearing for anything that wants to *reinterpret*
+/// those bytes under a second format — a type-8 view's `pixel_format` override
+/// names storage that Metal reinterprets in place, which only means the same
+/// thing here when the capture changed nothing. `paint_mapping`'s own row loop
+/// asks this same question to decide whether it may skip the conversion bounce,
+/// so both sides read one rule rather than two spellings of it.
+#[inline]
+pub(crate) fn bgra8_capture_is_verbatim(format: u16) -> bool {
+    format == MTL_FORMAT_BGRA8_UNORM || format == pixel_format::MTL_FORMAT_BGRA8_UNORM_SRGB
+}
+
 /// Result of a scanout copy attempt.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScanoutCopyResult {
@@ -1074,9 +1092,7 @@ fn paint_mapping<M: HostMemory + crate::runtime::host::HostOps>(
     };
 
     let mut src_row = vec![0u8; tight as usize];
-    let mut rgba_row = if format == MTL_FORMAT_BGRA8_UNORM
-        || format == pixel_format::MTL_FORMAT_BGRA8_UNORM_SRGB
-    {
+    let mut rgba_row = if bgra8_capture_is_verbatim(format) {
         None
     } else {
         Some(vec![0u8; (mw as usize) * (RGBA8_BPP as usize)])

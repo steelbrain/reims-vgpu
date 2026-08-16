@@ -3800,6 +3800,78 @@ fn mapping_declared_format(
     }
 }
 
+/// Why a type-11 mapping could not be read through a type-8 view.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Type11ViewRefusal {
+    /// Metal's own view-compatibility rule refused, asked against the format the
+    /// mapping declared. Carries the term that refused.
+    Incompatible(texture_view::ViewSampleRefusal),
+    /// The guest asked a view to reinterpret storage this device had already
+    /// rewritten. A view's `pixel_format` names bytes Metal reinterprets in
+    /// place, but [`crate::runtime::scanout::read_mapping_bgra8`] normalises a
+    /// non-BGRA8 mapping into BGRA8 before anything here sees it, so the bytes
+    /// the override would reinterpret are gone by then.
+    ///
+    /// The contract is in reach and this device is not holding it: honouring
+    /// the override needs the storage rows, which means reading the mapping
+    /// under `base` instead of under BGRA8. Until a loader does that, refusing
+    /// by name costs the guest this bind and says which one, where guessing
+    /// would hand back one reinterpretation of another format's bytes.
+    Normalised { base: u16, view: u16 },
+}
+
+impl crate::observe::Decline for Type11ViewRefusal {
+    fn slug(&self) -> &'static str {
+        match self {
+            Self::Incompatible(_) => "type11_view_incompatible",
+            Self::Normalised { .. } => "type11_view_over_normalised_bytes",
+        }
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        match self {
+            Self::Incompatible(why) => vec![("view_reason", why.to_string())],
+            Self::Normalised { base, view } => vec![
+                ("base", format!("{base:#x}")),
+                ("view", format!("{view:#x}")),
+            ],
+        }
+    }
+}
+
+crate::observe::decline_display!(Type11ViewRefusal);
+
+/// What format the BGRA8-normalised rows out of
+/// [`crate::runtime::scanout::read_mapping_bgra8`] must be read as, for a
+/// mapping declaring `base_fmt` sampled through an optional type-8 view.
+///
+/// Two rules, and keeping them in one function is the point — they disagree
+/// about which format is the answer and the disagreement is the whole defect:
+///
+/// * Metal's view-compatibility rule is about the **base texture**, so it is
+///   asked against `base_fmt`.
+/// * The bytes a caller will actually hold are this device's BGRA8 rewrite, so
+///   with no override the answer is BGRA8 whatever the base declared.
+///
+/// An override may only reinterpret bytes the capture left alone, which
+/// [`crate::runtime::scanout::bgra8_capture_is_verbatim`] answers.
+fn type11_raw_read_format(
+    base_fmt: u16,
+    format_override: Option<u16>,
+) -> Result<u16, Type11ViewRefusal> {
+    let sample = texture_view::effective_view_sample_format_reasoned(base_fmt, format_override)
+        .map_err(Type11ViewRefusal::Incompatible)?;
+    match format_override {
+        // No reinterpretation asked for, so the rows are read as what they are.
+        None => Ok(MTL_FORMAT_BGRA8_UNORM),
+        Some(_) if crate::runtime::scanout::bgra8_capture_is_verbatim(base_fmt) => Ok(sample),
+        Some(view) => Err(Type11ViewRefusal::Normalised {
+            base: base_fmt,
+            view,
+        }),
+    }
+}
+
 /// Sample a type-11 mapping as tight RGBA8 from guest pages.
 ///
 /// Guest pages ARE the surface content: the CPU writeback lands Stores in them
@@ -3824,8 +3896,23 @@ fn load_type11_mapping_rgba<M: HostMemory + HostOps>(
         }
         (m.width, m.height)
     };
-    let base_fmt = MTL_FORMAT_BGRA8_UNORM;
-    let sample_fmt = effective_view_sample_format(base_fmt, format_override)?;
+    // Metal checks a view against the *base texture's* format, so that is what
+    // has to be asked here. Hard-coding BGRA8 asked about `raw` instead — the
+    // buffer this function is about to fill — and the two are the same question
+    // only when the mapping happens to declare BGRA8. Against an RGBA16Float
+    // front buffer, which this device sees on every macos-13 boot, the
+    // hard-coded 4 refused every legal 8-byte view and admitted every illegal
+    // 4-byte one, in both cases silently.
+    let base_fmt = mapping_declared_format(state, mapping_id, None);
+    let sample_fmt = match type11_raw_read_format(base_fmt, format_override) {
+        Ok(fmt) => fmt,
+        Err(why) => {
+            crate::observe::Emit::decline("sample_type11_view", &why)
+                .field("mapping", mapping_id)
+                .fail_once(mapping_id as u64);
+            return None;
+        }
+    };
     let stride = w.saturating_mul(RGBA8_BPP);
     let mut raw = vec![0u8; (stride as usize).saturating_mul(h as usize)];
     if !crate::runtime::scanout::read_mapping_bgra8(state, host, mapping_id, &mut raw, stride, w, h)
