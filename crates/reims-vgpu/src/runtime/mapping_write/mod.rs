@@ -951,18 +951,16 @@ pub fn write_bgra8_from_resident_gpu<M: HostMemory + HostOps>(
             format,
         });
     };
-    let shared_backing = if host.map_pages_stable() {
-        mapper::ensure_contig_view(state, host, mapping_id).map(|(ptr, len)| {
-            crate::backend::vulkan::engine::GuestTargetBacking {
-                allocation_host_ptr: ptr,
-                allocation_len: len as u64,
-                plane_offset: base_off,
-                row_pitch: u64::from(bpr),
-            }
-        })
-    } else {
-        None
-    };
+    // Retainable specifically: this backing rides into `GuestPageTarget` and the
+    // engine reads it when the submission reaches the GPU, long after this call.
+    let shared_backing = mapper::ensure_retainable_contig_view(state, host, mapping_id).map(
+        |(ptr, len)| crate::backend::vulkan::engine::GuestTargetBacking {
+            allocation_host_ptr: ptr,
+            allocation_len: len as u64,
+            plane_offset: base_off,
+            row_pitch: u64::from(bpr),
+        },
+    );
     // One live window per physical format is enough to answer the remaining
     // device-level question: whether the driver's actual linear layout and
     // memory requirements agree with a guest plane on this host. The packed

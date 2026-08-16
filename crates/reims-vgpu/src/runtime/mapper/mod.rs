@@ -1475,10 +1475,11 @@ fn revalidate_timing_is_slow(elapsed_us: u64) -> bool {
 
 /// Release contiguous views whose page tables changed.
 ///
-/// A GPU object can retain a view only when [`HostOps::map_pages_stable`]
-/// promises the address for the device lifetime; `unmap_pages` is a no-op on
-/// exactly that host. A transient view is never admitted to a backend import,
-/// so its only users are CPU copies that finish inside their own call.
+/// A GPU object can retain a view only when the host called that view
+/// [`crate::runtime::host::PageAlias::Stable`], which promises the address for
+/// the VM's lifetime and makes `unmap_pages` a no-op on it. A transient view is
+/// never admitted to a backend import, so its only users are CPU copies that
+/// finish inside their own call.
 pub fn flush_retired_views<H: HostOps>(state: &mut DeviceState, host: &mut H) {
     // The backend allocation aliases the host view, so revoke the GPU parent
     // first. Existing child images and recorded buffers hold it through their
@@ -1929,6 +1930,28 @@ pub fn ensure_contig_view<H: HostMemory + HostOps>(
     ensure_contig_view_with_pages(state, host, mapping_id).map(|(ptr, len, _)| (ptr, len))
 }
 
+/// [`ensure_contig_view`] for a caller whose consumer outlives the call.
+///
+/// The view is the mapping's for as long as its page list stands, but the
+/// *address* is only guest RAM's when the host said so: a reconstructed view is
+/// released the moment the page list changes, while a GPU import over it is
+/// released after the last fence that could still read it. So anything handed to
+/// the backend asks here and everything doing a CPU copy inside its own call
+/// asks [`ensure_contig_view`].
+///
+/// Asked of the view this mapping holds rather than of the device. Both shims
+/// answer either way on one boot, and a device-wide question has to answer for
+/// the worst case — which on arm64 was every mapping.
+pub fn ensure_retainable_contig_view<H: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut H,
+    mapping_id: u32,
+) -> Option<(usize, usize)> {
+    let (ptr, len) = ensure_contig_view(state, host, mapping_id)?;
+    let alias = state.mappings.get(&mapping_id)?.contig_alias;
+    (alias == crate::runtime::host::PageAlias::Stable).then_some((ptr, len))
+}
+
 /// [`ensure_contig_view`] plus the guest-physical footprint owned by the view.
 ///
 /// The footprint is retained with an imported GPU resource so synchronizing
@@ -1969,7 +1992,7 @@ pub fn ensure_contig_view_with_pages<H: HostMemory + HostOps>(
     let gpas = mapping_page_gpas(state, host, mapping_id)?;
     let page_sz = crate::contract::iosurface_pages::page_size_of(state.page_shift) as usize;
     let physical_runs = reims_vgpu_paging::runs::contig_run_count(&gpas, page_sz as u64);
-    let Some(ptr) = host.map_pages(&gpas, page_sz) else {
+    let Some(view) = host.map_pages(&gpas, page_sz) else {
         let served = CONTIG_REFUSED_SERVED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let m = state.mappings.get_mut(&mapping_id)?;
         m.contig_refused_gen = Some(m.map_generation);
@@ -1990,10 +2013,11 @@ pub fn ensure_contig_view_with_pages<H: HostMemory + HostOps>(
         page_sz as u64,
     )?;
     let m = state.mappings.get_mut(&mapping_id)?;
-    m.contig_ptr = ptr;
+    m.contig_ptr = view.ptr;
     m.contig_len = len;
+    m.contig_alias = view.alias;
     m.contig_footprint = Some(footprint);
-    Some((ptr, len, gpas))
+    Some((view.ptr, len, gpas))
 }
 
 /// The mapping's one checked backend import and its physical-page footprint.
@@ -2011,11 +2035,14 @@ pub fn ensure_contig_import_with_footprint<H: HostMemory + HostOps>(
     std::sync::Arc<crate::runtime::guest_ram::GuestRamImport>,
     crate::runtime::guest_ram::GuestPageFootprint,
 )> {
-    if !host.map_pages_stable() {
+    let (ptr, len, _pages) = ensure_contig_view_with_pages(state, host, mapping_id)?;
+    let mapping = state.mappings.get(&mapping_id)?;
+    // Same rule as `ensure_retainable_contig_view`, asked here because this arm
+    // already holds the entry for its footprint.
+    if mapping.contig_alias != crate::runtime::host::PageAlias::Stable {
         return None;
     }
-    let (ptr, len, _pages) = ensure_contig_view_with_pages(state, host, mapping_id)?;
-    let footprint = state.mappings.get(&mapping_id)?.contig_footprint.clone()?;
+    let footprint = mapping.contig_footprint.clone()?;
     let len = u64::try_from(len).ok()?;
     // The one admission rule, which asks the map's standing refusal before the
     // latches. This site used to ask the three latches directly and so kept
@@ -2303,7 +2330,8 @@ fn copy_mapping_runs<H: HostMemory + HostOps>(
         if copy_lo >= copy_hi {
             continue;
         }
-        let Some(ptr) = host.map_pages(run_gpas, page_sz) else {
+        // Unmapped before this loop leaves the run, so either alias serves.
+        let Some(ptr) = host.map_pages(run_gpas, page_sz).map(|v| v.ptr) else {
             crate::observe::fail(format!(
                 "{site} fail reason=map_pages mid={mapping_id} run_pages={} mlo={run_mlo:#x}",
                 run_gpas.len()

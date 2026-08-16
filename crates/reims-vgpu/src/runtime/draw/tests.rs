@@ -281,6 +281,11 @@ fn type11_zero_copy_declines_transient_host_mappings() {
     assert!(state.set_mapping_geom(mid, width, height, MTL_FORMAT_BGRA8_UNORM));
 
     let resource = crate::model::TaskResource::new(Default::default(), std::sync::Arc::from([]));
+    // The window's pages are one GPA-contiguous run, so a host that would
+    // reconstruct even *this* is the only kind that has to fall back -- and it
+    // has to fall back on the alias verdict rather than on the page walk, which
+    // is why the map is asked before the refusal rather than skipped.
+    host.transient_map_pages = true;
     assert!(try_type11_sample_zero_copy(
         &mut state,
         &mut host,
@@ -290,9 +295,18 @@ fn type11_zero_copy_declines_transient_host_mappings() {
         resource.lifetime_ref(),
     )
     .is_none());
-    assert_eq!(
-        host.map_pages_calls, 0,
-        "transient hosts must decline before creating an importable view"
+    assert!(
+        host.map_pages_calls > 0,
+        "the refusal must come from the host's answer about the view it built, \
+         not from declining to ask"
+    );
+    assert!(
+        state
+            .mappings
+            .get(&mid)
+            .is_some_and(|m| m.contig_import.is_none()),
+        "and nothing importable may be retained over a view the host owes a \
+         release for"
     );
 }
 
@@ -311,7 +325,6 @@ fn mapping_sampled_planes_reuse_one_resource_owned_import() {
     let page = 1u64 << PAGE_SHIFT_X86;
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
     let mut host = FakeHost::new();
-    host.stable_map_pages = true;
     let mid = 17u32;
     let gpa0 = 0x4100_0000u64;
     let pages = 16u32;
@@ -436,7 +449,6 @@ fn small_mapping_sampled_plane_uses_its_direct_resource() {
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
     let mut host = FakeHost::new();
-    host.stable_map_pages = true;
     let mid = 18u32;
     let gpa = 0x4200_0000u64;
     host.map_range(gpa, page as usize, 0);
@@ -4524,6 +4536,11 @@ fn type5_sample_uses_serialized_rg8_view_over_unknown_surface_fourcc() {
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
     let mut host = FakeHost::new();
+    // The subject here is the serialized RG8 *byte* conversion, so the host is
+    // one that hands back reconstructed views and every zero-copy rung declines.
+    // Without this the surface's pages resolve as guest RAM and the resolver
+    // correctly returns a resident instead, which proves nothing about RG8.
+    host.transient_map_pages = true;
 
     // One-level x86 GVA table for the object list and type-5 descriptor.
     let dir_pfn = 2u32;
@@ -5385,17 +5402,23 @@ fn texture_ref_cache_geom_mismatch_does_not_hit_get_texture() {
     assert!(crate::runtime::surface_cache::get(&state, tex_ref, 1920, 1152).is_none());
 }
 
-/// A guest-run host pointer is only valid when the host has declared
-/// `map_pages` views stable. Arm64 MMIO remap views are transient, so the
-/// runtime must decline to produce runs at all rather than hand the engine a
-/// pointer whose view can be released before the submission gathers from it.
+/// A guest-run host pointer is only valid when the host said the view it just
+/// handed back is guest RAM itself. A view the host owes a release for can be
+/// released before the submission gathers from it, so the runtime must decline
+/// to produce runs at all rather than hand the engine that pointer.
 ///
-/// The two arms differ **only** in `stable_map_pages`, so the walkable arm is
+/// The two arms differ **only** in `transient_map_pages`, so the stable arm is
 /// the control: without it this would pass on a build that declined every span
 /// for some unrelated reason, which is exactly how a decline test goes hollow.
+///
+/// The stable arm is also the regression this test now carries. It asks nothing
+/// of the device and everything of the call, so a span whose pages coalesce to
+/// one GPA-contiguous stretch resolves on **any** host — which is what every
+/// draw-time buffer bind on arm64 is, and what a device-wide stability flag
+/// refused 19 885 times in one boot.
 #[test]
 #[cfg(feature = "backend-vulkan")]
-fn guest_runs_decline_on_unstable_host_mappings() {
+fn guest_runs_decline_on_transient_host_mappings() {
     use crate::contract::endian::st32;
     use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
 
@@ -5404,13 +5427,13 @@ fn guest_runs_decline_on_unstable_host_mappings() {
     let gva = 8u64;
 
     // A task whose page table really does resolve `[gva, gva+16)` onto `data0`.
-    let walkable = |stable: bool| -> Result<
+    let walkable = |transient: bool| -> Result<
         Vec<crate::backend::vulkan::engine::GuestRun>,
         super::vulkan::WindowRefusal,
     > {
         let mut host = FakeHost::new();
         host.strict_linux_map = true;
-        host.stable_map_pages = stable;
+        host.transient_map_pages = transient;
         let (dir_gpa, root_gpa, data0) =
             (2u64 << page_shift, 3u64 << page_shift, 4u64 << page_shift);
         for gpa in [dir_gpa, root_gpa, data0] {
@@ -5430,17 +5453,18 @@ fn guest_runs_decline_on_unstable_host_mappings() {
     };
 
     assert!(
-        walkable(true).is_ok_and(|runs| !runs.is_empty()),
-        "control: a host promising a stable alias resolves this span"
+        walkable(false).is_ok_and(|runs| !runs.is_empty()),
+        "control: a contiguous stretch is guest RAM and resolves, with nothing \
+         asked of the device"
     );
-    // Named, not merely absent: this refusal is now counted, and it must land
-    // in the route that says the host would not promise the alias rather than
+    // Named, not merely absent: this refusal is counted, and it must land in the
+    // route that says the view was one the host owes a release for rather than
     // in one of the two that report a page table the guest wrote.
     assert_eq!(
-        walkable(false).err(),
+        walkable(true).err(),
         Some(super::vulkan::WindowRefusal::NoAlias),
-        "the same span must yield no runs when the host will not promise the \
-         alias outlives the submission that gathers from it"
+        "the same span must yield no runs when the host built the view rather \
+         than naming guest RAM, since the gather outlives its release"
     );
 }
 
@@ -5468,7 +5492,6 @@ fn the_packed_alias_rail_refuses_on_a_host_whose_map_refused() {
     // A host that reports no guest RAM at all: the map resolves to a standing
     // refusal even though every latch below is set.
     let mut host = FakeHost::new();
-    host.stable_map_pages = true;
     crate::runtime::guest_ram_map::reset();
     crate::runtime::guest_ram::latch_import_limits(page, 1 << 30, 1 << 30);
     assert!(
@@ -5506,7 +5529,6 @@ fn packed_buffer_alias_is_reused_across_offsets() {
     let page_shift = PAGE_SHIFT_X86;
     let page = 1u64 << page_shift;
     let mut host = FakeHost::new();
-    host.stable_map_pages = true;
     let (dir_gpa, root_gpa, data_gpa) = (2 * page, 3 * page, 4 * page);
     host.map_range(dir_gpa, page as usize, 0);
     host.map_range(root_gpa, page as usize, 0);
@@ -5764,7 +5786,6 @@ fn a_window_refusal_names_which_check_refused() {
     let build = |leaf_pfn: u32, back_leaf: bool| {
         let mut host = FakeHost::new();
         host.strict_linux_map = true;
-        host.stable_map_pages = true;
         let (dir_gpa, root_gpa) = (2u64 << page_shift, 3u64 << page_shift);
         host.map_range(dir_gpa, page as usize, 0);
         host.map_range(root_gpa, page as usize, 0);

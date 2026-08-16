@@ -35,7 +35,7 @@ pub fn write_bytes<H: HostMemory + HostOps>(
     // refusal is `map_pages` declining a run it cannot alias — a RAMBlock or
     // MemoryRegion edge — never a gap in the list. Naming it that way keeps the
     // reason a fact about the refusal rather than a guess about the input.
-    let Some(ptr) = host.map_pages(&gpas, page_size) else {
+    let Some(view) = host.map_pages(&gpas, page_size) else {
         let err = MemError::MapPagesRefused;
         crate::observe::Emit::decline("gpa_write", &err)
             .field("gpa", format!("{gpa:#x}"))
@@ -46,6 +46,7 @@ pub fn write_bytes<H: HostMemory + HostOps>(
     };
     let total = gpas.len() * page_size;
     let off = (gpa - start) as usize;
+    let ptr = view.ptr;
     if ptr == 0 || off + buf.len() > total {
         host.unmap_pages(ptr, total);
         return Err(MemError::Unmapped);

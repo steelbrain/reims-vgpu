@@ -322,7 +322,10 @@ fn ensure_gva_view<H: HostMemory + HostOps>(
         }
         return None;
     }
-    let ptr = host.map_pages(&gpas, page_sz)?;
+    // The view is retained in `state.gva_host_views` and released from there,
+    // so a transient alias is as usable here as a stable one -- this rail owns
+    // the lifetime either way.
+    let ptr = host.map_pages(&gpas, page_sz)?.ptr;
     let page_sz = (1usize) << page_shift;
     let ptr_len = gpas.len().saturating_mul(page_sz);
     state.gva_host_views.push(GvaHostView {
@@ -548,7 +551,8 @@ pub fn map_fresh_span_within<H: HostMemory + HostOps>(
     }
     crate::runtime::mapper::flush_retired_views(state, host);
     let page_sz = page_size as usize;
-    let ptr_base = host.map_pages(&gpas, page_sz)?;
+    // Released by `unmap_fresh_span`, so either alias serves.
+    let ptr_base = host.map_pages(&gpas, page_sz)?.ptr;
     let map_len = gpas.len().saturating_mul(page_sz);
     let off = (gva & (page_size - 1)) as usize;
     if off >= map_len || ((map_len - off) as u64) < length {
@@ -695,7 +699,8 @@ fn span_multi<H: HostMemory + HostOps>(
     let end = gva.saturating_add(length);
     for run in &runs {
         let run_gpas = &gpas[run.clone()];
-        let Some(ptr) = host.map_pages(run_gpas, page_sz) else {
+        // Unmapped before the loop moves on, so either alias serves.
+        let Some(ptr) = host.map_pages(run_gpas, page_sz).map(|v| v.ptr) else {
             return Err(MemError::MapPagesRefused);
         };
         let total = run_gpas.len().saturating_mul(page_sz);

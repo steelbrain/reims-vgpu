@@ -21,7 +21,17 @@
 extern "C" {
 #endif
 
-/* v18: ReimsVgpuHostOps.dmabuf_for_pages and every REIMS_VGPU_DMABUF_* removed.
+/* v19: map_pages answers the stability of the pointer it just returned, and
+ *      ReimsVgpuHostOps.map_pages_stable is removed. v10 asked the question
+ *      once per *device*, but neither shim has one answer: both hand back a
+ *      direct RAMBlock pointer when the requested pages are already packed in
+ *      host VA — guest RAM itself, valid for the VM's lifetime — and build a
+ *      view only when they are not. A device-wide flag has to report the worse
+ *      of the two, so the arm64 shim answered 0 and every caller needing a
+ *      lasting alias refused every call, including the packed ones it would
+ *      have accepted. The shim already computes which arm it took; this
+ *      exports that answer instead of a summary of it.
+ * v18: ReimsVgpuHostOps.dmabuf_for_pages and every REIMS_VGPU_DMABUF_* removed.
  *      v17's spans replaced the mechanism outright: guest pages reach the host
  *      GPU by importing the RAMBlock mapping QEMU already holds, on Linux,
  *      Windows and macOS alike, rather than through a Linux-only udmabuf fd.
@@ -79,7 +89,8 @@ extern "C" {
  * v10: ReimsVgpuHostOps.map_pages_stable — whether a map_pages view is a stable
  *      guest-RAM alias (x86 PCI: direct RAMBlock pointer, unmap is a no-op) or
  *      a transient mapping (arm sysbus: mach_vm_remap). Gates GPU-direct
- *      writeback's cached host-pointer imports.
+ *      writeback's cached host-pointer imports. Superseded by v19's per-call
+ *      answer and removed there.
  * v9: host-window lifecycle + early FB — reims_vgpu_qemu_window_stop (close + join on
  *     teardown), reims_vgpu_qemu_window_set_early_fb (register BAR1 GOP so the window
  *     shows early boot), and the WindowClosed HostAction (11) the window emits
@@ -91,7 +102,7 @@ extern "C" {
  *     thread so IRQ pulses reach the guest mid-drain — ack fast).
  * v6: ReimsVgpuHostOps.is_ram_gpa (reject non-RAM PFNs on mapper / map_pages paths).
  * v5: ReimsVgpuQemuCreateInfo.guest_page_shift (12 = x86 Tahoe, 14 = arm64e). */
-#define REIMS_VGPU_QEMU_ABI_VERSION 18u
+#define REIMS_VGPU_QEMU_ABI_VERSION 19u
 
 #define REIMS_VGPU_QEMU_OK 0
 #define REIMS_VGPU_QEMU_ERR_ARGS 1
@@ -109,6 +120,15 @@ extern "C" {
  */
 #define REIMS_VGPU_GUEST_RAM_ERR_ARGS -1
 #define REIMS_VGPU_GUEST_RAM_ERR_NO_RAM -2
+
+/*
+ * What kind of pointer map_pages just returned. Non-negative so one return
+ * value carries both the success and the lifetime, and TRANSIENT is 0 so a
+ * caller reading the older "0 = success" contract keeps the conservative
+ * reading: release it, and do not hand it to anything that outlives the call.
+ */
+#define REIMS_VGPU_MAP_PAGES_TRANSIENT 0
+#define REIMS_VGPU_MAP_PAGES_STABLE 1
 
 /*
  * One span of guest RAM: where it starts in guest physical address space, where
@@ -249,17 +269,34 @@ typedef struct ReimsVgpuHostOps {
     /* Guest CPU X-register read (iosfc mapper directed handoff). 0 = success. */
     int (*read_xreg)(void *ctx, uint32_t index, uint64_t *out);
     /*
-     * Build one contiguous host-VA view of `count` guest pages (each
-     * REIMS_VGPU_GUEST_PAGE_SIZE_ARM64E, page-aligned GPAs into guest RAM) via
-     * mach_vm_remap — the ParavirtualizedGraphics mapMemory model: the view
-     * aliases guest RAM, so CPU/GPU writes through it *are* guest memory.
-     * 0 = success, fills *out_ptr (view length = count * page size).
+     * Build one contiguous host-VA view of `count` guest pages (page-aligned
+     * GPAs into guest RAM) — the ParavirtualizedGraphics mapMemory model: the
+     * view aliases guest RAM, so CPU/GPU writes through it *are* guest memory.
+     *
+     * Negative on failure. On success fills *out_ptr (view length =
+     * count * page size) and returns which kind of pointer that is:
+     *
+     *   REIMS_VGPU_MAP_PAGES_STABLE    guest RAM itself, or an alias this shim
+     *                                  holds until device teardown. Valid for
+     *                                  the device lifetime, never recycled for
+     *                                  unrelated memory, and unmap_pages owes
+     *                                  it nothing. Only such a pointer may be
+     *                                  handed to work that outlives this call —
+     *                                  a cached import, a recorded GPU gather.
+     *   REIMS_VGPU_MAP_PAGES_TRANSIENT a view built for this call, valid until
+     *                                  unmap_pages releases it.
+     *
+     * A shim answers per call, not per device: both shims return the direct
+     * RAMBlock pointer when the requested pages are already packed in host VA
+     * and build a view only when they are not, so the two answers come from one
+     * function on one host.
      */
     int (*map_pages)(void *ctx, const uint64_t *gpas, size_t count,
                      void **out_ptr);
     /*
      * Release a transient view from map_pages (len = count * page size).
-     * No-op when map_pages_stable is 1.
+     * A pointer map_pages reported STABLE is guest RAM or a retained alias:
+     * passing one here must do nothing.
      */
     void (*unmap_pages)(void *ctx, void *ptr, size_t len);
     /*
@@ -298,19 +335,6 @@ typedef struct ReimsVgpuHostOps {
      * running, not after it.
      */
     void (*notify_actions)(void *ctx);
-    /*
-     * 1 if map_pages returns a *stable* alias of guest RAM: the pointer stays
-     * valid for the device lifetime, unmap_pages is a no-op, and the address
-     * is never recycled for other memory. 0 if the view is a transient mapping
-     * that unmap_pages tears down.
-     *
-     * Base guest RAM reaches the GPU through the spans guest_ram_regions names,
-     * independently of this flag. A resource-shaped packed import may retain a
-     * map_pages view, however, and may do so only when this flag promises that
-     * submitted GPU work cannot outlive the alias. Default (absent field /
-     * older shim) must be treated as 0.
-     */
-    int map_pages_stable;
     /*
      * Guest-write tracking. A surface's pages are plain guest RAM: the guest
      * CPU stores into them with no device operation, so no counter the Rust

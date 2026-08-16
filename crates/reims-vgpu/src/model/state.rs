@@ -1469,6 +1469,13 @@ pub struct MappingEntry {
     /// whenever `page_entries` change; see `DeviceState::retired_views`.
     pub contig_ptr: usize,
     pub contig_len: usize,
+    /// What the host said about `contig_ptr` when it built it.
+    ///
+    /// Meaningless while `contig_ptr` is 0 and set together with it. CPU readers
+    /// do not consult it -- this mapping owns the view and retires it -- but a
+    /// GPU import retains the address past its own retirement, so only a
+    /// [`crate::runtime::host::PageAlias::Stable`] view may back one.
+    pub contig_alias: crate::runtime::host::PageAlias,
     /// Guest-physical pages represented by `contig_ptr`, in allocation order.
     ///
     /// Kept with the view because a resource synchronization names the
@@ -2841,6 +2848,7 @@ impl DeviceState {
         let view = (e.contig_ptr != 0).then_some((e.contig_ptr, e.contig_len));
         e.contig_ptr = 0;
         e.contig_len = 0;
+        e.contig_alias = crate::runtime::host::PageAlias::default();
         e.contig_footprint = None;
         (view, import)
     }

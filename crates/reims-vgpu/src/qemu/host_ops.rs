@@ -6,10 +6,11 @@
 //! the main loop.
 
 use crate::runtime::host::{
-    GuestRamRegionsError, HostAction, HostActionKind, HostMemory, HostOps, MemError,
+    GuestRamRegionsError, HostAction, HostActionKind, HostMemory, HostOps, MappedPages, MemError,
+    PageAlias,
 };
 use std::collections::VecDeque;
-use std::os::raw::{c_int, c_void};
+use std::os::raw::c_void;
 
 /// Versioned host callback table offered by QEMU C to Rust.
 ///
@@ -37,7 +38,17 @@ pub struct ReimsVgpuHostOps {
         Option<unsafe extern "C" fn(ctx: *mut c_void, kva: u64, buf: *mut u8, len: usize) -> i32>,
     /// Read guest CPU X-register `index` into `*out`. Returns 0 on success.
     pub read_xreg: Option<unsafe extern "C" fn(ctx: *mut c_void, index: u32, out: *mut u64) -> i32>,
-    /// Contiguous host-VA view of guest pages (mach_vm_remap of guest RAM).
+    /// Contiguous host-VA view of guest pages.
+    ///
+    /// Negative on failure. On success the return says which kind of pointer it
+    /// is: `REIMS_VGPU_MAP_PAGES_STABLE` when the answer is QEMU's own RAMBlock
+    /// mapping, which outlives the device and needs no release, or
+    /// `REIMS_VGPU_MAP_PAGES_TRANSIENT` when the shim assembled a view the
+    /// caller owns until `unmap_pages`.
+    ///
+    /// Both shims answer both ways on one boot -- a host-VA-packed request takes
+    /// the RAMBlock arm and a scattered one does not -- which is why the answer
+    /// rides the call and is not a field on this table.
     pub map_pages: Option<
         unsafe extern "C" fn(
             ctx: *mut c_void,
@@ -68,27 +79,6 @@ pub struct ReimsVgpuHostOps {
     /// thread. Distinct from `schedule_bh` (drain-worker wake): prompt actions
     /// (IRQ pulses, cursor moves) must be deliverable mid-drain.
     pub notify_actions: Option<unsafe extern "C" fn(ctx: *mut c_void)>,
-    /// 1 when `map_pages` owes no release: the pointer is guest RAM itself and
-    /// stays valid for the device lifetime, so a caller may hold it
-    /// indefinitely and `unmap_pages` has nothing to free.
-    ///
-    /// The two shims answer differently and the difference is real. x86 PCI
-    /// answers **1**: a contiguous run is the RAMBlock pointer, while a
-    /// fragmented list becomes a retained packed alias over the shared RAM
-    /// backing; both live until device teardown. arm MMIO answers **0**: a
-    /// contiguous run gets the direct HVA, but a fragmented one gets a packed
-    /// `mach_vm_remap` view with caller-owned lifetime, and a bare pointer
-    /// cannot say which it is.
-    ///
-    /// It used to also license retaining the pointer inside a cached host-pointer
-    /// import, which is where the stronger promise came from — MMIO could claim
-    /// 1 only because it never released a view at all, so every fragmented map
-    /// leaked a VA reservation until teardown. The GPU rail does not read this
-    /// flag for the base RAMBlock import: those spans come from
-    /// `guest_ram_regions` and neither shim built them. Resource-shaped packed
-    /// imports do read it, because retaining such an import requires the
-    /// `map_pages` alias itself to outlive submitted GPU work.
-    pub map_pages_stable: c_int,
     /// Register `count` page-aligned GPAs as one guest-write-tracked set and
     /// return a non-zero opaque token, or 0 when the host has no dirty bitmap.
     /// Mutates QEMU MemoryRegion logging state, so the shim may only do the
@@ -150,7 +140,6 @@ impl ReimsVgpuHostOps {
             read_xreg: None,
             map_pages: None,
             unmap_pages: None,
-            map_pages_stable: 0,
             track_guest_writes: None,
             untrack_guest_writes: None,
             guest_write_gen: None,
@@ -507,7 +496,7 @@ impl HostOps for QemuHost<'_> {
         }
     }
 
-    fn map_pages(&mut self, gpas: &[u64], page_size: usize) -> Option<usize> {
+    fn map_pages(&mut self, gpas: &[u64], page_size: usize) -> Option<MappedPages> {
         if gpas.is_empty() {
             return None;
         }
@@ -525,7 +514,7 @@ impl HostOps for QemuHost<'_> {
         let mut out: *mut c_void = std::ptr::null_mut();
         // SAFETY: QEMU owns ctx; gpas valid for count; out is stack local.
         let rc = unsafe { f(self.ops.ctx, gpas.as_ptr(), gpas.len(), &mut out) };
-        if rc != 0 {
+        if rc < 0 {
             QemuHostDecline::MapPagesCallbackFailed {
                 rc,
                 first_gpa,
@@ -544,11 +533,19 @@ impl HostOps for QemuHost<'_> {
             .emit(first_gpa);
             return None;
         }
-        Some(out as usize)
-    }
-
-    fn map_pages_stable(&self) -> bool {
-        self.ops.map_pages_stable != 0
+        // Anything the shim reports that is neither code reads as the view it
+        // owes a release for. A guess in the other direction hands a caller a
+        // pointer it may keep forever, which is the failure this return code
+        // exists to prevent.
+        let alias = if rc == super::abi::MAP_PAGES_STABLE {
+            PageAlias::Stable
+        } else {
+            PageAlias::Transient
+        };
+        Some(MappedPages {
+            ptr: out as usize,
+            alias,
+        })
     }
 
     fn guest_ram_regions(
@@ -603,9 +600,11 @@ impl HostOps for QemuHost<'_> {
         if let Some(f) = self.ops.unmap_pages {
             // SAFETY: ptr/len came from a successful map_pages.
             unsafe { f(self.ops.ctx, ptr as *mut c_void, len) }
-        } else if !self.map_pages_stable() {
-            // Stable aliases explicitly require no release. A missing callback
-            // is a leak only for a transient view.
+        } else {
+            // A caller may hand a stable pointer here and it costs nothing, but
+            // this side cannot tell the two apart once the pointer is bare -- so
+            // a table without the callback is reported every time rather than
+            // for the half that would actually leak.
             QemuHostDecline::UnmapPagesCallbackMissing { ptr, len }.emit(ptr as u64);
         }
     }

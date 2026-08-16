@@ -411,6 +411,42 @@ impl crate::observe::Decline for GuestRamRegionsError {
 
 crate::observe::decline::decline_display!(GuestRamRegionsError);
 
+/// How long a pointer from [`HostOps::map_pages`] stays the guest memory it
+/// names.
+///
+/// The host builds a view one of two ways and it knows which as it returns:
+/// either the requested pages were already packed in host VA, in which case the
+/// answer *is* QEMU's RAMBlock mapping and outlives every device object, or the
+/// host assembled a fresh contiguous range over scattered pages, which lives
+/// only until [`HostOps::unmap_pages`].
+///
+/// This is per call and not per device because both shims can answer either way
+/// on the same boot: a GPA-contiguous run takes the RAMBlock arm and a scattered
+/// one does not. A device-wide flag has to answer for the worst case, which on
+/// the arm64 shim retired every draw-time guest-run bind to the CPU byte loader
+/// even though each of those runs is contiguous by construction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PageAlias {
+    /// Guest RAM itself: valid for the VM's lifetime, never recycled for
+    /// unrelated memory, and [`HostOps::unmap_pages`] on it is a no-op.
+    Stable,
+    /// A view the host built for this call. Valid only until
+    /// [`HostOps::unmap_pages`], so nothing that outlives the call may hold it.
+    ///
+    /// The default, so a record that carries one of these next to a pointer it
+    /// has not built yet reads as the answer that licenses nothing.
+    #[default]
+    Transient,
+}
+
+/// A host-VA view over guest pages, with the lifetime claim that goes with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MappedPages {
+    /// Base of `gpas.len() * page_size` contiguous host bytes.
+    pub ptr: usize,
+    pub alias: PageAlias,
+}
+
 /// Services the device cannot provide itself (time, wake, action enqueue,
 /// guest CPU / KVA access for the IOSurface mapper path).
 pub trait HostOps {
@@ -436,28 +472,37 @@ pub trait HostOps {
     /// `gpas[i]` is one guest page base. View length is `gpas.len() * page_size`.
     /// ParavirtualizedGraphics mapMemory model: the view aliases guest RAM so
     /// CPU/GPU access *is* guest memory. Default: unavailable.
-    fn map_pages(&mut self, _gpas: &[u64], _page_size: usize) -> Option<usize> {
+    /// The answer says which kind of pointer it is — see [`PageAlias`]. A
+    /// caller that hands the address to anything outliving the call wants
+    /// [`HostOps::stable_page_alias`] instead of reading that field itself.
+    fn map_pages(&mut self, _gpas: &[u64], _page_size: usize) -> Option<MappedPages> {
         None
     }
 
-    /// Release a view obtained from [`HostOps::map_pages`].
-    fn unmap_pages(&mut self, _ptr: usize, _len: usize) {}
-
-    /// True when [`HostOps::map_pages`] returns a **stable** alias of guest
-    /// RAM: the pointer stays valid for the device lifetime,
-    /// [`HostOps::unmap_pages`] is a no-op, and the address is never recycled
-    /// for unrelated memory.
+    /// [`HostOps::map_pages`] for a caller whose consumer outlives the call: the
+    /// pointer only when it is a [`PageAlias::Stable`] one, with a transient view
+    /// released before returning `None`.
     ///
-    /// This is a claim about a CPU-side *view* only, and says nothing about the
-    /// GPU rail: guest RAM reaches the GPU by importing the spans
-    /// [`HostOps::guest_ram_regions`] names, which are QEMU's own RAMBlock
-    /// mappings and never a view this call built.
-    ///
-    /// Default `false` — the conservative answer, so a host that has not
-    /// declared stability keeps the portable CPU writeback.
-    fn map_pages_stable(&self) -> bool {
-        false
+    /// Here rather than at each call site because the release is the half that
+    /// gets forgotten and nothing downstream can notice: a transient view read
+    /// after `unmap_pages` is a host pointer into deallocated VA, and the symptom
+    /// is wrong pixels or a fault a long way from the mistake.
+    fn stable_page_alias(&mut self, gpas: &[u64], page_size: usize) -> Option<usize> {
+        let mapped = self.map_pages(gpas, page_size)?;
+        match mapped.alias {
+            PageAlias::Stable => Some(mapped.ptr),
+            PageAlias::Transient => {
+                self.unmap_pages(mapped.ptr, gpas.len().saturating_mul(page_size));
+                None
+            }
+        }
     }
+
+    /// Release a view obtained from [`HostOps::map_pages`].
+    ///
+    /// A [`PageAlias::Stable`] pointer needs no release and every host must treat
+    /// one as a no-op, so a caller holding a mixed set may pass them all.
+    fn unmap_pages(&mut self, _ptr: usize, _len: usize) {}
 
     /// Where guest RAM lives in this process, as stable spans held for the VM's
     /// lifetime.
@@ -685,10 +730,11 @@ pub struct FakeHost {
     /// reconstruct scattered shared pages; this narrower fixture exercises the
     /// refusal and multi-run fallback arms.
     pub strict_linux_map: bool,
-    /// Test-controlled answer for [`HostOps::map_pages_stable`]. Keep separate
-    /// from `strict_linux_map`: packed shape and pointer lifetime are distinct
-    /// host contracts.
-    pub stable_map_pages: bool,
+    /// When true, every successful `map_pages` reports [`PageAlias::Transient`]
+    /// even where this fixture aliased guest RAM directly, modelling a host that
+    /// reconstructs every view. Keep separate from `strict_linux_map`: packed
+    /// shape and pointer lifetime are distinct host contracts.
+    pub transient_map_pages: bool,
     /// Number of HostOps page-import attempts (test proxy for import amplification).
     pub map_pages_calls: u64,
     /// Half-open GPA ranges this host reports as **not** guest RAM, so a test
@@ -1136,6 +1182,22 @@ impl FakeHost {
 
 #[cfg(test)]
 impl FakeHost {
+    /// Label a view this fixture just built, honouring
+    /// [`FakeHost::transient_map_pages`].
+    ///
+    /// The knob may only weaken the claim. A fixture that reported `Stable` for
+    /// a bounce copy would hand a caller a pointer it is entitled to keep past
+    /// `unmap_pages`, and the fixture would then be the thing lying rather than
+    /// the host under test.
+    fn mapped(&self, ptr: usize, alias: PageAlias) -> MappedPages {
+        let alias = if self.transient_map_pages {
+            PageAlias::Transient
+        } else {
+            alias
+        };
+        MappedPages { ptr, alias }
+    }
+
     /// Contiguous heap copy of a scattered page list, written back on unmap.
     ///
     /// The answer wherever an *aliasing* view cannot be built: a page list
@@ -1362,10 +1424,6 @@ impl HostOps for FakeHost {
             .ok_or(MemError::XregUnavailable)
     }
 
-    fn map_pages_stable(&self) -> bool {
-        self.stable_map_pages
-    }
-
     fn track_guest_writes(&mut self, gpas: &[u64], page_size: usize) -> Option<u64> {
         if self.guest_writes_unobservable
             || gpas.is_empty()
@@ -1428,7 +1486,12 @@ impl HostOps for FakeHost {
     }
 
     /// Contiguous host view; `page_size` is the guest page size from the device.
-    fn map_pages(&mut self, gpas: &[u64], page_size: usize) -> Option<usize> {
+    ///
+    /// An alias into a provisioned range is guest RAM itself and is reported
+    /// [`PageAlias::Stable`]; a `mach_vm_remap` view or a bounce copy is a view
+    /// this fixture built and is [`PageAlias::Transient`] -- the same split both
+    /// product shims make.
+    fn map_pages(&mut self, gpas: &[u64], page_size: usize) -> Option<MappedPages> {
         self.map_pages_calls = self.map_pages_calls.saturating_add(1);
         if gpas.is_empty() || page_size == 0 || !page_size.is_power_of_two() {
             return None;
@@ -1454,32 +1517,10 @@ impl HostOps for FakeHost {
             if base_off + need > r.len || !packed {
                 return None;
             }
-            return Some(r.ptr + base_off);
+            return Some(self.mapped(r.ptr + base_off, PageAlias::Stable));
         }
         #[cfg(target_os = "macos")]
         {
-            if self.stable_map_pages {
-                for &gpa in gpas {
-                    if self.range_containing(gpa).is_none() {
-                        let _ = self.provision_range(gpa, page_size)?;
-                    }
-                }
-                if let Some(i) = self.range_containing(gpas[0]) {
-                    let r = &self.ranges[i];
-                    let base_off = (gpas[0] - r.gpa) as usize;
-                    let need = gpas.len() * page_size;
-                    if base_off + need <= r.len {
-                        let ok = gpas
-                            .iter()
-                            .enumerate()
-                            .all(|(n, &gpa)| gpa == gpas[0] + (n * page_size) as u64);
-                        if ok {
-                            return Some(r.ptr + base_off);
-                        }
-                    }
-                }
-                return None;
-            }
             for &gpa in gpas {
                 if self.range_containing(gpa).is_none() {
                     let _ = self.provision_range(gpa, page_size)?;
@@ -1512,7 +1553,7 @@ impl HostOps for FakeHost {
                     .enumerate()
                     .all(|(n, &gpa)| gpa == gpas[0] + (n * page_size) as u64);
                 if packed && base_off + need <= r.len {
-                    return Some(r.ptr + base_off);
+                    return Some(self.mapped(r.ptr + base_off, PageAlias::Stable));
                 }
             }
             // Fragmented, or spanning ranges. Each page has to be placed on its
@@ -1536,7 +1577,8 @@ impl HostOps for FakeHost {
                     })
                 });
             if !remappable {
-                return self.bounce_view(gpas, page_size);
+                let ptr = self.bounce_view(gpas, page_size)?;
+                return Some(self.mapped(ptr, PageAlias::Transient));
             }
             let mut srcs = Vec::with_capacity(gpas.len());
             for &gpa in gpas {
@@ -1578,7 +1620,7 @@ impl HostOps for FakeHost {
                     }
                 }
                 self.views.push((view as usize, len));
-                Some(view as usize)
+                Some(self.mapped(view as usize, PageAlias::Transient))
             }
         }
         #[cfg(not(target_os = "macos"))]
@@ -1605,12 +1647,13 @@ impl HostOps for FakeHost {
                     if ok {
                         let ptr = r.ptr + base_off;
                         self.views.push((ptr, need));
-                        return Some(ptr);
+                        return Some(self.mapped(ptr, PageAlias::Stable));
                     }
                 }
             }
             // Scattered pages: bounce + write-back on unmap (test convenience).
-            self.bounce_view(gpas, page_size)
+            let ptr = self.bounce_view(gpas, page_size)?;
+            Some(self.mapped(ptr, PageAlias::Transient))
         }
     }
 
@@ -1929,10 +1972,14 @@ mod tests {
         let p = GUEST_PAGE_SIZE_ARM64E as u64;
         h.map_range(0x10 * p, GUEST_PAGE_SIZE_ARM64E, 0);
         h.map_range(0x99 * p, GUEST_PAGE_SIZE_ARM64E, 0);
-        let Some(view) = h.map_pages(&[0x10 * p, 0x99 * p], GUEST_PAGE_SIZE_ARM64E) else {
+        let Some(mapped) = h.map_pages(&[0x10 * p, 0x99 * p], GUEST_PAGE_SIZE_ARM64E) else {
             // FakeHost without contig remap: not the product QEMU path.
             return;
         };
+        // Two non-adjacent guest pages cannot be an alias of guest RAM, so the
+        // fixture must say it built this one.
+        assert_eq!(mapped.alias, PageAlias::Transient);
+        let view = mapped.ptr;
         // write_gpa → view
         h.put_u32(0x99 * p + 8, 0xdead_beef);
         let via_view = unsafe { *((view + GUEST_PAGE_SIZE_ARM64E + 8) as *const u32) };
@@ -1969,9 +2016,14 @@ mod tests {
         }
 
         let gpas: Vec<u64> = (0..3).map(|i| base + i * X86_PAGE as u64).collect();
-        let view = h
+        let mapped = h
             .map_pages(&gpas, X86_PAGE)
             .expect("a packed run inside one provisioned range must map");
+        // A packed run inside one range *is* that range's memory, which is the
+        // answer the draw rails need and the one the arm64 shim gives for a
+        // GPA-contiguous stretch.
+        assert_eq!(mapped.alias, PageAlias::Stable);
+        let view = mapped.ptr;
         for i in 0..3usize {
             let got = unsafe { *((view + i * X86_PAGE) as *const u32) };
             assert_eq!(

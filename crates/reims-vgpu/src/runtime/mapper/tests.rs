@@ -888,7 +888,11 @@ impl HostOps for FailingKvaHost {
         Err(self.err)
     }
 
-    fn map_pages(&mut self, gpas: &[u64], page_size: usize) -> Option<usize> {
+    fn map_pages(
+        &mut self,
+        gpas: &[u64],
+        page_size: usize,
+    ) -> Option<crate::runtime::host::MappedPages> {
         self.inner.map_pages(gpas, page_size)
     }
 

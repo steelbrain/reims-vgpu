@@ -2694,40 +2694,6 @@ pub(super) const SAMPLED_GATHER_MIN_BYTES: u64 = 64 * 1024;
 /// whose direction has evidence and whose magnitude does not.
 pub(super) const ZERO_COPY_BUFFER_MIN_BYTES: u64 = 16 * 1024;
 
-/// Does this host promise a guest-page alias that stays valid indefinitely?
-///
-/// Every guest-run producer below needs that promise, and needs it for a reason
-/// that survived the removal of the host-pointer import: the engine gathers from
-/// these pointers when the submission it armed them for reaches the GPU, which is
-/// after this call returns, so a pointer with a bounded lifetime would be read
-/// after its view was released.
-///
-/// A `false` is expected control flow — the caller falls through to the CPU
-/// byte loader and the guest gets correct pixels — so it is not a decline. But
-/// it is answered by the host once and then forever, and the whole rail
-/// disappearing is not something a reader should have to infer from an absence,
-/// so the first refusal of the process says so by name.
-///
-/// This is where the arm64 pathway diverges: its MMIO shim can return a
-/// `mach_vm_remap` view for a fragmented page list, and since that view is
-/// released on `unmap_pages` rather than retained until teardown, the shim
-/// answers 0. The x86 PCI shim can assemble scattered file-backed guest pages
-/// into one packed alias and retains every such address until teardown, so it
-/// answers 1.
-fn guest_run_alias_available<M: HostOps>(host: &M) -> bool {
-    if host.map_pages_stable() {
-        return true;
-    }
-    static NOTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if !NOTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        crate::observe::fail(String::from(
-            "guest_run_rail off reason=host_page_alias_not_stable \
-             (draw binds take the CPU byte loader)",
-        ));
-    }
-    false
-}
-
 /// Walk `span` bytes of `task_id`'s GVA space from `gva` and return the guest
 /// pages covering it alongside the packed guest-RAM runs over them
 /// (GPA-contiguous stretches coalesced and mapped to stable host pointers).
@@ -2745,9 +2711,6 @@ pub(super) fn task_gva_guest_run_window<M: HostMemory + HostOps>(
     gva: u64,
     span: u64,
 ) -> Result<(Vec<u64>, Vec<crate::backend::vulkan::engine::GuestRun>), WindowRefusal> {
-    if !guest_run_alias_available(host) {
-        return Err(WindowRefusal::NoAlias);
-    }
     let page = state.page_size();
     let gpas =
         gva_mem::task_gva_page_gpas(host, &state.tasks, task_id, gva, span, state.page_shift);
@@ -2755,8 +2718,7 @@ pub(super) fn task_gva_guest_run_window<M: HostMemory + HostOps>(
     if gpas.len() as u64 != wanted {
         return Err(WindowRefusal::SpanUnmapped);
     }
-    let runs = coalesce_pages_to_runs(host, &gpas, page, gva % page, span)
-        .ok_or(WindowRefusal::Untileable)?;
+    let runs = coalesce_pages_to_runs(host, &gpas, page, gva % page, span)?;
     Ok((gpas, runs))
 }
 
@@ -2778,10 +2740,17 @@ pub(super) fn task_gva_guest_run_window<M: HostMemory + HostOps>(
 /// so about.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum WindowRefusal {
-    /// The host will not promise a stable page alias, so no rail here can run.
+    /// A stretch resolved, but the view the host built for it is one the host
+    /// owes a release for, so the engine cannot hold it.
     ///
-    /// Latched once per process by [`guest_run_alias_available`], which names
-    /// it on the failure channel; the per-caller route is what gives it a rate.
+    /// This is a per-stretch answer and not a host verdict: the engine gathers
+    /// from these pointers when the submission reaches the GPU, which is after
+    /// this call returns, so only a view that outlives the release may go. Both
+    /// shims hand back guest RAM itself for a host-VA-packed request and build a
+    /// view otherwise, and a coalesced stretch is GPA-contiguous by
+    /// construction, so this is the rare answer rather than the standing one.
+    /// It was the standing one for as long as the question was asked of the
+    /// device instead of the call.
     NoAlias,
     /// Some page of the span does not resolve under the task's page table.
     ///
@@ -2928,31 +2897,63 @@ fn band_runs(runs: usize) -> &'static str {
 /// covering `span` bytes from `head_off` into the first page.
 ///
 /// The stretch arithmetic is `reims_vgpu_paging::runs::coalesce_window`; what
-/// this adds is the host side — one `map_pages` per stretch. `map_pages` hands
-/// back a direct RAMBlock alias, so the import is a lookup and `unmap` is a
-/// no-op.
+/// this adds is the host side — one aliasing request per stretch. A stretch is
+/// GPA-contiguous, which on both shims is the shape that resolves to QEMU's own
+/// RAMBlock mapping, so the answer is guest RAM itself and the pointer outlives
+/// every submission that gathers from it.
 ///
-/// `None` if any stretch fails to import, or if the window runs out before
-/// `span` — a partial gather would hand the GPU a short buffer, which is a
-/// wrong frame rather than a slow one.
+/// [`HostOps::stable_page_alias`] rather than `map_pages` because that is the
+/// whole requirement: the engine reads these pointers after this call returns,
+/// so a view the host owes a release for must be released here and refused
+/// rather than handed on.
+///
+/// Refuses if any stretch fails to import or comes back transient, or if the
+/// window runs out before `span` — a partial gather would hand the GPU a short
+/// buffer, which is a wrong frame rather than a slow one.
 fn coalesce_pages_to_runs<M: HostOps>(
     host: &mut M,
     window: &[u64],
     page: u64,
     head_off: u64,
     span: u64,
-) -> Option<Vec<crate::backend::vulkan::engine::GuestRun>> {
+) -> Result<Vec<crate::backend::vulkan::engine::GuestRun>, WindowRefusal> {
     use crate::backend::vulkan::engine;
-    let stretches = reims_vgpu_paging::runs::coalesce_window(window, page, head_off, span)?;
+    let stretches = reims_vgpu_paging::runs::coalesce_window(window, page, head_off, span)
+        .ok_or(WindowRefusal::Untileable)?;
     let mut runs: Vec<engine::GuestRun> = Vec::with_capacity(stretches.len());
     for s in stretches {
-        let base = host.map_pages(&window[s.pages], page as usize)? as u64;
+        let pages = &window[s.pages];
+        let Some(mapped) = host.map_pages(pages, page as usize) else {
+            return Err(WindowRefusal::Untileable);
+        };
+        if mapped.alias != crate::runtime::host::PageAlias::Stable {
+            host.unmap_pages(mapped.ptr, pages.len().saturating_mul(page as usize));
+            note_transient_guest_run_alias();
+            return Err(WindowRefusal::NoAlias);
+        }
         runs.push(engine::GuestRun {
-            host_ptr: (base + s.start_offset) as usize,
+            host_ptr: (mapped.ptr as u64 + s.start_offset) as usize,
             len: s.len,
         });
     }
-    Some(runs)
+    Ok(runs)
+}
+
+/// Name the first GPA-contiguous stretch of the process that came back as a
+/// view rather than as guest RAM.
+///
+/// Once, because the interesting thing is that it happened at all: a stretch is
+/// contiguous by construction, so a host that reconstructs one is a host whose
+/// packing rule this device has not understood, and every draw bind on it takes
+/// the CPU byte loader. The rate lives on the callers' route counters.
+fn note_transient_guest_run_alias() {
+    static NOTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !NOTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        crate::observe::fail(String::from(
+            "guest_run_rail off reason=stretch_alias_transient \
+             (a GPA-contiguous stretch was not guest RAM; draw binds take the CPU byte loader)",
+        ));
+    }
 }
 
 /// Ensure one linear resource has the packed host allocation shared by all of
@@ -3020,9 +3021,6 @@ pub(super) fn ensure_packed_resource<M: HostMemory + HostOps>(
         size: backing.size,
     };
     let made = (|| {
-        if !guest_run_alias_available(host) {
-            return None;
-        }
         let page = state.page_size();
         let page_base = backing.gva & !(page - 1);
         let head = backing.gva - page_base;
@@ -3043,7 +3041,12 @@ pub(super) fn ensure_packed_resource<M: HostMemory + HostOps>(
         if gpas.len() as u64 != map_len / page {
             return None;
         }
-        let host_base = host.map_pages(&gpas, page as usize)?;
+        // Stable specifically: both the `runs` entry below and, on the
+        // `zc_packed_alias_import` arm, the import itself outlive this call, and
+        // a Vulkan guest import is released after the last fence rather than at
+        // the drop. A view the host owes a release for is released here instead
+        // and the whole resolution refuses.
+        let host_base = host.stable_page_alias(&gpas, page as usize)?;
         // A packed view answers a **scatter**: Vulkan host-pointer memory takes
         // one contiguous host range, and a linear guest resource may name guest
         // pages that are not contiguous. When this window's pages *are* one run
@@ -3063,9 +3066,9 @@ pub(super) fn ensure_packed_resource<M: HostMemory + HostOps>(
         // `reference_for_pages` is the existing resolver for exactly this
         // question — it checks the run itself and refuses `Scattered` with a run
         // count — so the contiguous case is routed to it rather than re-deciding
-        // contiguity here. `map_pages` above stays: on a contiguous window it
-        // hands back a direct RAMBlock alias, which is a lookup, and `runs` needs
-        // that host pointer either way.
+        // contiguity here. The alias above stays: on a contiguous window it hands
+        // back a direct RAMBlock alias, which is a lookup, and `runs` needs that
+        // host pointer either way.
         let ramblock = crate::runtime::guest_ram_map::reference_for_pages(
             host,
             &gpas,
@@ -3370,9 +3373,6 @@ fn mapping_window_guest_runs<M: HostMemory + HostOps>(
     base_off: u64,
     span: u64,
 ) -> Option<(Vec<u64>, Vec<crate::backend::vulkan::engine::GuestRun>)> {
-    if !guest_run_alias_available(host) {
-        return None;
-    }
     let gpas = mapper::mapping_page_gpas(state, host, mid)?;
     let page = state.page_size();
     if (gpas.len() as u64).saturating_mul(page) < base_off.checked_add(span)? {
@@ -3382,7 +3382,7 @@ fn mapping_window_guest_runs<M: HostMemory + HostOps>(
     let head_off = base_off % page;
     let need_pages = (head_off + span).div_ceil(page) as usize;
     let window = gpas.get(first_page..first_page + need_pages)?;
-    let runs = coalesce_pages_to_runs(host, window, page, head_off, span)?;
+    let runs = coalesce_pages_to_runs(host, window, page, head_off, span).ok()?;
     Some((window.to_vec(), runs))
 }
 
@@ -9138,8 +9138,13 @@ fn type11_render_identity(
     render_chain_identity(state, req)
 }
 
-/// Stable shared allocation behind the type-11 primary attachment, if this
-/// host can retain the mapping view for the device lifetime.
+/// Stable shared allocation behind the type-11 primary attachment, when the
+/// mapping's own view is one the engine may retain.
+///
+/// That question belongs to `ensure_contig_import_with_footprint`, which asks it
+/// of the view this mapping holds rather than of the device — so there is no
+/// pre-gate here. There was, and because it was a device-wide flag it took this
+/// whole rail off the arm64 pathway for views that were guest RAM all along.
 ///
 /// The mapping revalidation inside `ensure_contig_view` is part of the answer:
 /// it retires an alias when the guest has recycled any of its pages, and that
@@ -9151,9 +9156,6 @@ fn type11_guest_target_backing<H: HostMemory + HostOps>(
     host: &mut H,
     req: &DrawEncodeRequest,
 ) -> Option<crate::backend::vulkan::engine::GuestTargetMemory> {
-    if !host.map_pages_stable() {
-        return None;
-    }
     let c0 = req.colors.first()?;
     type11_render_identity(state, req)?;
     let (plane_offset, row_pitch, span_end) = {
@@ -11142,7 +11144,6 @@ mod vulkan_split_tests {
         let mut host = FakeHost::new();
         // The rail refuses a host whose page views are transient before it ever
         // builds one — see `type11_zero_copy_declines_transient_host_mappings`.
-        host.stable_map_pages = true;
         let mid = 913u32;
         let first_pfn = 0x40u32;
         let pages = (span >> PAGE_SHIFT_X86) as u32;
@@ -11249,7 +11250,6 @@ mod vulkan_split_tests {
 
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
         let mut host = FakeHost::new();
-        host.stable_map_pages = true;
         // Not shared with any other test's: `first_sight` latches per
         // `(reason, discriminant)` for the life of the process.
         let mid = 913u32;
@@ -11352,7 +11352,6 @@ mod vulkan_split_tests {
 
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
         let mut host = FakeHost::new();
-        host.stable_map_pages = true;
         let mid = 911u32;
         let pfn = 0x21u32;
         let gpa = (pfn as u64) << PAGE_SHIFT_X86;

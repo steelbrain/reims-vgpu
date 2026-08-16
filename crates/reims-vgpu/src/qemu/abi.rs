@@ -92,7 +92,7 @@ use std::slice;
 /// [[host-window]]). The symbol is always present; when the staticlib was built
 /// without the `host-window` feature it returns `REIMS_VGPU_QEMU_ERR_STATE` so the C
 /// shim falls back to QEMU's own display.
-pub const REIMS_VGPU_QEMU_ABI_VERSION: u32 = 18;
+pub const REIMS_VGPU_QEMU_ABI_VERSION: u32 = 19;
 
 #[repr(C)]
 pub struct ReimsVgpuQemuCreateInfo {
@@ -127,6 +127,17 @@ pub const REIMS_VGPU_QEMU_EMPTY: c_int = 4;
 /// on exactly one pathway.
 pub const REIMS_VGPU_GUEST_RAM_ERR_ARGS: c_int = -1;
 pub const REIMS_VGPU_GUEST_RAM_ERR_NO_RAM: c_int = -2;
+
+/// What a successful `map_pages` says about the pointer it just returned; see
+/// [`crate::runtime::host::PageAlias`].
+///
+/// Non-negative so one return carries both the verdict and the failure codes,
+/// the same shape `guest_ram_regions` uses. `TRANSIENT` is 0 because that is
+/// what every previous ABI's success return meant, so a shim built against an
+/// older header and loaded anyway degrades to the conservative answer rather
+/// than to the one that licenses retaining a view past its release.
+pub const MAP_PAGES_TRANSIENT: c_int = 0;
+pub const MAP_PAGES_STABLE: c_int = 1;
 
 fn copy_host_ops(ops: *const ReimsVgpuHostOps) -> Option<ReimsVgpuHostOps> {
     if ops.is_null() {
@@ -962,6 +973,28 @@ mod tests {
                 "REIMS_VGPU_GUEST_RAM_ERR_NO_RAM",
                 REIMS_VGPU_GUEST_RAM_ERR_NO_RAM,
             ),
+        ] {
+            assert_eq!(
+                header_define_i32(name),
+                ours,
+                "{name} has drifted from the staticlib's value"
+            );
+        }
+    }
+
+    /// `map_pages` returns one of these on success and the two spellings have
+    /// no other comparison.
+    ///
+    /// A drift is the worst-behaved kind on this boundary because both values
+    /// are *valid* returns: the shim saying "I built you a view" and the
+    /// staticlib hearing "this is guest RAM, keep it" produces a retained host
+    /// pointer into VA the shim deallocates at `unmap_pages`. Nothing reports
+    /// it — the symptom is wrong pixels, or a fault a long way from the call.
+    #[test]
+    fn the_abi_header_agrees_on_the_map_pages_alias_codes() {
+        for (name, ours) in [
+            ("REIMS_VGPU_MAP_PAGES_TRANSIENT", MAP_PAGES_TRANSIENT),
+            ("REIMS_VGPU_MAP_PAGES_STABLE", MAP_PAGES_STABLE),
         ] {
             assert_eq!(
                 header_define_i32(name),
