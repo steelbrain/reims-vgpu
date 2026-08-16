@@ -8385,6 +8385,43 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             }
         }
 
+        // TEMPORARY PROBE — collects evidence for the black rounded-corner
+        // defect and is not product behaviour. One line per distinct composite
+        // recipe, so a boot emits a handful. Remove before claiming the fix.
+        {
+            let c = &pd.color0;
+            let rt0 = req.colors.iter().find(|c| c.slot == 0);
+            let load0 = rt0.map_or(u16::MAX, |c| c.load_action);
+            let key = (c.blending_enabled as u64)
+                | ((frag_color_input as u64) << 1)
+                | ((c.src_rgb as u64) << 2)
+                | ((c.dst_rgb as u64) << 8)
+                | ((c.op_rgb as u64) << 14)
+                | ((c.src_alpha as u64) << 18)
+                | ((c.dst_alpha as u64) << 24)
+                | ((c.op_alpha as u64) << 30)
+                | ((c.write_mask.bits() as u64) << 34)
+                | ((load0 as u64) << 40);
+            if crate::observe::first_sight("probe_blend_recipe", key) {
+                crate::observe::off(format!(
+                    "probe_blend_recipe blend={} fetch={} src_rgb={} dst_rgb={} op_rgb={} \
+                     src_a={} dst_a={} op_a={} mask={:#x} load0={load0} geom={}x{} fmt={:#x}",
+                    c.blending_enabled,
+                    frag_color_input,
+                    c.src_rgb,
+                    c.dst_rgb,
+                    c.op_rgb,
+                    c.src_alpha,
+                    c.dst_alpha,
+                    c.op_alpha,
+                    c.write_mask.bits(),
+                    rt0.map_or(0, |c| c.width),
+                    rt0.map_or(0, |c| c.height),
+                    rt0.map_or(0, |c| c.format),
+                ));
+            }
+        }
+
         // The engine ignores this when the draw is indexed (the index count
         // governs), but it still validates it, so it is passed either way.
         //
