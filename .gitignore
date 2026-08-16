@@ -24,6 +24,7 @@ OVMF_VARS*.fd
 __pycache__/
 *.qcow2
 *.spv
+!/crates/reims-vgpu/src/backend/vulkan/engine/shaders/*.spv
 *.spv.h
 *.swp
 /vm/*
