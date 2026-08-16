@@ -95,14 +95,23 @@ func capture() async throws -> CGWindowID {
         )
     }
 
+    let filter = SCContentFilter(desktopIndependentWindow: window)
+
+    // Size the capture in PIXELS, not points. `SCWindow.frame` is points, and a
+    // configuration sized from it captures a 1920x1080 guest as 960x540 on a 2x
+    // display — every second guest pixel is gone, so no capture can be compared
+    // against the guest's own declared framebuffer. The filter answers both
+    // terms itself: `contentRect` is the region in points and `pointPixelScale`
+    // is that display's pixels per point, so their product is exactly the pixel
+    // count ScreenCaptureKit can deliver without resampling.
+    let scale = CGFloat(filter.pointPixelScale)
     let configuration = SCStreamConfiguration()
-    configuration.width = max(1, Int(window.frame.width.rounded(.up)))
-    configuration.height = max(1, Int(window.frame.height.rounded(.up)))
+    configuration.width = max(1, Int((filter.contentRect.width * scale).rounded(.up)))
+    configuration.height = max(1, Int((filter.contentRect.height * scale).rounded(.up)))
     configuration.showsCursor = false
     configuration.ignoreShadowsSingleWindow = true
     configuration.captureResolution = .best
 
-    let filter = SCContentFilter(desktopIndependentWindow: window)
     let image = try await SCScreenshotManager.captureImage(
         contentFilter: filter,
         configuration: configuration
