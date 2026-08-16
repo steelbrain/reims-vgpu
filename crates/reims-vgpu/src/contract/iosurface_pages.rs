@@ -278,6 +278,111 @@ pub struct DevicePlaneRecord {
     pub bytes_per_element: u16,
 }
 
+/// One row-addressable region a guest descriptor declares, and the two
+/// questions this module asks of one.
+///
+/// [`DeviceSurfaceRecord`] and [`DevicePlaneRecord`] carry the same four fields
+/// for this purpose, and both questions were written against them twice, once
+/// per record, in **texels**. A texel count is expressed in the counting
+/// region's own element size, so comparing a region's `width` against a view's
+/// `width` compares two numbers that mean the same quantity only when the two
+/// formats agree -- and a texture view exists precisely because they do not.
+/// `bytes_per_row` is already a byte quantity and bytes are what both sides
+/// mean, so that is the unit the questions are asked in here.
+///
+/// Written once because the two copies did not agree and could not be diffed
+/// while they were spelled against different record types.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RowGeometry {
+    pub width: u32,
+    pub height: u32,
+    pub bytes_per_row: u32,
+    pub bytes_per_element: u16,
+}
+
+impl From<&DeviceSurfaceRecord> for RowGeometry {
+    fn from(s: &DeviceSurfaceRecord) -> Self {
+        Self {
+            width: s.width,
+            height: s.height,
+            bytes_per_row: s.bytes_per_row,
+            bytes_per_element: s.bytes_per_element,
+        }
+    }
+}
+
+impl From<&DevicePlaneRecord> for RowGeometry {
+    fn from(p: &DevicePlaneRecord) -> Self {
+        Self {
+            width: p.width,
+            height: p.height,
+            bytes_per_row: p.bytes_per_row,
+            bytes_per_element: p.bytes_per_element,
+        }
+    }
+}
+
+impl RowGeometry {
+    /// The bytes of declared content in one row, as distinct from the pitch,
+    /// which may carry padding this device must not hand back as pixels.
+    ///
+    /// `None` when the descriptor declared no width or no element size. That is
+    /// not a row of zero bytes: it is the case where the guest gave nothing to
+    /// convert its texel count with, and a caller has to say what it wants done
+    /// about that rather than be handed a zero that compares.
+    pub fn content_row_bytes(self) -> Option<u64> {
+        if self.width == 0 || self.bytes_per_element == 0 {
+            None
+        } else {
+            checked_mul_u64(self.width as u64, self.bytes_per_element as u64)
+        }
+    }
+
+    /// May a row of `row_bytes` be read out of this region?
+    ///
+    /// Two bounds, and they are different questions. The pitch is how far apart
+    /// rows start, so a read past it runs into the next row. The content is how
+    /// much of a row the guest declared, so a read inside the pitch but past the
+    /// content stays within the allocation and returns padding -- wrong pixels
+    /// rather than an unsafe read, which is why both are checked and neither
+    /// substitutes for the other.
+    pub fn admits_row(self, row_bytes: u64) -> bool {
+        if self.bytes_per_row == 0 || row_bytes > self.bytes_per_row as u64 {
+            return false;
+        }
+        match self.content_row_bytes() {
+            Some(content) => row_bytes <= content,
+            None => true,
+        }
+    }
+
+    /// Is this region *the* one a view of `row_bytes` by `height` names?
+    ///
+    /// Identification, not admission, and the distinction is load-bearing. The
+    /// multi-plane scan has no wire-carried plane index to key on, so it matches
+    /// on geometry and takes a plane only when exactly one matches. Equality
+    /// rather than containment is what keeps that discriminating: on a biplanar
+    /// surface a chroma-sized row is *admitted* by the luma plane's rows and is
+    /// not the luma plane, so a containment test would match both, find two, and
+    /// decline a bind that is not ambiguous at all.
+    ///
+    /// `texel_width` is consulted only when the descriptor declared no element
+    /// size. Its `width` is then a count in a unit this device was not told, and
+    /// texel equality is all the descriptor leaves in reach. It is kept because
+    /// narrowing it would drop binds that work today, and it is the term to
+    /// replace should a descriptor be seen carrying the element size this branch
+    /// is missing.
+    pub fn is_row_exactly(self, row_bytes: u64, texel_width: u32, height: u32) -> bool {
+        if self.height != height {
+            return false;
+        }
+        match self.content_row_bytes() {
+            Some(content) => content == row_bytes,
+            None => self.width == texel_width,
+        }
+    }
+}
+
 pub fn arm_kernel_va(address: u64) -> bool {
     (address & ARM_KERNEL_VA_MASK) == ARM_KERNEL_VA_BASE
 }
@@ -399,7 +504,7 @@ pub fn sample_window_from_device_plane(
     }
     let bpp = format_bytes_per_pixel(pixel_format)?;
     let tight = checked_mul_u64(width as u64, bpp as u64)?;
-    if plane.bytes_per_row == 0 || (plane.bytes_per_row as u64) < tight {
+    if !RowGeometry::from(plane).admits_row(tight) {
         return None;
     }
     let mut surface_off = plane.plane_offset as u64;
@@ -412,7 +517,9 @@ pub fn sample_window_from_device_plane(
     if plane.plane_size != 0 && (plane.plane_size as u64) < plane_bytes {
         return None;
     }
-    if (plane.width != 0 && plane.width < width) || (plane.height != 0 && plane.height < height) {
+    // Rows are counted in rows on both sides, so this half needs no conversion.
+    // Its width half moved into `admits_row`, which asks it in bytes.
+    if plane.height != 0 && plane.height < height {
         return None;
     }
     Some((surface_off, plane.bytes_per_row, span_end))
@@ -429,10 +536,11 @@ pub fn sample_window_from_device_surface(
     }
     let bpp = format_bytes_per_pixel(pixel_format)?;
     let tight = checked_mul_u64(width as u64, bpp as u64)?;
-    if surf.bytes_per_row == 0 || (surf.bytes_per_row as u64) < tight {
+    if !RowGeometry::from(surf).admits_row(tight) {
         return None;
     }
-    if (surf.width != 0 && surf.width < width) || (surf.height != 0 && surf.height < height) {
+    // As in the plane arm: rows compare directly, the width half is in bytes.
+    if surf.height != 0 && surf.height < height {
         return None;
     }
     let rows_span = checked_mul_u64(surf.bytes_per_row as u64, (height - 1) as u64)?;
@@ -461,9 +569,10 @@ pub fn sample_window_from_device_surface(
 ///   a v0a8 surface's Y plane 0 and alpha plane 2 are both R8 at the luma
 ///   geometry, so the scan below matches two and takes neither.
 /// - **A single-plane surface** uses the surface-level base and pitch.
-/// - **A multi-plane surface with no wire index** (type-11) matches width,
-///   height and bytes-per-element, and takes the plane only when *exactly one*
-///   matches.
+/// - **A multi-plane surface with no wire index** (type-11) matches on the
+///   plane's declared row *bytes* and its height, and takes the plane only when
+///   *exactly one* matches. See [`RowGeometry::is_row_exactly`] for why the key
+///   is bytes and why it is equality.
 pub fn sample_window_from_device_desc(
     desc: Option<&[u8]>,
     plane_index: Option<u32>,
@@ -492,6 +601,7 @@ pub fn sample_window_from_device_desc(
                         return Some(w);
                     }
                 } else if let Some(bpp) = format_bytes_per_pixel(pixel_format) {
+                    let tight = checked_mul_u64(width as u64, bpp as u64)?;
                     let mut matches = 0u32;
                     let mut plane = DevicePlaneRecord::default();
                     // The plane record's own cap, not a repeat of its value.
@@ -504,11 +614,7 @@ pub fn sample_window_from_device_desc(
                         .min(reims_vgpu_wire::device_desc::TYPE4_PLANE_CAP as u8)
                     {
                         if let Some((cand, _)) = device_desc_plane(desc, p as u32) {
-                            if cand.width == width
-                                && cand.height == height
-                                && (cand.bytes_per_element == 0
-                                    || cand.bytes_per_element as u32 == bpp)
-                            {
+                            if RowGeometry::from(&cand).is_row_exactly(tight, width, height) {
                                 matches += 1;
                                 plane = cand;
                             }
@@ -1281,6 +1387,109 @@ mod tests {
         assert!(
             sample_window_from_device_desc(Some(&desc), None, MTL_FORMAT_R8_UNORM, 4, 4).is_none()
         );
+    }
+
+    /// A row-byte-equivalent reinterpretation view is a view Metal admits, and
+    /// the geometry scan used to refuse it by comparing texel counts across two
+    /// different formats.
+    ///
+    /// The numbers are a live macos-13 arm64 refusal, verbatim from the boot
+    /// log: `type11_fail reason=window mapping=7 80x320 fmt=0x46 pages=10
+    /// wire_len=154944 desc=320x320 bpr=484 alloc=154944`. The surface is 320
+    /// single-byte elements to a row inside a 484-byte pitch, and the guest asks
+    /// for it as 80 `RGBA8Unorm` texels -- the *same 320 bytes*, reinterpreted.
+    /// Metal admits such a view because its own term is `bytesPerRow`, a byte
+    /// quantity; this device refused it because `320 != 80`, which compares a
+    /// count of one-byte elements against a count of four-byte ones.
+    ///
+    /// The cost was the whole `DispatchThreadgroups`: the refused bind was the
+    /// kernel's storage output, so the surface kept stale content and nothing
+    /// downstream repaired it.
+    #[test]
+    fn a_row_byte_equivalent_view_is_admitted_because_the_contract_counts_bytes() {
+        use crate::contract::endian::{st16, st32, st64};
+        use crate::contract::pixel_format::MTL_FORMAT_RGBA8_UNORM;
+
+        let mut desc = vec![0u8; DEVICE_DESC_LEN];
+        st32(&mut desc[DEVICE_DESC_BASE_OFFSET..], 64);
+        st32(&mut desc[DEVICE_DESC_ALLOC_SIZE..], 154_944);
+        st64(&mut desc[DEVICE_DESC_DIMS..], pack_plane_dims(320, 320));
+        st32(&mut desc[DEVICE_DESC_BPR..], 484);
+        st16(&mut desc[DEVICE_DESC_BPE..], 1);
+        desc[DEVICE_DESC_PLANE_COUNT] = 1;
+
+        // The single plane restates the surface. `plane_count = 1` is what puts
+        // this on the scan arm rather than the surface arm -- the surface arm
+        // would have admitted these numbers, which is why the refusal was
+        // reachable only through the scan.
+        let p0 = DEVICE_DESC_PLANES;
+        st32(&mut desc[p0 + DEVICE_PLANE_OFFSET..], 64);
+        st32(&mut desc[p0 + DEVICE_PLANE_SIZE..], 154_880);
+        st64(&mut desc[p0 + DEVICE_PLANE_DIMS..], pack_plane_dims(320, 320));
+        st32(&mut desc[p0 + DEVICE_PLANE_BPR..], 484);
+        st16(&mut desc[p0 + DEVICE_PLANE_BPE..], 1);
+
+        // 80 * 4 == 320 * 1, so the view names exactly this plane's rows.
+        assert_eq!(
+            sample_window_from_device_desc(Some(&desc), None, MTL_FORMAT_RGBA8_UNORM, 80, 320),
+            // base 64, pitch 484, and an exclusive end of 64 + 319*484 + 320.
+            Some((64, 484, 154_780)),
+            "the guest asked for the bytes this plane declares, in its own units"
+        );
+
+        // The bound the widening must not have touched: a view whose rows do not
+        // fit the declared content is still refused, and so is one whose rows fit
+        // the pitch but not the content -- 121 * 4 = 484 is exactly the pitch and
+        // is still 164 bytes past the 320 the guest declared as content.
+        for (w, why) in [
+            (121u32, "a row that fills the pitch still reads padding as pixels"),
+            (128, "a row past the pitch reads into the next row"),
+        ] {
+            assert_eq!(
+                sample_window_from_device_desc(Some(&desc), None, MTL_FORMAT_RGBA8_UNORM, w, 320),
+                None,
+                "{why}"
+            );
+        }
+    }
+
+    /// The scan identifies a plane; it does not merely admit one. Containment
+    /// would be the natural way to say "counted in bytes" and it is wrong, so
+    /// this pins the difference on the shape that exposes it.
+    ///
+    /// On a biplanar surface the chroma plane is half the luma plane in both
+    /// axes and shares its pitch, so a chroma-sized row *fits* the luma plane
+    /// perfectly well. A containment key matches both planes, counts two, and
+    /// declines a request that was never ambiguous.
+    #[test]
+    fn the_scan_key_is_equality_because_containment_matches_the_wrong_plane_too() {
+        // Luma: 16 R8 elements per row inside a 64-byte pitch, 8 rows.
+        let luma = RowGeometry {
+            width: 16,
+            height: 8,
+            bytes_per_row: 64,
+            bytes_per_element: 1,
+        };
+        // Chroma: 8 RG8 elements per row, same pitch, 4 rows. Same row bytes.
+        let chroma = RowGeometry {
+            width: 8,
+            height: 4,
+            bytes_per_row: 64,
+            bytes_per_element: 2,
+        };
+        assert_eq!(luma.content_row_bytes(), Some(16));
+        assert_eq!(chroma.content_row_bytes(), Some(16));
+
+        let chroma_row = 8u64 * 2;
+        assert!(
+            luma.admits_row(chroma_row),
+            "the luma plane really does have room for a chroma row -- that is the trap"
+        );
+        assert!(
+            !luma.is_row_exactly(chroma_row, 8, 4),
+            "but it is not that row: the heights say so and equality reads them"
+        );
+        assert!(chroma.is_row_exactly(chroma_row, 8, 4));
     }
 
     /// v0a8 (biplanar video + alpha) shape from the live apple.com hero: the
