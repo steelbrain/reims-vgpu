@@ -10,7 +10,7 @@
 //!
 //! This is the boundary QEMU's threads cross, so it is the only place the map
 //! is true for both shims at once. Nothing here enforces it — it is what the two
-//! shims do, and it is why [`crate::backend::vulkan::engine`]'s lock census
+//! shims do, and it is why [`reims_vgpu_vulkan::engine`]'s lock census
 //! separates `worker` from `device`.
 //!
 //! | Work | x86 / PCI | arm64 / MMIO |
@@ -59,6 +59,9 @@ use std::slice;
 
 /// Bump when breaking the C shim contract.
 ///
+/// v19 removes the guest dirty-page callbacks. Resource validity records are
+/// the serialized ownership contract; hypervisor page observations must not
+/// decide which resource content the guest receives.
 /// v15 adds `reims_vgpu_qemu_scanout_may_paint`, the console-ownership verdict
 /// for one presented mapping. v14 moved the three-way *kind* into Rust but went
 /// on exporting it as an input, and the shims did with it what shims do: the x86
@@ -71,17 +74,6 @@ use std::slice;
 /// branch is product policy and a thin shim does not hold one. Removing both
 /// symbols rather than leaving them is deliberate — a shim that can still
 /// assemble its own answer will eventually do so again.
-/// v13 adds `guest_written_pages` on [`ReimsVgpuHostOps`]: the per-page form of
-/// v12's generation. A whole-set generation is enough to decide whether to reuse
-/// a host-side copy, and not enough to decide what to write back — a deferred
-/// writeback that discards its frame because one page moved loses the Store, and
-/// one that writes the whole frame anyway loses the guest's own store.
-/// v12 adds the guest-write tracking triple on [`ReimsVgpuHostOps`]:
-/// `track_guest_writes`, `untrack_guest_writes`, `guest_write_gen`. A surface's
-/// pages are plain guest RAM and the guest CPU stores into them with no device
-/// operation, so no counter this crate keeps can witness such a store and every
-/// host-side copy of those pages is stale from that instant with nothing to say
-/// so. The hypervisor's dirty bitmap is the only witness; these are the door.
 /// v11 adds `reims_vgpu_qemu_window_run_main`, which lets the Darwin MMIO shim make the
 /// AppKit-owned winit loop QEMU's process-main UI entry.
 /// v9 adds the host-window lifecycle + early framebuffer: `reims_vgpu_qemu_window_stop`
@@ -92,7 +84,7 @@ use std::slice;
 /// [[host-window]]). The symbol is always present; when the staticlib was built
 /// without the `host-window` feature it returns `REIMS_VGPU_QEMU_ERR_STATE` so the C
 /// shim falls back to QEMU's own display.
-pub const REIMS_VGPU_QEMU_ABI_VERSION: u32 = 18;
+pub const REIMS_VGPU_QEMU_ABI_VERSION: u32 = 20;
 
 #[repr(C)]
 pub struct ReimsVgpuQemuCreateInfo {
@@ -494,8 +486,7 @@ pub unsafe extern "C" fn reims_vgpu_qemu_device_drain(handle: u64) -> c_int {
             // only property that distinguishes the drain thread from a vCPU
             // inside an MMIO store, and telling those apart is what makes a
             // stalled guest attributable — see `EngineLockSite`.
-            #[cfg(feature = "backend-vulkan")]
-            crate::backend::vulkan::engine::mark_drain_thread();
+            crate::runtime::executor::mark_drain_thread();
             if device_drain(handle) {
                 REIMS_VGPU_QEMU_OK
             } else {
@@ -1010,7 +1001,6 @@ mod tests {
         assert_eq!(std::mem::offset_of!(GuestRamRegion, len), 16);
     }
 
-
     /// Every code the header defines maps to its own variant. A code that fell
     /// through to `UnknownCode` would still log a number, but the reader would
     /// be told the shim is newer than the staticlib when in fact the mapping
@@ -1086,7 +1076,7 @@ mod tests {
     }
 
     #[test]
-    fn backend_name_metal_default() {
+    fn backend_name_is_vulkan() {
         let mut buf = [0i8; 32];
         assert_eq!(
             unsafe { reims_vgpu_qemu_backend_name(buf.as_mut_ptr(), buf.len()) },
@@ -1095,7 +1085,7 @@ mod tests {
         let s = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) }
             .to_str()
             .unwrap();
-        assert!(s == "metal" || s == "vulkan", "got {s}");
+        assert_eq!(s, "vulkan");
     }
 
     #[test]

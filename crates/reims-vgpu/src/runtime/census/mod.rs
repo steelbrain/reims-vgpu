@@ -55,26 +55,10 @@
 //! change is a guest that starts populating the tail, and that is now a typed
 //! decline raised at the record, not a counter nobody reads.
 //!
-//! `t11_decline` was the second: an eight-way reason enum over the type-11
-//! sampled rail's zero-copy declines. Across every recorded boot, 1 051 sampled
-//! declines named `below_floor` and nothing else — the other seven variants
-//! never fired once, including the three that sat *after* the floor test and so
-//! were never shadowed by it. That answer set `SAMPLED_GATHER_MIN_BYTES`, whose
-//! scope and basis are recorded on the constant. The threshold now governs only
-//! the copied gather fallback; a directly-backed resource has no size
-//! crossover. The rail returns `Option` like its type-2/3 sibling: falling back
-//! to the CPU byte loader is expected control flow that yields the same pixels,
-//! so it stays quiet.
-//!
-//! `deferred_windows` was the third: peak population and forced-eviction count
-//! for the three deferred-window caps (GVA 16, surface 16, storage 8), built to
-//! answer whether any of them had ever bound. Across every boot in a 72 MB
-//! accumulated log it emitted exactly two distinct lines, differing only in
-//! `storage_peak` (1 vs 2) — every peak far under its cap, every `evicted` zero.
-//! That answer is recorded on the three constants. The alarm it was standing in
-//! for survives at each enforcing site, where it belongs: the storage rail's
-//! evictions are `compute_mirror_evicted`. Those fire when a cap binds instead of
-//! restating a level once a second forever.
+//! `deferred_windows` was the third: a population census for deferred state.
+//! State whose loss costs guest work now follows guest resource/content
+//! lifetimes rather than a capacity, so there is no eviction policy for this
+//! census to justify.
 //!
 //! The test to apply: name the reading the next window could produce that the
 //! last thousand did not. If there isn't one, the census has become a probe.

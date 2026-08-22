@@ -11,7 +11,7 @@
 //!
 //! [`crate::runtime::writeback_debt`] is the rail this doc spent four sections
 //! designing and one section burying, built in the one shape the four guest
-//! panics do not rule out: type-11 mappings are resolved at payment, while a
+//! panics do not rule out: IOSurface texture mappings are resolved at payment, while a
 //! live GVA resource retains the physical-page identity of its transfer
 //! backing without retaining raw host pointers. Read that
 //! module's doc first if you are here about deferral; what follows is the
@@ -19,7 +19,7 @@
 //! in the ways below.
 //!
 //! Twelve driven macos-13 sustained-animation boots, six an arm: **90 % of
-//! type-11 Stores are superseded before anything reads their pages**, `store_us`
+//! IOSurface texture Stores are superseded before anything reads their pages**, `store_us`
 //! falls 0.89 against 9.56 us a chain, `draw_us` 14.62 against 26.52, and five
 //! of six on-arm boots present at 105.8-109.2 Hz against a 77.2-78.6 Hz
 //! baseline. GVA targets use the same ownership rule now; their debt is keyed by
@@ -30,7 +30,7 @@
 //! * **"Six reads a second" is the wrong denominator, the same way
 //!   `target_reads` was.** Every `settle_*` counter quoted below counts settles
 //!   that *waited*; the settle *calls* are three orders larger.
-//!   `draw::vulkan::load_linear_guest_memoized` alone reaches its settle ~1 700
+//!   `draw::execution::load_linear_guest_memoized` alone reaches its settle ~1 700
 //!   times a second and reads the guest pages every one of them. The prize was
 //!   never 1 556-to-6.
 //! * **Those readers are nameable, so the deferral does not need the seam this
@@ -92,9 +92,9 @@
 //! built and already maintained from both ends. `finish` stamps the resident
 //! with the mapping's `surface_content_epoch` after every Store, and
 //! `registry_mark_ready` clears that stamp on every draw that renders into the
-//! resident, so `resident_content_epoch(identity) == m.surface_content_epoch` at
+//! resident, so `resident_read_plan(identity).content_epoch == m.content.surface_epoch` at
 //! the top of a Store means nothing has changed the pixels since the last one.
-//! It is the same comparison the type-11 attachment LOAD already elides its CPU
+//! It is the same comparison the IOSurface texture attachment LOAD already elides its CPU
 //! seed on, read from the writing side.
 //!
 //! **It is zero, and not nearly zero.** A census partitioning every
@@ -131,7 +131,7 @@
 //! The obvious reading of that ablation — that the copies are expensive because
 //! they sit in the graphics queue ahead of the draws — was tested by building
 //! the alternative and measuring it. It is wrong, and
-//! `backend::vulkan::engine::context`'s `dedicated_transfer_family` carries the
+//! `reims_vgpu_vulkan::engine::context`'s `dedicated_transfer_family` carries the
 //! four boots that say so: putting the bus-crossing half of this copy on a host
 //! that has an idle copy engine moves the block between three different counters
 //! and leaves the frame rate where it was. A narrower ablation isolates why —
@@ -162,7 +162,7 @@
 //! chooses.
 //!
 //! Which is what makes the two ablations in
-//! `backend::vulkan::engine::context`'s `dedicated_transfer_family` read the way
+//! `reims_vgpu_vulkan::engine::context`'s `dedicated_transfer_family` read the way
 //! they do: removing the copies entirely was worth ~30 Hz, and skipping only the
 //! image *read* while the bytes still crossed was worth 4 Hz of it. The 26 Hz is
 //! in the scatter, and the scatter is where the regions are.
@@ -211,7 +211,7 @@
 //! The lever it points at carries none of the deferral's hazards: **issue the
 //! scatter as one compute dispatch over a run table instead of ~200 transfer
 //! regions.** Same bytes, same destination, byte-identical result, nothing held
-//! across any window. That is what `backend::vulkan::engine::guest_scatter` now
+//! across any window. That is what `reims_vgpu_vulkan::engine::guest_scatter` now
 //! does — a private module, so this names it rather than links it — and the
 //! paragraphs below are its measurement rather than the expected value they used
 //! to be.
@@ -246,7 +246,7 @@
 //! kind of model and this one landed within 3 %.
 //!
 //! It was bracketed above as well as below. The ablation in
-//! `backend::vulkan::engine::context` that removed this rail's GPU work
+//! `reims_vgpu_vulkan::engine::context` that removed this rail's GPU work
 //! *entirely* — regions, detile and bytes — reached 104 Hz, so a model putting
 //! the region-free point above that would have been refuted on its face. The
 //! 74.9 to 104 Hz that remains is the detile and the traffic the compute path
@@ -255,7 +255,7 @@
 //! ## The two gates a compute scatter needs, both already open
 //!
 //! * The imported guest buffer must be bindable as a storage buffer. It already
-//!   is: `caps::host_pointer::GUEST_IMPORT_USAGE` includes `STORAGE_BUFFER`, and
+//!   is: `reims-vgpu-vulkan::host_pointer::GUEST_IMPORT_USAGE` includes `STORAGE_BUFFER`, and
 //!   that is the exact usage set the capability query asks the driver about — so
 //!   a host that admits the import admits this.
 //! * The offsets must be addressable in 4-byte units. Run offsets and lengths are
@@ -274,7 +274,7 @@
 //! pass's stated render-target extent is the attachment restated (99.97 % `full`,
 //! see `exec::report::note_pass_extent_coverage`) and the union of a pass's
 //! scissors covers the attachment 99.92 % of the time
-//! (`draw::vulkan::note_pass_scissor_union`).
+//! (`draw::execution::note_pass_scissor_union`).
 //!
 //! The reason there is no region is that the reference host does not copy here.
 //! It builds the render target's own GPU resource directly over the guest's
@@ -315,7 +315,7 @@
 //! own and the split is not yet apportioned.
 //!
 //! The lever is therefore not a damage rect and not a different queue — see
-//! `backend::vulkan::engine::context`'s `dedicated_transfer_family` for the rail
+//! `reims_vgpu_vulkan::engine::context`'s `dedicated_transfer_family` for the rail
 //! that was built to test the queue and measured nothing. It is landing this copy
 //! when something actually reads the bytes, which is what the contract does and
 //! what the deferred window above tried to do with the wrong land point.
@@ -337,7 +337,7 @@
 //!
 //!   Read that against [`SettleSite::ScanoutPaint`] and not against the slug it
 //!   used to share. `scanout::paint_mapping` has two callers — the console, and
-//!   `read_mapping_bgra8`, which is a draw materialising a sampled type-11
+//!   `read_mapping_bgra8`, which is a draw materialising a sampled IOSurface texture
 //!   texture — and until the sampled arm got [`SettleSite::SampledMappingRead`]
 //!   they charged one route. A macos-11 Safari-torture leg read 985 waits and
 //!   1.42 s on it, which is three orders of magnitude off the console's rate and
@@ -376,7 +376,7 @@
 //! day, and the off arm of the same binary clean. This is the **page recycling**
 //! hazard, which the list below names third and treats as one of four: the guest
 //! reassigns a surface's backing inside the park-to-land window — its own
-//! `MappingEntry::page_entries` doc measures id recycling at ~20 ms under scroll,
+//! Mapping page-plan documentation measures id recycling at ~20 ms under scroll,
 //! and that window is ~55 ms — and the landed copy writes a full surface into
 //! whatever now owns those pages. Here that was the guest's page tables.
 //! `gpuwb_pages_not_ours` fires on the same boot, which is this device saying so
@@ -408,7 +408,7 @@
 //! moment would have written anyway.
 //!
 //! What that costs is the thing the seam analysis below already identifies as
-//! hard, and it is now the *only* hard part: the land needs `DeviceState` and
+//! hard, and it is now the *only* hard part: the land needs `Device` and
 //! `HostMemory`, and [`settle_guest_writes`] takes a [`SettleSite`] and nothing
 //! else. Threading both through its call sites is the work. It is untested — no
 //! boot has run it — and it is recorded here because it is the one variant the
@@ -434,11 +434,11 @@
 //!
 //! **The seam is the plan, not the call graph.** The obvious shape — land from
 //! [`settle_guest_writes`] — does not fit: that function takes a [`SettleSite`]
-//! and nothing else, no `DeviceState` and no `HostMemory`, and threading both
+//! and nothing else, no `Device` and no `HostMemory`, and threading both
 //! through its sixteen call sites would be the bulk of the work. It does not have
-//! to. Split [`crate::backend::vulkan::engine::copy_target_to_guest_pages`] at
+//! to. Split [`reims_vgpu_vulkan::engine::copy_target_to_guest_pages`] at
 //! the point where it stops needing the guest's page tables: everything up to and
-//! including `references_for_runs` is `DeviceState`/`HostMemory` work and stays at
+//! including `references_for_runs` is `Device`/`HostMemory` work and stays at
 //! the Store, and what is left — acquire a scratch, plan the regions, record,
 //! submit — needs only the engine, which is a process-global behind its own lock.
 //!
@@ -492,13 +492,6 @@
 //! and never calls the settle, so a plan that is still parked is simply not
 //! something it claims anything about.
 //!
-//! One caveat for whoever reads the witness this rail feeds:
-//! `MappingEntry::render_flush`'s doc quotes `render_flush_age_sub_ms` /
-//! `_sub_frame` / `_frame_plus` figures, and **those counters exist nowhere in
-//! the tree but that comment** — they were retired without it. Its conclusion may
-//! still be right; it is simply no longer reproducible from a boot, so do not
-//! read those three numbers as something a fresh log can confirm.
-//!
 //! What the rail did buy is real and is kept: the Store does not read the frame
 //! back off the GPU. [`crate::runtime::mapping_write::write_bgra8_from_resident_gpu`]
 //! makes the guest's own pages the destination of the copy the GPU was going to
@@ -531,11 +524,10 @@
 //! ordered before the guest can observe it by the completion stamp: the stamp
 //! word is written behind an `ALL_COMMANDS -> TRANSFER` barrier and every
 //! submitted guest-page write settles before the stamp moves. See
-//! `backend::vulkan::engine::write_completion_stamp`.
+//! `reims_vgpu_vulkan::engine::write_completion_stamp`.
 
-use crate::model::DeviceState;
-#[cfg(feature = "backend-vulkan")]
 use crate::runtime::host::{HostMemory, HostOps};
+use crate::runtime::Device;
 
 /// Declare the settle sites once, and derive both census route names from one
 /// slug each: `concat!` builds `<slug>_us` from `<slug>`, so the count route
@@ -619,9 +611,8 @@ macro_rules! settle_sites {
 
 settle_sites! {
     /// `draw::texture_view::load_linear_texture_impl` — CPU read of a linear
-    /// texture's guest pages, reached from the Metal-only `load_sampled_rgba`
-    /// ladder. The two arms that reach it on the Vulkan pathway name themselves
-    /// below.
+    /// texture's guest pages. The two callers on the Vulkan pathway name
+    /// themselves below.
     LinearTextureLoad => "settle_linear_texture_load",
     /// The same leaf, reached from `draw::seed_color_load` — the colour LOAD
     /// seed reading the attachment's own guest pages to seed a
@@ -637,7 +628,7 @@ settle_sites! {
     /// [`crate::runtime::gva_store_witness`] answers — and not narrowing, which
     /// an overlap rate of 99.8 % cannot be improved by.
     LinearTextureSeed => "settle_linear_texture_seed",
-    /// The same leaf, reached from `draw::vulkan::resolve_sampled_source`'s
+    /// The same leaf, reached from `draw::execution::resolve_sampled_source`'s
     /// last-resort arm, after every rung above it declined.
     ///
     /// Reads **zero** on a driven drag, and that is a real answer rather than a
@@ -646,7 +637,7 @@ settle_sites! {
     /// far, so nothing reaches the last resort. A non-zero reading here means a
     /// rung above stopped serving.
     LinearTextureSampled => "settle_linear_texture_sampled",
-    /// `draw::vulkan::load_linear_guest_memoized` — the memoized full-span CPU
+    /// `draw::execution::load_linear_guest_memoized` — the memoized full-span CPU
     /// re-read behind every linear sampled bind the gather rail declines.
     LinearMemoRead => "settle_linear_memo_read",
     /// `draw::read_buffer_bytes_resolved` — the one CPU read of a buffer's
@@ -662,12 +653,12 @@ settle_sites! {
     /// times in a whole boot", and that is true of the console. It was not true
     /// of this *slug*, because `paint_mapping` has two callers and both charged
     /// it: the console's `scanout_copy_mapping`, and `read_mapping_bgra8`, which
-    /// is sampled type-11 bind materialisation on a draw. A macos-11
+    /// is sampled IOSurface texture bind materialisation on a draw. A macos-11
     /// Safari-torture leg read 985 waits and 1.42 s here, which is the second
     /// caller, and the doc's six-a-boot reading was being applied to a number
     /// three orders of magnitude off it. The sampled arm names itself below.
     ScanoutPaint => "settle_scanout_paint",
-    /// `scanout::read_mapping_bgra8` — a draw materialising a sampled type-11
+    /// `scanout::read_mapping_bgra8` — a draw materialising a sampled IOSurface texture
     /// texture out of a mapping's guest pages.
     ///
     /// Shares `paint_mapping`'s leaf with the console above and nothing else:
@@ -681,7 +672,7 @@ settle_sites! {
     CompletionStamp => "settle_completion_stamp",
     /// `drain::drain_main_fifo` — the root packet's completion stamp.
     RootStamp => "settle_root_stamp",
-    /// `mapping_write::write_bgra8_inner` — the copying type-11 Store.
+    /// `mapping_write::write_bgra8_inner` — the copying IOSurface texture Store.
     MappingBgra8Write => "settle_mapping_bgra8_write",
     /// `mapping_write::write_rgba8_image_changed`.
     MappingRgba8Write => "settle_mapping_rgba8_write",
@@ -697,6 +688,23 @@ settle_sites! {
     MappingBytesWrite => "settle_mapping_bytes_write",
     /// `mapper::read_mapping_bytes`.
     MappingBytesRead => "settle_mapping_bytes_read",
+    /// `gva_view::read_span` — the contiguous host read of a task-GVA span,
+    /// reached by the compute rail staging a linear texture whose rows are
+    /// tightly packed.
+    GvaSpanRead => "settle_gva_span_read",
+    /// `gva_view::read_rect` — the strided host read of a task-GVA rectangle,
+    /// reached by `blit_exec::read_texture_rect`'s linear arm.
+    ///
+    /// This site is why the two above it exist as a pair. The GVA rail is the
+    /// one host reader of guest pages that had no settle at all, and the arm
+    /// that reaches it is selected by the *target-import* rail: a source the
+    /// device rendered into directly owes no writeback debt, so the whole-plane
+    /// GPU copy refuses with `sl_gpu_src_not_resident` and the copy falls here
+    /// — to a bare `memcpy` racing the render that produced the very pixels it
+    /// is copying. With target import off the same copy finds a resident, runs
+    /// GPU-side, and is ordered by the render pass; that is why the defect was
+    /// visible on exactly one arm and why it came and went between boots.
+    GvaRectRead => "settle_gva_rect_read",
 }
 
 /// Block until every guest-page write this device has submitted has executed.
@@ -715,8 +723,7 @@ settle_sites! {
 /// returns without touching a queue when it is clear. `site` is what a boot
 /// reads to find which caller pays for the waits that are not free; see
 /// [`SettleSite`].
-pub fn settle_guest_writes(site: SettleSite) {
-    #[cfg(feature = "backend-vulkan")]
+pub fn settle_guest_writes(executor: &dyn crate::runtime::executor::Executor, site: SettleSite) {
     {
         // The flag read is one relaxed-acquire load and clear is the common
         // answer, so the census below runs only on the calls that cost
@@ -724,19 +731,17 @@ pub fn settle_guest_writes(site: SettleSite) {
         // this load and the wait, which makes the site's count a lower bound by
         // at most one per race — the engine re-reads the flag under its own
         // lock and the ordering is unaffected.
-        if !crate::backend::vulkan::engine::guest_writes_outstanding() {
+        if !executor.guest_writes_outstanding() {
             return;
         }
         let started = std::time::Instant::now();
-        crate::backend::vulkan::engine::quiesce_guest_writes();
+        executor.quiesce_guest_writes();
         crate::runtime::drain::note_store_route(site.route());
         crate::runtime::drain::note_store_route_us(
             site.route_us(),
             started.elapsed().as_micros() as u64,
         );
     }
-    #[cfg(not(feature = "backend-vulkan"))]
-    let _ = site;
 }
 
 /// [`settle_guest_writes`], skipped when the outstanding writeback lands nowhere
@@ -760,17 +765,17 @@ pub fn settle_guest_writes(site: SettleSite) {
 /// ruled out — a caller whose walk failed, or a second outstanding writeback
 /// (`gwdebt_unnamed`).
 pub fn settle_guest_writes_unless_disjoint(
+    executor: &dyn crate::runtime::executor::Executor,
     site: SettleSite,
     pages: impl FnOnce() -> Option<Vec<u64>>,
 ) {
-    #[cfg(feature = "backend-vulkan")]
     {
-        if !crate::backend::vulkan::engine::guest_writes_outstanding() {
+        if !executor.guest_writes_outstanding() {
             return;
         }
-        use crate::backend::vulkan::engine::GuestWriteReach as Reach;
+        use reims_vgpu_core::GuestWriteReach as Reach;
         let reach = match pages() {
-            Some(p) => crate::backend::vulkan::engine::guest_writes_reaching(&p),
+            Some(p) => executor.guest_writes_reaching(&p),
             // The caller could not name its own window, which is the same
             // undecidable as the ledger failing to name the writeback's.
             None => Reach::Unnamed,
@@ -783,11 +788,7 @@ pub fn settle_guest_writes_unless_disjoint(
         if reach == Reach::Disjoint {
             return;
         }
-        settle_guest_writes(site);
-    }
-    #[cfg(not(feature = "backend-vulkan"))]
-    {
-        let _ = (site, pages);
+        settle_guest_writes(executor, site);
     }
 }
 
@@ -801,30 +802,32 @@ pub fn settle_guest_writes_unless_disjoint(
 ///
 /// Task teardown means the GPU VA maps are gone, so nothing here writes guest
 /// pages — the deleted object's bytes are not guest work any more.
-pub fn retire_linear_residents(state: &mut DeviceState) {
-    if state.retired_linear_residents.is_empty() {
+pub fn retire_linear_residents(state: &mut Device) {
+    if !state.host_materializations.has_linear_residents() {
         return;
     }
-    let retired = std::mem::take(&mut state.retired_linear_residents);
-    // The engine that holds these pins is the Vulkan one; a `backend-metal`
+    let retired = state.host_materializations.take_linear_residents();
     // build arms nothing that could have pinned them, so taking the list is the
     // whole of the work there.
-    #[cfg(feature = "backend-vulkan")]
     for key in &retired {
-        crate::backend::vulkan::engine::unpin_resident_storage(key);
-        crate::backend::vulkan::engine::retire_resident_storage_content(key);
+        state.executor.unpin_resident_storage(key);
+        state.executor.retire_resident_storage_content(key);
+        let crate::model::ComputeStorageOrigin::Linear { resource, gva, .. } = key.origin else {
+            crate::observe::fail(format!(
+                "linear_resident_retired reason=non_linear_identity identity={key:?}"
+            ));
+            continue;
+        };
         crate::observe::off(format!(
-            "linear_resident_retired task={} ref={} gva={:#x} {}x{} fmt={:#x}",
-            key.map_generation,
-            key.texture_ref,
-            key.surface_offset,
+            "linear_resident_retired resource={} resource_generation={} gva={:#x} {}x{} fmt={:#x}",
+            resource.index(),
+            resource.generation(),
+            gva,
             key.width,
             key.height,
             key.pixel_format
         ));
     }
-    #[cfg(not(feature = "backend-vulkan"))]
-    drop(retired);
 }
 
 /// Copy `identity`'s pixels into `mapping_id`'s guest pages.
@@ -832,12 +835,11 @@ pub fn retire_linear_residents(state: &mut DeviceState) {
 /// `true` when the guest's pages hold the frame. `false` is a real loss and is
 /// reported on the failure channel by the arm that refused — the caller has no
 /// second copy to fall back to, because this rail never made one.
-#[cfg(feature = "backend-vulkan")]
 pub fn store_render_frame<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut M,
     mapping_id: u32,
-    identity: &crate::backend::vulkan::engine::TargetIdentity,
+    identity: &crate::model::TargetIdentity,
     width: u32,
     height: u32,
 ) -> bool {
@@ -851,7 +853,7 @@ pub fn store_render_frame<M: HostMemory + HostOps>(
     ) {
         Ok(bytes) => {
             crate::runtime::drain::note_store_route("render_flush_gpu_direct");
-            finish(state, mapping_id, identity, bytes as usize, started, false);
+            finish(state, mapping_id, identity, bytes as usize, started);
             return true;
         }
         Err(decline) => {
@@ -898,7 +900,7 @@ pub fn store_render_frame<M: HostMemory + HostOps>(
     // to lend. Reading the `Err` as fatal cost 34 frames a boot on exactly the
     // host class that has no second rail, and no boot of a capable host could
     // have shown it.
-    let leased = match crate::backend::vulkan::engine::read_target_leased(identity) {
+    let leased = match state.executor.read_target_leased(identity) {
         Ok(leased) => leased,
         Err(decline) => {
             // The typed fields, not `Display`. `TargetReadDecline::UnknownIdentity`
@@ -915,7 +917,7 @@ pub fn store_render_frame<M: HostMemory + HostOps>(
         }
     };
     let (ok, frame_len) = match leased {
-        Some(leased) if leased.bgra => {
+        Some(leased) if leased.is_bgra() => {
             crate::runtime::drain::note_store_route("render_flush_leased");
             let len = leased.bytes().len();
             let ok = crate::runtime::mapping_write::write_bgra8_uncached(
@@ -941,7 +943,7 @@ pub fn store_render_frame<M: HostMemory + HostOps>(
         leased => {
             drop(leased);
             crate::runtime::drain::note_store_route("render_flush_copied");
-            match crate::backend::vulkan::engine::read_target(identity) {
+            match state.executor.read_target(identity) {
                 Ok(rb) => {
                     // Shared rather than owned outright: the write's tail
                     // publishes this frame to the surface cache, and a cache
@@ -978,40 +980,8 @@ pub fn store_render_frame<M: HostMemory + HostOps>(
         ));
         return false;
     }
-    finish(state, mapping_id, identity, frame_len, started, false);
+    finish(state, mapping_id, identity, frame_len, started);
     true
-}
-
-/// Publish a Store for a resident whose attachment memory is the guest mapping.
-#[cfg(feature = "backend-vulkan")]
-pub fn store_guest_backed_frame(
-    state: &mut DeviceState,
-    mapping_id: u32,
-    identity: &crate::backend::vulkan::engine::TargetIdentity,
-    width: u32,
-    height: u32,
-    guest_store_recorded: bool,
-    guest_store_footprint: Option<crate::runtime::guest_ram::GuestPageFootprint>,
-) -> Result<(), crate::runtime::mapping_write::GpuWritebackDecline> {
-    let started = std::time::Instant::now();
-    crate::runtime::drain::note_store_route("surface_flush");
-    let bytes = crate::runtime::mapping_write::synchronize_guest_backed_resident(
-        state,
-        mapping_id,
-        identity,
-        width,
-        height,
-        guest_store_recorded,
-        guest_store_footprint,
-    )?;
-    crate::runtime::drain::note_store_route("render_flush_gpu_direct");
-    finish(state, mapping_id, identity, bytes as usize, started, true);
-    Ok(())
-}
-
-#[cfg(feature = "backend-vulkan")]
-fn finish_needs_registry_handoff(guest_backed: bool) -> bool {
-    !guest_backed
 }
 
 /// Hand the currency witness back to the image the frame came out of, and score
@@ -1023,33 +993,28 @@ fn finish_needs_registry_handoff(guest_backed: bool) -> bool {
 /// statement ago. Leaving the stamp behind invalidates a resident that holds
 /// exactly the mapping's content, which costs the next Load its elision and
 /// sends it to a CPU seed for bytes it already has.
-#[cfg(feature = "backend-vulkan")]
 fn finish(
-    state: &mut DeviceState,
+    state: &mut Device,
     mapping_id: u32,
-    identity: &crate::backend::vulkan::engine::TargetIdentity,
+    identity: &crate::model::TargetIdentity,
     frame_len: usize,
     started: std::time::Instant,
-    guest_backed: bool,
 ) {
     // A copied resident needs two pieces of registry state handed back: the
-    // mapping epoch says its mirror is current, and clearing sole-copy permits
-    // reclaim now that the guest pages hold the pixels. An imported resident is
-    // the guest allocation itself. It has no mirror epoch to stamp, and draw
-    // completion already leaves it non-sole-copy, so neither registry mutation
-    // applies.
-    if finish_needs_registry_handoff(guest_backed) {
-        if let Some(epoch) = state
-            .mappings
-            .get(&mapping_id)
-            .map(|m| m.surface_content_epoch)
-        {
-            crate::backend::vulkan::engine::stamp_resident_content_epoch(identity, epoch);
-        }
-        crate::backend::vulkan::engine::note_resident_content_copied_out(identity);
-    } else {
-        crate::runtime::drain::note_store_route("shared_store_registry_handoff_elided");
+    // mapping epoch says its representation is current, and clearing sole-copy
+    // permits reclaim now that the guest pages hold the pixels. Imported
+    // residents are normally completed by the direct Store route; stamping is
+    // still valid here because currency describes content equality, not the
+    // allocation topology.
+    if let Some(epoch) = state
+        .surfaces
+        .mappings
+        .get(&mapping_id)
+        .map(|m| m.content.surface_epoch)
+    {
+        state.executor.stamp_resident_content_epoch(identity, epoch);
     }
+    state.executor.note_resident_content_copied_out(identity);
     crate::runtime::drain::note_drain_phase(
         crate::runtime::drain::DrainPhase::Flush(crate::runtime::drain::FlushRail::Render),
         started,
@@ -1058,20 +1023,6 @@ fn finish(
         "render_store mapping={mapping_id} bytes={frame_len} us={}",
         started.elapsed().as_micros()
     ));
-}
-
-#[cfg(all(test, feature = "backend-vulkan"))]
-mod guest_backed_finish_tests {
-    use super::finish_needs_registry_handoff;
-
-    #[test]
-    fn shared_storage_has_no_mirror_or_sole_copy_handoff() {
-        assert!(!finish_needs_registry_handoff(true));
-        assert!(
-            finish_needs_registry_handoff(false),
-            "a copied resident still needs its epoch and reclaimability published"
-        );
-    }
 }
 
 /// Why a GVA render Store could not hand its resident straight to the guest's
@@ -1083,25 +1034,25 @@ mod guest_backed_finish_tests {
 /// whole framebuffer plus a host pass over it, which is the largest single cost
 /// this device pays. They are named individually so a boot says which check is
 /// holding the volume.
-#[cfg(feature = "backend-vulkan")]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GvaWritebackDecline {
-    /// The guest declared a destination format that [`crate::contract::pixel_format::store_texel_order`] does
-    /// not admit as a byte-copy destination, so no image→buffer copy can produce
-    /// it and `convert_rgba8_to_row` is the only route.
+    /// The guest declared a destination format that no host texel reproduces
+    /// verbatim, so no image→buffer copy can produce it and `convert_rgba8_to_row`
+    /// is the only route.
     ///
     /// This used to say "not four bytes of colour", and to name `RGBA16_FLOAT`
     /// as landing here *always*. Both went stale together: a resident now
     /// carries the format the guest declared rather than always being eight bits
     /// per channel, so a half-float destination can be the same bytes as the
-    /// image, and `RGBA16_FLOAT` is an admitted eight-byte member of that table.
-    /// The rule was never a width — it is whether the destination's texel and
-    /// the resident's are one layout, which is [`crate::contract::pixel_format::store_texel_order`]'s question
+    /// image. The rule was never a width — it is whether the destination's texel
+    /// and the resident's are one layout, which is
+    /// [`reims_vgpu_core::pixel_format::verbatim_storage_format`]'s question
     /// and not this doc's to restate.
     ///
     /// `R16_FLOAT` is what lands here now, twice on a driven macos-26 boot: it
     /// is renderable but deliberately not a byte-copy destination, for the
-    /// reason `store_texel_order`'s own doc gives for `RG16_FLOAT`.
+    /// reason `store_texel_order`'s own doc gives for `RG16_FLOAT`, and no
+    /// compute selector names it either.
     FormatNeedsConversion { format: u16 },
     /// The resident's format is not the format the destination stores, so a
     /// byte copy would land the wrong texel. Distinct from the engine's own
@@ -1114,8 +1065,8 @@ pub enum GvaWritebackDecline {
     /// is the arm that catches a half-float destination whose resident fell back
     /// to eight bits because the host cannot render to the wider format.
     ResidentFormatMismatch {
-        held: ash::vk::Format,
-        want: ash::vk::Format,
+        held: reims_vgpu_protocol::StorageImageFormat,
+        want: reims_vgpu_protocol::StorageImageFormat,
     },
     /// The guest's row pitch is not a whole number of texels, or is narrower
     /// than the frame, so there is no `bufferRowLength` that describes it.
@@ -1143,21 +1094,20 @@ pub enum GvaWritebackDecline {
     },
     /// The engine declined or the copy failed; the inner error names which.
     Engine {
-        inner: crate::backend::vulkan::engine::DrawError,
+        inner: crate::runtime::executor::DrawError,
     },
     /// The **copying** arm could not read the resident back, so neither arm
     /// landed the frame. Unlike every variant above this one, it is a loss: the
     /// direct arm has already declined by the time it can be produced, and there
     /// is no third rail.
     CopiedReadRefused {
-        inner: crate::backend::vulkan::engine::DrawError,
+        inner: crate::runtime::executor::DrawError,
     },
     /// The **copying** arm read the frame and could not write it into the guest
     /// pages its licence names. A loss, for the same reason as above.
     CopiedWriteRefused { err: crate::runtime::host::MemError },
 }
 
-#[cfg(feature = "backend-vulkan")]
 impl crate::observe::Decline for GvaWritebackDecline {
     fn slug(&self) -> &'static str {
         match self {
@@ -1200,7 +1150,6 @@ impl crate::observe::Decline for GvaWritebackDecline {
     }
 }
 
-#[cfg(feature = "backend-vulkan")]
 crate::observe::decline::decline_display!(GvaWritebackDecline);
 
 /// Land a GVA render Store's frame in the guest's pages, GPU-direct where the
@@ -1210,12 +1159,11 @@ crate::observe::decline::decline_display!(GvaWritebackDecline);
 ///
 /// The GPU-direct arm below needs a guest-RAM reference over the destination
 /// pages, which is `VK_EXT_external_memory_host` or nothing. On a host without
-/// that extension — and on every discrete GPU, where `linear_target_import`
-/// refuses `UnsupportedTopology` — it declines every Store of every GVA target
-/// with `gvawb_guest_ref_refused via=guest_ram_map_no_backend_import`.
+/// that extension it declines every Store of every GVA target with
+/// `gvawb_guest_ref_refused via=guest_ram_map_no_backend_import`.
 ///
 /// That decline used to be a **lost frame** for one of the two callers. The
-/// eager site in `draw::vulkan` carries its own copying rail (`gva_store_sync`:
+/// eager site in `draw::execution` carries its own copying rail (`gva_store_sync`:
 /// read the resident back, then `write_gva_rgba8_within`), so it never sees
 /// one; the deferred site — [`crate::runtime::writeback_debt::pay_for_texture`],
 /// which pays a resource's debt at the moment the guest samples it — had
@@ -1241,12 +1189,11 @@ crate::observe::decline::decline_display!(GvaWritebackDecline);
 /// transfer backing. `pages == None` is therefore still `Unlicensed` on both
 /// arms: there is no authorisation to write anywhere, and a copy is not a
 /// second opinion about that.
-#[cfg(feature = "backend-vulkan")]
 pub(crate) fn store_gva_frame<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut M,
     task_id: u32,
-    identity: &crate::backend::vulkan::engine::TargetIdentity,
+    identity: &crate::model::TargetIdentity,
     c0: &crate::runtime::draw::ColorRtRequest,
     texture_ref: u32,
     pages: Option<&crate::runtime::draw::StoreTargetPages>,
@@ -1264,7 +1211,7 @@ pub(crate) fn store_gva_frame<M: HostMemory + HostOps>(
     // declines every Store of every target, and a line each would drown the
     // channel.
     crate::observe::Emit::decline("gva_flush_gpu_declined", &decline)
-        .field("gva", format!("{:#x}", c0.target_gva))
+        .field("gva", format!("{:#x}", c0.target_gva()))
         .field("geom", format!("{}x{}", c0.width, c0.height))
         // The destination's declared format and the resident's own. The copying
         // arm below converts by `into_rgba8` and then
@@ -1272,8 +1219,8 @@ pub(crate) fn store_gva_frame<M: HostMemory + HostOps>(
         // decided entirely by this pair — so without it a channel-order defect
         // on this rail is a screenshot and no reading.
         .field("fmt", format!("{:#x}", c0.format))
-        .field("resident", format!("{:?}", identity.resident_format()))
-        .fail_once(c0.target_gva);
+        .field("resident", format!("{:?}", identity.resident_layout()))
+        .fail_once(c0.target_gva());
     crate::runtime::drain::note_store_route("gva_flush_gpu_declined");
     let Some(pages) = pages else {
         return Err(GvaWritebackDecline::Unlicensed);
@@ -1285,11 +1232,13 @@ pub(crate) fn store_gva_frame<M: HostMemory + HostOps>(
     // pass and not the no-op this comment used to claim. Both spellings of that
     // declaration must reach the same answer; `ResidentReadSnapshot::bgra` is
     // where they do, and where they did not.
-    let rgba = crate::backend::vulkan::engine::read_target(identity)
+    let rgba = state
+        .executor
+        .read_target(identity)
         .map_err(|inner| GvaWritebackDecline::CopiedReadRefused { inner })?
         .into_rgba8();
     let extent = land_gva_frame_bytes(state, host, task_id, c0, texture_ref, &rgba, pages)?;
-    crate::backend::vulkan::engine::note_resident_content_copied_out(identity);
+    state.executor.note_resident_content_copied_out(identity);
     crate::runtime::drain::note_store_route("gva_flush_copied");
     Ok(extent)
 }
@@ -1307,9 +1256,8 @@ pub(crate) fn store_gva_frame<M: HostMemory + HostOps>(
 /// Store's bytes. `write_gva_rgba8_within` records the host write itself, from
 /// inside `gva_view`, so the two arms leave the same witness behind and a
 /// decline is invisible to every reader of `gather_witness`.
-#[cfg(feature = "backend-vulkan")]
 fn land_gva_frame_bytes<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut M,
     task_id: u32,
     c0: &crate::runtime::draw::ColorRtRequest,
@@ -1320,36 +1268,47 @@ fn land_gva_frame_bytes<M: HostMemory + HostOps>(
     // The destination extent in the destination's own bytes, which is what the
     // direct arm returns too — the two rails must agree about how much guest
     // memory a Store of this geometry lands, or a caller could tell them apart.
-    let Some(tight) = crate::contract::pixel_format::tight_row_bytes(c0.width, c0.format) else {
+    let Some(tight) = reims_vgpu_core::pixel_format::tight_row_bytes(c0.width, c0.format) else {
         return Err(GvaWritebackDecline::FormatNeedsConversion { format: c0.format });
     };
     let extent =
-        u64::from(c0.height.saturating_sub(1)) * u64::from(c0.row_stride) + u64::from(tight);
+        u64::from(c0.height.saturating_sub(1)) * u64::from(c0.row_stride()) + u64::from(tight);
     crate::runtime::draw::write_gva_rgba8_within(
         state,
         host,
         task_id,
-        c0.target_gva,
+        c0.target_gva(),
         c0.width,
         c0.height,
-        c0.row_stride,
+        c0.row_stride(),
         c0.format,
         rgba,
         Some(pages.membership()),
     )
     .map_err(|err| GvaWritebackDecline::CopiedWriteRefused { err })?;
-    forget_gva_host_copies(state, task_id, c0.target_gva, texture_ref);
+    forget_gva_host_copies(state, task_id, c0.target_gva(), texture_ref);
     Ok(extent)
 }
 
 /// Drop every host-side copy of a GVA target's pixels.
 ///
-/// Both arms of [`store_gva_frame`] end here: once the guest's pages hold the
+/// Both arms of [`store_gva_frame`] end here, and so does a compute dispatch
+/// whose storage output landed in guest pages: once the guest's pages hold the
 /// frame they are the only place it exists, and a cache entry left behind would
-/// serve a later sample the previous Store's bytes. One function rather than two
-/// copies of the pair, because a copied rule is the next divergence.
-#[cfg(feature = "backend-vulkan")]
-fn forget_gva_host_copies(state: &mut DeviceState, task_id: u32, target_gva: u64, texture_ref: u32) {
+/// serve a later sample the previous Store's bytes. One function rather than
+/// three copies of the pair, because a copied rule is the next divergence.
+///
+/// The compute caller has the same obligation for a different reason. It never
+/// *writes* these caches on the direct arm — `store_linear_texture` and
+/// `mirror_linear_color_cache` are on the readback path only — but a previous
+/// dispatch's readback may have left an entry, and that entry is now stale by
+/// exactly one frame.
+pub(crate) fn forget_gva_host_copies(
+    state: &mut Device,
+    task_id: u32,
+    target_gva: u64,
+    texture_ref: u32,
+) {
     crate::runtime::surface_cache::evict_gva(state, target_gva);
     if texture_ref != 0 {
         crate::runtime::surface_cache::evict_texture(state, task_id, texture_ref);
@@ -1379,49 +1338,194 @@ fn forget_gva_host_copies(state: &mut DeviceState, task_id: u32, target_gva: u64
 /// frame exists, and an entry left behind would serve a later sample the
 /// previous Store's bytes. The sampled rail re-reads them from guest memory,
 /// which is what `store_gva_owned`'s `guest_holds_bytes` already promised.
-#[cfg(feature = "backend-vulkan")]
 fn store_gva_frame_direct<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut M,
     task_id: u32,
-    identity: &crate::backend::vulkan::engine::TargetIdentity,
+    identity: &crate::model::TargetIdentity,
     c0: &crate::runtime::draw::ColorRtRequest,
     texture_ref: u32,
     pages: Option<&crate::runtime::draw::StoreTargetPages>,
 ) -> Result<u64, GvaWritebackDecline> {
-    use crate::contract::pixel_format::store_texel_order;
-    // The destination's texel layout, and the whole reason this rail can exist
-    // at all: a copy converts nothing, so the guest must already read these
-    // bytes exactly as the resident holds them.
-    let Some(order) = store_texel_order(c0.format) else {
-        return Err(GvaWritebackDecline::FormatNeedsConversion { format: c0.format });
-    };
-    // Compared as whole formats, not as channel orders.
-    //
-    // While every resident was eight bits per channel an order was a complete
-    // description of one, so `is_bgra() != (order == Bgra8)` decided this. It is
-    // not any more: `RGBA16_FLOAT` and `RGBA8_UNORM` are both RGBA-ordered and
-    // are four bytes per texel apart, so an order comparison would admit a
-    // half-float destination over an eight-bit resident and copy a frame of the
-    // wrong size and the wrong texel into the guest's pages.
-    let want = crate::backend::vulkan::translate::pixel::vk_texel_layout(order);
-    let held = identity.resident_format();
-    // A healthy zero on the rail as it stands: `gva_chain_identity` builds the
-    // key from this same `c0.format`, so the two agree by construction and this
-    // arm is the alarm for an identity that came from somewhere else. It is also
-    // the arm that catches the honest disagreement — a guest format whose
-    // resident fell back to eight bits because the host cannot render to it —
-    // and sends that Store down the CPU conversion rail where it belongs.
+    copy_resident_into_gva_plane(
+        state,
+        host,
+        task_id,
+        identity,
+        &GvaPlaneDestination {
+            target_gva: c0.target_gva(),
+            width: c0.width,
+            height: c0.height,
+            row_stride: c0.row_stride(),
+            format: c0.format,
+            texture_ref,
+        },
+        pages,
+    )
+}
+
+/// A guest-linear plane a resident's pixels may be copied into.
+///
+/// The five terms [`copy_resident_into_gva_plane`] needs and nothing else. It
+/// exists because that rail used to take a [`crate::runtime::draw::ColorRtRequest`],
+/// which describes a *render attachment* — a slot, load and store actions, a
+/// clear colour, a multisample source — and a second caller with the same
+/// destination and no render pass behind it could not honestly fill one in.
+///
+/// `texture_ref` is the resource whose host-side pixel caches this copy
+/// invalidates, and is `0` where the caller has none to name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct GvaPlaneDestination {
+    pub target_gva: u64,
+    pub width: u32,
+    pub height: u32,
+    pub row_stride: u32,
+    /// The guest's own declaration for these bytes, which is what it will read
+    /// them back as. A copy converts nothing, so this is the format the
+    /// resident must already hold.
+    pub format: u16,
+    pub texture_ref: u32,
+}
+
+/// What a [`GvaPlaneDestination`]'s own terms imply about the bytes it names.
+///
+/// `extent` is the reason this is a type rather than three lines inside the copy
+/// below. A caller has to walk the guest's page table before it can hand over a
+/// licence, and the span it walks must be the span the copy writes — a walk one
+/// row short resolves fewer pages than `ordered_complete` demands and the copy
+/// declines, while a walk that is longer authorises pages the frame never
+/// reaches. Deriving it in one pure place is the only way the two cannot drift.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct GvaPlaneGeometry {
+    /// The semantic stored texel the resident must already hold.
+    pub want: reims_vgpu_protocol::StorageImageFormat,
+    /// Backend-independent stored texel the guest destination declares.
+    pub format: reims_vgpu_protocol::StorageImageFormat,
+    pub bpt: u64,
+    pub row_stride: u64,
+    /// The bytes from `target_gva` this plane occupies — the extent the copy
+    /// names and nothing past it. Padding after the final row belongs to the
+    /// allocation but is not texels this destination was given, and the copying
+    /// rail leaves it alone too. The two rails must land identical guest memory
+    /// or a fallback would be visible.
+    pub extent: u64,
+}
+
+impl GvaPlaneDestination {
+    /// The geometry, or the typed reason this destination has none.
+    ///
+    /// Pure, so a caller may ask for the span it must walk and
+    /// [`copy_resident_into_gva_plane`] may ask again for the copy it issues,
+    /// without either restating the rule.
+    pub(crate) fn geometry(&self) -> Result<GvaPlaneGeometry, GvaWritebackDecline> {
+        // The destination's texel, and the whole reason this rail can exist at
+        // all: a copy converts nothing, so the guest must already read these
+        // bytes exactly as the resident holds them.
+        //
+        // Asked of every rail that creates images, not of the render Store's
+        // table alone — this destination serves a compute storage output as
+        // readily as a Store, and a storage image is a thing the guest neither
+        // renders into nor samples. See
+        // [`reims_vgpu_core::pixel_format::verbatim_storage_format`].
+        let Some(format) = reims_vgpu_core::pixel_format::verbatim_storage_format(self.format)
+        else {
+            return Err(GvaWritebackDecline::FormatNeedsConversion {
+                format: self.format,
+            });
+        };
+        let want = format;
+        let bpt = format.bytes_per_texel() as u32;
+        let bpt = u64::from(bpt);
+        let row_stride = u64::from(self.row_stride);
+        if row_stride == 0
+            || !row_stride.is_multiple_of(bpt)
+            || row_stride < u64::from(self.width) * bpt
+        {
+            return Err(GvaWritebackDecline::PitchNotTexels {
+                row_stride: self.row_stride,
+            });
+        }
+        Ok(GvaPlaneGeometry {
+            want,
+            format,
+            bpt,
+            row_stride,
+            extent: u64::from(self.height.saturating_sub(1)) * row_stride
+                + u64::from(self.width) * bpt,
+        })
+    }
+}
+
+/// Copy `identity`'s pixels into the guest pages behind a linear destination,
+/// with no host copy of the frame at any point.
+///
+/// The body of [`store_gva_frame_direct`], reachable by any caller holding a
+/// resident and a licensed guest-linear plane. A render Store is one such
+/// caller; a `copyFromTexture:toTexture:` whose source is an IOSurface the GPU
+/// already holds and whose destination is a linear guest allocation is another,
+/// and it is the same copy — the two differ only in where the geometry and the
+/// page licence came from.
+/// A licensed direct-to-guest-pages destination: where the bytes go, which
+/// pages the licence covers, and how many bytes land.
+///
+/// The two rails that write guest pages from the GPU — a render Store and a
+/// compute storage-image output — differ only in the image they copy *from* and
+/// in which command buffer records the copy. Everything about the destination is
+/// this, so it is derived once and the second rail cannot spell any of it
+/// differently.
+pub(crate) struct GvaPlaneLicence {
+    pub target: reims_vgpu_memory::GuestPageTarget,
+    /// The pages walked, in guest-virtual order — what the copy is licensed
+    /// over and what every witness on this path is armed against.
+    pub gpas: Vec<u64>,
+    /// The bytes from `target_gva` the copy will land. The caller's return
+    /// value, and what the counters on this path are charged.
+    pub extent: u64,
+}
+
+/// Resolve a guest-linear plane into a destination the GPU may copy into, or
+/// the typed reason it may not.
+///
+/// `held` is the format the source image actually holds. **A copy converts
+/// nothing** — neither `vkCmdCopyImageToBuffer` nor the blit behind the
+/// rectangle plan performs a channel swap or a texel resize — so a source whose
+/// format is not the one the guest will read these bytes back as must be refused
+/// here rather than landed. That is the whole of the format contract on this
+/// rail, and it is stated once so neither caller can state it differently.
+///
+/// The comparison is between whole formats, not channel orders. While every
+/// resident was eight bits per channel an order was a complete description of
+/// one, so `is_bgra() != (order == Bgra8)` decided this. It is not any more:
+/// `RGBA16_FLOAT` and `RGBA8_UNORM` are both RGBA-ordered and are four bytes per
+/// texel apart, so an order comparison would admit a half-float destination over
+/// an eight-bit source and copy a frame of the wrong size and the wrong texel
+/// into the guest's pages.
+pub(crate) fn licence_gva_plane<M: HostMemory + HostOps>(
+    state: &mut Device,
+    host: &mut M,
+    held: reims_vgpu_protocol::StorageImageFormat,
+    c0: &GvaPlaneDestination,
+    pages: Option<&crate::runtime::draw::StoreTargetPages>,
+) -> Result<GvaPlaneLicence, GvaWritebackDecline> {
+    let GvaPlaneGeometry {
+        want,
+        format,
+        bpt,
+        row_stride,
+        extent,
+    } = c0.geometry()?;
+    // On the render rail this is a healthy zero as things stand:
+    // `gva_chain_identity` builds the key from this same `c0.format`, so the two
+    // agree by construction and this arm is the alarm for an identity that came
+    // from somewhere else. It is also the arm that catches the honest
+    // disagreement — a guest format whose resident fell back to eight bits
+    // because the host cannot render to it — and sends that Store down the CPU
+    // conversion rail where it belongs. On the compute rail it is not a healthy
+    // zero: a storage image takes its format from the specialized SPIR-V texel
+    // format, which can legitimately differ from the guest surface's, and this
+    // is what stops those bytes being landed raw.
     if held != want {
         return Err(GvaWritebackDecline::ResidentFormatMismatch { held, want });
-    }
-    let bpt = u64::from(order.bytes_per_texel());
-    let row_stride = u64::from(c0.row_stride);
-    if row_stride == 0 || !row_stride.is_multiple_of(bpt) || row_stride < u64::from(c0.width) * bpt
-    {
-        return Err(GvaWritebackDecline::PitchNotTexels {
-            row_stride: c0.row_stride,
-        });
     }
     let Some(pages) = pages else {
         return Err(GvaWritebackDecline::Unlicensed);
@@ -1434,27 +1538,20 @@ fn store_gva_frame_direct<M: HostMemory + HostOps>(
     if !in_page.is_multiple_of(bpt) {
         return Err(GvaWritebackDecline::OffsetNotTexelAligned { in_page });
     }
-    // The extent the copy names and nothing past it: padding after the final
-    // row belongs to the allocation but is not texels this Store was given, and
-    // the copying rail leaves it alone too. The two rails must land identical
-    // guest memory or a fallback would be visible.
-    let extent = u64::from(c0.height.saturating_sub(1)) * row_stride + u64::from(c0.width) * bpt;
     let runs =
         crate::runtime::guest_ram_map::references_for_runs(host, gpas, page_size, in_page, extent)
             .map_err(|refusal| GvaWritebackDecline::GuestRefRefused { refusal })?;
-    let target = crate::backend::vulkan::engine::GuestPageTarget {
+    let target = reims_vgpu_memory::GuestPageTarget {
         runs,
         // Checked above to divide exactly, so this is the guest's pitch and not
         // a rounding of it.
         row_length_texels: (row_stride / bpt) as u32,
         width: c0.width,
         height: c0.height,
-        format: want,
-        shared_backing: None,
+        format,
     };
-    // This device is about to write these guest pages, and the hypervisor's
-    // dirty bitmap is defined not to see it. Without this record a reader
-    // holding a gathered image over the same pages
+    // This device is about to write these guest pages. Without this record a
+    // reader holding a gathered image over the same pages
     // (`crate::runtime::gather_witness`) cannot tell "nobody wrote them" from
     // "we wrote them ourselves", and vouches a retained image that no longer
     // matches the pages — a wrong frame that then persists.
@@ -1464,43 +1561,62 @@ fn store_gva_frame_direct<M: HostMemory + HostOps>(
     // decline is invisible to every reader. Before the submit and not after it,
     // and over the whole walked span rather than the copy's extent: a spurious
     // bump costs a re-read of bytes that did not change, and the opposite error
-    // hands out a stale copy.
+    // hands out a stale copy. It is armed here, past the last refusal, so a
+    // caller that goes on to fail its submit has over-recorded rather than
+    // under-recorded — the direction that costs a re-read instead of a wrong
+    // frame.
     state.note_host_wrote_pages(gpas.to_vec());
-    crate::backend::vulkan::engine::copy_target_to_guest_pages(identity, &target, gpas)
+    Ok(GvaPlaneLicence {
+        target,
+        gpas: gpas.to_vec(),
+        extent,
+    })
+}
+
+pub(crate) fn copy_resident_into_gva_plane<M: HostMemory + HostOps>(
+    state: &mut Device,
+    host: &mut M,
+    task_id: u32,
+    identity: &crate::model::TargetIdentity,
+    c0: &GvaPlaneDestination,
+    pages: Option<&crate::runtime::draw::StoreTargetPages>,
+) -> Result<u64, GvaWritebackDecline> {
+    let licence = licence_gva_plane(state, host, identity.resident_layout().into(), c0, pages)?;
+    let GvaPlaneLicence {
+        target,
+        gpas,
+        extent,
+    } = &licence;
+    state
+        .executor
+        .copy_target_to_guest_pages(identity, target, gpas)
         .map_err(|inner| GvaWritebackDecline::Engine { inner })?;
+    let extent = *extent;
     // Nothing here leaves a host copy of the frame, so neither GVA-keyed cache
     // may go on naming one.
-    forget_gva_host_copies(state, task_id, c0.target_gva, texture_ref);
+    forget_gva_host_copies(state, task_id, c0.target_gva, c0.texture_ref);
     // The copy means this image has stopped being the only place these pixels
     // exist, so the reclaim paths may take it — the same handover
     // `store_render_frame` performs in `finish`.
-    crate::backend::vulkan::engine::note_resident_content_copied_out(identity);
-    // Arm the GVA write witness over the pages this Store just published, the
-    // twin of `mapper::stamp_guest_write_gen` on the type-11 rail. It is what
-    // lets a later reader ask whether these pages still hold this frame without
-    // reading them — see `crate::runtime::gva_store_witness`.
-    //
-    // After the submit, not before it: a stamp taken ahead of a copy that then
-    // declines would claim the guest's pages hold a frame that never reached
-    // them. And after `note_host_wrote_pages` above, because the epoch the
-    // witness records is compared against that same ring — capturing it first
-    // would have every target permanently invalidated by its own Store.
-    //
-    // Only this rail stamps. Both copying arms — the eager `gva_store_sync` and
-    // [`land_gva_frame_bytes`] behind this call — leave no witness, so their
-    // targets never read quiet and never take the shortcut this arms. That is
-    // safe and deliberate rather than an oversight: it is the arm a host without
-    // the guest-RAM import takes, and it already pays a blocking readback per
-    // Store, so the shortcut is worth less there and the rails stay easier to
-    // tell apart. The frame is in the guest's pages either way; what a missing
-    // stamp costs is a re-read, never a wrong image.
-    if let Some(key) = crate::runtime::gva_store_witness::GvaTargetKey::of(identity) {
-        crate::runtime::gva_store_witness::note_store(state, host, key, gpas);
+    state.executor.note_resident_content_copied_out(identity);
+    // Stamp the decoded resource generation after the copy and after recording
+    // this device's own page write. Those two contract-owned records are the
+    // complete currency test for a named target.
+    if let Some(key) = crate::runtime::writeback_debt::resource_key(state, task_id, c0.texture_ref)
+        .and_then(|resource| {
+            crate::runtime::gva_store_witness::GvaTargetKey::of(resource, identity)
+        })
+    {
+        // The copy-out rail: nothing advances the resource's content version
+        // after this point, so the current stamp is the one this Store leaves.
+        if let Some(guest_write) = state.resource_write_stamp_for(key.resource) {
+            crate::runtime::gva_store_witness::note_store(state, key, gpas, guest_write);
+        }
     }
     Ok(extent)
 }
 
-#[cfg(all(test, feature = "backend-vulkan"))]
+#[cfg(test)]
 mod gva_copying_arm_tests {
     use super::*;
     use crate::model::{DeviceId, PAGE_SHIFT_ARM64E};
@@ -1520,9 +1636,9 @@ mod gva_copying_arm_tests {
     const H: u32 = 2;
     const BPR: u32 = 16;
 
-    fn fixture() -> (FakeHost, DeviceState) {
+    fn fixture() -> (FakeHost, Device) {
         let mut host = FakeHost::new();
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
         define_task_pages_arm64e(&mut host, &mut state, DATA_BASE_PFN as u32, PAGES);
         (host, state)
     }
@@ -1530,15 +1646,16 @@ mod gva_copying_arm_tests {
     fn request() -> ColorRtRequest {
         ColorRtRequest {
             texture_ref: 0,
-            target_gva: TARGET_GVA,
-            row_stride: BPR,
+            storage: crate::runtime::draw::ColorTargetStorage::Linear(
+                crate::runtime::draw::LinearColorTarget::whole(TARGET_GVA, BPR, H),
+            ),
             width: W,
             height: H,
             // Byte-identical with the RGBA8 the readback hands over, so the
             // assertion below is about where the bytes landed and not about the
             // conversion, which has its own tests.
-            format: crate::contract::pixel_format::MTL_FORMAT_RGBA8_UNORM,
-            store_action: crate::contract::pass_action::MTL_STORE_ACTION_STORE,
+            format: reims_vgpu_core::pixel_format::MTL_FORMAT_RGBA8_UNORM,
+            store_action: reims_vgpu_protocol::pass_action::StoreAction::Store,
             ..Default::default()
         }
     }
@@ -1612,13 +1729,17 @@ mod gva_copying_arm_tests {
         let mut got = [0u8; (W * 4) as usize];
         crate::runtime::host::HostMemory::read_gpa(&host, gpa, &mut got)
             .expect("the destination page is guest RAM");
-        assert_eq!(got, [0u8; (W * 4) as usize], "nothing may have been written");
+        assert_eq!(
+            got,
+            [0u8; (W * 4) as usize],
+            "nothing may have been written"
+        );
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::SettleSite;
+    use super::{GvaPlaneDestination, SettleSite};
 
     /// Two sites sharing a slug would silently sum their waits into one census
     /// line, and the reading would name the wrong caller as the device's largest
@@ -1638,5 +1759,29 @@ mod tests {
             assert_eq!(site.route_us(), format!("{}_us", site.route()), "{site:?}");
         }
         assert_eq!(seen.len(), SettleSite::ALL.len());
+    }
+
+    #[test]
+    fn a_wide_compute_destination_keeps_its_semantic_texel_through_the_copy_licence() {
+        let destination = GvaPlaneDestination {
+            target_gva: 0x1000,
+            width: 3,
+            height: 2,
+            row_stride: 64,
+            format: reims_vgpu_core::pixel_format::MTL_FORMAT_RGBA32_FLOAT,
+            texture_ref: 0,
+        };
+        let geometry = destination.geometry().expect("RGBA32Float copies verbatim");
+        assert_eq!(geometry.bpt, 16);
+        assert_eq!(geometry.extent, 64 + 3 * 16);
+        assert_eq!(
+            geometry.format,
+            reims_vgpu_protocol::StorageImageFormat::Rgba32Float
+        );
+        assert_eq!(
+            geometry.want,
+            reims_vgpu_protocol::StorageImageFormat::Rgba32Float,
+            "the licence remains semantic"
+        );
     }
 }

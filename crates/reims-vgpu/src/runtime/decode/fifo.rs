@@ -16,7 +16,7 @@
 //! back head — lives in `runtime/drain/mod.rs`, which does it against live guest
 //! memory and reports each failure as a `PacketFault`.
 
-use crate::contract::endian::{ld32, st16, st32};
+use reims_vgpu_core::endian::{ld32, st16, st32};
 
 // --- child record layout, as the PVG command table numbers them ---
 
@@ -182,48 +182,7 @@ pub fn display_timing_entry_offset(index: u32, byte_capacity: u64) -> Option<u64
     )
 }
 
-/// Validity ops packed after object_id in a CmdInvalidateResources record.
-///
-/// Wire layout (PVG host + guest pageon hardcode): four **u8** fields, not a bit mask.
-/// Non-zero means apply that op to the resource's hostValid/guestValid state.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct InvalidateValidityOps {
-    pub clear_host_valid: u8,
-    pub set_host_valid: u8,
-    pub clear_guest_valid: u8,
-    pub set_guest_valid: u8,
-}
-
-impl InvalidateValidityOps {
-    /// Decode LE dword as four validity-op bytes (`0x01000001` → clr host + set guest).
-    pub fn from_le_dword(flags: u32) -> Self {
-        let b = flags.to_le_bytes();
-        Self {
-            clear_host_valid: b[0],
-            set_host_valid: b[1],
-            clear_guest_valid: b[2],
-            set_guest_valid: b[3],
-        }
-    }
-
-    #[cfg(test)]
-    pub fn to_le_dword(self) -> u32 {
-        u32::from_le_bytes([
-            self.clear_host_valid,
-            self.set_host_valid,
-            self.clear_guest_valid,
-            self.set_guest_valid,
-        ])
-    }
-
-    /// Pageon hardcode: clr hostValid + set guestValid.
-    pub const PAGEON: Self = Self {
-        clear_host_valid: 1,
-        set_host_valid: 0,
-        clear_guest_valid: 0,
-        set_guest_valid: 1,
-    };
-}
+pub use reims_vgpu_protocol::ResourceValidityOps as InvalidateValidityOps;
 
 /// One CmdInvalidateResources object record (RE: `pageBacking` second `getCommandBytes(8)`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -440,7 +399,7 @@ pub fn decode_synchronize_resources(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::contract::endian::st32;
+    use reims_vgpu_core::endian::st32;
 
     /// RE pageBacking: plen=16 = header + one 8-byte record; LE `01 00 00 01`
     /// = clear_host_valid + set_guest_valid (PVG validity-op bytes).
@@ -457,7 +416,7 @@ mod tests {
         assert_eq!(c.records.len(), 1);
         assert_eq!(c.records[0].object_id, 0x2a);
         assert_eq!(c.records[0].flags, CHILD_INVALIDATE_PAGEON_FLAGS);
-        assert_eq!(c.records[0].ops, InvalidateValidityOps::PAGEON);
+        assert_eq!(c.records[0].ops, InvalidateValidityOps::PAGE_ON);
         assert_eq!(c.records[0].ops.clear_host_valid, 1);
         assert_eq!(c.records[0].ops.set_host_valid, 0);
         assert_eq!(c.records[0].ops.clear_guest_valid, 0);
@@ -572,7 +531,7 @@ mod tests {
     fn exec_table_and_invalidate_record_decode_the_same_quad() {
         let p = exec_payload_with_table(&[(7, CHILD_INVALIDATE_PAGEON_FLAGS, [0u8; 16])]);
         let descs = decode_exec_resource_table(&p).expect("decode");
-        assert_eq!(descs[0].ops, InvalidateValidityOps::PAGEON);
+        assert_eq!(descs[0].ops, InvalidateValidityOps::PAGE_ON);
     }
 
     #[test]
@@ -644,8 +603,8 @@ mod tests {
         st32(&mut p[0..], 3);
         st32(&mut p[4..], COUNT);
         for i in 0..COUNT as usize {
-            let at = CHILD_RESOURCE_LIST_HEADER_LEN as usize
-                + i * CHILD_INVALIDATE_RECORD_LEN as usize;
+            let at =
+                CHILD_RESOURCE_LIST_HEADER_LEN as usize + i * CHILD_INVALIDATE_RECORD_LEN as usize;
             st32(&mut p[at..], 0x100 + i as u32);
             st32(&mut p[at + 4..], CHILD_INVALIDATE_PAGEON_FLAGS);
         }

@@ -67,7 +67,10 @@
 /// assigned in `main` once the class exists.
 static id gStagingBuffer;
 
-@interface CaptureCommandStream : NSObject
+@interface CaptureCommandStream : NSObject {
+  unsigned char *_continuationTarget;
+}
+- (void)setContinuationTarget:(void *)target;
 @end
 
 @implementation CaptureCommandStream
@@ -105,7 +108,12 @@ static id gStagingBuffer;
 - (char)addResourceMetadataReference:(id)r { return 1; }
 - (char)addHeapMetadataReference:(id)h { return 1; }
 - (void)endEncoding {}
-- (void)beginContinuation {}
+- (void)setContinuationTarget:(void *)target {
+  _continuationTarget = target;
+}
+- (void)beginContinuation {
+  if (_continuationTarget) _continuationTarget[6] = 1;
+}
 - (void)merge:(id)o {}
 - (unsigned long long)getNextTraceID {
   static unsigned long long t = 1;

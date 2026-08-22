@@ -145,7 +145,7 @@ fi
 # writes can be swept before the one that matters is produced. The boot's own
 # build call then finds everything current and adds nothing.
 echo "runtime-dead: building (instrumented) ..."
-"$REPO_ROOT/scripts/qemu-build/qemu-build.sh" --target x86_64 --backend vulkan \
+"$REPO_ROOT/scripts/qemu-build/qemu-build.sh" --target x86_64 \
     > "$OUT_DIR/build.log" 2>&1 || {
     echo "runtime-dead: instrumented build failed; see $OUT_DIR/build.log" >&2
     exit 1

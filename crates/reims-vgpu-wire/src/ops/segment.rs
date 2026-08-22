@@ -9,7 +9,8 @@
 //! # It is written twice
 //!
 //! `-beginSegment:protectionOptions:` allocates the eight bytes and writes the
-//! type, the flag and one more byte. `-endEncoding` comes back afterwards and
+//! type, whether this segment continues the preceding one, and an initially
+//! clear forward-continuation byte. `-endEncoding` comes back afterwards and
 //! fills in [`SegmentHeader::length`], which is why a capture taken between the
 //! two reads `length == 0` — the fixtures here are exactly that capture. A
 //! reader who takes those bytes as the finished header will conclude the length
@@ -98,10 +99,9 @@ pub fn protection_options_envelope(buf: &[u8]) -> Result<&ProtectionOptionsEnvel
     view::<ProtectionOptionsEnvelope>(buf)
 }
 
-/// The seven bytes `-beginSegment:protectionOptions:` writes, of the eight it
-/// allocates.
+/// The seven meaningful bytes of the eight-byte segment-header allocation.
 ///
-/// The eighth is never written by either call, so on a real wire it holds
+/// The eighth is never written, so on a real wire it holds
 /// whatever the ring last contained. It is deliberately not a field.
 #[repr(C)]
 #[derive(Debug)]
@@ -114,31 +114,16 @@ pub struct SegmentHeader {
     /// [`SEGMENT_TYPE_INFO`]; the raw byte is kept rather than an enum, because
     /// a guest may put any value here.
     pub segment_type: u8,
-    /// The unnamed `BOOL` first argument of `-beginSegment:protectionOptions:`,
-    /// verbatim. `beginSegment:1` wrote `1` and `beginSegment:0` wrote `0`
-    /// (`blit_begin_segment`, `blit_begin_segment_alt`), with every other byte
-    /// of the header unchanged between the two.
+    /// Non-zero when this segment continues the encoder left open by the
+    /// preceding segment. This is the `BOOL` argument to
+    /// `-beginSegment:protectionOptions:` verbatim.
+    pub continues_previous: u8,
+    /// Non-zero when the following segment continues this segment's encoder.
     ///
-    /// `reims_vgpu::runtime::decode::stream` reads the length and the type and
-    /// nothing else, so whatever this selects is currently ignored by the
-    /// device.
-    pub begin_flag: u8,
-    /// Written, always `0` so far, and not identified.
-    ///
-    /// **Tried:** both values of the `BOOL` argument and both encoder classes
-    /// move `begin_flag` and `segment_type` respectively and leave this at `0`.
-    /// The `protectionOptions:` argument does not reach the header at all —
-    /// `0x33` and `0x44` produced identical bytes.
-    ///
-    /// This doc used to end with a prediction: that
-    /// `reims_vgpu::runtime::decode::stream`'s
-    /// `SEGMENT_TYPE_PROTECTION_OPTIONS = 5` and its `Envelope` disposition mean
-    /// the options arrive as a *second segment* rather than as a field here, and
-    /// that if one appeared this byte would stay unexplained. Both halves are
-    /// now measured and both are right — see
-    /// [`SEGMENT_TYPE_PROTECTION_OPTIONS`]. So this byte still has no
-    /// experiment, and the obvious one is used up.
-    pub unidentified_u8: u8,
+    /// Header construction initializes this byte to zero. Beginning a
+    /// continuation marks it in the preceding header, producing the paired
+    /// relation `(continues_next, continues_previous)` across the two headers.
+    pub continues_next: u8,
 }
 
 // SAFETY: an align-1 `le` scalar and three `u8`s; every byte pattern is valid
@@ -151,6 +136,18 @@ unsafe impl Wire for SegmentHeader {}
 /// not an operation and has no opcode to dispatch on.
 pub fn segment_header(buf: &[u8]) -> Result<&SegmentHeader, WireError> {
     view::<SegmentHeader>(buf)
+}
+
+impl SegmentHeader {
+    /// Whether this segment continues an encoder opened by its predecessor.
+    pub fn continues_previous(&self) -> bool {
+        self.continues_previous != 0
+    }
+
+    /// Whether this segment leaves its encoder open for its successor.
+    pub fn continues_next(&self) -> bool {
+        self.continues_next != 0
+    }
 }
 
 #[cfg(test)]
@@ -207,7 +204,9 @@ mod tests {
         let h = segment_header(&bytes).expect("fits");
         assert_eq!(h.length.get(), 0x1234_5678);
         assert_eq!(h.segment_type, 0x11);
-        assert_eq!(h.begin_flag, 0x22);
-        assert_eq!(h.unidentified_u8, 0x33);
+        assert_eq!(h.continues_previous, 0x22);
+        assert_eq!(h.continues_next, 0x33);
+        assert!(h.continues_previous());
+        assert!(h.continues_next());
     }
 }

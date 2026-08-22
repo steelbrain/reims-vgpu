@@ -258,7 +258,7 @@ pub(super) fn note_depth_stencil_unsupported(
 
 /// Bands for the stated pass extent as a fraction of its attachment's area.
 ///
-/// Same seven bands as the scissor-union census in `draw::vulkan`, so the
+/// Same seven bands as the scissor-union census in `draw::execution`, so the
 /// two are readable side by side — they answer the same question from two
 /// different sources, and the whole point is which of the two carries damage the
 /// other does not.
@@ -275,11 +275,11 @@ pub(super) const PASS_EXTENT_SLUGS: [&str; 7] = [
 /// Score slot 0's attachment, whichever resolve arm found it.
 ///
 /// Both arms of the colour-attachment resolve consume the same wire form and
-/// must be scored the same way; only the mapping id differs, because a type-11
-/// attachment resolves *to* an id and a type-4 attachment *is* one. This existed
-/// on the type-11 arm alone, and the consequence was not that the census
+/// must be scored the same way; only the mapping id differs, because an IOSurface texture
+/// attachment resolves *to* an id and a surface backing attachment *is* one. This existed
+/// on the IOSurface texture arm alone, and the consequence was not that the census
 /// undercounted — it was that the census read **zero** on the whole x86/Vulkan
-/// pathway, where the workload takes the type-4 arm. A pathway-shaped blind spot
+/// pathway, where the workload takes the surface backing arm. A pathway-shaped blind spot
 /// reads exactly like "the guest never states an extent", which is the opposite
 /// of what it does.
 ///
@@ -287,7 +287,7 @@ pub(super) const PASS_EXTENT_SLUGS: [&str; 7] = [
 /// census, not a resolve, and making it resolve would put a guest-memory walk on
 /// the hottest record in the device.
 pub(super) fn note_pass_extent_for_slot(
-    state: &crate::model::DeviceState,
+    state: &crate::runtime::Device,
     task_id: u32,
     slot: u32,
     mapping_id: u32,
@@ -298,19 +298,23 @@ pub(super) fn note_pass_extent_for_slot(
     }
     // Named whether or not the mapping resolves. The extent score below cannot
     // run without the attachment's geometry, and on a driven boot that is most
-    // passes — `render_pass_target_extent_unapplied` counted 9 762 where the
+    // passes — `render_pass_target_extent_stated` counted 9 762 where the
     // bands scored 2 952 — so a census that shared the scorer's guard would
     // report a handful of tiny surfaces and read as if that were the whole
     // population. The pass names its target either way; the geometry is the part
     // that may be missing, and `?x?` says which.
-    match state.mappings.get(&mapping_id) {
+    match state.surfaces.mappings.get(&mapping_id) {
         Some(e) => {
-            note_pass_target(task_id, mapping_id, Some((e.width, e.height)));
+            note_pass_target(
+                task_id,
+                mapping_id,
+                Some((e.width_or_zero(), e.height_or_zero())),
+            );
             note_pass_extent_coverage(
                 cmd.pass_render_target_width,
                 cmd.pass_render_target_height,
-                e.width,
-                e.height,
+                e.width_or_zero(),
+                e.height_or_zero(),
             );
         }
         None => note_pass_target(task_id, mapping_id, None),
@@ -427,10 +431,10 @@ pub(super) fn note_pass_extent_coverage(pass_w: u64, pass_h: u64, surf_w: u32, s
     crate::runtime::drain::note_store_route(PASS_EXTENT_SLUGS[pass_extent_band(pct)]);
 }
 
-/// The bands, matching `draw::vulkan::coverage_band` exactly.
+/// The bands, matching `draw::execution::coverage_band` exactly.
 ///
 /// Declared here rather than shared because that one is behind
-/// `backend-vulkan` and this census runs on every backend; the two are pinned
+/// the Vulkan executor and this census runs for every submission; the two are pinned
 /// equal by `the_two_coverage_censuses_use_the_same_bands`.
 pub(super) fn pass_extent_band(pct: u64) -> usize {
     match pct {
@@ -444,8 +448,7 @@ pub(super) fn pass_extent_band(pct: u64) -> usize {
     }
 }
 
-/// Count a pass that stated an explicit render target extent, which this device
-/// does not apply.
+/// Count a pass that stated an explicit render target extent.
 ///
 /// This is the **denominator** for [`note_pass_extent_coverage`]'s bands and
 /// nothing more. It used to also put the extent's raw values on the fail
@@ -454,8 +457,9 @@ pub(super) fn pass_extent_band(pct: u64) -> usize {
 /// `note_pass_extent_coverage`, it has the geometry, and it has answered:
 /// `pass_extent_full` takes 11 826 of 11 827 scored passes on arm64/Vulkan and
 /// 10 537 of 10 540 on x86/Vulkan. The extent is the attachment restated, for
-/// all but a handful of passes a boot — see that function for what the handful
-/// costs and why it is not fixed by the obvious mapping.
+/// all but a handful of passes a boot. The executor now carries and applies
+/// both dimensions; this count remains the population denominator for the
+/// geometry bands rather than a claim that the state was dropped.
 ///
 /// The line is gone because it was reporting a non-loss on the channel reserved
 /// for lost guest work, and doing so at 85 % of that channel's whole volume —
@@ -466,8 +470,8 @@ pub(super) fn pass_extent_band(pct: u64) -> usize {
 /// Keep the gap between this count and the bands' sum in view: a pass counted
 /// here and not scored there is one whose attachment had no geometry yet, and
 /// the two numbers are only comparable when that gap is understood.
-pub(super) fn note_pass_target_extent() {
-    crate::runtime::drain::note_store_route("render_pass_target_extent_unapplied");
+pub(super) fn note_pass_target_extent_stated() {
+    crate::runtime::drain::note_store_route("render_pass_target_extent_stated");
 }
 
 /// A pass declaring more render-target array layers than this device draws.
@@ -553,8 +557,7 @@ pub(super) fn note_color_subresource_unsupported(
 /// 400-draw compositor stream among thousands of 2-draw ones is exactly the case
 /// that matters and is exactly what a mean hides. The two buckets above the old
 /// ceiling are what say whether removing it changed which streams complete.
-pub(super) fn note_stream_draw_drops(task_id: u32, acc: &StreamAccum) {
-    let kept = acc.draws.len();
+pub(super) fn note_stream_draw_drops(task_id: u32, acc: &StreamAccum, kept: usize) {
     if kept == 0 && acc.dropped_no_pipeline == 0 && acc.dropped_zero_count == 0 {
         return;
     }

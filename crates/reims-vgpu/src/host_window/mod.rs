@@ -2,7 +2,7 @@
 //! window with its own `VkSurfaceKHR`/swapchain that replaces QEMU's built-in UI
 //! and presents the engine frame directly, keeping the C/QEMU side thin.
 //!
-//! Gated behind the `host-window` cargo feature, which implies `backend-vulkan`.
+//! Gated behind the `host-window` cargo feature; Vulkan itself is unconditional.
 //! It is the display path the x86 pathway is verified on, so the feature is
 //! enabled in every `cargo` command `AGENTS.md` gives for the Vulkan arm.
 //!

@@ -5,9 +5,7 @@
 )]
 
 use super::*;
-use crate::contract::endian::{st16, st32, st64};
-use crate::contract::pixel_format::{MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_RGBA8_UNORM};
-use crate::model::{DeviceId, FENCE_DOMAIN_BLIT, PAGE_SHIFT_ARM64E};
+use crate::model::{DeviceId, PAGE_SHIFT_ARM64E};
 use crate::runtime::decode::blit::{self, Point, Size};
 use crate::runtime::decode::resource::{
     list_object_entry_offset, LINEAR_DESC_HANDLE, LINEAR_DESC_MIN_LEN, LINEAR_DESC_SIZE,
@@ -16,6 +14,36 @@ use crate::runtime::decode::resource::{
 use crate::runtime::gva_mem::write_task_gva_arm64e;
 use crate::runtime::host::FakeHost;
 use crate::runtime::objects;
+use reims_vgpu_core::endian::{st16, st32, st64};
+use reims_vgpu_core::pixel_format::{MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_RGBA8_UNORM};
+
+fn write_linear_texture_packing(
+    desc: &mut [u8],
+    levels: u16,
+    slices: u16,
+    bytes_per_slice: u64,
+    texture_type: u8,
+) {
+    use crate::runtime::decode::resource::{
+        TEXTURE_DESC_BASE_OFFSET, TEXTURE_DESC_BYTES_PER_SLICE, TEXTURE_DESC_DECLARATION,
+        TEXTURE_DESC_MIPMAP_LEVEL_COUNT, TEXTURE_DESC_MIP_LEVEL_RECORD_LEN,
+        TEXTURE_DESC_SLICE_COUNT,
+    };
+
+    st16(&mut desc[TEXTURE_DESC_MIPMAP_LEVEL_COUNT..], levels);
+    st16(&mut desc[TEXTURE_DESC_SLICE_COUNT..], slices);
+    st64(&mut desc[TEXTURE_DESC_BASE_OFFSET..], 0);
+    st64(&mut desc[TEXTURE_DESC_BYTES_PER_SLICE..], bytes_per_slice);
+    let declaration = TEXTURE_DESC_DECLARATION
+        + usize::from(levels.saturating_sub(1)) * TEXTURE_DESC_MIP_LEVEL_RECORD_LEN;
+    desc[declaration] = texture_type;
+    let array_length = declaration
+        + core::mem::offset_of!(
+            reims_vgpu_wire::ops::texture::TextureDescriptorBody,
+            array_length
+        );
+    st16(&mut desc[array_length..], slices);
+}
 
 /// The channel is the whole diagnostic for this rail: 177 checks collapse
 /// into eight statuses, so a refusal that reaches the dispatch line without a
@@ -70,9 +98,9 @@ fn zero_extent_and_pending_fences_are_control_flow_not_refusals() {
 }
 
 /// A task-1 device with the arm64e page tables every blit fixture walks.
-fn blit_device() -> (FakeHost, DeviceState) {
+fn blit_device() -> (FakeHost, Device) {
     let mut host = FakeHost::new();
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
     (host, state)
 }
@@ -89,23 +117,29 @@ fn copy_cmd(copy_kind: CopyKind, source: u32, destination: u32) -> Command {
 }
 
 /// Back `mapping_id` with one guest data page at `pfn` and mark it mapped.
-/// This is the surface state every type-11 / type-5 install needs before it
+/// This is the surface state every IOSurface texture / IOSurface plane view install needs before it
 /// can attach geometry or a descriptor.
-fn map_one_page_surface(host: &mut FakeHost, state: &mut DeviceState, mapping_id: u32, pfn: u32) {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+fn map_one_page_surface(host: &mut FakeHost, state: &mut Device, mapping_id: u32, pfn: u32) {
+    use reims_vgpu_paging::geometry::{
+        MAPPER_PAGE_ENTRY_PFN_SHIFT as PAGE_ENTRY_PFN_SHIFT,
+        MAPPER_PAGE_ENTRY_VALID as PAGE_ENTRY_VALID,
+    };
     host.map_range((pfn as u64) << PAGE_SHIFT_ARM64E, 0x4000, 0);
-    state.map_surface(mapping_id);
-    let m = state.mappings.get_mut(&mapping_id).unwrap();
-    m.mapped = true;
-    m.mapping_internal = 1;
-    m.page_entries = vec![(pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
+    state.map_mapper_surface(
+        reims_vgpu_protocol::MapperSurfaceRef::new(u64::from(mapping_id)),
+        reims_vgpu_protocol::MapperResolvedSurfaceId::new(mapping_id),
+    );
+    let m = state.surfaces.mappings.get_mut(&mapping_id).unwrap();
+    m.lifecycle.active = true;
+    m.lifecycle.internal_kva = 1;
+    m.pages.entries = vec![(pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
 }
 
 /// Publish object-list entry `obj_ref`: type and descriptor length packed
 /// into word 0, descriptor GVA in the following eight bytes.
 fn write_list_entry(
     host: &mut FakeHost,
-    state: &DeviceState,
+    state: &Device,
     obj_ref: u32,
     object_type: u32,
     desc_len: u32,
@@ -119,13 +153,7 @@ fn write_list_entry(
 }
 
 /// Install type-1 buffer: object-list at GVA 0, descriptor at GVA 0x100 + ref*0x20.
-fn install_buffer(
-    host: &mut FakeHost,
-    state: &mut DeviceState,
-    obj_ref: u32,
-    handle: u32,
-    size: u64,
-) {
+fn install_buffer(host: &mut FakeHost, state: &mut Device, obj_ref: u32, handle: u32, size: u64) {
     assert!(state.set_object_list(1, 0, 16));
     let mut desc = vec![0u8; LINEAR_DESC_MIN_LEN];
     st64(&mut desc[LINEAR_DESC_SIZE..], size);
@@ -141,7 +169,7 @@ fn install_buffer(
         desc_gva,
     );
     let e = objects::lookup_list_entry(state, host, 1, obj_ref).expect("entry");
-    assert_eq!(e.object_type, OBJECT_TYPE_BUFFER);
+    assert_eq!(e.kind, ObjectKind::Buffer);
 }
 
 /// A blit's destination bound is the pages the command named, and it holds
@@ -183,7 +211,7 @@ fn a_blit_destination_is_bounded_against_a_guest_that_repoints_it_mid_copy() {
     // `rig` is a whole scenario because the unbounded arm must run against a
     // guest in the same state, not against one the bounded arm already
     // refused half a copy into.
-    let rig = |host: &mut FakeHost, state: &mut DeviceState| {
+    let rig = |host: &mut FakeHost, state: &mut Device| {
         gva_mem::define_task_pages_arm64e(host, state, DATA_BASE, 16);
         install_buffer(host, state, 7, SRC_PAGE as u32, LEN);
         install_buffer(host, state, 8, DST_PAGE as u32, LEN);
@@ -210,7 +238,7 @@ fn a_blit_destination_is_bounded_against_a_guest_that_repoints_it_mid_copy() {
     };
 
     let mut host = FakeHost::new();
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     rig(&mut host, &mut state);
     let mut cmd = copy_cmd(CopyKind::BufferToBuffer, 7, 8);
     cmd.size = LEN;
@@ -234,7 +262,7 @@ fn a_blit_destination_is_bounded_against_a_guest_that_repoints_it_mid_copy() {
 
     // The same loop with no window, on a guest in the same state.
     let mut host = FakeHost::new();
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     rig(&mut host, &mut state);
     assert!(
         copy_bytes_within(
@@ -323,6 +351,23 @@ fn fill_buffer_roundtrip() {
         gva_mem::read_task_gva(&host, &state.tasks[1], gva, &mut out, PAGE_SHIFT_ARM64E).is_ok()
     );
     assert_eq!(out, [0x5a; 8]);
+
+    let (_, first_version) = state
+        .task_objects
+        .resources
+        .content_stamp(1, 7)
+        .expect("a resolved blit buffer has canonical content state");
+    assert_eq!(execute_blit(&mut state, &mut host, 1, &cmd), BlitStatus::Ok);
+    let (_, second_version) = state
+        .task_objects
+        .resources
+        .content_stamp(1, 7)
+        .expect("the resolved resource survives completion");
+    assert_eq!(
+        second_version.get(),
+        first_version.get() + 1,
+        "one immutable blit completion advances canonical content exactly once"
+    );
 }
 
 /// The pattern fill lands a repeating 32-bit unit, in the right order and
@@ -399,11 +444,11 @@ fn an_unaligned_pattern_fill_is_refused_rather_than_guessed() {
 
 /// The byte fill and the pattern fill are one write path.
 ///
-/// `write_fill_range` is `write_fill_pattern` with a one-byte pattern, and
-/// this asserts the two agree on the bytes rather than only on the code
-/// being shared — the divergence this rail keeps producing is two arms of
-/// one guest-memory write drifting, and a shared body is only worth
-/// anything if the equivalence is checked.
+/// Both forms become one resolved fill operation, and this asserts the two
+/// agree on the bytes rather than only on the code being shared — the
+/// divergence this rail keeps producing is two arms of one guest-memory write
+/// drifting, and a shared body is only worth anything if the equivalence is
+/// checked.
 #[test]
 fn a_byte_fill_and_a_four_equal_byte_pattern_fill_write_the_same_bytes() {
     let read_back = |cmd: &Command| {
@@ -513,7 +558,7 @@ fn copy_b2b_overlap_rejected() {
 }
 
 #[test]
-fn copy_buffer_to_type11_roundtrip() {
+fn copy_buffer_to_iosurface_texture_roundtrip() {
     let (mut host, mut state) = blit_device();
     // Buffer with 8 BGRA pixels (one row of 2 pixels for a 2x1 copy).
     install_buffer(&mut host, &mut state, 1, 1, 256);
@@ -521,9 +566,9 @@ fn copy_buffer_to_type11_roundtrip() {
     let src_gva = 1u64 << RESOURCE_PAGE_SHIFT;
     write_task_gva_arm64e(&mut host, &state.tasks[1], src_gva, &pat);
 
-    // Type-11 object ref 3 → mapping 9, 2x2 BGRA.
+    // IOSurface texture object ref 3 → mapping 9, 2x2 BGRA.
     let mapping_id = 9u32;
-    install_type11(&mut host, &mut state, 3, mapping_id, 0x20);
+    install_iosurface_texture(&mut host, &mut state, 3, mapping_id, 0x20);
 
     let mut cmd = copy_cmd(CopyKind::BufferToTexture, 1, 3);
     cmd.source_offset = 0;
@@ -552,18 +597,41 @@ fn copy_buffer_to_type11_roundtrip() {
         8
     ));
     assert_eq!(back, pat);
-    // Blit again — unified memory: pages are the only content; gen advances.
-    let gen_before = state.mappings[&mapping_id].content_generation;
+    // Blit again — unified memory: pages are the only content; both the legacy
+    // mapping witness and canonical resource authority advance.
+    let gen_before = state.surfaces.mappings[&mapping_id]
+        .content
+        .guest_page_generation;
+    let (resource_before, version_before) = state
+        .task_objects
+        .resources
+        .content_stamp(1, 3)
+        .expect("the resolved destination has canonical content state");
     assert_eq!(execute_blit(&mut state, &mut host, 1, &cmd), BlitStatus::Ok);
-    assert!(state.mappings[&mapping_id].content_generation > gen_before);
+    assert!(
+        state.surfaces.mappings[&mapping_id]
+            .content
+            .guest_page_generation
+            > gen_before
+    );
+    let (resource_after, version_after) = state
+        .task_objects
+        .resources
+        .content_stamp(1, 3)
+        .expect("the destination survives synchronous completion");
+    assert_eq!(resource_after, resource_before);
+    assert!(
+        version_after > version_before,
+        "a completed texture write must advance canonical content"
+    );
 }
 
-/// type-11→type-11 copy lands source bytes in dest pages (unified content).
+/// IOSurface texture→IOSurface texture copy lands source bytes in dest pages (unified content).
 #[test]
-fn copy_type11_to_type11_writes_dst_pages() {
+fn copy_iosurface_texture_to_iosurface_texture_writes_dst_pages() {
     let (mut host, mut state) = blit_device();
-    install_type11(&mut host, &mut state, 3, 3, 0x20);
-    install_type11(&mut host, &mut state, 4, 4, 0x21);
+    install_iosurface_texture(&mut host, &mut state, 3, 3, 0x20);
+    install_iosurface_texture(&mut host, &mut state, 4, 4, 0x21);
     // Seed source mid=3 pages with a known pattern.
     let src_pat = [9u8, 8, 7, 6, 5, 4, 3, 2, 1, 0, 11, 12, 13, 14, 15, 16];
     assert!(mapping_write::write_rect_raw(
@@ -617,8 +685,8 @@ fn copy_type11_to_type11_writes_dst_pages() {
 #[test]
 fn an_extent_past_the_edge_is_refused_like_an_origin_past_the_edge() {
     let (mut host, mut state) = blit_device();
-    install_type11(&mut host, &mut state, 3, 3, 0x20); // 2×2 BGRA, mid 3
-    install_type11(&mut host, &mut state, 4, 4, 0x21); // 2×2 BGRA, mid 4
+    install_iosurface_texture(&mut host, &mut state, 3, 3, 0x20); // 2×2 BGRA, mid 3
+    install_iosurface_texture(&mut host, &mut state, 4, 4, 0x21); // 2×2 BGRA, mid 4
     install_buffer(&mut host, &mut state, 5, 5, 4096);
 
     // Origin in range, extent past the edge: 3 wide out of a 2-wide texture.
@@ -673,8 +741,8 @@ fn an_extent_past_the_edge_is_refused_like_an_origin_past_the_edge() {
 #[test]
 fn copy_executor_reason_slugs_name_distinct_sites() {
     let (mut host, mut state) = blit_device();
-    install_type11(&mut host, &mut state, 3, 3, 0x20); // 2×2 BGRA, mid 3
-    install_type11(&mut host, &mut state, 4, 4, 0x21); // 2×2 BGRA, mid 4
+    install_iosurface_texture(&mut host, &mut state, 3, 3, 0x20); // 2×2 BGRA, mid 3
+    install_iosurface_texture(&mut host, &mut state, 4, 4, 0x21); // 2×2 BGRA, mid 4
     install_buffer(&mut host, &mut state, 5, 5, 4096);
 
     // texture→texture: destination origin past a 2×2 target → Bounds.
@@ -691,7 +759,7 @@ fn copy_executor_reason_slugs_name_distinct_sites() {
     );
     assert_eq!(blit_fail_reason(), "t2t_origin_oob");
 
-    // texture→texture: a type-11 endpoint with a non-zero z origin (type-11 is
+    // texture→texture: an IOSurface texture endpoint with a non-zero z origin (IOSurface texture is
     // 2D) → Unsupported, a DIFFERENT reason under the same executor.
     let mut cmd = copy_cmd(CopyKind::TextureToTexture, 3, 4);
     cmd.source_origin.z = 1;
@@ -704,7 +772,7 @@ fn copy_executor_reason_slugs_name_distinct_sites() {
         execute_blit(&mut state, &mut host, 1, &cmd),
         BlitStatus::Unsupported
     );
-    assert_eq!(blit_fail_reason(), "t2t_t11_z");
+    assert_eq!(blit_fail_reason(), "t2t_iosurface_z");
 
     // texture→buffer: source origin past bounds → Bounds "t2b_origin_oob".
     let mut cmd = copy_cmd(CopyKind::TextureToBuffer, 3, 5);
@@ -734,7 +802,7 @@ fn copy_executor_reason_slugs_name_distinct_sites() {
     );
     assert_eq!(blit_fail_reason(), "b2t_origin_oob");
 
-    // A full-target valid type-11→type-11 copy succeeds and resets the channel,
+    // A full-target valid IOSurface texture→IOSurface texture copy succeeds and resets the channel,
     // so no stale slug leaks into the next command's dispatch line.
     let mut cmd = copy_cmd(CopyKind::TextureToTexture, 3, 4);
     cmd.source_size = Size {
@@ -746,21 +814,22 @@ fn copy_executor_reason_slugs_name_distinct_sites() {
     assert_eq!(blit_fail_reason(), "");
 }
 
-/// Install type-11 object-list entry + mapping pages (2×2 BGRA).
-fn install_type11(
+/// Install IOSurface texture object-list entry + mapping pages (2×2 BGRA).
+fn install_iosurface_texture(
     host: &mut FakeHost,
-    state: &mut DeviceState,
+    state: &mut Device,
     obj_ref: u32,
     mapping_id: u32,
     pfn: u32,
 ) {
     map_one_page_surface(host, state, mapping_id, pfn);
     assert!(state.set_mapping_geom(mapping_id, 2, 2, MTL_FORMAT_BGRA8_UNORM));
-    install_type11_plane(
+    install_iosurface_texture_plane(
         host,
         state,
         obj_ref,
         mapping_id,
+        0,
         MTL_FORMAT_BGRA8_UNORM,
         2,
         2,
@@ -768,13 +837,8 @@ fn install_type11(
 }
 
 /// Shared biplanar mapping: plane0 Y 4×2 R8 @512 bpr=64; plane1 UV 2×1 RG8 @1024 bpr=64.
-fn install_biplanar_mapping(
-    host: &mut FakeHost,
-    state: &mut DeviceState,
-    mapping_id: u32,
-    pfn: u32,
-) {
-    use crate::contract::iosurface_pages::{
+fn install_biplanar_mapping(host: &mut FakeHost, state: &mut Device, mapping_id: u32, pfn: u32) {
+    use reims_vgpu_protocol::{
         DEVICE_DESC_ALLOC_SIZE, DEVICE_DESC_LEN, DEVICE_DESC_PLANES, DEVICE_DESC_PLANE_COUNT,
         DEVICE_PLANE_BPE, DEVICE_PLANE_BPR, DEVICE_PLANE_DESC_LEN, DEVICE_PLANE_DIMS,
         DEVICE_PLANE_OFFSET, DEVICE_PLANE_SIZE,
@@ -800,24 +864,35 @@ fn install_biplanar_mapping(
     // Surface-level geom is not the plane; leave has_geom false until texture latch.
 }
 
-fn install_type11_plane(
+fn install_iosurface_texture_plane(
     host: &mut FakeHost,
-    state: &mut DeviceState,
+    state: &mut Device,
     obj_ref: u32,
     mapping_id: u32,
+    plane: u16,
     format: u16,
     width: u32,
     height: u32,
 ) {
     use crate::runtime::decode::resource::OBJECT_TYPE_IOSURFACE;
-    // iosurface desc layout: surfaceID @0, format @0x16, width @0x18, height @0x1c.
-    const DESC_LEN: usize = 0x20;
+    use reims_vgpu_wire::ops::backed_texture::{
+        IOSURFACE_TEXTURE_TOTAL_LEN, OPCODE_IOSURFACE_TEXTURE,
+    };
+    const DESC_LEN: usize = 8 + IOSURFACE_TEXTURE_TOTAL_LEN as usize;
     assert!(state.set_object_list(1, 0, 16));
     let mut desc = vec![0u8; DESC_LEN];
-    st32(&mut desc[0..], mapping_id);
+    st64(&mut desc[0..], u64::from(mapping_id));
+    st32(&mut desc[8..], OPCODE_IOSURFACE_TEXTURE);
+    st32(&mut desc[12..], IOSURFACE_TEXTURE_TOTAL_LEN);
+    st32(&mut desc[16..], obj_ref);
     st16(&mut desc[0x16..], format);
     st32(&mut desc[0x18..], width);
     st32(&mut desc[0x1c..], height);
+    st32(&mut desc[0x20..], 1);
+    st16(&mut desc[0x24..], 1);
+    st16(&mut desc[0x26..], 1);
+    st16(&mut desc[0x28..], 1);
+    st16(&mut desc[0x34..], plane);
     let desc_gva = 0x180u64 + (obj_ref as u64) * 0x40;
     write_task_gva_arm64e(host, &state.tasks[1], desc_gva, &desc);
     write_list_entry(
@@ -830,14 +905,14 @@ fn install_type11_plane(
     );
 }
 
-/// Install a type-5 RefTexture (object_type=5) that names an IOSurface
+/// Install a IOSurface plane view RefTexture (object_type=5) that names an IOSurface
 /// mapping via `surfaceID@+0` and a serialized 0x62 color-view record
 /// (fmt@+0x16, w@+0x18, h@+0x1c, depth@+0x20, plane@+0x34 — the live blit-
-/// source layout from `decode_type5_texture_view_live_0x62_color_window_view`).
+/// source layout from `decode_iosurface_plane_view_live_0x62_color_window_view`).
 /// Also installs a single-page mapping at `mapping_id` so the resolve lands.
-fn install_type5(
+fn install_iosurface_plane_view(
     host: &mut FakeHost,
-    state: &mut DeviceState,
+    state: &mut Device,
     obj_ref: u32,
     mapping_id: u32,
     pfn: u32,
@@ -848,13 +923,13 @@ fn install_type5(
     // Mapping (surfaceID == mapping_id): mapped, one data page, latched geom.
     map_one_page_surface(host, state, mapping_id, pfn);
     assert!(state.set_mapping_geom(mapping_id, width, height, format));
-    // Type-5 descriptor: 56-byte blob, 0x62 color-view record.
+    // IOSurface plane view descriptor: 56-byte blob, 0x62 color-view record.
     assert!(state.set_object_list(1, 0, 16));
-    let built = reims_vgpu_wire::device_desc::Type5Builder::new(
+    let built = reims_vgpu_wire::device_desc::IOSurfacePlaneViewBuilder::new(
         mapping_id,
         0,
         obj_ref,
-        objects::TYPE5_RECORD_TAG_COLOR_VIEW,
+        objects::IOSURFACE_PLANE_VIEW_RECORD_TAG_COLOR_VIEW,
     )
     .geometry(format, width, height, 1)
     .with_len(56);
@@ -870,14 +945,15 @@ fn install_type5(
         desc_len as u32,
         desc_gva,
     );
-    let e = objects::lookup_list_entry(state, host, 1, obj_ref).expect("type5 entry");
-    assert_eq!(e.object_type, objects::OBJECT_TYPE_REF_TEXTURE);
+    let e =
+        objects::lookup_list_entry(state, host, 1, obj_ref).expect("iosurface_plane_view entry");
+    assert_eq!(e.kind, ObjectKind::IOSurfacePlaneView);
 }
 
 /// A blit source must read the plane the wire named, and the only shape that
 /// can prove it is two planes that share geometry and bytes-per-element.
 ///
-/// This branch resolved type-5 views through `type11_sample_window`, which
+/// This branch resolved IOSurface plane view views through `iosurface_texture_sample_window`, which
 /// takes no plane index and picks a plane by matching width, height and bpe.
 /// On the v0a8 shape the live apple.com hero produces — Y and alpha both R8
 /// at the luma geometry — that scan matches *two* records, takes neither, and
@@ -889,14 +965,14 @@ fn install_type5(
 /// identical in geometry to plane 0 and differs only in offset, so an
 /// assertion on the offset is exactly the assertion that the index was used.
 #[test]
-fn a_type5_blit_source_reads_the_plane_the_wire_named() {
-    use crate::contract::endian::st64;
-    use crate::contract::iosurface_pages::{
+fn a_iosurface_plane_view_blit_source_reads_the_plane_the_wire_named() {
+    use reims_vgpu_core::endian::st64;
+    use reims_vgpu_core::pixel_format::{MTL_FORMAT_R8_UNORM, MTL_FORMAT_RG8_UNORM};
+    use reims_vgpu_protocol::{
         DEVICE_DESC_ALLOC_SIZE, DEVICE_DESC_LEN, DEVICE_DESC_PLANES, DEVICE_DESC_PLANE_COUNT,
         DEVICE_PLANE_BPE, DEVICE_PLANE_BPR, DEVICE_PLANE_DESC_LEN, DEVICE_PLANE_DIMS,
         DEVICE_PLANE_OFFSET, DEVICE_PLANE_SIZE,
     };
-    use crate::contract::pixel_format::{MTL_FORMAT_R8_UNORM, MTL_FORMAT_RG8_UNORM};
     // Device-plane dims word: width u24@1, height u24@5 (`decode_device_plane`).
     let pack_plane_dims =
         |w: u32, h: u32| ((w as u64 & 0xffffff) << 8) | ((h as u64 & 0xffffff) << 40);
@@ -906,7 +982,7 @@ fn a_type5_blit_source_reads_the_plane_the_wire_named() {
     let (w, h) = (8u32, 4u32);
     // Plane 2 is the alpha plane: same 8x4 R8 as plane 0, different offset.
     const ALPHA_OFFSET: u32 = 128;
-    install_type5(
+    install_iosurface_plane_view(
         &mut host,
         &mut state,
         obj_ref,
@@ -916,7 +992,7 @@ fn a_type5_blit_source_reads_the_plane_the_wire_named() {
         w,
         h,
     );
-    set_type5_record_plane(&mut host, &state, obj_ref, 2);
+    set_iosurface_plane_view_record_plane(&mut host, &state, obj_ref, 2);
 
     let mut desc = vec![0u8; DEVICE_DESC_LEN];
     st32(&mut desc[DEVICE_DESC_ALLOC_SIZE..], 0x1000);
@@ -939,16 +1015,17 @@ fn a_type5_blit_source_reads_the_plane_the_wire_named() {
         st16(&mut desc[base + DEVICE_PLANE_BPE..], *bpe);
     }
     state
+        .surfaces
         .mappings
         .get_mut(&mapping_id)
         .expect("mapping")
-        .device_desc = desc;
+        .publish_device_desc_for_test(&desc);
 
     // The scan is genuinely ambiguous on this descriptor: without the index
     // it resolves nothing at all, which is what this test exists to exclude.
     let ambiguous = {
-        let m = state.mappings.get(&mapping_id).unwrap();
-        mapping_write::type11_sample_window(m, w, h, MTL_FORMAT_R8_UNORM)
+        let m = state.surfaces.mappings.get(&mapping_id).unwrap();
+        mapping_write::iosurface_texture_sample_window(m, w, h, MTL_FORMAT_R8_UNORM)
     };
     assert!(
         ambiguous.is_none(),
@@ -957,78 +1034,84 @@ fn a_type5_blit_source_reads_the_plane_the_wire_named() {
     // Sanity: plane 1 is a different geometry, so the ambiguity is between
     // planes 0 and 2 specifically and not a descriptor that resolves nothing.
     let uv = {
-        let m = state.mappings.get(&mapping_id).unwrap();
-        mapping_write::type5_sample_window(m, 1, 4, 2, MTL_FORMAT_RG8_UNORM)
+        let m = state.surfaces.mappings.get(&mapping_id).unwrap();
+        mapping_write::iosurface_plane_view_sample_window(m, 1, 4, 2, MTL_FORMAT_RG8_UNORM)
     };
     assert_eq!(uv.map(|(off, _, _)| off), Some(64));
 
     let backing = resolve_texture_backing(&mut state, &mut host, 1, obj_ref, 0, 0)
-        .expect("type-5 blit source must resolve");
+        .expect("IOSurface plane view blit source must resolve");
     match backing {
-        TextureBacking::Type11(t) => assert_eq!(
+        TextureBacking::Surface(t) => assert_eq!(
             t.surface_offset, ALPHA_OFFSET as u64,
             "the wire named plane 2, and only the wire index can reach it"
         ),
-        TextureBacking::Linear(_) => panic!("expected Type11 backing, got Linear"),
+        TextureBacking::Linear(_) => panic!("expected IOSurface backing, got Linear"),
     }
 }
 
-/// Overwrite the plane index in an installed type-5 record.
+/// Overwrite the plane index in an installed IOSurface plane view record.
 ///
-/// `install_type5` leaves it 0 (the field sits past the fields it writes and
+/// `install_iosurface_plane_view` leaves it 0 (the field sits past the fields it writes and
 /// the blob is zeroed), which is the one value that cannot distinguish a
 /// used index from a dropped one.
-fn set_type5_record_plane(host: &mut FakeHost, state: &DeviceState, obj_ref: u32, plane: u32) {
-    let off = objects::TYPE5_ARG_RECORD + objects::TYPE5_RECORD_PLANE;
+fn set_iosurface_plane_view_record_plane(
+    host: &mut FakeHost,
+    state: &Device,
+    obj_ref: u32,
+    plane: u32,
+) {
+    let off = objects::IOSURFACE_PLANE_VIEW_ARG_RECORD + objects::IOSURFACE_PLANE_VIEW_RECORD_PLANE;
     let desc_gva = 0x180u64 + (obj_ref as u64) * 0x40;
     let mut word = [0u8; 4];
     st32(&mut word, plane);
     write_task_gva_arm64e(host, &state.tasks[1], desc_gva + off as u64, &word);
-    let entry = objects::lookup_list_entry(state, host, 1, obj_ref).expect("type5 entry");
-    let desc = objects::read_descriptor(state, host, 1, &entry).expect("type5 desc");
+    let entry =
+        objects::lookup_list_entry(state, host, 1, obj_ref).expect("iosurface_plane_view entry");
+    let desc = objects::read_descriptor(state, host, 1, &entry).expect("iosurface_plane_view desc");
     assert_eq!(
-        objects::decode_type5_texture_view(&desc)
+        objects::decode_iosurface_plane_view(&desc)
             .expect("view")
             .plane_index,
         plane
     );
 }
 
-/// Regression guard for the type-5 RefTexture blit-source branch
-/// (`resolve_texture_backing_depth` ~588): a type-5 object whose 0x62 record
-/// names a BGRA8 view must resolve to a `Type11` backing carrying the VIEW
+/// Regression guard for the IOSurface plane view RefTexture blit-source branch
+/// (`resolve_texture_backing_depth` ~588): a IOSurface plane view object whose 0x62 record
+/// names a BGRA8 view must resolve to an `IOSurface` backing carrying the VIEW
 /// geometry/format (not the base mapping's), so a blit copy from a media /
-/// window backing lands. Mirrors the type-11 install fixtures.
+/// window backing lands. Mirrors the IOSurface texture install fixtures.
 #[test]
-fn type5_ref_texture_resolves_as_type11_blit_backing() {
-    use crate::contract::pixel_format::bytes_per_pixel;
+fn iosurface_plane_view_ref_texture_resolves_as_iosurface_texture_blit_backing() {
+    use reims_vgpu_core::pixel_format::bytes_per_pixel;
     let (mut host, mut state) = blit_device();
     let mapping_id = 34u32;
     let obj_ref = 12u32;
     let (w, h, fmt) = (2u32, 2u32, MTL_FORMAT_BGRA8_UNORM);
-    install_type5(&mut host, &mut state, obj_ref, mapping_id, 0x30, fmt, w, h);
+    install_iosurface_plane_view(&mut host, &mut state, obj_ref, mapping_id, 0x30, fmt, w, h);
     let backing = resolve_texture_backing(&mut state, &mut host, 1, obj_ref, 0, 0)
-        .expect("type-5 blit source must resolve");
+        .expect("IOSurface plane view blit source must resolve");
     match backing {
-        TextureBacking::Type11(t) => {
-            assert_eq!(t.mapping_id, mapping_id, "backs the named surface");
+        TextureBacking::Surface(t) => {
+            assert_eq!(t.mapping_id.get(), mapping_id, "backs the named surface");
             assert_eq!((t.width, t.height), (w, h), "view geometry, not base");
             assert_eq!(t.pixel_format, fmt);
             assert_eq!(t.bpp, bytes_per_pixel(fmt).unwrap());
             assert!(u64::from(t.row_stride) >= u64::from(w) * u64::from(t.bpp));
             assert!(t.span_end >= u64::from(t.row_stride) * u64::from(h));
         }
-        TextureBacking::Linear(_) => panic!("expected Type11 backing, got Linear"),
+        TextureBacking::Linear(_) => panic!("expected IOSurface backing, got Linear"),
     }
 }
 
-/// A type-5 record whose tag is neither 0x42 nor 0x62 is unknown wire → the
+/// A IOSurface plane view record whose tag is neither 0x42 nor 0x62 is unknown wire → the
 /// blit branch must fail closed (`t5_view_decode`), never invent geometry.
 #[test]
-fn type5_unknown_record_tag_fails_closed() {
+fn iosurface_plane_view_unknown_record_tag_fails_closed() {
     let (mut host, mut state) = blit_device();
     let (mapping_id, obj_ref) = (34u32, 12u32);
-    install_type5(
+    install_iosurface_plane_view(
         &mut host,
         &mut state,
         obj_ref,
@@ -1044,36 +1127,38 @@ fn type5_unknown_record_tag_fails_closed() {
     write_task_gva_arm64e(
         &mut host,
         &state.tasks[1],
-        desc_gva + objects::TYPE5_ARG_RECORD as u64,
+        desc_gva + objects::IOSURFACE_PLANE_VIEW_ARG_RECORD as u64,
         &bad,
     );
     match resolve_texture_backing(&mut state, &mut host, 1, obj_ref, 0, 0) {
         Err(st) => assert_eq!(st, BlitStatus::Unsupported),
-        Ok(_) => panic!("unknown type-5 record tag must fail closed"),
+        Ok(_) => panic!("unknown IOSurface plane view record tag must fail closed"),
     }
 }
 
 #[test]
-fn biplanar_type11_y_and_uv_planes_distinct() {
-    use crate::contract::pixel_format::{MTL_FORMAT_R8_UNORM, MTL_FORMAT_RG8_UNORM};
+fn biplanar_iosurface_texture_y_and_uv_planes_distinct() {
+    use reims_vgpu_core::pixel_format::{MTL_FORMAT_R8_UNORM, MTL_FORMAT_RG8_UNORM};
     let (mut host, mut state) = blit_device();
     let mapping_id = 7u32;
     install_biplanar_mapping(&mut host, &mut state, mapping_id, 0x30);
     // Y plane texture ref 10, UV plane texture ref 11 — same mapping_id.
-    install_type11_plane(
+    install_iosurface_texture_plane(
         &mut host,
         &mut state,
         10,
         mapping_id,
+        0,
         MTL_FORMAT_R8_UNORM,
         4,
         2,
     );
-    install_type11_plane(
+    install_iosurface_texture_plane(
         &mut host,
         &mut state,
         11,
         mapping_id,
+        1,
         MTL_FORMAT_RG8_UNORM,
         2,
         1,
@@ -1216,7 +1301,7 @@ fn biplanar_type11_y_and_uv_planes_distinct() {
 
 fn install_type8_view(
     host: &mut FakeHost,
-    state: &mut DeviceState,
+    state: &mut Device,
     view_ref: u32,
     base_ref: u32,
     pixel_format: u16,
@@ -1265,11 +1350,11 @@ fn install_type8_view(
 }
 
 #[test]
-fn copy_buffer_to_type8_view_of_type11() {
+fn copy_buffer_to_type8_view_of_iosurface_texture() {
     let (mut host, mut state) = blit_device();
     install_buffer(&mut host, &mut state, 1, 1, 256);
     let mapping_id = 9u32;
-    install_type11(&mut host, &mut state, 3, mapping_id, 0x20);
+    install_iosurface_texture(&mut host, &mut state, 3, mapping_id, 0x20);
     // View ref 8 → base 3, level 0, BGRA identity.
     install_type8_view(&mut host, &mut state, 8, 3, MTL_FORMAT_BGRA8_UNORM, 0, None);
     let pat = [0xaau8, 0xbb, 0xcc, 0xdd, 0x11, 0x22, 0x33, 0x44];
@@ -1306,7 +1391,7 @@ fn copy_buffer_to_type8_view_of_type11() {
 fn type8_swizzled_view_rejected_for_blit() {
     let (mut host, mut state) = blit_device();
     install_buffer(&mut host, &mut state, 1, 1, 256);
-    install_type11(&mut host, &mut state, 3, 9, 0x20);
+    install_iosurface_texture(&mut host, &mut state, 3, 9, 0x20);
     // Non-identity swizzle BGRA order selectors.
     install_type8_view(
         &mut host,
@@ -1331,11 +1416,11 @@ fn type8_swizzled_view_rejected_for_blit() {
 }
 
 #[test]
-fn type8_level_base_on_type11_rejected() {
+fn type8_level_base_on_iosurface_texture_rejected() {
     // Metal forbids mipmapped IOSurfaces; view level_base=1 fail-closes.
     let (mut host, mut state) = blit_device();
     install_buffer(&mut host, &mut state, 1, 1, 256);
-    install_type11(&mut host, &mut state, 3, 9, 0x20);
+    install_iosurface_texture(&mut host, &mut state, 3, 9, 0x20);
     install_type8_view(
         &mut host,
         &mut state,
@@ -1387,6 +1472,134 @@ fn texel_offset_math() {
     t1.slice_index = 2;
     // + 2 * 64 slice stride
     assert_eq!(t1.texel_offset(1, 2, 0), Some(0x124 + 128));
+}
+
+/// A linear rectangle resolves its pages once and round-trips row-exact —
+/// **including when the rectangle crosses guest pages**, which is the case the
+/// whole rail is made of.
+///
+/// The first version of this hoist required the rectangle's span to be one
+/// contiguous guest-physical run, and on a driven macos-13 boot that declined
+/// all 617 texture-to-texture blits: guest linear textures are scattered, so
+/// the "fast path" was never taken and the counter that recorded the decline
+/// was the only sign. So the rectangle here is deliberately **eight pages
+/// wide**, and the assertion that it walked once rather than once a row is
+/// what would have caught that.
+///
+/// The padding assertion is the other half. The row path writes `row_bytes`
+/// and never the gap between two rows, so a rectangle primitive that filled
+/// its span contiguously would round-trip every pixel correctly and destroy
+/// whatever the guest kept in the stride padding.
+#[test]
+fn a_linear_rectangle_lands_row_exact_through_one_page_table_walk() {
+    use crate::runtime::drain::census::store_route_count;
+
+    let (mut host, mut state) = blit_device();
+    // `blit_device` backs root PTE indices 0..8 with their own one-page RAM
+    // ranges, so a span from GVA 0 upwards is eight separate guest-physical
+    // pages: fragmented in exactly the way the real rail is.
+    let page = 1u64 << PAGE_SHIFT_ARM64E;
+    let base_gva = 0u64;
+    let pages = 8u64;
+    let (row_stride, row_bytes) = (page / 2, page / 4);
+    let row_count = pages * 2;
+
+    let pad = vec![0xeeu8; (row_stride * row_count) as usize];
+    for p in 0..pages {
+        let at = (p * page) as usize;
+        host.write_gpa((4 + p) << PAGE_SHIFT_ARM64E, &pad[at..at + page as usize])
+            .expect("seed the destination pages");
+    }
+
+    let t = LinearTextureLevel {
+        base_gva,
+        alloc_size: pages * page,
+        level_offset: 0,
+        row_stride,
+        slice_stride: 0,
+        slice_index: 0,
+        width: (row_bytes / 4) as u32,
+        height: row_count as u32,
+        depth: 1,
+        bpp: 4,
+        pixel_format: MTL_FORMAT_RGBA8_UNORM,
+    };
+    let tex = TextureBacking::Linear(t);
+    let src: Vec<u8> = (0..(row_bytes * row_count))
+        .map(|i| (i % 251) as u8)
+        .collect();
+    let allowed: std::collections::HashSet<u64> =
+        (0..pages).map(|p| (4 + p) << PAGE_SHIFT_ARM64E).collect();
+
+    let walks_before = store_route_count("blit_rect_linear_walk");
+    let rows_before = store_route_count("blit_rect_linear_rows_hoisted");
+    write_texture_rect(
+        &mut state,
+        &mut host,
+        1,
+        &tex,
+        Point { x: 0, y: 0, z: 0 },
+        row_bytes,
+        row_count,
+        &src,
+        Some(&allowed),
+    )
+    .expect("a fragmented rectangle inside the authorised pages must land");
+    assert_eq!(
+        store_route_count("blit_rect_linear_walk") - walks_before,
+        1,
+        "the rectangle must walk the page table once, not once per row"
+    );
+    assert_eq!(
+        store_route_count("blit_rect_linear_rows_hoisted") - rows_before,
+        row_count - 1,
+        "every row after the first is a page-table walk not paid"
+    );
+
+    let mut got = vec![0u8; (row_stride * row_count) as usize];
+    for p in 0..pages {
+        let at = (p * page) as usize;
+        host.read_gpa(
+            (4 + p) << PAGE_SHIFT_ARM64E,
+            &mut got[at..at + page as usize],
+        )
+        .expect("read the landed pages");
+    }
+    for y in 0..row_count {
+        let at = (y * row_stride) as usize;
+        assert_eq!(
+            &got[at..at + row_bytes as usize],
+            &src[(y * row_bytes) as usize..((y + 1) * row_bytes) as usize],
+            "row {y} must land at its own texel offset"
+        );
+        assert!(
+            got[at + row_bytes as usize..at + row_stride as usize]
+                .iter()
+                .all(|&b| b == 0xee),
+            "row {y}'s stride padding is not the copy's to write"
+        );
+    }
+
+    // And back, through the read direction's own single walk.
+    let reads_before = store_route_count("blit_rect_linear_read_walk");
+    let mut back = vec![0u8; (row_bytes * row_count) as usize];
+    read_texture_rect(
+        &mut state,
+        &mut host,
+        1,
+        &tex,
+        Point { x: 0, y: 0, z: 0 },
+        row_bytes,
+        row_count,
+        &mut back,
+    )
+    .expect("the same rectangle must read back");
+    assert_eq!(
+        store_route_count("blit_rect_linear_read_walk") - reads_before,
+        1,
+        "the read direction must walk once too"
+    );
+    assert_eq!(back, src, "the rectangle must round-trip byte for byte");
 }
 
 /// Geometry this device cannot measure must refuse the copy, never hand the
@@ -1493,8 +1706,7 @@ fn derived_slice_stride_2d() {
 fn copy_buffer_to_multilevel_view_l1() {
     use crate::runtime::decode::resource::{
         list_object_entry_offset, OBJECT_LIST_ENTRY_LEN, OBJECT_TYPE_TEXTURE, RESOURCE_PAGE_SHIFT,
-        TEXTURE_DESC_BASE_LEN, TEXTURE_DESC_DATA_OFFSET, TEXTURE_DESC_HEIGHT,
-        TEXTURE_DESC_LEVEL_RECORDS, TEXTURE_DESC_MIPMAP_LEVEL_COUNT,
+        TEXTURE_DESC_BASE_LEN, TEXTURE_DESC_HEIGHT, TEXTURE_DESC_LEVEL_RECORDS,
         TEXTURE_DESC_MIP_LEVEL_RECORD_LEN, TEXTURE_DESC_PIXEL_FORMAT, TEXTURE_DESC_ROW_STRIDE,
         TEXTURE_DESC_USED_SIZE, TEXTURE_DESC_WIDTH, TEXTURE_LEVEL_DEPTH, TEXTURE_LEVEL_HEIGHT,
         TEXTURE_LEVEL_OFFSET, TEXTURE_LEVEL_ROW_STRIDE, TEXTURE_LEVEL_SIZE, TEXTURE_LEVEL_WIDTH,
@@ -1509,8 +1721,13 @@ fn copy_buffer_to_multilevel_view_l1() {
     let mut desc = vec![0u8; body];
     st64(&mut desc[0..], 0x4000); // allocation
     st32(&mut desc[8..], handle);
-    st16(&mut desc[TEXTURE_DESC_MIPMAP_LEVEL_COUNT..], levels as u16);
-    st32(&mut desc[TEXTURE_DESC_DATA_OFFSET..], 0);
+    write_linear_texture_packing(
+        &mut desc,
+        levels as u16,
+        1,
+        40,
+        crate::runtime::decode::resource::TEXTURE_VIEW_MTL_TYPE_2D as u8,
+    );
     st32(&mut desc[TEXTURE_DESC_USED_SIZE..], 4 * 2 * 4); // L0
     st32(&mut desc[TEXTURE_DESC_ROW_STRIDE..], 16);
     st32(&mut desc[TEXTURE_DESC_WIDTH..], 4);
@@ -1585,8 +1802,8 @@ fn copy_buffer_to_multilevel_view_l1() {
 fn multilevel_view_relative_level_oob() {
     let (mut host, mut state) = blit_device();
     install_buffer(&mut host, &mut state, 1, 1, 64);
-    install_type11(&mut host, &mut state, 3, 9, 0x20);
-    // View over type-11 with level_count=1, level_base=0; command level 1 is OOB.
+    install_iosurface_texture(&mut host, &mut state, 3, 9, 0x20);
+    // View over IOSurface texture with level_count=1, level_base=0; command level 1 is OOB.
     install_type8_view(&mut host, &mut state, 8, 3, MTL_FORMAT_BGRA8_UNORM, 0, None);
     let mut cmd = copy_cmd(CopyKind::BufferToTexture, 1, 8);
     cmd.destination_level = 1; // relative 1 >= count 1
@@ -1600,6 +1817,52 @@ fn multilevel_view_relative_level_oob() {
         execute_blit(&mut state, &mut host, 1, &cmd),
         BlitStatus::Bounds
     );
+}
+
+#[test]
+fn empty_texture_view_ranges_are_not_invented_as_one() {
+    use crate::runtime::decode::resource::{
+        TEXTURE_VIEW_DESC_LEVEL_COUNT, TEXTURE_VIEW_DESC_SLICE_COUNT, TEXTURE_VIEW_MIN_RANGED,
+    };
+
+    let run = |level_count: u64, slice_count: u64| {
+        let (mut host, mut state) = blit_device();
+        install_buffer(&mut host, &mut state, 1, 1, 64);
+        install_iosurface_texture(&mut host, &mut state, 3, 9, 0x20);
+        install_type8_view(&mut host, &mut state, 8, 3, MTL_FORMAT_BGRA8_UNORM, 0, None);
+
+        let view_gva = 0x280u64 + 8 * 0x40;
+        let mut descriptor = vec![0u8; TEXTURE_VIEW_MIN_RANGED];
+        assert!(gva_mem::read_task_gva(
+            &host,
+            &state.tasks[1],
+            view_gva,
+            &mut descriptor,
+            PAGE_SHIFT_ARM64E,
+        )
+        .is_ok());
+        st64(
+            &mut descriptor[TEXTURE_VIEW_DESC_LEVEL_COUNT..],
+            level_count,
+        );
+        st64(
+            &mut descriptor[TEXTURE_VIEW_DESC_SLICE_COUNT..],
+            slice_count,
+        );
+        write_task_gva_arm64e(&mut host, &state.tasks[1], view_gva, &descriptor);
+
+        let mut command = copy_cmd(CopyKind::BufferToTexture, 1, 8);
+        command.source_bytes_per_row = 4;
+        command.source_size = Size {
+            width: 1,
+            height: 1,
+            depth: 1,
+        };
+        execute_blit(&mut state, &mut host, 1, &command)
+    };
+
+    assert_eq!(run(0, 1), BlitStatus::Bounds);
+    assert_eq!(run(1, 0), BlitStatus::Bounds);
 }
 
 #[test]
@@ -1669,26 +1932,52 @@ fn slice_level_zero_counts_are_noop() {
 /// Install a simple type-2 RGBA8 texture (single level, handle → GVA).
 fn install_linear_rgba(
     host: &mut FakeHost,
-    state: &mut DeviceState,
+    state: &mut Device,
     obj_ref: u32,
     handle: u32,
     width: u32,
     height: u32,
     row_stride: u32,
 ) {
+    install_linear_rgba_with_shape(
+        host,
+        state,
+        obj_ref,
+        handle,
+        width,
+        height,
+        row_stride,
+        crate::runtime::decode::resource::TEXTURE_VIEW_MTL_TYPE_2D as u8,
+        1,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn install_linear_rgba_with_shape(
+    host: &mut FakeHost,
+    state: &mut Device,
+    obj_ref: u32,
+    handle: u32,
+    width: u32,
+    height: u32,
+    row_stride: u32,
+    texture_type: u8,
+    slices: u16,
+) {
     use crate::runtime::decode::resource::{
         list_object_entry_offset, OBJECT_LIST_ENTRY_LEN, OBJECT_TYPE_TEXTURE, RESOURCE_PAGE_SHIFT,
-        TEXTURE_DESC_BASE_LEN, TEXTURE_DESC_DATA_OFFSET, TEXTURE_DESC_HEIGHT,
-        TEXTURE_DESC_MIPMAP_LEVEL_COUNT, TEXTURE_DESC_PIXEL_FORMAT, TEXTURE_DESC_ROW_STRIDE,
-        TEXTURE_DESC_USED_SIZE, TEXTURE_DESC_WIDTH,
+        TEXTURE_DESC_BASE_LEN, TEXTURE_DESC_HEIGHT, TEXTURE_DESC_PIXEL_FORMAT,
+        TEXTURE_DESC_ROW_STRIDE, TEXTURE_DESC_USED_SIZE, TEXTURE_DESC_WIDTH,
     };
     let _ = RESOURCE_PAGE_SHIFT;
     let mut desc = vec![0u8; TEXTURE_DESC_BASE_LEN];
     let size = (row_stride as u64) * (height as u64);
-    st64(&mut desc[0..], size.max(0x1000));
+    st64(
+        &mut desc[0..],
+        size.saturating_mul(u64::from(slices)).max(0x1000),
+    );
     st32(&mut desc[8..], handle);
-    st16(&mut desc[TEXTURE_DESC_MIPMAP_LEVEL_COUNT..], 1);
-    st32(&mut desc[TEXTURE_DESC_DATA_OFFSET..], 0);
+    write_linear_texture_packing(&mut desc, 1, slices, size, texture_type);
     st32(&mut desc[TEXTURE_DESC_USED_SIZE..], size as u32);
     st32(&mut desc[TEXTURE_DESC_ROW_STRIDE..], row_stride);
     st32(&mut desc[TEXTURE_DESC_WIDTH..], width);
@@ -1720,31 +2009,37 @@ fn install_linear_rgba(
 /// the pages held before the pass — zeros for a freshly allocated one.
 ///
 /// The ledger is what this can assert on both backend arms: `pay_gva` itself is
-/// `backend-vulkan`-only, but `take_gva` is not, so a resolve that named the debt
+/// Vulkan-executor-only, but `take_gva` is not, so a resolve that named the debt
 /// leaves the ledger empty and a resolve that did not leaves it holding one.
 #[test]
 fn a_blit_endpoint_lands_the_writeback_its_texture_still_owes() {
-    use crate::runtime::writeback_debt::{GvaResourceKey, GvaWritebackDebt};
+    use crate::runtime::writeback_debt::GvaWritebackDebt;
 
     const STRIDE: u32 = 64;
     let (mut host, mut state) = blit_device();
     install_linear_rgba(&mut host, &mut state, 2, 2, 16, 8, STRIDE);
+    crate::runtime::objects::resolve_resource(&state, &host, 1, 2)
+        .expect("installed texture resolves");
 
-    let key = GvaResourceKey {
-        task_id: 1,
-        texture_ref: 2,
-    };
-    let guest_write = state.buffer_write_gen.stamp(key.task_id, key.texture_ref);
+    let key = crate::runtime::writeback_debt::resource_key(&state, 1, 2)
+        .expect("installed texture has a canonical identity");
+    let guest_write = state.resource_write_stamp_for(key.resource).unwrap();
     assert_eq!(
-        state.pending_writebacks.arm_gva(
+        state.content.pending_writebacks.arm_gva(
             key,
             GvaWritebackDebt {
-                gva: 0x4000,
-                row_stride: STRIDE,
+                linear: crate::runtime::draw::LinearColorTarget {
+                    allocation_gva: 0x4000,
+                    allocation_size: u64::from(STRIDE) * 8,
+                    plane_offset: 0,
+                    row_stride: STRIDE,
+                },
                 width: 16,
                 height: 8,
                 format: MTL_FORMAT_RGBA8_UNORM,
+                resident_layout: reims_vgpu_core::pixel_format::TexelLayout::Rgba8,
                 generation: 3,
+                content: None,
                 guest_write,
                 seq: 0,
             },
@@ -1752,7 +2047,7 @@ fn a_blit_endpoint_lands_the_writeback_its_texture_still_owes() {
         None,
         "the resource owes exactly one frame going in"
     );
-    assert!(state.pending_writebacks.has_gva(key));
+    assert!(state.content.pending_writebacks.has_gva(key));
 
     let backing = resolve_texture_backing(&mut state, &mut host, 1, 2, 0, 0)
         .expect("a linear RGBA8 texture resolves as a blit endpoint");
@@ -1761,7 +2056,11 @@ fn a_blit_endpoint_lands_the_writeback_its_texture_still_owes() {
         "this is the private-texture rung, not a surface"
     );
     assert!(
-        !state.pending_writebacks.has_gva(key),
+        state.task_objects.resources.content_stamp(1, 2).is_some(),
+        "a resolved texture endpoint must publish a canonical resource identity"
+    );
+    assert!(
+        !state.content.pending_writebacks.has_gva(key),
         "resolving a blit endpoint must land what the texture owed, not read around it"
     );
 }
@@ -1769,36 +2068,37 @@ fn a_blit_endpoint_lands_the_writeback_its_texture_still_owes() {
 /// Overwrite an installed texture descriptor's `allocation_size` in place.
 /// The `install_linear_*` helpers floor it at 0x1000, and a bounds test
 /// needs an allocation sized to the image and nothing more.
-fn set_installed_allocation_size(
-    host: &mut FakeHost,
-    state: &DeviceState,
-    obj_ref: u32,
-    alloc: u64,
-) {
+fn set_installed_allocation_size(host: &mut FakeHost, state: &Device, obj_ref: u32, alloc: u64) {
     let desc_gva = 0x200u64 + (obj_ref as u64) * 0x80;
     write_task_gva_arm64e(host, &state.tasks[1], desc_gva, &alloc.to_le_bytes());
 }
 
-/// The array-slice form of the corner-mask bounds defect: the selected
-/// slice was charged a whole `row_stride * height` stride, so an allocation
-/// the guest sized for exactly two padded slices was refused for trailing
-/// padding that `texel_offset` never reaches.
+/// An array endpoint takes its slice spacing from the allocation descriptor,
+/// while the selected slice's read remains bounded to the texels it touches.
 #[test]
-fn a_last_array_slice_is_not_charged_for_its_trailing_row_padding() {
+fn an_array_slice_uses_the_declared_full_chain_pitch() {
     // 4x2 RGBA8: tight rows are 16 B, the guest pads to 24, so one slice
     // spans 48 B and the bytes read of a slice end at 24 + 16 = 40.
     const STRIDE: u32 = 24;
-    const TIGHT: u64 = 4 * 4;
     const ONE_SLICE: u64 = STRIDE as u64 * 2;
-    const READ: u64 = STRIDE as u64 + TIGHT;
-    const EXACT: u64 = ONE_SLICE + READ;
+    const EXACT: u64 = ONE_SLICE * 2;
 
     let (mut host, mut state) = blit_device();
-    install_linear_rgba(&mut host, &mut state, 2, 2, 4, 2, STRIDE);
+    install_linear_rgba_with_shape(
+        &mut host,
+        &mut state,
+        2,
+        2,
+        4,
+        2,
+        STRIDE,
+        crate::runtime::decode::resource::TEXTURE_VIEW_MTL_TYPE_2D_ARRAY as u8,
+        2,
+    );
     set_installed_allocation_size(&mut host, &state, 2, EXACT);
 
     let backing = resolve_texture_backing(&mut state, &mut host, 1, 2, 0, 1)
-        .expect("slice 1 fits an allocation sized for exactly two slices");
+        .expect("slice 1 fits the explicitly declared two-slice allocation");
     let stride = match backing {
         TextureBacking::Linear(t) => {
             assert_eq!(t.slice_stride, ONE_SLICE, "slices stay a full stride apart");
@@ -1811,20 +2111,18 @@ fn a_last_array_slice_is_not_charged_for_its_trailing_row_padding() {
             assert!(t.texel_offset(3, 1, 0).unwrap() + 4 <= EXACT);
             t.slice_stride
         }
-        TextureBacking::Type11(_) => panic!("linear texture resolved as type-11"),
+        TextureBacking::Surface(_) => panic!("linear texture resolved as IOSurface texture"),
     };
 
-    // The bound this replaced charged a second whole stride and refused this
-    // allocation, so the regression is visible here rather than only on a
-    // live guest.
-    assert!(
-        ONE_SLICE + stride > EXACT,
-        "the stride form must overcount, or this case proves nothing"
-    );
+    assert_eq!(ONE_SLICE + stride, EXACT);
+    // Descriptor bytes belong to the constructed resource lifetime. Retire
+    // that lifetime before publishing the deliberately shorter replacement;
+    // mutating a retained descriptor in place is not a guest operation.
+    assert!(state.task_objects.resources.delete(1, 2));
     set_installed_allocation_size(&mut host, &state, 2, EXACT - 1);
     match resolve_texture_backing(&mut state, &mut host, 1, 2, 0, 1) {
-        Err(st) => assert_eq!(st, BlitStatus::Bounds),
-        Ok(_) => panic!("one byte short of the read extent must still be refused"),
+        Err(st) => assert_eq!(st, BlitStatus::Unsupported),
+        Ok(_) => panic!("an allocation shorter than its declared packing must be refused"),
     }
 }
 
@@ -1866,7 +2164,7 @@ fn whole_surface_0x13e_single_level_copy() {
     assert_eq!(&back[16..32], &pat[16..32]);
 }
 
-/// A type-11 whole-surface `0x13e` moves every row, in order.
+/// An IOSurface texture whole-surface `0x13e` moves every row, in order.
 ///
 /// This arm stages the slice whole rather than a row at a time, because a
 /// per-row call into the mapping rail re-pays that rail's per-*rect* costs —
@@ -1882,10 +2180,10 @@ fn whole_surface_0x13e_single_level_copy() {
 /// buffer entire — a whole-buffer compare of a uniform fill would pass on a
 /// copy that wrote row 0 twice.
 #[test]
-fn a_type11_whole_surface_copy_lands_every_row_in_order() {
+fn a_iosurface_texture_whole_surface_copy_lands_every_row_in_order() {
     let (mut host, mut state) = blit_device();
-    install_type11(&mut host, &mut state, 2, 20, 0x40);
-    install_type11(&mut host, &mut state, 3, 21, 0x50);
+    install_iosurface_texture(&mut host, &mut state, 2, 20, 0x40);
+    install_iosurface_texture(&mut host, &mut state, 3, 21, 0x50);
 
     // 2×2 BGRA: two rows of 8 bytes, each row its own byte value.
     let src_pixels: [u8; 16] = [
@@ -1912,7 +2210,7 @@ fn a_type11_whole_surface_copy_lands_every_row_in_order() {
     assert_eq!(
         execute_blit(&mut state, &mut host, 1, &cmd),
         BlitStatus::Ok,
-        "a type-11 to type-11 whole-surface copy must execute"
+        "an IOSurface texture to IOSurface texture whole-surface copy must execute"
     );
 
     let mut back = [0u8; 16];
@@ -1968,11 +2266,6 @@ fn t2t_identity_self_copy_is_noop_ok() {
         gva_mem::read_task_gva(&host, &state.tasks[1], gva, &mut back, PAGE_SHIFT_ARM64E).is_ok()
     );
     assert_eq!(back, pat, "identity self-copy left the bytes unchanged");
-    // No overlap enrichment line was emitted (it's not a genuine overlap).
-    assert!(
-        note_t2t_overlap(1, 2, 2, 0, 0, 16, 16, 2, 1),
-        "identity path must not have consumed the overlap dedup slot"
-    );
 }
 
 /// Regression guard for the strided-column false positive: a self-copy of a
@@ -2017,22 +2310,18 @@ fn t2t_shifted_column_self_copy_moves_bytes() {
         let dst_texel = &back[r * 16 + 8..r * 16 + 12];
         assert_eq!(dst_texel, src_texel, "row {r} column x=2 holds moved src");
     }
-    // No overlap enrichment (this is not a genuine overlap).
-    assert!(
-        note_t2t_overlap(9, 2, 2, 0, 8, 4, 16, 4, 1),
-        "shifted-column path must not have consumed the overlap dedup slot"
-    );
 }
 
-/// Regression guard: a GENUINELY overlapping self-copy (src rect x[0,2),
-/// dst rect x[1,3) — overlap on x) is undefined in Metal and must still be
-/// rejected as Overlap, with the enrichment line emitted for diagnosis.
+/// An overlapping same-texture region is admitted by the serialized copy
+/// contract. Snapshot the whole source before the first destination write so
+/// the traversal direction cannot change the bytes copied.
 #[test]
-fn t2t_overlapping_self_copy_still_rejected() {
+fn t2t_overlapping_self_copy_stages_the_source_region() {
     let (mut host, mut state) = blit_device();
-    // Unique ref (4) so the (task,src,dst) enrichment key is globally
-    // distinct from the identity/shifted tests' probes.
     install_linear_rgba(&mut host, &mut state, 4, 4, 4, 4, 16);
+    let gva = 4u64 << RESOURCE_PAGE_SHIFT;
+    let pat: Vec<u8> = (0..64).map(|i| i as u8).collect();
+    write_task_gva_arm64e(&mut host, &state.tasks[1], gva, &pat);
     let mut cmd = copy_cmd(CopyKind::TextureToTexture, 4, 4);
     cmd.destination_origin.x = 1; // src x[0,2), dst x[1,3) overlap at x=1
     cmd.source_size = Size {
@@ -2040,24 +2329,65 @@ fn t2t_overlapping_self_copy_still_rejected() {
         height: 4,
         depth: 1,
     };
-    assert_eq!(
-        execute_blit(&mut state, &mut host, 1, &cmd),
-        BlitStatus::Overlap,
-        "genuinely overlapping self-copy must be rejected"
-    );
-    // The enrichment slot WAS consumed (a real overlap was logged).
-    assert!(
-        !note_t2t_overlap(1, 4, 4, 0, 4, 8, 16, 4, 1),
-        "the reject path must have logged the overlap enrichment once"
-    );
+    assert_eq!(execute_blit(&mut state, &mut host, 1, &cmd), BlitStatus::Ok);
+    let mut back = vec![0u8; 64];
+    gva_mem::read_task_gva(&host, &state.tasks[1], gva, &mut back, PAGE_SHIFT_ARM64E)
+        .expect("copied texture remains readable");
+    for row in 0..4usize {
+        assert_eq!(
+            &back[row * 16 + 4..row * 16 + 12],
+            &pat[row * 16..row * 16 + 8],
+            "row {row} came from the pre-copy source"
+        );
+    }
+}
+
+/// The strided vertical overlap emitted by the UI workload: eighteen one-pixel
+/// rows move down twelve rows in one texture. Rows 12..17 are both source and
+/// destination, so staging a row at a time would feed written pixels back into
+/// the tail of the copy.
+#[test]
+fn t2t_vertical_overlap_reads_every_source_row_before_writing() {
+    const WIDTH: u32 = 256;
+    const HEIGHT: u32 = 30;
+    const STRIDE: u32 = WIDTH * 4;
+    let (mut host, mut state) = blit_device();
+    install_linear_rgba(&mut host, &mut state, 5, 5, WIDTH, HEIGHT, STRIDE);
+    let gva = 5u64 << RESOURCE_PAGE_SHIFT;
+    let mut pat = vec![0u8; STRIDE as usize * HEIGHT as usize];
+    for row in 0..HEIGHT as usize {
+        pat[row * STRIDE as usize..row * STRIDE as usize + 4]
+            .copy_from_slice(&(row as u32).to_le_bytes());
+    }
+    write_task_gva_arm64e(&mut host, &state.tasks[1], gva, &pat);
+
+    let mut cmd = copy_cmd(CopyKind::TextureToTexture, 5, 5);
+    cmd.destination_origin.y = 12;
+    cmd.source_size = Size {
+        width: 1,
+        height: 18,
+        depth: 1,
+    };
+    assert_eq!(execute_blit(&mut state, &mut host, 1, &cmd), BlitStatus::Ok);
+
+    let mut back = vec![0u8; pat.len()];
+    gva_mem::read_task_gva(&host, &state.tasks[1], gva, &mut back, PAGE_SHIFT_ARM64E)
+        .expect("copied texture remains readable");
+    for source_row in 0..18usize {
+        let destination_row = source_row + 12;
+        assert_eq!(
+            &back[destination_row * STRIDE as usize..destination_row * STRIDE as usize + 4],
+            &pat[source_row * STRIDE as usize..source_row * STRIDE as usize + 4],
+            "destination row {destination_row} came from the pre-copy source row {source_row}"
+        );
+    }
 }
 
 #[test]
 fn whole_surface_0x13e_two_levels() {
     use crate::runtime::decode::resource::{
         list_object_entry_offset, OBJECT_LIST_ENTRY_LEN, OBJECT_TYPE_TEXTURE, RESOURCE_PAGE_SHIFT,
-        TEXTURE_DESC_BASE_LEN, TEXTURE_DESC_DATA_OFFSET, TEXTURE_DESC_HEIGHT,
-        TEXTURE_DESC_LEVEL_RECORDS, TEXTURE_DESC_MIPMAP_LEVEL_COUNT,
+        TEXTURE_DESC_BASE_LEN, TEXTURE_DESC_HEIGHT, TEXTURE_DESC_LEVEL_RECORDS,
         TEXTURE_DESC_MIP_LEVEL_RECORD_LEN, TEXTURE_DESC_PIXEL_FORMAT, TEXTURE_DESC_ROW_STRIDE,
         TEXTURE_DESC_USED_SIZE, TEXTURE_DESC_WIDTH, TEXTURE_LEVEL_DEPTH, TEXTURE_LEVEL_HEIGHT,
         TEXTURE_LEVEL_OFFSET, TEXTURE_LEVEL_ROW_STRIDE, TEXTURE_LEVEL_SIZE, TEXTURE_LEVEL_WIDTH,
@@ -2070,8 +2400,13 @@ fn whole_surface_0x13e_two_levels() {
         let mut desc = vec![0u8; body];
         st64(&mut desc[0..], 0x4000);
         st32(&mut desc[8..], handle);
-        st16(&mut desc[TEXTURE_DESC_MIPMAP_LEVEL_COUNT..], 2);
-        st32(&mut desc[TEXTURE_DESC_DATA_OFFSET..], 0);
+        write_linear_texture_packing(
+            &mut desc,
+            2,
+            1,
+            40,
+            crate::runtime::decode::resource::TEXTURE_VIEW_MTL_TYPE_2D as u8,
+        );
         st32(&mut desc[TEXTURE_DESC_USED_SIZE..], 32);
         st32(&mut desc[TEXTURE_DESC_ROW_STRIDE..], 16);
         st32(&mut desc[TEXTURE_DESC_WIDTH..], 4);
@@ -2135,7 +2470,7 @@ fn whole_surface_0x13e_two_levels() {
 /// Install type-2 RGBA8 volume (single level, depth>1) at `handle<<14`.
 fn install_linear_rgba_volume(
     host: &mut FakeHost,
-    state: &mut DeviceState,
+    state: &mut Device,
     obj_ref: u32,
     handle: u32,
     width: u32,
@@ -2145,9 +2480,8 @@ fn install_linear_rgba_volume(
 ) {
     use crate::runtime::decode::resource::{
         list_object_entry_offset, OBJECT_LIST_ENTRY_LEN, OBJECT_TYPE_TEXTURE, RESOURCE_PAGE_SHIFT,
-        TEXTURE_DESC_BASE_LEN, TEXTURE_DESC_DATA_OFFSET, TEXTURE_DESC_DEPTH, TEXTURE_DESC_HEIGHT,
-        TEXTURE_DESC_MIPMAP_LEVEL_COUNT, TEXTURE_DESC_PIXEL_FORMAT, TEXTURE_DESC_ROW_STRIDE,
-        TEXTURE_DESC_USED_SIZE, TEXTURE_DESC_WIDTH,
+        TEXTURE_DESC_BASE_LEN, TEXTURE_DESC_DEPTH, TEXTURE_DESC_HEIGHT, TEXTURE_DESC_PIXEL_FORMAT,
+        TEXTURE_DESC_ROW_STRIDE, TEXTURE_DESC_USED_SIZE, TEXTURE_DESC_WIDTH,
     };
     let _ = RESOURCE_PAGE_SHIFT;
     let mut desc = vec![0u8; TEXTURE_DESC_BASE_LEN];
@@ -2155,8 +2489,13 @@ fn install_linear_rgba_volume(
     let size = plane * (depth as u64);
     st64(&mut desc[0..], size.max(0x1000));
     st32(&mut desc[8..], handle);
-    st16(&mut desc[TEXTURE_DESC_MIPMAP_LEVEL_COUNT..], 1);
-    st32(&mut desc[TEXTURE_DESC_DATA_OFFSET..], 0);
+    write_linear_texture_packing(
+        &mut desc,
+        1,
+        1,
+        size,
+        crate::runtime::decode::resource::TEXTURE_VIEW_MTL_TYPE_3D as u8,
+    );
     st32(&mut desc[TEXTURE_DESC_USED_SIZE..], size as u32);
     st32(&mut desc[TEXTURE_DESC_ROW_STRIDE..], row_stride);
     st32(&mut desc[TEXTURE_DESC_WIDTH..], width);
@@ -2243,18 +2582,16 @@ fn whole_surface_0x13e_volume_rejects_nonzero_slice() {
 
 #[test]
 fn blit_fence_update_then_wait() {
-    use crate::model::FENCE_DOMAIN_BLIT;
-
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut upd = Command::default();
     upd.kind = Kind::Fence;
     upd.opcode = wire_blit::OPCODE_UPDATE_FENCE;
     upd.fence = 7;
     assert_eq!(execute_blit_fence(&mut state, 1, &upd), BlitStatus::Ok);
-    assert_eq!(state.fence_generation(1, FENCE_DOMAIN_BLIT, 7), Some(1));
+    assert_eq!(state.fence_generation(1, 7), Some(1));
     // Second update advances generation.
     assert_eq!(execute_blit_fence(&mut state, 1, &upd), BlitStatus::Ok);
-    assert_eq!(state.fence_generation(1, FENCE_DOMAIN_BLIT, 7), Some(2));
+    assert_eq!(state.fence_generation(1, 7), Some(2));
     let mut wait = Command::default();
     wait.kind = Kind::Fence;
     wait.opcode = wire_blit::OPCODE_WAIT_FOR_FENCE;
@@ -2264,7 +2601,7 @@ fn blit_fence_update_then_wait() {
 
 #[test]
 fn blit_fence_wait_pending_without_update() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut wait = Command::default();
     wait.kind = Kind::Fence;
     wait.opcode = wire_blit::OPCODE_WAIT_FOR_FENCE;
@@ -2273,12 +2610,12 @@ fn blit_fence_wait_pending_without_update() {
         execute_blit_fence(&mut state, 1, &wait),
         BlitStatus::FencePending
     );
-    assert!(state.fence_generation(1, FENCE_DOMAIN_BLIT, 3).is_none());
+    assert!(state.fence_generation(1, 3).is_none());
 }
 
 #[test]
 fn blit_fence_zero_ref_fails() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut upd = Command::default();
     upd.kind = Kind::Fence;
     upd.opcode = wire_blit::OPCODE_UPDATE_FENCE;
@@ -2298,12 +2635,12 @@ fn blit_fence_zero_ref_fails() {
 /// result; this locks the extent/stride/aspect-flag contract directly.
 #[test]
 fn blit_geometry_helpers_clamp_bpp_and_aspect() {
-    use crate::contract::pixel_format::{
-        MTL_FORMAT_A8_UNORM, MTL_FORMAT_DEPTH32_FLOAT_STENCIL8, MTL_FORMAT_RGBA16_FLOAT,
-    };
     use crate::runtime::decode::blit::{
         MTL_BLIT_OPTION_DEPTH_FROM_DEPTH_STENCIL, MTL_BLIT_OPTION_NONE,
         MTL_BLIT_OPTION_STENCIL_FROM_DEPTH_STENCIL,
+    };
+    use reims_vgpu_core::pixel_format::{
+        MTL_FORMAT_A8_UNORM, MTL_FORMAT_DEPTH32_FLOAT_STENCIL8, MTL_FORMAT_RGBA16_FLOAT,
     };
 
     // copy_extent: zero stays a no-op extent; in-range and exactly-max pass
@@ -2329,7 +2666,11 @@ fn blit_geometry_helpers_clamp_bpp_and_aspect() {
         None,
         "one past the edge refuses; it used to return 100 and copy less"
     );
-    assert_eq!(copy_extent("t", "w", 150, 100), None, "and so does far past");
+    assert_eq!(
+        copy_extent("t", "w", 150, 100),
+        None,
+        "and so does far past"
+    );
 
     // texture_storage_bpp: full-texel storage size per format; unknown fails.
     assert_eq!(texture_storage_bpp(MTL_FORMAT_BGRA8_UNORM), Ok(4));
@@ -2384,45 +2725,16 @@ fn blit_geometry_helpers_clamp_bpp_and_aspect() {
 fn tex_wrong_type_enrichment_dedups_per_ref_and_type() {
     reset_tex_wrong_type_dedup_for_test();
     // First sighting of a (task, ref, type) emits; repeats are deduped.
-    assert!(note_tex_wrong_type(7, 0x40, OBJECT_TYPE_BUFFER, 0, 0));
+    assert!(note_tex_wrong_type(7, 0x40, ObjectKind::Buffer, 0, 0));
     for _ in 0..20 {
-        assert!(!note_tex_wrong_type(7, 0x40, OBJECT_TYPE_BUFFER, 0, 0));
+        assert!(!note_tex_wrong_type(7, 0x40, ObjectKind::Buffer, 0, 0));
     }
     // A different ref is a distinct failure -> reports once.
-    assert!(note_tex_wrong_type(7, 0x41, OBJECT_TYPE_BUFFER, 0, 0));
+    assert!(note_tex_wrong_type(7, 0x41, ObjectKind::Buffer, 0, 0));
     // Same ref but a different actual object_type also reports (the type is
     // the diagnostic field, so a type change must not be masked).
-    assert!(note_tex_wrong_type(
-        7,
-        0x40,
-        crate::runtime::decode::resource::OBJECT_TYPE_FUNCTION,
-        0,
-        0
-    ));
-    assert!(!note_tex_wrong_type(
-        7,
-        0x40,
-        crate::runtime::decode::resource::OBJECT_TYPE_FUNCTION,
-        0,
-        0
-    ));
-}
-
-/// Regression guard: the `t2t_overlap` enrichment dedups per
-/// `(task, src_ref, dst_ref)` — a self-overlapping copy re-issued every
-/// frame must not flood — while a distinct src/dst pair reports once so a
-/// genuine drop stays diagnosable.
-#[test]
-fn t2t_overlap_enrichment_dedups_per_pair() {
-    // Unique task namespace (3) so the process-global dedup set never
-    // collides with other tests; the set starts empty so first-insert is
-    // deterministic without a reset.
-    assert!(note_t2t_overlap(3, 0x10, 0x10, 0, 4096, 256, 1024, 8, 1));
-    for _ in 0..20 {
-        assert!(!note_t2t_overlap(3, 0x10, 0x10, 0, 4096, 256, 1024, 8, 1));
-    }
-    // A distinct destination ref is a distinct failure -> reports once.
-    assert!(note_t2t_overlap(3, 0x10, 0x11, 0, 4096, 256, 1024, 8, 1));
+    assert!(note_tex_wrong_type(7, 0x40, ObjectKind::Function, 0, 0));
+    assert!(!note_tex_wrong_type(7, 0x40, ObjectKind::Function, 0, 0));
 }
 
 /// The precondition the `repack_storage_assumed` enrichment exists for.
@@ -2513,7 +2825,7 @@ fn copy_region_io_enrichment_dedups_per_page_and_direction() {
 /// only pinned this arm at eight would pass again the moment the other one
 /// moved, which is the failure that produced the divergence in the first place.
 ///
-/// The chain runs `MAX_TEXTURE_VIEW_CHAIN` views down to a type-11 base, each
+/// The chain runs `MAX_TEXTURE_VIEW_CHAIN` views down to an IOSurface texture base, each
 /// view a plain identity hop, so the only thing that can refuse it is depth.
 #[test]
 fn a_copy_follows_a_view_chain_as_deep_as_a_sample_does() {
@@ -2522,10 +2834,10 @@ fn a_copy_follows_a_view_chain_as_deep_as_a_sample_does() {
     let (mut host, mut state) = blit_device();
     install_buffer(&mut host, &mut state, 1, 1, 256);
     let mapping_id = 9u32;
-    install_type11(&mut host, &mut state, 3, mapping_id, 0x20);
+    install_iosurface_texture(&mut host, &mut state, 3, mapping_id, 0x20);
 
     // Views live at refs `outermost` down to `base_view`, each viewing the next
-    // lower ref; the lowest views the type-11 at ref 3. The object list holds
+    // lower ref; the lowest views the IOSurface texture at ref 3. The object list holds
     // 16 entries, so the deepest legal chain has to fit under that.
     let base_view = 4u32;
     let outermost = base_view + MAX_TEXTURE_VIEW_CHAIN as u32 - 1;
@@ -2552,7 +2864,7 @@ fn a_copy_follows_a_view_chain_as_deep_as_a_sample_does() {
         .expect("the sample arm follows the contract's deepest chain");
     assert_eq!(
         resolved.base_texture_ref, 3,
-        "the sample arm must land on the type-11 base, not stop inside the chain"
+        "the sample arm must land on the IOSurface texture base, not stop inside the chain"
     );
 
     // The copy arm must reach the same base, and land real pixels through it.
@@ -2592,6 +2904,77 @@ fn a_copy_follows_a_view_chain_as_deep_as_a_sample_does() {
     );
 }
 
+/// Nested native views are constructed on their immediate base view, so the
+/// resolver must preserve the inner mip offset, format, and channel mapping.
+#[test]
+fn nested_sample_views_compose_instead_of_skipping_inner_descriptors() {
+    use crate::runtime::draw::resolve_texture_view_reasoned;
+
+    let (mut host, mut state) = blit_device();
+    install_buffer(&mut host, &mut state, 1, 1, 256);
+    install_iosurface_texture(&mut host, &mut state, 3, 9, 0x20);
+
+    let inner_raw = [4, 3, 2, 5];
+    let outer_raw = [5, 2, 3, 4];
+    install_type8_view(
+        &mut host,
+        &mut state,
+        4,
+        3,
+        MTL_FORMAT_BGRA8_UNORM,
+        2,
+        Some(inner_raw),
+    );
+    install_type8_view(&mut host, &mut state, 5, 4, 0, 0, Some(outer_raw));
+
+    let resolved = resolve_texture_view_reasoned(&state, &host, 1, 5)
+        .expect("the nested one-level view contract is exactly representable");
+    assert_eq!(resolved.base_texture_ref, 3);
+    assert_eq!(
+        resolved.range,
+        Some(crate::runtime::draw::TextureViewRange {
+            level_base: 2,
+            level_count: 1,
+            slice_base: 0,
+            slice_count: 1,
+        }),
+        "the inner mip range was discarded"
+    );
+    assert_eq!(
+        resolved.texture_type,
+        Some(crate::runtime::decode::resource::TEXTURE_VIEW_MTL_TYPE_2D),
+        "the resolved view must retain its declared output type"
+    );
+    assert_eq!(resolved.pixel_format, Some(MTL_FORMAT_BGRA8_UNORM));
+    let inner = pixel_format::swizzle_plan(&inner_raw).unwrap();
+    let outer = pixel_format::swizzle_plan(&outer_raw).unwrap();
+    assert_eq!(resolved.swizzle, Some(outer.after(&inner)));
+}
+
+/// A one-level inner view cannot be viewed at relative level one. Flattening
+/// both bases by addition would turn a native construction failure into a
+/// different, apparently valid base mip.
+#[test]
+fn nested_sample_view_refuses_a_level_outside_the_inner_view() {
+    use crate::runtime::draw::{resolve_texture_view_reasoned, TextureViewDecline};
+
+    let (mut host, mut state) = blit_device();
+    install_buffer(&mut host, &mut state, 1, 1, 256);
+    install_iosurface_texture(&mut host, &mut state, 3, 9, 0x20);
+    install_type8_view(&mut host, &mut state, 4, 3, MTL_FORMAT_BGRA8_UNORM, 2, None);
+    install_type8_view(&mut host, &mut state, 5, 4, 0, 1, None);
+
+    assert_eq!(
+        resolve_texture_view_reasoned(&state, &host, 1, 5),
+        Err(TextureViewDecline::ChainLevelOutOfRange {
+            texture_ref: 4,
+            outer_base: 1,
+            outer_count: 1,
+            inner_count: 1,
+        })
+    );
+}
+
 /// ...and both refuse the same chain one hop past the contract.
 ///
 /// The companion to the test above, and it is not redundant with it. Agreement
@@ -2609,7 +2992,7 @@ fn a_copy_refuses_a_view_chain_the_sample_arm_also_refuses() {
 
     let (mut host, mut state) = blit_device();
     install_buffer(&mut host, &mut state, 1, 1, 256);
-    install_type11(&mut host, &mut state, 3, 9, 0x20);
+    install_iosurface_texture(&mut host, &mut state, 3, 9, 0x20);
 
     let base_view = 4u32;
     let outermost = base_view + MAX_TEXTURE_VIEW_CHAIN as u32; // one view too many
@@ -2695,7 +3078,7 @@ fn the_gpu_whole_plane_arm_refuses_before_it_resolves_anything() {
 /// The GPU whole-plane arm's destination half, and specifically the plane check.
 ///
 /// `write_bgra8_from_resident_gpu` resolves the plane itself, from the mapping's
-/// declaration, and takes no plane index. A type-5 view carries one on the wire
+/// declaration, and takes no plane index. A IOSurface plane view view carries one on the wire
 /// and can therefore name a plane at a `surface_offset` that scan does not reach.
 /// Landing a frame there is silent at every layer — the pixels appear in the next
 /// plane of the same IOSurface — so the disagreement has to refuse before the
@@ -2728,7 +3111,7 @@ fn the_gpu_whole_plane_arm_refuses_a_plane_the_rail_would_not_write() {
     );
     assert_eq!(
         gpu_whole_plane_destination(None, Some(window), src),
-        Err(DstNotType11),
+        Err(DstNotIOSurface),
         "a linear allocation has no mapping for the rail to name"
     );
     assert_eq!(
@@ -2737,7 +3120,7 @@ fn the_gpu_whole_plane_arm_refuses_a_plane_the_rail_would_not_write() {
         "a mapping that declines the extent has no window to write"
     );
 
-    // The type-5 plane hazard: the guest's descriptor names the second plane of a
+    // The IOSurface plane view plane hazard: the guest's descriptor names the second plane of a
     // biplanar surface, the mapping's own geometry scan resolves the first.
     let second_plane = GpuPlane {
         surface_offset: 0x8000,
@@ -2813,7 +3196,7 @@ fn the_gpu_whole_plane_arm_refuses_a_plane_the_rail_would_not_write() {
 /// is what the assertions below pin.
 #[test]
 fn the_gpu_whole_plane_arm_compares_stored_texels_and_not_transfer_functions() {
-    use crate::contract::pixel_format::{
+    use reims_vgpu_core::pixel_format::{
         MTL_FORMAT_BGRA8_UNORM_SRGB, MTL_FORMAT_R32_FLOAT, MTL_FORMAT_RGBA8_UNORM_SRGB,
     };
     use GpuPlaneRefusal::*;
@@ -2894,5 +3277,126 @@ fn the_gpu_whole_plane_arm_compares_stored_texels_and_not_transfer_functions() {
         ),
         Err(FormatDiffers),
         "three agreeing formats with no stored-texel layout are still not a byte copy"
+    );
+}
+
+/// The GPU arm for a whole-plane IOSurface texture source going to a guest-linear
+/// destination, decided from the two endpoints alone.
+///
+/// The staging loop this stands in front of reads the source's *guest bytes*,
+/// and a mapping read must first settle: pay the surface's writeback debt and
+/// then wait for this device's own submitted writes to land. That wait, not the
+/// memcpy behind it, is what the rail costs. The GPU arm owes the source no
+/// settle at all, because the resident is the content — so every term below is
+/// about whether the resident and the destination plane are the two ends of one
+/// byte copy, and never about whether the guest's pages are readable.
+#[test]
+fn a_whole_surface_iosurface_texture_source_reaches_the_destinations_own_guest_plane() {
+    use T2tGvaRefusal::*;
+
+    const W: u32 = 64;
+    const H: u32 = 32;
+    const BPR: u64 = 256;
+    let src = IOSurfaceTextureBacking {
+        mapping_id: MappingId::new(7),
+        width: W,
+        height: H,
+        surface_offset: 0,
+        row_stride: BPR as u32,
+        span_end: BPR * H as u64,
+        bpp: 4,
+        pixel_format: MTL_FORMAT_BGRA8_UNORM,
+    };
+    let dst = LinearTextureLevel {
+        base_gva: 0x4000,
+        alloc_size: BPR * H as u64,
+        level_offset: 0,
+        row_stride: BPR,
+        slice_stride: 0,
+        slice_index: 0,
+        width: W,
+        height: H,
+        depth: 1,
+        bpp: 4,
+        pixel_format: MTL_FORMAT_BGRA8_UNORM,
+    };
+
+    let (plane, geometry) =
+        gpu_t2t_gva_plane(Some((W, H)), &src, &dst, 9).expect("one whole plane into another");
+    assert_eq!(
+        plane.target_gva, 0x4000,
+        "the level's own base is the plane"
+    );
+    assert_eq!(
+        plane.texture_ref, 9,
+        "the destination is the resource whose host-side pixel caches this invalidates"
+    );
+    assert_eq!(
+        geometry.extent,
+        (H as u64 - 1) * BPR + W as u64 * 4,
+        "the span is the copy's own bytes and not the row padding after the last of them"
+    );
+
+    assert_eq!(
+        gpu_t2t_gva_plane(None, &src, &dst, 9).unwrap_err(),
+        NoSurface,
+        "a mapping with no declared geometry has no surface identity to ask about"
+    );
+    // The resident is keyed by the mapping's own geometry and this copy lands it
+    // whole, so a source that is one plane of a larger surface would land the
+    // whole resident into a window that is not the whole of it.
+    assert_eq!(
+        gpu_t2t_gva_plane(
+            Some((W, H)),
+            &IOSurfaceTextureBacking {
+                surface_offset: 0x8000,
+                ..src
+            },
+            &dst,
+            9
+        )
+        .unwrap_err(),
+        SrcNotWholeSurface,
+        "a second plane of a biplanar surface is not the resident"
+    );
+    assert_eq!(
+        gpu_t2t_gva_plane(Some((W, H * 2)), &src, &dst, 9).unwrap_err(),
+        SrcNotWholeSurface,
+        "a texture that disagrees with its mapping about the surface's size is not the resident"
+    );
+    // The class `texture_region_window` bounds the staging loop with: a copy that
+    // runs off its resource paints whatever the guest handed those pages to next.
+    assert_eq!(
+        gpu_t2t_gva_plane(
+            Some((W, H)),
+            &src,
+            &LinearTextureLevel {
+                alloc_size: BPR * H as u64 - 1,
+                ..dst
+            },
+            9
+        )
+        .unwrap_err(),
+        DstExtentOob,
+        "a plane running past its allocation is refused before anything is walked"
+    );
+    // Carried whole rather than collapsed, so the reading names the same check
+    // the copy itself would have named.
+    assert!(
+        matches!(
+            gpu_t2t_gva_plane(
+                Some((W, H)),
+                &src,
+                &LinearTextureLevel {
+                    row_stride: 3,
+                    ..dst
+                },
+                9
+            ),
+            Err(DstPlane(
+                crate::runtime::render_writeback::GvaWritebackDecline::PitchNotTexels { .. }
+            ))
+        ),
+        "a pitch that is not a whole number of texels is the plane's own refusal"
     );
 }

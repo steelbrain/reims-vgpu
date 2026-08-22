@@ -1,0 +1,18 @@
+[package]
+name = "reims-vgpu-core"
+version = "0.1.0"
+edition = "2021"
+description = "Backend-independent semantic state core for Reims vGPU"
+license = "GPL-2.0-or-later"
+
+[features]
+test-fixtures = []
+
+[lib]
+name = "reims_vgpu_core"
+
+[dependencies]
+reims-vgpu-memory = { path = "../reims-vgpu-memory" }
+reims-vgpu-observe = { path = "../reims-vgpu-observe" }
+reims-vgpu-paging = { path = "../reims-vgpu-paging" }
+reims-vgpu-protocol = { path = "../reims-vgpu-protocol" }

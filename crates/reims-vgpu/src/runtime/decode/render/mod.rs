@@ -6,6 +6,7 @@
 //! remaining accepted opcodes are recognized and returned as typed kinds with
 //! raw length validation where the contract specifies fixed sizes.
 
+use reims_vgpu_protocol::{HeapObject, ObjectTableRef, ResourceObject};
 use reims_vgpu_wire::ops::render as wire;
 use reims_vgpu_wire::ops::render_pass as wire_pass;
 use reims_vgpu_wire::ops::tile as wire_tile;
@@ -43,7 +44,6 @@ fn narrow_count(value: u64) -> Result<u32, DecodeStatus> {
 /// hold — the selector's own argument, overruled.
 ///
 /// Three arms of this device disagree about that value and were never diffed
-/// against each other. This one clamps it. `backend::metal::render` refuses it
 /// by name as `metal_render_instance_count_zero` — a refusal this clamp makes
 /// unreachable, so the two cannot both be describing the contract. And
 /// `runtime::icb` decodes the same argument out of an ICB slot and hands it
@@ -60,17 +60,15 @@ fn narrow_count(value: u64) -> Result<u32, DecodeStatus> {
 /// command on this workload reaches the clamp, and it is inert rather than
 /// load-bearing — which is also why it has not been replaced. Both candidate
 /// replacements (pass the zero through as the ICB path does, or refuse it as
-/// `backend::metal::render` does) would be unobservable here, so the reading
 /// cannot choose between them, and Metal's own validation rejects
 /// `instanceCount:0` outright — which is the reason to doubt any guest emits it.
 ///
 /// A firing is the signal. It would mean a real selector carries zero, and the
 /// arm that receives it decides the pixels: this one draws one instance, the
-/// Metal backend refuses the draw, the ICB path draws nothing.
 ///
 /// Because this is the single site, the count it guarantees is what let the
 /// four further `.max(1)`s downstream of it go: two in `runtime::exec`, one in
-/// `runtime::draw` and one in `runtime::draw::vulkan`, each re-applying a rule
+/// `runtime::draw` and one in `runtime::draw::execution`, each re-applying a rule
 /// already applied here. The last of those outlived the sweep that claimed all
 /// of them, which is the failure mode a restatement has: it changes nothing
 /// until the rule it copies changes, and then it changes one arm.
@@ -156,14 +154,14 @@ pub(crate) const PASS_DEPTH_ATTACH_CLEAR_DEPTH: usize =
 #[cfg(test)]
 pub(crate) const PASS_STENCIL_ATTACH_CLEAR_STENCIL: usize =
     core::mem::offset_of!(wire_pass::StencilAttachmentBody, clear_stencil);
-pub const PASS_MAX_COLOR_ATTACHMENTS: usize = wire_pass::RENDER_PASS_COLOR_ATTACHMENTS;
+pub const PASS_MAX_COLOR_ATTACHMENTS: usize = reims_vgpu_protocol::MAX_COLOR_ATTACHMENTS;
 
 /// Offset of the pass-level tail, past the last colour slot.
 ///
-/// Four fields this device decodes and does not apply. They are the guest's
-/// explicit statement about the pass's extent and its occlusion query buffer,
-/// and none of them can be recovered from the attachments: a guest may bind a
-/// 4096-wide texture and ask for a 640-wide pass.
+/// Four pass-level fields consumed independently by execution: the visibility
+/// result buffer, array length, and the two raster-extent axes. None can be
+/// recovered from the attachments: a guest may bind a 4096-wide texture and
+/// ask for a 640-wide pass.
 #[cfg(test)]
 pub(crate) const PASS_TAIL_OFF: usize =
     PASS_COLOR_ATTACH_OFF + PASS_MAX_COLOR_ATTACHMENTS * PASS_COLOR_ATTACH_STRIDE;
@@ -176,7 +174,6 @@ pub(crate) const PASS_TAIL_TARGET_WIDTH: usize = 0x0c;
 #[cfg(test)]
 pub(crate) const PASS_TAIL_TARGET_HEIGHT: usize = 0x14;
 // The five load/store ordinals this record carries are declared in
-// `contract::pass_action`, not here: both backends and the Metal C ABI mirror
 // consume them, and while they lived in this decoder the mirror's copy was the
 // only spelling the encode path could reach.
 pub const PASS_MIN_PAYLOAD: usize = PASS_COLOR_ATTACH_OFF + PASS_COLOR_ATTACH_STRIDE;
@@ -324,7 +321,9 @@ pub enum Kind {
     SetDepthBias,
     SetStencilReference,
     Fence,
-    Barrier,
+    BarrierResources,
+    BarrierScope,
+    TextureBarrier,
     /// `setTriangleFillMode:` / `setDepthClipMode:`. The value is in
     /// [`Command::mode`]; which state it sets is [`Command::opcode`], as on the
     /// wire.
@@ -400,7 +399,7 @@ pub enum Kind {
     /// rasterization rate map, `0x22`/`0x23` the imageblock and threadgroup
     /// memory lengths, `0x24` the tile size. Which one is [`Command::opcode`],
     /// as on the wire; the scalar is [`Command::mode`] and the rate map's ref is
-    /// [`Command::object_ref`].
+    /// [`Command::texture_ref`].
     ///
     /// Decoded and counted rather than applied. Each of the six is behind a
     /// capability that defaults off, so a non-zero count is the first evidence
@@ -521,7 +520,6 @@ fn scissor_from_wire(r: &wire::ScissorRect) -> ScissorRect {
 }
 
 /// Lift one wire viewport, in the `[originX, originY, width, height, znear,
-/// zfar]` order both backends read it back in. Shared by the singular and
 /// plural viewport opcodes for the same reason as [`scissor_from_wire`].
 fn viewport_from_wire(v: &wire::Viewport) -> [f64; 6] {
     [
@@ -686,6 +684,21 @@ pub struct Command {
     pub pipeline_ref: u32,
     pub first: u32,
     pub count: u32,
+    /// Resource declarations carried by [`Kind::UseResource`].
+    pub residency_resources: Vec<ObjectTableRef<ResourceObject>>,
+    /// Heap declarations carried by [`Kind::UseHeap`]. Heap refs inhabit the
+    /// serializer's heap namespace, not the task object-list namespace.
+    pub residency_heaps: Vec<ObjectTableRef<HeapObject>>,
+    /// Resource declarations carried by [`Kind::BarrierResources`].
+    pub barrier_resources: Vec<ObjectTableRef<ResourceObject>>,
+    /// Render stages whose accesses must complete before a barrier.
+    pub barrier_after_stages: u16,
+    /// Render stages whose accesses wait behind a barrier.
+    pub barrier_before_stages: u16,
+    /// `MTLBarrierScope` carried by [`Kind::BarrierScope`].
+    pub barrier_scope: u8,
+    /// Written byte adjacent to `barrier_scope` whose meaning is not established.
+    pub barrier_unidentified_u8: u8,
     pub buffer_ref: u32,
     pub buffer_offset: u64,
     /// Multi-entry buffer binds for slots `first..first+count`.
@@ -767,11 +780,11 @@ pub struct Command {
     /// [`DecodedBufferBind::attribute_stride`], because the record does.
     pub attribute_stride: Option<u64>,
     pub raw_payload_len: usize,
-    /// Color attachment[0] when kind is RenderPass (boot clear path).
+    /// Color attachment zero when kind is RenderPass (boot clear path).
     pub color0: ColorAttachment,
     pub depth: DepthAttachment,
     pub stencil: StencilAttachment,
-    /// The pass's own tail, on [`Kind::RenderPass`]. Decoded, not applied.
+    /// The pass's own tail, on [`Kind::RenderPass`].
     ///
     /// `visibility_result_buffer_ref` is the buffer
     /// `setVisibilityResultMode:offset:` indexes — that record carries the mode
@@ -787,9 +800,9 @@ pub struct Command {
     /// setBlendColor RGBA floats (when kind is SetBlendColor).
     pub blend_color: [f32; 4],
     /// setCullMode
-    pub cull_mode: u32,
+    pub cull_mode: u64,
     /// setFrontFacingWinding
-    pub front_facing: u32,
+    pub front_facing: u64,
     /// setDepthBias (depthBias, slopeScale, clamp) as f32.
     pub depth_bias: [f32; 3],
     /// setDepthStencilState object ref
@@ -834,8 +847,8 @@ pub(crate) fn unclaimed_accepted_opcode() -> u32 {
     (0..=wire::OPCODE_SET_VERTEX_BUFFER_OFFSET_STRIDE)
         .find(|&op| {
             let mut v = vec![0u8; OP_HEADER_LEN];
-            crate::contract::endian::st32(&mut v[0..4], op);
-            crate::contract::endian::st32(&mut v[4..8], OP_HEADER_LEN as u32);
+            reims_vgpu_core::endian::st32(&mut v[0..4], op);
+            reims_vgpu_core::endian::st32(&mut v[4..8], OP_HEADER_LEN as u32);
             matches!(decode(&v), Ok(c) if c.kind == Kind::OtherAccepted)
         })
         .expect("every opcode in the window is decoded; the catch-all is unreachable")
@@ -1400,13 +1413,13 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
         wire::OPCODE_SET_CULL_MODE => {
             let m = wire::set_cull_mode(&op).map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::SetCullMode;
-            out.cull_mode = m.mode.get() as u32;
+            out.cull_mode = m.mode.get();
             Ok(out)
         }
         wire::OPCODE_SET_FRONT_FACING => {
             let m = wire::set_front_facing(&op).map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::SetFrontFacing;
-            out.front_facing = m.mode.get() as u32;
+            out.front_facing = m.mode.get();
             Ok(out)
         }
         wire::OPCODE_SET_DEPTH_BIAS => {
@@ -1435,15 +1448,16 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
             Ok(out)
         }
         wire::OPCODE_USE_RESOURCE => {
-            // Refs are not lifted (exec no-ops residency); count bounds the
-            // record via the wire layout (usage+stages pack to 4 bytes, refs
-            // at +8).
             let (head, refs) = wire::use_resource(&op).map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::UseResource;
             out.count = head.count.get();
             if out.count as usize != refs.len() {
                 return Err(DecodeStatus::ErrShort);
             }
+            out.residency_resources.extend(
+                refs.iter()
+                    .map(|reference| ObjectTableRef::new(reference.object_ref.get())),
+            );
             Ok(out)
         }
         wire::OPCODE_USE_HEAP => {
@@ -1454,6 +1468,10 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
             if out.count as usize != refs.len() {
                 return Err(DecodeStatus::ErrShort);
             }
+            out.residency_heaps.extend(
+                refs.iter()
+                    .map(|reference| ObjectTableRef::new(reference.object_ref.get())),
+            );
             Ok(out)
         }
         // The two residency forms that take no `stages:`. A render encoder
@@ -1475,6 +1493,10 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
             if out.count as usize != refs.len() {
                 return Err(DecodeStatus::ErrShort);
             }
+            out.residency_resources.extend(
+                refs.iter()
+                    .map(|reference| ObjectTableRef::new(reference.object_ref.get())),
+            );
             Ok(out)
         }
         wire::OPCODE_USE_HEAPS_NO_STAGES => {
@@ -1485,12 +1507,50 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
             if out.count as usize != refs.len() {
                 return Err(DecodeStatus::ErrShort);
             }
+            out.residency_heaps.extend(
+                refs.iter()
+                    .map(|reference| ObjectTableRef::new(reference.object_ref.get())),
+            );
             Ok(out)
         }
-        wire::OPCODE_MEMORY_BARRIER_RESOURCES
-        | wire::OPCODE_MEMORY_BARRIER_SCOPE
-        | wire::OPCODE_TEXTURE_BARRIER => {
-            out.kind = Kind::Barrier;
+        wire::OPCODE_MEMORY_BARRIER_RESOURCES => {
+            let (head, refs) =
+                wire::memory_barrier_resources(&op).map_err(|_| DecodeStatus::ErrShort)?;
+            let expected = (head.count.get() as usize)
+                .checked_mul(core::mem::size_of::<wire::RefBind>())
+                .and_then(|refs| {
+                    refs.checked_add(core::mem::size_of::<wire::MemoryBarrierResources>())
+                })
+                .ok_or(DecodeStatus::ErrBadLength)?;
+            if payload.len() != expected {
+                return Err(DecodeStatus::ErrBadLength);
+            }
+            out.kind = Kind::BarrierResources;
+            out.barrier_after_stages = head.after_stages.get();
+            out.barrier_before_stages = head.before_stages.get();
+            out.barrier_resources.extend(
+                refs.iter()
+                    .map(|resource| ObjectTableRef::new(resource.object_ref.get())),
+            );
+            Ok(out)
+        }
+        wire::OPCODE_MEMORY_BARRIER_SCOPE => {
+            if command_length != wire::MEMORY_BARRIER_SCOPE_TOTAL_LEN as usize {
+                return Err(DecodeStatus::ErrBadLength);
+            }
+            let scope = wire::memory_barrier_scope(&op).map_err(|_| DecodeStatus::ErrShort)?;
+            out.kind = Kind::BarrierScope;
+            out.barrier_scope = scope.scope;
+            out.barrier_unidentified_u8 = scope.unidentified_u8;
+            out.barrier_after_stages = u16::from(scope.after_stages);
+            out.barrier_before_stages = u16::from(scope.before_stages);
+            Ok(out)
+        }
+        wire::OPCODE_TEXTURE_BARRIER => {
+            if !wire::texture_barrier_has_no_payload(&op) {
+                return Err(DecodeStatus::ErrBadLength);
+            }
+            out.kind = Kind::TextureBarrier;
             Ok(out)
         }
         wire::OPCODE_SET_DEPTH_CLIP_MODE | wire::OPCODE_SET_TRIANGLE_FILL_MODE => {

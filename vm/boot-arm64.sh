@@ -111,8 +111,7 @@ Both selections are per-boot and repoint no \`current\`. Layout:
 Change the default rail with:  ln -sfn <rail> $RAILS_DIR/current
 Always builds reims-vgpu-efi and reims-vgpu before boot. In-tree QEMU is rebuilt
 unless QEMU_BIN is set to something other than the default path.
-Env: GUEST_DIR RAILS_DIR RAIL RUN_DIR QEMU_BIN AVPBOOTER RAM CPUS SSH_PORT REIMS_VGPU_BACKEND
-     (vulkan default for reims-vgpu-mmio; metal default for apple-gfx-mmio)
+Env: GUEST_DIR RAILS_DIR RAIL RUN_DIR QEMU_BIN AVPBOOTER RAM CPUS SSH_PORT
      TESTING_TIMEOUT QMP_DUMP_TIMEOUT GUEST_MAC
      NET=user (SLIRP, default) | NET=none (no NIC — one-time offline Setup Assistant bootstrap)
      TRACE=1 — control-plane trace rail: the display device's QEMU trace events
@@ -337,15 +336,9 @@ build_reims_vgpu_efi() {
 require_shader_toolchain
 ensure_rust_tools
 build_reims_vgpu_efi
-if [ -z "${REIMS_VGPU_BACKEND:-}" ]; then
-  case "$GFX_DEVICE" in
-    reims-vgpu-mmio) REIMS_VGPU_BACKEND=vulkan ;;
-    *) REIMS_VGPU_BACKEND=metal ;;
-  esac
-fi
 if [ "$QEMU_BIN" = "$QEMU_BIN_DEFAULT" ]; then
-  echo "boot-arm64.sh: building in-tree QEMU (scripts/qemu-build --target aarch64 --backend $REIMS_VGPU_BACKEND) ..."
-  "$REPO_ROOT/scripts/qemu-build/qemu-build.sh" --target aarch64 --backend "$REIMS_VGPU_BACKEND" \
+  echo "boot-arm64.sh: building in-tree QEMU (scripts/qemu-build --target aarch64) ..."
+  "$REPO_ROOT/scripts/qemu-build/qemu-build.sh" --target aarch64 \
     || die "qemu-build failed"
 else
   # See the matching note in boot-x86.sh: an overridden QEMU_BIN already has the
@@ -456,30 +449,19 @@ else
   QEMU_ARGS+=(-nic none)   # suppress QEMU's implicit default user-mode NIC
 fi
 
-# The Vulkan product build owns its AppKit window in Rust and therefore disables
-# QEMU's Cocoa display. The Apple reference and Metal-direct builds retain Cocoa.
-# The build stamp is authoritative configure-time state, not an env-gated device
-# path; fail closed rather than accidentally run two competing display windows.
+# The product build owns its AppKit window in Rust and therefore disables QEMU's
+# Cocoa display. The Apple reference build retains Cocoa.
 DISPLAY_KIND="cocoa"
 if [ "$GFX_DEVICE" = "reims-vgpu-mmio" ]; then
-  BACKEND_STAMP="$(dirname "$QEMU_BIN")/reims-vgpu-backend.stamp"
-  [ -f "$BACKEND_STAMP" ] || die \
-    "missing backend stamp: $BACKEND_STAMP (rebuild with scripts/qemu-build/qemu-build.sh)"
-  case "$(cat "$BACKEND_STAMP")" in
-    vulkan)
-      DISPLAY_KIND="reims-host-window"
-      VULKAN_LOADER_DIR="/opt/homebrew/opt/vulkan-loader/lib"
-      MOLTENVK_ICD="/opt/homebrew/etc/vulkan/icd.d/MoltenVK_icd.json"
-      [ -d "$VULKAN_LOADER_DIR" ] || die \
-        "Vulkan loader not found: $VULKAN_LOADER_DIR (install Homebrew vulkan-loader)"
-      [ -f "$MOLTENVK_ICD" ] || die \
-        "MoltenVK ICD not found: $MOLTENVK_ICD (install Homebrew molten-vk)"
-      export DYLD_FALLBACK_LIBRARY_PATH="$VULKAN_LOADER_DIR${DYLD_FALLBACK_LIBRARY_PATH:+:$DYLD_FALLBACK_LIBRARY_PATH}"
-      export VK_ICD_FILENAMES="$MOLTENVK_ICD"
-      ;;
-    metal) DISPLAY_KIND="cocoa" ;;
-    *) die "invalid backend stamp: $BACKEND_STAMP" ;;
-  esac
+  DISPLAY_KIND="reims-host-window"
+  VULKAN_LOADER_DIR="/opt/homebrew/opt/vulkan-loader/lib"
+  MOLTENVK_ICD="/opt/homebrew/etc/vulkan/icd.d/MoltenVK_icd.json"
+  [ -d "$VULKAN_LOADER_DIR" ] || die \
+    "Vulkan loader not found: $VULKAN_LOADER_DIR (install Homebrew vulkan-loader)"
+  [ -f "$MOLTENVK_ICD" ] || die \
+    "MoltenVK ICD not found: $MOLTENVK_ICD (install Homebrew molten-vk)"
+  export DYLD_FALLBACK_LIBRARY_PATH="$VULKAN_LOADER_DIR${DYLD_FALLBACK_LIBRARY_PATH:+:$DYLD_FALLBACK_LIBRARY_PATH}"
+  export VK_ICD_FILENAMES="$MOLTENVK_ICD"
 fi
 
 echo "boot-arm64.sh: device=$GFX_DEVICE class=$BOOT_CLASS rail=$RAIL_NAME snapshot=$SNAPSHOT_NAME uuid=$UUID"

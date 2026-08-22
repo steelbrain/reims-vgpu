@@ -13,16 +13,15 @@ const W: u32 = 16;
 const H: u32 = 16;
 const FRAME_BYTES: usize = (W * H * 4) as usize;
 
-fn state_capped(cap: usize) -> DeviceState {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
-    state.gva_cache_byte_cap = cap;
+fn state_capped(cap: usize) -> Device {
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
+    state.host_replicas.gva_cache_byte_cap = cap;
     state
 }
 
-fn store_frame(state: &mut DeviceState, gva: u64, fill: u8) {
+fn store_frame(state: &mut Device, gva: u64, fill: u8) {
     store_gva_owned(state, gva, W, H, vec![fill; FRAME_BYTES], 0, None, true);
 }
-
 
 /// The leak, and the bound.
 ///
@@ -40,7 +39,7 @@ fn the_byte_cap_bounds_a_map_whose_keys_never_repeat() {
         for i in 0..400u64 {
             store_frame(&mut state, 0x1000 + i * 0x1000, i as u8);
         }
-        state.host_gva_surfaces.len()
+        state.host_replicas.gva_surfaces.len()
     };
     assert_eq!(
         uncapped, 400,
@@ -52,17 +51,22 @@ fn the_byte_cap_bounds_a_map_whose_keys_never_repeat() {
     for i in 0..400u64 {
         store_frame(&mut state, 0x1000 + i * 0x1000, i as u8);
     }
-    let bytes: usize = state.host_gva_surfaces.values().map(|e| e.bgra.len()).sum();
+    let bytes: usize = state
+        .host_replicas
+        .gva_surfaces
+        .values()
+        .map(|e| e.bgra.len())
+        .sum();
     assert!(
         bytes <= cap,
         "capped map holds {bytes} bytes against a {cap}-byte cap"
     );
     assert!(
-        state.host_gva_surfaces.len() < 400,
+        state.host_replicas.gva_surfaces.len() < 400,
         "the cap must actually have evicted something"
     );
     assert!(
-        state.gva_eviction_witness.evicted > 0,
+        state.host_replicas.gva_eviction_witness.evicted > 0,
         "and it must say so: an eviction count of zero is a cap that never engaged"
     );
 }
@@ -100,7 +104,11 @@ fn an_entry_read_every_frame_but_never_rewritten_survives_the_cap() {
         "and it is still its own pixels, not a neighbour's"
     );
     assert_eq!(
-        state.gva_eviction_witness.wanted.load(Relaxed),
+        state
+            .host_replicas
+            .gva_eviction_witness
+            .wanted
+            .load(Relaxed),
         0,
         "no lookup was ever charged to the cap"
     );
@@ -126,12 +134,15 @@ fn the_same_entry_is_evicted_when_nothing_reports_reading_it() {
         "an entry nothing reports using is exactly what the cap is for"
     );
     assert_eq!(
-        state.gva_eviction_witness.wanted.load(Relaxed),
+        state
+            .host_replicas
+            .gva_eviction_witness
+            .wanted
+            .load(Relaxed),
         1,
         "and the lookup that then wanted it is charged to the cap, not written off"
     );
 }
-
 
 /// The harm witness must charge the cap for its own misses and nothing
 /// else, or the number cannot be read.
@@ -148,13 +159,17 @@ fn the_witness_charges_the_cap_only_for_misses_the_cap_caused() {
     for i in 0..64u64 {
         store_frame(&mut state, 0x300_0000 + i * 0x1000, i as u8);
     }
-    assert!(state.gva_eviction_witness.evicted > 0);
-    assert!(!state.host_gva_surfaces.contains_key(&victim));
+    assert!(state.host_replicas.gva_eviction_witness.evicted > 0);
+    assert!(!state.host_replicas.gva_surfaces.contains_key(&victim));
 
     // Never cached at all.
     assert!(get_gva(&state, 0xdead_0000, W, H).is_none());
     assert_eq!(
-        state.gva_eviction_witness.wanted.load(Relaxed),
+        state
+            .host_replicas
+            .gva_eviction_witness
+            .wanted
+            .load(Relaxed),
         0,
         "an address this cache never held is an ordinary miss"
     );
@@ -162,7 +177,11 @@ fn the_witness_charges_the_cap_only_for_misses_the_cap_caused() {
     // Evicted, but asked for at a geometry it never had.
     assert!(get_gva(&state, victim, W * 2, H).is_none());
     assert_eq!(
-        state.gva_eviction_witness.wanted.load(Relaxed),
+        state
+            .host_replicas
+            .gva_eviction_witness
+            .wanted
+            .load(Relaxed),
         0,
         "the cap did not remove *that* identity"
     );
@@ -170,7 +189,11 @@ fn the_witness_charges_the_cap_only_for_misses_the_cap_caused() {
     // The real thing.
     assert!(get_gva(&state, victim, W, H).is_none());
     assert_eq!(
-        state.gva_eviction_witness.wanted.load(Relaxed),
+        state
+            .host_replicas
+            .gva_eviction_witness
+            .wanted
+            .load(Relaxed),
         1,
         "a lookup that would have hit but for the cap is the cost of capping"
     );
@@ -195,12 +218,23 @@ fn asking_whether_an_entry_exists_is_not_charged_as_harm() {
     assert!(!has_gva(&state, victim, W, H));
     touch_gva(&mut state, victim, W, H);
     assert_eq!(
-        state.gva_eviction_witness.wanted.load(Relaxed),
+        state
+            .host_replicas
+            .gva_eviction_witness
+            .wanted
+            .load(Relaxed),
         0,
         "probes do not read the pixels, so they are not denied any"
     );
     assert!(get_gva(&state, victim, W, H).is_none());
-    assert_eq!(state.gva_eviction_witness.wanted.load(Relaxed), 1);
+    assert_eq!(
+        state
+            .host_replicas
+            .gva_eviction_witness
+            .wanted
+            .load(Relaxed),
+        1
+    );
 }
 
 /// Once the content is back, later misses are a different question.
@@ -216,15 +250,22 @@ fn a_store_that_brings_an_evicted_identity_back_stops_charging_the_cap() {
     for i in 0..64u64 {
         store_frame(&mut state, 0x300_0000 + i * 0x1000, i as u8);
     }
-    assert!(!state.host_gva_surfaces.contains_key(&victim));
+    assert!(!state.host_replicas.gva_surfaces.contains_key(&victim));
 
     store_frame(&mut state, victim, 0x22);
     assert!(get_gva(&state, victim, W, H).is_some());
     // Evict it again by store pressure, but this time the witness has
     // forgotten it, so the miss below is not the cap's to answer for.
-    state.gva_eviction_witness = crate::model::GvaEvictionWitness::default();
+    state.host_replicas.gva_eviction_witness = crate::model::GvaEvictionWitness::default();
     assert!(get_gva(&state, 0x5_1000, W, H).is_none());
-    assert_eq!(state.gva_eviction_witness.wanted.load(Relaxed), 0);
+    assert_eq!(
+        state
+            .host_replicas
+            .gva_eviction_witness
+            .wanted
+            .load(Relaxed),
+        0
+    );
 }
 
 /// The ring bound must under-report visibly, never silently.
@@ -240,7 +281,7 @@ fn forgetting_an_evicted_key_is_reported_rather_than_swallowed() {
     for i in 0..n {
         store_frame(&mut state, 0x1000 + i * 0x1000, i as u8);
     }
-    let (evicted, _, forgotten) = state.gva_eviction_witness.counts();
+    let (evicted, _, forgotten) = state.host_replicas.gva_eviction_witness.counts();
     assert!(evicted > crate::model::GVA_EVICTION_WITNESS_KEYS as u64);
     assert!(
         forgotten > 0,
@@ -251,7 +292,11 @@ fn forgetting_an_evicted_key_is_reported_rather_than_swallowed() {
     // lookup for it is uncounted — which is the point of `forgotten`.
     assert!(get_gva(&state, 0x1000, W, H).is_none());
     assert_eq!(
-        state.gva_eviction_witness.wanted.load(Relaxed),
+        state
+            .host_replicas
+            .gva_eviction_witness
+            .wanted
+            .load(Relaxed),
         0,
         "uncounted, and `forgotten` is the flag that keeps that honest"
     );
@@ -278,11 +323,11 @@ fn an_entry_bigger_than_the_cap_is_admitted_alone_not_evicted_by_its_own_store()
         .expect("an oversized entry rides alone rather than being refused");
     assert!(served.iter().all(|&b| b == 0x77));
     assert_eq!(
-        state.gva_cache_bytes, big,
+        state.host_replicas.gva_cache_bytes, big,
         "and the total still describes it"
     );
     assert_eq!(
-        state.gva_eviction_witness.evicted, 0,
+        state.host_replicas.gva_eviction_witness.evicted, 0,
         "nothing was evicted: there was nothing else to evict"
     );
 
@@ -305,27 +350,36 @@ fn an_entry_bigger_than_the_cap_is_admitted_alone_not_evicted_by_its_own_store()
 /// the real sum at every step. `gva_cap_drift` is the same check, live.
 #[test]
 fn the_running_byte_total_equals_the_map_after_every_transition() {
-    let truth = |state: &DeviceState| -> usize {
-        state.host_gva_surfaces.values().map(|e| e.bgra.len()).sum()
+    let truth = |state: &Device| -> usize {
+        state
+            .host_replicas
+            .gva_surfaces
+            .values()
+            .map(|e| e.bgra.len())
+            .sum()
     };
     let mut state = state_capped(usize::MAX);
-    assert_eq!(state.gva_cache_bytes, 0);
+    assert_eq!(state.host_replicas.gva_cache_bytes, 0);
 
     // Fresh keys.
     for i in 0..8u64 {
         store_frame(&mut state, 0x1000 + i * 0x1000, i as u8);
-        assert_eq!(state.gva_cache_bytes, truth(&state), "after insert {i}");
+        assert_eq!(
+            state.host_replicas.gva_cache_bytes,
+            truth(&state),
+            "after insert {i}"
+        );
     }
-    assert_eq!(state.gva_cache_bytes, 8 * FRAME_BYTES);
+    assert_eq!(state.host_replicas.gva_cache_bytes, 8 * FRAME_BYTES);
 
     // Replace at an existing key, same size: the total must not move.
     store_frame(&mut state, 0x1000, 0xFF);
     assert_eq!(
-        state.gva_cache_bytes,
+        state.host_replicas.gva_cache_bytes,
         8 * FRAME_BYTES,
         "replace double-charged"
     );
-    assert_eq!(state.gva_cache_bytes, truth(&state));
+    assert_eq!(state.host_replicas.gva_cache_bytes, truth(&state));
 
     // Replace at an existing key with a *different* geometry: the old bytes
     // are reclaimed and the new ones charged.
@@ -340,25 +394,33 @@ fn the_running_byte_total_equals_the_map_after_every_transition() {
         None,
         true,
     );
-    assert_eq!(state.gva_cache_bytes, truth(&state), "geometry change");
+    assert_eq!(
+        state.host_replicas.gva_cache_bytes,
+        truth(&state),
+        "geometry change"
+    );
 
     // Eviction.
     evict_gva(&mut state, 0x1000);
-    assert_eq!(state.gva_cache_bytes, truth(&state), "after evict");
-    assert_eq!(state.gva_cache_bytes, 7 * FRAME_BYTES);
+    assert_eq!(
+        state.host_replicas.gva_cache_bytes,
+        truth(&state),
+        "after evict"
+    );
+    assert_eq!(state.host_replicas.gva_cache_bytes, 7 * FRAME_BYTES);
 
     // And after the cap itself has run a batch of evictions.
-    state.gva_cache_byte_cap = 4 * FRAME_BYTES;
+    state.host_replicas.gva_cache_byte_cap = 4 * FRAME_BYTES;
     for i in 0..64u64 {
         store_frame(&mut state, 0x400_0000 + i * 0x1000, i as u8);
         assert_eq!(
-            state.gva_cache_bytes,
+            state.host_replicas.gva_cache_bytes,
             truth(&state),
             "under the cap, round {i}"
         );
     }
     assert!(
-        state.gva_eviction_witness.evicted > 0,
+        state.host_replicas.gva_eviction_witness.evicted > 0,
         "the cap must have run"
     );
 }
@@ -367,7 +429,7 @@ use std::sync::atomic::Ordering::Relaxed;
 
 /// Store a frame whose bytes the guest's own pages do **not** hold — the shape
 /// a render writeback produces on every outcome that did not reach guest RAM.
-fn store_unlanded_frame(state: &mut DeviceState, gva: u64, fill: u8) {
+fn store_unlanded_frame(state: &mut Device, gva: u64, fill: u8) {
     store_gva_owned(state, gva, W, H, vec![fill; FRAME_BYTES], 0, None, false);
 }
 
@@ -390,15 +452,15 @@ fn the_cap_never_evicts_bytes_the_guest_does_not_have() {
         store_unlanded_frame(&mut state, 0x1000 + i * 0x1000, i as u8);
     }
     assert_eq!(
-        state.host_gva_surfaces.len(),
+        state.host_replicas.gva_surfaces.len(),
         64,
         "no unlanded entry may be evicted, even eight times over the cap"
     );
     assert!(
-        state.gva_cache_bytes > state.gva_cache_byte_cap,
+        state.host_replicas.gva_cache_bytes > state.host_replicas.gva_cache_byte_cap,
         "the map is deliberately over its cap rather than lossy"
     );
-    let (evicted, wanted, _) = state.gva_eviction_witness.counts();
+    let (evicted, wanted, _) = state.host_replicas.gva_eviction_witness.counts();
     assert_eq!((evicted, wanted), (0, 0), "and nothing was taken");
 }
 
@@ -421,20 +483,21 @@ fn the_cap_still_evicts_what_the_guest_can_re_derive() {
     for i in 0..4u64 {
         assert!(
             state
-                .host_gva_surfaces
+                .host_replicas
+                .gva_surfaces
                 .contains_key(&(0x1_0000 + i * 0x1000)),
             "unlanded entry {i} survived the landed stream"
         );
     }
-    let (evicted, _, _) = state.gva_eviction_witness.counts();
+    let (evicted, _, _) = state.host_replicas.gva_eviction_witness.counts();
     assert!(
         evicted > 0,
         "landed entries are still reclaimed, or the cap has stopped working"
     );
     assert!(
-        state.host_gva_surfaces.len() < 36,
+        state.host_replicas.gva_surfaces.len() < 36,
         "and the map did not simply keep everything: {}",
-        state.host_gva_surfaces.len()
+        state.host_replicas.gva_surfaces.len()
     );
 }
 
@@ -453,7 +516,7 @@ fn landing_in_guest_pages_returns_an_entry_to_the_caps_reach() {
         store_frame(&mut state, 0xB_0000 + i * 0x1000, i as u8);
     }
     assert!(
-        !state.host_gva_surfaces.contains_key(&gva),
+        !state.host_replicas.gva_surfaces.contains_key(&gva),
         "once the guest holds the bytes the entry is an ordinary candidate"
     );
 }
@@ -472,7 +535,11 @@ fn a_cap_with_nothing_evictable_reports_instead_of_going_quiet() {
     for i in 0..200u64 {
         store_unlanded_frame(&mut state, 0x1000 + i * 0x1000, i as u8);
     }
-    assert_eq!(state.host_gva_surfaces.len(), 200, "still nothing evicted");
+    assert_eq!(
+        state.host_replicas.gva_surfaces.len(),
+        200,
+        "still nothing evicted"
+    );
 
     let lines: Vec<String> = capture
         .lines()

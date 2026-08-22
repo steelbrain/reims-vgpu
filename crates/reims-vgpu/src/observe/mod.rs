@@ -7,8 +7,8 @@
 //! `model/` and `host_window/` all reject guest work and all owe the reader a
 //! reason. It lived under `runtime/` only because that is where the first
 //! caller happened to be, and the result was the lapse this module exists to
-//! close: 451 fail sites in `runtime/` against 0 in `backend/metal/`,
-//! `contract/` and `qemu/`.
+//! close: failure reporting was concentrated in `runtime/`, while `backend/`,
+//! `contract/` and `qemu/` had none.
 //!
 //! `translate/` and `caps/` are the other half of the argument. They are pure —
 //! they return typed declines and log nothing, which is correct — so the sink
@@ -62,36 +62,32 @@
 //! speculative returns (a resolver legitimately answering "not ready yet" every
 //! poll, a genuinely-unbound `ref==0`). Those flood the log.
 
-pub mod decline;
-pub mod driver_watch;
-pub mod emit;
-pub mod footprint;
 pub mod ladder;
+pub(crate) mod model;
 pub mod panic;
-pub mod phase_clock;
-pub mod sink;
+pub use reims_vgpu_observe::{decline, driver_watch, emit, footprint, phase_clock, sink};
 
-/// Re-exported so call sites write `crate::observe::decline_display!(..)`
-/// next to the trait it implements, rather than reaching into the submodule.
-pub(crate) use decline::decline_display;
-pub use decline::{Decline, Refusal};
-pub(crate) use emit::{first_sight, state_changed, Emit};
 /// The fail line a loader whose event name carries the domain emits for a rung.
 pub(crate) use ladder::RungReport;
 /// The four object-list resolution rungs, so a rail spells the condition the
 /// same way every other rail does. See [`ladder`] for why it is a macro.
 pub(crate) use ladder::{ladder_slug, ladder_slugs};
+/// Re-exported so call sites write `crate::observe::decline_display!(..)`
+/// next to the trait it implements, rather than reaching into the submodule.
+pub(crate) use reims_vgpu_observe::decline_display;
+pub(crate) use reims_vgpu_observe::{first_sight, Emit};
+pub use reims_vgpu_observe::{Decline, Refusal};
 
 // The sink's surface is re-exported flat so call sites read `observe::fail(…)`
 // rather than `observe::sink::fail(…)`. `sink` stays public for readers who
 // want the machinery.
-pub use sink::{
+pub use reims_vgpu_observe::{
     bgra_present_stats, bgra_rgb_stats, fail, line, nonzero_stats, off, redirect_logs_for_tests,
     rgba_rgb_stats,
 };
-pub(crate) use sink::{draw_log_enabled, elapsed_ms, elapsed_us};
+pub(crate) use reims_vgpu_observe::{draw_log_enabled, elapsed_ms, elapsed_us};
 
 // Path accessors and the line matcher exist so tests can assert against the
 // real sink rather than a mock; production never reads them back.
 #[cfg(test)]
-pub(crate) use sink::{fail_log_path, FailCapture};
+pub(crate) use reims_vgpu_observe::{fail_log_path, FailCapture};

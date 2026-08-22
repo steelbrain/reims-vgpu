@@ -1,4 +1,4 @@
-//! The resident identity a type-11 guest surface renders into.
+//! The resident identity an IOSurface texture guest surface renders into.
 //!
 //! A compatible surface resident is a Vulkan image imported over the guest
 //! allocation itself. Rendering, attachment LOAD, Store synchronization, and
@@ -10,14 +10,11 @@
 //! resource and its current incarnation, so changing host capability changes
 //! performance and ownership but never which surface the guest observes.
 
-#![cfg(feature = "backend-vulkan")]
-
-use crate::backend::vulkan::engine::TargetIdentity;
-use crate::model::DeviceState;
-use ash::vk;
+use crate::model::TargetIdentity;
+use crate::runtime::Device;
 
 /// Build a protocol-stable resident identity for this mapping at its current
-/// [`crate::model::MappingEntry::map_generation`].
+/// the mapping lifecycle generation.
 ///
 /// One identity per mapping, always. `ResourcePools::registry` is keyed by
 /// `TargetIdentity`, so two mappings with equal identities would render into and
@@ -34,26 +31,27 @@ use ash::vk;
 /// is what this namespace answered for every mapping before it could answer at
 /// all; the GPU writeback rail then refuses that pair by name and the copying
 /// rail converts, exactly as it did.
-fn surface_format(state: &DeviceState, mapping_id: u32) -> vk::Format {
+fn surface_format(state: &Device, mapping_id: u32) -> reims_vgpu_core::pixel_format::TexelLayout {
     state
+        .surfaces
         .mappings
         .get(&mapping_id)
         .map(crate::runtime::mapping_write::mapping_store_format)
-        .and_then(crate::contract::pixel_format::store_texel_order)
-        .map(crate::backend::vulkan::translate::pixel::vk_texel_layout)
-        .unwrap_or(crate::backend::vulkan::translate::pixel::SCANOUT_FORMAT)
+        .and_then(reims_vgpu_core::pixel_format::store_texel_order)
+        .unwrap_or(reims_vgpu_core::pixel_format::TexelLayout::Bgra8)
 }
 
 pub fn surface_identity(
-    state: &DeviceState,
+    state: &Device,
     mapping_id: u32,
     width: u32,
     height: u32,
 ) -> TargetIdentity {
     let gen = state
+        .surfaces
         .mappings
         .get(&mapping_id)
-        .map(|m| m.map_generation as u64)
+        .map(|m| m.lifecycle.generation as u64)
         .unwrap_or(0);
     TargetIdentity::Surface {
         id: mapping_id,
@@ -76,7 +74,7 @@ mod tests {
     /// `VkImage`, and a spurious change orphans a live resident.
     #[test]
     fn identity_separates_mappings_and_tracks_only_the_map_generation() {
-        let state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
         let a = surface_identity(&state, 7, 64, 32);
         let b = surface_identity(&state, 8, 64, 32);
         assert_ne!(a, b, "distinct mappings must not share a resident");
@@ -105,33 +103,28 @@ mod tests {
     /// recreate it on every alternation.
     #[test]
     fn a_mappings_resident_follows_the_pixel_format_it_declares() {
-        use crate::backend::vulkan::translate::pixel::SCANOUT_FORMAT;
-        use crate::contract::pixel_format::{MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_RGBA16_FLOAT};
+        use reims_vgpu_core::pixel_format::{MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_RGBA16_FLOAT};
 
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let mut state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
         assert!(state.map_surface(7));
-        let declare = |state: &mut DeviceState, format: u16| {
-            let m = state.mappings.get_mut(&7).unwrap();
-            m.mapped = true;
-            m.has_geom = true;
-            m.width = 64;
-            m.height = 32;
-            m.format = format;
+        let declare = |state: &mut Device, format: u16| {
+            let m = state.surfaces.mappings.get_mut(&7).unwrap();
+            m.lifecycle.active = true;
+            m.publish_geometry_for_test(64, 32, format);
         };
 
         declare(&mut state, MTL_FORMAT_BGRA8_UNORM);
         let bgra8 = surface_identity(&state, 7, 64, 32);
         assert_eq!(
-            bgra8.resident_format(),
-            SCANOUT_FORMAT,
-            "a scanout-order plane is the format it always was"
+            bgra8.resident_layout(),
+            reims_vgpu_protocol::TexelLayout::Bgra8
         );
 
         declare(&mut state, MTL_FORMAT_RGBA16_FLOAT);
         let half = surface_identity(&state, 7, 64, 32);
         assert_eq!(
-            half.resident_format(),
-            vk::Format::R16G16B16A16_SFLOAT,
+            half.resident_layout(),
+            reims_vgpu_protocol::TexelLayout::Rgba16Float,
             "a half-float plane renders in half float, not at eight bits"
         );
 
@@ -156,31 +149,30 @@ mod tests {
     /// than it was, and the frame is never lost for want of an answer here.
     #[test]
     fn an_undeclared_or_unrepresentable_plane_keeps_guest_scanout_order() {
-        use crate::backend::vulkan::translate::pixel::SCANOUT_FORMAT;
-
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let mut state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
         assert!(state.map_surface(7));
         // Never declared: `has_geom` false, so there is no format to read.
         assert_eq!(
-            surface_identity(&state, 7, 64, 32).resident_format(),
-            SCANOUT_FORMAT
+            surface_identity(&state, 7, 64, 32).resident_layout(),
+            reims_vgpu_protocol::TexelLayout::Bgra8
         );
         // Declared as a format with no `TexelLayout` to store into.
         {
-            let m = state.mappings.get_mut(&7).unwrap();
-            m.has_geom = true;
-            m.width = 64;
-            m.height = 32;
-            m.format = crate::contract::pixel_format::MTL_FORMAT_RGBA32_FLOAT;
+            let m = state.surfaces.mappings.get_mut(&7).unwrap();
+            m.publish_geometry_for_test(
+                64,
+                32,
+                reims_vgpu_core::pixel_format::MTL_FORMAT_RGBA32_FLOAT,
+            );
         }
         assert_eq!(
-            surface_identity(&state, 7, 64, 32).resident_format(),
-            SCANOUT_FORMAT
+            surface_identity(&state, 7, 64, 32).resident_layout(),
+            reims_vgpu_protocol::TexelLayout::Bgra8
         );
         // And a mapping this device has never seen at all.
         assert_eq!(
-            surface_identity(&state, 999, 64, 32).resident_format(),
-            SCANOUT_FORMAT
+            surface_identity(&state, 999, 64, 32).resident_layout(),
+            reims_vgpu_protocol::TexelLayout::Bgra8
         );
     }
 
@@ -204,7 +196,7 @@ mod tests {
     /// "four buffers, four residents" is what the compositor does.
     #[test]
     fn a_four_buffer_swapchain_at_one_geometry_gets_four_residents() {
-        let state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
         let ids: Vec<TargetIdentity> = [11u32, 12, 13, 14]
             .iter()
             .map(|&mid| surface_identity(&state, mid, 1920, 1080))

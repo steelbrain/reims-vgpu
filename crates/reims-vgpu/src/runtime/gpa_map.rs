@@ -57,9 +57,9 @@ pub fn write_bytes<H: HostMemory + HostOps>(
     // After the copy, not before: the footprint is the set of frames this
     // device *wrote*, and every refusal above returns without writing one.
     //
-    // The peer rails also record here into `DeviceState::host_writes`, so a
+    // The peer rails also record here into `Device::host_writes`, so a
     // reader can tell "the guest did not write these pages" from "nobody did".
-    // This one does not, because it never takes a `DeviceState` — every caller is
+    // This one does not, because it never takes a `Device` — every caller is
     // the control plane in `runtime::drain` (completion stamps, DeviceInfo, the
     // display shared page, child FIFO HEAD), writing pages the device was handed
     // by the register handshake rather than any surface's backing. A sampled

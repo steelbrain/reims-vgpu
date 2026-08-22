@@ -173,7 +173,7 @@ Then run the device against the same fixtures, because a new fixture is a new te
 
 ```sh
 REIMS_WIRE_FIXTURES_REQUIRED=1 cargo test -p reims-vgpu --no-default-features \
-  --features backend-vulkan,host-window --test wire_fixtures_reach_the_decoders \
+  --features host-window --test wire_fixtures_reach_the_decoders \
   -- --nocapture
 ```
 
@@ -291,7 +291,7 @@ A field or bit you could not make move gets:
 - a doc comment stating **what has already been tried** and what it read;
 - a doc comment stating **the specific experiment** that would settle it.
 
-`NewTextureBody::unidentified_flags` and `unidentified_u64` are the templates. This is not a
+`SamplerBody::unidentified_flag_bits` is the template. This is not a
 placeholder to tidy up later — it is the honest encoding of what is known, and it is what stops the
 next reader from re-running an experiment that already failed.
 

@@ -1,16 +1,15 @@
 # vm/ — macOS guests for the reims-vgpu pathways
 
-`crates/reims-vgpu` runs three backend pathways over two guest rails. Pick the boot script for the
-guest you are on and the QEMU/reims-vgpu backend for the host GPU path.
+The `reims-vgpu` composition staticlib runs one semantic core and one Vulkan executor over two
+host/guest pathways. Pick the boot script for the guest architecture you are on.
 
 | Pathway | Script | Host accel | Backend | Typical device |
 |---|---|---|---|---|
 | x86 macOS / Linux Vulkan | `vm/boot-x86.sh` | KVM / OpenCore+OVMF | Vulkan via `metal2vulkan` | `reims-vgpu-pci` |
-| arm64 macOS / macOS Metal | `vm/boot-arm64.sh` | HVF / `vmapple` | Metal-direct | `reims-vgpu-mmio` (product) or `apple-gfx-mmio` (Apple reference A/B) |
-| arm64 macOS / macOS Vulkan | `vm/boot-arm64.sh` | HVF / `vmapple` | Vulkan via `metal2vulkan` through MoltenVK | `reims-vgpu-mmio` |
+| arm64 macOS / macOS Vulkan | `vm/boot-arm64.sh` | HVF / `vmapple` | Vulkan via `metal2vulkan` through MoltenVK | `reims-vgpu-mmio` (product) or `apple-gfx-mmio` (Apple reference A/B) |
 
 ```bash
-# arm64 macOS guest on Mac host (Metal or Vulkan/MoltenVK backend)
+# arm64 macOS guest on Mac host (Vulkan/MoltenVK backend)
 vm/boot-arm64.sh --testing                 # agent boot: GUI + serial-to-file, hard kill, reverts
 vm/boot-arm64.sh --interactive             # human boot: GUI, no time limit, reverts
 vm/boot-arm64.sh --device reims-vgpu-mmio --testing

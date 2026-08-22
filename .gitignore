@@ -66,3 +66,6 @@ Vulkan-Headers/
 # what a stray instrumented `cargo test` drops in the tree).
 *.profraw
 *.profdata
+
+# Conformance binaries, built from conformance/suite; regenerate, do not commit.
+conformance/build/

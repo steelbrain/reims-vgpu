@@ -1,0 +1,20 @@
+[package]
+name = "reims-vgpu-memory"
+version = "0.1.0"
+edition = "2021"
+description = "Checked guest-memory import identities and ranges for Reims vGPU"
+license = "GPL-2.0-or-later"
+
+[lib]
+name = "reims_vgpu_memory"
+
+[features]
+test-fixtures = ["reims-vgpu-observe/test-fixtures"]
+
+[dependencies]
+reims-vgpu-observe = { path = "../reims-vgpu-observe" }
+reims-vgpu-paging = { path = "../reims-vgpu-paging" }
+reims-vgpu-protocol = { path = "../reims-vgpu-protocol" }
+
+[dev-dependencies]
+reims-vgpu-observe = { path = "../reims-vgpu-observe", features = ["test-fixtures"] }

@@ -3,22 +3,6 @@
 //! Sources: `apple-pv-gpu.h`, `reims_vgpu_fifo_format.h`.
 //! Values are protocol constants — not content heuristics.
 
-/// Gfx MMIO window size (16 KiB); bounds the sparse register store.
-///
-/// This constant is the owner. `REIMS_VGPU_GFX_MMIO_SIZE` in
-/// `include/reims_vgpu_qemu_abi.h` mirrors it and both shims size their region
-/// from the header — the sysbus gfx window on one, BAR0 on the other — so the
-/// window the guest can address and the bound Rust indexes cannot part without
-/// `the_abi_header_agrees_on_the_gfx_window_size` failing.
-///
-/// The iosfc window's size is not mirrored here. QEMU declares that region
-/// (`REIMS_VGPU_MMIO_IOSFC_MMIO_SIZE` in `reims-vgpu-mmio.c`) and Rust only
-/// needs a bound for state it keeps per offset, which the iosfc rail does not do
-/// — it decodes five named registers and ignores the rest. A second unread copy
-/// of the iosfc size would be a source of truth nothing checks against the one
-/// that actually sizes the `MemoryRegion`.
-pub const GFX_MMIO_SIZE: u64 = 0x4000;
-
 /// Control block base inside the gfx window.
 pub const REG_BASE: u64 = 0x1000;
 
@@ -112,22 +96,20 @@ pub const EFI_BUILTIN_CONNECTED: u32 = 1;
 /// [`EFI_DISPLAY_PORT_COUNT`] published here it creates channels 0..=5.
 ///
 /// The bound is therefore not tight, and it is not load-bearing either — see
-/// [`accept_child_channel`] for what a refusal past it would cost. It is pinned
+/// [`crate::runtime::accept_child_channel`] for what a refusal past it would cost. It is pinned
 /// from above by the three `u32` masks below and from *use* by the layout of the
 /// root page, which has room for `(page_size - CHILD_REG_BLOCK_OFFSET) /
 /// CHILD_REG_BLOCK_STRIDE` blocks — 153 on a 4 KiB page — and which the guest
 /// indexes with no bound check of its own.
-pub const MAX_CHANNELS: usize = 32;
+pub use reims_vgpu_core::MAX_CHANNELS;
 
-/// `active_child_mask`, `pending.child_mask` and `child_doorbell_rung` are each
+/// The active and pending child-work masks and `child_doorbell_rung` are each
 /// a `u32` carrying one bit per channel, and every producer reaches them with a
 /// bare `1u32 << channel_id`. That is only defined because a channel id is
 /// bounded by 32 — a `MAX_CHANNELS` above `u32::BITS` would make every one of
 /// those shifts overflow, which Rust panics on in debug and wraps in release.
 /// The masks would have to widen with the constant, so this refuses the change
 /// at the constant rather than at the four shift sites.
-const _: () = assert!(MAX_CHANNELS <= u32::BITS as usize);
-
 /// Whether `channel_id` names a child channel this device has.
 ///
 /// Channel 0 is the root/main FIFO, not a child, so it is refused here for the
@@ -143,40 +125,6 @@ pub const fn is_child_channel(channel_id: u32) -> bool {
     channel_id >= 1 && (channel_id as usize) < MAX_CHANNELS
 }
 
-/// [`is_child_channel`], reporting the refusal when the answer is no.
-///
-/// The three sites that gate on a channel id are the two doorbell handlers
-/// (locked and lock-free) and `ensure_child_ring`, and all three used to answer
-/// this question and then say nothing: an `if` with no `else` at the first two,
-/// and a `0` return at the third that is indistinguishable from "ring not valid
-/// yet". A guest ringing channel 32 therefore set no mask bit, scheduled no
-/// bottom half, and was never told — every command it queued there sits in the
-/// ring forever, which is a stalled channel rather than a dropped record and so
-/// does not even look like corruption from the guest's side.
-///
-/// `MAX_CHANNELS` is a bound this device imposes, not one the protocol states,
-/// and nothing tells a guest what it is: `DEVICE_INFO_CAPS` advertises no
-/// channel count, and the register blocks the guest indexes are inside its own
-/// root page rather than in this device's MMIO window. What bounds a guest in
-/// practice is its own enumeration, which stops at id 12 — see
-/// [`MAX_CHANNELS`]. This report is what would say that reading had gone stale.
-///
-/// Latched per channel id, so a guest hammering one out-of-range doorbell costs
-/// one line rather than one per ring; the census route counts every occurrence.
-pub fn accept_child_channel(channel_id: u32, site: &'static str) -> bool {
-    if is_child_channel(channel_id) {
-        return true;
-    }
-    crate::runtime::drain::census::note_store_route("child_channel_out_of_range");
-    if crate::observe::first_sight("channel_outside_device_range", u64::from(channel_id)) {
-        crate::observe::fail(format!(
-            "child_channel_out_of_range reason=channel_outside_device_range \
-             site={site} channel={channel_id} max_channels={MAX_CHANNELS}"
-        ));
-    }
-    false
-}
-
 /// Whether `mapping_id` names a mapping rather than "no mapping".
 ///
 /// Zero is the device-wide sentinel for an unbound mapping — `runtime::draw`
@@ -186,7 +134,7 @@ pub fn accept_child_channel(channel_id: u32, site: &'static str) -> bool {
 /// sentinel-aware reader will ever consult.
 ///
 /// Four callers knew that and six did not: `runtime::texture` and the two
-/// type-4 backing paths in `runtime::objects` refused zero, while the five
+/// surface backing backing paths in `runtime::objects` refused zero, while the five
 /// `DeviceState` mutators and `mapper::capture_published_request` bounded the
 /// id from above only.
 ///
@@ -194,18 +142,18 @@ pub fn accept_child_channel(channel_id: u32, site: &'static str) -> bool {
 ///
 /// This used to also require `mapping_id < MAX_MAPPINGS` (4096). Nothing was
 /// indexed by that number. Every one of the five `DeviceState` mutators reaches
-/// `self.mappings.entry(mapping_id).or_default()` on a `BTreeMap` keyed by the
+/// `self.surfaces.mappings.entry(mapping_id).or_default()` on a `BTreeMap` keyed by the
 /// full `u32`, and no other structure in the device is sized by mapping id — so
 /// the bound allocated nothing, protected nothing, and its only effect was that
 /// a guest naming id 4096 had its MAP, UNMAP, MappingInternal attach, device
-/// descriptor and geometry silently refused, and every type-4 surface backing
+/// descriptor and geometry silently refused, and every surface backing surface backing
 /// with it. A mapping id is a full `u32` on the wire; the guest chooses it and
 /// the device is not entitled to an opinion about how large it is.
 ///
 /// Zero stays refused because it is a *meaning*, not a size: the sentinel is
 /// read as "unbound" by the draw path, so a mapping stored under it could never
 /// be served.
-pub const fn is_mapping_id(mapping_id: u32) -> bool {
+pub const fn is_surface_mapping_id(mapping_id: u32) -> bool {
     mapping_id >= 1
 }
 
@@ -272,18 +220,18 @@ pub const fn scanout_extent_ok(width: u32, height: u32) -> bool {
     scanout_extent_fault(width, height).is_none()
 }
 
-// Single source of truth for the shifts: `contract::gva::PAGE_SHIFT_*`,
+// Single source of truth for the shifts: `reims_vgpu_paging::geometry::PAGE_SHIFT_*`,
 // re-exported rather than restated. There is **no** bare `PAGE_SIZE` /
 // `PAGE_SHIFT` — those names defaulted to arm16K and caused x86 wild writes
 // (stamp slots). Product code uses `state.page_size()` / `state.page_shift`;
 // fixtures pick an arch-qualified name.
 //
-// The two `PAGE_SIZE_*` below are NOT the `contract::gva` constants of the same
+// The two `PAGE_SIZE_*` below are NOT the `reims_vgpu_paging::geometry` constants of the same
 // name: those are `u32` for page-offset masking, these are the `u64` widening
 // the device's address arithmetic and its fixtures want. Both derive from the
 // one re-exported shift, so they cannot disagree in value — but the names do
 // collide, so import from one module or the other on purpose.
-pub(crate) use crate::contract::gva::{pfn_to_gpa, PAGE_SHIFT_ARM64E, PAGE_SHIFT_X86};
+pub(crate) use reims_vgpu_paging::geometry::{pfn_to_gpa, PAGE_SHIFT_ARM64E, PAGE_SHIFT_X86};
 // Gated with the fixtures that want them. That is the same statement the
 // comment above makes, now enforced rather than asserted: no product path
 // names either one, because product code goes through `state.page_size()`.
@@ -298,8 +246,8 @@ pub const PACKET_TOTAL_SIZE: usize = 0x04;
 pub const PACKET_COMPLETION_STAMP: usize = 0x08;
 pub const PACKET_HEADER_LEN: u32 = 12;
 pub const PACKET_STAMP_LEN: u32 = 8;
-pub const STAMP_INDEX_MASK: u32 = 0xffff;
-pub const STAMP_SLOT_LEN: u32 = 4;
+pub const STAMP_INDEX_MASK: u32 = reims_vgpu_protocol::STAMP_INDEX_MASK;
+pub const STAMP_SLOT_LEN: u32 = reims_vgpu_protocol::STAMP_SLOT_LEN as u32;
 
 /// `CmdDisplaySetSharedStatePage`, the same command as
 /// [`CHILD_OP_SETUP_SHARED_STATE`] and not a second meaning for the number.
@@ -814,7 +762,7 @@ pub const DISPLAY_DESC_HEIGHT_MM: u64 = 0x16;
 ///
 /// **No guest on this device reads this pair today**, and that is worth stating
 /// so nobody reads a fix into it: the capability arrives at protocol rung 0x2a
-/// and [`version_reply`] clamps down and never up, so a stock guest asking for 4
+/// and [`negotiate_protocol_version`] clamps down and never up, so a stock guest asking for 4
 /// gets 4 and stays below it. What writing them buys is that the field is not a
 /// zero waiting for the first guest that does negotiate higher — a 0 x 0 mm panel
 /// — and that this device publishes what the reference implementation publishes
@@ -1056,13 +1004,9 @@ pub const CURSOR_GLYPH_BPP: u32 = 4;
 /// anything exotic: the accessibility pointer-size slider scales the sprite
 /// several times over, and a Retina backing store doubles it again.
 ///
-/// `the_cursor_bound_matches_the_sprite_size_qemu_will_allocate` reads the guard
-/// out of `vendor/qemu/ui/cursor.c` and compares it to this, because the two
-/// numbers live in different languages in different trees and nothing else
-/// relates them. Being *above* QEMU's bound is the worse direction: `cursor_alloc`
-/// answers `NULL`, and both shims drop the glyph on that path with no line at
-/// all — a silent loss in C, which is exactly what this constant existing in
-/// Rust is supposed to prevent.
+/// Keep this synchronized by review with the host cursor allocator. It cannot
+/// be derived across the Rust/C boundary, and testing it by parsing source text
+/// would assert spelling rather than cursor behavior.
 pub const CURSOR_MAX_DIM: u32 = 512;
 pub const CURSOR_GLYPH_PAYLOAD_LEN: usize = 0x2c;
 
@@ -1128,7 +1072,6 @@ pub fn negotiate_protocol_version(requested: u32) -> u32 {
 /// on every driven boot recorded so far.
 ///
 /// It is *not* narrowed to 1 the way key 11's primitive mask was narrowed to
-/// what both backends execute, and the difference is that Metal guarantees
 /// sample count 4 on every device it runs on. An `MTLDevice` answering 1 is a
 /// shape no macOS guest has ever had to handle, so narrowing trades a known
 /// refusal for an unknown one. The honest repair is to rasterize at the count
@@ -1160,7 +1103,6 @@ pub const DEVICE_INFO_KEY_DUAL_PLANE_TEXTURES: u32 = 12;
 ///
 /// This key has no term in [`DeviceInfoLimits`], so no host reduction touches
 /// it, which is the shape key 11 had when it was authorising primitive types
-/// both backends refuse. The question is worth answering here rather than
 /// re-asking, because the answer is the opposite one and for a reason that
 /// generalises.
 ///
@@ -1168,9 +1110,8 @@ pub const DEVICE_INFO_KEY_DUAL_PLANE_TEXTURES: u32 = 12;
 /// primitive types — the refusal is permanent, so the honest advertisement is
 /// the narrow one. Framebuffer read is not that: the Vulkan arm implements the
 /// attachment-0 fetch through a subpass input attachment, which is Vulkan 1.0
-/// core and needs no capability; the Metal arm serves an Apple GPU, whose
 /// families all have it. What is missing is only the fetch of a *secondary* MRT
-/// attachment, which `runtime::draw::vulkan` refuses by name as
+/// attachment, which `runtime::draw::execution` refuses by name as
 /// `draw_prepare_color_input_mrt_unsupported`.
 ///
 /// So the gap is this device's to close, not to hide, and a `0` here would be
@@ -1197,7 +1138,7 @@ pub const DEVICE_INFO_KEY_RGB10A2_GAMMA: u32 = 8;
 /// out on, so it is a promise about what this device can address rather than a
 /// capability it can decline later.
 ///
-/// Distinct from [`crate::contract::iosurface_pages::ROW_BYTES_ALIGN`], which is
+/// Distinct from [`reims_vgpu_protocol::ROW_BYTES_ALIGN`], which is
 /// an IOSurface row estimate for counting pages and is deliberately not a pitch.
 /// Do not relate the two: one is Metal's linear-texture rule and the other is
 /// IOSurface's allocator, and nothing says they are the same number.
@@ -1300,7 +1241,7 @@ pub const DEVICE_INFO_SERIALIZER_VERSION: u32 = 8;
 ///
 /// Not a count and not a maximum: the guest's `supportsPrimitiveType:` tests
 /// **bit `type`** of this value for any `type <= 8`, and answers `type < 5` when
-/// the key is absent. See [`crate::contract::draw::EXECUTABLE_PRIMITIVE_TYPES`]
+/// the key is absent. See [`reims_vgpu_core::draw::EXECUTABLE_PRIMITIVE_TYPES`]
 /// for what this device puts in it and why that is narrower than the capture.
 ///
 /// Narrowing it changed nothing on the x86 pathway, as expected and no more
@@ -1330,15 +1271,8 @@ pub fn protocol_dual_plane_textures(version: u32) -> bool {
     matches!(version, 31 | 41 | 42 | 43 | 60 | 61 | 62)
 }
 
-/// What the host GPU can actually do, for the keys above.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DeviceInfoLimits {
-    pub max_sample_count: u32,
-    pub d24_stencil8: bool,
-    pub max_threads_per_threadgroup: [u32; 3],
-    pub max_threadgroup_memory_bytes: u32,
-    pub native_fp16: bool,
-}
+/// What the host GPU can actually do, for the keys below.
+pub use reims_vgpu_core::DeviceInfoLimits;
 
 /// The device-info reply for this host: GPU-dependent keys reduced to what
 /// `limits` says the host can execute, and version-dependent keys answered from
@@ -1423,7 +1357,6 @@ pub fn device_info_caps(limits: &DeviceInfoLimits, version: u32) -> Vec<(u32, u3
 /// **instruction to the guest** about what it may build, and one it cannot
 /// re-ask about later. Key 11 is what that costs when it is left as a number:
 /// it read `1023` from a capture for as long as this table existed, which
-/// authorised four primitive types both backends refuse, and nothing said so
 /// because the entry was a pair of integers.
 ///
 /// A new entry therefore gets a `DEVICE_INFO_KEY_*` constant whose doc says what
@@ -1470,7 +1403,7 @@ pub const DEVICE_INFO_CAPS: &[(u32, u32)] = &[
     ),
     (
         DEVICE_INFO_KEY_PRIMITIVE_TYPE_MASK,
-        crate::contract::draw::EXECUTABLE_PRIMITIVE_TYPES,
+        reims_vgpu_core::draw::EXECUTABLE_PRIMITIVE_TYPES,
     ),
     (DEVICE_INFO_KEY_DUAL_PLANE_TEXTURES, 1),
     (DEVICE_INFO_KEY_LINEAR_TEXTURE_ALIGN, 256),
@@ -1499,7 +1432,10 @@ pub const DEVICE_INFO_CAPS: &[(u32, u32)] = &[
     (DEVICE_INFO_KEY_MIN_LINEAR_TEXTURE_ALIGN, 256),
     (DEVICE_INFO_KEY_TEXTURE_WRITE_ROUNDING, 7),
     (DEVICE_INFO_KEY_SUPPORT_FLAGS_2025, 2),
-    (DEVICE_INFO_KEY_HOST_GPU_FAMILIES, DEVICE_INFO_GPU_FAMILY_SET),
+    (
+        DEVICE_INFO_KEY_HOST_GPU_FAMILIES,
+        DEVICE_INFO_GPU_FAMILY_SET,
+    ),
 ];
 
 /// Wire key 18 — the **AIR version** this device's compiler targets, packed as
@@ -1819,7 +1755,10 @@ mod tests {
         let dpi_x10 = |px: u16, mm: u16| (px as u64 * 254 * 10) / (mm as u64 * 10);
         let horizontal = dpi_x10(DISPLAY_MODE_EFI_W, DISPLAY_WIDTH_MM);
         let vertical = dpi_x10(DISPLAY_MODE_EFI_H, DISPLAY_HEIGHT_MM);
-        assert_eq!(horizontal, vertical, "square pixels, or the guest is misled");
+        assert_eq!(
+            horizontal, vertical,
+            "square pixels, or the guest is misled"
+        );
         assert!(
             (900..1440).contains(&horizontal),
             "{horizontal} tenths of a DPI is outside the ordinary desktop band; \
@@ -2080,92 +2019,15 @@ mod tests {
     /// a `BTreeMap` keyed by the full `u32`, so the ceiling refused ids the map
     /// would have held; `u32::MAX` is asserted *accepted* now, in the same place
     /// it was once asserted refused, so a reinstated bound fails here.
-    /// `CURSOR_MAX_DIM` must be the sprite size `cursor_alloc` will actually
-    /// allocate.
-    ///
-    /// The two numbers live in different languages in different trees and
-    /// nothing else relates them, which is how they came to differ by a factor
-    /// of two: this was 256 with no stated basis while QEMU's `cursor_alloc`
-    /// refuses only above 512, so every cursor sprite between 257 and 512 was
-    /// dropped here for nothing. A `SetCursorGlyph` past the bound is dropped
-    /// whole — the guest's pointer keeps whatever image it had.
-    ///
-    /// Equality rather than `<=`, and the direction matters both ways. Below
-    /// QEMU's bound is the loss above. **Above** it is worse: `cursor_alloc`
-    /// answers `NULL`, and both shims discard the glyph on that path with no
-    /// line at all — a silent loss in C, which is what bounding this in Rust
-    /// exists to prevent.
-    ///
-    /// Read out of the guard itself rather than pinned to a literal here, so a
-    /// QEMU bump that moves the sprite limit fails this test instead of
-    /// silently re-opening one of those two gaps. The parse asserts it found the
-    /// guard before believing anything: a scan that matches nothing must fail,
-    /// not pass.
-    ///
-    /// Beside the constant rather than in an integration test, because
-    /// `model::regs` is a private module — an integration test cannot name
-    /// `CURSOR_MAX_DIM`, and widening the crate's public surface to be testable
-    /// is the wrong trade. Nothing here is backend-gated, so one arm executing
-    /// it is enough.
-    #[test]
-    fn the_cursor_bound_matches_the_sprite_size_qemu_will_allocate() {
-        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../vendor/qemu/ui/cursor.c");
-        let src = std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("{} must be readable: {e}", path.display()));
-
-        // The body of `cursor_alloc`, so a `> N` elsewhere in the file cannot
-        // answer for the one that refuses an allocation.
-        let body = src
-            .split_once("QEMUCursor *cursor_alloc(")
-            .map(|(_, tail)| tail)
-            .unwrap_or_else(|| panic!("{} must define cursor_alloc", path.display()));
-        let body = body
-            .split_once("\n}")
-            .map(|(head, _)| head)
-            .expect("cursor_alloc must have a body");
-
-        let bounds: Vec<u32> = body
-            .match_indices("width > ")
-            .chain(body.match_indices("height > "))
-            .filter_map(|(at, pat)| {
-                body[at + pat.len()..]
-                    .split(|c: char| !c.is_ascii_digit())
-                    .next()
-                    .filter(|d| !d.is_empty())
-                    .and_then(|d| d.parse().ok())
-            })
-            .collect();
-
-        assert_eq!(
-            bounds.len(),
-            2,
-            "expected cursor_alloc to bound width and height; found {bounds:?}. \
-             The guard moved or was reworded — read it and re-derive \
-             CURSOR_MAX_DIM rather than deleting this test."
-        );
-        assert!(
-            bounds.iter().all(|&b| b == bounds[0]),
-            "cursor_alloc bounds width and height differently ({bounds:?}); \
-             CURSOR_MAX_DIM is one number and cannot express that"
-        );
-        assert_eq!(
-            CURSOR_MAX_DIM, bounds[0],
-            "CURSOR_MAX_DIM must be the sprite edge cursor_alloc will allocate: \
-             below it drops guest cursors this host would have shown, above it \
-             reaches a NULL both shims discard without a line"
-        );
-    }
-
     #[test]
     fn the_mapping_id_bound_refuses_only_the_no_mapping_sentinel() {
         assert!(
-            !is_mapping_id(0),
+            !is_surface_mapping_id(0),
             "0 names no mapping; it must not open an entry"
         );
-        assert!(is_mapping_id(1));
+        assert!(is_surface_mapping_id(1));
         assert!(
-            is_mapping_id(u32::MAX),
+            is_surface_mapping_id(u32::MAX),
             "a mapping id is a full u32 on the wire and its storage is a map"
         );
     }
@@ -2201,7 +2063,7 @@ mod tests {
     fn the_abi_header_agrees_on_the_gfx_window_size() {
         assert_eq!(
             u64::from(crate::qemu::abi::header_define("REIMS_VGPU_GFX_MMIO_SIZE")),
-            GFX_MMIO_SIZE,
+            reims_vgpu_core::GFX_MMIO_SIZE,
             "the shims size the gfx MMIO region from the header; it has drifted \
              from the bound Rust's sparse register store is indexed against"
         );
@@ -2213,7 +2075,7 @@ mod tests {
     /// `reims-vgpu-mmio.c` sizes its `mach_vm_remap` view, its alignment mask
     /// and its packed-contiguity stride from the header's arm64e page size,
     /// while every Rust reader derives the same number from
-    /// `contract::gva::PAGE_SHIFT_ARM64E`. A drift is a view built at one
+    /// `reims_vgpu_paging::geometry::PAGE_SHIFT_ARM64E`. A drift is a view built at one
     /// stride and addressed at another, on one pathway, with no failure at the
     /// seam.
     ///

@@ -612,60 +612,55 @@ fn the_texture_record_carries_no_compression_type() {
 
 #[test]
 #[cfg_attr(not(wire_fixtures), ignore = "run scripts/wire-oracle/wire-oracle.sh")]
-fn the_unidentified_flag_nibble_still_reads_what_it_always_has() {
-    // Bits [5:4] have never moved under any perturbation. That is a claim about
-    // Apple's serializer, so it belongs here rather than in a synthesized unit
-    // test — and if a new fixture ever moves them, this is the test that says
-    // so, which is the moment they stop being unidentified.
-    //
-    // It has already fired once, which is why the field is two bits and not
-    // four: `texture_no_gpu_optimized_contents` moved bit 6, and bit 7 turned
-    // out never to be written at all. See `no_view_reads_a_bit_the_serializer_
-    // never_wrote` for how the second half of that was measured.
-    //
-    // Both encodings are swept, and separately: the wide form has a *three*-bit
-    // nibble because it writes bit 7, so folding the two together would compare
-    // a field to a differently-shaped one and could only ever fire on the first
-    // wide case.
+fn texture_private_fields_read_back_the_properties_that_moved_them() {
     let root = fixtures();
-    let mut narrow = None;
-    let mut wide = None;
+    let mut narrow = 0;
+    let mut wide = 0;
     for case in root["cases"].as_array().expect("cases array") {
         if case["selector"] != "newTextureWithDescriptor:allocator:" {
             continue;
         }
+        let Some(framebuffer_only) = case["expect"]["framebuffer_only"].as_u64() else {
+            continue;
+        };
+        let is_drawable = expect_u64(case, "is_drawable");
         let bytes = unhex(case["buffer"].as_str().expect("buffer hex"));
         let o = op(&bytes, 0).expect("well formed");
-        let (seen, flags) = if o.opcode() == texture::OPCODE_NEW_TEXTURE_WIDE {
-            (
-                &mut wide,
-                texture::new_texture_wide(&o)
-                    .expect("fits")
-                    .desc
-                    .unidentified_flags(),
-            )
-        } else {
-            (
-                &mut narrow,
-                new_texture(&o).expect("fits").desc.unidentified_flags(),
-            )
-        };
-        match *seen {
-            None => *seen = Some(flags),
-            Some(prev) => assert_eq!(
-                flags, prev,
-                "case {} moved the unidentified flags from {prev:#06b} to {flags:#06b} -- \
-                 identify them and give them names",
+        let protection_options = expect_u64(case, "protection_options");
+        let (got_framebuffer, got_drawable, got_write_swizzle, got_protection) =
+            if o.opcode() == texture::OPCODE_NEW_TEXTURE_WIDE {
+                wide += 1;
+                let d = &texture::new_texture_wide(&o).expect("fits").desc;
+                (
+                    d.framebuffer_only(),
+                    d.is_drawable(),
+                    Some(d.write_swizzle_enabled()),
+                    d.protection_options.get(),
+                )
+            } else {
+                narrow += 1;
+                let d = &new_texture(&o).expect("fits").desc;
+                (
+                    d.framebuffer_only(),
+                    d.is_drawable(),
+                    None,
+                    d.protection_options.get(),
+                )
+            };
+        assert_eq!(got_framebuffer as u64, framebuffer_only, "{}", case["name"]);
+        assert_eq!(got_drawable as u64, is_drawable, "{}", case["name"]);
+        assert_eq!(got_protection, protection_options, "{}", case["name"]);
+        if let Some(got) = got_write_swizzle {
+            assert_eq!(
+                got as u64,
+                expect_u64(case, "write_swizzle_enabled"),
+                "{}",
                 case["name"]
-            ),
+            );
         }
     }
-    assert!(narrow.is_some(), "no texture cases to read flags from");
-    assert!(
-        wide.is_some(),
-        "no wide texture case; the swizzled form is captured under \
-         `-setSupportsSwizzledTextures:` and its flag nibble is a separate claim"
-    );
+    assert!(narrow > 0, "no narrow texture cases carried private flags");
+    assert!(wide > 0, "no wide texture cases carried private flags");
 }
 
 /// Bits the serializer leaves alone, per record, measured rather than eyeballed.
@@ -747,10 +742,8 @@ const PARTIALLY_WRITTEN: &[(&str, &str, usize, UnwrittenBytes)] = &[
     // than by selector. See `ops::texture::WideTextureDescriptorBody`.
     ("PGSerializer", "opcode 0x0034", 52, &[(51, 0x00)]),
     // The same wide descriptor's tail in the three records that embed it, at
-    // whatever offset each one puts it. Note the IOSurface form's is *not* at
-    // the end: its `plane` follows the descriptor, and that plane is four
-    // written bytes here where the narrow form's two-byte one leaves two
-    // unwritten. So the wide record has one hole and the narrow one has three.
+    // whatever offset each one puts it. The IOSurface form then carries a
+    // two-byte plane and a one-byte rotation; its final byte is unwritten.
     ("PGSerializer", "opcode 0x0037", 72, &[(71, 0x00)]),
     (
         "PGSerializer",
@@ -758,7 +751,12 @@ const PARTIALLY_WRITTEN: &[(&str, &str, usize, UnwrittenBytes)] = &[
         68,
         &[(55, 0x00), (56, 0x01), (57, 0x00), (58, 0x00), (59, 0x00)],
     ),
-    ("PGSerializer", "opcode 0x0039", 56, &[(51, 0x00)]),
+    (
+        "PGSerializer",
+        "opcode 0x0039",
+        56,
+        &[(51, 0x00), (55, 0x00)],
+    ),
     // The fifth, and the one where the hole is not near the end: this is a
     // query, so the reply pair follows the descriptor and the unwritten byte
     // lands twelve bytes from the record's tail.
@@ -3706,6 +3704,7 @@ fn every_segment_header_fixture_reads_back_what_the_encoder_wrote() {
     let mut checked = 0usize;
     let mut envelope_payloads: std::collections::BTreeSet<u64> = Default::default();
     let mut envelope_types: std::collections::BTreeSet<u8> = Default::default();
+    let mut continuation_pair: std::collections::BTreeMap<&str, (bool, bool)> = Default::default();
 
     for case in root["cases"].as_array().expect("cases array") {
         if case["selector"] != "beginSegment:protectionOptions:" {
@@ -3728,7 +3727,7 @@ fn every_segment_header_fixture_reads_back_what_the_encoder_wrote() {
         // options, which is exactly the misreading the burst invites — so it is
         // recognised by position, `_1` of a three-record split, and asserted as
         // itself.
-        if name.ends_with("_1") {
+        if name.ends_with("_1") && case["expect"].get("flag").is_none() {
             let e = segment::protection_options_envelope(&bytes)
                 .unwrap_or_else(|e| panic!("{name}: {e}"));
             assert_eq!(
@@ -3748,15 +3747,20 @@ fn every_segment_header_fixture_reads_back_what_the_encoder_wrote() {
             "{name}: the length is backfilled by -endEncoding, so it must still \
              read 0 at -beginSegment: time"
         );
+        let continues_previous = expect_u64(case, "flag") != 0;
+        let continues_next = case["expect"]
+            .get("continues_next")
+            .and_then(serde_json::Value::as_u64)
+            .is_some_and(|value| value != 0);
         assert_eq!(
-            h.begin_flag as u64,
-            expect_u64(case, "flag"),
-            "{name}: begin_flag"
+            h.continues_previous(),
+            continues_previous,
+            "{name}: continues_previous"
         );
-        assert_eq!(
-            h.unidentified_u8, 0,
-            "{name}: unidentified_u8 is no longer 0"
-        );
+        assert_eq!(h.continues_next(), continues_next, "{name}: continues_next");
+        if name.starts_with("blit_segment_continuation_pair_") {
+            continuation_pair.insert(name, (h.continues_previous(), h.continues_next()));
+        }
 
         // The eighth byte is never written. If a view ever grew into it, a real
         // guest would be reading whatever its ring last held.
@@ -3800,6 +3804,16 @@ fn every_segment_header_fixture_reads_back_what_the_encoder_wrote() {
     }
 
     assert!(checked > 0, "no beginSegment: cases in fixtures.json");
+    assert_eq!(
+        continuation_pair.get("blit_segment_continuation_pair_0"),
+        Some(&(false, true)),
+        "the first header must leave its encoder open for the paired continuation"
+    );
+    assert_eq!(
+        continuation_pair.get("blit_segment_continuation_pair_1"),
+        Some(&(true, false)),
+        "the second header must continue the first and then close the encoder"
+    );
 
     // The envelope, and the reason it is asserted here rather than left to the
     // fixtures: two distinct payloads is what separates "the guest's options
@@ -3849,6 +3863,50 @@ fn every_segment_header_fixture_reads_back_what_the_encoder_wrote() {
     eprintln!(
         "checked {checked} segment headers across {} classes",
         by_class.len()
+    );
+}
+
+/// A continuation is one edge represented in two adjacent headers. Testing
+/// either byte alone cannot establish its direction, so this fixture requires
+/// both ends and their opposite values.
+#[test]
+#[cfg_attr(not(wire_fixtures), ignore = "run scripts/wire-oracle/wire-oracle.sh")]
+fn segment_continuation_pair_has_both_directional_ends() {
+    use reims_vgpu_wire::ops::segment;
+
+    let root = fixtures();
+    let mut pair = std::collections::BTreeMap::new();
+    for case in root["cases"].as_array().expect("cases array") {
+        let Some(name) = case["name"].as_str() else {
+            continue;
+        };
+        if !name.starts_with("blit_segment_continuation_pair_") {
+            continue;
+        }
+        let bytes = unhex(case["buffer"].as_str().expect("buffer hex"));
+        let written = unhex(case["written_mask"].as_str().expect("written mask"));
+        let header = segment::segment_header(&bytes).unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(
+            written,
+            [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0],
+            "{name}: exactly the final header byte must remain unwritten"
+        );
+        assert_eq!(bytes[7], 0xaa, "{name}: unwritten poison changed");
+        pair.insert(name, (header.continues_previous(), header.continues_next()));
+    }
+
+    assert_eq!(
+        pair.get("blit_segment_continuation_pair_0"),
+        Some(&(false, true))
+    );
+    assert_eq!(
+        pair.get("blit_segment_continuation_pair_1"),
+        Some(&(true, false))
+    );
+    assert_eq!(
+        pair.len(),
+        2,
+        "unexpected continuation-pair fixtures: {pair:?}"
     );
 }
 
@@ -4706,6 +4764,16 @@ fn every_sampler_fixture_reads_back_what_metal_was_asked_for() {
 
     let root = fixtures();
     let mut checked = 0usize;
+    let private_candidate_names = [
+        "sampler_force_seams_on_cubemap_filtering",
+        "sampler_force_resource_index",
+        "sampler_resource_index",
+        "sampler_pixel_format",
+        "sampler_reduction_mode",
+        "sampler_lod_bias",
+        "sampler_border_color_spi",
+    ];
+    let mut private_candidates = std::collections::BTreeSet::new();
     for case in root["cases"].as_array().expect("cases array") {
         let name = case["name"].as_str().expect("case name");
         if case["selector"] != "newSamplerStateWithDescriptor:allocator:" {
@@ -4802,6 +4870,14 @@ fn every_sampler_fixture_reads_back_what_metal_was_asked_for() {
             expect_u64(case, "support_argument_buffers"),
             "{name}: support_argument_buffers"
         );
+        assert_eq!(
+            s.unidentified_flag_bits(),
+            0,
+            "{name}: a private candidate moved an unidentified sampler flag"
+        );
+        if private_candidate_names.contains(&name) {
+            private_candidates.insert(name);
+        }
         // Metal keeps these as `float`, and the expectation is the `double`
         // JSON carries, so the comparison is made in the wire's own width.
         assert_eq!(
@@ -4821,6 +4897,11 @@ fn every_sampler_fixture_reads_back_what_metal_was_asked_for() {
         checked += 1;
     }
     assert!(checked > 0, "no sampler cases in fixtures.json");
+    assert_eq!(
+        private_candidates,
+        private_candidate_names.into_iter().collect(),
+        "the private sampler-property exclusion sweep is incomplete"
+    );
     eprintln!("checked {checked} sampler fixtures against Apple's serializer");
 }
 
@@ -4872,7 +4953,12 @@ fn every_depth_stencil_fixture_reads_back_what_metal_was_asked_for() {
             "{name}: depth_write_enabled"
         );
 
-        for (face, side) in [(&d.front, "front"), (&d.back, "back")] {
+        for (face, side) in [(d.front_stencil(), "front"), (d.back_stencil(), "back")] {
+            let expected_present = expect_u64(case, &format!("{side}_face_present")) != 0;
+            assert_eq!(face.is_some(), expected_present, "{name}: {side} presence");
+            let Some(face) = face else {
+                continue;
+            };
             assert_eq!(
                 face.compare_function() as u64,
                 expect_u64(case, &format!("{side}_stencil_compare_function")),
@@ -4910,10 +4996,14 @@ fn every_depth_stencil_fixture_reads_back_what_metal_was_asked_for() {
             );
         }
         assert_eq!(
-            d.unidentified_state_bits(),
-            0b11,
-            "{name}: the two unidentified state bits moved; that is the moment they \
-             stop being unidentified"
+            d.front_stencil_present() as u64,
+            expect_u64(case, "front_face_present"),
+            "{name}: front-face presence"
+        );
+        assert_eq!(
+            d.back_stencil_present() as u64,
+            expect_u64(case, "back_face_present"),
+            "{name}: back-face presence"
         );
         checked += 1;
     }
@@ -4924,9 +5014,9 @@ fn every_depth_stencil_fixture_reads_back_what_metal_was_asked_for() {
 #[test]
 #[cfg_attr(not(wire_fixtures), ignore = "run scripts/wire-oracle/wire-oracle.sh")]
 fn a_nil_stencil_face_produces_the_record_a_default_one_does() {
-    // The negative result behind `unidentified_state_bits`, kept as a test so
-    // the experiment is not re-run by hand. If a later Metal stops substituting
-    // a default face, these records diverge and the two bits become derivable.
+    // Publicly assigning nil is not a way to create an absent face: the
+    // descriptor substitutes its default face before serialization. Keep that
+    // API behavior distinct from the private-slot presence contract below.
     let root = fixtures();
     let mut by_name = std::collections::BTreeMap::new();
     for case in root["cases"].as_array().expect("cases array") {
@@ -4965,6 +5055,40 @@ fn a_nil_stencil_face_produces_the_record_a_default_one_does() {
             "{absent} moved bytes {moved:?}; a nil face reaches the wire after all, and \
              `ops::depth_stencil` says it does not"
         );
+    }
+}
+
+#[test]
+#[cfg_attr(not(wire_fixtures), ignore = "run scripts/wire-oracle/wire-oracle.sh")]
+fn private_face_absence_controls_presence_and_hides_its_unwritten_body() {
+    use reims_vgpu_wire::ops::depth_stencil::new_depth_stencil;
+
+    let root = fixtures();
+    let mut by_name = std::collections::BTreeMap::new();
+    for case in root["cases"].as_array().expect("cases array") {
+        by_name.insert(case["name"].as_str().expect("case name"), case);
+    }
+
+    for (name, front_present, back_present) in [
+        ("depth_stencil_private_front_face_absent", false, true),
+        ("depth_stencil_private_back_face_absent", true, false),
+        ("depth_stencil_private_both_faces_absent", false, false),
+    ] {
+        let case = by_name
+            .get(name)
+            .unwrap_or_else(|| panic!("{name} fixture"));
+        let bytes = unhex(case["buffer"].as_str().expect("buffer hex"));
+        let op = op(&bytes, 0).unwrap_or_else(|error| panic!("{name}: {error}"));
+        let descriptor = new_depth_stencil(&op).unwrap_or_else(|error| panic!("{name}: {error}"));
+
+        assert_eq!(descriptor.front_stencil_present(), front_present, "{name}");
+        assert_eq!(descriptor.back_stencil_present(), back_present, "{name}");
+        assert_eq!(
+            descriptor.front_stencil().is_some(),
+            front_present,
+            "{name}"
+        );
+        assert_eq!(descriptor.back_stencil().is_some(), back_present, "{name}");
     }
 }
 
@@ -5409,10 +5533,8 @@ fn every_backed_texture_fixture_reads_back_what_metal_was_asked_for() {
 
         if case["selector"] == "newIOSurfaceTextureWithDescriptor:plane:allocator:" {
             let o = op(&bytes, 0).unwrap_or_else(|e| panic!("{name}: {e}"));
-            // The wide form, whose `plane` is four bytes where the narrow one's
-            // is two. Reading it through the wide view is the assertion: a
-            // `U16le` here would still read the right number, so what this
-            // catches is the *record length* arithmetic that the width feeds.
+            // The wide form carries a two-byte plane followed by rotation. The
+            // final byte is unwritten and must not affect either value.
             if o.opcode() == bt::OPCODE_IOSURFACE_TEXTURE_WIDE {
                 assert_eq!(
                     o.length(),
@@ -5430,11 +5552,40 @@ fn every_backed_texture_fixture_reads_back_what_metal_was_asked_for() {
                     expect_u64(case, "plane"),
                     "{name}: plane"
                 );
+                if let Some(rotation) = case["expect"]["rotation"].as_u64() {
+                    assert_eq!(t.rotation as u64, rotation, "{name}: rotation");
+                }
                 assert_eq!(
-                    t.desc.unidentified_u64.get(),
-                    0,
-                    "{name}: the wide descriptor's trailing u64 moved"
+                    t.desc.protection_options.get(),
+                    expect_u64(case, "protection_options"),
+                    "{name}: protection_options"
                 );
+                planes.insert(expect_u64(case, "plane"));
+                continue;
+            }
+            if o.opcode() == bt::OPCODE_IOSURFACE_TEXTURE_ROTATED {
+                assert_eq!(
+                    o.length(),
+                    bt::IOSURFACE_TEXTURE_ROTATED_TOTAL_LEN,
+                    "{name}: length"
+                );
+                let t = bt::iosurface_texture_rotated(&o).unwrap_or_else(|e| panic!("{name}: {e}"));
+                assert_eq!(
+                    t.object_ref.get() as u64,
+                    expect_u64(case, "object_ref"),
+                    "{name}: object_ref"
+                );
+                assert_eq!(
+                    t.plane.get() as u64,
+                    expect_u64(case, "plane"),
+                    "{name}: plane"
+                );
+                assert_eq!(
+                    t.rotation as u64,
+                    expect_u64(case, "rotation"),
+                    "{name}: rotation"
+                );
+                assert_desc(case, name, &t.desc);
                 planes.insert(expect_u64(case, "plane"));
                 continue;
             }
@@ -5456,12 +5607,10 @@ fn every_backed_texture_fixture_reads_back_what_metal_was_asked_for() {
                 "{name}: plane"
             );
             assert_desc(case, name, &t.desc);
-            // The experiment `ops::texture::unidentified_u64` named as the last
-            // way to move that word. It did not move.
             assert_eq!(
-                t.desc.unidentified_u64.get(),
-                0,
-                "{name}: the descriptor's trailing u64 moved -- it is no longer unidentified"
+                t.desc.protection_options.get(),
+                expect_u64(case, "protection_options"),
+                "{name}: protection_options"
             );
             planes.insert(expect_u64(case, "plane"));
         }

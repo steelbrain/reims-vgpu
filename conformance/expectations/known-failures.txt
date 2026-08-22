@@ -1,0 +1,82 @@
+# Cases this device is known to fail, one name a line, `#` starts a comment.
+#
+# The comment is the point: a name with no comment is a case somebody silenced.
+# `verdict.py` reads this file in both directions -- an unlisted failure fails
+# the run, and so does a listed case that has started passing. Prune when you
+# fix something.
+#
+# Recorded on rail macos-13, x86 pathway, with the import capable and on.
+
+# ---------------------------------------------------------------------------
+# A8Unorm is refused on the compute sampled rail.
+#
+# The device declines the bind rather than mis-executing it, so every one of
+# these reports "the readback dispatch produced nothing" -- the refusal is
+# visible and named. `/tmp/reims-vgpu-fail.log`:
+#
+#   compute_linux sampled_format fail reason=mtl_format_unsupported bind=32 fmt=0x1
+#   compute_record reason=sampled_format_unsupported class=unsupported
+#
+# `fmt=0x1` is `MTLPixelFormatA8Unorm`. Twelve cases, and twelve refusals in the
+# log, so nothing here is lost silently. The fragment arm of the same shapes
+# passes, which is why the type layer renders at all: a glyph atlas reaches the
+# rasterizer and not a kernel.
+# ---------------------------------------------------------------------------
+incremental_a8Unorm_compute_first_read
+replace_a8Unorm_compute_first_read
+linear_a8Unorm_218x16_pitch_256
+linear_a8Unorm_54x16_pitch_tight_plus1
+linear_a8Unorm_54x16_pitch_tight_plus2
+linear_a8Unorm_64x16_pitch_tight
+linear_a8Unorm_64x16_pitch_tight_sampled
+offset_alias_a8Unorm_54x16_x4
+offset_oracle_218x16_pitch_tight_compute
+offset_oracle_250x16_pitch_tight_compute
+offset_oracle_256x16_pitch_tight_compute
+offset_oracle_54x16_pitch_tight_plus1_compute
+
+# ---------------------------------------------------------------------------
+# Nothing above mip level 0 arrives.
+#
+# All three ways of asking agree, which is what makes this one defect and not
+# three. A `sample` at level N returns level 0's texels (`got=0x10101010`, which
+# is level 0's fill) and a `fetch` or a blit-readback at level N returns zeros --
+# so the levels are not merely sampled at the wrong LOD, they are not populated.
+# Level 0 passes on all three.
+#
+# Not diagnosed. Unlike the family above there is no refusal in the fail log for
+# these, which makes it the more serious of the two: guest work is lost with
+# nothing saying so.
+# ---------------------------------------------------------------------------
+mip_blit_level_1_size32
+mip_blit_level_2_size16
+mip_blit_level_3_size8
+mip_blit_level_4_size4
+mip_blit_level_5_size2
+mip_blit_level_6_size1
+mip_fetch_level_1_size32
+mip_fetch_level_2_size16
+mip_fetch_level_3_size8
+mip_fetch_level_4_size4
+mip_fetch_level_5_size2
+mip_fetch_level_6_size1
+mip_sample_level_1_size32
+mip_sample_level_2_size16
+mip_sample_level_3_size8
+mip_sample_level_4_size4
+mip_sample_level_5_size2
+mip_sample_level_6_size1
+
+# ---------------------------------------------------------------------------
+# A render target made from an `MTLBuffer` is refused as a colour attachment.
+#
+# `never_written=262144` of 262144: every draw into it was dropped, so the copy
+# out of it moved a target nothing had rendered to. The fail log names it:
+#
+#   rt_resolve reason=rt_wrong_type object_type=texture_view
+#
+# A texture created over a buffer arrives at the render-target resolver as a
+# texture view, and the resolver's ladder does not admit that type. Named, not
+# diagnosed; `rt_resolve` is where to start.
+# ---------------------------------------------------------------------------
+srt_blit_buffer_backed_512x512

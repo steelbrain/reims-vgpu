@@ -1,9 +1,9 @@
 //! Resource descriptor decode (port of `host/utils/reims-vgpu-resource-decode`).
 
-use crate::contract::endian::{ld16, ld32, ld64}; // ld64: texture-view level base/count
+use crate::runtime::heap_query;
+use reims_vgpu_core::endian::{ld16, ld32, ld64}; // ld64: texture-view level base/count
 #[cfg(test)]
-use crate::contract::endian::{st16, st32};
-use crate::runtime::heap_query; // ICB layout fixture encoder only
+use reims_vgpu_core::endian::{st16, st32}; // ICB layout fixture encoder only
 
 use core::mem::{offset_of, size_of};
 use reims_vgpu_wire::ops::{
@@ -12,86 +12,53 @@ use reims_vgpu_wire::ops::{
 };
 use reims_vgpu_wire::OP_HEADER_LEN as OP_HDR;
 
-/// A refusal from the descriptor decoder.
-///
-/// This decoder sits upstream of every rail — blit, compute, render, mipmap and
-/// resource registration all reach a guest object through it — so a refusal
-/// here means some object the guest created is unusable everywhere. The payload
-/// is the registered slug naming which check refused: **29 of the 40 sites were
-/// `ErrShort`**, one name for twenty-nine different reads, from a 12-byte
-/// object-list entry to a vertex-attribute table offset inside a type-7 body.
-///
-/// Slugs carry a `res_` prefix. Six modules under `runtime/decode/` define a
-/// type called `DecodeStatus` and five of them have an `ErrShort` meaning a
-/// different read, so without the prefix the crate-wide uniqueness gate could
-/// not tell this decoder's refusals from the stream framer's.
-///
-/// There is deliberately no `Ok`: every entry point returns
-/// `Result<_, DecodeStatus>`. `Ok`, `ErrArgs` and `ErrOverflow` were **never
-/// constructed anywhere in the crate** — they existed only as arms of a
-/// `decode_status_name` helper that itself had no callers — so they are gone
-/// and this is a [`crate::observe::Decline`], not a `Refusal`.
-///
-/// `ErrBadLength` went the same way. Every length disagreement this decoder can
-/// see is a read that ran off the end, and all three sites of the compact-TLV
-/// walk already say so with their own slug (`res_tlv_offset_past_end`,
-/// `res_tlv_header_short`, `res_tlv_value_short`). A second class for the same
-/// condition would only split one check's census across two names.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DecodeStatus {
-    /// The blob is shorter than the field being read.
-    ErrShort(&'static str),
-    /// An object-list type tag this host has no contract for.
-    ErrUnknownType(&'static str),
-    /// A well-formed blob whose tag/opcode names a variant the decoder does not
-    /// implement.
-    ErrUnsupported(&'static str),
-}
+pub use reims_vgpu_protocol::{
+    ColorWriteMask, ObjectKind, ObjectListEntry as ListObjectEntry, MTL_COLOR_WRITE_MASK_ALL,
+    MTL_COLOR_WRITE_MASK_ALPHA, MTL_COLOR_WRITE_MASK_BLUE, MTL_COLOR_WRITE_MASK_GREEN,
+    MTL_COLOR_WRITE_MASK_NONE, MTL_COLOR_WRITE_MASK_RED,
+};
 
-impl crate::observe::Decline for DecodeStatus {
+pub use reims_vgpu_protocol::ResourceDecodeError as DecodeStatus;
+
+/// Observation adapter for the protocol-owned decode refusal.
+#[derive(Clone, Copy, Debug)]
+pub struct DecodeDecline(pub DecodeStatus);
+
+impl crate::observe::Decline for DecodeDecline {
     fn slug(&self) -> &'static str {
-        match self {
-            Self::ErrShort(s) | Self::ErrUnknownType(s) | Self::ErrUnsupported(s) => s,
-        }
+        self.0.slug()
     }
 
     fn fields(&self) -> Vec<(&'static str, String)> {
-        vec![(
-            "class",
-            match self {
-                Self::ErrShort(_) => "short",
-                Self::ErrUnknownType(_) => "unknown_type",
-                Self::ErrUnsupported(_) => "unsupported",
-            }
-            .to_string(),
-        )]
+        self.0.fields()
     }
 }
 
 /// Live object-list type tags (`reims_vgpu_resource_decode.h` / arm contract).
 ///
-/// Type 3 carries the same geometry prefix as type 2 (WindowServer composite
-/// and glyph sources); type 7 is the container for sampler, depth-stencil and
-/// render/compute pipeline descriptors.
+/// Wire tag 3 carries the same geometry prefix as wire tag 2 (WindowServer
+/// composite and glyph sources); wire tag 7 is the serializer-resource
+/// container for sampler, depth-stencil, render/compute pipeline, and indirect
+/// command-buffer descriptors.
 pub const OBJECT_TYPE_BUFFER: u8 = 1;
 pub const OBJECT_TYPE_TEXTURE: u8 = 2;
 pub const OBJECT_TYPE_TEXTURE_VARIANT: u8 = 3;
 pub const OBJECT_TYPE_FUNCTION: u8 = 6;
-pub const OBJECT_TYPE_TYPE7: u8 = 7;
+pub const OBJECT_TYPE_SERIALIZER_RESOURCE: u8 = 7;
 pub const OBJECT_TYPE_TEXTURE_VIEW: u8 = 8;
 pub const OBJECT_TYPE_IOSURFACE: u8 = 11;
 
-/// Type-7 first dword subtypes.
-pub const TYPE7_OBJECT_SAMPLER: u32 = w_smp::OPCODE_NEW_SAMPLER;
-pub const TYPE7_OBJECT_DEPTH_STENCIL: u32 = w_ds::OPCODE_NEW_DEPTH_STENCIL;
-pub const TYPE7_OBJECT_COMPUTE_PIPELINE: u32 = 0x0b;
-pub const TYPE7_OBJECT_RENDER_PIPELINE: u32 = 0x0e;
+/// Serializer resource first dword subtypes.
+pub const SERIALIZER_RESOURCE_OBJECT_SAMPLER: u32 = w_smp::OPCODE_NEW_SAMPLER;
+pub const SERIALIZER_RESOURCE_OBJECT_DEPTH_STENCIL: u32 = w_ds::OPCODE_NEW_DEPTH_STENCIL;
+pub const SERIALIZER_RESOURCE_OBJECT_COMPUTE_PIPELINE: u32 = 0x0b;
+pub const SERIALIZER_RESOURCE_OBJECT_RENDER_PIPELINE: u32 = 0x0e;
 /// Indirect command buffer create body from
 /// `PGSerializer newIndirectCommandBufferWithDescriptor:layout:maxCommandCount:options:allocator:`.
-pub const TYPE7_OBJECT_ICB: u32 = w_icb::OPCODE_NEW_INDIRECT_COMMAND_BUFFER;
-/// End of the 16-byte type-7 header, which is also where its first TLV
+pub const SERIALIZER_RESOURCE_OBJECT_ICB: u32 = w_icb::OPCODE_NEW_INDIRECT_COMMAND_BUFFER;
+/// End of the 16-byte serializer resource header, which is also where its first TLV
 /// starts — one boundary, so one name.
-pub const TYPE7_FIRST_TLVS: usize = 16;
+pub const SERIALIZER_RESOURCE_FIRST_TLVS: usize = 16;
 /// Serialized ICB descriptor length (allocateOperationBytes 0x58).
 pub const ICB_DESC_LEN: usize = w_icb::NEW_INDIRECT_COMMAND_BUFFER_TOTAL_LEN as usize;
 /// Per-stage max bind counts are single bytes (PGSerializer create body).
@@ -266,7 +233,7 @@ pub const MTL_INDIRECT_CMD_CONCURRENT_DISPATCH_THREADS: u32 = 1 << 6;
 pub const MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS: u32 = 1 << 7;
 pub const MTL_INDIRECT_CMD_DRAW_MESH_THREADS: u32 = 1 << 8;
 
-/// Compact type-7 TLV field: `[tag:u8][length:u8][value…]` after a field-count byte.
+/// Compact serializer resource TLV field: `[tag:u8][length:u8][value…]` after a field-count byte.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CompactTlv {
     pub tag: u8,
@@ -276,237 +243,27 @@ pub struct CompactTlv {
     pub has_u32: bool,
 }
 
-/// Linear buffer descriptor (type-1): allocation size + guest page handle.
-///
-/// Contract: `reims_vgpu_resource_format.h` `REIMS_VGPU_RESOURCE_LINEAR_DESC_*`.
-/// Backing GVA = `(handle as u64) << PAGE_SHIFT` (14 on arm64e guest).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct BufferDescriptor {
-    pub allocation_size: u64,
-    pub handle64: u64,
-    pub handle: u32,
-}
+pub use reims_vgpu_protocol::BufferDescriptor;
 
 /// Linear descriptor offsets (shared with type-2 texture prefix).
 pub const LINEAR_DESC_MIN_LEN: usize = 16;
 pub const LINEAR_DESC_SIZE: usize = 0;
 pub const LINEAR_DESC_HANDLE: usize = 8;
-/// Arm fixture alias of [`crate::contract::gva::PAGE_SHIFT_ARM64E`].
+/// Arm fixture alias of [`reims_vgpu_paging::geometry::PAGE_SHIFT_ARM64E`].
 /// Prefer `PAGE_SHIFT_ARM64E` / `PAGE_SHIFT_X86` at new call sites. Product
-/// paths must pass `DeviceState::page_shift`, not a fixed arch constant.
-pub const RESOURCE_PAGE_SHIFT: u32 = crate::contract::gva::PAGE_SHIFT_ARM64E;
+/// paths must pass `Device::page_shift`, not a fixed arch constant.
+pub const RESOURCE_PAGE_SHIFT: u32 = reims_vgpu_paging::geometry::PAGE_SHIFT_ARM64E;
 
-impl BufferDescriptor {
-    /// Guest VA of buffer backing at the given page_shift, or None when
-    /// size/handle/shift is invalid. Callers must pass arm (14) or x86 (12)
-    /// explicitly — there is no default.
-    pub fn backing_gva_size(&self, page_shift: u32) -> Option<(u64, u64)> {
-        if self.allocation_size == 0 || self.handle == 0 || page_shift == 0 || page_shift > 30 {
-            return None;
-        }
-        Some(((self.handle as u64) << page_shift, self.allocation_size))
-    }
-}
-
-/// One mip level layout inside a type-2/3 texture allocation.
-///
-/// Level 0 comes from the geometry prefix; levels 1..N-1 are 36-byte records at
-/// `TEXTURE_DESC_LEVEL_RECORDS` (offset/size/row_stride from allocation base).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct TextureLevelLayout {
-    /// Byte offset from allocation base (`handle << PAGE_SHIFT`).
-    pub offset: u64,
-    pub size: u64,
-    pub row_stride: u64,
-    pub width: u32,
-    pub height: u32,
-    pub depth: u32,
-}
-
-impl TextureLevelLayout {
-    /// Bytes from [`Self::offset`] that a row-by-row reader or writer of this
-    /// level actually touches, given one tight row of its format.
-    ///
-    /// `row_stride * height` is the obvious answer and it overcounts by one
-    /// row of trailing padding: the last row occupies `tight_row` bytes, and
-    /// every reader in this crate walks `base + y * row_stride` for `tight_row`
-    /// bytes. Used as a bound against `TextureDescriptor::allocation_size`,
-    /// the looser form rejects allocations the guest sized correctly.
-    ///
-    /// Measured: a 27x27 `RG8Unorm` window-corner mask at offset 0x850 with a
-    /// 384-byte stride in a 12 288-byte allocation scores 12 496 under
-    /// `stride * height` and is refused, while its true extent is 12 166. That
-    /// refusal dropped the WindowServer's whole full-screen composite draw, so
-    /// the guest's rounded window corners and drop shadows rendered square.
-    ///
-    /// `None` for zero height (no rows) or on overflow. A bound this feeds must
-    /// treat `None` as a refusal, never as "no limit".
-    pub fn read_span(&self, tight_row: u32) -> Option<u64> {
-        self.height
-            .checked_sub(1)
-            .map(u64::from)?
-            .checked_mul(self.row_stride)?
-            .checked_add(u64::from(tight_row))
-    }
-
-    /// How many contiguous depth planes one array slice of this level holds.
-    ///
-    /// `depth` 0 and 1 both mean one plane, matching `TextureDescriptor`'s
-    /// "0 means 2D" encoding. **The one place that rule is written.** It used to
-    /// be written three times — here as `depth.max(1)`, again in
-    /// `blit_exec`'s caller as `if layout.depth == 0 { 1 } else { .. }`, and a
-    /// third time inside the stride helper that caller then passed the already
-    /// normalized value to — and only this copy carried the encoding it comes
-    /// from. Two of the three read as a defensive clamp on a decoded guest field,
-    /// which is the shape that fabricates a geometry the guest did not send the
-    /// day one of them is reached without the others.
-    pub fn planes(&self) -> u32 {
-        self.depth.max(1)
-    }
-
-    /// Contiguous Metal packing for one array slice / cube face of this level:
-    /// `row_stride * height * planes`.
-    ///
-    /// Zero height gives zero, which is the honest answer for a level with no
-    /// rows rather than the one-row stride a `height.max(1)` would invent. The
-    /// blit caller refuses a zero-height level by name (`tex_zero_geom`) before
-    /// it gets here, so that arm is unreachable through it today; it is written
-    /// this way so it stays right for a caller that does not.
-    pub fn slice_stride(&self) -> Option<u64> {
-        self.row_stride
-            .checked_mul(u64::from(self.height))?
-            .checked_mul(u64::from(self.planes()))
-    }
-
-    /// Bytes from [`Self::offset`] that a reader of one whole array slice /
-    /// cube face of this level touches, with [`Self::planes`] packed
-    /// contiguously inside the slice at `row_stride * height` each.
-    ///
-    /// Every plane below the last is walked in full; the last one ends at
-    /// [`Self::read_span`], because the padding after its final row is no more
-    /// read here than it is in the 2D case.
-    ///
-    /// Takes its plane count from `self` rather than from the caller. It used to
-    /// take a `depth` parameter, and its only production caller passed
-    /// `self.depth` with the encoding above already applied — a value the
-    /// receiver holds, travelling as a loose argument that a second caller could
-    /// get wrong with nothing to notice.
-    pub fn slice_read_span(&self, tight_row: u32) -> Option<u64> {
-        u64::from(self.planes() - 1)
-            .checked_mul(self.row_stride)?
-            .checked_mul(u64::from(self.height))?
-            .checked_add(self.read_span(tight_row)?)
-    }
-}
-
-/// Type-2/3 linear texture geometry (`REIMS_VGPU_RESOURCE_TEXTURE_DESC_*`).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct TextureDescriptor {
-    pub allocation_size: u64,
-    pub handle: u32,
-    pub mipmap_level_count: u32,
-    pub data_offset: u32,
-    pub bytes_per_element: u8,
-    pub used_size: u32,
-    pub row_stride: u32,
-    pub width: u32,
-    pub height: u32,
-    pub depth: u32,
-    pub pixel_format: u16,
-    /// Per-mip layouts (index 0 = L0). Empty if geometry incomplete.
-    pub levels: Vec<TextureLevelLayout>,
-}
-
-impl TextureDescriptor {
-    /// The extent this descriptor names, or `None` when it names none.
-    ///
-    /// The decoder reads each geometry field only if the record is long enough
-    /// to carry it, so a short record and a record of zeroes both arrive here as
-    /// zero. Neither is a texture, and neither is a 1x1 one: a caller that
-    /// clamps the two fields up sizes a four-byte payload, finds any buffer long
-    /// enough, and binds a single texel of whatever the read returned — which is
-    /// indistinguishable from a real bind at every layer above.
-    ///
-    /// This replaced a `has_width` and a `has_height` field, each set to
-    /// `field != 0` beside the field it described and each read as a zero check
-    /// by three call sites. Storing a predicate next to its own input lets the
-    /// two disagree; there is nothing here for a future decode arm to forget to
-    /// set. Callers wanting only the handle or the format read those directly.
-    pub fn extent(&self) -> Option<(u32, u32)> {
-        if self.width == 0 || self.height == 0 {
-            return None;
-        }
-        Some((self.width, self.height))
-    }
-
-    /// The row stride this descriptor names, or `None` when it names none.
-    ///
-    /// Same shape as [`Self::extent`] and for the same reason: this replaced a
-    /// `has_row_stride` field assigned `row_stride != 0` two lines after
-    /// `row_stride` itself, which three readers then spelled back out as a zero
-    /// check. A stride of zero is a record that carried no stride, and the
-    /// consequence — how far a row read may reach — is not something to guess.
-    pub fn declared_row_stride(&self) -> Option<u32> {
-        (self.row_stride != 0).then_some(self.row_stride)
-    }
-
-    /// The pixel format this descriptor names, or `None` when it names none.
-    ///
-    /// `MTLPixelFormatInvalid` is 0, so a zero is an absent format rather than
-    /// a format, and the gates downstream of it fail closed. Named the same as
-    /// [`TextureViewDescriptor::declared_pixel_format`] because it is the same
-    /// question: the two decoders once disagreed about what an absent format
-    /// meant, one storing `!= 0` and the other an unconditional `true`.
-    pub fn declared_pixel_format(&self) -> Option<u16> {
-        (self.pixel_format != 0).then_some(self.pixel_format)
-    }
-
-    /// Allocation base GVA (`handle << page_shift`), not including data_offset.
-    /// `page_shift` must be chosen explicitly (12 or 14).
-    pub fn allocation_base_gva(&self, page_shift: u32) -> Option<u64> {
-        if self.handle == 0 || page_shift == 0 || page_shift > 30 {
-            return None;
-        }
-        Some((self.handle as u64) << page_shift)
-    }
-
-    /// Level-0 texel base GVA and allocation size at the given page_shift.
-    pub fn backing_gva_size(&self, page_shift: u32) -> Option<(u64, u64)> {
-        if self.allocation_size == 0 || self.handle == 0 {
-            return None;
-        }
-        let base = self.allocation_base_gva(page_shift)?;
-        Some((base + self.data_offset as u64, self.allocation_size))
-    }
-
-    /// Layout for mip `level` (0-based).
-    pub fn level(&self, level: u32) -> Option<&TextureLevelLayout> {
-        self.levels.get(level as usize)
-    }
-
-    /// Guest VA of mip `level` texel base + layout at the given page_shift.
-    pub fn level_gva(&self, level: u32, page_shift: u32) -> Option<(u64, &TextureLevelLayout)> {
-        let base = self.allocation_base_gva(page_shift)?;
-        let layout = self.level(level)?;
-        if layout.width == 0 || layout.height == 0 || layout.row_stride == 0 {
-            return None;
-        }
-        // Offset must leave room for at least one row within the allocation.
-        if self.allocation_size != 0
-            && (layout.offset >= self.allocation_size
-                || self.allocation_size - layout.offset < layout.row_stride)
-        {
-            return None;
-        }
-        Some((base.checked_add(layout.offset)?, layout))
-    }
-}
+pub use reims_vgpu_protocol::{LinearTextureDescriptor as TextureDescriptor, TextureLevelLayout};
 
 /// Texture descriptor field offsets (geometry prefix + format trailer).
 pub const TEXTURE_DESC_GEOMETRY_LEN: usize = 68;
 pub const TEXTURE_DESC_MIPMAP_LEVEL_COUNT: usize = 12;
-pub const TEXTURE_DESC_DATA_OFFSET: usize = 16;
+pub const TEXTURE_DESC_SLICE_COUNT: usize = 14;
+pub const TEXTURE_DESC_BASE_OFFSET: usize = 16;
+pub const TEXTURE_DESC_BYTES_PER_SLICE: usize = 24;
 pub const TEXTURE_DESC_BYTES_PER_ELEMENT: usize = 35;
+pub const TEXTURE_DESC_LEVEL_ZERO: usize = 36;
 pub const TEXTURE_DESC_USED_SIZE: usize = 44;
 pub const TEXTURE_DESC_ROW_STRIDE: usize = 52;
 pub const TEXTURE_DESC_WIDTH: usize = 60;
@@ -520,13 +277,19 @@ pub const TEXTURE_LEVEL_ROW_STRIDE: usize = 16;
 pub const TEXTURE_LEVEL_WIDTH: usize = 24;
 pub const TEXTURE_LEVEL_HEIGHT: usize = 28;
 pub const TEXTURE_LEVEL_DEPTH: usize = 32;
-pub const TEXTURE_DESC_PIXEL_FORMAT: usize = 86;
+/// Start of the shared 32-byte serialized texture declaration for a one-level
+/// texture. Every additional mip inserts one layout record before it.
+pub const TEXTURE_DESC_DECLARATION: usize = 84;
+pub const TEXTURE_DESC_PIXEL_FORMAT: usize = TEXTURE_DESC_DECLARATION
+    + offset_of!(reims_vgpu_wire::ops::texture::TextureDescriptorBody, packed)
+    + size_of::<u16>();
 #[cfg(test)]
-pub(crate) const TEXTURE_DESC_BASE_LEN: usize = 116;
+pub(crate) const TEXTURE_DESC_BASE_LEN: usize =
+    TEXTURE_DESC_DECLARATION + heap_query::TEXTURE_BODY_LEN;
 /// Mip level records this device will read from a texture descriptor.
 ///
 /// A **corruption guard, not a capacity choice** — the same kind of bound as
-/// `wire::device_desc::TYPE4_PLANE_CAP`, and it is written here because nothing
+/// `wire::device_desc::SURFACE_BACKING_PLANE_CAP`, and it is written here because nothing
 /// else in this file said so. A pyramid of 16 levels has a base of 2^15 = 32768
 /// pixels in its largest dimension, which is above every Metal texture-size
 /// limit, so a descriptor declaring more levels than this describes a texture
@@ -547,224 +310,11 @@ pub(crate) const TEXTURE_DESC_BASE_LEN: usize = 116;
 /// explicit `levels > TEXTURE_MAX_MIP_LEVELS` test for exactly that reason.
 pub const TEXTURE_MAX_MIP_LEVELS: usize = 16;
 
-/// Vertex attribute from a type-7 render-pipeline vertex-input block.
-///
-/// The two step fields are `Option` rather than a value beside its own presence
-/// bit. The serializer writes a layout's `stepFunction` and `stepRate` as tagged
-/// entries and omits the tag the guest never set, so absence is a state of the
-/// record — and a pair of fields that can spell "absent, 7" is a state the wire
-/// cannot produce. Resolve them through [`VertexAttribute::step_rate`] and
-/// [`VertexAttribute::step_function_ordinal`]; the raw `Option` is what the
-/// record said, and the methods are what Metal does with it.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct VertexAttribute {
-    pub location: u32,
-    pub format: u32,
-    pub offset: u32,
-    pub buffer_index: u32,
-    pub stride: u32,
-    /// `MTLVertexStepFunction` ordinal the layout entry declared, if it did.
-    pub declared_step_function: Option<u32>,
-    /// `MTLVertexBufferLayoutDescriptor.stepRate` the layout entry declared.
-    pub declared_step_rate: Option<u32>,
-}
-
-impl VertexAttribute {
-    /// The step rate this attribute's buffer layout runs at.
-    ///
-    /// `MTLVertexBufferLayoutDescriptor.stepRate` defaults to 1, so a layout
-    /// that declared none steps once per vertex or instance. A layout that
-    /// declared **zero** means zero — that is what `MTLVertexStepFunctionConstant`
-    /// pairs with — so nothing here clamps it up. Two call sites used to, which
-    /// turned a constant-rate attribute into a per-instance one that advanced,
-    /// while the third passed the zero through: one wire field, two answers.
-    pub fn step_rate(&self) -> u32 {
-        self.declared_step_rate.unwrap_or(1)
-    }
-
-    /// The `MTLVertexStepFunction` ordinal this attribute's layout runs at.
-    ///
-    /// `when_absent` is the caller's default because it genuinely differs: a
-    /// plain vertex descriptor defaults to `PerVertex`, and a post-tessellation
-    /// one indexes control points instead.
-    pub fn step_function_ordinal(&self, when_absent: u32) -> u32 {
-        self.declared_step_function.unwrap_or(when_absent)
-    }
-}
-
-/// `MTLColorWriteMask` for one attachment, in Metal's own bit order.
-///
-/// A newtype rather than a bare `u32` for one reason: the value that means
-/// "write every channel" is `0xf`, and the value a derived `Default` would
-/// produce is `0` — which means *write nothing*. `PipelineColorAttachment` is
-/// built with `..Default::default()` in the decoder and defaulted outright at
-/// several call sites, so a bare field would make an omitted mask a black
-/// attachment. Here the omission is unwritable: `Default` is `all`, which is
-/// also what an entry that does not carry tag `0x09` means on the wire.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct ColorWriteMask {
-    /// Private so the only ways to obtain one are [`ColorWriteMask::new`],
-    /// which range-checks, and `Default`, which is `all`. A `pub` field would
-    /// also make this a decode field needing its own coverage disposition,
-    /// when the disposition that matters is `PipelineColorAttachment`'s.
-    bits: u32,
-}
-
-impl Default for ColorWriteMask {
-    fn default() -> Self {
-        Self {
-            bits: MTL_COLOR_WRITE_MASK_ALL,
-        }
-    }
-}
-
-impl ColorWriteMask {
-    /// `None` for a value outside `MTLColorWriteMask`'s four bits — see
-    /// [`ColorWriteMaskOutOfRange`], which is what the decoder reports for it.
-    pub fn new(bits: u32) -> Option<Self> {
-        (bits <= MTL_COLOR_WRITE_MASK_ALL).then_some(Self { bits })
-    }
-
-    pub fn bits(self) -> u32 {
-        self.bits
-    }
-}
-
-/// One pipeline color-attachment entry (format + blend) from the type-7 color section.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct PipelineColorAttachment {
-    pub slot: u32,
-    pub has_pixel_format: bool,
-    pub pixel_format: u32,
-    pub blending_enabled: bool,
-    pub src_rgb: u32,
-    pub dst_rgb: u32,
-    pub op_rgb: u32,
-    pub src_alpha: u32,
-    pub dst_alpha: u32,
-    pub op_alpha: u32,
-    /// Which channels this attachment writes. Independent of blending: a
-    /// masked attachment with blending off still leaves the unwritten channels
-    /// alone, so this cannot ride inside the blend state.
-    pub write_mask: ColorWriteMask,
-}
-
-/// Decoded type-7 render pipeline (functions + optional stage-in attrs).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct RenderPipelineDescriptor {
-    pub object_id: u32,
-    /// The fourth header word: the serialized property list's length **before**
-    /// the four-byte padding the declared length includes.
-    ///
-    /// It was called `word3` and carried no doc for as long as it has been
-    /// decoded, which made it indistinguishable from a field nobody had
-    /// identified. It is not: the header is `objType`, declared length, the new
-    /// object's ref, and this — and the declared length is exactly
-    /// [`TYPE7_FIRST_TLVS`] plus this rounded up to four.
-    ///
-    /// That relation is checkable from the header alone, which is what
-    /// [`note_type7_payload_len`] does. Nothing else reads the field: the walks
-    /// below bound themselves on the *declared* length, which is the larger of
-    /// the two and the one that describes the bytes actually present.
-    pub serialized_payload_len: u32,
-    pub vertex_func_ref: u32,
-    pub fragment_func_ref: u32,
-    /// Object-stage function ref (mesh SPI shape: tag `0x01`).
-    ///
-    /// Zero on classic pipelines. Mesh-only/dual-export fixtures may leave this
-    /// zero and put the metallib in `vertex_func_ref` instead.
-    pub object_func_ref: u32,
-    /// Mesh-stage function ref (mesh SPI shape: tag `0x02`).
-    ///
-    /// Zero on classic pipelines. When zero, product mesh fill falls back to
-    /// dual-export / mesh-only metallib in `vertex_func_ref`.
-    pub mesh_func_ref: u32,
-    /// Byte offset from end of 16-byte header to color-attachment section (tag 0x08).
-    pub color_attachment_offset: u32,
-    pub has_color_attachment_offset: bool,
-    /// Byte offset from the end of the same header to the serialized
-    /// `vertexDescriptor`, on the classic shape only. See
-    /// [`PIPELINE_TAG_VERTEX_DESCRIPTOR_OFFSET`].
-    pub vertex_descriptor_offset: u32,
-    /// Whether the descriptor stated that offset. False means **no vertex
-    /// descriptor**, not an unknown position; the mesh shape never states one
-    /// and falls back to inferring the block.
-    pub has_vertex_descriptor_offset: bool,
-    /// The guest's `rasterSampleCount`. See
-    /// [`PIPELINE_TAG_RASTER_SAMPLE_COUNT`].
-    ///
-    /// **Zero means the descriptor did not state the property**, which is the
-    /// Metal default of [`DEFAULT_RASTER_SAMPLE_COUNT`]. Readers ask `> 1` rather
-    /// than `!= 1` so that an absent property and a stated single-sample count
-    /// are one answer, and so a defaulted `RenderPipelineDescriptor` does not
-    /// read as a count no device can rasterize at.
-    pub raster_sample_count: u32,
-    /// Maximum tessellation factor declared for a classic tessellation
-    /// pipeline. Zero means the property was omitted.
-    pub max_tessellation_factor: u32,
-    /// `MTLTessellationFactorStepFunction`; zero when omitted.
-    pub tessellation_factor_step_function: u32,
-    /// `MTLWinding`; zero when omitted.
-    pub tessellation_output_winding_order: u32,
-    pub vertex_attributes: Vec<VertexAttribute>,
-    /// First color attachment (compat / color0).
-    pub color0: PipelineColorAttachment,
-    /// All color attachments with Metal slot indices (0..count-1 by entry order).
-    pub color_attachments: Vec<PipelineColorAttachment>,
-}
-
-/// Compute stage-input attribute from type-7 compute pipeline compact block.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct ComputeStageInputAttribute {
-    pub raw_bits: u32,
-    pub location: u32,
-    pub format: u32,
-    pub offset: u32,
-    pub buffer_index: u32,
-}
-
-/// Compute stage-input layout from type-7 compute pipeline compact block.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct ComputeStageInputLayout {
-    pub raw_bits: u32,
-    pub buffer_index: u32,
-    pub step_function: u32,
-    pub step_rate: u32,
-    pub stride: u64,
-}
-
-/// Decoded compute `stageInputDescriptor` from a type-7 compute pipeline.
-///
-/// Layout is the MetalSerializer compact block after the first TLV record:
-/// `word0`, `header0` (payload len + counts + index metadata), `header1`
-/// (layout/attribute section offsets), then packed layout/attribute entries.
-/// See `reims_vgpu_resource_format.h` COMPUTE_STAGE_INPUT_* and resource-surface-manifest.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct ComputeStageInputDescriptor {
-    pub word0: u32,
-    pub header0: u32,
-    pub header1: u32,
-    pub index_type: u32,
-    pub index_buffer_index: u32,
-    pub attributes: Vec<ComputeStageInputAttribute>,
-    pub layouts: Vec<ComputeStageInputLayout>,
-    /// Attributes beyond [`MAX_COMPUTE_STAGE_INPUT_ATTRS`]. A healthy zero: the
-    /// cap is the width of the wire's own count field, so no descriptor can
-    /// state a count that reaches this. Nonzero refuses the pipeline
-    /// (`stage_input_over_cap`), which is the reading that says the count field
-    /// is wider than this decoder believes.
-    pub dropped_attributes: u32,
-    /// Layouts beyond [`MAX_COMPUTE_STAGE_INPUT_LAYOUTS`]; same healthy zero and
-    /// same refusal as [`Self::dropped_attributes`].
-    pub dropped_layouts: u32,
-}
-
-/// Decoded type-7 compute pipeline (kernel function + optional stage-input).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct ComputePipelineDescriptor {
-    pub kernel_func_ref: u32,
-    pub stage_input: Option<ComputeStageInputDescriptor>,
-}
+pub use reims_vgpu_protocol::resource::{
+    ComputePipelineDescriptor, ComputeStageInputAttribute, ComputeStageInputDescriptor,
+    ComputeStageInputLayout, DepthStencilDescriptor, DepthStencilFace, FunctionDescriptor,
+    PipelineColorAttachment, RenderPipelineDescriptor, SamplerDescriptor, VertexAttribute,
+};
 
 /// Both counts are 5-bit fields of `header0`
 /// ([`COMPUTE_STAGE_INPUT_HEADER0_COUNT_MASK`] is `0x1f`, applied at both
@@ -890,60 +440,7 @@ const COMPUTE_STAGE_INPUT_ATTR_BITS_READ: u32 = COMPUTE_STAGE_INPUT_ATTR_BITS_LO
     | (COMPUTE_STAGE_INPUT_ATTR_BITS_BUFFER_MASK << COMPUTE_STAGE_INPUT_ATTR_BITS_BUFFER_SHIFT)
     | (COMPUTE_STAGE_INPUT_ATTR_BITS_FORMAT_MASK << COMPUTE_STAGE_INPUT_ATTR_BITS_FORMAT_SHIFT);
 
-/// Type-8 texture view (base texture + optional format/level/slice/swizzle).
-///
-/// Which fields the wire carried is a property of `view_opcode` and nothing
-/// else: the three forms are three distinct records, and the swizzle body
-/// embeds the ranged one whole. So the question is asked of the opcode through
-/// [`Self::carries_range`] and [`Self::carries_swizzle`], rather than answered
-/// by booleans set beside the fields they describe. Five such booleans used to
-/// live here, written at all three decode sites — fifteen assignments that
-/// could disagree with the opcode, and one of them (`has_pixel_format`) that no
-/// consumer ever read, because both of them spelled its rule again themselves.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct TextureViewDescriptor {
-    pub view_opcode: u32,
-    pub view_texture_ref: u32,
-    pub base_texture_ref: u32,
-    pub pixel_format: u16,
-    /// `MTLTextureType`, on the forms [`Self::carries_range`] names (`@18`).
-    pub texture_type: u16,
-    pub level_base: u64,
-    pub level_count: u64,
-    pub slice_base: u64,
-    pub slice_count: u64,
-    pub swizzle: [u8; 4],
-}
-
-impl TextureViewDescriptor {
-    /// Whether this form carries `texture_type`, the level range and the slice
-    /// range — the ranged body, which the swizzle form embeds whole.
-    ///
-    /// The three travel together because they are one record. Reading them off
-    /// a simple view would take `MTLTextureType1D` (which is 0) and a
-    /// zero-length level range for things the guest asked for.
-    pub fn carries_range(&self) -> bool {
-        matches!(
-            self.view_opcode,
-            TEXTURE_VIEW_OPCODE_RANGED | TEXTURE_VIEW_OPCODE_SWIZZLE
-        )
-    }
-
-    /// Whether this form carries per-channel swizzles.
-    pub fn carries_swizzle(&self) -> bool {
-        self.view_opcode == TEXTURE_VIEW_OPCODE_SWIZZLE
-    }
-
-    /// The view's own pixel format, where it declared one.
-    ///
-    /// All three forms carry the field, and `MTLPixelFormatInvalid` is 0 — so a
-    /// zero is a view that reinterprets nothing and keeps its base texture's
-    /// format, which is why this is the one presence question the opcode does
-    /// not answer.
-    pub fn declared_pixel_format(&self) -> Option<u16> {
-        (self.pixel_format != 0).then_some(self.pixel_format)
-    }
-}
+pub use reims_vgpu_protocol::{TextureViewDescriptor, TextureViewForm};
 
 // The record header every type-8 blob starts with. Named here because this
 // file reads it on five different records, and derived from the wire crate's
@@ -1061,8 +558,7 @@ pub const TEXTURE_VIEW_MTL_TYPE_1D: u16 = 0;
 pub const TEXTURE_VIEW_MTL_TYPE_1D_ARRAY: u16 = 1;
 pub const TEXTURE_VIEW_MTL_TYPE_2D: u16 = 2;
 pub const TEXTURE_VIEW_MTL_TYPE_2D_ARRAY: u16 = 3;
-#[cfg(test)]
-pub(crate) const TEXTURE_VIEW_MTL_TYPE_2D_MULTISAMPLE: u16 = 4;
+pub const TEXTURE_VIEW_MTL_TYPE_2D_MULTISAMPLE: u16 = 4;
 pub const TEXTURE_VIEW_MTL_TYPE_CUBE: u16 = 5;
 pub const TEXTURE_VIEW_MTL_TYPE_CUBE_ARRAY: u16 = 6;
 pub const TEXTURE_VIEW_MTL_TYPE_3D: u16 = 7;
@@ -1144,44 +640,6 @@ pub const BLEND_OP_ADD: u32 = 0;
 // where a member has no reader. `_NONE` has one on the Vulkan arm only, and
 // gating it on that arm would make the mirror's completeness depend on which
 // backend is compiled — which is the property a mirror exists to not have.
-pub const MTL_COLOR_WRITE_MASK_NONE: u32 = 0;
-pub const MTL_COLOR_WRITE_MASK_ALPHA: u32 = 1 << 0;
-pub const MTL_COLOR_WRITE_MASK_BLUE: u32 = 1 << 1;
-pub const MTL_COLOR_WRITE_MASK_GREEN: u32 = 1 << 2;
-pub const MTL_COLOR_WRITE_MASK_RED: u32 = 1 << 3;
-pub const MTL_COLOR_WRITE_MASK_ALL: u32 = 0xf;
-
-/// Where the sampler-creation record (type-7 subtype 0x03) puts each field, for
-/// the synthetic buffers the tests below assemble.
-///
-/// Derived from the view `decode_sampler_descriptor` actually reads. These were
-/// eight literals from a ported C header, and `ops::sampler`'s module doc says
-/// the two derivations agree — which was worth stating precisely because until
-/// the fixtures existed nothing had compared them. Deriving them is how that
-/// stays true without anyone re-checking it.
-///
-/// Two of them were also *anonymous*: `SAMPLER_DESC_WORD16` and `_WORD20` named
-/// their own offsets because the C header did not know what was there. The
-/// oracle does — `flags`, whose low nibble is the only written part, and
-/// `lodMinClamp` — so they are named for the fields now.
-///
-/// The cfg is their one consumer's, `icb::tests::put_type7_sampler`, which
-/// builds a sampler for the Metal ICB encoder and is gated the same way. Naming
-/// that cfg here rather than reaching for `allow(dead_code)` is what keeps the
-/// Vulkan arm able to say these are unreferenced if the consumer ever goes.
-#[cfg(all(test, feature = "backend-metal", target_os = "macos"))]
-pub(crate) mod sampler_desc {
-    use super::{offset_of, w_smp, OP_HDR};
-
-    pub(crate) const LEN: usize = w_smp::NEW_SAMPLER_TOTAL_LEN as usize;
-    pub(crate) const TAG: usize = offset_of!(reims_vgpu_wire::OpHeader, opcode);
-    pub(crate) const DECLARED_LEN: usize = offset_of!(reims_vgpu_wire::OpHeader, length);
-    pub(crate) const ID: usize = OP_HDR + offset_of!(w_smp::SamplerBody, object_ref);
-    pub(crate) const STATE_BITS: usize = OP_HDR + offset_of!(w_smp::SamplerBody, state);
-    pub(crate) const FLAGS: usize = OP_HDR + offset_of!(w_smp::SamplerBody, flags);
-    pub(crate) const LOD_MIN: usize = OP_HDR + offset_of!(w_smp::SamplerBody, lod_min_clamp);
-    pub(crate) const LOD_MAX: usize = OP_HDR + offset_of!(w_smp::SamplerBody, lod_max_clamp);
-}
 
 /// Live function descriptor (reims_vgpu_resource_format.h).
 pub const FUNCTION_DESC_BLOB_GVA: usize = 0;
@@ -1189,7 +647,7 @@ pub const FUNCTION_DESC_BLOB_SIZE: usize = 8;
 pub const FUNCTION_DESC_FUNCTION_ID: usize = 0x14;
 pub const FUNCTION_DESC_MIN_LEN: usize = 12;
 
-/// Compact first-subrecord tags (u8) on type-7 pipelines.
+/// Compact first-subrecord tags (u8) on serializer resource pipelines.
 pub const PIPELINE_TAG_KERNEL_FUNC: u8 = 0x00;
 /// Classic: vertex function. Mesh SPI: object function.
 pub const PIPELINE_TAG_VERTEX_FUNC: u8 = 0x01;
@@ -1199,7 +657,7 @@ pub const PIPELINE_TAG_FRAGMENT_FUNC: u8 = 0x02;
 pub const PIPELINE_TAG_MESH_FRAGMENT_FUNC: u8 = 0x03;
 /// Classic: where the serialized `vertexDescriptor` starts, in the same units as
 /// [`PIPELINE_TAG_COLOR_ATTACH_OFFSET`] — a byte offset from the end of the
-/// 16-byte type-7 header.
+/// 16-byte serializer resource header.
 ///
 /// The same wire tag as [`PIPELINE_TAG_MESH_FRAGMENT_FUNC`], whose role it takes
 /// on the mesh shape. The pair is the third instance of this file's standing
@@ -1263,10 +721,9 @@ pub const PIPELINE_TAG_TESSELLATION_OUTPUT_WINDING_ORDER: u8 = 0x12;
 pub const DEFAULT_RASTER_SAMPLE_COUNT: u32 = 1;
 /// Mesh SPI section offset (analog of classic [`PIPELINE_TAG_COLOR_ATTACH_OFFSET`]).
 ///
-/// Live host Metal `-[_MTLDevice serializeMeshRenderPipelineDescriptor:]`
-/// differentials (2026-07-12, Apple M3 Max): same compact first-subrecord
-/// grammar as classic type-7 (`[fieldCount]×[tag][0x04][u32]`). Presence of
-/// this tag selects the mesh role map for tags 0x01/0x02/0x03.
+/// Mesh descriptors use the same compact first-subrecord grammar as classic
+/// serializer resource (`[fieldCount]×[tag][0x04][u32]`). Presence of this tag selects the
+/// mesh role map for tags 0x01/0x02/0x03.
 pub const PIPELINE_TAG_MESH_SECTION_OFFSET: u8 = 0x14;
 /// Mesh object-stage function — same wire tag as classic vertex (`0x01`).
 #[cfg(test)]
@@ -1345,7 +802,6 @@ const VERTEX_LAYOUT_TAGS_CONSUMED: [u8; 4] = [
 
 /// `MTLVertexDescriptor.attributes` is a 31-slot array, so a descriptor naming
 /// more is malformed rather than something we chose not to read. The same
-/// number is [`crate::backend::metal::constants::REIMS_VGPU_METAL_MAX_ATTRS`],
 /// which is the Metal limit itself; this is the decode side of it, stated here
 /// because the Vulkan arm decodes the same descriptor and must lose the same
 /// attributes or none.
@@ -1420,59 +876,6 @@ fn note_vertex_truncated(what: &'static str, declared: usize, max: usize) {
 }
 pub const VERTEX_LABEL_MIN_ASCII: u8 = 0x20;
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct FunctionDescriptor {
-    pub blob_gva: u64,
-    pub blob_size: u32,
-    pub function_id: u32,
-}
-
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct SamplerDescriptor {
-    pub min_filter: u32,
-    pub mag_filter: u32,
-    pub mip_filter: u32,
-    pub s_address: u32,
-    pub t_address: u32,
-    pub r_address: u32,
-    /// `MTLSamplerDescriptor.maxAnisotropy`, already floored at 1 by
-    /// [`decode_sampler_descriptor`], which is the only producer of this type.
-    /// Every consumer may bind it straight through; four of them used to floor
-    /// it again and a fifth did not, which is the shape that leaves one arm
-    /// disagreeing about a value none of them owned.
-    pub max_anisotropy: u32,
-    pub lod_min_clamp: f32,
-    pub lod_max_clamp: f32,
-    pub compare_function: u32,
-    pub border_color: u32,
-    pub normalized_coordinates: bool,
-    pub support_argument_buffers: bool,
-    pub lod_average: bool,
-}
-
-/// Type-7 depth-stencil face (12 bytes).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct DepthStencilFace {
-    pub compare_function: u32,
-    pub stencil_failure_operation: u32,
-    pub depth_failure_operation: u32,
-    pub depth_stencil_pass_operation: u32,
-    pub read_mask: u32,
-    pub write_mask: u32,
-}
-
-/// Type-7 depth-stencil state (40 bytes).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct DepthStencilDescriptor {
-    pub depth_stencil_id: u32,
-    pub depth_compare_function: u32,
-    pub depth_write_enabled: bool,
-    pub front_stencil_enabled: bool,
-    pub back_stencil_enabled: bool,
-    pub front_face: DepthStencilFace,
-    pub back_face: DepthStencilFace,
-}
-
 /// Where the depth-stencil creation record puts each field, for the synthetic
 /// buffers the tests below assemble.
 ///
@@ -1492,244 +895,24 @@ const DEPTH_STENCIL_DESC_ID: usize = OP_HDR + offset_of!(w_ds::DepthStencilBody,
 const DEPTH_STENCIL_DESC_FRONT_FACE: usize = OP_HDR + offset_of!(w_ds::DepthStencilBody, front);
 #[cfg(test)]
 pub(crate) const DEPTH_STENCIL_DEPTH_WRITE: u32 = 1 << 3;
-pub const DEPTH_STENCIL_FRONT_STENCIL_ENABLED: u32 = 1 << 4;
-pub const DEPTH_STENCIL_BACK_STENCIL_ENABLED: u32 = 1 << 5;
 
-/// Per-command-slot layout offsets inside the ICB backing buffer.
-///
-/// Type encoding from `AppleParavirtIndirectCommandBuffer._commandLayout`,
-/// embedded at create-body `+0x1c` (52 bytes).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct IcbCommandLayout {
-    pub command_type_offset: u16,
-    pub barrier_offset: u16,
-    pub kernel_dispatch_arguments_offset: u16,
-    pub tessellation_factor_offset: u16,
-    pub pipeline_state_offset: u32,
-    pub vertex_buffer_bind_offset: u32,
-    pub fragment_buffer_bind_offset: u32,
-    pub object_buffer_bind_offset: u32,
-    pub mesh_buffer_bind_offset: u32,
-    pub kernel_buffer_bind_offset: u32,
-    pub attribute_stride_offset: u32,
-    pub object_threadgroup_memory_length_offset: u32,
-    pub threadgroup_memory_length_offset: u32,
-    pub command_arguments_offset: u32,
-    pub command_size: u32,
-}
+pub use reims_vgpu_protocol::{
+    IcbCommandLayout, IcbUnappliedFlag, IndirectCommandBufferDescriptor,
+    ResourceDescriptor as Descriptor,
+};
 
-/// Decoded type-7 ICB create descriptor (88-byte MetalSerializer body).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct IndirectCommandBufferDescriptor {
-    pub command_types: u32,
-    pub max_vertex_buffer_bind_count: u16,
-    pub max_fragment_buffer_bind_count: u16,
-    pub max_kernel_buffer_bind_count: u16,
-    /// `maxObjectBufferBindCount` create body `+0x0f`.
-    pub max_object_buffer_bind_count: u16,
-    /// `maxMeshBufferBindCount` create body `+0x10`.
-    pub max_mesh_buffer_bind_count: u16,
-    /// `maxKernelThreadgroupMemoryBindCount` create body `+0x11`.
-    pub max_kernel_threadgroup_memory_bind_count: u16,
-    /// `maxObjectThreadgroupMemoryBindCount` create body `+0x12`.
-    pub max_object_threadgroup_memory_bind_count: u16,
-    /// The whole flag word at `+0x16`, ten of whose bits are attributed.
-    ///
-    /// Stored as the word rather than as a bool per bit, and read through the
-    /// accessors below, because this device previously carried two of them as
-    /// fields and dropped the other eight on the floor. One declaration is what
-    /// keeps a decoded bit and its accessor from drifting apart, and it means a
-    /// bit that gains a consumer needs no decoder change.
-    pub flags: u16,
-    pub max_command_count: u32,
-    /// `MTLResourceOptions`, **sixteen bits wide on the wire** despite the
-    /// selector declaring the argument `Q`. See [`ICB_DESC_OPTIONS`].
-    pub options: u16,
-    /// Layout for decoding filled command slots in the ICB backing buffer.
-    pub layout: IcbCommandLayout,
-}
-
-/// One decoded flag the guest asked for and this device does not carry into the
-/// host indirect command buffer.
-///
-/// Eight of the ten attributed bits reach no host setter. Six of them default
-/// **on** in the descriptor Metal builds and in the one the guest built, so a
-/// guest that leaves them alone loses nothing; the loss is the guest turning one
-/// *off*, or turning one of the two `support*` flags *on*. That asymmetry is why
-/// this is a list of named losses rather than a mask comparison — see
-/// [`IndirectCommandBufferDescriptor::unapplied_flags`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum IcbUnappliedFlag {
-    SupportRayTracing,
-    SupportDynamicAttributeStride,
-    InheritDepthStencilState,
-    InheritDepthBias,
-    InheritDepthClipMode,
-    InheritCullMode,
-    InheritFrontFacingWinding,
-    InheritTriangleFillMode,
-}
-
-impl IcbUnappliedFlag {
-    /// One slug per flag rather than one for the set. A count that said only
-    /// "some flag was dropped" would not say whether the guest wanted ray
-    /// tracing or wanted its cull mode not inherited, and those cost entirely
-    /// different things to implement.
-    pub fn slug(self) -> &'static str {
-        match self {
-            Self::SupportRayTracing => "icb_flag_support_ray_tracing_dropped",
-            Self::SupportDynamicAttributeStride => "icb_flag_dynamic_attribute_stride_dropped",
-            Self::InheritDepthStencilState => "icb_flag_no_inherit_depth_stencil_dropped",
-            Self::InheritDepthBias => "icb_flag_no_inherit_depth_bias_dropped",
-            Self::InheritDepthClipMode => "icb_flag_no_inherit_depth_clip_dropped",
-            Self::InheritCullMode => "icb_flag_no_inherit_cull_mode_dropped",
-            Self::InheritFrontFacingWinding => "icb_flag_no_inherit_winding_dropped",
-            Self::InheritTriangleFillMode => "icb_flag_no_inherit_fill_mode_dropped",
-        }
-    }
-}
-
-impl IndirectCommandBufferDescriptor {
-    /// `inheritPipelineState`, bit 0 of [`Self::flags`].
-    pub fn inherit_pipeline_state(&self) -> bool {
-        self.flags & ICB_FLAG_INHERIT_PIPELINE_STATE != 0
-    }
-
-    /// `inheritBuffers`, bit 1.
-    pub fn inherit_buffers(&self) -> bool {
-        self.flags & ICB_FLAG_INHERIT_BUFFERS != 0
-    }
-
-    // `supportRayTracing` (bit 2) and `supportDynamicAttributeStride` (bit 3)
-    // have no accessor, and that is the rule rather than an omission: an
-    // accessor here means the device acts on the bit, and those two it does not.
-    // Both are read by `unapplied_flags` instead, which names each one the guest
-    // asked for so the request is measured rather than dropped in silence. An
-    // accessor beside that would be a second reader of the same bit whose only
-    // effect is to make the two kinds of flag look alike.
-
-    /// The bits no `MTLIndirectCommandBufferDescriptor` property moves.
-    ///
-    /// Exposed so a reading other than the `0x7840` every record Apple produced
-    /// carries is visible: one of them would then be a real field this contract
-    /// does not know about.
-    pub fn unidentified_flags(&self) -> u16 {
-        self.flags & ICB_FLAG_UNIDENTIFIED
-    }
-
-    /// Every flag the guest asked for that this device does not apply.
-    ///
-    /// Empty on a descriptor whose flags are at their defaults, which is what
-    /// makes each of these a healthy zero: a non-zero count is the measured
-    /// argument for building the host setter that flag needs.
-    pub fn unapplied_flags(&self) -> Vec<IcbUnappliedFlag> {
-        let mut out = Vec::new();
-        // Default off: asking is setting the bit.
-        for (bit, flag) in [
-            (
-                ICB_FLAG_SUPPORT_RAY_TRACING,
-                IcbUnappliedFlag::SupportRayTracing,
-            ),
-            (
-                ICB_FLAG_SUPPORT_DYNAMIC_ATTRIBUTE_STRIDE,
-                IcbUnappliedFlag::SupportDynamicAttributeStride,
-            ),
-        ] {
-            if self.flags & bit != 0 {
-                out.push(flag);
-            }
-        }
-        // Default on: asking is clearing the bit. This device sets none of
-        // these on the host descriptor, so it inherits whatever Metal defaults
-        // to — which is the same "on" the guest started from. A guest that
-        // cleared one gets a host ICB that still inherits that state.
-        for (bit, flag) in [
-            (
-                ICB_FLAG_INHERIT_DEPTH_STENCIL_STATE,
-                IcbUnappliedFlag::InheritDepthStencilState,
-            ),
-            (
-                ICB_FLAG_INHERIT_DEPTH_BIAS,
-                IcbUnappliedFlag::InheritDepthBias,
-            ),
-            (
-                ICB_FLAG_INHERIT_DEPTH_CLIP_MODE,
-                IcbUnappliedFlag::InheritDepthClipMode,
-            ),
-            (
-                ICB_FLAG_INHERIT_CULL_MODE,
-                IcbUnappliedFlag::InheritCullMode,
-            ),
-            (
-                ICB_FLAG_INHERIT_FRONT_FACING_WINDING,
-                IcbUnappliedFlag::InheritFrontFacingWinding,
-            ),
-            (
-                ICB_FLAG_INHERIT_TRIANGLE_FILL_MODE,
-                IcbUnappliedFlag::InheritTriangleFillMode,
-            ),
-        ] {
-            if self.flags & bit == 0 {
-                out.push(flag);
-            }
-        }
-        out
-    }
-}
-
-/// One decoded object-list descriptor.
-///
-/// There is deliberately no `Unknown`: an object type this host has no contract
-/// for is [`DecodeStatus::ErrUnknownType`], and a type-7 subtype it does not
-/// implement is [`DecodeStatus::ErrUnsupported`]. Both name the check that
-/// refused. An `Unknown` variant would let the same condition arrive as a
-/// successful decode carrying nothing, which every consumer would then have to
-/// re-refuse without knowing why.
-#[derive(Clone, Debug, PartialEq)]
-pub enum Descriptor {
-    Buffer(BufferDescriptor),
-    Texture(TextureDescriptor),
-    Sampler(SamplerDescriptor),
-    Function(FunctionDescriptor),
-    RenderPipeline(RenderPipelineDescriptor),
-    ComputePipeline(ComputePipelineDescriptor),
-    DepthStencil(DepthStencilDescriptor),
-    TextureView(TextureViewDescriptor),
-    IOSurfaceTexture {
-        mapping_id: u32,
-        object_ref: u32,
-        pixel_format: u16,
-        width: u32,
-        height: u32,
-    },
-    IndirectCommandBuffer(IndirectCommandBufferDescriptor),
-}
-
-/// Live Reims VGPU object-list entry size (kb + reims-vgpu-resource-format).
-pub const OBJECT_LIST_ENTRY_LEN: usize = 12;
-pub const OBJECT_LIST_ENTRY_HEADER: usize = 0;
-pub const OBJECT_LIST_ENTRY_DESC_GVA: usize = 4;
-pub const OBJECT_TYPE_MASK: u32 = 0xff;
-pub const OBJECT_DESC_LEN_SHIFT: u32 = 8;
-
-/// Wire object-list entry: `[type:u8 | desc_len:u24]<< packed u32` + `desc_gva:u64`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct ListObjectEntry {
-    pub object_type: u8,
-    pub descriptor_length: u32,
-    pub descriptor_gva: u64,
-}
+/// Live Reims VGPU object-list entry size.
+pub use reims_vgpu_protocol::OBJECT_LIST_ENTRY_LEN;
 
 /// Decode one 12-byte object-list entry (live arm Reims VGPU contract).
 pub fn decode_list_object_entry(bytes: &[u8]) -> Result<ListObjectEntry, DecodeStatus> {
-    if bytes.len() < OBJECT_LIST_ENTRY_LEN {
-        return Err(DecodeStatus::ErrShort("res_list_entry_short"));
-    }
-    let first = ld32(&bytes[OBJECT_LIST_ENTRY_HEADER..]);
-    Ok(ListObjectEntry {
-        object_type: (first & OBJECT_TYPE_MASK) as u8,
-        descriptor_length: first >> OBJECT_DESC_LEN_SHIFT,
-        descriptor_gva: ld64(&bytes[OBJECT_LIST_ENTRY_DESC_GVA..]),
+    reims_vgpu_protocol::decode_object_list_entry(bytes).map_err(|error| match error {
+        reims_vgpu_protocol::ObjectListDecodeError::Short { .. } => {
+            DecodeStatus::ErrShort("res_list_entry_short")
+        }
+        reims_vgpu_protocol::ObjectListDecodeError::UnknownKind { .. } => {
+            DecodeStatus::ErrUnknownType("res_object_type_unknown")
+        }
     })
 }
 
@@ -1763,10 +946,19 @@ pub fn decode_texture_descriptor(bytes: &[u8]) -> Result<TextureDescriptor, Deco
         ..Default::default()
     };
     if bytes.len() >= TEXTURE_DESC_MIPMAP_LEVEL_COUNT + 2 {
-        out.mipmap_level_count = ld16(&bytes[TEXTURE_DESC_MIPMAP_LEVEL_COUNT..]) as u32;
+        let dimension = ld16(&bytes[TEXTURE_DESC_MIPMAP_LEVEL_COUNT..]);
+        out.mipmap_level_count = u32::from(dimension & 0x3fff);
+        out.cube_faces = dimension & 0x4000 != 0;
+        out.compressed_layout = dimension & 0x8000 != 0;
     }
-    if bytes.len() >= TEXTURE_DESC_DATA_OFFSET + 4 {
-        out.data_offset = ld32(&bytes[TEXTURE_DESC_DATA_OFFSET..]);
+    if bytes.len() >= TEXTURE_DESC_SLICE_COUNT + 2 {
+        out.slice_count = u32::from(ld16(&bytes[TEXTURE_DESC_SLICE_COUNT..]));
+    }
+    if bytes.len() >= TEXTURE_DESC_BASE_OFFSET + 8 {
+        out.base_offset = ld64(&bytes[TEXTURE_DESC_BASE_OFFSET..]);
+    }
+    if bytes.len() >= TEXTURE_DESC_BYTES_PER_SLICE + 8 {
+        out.bytes_per_slice = ld64(&bytes[TEXTURE_DESC_BYTES_PER_SLICE..]);
     }
     if bytes.len() > TEXTURE_DESC_BYTES_PER_ELEMENT {
         out.bytes_per_element = bytes[TEXTURE_DESC_BYTES_PER_ELEMENT];
@@ -1809,6 +1001,11 @@ pub fn decode_texture_descriptor(bytes: &[u8]) -> Result<TextureDescriptor, Deco
         // the padded form as a bound refuses allocations the guest sized
         // correctly. Do not "fix" this to `read_span`; levels 1.. take `size`
         // from the wire at `TEXTURE_LEVEL_SIZE` and mean the same padded span.
+        let l0_offset = if bytes.len() >= TEXTURE_DESC_LEVEL_ZERO + 8 {
+            ld64(&bytes[TEXTURE_DESC_LEVEL_ZERO..])
+        } else {
+            0
+        };
         let l0_size = if out.used_size != 0 {
             out.used_size as u64
         } else if out.declared_row_stride().is_some() && out.height > 0 {
@@ -1817,7 +1014,7 @@ pub fn decode_texture_descriptor(bytes: &[u8]) -> Result<TextureDescriptor, Deco
             0
         };
         out.levels.push(TextureLevelLayout {
-            offset: out.data_offset as u64,
+            offset: l0_offset,
             size: l0_size,
             row_stride: out.row_stride as u64,
             width: out.width,
@@ -1877,29 +1074,32 @@ pub fn decode_texture_descriptor(bytes: &[u8]) -> Result<TextureDescriptor, Deco
         }
     }
 
-    // Format trailer: shift by (levels-1)*36 for multi-mip bodies.
+    // Complete creation declaration: shift by (levels-1)*36 for multi-mip
+    // bodies. The pixel format used to be read alone at +86, dropping usage,
+    // sample count, resource options and every other field in the same body.
+    // This is the same wire form heap and buffer-backed textures carry, so one
+    // decoder owns it.
     let levels = declared_levels;
-    let format_shift = if levels > 1 {
+    let declaration_shift = if levels > 1 {
         (levels as usize - 1).saturating_mul(TEXTURE_DESC_MIP_LEVEL_RECORD_LEN)
     } else {
         0
     };
-    let pf_off = TEXTURE_DESC_PIXEL_FORMAT + format_shift;
-    if bytes.len() >= pf_off + 2 {
-        out.pixel_format = ld16(&bytes[pf_off..]);
-    } else if crate::observe::first_sight("texture_desc_format_unreachable", levels as u64) {
-        // No fallback to the unshifted offset. The fallback's own length test
-        // was `TEXTURE_DESC_PIXEL_FORMAT + 2`, so for a single-mip body it
-        // guarded the same two bytes the branch above already read. It
-        // was reachable only when `format_shift > 0` — and there offset 86 is
-        // not the format at all: the level records start at 72 and run 36 bytes
-        // each, so 86..88 is inside level record 1. The fallback therefore
-        // produced a format only in the case where it was guaranteed to be
-        // reading something else, and then set `has_pixel_format`, which is
-        // what seven downstream gates fail closed on. Better to have no format.
+    let declaration_off = TEXTURE_DESC_DECLARATION.saturating_add(declaration_shift);
+    let declaration_end = declaration_off.saturating_add(heap_query::TEXTURE_BODY_LEN);
+    if let Some(body) = bytes.get(declaration_off..declaration_end) {
+        out.declaration = Some(
+            heap_query::decode_serialized_texture_descriptor(body)
+                .map_err(|_| DecodeStatus::ErrShort("res_texture_declaration"))?,
+        );
+    } else if crate::observe::first_sight("texture_desc_declaration_unreachable", levels as u64) {
+        // No fallback to the unshifted offset. With several mips that offset is
+        // inside a level-layout record, so treating it as a declaration would
+        // manufacture a format and usage out of geometry bytes.
         crate::observe::fail(format!(
-            "texture_desc_format_unreachable levels={levels} pf_off={pf_off} len={} \
-             (multi-mip body too short for its shifted format trailer)",
+            "texture_desc_declaration_unreachable levels={levels} \
+             declaration_off={declaration_off} len={} \
+             (body ends before the shifted texture declaration)",
             bytes.len()
         ));
     }
@@ -1924,7 +1124,7 @@ pub fn decode_function_descriptor(bytes: &[u8]) -> Result<FunctionDescriptor, De
     })
 }
 
-/// Compact type-7 first sub-record: `[fieldCount:u8]` × `[tag:u8][len:u8][value…]`.
+/// Compact serializer resource first sub-record: `[fieldCount:u8]` × `[tag:u8][len:u8][value…]`.
 pub fn decode_compact_tlv_record(
     bytes: &[u8],
     offset: usize,
@@ -2154,23 +1354,21 @@ pub fn decode_depth_stencil_descriptor(
 ) -> Result<DepthStencilDescriptor, DecodeStatus> {
     let op = reims_vgpu_wire::op(bytes, 0)
         .map_err(|_| DecodeStatus::ErrShort("res_depth_stencil_short"))?;
-    if op.opcode() != TYPE7_OBJECT_DEPTH_STENCIL || op.length() as usize != bytes.len() {
+    if op.opcode() != SERIALIZER_RESOURCE_OBJECT_DEPTH_STENCIL
+        || op.length() as usize != bytes.len()
+    {
         return Err(DecodeStatus::ErrUnsupported("res_depth_stencil_tag"));
     }
     let body = w_ds::new_depth_stencil(&op)
         .map_err(|_| DecodeStatus::ErrShort("res_depth_stencil_short"))?;
-    // Product still names bits [5:4] as face-enabled; wire records them as
-    // unidentified (Metal substitutes default faces before serialize). Keep the
-    // product field names; source the bit from the same byte the view exposes.
-    let state = body.depth_state;
     Ok(DepthStencilDescriptor {
         depth_stencil_id: body.object_ref.get(),
         depth_compare_function: body.depth_compare_function() as u32,
         depth_write_enabled: body.depth_write_enabled(),
-        front_stencil_enabled: (state & DEPTH_STENCIL_FRONT_STENCIL_ENABLED as u8) != 0,
-        back_stencil_enabled: (state & DEPTH_STENCIL_BACK_STENCIL_ENABLED as u8) != 0,
-        front_face: face_from_wire(&body.front),
-        back_face: face_from_wire(&body.back),
+        front_stencil_present: body.front_stencil_present(),
+        back_stencil_present: body.back_stencil_present(),
+        front_face: body.front_stencil().map(face_from_wire).unwrap_or_default(),
+        back_face: body.back_stencil().map(face_from_wire).unwrap_or_default(),
     })
 }
 
@@ -2204,7 +1402,7 @@ fn wire_max_anisotropy(value: u8) -> u32 {
 pub fn decode_sampler_descriptor(bytes: &[u8]) -> Result<SamplerDescriptor, DecodeStatus> {
     let op =
         reims_vgpu_wire::op(bytes, 0).map_err(|_| DecodeStatus::ErrShort("res_sampler_short"))?;
-    if op.opcode() != TYPE7_OBJECT_SAMPLER || op.length() as usize != bytes.len() {
+    if op.opcode() != SERIALIZER_RESOURCE_OBJECT_SAMPLER || op.length() as usize != bytes.len() {
         return Err(DecodeStatus::ErrUnsupported("res_sampler_tag"));
     }
     let body = w_smp::new_sampler(&op).map_err(|_| DecodeStatus::ErrShort("res_sampler_short"))?;
@@ -2290,7 +1488,7 @@ const COMPUTE_PIPELINE_TAG_THREADGROUP_MULTIPLE: u8 = 0x01;
 /// constant's doc gives.
 const COMPUTE_PIPELINE_TAG_LABEL: u8 = 0x02;
 /// `MTLComputePipelineDescriptor.stageInputDescriptor` — a byte offset from the
-/// end of the 16-byte type-7 header to a nested property list, in the same units
+/// end of the 16-byte serializer resource header to a nested property list, in the same units
 /// as [`PIPELINE_TAG_VERTEX_DESCRIPTOR_OFFSET`] and
 /// [`PIPELINE_TAG_COLOR_ATTACH_OFFSET`]. `COMPUTE_PIPELINE_TAG_LABEL` is the same
 /// kind of offset, to a NUL-terminated string.
@@ -2366,7 +1564,6 @@ pub const PIPELINE_TAG_COMPUTE_STAGE_INPUT_OFFSET: u8 = 0x03;
 ///   render pass descriptor carries the depth and stencil textures a draw
 ///   renders into, and this device takes them from there. Both backends then
 ///   pin the host format — Vulkan to `TRANSIENT_DEPTH_FORMAT` or the device's
-///   queried combined format, the Metal arm to `DEPTH32_FLOAT` in
 ///   `validate_depth_attachment` — so there is no arm on which the guest's
 ///   declared format could change the attachment it gets. Dropping them cannot
 ///   change what the guest observes; the attachment it observes is the one its
@@ -2401,7 +1598,7 @@ const COMPUTE_PIPELINE_TAGS_BENIGN: [u8; 2] = [
 /// or how often.
 ///
 /// It is now a refusal on that same sibling's licence, and the licence is what
-/// took the work: the sibling refuses because `type7_color_attach_shape`
+/// took the work: the sibling refuses because `serializer_resource_color_attach_shape`
 /// measured its zero first. This block's `unconsumed` count is *not* zero and
 /// never will be — two labels arrive on every boot — so the zero that had to be
 /// measured was a different one. Splitting the unread tags into
@@ -2549,14 +1746,14 @@ impl crate::observe::Decline for PipelineFieldDropped {
     }
 }
 
-/// Report the shape of a type-7 pipeline's own compact-TLV block and every
+/// Report the shape of a serializer resource pipeline's own compact-TLV block and every
 /// field in it this decoder does not consume.
 ///
 /// Two lines with the two jobs [`note_color_entry_fields`] splits for the same
 /// reason: a silent census cannot tell "the guest sends only the tags we read"
 /// from "this walk never ran on a live guest".
 ///
-/// * `type7_pipeline_shape` is the *branch*, on the off channel, deduped per
+/// * `serializer_resource_pipeline_shape` is the *branch*, on the off channel, deduped per
 ///   distinct `(kind, tag, len)` sequence and starring the unread tags. A boot
 ///   with pipeline shapes and no drop line is a positive reading.
 /// * `pipeline_descriptor_field_dropped` is the *loss*, one typed decline per
@@ -2688,9 +1885,9 @@ fn report_tlv_shape(
             }
         }
     }
-    if crate::observe::first_sight("type7_pipeline_shape", shape_key) {
+    if crate::observe::first_sight("serializer_resource_pipeline_shape", shape_key) {
         crate::observe::off(format!(
-            "type7_pipeline_shape kind={kind} nfields={field_count} tags=[{shape}] \
+            "serializer_resource_pipeline_shape kind={kind} nfields={field_count} tags=[{shape}] \
              unconsumed={} unknown={}",
             dropped.len(),
             unknown.len()
@@ -2702,7 +1899,7 @@ fn report_tlv_shape(
     // it stays visible.
     for &(tag, len, first_value) in &unknown {
         crate::observe::Emit::decline(
-            "type7_pipeline",
+            "serializer_resource_pipeline",
             &PipelineFieldDropped {
                 kind,
                 tag,
@@ -2719,15 +1916,15 @@ fn report_tlv_shape(
 pub fn decode_render_pipeline_descriptor(
     bytes: &[u8],
 ) -> Result<RenderPipelineDescriptor, DecodeStatus> {
-    if bytes.len() < TYPE7_MIN_LEN {
+    if bytes.len() < SERIALIZER_RESOURCE_MIN_LEN {
         return Err(DecodeStatus::ErrShort("res_render_pipeline_short"));
     }
     let obj_type = ld32(&bytes[0..]);
     let declared = ld32(&bytes[4..]) as usize;
-    if obj_type != TYPE7_OBJECT_RENDER_PIPELINE {
+    if obj_type != SERIALIZER_RESOURCE_OBJECT_RENDER_PIPELINE {
         return Err(DecodeStatus::ErrUnsupported("res_render_pipeline_tag"));
     }
-    if declared != bytes.len() || declared < TYPE7_MIN_LEN {
+    if declared != bytes.len() || declared < SERIALIZER_RESOURCE_MIN_LEN {
         return Err(DecodeStatus::ErrShort("res_render_pipeline_declared_len"));
     }
     let mut out = RenderPipelineDescriptor {
@@ -2735,8 +1932,8 @@ pub fn decode_render_pipeline_descriptor(
         serialized_payload_len: ld32(&bytes[12..]),
         ..Default::default()
     };
-    note_type7_payload_len("render", out.serialized_payload_len, declared);
-    let (fields, consumed) = decode_compact_tlv_record(bytes, TYPE7_FIRST_TLVS)?;
+    note_serializer_resource_payload_len("render", out.serialized_payload_len, declared);
+    let (fields, consumed) = decode_compact_tlv_record(bytes, SERIALIZER_RESOURCE_FIRST_TLVS)?;
     let tag01 = compact_tlv_u32(&fields, PIPELINE_TAG_VERTEX_FUNC).unwrap_or(0);
     let tag02 = compact_tlv_u32(&fields, PIPELINE_TAG_FRAGMENT_FUNC).unwrap_or(0);
     let tag03 = compact_tlv_u32(&fields, PIPELINE_TAG_MESH_FRAGMENT_FUNC).unwrap_or(0);
@@ -2752,7 +1949,7 @@ pub fn decode_render_pipeline_descriptor(
     out.tessellation_output_winding_order =
         compact_tlv_u32(&fields, PIPELINE_TAG_TESSELLATION_OUTPUT_WINDING_ORDER).unwrap_or(0);
     // Mesh SPI shape: tag 0x14 section offset (host serializeMeshRenderPipelineDescriptor).
-    // Classic type-7 uses tag 0x08. Roles for 0x01/0x02/0x03 differ by shape.
+    // Classic serializer resource uses tag 0x08. Roles for 0x01/0x02/0x03 differ by shape.
     if let Some(off) = compact_tlv_u32(&fields, PIPELINE_TAG_MESH_SECTION_OFFSET) {
         note_pipeline_tlv_fields(
             "render_mesh",
@@ -2790,9 +1987,9 @@ pub fn decode_render_pipeline_descriptor(
             out.has_color_attachment_offset = true;
         }
     }
-    let first_tlv_end = TYPE7_FIRST_TLVS + consumed;
+    let first_tlv_end = SERIALIZER_RESOURCE_FIRST_TLVS + consumed;
     if out.has_color_attachment_offset {
-        let color_abs = TYPE7_FIRST_TLVS + out.color_attachment_offset as usize;
+        let color_abs = SERIALIZER_RESOURCE_FIRST_TLVS + out.color_attachment_offset as usize;
         // The vertex block runs from where the descriptor says it starts to
         // where the colour section begins. Only the classic shape states that
         // start; the mesh shape does not, so it keeps the old inference —
@@ -2803,7 +2000,7 @@ pub fn decode_render_pipeline_descriptor(
         let start = if inferred {
             first_tlv_end
         } else {
-            TYPE7_FIRST_TLVS + out.vertex_descriptor_offset as usize
+            SERIALIZER_RESOURCE_FIRST_TLVS + out.vertex_descriptor_offset as usize
         };
         if color_abs <= declared && start < color_abs {
             out.vertex_attributes = parse_vertex_block(bytes, start, color_abs)?;
@@ -2821,12 +2018,12 @@ pub fn decode_render_pipeline_descriptor(
     Ok(out)
 }
 
-/// The two lengths in a type-7 header disagree about the same payload.
+/// The two lengths in a serializer resource header disagree about the same payload.
 ///
 /// The header states the payload's length twice: the declared length at `+4`
 /// covers the header and the payload padded to four bytes, and
 /// [`RenderPipelineDescriptor::serialized_payload_len`] at `+0xc` is the same
-/// payload unpadded. So `declared == TYPE7_FIRST_TLVS + round_up_4(payload)`
+/// payload unpadded. So `declared == SERIALIZER_RESOURCE_FIRST_TLVS + round_up_4(payload)`
 /// always, and a record where it does not hold is one whose two halves were
 /// written by different ideas of how long it is.
 ///
@@ -2850,7 +2047,7 @@ pub fn decode_render_pipeline_descriptor(
 /// state a payload length first. A reader who measures only the boot will
 /// conclude the promotion is free, and it is not.
 ///
-/// Both pipeline subtypes reach this, and **only** those two: the other type-7
+/// Both pipeline subtypes reach this, and **only** those two: the other serializer resource
 /// subtypes — sampler, depth-stencil, ICB — are fixed-layout wire structs rather
 /// than property-list containers, so their fourth header word is a declared
 /// field of the struct and not a payload length. The relation would be false
@@ -2859,26 +2056,26 @@ pub fn decode_render_pipeline_descriptor(
 /// **Both halves have now been booted, which is worth stating because a
 /// `kind=compute` zero could have meant the arm never ran.** The compute arm was
 /// added a commit after the render one and had no boot behind it; a later driven
-/// x86 boot reported `type7_pipeline_shape kind=compute` twice against
+/// x86 boot reported `serializer_resource_pipeline_shape kind=compute` twice against
 /// `kind=render` four times, so the compute arm decoded two real descriptors and
 /// agreed on both. The denominator to quote for this instrument is that shape
 /// line, not this one, because this one is silent on success by construction.
-fn note_type7_payload_len(kind: &'static str, payload: u32, declared: usize) {
+fn note_serializer_resource_payload_len(kind: &'static str, payload: u32, declared: usize) {
     let padded = (payload as usize).next_multiple_of(4);
-    if TYPE7_FIRST_TLVS.checked_add(padded) == Some(declared) {
+    if SERIALIZER_RESOURCE_FIRST_TLVS.checked_add(padded) == Some(declared) {
         return;
     }
     if crate::observe::first_sight(
-        "type7_payload_len_disagrees",
+        "serializer_resource_payload_len_disagrees",
         ((payload as u64) << 32) | declared as u64,
     ) {
         crate::observe::fail(format!(
-            "type7_payload_len kind={kind} reason=type7_payload_len_disagrees \
+            "serializer_resource_payload_len kind={kind} reason=serializer_resource_payload_len_disagrees \
              payload={payload} padded={padded} declared={declared} \
              expected={} (the header states its payload length twice and the \
              two do not agree; nothing is refused, the walks below bound \
              themselves on the declared length)",
-            TYPE7_FIRST_TLVS + padded
+            SERIALIZER_RESOURCE_FIRST_TLVS + padded
         ));
     }
 }
@@ -2900,7 +2097,7 @@ fn note_type7_payload_len(kind: &'static str, payload: u32, declared: usize) {
 /// **Its zero is not yet a measurement, and the denominator says so.** Both
 /// callers sit inside [`parse_compute_stage_input_block`], and on a driven x86
 /// boot — Safari composited over a Ventura desktop, 25 s of window drag —
-/// `type7_pipeline_shape` reported two compute pipelines while
+/// `serializer_resource_pipeline_shape` reported two compute pipelines while
 /// `compute_stage_input_decoded` reported **none**. Neither compute pipeline
 /// carried a stage-input block at all, so no entry word was ever offered to this
 /// function and its silence is an empty walk rather than a clean one. That is
@@ -2958,11 +2155,11 @@ fn note_unread_bits(kind: &'static str, word: u32, read_mask: u32) {
 /// is the whole of what the offset was read for.
 fn note_vertex_block_inferred(start: usize, color_abs: usize) {
     if crate::observe::first_sight(
-        "type7_vertex_block_inferred",
+        "serializer_resource_vertex_block_inferred",
         ((start as u64) << 32) | color_abs as u64,
     ) {
         crate::observe::off(format!(
-            "type7_vertex_block_inferred start={start} color={color_abs} \
+            "serializer_resource_vertex_block_inferred start={start} color={color_abs} \
              (the descriptor stated no vertexDescriptor offset, so the block was \
               located by stepping over the label)"
         ));
@@ -2996,7 +2193,7 @@ fn note_vertex_block_inferred(start: usize, color_abs: usize) {
 ///
 /// # What licenses it
 ///
-/// A bare zero would not. `type7_color_attach_shape` is the sibling that fires:
+/// A bare zero would not. `serializer_resource_color_attach_shape` is the sibling that fires:
 /// it reports every entry's tag sequence and stars the unread ones, and across
 /// every driven boot in the record it appears 4–13 times per boot, each one
 /// `unconsumed=0`, over the tag set `00,01,02,04,07`. So the walk runs on a live
@@ -3115,7 +2312,7 @@ const COLOR_ATTACH_DROP_VALUE_CAP: u32 = 64;
 /// "the guest sends nothing but the eight tags we read" from "this walk never
 /// ran on a live guest":
 ///
-/// * `type7_color_attach_shape` is the *branch*, deduped per distinct `(tag,
+/// * `serializer_resource_color_attach_shape` is the *branch*, deduped per distinct `(tag,
 ///   len)` sequence. A boot with entries but no drop line is then a positive
 ///   reading — the entries were seen and carried only consumed tags — rather
 ///   than an absence.
@@ -3178,9 +2375,9 @@ fn note_color_entry_fields(bytes: &[u8], entry: usize, slot: u32) -> Result<(), 
         }
         p += 2 + field_len;
     }
-    if crate::observe::first_sight("type7_color_attach_shape", shape_key) {
+    if crate::observe::first_sight("serializer_resource_color_attach_shape", shape_key) {
         crate::observe::off(format!(
-            "type7_color_attach_shape slot={slot} nfields={field_count} \
+            "serializer_resource_color_attach_shape slot={slot} nfields={field_count} \
              tags=[{shape}] unconsumed={}",
             dropped.len()
         ));
@@ -3193,7 +2390,7 @@ fn note_color_entry_fields(bytes: &[u8], entry: usize, slot: u32) -> Result<(), 
             ((slot as u64) << 40) | ((read as u64) << 16) | (field_count as u64),
         ) {
             crate::observe::Emit::decline(
-                "type7_color_attach",
+                "serializer_resource_color_attach",
                 &ColorAttachEntryShort {
                     read,
                     declared: field_count,
@@ -3217,11 +2414,14 @@ fn note_color_entry_fields(bytes: &[u8], entry: usize, slot: u32) -> Result<(), 
         if !crate::observe::first_sight("color_attachment_field_dropped", disc) {
             continue;
         }
-        crate::observe::Emit::decline("type7_color_attach", &ColorAttachDropped { tag })
-            .field("slot", slot)
-            .field("len", field_len)
-            .field("value", value)
-            .fail();
+        crate::observe::Emit::decline(
+            "serializer_resource_color_attach",
+            &ColorAttachDropped { tag },
+        )
+        .field("slot", slot)
+        .field("len", field_len)
+        .field("value", value)
+        .fail();
     }
     // Outside the loop, so the refusal does not inherit `first_sight`'s latch:
     // the line names a tag once, the pipeline is refused every time.
@@ -3247,7 +2447,9 @@ fn parse_one_color_entry(
                 // attachments are not a dense in-order prefix, so every consumer
                 // that matches `a.slot == c.slot` was reading another slot's
                 // blend state, write mask and pixel format.
-                crate::runtime::drain::note_store_route("type7_color_slot_off_position");
+                crate::runtime::drain::note_store_route(
+                    "serializer_resource_color_slot_off_position",
+                );
             }
             declared
         }
@@ -3262,7 +2464,7 @@ fn parse_one_color_entry(
                 u64::from(declared),
             ) {
                 crate::observe::Emit::decline(
-                    "type7_color_attach",
+                    "serializer_resource_color_attach",
                     &ColorAttachIndexOutOfRange { declared },
                 )
                 .field("position", position)
@@ -3327,10 +2529,13 @@ fn parse_one_color_entry(
             // has none — every representable mask is a mask the guest might
             // have meant, and picking one is guessing which channels it wanted.
             if crate::observe::first_sight("color_write_mask_out_of_range", u64::from(mask)) {
-                crate::observe::Emit::decline("type7_color_attach", &ColorWriteMaskOutOfRange)
-                    .field("slot", slot)
-                    .field("value", mask)
-                    .fail();
+                crate::observe::Emit::decline(
+                    "serializer_resource_color_attach",
+                    &ColorWriteMaskOutOfRange,
+                )
+                .field("slot", slot)
+                .field("value", mask)
+                .fail();
             }
             return Err(DecodeStatus::ErrUnsupported("res_color_write_mask_over"));
         };
@@ -3396,7 +2601,7 @@ fn note_color_table_truncated(
         return;
     }
     crate::observe::Emit::decline(
-        "type7_color_attach",
+        "serializer_resource_color_attach",
         &ColorAttachTableTruncated { declared, decoded },
     )
     .field("section_off", section_off)
@@ -3408,15 +2613,7 @@ fn note_color_table_truncated(
 /// section naming more than eight is malformed rather than something we chose
 /// not to read. Same bound as `render::PASS_MAX_COLOR_ATTACHMENTS`, stated here
 /// because this is the pipeline-descriptor side of the same Metal limit.
-const MAX_COLOR_ATTACHMENTS: usize = 8;
-// The doc above says "same bound" and then writes the number again, which is the
-// one thing that cannot keep it true. The pass side derives its copy from the
-// wire record's own array width (`wire::RENDER_PASS_COLOR_ATTACHMENTS`), so this
-// pin makes the claim checkable: if Apple's record ever carries more slots, the
-// two sides part at compile time instead of this one refusing pipeline
-// descriptors the pass decoder happily accepts.
-const _: () =
-    assert!(MAX_COLOR_ATTACHMENTS == crate::runtime::decode::render::PASS_MAX_COLOR_ATTACHMENTS);
+const MAX_COLOR_ATTACHMENTS: usize = reims_vgpu_protocol::MAX_COLOR_ATTACHMENTS;
 
 /// Parse all color-attachment entries.
 ///
@@ -3518,7 +2715,7 @@ pub fn parse_color_attachments(
 pub struct HeapTextureRecord<'a> {
     /// Ref of the heap the texture is placed in. Never 0 for a well-formed
     /// record; the caller decides what a 0 means for its own path.
-    pub heap_ref: u32,
+    pub heap_ref: reims_vgpu_protocol::ObjectTableRef<reims_vgpu_protocol::HeapObject>,
     /// Whether [`HeapTextureRecord::offset`] is the guest's request or is to be
     /// ignored. The serializer writes the offset either way.
     pub use_offset: bool,
@@ -3563,7 +2760,7 @@ pub fn decode_heap_texture(bytes: &[u8]) -> Result<HeapTextureRecord<'_>, Decode
             let desc_at = OP_HDR + offset_of!(w_heap::NewHeapTextureBody, desc);
             let use_offset_at = OP_HDR + offset_of!(w_heap::NewHeapTextureBody, use_offset_bits);
             Ok(HeapTextureRecord {
-                heap_ref: b.heap_ref.get(),
+                heap_ref: reims_vgpu_protocol::ObjectTableRef::new(b.heap_ref.get()),
                 use_offset: b.use_offset(),
                 offset: b.offset.get(),
                 descriptor: &bytes[desc_at..use_offset_at],
@@ -3580,7 +2777,7 @@ pub fn decode_heap_texture(bytes: &[u8]) -> Result<HeapTextureRecord<'_>, Decode
             let use_offset_at =
                 OP_HDR + offset_of!(w_heap::NewHeapTextureWideBody, use_offset_bits);
             Ok(HeapTextureRecord {
-                heap_ref: b.heap_ref.get(),
+                heap_ref: reims_vgpu_protocol::ObjectTableRef::new(b.heap_ref.get()),
                 use_offset: b.use_offset(),
                 offset: b.offset.get(),
                 descriptor: &bytes[desc_at..use_offset_at],
@@ -3612,7 +2809,7 @@ pub fn decode_texture_view_descriptor(bytes: &[u8]) -> Result<TextureViewDescrip
                 .map_err(|_| DecodeStatus::ErrShort("res_texture_view_short"))?;
             let pixel_format = b.pixel_format.get();
             Ok(TextureViewDescriptor {
-                view_opcode,
+                form: TextureViewForm::Simple,
                 view_texture_ref: b.object_ref.get(),
                 base_texture_ref: b.base_texture_ref.get(),
                 pixel_format,
@@ -3624,7 +2821,7 @@ pub fn decode_texture_view_descriptor(bytes: &[u8]) -> Result<TextureViewDescrip
                 .map_err(|_| DecodeStatus::ErrShort("res_texture_view_short"))?;
             let pixel_format = b.pixel_format.get();
             Ok(TextureViewDescriptor {
-                view_opcode,
+                form: TextureViewForm::Ranged,
                 view_texture_ref: b.object_ref.get(),
                 base_texture_ref: b.base_texture_ref.get(),
                 pixel_format,
@@ -3642,7 +2839,7 @@ pub fn decode_texture_view_descriptor(bytes: &[u8]) -> Result<TextureViewDescrip
             let r = &b.ranged;
             let pixel_format = r.pixel_format.get();
             Ok(TextureViewDescriptor {
-                view_opcode,
+                form: TextureViewForm::Swizzled,
                 view_texture_ref: r.object_ref.get(),
                 base_texture_ref: r.base_texture_ref.get(),
                 pixel_format,
@@ -3673,17 +2870,7 @@ pub fn decode_texture_view_descriptor(bytes: &[u8]) -> Result<TextureViewDescrip
 /// which is also the shape `reims_vgpu_wire::ops::backed_texture` derived from
 /// Apple's bytes (`BufferTextureBody { object_ref, buffer_ref, offset,
 /// bytes_per_row, desc }`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct BufferTextureDescriptor {
-    pub new_texture_ref: u32,
-    pub buffer_ref: u32,
-    pub offset: u64,
-    pub bytes_per_row: u64,
-    /// The embedded texture descriptor, read by
-    /// [`crate::runtime::heap_query::decode_serialized_texture_descriptor`] —
-    /// the single reader that function's own doc asks every path to use.
-    pub desc: crate::runtime::heap_query::TextureDescriptor,
-}
+pub use reims_vgpu_protocol::BufferTextureDescriptor;
 
 /// Decode the opcode-9 (buffer-backed texture) type-8 descriptor — the
 /// serialized form of
@@ -3786,59 +2973,30 @@ pub fn texture_type8_opcode(bytes: &[u8]) -> Option<u32> {
     texture_type8_header(bytes).map(|(opcode, _)| opcode)
 }
 
-const TYPE7_MIN_LEN: usize = 17;
+const SERIALIZER_RESOURCE_MIN_LEN: usize = 17;
 
-/// **Unused on the x86 PCI pathway.** A probe placed at the top of this function
-/// — before the length check, so a short record would also report — emitted
-/// nothing across a full interactive session. Type-11 geometry on that pathway
-/// is latched from the **type-4** surface backing descriptor instead
-/// (`runtime/objects`, `decode_type4_surface` -> `set_mapping_geom`). Do not
-/// reason about what the guest tells us at surface-create time from this
-/// decoder without re-confirming it runs; measure `decode_type4_surface`.
-/// Offsets in the type-11 IOSurface-texture descriptor. Named rather than
-/// written as hex at the read sites, which is the convention every other
-/// decoder in this file already follows — an offset that appears only as a
-/// literal cannot be found by a reader checking whether the layout still holds.
-pub const IOSURFACE_TEX_MAPPING_ID: usize = 0x00;
-pub const IOSURFACE_TEX_OBJECT_REF: usize = 0x10;
-pub const IOSURFACE_TEX_PIXEL_FORMAT: usize = 0x16;
-pub const IOSURFACE_TEX_WIDTH: usize = 0x18;
-pub const IOSURFACE_TEX_HEIGHT: usize = 0x1c;
-/// Through `height`. Live blobs run longer (0x38 / 0x58); the tail past this is
-/// not decoded, and the comment on the decoder says why.
+/// Decode the arm mapper-backed IOSurface texture-view object.
 ///
-/// Whether that tail carries guest intent is **open, and an x86 boot cannot
-/// settle it.** A probe emitting every distinct (length, tail) shape from this
-/// decoder was run against a driven x86 PCI boot and emitted nothing at all,
-/// which confirms rather than contradicts
-/// [`crate::runtime::objects::undecoded_type4_surface_bytes`] — that doc already
-/// records that this decoder does not run on that pathway. The 0x38/0x58 blobs
-/// are an arm64 phenomenon.
-///
-/// Settling it needs the same Apple host as the other arm64-only questions:
-/// re-add a dedup-by-(len, tail) probe here, boot `reims-vgpu-mmio`, and read
-/// the shapes out of the fail log. Do not re-run it on x86 — that measurement
-/// has been made and its answer is "not observable here".
-pub const IOSURFACE_TEX_MIN_LEN: usize = 0x20;
-
-pub fn decode_iosurface_texture_descriptor(bytes: &[u8]) -> Result<Descriptor, DecodeStatus> {
-    // Matches reims-vgpu-iosurface-pages texture descriptor min layout (mappingID,
-    // object self-ref, format, width, height). Live type-11 blobs are longer
-    // (0x38/0x58); multi-mip level records are **not** part of this object type
-    // — Metal forbids mipmapped IOSurface textures
-    // (`newTextureWithDescriptor:iosurface:` rejects mipmapLevelCount > 1),
-    // and product resolve fail-closes non-zero levels rather than inventing
-    // a pyramid packing in the mapping (see blit_exec::Type11Texture).
-    if bytes.len() < IOSURFACE_TEX_MIN_LEN {
-        return Err(DecodeStatus::ErrShort("res_iosurface_short"));
-    }
-    Ok(Descriptor::IOSurfaceTexture {
-        mapping_id: ld32(&bytes[IOSURFACE_TEX_MAPPING_ID..]),
-        object_ref: ld32(&bytes[IOSURFACE_TEX_OBJECT_REF..]),
-        pixel_format: ld16(&bytes[IOSURFACE_TEX_PIXEL_FORMAT..]),
-        width: ld32(&bytes[IOSURFACE_TEX_WIDTH..]),
-        height: ld32(&bytes[IOSURFACE_TEX_HEIGHT..]),
-    })
+/// The outer object is an eight-byte mapper-service identity followed by one
+/// complete nested serializer operation. The nested operation is decoded by
+/// the wire crate's ordinary IOSurface texture views; there is no independent
+/// mapper tail and no length-selected field guessing here.
+pub fn decode_mapper_iosurface_texture_view(bytes: &[u8]) -> Result<Descriptor, DecodeStatus> {
+    let view =
+        reims_vgpu_protocol::decode_mapper_iosurface_texture_view(bytes).map_err(|error| {
+            match error {
+                reims_vgpu_protocol::MapperIOSurfaceTextureDecodeError::Short => {
+                    DecodeStatus::ErrShort("res_mapper_iosurface_texture_short")
+                }
+                reims_vgpu_protocol::MapperIOSurfaceTextureDecodeError::BadLength => {
+                    DecodeStatus::ErrUnsupported("res_mapper_iosurface_texture_length")
+                }
+                reims_vgpu_protocol::MapperIOSurfaceTextureDecodeError::UnknownVariant => {
+                    DecodeStatus::ErrUnsupported("res_mapper_iosurface_texture_variant")
+                }
+            }
+        })?;
+    Ok(Descriptor::MapperIOSurfaceTextureView(view))
 }
 
 fn section_range_fits(len: usize, start: u64, count: u32, entry_size: usize) -> bool {
@@ -3892,7 +3050,7 @@ fn parse_compute_stage_input_section(
     if declared_offset == 0 {
         return Ok(None);
     }
-    let section = TYPE7_FIRST_TLVS.saturating_add(declared_offset as usize);
+    let section = SERIALIZER_RESOURCE_FIRST_TLVS.saturating_add(declared_offset as usize);
     if section >= bytes.len() {
         return Err(DecodeStatus::ErrShort("res_compute_stage_input_off_oob"));
     }
@@ -3928,7 +3086,8 @@ fn parse_compute_stage_input_section(
     if attr_count == 0 && layout_count == 0 {
         return Ok(None);
     }
-    if attr_count > MAX_COMPUTE_STAGE_INPUT_ATTRS || layout_count > MAX_COMPUTE_STAGE_INPUT_LAYOUTS {
+    if attr_count > MAX_COMPUTE_STAGE_INPUT_ATTRS || layout_count > MAX_COMPUTE_STAGE_INPUT_LAYOUTS
+    {
         return Err(DecodeStatus::ErrUnsupported("stage_input_over_cap"));
     }
 
@@ -4152,26 +3311,26 @@ pub fn parse_compute_stage_input_block(
     Ok(Some(out))
 }
 
-/// Decode type-7 compute pipeline (`objType=0x0b`): kernel TLV + optional stage-input.
+/// Decode serializer resource compute pipeline (`objType=0x0b`): kernel TLV + optional stage-input.
 pub fn decode_compute_pipeline_descriptor(
     bytes: &[u8],
 ) -> Result<ComputePipelineDescriptor, DecodeStatus> {
-    if bytes.len() < TYPE7_MIN_LEN {
+    if bytes.len() < SERIALIZER_RESOURCE_MIN_LEN {
         return Err(DecodeStatus::ErrShort("res_compute_pipeline_short"));
     }
-    if ld32(&bytes[0..]) != TYPE7_OBJECT_COMPUTE_PIPELINE {
+    if ld32(&bytes[0..]) != SERIALIZER_RESOURCE_OBJECT_COMPUTE_PIPELINE {
         return Err(DecodeStatus::ErrUnsupported("res_compute_pipeline_tag"));
     }
     let declared = ld32(&bytes[4..]) as usize;
-    if declared != bytes.len() || declared < TYPE7_MIN_LEN {
+    if declared != bytes.len() || declared < SERIALIZER_RESOURCE_MIN_LEN {
         return Err(DecodeStatus::ErrShort("res_compute_pipeline_declared_len"));
     }
     // The same four-word header its render sibling carries, so the same relation
     // between its two lengths holds. Checked rather than stored: this descriptor
     // has no consumer for the value, and the walks below bound themselves on the
     // declared length.
-    note_type7_payload_len("compute", ld32(&bytes[12..]), declared);
-    let (fields, consumed) = decode_compact_tlv_record(bytes, TYPE7_FIRST_TLVS)?;
+    note_serializer_resource_payload_len("compute", ld32(&bytes[12..]), declared);
+    let (fields, consumed) = decode_compact_tlv_record(bytes, SERIALIZER_RESOURCE_FIRST_TLVS)?;
     note_pipeline_tlv_fields(
         "compute",
         &COMPUTE_PIPELINE_TAGS_CONSUMED,
@@ -4185,7 +3344,7 @@ pub fn decode_compute_pipeline_descriptor(
     // therefore does not replace.
     let stage_input = match compact_tlv_u32(&fields, PIPELINE_TAG_COMPUTE_STAGE_INPUT_OFFSET) {
         Some(off) => parse_compute_stage_input_section(bytes, off)?,
-        None => parse_compute_stage_input_block(bytes, TYPE7_FIRST_TLVS + consumed)?,
+        None => parse_compute_stage_input_block(bytes, SERIALIZER_RESOURCE_FIRST_TLVS + consumed)?,
     };
     Ok(ComputePipelineDescriptor {
         kernel_func_ref: compact_tlv_u32(&fields, PIPELINE_TAG_KERNEL_FUNC).unwrap_or(0),
@@ -4509,7 +3668,7 @@ pub fn icb_layout_attribute_stride_slot_count(layout: &IcbCommandLayout) -> u32 
     icb_layout_table_len(start, end, ICB_ATTRIBUTE_STRIDE_ENTRY_SIZE)
 }
 
-/// Decode type-7 ICB create descriptor (tag 0x36, length 0x58).
+/// Decode serializer resource ICB create descriptor (tag 0x36, length 0x58).
 ///
 /// Field map from PGSerializer
 /// `newIndirectCommandBufferWithDescriptor:layout:maxCommandCount:options:allocator:`
@@ -4519,7 +3678,7 @@ pub fn decode_icb_descriptor(
 ) -> Result<IndirectCommandBufferDescriptor, DecodeStatus> {
     let op =
         reims_vgpu_wire::op(bytes, 0).map_err(|_| DecodeStatus::ErrShort("res_icb_desc_short"))?;
-    if op.opcode() != TYPE7_OBJECT_ICB
+    if op.opcode() != SERIALIZER_RESOURCE_OBJECT_ICB
         || op.length() as usize != ICB_DESC_LEN
         || bytes.len() != ICB_DESC_LEN
     {
@@ -4550,44 +3709,136 @@ pub fn decode_icb_descriptor(
     })
 }
 
-/// Decode type-7 container (sampler / depth-stencil / pipelines / ICB).
-pub fn decode_type7_descriptor(bytes: &[u8]) -> Result<Descriptor, DecodeStatus> {
+/// Decode a serializer resource (sampler, depth-stencil, pipeline, or ICB).
+///
+/// The object-list wire tag is consumed by [`ObjectKind::SerializerResource`].
+/// Callers beyond this module deal only in the semantic family and decoded
+/// descriptor variants.
+pub fn decode_serializer_resource(bytes: &[u8]) -> Result<Descriptor, DecodeStatus> {
     if bytes.len() < 4 {
-        return Err(DecodeStatus::ErrShort("res_type7_short"));
+        return Err(DecodeStatus::ErrShort("res_serializer_resource_short"));
     }
     let first = ld32(&bytes[0..]);
     match first {
-        TYPE7_OBJECT_SAMPLER => Ok(Descriptor::Sampler(decode_sampler_descriptor(bytes)?)),
-        TYPE7_OBJECT_DEPTH_STENCIL => Ok(Descriptor::DepthStencil(
+        SERIALIZER_RESOURCE_OBJECT_SAMPLER => {
+            Ok(Descriptor::Sampler(decode_sampler_descriptor(bytes)?))
+        }
+        SERIALIZER_RESOURCE_OBJECT_DEPTH_STENCIL => Ok(Descriptor::DepthStencil(
             decode_depth_stencil_descriptor(bytes)?,
         )),
-        TYPE7_OBJECT_RENDER_PIPELINE => Ok(Descriptor::RenderPipeline(
+        SERIALIZER_RESOURCE_OBJECT_RENDER_PIPELINE => Ok(Descriptor::RenderPipeline(
             decode_render_pipeline_descriptor(bytes)?,
         )),
-        TYPE7_OBJECT_COMPUTE_PIPELINE => Ok(Descriptor::ComputePipeline(
+        SERIALIZER_RESOURCE_OBJECT_COMPUTE_PIPELINE => Ok(Descriptor::ComputePipeline(
             decode_compute_pipeline_descriptor(bytes)?,
         )),
-        TYPE7_OBJECT_ICB => Ok(Descriptor::IndirectCommandBuffer(decode_icb_descriptor(
-            bytes,
-        )?)),
-        _ => Err(DecodeStatus::ErrUnsupported("res_type7_subtype_unknown")),
+        SERIALIZER_RESOURCE_OBJECT_ICB => Ok(Descriptor::IndirectCommandBuffer(
+            decode_icb_descriptor(bytes)?,
+        )),
+        _ => Err(DecodeStatus::ErrUnsupported(
+            "res_serializer_resource_subtype_unknown",
+        )),
     }
 }
 
-pub fn decode_descriptor(object_type: u8, bytes: &[u8]) -> Result<Descriptor, DecodeStatus> {
-    match object_type {
-        OBJECT_TYPE_BUFFER => Ok(Descriptor::Buffer(decode_buffer_descriptor(bytes)?)),
-        OBJECT_TYPE_TEXTURE | OBJECT_TYPE_TEXTURE_VARIANT => {
-            Ok(Descriptor::Texture(decode_texture_descriptor(bytes)?))
-        }
-        OBJECT_TYPE_FUNCTION => Ok(Descriptor::Function(decode_function_descriptor(bytes)?)),
-        OBJECT_TYPE_TYPE7 => decode_type7_descriptor(bytes),
-        OBJECT_TYPE_TEXTURE_VIEW => Ok(Descriptor::TextureView(decode_texture_view_descriptor(
-            bytes,
-        )?)),
-        OBJECT_TYPE_IOSURFACE => decode_iosurface_texture_descriptor(bytes),
-        _ => Err(DecodeStatus::ErrUnknownType("res_object_type_unknown")),
+pub fn decode_descriptor(kind: ObjectKind, bytes: &[u8]) -> Result<Descriptor, DecodeStatus> {
+    match kind {
+        ObjectKind::Buffer => Ok(Descriptor::Buffer(decode_buffer_descriptor(bytes)?)),
+        ObjectKind::Texture => Ok(Descriptor::Texture(decode_texture_descriptor(bytes)?)),
+        ObjectKind::Function => Ok(Descriptor::Function(decode_function_descriptor(bytes)?)),
+        ObjectKind::SerializerResource => decode_serializer_resource(bytes),
+        ObjectKind::TextureView => match texture_type8_opcode(bytes) {
+            Some(HEAP_TEXTURE_OPCODE) | Some(HEAP_TEXTURE_WIDE_OPCODE) => {
+                Ok(Descriptor::HeapTexture(
+                    reims_vgpu_protocol::decode_heap_texture_descriptor(bytes)?,
+                ))
+            }
+            Some(TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE)
+            | Some(TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE_WIDE) => Ok(Descriptor::BufferTexture(
+                decode_buffer_texture_descriptor(bytes)?,
+            )),
+            _ => Ok(Descriptor::TextureView(decode_texture_view_descriptor(
+                bytes,
+            )?)),
+        },
+        ObjectKind::IOSurfaceTexture => decode_mapper_iosurface_texture_view(bytes),
+        ObjectKind::IOSurfacePlaneView => Ok(Descriptor::IOSurfacePlaneView(
+            decode_iosurface_plane_view_resource(bytes)?,
+        )),
+        ObjectKind::SurfaceBacking => Ok(Descriptor::SurfaceBacking(
+            reims_vgpu_protocol::decode_surface_backing_descriptor(bytes)?,
+        )),
+        ObjectKind::MemorylessTexture
+        | ObjectKind::DualPlaneTexture
+        | ObjectKind::ResourceHandle
+        | ObjectKind::HeapBuffer
+        | ObjectKind::ExternalBuffer => Err(DecodeStatus::ErrUnsupported(
+            "res_descriptor_owned_by_surface_path",
+        )),
     }
+}
+
+pub fn decode_iosurface_plane_view_resource(
+    bytes: &[u8],
+) -> Result<reims_vgpu_protocol::IOSurfacePlaneViewResourceDescriptor, DecodeStatus> {
+    use reims_vgpu_protocol::{
+        IOSurfacePlaneViewDecodeState, IOSurfacePlaneViewDescriptor, IOSurfacePlaneViewRecordKind,
+        IOSurfacePlaneViewResourceDescriptor, ObjectTableRef, ResourceObject, TaskId,
+    };
+    use reims_vgpu_wire::device_desc as wire;
+
+    let header = wire::iosurface_plane_view_header(bytes)
+        .map_err(|_| DecodeStatus::ErrShort("res_iosurface_plane_view_header"))?;
+    let mut decoded = IOSurfacePlaneViewResourceDescriptor {
+        surface: ObjectTableRef::<ResourceObject>::new(header.surface_id.get()),
+        owner_task: TaskId::new(header.owner_task.get()),
+        operation_kind: None,
+        operation_length: None,
+        own_ref: None,
+        record_kind: None,
+        unidentified_record_flags: 0,
+        view: None,
+        decode_state: IOSurfacePlaneViewDecodeState::MissingOperation,
+    };
+    let Ok(args) = wire::iosurface_plane_view_args_header(bytes) else {
+        return Ok(decoded);
+    };
+    decoded.operation_kind = Some(args.kind.get());
+    decoded.operation_length = Some(args.blob_len.get());
+    decoded.own_ref = Some(ObjectTableRef::<ResourceObject>::new(args.own_ref.get()));
+    decoded.decode_state = IOSurfacePlaneViewDecodeState::MissingRecord;
+
+    let Ok(record) = wire::iosurface_plane_view_texture_record(bytes) else {
+        return Ok(decoded);
+    };
+    decoded.unidentified_record_flags = record._unknown;
+    let record_kind = match record.tag {
+        wire::IOSURFACE_PLANE_VIEW_RECORD_TAG_PLANE => IOSurfacePlaneViewRecordKind::Plane,
+        wire::IOSURFACE_PLANE_VIEW_RECORD_TAG_COLOR_VIEW => IOSurfacePlaneViewRecordKind::ColorView,
+        _ => {
+            decoded.decode_state = IOSurfacePlaneViewDecodeState::UnknownRecordTag(record.tag);
+            return Ok(decoded);
+        }
+    };
+    decoded.record_kind = Some(record_kind);
+    let decoded_view = IOSurfacePlaneViewDescriptor {
+        pixel_format: record.pixel_format.get(),
+        width: record.width.get(),
+        height: record.height.get(),
+        depth: record.depth.get(),
+        plane_index: wire::iosurface_plane_view_record_plane_index(bytes).unwrap_or(0),
+    };
+    if decoded_view.pixel_format != 0
+        && decoded_view.width != 0
+        && decoded_view.height != 0
+        && decoded_view.depth == 1
+    {
+        decoded.view = Some(decoded_view);
+        decoded.decode_state = IOSurfacePlaneViewDecodeState::Complete;
+    } else {
+        decoded.decode_state = IOSurfacePlaneViewDecodeState::InvalidGeometry;
+    }
+    Ok(decoded)
 }
 
 #[cfg(test)]

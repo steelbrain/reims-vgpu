@@ -21,7 +21,13 @@
 extern "C" {
 #endif
 
-/* v18: ReimsVgpuHostOps.dmabuf_for_pages and every REIMS_VGPU_DMABUF_* removed.
+/* v20: ReimsVgpuHostOps.map_pages_with_padding — build a resource-shaped
+ *      guest-page alias whose exact trailing extent is host-only binding
+ *      padding. The padding is not guest RAM and never enters a guest page
+ *      footprint.
+ * v19: remove guest dirty-page callbacks. Resource validity records are the
+ *      ownership contract; memory observations do not select guest content.
+ * v18: ReimsVgpuHostOps.dmabuf_for_pages and every REIMS_VGPU_DMABUF_* removed.
  *      v17's spans replaced the mechanism outright: guest pages reach the host
  *      GPU by importing the RAMBlock mapping QEMU already holds, on Linux,
  *      Windows and macOS alike, rather than through a Linux-only udmabuf fd.
@@ -65,15 +71,6 @@ extern "C" {
  *      twice over. It is product policy; a thin shim does not hold one. Both old
  *      symbols are removed rather than kept — a shim that can still assemble its
  *      own answer will eventually do so again.
- * v13: ReimsVgpuHostOps.guest_written_pages — the per-page form of v12's
- *      generation. The generation says a surface's pages moved; this says
- *      which, which is what a deferred writeback needs in order to land its
- *      frame without replacing the guest's own stores.
- * v12: ReimsVgpuHostOps.track_guest_writes / untrack_guest_writes /
- *      guest_write_gen — the hypervisor dirty bitmap, the only witness for a
- *      write to a surface's guest pages that no device operation made. Every
- *      host-side copy of those pages is stale the instant the guest CPU stores
- *      into them, and nothing this device counts can see that store.
  * v11: reims_vgpu_qemu_window_run_main — run the host window as QEMU's process-main
  *      UI loop (required by AppKit on Darwin).
  * v10: ReimsVgpuHostOps.map_pages_stable — whether a map_pages view is a stable
@@ -91,7 +88,7 @@ extern "C" {
  *     thread so IRQ pulses reach the guest mid-drain — ack fast).
  * v6: ReimsVgpuHostOps.is_ram_gpa (reject non-RAM PFNs on mapper / map_pages paths).
  * v5: ReimsVgpuQemuCreateInfo.guest_page_shift (12 = x86 Tahoe, 14 = arm64e). */
-#define REIMS_VGPU_QEMU_ABI_VERSION 18u
+#define REIMS_VGPU_QEMU_ABI_VERSION 20u
 
 #define REIMS_VGPU_QEMU_OK 0
 #define REIMS_VGPU_QEMU_ERR_ARGS 1
@@ -312,49 +309,17 @@ typedef struct ReimsVgpuHostOps {
      */
     int map_pages_stable;
     /*
-     * Guest-write tracking. A surface's pages are plain guest RAM: the guest
-     * CPU stores into them with no device operation, so no counter the Rust
-     * device keeps can witness such a store, and any host-side copy of those
-     * pages is silently stale from that instant. The hypervisor's dirty
-     * bitmap is the only witness, and these three calls are the door to it.
+     * Build a stable packed alias over `count` guest pages and extend the host
+     * allocation to exactly `total_len` bytes with anonymous read/write
+     * padding. `total_len` must be at least count * guest page size and aligned
+     * to the host allocation granularity. The extra bytes are not guest RAM.
      *
-     * track_guest_writes registers `count` page-aligned GPAs (each of
-     * `page_size` bytes) as one tracked set and returns a non-zero opaque
-     * token, or 0 when this host cannot observe such writes at all. Callers
-     * must read a 0 token as "assume written on every check".
-     *
-     * untrack_guest_writes releases a token. guest_write_gen returns a
-     * monotonic count of host observations that some page of the set was
-     * written, or 0 for an unknown token; it is safe from any thread, while
-     * track/untrack are not (they mutate QEMU MemoryRegion logging state and
-     * must run with the BQL held).
+     * Optional. A NULL callback means this host cannot materialize image
+     * binding padding and the backend keeps the transfer representation.
      */
-    uint64_t (*track_guest_writes)(void *ctx, const uint64_t *gpas, size_t count,
-                                   size_t page_size);
-    void (*untrack_guest_writes)(void *ctx, uint64_t token);
-    uint64_t (*guest_write_gen)(void *ctx, uint64_t token);
-    /*
-     * Which pages of the set were written, not just whether any were.
-     *
-     * Fills `out` with the page-aligned GPAs of `token`'s set whose most recent
-     * observed write is newer than `since_gen` — a value the caller previously
-     * read from guest_write_gen and recorded next to a host-side copy — and
-     * returns how many. Safe from any thread.
-     *
-     * Returns -1 for every case where the answer is not knowable and the caller
-     * must assume the whole set was written: an unknown token, a token whose
-     * generation is still unreadable, a `since_gen` of 0, or more written pages
-     * than `max` can hold. A truncated list would say "these pages and no
-     * others", which turns a conservative caller into a wrong one.
-     *
-     * A whole-set generation is enough to decide whether to *reuse* a copy. It
-     * is not enough to decide what to *write back*: a writeback that discards
-     * its whole frame because one page moved loses the Store, and one that
-     * writes the whole frame anyway loses the guest's own store. This is the
-     * call that lets a writeback do neither.
-     */
-    int64_t (*guest_written_pages)(void *ctx, uint64_t token, uint64_t since_gen,
-                                   uint64_t *out, size_t max);
+    int (*map_pages_with_padding)(void *ctx, const uint64_t *gpas,
+                                  size_t count, size_t total_len,
+                                  void **out_ptr);
 } ReimsVgpuHostOps;
 
 /*

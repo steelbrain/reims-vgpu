@@ -112,21 +112,9 @@ Legitimate reasons a function reads zero:
    resize, is not video, is not a mode change, is not sleep/wake, is not a second
    display. Cold here means "this run did not ask", full stop.
 4. **It is an error or allocation-failure path.**
-5. **It belongs to the other pathway.** This run is x86 / 12-bit page shift /
-   Vulkan. Most of `backend/metal/` is `cfg`-ed out of the build and does not
-   appear at all — but page-geometry and attach-specific paths do, and read cold.
-6. **It is Metal-arm logic that was deliberately moved out of the gated tree,
-   so it is compiled in and still only called from the other arm.** This is
-   reason 5's exception and it did not exist when the first baseline was taken.
-   `AGENTS.md` asks for pure logic under `backend/metal/` to be moved out, so
-   its tests run on every arm instead of on none; `backend/hash.rs`,
-   `backend/render_pso_key.rs` and `model/content_cache.rs` were moved for
-   exactly that reason and all three read 0.00% here. Reason 5 as it used to be
-   written — "`backend-metal` is cfg'd out entirely, so it does not appear at
-   all" — turns that into an argument that they *cannot* be Metal-only, and so
-   into a deletion. Read the module's own doc: each of these says in its first
-   paragraph why it sits outside `metal`.
-7. **It is a capability-gated fallback and this host is too capable to need
+5. **It belongs to the other attach or page geometry.** This run is x86 with a
+   12-bit page shift; arm64-only mapper and 14-bit page paths compile but read cold.
+6. **It is a capability-gated fallback and this host is too capable to need
    it.** `runtime/spirv_vertex_input.rs` is 0% across all 10 functions because
    it is reached only from `VertexFormatSupport::resolve`'s widening fallback,
    which runs when a device declines a three-component vertex format. This
@@ -251,7 +239,7 @@ reaches it, and each named the guest action that would take it:
 | file | why it is zero | the guest action that takes it |
 |---|---|---|
 | `runtime/icb/mod.rs` | already priced, five boots behind it | indirect command buffers, type-7 tag `0x36` |
-| `runtime/heap_query.rs` | Vulkan host has no Metal device, so it answers `NoMetalDevice` | `CmdHeapTextureSizeAndAlign`, child-FIFO config op `0x40` — `[MTLDevice heapTextureSizeAndAlignForDescriptor:]` |
+| `runtime/heap_query.rs` | host requirements query is not implemented for Vulkan | `CmdHeapTextureSizeAndAlign`, child-FIFO config op `0x40` |
 | `runtime/mipmap.rs` | a window drag creates no multi-mip textures | blit opcode `0x133 generateMipmaps` |
 | `runtime/plan/event_sync.rs` | pure planning behind `fence_exec`; same reason | Metal events and encoder fences, segment type 3 and the blit/compute/render fence fields |
 | `runtime/fence_exec.rs` | the sole executor for the above; this workload issued no cross-encoder sync | same |

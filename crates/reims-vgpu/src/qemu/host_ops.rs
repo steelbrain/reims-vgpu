@@ -6,7 +6,7 @@
 //! the main loop.
 
 use crate::runtime::host::{
-    GuestRamRegionsError, HostAction, HostActionKind, HostMemory, HostOps, MemError,
+    GuestRamRegionsError, HostAction, HostActionKind, HostMemory, MemError,
 };
 use std::collections::VecDeque;
 use std::os::raw::{c_int, c_void};
@@ -89,36 +89,14 @@ pub struct ReimsVgpuHostOps {
     /// imports do read it, because retaining such an import requires the
     /// `map_pages` alias itself to outlive submitted GPU work.
     pub map_pages_stable: c_int,
-    /// Register `count` page-aligned GPAs as one guest-write-tracked set and
-    /// return a non-zero opaque token, or 0 when the host has no dirty bitmap.
-    /// Mutates QEMU MemoryRegion logging state, so the shim may only do the
-    /// enabling part with the BQL held — see the C side for how it defers.
-    pub track_guest_writes: Option<
+    pub map_pages_with_padding: Option<
         unsafe extern "C" fn(
             ctx: *mut c_void,
             gpas: *const u64,
             count: usize,
-            page_size: usize,
-        ) -> u64,
-    >,
-    /// Release a token from `track_guest_writes`.
-    pub untrack_guest_writes: Option<unsafe extern "C" fn(ctx: *mut c_void, token: u64)>,
-    /// Monotonic count of host observations that some page of the token's set
-    /// was written; 0 for an unknown or not-yet-armed token. Safe from any
-    /// thread.
-    pub guest_write_gen: Option<unsafe extern "C" fn(ctx: *mut c_void, token: u64) -> u64>,
-    /// Page-aligned GPAs of the token's set written since `since_gen`, into
-    /// `out`, returning how many — or -1 for every case where the answer is not
-    /// knowable and the caller must assume the whole set was written. Safe from
-    /// any thread.
-    pub guest_written_pages: Option<
-        unsafe extern "C" fn(
-            ctx: *mut c_void,
-            token: u64,
-            since_gen: u64,
-            out: *mut u64,
-            max: usize,
-        ) -> i64,
+            total_len: usize,
+            out_ptr: *mut *mut c_void,
+        ) -> i32,
     >,
 }
 
@@ -151,13 +129,10 @@ impl ReimsVgpuHostOps {
             map_pages: None,
             unmap_pages: None,
             map_pages_stable: 0,
-            track_guest_writes: None,
-            untrack_guest_writes: None,
-            guest_write_gen: None,
-            guest_written_pages: None,
             is_ram_gpa: None,
             guest_ram_regions: None,
             notify_actions: None,
+            map_pages_with_padding: None,
         }
     }
 }
@@ -189,6 +164,17 @@ enum QemuHostDecline {
         page_count: usize,
         page_size: usize,
     },
+    MapPagesWithPaddingFailed {
+        rc: i32,
+        first_gpa: u64,
+        page_count: usize,
+        total_len: usize,
+    },
+    MapPagesWithPaddingNullPointer {
+        first_gpa: u64,
+        page_count: usize,
+        total_len: usize,
+    },
     UnmapPagesCallbackMissing {
         ptr: usize,
         len: usize,
@@ -203,6 +189,10 @@ impl crate::observe::Decline for QemuHostDecline {
             Self::MapPagesCallbackMissing { .. } => "qemu_map_pages_callback_missing",
             Self::MapPagesCallbackFailed { .. } => "qemu_map_pages_callback_failed",
             Self::MapPagesNullPointer { .. } => "qemu_map_pages_null_pointer",
+            Self::MapPagesWithPaddingFailed { .. } => "qemu_map_pages_with_padding_callback_failed",
+            Self::MapPagesWithPaddingNullPointer { .. } => {
+                "qemu_map_pages_with_padding_null_pointer"
+            }
             Self::UnmapPagesCallbackMissing { .. } => "qemu_unmap_pages_callback_missing",
         }
     }
@@ -238,6 +228,26 @@ impl crate::observe::Decline for QemuHostDecline {
             Self::UnmapPagesCallbackMissing { ptr, len } => {
                 vec![("ptr", format!("{ptr:#x}")), ("len", len.to_string())]
             }
+            Self::MapPagesWithPaddingFailed {
+                rc,
+                first_gpa,
+                page_count,
+                total_len,
+            } => vec![
+                ("rc", rc.to_string()),
+                ("first_gpa", format!("{first_gpa:#x}")),
+                ("page_count", page_count.to_string()),
+                ("total_len", total_len.to_string()),
+            ],
+            Self::MapPagesWithPaddingNullPointer {
+                first_gpa,
+                page_count,
+                total_len,
+            } => vec![
+                ("first_gpa", format!("{first_gpa:#x}")),
+                ("page_count", page_count.to_string()),
+                ("total_len", total_len.to_string()),
+            ],
         }
     }
 }
@@ -359,7 +369,7 @@ impl HostMemory for QemuHost<'_> {
     }
 }
 
-impl HostOps for QemuHost<'_> {
+impl crate::runtime::host::HostControl for QemuHost<'_> {
     fn mono_ns(&self) -> u64 {
         match self.ops.mono_ns {
             // SAFETY: QEMU owns ctx.
@@ -456,7 +466,9 @@ impl HostOps for QemuHost<'_> {
             QemuHostDecline::ScheduleBhCallbackMissing.emit(0);
         }
     }
+}
 
+impl crate::runtime::host::GuestCpuAccess for QemuHost<'_> {
     fn read_kva(&self, kva: u64, buf: &mut [u8]) -> Result<(), MemError> {
         if buf.is_empty() {
             return Ok(());
@@ -506,7 +518,9 @@ impl HostOps for QemuHost<'_> {
             ))
         }
     }
+}
 
+impl crate::runtime::host::HostPageViews for QemuHost<'_> {
     fn map_pages(&mut self, gpas: &[u64], page_size: usize) -> Option<usize> {
         if gpas.is_empty() {
             return None;
@@ -551,16 +565,66 @@ impl HostOps for QemuHost<'_> {
         self.ops.map_pages_stable != 0
     }
 
+    fn map_pages_with_padding(
+        &mut self,
+        gpas: &[u64],
+        _page_size: usize,
+        total_len: usize,
+    ) -> Option<usize> {
+        let first_gpa = *gpas.first()?;
+        let f = self.ops.map_pages_with_padding?;
+        let mut out: *mut c_void = std::ptr::null_mut();
+        // SAFETY: QEMU owns ctx; gpas valid for count; out is stack local.
+        let rc = unsafe { f(self.ops.ctx, gpas.as_ptr(), gpas.len(), total_len, &mut out) };
+        if rc != 0 {
+            QemuHostDecline::MapPagesWithPaddingFailed {
+                rc,
+                first_gpa,
+                page_count: gpas.len(),
+                total_len,
+            }
+            .emit(first_gpa);
+            return None;
+        }
+        if out.is_null() {
+            QemuHostDecline::MapPagesWithPaddingNullPointer {
+                first_gpa,
+                page_count: gpas.len(),
+                total_len,
+            }
+            .emit(first_gpa);
+            return None;
+        }
+        Some(out as usize)
+    }
+
+    fn unmap_pages(&mut self, ptr: usize, len: usize) {
+        if ptr == 0 || len == 0 {
+            return;
+        }
+        if let Some(f) = self.ops.unmap_pages {
+            // SAFETY: ptr/len came from a successful map_pages.
+            unsafe { f(self.ops.ctx, ptr as *mut c_void, len) }
+        } else {
+            QemuHostDecline::UnmapPagesCallbackMissing { ptr, len }.emit(ptr as u64);
+        }
+    }
+
+    fn is_ram_gpa(&self, gpa: u64) -> bool {
+        match self.ops.is_ram_gpa {
+            // SAFETY: QEMU owns ctx; pure address-space query.
+            Some(f) => unsafe { f(self.ops.ctx, gpa) != 0 },
+            // Older/missing table: do not invent a reject (map_pages still RAM-checks).
+            None => true,
+        }
+    }
+}
+
+impl crate::runtime::host::GuestRamProvider for QemuHost<'_> {
     fn guest_ram_regions(
         &mut self,
     ) -> Result<Vec<crate::runtime::guest_ram::GuestRamRegion>, GuestRamRegionsError> {
         /// Spans the first call asks for.
-        ///
-        /// An x86 machine with a PCI hole has two RAMBlocks and a vmapple one
-        /// has one, so this is already several times the answer. It is a first
-        /// guess and not a bound: a host with more spans reports its total and
-        /// gets asked again at that size, which is why nothing here is a cap
-        /// that could silently import part of the guest's memory.
         const FIRST_TRY: usize = 8;
 
         let f = self
@@ -569,8 +633,7 @@ impl HostOps for QemuHost<'_> {
             .ok_or(GuestRamRegionsError::CallbackMissing)?;
         let mut buf = vec![crate::runtime::guest_ram::GuestRamRegion::default(); FIRST_TRY];
         // SAFETY: QEMU owns ctx and keeps it valid for the device lifetime;
-        // `buf` is valid for `len` writes of the shared `#[repr(C)]` struct for
-        // the duration of the call.
+        // `buf` is valid for `len` shared-ABI writes during the call.
         let mut rc = unsafe { f(self.ops.ctx, buf.as_mut_ptr(), buf.len()) };
         if rc < 0 {
             return Err(GuestRamRegionsError::from_code(rc));
@@ -578,7 +641,7 @@ impl HostOps for QemuHost<'_> {
         let mut total = rc as usize;
         if total > buf.len() {
             buf.resize(total, crate::runtime::guest_ram::GuestRamRegion::default());
-            // SAFETY: as above, with the array the shim's own total sized.
+            // SAFETY: as above, with the array sized from the shim's answer.
             rc = unsafe { f(self.ops.ctx, buf.as_mut_ptr(), buf.len()) };
             if rc < 0 {
                 return Err(GuestRamRegionsError::from_code(rc));
@@ -595,92 +658,6 @@ impl HostOps for QemuHost<'_> {
         buf.truncate(total);
         Ok(buf)
     }
-
-    fn unmap_pages(&mut self, ptr: usize, len: usize) {
-        if ptr == 0 || len == 0 {
-            return;
-        }
-        if let Some(f) = self.ops.unmap_pages {
-            // SAFETY: ptr/len came from a successful map_pages.
-            unsafe { f(self.ops.ctx, ptr as *mut c_void, len) }
-        } else if !self.map_pages_stable() {
-            // Stable aliases explicitly require no release. A missing callback
-            // is a leak only for a transient view.
-            QemuHostDecline::UnmapPagesCallbackMissing { ptr, len }.emit(ptr as u64);
-        }
-    }
-
-    fn is_ram_gpa(&self, gpa: u64) -> bool {
-        match self.ops.is_ram_gpa {
-            // SAFETY: QEMU owns ctx; pure address-space query.
-            Some(f) => unsafe { f(self.ops.ctx, gpa) != 0 },
-            // Older/missing table: do not invent a reject (map_pages still RAM-checks).
-            None => true,
-        }
-    }
-
-    fn track_guest_writes(&mut self, gpas: &[u64], page_size: usize) -> Option<u64> {
-        if gpas.is_empty() || page_size == 0 {
-            return None;
-        }
-        let f = self.ops.track_guest_writes?;
-        // SAFETY: QEMU owns ctx; the slice outlives the call and the shim
-        // copies the page list before returning.
-        let token = unsafe { f(self.ops.ctx, gpas.as_ptr(), gpas.len(), page_size) };
-        // A shim that cannot track answers 0 rather than failing. Not a
-        // decline: "this host has no dirty bitmap" is a capability, and every
-        // consumer already has to handle it on the fixture hosts.
-        (token != 0).then_some(token)
-    }
-
-    fn untrack_guest_writes(&mut self, token: u64) {
-        if token == 0 {
-            return;
-        }
-        if let Some(f) = self.ops.untrack_guest_writes {
-            // SAFETY: token came from a successful track_guest_writes.
-            unsafe { f(self.ops.ctx, token) }
-        }
-    }
-
-    fn guest_write_gen(&self, token: u64) -> Option<u64> {
-        if token == 0 {
-            return None;
-        }
-        let f = self.ops.guest_write_gen?;
-        // SAFETY: QEMU owns ctx; the shim answers from its own lock.
-        let gen_ = unsafe { f(self.ops.ctx, token) };
-        // 0 is the shim's "unknown token, or not yet armed" answer. Reading it
-        // as a generation would let two pre-arm checks agree and vouch for a
-        // resident nothing has ever validated.
-        (gen_ != 0).then_some(gen_)
-    }
-
-    fn guest_written_pages(&self, token: u64, since_gen: u64) -> Option<Vec<u64>> {
-        if token == 0 || since_gen == 0 {
-            return None;
-        }
-        let f = self.ops.guest_written_pages?;
-        // The shim refuses rather than truncating, so the buffer has to be able
-        // to hold a whole surface's page list. A display-sized BGRA8 surface is
-        // ~2 000 x86 pages; the cap is a few times that so a larger one still
-        // gets an exact answer, and a set beyond it declines into "assume the
-        // whole surface was written" rather than into a short list.
-        const MAX_PAGES: usize = 16 * 1024;
-        let mut out = vec![0u64; MAX_PAGES];
-        // SAFETY: QEMU owns ctx; `out` is writable for MAX_PAGES u64s for the
-        // duration of the call, and the shim writes at most `max` of them.
-        let n = unsafe { f(self.ops.ctx, token, since_gen, out.as_mut_ptr(), MAX_PAGES) };
-        if n < 0 {
-            return None;
-        }
-        let n = usize::try_from(n).ok()?;
-        if n > MAX_PAGES {
-            return None;
-        }
-        out.truncate(n);
-        Some(out)
-    }
 }
 
 /// Host used when no QEMU ops table is bound (unit tests / headless create).
@@ -695,7 +672,7 @@ impl HostMemory for NullHost {
     }
 }
 
-impl HostOps for NullHost {
+impl crate::runtime::host::HostControl for NullHost {
     fn mono_ns(&self) -> u64 {
         0
     }
@@ -703,10 +680,16 @@ impl HostOps for NullHost {
     fn schedule_bh(&mut self) {}
 }
 
+impl crate::runtime::host::GuestCpuAccess for NullHost {}
+impl crate::runtime::host::GuestRamProvider for NullHost {}
+impl crate::runtime::host::HostPageViews for NullHost {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::host::HostAction as HA;
+    use crate::runtime::host::{
+        GuestCpuAccess, GuestRamProvider, HostAction as HA, HostControl, HostPageViews,
+    };
 
     unsafe extern "C" fn fail_read_gpa(
         _ctx: *mut c_void,
@@ -758,6 +741,31 @@ mod tests {
         unsafe {
             *out = std::ptr::null_mut();
         }
+        0
+    }
+
+    static PADDED_FIRST_GPA: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static PADDED_PAGE_COUNT: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+    static PADDED_TOTAL_LEN: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    unsafe extern "C" fn record_padded_map(
+        _ctx: *mut c_void,
+        gpas: *const u64,
+        count: usize,
+        total_len: usize,
+        out: *mut *mut c_void,
+    ) -> i32 {
+        use std::sync::atomic::Ordering::Relaxed;
+        // SAFETY: this fixture is called with one non-empty GPA array and one
+        // writable output slot by `QemuHost::map_pages_with_padding`.
+        unsafe {
+            PADDED_FIRST_GPA.store(*gpas, Relaxed);
+            *out = 0x1_0000usize as *mut c_void;
+        }
+        PADDED_PAGE_COUNT.store(count, Relaxed);
+        PADDED_TOTAL_LEN.store(total_len, Relaxed);
         0
     }
 
@@ -1027,6 +1035,17 @@ mod tests {
                 page_count: 2,
                 page_size: 0x4000,
             },
+            QemuHostDecline::MapPagesWithPaddingFailed {
+                rc: -12,
+                first_gpa: 0x4000,
+                page_count: 2,
+                total_len: 0xc000,
+            },
+            QemuHostDecline::MapPagesWithPaddingNullPointer {
+                first_gpa: 0x4000,
+                page_count: 2,
+                total_len: 0xc000,
+            },
             QemuHostDecline::UnmapPagesCallbackMissing {
                 ptr: 0x10000,
                 len: 0x8000,
@@ -1038,6 +1057,8 @@ mod tests {
             "qemu_map_pages_callback_missing",
             "qemu_map_pages_callback_failed",
             "qemu_map_pages_null_pointer",
+            "qemu_map_pages_with_padding_callback_failed",
+            "qemu_map_pages_with_padding_null_pointer",
             "qemu_unmap_pages_callback_missing",
         ];
         assert_eq!(declines.len(), expected.len());
@@ -1071,5 +1092,23 @@ mod tests {
         let prompt = parking_lot::Mutex::new(VecDeque::new());
         let mut host = QemuHost::new(&ops, &mut actions, &prompt);
         assert_eq!(host.map_pages(&[0xc000], 0x4000), None);
+    }
+
+    #[test]
+    fn padded_page_mapping_forwards_the_exact_host_extent() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut ops = ReimsVgpuHostOps::null();
+        ops.map_pages_with_padding = Some(record_padded_map);
+        let mut actions = VecDeque::new();
+        let prompt = parking_lot::Mutex::new(VecDeque::new());
+        let mut host = QemuHost::new(&ops, &mut actions, &prompt);
+
+        assert_eq!(
+            host.map_pages_with_padding(&[0x4000, 0x9000], 0x1000, 0x5000),
+            Some(0x1_0000)
+        );
+        assert_eq!(PADDED_FIRST_GPA.load(Relaxed), 0x4000);
+        assert_eq!(PADDED_PAGE_COUNT.load(Relaxed), 2);
+        assert_eq!(PADDED_TOTAL_LEN.load(Relaxed), 0x5000);
     }
 }

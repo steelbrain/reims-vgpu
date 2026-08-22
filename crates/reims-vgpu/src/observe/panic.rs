@@ -176,8 +176,8 @@ pub(crate) fn report(entry: &'static str, payload: &(dyn Any + Send)) {
         .ok()
         .flatten()
         .unwrap_or_else(|| "unknown".to_string());
-    let discriminant = crate::contract::fnv::fold_bytes(
-        crate::contract::fnv::fold_bytes(crate::contract::fnv::FNV_OFFSET_BASIS, entry.as_bytes()),
+    let discriminant = reims_vgpu_core::fnv::fold_bytes(
+        reims_vgpu_core::fnv::fold_bytes(reims_vgpu_core::fnv::FNV_OFFSET_BASIS, entry.as_bytes()),
         at.as_bytes(),
     );
     let decline = AbiPanic {

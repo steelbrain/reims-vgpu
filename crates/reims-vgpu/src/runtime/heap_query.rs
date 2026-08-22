@@ -4,8 +4,10 @@
 //! Apple host routine reconstructs an `MTLTextureDescriptor` and returns the
 //! device's `MTLSizeAndAlign` as two little-endian `u64`s.
 
-use crate::contract::endian::{ld32, ld64, st64};
+use reims_vgpu_core::endian::{ld32, ld64, st64};
 use reims_vgpu_wire::ops::texture as wire;
+
+pub use reims_vgpu_protocol::TextureDeclaration as TextureDescriptor;
 
 pub const REQUEST_HEADER_LEN: usize = 24;
 pub const REPLY_LEN: usize = 16;
@@ -25,37 +27,6 @@ pub const TEXTURE_BODY_LEN: usize = wire::TEXTURE_DESCRIPTOR_LEN;
 /// body has an opcode of its own; see
 /// [`crate::runtime::decode::resource::decode_heap_texture`].
 pub const WIDE_TEXTURE_BODY_LEN: usize = wire::WIDE_TEXTURE_DESCRIPTOR_LEN;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TextureDescriptor {
-    pub texture_type: u8,
-    pub framebuffer_only: bool,
-    pub is_drawable: bool,
-    pub allow_gpu_optimized_contents: bool,
-    /// `MTLTextureUsage` mask. Eight bits of the packed word on the narrow
-    /// body and a field of its own on the wide one, so it is held at the wider
-    /// of the two — narrowing it here would drop any bit above 7 that a wide
-    /// descriptor sets.
-    pub usage: u32,
-    pub pixel_format: u16,
-    pub width: u32,
-    pub height: u32,
-    pub depth: u32,
-    pub mipmap_level_count: u16,
-    pub sample_count: u16,
-    pub array_length: u16,
-    pub resource_options: u16,
-    pub protection_options: u64,
-    /// `MTLTextureSwizzleChannels` as four raw `MTLTextureSwizzle` ordinals in
-    /// red, green, blue, alpha order — the same encoding the type-8 swizzle
-    /// view carries, so [`crate::contract::pixel_format::swizzle_plan`] reads
-    /// both.
-    ///
-    /// `None` on the narrow body, which has no such field at all. That is not
-    /// the same as the identity: a reader must not turn an absent swizzle into
-    /// a present one.
-    pub swizzle: Option<[u8; 4]>,
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Request {
@@ -91,8 +62,7 @@ pub enum QueryError {
     UnknownPixelFormat,
     UnknownUsage,
     UnknownResourceOptions,
-    UnsupportedProtectionOptions,
-    NoMetalDevice,
+    HostRequirementsUnavailable,
     ZeroRequirement,
     /// The request names a task id that resolves to no active task, so there is
     /// nowhere to write the reply. Checked by the caller in `runtime/drain/mod.rs`
@@ -123,8 +93,7 @@ impl crate::observe::Decline for QueryError {
             Self::UnknownPixelFormat => "heap_query_unknown_pixel_format",
             Self::UnknownUsage => "heap_query_unknown_usage",
             Self::UnknownResourceOptions => "heap_query_unknown_resource_options",
-            Self::UnsupportedProtectionOptions => "heap_query_unsupported_protection_options",
-            Self::NoMetalDevice => "heap_query_no_metal_device",
+            Self::HostRequirementsUnavailable => "heap_query_host_requirements_unavailable",
             Self::ZeroRequirement => "heap_query_zero_requirement",
             Self::BadTask => "heap_query_bad_task",
         }
@@ -173,40 +142,16 @@ pub fn decode_request(payload: &[u8]) -> Result<Request, QueryError> {
 /// paths from drifting.
 ///
 /// Read through `reims_vgpu_wire`'s view rather than at offsets restated here,
-/// so a field this device names is the field Apple's bytes derived. Two of the
-/// names below are this device's reading and not the wire crate's:
-/// `framebuffer_only` and `is_drawable` are `packed[5:4]`, which that crate
-/// carries as `unidentified_flags` because neither is an `MTLTextureDescriptor`
-/// property and no perturbation has moved either. They read 0 on every fixture.
+/// so a field this device names is the field Apple's bytes derived. The two
+/// `framebufferOnly`, `isDrawable`, and `protectionOptions` were independently
+/// attributed by controlled serializer perturbations.
 pub fn decode_serialized_texture_descriptor(body: &[u8]) -> Result<TextureDescriptor, QueryError> {
     if body.len() != TEXTURE_BODY_LEN {
         return Err(QueryError::BadDescriptorLength);
     }
     let d: &wire::TextureDescriptorBody =
         reims_vgpu_wire::view(body).map_err(|_| QueryError::BadDescriptorLength)?;
-    let packed = d.packed.get();
-    Ok(TextureDescriptor {
-        texture_type: d.texture_type(),
-        framebuffer_only: packed & (1 << 4) != 0,
-        is_drawable: packed & (1 << 5) != 0,
-        allow_gpu_optimized_contents: d.allow_gpu_optimized_contents(),
-        usage: d.usage() as u32,
-        pixel_format: d.pixel_format(),
-        width: d.width.get(),
-        height: d.height.get(),
-        depth: d.depth.get(),
-        mipmap_level_count: d.mipmap_level_count.get(),
-        sample_count: d.sample_count.get(),
-        array_length: d.array_length.get(),
-        resource_options: d.resource_options.get(),
-        // The wire crate calls this word `unidentified_u64` and has moved it in
-        // no capture. `protection_options` is this device's ported reading of
-        // it; `query_size_and_align` refuses a non-zero one rather than acting
-        // on the name, which is the only safe thing to do with a field whose
-        // meaning nothing has confirmed.
-        protection_options: d.unidentified_u64.get(),
-        swizzle: None,
-    })
+    Ok(reims_vgpu_protocol::texture_declaration_from_narrow(d))
 }
 
 /// Decode the 40-byte wide `PGSerializedTextureDescriptor` body.
@@ -226,170 +171,13 @@ pub fn decode_wide_serialized_texture_descriptor(
     }
     let d: &wire::WideTextureDescriptorBody =
         reims_vgpu_wire::view(body).map_err(|_| QueryError::BadDescriptorLength)?;
-    Ok(TextureDescriptor {
-        texture_type: d.texture_type(),
-        // The same two bits the narrow form carries. Bit 7 is a third flag that
-        // exists only here — the narrow serializer never writes it — and it is
-        // unnamed in both crates, so it is not read.
-        framebuffer_only: d.type_and_flags & (1 << 4) != 0,
-        is_drawable: d.type_and_flags & (1 << 5) != 0,
-        allow_gpu_optimized_contents: d.allow_gpu_optimized_contents(),
-        usage: d.usage.get(),
-        pixel_format: d.pixel_format.get(),
-        width: d.width.get(),
-        height: d.height.get(),
-        depth: d.depth.get(),
-        mipmap_level_count: d.mipmap_level_count.get(),
-        sample_count: d.sample_count.get(),
-        array_length: d.array_length.get(),
-        resource_options: d.resource_options.get(),
-        protection_options: d.unidentified_u64.get(),
-        swizzle: Some([
-            d.swizzle_red,
-            d.swizzle_green,
-            d.swizzle_blue,
-            d.swizzle_alpha,
-        ]),
-    })
+    Ok(reims_vgpu_protocol::texture_declaration_from_wide(d))
 }
 
-#[cfg(target_os = "macos")]
-pub fn query_size_and_align(desc: &TextureDescriptor) -> Result<SizeAndAlign, QueryError> {
-    use metal::{
-        MTLResourceOptions, MTLTextureType, MTLTextureUsage, TextureDescriptor as MtlDescriptor,
-    };
-    use objc::runtime::{NO, YES};
-    use objc::{msg_send, sel, sel_impl};
-
-    let texture_type = match desc.texture_type {
-        0 => MTLTextureType::D1,
-        1 => MTLTextureType::D1Array,
-        2 => MTLTextureType::D2,
-        3 => MTLTextureType::D2Array,
-        4 => MTLTextureType::D2Multisample,
-        5 => MTLTextureType::Cube,
-        6 => MTLTextureType::CubeArray,
-        7 => MTLTextureType::D3,
-        8 => MTLTextureType::D2MultisampleArray,
-        _ => return Err(QueryError::UnknownTextureType),
-    };
-    let pixel_format =
-        pixel_format_from_wire(desc.pixel_format).ok_or(QueryError::UnknownPixelFormat)?;
-    let usage = MTLTextureUsage::from_bits(desc.usage as u64).ok_or(QueryError::UnknownUsage)?;
-    let resource_options = MTLResourceOptions::from_bits(desc.resource_options as u64)
-        .ok_or(QueryError::UnknownResourceOptions)?;
-    if desc.protection_options != 0 {
-        return Err(QueryError::UnsupportedProtectionOptions);
-    }
-    let device = metal::Device::system_default().ok_or(QueryError::NoMetalDevice)?;
-    let mtl = MtlDescriptor::new();
-    mtl.set_texture_type(texture_type);
-    mtl.set_pixel_format(pixel_format);
-    mtl.set_width(desc.width as u64);
-    mtl.set_height(desc.height as u64);
-    mtl.set_depth(desc.depth as u64);
-    mtl.set_mipmap_level_count(desc.mipmap_level_count as u64);
-    mtl.set_sample_count(desc.sample_count as u64);
-    mtl.set_array_length(desc.array_length as u64);
-    mtl.set_resource_options(resource_options);
-    mtl.set_usage(usage);
-    unsafe {
-        let framebuffer_only = if desc.framebuffer_only { YES } else { NO };
-        let is_drawable = if desc.is_drawable { YES } else { NO };
-        let allow_gpu_optimized = if desc.allow_gpu_optimized_contents {
-            YES
-        } else {
-            NO
-        };
-        let _: () = msg_send![&*mtl, setFramebufferOnly: framebuffer_only];
-        let _: () = msg_send![&*mtl, setIsDrawable: is_drawable];
-        let _: () = msg_send![
-            &*mtl,
-            setAllowGPUOptimizedContents: allow_gpu_optimized
-        ];
-    }
-    let requirement = device.heap_texture_size_and_align(&mtl);
-    if requirement.size == 0 || requirement.align == 0 {
-        return Err(QueryError::ZeroRequirement);
-    }
-    Ok(SizeAndAlign {
-        size: requirement.size,
-        align: requirement.align,
-    })
-}
-
-#[cfg(not(target_os = "macos"))]
 pub fn query_size_and_align(_desc: &TextureDescriptor) -> Result<SizeAndAlign, QueryError> {
-    // The Linux Vulkan pathway does not yet have a verified equivalence between
-    // VkImage memory requirements and Apple's guest heap placement contract.
-    Err(QueryError::NoMetalDevice)
-}
-
-#[cfg(target_os = "macos")]
-fn pixel_format_from_wire(raw: u16) -> Option<metal::MTLPixelFormat> {
-    use metal::MTLPixelFormat as F;
-    Some(match raw as u64 {
-        x if x == F::Invalid as u64 => F::Invalid,
-        x if x == F::A8Unorm as u64 => F::A8Unorm,
-        x if x == F::R8Unorm as u64 => F::R8Unorm,
-        x if x == F::R8Unorm_sRGB as u64 => F::R8Unorm_sRGB,
-        x if x == F::R8Snorm as u64 => F::R8Snorm,
-        x if x == F::R8Uint as u64 => F::R8Uint,
-        x if x == F::R8Sint as u64 => F::R8Sint,
-        x if x == F::R16Unorm as u64 => F::R16Unorm,
-        x if x == F::R16Snorm as u64 => F::R16Snorm,
-        x if x == F::R16Uint as u64 => F::R16Uint,
-        x if x == F::R16Sint as u64 => F::R16Sint,
-        x if x == F::R16Float as u64 => F::R16Float,
-        x if x == F::RG8Unorm as u64 => F::RG8Unorm,
-        x if x == F::RG8Unorm_sRGB as u64 => F::RG8Unorm_sRGB,
-        x if x == F::RG8Snorm as u64 => F::RG8Snorm,
-        x if x == F::RG8Uint as u64 => F::RG8Uint,
-        x if x == F::RG8Sint as u64 => F::RG8Sint,
-        x if x == F::B5G6R5Unorm as u64 => F::B5G6R5Unorm,
-        x if x == F::A1BGR5Unorm as u64 => F::A1BGR5Unorm,
-        x if x == F::ABGR4Unorm as u64 => F::ABGR4Unorm,
-        x if x == F::BGR5A1Unorm as u64 => F::BGR5A1Unorm,
-        x if x == F::R32Uint as u64 => F::R32Uint,
-        x if x == F::R32Sint as u64 => F::R32Sint,
-        x if x == F::R32Float as u64 => F::R32Float,
-        x if x == F::RG16Unorm as u64 => F::RG16Unorm,
-        x if x == F::RG16Snorm as u64 => F::RG16Snorm,
-        x if x == F::RG16Uint as u64 => F::RG16Uint,
-        x if x == F::RG16Sint as u64 => F::RG16Sint,
-        x if x == F::RG16Float as u64 => F::RG16Float,
-        x if x == F::RGBA8Unorm as u64 => F::RGBA8Unorm,
-        x if x == F::RGBA8Unorm_sRGB as u64 => F::RGBA8Unorm_sRGB,
-        x if x == F::RGBA8Snorm as u64 => F::RGBA8Snorm,
-        x if x == F::RGBA8Uint as u64 => F::RGBA8Uint,
-        x if x == F::RGBA8Sint as u64 => F::RGBA8Sint,
-        x if x == F::BGRA8Unorm as u64 => F::BGRA8Unorm,
-        x if x == F::BGRA8Unorm_sRGB as u64 => F::BGRA8Unorm_sRGB,
-        x if x == F::RGB10A2Unorm as u64 => F::RGB10A2Unorm,
-        x if x == F::RGB10A2Uint as u64 => F::RGB10A2Uint,
-        x if x == F::RG11B10Float as u64 => F::RG11B10Float,
-        x if x == F::RGB9E5Float as u64 => F::RGB9E5Float,
-        x if x == F::BGR10A2Unorm as u64 => F::BGR10A2Unorm,
-        x if x == F::RG32Uint as u64 => F::RG32Uint,
-        x if x == F::RG32Sint as u64 => F::RG32Sint,
-        x if x == F::RG32Float as u64 => F::RG32Float,
-        x if x == F::RGBA16Unorm as u64 => F::RGBA16Unorm,
-        x if x == F::RGBA16Snorm as u64 => F::RGBA16Snorm,
-        x if x == F::RGBA16Uint as u64 => F::RGBA16Uint,
-        x if x == F::RGBA16Sint as u64 => F::RGBA16Sint,
-        x if x == F::RGBA16Float as u64 => F::RGBA16Float,
-        x if x == F::RGBA32Uint as u64 => F::RGBA32Uint,
-        x if x == F::RGBA32Sint as u64 => F::RGBA32Sint,
-        x if x == F::RGBA32Float as u64 => F::RGBA32Float,
-        x if x == F::Depth16Unorm as u64 => F::Depth16Unorm,
-        x if x == F::Depth32Float as u64 => F::Depth32Float,
-        x if x == F::Stencil8 as u64 => F::Stencil8,
-        x if x == F::Depth24Unorm_Stencil8 as u64 => F::Depth24Unorm_Stencil8,
-        x if x == F::Depth32Float_Stencil8 as u64 => F::Depth32Float_Stencil8,
-        x if x == F::X32_Stencil8 as u64 => F::X32_Stencil8,
-        x if x == F::X24_Stencil8 as u64 => F::X24_Stencil8,
-        _ => return None,
-    })
+    // Vulkan image requirements are not yet proven equivalent to the guest heap
+    // placement contract, so refuse rather than return a guessed layout.
+    Err(QueryError::HostRequirementsUnavailable)
 }
 
 #[cfg(test)]
@@ -416,6 +204,7 @@ mod tests {
                 texture_type: 2,
                 framebuffer_only: false,
                 is_drawable: false,
+                write_swizzle_enabled: None,
                 allow_gpu_optimized_contents: true,
                 usage: 3,
                 pixel_format: 125,

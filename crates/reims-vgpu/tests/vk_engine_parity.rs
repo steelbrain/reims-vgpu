@@ -6,16 +6,15 @@
 //!
 //! **Serial:** the engine is process-global; all tests take the suite lock.
 
-#![cfg(feature = "backend-vulkan")]
-
 use metal2vulkan::passes::Stage;
-use reims_vgpu::backend::vulkan::engine::{
-    self, BlendFactor, BlendOp, BlendStateResource, BufferContent, CullMode, DepthState, DrawRequest,
-    IndexType, IndexedDrawResource, PrimitiveTopology, SampledContentIdentity, SampledImageResource,
-    SampledSource, SamplerCompareFunction, SamplerResource, ScissorResource, SecondaryColorTarget,
-    StencilFaceOps, StencilOp, StencilState, StorageBufferResource, TargetIdentity,
-    VertexAttributeFormat, VertexAttributeResource, VertexStepFunction, ViewportResource,
-    VisibilityResultMode, MAX_DEVICE_RECREATES,
+use reims_vgpu_vulkan::engine::{
+    self, AttachmentInitial, BlendFactor, BlendOp, BlendStateResource, BufferContent, CullMode,
+    DepthState, DrawRequest, IndexType, IndexedDrawResource, PrimitiveTopology,
+    SampledContentIdentity, SampledImageResource, SampledSource, SamplerCompareFunction,
+    SamplerResource, ScissorResource, SecondaryColorTarget, StencilFaceOps, StencilOp,
+    StencilState, StorageBufferResource, TargetIdentity, VertexAttributeFormat,
+    VertexAttributeResource, VertexStepFunction, ViewportResource, VisibilityResultMode,
+    MAX_DEVICE_RECREATES,
 };
 /// The resident format every `TargetIdentity::Surface` in this file is built at.
 ///
@@ -23,8 +22,8 @@ use reims_vgpu::backend::vulkan::engine::{
 /// against a resident in guest scanout order — several assert on the byte order
 /// of what they read back. Naming the constant once keeps that premise in one
 /// place and makes a test that wants a different format say so.
-const SURFACE_TEST_FORMAT: ash::vk::Format =
-    reims_vgpu::backend::vulkan::translate::pixel::SCANOUT_FORMAT;
+const SURFACE_TEST_FORMAT: reims_vgpu_core::pixel_format::TexelLayout =
+    reims_vgpu_core::pixel_format::TexelLayout::Bgra8;
 
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
@@ -52,6 +51,16 @@ fn engine_test_session() -> std::sync::MutexGuard<'static, ()> {
     guard
 }
 
+/// Synthetic serialized owner for sampled-cache tests. Keeping the strong
+/// resource in the test scope gives the engine the same weak lifetime proof a
+/// real task resource supplies; dropping it is the cache boundary.
+fn sampled_resource_owner() -> std::sync::Arc<reims_vgpu::model::TaskResource> {
+    std::sync::Arc::new(reims_vgpu::model::TaskResource::new(
+        reims_vgpu_protocol::ObjectListEntry::new(reims_vgpu_protocol::ObjectKind::Buffer, 0, 0),
+        std::sync::Arc::from([]),
+    ))
+}
+
 fn fixtures() -> PathBuf {
     // Minimal AIR fixture subset owned by reims-vgpu's Vulkan engine tests.
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/air")
@@ -70,36 +79,18 @@ fn translate_words(name: &str, stage: Stage) -> Vec<u32> {
     assert!(path.exists(), "missing reims-vgpu AIR fixture: {name}");
     let spv = metal2vulkan::translate(path.to_str().unwrap(), stage, &tmp)
         .unwrap_or_else(|e| panic!("translate {name}: {e}"));
-    let mut words: Vec<u32> = spv
+    let words: Vec<u32> = spv
         .chunks_exact(4)
         .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
-    // The translator emits its own narrow bands; the device uses wider ones so
-    // the texture band can hold Metal's whole 128-entry argument table. In the
-    // product every translation reaches the engine through
-    // `m2v_cache::CachedShader::new`, which applies this once per shader. This
-    // helper calls the translator directly, so it has to apply it too — without
-    // this the module says binding 96 for a framebuffer-fetch input while the
-    // engine binds the input attachment at 192, and the shader reads zero.
-    reims_vgpu::runtime::spirv_bind::widen_sampled_bands(&mut words);
     words
 }
 
 /// The device binding number for sampler `index`.
 ///
-/// `translate_words` widens the translator's bands, which moves a sampler out of
-/// metal2vulkan's `[64,96)` into this device's `[160,192)`. A request that keeps
-/// naming the pre-widen number provides a sampler at a binding the widened
-/// module does not use, and leaves the binding it *does* use absent from the
-/// descriptor set layout — so the fragment shader sampled through a descriptor
-/// nothing wrote. That was silent until `exec::used_binding_absent_from_layout`
-/// landed and started refusing the draw by name.
-///
-/// Derived from the constant rather than spelled, so the two cannot drift again.
-/// The texture band needs no such helper: `TEXTURE_BINDING_BASE` *is*
-/// metal2vulkan's texture base, so widening leaves a texture where it was.
+/// Derived from metal2vulkan's selected default layout rather than spelled.
 fn sampler_binding(index: u32) -> u32 {
-    reims_vgpu::runtime::spirv_bind::SAMPLER_BINDING_BASE + index
+    reims_vgpu_vulkan::spirv_bind::SAMPLER_BINDING_BASE + index
 }
 
 fn triangle_spirv() -> (Vec<u32>, Vec<u32>) {
@@ -120,8 +111,10 @@ fn skip_if_no_gpu(err: &str) -> bool {
 
 fn engine_req(vert: &[u32], frag: &[u32], w: u32, h: u32) -> DrawRequest {
     DrawRequest {
-        vert_spirv: std::sync::Arc::new(vert.to_vec()),
-        frag_spirv: std::sync::Arc::new(frag.to_vec()),
+        program: reims_vgpu_core::PreparedRenderProgram {
+            vertex: reims_vgpu_vulkan::m2v_cache::prepare_test_shader(vert.to_vec()),
+            fragment: reims_vgpu_vulkan::m2v_cache::prepare_test_shader(frag.to_vec()),
+        },
         width: w,
         height: h,
         vertex_count: 3,
@@ -143,7 +136,7 @@ fn near(got: u8, want: u8) -> bool {
 ///
 /// The engine picks the attachment format from the resolved target — a
 /// `TargetIdentity::Surface` resident is the format its mapping declared, which
-/// is `SURFACE_TEST_FORMAT` for every identity in this file, so a type-11
+/// is `SURFACE_TEST_FORMAT` for every identity in this file, so an IOSurface texture
 /// composite Store's readback lands in guest scanout order with no CPU pass — and reports
 /// which it used in `DrawOutput::pixels_bgra`. These cases assert *colour*, not
 /// byte layout, so they normalize here from the reported order rather than
@@ -198,6 +191,70 @@ fn plain_triangle_known_color() {
     if let Some(px) = draw_or_skip("plain_triangle", &req) {
         assert_fullscreen_fragment_color("plain_triangle", &px, 16, 16);
     }
+}
+
+/// A render-pass extent constrains rasterization, not attachment load-clear.
+/// The whole 8x8 attachment must become red before the full-screen draw is
+/// clipped to the upper-left 4x4 raster bound.
+#[test]
+fn render_target_extent_clips_fragments_without_narrowing_clear() {
+    let _g = engine_test_session();
+    let (v, f) = triangle_spirv();
+    let mut req = engine_req(&v, &f, 8, 8);
+    req.target_clear = [1.0, 0.0, 0.0, 1.0];
+    req.render_target_extent = reims_vgpu_core::RenderTargetExtent {
+        width: std::num::NonZeroU32::new(4),
+        height: std::num::NonZeroU32::new(4),
+    };
+    let Some(px) = draw_or_skip("render_target_extent", &req) else {
+        return;
+    };
+
+    for y in 0..8usize {
+        for x in 0..8usize {
+            let pixel = &px[(y * 8 + x) * 4..][..4];
+            if x < 4 && y < 4 {
+                assert!(
+                    near(pixel[0], 64)
+                        && near(pixel[1], 128)
+                        && near(pixel[2], 191)
+                        && near(pixel[3], 255),
+                    "fragment at ({x},{y}) was not drawn: {pixel:?}"
+                );
+            } else {
+                assert_eq!(pixel, [255, 0, 0, 255], "clear lost at ({x},{y})");
+            }
+        }
+    }
+}
+
+/// Sub-unit line width is not sent to Vulkan as an invalid dynamic value. The
+/// semantic projection suppresses line fragments while leaving filled
+/// triangles untouched, matching the render-encoder contract.
+#[test]
+fn zero_line_width_discards_lines_but_not_filled_triangles() {
+    let _g = engine_test_session();
+    let (v, f) = triangle_spirv();
+    let (w, h) = (16u32, 16u32);
+
+    let mut filled = engine_req(&v, &f, w, h);
+    filled.line_width = reims_vgpu_core::LineWidth::from_f32(0.0);
+    let Some(filled_pixels) = draw_or_skip("zero_width_filled_triangle", &filled) else {
+        return;
+    };
+    assert_fullscreen_fragment_color("zero_width_filled_triangle", &filled_pixels, w, h);
+
+    let mut line = engine_req(&v, &f, w, h);
+    line.primitive_topology = PrimitiveTopology::Line;
+    line.vertex_count = 2;
+    line.line_width = reims_vgpu_core::LineWidth::from_f32(0.0);
+    let line_pixels = draw_or_skip("zero_width_line", &line).expect("same GPU context");
+    assert!(
+        line_pixels
+            .chunks_exact(4)
+            .all(|pixel| pixel[0..3] == [0, 0, 0]),
+        "zero-width line produced a fragment"
+    );
 }
 
 /// Four-sample rasterization with a matching resident depth attachment resolves
@@ -438,7 +495,7 @@ fn two_viewports_build_and_bind_a_two_slot_pipeline() {
         },
     ];
     assert_eq!(
-        reims_vgpu::backend::vulkan::engine::viewport_slot_count(&req),
+        reims_vgpu_vulkan::engine::viewport_slot_count(&req),
         2,
         "both lists are two long, so the pipeline must declare two slots"
     );
@@ -477,7 +534,7 @@ fn a_shorter_scissor_list_is_defaulted_rather_than_truncating_the_viewports() {
         height: h,
     }];
     assert_eq!(
-        reims_vgpu::backend::vulkan::engine::viewport_slot_count(&req),
+        reims_vgpu_vulkan::engine::viewport_slot_count(&req),
         2,
         "the longer list decides the count; the single scissor does not truncate it"
     );
@@ -590,7 +647,10 @@ fn depth_test_honored_compare_and_clear_wired() {
     let rgba = [17u8, 140, 203, 255];
 
     // Returns Some(covered) for a fragment at z=0.5 with the given depth state.
-    let variant = |compare: SamplerCompareFunction, clear: f32| -> Option<bool> {
+    let variant = |compare: SamplerCompareFunction,
+                   clear: f32,
+                   depth_bias: Option<[f32; 3]>|
+     -> Option<bool> {
         let mut req = engine_req(&vert, &frag, w, h);
         req.vertex_count = 6;
         req.storage_buffers.push(StorageBufferResource {
@@ -615,8 +675,12 @@ fn depth_test_honored_compare_and_clear_wired() {
             multisampled: false,
             source: SampledSource::Bytes(std::sync::Arc::new(rgba.repeat(4))),
             byte_origin: Default::default(),
-            format: ash::vk::Format::R8G8B8A8_UNORM,
+            format: reims_vgpu_protocol::ImageFormat::linear(
+                reims_vgpu_protocol::TexelLayout::Rgba8,
+            ),
             identity: None,
+            content: None,
+            resource_lifetime: None,
             swizzle: Default::default(),
         });
         req.samplers
@@ -632,25 +696,26 @@ fn depth_test_honored_compare_and_clear_wired() {
             load: false,
             stencil: None,
         });
+        req.depth_bias = depth_bias;
         draw_or_skip("depth", &req).map(|px| triangle_covered(&px, w, h))
     };
 
     // Absolute anchors (convention-independent): Never never draws, Always always
     // draws. If depth state were ignored, Never would still cover.
-    let Some(never) = variant(SamplerCompareFunction::Never, 1.0) else {
+    let Some(never) = variant(SamplerCompareFunction::Never, 1.0, None) else {
         return; // no GPU
     };
     assert!(!never, "compare=Never must discard every fragment");
     assert!(
-        variant(SamplerCompareFunction::Always, 1.0).unwrap(),
+        variant(SamplerCompareFunction::Always, 1.0, None).unwrap(),
         "compare=Always must keep every fragment"
     );
 
     // Relationships (convention-independent): with fragment z=0.5,
-    let less_hi = variant(SamplerCompareFunction::Less, 1.0).unwrap();
-    let less_lo = variant(SamplerCompareFunction::Less, 0.0).unwrap();
-    let greater_lo = variant(SamplerCompareFunction::Greater, 0.0).unwrap();
-    let greater_hi = variant(SamplerCompareFunction::Greater, 1.0).unwrap();
+    let less_hi = variant(SamplerCompareFunction::Less, 1.0, None).unwrap();
+    let less_lo = variant(SamplerCompareFunction::Less, 0.0, None).unwrap();
+    let greater_lo = variant(SamplerCompareFunction::Greater, 0.0, None).unwrap();
+    let greater_hi = variant(SamplerCompareFunction::Greater, 1.0, None).unwrap();
     // The compare op matters: Less vs Greater against the same reference differ.
     assert_ne!(
         less_hi, greater_hi,
@@ -667,6 +732,131 @@ fn depth_test_honored_compare_and_clear_wired() {
         "Less@1.0 and Greater@0.0 must agree (depth compare wired consistently)"
     );
     assert_eq!(less_lo, greater_hi, "Less@0.0 and Greater@1.0 must agree");
+
+    // Equal fragment and clear depths fail `Less`; a negative constant bias
+    // moves the fragment toward the viewer and makes the same comparison pass.
+    // This catches both a dropped state and an accidental sign reversal.
+    assert!(
+        !variant(SamplerCompareFunction::Less, 0.5, None).unwrap(),
+        "equal depth must fail Less without bias"
+    );
+    assert!(
+        variant(SamplerCompareFunction::Less, 0.5, Some([-1.0, 0.0, 0.0]),).unwrap(),
+        "negative constant bias must move the fragment toward Less"
+    );
+}
+
+#[test]
+fn mismatched_depth_attachment_clear_covers_its_full_image() {
+    let _g = engine_test_session();
+    let (simple_v, simple_f) = triangle_spirv();
+    let depth_identity = TargetIdentity::Texture {
+        ref_: 0xd8,
+        width: 8,
+        height: 8,
+        generation: 1,
+        stencil: false,
+    };
+    let depth = |clear_value: f32, load: bool, compare| DepthState {
+        identity: Some(depth_identity.clone()),
+        test_enable: true,
+        write_enable: true,
+        compare,
+        clear_value,
+        load,
+        stencil: None,
+    };
+
+    // Establish known depth=1 over the complete resident.
+    let mut establish = engine_req(&simple_v, &simple_f, 8, 8);
+    establish.vertex_count = 0;
+    establish.skip_readback = true;
+    establish.target_identity = Some(TargetIdentity::Anonymous { slot: 0xd80 });
+    establish.depth = Some(depth(1.0, false, SamplerCompareFunction::Always));
+    match engine::execute_draw_request(&establish) {
+        Ok(_) => {}
+        Err(error) if skip_if_no_gpu(&error.to_string()) => {
+            eprintln!("SKIP mismatched depth: {error}");
+            return;
+        }
+        Err(error) => panic!("establish depth: {error}"),
+    }
+
+    // A smaller color attachment constrains rasterization to 4x4, but Metal's
+    // depth load clear still replaces all 8x8 depth texels with 0.25.
+    let mut narrow = engine_req(&simple_v, &simple_f, 4, 4);
+    narrow.vertex_count = 0;
+    narrow.skip_readback = true;
+    narrow.target_identity = Some(TargetIdentity::Anonymous { slot: 0xd81 });
+    narrow.depth = Some(depth(0.25, false, SamplerCompareFunction::Always));
+    engine::execute_draw_request(&narrow).expect("narrow depth clear");
+
+    // Load the complete depth resident and draw z=0.5 with Less. A complete
+    // 0.25 clear rejects every fragment; stale depth=1 outside 4x4 would show
+    // the sampled green output there.
+    let vert = translate_words("textured_quad.air", Stage::Vertex);
+    let frag = translate_words("textured_quad.air", Stage::Fragment);
+    let encode_f32 = |values: &[f32]| {
+        values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>()
+    };
+    let positions: [[f32; 4]; 6] = [
+        [-1.0, -1.0, 0.5, 1.0],
+        [1.0, -1.0, 0.5, 1.0],
+        [-1.0, 1.0, 0.5, 1.0],
+        [-1.0, 1.0, 0.5, 1.0],
+        [1.0, -1.0, 0.5, 1.0],
+        [1.0, 1.0, 0.5, 1.0],
+    ];
+    let uvs: [[f32; 2]; 6] = [
+        [0.0, 1.0],
+        [1.0, 1.0],
+        [0.0, 0.0],
+        [0.0, 0.0],
+        [1.0, 1.0],
+        [1.0, 0.0],
+    ];
+    let mut verify = engine_req(&vert, &frag, 8, 8);
+    verify.vertex_count = 6;
+    verify.depth = Some(depth(0.0, true, SamplerCompareFunction::Less));
+    verify.storage_buffers.push(StorageBufferResource {
+        binding: 0,
+        content: encode_f32(&positions.into_iter().flatten().collect::<Vec<_>>()).into(),
+    });
+    verify.storage_buffers.push(StorageBufferResource {
+        binding: 1,
+        content: encode_f32(&uvs.into_iter().flatten().collect::<Vec<_>>()).into(),
+    });
+    verify.sampled_images.push(SampledImageResource {
+        binding: 32,
+        array_element: 0,
+        descriptor_count: 1,
+        width: 1,
+        height: 1,
+        layers: 1,
+        arrayed: false,
+        volume: false,
+        cube: false,
+        one_dim: false,
+        multisampled: false,
+        source: SampledSource::Bytes(std::sync::Arc::new(vec![0, 255, 0, 255])),
+        byte_origin: Default::default(),
+        format: reims_vgpu_protocol::ImageFormat::linear(reims_vgpu_protocol::TexelLayout::Rgba8),
+        identity: None,
+        content: None,
+        resource_lifetime: None,
+        swizzle: Default::default(),
+    });
+    verify
+        .samplers
+        .push(SamplerResource::normalized_default(sampler_binding(0)));
+    let pixels = draw_or_skip("mismatched depth verify", &verify).expect("same GPU context");
+    assert!(
+        pixels.chunks_exact(4).all(|pixel| pixel[1] == 0),
+        "stale depth outside the smaller color attachment admitted green fragments"
+    );
 }
 
 /// Same depth wiring proof as `depth_test_honored_compare_and_clear_wired`, but
@@ -748,8 +938,12 @@ fn depth_test_honored_on_resident_target_path() {
             multisampled: false,
             source: SampledSource::Bytes(std::sync::Arc::new(rgba.repeat(4))),
             byte_origin: Default::default(),
-            format: ash::vk::Format::R8G8B8A8_UNORM,
+            format: reims_vgpu_protocol::ImageFormat::linear(
+                reims_vgpu_protocol::TexelLayout::Rgba8,
+            ),
             identity: None,
+            content: None,
+            resource_lifetime: None,
             swizzle: Default::default(),
         });
         req.samplers
@@ -888,8 +1082,12 @@ fn stencil_test_honored_compare_ref_and_clear_wired() {
             multisampled: false,
             source: SampledSource::Bytes(std::sync::Arc::new(rgba.repeat(4))),
             byte_origin: Default::default(),
-            format: ash::vk::Format::R8G8B8A8_UNORM,
+            format: reims_vgpu_protocol::ImageFormat::linear(
+                reims_vgpu_protocol::TexelLayout::Rgba8,
+            ),
             identity: None,
+            content: None,
+            resource_lifetime: None,
             swizzle: Default::default(),
         });
         req.samplers
@@ -968,11 +1166,37 @@ fn blend_src_alpha_known_color() {
         src_alpha: BlendFactor::One,
         dst_alpha: BlendFactor::OneMinusSrcAlpha,
         alpha_op: BlendOp::Add,
-        constants: [0.0; 4],
     });
     if let Some(px) = draw_or_skip("blend_src_alpha", &req) {
         // Fragment alpha=1 → same as replace over black seed.
         assert_fullscreen_fragment_color("blend_src_alpha", &px, 8, 8);
+    }
+}
+
+#[test]
+fn blend_color_is_dynamic_encoder_state() {
+    let _g = engine_test_session();
+    let (v, f) = triangle_spirv();
+    let mut req = engine_req(&v, &f, 8, 8);
+    req.target_rgba8 = Some(std::sync::Arc::new([0, 0, 0, 0].repeat(8 * 8)));
+    req.blend_constants = [0.2, 0.4, 0.6, 0.8];
+    req.blend = Some(BlendStateResource {
+        src_color: BlendFactor::ConstantColor,
+        dst_color: BlendFactor::Zero,
+        color_op: BlendOp::Add,
+        src_alpha: BlendFactor::ConstantAlpha,
+        dst_alpha: BlendFactor::Zero,
+        alpha_op: BlendOp::Add,
+    });
+    if let Some(px) = draw_or_skip("blend_color", &req) {
+        let center = ((8 / 2) * 8 + 8 / 2) * 4;
+        let got = &px[center..center + 4];
+        // Fixture output is approximately (0.25, 0.5, 0.75, 1.0).
+        let expected = [13, 51, 115, 204];
+        assert!(
+            got.iter().zip(expected).all(|(&a, b)| near(a, b)),
+            "blend constants did not reach the draw: got={got:?} expected={expected:?}"
+        );
     }
 }
 
@@ -1025,6 +1249,7 @@ fn storage_buffer_binding_still_renders() {
 #[test]
 fn sampled_and_sampler_still_renders() {
     let _g = engine_test_session();
+    let sampled_owner = sampled_resource_owner();
     let (v, f) = triangle_spirv();
     let mut req = engine_req(&v, &f, 8, 8);
     req.sampled_images.push(SampledImageResource {
@@ -1043,8 +1268,10 @@ fn sampled_and_sampler_still_renders() {
             255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 0, 255,
         ])),
         byte_origin: Default::default(),
-        format: ash::vk::Format::R8G8B8A8_UNORM,
+        format: reims_vgpu_protocol::ImageFormat::linear(reims_vgpu_protocol::TexelLayout::Rgba8),
         identity: None,
+        content: None,
+        resource_lifetime: Some(sampled_owner.lifetime_ref()),
         swizzle: Default::default(),
     });
     req.samplers.push(SamplerResource::normalized_default(2));
@@ -1129,6 +1356,7 @@ fn sampled_and_sampler_still_renders() {
 #[test]
 fn sampled_upload_happens_once_across_more_draws_than_the_ring_is_deep() {
     let _g = engine_test_session();
+    let sampled_owner = sampled_resource_owner();
     let (v, f) = triangle_spirv();
     let mut req = engine_req(&v, &f, 8, 8);
     req.sampled_images.push(SampledImageResource {
@@ -1147,8 +1375,10 @@ fn sampled_upload_happens_once_across_more_draws_than_the_ring_is_deep() {
             255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 0, 255,
         ])),
         byte_origin: Default::default(),
-        format: ash::vk::Format::R8G8B8A8_UNORM,
+        format: reims_vgpu_protocol::ImageFormat::linear(reims_vgpu_protocol::TexelLayout::Rgba8),
         identity: None,
+        content: None,
+        resource_lifetime: Some(sampled_owner.lifetime_ref()),
         swizzle: Default::default(),
     });
     req.samplers.push(SamplerResource::normalized_default(2));
@@ -1182,7 +1412,7 @@ fn sampled_upload_happens_once_across_more_draws_than_the_ring_is_deep() {
     }
 }
 
-/// A resident type-11 sample stays on the GPU: no source readback, staging
+/// A resident IOSurface texture sample stays on the GPU: no source readback, staging
 /// upload, or temporary sampled image. The tracked layout must still permit a
 /// later LoadFromTarget draw on the source identity.
 #[test]
@@ -1225,8 +1455,10 @@ fn resident_sample_bind_avoids_roundtrip_and_remains_loadable() {
         multisampled: false,
         source: SampledSource::Target(source.clone()),
         byte_origin: Default::default(),
-        format: ash::vk::Format::R8G8B8A8_UNORM,
+        format: reims_vgpu_protocol::ImageFormat::linear(reims_vgpu_protocol::TexelLayout::Rgba8),
         identity: None,
+        content: None,
+        resource_lifetime: None,
         swizzle: Default::default(),
     });
     engine::reset_draw_counters();
@@ -1266,7 +1498,7 @@ fn resident_sample_uses_the_bindings_compatible_format_view() {
         width: 16,
         height: 16,
         generation: 1,
-        format: ash::vk::Format::B8G8R8A8_UNORM,
+        format: reims_vgpu_core::pixel_format::TexelLayout::Bgra8,
     };
     let mut produce = engine_req(&source_v, &source_f, 16, 16);
     produce.target_identity = Some(source.clone());
@@ -1328,8 +1560,11 @@ fn resident_sample_uses_the_bindings_compatible_format_view() {
         multisampled: false,
         source: SampledSource::Target(source),
         byte_origin: Default::default(),
-        format: ash::vk::Format::B8G8R8A8_SRGB,
+        format: reims_vgpu_protocol::ImageFormat::srgb(reims_vgpu_protocol::TexelLayout::Bgra8)
+            .unwrap(),
         identity: None,
+        content: None,
+        resource_lifetime: None,
         swizzle: Default::default(),
     });
     consume
@@ -1387,8 +1622,10 @@ fn resident_sample_alias_uses_native_feedback_or_snapshot_fallback() {
         multisampled: false,
         source: SampledSource::Target(identity.clone()),
         byte_origin: Default::default(),
-        format: ash::vk::Format::R8G8B8A8_UNORM,
+        format: reims_vgpu_protocol::ImageFormat::linear(reims_vgpu_protocol::TexelLayout::Rgba8),
         identity: None,
+        content: None,
+        resource_lifetime: None,
         swizzle: Default::default(),
     });
     alias.sampled_images.push(SampledImageResource {
@@ -1405,8 +1642,10 @@ fn resident_sample_alias_uses_native_feedback_or_snapshot_fallback() {
         multisampled: false,
         source: SampledSource::Target(identity.clone()),
         byte_origin: Default::default(),
-        format: ash::vk::Format::R8G8B8A8_UNORM,
+        format: reims_vgpu_protocol::ImageFormat::linear(reims_vgpu_protocol::TexelLayout::Rgba8),
         identity: None,
+        content: None,
+        resource_lifetime: None,
         swizzle: Default::default(),
     });
     engine::reset_draw_counters();
@@ -1421,10 +1660,9 @@ fn resident_sample_alias_uses_native_feedback_or_snapshot_fallback() {
         delta.sampled_gpu_binds, 2,
         "GPU resident-bind proxy: {delta:?}"
     );
-    let expected_snapshot_allocs = u64::from(!engine::attachment_feedback_loop_active());
     assert_eq!(
-        delta.sampled_free_allocs, expected_snapshot_allocs,
-        "two bindings share one snapshot only on a host without feedback-loop support: {delta:?}"
+        delta.sampled_free_allocs, 1,
+        "two bindings share one stable pre-draw snapshot: {delta:?}"
     );
     assert_eq!(delta.sampled_reuploads, 0, "no host reupload: {delta:?}");
     assert_eq!(
@@ -1435,6 +1673,113 @@ fn resident_sample_alias_uses_native_feedback_or_snapshot_fallback() {
     assert_eq!(
         delta.batch_readback_joins, 1,
         "the read must exercise the open-pass close before its image barrier: {delta:?}"
+    );
+}
+
+/// The attachment descriptor and fragment binding name one texture. Its Clear,
+/// Load or DontCare action is therefore the sampled source at fragment
+/// execution; none may be restated as a CPU-uploaded sampled image.
+#[test]
+fn attachment_initial_contents_are_sampled_without_a_host_upload() {
+    let _g = engine_test_session();
+    let vert = translate_words("textured_quad.air", Stage::Vertex);
+    let frag = translate_words("textured_quad.air", Stage::Fragment);
+    let (w, h) = (16u32, 16u32);
+    let positions: [[f32; 4]; 6] = [
+        [-1.0, -1.0, 0.0, 1.0],
+        [1.0, -1.0, 0.0, 1.0],
+        [-1.0, 1.0, 0.0, 1.0],
+        [-1.0, 1.0, 0.0, 1.0],
+        [1.0, -1.0, 0.0, 1.0],
+        [1.0, 1.0, 0.0, 1.0],
+    ];
+    let uvs: [[f32; 2]; 6] = [
+        [0.0, 1.0],
+        [1.0, 1.0],
+        [0.0, 0.0],
+        [0.0, 0.0],
+        [1.0, 1.0],
+        [1.0, 0.0],
+    ];
+    let encode_f32 = |values: &[f32]| {
+        values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>()
+    };
+    let make_req = |id: u32, initial: AttachmentInitial| {
+        let identity = TargetIdentity::Surface {
+            id,
+            width: w,
+            height: h,
+            generation: 1,
+            format: SURFACE_TEST_FORMAT,
+        };
+        let mut req = engine_req(&vert, &frag, w, h);
+        req.vertex_count = 6;
+        req.target_identity = Some(identity.clone());
+        req.storage_buffers.push(StorageBufferResource {
+            binding: 0,
+            content: encode_f32(&positions.into_iter().flatten().collect::<Vec<_>>()).into(),
+        });
+        req.storage_buffers.push(StorageBufferResource {
+            binding: 1,
+            content: encode_f32(&uvs.into_iter().flatten().collect::<Vec<_>>()).into(),
+        });
+        req.sampled_images.push(SampledImageResource {
+            binding: 32,
+            array_element: 0,
+            descriptor_count: 1,
+            width: w,
+            height: h,
+            layers: 1,
+            arrayed: false,
+            volume: false,
+            cube: false,
+            one_dim: false,
+            multisampled: false,
+            source: SampledSource::Attachment { identity, initial },
+            byte_origin: Default::default(),
+            format: reims_vgpu_protocol::ImageFormat::linear(
+                reims_vgpu_protocol::TexelLayout::Bgra8,
+            ),
+            identity: None,
+            content: None,
+            resource_lifetime: None,
+            swizzle: Default::default(),
+        });
+        req.samplers
+            .push(SamplerResource::normalized_default(sampler_binding(0)));
+        req
+    };
+
+    engine::reset_draw_counters();
+    let before = engine::counter_snapshot();
+    let mut clear = make_req(0x54, AttachmentInitial::Clear([0.25, 0.5, 0.75, 1.0]));
+    clear.target_clear = [0.25, 0.5, 0.75, 1.0];
+    let Some(clear_pixels) = draw_or_skip("attachment initial clear", &clear) else {
+        return;
+    };
+    assert_fullscreen_fragment_color("attachment initial clear", &clear_pixels, w, h);
+
+    let mut seed = make_req(0x55, AttachmentInitial::Seed);
+    seed.target_rgba8 = Some(std::sync::Arc::new(
+        [64, 128, 191, 255].repeat((w * h) as usize),
+    ));
+    let seed_pixels = draw_or_skip("attachment initial seed", &seed).expect("GPU remains usable");
+    assert_fullscreen_fragment_color("attachment initial seed", &seed_pixels, w, h);
+
+    let dont_care = make_req(0x56, AttachmentInitial::DontCare);
+    let _ = draw_or_skip("attachment initial dont-care", &dont_care)
+        .expect("undefined initial contents remain a valid GPU source");
+    let delta = engine::counter_snapshot().delta_since(&before);
+    assert_eq!(
+        delta.sampled_reuploads, 0,
+        "no host sampled upload: {delta:?}"
+    );
+    assert_eq!(
+        delta.sampled_gpu_binds, 3,
+        "one target bind per draw: {delta:?}"
     );
 }
 
@@ -1479,12 +1824,15 @@ fn vertex_buffers_bind_in_one_bulk_call_without_losing_slots() {
     }
 }
 
-/// Identity-keyed sampled rebind: same producer key+generation binds the
-/// retained image without hashing/comparing content; a bumped generation with
-/// changed bytes falls back to the content-addressed path (miss + reupload).
+/// A producer name is not proof that live sampled bytes are unchanged.
+///
+/// This deliberately changes the bytes without changing the supplied identity.
+/// The cache must compare the content, miss, and upload. An identity-first
+/// lookup binds the first draw's stale pixels and fails this test.
 #[test]
-fn sampled_identity_fast_path_skips_content_compare() {
+fn sampled_identity_never_overrides_changed_content() {
     let _g = engine_test_session();
+    let sampled_owner = sampled_resource_owner();
     let (v, f) = triangle_spirv();
     let mut req = engine_req(&v, &f, 8, 8);
     req.sampled_images.push(SampledImageResource {
@@ -1503,11 +1851,13 @@ fn sampled_identity_fast_path_skips_content_compare() {
             255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 0, 255,
         ])),
         byte_origin: Default::default(),
-        format: ash::vk::Format::R8G8B8A8_UNORM,
+        format: reims_vgpu_protocol::ImageFormat::linear(reims_vgpu_protocol::TexelLayout::Rgba8),
         identity: Some(SampledContentIdentity {
             key: 0x1234_5000,
             generation: 1,
         }),
+        content: None,
+        resource_lifetime: Some(sampled_owner.lifetime_ref()),
         swizzle: Default::default(),
     });
     req.samplers.push(SamplerResource::normalized_default(2));
@@ -1520,40 +1870,33 @@ fn sampled_identity_fast_path_skips_content_compare() {
         Err(e) => panic!("cold identity draw: {e}"),
     }
 
-    // Same identity + generation: identity hit, no content hash/compare
-    // accounting (cache_hit_bytes stays zero), no reupload.
+    // Equal bytes still reuse the exact-content entry.
     let warm_before = engine::counter_snapshot();
-    engine::execute_draw_request(&req).expect("identity rebind");
+    engine::execute_draw_request(&req).expect("content rebind");
     let d = engine::counter_snapshot().delta_since(&warm_before);
-    assert_eq!(d.sampled_identity_hits, 1, "identity hit: {d:?}");
-    assert_eq!(d.sampled_cache_hits, 0, "no content hit: {d:?}");
-    assert_eq!(d.sampled_cache_hit_bytes, 0, "no content bytes: {d:?}");
+    assert_eq!(d.sampled_cache_hits, 1, "exact content hit: {d:?}");
+    assert_eq!(d.sampled_cache_hit_bytes, 16, "compared content: {d:?}");
     assert_eq!(d.sampled_reuploads, 0, "no upload: {d:?}");
 
-    // Bumped generation + changed bytes: identity misses, content path
-    // misses, upload happens, and the NEW generation is adopted.
+    // Keep the identity exactly unchanged while replacing the bytes. This is
+    // the stale-compositor case: identity cannot suppress the upload.
     {
         let img = &mut req.sampled_images[0];
         img.source = SampledSource::Bytes(std::sync::Arc::new(vec![
             1, 0, 0, 255, 0, 1, 0, 255, 0, 0, 1, 255, 1, 1, 0, 255,
         ]));
-        img.identity = Some(SampledContentIdentity {
-            key: 0x1234_5000,
-            generation: 2,
-        });
     }
     let changed_before = engine::counter_snapshot();
-    engine::execute_draw_request(&req).expect("gen bump upload");
+    engine::execute_draw_request(&req).expect("changed content upload");
     let d = engine::counter_snapshot().delta_since(&changed_before);
-    assert_eq!(d.sampled_identity_hits, 0, "gen bump no identity: {d:?}");
-    assert_eq!(d.sampled_cache_misses, 1, "gen bump miss: {d:?}");
-    assert_eq!(d.sampled_reuploads, 1, "gen bump upload: {d:?}");
+    assert_eq!(d.sampled_cache_misses, 1, "changed bytes miss: {d:?}");
+    assert_eq!(d.sampled_reuploads, 1, "changed bytes upload: {d:?}");
 
-    // The new generation now identity-hits.
+    // The uploaded replacement is subsequently reusable by exact bytes.
     let settle_before = engine::counter_snapshot();
-    engine::execute_draw_request(&req).expect("settled identity rebind");
+    engine::execute_draw_request(&req).expect("settled content rebind");
     let d = engine::counter_snapshot().delta_since(&settle_before);
-    assert_eq!(d.sampled_identity_hits, 1, "settled identity: {d:?}");
+    assert_eq!(d.sampled_cache_hits, 1, "replacement content hit: {d:?}");
     assert_eq!(d.sampled_reuploads, 0, "settled no upload: {d:?}");
 }
 
@@ -1783,7 +2126,7 @@ fn every_admitted_resident_survives_past_the_retired_slot_cap() {
 /// and reads back in it **without the caller asking**, and says so; a pooled
 /// target does not.
 ///
-/// This is the contract the type-11 composite Store rests on. That Store's
+/// This is the contract the IOSurface texture composite Store rests on. That Store's
 /// consumers are all defined in BGRA — `mapping_write::write_bgra8`,
 /// `surface_cache`, the deferred window the flush reads — so when the attachment
 /// is BGRA the readback lands ready to use, and when it is not the runtime pays a
@@ -1989,6 +2332,7 @@ fn a_skipped_draw_readback_and_a_resident_read_are_counted_apart() {
 #[test]
 fn sampled_rgba_upload_to_bgra_target_preserves_semantic_channels() {
     let _g = engine_test_session();
+    let sampled_owner = sampled_resource_owner();
     let vert = translate_words("textured_quad.air", Stage::Vertex);
     let frag = translate_words("textured_quad.air", Stage::Fragment);
     let w = 16u32;
@@ -2050,8 +2394,10 @@ fn sampled_rgba_upload_to_bgra_target_preserves_semantic_channels() {
         multisampled: false,
         source: SampledSource::Bytes(std::sync::Arc::new(rgba.repeat(4))),
         byte_origin: Default::default(),
-        format: ash::vk::Format::R8G8B8A8_UNORM,
+        format: reims_vgpu_protocol::ImageFormat::linear(reims_vgpu_protocol::TexelLayout::Rgba8),
         identity: None,
+        content: None,
+        resource_lifetime: Some(sampled_owner.lifetime_ref()),
         swizzle: Default::default(),
     });
     req.samplers
@@ -2131,6 +2477,7 @@ fn reflected_static_sampler_descriptor_samples_texture() {
     use metal2vulkan::reflect::ResourceKind;
 
     let _g = engine_test_session();
+    let sampled_owner = sampled_resource_owner();
     let vert = translate_words("textured_quad.air", Stage::Vertex);
     let tmp = std::env::temp_dir().join(format!(
         "paravirt_engine_{}_static_sampler",
@@ -2142,27 +2489,21 @@ fn reflected_static_sampler_descriptor_samples_texture() {
     let (frag, reflection) =
         metal2vulkan::translate_reflected(air.to_str().unwrap(), Stage::Fragment, &tmp)
             .expect("translate static sampler fixture");
-    let mut frag = frag
+    let frag = frag
         .chunks_exact(4)
         .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect::<Vec<_>>();
-    assert_eq!(
-        reims_vgpu::runtime::spirv_bind::widen_sampled_bands(&mut frag),
-        1,
-        "fixture has one sampler in the translator's narrow tail band"
-    );
-    assert_eq!(
-        reims_vgpu::runtime::spirv_bind::offset_fragment_sampled_resource_bindings(&mut frag),
-        2,
-        "fixture has one sampled image and one constexpr sampler"
-    );
     let reflected = reflection
         .bindings
         .iter()
         .find(|binding| binding.kind == ResourceKind::StaticSampler)
         .expect("reflected constexpr sampler");
     reflected.descriptor.expect("static sampler descriptor");
-    let state = reflected.static_sampler.expect("static sampler state");
+    let descriptor = reims_vgpu_vulkan::spirv_bind::reflected_sampler_descriptors(&reflection)
+        .into_iter()
+        .find(|descriptor| descriptor.static_state.is_some())
+        .expect("semantic constexpr sampler descriptor");
+    let state = descriptor.static_state.expect("static sampler state");
 
     let (w, h) = (16u32, 16u32);
     let mut req = engine_req(&vert, &frag, w, h);
@@ -2198,8 +2539,15 @@ fn reflected_static_sampler_descriptor_samples_texture() {
         content: encode_f32(&uvs.into_iter().flatten().collect::<Vec<_>>()).into(),
     });
     let rgba = [17u8, 91, 203, 255];
+    let texture_binding = reflection
+        .bindings
+        .iter()
+        .find(|binding| binding.kind == ResourceKind::Texture)
+        .and_then(|binding| binding.descriptor)
+        .expect("reflected sampled texture")
+        .binding;
     req.sampled_images.push(SampledImageResource {
-        binding: 32 + reims_vgpu::runtime::spirv_bind::FRAG_SAMPLED_RESOURCE_BINDING_OFFSET,
+        binding: texture_binding,
         array_element: 0,
         descriptor_count: 1,
         width: 2,
@@ -2212,15 +2560,16 @@ fn reflected_static_sampler_descriptor_samples_texture() {
         multisampled: false,
         source: SampledSource::Bytes(std::sync::Arc::new(rgba.repeat(4))),
         byte_origin: Default::default(),
-        format: ash::vk::Format::R8G8B8A8_UNORM,
+        format: reims_vgpu_protocol::ImageFormat::linear(reims_vgpu_protocol::TexelLayout::Rgba8),
         identity: None,
+        content: None,
+        resource_lifetime: Some(sampled_owner.lifetime_ref()),
         swizzle: Default::default(),
     });
     req.samplers.push(
         reims_vgpu::runtime::draw::reflected_static_sampler_resource(
             "fragment",
-            reims_vgpu::runtime::spirv_bind::reflected_sampler_binding(reflected, true)
-                .expect("reflected sampler maps into the executable variant"),
+            descriptor.binding,
             state,
         )
         .expect("map reflected static sampler"),
@@ -2248,14 +2597,23 @@ fn reflected_static_sampler_descriptor_samples_texture() {
         .into_rgba8();
     let descriptors = engine::counter_snapshot().delta_since(&before);
     if descriptors.descriptor_set_updates == 0 {
-        assert_eq!(descriptors.descriptor_pushes, 1, "first draw pushes: {descriptors:?}");
+        assert_eq!(
+            descriptors.descriptor_pushes, 1,
+            "first draw pushes: {descriptors:?}"
+        );
         assert_eq!(
             descriptors.descriptor_push_held, 1,
             "the exact repeated state is retained by the command buffer: {descriptors:?}"
         );
     } else {
-        assert_eq!(descriptors.descriptor_set_updates, 2, "fallback updates: {descriptors:?}");
-        assert_eq!(descriptors.descriptor_set_binds, 2, "fallback binds: {descriptors:?}");
+        assert_eq!(
+            descriptors.descriptor_set_updates, 2,
+            "fallback updates: {descriptors:?}"
+        );
+        assert_eq!(
+            descriptors.descriptor_set_binds, 2,
+            "fallback binds: {descriptors:?}"
+        );
         assert_eq!(descriptors.descriptor_pushes, 0);
         assert_eq!(descriptors.descriptor_push_held, 0);
     }
@@ -2309,7 +2667,7 @@ fn sampled_bgra8_bytes_upload_matches_rgba8_semantic_color() {
 
     // Render the color once via an Rgba8 upload and once via a Bgra8 upload; the
     // sampled output must be byte-identical.
-    let render = |bytes: Vec<u8>, format: ash::vk::Format, id: u32| {
+    let render = |bytes: Vec<u8>, format: reims_vgpu_protocol::ImageFormat, id: u32| {
         let identity = TargetIdentity::Surface {
             id,
             width: w,
@@ -2345,6 +2703,8 @@ fn sampled_bgra8_bytes_upload_matches_rgba8_semantic_color() {
             byte_origin: Default::default(),
             format,
             identity: None,
+            content: None,
+            resource_lifetime: None,
             swizzle: Default::default(),
         });
         req.samplers
@@ -2363,11 +2723,19 @@ fn sampled_bgra8_bytes_upload_matches_rgba8_semantic_color() {
         }
     };
 
-    let Some(rgba_out) = render(rgba.repeat(4), ash::vk::Format::R8G8B8A8_UNORM, 90) else {
+    let Some(rgba_out) = render(
+        rgba.repeat(4),
+        reims_vgpu_protocol::ImageFormat::linear(reims_vgpu_protocol::TexelLayout::Rgba8),
+        90,
+    ) else {
         return;
     };
-    let bgra_out =
-        render(bgra.repeat(4), ash::vk::Format::B8G8R8A8_UNORM, 91).expect("bgra8 render");
+    let bgra_out = render(
+        bgra.repeat(4),
+        reims_vgpu_protocol::ImageFormat::linear(reims_vgpu_protocol::TexelLayout::Bgra8),
+        91,
+    )
+    .expect("bgra8 render");
 
     let center = ((h / 2) * w + w / 2) as usize * 4;
     // Both uploads carry the identical semantic color, so the guest-visible BGRA
@@ -2401,7 +2769,7 @@ fn sampled_bgra8_bytes_upload_matches_rgba8_semantic_color() {
 /// is exactly the silent failure this asserts against.
 #[test]
 fn a_view_swizzle_is_performed_by_the_image_view_not_the_cpu() {
-    use reims_vgpu::contract::pixel_format;
+    use reims_vgpu_core::pixel_format;
 
     let _g = engine_test_session();
     let vert = translate_words("textured_quad.air", Stage::Vertex);
@@ -2469,8 +2837,12 @@ fn a_view_swizzle_is_performed_by_the_image_view_not_the_cpu() {
             multisampled: false,
             source: SampledSource::Bytes(std::sync::Arc::new(source.repeat(4))),
             byte_origin: Default::default(),
-            format: ash::vk::Format::R8G8B8A8_UNORM,
+            format: reims_vgpu_protocol::ImageFormat::linear(
+                reims_vgpu_protocol::TexelLayout::Rgba8,
+            ),
             identity: None,
+            content: None,
+            resource_lifetime: None,
             swizzle: plan,
         });
         req.samplers
@@ -2590,7 +2962,7 @@ fn partial_draw_preserves_a_native_guest_target_seed() {
     let mut req = engine_req(&vert, &frag, w, h);
     req.target_identity = Some(identity.clone());
     req.skip_readback = true;
-    req.target_guest_seed = Some(engine::GuestTargetSeed {
+    req.target_guest = Some(engine::GuestTargetPlan::Seed(engine::GuestTargetSeed {
         source: engine::GuestRunSource {
             runs: std::sync::Arc::new(vec![engine::GuestRun {
                 host_ptr: backing.as_ptr() as usize,
@@ -2600,10 +2972,10 @@ fn partial_draw_preserves_a_native_guest_target_seed() {
             total_len: backing.len() as u64,
             row_length_texels: 0,
             pages: None,
-            direct_image: None,
+            physical_pages: None,
         },
-        format: SURFACE_TEST_FORMAT,
-    });
+        format: reims_vgpu_protocol::TexelLayout::Bgra8,
+    }));
     req.scissors = vec![ScissorResource {
         x: 0,
         y: 0,
@@ -2646,7 +3018,7 @@ fn partial_draw_preserves_a_native_guest_target_seed() {
 /// nothing at all.
 #[test]
 fn an_alpha_only_write_mask_leaves_the_colour_channels_alone() {
-    use reims_vgpu::backend::vulkan::engine::ColorWriteMask;
+    use reims_vgpu_vulkan::engine::ColorWriteMask;
     let _g = engine_test_session();
     let (vert, frag) = triangle_spirv();
     let (w, h) = (16u32, 16u32);
@@ -2697,7 +3069,7 @@ fn an_alpha_only_write_mask_leaves_the_colour_channels_alone() {
 /// A `SeedOrder::Bgra8` seed must land the same semantic pixels as the
 /// equivalent `SeedOrder::Rgba8` seed.
 ///
-/// This is the type-11 composite Load. `surface_cache` holds guest scanout order
+/// This is the IOSurface texture composite Load. `surface_cache` holds guest scanout order
 /// while the pooled target is RGBA, so the runtime used to allocate, copy and
 /// swizzle a whole framebuffer per seeded draw purely to restate pixels it
 /// already had — at the 28-111 Stores/s `store_routes` measures. Naming the
@@ -2802,7 +3174,6 @@ fn premult_one_omsa_gpu_blend_matches_software_oracle() {
         src_alpha: BlendFactor::One,
         dst_alpha: BlendFactor::OneMinusSrcAlpha,
         alpha_op: BlendOp::Add,
-        constants: [0.0; 4],
     });
     let gpu_px = match engine::execute_draw_request(&gpu) {
         Ok(o) => o.pixels,
@@ -2953,7 +3324,7 @@ fn chain_load_from_target_byte_parity_vs_cpu_seed() {
     );
 }
 
-/// The type-11 composite Store's shape: `LoadFromTarget` on a resident that the
+/// The IOSurface texture composite Store's shape: `LoadFromTarget` on a resident that the
 /// *previous* pass read back, rather than one it left GPU-only.
 ///
 /// Every other `LoadFromTarget` case in this suite sets `skip_readback = true`
@@ -3094,7 +3465,7 @@ fn gva_chain_resident_single_readback_matches_cpu_seed_chain() {
         width: 16,
         height: 16,
         generation: 0,
-        format: reims_vgpu::backend::vulkan::translate::pixel::RESIDENT_RGBA_FORMAT,
+        format: reims_vgpu_core::pixel_format::TexelLayout::Rgba8,
     };
     engine::reset_draw_counters();
     let before = engine::counter_snapshot();
@@ -3156,7 +3527,7 @@ fn gva_deferred_store_flush_read_matches_sync_store() {
         width: 16,
         height: 16,
         generation: 0,
-        format: reims_vgpu::backend::vulkan::translate::pixel::RESIDENT_RGBA_FORMAT,
+        format: reims_vgpu_core::pixel_format::TexelLayout::Rgba8,
     };
     engine::reset_draw_counters();
     let before = engine::counter_snapshot();
@@ -3456,12 +3827,13 @@ fn mrt_secondary_attachment_becomes_sampleable_resident() {
     let mut mrt = engine_req(&v, &f, 16, 16);
     mrt.target_identity = Some(primary.clone());
     mrt.secondary_targets.push(SecondaryColorTarget {
+        target_guest: None,
         identity: secondary.clone(),
         width: 16,
         height: 16,
-        format: ash::vk::Format::R8G8B8A8_UNORM,
+        format: reims_vgpu_protocol::ImageFormat::linear(reims_vgpu_protocol::TexelLayout::Rgba8),
         clear: [0.0, 0.0, 1.0, 1.0],
-        load: false,
+        load_action: reims_vgpu_core::ColorLoadAction::Clear,
         // Unblended: this parity case checks the attachment is written at
         // all, not how it composites.
         blend: None,
@@ -3508,8 +3880,10 @@ fn mrt_secondary_attachment_becomes_sampleable_resident() {
         multisampled: false,
         source: SampledSource::Target(secondary.clone()),
         byte_origin: Default::default(),
-        format: ash::vk::Format::R8G8B8A8_UNORM,
+        format: reims_vgpu_protocol::ImageFormat::linear(reims_vgpu_protocol::TexelLayout::Rgba8),
         identity: None,
+        content: None,
+        resource_lifetime: None,
         swizzle: Default::default(),
     });
     engine::reset_draw_counters();
@@ -3521,6 +3895,169 @@ fn mrt_secondary_attachment_becomes_sampleable_resident() {
         "secondary must bind directly with no CPU reupload: {delta:?}"
     );
     assert_eq!(delta.sampled_reuploads, 0, "no host reupload: {delta:?}");
+}
+
+/// Metal applies each attachment's load action over that attachment's full
+/// image, then rasterizes MRT work over the minimum common extent. Exercise
+/// both directions so neither slot-zero nor secondary handling can accidentally
+/// define the rule for the other.
+#[test]
+fn mismatched_mrt_extents_clear_full_images_and_rasterize_to_the_minimum() {
+    let _g = engine_test_session();
+    let (v, f) = triangle_spirv();
+
+    // Complement the clear cases with the native LOAD result: pixels in the
+    // larger attachment but outside the common raster extent retain their
+    // previous contents.
+    let loaded_primary = TargetIdentity::Surface {
+        id: 0x69,
+        width: 8,
+        height: 8,
+        generation: 1,
+        format: SURFACE_TEST_FORMAT,
+    };
+    let mut establish_load = engine_req(&v, &f, 8, 8);
+    establish_load.vertex_count = 0;
+    establish_load.skip_readback = true;
+    establish_load.target_identity = Some(loaded_primary.clone());
+    establish_load.target_clear = [0.0, 0.0, 1.0, 1.0];
+    match engine::execute_draw_request(&establish_load) {
+        Ok(_) => {}
+        Err(error) if skip_if_no_gpu(&error.to_string()) => {
+            eprintln!("SKIP mismatched MRT: {error}");
+            return;
+        }
+        Err(error) => panic!("establish large MRT LOAD target: {error}"),
+    }
+    let mut load = engine_req(&v, &f, 8, 8);
+    load.target_identity = Some(loaded_primary);
+    load.color_load_action = reims_vgpu_core::ColorLoadAction::Load;
+    load.load_from_target = true;
+    load.secondary_targets.push(SecondaryColorTarget {
+        target_guest: None,
+        identity: TargetIdentity::Surface {
+            id: 0x6e,
+            width: 4,
+            height: 4,
+            generation: 1,
+            format: SURFACE_TEST_FORMAT,
+        },
+        width: 4,
+        height: 4,
+        format: reims_vgpu_protocol::ImageFormat::linear(reims_vgpu_protocol::TexelLayout::Rgba8),
+        clear: [1.0, 0.0, 0.0, 1.0],
+        load_action: reims_vgpu_core::ColorLoadAction::Clear,
+        blend: None,
+        color_write_mask: Default::default(),
+    });
+    let loaded_pixels =
+        semantic_rgba(&engine::execute_draw_request(&load).expect("large-primary MRT LOAD"));
+    for y in 0..8usize {
+        for x in 0..8usize {
+            if x < 4 && y < 4 {
+                continue;
+            }
+            assert_eq!(
+                &loaded_pixels[(y * 8 + x) * 4..][..4],
+                [0, 0, 255, 255],
+                "large primary LOAD did not preserve ({x},{y})"
+            );
+        }
+    }
+
+    let large_primary = TargetIdentity::Surface {
+        id: 0x6a,
+        width: 8,
+        height: 8,
+        generation: 1,
+        format: SURFACE_TEST_FORMAT,
+    };
+    let small_secondary = TargetIdentity::Surface {
+        id: 0x6b,
+        width: 4,
+        height: 4,
+        generation: 1,
+        format: SURFACE_TEST_FORMAT,
+    };
+    let mut first = engine_req(&v, &f, 8, 8);
+    first.target_identity = Some(large_primary);
+    first.target_clear = [1.0, 0.0, 0.0, 1.0];
+    first.secondary_targets.push(SecondaryColorTarget {
+        target_guest: None,
+        identity: small_secondary,
+        width: 4,
+        height: 4,
+        format: reims_vgpu_protocol::ImageFormat::linear(reims_vgpu_protocol::TexelLayout::Rgba8),
+        clear: [0.0, 0.0, 1.0, 1.0],
+        load_action: reims_vgpu_core::ColorLoadAction::Clear,
+        blend: None,
+        color_write_mask: Default::default(),
+    });
+    let first_pixels = match engine::execute_draw_request(&first) {
+        Ok(output) => semantic_rgba(&output),
+        Err(error) if skip_if_no_gpu(&error.to_string()) => {
+            eprintln!("SKIP mismatched MRT: {error}");
+            return;
+        }
+        Err(error) => panic!("large-primary MRT: {error}"),
+    };
+    for y in 0..8usize {
+        for x in 0..8usize {
+            if x < 4 && y < 4 {
+                continue;
+            }
+            assert_eq!(
+                &first_pixels[(y * 8 + x) * 4..][..4],
+                [255, 0, 0, 255],
+                "large primary lost its full-image clear at ({x},{y})"
+            );
+        }
+    }
+
+    let small_primary = TargetIdentity::Surface {
+        id: 0x6c,
+        width: 4,
+        height: 4,
+        generation: 1,
+        format: SURFACE_TEST_FORMAT,
+    };
+    let large_secondary = TargetIdentity::Surface {
+        id: 0x6d,
+        width: 8,
+        height: 8,
+        generation: 1,
+        format: SURFACE_TEST_FORMAT,
+    };
+    let mut second = engine_req(&v, &f, 4, 4);
+    second.target_identity = Some(small_primary);
+    second.skip_readback = true;
+    second.secondary_targets.push(SecondaryColorTarget {
+        target_guest: None,
+        identity: large_secondary.clone(),
+        width: 8,
+        height: 8,
+        format: reims_vgpu_protocol::ImageFormat::linear(reims_vgpu_protocol::TexelLayout::Rgba8),
+        clear: [0.0, 0.0, 1.0, 1.0],
+        load_action: reims_vgpu_core::ColorLoadAction::Clear,
+        blend: None,
+        color_write_mask: Default::default(),
+    });
+    engine::execute_draw_request(&second).expect("large-secondary MRT");
+    let secondary_pixels = engine::read_target(&large_secondary)
+        .expect("read large secondary")
+        .pixels;
+    for y in 0..8usize {
+        for x in 0..8usize {
+            if x < 4 && y < 4 {
+                continue;
+            }
+            assert_eq!(
+                &secondary_pixels[(y * 8 + x) * 4..][..4],
+                [0, 0, 255, 255],
+                "large secondary lost its full-image blue clear at ({x},{y})"
+            );
+        }
+    }
 }
 
 /// The vibrancy coverage mask is Metal RG16Float (0x41). Exercise the real
@@ -3542,17 +4079,20 @@ fn mrt_rg16float_secondary_builds_and_renders() {
         width: 32,
         height: 32,
         generation: 0,
-        format: reims_vgpu::backend::vulkan::translate::pixel::RESIDENT_RGBA_FORMAT,
+        format: reims_vgpu_core::pixel_format::TexelLayout::Rgba8,
     };
     let mut mrt = engine_req(&v, &f, 32, 32);
     mrt.target_identity = Some(primary.clone());
     mrt.secondary_targets.push(SecondaryColorTarget {
+        target_guest: None,
         identity: mask.clone(),
         width: 32,
         height: 32,
-        format: ash::vk::Format::R16G16_SFLOAT,
+        format: reims_vgpu_protocol::ImageFormat::linear(
+            reims_vgpu_protocol::TexelLayout::Rg16Float,
+        ),
         clear: [1.0, 0.5, 0.0, 0.0],
-        load: false,
+        load_action: reims_vgpu_core::ColorLoadAction::Clear,
         // Unblended: this is the vibrancy coverage-mask shape, and a mask is a
         // raw store. Which is exactly why every secondary used to be forced
         // unblended — one real case generalized into a rule for all of them.
@@ -3614,12 +4154,15 @@ fn depth_and_mrt_secondary_render_in_one_pass() {
         let mut req = engine_req(&v, &f, w, h);
         req.target_identity = Some(primary);
         req.secondary_targets.push(SecondaryColorTarget {
+            target_guest: None,
             identity: secondary.clone(),
             width: w,
             height: h,
-            format: ash::vk::Format::R8G8B8A8_UNORM,
+            format: reims_vgpu_protocol::ImageFormat::linear(
+                reims_vgpu_protocol::TexelLayout::Rgba8,
+            ),
             clear: [0.0, 0.0, 1.0, 1.0],
-            load: false,
+            load_action: reims_vgpu_core::ColorLoadAction::Clear,
             blend: None,
             color_write_mask: Default::default(),
         });
@@ -3690,7 +4233,7 @@ fn single_rt_draw_unaffected_by_mrt_path() {
         width: 16,
         height: 16,
         generation: 0,
-        format: reims_vgpu::backend::vulkan::translate::pixel::RESIDENT_RGBA_FORMAT,
+        format: reims_vgpu_core::pixel_format::TexelLayout::Rgba8,
     };
     assert!(!engine::resident_content_ready(&never));
 }
@@ -3737,7 +4280,7 @@ fn framebuffer_fetch_reads_destination_via_input_attachment() {
 /// changes what the next one sees. Run it on purpose:
 ///
 /// ```sh
-/// cargo test -p reims-vgpu --no-default-features --features backend-vulkan,host-window \
+/// cargo test -p reims-vgpu --no-default-features --features host-window \
 ///   --test vk_engine_parity -- --ignored --nocapture --exact \
 ///   measure_draw_cost_against_pass_size
 /// ```
@@ -3831,7 +4374,7 @@ fn measure_draw_cost_against_pass_size() {
 /// `live=None` with no way to tell which kind they were.
 #[test]
 fn resident_content_state_separates_an_absent_slot_from_an_unstamped_one() {
-    use reims_vgpu::backend::vulkan::engine::ResidentContent;
+    use reims_vgpu_vulkan::engine::ResidentContent;
     let _g = engine_test_session();
     let (v, f) = triangle_spirv();
 
@@ -3891,5 +4434,412 @@ fn resident_content_state_separates_an_absent_slot_from_an_unstamped_one() {
         engine::resident_content_state(&live),
         ResidentContent::Unstamped,
         "a draw since the stamp clears it — the slot is still there"
+    );
+}
+
+/// A tightly-packed 2D declaration must be admitted for direct binding.
+///
+/// The backend's admission answer is a device-capability question — does this
+/// shape, format and pitch plan as a linear image here — and not the separate
+/// question of whether such an image may inherit the bytes already in the
+/// allocation. External images are born `UNDEFINED`, which bounds what an alias
+/// can *inherit*; it does not bound whether one can exist. Answering both with
+/// one constant `Refused` is what kept every sampled bind on the copy rail, so
+/// this test pins the two apart: a shape the device can plan answers `Direct`
+/// and names the length the caller must grow its allocation to.
+///
+/// `None` is not a failure here. It is the documented "no device yet resolved"
+/// answer, which is what a checkout with no Vulkan ICD returns, and the suite
+/// skips rather than reporting a device fact it could not measure.
+#[test]
+fn a_tight_two_dimensional_declaration_is_admitted_for_direct_binding() {
+    let _guard = engine_test_session();
+    let (width, height) = (256u32, 128u32);
+    let bytes_per_texel = 4u64;
+    let row_pitch = u64::from(width) * bytes_per_texel;
+    let resource_len = row_pitch * u64::from(height);
+    let request = reims_vgpu_memory::GuestImageBindingRequest {
+        backing: reims_vgpu_memory::GuestTargetBacking {
+            allocation_host_ptr: 0,
+            allocation_len: resource_len,
+            resource_offset: 0,
+            resource_len,
+            plane_offset: 0,
+            row_pitch,
+        },
+        allocation: reims_vgpu_memory::GuestImageAllocationLayout::single(
+            0,
+            row_pitch,
+            reims_vgpu_memory::GuestImageLayout::D2 { width, height },
+        ),
+        format: reims_vgpu_protocol::ImageFormat::linear(reims_vgpu_protocol::TexelLayout::Bgra8),
+    };
+    let Some(disposition) = engine::sampled_guest_image_binding_requirement(request) else {
+        eprintln!("skipping: no Vulkan device resolved, so there is no admission to assert");
+        return;
+    };
+    match disposition {
+        reims_vgpu_memory::GuestImageBindingDisposition::Direct(requirement) => {
+            assert!(
+                requirement.allocation_len >= resource_len,
+                "an alias may need trailing host-only padding, but never fewer bytes than the \
+                 guest resource it covers: {} < {resource_len}",
+                requirement.allocation_len
+            );
+        }
+        reims_vgpu_memory::GuestImageBindingDisposition::Refused => {
+            panic!(
+                "a tightly-packed {width}x{height} BGRA8 declaration is the simplest linear image \
+                 there is; a device that refuses it cannot alias guest pages at all"
+            );
+        }
+    }
+}
+
+/// One 2D RGBA8 image sitting in host storage that stands in for a RAMBlock,
+/// described exactly as the aliasing rail admits it: one mip, one layer,
+/// tightly packed rows, identity swizzle.
+///
+/// `storage` is what the import points into, so the fixture owns it and every
+/// draw that binds the alias has to outlive nothing else. Writing through
+/// [`Self::fill`] is the guest's CPU write: it goes to the same bytes the
+/// device samples, which is the whole property these tests exist to check.
+struct GuestAliasFixture {
+    storage: Vec<u8>,
+    texels: std::ops::Range<usize>,
+    width: u32,
+    height: u32,
+    memory: reims_vgpu_memory::GuestTargetMemory,
+    transfer: reims_vgpu_memory::GuestRunSource,
+}
+
+impl GuestAliasFixture {
+    /// Build the fixture, or answer `None` on a host that publishes no import
+    /// granularity — there is no guest RAM to alias there, and the copy rail is
+    /// the only rail such a host has.
+    ///
+    /// Must be called after at least one successful draw: the granularity is
+    /// what the backend measured from the device, so it does not exist until a
+    /// device does.
+    fn new(width: u32, height: u32) -> Option<Self> {
+        use reims_vgpu_memory::{
+            granularity, GuestImageLayout, GuestPageFootprint, GuestPageSet, GuestRamImport,
+            GuestRamRegion, GuestRun, GuestRunSource, GuestTargetBacking, GuestTargetMemory,
+        };
+
+        let align = granularity()?;
+        let bytes_per_texel = 4u64;
+        let row_pitch = u64::from(width) * bytes_per_texel;
+        let resource_len = row_pitch * u64::from(height);
+        let block_len = resource_len.next_multiple_of(align);
+        // One granule of slack so the covered span can start on an aligned
+        // address inside an allocation this test does not control the base of.
+        let storage = vec![0u8; (block_len + align) as usize];
+        let pad = (storage.as_ptr() as u64).next_multiple_of(align) - storage.as_ptr() as u64;
+        let base = storage.as_ptr() as u64 + pad;
+        let gpa_base = 0x3_0000_0000u64;
+        let import = std::sync::Arc::new(
+            GuestRamImport::new(
+                GuestRamRegion {
+                    gpa_base,
+                    host_va: base,
+                    len: block_len,
+                },
+                align,
+            )
+            .expect("an aligned, non-empty region"),
+        );
+        let pages = (0..block_len / align)
+            .map(|page| gpa_base + page * align)
+            .collect::<Vec<_>>();
+        let backing = GuestTargetBacking {
+            allocation_host_ptr: base as usize,
+            allocation_len: block_len,
+            resource_offset: 0,
+            resource_len,
+            plane_offset: 0,
+            row_pitch,
+        };
+        let memory = GuestTargetMemory {
+            backing,
+            import,
+            footprint: GuestPageFootprint::new(pages.as_slice().into(), align)
+                .expect("a non-empty page list at a power-of-two page size"),
+        };
+        let transfer = GuestRunSource {
+            runs: std::sync::Arc::new(vec![GuestRun {
+                host_ptr: base as usize,
+                len: resource_len,
+            }]),
+            source_offset: 0,
+            total_len: resource_len,
+            row_length_texels: width,
+            pages: None,
+            physical_pages: GuestPageSet::new(&pages),
+        };
+        // Ask the device whether it can plan this shape as a linear image
+        // before asserting anything about aliasing. A host that answers
+        // `Refused` keeps every sampled bind on the copy rail by design.
+        let request = reims_vgpu_memory::GuestImageBindingRequest {
+            backing,
+            allocation: reims_vgpu_memory::GuestImageAllocationLayout::single(
+                0,
+                row_pitch,
+                GuestImageLayout::D2 { width, height },
+            ),
+            format: reims_vgpu_protocol::ImageFormat::linear(
+                reims_vgpu_protocol::TexelLayout::Rgba8,
+            ),
+        };
+        match engine::sampled_guest_image_binding_requirement(request)? {
+            reims_vgpu_memory::GuestImageBindingDisposition::Direct(_) => {}
+            reims_vgpu_memory::GuestImageBindingDisposition::Refused => return None,
+        }
+        let texels = pad as usize..(pad + resource_len) as usize;
+        Some(Self {
+            storage,
+            texels,
+            width,
+            height,
+            memory,
+            transfer,
+        })
+    }
+
+    /// Write one colour over every texel, the way the guest's own CPU would.
+    fn fill(&mut self, rgba: [u8; 4]) {
+        let range = self.texels.clone();
+        for texel in self.storage[range].chunks_exact_mut(4) {
+            texel.copy_from_slice(&rgba);
+        }
+    }
+
+    fn source(&self) -> SampledSource {
+        let source = reims_vgpu_memory::GuestImageSource::single_mip(
+            self.memory.clone(),
+            reims_vgpu_memory::GuestImageLayout::D2 {
+                width: self.width,
+                height: self.height,
+            },
+            self.transfer.clone(),
+        )
+        .expect("a single-mip allocation whose plane starts at its resource");
+        SampledSource::GuestImage(source, reims_vgpu_core::GatherVouch::Fresh)
+    }
+}
+
+/// A fullscreen textured quad sampling `fixture` into a BGRA surface resident.
+fn guest_alias_req(
+    vert: &[u32],
+    frag: &[u32],
+    identity: &TargetIdentity,
+    fixture: &GuestAliasFixture,
+    w: u32,
+    h: u32,
+) -> DrawRequest {
+    let positions: [[f32; 4]; 6] = [
+        [-1.0, -1.0, 0.0, 1.0],
+        [1.0, -1.0, 0.0, 1.0],
+        [-1.0, 1.0, 0.0, 1.0],
+        [-1.0, 1.0, 0.0, 1.0],
+        [1.0, -1.0, 0.0, 1.0],
+        [1.0, 1.0, 0.0, 1.0],
+    ];
+    let uvs: [[f32; 2]; 6] = [
+        [0.0, 1.0],
+        [1.0, 1.0],
+        [0.0, 0.0],
+        [0.0, 0.0],
+        [1.0, 1.0],
+        [1.0, 0.0],
+    ];
+    let encode_f32 = |values: &[f32]| {
+        values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>()
+    };
+    let mut req = engine_req(vert, frag, w, h);
+    req.vertex_count = 6;
+    req.target_identity = Some(identity.clone());
+    req.skip_readback = true;
+    req.storage_buffers.push(StorageBufferResource {
+        binding: 0,
+        content: encode_f32(&positions.into_iter().flatten().collect::<Vec<_>>()).into(),
+    });
+    req.storage_buffers.push(StorageBufferResource {
+        binding: 1,
+        content: encode_f32(&uvs.into_iter().flatten().collect::<Vec<_>>()).into(),
+    });
+    req.sampled_images.push(SampledImageResource {
+        binding: 32,
+        array_element: 0,
+        descriptor_count: 1,
+        width: fixture.width,
+        height: fixture.height,
+        layers: 1,
+        arrayed: false,
+        volume: false,
+        cube: false,
+        one_dim: false,
+        multisampled: false,
+        source: fixture.source(),
+        byte_origin: Default::default(),
+        format: reims_vgpu_protocol::ImageFormat::linear(reims_vgpu_protocol::TexelLayout::Rgba8),
+        identity: None,
+        content: None,
+        resource_lifetime: None,
+        swizzle: Default::default(),
+    });
+    req.samplers
+        .push(SamplerResource::normalized_default(sampler_binding(0)));
+    req
+}
+
+/// The centre texel of a BGRA resident, in the guest's own byte order.
+fn bgra_center(pixels: &[u8], w: u32, h: u32) -> [u8; 4] {
+    let center = ((h / 2) * w + w / 2) as usize * 4;
+    pixels[center..center + 4]
+        .try_into()
+        .expect("four channels")
+}
+
+/// An alias inherits the bytes the guest wrote before the image existed.
+///
+/// A Vulkan image over imported host memory is born `UNDEFINED`, and the first
+/// transition out of that layout is permitted to discard everything the memory
+/// holds. The guest is nonetheless entitled to those texels: it wrote them into
+/// its own allocation and declared the allocation as a texture, and the native
+/// oracle this device emulates makes them visible. So an alias owes one copy at
+/// birth, laundered through a staging buffer because an imported buffer and the
+/// image alias the same bytes and Vulkan forbids a copy whose regions overlap.
+///
+/// This test writes the texels *before* the first bind and reads the result
+/// back. Note what it cannot prove: a driver that happens not to discard on the
+/// `UNDEFINED` transition would return the right pixels with the copy removed.
+/// The counter assertion is what pins the copy itself to having been recorded.
+#[test]
+fn a_new_guest_alias_samples_the_bytes_written_before_it_existed() {
+    let _g = engine_test_session();
+    let vert = translate_words("textured_quad.air", Stage::Vertex);
+    let frag = translate_words("textured_quad.air", Stage::Fragment);
+    let (w, h) = (16u32, 16u32);
+    let identity = TargetIdentity::Surface {
+        id: 0x9A1,
+        width: w,
+        height: h,
+        generation: 1,
+        format: SURFACE_TEST_FORMAT,
+    };
+    // One ordinary draw first: the import granularity is measured from the
+    // device, so there is nothing to build a guest allocation against until a
+    // device has been resolved.
+    let (warm_vert, warm_frag) = triangle_spirv();
+    if draw_or_skip(
+        "guest alias warm-up",
+        &engine_req(&warm_vert, &warm_frag, w, h),
+    )
+    .is_none()
+    {
+        return;
+    }
+    let Some(mut fixture) = GuestAliasFixture::new(16, 16) else {
+        eprintln!("skipping: this host cannot alias guest pages as a sampled image");
+        return;
+    };
+    let rgba = [17u8, 91, 203, 255];
+    fixture.fill(rgba);
+
+    let req = guest_alias_req(&vert, &frag, &identity, &fixture, w, h);
+    let before = engine::counter_snapshot();
+    engine::execute_draw_request(&req).expect("a draw sampling an aliased guest allocation");
+    let delta = engine::counter_snapshot().delta_since(&before);
+    assert_eq!(
+        delta.sampled_guest_direct_binds, 1,
+        "the sampled bind did not take the aliasing rail: {delta:?}"
+    );
+    assert_eq!(
+        delta.sampled_guest_materializations, 1,
+        "a newly created alias must record exactly one birth copy: {delta:?}"
+    );
+    let pixels = engine::read_target(&identity)
+        .expect("read the resident the alias was sampled into")
+        .pixels;
+    assert_eq!(
+        bgra_center(&pixels, w, h),
+        [rgba[2], rgba[1], rgba[0], rgba[3]],
+        "the alias lost the texels the guest wrote before the image existed"
+    );
+}
+
+/// A guest CPU write after the alias exists reaches the next sampled read.
+///
+/// This is the property the whole rail is for: the image *is* the guest's
+/// pages, so a store the guest makes is visible without this device copying
+/// anything. The second draw must therefore reuse the same resident — a rebuilt
+/// alias would carry the new bytes through its birth copy instead and prove
+/// nothing — which is why the materialization count is asserted to stay put
+/// while the pixels change.
+#[test]
+fn a_guest_write_after_the_alias_exists_reaches_the_next_sampled_read() {
+    let _g = engine_test_session();
+    let vert = translate_words("textured_quad.air", Stage::Vertex);
+    let frag = translate_words("textured_quad.air", Stage::Fragment);
+    let (w, h) = (16u32, 16u32);
+    let identity = TargetIdentity::Surface {
+        id: 0x9A2,
+        width: w,
+        height: h,
+        generation: 1,
+        format: SURFACE_TEST_FORMAT,
+    };
+    let (warm_vert, warm_frag) = triangle_spirv();
+    if draw_or_skip(
+        "guest alias warm-up",
+        &engine_req(&warm_vert, &warm_frag, w, h),
+    )
+    .is_none()
+    {
+        return;
+    }
+    let Some(mut fixture) = GuestAliasFixture::new(16, 16) else {
+        eprintln!("skipping: this host cannot alias guest pages as a sampled image");
+        return;
+    };
+    let first = [17u8, 91, 203, 255];
+    fixture.fill(first);
+    let req = guest_alias_req(&vert, &frag, &identity, &fixture, w, h);
+    engine::execute_draw_request(&req).expect("the draw that creates the alias");
+    let pixels = engine::read_target(&identity)
+        .expect("read the first result")
+        .pixels;
+    assert_eq!(
+        bgra_center(&pixels, w, h),
+        [first[2], first[1], first[0], first[3]],
+        "the alias did not carry the guest's initial texels"
+    );
+
+    // The guest stores into its own allocation. Nothing tells this device.
+    let second = [201u8, 77, 31, 255];
+    fixture.fill(second);
+    let before = engine::counter_snapshot();
+    engine::execute_draw_request(&req).expect("the draw that samples the guest's new bytes");
+    let delta = engine::counter_snapshot().delta_since(&before);
+    assert_eq!(
+        delta.sampled_guest_direct_binds, 1,
+        "the second bind left the aliasing rail: {delta:?}"
+    );
+    assert_eq!(
+        delta.sampled_guest_materializations, 0,
+        "the second bind rebuilt the alias instead of reusing it, so this measures a copy \
+         rather than a guest write: {delta:?}"
+    );
+    let pixels = engine::read_target(&identity)
+        .expect("read the second result")
+        .pixels;
+    assert_eq!(
+        bgra_center(&pixels, w, h),
+        [second[2], second[1], second[0], second[3]],
+        "a guest CPU write into the aliased pages was not visible to the device"
     );
 }

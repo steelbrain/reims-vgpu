@@ -55,11 +55,11 @@ pub const MTL_BLIT_OPTION_KNOWN_MASK: u32 = MTL_BLIT_OPTION_DEPTH_FROM_DEPTH_STE
 
 /// Selected texture aspect for a buffer↔texture / options-bearing copy.
 ///
-/// Defined in [`crate::contract::pixel_format`], which is where every consumer
+/// Defined in [`reims_vgpu_core::pixel_format`], which is where every consumer
 /// of the choice lives, and re-exported here because this is where it is
 /// produced. One type, so the decoder's refusal of depth+stencil is the only
 /// place that state is ever considered.
-pub(crate) use crate::contract::pixel_format::BlitAspect;
+pub(crate) use reims_vgpu_core::pixel_format::BlitAspect;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BlitOptionError {
@@ -132,185 +132,10 @@ impl crate::observe::Refusal for DecodeStatus {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum Kind {
-    #[default]
-    Unknown = 0,
-    Copy,
-    FillBuffer,
-    Resource,
-    Image,
-    Fence,
-    /// `optimizeIndirectCommandBuffer:withRange:` and
-    /// `resetCommandsInBuffer:withRange:`, which name one ICB and a command
-    /// range. Which of the two is [`Command::opcode`]; the buffer is
-    /// [`Command::resource`] and the range is [`Command::range_location`] and
-    /// [`Command::range_length`].
-    IcbRange,
-    /// `copyIndirectCommandBuffer:sourceRange:destination:destinationIndex:`.
-    /// Source and destination are [`Command::source`] and
-    /// [`Command::destination`], the source range is the shared range pair, and
-    /// the destination command index is [`Command::destination_index`].
-    IcbCopy,
-    /// `fillBuffer:range:pattern4:` — [`Kind::FillBuffer`] with a repeating
-    /// 32-bit unit in [`Command::fill_pattern`] instead of the single byte in
-    /// [`Command::fill_value`]. Separate kinds rather than one kind with two
-    /// value fields, because an executor that read the wrong one would write
-    /// plausible bytes rather than fail.
-    FillBufferPattern4,
-    /// `fillTexture:level:slice:region:color:[pixelFormat:]` and
-    /// `fillTexture:level:slice:region:bytes:length:`, told apart by
-    /// [`Command::fill_source`].
-    FillTexture,
-    /// `invalidateCompressedTexture:` and its `slice:level:` form. The texture
-    /// is [`Command::texture`]; the whole-texture form leaves
-    /// [`Command::slice`] and [`Command::level`] at zero, and
-    /// [`Command::opcode`] is what distinguishes "slice 0, level 0" from "every
-    /// slice and every level".
-    InvalidateCompressedTexture,
-}
-
-/// Where a [`Kind::FillTexture`] takes the value it writes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum FillSource {
-    #[default]
-    None = 0,
-    /// A clear colour, in [`Command::fill_color_raw`], interpreted in
-    /// [`Command::fill_pixel_format`].
-    Color,
-    /// A pixel pattern the serializer staged into a buffer rather than putting
-    /// it on the wire: [`Command::fill_bytes_ref`],
-    /// [`Command::fill_bytes_offset`] and [`Command::fill_bytes_length`]. The
-    /// record carries no pixel data.
-    Bytes,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum CopyKind {
-    #[default]
-    None = 0,
-    BufferToTexture,
-    BufferToBuffer,
-    TextureToBuffer,
-    TextureToTexture,
-    TextureToTextureSliceLevel,
-}
-
-/// What a blit command's source/destination/resource ref names.
-///
-/// There is deliberately no `Fence`: the two fence opcodes carry their ref in
-/// [`Command::fence`] under [`Kind::Fence`] and leave every `RefKind` field at
-/// `None`, so a `RefKind::Fence` was a second name for a ref this decoder puts
-/// somewhere else.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum RefKind {
-    #[default]
-    None = 0,
-    Buffer,
-    Texture,
-    Resource,
-    /// An `MTLIndirectCommandBuffer`. Not folded into [`Self::Resource`]: the
-    /// three ICB records reach it through `indirectCommandBufferRef`, which is
-    /// a different accessor from every other resource in this encoder, and a
-    /// consumer that resolved one as a generic resource would look it up in the
-    /// wrong table.
-    IndirectCommandBuffer,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Point {
-    pub x: u64,
-    pub y: u64,
-    pub z: u64,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Size {
-    pub width: u64,
-    pub height: u64,
-    pub depth: u64,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Command {
-    pub opcode: u32,
-    pub command_length: u32,
-    pub kind: Kind,
-    pub copy_kind: CopyKind,
-    pub source_kind: RefKind,
-    pub destination_kind: RefKind,
-    pub source: u32,
-    pub destination: u32,
-    pub source_offset: u64,
-    pub source_bytes_per_row: u64,
-    pub source_bytes_per_image: u64,
-    pub source_origin: Point,
-    pub source_size: Size,
-    pub destination_offset: u64,
-    pub destination_bytes_per_row: u64,
-    pub destination_bytes_per_image: u64,
-    pub destination_origin: Point,
-    pub size: u64,
-    pub source_slice: u16,
-    pub source_level: u16,
-    pub destination_slice: u16,
-    pub destination_level: u16,
-    pub slice_count: u16,
-    pub level_count: u16,
-    pub has_options: bool,
-    pub options: u32,
-    pub resource: u32,
-    pub resource_kind: RefKind,
-    pub buffer: u32,
-    pub range_location: u64,
-    pub range_length: u64,
-    /// Destination command index of a [`Kind::IcbCopy`].
-    ///
-    /// A `u64` of its own rather than one of the `u16` subresource indices
-    /// beside it: this counts *commands* in the destination buffer, and the
-    /// record keeps the two kinds of index apart.
-    pub destination_index: u64,
-    pub fill_value: u8,
-    /// The repeating 32-bit unit of a [`Kind::FillBufferPattern4`].
-    pub fill_pattern: u32,
-    pub texture: u32,
-    pub slice: u16,
-    pub level: u16,
-    pub fence: u32,
-
-    // --- Kind::FillTexture ---------------------------------------------------
-    pub fill_source: FillSource,
-    /// The filled region. Named apart from the copy records' origin and size
-    /// because a fill has one texture and no direction: reusing
-    /// `source_origin`/`destination_origin` here would make a reader ask which
-    /// end of a copy this was.
-    ///
-    /// The wire stores the region **size before its origin**, reversing
-    /// `MTLRegion` and the selector's own type encoding. That is the wire
-    /// crate's business and this decoder reads it through the pinned view, but
-    /// it is the reason not to hand-roll the offsets here.
-    pub fill_origin: Point,
-    pub fill_size: Size,
-    /// The clear colour's four components as the serializer wrote them.
-    ///
-    /// IEEE-754 `double` bit patterns rather than `f64`, for two reasons:
-    /// [`Command`] is `Eq`, which `f64` cannot be, and nothing in this device
-    /// converts them yet — so storing the bits keeps the record exact instead of
-    /// committing to a conversion no consumer has asked for.
-    pub fill_color_raw: [u64; 4],
-    /// The format the colour is interpreted in. Comes from the guest's argument
-    /// on the `pixelFormat:` form and from the *texture* on the other, and the
-    /// wire record cannot tell you which — [`Command::opcode`] is the same for
-    /// both.
-    pub fill_pixel_format: u16,
-    /// The staging buffer a [`FillSource::Bytes`] fill named, its offset, and
-    /// the number of pattern bytes there. An executor must fetch them; the
-    /// record carries no pixel data and the length is the guest's rather than
-    /// anything derivable from the region.
-    pub fill_bytes_ref: u32,
-    pub fill_bytes_offset: u64,
-    pub fill_bytes_length: u64,
-}
+pub use reims_vgpu_protocol::{
+    BlitCommand as Command, BlitCopyKind as CopyKind, BlitFillSource as FillSource,
+    BlitKind as Kind, BlitPoint as Point, BlitRefKind as RefKind, BlitSize as Size,
+};
 
 /// Transactional decode of one blit command record.
 ///
@@ -667,8 +492,8 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::contract::endian::{st16, st32, st64};
     use core::mem::offset_of;
+    use reims_vgpu_core::endian::{st16, st32, st64};
     use reims_vgpu_wire::OP_HEADER_LEN;
 
     // format offsets (payload-relative)
@@ -1035,7 +860,7 @@ mod tests {
     /// that Apple never emits them.
     #[test]
     fn an_icb_blit_record_is_read_rather_than_refused_whole() {
-        use crate::contract::endian::st64;
+        use reims_vgpu_core::endian::st64;
         use reims_vgpu_wire::ops::blit as wire;
 
         for (op, wire_op) in [

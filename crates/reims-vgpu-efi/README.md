@@ -13,7 +13,7 @@ firmware-side business logic.
 
 | Crate | Role | Target |
 |-------|------|--------|
-| `crates/reims-vgpu` | Host protocol + Metal/Vulkan + QEMU staticlib | host (e.g. Linux) |
+| `crates/reims-vgpu` | Host composition + QEMU staticlib, linking semantic and Vulkan sibling crates | host (Linux or macOS) |
 | **`crates/reims-vgpu-efi`** | UEFI option-ROM PE (GOP install + Blt) | `x86_64-unknown-uefi` |
 
 Sibling packages, separate Cargo workspaces. Do **not** add this crate as a

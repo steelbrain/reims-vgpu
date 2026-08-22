@@ -1,20 +1,8 @@
 //! CmdExecIndirect2: load streams, multi-attachment clears, Metal draw attempt.
 //!
 //! Clear-only passes write guest mapping pages (archive render_clear).
-//! Draws try Metal encode when pipeline MTLBs resolve; otherwise color targets
 //! are still marked dirty for DisplaySwap.
 
-use crate::contract::draw::DrawArgs;
-use crate::contract::endian::{ld32, ld64};
-use crate::contract::pass_action::{
-    store_action_publishes_single_sample, MTL_LOAD_ACTION_CLEAR, MTL_LOAD_ACTION_LOAD,
-    MTL_STORE_ACTION_MULTISAMPLE_RESOLVE, MTL_STORE_ACTION_STORE,
-    MTL_STORE_ACTION_STORE_AND_MULTISAMPLE_RESOLVE,
-};
-use crate::contract::pixel_format::{
-    f64_to_unorm8, solid_rgba8, MTL_FORMAT_BGRA8_UNORM, RGBA8_BPP,
-};
-use crate::model::DeviceState;
 use crate::runtime::blit_exec::{self, BlitStatus};
 use crate::runtime::compute_exec::{self, ComputeStatus};
 use crate::runtime::decode::blit::{self, Kind as BlitKind};
@@ -47,8 +35,23 @@ use crate::runtime::host::{HostMemory, HostOps};
 use crate::runtime::mapping_write;
 use crate::runtime::mipmap::{self, MipmapStatus};
 use crate::runtime::objects;
-use crate::runtime::plan::event_sync::{Domain as FenceDomain, FenceAction};
 use crate::runtime::task_slot::{resolve_task_word, TaskWordSite};
+use crate::runtime::Device;
+use reims_vgpu_core::draw::DrawArgs;
+use reims_vgpu_core::endian::{ld32, ld64};
+use reims_vgpu_core::pixel_format::{
+    f64_to_unorm8, solid_rgba8, MTL_FORMAT_BGRA8_UNORM, RGBA8_BPP,
+};
+use reims_vgpu_core::{FenceAction, SynchronizationDomain as FenceDomain};
+use reims_vgpu_protocol::pass_action::{
+    store_action_publishes_single_sample, MTL_LOAD_ACTION_CLEAR,
+    MTL_STORE_ACTION_MULTISAMPLE_RESOLVE, MTL_STORE_ACTION_STORE,
+    MTL_STORE_ACTION_STORE_AND_MULTISAMPLE_RESOLVE,
+};
+use reims_vgpu_protocol::{
+    ObjectTableRef, ResourceObject, ResourceValidity, SegmentBoundary, SegmentKind,
+    SubmissionResourceUse, TaskId,
+};
 use reims_vgpu_wire::ops::blit as wire_blit;
 use reims_vgpu_wire::ops::render as wire_render;
 use reims_vgpu_wire::ops::render_pass as wire_pass;
@@ -56,7 +59,7 @@ use reims_vgpu_wire::ops::tile as wire_tile;
 use std::sync::Arc;
 
 /// Pending render-pass ICB execute (range form or indirect range buffer).
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 struct RenderIcbExecute {
     icb_ref: u32,
     is_range: bool,
@@ -64,6 +67,15 @@ struct RenderIcbExecute {
     range_length: u64,
     args_buffer_ref: u32,
     args_buffer_offset: u64,
+    /// Encoder state inherited at the exact execute record, not at stream end.
+    inherited: PendingDraw,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RenderWork {
+    Draw(usize),
+    ExecuteIcb(usize),
+    Barrier,
 }
 
 /// One draw recorded with the bind state at that point (archive DrawRec / multi-draw job).
@@ -71,7 +83,7 @@ struct RenderIcbExecute {
 /// Archive `apple_pv_gpu_render_worker_run` executes **every** draw in order,
 /// seeding draw N from draw N-1's writeback. Product previously kept only
 /// `last_draw`, which dropped the logo when the pill was the final draw in the
-/// same stream (journal: logo RG8 168×206 + pill → one type-11 FB).
+/// same stream (journal: logo RG8 168×206 + pill → one IOSurface texture FB).
 #[derive(Clone, Debug, Default)]
 struct PendingDraw {
     pipeline_ref: u32,
@@ -90,23 +102,157 @@ struct PendingDraw {
     /// Every scissor rect this draw was recorded with. See [`Self::viewports`].
     scissors: Vec<ScissorRect>,
     blend_color: Option<[f32; 4]>,
-    cull_mode: Option<u32>,
-    front_facing: Option<u32>,
-    /// `setTriangleFillMode:` — `MTLTriangleFillMode`, `None` where the stream
-    /// bound none and the Metal default (fill) applies.
-    fill_mode: Option<u32>,
-    /// `setDepthClipMode:` — `MTLDepthClipMode`, `None` for the Metal default
-    /// (clip).
-    depth_clip_mode: Option<u32>,
+    render_target_extent: reims_vgpu_core::RenderTargetExtent,
+    cull_mode: reims_vgpu_protocol::CullMode,
+    front_face_ccw: bool,
+    /// `setTriangleFillMode:` — `MTLTriangleFillMode`, initialized to the
+    /// Metal default (`Fill`) until the stream replaces it.
+    fill_mode: reims_vgpu_protocol::FillMode,
+    /// `setLineWidth:` state, initialized to Metal's `1.0` default.
+    line_width: reims_vgpu_core::LineWidth,
+    /// `setDepthClipMode:` — `MTLDepthClipMode`, initialized to the Metal
+    /// default (`Clip`) until the stream replaces it.
+    depth_clip_mode: reims_vgpu_protocol::DepthClipMode,
     depth_bias: Option<[f32; 3]>,
     depth_stencil_ref: u32,
     stencil_ref: Option<(u32, u32)>,
-    depth_attach: Option<DepthAttachment>,
-    stencil_attach: Option<StencilAttachment>,
+    depth_attach: Option<draw::DepthAttachmentState>,
+    stencil_attach: Option<draw::StencilAttachmentState>,
     /// The occlusion query armed when this draw was recorded, snapshotted from
     /// [`StreamAccum::visibility`]. `None` is the Metal default,
     /// `MTLVisibilityResultModeDisabled`.
     visibility: Option<draw::VisibilityArming>,
+    /// ICB object that produced this draw, or `None` for a direct encoder draw.
+    icb_ref: Option<u32>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RasterState {
+    cull_mode: Result<reims_vgpu_protocol::CullMode, RasterStateRefusal>,
+    front_face_ccw: Result<bool, RasterStateRefusal>,
+    fill_mode: Result<reims_vgpu_protocol::FillMode, RasterStateRefusal>,
+    line_width: reims_vgpu_core::LineWidth,
+    depth_clip_mode: Result<reims_vgpu_protocol::DepthClipMode, RasterStateRefusal>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct VisibilityState(Result<Option<draw::VisibilityArming>, VisibilityStateRefusal>);
+
+impl Default for VisibilityState {
+    fn default() -> Self {
+        Self(Ok(None))
+    }
+}
+
+impl VisibilityState {
+    fn set(&mut self, raw: u64, offset: u64) {
+        self.0 = u32::try_from(raw)
+            .map_err(|_| VisibilityStateRefusal { raw })
+            .and_then(|raw32| {
+                reims_vgpu_protocol::visibility_result_mode(raw32)
+                    .map_err(|_| VisibilityStateRefusal { raw })
+            })
+            .map(|mode| mode.map(|mode| draw::VisibilityArming { mode, offset }));
+    }
+
+    fn resolved(self) -> Result<Option<draw::VisibilityArming>, VisibilityStateRefusal> {
+        self.0
+    }
+}
+
+fn pass_actions(
+    aspect: &'static str,
+    slot: u32,
+    load_raw: u16,
+    store_raw: u16,
+) -> Result<
+    (
+        reims_vgpu_protocol::pass_action::LoadAction,
+        reims_vgpu_protocol::pass_action::StoreAction,
+    ),
+    PassActionRefusal,
+> {
+    let load_action =
+        reims_vgpu_protocol::pass_action::load_action(load_raw).map_err(|_| PassActionRefusal {
+            aspect,
+            slot,
+            action: PassActionKind::Load,
+            raw: load_raw,
+        })?;
+    let store_action = reims_vgpu_protocol::pass_action::store_action(store_raw).map_err(|_| {
+        PassActionRefusal {
+            aspect,
+            slot,
+            action: PassActionKind::Store,
+            raw: store_raw,
+        }
+    })?;
+    Ok((load_action, store_action))
+}
+
+fn depth_attachment_state(
+    attachment: DepthAttachment,
+) -> Result<draw::DepthAttachmentState, PassActionRefusal> {
+    let (load_action, store_action) =
+        pass_actions("depth", 0, attachment.load_action, attachment.store_action)?;
+    Ok(draw::DepthAttachmentState {
+        texture_ref: attachment.texture_ref,
+        load_action,
+        store_action,
+        clear_depth: attachment.clear_depth,
+    })
+}
+
+fn stencil_attachment_state(
+    attachment: StencilAttachment,
+) -> Result<draw::StencilAttachmentState, PassActionRefusal> {
+    let (load_action, store_action) = pass_actions(
+        "stencil",
+        0,
+        attachment.load_action,
+        attachment.store_action,
+    )?;
+    Ok(draw::StencilAttachmentState {
+        texture_ref: attachment.texture_ref,
+        load_action,
+        store_action,
+        clear_stencil: attachment.clear_stencil,
+    })
+}
+
+impl Default for RasterState {
+    fn default() -> Self {
+        Self {
+            cull_mode: Ok(reims_vgpu_protocol::CullMode::None),
+            front_face_ccw: Ok(false),
+            fill_mode: Ok(reims_vgpu_protocol::FillMode::Fill),
+            line_width: reims_vgpu_core::LineWidth::default(),
+            depth_clip_mode: Ok(reims_vgpu_protocol::DepthClipMode::Clip),
+        }
+    }
+}
+
+impl RasterState {
+    fn resolved(
+        self,
+    ) -> Result<
+        (
+            reims_vgpu_protocol::CullMode,
+            bool,
+            reims_vgpu_protocol::FillMode,
+            reims_vgpu_core::LineWidth,
+            reims_vgpu_protocol::DepthClipMode,
+        ),
+        RasterStateRefusal,
+    > {
+        Ok((
+            self.cull_mode?,
+            self.front_face_ccw?,
+            self.fill_mode?,
+            self.line_width,
+            self.depth_clip_mode?,
+        ))
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -125,14 +271,18 @@ struct StreamAccum {
     color_targets: Vec<u32>,
     /// All draws in stream order (archive multi-draw job).
     draws: Vec<PendingDraw>,
+    /// Every work-producing record in encoder order. Draw and ICB payloads live
+    /// in their typed stores above/below; this sequence is the sole ordering
+    /// authority and barriers occupy their own positions in it.
+    render_work: Vec<RenderWork>,
     saw_draw: bool,
     /// Every render ICB execute (`0x14`/`0x15`) in this stream, in stream
     /// order.
     ///
     /// A list rather than a latch because `executeCommandsInBuffer:` is work,
     /// not state: a second record does not replace the first, it asks for a
-    /// second execution. See the loop that drains this in [`finish_stream`] for
-    /// what a capacity of one used to cost.
+    /// second execution. [`Self::render_work`] places each entry among direct
+    /// draws and barriers before [`finish_stream`] expands its commands.
     execute_icb: Vec<RenderIcbExecute>,
     vertex_buffers: BindTable<BufferBind>,
     fragment_buffers: BindTable<BufferBind>,
@@ -147,14 +297,12 @@ struct StreamAccum {
     scissors: Vec<ScissorRect>,
     indexed: Option<IndexedDrawInfo>,
     blend_color: Option<[f32; 4]>,
-    cull_mode: Option<u32>,
-    front_facing: Option<u32>,
-    /// `setTriangleFillMode:` — `MTLTriangleFillMode`, `None` where the stream
-    /// bound none and the Metal default (fill) applies.
-    fill_mode: Option<u32>,
-    /// `setDepthClipMode:` — `MTLDepthClipMode`, `None` for the Metal default
-    /// (clip).
-    depth_clip_mode: Option<u32>,
+    /// Pass-owned raster bounds. Zero on either wire axis independently means
+    /// that axis inherits the minimum attachment dimension.
+    render_target_extent: reims_vgpu_core::RenderTargetExtent,
+    /// Sticky raster setters, each retaining either the decoded semantic value
+    /// or the exact invalid ordinal until a later setter replaces that field.
+    raster: RasterState,
     depth_bias: Option<[f32; 3]>,
     depth_stencil_ref: u32,
     stencil_ref: Option<(u32, u32)>,
@@ -174,7 +322,7 @@ struct StreamAccum {
     /// Encoder state, so one slot is the contract rather than a bound: a second
     /// record genuinely replaces the first. What *accumulates* across draws is
     /// the count in the guest's buffer, not the arming.
-    visibility: Option<draw::VisibilityArming>,
+    visibility: VisibilityState,
     /// Draw records this stream decoded but did not keep because no pipeline was
     /// latched. See [`StreamDrawDrop`]; reported once per stream by
     /// [`note_stream_draw_drops`].
@@ -200,20 +348,134 @@ struct StreamAccum {
     ///
     /// Recording it lets [`StreamAccum::bind_snapshot`] refuse. That is the
     /// funnel both consumers of the stream's state pass through — a decoded draw
-    /// and an end-of-stream ICB execute — which is why the refusal lives there
-    /// and not in either backend's encoder.
+    /// and an ICB execute at its exact record position — which is why the
+    /// refusal lives there and not in the backend encoder.
     ///
     /// **Sticky, and it cannot go stale.** There is no retirement path and none
-    /// is needed: this field describes the accumulator beside it, a
-    /// `StreamAccum` is built fresh per stream and dropped at [`finish_stream`],
-    /// so the refusal and the state it describes have exactly the same life. The
-    /// compute rail's equivalent needs a `clear_refusal_at` because a
-    /// `ComputeAccum` outlives many dispatches; a render pass's state does not
-    /// outlive the pass.
+    /// is needed: this field describes the accumulator beside it. A
+    /// `StreamAccum` is built when a render encoder begins and dropped at its
+    /// closing segment, so the refusal and the state it describes have exactly
+    /// the same life even when that encoder spans child buffers. The compute
+    /// rail's equivalent needs a `clear_refusal_at` because a `ComputeAccum`
+    /// outlives many dispatches; a render pass's state does not outlive the
+    /// pass.
     unrepresentable: Option<StreamRefusal>,
 }
 
+/// Decoder state owned by one encoder whose segment header keeps it open.
+///
+/// The segment flags, rather than the child command-buffer descriptor, delimit
+/// this state. A render or compute encoder may therefore span several child
+/// buffers, and every stateful record in the later buffers observes the state
+/// established by the earlier ones. Stateless encoder families still occupy
+/// the enum: their presence is what lets the continuation check reject a type
+/// change instead of dispatching the next segment through the wrong decoder.
+enum OpenEncoder {
+    /// Both stateful arms are boxed. Their payloads are the only large things
+    /// here — a `StreamAccum` is about 496 bytes, most of it the six
+    /// `BindTable`s, and a `ComputeSegment` about 232 — while the three
+    /// stateless arms carry nothing. Inline, the enum is as wide as its largest
+    /// payload for the whole life of every open encoder, and
+    /// [`OpenEncoder::new`] returns it by value, so an encoder-begin copies
+    /// that width whichever arm it opened. Boxed, the move is a pointer.
+    ///
+    /// The allocation is per encoder-begin, which is per render pass or per
+    /// compute segment, not per draw or per dispatch: exactly one
+    /// `OpenEncoder` is live per task, and the records inside a segment all
+    /// mutate it through the same borrow.
+    Render(Box<StreamAccum>),
+    Compute(Box<crate::runtime::compute_session::ComputeSegment>),
+    Blit,
+    Event,
+    Info,
+}
+
+impl OpenEncoder {
+    fn new(type_: u8) -> Option<Self> {
+        match type_ {
+            SEGMENT_TYPE_RENDER => Some(Self::Render(Box::default())),
+            SEGMENT_TYPE_COMPUTE => Some(Self::Compute(Box::default())),
+            SEGMENT_TYPE_BLIT => Some(Self::Blit),
+            SEGMENT_TYPE_EVENT => Some(Self::Event),
+            SEGMENT_TYPE_INFO => Some(Self::Info),
+            _ => None,
+        }
+    }
+
+    fn type_(&self) -> u8 {
+        match self {
+            Self::Render(_) => SEGMENT_TYPE_RENDER,
+            Self::Compute(_) => SEGMENT_TYPE_COMPUTE,
+            Self::Blit => SEGMENT_TYPE_BLIT,
+            Self::Event => SEGMENT_TYPE_EVENT,
+            Self::Info => SEGMENT_TYPE_INFO,
+        }
+    }
+}
+
+/// A segment-header encoder lifetime that cannot be represented faithfully.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EncoderLifetimeRefusal {
+    MissingPrevious { actual: u8 },
+    TypeMismatch { previous: u8, actual: u8 },
+    RestartBeforeClose { previous: u8, actual: u8 },
+    Unclosed { previous: u8 },
+}
+
+impl crate::observe::Decline for EncoderLifetimeRefusal {
+    fn slug(&self) -> &'static str {
+        match self {
+            Self::MissingPrevious { .. } => "stream_encoder_continuation_without_previous",
+            Self::TypeMismatch { .. } => "stream_encoder_continuation_type_mismatch",
+            Self::RestartBeforeClose { .. } => "stream_encoder_restart_before_close",
+            Self::Unclosed { .. } => "stream_encoder_unclosed",
+        }
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        match *self {
+            Self::MissingPrevious { actual } => {
+                vec![(
+                    "actual",
+                    stream::segment_type_name(u32::from(actual)).into(),
+                )]
+            }
+            Self::TypeMismatch { previous, actual }
+            | Self::RestartBeforeClose { previous, actual } => vec![
+                (
+                    "previous",
+                    stream::segment_type_name(u32::from(previous)).into(),
+                ),
+                (
+                    "actual",
+                    stream::segment_type_name(u32::from(actual)).into(),
+                ),
+            ],
+            Self::Unclosed { previous } => vec![(
+                "previous",
+                stream::segment_type_name(u32::from(previous)).into(),
+            )],
+        }
+    }
+}
+
 impl StreamAccum {
+    fn push_draw(&mut self, draw: PendingDraw) {
+        let index = self.draws.len();
+        self.draws.push(draw);
+        self.render_work.push(RenderWork::Draw(index));
+    }
+
+    fn push_icb(&mut self, execute: RenderIcbExecute) {
+        let index = self.execute_icb.len();
+        self.execute_icb.push(execute);
+        self.render_work.push(RenderWork::ExecuteIcb(index));
+    }
+
+    fn push_barrier(&mut self) {
+        self.render_work.push(RenderWork::Barrier);
+    }
+
     /// The subset of [`Self::clears`] whose colour the guest may read back, so
     /// writing it into the guest's pages is publishing the pass's result rather
     /// than inventing one.
@@ -237,13 +499,12 @@ impl StreamAccum {
     /// The stream's bind state as a `PendingDraw`, or what makes it
     /// unrepresentable.
     ///
-    /// Two things need it and must not disagree: a decoded draw, which fills
-    /// in `pipeline_ref` and `draw` on top, and an ICB execute, which inherits
-    /// the state as it stands at end of stream and supplies neither. Both must
-    /// also refuse on the same terms, which is why the check is here rather than
-    /// at either of them: a snapshot of state that is missing something the
-    /// guest asked for is not this stream's state, and a draw encoded from it
-    /// computes the wrong pixels with nothing to say so.
+    /// Two things need it and must not disagree: a decoded draw, which fills in
+    /// `pipeline_ref` and `draw` on top, and an ICB execute, which inherits the
+    /// state at that operation's encoder position. Both must also refuse on the
+    /// same terms, which is why the check is here rather than at either of them:
+    /// a snapshot missing something the guest asked for is not this stream's
+    /// state, and a draw encoded from it computes the wrong pixels silently.
     ///
     /// Draws recorded *before* the refusal are untouched. They snapshotted state
     /// that was still complete, so they are the guest's own work and they stand;
@@ -252,6 +513,31 @@ impl StreamAccum {
         if let Some(refused) = self.unrepresentable {
             return Err(refused);
         }
+        let (cull_mode, front_face_ccw, fill_mode, line_width, depth_clip_mode) =
+            self.raster.resolved().map_err(StreamRefusal::Raster)?;
+        let visibility = self
+            .visibility
+            .resolved()
+            .map_err(StreamRefusal::Visibility)?;
+        for &(slot, attachment) in &self.color_slots {
+            pass_actions(
+                "color",
+                slot,
+                attachment.load_action,
+                attachment.store_action,
+            )
+            .map_err(StreamRefusal::PassAction)?;
+        }
+        let depth_attach = self
+            .depth_attach
+            .map(depth_attachment_state)
+            .transpose()
+            .map_err(StreamRefusal::PassAction)?;
+        let stencil_attach = self
+            .stencil_attach
+            .map(stencil_attachment_state)
+            .transpose()
+            .map_err(StreamRefusal::PassAction)?;
         Ok(PendingDraw {
             indexed: self.indexed.clone(),
             vertex_buffers: self.vertex_buffers.clone(),
@@ -263,16 +549,18 @@ impl StreamAccum {
             viewports: self.viewports.clone(),
             scissors: self.scissors.clone(),
             blend_color: self.blend_color,
-            cull_mode: self.cull_mode,
-            front_facing: self.front_facing,
-            fill_mode: self.fill_mode,
-            depth_clip_mode: self.depth_clip_mode,
+            render_target_extent: self.render_target_extent,
+            cull_mode,
+            front_face_ccw,
+            fill_mode,
+            line_width,
+            depth_clip_mode,
             depth_bias: self.depth_bias,
             depth_stencil_ref: self.depth_stencil_ref,
             stencil_ref: self.stencil_ref,
-            depth_attach: self.depth_attach,
-            stencil_attach: self.stencil_attach,
-            visibility: self.visibility,
+            depth_attach,
+            stencil_attach,
+            visibility,
             ..Default::default()
         })
     }
@@ -514,11 +802,11 @@ pub struct ExecResult {
     /// The caller must keep this packet at the channel head and retry it.
     pub deferred: bool,
     pub texture_refs: Vec<u32>,
-    pub type11_mappings: Vec<u32>,
+    pub iosurface_mappings: Vec<u32>,
     pub saw_draw: bool,
     pub clears_applied: u32,
-    pub metal_draws_ok: u32,
-    pub metal_draws_fail: u32,
+    pub draws_ok: u32,
+    pub draws_fail: u32,
     /// Render-pass attachment sets resolved from guest objects. One Metal
     /// render stream has one fixed attachment set regardless of draw count.
     pub render_attachment_resolves: u32,
@@ -535,8 +823,11 @@ pub struct ExecResult {
     pub compute_control_fail: u32,
     /// ICB materialize+execute failures (`0xe4`/`0xe5`).
     pub compute_icb_fail: u32,
-    /// Render ICB execute ok / fail (`0x14`/`0x15`).
+    /// Successfully encoded render-ICB commands. One execute range can contain
+    /// zero or more commands, so this is not an execute-record count.
     pub render_icb_ok: u32,
+    /// Render-ICB refusals and command encode failures. A refusal before range
+    /// expansion counts once; failures after expansion count per command.
     pub render_icb_fail: u32,
     /// Wall-clock for the whole synchronous packet body. A packet holding the
     /// device lock past `SYNC_EXEC_STALL_US` starves the guest's read-to-clear
@@ -545,7 +836,7 @@ pub struct ExecResult {
 }
 
 pub fn process_exec_indirect2<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut M,
     payload: &[u8],
 ) -> ExecResult {
@@ -666,7 +957,6 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
     // run without protocol ownership. Keep the packet unconsumed until every
     // referenced render stage is ready, so replay cannot duplicate clears,
     // fences, compute dispatches, or guest writeback.
-    #[cfg(feature = "backend-vulkan")]
     let translation_pending = {
         let preflight_started = std::time::Instant::now();
         let pending = streams.iter().fold(false, |pending, stream| {
@@ -682,34 +972,121 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
         );
         pending
     };
-    #[cfg(all(feature = "backend-metal", target_os = "macos"))]
-    let translation_pending = false;
+
     if translation_pending {
         out.deferred = true;
         note_exec_header(exec_started, measured_ns);
         return out;
     }
 
-    // Before any of this submission's work runs. Each record states what was
-    // true of its resource *before* the submission, so a pending window holding
-    // pixels the guest has since overwritten has to go now — landing it later
-    // would replace the guest's own bytes with a frame the guest has declared
-    // stale.
-    consume_resource_table(state, task_id, &resource_descs);
+    let submission_identity = state.submissions.next_identity(TaskId::new(task_id));
+    let segments_started = std::time::Instant::now();
+    let submission_segments = semantic_submission_segments(&streams);
+    let segments_ns = segments_started.elapsed().as_nanos() as u64;
+    measured_ns += segments_ns;
+    crate::runtime::drain::note_exec_phase(crate::runtime::drain::ExecPhase::Segments, segments_ns);
 
-    for stream in streams {
-        let mut acc = StreamAccum::default();
+    let open_started = std::time::Instant::now();
+    let descs = resource_descs.len() as u64;
+    // Validity commands are ordered at the head of this submission. They run
+    // under its identity before expected content is snapshotted, because a
+    // guest-write declaration creates the version the following commands must
+    // expect. That ordering is why this is a separate pass from the resolve
+    // below and not one fused loop over `resource_descs`.
+    let table_started = std::time::Instant::now();
+    consume_resource_table(state, task_id, &resource_descs);
+    crate::runtime::drain::note_open_part(
+        crate::runtime::drain::OpenPart::Table,
+        table_started.elapsed().as_nanos() as u64,
+        descs,
+    );
+
+    let begin_started = std::time::Instant::now();
+
+    let resolved = state.task_objects.resources.begin_submission(
+        task_id,
+        submission_identity.id,
+        resource_descs
+            .iter()
+            .map(|desc| ObjectTableRef::<ResourceObject>::new(desc.object_id)),
+    );
+    crate::runtime::drain::note_open_part(
+        crate::runtime::drain::OpenPart::Begin,
+        begin_started.elapsed().as_nanos() as u64,
+        descs,
+    );
+
+    let use_started = std::time::Instant::now();
+    let submission_resources: std::sync::Arc<[SubmissionResourceUse]> = resource_descs
+        .iter()
+        .zip(resolved)
+        .map(
+            |(desc, (object, resource, expected_content))| SubmissionResourceUse {
+                object,
+                resource,
+                expected_content,
+                validity: ResourceValidity {
+                    clear_host: desc.ops.clear_host_valid != 0,
+                    set_host: desc.ops.set_host_valid != 0,
+                    clear_guest: desc.ops.clear_guest_valid != 0,
+                    set_guest: desc.ops.set_guest_valid != 0,
+                },
+            },
+        )
+        .collect::<Vec<_>>()
+        .into();
+    state.submissions.begin(
+        submission_identity,
+        submission_resources,
+        submission_segments,
+    );
+    crate::runtime::drain::note_open_part(
+        crate::runtime::drain::OpenPart::Use,
+        use_started.elapsed().as_nanos() as u64,
+        descs,
+    );
+    let open_ns = open_started.elapsed().as_nanos() as u64;
+    measured_ns += open_ns;
+    crate::runtime::drain::note_exec_phase(crate::runtime::drain::ExecPhase::Open, open_ns);
+
+    let mut open_encoder = None;
+    for (stream_index, stream) in (0u32..).zip(streams) {
         let walk_started = std::time::Instant::now();
-        walk_stream(state, host, task_id, &stream, &mut out, &mut acc);
-        let walk_ns = walk_started.elapsed().as_nanos() as u64;
+        let finish_ns = walk_submitted_stream(
+            state,
+            host,
+            task_id,
+            stream_index,
+            &stream,
+            &mut out,
+            &mut open_encoder,
+        );
+        let walk_ns = (walk_started.elapsed().as_nanos() as u64).saturating_sub(finish_ns);
         measured_ns += walk_ns;
         crate::runtime::drain::note_exec_phase(crate::runtime::drain::ExecPhase::Walk, walk_ns);
-        let finish_started = std::time::Instant::now();
-        finish_stream(state, host, task_id, &mut out, &acc);
-        let finish_ns = finish_started.elapsed().as_nanos() as u64;
         measured_ns += finish_ns;
         crate::runtime::drain::note_exec_phase(crate::runtime::drain::ExecPhase::Finish, finish_ns);
     }
+    if let Some(previous) = open_encoder {
+        crate::observe::Emit::decline(
+            "stream_encoder",
+            &EncoderLifetimeRefusal::Unclosed {
+                previous: previous.type_(),
+            },
+        )
+        .field("task", task_id)
+        .fail();
+    }
+    let close_started = std::time::Instant::now();
+    if let Some(context) = state.submissions.finish() {
+        state.task_objects.resources.complete_submission(
+            context.identity.id,
+            context.resources.iter().filter_map(|use_| use_.resource),
+        );
+    }
+    let close_ns = close_started.elapsed().as_nanos() as u64;
+    measured_ns += close_ns;
+    crate::runtime::drain::note_exec_phase(crate::runtime::drain::ExecPhase::Close, close_ns);
     note_exec_header(exec_started, measured_ns);
     out.total_us = elapsed_us(exec_started);
     out
@@ -719,7 +1096,7 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
 /// return points.
 ///
 /// [`ExecPhase::Header`] is the **leftover**, not a span: it is the function's
-/// own elapsed time minus the four that measured themselves, so the five sum to
+/// own elapsed time minus the ones that measured themselves, so they all sum to
 /// the opcode's `op0x37_us` whatever path the call took. Deriving it rather than
 /// wrapping the header parse is what makes the tiling closed — a cost in a
 /// corner nobody thought to list still lands here instead of vanishing, which is
@@ -748,8 +1125,8 @@ fn note_exec_header(exec_started: std::time::Instant, measured_ns: u64) {
 ///
 /// The table's ids are the **task's object-ref space**, not the mapping space.
 /// Measured over one boot's 6 823 records: 72 % are live object refs, 20 % are
-/// mappings, 19 % resolve nowhere, and `texture_to_mapping` answered for exactly
-/// none. So most records name resources that have no surface state to apply a
+/// mappings, and 19 % resolve nowhere. The retained IOSurface relation answered
+/// for exactly none. So most records name resources that have no surface state to apply a
 /// validity quad to — buffers, heaps, pipelines — and that is the protocol
 /// working, not a loss.
 ///
@@ -771,13 +1148,13 @@ fn note_exec_header(exec_started: std::time::Instant, measured_ns: u64) {
 /// for ids that later do execute — and nothing measures that yet on either.
 ///
 /// `validity_unknown_object` is **not** by itself a defect either, and a reader
-/// scoring it needs to know why: `DeviceState::objects` is populated lazily, by
-/// `objects::resolve_type11_ref` and `resolve_type4_surface_ex` at the moment a
-/// decoded command names a ref. A resource the guest has created in its own
-/// object list but has not yet named in an executed stream is absent from the
-/// set by construction. The table names the submission's whole residency list,
-/// which is a superset of what its command buffers reference. What *would* be
-/// the finding is this count staying high for ids that later do execute.
+/// scoring it needs to know why: the canonical task-resource registry is
+/// populated lazily, when a decoded command first resolves a ref. A resource
+/// the guest has created in its object list but has not yet named in an
+/// executed stream is absent by construction. The table names the submission's
+/// whole residency list, which is a superset of what its command buffers
+/// reference. What *would* be the finding is this count staying high for ids
+/// that later do execute.
 ///
 /// # What `set_host_valid` means, and how that is known
 ///
@@ -791,7 +1168,7 @@ fn note_exec_header(exec_started: std::time::Instant, measured_ns: u64) {
 ///
 /// The census that measured it is gone; a correlation with no counter-examples
 /// over 19 135 trials is a finding, not a thing to keep re-deriving per frame.
-fn consume_resource_table(state: &mut DeviceState, task_id: u32, descs: &[ExecResourceDesc]) {
+fn consume_resource_table(state: &mut Device, task_id: u32, descs: &[ExecResourceDesc]) {
     use crate::runtime::resource_validity::{apply, ValiditySite};
     let mut no_surface = 0u32;
     let mut unknown = 0u32;
@@ -807,7 +1184,12 @@ fn consume_resource_table(state: &mut DeviceState, task_id: u32, descs: &[ExecRe
         if !outcome.missed {
             continue;
         }
-        if state.objects.contains(&(task_id, d.object_id)) {
+        if state
+            .task_objects
+            .resources
+            .get(task_id, d.object_id)
+            .is_some()
+        {
             no_surface = no_surface.saturating_add(1);
         } else {
             unknown = unknown.saturating_add(1);
@@ -849,9 +1231,8 @@ fn elapsed_us(started: std::time::Instant) -> u64 {
     u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
 }
 
-#[cfg(feature = "backend-vulkan")]
 fn preflight_render_translations<M: HostMemory + HostOps>(
-    state: &DeviceState,
+    state: &Device,
     host: &M,
     task_id: u32,
     stream: &[u8],
@@ -859,7 +1240,10 @@ fn preflight_render_translations<M: HostMemory + HostOps>(
     use crate::runtime::drain::{note_preflight_part, note_preflight_pipe, PreflightPart};
     let refs_started = std::time::Instant::now();
     let pipelines = render_pipeline_refs(stream);
-    note_preflight_part(PreflightPart::Refs, refs_started.elapsed().as_nanos() as u64);
+    note_preflight_part(
+        PreflightPart::Refs,
+        refs_started.elapsed().as_nanos() as u64,
+    );
     let mut pending = false;
     for pipeline_ref in pipelines {
         note_preflight_pipe();
@@ -868,12 +1252,8 @@ fn preflight_render_translations<M: HostMemory + HostOps>(
         // resolves below. `translations_ready` states why that is not a weaker
         // answer — chiefly that the translate cache never evicts, so a shader
         // this memo saw translated is still translated.
-        if crate::runtime::pipeline_resolve::translations_ready(
-            state,
-            host,
-            task_id,
-            pipeline_ref,
-        ) {
+        if crate::runtime::pipeline_resolve::translations_ready(state, host, task_id, pipeline_ref)
+        {
             continue;
         }
         let air_started = std::time::Instant::now();
@@ -896,27 +1276,34 @@ fn preflight_render_translations<M: HostMemory + HostOps>(
         ) else {
             continue;
         };
+        let raster_sample_count = draw::load_render_pipeline(state, host, task_id, pipeline_ref)
+            .map(|descriptor| descriptor.raster_sample_count.max(1))
+            .unwrap_or(1);
         let cache_started = std::time::Instant::now();
-        if !crate::runtime::m2v_cache::ensure_cached_async(
+        if !state.executor.ensure_render_translation(
             v_air,
-            metal2vulkan::passes::Stage::Vertex,
+            reims_vgpu_core::ShaderStage::Vertex,
+            raster_sample_count,
             pipeline_ref,
         ) {
             pending = true;
         }
-        if !crate::runtime::m2v_cache::ensure_cached_async(
+        if !state.executor.ensure_render_translation(
             f_air,
-            metal2vulkan::passes::Stage::Fragment,
+            reims_vgpu_core::ShaderStage::Fragment,
+            raster_sample_count,
             pipeline_ref,
         ) {
             pending = true;
         }
-        note_preflight_part(PreflightPart::Cache, cache_started.elapsed().as_nanos() as u64);
+        note_preflight_part(
+            PreflightPart::Cache,
+            cache_started.elapsed().as_nanos() as u64,
+        );
     }
     pending
 }
 
-#[cfg(feature = "backend-vulkan")]
 fn render_pipeline_refs(stream: &[u8]) -> Vec<u32> {
     // Deliberately silent on a framing refusal: this is a speculative pre-scan of
     // the very stream `walk_stream` is about to frame and report on. Logging here
@@ -951,9 +1338,8 @@ fn render_pipeline_refs(stream: &[u8]) -> Vec<u32> {
     pipelines
 }
 
-#[cfg(feature = "backend-vulkan")]
 fn preflight_compute_translations<M: HostMemory + HostOps>(
-    state: &DeviceState,
+    state: &Device,
     host: &M,
     task_id: u32,
     stream: &[u8],
@@ -961,21 +1347,16 @@ fn preflight_compute_translations<M: HostMemory + HostOps>(
     use crate::runtime::drain::{note_preflight_part, note_preflight_pipe, PreflightPart};
     let refs_started = std::time::Instant::now();
     let inputs = compute_translation_inputs(stream);
-    note_preflight_part(PreflightPart::Refs, refs_started.elapsed().as_nanos() as u64);
+    note_preflight_part(
+        PreflightPart::Refs,
+        refs_started.elapsed().as_nanos() as u64,
+    );
     let mut pending = false;
     for (pipeline_ref, local_size) in inputs {
         note_preflight_pipe();
         let air_started = std::time::Instant::now();
         let loaded = compute_exec::load_compute_pipeline(state, host, task_id, pipeline_ref)
-            .and_then(|pipeline| {
-                crate::runtime::mtlb::load_mtlb(
-                    state,
-                    host,
-                    task_id,
-                    pipeline.kernel_func_ref,
-                    crate::runtime::mtlb::AirLoadRail::Compute,
-                )
-            });
+            .map(|pipeline| std::sync::Arc::clone(&pipeline.kernel_mtlb));
         note_preflight_part(PreflightPart::Air, air_started.elapsed().as_nanos() as u64);
         let Some(mtlb) = loaded else {
             continue;
@@ -984,9 +1365,13 @@ fn preflight_compute_translations<M: HostMemory + HostOps>(
             continue;
         };
         let cache_started = std::time::Instant::now();
-        let cached =
-            crate::runtime::m2v_cache::ensure_cached_kernel_async(air, local_size, pipeline_ref);
-        note_preflight_part(PreflightPart::Cache, cache_started.elapsed().as_nanos() as u64);
+        let cached = state
+            .executor
+            .ensure_compute_translation(air, local_size, pipeline_ref);
+        note_preflight_part(
+            PreflightPart::Cache,
+            cache_started.elapsed().as_nanos() as u64,
+        );
         if !cached {
             pending = true;
         }
@@ -997,7 +1382,6 @@ fn preflight_compute_translations<M: HostMemory + HostOps>(
 /// Structurally collect compute pipeline + LocalSize pairs in command order.
 /// Threads-indirect carries LocalSize in guest argument memory rather than the
 /// stream record, so it deliberately remains on the synchronous fallback.
-#[cfg(feature = "backend-vulkan")]
 fn compute_translation_inputs(stream: &[u8]) -> Vec<(u32, [u32; 3])> {
     // Silent for the same reason as `render_pipeline_refs`: a pre-scan whose
     // framing refusal `walk_stream` will report once, with the task attached.
@@ -1124,8 +1508,211 @@ fn walk_segment_records(stream: &[u8], seg: &stream::Segment, mut handle: impl F
     }
 }
 
+fn finish_open_encoder<M: HostMemory + HostOps>(
+    state: &mut Device,
+    host: &mut M,
+    task_id: u32,
+    out: &mut ExecResult,
+    encoder: &mut OpenEncoder,
+) -> u64 {
+    let started = std::time::Instant::now();
+    match encoder {
+        OpenEncoder::Render(acc) => finish_stream(state, host, task_id, out, acc),
+        OpenEncoder::Compute(compute) => {
+            if let Some(st) = crate::runtime::compute_session::finish_session(
+                &mut compute.session,
+                state,
+                host,
+                task_id,
+            ) {
+                if !matches!(st, ComputeStatus::Ok) {
+                    out.compute_control_fail = out.compute_control_fail.saturating_add(1);
+                    if let Some(e) = crate::observe::Emit::refusal("compute_session_finish", &st) {
+                        e.field("task", task_id).fail_once(u64::from(task_id));
+                    }
+                }
+            }
+        }
+        OpenEncoder::Blit | OpenEncoder::Event | OpenEncoder::Info => {}
+    }
+    started.elapsed().as_nanos() as u64
+}
+
+fn semantic_segment_boundary(
+    stream_index: u32,
+    segment: &stream::Segment,
+) -> Option<SegmentBoundary> {
+    let kind = match segment.type_ {
+        SEGMENT_TYPE_RENDER => SegmentKind::Render,
+        SEGMENT_TYPE_COMPUTE => SegmentKind::Compute,
+        SEGMENT_TYPE_BLIT => SegmentKind::Blit,
+        SEGMENT_TYPE_EVENT => SegmentKind::Event,
+        SEGMENT_TYPE_INFO => SegmentKind::Info,
+        _ => return None,
+    };
+    Some(SegmentBoundary {
+        stream_index,
+        index: segment.index,
+        kind,
+        continues_previous: segment.continues_previous,
+        continues_next: segment.continues_next,
+    })
+}
+
+fn semantic_submission_segments(streams: &[Vec<u8>]) -> Arc<[SegmentBoundary]> {
+    streams
+        .iter()
+        .zip(0u32..)
+        .filter_map(|(bytes, stream_index)| {
+            stream::iter_segments(bytes)
+                .ok()
+                .map(|segments| (stream_index, segments))
+        })
+        .flat_map(|(stream_index, segments)| {
+            segments
+                .into_iter()
+                .filter_map(move |segment| semantic_segment_boundary(stream_index, &segment))
+        })
+        .collect::<Vec<_>>()
+        .into()
+}
+
+/// Walk one submitted child buffer under the segment-header encoder lifetime.
+///
+/// `open` is submission state, not stream state: the closing flag of one child
+/// buffer may deliberately leave its encoder for the opening flag of the next.
+/// The returned duration is time spent closing encoders, so the caller can keep
+/// the `Walk` and `Finish` census phases disjoint even when a close occurs in
+/// the middle of a child buffer.
+fn walk_submitted_stream<M: HostMemory + HostOps>(
+    state: &mut Device,
+    host: &mut M,
+    task_id: u32,
+    stream_index: u32,
+    bytes: &[u8],
+    out: &mut ExecResult,
+    open: &mut Option<OpenEncoder>,
+) -> u64 {
+    let segs = match stream::iter_segments(bytes) {
+        Ok(s) => s,
+        Err(status) => {
+            if let Some(e) = crate::observe::Emit::refusal("stream_frame_fail", &status) {
+                e.field("task", task_id)
+                    .field("bytes", bytes.len())
+                    .fail_once(u64::from(task_id));
+            }
+            return 0;
+        }
+    };
+
+    let mut finish_ns = 0u64;
+    for seg in segs {
+        if let Some(e) =
+            crate::observe::Emit::refusal("stream_segment", &stream::segment_disposition(seg.type_))
+        {
+            e.field("seg_type", seg.type_)
+                .field("seg_off", seg.offset)
+                .field("seg_len", seg.length)
+                .fail_once(u64::from(seg.type_));
+            continue;
+        }
+        if stream::segment_disposition(seg.type_) == stream::SegmentDisposition::Envelope {
+            continue;
+        }
+
+        state
+            .submissions
+            .enter_segment_if_active(semantic_segment_boundary(stream_index, &seg));
+
+        let mut encoder = if seg.continues_previous {
+            match open.take() {
+                Some(encoder) if encoder.type_() == seg.type_ => encoder,
+                Some(previous) => {
+                    crate::observe::Emit::decline(
+                        "stream_encoder",
+                        &EncoderLifetimeRefusal::TypeMismatch {
+                            previous: previous.type_(),
+                            actual: seg.type_,
+                        },
+                    )
+                    .field("task", task_id)
+                    .fail();
+                    continue;
+                }
+                None => {
+                    crate::observe::Emit::decline(
+                        "stream_encoder",
+                        &EncoderLifetimeRefusal::MissingPrevious { actual: seg.type_ },
+                    )
+                    .field("task", task_id)
+                    .fail();
+                    continue;
+                }
+            }
+        } else {
+            if let Some(previous) = open.take() {
+                crate::observe::Emit::decline(
+                    "stream_encoder",
+                    &EncoderLifetimeRefusal::RestartBeforeClose {
+                        previous: previous.type_(),
+                        actual: seg.type_,
+                    },
+                )
+                .field("task", task_id)
+                .fail();
+            }
+            let Some(encoder) = OpenEncoder::new(seg.type_) else {
+                unreachable!("walk disposition admitted no encoder state")
+            };
+            encoder
+        };
+
+        match &mut encoder {
+            OpenEncoder::Render(acc) => {
+                walk_segment_records(bytes, &seg, |op, cmd| {
+                    handle_render_record(state, host, task_id, op, cmd, out, acc)
+                });
+            }
+            OpenEncoder::Compute(compute) => {
+                walk_segment_records(bytes, &seg, |op, cmd| {
+                    handle_compute_record(state, host, task_id, op, cmd, out, compute)
+                });
+            }
+            OpenEncoder::Blit => {
+                walk_segment_records(bytes, &seg, |op, cmd| {
+                    handle_blit_record(state, host, task_id, op, cmd)
+                });
+            }
+            OpenEncoder::Event => {
+                walk_segment_records(bytes, &seg, |_op, cmd| {
+                    handle_event_record(state, task_id, cmd)
+                });
+            }
+            OpenEncoder::Info => {
+                walk_segment_records(bytes, &seg, |op, cmd| {
+                    handle_info_record(state, host, task_id, op, cmd)
+                });
+            }
+        }
+
+        if seg.continues_next {
+            *open = Some(encoder);
+        } else {
+            finish_ns = finish_ns.saturating_add(finish_open_encoder(
+                state,
+                host,
+                task_id,
+                out,
+                &mut encoder,
+            ));
+        }
+    }
+    finish_ns
+}
+
+#[cfg(test)]
 fn walk_stream<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut M,
     task_id: u32,
     stream: &[u8],
@@ -1208,7 +1795,7 @@ fn walk_stream<M: HostMemory + HostOps>(
 }
 
 fn handle_info_record<M: HostMemory + HostOps>(
-    state: &DeviceState,
+    state: &Device,
     host: &M,
     task_id: u32,
     opcode: u32,
@@ -1251,7 +1838,7 @@ fn handle_info_record<M: HostMemory + HostOps>(
     }
 }
 
-fn handle_event_record(state: &mut DeviceState, task_id: u32, cmd_bytes: &[u8]) {
+fn handle_event_record(state: &mut Device, task_id: u32, cmd_bytes: &[u8]) {
     let cmd = match event_decode::decode(cmd_bytes) {
         Ok(c) => c,
         Err(status) => {
@@ -1273,7 +1860,7 @@ fn handle_event_record(state: &mut DeviceState, task_id: u32, cmd_bytes: &[u8]) 
 }
 
 fn handle_compute_record<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut M,
     task_id: u32,
     opcode: u32,
@@ -1442,19 +2029,22 @@ impl crate::observe::Decline for TextureFillDropped {
 }
 
 fn handle_blit_record<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut M,
     task_id: u32,
     opcode: u32,
     cmd_bytes: &[u8],
 ) {
-    // `walk_blit_us` charges this rail 33.3 s of a 45 s driven Maps window and
-    // every clock inside `execute_blit` accounts for 0.14 s of it. The gap has
-    // to be in this function, and only two things here are outside that call:
-    // the decode above, and the `Fence` arm, which reaches
-    // `execute_blit_fence` directly rather than through `execute_blit`. A
-    // blocking fence wait costs exactly what is missing and does no work while
-    // it costs it, which is why no copy clock can see it.
+    // `walk_blit_us` charges this rail more than the whole render family does on
+    // a driven fullscreen Maps window, against three orders of magnitude fewer
+    // records, so the per-record cost here is what matters and not the count.
+    //
+    // This comment used to name the `Fence` arm as the gap, on the reasoning
+    // that a blocking wait costs wall clock while no copy clock can see it. The
+    // per-kind counters below refute that: `blitrec_copy_n` equals
+    // `walk_records_blit` exactly on every boot measured, so this workload sends
+    // no fences and no fills at all and every record is a `Copy`. The cost is
+    // inside `execute_blit`, and `blit_kind_*_us` splits it further.
     //
     // Timed at the closure `walk_segment_records` calls, so decode is inside the
     // span and no arm can leave without being charged.
@@ -1504,7 +2094,6 @@ fn handle_blit_record<M: HostMemory + HostOps>(
         // dropped one, so they stay fail-visible as well as counted.
         //
         // Counted rather than executed on purpose. `runtime::icb` materializes
-        // host ICBs on the Metal arm only, and it reads 0.00% on a driven x86
         // boot — so the count is what says whether an executor is worth building,
         // and for which of the two.
         BlitKind::IcbRange if cmd.opcode == wire_blit::OPCODE_OPTIMIZE_ICB => {
@@ -1552,7 +2141,7 @@ fn handle_blit_record<M: HostMemory + HostOps>(
         // decides whether an executor is worth building.
         //
         // Not executed here on purpose. A texture fill needs the destination
-        // resolved through the type-4/5/11 rails, the region walked per row,
+        // resolved through the surface backing/5/11 rails, the region walked per row,
         // and — for the colour form — the clear colour converted into the
         // texture's pixel format, which is a converter this device does not
         // have. The count is what says whether to build one, and for which of
@@ -1586,11 +2175,11 @@ fn handle_blit_record<M: HostMemory + HostOps>(
                     // `Refusal` supplies it, and an uninstrumented site now reads
                     // `blit_unattributed` rather than rendering a bare `reason=`.
                     let src_ty = objects::lookup_list_entry(state, host, task_id, cmd.source)
-                        .map(|e| e.object_type)
-                        .unwrap_or(0);
+                        .map(|e| e.kind.to_string())
+                        .unwrap_or_else(|| "absent".to_string());
                     let dst_ty = objects::lookup_list_entry(state, host, task_id, cmd.destination)
-                        .map(|e| e.object_type)
-                        .unwrap_or(0);
+                        .map(|e| e.kind.to_string())
+                        .unwrap_or_else(|| "absent".to_string());
                     if let Some(e) = crate::observe::Emit::refusal("blit_fail", &st) {
                         e.field("st", format!("{st:?}"))
                             .field("kind", format!("{:?}", cmd.kind))
@@ -1645,8 +2234,42 @@ fn handle_blit_record<M: HostMemory + HostOps>(
     });
 }
 
+/// How many decoded render records the guest sends per draw.
+///
+/// The wire stream is a delta: `setVertexBuffer:offset:atIndex:` writes one
+/// slot, `setRenderPipelineState:` writes one, and a draw record carries almost
+/// nothing. [`StreamAccum`] latches those writes, and the draw arm then resolves
+/// the whole accumulated state into a `DrawRequest` -- every slot, whether the
+/// guest touched it since the last draw or not.
+///
+/// `records_per_draw` is what says how much of that is redundant. A guest
+/// writing three slots between draws while the draw path resolves two dozen is
+/// the difference between what the contract asked for and what this device
+/// does; a guest re-writing every slot every draw would mean there is no
+/// redundancy to remove and the resolution has to stay where it is.
+///
+/// It is a count and not a timing, so it survives host contention.
+pub mod stream_shape_census {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+    static RECORDS: AtomicU64 = AtomicU64::new(0);
+    static DRAWS: AtomicU64 = AtomicU64::new(0);
+
+    pub(super) fn note(is_draw: bool) {
+        RECORDS.fetch_add(1, Relaxed);
+        if is_draw {
+            DRAWS.fetch_add(1, Relaxed);
+        }
+    }
+
+    /// Read and reset `(records, draws)`.
+    pub fn take() -> (u64, u64) {
+        (RECORDS.swap(0, Relaxed), DRAWS.swap(0, Relaxed))
+    }
+}
+
 fn handle_render_record<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &M,
     task_id: u32,
     opcode: u32,
@@ -1671,6 +2294,10 @@ fn handle_render_record<M: HostMemory + HostOps>(
             return;
         }
     };
+    stream_shape_census::note(matches!(
+        cmd.kind,
+        RenderKind::Draw | RenderKind::DrawIndirect | RenderKind::DrawPatches
+    ));
     match cmd.kind {
         RenderKind::SetPipeline => {
             // Apply what the record decoded, ref 0 included. This used to be
@@ -1818,22 +2445,22 @@ fn handle_render_record<M: HostMemory + HostOps>(
                     if !out.texture_refs.contains(&texture_ref) {
                         out.texture_refs.push(texture_ref);
                     }
-                    if let Some(m) = objects::resolve_type11_ref(state, host, task_id, texture_ref)
+                    if let Some(m) =
+                        objects::resolve_iosurface_texture_ref(state, host, task_id, texture_ref)
                     {
-                        if !out.type11_mappings.contains(&m) {
-                            out.type11_mappings.push(m);
+                        if !out.iosurface_mappings.contains(&m) {
+                            out.iosurface_mappings.push(m);
                         }
-                    } else if objects::resolve_type4_surface(state, host, texture_ref) {
-                        // x86 type-4: object ref is surface_id / mapping_id.
-                        if !out.type11_mappings.contains(&texture_ref) {
-                            out.type11_mappings.push(texture_ref);
+                    } else if objects::resolve_surface_backing(state, host, texture_ref) {
+                        // x86 surface backing: object ref is surface_id / mapping_id.
+                        if !out.iosurface_mappings.contains(&texture_ref) {
+                            out.iosurface_mappings.push(texture_ref);
                         }
                     }
                     Some(TextureBind {
                         index,
                         texture_ref,
-                        resource: objects::resolve_resource(state, host, task_id, texture_ref)
-                            .ok(),
+                        resource: objects::resolve_resource(state, host, task_id, texture_ref).ok(),
                     })
                 },
             );
@@ -1910,10 +2537,22 @@ fn handle_render_record<M: HostMemory + HostOps>(
             acc.blend_color = Some(cmd.blend_color);
         }
         RenderKind::SetCullMode => {
-            acc.cull_mode = Some(cmd.cull_mode);
+            acc.raster.cull_mode = u32::try_from(cmd.cull_mode)
+                .ok()
+                .and_then(|raw| reims_vgpu_protocol::cull_mode(raw).ok())
+                .ok_or(RasterStateRefusal {
+                    field: RasterStateField::CullMode,
+                    raw: cmd.cull_mode,
+                });
         }
         RenderKind::SetFrontFacing => {
-            acc.front_facing = Some(cmd.front_facing);
+            acc.raster.front_face_ccw = u32::try_from(cmd.front_facing)
+                .ok()
+                .and_then(|raw| reims_vgpu_protocol::front_face_ccw(raw).ok())
+                .ok_or(RasterStateRefusal {
+                    field: RasterStateField::FrontFacing,
+                    raw: cmd.front_facing,
+                });
         }
         RenderKind::SetDepthBias => {
             acc.depth_bias = Some(cmd.depth_bias);
@@ -1925,34 +2564,34 @@ fn handle_render_record<M: HostMemory + HostOps>(
             acc.stencil_ref = Some((cmd.stencil_ref_front, cmd.stencil_ref_back));
         }
         RenderKind::RenderPass => {
-            // The pass's own tail, decoded and not applied. Four counters
-            // rather than one, because they name four different losses and one
-            // of them is not a loss at all when it is zero.
+            // The pass's own tail. Four counters distinguish the independent
+            // contract terms rather than collapsing them into one reading.
             //
-            // `render_target_width`/`height` are the guest's explicit extent
-            // and this device renders at the attachment's instead, which is a
-            // silent over-render whenever the two differ. `array_length` is
-            // layered rendering. The visibility buffer is the other half of
+            // `render_target_width`/`height` are the guest's explicit raster
+            // bounds and now travel with every draw. `array_length` is layered
+            // rendering. The visibility buffer is the other half of
             // `setVisibilityResultMode:offset:` — that record already counts
             // its own drop, and this counts the buffer it would have written
             // to, so the two should track and a divergence means one of the
             // arms is wrong. All four report only a non-default value: a pass
             // that asks for the API default is asking for what already happens.
             //
-            // The extent one is **not** a healthy zero and the others are. On a
-            // driven arm64/Vulkan boot it reads 1 575 over 127 one-second
-            // windows while the visibility buffer, the array length and the
-            // colour subresource all read 0 — so the macOS window server states
-            // an explicit pass extent on essentially every pass, and this
-            // device renders at the attachment's instead. Whether that is a
-            // loss is settled by `note_pass_extent_coverage`'s bands and not by
-            // this count: the two agree, so this is the denominator of a
-            // measurement rather than an alarm.
+            // The extent count remains the denominator for
+            // `note_pass_extent_coverage`'s bands; it is an instrument, not a
+            // second implementation rule.
             // Kept, not counted: this is where the pass says which guest buffer
             // its occlusion counts land in, and `finish_stream` writes them
             // there. `0` is a pass that named none, which leaves the arming
             // below with nowhere to write.
             acc.visibility_buffer_ref = cmd.pass_visibility_result_buffer_ref;
+            match render_target_extent(cmd.pass_render_target_width, cmd.pass_render_target_height)
+            {
+                Ok(extent) => acc.render_target_extent = extent,
+                Err(extent) => {
+                    acc.unrepresentable
+                        .get_or_insert(StreamRefusal::PassExtent(extent));
+                }
+            }
             // Refused rather than drawn into layer 0, the decision the colour
             // subresource arm below already made for the same shape of loss:
             // the layer a draw selects is a coordinate the pass did not name,
@@ -1966,7 +2605,7 @@ fn handle_render_record<M: HostMemory + HostOps>(
                 acc.unrepresentable.get_or_insert(StreamRefusal::Pass(drop));
             }
             if cmd.pass_render_target_width != 0 || cmd.pass_render_target_height != 0 {
-                note_pass_target_extent();
+                note_pass_target_extent_stated();
             }
             // Full multi-attachment: re-decode all color slots from payload.
             if cmd_bytes.len() >= 8 {
@@ -1982,10 +2621,8 @@ fn handle_render_record<M: HostMemory + HostOps>(
                 // guest that wanted none also produces.
                 let depth = decode_depth_attachment(payload);
                 if depth.texture_ref != 0 {
-                    if attachment_subresource_is_bindable(
-                        depth.into(),
-                        LevelSupport::LevelZeroOnly,
-                    ) {
+                    if attachment_subresource_is_bindable(depth.into(), LevelSupport::LevelZeroOnly)
+                    {
                         acc.depth_attach = Some(depth);
                     } else {
                         let drop = note_depth_stencil_unsupported(task_id, "depth", &depth.into());
@@ -2066,19 +2703,19 @@ fn handle_render_record<M: HostMemory + HostOps>(
                         out.texture_refs.push(att.resolve_texture_ref);
                     }
                     if let Some(m) =
-                        objects::resolve_type11_ref(state, host, task_id, published_ref)
+                        objects::resolve_iosurface_texture_ref(state, host, task_id, published_ref)
                     {
                         note_pass_extent_for_slot(state, task_id, slot, m, &cmd);
-                        if !out.type11_mappings.contains(&m) {
-                            out.type11_mappings.push(m);
+                        if !out.iosurface_mappings.contains(&m) {
+                            out.iosurface_mappings.push(m);
                         }
-                    } else if objects::resolve_type4_surface(state, host, published_ref) {
-                        // A type-4 attachment is its own mapping id — the arm
-                        // below pushes `att.texture_ref` where the type-11 arm
+                    } else if objects::resolve_surface_backing(state, host, published_ref) {
+                        // A surface backing attachment is its own mapping id — the arm
+                        // below pushes `att.texture_ref` where the IOSurface texture arm
                         // pushes the id it resolved to.
                         note_pass_extent_for_slot(state, task_id, slot, published_ref, &cmd);
-                        if !out.type11_mappings.contains(&published_ref) {
-                            out.type11_mappings.push(published_ref);
+                        if !out.iosurface_mappings.contains(&published_ref) {
+                            out.iosurface_mappings.push(published_ref);
                         }
                     }
                     // The load action decides this, and only the load action.
@@ -2130,6 +2767,14 @@ fn handle_render_record<M: HostMemory + HostOps>(
             }
             acc.saw_draw = true;
             out.saw_draw = true;
+            let primitive_topology =
+                match reims_vgpu_protocol::primitive_topology(cmd.primitive_type) {
+                    Ok(topology) => topology,
+                    Err(error) => {
+                        note_primitive_topology_refused(task_id, acc.pipeline_ref, error);
+                        return;
+                    }
+                };
             let count = if cmd.index_count != 0 {
                 cmd.index_count
             } else {
@@ -2137,10 +2782,11 @@ fn handle_render_record<M: HostMemory + HostOps>(
             };
             if cmd.index_count != 0 && cmd.index_buffer_ref != 0 {
                 acc.indexed = Some(IndexedDrawInfo {
-                    index_type: cmd.index_type,
+                    index_type: reims_vgpu_protocol::decode_index_type(cmd.index_type),
                     index_count: cmd.index_count,
                     index_buffer_ref: cmd.index_buffer_ref,
                     index_buffer_offset: cmd.index_buffer_offset,
+                    index_start: 0,
                     base_vertex: cmd.base_vertex,
                 });
             } else {
@@ -2171,12 +2817,12 @@ fn handle_render_record<M: HostMemory + HostOps>(
                 acc.dropped_zero_count = acc.dropped_zero_count.saturating_add(1);
             } else {
                 match acc.bind_snapshot() {
-                    Ok(snapshot) => acc.draws.push(PendingDraw {
+                    Ok(snapshot) => acc.push_draw(PendingDraw {
                         pipeline_ref: acc.pipeline_ref,
                         draw: DrawArgs {
                             vertex_count: count,
                             instance_count: cmd.instance_count,
-                            primitive_type: cmd.primitive_type,
+                            primitive_topology,
                             first_vertex: cmd.vertex_start,
                             base_instance: cmd.base_instance,
                         },
@@ -2191,13 +2837,22 @@ fn handle_render_record<M: HostMemory + HostOps>(
                 note_unnamed_icb_execute(task_id, &cmd);
                 return;
             }
-            acc.execute_icb.push(RenderIcbExecute {
+            let inherited = match acc.bind_snapshot() {
+                Ok(snapshot) => snapshot,
+                Err(over) => {
+                    out.render_icb_fail = out.render_icb_fail.saturating_add(1);
+                    note_draw_refused(over, acc.pipeline_ref, "icb_execute");
+                    return;
+                }
+            };
+            acc.push_icb(RenderIcbExecute {
                 icb_ref: cmd.indirect_command_buffer_ref,
                 is_range: cmd.icb_is_range,
                 range_location: cmd.icb_range_location,
                 range_length: cmd.icb_range_length,
                 args_buffer_ref: cmd.icb_args_buffer_ref,
                 args_buffer_offset: cmd.icb_args_buffer_offset,
+                inherited,
             });
         }
         RenderKind::Fence => {
@@ -2244,24 +2899,12 @@ fn handle_render_record<M: HostMemory + HostOps>(
             // we never invent semantics for it.
             note_unimplemented_render_opcode(cmd.opcode, cmd_bytes, task_id, acc);
         }
-        // Two kinds the product answers by doing nothing, counted separately.
-        // They used to fall into the catch-all below, which made them
-        // indistinguishable from a record that was handled — and unlike a
-        // `SetBuffer` these carry ordering and lifetime the guest expects us to
-        // honour, so silence was the wrong answer even though doing nothing is
-        // the right one.
-        //
-        // The arguments are the compute rail's, which reached the same two
-        // conclusions first (`compute_noop_residency_hint`,
-        // `compute_noop_barrier`). Residency: `useResource:`/`useHeap:` are
-        // hints for a driver that pages resources, and this product resolves
-        // every binding per draw, so there is nothing for them to keep
-        // resident. Barriers: the render rail submits and waits at pass
-        // granularity, so a barrier inside the pass is implied by the boundary.
-        //
-        // These counters exist to price those arguments rather than to doubt
-        // them. A large residency count is the cost of resolving per draw; a
-        // large barrier count is what the pass-granularity submit is buying.
+        // Residency declarations are the one kind the product answers by doing
+        // nothing. They used to fall into the catch-all below, which made them
+        // indistinguishable from a record that was handled. `useResource:` and
+        // `useHeap:` are hints for a driver that pages resources, while this
+        // product resolves every binding per draw, so there is nothing for the
+        // records to keep resident. The counter prices that repeated resolving.
         // The render states this rail decodes and does not apply. Each reports
         // only when the guest asked for something *other* than the API default,
         // because asking for the default is asking for what we already do — so
@@ -2283,31 +2926,41 @@ fn handle_render_record<M: HostMemory + HostOps>(
             // asking for Fill, and dropping the second record would leave the
             // rest of the pass wireframed.
             //
-            // The ordinal is carried raw and translated per backend, the way
-            // `cull_mode` and `front_facing` beside it are: only the backend
-            // knows whether the host can spell the answer, so only the backend
-            // can refuse by name.
-            let slot = match cmd.opcode {
-                wire_render::OPCODE_SET_TRIANGLE_FILL_MODE => &mut acc.fill_mode,
-                _ => &mut acc.depth_clip_mode,
-            };
-            // The record's field is 64-bit and the ordinals are small, but a
-            // guest writes what it likes. `u32::MAX` is not a value of either
-            // Metal enum, so a wide word reaches the backend as an
-            // out-of-contract value that says its own name, rather than as its
-            // own low half — which for a multiple of 2^32 would be the
-            // *default*, the one answer that renders with nothing in the log.
-            *slot = Some(u32::try_from(cmd.mode).unwrap_or(u32::MAX));
+            if cmd.opcode == wire_render::OPCODE_SET_TRIANGLE_FILL_MODE {
+                match u32::try_from(cmd.mode)
+                    .ok()
+                    .and_then(|raw| reims_vgpu_protocol::fill_mode(raw).ok())
+                {
+                    Some(mode) => acc.raster.fill_mode = Ok(mode),
+                    None => {
+                        acc.raster.fill_mode = Err(RasterStateRefusal {
+                            field: RasterStateField::FillMode,
+                            raw: cmd.mode,
+                        });
+                    }
+                }
+            } else {
+                match u32::try_from(cmd.mode)
+                    .ok()
+                    .and_then(|raw| reims_vgpu_protocol::depth_clip_mode(raw).ok())
+                {
+                    Some(mode) => acc.raster.depth_clip_mode = Ok(mode),
+                    None => {
+                        acc.raster.depth_clip_mode = Err(RasterStateRefusal {
+                            field: RasterStateField::DepthClipMode,
+                            raw: cmd.mode,
+                        });
+                    }
+                }
+            }
         }
         RenderKind::SetFloatState => {
-            // Both default to 1.0. Compared exactly rather than with a
-            // tolerance: the guest wrote a literal and the question is whether
-            // it wrote *the* literal, not whether it is close to it.
-            if cmd.float_value != 1.0 {
-                crate::runtime::drain::note_store_route(match cmd.opcode {
-                    wire_render::OPCODE_SET_LINE_WIDTH => "render_line_width_dropped",
-                    _ => "render_tessellation_scale_dropped",
-                });
+            if cmd.opcode == wire_render::OPCODE_SET_LINE_WIDTH {
+                acc.raster.line_width = reims_vgpu_core::LineWidth::from_f32(cmd.float_value);
+            } else if cmd.float_value != 1.0 {
+                // Tessellation scale remains outside the implemented primitive
+                // domain. Keep the loss named until tessellation itself exists.
+                crate::runtime::drain::note_store_route("render_tessellation_scale_dropped");
             }
         }
         RenderKind::SetStoreAction => {
@@ -2408,10 +3061,7 @@ fn handle_render_record<M: HostMemory + HostOps>(
             // the backend as an out-of-contract value that says its own name,
             // the same treatment `fill_mode` gives its ordinal, rather than as
             // its own low half.
-            acc.visibility = (cmd.mode != 0).then(|| draw::VisibilityArming {
-                mode: u32::try_from(cmd.mode).unwrap_or(u32::MAX),
-                offset: cmd.visibility_result_offset,
-            });
+            acc.visibility.set(cmd.mode, cmd.visibility_result_offset);
         }
         RenderKind::DrawIndirect => {
             execute_indirect_draw(state, host, task_id, &cmd, acc);
@@ -2419,8 +3069,19 @@ fn handle_render_record<M: HostMemory + HostOps>(
         RenderKind::UseResource | RenderKind::UseHeap => {
             crate::runtime::drain::note_store_route("render_noop_residency_hint");
         }
-        RenderKind::Barrier => {
-            crate::runtime::drain::note_store_route("render_noop_barrier");
+        RenderKind::BarrierResources | RenderKind::BarrierScope | RenderKind::TextureBarrier => {
+            // A render barrier orders following fragment reads after preceding
+            // draw writes, including reads of a render target. Draws can remain
+            // in one deferred backend batch, so the tranche tail is not a
+            // boundary here. Retain the exact draw position so finish_stream
+            // submits the batch there; the backend queue orders the next draw
+            // after it and reopening the continued pass LOADs the content it
+            // produced.
+            // This is deliberately stronger than a resource/scope-qualified
+            // barrier, but it preserves the guest-visible ordering without
+            // reconstructing a narrower answer from unrelated state.
+            acc.push_barrier();
+            crate::runtime::drain::note_store_route("render_barrier_submission_boundary");
         }
         // The tile-shader family. Nine opcodes that used to reach
         // `OtherAccepted` together, split here into the three different things
@@ -2602,9 +3263,8 @@ use crate::runtime::draw::BindTableClass as BindClass;
 /// dropped here cannot come from a conforming Apple stream in any class — but
 /// what a reading would *mean* still differs by class:
 ///
-/// * **Texture** — the bound is Apple's whole 128-entry table. It was 32, the
-///   width of a descriptor binding band, and slots 32..127 were guest work with
-///   nowhere to go until `spirv_bind::widen_sampled_bands` closed the gap.
+/// * **Texture** — the bound is Apple's whole 128-entry table. metal2vulkan's
+///   reflected descriptor layout has a matching 128-entry texture range.
 /// * **Buffer** — 31 is exactly the serializer's own buffer bound, with no
 ///   margin at all, so a non-zero reading is either a guest writing its own
 ///   stream or a decode that mis-sized the table.
@@ -2615,7 +3275,13 @@ use crate::runtime::draw::BindTableClass as BindClass;
 /// table to widen, which is the whole reason the counter exists. Splitting it is
 /// the same lesson `BlitEncoderSPI` taught one layer up — a family is not
 /// uniform in what its loss means.
-impl BindClass {
+trait BindClassCensus {
+    fn past_table_route(self) -> &'static str;
+    fn apple_table(self) -> u32;
+    fn reach_route(self, reach: u32) -> &'static str;
+}
+
+impl BindClassCensus for BindClass {
     /// The census name for slots this class lost to [`BindClass::table`].
     ///
     /// Also the `reason=` slug of [`BindSlotPastTable`], deliberately: the two
@@ -2687,7 +3353,7 @@ impl BindClass {
     /// against 31, sampler 32 against 16 — so a record reaching past one is a
     /// record Apple's serializer cannot emit, and `over_table` is a healthy
     /// zero rather than headroom being measured. The texture band that closed
-    /// the last of it lives in [`crate::runtime::spirv_bind`] as `[32,160)`,
+    /// the last of it lives in [`reims_vgpu_vulkan::spirv_bind`] as `[32,160)`,
     /// held there by a `const` assertion that
     /// [`crate::runtime::draw::MAX_TEXTURE_BIND_SLOTS`] reads its value from,
     /// so the two cannot part without failing the build.
@@ -2814,10 +3480,58 @@ fn note_draw_refused(refusal: StreamRefusal, pipeline_ref: u32, site: &'static s
         StreamRefusal::Bind(over) => crate::observe::Emit::decline("render_draw", &over),
         StreamRefusal::Pass(drop) => crate::observe::Emit::decline("render_draw", &drop),
         StreamRefusal::BufferOffset(over) => crate::observe::Emit::decline("render_draw", &over),
+        StreamRefusal::Raster(state) => crate::observe::Emit::decline("render_draw", &state),
+        StreamRefusal::Visibility(state) => crate::observe::Emit::decline("render_draw", &state),
+        StreamRefusal::PassAction(action) => crate::observe::Emit::decline("render_draw", &action),
+        StreamRefusal::PassExtent(extent) => crate::observe::Emit::decline("render_draw", &extent),
     };
     emit.field("site", site)
         .field("pipeline_ref", pipeline_ref)
         .fail_once(refusal.latch());
+}
+
+fn note_attachment_plan_refused(
+    refusal: &reims_vgpu_core::AttachmentPlanDecline,
+    task_id: u32,
+    pipeline_ref: u32,
+    site: &'static str,
+) {
+    use crate::observe::Decline;
+
+    crate::runtime::drain::note_store_route("render_attachment_plan_refused");
+    let key = refusal.latch() ^ u64::from(pipeline_ref).rotate_left(17);
+    if crate::observe::first_sight(refusal.slug(), key) {
+        crate::observe::Emit::decline("render_attachment_plan", refusal)
+            .field("task_id", task_id)
+            .field("pipeline_ref", pipeline_ref)
+            .field("site", site)
+            .fail();
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PrimitiveTopologyRefusal(reims_vgpu_protocol::PipelineStateDecodeError);
+
+impl crate::observe::Decline for PrimitiveTopologyRefusal {
+    fn slug(&self) -> &'static str {
+        self.0.slug()
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        vec![("raw", self.0.raw().to_string())]
+    }
+}
+
+fn note_primitive_topology_refused(
+    task_id: u32,
+    pipeline_ref: u32,
+    error: reims_vgpu_protocol::PipelineStateDecodeError,
+) {
+    crate::runtime::drain::note_store_route("render_draw_refused_primitive_topology");
+    crate::observe::Emit::decline("render_draw", &PrimitiveTopologyRefusal(error))
+        .field("task", task_id)
+        .field("pipeline_ref", pipeline_ref)
+        .fail_once(u64::from(error.raw()));
 }
 
 impl StreamRefusal {
@@ -2835,6 +3549,27 @@ impl StreamRefusal {
             Self::BufferOffset(over) => {
                 1 << 62 | (u64::from(over.stage as u32) << 32) | u64::from(over.index)
             }
+            Self::Raster(state) => {
+                (1 << 61) | (u64::from(state.field as u8) << 56) | (state.raw & ((1 << 56) - 1))
+            }
+            Self::Visibility(state) => (1 << 60) | (state.raw & ((1 << 60) - 1)),
+            Self::PassAction(action) => {
+                (1 << 59)
+                    | (match action.aspect {
+                        "color" => 0,
+                        "depth" => 1u64 << 56,
+                        "stencil" => 2u64 << 56,
+                        _ => 3u64 << 56,
+                    })
+                    | (u64::from(action.action as u8) << 58)
+                    | (u64::from(action.slot) << 16)
+                    | u64::from(action.raw)
+            }
+            Self::PassExtent(extent) => {
+                (1 << 55)
+                    | (u64::from(extent.axis == "height") << 54)
+                    | (extent.raw & ((1 << 54) - 1))
+            }
         }
     }
 }
@@ -2846,34 +3581,16 @@ impl StreamRefusal {
 // re-point what the census means, so this is a build gate rather than a test —
 // the same reason `reims_vgpu_wire::Wire::ASSERT_ALIGN_1` is one.
 //
-// Textures: the bound IS Apple's table now, so no texture bind an Apple guest
-// can emit is refused. This used to be `>`, and the gap it recorded — slots
-// 32..127, dropped because the descriptor binding band was 32 wide — is what
-// `spirv_bind::widen_sampled_bands` closed. A `<` here would mean this device
-// accepts a slot it cannot name; a `>` would mean the gap is back.
+// Textures: the bound is Apple's table, so no texture bind an Apple guest can
+// emit is refused. A mismatch would desynchronize guest argument slots from the
+// translator's reflected 128-entry texture range.
 const _: () = assert!(reims_vgpu_wire::ops::bind_limit::TEXTURE == MAX_TEXTURE_BIND_SLOTS);
-// Buffers: two independent derivations of one table size — Apple's serializer
-// truncates there and Metal's `REIMS_VGPU_METAL_MAX_BUFFERS` stops there.
+// Buffers: the bound is Apple's serializer table size.
 const _: () = assert!(reims_vgpu_wire::ops::bind_limit::BUFFER == MAX_BUFFER_BIND_SLOTS);
 // Samplers: Apple truncates well below the bound, so this slug cannot fire on a
 // stream Apple's serializer wrote. A reading is a guest writing its own stream,
 // or a decode that mis-sized the table.
 const _: () = assert!(reims_vgpu_wire::ops::bind_limit::SAMPLER < MAX_SAMPLER_BIND_SLOTS);
-// The two band bounds are the *encoding's*, so they must stay equal to the
-// distance between the bands they name. A texture index at
-// `MAX_TEXTURE_BIND_SLOTS` would carry sampler 0's descriptor binding, and a
-// sampler index at `MAX_SAMPLER_BIND_SLOTS` would carry the first ColorInput's;
-// either collision is silent, because a flat binding number cannot say which
-// class wrote it.
-const _: () = assert!(
-    crate::runtime::spirv_bind::TEXTURE_BINDING_BASE + MAX_TEXTURE_BIND_SLOTS
-        == crate::runtime::spirv_bind::SAMPLER_BINDING_BASE
-);
-const _: () = assert!(
-    crate::runtime::spirv_bind::SAMPLER_BINDING_BASE + MAX_SAMPLER_BIND_SLOTS
-        == crate::runtime::spirv_bind::COLOR_INPUT_BINDING_BASE
-);
-
 /// Which bind table a record names: the stage picks vertex or fragment, the
 /// class picks buffer, texture or sampler.
 ///
@@ -2928,6 +3645,137 @@ enum StreamRefusal {
     /// different records with different counters, and sharing one would put two
     /// checks behind one `reason=` slug and one `fail_once` latch.
     BufferOffset(BufferOffsetSlotPastTable),
+    /// A sticky raster-state setter carried an ordinal outside its Metal enum.
+    /// Every later draw reads that state, so none may substitute the API
+    /// default until another valid setter replaces it.
+    Raster(RasterStateRefusal),
+    /// A sticky visibility-query setter carried an ordinal outside its Metal
+    /// enum. It remains invalid until a later setter replaces it, just like
+    /// the raster fields above.
+    Visibility(VisibilityStateRefusal),
+    /// A pass attachment's load or store action is outside its declared enum.
+    /// This also covers store-action overrides applied after the pass record.
+    PassAction(PassActionRefusal),
+    /// A non-zero pass raster dimension that cannot be represented by the
+    /// backend-independent image geometry.
+    PassExtent(PassExtentRefusal),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PassExtentRefusal {
+    axis: &'static str,
+    raw: u64,
+}
+
+impl crate::observe::Decline for PassExtentRefusal {
+    fn slug(&self) -> &'static str {
+        "render_target_extent_unrepresentable"
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        vec![("axis", self.axis.into()), ("raw", self.raw.to_string())]
+    }
+}
+
+fn render_target_extent(
+    width: u64,
+    height: u64,
+) -> Result<reims_vgpu_core::RenderTargetExtent, PassExtentRefusal> {
+    fn axis(
+        name: &'static str,
+        raw: u64,
+    ) -> Result<Option<std::num::NonZeroU32>, PassExtentRefusal> {
+        if raw == 0 {
+            return Ok(None);
+        }
+        u32::try_from(raw)
+            .ok()
+            .and_then(std::num::NonZeroU32::new)
+            .map(Some)
+            .ok_or(PassExtentRefusal { axis: name, raw })
+    }
+
+    Ok(reims_vgpu_core::RenderTargetExtent {
+        width: axis("width", width)?,
+        height: axis("height", height)?,
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+enum RasterStateField {
+    CullMode,
+    FrontFacing,
+    FillMode,
+    DepthClipMode,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RasterStateRefusal {
+    field: RasterStateField,
+    raw: u64,
+}
+
+impl crate::observe::Decline for RasterStateRefusal {
+    fn slug(&self) -> &'static str {
+        match self.field {
+            RasterStateField::CullMode => "unknown_cull_mode",
+            RasterStateField::FrontFacing => "unknown_winding",
+            RasterStateField::FillMode => "unknown_fill_mode",
+            RasterStateField::DepthClipMode => "unknown_depth_clip_mode",
+        }
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        vec![("raw", self.raw.to_string())]
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct VisibilityStateRefusal {
+    raw: u64,
+}
+
+impl crate::observe::Decline for VisibilityStateRefusal {
+    fn slug(&self) -> &'static str {
+        "unknown_visibility_result_mode"
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        vec![("raw", self.raw.to_string())]
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+enum PassActionKind {
+    Load,
+    Store,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PassActionRefusal {
+    aspect: &'static str,
+    slot: u32,
+    action: PassActionKind,
+    raw: u16,
+}
+
+impl crate::observe::Decline for PassActionRefusal {
+    fn slug(&self) -> &'static str {
+        match self.action {
+            PassActionKind::Load => "load_action_unmapped",
+            PassActionKind::Store => "store_action_unmapped",
+        }
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        vec![
+            ("aspect", self.aspect.into()),
+            ("slot", self.slot.to_string()),
+            ("raw", self.raw.to_string()),
+        ]
+    }
 }
 
 /// A `SetBufferOffset` record naming a slot the buffer table does not have.
@@ -2997,7 +3845,7 @@ struct BindTables<'a, B> {
 ///
 /// `make` builds the bind for a live slot and returns `None` for the zero ref,
 /// which keeps the ref field's name — and any side registration, such as the
-/// texture arm's type-11 mapping list — with the caller. The clear count comes
+/// texture arm's IOSurface texture mapping list — with the caller. The clear count comes
 /// back as a return value rather than through an `&mut` counter so `make` can
 /// hold the rest of `ExecResult`.
 fn apply_binds<T: Copy, B: Clone>(
@@ -3088,6 +3936,13 @@ fn apply_binds<T: Copy, B: Clone>(
             break;
         }
         let bind = make(index, entry);
+        // `Arc::make_mut` copies here whenever the table is shared, which it is
+        // for the first bind record after every draw -- `bind_snapshot` clones all
+        // six tables. That reads like copy-on-write thrash and was measured on a
+        // driven fullscreen Maps boot: 2.74 calls a draw, 1.10 of them copying,
+        // and **2.9 elements per copy**. The tables hold about three entries, so
+        // the whole cost is ~3 element copies a draw. Not a lever; do not spend a
+        // boot on it again.
         let list = match stage {
             Stage::Vertex => Arc::make_mut(vertex),
             Stage::Fragment => Arc::make_mut(fragment),
@@ -3111,8 +3966,285 @@ fn apply_binds<T: Copy, B: Clone>(
     cleared
 }
 
+#[derive(Debug, Default)]
+struct ExpandedRenderWork {
+    draws: Vec<PendingDraw>,
+    barriers_after_draw: Vec<usize>,
+}
+
+fn render_icb_refusal(
+    out: &mut ExecResult,
+    icb_ref: u32,
+    command_index: Option<u32>,
+    refusal: crate::runtime::icb::IcbStatus,
+) {
+    out.render_icb_fail = out.render_icb_fail.saturating_add(1);
+    let key = (u64::from(icb_ref) << 32) | u64::from(command_index.unwrap_or(u32::MAX));
+    let mut emit = crate::observe::Emit::decline("render_icb", &refusal).field("icb_ref", icb_ref);
+    if let Some(index) = command_index {
+        emit = emit.field("command_index", index);
+    }
+    emit.fail_once(key);
+}
+
+fn icb_u32(value: u64, slug: &'static str) -> Result<u32, crate::runtime::icb::IcbStatus> {
+    u32::try_from(value).map_err(|_| crate::runtime::icb::IcbStatus::Args(slug))
+}
+
+fn pending_draw_from_icb<M: HostMemory + HostOps>(
+    state: &Device,
+    host: &M,
+    task_id: u32,
+    execute: &RenderIcbExecute,
+    descriptor: &reims_vgpu_protocol::IndirectCommandBufferDescriptor,
+    fill: crate::runtime::icb::IcbRenderFill,
+) -> Result<Option<PendingDraw>, crate::runtime::icb::IcbStatus> {
+    use crate::runtime::icb::{IcbRenderBindStage, IcbRenderDraw, IcbStatus};
+
+    if !fill.object_threadgroup_memory.is_empty() {
+        return Err(IcbStatus::Unsupported(
+            "render_icb_object_threadgroup_memory_unimplemented",
+        ));
+    }
+    let mut draw = execute.inherited.clone();
+    draw.icb_ref = Some(execute.icb_ref);
+    if descriptor.inherit_pipeline_state() && fill.pipeline_ref != 0 {
+        return Err(IcbStatus::Args("render_icb_inherited_pipeline_ref_nonzero"));
+    }
+    draw.pipeline_ref = if descriptor.inherit_pipeline_state() {
+        execute.inherited.pipeline_ref
+    } else {
+        fill.pipeline_ref
+    };
+    if draw.pipeline_ref == 0 {
+        return Err(IcbStatus::Missing("render_icb_pipeline_ref_zero"));
+    }
+
+    if !descriptor.inherit_buffers() {
+        let mut vertex = Vec::new();
+        let mut fragment = Vec::new();
+        for bind in fill.buffers {
+            let table = match bind.effective_stage() {
+                IcbRenderBindStage::Vertex => &mut vertex,
+                IcbRenderBindStage::Fragment => &mut fragment,
+                IcbRenderBindStage::Object | IcbRenderBindStage::Mesh => {
+                    return Err(IcbStatus::Unsupported(
+                        "render_icb_object_mesh_buffer_unimplemented",
+                    ));
+                }
+            };
+            table.push(BufferBind {
+                index: bind.index,
+                buffer_ref: bind.buffer_ref,
+                resource: objects::resolve_resource(state, host, task_id, bind.buffer_ref).ok(),
+                offset: bind.offset,
+                attribute_stride: bind.has_attribute_stride.then_some(bind.attribute_stride),
+            });
+        }
+        draw.vertex_buffers = Arc::new(vertex);
+        draw.fragment_buffers = Arc::new(fragment);
+    }
+
+    match fill.draw {
+        IcbRenderDraw::Primitives {
+            primitive_type,
+            vertex_start,
+            vertex_count,
+            instance_count,
+            base_instance,
+        } => {
+            if vertex_count == 0 || instance_count == 0 {
+                return Ok(None);
+            }
+            draw.draw = DrawArgs {
+                vertex_count: icb_u32(vertex_count, "render_icb_vertex_count_too_wide")?,
+                instance_count: icb_u32(instance_count, "render_icb_instance_count_too_wide")?,
+                primitive_topology: reims_vgpu_protocol::primitive_topology(u32::from(
+                    primitive_type,
+                ))
+                .map_err(|_| IcbStatus::Args("render_icb_primitive_type_invalid"))?,
+                first_vertex: icb_u32(vertex_start, "render_icb_vertex_start_too_wide")?,
+                base_instance: icb_u32(base_instance, "render_icb_base_instance_too_wide")?,
+            };
+            draw.indexed = None;
+        }
+        IcbRenderDraw::Indexed {
+            primitive_type,
+            index_type,
+            index_buffer_ref,
+            index_count,
+            index_buffer_offset,
+            instance_count,
+            base_vertex,
+            base_instance,
+            ..
+        } => {
+            if index_count == 0 || instance_count == 0 {
+                return Ok(None);
+            }
+            let count = icb_u32(index_count, "render_icb_index_count_too_wide")?;
+            draw.draw = DrawArgs {
+                vertex_count: count,
+                instance_count: icb_u32(instance_count, "render_icb_instance_count_too_wide")?,
+                primitive_topology: reims_vgpu_protocol::primitive_topology(u32::from(
+                    primitive_type,
+                ))
+                .map_err(|_| IcbStatus::Args("render_icb_primitive_type_invalid"))?,
+                first_vertex: 0,
+                base_instance: icb_u32(base_instance, "render_icb_base_instance_too_wide")?,
+            };
+            draw.indexed = Some(IndexedDrawInfo {
+                index_type: reims_vgpu_protocol::decode_index_type(u32::from(index_type)),
+                index_count: count,
+                index_buffer_ref,
+                index_buffer_offset,
+                index_start: 0,
+                base_vertex,
+            });
+        }
+        IcbRenderDraw::Patches { .. } | IcbRenderDraw::IndexedPatches { .. } => {
+            return Err(IcbStatus::Unsupported(
+                "render_icb_tessellation_draw_unimplemented",
+            ));
+        }
+        IcbRenderDraw::MeshThreads(_) | IcbRenderDraw::MeshThreadgroups(_) => {
+            return Err(IcbStatus::Unsupported("render_icb_mesh_draw_unimplemented"));
+        }
+    }
+    Ok(Some(draw))
+}
+
+fn expand_render_work<M: HostMemory + HostOps>(
+    state: &Device,
+    host: &M,
+    task_id: u32,
+    out: &mut ExecResult,
+    acc: &StreamAccum,
+) -> ExpandedRenderWork {
+    use crate::runtime::icb::IcbCommandFill;
+
+    let mut expanded = ExpandedRenderWork::default();
+    for work in &acc.render_work {
+        match *work {
+            RenderWork::Draw(index) => {
+                if let Some(draw) = acc.draws.get(index) {
+                    expanded.draws.push(draw.clone());
+                }
+            }
+            RenderWork::Barrier => expanded.barriers_after_draw.push(expanded.draws.len()),
+            RenderWork::ExecuteIcb(index) => {
+                let Some(execute) = acc.execute_icb.get(index) else {
+                    continue;
+                };
+                crate::runtime::drain::note_store_route("icb_exec_seen");
+                let (location, length) = if execute.is_range {
+                    (execute.range_location, execute.range_length)
+                } else {
+                    let Some(range) = read_icb_exec_range(
+                        state,
+                        host,
+                        task_id,
+                        execute.args_buffer_ref,
+                        execute.args_buffer_offset,
+                    ) else {
+                        render_icb_refusal(
+                            out,
+                            execute.icb_ref,
+                            None,
+                            crate::runtime::icb::IcbStatus::Missing("render_icb_exec_range_read"),
+                        );
+                        continue;
+                    };
+                    range
+                };
+                let Some(record) = state
+                    .task_objects
+                    .indirect_command_buffers
+                    .snapshot(task_id, execute.icb_ref)
+                else {
+                    render_icb_refusal(
+                        out,
+                        execute.icb_ref,
+                        None,
+                        crate::runtime::icb::IcbStatus::Missing("render_icb_not_registered"),
+                    );
+                    continue;
+                };
+                let fills = match crate::runtime::icb::decode_icb_command_range(
+                    state,
+                    host,
+                    task_id,
+                    execute.icb_ref,
+                    location,
+                    length,
+                ) {
+                    Ok(fills) => fills,
+                    Err(refusal) => {
+                        render_icb_refusal(out, execute.icb_ref, None, refusal);
+                        continue;
+                    }
+                };
+                for fill in fills {
+                    match fill {
+                        IcbCommandFill::Render(fill) => {
+                            let command_index = fill.command_index;
+                            match pending_draw_from_icb(
+                                state,
+                                host,
+                                task_id,
+                                execute,
+                                &record.descriptor,
+                                fill,
+                            ) {
+                                Ok(Some(draw)) => expanded.draws.push(draw),
+                                Ok(None) => {}
+                                Err(refusal) => render_icb_refusal(
+                                    out,
+                                    execute.icb_ref,
+                                    Some(command_index),
+                                    refusal,
+                                ),
+                            }
+                        }
+                        IcbCommandFill::Compute(fill) => render_icb_refusal(
+                            out,
+                            execute.icb_ref,
+                            Some(fill.command_index),
+                            crate::runtime::icb::IcbStatus::Unsupported(
+                                "render_icb_compute_command_in_render_encoder",
+                            ),
+                        ),
+                    }
+                }
+            }
+        }
+    }
+    expanded
+}
+
+/// Submit every recorded render barrier at or before one draw position.
+///
+/// Positions are appended while the wire is walked, so they are sorted. The
+/// cursor makes each command effective exactly once, including consecutive and
+/// trailing barriers. `<=` also preserves ordering after an earlier draw
+/// refusal skips directly to the chain tail.
+fn flush_render_barriers_at(
+    state: &Device,
+    positions: &[usize],
+    cursor: &mut usize,
+    draw_position: usize,
+) {
+    while positions
+        .get(*cursor)
+        .is_some_and(|position| *position <= draw_position)
+    {
+        state.executor.flush_submission_tail();
+        *cursor += 1;
+    }
+}
+
 fn finish_stream<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut M,
     task_id: u32,
     out: &mut ExecResult,
@@ -3122,13 +4254,14 @@ fn finish_stream<M: HostMemory + HostOps>(
     // drops, so the six tile this function rather than sampling it. See
     // [`finish_phase`] for what the split is for.
     let mut fin = finish_phase::FinishTimer::open();
-    note_stream_draw_drops(task_id, acc);
     // Archive ApplePVGPUDrawJob: clear/load seed is private initial_rgba for the
     // async job; guest pages are written once at completion. Apply clear-to-guest
     // only for clear-only streams (no draws). When draws run, CLEAR is the Metal
     // pass seed inside encode (mrt_draw_request solid seed) — not a pre-draw
     // guest store that would expose intermediate pixels to DisplaySwap.
-    let will_draw = acc.saw_draw && !acc.color_slots.is_empty() && !acc.draws.is_empty();
+    let expanded = expand_render_work(state, host, task_id, out, acc);
+    note_stream_draw_drops(task_id, acc, expanded.draws.len());
+    let will_draw = !acc.color_slots.is_empty() && !expanded.draws.is_empty();
     if !will_draw {
         for att in acc.clears_reaching_guest_pages() {
             if apply_clear(state, host, task_id, att) {
@@ -3137,201 +4270,7 @@ fn finish_stream<M: HostMemory + HostOps>(
         }
     }
 
-    // Render ICB execute (`0x14`/`0x15`) — open pass over color slots and run ICB.
-    // Counted in FRONT of every gate below, because the only always-on report
-    // of this rail (`exec_summary`'s `icb_ok`/`icb_fail`) is emitted solely for
-    // packets that already failed, so an ICB that succeeds is invisible there
-    // and the whole rail reads as "never runs". This says how often the decoded
-    // stream asks for one at all, which is the denominator `runtime/icb`
-    // (2818 product lines) has never had.
-    //
-    // # Measured absent on three driven x86 / Vulkan boots
-    //
-    // The third is the one that carries the weight, because the first two were
-    // compositing-only and could not tell "the guest does not use ICB" from
-    // "this workload never reaches Metal":
-    //
-    //   1. Wikipedia + apple.com + System Settings, three title-bar drags.
-    //   2. apple.com, four page-downs.
-    //   3. Chess (SceneKit 3D) + Maps + the WebGL aquarium rendering live —
-    //      **66 512 draws** and 74.9 ms of `compute_us` across the boot.
-    //
-    // `icb_exec_seen`, `compute_icb_seen` and `compute_ctrl_seen` are all absent
-    // from every one. Across the whole accumulated fail log the subsystem has
-    // never emitted a line of its own either (every "icb" string in it is a
-    // field *name* on an `exec_summary` line).
-    //
-    // **This is still not a licence to delete `runtime/icb`, and the precedent
-    // that settles it is `ffe31d4`**: `mrt_draw_multi` also measured zero, and
-    // that session kept MRT *rendering* because it is decoded contract, cutting
-    // only the speculative sampling side-map built around it.
-    // `ExecuteCommandsInBuffer` is likewise a real Metal opcode in the decoded
-    // stream — a guest that issues one against a decoder we deleted loses work
-    // silently, which is the one outcome the ground rules forbid outright. What
-    // the reading does license is scrutiny of any layer built *around* the
-    // decode on speculation rather than on decoded fields.
-    //
-    // arm64 is unmeasured; these are x86 / Vulkan readings only.
-    //
-    // # A stream may ask for several, and every one of them runs
-    //
-    // `executeCommandsInBuffer:` is not a state a later record replaces — it is
-    // work, and Metal's ordinary ICB shape is one buffer per object batch, so
-    // several in one encoder is the expected case rather than the odd one.
-    // This used to be an `Option` assigned with `=`, which made the stream's
-    // capacity for them **one**: a second record overwrote the first and the
-    // first's commands never ran, with no counter and no line. That is a bound
-    // with no constant to name it, which is why none of the five bound scans
-    // could see it.
-    //
-    // The list is bounded by the stream the way [`StreamDrawDrop`] describes
-    // for `draws`: a record has a minimum encoded length, so the count cannot
-    // exceed the stream bytes already in memory.
-    //
-    // Records 2+ open their pass with `MTL_LOAD_ACTION_LOAD` and no clears.
-    // Each execute writes back before the next builds its request, so the LOAD
-    // seed is the previous execute's output — the clear belongs to the pass,
-    // which began at the first one, and re-running it would wipe what the ICB
-    // before it drew.
-    for (icb_index, exec) in acc.execute_icb.iter().enumerate() {
-        crate::runtime::drain::note_store_route("icb_exec_seen");
-        if !acc.color_slots.is_empty() {
-            // `mrt_draw_request` gates on a non-zero pipeline ref, and an
-            // ICB-only execute has none in the stream — its PSO lives inside
-            // the filled slots — so 1 stands in and only the colour list is
-            // taken. That case also takes the default single-triangle geometry
-            // rather than the stream's last draw, because the ICB carries its
-            // own. Otherwise the last pass's geometry describes the pass this
-            // ICB runs inside.
-            let (pipeline, args) = if acc.pipeline_ref != 0 {
-                let args = acc.draws.last().map_or(
-                    DrawArgs {
-                        vertex_count: 1,
-                        instance_count: 1,
-                        primitive_type: 3,
-                        first_vertex: 0,
-                        base_instance: 0,
-                    },
-                    |pd| pd.draw,
-                );
-                (acc.pipeline_ref, args)
-            } else {
-                (
-                    1,
-                    DrawArgs {
-                        vertex_count: 1,
-                        instance_count: 1,
-                        primitive_type: 3,
-                        first_vertex: 0,
-                        base_instance: 0,
-                    },
-                )
-            };
-            // The first execute opens the pass, so it takes the stream's load
-            // actions and its clears. Every later one composites onto what the
-            // pass already holds.
-            let loading_slots;
-            let (slots, clears): (&[(u32, ColorAttachment)], &[ColorAttachment]) = if icb_index == 0
-            {
-                (&acc.color_slots, &acc.clears)
-            } else {
-                loading_slots = color_slots_loading(&acc.color_slots);
-                (&loading_slots, &[])
-            };
-            let req = draw::mrt_draw_request(state, host, task_id, pipeline, slots, clears, args);
-            // ICB execute inherits stream bind state at end of stream, and both
-            // branches below inherit the same six tables — the last draw's
-            // snapshot is those tables as they stood when it was recorded, and
-            // nothing between then and here can have refilled a slot the walk
-            // refused. So a bind the tables could not hold is asked about once,
-            // ahead of both, rather than only on the second branch.
-            let inherited = acc.bind_snapshot();
-            if let Err(over) = inherited {
-                out.render_icb_fail += 1;
-                note_draw_refused(over, pipeline, "icb_execute");
-            } else if let (Some(mut req), Ok(snapshot)) = (req, inherited) {
-                if let Some(pd) = acc.draws.last() {
-                    fill_draw_binds_from_pending(&mut req, pd);
-                } else {
-                    fill_draw_binds_from_pending(&mut req, &snapshot);
-                }
-                let (loc, len) = if exec.is_range {
-                    (exec.range_location, exec.range_length)
-                } else {
-                    // Indirect: stage 8-byte range from guest buffer.
-                    match read_icb_exec_range(
-                        state,
-                        host,
-                        task_id,
-                        exec.args_buffer_ref,
-                        exec.args_buffer_offset,
-                    ) {
-                        Some(v) => v,
-                        None => {
-                            // Sibling ICB arms all log; this one only bumped the
-                            // counter (ICB audit) — name the reason.
-                            crate::observe::fail(format!(
-                                "render_icb fail reason=exec_range_read args_ref={} args_off={}",
-                                exec.args_buffer_ref, exec.args_buffer_offset
-                            ));
-                            out.render_icb_fail += 1;
-                            dirty_color_targets(state, host, task_id, &acc.color_targets);
-                            // `continue`, not `return`. One execute whose range
-                            // could not be read is one execute lost; it says
-                            // nothing about the next one's args buffer, and it
-                            // used to abandon the whole packet — including the
-                            // stream's own draws below — because there could
-                            // only ever be one of these.
-                            continue;
-                        }
-                    }
-                };
-                match draw::encode_icb_execute_and_writeback(
-                    state,
-                    host,
-                    &req,
-                    exec.icb_ref,
-                    loc,
-                    len,
-                ) {
-                    EncodeStatus::Ok => {
-                        crate::runtime::drain::note_store_route("icb_exec_ok");
-                        out.render_icb_ok += 1;
-                    }
-                    st => {
-                        out.render_icb_fail += 1;
-                        // Was `st={st:?}` — the variant, Debug-rendered, with no
-                        // `reason=` at all, so ten distinct checks in
-                        // `encode_icb_execute_and_writeback` (plus every ICB
-                        // refusal forwarded into it) shared four names and none
-                        // of them was greppable. Latched per ICB: the guest
-                        // re-executes the same one every frame.
-                        if let Some(e) = crate::observe::Emit::refusal("render_icb", &st) {
-                            e.field("icb_ref", exec.icb_ref)
-                                .field("loc", loc)
-                                .field("len", len)
-                                .field("colors", acc.color_slots.len())
-                                .fail_once(exec.icb_ref as u64);
-                        }
-                        dirty_color_targets(state, host, task_id, &acc.color_targets);
-                    }
-                }
-            } else {
-                out.render_icb_fail += 1;
-                crate::observe::fail(format!(
-                    "render_icb fail reason=mrt_request icb_ref={} colors={}",
-                    exec.icb_ref,
-                    acc.color_slots.len()
-                ));
-            }
-        } else {
-            out.render_icb_fail += 1;
-            crate::observe::fail("render_icb fail reason=no_color_slots");
-        }
-        // ICB execute is the primary work; still allow a co-recorded draw below if present.
-    }
-
-    if acc.saw_draw && !acc.color_slots.is_empty() && !acc.draws.is_empty() {
+    if !acc.color_slots.is_empty() && !expanded.draws.is_empty() {
         // Archive multi-draw (apple-pv-gpu-exec DrawJob): every honorable draw of
         // one exec packet targets one surface in decode order; the worker threads
         // each record's RGBA output as the next record's initial content; guest
@@ -3339,29 +4278,34 @@ fn finish_stream<M: HostMemory + HostOps>(
         //
         // Chain in-process color0 RGBA8 between encodes (no float16 guest round-
         // trip between draws). Only the last successful encode stores to guest.
-        let draw_list: Vec<&PendingDraw> = acc
-            .draws
-            .iter()
-            .filter(|pd| pd.pipeline_ref != 0 && pd.draw.vertex_count > 0)
-            .collect();
+        // Direct and expanded ICB draws are already in encoder order, with
+        // barrier positions measured against this exact list.
+        let draw_list: Vec<&PendingDraw> = expanded.draws.iter().collect();
+        let mut render_barrier_cursor = 0;
+        flush_render_barriers_at(
+            state,
+            &expanded.barriers_after_draw,
+            &mut render_barrier_cursor,
+            0,
+        );
         let mut chain_rgba: Option<Vec<u8>> = None;
         // Occlusion counts, keyed by the guest byte offset each lands at.
         //
-        // Summed rather than replaced because one Metal counter can span
-        // several draws and every backend here runs one query per draw: Metal
-        // accumulates into the buffer word itself, so the equivalent is the sum
-        // of what each draw passed. Several offsets in one pass are legal and
+        // Summed rather than replaced because the guest counter can span
+        // several draws while Vulkan runs one query per draw. The equivalent is
+        // the sum of what each draw passed. Several offsets in one pass are legal and
         // independent, which is why this is a map and not a scalar.
         let mut visibility_counts: std::collections::BTreeMap<u64, u64> =
             std::collections::BTreeMap::new();
         // Resident render-pass chain: intermediate records keep their content
         // on the engine target (no CPU chain buffer); records 2+ LoadFromTarget.
-        let mut resident_chain = false;
-        let mut saw_nometal = false;
+        let mut resident_chain_identity: Option<crate::model::TargetIdentity> = None;
+        let mut saw_backend_unavailable = false;
         let first_draw = draw_list.first().copied();
+        let mut first_attachment_refusal = None;
         let mut first_req = first_draw.and_then(|pd| {
             out.render_attachment_resolves = out.render_attachment_resolves.saturating_add(1);
-            draw::mrt_draw_request(
+            match draw::mrt_draw_request(
                 state,
                 host,
                 task_id,
@@ -3369,7 +4313,13 @@ fn finish_stream<M: HostMemory + HostOps>(
                 &acc.color_slots,
                 &acc.clears,
                 pd.draw,
-            )
+            ) {
+                Ok(req) => req,
+                Err(refusal) => {
+                    first_attachment_refusal = Some(refusal);
+                    None
+                }
+            }
         });
         // A serialized Metal render stream is one render pass: its attachment
         // descriptors are fixed while pipeline, binds, and draw arguments may
@@ -3378,16 +4328,31 @@ fn finish_stream<M: HostMemory + HostOps>(
         // GVA LOAD seed). The resident target itself preserves record order.
         let attachment_template = first_req.as_ref().map(render_pass_attachment_template);
         if first_draw.is_some() && first_req.is_none() {
-            let refs: Vec<u32> = acc.color_slots.iter().map(|(_, a)| a.texture_ref).collect();
-            crate::observe::fail(format!(
-                "metal_draw mrt_request fail task={task_id} pipe={} slots={refs:?} di=0/{}",
-                first_draw.map(|pd| pd.pipeline_ref).unwrap_or(0),
-                draw_list.len()
-            ));
-            out.metal_draws_fail = out.metal_draws_fail.saturating_add(1);
+            if let Some(refusal) = first_attachment_refusal.as_ref() {
+                note_attachment_plan_refused(
+                    refusal,
+                    task_id,
+                    first_draw.map(|pd| pd.pipeline_ref).unwrap_or(0),
+                    "draw",
+                );
+            } else {
+                let refs: Vec<u32> = acc.color_slots.iter().map(|(_, a)| a.texture_ref).collect();
+                crate::observe::fail(format!(
+                    "draw mrt_request fail task={task_id} pipe={} slots={refs:?} di=0/{}",
+                    first_draw.map(|pd| pd.pipeline_ref).unwrap_or(0),
+                    draw_list.len()
+                ));
+            }
+            out.draws_fail = out.draws_fail.saturating_add(1);
             dirty_color_targets(state, host, task_id, &acc.color_targets);
         }
         for (di, pd) in draw_list.iter().enumerate() {
+            flush_render_barriers_at(
+                state,
+                &expanded.barriers_after_draw,
+                &mut render_barrier_cursor,
+                di,
+            );
             fin.enter(crate::runtime::drain::FinishPhase::Retarget);
             let mut req = if di == 0 {
                 let Some(req) = first_req.take() else {
@@ -3405,32 +4370,36 @@ fn finish_stream<M: HostMemory + HostOps>(
                 fill_draw_binds_from_pending(&mut req, pd);
                 (req.continues_render_pass, req.render_pass_continues) =
                     render_pass_chain_position(di, draw_list.len());
-                // A resident type-11 target carries attachment contents between
+                // A resident IOSurface texture target carries attachment contents between
                 // records without a CPU chain buffer. Like a native Metal render
                 // pass, only the final record performs the guest-visible Store;
                 // importing a full frame after every draw held DeviceInner for
                 // seconds and starved the guest completion/status registers.
-                let unified = req
+                let intermediate_store_is_guest_materialized = req
                     .colors
                     .first()
-                    .map(|c| c.mapping_id != 0)
+                    .map(|c| c.mapping_id() != 0)
                     .unwrap_or(false);
                 // Records 2+ of a chain composite over the prior record: force
                 // loadAction=Load on every color. Leaving the pass action alone
-                // on a type-11 target let a CLEAR re-run before each record,
+                // on an IOSurface texture target let a CLEAR re-run before each record,
                 // wiping the full composite drawn by record 1 (live poison=1:
                 // mid peak 10.9M native → 2.5M after later records).
                 if di > 0 {
                     for c in &mut req.colors {
-                        c.load_action = MTL_LOAD_ACTION_LOAD;
+                        c.load_action = reims_vgpu_protocol::pass_action::LoadAction::Load;
                     }
                     // Chain from the engine resident when available; otherwise
                     // seed from the prior encode output (archive "thread each
-                    // record's output as next initial content"). MoltenVK's
-                    // portability path returns CPU pixels for type-11 mappings,
-                    // so `unified` does not imply that a resident exists.
+                    // record's output as next initial content"). A
+                    // mapping-backed Store reaching guest pages does not imply
+                    // that a resident exists; memory topology is not an input
+                    // to this semantic choice.
                     // Moved, not cloned (multi-MiB).
-                    match multi_draw_chain_source(resident_chain, chain_rgba.is_some()) {
+                    match multi_draw_chain_source(
+                        resident_chain_identity.is_some(),
+                        chain_rgba.is_some(),
+                    ) {
                         MultiDrawChainSource::Resident => {
                             req.chain_from_resident = true;
                         }
@@ -3442,10 +4411,10 @@ fn finish_stream<M: HostMemory + HostOps>(
                         MultiDrawChainSource::Missing => {
                             crate::observe::fail(format!(
                                 "multi_draw_chain_break reason=prior_output_missing \
-                                 task={task_id} pipe={} di={di}/{} unified={}",
+                                 task={task_id} pipe={} di={di}/{} guest_materialized={}",
                                 pd.pipeline_ref,
                                 draw_list.len(),
-                                unified as u8
+                                intermediate_store_is_guest_materialized as u8
                             ));
                         }
                     }
@@ -3457,12 +4426,12 @@ fn finish_stream<M: HostMemory + HostOps>(
                 let draw_started = std::time::Instant::now();
                 fin.enter(crate::runtime::drain::FinishPhase::Encode);
                 let encode =
-                    draw::encode_draw_chain(state, host, &mut req, do_writeback, force_full_store);
+                    draw::encode_draw_chain(state, host, &req, do_writeback, force_full_store);
                 fin.enter(crate::runtime::drain::FinishPhase::Result);
                 // Read before the status is matched: a draw whose Store failed
                 // still ran its query, and the count is the guest's answer
                 // either way.
-                match (req.visibility, req.visibility_samples) {
+                match (req.visibility, encode.visibility_samples) {
                     (Some(arming), Some(samples)) => {
                         let slot = visibility_counts.entry(arming.offset).or_default();
                         *slot = slot.saturating_add(samples);
@@ -3471,9 +4440,8 @@ fn finish_stream<M: HostMemory + HostOps>(
                     // query, so the guest will read its own stale word and cull
                     // on it. Both backends record one now, so what is left here
                     // is the refusal cases — a Vulkan host without
-                    // `occlusionQueryPrecise` asked for a counting query, a mode
-                    // ordinal neither table converts, an encode that failed
-                    // before the pass ran — and any draw form whose encoder does
+                    // `occlusionQueryPrecise` asked for a counting query, an
+                    // encode that failed before the pass ran — and any draw form whose encoder does
                     // not carry the arming at all. Detected here rather than in
                     // each backend because the question is the same on all three
                     // pathways: was the query the guest armed actually run.
@@ -3481,7 +4449,7 @@ fn finish_stream<M: HostMemory + HostOps>(
                         crate::runtime::drain::note_store_route("visibility_query_unanswered");
                         if crate::observe::first_sight(
                             "visibility_query_unanswered",
-                            u64::from(arming.mode),
+                            u64::from(arming.mode.guest_ordinal()),
                         ) {
                             crate::observe::fail(format!(
                                 "visibility_query_unanswered \
@@ -3489,7 +4457,9 @@ fn finish_stream<M: HostMemory + HostOps>(
                                  pipe={} mode={} off={:#x} (the guest armed an \
                                  occlusion query and this backend ran none; it will \
                                  read whatever its buffer already held)",
-                                pd.pipeline_ref, arming.mode, arming.offset
+                                pd.pipeline_ref,
+                                arming.mode.guest_ordinal(),
+                                arming.offset
                             ));
                         }
                     }
@@ -3499,24 +4469,32 @@ fn finish_stream<M: HostMemory + HostOps>(
                     crate::runtime::drain::DrainPhase::Draw,
                     draw_started,
                 );
-                match encode {
-                    (EncodeStatus::Ok, Some(rgba)) => {
-                        out.metal_draws_ok += 1;
-                        if !resident_chain {
+                if pd.icb_ref.is_some() {
+                    if matches!(&encode.status, EncodeStatus::Ok) {
+                        out.render_icb_ok = out.render_icb_ok.saturating_add(1);
+                        crate::runtime::drain::note_store_route("icb_exec_ok");
+                    } else {
+                        out.render_icb_fail = out.render_icb_fail.saturating_add(1);
+                    }
+                }
+                match (encode.status, encode.chain_rgba, encode.resident_identity) {
+                    (EncodeStatus::Ok, Some(rgba), _) => {
+                        out.draws_ok += 1;
+                        if resident_chain_identity.is_none() {
                             chain_rgba = Some(rgba);
                         }
                     }
-                    (EncodeStatus::Ok, None) if req.chain_resident_established => {
+                    (EncodeStatus::Ok, None, Some(identity)) => {
                         // Resident render-pass chain intermediate: content stays
                         // on the engine target; the next record loads it there.
-                        out.metal_draws_ok += 1;
-                        resident_chain = true;
+                        out.draws_ok += 1;
+                        resident_chain_identity = Some(identity);
                     }
-                    (EncodeStatus::Ok, None) => {
+                    (EncodeStatus::Ok, None, None) => {
                         // Intermediate must return color0 for chaining; treat as
                         // break so we do not composite later draws on a missing seed.
-                        out.metal_draws_ok += 1;
-                        if !do_writeback && !unified {
+                        out.draws_ok += 1;
+                        if !do_writeback && !intermediate_store_is_guest_materialized {
                             // Every draw after this one is dropped, so say so.
                             // The two sibling break arms below report through
                             // `note_draw_encode_fail`; this one encoded `Ok` and
@@ -3539,57 +4517,65 @@ fn finish_stream<M: HostMemory + HostOps>(
                             land_chain_before_abandon(
                                 state,
                                 host,
-                                task_id,
-                                acc,
-                                &req,
                                 &mut chain_rgba,
-                                ChainEnd {
-                                    cause: draw::ChainAbandonCause::NoColor0,
-                                    resident: resident_chain,
+                                ChainAbandonContext {
+                                    task_id,
+                                    acc,
+                                    req: &req,
+                                    resident_identity: resident_chain_identity.as_ref(),
+                                    end: ChainEnd {
+                                        cause: draw::ChainAbandonCause::NoColor0,
+                                        resident: resident_chain_identity.is_some(),
+                                    },
                                 },
                             );
                             break;
                         }
                     }
-                    (st @ EncodeStatus::NoMetal(_), _) => {
-                        saw_nometal = true;
-                        out.metal_draws_fail += 1;
+                    (st @ EncodeStatus::BackendUnavailable(_), _, _) => {
+                        saw_backend_unavailable = true;
+                        out.draws_fail += 1;
                         note_draw_encode_fail(task_id, pd.pipeline_ref, st, di, draw_list.len());
                         land_chain_before_abandon(
                             state,
                             host,
-                            task_id,
-                            acc,
-                            &req,
                             &mut chain_rgba,
-                            ChainEnd {
-                                cause: draw::ChainAbandonCause::NoMetal,
-                                resident: resident_chain,
+                            ChainAbandonContext {
+                                task_id,
+                                acc,
+                                req: &req,
+                                resident_identity: resident_chain_identity.as_ref(),
+                                end: ChainEnd {
+                                    cause: draw::ChainAbandonCause::BackendUnavailable,
+                                    resident: resident_chain_identity.is_some(),
+                                },
                             },
                         );
                         break;
                     }
-                    // `Ok` and the distinct clear-fallback `NoMetal` recovery
+                    // `Ok` and the distinct clear-fallback `BackendUnavailable` recovery
                     // are exhausted above. Every remaining status is a typed
-                    // terminal refusal, including the Metal-only carrier when
-                    // that feature exists.
-                    (st, _) => {
-                        out.metal_draws_fail += 1;
+                    // terminal refusal.
+                    (st, _, _) => {
+                        out.draws_fail += 1;
                         note_draw_encode_fail(task_id, pd.pipeline_ref, st, di, draw_list.len());
                         // If earlier GVA draws produced a chain image, land it
-                        // before abandoning the packet. Unified targets already
-                        // landed each record in guest memory — never write the
-                        // (zero) chain buffer over them.
+                        // before abandoning the packet. Mapping-backed targets
+                        // already landed each record in guest memory — never
+                        // write the (zero) chain buffer over them.
                         land_chain_before_abandon(
                             state,
                             host,
-                            task_id,
-                            acc,
-                            &req,
                             &mut chain_rgba,
-                            ChainEnd {
-                                cause: draw::ChainAbandonCause::TerminalRefusal,
-                                resident: resident_chain,
+                            ChainAbandonContext {
+                                task_id,
+                                acc,
+                                req: &req,
+                                resident_identity: resident_chain_identity.as_ref(),
+                                end: ChainEnd {
+                                    cause: draw::ChainAbandonCause::TerminalRefusal,
+                                    resident: resident_chain_identity.is_some(),
+                                },
                             },
                         );
                         break;
@@ -3597,26 +4583,41 @@ fn finish_stream<M: HostMemory + HostOps>(
                 }
             }
         }
+        flush_render_barriers_at(
+            state,
+            &expanded.barriers_after_draw,
+            &mut render_barrier_cursor,
+            draw_list.len(),
+        );
         fin.enter(crate::runtime::drain::FinishPhase::Tail);
         write_visibility_results(state, host, task_id, acc, &visibility_counts);
-        // Encode never landed Stores (NoMetal stubs, missing MTLB/pipeline, or
+        // Encode never landed Stores (unavailable operations, missing MTLB/pipeline, or
         // mrt resolve fail). Honor CLEAR load+store into guest/host pages so
         // dual-buffer display mids at least hold the pass clear color (archive
         // CLEAR seed — not a content heuristic). Applies for any draw-fail
-        // class, not only NoMetal: mrt_request fail used to skip this and left
+        // class, not only BackendUnavailable: mrt_request fail used to skip this and left
         // mid pages empty → nz_swing thrash on x86 Linux product.
-        if out.metal_draws_ok == 0 && !acc.clears.is_empty() {
+        if out.draws_ok == 0 && !acc.clears.is_empty() {
             for att in acc.clears_reaching_guest_pages() {
                 if apply_clear(state, host, task_id, att) {
                     out.clears_applied = out.clears_applied.saturating_add(1);
                 }
             }
-            if out.clears_applied > 0 || saw_nometal || out.metal_draws_fail > 0 {
+            if out.clears_applied > 0 || saw_backend_unavailable || out.draws_fail > 0 {
                 crate::observe::fail(format!(
-                    "draw_fail_clear_fallback task={task_id} clears={} draws_fail={} nometal={}",
-                    out.clears_applied, out.metal_draws_fail, saw_nometal as u8
+                    "draw_fail_clear_fallback task={task_id} clears={} draws_fail={} backend_unavailable={}",
+                    out.clears_applied, out.draws_fail, saw_backend_unavailable as u8
                 ));
             }
+        }
+    }
+
+    // A barrier-only stream, or a render stream whose draws were all refused
+    // before entering the backend, can still order an open batch left by a
+    // preceding stream. No draw loop exists to consume its positions.
+    if !will_draw && !expanded.barriers_after_draw.is_empty() {
+        for _ in &expanded.barriers_after_draw {
+            state.executor.flush_submission_tail();
         }
     }
 }
@@ -3637,7 +4638,7 @@ fn finish_stream<M: HostMemory + HostOps>(
 /// and a vertex bind go through, so a guest naming a non-buffer or an unbacked
 /// object refuses by that rail's own name instead of a literal invented here.
 fn write_visibility_results<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut M,
     task_id: u32,
     acc: &StreamAccum,
@@ -3730,7 +4731,7 @@ fn write_visibility_results<M: HostMemory + HostOps>(
 
 /// Why a draw list stopped early while every draw in it had encoded `Ok`.
 ///
-/// This is the one abandon path that no counter can see. `metal_draws_fail`
+/// This is the one abandon path that no counter can see. `draws_fail`
 /// stays 0, so `packet_failed` is false and even the packet-level
 /// `exec_indirect2` line is suppressed; the draws after this point are dropped
 /// with the packet still reported as successful.
@@ -3776,14 +4777,13 @@ fn render_pass_attachment_template(first: &draw::DrawEncodeRequest) -> draw::Dra
         .map(|c| draw::ColorRtRequest {
             slot: c.slot,
             texture_ref: c.texture_ref,
-            mapping_id: c.mapping_id,
-            target_gva: c.target_gva,
-            row_stride: c.row_stride,
+            resource: c.resource.clone(),
+            storage: c.storage,
             width: c.width,
             height: c.height,
             format: c.format,
             sample_count: c.sample_count,
-            load_action: MTL_LOAD_ACTION_LOAD,
+            load_action: reims_vgpu_protocol::pass_action::LoadAction::Load,
             store_action: c.store_action,
             clear_color: c.clear_color,
             target_seed_rgba: None,
@@ -3805,7 +4805,7 @@ fn retarget_render_pass_draw(
     req.pipeline_ref = draw.pipeline_ref;
     req.vertex_count = draw.draw.vertex_count;
     req.instance_count = draw.draw.instance_count;
-    req.primitive_type = draw.draw.primitive_type;
+    req.primitive_topology = draw.draw.primitive_topology;
     req.first_vertex = draw.draw.first_vertex;
     req.base_instance = draw.draw.base_instance;
     req
@@ -3835,13 +4835,13 @@ fn retarget_render_pass_draw(
 /// of the device rather than of the Metal API, and a design that stopped
 /// completing compute before render would break this silently.
 fn execute_indirect_draw<M: HostMemory + HostOps>(
-    state: &DeviceState,
+    state: &Device,
     host: &M,
     task_id: u32,
     cmd: &render::Command,
     acc: &mut StreamAccum,
 ) {
-    use crate::contract::draw::indirect;
+    use reims_vgpu_core::draw::indirect;
 
     let indexed_form = cmd.opcode == wire_render::OPCODE_DRAW_INDEXED_INDIRECT;
     let block_len = if indexed_form {
@@ -3869,13 +4869,20 @@ fn execute_indirect_draw<M: HostMemory + HostOps>(
         }
     };
 
+    let primitive_topology = match reims_vgpu_protocol::primitive_topology(cmd.primitive_type) {
+        Ok(topology) => topology,
+        Err(error) => {
+            note_primitive_topology_refused(task_id, acc.pipeline_ref, error);
+            return;
+        }
+    };
     let (args, index_start, base_vertex) = if indexed_form {
-        match indirect::indexed(&block, cmd.primitive_type) {
+        match indirect::indexed(&block, primitive_topology) {
             Some(v) => (v.0, v.1, v.2),
             None => return,
         }
     } else {
-        match indirect::unindexed(&block, cmd.primitive_type) {
+        match indirect::unindexed(&block, primitive_topology) {
             Some(args) => (args, 0, 0),
             None => return,
         }
@@ -3883,22 +4890,12 @@ fn execute_indirect_draw<M: HostMemory + HostOps>(
 
     acc.saw_draw = true;
     if indexed_form {
-        // `indexStart` counts indices, not bytes. The loader is given a byte
-        // offset, so it is scaled here by the width the record's own
-        // `index_type` declares — the same two widths `translate::raster::
-        // index_type` accepts, and an unknown one is left to the loader's
-        // typed refusal rather than being guessed at as 2.
-        let stride = match cmd.index_type {
-            1 => 4u64, // MTLIndexTypeUInt32
-            _ => 2,    // MTLIndexTypeUInt16, and Metal's default
-        };
         acc.indexed = Some(IndexedDrawInfo {
-            index_type: cmd.index_type,
+            index_type: reims_vgpu_protocol::decode_index_type(cmd.index_type),
             index_count: args.vertex_count,
             index_buffer_ref: cmd.index_buffer_ref,
-            index_buffer_offset: cmd
-                .index_buffer_offset
-                .saturating_add(u64::from(index_start).saturating_mul(stride)),
+            index_buffer_offset: cmd.index_buffer_offset,
+            index_start,
             base_vertex: i64::from(base_vertex),
         });
     } else {
@@ -3921,7 +4918,7 @@ fn execute_indirect_draw<M: HostMemory + HostOps>(
         return;
     }
     match acc.bind_snapshot() {
-        Ok(snapshot) => acc.draws.push(PendingDraw {
+        Ok(snapshot) => acc.push_draw(PendingDraw {
             pipeline_ref: acc.pipeline_ref,
             draw: args,
             ..snapshot
@@ -3931,7 +4928,7 @@ fn execute_indirect_draw<M: HostMemory + HostOps>(
 }
 
 fn read_icb_exec_range<M: HostMemory + HostOps>(
-    state: &DeviceState,
+    state: &Device,
     host: &M,
     task_id: u32,
     buffer_ref: u32,
@@ -3967,35 +4964,6 @@ enum MultiDrawChainSource {
     Missing,
 }
 
-/// The same colour slots, opening with `LOAD` instead of whatever the stream
-/// asked for.
-///
-/// One render pass has one load action per attachment, taken when the pass
-/// begins. This device opens a fresh host pass per ICB execute, so the second
-/// and later ones have to be told that their pass is a continuation — the
-/// alternative is a `CLEAR` re-running mid-pass and wiping what the execute
-/// before it drew, which is the same failure the multi-draw chain describes at
-/// `di > 0`.
-///
-/// The clear colour is carried through untouched. It is not read on the `LOAD`
-/// path, and blanking it here would put an invented value in the record that a
-/// later reader of the request would have no way to distinguish from a decoded
-/// one.
-fn color_slots_loading(slots: &[(u32, ColorAttachment)]) -> Vec<(u32, ColorAttachment)> {
-    slots
-        .iter()
-        .map(|&(slot, att)| {
-            (
-                slot,
-                ColorAttachment {
-                    load_action: MTL_LOAD_ACTION_LOAD,
-                    ..att
-                },
-            )
-        })
-        .collect()
-}
-
 fn multi_draw_chain_source(resident_chain: bool, cpu_chain_ready: bool) -> MultiDrawChainSource {
     if resident_chain {
         MultiDrawChainSource::Resident
@@ -4017,9 +4985,11 @@ fn fill_draw_binds_from_pending(req: &mut draw::DrawEncodeRequest, pd: &PendingD
     req.scissors.clone_from(&pd.scissors);
     req.indexed = pd.indexed.clone();
     req.blend_color = pd.blend_color;
+    req.render_target_extent = pd.render_target_extent;
     req.cull_mode = pd.cull_mode;
-    req.front_facing = pd.front_facing;
+    req.front_face_ccw = pd.front_face_ccw;
     req.fill_mode = pd.fill_mode;
+    req.line_width = pd.line_width;
     req.depth_clip_mode = pd.depth_clip_mode;
     req.depth_bias = pd.depth_bias;
     req.depth_stencil_ref = pd.depth_stencil_ref;
@@ -4027,25 +4997,20 @@ fn fill_draw_binds_from_pending(req: &mut draw::DrawEncodeRequest, pd: &PendingD
     req.depth_attach = pd.depth_attach;
     req.stencil_attach = pd.stencil_attach;
     req.visibility = pd.visibility;
-    // Cleared with the arming it belongs to. `req` is reused across the draws
-    // of a chain, so a stale count from draw N-1 would otherwise be read as
-    // draw N's — and an occlusion count that is silently the previous draw's is
-    // the exact shape of wrong this rail exists to avoid.
-    req.visibility_samples = None;
 }
 
 fn dirty_color_targets<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &M,
     task_id: u32,
     refs: &[u32],
 ) {
     for &tex_ref in refs {
-        if let Some(mid) = objects::resolve_type11_ref(state, host, task_id, tex_ref) {
-            // The guest pages are the only copy of a type-11 surface, so there
+        if let Some(mid) = objects::resolve_iosurface_texture_ref(state, host, task_id, tex_ref) {
+            // The guest pages are the only copy of an IOSurface texture surface, so there
             // is no mirror to drop — only bump gen for scanout skips.
             let _ = state.mark_mapping_written(mid);
-        } else if objects::resolve_type4_surface(state, host, tex_ref) {
+        } else if objects::resolve_surface_backing(state, host, tex_ref) {
             let _ = state.mark_mapping_written(tex_ref);
         }
     }
@@ -4062,27 +5027,39 @@ struct ChainEnd {
     resident: bool,
 }
 
+struct ChainAbandonContext<'a> {
+    task_id: u32,
+    acc: &'a StreamAccum,
+    req: &'a draw::DrawEncodeRequest,
+    resident_identity: Option<&'a crate::model::TargetIdentity>,
+    end: ChainEnd,
+}
+
 /// Land the chain image this packet has produced before abandoning it.
 ///
 /// Three records break a multi-draw chain: a typed terminal refusal, the
-/// `NoMetal` carrier, and an intermediate that returned no colour0. All three
+/// `BackendUnavailable` carrier, and an intermediate that returned no colour0. All three
 /// leave earlier GVA draws' pixels only on the engine target, and dropping
 /// them left dual-mid pages black while the content generation advanced — so
 /// the resident is read back and written out first, and the colour targets are
 /// marked written either way.
 ///
-/// Unified targets already landed each record in guest memory and must never
-/// take the (zero) chain buffer over them; the one caller where that is
-/// possible gates on it.
+/// Mapping-backed targets already landed each record in guest memory and must
+/// never take the (zero) chain buffer over them; the one caller where that is
+/// possible gates on it. This is a storage/content fact, not host topology.
 fn land_chain_before_abandon<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut M,
-    task_id: u32,
-    acc: &StreamAccum,
-    req: &draw::DrawEncodeRequest,
     chain_rgba: &mut Option<Vec<u8>>,
-    end: ChainEnd,
+    context: ChainAbandonContext<'_>,
 ) {
+    let ChainAbandonContext {
+        task_id,
+        acc,
+        req,
+        resident_identity,
+        end,
+    } = context;
     // The one caller that has no identity to be handed. The chain broke, so no
     // span carries the key its last good record registered, and the abandoning
     // read has to name the resident from the state it can still see. That is a
@@ -4090,14 +5067,11 @@ fn land_chain_before_abandon<M: HostMemory + HostOps>(
     // `read_resident_chain`, because every *other* caller has the draw's own
     // key and a shared re-derivation would silently give them this one's answer
     // — see `draw::M2vDrawSpan::ResidentSurfaceStore` for what that cost.
-    #[cfg(feature = "backend-vulkan")]
     if end.resident && chain_rgba.is_none() {
-        if let Some(identity) = draw::render_chain_identity(state, req) {
-            *chain_rgba = draw::read_resident_chain(req, &identity);
+        if let Some(identity) = resident_identity {
+            *chain_rgba = draw::read_resident_chain(state.executor.as_ref(), req, identity);
         }
     }
-    #[cfg(not(feature = "backend-vulkan"))]
-    let _ = (req, end.resident);
     if let Some(rgba) = chain_rgba.take() {
         let _ =
             draw::writeback_chain_rgba(state, host, task_id, &acc.color_slots, &rgba, end.cause);
@@ -4106,11 +5080,16 @@ fn land_chain_before_abandon<M: HostMemory + HostOps>(
 }
 
 fn apply_clear<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut M,
     task_id: u32,
     att: &ColorAttachment,
 ) -> bool {
+    if !draw::load_action_in_contract(0, att.load_action)
+        || !draw::store_action_in_contract(0, att.store_action)
+    {
+        return false;
+    }
     if att.texture_ref == 0 || !store_action_publishes_single_sample(att.store_action) {
         return false;
     }
@@ -4122,9 +5101,7 @@ fn apply_clear<M: HostMemory + HostOps>(
         ));
         return false;
     }
-    if att.store_action == MTL_STORE_ACTION_MULTISAMPLE_RESOLVE
-        && att.resolve_texture_ref == 0
-    {
+    if att.store_action == MTL_STORE_ACTION_MULTISAMPLE_RESOLVE && att.resolve_texture_ref == 0 {
         crate::observe::fail(format!(
             "render_clear reason=clear_multisample_resolve_target_missing source={}",
             att.texture_ref
@@ -4142,11 +5119,22 @@ fn apply_clear<M: HostMemory + HostOps>(
     } else {
         *att
     };
-    // Prefer full draw-path resolve (type-11 or type-2/3 GVA wallpaper targets).
+    // Prefer full draw-path resolve (IOSurface texture or type-2/3 GVA wallpaper targets).
     let Some(req) =
         // A clear-only pass: no pipeline and no geometry, so every draw
         // argument including the base instance is zero by construction.
-        draw::color_target_request(state, host, task_id, target, 0, 0, 1, 0, 0, 0)
+        draw::color_target_request(
+            state,
+            host,
+            task_id,
+            target,
+            0,
+            0,
+            1,
+            reims_vgpu_protocol::PrimitiveTopology::Point,
+            0,
+            0,
+        )
     else {
         // A clear whose color target cannot resolve (mapping unresolved, geometry
         // missing) is dropped here with no other trace — the "background didn't
@@ -4162,21 +5150,21 @@ fn apply_clear<M: HostMemory + HostOps>(
     let w = c0.width;
     let h = c0.height;
     let rgba = solid_rgba8(w, h, &att.clear_color);
-    if c0.target_gva != 0 {
+    if c0.target_gva() != 0 {
         return draw::write_gva_rgba8(
             state,
             host,
             task_id,
-            c0.target_gva,
+            c0.target_gva(),
             w,
             h,
-            c0.row_stride,
+            c0.row_stride(),
             c0.format,
             &rgba,
         )
         .is_ok();
     }
-    if c0.mapping_id == 0 {
+    if c0.mapping_id() == 0 {
         return false;
     }
     let r = f64_to_unorm8(att.clear_color[0]);
@@ -4193,9 +5181,9 @@ fn apply_clear<M: HostMemory + HostOps>(
         }
     }
     let _ = MTL_FORMAT_BGRA8_UNORM;
-    let ok = mapping_write::write_bgra8(state, host, c0.mapping_id, &img, stride, w, h);
+    let ok = mapping_write::write_bgra8(state, host, c0.mapping_id(), &img, stride, w, h);
     // host_cache also updated inside write_bgra8 (surface_cache::store).
-    state.note_surface_clear(c0.mapping_id);
+    state.note_surface_clear(c0.mapping_id());
     ok
 }
 
@@ -4207,7 +5195,7 @@ use report::{
     note_compute_refusal, note_depth_stencil_unsupported, note_draw_encode_fail,
     note_empty_scissor, note_indexed_draw_without_buffer, note_indirect_draw_refused,
     note_pass_array_length_unsupported, note_pass_extent_for_slot,
-    note_pass_raster_sample_count_unsupported, note_pass_target_extent,
+    note_pass_raster_sample_count_unsupported, note_pass_target_extent_stated,
     note_store_action_no_attachment, note_stream_draw_drops, note_unimplemented_render_opcode,
     note_unnamed_icb_execute,
 };

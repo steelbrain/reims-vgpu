@@ -108,6 +108,21 @@ say() { echo "app-sweep-probe: $*"; }
 qmp() { QMP_SOCK="$QMP_SOCK" timeout 30 "$REPO/scripts/qmp/qmp.py" "$@" >/dev/null 2>&1 || true; }
 gssh() { timeout "${1:-20}" ssh -o BatchMode=yes -o ConnectTimeout=8 "$GUEST" "$2" 2>/dev/null; }
 
+# End the measured application's process before the next leg. Command-Q is the
+# ordinary path, but a first-run sheet may consume or defer it while continuing
+# to own the desktop. That made every later leg measure the sheet and report
+# zero frames from applications that never became frontmost. Force termination
+# is test cleanup only, and only runs when the process survived Command-Q.
+close_app() {
+  local app="$1"
+  qmp key meta_l+q
+  sleep 2
+  if gssh 10 "pgrep -x '$app' >/dev/null"; then
+    gssh 10 "killall '$app' >/dev/null 2>&1" || true
+    sleep 2
+  fi
+}
+
 [ -S "$QMP_SOCK" ] || { say "no QMP socket at $QMP_SOCK — is a boot running?" >&2; exit 2; }
 [ -f "$FAILLOG" ] || { say "no fail log at $FAILLOG — is a boot running?" >&2; exit 2; }
 gssh 10 true || { say "no guest at $GUEST" >&2; exit 2; }
@@ -255,8 +270,7 @@ for app in "${APP_LIST[@]}"; do
   run_app "$app" "$SECONDS_PER_APP" || FAILED=1
   # Close it so the next app is not composited behind a growing stack, which
   # would make each later app's reading a different workload from the first's.
-  qmp key meta_l+q
-  sleep 2
+  close_app "$app"
 done
 
 # Safari again, harder. The sweep above opens an app and pushes a wheel at it;
@@ -292,8 +306,7 @@ if [ "$TORTURE_SECONDS" -gt 0 ]; then
   printf 'Safari-torture\t%s\t%s\t%s\t%s\t%s\n' "$verdict" "$hz_med" "$hz_min" "$gap" "$alarms" \
     >>"$VERDICTS"
   say "Safari torture: $verdict  present_hz med=$hz_med min=$hz_min  worst census gap=${gap}s  alarms=$alarms"
-  qmp key meta_l+q
-  sleep 2
+  close_app Safari
 fi
 
 # Launchpad last, and it is two composites rather than one. Opening it blurs

@@ -200,8 +200,7 @@ Always builds reims-vgpu-efi and reims-vgpu before boot. In-tree QEMU is rebuilt
 unless QEMU_BIN is set to something other than the default path.
 Env: DISKS_DIR OVMF_DIR RAILS_DIR RAIL RUN_DIR QEMU_BIN OVMF_CODE OVMF_VARS_MASTER
      OPENCORE_MASTER DISK_MASTER RAM CPU_SOCKETS CPU_CORES CPU_THREADS CPU_MODEL
-     CPU_OPTIONS SSH_PORT TESTING_TIMEOUT QMP_DUMP_TIMEOUT GUEST_MAC REIMS_VGPU_BACKEND
-     (metal|vulkan for qemu-build)
+     CPU_OPTIONS SSH_PORT TESTING_TIMEOUT QMP_DUMP_TIMEOUT GUEST_MAC
      NET=user (SLIRP, default) | NET=none (no NIC)
      REIMS_VGPU_PCI_ATTACH=pcibridge|bus0   (default pcibridge; product secondary bus)
      REIMS_VGPU_GOP_ROM=path | REIMS_VGPU_GOP_ROM= (option ROM on reims-vgpu-pci; auto if built)
@@ -396,12 +395,10 @@ build_reims_vgpu_efi() {
 require_shader_toolchain
 ensure_rust_tools
 build_reims_vgpu_efi
-# Product Linux x86 rail needs Vulkan. Override REIMS_VGPU_BACKEND only for an explicit
-# alternate build.
+# Product Linux x86 rail uses Vulkan.
 if [ "$QEMU_BIN" = "$QEMU_BIN_DEFAULT" ]; then
-  REIMS_VGPU_BACKEND="${REIMS_VGPU_BACKEND:-vulkan}"
-  echo "boot-x86.sh: building in-tree QEMU (scripts/qemu-build --target x86_64 --backend $REIMS_VGPU_BACKEND) ..."
-  "$REPO_ROOT/scripts/qemu-build/qemu-build.sh" --target x86_64 --backend "$REIMS_VGPU_BACKEND" \
+  echo "boot-x86.sh: building in-tree QEMU (scripts/qemu-build --target x86_64) ..."
+  "$REPO_ROOT/scripts/qemu-build/qemu-build.sh" --target x86_64 \
     || die "qemu-build failed"
 else
   # An overridden QEMU_BIN is a binary that already exists, and the reims-vgpu
@@ -415,7 +412,6 @@ else
   # runs: the default branch above rebuilds QEMU every boot and would pick up a
   # half-finished edit mid-run (AGENTS.md records one run discarded for exactly
   # that). Keep this branch free of the tree.
-  REIMS_VGPU_BACKEND="${REIMS_VGPU_BACKEND:-vulkan}"
   echo "boot-x86.sh: QEMU_BIN pinned ($QEMU_BIN) — not building; the staticlib is already linked in"
 fi
 [ -x "$QEMU_BIN" ] || die "QEMU not available: $QEMU_BIN"

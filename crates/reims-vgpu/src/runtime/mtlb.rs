@@ -1,7 +1,7 @@
-//! Guest type-6 function objects: loading the MTLB container, and carving the
+//! Guest function objects: loading the MTLB container, and carving the
 //! wrapped AIR out of it.
 //!
-//! Each type-6 object's descriptor names an MTLB container in guest memory;
+//! Each function descriptor names an MTLB container in guest memory;
 //! metal2vulkan consumes the LLVM BitcodeWrapper (`0x0b17c0de`) record inside.
 //! [`load_mtlb`](crate::runtime::mtlb::load_mtlb) does the first half
 //! (object list → container bytes) and
@@ -36,11 +36,13 @@
 //! So a `draw_load_mtlb` line is a real event, and the flood this could have
 //! been does not exist on a healthy guest.
 
-use crate::model::DeviceState;
-use crate::runtime::decode::resource::{decode_function_descriptor, OBJECT_TYPE_FUNCTION};
+use crate::model::LoadedFunction;
+use crate::runtime::decode::resource::{decode_function_descriptor, ObjectKind};
 use crate::runtime::draw::host_alloc_len;
 use crate::runtime::host::{HostMemory, HostOps};
+use crate::runtime::Device;
 use crate::runtime::{gva_mem, objects};
+use std::sync::Arc;
 
 /// LLVM BitcodeWrapperHeader magic `0x0b17c0de` LE.
 ///
@@ -52,54 +54,7 @@ pub const AIR_WRAP_MAGIC: [u8; 4] = [0xde, 0xc0, 0x17, 0x0b];
 const WRAPPER_HEADER_LEN: usize = 0x14;
 
 /// A structural refusal while locating the LLVM BitcodeWrapper inside an MTLB.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum MtlbDecline {
-    WrappedAirMissing {
-        data_len: usize,
-    },
-    WrapperHeaderTruncated {
-        offset: usize,
-        data_len: usize,
-    },
-    BlobOutOfBounds {
-        offset: usize,
-        blob_len: u64,
-        data_len: usize,
-    },
-}
-
-impl crate::observe::Decline for MtlbDecline {
-    fn slug(&self) -> &'static str {
-        match self {
-            Self::WrappedAirMissing { .. } => "mtlb_wrapped_air_missing",
-            Self::WrapperHeaderTruncated { .. } => "mtlb_wrapper_header_truncated",
-            Self::BlobOutOfBounds { .. } => "mtlb_blob_out_of_bounds",
-        }
-    }
-
-    fn fields(&self) -> Vec<(&'static str, String)> {
-        match self {
-            Self::WrappedAirMissing { data_len } => vec![("data_len", data_len.to_string())],
-            Self::WrapperHeaderTruncated { offset, data_len } => vec![
-                ("offset", offset.to_string()),
-                ("data_len", data_len.to_string()),
-            ],
-            Self::BlobOutOfBounds {
-                offset,
-                blob_len,
-                data_len,
-            } => vec![
-                ("offset", offset.to_string()),
-                ("blob_len", blob_len.to_string()),
-                ("data_len", data_len.to_string()),
-            ],
-        }
-    }
-}
-
-crate::observe::decline_display!(MtlbDecline);
-
-impl std::error::Error for MtlbDecline {}
+pub use reims_vgpu_core::MtlbDecline;
 
 /// Which rail asked for a function's MTLB container.
 ///
@@ -112,7 +67,7 @@ impl std::error::Error for MtlbDecline {}
 pub enum AirLoadRail {
     /// Compute dispatch, its sessions, and compute ICB bodies.
     Compute,
-    /// Render draws on either backend, and render ICB bodies.
+    /// Render draws and render ICB bodies.
     Draw,
 }
 
@@ -126,7 +81,11 @@ impl AirLoadRail {
     }
 }
 
-/// Load a type-6 function object's MTLB container out of guest memory.
+/// Resolve a function object's immutable MTLB container.
+///
+/// The first resolution reads guest memory and retains the payload under the
+/// function reference lifetime. Later callers receive the same bytes until an
+/// explicit function delete or task teardown ends that lifetime.
 ///
 /// `None` means the caller gets no shader; every reason for it but one is
 /// written to the fail log under [`AirLoadRail::event`], because the callers all
@@ -137,17 +96,26 @@ impl AirLoadRail {
 /// state (a pipeline with no fragment stage, say) that `AGENTS.md` names as a
 /// thing not to log. It stays silent.
 pub fn load_mtlb<M: HostMemory + HostOps>(
-    state: &DeviceState,
+    state: &Device,
     host: &M,
     task_id: u32,
     func_ref: u32,
     rail: AirLoadRail,
-) -> Option<Vec<u8>> {
+) -> Option<Arc<[u8]>> {
     if func_ref == 0 {
         return None;
     }
+    if let Some(function) = state
+        .task_objects
+        .functions
+        .get(task_id, reims_vgpu_protocol::SerializerRef::new(func_ref))
+    {
+        crate::runtime::drain::note_store_route("function_state_hit");
+        return Some(Arc::clone(&function.mtlb));
+    }
+    crate::runtime::drain::note_store_route("function_state_miss");
     let report = crate::observe::RungReport::new(rail.event(), "func_ref");
-    let miss = |reason: &str, detail: String| -> Option<Vec<u8>> {
+    let miss = |reason: &str, detail: String| -> Option<Arc<[u8]>> {
         report.reason(task_id, func_ref, reason, &detail);
         None
     };
@@ -156,7 +124,7 @@ pub fn load_mtlb<M: HostMemory + HostOps>(
         host,
         task_id,
         func_ref,
-        &[OBJECT_TYPE_FUNCTION],
+        &[ObjectKind::Function],
     ) {
         Ok(found) => found,
         Err(rung) => {
@@ -201,7 +169,16 @@ pub fn load_mtlb<M: HostMemory + HostOps>(
             format!("blob_gva={:#x} blob_size={}", f.blob_gva, f.blob_size),
         );
     }
-    Some(mtlb)
+    let mtlb: Arc<[u8]> = mtlb.into();
+    let function = Arc::new(LoadedFunction {
+        mtlb: Arc::clone(&mtlb),
+    });
+    let retained = state.task_objects.functions.register(
+        task_id,
+        reims_vgpu_protocol::SerializerRef::new(func_ref),
+        function,
+    );
+    Some(Arc::clone(&retained.mtlb))
 }
 
 /// Extract the wrapped-AIR blob from an MTLB container or bare wrapper.
@@ -247,20 +224,17 @@ fn blob_at(data: &[u8], off: usize) -> Result<&[u8], MtlbDecline> {
 
 #[cfg(test)]
 mod tests {
+    use crate::runtime::decode::resource::OBJECT_TYPE_FUNCTION;
+
     use super::*;
-    use crate::contract::endian::{st32, st64};
-    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
     use crate::model::{DeviceId, PAGE_SHIFT_ARM64E};
     use crate::runtime::host::FakeHost;
+    use reims_vgpu_core::endian::{st32, st64};
+    use reims_vgpu_paging::geometry::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
 
     /// Task 1 with a one-entry object list whose ref 1 holds `object_type`, and
     /// a descriptor blob of `desc` at GVA 0x40.
-    fn task_with_one_object(
-        host: &mut FakeHost,
-        state: &mut DeviceState,
-        object_type: u8,
-        desc: &[u8],
-    ) {
+    fn task_with_one_object(host: &mut FakeHost, state: &mut Device, object_type: u8, desc: &[u8]) {
         let dir_gpa = 2u64 << PAGE_SHIFT_ARM64E;
         let root_gpa = 3u64 << PAGE_SHIFT_ARM64E;
         let data_gpa = 4u64 << PAGE_SHIFT_ARM64E;
@@ -297,8 +271,8 @@ mod tests {
     #[test]
     fn both_rails_name_the_rung_that_refused_under_their_own_event() {
         let mut host = FakeHost::new();
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        // Object type 11 is an IOSurface, not the type-6 function this loads.
+        let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        // IOSurface wire tag 11 is not the function tag this loader accepts.
         task_with_one_object(&mut host, &mut state, 11, &[0u8; 0x20]);
 
         let cap = crate::observe::FailCapture::start();
@@ -308,7 +282,7 @@ mod tests {
             line.contains(&format!(
                 "reason={}",
                 crate::observe::ladder_slug!("", wrong_type)
-            )) && line.contains("ot=11"),
+            )) && line.contains("ot=iosurface_texture"),
             "the draw rail must name the rung and the tag it found: {line}"
         );
         drop(cap);
@@ -316,7 +290,8 @@ mod tests {
         let cap = crate::observe::FailCapture::start();
         assert!(load_mtlb(&state, &host, 1, 1, AirLoadRail::Compute).is_none());
         assert!(
-            cap.one("compute_load_mtlb").contains("ot=11"),
+            cap.one("compute_load_mtlb")
+                .contains("ot=iosurface_texture"),
             "the compute rail keeps its own event name"
         );
     }
@@ -326,7 +301,7 @@ mod tests {
     #[test]
     fn an_unbound_function_ref_says_nothing() {
         let mut host = FakeHost::new();
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
         task_with_one_object(&mut host, &mut state, OBJECT_TYPE_FUNCTION, &[0u8; 0x20]);
 
         for rail in [AirLoadRail::Draw, AirLoadRail::Compute] {

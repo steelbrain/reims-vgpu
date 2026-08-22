@@ -139,7 +139,7 @@ pub enum Part {
     /// `to_vec` of the prior record's seed for a Load one — so this is where a
     /// draw sampling the target it is drawing into pays for the copy.
     ResolveAlias = 1,
-    /// `resolve_sampled_source`: the type-11 rung ladder and the linear guest
+    /// `resolve_sampled_source`: the IOSurface texture rung ladder and the linear guest
     /// rungs, for every bind the alias branch above did not claim.
     ResolveSource = 2,
     /// `load_vulkan_sampler` over the record's vertex and fragment sampler
@@ -149,12 +149,21 @@ pub enum Part {
     /// samplers from reflection plus defaults for the reflected interface each
     /// shader variant already carries.
     Reflect = 4,
+    /// Nested inside [`Part::ResolveSource`]: retaining or borrowing the packed
+    /// allocation for one linear texture.
+    LinearPacked = 5,
+    /// Nested inside [`Part::ResolveSource`]: querying or reusing exact backend
+    /// image-binding admission for one linear texture.
+    LinearAdmission = 6,
+    /// Nested inside [`Part::ResolveSource`]: content identity and coherency
+    /// witnessing for any zero-copy sampled source.
+    GatherWitness = 7,
 }
 
 impl Part {
     /// Highest ordinal, so [`PARTS`] is derived from the enum rather than
     /// hand-counted beside it.
-    const LAST: Part = Part::Reflect;
+    const LAST: Part = Part::GatherWitness;
 }
 
 const PARTS: usize = Part::LAST as usize + 1;
@@ -174,6 +183,9 @@ pub struct SampledPhaseWindow {
     pub resolve_us: u64,
     pub samplers_us: u64,
     pub reflect_us: u64,
+    pub linear_packed_us: u64,
+    pub linear_admission_us: u64,
+    pub gather_witness_us: u64,
     /// Sampled phases entered in the window — the denominator the four share.
     pub sampled: u64,
 }
@@ -188,6 +200,9 @@ pub fn take_window() -> Option<SampledPhaseWindow> {
         resolve_us: to_us(ACC[Part::ResolveSource as usize].swap(0, Ordering::Relaxed)),
         samplers_us: to_us(ACC[Part::Samplers as usize].swap(0, Ordering::Relaxed)),
         reflect_us: to_us(ACC[Part::Reflect as usize].swap(0, Ordering::Relaxed)),
+        linear_packed_us: to_us(ACC[Part::LinearPacked as usize].swap(0, Ordering::Relaxed)),
+        linear_admission_us: to_us(ACC[Part::LinearAdmission as usize].swap(0, Ordering::Relaxed)),
+        gather_witness_us: to_us(ACC[Part::GatherWitness as usize].swap(0, Ordering::Relaxed)),
         sampled,
     };
     (sampled > 0).then_some(w)
@@ -262,6 +277,9 @@ mod tests {
         assert_eq!(w.alias_us, 0, "{w:?}");
         assert_eq!(w.samplers_us, 0, "{w:?}");
         assert_eq!(w.reflect_us, 0, "{w:?}");
+        assert_eq!(w.linear_packed_us, 0, "{w:?}");
+        assert_eq!(w.linear_admission_us, 0, "{w:?}");
+        assert_eq!(w.gather_witness_us, 0, "{w:?}");
         assert!(w.lookup_us >= 1_000 && w.lookup_us < w.resolve_us, "{w:?}");
     }
 

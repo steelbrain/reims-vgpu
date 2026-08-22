@@ -1,6 +1,6 @@
 //! Event/sync command decoder (port of `host/utils/reims-vgpu-event-decode`).
 
-use crate::contract::endian::{ld32, ld64};
+use reims_vgpu_core::endian::{ld32, ld64};
 use reims_vgpu_wire::ops::blit as wire_blit;
 
 pub const U32_SIZE: usize = 4;
@@ -193,7 +193,7 @@ mod tests {
         assert_eq!(slugs.len(), n, "two event decode checks share a slug");
     }
     use super::*;
-    use crate::contract::endian::{st32, st64};
+    use reims_vgpu_core::endian::{st32, st64};
 
     fn build(opcode: u32, payload: &[u8]) -> Vec<u8> {
         let len = (OP_HEADER_LEN + payload.len()) as u32;

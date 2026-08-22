@@ -3,7 +3,7 @@ using namespace metal;
 
 // Object stage + mesh stage dual-export metallib (fallback product path).
 // Product fill selects by function type (object=8, mesh=7) when mesh SPI
-// type-7 shape (tag 0x14) is absent. Prefer separate metallibs + mesh SPI
+// serializer-resource shape (tag 0x14) is absent. Prefer separate metallibs + mesh SPI
 // tags 0x01/0x02/0x03 when available (see icb_object_stage /
 // icb_mesh_with_payload).
 

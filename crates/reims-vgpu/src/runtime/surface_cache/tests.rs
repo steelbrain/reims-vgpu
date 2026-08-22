@@ -19,7 +19,7 @@ use crate::runtime::host::FakeHost;
 fn the_backing_probe_separates_a_reassigned_address_from_an_unmapped_one() {
     use crate::model::GvaBacking;
     let mut host = FakeHost::new();
-    let mut st = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut st = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let root_gpa = setup_depth1_task(&mut host, &mut st);
 
     // Three entries at GVAs 1, 2 and 3 pages in, each recording the page its
@@ -27,7 +27,7 @@ fn the_backing_probe_separates_a_reassigned_address_from_an_unmapped_one() {
     for i in 1..=3u32 {
         let gva = (i as u64) << PAGE_SHIFT_ARM64E;
         store_gva_owned(&mut st, gva, 2, 2, vec![0u8; 2 * 2 * 4], 0, None, true);
-        st.host_gva_surfaces.get_mut(&gva).unwrap().backing = Some(GvaBacking {
+        st.host_replicas.gva_surfaces.get_mut(&gva).unwrap().backing = Some(GvaBacking {
             task_id: 1,
             first_gpa: ((4 + i) as u64) << PAGE_SHIFT_ARM64E,
         });
@@ -70,12 +70,12 @@ fn the_backing_probe_separates_a_reassigned_address_from_an_unmapped_one() {
 fn the_seed_door_refuses_an_address_recorded_by_another_task() {
     use crate::model::GvaBacking;
     let mut host = FakeHost::new();
-    let mut st = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut st = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     setup_depth1_task(&mut host, &mut st);
 
     let gva = 1u64 << PAGE_SHIFT_ARM64E;
     store_gva_owned(&mut st, gva, 2, 2, vec![0u8; 2 * 2 * 4], 0, None, true);
-    st.host_gva_surfaces.get_mut(&gva).unwrap().backing = Some(GvaBacking {
+    st.host_replicas.gva_surfaces.get_mut(&gva).unwrap().backing = Some(GvaBacking {
         task_id: 1,
         first_gpa: 5u64 << PAGE_SHIFT_ARM64E,
     });
@@ -106,12 +106,12 @@ fn the_seed_door_refuses_an_address_recorded_by_another_task() {
 fn the_seed_door_refuses_a_backing_the_guest_has_re_pointed() {
     use crate::model::GvaBacking;
     let mut host = FakeHost::new();
-    let mut st = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut st = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let root_gpa = setup_depth1_task(&mut host, &mut st);
 
     let gva = 2u64 << PAGE_SHIFT_ARM64E;
     store_gva_owned(&mut st, gva, 2, 2, vec![0u8; 2 * 2 * 4], 0, None, true);
-    st.host_gva_surfaces.get_mut(&gva).unwrap().backing = Some(GvaBacking {
+    st.host_replicas.gva_surfaces.get_mut(&gva).unwrap().backing = Some(GvaBacking {
         task_id: 1,
         first_gpa: 6u64 << PAGE_SHIFT_ARM64E,
     });
@@ -157,7 +157,7 @@ fn the_seed_verdicts_have_distinct_route_names() {
 /// 1080p one.
 #[test]
 fn the_cache_gauge_reports_count_bytes_and_the_largest_entry() {
-    let mut st = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut st = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     assert_eq!(cache_levels(&st).0, CacheLevel::default(), "empty is zero");
 
     // Two small entries and one large: 4x4 and 2x2 at RGBA8, then 8x8.
@@ -196,7 +196,7 @@ fn the_cache_gauge_reports_count_bytes_and_the_largest_entry() {
 /// either value would pin the counter's history instead.
 #[test]
 fn a_gva_reused_after_eviction_never_repeats_a_generation() {
-    let mut st = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut st = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let (gva, w, h) = (0xa4_c000u64, 2u32, 2u32);
 
     let px = vec![0x11; (w * h * 4) as usize];
@@ -227,31 +227,25 @@ fn a_gva_reused_after_eviction_never_repeats_a_generation() {
 /// it was guarding against, so nothing may reintroduce a second source.
 #[test]
 fn every_host_cache_producer_draws_from_one_generation_source() {
-    let mut st = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut st = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let px = vec![0u8; 4 * 4 * 4];
     let mut seen = std::collections::HashSet::new();
 
     store(&mut st, 7, 4, 4, px.clone());
     seen.insert(
-        get_from_with_gen(&st.host_surfaces, &7, 4, 4)
+        get_from_with_gen(&st.host_replicas.surfaces, &7, 4, 4)
             .expect("mid store")
             .1,
     );
     store_texture(&mut st, 3, 9, 4, 4, px.clone(), 0);
     seen.insert(
-        get_from_with_gen(&st.host_texture_surfaces, &(3, 9), 4, 4)
+        get_from_with_gen(&st.host_replicas.texture_surfaces, &(3, 9), 4, 4)
             .expect("ref store")
             .1,
     );
     store_gva_owned(&mut st, 0x5000, 4, 4, px, 0, None, true);
     seen.insert(get_gva_with_gen(&st, 0x5000, 4, 4).expect("gva store").1);
-    assert!(
-        cede_surface_to_resident(&mut st, 7, 4, 4),
-        "cession is a state change and must take a generation too"
-    );
-    seen.insert(st.host_surfaces.get(&7).expect("ceded entry").host_gen);
-
-    assert_eq!(seen.len(), 4, "four stores, four distinct generations");
+    assert_eq!(seen.len(), 3, "three stores, three distinct generations");
     assert!(
         !seen.contains(&0),
         "0 is reserved for 'no host content yet'"
@@ -269,8 +263,8 @@ fn every_host_cache_producer_draws_from_one_generation_source() {
 /// resident-authoritative afterwards is the proof the bytes did not land.
 #[test]
 fn a_short_resident_readback_is_distinguishable_from_a_supersede() {
-    use crate::contract::pixel_format::MTL_FORMAT_RGBA16_FLOAT;
-    let mut st = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    use reims_vgpu_core::pixel_format::MTL_FORMAT_RGBA16_FLOAT;
+    let mut st = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let win = LinearWindow {
         task_id: 6,
         texture_ref: 21,
@@ -304,8 +298,8 @@ fn a_short_resident_readback_is_distinguishable_from_a_supersede() {
 /// and a plain bytes store also clears it.
 #[test]
 fn linear_resident_note_materialize_and_store_clear() {
-    use crate::contract::pixel_format::{MTL_FORMAT_RGBA16_FLOAT, MTL_FORMAT_RGBA8_UNORM};
-    let mut st = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    use reims_vgpu_core::pixel_format::{MTL_FORMAT_RGBA16_FLOAT, MTL_FORMAT_RGBA8_UNORM};
+    let mut st = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let win = LinearWindow {
         task_id: 6,
         texture_ref: 21,
@@ -373,7 +367,7 @@ fn linear_resident_note_materialize_and_store_clear() {
 /// again.
 #[test]
 fn both_linear_store_paths_admit_the_same_windows() {
-    use crate::contract::pixel_format::MTL_FORMAT_RGBA16_FLOAT;
+    use reims_vgpu_core::pixel_format::MTL_FORMAT_RGBA16_FLOAT;
     let ok = LinearWindow {
         task_id: 6,
         texture_ref: 21,
@@ -417,14 +411,14 @@ fn both_linear_store_paths_admit_the_same_windows() {
         ),
     ];
     for (name, win, admits) in cases {
-        let mut st = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let mut st = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
         let px = vec![0u8; (win.width.max(1) * win.height.max(1) * 8) as usize];
         assert_eq!(
             store_linear_texture(&mut st, &win, &px),
             admits,
             "bytes store disagrees on {name}"
         );
-        let mut st = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let mut st = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
         assert_eq!(
             note_linear_texture_resident(&mut st, &win, 7),
             admits,
@@ -433,17 +427,18 @@ fn both_linear_store_paths_admit_the_same_windows() {
     }
     // The one precondition the deferred path holds alone: generation 0 is
     // its "no resident" value, so it can never be stored as one.
-    let mut st = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut st = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     assert!(!note_linear_texture_resident(&mut st, &ok, 0));
 }
 
 /// Task/object deletion of a resident-authoritative entry queues the
-/// engine unpin key (the runtime drains `retired_linear_residents`).
+/// executor release effect.
 #[test]
 fn linear_resident_retires_on_task_and_object_delete() {
-    use crate::contract::pixel_format::MTL_FORMAT_RGBA16_FLOAT;
-    let mut st = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    use reims_vgpu_core::pixel_format::MTL_FORMAT_RGBA16_FLOAT;
+    let mut st = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     st.define_task(6, 0x1000, 1);
+    let first_resource = st.register_test_resource(6, 21);
     let win = LinearWindow {
         task_id: 6,
         texture_ref: 21,
@@ -456,24 +451,32 @@ fn linear_resident_retires_on_task_and_object_delete() {
     assert!(note_linear_texture_resident(&mut st, &win, 2));
     // A pending guest-flush obligation dies with the entry (boot-16 rule:
     // never write guest pages at a lifetime boundary).
-    assert!(st.delete_task(6));
-    assert_eq!(st.retired_linear_residents.len(), 1);
-    let key = st.retired_linear_residents[0];
+    assert!(st.delete_task(6).is_some());
+    assert_eq!(st.host_materializations.queued_linear_residents().len(), 1);
+    let key = st.host_materializations.queued_linear_residents()[0];
     assert!(key.is_linear());
-    assert_eq!(key.map_generation, 6);
-    assert_eq!(key.texture_ref, 21);
-    assert_eq!(key.surface_offset, 0x30_2000);
+    assert_eq!(
+        key.linear_window(),
+        Some((first_resource, 0x30_2000, 32, 64))
+    );
     crate::runtime::render_writeback::retire_linear_residents(&mut st);
-    assert!(st.retired_linear_residents.is_empty());
+    assert!(st
+        .host_materializations
+        .queued_linear_residents()
+        .is_empty());
 
     st.define_task(6, 0x1000, 1);
     st.insert_object(6, 21);
+    let second_resource = st.register_test_resource(6, 21);
     assert!(note_linear_texture_resident(&mut st, &win, 5));
     assert!(st.delete_object(6, 21));
-    assert_eq!(st.retired_linear_residents.len(), 1);
-    assert_eq!(st.retired_linear_residents[0].texture_ref, 21);
+    assert_eq!(st.host_materializations.queued_linear_residents().len(), 1);
+    assert_eq!(
+        st.host_materializations.queued_linear_residents()[0].resource(),
+        Some(second_resource)
+    );
     // Non-resident entries retire nothing.
-    st.retired_linear_residents.clear();
+    let _ = st.host_materializations.take_linear_residents();
     let px = vec![0u8; 4 * 2 * 8];
     st.insert_object(6, 22);
     assert!(store_linear_texture(
@@ -486,12 +489,15 @@ fn linear_resident_retires_on_task_and_object_delete() {
         &px,
     ));
     assert!(st.delete_object(6, 22));
-    assert!(st.retired_linear_residents.is_empty());
+    assert!(st
+        .host_materializations
+        .queued_linear_residents()
+        .is_empty());
 }
 
 #[test]
 fn store_and_get_roundtrip() {
-    let mut st = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut st = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let w = 4u32;
     let h = 2u32;
     let mut px = vec![0u8; (w * h * 4) as usize];
@@ -511,7 +517,7 @@ fn store_and_get_roundtrip() {
 
 #[test]
 fn texture_and_surface_namespaces_are_separate() {
-    let mut st = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut st = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let w = 2u32;
     let h = 2u32;
     let mut surface = vec![0u8; 16];
@@ -529,7 +535,7 @@ fn texture_and_surface_namespaces_are_separate() {
 /// other process's render seed.
 #[test]
 fn texture_cache_keeps_same_numbered_refs_in_separate_tasks() {
-    let mut st = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut st = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let (texture_ref, w, h) = (5, 2, 2);
     store_texture(&mut st, 0, texture_ref, w, h, vec![0x11; 16], 0x1000);
     store_texture(&mut st, 1, texture_ref, w, h, vec![0x22; 16], 0x2000);
@@ -556,7 +562,7 @@ fn texture_cache_keeps_same_numbered_refs_in_separate_tasks() {
 /// and only the second is a wrong LOAD seed.
 #[test]
 fn the_ref_cache_remembers_which_address_produced_its_pixels() {
-    let mut st = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut st = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let (w, h) = (2u32, 2u32);
     assert_eq!(
         texture_source_gva(&st, 3, 5, w, h),
@@ -582,7 +588,7 @@ fn the_ref_cache_remembers_which_address_produced_its_pixels() {
 
 #[test]
 fn gva_cache_roundtrip() {
-    let mut st = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut st = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let gva = 0x2c48000u64;
     let mut px = vec![0u8; 16];
     px[0] = 0xaa;
@@ -622,7 +628,7 @@ fn gva_cache_roundtrip() {
 /// a 64x48 layer takes the same path as a full-screen one.
 #[test]
 fn gva_encode_is_keyed_by_address_at_any_size() {
-    let mut st = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut st = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let gva = 0x2c22000u64;
     // Small layer — same retain path as wallpaper (no W×H gate).
     let w = 64u32;
@@ -653,7 +659,7 @@ fn gva_encode_is_keyed_by_address_at_any_size() {
 ///  - `get_from` returns the same bytes, dropping only the generation.
 #[test]
 fn host_surface_cache_hit_validates_geom_and_truncates_to_need() {
-    use crate::contract::pixel_format::RGBA8_BPP;
+    use reims_vgpu_core::pixel_format::RGBA8_BPP;
     let (id, w, h) = (7u32, 4u32, 2u32);
     let need = (w * h * RGBA8_BPP) as usize; // 32
     let mut map: std::collections::BTreeMap<u32, HostSurface> = Default::default();
@@ -705,90 +711,6 @@ fn host_surface_cache_hit_validates_geom_and_truncates_to_need() {
     );
 }
 
-/// Ceding a mapping to its resident must stop the cache answering for it —
-/// with a miss, never with the frame the Store superseded.
-///
-/// The whole point of the `skip_readback` rail is that no CPU copy of the new
-/// frame exists, so anything still serving the *old* one is serving a frame
-/// that is now a layer behind. `capture_present_frame` reads
-/// `surface_cache::get` **before** it tries the resident, so a cession that
-/// left the bytes in place would pin the display to the pre-Store frame for as
-/// long as the rail stayed engaged, with nothing to report it.
-///
-/// The restore direction is asserted too: the flush writes through
-/// `mapping_write::write_bgra8`, whose tail republishes this entry, and that
-/// is what ends the cession. A cession that could not be ended would leave the
-/// mapping permanently dependent on a resident that only a pin protects.
-#[test]
-fn a_ceded_surface_serves_a_miss_and_says_it_was_ceded() {
-    use crate::model::{DeviceId, PAGE_SHIFT_X86};
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
-    let (w, h) = (4u32, 4u32);
-    let need = (w * h * 4) as usize;
-    store(&mut state, 7, w, h, vec![0xA1u8; need]);
-    let before = state.host_surfaces.get(&7).map(|e| e.host_gen).unwrap();
-
-    assert!(cede_surface_to_resident(&mut state, 7, w, h));
-    assert_eq!(
-        get(&state, 7, w, h),
-        None,
-        "a ceded entry must not serve the frame the Store superseded"
-    );
-    assert!(
-        get_shared(&state, 7, w, h).is_none(),
-        "the shared handle must miss wherever the slice does"
-    );
-    assert!(surface_ceded_to_resident(&state, 7, w, h));
-    assert!(
-        state.host_surfaces.get(&7).unwrap().host_gen != before,
-        "the cession is a state change and must advance host_gen"
-    );
-
-    // A geometry this cache would not have stored anyway is refused, so the
-    // arm can fail closed rather than leave a live entry contradicting a
-    // resident-authoritative window.
-    assert!(!cede_surface_to_resident(&mut state, 0, w, h));
-    assert!(!cede_surface_to_resident(&mut state, 7, 0, h));
-    assert!(!cede_surface_to_resident(
-        &mut state,
-        7,
-        w,
-        crate::model::MAX_SCANOUT_DIM + 1
-    ));
-
-    // The flush's republish ends it.
-    store(&mut state, 7, w, h, vec![0xB2u8; need]);
-    assert!(!surface_ceded_to_resident(&state, 7, w, h));
-    assert_eq!(get(&state, 7, w, h).map(|b| b[0]), Some(0xB2));
-}
-
-/// A ceded entry is not the same thing as a stale-geometry one, and the
-/// classifier must not confuse them.
-///
-/// Both make `get` miss, and folding them together would print
-/// `have=4x4` against `want=4x4` on the LOAD-seed decline — a line that reads
-/// as a contradiction rather than as the expected cost of the rail.
-#[test]
-fn cession_is_distinguishable_from_a_stale_geometry_entry() {
-    use crate::model::{DeviceId, PAGE_SHIFT_X86};
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
-    store(&mut state, 7, 8, 8, vec![0xA1u8; 8 * 8 * 4]);
-    assert!(
-        !surface_ceded_to_resident(&state, 7, 4, 4),
-        "an entry at another geometry is stale, not ceded"
-    );
-    assert!(
-        !surface_ceded_to_resident(&state, 9, 4, 4),
-        "an absent entry is absent, not ceded"
-    );
-    assert!(cede_surface_to_resident(&mut state, 7, 4, 4));
-    assert!(surface_ceded_to_resident(&state, 7, 4, 4));
-    assert!(
-        !surface_ceded_to_resident(&state, 7, 8, 8),
-        "the cession is scoped to the geometry it was taken at"
-    );
-}
-
 /// `get_shared` must hit exactly when `get` hits, including for a stored
 /// buffer carrying slop past `width * height * 4`.
 ///
@@ -799,7 +721,7 @@ fn cession_is_distinguishable_from_a_stale_geometry_entry() {
 #[test]
 fn get_shared_hits_wherever_get_hits_and_never_serves_slop() {
     use crate::model::{DeviceId, PAGE_SHIFT_X86};
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
     let (w, h) = (4u32, 4u32);
     let need = (w * h * 4) as usize;
 
@@ -813,7 +735,7 @@ fn get_shared_hits_wherever_get_hits_and_never_serves_slop() {
     // the engine rejects a seed whose length is not exactly that.
     let mut slop = vec![0xB2u8; need + 16];
     slop[need] = 0xCD;
-    state.host_surfaces.get_mut(&7).unwrap().bgra = std::sync::Arc::new(slop);
+    state.host_replicas.surfaces.get_mut(&7).unwrap().bgra = std::sync::Arc::new(slop);
     let got = get_shared(&state, 7, w, h).expect("a store with slop must still hit");
     assert_eq!(got.len(), need, "must truncate to width*height*BPP");
     assert!(got.iter().all(|&b| b == 0xB2), "no slop byte leaks in");
@@ -828,9 +750,9 @@ fn get_shared_hits_wherever_get_hits_and_never_serves_slop() {
 /// so a GVA of `i << PAGE_SHIFT_ARM64E` resolves to a page this test can
 /// re-point by rewriting one PTE — which is exactly what the guest does when
 /// it hands a virtual address to a different allocation.
-fn setup_depth1_task(host: &mut FakeHost, state: &mut DeviceState) -> u64 {
-    use crate::contract::endian::st32;
-    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+fn setup_depth1_task(host: &mut FakeHost, state: &mut Device) -> u64 {
+    use reims_vgpu_core::endian::st32;
+    use reims_vgpu_paging::geometry::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
     const DIR_PFN: u32 = 2;
     const ROOT_PFN: u32 = 3;
     const PT_BASE: u32 = 4;
@@ -854,7 +776,7 @@ fn setup_depth1_task(host: &mut FakeHost, state: &mut DeviceState) -> u64 {
 }
 
 fn repoint_pte(host: &mut FakeHost, root_gpa: u64, index: u64, pfn: u32) {
-    use crate::contract::endian::st32;
+    use reims_vgpu_core::endian::st32;
     let mut pte = [0u8; 4];
     st32(&mut pte, pfn);
     let _ = host.write_gpa(root_gpa + index * 4, &pte);
@@ -874,7 +796,7 @@ fn repoint_pte(host: &mut FakeHost, root_gpa: u64, index: u64, pfn: u32) {
 #[test]
 fn an_address_that_does_not_resolve_records_no_backing() {
     let mut host = FakeHost::new();
-    let mut st = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut st = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let root_gpa = setup_depth1_task(&mut host, &mut st);
     let page = 1u64 << PAGE_SHIFT_ARM64E;
     let (w, h) = (64u32, 64u32);
@@ -910,7 +832,7 @@ fn an_address_that_does_not_resolve_records_no_backing() {
 #[test]
 fn a_backing_the_probe_cannot_read_is_not_a_fresh_one() {
     let mut host = FakeHost::new();
-    let mut st = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut st = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     setup_depth1_task(&mut host, &mut st);
     let page = 1u64 << PAGE_SHIFT_ARM64E;
     // 64x64 BGRA8 is exactly one 16 KiB page.
