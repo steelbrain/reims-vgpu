@@ -984,6 +984,50 @@ mod device_capability_snapshot_tests {
 /// The last two are both [`Self::Device`]: this crate cannot tell a vCPU thread
 /// from the main loop without QEMU telling it, and the actionable split is
 /// "the render tranche" against "everything QEMU needed while it ran".
+///
+/// # This mutex is the ceiling on any parallel encode, and the number is 2.7x
+///
+/// Driven fullscreen Maps on the x86/Vulkan rail is drain-CPU bound at duty
+/// 0.92 and 22.01 us of `proc_us` a draw, which is ~14.6 frames at this
+/// workload's ~3132 draws a frame. Reaching 60 needs 5.3 us a draw. No serial
+/// repair in that profile is worth more than about 6 % -- the largest single
+/// column is 2.3 us -- so the remaining route is to use more than one of the
+/// host's 24 cores, and what that can buy is set here.
+///
+/// Measured on the same boot the numbers above come from: `engine_lock` says
+/// the worker class holds this mutex **8.088 us a draw** of that 22.01, so the
+/// serial fraction is **36.8 %** and Amdahl caps any parallel encoder at
+/// **2.72x** -- about 40 frames, not 60, however many threads it is given.
+///
+/// The unit that could go wide is the packet, and there are enough of them:
+/// 45 125 packets over 50 driven seconds, **52.5 draws each**, each costing
+/// **823 us** of `exec_phase finish_us`. Metal command buffers are encoded
+/// independently with their order fixed at commit, so the contract grants the
+/// concurrency; this mutex is what would take it back.
+///
+/// What is actually inside the 8.088 us, from `draw_phase` on the same boot,
+/// decides whether the cap can move:
+///
+/// * ~1.3 us a draw is real command recording (`rec_*`), which needs nothing
+///   shared once an encoder owns its own command pool.
+/// * ~1.28 us is `Phase::Slot`, which is the worker **blocking on the GPU
+///   ring**, not work -- see that phase's own doc. It does not shrink by being
+///   parallelised and it is not CPU.
+/// * ~3.4 us is resident-registry traffic (`PostStore`, `Acquire`,
+///   `PostTarget`, the read-set and visibility barriers) and is genuinely
+///   shared state.
+///
+/// So splitting the per-encoder resources out of this mutex and leaving only
+/// the registry behind would put the serial fraction near 15 % and the ceiling
+/// near 6x, which is the only arrangement in reach that has 60 frames in it.
+/// That is a change to what `EngineState` owns, and it is a prerequisite for
+/// the packet fan-out rather than a consequence of it.
+///
+/// One design is already excluded by measurement and must not be retried: a
+/// two-stage pipeline that keeps one recorder thread and lets the resolver run
+/// ahead. It was built, and it is 3.2x **slower**, because the resolver must
+/// synchronise with the recorder 6.4 times a draw at 7.6 us a synchronisation.
+/// `reims_vgpu_core::render`'s `thread_seam` doc carries that in full.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum EngineLockSite {
     /// The drain worker executing guest commands. Recognised by the thread
