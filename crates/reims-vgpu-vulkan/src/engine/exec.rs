@@ -3369,7 +3369,7 @@ fn depth_bars_batching(has_depth: bool) -> bool {
 /// are in play — a depth MRT draw has one framebuffer and must dispose it once.
 unsafe fn dispose_ad_hoc_attachments(
     ctx: &super::context::DeviceContext,
-    pools: &mut super::pools::ResourcePools,
+    pools: &mut super::pools::RecordingPools<'_>,
     ordinary_ad_hoc_framebuffer: bool,
     target_fb: vk::Framebuffer,
     transient_depth: Option<(Option<OwnedDepthImage>, vk::Framebuffer)>,
@@ -3518,7 +3518,7 @@ struct AcquiredDepth {
 
 unsafe fn acquire_depth_view(
     ctx: &super::context::DeviceContext,
-    pools: &mut super::pools::ResourcePools,
+    pools: &mut super::pools::RecordingPools<'_>,
     req: &DrawRequest,
     counters: &EngineCounters,
 ) -> Result<AcquiredDepth, DrawError> {

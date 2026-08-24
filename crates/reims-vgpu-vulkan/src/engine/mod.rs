@@ -4546,7 +4546,10 @@ pub fn copy_target_to_guest_pages(
         ));
     }
     unsafe {
-        let plan = plan_guest_copy(ctx, pools, counters, dst)?;
+        let plan = {
+            let mut recording = pools.recording();
+            plan_guest_copy(ctx, &mut recording, counters, dst)?
+        };
         copy_image_level0_to_buffer(ctx, pools, counters, identity, &snap, &plan, pages)?;
         pools.registry_note_access(identity, pools::ResidentAccess::transfer_read());
         // The copy above is `vkCmdCopyImageToBuffer` into the guest's own
@@ -4638,7 +4641,10 @@ pub fn copy_resident_level0(
         ));
     }
     unsafe { pools.batch_flush(ctx, counters)? };
-    let plan = unsafe { plan_guest_copy(ctx, pools, counters, target)? };
+    let plan = unsafe {
+        let mut recording = pools.recording();
+        plan_guest_copy(ctx, &mut recording, counters, target)?
+    };
     let (destination_image, _) = unsafe {
         pools.registry_ensure_attachment(
             ctx,
@@ -4752,17 +4758,21 @@ pub fn copy_resident_level0(
             &[],
             &destination_release,
         );
-        record_guest_copy_plan(
-            ctx,
-            pools,
-            cb,
-            destination_image,
-            destination_next.layout(),
-            &plan,
-        );
+        {
+            let mut recording = pools.recording();
+            record_guest_copy_plan(
+                ctx,
+                &mut recording,
+                cb,
+                destination_image,
+                destination_next.layout(),
+                &plan,
+            );
+        }
         release_guest_copy_to_host(ctx, cb, &plan);
         if let Some(pages) = reims_vgpu_memory::GuestWritePages::new(pages) {
-            record_guest_write_debt(pools, GuestWriteSource::RingEntry, &pages);
+            let mut recording = pools.recording();
+            record_guest_write_debt(&mut recording, GuestWriteSource::RingEntry, &pages);
         }
 
         pools.encoder_mut().gpu_span_seal_current(ctx, cb);
@@ -4821,7 +4831,7 @@ pub fn copy_resident_level0(
 /// still consumed the pool slots they describe.
 unsafe fn plan_guest_copy(
     ctx: &context::DeviceContext,
-    pools: &mut pools::ResourcePools,
+    pools: &mut pools::RecordingPools<'_>,
     counters: &counters::EngineCounters,
     dst: &GuestPageTarget,
 ) -> Result<GuestCopyPlan, DrawError> {
@@ -4958,7 +4968,7 @@ pub(super) enum GuestWriteSource<'a> {
 }
 
 pub(super) fn record_guest_write_debt(
-    pools: &mut pools::ResourcePools,
+    pools: &mut pools::RecordingPools<'_>,
     source: GuestWriteSource<'_>,
     pages: &reims_vgpu_memory::GuestWritePages,
 ) {
@@ -5092,7 +5102,7 @@ fn scatter_split_enabled() -> bool {
 /// an import, and one `vkCmdCopyBuffer` names exactly one destination buffer.
 unsafe fn plan_guest_linear_copies(
     ctx: &context::DeviceContext,
-    pools: &mut pools::ResourcePools,
+    pools: &mut pools::RecordingPools<'_>,
     dst: &GuestPageTarget,
 ) -> Result<Vec<(ash::vk::Buffer, Vec<ash::vk::BufferCopy>)>, DrawError> {
     use host_ram::GuestWriteDecline;
@@ -5177,7 +5187,7 @@ fn compute_scatter_enabled() -> bool {
 /// about.
 unsafe fn plan_guest_scatter_dispatches(
     ctx: &context::DeviceContext,
-    pools: &mut pools::ResourcePools,
+    pools: &mut pools::RecordingPools<'_>,
     counters: &counters::EngineCounters,
     dst: &GuestPageTarget,
     scratch: &pools::BufferSlot,
@@ -5234,7 +5244,7 @@ unsafe fn plan_guest_scatter_dispatches(
     // because a second copy of the placement arithmetic is a second place to
     // name a descriptor offset the driver will not accept.
     let words: Vec<&[u32]> = tables.iter().map(|(_, t)| &t.words[..]).collect();
-    let (runs_slot, places) = unsafe { stage_run_tables(ctx, pools, counters, &words) }?;
+    let (runs_slot, places) = unsafe { stage_run_tables(ctx, pools, counters, &words)? };
     let mut groups = Vec::with_capacity(tables.len());
     for ((buffer, table), place) in tables.iter().zip(&places) {
         let set = unsafe {
@@ -5349,7 +5359,7 @@ fn pack_run_tables(tables: &[&[u32]], align: u64) -> (Vec<u8>, Vec<RunTablePlace
 /// `ctx` must be the device `pools` belongs to.
 unsafe fn stage_run_tables(
     ctx: &context::DeviceContext,
-    pools: &mut pools::ResourcePools,
+    pools: &mut pools::RecordingPools<'_>,
     counters: &counters::EngineCounters,
     tables: &[&[u32]],
 ) -> Result<(pools::BufferSlot, Vec<RunTablePlace>), types::DrawError> {
@@ -5409,7 +5419,7 @@ pub(super) fn group_by_buffer<C>(
 /// the whole frame instead of the part that happened to be first.
 unsafe fn plan_guest_copies(
     ctx: &context::DeviceContext,
-    pools: &mut pools::ResourcePools,
+    pools: &mut pools::RecordingPools<'_>,
     dst: &GuestPageTarget,
     geom: reims_vgpu_paging::regions::WindowGeometry,
 ) -> Result<Vec<(ash::vk::Buffer, Vec<ash::vk::BufferImageCopy>)>, DrawError> {
@@ -5537,7 +5547,17 @@ unsafe fn copy_image_level0_to_buffer(
             .encoder_mut()
             .readback_span_mark(ctx, cb, ash::vk::PipelineStageFlags::TRANSFER, 1)
     };
-    unsafe { record_guest_copy_plan(ctx, pools, cb, snap.image, read_access.layout(), plan) };
+    unsafe {
+        let mut recording = pools.recording();
+        record_guest_copy_plan(
+            ctx,
+            &mut recording,
+            cb,
+            snap.image,
+            read_access.layout(),
+            plan,
+        )
+    };
     unsafe {
         pools.encoder_mut().readback_span_mark(
             ctx,
@@ -5548,7 +5568,12 @@ unsafe fn copy_image_level0_to_buffer(
     };
     unsafe { release_guest_copy_to_host(ctx, cb, plan) };
     if let Some(pages) = reims_vgpu_memory::GuestWritePages::new(pages) {
-        record_guest_write_debt(pools, GuestWriteSource::ResidentTarget(source), &pages);
+        let mut recording = pools.recording();
+        record_guest_write_debt(
+            &mut recording,
+            GuestWriteSource::ResidentTarget(source),
+            &pages,
+        );
     }
     // The wait this rail no longer takes here.
     //
@@ -5605,7 +5630,7 @@ unsafe fn copy_image_level0_to_buffer(
 /// guessed from the plan.
 unsafe fn record_guest_copy_plan(
     ctx: &context::DeviceContext,
-    pools: &mut pools::ResourcePools,
+    pools: &mut pools::RecordingPools<'_>,
     cb: ash::vk::CommandBuffer,
     src_image: ash::vk::Image,
     src_layout: ash::vk::ImageLayout,

@@ -11,7 +11,7 @@ use std::sync::atomic::Ordering;
 use super::context::DeviceContext;
 use super::counters::{CreateSite, EngineCounters};
 use super::digest::Digest128;
-use super::pools::{DeferredHandle, ResourcePools};
+use super::pools::{DeferredHandle, RecordingPools};
 use super::types::{
     BlendKey, ColorWriteMask, CullMode, DepthClipMode, DrawError, FillMode, PrimitiveTopology,
     SamplerStateKey, VertexAttributeFormat, VertexStepFunction,
@@ -1440,7 +1440,7 @@ impl ObjectCaches {
         ctx: &DeviceContext,
         words: &std::sync::Arc<Vec<u32>>,
         counters: &EngineCounters,
-        pools: &mut ResourcePools,
+        pools: &mut RecordingPools<'_>,
     ) -> Result<(Digest128, vk::ShaderModule), DrawError> {
         if let Some(key) = indexes.shader_digests.get(words) {
             // Negative before positive, in the order the walking form asks them:
@@ -1469,7 +1469,7 @@ impl ObjectCaches {
         ctx: &DeviceContext,
         words: &[u32],
         counters: &EngineCounters,
-        pools: &mut ResourcePools,
+        pools: &mut RecordingPools<'_>,
     ) -> Result<(Digest128, vk::ShaderModule), DrawError> {
         // Verify that the host features enabled at device creation cover the
         // final module. metal2vulkan owns capability declaration; mutating its
@@ -1576,7 +1576,7 @@ impl ObjectCaches {
         ctx: &DeviceContext,
         key: &LayoutKey,
         counters: &EngineCounters,
-        pools: &mut ResourcePools,
+        pools: &mut RecordingPools<'_>,
     ) -> Result<(vk::DescriptorSetLayout, vk::PipelineLayout), DrawError> {
         if let Some(err) = self.layouts.get_negative(key) {
             counters.layout_misses.fetch_add(1, Ordering::Relaxed);
@@ -1679,7 +1679,7 @@ impl ObjectCaches {
         ctx: &DeviceContext,
         key: PassKey,
         counters: &EngineCounters,
-        pools: &mut ResourcePools,
+        pools: &mut RecordingPools<'_>,
     ) -> Result<vk::RenderPass, DrawError> {
         if let Some(err) = self.passes.get_negative(&key) {
             counters.pass_misses.fetch_add(1, Ordering::Relaxed);
@@ -1888,7 +1888,7 @@ impl ObjectCaches {
         ctx: &DeviceContext,
         key: &SamplerStateKey,
         counters: &EngineCounters,
-        pools: &mut ResourcePools,
+        pools: &mut RecordingPools<'_>,
     ) -> Result<vk::Sampler, DrawError> {
         if let Some(err) = self.samplers.get_negative(key) {
             counters.sampler_misses.fetch_add(1, Ordering::Relaxed);
@@ -2102,7 +2102,7 @@ impl ObjectCaches {
         pipeline_layout: vk::PipelineLayout,
         render_pass: vk::RenderPass,
         counters: &EngineCounters,
-        pools: &mut ResourcePools,
+        pools: &mut RecordingPools<'_>,
     ) -> Result<vk::Pipeline, DrawError> {
         if let Some(identity) = pipeline_lifetime {
             if let Some(pipeline) = indexes.pipeline_objects.get(identity, key) {
@@ -2543,7 +2543,7 @@ impl ObjectCaches {
         shader: ShaderModuleSource<'_>,
         pipeline_layout: vk::PipelineLayout,
         counters: &EngineCounters,
-        pools: &mut ResourcePools,
+        pools: &mut RecordingPools<'_>,
     ) -> Result<vk::Pipeline, DrawError> {
         if let Some(err) = self.compute_pipelines.get_negative(key) {
             counters

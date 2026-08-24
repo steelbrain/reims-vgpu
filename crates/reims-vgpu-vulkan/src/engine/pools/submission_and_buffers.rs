@@ -973,126 +973,143 @@ impl SharedPools {
     }
 }
 
+macro_rules! impl_submission_owner_ops {
+    ($pool:ty) => {
+        #[allow(
+            dead_code,
+            reason = "pool operations are generated for both owner and recording views"
+        )]
+        impl $pool {
+            /// Close one guest exec as one native recording transaction.
+            ///
+            /// Segment continuation may retain the render pass and dynamic state for
+            /// every compatible draw inside the exec, but the exec boundary commits
+            /// that command buffer before another identity can claim the encoder. The
+            /// identity is released even when the driver refuses the commit: callers
+            /// cannot retry a consumed packet, and retaining it would turn the next
+            /// packet into a false overlap refusal.
+            pub(crate) unsafe fn close_submission(
+                &mut self,
+                ctx: &DeviceContext,
+                counters: &EngineCounters,
+                identity: SubmissionIdentity,
+            ) -> Result<(), DrawError> {
+                if !self.encoder.submission_is_closing(identity)? {
+                    return Ok(());
+                }
+                let result = unsafe { self.batch_flush(ctx, counters) };
+                self.encoder.release_submission(identity);
+                result
+            }
+
+            /// End one guest allocation's backend lifetime after open submissions.
+            pub(crate) unsafe fn retire_guest_import(
+                &mut self,
+                device: &ash::Device,
+                import_id: reims_vgpu_memory::ImportId,
+            ) {
+                match self.shared.host_ram_imports.retire(import_id) {
+                    host_ram::ParentRetire::Ready(parent) => {
+                        crate::telemetry::note_route("guest_import_retired_now");
+                        self.dispose(device, DeferredHandle::GuestAllocation(parent));
+                    }
+                    host_ram::ParentRetire::WaitingForChildren => {
+                        crate::telemetry::note_route("guest_import_retired_waiting_child");
+                        self.dispose(device, DeferredHandle::GuestAllocationBarrier(import_id));
+                    }
+                    host_ram::ParentRetire::NotImported => {
+                        crate::telemetry::note_route("guest_import_retired_unimported");
+                        self.shared.completed_guest_imports.push(import_id);
+                    }
+                }
+            }
+
+            /// Take allocation identities whose backend access has ended.
+            pub(crate) fn take_completed_guest_imports(
+                &mut self,
+            ) -> Vec<reims_vgpu_memory::ImportId> {
+                std::mem::take(&mut self.shared.completed_guest_imports)
+            }
+
+            pub(crate) fn guest_reset_counts(&self) -> (usize, usize, usize, usize) {
+                let sampled = self.encoder.sampled_live.len()
+                    + self.shared.sampled_free.len()
+                    + self.shared.sampled_cache.len()
+                    + self.encoder.attachment_snapshot_live.len()
+                    + self.shared.attachment_snapshot_free.len();
+                let storage = self.encoder.storage_image_live.len()
+                    + self.shared.storage_image_free.len()
+                    + self.shared.compute_storage_registry.len();
+                (
+                    self.shared.registry.len(),
+                    self.shared.targets.len(),
+                    sampled,
+                    storage,
+                )
+            }
+
+            /// The bindable range `guest_ref` names, importing its RAMBlock if this is
+            /// the first reference into it.
+            ///
+            /// Unlike a per-window import there is nothing to displace: an
+            /// import is per RAMBlock and lives as long as the device, so no caller can
+            /// find the buffer it just bound freed underneath a submission in flight.
+            ///
+            /// # Safety
+            ///
+            /// `ctx` must own the device every live import was made against.
+            pub(crate) unsafe fn bind_guest_ram(
+                &mut self,
+                ctx: &DeviceContext,
+                guest_ref: &reims_vgpu_memory::GuestRef,
+            ) -> Result<host_ram::BoundGuestRam, host_ram::HostRamDecline> {
+                unsafe { self.shared.host_ram_imports.bind(ctx, guest_ref) }
+            }
+
+            /// Import a RAMBlock ahead of any reference into it.
+            ///
+            /// # Safety
+            ///
+            /// `ctx` must own the device every live import was made against.
+            pub(crate) unsafe fn warm_guest_ram(
+                &mut self,
+                ctx: &DeviceContext,
+                import: &reims_vgpu_memory::GuestRamImport,
+            ) -> Result<bool, host_ram::HostRamDecline> {
+                unsafe { self.shared.host_ram_imports.warm(ctx, import) }
+            }
+
+            /// How many RAMBlocks are imported, and how many bytes they cover.
+            ///
+            /// The count is the reading that says whether the model held: one or two
+            /// for a whole boot. A count that tracks the workload is a per-resource
+            /// import, which the extension does not guarantee works and which pays the
+            /// driver's page pinning for an answer that never changes.
+            pub(crate) fn host_ram_import_census(
+                &self,
+            ) -> (usize, usize, u64, usize, usize, usize) {
+                let (ramblocks, aliases) = self.shared.host_ram_imports.counts();
+                let recycled_images = self.shared.sampled_free.len()
+                    + self.shared.attachment_snapshot_free.len()
+                    + self.shared.target_free.len()
+                    + self.shared.storage_image_free.len();
+                (
+                    ramblocks,
+                    aliases,
+                    self.shared.host_ram_imports.imported_bytes(),
+                    0,
+                    0,
+                    recycled_images,
+                )
+            }
+        }
+    };
+}
+
+impl_submission_owner_ops!(ResourcePools);
+impl_submission_owner_ops!(RecordingPools<'_>);
+
 impl ResourcePools {
-    /// Close one guest exec as one native recording transaction.
-    ///
-    /// Segment continuation may retain the render pass and dynamic state for
-    /// every compatible draw inside the exec, but the exec boundary commits
-    /// that command buffer before another identity can claim the encoder. The
-    /// identity is released even when the driver refuses the commit: callers
-    /// cannot retry a consumed packet, and retaining it would turn the next
-    /// packet into a false overlap refusal.
-    pub(crate) unsafe fn close_submission(
-        &mut self,
-        ctx: &DeviceContext,
-        counters: &EngineCounters,
-        identity: SubmissionIdentity,
-    ) -> Result<(), DrawError> {
-        if !self.encoder.submission_is_closing(identity)? {
-            return Ok(());
-        }
-        let result = unsafe { self.batch_flush(ctx, counters) };
-        self.encoder.release_submission(identity);
-        result
-    }
-
-    /// End one guest allocation's backend lifetime after open submissions.
-    pub(crate) unsafe fn retire_guest_import(
-        &mut self,
-        device: &ash::Device,
-        import_id: reims_vgpu_memory::ImportId,
-    ) {
-        match self.shared.host_ram_imports.retire(import_id) {
-            host_ram::ParentRetire::Ready(parent) => {
-                crate::telemetry::note_route("guest_import_retired_now");
-                self.dispose(device, DeferredHandle::GuestAllocation(parent));
-            }
-            host_ram::ParentRetire::WaitingForChildren => {
-                crate::telemetry::note_route("guest_import_retired_waiting_child");
-                self.dispose(device, DeferredHandle::GuestAllocationBarrier(import_id));
-            }
-            host_ram::ParentRetire::NotImported => {
-                crate::telemetry::note_route("guest_import_retired_unimported");
-                self.shared.completed_guest_imports.push(import_id);
-            }
-        }
-    }
-
-    /// Take allocation identities whose backend access has ended.
-    pub(crate) fn take_completed_guest_imports(&mut self) -> Vec<reims_vgpu_memory::ImportId> {
-        std::mem::take(&mut self.shared.completed_guest_imports)
-    }
-
-    pub(crate) fn guest_reset_counts(&self) -> (usize, usize, usize, usize) {
-        let sampled = self.encoder.sampled_live.len()
-            + self.shared.sampled_free.len()
-            + self.shared.sampled_cache.len()
-            + self.encoder.attachment_snapshot_live.len()
-            + self.shared.attachment_snapshot_free.len();
-        let storage = self.encoder.storage_image_live.len()
-            + self.shared.storage_image_free.len()
-            + self.shared.compute_storage_registry.len();
-        (
-            self.shared.registry.len(),
-            self.shared.targets.len(),
-            sampled,
-            storage,
-        )
-    }
-
-    /// The bindable range `guest_ref` names, importing its RAMBlock if this is
-    /// the first reference into it.
-    ///
-    /// Unlike a per-window import there is nothing to displace: an
-    /// import is per RAMBlock and lives as long as the device, so no caller can
-    /// find the buffer it just bound freed underneath a submission in flight.
-    ///
-    /// # Safety
-    ///
-    /// `ctx` must own the device every live import was made against.
-    pub(crate) unsafe fn bind_guest_ram(
-        &mut self,
-        ctx: &DeviceContext,
-        guest_ref: &reims_vgpu_memory::GuestRef,
-    ) -> Result<host_ram::BoundGuestRam, host_ram::HostRamDecline> {
-        unsafe { self.shared.host_ram_imports.bind(ctx, guest_ref) }
-    }
-
-    /// Import a RAMBlock ahead of any reference into it.
-    ///
-    /// # Safety
-    ///
-    /// `ctx` must own the device every live import was made against.
-    pub(crate) unsafe fn warm_guest_ram(
-        &mut self,
-        ctx: &DeviceContext,
-        import: &reims_vgpu_memory::GuestRamImport,
-    ) -> Result<bool, host_ram::HostRamDecline> {
-        unsafe { self.shared.host_ram_imports.warm(ctx, import) }
-    }
-
-    /// How many RAMBlocks are imported, and how many bytes they cover.
-    ///
-    /// The count is the reading that says whether the model held: one or two
-    /// for a whole boot. A count that tracks the workload is a per-resource
-    /// import, which the extension does not guarantee works and which pays the
-    /// driver's page pinning for an answer that never changes.
-    pub(crate) fn host_ram_import_census(&self) -> (usize, usize, u64, usize, usize, usize) {
-        let (ramblocks, aliases) = self.shared.host_ram_imports.counts();
-        let recycled_images = self.shared.sampled_free.len()
-            + self.shared.attachment_snapshot_free.len()
-            + self.shared.target_free.len()
-            + self.shared.storage_image_free.len();
-        (
-            ramblocks,
-            aliases,
-            self.shared.host_ram_imports.imported_bytes(),
-            0,
-            0,
-            recycled_images,
-        )
-    }
-
     pub(crate) fn new() -> Self {
         Self {
             encoder: EncoderPools::new(),
@@ -1101,834 +1118,874 @@ impl ResourcePools {
     }
 
     pub(in crate::engine) fn recording(&mut self) -> RecordingPools<'_> {
-        RecordingPools { pools: self }
-    }
-
-    /// The command-recording state owned by this encoder alone.
-    ///
-    /// Returning the narrow owner makes command-buffer state operations unable
-    /// to reach the resident registry or device-wide allocators by type. This
-    /// is the unit a future encoder worker can move independently; callers that
-    /// need shared resources continue to use [`ResourcePools`] explicitly.
-    pub(in crate::engine) fn encoder_mut(&mut self) -> &mut EncoderPools {
-        &mut self.encoder
-    }
-
-    /// The command-recording state owned by this encoder alone.
-    pub(in crate::engine) fn encoder(&self) -> &EncoderPools {
-        &self.encoder
-    }
-
-    /// Advance the registry clock and report whether a bounded maintenance pass
-    /// is due. The pass may release objects already outside every live resource
-    /// (dead direct images and free-pool entries), but elapsed time is never an
-    /// authority to destroy a live resident.
-    pub(super) fn plan_idle_maintenance(&mut self, now_ms: u64) -> bool {
-        if now_ms > self.shared.idle_clock_ms {
-            self.shared.idle_clock_ms = now_ms;
+        RecordingPools {
+            encoder: &mut self.encoder,
+            shared: &mut self.shared,
         }
-        let now = self.shared.idle_clock_ms;
-        if now < IDLE_MAINTENANCE_START_MS
-            || now.saturating_sub(self.shared.last_maintenance_ms) < MAINTENANCE_INTERVAL_MS
-        {
-            return false;
-        }
-        self.shared.last_maintenance_ms = now;
-        true
-    }
-
-    /// Destroy up to `max` images from the image recycle pools (`sampled_free`
-    /// then `target_free`) — freeing their slab sub-allocations — and up to `max`
-    /// buffers from the HOST_VISIBLE `staging_free`/`readback_free` pools. Called
-    /// only on a fired idle pass. Returns the total count destroyed. Terminal
-    /// destroy (not re-recycle): at idle these are pure retained memory.
-    ///
-    /// The buffer pools matter as much as the image pools for "least host memory":
-    /// they are never re-evaluated on the hot path, so at idle they hold a whole
-    /// video session's upload working set forever (measured `staging_mb=177` +
-    /// `readback_mb=61` frozen for 30 s+ after the tab closed). On a discrete GPU
-    /// that is system RAM; on an iGPU it is shared guest RAM (portability target).
-    /// Trimming here (gradual, like the image pools; they refill a-few-per-frame
-    /// when uploads resume) returns it once the session ends without any hot-path
-    /// re-alloc churn.
-    ///
-    /// `trim_buffers` gates ONLY the HOST_VISIBLE buffer pools: they re-alloc via
-    /// full `vkAllocateMemory` on the upload hot path, so we only free them once
-    /// idle has *settled* (see [`SETTLED_PASSES_FOR_BUFFER_TRIM`]). The image
-    /// pools always trim — they refill via cheap slab suballocation.
-    pub(super) unsafe fn trim_recycle_pools(
-        &mut self,
-        device: &ash::Device,
-        max: usize,
-        trim_buffers: bool,
-    ) -> usize {
-        let mut trimmed = 0;
-        while trimmed < max {
-            let Some(slot) = self.shared.attachment_snapshot_free.pop_any() else {
-                break;
-            };
-            self.destroy_deferred_handle(device, DeferredHandle::RecycleSampled(slot));
-            trimmed += 1;
-        }
-        while trimmed < max {
-            let Some(slot) = self.shared.sampled_free.pop_any() else {
-                break;
-            };
-            self.destroy_deferred_handle(device, DeferredHandle::RecycleSampled(slot));
-            trimmed += 1;
-        }
-        while trimmed < max {
-            let Some(img) = self.shared.target_free.pop_any() else {
-                break;
-            };
-            self.destroy_deferred_handle(
-                device,
-                DeferredHandle::Image {
-                    image: img.image,
-                    view: img.view,
-                    memory: img.memory,
-                },
-            );
-            trimmed += 1;
-        }
-        // Buffer pools get their own budget so image trimming never starves them,
-        // and only trim once idle has settled (they re-alloc via full
-        // vkAllocateMemory on the upload hot path — trimming mid-video hitches it).
-        let mut buf_trimmed = 0;
-        if trim_buffers {
-            while buf_trimmed < max {
-                let Some(slot) = pop_largest_pool_entry(&mut self.encoder.staging_free) else {
-                    break;
-                };
-                release_buffer_slot(device, &mut self.shared.slabs, slot);
-                buf_trimmed += 1;
-            }
-            while buf_trimmed < max {
-                let Some(slot) = pop_largest_pool_entry(&mut self.encoder.readback_free) else {
-                    break;
-                };
-                release_buffer_slot(device, &mut self.shared.slabs, slot);
-                buf_trimmed += 1;
-            }
-            // The gather pool is under the same budget and the same settled-idle
-            // gate as the two above, for the same reason: its refill is a slab
-            // carve that only costs anything when it lands on a new block, and
-            // trimming it mid-workload would buy back VRAM at the price of that
-            // block allocation under the engine lock.
-            while buf_trimmed < max {
-                let Some(slot) = pop_largest_pool_entry(&mut self.encoder.gather_free) else {
-                    break;
-                };
-                release_buffer_slot(device, &mut self.shared.slabs, slot);
-                buf_trimmed += 1;
-            }
-            // Returning the carves above is what lets an upload block empty;
-            // this is where the emptied blocks go back. It belongs here and not
-            // in the release that empties a block, because a live workload
-            // crosses a block boundary and back several times a minute and
-            // re-crossing costs a whole block allocation (20-30 ms under this
-            // lock). The settled gate is the same one the buffer pools are
-            // under, so what is retained mid-session is bounded by the live
-            // working set, and what a quiet desktop keeps is one spare block per
-            // size class — tens of MiB against the ~177 MiB of frozen staging
-            // this trim was written for.
-            self.shared
-                .slabs
-                .trim_empty_blocks(device, BUFFER_SLAB_IDLE_KEEP_EMPTY);
-            // The standalone (non-slab) compute-storage recycle pool re-allocs via
-            // a full `vkAllocateMemory` on the next dispatch — like the buffer
-            // pools above and unlike the slab-backed image pools (cheap
-            // suballocation refill) — so gate its trim on settled idle too: a brief
-            // pause between compute dispatches must not steal a pooled storage
-            // image and spike the next dispatch with a fresh allocation. Its own
-            // budget so it never starves the buffer trim.
-            let mut storage_trimmed = 0;
-            while storage_trimmed < max {
-                let Some(slot) = self.shared.storage_image_free.pop_any() else {
-                    break;
-                };
-                self.destroy_deferred_handle(device, slot.deferred());
-                storage_trimmed += 1;
-            }
-            buf_trimmed += storage_trimmed;
-        }
-        // The DEVICE_LOCAL image slab, under the same settled state as the
-        // pools above rather than at the caller — which is how it came to run on
-        // *every* fired pass instead. The pass fires every
-        // `MAINTENANCE_INTERVAL_MS` whenever the poll heartbeat ticks, which is
-        // most of the time on any workload that does not saturate the drain
-        // worker, so trimming to zero there handed back the block the next frame
-        // re-allocated. [`IDLE_SLAB_KEEP_EMPTY`] carries the boot that read 257
-        // allocations against 162 trims of a 64 MiB block in 25 seconds.
-        //
-        // Not inside the `if` above, because the switch that restores the old
-        // behaviour has to be able to reach this on an unsettled pass; the
-        // policy is [`idle_slab_trim_keep`] and this is its only caller.
-        if let Some(keep) = idle_slab_trim_keep(trim_buffers) {
-            self.shared.slab.trim_empty_blocks(device, keep);
-        }
-        trimmed + buf_trimmed
-    }
-
-    /// Take entry `index` out of the sampled cache and update its byte gauge.
-    fn remove_sampled_entry(&mut self, index: usize) -> SampledSlot {
-        let evicted = self.shared.sampled_cache.swap_remove(index);
-        self.shared.sampled_cache_bytes = self
-            .shared
-            .sampled_cache_bytes
-            .saturating_sub(evicted.content_len);
-        evicted.slot
-    }
-
-    fn push_sampled_entry(&mut self, entry: ResidentSampledSlot) {
-        self.shared.sampled_cache.push(entry);
-    }
-
-    /// Remove entries whose serialized texture owners are all gone. The
-    /// returned slots still follow the ordinary deferred recycle path, so a
-    /// submission recorded before deletion may finish sampling them safely.
-    fn take_released_sampled_entries(&mut self) -> Vec<SampledSlot> {
-        let mut released = Vec::new();
-        while let Some(index) = self
-            .shared
-            .sampled_cache
-            .iter()
-            .position(|entry| !entry.has_live_owner())
-        {
-            released.push(self.remove_sampled_entry(index));
-        }
-        released
-    }
-
-    /// Update the consecutive-settled-pass counter for maintenance and return
-    /// whether the HOST_VISIBLE buffer pools may be trimmed this pass.
-    ///
-    /// A pass is settled only if no staging buffer was acquired since the
-    /// previous pass. The trim then needs
-    /// `SETTLED_PASSES_FOR_BUFFER_TRIM` consecutive settled passes.
-    ///
-    /// Upload traffic is the direct signal for the failure this gate prevents:
-    /// "a single quiet pass mid-playback
-    /// cannot steal a staging buffer and spike the next upload's latency with a
-    /// full `vkAllocateMemory`". Registry victims go to zero when the session is
-    /// idle *and* when it is busy with a stable working set — a steady animation
-    /// re-uses the same render targets forever, so nothing ages out and every pass
-    /// reads as quiet. Measured under testufo: `idle_target_drain` fired 169 times
-    /// in one boot, roughly once a second throughout the load, and the staging pool
-    /// re-allocated the 8 MiB full-frame bucket 607 times at **12.6 ms each**.
-    ///
-    /// So ask the pool that is about to be trimmed. `staging_hits + misses` is
-    /// every acquire, so an unchanged total is the upload path genuinely doing
-    /// nothing — the quantity the victim count was standing in for, measured
-    /// directly instead of inferred. At true idle the guest stops publishing, no
-    /// draw acquires staging, and the trim still fires and still returns the
-    /// memory.
-    pub(super) fn note_maintenance_settled(&mut self) -> bool {
-        let acquires = self
-            .encoder
-            .staging_hits
-            .wrapping_add(self.encoder.staging_misses);
-        let uploads_ran = acquires != self.encoder.settled_staging_mark;
-        self.encoder.settled_staging_mark = acquires;
-        if !uploads_ran {
-            self.shared.settled_maintenance_passes =
-                self.shared.settled_maintenance_passes.saturating_add(1);
-        } else {
-            self.shared.settled_maintenance_passes = 0;
-        }
-        self.shared.settled_maintenance_passes >= SETTLED_PASSES_FOR_BUFFER_TRIM
-    }
-
-    /// Run periodic maintenance for objects that are already outside live
-    /// resource ownership. Live render, sampled, and compute residents leave
-    /// only through explicit lifetime changes or allocation-pressure recovery;
-    /// an idle interval is not a resource-state transition.
-    pub(crate) unsafe fn advance_registry_maintenance(
-        &mut self,
-        ctx: &DeviceContext,
-        counters: &EngineCounters,
-        now_ms: u64,
-    ) {
-        if !self.plan_idle_maintenance(now_ms) {
-            return;
-        }
-        for slot in self.take_released_sampled_entries() {
-            self.dispose(&ctx.device, DeferredHandle::RecycleSampled(slot));
-        }
-        self.retire_released_residents(ctx, counters, IDLE_RECYCLE_TRIM_PER_PASS);
-        let trim_buffers = self.note_maintenance_settled();
-        self.trim_recycle_pools(&ctx.device, IDLE_RECYCLE_TRIM_PER_PASS, trim_buffers);
-    }
-
-    /// Cumulative transient sampled/snapshot pool recycle diagnostics:
-    /// `(free_hits, free_allocs, recycle_admits, recycle_cap_drops)`.
-    /// Merged into `CounterSnapshot` by `engine::counter_snapshot`.
-    pub(crate) fn recycle_stats(&self) -> (u64, u64, u64, u64) {
-        let sampled = self.shared.sampled_free.stats();
-        let snapshots = self.shared.attachment_snapshot_free.stats();
-        (
-            sampled.0 + snapshots.0,
-            sampled.1 + snapshots.1,
-            sampled.2 + snapshots.2,
-            sampled.3 + snapshots.3,
-        )
-    }
-
-    pub(crate) unsafe fn ensure_init(
-        &mut self,
-        ctx: &DeviceContext,
-        counters: &EngineCounters,
-    ) -> Result<(), DrawError> {
-        if self.encoder.initialized {
-            return Ok(());
-        }
-        debug_assert_eq!(self.shared.attachment_snapshot_free.len(), 0);
-        unsafe {
-            self.encoder.ensure_init(
-                ctx,
-                counters,
-                super::batch_max_draws(ctx.caps.memory.topology),
-            )
-        }
-    }
-
-    /// The capacity installed for this pool's physical device.
-    pub(crate) fn batch_capacity(&self) -> u64 {
-        self.encoder.batch_max_draws
-    }
-
-    /// The device's guest-scatter pipeline, built on the first writeback that
-    /// wants it and `None` on a device whose driver refused to build it.
-    ///
-    /// The refusal latches: a host that cannot compile our kernel is not going
-    /// to compile it on the next frame either, and retrying would put a pipeline
-    /// creation on the hot path several hundred times a second. It is emitted
-    /// once, on the fail channel, because the fallback it selects is the
-    /// expensive path this rail exists to leave.
-    ///
-    /// # Safety
-    ///
-    /// `ctx` must be the device these pools belong to.
-    pub(crate) unsafe fn scatter_pipeline(
-        &mut self,
-        ctx: &DeviceContext,
-    ) -> Option<super::super::guest_scatter::ScatterPipeline> {
-        if let Some(p) = self.shared.scatter {
-            return Some(p);
-        }
-        if self.shared.scatter_refused {
-            return None;
-        }
-        match unsafe { super::super::guest_scatter::ScatterPipeline::create(ctx) } {
-            Ok(p) => {
-                self.shared.scatter = Some(p);
-                Some(p)
-            }
-            Err(e) => {
-                self.shared.scatter_refused = true;
-                reims_vgpu_observe::Emit::decline("scatter_pipeline", &e).fail();
-                None
-            }
-        }
-    }
-
-    /// Whether the current command buffer already owns the cleanup that will
-    /// receive resources rejected by a sampled-cache admission. A submitted
-    /// entry owns it through `pending`; a deferred batch owns it through
-    /// `open_batch`. Native-object destruction is governed independently by
-    /// the recording order.
-    fn current_entry_owns_cleanup(&self) -> bool {
-        self.encoder
-            .slots
-            .get(self.encoder.cur)
-            .is_some_and(|slot| slot.pending.is_some())
-            || self.encoder.open_batch.is_some()
-    }
-
-    /// Destroy `handle` now if every recording that could have named it is
-    /// terminal, else park it until that exact ordered prefix retires.
-    pub(crate) unsafe fn dispose(&mut self, device: &ash::Device, handle: DeferredHandle) {
-        self.release_ready_graveyard(device);
-        match self.shared.retirement.latest() {
-            Some(point) if !self.shared.retirement.retired(point) => {
-                self.shared.graveyard.push((point, handle));
-            }
-            _ => self.destroy_or_recycle(device, handle),
-        }
-    }
-
-    /// Acquire + bind DEVICE_LOCAL image memory from the slab suballocator,
-    /// registering the sub-allocation against `image` on success. On bind
-    /// failure the slab range is released (the caller destroys the `image`).
-    /// Returns the backing `VkDeviceMemory` (shared across the block's other
-    /// images) for the pool's image struct; the image was bound at the slab
-    /// offset, not offset 0.
-    ///
-    /// Out of memory gets one retry here, for every caller, after emptying the
-    /// recycle pools. Only the pools: this runs at four sites, one of them
-    /// part-way through recording a draw, and
-    /// [`ResourcePools::reclaim_pools_for_allocation_retry`] is the half of the
-    /// recovery that is safe there — a free-list entry is by construction one no
-    /// command buffer holds. Retiring live residents is not safe here, and is
-    /// done only by `registry_ensure_attachment`, which calls the fuller
-    /// [`ResourcePools::reclaim_for_allocation_retry`] itself; that function
-    /// records the segfault which established the difference.
-    pub(super) unsafe fn bind_image_slab(
-        &mut self,
-        ctx: &DeviceContext,
-        image: vk::Image,
-        ireq: &vk::MemoryRequirements,
-        bind_op: VkOp,
-        counters: &EngineCounters,
-    ) -> Result<vk::DeviceMemory, DrawError> {
-        match self.bind_image_slab_once(ctx, image, ireq, bind_op, counters) {
-            // Once, and only for this result. A reclaim that frees nothing means
-            // there was nothing to free, so the original error is the honest one
-            // and a second attempt would only repeat it.
-            Err(error)
-                if error.out_of_memory() && self.reclaim_pools_for_allocation_retry(ctx) > 0 =>
-            {
-                self.bind_image_slab_once(ctx, image, ireq, bind_op, counters)
-                    .map_err(|_| error)
-            }
-            other => other,
-        }
-    }
-
-    unsafe fn bind_image_slab_once(
-        &mut self,
-        ctx: &DeviceContext,
-        image: vk::Image,
-        ireq: &vk::MemoryRequirements,
-        bind_op: VkOp,
-        counters: &EngineCounters,
-    ) -> Result<vk::DeviceMemory, DrawError> {
-        self.shared
-            .slab
-            .ensure_image_unregistered(image)
-            .map_err(DrawError::Slab)?;
-        let token = self.shared.slab.acquire(ctx, ireq, counters)?;
-        match ctx
-            .device
-            .bind_image_memory(image, token.memory, token.offset())
-        {
-            Ok(()) => {
-                self.shared.slab.register(image, token);
-                Ok(token.memory)
-            }
-            Err(e) => {
-                self.shared.slab.release_token(&ctx.device, token);
-                Err(DrawError::VkCall(VkCall::new(bind_op, e)))
-            }
-        }
-    }
-
-    /// Release the slab sub-allocation backing `image` (the caller destroys the
-    /// `image`/view handles). No-op for a non-slab image. This replaces the raw
-    /// `vkFreeMemory` at every DEVICE_LOCAL-image free site: the memory belongs
-    /// to a shared block, not the image.
-    pub(super) unsafe fn free_image_slab(&mut self, device: &ash::Device, image: vk::Image) {
-        self.shared.slab.free_image(device, image);
-    }
-
-    /// Terminal handling for a deferred handle once it is safe (in_flight == 0):
-    /// recyclable slots rejoin their geometry-keyed pools; every other handle
-    /// is destroyed.
-    unsafe fn destroy_or_recycle(&mut self, device: &ash::Device, handle: DeferredHandle) {
-        match handle {
-            DeferredHandle::RecycleSampled(slot) => {
-                self.admit_sampled(slot);
-            }
-            DeferredHandle::RecycleTarget(img) => {
-                self.admit_target(img);
-            }
-            other => self.destroy_deferred_handle(device, other),
-        }
-    }
-
-    /// Return an evicted sampled slot to `sampled_free` for reuse by a later
-    /// same-geometry `acquire_sampled`.
-    fn admit_sampled(&mut self, slot: SampledSlot) {
-        self.shared.sampled_free.admit(slot.key(), slot)
-    }
-
-    /// Return a displaced resident-target image to `target_free` for reuse by a
-    /// later same-(geometry, format) `registry_ensure`/`registry_ensure_attachment`
-    /// create.
-    fn admit_target(&mut self, img: FreeTargetImage) {
-        self.shared.target_free.admit(img.key(), img)
-    }
-
-    /// Return a retired transient compute-storage image to `storage_image_free`
-    /// for reuse by a later same-geometry `acquire_storage_image`.
-    fn admit_storage_image(&mut self, slot: StorageImageSlot) {
-        self.shared.storage_image_free.admit(slot.key, slot)
-    }
-
-    /// Pop a recycled resident-target image for `(width, height, format)` if one
-    /// is available, else `None`. Splits the reuse (`target_free_hits`) vs
-    /// fresh-alloc (`target_free_allocs`) census so a boot can prove the
-    /// per-frame realloc storm collapsed (allocs ≈ 0 under video).
-    pub(super) fn take_free_target(
-        &mut self,
-        width: u32,
-        height: u32,
-        sample_count: u32,
-        format: vk::Format,
-    ) -> Option<FreeTargetImage> {
-        let key = TargetRecycleKey {
-            width,
-            height,
-            sample_count,
-            format,
-        };
-        self.shared.target_free.take(&key)
-    }
-
-    /// Cumulative resident-target recycle diagnostics:
-    /// `(free_hits, free_allocs, recycle_admits, recycle_cap_drops)`.
-    pub(crate) fn target_recycle_stats(&self) -> (u64, u64, u64, u64) {
-        self.shared.target_free.stats()
-    }
-
-    /// `(non_pinned_peak, non_pinned_peak_bytes)` for the resident registry —
-    /// the reach, and what the reach costs. Neither answers alone.
-    ///
-    /// Both are cumulative for the life of the pools. The bytes are what said a
-    /// slot count was never measuring the resource it claimed to protect, which
-    /// is the reading that retired that count — see
-    /// [`ResourcePools::non_pinned_registry_bytes`] and
-    /// [`ResourcePools::recoverable_residents`].
-    pub(crate) fn registry_pressure_stats(&self) -> (u64, u64) {
-        (
-            self.shared.registry_non_pinned_peak,
-            self.shared.registry_non_pinned_peak_bytes,
-        )
-    }
-
-    /// `(sole_copy_peak_slots, sole_copy_peak_bytes)` — what protecting
-    /// unreproducible content costs, in the two quantities that have to be read
-    /// together.
-    ///
-    /// This is the population the allocation-failure retry cannot give back, so
-    /// its peak against `registry_non_pinned_peak` is what says whether the
-    /// retry still has anything to work with. See
-    /// [`super::SharedPools::registry_sole_copy`].
-    pub(crate) fn registry_sole_copy_stats(&self) -> (u64, u64) {
-        (
-            self.shared.registry_sole_copy_peak.count as u64,
-            self.shared.registry_sole_copy_peak.bytes,
-        )
-    }
-
-    /// `(sole_copy_peak_slots, sole_copy_peak_bytes)` for the compute-storage
-    /// registry — the sibling of [`Self::registry_sole_copy_stats`] over the
-    /// other population.
-    pub(crate) fn compute_storage_sole_copy_stats(&self) -> (u64, u64) {
-        (
-            self.shared.compute_storage_sole_copy_peak.count as u64,
-            self.shared.compute_storage_sole_copy_peak.bytes,
-        )
-    }
-
-    /// `VkDeviceMemory` the image slab holds right now, and the carved half of
-    /// it, in bytes. See [`slab::SlabPool::held_bytes`] for what it covers.
-    pub(crate) fn slab_held_bytes(&self) -> (u64, u64) {
-        self.shared.slab.held_bytes()
-    }
-
-    /// The worst gap between a resident being touched and being read again, for
-    /// the life of the pools. See
-    /// [`ResourcePools::resident_resample_peak_ms`] for what it is the margin
-    /// against.
-    pub(crate) fn resident_resample_peak_ms(&self) -> u64 {
-        self.shared.resident_resample_peak_ms
-    }
-
-    /// Take handles whose complete pre-removal recording prefix is terminal.
-    /// Taking before destruction permits terminal handling to borrow the free
-    /// pools that live beside the graveyard.
-    fn take_released_graveyard(&mut self) -> Vec<DeferredHandle> {
-        let retirement = Arc::clone(&self.shared.retirement);
-        let (ready, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut self.shared.graveyard)
-            .into_iter()
-            .partition(|(point, _)| retirement.retired(*point));
-        self.shared.graveyard = waiting;
-        ready.into_iter().map(|(_, handle)| handle).collect()
-    }
-
-    /// Terminally handle every graveyard entry whose prefix has retired.
-    unsafe fn release_ready_graveyard(&mut self, device: &ash::Device) {
-        for handle in self.take_released_graveyard() {
-            self.destroy_or_recycle(device, handle);
-        }
-    }
-
-    /// Teardown-only release after every command buffer has been waited or the
-    /// device has been lost and is itself being destroyed.
-    pub(super) unsafe fn release_all_graveyard(&mut self, device: &ash::Device) {
-        for (_, handle) in std::mem::take(&mut self.shared.graveyard) {
-            self.destroy_or_recycle(device, handle);
-        }
-    }
-
-    /// Retire one slot: wait its fence, reset it, and drain the cleanup it
-    /// owes. No-op for a slot with nothing pending.
-    unsafe fn retire_slot(
-        &mut self,
-        ctx: &DeviceContext,
-        counters: &EngineCounters,
-        index: usize,
-    ) -> Result<(), DrawError> {
-        let Some(retired) = (unsafe { self.encoder.take_retired_slot(ctx, counters, index)? })
-        else {
-            return Ok(());
-        };
-        unsafe { self.apply_shared_retirement(&ctx.device, retired) };
-        Ok(())
-    }
-
-    /// Apply the shared half of a retirement after its encoder has reclaimed
-    /// every private object.
-    unsafe fn apply_shared_retirement(&mut self, device: &ash::Device, shared: SharedRetirement) {
-        let SharedRetirement {
-            visibility,
-            cleanup,
-            retirement,
-        } = shared;
-        super::super::retire_guest_write_pages(&visibility.guest_write_tokens);
-        self.drain_shared_cleanup(cleanup);
-        retirement.retire();
-        self.release_ready_graveyard(device);
-    }
-
-    /// Start a new entry (draw / dispatch / sync helper): advance to the next
-    /// ring slot, retiring it first if its CB is still in flight (this is the
-    /// only place a full ring blocks). Returns the slot's CB + fence; the CB
-    /// is ready to reset/record and the fence is unsignaled, ready to submit.
-    pub(crate) unsafe fn begin_entry(
-        &mut self,
-        ctx: &DeviceContext,
-        counters: &EngineCounters,
-    ) -> Result<(vk::CommandBuffer, vk::Fence), DrawError> {
-        // Any path that claims a slot first submits the deferred batch — the
-        // single choke point that keeps queue order = record order for every
-        // reader/compute/prefetch path (and prevents ring wrap from resetting
-        // the still-recording batch CB).
-        self.batch_flush(ctx, counters)?;
-        // A caller that returned early left an unsubmitted command buffer in
-        // this encoder. Dropping its lease cancels the exact order point; the
-        // next reset discards the recording itself.
-        self.encoder.recording.take();
-        self.release_ready_graveyard(&ctx.device);
-        // Whatever pass was standing, the caller is about to record into a
-        // different command buffer than the one that opened it. Unconditional
-        // and above the early exits below, because every claim of a slot ends
-        // the echoed pass's recording session whether a batch was open or not.
-        self.encoder.forget_pass_echo();
-        // Reap the oldest contiguous run of already-signaled slots before
-        // claiming one, rather than only the slot about to be reused. The
-        // readback path deliberately waits a fence without retiring (see
-        // `wait_entry_fence`), so a signaled slot can sit unreaped for a whole
-        // ring, holding its staging, gather and readback buffers out of the free
-        // lists and its descriptor sets out of the arena — every one of which
-        // the next draw then allocates fresh.
-        //
-        // This used to be load-bearing for the sampled content cache too, whose
-        // admissions travelled in the same cleanup: a texture the guest had not
-        // changed re-uploaded and re-allocated for RING_DEPTH - 1 draws before
-        // the cache could serve it. It no longer is — admission happens at
-        // submit, in `finish_entry_async`, which is the whole of why.
-        //
-        // `break` on the first unsignaled slot is load-bearing: reaping out of
-        // order can drop `in_flight` to 0 while later slots still run, which
-        // would let `gpu_work_open()` admit a graveyard drain under live work.
-        let n = self.encoder.slots.len();
-        for step in 1..=n {
-            let index = (self.encoder.cur + step) % n;
-            if self.encoder.slots[index].pending.is_none() {
-                continue;
-            }
-            if !self.encoder.try_take_submit_return(counters, index)? {
-                break;
-            }
-            let signaled = ctx
-                .device
-                .get_fence_status(self.encoder.slots[index].fence)
-                .map_err(|e| wait_error(counters, e, DeviceLostOp::PoolsFenceStatusBeginEntry))?;
-            if !signaled {
-                break;
-            }
-            self.retire_slot(ctx, counters, index)?;
-        }
-        let next = (self.encoder.cur + 1) % self.encoder.slots.len();
-        if self.encoder.slots[next].pending.is_some() {
-            self.encoder.await_submit_return(
-                counters,
-                next,
-                DeviceLostOp::PoolsWaitFencesRetire,
-            )?;
-            // Count as a "block" only when the fence is genuinely unsignaled
-            // (the GPU still owns the slot); reclaiming a finished slot on
-            // advance is bookkeeping, not a stall.
-            let still_running = !ctx
-                .device
-                .get_fence_status(self.encoder.slots[next].fence)
-                .map_err(|e| wait_error(counters, e, DeviceLostOp::PoolsFenceStatusBeginEntry))?;
-            self.retire_slot(ctx, counters, next)?;
-            if still_running {
-                counters.ring_retire_blocks.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-        self.encoder.cur = next;
-        let lease = self
-            .shared
-            .checkout_recording()
-            .map_err(|_| DrawError::RecordingSequenceExhausted)?;
-        self.encoder.begin_recording(lease);
-        Ok((
-            self.encoder.slots[next].cmd_buf,
-            self.encoder.slots[next].fence,
-        ))
-    }
-
-    /// Park the sealed cleanup on the current slot and give the content cache
-    /// the images this entry's CB fills. The CB was submitted with the slot
-    /// fence and the entry returns without waiting.
-    ///
-    /// # Why the cache takes them now and not at retire
-    ///
-    /// A cache entry is a CPU-side name for a GPU image, and the only thing that
-    /// has to have happened before a *consumer* may bind it is that the fill was
-    /// recorded and submitted first. Every consumer is itself a recorded
-    /// command, `begin_entry` flushes the open batch before any path claims a
-    /// slot so queue order is record order, and the fill's own
-    /// `TRANSFER_WRITE → SHADER_READ` barrier (see `upload_buffer_to_sampled_image`)
-    /// has every later-submitted command in its second scope. So the fence adds
-    /// nothing to the consumer's correctness — it only delays the name.
-    ///
-    /// Admitting at retire delayed it by a whole ring: a window bound N times
-    /// while the first bind's slot was still in flight missed N times, gathered
-    /// N times, and threw away N-1 of the images on arrival. Measured on the
-    /// macos-26 rail at `a6ed11b9`: `sampled_admit_duplicate` 5533 against
-    /// `sampled_admit_kept` 3876, and 58.9 GB of guest texels imported in one
-    /// driven boot against 219 MB on macos-13.
-    ///
-    /// The admissions run **after** the slot is marked pending, not before.
-    /// Entries that cannot be retained return their images to `sampled_live`;
-    /// making this slot visible first ensures the next seal parks them behind
-    /// the command buffer that filled or sampled them.
-    pub(crate) unsafe fn finish_entry_async(
-        &mut self,
-        sealed: SealedEntry,
-        timeline: Option<u64>,
-        submit_return: Option<super::super::queue_owner::PendingQueueSubmit>,
-    ) {
-        let admissions = self
-            .encoder
-            .park_submitted_entry(sealed, timeline, submit_return);
-        // The submission is now outstanding, and this is the one point both
-        // submit paths reach — a batch flush and a lone draw's own submit. The
-        // trail's per-slot record is cleared again in `retire_slot`, so a slot
-        // holding one is a submission whose fence has not signalled.
-        self.admit_recorded_sampled(admissions);
-    }
-
-    /// Withdraw a sealed command buffer that the queue rejected.
-    ///
-    /// The driver never accepted the command buffer, so every resource can
-    /// return immediately to the same owners `seal_entry` took it from. The
-    /// recording lease is cancelled rather than submitted, and guest-write
-    /// debt is retired without inventing a fence lifetime.
-    pub(super) unsafe fn abort_sealed_entry(
-        &mut self,
-        device: &ash::Device,
-        slot: usize,
-        sealed: SealedEntry,
-    ) {
-        let SealedEntry {
-            recording,
-            cleanup,
-            admissions,
-        } = sealed;
-        drop(recording);
-        let PendingGpuCleanup {
-            encoder,
-            visibility,
-            mut shared,
-        } = cleanup;
-        unsafe { self.encoder.reclaim_retired_entry(device, encoder) };
-        super::super::retire_guest_write_pages(&visibility.guest_write_tokens);
-        shared
-            .sampled
-            .extend(admissions.into_iter().map(|(slot, _)| slot));
-        self.drain_shared_cleanup(shared);
-        self.encoder.slots[slot].span = gpu_span::SlotSpan::Idle;
-        self.encoder.slots[slot].readback_span_armed = false;
-        self.encoder.slots[slot].pass_spans = 0;
-        self.release_ready_graveyard(device);
-    }
-
-    /// Give the content cache the images a recorded command buffer fills.
-    ///
-    /// The one admission point, reached from the two places that can be the
-    /// earliest safe moment for their caller — [`Self::finish_entry_async`] for
-    /// a draw that submits on its own, and [`Self::batch_append`] for one that
-    /// defers into an open batch. Earliest matters: a window not yet in the
-    /// cache is a window the next bind re-imports across PCIe in full.
-    ///
-    /// # The precondition, and why it is not the same instant for both callers
-    ///
-    /// An admission that cannot be retained returns its image to
-    /// `sampled_live`. The command buffer that fills or samples that image must
-    /// already satisfy [`Self::current_entry_owns_cleanup`] so the next seal
-    /// parks the image behind the right fence. A batch enters the mask when
-    /// `open_batch` is set; a non-batch slot enters it when its cleanup is
-    /// parked. The assertion keeps a third caller from admitting too early.
-    unsafe fn admit_recorded_sampled(&mut self, admissions: Vec<(SampledSlot, SampledRetain)>) {
-        debug_assert!(
-            admissions.is_empty() || self.current_entry_owns_cleanup(),
-            "admitting before the filling command buffer owns its cleanup"
-        );
-        for (slot, retain) in admissions {
-            self.admit_sampled_slot(slot, &retain.content, retain.resource_lifetime.as_ref());
-        }
-    }
-
-    /// Discard every content-cache entry, in-flight-safely.
-    ///
-    /// The answer to a submission that published entries and then failed to
-    /// reach the queue: those images hold undefined content and the cache would
-    /// hand them to a later bind as if they held a guest window. Nothing records
-    /// which entries came from which submission and nothing should — the cache
-    /// is a pure optimisation, so "some of this is unfilled" has a sound answer
-    /// that needs no bookkeeping at all.
-    ///
-    /// Discard records failed-publication victims, and each slot is disposed
-    /// rather than dropped because an earlier in-flight CB may still sample it.
-    pub(crate) unsafe fn discard_sampled_cache(&mut self, device: &ash::Device) {
-        for slot in self.take_whole_sampled_cache() {
-            self.dispose(device, DeferredHandle::RecycleSampled(slot));
-        }
-    }
-
-    /// Device-free half of [`Self::discard_sampled_cache`]: empty the cache
-    /// through the one removal site and return the slots for the caller to
-    /// dispose.
-    ///
-    /// Split out so the accounting is testable without a device.
-    fn take_whole_sampled_cache(&mut self) -> Vec<SampledSlot> {
-        if self.shared.sampled_cache.is_empty() {
-            return Vec::new();
-        }
-        crate::telemetry::note_route("sampled_cache_discarded");
-        let mut taken = Vec::with_capacity(self.shared.sampled_cache.len());
-        while !self.shared.sampled_cache.is_empty() {
-            taken.push(self.remove_sampled_entry(0));
-        }
-        taken
     }
 }
+
+macro_rules! impl_recording_pool_ops {
+    ($pool:ty) => {
+        #[allow(
+            dead_code,
+            reason = "pool operations are generated for both owner and recording views"
+        )]
+        impl $pool {
+            /// The command-recording state owned by this encoder alone.
+            ///
+            /// Returning the narrow owner makes command-buffer state operations unable
+            /// to reach the resident registry or device-wide allocators by type. This
+            /// is the unit a future encoder worker can move independently; callers that
+            /// need shared resources continue to use [`ResourcePools`] explicitly.
+            pub(in crate::engine) fn encoder_mut(&mut self) -> &mut EncoderPools {
+                &mut self.encoder
+            }
+
+            /// The command-recording state owned by this encoder alone.
+            pub(in crate::engine) fn encoder(&self) -> &EncoderPools {
+                &self.encoder
+            }
+
+            /// Advance the registry clock and report whether a bounded maintenance pass
+            /// is due. The pass may release objects already outside every live resource
+            /// (dead direct images and free-pool entries), but elapsed time is never an
+            /// authority to destroy a live resident.
+            pub(super) fn plan_idle_maintenance(&mut self, now_ms: u64) -> bool {
+                if now_ms > self.shared.idle_clock_ms {
+                    self.shared.idle_clock_ms = now_ms;
+                }
+                let now = self.shared.idle_clock_ms;
+                if now < IDLE_MAINTENANCE_START_MS
+                    || now.saturating_sub(self.shared.last_maintenance_ms) < MAINTENANCE_INTERVAL_MS
+                {
+                    return false;
+                }
+                self.shared.last_maintenance_ms = now;
+                true
+            }
+
+            /// Destroy up to `max` images from the image recycle pools (`sampled_free`
+            /// then `target_free`) — freeing their slab sub-allocations — and up to `max`
+            /// buffers from the HOST_VISIBLE `staging_free`/`readback_free` pools. Called
+            /// only on a fired idle pass. Returns the total count destroyed. Terminal
+            /// destroy (not re-recycle): at idle these are pure retained memory.
+            ///
+            /// The buffer pools matter as much as the image pools for "least host memory":
+            /// they are never re-evaluated on the hot path, so at idle they hold a whole
+            /// video session's upload working set forever (measured `staging_mb=177` +
+            /// `readback_mb=61` frozen for 30 s+ after the tab closed). On a discrete GPU
+            /// that is system RAM; on an iGPU it is shared guest RAM (portability target).
+            /// Trimming here (gradual, like the image pools; they refill a-few-per-frame
+            /// when uploads resume) returns it once the session ends without any hot-path
+            /// re-alloc churn.
+            ///
+            /// `trim_buffers` gates ONLY the HOST_VISIBLE buffer pools: they re-alloc via
+            /// full `vkAllocateMemory` on the upload hot path, so we only free them once
+            /// idle has *settled* (see [`SETTLED_PASSES_FOR_BUFFER_TRIM`]). The image
+            /// pools always trim — they refill via cheap slab suballocation.
+            pub(super) unsafe fn trim_recycle_pools(
+                &mut self,
+                device: &ash::Device,
+                max: usize,
+                trim_buffers: bool,
+            ) -> usize {
+                let mut trimmed = 0;
+                while trimmed < max {
+                    let Some(slot) = self.shared.attachment_snapshot_free.pop_any() else {
+                        break;
+                    };
+                    self.destroy_deferred_handle(device, DeferredHandle::RecycleSampled(slot));
+                    trimmed += 1;
+                }
+                while trimmed < max {
+                    let Some(slot) = self.shared.sampled_free.pop_any() else {
+                        break;
+                    };
+                    self.destroy_deferred_handle(device, DeferredHandle::RecycleSampled(slot));
+                    trimmed += 1;
+                }
+                while trimmed < max {
+                    let Some(img) = self.shared.target_free.pop_any() else {
+                        break;
+                    };
+                    self.destroy_deferred_handle(
+                        device,
+                        DeferredHandle::Image {
+                            image: img.image,
+                            view: img.view,
+                            memory: img.memory,
+                        },
+                    );
+                    trimmed += 1;
+                }
+                // Buffer pools get their own budget so image trimming never starves them,
+                // and only trim once idle has settled (they re-alloc via full
+                // vkAllocateMemory on the upload hot path — trimming mid-video hitches it).
+                let mut buf_trimmed = 0;
+                if trim_buffers {
+                    while buf_trimmed < max {
+                        let Some(slot) = pop_largest_pool_entry(&mut self.encoder.staging_free)
+                        else {
+                            break;
+                        };
+                        release_buffer_slot(device, &mut self.shared.slabs, slot);
+                        buf_trimmed += 1;
+                    }
+                    while buf_trimmed < max {
+                        let Some(slot) = pop_largest_pool_entry(&mut self.encoder.readback_free)
+                        else {
+                            break;
+                        };
+                        release_buffer_slot(device, &mut self.shared.slabs, slot);
+                        buf_trimmed += 1;
+                    }
+                    // The gather pool is under the same budget and the same settled-idle
+                    // gate as the two above, for the same reason: its refill is a slab
+                    // carve that only costs anything when it lands on a new block, and
+                    // trimming it mid-workload would buy back VRAM at the price of that
+                    // block allocation under the engine lock.
+                    while buf_trimmed < max {
+                        let Some(slot) = pop_largest_pool_entry(&mut self.encoder.gather_free)
+                        else {
+                            break;
+                        };
+                        release_buffer_slot(device, &mut self.shared.slabs, slot);
+                        buf_trimmed += 1;
+                    }
+                    // Returning the carves above is what lets an upload block empty;
+                    // this is where the emptied blocks go back. It belongs here and not
+                    // in the release that empties a block, because a live workload
+                    // crosses a block boundary and back several times a minute and
+                    // re-crossing costs a whole block allocation (20-30 ms under this
+                    // lock). The settled gate is the same one the buffer pools are
+                    // under, so what is retained mid-session is bounded by the live
+                    // working set, and what a quiet desktop keeps is one spare block per
+                    // size class — tens of MiB against the ~177 MiB of frozen staging
+                    // this trim was written for.
+                    self.shared
+                        .slabs
+                        .trim_empty_blocks(device, BUFFER_SLAB_IDLE_KEEP_EMPTY);
+                    // The standalone (non-slab) compute-storage recycle pool re-allocs via
+                    // a full `vkAllocateMemory` on the next dispatch — like the buffer
+                    // pools above and unlike the slab-backed image pools (cheap
+                    // suballocation refill) — so gate its trim on settled idle too: a brief
+                    // pause between compute dispatches must not steal a pooled storage
+                    // image and spike the next dispatch with a fresh allocation. Its own
+                    // budget so it never starves the buffer trim.
+                    let mut storage_trimmed = 0;
+                    while storage_trimmed < max {
+                        let Some(slot) = self.shared.storage_image_free.pop_any() else {
+                            break;
+                        };
+                        self.destroy_deferred_handle(device, slot.deferred());
+                        storage_trimmed += 1;
+                    }
+                    buf_trimmed += storage_trimmed;
+                }
+                // The DEVICE_LOCAL image slab, under the same settled state as the
+                // pools above rather than at the caller — which is how it came to run on
+                // *every* fired pass instead. The pass fires every
+                // `MAINTENANCE_INTERVAL_MS` whenever the poll heartbeat ticks, which is
+                // most of the time on any workload that does not saturate the drain
+                // worker, so trimming to zero there handed back the block the next frame
+                // re-allocated. [`IDLE_SLAB_KEEP_EMPTY`] carries the boot that read 257
+                // allocations against 162 trims of a 64 MiB block in 25 seconds.
+                //
+                // Not inside the `if` above, because the switch that restores the old
+                // behaviour has to be able to reach this on an unsettled pass; the
+                // policy is [`idle_slab_trim_keep`] and this is its only caller.
+                if let Some(keep) = idle_slab_trim_keep(trim_buffers) {
+                    self.shared.slab.trim_empty_blocks(device, keep);
+                }
+                trimmed + buf_trimmed
+            }
+
+            /// Take entry `index` out of the sampled cache and update its byte gauge.
+            fn remove_sampled_entry(&mut self, index: usize) -> SampledSlot {
+                let evicted = self.shared.sampled_cache.swap_remove(index);
+                self.shared.sampled_cache_bytes = self
+                    .shared
+                    .sampled_cache_bytes
+                    .saturating_sub(evicted.content_len);
+                evicted.slot
+            }
+
+            fn push_sampled_entry(&mut self, entry: ResidentSampledSlot) {
+                self.shared.sampled_cache.push(entry);
+            }
+
+            /// Remove entries whose serialized texture owners are all gone. The
+            /// returned slots still follow the ordinary deferred recycle path, so a
+            /// submission recorded before deletion may finish sampling them safely.
+            fn take_released_sampled_entries(&mut self) -> Vec<SampledSlot> {
+                let mut released = Vec::new();
+                while let Some(index) = self
+                    .shared
+                    .sampled_cache
+                    .iter()
+                    .position(|entry| !entry.has_live_owner())
+                {
+                    released.push(self.remove_sampled_entry(index));
+                }
+                released
+            }
+
+            /// Update the consecutive-settled-pass counter for maintenance and return
+            /// whether the HOST_VISIBLE buffer pools may be trimmed this pass.
+            ///
+            /// A pass is settled only if no staging buffer was acquired since the
+            /// previous pass. The trim then needs
+            /// `SETTLED_PASSES_FOR_BUFFER_TRIM` consecutive settled passes.
+            ///
+            /// Upload traffic is the direct signal for the failure this gate prevents:
+            /// "a single quiet pass mid-playback
+            /// cannot steal a staging buffer and spike the next upload's latency with a
+            /// full `vkAllocateMemory`". Registry victims go to zero when the session is
+            /// idle *and* when it is busy with a stable working set — a steady animation
+            /// re-uses the same render targets forever, so nothing ages out and every pass
+            /// reads as quiet. Measured under testufo: `idle_target_drain` fired 169 times
+            /// in one boot, roughly once a second throughout the load, and the staging pool
+            /// re-allocated the 8 MiB full-frame bucket 607 times at **12.6 ms each**.
+            ///
+            /// So ask the pool that is about to be trimmed. `staging_hits + misses` is
+            /// every acquire, so an unchanged total is the upload path genuinely doing
+            /// nothing — the quantity the victim count was standing in for, measured
+            /// directly instead of inferred. At true idle the guest stops publishing, no
+            /// draw acquires staging, and the trim still fires and still returns the
+            /// memory.
+            pub(super) fn note_maintenance_settled(&mut self) -> bool {
+                let acquires = self
+                    .encoder
+                    .staging_hits
+                    .wrapping_add(self.encoder.staging_misses);
+                let uploads_ran = acquires != self.encoder.settled_staging_mark;
+                self.encoder.settled_staging_mark = acquires;
+                if !uploads_ran {
+                    self.shared.settled_maintenance_passes =
+                        self.shared.settled_maintenance_passes.saturating_add(1);
+                } else {
+                    self.shared.settled_maintenance_passes = 0;
+                }
+                self.shared.settled_maintenance_passes >= SETTLED_PASSES_FOR_BUFFER_TRIM
+            }
+
+            /// Run periodic maintenance for objects that are already outside live
+            /// resource ownership. Live render, sampled, and compute residents leave
+            /// only through explicit lifetime changes or allocation-pressure recovery;
+            /// an idle interval is not a resource-state transition.
+            pub(crate) unsafe fn advance_registry_maintenance(
+                &mut self,
+                ctx: &DeviceContext,
+                counters: &EngineCounters,
+                now_ms: u64,
+            ) {
+                if !self.plan_idle_maintenance(now_ms) {
+                    return;
+                }
+                for slot in self.take_released_sampled_entries() {
+                    self.dispose(&ctx.device, DeferredHandle::RecycleSampled(slot));
+                }
+                self.retire_released_residents(ctx, counters, IDLE_RECYCLE_TRIM_PER_PASS);
+                let trim_buffers = self.note_maintenance_settled();
+                self.trim_recycle_pools(&ctx.device, IDLE_RECYCLE_TRIM_PER_PASS, trim_buffers);
+            }
+
+            /// Cumulative transient sampled/snapshot pool recycle diagnostics:
+            /// `(free_hits, free_allocs, recycle_admits, recycle_cap_drops)`.
+            /// Merged into `CounterSnapshot` by `engine::counter_snapshot`.
+            pub(crate) fn recycle_stats(&self) -> (u64, u64, u64, u64) {
+                let sampled = self.shared.sampled_free.stats();
+                let snapshots = self.shared.attachment_snapshot_free.stats();
+                (
+                    sampled.0 + snapshots.0,
+                    sampled.1 + snapshots.1,
+                    sampled.2 + snapshots.2,
+                    sampled.3 + snapshots.3,
+                )
+            }
+
+            pub(crate) unsafe fn ensure_init(
+                &mut self,
+                ctx: &DeviceContext,
+                counters: &EngineCounters,
+            ) -> Result<(), DrawError> {
+                if self.encoder.initialized {
+                    return Ok(());
+                }
+                debug_assert_eq!(self.shared.attachment_snapshot_free.len(), 0);
+                unsafe {
+                    self.encoder.ensure_init(
+                        ctx,
+                        counters,
+                        super::batch_max_draws(ctx.caps.memory.topology),
+                    )
+                }
+            }
+
+            /// The capacity installed for this pool's physical device.
+            pub(crate) fn batch_capacity(&self) -> u64 {
+                self.encoder.batch_max_draws
+            }
+
+            /// The device's guest-scatter pipeline, built on the first writeback that
+            /// wants it and `None` on a device whose driver refused to build it.
+            ///
+            /// The refusal latches: a host that cannot compile our kernel is not going
+            /// to compile it on the next frame either, and retrying would put a pipeline
+            /// creation on the hot path several hundred times a second. It is emitted
+            /// once, on the fail channel, because the fallback it selects is the
+            /// expensive path this rail exists to leave.
+            ///
+            /// # Safety
+            ///
+            /// `ctx` must be the device these pools belong to.
+            pub(crate) unsafe fn scatter_pipeline(
+                &mut self,
+                ctx: &DeviceContext,
+            ) -> Option<super::super::guest_scatter::ScatterPipeline> {
+                if let Some(p) = self.shared.scatter {
+                    return Some(p);
+                }
+                if self.shared.scatter_refused {
+                    return None;
+                }
+                match unsafe { super::super::guest_scatter::ScatterPipeline::create(ctx) } {
+                    Ok(p) => {
+                        self.shared.scatter = Some(p);
+                        Some(p)
+                    }
+                    Err(e) => {
+                        self.shared.scatter_refused = true;
+                        reims_vgpu_observe::Emit::decline("scatter_pipeline", &e).fail();
+                        None
+                    }
+                }
+            }
+
+            /// Whether the current command buffer already owns the cleanup that will
+            /// receive resources rejected by a sampled-cache admission. A submitted
+            /// entry owns it through `pending`; a deferred batch owns it through
+            /// `open_batch`. Native-object destruction is governed independently by
+            /// the recording order.
+            fn current_entry_owns_cleanup(&self) -> bool {
+                self.encoder
+                    .slots
+                    .get(self.encoder.cur)
+                    .is_some_and(|slot| slot.pending.is_some())
+                    || self.encoder.open_batch.is_some()
+            }
+
+            /// Destroy `handle` now if every recording that could have named it is
+            /// terminal, else park it until that exact ordered prefix retires.
+            pub(crate) unsafe fn dispose(&mut self, device: &ash::Device, handle: DeferredHandle) {
+                self.release_ready_graveyard(device);
+                match self.shared.retirement.latest() {
+                    Some(point) if !self.shared.retirement.retired(point) => {
+                        self.shared.graveyard.push((point, handle));
+                    }
+                    _ => self.destroy_or_recycle(device, handle),
+                }
+            }
+
+            /// Acquire + bind DEVICE_LOCAL image memory from the slab suballocator,
+            /// registering the sub-allocation against `image` on success. On bind
+            /// failure the slab range is released (the caller destroys the `image`).
+            /// Returns the backing `VkDeviceMemory` (shared across the block's other
+            /// images) for the pool's image struct; the image was bound at the slab
+            /// offset, not offset 0.
+            ///
+            /// Out of memory gets one retry here, for every caller, after emptying the
+            /// recycle pools. Only the pools: this runs at four sites, one of them
+            /// part-way through recording a draw, and
+            /// [`ResourcePools::reclaim_pools_for_allocation_retry`] is the half of the
+            /// recovery that is safe there — a free-list entry is by construction one no
+            /// command buffer holds. Retiring live residents is not safe here, and is
+            /// done only by `registry_ensure_attachment`, which calls the fuller
+            /// [`ResourcePools::reclaim_for_allocation_retry`] itself; that function
+            /// records the segfault which established the difference.
+            pub(super) unsafe fn bind_image_slab(
+                &mut self,
+                ctx: &DeviceContext,
+                image: vk::Image,
+                ireq: &vk::MemoryRequirements,
+                bind_op: VkOp,
+                counters: &EngineCounters,
+            ) -> Result<vk::DeviceMemory, DrawError> {
+                match self.bind_image_slab_once(ctx, image, ireq, bind_op, counters) {
+                    // Once, and only for this result. A reclaim that frees nothing means
+                    // there was nothing to free, so the original error is the honest one
+                    // and a second attempt would only repeat it.
+                    Err(error)
+                        if error.out_of_memory()
+                            && self.reclaim_pools_for_allocation_retry(ctx) > 0 =>
+                    {
+                        self.bind_image_slab_once(ctx, image, ireq, bind_op, counters)
+                            .map_err(|_| error)
+                    }
+                    other => other,
+                }
+            }
+
+            unsafe fn bind_image_slab_once(
+                &mut self,
+                ctx: &DeviceContext,
+                image: vk::Image,
+                ireq: &vk::MemoryRequirements,
+                bind_op: VkOp,
+                counters: &EngineCounters,
+            ) -> Result<vk::DeviceMemory, DrawError> {
+                self.shared
+                    .slab
+                    .ensure_image_unregistered(image)
+                    .map_err(DrawError::Slab)?;
+                let token = self.shared.slab.acquire(ctx, ireq, counters)?;
+                match ctx
+                    .device
+                    .bind_image_memory(image, token.memory, token.offset())
+                {
+                    Ok(()) => {
+                        self.shared.slab.register(image, token);
+                        Ok(token.memory)
+                    }
+                    Err(e) => {
+                        self.shared.slab.release_token(&ctx.device, token);
+                        Err(DrawError::VkCall(VkCall::new(bind_op, e)))
+                    }
+                }
+            }
+
+            /// Release the slab sub-allocation backing `image` (the caller destroys the
+            /// `image`/view handles). No-op for a non-slab image. This replaces the raw
+            /// `vkFreeMemory` at every DEVICE_LOCAL-image free site: the memory belongs
+            /// to a shared block, not the image.
+            pub(super) unsafe fn free_image_slab(
+                &mut self,
+                device: &ash::Device,
+                image: vk::Image,
+            ) {
+                self.shared.slab.free_image(device, image);
+            }
+
+            /// Terminal handling for a deferred handle once it is safe (in_flight == 0):
+            /// recyclable slots rejoin their geometry-keyed pools; every other handle
+            /// is destroyed.
+            unsafe fn destroy_or_recycle(&mut self, device: &ash::Device, handle: DeferredHandle) {
+                match handle {
+                    DeferredHandle::RecycleSampled(slot) => {
+                        self.admit_sampled(slot);
+                    }
+                    DeferredHandle::RecycleTarget(img) => {
+                        self.admit_target(img);
+                    }
+                    other => self.destroy_deferred_handle(device, other),
+                }
+            }
+
+            /// Return an evicted sampled slot to `sampled_free` for reuse by a later
+            /// same-geometry `acquire_sampled`.
+            fn admit_sampled(&mut self, slot: SampledSlot) {
+                self.shared.sampled_free.admit(slot.key(), slot)
+            }
+
+            /// Return a displaced resident-target image to `target_free` for reuse by a
+            /// later same-(geometry, format) `registry_ensure`/`registry_ensure_attachment`
+            /// create.
+            fn admit_target(&mut self, img: FreeTargetImage) {
+                self.shared.target_free.admit(img.key(), img)
+            }
+
+            /// Return a retired transient compute-storage image to `storage_image_free`
+            /// for reuse by a later same-geometry `acquire_storage_image`.
+            fn admit_storage_image(&mut self, slot: StorageImageSlot) {
+                self.shared.storage_image_free.admit(slot.key, slot)
+            }
+
+            /// Pop a recycled resident-target image for `(width, height, format)` if one
+            /// is available, else `None`. Splits the reuse (`target_free_hits`) vs
+            /// fresh-alloc (`target_free_allocs`) census so a boot can prove the
+            /// per-frame realloc storm collapsed (allocs ≈ 0 under video).
+            pub(super) fn take_free_target(
+                &mut self,
+                width: u32,
+                height: u32,
+                sample_count: u32,
+                format: vk::Format,
+            ) -> Option<FreeTargetImage> {
+                let key = TargetRecycleKey {
+                    width,
+                    height,
+                    sample_count,
+                    format,
+                };
+                self.shared.target_free.take(&key)
+            }
+
+            /// Cumulative resident-target recycle diagnostics:
+            /// `(free_hits, free_allocs, recycle_admits, recycle_cap_drops)`.
+            pub(crate) fn target_recycle_stats(&self) -> (u64, u64, u64, u64) {
+                self.shared.target_free.stats()
+            }
+
+            /// `(non_pinned_peak, non_pinned_peak_bytes)` for the resident registry —
+            /// the reach, and what the reach costs. Neither answers alone.
+            ///
+            /// Both are cumulative for the life of the pools. The bytes are what said a
+            /// slot count was never measuring the resource it claimed to protect, which
+            /// is the reading that retired that count — see
+            /// [`ResourcePools::non_pinned_registry_bytes`] and
+            /// [`ResourcePools::recoverable_residents`].
+            pub(crate) fn registry_pressure_stats(&self) -> (u64, u64) {
+                (
+                    self.shared.registry_non_pinned_peak,
+                    self.shared.registry_non_pinned_peak_bytes,
+                )
+            }
+
+            /// `(sole_copy_peak_slots, sole_copy_peak_bytes)` — what protecting
+            /// unreproducible content costs, in the two quantities that have to be read
+            /// together.
+            ///
+            /// This is the population the allocation-failure retry cannot give back, so
+            /// its peak against `registry_non_pinned_peak` is what says whether the
+            /// retry still has anything to work with. See
+            /// [`super::SharedPools::registry_sole_copy`].
+            pub(crate) fn registry_sole_copy_stats(&self) -> (u64, u64) {
+                (
+                    self.shared.registry_sole_copy_peak.count as u64,
+                    self.shared.registry_sole_copy_peak.bytes,
+                )
+            }
+
+            /// `(sole_copy_peak_slots, sole_copy_peak_bytes)` for the compute-storage
+            /// registry — the sibling of [`Self::registry_sole_copy_stats`] over the
+            /// other population.
+            pub(crate) fn compute_storage_sole_copy_stats(&self) -> (u64, u64) {
+                (
+                    self.shared.compute_storage_sole_copy_peak.count as u64,
+                    self.shared.compute_storage_sole_copy_peak.bytes,
+                )
+            }
+
+            /// `VkDeviceMemory` the image slab holds right now, and the carved half of
+            /// it, in bytes. See [`slab::SlabPool::held_bytes`] for what it covers.
+            pub(crate) fn slab_held_bytes(&self) -> (u64, u64) {
+                self.shared.slab.held_bytes()
+            }
+
+            /// The worst gap between a resident being touched and being read again, for
+            /// the life of the pools. See
+            /// [`ResourcePools::resident_resample_peak_ms`] for what it is the margin
+            /// against.
+            pub(crate) fn resident_resample_peak_ms(&self) -> u64 {
+                self.shared.resident_resample_peak_ms
+            }
+
+            /// Take handles whose complete pre-removal recording prefix is terminal.
+            /// Taking before destruction permits terminal handling to borrow the free
+            /// pools that live beside the graveyard.
+            fn take_released_graveyard(&mut self) -> Vec<DeferredHandle> {
+                let retirement = Arc::clone(&self.shared.retirement);
+                let (ready, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut self.shared.graveyard)
+                    .into_iter()
+                    .partition(|(point, _)| retirement.retired(*point));
+                self.shared.graveyard = waiting;
+                ready.into_iter().map(|(_, handle)| handle).collect()
+            }
+
+            /// Terminally handle every graveyard entry whose prefix has retired.
+            unsafe fn release_ready_graveyard(&mut self, device: &ash::Device) {
+                for handle in self.take_released_graveyard() {
+                    self.destroy_or_recycle(device, handle);
+                }
+            }
+
+            /// Teardown-only release after every command buffer has been waited or the
+            /// device has been lost and is itself being destroyed.
+            pub(super) unsafe fn release_all_graveyard(&mut self, device: &ash::Device) {
+                for (_, handle) in std::mem::take(&mut self.shared.graveyard) {
+                    self.destroy_or_recycle(device, handle);
+                }
+            }
+
+            /// Retire one slot: wait its fence, reset it, and drain the cleanup it
+            /// owes. No-op for a slot with nothing pending.
+            unsafe fn retire_slot(
+                &mut self,
+                ctx: &DeviceContext,
+                counters: &EngineCounters,
+                index: usize,
+            ) -> Result<(), DrawError> {
+                let Some(retired) =
+                    (unsafe { self.encoder.take_retired_slot(ctx, counters, index)? })
+                else {
+                    return Ok(());
+                };
+                unsafe { self.apply_shared_retirement(&ctx.device, retired) };
+                Ok(())
+            }
+
+            /// Apply the shared half of a retirement after its encoder has reclaimed
+            /// every private object.
+            unsafe fn apply_shared_retirement(
+                &mut self,
+                device: &ash::Device,
+                shared: SharedRetirement,
+            ) {
+                let SharedRetirement {
+                    visibility,
+                    cleanup,
+                    retirement,
+                } = shared;
+                super::super::retire_guest_write_pages(&visibility.guest_write_tokens);
+                self.drain_shared_cleanup(cleanup);
+                retirement.retire();
+                self.release_ready_graveyard(device);
+            }
+
+            /// Start a new entry (draw / dispatch / sync helper): advance to the next
+            /// ring slot, retiring it first if its CB is still in flight (this is the
+            /// only place a full ring blocks). Returns the slot's CB + fence; the CB
+            /// is ready to reset/record and the fence is unsignaled, ready to submit.
+            pub(crate) unsafe fn begin_entry(
+                &mut self,
+                ctx: &DeviceContext,
+                counters: &EngineCounters,
+            ) -> Result<(vk::CommandBuffer, vk::Fence), DrawError> {
+                // Any path that claims a slot first submits the deferred batch — the
+                // single choke point that keeps queue order = record order for every
+                // reader/compute/prefetch path (and prevents ring wrap from resetting
+                // the still-recording batch CB).
+                self.batch_flush(ctx, counters)?;
+                // A caller that returned early left an unsubmitted command buffer in
+                // this encoder. Dropping its lease cancels the exact order point; the
+                // next reset discards the recording itself.
+                self.encoder.recording.take();
+                self.release_ready_graveyard(&ctx.device);
+                // Whatever pass was standing, the caller is about to record into a
+                // different command buffer than the one that opened it. Unconditional
+                // and above the early exits below, because every claim of a slot ends
+                // the echoed pass's recording session whether a batch was open or not.
+                self.encoder.forget_pass_echo();
+                // Reap the oldest contiguous run of already-signaled slots before
+                // claiming one, rather than only the slot about to be reused. The
+                // readback path deliberately waits a fence without retiring (see
+                // `wait_entry_fence`), so a signaled slot can sit unreaped for a whole
+                // ring, holding its staging, gather and readback buffers out of the free
+                // lists and its descriptor sets out of the arena — every one of which
+                // the next draw then allocates fresh.
+                //
+                // This used to be load-bearing for the sampled content cache too, whose
+                // admissions travelled in the same cleanup: a texture the guest had not
+                // changed re-uploaded and re-allocated for RING_DEPTH - 1 draws before
+                // the cache could serve it. It no longer is — admission happens at
+                // submit, in `finish_entry_async`, which is the whole of why.
+                //
+                // `break` on the first unsignaled slot is load-bearing: reaping out of
+                // order can drop `in_flight` to 0 while later slots still run, which
+                // would let `gpu_work_open()` admit a graveyard drain under live work.
+                let n = self.encoder.slots.len();
+                for step in 1..=n {
+                    let index = (self.encoder.cur + step) % n;
+                    if self.encoder.slots[index].pending.is_none() {
+                        continue;
+                    }
+                    if !self.encoder.try_take_submit_return(counters, index)? {
+                        break;
+                    }
+                    let signaled = ctx
+                        .device
+                        .get_fence_status(self.encoder.slots[index].fence)
+                        .map_err(|e| {
+                            wait_error(counters, e, DeviceLostOp::PoolsFenceStatusBeginEntry)
+                        })?;
+                    if !signaled {
+                        break;
+                    }
+                    self.retire_slot(ctx, counters, index)?;
+                }
+                let next = (self.encoder.cur + 1) % self.encoder.slots.len();
+                if self.encoder.slots[next].pending.is_some() {
+                    self.encoder.await_submit_return(
+                        counters,
+                        next,
+                        DeviceLostOp::PoolsWaitFencesRetire,
+                    )?;
+                    // Count as a "block" only when the fence is genuinely unsignaled
+                    // (the GPU still owns the slot); reclaiming a finished slot on
+                    // advance is bookkeeping, not a stall.
+                    let still_running = !ctx
+                        .device
+                        .get_fence_status(self.encoder.slots[next].fence)
+                        .map_err(|e| {
+                            wait_error(counters, e, DeviceLostOp::PoolsFenceStatusBeginEntry)
+                        })?;
+                    self.retire_slot(ctx, counters, next)?;
+                    if still_running {
+                        counters.ring_retire_blocks.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                self.encoder.cur = next;
+                let lease = self
+                    .shared
+                    .checkout_recording()
+                    .map_err(|_| DrawError::RecordingSequenceExhausted)?;
+                self.encoder.begin_recording(lease);
+                Ok((
+                    self.encoder.slots[next].cmd_buf,
+                    self.encoder.slots[next].fence,
+                ))
+            }
+
+            /// Park the sealed cleanup on the current slot and give the content cache
+            /// the images this entry's CB fills. The CB was submitted with the slot
+            /// fence and the entry returns without waiting.
+            ///
+            /// # Why the cache takes them now and not at retire
+            ///
+            /// A cache entry is a CPU-side name for a GPU image, and the only thing that
+            /// has to have happened before a *consumer* may bind it is that the fill was
+            /// recorded and submitted first. Every consumer is itself a recorded
+            /// command, `begin_entry` flushes the open batch before any path claims a
+            /// slot so queue order is record order, and the fill's own
+            /// `TRANSFER_WRITE → SHADER_READ` barrier (see `upload_buffer_to_sampled_image`)
+            /// has every later-submitted command in its second scope. So the fence adds
+            /// nothing to the consumer's correctness — it only delays the name.
+            ///
+            /// Admitting at retire delayed it by a whole ring: a window bound N times
+            /// while the first bind's slot was still in flight missed N times, gathered
+            /// N times, and threw away N-1 of the images on arrival. Measured on the
+            /// macos-26 rail at `a6ed11b9`: `sampled_admit_duplicate` 5533 against
+            /// `sampled_admit_kept` 3876, and 58.9 GB of guest texels imported in one
+            /// driven boot against 219 MB on macos-13.
+            ///
+            /// The admissions run **after** the slot is marked pending, not before.
+            /// Entries that cannot be retained return their images to `sampled_live`;
+            /// making this slot visible first ensures the next seal parks them behind
+            /// the command buffer that filled or sampled them.
+            pub(crate) unsafe fn finish_entry_async(
+                &mut self,
+                sealed: SealedEntry,
+                timeline: Option<u64>,
+                submit_return: Option<super::super::queue_owner::PendingQueueSubmit>,
+            ) {
+                let admissions = self
+                    .encoder
+                    .park_submitted_entry(sealed, timeline, submit_return);
+                // The submission is now outstanding, and this is the one point both
+                // submit paths reach — a batch flush and a lone draw's own submit. The
+                // trail's per-slot record is cleared again in `retire_slot`, so a slot
+                // holding one is a submission whose fence has not signalled.
+                self.admit_recorded_sampled(admissions);
+            }
+
+            /// Withdraw a sealed command buffer that the queue rejected.
+            ///
+            /// The driver never accepted the command buffer, so every resource can
+            /// return immediately to the same owners `seal_entry` took it from. The
+            /// recording lease is cancelled rather than submitted, and guest-write
+            /// debt is retired without inventing a fence lifetime.
+            pub(super) unsafe fn abort_sealed_entry(
+                &mut self,
+                device: &ash::Device,
+                slot: usize,
+                sealed: SealedEntry,
+            ) {
+                let SealedEntry {
+                    recording,
+                    cleanup,
+                    admissions,
+                } = sealed;
+                drop(recording);
+                let PendingGpuCleanup {
+                    encoder,
+                    visibility,
+                    mut shared,
+                } = cleanup;
+                unsafe { self.encoder.reclaim_retired_entry(device, encoder) };
+                super::super::retire_guest_write_pages(&visibility.guest_write_tokens);
+                shared
+                    .sampled
+                    .extend(admissions.into_iter().map(|(slot, _)| slot));
+                self.drain_shared_cleanup(shared);
+                self.encoder.slots[slot].span = gpu_span::SlotSpan::Idle;
+                self.encoder.slots[slot].readback_span_armed = false;
+                self.encoder.slots[slot].pass_spans = 0;
+                self.release_ready_graveyard(device);
+            }
+
+            /// Give the content cache the images a recorded command buffer fills.
+            ///
+            /// The one admission point, reached from the two places that can be the
+            /// earliest safe moment for their caller — [`Self::finish_entry_async`] for
+            /// a draw that submits on its own, and [`Self::batch_append`] for one that
+            /// defers into an open batch. Earliest matters: a window not yet in the
+            /// cache is a window the next bind re-imports across PCIe in full.
+            ///
+            /// # The precondition, and why it is not the same instant for both callers
+            ///
+            /// An admission that cannot be retained returns its image to
+            /// `sampled_live`. The command buffer that fills or samples that image must
+            /// already satisfy [`Self::current_entry_owns_cleanup`] so the next seal
+            /// parks the image behind the right fence. A batch enters the mask when
+            /// `open_batch` is set; a non-batch slot enters it when its cleanup is
+            /// parked. The assertion keeps a third caller from admitting too early.
+            unsafe fn admit_recorded_sampled(
+                &mut self,
+                admissions: Vec<(SampledSlot, SampledRetain)>,
+            ) {
+                debug_assert!(
+                    admissions.is_empty() || self.current_entry_owns_cleanup(),
+                    "admitting before the filling command buffer owns its cleanup"
+                );
+                for (slot, retain) in admissions {
+                    self.admit_sampled_slot(
+                        slot,
+                        &retain.content,
+                        retain.resource_lifetime.as_ref(),
+                    );
+                }
+            }
+
+            /// Discard every content-cache entry, in-flight-safely.
+            ///
+            /// The answer to a submission that published entries and then failed to
+            /// reach the queue: those images hold undefined content and the cache would
+            /// hand them to a later bind as if they held a guest window. Nothing records
+            /// which entries came from which submission and nothing should — the cache
+            /// is a pure optimisation, so "some of this is unfilled" has a sound answer
+            /// that needs no bookkeeping at all.
+            ///
+            /// Discard records failed-publication victims, and each slot is disposed
+            /// rather than dropped because an earlier in-flight CB may still sample it.
+            pub(crate) unsafe fn discard_sampled_cache(&mut self, device: &ash::Device) {
+                for slot in self.take_whole_sampled_cache() {
+                    self.dispose(device, DeferredHandle::RecycleSampled(slot));
+                }
+            }
+
+            /// Device-free half of [`Self::discard_sampled_cache`]: empty the cache
+            /// through the one removal site and return the slots for the caller to
+            /// dispose.
+            ///
+            /// Split out so the accounting is testable without a device.
+            fn take_whole_sampled_cache(&mut self) -> Vec<SampledSlot> {
+                if self.shared.sampled_cache.is_empty() {
+                    return Vec::new();
+                }
+                crate::telemetry::note_route("sampled_cache_discarded");
+                let mut taken = Vec::with_capacity(self.shared.sampled_cache.len());
+                while !self.shared.sampled_cache.is_empty() {
+                    taken.push(self.remove_sampled_entry(0));
+                }
+                taken
+            }
+        }
+    };
+}
+
+impl_recording_pool_ops!(ResourcePools);
+impl_recording_pool_ops!(RecordingPools<'_>);
 
 impl EncoderPools {
     /// Reset this slot's readback timestamp region and write its start stamp.
@@ -2564,7 +2621,10 @@ impl EncoderPools {
     }
 }
 
-impl ResourcePools {
+macro_rules! impl_recording_operation_ops {
+    ($pool:ty) => {
+#[allow(dead_code, reason = "pool operations are generated for both owner and recording views")]
+impl $pool {
     /// Begin one decoded guest operation recorded into `cb`.
     ///
     /// Guest CPU writes are external to this backend, so no command-buffer
@@ -3057,6 +3117,11 @@ impl ResourcePools {
         crate::telemetry::note_route_n("sampled_bindmap_write_disjoint", disjoint);
     }
 }
+    };
+}
+
+impl_recording_operation_ops!(ResourcePools);
+impl_recording_operation_ops!(RecordingPools<'_>);
 
 impl EncoderPools {
     /// Bind the graphics pipeline unless this command buffer already carries it.
@@ -3342,7 +3407,10 @@ impl EncoderPools {
     }
 }
 
-impl ResourcePools {
+macro_rules! impl_recording_debt_ops {
+    ($pool:ty) => {
+#[allow(dead_code, reason = "pool operations are generated for both owner and recording views")]
+impl $pool {
     /// Whether a recorded command buffer still owes an ordering point for its
     /// guest-memory reads.
     pub(crate) fn has_guest_read_debt(&self) -> bool {
@@ -3904,6 +3972,11 @@ impl ResourcePools {
         }
     }
 }
+    };
+}
+
+impl_recording_debt_ops!(ResourcePools);
+impl_recording_debt_ops!(RecordingPools<'_>);
 
 impl EncoderPools {
     /// Create one host-visible buffer of exactly `bucket` bytes, usable as a
@@ -4163,113 +4236,171 @@ impl EncoderPools {
     }
 }
 
-impl ResourcePools {
-    pub(crate) unsafe fn acquire_target(
-        &mut self,
-        ctx: &DeviceContext,
-        key: TargetKey,
-        render_pass: vk::RenderPass,
-        counters: &EngineCounters,
-    ) -> Result<&TargetSlot, DrawError> {
-        // Band the pool's occupancy on **every** call, hit or miss, and before
-        // anything can return. Sited here rather than beside the cap because a
-        // band taken after the hit early-return counts only misses, and a zero
-        // from it then means either "never called" or "always hit" — two states
-        // a reader cannot separate, which is the sampling-point trap this exists
-        // to escape. Taken here, a zero means the function did not run.
-        crate::telemetry::note_route(target_pool_depth_band(self.shared.target_order.len()));
-        let map_key = (key, render_pass.as_raw());
-        if self.shared.targets.contains_key(&map_key) {
-            return Ok(self.shared.targets.get(&map_key).unwrap());
-        }
-        let usage = vk::ImageUsageFlags::COLOR_ATTACHMENT
-            | vk::ImageUsageFlags::INPUT_ATTACHMENT
-            | vk::ImageUsageFlags::TRANSFER_SRC
-            | if key.with_transfer_dst {
-                vk::ImageUsageFlags::TRANSFER_DST
-            } else {
-                vk::ImageUsageFlags::empty()
-            };
-        let image = ctx
-            .device
-            .create_image(
-                &vk::ImageCreateInfo::default()
-                    .image_type(vk::ImageType::TYPE_2D)
-                    .format(translate::pixel::RESIDENT_RGBA_FORMAT)
-                    .extent(vk::Extent3D {
-                        width: key.width,
-                        height: key.height,
-                        depth: 1,
-                    })
-                    .mip_levels(1)
-                    .array_layers(1)
-                    .samples(vk::SampleCountFlags::TYPE_1)
-                    .tiling(vk::ImageTiling::OPTIMAL)
-                    .usage(usage)
-                    .initial_layout(vk::ImageLayout::UNDEFINED),
-                None,
-            )
-            .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::PoolsCreateTargetImage, e)))?;
-        counters.note_create(CreateSite::TargetImage);
-        let ireq = ctx.device.get_image_memory_requirements(image);
-        let memory = match self.bind_image_slab(ctx, image, &ireq, VkOp::PoolsBindTarget, counters)
-        {
-            Ok(m) => m,
-            Err(error) => {
-                ctx.device.destroy_image(image, None);
-                return Err(error);
+macro_rules! impl_recording_resource_ops {
+    ($pool:ty) => {
+        #[allow(
+            dead_code,
+            reason = "pool operations are generated for both owner and recording views"
+        )]
+        impl $pool {
+            pub(crate) unsafe fn acquire_target(
+                &mut self,
+                ctx: &DeviceContext,
+                key: TargetKey,
+                render_pass: vk::RenderPass,
+                counters: &EngineCounters,
+            ) -> Result<&TargetSlot, DrawError> {
+                // Band the pool's occupancy on **every** call, hit or miss, and before
+                // anything can return. Sited here rather than beside the cap because a
+                // band taken after the hit early-return counts only misses, and a zero
+                // from it then means either "never called" or "always hit" — two states
+                // a reader cannot separate, which is the sampling-point trap this exists
+                // to escape. Taken here, a zero means the function did not run.
+                crate::telemetry::note_route(target_pool_depth_band(
+                    self.shared.target_order.len(),
+                ));
+                let map_key = (key, render_pass.as_raw());
+                if self.shared.targets.contains_key(&map_key) {
+                    return Ok(self.shared.targets.get(&map_key).unwrap());
+                }
+                let usage = vk::ImageUsageFlags::COLOR_ATTACHMENT
+                    | vk::ImageUsageFlags::INPUT_ATTACHMENT
+                    | vk::ImageUsageFlags::TRANSFER_SRC
+                    | if key.with_transfer_dst {
+                        vk::ImageUsageFlags::TRANSFER_DST
+                    } else {
+                        vk::ImageUsageFlags::empty()
+                    };
+                let image = ctx
+                    .device
+                    .create_image(
+                        &vk::ImageCreateInfo::default()
+                            .image_type(vk::ImageType::TYPE_2D)
+                            .format(translate::pixel::RESIDENT_RGBA_FORMAT)
+                            .extent(vk::Extent3D {
+                                width: key.width,
+                                height: key.height,
+                                depth: 1,
+                            })
+                            .mip_levels(1)
+                            .array_layers(1)
+                            .samples(vk::SampleCountFlags::TYPE_1)
+                            .tiling(vk::ImageTiling::OPTIMAL)
+                            .usage(usage)
+                            .initial_layout(vk::ImageLayout::UNDEFINED),
+                        None,
+                    )
+                    .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::PoolsCreateTargetImage, e)))?;
+                counters.note_create(CreateSite::TargetImage);
+                let ireq = ctx.device.get_image_memory_requirements(image);
+                let memory = match self.bind_image_slab(
+                    ctx,
+                    image,
+                    &ireq,
+                    VkOp::PoolsBindTarget,
+                    counters,
+                ) {
+                    Ok(m) => m,
+                    Err(error) => {
+                        ctx.device.destroy_image(image, None);
+                        return Err(error);
+                    }
+                };
+                let view = match ctx.device.create_image_view(
+                    &vk::ImageViewCreateInfo::default()
+                        .image(image)
+                        .view_type(vk::ImageViewType::TYPE_2D)
+                        .format(translate::pixel::RESIDENT_RGBA_FORMAT)
+                        .subresource_range(color_subresource_range()),
+                    None,
+                ) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        ctx.device.destroy_image(image, None);
+                        self.free_image_slab(&ctx.device, image);
+                        return Err(DrawError::VkCall(VkCall::new(
+                            VkOp::PoolsCreateTargetView,
+                            e,
+                        )));
+                    }
+                };
+                counters.note_create(CreateSite::TargetImageView);
+                let attachments = [view];
+                let framebuffer = match ctx.device.create_framebuffer(
+                    &vk::FramebufferCreateInfo::default()
+                        .render_pass(render_pass)
+                        .attachments(&attachments)
+                        .width(key.width)
+                        .height(key.height)
+                        .layers(1),
+                    None,
+                ) {
+                    Ok(fb) => fb,
+                    Err(e) => {
+                        ctx.device.destroy_image_view(view, None);
+                        ctx.device.destroy_image(image, None);
+                        self.free_image_slab(&ctx.device, image);
+                        return Err(DrawError::VkCall(VkCall::new(
+                            VkOp::PoolsCreateFramebuffer,
+                            e,
+                        )));
+                    }
+                };
+                counters.note_create(CreateSite::TargetFramebuffer);
+                if self.shared.target_order.len() >= TARGET_POOL_MAX_ENTRIES {
+                    if let Some(old_k) = self.shared.target_order.first().cloned() {
+                        if let Some(old) = self.shared.targets.remove(&old_k) {
+                            // Counted, not logged. The eviction costs a re-create and
+                            // nothing else — the key is geometry plus render pass, so
+                            // this slot is scratch and holds no guest resource's content
+                            // — but an uncounted eviction is one nobody can rank against
+                            // the re-creates it causes.
+                            crate::telemetry::note_route("target_pool_evict");
+                            self.dispose(&ctx.device, DeferredHandle::Framebuffer(old.framebuffer));
+                            self.dispose(
+                                &ctx.device,
+                                DeferredHandle::Image {
+                                    image: old.image,
+                                    view: old.view,
+                                    memory: old.memory,
+                                },
+                            );
+                        }
+                        self.shared.target_order.remove(0);
+                    }
+                }
+                self.shared.targets.insert(
+                    map_key,
+                    TargetSlot {
+                        image,
+                        memory,
+                        view,
+                        framebuffer,
+                    },
+                );
+                self.shared.target_order.push(map_key);
+                Ok(self.shared.targets.get(&map_key).unwrap())
             }
-        };
-        let view = match ctx.device.create_image_view(
-            &vk::ImageViewCreateInfo::default()
-                .image(image)
-                .view_type(vk::ImageViewType::TYPE_2D)
-                .format(translate::pixel::RESIDENT_RGBA_FORMAT)
-                .subresource_range(color_subresource_range()),
-            None,
-        ) {
-            Ok(v) => v,
-            Err(e) => {
-                ctx.device.destroy_image(image, None);
-                self.free_image_slab(&ctx.device, image);
-                return Err(DrawError::VkCall(VkCall::new(
-                    VkOp::PoolsCreateTargetView,
-                    e,
-                )));
-            }
-        };
-        counters.note_create(CreateSite::TargetImageView);
-        let attachments = [view];
-        let framebuffer = match ctx.device.create_framebuffer(
-            &vk::FramebufferCreateInfo::default()
-                .render_pass(render_pass)
-                .attachments(&attachments)
-                .width(key.width)
-                .height(key.height)
-                .layers(1),
-            None,
-        ) {
-            Ok(fb) => fb,
-            Err(e) => {
-                ctx.device.destroy_image_view(view, None);
-                ctx.device.destroy_image(image, None);
-                self.free_image_slab(&ctx.device, image);
-                return Err(DrawError::VkCall(VkCall::new(
-                    VkOp::PoolsCreateFramebuffer,
-                    e,
-                )));
-            }
-        };
-        counters.note_create(CreateSite::TargetFramebuffer);
-        if self.shared.target_order.len() >= TARGET_POOL_MAX_ENTRIES {
-            if let Some(old_k) = self.shared.target_order.first().cloned() {
-                if let Some(old) = self.shared.targets.remove(&old_k) {
-                    // Counted, not logged. The eviction costs a re-create and
-                    // nothing else — the key is geometry plus render pass, so
-                    // this slot is scratch and holds no guest resource's content
-                    // — but an uncounted eviction is one nobody can rank against
-                    // the re-creates it causes.
-                    crate::telemetry::note_route("target_pool_evict");
+
+            /// Acquire the discard-only source of a multisample resolve pass.
+            ///
+            /// One slot is sufficient: Metal's resolve-only store action makes the
+            /// source unobservable after the encoder ends. Replacing its shape does not
+            /// evict guest data; the displaced handles remain alive behind every ring
+            /// slot that could still reference them.
+            pub(crate) unsafe fn acquire_multisample_target(
+                &mut self,
+                ctx: &DeviceContext,
+                key: MultisampleTargetKey,
+                render_pass: vk::RenderPass,
+                counters: &EngineCounters,
+            ) -> Result<(vk::Image, vk::ImageView, vk::Framebuffer), DrawError> {
+                if let Some(slot) = self.shared.multisample_target.as_ref() {
+                    if slot.key == key && !key.transient_depth {
+                        return Ok((slot.image, slot.view, slot.framebuffer));
+                    }
+                }
+                if let Some(old) = self.shared.multisample_target.take() {
                     self.dispose(&ctx.device, DeferredHandle::Framebuffer(old.framebuffer));
                     self.dispose(
                         &ctx.device,
@@ -4280,447 +4411,419 @@ impl ResourcePools {
                         },
                     );
                 }
-                self.shared.target_order.remove(0);
+                let image = ctx
+                    .device
+                    .create_image(
+                        &vk::ImageCreateInfo::default()
+                            .image_type(vk::ImageType::TYPE_2D)
+                            .format(key.format)
+                            .extent(vk::Extent3D {
+                                width: key.width,
+                                height: key.height,
+                                depth: 1,
+                            })
+                            .mip_levels(1)
+                            .array_layers(1)
+                            .samples(super::super::caches::vk_sample_count(key.samples))
+                            .tiling(vk::ImageTiling::OPTIMAL)
+                            .usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
+                            .initial_layout(vk::ImageLayout::UNDEFINED),
+                        None,
+                    )
+                    .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::PoolsCreateTargetImage, e)))?;
+                counters.note_create(CreateSite::TargetImage);
+                let requirements = ctx.device.get_image_memory_requirements(image);
+                let memory = match self.bind_image_slab(
+                    ctx,
+                    image,
+                    &requirements,
+                    VkOp::PoolsBindTarget,
+                    counters,
+                ) {
+                    Ok(memory) => memory,
+                    Err(error) => {
+                        ctx.device.destroy_image(image, None);
+                        return Err(error);
+                    }
+                };
+                let view = ctx
+                    .device
+                    .create_image_view(
+                        &vk::ImageViewCreateInfo::default()
+                            .image(image)
+                            .view_type(vk::ImageViewType::TYPE_2D)
+                            .format(key.format)
+                            .subresource_range(super::super::color_subresource_range()),
+                        None,
+                    )
+                    .map_err(|e| {
+                        ctx.device.destroy_image(image, None);
+                        self.free_image_slab(&ctx.device, image);
+                        DrawError::VkCall(VkCall::new(VkOp::PoolsCreateTargetView, e))
+                    })?;
+                counters.note_create(CreateSite::TargetImageView);
+                let mut attachments = vec![view, key.resolve_view];
+                attachments.extend(key.depth_view);
+                let framebuffer = ctx
+                    .device
+                    .create_framebuffer(
+                        &vk::FramebufferCreateInfo::default()
+                            .render_pass(render_pass)
+                            .attachments(&attachments)
+                            .width(key.width)
+                            .height(key.height)
+                            .layers(1),
+                        None,
+                    )
+                    .map_err(|e| {
+                        ctx.device.destroy_image_view(view, None);
+                        ctx.device.destroy_image(image, None);
+                        self.free_image_slab(&ctx.device, image);
+                        DrawError::VkCall(VkCall::new(VkOp::PoolsCreateFramebuffer, e))
+                    })?;
+                counters.note_create(CreateSite::TargetFramebuffer);
+                self.shared.multisample_target = Some(MultisampleTargetSlot {
+                    image,
+                    memory,
+                    view,
+                    framebuffer,
+                    key,
+                });
+                Ok((image, view, framebuffer))
             }
-        }
-        self.shared.targets.insert(
-            map_key,
-            TargetSlot {
-                image,
-                memory,
-                view,
-                framebuffer,
-            },
-        );
-        self.shared.target_order.push(map_key);
-        Ok(self.shared.targets.get(&map_key).unwrap())
-    }
 
-    /// Acquire the discard-only source of a multisample resolve pass.
-    ///
-    /// One slot is sufficient: Metal's resolve-only store action makes the
-    /// source unobservable after the encoder ends. Replacing its shape does not
-    /// evict guest data; the displaced handles remain alive behind every ring
-    /// slot that could still reference them.
-    pub(crate) unsafe fn acquire_multisample_target(
-        &mut self,
-        ctx: &DeviceContext,
-        key: MultisampleTargetKey,
-        render_pass: vk::RenderPass,
-        counters: &EngineCounters,
-    ) -> Result<(vk::Image, vk::ImageView, vk::Framebuffer), DrawError> {
-        if let Some(slot) = self.shared.multisample_target.as_ref() {
-            if slot.key == key && !key.transient_depth {
-                return Ok((slot.image, slot.view, slot.framebuffer));
+            pub(crate) unsafe fn acquire_sampled(
+                &mut self,
+                ctx: &DeviceContext,
+                sk: SampledKey,
+                counters: &EngineCounters,
+            ) -> Result<SampledSlot, DrawError> {
+                unsafe { self.acquire_sampled_for(ctx, sk, counters, SampledTransientUse::Upload) }
             }
-        }
-        if let Some(old) = self.shared.multisample_target.take() {
-            self.dispose(&ctx.device, DeferredHandle::Framebuffer(old.framebuffer));
-            self.dispose(
-                &ctx.device,
-                DeferredHandle::Image {
-                    image: old.image,
-                    view: old.view,
-                    memory: old.memory,
-                },
-            );
-        }
-        let image = ctx
-            .device
-            .create_image(
-                &vk::ImageCreateInfo::default()
-                    .image_type(vk::ImageType::TYPE_2D)
-                    .format(key.format)
-                    .extent(vk::Extent3D {
-                        width: key.width,
-                        height: key.height,
-                        depth: 1,
-                    })
-                    .mip_levels(1)
-                    .array_layers(1)
-                    .samples(super::super::caches::vk_sample_count(key.samples))
-                    .tiling(vk::ImageTiling::OPTIMAL)
-                    .usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
-                    .initial_layout(vk::ImageLayout::UNDEFINED),
-                None,
-            )
-            .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::PoolsCreateTargetImage, e)))?;
-        counters.note_create(CreateSite::TargetImage);
-        let requirements = ctx.device.get_image_memory_requirements(image);
-        let memory = match self.bind_image_slab(
-            ctx,
-            image,
-            &requirements,
-            VkOp::PoolsBindTarget,
-            counters,
-        ) {
-            Ok(memory) => memory,
-            Err(error) => {
-                ctx.device.destroy_image(image, None);
-                return Err(error);
-            }
-        };
-        let view = ctx
-            .device
-            .create_image_view(
-                &vk::ImageViewCreateInfo::default()
-                    .image(image)
-                    .view_type(vk::ImageViewType::TYPE_2D)
-                    .format(key.format)
-                    .subresource_range(super::super::color_subresource_range()),
-                None,
-            )
-            .map_err(|e| {
-                ctx.device.destroy_image(image, None);
-                self.free_image_slab(&ctx.device, image);
-                DrawError::VkCall(VkCall::new(VkOp::PoolsCreateTargetView, e))
-            })?;
-        counters.note_create(CreateSite::TargetImageView);
-        let mut attachments = vec![view, key.resolve_view];
-        attachments.extend(key.depth_view);
-        let framebuffer = ctx
-            .device
-            .create_framebuffer(
-                &vk::FramebufferCreateInfo::default()
-                    .render_pass(render_pass)
-                    .attachments(&attachments)
-                    .width(key.width)
-                    .height(key.height)
-                    .layers(1),
-                None,
-            )
-            .map_err(|e| {
-                ctx.device.destroy_image_view(view, None);
-                ctx.device.destroy_image(image, None);
-                self.free_image_slab(&ctx.device, image);
-                DrawError::VkCall(VkCall::new(VkOp::PoolsCreateFramebuffer, e))
-            })?;
-        counters.note_create(CreateSite::TargetFramebuffer);
-        self.shared.multisample_target = Some(MultisampleTargetSlot {
-            image,
-            memory,
-            view,
-            framebuffer,
-            key,
-        });
-        Ok((image, view, framebuffer))
-    }
 
-    pub(crate) unsafe fn acquire_sampled(
-        &mut self,
-        ctx: &DeviceContext,
-        sk: SampledKey,
-        counters: &EngineCounters,
-    ) -> Result<SampledSlot, DrawError> {
-        unsafe { self.acquire_sampled_for(ctx, sk, counters, SampledTransientUse::Upload) }
-    }
-
-    pub(crate) unsafe fn acquire_attachment_snapshot(
-        &mut self,
-        ctx: &DeviceContext,
-        sk: SampledKey,
-        counters: &EngineCounters,
-    ) -> Result<SampledSlot, DrawError> {
-        unsafe {
-            self.acquire_sampled_for(ctx, sk, counters, SampledTransientUse::AttachmentSnapshot)
-        }
-    }
-
-    unsafe fn acquire_sampled_for(
-        &mut self,
-        ctx: &DeviceContext,
-        sk: SampledKey,
-        counters: &EngineCounters,
-        use_: SampledTransientUse,
-    ) -> Result<SampledSlot, DrawError> {
-        let SampledKey {
-            width,
-            height,
-            mip_levels,
-            layers,
-            volume,
-            cube,
-            arrayed,
-            one_dim,
-            format,
-            swizzle,
-        } = sk;
-        // A hit reuses a recycled slot — no vkAllocateMemory this acquire. A miss
-        // is counted here, at the empty free list, rather than after the create
-        // succeeds: the census question is whether the pool had one, not whether
-        // the fallback worked.
-        let recycled = match use_ {
-            SampledTransientUse::Upload => self.shared.sampled_free.take(&sk),
-            SampledTransientUse::AttachmentSnapshot => {
-                self.shared.attachment_snapshot_free.take(&sk)
-            }
-        };
-        if let Some(slot) = recycled {
-            let handles = slot.handles();
-            match use_ {
-                SampledTransientUse::Upload => self.encoder.sampled_live.push(slot),
-                SampledTransientUse::AttachmentSnapshot => {
-                    self.encoder.attachment_snapshot_live.push(slot)
+            pub(crate) unsafe fn acquire_attachment_snapshot(
+                &mut self,
+                ctx: &DeviceContext,
+                sk: SampledKey,
+                counters: &EngineCounters,
+            ) -> Result<SampledSlot, DrawError> {
+                unsafe {
+                    self.acquire_sampled_for(
+                        ctx,
+                        sk,
+                        counters,
+                        SampledTransientUse::AttachmentSnapshot,
+                    )
                 }
             }
-            return Ok(handles);
-        }
-        let image_type = if one_dim {
-            vk::ImageType::TYPE_1D
-        } else if volume {
-            vk::ImageType::TYPE_3D
-        } else {
-            vk::ImageType::TYPE_2D
-        };
-        let view_type = if one_dim && arrayed {
-            vk::ImageViewType::TYPE_1D_ARRAY
-        } else if one_dim {
-            vk::ImageViewType::TYPE_1D
-        } else if volume {
-            vk::ImageViewType::TYPE_3D
-        } else if cube {
-            vk::ImageViewType::CUBE
-        } else if arrayed {
-            vk::ImageViewType::TYPE_2D_ARRAY
-        } else {
-            vk::ImageViewType::TYPE_2D
-        };
-        let extent_depth = if volume { layers } else { 1 };
-        let array_layers = if volume { 1 } else { layers };
-        let flags = if cube {
-            vk::ImageCreateFlags::CUBE_COMPATIBLE
-        } else {
-            vk::ImageCreateFlags::empty()
-        };
-        let vk_format = format;
-        let image = ctx
-            .device
-            .create_image(
-                &vk::ImageCreateInfo::default()
-                    .flags(flags)
-                    .image_type(image_type)
-                    .format(vk_format)
-                    .extent(vk::Extent3D {
-                        width,
-                        height,
-                        depth: extent_depth,
-                    })
-                    .mip_levels(mip_levels)
-                    .array_layers(array_layers)
-                    .samples(vk::SampleCountFlags::TYPE_1)
-                    .tiling(vk::ImageTiling::OPTIMAL)
-                    .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST)
-                    .initial_layout(vk::ImageLayout::UNDEFINED),
-                None,
-            )
-            .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::PoolsCreateSampledImage, e)))?;
-        counters.note_create(CreateSite::SampledImage);
-        let req = ctx.device.get_image_memory_requirements(image);
-        let memory = match self.bind_image_slab(ctx, image, &req, VkOp::PoolsBindSampled, counters)
-        {
-            Ok(m) => m,
-            Err(error) => {
-                ctx.device.destroy_image(image, None);
-                return Err(error);
+
+            unsafe fn acquire_sampled_for(
+                &mut self,
+                ctx: &DeviceContext,
+                sk: SampledKey,
+                counters: &EngineCounters,
+                use_: SampledTransientUse,
+            ) -> Result<SampledSlot, DrawError> {
+                let SampledKey {
+                    width,
+                    height,
+                    mip_levels,
+                    layers,
+                    volume,
+                    cube,
+                    arrayed,
+                    one_dim,
+                    format,
+                    swizzle,
+                } = sk;
+                // A hit reuses a recycled slot — no vkAllocateMemory this acquire. A miss
+                // is counted here, at the empty free list, rather than after the create
+                // succeeds: the census question is whether the pool had one, not whether
+                // the fallback worked.
+                let recycled = match use_ {
+                    SampledTransientUse::Upload => self.shared.sampled_free.take(&sk),
+                    SampledTransientUse::AttachmentSnapshot => {
+                        self.shared.attachment_snapshot_free.take(&sk)
+                    }
+                };
+                if let Some(slot) = recycled {
+                    let handles = slot.handles();
+                    match use_ {
+                        SampledTransientUse::Upload => self.encoder.sampled_live.push(slot),
+                        SampledTransientUse::AttachmentSnapshot => {
+                            self.encoder.attachment_snapshot_live.push(slot)
+                        }
+                    }
+                    return Ok(handles);
+                }
+                let image_type = if one_dim {
+                    vk::ImageType::TYPE_1D
+                } else if volume {
+                    vk::ImageType::TYPE_3D
+                } else {
+                    vk::ImageType::TYPE_2D
+                };
+                let view_type = if one_dim && arrayed {
+                    vk::ImageViewType::TYPE_1D_ARRAY
+                } else if one_dim {
+                    vk::ImageViewType::TYPE_1D
+                } else if volume {
+                    vk::ImageViewType::TYPE_3D
+                } else if cube {
+                    vk::ImageViewType::CUBE
+                } else if arrayed {
+                    vk::ImageViewType::TYPE_2D_ARRAY
+                } else {
+                    vk::ImageViewType::TYPE_2D
+                };
+                let extent_depth = if volume { layers } else { 1 };
+                let array_layers = if volume { 1 } else { layers };
+                let flags = if cube {
+                    vk::ImageCreateFlags::CUBE_COMPATIBLE
+                } else {
+                    vk::ImageCreateFlags::empty()
+                };
+                let vk_format = format;
+                let image = ctx
+                    .device
+                    .create_image(
+                        &vk::ImageCreateInfo::default()
+                            .flags(flags)
+                            .image_type(image_type)
+                            .format(vk_format)
+                            .extent(vk::Extent3D {
+                                width,
+                                height,
+                                depth: extent_depth,
+                            })
+                            .mip_levels(mip_levels)
+                            .array_layers(array_layers)
+                            .samples(vk::SampleCountFlags::TYPE_1)
+                            .tiling(vk::ImageTiling::OPTIMAL)
+                            .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST)
+                            .initial_layout(vk::ImageLayout::UNDEFINED),
+                        None,
+                    )
+                    .map_err(|e| {
+                        DrawError::VkCall(VkCall::new(VkOp::PoolsCreateSampledImage, e))
+                    })?;
+                counters.note_create(CreateSite::SampledImage);
+                let req = ctx.device.get_image_memory_requirements(image);
+                let memory = match self.bind_image_slab(
+                    ctx,
+                    image,
+                    &req,
+                    VkOp::PoolsBindSampled,
+                    counters,
+                ) {
+                    Ok(m) => m,
+                    Err(error) => {
+                        ctx.device.destroy_image(image, None);
+                        return Err(error);
+                    }
+                };
+                let view = match ctx.device.create_image_view(
+                    &vk::ImageViewCreateInfo::default()
+                        .image(image)
+                        .view_type(view_type)
+                        .format(vk_format)
+                        // The decoded type-8 view swizzle, performed by the hardware at
+                        // sample time. Identity for every ordinary bind. The format
+                        // contributes no mapping of its own: `translate::pixel`'s
+                        // sampled rail admits only formats whose Metal channels sit
+                        // identically on their Vulkan ones, and declines the rest by
+                        // name rather than binding a plan it cannot carry.
+                        .components(translate::pixel::vk_component_mapping(&swizzle))
+                        .subresource_range(vk::ImageSubresourceRange {
+                            aspect_mask: vk::ImageAspectFlags::COLOR,
+                            base_mip_level: 0,
+                            level_count: mip_levels,
+                            base_array_layer: 0,
+                            layer_count: array_layers,
+                        }),
+                    None,
+                ) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        ctx.device.destroy_image(image, None);
+                        self.free_image_slab(&ctx.device, image);
+                        return Err(DrawError::VkCall(VkCall::new(
+                            VkOp::PoolsCreateSampledView,
+                            e,
+                        )));
+                    }
+                };
+                counters.note_create(CreateSite::SampledImageView);
+                let slot = SampledSlot {
+                    image,
+                    memory,
+                    view,
+                    width,
+                    height,
+                    mip_levels,
+                    layers,
+                    volume,
+                    cube,
+                    arrayed,
+                    one_dim,
+                    format,
+                    swizzle,
+                };
+                let handles = slot.handles();
+                match use_ {
+                    SampledTransientUse::Upload => self.encoder.sampled_live.push(slot),
+                    SampledTransientUse::AttachmentSnapshot => {
+                        self.encoder.attachment_snapshot_live.push(slot)
+                    }
+                }
+                Ok(handles)
             }
-        };
-        let view = match ctx.device.create_image_view(
-            &vk::ImageViewCreateInfo::default()
-                .image(image)
-                .view_type(view_type)
-                .format(vk_format)
-                // The decoded type-8 view swizzle, performed by the hardware at
-                // sample time. Identity for every ordinary bind. The format
-                // contributes no mapping of its own: `translate::pixel`'s
-                // sampled rail admits only formats whose Metal channels sit
-                // identically on their Vulkan ones, and declines the rest by
-                // name rather than binding a plan it cannot carry.
-                .components(translate::pixel::vk_component_mapping(&swizzle))
-                .subresource_range(vk::ImageSubresourceRange {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    base_mip_level: 0,
-                    level_count: mip_levels,
-                    base_array_layer: 0,
-                    layer_count: array_layers,
-                }),
-            None,
-        ) {
-            Ok(v) => v,
-            Err(e) => {
-                ctx.device.destroy_image(image, None);
-                self.free_image_slab(&ctx.device, image);
-                return Err(DrawError::VkCall(VkCall::new(
-                    VkOp::PoolsCreateSampledView,
-                    e,
-                )));
+
+            pub(crate) fn find_cached_sampled(
+                &mut self,
+                key: SampledKey,
+                content: &[u8],
+                identity: Option<crate::engine::SampledContentIdentity>,
+                resource_lifetime: Option<&reims_vgpu_core::ResourceLifetimeRef>,
+                counters: &EngineCounters,
+            ) -> Option<SampledSlot> {
+                // Before any cache is consulted, so the set is what the workload *asked
+                // for* rather than what this cache happened to keep. That is the whole
+                // distinction from the victim ledger, whose reach is censored at
+                // `SAMPLED_VICTIM_LEDGER` and reads `beyond_ledger` 6 704 times on a
+                // driven macos-26 boot.
+                super::sampled_working_set::note_wanted(key, identity, content.len());
+                let content_hash = sampled_content_hash(content);
+                // The digest narrows the walk to one candidate; the retained bytes are
+                // what decide the hit. `ResidentSampledSlot::content` carries why the
+                // digest is not allowed to answer on its own.
+                let found = self.shared.sampled_cache.iter().position(|entry| {
+                    entry.has_live_owner()
+                        && entry.slot.key() == key
+                        && entry.fingerprint == SampledFingerprint::Content(content_hash)
+                        && entry.content.as_deref().is_some_and(|b| b == content)
+                });
+                let Some(index) = found else {
+                    counters
+                        .sampled_cache_misses
+                        .fetch_add(1, Ordering::Relaxed);
+                    return None;
+                };
+                let Some(owner) = resource_lifetime.filter(|owner| owner.is_live()) else {
+                    counters
+                        .sampled_cache_misses
+                        .fetch_add(1, Ordering::Relaxed);
+                    return None;
+                };
+                let entry = &mut self.shared.sampled_cache[index];
+                entry.retain_owner(owner);
+                entry.last_touch_ms = self.shared.idle_clock_ms;
+                let handles = entry.slot.handles();
+                counters.sampled_cache_hits.fetch_add(1, Ordering::Relaxed);
+                counters
+                    .sampled_cache_hit_bytes
+                    .fetch_add(content.len() as u64, Ordering::Relaxed);
+                Some(handles)
             }
-        };
-        counters.note_create(CreateSite::SampledImageView);
-        let slot = SampledSlot {
-            image,
-            memory,
-            view,
-            width,
-            height,
-            mip_levels,
-            layers,
-            volume,
-            cube,
-            arrayed,
-            one_dim,
-            format,
-            swizzle,
-        };
-        let handles = slot.handles();
-        match use_ {
-            SampledTransientUse::Upload => self.encoder.sampled_live.push(slot),
-            SampledTransientUse::AttachmentSnapshot => {
-                self.encoder.attachment_snapshot_live.push(slot)
+
+            /// Admit one detached sampled slot into the exact-content cache. A slot
+            /// whose content duplicates an existing entry, or has no serialized owner,
+            /// returns to the live list for fence-safe recycling.
+            ///
+            /// # Every exit is counted, because a cache that never fills looks the same
+            ///
+            /// `sampled_admit_kept`, `_duplicate`, `_no_identity` and `_no_lifetime`
+            /// partition the calls.
+            fn admit_sampled_slot(
+                &mut self,
+                slot: SampledSlot,
+                content: &SampledRetainContent,
+                resource_lifetime: Option<&reims_vgpu_core::ResourceLifetimeRef>,
+            ) {
+                self.admit_sampled_entry(slot, content, resource_lifetime);
+            }
+
+            /// Device-free half of [`Self::admit_sampled_slot`], split out so admission
+            /// is reachable from a test with no GPU.
+            ///
+            /// The three arms that decline hand the slot back to `sampled_live`, which
+            /// this entry's own [`Self::seal_entry`] has just emptied — so it is swept
+            /// into the *next* entry's cleanup and recycled when that entry's fence
+            /// signals. On one queue that fence is behind this entry's, so a CB still
+            /// reading the image cannot be racing the recycle.
+            fn admit_sampled_entry(
+                &mut self,
+                slot: SampledSlot,
+                content: &SampledRetainContent,
+                resource_lifetime: Option<&reims_vgpu_core::ResourceLifetimeRef>,
+            ) {
+                let Some(owner) = resource_lifetime.filter(|owner| owner.is_live()) else {
+                    crate::telemetry::note_route("sampled_admit_no_lifetime");
+                    self.encoder.sampled_live.push(slot);
+                    return;
+                };
+                let (fingerprint, retained, content_len) = match content {
+                    // The `Arc` is cloned rather than the bytes copied: the retire path
+                    // already holds one, so recognising this entry by content later
+                    // costs a refcount here and no new allocation.
+                    SampledRetainContent::Bytes(bytes) => (
+                        SampledFingerprint::Content(sampled_content_hash(bytes)),
+                        Some(bytes.clone()),
+                        bytes.len(),
+                    ),
+                };
+                // Deduplication asks the same question a lookup does, so it has to
+                // answer it the same way: a fingerprint match proposes a duplicate and
+                // something else confirms it. Collapsing two entries here is exactly as
+                // wrong as returning the wrong one from `find_cached_sampled` — the
+                // survivor then answers for content it was not built from.
+                let duplicate = self.shared.sampled_cache.iter().position(|entry| {
+                    entry.has_live_owner()
+                        && entry.slot.key() == slot.key()
+                        && entry.fingerprint == fingerprint
+                        && entry.content.as_deref() == retained.as_deref()
+                });
+                if let Some(index) = duplicate {
+                    crate::telemetry::note_route("sampled_admit_duplicate");
+                    let existing = &mut self.shared.sampled_cache[index];
+                    existing.retain_owner(owner);
+                    self.encoder.sampled_live.push(slot);
+                    return;
+                }
+                crate::telemetry::note_route("sampled_admit_kept");
+                self.shared.sampled_cache_bytes =
+                    self.shared.sampled_cache_bytes.saturating_add(content_len);
+                let touch = self.shared.idle_clock_ms;
+                self.push_sampled_entry(ResidentSampledSlot {
+                    slot,
+                    fingerprint,
+                    content: retained,
+                    content_len,
+                    owners: vec![owner.clone()],
+                    last_touch_ms: touch,
+                });
+            }
+
+            pub(crate) fn recycle_sampled(&mut self) {
+                // This method owns sampled-slot recycling even when a future caller
+                // does not also recycle staging. No memo may survive the slots it
+                // names entering the free pool.
+                self.forget_cb_sampled_guest();
+                for slot in self.encoder.sampled_live.drain(..) {
+                    let sk = slot.key();
+                    self.shared.sampled_free.push_uncapped(sk, slot);
+                }
+                for slot in self.encoder.attachment_snapshot_live.drain(..) {
+                    let sk = slot.key();
+                    self.shared.attachment_snapshot_free.push_uncapped(sk, slot);
+                }
             }
         }
-        Ok(handles)
-    }
-
-    pub(crate) fn find_cached_sampled(
-        &mut self,
-        key: SampledKey,
-        content: &[u8],
-        identity: Option<crate::engine::SampledContentIdentity>,
-        resource_lifetime: Option<&reims_vgpu_core::ResourceLifetimeRef>,
-        counters: &EngineCounters,
-    ) -> Option<SampledSlot> {
-        // Before any cache is consulted, so the set is what the workload *asked
-        // for* rather than what this cache happened to keep. That is the whole
-        // distinction from the victim ledger, whose reach is censored at
-        // `SAMPLED_VICTIM_LEDGER` and reads `beyond_ledger` 6 704 times on a
-        // driven macos-26 boot.
-        super::sampled_working_set::note_wanted(key, identity, content.len());
-        let content_hash = sampled_content_hash(content);
-        // The digest narrows the walk to one candidate; the retained bytes are
-        // what decide the hit. `ResidentSampledSlot::content` carries why the
-        // digest is not allowed to answer on its own.
-        let found = self.shared.sampled_cache.iter().position(|entry| {
-            entry.has_live_owner()
-                && entry.slot.key() == key
-                && entry.fingerprint == SampledFingerprint::Content(content_hash)
-                && entry.content.as_deref().is_some_and(|b| b == content)
-        });
-        let Some(index) = found else {
-            counters
-                .sampled_cache_misses
-                .fetch_add(1, Ordering::Relaxed);
-            return None;
-        };
-        let Some(owner) = resource_lifetime.filter(|owner| owner.is_live()) else {
-            counters
-                .sampled_cache_misses
-                .fetch_add(1, Ordering::Relaxed);
-            return None;
-        };
-        let entry = &mut self.shared.sampled_cache[index];
-        entry.retain_owner(owner);
-        entry.last_touch_ms = self.shared.idle_clock_ms;
-        let handles = entry.slot.handles();
-        counters.sampled_cache_hits.fetch_add(1, Ordering::Relaxed);
-        counters
-            .sampled_cache_hit_bytes
-            .fetch_add(content.len() as u64, Ordering::Relaxed);
-        Some(handles)
-    }
-
-    /// Admit one detached sampled slot into the exact-content cache. A slot
-    /// whose content duplicates an existing entry, or has no serialized owner,
-    /// returns to the live list for fence-safe recycling.
-    ///
-    /// # Every exit is counted, because a cache that never fills looks the same
-    ///
-    /// `sampled_admit_kept`, `_duplicate`, `_no_identity` and `_no_lifetime`
-    /// partition the calls.
-    fn admit_sampled_slot(
-        &mut self,
-        slot: SampledSlot,
-        content: &SampledRetainContent,
-        resource_lifetime: Option<&reims_vgpu_core::ResourceLifetimeRef>,
-    ) {
-        self.admit_sampled_entry(slot, content, resource_lifetime);
-    }
-
-    /// Device-free half of [`Self::admit_sampled_slot`], split out so admission
-    /// is reachable from a test with no GPU.
-    ///
-    /// The three arms that decline hand the slot back to `sampled_live`, which
-    /// this entry's own [`Self::seal_entry`] has just emptied — so it is swept
-    /// into the *next* entry's cleanup and recycled when that entry's fence
-    /// signals. On one queue that fence is behind this entry's, so a CB still
-    /// reading the image cannot be racing the recycle.
-    fn admit_sampled_entry(
-        &mut self,
-        slot: SampledSlot,
-        content: &SampledRetainContent,
-        resource_lifetime: Option<&reims_vgpu_core::ResourceLifetimeRef>,
-    ) {
-        let Some(owner) = resource_lifetime.filter(|owner| owner.is_live()) else {
-            crate::telemetry::note_route("sampled_admit_no_lifetime");
-            self.encoder.sampled_live.push(slot);
-            return;
-        };
-        let (fingerprint, retained, content_len) = match content {
-            // The `Arc` is cloned rather than the bytes copied: the retire path
-            // already holds one, so recognising this entry by content later
-            // costs a refcount here and no new allocation.
-            SampledRetainContent::Bytes(bytes) => (
-                SampledFingerprint::Content(sampled_content_hash(bytes)),
-                Some(bytes.clone()),
-                bytes.len(),
-            ),
-        };
-        // Deduplication asks the same question a lookup does, so it has to
-        // answer it the same way: a fingerprint match proposes a duplicate and
-        // something else confirms it. Collapsing two entries here is exactly as
-        // wrong as returning the wrong one from `find_cached_sampled` — the
-        // survivor then answers for content it was not built from.
-        let duplicate = self.shared.sampled_cache.iter().position(|entry| {
-            entry.has_live_owner()
-                && entry.slot.key() == slot.key()
-                && entry.fingerprint == fingerprint
-                && entry.content.as_deref() == retained.as_deref()
-        });
-        if let Some(index) = duplicate {
-            crate::telemetry::note_route("sampled_admit_duplicate");
-            let existing = &mut self.shared.sampled_cache[index];
-            existing.retain_owner(owner);
-            self.encoder.sampled_live.push(slot);
-            return;
-        }
-        crate::telemetry::note_route("sampled_admit_kept");
-        self.shared.sampled_cache_bytes =
-            self.shared.sampled_cache_bytes.saturating_add(content_len);
-        let touch = self.shared.idle_clock_ms;
-        self.push_sampled_entry(ResidentSampledSlot {
-            slot,
-            fingerprint,
-            content: retained,
-            content_len,
-            owners: vec![owner.clone()],
-            last_touch_ms: touch,
-        });
-    }
-
-    pub(crate) fn recycle_sampled(&mut self) {
-        // This method owns sampled-slot recycling even when a future caller
-        // does not also recycle staging. No memo may survive the slots it
-        // names entering the free pool.
-        self.forget_cb_sampled_guest();
-        for slot in self.encoder.sampled_live.drain(..) {
-            let sk = slot.key();
-            self.shared.sampled_free.push_uncapped(sk, slot);
-        }
-        for slot in self.encoder.attachment_snapshot_live.drain(..) {
-            let sk = slot.key();
-            self.shared.attachment_snapshot_free.push_uncapped(sk, slot);
-        }
-    }
+    };
 }
+
+impl_recording_resource_ops!(ResourcePools);
+impl_recording_resource_ops!(RecordingPools<'_>);
 
 /// Lift the images named by `retains` out of `slots`, pairing each with what
 /// names it.

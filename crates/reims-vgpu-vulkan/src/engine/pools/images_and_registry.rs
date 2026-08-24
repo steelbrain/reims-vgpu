@@ -243,7 +243,10 @@ struct NewResident {
     attachment_view: Option<vk::ImageView>,
 }
 
-impl ResourcePools {
+macro_rules! impl_image_registry_pool_ops {
+    ($pool:ty) => {
+#[allow(dead_code, reason = "pool operations are generated for both owner and recording views")]
+impl $pool {
     /// Resolve a sampled declaration to a resident whose image *is* the guest's
     /// allocation, so the GPU samples the pages the guest CPU writes.
     ///
@@ -3696,6 +3699,11 @@ impl ResourcePools {
         }
     }
 }
+    };
+}
+
+impl_image_registry_pool_ops!(ResourcePools);
+impl_image_registry_pool_ops!(RecordingPools<'_>);
 
 #[cfg(test)]
 mod heap_image_definition_tests {

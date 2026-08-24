@@ -708,21 +708,8 @@ pub(crate) struct ResourcePools {
 /// recording-local state can move to a worker without granting that worker
 /// ownership of session teardown or replacement.
 pub(crate) struct RecordingPools<'a> {
-    pools: &'a mut ResourcePools,
-}
-
-impl std::ops::Deref for RecordingPools<'_> {
-    type Target = ResourcePools;
-
-    fn deref(&self) -> &Self::Target {
-        self.pools
-    }
-}
-
-impl std::ops::DerefMut for RecordingPools<'_> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        self.pools
-    }
+    encoder: &'a mut EncoderPools,
+    shared: &'a mut SharedPools,
 }
 
 /// State of the deferred-submit draw batch (draw-batching increment 1): the
@@ -1350,7 +1337,10 @@ impl DeferredHandle {
     }
 }
 
-impl ResourcePools {
+macro_rules! impl_deferred_pool_ops {
+    ($pool:ty) => {
+#[allow(dead_code, reason = "pool operations are generated for both owner and recording views")]
+impl $pool {
     fn release_heap_placement_child(
         &mut self,
         placement: HeapPlacementMemoryKey,
@@ -1472,6 +1462,11 @@ impl ResourcePools {
         }
     }
 }
+    };
+}
+
+impl_deferred_pool_ops!(ResourcePools);
+impl_deferred_pool_ops!(RecordingPools<'_>);
 
 /// Cleanup owed by an entry that skipped its post-submit fence wait: the
 /// descriptor set and every transient pool slot the CB references, moved out of
