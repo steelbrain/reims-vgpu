@@ -48,10 +48,10 @@ split and the scalar sequence without guessing. Field *meanings* come from
 perturbation: change one Metal property, serialize, diff the bytes, and whatever
 moved is that property's home.
 
-**Anything not derived is not named.** Four bits in the texture descriptor's
-packed word have never moved under any perturbation. They are
-`unidentified_flags()`, and the doc comment carries the experiment that would
-settle them. Inventing a plausible name is how a guess becomes folklore.
+**Anything not derived is not named.** The private texture fields are named only
+after independent perturbations moved them: `framebufferOnly`, `isDrawable`,
+`writeSwizzleEnabled`, and `protectionOptions`. Inventing a plausible name is
+how a guess becomes folklore.
 
 **Exhaustiveness is a number.** `class_copyMethodList` enumerates Apple's whole
 surface — currently 364 selectors across the serializer and its four encoder
@@ -136,11 +136,12 @@ each capture rather than remembered.
 The current coverage line, printed by the test suite:
 
 ```
-wire coverage: 20 covered, 4 unimplemented, 8 excluded, 332 untriaged of 364 selectors
+wire coverage: 207 covered, 0 unimplemented, 153 excluded, 4 untriaged of 364 selectors
 ```
 
-Opcodes measured but not yet viewed: 3 (sampler state), 4 (depth/stencil state),
-13 (fence), 21 (heap-placed texture).
+Every selector known to emit a fixed operation now has a view. The four remaining
+untriaged selectors are the explicit manifest gap, not measured opcodes waiting
+beside an implemented decoder.
 
 ## Relationship to `reims-vgpu`
 
@@ -159,7 +160,7 @@ Covered families used today:
 | `decode::render` | `ops::render`, `ops::render_pass`, `ops::tile` | `op` framing + draw/state parsers and views |
 | `decode::resource` | `ops::{sampler,depth_stencil,texture_view,icb,heap_texture,backed_texture,…}` | parsers for covered create records (sampler, depth/stencil, texture views, ICB, heap/buffer textures) |
 | `decode::stream` | `ops::segment`, `OP_HEADER_LEN` | segment header types and record framing constants |
-| `contract::gva` / page walk | `page_table` | GVA walk layout |
+| `reims-vgpu-paging` page walk | `page_table` | GVA walk layout |
 
 What stays local in decode (wire has no export):
 

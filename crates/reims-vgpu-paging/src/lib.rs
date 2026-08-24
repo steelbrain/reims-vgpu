@@ -24,6 +24,8 @@
 
 extern crate alloc;
 
+pub mod geometry;
+pub mod mapper;
 pub mod regions;
 pub mod resolve;
 pub mod runs;

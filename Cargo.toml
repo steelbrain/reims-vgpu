@@ -1,13 +1,21 @@
-# Cargo workspace for the project's host-side product crate.
+# Cargo workspace for the project's host-side device stack.
 #
-# Product path: crates/reims-vgpu (protocol + C ABI + Metal|Vulkan backend).
+# Shipping composition/staticlib: crates/reims-vgpu (QEMU ABI + orchestration).
+# Semantic contract/core and Vulkan execution live in their sibling crates.
 # UEFI option ROM: crates/reims-vgpu-efi (own Cargo workspace — x86_64-unknown-uefi;
 # not a member here so host builds never pull the no_std PE graph).
 [workspace]
 resolver = "2"
 members = [
   "crates/reims-vgpu",
+  "crates/reims-vgpu-core",
+  "crates/reims-vgpu-config",
+  "crates/reims-vgpu-memory",
+  "crates/reims-vgpu-observe",
   "crates/reims-vgpu-paging",
+  "crates/reims-vgpu-protocol",
+  "crates/reims-vgpu-testkit",
+  "crates/reims-vgpu-vulkan",
   "crates/reims-vgpu-wire",
 ]
 exclude = [

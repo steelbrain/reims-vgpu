@@ -1,6 +1,6 @@
 //! Behavior: turn guest work into HostActions / backend jobs.
 //!
-//! Drain FIFOs, parse wire (using [`crate::contract`]), resolve memory, plan
+//! Drain FIFOs, parse wire through `reims-vgpu-wire` and `reims-vgpu-protocol`, resolve memory, plan
 //! ops, update [`crate::model`] state. No GPU API calls here.
 
 /// The split of [`chain_phase`]'s largest column, `binds_us`.
@@ -9,81 +9,59 @@ pub mod bind_phase;
 pub mod blit_exec;
 /// Draw-time buffer binds, resolved once per reference and held until the
 /// guest moves the addresses under them.
-#[cfg(feature = "backend-vulkan")]
 pub mod bound_buffers;
 /// Guest-declared write generations for task-local GVA resources.
-pub mod buffer_write_gen;
 /// Always-on proxies and censuses, one per measured bug class.
 pub mod census;
 /// Where a draw chain's wall clock goes on the runtime side of the engine
 /// boundary, which is 82% of it.
 pub mod chain_phase;
 /// Product-path compute bind/dispatch (pipeline + buffers + direct dispatch).
-// See the note on `backend::metal`: `Status` is a 264-byte `Copy` payload
-// carried on failure paths, and boxing it would cost the refusal vocabulary
-// that makes each one greppable.
-#[allow(clippy::result_large_err, clippy::large_enum_variant)]
 pub mod compute_exec;
-/// Multi-record compute encoder session (control-flow SPI + ICB execute).
-// See the note on `backend::metal`: `Status` is a 264-byte `Copy` payload
-// carried on failure paths, and boxing it would cost the refusal vocabulary
-// that makes each one greppable.
-#[allow(clippy::result_large_err, clippy::large_enum_variant)]
+/// Multi-record compute sequencing state.
 pub mod compute_session;
 pub mod decode;
+mod device;
+pub use device::Device;
 pub mod drain;
 /// The always-on log sink every decline and census writes to
 /// (`/tmp/reims-vgpu-fail.log`); `line()` is the `REIMS_VGPU_DRAW_LOG=1`-gated tier.
-/// CmdExecIndirect2 stream walk + type-11 resolve.
+/// CmdExecIndirect2 stream walk + IOSurface texture resolve.
 pub mod exec;
+/// Device-owned execution port and the compatibility Vulkan adapter.
+pub mod executor;
 /// Product-path event + encoder fence sync (event/blit/compute/render domains).
 pub mod fence_exec;
-/// Is the hypervisor's guest-write generation a sound cache key for the
-/// zero-copy sampled gathers? Measurement, not policy.
-#[cfg(feature = "backend-vulkan")]
+/// Contract generations and exact device-write footprints for sampled gathers.
 pub mod gather_witness;
 /// Guest-physical control-plane writes via HostOps map_pages.
 pub mod gpa_map;
-/// The last few pieces of work handed to the GPU, so a host GPU hang can name
-/// what it was running instead of only that a fence stopped signalling.
-pub mod gpu_hang_trail;
-/// The bound on every GPU reference to guest RAM — one import per RAMBlock,
-/// and the only type that can name a byte inside one.
+/// The bound on every GPU reference to guest RAM: VM-lifetime RAMBlock imports
+/// and guest-lifetime packed mapping imports share this one checked type.
 pub mod guest_ram;
 /// This process's imports of guest RAM, and the one place a guest physical
 /// address becomes a bindable reference.
 pub mod guest_ram_map;
 /// Scattered guest windows → image-copy rectangles. Pure arithmetic, ungated so
-/// both backends and every test arm reach it.
 /// Task GVA → guest RAM reads.
 pub mod gva_mem;
-/// Gated with the `GuestWriteVerdict` it reuses and the `TargetIdentity` it
-/// keys on, both of which are Vulkan-side; the type-11 twin this mirrors
-/// (`mapper::mapping_guest_write_verdict`) carries the same gate.
-#[cfg(feature = "backend-vulkan")]
+pub mod gva_refusal;
+/// GVA Store currency is used by Vulkan residents and retained in the decoded
+/// task-resource namespace.
 pub mod gva_store_witness;
 /// Task-GVA HostOps views (MapMemory2 / UnmapMemory lifecycle).
 pub mod gva_view;
 /// CmdHeapTextureSizeAndAlign wire decode + host requirement query.
 pub mod heap_query;
 pub mod host;
-/// Which guest pages this device has written, and when — the half of the
-/// guest-write witness the hypervisor's dirty bitmap cannot supply.
-pub mod host_writes;
-/// Type-7 ICB (0x36) materialization, host command fills, execute writeback.
+/// Which guest pages this device has written, and when.
+/// ICB descriptor materialization, host command fills, and execute writeback.
 pub mod icb;
 
-/// Metal draw encode + writeback when MTLBs resolve.
-// See the note on `backend::metal`: `Status` is a 264-byte `Copy` payload
-// carried on failure paths, and boxing it would cost the refusal vocabulary
-// that makes each one greppable.
-#[allow(clippy::result_large_err, clippy::large_enum_variant)]
+/// Draw encode and writeback when MTLBs resolve.
 pub mod draw;
 pub mod input;
-/// Process-global metal2vulkan SPIR-V cache (AIR content hash → SPIR-V).
-pub mod m2v_cache;
 /// IOSurface mapper capture + page-table resolve.
-pub mod map_audit;
 pub mod mapper;
 /// Write host BGRA into guest mapping pages (render writeback).
 pub mod mapping_write;
@@ -93,14 +71,11 @@ pub mod mmio;
 /// MTLB container → wrapped-AIR carve for metal2vulkan.
 pub mod mtlb;
 pub mod node_guard;
-/// Object-list lookup and type-11 registration.
+/// Object-list lookup and IOSurface texture registration.
 pub mod objects;
 /// A draw's pipeline and both its shaders, resolved once per pipeline object.
-#[cfg(feature = "backend-vulkan")]
 pub mod pipeline_resolve;
-pub mod plan;
-/// The resident identity a type-11 guest surface renders into.
-#[cfg(feature = "backend-vulkan")]
+/// The resident identity an IOSurface texture guest surface renders into.
 pub mod present_identity;
 /// Whether a range's page-table entries are in the state the guest's own next
 /// edit of them requires — the direction that is ordered is the map.
@@ -115,18 +90,13 @@ pub mod resource_validity;
 pub mod sampled_phase;
 /// Guest surface → host BGRA8 for the QEMU console.
 pub mod scanout;
-/// SPIR-V set-0 binding relocation for metal2vulkan + internal Vulkan engine (Linux).
-pub mod spirv_bind;
-mod spirv_layout;
-/// How wide a translated vertex shader's stage-in reads are, per `Location`.
-pub mod spirv_vertex_input;
 /// Host surface cache (Linux/Vulkan discrete-GPU present, kb §8.5).
 pub mod surface_cache;
 /// The wire task word a command payload carries → a live task slot.
 pub mod task_slot;
-/// Texture / type-11 geometry registration.
+/// Texture / IOSurface texture geometry registration.
 pub mod texture;
-/// Track host-authoritative surface and GVA frames, and transfer them on demand.
+/// Track host-authoritative GVA resources and transfer them on demand.
 pub mod writeback_debt;
 
 /// The unit-test host double, gated with its definition. An ungated re-export
@@ -134,3 +104,30 @@ pub mod writeback_debt;
 #[cfg(test)]
 pub(crate) use host::FakeHost;
 pub(crate) use host::{HostAction, HostOps};
+
+/// Apply the model's child-channel range rule and report a rejected command.
+///
+/// The two doorbell handlers and `ensure_child_ring` all gate guest work on
+/// this answer. Keeping emission here lets the model own the pure channel
+/// predicate without reaching into runtime census state.
+pub fn accept_child_channel(channel_id: u32, site: &'static str) -> bool {
+    if crate::model::is_child_channel(channel_id) {
+        return true;
+    }
+    drain::census::note_store_route("child_channel_out_of_range");
+    if crate::observe::first_sight("channel_outside_device_range", u64::from(channel_id)) {
+        crate::observe::fail(format!(
+            "child_channel_out_of_range reason=channel_outside_device_range \
+             site={site} channel={channel_id} max_channels={}",
+            crate::model::MAX_CHANNELS
+        ));
+    }
+    false
+}
+
+/// Emit observation-only consequences of a mapping-page mutation.
+pub fn note_mapping_invalidation(effect: crate::model::MappingInvalidationEffect) {
+    if effect.dropped_host_cache {
+        drain::note_store_route("invalidate_dropped_host_cache");
+    }
+}

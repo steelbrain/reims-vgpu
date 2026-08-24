@@ -63,7 +63,7 @@
 //! One `Instant::now()` per phase transition, accumulated in a local array and
 //! flushed to the shared census once per stream. A packet of ninety draws
 //! therefore pays twelve atomics rather than a thousand — the same trade
-//! `crate::backend::vulkan::engine::draw_phase`'s timer makes per draw.
+//! `reims_vgpu_vulkan::engine::draw_phase`'s timer makes per draw.
 
 use crate::runtime::drain::{note_finish_phase, FinishPhase};
 use std::time::Instant;

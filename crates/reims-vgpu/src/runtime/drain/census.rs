@@ -694,7 +694,7 @@ pub enum ReadbackPhase {
     /// near zero exactly when every readback in the window was leased and
     /// climbs in proportion to the ones that were not.
     Map,
-    /// Write the frame into the guest's pages (`write_bgra8_skipping`).
+    /// Write the frame into the guest's pages (`write_bgra8`).
     ///
     /// Reads zero on a window the GPU rail landed, because that rail's
     /// destination *is* the guest's pages and there is no second pass to time.
@@ -765,7 +765,7 @@ impl ReadbackPhase {
 /// inside the per-draw loop. **The remaining ~197 ms/s is the whole of the drain
 /// residue that is left**, and no span reaches it.
 ///
-/// These five tile the function rather than nominate a part of it, which is the
+/// These tile the function rather than nominate a part of it, which is the
 /// method that worked on the child-FIFO loop after nominating one twice did not.
 /// [`Self::Header`] is deliberately the leftover: it is timed as the function's
 /// total minus the other four, so a cost in a corner nobody listed still lands
@@ -816,10 +816,38 @@ pub enum ExecPhase {
     /// loop. **Contains `draw_us`**, which names itself, so `Finish` minus
     /// `draw_us` is the per-draw setup and result handling around the encode.
     Finish,
+    /// `semantic_submission_segments`: a second pass over every loaded stream,
+    /// before the walk that decodes them, to cut the submission into segments.
+    ///
+    /// Carved out of [`Self::Header`] because it is a whole extra traversal of
+    /// the same bytes [`Self::Walk`] then traverses, and an aggregate that
+    /// merely says "the leftover is large" cannot say whether the cost is a
+    /// traversal or the bookkeeping beside it. Those want opposite repairs.
+    Segments,
+    /// Opening the submission: `consume_resource_table`, `begin_submission`,
+    /// materializing one `SubmissionResourceUse` per resource descriptor, and
+    /// `submissions.begin`.
+    ///
+    /// Scales with the resource table's length rather than with the stream's,
+    /// which is why it is separated from [`Self::Segments`] beside it — one is
+    /// paid per byte of command stream and the other per resource the guest
+    /// named, and a boot cannot tell them apart while they share a field.
+    Open,
+    /// Closing it: `submissions.finish` and `complete_submission`.
+    Close,
     /// Everything else the function does — header and payload validation, the
-    /// resource-table decode, `consume_resource_table`, and any path that
-    /// returns early. Derived rather than measured directly, so the five sum to
-    /// the function's own total by construction.
+    /// resource-table decode, and any path that returns early. Derived rather
+    /// than measured directly, so the phases sum to the function's own total by
+    /// construction.
+    ///
+    /// **A large reading here is a finding about this census, not about the
+    /// device**: it means real cost is sitting in a corner no span names, and
+    /// the response is to tile that corner rather than to reason about what
+    /// might be in it. That has now happened twice — the first time this was
+    /// documented at 6.7 ms/s with the note that "Header being small is the
+    /// reassuring reading", and a later driven Maps boot read it at 176 ms/s,
+    /// second only to the encode. [`Self::Segments`], [`Self::Open`] and
+    /// [`Self::Close`] are what that reading was carved into.
     Header,
 }
 
@@ -827,13 +855,16 @@ impl ExecPhase {
     /// How many phases there are. The census arrays are sized from this, so a
     /// new variant that forgets to bump it fails to build [`Self::ALL`] rather
     /// than overflowing an array at report time.
-    pub(crate) const COUNT: usize = 5;
+    pub(crate) const COUNT: usize = 8;
 
     const ALL: [ExecPhase; Self::COUNT] = [
         ExecPhase::Load,
         ExecPhase::Preflight,
         ExecPhase::Walk,
         ExecPhase::Finish,
+        ExecPhase::Segments,
+        ExecPhase::Open,
+        ExecPhase::Close,
         ExecPhase::Header,
     ];
 
@@ -843,7 +874,10 @@ impl ExecPhase {
             ExecPhase::Preflight => 1,
             ExecPhase::Walk => 2,
             ExecPhase::Finish => 3,
-            ExecPhase::Header => 4,
+            ExecPhase::Segments => 4,
+            ExecPhase::Open => 5,
+            ExecPhase::Close => 6,
+            ExecPhase::Header => 7,
         }
     }
 
@@ -853,6 +887,9 @@ impl ExecPhase {
             ExecPhase::Preflight => "preflight",
             ExecPhase::Walk => "walk",
             ExecPhase::Finish => "finish",
+            ExecPhase::Segments => "segments",
+            ExecPhase::Open => "open",
+            ExecPhase::Close => "close",
             ExecPhase::Header => "header",
         }
     }
@@ -944,6 +981,69 @@ impl PreflightPart {
             PreflightPart::Refs => "refs",
             PreflightPart::Air => "air",
             PreflightPart::Cache => "cache",
+        }
+    }
+}
+
+/// Which part of opening a submission a span was spent in.
+///
+/// [`ExecPhase::Open`] is **147 ms/s of a drain worker at 0.95 duty** on driven
+/// fullscreen Maps — 260 us of CPU to open one submission, and the second
+/// largest cost in this device after the draw encode. Three unlike things
+/// happen in there over the same descriptor slice, and the aggregate cannot say
+/// which one costs.
+///
+/// It has already misdirected one repair. `begin_submission` took four
+/// `BTreeMap` descents per descriptor where two would do, which is real
+/// duplicated work and looked like the answer; collapsing it to two moved
+/// `open_us` by nothing measurable (4.158/4.225 against 4.182 us a draw). So
+/// the map descents are not where the time is, and the next guess would have
+/// been another guess. These three tile it instead.
+///
+/// `descs` is here because the per-packet figure alone cannot be reasoned
+/// about: 260 us is a hundred entries at 2.6 us each or ten thousand at 26 ns,
+/// and those are opposite problems. The count is the denominator every other
+/// field in this line needs.
+///
+/// The two passes are **not** redundant and must not be merged. Every validity
+/// record has to be applied before any expected content is snapshotted, because
+/// a guest-write declaration creates the version the following commands expect
+/// — one fused loop would snapshot descriptor `i` before descriptor `j`'s
+/// declaration had landed.
+#[derive(Clone, Copy)]
+pub enum OpenPart {
+    /// `consume_resource_table`: the guest's own statement of who owns each
+    /// resource's authoritative bytes, applied one descriptor at a time.
+    Table,
+    /// `begin_submission`: resolving each descriptor and entering the resource
+    /// it names into this submission.
+    Begin,
+    /// Materializing one `SubmissionResourceUse` per descriptor and handing the
+    /// slice to `submissions.begin`.
+    Use,
+}
+
+impl OpenPart {
+    /// How many parts there are. The census arrays are sized from this, so a new
+    /// variant that forgets to bump it fails to build [`Self::ALL`] rather than
+    /// overflowing an array at report time.
+    pub(crate) const COUNT: usize = 3;
+
+    const ALL: [OpenPart; Self::COUNT] = [OpenPart::Table, OpenPart::Begin, OpenPart::Use];
+
+    const fn index(self) -> usize {
+        match self {
+            OpenPart::Table => 0,
+            OpenPart::Begin => 1,
+            OpenPart::Use => 2,
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            OpenPart::Table => "table",
+            OpenPart::Begin => "begin",
+            OpenPart::Use => "use",
         }
     }
 }
@@ -1304,7 +1404,7 @@ impl WindowPublishCensus {
 /// help", removed a staging hop on that basis and measured no change.
 ///
 /// The gap is a factor of four, which is the shape of doing the work four times,
-/// not of doing it once badly. `write_bgra8_skipping` makes up to three
+/// not of doing it once badly. `write_bgra8` makes up to three
 /// whole-frame passes and the name covers all of them, so none of them can be
 /// ruled in or out:
 ///
@@ -1722,6 +1822,9 @@ pub(crate) struct DrainDutyCensus {
     /// [`PreflightPart::index`]. Sums to `preflight_us` on the `exec_phase`
     /// line. `pre_pipes` is the distinct pipeline refs the scan resolved, which
     /// is the denominator every per-pipeline figure needs.
+    open_ns: [std::sync::atomic::AtomicU64; OpenPart::COUNT],
+    open_count: [std::sync::atomic::AtomicU64; OpenPart::COUNT],
+    open_descs: std::sync::atomic::AtomicU64,
     pre_ns: [std::sync::atomic::AtomicU64; PreflightPart::COUNT],
     pre_count: [std::sync::atomic::AtomicU64; PreflightPart::COUNT],
     pre_pipes: std::sync::atomic::AtomicU64,
@@ -2024,6 +2127,38 @@ impl DrainDutyCensus {
     }
 
     /// One span inside the translation preflight, in nanoseconds.
+    /// One span inside opening a submission, in nanoseconds, plus how many
+    /// resource descriptors that submission carried.
+    pub(crate) fn note_open(&self, part: OpenPart, ns: u64, descs: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let i = part.index();
+        self.open_ns[i].fetch_add(ns, Relaxed);
+        self.open_count[i].fetch_add(1, Relaxed);
+        if matches!(part, OpenPart::Table) {
+            self.open_descs.fetch_add(descs, Relaxed);
+        }
+    }
+
+    /// The inside of [`ExecPhase::Open`] over the window just reported, or
+    /// `None` when no submission opened in it. The `_us` fields sum to
+    /// `exec_phase`'s `open_us`, so the identity is checkable on the line.
+    pub(crate) fn take_open_parts(&self) -> Option<String> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let win_ms = self.last_win_ms.load(Relaxed);
+        let mut body = String::new();
+        let mut any = false;
+        for part in OpenPart::ALL {
+            let i = part.index();
+            let us = self.open_ns[i].swap(0, Relaxed) / 1000;
+            let n = self.open_count[i].swap(0, Relaxed);
+            any |= n != 0;
+            let label = part.label();
+            body.push_str(&format!(" {label}_us={us} {label}_n={n}"));
+        }
+        let descs = self.open_descs.swap(0, Relaxed);
+        any.then(|| format!("open_split win_ms={win_ms} descs={descs}{body}"))
+    }
+
     pub(crate) fn note_preflight(&self, part: PreflightPart, ns: u64) {
         use std::sync::atomic::Ordering::Relaxed;
         let i = part.index();
@@ -2071,7 +2206,7 @@ impl DrainDutyCensus {
     /// The inside of `CHILD_OP_EXEC_INDIRECT2` over the window [`Self::note`]
     /// just reported, or `None` when no exec packet ran in it.
     ///
-    /// Read against `drain_ops`: these five sum to its `op0x37_us`. `finish_us`
+    /// Read against `drain_ops`: these sum to its `op0x37_us`. `finish_us`
     /// contains `drain_duty`'s `draw_us`, so `finish_us - draw_us` is the
     /// per-draw setup and result handling that sits around the encode and is
     /// named by nothing else.
@@ -2762,6 +2897,14 @@ pub fn note_finish_phase(phase: FinishPhase, ns: u64, entries: u64) {
     DRAIN_DUTY.note_finish(phase, ns, entries);
 }
 
+/// Attribute one span inside opening a submission, in nanoseconds.
+///
+/// `descs` is the submission's resource-descriptor count and is banked once,
+/// from [`OpenPart::Table`], so the three parts do not triple it.
+pub fn note_open_part(part: OpenPart, ns: u64, descs: u64) {
+    DRAIN_DUTY.note_open(part, ns, descs);
+}
+
 /// Attribute one span inside the translation preflight, in nanoseconds.
 pub fn note_preflight_part(part: PreflightPart, ns: u64) {
     DRAIN_DUTY.note_preflight(part, ns);
@@ -2783,7 +2926,11 @@ pub fn note_drain_setup(ns: u64) {
 }
 
 /// Accumulate one completed drain tranche; emits at most once per second.
-pub fn note_drain_tranche(drain_us: u64, publish_us: u64) {
+pub fn note_drain_tranche(
+    executor: &dyn crate::runtime::executor::Executor,
+    drain_us: u64,
+    publish_us: u64,
+) {
     if let Some(line) = DRAIN_DUTY.note(drain_us, publish_us, crate::observe::elapsed_ms() as u64) {
         crate::observe::off(line);
         // Immediately after `drain_duty`, so the two read as one record: the
@@ -2803,6 +2950,78 @@ pub fn note_drain_tranche(drain_us: u64, publish_us: u64) {
             crate::observe::off(exec);
         }
         // Under `exec_phase`, dividing its `preflight_us`.
+        if let Some(open) = DRAIN_DUTY.take_open_parts() {
+            crate::observe::off(open);
+        }
+        // The alias walk's own totals, owned by the semantic core because the
+        // walk is core's. `iters_per_walk` is the reading that matters: how many
+        // storage nodes one guest write examines to find the ranges overlapping
+        // it. A number near the device's whole storage population says the
+        // overlap search is a linear scan being paid per write.
+        {
+            let (walks, visited, scan_iters) = reims_vgpu_core::resource::alias_walk_census::take();
+            if walks != 0 {
+                crate::observe::off(format!(
+                    "alias_walk walks={walks} visited={visited} scan_iters={scan_iters} \
+                     visited_per_walk={:.2} iters_per_walk={:.1}",
+                    visited as f64 / walks as f64,
+                    scan_iters as f64 / walks as f64,
+                ));
+            }
+        }
+        // What the guest's own stream looks like: decoded render records
+        // against the draws among them. The stream is a delta and the draw path
+        // resolves the whole accumulated state per draw, so this ratio is the
+        // size of what a resolve-on-write design would stop redoing.
+        {
+            let (records, draws) = crate::runtime::exec::stream_shape_census::take();
+            if draws != 0 {
+                crate::observe::off(format!(
+                    "stream_shape records={records} draws={draws} records_per_draw={:.2}",
+                    records as f64 / draws as f64,
+                ));
+            }
+        }
+        // The per-draw visibility merge's own totals, owned by the Vulkan crate
+        // because the ledger is its. The reading that matters is
+        // `skipped_per_ask` against `walked_per_ask`: the merge is linear in
+        // pages *plus* the ledger runs its cursor has to reach past, and every
+        // set restarts that cursor, so the second term grows with what the
+        // guest has outstanding rather than with what this draw reads. It is a
+        // distance and not a cost — the seek bisects it — but it is the number
+        // that says how much reach the seek needs, and a merge that went back
+        // to stepping would pay all of it.
+        {
+            let (
+                asks,
+                sets,
+                given,
+                walked,
+                runs,
+                span_misses,
+                runs_skipped,
+                rebuilds,
+                rebuild_pages,
+                rebuild_ns,
+            ) = reims_vgpu_vulkan::engine::vis_walk_census::take();
+            if asks != 0 && sets != 0 {
+                crate::observe::off(format!(
+                    "vis_walk asks={asks} sets={sets} given={given} walked={walked} \
+                     runs_skipped={runs_skipped} runs_per_ask={:.1} sets_per_ask={:.2} \
+                     given_per_set={:.1} walked_per_ask={:.1} skipped_per_ask={:.1} \
+                     span_miss_frac={:.3} rebuilds={rebuilds} rebuild_pages={rebuild_pages} \
+                     rebuild_us={} rebuild_us_per_ask={:.3}",
+                    runs as f64 / asks as f64,
+                    sets as f64 / asks as f64,
+                    given as f64 / sets as f64,
+                    walked as f64 / asks as f64,
+                    runs_skipped as f64 / asks as f64,
+                    span_misses as f64 / sets as f64,
+                    rebuild_ns / 1000,
+                    rebuild_ns as f64 / 1000.0 / asks as f64,
+                ));
+            }
+        }
         if let Some(pre) = DRAIN_DUTY.take_preflight_parts() {
             crate::observe::off(pre);
         }
@@ -2832,15 +3051,34 @@ pub fn note_drain_tranche(drain_us: u64, publish_us: u64) {
         }
         // Under `window_publish`, which says how many frames were offered but
         // not why fewer reached the screen.
-        emit_engine_lock(DRAIN_DUTY.last_window_ms());
+        emit_engine_lock(executor, DRAIN_DUTY.last_window_ms());
         if let Some(routes) = take_store_routes() {
             crate::observe::off(routes);
         }
+        // The width any packet-level fan-out could use. Joined by `t=` so it
+        // is read against the same window's draws and duty.
+        for tranche in take_drain_tranche(crate::observe::elapsed_ms() as u64) {
+            crate::observe::off(tranche);
+        }
+        // The one genuine per-draw write on the resolve side, and therefore
+        // where a packet-parallel encoder's threads would meet.
+        if let Some(ledger) = reims_vgpu_core::content_tracking::host_write_census::take(
+            crate::observe::elapsed_ms() as u64,
+        ) {
+            crate::observe::off(ledger);
+        }
+        // What canonical page-set construction costs on the draw path. Joined
+        // by `t=` like the rest, so `builds` divides by this window's draws.
+        if let Some(sets) =
+            reims_vgpu_memory::page_set_census::take(crate::observe::elapsed_ms() as u64)
+        {
+            crate::observe::off(sets);
+        }
         // Beside `store_routes` deliberately: the two are read against each
-        // other. `type4_backing_fail` lines equal `type4_backing_recovered +
-        // type4_backing_superseded` from that line plus this one's `n`, and a
+        // other. `surface_backing_fail` lines equal `surface_backing_recovered +
+        // surface_backing_superseded` from that line plus this one's `n`, and a
         // refusal that never recovered is only visible as the residue.
-        if let Some(outstanding) = crate::runtime::objects::type4_backing_outstanding_census() {
+        if let Some(outstanding) = crate::runtime::objects::surface_backing_outstanding_census() {
             crate::observe::off(outstanding);
         }
         // The same reason and the same place: `store_routes` counts the watches
@@ -2859,27 +3097,24 @@ pub fn note_drain_tranche(drain_us: u64, publish_us: u64) {
         // Beside the engine counters it has to be read against: the eviction
         // routes say which cap fired and this says how much the workload wanted,
         // and neither is interpretable without the other.
-        #[cfg(feature = "backend-vulkan")]
-        if let Some(wanted) = crate::backend::vulkan::engine::sampled_working_set_census() {
+        if let Some(wanted) = executor.sampled_working_set_census() {
             crate::observe::off(wanted);
         }
         // The same question one rail over, and the one with no cache behind it
         // yet: `buffer_guest_gathers` says how many gathers ran and this says
         // how few distinct windows they were.
-        #[cfg(feature = "backend-vulkan")]
-        if let Some(wanted) = crate::backend::vulkan::engine::buffer_gather_working_set_census() {
+        if let Some(wanted) = executor.buffer_gather_working_set_census() {
             crate::observe::off(wanted);
         }
-        emit_engine_delta();
+        emit_engine_delta(executor);
         // After `emit_engine_delta`, which emits `draw_phase`: the two divide
         // against each other and reading them in the other order invites
         // treating the engine's phases as the whole draw, which is the
         // misreading this line exists to correct. Not gated on the backend —
-        // the timer is runtime-side and the Metal arm can adopt it without a
         // second census.
         emit_chain_phase();
-        emit_object_cache_levels();
-        emit_guest_import_levels();
+        emit_object_cache_levels(executor);
+        emit_guest_import_levels(executor);
     }
 }
 
@@ -2946,9 +3181,9 @@ pub fn note_drain_tranche(drain_us: u64, publish_us: u64) {
 ///
 /// `mib` is the same level and is not a rate: it is guest RAM the device can
 /// currently reach, against what the machine reported.
-#[cfg(feature = "backend-vulkan")]
-fn emit_guest_import_levels() {
-    let (bytes, count, aliases) = crate::backend::vulkan::engine::guest_import_census();
+fn emit_guest_import_levels(executor: &dyn crate::runtime::executor::Executor) {
+    let (bytes, count, aliases, guest_images, live_guest_images, recycled_images) =
+        executor.guest_import_census();
     let (spans, span_bytes) = crate::runtime::guest_ram_map::span_census();
     // An engine that never imported emits nothing, so a host on a negative
     // `host_pointer` rung — or a boot before the first guest window — costs no
@@ -2958,15 +3193,13 @@ fn emit_guest_import_levels() {
     }
     crate::observe::off(format!(
         "guest_import_levels (levels, not per-interval) ramblocks={count}/{spans} aliases={aliases} \
+         guest_images={guest_images}/{live_guest_images}_live recycled_images={recycled_images} \
          imported_mib={} ramblock_reported_mib={} (RAMBlock spans import lazily; \
          packed aliases add to imported_mib without changing the reported RAM size)",
         bytes / (1024 * 1024),
         span_bytes / (1024 * 1024),
     ));
 }
-
-#[cfg(not(feature = "backend-vulkan"))]
-fn emit_guest_import_levels() {}
 
 /// Live entry counts of the caches that hold one entry per distinct guest
 /// object, as **levels** rather than per-window deltas.
@@ -2979,13 +3212,12 @@ fn emit_guest_import_levels() {}
 /// some key is carrying per-frame state, and the argument is wrong for that
 /// cache. A settling level is the argument holding.
 ///
-/// `m2v` counts translated shaders (`runtime::m2v_cache`); the rest are the
+/// `m2v` counts translated shaders (`reims_vgpu_vulkan::m2v_cache`); the rest are the
 /// Vulkan engine's immutable-object caches.
-#[cfg(feature = "backend-vulkan")]
-fn emit_object_cache_levels() {
+fn emit_object_cache_levels(executor: &dyn crate::runtime::executor::Executor) {
     let [shaders, layouts, passes, pipelines, samplers, compute_pipelines] =
-        crate::backend::vulkan::engine::object_cache_levels();
-    let (_, _, m2v) = crate::runtime::m2v_cache::stats();
+        executor.object_cache_levels();
+    let m2v = executor.shader_translation_cache_level();
     crate::observe::off(format!(
         "object_cache_levels (levels, not per-interval) m2v={m2v} shaders={shaders} \
          layouts={layouts} passes={passes} pipelines={pipelines} samplers={samplers} \
@@ -2993,11 +3225,10 @@ fn emit_object_cache_levels() {
     ));
 }
 
-#[cfg(feature = "backend-vulkan")]
-fn emit_engine_delta() {
-    use crate::backend::vulkan::engine::CounterSnapshot;
+fn emit_engine_delta(executor: &dyn crate::runtime::executor::Executor) {
+    use crate::runtime::executor::CounterSnapshot;
     static PREV: std::sync::Mutex<Option<CounterSnapshot>> = std::sync::Mutex::new(None);
-    let now = crate::backend::vulkan::engine::counter_snapshot();
+    let now = executor.counter_snapshot();
     let Ok(mut prev) = PREV.lock() else {
         return;
     };
@@ -3012,7 +3243,7 @@ fn emit_engine_delta() {
     }
     crate::observe::off(line);
     emit_registry_pressure(&now);
-    emit_draw_phase();
+    emit_draw_phase(executor);
 }
 
 /// How far the resident registries reached, and what the populations that
@@ -3066,8 +3297,7 @@ fn emit_engine_delta() {
 /// slot count to evict for. `vram_reclaim_retry` and
 /// `vram_compute_storage_reclaim_retry` on the fail channel are what report a
 /// reclaim now, and they fire only when an allocation was actually refused.
-#[cfg(feature = "backend-vulkan")]
-fn emit_registry_pressure(now: &crate::backend::vulkan::engine::CounterSnapshot) {
+fn emit_registry_pressure(now: &crate::runtime::executor::CounterSnapshot) {
     crate::observe::off(format!(
         "registry_pressure (levels, not per-interval) peak={} peak_mib={} \
          resident_samples={} resample_peak_ms={}/{} \
@@ -3076,7 +3306,7 @@ fn emit_registry_pressure(now: &crate::backend::vulkan::engine::CounterSnapshot)
         now.registry_non_pinned_peak_bytes >> 20,
         now.sampled_gpu_binds,
         now.resident_resample_peak_ms,
-        crate::backend::vulkan::engine::IDLE_MAINTENANCE_START_MS,
+        crate::runtime::executor::IDLE_MAINTENANCE_START_MS,
         now.slab_carved_bytes >> 20,
         now.slab_held_bytes >> 20,
         now.registry_sole_copy_peak,
@@ -3110,7 +3340,7 @@ fn emit_bind_phase() {
     };
     crate::observe::off(format!(
         "bind_phase binds={} vertex_us={} fragment_us={} attrs_us={} \
-         acc_unused={} acc_deref={} acc_undecl={} acc_n={} acc_unused_staged={} neutral={}",
+         acc_unused={} acc_deref={} acc_undecl={} acc_n={} acc_unused_staged={}",
         w.binds,
         w.vertex_us,
         w.fragment_us,
@@ -3122,10 +3352,7 @@ fn emit_bind_phase() {
         // so this is their sum and not a separately-counted total: a reader who
         // divides gets an identity that holds or a bug that shows.
         w.access_total(),
-        // These two partition `acc_unused` in turn, so the second identity on
-        // the line is `acc_unused_staged + neutral == acc_unused`.
         w.access_unused_staged,
-        w.neutral_served,
     ));
 }
 
@@ -3178,8 +3405,16 @@ fn emit_sampled_phase() {
     };
     crate::observe::off(format!(
         "sampled_phase sampled={} lookup_us={} alias_us={} resolve_us={} samplers_us={} \
-         reflect_us={}",
-        w.sampled, w.lookup_us, w.alias_us, w.resolve_us, w.samplers_us, w.reflect_us,
+         reflect_us={} linear_packed_us={} linear_admission_us={} gather_witness_us={}",
+        w.sampled,
+        w.lookup_us,
+        w.alias_us,
+        w.resolve_us,
+        w.samplers_us,
+        w.reflect_us,
+        w.linear_packed_us,
+        w.linear_admission_us,
+        w.gather_witness_us,
     ));
 }
 
@@ -3192,9 +3427,8 @@ fn emit_sampled_phase() {
 /// staging half of `setup_us` scale with bytes, `wait_us` does not.
 ///
 /// Silent when no draw ran, so an idle desktop costs nothing.
-#[cfg(feature = "backend-vulkan")]
-fn emit_draw_phase() {
-    let Some(w) = crate::backend::vulkan::engine::draw_phase_window() else {
+fn emit_draw_phase(executor: &dyn crate::runtime::executor::Executor) {
+    let Some(w) = executor.draw_phase_window() else {
         return;
     };
     crate::observe::off(format!(
@@ -3204,7 +3438,11 @@ fn emit_draw_phase() {
          sg_seed_us={} stage_pass_us={} \
          acquire_us={} acquire_sampled_us={} sampled_upload_us={} acquire_readback_us={} \
          descriptors_us={} \
-         record_us={} rec_begin_us={} rec_barrier_us={} rec_pass_us={} rec_state_us={} \
+         record_us={} rec_begin_us={} rec_barrier_us={} \
+         rb_imported_test_us={} rb_read_set_us={} rb_visibility_us={} rb_pass_break_us={} \
+         rb_snapshot_us={} rb_seed_us={} rb_materialize_us={} \
+         rb_resident_us={} rb_upload_us={} rb_attachment_us={} \
+         rec_pass_us={} rec_state_us={} \
          rec_draw_us={} submit_us={} post_target_us={} post_store_us={} post_sampled_us={} \
          post_park_us={} wait_us={} readback_us={} max_us={} stalls={}",
         w.draws,
@@ -3231,6 +3469,16 @@ fn emit_draw_phase() {
         w.record_us,
         w.rec_begin_us,
         w.rec_barrier_us,
+        w.rb_imported_test_us,
+        w.rb_read_set_us,
+        w.rb_visibility_us,
+        w.rb_pass_break_us,
+        w.rb_snapshot_us,
+        w.rb_seed_us,
+        w.rb_materialize_us,
+        w.rb_resident_us,
+        w.rb_upload_us,
+        w.rb_attachment_us,
         w.rec_pass_us,
         w.rec_state_us,
         w.rec_draw_us,
@@ -3244,9 +3492,9 @@ fn emit_draw_phase() {
         w.max_us,
         w.stalls,
     ));
-    emit_stage_phase();
-    emit_gather_phase();
-    emit_gpu_span();
+    emit_stage_phase(executor);
+    emit_gather_phase(executor);
+    emit_gpu_span(executor);
 }
 
 /// Beside `draw_phase`, because it is the one column in it the GPU wrote.
@@ -3271,18 +3519,38 @@ fn emit_draw_phase() {
 /// **A per-second `busy_us` is not comparable across boots that delivered
 /// different amounts of work.** The guest sets the draw rate on this rail, so a
 /// change that slows the guest lowers `busy_us` by lowering the workload. Divide
-/// by `draw_phase draws` or by the kind's own `*_n` before comparing two arms —
+/// by `retired_draws` or by the kind's own `*_n` before comparing two arms —
 /// the writeback's own positive control halved the frame rate and lowered
 /// `busy_us` by 48 % while per-submission GPU cost moved 1.5 %.
-#[cfg(feature = "backend-vulkan")]
-fn emit_gpu_span() {
-    let Some(w) = crate::backend::vulkan::engine::gpu_span::take_window() else {
+/// # `pass_us` splits the GPU second where the kinds cannot
+///
+/// The per-[`Kind`] columns tile `busy_us`, but they stop at the submission, and
+/// a draw submission on this rail carries tens of draws across several render
+/// pass instances. So the tiling can say the GPU second is all `draw_us` — it
+/// reads exactly that on a driven Maps boot — while saying nothing about
+/// whether that second goes on drawing or on beginning and ending passes.
+///
+/// `pass_us` is the time stamped *inside* pass instances, so it is a part of
+/// `busy_us` and not a peer of it. Read the remainder:
+///
+/// ```text
+/// pass_us              inside pass instances: the draws themselves
+/// busy_us - pass_us    outside them: pass boundaries and non-pass work
+/// ```
+///
+/// That remainder is the number that says whether fewer pass boundaries is a
+/// lever worth building. `pass_n` is its denominator, and it counts instances
+/// whose slot retired with both stamps readable — not `passbegin_*`, which
+/// counts every instance begun.
+fn emit_gpu_span(executor: &dyn crate::runtime::executor::Executor) {
+    let Some(w) = executor.gpu_span_window() else {
         return;
     };
     crate::observe::off(format!(
         "gpu_span busy_us={} busy_max_us={} read={} armed={} sealed={} unread={} \
-         unattributed={} draw_us={} draw_n={} store_us={} store_n={} \
-         readback_us={} readback_n={} compute_us={} compute_n={} stamp_us={} stamp_n={}",
+         unattributed={} draw_us={} draw_n={} retired_draws={} store_us={} store_n={} \
+         readback_us={} readback_n={} compute_us={} compute_n={} stamp_us={} stamp_n={} \
+         pass_us={} pass_n={}",
         w.busy_us,
         w.busy_max_us,
         w.read,
@@ -3292,6 +3560,7 @@ fn emit_gpu_span() {
         w.unattributed(),
         w.kind_us[0],
         w.kind_n[0],
+        w.retired_draws,
         w.kind_us[1],
         w.kind_n[1],
         w.kind_us[2],
@@ -3300,6 +3569,8 @@ fn emit_gpu_span() {
         w.kind_n[3],
         w.kind_us[4],
         w.kind_n[4],
+        w.pass_us,
+        w.pass_n,
     ));
 }
 
@@ -3307,11 +3578,10 @@ fn emit_gpu_span() {
 ///
 /// Emitted only when a gather dispatched, so the line's presence is itself the
 /// statement that this boot ran the dispatch arm — see
-/// [`crate::backend::vulkan::engine::gather_phase`] for what each part is and
+/// [`reims_vgpu_vulkan::engine::gather_phase`] for what each part is and
 /// what would remove it.
-#[cfg(feature = "backend-vulkan")]
-fn emit_gather_phase() {
-    let Some(w) = crate::backend::vulkan::engine::gather_phase::take_window() else {
+fn emit_gather_phase(executor: &dyn crate::runtime::executor::Executor) {
+    let Some(w) = executor.gather_phase_window() else {
         return;
     };
     crate::observe::off(format!(
@@ -3323,9 +3593,8 @@ fn emit_gather_phase() {
 
 /// Under `draw_phase`, dividing its largest column — `stage_us` is 83 % of that
 /// phase's second on a driven drag, and the five parts want opposite fixes.
-#[cfg(feature = "backend-vulkan")]
-fn emit_stage_phase() {
-    let Some(w) = crate::backend::vulkan::engine::stage_phase::take_window() else {
+fn emit_stage_phase(executor: &dyn crate::runtime::executor::Executor) {
+    let Some(w) = executor.stage_phase_window() else {
         return;
     };
     crate::observe::off(format!(
@@ -3353,40 +3622,6 @@ fn emit_stage_phase() {
     ));
 }
 
-#[cfg(not(feature = "backend-vulkan"))]
-fn emit_engine_delta() {}
-
-/// The Metal arm's counterpart. Same question, same cadence, different tables:
-/// this arm builds `MTLFunction` / `MTLRenderPipelineState` /
-/// `MTLComputePipelineState` / `MTLSamplerState` / `MTLDepthStencilState` and
-/// compute reflections, and holds them in `backend::metal::cache`.
-///
-/// No `m2v` field: AIR reaches Metal directly on this arm, so
-/// `runtime::m2v_cache` is never populated and a zero there would read as an
-/// empty cache rather than an absent rail.
-#[cfg(all(
-    not(feature = "backend-vulkan"),
-    feature = "backend-metal",
-    target_os = "macos"
-))]
-fn emit_object_cache_levels() {
-    let [functions, render_pso, compute_pso, samplers, depth_stencil, reflections] =
-        crate::backend::metal::cache_levels();
-    crate::observe::off(format!(
-        "object_cache_levels (levels, not per-interval) functions={functions} \
-         render_pso={render_pso} compute_pso={compute_pso} samplers={samplers} \
-         depth_stencil={depth_stencil} reflections={reflections}"
-    ));
-}
-
-/// No compiled-object caches on this build: either no backend, or the Metal
-/// feature without the Apple target that carries `backend::metal::cache`.
-#[cfg(not(any(
-    feature = "backend-vulkan",
-    all(feature = "backend-metal", target_os = "macos")
-)))]
-fn emit_object_cache_levels() {}
-
 /// The engine mutex's wait and hold time over the same window, split by which
 /// thread class asked for it.
 ///
@@ -3395,15 +3630,11 @@ fn emit_object_cache_levels() {}
 /// `host_window_cadence presents` is what reached the screen, and when the two
 /// disagree the first candidate is that the window thread could not have the
 /// engine while the worker held it.
-#[cfg(feature = "backend-vulkan")]
-fn emit_engine_lock(win_ms: u64) {
-    if let Some(line) = crate::backend::vulkan::engine::take_engine_lock_census(win_ms) {
+fn emit_engine_lock(executor: &dyn crate::runtime::executor::Executor, win_ms: u64) {
+    if let Some(line) = executor.take_engine_lock_census(win_ms) {
         crate::observe::off(line);
     }
 }
-
-#[cfg(not(feature = "backend-vulkan"))]
-fn emit_engine_lock(_win_ms: u64) {}
 
 /// Count a drain wake-up that returned before taking the device lock.
 pub fn note_drain_skipped() {
@@ -3487,7 +3718,7 @@ pub fn note_readback_gpu_us(barrier_us: u64, copy_us: u64) {
 /// The routes are the attribution for `engine_delta`'s readback bytes: only
 /// `cpu_portability` reads a full frame back and CPU-copies it into the guest's
 /// pages, and only it is forced to — `gva_store_defer_eligible` refuses any
-/// target with a nonzero `mapping_id`, so a type-11 composite Store has no
+/// target with a nonzero `mapping_id`, so an IOSurface texture composite Store has no
 /// deferred rail to take. Whether that is 2 Stores a second or 20 decides
 /// whether building one is worth it, and the route's own first-appearance line
 /// is deduplicated per process and cannot say.
@@ -3521,14 +3752,14 @@ thread_local! {
 /// ```text
 /// AUC 0.75  surface_flush             permutation p = 0.021 raw
 /// AUC 0.73  load_seed_ok                            p = 0.914 Bonferroni
-/// AUC 0.72  type11_seed_uploaded      (43 columns tested)
-/// AUC 0.72  type11_seed_guest_wrote
-/// AUC 0.71  t11_gw_ref_moved
+/// AUC 0.72  iosurface_texture_seed_uploaded      (43 columns tested)
+/// AUC 0.72  iosurface_texture_seed_guest_wrote
+/// AUC 0.71  iosurface_gw_ref_moved
 /// ```
 ///
 /// Corrected for having looked at 43 columns, nothing is distinguishable from
 /// noise. The leaders are also largely one quantity wearing different names — a
-/// type-11 seed upload is a `load_seed_ok_mapping` — so they are one weak
+/// IOSurface texture seed upload is a `load_seed_ok_mapping` — so they are one weak
 /// signal, not five.
 ///
 /// The reason is structural rather than a gap to be filled by adding counters.
@@ -3670,7 +3901,7 @@ fn take_store_routes() -> Option<String> {
 
 #[cfg(test)]
 mod drain_gap_tests {
-    use super::{DRAIN_DUTY_REPORT_MS, DrainDutyCensus, PostSweep};
+    use super::{DrainDutyCensus, PostSweep, DRAIN_DUTY_REPORT_MS};
 
     /// The four gap buckets plus `busy_us` account for the whole window.
     ///
@@ -3794,7 +4025,11 @@ mod irq_wait_tests {
                 .parse()
                 .expect("a microsecond count")
         };
-        assert_eq!(field("irq_waits"), 2, "one per emptying, not one per action");
+        assert_eq!(
+            field("irq_waits"),
+            2,
+            "one per emptying, not one per action"
+        );
         assert_eq!(field("irq_wait_us"), 300 + 50);
         assert_eq!(
             field("irq_wait_max_us"),
@@ -3906,4 +4141,139 @@ mod lookup_age_tests {
             );
         }
     }
+}
+
+/// How many packets one drain call consumes before it stops.
+///
+/// # The question this answers
+///
+/// The x86/Vulkan rail is drain-CPU bound and the route to 60 fps is encoding
+/// command buffers concurrently — `reims_vgpu_core::render`'s `thread_seam`
+/// doc establishes that the seam is the *packet* and not the draw, because a
+/// resolver and a recorder cut apart at draw granularity must synchronise 6.4
+/// times a draw at 7.6 µs a time.
+///
+/// A packet seam only pays if packets are available together. The guest may
+/// publish more packets while this device is draining, so the child population
+/// is a throughput upper bound rather than an initial-tail snapshot. The
+/// separate `exec_run` population removes non-EXEC boundaries; a scheduler
+/// still has to measure readiness and resource dependencies before treating
+/// that run length as executable width.
+///
+/// This is a count and a distribution, not a timing: it is read to size a
+/// design, and it must survive both host contention and the perturbation of
+/// measuring it.
+///
+/// The buckets are powers of two because the reading wanted is an order of
+/// magnitude — "usually one", "usually a handful", "usually dozens" — and a
+/// mean would hide a bimodal ring behind a comfortable-looking average.
+#[derive(Default)]
+struct TrancheCensus {
+    wakes: std::sync::atomic::AtomicU64,
+    packets: std::sync::atomic::AtomicU64,
+    max: std::sync::atomic::AtomicU64,
+    /// `[1, 2-3, 4-7, 8-15, 16-31, 32-63, 64+]`.
+    buckets: [std::sync::atomic::AtomicU64; 7],
+}
+
+/// Which ring a wake drained. They are two populations and blending them
+/// would hide the one that matters: the render command stream arrives on the
+/// child FIFOs, and the root ring carries control traffic whose width says
+/// nothing about encoder fan-out.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TrancheRing {
+    Root = 0,
+    Child = 1,
+}
+
+static TRANCHE: [TrancheCensus; 2] = [
+    TrancheCensus {
+        wakes: std::sync::atomic::AtomicU64::new(0),
+        packets: std::sync::atomic::AtomicU64::new(0),
+        max: std::sync::atomic::AtomicU64::new(0),
+        buckets: [const { std::sync::atomic::AtomicU64::new(0) }; 7],
+    },
+    TrancheCensus {
+        wakes: std::sync::atomic::AtomicU64::new(0),
+        packets: std::sync::atomic::AtomicU64::new(0),
+        max: std::sync::atomic::AtomicU64::new(0),
+        buckets: [const { std::sync::atomic::AtomicU64::new(0) }; 7],
+    },
+];
+
+/// Consecutive successfully-consumed `EXEC_INDIRECT2` packets. Unlike the
+/// child tranche population, this excludes resource/control packets and splits
+/// at each non-EXEC opcode. It is the width a whole-submission encoder could
+/// actually consume without crossing another guest command class.
+static EXEC_RUN: TrancheCensus = TrancheCensus {
+    wakes: std::sync::atomic::AtomicU64::new(0),
+    packets: std::sync::atomic::AtomicU64::new(0),
+    max: std::sync::atomic::AtomicU64::new(0),
+    buckets: [const { std::sync::atomic::AtomicU64::new(0) }; 7],
+};
+
+fn note_width(c: &TrancheCensus, packets: u64) {
+    use std::sync::atomic::Ordering;
+    if packets == 0 {
+        return;
+    }
+    c.wakes.fetch_add(1, Ordering::Relaxed);
+    c.packets.fetch_add(packets, Ordering::Relaxed);
+    c.max.fetch_max(packets, Ordering::Relaxed);
+    let bucket = match packets {
+        1 => 0,
+        2..=3 => 1,
+        4..=7 => 2,
+        8..=15 => 3,
+        16..=31 => 4,
+        32..=63 => 5,
+        _ => 6,
+    };
+    c.buckets[bucket].fetch_add(1, Ordering::Relaxed);
+}
+
+/// Record that one drain wake consumed `packets` packets before the ring ran
+/// dry. A wake that found nothing is not a wake for this purpose — it says
+/// nothing about available width — so zero is dropped.
+pub fn note_tranche_width(ring: TrancheRing, packets: u64) {
+    note_width(&TRANCHE[ring as usize], packets);
+}
+
+pub fn note_exec_run_width(packets: u64) {
+    note_width(&EXEC_RUN, packets);
+}
+
+/// [`take_drain_tranche`] for the census's own test.
+#[cfg(test)]
+pub(super) fn take_drain_tranche_for_test(t_ms: u64) -> Vec<String> {
+    take_drain_tranche(t_ms)
+}
+
+/// One window of [`note_tranche_width`], taken and reset, one line per ring.
+fn take_drain_tranche(t_ms: u64) -> Vec<String> {
+    use std::sync::atomic::Ordering;
+    let mut lines = Vec::new();
+    for (ring, c) in [
+        ("root", &TRANCHE[0]),
+        ("child", &TRANCHE[1]),
+        ("exec_run", &EXEC_RUN),
+    ] {
+        let wakes = c.wakes.swap(0, Ordering::Relaxed);
+        if wakes == 0 {
+            continue;
+        }
+        let packets = c.packets.swap(0, Ordering::Relaxed);
+        let max = c.max.swap(0, Ordering::Relaxed);
+        let b: Vec<String> = c
+            .buckets
+            .iter()
+            .map(|x| x.swap(0, Ordering::Relaxed).to_string())
+            .collect();
+        let populations = if ring == "exec_run" { "runs" } else { "wakes" };
+        lines.push(format!(
+            "drain_tranche t={t_ms} ring={ring} {populations}={wakes} packets={packets} max={max} b1={} b2={} b4={} b8={} b16={} b32={} b64={}",
+            b[0], b[1], b[2], b[3], b[4], b[5], b[6]
+        ));
+    }
+    lines
 }

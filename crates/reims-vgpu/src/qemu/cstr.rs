@@ -2,8 +2,7 @@
 //!
 //! Not a shim symbol, unlike everything else under [`super`]: it is the rule two
 //! shim-facing writers share. `reims_vgpu_qemu_abi.h` hands both of them a
-//! `(char *, size_t)` pair — the backend-name getter and the Metal error
-//! buffer — and both used to spell the truncation out.
+//! `(char *, size_t)` pair, and both used to spell the truncation out.
 //!
 //! They agreed, which is the hazard rather than the reassurance. The rule is
 //! four lines and one of them is a raw `copy_nonoverlapping`, so a third writer
@@ -12,9 +11,7 @@
 //! toolchain compares one copy of that arithmetic to another, and the header
 //! says only that the buffer is valid for `cap` bytes.
 //!
-//! It lives under `qemu` because the contract is the header's, and
-//! `backend::metal::error` reaches up to it for the same reason it already
-//! imports that module's `REIMS_VGPU_ERR_*` constants: it sits on this boundary.
+//! It lives under `qemu` because the contract is the header's.
 
 use std::os::raw::c_char;
 
@@ -66,9 +63,9 @@ mod tests {
 
     #[test]
     fn a_string_that_fits_is_written_whole_and_terminated() {
-        let (buf, guard) = write_into(8, "metal");
-        assert_eq!(&buf[..5], b"metal");
-        assert_eq!(buf[5], 0);
+        let (buf, guard) = write_into(8, "vulkan");
+        assert_eq!(&buf[..6], b"vulkan");
+        assert_eq!(buf[6], 0);
         assert_eq!(guard, 0xAA, "wrote past the caller's capacity");
     }
 

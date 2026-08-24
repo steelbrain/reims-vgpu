@@ -38,15 +38,15 @@
 //! not independent, and so why deriving one pathway's does not leave the other
 //! one guessed.
 //!
-//! # Relationship to `reims_vgpu::contract::gva_resolve`
+//! # Relationship to paging resolution and the device refusal adapter
 //!
 //! That module walks the same tree and reached the same constants
 //! independently, which is why the agreement is worth something — including on
 //! the subtle part, the two-arm split on a zero PFN.
 //!
-//! What stays there is the part that is not byte interpretation: the translation
-//! cache, task lookup, and the device's typed refusal channel. This module owns
-//! the tree and nothing else.
+//! What stays outside this byte view is the part that is not byte interpretation:
+//! task lookup, allocation-requiring span resolution, and the device's typed
+//! refusal channel. This module owns the tree and nothing else.
 
 use crate::mem::GuestMemory;
 
@@ -330,7 +330,14 @@ pub fn walk<M: GuestMemory>(
     depth: u32,
     gva: u64,
 ) -> Result<Walk, WalkFailure> {
-    walk_recording_nodes(mem, geometry, root_pfn, depth, gva, &mut NodePath::default())
+    walk_recording_nodes(
+        mem,
+        geometry,
+        root_pfn,
+        depth,
+        gva,
+        &mut NodePath::default(),
+    )
 }
 
 /// [`walk`], additionally reporting the interior nodes the descent read.

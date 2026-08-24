@@ -1,14 +1,14 @@
 use crate::model::PAGE_SHIFT_ARM64E;
 
 use super::*;
-use crate::contract::endian::st32;
+use reims_vgpu_core::endian::{st32, st64};
 
 /// A `newSampler` record carrying `state`, at the layout the wire crate's
 /// own fixtures use.
 fn sampler_record(state: u32) -> Vec<u8> {
     use reims_vgpu_wire::ops::sampler::NEW_SAMPLER_TOTAL_LEN;
     let mut b = vec![0u8; NEW_SAMPLER_TOTAL_LEN as usize];
-    st32(&mut b[0..], TYPE7_OBJECT_SAMPLER);
+    st32(&mut b[0..], SERIALIZER_RESOURCE_OBJECT_SAMPLER);
     st32(&mut b[4..], NEW_SAMPLER_TOTAL_LEN);
     st32(&mut b[8..], 7);
     st32(&mut b[12..], state);
@@ -136,7 +136,7 @@ fn a_vertex_entry_tag_with_no_reader_is_reported() {
     assert!(
         clean
             .iter()
-            .filter(|l| l.contains("type7_pipeline_shape"))
+            .filter(|l| l.contains("serializer_resource_pipeline_shape"))
             .all(|l| l.contains("unconsumed=0")),
         "the entries a guest sends are read whole; that is the reading this \
          instrument exists to make, and it must not be an absence: {clean:?}"
@@ -155,7 +155,9 @@ fn a_vertex_entry_tag_with_no_reader_is_reported() {
     let lines = cap2.lines();
     let shape: Vec<&String> = lines
         .iter()
-        .filter(|l| l.contains("type7_pipeline_shape") && l.contains("kind=vertex_layout"))
+        .filter(|l| {
+            l.contains("serializer_resource_pipeline_shape") && l.contains("kind=vertex_layout")
+        })
         .collect();
     assert_eq!(
         shape.len(),
@@ -348,8 +350,15 @@ fn heap_texture_use_offset_ignores_the_ring_bytes_around_it() {
                 record.offset, 0x0123_4ab0,
                 "ring {ring:#04x} byte {byte:#04x}: offset"
             );
-            assert_eq!(record.heap_ref, 6565);
+            assert_eq!(record.heap_ref.get(), 6565);
             assert_eq!(record.descriptor.len(), 32);
+            assert!(matches!(
+                decode_descriptor(ObjectKind::TextureView, &bytes),
+                Ok(Descriptor::HeapTexture(total))
+                    if total.heap.get() == 6565
+                        && total.use_offset == expect
+                        && total.offset == 0x0123_4ab0
+            ));
         }
     }
 }
@@ -411,7 +420,7 @@ fn a_wide_heap_texture_record_decodes_at_its_own_offsets() {
             record.wide,
             "ring {ring:#04x}: record reports its body width"
         );
-        assert_eq!(record.heap_ref, 6565);
+        assert_eq!(record.heap_ref.get(), 6565);
         assert!(record.use_offset);
         assert_eq!(record.offset, 0x0077_7000);
         assert_eq!(record.descriptor.len(), heap_query::WIDE_TEXTURE_BODY_LEN);
@@ -429,6 +438,14 @@ fn a_wide_heap_texture_record_decodes_at_its_own_offsets() {
         // it at the narrow width would silently drop bit 16.
         assert_eq!(desc.usage, 0x0001_0005);
         assert_eq!(desc.swizzle, Some([5, 0, 1, 2]));
+        assert!(matches!(
+            decode_descriptor(ObjectKind::TextureView, &bytes),
+            Ok(Descriptor::HeapTexture(total))
+                if total.heap.get() == 6565
+                    && total.declaration == desc
+                    && total.use_offset
+                    && total.offset == 0x0077_7000
+        ));
     }
 }
 
@@ -493,6 +510,10 @@ fn a_wide_buffer_texture_record_decodes_its_wide_descriptor() {
     assert_eq!(d.desc.width, 0x1111);
     assert_eq!(d.desc.usage, 0x0001_0005);
     assert_eq!(d.desc.swizzle, Some([5, 0, 1, 2]));
+    assert!(matches!(
+        decode_descriptor(ObjectKind::TextureView, &b),
+        Ok(Descriptor::BufferTexture(total)) if total == d
+    ));
 
     // The narrow opcode at this length is not this record. Before the wide
     // form existed this decoder took any length at or above the narrow one,
@@ -519,6 +540,49 @@ fn a_wide_buffer_texture_record_decodes_its_wide_descriptor() {
         decode_buffer_texture_descriptor(&wrong_declared),
         Err(DecodeStatus::ErrShort("res_buffer_texture_declared_len"))
     ));
+}
+
+#[test]
+fn an_iosurface_plane_view_decodes_its_surface_relation_and_nested_view_once() {
+    use reims_vgpu_protocol::{
+        IOSurfacePlaneViewDecodeState, IOSurfacePlaneViewDescriptor, IOSurfacePlaneViewRecordKind,
+    };
+    use reims_vgpu_wire::device_desc::{
+        IOSurfacePlaneViewBuilder, IOSURFACE_PLANE_VIEW_RECORD_TAG_COLOR_VIEW,
+    };
+
+    let bytes =
+        IOSurfacePlaneViewBuilder::new(0x1234, 7, 99, IOSURFACE_PLANE_VIEW_RECORD_TAG_COLOR_VIEW)
+            .geometry(0x50, 640, 480, 1)
+            .unknown(0xa5)
+            .plane_index(2);
+    let Descriptor::IOSurfacePlaneView(decoded) =
+        decode_descriptor(ObjectKind::IOSurfacePlaneView, bytes.bytes()).unwrap()
+    else {
+        panic!("type-5 descriptor did not retain its semantic family");
+    };
+    assert_eq!(decoded.surface.get(), 0x1234);
+    assert_eq!(decoded.owner_task.get(), 7);
+    assert_eq!(decoded.own_ref.map(|r| r.get()), Some(99));
+    assert_eq!(decoded.unidentified_record_flags, 0xa5);
+    assert_eq!(
+        decoded.record_kind,
+        Some(IOSurfacePlaneViewRecordKind::ColorView)
+    );
+    assert_eq!(
+        decoded.decode_state,
+        IOSurfacePlaneViewDecodeState::Complete
+    );
+    assert_eq!(
+        decoded.view,
+        Some(IOSurfacePlaneViewDescriptor {
+            pixel_format: 0x50,
+            width: 640,
+            height: 480,
+            depth: 1,
+            plane_index: 2,
+        })
+    );
 }
 
 #[test]
@@ -572,11 +636,10 @@ fn the_embedded_descriptor_decodes_through_the_shared_reader() {
 ///
 /// This is the collapse the payload closes: **29 of the decoder's 40 sites
 /// were `ErrShort`**, one name for twenty-nine different reads spanning a
-/// 12-byte object-list entry, a type-7 TLV walk and a vertex-attribute
+/// 12-byte object-list entry, a serializer resource TLV walk and a vertex-attribute
 /// table offset. Asserting the class alone would pass on any of them.
 #[test]
 fn every_short_read_names_the_field_it_ran_out_on() {
-    use crate::observe::Decline;
     let cases: &[(&str, &'static str)] = &[
         ("list entry", "res_list_entry_short"),
         ("buffer", "res_buffer_desc_short"),
@@ -596,14 +659,18 @@ fn every_short_read_names_the_field_it_ran_out_on() {
     // The other three classes, so the whole vocabulary is exercised rather
     // than just the one that used to swallow everything.
     assert_eq!(
-        decode_descriptor(0xfe, &[0u8; 64]).unwrap_err().slug(),
+        decode_list_object_entry(&[0xfe, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+            .unwrap_err()
+            .slug(),
         "res_object_type_unknown"
     );
-    let mut type7 = [0u8; 64];
-    st32(&mut type7[0..], 0xdead_beef);
+    let mut serializer_resource = [0u8; 64];
+    st32(&mut serializer_resource[0..], 0xdead_beef);
     assert_eq!(
-        decode_type7_descriptor(&type7).unwrap_err().slug(),
-        "res_type7_subtype_unknown"
+        decode_serializer_resource(&serializer_resource)
+            .unwrap_err()
+            .slug(),
+        "res_serializer_resource_subtype_unknown"
     );
 }
 
@@ -611,7 +678,7 @@ fn every_short_read_names_the_field_it_ran_out_on() {
 fn icb_descriptor_from_serializer_fixture() {
     // PGSerializer emission: ConcurrentDispatch, maxKernel=4, maxCmd=8, options=0.
     let mut b = [0u8; ICB_DESC_LEN];
-    st32(&mut b[0..], TYPE7_OBJECT_ICB);
+    st32(&mut b[0..], SERIALIZER_RESOURCE_OBJECT_ICB);
     st32(&mut b[4..], ICB_DESC_LEN as u32);
     st32(&mut b[8..], MTL_INDIRECT_CMD_CONCURRENT_DISPATCH);
     // bind counts as u8: vertex, fragment, kernel, …
@@ -720,7 +787,7 @@ fn the_decoded_flag_word_holds_no_bit_the_serializer_never_wrote() {
     let mut seen = std::collections::BTreeSet::new();
     for ring in [0x00u8, 0x80, 0xff] {
         let mut b = [0u8; ICB_DESC_LEN];
-        st32(&mut b[0..], TYPE7_OBJECT_ICB);
+        st32(&mut b[0..], SERIALIZER_RESOURCE_OBJECT_ICB);
         st32(&mut b[4..], ICB_DESC_LEN as u32);
         st32(&mut b[8..], MTL_INDIRECT_CMD_DRAW);
         // Every written bit set, plus whatever the ring left in bit 15.
@@ -851,7 +918,7 @@ fn the_options_word_ignores_the_two_bytes_the_serializer_never_writes() {
     let mut decoded = Vec::new();
     for ring in [0x00u8, 0xaa, 0x55, 0xff] {
         let mut b = [0u8; ICB_DESC_LEN];
-        st32(&mut b[0..], TYPE7_OBJECT_ICB);
+        st32(&mut b[0..], SERIALIZER_RESOURCE_OBJECT_ICB);
         st32(&mut b[4..], ICB_DESC_LEN as u32);
         st32(&mut b[8..], MTL_INDIRECT_CMD_DRAW);
         b[ICB_DESC_MAX_VERTEX_BINDS] = 4;
@@ -885,7 +952,7 @@ fn the_options_word_ignores_the_two_bytes_the_serializer_never_writes() {
 #[test]
 fn a_dispatch_only_command_mask_keeps_the_stated_fragment_bind_count() {
     let mut b = [0u8; ICB_DESC_LEN];
-    st32(&mut b[0..], TYPE7_OBJECT_ICB);
+    st32(&mut b[0..], SERIALIZER_RESOURCE_OBJECT_ICB);
     st32(&mut b[4..], ICB_DESC_LEN as u32);
     // Dispatch bits only — no draw bit anywhere in the mask.
     st32(
@@ -910,7 +977,7 @@ fn a_dispatch_only_command_mask_keeps_the_stated_fragment_bind_count() {
     assert_eq!(icb.max_kernel_buffer_bind_count, 4);
     assert_eq!(icb.layout.command_size, layout.command_size);
     assert_eq!(icb.layout.kernel_buffer_bind_offset, 0x64);
-    match decode_type7_descriptor(&b).unwrap() {
+    match decode_serializer_resource(&b).unwrap() {
         Descriptor::IndirectCommandBuffer(d) => assert_eq!(d.max_command_count, 8),
         _ => panic!("expected ICB"),
     }
@@ -927,11 +994,11 @@ fn a_dispatch_only_command_mask_keeps_the_stated_fragment_bind_count() {
 /// layout table sizing for object/mesh/objectTG/kernelTG.
 #[test]
 fn icb_create_body_max_count_matrix() {
-    use crate::contract::endian::st16;
+    use reims_vgpu_core::endian::st16;
 
     // --- Decode: single-byte fields at RE offsets ---
     let mut b = [0u8; ICB_DESC_LEN];
-    st32(&mut b[0..], TYPE7_OBJECT_ICB);
+    st32(&mut b[0..], SERIALIZER_RESOURCE_OBJECT_ICB);
     st32(&mut b[4..], ICB_DESC_LEN as u32);
     st32(
         &mut b[8..],
@@ -1037,10 +1104,10 @@ fn icb_create_body_max_count_matrix() {
 /// pinned by `const` assertion beside the masks, not here.
 #[test]
 fn a_packed_stage_input_bit_with_no_field_says_so() {
-    use crate::contract::endian::st32;
     use crate::runtime::decode::resource::{
         COMPUTE_STAGE_INPUT_ATTR_BITS_FORMAT_MASK, COMPUTE_STAGE_INPUT_ATTR_BITS_FORMAT_SHIFT,
     };
+    use reims_vgpu_core::endian::st32;
 
     // The top bit of the attribute word, which is 16 above the highest bit any
     // field names. A value no other test in this process sets, so `first_sight`
@@ -1118,7 +1185,7 @@ fn macos12_shaped_compute_pipeline(kernel_ref: u32, attrs: u32, layouts: u32) ->
     // Two fields of `[tag][len][u32]` behind a one-byte count, then padding to
     // the section's four-byte alignment.
     const TLV_TWO_FIELDS: usize = 1 + 2 * (1 + 1 + 4);
-    let section = (TYPE7_FIRST_TLVS + TLV_TWO_FIELDS).next_multiple_of(4);
+    let section = (SERIALIZER_RESOURCE_FIRST_TLVS + TLV_TWO_FIELDS).next_multiple_of(4);
     // The section's own two fields, then its two offset arrays and compact-TLV
     // entries. Both entry kinds carry four u32 properties.
     const ENTRY_LEN: usize = 1 + 4 * (1 + 1 + 4);
@@ -1129,17 +1196,20 @@ fn macos12_shaped_compute_pipeline(kernel_ref: u32, attrs: u32, layouts: u32) ->
     let total = section + layout_rel + layout_array_len;
 
     let mut b = vec![0u8; total];
-    st32(&mut b[0..], TYPE7_OBJECT_COMPUTE_PIPELINE);
+    st32(&mut b[0..], SERIALIZER_RESOURCE_OBJECT_COMPUTE_PIPELINE);
     st32(&mut b[4..], total as u32);
     st32(&mut b[8..], kernel_ref + 1);
-    st32(&mut b[12..], (total - TYPE7_FIRST_TLVS) as u32);
+    st32(
+        &mut b[12..],
+        (total - SERIALIZER_RESOURCE_FIRST_TLVS) as u32,
+    );
 
-    b[TYPE7_FIRST_TLVS] = 2;
-    let mut p = TYPE7_FIRST_TLVS + 1;
+    b[SERIALIZER_RESOURCE_FIRST_TLVS] = 2;
+    let mut p = SERIALIZER_RESOURCE_FIRST_TLVS + 1;
     for (tag, value) in [
         (
             PIPELINE_TAG_COMPUTE_STAGE_INPUT_OFFSET,
-            (section - TYPE7_FIRST_TLVS) as u32,
+            (section - SERIALIZER_RESOURCE_FIRST_TLVS) as u32,
         ),
         (PIPELINE_TAG_KERNEL_FUNC, kernel_ref),
     ] {
@@ -1264,9 +1334,9 @@ fn a_populated_compute_stage_input_section_preserves_every_field() {
 #[test]
 fn a_compute_stage_input_offset_is_bounds_checked_and_zero_means_nil() {
     // The offset field sits at the start of the first TLV entry's value.
-    let off_at = TYPE7_FIRST_TLVS + 1 + 2;
+    let off_at = SERIALIZER_RESOURCE_FIRST_TLVS + 1 + 2;
     assert_eq!(
-        macos12_shaped_compute_pipeline(9, 0, 0)[TYPE7_FIRST_TLVS + 1],
+        macos12_shaped_compute_pipeline(9, 0, 0)[SERIALIZER_RESOURCE_FIRST_TLVS + 1],
         PIPELINE_TAG_COMPUTE_STAGE_INPUT_OFFSET,
         "the builder emits the offset tag first"
     );
@@ -1302,14 +1372,14 @@ fn a_stage_input_at_the_wire_count_field_maximum_loses_nothing() {
     let n = COMPUTE_STAGE_INPUT_HEADER0_COUNT_MASK;
     let ns = n as usize;
 
-    // Same 24-byte type-7 prefix as the fixture above (tag, declared length,
+    // Same 24-byte serializer resource prefix as the fixture above (tag, declared length,
     // then an empty first TLV record), so the stage-input block starts at 24.
     const BLOCK: usize = 24;
     let layout_section = BLOCK + COMPUTE_STAGE_INPUT_MIN_LEN;
     let attr_section = layout_section + ns * COMPUTE_STAGE_INPUT_LAYOUT_ENTRY_SIZE;
     let total = attr_section + ns * COMPUTE_STAGE_INPUT_ATTR_ENTRY_SIZE;
     let mut b = vec![0u8; total];
-    st32(&mut b[0..], TYPE7_OBJECT_COMPUTE_PIPELINE);
+    st32(&mut b[0..], SERIALIZER_RESOURCE_OBJECT_COMPUTE_PIPELINE);
     st32(&mut b[4..], total as u32);
     // word0, then header0: payload length (everything after word0) plus both
     // count fields at their maximum.
@@ -1338,7 +1408,7 @@ fn a_stage_input_at_the_wire_count_field_maximum_loses_nothing() {
     }
 
     let si = decode_compute_pipeline_descriptor(&b)
-        .expect("type-7 decodes")
+        .expect("serializer resource decodes")
         .stage_input
         .expect("stage-input block");
     assert_eq!(si.dropped_attributes, 0, "no attribute may be dropped");
@@ -1362,7 +1432,7 @@ fn list_entry_and_buffer() {
     // desc_gva
     list[4] = 0x80;
     let le = decode_list_object_entry(&list).unwrap();
-    assert_eq!(le.object_type, 11);
+    assert_eq!(le.kind, ObjectKind::IOSurfaceTexture);
     assert_eq!(le.descriptor_length, 0x20);
     assert_eq!(le.descriptor_gva, 0x80);
 
@@ -1375,31 +1445,42 @@ fn list_entry_and_buffer() {
     let d = decode_buffer_descriptor(&buf).unwrap();
     assert_eq!(d.allocation_size, 256);
     assert_eq!(d.handle, 0x1234);
+    assert!(!d.is_private);
     assert_eq!(
         d.backing_gva_size(PAGE_SHIFT_ARM64E),
         Some(((0x1234u64) << RESOURCE_PAGE_SHIFT, 256))
     );
+
+    st64(&mut buf[LINEAR_DESC_HANDLE..], 0x1_0000_1234);
+    let private = decode_buffer_descriptor(&buf).unwrap();
+    assert_eq!(private.handle, 0x1234);
+    assert!(private.is_private);
 }
 
 #[test]
-fn iosurface_type11() {
-    let mut b = [0u8; 0x20];
-    b[0] = 2;
-    b[0x16] = 0x50;
-    b[0x18] = 64;
-    b[0x1c] = 32;
-    match decode_descriptor(11, &b).unwrap() {
-        Descriptor::IOSurfaceTexture {
-            mapping_id,
-            width,
-            height,
-            pixel_format,
-            ..
-        } => {
-            assert_eq!(mapping_id, 2);
-            assert_eq!(width, 64);
-            assert_eq!(height, 32);
-            assert_eq!(pixel_format, 0x50);
+fn iosurface_to_iosurface() {
+    let mut b = [0u8; 56];
+    st64(&mut b[0..], 0x1122_3344_0000_0002);
+    st32(&mut b[8..], w_backed::OPCODE_IOSURFACE_TEXTURE);
+    st32(&mut b[12..], w_backed::IOSURFACE_TEXTURE_TOTAL_LEN);
+    st32(&mut b[16..], 17);
+    st32(&mut b[20..], 0x0050_0002);
+    st32(&mut b[24..], 64);
+    st32(&mut b[28..], 32);
+    st32(&mut b[32..], 1);
+    st16(&mut b[36..], 1);
+    st16(&mut b[38..], 1);
+    st16(&mut b[40..], 1);
+    st16(&mut b[52..], 3);
+    match decode_descriptor(ObjectKind::IOSurfaceTexture, &b).unwrap() {
+        Descriptor::MapperIOSurfaceTextureView(view) => {
+            assert_eq!(view.mapper_surface.get(), 0x1122_3344_0000_0002);
+            assert_eq!(view.object.get(), 17);
+            assert_eq!(view.declaration.width, 64);
+            assert_eq!(view.declaration.height, 32);
+            assert_eq!(view.declaration.pixel_format, 0x50);
+            assert_eq!(view.plane.get(), 3);
+            assert_eq!(view.rotation, None);
         }
         _ => panic!("wrong kind"),
     }
@@ -1407,20 +1488,27 @@ fn iosurface_type11() {
 
 #[test]
 fn linear_texture_geometry() {
-    use crate::contract::endian::{st16, st64};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use reims_vgpu_core::endian::{st32, st64};
+    use reims_vgpu_core::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     let mut b = vec![0u8; TEXTURE_DESC_BASE_LEN];
     st64(&mut b[0..], 0x10000);
     st32(&mut b[8..], 0x10);
     st32(&mut b[TEXTURE_DESC_ROW_STRIDE..], 256);
     st32(&mut b[TEXTURE_DESC_WIDTH..], 64);
     st32(&mut b[TEXTURE_DESC_HEIGHT..], 32);
-    st16(&mut b[TEXTURE_DESC_PIXEL_FORMAT..], MTL_FORMAT_BGRA8_UNORM);
+    // The trailer is the shared serialized texture declaration. Route it
+    // through that decoder, including fields the old format-only read lost.
+    st32(
+        &mut b[TEXTURE_DESC_DECLARATION..],
+        2 | (5 << 8) | (u32::from(MTL_FORMAT_BGRA8_UNORM) << 16),
+    );
     let d = decode_texture_descriptor(&b).unwrap();
     assert_eq!(d.width, 64);
     assert_eq!(d.height, 32);
     assert_eq!(d.row_stride, 256);
-    assert_eq!(d.pixel_format, MTL_FORMAT_BGRA8_UNORM);
+    assert_eq!(d.declared_pixel_format(), Some(MTL_FORMAT_BGRA8_UNORM));
+    assert_eq!(d.declared_usage(), Some(5));
+    assert_eq!(d.declaration.unwrap().texture_type, 2);
     assert_eq!(
         d.backing_gva_size(PAGE_SHIFT_ARM64E),
         Some(((0x10u64) << RESOURCE_PAGE_SHIFT, 0x10000))
@@ -1432,13 +1520,13 @@ fn linear_texture_geometry() {
 /// A descriptor naming no extent is not a one-by-one texture, and the three
 /// call sites that used to ask `has_width && has_height` now ask this.
 ///
-/// The sampled-source path in `draw::vulkan` clamped both fields up
+/// The sampled-source path in `draw::execution` clamped both fields up
 /// with `.max(1)`, which sized a four-byte payload — satisfied by almost any
 /// buffer — and bound a single texel of it. Nothing above that could tell
 /// the result from a real bind.
 #[test]
 fn a_descriptor_naming_no_extent_is_not_a_one_by_one_texture() {
-    use crate::contract::endian::st64;
+    use reims_vgpu_core::endian::st64;
     let mut b = vec![0u8; TEXTURE_DESC_BASE_LEN];
     st64(&mut b[0..], 0x10000);
     st32(&mut b[8..], 0x10);
@@ -1473,8 +1561,8 @@ fn a_descriptor_naming_no_extent_is_not_a_one_by_one_texture() {
 
 #[test]
 fn multi_mip_level_layouts() {
-    use crate::contract::endian::{st16, st32, st64};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use reims_vgpu_core::endian::{st16, st32, st64};
+    use reims_vgpu_core::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     // 2 mips: L0 64x32 + L1 record + format trailer shifted by 36.
     let levels = 2u32;
     let body = TEXTURE_DESC_BASE_LEN + TEXTURE_DESC_MIP_LEVEL_RECORD_LEN; // 116+36=152
@@ -1482,7 +1570,9 @@ fn multi_mip_level_layouts() {
     st64(&mut b[0..], 0x20000);
     st32(&mut b[8..], 0x20);
     st16(&mut b[TEXTURE_DESC_MIPMAP_LEVEL_COUNT..], levels as u16);
-    st32(&mut b[TEXTURE_DESC_DATA_OFFSET..], 0);
+    st16(&mut b[TEXTURE_DESC_SLICE_COUNT..], 1);
+    st64(&mut b[TEXTURE_DESC_BASE_OFFSET..], 0);
+    st64(&mut b[TEXTURE_DESC_BYTES_PER_SLICE..], 0x2800);
     st32(&mut b[TEXTURE_DESC_USED_SIZE..], 64 * 32 * 4);
     st32(&mut b[TEXTURE_DESC_ROW_STRIDE..], 256);
     st32(&mut b[TEXTURE_DESC_WIDTH..], 64);
@@ -1495,13 +1585,17 @@ fn multi_mip_level_layouts() {
     st32(&mut b[rec + TEXTURE_LEVEL_WIDTH..], 32);
     st32(&mut b[rec + TEXTURE_LEVEL_HEIGHT..], 16);
     st32(&mut b[rec + TEXTURE_LEVEL_DEPTH..], 1);
-    // Format at 86 + 36
-    let pf_off = TEXTURE_DESC_PIXEL_FORMAT + TEXTURE_DESC_MIP_LEVEL_RECORD_LEN;
-    st16(&mut b[pf_off..], MTL_FORMAT_BGRA8_UNORM);
+    // Declaration at 84 + 36; format remains its packed high word.
+    let declaration = TEXTURE_DESC_DECLARATION + TEXTURE_DESC_MIP_LEVEL_RECORD_LEN;
+    st32(
+        &mut b[declaration..],
+        2 | (4 << 8) | (u32::from(MTL_FORMAT_BGRA8_UNORM) << 16),
+    );
     let d = decode_texture_descriptor(&b).unwrap();
     assert_eq!(d.mipmap_level_count, 2);
     assert_eq!(d.levels.len(), 2);
-    assert_eq!(d.pixel_format, MTL_FORMAT_BGRA8_UNORM);
+    assert_eq!(d.declared_pixel_format(), Some(MTL_FORMAT_BGRA8_UNORM));
+    assert_eq!(d.declared_usage(), Some(4));
     let l0 = d.level(0).unwrap();
     assert_eq!((l0.width, l0.height, l0.row_stride), (64, 32, 256));
     let l1 = d.level(1).unwrap();
@@ -1512,6 +1606,56 @@ fn multi_mip_level_layouts() {
     assert_eq!(gva1, ((0x20u64) << RESOURCE_PAGE_SHIFT) + 0x2000);
     assert_eq!(lay1.width, 32);
     assert!(d.level_gva(2, PAGE_SHIFT_ARM64E).is_none());
+}
+
+#[test]
+fn texture_dimension_flags_and_slice_major_offsets_decode_independently() {
+    use reims_vgpu_core::endian::{st16, st32, st64};
+
+    let body = TEXTURE_DESC_BASE_LEN + TEXTURE_DESC_MIP_LEVEL_RECORD_LEN;
+    let mut b = vec![0u8; body];
+    st64(&mut b[LINEAR_DESC_SIZE..], 0x40_000);
+    st32(&mut b[LINEAR_DESC_HANDLE..], 3);
+    st16(&mut b[TEXTURE_DESC_MIPMAP_LEVEL_COUNT..], 2 | 0xc000);
+    st16(&mut b[TEXTURE_DESC_SLICE_COUNT..], 3);
+    st64(&mut b[TEXTURE_DESC_BASE_OFFSET..], 0x100);
+    st64(&mut b[TEXTURE_DESC_BYTES_PER_SLICE..], 0x3000);
+    st64(&mut b[TEXTURE_DESC_LEVEL_ZERO..], 0x200);
+    st32(&mut b[TEXTURE_DESC_USED_SIZE..], 0x1000);
+    st32(&mut b[TEXTURE_DESC_ROW_STRIDE..], 0x100);
+    st32(&mut b[TEXTURE_DESC_WIDTH..], 32);
+    st32(&mut b[TEXTURE_DESC_HEIGHT..], 16);
+    st32(&mut b[TEXTURE_DESC_DEPTH..], 1);
+
+    let rec = TEXTURE_DESC_LEVEL_RECORDS;
+    st64(&mut b[rec + TEXTURE_LEVEL_OFFSET..], 0x2400);
+    st64(&mut b[rec + TEXTURE_LEVEL_SIZE..], 0x400);
+    st64(&mut b[rec + TEXTURE_LEVEL_ROW_STRIDE..], 0x80);
+    st32(&mut b[rec + TEXTURE_LEVEL_WIDTH..], 16);
+    st32(&mut b[rec + TEXTURE_LEVEL_HEIGHT..], 8);
+    st32(&mut b[rec + TEXTURE_LEVEL_DEPTH..], 1);
+
+    let declaration = TEXTURE_DESC_DECLARATION + TEXTURE_DESC_MIP_LEVEL_RECORD_LEN;
+    b[declaration] = TEXTURE_VIEW_MTL_TYPE_CUBE as u8;
+    let array_length = declaration
+        + core::mem::offset_of!(
+            reims_vgpu_wire::ops::texture::TextureDescriptorBody,
+            array_length
+        );
+    st16(&mut b[array_length..], 3);
+
+    let d = decode_texture_descriptor(&b).unwrap();
+    assert_eq!(d.mipmap_level_count, 2);
+    assert!(d.cube_faces);
+    assert!(d.compressed_layout);
+    assert_eq!(d.slice_count, 3);
+    assert_eq!(d.base_offset, 0x100);
+    assert_eq!(d.bytes_per_slice, 0x3000);
+    assert_eq!(d.level(0).unwrap().offset, 0x200);
+    assert_eq!(d.level(1).unwrap().offset, 0x2400);
+    assert_eq!(d.subresource_offset(2, 1), Some(0x8500));
+    assert_eq!(d.physical_slice_count(), Some(18));
+    assert_eq!(d.packed_allocation_end(), Some(0x36_100));
 }
 
 /// A mip level the descriptor named but the body does not reach is a drop,
@@ -1529,7 +1673,7 @@ fn multi_mip_level_layouts() {
 /// format trailer.
 #[test]
 fn a_level_record_the_body_does_not_reach_is_reported_not_dropped() {
-    use crate::contract::endian::{st16, st32, st64};
+    use reims_vgpu_core::endian::{st16, st32, st64};
     // Declares 3 levels but carries only L0's geometry prefix and one
     // record's worth of room — L2's record runs past the end.
     let body = TEXTURE_DESC_LEVEL_RECORDS + TEXTURE_DESC_MIP_LEVEL_RECORD_LEN;
@@ -1568,7 +1712,7 @@ fn a_level_record_the_body_does_not_reach_is_reported_not_dropped() {
     );
 }
 
-/// The type-7 header states its payload length twice, and a record where the
+/// The serializer resource header states its payload length twice, and a record where the
 /// two disagree says so.
 ///
 /// The declared length at `+4` covers the header plus the payload padded to
@@ -1580,14 +1724,14 @@ fn a_level_record_the_body_does_not_reach_is_reported_not_dropped() {
 /// why it reports rather than refuses, and why a future promotion to a refusal
 /// has to fix the fixtures first rather than only measure a boot.
 #[test]
-fn a_type7_header_states_its_payload_length_twice_and_says_when_they_disagree() {
-    use crate::contract::endian::st32;
+fn a_serializer_resource_header_states_its_payload_length_twice_and_says_when_they_disagree() {
+    use reims_vgpu_core::endian::st32;
 
     // A minimal classic pipeline: header, then a one-field TLV block of seven
     // bytes, padded to eight by the declared length.
     let mut b = vec![0u8; 16 + 8];
     let blen = b.len() as u32;
-    st32(&mut b[0..], TYPE7_OBJECT_RENDER_PIPELINE);
+    st32(&mut b[0..], SERIALIZER_RESOURCE_OBJECT_RENDER_PIPELINE);
     st32(&mut b[4..], blen);
     st32(&mut b[8..], 3);
     st32(&mut b[12..], 7);
@@ -1603,7 +1747,7 @@ fn a_type7_header_states_its_payload_length_twice_and_says_when_they_disagree() 
     assert!(
         !cap.lines()
             .iter()
-            .any(|l| l.contains("type7_payload_len_disagrees")),
+            .any(|l| l.contains("serializer_resource_payload_len_disagrees")),
         "7 rounds up to 8 and 16 + 8 is the declared length, so the two agree: \
          {:?}",
         cap.lines()
@@ -1617,7 +1761,7 @@ fn a_type7_header_states_its_payload_length_twice_and_says_when_they_disagree() 
     assert!(
         lines
             .iter()
-            .any(|l| l.contains("type7_payload_len_disagrees")
+            .any(|l| l.contains("serializer_resource_payload_len_disagrees")
                 && l.contains("payload=9")
                 && l.contains("declared=24")
                 && l.contains("expected=28")),
@@ -1628,11 +1772,11 @@ fn a_type7_header_states_its_payload_length_twice_and_says_when_they_disagree() 
 
 #[test]
 fn compact_render_pipeline_funcs() {
-    use crate::contract::endian::st32;
-    // Minimal type-7 render pipeline: header + fieldCount=2 with vert/frag refs.
+    use reims_vgpu_core::endian::st32;
+    // Minimal serializer resource render pipeline: header + fieldCount=2 with vert/frag refs.
     let mut b = vec![0u8; 16 + 1 + 6 + 6];
     let blen = b.len() as u32;
-    st32(&mut b[0..], TYPE7_OBJECT_RENDER_PIPELINE);
+    st32(&mut b[0..], SERIALIZER_RESOURCE_OBJECT_RENDER_PIPELINE);
     st32(&mut b[4..], blen);
     st32(&mut b[8..], 9);
     b[16] = 2;
@@ -1665,7 +1809,7 @@ fn compact_render_pipeline_funcs() {
 fn a_depth_stencil_pipeline_with_a_sample_count_decodes() {
     let mut b = vec![0u8; 16 + 1 + 5 * 6];
     let blen = b.len() as u32;
-    st32(&mut b[0..], TYPE7_OBJECT_RENDER_PIPELINE);
+    st32(&mut b[0..], SERIALIZER_RESOURCE_OBJECT_RENDER_PIPELINE);
     st32(&mut b[4..], blen);
     st32(&mut b[8..], 20);
     // Written in the order the guest's serializer emits them: the descriptor's
@@ -1704,14 +1848,14 @@ fn a_classic_tessellation_pipeline_preserves_its_three_properties() {
         (PIPELINE_TAG_TESSELLATION_FACTOR_STEP_FUNCTION, 1),
         (PIPELINE_TAG_TESSELLATION_OUTPUT_WINDING_ORDER, 1),
     ];
-    let mut b = vec![0u8; TYPE7_FIRST_TLVS + 1 + fields.len() * 6];
+    let mut b = vec![0u8; SERIALIZER_RESOURCE_FIRST_TLVS + 1 + fields.len() * 6];
     let len = b.len() as u32;
-    st32(&mut b[0..], TYPE7_OBJECT_RENDER_PIPELINE);
+    st32(&mut b[0..], SERIALIZER_RESOURCE_OBJECT_RENDER_PIPELINE);
     st32(&mut b[4..], len);
     st32(&mut b[8..], 22);
-    st32(&mut b[12..], len - TYPE7_FIRST_TLVS as u32);
-    b[TYPE7_FIRST_TLVS] = fields.len() as u8;
-    let mut p = TYPE7_FIRST_TLVS + 1;
+    st32(&mut b[12..], len - SERIALIZER_RESOURCE_FIRST_TLVS as u32);
+    b[SERIALIZER_RESOURCE_FIRST_TLVS] = fields.len() as u8;
+    let mut p = SERIALIZER_RESOURCE_FIRST_TLVS + 1;
     for (tag, value) in fields {
         b[p] = tag;
         b[p + 1] = 4;
@@ -1742,7 +1886,7 @@ fn a_pipeline_sample_count_is_preserved_for_backend_rasterization() {
     let pipeline = |count: u32| {
         let mut b = vec![0u8; 16 + 1 + 6];
         let blen = b.len() as u32;
-        st32(&mut b[0..], TYPE7_OBJECT_RENDER_PIPELINE);
+        st32(&mut b[0..], SERIALIZER_RESOURCE_OBJECT_RENDER_PIPELINE);
         st32(&mut b[4..], blen);
         st32(&mut b[8..], 21);
         b[16] = 1;
@@ -1791,7 +1935,7 @@ fn a_pipeline_sample_count_is_preserved_for_backend_rasterization() {
 /// otherwise.
 #[test]
 fn an_unidentified_pipeline_descriptor_field_refuses_the_pipeline() {
-    use crate::contract::endian::st32;
+    use reims_vgpu_core::endian::st32;
     // Tags no other test in this process uses, so `first_sight` cannot have
     // latched either shape or either drop already.
     const UNKNOWN_TAG_A: u8 = 0x6d;
@@ -1799,7 +1943,7 @@ fn an_unidentified_pipeline_descriptor_field_refuses_the_pipeline() {
 
     let mut b = vec![0u8; 16 + 1 + 6 + 6 + 6];
     let blen = b.len() as u32;
-    st32(&mut b[0..], TYPE7_OBJECT_RENDER_PIPELINE);
+    st32(&mut b[0..], SERIALIZER_RESOURCE_OBJECT_RENDER_PIPELINE);
     st32(&mut b[4..], blen);
     st32(&mut b[8..], 9);
     b[16] = 3;
@@ -1823,7 +1967,7 @@ fn an_unidentified_pipeline_descriptor_field_refuses_the_pipeline() {
 
     let shape: Vec<&String> = lines
         .iter()
-        .filter(|l| l.contains("type7_pipeline_shape"))
+        .filter(|l| l.contains("serializer_resource_pipeline_shape"))
         .collect();
     assert_eq!(
         shape.len(),
@@ -1900,11 +2044,11 @@ fn an_unidentified_pipeline_descriptor_field_refuses_the_pipeline() {
 /// refusal.
 #[test]
 fn an_identified_but_unapplied_pipeline_field_still_builds_the_pipeline() {
-    use crate::contract::endian::st32;
+    use reims_vgpu_core::endian::st32;
 
     let mut b = vec![0u8; 16 + 1 + 6 + 6 + 6];
     let blen = b.len() as u32;
-    st32(&mut b[0..], TYPE7_OBJECT_RENDER_PIPELINE);
+    st32(&mut b[0..], SERIALIZER_RESOURCE_OBJECT_RENDER_PIPELINE);
     st32(&mut b[4..], blen);
     st32(&mut b[8..], 9);
     b[16] = 3;
@@ -1940,7 +2084,7 @@ fn an_identified_but_unapplied_pipeline_field_still_builds_the_pipeline() {
     // for alarm — starred as unread, and not counted as unknown.
     let shape: Vec<&String> = lines
         .iter()
-        .filter(|l| l.contains("type7_pipeline_shape"))
+        .filter(|l| l.contains("serializer_resource_pipeline_shape"))
         .collect();
     assert_eq!(shape.len(), 1, "{lines:?}");
     assert!(
@@ -1969,7 +2113,7 @@ fn an_identified_but_unapplied_pipeline_field_still_builds_the_pipeline() {
 /// readable off the result rather than argued.
 #[test]
 fn a_classic_pipeline_takes_its_vertex_block_from_the_stated_offset() {
-    use crate::contract::endian::st32;
+    use reims_vgpu_core::endian::st32;
 
     const DECOY_BUFFER: u32 = 0;
     const REAL_BUFFER: u32 = 2;
@@ -1987,7 +2131,7 @@ fn a_classic_pipeline_takes_its_vertex_block_from_the_stated_offset() {
 
     let mut b = vec![0u8; 16 + color_rel + 8];
     let blen = b.len() as u32;
-    st32(&mut b[0..], TYPE7_OBJECT_RENDER_PIPELINE);
+    st32(&mut b[0..], SERIALIZER_RESOURCE_OBJECT_RENDER_PIPELINE);
     st32(&mut b[4..], blen);
     st32(&mut b[8..], 12);
     b[16] = 4;
@@ -2024,7 +2168,7 @@ fn a_classic_pipeline_takes_its_vertex_block_from_the_stated_offset() {
     assert!(
         !cap.lines()
             .iter()
-            .any(|l| l.contains("type7_vertex_block_inferred")),
+            .any(|l| l.contains("serializer_resource_vertex_block_inferred")),
         "and a descriptor that stated its offset must not report the fallback: \
          {:?}",
         cap.lines()
@@ -2039,11 +2183,11 @@ fn a_classic_pipeline_takes_its_vertex_block_from_the_stated_offset() {
 /// what makes the stated offset usable as the only route to the block.
 #[test]
 fn a_classic_pipeline_without_the_offset_reports_no_vertex_descriptor() {
-    use crate::contract::endian::st32;
+    use reims_vgpu_core::endian::st32;
 
     let mut b = vec![0u8; 16 + 13 + 8];
     let blen = b.len() as u32;
-    st32(&mut b[0..], TYPE7_OBJECT_RENDER_PIPELINE);
+    st32(&mut b[0..], SERIALIZER_RESOURCE_OBJECT_RENDER_PIPELINE);
     st32(&mut b[4..], blen);
     st32(&mut b[8..], 13);
     b[16] = 2;
@@ -2066,7 +2210,7 @@ fn a_classic_pipeline_without_the_offset_reports_no_vertex_descriptor() {
 
 #[test]
 fn compact_render_pipeline_object_mesh_funcs() {
-    use crate::contract::endian::st32;
+    use reims_vgpu_core::endian::st32;
     // Mesh SPI shape: tag 0x14 section offset + 0x01 object / 0x02 mesh / 0x03 frag.
     // (Host serializeMeshRenderPipelineDescriptor differentials, 2026-07-12.)
     //
@@ -2077,7 +2221,7 @@ fn compact_render_pipeline_object_mesh_funcs() {
     // offset must carry the eight header bytes a real descriptor carries.
     let mut b = vec![0u8; 16 + 24 + 8];
     let blen = b.len() as u32;
-    st32(&mut b[0..], TYPE7_OBJECT_RENDER_PIPELINE);
+    st32(&mut b[0..], SERIALIZER_RESOURCE_OBJECT_RENDER_PIPELINE);
     st32(&mut b[4..], blen);
     st32(&mut b[8..], 7);
     b[16] = 4;
@@ -2105,16 +2249,13 @@ fn compact_render_pipeline_object_mesh_funcs() {
 
 #[test]
 fn depth_stencil_object_decode() {
-    use crate::contract::endian::st32;
+    use reims_vgpu_core::endian::st32;
     let mut b = vec![0u8; DEPTH_STENCIL_DESC_LEN];
-    st32(&mut b[0..], TYPE7_OBJECT_DEPTH_STENCIL);
+    st32(&mut b[0..], SERIALIZER_RESOURCE_OBJECT_DEPTH_STENCIL);
     st32(&mut b[4..], DEPTH_STENCIL_DESC_LEN as u32);
     st32(&mut b[DEPTH_STENCIL_DESC_ID..], 5);
-    // compare Less=1, write enabled, both stencil enabled
-    let bits = 1u32
-        | DEPTH_STENCIL_DEPTH_WRITE
-        | DEPTH_STENCIL_FRONT_STENCIL_ENABLED
-        | DEPTH_STENCIL_BACK_STENCIL_ENABLED;
+    // compare Less=1, write enabled, both stencil faces present
+    let bits = 1u32 | DEPTH_STENCIL_DEPTH_WRITE | (1 << 4) | (1 << 5);
     st32(&mut b[DEPTH_STENCIL_DESC_STATE_BITS..], bits);
     st32(&mut b[DEPTH_STENCIL_DESC_FRONT_FACE + 4..], 0xff);
     st32(&mut b[DEPTH_STENCIL_DESC_FRONT_FACE + 8..], 0xff);
@@ -2122,14 +2263,15 @@ fn depth_stencil_object_decode() {
     assert_eq!(d.depth_stencil_id, 5);
     assert_eq!(d.depth_compare_function, 1);
     assert!(d.depth_write_enabled);
-    assert!(d.front_stencil_enabled);
+    assert!(d.front_stencil_present);
+    assert!(d.back_stencil_present);
     assert_eq!(d.front_face.read_mask, 0xff);
 }
 
 #[test]
 fn color_attachment0_blend_section() {
-    use crate::contract::endian::st32;
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use reims_vgpu_core::endian::st32;
+    use reims_vgpu_core::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     // Place section at off=16 (nonzero; 0 means "absent" for callers).
     // Section: count=1, entry_rel=8, entry with fieldCount + tags.
     let off = 16usize;
@@ -2176,7 +2318,7 @@ fn color_attachment0_blend_section() {
 /// borrowing entry 0's would be visible rather than coincidentally equal.
 #[test]
 fn colour_attachment_slots_are_their_own_index_and_carry_their_own_state() {
-    use crate::contract::endian::st32;
+    use reims_vgpu_core::endian::st32;
     // [count][off0][off1][off2] then three 1-field entries, 7 bytes each.
     const ENTRY_LEN: usize = 7;
     let off = 16usize;
@@ -2229,8 +2371,8 @@ fn colour_attachment_slots_are_their_own_index_and_carry_their_own_state() {
 /// fit, and both take the same exit.
 #[test]
 fn a_colour_attachment_table_that_cannot_deliver_its_count_refuses() {
-    use crate::contract::endian::st32;
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use reims_vgpu_core::endian::st32;
+    use reims_vgpu_core::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     let off = 16usize;
     // Header (count + 3 offset words) then one entry: one tag, 6 bytes.
     let mut buf = vec![0u8; off + 4 + 3 * 4 + 1 + 6];
@@ -2313,7 +2455,7 @@ fn a_colour_table_reach_past_the_record_refuses_instead_of_indexing_past_it() {
 /// rest onto nothing.
 #[test]
 fn a_colour_attachment_count_past_the_eight_slot_array_refuses() {
-    use crate::contract::endian::st32;
+    use reims_vgpu_core::endian::st32;
     let off = 16usize;
     let declared = MAX_COLOR_ATTACHMENTS + 1;
     // Only the header needs to be well formed: the count is refused before any
@@ -2345,8 +2487,8 @@ fn a_colour_attachment_count_past_the_eight_slot_array_refuses() {
 /// pipeline to build.
 #[test]
 fn a_colour_attachment_slot_past_the_array_refuses_instead_of_taking_a_position() {
-    use crate::contract::endian::st32;
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use reims_vgpu_core::endian::st32;
+    use reims_vgpu_core::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     let off = 16usize;
     let mut buf = vec![0u8; off + 8 + 1 + 2 * 6];
     st32(&mut buf[off..], 1);
@@ -2385,8 +2527,8 @@ fn a_colour_attachment_slot_past_the_array_refuses_instead_of_taking_a_position(
 /// half, and assert the refusal names the pair.
 #[test]
 fn a_colour_attachment_entry_shorter_than_its_field_count_is_refused() {
-    use crate::contract::endian::st32;
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use reims_vgpu_core::endian::st32;
+    use reims_vgpu_core::pixel_format::MTL_FORMAT_BGRA8_UNORM;
 
     let off = 16usize;
     // Header (count + one offset), then `[3][01:4 <fmt>][02:4 <trunc>]` — the
@@ -2446,8 +2588,8 @@ fn a_colour_attachment_entry_shorter_than_its_field_count_is_refused() {
 /// without it puts Metal's default where the guest set its own.
 #[test]
 fn an_unconsumed_colour_attachment_field_refuses_the_pipeline() {
-    use crate::contract::endian::st32;
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use reims_vgpu_core::endian::st32;
+    use reims_vgpu_core::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     // A tag no other test in this process uses, so `first_sight` cannot
     // have latched it already.
     const UNKNOWN_TAG: u8 = 0x7f;
@@ -2475,7 +2617,7 @@ fn an_unconsumed_colour_attachment_field_refuses_the_pipeline() {
 
     let shape: Vec<&String> = lines
         .iter()
-        .filter(|l| l.contains("type7_color_attach_shape"))
+        .filter(|l| l.contains("serializer_resource_color_attach_shape"))
         .collect();
     assert_eq!(
         shape.len(),
@@ -2529,8 +2671,8 @@ fn an_unconsumed_colour_attachment_field_refuses_the_pipeline() {
 /// already read from the wire.
 #[test]
 fn a_colour_attachment_takes_the_slot_the_guest_declared() {
-    use crate::contract::endian::st32;
-    use crate::contract::pixel_format::{MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_RGBA8_UNORM};
+    use reims_vgpu_core::endian::st32;
+    use reims_vgpu_core::pixel_format::{MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_RGBA8_UNORM};
 
     // Two entries, declared out of order: table position 0 names slot 3 and
     // position 1 names slot 1. Nothing but the declared index distinguishes
@@ -2587,8 +2729,8 @@ fn a_colour_attachment_takes_the_slot_the_guest_declared() {
 /// that omits it left the property at `all`.
 #[test]
 fn a_colour_attachment_write_mask_decodes_and_defaults_to_all() {
-    use crate::contract::endian::st32;
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use reims_vgpu_core::endian::st32;
+    use reims_vgpu_core::pixel_format::MTL_FORMAT_BGRA8_UNORM;
 
     // `[fieldCount][01 pixelFormat][09 writeMask]`, the shape the live
     // guest sent (alpha-only, value 1).
@@ -2610,14 +2752,14 @@ fn a_colour_attachment_write_mask_decodes_and_defaults_to_all() {
         masked.first().map(|c| c.write_mask),
         Some(ColorWriteMask::new(MTL_COLOR_WRITE_MASK_ALPHA).unwrap())
     );
-    assert_ne!(masked[0].write_mask.bits, MTL_COLOR_WRITE_MASK_ALL);
+    assert_ne!(masked[0].write_mask.bits(), MTL_COLOR_WRITE_MASK_ALL);
 
     // Same entry with the tag dropped: `all`, not `none`. This is the arm
     // a derived `Default` on a bare `u32` would have made a black
     // attachment, and every pipeline in the tree takes it.
     buf[entry] = 1;
     let plain = parse_color_attachments(&buf, buf.len(), off).expect("a well-formed table decodes");
-    assert_eq!(plain[0].write_mask.bits, MTL_COLOR_WRITE_MASK_ALL);
+    assert_eq!(plain[0].write_mask.bits(), MTL_COLOR_WRITE_MASK_ALL);
     assert_eq!(plain[0].write_mask, ColorWriteMask::default());
 }
 
@@ -2638,7 +2780,7 @@ fn a_colour_attachment_write_mask_decodes_and_defaults_to_all() {
 /// refusing is what a device that does not know what it is holding does.
 #[test]
 fn a_write_mask_outside_the_four_bits_refuses_the_pipeline() {
-    use crate::contract::endian::st32;
+    use reims_vgpu_core::endian::st32;
     let off = 16usize;
     let mut buf = vec![0u8; off + 8 + 1 + 6];
     st32(&mut buf[off..], 1);
@@ -2669,7 +2811,7 @@ fn a_write_mask_outside_the_four_bits_refuses_the_pipeline() {
     // is about the range and not about the tag being present.
     st32(&mut buf[entry + 3..], MTL_COLOR_WRITE_MASK_ALL);
     let ok = parse_color_attachments(&buf, buf.len(), off).expect("0xf is a mask Metal can hold");
-    assert_eq!(ok[0].write_mask.bits, MTL_COLOR_WRITE_MASK_ALL);
+    assert_eq!(ok[0].write_mask.bits(), MTL_COLOR_WRITE_MASK_ALL);
 }
 
 /// The measured case, from an x86/Vulkan boot in Dark appearance: a 27x27
@@ -2816,7 +2958,7 @@ fn a_slice_read_span_charges_full_planes_and_a_tight_last_row() {
 
 #[test]
 fn texture_view_simple() {
-    use crate::contract::endian::{st16, st32};
+    use reims_vgpu_core::endian::{st16, st32};
     let mut b = vec![0u8; TEXTURE_VIEW_MIN_SIMPLE];
     st32(
         &mut b[TEXTURE_VIEW_DESC_OPCODE..],
@@ -2854,7 +2996,7 @@ fn texture_view_simple() {
 
 #[test]
 fn texture_view_swizzle_form() {
-    use crate::contract::endian::{st16, st32, st64};
+    use reims_vgpu_core::endian::{st16, st32, st64};
     let mut b = vec![0u8; TEXTURE_VIEW_MIN_SWIZZLE];
     st32(
         &mut b[TEXTURE_VIEW_DESC_OPCODE..],
@@ -2881,7 +3023,7 @@ fn texture_view_swizzle_form() {
     b[TEXTURE_VIEW_DESC_SWIZZLE + 2] = 2;
     b[TEXTURE_VIEW_DESC_SWIZZLE + 3] = 5;
     let v = decode_texture_view_descriptor(&b).unwrap();
-    assert_eq!(v.view_opcode, TEXTURE_VIEW_OPCODE_SWIZZLE);
+    assert_eq!(v.form, TextureViewForm::Swizzled);
     assert_eq!(v.base_texture_ref, 4);
     assert!(v.carries_range());
     assert_eq!(v.level_base, 1);
@@ -2893,7 +3035,7 @@ fn texture_view_swizzle_form() {
 
 #[test]
 fn texture_view_ranged_form() {
-    use crate::contract::endian::{st16, st32, st64};
+    use reims_vgpu_core::endian::{st16, st32, st64};
     let mut b = vec![0u8; TEXTURE_VIEW_MIN_RANGED];
     st32(
         &mut b[TEXTURE_VIEW_DESC_OPCODE..],
@@ -2915,7 +3057,7 @@ fn texture_view_ranged_form() {
     st64(&mut b[TEXTURE_VIEW_DESC_SLICE_BASE..], 0);
     st64(&mut b[TEXTURE_VIEW_DESC_SLICE_COUNT..], 1);
     let v = decode_texture_view_descriptor(&b).unwrap();
-    assert_eq!(v.view_opcode, TEXTURE_VIEW_OPCODE_RANGED);
+    assert_eq!(v.form, TextureViewForm::Ranged);
     assert_eq!(v.level_base, 2);
     assert_eq!(v.level_count, 1);
     assert!(v.carries_range());
@@ -2956,6 +3098,7 @@ fn decodes_opcode9_buffer_texture_live_blobs() {
     assert!(d1.desc.allow_gpu_optimized_contents);
     assert!(!d1.desc.framebuffer_only);
     assert!(!d1.desc.is_drawable);
+    assert_eq!(d1.desc.write_swizzle_enabled, None);
 
     let b2 = hex_to_bytes(
         "09000000400000004c0000004b000000000000000000000000010000000000004\
@@ -2970,11 +3113,11 @@ fn decodes_opcode9_buffer_texture_live_blobs() {
 
     // A real texture-VIEW (opcode 8) is NOT a buffer texture.
     let mut view = vec![0u8; TEXTURE_VIEW_MIN_RANGED];
-    crate::contract::endian::st32(
+    reims_vgpu_core::endian::st32(
         &mut view[TEXTURE_VIEW_DESC_OPCODE..],
         TEXTURE_VIEW_OPCODE_RANGED,
     );
-    crate::contract::endian::st32(
+    reims_vgpu_core::endian::st32(
         &mut view[TEXTURE_VIEW_DESC_LEN..],
         TEXTURE_VIEW_MIN_RANGED as u32,
     );
@@ -3002,11 +3145,11 @@ fn the_type8_header_peek_is_bounded_by_the_header_it_reads() {
     // Exactly the header, declaring a 64-byte buffer-backed texture: the
     // shortest blob that carries an opcode at all.
     let mut short = vec![0u8; OP_HDR];
-    crate::contract::endian::st32(
+    reims_vgpu_core::endian::st32(
         &mut short[TEXTURE_VIEW_DESC_OPCODE..],
         TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE,
     );
-    crate::contract::endian::st32(&mut short[TEXTURE_VIEW_DESC_LEN..], BUF_TEX_MIN_LEN as u32);
+    reims_vgpu_core::endian::st32(&mut short[TEXTURE_VIEW_DESC_LEN..], BUF_TEX_MIN_LEN as u32);
     assert_eq!(
         texture_type8_header(&short),
         Some((TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE, BUF_TEX_MIN_LEN as u32)),
@@ -3030,16 +3173,16 @@ fn hex_to_bytes(s: &str) -> Vec<u8> {
 
 #[test]
 fn property_fuzz_types() {
-    for t in 0u8..16 {
+    for kind in (0u8..16).filter_map(ObjectKind::from_wire_tag) {
         let bytes = vec![0u8; 128];
-        let _ = decode_descriptor(t, &bytes);
+        let _ = decode_descriptor(kind, &bytes);
     }
 }
 
-/// A type-7 subtype **is** a `PGSerializer` opcode, and the two this module
+/// A serializer resource subtype **is** a `PGSerializer` opcode, and the two this module
 /// still spells as numbers are exactly the two nothing has driven.
 ///
-/// The type-7 object-list entry is reached by object *type* rather than off
+/// The serializer resource object-list entry is reached by object *type* rather than off
 /// the command stream, which is why its subtypes look like a private
 /// enumeration and were written as one. They are not: `0x03` is
 /// `newSamplerState`, `0x04` is `newDepthStencilState` and `0x36` is
@@ -3060,7 +3203,7 @@ fn property_fuzz_types() {
 /// number from the wrong opcode space — the same trap `0x1b` sets, where
 /// the texture-view creation and `useHeap:` share a value.
 #[test]
-fn the_undrivable_type7_subtypes_are_the_pipeline_pair_and_nothing_claims_them() {
+fn the_undrivable_serializer_resource_subtypes_are_the_pipeline_pair_and_nothing_claims_them() {
     let serializer_opcodes = |op: u32| {
         reims_vgpu_wire::manifest::MANIFEST
             .iter()
@@ -3070,9 +3213,18 @@ fn the_undrivable_type7_subtypes_are_the_pipeline_pair_and_nothing_claims_them()
 
     // The three that are derived must still be, in the serializer's space.
     for (tag, name) in [
-        (TYPE7_OBJECT_SAMPLER, "TYPE7_OBJECT_SAMPLER"),
-        (TYPE7_OBJECT_DEPTH_STENCIL, "TYPE7_OBJECT_DEPTH_STENCIL"),
-        (TYPE7_OBJECT_ICB, "TYPE7_OBJECT_ICB"),
+        (
+            SERIALIZER_RESOURCE_OBJECT_SAMPLER,
+            "SERIALIZER_RESOURCE_OBJECT_SAMPLER",
+        ),
+        (
+            SERIALIZER_RESOURCE_OBJECT_DEPTH_STENCIL,
+            "SERIALIZER_RESOURCE_OBJECT_DEPTH_STENCIL",
+        ),
+        (
+            SERIALIZER_RESOURCE_OBJECT_ICB,
+            "SERIALIZER_RESOURCE_OBJECT_ICB",
+        ),
     ] {
         assert!(
             serializer_opcodes(tag),
@@ -3085,10 +3237,13 @@ fn the_undrivable_type7_subtypes_are_the_pipeline_pair_and_nothing_claims_them()
     // derivation and must come from it rather than stay a literal.
     for (tag, name) in [
         (
-            TYPE7_OBJECT_COMPUTE_PIPELINE,
-            "TYPE7_OBJECT_COMPUTE_PIPELINE",
+            SERIALIZER_RESOURCE_OBJECT_COMPUTE_PIPELINE,
+            "SERIALIZER_RESOURCE_OBJECT_COMPUTE_PIPELINE",
         ),
-        (TYPE7_OBJECT_RENDER_PIPELINE, "TYPE7_OBJECT_RENDER_PIPELINE"),
+        (
+            SERIALIZER_RESOURCE_OBJECT_RENDER_PIPELINE,
+            "SERIALIZER_RESOURCE_OBJECT_RENDER_PIPELINE",
+        ),
     ] {
         assert!(
             !serializer_opcodes(tag),

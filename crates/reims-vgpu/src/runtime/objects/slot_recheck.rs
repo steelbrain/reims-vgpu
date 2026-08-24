@@ -45,10 +45,10 @@
 //! macos-26, where rails 11 through 15 record zero `list_miss_slot_empty` in a
 //! driven boot.
 
-use crate::model::DeviceState;
 use crate::runtime::decode::resource::{decode_list_object_entry, OBJECT_LIST_ENTRY_LEN};
 use crate::runtime::gva_mem;
 use crate::runtime::host::HostMemory;
+use crate::runtime::Device;
 
 use super::{list_entry_or_miss, ListLookup, ListMiss};
 
@@ -293,12 +293,7 @@ fn verdict_of(read: Result<(), ListMiss>) -> Verdict {
 /// Called only from the `Named` arm of the lookup — a probe misses on every task
 /// that does not own the ref, which is how it finds the one that does, and
 /// watching those would fill the ledger with the search.
-pub(super) fn note_slot_empty<M: HostMemory>(
-    state: &DeviceState,
-    host: &M,
-    task_id: u32,
-    ref_: u32,
-) {
+pub(super) fn note_slot_empty<M: HostMemory>(state: &Device, host: &M, task_id: u32, ref_: u32) {
     let now = crate::observe::elapsed_us();
     let admitted = ledger()
         .lock()
@@ -328,7 +323,7 @@ pub(super) fn note_slot_empty<M: HostMemory>(
 /// for the same answer. Emitted once per newly-watched `(task, ref)`, which a
 /// driven macos-26 boot reaches a few dozen times — the misses themselves are
 /// three times that, and repeats of a slot already watched cost nothing.
-fn note_list_population<M: HostMemory>(state: &DeviceState, host: &M, task_id: u32, ref_: u32) {
+fn note_list_population<M: HostMemory>(state: &Device, host: &M, task_id: u32, ref_: u32) {
     let Some(pop) = first_page_population(state, host, task_id) else {
         // The list's own first page did not read, which the per-slot walk would
         // have reported as `Unreadable` rather than `SlotEmpty` — so reaching
@@ -405,7 +400,7 @@ impl std::fmt::Display for Population {
 /// some other way would not settle it. The two sites count the same way because
 /// there is one count.
 pub(super) fn first_page_population<M: HostMemory>(
-    state: &DeviceState,
+    state: &Device,
     host: &M,
     task_id: u32,
 ) -> Option<Population> {
@@ -501,7 +496,7 @@ fn note_ended_detail(task_id: u32, ref_: u32, miss: ListMiss, age_us: u64) {
 /// Runs at the tail of a drain tranche, with the same `state` and host the
 /// lookup used. Returns early with the lock untouched when nothing is watched,
 /// which is every tranche on every rail that does not produce the miss.
-pub fn sweep<M: HostMemory>(state: &DeviceState, host: &M) {
+pub fn sweep<M: HostMemory>(state: &Device, host: &M) {
     let due = ledger()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -669,7 +664,11 @@ mod tests {
         // Only the older watch: `(1, 2)` was admitted during this sweep's own
         // tranche and has not yet had a later one.
         assert_eq!(
-            ledger.begin_sweep().into_iter().map(|(k, _)| k).collect::<Vec<_>>(),
+            ledger
+                .begin_sweep()
+                .into_iter()
+                .map(|(k, _)| k)
+                .collect::<Vec<_>>(),
             vec![(1, 1)]
         );
     }

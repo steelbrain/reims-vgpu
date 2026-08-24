@@ -1,13 +1,7 @@
 use super::*;
-use crate::contract::endian::{st16, st32, st64};
-use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
-/// Page-entry bits for hand-mapping a draw target. Metal-arm only, same reason
-/// as the compute-pipeline block below.
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-use crate::contract::pass_action::MTL_STORE_ACTION_STORE;
-use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+use reims_vgpu_core::endian::{st16, st32, st64};
+use reims_vgpu_paging::geometry::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+
 use crate::model::{DeviceId, PAGE_SHIFT_ARM64E};
 use crate::runtime::decode::resource::{
     compute_only_icb_layout, encode_icb_command_layout, list_object_entry_offset,
@@ -15,30 +9,15 @@ use crate::runtime::decode::resource::{
     ICB_DESC_MAX_FRAGMENT_BINDS, ICB_DESC_MAX_KERNEL_BINDS, ICB_DESC_MAX_VERTEX_BINDS,
     ICB_DESC_OPTIONS, ICB_FLAG_INHERIT_BUFFERS, ICB_LAYOUT_LEN,
     MTL_INDIRECT_CMD_CONCURRENT_DISPATCH, MTL_INDIRECT_CMD_DRAW, MTL_INDIRECT_CMD_DRAW_INDEXED,
-    OBJECT_LIST_ENTRY_LEN, OBJECT_TYPE_BUFFER, OBJECT_TYPE_TYPE7, PIPELINE_TAG_FRAGMENT_FUNC,
-    PIPELINE_TAG_VERTEX_FUNC,
-    RESOURCE_PAGE_SHIFT, TYPE7_OBJECT_ICB, TYPE7_OBJECT_RENDER_PIPELINE,
+    OBJECT_LIST_ENTRY_LEN, OBJECT_TYPE_BUFFER, OBJECT_TYPE_SERIALIZER_RESOURCE,
+    PIPELINE_TAG_FRAGMENT_FUNC, PIPELINE_TAG_VERTEX_FUNC, RESOURCE_PAGE_SHIFT,
+    SERIALIZER_RESOURCE_OBJECT_ICB, SERIALIZER_RESOURCE_OBJECT_RENDER_PIPELINE,
 };
-/// Compute-pipeline and function descriptor constants, used only by the
-/// Metal-arm execute tests below. Kept in their own gated `use` so the Vulkan arm
-/// does not carry unused imports.
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-use crate::runtime::decode::resource::{
-    OBJECT_TYPE_FUNCTION, PIPELINE_TAG_KERNEL_FUNC, TYPE7_FIRST_TLVS,
-    TYPE7_OBJECT_COMPUTE_PIPELINE,
-};
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-use crate::runtime::draw::{
-    encode_icb_execute_and_writeback, BufferBind, ColorRtRequest, DrawEncodeRequest, EncodeStatus,
-};
+use reims_vgpu_core::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+
 use crate::runtime::gva_mem;
 use crate::runtime::host::FakeHost;
-/// Readback, the draw encoder and the fixture directory. Every Metal-arm ICB
-/// test needs this same set; it was spelled inside 29 test bodies before.
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-use crate::runtime::mapping_write;
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-use std::path::PathBuf;
+
 use std::sync::Mutex;
 
 /// The ICB reason survives the hop onto the compute rail.
@@ -56,8 +35,8 @@ fn an_icb_refusal_keeps_its_slug_on_the_compute_rail() {
         IcbStatus::Missing("icb_desc_no_list_entry"),
         IcbStatus::BadDescriptor("icb_desc_wrong_type"),
         IcbStatus::Args("icb_drs_unknown_command_type"),
-        IcbStatus::MetalFailed("icb_pso_pipeline_state"),
-        IcbStatus::NoMetal("icb_frc_no_metal"),
+        IcbStatus::BackendFailed("icb_pso_pipeline_state"),
+        IcbStatus::Unsupported("icb_execute_unimplemented"),
     ] {
         assert_eq!(
             ComputeStatus::from(e).refusal(),
@@ -96,17 +75,17 @@ fn an_icb_decline_renders_its_check_and_its_class() {
     assert_eq!(line, "render_icb reason=icb_frc_index_span_zero class=args");
 }
 
-/// Process-global ICB cache is shared across tests — serialize metal ICB tests.
+/// Serialize the ICB tests that compare crate-wide observation counters.
 ///
 /// Taken with `unwrap_or_else(|e| e.into_inner())`, never a bare `unwrap`:
-/// the guard only orders access to a process-global cache, so a poisoned
-/// lock carries no unsound state. A bare `unwrap` turns the *first* failing
+/// the guard only orders test observations, so a poisoned lock carries no
+/// unsound state. A bare `unwrap` turns the *first* failing
 /// test into a cascade — when the `compute_mul3add1.mtlb` fixture went
 /// missing, 3 real failures poisoned this lock and reported as 43, burying
 /// the one root cause under 40 `PoisonError`s.
 static ICB_TEST_LOCK: Mutex<()> = Mutex::new(());
 
-fn setup_task(host: &mut FakeHost, state: &mut DeviceState) {
+fn setup_task(host: &mut FakeHost, state: &mut Device) {
     let dir_pfn = 2u32;
     let root_pfn = 3u32;
     let dir_gpa = (dir_pfn as u64) << PAGE_SHIFT_ARM64E;
@@ -148,111 +127,19 @@ fn unit_mesh_threads_draw() -> IcbRenderDraw {
     })
 }
 
-/// The shared opening of every `compute_mul3add1.mtlb` body: the encode lock,
-/// a cleared ICB cache, the kernel blob, and a task-1 device with its page
-/// tables walked. Six bodies opened with these eleven lines; what they vary
-/// starts at the ICB descriptor, so that is where the fixture stops.
-///
-/// The guard is returned rather than taken inside, because it has to outlive
-/// the body — `clear_icb_cache` and the ICB cache it clears are process-global.
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-fn mul3add1_fixture() -> (
-    std::sync::MutexGuard<'static, ()>,
-    Vec<u8>,
-    FakeHost,
-    DeviceState,
-) {
-    let guard = icb_test_guard();
-    let mtlb = read_fixture("compute_mul3add1.mtlb");
-    let (host, state) = icb_device();
-    (guard, mtlb, host, state)
-}
-
-/// Hold the encode lock for this test and clear the process-global ICB cache
-/// under it. Thirty-six bodies opened with these two statements; taking the
-/// lock without clearing, or clearing without holding it, are both bugs the
-/// pairing prevents.
+/// Hold the encode lock for this test. The backend encoder used by these tests
+/// is shared; semantic ICB state itself is device-owned.
 fn icb_test_guard() -> std::sync::MutexGuard<'static, ()> {
-    let guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    clear_icb_cache();
-    guard
+    ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// A device with task 1 defined and its page tables walked — what every body
 /// in this file needs before it can put an object anywhere.
-fn icb_device() -> (FakeHost, DeviceState) {
+fn icb_device() -> (FakeHost, Device) {
     let mut host = FakeHost::new();
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     setup_task(&mut host, &mut state);
     (host, state)
-}
-
-/// A shader blob out of `tests/fixtures`. Forty-four reads spelled out the
-/// join and then repeated the file name in the `expect`, which reported the
-/// name and swallowed the `io::Error` saying *why*; this reports both.
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-fn read_fixture(name: &str) -> Vec<u8> {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures")
-        .join(name);
-    std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
-}
-
-/// [`fill_render_command`] against the fixture every render body in this file
-/// builds: task 1, ICB object ref 9.
-///
-/// Both are constant across every caller — they are what `icb_device` and
-/// `mul3add1_fixture` set up — so they were four lines of noise in front of the
-/// `IcbRenderFill` that is the actual subject of each test.
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-fn fill_render(
-    state: &DeviceState,
-    host: &FakeHost,
-    fill: &IcbRenderFill,
-) -> Result<(), IcbStatus> {
-    fill_render_command(state, host, 1, 9, fill)
-}
-
-/// [`fill_compute_command`] against the same fixture. See [`fill_render`].
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-fn fill_compute(
-    state: &DeviceState,
-    host: &FakeHost,
-    fill: &IcbComputeFill,
-) -> Result<(), IcbStatus> {
-    fill_compute_command(state, host, 1, 9, fill)
-}
-
-/// The guest's `ExecuteCommandsInBuffer` (0xe4) over `[location, length)` of
-/// ICB object `icb_ref` — the command eight bodies build field by field on a
-/// `Default` before handing it to `ComputeSession::encode_icb`.
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-fn execute_icb_command(
-    icb_ref: u32,
-    location: u64,
-    length: u64,
-) -> crate::runtime::decode::compute::Command {
-    use crate::runtime::decode::compute::{Command, Kind};
-    Command {
-        kind: Kind::ExecuteCommandsInBuffer,
-        indirect_command_buffer_ref: icb_ref,
-        indirect_command_range_location: location,
-        indirect_command_range_length: length,
-        ..Default::default()
-    }
-}
-
-/// The four little-endian `u32`s at task 1's `gva`, which is what every
-/// compute-writeback body in this file checks its kernel by. Panics rather than
-/// returning: a read that fails here is the fixture broken, not the assertion.
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-fn read_u32x4(host: &FakeHost, state: &DeviceState, gva: u64) -> Vec<u32> {
-    let mut back = [0u8; 16];
-    gva_mem::read_task_gva(host, &state.tasks[1], gva, &mut back, PAGE_SHIFT_ARM64E)
-        .expect("readback");
-    back.chunks(4)
-        .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
-        .collect()
 }
 
 /// Three UInt16 indices out of buffer ref 12 at its base, one instance, no base
@@ -338,7 +225,7 @@ fn make_icb_desc_bytes_tg(
 ) -> Vec<u8> {
     use crate::runtime::decode::resource::{compute_icb_layout, ICB_DESC_MAX_KERNEL_TG_BINDS};
     let mut b = vec![0u8; ICB_DESC_LEN];
-    st32(&mut b[0..], TYPE7_OBJECT_ICB);
+    st32(&mut b[0..], SERIALIZER_RESOURCE_OBJECT_ICB);
     st32(&mut b[4..], ICB_DESC_LEN as u32);
     st32(&mut b[8..], MTL_INDIRECT_CMD_CONCURRENT_DISPATCH);
     b[ICB_DESC_MAX_VERTEX_BINDS] = 0;
@@ -361,132 +248,7 @@ fn make_icb_desc_bytes_tg(
     b
 }
 
-/// Render ICB create body (Draw and/or DrawIndexed commandTypes).
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-fn make_render_icb_desc_bytes(
-    max_cmds: u32,
-    max_vertex: u16,
-    max_fragment: u16,
-    command_types: u32,
-) -> Vec<u8> {
-    make_render_icb_desc_bytes_ex(max_cmds, max_vertex, max_fragment, 0, 0, command_types, 0)
-}
-
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-fn make_render_icb_desc_bytes_flags(
-    max_cmds: u32,
-    max_vertex: u16,
-    max_fragment: u16,
-    command_types: u32,
-    flags: u16,
-) -> Vec<u8> {
-    make_render_icb_desc_bytes_ex(
-        max_cmds,
-        max_vertex,
-        max_fragment,
-        0,
-        0,
-        command_types,
-        flags,
-    )
-}
-
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-fn make_render_icb_desc_bytes_ex(
-    max_cmds: u32,
-    max_vertex: u16,
-    max_fragment: u16,
-    max_object: u16,
-    max_mesh: u16,
-    command_types: u32,
-    flags: u16,
-) -> Vec<u8> {
-    use crate::runtime::decode::resource::{
-        render_icb_layout_ex, ICB_DESC_MAX_MESH_BINDS, ICB_DESC_MAX_OBJECT_BINDS,
-        ICB_FLAG_INHERIT_PIPELINE_STATE,
-    };
-    let mut b = vec![0u8; ICB_DESC_LEN];
-    st32(&mut b[0..], TYPE7_OBJECT_ICB);
-    st32(&mut b[4..], ICB_DESC_LEN as u32);
-    st32(&mut b[8..], command_types);
-    b[ICB_DESC_MAX_VERTEX_BINDS] = max_vertex as u8;
-    b[ICB_DESC_MAX_FRAGMENT_BINDS] = max_fragment as u8;
-    b[ICB_DESC_MAX_KERNEL_BINDS] = 0;
-    b[ICB_DESC_MAX_OBJECT_BINDS] = max_object as u8;
-    b[ICB_DESC_MAX_MESH_BINDS] = max_mesh as u8;
-    // See `make_icb_desc_bytes_tg`: off the serializer's default word.
-    st16(
-        &mut b[ICB_DESC_FLAGS..],
-        crate::runtime::decode::resource::ICB_FLAGS_DEFAULT | flags,
-    );
-    let layout = render_icb_layout_ex(
-        max_vertex,
-        max_fragment,
-        max_object,
-        max_mesh,
-        0,
-        command_types,
-    );
-    b[ICB_DESC_LAYOUT..ICB_DESC_LAYOUT + ICB_LAYOUT_LEN]
-        .copy_from_slice(&encode_icb_command_layout(&layout));
-    st32(&mut b[ICB_DESC_MAX_COMMAND_COUNT..], max_cmds);
-    st32(&mut b[ICB_DESC_OPTIONS..], 0);
-    let _ = ICB_FLAG_INHERIT_PIPELINE_STATE;
-    b
-}
-
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-fn load_oracle_mtlb() -> (Vec<u8>, Vec<u8>) {
-    let vtx = read_fixture("oracle_draw_vtx.mtlb");
-    let frag = read_fixture("oracle_draw_frag.mtlb");
-    (vtx, frag)
-}
-
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-fn load_stagein_mtlb() -> (Vec<u8>, Vec<u8>) {
-    let vtx = read_fixture("render_stagein_vtx.mtlb");
-    let frag = read_fixture("render_stagein_frag.mtlb");
-    (vtx, frag)
-}
-
-/// Minimal compute pipeline type-7 descriptor: one first-TLV entry naming the
-/// kernel function ref. Eight call sites built these same seven lines. Gated
-/// like its constants and all eight callers, which are Metal-arm execute tests.
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-fn make_compute_pipeline_desc(kernel_ref: u32) -> Vec<u8> {
-    let mut pdesc = vec![0u8; 32];
-    st32(&mut pdesc[0..], TYPE7_OBJECT_COMPUTE_PIPELINE);
-    st32(&mut pdesc[4..], 32);
-    pdesc[TYPE7_FIRST_TLVS] = 1;
-    pdesc[TYPE7_FIRST_TLVS + 1] = PIPELINE_TAG_KERNEL_FUNC;
-    pdesc[TYPE7_FIRST_TLVS + 2] = 4;
-    st32(&mut pdesc[TYPE7_FIRST_TLVS + 3..], kernel_ref);
-    pdesc
-}
-
-/// Minimal render pipeline type-7 descriptor: a first-TLV block carrying only
-/// the vertex and fragment function refs — no vertex-input and no colour
-/// attachment, unlike [`make_stagein_render_pipeline_desc`]. Six call sites
-/// built these same twelve lines. Gated like its constants and all six callers,
-/// which are Metal-arm execute tests.
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-fn make_render_pipeline_desc(vert_ref: u32, frag_ref: u32) -> Vec<u8> {
-    let mut pdesc = vec![0u8; 16 + 1 + 6 + 6];
-    let blen = pdesc.len() as u32;
-    st32(&mut pdesc[0..], TYPE7_OBJECT_RENDER_PIPELINE);
-    st32(&mut pdesc[4..], blen);
-    st32(&mut pdesc[8..], 6);
-    pdesc[TYPE7_FIRST_TLVS] = 2;
-    pdesc[TYPE7_FIRST_TLVS + 1] = PIPELINE_TAG_VERTEX_FUNC;
-    pdesc[TYPE7_FIRST_TLVS + 2] = 4;
-    st32(&mut pdesc[TYPE7_FIRST_TLVS + 3..], vert_ref);
-    pdesc[TYPE7_FIRST_TLVS + 7] = PIPELINE_TAG_FRAGMENT_FUNC;
-    pdesc[TYPE7_FIRST_TLVS + 8] = 4;
-    st32(&mut pdesc[TYPE7_FIRST_TLVS + 9..], frag_ref);
-    pdesc
-}
-
-/// Type-7 render pipeline with vertex-input block: Float4 attr0 @ buffer0 stride 16.
+/// Serializer resource render pipeline with vertex-input block: Float4 attr0 @ buffer0 stride 16.
 ///
 /// Layout matches `parse_vertex_block` / color-attachment section (offset from
 /// header end via tag `0x08`).
@@ -511,7 +273,7 @@ fn make_stagein_render_pipeline_desc(vert_ref: u32, frag_ref: u32) -> Vec<u8> {
     let color_off_from_header = (color_abs - 16) as u32; // 86
 
     let mut b = vec![0u8; 117];
-    st32(&mut b[0..], TYPE7_OBJECT_RENDER_PIPELINE);
+    st32(&mut b[0..], SERIALIZER_RESOURCE_OBJECT_RENDER_PIPELINE);
     st32(&mut b[4..], 117);
     st32(&mut b[8..], 6); // object id
                           // First TLVs
@@ -577,66 +339,6 @@ fn make_stagein_render_pipeline_desc(vert_ref: u32, frag_ref: u32) -> Vec<u8> {
     b
 }
 
-/// Compact type-7 mesh pipeline (host SPI shape): tag `0x14` section offset
-/// + optional object `0x01` + mesh `0x02` + fragment `0x03`.
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-fn make_mesh_render_pipeline_desc(
-    object_ref: Option<u32>,
-    mesh_ref: u32,
-    frag_ref: u32,
-) -> Vec<u8> {
-    use crate::runtime::decode::resource::{
-        PIPELINE_TAG_MESH_FRAGMENT_FUNC, PIPELINE_TAG_MESH_FUNC, PIPELINE_TAG_MESH_SECTION_OFFSET,
-        PIPELINE_TAG_OBJECT_FUNC, TYPE7_OBJECT_RENDER_PIPELINE,
-    };
-    let mut fields = Vec::new();
-    // Section offset filled after we know field payload size (matches SPI:
-    // offset from header end to trailing color/rest region).
-    fields.push((PIPELINE_TAG_MESH_SECTION_OFFSET, 0u32));
-    if let Some(oref) = object_ref {
-        fields.push((PIPELINE_TAG_OBJECT_FUNC, oref));
-    }
-    fields.push((PIPELINE_TAG_MESH_FUNC, mesh_ref));
-    fields.push((PIPELINE_TAG_MESH_FRAGMENT_FUNC, frag_ref));
-    let n = fields.len();
-    // header 16 + fieldCount 1 + n * (tag+len+u32=6)
-    let first_tlv_len = 1 + n * 6;
-    let mut b = vec![0u8; 16 + first_tlv_len];
-    let blen = b.len() as u32;
-    st32(&mut b[0..], TYPE7_OBJECT_RENDER_PIPELINE);
-    st32(&mut b[4..], blen);
-    st32(&mut b[8..], 6);
-    b[16] = n as u8;
-    // Mesh section offset = first-subrecord size (no color block in fixture).
-    fields[0].1 = first_tlv_len as u32;
-    let mut p = 17;
-    for (tag, val) in fields {
-        b[p] = tag;
-        b[p + 1] = 4;
-        st32(&mut b[p + 2..], val);
-        p += 6;
-    }
-    b
-}
-
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-fn put_type1_buffer(
-    host: &mut FakeHost,
-    state: &DeviceState,
-    obj_ref: u32,
-    handle: u32,
-    bytes: &[u8],
-) {
-    let gva = (handle as u64) << RESOURCE_PAGE_SHIFT;
-    gva_mem::write_task_gva_arm64e(host, &state.tasks[1], gva, bytes);
-    let mut bdesc = vec![0u8; 16];
-    st64(&mut bdesc[0..], bytes.len() as u64);
-    st64(&mut bdesc[8..], handle as u64);
-    // Descriptors must sit past the object-list region (32×12 = 0x180).
-    let bdesc_gva = 0x200u64 + (obj_ref as u64) * 0x20;
-    put_object(host, state, obj_ref, OBJECT_TYPE_BUFFER, bdesc_gva, &bdesc);
-}
-
 /// Write `bytes` at `gva` and publish it as object `ref_` in the task's object
 /// list — the pair every fixture here performs together.
 ///
@@ -645,211 +347,12 @@ fn put_type1_buffer(
 /// call sites and asserted equal to the slice at every one of them across the
 /// whole suite. A test that needs the two to disagree — a short-descriptor
 /// refusal — calls [`put_list_entry`] directly, which still takes both.
-fn put_object(
-    host: &mut FakeHost,
-    state: &DeviceState,
-    ref_: u32,
-    otype: u8,
-    gva: u64,
-    bytes: &[u8],
-) {
+fn put_object(host: &mut FakeHost, state: &Device, ref_: u32, otype: u8, gva: u64, bytes: &[u8]) {
     gva_mem::write_task_gva_arm64e(host, &state.tasks[1], gva, bytes);
     put_list_entry(host, state, ref_, otype, bytes.len() as u32, gva);
 }
 
-/// Map a 4x4 BGRA8 render target for a draw to land in, one guest page backed
-/// at `pfn`, and return its mapping id.
-///
-/// Every draw test in this file needs exactly this surface and differs only in
-/// which page it takes, so `pfn` is the one parameter — distinct per test so
-/// two fixtures never share a guest page. The mapping is marked internal and
-/// mapped by hand because `map_surface` alone leaves it without page entries,
-/// which is the state a real `MapMemory2` would have already left behind.
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-/// Read back [`map_draw_target`]'s 4x4 surface and assert every texel is the
-/// colour the ICB test shaders write: `float4(0.4, 0.267, 0.133, 1)`, which is
-/// BGRA 34, 68, 102, 255.
-///
-/// The tolerance is +/-2 per channel, for float-to-unorm rounding across
-/// different Metal devices. `what` names the command shape under test so a
-/// failure says which of the eighteen callers produced the wrong pixels.
-fn assert_target_is_shader_solid(
-    state: &mut DeviceState,
-    host: &mut FakeHost,
-    mapping_id: u32,
-    what: &str,
-) {
-    assert_target_texels(state, host, mapping_id, [34, 68, 102, 255], 2, what);
-}
-
-/// Same readback for the stage-in shaders, whose blue channel carries the
-/// surface id so a test can tell which surface the stage-in attributes came
-/// from. Tolerance is +/-1 rather than +/-2 because these write exact byte
-/// values rather than a float4 that has to round.
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-fn assert_stagein_solid(
-    state: &mut DeviceState,
-    host: &mut FakeHost,
-    mapping_id: u32,
-    sid: u8,
-    what: &str,
-) {
-    assert_target_texels(
-        state,
-        host,
-        mapping_id,
-        [0x22, 0x44, 0x60 + sid, 0xff],
-        1,
-        what,
-    );
-}
-
-/// Read back [`map_draw_target`]'s 4x4 surface and assert every texel is `want`
-/// within `tol` per channel. `what` names the command shape under test so a
-/// failure says which of the twenty-nine callers produced the wrong pixels.
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-fn assert_target_texels(
-    state: &mut DeviceState,
-    host: &mut FakeHost,
-    mapping_id: u32,
-    want: [u8; 4],
-    tol: i32,
-    what: &str,
-) {
-    let mut back = vec![0u8; 4 * 4 * 4];
-    assert!(mapping_write::read_rect_raw(
-        state,
-        host,
-        mapping_id,
-        mapping_write::Rect {
-            origin_x: 0,
-            origin_y: 0,
-            width: 4,
-            height: 4
-        },
-        &mut back,
-        16
-    ));
-    let near = |g: u8, w: u8| (g as i32 - w as i32).abs() <= tol;
-    for (p, px) in back.chunks_exact(4).enumerate() {
-        assert!(
-            near(px[0], want[0])
-                && near(px[1], want[1])
-                && near(px[2], want[2])
-                && near(px[3], want[3]),
-            "pixel {p} = {px:02x?}; want ~{want:02x?} ({what})"
-        );
-    }
-}
-
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-/// The one-triangle draw every ICB pixel test issues into [`map_draw_target`]'s
-/// surface: pipeline 6, three vertices, one instance, triangles, over a
-/// zero-filled 4x4 BGRA8 seed.
-///
-/// A test that needs a different shape spells its own literal; this is only the
-/// two dozen that wanted exactly this one.
-fn draw_request(mapping_id: u32) -> DrawEncodeRequest {
-    DrawEncodeRequest {
-        task_id: 1,
-        pipeline_ref: 6,
-        vertex_count: 3,
-        instance_count: 1,
-        primitive_type: 3,
-        colors: vec![ColorRtRequest {
-            slot: 0,
-            mapping_id,
-            width: 4,
-            height: 4,
-            format: crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM,
-            store_action: MTL_STORE_ACTION_STORE,
-            target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
-            ..Default::default()
-        }],
-        ..Default::default()
-    }
-}
-
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-/// Publish an MTLB `blob` at `blob_page`'s GVA page and describe it as function
-/// object `ref_`, whose 32-byte descriptor lives at `desc_gva` and carries
-/// `(blob gva, blob len)`. Fifty-six test bodies spelled these six lines.
-///
-/// All four values are the caller's because they are fixture identities that
-/// must not collide inside one test: two functions in the same pipeline take
-/// different pages, different refs and different descriptor addresses.
-fn put_function_object(
-    host: &mut FakeHost,
-    state: &DeviceState,
-    ref_: u32,
-    desc_gva: u64,
-    blob_page: u64,
-    blob: &[u8],
-) {
-    let blob_gva = blob_page << RESOURCE_PAGE_SHIFT;
-    gva_mem::write_task_gva_arm64e(host, &state.tasks[1], blob_gva, blob);
-    let mut fdesc = vec![0u8; 32];
-    st64(&mut fdesc[0..], blob_gva);
-    st32(&mut fdesc[8..], blob.len() as u32);
-    put_object(host, state, ref_, OBJECT_TYPE_FUNCTION, desc_gva, &fdesc);
-}
-
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-/// Publish an encoded ICB command-memory `slot` at `cmd_handle`'s page, wrap it
-/// in buffer object 10, and associate that buffer with ICB object 9 — the
-/// sequence `execute` performs before any fill, spelled in thirteen test bodies
-/// before this.
-///
-/// `cmd_handle` is the caller's because it is the slot's GVA page index and must
-/// not collide with the other fixtures a given test has already placed; refs 9
-/// and 10 and descriptor GVA 0x1a0 are this file's fixture identities and are
-/// the same at every one of those sites.
-fn associate_icb_command_memory(
-    host: &mut FakeHost,
-    state: &DeviceState,
-    cmd_handle: u32,
-    slot: &[u8],
-) {
-    let cmd_gva = u64::from(cmd_handle) << RESOURCE_PAGE_SHIFT;
-    gva_mem::write_task_gva_arm64e(host, &state.tasks[1], cmd_gva, slot);
-    let mut cmd_bdesc = vec![0u8; 16];
-    st64(&mut cmd_bdesc[0..], slot.len() as u64);
-    st64(&mut cmd_bdesc[8..], u64::from(cmd_handle));
-    put_object(host, state, 10, OBJECT_TYPE_BUFFER, 0x1a0, &cmd_bdesc);
-    // `&*host`, not `host`: this takes `&M` while `put_object` above needs
-    // `&mut FakeHost`, and the reborrow is what lets one binding serve both.
-    //
-    // Straight to the association rather than through `0x1d1`. That record is a
-    // query this device refuses — see `apply_icb_host_resource_info` — so
-    // routing every ICB fixture through it would have made this helper the one
-    // thing keeping the old misreading alive.
-    associate_icb_backing_buffer_ref(state, &*host, 1, 9, 10)
-        .expect("associate ICB command memory");
-}
-
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-fn map_draw_target(host: &mut FakeHost, state: &mut DeviceState, pfn: u32) -> u32 {
-    let mapping_id = 9u32;
-    host.map_range((pfn as u64) << PAGE_SHIFT_ARM64E, 0x4000, 0);
-    state.map_surface(mapping_id);
-    {
-        let m = state.mappings.get_mut(&mapping_id).unwrap();
-        m.mapped = true;
-        m.mapping_internal = 1;
-        m.page_entries = vec![(pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
-    }
-    assert!(state.set_mapping_geom(mapping_id, 4, 4, MTL_FORMAT_BGRA8_UNORM));
-    mapping_id
-}
-
-fn put_list_entry(
-    host: &mut FakeHost,
-    state: &DeviceState,
-    ref_: u32,
-    otype: u8,
-    len: u32,
-    gva: u64,
-) {
+fn put_list_entry(host: &mut FakeHost, state: &Device, ref_: u32, otype: u8, len: u32, gva: u64) {
     let off = list_object_entry_offset(ref_, 32).unwrap();
     let mut le = [0u8; OBJECT_LIST_ENTRY_LEN];
     let packed = (otype as u32) | (len << 8);
@@ -864,7 +367,14 @@ fn load_icb_from_object_list() {
     let (mut host, state) = icb_device();
     let desc = make_icb_desc_bytes(8, 4, true);
     let gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, gva, &desc);
+    put_object(
+        &mut host,
+        &state,
+        9,
+        OBJECT_TYPE_SERIALIZER_RESOURCE,
+        gva,
+        &desc,
+    );
     let icb = load_icb_descriptor(&state, &host, 1, 9).unwrap();
     assert_eq!(icb.max_command_count, 8);
     assert_eq!(icb.max_kernel_buffer_bind_count, 4);
@@ -875,11 +385,8 @@ fn load_icb_from_object_list() {
 /// A flag this device does not apply is counted when the guest asks for it, and
 /// not counted when the guest leaves it alone.
 ///
-/// The load path is where this has to be checked rather than at the decoder:
-/// `load_icb_descriptor` is what both backends call, and it is the only place
-/// that sees a decoded descriptor on the Vulkan arm at all. A counter sited in
-/// `materialize_metal_icb` would read structurally zero there for a reason that
-/// has nothing to do with what the guest asked for.
+/// The load path is where this has to be checked: it observes the descriptor
+/// independently of whether an executor is available.
 #[test]
 fn a_flag_this_device_does_not_apply_is_counted_when_the_guest_asks_for_it() {
     use crate::runtime::decode::resource::{
@@ -900,7 +407,14 @@ fn a_flag_this_device_does_not_apply_is_counted_when_the_guest_asks_for_it() {
         let (mut host, state) = icb_device();
         let desc = make_icb_desc_bytes(8, 4, true);
         let gva = 1u64 << RESOURCE_PAGE_SHIFT;
-        put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, gva, &desc);
+        put_object(
+            &mut host,
+            &state,
+            9,
+            OBJECT_TYPE_SERIALIZER_RESOURCE,
+            gva,
+            &desc,
+        );
         load_icb_descriptor(&state, &host, 1, 9).unwrap();
     }
     for (route, was) in routes.iter().zip(&before) {
@@ -932,10 +446,17 @@ fn a_flag_this_device_does_not_apply_is_counted_when_the_guest_asks_for_it() {
         // The helper ORs the serializer's default word in, so a flag the guest
         // *clears* has to be cleared after the fact.
         let mut desc = make_icb_desc_bytes_tg(8, 4, 0, set);
-        let word = crate::contract::endian::ld16(&desc[ICB_DESC_FLAGS..]);
+        let word = reims_vgpu_core::endian::ld16(&desc[ICB_DESC_FLAGS..]);
         st16(&mut desc[ICB_DESC_FLAGS..], word & !clear);
         let gva = 1u64 << RESOURCE_PAGE_SHIFT;
-        put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, gva, &desc);
+        put_object(
+            &mut host,
+            &state,
+            9,
+            OBJECT_TYPE_SERIALIZER_RESOURCE,
+            gva,
+            &desc,
+        );
         let before_route = store_route_count(route);
         let before_other = store_route_count(other);
         load_icb_descriptor(&state, &host, 1, 9).unwrap();
@@ -950,109 +471,6 @@ fn a_flag_this_device_does_not_apply_is_counted_when_the_guest_asks_for_it() {
             "{other} fired for a flag it does not name"
         );
     }
-}
-
-#[test]
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-fn materialize_and_execute_empty_range() {
-    use crate::backend::metal::raw_metal::execute_commands_in_buffer;
-    use crate::backend::metal::runtime::{system_device, thread_queue};
-    use metal::MTLDispatchType;
-
-    let _guard = icb_test_guard();
-    let (mut host, state) = icb_device();
-    let desc = make_icb_desc_bytes(8, 4, true);
-    let gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, gva, &desc);
-    let (d, icb) = resolve_metal_icb(&state, &host, 1, 9).expect("materialize");
-    assert_eq!(d.max_command_count, 8);
-    assert_eq!(icb.size(), 8);
-
-    let device = system_device().unwrap();
-    let queue = thread_queue(device);
-    let cb = queue.new_command_buffer().to_owned();
-    let enc = cb.compute_command_encoder_with_dispatch_type(MTLDispatchType::Serial);
-    execute_commands_in_buffer(enc, icb.as_ref(), 0, 0);
-    enc.end_encoding();
-    cb.commit();
-    cb.wait_until_completed();
-}
-
-#[test]
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-fn fill_and_execute_mul3add1_writeback() {
-    use crate::runtime::compute_session::ComputeSession;
-
-    let (_guard, mtlb, mut host, mut state) = mul3add1_fixture();
-
-    // ICB object ref 9: 1 command, maxKernel=1, no inherit (explicit fills).
-    let icb_desc = make_icb_desc_bytes(1, 1, false);
-    let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
-
-    // Function + pipeline + data buffer (mul3add1).
-    put_function_object(&mut host, &state, 5, 0x100, 2, &mtlb);
-
-    let pdesc = make_compute_pipeline_desc(5);
-    let pdesc_gva = 0x140u64;
-    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, pdesc_gva, &pdesc);
-
-    let data = [1u32, 2, 3, 4];
-    let data_bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
-    let buf_gva = 3u64 << RESOURCE_PAGE_SHIFT;
-    gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], buf_gva, &data_bytes);
-    let mut bdesc = vec![0u8; 16];
-    st64(&mut bdesc[0..], 16);
-    st32(&mut bdesc[8..], 3);
-    let bdesc_gva = 0x180u64;
-    put_object(&mut host, &state, 7, OBJECT_TYPE_BUFFER, bdesc_gva, &bdesc);
-
-    // Host fill of command slot 0 (no stream fill opcode yet).
-    fill_compute(
-        &state,
-        &host,
-        &IcbComputeFill {
-            command_index: 0,
-            pipeline_ref: 6,
-            buffers: vec![kernel_bind(0, 7)],
-            threadgroup_memory: vec![],
-            barrier: false,
-            dispatch: unit_grid_dispatch(4, 1, 1),
-        },
-    )
-    .expect("fill");
-
-    // Cache hit on re-resolve (same size / command count).
-    let (d_a, icb_a) = resolve_metal_icb(&state, &host, 1, 9).unwrap();
-    let (d_b, icb_b) = resolve_metal_icb(&state, &host, 1, 9).unwrap();
-    assert_eq!(d_a.max_command_count, d_b.max_command_count);
-    assert_eq!(icb_a.size(), icb_b.size());
-    assert_eq!(icb_a.size(), 1);
-
-    // Product execute 0xe4 range [0,1] on a compute session + writeback.
-    let mut session = ComputeSession::open(0).expect("session");
-    let cmd = execute_icb_command(9, 0, 1);
-    assert_eq!(
-        session.encode_icb(
-            &mut state,
-            &mut host,
-            1,
-            &cmd,
-            &crate::runtime::compute_exec::ComputeAccum::default()
-        ),
-        crate::runtime::compute_exec::ComputeStatus::Ok
-    );
-    assert_eq!(
-        session.finish(&mut host, &mut state, 1),
-        crate::runtime::compute_exec::ComputeStatus::Ok
-    );
-
-    let out = read_u32x4(&host, &state, buf_gva);
-    assert_eq!(
-        out,
-        vec![4, 7, 10, 13],
-        "ICB fill+execute mul3add1 writeback"
-    );
 }
 
 #[test]
@@ -1276,192 +694,6 @@ fn decode_encode_draw_patches_slot_roundtrip() {
     }
 }
 
-/// Pixel-level ICB DrawPatches oracle: triangle patch + constant tess
-/// factors 1.0 → solid BGRA fill (full-screen control points).
-#[test]
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-fn fill_render_draw_patches_tessellation_oracle() {
-    use crate::runtime::decode::resource::MTL_INDIRECT_CMD_DRAW_PATCHES;
-
-    let _guard = icb_test_guard();
-
-    let vert_mtlb = read_fixture("icb_tess_vtx.metallib");
-    let frag_mtlb = read_fixture("icb_tess_frag.metallib");
-
-    let (mut host, mut state) = icb_device();
-
-    let icb_desc = make_render_icb_desc_bytes(1, 1, 0, MTL_INDIRECT_CMD_DRAW_PATCHES);
-    let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
-
-    put_function_object(&mut host, &state, 2, 0x200, 2, &vert_mtlb);
-
-    put_function_object(&mut host, &state, 3, 0x220, 3, &frag_mtlb);
-
-    // Vertex-input Float4 @ buffer0 stride 16 (step defaults to PerPatchControlPoint).
-    let pdesc = make_stagein_render_pipeline_desc(2, 3);
-    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x240, &pdesc);
-
-    // Full-screen clip-space triangle as 3 control points.
-    let tri: [[f32; 4]; 3] = [
-        [-1.0, -1.0, 0.0, 1.0],
-        [3.0, -1.0, 0.0, 1.0],
-        [-1.0, 3.0, 0.0, 1.0],
-    ];
-    let cp_bytes: Vec<u8> = tri
-        .iter()
-        .flat_map(|v| v.iter().flat_map(|f| f.to_le_bytes()))
-        .collect();
-    put_type1_buffer(&mut host, &state, 11, 4, &cp_bytes);
-
-    // MTLTriangleTessellationFactorsHalf: edge[3] + inside, half 1.0 = 0x3c00.
-    let tess_bytes: [u8; 8] = [
-        0x00, 0x3c, // edge0
-        0x00, 0x3c, // edge1
-        0x00, 0x3c, // edge2
-        0x00, 0x3c, // inside
-    ];
-    put_type1_buffer(&mut host, &state, 12, 5, &tess_bytes);
-
-    fill_render(
-        &state,
-        &host,
-        &IcbRenderFill {
-            command_index: 0,
-            pipeline_ref: 6,
-            buffers: vec![render_bind(0, 11, false)],
-            object_threadgroup_memory: vec![],
-            draw: IcbRenderDraw::Patches {
-                number_of_patch_control_points: 3,
-                patch_start: 0,
-                patch_count: 1,
-                patch_index_buffer_ref: 0, // null — sequential control points
-                patch_index_buffer_offset: 0,
-                patch_index_wire_va: 0,
-                instance_count: 1,
-                base_instance: 0,
-                tessellation_factor: IcbTessellationFactor {
-                    buffer_ref: 12,
-                    offset: 0,
-                    wire_va: 0,
-                    instance_stride: 0,
-                },
-            },
-        },
-    )
-    .expect("fill DrawPatches tessellation");
-
-    let mapping_id = map_draw_target(&mut host, &mut state, 0x38);
-
-    let req = draw_request(mapping_id);
-    assert_eq!(
-        encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
-        EncodeStatus::Ok,
-        "DrawPatches tessellation ICB execute"
-    );
-
-    assert_target_is_shader_solid(
-        &mut state,
-        &mut host,
-        mapping_id,
-        "DrawPatches tessellation",
-    );
-}
-
-/// Pixel-level ICB DrawIndexedPatches: dummy control point at index 0,
-/// real triangle at indices [1,2,3] → same solid BGRA as DrawPatches.
-#[test]
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-fn fill_render_draw_indexed_patches_tessellation_oracle() {
-    use crate::runtime::decode::resource::MTL_INDIRECT_CMD_DRAW_INDEXED_PATCHES;
-
-    let _guard = icb_test_guard();
-
-    let vert_mtlb = read_fixture("icb_tess_vtx.metallib");
-    let frag_mtlb = read_fixture("icb_tess_frag.metallib");
-
-    let (mut host, mut state) = icb_device();
-
-    let icb_desc = make_render_icb_desc_bytes(1, 1, 0, MTL_INDIRECT_CMD_DRAW_INDEXED_PATCHES);
-    let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
-
-    put_function_object(&mut host, &state, 2, 0x200, 2, &vert_mtlb);
-
-    put_function_object(&mut host, &state, 3, 0x220, 3, &frag_mtlb);
-
-    let pdesc = make_stagein_render_pipeline_desc(2, 3);
-    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x240, &pdesc);
-
-    // Control points: dummy at 0, real full-screen triangle at 1,2,3.
-    let cps: [[f32; 4]; 4] = [
-        [0.0, 0.0, 0.0, 1.0],
-        [-1.0, -1.0, 0.0, 1.0],
-        [3.0, -1.0, 0.0, 1.0],
-        [-1.0, 3.0, 0.0, 1.0],
-    ];
-    let cp_bytes: Vec<u8> = cps
-        .iter()
-        .flat_map(|v| v.iter().flat_map(|f| f.to_le_bytes()))
-        .collect();
-    put_type1_buffer(&mut host, &state, 11, 4, &cp_bytes);
-
-    // UInt16 control-point indices [1,2,3].
-    let indices: [u16; 3] = [1, 2, 3];
-    let index_bytes: Vec<u8> = indices.iter().flat_map(|v| v.to_le_bytes()).collect();
-    put_type1_buffer(&mut host, &state, 13, 5, &index_bytes);
-
-    let tess_bytes: [u8; 8] = [0x00, 0x3c, 0x00, 0x3c, 0x00, 0x3c, 0x00, 0x3c];
-    put_type1_buffer(&mut host, &state, 12, 6, &tess_bytes);
-
-    fill_render(
-        &state,
-        &host,
-        &IcbRenderFill {
-            command_index: 0,
-            pipeline_ref: 6,
-            buffers: vec![render_bind(0, 11, false)],
-            object_threadgroup_memory: vec![],
-            draw: IcbRenderDraw::IndexedPatches {
-                number_of_patch_control_points: 3,
-                patch_start: 0,
-                patch_count: 1,
-                patch_index_buffer_ref: 0,
-                patch_index_buffer_offset: 0,
-                patch_index_wire_va: 0,
-                control_point_index_buffer_ref: 13,
-                control_point_index_buffer_offset: 0,
-                control_point_index_wire_va: 0,
-                instance_count: 1,
-                base_instance: 0,
-                tessellation_factor: IcbTessellationFactor {
-                    buffer_ref: 12,
-                    offset: 0,
-                    wire_va: 0,
-                    instance_stride: 0,
-                },
-            },
-        },
-    )
-    .expect("fill DrawIndexedPatches tessellation");
-
-    let mapping_id = map_draw_target(&mut host, &mut state, 0x39);
-
-    let req = draw_request(mapping_id);
-    assert_eq!(
-        encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
-        EncodeStatus::Ok,
-        "DrawIndexedPatches tessellation ICB execute"
-    );
-
-    assert_target_is_shader_solid(
-        &mut state,
-        &mut host,
-        mapping_id,
-        "DrawIndexedPatches tessellation",
-    );
-}
-
 /// Unknown wire command types still fail closed.
 #[test]
 fn unknown_icb_command_types_fail_closed() {
@@ -1477,6 +709,142 @@ fn unknown_icb_command_types_fail_closed() {
         crate::observe::Decline::slug(&err),
         "icb_drs_unknown_command_type"
     );
+}
+
+#[test]
+fn an_inherited_render_pipeline_needs_no_per_command_pipeline_ref() {
+    let layout = render_icb_layout(0, 0, MTL_INDIRECT_CMD_DRAW);
+    let mut slot = vec![0u8; layout.command_size as usize];
+    st32(
+        &mut slot[layout.command_type_offset as usize..],
+        ICB_CMD_TYPE_DRAW,
+    );
+    let args = layout.command_arguments_offset as usize;
+    st16(&mut slot[args..], 3);
+    st64(&mut slot[args + 0xa..], 3);
+    st64(&mut slot[args + 0x12..], 1);
+
+    let strict = decode_render_command_slot(&layout, &slot, 0, 0).unwrap_err();
+    assert_eq!(
+        crate::observe::Decline::slug(&strict),
+        "icb_drs_pipeline_ref_zero"
+    );
+    let inherited = decode_render_command_slot_with_inheritance(
+        &layout,
+        &slot,
+        0,
+        0,
+        IcbInheritance {
+            pipeline_state: true,
+            buffers: false,
+        },
+    )
+    .expect("an inherited pipeline makes the slot complete")
+    .expect("the draw slot is populated");
+    assert_eq!(inherited.pipeline_ref, 0);
+
+    st32(&mut slot[layout.pipeline_state_offset as usize..], 7);
+    let conflicting = decode_render_command_slot_with_inheritance(
+        &layout,
+        &slot,
+        0,
+        0,
+        IcbInheritance {
+            pipeline_state: true,
+            buffers: false,
+        },
+    )
+    .unwrap_err();
+    assert_eq!(
+        crate::observe::Decline::slug(&conflicting),
+        "icb_drs_inherited_pipeline_ref_nonzero"
+    );
+}
+
+#[test]
+fn inherited_render_buffers_are_absent_from_the_command_fill() {
+    let layout = render_icb_layout(1, 0, MTL_INDIRECT_CMD_DRAW);
+    let slot = encode_render_command_slot(
+        &layout,
+        &IcbRenderFill {
+            command_index: 0,
+            pipeline_ref: 0,
+            buffers: vec![render_bind(0, 999, false)],
+            object_threadgroup_memory: vec![],
+            draw: IcbRenderDraw::Primitives {
+                primitive_type: 3,
+                vertex_start: 0,
+                vertex_count: 3,
+                instance_count: 1,
+                base_instance: 0,
+            },
+        },
+    )
+    .expect("encode ignored command-local buffer");
+    let fill = decode_render_command_slot_with_inheritance(
+        &layout,
+        &slot,
+        1,
+        0,
+        IcbInheritance {
+            pipeline_state: true,
+            buffers: true,
+        },
+    )
+    .expect("decode inherited render slot")
+    .expect("populated draw slot");
+    assert!(fill.buffers.is_empty());
+}
+
+#[test]
+fn an_inherited_compute_pipeline_needs_no_per_command_pipeline_ref() {
+    let layout = compute_only_icb_layout(0);
+    let mut slot = encode_compute_command_slot(
+        &layout,
+        &IcbComputeFill {
+            command_index: 0,
+            pipeline_ref: 7,
+            buffers: vec![],
+            threadgroup_memory: vec![],
+            barrier: false,
+            dispatch: unit_grid_dispatch(1, 1, 1),
+        },
+    )
+    .expect("encode compute slot");
+
+    let conflicting = decode_compute_command_slot_with_inheritance(
+        &layout,
+        &slot,
+        0,
+        IcbInheritance {
+            pipeline_state: true,
+            buffers: false,
+        },
+    )
+    .unwrap_err();
+    assert_eq!(
+        crate::observe::Decline::slug(&conflicting),
+        "icb_dcs_inherited_pipeline_ref_nonzero"
+    );
+
+    st32(&mut slot[layout.pipeline_state_offset as usize..], 0);
+    let strict = decode_compute_command_slot(&layout, &slot, 0).unwrap_err();
+    assert_eq!(
+        crate::observe::Decline::slug(&strict),
+        "icb_dcs_pipeline_ref_zero"
+    );
+    let inherited = decode_compute_command_slot_with_inheritance(
+        &layout,
+        &slot,
+        0,
+        IcbInheritance {
+            pipeline_state: true,
+            buffers: false,
+        },
+    )
+    .expect("an inherited pipeline makes the slot complete")
+    .expect("the dispatch slot is populated");
+    assert_eq!(inherited.pipeline_ref, 0);
 }
 
 /// Mesh/object buffer binds share the 0x14 ref/va/gpuva pack at layout
@@ -1648,108 +1016,6 @@ fn decode_encode_draw_mesh_slot_roundtrip() {
     }
 }
 
-/// Pixel-level ICB drawMeshThreads: mesh emits full-screen triangle,
-/// fragment solid BGRA matching tess/draw oracles.
-#[test]
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-fn fill_render_draw_mesh_threads_oracle() {
-    use crate::runtime::decode::resource::MTL_INDIRECT_CMD_DRAW_MESH_THREADS;
-
-    let _guard = icb_test_guard();
-
-    let mesh_mtlb = read_fixture("icb_mesh.metallib");
-    let frag_mtlb = read_fixture("icb_mesh_frag.metallib");
-
-    let (mut host, mut state) = icb_device();
-
-    let icb_desc = make_render_icb_desc_bytes(1, 0, 0, MTL_INDIRECT_CMD_DRAW_MESH_THREADS);
-    let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
-
-    // Mesh function lives in the type-7 "vertex" function slot (no guest
-    // mesh-pipeline descriptor yet — host-fill only path).
-    put_function_object(&mut host, &state, 2, 0x200, 2, &mesh_mtlb);
-
-    put_function_object(&mut host, &state, 3, 0x220, 3, &frag_mtlb);
-
-    // No vertex attributes needed for mesh; reuse stage-in desc helper with empty attrs.
-    let pdesc = make_stagein_render_pipeline_desc(2, 3);
-    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x240, &pdesc);
-
-    fill_render(
-        &state,
-        &host,
-        &IcbRenderFill {
-            command_index: 0,
-            pipeline_ref: 6,
-            buffers: vec![],
-            object_threadgroup_memory: vec![],
-            draw: unit_mesh_threads_draw(),
-        },
-    )
-    .expect("fill DrawMeshThreads");
-
-    let mapping_id = map_draw_target(&mut host, &mut state, 0x3a);
-
-    let req = draw_request(mapping_id);
-    assert_eq!(
-        encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
-        EncodeStatus::Ok,
-        "DrawMeshThreads ICB execute"
-    );
-
-    assert_target_is_shader_solid(&mut state, &mut host, mapping_id, "DrawMeshThreads");
-}
-
-/// Pixel-level ICB drawMeshThreadgroups (same solid BGRA).
-#[test]
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-fn fill_render_draw_mesh_threadgroups_oracle() {
-    use crate::runtime::decode::resource::MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS;
-
-    let _guard = icb_test_guard();
-
-    let mesh_mtlb = read_fixture("icb_mesh.metallib");
-    let frag_mtlb = read_fixture("icb_mesh_frag.metallib");
-
-    let (mut host, mut state) = icb_device();
-
-    let icb_desc = make_render_icb_desc_bytes(1, 0, 0, MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS);
-    let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
-
-    put_function_object(&mut host, &state, 2, 0x200, 2, &mesh_mtlb);
-
-    put_function_object(&mut host, &state, 3, 0x220, 3, &frag_mtlb);
-
-    let pdesc = make_stagein_render_pipeline_desc(2, 3);
-    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x240, &pdesc);
-
-    fill_render(
-        &state,
-        &host,
-        &IcbRenderFill {
-            command_index: 0,
-            pipeline_ref: 6,
-            buffers: vec![],
-            object_threadgroup_memory: vec![],
-            draw: unit_mesh_draw(),
-        },
-    )
-    .expect("fill DrawMeshThreadgroups");
-
-    let mapping_id = map_draw_target(&mut host, &mut state, 0x3b);
-
-    let req = draw_request(mapping_id);
-    assert_eq!(
-        encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
-        EncodeStatus::Ok,
-        "DrawMeshThreadgroups ICB execute"
-    );
-
-    assert_target_is_shader_solid(&mut state, &mut host, mapping_id, "DrawMeshThreadgroups");
-}
-
 /// Wire `baseVertex@0x28` is a signed value stored as u64 bits (two's complement).
 #[test]
 fn decode_encode_signed_base_vertex() {
@@ -1820,73 +1086,6 @@ fn decode_encode_signed_base_vertex() {
 /// DrawIndexed with `baseVertex = -1`: indices `[1,2,3]` + offset → verts 0,1,2
 /// of a stage_in clip-space triangle (same solid as baseVertex 0 / indices 0,1,2).
 #[test]
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-fn fill_render_negative_base_vertex_stagein_oracle() {
-    let _guard = icb_test_guard();
-
-    let (vert_mtlb, frag_mtlb) = load_stagein_mtlb();
-    let (mut host, mut state) = icb_device();
-
-    let icb_desc = make_render_icb_desc_bytes(1, 1, 1, MTL_INDIRECT_CMD_DRAW_INDEXED);
-    let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
-
-    put_function_object(&mut host, &state, 2, 0x200, 2, &vert_mtlb);
-
-    put_function_object(&mut host, &state, 3, 0x220, 3, &frag_mtlb);
-
-    let pdesc = make_stagein_render_pipeline_desc(2, 3);
-    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x240, &pdesc);
-
-    // Clip-space full-cover triangle at vertex indices 0,1,2.
-    let tri: [[f32; 4]; 3] = [
-        [-1.0, -1.0, 0.0, 1.0],
-        [3.0, -1.0, 0.0, 1.0],
-        [-1.0, 3.0, 0.0, 1.0],
-    ];
-    let pos_bytes: Vec<u8> = tri
-        .iter()
-        .flat_map(|v| v.iter().flat_map(|f| f.to_le_bytes()))
-        .collect();
-    put_type1_buffer(&mut host, &state, 11, 4, &pos_bytes);
-
-    // indices [1,2,3] + baseVertex(-1) → vertex_id 0,1,2.
-    let indices: [u16; 3] = [1, 2, 3];
-    let index_bytes: Vec<u8> = indices.iter().flat_map(|v| v.to_le_bytes()).collect();
-    put_type1_buffer(&mut host, &state, 12, 5, &index_bytes);
-
-    let sid = 7u8;
-    let r = (0x60u32 + sid as u32) as f32 / 255.0;
-    let color = [r, 0x44 as f32 / 255.0, 0x22 as f32 / 255.0, 1.0f32];
-    let color_bytes: Vec<u8> = color.iter().flat_map(|f| f.to_le_bytes()).collect();
-    put_type1_buffer(&mut host, &state, 13, 6, &color_bytes);
-
-    fill_render(
-        &state,
-        &host,
-        &IcbRenderFill {
-            command_index: 0,
-            pipeline_ref: 6,
-            buffers: vec![render_bind(0, 11, false), render_bind(0, 13, true)],
-            object_threadgroup_memory: vec![],
-            draw: indexed_draw(-1),
-        },
-    )
-    .expect("fill DrawIndexed baseVertex=-1");
-
-    let mapping_id = map_draw_target(&mut host, &mut state, 0x37);
-
-    let req = draw_request(mapping_id);
-    assert_eq!(
-        encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
-        EncodeStatus::Ok,
-        "negative baseVertex stage_in DrawIndexed"
-    );
-
-    assert_stagein_solid(&mut state, &mut host, mapping_id, sid, "baseVertex=-1");
-}
-
-#[test]
 fn decode_encode_command_slot_roundtrip() {
     let layout = compute_only_icb_layout(1);
     let fill = IcbComputeFill {
@@ -1917,93 +1116,6 @@ fn decode_encode_command_slot_roundtrip() {
     assert!(decode_compute_command_slot(&layout, &empty, 1)
         .unwrap()
         .is_none());
-}
-
-#[test]
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-fn buffer_backed_fill_execute_mul3add1() {
-    use crate::runtime::compute_session::ComputeSession;
-
-    let (_guard, mtlb, mut host, mut state) = mul3add1_fixture();
-
-    let icb_desc = make_icb_desc_bytes(1, 1, false);
-    let layout = compute_only_icb_layout(1);
-    let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
-
-    put_function_object(&mut host, &state, 5, 0x100, 2, &mtlb);
-
-    let pdesc = make_compute_pipeline_desc(5);
-    let pdesc_gva = 0x140u64;
-    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, pdesc_gva, &pdesc);
-
-    let data = [1u32, 2, 3, 4];
-    let data_bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
-    let buf_gva = 3u64 << RESOURCE_PAGE_SHIFT;
-    gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], buf_gva, &data_bytes);
-    let mut bdesc = vec![0u8; 16];
-    st64(&mut bdesc[0..], 16);
-    st32(&mut bdesc[8..], 3);
-    let bdesc_gva = 0x180u64;
-    put_object(&mut host, &state, 7, OBJECT_TYPE_BUFFER, bdesc_gva, &bdesc);
-
-    // Guest-style fill: command slot in a type-1 backing buffer (handle 4).
-    let slot = encode_compute_command_slot(
-        &layout,
-        &IcbComputeFill {
-            command_index: 0,
-            pipeline_ref: 6,
-            buffers: vec![kernel_bind(0, 7)],
-            threadgroup_memory: vec![],
-            barrier: false,
-            dispatch: unit_grid_dispatch(4, 1, 1),
-        },
-    )
-    .unwrap();
-    let cmd_handle = 4u32;
-    let cmd_mem_gva = (cmd_handle as u64) << RESOURCE_PAGE_SHIFT;
-    gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], cmd_mem_gva, &slot);
-    let mut cmd_bdesc = vec![0u8; 16];
-    st64(&mut cmd_bdesc[0..], slot.len() as u64);
-    st64(&mut cmd_bdesc[8..], cmd_handle as u64);
-    let cmd_bdesc_gva = 0x1c0u64;
-    put_object(
-        &mut host,
-        &state,
-        10,
-        OBJECT_TYPE_BUFFER,
-        cmd_bdesc_gva,
-        &cmd_bdesc,
-    );
-
-    // Auto-bind via type-1 buffer_ref (sync path / 0x1d1 payload).
-    let mem = associate_icb_backing_buffer_ref(&state, &host, 1, 9, 10).expect("associate");
-    assert_eq!(mem.gva, cmd_mem_gva);
-    assert_eq!(mem.byte_len, layout.command_size as u64);
-
-    let mut session = ComputeSession::open(0).expect("session");
-    let cmd = execute_icb_command(9, 0, 1);
-    assert_eq!(
-        session.encode_icb(
-            &mut state,
-            &mut host,
-            1,
-            &cmd,
-            &crate::runtime::compute_exec::ComputeAccum::default()
-        ),
-        crate::runtime::compute_exec::ComputeStatus::Ok
-    );
-    assert_eq!(
-        session.finish(&mut host, &mut state, 1),
-        crate::runtime::compute_exec::ComputeStatus::Ok
-    );
-
-    let out = read_u32x4(&host, &state, buf_gva);
-    assert_eq!(
-        out,
-        vec![4, 7, 10, 13],
-        "type-1 associated ICB fill+execute mul3add1"
-    );
 }
 
 #[test]
@@ -2050,7 +1162,14 @@ fn a_0x1d1_query_is_refused_and_binds_nothing() {
     let layout = compute_only_icb_layout(1);
     let icb_desc = make_icb_desc_bytes(1, 1, false);
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
+    put_object(
+        &mut host,
+        &state,
+        9,
+        OBJECT_TYPE_SERIALIZER_RESOURCE,
+        icb_gva,
+        &icb_desc,
+    );
     // Record the create body, as `execute` would, so the decode below refuses
     // for want of command memory rather than for want of the ICB itself.
     resolve_icb_record(&state, &host, 1, 9).expect("record the ICB create body");
@@ -2097,921 +1216,386 @@ fn a_0x1d1_query_is_refused_and_binds_nothing() {
     assert_eq!(after, IcbStatus::Missing("icb_fill_no_command_memory"));
 }
 
-/// Product DrawIndexed ICB fill + execute: oracle fullscreen triangle via
-/// indices [0,1,2], fragment constant color → solid BGRA writeback.
+/// An empty execute range does not touch command memory. The range location is
+/// still checked against the ICB declaration, but no backing association is
+/// required merely to execute zero commands.
 #[test]
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-fn fill_render_draw_indexed_execute_oracle() {
+fn an_empty_icb_range_is_a_noop_without_command_memory() {
     let _guard = icb_test_guard();
-
-    let (vert_mtlb, frag_mtlb) = load_oracle_mtlb();
-    let (mut host, mut state) = icb_device();
-
-    // ICB: DrawIndexed, maxFragment=1 for color constant at fragment buffer 0.
-    let icb_desc = make_render_icb_desc_bytes(1, 0, 1, MTL_INDIRECT_CMD_DRAW_INDEXED);
-    let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
-
-    // Vertex function (ref 2) + fragment function (ref 3).
-    // Descriptor GVAs stay past object-list region (32×12 = 0x180).
-    put_function_object(&mut host, &state, 2, 0x200, 2, &vert_mtlb);
-
-    put_function_object(&mut host, &state, 3, 0x220, 3, &frag_mtlb);
-
-    // Render pipeline type-7 (ref 6): vertex=2, fragment=3.
-    let pdesc = make_render_pipeline_desc(2, 3);
-    let pdesc_gva = 0x240u64;
-    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, pdesc_gva, &pdesc);
-
-    // Index buffer (ref 12, handle 4): UInt16 [0,1,2].
-    let indices: [u16; 3] = [0, 1, 2];
-    let index_bytes: Vec<u8> = indices.iter().flat_map(|v| v.to_le_bytes()).collect();
-    put_type1_buffer(&mut host, &state, 12, 4, &index_bytes);
-
-    // Fragment color buffer (ref 13, handle 5): RGBA float4 for sid=7.
-    let sid = 7u8;
-    let r = (0x60u32 + sid as u32) as f32 / 255.0;
-    let color = [r, 0x44 as f32 / 255.0, 0x22 as f32 / 255.0, 1.0f32];
-    let color_bytes: Vec<u8> = color.iter().flat_map(|f| f.to_le_bytes()).collect();
-    put_type1_buffer(&mut host, &state, 13, 5, &color_bytes);
-
-    // Mapping for color writeback (4×4 BGRA).
-    let mapping_id = map_draw_target(&mut host, &mut state, 0x30);
-
-    fill_render(
+    let (mut host, state) = icb_device();
+    let desc = make_icb_desc_bytes(2, 1, false);
+    let gva = 1u64 << RESOURCE_PAGE_SHIFT;
+    put_object(
+        &mut host,
         &state,
-        &host,
-        &IcbRenderFill {
-            command_index: 0,
-            pipeline_ref: 6,
-            buffers: vec![render_bind(0, 13, true)],
-            object_threadgroup_memory: vec![],
-            draw: indexed_draw(0),
-        },
-    )
-    .expect("fill_render DrawIndexed");
-
-    let req = draw_request(mapping_id);
-    assert_eq!(
-        encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
-        EncodeStatus::Ok
+        9,
+        OBJECT_TYPE_SERIALIZER_RESOURCE,
+        gva,
+        &desc,
     );
+    resolve_icb_record(&state, &host, 1, 9).expect("record ICB declaration");
 
-    // BGRA writeback: B=0x22 G=0x44 R=0x67 A=0xff (oracle sid=7).
-    assert_stagein_solid(
-        &mut state,
-        &mut host,
-        mapping_id,
-        sid,
-        "ICB DrawIndexed oracle",
+    assert!(decode_icb_command_range(&state, &host, 1, 9, 1, 0)
+        .expect("empty range")
+        .is_empty());
+    assert_eq!(
+        decode_icb_command_range(&state, &host, 1, 9, 3, 0)
+            .expect_err("empty range still has to be within the declaration"),
+        IcbStatus::Args("icb_fill_range_past_capacity")
     );
 }
 
-/// Buffer-backed DrawIndexed: encode slot → 0x1d1 associate → execute re-fill.
 #[test]
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-fn buffer_backed_render_draw_indexed_fill_execute() {
+fn inherited_compute_buffers_do_not_resolve_command_local_bindings() {
     let _guard = icb_test_guard();
-
-    let (vert_mtlb, frag_mtlb) = load_oracle_mtlb();
-    let (mut host, mut state) = icb_device();
-
-    let max_v = 0u16;
-    let max_f = 1u16;
-    let layout = render_icb_layout(max_v, max_f, MTL_INDIRECT_CMD_DRAW_INDEXED);
-    let icb_desc = make_render_icb_desc_bytes(1, max_v, max_f, MTL_INDIRECT_CMD_DRAW_INDEXED);
-    let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
-
-    put_function_object(&mut host, &state, 2, 0x200, 2, &vert_mtlb);
-
-    put_function_object(&mut host, &state, 3, 0x220, 3, &frag_mtlb);
-
-    let pdesc = make_render_pipeline_desc(2, 3);
-    let pdesc_gva = 0x240u64;
-    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, pdesc_gva, &pdesc);
-
-    let indices: [u16; 3] = [0, 1, 2];
-    let index_bytes: Vec<u8> = indices.iter().flat_map(|v| v.to_le_bytes()).collect();
-    put_type1_buffer(&mut host, &state, 12, 4, &index_bytes);
-
-    let sid = 7u8;
-    let r = (0x60u32 + sid as u32) as f32 / 255.0;
-    let color = [r, 0x44 as f32 / 255.0, 0x22 as f32 / 255.0, 1.0f32];
-    let color_bytes: Vec<u8> = color.iter().flat_map(|f| f.to_le_bytes()).collect();
-    put_type1_buffer(&mut host, &state, 13, 5, &color_bytes);
-
-    let slot = encode_render_command_slot(
-        &layout,
-        &IcbRenderFill {
-            command_index: 0,
-            pipeline_ref: 6,
-            buffers: vec![render_bind(0, 13, true)],
-            object_threadgroup_memory: vec![],
-            draw: indexed_draw(0),
-        },
-    )
-    .unwrap();
-
-    associate_icb_command_memory(&mut host, &state, 6, &slot);
-
-    let mapping_id = map_draw_target(&mut host, &mut state, 0x31);
-
-    // Execute path re-fills from command memory (DrawIndexed + fragment bind).
-    let req = draw_request(mapping_id);
-    assert_eq!(
-        encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
-        EncodeStatus::Ok
-    );
-
-    assert_stagein_solid(
-        &mut state,
+    let (mut host, state) = icb_device();
+    let layout = compute_only_icb_layout(1);
+    let desc = make_icb_desc_bytes(1, 1, true);
+    let descriptor_gva = 1u64 << RESOURCE_PAGE_SHIFT;
+    put_object(
         &mut host,
-        mapping_id,
-        sid,
-        "buffer-backed DrawIndexed",
+        &state,
+        9,
+        OBJECT_TYPE_SERIALIZER_RESOURCE,
+        descriptor_gva,
+        &desc,
     );
-}
+    resolve_icb_record(&state, &host, 1, 9).expect("record inherited-buffer ICB");
 
-/// Wire-backed E2E: DrawPatches tessellation.
-///
-/// Guest path only — no `fill_render_command` host API:
-/// encode slot → type-1 command memory → `0x1d1` associate → execute
-/// re-fills via `fill_icb_from_command_memory` → solid BGRA.
-#[test]
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-fn wire_backed_draw_patches_tessellation_e2e() {
-    use crate::runtime::decode::resource::{
-        render_draw_patches_icb_layout, MTL_INDIRECT_CMD_DRAW_PATCHES,
-    };
-
-    let _guard = icb_test_guard();
-
-    let vert_mtlb = read_fixture("icb_tess_vtx.metallib");
-    let frag_mtlb = read_fixture("icb_tess_frag.metallib");
-
-    let (mut host, mut state) = icb_device();
-
-    let layout = render_draw_patches_icb_layout(1);
-    let icb_desc = make_render_icb_desc_bytes(1, 1, 0, MTL_INDIRECT_CMD_DRAW_PATCHES);
-    let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
-
-    put_function_object(&mut host, &state, 2, 0x200, 2, &vert_mtlb);
-
-    put_function_object(&mut host, &state, 3, 0x220, 3, &frag_mtlb);
-
-    let pdesc = make_stagein_render_pipeline_desc(2, 3);
-    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x240, &pdesc);
-
-    let tri: [[f32; 4]; 3] = [
-        [-1.0, -1.0, 0.0, 1.0],
-        [3.0, -1.0, 0.0, 1.0],
-        [-1.0, 3.0, 0.0, 1.0],
-    ];
-    let cp_bytes: Vec<u8> = tri
-        .iter()
-        .flat_map(|v| v.iter().flat_map(|f| f.to_le_bytes()))
-        .collect();
-    put_type1_buffer(&mut host, &state, 11, 4, &cp_bytes);
-
-    let tess_bytes: [u8; 8] = [0x00, 0x3c, 0x00, 0x3c, 0x00, 0x3c, 0x00, 0x3c];
-    put_type1_buffer(&mut host, &state, 12, 5, &tess_bytes);
-
-    // Absolute wire VAs for control-point bind + tess factor (base+0).
-    let cp_wire = (4u64) << RESOURCE_PAGE_SHIFT;
-    let tess_wire = (5u64) << RESOURCE_PAGE_SHIFT;
-
-    let slot = encode_render_command_slot(
+    let slot = encode_compute_command_slot(
         &layout,
-        &IcbRenderFill {
+        &IcbComputeFill {
             command_index: 0,
-            pipeline_ref: 6,
-            buffers: vec![IcbRenderBufferBind {
+            pipeline_ref: 7,
+            buffers: vec![IcbKernelBufferBind {
                 index: 0,
-                buffer_ref: 11,
+                buffer_ref: 999,
                 offset: 0,
-                wire_va: cp_wire,
+                wire_va: 0xdead,
                 attribute_stride: 0,
                 has_attribute_stride: false,
-                is_fragment: false,
-                stage: IcbRenderBindStage::Vertex,
             }],
-            object_threadgroup_memory: vec![],
-            draw: IcbRenderDraw::Patches {
-                number_of_patch_control_points: 3,
-                patch_start: 0,
-                patch_count: 1,
-                patch_index_buffer_ref: 0,
-                patch_index_buffer_offset: 0,
-                patch_index_wire_va: 0,
-                instance_count: 1,
-                base_instance: 0,
-                tessellation_factor: IcbTessellationFactor {
-                    buffer_ref: 12,
-                    offset: 0,
-                    wire_va: tess_wire,
-                    instance_stride: 0,
-                },
-            },
+            threadgroup_memory: vec![],
+            barrier: false,
+            dispatch: unit_grid_dispatch(1, 1, 1),
         },
     )
-    .expect("encode DrawPatches slot");
+    .expect("encode command-local bind that inherited mode ignores");
+    let command_gva = 5u64 << RESOURCE_PAGE_SHIFT;
+    gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], command_gva, &slot);
+    bind_icb_command_memory(
+        &state,
+        1,
+        9,
+        IcbCommandMemory {
+            gva: command_gva,
+            byte_len: slot.len() as u64,
+        },
+    )
+    .expect("bind command memory");
 
-    // Command memory only — never call fill_render_command.
-    associate_icb_command_memory(&mut host, &state, 6, &slot);
-
-    // Explicit re-fill (what execute does) — proves decode+resolve path.
-    fill_icb_from_command_memory(&state, &host, 1, 9, 0, 1)
-        .expect("fill_icb_from_command_memory DrawPatches");
-
-    let mapping_id = map_draw_target(&mut host, &mut state, 0x3c);
-
-    let req = draw_request(mapping_id);
-    assert_eq!(
-        encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
-        EncodeStatus::Ok,
-        "wire-backed DrawPatches execute"
-    );
-
-    assert_target_is_shader_solid(&mut state, &mut host, mapping_id, "wire-backed DrawPatches");
+    let fills = decode_icb_command_range(&state, &host, 1, 9, 0, 1)
+        .expect("ignored command-local ref must not be resolved");
+    let [IcbCommandFill::Compute(fill)] = fills.as_slice() else {
+        panic!("expected one compute fill");
+    };
+    assert!(fill.buffers.is_empty());
 }
 
-/// Dedicated wire-backed E2E: DrawIndexedPatches tessellation (not via
-/// host fill API or DrawPatches-only path).
 #[test]
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-fn wire_backed_draw_indexed_patches_tessellation_e2e() {
-    use crate::runtime::decode::resource::{
-        render_draw_indexed_patches_icb_layout, MTL_INDIRECT_CMD_DRAW_INDEXED_PATCHES,
-    };
-
+fn icb_ranges_select_slots_in_order_and_skip_reset_slots() {
     let _guard = icb_test_guard();
+    let (mut host, state) = icb_device();
+    let layout = compute_only_icb_layout(1);
+    let desc = make_icb_desc_bytes(2, 1, false);
+    let descriptor_gva = 1u64 << RESOURCE_PAGE_SHIFT;
+    put_object(
+        &mut host,
+        &state,
+        9,
+        OBJECT_TYPE_SERIALIZER_RESOURCE,
+        descriptor_gva,
+        &desc,
+    );
+    resolve_icb_record(&state, &host, 1, 9).expect("record ICB declaration");
 
-    let vert_mtlb = read_fixture("icb_tess_vtx.metallib");
-    let frag_mtlb = read_fixture("icb_tess_frag.metallib");
+    let slot = |pipeline_ref| {
+        encode_compute_command_slot(
+            &layout,
+            &IcbComputeFill {
+                command_index: 0,
+                pipeline_ref,
+                buffers: vec![],
+                threadgroup_memory: vec![],
+                barrier: false,
+                dispatch: unit_grid_dispatch(1, 1, 1),
+            },
+        )
+        .expect("encode command slot")
+    };
+    let mut bytes = slot(6);
+    bytes.extend_from_slice(&slot(7));
+    // Put slot zero at the end of one guest page and slot one at the start of
+    // the next, so the final assertion can make the out-of-range prefix
+    // unreadable without affecting the selected slot.
+    let command_gva = (1u64 << RESOURCE_PAGE_SHIFT) - u64::from(layout.command_size);
+    gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], command_gva, &bytes);
+    bind_icb_command_memory(
+        &state,
+        1,
+        9,
+        IcbCommandMemory {
+            gva: command_gva,
+            byte_len: bytes.len() as u64,
+        },
+    )
+    .expect("bind command memory");
 
-    let (mut host, mut state) = icb_device();
+    let pipelines = |fills: Vec<IcbCommandFill>| {
+        fills
+            .into_iter()
+            .map(|fill| match fill {
+                IcbCommandFill::Compute(fill) => fill.pipeline_ref,
+                IcbCommandFill::Render(_) => panic!("expected compute fill"),
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        pipelines(decode_icb_command_range(&state, &host, 1, 9, 0, 1).unwrap()),
+        [6]
+    );
+    assert_eq!(
+        pipelines(decode_icb_command_range(&state, &host, 1, 9, 1, 1).unwrap()),
+        [7]
+    );
+    assert_eq!(
+        pipelines(decode_icb_command_range(&state, &host, 1, 9, 0, 2).unwrap()),
+        [6, 7]
+    );
 
-    let layout = render_draw_indexed_patches_icb_layout(1);
-    let icb_desc = make_render_icb_desc_bytes(1, 1, 0, MTL_INDIRECT_CMD_DRAW_INDEXED_PATCHES);
-    let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
+    let reset_slot = vec![0u8; layout.command_size as usize];
+    gva_mem::write_task_gva_arm64e(
+        &mut host,
+        &state.tasks[1],
+        command_gva + u64::from(layout.command_size),
+        &reset_slot,
+    );
+    assert_eq!(
+        pipelines(decode_icb_command_range(&state, &host, 1, 9, 0, 2).unwrap()),
+        [6]
+    );
 
-    put_function_object(&mut host, &state, 2, 0x200, 2, &vert_mtlb);
+    let second = slot(7);
+    gva_mem::write_task_gva_arm64e(
+        &mut host,
+        &state.tasks[1],
+        command_gva + u64::from(layout.command_size),
+        &second,
+    );
+    let slot0_gpa =
+        gva_mem::translate_task_gva(&host, &state.tasks[1], command_gva, state.page_shift)
+            .expect("translate slot zero");
+    host.mark_non_ram(slot0_gpa, u64::from(layout.command_size));
+    assert_eq!(
+        pipelines(decode_icb_command_range(&state, &host, 1, 9, 1, 1).unwrap()),
+        [7],
+        "a subrange must not read an earlier command slot"
+    );
+}
 
-    put_function_object(&mut host, &state, 3, 0x220, 3, &frag_mtlb);
+#[test]
+fn dispatch_bits_select_a_compute_command_domain_even_with_render_bits_set() {
+    let _guard = icb_test_guard();
+    let (mut host, state) = icb_device();
+    let command_types = MTL_INDIRECT_CMD_DRAW | MTL_INDIRECT_CMD_CONCURRENT_DISPATCH;
+    let mut layout = render_icb_layout(0, 0, command_types);
+    layout.command_size = layout.command_arguments_offset + ICB_CONCURRENT_DISPATCH_ARGS_LEN as u32;
+    let mut desc = make_icb_desc_bytes(2, 0, false);
+    st32(&mut desc[8..], command_types);
+    desc[ICB_DESC_LAYOUT..ICB_DESC_LAYOUT + ICB_LAYOUT_LEN]
+        .copy_from_slice(&encode_icb_command_layout(&layout));
+    let descriptor_gva = 1u64 << RESOURCE_PAGE_SHIFT;
+    put_object(
+        &mut host,
+        &state,
+        9,
+        OBJECT_TYPE_SERIALIZER_RESOURCE,
+        descriptor_gva,
+        &desc,
+    );
+    resolve_icb_record(&state, &host, 1, 9).expect("record mixed ICB declaration");
 
-    let pdesc = make_stagein_render_pipeline_desc(2, 3);
-    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x240, &pdesc);
-
-    // Control points: dummy at 0, real triangle at 1,2,3.
-    let cps: [[f32; 4]; 4] = [
-        [0.0, 0.0, 0.0, 1.0],
-        [-1.0, -1.0, 0.0, 1.0],
-        [3.0, -1.0, 0.0, 1.0],
-        [-1.0, 3.0, 0.0, 1.0],
-    ];
-    let cp_bytes: Vec<u8> = cps
-        .iter()
-        .flat_map(|v| v.iter().flat_map(|f| f.to_le_bytes()))
-        .collect();
-    put_type1_buffer(&mut host, &state, 11, 4, &cp_bytes);
-
-    let indices: [u16; 3] = [1, 2, 3];
-    let index_bytes: Vec<u8> = indices.iter().flat_map(|v| v.to_le_bytes()).collect();
-    put_type1_buffer(&mut host, &state, 13, 5, &index_bytes);
-
-    let tess_bytes: [u8; 8] = [0x00, 0x3c, 0x00, 0x3c, 0x00, 0x3c, 0x00, 0x3c];
-    put_type1_buffer(&mut host, &state, 12, 6, &tess_bytes);
-
-    let cp_wire = (4u64) << RESOURCE_PAGE_SHIFT;
-    let index_wire = (5u64) << RESOURCE_PAGE_SHIFT;
-    let tess_wire = (6u64) << RESOURCE_PAGE_SHIFT;
-
-    let slot = encode_render_command_slot(
+    let mut bytes = encode_render_command_slot(
         &layout,
-        &IcbRenderFill {
-            command_index: 0,
-            pipeline_ref: 6,
-            buffers: vec![IcbRenderBufferBind {
-                index: 0,
-                buffer_ref: 11,
-                offset: 0,
-                wire_va: cp_wire,
-                attribute_stride: 0,
-                has_attribute_stride: false,
-                is_fragment: false,
-                stage: IcbRenderBindStage::Vertex,
-            }],
-            object_threadgroup_memory: vec![],
-            draw: IcbRenderDraw::IndexedPatches {
-                number_of_patch_control_points: 3,
-                patch_start: 0,
-                patch_count: 1,
-                patch_index_buffer_ref: 0,
-                patch_index_buffer_offset: 0,
-                patch_index_wire_va: 0,
-                control_point_index_buffer_ref: 13,
-                control_point_index_buffer_offset: 0,
-                control_point_index_wire_va: index_wire,
-                instance_count: 1,
-                base_instance: 0,
-                tessellation_factor: IcbTessellationFactor {
-                    buffer_ref: 12,
-                    offset: 0,
-                    wire_va: tess_wire,
-                    instance_stride: 0,
-                },
-            },
-        },
-    )
-    .expect("encode DrawIndexedPatches slot");
-
-    associate_icb_command_memory(&mut host, &state, 7, &slot);
-
-    fill_icb_from_command_memory(&state, &host, 1, 9, 0, 1)
-        .expect("fill_icb_from_command_memory DrawIndexedPatches");
-
-    let mapping_id = map_draw_target(&mut host, &mut state, 0x48);
-
-    let req = draw_request(mapping_id);
-    assert_eq!(
-        encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
-        EncodeStatus::Ok,
-        "wire-backed DrawIndexedPatches execute"
-    );
-
-    assert_target_is_shader_solid(
-        &mut state,
-        &mut host,
-        mapping_id,
-        "wire-backed DrawIndexedPatches",
-    );
-}
-
-/// Object+mesh host fill: dual-function metallib (object type 8 + mesh type 7)
-/// → drawMeshThreadgroups → solid BGRA (object sets mesh grid via payload).
-#[test]
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-fn fill_render_object_mesh_threadgroups_oracle() {
-    use crate::runtime::decode::resource::MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS;
-
-    let _guard = icb_test_guard();
-
-    let om_mtlb = read_fixture("icb_object_mesh.metallib");
-    let frag_mtlb = read_fixture("icb_mesh_frag.metallib");
-
-    let (mut host, mut state) = icb_device();
-
-    // maxObjectTG=1 so create body + materialize allow object TG memory binds.
-    let icb_desc =
-        make_render_icb_desc_bytes_ex(1, 0, 0, 0, 0, MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS, 0);
-    // Patch max_object_tg create byte + layout with 1 object TG slot.
-    {
-        use crate::runtime::decode::resource::{
-            encode_icb_command_layout, render_draw_mesh_threadgroups_icb_layout_ex,
-            ICB_DESC_LAYOUT, ICB_DESC_MAX_OBJECT_TG_BINDS, ICB_LAYOUT_LEN,
-        };
-        let mut b = icb_desc.clone();
-        b[ICB_DESC_MAX_OBJECT_TG_BINDS] = 1;
-        let layout = render_draw_mesh_threadgroups_icb_layout_ex(0, 0, 1);
-        b[ICB_DESC_LAYOUT..ICB_DESC_LAYOUT + ICB_LAYOUT_LEN]
-            .copy_from_slice(&encode_icb_command_layout(&layout));
-        let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-        put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &b);
-    }
-
-    put_function_object(&mut host, &state, 2, 0x200, 2, &om_mtlb);
-
-    put_function_object(&mut host, &state, 3, 0x220, 3, &frag_mtlb);
-
-    let pdesc = make_stagein_render_pipeline_desc(2, 3);
-    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x240, &pdesc);
-
-    fill_render(
-        &state,
-        &host,
-        &IcbRenderFill {
-            command_index: 0,
-            pipeline_ref: 6,
-            buffers: vec![],
-            // length 0 = clear; exercise API path with empty vec is fine.
-            // Non-zero object TG mem optional for this payload-only shader.
-            object_threadgroup_memory: vec![],
-            draw: unit_mesh_draw(),
-        },
-    )
-    .expect("fill object+mesh threadgroups");
-
-    let mapping_id = map_draw_target(&mut host, &mut state, 0x3e);
-
-    let req = draw_request(mapping_id);
-    assert_eq!(
-        encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
-        EncodeStatus::Ok,
-        "object+mesh ICB execute"
-    );
-
-    assert_target_is_shader_solid(&mut state, &mut host, mapping_id, "object+mesh");
-}
-
-/// Dedicated wire-backed E2E: dual-export object+mesh metallib in classic
-/// type-7 vertex slot (no mesh SPI tag 0x14) through command memory.
-/// Not claimed via mesh SPI separate-ref E2E.
-#[test]
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-fn wire_backed_dual_export_object_mesh_e2e() {
-    use crate::runtime::decode::resource::{
-        decode_render_pipeline_descriptor, render_draw_mesh_threadgroups_icb_layout,
-        MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS,
-    };
-
-    let _guard = icb_test_guard();
-
-    let om_mtlb = read_fixture("icb_object_mesh.metallib");
-    let frag_mtlb = read_fixture("icb_mesh_frag.metallib");
-
-    let (mut host, mut state) = icb_device();
-
-    let layout = render_draw_mesh_threadgroups_icb_layout();
-    let icb_desc = make_render_icb_desc_bytes(1, 0, 0, MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS);
-    let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
-
-    // Dual-export object+mesh in classic "vertex" function slot only.
-    put_function_object(&mut host, &state, 2, 0x200, 2, &om_mtlb);
-
-    put_function_object(&mut host, &state, 3, 0x220, 3, &frag_mtlb);
-
-    // Classic type-7 shape: tag 0x01/0x02 only (no mesh SPI 0x14).
-    let pdesc = make_stagein_render_pipeline_desc(2, 3);
-    let decoded = decode_render_pipeline_descriptor(&pdesc).expect("classic pipeline");
-    assert_eq!(decoded.vertex_func_ref, 2);
-    assert_eq!(decoded.fragment_func_ref, 3);
-    assert_eq!(decoded.object_func_ref, 0);
-    assert_eq!(decoded.mesh_func_ref, 0);
-    assert!(!decoded.has_color_attachment_offset || decoded.color_attachment_offset != 0);
-    // Mesh SPI shape uses tag 0x14; classic stagein has tag 0x08.
-    // object/mesh refs must stay zero so fill uses dual-export scan of vertex metallib.
-    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x240, &pdesc);
-
-    let fill = IcbRenderFill {
-        command_index: 0,
-        pipeline_ref: 6,
-        buffers: vec![],
-        object_threadgroup_memory: vec![],
-        draw: unit_mesh_draw(),
-    };
-    let slot = encode_render_command_slot(&layout, &fill).expect("encode dual-export slot");
-
-    associate_icb_command_memory(&mut host, &state, 5, &slot);
-
-    fill_icb_from_command_memory(&state, &host, 1, 9, 0, 1)
-        .expect("fill_icb_from_command_memory dual-export object+mesh");
-
-    let mapping_id = map_draw_target(&mut host, &mut state, 0x4b);
-
-    let req = draw_request(mapping_id);
-    assert_eq!(
-        encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
-        EncodeStatus::Ok,
-        "wire-backed dual-export object+mesh execute"
-    );
-
-    assert_target_is_shader_solid(
-        &mut state,
-        &mut host,
-        mapping_id,
-        "wire-backed dual-export object+mesh",
-    );
-}
-
-/// Separate object + mesh + fragment function refs via mesh SPI type-7
-/// tags 0x01 / 0x02 / 0x03 under section tag 0x14 (not dual-export).
-#[test]
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-fn fill_render_separate_object_mesh_func_refs_oracle() {
-    use crate::runtime::decode::resource::{
-        decode_render_pipeline_descriptor, MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS,
-    };
-
-    let _guard = icb_test_guard();
-
-    let obj_mtlb = read_fixture("icb_object_stage.metallib");
-    let mesh_mtlb = read_fixture("icb_mesh_with_payload.metallib");
-    let frag_mtlb = read_fixture("icb_mesh_frag.metallib");
-
-    let (mut host, mut state) = icb_device();
-
-    let icb_desc =
-        make_render_icb_desc_bytes_ex(1, 0, 0, 0, 0, MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS, 0);
-    {
-        use crate::runtime::decode::resource::{
-            encode_icb_command_layout, render_draw_mesh_threadgroups_icb_layout_ex,
-            ICB_DESC_LAYOUT, ICB_DESC_MAX_OBJECT_TG_BINDS, ICB_LAYOUT_LEN,
-        };
-        let mut b = icb_desc.clone();
-        b[ICB_DESC_MAX_OBJECT_TG_BINDS] = 1;
-        let layout = render_draw_mesh_threadgroups_icb_layout_ex(0, 0, 1);
-        b[ICB_DESC_LAYOUT..ICB_DESC_LAYOUT + ICB_LAYOUT_LEN]
-            .copy_from_slice(&encode_icb_command_layout(&layout));
-        let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-        put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &b);
-    }
-
-    // Object function ref 2, mesh ref 4, fragment ref 3 — three distinct objects.
-    put_function_object(&mut host, &state, 2, 0x200, 2, &obj_mtlb);
-
-    put_function_object(&mut host, &state, 3, 0x220, 3, &frag_mtlb);
-
-    put_function_object(&mut host, &state, 4, 0x260, 4, &mesh_mtlb);
-
-    let pdesc = make_mesh_render_pipeline_desc(Some(2), 4, 3);
-    let decoded = decode_render_pipeline_descriptor(&pdesc).expect("mesh pipeline decode");
-    assert_eq!(decoded.object_func_ref, 2);
-    assert_eq!(decoded.mesh_func_ref, 4);
-    assert_eq!(decoded.fragment_func_ref, 3);
-    assert_eq!(decoded.vertex_func_ref, 0);
-    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x280, &pdesc);
-
-    fill_render(
-        &state,
-        &host,
         &IcbRenderFill {
             command_index: 0,
             pipeline_ref: 6,
             buffers: vec![],
             object_threadgroup_memory: vec![],
-            draw: unit_mesh_draw(),
+            draw: IcbRenderDraw::Primitives {
+                primitive_type: 3,
+                vertex_start: 0,
+                vertex_count: 3,
+                instance_count: 1,
+                base_instance: 0,
+            },
         },
     )
-    .expect("fill separate object+mesh+frag refs");
-
-    let mapping_id = map_draw_target(&mut host, &mut state, 0x3f);
-
-    let req = draw_request(mapping_id);
-    assert_eq!(
-        encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
-        EncodeStatus::Ok,
-        "separate object/mesh func-ref ICB execute"
+    .expect("encode render slot");
+    bytes.extend_from_slice(
+        &encode_compute_command_slot(
+            &layout,
+            &IcbComputeFill {
+                command_index: 1,
+                pipeline_ref: 7,
+                buffers: vec![],
+                threadgroup_memory: vec![],
+                barrier: false,
+                dispatch: unit_grid_dispatch(1, 1, 1),
+            },
+        )
+        .expect("encode compute slot"),
     );
-
-    assert_target_is_shader_solid(
-        &mut state,
-        &mut host,
-        mapping_id,
-        "separate object/mesh refs",
-    );
-}
-
-/// Dedicated wire-backed E2E: mesh SPI pipeline shape (tag 0x14 + object/
-/// mesh/frag refs 0x01/0x02/0x03) through command memory — not dual-export
-/// and not host `fill_render_command` API.
-#[test]
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-fn wire_backed_mesh_spi_pipeline_e2e() {
-    use crate::runtime::decode::resource::{
-        decode_render_pipeline_descriptor, render_draw_mesh_threadgroups_icb_layout,
-        MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS,
-    };
-
-    let _guard = icb_test_guard();
-
-    let obj_mtlb = read_fixture("icb_object_stage.metallib");
-    let mesh_mtlb = read_fixture("icb_mesh_with_payload.metallib");
-    let frag_mtlb = read_fixture("icb_mesh_frag.metallib");
-
-    let (mut host, mut state) = icb_device();
-
-    let layout = render_draw_mesh_threadgroups_icb_layout();
-    let icb_desc = make_render_icb_desc_bytes(1, 0, 0, MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS);
-    let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
-
-    // Three distinct function objects: object=2, frag=3, mesh=4.
-    put_function_object(&mut host, &state, 2, 0x200, 2, &obj_mtlb);
-
-    put_function_object(&mut host, &state, 3, 0x220, 3, &frag_mtlb);
-
-    put_function_object(&mut host, &state, 4, 0x260, 4, &mesh_mtlb);
-
-    let pdesc = make_mesh_render_pipeline_desc(Some(2), 4, 3);
-    let decoded = decode_render_pipeline_descriptor(&pdesc).expect("mesh SPI pipeline");
-    assert_eq!(decoded.object_func_ref, 2);
-    assert_eq!(decoded.mesh_func_ref, 4);
-    assert_eq!(decoded.fragment_func_ref, 3);
-    assert_eq!(decoded.vertex_func_ref, 0);
-    assert!(decoded.has_color_attachment_offset); // tag 0x14 shape
-    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x280, &pdesc);
-
-    let fill = IcbRenderFill {
-        command_index: 0,
-        pipeline_ref: 6,
-        buffers: vec![],
-        object_threadgroup_memory: vec![],
-        draw: unit_mesh_draw(),
-    };
-    let slot = encode_render_command_slot(&layout, &fill).expect("encode mesh SPI slot");
-
-    associate_icb_command_memory(&mut host, &state, 5, &slot);
-
-    fill_icb_from_command_memory(&state, &host, 1, 9, 0, 1)
-        .expect("fill_icb_from_command_memory mesh SPI pipeline");
-
-    let mapping_id = map_draw_target(&mut host, &mut state, 0x47);
-
-    let req = draw_request(mapping_id);
-    assert_eq!(
-        encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
-        EncodeStatus::Ok,
-        "wire-backed mesh SPI pipeline execute"
-    );
-
-    assert_target_is_shader_solid(
-        &mut state,
-        &mut host,
-        mapping_id,
-        "wire-backed mesh SPI pipeline",
-    );
-}
-
-/// Pixel: setMeshBuffer — mesh stage reads scale from buffer(0).
-#[test]
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-fn fill_render_mesh_buffer_bind_oracle() {
-    use crate::runtime::decode::resource::MTL_INDIRECT_CMD_DRAW_MESH_THREADS;
-
-    let _guard = icb_test_guard();
-
-    let mesh_mtlb = read_fixture("icb_mesh_buf.metallib");
-    let frag_mtlb = read_fixture("icb_mesh_frag.metallib");
-
-    let (mut host, mut state) = icb_device();
-
-    // max_mesh=1 so create/layout allow mesh buffer bind table.
-    let icb_desc =
-        make_render_icb_desc_bytes_ex(1, 0, 0, 0, 1, MTL_INDIRECT_CMD_DRAW_MESH_THREADS, 0);
-    let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
-
-    put_function_object(&mut host, &state, 2, 0x200, 2, &mesh_mtlb);
-
-    put_function_object(&mut host, &state, 3, 0x220, 3, &frag_mtlb);
-
-    let pdesc = make_stagein_render_pipeline_desc(2, 3);
-    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x240, &pdesc);
-
-    // scale = 1.0f LE (handle must be a setup_task-mapped page pfn).
-    let scale_bytes = 1.0f32.to_le_bytes();
-    put_type1_buffer(&mut host, &state, 7, 4, &scale_bytes);
-
-    fill_render(
+    let command_gva = 5u64 << RESOURCE_PAGE_SHIFT;
+    gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], command_gva, &bytes);
+    bind_icb_command_memory(
         &state,
-        &host,
-        &IcbRenderFill {
-            command_index: 0,
-            pipeline_ref: 6,
-            buffers: vec![IcbRenderBufferBind {
-                index: 0,
-                buffer_ref: 7,
-                offset: 0,
-                wire_va: 0,
-                attribute_stride: 0,
-                has_attribute_stride: false,
-                is_fragment: false,
-                stage: IcbRenderBindStage::Mesh,
-            }],
-            object_threadgroup_memory: vec![],
-            draw: unit_mesh_threads_draw(),
+        1,
+        9,
+        IcbCommandMemory {
+            gva: command_gva,
+            byte_len: bytes.len() as u64,
         },
     )
-    .expect("fill mesh buffer bind");
+    .expect("bind mixed command memory");
 
-    let mapping_id = map_draw_target(&mut host, &mut state, 0x40);
-
-    let req = draw_request(mapping_id);
+    let refused = decode_icb_command_range(&state, &host, 1, 9, 0, 2)
+        .expect_err("a render slot cannot be filled in the compute command domain");
     assert_eq!(
-        encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
-        EncodeStatus::Ok,
-        "mesh buffer bind ICB execute"
+        crate::observe::Decline::slug(&refused),
+        "icb_fill_render_command_in_compute_domain"
     );
 
-    assert_target_is_shader_solid(&mut state, &mut host, mapping_id, "mesh buffer bind");
+    let fills = decode_icb_command_range(&state, &host, 1, 9, 1, 1)
+        .expect("the compute slot remains valid despite the extra render bit");
+    assert!(matches!(
+        fills.as_slice(),
+        [IcbCommandFill::Compute(IcbComputeFill {
+            pipeline_ref: 7,
+            command_index: 1,
+            ..
+        })]
+    ));
 }
 
-/// Pixel: setObjectBuffer — object stage reads scale from buffer(0) → payload.
 #[test]
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-fn fill_render_object_buffer_bind_oracle() {
-    use crate::runtime::decode::resource::MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS;
-
+fn icb_lifetimes_are_device_owned_generational_and_task_scoped() {
     let _guard = icb_test_guard();
+    let (mut host_a, mut state_a) = icb_device();
+    let (mut host_b, state_b) = icb_device();
+    let desc = make_icb_desc_bytes(1, 1, false);
+    let gva = 1u64 << RESOURCE_PAGE_SHIFT;
+    put_object(
+        &mut host_a,
+        &state_a,
+        9,
+        OBJECT_TYPE_SERIALIZER_RESOURCE,
+        gva,
+        &desc,
+    );
+    put_object(
+        &mut host_b,
+        &state_b,
+        9,
+        OBJECT_TYPE_SERIALIZER_RESOURCE,
+        gva,
+        &desc,
+    );
 
-    let om_mtlb = read_fixture("icb_object_buf.metallib");
-    let frag_mtlb = read_fixture("icb_mesh_frag.metallib");
-
-    let (mut host, mut state) = icb_device();
-
-    // max_object=1 for object buffer bind table.
-    let icb_desc =
-        make_render_icb_desc_bytes_ex(1, 0, 0, 1, 0, MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS, 0);
-    let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
-
-    put_function_object(&mut host, &state, 2, 0x200, 2, &om_mtlb);
-
-    put_function_object(&mut host, &state, 3, 0x220, 3, &frag_mtlb);
-
-    let pdesc = make_stagein_render_pipeline_desc(2, 3);
-    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x240, &pdesc);
-
-    let scale_bytes = 1.0f32.to_le_bytes();
-    put_type1_buffer(&mut host, &state, 7, 4, &scale_bytes);
-
-    fill_render(
-        &state,
-        &host,
-        &IcbRenderFill {
-            command_index: 0,
-            pipeline_ref: 6,
-            buffers: vec![IcbRenderBufferBind {
-                index: 0,
-                buffer_ref: 7,
-                offset: 0,
-                wire_va: 0,
-                attribute_stride: 0,
-                has_attribute_stride: false,
-                is_fragment: false,
-                stage: IcbRenderBindStage::Object,
-            }],
-            object_threadgroup_memory: vec![],
-            draw: unit_mesh_draw(),
+    resolve_icb_record(&state_a, &host_a, 1, 9).expect("record first device ICB");
+    resolve_icb_record(&state_b, &host_b, 1, 9).expect("record second device ICB");
+    let first = state_a
+        .task_objects
+        .indirect_command_buffers
+        .identity(1, 9)
+        .expect("first identity");
+    bind_icb_command_memory(
+        &state_a,
+        1,
+        9,
+        IcbCommandMemory {
+            gva: 0x4000,
+            byte_len: 64,
         },
     )
-    .expect("fill object buffer bind");
+    .expect("bind only the first device");
+    assert!(
+        state_b
+            .task_objects
+            .indirect_command_buffers
+            .snapshot(1, 9)
+            .expect("second record")
+            .command_memory
+            .is_none(),
+        "equal task/ref pairs on different devices must not share state"
+    );
 
-    let mapping_id = map_draw_target(&mut host, &mut state, 0x41);
+    let mut changed = state_a
+        .task_objects
+        .indirect_command_buffers
+        .snapshot(1, 9)
+        .expect("first record")
+        .descriptor;
+    changed.max_kernel_buffer_bind_count += 1;
+    state_a
+        .task_objects
+        .indirect_command_buffers
+        .record(1, 9, changed)
+        .expect("replace changed declaration");
+    let changed_identity = state_a
+        .task_objects
+        .indirect_command_buffers
+        .identity(1, 9)
+        .expect("changed identity");
+    assert_eq!(first.index(), changed_identity.index());
+    assert_ne!(first.generation(), changed_identity.generation());
+    assert!(
+        state_a
+            .task_objects
+            .indirect_command_buffers
+            .snapshot(1, 9)
+            .expect("changed record")
+            .command_memory
+            .is_none(),
+        "any declaration change invalidates command memory decoded under the old layout"
+    );
 
-    let req = draw_request(mapping_id);
+    assert!(state_a.task_objects.indirect_command_buffers.delete(1, 9));
     assert_eq!(
-        encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
-        EncodeStatus::Ok,
-        "object buffer bind ICB execute"
+        state_a.task_objects.indirect_command_buffers.identity(1, 9),
+        None
     );
+    resolve_icb_record(&state_a, &host_a, 1, 9).expect("recreate deleted ICB");
+    let replacement = state_a
+        .task_objects
+        .indirect_command_buffers
+        .identity(1, 9)
+        .expect("replacement identity");
+    assert_eq!(changed_identity.index(), replacement.index());
+    assert_ne!(changed_identity.generation(), replacement.generation());
 
-    assert_target_is_shader_solid(&mut state, &mut host, mapping_id, "object buffer bind");
-}
-
-/// Wire-backed E2E: encode mesh buffer bind + MeshThreads → command memory
-/// → 0x1d1 → fill_icb_from_command_memory → execute (setMeshBuffer path).
-#[test]
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-fn wire_backed_mesh_buffer_bind_e2e() {
-    use crate::runtime::decode::resource::{
-        encode_icb_command_layout, render_draw_mesh_threads_icb_layout_with_binds, ICB_DESC_LAYOUT,
-        ICB_LAYOUT_LEN, MTL_INDIRECT_CMD_DRAW_MESH_THREADS,
-    };
-
-    let _guard = icb_test_guard();
-
-    let mesh_mtlb = read_fixture("icb_mesh_buf.metallib");
-    let frag_mtlb = read_fixture("icb_mesh_frag.metallib");
-
-    let (mut host, mut state) = icb_device();
-
-    let mut icb_desc =
-        make_render_icb_desc_bytes_ex(1, 0, 0, 0, 1, MTL_INDIRECT_CMD_DRAW_MESH_THREADS, 0);
-    let layout = render_draw_mesh_threads_icb_layout_with_binds(0, 1);
-    icb_desc[ICB_DESC_LAYOUT..ICB_DESC_LAYOUT + ICB_LAYOUT_LEN]
-        .copy_from_slice(&encode_icb_command_layout(&layout));
-    let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
-
-    put_function_object(&mut host, &state, 2, 0x200, 2, &mesh_mtlb);
-
-    put_function_object(&mut host, &state, 3, 0x220, 3, &frag_mtlb);
-
-    let pdesc = make_stagein_render_pipeline_desc(2, 3);
-    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x240, &pdesc);
-
-    let scale_bytes = 1.0f32.to_le_bytes();
-    put_type1_buffer(&mut host, &state, 7, 4, &scale_bytes);
-    let scale_gva = 4u64 << RESOURCE_PAGE_SHIFT;
-
-    let fill = IcbRenderFill {
-        command_index: 0,
-        pipeline_ref: 6,
-        buffers: vec![IcbRenderBufferBind {
-            index: 0,
-            buffer_ref: 7,
-            offset: 0,
-            wire_va: scale_gva,
-            attribute_stride: 0,
-            has_attribute_stride: false,
-            is_fragment: false,
-            stage: IcbRenderBindStage::Mesh,
-        }],
-        object_threadgroup_memory: vec![],
-        draw: unit_mesh_threads_draw(),
-    };
-    let slot = encode_render_command_slot(&layout, &fill).expect("encode mesh bind slot");
-
-    associate_icb_command_memory(&mut host, &state, 5, &slot);
-
-    fill_icb_from_command_memory(&state, &host, 1, 9, 0, 1)
-        .expect("fill_icb_from_command_memory mesh buffer bind");
-
-    let mapping_id = map_draw_target(&mut host, &mut state, 0x42);
-
-    let req = draw_request(mapping_id);
+    assert!(state_a.delete_task(1).is_some());
     assert_eq!(
-        encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
-        EncodeStatus::Ok,
-        "wire-backed mesh buffer bind execute"
+        state_a.task_objects.indirect_command_buffers.identity(1, 9),
+        None
     );
-
-    assert_target_is_shader_solid(
-        &mut state,
-        &mut host,
-        mapping_id,
-        "wire-backed mesh buffer bind",
-    );
-}
-
-/// Wire-backed E2E: encode object buffer bind + MeshThreadgroups → command
-/// memory → 0x1d1 → fill_icb_from_command_memory → execute (setObjectBuffer).
-#[test]
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-fn wire_backed_object_buffer_bind_e2e() {
-    use crate::runtime::decode::resource::{
-        encode_icb_command_layout, render_draw_mesh_threadgroups_icb_layout_ex, ICB_DESC_LAYOUT,
-        ICB_LAYOUT_LEN, MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS,
-    };
-
-    let _guard = icb_test_guard();
-
-    let om_mtlb = read_fixture("icb_object_buf.metallib");
-    let frag_mtlb = read_fixture("icb_mesh_frag.metallib");
-
-    let (mut host, mut state) = icb_device();
-
-    let mut icb_desc =
-        make_render_icb_desc_bytes_ex(1, 0, 0, 1, 0, MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS, 0);
-    let layout = render_draw_mesh_threadgroups_icb_layout_ex(1, 0, 0);
-    icb_desc[ICB_DESC_LAYOUT..ICB_DESC_LAYOUT + ICB_LAYOUT_LEN]
-        .copy_from_slice(&encode_icb_command_layout(&layout));
-    let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
-
-    put_function_object(&mut host, &state, 2, 0x200, 2, &om_mtlb);
-
-    put_function_object(&mut host, &state, 3, 0x220, 3, &frag_mtlb);
-
-    let pdesc = make_stagein_render_pipeline_desc(2, 3);
-    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x240, &pdesc);
-
-    let scale_bytes = 1.0f32.to_le_bytes();
-    put_type1_buffer(&mut host, &state, 7, 4, &scale_bytes);
-    let scale_gva = 4u64 << RESOURCE_PAGE_SHIFT;
-
-    let fill = IcbRenderFill {
-        command_index: 0,
-        pipeline_ref: 6,
-        buffers: vec![IcbRenderBufferBind {
-            index: 0,
-            buffer_ref: 7,
-            offset: 0,
-            wire_va: scale_gva,
-            attribute_stride: 0,
-            has_attribute_stride: false,
-            is_fragment: false,
-            stage: IcbRenderBindStage::Object,
-        }],
-        object_threadgroup_memory: vec![],
-        draw: unit_mesh_draw(),
-    };
-    let slot = encode_render_command_slot(&layout, &fill).expect("encode object bind slot");
-
-    associate_icb_command_memory(&mut host, &state, 5, &slot);
-
-    fill_icb_from_command_memory(&state, &host, 1, 9, 0, 1)
-        .expect("fill_icb_from_command_memory object buffer bind");
-
-    let mapping_id = map_draw_target(&mut host, &mut state, 0x43);
-
-    let req = draw_request(mapping_id);
-    assert_eq!(
-        encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
-        EncodeStatus::Ok,
-        "wire-backed object buffer bind execute"
-    );
-
-    assert_target_is_shader_solid(
-        &mut state,
-        &mut host,
-        mapping_id,
-        "wire-backed object buffer bind",
+    assert!(
+        state_b
+            .task_objects
+            .indirect_command_buffers
+            .identity(1, 9)
+            .is_some(),
+        "tearing down one device's task must not touch another device"
     );
 }
 
@@ -3061,484 +1645,9 @@ fn decode_encode_object_tg_memory_mesh_slot() {
     assert_eq!(decoded.object_threadgroup_memory[1].length, 32);
 }
 
-/// Dedicated: non-multiple-of-16 object TG length is fail-closed (Args).
-#[test]
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-fn fill_render_object_tg_memory_bad_length_rejected() {
-    use crate::runtime::decode::resource::MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS;
-
-    let _guard = icb_test_guard();
-
-    let om_mtlb = read_fixture("icb_object_tg.metallib");
-    let frag_mtlb = read_fixture("icb_mesh_frag.metallib");
-
-    let (mut host, state) = icb_device();
-
-    {
-        use crate::runtime::decode::resource::{
-            encode_icb_command_layout, render_draw_mesh_threadgroups_icb_layout_ex,
-            ICB_DESC_LAYOUT, ICB_DESC_MAX_OBJECT_TG_BINDS, ICB_LAYOUT_LEN,
-        };
-        let mut b = make_render_icb_desc_bytes_ex(
-            1,
-            0,
-            0,
-            0,
-            0,
-            MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS,
-            0,
-        );
-        b[ICB_DESC_MAX_OBJECT_TG_BINDS] = 1;
-        let layout = render_draw_mesh_threadgroups_icb_layout_ex(0, 0, 1);
-        b[ICB_DESC_LAYOUT..ICB_DESC_LAYOUT + ICB_LAYOUT_LEN]
-            .copy_from_slice(&encode_icb_command_layout(&layout));
-        let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-        put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &b);
-    }
-
-    put_function_object(&mut host, &state, 2, 0x200, 2, &om_mtlb);
-
-    put_function_object(&mut host, &state, 3, 0x220, 3, &frag_mtlb);
-
-    let pdesc = make_stagein_render_pipeline_desc(2, 3);
-    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x240, &pdesc);
-
-    let err = fill_render(
-        &state,
-        &host,
-        &IcbRenderFill {
-            command_index: 0,
-            pipeline_ref: 6,
-            buffers: vec![],
-            object_threadgroup_memory: vec![IcbThreadgroupMemory {
-                index: 0,
-                length: 8, // not multiple of 16
-            }],
-            draw: unit_mesh_draw(),
-        },
-    );
-    assert_eq!(
-        err,
-        Err(IcbStatus::Args("icb_frc_object_tg_length_alignment")),
-        "length 8 must fail closed, and name the alignment check"
-    );
-}
-
-/// Dedicated host-fill: object TG length 16 used by object shader → solid BGRA.
-#[test]
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-fn fill_render_object_tg_memory_oracle() {
-    use crate::runtime::decode::resource::MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS;
-
-    let _guard = icb_test_guard();
-
-    let om_mtlb = read_fixture("icb_object_tg.metallib");
-    let frag_mtlb = read_fixture("icb_mesh_frag.metallib");
-
-    let (mut host, mut state) = icb_device();
-
-    {
-        use crate::runtime::decode::resource::{
-            encode_icb_command_layout, render_draw_mesh_threadgroups_icb_layout_ex,
-            ICB_DESC_LAYOUT, ICB_DESC_MAX_OBJECT_TG_BINDS, ICB_LAYOUT_LEN,
-        };
-        let mut b = make_render_icb_desc_bytes_ex(
-            1,
-            0,
-            0,
-            0,
-            0,
-            MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS,
-            0,
-        );
-        b[ICB_DESC_MAX_OBJECT_TG_BINDS] = 1;
-        let layout = render_draw_mesh_threadgroups_icb_layout_ex(0, 0, 1);
-        b[ICB_DESC_LAYOUT..ICB_DESC_LAYOUT + ICB_LAYOUT_LEN]
-            .copy_from_slice(&encode_icb_command_layout(&layout));
-        let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-        put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &b);
-    }
-
-    put_function_object(&mut host, &state, 2, 0x200, 2, &om_mtlb);
-
-    put_function_object(&mut host, &state, 3, 0x220, 3, &frag_mtlb);
-
-    let pdesc = make_stagein_render_pipeline_desc(2, 3);
-    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x240, &pdesc);
-
-    fill_render(
-        &state,
-        &host,
-        &IcbRenderFill {
-            command_index: 0,
-            pipeline_ref: 6,
-            buffers: vec![],
-            object_threadgroup_memory: vec![IcbThreadgroupMemory {
-                index: 0,
-                length: 16,
-            }],
-            draw: unit_mesh_draw(),
-        },
-    )
-    .expect("fill object TG memory");
-
-    let mapping_id = map_draw_target(&mut host, &mut state, 0x45);
-
-    let req = draw_request(mapping_id);
-    assert_eq!(
-        encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
-        EncodeStatus::Ok,
-        "object TG memory ICB execute"
-    );
-
-    assert_target_is_shader_solid(&mut state, &mut host, mapping_id, "object TG memory");
-}
-
-/// Dedicated wire-backed E2E: object TG length 16 through command memory.
-#[test]
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-fn wire_backed_object_tg_memory_e2e() {
-    use crate::runtime::decode::resource::{
-        encode_icb_command_layout, render_draw_mesh_threadgroups_icb_layout_ex, ICB_DESC_LAYOUT,
-        ICB_DESC_MAX_OBJECT_TG_BINDS, ICB_LAYOUT_LEN, MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS,
-    };
-
-    let _guard = icb_test_guard();
-
-    let om_mtlb = read_fixture("icb_object_tg.metallib");
-    let frag_mtlb = read_fixture("icb_mesh_frag.metallib");
-
-    let (mut host, mut state) = icb_device();
-
-    let layout = render_draw_mesh_threadgroups_icb_layout_ex(0, 0, 1);
-    let mut icb_desc =
-        make_render_icb_desc_bytes_ex(1, 0, 0, 0, 0, MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS, 0);
-    icb_desc[ICB_DESC_MAX_OBJECT_TG_BINDS] = 1;
-    icb_desc[ICB_DESC_LAYOUT..ICB_DESC_LAYOUT + ICB_LAYOUT_LEN]
-        .copy_from_slice(&encode_icb_command_layout(&layout));
-    let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
-
-    put_function_object(&mut host, &state, 2, 0x200, 2, &om_mtlb);
-
-    put_function_object(&mut host, &state, 3, 0x220, 3, &frag_mtlb);
-
-    let pdesc = make_stagein_render_pipeline_desc(2, 3);
-    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x240, &pdesc);
-
-    let fill = IcbRenderFill {
-        command_index: 0,
-        pipeline_ref: 6,
-        buffers: vec![],
-        object_threadgroup_memory: vec![IcbThreadgroupMemory {
-            index: 0,
-            length: 16,
-        }],
-        draw: unit_mesh_draw(),
-    };
-    let slot = encode_render_command_slot(&layout, &fill).expect("encode object TG slot");
-
-    associate_icb_command_memory(&mut host, &state, 5, &slot);
-
-    fill_icb_from_command_memory(&state, &host, 1, 9, 0, 1)
-        .expect("fill_icb_from_command_memory object TG");
-
-    let mapping_id = map_draw_target(&mut host, &mut state, 0x46);
-
-    let req = draw_request(mapping_id);
-    assert_eq!(
-        encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
-        EncodeStatus::Ok,
-        "wire-backed object TG execute"
-    );
-
-    assert_target_is_shader_solid(&mut state, &mut host, mapping_id, "wire-backed object TG");
-}
-
-/// Wire-backed E2E: drawMeshThreads.
-///
-/// Same guest path as patches: encode slot into type-1 command memory,
-/// `0x1d1` bind, execute re-fills from wire (no host `fill_render_command`).
-#[test]
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-fn wire_backed_mesh_threads_e2e() {
-    use crate::runtime::decode::resource::{
-        render_draw_mesh_threads_icb_layout, MTL_INDIRECT_CMD_DRAW_MESH_THREADS,
-    };
-
-    let _guard = icb_test_guard();
-
-    let mesh_mtlb = read_fixture("icb_mesh.metallib");
-    let frag_mtlb = read_fixture("icb_mesh_frag.metallib");
-
-    let (mut host, mut state) = icb_device();
-
-    let layout = render_draw_mesh_threads_icb_layout(0);
-    let icb_desc = make_render_icb_desc_bytes(1, 0, 0, MTL_INDIRECT_CMD_DRAW_MESH_THREADS);
-    let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
-
-    put_function_object(&mut host, &state, 2, 0x200, 2, &mesh_mtlb);
-
-    put_function_object(&mut host, &state, 3, 0x220, 3, &frag_mtlb);
-
-    let pdesc = make_stagein_render_pipeline_desc(2, 3);
-    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x240, &pdesc);
-
-    let slot = encode_render_command_slot(
-        &layout,
-        &IcbRenderFill {
-            command_index: 0,
-            pipeline_ref: 6,
-            buffers: vec![],
-            object_threadgroup_memory: vec![],
-            draw: unit_mesh_threads_draw(),
-        },
-    )
-    .expect("encode MeshThreads slot");
-
-    associate_icb_command_memory(&mut host, &state, 6, &slot);
-
-    fill_icb_from_command_memory(&state, &host, 1, 9, 0, 1)
-        .expect("fill_icb_from_command_memory MeshThreads");
-
-    let mapping_id = map_draw_target(&mut host, &mut state, 0x3d);
-
-    let req = draw_request(mapping_id);
-    assert_eq!(
-        encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
-        EncodeStatus::Ok,
-        "wire-backed MeshThreads execute"
-    );
-
-    assert_target_is_shader_solid(&mut state, &mut host, mapping_id, "wire-backed MeshThreads");
-}
-
-/// Dedicated wire-backed E2E: drawMeshThreadgroups (no object buffer binds).
-///
-/// Separate from object-buffer E2E so MeshThreadgroups command-memory path
-/// cannot regress silently when that other test is simplified.
-#[test]
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-fn wire_backed_mesh_threadgroups_e2e() {
-    use crate::runtime::decode::resource::{
-        render_draw_mesh_threadgroups_icb_layout, MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS,
-    };
-
-    let _guard = icb_test_guard();
-
-    let mesh_mtlb = read_fixture("icb_mesh.metallib");
-    let frag_mtlb = read_fixture("icb_mesh_frag.metallib");
-
-    let (mut host, mut state) = icb_device();
-
-    let layout = render_draw_mesh_threadgroups_icb_layout();
-    let icb_desc = make_render_icb_desc_bytes(1, 0, 0, MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS);
-    let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
-
-    put_function_object(&mut host, &state, 2, 0x200, 2, &mesh_mtlb);
-
-    put_function_object(&mut host, &state, 3, 0x220, 3, &frag_mtlb);
-
-    let pdesc = make_stagein_render_pipeline_desc(2, 3);
-    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x240, &pdesc);
-
-    let slot = encode_render_command_slot(
-        &layout,
-        &IcbRenderFill {
-            command_index: 0,
-            pipeline_ref: 6,
-            buffers: vec![],
-            object_threadgroup_memory: vec![],
-            draw: unit_mesh_draw(),
-        },
-    )
-    .expect("encode MeshThreadgroups slot");
-
-    associate_icb_command_memory(&mut host, &state, 6, &slot);
-
-    fill_icb_from_command_memory(&state, &host, 1, 9, 0, 1)
-        .expect("fill_icb_from_command_memory MeshThreadgroups");
-
-    let mapping_id = map_draw_target(&mut host, &mut state, 0x44);
-
-    let req = draw_request(mapping_id);
-    assert_eq!(
-        encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
-        EncodeStatus::Ok,
-        "wire-backed MeshThreadgroups execute"
-    );
-
-    assert_target_is_shader_solid(
-        &mut state,
-        &mut host,
-        mapping_id,
-        "wire-backed MeshThreadgroups",
-    );
-}
-
-/// inheritBuffers=true: ICB slot records only draw+PSO; fragment color
-/// comes from the parent encoder (stream bind path).
-#[test]
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-fn inherit_buffers_encoder_fragment_color() {
-    let _guard = icb_test_guard();
-
-    let (vert_mtlb, frag_mtlb) = load_oracle_mtlb();
-    let (mut host, mut state) = icb_device();
-
-    // inheritBuffers bit1; maxFragment still advertises encoder bind capacity.
-    let icb_desc = make_render_icb_desc_bytes_flags(
-        1,
-        0,
-        1,
-        MTL_INDIRECT_CMD_DRAW_INDEXED,
-        ICB_FLAG_INHERIT_BUFFERS,
-    );
-    let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
-
-    put_function_object(&mut host, &state, 2, 0x200, 2, &vert_mtlb);
-
-    put_function_object(&mut host, &state, 3, 0x220, 3, &frag_mtlb);
-
-    let pdesc = make_render_pipeline_desc(2, 3);
-    let pdesc_gva = 0x240u64;
-    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, pdesc_gva, &pdesc);
-
-    let indices: [u16; 3] = [0, 1, 2];
-    let index_bytes: Vec<u8> = indices.iter().flat_map(|v| v.to_le_bytes()).collect();
-    put_type1_buffer(&mut host, &state, 12, 4, &index_bytes);
-
-    let sid = 7u8;
-    let r = (0x60u32 + sid as u32) as f32 / 255.0;
-    let color = [r, 0x44 as f32 / 255.0, 0x22 as f32 / 255.0, 1.0f32];
-    let color_bytes: Vec<u8> = color.iter().flat_map(|f| f.to_le_bytes()).collect();
-    put_type1_buffer(&mut host, &state, 13, 5, &color_bytes);
-
-    // Fill: pipeline + draw only — no fragment buffer in the ICB slot.
-    fill_render(
-        &state,
-        &host,
-        &IcbRenderFill {
-            command_index: 0,
-            pipeline_ref: 6,
-            buffers: vec![],
-            object_threadgroup_memory: vec![],
-            draw: indexed_draw(0),
-        },
-    )
-    .expect("fill inherit draw");
-
-    let mapping_id = map_draw_target(&mut host, &mut state, 0x32);
-
-    // Stream-style fragment bind on the encode request (parent encoder).
-    let req = DrawEncodeRequest {
-        fragment_buffers: vec![BufferBind {
-            index: 0,
-            buffer_ref: 13,
-            offset: 0,
-            attribute_stride: None,
-            ..Default::default()
-        }]
-        .into(),
-        viewports: vec![[0.0, 0.0, 4.0, 4.0, 0.0, 1.0]],
-        ..draw_request(mapping_id)
-    };
-    assert_eq!(
-        encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
-        EncodeStatus::Ok,
-        "inheritBuffers encoder fragment path"
-    );
-
-    assert_stagein_solid(
-        &mut state,
-        &mut host,
-        mapping_id,
-        sid,
-        "inheritBuffers encoder",
-    );
-}
-
 /// inheritPipelineState=true: ICB slot records only buffers+draw; PSO
 /// comes from the parent render encoder (stream pipeline bind path).
 /// Mirrors `inherit_pipeline_encoder_kernel_mul3add1` for compute.
-#[test]
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-fn inherit_pipeline_encoder_fragment_color() {
-    use crate::runtime::decode::resource::ICB_FLAG_INHERIT_PIPELINE_STATE;
-
-    let _guard = icb_test_guard();
-
-    let (vert_mtlb, frag_mtlb) = load_oracle_mtlb();
-    let (mut host, mut state) = icb_device();
-
-    // inheritPipelineState bit0; maxFragment for fragment color in ICB slot.
-    let icb_desc = make_render_icb_desc_bytes_flags(
-        1,
-        0,
-        1,
-        MTL_INDIRECT_CMD_DRAW_INDEXED,
-        ICB_FLAG_INHERIT_PIPELINE_STATE,
-    );
-    let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
-
-    put_function_object(&mut host, &state, 2, 0x200, 2, &vert_mtlb);
-
-    put_function_object(&mut host, &state, 3, 0x220, 3, &frag_mtlb);
-
-    let pdesc = make_render_pipeline_desc(2, 3);
-    let pdesc_gva = 0x240u64;
-    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, pdesc_gva, &pdesc);
-
-    let indices: [u16; 3] = [0, 1, 2];
-    let index_bytes: Vec<u8> = indices.iter().flat_map(|v| v.to_le_bytes()).collect();
-    put_type1_buffer(&mut host, &state, 12, 4, &index_bytes);
-
-    let sid = 7u8;
-    let r = (0x60u32 + sid as u32) as f32 / 255.0;
-    let color = [r, 0x44 as f32 / 255.0, 0x22 as f32 / 255.0, 1.0f32];
-    let color_bytes: Vec<u8> = color.iter().flat_map(|f| f.to_le_bytes()).collect();
-    put_type1_buffer(&mut host, &state, 13, 5, &color_bytes);
-
-    // Fill: buffers + draw only — pipeline_ref 0 (inherited from parent).
-    fill_render(
-        &state,
-        &host,
-        &IcbRenderFill {
-            command_index: 0,
-            pipeline_ref: 0,
-            buffers: vec![render_bind(0, 13, true)],
-            object_threadgroup_memory: vec![],
-            draw: indexed_draw(0),
-        },
-    )
-    .expect("fill inheritPipeline draw");
-
-    let mapping_id = map_draw_target(&mut host, &mut state, 0x34);
-
-    // Stream-style pipeline on the encode request (parent encoder).
-    let req = DrawEncodeRequest {
-        viewports: vec![[0.0, 0.0, 4.0, 4.0, 0.0, 1.0]],
-        ..draw_request(mapping_id)
-    };
-    assert_eq!(
-        encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
-        EncodeStatus::Ok,
-        "inheritPipelineState encoder fragment path"
-    );
-
-    assert_stagein_solid(
-        &mut state,
-        &mut host,
-        mapping_id,
-        sid,
-        "inheritPipelineState encoder",
-    );
-}
-
 #[test]
 fn stagein_pipeline_fixture_decodes_vertex_attrs() {
     use crate::runtime::decode::resource::decode_render_pipeline_descriptor;
@@ -3555,184 +1664,8 @@ fn stagein_pipeline_fixture_decodes_vertex_attrs() {
     assert_eq!(a.stride, 16);
 }
 
-/// ICB Draw with `[[stage_in]]` vertex descriptor: position buffer +
-/// fragment color → solid BGRA (render_stagein fixtures).
-#[test]
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-fn fill_render_stagein_draw_execute_oracle() {
-    let _guard = icb_test_guard();
-
-    let (vert_mtlb, frag_mtlb) = load_stagein_mtlb();
-    let (mut host, mut state) = icb_device();
-
-    // Draw (not indexed): max_vertex=1 for position buffer bind.
-    let icb_desc = make_render_icb_desc_bytes(1, 1, 1, MTL_INDIRECT_CMD_DRAW);
-    let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
-
-    put_function_object(&mut host, &state, 2, 0x200, 2, &vert_mtlb);
-
-    put_function_object(&mut host, &state, 3, 0x220, 3, &frag_mtlb);
-
-    let pdesc = make_stagein_render_pipeline_desc(2, 3);
-    let pdesc_gva = 0x240u64;
-    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, pdesc_gva, &pdesc);
-
-    // Fullscreen triangle positions (clip space), stride 16 Float4.
-    let tri: [[f32; 4]; 3] = [
-        [-1.0, -1.0, 0.0, 1.0],
-        [3.0, -1.0, 0.0, 1.0],
-        [-1.0, 3.0, 0.0, 1.0],
-    ];
-    let pos_bytes: Vec<u8> = tri
-        .iter()
-        .flat_map(|v| v.iter().flat_map(|f| f.to_le_bytes()))
-        .collect();
-    put_type1_buffer(&mut host, &state, 11, 4, &pos_bytes);
-
-    let sid = 7u8;
-    let r = (0x60u32 + sid as u32) as f32 / 255.0;
-    let color = [r, 0x44 as f32 / 255.0, 0x22 as f32 / 255.0, 1.0f32];
-    let color_bytes: Vec<u8> = color.iter().flat_map(|f| f.to_le_bytes()).collect();
-    put_type1_buffer(&mut host, &state, 13, 5, &color_bytes);
-
-    fill_render(
-        &state,
-        &host,
-        &IcbRenderFill {
-            command_index: 0,
-            pipeline_ref: 6,
-            buffers: vec![render_bind(0, 11, false), render_bind(0, 13, true)],
-            object_threadgroup_memory: vec![],
-            draw: IcbRenderDraw::Primitives {
-                primitive_type: 3,
-                vertex_start: 0,
-                vertex_count: 3,
-                instance_count: 1,
-                base_instance: 0,
-            },
-        },
-    )
-    .expect("fill_render stage_in Draw");
-
-    let mapping_id = map_draw_target(&mut host, &mut state, 0x33);
-
-    let req = draw_request(mapping_id);
-    assert_eq!(
-        encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
-        EncodeStatus::Ok,
-        "stage_in ICB execute"
-    );
-
-    assert_stagein_solid(&mut state, &mut host, mapping_id, sid, "ICB stage_in");
-}
-
 /// Dedicated wire-backed E2E: classic Draw (`0x1`) with stage_in vertex
 /// buffer + fragment color — not DrawIndexed and not host fill API.
-#[test]
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-fn wire_backed_draw_primitives_stagein_e2e() {
-    use crate::runtime::decode::resource::{render_icb_layout, MTL_INDIRECT_CMD_DRAW};
-
-    let _guard = icb_test_guard();
-
-    let (vert_mtlb, frag_mtlb) = load_stagein_mtlb();
-    let (mut host, mut state) = icb_device();
-
-    let layout = render_icb_layout(1, 1, MTL_INDIRECT_CMD_DRAW);
-    let icb_desc = make_render_icb_desc_bytes(1, 1, 1, MTL_INDIRECT_CMD_DRAW);
-    let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
-
-    put_function_object(&mut host, &state, 2, 0x200, 2, &vert_mtlb);
-
-    put_function_object(&mut host, &state, 3, 0x220, 3, &frag_mtlb);
-
-    let pdesc = make_stagein_render_pipeline_desc(2, 3);
-    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x240, &pdesc);
-
-    let tri: [[f32; 4]; 3] = [
-        [-1.0, -1.0, 0.0, 1.0],
-        [3.0, -1.0, 0.0, 1.0],
-        [-1.0, 3.0, 0.0, 1.0],
-    ];
-    let pos_bytes: Vec<u8> = tri
-        .iter()
-        .flat_map(|v| v.iter().flat_map(|f| f.to_le_bytes()))
-        .collect();
-    put_type1_buffer(&mut host, &state, 11, 4, &pos_bytes);
-
-    let sid = 7u8;
-    let r = (0x60u32 + sid as u32) as f32 / 255.0;
-    let color = [r, 0x44 as f32 / 255.0, 0x22 as f32 / 255.0, 1.0f32];
-    let color_bytes: Vec<u8> = color.iter().flat_map(|f| f.to_le_bytes()).collect();
-    put_type1_buffer(&mut host, &state, 13, 5, &color_bytes);
-
-    let pos_wire = (4u64) << RESOURCE_PAGE_SHIFT;
-    let color_wire = (5u64) << RESOURCE_PAGE_SHIFT;
-
-    let slot = encode_render_command_slot(
-        &layout,
-        &IcbRenderFill {
-            command_index: 0,
-            pipeline_ref: 6,
-            buffers: vec![
-                IcbRenderBufferBind {
-                    index: 0,
-                    buffer_ref: 11,
-                    offset: 0,
-                    wire_va: pos_wire,
-                    attribute_stride: 0,
-                    has_attribute_stride: false,
-                    is_fragment: false,
-                    stage: IcbRenderBindStage::Vertex,
-                },
-                IcbRenderBufferBind {
-                    index: 0,
-                    buffer_ref: 13,
-                    offset: 0,
-                    wire_va: color_wire,
-                    attribute_stride: 0,
-                    has_attribute_stride: false,
-                    is_fragment: true,
-                    stage: IcbRenderBindStage::Fragment,
-                },
-            ],
-            object_threadgroup_memory: vec![],
-            draw: IcbRenderDraw::Primitives {
-                primitive_type: 3,
-                vertex_start: 0,
-                vertex_count: 3,
-                instance_count: 1,
-                base_instance: 0,
-            },
-        },
-    )
-    .expect("encode Draw primitives slot");
-
-    associate_icb_command_memory(&mut host, &state, 6, &slot);
-
-    fill_icb_from_command_memory(&state, &host, 1, 9, 0, 1)
-        .expect("fill_icb_from_command_memory Draw primitives");
-
-    let mapping_id = map_draw_target(&mut host, &mut state, 0x49);
-
-    let req = draw_request(mapping_id);
-    assert_eq!(
-        encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
-        EncodeStatus::Ok,
-        "wire-backed Draw primitives execute"
-    );
-
-    assert_stagein_solid(
-        &mut state,
-        &mut host,
-        mapping_id,
-        sid,
-        "wire-backed Draw stage_in",
-    );
-}
-
 #[test]
 fn decode_encode_attribute_stride_table() {
     use crate::runtime::decode::resource::{
@@ -3819,203 +1752,9 @@ fn decode_encode_attribute_stride_table() {
     assert!(!fbind.has_attribute_stride);
 }
 
-/// Host fill with attributeStride on vertex bind — stage_in Draw still solid.
-#[test]
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-fn fill_render_attribute_stride_stagein_execute() {
-    let _guard = icb_test_guard();
-
-    let (vert_mtlb, frag_mtlb) = load_stagein_mtlb();
-    let (mut host, mut state) = icb_device();
-
-    let icb_desc = make_render_icb_desc_bytes(1, 1, 1, MTL_INDIRECT_CMD_DRAW);
-    let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
-
-    put_function_object(&mut host, &state, 2, 0x200, 2, &vert_mtlb);
-
-    put_function_object(&mut host, &state, 3, 0x220, 3, &frag_mtlb);
-
-    let pdesc = make_stagein_render_pipeline_desc(2, 3);
-    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x240, &pdesc);
-
-    // Tight Float4 positions (stride 16) — attributeStride matches layout stride.
-    let tri: [[f32; 4]; 3] = [
-        [-1.0, -1.0, 0.0, 1.0],
-        [3.0, -1.0, 0.0, 1.0],
-        [-1.0, 3.0, 0.0, 1.0],
-    ];
-    let pos_bytes: Vec<u8> = tri
-        .iter()
-        .flat_map(|v| v.iter().flat_map(|f| f.to_le_bytes()))
-        .collect();
-    put_type1_buffer(&mut host, &state, 11, 4, &pos_bytes);
-
-    let sid = 7u8;
-    let r = (0x60u32 + sid as u32) as f32 / 255.0;
-    let color = [r, 0x44 as f32 / 255.0, 0x22 as f32 / 255.0, 1.0f32];
-    let color_bytes: Vec<u8> = color.iter().flat_map(|f| f.to_le_bytes()).collect();
-    put_type1_buffer(&mut host, &state, 13, 5, &color_bytes);
-
-    fill_render(
-        &state,
-        &host,
-        &IcbRenderFill {
-            command_index: 0,
-            pipeline_ref: 6,
-            buffers: vec![
-                IcbRenderBufferBind {
-                    index: 0,
-                    buffer_ref: 11,
-                    offset: 0,
-                    wire_va: 0,
-                    attribute_stride: 16,
-                    has_attribute_stride: true,
-                    is_fragment: false,
-                    stage: IcbRenderBindStage::default(),
-                },
-                render_bind(0, 13, true),
-            ],
-            object_threadgroup_memory: vec![],
-            draw: IcbRenderDraw::Primitives {
-                primitive_type: 3,
-                vertex_start: 0,
-                vertex_count: 3,
-                instance_count: 1,
-                base_instance: 0,
-            },
-        },
-    )
-    .expect("fill with attributeStride");
-
-    let mapping_id = map_draw_target(&mut host, &mut state, 0x36);
-
-    let req = draw_request(mapping_id);
-    assert_eq!(
-        encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
-        EncodeStatus::Ok
-    );
-
-    assert_stagein_solid(
-        &mut state,
-        &mut host,
-        mapping_id,
-        sid,
-        "attributeStride stage_in",
-    );
-}
-
 /// Dedicated wire-backed E2E: vertex attributeStride=16 through command
 /// memory (not host fill API). Proves stride table encode → decode →
 /// setVertexBuffer:offset:attributeStride:.
-#[test]
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-fn wire_backed_attribute_stride_stagein_e2e() {
-    use crate::runtime::decode::resource::{render_icb_layout, MTL_INDIRECT_CMD_DRAW};
-
-    let _guard = icb_test_guard();
-
-    let (vert_mtlb, frag_mtlb) = load_stagein_mtlb();
-    let (mut host, mut state) = icb_device();
-
-    let layout = render_icb_layout(1, 1, MTL_INDIRECT_CMD_DRAW);
-    assert!(icb_layout_attribute_stride_slot_count(&layout) >= 1);
-    let icb_desc = make_render_icb_desc_bytes(1, 1, 1, MTL_INDIRECT_CMD_DRAW);
-    let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
-
-    put_function_object(&mut host, &state, 2, 0x200, 2, &vert_mtlb);
-
-    put_function_object(&mut host, &state, 3, 0x220, 3, &frag_mtlb);
-
-    let pdesc = make_stagein_render_pipeline_desc(2, 3);
-    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x240, &pdesc);
-
-    let tri: [[f32; 4]; 3] = [
-        [-1.0, -1.0, 0.0, 1.0],
-        [3.0, -1.0, 0.0, 1.0],
-        [-1.0, 3.0, 0.0, 1.0],
-    ];
-    let pos_bytes: Vec<u8> = tri
-        .iter()
-        .flat_map(|v| v.iter().flat_map(|f| f.to_le_bytes()))
-        .collect();
-    put_type1_buffer(&mut host, &state, 11, 4, &pos_bytes);
-
-    let sid = 7u8;
-    let r = (0x60u32 + sid as u32) as f32 / 255.0;
-    let color = [r, 0x44 as f32 / 255.0, 0x22 as f32 / 255.0, 1.0f32];
-    let color_bytes: Vec<u8> = color.iter().flat_map(|f| f.to_le_bytes()).collect();
-    put_type1_buffer(&mut host, &state, 13, 5, &color_bytes);
-
-    let pos_wire = (4u64) << RESOURCE_PAGE_SHIFT;
-    let color_wire = (5u64) << RESOURCE_PAGE_SHIFT;
-
-    let fill = IcbRenderFill {
-        command_index: 0,
-        pipeline_ref: 6,
-        buffers: vec![
-            IcbRenderBufferBind {
-                index: 0,
-                buffer_ref: 11,
-                offset: 0,
-                wire_va: pos_wire,
-                attribute_stride: 16,
-                has_attribute_stride: true,
-                is_fragment: false,
-                stage: IcbRenderBindStage::Vertex,
-            },
-            IcbRenderBufferBind {
-                index: 0,
-                buffer_ref: 13,
-                offset: 0,
-                wire_va: color_wire,
-                attribute_stride: 0,
-                has_attribute_stride: false,
-                is_fragment: true,
-                stage: IcbRenderBindStage::Fragment,
-            },
-        ],
-        object_threadgroup_memory: vec![],
-        draw: IcbRenderDraw::Primitives {
-            primitive_type: 3,
-            vertex_start: 0,
-            vertex_count: 3,
-            instance_count: 1,
-            base_instance: 0,
-        },
-    };
-    let slot = encode_render_command_slot(&layout, &fill).expect("encode attributeStride slot");
-    // Wire carries non-zero stride at attributeStrideOffset.
-    assert_eq!(
-        ld64(&slot[layout.attribute_stride_offset as usize..]),
-        16,
-        "attribute stride table on wire"
-    );
-
-    associate_icb_command_memory(&mut host, &state, 6, &slot);
-
-    fill_icb_from_command_memory(&state, &host, 1, 9, 0, 1)
-        .expect("fill_icb_from_command_memory attributeStride");
-
-    let mapping_id = map_draw_target(&mut host, &mut state, 0x4a);
-
-    let req = draw_request(mapping_id);
-    assert_eq!(
-        encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
-        EncodeStatus::Ok,
-        "wire-backed attributeStride execute"
-    );
-
-    assert_stagein_solid(
-        &mut state,
-        &mut host,
-        mapping_id,
-        sid,
-        "wire-backed attributeStride",
-    );
-}
-
 #[test]
 fn decode_encode_barrier_and_threadgroup_memory() {
     use crate::runtime::decode::resource::{compute_icb_layout, icb_layout_kernel_tg_slot_count};
@@ -4052,963 +1791,4 @@ fn decode_encode_barrier_and_threadgroup_memory() {
     assert_eq!(decoded.threadgroup_memory[0].length, 64);
     assert_eq!(decoded.threadgroup_memory[1].index, 1);
     assert_eq!(decoded.threadgroup_memory[1].length, 128);
-}
-
-/// Host fill + execute with barrier + threadgroup memory lengths (no shader
-/// dependency — mul3add1 ignores TG mem; verifies Metal accepts the record).
-#[test]
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-fn fill_compute_barrier_and_tg_memory_execute() {
-    use crate::runtime::compute_session::ComputeSession;
-
-    let (_guard, mtlb, mut host, mut state) = mul3add1_fixture();
-
-    let icb_desc = make_icb_desc_bytes_tg(1, 1, 1, 0);
-    let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
-
-    put_function_object(&mut host, &state, 5, 0x100, 2, &mtlb);
-
-    let pdesc = make_compute_pipeline_desc(5);
-    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x140, &pdesc);
-
-    let data = [1u32, 2, 3, 4];
-    let data_bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
-    let buf_gva = 3u64 << RESOURCE_PAGE_SHIFT;
-    gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], buf_gva, &data_bytes);
-    let mut bdesc = vec![0u8; 16];
-    st64(&mut bdesc[0..], 16);
-    st32(&mut bdesc[8..], 3);
-    put_object(&mut host, &state, 7, OBJECT_TYPE_BUFFER, 0x180, &bdesc);
-
-    fill_compute(
-        &state,
-        &host,
-        &IcbComputeFill {
-            command_index: 0,
-            pipeline_ref: 6,
-            buffers: vec![kernel_bind(0, 7)],
-            threadgroup_memory: vec![IcbThreadgroupMemory {
-                index: 0,
-                length: 16,
-            }],
-            barrier: true,
-            dispatch: unit_grid_dispatch(4, 1, 1),
-        },
-    )
-    .expect("fill with barrier+tg");
-
-    let mut session = ComputeSession::open(0).expect("session");
-    let cmd = execute_icb_command(9, 0, 1);
-    assert_eq!(
-        session.encode_icb(
-            &mut state,
-            &mut host,
-            1,
-            &cmd,
-            &crate::runtime::compute_exec::ComputeAccum::default()
-        ),
-        crate::runtime::compute_exec::ComputeStatus::Ok
-    );
-    assert_eq!(
-        session.finish(&mut host, &mut state, 1),
-        crate::runtime::compute_exec::ComputeStatus::Ok
-    );
-
-    let out = read_u32x4(&host, &state, buf_gva);
-    assert_eq!(out, vec![4, 7, 10, 13], "barrier+tg fill still mul3add1");
-}
-
-/// inheritBuffers=true: ICB slot records only PSO+dispatch; kernel buffer
-/// comes from the parent compute encoder (stream `ComputeAccum`).
-#[test]
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-fn inherit_buffers_encoder_kernel_mul3add1() {
-    use crate::runtime::compute_exec::{ComputeAccum, ComputeBufferBind};
-    use crate::runtime::compute_session::ComputeSession;
-
-    let (_guard, mtlb, mut host, mut state) = mul3add1_fixture();
-
-    // inheritBuffers; maxKernel still advertises encoder bind capacity.
-    let icb_desc = make_icb_desc_bytes_tg(1, 1, 0, ICB_FLAG_INHERIT_BUFFERS);
-    let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
-
-    put_function_object(&mut host, &state, 5, 0x100, 2, &mtlb);
-
-    let pdesc = make_compute_pipeline_desc(5);
-    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x140, &pdesc);
-
-    let data = [1u32, 2, 3, 4];
-    let data_bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
-    let buf_gva = 3u64 << RESOURCE_PAGE_SHIFT;
-    gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], buf_gva, &data_bytes);
-    let mut bdesc = vec![0u8; 16];
-    st64(&mut bdesc[0..], 16);
-    st32(&mut bdesc[8..], 3);
-    put_object(&mut host, &state, 7, OBJECT_TYPE_BUFFER, 0x180, &bdesc);
-
-    // Fill: pipeline + dispatch only — no kernel buffer in the ICB slot.
-    fill_compute(
-        &state,
-        &host,
-        &IcbComputeFill {
-            command_index: 0,
-            pipeline_ref: 6,
-            buffers: vec![],
-            threadgroup_memory: vec![],
-            barrier: false,
-            dispatch: unit_grid_dispatch(4, 1, 1),
-        },
-    )
-    .expect("fill inheritBuffers dispatch");
-
-    // Stream-style kernel bind on the parent encoder.
-    let mut acc = ComputeAccum::default();
-    acc.buffers.push(ComputeBufferBind {
-        index: 0,
-        buffer_ref: 7,
-        offset: 0,
-        attribute_stride: 0,
-        has_attribute_stride: false,
-    });
-
-    let mut session = ComputeSession::open(0).expect("session");
-    let cmd = execute_icb_command(9, 0, 1);
-    assert_eq!(
-        session.encode_icb(&mut state, &mut host, 1, &cmd, &acc),
-        crate::runtime::compute_exec::ComputeStatus::Ok,
-        "inheritBuffers encoder kernel path"
-    );
-    assert_eq!(
-        session.finish(&mut host, &mut state, 1),
-        crate::runtime::compute_exec::ComputeStatus::Ok
-    );
-
-    let out = read_u32x4(&host, &state, buf_gva);
-    assert_eq!(
-        out,
-        vec![4, 7, 10, 13],
-        "inheritBuffers encoder mul3add1 writeback"
-    );
-}
-
-/// inheritPipelineState=true: ICB slot records only buffers+dispatch; PSO
-/// comes from the parent compute encoder.
-#[test]
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-fn inherit_pipeline_encoder_kernel_mul3add1() {
-    use crate::runtime::compute_exec::ComputeAccum;
-    use crate::runtime::compute_session::ComputeSession;
-    use crate::runtime::decode::resource::ICB_FLAG_INHERIT_PIPELINE_STATE;
-
-    let (_guard, mtlb, mut host, mut state) = mul3add1_fixture();
-
-    let icb_desc = make_icb_desc_bytes_tg(1, 1, 0, ICB_FLAG_INHERIT_PIPELINE_STATE);
-    let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
-
-    put_function_object(&mut host, &state, 5, 0x100, 2, &mtlb);
-
-    let pdesc = make_compute_pipeline_desc(5);
-    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x140, &pdesc);
-
-    let data = [1u32, 2, 3, 4];
-    let data_bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
-    let buf_gva = 3u64 << RESOURCE_PAGE_SHIFT;
-    gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], buf_gva, &data_bytes);
-    let mut bdesc = vec![0u8; 16];
-    st64(&mut bdesc[0..], 16);
-    st32(&mut bdesc[8..], 3);
-    put_object(&mut host, &state, 7, OBJECT_TYPE_BUFFER, 0x180, &bdesc);
-
-    // Fill: buffers + dispatch only — pipeline_ref 0 (inherited).
-    fill_compute(
-        &state,
-        &host,
-        &IcbComputeFill {
-            command_index: 0,
-            pipeline_ref: 0,
-            buffers: vec![kernel_bind(0, 7)],
-            threadgroup_memory: vec![],
-            barrier: false,
-            dispatch: unit_grid_dispatch(4, 1, 1),
-        },
-    )
-    .expect("fill inheritPipeline dispatch");
-
-    let mut acc = ComputeAccum::default();
-    acc.set_pipeline(6);
-
-    let mut session = ComputeSession::open(0).expect("session");
-    let cmd = execute_icb_command(9, 0, 1);
-    assert_eq!(
-        session.encode_icb(&mut state, &mut host, 1, &cmd, &acc),
-        crate::runtime::compute_exec::ComputeStatus::Ok,
-        "inheritPipelineState encoder path"
-    );
-    assert_eq!(
-        session.finish(&mut host, &mut state, 1),
-        crate::runtime::compute_exec::ComputeStatus::Ok
-    );
-
-    let out = read_u32x4(&host, &state, buf_gva);
-    assert_eq!(
-        out,
-        vec![4, 7, 10, 13],
-        "inheritPipelineState encoder mul3add1 writeback"
-    );
-}
-
-/// Install a type-2 linear texture (single level) and write seed texels.
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-// A test fixture builder: object ref, handle, geometry and seed texels.
-#[allow(clippy::too_many_arguments)]
-fn put_type2_texture(
-    host: &mut FakeHost,
-    state: &mut DeviceState,
-    obj_ref: u32,
-    handle: u32,
-    width: u32,
-    height: u32,
-    pixel_format: u16,
-    seed: &[u8],
-) {
-    use crate::runtime::decode::resource::{
-        OBJECT_TYPE_TEXTURE, TEXTURE_DESC_BASE_LEN, TEXTURE_DESC_DATA_OFFSET, TEXTURE_DESC_HEIGHT,
-        TEXTURE_DESC_MIPMAP_LEVEL_COUNT, TEXTURE_DESC_PIXEL_FORMAT, TEXTURE_DESC_ROW_STRIDE,
-        TEXTURE_DESC_USED_SIZE, TEXTURE_DESC_WIDTH,
-    };
-    let bpp = crate::contract::pixel_format::bytes_per_pixel(pixel_format).unwrap_or(4);
-    let row_stride = width * bpp;
-    let size = (row_stride as u64) * (height as u64);
-    let mut desc = vec![0u8; TEXTURE_DESC_BASE_LEN];
-    st64(&mut desc[0..], size.max(0x1000));
-    st32(&mut desc[8..], handle);
-    st16(&mut desc[TEXTURE_DESC_MIPMAP_LEVEL_COUNT..], 1);
-    st32(&mut desc[TEXTURE_DESC_DATA_OFFSET..], 0);
-    st32(&mut desc[TEXTURE_DESC_USED_SIZE..], size as u32);
-    st32(&mut desc[TEXTURE_DESC_ROW_STRIDE..], row_stride);
-    st32(&mut desc[TEXTURE_DESC_WIDTH..], width);
-    st32(&mut desc[TEXTURE_DESC_HEIGHT..], height);
-    st16(&mut desc[TEXTURE_DESC_PIXEL_FORMAT..], pixel_format);
-    // Descriptor GVAs stay below the first resource page (handle<<14).
-    let desc_gva = 0x200u64 + (obj_ref as u64) * 0x80;
-    put_object(host, state, obj_ref, OBJECT_TYPE_TEXTURE, desc_gva, &desc);
-    let data_gva = (handle as u64) << RESOURCE_PAGE_SHIFT;
-    let mut page = vec![0u8; size as usize];
-    let n = seed.len().min(page.len());
-    page[..n].copy_from_slice(&seed[..n]);
-    gva_mem::write_task_gva_arm64e(host, &state.tasks[1], data_gva, &page);
-}
-
-/// Minimal type-7 sampler (36 B): clamp-to-edge, nearest, normalized coords.
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-fn put_type7_sampler(host: &mut FakeHost, state: &DeviceState, obj_ref: u32, normalized: bool) {
-    use crate::runtime::decode::resource::{sampler_desc as off, TYPE7_OBJECT_SAMPLER};
-    let mut desc = vec![0u8; off::LEN];
-    st32(&mut desc[off::TAG..], TYPE7_OBJECT_SAMPLER);
-    st32(&mut desc[off::DECLARED_LEN..], off::LEN as u32);
-    st32(&mut desc[off::ID..], obj_ref);
-    // Address modes ClampToEdge=0 at bits 8/12/16; filters nearest=0.
-    // Normalized coords bit 31 when requested.
-    let mut bits = 0u32;
-    if normalized {
-        bits |= 0x8000_0000;
-    }
-    st32(&mut desc[off::STATE_BITS..], bits);
-    st32(&mut desc[off::FLAGS..], 0);
-    st32(&mut desc[off::LOD_MIN..], 0f32.to_bits());
-    st32(&mut desc[off::LOD_MAX..], f32::MAX.to_bits());
-    let desc_gva = 0x300u64 + (obj_ref as u64) * 0x40;
-    put_object(host, state, obj_ref, OBJECT_TYPE_TYPE7, desc_gva, &desc);
-}
-
-/// Textures/samplers always bind on the parent compute encoder at ICB
-/// execute (classic `MTLIndirectComputeCommand` has no setTexture/setSampler).
-///
-/// Metal on this stack rejects `supportIndirectCommandBuffers` for kernels
-/// that declare direct `texture`/`sampler` arguments — those need argument
-/// buffers. Product still applies stream texture/sampler state before
-/// `executeCommandsInBuffer`. This oracle uses ICB-capable mul3add1 for the
-/// dispatch while staging a storage texture + sampler on the encoder:
-/// buffer writeback proves execute; texture writeback preserves seed
-/// (kernel does not touch the texture).
-#[test]
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-fn icb_parent_encoder_texture_and_sampler_binds() {
-    use crate::contract::pixel_format::MTL_FORMAT_RGBA8_UNORM;
-    use crate::runtime::compute_exec::{ComputeAccum, ComputeSamplerBind, ComputeTextureBind};
-    use crate::runtime::compute_session::ComputeSession;
-
-    let (_guard, mtlb, mut host, mut state) = mul3add1_fixture();
-
-    let icb_desc = make_icb_desc_bytes(1, 1, false);
-    let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
-
-    put_function_object(&mut host, &state, 5, 0x100, 2, &mtlb);
-
-    let pdesc = make_compute_pipeline_desc(5);
-    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x140, &pdesc);
-
-    let data = [1u32, 2, 3, 4];
-    let data_bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
-    let buf_gva = 3u64 << RESOURCE_PAGE_SHIFT;
-    gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], buf_gva, &data_bytes);
-    let mut bdesc = vec![0u8; 16];
-    st64(&mut bdesc[0..], 16);
-    st32(&mut bdesc[8..], 3);
-    put_object(&mut host, &state, 7, OBJECT_TYPE_BUFFER, 0x180, &bdesc);
-
-    const W: u32 = 2;
-    const H: u32 = 2;
-    let seed = vec![0xCDu8; (W * H * 4) as usize];
-    put_type2_texture(
-        &mut host,
-        &mut state,
-        11,
-        4,
-        W,
-        H,
-        MTL_FORMAT_RGBA8_UNORM,
-        &seed,
-    );
-    put_type7_sampler(&mut host, &state, 14, true);
-
-    fill_compute(
-        &state,
-        &host,
-        &IcbComputeFill {
-            command_index: 0,
-            pipeline_ref: 6,
-            buffers: vec![kernel_bind(0, 7)],
-            threadgroup_memory: vec![],
-            barrier: false,
-            dispatch: unit_grid_dispatch(4, 1, 1),
-        },
-    )
-    .expect("fill mul3add1 ICB");
-
-    // Stream binds texture + sampler on the parent encoder (always, not inherit flags).
-    let mut acc = ComputeAccum::default();
-    acc.set_pipeline(6);
-    acc.textures.push(ComputeTextureBind {
-        index: 0,
-        texture_ref: 11,
-    });
-    acc.samplers.push(ComputeSamplerBind {
-        index: 0,
-        sampler_ref: 14,
-        lod_min_bits: 0,
-        lod_max_bits: 0,
-        has_lod_clamp: false,
-    });
-
-    let mut session = ComputeSession::open(0).expect("session");
-    let cmd = execute_icb_command(9, 0, 1);
-    assert_eq!(
-        session.encode_icb(&mut state, &mut host, 1, &cmd, &acc),
-        crate::runtime::compute_exec::ComputeStatus::Ok,
-        "ICB execute with parent-encoder texture+sampler"
-    );
-    assert_eq!(
-        session.finish(&mut host, &mut state, 1),
-        crate::runtime::compute_exec::ComputeStatus::Ok
-    );
-
-    let out = read_u32x4(&host, &state, buf_gva);
-    assert_eq!(
-        out,
-        vec![4, 7, 10, 13],
-        "mul3add1 still correct with encoder tex/samp"
-    );
-
-    // Storage writeback path: kernel unused the texture — seed preserved via flush.
-    let tex_gva = 4u64 << RESOURCE_PAGE_SHIFT;
-    let mut tex_back = vec![0u8; seed.len()];
-    assert!(gva_mem::read_task_gva(
-        &host,
-        &state.tasks[1],
-        tex_gva,
-        &mut tex_back,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    assert_eq!(
-        tex_back, seed,
-        "encoder storage texture writeback preserves seed"
-    );
-}
-
-/// Real texture-using ICB kernel via **argument buffers**: AB holds
-/// `texture2d<uint, write>`; stream texture is packaged into the AB, bound
-/// as kernel buffer 0 on the ICB command, and `useResource`d on the parent
-/// encoder. Oracle: xyplane-v1 `[x,y,5,255]`.
-#[test]
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-fn icb_argument_buffer_storage_texture_xyplane() {
-    use crate::contract::pixel_format::MTL_FORMAT_RGBA8_UINT;
-    use crate::runtime::compute_exec::{ComputeAccum, ComputeTextureBind};
-    use crate::runtime::compute_session::ComputeSession;
-
-    let _guard = icb_test_guard();
-    let mtlb = std::fs::read(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/icb_ab_storage_xyplane.metallib"),
-    )
-    .expect("icb_ab_storage_xyplane.metallib");
-
-    let (mut host, mut state) = icb_device();
-
-    // maxKernel=1 for the AB buffer slot; no inheritBuffers — AB recorded on ICB.
-    let icb_desc = make_icb_desc_bytes(1, 1, false);
-    let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
-
-    put_function_object(&mut host, &state, 5, 0x100, 2, &mtlb);
-
-    let pdesc = make_compute_pipeline_desc(5);
-    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x140, &pdesc);
-
-    const W: u32 = 4;
-    const H: u32 = 4;
-    let seed = vec![0x00u8; (W * H * 4) as usize];
-    put_type2_texture(
-        &mut host,
-        &mut state,
-        11,
-        4,
-        W,
-        H,
-        MTL_FORMAT_RGBA8_UINT,
-        &seed,
-    );
-
-    // Fill: pipeline + dispatch only (AB buffer patched at execute).
-    fill_compute(
-        &state,
-        &host,
-        &IcbComputeFill {
-            command_index: 0,
-            pipeline_ref: 6,
-            buffers: vec![],
-            threadgroup_memory: vec![],
-            barrier: false,
-            dispatch: unit_grid_dispatch(W, H, 1),
-        },
-    )
-    .expect("fill AB storage ICB");
-
-    let mut acc = ComputeAccum::default();
-    acc.set_pipeline(6);
-    acc.textures.push(ComputeTextureBind {
-        index: 0,
-        texture_ref: 11,
-    });
-
-    let mut session = ComputeSession::open(0).expect("session");
-    let cmd = execute_icb_command(9, 0, 1);
-    assert_eq!(
-        session.encode_icb(&mut state, &mut host, 1, &cmd, &acc),
-        crate::runtime::compute_exec::ComputeStatus::Ok,
-        "AB storage texture ICB execute"
-    );
-    assert_eq!(
-        session.finish(&mut host, &mut state, 1),
-        crate::runtime::compute_exec::ComputeStatus::Ok
-    );
-
-    let data_gva = 4u64 << RESOURCE_PAGE_SHIFT;
-    let mut back = vec![0u8; (W * H * 4) as usize];
-    assert!(gva_mem::read_task_gva(
-        &host,
-        &state.tasks[1],
-        data_gva,
-        &mut back,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    for y in 0..H {
-        for x in 0..W {
-            let i = ((y * W + x) * 4) as usize;
-            assert_eq!(
-                &back[i..i + 4],
-                &[x as u8, y as u8, 5, 255],
-                "AB storage texel ({x},{y})"
-            );
-        }
-    }
-}
-
-/// Sampled + storage textures + sampler in one argument buffer under ICB.
-#[test]
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-fn icb_argument_buffer_sample_and_write() {
-    use crate::contract::pixel_format::{MTL_FORMAT_RGBA8_UINT, MTL_FORMAT_RGBA8_UNORM};
-    use crate::runtime::compute_exec::{ComputeAccum, ComputeSamplerBind, ComputeTextureBind};
-    use crate::runtime::compute_session::ComputeSession;
-
-    let _guard = icb_test_guard();
-    let mtlb = std::fs::read(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/icb_ab_sample_xyplane.metallib"),
-    )
-    .expect("icb_ab_sample_xyplane.metallib");
-
-    let (mut host, mut state) = icb_device();
-
-    let icb_desc = make_icb_desc_bytes(1, 1, false);
-    let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
-
-    put_function_object(&mut host, &state, 5, 0x100, 2, &mtlb);
-
-    let pdesc = make_compute_pipeline_desc(5);
-    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x140, &pdesc);
-
-    const W: u32 = 4;
-    const H: u32 = 4;
-    let mut input = vec![0u8; (W * H * 4) as usize];
-    for y in 0..H {
-        for x in 0..W {
-            let i = ((y * W + x) * 4) as usize;
-            input[i] = x as u8;
-            input[i + 1] = y as u8;
-            input[i + 2] = 5;
-            input[i + 3] = 255;
-        }
-    }
-    put_type2_texture(
-        &mut host,
-        &mut state,
-        11,
-        4,
-        W,
-        H,
-        MTL_FORMAT_RGBA8_UNORM,
-        &input,
-    );
-    let out_seed = vec![0x11u8; (W * H * 4) as usize];
-    put_type2_texture(
-        &mut host,
-        &mut state,
-        12,
-        5,
-        W,
-        H,
-        MTL_FORMAT_RGBA8_UINT,
-        &out_seed,
-    );
-    put_type7_sampler(&mut host, &state, 14, true);
-
-    fill_compute(
-        &state,
-        &host,
-        &IcbComputeFill {
-            command_index: 0,
-            pipeline_ref: 6,
-            buffers: vec![],
-            threadgroup_memory: vec![],
-            barrier: false,
-            dispatch: unit_grid_dispatch(W, H, 1),
-        },
-    )
-    .expect("fill AB sample ICB");
-
-    let mut acc = ComputeAccum::default();
-    acc.set_pipeline(6);
-    // Order matches AB members: id(0)=in, id(1)=out, id(2)=sampler.
-    acc.textures.push(ComputeTextureBind {
-        index: 0,
-        texture_ref: 11,
-    });
-    acc.textures.push(ComputeTextureBind {
-        index: 1,
-        texture_ref: 12,
-    });
-    acc.samplers.push(ComputeSamplerBind {
-        index: 0,
-        sampler_ref: 14,
-        lod_min_bits: 0,
-        lod_max_bits: 0,
-        has_lod_clamp: false,
-    });
-
-    let mut session = ComputeSession::open(0).expect("session");
-    let cmd = execute_icb_command(9, 0, 1);
-    assert_eq!(
-        session.encode_icb(&mut state, &mut host, 1, &cmd, &acc),
-        crate::runtime::compute_exec::ComputeStatus::Ok,
-        "AB sample+write ICB execute"
-    );
-    assert_eq!(
-        session.finish(&mut host, &mut state, 1),
-        crate::runtime::compute_exec::ComputeStatus::Ok
-    );
-
-    let out_gva = 5u64 << RESOURCE_PAGE_SHIFT;
-    let mut back = vec![0u8; (W * H * 4) as usize];
-    assert!(gva_mem::read_task_gva(
-        &host,
-        &state.tasks[1],
-        out_gva,
-        &mut back,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    for y in 0..H {
-        for x in 0..W {
-            let i = ((y * W + x) * 4) as usize;
-            assert_eq!(
-                &back[i..i + 4],
-                &[x as u8, y as u8, 5, 255],
-                "AB sample out texel ({x},{y})"
-            );
-        }
-    }
-}
-
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-#[test]
-fn resolve_bind_offset_from_wire_va() {
-    let (mut host, state) = icb_device();
-    // 32 B buffer at handle 4: 16 B pad + 16 B color payload.
-    let mut bytes = vec![0u8; 32];
-    let sid = 7u8;
-    let r = (0x60u32 + sid as u32) as f32 / 255.0;
-    let color = [r, 0x44 as f32 / 255.0, 0x22 as f32 / 255.0, 1.0f32];
-    let color_bytes: Vec<u8> = color.iter().flat_map(|f| f.to_le_bytes()).collect();
-    bytes[16..32].copy_from_slice(&color_bytes);
-    put_type1_buffer(&mut host, &state, 13, 4, &bytes);
-    let base = (4u64) << RESOURCE_PAGE_SHIFT;
-    assert_eq!(
-        offset_from_wire_va(&state, &host, 1, 13, base + 16).unwrap(),
-        16
-    );
-    assert_eq!(offset_from_wire_va(&state, &host, 1, 13, 0).unwrap(), 0);
-    assert!(offset_from_wire_va(&state, &host, 1, 13, base - 1).is_err());
-    assert!(offset_from_wire_va(&state, &host, 1, 13, base + 32).is_err());
-}
-
-/// Host fill with non-zero fragment bind offset into a padded type-1 buffer.
-#[test]
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-fn fill_render_nonzero_bind_offset_oracle() {
-    let _guard = icb_test_guard();
-
-    let (vert_mtlb, frag_mtlb) = load_oracle_mtlb();
-    let (mut host, mut state) = icb_device();
-
-    let icb_desc = make_render_icb_desc_bytes(1, 0, 1, MTL_INDIRECT_CMD_DRAW_INDEXED);
-    let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
-
-    put_function_object(&mut host, &state, 2, 0x200, 2, &vert_mtlb);
-
-    put_function_object(&mut host, &state, 3, 0x220, 3, &frag_mtlb);
-
-    let pdesc = make_render_pipeline_desc(2, 3);
-    let pdesc_gva = 0x240u64;
-    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, pdesc_gva, &pdesc);
-
-    let indices: [u16; 3] = [0, 1, 2];
-    // Index buffer: 4 B pad + 6 B indices (offset 4).
-    let mut index_bytes = vec![0u8; 4];
-    index_bytes.extend(indices.iter().flat_map(|v| v.to_le_bytes()));
-    put_type1_buffer(&mut host, &state, 12, 4, &index_bytes);
-    let index_base = (4u64) << RESOURCE_PAGE_SHIFT;
-
-    let sid = 7u8;
-    let r = (0x60u32 + sid as u32) as f32 / 255.0;
-    let color = [r, 0x44 as f32 / 255.0, 0x22 as f32 / 255.0, 1.0f32];
-    let color_bytes: Vec<u8> = color.iter().flat_map(|f| f.to_le_bytes()).collect();
-    // Color buffer: 16 B pad + float4 (offset 16).
-    let mut color_buf = vec![0xAAu8; 16];
-    color_buf.extend_from_slice(&color_bytes);
-    put_type1_buffer(&mut host, &state, 13, 5, &color_buf);
-    let color_base = (5u64) << RESOURCE_PAGE_SHIFT;
-
-    fill_render(
-        &state,
-        &host,
-        &IcbRenderFill {
-            command_index: 0,
-            pipeline_ref: 6,
-            buffers: vec![IcbRenderBufferBind {
-                index: 0,
-                buffer_ref: 13,
-                offset: 16,
-                wire_va: 0,
-                attribute_stride: 0,
-                has_attribute_stride: false, // host fill uses offset directly
-                is_fragment: true,
-                stage: IcbRenderBindStage::default(),
-            }],
-            object_threadgroup_memory: vec![],
-            draw: IcbRenderDraw::Indexed {
-                primitive_type: 3,
-                index_type: 0,
-                index_buffer_ref: 12,
-                index_count: 3,
-                index_buffer_offset: 4,
-                index_wire_va: 0,
-                instance_count: 1,
-                base_vertex: 0,
-                base_instance: 0,
-            },
-        },
-    )
-    .expect("fill with non-zero offsets");
-
-    let mapping_id = map_draw_target(&mut host, &mut state, 0x34);
-
-    let req = draw_request(mapping_id);
-    assert_eq!(
-        encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
-        EncodeStatus::Ok
-    );
-
-    assert_stagein_solid(
-        &mut state,
-        &mut host,
-        mapping_id,
-        sid,
-        "nonzero bind offset",
-    );
-    let _ = (index_base, color_base);
-}
-
-/// Buffer-backed fill: wire VA = type-1 base+offset → resolve → execute.
-#[test]
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-fn buffer_backed_nonzero_wire_va_offset() {
-    let _guard = icb_test_guard();
-
-    let (vert_mtlb, frag_mtlb) = load_oracle_mtlb();
-    let (mut host, mut state) = icb_device();
-
-    let max_v = 0u16;
-    let max_f = 1u16;
-    let layout = render_icb_layout(max_v, max_f, MTL_INDIRECT_CMD_DRAW_INDEXED);
-    let icb_desc = make_render_icb_desc_bytes(1, max_v, max_f, MTL_INDIRECT_CMD_DRAW_INDEXED);
-    let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
-
-    put_function_object(&mut host, &state, 2, 0x200, 2, &vert_mtlb);
-
-    put_function_object(&mut host, &state, 3, 0x220, 3, &frag_mtlb);
-
-    let pdesc = make_render_pipeline_desc(2, 3);
-    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x240, &pdesc);
-
-    let indices: [u16; 3] = [0, 1, 2];
-    let mut index_bytes = vec![0u8; 8]; // pad 8
-    index_bytes.extend(indices.iter().flat_map(|v| v.to_le_bytes()));
-    put_type1_buffer(&mut host, &state, 12, 4, &index_bytes);
-    let index_wire = ((4u64) << RESOURCE_PAGE_SHIFT) + 8;
-
-    let sid = 7u8;
-    let r = (0x60u32 + sid as u32) as f32 / 255.0;
-    let color = [r, 0x44 as f32 / 255.0, 0x22 as f32 / 255.0, 1.0f32];
-    let color_bytes: Vec<u8> = color.iter().flat_map(|f| f.to_le_bytes()).collect();
-    let mut color_buf = vec![0u8; 24]; // pad 24
-    color_buf.extend_from_slice(&color_bytes);
-    put_type1_buffer(&mut host, &state, 13, 5, &color_buf);
-    let color_wire = ((5u64) << RESOURCE_PAGE_SHIFT) + 24;
-
-    let slot = encode_render_command_slot(
-        &layout,
-        &IcbRenderFill {
-            command_index: 0,
-            pipeline_ref: 6,
-            buffers: vec![IcbRenderBufferBind {
-                index: 0,
-                buffer_ref: 13,
-                offset: 0,
-                wire_va: color_wire,
-                attribute_stride: 0,
-                has_attribute_stride: false,
-                is_fragment: true,
-                stage: IcbRenderBindStage::default(),
-            }],
-            object_threadgroup_memory: vec![],
-            draw: IcbRenderDraw::Indexed {
-                primitive_type: 3,
-                index_type: 0,
-                index_buffer_ref: 12,
-                index_count: 3,
-                index_buffer_offset: 0,
-                index_wire_va: index_wire,
-                instance_count: 1,
-                base_vertex: 0,
-                base_instance: 0,
-            },
-        },
-    )
-    .unwrap();
-
-    // Decode + resolve without host fill API.
-    let mut decoded = decode_render_command_slot(&layout, &slot, max_v, max_f)
-        .unwrap()
-        .expect("slot");
-    assert_eq!(decoded.buffers[0].wire_va, color_wire);
-    match decoded.draw {
-        IcbRenderDraw::Indexed { index_wire_va, .. } => {
-            assert_eq!(index_wire_va, index_wire);
-        }
-        _ => panic!("indexed"),
-    }
-    resolve_render_fill_offsets(&state, &host, 1, &mut decoded).unwrap();
-    assert_eq!(decoded.buffers[0].offset, 24);
-    match decoded.draw {
-        IcbRenderDraw::Indexed {
-            index_buffer_offset,
-            ..
-        } => assert_eq!(index_buffer_offset, 8),
-        _ => panic!("indexed"),
-    }
-
-    associate_icb_command_memory(&mut host, &state, 6, &slot);
-
-    let mapping_id = map_draw_target(&mut host, &mut state, 0x35);
-
-    let req = draw_request(mapping_id);
-    assert_eq!(
-        encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
-        EncodeStatus::Ok
-    );
-
-    assert_stagein_solid(&mut state, &mut host, mapping_id, sid, "wire_va offset");
-}
-
-/// Each render bind stage is bounded by its own field of the create descriptor.
-///
-/// The four maxima are decoded separately and handed to Metal separately, so
-/// mapping them onto one bound would report the wrong table for three stages out
-/// of four — the failure mode `8ad945e` found on the type-1 buffer span.
-#[test]
-fn a_render_icb_bind_is_bounded_by_the_count_its_own_stage_declared() {
-    use crate::observe::Decline;
-
-    let desc = IndirectCommandBufferDescriptor {
-        max_vertex_buffer_bind_count: 4,
-        max_fragment_buffer_bind_count: 2,
-        max_object_buffer_bind_count: 3,
-        max_mesh_buffer_bind_count: 1,
-        ..Default::default()
-    };
-
-    // The last in-range index of each stage is accepted, and the first
-    // out-of-range one is refused under that stage's own slug.
-    for (stage, declared, slug) in [
-        (
-            IcbRenderBindStage::Vertex,
-            4u32,
-            "icb_frc_vertex_bind_index_past_max",
-        ),
-        (
-            IcbRenderBindStage::Fragment,
-            2,
-            "icb_frc_fragment_bind_index_past_max",
-        ),
-        (
-            IcbRenderBindStage::Object,
-            3,
-            "icb_frc_object_bind_index_past_max",
-        ),
-        (
-            IcbRenderBindStage::Mesh,
-            1,
-            "icb_frc_mesh_bind_index_past_max",
-        ),
-    ] {
-        assert!(
-            refuse_render_bind_past_declared_max(stage, declared - 1, &desc).is_ok(),
-            "{stage:?} refused its own last declared index"
-        );
-        let refusal = refuse_render_bind_past_declared_max(stage, declared, &desc)
-            .expect_err("index past the declared count must refuse");
-        assert_eq!(refusal.slug(), slug);
-    }
-}
-
-/// A stage the guest declared no binds for admits no index at all, including 0.
-///
-/// `max_* == 0` is the common case for stages a pipeline does not use, and `0`
-/// is the index a zeroed fill record carries, so this is the arm a malformed
-/// record reaches first.
-#[test]
-fn a_render_icb_stage_declaring_no_binds_refuses_index_zero() {
-    let desc = IndirectCommandBufferDescriptor::default();
-    for stage in [
-        IcbRenderBindStage::Vertex,
-        IcbRenderBindStage::Fragment,
-        IcbRenderBindStage::Object,
-        IcbRenderBindStage::Mesh,
-    ] {
-        assert_eq!(stage.declared_bind_count(&desc), 0, "{stage:?}");
-        assert!(refuse_render_bind_past_declared_max(stage, 0, &desc).is_err());
-    }
-}
-
-/// An execute that filled no slots says so, and one that met a different
-/// refusal still forwards it.
-///
-/// The rule this pins used to be a wildcard — `Err(IcbStatus::Missing(_)) => {}`
-/// — copied into the render arm and the compute arm. It swallowed both slugs
-/// `decode_icb_command_range` raises under `Missing`, and only one of them had
-/// been argued for. The four cases below are the whole vocabulary that reaches
-/// this function: filled, unfilled, the other `Missing`, and everything else.
-#[test]
-fn an_icb_execute_that_filled_no_slots_is_counted_and_not_swallowed() {
-    use crate::runtime::drain::store_route_count;
-    const ROUTE: &str = "icb_executed_without_command_memory";
-
-    let quiet = store_route_count(ROUTE);
-    assert_eq!(
-        icb_fill_outcome(Ok(()), 1, 9),
-        Ok(()),
-        "a filled ICB is carried on from"
-    );
-    assert_eq!(
-        store_route_count(ROUTE),
-        quiet,
-        "a filled ICB costs the guest nothing and must not count"
-    );
-
-    // The unfilled case: control flow is unchanged so the caller still does its
-    // writeback, but the lost commands are now counted.
-    assert_eq!(
-        icb_fill_outcome(
-            Err(IcbStatus::Missing(ICB_FILL_NO_COMMAND_MEMORY)),
-            1,
-            9
-        ),
-        Ok(()),
-        "an empty execute is a no-op, not a reason to skip the writeback"
-    );
-    assert_eq!(
-        store_route_count(ROUTE),
-        quiet + 1,
-        "the commands the guest encoded into this ICB were lost, and it says so"
-    );
-
-    // The other `Missing` slug, and a variant from another class. Both forward,
-    // so the caller declines by the name of the check that actually refused.
-    for other in [
-        IcbStatus::Missing("icb_fill_not_cached"),
-        IcbStatus::Args("icb_fill_zero_command_size"),
-    ] {
-        assert_eq!(
-            icb_fill_outcome(Err(other), 1, 9),
-            Err(other),
-            "{other:?} names a different loss and must not be swallowed"
-        );
-    }
-    assert_eq!(
-        store_route_count(ROUTE),
-        quiet + 1,
-        "a forwarded refusal is not an empty execute"
-    );
 }

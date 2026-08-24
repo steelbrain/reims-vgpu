@@ -204,7 +204,7 @@ dependencies = [
  "bitflags 1.3.2",
  "block",
  "cocoa-foundation",
- "core-foundation 0.9.4",
+ "core-foundation",
  "core-graphics",
  "foreign-types",
  "libc",
@@ -219,8 +219,8 @@ checksum = "8c6234cbb2e4c785b456c0644748b1ac416dd045799740356f8363dfe00c93f7"
 dependencies = [
  "bitflags 1.3.2",
  "block",
- "core-foundation 0.9.4",
- "core-graphics-types 0.1.3",
+ "core-foundation",
+ "core-graphics-types",
  "libc",
  "objc",
 ]
@@ -255,16 +255,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "core-foundation"
-version = "0.10.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b2a6cd9ae233e7f62ba4e9353e81a88df7fc8a5987b8d445b4d90c879bd156f6"
-dependencies = [
- "core-foundation-sys",
- "libc",
-]
-
-[[package]]
 name = "core-foundation-sys"
 version = "0.8.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -277,8 +267,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c07782be35f9e1140080c6b96f0d44b739e2278479f64e02fdab4e32dfd8b081"
 dependencies = [
  "bitflags 1.3.2",
- "core-foundation 0.9.4",
- "core-graphics-types 0.1.3",
+ "core-foundation",
+ "core-graphics-types",
  "foreign-types",
  "libc",
 ]
@@ -290,18 +280,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "45390e6114f68f718cc7a830514a96f903cccd70d02a8f6d9f643ac4ba45afaf"
 dependencies = [
  "bitflags 1.3.2",
- "core-foundation 0.9.4",
- "libc",
-]
-
-[[package]]
-name = "core-graphics-types"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3d44a101f213f6c4cdc1853d4b78aef6db6bdfa3468798cc1d9912f4735013eb"
-dependencies = [
- "bitflags 2.13.1",
- "core-foundation 0.10.1",
+ "core-foundation",
  "libc",
 ]
 
@@ -637,24 +616,9 @@ dependencies = [
 ]
 
 [[package]]
-name = "metal"
-version = "0.33.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c7047791b5bc903b8cd963014b355f71dc9864a9a0b727057676c1dcae5cbc15"
-dependencies = [
- "bitflags 2.13.1",
- "block",
- "core-graphics-types 0.2.0",
- "foreign-types",
- "log",
- "objc",
- "paste",
-]
-
-[[package]]
 name = "metal2vulkan"
 version = "0.1.0"
-source = "git+https://github.com/steelbrain/metal2vulkan.git?rev=8b78eaca3be72b4e596aa1c790a4cd114ac1e9ec#8b78eaca3be72b4e596aa1c790a4cd114ac1e9ec"
+source = "git+https://github.com/steelbrain/metal2vulkan.git?rev=9ff250502cd7ae8c6e0fab0b373b88d254d46170#9ff250502cd7ae8c6e0fab0b373b88d254d46170"
 dependencies = [
  "spirv",
  "wait-timeout",
@@ -973,12 +937,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "paste"
-version = "1.0.15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
-
-[[package]]
 name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1133,28 +1091,90 @@ dependencies = [
 name = "reims-vgpu"
 version = "0.1.0"
 dependencies = [
- "ash",
  "ash-window",
- "block",
  "cc",
- "foreign-types",
  "libc",
- "metal",
  "metal2vulkan",
- "objc",
  "once_cell",
  "parking_lot",
  "raw-window-handle",
+ "reims-vgpu-config",
+ "reims-vgpu-core",
+ "reims-vgpu-memory",
+ "reims-vgpu-observe",
  "reims-vgpu-paging",
+ "reims-vgpu-protocol",
+ "reims-vgpu-vulkan",
  "reims-vgpu-wire",
  "serde_json",
  "winit",
 ]
 
 [[package]]
+name = "reims-vgpu-config"
+version = "0.1.0"
+
+[[package]]
+name = "reims-vgpu-core"
+version = "0.1.0"
+dependencies = [
+ "reims-vgpu-memory",
+ "reims-vgpu-observe",
+ "reims-vgpu-paging",
+ "reims-vgpu-protocol",
+]
+
+[[package]]
+name = "reims-vgpu-memory"
+version = "0.1.0"
+dependencies = [
+ "reims-vgpu-observe",
+ "reims-vgpu-paging",
+ "reims-vgpu-protocol",
+]
+
+[[package]]
+name = "reims-vgpu-observe"
+version = "0.1.0"
+
+[[package]]
 name = "reims-vgpu-paging"
 version = "0.1.0"
 dependencies = [
+ "reims-vgpu-wire",
+]
+
+[[package]]
+name = "reims-vgpu-protocol"
+version = "0.1.0"
+dependencies = [
+ "reims-vgpu-wire",
+]
+
+[[package]]
+name = "reims-vgpu-testkit"
+version = "0.1.0"
+dependencies = [
+ "reims-vgpu-core",
+]
+
+[[package]]
+name = "reims-vgpu-vulkan"
+version = "0.1.0"
+dependencies = [
+ "ash",
+ "ash-window",
+ "metal2vulkan",
+ "once_cell",
+ "parking_lot",
+ "raw-window-handle",
+ "reims-vgpu-config",
+ "reims-vgpu-core",
+ "reims-vgpu-memory",
+ "reims-vgpu-observe",
+ "reims-vgpu-paging",
+ "reims-vgpu-protocol",
+ "reims-vgpu-testkit",
  "reims-vgpu-wire",
 ]
 
@@ -1861,7 +1881,7 @@ dependencies = [
  "calloop",
  "cfg_aliases",
  "concurrent-queue",
- "core-foundation 0.9.4",
+ "core-foundation",
  "core-graphics",
  "cursor-icon",
  "dpi",

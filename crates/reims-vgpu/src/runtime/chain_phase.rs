@@ -36,7 +36,7 @@
 //! | phase | from | to | what would fix it |
 //! |---|---|---|---|
 //! | `prep` | `encode_draw_chain` entry | the metal2vulkan call | the CLEAR-only fast path, which never leaves this phase |
-//! | `pipeline` | there | both shaders translated | `runtime::pipeline_resolve` (backend-vulkan only, so named not linked), which is what the five bars below it were measured to justify |
+//! | `pipeline` | there | both shaders translated | `runtime::pipeline_resolve`, which is what the five bars below it were measured to justify |
 //! | `binds` | there | vertex/fragment buffer content materialized | zero-copy buffer binds |
 //! | `sampled` | there | every sampled image and sampler resolved | the gather witness and the sampled cache |
 //! | `seed` | there | the colour Load seed resolved | resident Load elision |
@@ -142,7 +142,7 @@ pub enum Phase {
     /// path and this boot has none.
     PipelineXlate = 12,
     /// The CLEAR-seed Store loop at the head of `draw_vk`: one full-surface
-    /// solid buffer per colour attachment, a channel swap for a type-11 target,
+    /// solid buffer per colour attachment, a channel swap for an IOSurface texture target,
     /// and the write of it into the guest's pages.
     ///
     /// # Why the prep span is split at all
@@ -157,7 +157,7 @@ pub enum Phase {
     /// GVA fallback, taken before any GPU work so the set predates the submit.
     PrepPages = 14,
     /// The four target-identity rails: resident render chain, GVA deferred
-    /// store, type-11 surface resident, and the Load-from-target identity.
+    /// store, IOSurface texture surface resident, and the Load-from-target identity.
     ///
     /// # Why the assemble span is split at all
     ///
@@ -285,6 +285,16 @@ pub fn enter(next: Phase) {
             open.set(Some((next, now)));
         }
     });
+}
+
+/// Charge work performed once for an EXEC-owned draw batch without inventing
+/// another draw-chain count.
+///
+/// Each prepared draw owns its normal [`ChainTimer`]. Native execution and
+/// ordered Store publication happen once after those timers have closed, so
+/// their aggregate duration is added to the corresponding phase separately.
+pub fn note_detached(phase: Phase, elapsed: std::time::Duration) {
+    ACC[phase as usize].fetch_add(charge_ns(elapsed), Ordering::Relaxed);
 }
 
 /// Charges one draw chain's wall clock to one phase at a time.
@@ -451,6 +461,19 @@ mod tests {
         assert!(
             take_window().is_none(),
             "no chain ran, so there is no window"
+        );
+    }
+
+    #[test]
+    fn detached_batch_work_charges_time_without_inventing_an_extra_chain() {
+        let _ = take_window();
+        drop(ChainTimer::start());
+        note_detached(Phase::Engine, std::time::Duration::from_millis(2));
+        let window = take_window().expect("detached engine work is measurable");
+        assert_eq!(window.chains, 1);
+        assert!(
+            window.engine_us >= 1_000,
+            "engine batch was charged: {window:?}"
         );
     }
 

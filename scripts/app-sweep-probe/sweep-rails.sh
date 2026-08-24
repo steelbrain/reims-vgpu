@@ -72,8 +72,7 @@ say() { echo "sweep-rails: $*"; }
 # its own path — a copy in /tmp dies on `kvmvapic.bin`.
 if [ -z "${QEMU_BIN:-}" ]; then
   say "building once and pinning, so every rail runs one binary"
-  "$REPO/scripts/qemu-build/qemu-build.sh" --target x86_64 \
-    --backend "${REIMS_VGPU_BACKEND:-vulkan}" || {
+  "$REPO/scripts/qemu-build/qemu-build.sh" --target x86_64 || {
     echo "sweep-rails: qemu-build failed" >&2
     exit 1
   }

@@ -1,19 +1,119 @@
 // Only the compute-preflight test names these opcodes, and that test is
 // Vulkan-only — this device compiles no compute preflight without it.
-#[cfg(feature = "backend-vulkan")]
 use reims_vgpu_wire::ops::compute as wire_compute;
 
 use reims_vgpu_wire::OP_HEADER_LEN;
 
 use super::*;
-use crate::contract::endian::{st16, st32, st64};
-use crate::contract::pass_action::{MTL_LOAD_ACTION_CLEAR, MTL_STORE_ACTION_STORE};
 use crate::model::{DeviceId, PAGE_SHIFT_ARM64E, PAGE_SHIFT_X86};
 use crate::runtime::decode::render::{
     PASS_ATTACH_CLEAR_COLOR, PASS_ATTACH_LOAD_ACTION, PASS_ATTACH_STORE_ACTION, PASS_ATTACH_TEXREF,
     PASS_COLOR_ATTACH_OFF, PASS_COLOR_ATTACH_STRIDE,
 };
 use crate::runtime::host::FakeHost;
+use reims_vgpu_core::endian::{st16, st32, st64};
+use reims_vgpu_protocol::pass_action::{MTL_LOAD_ACTION_CLEAR, MTL_STORE_ACTION_STORE};
+
+#[test]
+fn a_batched_resident_failure_preserves_the_exact_successful_prefix() {
+    let first_identity = crate::model::TargetIdentity::Gva {
+        gva: 0x4000,
+        width: 8,
+        height: 8,
+        generation: 3,
+        format: reims_vgpu_core::pixel_format::TexelLayout::Rgba8,
+    };
+    let records = vec![
+        PreparedResidentRecord {
+            req: draw::DrawEncodeRequest::default(),
+            pipeline_ref: 7,
+            icb: false,
+            draw_index: 2,
+        },
+        PreparedResidentRecord {
+            req: draw::DrawEncodeRequest::default(),
+            pipeline_ref: 8,
+            icb: false,
+            draw_index: 3,
+        },
+    ];
+    let progress = draw::PreparedM2vProgress {
+        completed: vec![
+            draw::M2vDrawSpan::ResidentChain {
+                submission: reims_vgpu_protocol::SubmissionId::new(1),
+                identity: first_identity.clone(),
+                visibility_samples: None,
+            },
+            draw::M2vDrawSpan::None,
+        ],
+        failure: None,
+    };
+    let mut out = ExecResult::default();
+    let mut visibility = std::collections::BTreeMap::new();
+
+    let failure = apply_prepared_resident_prefix(&mut out, &records, progress, &mut visibility, 5)
+        .expect_err("the second completion is a refusal");
+
+    assert_eq!(failure, (Some(first_identity), 1));
+    assert_eq!(out.draws_ok, 1);
+    assert_eq!(out.draws_fail, 1);
+}
+
+#[test]
+fn a_malformed_compute_barrier_blocks_the_later_dispatch() {
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    let mut out = ExecResult::default();
+    let mut seg = crate::runtime::compute_session::ComputeSegment::default();
+
+    handle_compute_record(
+        &mut state,
+        &mut host,
+        1,
+        wire_compute::OPCODE_MEMORY_BARRIER_SCOPE,
+        &[0; 4],
+        &mut out,
+        &mut seg,
+    );
+
+    let mut dispatch = crate::runtime::decode::compute::Command::default();
+    dispatch.kind = ComputeKind::DispatchThreadgroups;
+    assert_eq!(
+        compute_exec::apply_record(&mut state, &mut host, 1, &dispatch, &mut seg),
+        Some(ComputeStatus::Unsupported(
+            "compute_barrier_decode_malformed"
+        ))
+    );
+}
+
+#[test]
+fn compute_fences_reach_the_dependency_accumulator_from_the_stream_walker() {
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    let mut out = ExecResult::default();
+    let mut seg = crate::runtime::compute_session::ComputeSegment::default();
+
+    let command = |opcode| {
+        let mut bytes = [0u8; wire_compute::FENCE_TOTAL_LEN as usize];
+        st32(&mut bytes[0..4], opcode);
+        st32(&mut bytes[4..8], wire_compute::FENCE_TOTAL_LEN);
+        st32(&mut bytes[8..12], 41);
+        bytes
+    };
+    for opcode in [
+        wire_compute::OPCODE_UPDATE_FENCE,
+        wire_compute::OPCODE_WAIT_FOR_FENCE,
+    ] {
+        let bytes = command(opcode);
+        handle_compute_record(&mut state, &mut host, 1, opcode, &bytes, &mut out, &mut seg);
+    }
+
+    assert_eq!(state.fence_generation(1, 41), Some(1));
+    assert_eq!(
+        seg.pending_barriers,
+        vec![reims_vgpu_core::ComputeBarrier::Fence]
+    );
+}
 
 #[test]
 fn render_pass_chain_edges_follow_the_decoded_encoder() {
@@ -26,7 +126,7 @@ fn render_pass_chain_edges_follow_the_decoded_encoder() {
 /// The abandon line must say how much guest work it dropped.
 ///
 /// This break was silent, and the counter that would have caught it
-/// (`metal_draws_fail`) stays 0 on this path because the draw encoded
+/// (`draws_fail`) stays 0 on this path because the draw encoded
 /// `Ok` — so `packet_failed` is false and the packet-level line is
 /// suppressed too. The whole value of the line is the amount lost:
 /// breaking at 0 of 8 drops a whole composite, breaking at 7 of 8 drops
@@ -61,10 +161,102 @@ fn chain_abandon_reports_how_many_draws_were_lost() {
 
 #[test]
 fn short_payload_noop() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     let r = process_exec_indirect2(&mut state, &mut host, &[0u8; 4]);
     assert_eq!(r.streams_loaded, 0);
+}
+
+/// The packet's semantic identity must reach the backend at the exact point
+/// its command streams end. Without this event a backend has no contract-owned
+/// lifetime for an independently recorded encoder and can only infer one from
+/// timing or from the next packet arriving.
+#[test]
+fn an_exec_packet_closes_its_exact_backend_submission() {
+    use crate::runtime::executor::*;
+    use reims_vgpu_core::{
+        CapabilityService, ComputeResidencyService, ExecutionPort, GuestWriteService,
+        PresentationService, ReadbackService, ResidentService,
+    };
+    use std::sync::Mutex;
+
+    #[derive(Debug, Default)]
+    struct CloseProbe {
+        closed: Mutex<Vec<reims_vgpu_protocol::SubmissionIdentity>>,
+    }
+
+    impl ExecutionPort for CloseProbe {
+        type Submission = ResolvedSubmission;
+        type Completion = ExecutionCompletion;
+        type Error = DrawError;
+
+        fn execute(&self, _submission: Self::Submission) -> Result<Self::Completion, Self::Error> {
+            unreachable!("the test packet contains no executable stream")
+        }
+    }
+    impl ResidentService for CloseProbe {}
+    impl GuestWriteService for CloseProbe {}
+    impl ComputeResidencyService for CloseProbe {}
+    impl CapabilityService for CloseProbe {}
+    impl PresentationService for CloseProbe {}
+    impl ReadbackService for CloseProbe {
+        type Error = DrawError;
+
+        fn read_target(
+            &self,
+            _identity: &crate::model::TargetIdentity,
+        ) -> Result<reims_vgpu_core::TargetReadback, Self::Error> {
+            unreachable!("the test packet performs no readback")
+        }
+    }
+    impl GuestPageTransferService for CloseProbe {}
+    impl ResidentCopyService for CloseProbe {}
+    impl CompletionService for CloseProbe {}
+    impl SubmissionBatchService for CloseProbe {
+        fn close_submission(
+            &self,
+            identity: reims_vgpu_protocol::SubmissionIdentity,
+        ) -> Result<(), DrawError> {
+            self.closed.lock().unwrap().push(identity);
+            Ok(())
+        }
+    }
+    impl GuestImportService for CloseProbe {}
+    impl GuestImagePlanningService for CloseProbe {}
+    impl MaintenanceService for CloseProbe {}
+    impl SessionService for CloseProbe {}
+    impl ObservationService for CloseProbe {}
+    impl ShaderTranslationService for CloseProbe {}
+    impl RenderBufferPlanningService for CloseProbe {}
+    impl WindowPresentationService for CloseProbe {}
+    impl Executor for CloseProbe {}
+
+    let probe = std::sync::Arc::new(CloseProbe::default());
+    let mut state = Device::new_with_executor(DeviceId(1), PAGE_SHIFT_X86, probe.clone());
+    let mut host = FakeHost::new();
+    state.define_task(3, 0x1_0000, 2);
+
+    // A declared zero-length command buffer is visited and refused, leaving an
+    // otherwise empty but well-formed submission. That isolates the boundary
+    // event from draw execution.
+    let mut payload = vec![
+        0u8;
+        CHILD_EXEC_INDIRECT_HEADER_LEN as usize
+            + CHILD_EXEC_INDIRECT_CMDBUF_DESC_LEN as usize
+    ];
+    st32(&mut payload[CHILD_EXEC_INDIRECT_TASK_ID as usize..], 3);
+    st32(&mut payload[CHILD_EXEC_INDIRECT_CMDBUF_COUNT as usize..], 1);
+
+    let result = process_exec_indirect2(&mut state, &mut host, &payload);
+    assert_eq!(result.task_id, 3);
+    let closed = probe.closed.lock().unwrap();
+    assert_eq!(closed.len(), 1, "one packet has one close boundary");
+    assert_eq!(closed[0].task.get(), 3);
+    assert_ne!(
+        closed[0].id.get(),
+        0,
+        "a packet identity is never standalone"
+    );
 }
 
 /// An exec packet naming a slot that is not live must be refused under the
@@ -83,7 +275,7 @@ fn short_payload_noop() {
 /// is a probe that cannot distinguish the cases.
 #[test]
 fn an_exec_packet_naming_a_dead_slot_is_refused_not_aimed_at_its_neighbour() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
     let mut host = FakeHost::new();
     state.define_task(3, 0x1_0000, 2);
     assert!(state.tasks[3].active);
@@ -119,7 +311,7 @@ fn a_resource_record_that_populates_its_unrecovered_tail_says_so() {
     use crate::runtime::decode::fifo::{
         CHILD_EXEC_RESOURCE_OBJECT_ID, CHILD_EXEC_RESOURCE_TAIL, CHILD_EXEC_RESOURCE_VALIDITY_OPS,
     };
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
     let mut host = FakeHost::new();
     state.define_task(3, 0x1_0000, 2);
 
@@ -176,8 +368,6 @@ fn a_resource_record_that_populates_its_unrecovered_tail_says_so() {
     assert!(line.contains(" tail_nz=1"), "{line}");
 }
 
-
-
 /// One segment header whose declared length runs `overshoot` bytes past the
 /// buffer, followed by `tail` bytes of would-be records.
 fn truncated_segment(type_: u8, overshoot: usize, tail: usize) -> Vec<u8> {
@@ -202,7 +392,7 @@ fn a_stream_that_will_not_frame_says_so_instead_of_executing_nothing() {
     // stream the framing decoder rejected executed zero records and produced
     // zero log lines — byte-for-byte indistinguishable at the sink from an
     // idle guest that submitted nothing.
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     let mut out = ExecResult::default();
     let mut acc = StreamAccum::default();
@@ -231,6 +421,129 @@ fn a_stream_that_will_not_frame_says_so_instead_of_executing_nothing() {
     assert!(
         added.contains(&format!("task={task_id}")),
         "the line must carry the task whose work was dropped, got:\n{added}"
+    );
+}
+
+/// Pipeline and bind state belong to the serialized encoder, not to the child
+/// buffer that happens to carry one segment of it. The second segment omits its
+/// pipeline record deliberately: resetting at the child-buffer boundary turns
+/// its valid draw into `stream_draw_dropped_unbound`.
+#[test]
+fn a_render_encoder_continuation_keeps_pipeline_state_across_child_buffers() {
+    use crate::runtime::decode::stream::{SEGMENT_HEADER_LEN, SEGMENT_TYPE_RENDER};
+
+    fn render_segment(records: &[u8], continues_previous: bool, continues_next: bool) -> Vec<u8> {
+        let mut bytes = vec![0u8; SEGMENT_HEADER_LEN];
+        st32(
+            &mut bytes[0..4],
+            (SEGMENT_HEADER_LEN + records.len()) as u32,
+        );
+        bytes[4] = SEGMENT_TYPE_RENDER;
+        bytes[5] = u8::from(continues_previous);
+        bytes[6] = u8::from(continues_next);
+        bytes.extend_from_slice(records);
+        bytes
+    }
+
+    let mut set_pipeline = vec![0u8; wire_render::SET_STATE_TOTAL_LEN as usize];
+    st32(
+        &mut set_pipeline[0..4],
+        wire_render::OPCODE_SET_RENDER_PIPELINE_STATE,
+    );
+    st32(&mut set_pipeline[4..8], wire_render::SET_STATE_TOTAL_LEN);
+    st32(&mut set_pipeline[8..12], 0x41);
+
+    let mut draw = vec![0u8; wire_render::DRAW_TOTAL_LEN as usize];
+    st32(&mut draw[0..4], wire_render::OPCODE_DRAW);
+    st32(&mut draw[4..8], wire_render::DRAW_TOTAL_LEN);
+    st32(&mut draw[8..12], 3);
+    st16(&mut draw[12..14], 0);
+    st16(&mut draw[14..16], 3);
+
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    let mut out = ExecResult::default();
+    let mut open = None;
+
+    walk_submitted_stream(
+        &mut state,
+        &mut host,
+        1,
+        0,
+        &render_segment(&set_pipeline, false, true),
+        &mut out,
+        &mut open,
+    );
+    walk_submitted_stream(
+        &mut state,
+        &mut host,
+        1,
+        1,
+        &render_segment(&draw, true, true),
+        &mut out,
+        &mut open,
+    );
+
+    let Some(OpenEncoder::Render(acc)) = open.as_ref() else {
+        panic!("the continued render encoder must remain open")
+    };
+    assert_eq!(acc.pipeline_ref, 0x41);
+    assert_eq!(acc.draws.len(), 1, "the continuation draw must be retained");
+    assert_eq!(acc.dropped_no_pipeline, 0);
+
+    walk_submitted_stream(
+        &mut state,
+        &mut host,
+        1,
+        2,
+        &render_segment(&[], true, false),
+        &mut out,
+        &mut open,
+    );
+    assert!(
+        open.is_none(),
+        "the closing segment owns encoder retirement"
+    );
+}
+
+#[test]
+fn submission_context_preserves_every_child_buffer_segment_in_order() {
+    use crate::runtime::decode::stream::{
+        SEGMENT_HEADER_LEN, SEGMENT_TYPE_COMPUTE, SEGMENT_TYPE_RENDER,
+    };
+
+    fn segment(type_: u8, continues_previous: bool, continues_next: bool) -> Vec<u8> {
+        let mut bytes = vec![0u8; SEGMENT_HEADER_LEN];
+        st32(&mut bytes[0..4], SEGMENT_HEADER_LEN as u32);
+        bytes[4] = type_;
+        bytes[5] = u8::from(continues_previous);
+        bytes[6] = u8::from(continues_next);
+        bytes
+    }
+
+    let streams = vec![
+        segment(SEGMENT_TYPE_RENDER, false, true),
+        segment(SEGMENT_TYPE_COMPUTE, true, false),
+    ];
+    let boundaries = semantic_submission_segments(&streams);
+    assert_eq!(
+        boundaries.as_ref(),
+        [
+            SegmentBoundary {
+                stream_index: 0,
+                index: 0,
+                kind: SegmentKind::Render,
+                continues_previous: false,
+                continues_next: true,
+            },
+            SegmentBoundary {
+                stream_index: 1,
+                index: 0,
+                kind: SegmentKind::Compute,
+                continues_previous: true,
+                continues_next: false,
+            },
+        ]
     );
 }
 
@@ -335,7 +648,6 @@ fn an_unknown_segment_family_is_refused_and_the_type_5_envelope_is_not() {
     );
 }
 
-#[cfg(feature = "backend-vulkan")]
 #[test]
 fn render_preflight_collects_content_pipelines_without_duplicates() {
     use crate::runtime::decode::stream::{SEGMENT_HEADER_LEN, SEGMENT_TYPE_RENDER};
@@ -358,7 +670,6 @@ fn render_preflight_collects_content_pipelines_without_duplicates() {
     assert_eq!(render_pipeline_refs(&stream), vec![41, 77]);
 }
 
-#[cfg(feature = "backend-vulkan")]
 #[test]
 fn compute_preflight_collects_pipeline_and_local_size_without_duplicates() {
     use crate::runtime::decode::stream::{SEGMENT_HEADER_LEN, SEGMENT_TYPE_COMPUTE};
@@ -396,7 +707,6 @@ fn compute_preflight_collects_pipeline_and_local_size_without_duplicates() {
 
 #[test]
 fn event_segment_signal_wait_in_stream() {
-    use crate::model::FENCE_DOMAIN_EVENT;
     use crate::runtime::decode::event::SIGNAL_WAIT_PAYLOAD_LEN;
     use crate::runtime::decode::stream::{SEGMENT_HEADER_LEN, SEGMENT_TYPE_EVENT};
 
@@ -427,7 +737,7 @@ fn event_segment_signal_wait_in_stream() {
     let mut stream = Vec::new();
     push_segment(&mut stream, SEGMENT_TYPE_EVENT, &records);
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     let mut out = ExecResult::default();
     let mut acc = StreamAccum::default();
@@ -436,7 +746,7 @@ fn event_segment_signal_wait_in_stream() {
     // The signal landed, and the pending wait for 8 left it alone. The
     // three per-op counters this used to assert had no product reader; the
     // generation store is what the next wait actually reads.
-    assert_eq!(state.fence_generation(1, FENCE_DOMAIN_EVENT, 11), Some(7));
+    assert_eq!(state.event_generation(1, 11), Some(7));
 }
 
 #[test]
@@ -508,7 +818,7 @@ fn an_indexed_draw_with_no_index_buffer_is_named() {
         cmd
     };
     let run = |cmd: &[u8]| {
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
         let host = FakeHost::new();
         let mut out = ExecResult::default();
         let mut acc = StreamAccum {
@@ -548,6 +858,47 @@ fn an_indexed_draw_with_no_index_buffer_is_named() {
         log.contains(&format!("op={:#x}", wire_render::OPCODE_DRAW_INDEXED)),
         "the line must name which indexed form fired, since each reads the \
          ref at a different offset"
+    );
+}
+
+/// Primitive topology is parsed at the stream-normalization boundary. An
+/// ordinal outside the advertised semantic enum must refuse this draw rather
+/// than reaching the executor as a triangle through a defaulting conversion.
+#[test]
+fn an_unknown_primitive_topology_refuses_the_draw_without_a_fallback() {
+    let mut command = vec![0u8; wire_render::DRAW_TOTAL_LEN as usize];
+    st32(&mut command[0..4], wire_render::OPCODE_DRAW);
+    st32(&mut command[4..8], wire_render::DRAW_TOTAL_LEN);
+    st32(&mut command[8..12], 5); // outside the public MTLPrimitiveType enum
+    st16(&mut command[12..14], 0);
+    st16(&mut command[14..16], 3);
+
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let host = FakeHost::new();
+    let mut out = ExecResult::default();
+    let mut acc = StreamAccum {
+        pipeline_ref: 0x41,
+        ..Default::default()
+    };
+    handle_render_record(
+        &mut state,
+        &host,
+        1,
+        wire_render::OPCODE_DRAW,
+        &command,
+        &mut out,
+        &mut acc,
+    );
+
+    assert!(acc.saw_draw, "the decoded guest operation was observed");
+    assert!(
+        acc.draws.is_empty(),
+        "an unknown topology must not become an executable draw"
+    );
+    let log = std::fs::read_to_string(crate::observe::fail_log_path()).expect("fail log");
+    assert!(
+        log.contains("reason=unknown_primitive_type") && log.contains("raw=5"),
+        "the refusal must preserve the contract field and exact ordinal; got:\n{log}"
     );
 }
 
@@ -594,7 +945,7 @@ fn an_unsupported_depth_attachment_is_named_not_just_dropped() {
         cmd
     };
     let run = |cmd: &[u8]| {
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
         let host = FakeHost::new();
         let mut out = ExecResult::default();
         let mut acc = StreamAccum::default();
@@ -718,8 +1069,8 @@ fn an_unsupported_depth_attachment_is_named_not_just_dropped() {
 /// This counted and rendered anyway until the arms beside it stopped doing so.
 #[test]
 fn a_pass_declaring_more_array_layers_than_this_device_draws_refuses_the_draws() {
-    use crate::contract::endian::st32;
     use crate::runtime::decode::render::{PASS_ATTACH_TEXREF, PASS_COLOR_ATTACH_OFF};
+    use reims_vgpu_core::endian::st32;
 
     // A full-length record, not the `PASS_MIN_PAYLOAD` one the arms below use:
     // the array length is read only from the whole `RenderPassBody`, and a
@@ -740,7 +1091,7 @@ fn a_pass_declaring_more_array_layers_than_this_device_draws_refuses_the_draws()
         cmd
     };
     let run = |cmd: &[u8]| {
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
         let host = FakeHost::new();
         let mut out = ExecResult::default();
         let mut acc = StreamAccum::default();
@@ -807,7 +1158,7 @@ fn a_pass_declaring_more_array_layers_than_this_device_draws_refuses_the_draws()
 /// is entitled to ask; this is the refusal that says what that costs.
 #[test]
 fn a_pass_declaring_a_raster_sample_count_this_device_cannot_rasterize_refuses_the_draws() {
-    use crate::contract::endian::st32;
+    use reims_vgpu_core::endian::st32;
 
     let record = |count: u32| {
         let total = wire_pass::DEFAULT_RASTER_SAMPLE_COUNT_TOTAL_LEN as usize;
@@ -818,7 +1169,7 @@ fn a_pass_declaring_a_raster_sample_count_this_device_cannot_rasterize_refuses_t
         cmd
     };
     let run = |cmd: &[u8]| {
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
         let host = FakeHost::new();
         let mut out = ExecResult::default();
         let mut acc = StreamAccum::default();
@@ -894,11 +1245,11 @@ fn a_pass_declaring_a_raster_sample_count_this_device_cannot_rasterize_refuses_t
 ///
 #[test]
 fn a_colour_attachment_naming_a_subresource_this_device_cannot_bind_refuses_the_draws() {
-    use crate::contract::endian::st32;
     use crate::runtime::decode::render::{
         PASS_ATTACH_DEPTH_PLANE, PASS_ATTACH_LEVEL, PASS_ATTACH_RESOLVEREF, PASS_ATTACH_SLICE,
         PASS_ATTACH_TEXREF, PASS_COLOR_ATTACH_OFF, PASS_MIN_PAYLOAD,
     };
+    use reims_vgpu_core::endian::st32;
 
     let pass_resolving = |level: u16, slice: u16, plane: u16, resolve: u32| {
         let total = OP_HEADER_LEN + PASS_MIN_PAYLOAD;
@@ -918,7 +1269,7 @@ fn a_colour_attachment_naming_a_subresource_this_device_cannot_bind_refuses_the_
     };
     let pass = |level: u16, slice: u16, plane: u16| pass_resolving(level, slice, plane, 0);
     let run = |cmd: &[u8]| {
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
         let host = FakeHost::new();
         let mut out = ExecResult::default();
         let mut acc = StreamAccum::default();
@@ -980,7 +1331,7 @@ fn a_colour_attachment_naming_a_subresource_this_device_cannot_bind_refuses_the_
 
     // The source and resolve destination stay distinct through stream decode.
     // Collapsing them here turns a resolve operation into single-sample drawing
-    // and loses coverage before either backend sees the request.
+    // and loses coverage before the backend sees the request.
     let acc = run(&pass_resolving(0, 0, 0, 0x99));
     assert_eq!(acc.color_slots.len(), 1);
     assert_eq!(acc.color_slots[0].1.texture_ref, 77);
@@ -1013,7 +1364,7 @@ fn a_colour_attachment_naming_a_subresource_this_device_cannot_bind_refuses_the_
 /// read them side by side. Bands that drifted apart would make that
 /// comparison silently wrong rather than obviously so.
 ///
-/// Declared twice because `coverage_band` is behind `backend-vulkan` and
+/// Declared twice because `coverage_band` belongs to the Vulkan execution path and
 /// this census runs on every backend. This is the comparison that keeps the
 /// duplication honest.
 #[test]
@@ -1025,7 +1376,6 @@ fn the_two_coverage_censuses_use_the_same_bands() {
             band < PASS_EXTENT_SLUGS.len(),
             "pct {pct} banded out of range"
         );
-        #[cfg(feature = "backend-vulkan")]
         assert_eq!(
             band,
             crate::runtime::draw::coverage_band_for_test(pct),
@@ -1057,8 +1407,8 @@ fn the_pass_extent_census_scores_a_fraction_and_clamps_it() {
         "960x540 of 1920x1080 is 25%"
     );
 
-    // A pass stating more than the attachment holds. Metal permits it and
-    // the rasteriser clips, so this reads full rather than over 100%.
+    // The instrument clamps a malformed over-attachment reading to its top
+    // band. Product execution refuses this shape before it reaches a backend.
     let before = store_route_count("pass_extent_full");
     note_pass_extent_coverage(4096, 4096, 1920, 1080);
     assert_eq!(store_route_count("pass_extent_full"), before + 1);
@@ -1078,20 +1428,36 @@ fn the_pass_extent_census_scores_a_fraction_and_clamps_it() {
     );
 }
 
+#[test]
+fn pass_extent_zero_is_per_axis_default_and_large_values_refuse() {
+    let extent = render_target_extent(0, 4).expect("representable extent");
+    assert_eq!(extent.width, None);
+    assert_eq!(extent.height.map(std::num::NonZeroU32::get), Some(4));
+
+    let error = render_target_extent(u64::from(u32::MAX) + 1, 0)
+        .expect_err("the semantic image geometry is u32");
+    assert_eq!(error.axis, "width");
+    assert_eq!(error.raw, u64::from(u32::MAX) + 1);
+    assert_eq!(
+        crate::observe::Decline::slug(&error),
+        "render_target_extent_unrepresentable"
+    );
+}
+
 /// The extent census scores whichever resolve arm supplied the mapping id,
 /// and only for slot 0.
 ///
-/// This is the arm-parity test. The census used to hang off the type-11
+/// This is the arm-parity test. The census used to hang off the IOSurface texture
 /// resolve alone, so on the x86/Vulkan pathway — where the workload takes
-/// the type-4 arm — every band read zero, which is indistinguishable from a
-/// guest that never states an extent. A type-4 attachment *is* its own
+/// the surface backing arm — every band read zero, which is indistinguishable from a
+/// guest that never states an extent. A surface backing attachment *is* its own
 /// mapping id, so the only difference between the two call sites is which
 /// id they pass, and this pins that the scoring does not care which.
 #[test]
 fn the_pass_extent_census_scores_either_resolve_arm() {
     use crate::runtime::drain::store_route_count;
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let cmd = crate::runtime::decode::render::Command {
         pass_render_target_width: 960,
         pass_render_target_height: 540,
@@ -1129,7 +1495,7 @@ fn the_pass_extent_census_scores_either_resolve_arm() {
 fn stream_accum_upserts_buffer_and_viewport() {
     // wire opcodes via wire_render import
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let host = FakeHost::new();
     let mut out = ExecResult::default();
     let mut acc = StreamAccum::default();
@@ -1217,7 +1583,7 @@ fn stream_accum_upserts_buffer_and_viewport() {
 
 #[test]
 fn wide_indexed_draw_reaches_pending_draw() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let host = FakeHost::new();
     let mut out = ExecResult::default();
     let mut acc = StreamAccum {
@@ -1239,7 +1605,7 @@ fn wide_indexed_draw_reaches_pending_draw() {
     assert!(out.saw_draw);
     assert_eq!(acc.draws.len(), 1);
     let indexed = acc.draws[0].indexed.as_ref().expect("indexed draw");
-    assert_eq!(indexed.index_type, 0);
+    assert_eq!(indexed.index_type, Ok(reims_vgpu_protocol::IndexType::U16));
     assert_eq!(indexed.index_buffer_ref, 0x3e);
     assert_eq!(indexed.index_count, 6);
     assert_eq!(indexed.index_buffer_offset, 0x10100);
@@ -1248,7 +1614,7 @@ fn wide_indexed_draw_reaches_pending_draw() {
         DrawArgs {
             vertex_count: 6,
             instance_count: 1,
-            primitive_type: 3,
+            primitive_topology: reims_vgpu_protocol::PrimitiveTopology::Triangle,
             first_vertex: 0,
             base_instance: 0
         }
@@ -1266,9 +1632,9 @@ fn wide_indexed_draw_reaches_pending_draw() {
 /// `DrawEncodeRequest` fails here.
 #[test]
 fn a_base_vertex_and_base_instance_reach_the_pending_draw() {
-    use crate::contract::endian::st16;
+    use reims_vgpu_core::endian::st16;
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let host = FakeHost::new();
     let mut out = ExecResult::default();
     let mut acc = StreamAccum {
@@ -1317,7 +1683,7 @@ fn a_base_vertex_and_base_instance_reach_the_pending_draw() {
 /// code at exactly 64.
 #[test]
 fn every_decoded_draw_in_a_stream_reaches_the_draw_list() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let host = FakeHost::new();
     let mut out = ExecResult::default();
     let mut acc = StreamAccum {
@@ -1337,7 +1703,10 @@ fn every_decoded_draw_in_a_stream_reaches_the_draw_list() {
     }
 
     assert_eq!(acc.draws.len(), records, "no draw may be truncated away");
-    assert_eq!(acc.dropped_no_pipeline, 0, "all of these had a pipeline bound");
+    assert_eq!(
+        acc.dropped_no_pipeline, 0,
+        "all of these had a pipeline bound"
+    );
 
     // With no pipeline latched the same record is the other arm: still not
     // a `PendingDraw`, but counted rather than vanishing.
@@ -1362,7 +1731,7 @@ fn every_decoded_draw_in_a_stream_reaches_the_draw_list() {
 /// pushed with pipeline 61 and both assertions fail.
 #[test]
 fn setting_the_render_pipeline_to_ref_zero_unbinds_it() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let host = FakeHost::new();
     let mut out = ExecResult::default();
     let mut acc = StreamAccum {
@@ -1420,7 +1789,7 @@ fn setting_the_render_pipeline_to_ref_zero_unbinds_it() {
 /// either way, which is exactly how a regression here would hide.
 #[test]
 fn draws_sharing_a_bind_table_share_its_allocation() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let host = FakeHost::new();
     let mut out = ExecResult::default();
     let mut acc = StreamAccum {
@@ -1498,15 +1867,9 @@ fn draw_preparation_keeps_every_recorded_bind_table_allocation() {
     assert!(Arc::ptr_eq(&req.vertex_buffers, &pd.vertex_buffers));
     assert!(Arc::ptr_eq(&req.fragment_buffers, &pd.fragment_buffers));
     assert!(Arc::ptr_eq(&req.vertex_textures, &pd.vertex_textures));
-    assert!(Arc::ptr_eq(
-        &req.fragment_textures,
-        &pd.fragment_textures
-    ));
+    assert!(Arc::ptr_eq(&req.fragment_textures, &pd.fragment_textures));
     assert!(Arc::ptr_eq(&req.vertex_samplers, &pd.vertex_samplers));
-    assert!(Arc::ptr_eq(
-        &req.fragment_samplers,
-        &pd.fragment_samplers
-    ));
+    assert!(Arc::ptr_eq(&req.fragment_samplers, &pd.fragment_samplers));
 }
 
 /// A bind that changes after a draw must not reach back into that draw.
@@ -1517,7 +1880,7 @@ fn draw_preparation_keeps_every_recorded_bind_table_allocation() {
 /// snapshot the guest already committed to.
 #[test]
 fn a_bind_after_a_draw_does_not_rewrite_that_draws_snapshot() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let host = FakeHost::new();
     let mut out = ExecResult::default();
     let mut acc = StreamAccum {
@@ -1584,10 +1947,10 @@ fn a_recorded_buffer_bind_retains_its_object_across_offset_change_and_ref_reuse(
     use crate::runtime::objects;
 
     let mut host = FakeHost::new();
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     define_task_pages_arm64e(&mut host, &mut state, 4, 8);
     assert!(state.set_object_list(1, 0, 32));
-    let put_buffer = |host: &mut FakeHost, state: &DeviceState, handle: u32, size: u64| {
+    let put_buffer = |host: &mut FakeHost, state: &Device, handle: u32, size: u64| {
         let descriptor_gva = 0x180;
         let mut descriptor = [0u8; 16];
         st64(&mut descriptor, size);
@@ -1612,18 +1975,46 @@ fn a_recorded_buffer_bind_retains_its_object_across_offset_change_and_ref_reuse(
     st32(&mut bind[OP_HEADER_LEN + render::BIND_COUNT..], 1);
     st32(&mut bind[OP_HEADER_LEN + render::BIND_ENTRIES..], 7);
     let mut out = ExecResult::default();
-    let mut acc = StreamAccum { pipeline_ref: 61, ..Default::default() };
-    handle_render_record(&mut state, &host, 1, wire_render::OPCODE_SET_VERTEX_BUFFER, &bind, &mut out, &mut acc);
-    let first = acc.vertex_buffers[0].resource.clone().expect("setter retain");
+    let mut acc = StreamAccum {
+        pipeline_ref: 61,
+        ..Default::default()
+    };
+    handle_render_record(
+        &mut state,
+        &host,
+        1,
+        wire_render::OPCODE_SET_VERTEX_BUFFER,
+        &bind,
+        &mut out,
+        &mut acc,
+    );
+    let first = acc.vertex_buffers[0]
+        .resource
+        .clone()
+        .expect("setter retain");
 
     let offset_total = OP_HEADER_LEN + render::BUFFER_OFFSET_PAYLOAD_LEN;
     let mut offset = vec![0u8; offset_total];
     st32(&mut offset, wire_render::OPCODE_SET_VERTEX_BUFFER_OFFSET);
     st32(&mut offset[4..], offset_total as u32);
-    st64(&mut offset[OP_HEADER_LEN + render::BUFFER_OFFSET_VALUE..], 0x80);
-    handle_render_record(&mut state, &host, 1, wire_render::OPCODE_SET_VERTEX_BUFFER_OFFSET, &offset, &mut out, &mut acc);
+    st64(
+        &mut offset[OP_HEADER_LEN + render::BUFFER_OFFSET_VALUE..],
+        0x80,
+    );
+    handle_render_record(
+        &mut state,
+        &host,
+        1,
+        wire_render::OPCODE_SET_VERTEX_BUFFER_OFFSET,
+        &offset,
+        &mut out,
+        &mut acc,
+    );
     assert_eq!(acc.vertex_buffers[0].offset, 0x80);
-    assert!(Arc::ptr_eq(&first, acc.vertex_buffers[0].resource.as_ref().unwrap()));
+    assert!(Arc::ptr_eq(
+        &first,
+        acc.vertex_buffers[0].resource.as_ref().unwrap()
+    ));
 
     let mut draw = vec![0u8; 0x20];
     let draw_op = wire_render::OPCODE_DRAW_INDEXED_WIDE;
@@ -1650,12 +2041,15 @@ fn a_texture_slot_replaces_object_identity_only_on_a_later_setter() {
     use crate::model::TaskResource;
     use crate::runtime::decode::resource::ListObjectEntry;
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let host = FakeHost::new();
-    let first = state.task_resources.register(
+    let first = state.task_objects.resources.register(
         1,
         9,
-        Arc::new(TaskResource::new(ListObjectEntry::default(), Arc::from([]))),
+        Arc::new(TaskResource::new(
+            ListObjectEntry::new(reims_vgpu_protocol::ObjectKind::Buffer, 0, 0),
+            Arc::from([]),
+        )),
     );
     let total = OP_HEADER_LEN + render::BIND_ENTRIES + 4;
     let mut command = vec![0u8; total];
@@ -1665,18 +2059,46 @@ fn a_texture_slot_replaces_object_identity_only_on_a_later_setter() {
     st32(&mut command[OP_HEADER_LEN + render::BIND_ENTRIES..], 9);
     let mut out = ExecResult::default();
     let mut acc = StreamAccum::default();
-    handle_render_record(&mut state, &host, 1, wire_render::OPCODE_SET_FRAGMENT_TEXTURE, &command, &mut out, &mut acc);
-    assert!(Arc::ptr_eq(acc.fragment_textures[0].resource.as_ref().unwrap(), &first));
+    handle_render_record(
+        &mut state,
+        &host,
+        1,
+        wire_render::OPCODE_SET_FRAGMENT_TEXTURE,
+        &command,
+        &mut out,
+        &mut acc,
+    );
+    assert!(Arc::ptr_eq(
+        acc.fragment_textures[0].resource.as_ref().unwrap(),
+        &first
+    ));
 
-    assert!(state.task_resources.delete(1, 9));
-    let replacement = state.task_resources.register(
+    assert!(state.task_objects.resources.delete(1, 9));
+    let replacement = state.task_objects.resources.register(
         1,
         9,
-        Arc::new(TaskResource::new(ListObjectEntry::default(), Arc::from([]))),
+        Arc::new(TaskResource::new(
+            ListObjectEntry::new(reims_vgpu_protocol::ObjectKind::Buffer, 0, 0),
+            Arc::from([]),
+        )),
     );
-    assert!(Arc::ptr_eq(acc.fragment_textures[0].resource.as_ref().unwrap(), &first));
-    handle_render_record(&mut state, &host, 1, wire_render::OPCODE_SET_FRAGMENT_TEXTURE, &command, &mut out, &mut acc);
-    assert!(Arc::ptr_eq(acc.fragment_textures[0].resource.as_ref().unwrap(), &replacement));
+    assert!(Arc::ptr_eq(
+        acc.fragment_textures[0].resource.as_ref().unwrap(),
+        &first
+    ));
+    handle_render_record(
+        &mut state,
+        &host,
+        1,
+        wire_render::OPCODE_SET_FRAGMENT_TEXTURE,
+        &command,
+        &mut out,
+        &mut acc,
+    );
+    assert!(Arc::ptr_eq(
+        acc.fragment_textures[0].resource.as_ref().unwrap(),
+        &replacement
+    ));
 }
 
 #[test]
@@ -1685,7 +2107,7 @@ fn accepted_render_without_executor_is_fail_visible() {
     // lock and clear it so this test always observes its first-sighting line.
     let _guard = UNIMPL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     reset_unimplemented_opcode_dedup_for_test();
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let host = FakeHost::new();
     let mut out = ExecResult::default();
     let mut acc = StreamAccum {
@@ -1780,50 +2202,39 @@ fn a_dropped_draw_names_which_check_refused_not_just_its_class() {
     // Distinct from every other pipeline in the suite: `fail_once` latches per
     // (reason, pipeline) for the whole process.
     let pipe = 249_001u32;
-    note_draw_encode_fail(
-        task,
-        pipe,
-        EncodeStatus::BadArgs("draw_mtl_zero_geom"),
-        1,
-        3,
-    );
+    note_draw_encode_fail(task, pipe, EncodeStatus::BadArgs("draw_zero_geom"), 1, 3);
     let body = sink_body();
     assert!(
-        body.lines().any(|l| l
-            .contains("draw_encode_fail reason=draw_mtl_zero_geom class=bad_args")
-            && l.contains(&format!("pipe={pipe}"))
-            && l.contains(&format!("task={task}"))
-            && l.contains("di=1/3")),
+        body.lines().any(
+            |l| l.contains("draw_encode_fail reason=draw_zero_geom class=bad_args")
+                && l.contains(&format!("pipe={pipe}"))
+                && l.contains(&format!("task={task}"))
+                && l.contains("di=1/3")
+        ),
         "the boundary line must carry the specific check and the class:\n{body}"
     );
 
     // Latched per (reason, pipeline): the guest re-submits the same failing
     // draw every frame, so a repeat adds nothing the first line did not…
-    note_draw_encode_fail(
-        task,
-        pipe,
-        EncodeStatus::BadArgs("draw_mtl_zero_geom"),
-        2,
-        3,
-    );
+    note_draw_encode_fail(task, pipe, EncodeStatus::BadArgs("draw_zero_geom"), 2, 3);
     // …but a *different* check on the same pipeline is a different event and
     // must still be visible. Latching on the class would have hidden it, which
     // is exactly the failure this migration removes.
     note_draw_encode_fail(
         task,
         pipe,
-        EncodeStatus::MetalFailed("draw_mtl_core_failed"),
+        EncodeStatus::BackendFailed("draw_core_failed"),
         2,
         3,
     );
     let body = sink_body();
     assert_eq!(
-        body.matches("reason=draw_mtl_zero_geom").count(),
+        body.matches("reason=draw_zero_geom").count(),
         1,
         "a re-attempted refusal must log once:\n{body}"
     );
     assert!(
-        body.contains("reason=draw_mtl_core_failed"),
+        body.contains("reason=draw_core_failed"),
         "a second check on the same pipeline must not be latched away:\n{body}"
     );
 
@@ -1843,7 +2254,7 @@ fn a_dropped_draw_names_which_check_refused_not_just_its_class() {
 fn zero_ref_render_bind_unbinds_existing_slots() {
     // wire opcodes via wire_render import
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let host = FakeHost::new();
     let mut out = ExecResult::default();
     let mut acc = StreamAccum::default();
@@ -1895,17 +2306,20 @@ fn zero_ref_render_bind_unbinds_existing_slots() {
     assert_eq!(out.sampler_unbinds, 1);
 }
 
-/// x86 type-4 display mid: clear-only stream must Store solid BGRA into pages.
+/// x86 surface backing display mid: clear-only stream must Store solid BGRA into pages.
 #[test]
-fn clear_only_type4_surface_writes_guest_pages() {
-    use crate::contract::endian::{st32, st64};
-    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+fn clear_only_surface_backing_writes_guest_pages() {
     use crate::runtime::decode::render::ColorAttachment;
     use crate::runtime::objects::{self, OBJECT_TYPE_SURFACE};
+    use reims_vgpu_core::endian::{st32, st64};
+    use reims_vgpu_paging::geometry::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+    use reims_vgpu_paging::geometry::{
+        MAPPER_PAGE_ENTRY_PFN_SHIFT as PAGE_ENTRY_PFN_SHIFT,
+        MAPPER_PAGE_ENTRY_VALID as PAGE_ENTRY_VALID,
+    };
 
     let mut host = FakeHost::new();
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     state.page_shift = PAGE_SHIFT_X86;
     // Surface pages at pfn 0x40 (one 4K page is enough for 16×16).
     let page = 0x40u64 << PAGE_SHIFT_X86;
@@ -1930,7 +2344,7 @@ fn clear_only_type4_surface_writes_guest_pages() {
     let _ = host.write_gpa(root_gpa + 0x40 * 4, &d[..4]);
     state.define_task(1, 0x1000, 2);
     assert!(state.set_object_list(1, 0, 8));
-    // Type-4 at surface_id=5.
+    // Surface backing at surface_id=5.
     let mut entry = [0u8; 12];
     st32(
         &mut entry[0..],
@@ -1948,7 +2362,7 @@ fn clear_only_type4_surface_writes_guest_pages() {
     st32(&mut desc[0x20..], 64);
     let _ = host.write_gpa(data_gpa + 0x80, &desc);
 
-    assert!(objects::resolve_type4_surface(&mut state, &host, 5));
+    assert!(objects::resolve_surface_backing(&mut state, &host, 5));
     let mut out = ExecResult::default();
     let mut acc = StreamAccum::default();
     acc.clears.push(ColorAttachment {
@@ -1964,15 +2378,15 @@ fn clear_only_type4_surface_writes_guest_pages() {
     finish_stream(&mut state, &mut host, 1, &mut out, &acc);
     assert!(
         out.clears_applied >= 1,
-        "type-4 clear must apply, got {}",
+        "surface backing clear must apply, got {}",
         out.clears_applied
     );
     // Read first pixel from guest page (BGRA).
     let mut px = [0u8; 4];
     assert!(host.read_gpa(page, &mut px).is_ok());
     assert_eq!(px, [0, 0, 255, 255], "expected opaque red BGRA, got {px:?}");
-    let m = state.mappings.get(&5).expect("mapping");
-    assert!(m.content_generation > 0 || m.mapped);
+    let m = state.surfaces.mappings.get(&5).expect("mapping");
+    assert!(m.content.guest_page_generation > 0 || m.lifecycle.active);
     let _ = PAGE_ENTRY_VALID;
     let _ = PAGE_ENTRY_PFN_SHIFT;
 }
@@ -1982,7 +2396,7 @@ fn clear_only_type4_surface_writes_guest_pages() {
 #[test]
 fn finish_stream_clear_only_branch_without_draws() {
     use crate::runtime::decode::render::ColorAttachment;
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     let mut out = ExecResult::default();
     let mut acc = StreamAccum::default();
@@ -1998,15 +2412,15 @@ fn finish_stream_clear_only_branch_without_draws() {
     });
     // No draws → clear-only branch (attempts apply_clear; unresolvable ref).
     finish_stream(&mut state, &mut host, 1, &mut out, &acc);
-    assert_eq!(out.metal_draws_ok, 0);
-    assert_eq!(out.metal_draws_fail, 0);
+    assert_eq!(out.draws_ok, 0);
+    assert_eq!(out.draws_fail, 0);
 }
 
 #[test]
 fn finish_stream_with_draws_skips_guest_clear_prelude() {
     use crate::runtime::decode::render::ColorAttachment;
     use crate::runtime::draw::BufferBind;
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     let mut out = ExecResult::default();
     let mut acc = StreamAccum::default();
@@ -2023,13 +2437,14 @@ fn finish_stream_with_draws_skips_guest_clear_prelude() {
     acc.clears.push(att);
     acc.saw_draw = true;
     acc.color_slots.push((0, att));
-    acc.draws.push(PendingDraw {
+    acc.push_draw(PendingDraw {
+        icb_ref: None,
         visibility: None,
         pipeline_ref: 1,
         draw: DrawArgs {
             vertex_count: 3,
             instance_count: 1,
-            primitive_type: 3,
+            primitive_topology: reims_vgpu_protocol::PrimitiveTopology::Triangle,
             first_vertex: 0,
             base_instance: 0,
         },
@@ -2049,10 +2464,12 @@ fn finish_stream_with_draws_skips_guest_clear_prelude() {
         viewports: Vec::new(),
         scissors: Vec::new(),
         blend_color: None,
-        cull_mode: None,
-        front_facing: None,
-        fill_mode: None,
-        depth_clip_mode: None,
+        render_target_extent: Default::default(),
+        cull_mode: reims_vgpu_protocol::CullMode::None,
+        front_face_ccw: false,
+        fill_mode: reims_vgpu_protocol::FillMode::Fill,
+        line_width: reims_vgpu_core::LineWidth::ONE,
+        depth_clip_mode: reims_vgpu_protocol::DepthClipMode::Clip,
         depth_bias: None,
         depth_stencil_ref: 0,
         stencil_ref: None,
@@ -2060,24 +2477,24 @@ fn finish_stream_with_draws_skips_guest_clear_prelude() {
         stencil_attach: None,
     });
     finish_stream(&mut state, &mut host, 1, &mut out, &acc);
-    // Unresolvable RT → mrt_request fail before encode (not NoMetal); no clear.
+    // Unresolvable RT → mrt_request fail before encode (not BackendUnavailable); no clear.
     assert_eq!(
         out.clears_applied, 0,
         "unresolvable multi-draw must not guest-clear"
     );
 }
 
-/// Linux NoMetal: draws fail but CLEAR seed still Stores into type-4 pages.
+/// Linux BackendUnavailable: draws fail but CLEAR seed still Stores into surface backing pages.
 #[test]
-fn nometal_draw_falls_back_to_type4_clear() {
-    use crate::contract::endian::{st32, st64};
-    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+fn backend_unavailable_draw_falls_back_to_surface_backing_clear() {
     use crate::runtime::decode::render::ColorAttachment;
     use crate::runtime::draw::BufferBind;
     use crate::runtime::objects::{self, OBJECT_TYPE_SURFACE};
+    use reims_vgpu_core::endian::{st32, st64};
+    use reims_vgpu_paging::geometry::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
 
     let mut host = FakeHost::new();
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     state.page_shift = PAGE_SHIFT_X86;
     let page = 0x50u64 << PAGE_SHIFT_X86;
     host.map_range(page, 0x2000, 0);
@@ -2114,7 +2531,7 @@ fn nometal_draw_falls_back_to_type4_clear() {
     st32(&mut desc[0x1c..], 16);
     st32(&mut desc[0x20..], 64);
     let _ = host.write_gpa(data_gpa + 0x80, &desc);
-    assert!(objects::resolve_type4_surface(&mut state, &host, 5));
+    assert!(objects::resolve_surface_backing(&mut state, &host, 5));
 
     let mut out = ExecResult::default();
     let mut acc = StreamAccum::default();
@@ -2131,13 +2548,14 @@ fn nometal_draw_falls_back_to_type4_clear() {
     acc.clears.push(att);
     acc.saw_draw = true;
     acc.color_slots.push((0, att));
-    acc.draws.push(PendingDraw {
+    acc.push_draw(PendingDraw {
+        icb_ref: None,
         visibility: None,
         pipeline_ref: 7,
         draw: DrawArgs {
             vertex_count: 3,
             instance_count: 1,
-            primitive_type: 3,
+            primitive_topology: reims_vgpu_protocol::PrimitiveTopology::Triangle,
             first_vertex: 0,
             base_instance: 0,
         },
@@ -2157,10 +2575,12 @@ fn nometal_draw_falls_back_to_type4_clear() {
         viewports: Vec::new(),
         scissors: Vec::new(),
         blend_color: None,
-        cull_mode: None,
-        front_facing: None,
-        fill_mode: None,
-        depth_clip_mode: None,
+        render_target_extent: Default::default(),
+        cull_mode: reims_vgpu_protocol::CullMode::None,
+        front_face_ccw: false,
+        fill_mode: reims_vgpu_protocol::FillMode::Fill,
+        line_width: reims_vgpu_core::LineWidth::ONE,
+        depth_clip_mode: reims_vgpu_protocol::DepthClipMode::Clip,
         depth_bias: None,
         depth_stencil_ref: 0,
         stencil_ref: None,
@@ -2169,22 +2589,21 @@ fn nometal_draw_falls_back_to_type4_clear() {
     });
     let mut second = acc.draws[0].clone();
     second.pipeline_ref = 8;
-    acc.draws.push(second);
+    acc.push_draw(second);
     finish_stream(&mut state, &mut host, 1, &mut out, &acc);
     assert_eq!(
         out.render_attachment_resolves, 1,
         "one render stream resolves its fixed attachment set once"
     );
-    // Non-Apple: Linux encode Stores CLEAR load into type-4 (Ok) or
-    // NoMetal clear fallback — either path must land green BGRA.
-    #[cfg(feature = "backend-vulkan")]
+    // Non-Apple: Linux encode Stores CLEAR load into surface backing (Ok) or
+    // BackendUnavailable clear fallback — either path must land green BGRA.
     {
         assert!(
-            out.metal_draws_ok >= 1 || out.clears_applied >= 1 || out.metal_draws_fail >= 1,
+            out.draws_ok >= 1 || out.clears_applied >= 1 || out.draws_fail >= 1,
             "expected clear store path: ok={} clear={} fail={}",
-            out.metal_draws_ok,
+            out.draws_ok,
             out.clears_applied,
-            out.metal_draws_fail
+            out.draws_fail
         );
         let mut px = [0u8; 4];
         assert!(host.read_gpa(page, &mut px).is_ok());
@@ -2237,7 +2656,7 @@ fn multi_draw_store_plan_matches_archive_drawjob_writeback() {
 }
 
 #[test]
-fn multi_draw_chain_source_preserves_portable_unified_output() {
+fn multi_draw_chain_source_preserves_cpu_materialized_output() {
     assert_eq!(
         multi_draw_chain_source(true, false),
         MultiDrawChainSource::Resident
@@ -2259,19 +2678,18 @@ fn render_pass_template_reuses_attachment_without_load_seed() {
         pipeline_ref: 7,
         vertex_count: 3,
         instance_count: 1,
-        primitive_type: 3,
+        primitive_topology: reims_vgpu_protocol::PrimitiveTopology::Triangle,
         colors: vec![draw::ColorRtRequest {
             slot: 0,
             texture_ref: 11,
-            mapping_id: 3,
-            target_gva: 0,
-            row_stride: 0,
+            resource: None,
+            storage: draw::ColorTargetStorage::Mapping(3),
             width: 1920,
             height: 1080,
             format: 0x50,
             sample_count: 1,
-            load_action: MTL_LOAD_ACTION_CLEAR,
-            store_action: MTL_STORE_ACTION_STORE,
+            load_action: reims_vgpu_protocol::pass_action::LoadAction::Clear,
+            store_action: reims_vgpu_protocol::pass_action::StoreAction::Store,
             clear_color: [0.1, 0.2, 0.3, 1.0],
             target_seed_rgba: Some(vec![0xbb; 16]),
             multisample_source_ref: 0,
@@ -2280,8 +2698,11 @@ fn render_pass_template_reuses_attachment_without_load_seed() {
     };
     let template = render_pass_attachment_template(&first);
     assert!(template.colors[0].target_seed_rgba.is_none());
-    assert_eq!(template.colors[0].load_action, MTL_LOAD_ACTION_LOAD);
-    assert_eq!(template.colors[0].mapping_id, 3);
+    assert_eq!(
+        template.colors[0].load_action,
+        reims_vgpu_protocol::pass_action::LoadAction::Load
+    );
+    assert_eq!(template.colors[0].mapping_id(), 3);
     assert_eq!(
         (template.colors[0].width, template.colors[0].height),
         (1920, 1080)
@@ -2292,7 +2713,7 @@ fn render_pass_template_reuses_attachment_without_load_seed() {
         draw: DrawArgs {
             vertex_count: 6,
             instance_count: 2,
-            primitive_type: 4,
+            primitive_topology: reims_vgpu_protocol::PrimitiveTopology::TriangleStrip,
             first_vertex: 9,
             base_instance: 0,
         },
@@ -2304,13 +2725,18 @@ fn render_pass_template_reuses_attachment_without_load_seed() {
         (
             req.vertex_count,
             req.instance_count,
-            req.primitive_type,
+            req.primitive_topology,
             req.first_vertex
         ),
-        (6, 2, 4, 9)
+        (
+            6,
+            2,
+            reims_vgpu_protocol::PrimitiveTopology::TriangleStrip,
+            9,
+        )
     );
     assert_eq!(req.colors.len(), 1);
-    assert_eq!(req.colors[0].mapping_id, 3);
+    assert_eq!(req.colors[0].mapping_id(), 3);
     assert_eq!(
         first.colors[0].target_seed_rgba.as_ref().map(Vec::len),
         Some(16)
@@ -2365,8 +2791,8 @@ fn dropped_clear_logs_once_per_reason_target() {
 /// pass by coincidence.
 #[test]
 fn a_store_action_override_reaches_the_slot_it_names() {
-    use crate::contract::pass_action::MTL_STORE_ACTION_DONT_CARE;
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    use reims_vgpu_protocol::pass_action::MTL_STORE_ACTION_DONT_CARE;
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let host = FakeHost::new();
     let mut out = ExecResult::default();
     let mut acc = StreamAccum::default();
@@ -2450,11 +2876,11 @@ fn a_store_action_override_reaches_the_slot_it_names() {
 /// the wrong one cannot pass.
 #[test]
 fn a_depth_or_stencil_store_action_override_reaches_its_own_attachment() {
-    use crate::contract::pass_action::MTL_STORE_ACTION_DONT_CARE;
     use crate::runtime::decode::render::StencilAttachment;
     use crate::runtime::drain::store_route_count;
+    use reims_vgpu_protocol::pass_action::MTL_STORE_ACTION_DONT_CARE;
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let host = FakeHost::new();
     let mut out = ExecResult::default();
     let mut acc = StreamAccum::default();
@@ -2464,7 +2890,7 @@ fn a_depth_or_stencil_store_action_override_reaches_its_own_attachment() {
         let mut c = vec![0u8; total];
         st32(&mut c[0..], opcode);
         st32(&mut c[4..], total as u32);
-        crate::contract::endian::st64(&mut c[reims_vgpu_wire::OP_HEADER_LEN..], action);
+        reims_vgpu_core::endian::st64(&mut c[reims_vgpu_wire::OP_HEADER_LEN..], action);
         c
     };
     let mut send = |acc: &mut StreamAccum, opcode: u32, action: u64| {
@@ -2553,9 +2979,9 @@ fn a_depth_or_stencil_store_action_override_reaches_its_own_attachment() {
 /// three times — fails here rather than passing on a degenerate fixture.
 #[test]
 fn a_plural_scissor_record_reaches_the_accumulator_whole() {
-    use crate::contract::endian::st64;
+    use reims_vgpu_core::endian::st64;
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let host = FakeHost::new();
     let mut out = ExecResult::default();
     let mut acc = StreamAccum::default();
@@ -2639,10 +3065,10 @@ fn a_plural_scissor_record_reaches_the_accumulator_whole() {
 /// selects, so dropping slot 1 silently renumbers slot 2.
 #[test]
 fn an_empty_rect_in_a_plural_scissor_record_keeps_the_previous_state() {
-    use crate::contract::endian::st64;
     use crate::runtime::drain::store_route_count;
+    use reims_vgpu_core::endian::st64;
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let host = FakeHost::new();
     let mut out = ExecResult::default();
     let mut acc = StreamAccum::default();
@@ -2730,7 +3156,7 @@ fn a_bind_past_the_last_table_slot_reports_what_it_dropped() {
     let c = render::decode(&command).expect("an over-table texture run must decode");
     assert_eq!(c.ref_binds.len(), COUNT as usize);
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let host = FakeHost::new();
     let mut out = ExecResult::default();
     let mut acc = StreamAccum::default();
@@ -2851,7 +3277,7 @@ fn a_sampler_above_apples_table_but_inside_ours_still_binds() {
         0x3333,
     );
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let host = FakeHost::new();
     let mut out = ExecResult::default();
     let mut acc = StreamAccum::default();
@@ -2880,8 +3306,8 @@ fn a_sampler_above_apples_table_but_inside_ours_still_binds() {
 /// 32 up was refused because `metal2vulkan` numbers its bands 32 apart, so
 /// texture 68 and sampler 36 would have been one descriptor binding. Nothing
 /// about the *information* forced that — the SPIR-V type says which class a
-/// variable is — so `spirv_bind::widen_sampled_bands` moves the sampler band out
-/// of the way and the whole 128-entry table becomes reachable.
+/// variable is — so metal2vulkan assigns non-overlapping texture and sampler
+/// ranges and the whole 128-entry table becomes reachable.
 ///
 /// Asserted three ways, because each alone could pass while the slot is still
 /// lost: the accumulator keeps the bind, nothing is counted against the table,
@@ -2889,7 +3315,7 @@ fn a_sampler_above_apples_table_but_inside_ours_still_binds() {
 #[test]
 fn a_texture_bind_past_the_old_band_binds_and_keeps_its_own_descriptor() {
     use crate::runtime::drain::store_route_count;
-    use crate::runtime::spirv_bind::{SAMPLER_BINDING_BASE, TEXTURE_BINDING_BASE};
+    use reims_vgpu_vulkan::spirv_bind::{SAMPLER_BINDING_BASE, TEXTURE_BINDING_BASE};
     use reims_vgpu_wire::ops::bind_limit;
 
     // Past the old 32-wide band, inside Apple's table, and far enough in that
@@ -2917,7 +3343,7 @@ fn a_texture_bind_past_the_old_band_binds_and_keeps_its_own_descriptor() {
         st32(&mut command[at..], 0x9000 + i as u32);
     }
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let host = FakeHost::new();
     let mut out = ExecResult::default();
     let mut acc = StreamAccum::default();
@@ -2984,7 +3410,7 @@ fn the_last_texture_slot_binds_where_the_same_buffer_slot_does_not() {
         command
     };
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let host = FakeHost::new();
     let mut out = ExecResult::default();
     let mut acc = StreamAccum::default();
@@ -3077,7 +3503,7 @@ fn every_bind_record_lands_in_one_reach_band_and_the_top_one_reconciles() {
     ];
     let read = || bands.map(store_route_count);
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let host = FakeHost::new();
     let mut out = ExecResult::default();
     let mut acc = StreamAccum::default();
@@ -3145,7 +3571,7 @@ fn every_bind_record_lands_in_one_reach_band_and_the_top_one_reconciles() {
 fn a_decoded_record_that_no_arm_applies_names_what_happened_instead() {
     use crate::runtime::drain::store_route_count;
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let host = FakeHost::new();
     let mut out = ExecResult::default();
     let mut acc = StreamAccum::default();
@@ -3233,7 +3659,7 @@ fn a_decoded_record_that_no_arm_applies_names_what_happened_instead() {
 /// warns about at `SamplerLodBind`.
 #[test]
 fn a_sampler_bind_carries_its_own_lod_clamps_per_slot() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let host = FakeHost::new();
     let mut out = ExecResult::default();
     let mut acc = StreamAccum::default();
@@ -3323,7 +3749,7 @@ fn an_indirect_draw_takes_its_counts_from_the_guest_buffer() {
     // uses on the compute rail.
     let build = |words: &[u32]| {
         let mut host = FakeHost::new();
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
         gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
         assert!(state.set_object_list(1, 0, 32));
         let bytes: Vec<u8> = words.iter().flat_map(|v| v.to_le_bytes()).collect();
@@ -3368,10 +3794,10 @@ fn an_indirect_draw_takes_its_counts_from_the_guest_buffer() {
         );
         assert_eq!(
             acc.draws[0].draw,
-            crate::contract::draw::DrawArgs {
+            reims_vgpu_core::draw::DrawArgs {
                 vertex_count: 11,
                 instance_count: 22,
-                primitive_type: 4,
+                primitive_topology: reims_vgpu_protocol::PrimitiveTopology::TriangleStrip,
                 first_vertex: 33,
                 base_instance: 44,
             }
@@ -3410,7 +3836,11 @@ fn an_indirect_draw_takes_its_counts_from_the_guest_buffer() {
         let pd = &acc.draws[0];
         assert_eq!(pd.draw.vertex_count, 11, "indexCount");
         assert_eq!(pd.draw.instance_count, 22);
-        assert_eq!(pd.draw.primitive_type, 3, "from the record, not the block");
+        assert_eq!(
+            pd.draw.primitive_topology,
+            reims_vgpu_protocol::PrimitiveTopology::Triangle,
+            "from the record, not the block"
+        );
         assert_eq!(
             pd.draw.first_vertex, 0,
             "indexStart offsets the index buffer, never the vertex fetch"
@@ -3421,9 +3851,12 @@ fn an_indirect_draw_takes_its_counts_from_the_guest_buffer() {
         assert_eq!(idx.index_count, 11);
         assert_eq!(idx.base_vertex, 44, "baseVertex, the block's signed field");
         assert_eq!(
-            idx.index_buffer_offset,
-            0x100 + 33 * 4,
-            "indexStart 33 at four bytes per UInt32 index, past the record's own offset"
+            idx.index_buffer_offset, 0x100,
+            "the record's byte offset remains independent of index element width"
+        );
+        assert_eq!(
+            idx.index_start, 33,
+            "the indirect element offset stays typed"
         );
     }
 
@@ -3467,7 +3900,7 @@ fn an_indirect_draw_takes_its_counts_from_the_guest_buffer() {
 /// range, `0x15` carries the range literally.
 #[test]
 fn every_icb_execute_in_a_stream_is_kept_in_order() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let host = FakeHost::new();
     let mut out = ExecResult::default();
     let mut acc = StreamAccum::default();
@@ -3521,61 +3954,221 @@ fn every_icb_execute_in_a_stream_is_kept_in_order() {
     );
     assert_eq!(acc.execute_icb[2].range_location, 0x1100);
     assert_eq!(acc.execute_icb[2].range_length, 0x2200);
+    assert_eq!(
+        acc.render_work,
+        [
+            RenderWork::ExecuteIcb(0),
+            RenderWork::ExecuteIcb(1),
+            RenderWork::ExecuteIcb(2),
+        ],
+        "the typed payload store must not become a second ordering authority"
+    );
 }
 
-/// The pass opens once, so only the first execute in it may clear.
-///
-/// Each ICB execute opens its own host pass over the same attachments. Leaving
-/// the stream's `CLEAR` on the later ones re-runs the clear inside what Metal
-/// treats as one pass, wiping whatever the execute before it drew — the same
-/// failure the multi-draw chain describes at `di > 0` and forces `LOAD` for.
 #[test]
-fn a_later_icb_execute_opens_its_pass_with_load() {
-    let slots = vec![
-        (
-            0u32,
-            ColorAttachment {
-                texture_ref: 11,
-                load_action: MTL_LOAD_ACTION_CLEAR,
-                store_action: MTL_STORE_ACTION_STORE,
-                clear_color: [0.25, 0.5, 0.75, 1.0],
-                ..Default::default()
+fn icb_replay_uses_the_declared_inheritance_and_keeps_draw_arguments() {
+    use crate::runtime::icb::{
+        IcbRenderBindStage, IcbRenderBufferBind, IcbRenderDraw, IcbRenderFill,
+    };
+
+    let state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let host = FakeHost::new();
+    let inherited = PendingDraw {
+        pipeline_ref: 0x51,
+        fragment_textures: Arc::new(vec![TextureBind {
+            index: 2,
+            texture_ref: 0x77,
+            ..Default::default()
+        }]),
+        vertex_buffers: Arc::new(vec![BufferBind {
+            index: 0,
+            buffer_ref: 0x88,
+            ..Default::default()
+        }]),
+        ..Default::default()
+    };
+    let execute = RenderIcbExecute {
+        icb_ref: 0x91,
+        is_range: true,
+        range_location: 0,
+        range_length: 1,
+        args_buffer_ref: 0,
+        args_buffer_offset: 0,
+        inherited,
+    };
+    let descriptor = reims_vgpu_protocol::IndirectCommandBufferDescriptor {
+        flags: 0b11,
+        ..Default::default()
+    };
+    let fill = IcbRenderFill {
+        command_index: 0,
+        pipeline_ref: 0,
+        buffers: vec![IcbRenderBufferBind {
+            index: 0,
+            buffer_ref: 0x99,
+            stage: IcbRenderBindStage::Vertex,
+            ..Default::default()
+        }],
+        object_threadgroup_memory: Vec::new(),
+        draw: IcbRenderDraw::Primitives {
+            primitive_type: 3,
+            vertex_start: 4,
+            vertex_count: 6,
+            instance_count: 2,
+            base_instance: 9,
+        },
+    };
+    let draw = pending_draw_from_icb(&state, &host, 1, &execute, &descriptor, fill)
+        .expect("the inherited command is representable")
+        .expect("the command is not an empty draw");
+    assert_eq!(draw.pipeline_ref, 0x51);
+    assert_eq!(draw.icb_ref, Some(0x91));
+    assert_eq!(draw.draw.vertex_count, 6);
+    assert_eq!(draw.draw.instance_count, 2);
+    assert_eq!(draw.draw.first_vertex, 4);
+    assert_eq!(draw.draw.base_instance, 9);
+    assert_eq!(draw.fragment_textures[0].texture_ref, 0x77);
+    assert_eq!(
+        draw.vertex_buffers[0].buffer_ref, 0x88,
+        "inherited encoder buffers remain authoritative over per-command slots"
+    );
+}
+
+#[test]
+fn icb_replay_refuses_a_per_command_pipeline_when_pipeline_state_is_inherited() {
+    use crate::runtime::icb::{IcbRenderDraw, IcbRenderFill};
+
+    let state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let host = FakeHost::new();
+    let execute = RenderIcbExecute {
+        icb_ref: 0x91,
+        is_range: true,
+        range_location: 0,
+        range_length: 1,
+        args_buffer_ref: 0,
+        args_buffer_offset: 0,
+        inherited: PendingDraw {
+            pipeline_ref: 0x51,
+            ..Default::default()
+        },
+    };
+    let descriptor = reims_vgpu_protocol::IndirectCommandBufferDescriptor {
+        flags: 1,
+        ..Default::default()
+    };
+    let fill = IcbRenderFill {
+        command_index: 0,
+        pipeline_ref: 0x61,
+        buffers: Vec::new(),
+        object_threadgroup_memory: Vec::new(),
+        draw: IcbRenderDraw::Primitives {
+            primitive_type: 3,
+            vertex_start: 0,
+            vertex_count: 3,
+            instance_count: 1,
+            base_instance: 0,
+        },
+    };
+
+    let refusal = pending_draw_from_icb(&state, &host, 1, &execute, &descriptor, fill).unwrap_err();
+    assert_eq!(
+        crate::observe::Decline::slug(&refusal),
+        "render_icb_inherited_pipeline_ref_nonzero"
+    );
+}
+
+#[test]
+fn direct_icb_barrier_and_direct_expand_in_encoder_order() {
+    use crate::runtime::decode::resource::{render_icb_layout, MTL_INDIRECT_CMD_DRAW};
+    use crate::runtime::gva_mem;
+    use crate::runtime::icb::{encode_render_command_slot, IcbRenderDraw, IcbRenderFill};
+
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
+    let layout = render_icb_layout(0, 0, MTL_INDIRECT_CMD_DRAW);
+    let descriptor = reims_vgpu_protocol::IndirectCommandBufferDescriptor {
+        command_types: MTL_INDIRECT_CMD_DRAW,
+        max_command_count: 1,
+        flags: 0b11,
+        layout,
+        ..Default::default()
+    };
+    state
+        .task_objects
+        .indirect_command_buffers
+        .record(1, 0x91, descriptor)
+        .unwrap();
+    let slot = encode_render_command_slot(
+        &layout,
+        &IcbRenderFill {
+            command_index: 0,
+            pipeline_ref: 0,
+            buffers: Vec::new(),
+            object_threadgroup_memory: Vec::new(),
+            draw: IcbRenderDraw::Primitives {
+                primitive_type: 3,
+                vertex_start: 0,
+                vertex_count: 3,
+                instance_count: 1,
+                base_instance: 5,
             },
-        ),
-        (
-            1u32,
-            ColorAttachment {
-                texture_ref: 12,
-                load_action: crate::contract::pass_action::MTL_LOAD_ACTION_DONT_CARE,
-                store_action: MTL_STORE_ACTION_STORE,
-                clear_color: [0.0; 4],
-                // A second attachment whose action is *not* CLEAR, so the
-                // helper is shown rewriting every slot rather than only the
-                // one that would have re-cleared.
-                slice: 3,
-                ..Default::default()
-            },
-        ),
-    ];
-    let loading = color_slots_loading(&slots);
-    assert_eq!(loading.len(), slots.len(), "no attachment is dropped");
-    for ((slot, att), (orig_slot, orig)) in loading.iter().zip(slots.iter()) {
-        assert_eq!(
-            slot, orig_slot,
-            "the slot index is the pass's, not an index"
-        );
-        assert_eq!(att.load_action, MTL_LOAD_ACTION_LOAD);
-        // Everything else is the stream's own. The clear colour in particular
-        // is carried rather than blanked: it is unread on this path, and a
-        // zero here would be an invented value in a decoded record.
-        assert_eq!(att.texture_ref, orig.texture_ref);
-        assert_eq!(att.store_action, orig.store_action);
-        assert_eq!(att.clear_color, orig.clear_color);
-        assert_eq!(att.slice, orig.slice);
-        assert_eq!(att.level, orig.level);
-        assert_eq!(att.depth_plane, orig.depth_plane);
-        assert_eq!(att.resolve_texture_ref, orig.resolve_texture_ref);
-    }
+        },
+    )
+    .unwrap();
+    let command_gva = 5u64 << crate::runtime::decode::resource::RESOURCE_PAGE_SHIFT;
+    gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], command_gva, &slot);
+    assert!(state.task_objects.indirect_command_buffers.bind(
+        1,
+        0x91,
+        reims_vgpu_protocol::IcbCommandMemory {
+            gva: command_gva,
+            byte_len: slot.len() as u64,
+        },
+    ));
+
+    let direct = |pipeline_ref| PendingDraw {
+        pipeline_ref,
+        draw: DrawArgs {
+            vertex_count: 3,
+            instance_count: 1,
+            primitive_topology: reims_vgpu_protocol::PrimitiveTopology::Triangle,
+            first_vertex: 0,
+            base_instance: 0,
+        },
+        ..Default::default()
+    };
+    let mut acc = StreamAccum::default();
+    acc.push_draw(direct(0x41));
+    acc.push_icb(RenderIcbExecute {
+        icb_ref: 0x91,
+        is_range: true,
+        range_location: 0,
+        range_length: 1,
+        args_buffer_ref: 0,
+        args_buffer_offset: 0,
+        inherited: direct(0x51),
+    });
+    acc.push_barrier(reims_vgpu_core::RenderBarrier::Texture);
+    acc.push_draw(direct(0x61));
+
+    let mut out = ExecResult::default();
+    let expanded = expand_render_work(&state, &host, 1, &mut out, &acc);
+    assert_eq!(
+        expanded
+            .draws
+            .iter()
+            .map(|draw| draw.pipeline_ref)
+            .collect::<Vec<_>>(),
+        [0x41, 0x51, 0x61]
+    );
+    assert_eq!(expanded.draws[1].icb_ref, Some(0x91));
+    assert_eq!(expanded.draws[1].draw.base_instance, 5);
+    assert_eq!(
+        expanded.barriers_before_draw,
+        [(2, reims_vgpu_core::RenderBarrier::Texture)]
+    );
+    assert_eq!(out.render_icb_fail, 0);
 }
 
 /// A buffer-offset record that lands on nothing says so, both ways.
@@ -3590,7 +4183,7 @@ fn a_later_icb_execute_opens_its_pass_with_load() {
 fn a_buffer_offset_that_lands_on_nothing_reports_which_way_it_missed() {
     use crate::runtime::drain::store_route_count;
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let host = FakeHost::new();
     let mut out = ExecResult::default();
     let mut acc = StreamAccum::default();
@@ -3640,42 +4233,105 @@ fn a_buffer_offset_that_lands_on_nothing_reports_which_way_it_missed() {
     );
 }
 
-/// The records this rail answers by doing nothing still say they arrived.
+/// Residency hints remain measurable no-ops, while barriers retain their exact
+/// position and decoded dependency domain in the stream.
 ///
-/// `UseResource`, `UseHeap` and `Barrier` all reached the dispatch's
-/// catch-all, so a guest's residency declaration and its barriers were
-/// indistinguishable from a record that had been executed — the arm they
-/// fell into was shared with `Kind::Unknown` and with every guarded arm's
-/// else-case. Doing nothing is still the answer; being silent about it is
-/// not, and a counter nobody reads back cannot show it is wired up.
+/// The barrier used to share the residency answer on the claim that a submit
+/// boundary was a memory dependency. It is not: the resolved command must
+/// reach the backend at its exact position while residency hints remain no-ops.
 #[test]
-fn a_residency_or_barrier_record_is_counted_rather_than_dropped_in_silence() {
+fn render_barriers_preserve_position_and_scope_while_residency_stays_a_noop() {
     use crate::runtime::drain::store_route_count;
+    use crate::runtime::executor::*;
+    use reims_vgpu_core::{
+        CapabilityService, ComputeResidencyService, ExecutionPort, GuestWriteService,
+        PresentationService, ReadbackService, ResidentService,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    for (op, route, payload_len) in [
+    #[derive(Debug, Default)]
+    struct BarrierProbe {
+        flushes: AtomicUsize,
+    }
+
+    impl ExecutionPort for BarrierProbe {
+        type Submission = ResolvedSubmission;
+        type Completion = ExecutionCompletion;
+        type Error = DrawError;
+
+        fn execute(&self, _submission: Self::Submission) -> Result<Self::Completion, Self::Error> {
+            unreachable!("this test submits no draw")
+        }
+    }
+    impl ResidentService for BarrierProbe {}
+    impl GuestWriteService for BarrierProbe {}
+    impl ComputeResidencyService for BarrierProbe {}
+    impl CapabilityService for BarrierProbe {}
+    impl PresentationService for BarrierProbe {}
+    impl ReadbackService for BarrierProbe {
+        type Error = DrawError;
+
+        fn read_target(
+            &self,
+            _identity: &crate::model::TargetIdentity,
+        ) -> Result<reims_vgpu_core::TargetReadback, Self::Error> {
+            unreachable!("this test reads no target")
+        }
+    }
+    impl GuestPageTransferService for BarrierProbe {}
+    impl ResidentCopyService for BarrierProbe {}
+    impl CompletionService for BarrierProbe {}
+    impl SubmissionBatchService for BarrierProbe {
+        fn flush_submission_tail(&self) {
+            self.flushes.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    impl GuestImportService for BarrierProbe {}
+    impl GuestImagePlanningService for BarrierProbe {}
+    impl MaintenanceService for BarrierProbe {}
+    impl SessionService for BarrierProbe {}
+    impl ObservationService for BarrierProbe {}
+    impl ShaderTranslationService for BarrierProbe {}
+    impl RenderBufferPlanningService for BarrierProbe {}
+    impl WindowPresentationService for BarrierProbe {}
+    impl Executor for BarrierProbe {}
+
+    for (op, route, payload_len, expected_flushes) in [
         (
             wire_render::OPCODE_USE_RESOURCE,
             "render_noop_residency_hint",
             render::USE_RESOURCE_REFS + 4,
+            0,
         ),
         (
             wire_render::OPCODE_USE_HEAP,
             "render_noop_residency_hint",
             render::USE_HEAP_REFS + 4,
+            0,
         ),
         (
             wire_render::OPCODE_MEMORY_BARRIER_RESOURCES,
-            "render_noop_barrier",
+            "render_barrier_resources",
+            core::mem::size_of::<wire_render::MemoryBarrierResources>()
+                + core::mem::size_of::<wire_render::RefBind>(),
             0,
         ),
         (
             wire_render::OPCODE_MEMORY_BARRIER_SCOPE,
-            "render_noop_barrier",
+            "render_barrier_scope",
+            core::mem::size_of::<wire_render::MemoryBarrierScope>(),
+            0,
+        ),
+        (
+            wire_render::OPCODE_TEXTURE_BARRIER,
+            "render_barrier_texture",
+            0,
             0,
         ),
     ] {
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        let host = FakeHost::new();
+        let probe = Arc::new(BarrierProbe::default());
+        let mut state = Device::new_with_executor(DeviceId(1), PAGE_SHIFT_ARM64E, probe.clone());
+        let mut host = FakeHost::new();
         let mut out = ExecResult::default();
         let mut acc = StreamAccum::default();
 
@@ -3695,7 +4351,199 @@ fn a_residency_or_barrier_record_is_counted_rather_than_dropped_in_silence() {
             before + 1,
             "op {op:#x} did not reach {route}"
         );
+        assert_eq!(
+            probe.flushes.load(Ordering::Relaxed),
+            0,
+            "record walking cannot submit draws that finish_stream has not executed"
+        );
+        if op == wire_render::OPCODE_TEXTURE_BARRIER {
+            assert_eq!(
+                acc.render_work,
+                [RenderWork::Barrier(reims_vgpu_core::RenderBarrier::Texture)],
+                "the barrier must retain its exact position before execution"
+            );
+        }
+        finish_stream(&mut state, &mut host, 1, &mut out, &acc);
+        assert_eq!(
+            probe.flushes.load(Ordering::Relaxed),
+            expected_flushes,
+            "op {op:#x} applied the wrong submission boundary"
+        );
     }
+
+    // The exact render-target/fragment-to-fragment form retains all four
+    // decoded API fields. Vulkan may project this common shape more narrowly;
+    // other admitted forms remain typed and use its conservative dependency.
+    let probe = Arc::new(BarrierProbe::default());
+    let mut state = Device::new_with_executor(DeviceId(1), PAGE_SHIFT_ARM64E, probe.clone());
+    let host = FakeHost::new();
+    let mut out = ExecResult::default();
+    let mut acc = StreamAccum::default();
+    let mut command = vec![0u8; wire_render::MEMORY_BARRIER_SCOPE_TOTAL_LEN as usize];
+    st32(&mut command[0..], wire_render::OPCODE_MEMORY_BARRIER_SCOPE);
+    st32(
+        &mut command[4..],
+        wire_render::MEMORY_BARRIER_SCOPE_TOTAL_LEN,
+    );
+    command[reims_vgpu_wire::OP_HEADER_LEN..][..4].copy_from_slice(&[4, 0, 2, 2]);
+    handle_render_record(
+        &mut state,
+        &host,
+        1,
+        wire_render::OPCODE_MEMORY_BARRIER_SCOPE,
+        &command,
+        &mut out,
+        &mut acc,
+    );
+    assert_eq!(
+        acc.render_work,
+        [RenderWork::Barrier(reims_vgpu_core::RenderBarrier::Scope {
+            scope: reims_vgpu_core::MemoryBarrierScope::RENDER_TARGETS,
+            after: reims_vgpu_core::RenderBarrierStages::FRAGMENT,
+            before: reims_vgpu_core::RenderBarrierStages::FRAGMENT,
+        })]
+    );
+    assert_eq!(probe.flushes.load(Ordering::Relaxed), 0);
+
+    let barrier = reims_vgpu_core::RenderBarrier::Texture;
+    let mut cursor = 0;
+    let positions = [(1, barrier.clone()), (1, barrier.clone()), (3, barrier)];
+    let mut pending = Vec::new();
+    append_render_barriers_at(&positions, &mut cursor, 0, &mut pending);
+    assert!(pending.is_empty());
+    append_render_barriers_at(&positions, &mut cursor, 1, &mut pending);
+    assert_eq!(pending.len(), 2);
+    append_render_barriers_at(&positions, &mut cursor, 2, &mut pending);
+    assert_eq!(pending.len(), 2);
+    append_render_barriers_at(&positions, &mut cursor, 3, &mut pending);
+    assert_eq!(pending.len(), 3);
+    assert_eq!(cursor, positions.len());
+}
+
+#[test]
+fn render_barrier_resources_are_resolved_generationally_and_invalid_terms_refuse() {
+    use crate::model::TaskResource;
+    use crate::runtime::decode::resource::ListObjectEntry;
+    use reims_vgpu_protocol::{ObjectKind, ObjectTableRef};
+
+    fn resource() -> Arc<TaskResource> {
+        Arc::new(TaskResource::new(
+            ListObjectEntry::new(ObjectKind::Buffer, 0, 0),
+            Arc::from([]),
+        ))
+    }
+
+    let state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let host = FakeHost::new();
+    let first = state.task_objects.resources.register(1, 77, resource());
+    let command = render::Command {
+        kind: RenderKind::BarrierResources,
+        barrier_after_stages: 1,
+        barrier_before_stages: 2,
+        barrier_resources: vec![ObjectTableRef::new(77)],
+        ..Default::default()
+    };
+    let first_barrier = resolved_render_barrier(&state, &host, 1, &command)
+        .expect("valid barrier")
+        .expect("nonempty barrier");
+    let reims_vgpu_core::RenderBarrier::Resources { resources, .. } = &first_barrier else {
+        panic!("resource-list barrier changed domain");
+    };
+    assert_eq!(resources[0].id, first.semantic_id().unwrap());
+    assert_eq!(resources[0].lifetime.id(), first.lifetime_ref().id());
+
+    assert!(state.task_objects.resources.delete(1, 77));
+    let replacement = state.task_objects.resources.register(1, 77, resource());
+    let replacement_barrier = resolved_render_barrier(&state, &host, 1, &command)
+        .expect("valid replacement barrier")
+        .expect("nonempty replacement barrier");
+    let reims_vgpu_core::RenderBarrier::Resources { resources, .. } = replacement_barrier else {
+        panic!("replacement changed domain");
+    };
+    assert_eq!(resources[0].id, replacement.semantic_id().unwrap());
+    assert_ne!(
+        first_barrier,
+        reims_vgpu_core::RenderBarrier::Resources {
+            resources,
+            after: reims_vgpu_core::RenderBarrierStages::VERTEX,
+            before: reims_vgpu_core::RenderBarrierStages::FRAGMENT,
+        }
+    );
+
+    let unsupported = render::Command {
+        kind: RenderKind::BarrierScope,
+        barrier_scope: 1,
+        barrier_after_stages: 4,
+        barrier_before_stages: 2,
+        ..Default::default()
+    };
+    assert_eq!(
+        resolved_render_barrier(&state, &host, 1, &unsupported),
+        Err(RenderBarrierRefusal::UnsupportedStages {
+            side: "after",
+            raw: 4,
+        })
+    );
+    let unidentified = render::Command {
+        kind: RenderKind::BarrierScope,
+        barrier_scope: 1,
+        barrier_unidentified_u8: 1,
+        barrier_after_stages: 1,
+        barrier_before_stages: 2,
+        ..Default::default()
+    };
+    assert_eq!(
+        resolved_render_barrier(&state, &host, 1, &unidentified),
+        Err(RenderBarrierRefusal::UnidentifiedField { raw: 1 })
+    );
+}
+
+#[test]
+fn a_render_barrier_survives_a_refused_draw_until_one_is_recorded() {
+    let barrier = reims_vgpu_core::RenderBarrier::Texture;
+    let mut pending = vec![barrier.clone()];
+    retire_render_barriers_after(EncodeStatus::MissingPipeline("test_refusal"), &mut pending);
+    assert_eq!(pending, [barrier], "a pre-backend refusal consumes nothing");
+    retire_render_barriers_after(EncodeStatus::Ok, &mut pending);
+    assert!(
+        pending.is_empty(),
+        "the recorded draw consumes the dependency"
+    );
+}
+
+#[test]
+fn a_malformed_render_barrier_refuses_only_later_state_snapshots() {
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let host = FakeHost::new();
+    let mut out = ExecResult::default();
+    let mut acc = StreamAccum::default();
+    assert!(
+        acc.bind_snapshot().is_ok(),
+        "state before the barrier is valid"
+    );
+
+    let mut command = vec![0u8; wire_render::MEMORY_BARRIER_SCOPE_TOTAL_LEN as usize];
+    st32(&mut command, wire_render::OPCODE_MEMORY_BARRIER_SCOPE);
+    st32(
+        &mut command[4..],
+        wire_render::MEMORY_BARRIER_SCOPE_TOTAL_LEN,
+    );
+    command[reims_vgpu_wire::OP_HEADER_LEN..][..4].copy_from_slice(&[1, 1, 1, 2]);
+    handle_render_record(
+        &mut state,
+        &host,
+        1,
+        wire_render::OPCODE_MEMORY_BARRIER_SCOPE,
+        &command,
+        &mut out,
+        &mut acc,
+    );
+    assert!(matches!(
+        acc.bind_snapshot(),
+        Err(StreamRefusal::Barrier(
+            RenderBarrierRefusal::UnidentifiedField { raw: 1 }
+        ))
+    ));
 }
 
 /// The three ICB blit records are told apart rather than refused as one.
@@ -3708,8 +4556,8 @@ fn a_residency_or_barrier_record_is_counted_rather_than_dropped_in_silence() {
 /// cannot tell those apart cannot answer the question they exist to answer.
 #[test]
 fn each_icb_blit_record_reaches_a_counter_that_names_which_one_it_is() {
-    use crate::contract::endian::st64;
     use crate::runtime::drain::store_route_count;
+    use reims_vgpu_core::endian::st64;
     use reims_vgpu_wire::ops::blit as wire;
 
     let range = |op: u32| {
@@ -3748,7 +4596,7 @@ fn each_icb_blit_record_reaches_a_counter_that_names_which_one_it_is() {
         ),
         (wire_blit::OPCODE_COPY_ICB, copy(), "blit_icb_copy_dropped"),
     ] {
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
         let mut host = FakeHost::new();
         let before = store_route_count(route);
         handle_blit_record(&mut state, &mut host, 1, op, &command);
@@ -3763,7 +4611,7 @@ fn each_icb_blit_record_reaches_a_counter_that_names_which_one_it_is() {
     // reach either of the dropped-work counters. Sharing one would put a
     // correct no-op in the same bucket as stale commands executing.
     for route in ["blit_icb_reset_dropped", "blit_icb_copy_dropped"] {
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
         let mut host = FakeHost::new();
         let before = store_route_count(route);
         let command = range(wire_blit::OPCODE_OPTIMIZE_ICB);
@@ -3794,8 +4642,8 @@ fn each_icb_blit_record_reaches_a_counter_that_names_which_one_it_is() {
 /// boot's reading unusable for deciding which executor to build.
 #[test]
 fn each_blit_spi_record_reaches_a_counter_that_names_which_one_it_is() {
-    use crate::contract::endian::st64;
     use crate::runtime::drain::store_route_count;
+    use reims_vgpu_core::endian::st64;
     use reims_vgpu_wire::ops::blit as wire;
 
     // A texture fill of either form: identical through the region, then the
@@ -3864,7 +4712,7 @@ fn each_blit_spi_record_reaches_a_counter_that_names_which_one_it_is() {
             INVALID,
         ),
     ] {
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
         let mut host = FakeHost::new();
         let others: Vec<(&str, u64)> = [COLOR, BYTES, INVALID]
             .into_iter()
@@ -3899,7 +4747,7 @@ fn each_blit_spi_record_reaches_a_counter_that_names_which_one_it_is() {
     st64(&mut v[reims_vgpu_wire::OP_HEADER_LEN + 4..], 0);
     st64(&mut v[reims_vgpu_wire::OP_HEADER_LEN + 12..], 8);
     st32(&mut v[reims_vgpu_wire::OP_HEADER_LEN + 20..], 0x89ab_cdef);
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     let before: Vec<u64> = [COLOR, BYTES, INVALID]
         .into_iter()
@@ -3930,7 +4778,7 @@ fn each_blit_spi_record_reaches_a_counter_that_names_which_one_it_is() {
 /// entry is the guest's number and not padding.
 #[test]
 fn a_strided_vertex_bind_lands_in_the_table_carrying_its_stride() {
-    use crate::contract::endian::st64;
+    use reims_vgpu_core::endian::st64;
 
     let total = reims_vgpu_wire::OP_HEADER_LEN
         + render::BIND_ENTRIES
@@ -3954,7 +4802,7 @@ fn a_strided_vertex_bind_lands_in_the_table_carrying_its_stride() {
     st64(&mut command[e + 4..], 0x2345);
     st64(&mut command[e + 12..], 0x3456);
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let host = FakeHost::new();
     let mut out = ExecResult::default();
     let mut acc = StreamAccum::default();
@@ -4040,14 +4888,13 @@ fn a_strided_vertex_bind_lands_in_the_table_carrying_its_stride() {
 /// draw list, which is what
 /// [`an_indirect_draw_takes_its_counts_from_the_guest_buffer`] holds.
 ///
-/// `setTriangleFillMode:` and `setDepthClipMode:` used to be the first two
-/// rows here and are not any more: both now reach a backend, and
-/// [`a_fill_mode_and_a_depth_clip_mode_reach_the_stream_state`] is what
-/// replaced their rows.
+/// `setTriangleFillMode:`, `setLineWidth:`, and `setDepthClipMode:` used to be
+/// rows here and are not any more: all now reach a backend. Their state tests
+/// replace the old dropped counters.
 #[test]
 fn every_decoded_but_unapplied_render_state_reaches_its_own_counter() {
-    use crate::contract::endian::st64;
     use crate::runtime::drain::store_route_count;
+    use reims_vgpu_core::endian::st64;
 
     // (opcode, total length, payload writer, route, whether a default-valued
     // record of the same opcode must NOT count).
@@ -4060,13 +4907,6 @@ fn every_decoded_but_unapplied_render_state_reaches_its_own_counter() {
     let float_at_default: Writer = |p| st32(p, 1.0f32.to_bits());
 
     let cases: &[(u32, usize, Writer, Option<Writer>, &str)] = &[
-        (
-            wire_render::OPCODE_SET_LINE_WIDTH,
-            12,
-            float_non_default,
-            Some(float_at_default),
-            "render_line_width_dropped",
-        ),
         (
             wire_render::OPCODE_SET_TESSELLATION_FACTOR_SCALE,
             12,
@@ -4304,7 +5144,7 @@ fn every_decoded_but_unapplied_render_state_reaches_its_own_counter() {
     ];
 
     let run = |op: u32, total: usize, write: Writer| {
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
         let host = FakeHost::new();
         let mut out = ExecResult::default();
         let mut acc = StreamAccum::default();
@@ -4338,13 +5178,13 @@ fn every_decoded_but_unapplied_render_state_reaches_its_own_counter() {
 }
 
 /// `setTriangleFillMode:` and `setDepthClipMode:` land in the stream's state
-/// and travel to a draw, ordinal for ordinal.
+/// and travel to a draw as semantic state.
 ///
 /// Both records share one 16-byte wire form and one decode arm, so the opcode
 /// is the only thing that says which state a record sets — swapping the two
 /// arms compiles, renders, and wireframes a pass that asked to be clamped.
-/// Each is therefore driven on its own and the *other* slot asserted still
-/// unset.
+/// Each is therefore driven on its own and the sibling asserted at its Metal
+/// default.
 ///
 /// The default value is latched too. A stream that sets Lines and then sets
 /// Fill again is asking for Fill, so an arm that skipped `mode == 0` — which
@@ -4353,10 +5193,10 @@ fn every_decoded_but_unapplied_render_state_reaches_its_own_counter() {
 /// wireframed.
 #[test]
 fn a_fill_mode_and_a_depth_clip_mode_reach_the_stream_state() {
-    use crate::contract::endian::st64;
+    use reims_vgpu_core::endian::st64;
 
     let drive = |op: u32, mode: u64| {
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
         let host = FakeHost::new();
         let mut out = ExecResult::default();
         let mut acc = StreamAccum::default();
@@ -4370,35 +5210,235 @@ fn a_fill_mode_and_a_depth_clip_mode_reach_the_stream_state() {
 
     for mode in [0u64, 1] {
         let acc = drive(wire_render::OPCODE_SET_TRIANGLE_FILL_MODE, mode);
-        assert_eq!(acc.fill_mode, Some(mode as u32), "fill mode {mode}");
         assert_eq!(
-            acc.depth_clip_mode, None,
+            acc.raster.fill_mode,
+            Ok(if mode == 0 {
+                reims_vgpu_protocol::FillMode::Fill
+            } else {
+                reims_vgpu_protocol::FillMode::Lines
+            }),
+            "fill mode {mode}"
+        );
+        assert_eq!(
+            acc.raster.depth_clip_mode,
+            Ok(reims_vgpu_protocol::DepthClipMode::Clip),
             "fill mode {mode} set the sibling"
         );
         let acc = drive(wire_render::OPCODE_SET_DEPTH_CLIP_MODE, mode);
-        assert_eq!(acc.depth_clip_mode, Some(mode as u32), "depth clip {mode}");
-        assert_eq!(acc.fill_mode, None, "depth clip {mode} set the sibling");
+        assert_eq!(
+            acc.raster.depth_clip_mode,
+            Ok(if mode == 0 {
+                reims_vgpu_protocol::DepthClipMode::Clip
+            } else {
+                reims_vgpu_protocol::DepthClipMode::Clamp
+            }),
+            "depth clip {mode}"
+        );
+        assert_eq!(
+            acc.raster.fill_mode,
+            Ok(reims_vgpu_protocol::FillMode::Fill),
+            "depth clip {mode} set the sibling"
+        );
     }
 
     // The record's field is 64 bits wide and the backend takes 32. A word
     // whose low half is zero must not arrive as the Metal default, which
     // would render silently; it arrives as a value no `MTLTriangleFillMode`
-    // has, and the backend names it.
+    // has, and makes the stream unrepresentable by its own name.
     let acc = drive(wire_render::OPCODE_SET_TRIANGLE_FILL_MODE, 1u64 << 32);
-    assert_eq!(acc.fill_mode, Some(u32::MAX));
+    assert_eq!(
+        acc.raster.fill_mode,
+        Err(RasterStateRefusal {
+            field: RasterStateField::FillMode,
+            raw: 1u64 << 32,
+        })
+    );
+    assert!(matches!(
+        acc.bind_snapshot(),
+        Err(StreamRefusal::Raster(RasterStateRefusal {
+            field: RasterStateField::FillMode,
+            raw,
+        })) if raw == 1u64 << 32
+    ));
 
     // And a draw carries them. `bind_snapshot` builds its `PendingDraw` with
     // `..Default::default()`, so a field added to the accumulator and not to
     // the snapshot reaches no draw at all and nothing else would say so.
     let mut acc = drive(wire_render::OPCODE_SET_TRIANGLE_FILL_MODE, 1);
-    acc.depth_clip_mode = Some(1);
+    acc.raster.depth_clip_mode = Ok(reims_vgpu_protocol::DepthClipMode::Clamp);
     let pd = acc.bind_snapshot().expect("state is representable");
-    assert_eq!(pd.fill_mode, Some(1));
-    assert_eq!(pd.depth_clip_mode, Some(1));
+    assert_eq!(pd.fill_mode, reims_vgpu_protocol::FillMode::Lines);
+    assert_eq!(
+        pd.depth_clip_mode,
+        reims_vgpu_protocol::DepthClipMode::Clamp
+    );
     let mut req = crate::runtime::draw::DrawEncodeRequest::default();
     fill_draw_binds_from_pending(&mut req, &pd);
-    assert_eq!(req.fill_mode, Some(1));
-    assert_eq!(req.depth_clip_mode, Some(1));
+    assert_eq!(req.fill_mode, reims_vgpu_protocol::FillMode::Lines);
+    assert_eq!(
+        req.depth_clip_mode,
+        reims_vgpu_protocol::DepthClipMode::Clamp
+    );
+}
+
+#[test]
+fn line_width_latches_every_bit_pattern_and_reaches_the_draw() {
+    use reims_vgpu_core::endian::st32;
+
+    let drive = |bits: u32| {
+        let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let host = FakeHost::new();
+        let mut out = ExecResult::default();
+        let mut acc = StreamAccum::default();
+        let mut command = vec![0u8; 12];
+        st32(&mut command[0..], wire_render::OPCODE_SET_LINE_WIDTH);
+        st32(&mut command[4..], 12);
+        st32(&mut command[reims_vgpu_wire::OP_HEADER_LEN..], bits);
+        handle_render_record(
+            &mut state,
+            &host,
+            1,
+            wire_render::OPCODE_SET_LINE_WIDTH,
+            &command,
+            &mut out,
+            &mut acc,
+        );
+        acc
+    };
+
+    assert_eq!(
+        StreamAccum::default().raster.line_width,
+        reims_vgpu_core::LineWidth::ONE
+    );
+    for bits in [0.0f32.to_bits(), 4.0f32.to_bits(), f32::NAN.to_bits()] {
+        let acc = drive(bits);
+        assert_eq!(acc.raster.line_width.bits(), bits);
+        let pd = acc.bind_snapshot().expect("line width is semantic state");
+        assert_eq!(pd.line_width.bits(), bits);
+        let mut req = crate::runtime::draw::DrawEncodeRequest::default();
+        fill_draw_binds_from_pending(&mut req, &pd);
+        assert_eq!(req.line_width.bits(), bits);
+    }
+}
+
+#[test]
+fn invalid_sticky_raster_state_refuses_until_that_field_is_replaced() {
+    use reims_vgpu_core::endian::st64;
+
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let host = FakeHost::new();
+    let mut out = ExecResult::default();
+    let mut acc = StreamAccum::default();
+    let mut drive = |op: u32, raw: u64, acc: &mut StreamAccum| {
+        let mut command = vec![0u8; wire_render::SET_MODE_TOTAL_LEN as usize];
+        st32(&mut command[0..], op);
+        st32(&mut command[4..], wire_render::SET_MODE_TOTAL_LEN);
+        st64(&mut command[reims_vgpu_wire::OP_HEADER_LEN..], raw);
+        handle_render_record(&mut state, &host, 1, op, &command, &mut out, acc);
+    };
+
+    drive(wire_render::OPCODE_SET_CULL_MODE, 1u64 << 32, &mut acc);
+    assert!(matches!(
+        acc.bind_snapshot(),
+        Err(StreamRefusal::Raster(RasterStateRefusal {
+            field: RasterStateField::CullMode,
+            raw,
+        })) if raw == 1u64 << 32
+    ));
+
+    drive(wire_render::OPCODE_SET_CULL_MODE, 2, &mut acc);
+    assert_eq!(
+        acc.bind_snapshot().unwrap().cull_mode,
+        reims_vgpu_protocol::CullMode::Back
+    );
+
+    drive(wire_render::OPCODE_SET_FRONT_FACING, 7, &mut acc);
+    assert!(matches!(
+        acc.bind_snapshot(),
+        Err(StreamRefusal::Raster(RasterStateRefusal {
+            field: RasterStateField::FrontFacing,
+            raw: 7,
+        }))
+    ));
+    drive(wire_render::OPCODE_SET_FRONT_FACING, 1, &mut acc);
+    let snapshot = acc.bind_snapshot().unwrap();
+    assert_eq!(snapshot.cull_mode, reims_vgpu_protocol::CullMode::Back);
+    assert!(snapshot.front_face_ccw);
+}
+
+#[test]
+fn attachment_actions_refuse_snapshots_until_the_exact_attachment_is_replaced() {
+    let mut acc = StreamAccum {
+        depth_attach: Some(DepthAttachment {
+            texture_ref: 11,
+            load_action: 3,
+            store_action: MTL_STORE_ACTION_STORE,
+            clear_depth: 0.25,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    assert!(matches!(
+        acc.bind_snapshot(),
+        Err(StreamRefusal::PassAction(PassActionRefusal {
+            aspect: "depth",
+            action: PassActionKind::Load,
+            raw: 3,
+            ..
+        }))
+    ));
+
+    acc.depth_attach.as_mut().unwrap().load_action =
+        reims_vgpu_protocol::pass_action::MTL_LOAD_ACTION_LOAD;
+    acc.stencil_attach = Some(StencilAttachment {
+        texture_ref: 12,
+        load_action: MTL_LOAD_ACTION_CLEAR,
+        store_action: 4,
+        clear_stencil: 9,
+        ..Default::default()
+    });
+    assert!(matches!(
+        acc.bind_snapshot(),
+        Err(StreamRefusal::PassAction(PassActionRefusal {
+            aspect: "stencil",
+            action: PassActionKind::Store,
+            raw: 4,
+            ..
+        }))
+    ));
+
+    acc.stencil_attach.as_mut().unwrap().store_action = MTL_STORE_ACTION_STORE;
+    acc.color_slots.push((
+        2,
+        ColorAttachment {
+            texture_ref: 13,
+            load_action: MTL_LOAD_ACTION_CLEAR,
+            store_action: 5,
+            ..Default::default()
+        },
+    ));
+    assert!(matches!(
+        acc.bind_snapshot(),
+        Err(StreamRefusal::PassAction(PassActionRefusal {
+            aspect: "color",
+            slot: 2,
+            action: PassActionKind::Store,
+            raw: 5,
+        }))
+    ));
+
+    acc.color_slots[0].1.store_action = MTL_STORE_ACTION_STORE;
+    let snapshot = acc
+        .bind_snapshot()
+        .expect("all attachment actions are semantic");
+    assert_eq!(
+        snapshot.depth_attach.unwrap().load_action,
+        reims_vgpu_protocol::pass_action::LoadAction::Load
+    );
+    assert_eq!(
+        snapshot.stencil_attach.unwrap().store_action,
+        reims_vgpu_protocol::pass_action::StoreAction::Store
+    );
 }
 
 /// Every command buffer the submission declares is visited, however many
@@ -4423,7 +5463,7 @@ fn a_fill_mode_and_a_depth_clip_mode_reach_the_stream_state() {
 #[test]
 fn every_declared_command_buffer_is_visited_not_just_the_first_sixteen() {
     const N_CB: u32 = 33;
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
     let mut host = FakeHost::new();
     state.define_task(3, 0x1_0000, 2);
 
@@ -4500,7 +5540,7 @@ fn a_bind_past_the_table_refuses_the_draws_that_would_read_it() {
     const FIRST: u32 = MAX_BUFFER_BIND_SLOTS + 4;
 
     let draw = |acc: &mut StreamAccum| {
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
         let host = FakeHost::new();
         let mut out = ExecResult::default();
         let mut command = vec![0u8; 0x20];
@@ -4545,7 +5585,7 @@ fn a_bind_past_the_table_refuses_the_draws_that_would_read_it() {
         0x4444,
     );
     {
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
         let host = FakeHost::new();
         let mut out = ExecResult::default();
         handle_render_record(&mut state, &host, 1, op, &command, &mut out, &mut acc);
@@ -4608,7 +5648,7 @@ fn a_buffer_offset_past_the_table_refuses_the_stream() {
     st32(&mut command[4..], total as u32);
     st32(&mut command[OP_HEADER_LEN + BUFFER_OFFSET_INDEX..], FIRST);
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let host = FakeHost::new();
     let mut out = ExecResult::default();
     let mut acc = StreamAccum {
@@ -4671,7 +5711,7 @@ fn a_buffer_offset_past_the_table_refuses_the_stream() {
 /// one a naive `mode: u32` field would get wrong.
 #[test]
 fn an_armed_visibility_query_and_its_buffer_both_reach_the_accumulator() {
-    let mut state = DeviceState::new(DeviceId(0), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(0), PAGE_SHIFT_ARM64E);
     let host = FakeHost::new();
     let mut out = ExecResult::default();
     let mut acc = StreamAccum::default();
@@ -4702,11 +5742,11 @@ fn an_armed_visibility_query_and_its_buffer_both_reach_the_accumulator() {
     // Counting at 0x1234.
     arm(&mut acc, 0x1234, 2);
     assert_eq!(
-        acc.visibility,
-        Some(crate::runtime::draw::VisibilityArming {
-            mode: 2,
+        acc.visibility.resolved(),
+        Ok(Some(crate::runtime::draw::VisibilityArming {
+            mode: reims_vgpu_protocol::VisibilityResultMode::Counting,
             offset: 0x1234
-        }),
+        })),
         "a counting query keeps both its mode and the offset it writes to"
     );
 
@@ -4714,19 +5754,45 @@ fn an_armed_visibility_query_and_its_buffer_both_reach_the_accumulator() {
     // second `setVisibilityResultMode:` genuinely supersedes the first.
     arm(&mut acc, 0x20, 1);
     assert_eq!(
-        acc.visibility,
-        Some(crate::runtime::draw::VisibilityArming {
-            mode: 1,
+        acc.visibility.resolved(),
+        Ok(Some(crate::runtime::draw::VisibilityArming {
+            mode: reims_vgpu_protocol::VisibilityResultMode::Boolean,
             offset: 0x20
-        }),
+        })),
         "a second arming replaces the first rather than accumulating"
     );
 
     // Disabled clears it, rather than arming a query with mode 0.
     arm(&mut acc, 0x20, 0);
     assert_eq!(
-        acc.visibility, None,
+        acc.visibility.resolved(),
+        Ok(None),
         "MTLVisibilityResultModeDisabled disarms; it is not a third mode"
+    );
+
+    // Preserve all 64 wire bits. Narrowing this value before validation used
+    // to turn it into Disabled and silently disarm a query the guest did not
+    // ask to disarm.
+    let invalid = (1u64 << 32) | 1;
+    arm(&mut acc, 0x40, invalid);
+    assert_eq!(
+        acc.visibility.resolved(),
+        Err(VisibilityStateRefusal { raw: invalid })
+    );
+    assert!(matches!(
+        acc.bind_snapshot(),
+        Err(StreamRefusal::Visibility(VisibilityStateRefusal { raw })) if raw == invalid
+    ));
+
+    // A later valid setter replaces only this sticky field and makes snapshots
+    // executable again.
+    arm(&mut acc, 0x48, 2);
+    assert_eq!(
+        acc.bind_snapshot().unwrap().visibility,
+        Some(crate::runtime::draw::VisibilityArming {
+            mode: reims_vgpu_protocol::VisibilityResultMode::Counting,
+            offset: 0x48,
+        })
     );
 }
 
@@ -4747,15 +5813,15 @@ fn an_armed_visibility_query_and_its_buffer_both_reach_the_accumulator() {
 /// single-offset fixture.
 #[test]
 fn a_visibility_count_lands_at_the_guest_offset_the_pass_named() {
-    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
     use crate::runtime::decode::resource::{
         list_object_entry_offset, OBJECT_LIST_ENTRY_LEN, OBJECT_TYPE_BUFFER, RESOURCE_PAGE_SHIFT,
     };
     use crate::runtime::gva_mem;
     use crate::runtime::host::HostMemory;
+    use reims_vgpu_paging::geometry::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
 
     let mut host = FakeHost::new();
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
 
     // A task with a one-level page directory, the same shape the ICB fixtures
     // build: without it no GVA resolves and the writeback would refuse for a
@@ -4867,8 +5933,7 @@ fn a_visibility_count_lands_at_the_guest_offset_the_pass_named() {
 /// the store is what a later wait actually reads, so it is the thing whose loss
 /// costs the guest its ordering.
 #[test]
-fn a_render_encoder_fence_reaches_the_render_fence_domain() {
-    use crate::model::{FENCE_DOMAIN_BLIT, FENCE_DOMAIN_RENDER};
+fn a_render_encoder_fence_reaches_the_shared_fence_object() {
     use crate::runtime::decode::stream::{SEGMENT_HEADER_LEN, SEGMENT_TYPE_RENDER};
     use reims_vgpu_wire::ops::render as wire_render;
 
@@ -4897,7 +5962,7 @@ fn a_render_encoder_fence_reaches_the_render_fence_domain() {
     stream[4] = SEGMENT_TYPE_RENDER;
     stream.extend_from_slice(&records);
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     let mut out = ExecResult::default();
     let mut acc = StreamAccum::default();
@@ -4906,16 +5971,112 @@ fn a_render_encoder_fence_reaches_the_render_fence_domain() {
     // Two updates: the first seeds the generation, the second advances it. A
     // dropped fence leaves `None` here, which is what this used to read.
     assert_eq!(
-        state.fence_generation(1, FENCE_DOMAIN_RENDER, FENCE_REF),
+        state.fence_generation(1, FENCE_REF),
         Some(2),
-        "both updates landed on the render-fence domain"
+        "both render updates landed on the fence object"
     );
-    // And they landed on the *render* domain specifically — the constants this
-    // arm used to compare against belong to the blit encoder.
     assert_eq!(
-        state.fence_generation(1, FENCE_DOMAIN_BLIT, FENCE_REF),
-        None,
-        "a render fence does not touch the blit encoder's domain"
+        acc.render_work,
+        vec![RenderWork::Barrier(reims_vgpu_core::RenderBarrier::Fence {
+            after: reims_vgpu_core::RenderBarrierStages::FRAGMENT,
+            before: reims_vgpu_core::RenderBarrierStages::FRAGMENT,
+        })],
+        "the wait keeps both stage masks at its encoder position"
+    );
+}
+
+/// A nil fence is an unbound operation, so its companion stage word carries no
+/// dependency to interpret. Serializer storage outside the live reference may
+/// contain any bits; those bits must not poison the encoder and suppress later
+/// work. The same unknown mask on a live fence remains a typed refusal.
+#[test]
+fn a_nil_render_fence_does_not_validate_stale_stage_bits() {
+    use crate::runtime::decode::stream::{SEGMENT_HEADER_LEN, SEGMENT_TYPE_RENDER};
+    use reims_vgpu_wire::ops::render as wire_render;
+
+    const LIVE_FENCE_REF: u32 = 6464;
+    const STAGES_FRAGMENT: u32 = 2;
+    const STAGES_UNKNOWN: u32 = 1 << 5;
+
+    fn stream_with_fences(records: &[(u32, u32, u32)]) -> Vec<u8> {
+        let mut payload = Vec::new();
+        for &(opcode, fence_ref, stages) in records {
+            let mut hdr = [0u8; 8];
+            st32(&mut hdr[0..4], opcode);
+            st32(&mut hdr[4..8], wire_render::FENCE_TOTAL_LEN);
+            payload.extend_from_slice(&hdr);
+            let mut fence = [0u8; 8];
+            st32(&mut fence[0..4], fence_ref);
+            st32(&mut fence[4..8], stages);
+            payload.extend_from_slice(&fence);
+        }
+
+        let mut stream = vec![0u8; SEGMENT_HEADER_LEN];
+        let stream_len = stream.len() + payload.len();
+        st32(&mut stream[0..4], stream_len as u32);
+        stream[4] = SEGMENT_TYPE_RENDER;
+        stream.extend_from_slice(&payload);
+        stream
+    }
+
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    let mut out = ExecResult::default();
+    let mut acc = StreamAccum::default();
+    let stream = stream_with_fences(&[
+        (wire_render::OPCODE_UPDATE_FENCE, 0, STAGES_UNKNOWN),
+        (
+            wire_render::OPCODE_UPDATE_FENCE,
+            LIVE_FENCE_REF,
+            STAGES_FRAGMENT,
+        ),
+        (
+            wire_render::OPCODE_WAIT_FOR_FENCE,
+            LIVE_FENCE_REF,
+            STAGES_FRAGMENT,
+        ),
+    ]);
+    walk_stream(&mut state, &mut host, 1, &stream, &mut out, &mut acc);
+
+    assert!(
+        acc.unrepresentable.is_none(),
+        "stage bits beside an unbound fence do not invalidate the stream"
+    );
+    assert_eq!(state.fence_generation(1, 0), None);
+    assert_eq!(state.fence_generation(1, LIVE_FENCE_REF), Some(1));
+    assert_eq!(
+        acc.render_work,
+        vec![RenderWork::Barrier(reims_vgpu_core::RenderBarrier::Fence {
+            after: reims_vgpu_core::RenderBarrierStages::FRAGMENT,
+            before: reims_vgpu_core::RenderBarrierStages::FRAGMENT,
+        })]
+    );
+
+    let mut live_state = Device::new(DeviceId(2), PAGE_SHIFT_ARM64E);
+    let mut live_host = FakeHost::new();
+    let mut live_out = ExecResult::default();
+    let mut live_acc = StreamAccum::default();
+    let live_unknown = stream_with_fences(&[(
+        wire_render::OPCODE_UPDATE_FENCE,
+        LIVE_FENCE_REF,
+        STAGES_UNKNOWN,
+    )]);
+    walk_stream(
+        &mut live_state,
+        &mut live_host,
+        1,
+        &live_unknown,
+        &mut live_out,
+        &mut live_acc,
+    );
+    assert_eq!(
+        live_acc.unrepresentable,
+        Some(StreamRefusal::Barrier(
+            RenderBarrierRefusal::FenceStagesUnsupported {
+                raw: STAGES_UNKNOWN,
+            }
+        )),
+        "the same unknown stage mask on a live fence remains fail-closed"
     );
 }
 
@@ -4938,15 +6099,18 @@ fn a_render_encoder_fence_reaches_the_render_fence_domain() {
 /// without restoring the seed leaves the original bug.
 #[test]
 fn a_clear_seeds_the_pass_for_any_store_action_and_publishes_only_for_store() {
-    use crate::contract::pass_action::MTL_STORE_ACTION_DONT_CARE;
     use crate::runtime::decode::render::{
         PASS_ATTACH_LOAD_ACTION, PASS_ATTACH_STORE_ACTION, PASS_ATTACH_TEXREF,
         PASS_COLOR_ATTACH_OFF,
     };
+    use reims_vgpu_protocol::pass_action::MTL_STORE_ACTION_DONT_CARE;
 
     let seeded = |store_action: u16| {
         let mut payload = vec![0u8; 0x400];
-        st32(&mut payload[PASS_COLOR_ATTACH_OFF + PASS_ATTACH_TEXREF..], 7);
+        st32(
+            &mut payload[PASS_COLOR_ATTACH_OFF + PASS_ATTACH_TEXREF..],
+            7,
+        );
         payload[PASS_COLOR_ATTACH_OFF + PASS_ATTACH_LOAD_ACTION
             ..PASS_COLOR_ATTACH_OFF + PASS_ATTACH_LOAD_ACTION + 2]
             .copy_from_slice(&MTL_LOAD_ACTION_CLEAR.to_le_bytes());
@@ -4958,7 +6122,7 @@ fn a_clear_seeds_the_pass_for_any_store_action_and_publishes_only_for_store() {
         st32(&mut cmd[4..], (OP_HEADER_LEN + payload.len()) as u32);
         cmd[OP_HEADER_LEN..].copy_from_slice(&payload);
 
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
         let host = FakeHost::new();
         let mut out = ExecResult::default();
         let mut acc = StreamAccum::default();
@@ -4998,4 +6162,73 @@ fn a_clear_seeds_the_pass_for_any_store_action_and_publishes_only_for_store() {
         "DontCare says the result is dropped, so writing the clear colour into \
          guest pages would be inventing content the guest declined"
     );
+}
+
+/// The dirty-flag predicate is pointer identity, so an equal-but-separate table
+/// is a *changed* state and not an unchanged one.
+///
+/// This is the property the whole reading rests on. `render_encoder_delta`
+/// is allowed to be conservative — calling a genuinely unchanged pair "changed"
+/// only forgoes a saving — but it must never call a changed pair unchanged, and
+/// the way that would happen is by comparing contents instead of allocations.
+/// Two tables holding equal bytes are two `Set` records; the guest re-stated
+/// its binds and the encoder state was rebuilt, whatever the bytes say.
+#[test]
+fn encoder_state_is_unchanged_only_when_the_tables_are_the_same_allocation() {
+    let base = PendingDraw {
+        pipeline_ref: 7,
+        ..Default::default()
+    };
+
+    let shared = PendingDraw {
+        vertex_buffers: base.vertex_buffers.clone(),
+        fragment_buffers: base.fragment_buffers.clone(),
+        vertex_textures: base.vertex_textures.clone(),
+        fragment_textures: base.fragment_textures.clone(),
+        vertex_samplers: base.vertex_samplers.clone(),
+        fragment_samplers: base.fragment_samplers.clone(),
+        ..base.clone()
+    };
+    assert!(
+        render_encoder_delta(&base, &shared).all_unchanged(),
+        "cloned handles are the same allocation, so no Set record separated them"
+    );
+    assert!(render_encoder_delta(&base, &shared).all_unchanged());
+
+    // A different pipeline with every table shared is still a changed state:
+    // the reflected interface the binds project onto has moved.
+    let repipelined = PendingDraw {
+        pipeline_ref: 8,
+        ..shared.clone()
+    };
+    assert!(
+        !render_encoder_delta(&base, &repipelined).all_unchanged(),
+        "a SetPipeline between the two draws changes which binding each bind lands on"
+    );
+    assert_eq!(
+        render_encoder_delta(&base, &repipelined),
+        reims_vgpu_core::RenderEncoderDelta {
+            pipeline: true,
+            ..reims_vgpu_core::RenderEncoderDelta::NONE_CHANGED
+        }
+    );
+
+    // Equal contents in a fresh allocation: the guest re-stated the class, so
+    // this must read as changed even though a byte comparison would not.
+    let restated = PendingDraw {
+        vertex_textures: std::sync::Arc::new((*base.vertex_textures).clone()),
+        ..shared.clone()
+    };
+    assert!(
+        !render_encoder_delta(&base, &restated).all_unchanged(),
+        "an equal-but-separate table is a Set record and must never read as unchanged"
+    );
+    let restated_delta = render_encoder_delta(&base, &restated);
+    assert!(restated_delta.vertex_textures);
+    assert!(!restated_delta.pipeline);
+    assert!(!restated_delta.vertex_buffers);
+    assert!(!restated_delta.fragment_buffers);
+    assert!(!restated_delta.fragment_textures);
+    assert!(!restated_delta.vertex_samplers);
+    assert!(!restated_delta.fragment_samplers);
 }

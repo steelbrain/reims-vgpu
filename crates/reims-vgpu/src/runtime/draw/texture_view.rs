@@ -11,16 +11,113 @@
 use super::*;
 
 /// Type-8 view resolution for sample/seed paths.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ViewResolve {
     /// Non-view base texture ref after walking the view chain (archive
     /// `REIMS_VGPU_RESOURCE_RESOLVE_MAX_VIEW_CHAIN` walk).
     pub(crate) base_texture_ref: u32,
-    pub(crate) level: u32,
+    /// Range exposed by the resolved view, expressed in the final base
+    /// texture's mip/layer namespace. `None` is the simple format-only form,
+    /// which does not narrow the immediate base's range.
+    pub(crate) range: Option<TextureViewRange>,
+    /// Declared output texture type for a ranged view. A simple format-only
+    /// view inherits the first ranged type beneath it, or the base texture's
+    /// declaration when the whole chain is simple.
+    pub(crate) texture_type: Option<u16>,
     /// Present when the view carries a swizzle form (opcode 0x1b); selectors already validated.
     pub(crate) swizzle: Option<pixel_format::SwizzlePlan>,
     /// Non-zero view pixel format from the descriptor (`@16`); `None` inherits the base format.
     pub(crate) pixel_format: Option<u16>,
+}
+
+impl ViewResolve {
+    /// Translate a level/slice relative to this view into the final base
+    /// texture. A simple view does not narrow either namespace.
+    pub(crate) fn select(&self, level: u64, slice: u64) -> Option<(u64, u64)> {
+        self.range
+            .map_or_else(|| Some((level, slice)), |range| range.select(level, slice))
+    }
+
+    /// Return the one mip selected by a non-array view consumer.
+    ///
+    /// Consumers which cannot carry layers must ask this explicitly; resolving
+    /// a view no longer discards the other subresources on their behalf.
+    pub(crate) fn single_non_array_level(&self) -> Option<u32> {
+        self.range
+            .map_or(Some(0), TextureViewRange::single_non_array_subresource)
+    }
+}
+
+/// A texture view's exact subresource range in its final base texture.
+///
+/// Mip levels and array slices remain separate because a 3D texture's depth
+/// planes are not array slices. The wire carries all four terms as 64-bit
+/// values and resolution preserves that width until a concrete consumer has a
+/// narrower API boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct TextureViewRange {
+    pub(crate) level_base: u64,
+    pub(crate) level_count: u64,
+    pub(crate) slice_base: u64,
+    pub(crate) slice_count: u64,
+}
+
+impl TextureViewRange {
+    fn compose_over(self, inner: Self) -> Result<Self, RangeCompositionError> {
+        let level_end = self
+            .level_base
+            .checked_add(self.level_count)
+            .ok_or(RangeCompositionError::LevelOverflow)?;
+        if level_end > inner.level_count {
+            return Err(RangeCompositionError::LevelOutOfRange);
+        }
+        let slice_end = self
+            .slice_base
+            .checked_add(self.slice_count)
+            .ok_or(RangeCompositionError::SliceOverflow)?;
+        if slice_end > inner.slice_count {
+            return Err(RangeCompositionError::SliceOutOfRange);
+        }
+        Ok(Self {
+            level_base: inner
+                .level_base
+                .checked_add(self.level_base)
+                .ok_or(RangeCompositionError::LevelOverflow)?,
+            level_count: self.level_count,
+            slice_base: inner
+                .slice_base
+                .checked_add(self.slice_base)
+                .ok_or(RangeCompositionError::SliceOverflow)?,
+            slice_count: self.slice_count,
+        })
+    }
+
+    /// Select one subresource relative to this view.
+    pub(crate) fn select(self, level: u64, slice: u64) -> Option<(u64, u64)> {
+        if level >= self.level_count || slice >= self.slice_count {
+            return None;
+        }
+        Some((
+            self.level_base.checked_add(level)?,
+            self.slice_base.checked_add(slice)?,
+        ))
+    }
+
+    /// The currently supported sampled/compute import shape: one mip and the
+    /// complete non-array slice domain.
+    pub(crate) fn single_non_array_subresource(self) -> Option<u32> {
+        (self.level_count == 1 && self.slice_base == 0 && self.slice_count == 1)
+            .then(|| u32::try_from(self.level_base).ok())
+            .flatten()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RangeCompositionError {
+    LevelOverflow,
+    LevelOutOfRange,
+    SliceOverflow,
+    SliceOutOfRange,
 }
 
 /// A specific refusal while resolving one type-8 texture-view chain.
@@ -31,7 +128,7 @@ pub(crate) enum TextureViewDecline {
     },
     HopObjectNotView {
         texture_ref: u32,
-        object_type: u8,
+        object_type: ObjectKind,
     },
     HopDescriptorMissing {
         texture_ref: u32,
@@ -49,9 +146,9 @@ pub(crate) enum TextureViewDecline {
         texture_ref: u32,
         opcode: u32,
     },
-    HopLevelOverflow {
+    HopTextureTypeUnsupported {
         texture_ref: u32,
-        level_base: u64,
+        texture_type: u16,
     },
     HopSwizzleInvalid {
         texture_ref: u32,
@@ -61,6 +158,24 @@ pub(crate) enum TextureViewDecline {
         base: u32,
         next: u32,
         depth: u32,
+    },
+    ChainLevelOutOfRange {
+        texture_ref: u32,
+        outer_base: u64,
+        outer_count: u64,
+        inner_count: u64,
+    },
+    ChainLevelOverflow {
+        texture_ref: u32,
+    },
+    ChainSliceOutOfRange {
+        texture_ref: u32,
+        outer_base: u64,
+        outer_count: u64,
+        inner_count: u64,
+    },
+    ChainSliceOverflow {
+        texture_ref: u32,
     },
     ChainOverflow {
         base: u32,
@@ -83,9 +198,13 @@ impl Decline for TextureViewDecline {
             // Keep the descriptor decoder's exact registered reason primary.
             Self::HopDecode { reason, .. } => reason.slug(),
             Self::HopZeroBase { .. } => "texture_view_hop_zero_base",
-            Self::HopLevelOverflow { .. } => "texture_view_hop_level_overflow",
+            Self::HopTextureTypeUnsupported { .. } => "texture_view_hop_texture_type_unsupported",
             Self::HopSwizzleInvalid { .. } => "texture_view_hop_swizzle_invalid",
             Self::ChainSelfOrZero { .. } => "texture_view_chain_self_or_zero",
+            Self::ChainLevelOutOfRange { .. } => "texture_view_chain_level_out_of_range",
+            Self::ChainLevelOverflow { .. } => "texture_view_chain_level_overflow",
+            Self::ChainSliceOutOfRange { .. } => "texture_view_chain_slice_out_of_range",
+            Self::ChainSliceOverflow { .. } => "texture_view_chain_slice_overflow",
             Self::ChainOverflow { .. } => "texture_view_chain_overflow",
         }
     }
@@ -134,12 +253,12 @@ impl Decline for TextureViewDecline {
                 ("texture_ref", texture_ref.to_string()),
                 ("opcode", format!("{opcode:#x}")),
             ],
-            Self::HopLevelOverflow {
+            Self::HopTextureTypeUnsupported {
                 texture_ref,
-                level_base,
+                texture_type,
             } => vec![
                 ("texture_ref", texture_ref.to_string()),
-                ("level_base", level_base.to_string()),
+                ("texture_type", texture_type.to_string()),
             ],
             Self::HopSwizzleInvalid {
                 texture_ref,
@@ -160,6 +279,31 @@ impl Decline for TextureViewDecline {
                 ("next", next.to_string()),
                 ("depth", depth.to_string()),
             ],
+            Self::ChainLevelOutOfRange {
+                texture_ref,
+                outer_base,
+                outer_count,
+                inner_count,
+            } => vec![
+                ("texture_ref", texture_ref.to_string()),
+                ("outer_base", outer_base.to_string()),
+                ("outer_count", outer_count.to_string()),
+                ("inner_count", inner_count.to_string()),
+            ],
+            Self::ChainLevelOverflow { texture_ref } | Self::ChainSliceOverflow { texture_ref } => {
+                vec![("texture_ref", texture_ref.to_string())]
+            }
+            Self::ChainSliceOutOfRange {
+                texture_ref,
+                outer_base,
+                outer_count,
+                inner_count,
+            } => vec![
+                ("texture_ref", texture_ref.to_string()),
+                ("outer_base", outer_base.to_string()),
+                ("outer_count", outer_count.to_string()),
+                ("inner_count", inner_count.to_string()),
+            ],
             Self::ChainOverflow { base, depth } => {
                 vec![("base", base.to_string()), ("depth", depth.to_string())]
             }
@@ -171,19 +315,14 @@ crate::observe::decline_display!(TextureViewDecline);
 
 impl std::error::Error for TextureViewDecline {}
 
-/// Archive `REIMS_VGPU_RESOURCE_RESOLVE_MAX_VIEW_CHAIN` — nested type-8 views collapse
-/// to a non-view base (`apple_pv_gpu_resource_resolve_texture` chain walk).
+/// Contract view-chain limit: nested type-8 views collapse to a non-view base.
 ///
 /// This is the decoded contract's own bound, not a budget of ours: a chain that
 /// needs a ninth hop is one the guest's own resolver would not have followed
 /// either, so refusing it is fidelity rather than a shortfall. That makes it the
-/// number **every** arm that walks a type-8 chain must use, and it is `pub(crate)`
-/// for exactly that reason. Two arms walk one: this module's
-/// [`resolve_texture_view_reasoned`] for the draw/sample path, and
-/// `blit_exec::resolve_texture_backing_depth` for copies. They used to disagree —
-/// blit stopped at five hops on a number its own comment called "not a contract
-/// limit" — so a six-deep chain sampled correctly and had its blit dropped as
-/// `tex_view_depth_cap`. Both now count hops against this constant.
+/// number **every** consumer uses through [`resolve_texture_view_reasoned`].
+/// Blits, sampling, compute, and render-target resolution must not grow their
+/// own chain walkers: doing so gives one wire object multiple meanings.
 ///
 /// It is also what terminates a guest-built cycle. `A views B views A` is
 /// expressible and neither walk carries a visited set; the chain simply runs out
@@ -192,58 +331,13 @@ impl std::error::Error for TextureViewDecline {}
 /// depth already does.
 pub(crate) const MAX_TEXTURE_VIEW_CHAIN: usize = 8;
 
-/// Report a slice range the render path decodes and does not apply.
-///
-/// [`decode_texture_view_hop_reasoned`] resolves a type-8 view to four things —
-/// base ref, mip level, swizzle and format override — and the ranged forms
-/// (opcodes `0x08` and `0x1b`) carry two more that nothing on this path reads:
-/// `slice_base` and `slice_count`. `blit_exec` consumes them; the draw and
-/// sample path does not. So a guest that views slices `[5, 9)` of a texture
-/// array samples slice **0** of the base, silently, and the wrong texels reach
-/// the frame with no refusal anywhere.
-///
-/// Reported rather than declined, because declining would break every view
-/// that asks for the default. A view whose range *is* the default —
-/// `slice_base == 0` with at most one slice — is asking for what this path
-/// already does, so it says nothing. That makes this a healthy zero, and a
-/// non-zero reading is the measured argument for threading the slice through.
-///
-/// # The reading, and what it says about doing that work
-///
-/// **Zero.** Driven x86/PCI boot, `web-content-probe -n 10 --churn 1`: not one
-/// `slice_dropped` line over the whole run, against 10/10 visual-gate regions
-/// on colour. This guest binds no texture-array or cube view with a non-default
-/// slice range on this workload, so threading `slice_base`/`slice_count`
-/// through the draw and sample path would cost a `ViewResolve` field, every
-/// consumer of it, and a `baseArrayLayer`/`layerCount` on the sample view — for
-/// no measured benefit on the pathway that can measure it.
-///
-/// So it stays reported. The gap is real and the wrong texels really would reach
-/// the frame if a guest asked; the argument for closing it has to come from a
-/// workload that puts a non-zero reading here. `blit_exec` already consumes both
-/// fields, so that arm is the reference when one does.
-///
-/// Keyed by texture ref through [`crate::observe::state_changed`] rather than
-/// latched once: this runs per bind, so an undeduped line floods and a
-/// first-sight latch goes quiet after the first view and never reports the
-/// second. A transition report is bounded by the number of real changes.
-fn note_view_slice_range_dropped(
-    texture_ref: u32,
-    opcode: u32,
-    view: &crate::runtime::decode::resource::TextureViewDescriptor,
-) {
-    if !view.carries_range() || (view.slice_base == 0 && view.slice_count <= 1) {
-        return;
-    }
-    let state = view.slice_base.rotate_left(32) ^ view.slice_count;
-    if !crate::observe::state_changed("view_slice_dropped", texture_ref as u64, state) {
-        return;
-    }
-    crate::observe::fail(format!(
-        "texture_view slice_dropped ref={texture_ref} opcode={opcode:#x} \
-         base={} count={} note=render path samples slice 0",
-        view.slice_base, view.slice_count
-    ));
+#[derive(Clone, Copy, Debug)]
+struct ViewHop {
+    base_texture_ref: u32,
+    range: Option<TextureViewRange>,
+    texture_type: Option<u16>,
+    swizzle: Option<pixel_format::SwizzlePlan>,
+    pixel_format: Option<u16>,
 }
 
 /// Decode one type-8 hop (does not walk nested bases).
@@ -253,69 +347,85 @@ fn note_view_slice_range_dropped(
 /// [`resolve_texture_view_reasoned`]'s `?`, and [`resolve_texture_view`] is what
 /// turns the whole walk into an `Option` for the hot path.
 fn decode_texture_view_hop_reasoned<M: HostMemory + HostOps>(
-    state: &DeviceState,
+    state: &Device,
     host: &M,
     task_id: u32,
     texture_ref: u32,
-) -> Result<(u32, u32, Option<pixel_format::SwizzlePlan>, Option<u16>), TextureViewDecline> {
-    use crate::runtime::decode::resource::{
-        decode_texture_view_descriptor, texture_type8_header, OBJECT_TYPE_TEXTURE_VIEW,
-    };
-    let (_entry, desc) = objects::resolve_descriptor(
-        state,
-        host,
-        task_id,
-        texture_ref,
-        &[OBJECT_TYPE_TEXTURE_VIEW],
-    )
-    .map_err(|rung| match rung {
-        objects::LadderRung::NoListEntry => TextureViewDecline::HopEntryMissing { texture_ref },
-        objects::LadderRung::WrongType { got } => TextureViewDecline::HopObjectNotView {
-            texture_ref,
-            object_type: got,
-        },
-        objects::LadderRung::DescRead { declared_len } => {
-            TextureViewDecline::HopDescriptorMissing {
+) -> Result<ViewHop, TextureViewDecline> {
+    use crate::runtime::decode::resource::texture_type8_header;
+    let resource = objects::resolve_resource(state, host, task_id, texture_ref).map_err(
+        |rung| match rung {
+            objects::LadderRung::NoListEntry => TextureViewDecline::HopEntryMissing { texture_ref },
+            objects::LadderRung::WrongType { got } => TextureViewDecline::HopObjectNotView {
                 texture_ref,
-                descriptor_length: declared_len,
+                object_type: got,
+            },
+            objects::LadderRung::DescRead { declared_len } => {
+                TextureViewDecline::HopDescriptorMissing {
+                    texture_ref,
+                    descriptor_length: declared_len,
+                }
             }
-        }
-    })?;
-    // Bytes visible before decode, for the len-mismatch / bad-opcode census.
-    let (opcode, declared) = texture_type8_header(&desc).unwrap_or((0, 0));
-    let view = decode_texture_view_descriptor(&desc).map_err(|reason| {
-        // Dump the full wire blob for an unknown texture-view opcode: this is the
-        // only signal that reveals a new serializer variant (off the hot path —
-        // fires only on a genuine decode failure).
-        let hex: String = desc.iter().map(|b| format!("{b:02x}")).collect();
-        TextureViewDecline::HopDecode {
+        },
+    )?;
+    if resource.entry().kind != ObjectKind::TextureView {
+        return Err(TextureViewDecline::HopObjectNotView {
             texture_ref,
-            opcode,
-            declared,
-            descriptor_len: desc.len(),
-            bytes_hex: hex,
-            reason,
+            object_type: resource.entry().kind,
+        });
+    }
+    let desc = resource.descriptor().as_ref();
+    // Bytes visible before decode, for the len-mismatch / bad-opcode census.
+    let (opcode, declared) = texture_type8_header(desc).unwrap_or((0, 0));
+    let view = match objects::decoded_resource(&resource) {
+        Ok(crate::runtime::decode::resource::Descriptor::TextureView(view)) => view,
+        Err(reason) => {
+            // Dump the full wire blob for an unknown texture-view opcode: this is the
+            // only signal that reveals a new serializer variant (off the hot path —
+            // fires only on a genuine decode failure).
+            let hex: String = desc.iter().map(|b| format!("{b:02x}")).collect();
+            return Err(TextureViewDecline::HopDecode {
+                texture_ref,
+                opcode,
+                declared,
+                descriptor_len: desc.len(),
+                bytes_hex: hex,
+                reason: *reason,
+            });
         }
-    })?;
+        Ok(_) => {
+            return Err(TextureViewDecline::HopDecode {
+                texture_ref,
+                opcode,
+                declared,
+                descriptor_len: desc.len(),
+                bytes_hex: String::new(),
+                reason: crate::runtime::decode::resource::DecodeStatus::ErrUnsupported(
+                    "res_texture_view_semantic_kind",
+                ),
+            });
+        }
+    };
     if view.base_texture_ref == 0 {
         return Err(TextureViewDecline::HopZeroBase {
             texture_ref,
             opcode,
         });
     }
-    note_view_slice_range_dropped(texture_ref, opcode, &view);
-    let level = if view.carries_range() {
-        // level_base is a mip index (u64 on wire); reject pathological values.
-        if view.level_base > u32::MAX as u64 {
-            return Err(TextureViewDecline::HopLevelOverflow {
-                texture_ref,
-                level_base: view.level_base,
-            });
-        }
-        view.level_base as u32
-    } else {
-        0
-    };
+    if view.carries_range()
+        && !crate::runtime::decode::resource::texture_view_type_supported(view.texture_type)
+    {
+        return Err(TextureViewDecline::HopTextureTypeUnsupported {
+            texture_ref,
+            texture_type: view.texture_type,
+        });
+    }
+    let range = view.carries_range().then_some(TextureViewRange {
+        level_base: view.level_base,
+        level_count: view.level_count,
+        slice_base: view.slice_base,
+        slice_count: view.slice_count,
+    });
     let swizzle = if view.carries_swizzle() {
         // Malformed selectors (not in 0..5) fail the resolve — visible soft miss on sample.
         Some(pixel_format::swizzle_plan(&view.swizzle).ok_or(
@@ -329,29 +439,38 @@ fn decode_texture_view_hop_reasoned<M: HostMemory + HostOps>(
     };
     // Zero pixel_format means inherit base (serializer always writes a real format when set).
     let pixel_format = view.declared_pixel_format();
-    Ok((view.base_texture_ref, level, swizzle, pixel_format))
+    Ok(ViewHop {
+        base_texture_ref: view.base_texture_ref,
+        range,
+        texture_type: view.carries_range().then_some(view.texture_type),
+        swizzle,
+        pixel_format,
+    })
 }
 
-/// Resolve type-8 view to non-view base + mip + format override + swizzle.
+/// Resolve a type-8 view to its non-view base, exact subresource range, format,
+/// declared type, and swizzle.
 ///
 /// The `Result` carries a specific failure slug (`reason=view_resolve` sub-case)
 /// for the always-on fail log; [`resolve_texture_view`] collapses it to `Option`
 /// for the hot path. Walks nested type-8 bases up to [`MAX_TEXTURE_VIEW_CHAIN`]
-/// (archive `apple_pv_gpu_resource_resolve_texture` chain). Outer-most view
-/// supplies level / format / swizzle (inner hops only extend the base ref),
-/// matching the product RT path which materializes a single selected level.
+/// Each view is constructed on its immediate base object. Nested mip/layer
+/// ranges and swizzles therefore compose; a walk that merely skips inner
+/// descriptors changes the view's semantics.
 pub(crate) fn resolve_texture_view_reasoned<M: HostMemory + HostOps>(
-    state: &DeviceState,
+    state: &Device,
     host: &M,
     task_id: u32,
     texture_ref: u32,
 ) -> Result<ViewResolve, TextureViewDecline> {
-    use crate::runtime::decode::resource::OBJECT_TYPE_TEXTURE_VIEW;
+    let outer = decode_texture_view_hop_reasoned(state, host, task_id, texture_ref)?;
+    let mut base = outer.base_texture_ref;
+    let mut range = outer.range;
+    let mut texture_type = outer.texture_type;
+    let mut swizzle = outer.swizzle;
+    let mut pixel_format = outer.pixel_format;
 
-    let (mut base, level, swizzle, pixel_format) =
-        decode_texture_view_hop_reasoned(state, host, task_id, texture_ref)?;
-
-    // Collapse nested type-8 bases to a non-view texture (type-11 / type-2/3).
+    // Collapse nested type-8 bases to a non-view texture (IOSurface texture / type-2/3).
     let mut depth = 0u32;
     for _ in 1..MAX_TEXTURE_VIEW_CHAIN {
         let Some(entry) = objects::lookup_list_entry(state, host, task_id, base) else {
@@ -359,27 +478,70 @@ pub(crate) fn resolve_texture_view_reasoned<M: HostMemory + HostOps>(
             // visibly (same as a one-hop miss on an unmapped base).
             break;
         };
-        if entry.object_type != OBJECT_TYPE_TEXTURE_VIEW {
+        if entry.kind != ObjectKind::TextureView {
             break;
         }
         depth += 1;
-        let (next, _lvl, _sw, _fmt) = decode_texture_view_hop_reasoned(state, host, task_id, base)?;
+        let inner = decode_texture_view_hop_reasoned(state, host, task_id, base)?;
+        let next = inner.base_texture_ref;
         if next == 0 || next == base {
             return Err(TextureViewDecline::ChainSelfOrZero { base, next, depth });
+        }
+        range = match (range, inner.range) {
+            (Some(outer), Some(inner)) => {
+                Some(outer.compose_over(inner).map_err(|error| match error {
+                    RangeCompositionError::LevelOverflow => {
+                        TextureViewDecline::ChainLevelOverflow { texture_ref: base }
+                    }
+                    RangeCompositionError::LevelOutOfRange => {
+                        TextureViewDecline::ChainLevelOutOfRange {
+                            texture_ref: base,
+                            outer_base: outer.level_base,
+                            outer_count: outer.level_count,
+                            inner_count: inner.level_count,
+                        }
+                    }
+                    RangeCompositionError::SliceOverflow => {
+                        TextureViewDecline::ChainSliceOverflow { texture_ref: base }
+                    }
+                    RangeCompositionError::SliceOutOfRange => {
+                        TextureViewDecline::ChainSliceOutOfRange {
+                            texture_ref: base,
+                            outer_base: outer.slice_base,
+                            outer_count: outer.slice_count,
+                            inner_count: inner.slice_count,
+                        }
+                    }
+                })?)
+            }
+            (outer @ Some(_), None) => outer,
+            (None, inner) => inner,
+        };
+        swizzle = match (swizzle, inner.swizzle) {
+            (Some(outer), Some(inner)) => Some(outer.after(&inner)),
+            (outer @ Some(_), None) => outer,
+            (None, inner) => inner,
+        };
+        if pixel_format.is_none() {
+            pixel_format = inner.pixel_format;
+        }
+        if texture_type.is_none() {
+            texture_type = inner.texture_type;
         }
         base = next;
     }
 
     // Final base must not still be a type-8 view past the chain cap.
     if let Some(entry) = objects::lookup_list_entry(state, host, task_id, base) {
-        if entry.object_type == OBJECT_TYPE_TEXTURE_VIEW {
+        if entry.kind == ObjectKind::TextureView {
             return Err(TextureViewDecline::ChainOverflow { base, depth });
         }
     }
 
     Ok(ViewResolve {
         base_texture_ref: base,
-        level,
+        range,
+        texture_type,
         swizzle,
         pixel_format,
     })
@@ -392,7 +554,7 @@ pub(crate) fn resolve_texture_view_reasoned<M: HostMemory + HostOps>(
 /// or swizzle selectors are malformed. See [`resolve_texture_view_reasoned`] for
 /// the specific reason on the fail path.
 pub(super) fn resolve_texture_view<M: HostMemory + HostOps>(
-    state: &DeviceState,
+    state: &Device,
     host: &M,
     task_id: u32,
     texture_ref: u32,
@@ -405,7 +567,7 @@ pub(super) fn resolve_texture_view<M: HostMemory + HostOps>(
 /// Three different bugs, and only one of them is this crate's:
 ///
 /// * `BaseUndeclared` — a format the guest's own texture is in that
-///   `contract::pixel_format` has no row for. **Ours.** Nothing about the bind
+///   `reims_vgpu_core::pixel_format` has no row for. **Ours.** Nothing about the bind
 ///   is wrong; this table is short.
 /// * `ViewUndeclared` — the guest named an override this table has no row for.
 ///   Also ours, one argument over.
@@ -422,6 +584,27 @@ pub(crate) enum ViewSampleRefusal {
     BaseUndeclared { base: u16 },
     ViewUndeclared { view: u16 },
     WidthMismatch { base_bpp: u32, view_bpp: u32 },
+}
+
+impl Decline for ViewSampleRefusal {
+    fn slug(&self) -> &'static str {
+        match self {
+            Self::BaseUndeclared { .. } => "texture_view_base_format_undeclared",
+            Self::ViewUndeclared { .. } => "texture_view_format_undeclared",
+            Self::WidthMismatch { .. } => "texture_view_format_width_mismatch",
+        }
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        match self {
+            Self::BaseUndeclared { base } => vec![("base_format", format!("{base:#x}"))],
+            Self::ViewUndeclared { view } => vec![("view_format", format!("{view:#x}"))],
+            Self::WidthMismatch { base_bpp, view_bpp } => vec![
+                ("base_bpp", base_bpp.to_string()),
+                ("view_bpp", view_bpp.to_string()),
+            ],
+        }
+    }
 }
 
 impl std::fmt::Display for ViewSampleRefusal {
@@ -483,9 +666,8 @@ pub(crate) fn effective_view_sample_format_reasoned(
 /// for free on the image view, so the Vulkan pathway uses
 /// `SampledImageResource::swizzle` and never calls this; every invocation here
 /// is a texture that gave up its zero-copy crossing to be remapped by hand. The
-/// Metal-direct pathway still needs it, so it reports itself rather than being
 /// deleted.
-#[cfg(any(test, all(feature = "backend-metal", target_os = "macos")))]
+#[cfg(test)]
 pub(super) fn apply_view_swizzle_rgba8(
     rgba: &mut [u8],
     plan: Option<&pixel_format::SwizzlePlan>,
@@ -527,7 +709,7 @@ pub(crate) enum LinearLoadRefusal {
     /// The texture ref is not in this task's object list.
     ObjectListMiss,
     /// The list entry is not a texture or texture variant.
-    NotATexture { object_type: u8 },
+    NotATexture { object_type: ObjectKind },
     /// The entry's descriptor bytes could not be read from guest memory.
     DescriptorUnreadable,
     /// The descriptor bytes are not a decodable texture descriptor.
@@ -538,7 +720,7 @@ pub(crate) enum LinearLoadRefusal {
     /// which would reinterpret the allocation rather than re-read it.
     ViewFormatBppMismatch { base: u16, view: u16 },
     /// The requested mip level has no address/layout in the descriptor.
-    NoLevelGva { level: u32 },
+    NoLevelGva { slice: u32, level: u32 },
     /// This format has no bytes-per-pixel in the contract table, so no row
     /// length can be computed for it.
     FormatBppUnknown { format: u16 },
@@ -589,7 +771,9 @@ impl crate::observe::Decline for LinearLoadRefusal {
                 ("base_fmt", format!("{base:#x}")),
                 ("view_fmt", format!("{view:#x}")),
             ],
-            Self::NoLevelGva { level } => vec![("level", level.to_string())],
+            Self::NoLevelGva { slice, level } => {
+                vec![("slice", slice.to_string()), ("level", level.to_string())]
+            }
             Self::FormatBppUnknown { format } | Self::RowConvertUnsupported { format } => {
                 vec![("fmt", format!("{format:#x}"))]
             }
@@ -606,8 +790,15 @@ impl crate::observe::Decline for LinearLoadRefusal {
     }
 }
 
-/// Load a linear (buffer-backed) texture for sampling, keeping the layout its
-/// bytes are in.
+/// Load one `(slice, level)` subresource of a linear (buffer-backed) texture for
+/// sampling, keeping the layout its bytes are in.
+///
+/// One subresource, never a whole texture: a caller that needs every array layer
+/// or every cube face calls this once per physical slice and concatenates, which
+/// is the only order the engine's tightly-packed layered expectation accepts.
+/// The slice count belongs to the caller because it is the *bind* that says how
+/// many layers it declared, and `LinearTextureDescriptor::physical_slice_count`
+/// is what answers it.
 ///
 /// A caller that passes anything but [`NativeUploads::NONE`] must carry the
 /// returned layout all the way to the bind: the bytes are then the guest's own
@@ -619,10 +810,11 @@ impl crate::observe::Decline for LinearLoadRefusal {
 // struct would hide which of them a call site varies.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn load_linear_texture_host<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut M,
     task_id: u32,
     texture_ref: u32,
+    slice: u32,
     level: u32,
     format_override: Option<u16>,
     native: NativeUploads,
@@ -633,6 +825,7 @@ pub(crate) fn load_linear_texture_host<M: HostMemory + HostOps>(
         host,
         task_id,
         texture_ref,
+        slice,
         level,
         format_override,
         native,
@@ -682,10 +875,7 @@ impl NativeUploads {
     /// says so rather than inheriting them.
     ///
     /// Gated because the only rail that opts into a native upload is the
-    /// Vulkan one; the Metal arm's single caller drops the layout and takes
-    /// [`Self::NONE`]. Ungated it is dead code on `backend-metal`, which the
     /// cross-compiled clippy run is what catches.
-    #[cfg(any(feature = "backend-vulkan", test))]
     pub const BGRA8: Self = Self {
         bgra8: true,
         float16: false,
@@ -740,33 +930,35 @@ pub(crate) fn linear_native_upload_format(
 // wrappers above exist to make obvious.
 #[allow(clippy::too_many_arguments)]
 fn load_linear_texture_impl<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut M,
     task_id: u32,
     texture_ref: u32,
+    slice: u32,
     level: u32,
     format_override: Option<u16>,
     native: NativeUploads,
     site: crate::runtime::render_writeback::SettleSite,
 ) -> Result<(Vec<u8>, SampledByteFormat), LinearLoadRefusal> {
     use LinearLoadRefusal as R;
-    let (_entry, desc_bytes) = objects::resolve_descriptor(
-        state,
-        host,
-        task_id,
-        texture_ref,
-        &[OBJECT_TYPE_TEXTURE, OBJECT_TYPE_TEXTURE_VARIANT],
-    )
-    .map_err(|rung| match rung {
-        objects::LadderRung::NoListEntry => R::ObjectListMiss,
-        objects::LadderRung::WrongType { got } => R::NotATexture { object_type: got },
-        objects::LadderRung::DescRead { .. } => R::DescriptorUnreadable,
-    })?;
-    let tex = decode_texture_descriptor(&desc_bytes).map_err(|_| R::DescriptorUndecodable)?;
-    if tex.declared_pixel_format().is_none() {
-        return Err(R::NoPixelFormat);
+    let resource = objects::resolve_resource(state, host, task_id, texture_ref).map_err(
+        |rung| match rung {
+            objects::LadderRung::NoListEntry => R::ObjectListMiss,
+            objects::LadderRung::WrongType { got } => R::NotATexture { object_type: got },
+            objects::LadderRung::DescRead { .. } => R::DescriptorUnreadable,
+        },
+    )?;
+    if resource.entry().kind != ObjectKind::Texture {
+        return Err(R::NotATexture {
+            object_type: resource.entry().kind,
+        });
     }
-    let base_fmt = tex.pixel_format;
+    let Ok(crate::runtime::decode::resource::Descriptor::Texture(tex)) =
+        objects::decoded_resource(&resource)
+    else {
+        return Err(R::DescriptorUndecodable);
+    };
+    let base_fmt = tex.declared_pixel_format().ok_or(R::NoPixelFormat)?;
     let sample_fmt = effective_view_sample_format(base_fmt, format_override).ok_or(
         R::ViewFormatBppMismatch {
             base: base_fmt,
@@ -774,8 +966,8 @@ fn load_linear_texture_impl<M: HostMemory + HostOps>(
         },
     )?;
     let (gva, layout) = tex
-        .level_gva(level, state.page_shift)
-        .ok_or(R::NoLevelGva { level })?;
+        .subresource_gva(slice, level, state.page_shift)
+        .ok_or(R::NoLevelGva { slice, level })?;
     let w = layout.width;
     let h = layout.height;
     let planes = layout.planes();
@@ -804,7 +996,14 @@ fn load_linear_texture_impl<M: HostMemory + HostOps>(
     // Every depth plane belongs to the level; only the final plane's final-row
     // padding lies outside the bytes this loader reads.
     let span = layout.slice_read_span(tight).ok_or(R::SizeOverflow)?;
-    let end = layout.offset.saturating_add(span);
+    // Bounded against the subresource this call actually reads. `base_offset +
+    // layout.offset` is the same arithmetic only for slice 0; for any later
+    // face or array layer it omits the inter-slice advance and would bound a
+    // read of the last slice against the extent of the first.
+    let end = tex
+        .subresource_offset(slice, level)
+        .and_then(|offset| offset.checked_add(span))
+        .ok_or(R::SizeOverflow)?;
     if tex.allocation_size != 0 && end > tex.allocation_size {
         return Err(R::SpanExceedsAllocation {
             end,
@@ -822,7 +1021,13 @@ fn load_linear_texture_impl<M: HostMemory + HostOps>(
     // Census, pay, settle — the whole obligation of a CPU read of one named
     // resource's guest bytes. See `writeback_debt::settle_for_texture`.
     crate::runtime::writeback_debt::settle_for_texture(
-        state, host, task_id, texture_ref, gva, span, site,
+        state,
+        host,
+        task_id,
+        texture_ref,
+        gva,
+        span,
+        site,
     );
     // Tight display textures are the common compositor source. Read the whole
     // image with one task-root/cache lifetime: the row loop below otherwise
@@ -856,9 +1061,9 @@ fn load_linear_texture_impl<M: HostMemory + HostOps>(
     // `need_rgba` is the RGBA8 figure. The tight-row check is the same
     // agreement one step earlier — a source row that is not exactly one tight
     // row of the upload layout cannot be copied straight through.
-    if let Some(fmt) = linear_native_upload_format(sample_fmt, native).filter(|fmt| {
-        (tight as u64) == (w as u64).saturating_mul(fmt.bytes_per_texel() as u64)
-    }) {
+    if let Some(fmt) = linear_native_upload_format(sample_fmt, native)
+        .filter(|fmt| (tight as u64) == (w as u64).saturating_mul(fmt.bytes_per_texel() as u64))
+    {
         let row_bytes = tight as usize;
         let rows = (h as usize)
             .checked_mul(planes as usize)
@@ -911,7 +1116,10 @@ fn load_linear_texture_impl<M: HostMemory + HostOps>(
             return Err(R::RowConvertUnsupported { format: sample_fmt });
         }
     }
-    Ok((rgba, SampledByteFormat::from_source(TexelLayout::Rgba8, sample_fmt)))
+    Ok((
+        rgba,
+        SampledByteFormat::from_source(TexelLayout::Rgba8, sample_fmt),
+    ))
 }
 
 ///
@@ -963,7 +1171,8 @@ where
         return Ok((bytes, SampledByteFormat::from_source(layout, sample_format)));
     }
     if native_len == rgba_len
-        && pixel_format::sampled_class(sample_format) == Some(pixel_format::SampledClass::Bgra8Unorm)
+        && pixel_format::sampled_class(sample_format)
+            == Some(pixel_format::SampledClass::Bgra8Unorm)
     {
         // A channel exchange, which moves no value across the transfer
         // function: the bytes stay encoded exactly as the guest stored them.
@@ -1005,11 +1214,10 @@ where
 #[cfg(test)]
 mod texture_view_split_tests {
     use super::*;
-    use crate::runtime::decode::resource::TextureViewDescriptor;
 
     #[test]
     fn view_pixel_format_override_effective() {
-        use crate::contract::pixel_format::{
+        use reims_vgpu_core::pixel_format::{
             MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_R8_UNORM, MTL_FORMAT_RGBA16_FLOAT,
             MTL_FORMAT_RGBA8_UNORM,
         };
@@ -1050,7 +1258,7 @@ mod texture_view_split_tests {
     /// see `an_integer_texel_is_declared_but_has_no_sampled_rail`.
     #[test]
     fn a_declared_format_clears_the_width_gate_whether_or_not_a_rail_takes_it() {
-        use crate::contract::pixel_format::{
+        use reims_vgpu_core::pixel_format::{
             MTL_FORMAT_R8_UINT, MTL_FORMAT_R8_UNORM, MTL_FORMAT_RGBA8_UNORM,
         };
         assert_eq!(
@@ -1079,7 +1287,7 @@ mod texture_view_split_tests {
     /// the success case to say so.
     #[test]
     fn the_view_gate_names_which_of_its_three_terms_refused() {
-        use crate::contract::pixel_format::{
+        use reims_vgpu_core::pixel_format::{
             MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_R8_UNORM, MTL_FORMAT_RGBA8_UNORM,
         };
         // A value Metal does not define and this table therefore has no row for.
@@ -1148,12 +1356,14 @@ mod texture_view_split_tests {
         use crate::observe::Decline;
         let all = [
             LinearLoadRefusal::ObjectListMiss,
-            LinearLoadRefusal::NotATexture { object_type: 9 },
+            LinearLoadRefusal::NotATexture {
+                object_type: ObjectKind::MemorylessTexture,
+            },
             LinearLoadRefusal::DescriptorUnreadable,
             LinearLoadRefusal::DescriptorUndecodable,
             LinearLoadRefusal::NoPixelFormat,
             LinearLoadRefusal::ViewFormatBppMismatch { base: 1, view: 2 },
-            LinearLoadRefusal::NoLevelGva { level: 3 },
+            LinearLoadRefusal::NoLevelGva { slice: 0, level: 3 },
             LinearLoadRefusal::FormatBppUnknown { format: 4 },
             LinearLoadRefusal::RowStrideBelowTight {
                 stride: 5,
@@ -1208,108 +1418,72 @@ mod texture_view_split_tests {
         assert_eq!(r.fields(), vec![("row", "11".to_string())]);
     }
 
-    /// Start capturing the always-on log; returns the offset to slice from.
-    fn log_mark() -> usize {
-        crate::observe::redirect_logs_for_tests();
-        std::fs::read_to_string(crate::observe::fail_log_path())
-            .unwrap_or_default()
-            .len()
-    }
-
-    fn log_since(mark: usize) -> String {
-        let body = std::fs::read_to_string(crate::observe::fail_log_path()).unwrap_or_default();
-        body[mark.min(body.len())..].to_string()
-    }
-
-    fn ranged_view(slice_base: u64, slice_count: u64) -> TextureViewDescriptor {
-        TextureViewDescriptor {
-            view_opcode: crate::runtime::decode::resource::TEXTURE_VIEW_OPCODE_RANGED,
-            base_texture_ref: 9,
-            slice_base,
-            slice_count,
-            ..Default::default()
-        }
-    }
-
-    /// A slice range the render path cannot honour is guest work lost, and the
-    /// device must say so.
-    ///
-    /// The loss is real: `decode_texture_view_hop_reasoned` resolves a view to
-    /// base ref, mip level, swizzle and format, and nothing downstream of it
-    /// reads `slice_base`. A guest viewing slices `[5, 9)` samples slice 0.
     #[test]
-    fn a_slice_range_the_render_path_drops_is_reported() {
-        let mark = log_mark();
-        // Distinct refs, because the report is keyed by ref and would
-        // otherwise dedup the second away.
-        note_view_slice_range_dropped(0x1001, 8, &ranged_view(5, 4));
-        note_view_slice_range_dropped(0x1002, 0x1b, &ranged_view(0, 6));
-        let log = log_since(mark);
-        assert!(
-            log.contains("slice_dropped ref=4097") && log.contains("base=5 count=4"),
-            "a non-default slice base went unreported:\n{log}"
-        );
-        assert!(
-            log.contains("slice_dropped ref=4098") && log.contains("base=0 count=6"),
-            "a multi-slice range went unreported:\n{log}"
-        );
-    }
-
-    /// ...and a view asking for what this path already does says nothing.
-    ///
-    /// This is the half that makes the counter usable: without it the line
-    /// fires on every ordinary 2D view and a real loss is invisible in the
-    /// volume. A healthy zero here is what makes a non-zero reading the
-    /// measured argument for threading the slice through.
-    #[test]
-    fn a_default_slice_range_is_not_reported() {
-        let mark = log_mark();
-        note_view_slice_range_dropped(0x2001, 8, &ranged_view(0, 1));
-        note_view_slice_range_dropped(0x2002, 8, &ranged_view(0, 0));
-        // The format-only form carries no slice range at all.
-        note_view_slice_range_dropped(
-            0x2003,
-            7,
-            // Slice words set to what a ranged record would put there: the
-            // gate must turn on the opcode alone, not on the words being
-            // non-zero.
-            &TextureViewDescriptor {
-                view_opcode: crate::runtime::decode::resource::TEXTURE_VIEW_OPCODE_SIMPLE,
-                base_texture_ref: 9,
-                slice_base: 5,
-                slice_count: 4,
-                ..Default::default()
-            },
-        );
-        let log = log_since(mark);
-        assert!(
-            !log.contains("slice_dropped"),
-            "a default slice range was reported as a loss:\n{log}"
-        );
-    }
-
-    /// The report is bounded by real changes, not by binds.
-    ///
-    /// It sits on the per-bind path, so an undeduped line floods the log and a
-    /// once-latch goes quiet after the first view and never reports a second.
-    #[test]
-    fn the_same_view_bound_twice_reports_once_and_a_changed_range_reports_again() {
-        let mark = log_mark();
-        for _ in 0..5 {
-            note_view_slice_range_dropped(0x3001, 8, &ranged_view(5, 4));
-        }
+    fn nested_ranges_compose_in_the_final_base_namespace() {
+        let outer = TextureViewRange {
+            level_base: 1,
+            level_count: 2,
+            slice_base: 2,
+            slice_count: 3,
+        };
+        let inner = TextureViewRange {
+            level_base: 4,
+            level_count: 5,
+            slice_base: 8,
+            slice_count: 7,
+        };
         assert_eq!(
-            log_since(mark).matches("slice_dropped").count(),
-            1,
-            "the per-bind path reported more than once for an unchanged view"
+            outer.compose_over(inner),
+            Ok(TextureViewRange {
+                level_base: 5,
+                level_count: 2,
+                slice_base: 10,
+                slice_count: 3,
+            })
         );
+    }
 
-        let mark = log_mark();
-        note_view_slice_range_dropped(0x3001, 8, &ranged_view(6, 4));
+    #[test]
+    fn nested_ranges_refuse_each_out_of_bounds_axis_independently() {
+        let inner = TextureViewRange {
+            level_base: 4,
+            level_count: 2,
+            slice_base: 8,
+            slice_count: 3,
+        };
         assert_eq!(
-            log_since(mark).matches("slice_dropped").count(),
-            1,
-            "a view whose slice range changed did not report again"
+            TextureViewRange {
+                level_base: 1,
+                level_count: 2,
+                slice_base: 0,
+                slice_count: 1,
+            }
+            .compose_over(inner),
+            Err(RangeCompositionError::LevelOutOfRange)
         );
+        assert_eq!(
+            TextureViewRange {
+                level_base: 0,
+                level_count: 1,
+                slice_base: 2,
+                slice_count: 2,
+            }
+            .compose_over(inner),
+            Err(RangeCompositionError::SliceOutOfRange)
+        );
+    }
+
+    #[test]
+    fn range_selection_never_flattens_an_array_or_mip_range() {
+        let range = TextureViewRange {
+            level_base: 3,
+            level_count: 2,
+            slice_base: 5,
+            slice_count: 4,
+        };
+        assert_eq!(range.select(1, 3), Some((4, 8)));
+        assert_eq!(range.select(2, 0), None);
+        assert_eq!(range.select(0, 4), None);
+        assert_eq!(range.single_non_array_subresource(), None);
     }
 }

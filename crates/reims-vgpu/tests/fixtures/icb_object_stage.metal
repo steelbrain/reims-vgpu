@@ -1,7 +1,7 @@
 #include <metal_stdlib>
 using namespace metal;
 
-// Object-stage only metallib for mesh SPI type-7 object_func_ref (tag 0x01
+// Object-stage only metallib for the mesh serializer resource's object_func_ref (tag 0x01
 // under section tag 0x14). Payload layout must match icb_mesh_with_payload.
 
 struct Payload {

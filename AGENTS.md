@@ -24,18 +24,17 @@ what was once true, it goes in one of the three places above.
 
 This research project emulates Apple's paravirtualized GPU on the host. An unmodified macOS guest
 uses Apple's own GPU drivers; our QEMU device and Rust backend decode the command stream and
-execute it through Metal or Vulkan. We ship no guest driver.
+execute it through Vulkan. We ship no guest driver.
 
-`crates/reims-vgpu` supports three first-class pathways:
+The project supports two first-class pathways:
 
 | Pathway | Host | Guest | Attach | Page shift | Backend | Boot |
 |---|---|---|---|---|---|---|
 | x86 macOS / Linux Vulkan | Linux x86_64 (KVM) | x86_64 macOS Metal guest | PCI (`reims-vgpu-pci`) | 12 | Vulkan | `vm/boot-x86.sh` |
-| arm64 macOS / macOS Metal | Apple Silicon macOS (HVF) | arm64 macOS Metal guest | sysbus MMIO (`reims-vgpu-mmio`) | 14 | Metal-direct | `vm/boot-arm64.sh` |
 | arm64 macOS / macOS Vulkan | Apple Silicon macOS (HVF) | arm64 macOS Metal guest | sysbus MMIO (`reims-vgpu-mmio`) | 14 | Vulkan through MoltenVK | `vm/boot-arm64.sh` |
 
 Pathway-specific facts must be verified on the pathway being changed. Do not generalize from arm64
-to x86, from Metal to Vulkan, or from one host GPU class to another. Some rails run on exactly one
+to x86 or from one host GPU class to another. Some rails run on exactly one
 pathway — the arm64-only mapper rail is the standing example — and no boot on the other host can
 measure them.
 
@@ -43,17 +42,43 @@ measure them.
 
 - `vendor/qemu` - QEMU fork with the thin device shim: QOM, MMIO/BAR, IRQ/MSI, console/display
   integration, and HostOps plumbing.
-- `crates/reims-vgpu` - Rust staticlib that owns protocol decode, device model, memory mapping,
-  command planning/execution, scheduling, and Metal/Vulkan backend behavior.
-- `crates/reims-vgpu/src/observe/` - crate-wide observability: fail logs, typed decline reasons,
-  emission helpers, and gates.
-- `crates/reims-vgpu-wire` - derived wire-format views, with their own `AGENTS.md`. Where that file
-  is stricter than this one, it wins.
+- `crates/reims-vgpu-wire` - borrowed wire-format views; its stricter `AGENTS.md` wins locally.
+- `crates/reims-vgpu-protocol` - decoded semantic vocabulary and typed identities.
+- `crates/reims-vgpu-paging` / `crates/reims-vgpu-memory` - page resolution and bounded guest-memory
+  plans.
+- `crates/reims-vgpu-core` - backend-independent resource graph, lifecycle/content authority,
+  normalized commands, executor ports, and presentation semantics.
+- `crates/reims-vgpu-vulkan` - Vulkan capabilities, topology policy, native objects, execution, and
+  session-owned GPU state.
+- `crates/reims-vgpu` - composition staticlib: byte decoding, orchestration, QEMU ABI, and adapters
+  between the semantic core and Vulkan executor.
+- `crates/reims-vgpu-observe` / `crates/reims-vgpu-config` - shared observability and operator
+  configuration.
 - `vm/` - snapshot-revert boot scripts for arm64 and x86 guests.
 - `bugs/` - gitignored. One directory per defect that belongs to `metal2vulkan` rather than here.
 
 Start with the owning source modules and nearby tests when changing device, decode, present, or
 backend behavior. Keep durable design facts in code comments close to the behavior they explain.
+The maintained ownership map is [`docs/architecture.md`](docs/architecture.md).
+
+### Preserve The Semantic Seam
+
+- Parse guest bytes once: wire layouts stay in `reims-vgpu-wire`; decoded meaning belongs in
+  `reims-vgpu-protocol` or `reims-vgpu-core`.
+- Resolve reusable task/object names to generational `ResourceId`s before storing execution,
+  residency, witness, or content-authority state. Raw names may remain only at decode, namespace,
+  pre-construction, and explicitly documented compatibility boundaries.
+- Core commands are immutable, backend-neutral, and fully resolved. Vulkan handles, formats,
+  placement choices, and native shader payloads do not cross into them; completion facts return
+  separately and are what advance semantic state.
+- Resource identity, backing/view relations, content versions, and teardown are shared semantics.
+  Unified/discrete policy may choose placement, transfer, and batching only; import availability is
+  a separate measured capability.
+- `reims-vgpu-protocol` and `reims-vgpu-core` must not depend on the composition crate or Vulkan.
+  QEMU shims remain transport-only.
+
+Enforce these rules with types and behavioral fixtures: stale object-slot reuse, two-device reset
+isolation, and the four topology/import cells. Do not add a source-text architecture scanner.
 
 ### A translator defect is packaged, not described
 
@@ -85,21 +110,17 @@ arm that made the repair reachable was already sitting one commit ahead of what 
 
 ### C Is A Thin Shim
 
-C and Objective-C in the QEMU path exist to connect QEMU to Rust. Keep product logic in
-`crates/reims-vgpu`: protocol interpretation, resource state, scheduling, GPU encode, present model,
-backend policy, and performance behavior belong in Rust.
+C and Objective-C in the QEMU path exist to connect QEMU to Rust. Keep product logic in the owning
+Rust crate named by `docs/architecture.md`; the `reims-vgpu` composition crate exposes the QEMU ABI.
 
 A shim that calls two queries and branches on the pair has reconstructed a rule, which is the same
 violation as writing one. Export the answer, not the inputs — and delete the inputs, because a shim
 that can still assemble its own answer eventually will.
 
 Once a `reims_vgpu_qemu_*` entry point is wrapped in the shared `reims-vgpu-shim.c`, that wrapper is
-the only caller; neither device shim may reach the raw entry point. This has cost twice, both times
-on who owns the host console — `reims_vgpu_qemu_scanout_may_paint` assembled shim-side from two
-other queries, and `reims_vgpu_qemu_console_feed` called raw by the arm64 shim, which read a failed
-call as "not early". A test used to check this by parsing the C; it was a source grep and is gone.
-Each shim is built for a different host, so a re-inlined call fails on whichever pathway is not
-being booted — check both shims by hand when you touch one.
+the only caller; neither device shim may reach the raw entry point. Each shim is built for a
+different host, so check both by hand when touching one. Do not restore the retired source-text
+call-shape test.
 
 Anything crossing the boundary lives twice, once in Rust and once in
 `crates/reims-vgpu/include/reims_vgpu_qemu_abi.h`, and nothing else in the toolchain compares the
@@ -136,25 +157,22 @@ Behavior changes need tests that fail without the change. Bug fixes need a focus
 or proxy test for the bug class. Run Rust tests serially with `-- --test-threads=1`; GPU-touching
 tests are not safe to run in parallel.
 
+**A Rust test is necessary and it is not sufficient, because it cannot disagree with you.** Every
+one in this tree feeds the decoder bytes we wrote, drives ports we wrote, and asserts an expectation
+we wrote. That proves the code does what we believe the contract says. It cannot tell us the belief
+is wrong, and a belief that is wrong gets locked in by the very test that was supposed to protect
+it. Nothing in `cargo test` has an oracle. `conformance/` does, and the rule that follows from that
+is in `## Verification` under **A fix is not done until a case in `conformance/` fails without it**.
+
 ### Do Not Validate By Grepping Source
 
 **No test, script, or gate may read this repository's own Rust source as text and assert on what it
 finds.** No `read_to_string` over `src/`, no regex for a call shape, no walking `src/` to build a
 census of sites, no verdict table keyed by file and line that a new match must be added to.
 
-This crate accumulated forty such scanners — 17,000 lines, more than the behavioural suite — and
-retired all of them at once. They fail in three ways that no amount of care fixes:
-
-- **They test spelling, not behavior.** A scanner proves a `push` sits near a `len()` comparison. It
-  cannot prove the guest keeps its work, which is the only thing that matters. A rename satisfies
-  one; a real regression walks past it.
-- **They are wrong in the direction that reads as thorough.** One scan here was off by 40 % because
-  `use ops::{texture_view as w_view}` never puts the family name after the token `ops::`. It
-  reported a clean sweep of a population it could not see, and its output looked identical to a
-  correct one.
-- **Their verdict tables become the work.** A table demanding a written line per site turns every
-  edit into a documentation exercise against the scanner rather than against the device, and the
-  lines go stale the moment the code they describe moves.
+Source scanners test spelling rather than behavior, miss aliases and indirect forms, and turn
+file/line verdict tables into stale maintenance work. A clean scan is therefore not evidence that
+the guest-visible invariant holds.
 
 What to do instead, in order of preference:
 
@@ -184,7 +202,7 @@ values** — that a table is wide enough for the mask indexing it, that two bind
 overlap, that five bit-masks tile a word, that an external crate's enum discriminant still matches
 the ordinal this device decodes. `rustc` evaluates these on every arm that compiles the file,
 including the cross-compiled `--target aarch64-apple-darwin` clippy run, which is why they reach
-Metal code no Linux host can run tests for.
+platform-gated code that native Linux tests cannot execute.
 
 **Declaring a constant and then asserting it equals what you just declared it to be is not a
 check.** `pub const X: u64 = u64::MAX;` followed by `assert!(X == u64::MAX)` proves nothing. Nor
@@ -236,7 +254,8 @@ window means WindowServer crashed`: a signal that correlates with the answer, qu
 wrong on four boots that all read green.
 
 Two things that look like side channels and are not. **Host capability is measured, not inferred**:
-asking the device what it supports is the contract, which is why `caps::memory_topology` reads two
+asking the device what it supports is the contract, which is why `reims-vgpu-vulkan::memory`
+classifies topology from two
 structural signals and why gating on a vendor or driver name — a correlate — is banned in the same
 breath. And **an instrument may observe whatever it likes**, because it changes nothing the guest
 sees; a probe, a census, or an audit is not bound by this rule. The line is whether the observation
@@ -301,13 +320,80 @@ refusal on the fail channel naming what was dropped, so the overflow is visible 
 absorbed as a slow path. A silent eviction and a `reason=` line cost the same microseconds and only
 one of them can be found.
 
-**Both worked examples are already in the tree, and they are precedent rather than debt.**
-`backend::vulkan::engine::caches` held 1024 entries (64 for render passes) evicting in insertion
-order, which discards the compositor's pipeline — created first, bound every frame — and pays a
-driver-side shader compile per frame forever after. `model::content_cache` held 96/64/64/64/32/16
-and overwrote a rotating slot; a boot that settles at 92 distinct render pipelines against 64 slots
-is how that cap was shown to be binding. Both are unbounded now, keyed by content, and both module
-docs carry the argument. Read one before adding a bound anywhere.
+The former Vulkan pipeline caches and host-copy caches are the worked examples: both are now
+unbounded and keyed by contract-owned content or guest lifetimes. Their owning module docs carry
+the reasoning; read one before adding a bound anywhere.
+
+### A Cache Is Admissible Only If It Cannot Miss On Something Live
+
+**This section used to ban every cache outright, and that was too strict — it contradicted the
+section above it.** `## A Bounded Cache Is Fake Performance` says a cache keyed by a contract-owned
+lifetime "is not bounded by a number — it is bounded by the guest's own lifetimes, which is the
+correct bound and the only one that is always right." This section then said not to write one. Both
+could not be true, and the ban is the half that was wrong.
+
+The objection that produced the ban is still the right objection, but it is narrower than it was
+stated. It was: a memo makes throughput a function of *hit rate*, hit rate is a property of the
+workload rather than of this device, and two boots of one binary can then differ by more than any
+change ever measured here with nothing in the census saying which one happened. Every ranking rule
+in `## Verification` assumes the two arms did the same work, and an arm whose memo ran cold did not.
+
+That argument depends entirely on the memo being able to **miss on something that is still live**.
+A cache that never evicts a valid entry cannot: ask it twice about a thing the guest has not
+changed and the second ask hits, with certainty, on every host and every rail. The hit rate stops
+being a free variable and becomes a statement about how often the guest reuses its own live
+objects — which is the workload we are paid to make fast, not noise contaminating the measurement.
+And the miss path is the general path unchanged, so the floor is "no worse than today".
+
+So a cache is admissible when **all five** of these hold. They are conditions, not preferences; a
+cache that meets four of them is one of the caches this section still bans.
+
+1. **Keyed by a contract-owned identity.** A generational `ResourceId`, a mapping, a pipeline, a
+   content version the contract itself moves. Not an address, not an argument hash, not a name
+   string, not an ordinal you assigned.
+2. **No valid entry is ever dropped.** No capacity, no LRU, no TTL, no sampling stride, no
+   "clear it under pressure". If the guest holds a million live objects then a million entries is
+   what correctness costs, and that memory is a real reading about a real workload.
+3. **Entries die with the thing they describe, through the contract's own lifetime event.** The
+   guest drops the resource, the entry goes; the contract moves the version, the entry is
+   superseded. If finding stale entries needs a sweep, a scan, or an invalidation pass you wrote,
+   the key is wrong — fix the key, do not add the pass.
+4. **A hit and a miss are indistinguishable to the guest.** The value is a pure function of
+   contract-owned inputs. If a stale entry could change a pixel, this is a correctness bug wearing
+   a performance hat, and note which way that fails: the failure mode is *content*, which no counter
+   in this tree reports. `runtime/gather_witness.rs` is the standing example of how expensive that
+   class is to find after the fact.
+5. **It is on the census.** Live entries, hits, and misses. Without those three a degenerate hit
+   rate is invisible, and the "arms did the same work" assumption goes back to being unverifiable.
+
+**A cache is still the last answer, not the first**, and the three questions below are still the
+work. Reach for one only after all three have been answered and the recomputation is genuinely
+required and genuinely repeated over a live, unchanged thing:
+
+- **What does the guest tell us changed between these two draws?** If it hands us a delta and we
+  re-resolve the world, the fix is to consume the delta. If it does not, that is a contract fact
+  worth learning before optimizing around it.
+- **Why is the answer being recomputed at all?** State that genuinely cannot change between two
+  asks does not need remembering — it needs *owning*, by the type whose lifetime it shares, computed
+  once at the point the contract says it becomes true. That is not a cache; it is where the value
+  lives, it needs no invalidation logic at all, and it is strictly better than a cache that meets
+  every condition above. Prefer it whenever it is reachable.
+- **Is the general path slow because it is doing work the contract does not ask for?** That is the
+  usual answer, and it is the only one that makes the device faster on *every* workload rather than
+  on the ones that hit.
+
+What stays banned, unchanged: a bound that evicts a valid entry; a memo whose key is not a
+contract-owned lifetime; a "remember what we computed last time" field whose staleness question has
+no answer from the type's lifetime alone; and a fast path bolted beside a general path, which is a
+seam under `## It Fits Or It Does Not Belong` whether or not it caches anything.
+
+**Score it on the whole drain, never on its own phase.** A cache reports its own win honestly and
+hides what it cost everywhere else. `vulkan: let the write ledger remember what it already answered`
+measured −79.8 % on its phase and −10.6 % CPU, disjoint at n=3 an arm; the `BTreeMap` page-counts
+arm measured −82 % on the rebuild it targeted and **+1.33 µs/draw on the drain**, also disjoint, and
+was reverted for it. A phase number is a diagnosis — it prices the work that was skipped. Only
+`drain_duty proc_us` per draw at n≥3, within one boot population, decides whether the change is a
+win.
 
 ### No Magic Numbers
 
@@ -330,20 +416,6 @@ that no longer exist.
 State exactly what you verified. A single green boot does not prove an entire class is fixed. Broad
 claims such as "zero-copy everywhere" or "no fallback remains" require an audit of every place that
 could falsify them. One workload on one pathway proves one workload on one pathway.
-
-### A Subagent Shares Your Working Tree
-
-A delegated agent runs in this same checkout, so anything it does to git happens to you. Brief every
-one of them read-only, by name: no `checkout`, `switch`, `stash`, `reset`, `restore` or `commit`.
-The failure is quiet — an agent that runs `git checkout HEAD~1` to get a "clean build" and does not
-return leaves HEAD detached, and the next commit lands off the branch where nothing but the reflog
-can find it. Check `git status` after any delegated run before committing.
-
-**The same rule binds you, and the likeliest way to break it is reverting a probe.** Stubbing a gate
-out to prove a test really fails without it is the right habit; undoing it with `git checkout --
-<file>` takes every uncommitted edit in that file with it, including the change you were probing.
-Copy the file aside and copy it back, or edit the stub out the way you edited it in. Never reach for
-git to undo a probe.
 
 ## Before A Broad Sweep
 
@@ -413,17 +485,15 @@ off, or a field two bytes too wide:
 
 ```sh
 RUSTDOCFLAGS="-A rustdoc::private_intra_doc_links" cargo doc -p reims-vgpu \
-  --no-deps --document-private-items \
-  --no-default-features --features backend-vulkan,host-window
+  --no-deps --document-private-items --no-default-features --features host-window
 ```
 
 Triage its output before editing anything, because most of it is not rot. Three classes, and only
 the first is:
 
 - **The symbol exists nowhere.** Real rot, and the only class worth a commit. Confirm with a grep
-  for the leaf name; run the doc build on the Metal arm too (`--target aarch64-apple-darwin
-  --features backend-metal`) and take the intersection, or a `backend-metal`-gated target will read
-  as missing on the Vulkan arm.
+  for the leaf name; run the doc build for both supported targets and take the intersection, or a
+  platform-gated target can read as missing on the other host.
 - **A bare name inside a `//!` module doc.** These never resolve here whatever they name — a
   `pub fn` in that same module fails exactly as a deleted one does, and `self::` does not help.
   Only a fully-qualified `crate::…` path resolves from a `//!` doc. Cosmetic; the reference is
@@ -491,8 +561,7 @@ with the raw wire captured on first sighting (`runtime/exec/report.rs`). A test 
 
 ## Support Matrix
 
-arm64 and x86 are both first-class. Metal and Vulkan are both first-class where the host supports
-them.
+arm64 and x86 are both first-class. Vulkan is the backend on both pathways.
 
 The Vulkan backend must support all four memory/import cells:
 
@@ -504,8 +573,9 @@ The Vulkan backend must support all four memory/import cells:
 On a unified host the import *is* the rail: a `GuestSlice` binds directly and there is no
 device-local mirror. On a discrete host the device-local resource is the working memory and the
 import is its backing store, so the copy between them is GPU-side and correct rather than a
-fallback. `caps::memory_topology` decides which, from two structural signals — do not add a third
-classifier and do not branch on vendor or driver name. A misclassification must stay a
+fallback. `reims-vgpu-vulkan::memory` classifies the device from two structural signals and
+`reims-vgpu-vulkan::policy` owns the consequences — do not add a third classifier and do not branch
+on vendor or driver name. A misclassification must stay a
 **performance** bug: nothing may branch on topology in a way that changes what the guest observes.
 
 Vulkan 1.2 is the baseline. Anything above Vulkan 1.2 must have a fallback or a capability-gated
@@ -515,9 +585,8 @@ path. Gate on capabilities, not vendor names, driver names, or API-version assum
 
 The GPU reads and writes guest memory through the mapping QEMU already holds over each RAMBlock,
 imported once and held for the VM's lifetime. The primitive is per platform and the three converge:
-`VK_EXT_external_memory_host` on Linux and Windows, the same extension through MoltenVK on macOS,
-and `newBufferWithBytesNoCopy` on the Metal-direct arm — which is what MoltenVK implements the
-extension over.
+`VK_EXT_external_memory_host` on Linux and Windows, and the same extension through MoltenVK on
+macOS.
 
 Portability is why. dma-buf is a Linux kernel object and there is no Windows equivalent —
 `VK_KHR_external_memory_win32` moves NT handles for GPU-allocated or D3D resources, not arbitrary
@@ -539,7 +608,8 @@ method on the import, not a field on the slice.
 nothing at `vkCreateDevice`, and runs every guest-memory rail through the copying path. Those rails
 are not a legacy arm: they are the only arm on such a host, and they are the arm a discrete GPU
 takes regardless, because there the copy into VRAM is the point. Both halves are gated — the
-capability at `caps::host_pointer`, and the reference at `runtime/guest_ram_map.rs`, which refuses
+capability at `reims-vgpu-vulkan::host_pointer`, and the reference at
+`runtime/guest_ram_map.rs`, which refuses
 by name when no backend published a granularity.
 
 **Page recycling is unchanged and still load-bearing.** The guest reassigning a GPA to a different
@@ -573,16 +643,18 @@ So the deferred-flush rail — the device's largest cost — is retired, by writ
 directly. **`runtime/storage_flush/` went with it and no longer exists**; do not go looking for it,
 and do not read a reference to it in an older commit body or `kb/` entry as a live path. Its two
 halves are now `runtime/render_writeback.rs`, whose module doc lists the four hazards the deferred
-window carried and why each cannot arise in the direct path, and `runtime/host_writes.rs`, the
-per-page record of which guest pages this device has written. Read `render_writeback`'s doc before
+window carried and why each cannot arise in the direct path, and
+`reims-vgpu-core::content_tracking::HostWrites`, the per-page record of which guest pages this
+device has written. Read `render_writeback`'s doc before
 assuming a landing is safe to skip. Note that `runtime/gva_view.rs::ensure_gva_view` hands back a
 host pointer but is not a window resolver — it requires the span to be one contiguous page run and
 returns `None` otherwise.
 
 ### Environment overrides
 
-Every variable the crate reads is named in `crates/reims-vgpu/src/env.rs`, which also owns the parse.
-Read a variable through it or the second spelling of "off" is a divergence nothing can find.
+Every supported variable is named and parsed in `crates/reims-vgpu-config`; the composition crate's
+`env` module is only a compatibility re-export. Read configuration through that shared vocabulary
+or the second spelling of "off" is a divergence nothing can find.
 
 **An override may only narrow what the device does; it may never widen it.** A switch can turn off a
 rail the host could have run. It can never turn on one the host reported it cannot: capability is
@@ -595,15 +667,30 @@ Two matter for verification rather than for ablation:
 - `REIMS_VGPU_GUEST_IMPORT=off` takes a capable host down to the `disabled_by_env` rung, which is
   how the copying rails get exercised without hunting for hardware that lacks the extension.
 - `REIMS_VGPU_GATHER_AUDIT_ALL=on` makes the zero-copy sampled cache's content audit judge **every**
-  vouched bind instead of one in sixty-four. The stride is the alarm's sampling rate and nothing the
-  guest observes depends on it — the bind itself is vouched by two witnesses covering disjoint
-  writers, the hypervisor dirty bitmap and this device's own page-exact write record, which is why
-  it is a contract rail and not a guess; read `runtime/gather_witness.rs` before touching either.
+  vouched bind. Without it the audit does not run at all — `AuditDensity::default()` is `Disabled`,
+  not a stride, so a shipping boot judges **zero** binds and emits no `gw_audit_*` counter of any
+  kind. This file used to describe a one-in-sixty-four sampling rate; there is none, and a boot
+  without the switch cannot answer a content question however long it runs. Nothing the guest
+  observes depends on the switch either way. **The vouch itself is not a statement about bytes, and this file used
+  to say it was.** Its two accounts — the decoded resource-validity transition and this device's own
+  page-exact write record — do not cover disjoint writers: a guest CPU store into unified shared
+  storage bumps neither, because the validity transition is a synchronization statement consumed at
+  submission construction and not a version emitted per write. `runtime/gather_witness.rs` says so in
+  its own first paragraph, and a macos-13 sweep measured the consequence — 876 `gw_audit_unsound`
+  against 254 600 `gw_audit_ok` in one boot. Read that module doc before treating a vouch as evidence
+  about content. **The unsoundness is real; the symptom this file used to attribute to it is not
+  its.** Maps losing its CPU-rasterized type and POI icons while GPU-drawn geometry renders
+  correctly was named here as the consequence, and that attribution is refuted: a gate-verified
+  boot with `REIMS_VGPU_GATHER_VOUCH=off` re-gathered **every** bind (`gw_vouched` 0 against
+  `gw_withheld` 1 618 985) and the type layer was still entirely absent. Do not spend boots on the
+  witness for that defect; `kb/` carries where it actually points.
   That cache is the only place in this device where an
   image is bound with nothing read and nothing compared, and a stale bind's failure mode is content,
-  which no counter reports — the audit is the sole instrument, and at the shipping stride it samples
-  about 1.6 % of the binds it could judge. Run a rail sweep under it and read `gw_audit_unsound`
-  against `gw_audit_ok` beside it; a zero is only evidence when the `ok` is large. **Never quote a
+  which no counter reports — the audit is the sole instrument, and it is off unless you turn it on.
+  Run a rail sweep under it and read `gw_audit_unsound` against `gw_audit_ok` beside it; a zero is
+  only evidence when the `ok` is large, and **an absent counter is not a zero** — eight driven Maps
+  boots carried 1.8 M vouched binds each and no `gw_audit_*` line between them, which says the alarm
+  never ran and says nothing whatever about the bytes. **Never quote a
   timing from such a boot** — the fold re-reads the very windows the cache exists to avoid reading.
 
 ## Verification
@@ -622,6 +709,107 @@ do not generalize from one rail to another.
   `scripts/screenshot-when-macos-host/screenshot-when-macos-host.sh /tmp/screen.png`
 - x86: `vm/boot-x86.sh --device reims-vgpu-pci --testing`, then
   `scripts/screenshot-when-kde-plasma-host/screenshot-when-kde-plasma-host.sh -o /tmp/screen.png`
+
+### Ask the API before you photograph the screen
+
+`conformance/` is a Swift battery that runs the **same source** on a native macOS host and inside
+the guest. A rendering question answered by a screenshot names no seam — "labels absent" is what a
+wrong pitch, a wrong swizzle, a dropped dispatch, a lost mip level and an unordered host read all
+look like. A case here computes a value the CPU can predict exactly, asks the GPU for it, and
+compares, so a failure names the case, the bytes wanted and the bytes returned.
+
+**The native arm is what makes a guest failure a finding**, and neither arm means anything alone:
+
+| native | guest | meaning |
+|---|---|---|
+| PASS | FAIL | a named device defect |
+| FAIL | — | a wrong expectation in the suite, not a finding |
+
+So a guest failure is not reportable until the same case is green natively, and a case added to the
+battery is not finished until it has been run on both. `conformance/run-native.sh` is the oracle arm
+and `conformance/run-guest.sh` boots a rail and runs the same source against this device — the
+latter scores itself with `conformance/verdict.py` and exits non-zero on any guest failure that is
+not written down in `conformance/expectations/known-failures.txt`, **and on any listed failure that
+has started passing**.
+
+Reach for it before a boot when the question is *what the API does*: a contract question, a format,
+a stride, an ordering rule, a rail with one case on it. Reach for a driven boot when the question is
+throughput, cadence or a whole compositor. The battery cannot see a frame and a frame cannot name a
+seam.
+
+### A fix is not done until a case in `conformance/` fails without it
+
+This is the rule this project has paid the most to learn, so it is stated as an obligation and not
+as advice. **Every fix to something the guest can observe adds a case to the battery, and the case
+is verified by reverting the fix and watching it fail.** A fix without one is not finished, however
+green `cargo test` is and however good the screenshot looks.
+
+The reason is not thoroughness. It is that the battery is the only instrument here that can tell us
+we are wrong about the contract:
+
+- **A Rust test cannot disagree with you.** It consumes wire bytes we authored against ports we
+  wrote, and asserts what we believe Metal does. If the belief is wrong the test passes and locks
+  the error in — the test becomes the thing defending the bug. The battery's *native* arm is the
+  only place in this tree where Apple's own implementation answers the question, which is why a case
+  that fails on the oracle is a bug in the suite and never a finding about this device.
+- **A Rust test drives a guest we imagined.** The battery makes Apple's real driver produce the
+  command stream, on the real rail, through the real Vulkan path, on a real host GPU. Whole classes
+  live only there: what the driver chooses to stage through a buffer, what it emits as a
+  whole-surface copy, how many frames it leaves in flight, which rail a descriptor actually lands
+  on. No amount of unit testing reaches any of them, because every one of them is a decision made
+  by software we do not ship and cannot fake.
+- **A screenshot cannot name a seam, as the section above says, and a driven boot proves one
+  workload on one rail.** A case names the bytes and keeps naming them on every later run.
+
+The worked example is the host read that was not ordered against this device's own submitted GPU
+writes. It cost three days. Its Rust regression test is real and it gates the mechanism — and it
+was written *from the diagnosis*, after the fact, and could not have found the defect or found the
+next one of its class, because it asserts that one function settles and knows nothing about which
+rail a compositor's copies take. `srt_blit_pipelined_1024x768_x8` fails on the broken build and
+passes on the fixed one, through the guest's own driver. That is the difference between a test that
+records what we learned and a test that would have caught it.
+
+**A case is a gate only if the broken arm loses it.** Three attempts at that same case passed on the
+broken build — each of which reads as evidence the defect is not real, and one of which nearly ended
+the investigation. Revert the fix, watch the case fail, then restore it; `conformance/README.md`
+carries the three things that one needed before it reproduced. A case that has never been seen
+failing is decoration.
+
+Where the battery genuinely cannot reach — a host-side cadence, a counter, a lifetime with no
+guest-visible value — say so in the commit body and name what does gate it instead. That is a
+narrow exemption and it is not the usual answer: if the guest can see the difference, the battery
+can express it.
+
+**Prune `expectations/known-failures.txt` in the same commit.** A fix that makes a listed case pass
+must remove its line, and `verdict.py` fails the run until it does. A list nobody prunes stops being
+a list of defects and becomes a list of cases nobody reads.
+
+### Never score a frame by OCR. Look at it.
+
+**OCR may not decide anything about a frame.** Not a pass, not a fail, not a ranking between two
+arms. A capture is scored by opening it and looking at it, every time, and a result reported from a
+frame nobody looked at is not a result.
+
+This is not a preference about rigour, it is what OCR measured wrong here, twice, in the direction
+that reads as a finding:
+
+- **It invented type that was not there.** A word count with a confidence floor read a Maps scene as
+  carrying legible labels. The frame carries none at all — the "words" were road casings and
+  antialiasing, and a whole investigation into *which* labels were wrong was built on a layer that
+  was simply absent. The right question, missing labels, was never asked, because the instrument
+  answered a different one.
+- **It cannot see a defect that is not text.** The same scene renders as hundreds of full-width
+  horizontal stripes of correct colour interleaved with background. OCR scores a torn frame exactly
+  as it scores a clean one, so that defect sat unreported across every sweep that used this scoring.
+
+The general form is the trap `## Before A Broad Sweep` already names: a zero that is an artifact of
+where it was sampled. A word count samples one channel of one layer, and reports the same number for
+"rendered correctly and has no text", "rendered nothing" and "rendered garbage". Three states, one
+reading.
+
+So a probe may still *capture*, crop, and lay frames side by side — that is an instrument doing what
+instruments do. What it may not do is emit a verdict column. Save the frames, name them by scene, and
+read them.
 
 ### Run `vm/guest-authorize.sh` after an x86 boot, before any probe
 
@@ -963,6 +1151,37 @@ Only a live device creates `/tmp/reims-vgpu-fail.log`, so waiting on it catches 
 killing any surviving QEMU first avoids the race. Confirm afterwards that the log is a boot's and
 not the test suite's, by the presence of `store_routes`/`present_page_identity`.
 
+### Band to the driven windows before computing anything per draw
+
+A boot's log holds the ramp, the driven band and the post-probe idle, and a
+whole-boot total mixes all three. Keep only `drain_duty` windows with
+`draws > 0` **and** `duty >= 0.5`, and join every other census to them by `t=`.
+
+The error is not small and it does not look like an error. On one driven
+fullscreen Maps boot the whole-boot arithmetic read `gap_idle_us` at **41.8
+us/draw** -- idle windows contribute idle time and no draws -- which says the
+drain worker is idle two thirds of the time on a rail where the banded duty is
+0.92. It also moved `proc_us` from a banded 22.14 to 23.98. Both readings are
+self-consistent and both are wrong in the direction that reads as a device
+result. The duty distribution over windows with draws is min 0.005, p25 0.099,
+median 0.818, p75 0.966: the low quartile is the boot ramp, not the device
+idling under load.
+
+**Rank throughput on draws per driven second, not on `present_hz`.** Draws per
+frame is the workload and it drifts between boots of one binary by more than the
+effects measured here -- 2 456 to 3 804 across six boots of two arms -- so a
+frame count is comparable only with draws-per-frame quoted beside it, and
+`fps = draws_per_sec / draws_per_frame` is the identity that says why. Summing
+`host_window_cadence` over a *wall-clock range* spanning the band is not a fix:
+the range includes the undriven windows between driven ones.
+
+This is the rule that hid a real +6.4 % arm. Six interleaved boots were scored
+on whole-boot `present_hz`, came back overlapping, and were written off as
+buying no frames; rebanded, the same boots are **disjoint** on both
+`draws/driven-sec` and `proc_us`. `scripts/`-adjacent harnesses should band, and
+a number quoted without saying it was banded should be re-derived before it is
+believed.
+
 ### A boot measured next to your own subagents measures the contention
 
 Every `us=` number this device reports is wall clock on a shared machine, so a driven boot taken
@@ -981,37 +1200,11 @@ field as an upper bound.
 Run the relevant native tests serially from the repo root:
 
 ```sh
-cargo test -p reims-vgpu --no-default-features --features backend-vulkan,host-window -- --test-threads=1
-cargo test -p reims-vgpu --no-default-features --features backend-metal -- --test-threads=1
+cargo test -p reims-vgpu --no-default-features --features host-window -- --test-threads=1
 ```
 
-`backend-metal` is Apple-only; run that arm only on Apple hosts. Run the feature matrix from the
-repo root when cfgs, features, backend boundaries, or shared Rust code change:
-
-**On a non-Apple host, the test functions under `backend/metal/` do not run, and nothing in the
-output says so.** This is worse than the fixture gap below, which at least reports `ignored`: these
-tests are `cfg`-ed out of the arm you can run, so a Linux session's green count simply does not
-include them and reads exactly like a clean tree. The cross-compiled clippy and `cargo check`
-commands above *compile* them, which is why a code warning there is still caught — but
-`cargo test --target aarch64-apple-darwin … --no-run` fails at the **link** step (no Apple linker,
-no macOS SDK), so no binary is ever produced. Do not read "compiles on the Metal arm" as "its tests
-passed"; nobody on a Linux host has run them.
-
-Nothing counts them any more — a source scan used to, and went with the rest. Do not try to restore
-the count with a `grep` for `#[test]`: that is what the scan did, and it was wrong by four, because
-the prose in those files says "a `const` assertion rather than a `#[test]`" and the grep counted the
-sentences. The gap is real and unclosed: work on `backend/metal/` needs an Apple host to be tested
-at all.
-
-Where a file under `backend/metal/` is pure logic, **move it out of the gated tree** rather than
-working around the gate — `backend::hash` is the worked example, and its two tests now run on every
-arm instead of on none. The bar is that it names nothing from the `metal` crate; state in the
-module's own doc why it sits outside `metal`, or the next reader moves it back.
-
-Copying the file to `/tmp` and building with bare `rustc --test` still works for a one-off reading,
-and needs the `//!` module doc stripped if it links outside the file. It is not a gate: nothing
-re-runs it. A file that reaches `crate::` for more than constants needs its dependency closure
-copied too, which is usually the point at which the logic belongs in `contract/` instead.
+Run the feature matrix from the repo root when cfgs, features, backend boundaries, or shared Rust
+code change:
 
 ```sh
 scripts/feature-matrix/feature-matrix.sh
@@ -1030,13 +1223,6 @@ either suite covers what they cover, so a green run is not evidence about a wire
 with `scripts/wire-oracle/wire-oracle.sh` on an Apple host, and set `REIMS_WIRE_FIXTURES_REQUIRED=1`
 there so their absence fails the build.
 
-**The `backend-metal` `--lib` arm is expected to be green.** It used to carry six standing failures
-in a module that has since been deleted outright, and this file used to tell you to expect them;
-they were Vulkan-rail tests compiled unconditionally, and they carried the gate before the module
-went. A red there is a real
-result again — do not restore the exception, and do not silence a new one by weakening what it
-asserts.
-
 ## Commit Guidelines
 
 Commit only work you wrote. Never commit third-party code or intellectual property, including Apple
@@ -1049,16 +1235,17 @@ Each commit should have a detailed message body that states:
 - Which component or pathway it touches.
 - What behavior changed and why.
 - What tests, clippy runs, feature-matrix checks, or live-VM verification were performed.
+- **Which `conformance/` case gates it**, for anything the guest can observe — by name, with the
+  result of running the battery on the broken build and on the fixed one. "No case, because the
+  battery cannot reach this" is an acceptable answer exactly once it says what does gate it instead.
 - What was not verified, if anything.
 
-Rust commits should be warning-free under clippy with `-D warnings` for every affected matrix arm.
-**All three run on a Linux host** — the Metal arm needs its `--target`, and with it clippy analyses
-the `backend-metal` code without an Apple machine:
+Rust commits should be warning-free under clippy with `-D warnings` for both supported targets:
 
 ```sh
-cargo clippy -p reims-vgpu --target aarch64-apple-darwin --all-targets --no-default-features --features backend-metal -- -D warnings
-cargo clippy -p reims-vgpu --all-targets --no-default-features --features backend-vulkan,host-window -- -D warnings
-cargo clippy -p reims-vgpu --target x86_64-unknown-linux-gnu --all-targets --no-default-features --features backend-vulkan,host-window -- -D warnings
+cargo clippy -p reims-vgpu --target aarch64-apple-darwin --all-targets --no-default-features --features host-window -- -D warnings
+cargo clippy -p reims-vgpu --all-targets --no-default-features --features host-window -- -D warnings
+cargo clippy -p reims-vgpu --target x86_64-unknown-linux-gnu --all-targets --no-default-features --features host-window -- -D warnings
 ```
 
 A commit touching `crates/reims-vgpu-efi` — its own workspace, so the commands above do not reach it
@@ -1072,39 +1259,41 @@ cargo clippy --profile test --lib -- -D warnings           # the host-runnable l
 ```
 
 Expect zero from all three. **`scripts/feature-matrix` does not cover this**: it runs `cargo check`,
-so its `warnings=0` is a rustc count and it cannot see a clippy lint on any arm. That gap plus a
-"the Metal command is Apple-only" line that used to sit here is how a `clippy::question_mark` in
-`runtime/draw/mod.rs` survived several commits that each said "clippy clean" — every one of
-them was clean on the arms it ran, and nobody on a Linux host ran the Metal one.
+so its `warnings=0` is a rustc count and it cannot see a clippy lint.
 
 Do not hide warnings, skip an affected arm, or commit a dropped test
 count without calling it out — and **do not read "clippy clean" in a commit body as covering every
 arm**; it means the arms that commit ran.
 
-### Never run `cargo fmt`
+### Always run `cargo fmt`
 
-This crate is not kept rustfmt-clean and must not be made so in passing. One invocation rewrote 77
-files and 984 lines, nearly all of it code the change had nothing to do with, and the diff had to be
-thrown away and the two intended edits re-applied by hand. A reformatting commit would also bury
-every `git blame` line the doc comments here depend on.
+`rustfmt.toml` at the repo root is the format, and **both workspaces are clean under it**. Run it
+before every commit — twice, because the root invocation does not reach `crates/reims-vgpu-efi`,
+which is its own workspace:
 
-Match the surrounding style by hand. If a line you wrote is too long, wrap it the way its neighbours
-wrap. Reformatting is its own commit, decided deliberately, and nobody has decided it.
+```sh
+cargo fmt --all
+(cd crates/reims-vgpu-efi && cargo fmt --all)
+```
 
-One standing exception, carried by `#[allow]`s at the module declaration that states the reason.
-`backend::metal::error::Status` is large by design — the payload is what makes each refusal name the
-check that refused, and it is `Copy` and compared by value at hundreds of sites — so
-`result_large_err` and `large_enum_variant` are exempted there. **A new error type that is large for
-no such reason should still be boxed**, not added to the exemption.
+The gate is `scripts/feature-matrix/feature-matrix.sh`, whose first two cells run
+`cargo fmt --all -- --check` over each workspace and fail the run on a diff. Nothing else in the
+toolchain sees formatting: rustc and clippy are both silent on it, which is why an unformatted tree
+survived here for as long as it did.
 
-### Never transmute a guest ordinal into a Metal enum
+**This replaces a standing ban, and the ban's reasoning is why the mandate now holds.** Running
+`cargo fmt` on an *unformatted* tree rewrote 77 files and 984 lines under a change that touched two
+of them; the diff was unreviewable, had to be thrown away, and buried the `git blame` lines the doc
+comments here depend on. Every one of those costs is one-time, and every one has now been paid. On
+a clean tree `cargo fmt --all` is a no-op, and the only diff it can produce is the lines the current
+change wrote. Keeping the tree clean is what guarantees the 77-file commit never happens again —
+forbidding the command was what made it inevitable, because the debt only ever grew.
 
-The `MTL*` types are fieldless `#[repr(u64)]` enums, so producing one whose discriminant is not a
-declared variant is **undefined behavior, not a decode error** — the same rule
-`reims-vgpu-wire`'s invariant 4 states for wire structs. A decoded guest value is an arbitrary
-`u32`, so `transmute` is never the conversion.
+Two things the mandate does not license:
 
-`backend::metal::mtl_enum` is the only way across: name every variant, get `None` for anything
-else, turn that into a typed refusal. Add a table there rather than a cast, and read that module's
-doc first — two of these enums have interior holes, so a `<= max` range check is not a substitute,
-and `MTLStepFunction`'s names in `metal` 0.33 are not Apple's.
+- **A reformat is still its own commit.** Do not let an unrelated rewrap ride along inside a
+  behavior change. That is what made the old diff unreviewable, and it is a property of the commit,
+  not of the command.
+- **rustfmt does not touch comment prose.** `wrap_comments` is off, which is its default, so every
+  `//!` and `///` in this crate stays exactly as written — the module docs that carry this project's
+  durable reasoning are yours to wrap by hand, and rustfmt will not second-guess them.

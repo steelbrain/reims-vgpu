@@ -14,18 +14,16 @@
 //! This module is that, and it is a sorted `Vec` of a dozen or so entries rather
 //! than a cache with an eviction policy.
 //!
-//! A RAMBlock is imported in **chunks** rather than whole, because a driver has
-//! been measured truncating a multi-gigabyte `allocationSize` to 32 bits on this
-//! path and reading back garbage past the truncation — see
-//! [`crate::backend::vulkan::caps::host_pointer::IMPORT_SPAN_CEILING`]. Chunking
-//! needed nothing else to change: a window has always resolved against whichever
-//! import backs its GPA, and one straddling two of them has always grouped into
-//! two `VkBuffer` sources, because a RAMBlock boundary could already split one.
+//! A RAMBlock is imported in **chunks** when it is longer than the backend's
+//! queried single-allocation limit. A window resolves against whichever import
+//! backs its GPA, and one straddling two of them groups into two `VkBuffer`
+//! sources, because a RAMBlock boundary could already split one.
 //!
 //! # Why the imports are built here and not at device create
 //!
 //! The backend measures the granularity; the runtime holds the
-//! [`HostOps`](crate::runtime::HostOps) that can say where guest RAM lives.
+//! [`GuestRamProvider`](crate::runtime::host::GuestRamProvider) that can say where
+//! guest RAM lives.
 //! Neither side has both, and the device context deliberately does not take a
 //! host — see the module doc on [`crate::qemu::host_ops`] for why the runtime
 //! keeps it. So the granularity is published by the backend through
@@ -51,7 +49,7 @@ use crate::runtime::guest_ram::{
     granularity, import_budget, import_span_max, GuestRamError, GuestRamImport, GuestRamRegion,
     GuestRef,
 };
-use crate::runtime::host::{GuestRamRegionsError, HostOps};
+use crate::runtime::host::{GuestRamProvider, GuestRamRegionsError};
 use std::sync::Arc;
 
 /// Why a guest physical address did not become a bindable reference.
@@ -99,7 +97,7 @@ pub enum MapRefusal {
     ///
     /// The backend publishes this budget as the roomiest heap an import can be
     /// *charged to* — the same population of memory types
-    /// `caps::memory_topology::select_memory_type` will choose from, since every
+    /// `reims-vgpu-vulkan`'s memory selector will choose from, since every
     /// import goes through it carrying one class's required flags. So a sum that
     /// passes here has a heap that each individual chunk fits, and the exact
     /// per-allocation check at the pick — which refuses rather than making a
@@ -116,20 +114,11 @@ pub enum MapRefusal {
     ///
     /// # What would give such a host the fast rail back
     ///
-    /// Not this refusal, which only makes the host work. A RAMBlock is now
-    /// imported in chunks — for an unrelated reason, a driver truncating
-    /// `allocationSize` — and two of the three things that stood in the way of
-    /// using those chunks for *residency* have gone with it: the split exists,
-    /// and the lookup is a binary search rather than a linear `find`, so a
-    /// hundred imports cost what two did.
-    ///
-    /// What is left is the part that was always the hard one. Chunks are still
-    /// imported eagerly and all at once, and the sum is still what this compares,
-    /// so the refusal fires exactly where it did. Making a small-heap host work
-    /// means importing a chunk on first reference into it and *releasing* chunks
-    /// again — against this module's standing advice, which is sound only while
-    /// every import fits. That cannot be measured on a host whose roomiest heap
-    /// is four times its guest.
+    /// Not this refusal, which governs the optional whole-VM import. Resource-
+    /// sized stable aliases are admitted independently by
+    /// [`crate::runtime::guest_ram::host_allocation_import_align`], so a guest
+    /// allocation that fits can still take the direct rail without making
+    /// unrelated RAM resident.
     ImportExceedsHeap { needed: u64, budget: u64 },
     /// The address is not inside any imported span. Guest RAM the GPU can reach
     /// exists, and this address is not in it — a device MMIO address, a hole,
@@ -357,7 +346,7 @@ pub fn imports() -> Vec<Arc<GuestRamImport>> {
 /// a host pointer chained, which is where a driver that pins takes a reference
 /// on every page of guest RAM — seconds, proportional to the RAM the VM was
 /// given, and measured per block by
-/// [`crate::backend::vulkan::engine::warm_guest_ram_imports`].
+/// [`reims_vgpu_vulkan::engine::warm_guest_ram_imports`].
 ///
 /// Both were lazy and both landed on the guest's first `gather`, inside its
 /// first draw, inside a display transaction the guest abandons after 1000 ms.
@@ -376,9 +365,11 @@ pub fn imports() -> Vec<Arc<GuestRamImport>> {
 /// leaves the lazy path to handle a backend that is genuinely late.
 ///
 /// The device-side half is Vulkan-only because only Vulkan has a device-side
-/// half: the Metal-direct arm builds a `newBufferWithBytesNoCopy` per call
 /// against unified memory and holds no per-RAMBlock import to warm.
-pub fn warm<H: HostOps + ?Sized>(host: &mut H) {
+pub fn warm<H: GuestRamProvider + ?Sized>(
+    host: &mut H,
+    executor: &dyn crate::runtime::executor::Executor,
+) {
     if granularity().is_none() {
         return;
     }
@@ -386,11 +377,10 @@ pub fn warm<H: HostOps + ?Sized>(host: &mut H) {
     if !already {
         with_map(host, |_| ());
     }
-    #[cfg(feature = "backend-vulkan")]
     {
         let imports = imports();
         if !imports.is_empty() {
-            let (warmed, bytes) = crate::backend::vulkan::engine::warm_guest_ram_imports(&imports);
+            let (warmed, bytes) = executor.warm_guest_ram_imports(&imports);
             if warmed > 0 {
                 crate::observe::off(format!(
                     "guest_ram_warm blocks={warmed} bytes={bytes} spans={}",
@@ -405,7 +395,7 @@ pub fn warm<H: HostOps + ?Sized>(host: &mut H) {
 ///
 /// The one place the resolution is built, so no entry point can hold a second
 /// copy of "have we asked the host yet".
-fn with_map<H: HostOps + ?Sized, R>(host: &mut H, body: impl FnOnce(&Resolved) -> R) -> R {
+fn with_map<H: GuestRamProvider + ?Sized, R>(host: &mut H, body: impl FnOnce(&Resolved) -> R) -> R {
     let mut guard = MAP.lock().unwrap_or_else(|p| p.into_inner());
     if guard.is_none() {
         *guard = Some(resolve(host));
@@ -427,67 +417,15 @@ fn with_map<H: HostOps + ?Sized, R>(host: &mut H, body: impl FnOnce(&Resolved) -
 /// away. That caller must ask *this* rather than re-reading
 /// [`crate::runtime::guest_ram::granularity`], which is the same answer for one
 /// of the four refusals and silence for the other three.
-pub fn standing_refusal<H: HostOps + ?Sized>(host: &mut H) -> Option<MapRefusal> {
+pub fn standing_refusal<H: GuestRamProvider + ?Sized>(host: &mut H) -> Option<MapRefusal> {
     with_map(host, |resolved| resolved.refusal)
-}
-
-/// The whole admission rule for a packed-alias import, in one place.
-///
-/// The alias rails do something the RAMBlock map does not: they build a *new*
-/// host-pointer import over a host allocation they arrange themselves, so that a
-/// guest resource whose pages are scattered can still be presented to Vulkan as
-/// one contiguous range. They are the only importers outside [`resolve`].
-///
-/// # Why they may not assemble this themselves
-///
-/// They did, and it was the same three latches written by hand twice —
-/// `granularity`, `import_span_max`, `import_budget` — with the term that
-/// matters missing from both copies: [`standing_refusal`]. That is precisely
-/// what that function's doc forbids, in the sentence saying a caller must ask it
-/// "rather than re-reading `guest_ram::granularity`, which is the same answer
-/// for one of the four refusals and silence for the other three".
-///
-/// The silence is the bug. The latches are published once at device create from
-/// what the *host* supports, and they stay `Some` for the whole boot. The map's
-/// refusal is a different judgement made later, about what this *guest* fits
-/// into that host — `ImportExceedsHeap` above all, where the guest's RAMBlocks
-/// sum past the roomiest heap an import can be charged to. On such a host the
-/// map is discarded and every RAMBlock reference declines, and these two rails
-/// went on importing anyway, because every latch they asked still answered
-/// `Some`.
-///
-/// That is the reported failure and not a theoretical one: an 8 GiB-or-larger
-/// guest on a host whose importable heap is smaller boots to a black screen or
-/// dies, while the same guest with `REIMS_VGPU_GUEST_IMPORT=off` works — and
-/// `off` is the one arm that also takes these rails' latches away, which is why
-/// it was the arm that worked.
-///
-/// So the rule is one function and the answer is the alignment to import at.
-/// `None` is a refusal already named on the fail channel by whoever owns it.
-pub fn packed_alias_import_align<H: HostOps + ?Sized>(host: &mut H, len: u64) -> Option<u64> {
-    if let Some(refusal) = standing_refusal(host) {
-        // Latched by the refusal, not per call: on a host standing on one,
-        // every alias attempt of every resource refuses for the same reason and
-        // a line each would drown the channel.
-        crate::observe::Emit::decline("packed_alias_refused", &refusal)
-            .fail_once(crate::observe::Decline::slug(&refusal).as_ptr() as u64);
-        crate::runtime::drain::note_store_route("zc_packed_alias_standing_refusal");
-        return None;
-    }
-    let align = crate::runtime::guest_ram::granularity()?;
-    if len > crate::runtime::guest_ram::import_span_max()?
-        || len > crate::runtime::guest_ram::import_budget()?
-    {
-        return None;
-    }
-    Some(align)
 }
 
 /// Turn a guest physical address and a length into a bindable reference.
 ///
 /// The whole guest-memory rail goes through here. Building the imports on the
 /// first call is why `host` is taken: after that it is not touched.
-pub fn reference<H: HostOps + ?Sized>(
+pub fn reference<H: GuestRamProvider + ?Sized>(
     host: &mut H,
     gpa: u64,
     len: u64,
@@ -507,13 +445,7 @@ pub fn reference<H: HostOps + ?Sized>(
 /// not from the start of a page and not from the start of the import. It is
 /// what a copy's source offset is measured in, which is the only thing a
 /// consumer needs and the only thing it may not compute for itself.
-#[derive(Debug)]
-pub struct GuestWindowRun {
-    /// Byte offset of this run's first byte within the requested window.
-    pub window_offset: u64,
-    /// The bindable reference for this run's bytes.
-    pub guest: GuestRef,
-}
+pub use reims_vgpu_memory::GuestWindowRun;
 
 /// [`reference_for_pages`] for a window that is *not* one contiguous stretch:
 /// one reference per maximal GPA run, in window order.
@@ -548,7 +480,7 @@ pub struct GuestWindowRun {
 /// second for an answer that cannot change inside one call, so the walk happens
 /// inside a single [`with_map`] instead. [`reference`] keeps its own lock for
 /// the callers that resolve exactly one span.
-pub fn references_for_runs<H: HostOps + ?Sized>(
+pub fn references_for_runs<H: GuestRamProvider + ?Sized>(
     host: &mut H,
     gpas: &[u64],
     page_size: u64,
@@ -636,7 +568,7 @@ pub fn references_for_runs<H: HostOps + ?Sized>(
 ///
 /// The one implementation of the contiguity rule, so the sampled, buffer and
 /// writeback rails cannot disagree about what a bindable page list is.
-pub fn reference_for_pages<H: HostOps + ?Sized>(
+pub fn reference_for_pages<H: GuestRamProvider + ?Sized>(
     host: &mut H,
     gpas: &[u64],
     page_size: u64,
@@ -682,7 +614,7 @@ pub fn reference_for_pages<H: HostOps + ?Sized>(
 /// same six gathers.
 ///
 /// The seconds are `vkAllocateMemory` with the host pointer chained, measured
-/// per RAMBlock at [`crate::backend::vulkan::engine::warm_guest_ram_imports`],
+/// per RAMBlock at [`reims_vgpu_vulkan::engine::warm_guest_ram_imports`],
 /// which is now also warmed from [`warm`]. The table below is the state before
 /// that, kept because its second row is what ruled out a per-byte cost and sent
 /// the search to one-time setup:
@@ -749,7 +681,7 @@ fn chunk_span(span: GuestRamRegion, span_max: u64) -> Vec<GuestRamRegion> {
     out
 }
 
-fn resolve<H: HostOps + ?Sized>(host: &mut H) -> Resolved {
+fn resolve<H: GuestRamProvider + ?Sized>(host: &mut H) -> Resolved {
     let Some(align) = granularity() else {
         return Resolved {
             imports: Vec::new(),
@@ -771,14 +703,11 @@ fn resolve<H: HostOps + ?Sized>(host: &mut H) -> Resolved {
     // `GuestRamImport::new` names the check that rejected each skipped one on
     // the fail channel, so a partial import is never silent.
     //
-    // One import per RAMBlock was the shape until a driver was found truncating
-    // `allocationSize` to 32 bits on this path — see
-    // [`crate::backend::vulkan::caps::host_pointer::IMPORT_SPAN_CEILING`]. Each
-    // block is now imported in chunks no larger than the span the backend
-    // published. Nothing else had to change: a window already resolves against
-    // whichever import backs its GPA, and one straddling two of them already
-    // groups into two `VkBuffer` sources, because a RAMBlock boundary has always
-    // been able to split one.
+    // Each block is imported in chunks no larger than the API-derived span the
+    // backend published. Nothing else has to change: a window already resolves
+    // against whichever import backs its GPA, and one straddling two of them
+    // already groups into two `VkBuffer` sources, because a RAMBlock boundary
+    // has always been able to split one.
     let span_max = import_span_max().unwrap_or(u64::MAX);
     let mut imports: Vec<Arc<GuestRamImport>> = spans
         .into_iter()
@@ -858,6 +787,137 @@ mod tests {
     /// also a test about the heap. The budget tests name their own.
     const UNBOUNDED: u64 = u64::MAX;
 
+    #[derive(Debug)]
+    struct NoopExecutor;
+
+    impl crate::runtime::executor::CapabilityService for NoopExecutor {}
+    impl crate::runtime::executor::PresentationService for NoopExecutor {}
+    impl crate::runtime::executor::WindowPresentationService for NoopExecutor {}
+    impl crate::runtime::executor::GuestPageTransferService for NoopExecutor {}
+    impl crate::runtime::executor::ResidentCopyService for NoopExecutor {}
+    impl crate::runtime::executor::CompletionService for NoopExecutor {}
+    impl crate::runtime::executor::SubmissionBatchService for NoopExecutor {}
+    impl crate::runtime::executor::GuestImportService for NoopExecutor {}
+    impl crate::runtime::executor::MaintenanceService for NoopExecutor {}
+    impl crate::runtime::executor::ObservationService for NoopExecutor {}
+    impl crate::runtime::executor::ShaderTranslationService for NoopExecutor {}
+    impl crate::runtime::executor::RenderBufferPlanningService for NoopExecutor {}
+    impl crate::runtime::executor::GuestImagePlanningService for NoopExecutor {}
+    impl crate::runtime::executor::SessionService for NoopExecutor {}
+    impl crate::runtime::executor::ReadbackService for NoopExecutor {
+        type Error = crate::runtime::executor::DrawError;
+
+        fn read_target(
+            &self,
+            _identity: &crate::model::TargetIdentity,
+        ) -> Result<crate::runtime::executor::TargetReadback, Self::Error> {
+            Err(crate::runtime::executor::DrawError::Facade(
+                crate::runtime::executor::EngineFacadeDecline::ExecutorServiceUnavailable {
+                    service: "target_readback",
+                },
+            ))
+        }
+    }
+    impl crate::runtime::executor::Executor for NoopExecutor {}
+    impl crate::runtime::executor::ResidentService for NoopExecutor {}
+    impl crate::runtime::executor::GuestWriteService for NoopExecutor {}
+    impl crate::runtime::executor::ComputeResidencyService for NoopExecutor {}
+
+    impl crate::runtime::executor::ExecutionPort for NoopExecutor {
+        type Submission = crate::runtime::executor::ResolvedSubmission;
+        type Completion = crate::runtime::executor::ExecutionCompletion;
+        type Error = crate::runtime::executor::DrawError;
+
+        fn execute(&self, _submission: Self::Submission) -> Result<Self::Completion, Self::Error> {
+            Err(crate::runtime::executor::DrawError::Facade(
+                crate::runtime::executor::EngineFacadeDecline::ExecutorServiceUnavailable {
+                    service: "test",
+                },
+            ))
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct RecordingWarmExecutor {
+        imports: std::sync::Mutex<std::collections::BTreeSet<reims_vgpu_memory::ImportId>>,
+        bytes: std::sync::atomic::AtomicU64,
+    }
+
+    impl RecordingWarmExecutor {
+        fn bytes(&self) -> u64 {
+            self.bytes.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    impl crate::runtime::executor::CapabilityService for RecordingWarmExecutor {}
+    impl crate::runtime::executor::PresentationService for RecordingWarmExecutor {}
+    impl crate::runtime::executor::WindowPresentationService for RecordingWarmExecutor {}
+    impl crate::runtime::executor::MaintenanceService for RecordingWarmExecutor {}
+    impl crate::runtime::executor::SubmissionBatchService for RecordingWarmExecutor {}
+    impl crate::runtime::executor::ObservationService for RecordingWarmExecutor {}
+    impl crate::runtime::executor::ShaderTranslationService for RecordingWarmExecutor {}
+    impl crate::runtime::executor::RenderBufferPlanningService for RecordingWarmExecutor {}
+    impl crate::runtime::executor::GuestImagePlanningService for RecordingWarmExecutor {}
+    impl crate::runtime::executor::SessionService for RecordingWarmExecutor {}
+    impl crate::runtime::executor::ResidentService for RecordingWarmExecutor {}
+    impl crate::runtime::executor::GuestWriteService for RecordingWarmExecutor {}
+    impl crate::runtime::executor::ComputeResidencyService for RecordingWarmExecutor {}
+
+    impl crate::runtime::executor::GuestPageTransferService for RecordingWarmExecutor {}
+    impl crate::runtime::executor::ResidentCopyService for RecordingWarmExecutor {}
+    impl crate::runtime::executor::CompletionService for RecordingWarmExecutor {}
+
+    impl crate::runtime::executor::GuestImportService for RecordingWarmExecutor {
+        fn warm_guest_ram_imports(
+            &self,
+            imports: &[std::sync::Arc<crate::runtime::guest_ram::GuestRamImport>],
+        ) -> (usize, u64) {
+            let mut known = self.imports.lock().unwrap_or_else(|p| p.into_inner());
+            let mut warmed = 0;
+            let mut bytes = 0u64;
+            for import in imports {
+                if known.insert(import.id()) {
+                    warmed += 1;
+                    bytes = bytes.saturating_add(import.len());
+                }
+            }
+            self.bytes
+                .fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+            (warmed, bytes)
+        }
+    }
+
+    impl crate::runtime::executor::ReadbackService for RecordingWarmExecutor {
+        type Error = crate::runtime::executor::DrawError;
+
+        fn read_target(
+            &self,
+            _identity: &crate::model::TargetIdentity,
+        ) -> Result<crate::runtime::executor::TargetReadback, Self::Error> {
+            Err(crate::runtime::executor::DrawError::Facade(
+                crate::runtime::executor::EngineFacadeDecline::ExecutorServiceUnavailable {
+                    service: "test",
+                },
+            ))
+        }
+    }
+
+    impl crate::runtime::executor::ExecutionPort for RecordingWarmExecutor {
+        type Submission = crate::runtime::executor::ResolvedSubmission;
+        type Completion = crate::runtime::executor::ExecutionCompletion;
+        type Error = crate::runtime::executor::DrawError;
+
+        fn execute(&self, _submission: Self::Submission) -> Result<Self::Completion, Self::Error> {
+            Err(crate::runtime::executor::DrawError::Facade(
+                crate::runtime::executor::EngineFacadeDecline::ExecutorServiceUnavailable {
+                    service: "test",
+                },
+            ))
+        }
+    }
+
+    impl crate::runtime::executor::Executor for RecordingWarmExecutor {}
+
     /// Latch a granularity with a budget and a span ceiling that admit
     /// everything, so a test about the granularity is only about that.
     fn latch_granularity(align: u64) {
@@ -874,12 +934,7 @@ mod tests {
 
     struct Spans(Vec<GuestRamRegion>);
 
-    impl HostOps for Spans {
-        fn mono_ns(&self) -> u64 {
-            0
-        }
-        fn enqueue(&mut self, _action: crate::runtime::host::HostAction) {}
-        fn schedule_bh(&mut self) {}
+    impl GuestRamProvider for Spans {
         fn guest_ram_regions(&mut self) -> Result<Vec<GuestRamRegion>, GuestRamRegionsError> {
             Ok(self.0.clone())
         }
@@ -887,12 +942,7 @@ mod tests {
 
     struct Refusing;
 
-    impl HostOps for Refusing {
-        fn mono_ns(&self) -> u64 {
-            0
-        }
-        fn enqueue(&mut self, _action: crate::runtime::host::HostAction) {}
-        fn schedule_bh(&mut self) {}
+    impl GuestRamProvider for Refusing {
         fn guest_ram_regions(&mut self) -> Result<Vec<GuestRamRegion>, GuestRamRegionsError> {
             Err(GuestRamRegionsError::NoRam)
         }
@@ -988,15 +1038,10 @@ mod tests {
         }
     }
 
-    /// The reason chunking exists: no single import may be longer than the span
-    /// the backend published.
-    ///
-    /// A driver has been measured truncating `allocationSize` to 32 bits on the
-    /// host-pointer path and reading back unrelated data past the truncation, so
-    /// an import longer than the published ceiling is not a slow import, it is a
-    /// silently wrong one. This asserts the property that makes that
-    /// unreachable, and asserts it about every import rather than about the
-    /// count, because the count is a consequence and the length is the rule.
+    /// No single import may be longer than the API-derived span the backend
+    /// published. This asserts that property about every import rather than
+    /// about the count, because the count is a consequence and the length is
+    /// the rule.
     #[test]
     fn no_import_is_longer_than_the_span_the_backend_published() {
         const CEILING: u64 = 0x2000_0000;
@@ -1211,7 +1256,7 @@ mod tests {
     fn warming_before_the_backend_publishes_a_granularity_latches_nothing() {
         with_granularity(None, || {
             let mut host = two_spans();
-            warm(&mut host);
+            warm(&mut host, &NoopExecutor);
             assert!(
                 MAP.lock().unwrap_or_else(|p| p.into_inner()).is_none(),
                 "a warm with no granularity must not latch a refusal"
@@ -1219,7 +1264,7 @@ mod tests {
 
             // The backend comes up late; the import must still be available.
             latch_granularity(0x1000);
-            warm(&mut host);
+            warm(&mut host, &NoopExecutor);
             assert_eq!(
                 standing_refusal(&mut host),
                 None,
@@ -1241,8 +1286,8 @@ mod tests {
         });
         let warmed = with_granularity(Some(0x1000), || {
             let mut host = two_spans();
-            warm(&mut host);
-            warm(&mut host);
+            warm(&mut host, &NoopExecutor);
+            warm(&mut host, &NoopExecutor);
             let refusal = standing_refusal(&mut host);
             (refusal, imports().len())
         });
@@ -1306,12 +1351,7 @@ mod tests {
     fn the_host_is_asked_once_however_many_references_follow() {
         with_granularity(Some(0x1000), || {
             struct Counting(std::cell::Cell<usize>);
-            impl HostOps for Counting {
-                fn mono_ns(&self) -> u64 {
-                    0
-                }
-                fn enqueue(&mut self, _a: crate::runtime::host::HostAction) {}
-                fn schedule_bh(&mut self) {}
+            impl GuestRamProvider for Counting {
                 fn guest_ram_regions(
                     &mut self,
                 ) -> Result<Vec<GuestRamRegion>, GuestRamRegionsError> {
@@ -1697,6 +1737,39 @@ mod tests {
                 vec!["OFF guest_ram_map reason=guest_ram_map_no_backend_import"],
                 "a host that cannot import has not lost guest work to fragmentation"
             );
+        });
+    }
+
+    /// The protocol handshake publishes each RAMBlock to the executor before
+    /// the first draw can demand an import, and does so only once per import.
+    #[test]
+    fn the_handshake_warm_imports_before_any_draw_references_a_byte() {
+        const LEN: u64 = 16 << 20;
+
+        struct OneBlock(u64);
+        impl crate::runtime::host::GuestRamProvider for OneBlock {
+            fn guest_ram_regions(
+                &mut self,
+            ) -> Result<
+                Vec<reims_vgpu_memory::GuestRamRegion>,
+                crate::runtime::host::GuestRamRegionsError,
+            > {
+                Ok(vec![reims_vgpu_memory::GuestRamRegion {
+                    gpa_base: 0,
+                    host_va: self.0,
+                    len: LEN,
+                }])
+            }
+        }
+
+        with_granularity(Some(4096), || {
+            let mut host = OneBlock(0x7f00_0000_0000);
+            let executor = RecordingWarmExecutor::default();
+            warm(&mut host, &executor);
+            assert_eq!(executor.bytes(), LEN);
+
+            warm(&mut host, &executor);
+            assert_eq!(executor.bytes(), LEN);
         });
     }
 }

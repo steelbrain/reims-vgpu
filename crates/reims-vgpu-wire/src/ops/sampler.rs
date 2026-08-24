@@ -205,9 +205,12 @@ impl SamplerBody {
     /// Read `0` in all 16 sampler cases. They are inside the written nibble, so
     /// unlike `flags[7:4]` they are a real field rather than ring noise.
     ///
-    /// To settle them: `MTLSamplerDescriptor` has no property left unperturbed
-    /// here, so the next source is a sampler built for an argument buffer with
-    /// a `supportArgumentBuffers` variant, or the guest driver's own builder.
+    /// Tried without moving these bits: every public descriptor property,
+    /// `forceSeamsOnCubemapFiltering`, `forceResourceIndex`, resource index,
+    /// pixel format, reduction mode, LOD bias, and the private border-colour
+    /// selector. `supportArgumentBuffers` already owns bit 0. The remaining
+    /// experiment is the guest builder or host consumer; another descriptor
+    /// perturbation sweep has no untested property left to offer.
     #[inline]
     pub fn unidentified_flag_bits(&self) -> u8 {
         (self.flags >> 1) & 0x7

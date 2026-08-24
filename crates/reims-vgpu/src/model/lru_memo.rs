@@ -51,32 +51,21 @@ impl<K: Ord + Clone, V> LruBytesMemo<K, V> {
     }
 
     /// Current summed entry bytes (the value the byte cap bounds).
-    pub fn bytes(&self) -> usize {
+    #[cfg(test)]
+    fn bytes(&self) -> usize {
         self.bytes
     }
 
     /// Live entry count.
-    pub fn len(&self) -> usize {
+    #[cfg(test)]
+    fn len(&self) -> usize {
         self.map.len()
-    }
-
-    /// Kept because clippy requires it beside `len`, not because a caller
-    /// exists; `len_without_is_empty` is a hard error at `-D warnings` on this
-    /// crate.
-    ///
-    /// Removing the `allow` is not a way to delete this method; `len` has
-    /// callers, so deleting it fails the clippy arms instead.
-    #[allow(
-        dead_code,
-        reason = "exists to satisfy clippy::len_without_is_empty beside `len`, not for a caller"
-    )]
-    pub fn is_empty(&self) -> bool {
-        self.map.is_empty()
     }
 
     /// Peek without touching recency — for read paths that hold only `&self`.
     /// Prefer [`Self::get_touch`] on the hot path so hits stay warm.
-    pub fn peek(&self, key: &K) -> Option<&V> {
+    #[cfg(test)]
+    fn peek(&self, key: &K) -> Option<&V> {
         self.map.get(key).map(|s| &s.value)
     }
 
@@ -92,7 +81,8 @@ impl<K: Ord + Clone, V> LruBytesMemo<K, V> {
     }
 
     /// Remove `key`, returning its value and reclaiming its bytes.
-    pub fn remove(&mut self, key: &K) -> Option<V> {
+    #[cfg(test)]
+    fn remove(&mut self, key: &K) -> Option<V> {
         let slot = self.map.remove(key)?;
         self.bytes = self.bytes.saturating_sub(slot.bytes);
         Some(slot.value)

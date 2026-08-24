@@ -5,9 +5,9 @@
 //! differential C↔Rust comparison against: these expectations are now the
 //! source of truth for the values they cover, not a copy of one.
 
-use reims_vgpu::contract::endian::{st32, st64};
-use reims_vgpu::contract::pixel_format;
 use reims_vgpu::runtime::decode::{blit, event, stream};
+use reims_vgpu_core::endian::{st32, st64};
+use reims_vgpu_core::pixel_format;
 
 /// Never share the live product logs with a concurrent boot.
 fn isolate_logs() {
@@ -20,7 +20,7 @@ fn pixel_format_c_matrix_rows() {
     // IOSurface row expectations, from the deleted C pixel-format matrix, read
     // through the mapper rail's own row-bytes rule rather than a second copy of
     // it that only this vector reached.
-    use reims_vgpu::contract::iosurface_pages::packed_span_estimate;
+    use reims_vgpu_protocol::packed_span_estimate;
     assert_eq!(
         packed_span_estimate(pixel_format::MTL_FORMAT_BGRA8_UNORM, 200, 1),
         Some(896)

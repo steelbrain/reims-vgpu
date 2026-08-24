@@ -85,11 +85,11 @@ pub fn note_declined(reason: SwizzleDecline, texture_ref: u32) {
 /// wrote it — the same argument that prefixed the slate reasons.
 ///
 /// A second variant, `ResidentDirectBind`, is gone. It named a resident bound
-/// through the registry's own image view, which the engine creates once per
-/// target and cannot re-decorate — so that arm dropped the bind. It does not
-/// drop it any more: a swizzled resident bind now takes the snapshot arm, whose
-/// view the engine creates per bind and decorates from this very plan. The
-/// engine counts it as `sampled_resident_swizzle_snapshot`, which is a rail
+/// through the registry's own image view, which the engine once created one of
+/// per target and could not re-decorate — so that arm dropped the bind. It does
+/// not drop it any more, and no longer copies to avoid it either: the registry
+/// keys a view on the format *and* the mapping, so a swizzled resident binds
+/// directly and the hardware performs the mapping at sample time. That is a rail
 /// taken and not a swizzle lost, so it does not belong in this enum.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SwizzleDecline {

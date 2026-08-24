@@ -12,7 +12,8 @@
 //!
 //! ```text
 //! payload +000  u32  object_ref  the ref the guest's allocator assigned
-//! payload +004  u32  packed      texture_type[3:0] flags[5:4] gpu_opt[6]
+//! payload +004  u32  packed      texture_type[3:0] framebuffer_only[4]
+//!                                is_drawable[5] gpu_opt[6]
 //!                                usage[15:8] pixel_format[31:16]; bit 7 unwritten
 //! payload +008  u32  width
 //! payload +012  u32  height
@@ -21,7 +22,7 @@
 //! payload +022  u16  sample_count
 //! payload +024  u16  array_length
 //! payload +026  u16  resource_options
-//! payload +028  u64  unidentified (see `unidentified_u64`)
+//! payload +028  u64  protection_options
 //! ```
 //!
 //! `object_ref` is a payload field, not a header one. Object-creation records
@@ -82,6 +83,19 @@ pub const NEW_TEXTURE_TOTAL_LEN: u32 = 44;
 /// Bytes of [`TextureDescriptorBody`], the half two records share.
 pub const TEXTURE_DESCRIPTOR_LEN: usize = 32;
 
+/// `MTLStorageMode`, `resource_options[7:4]`, from the raw options word.
+///
+/// The narrow and wide descriptor bodies both carry that word, and a semantic
+/// consumer holding only the word needs the same answer they do — so the shift
+/// is written once here and the two accessors call it. See
+/// [`TextureDescriptorBody::storage_mode`] for what the field means and for the
+/// misreading it invites.
+#[inline]
+#[must_use]
+pub const fn storage_mode_nibble(resource_options: u16) -> u8 {
+    ((resource_options >> 4) & 0xf) as u8
+}
+
 /// The 32-byte texture descriptor, without the new object's ref.
 ///
 /// Declared apart from [`NewTextureBody`] because it is not only that record's
@@ -93,8 +107,8 @@ pub const TEXTURE_DESCRIPTOR_LEN: usize = 32;
 #[repr(C)]
 #[derive(Debug)]
 pub struct TextureDescriptorBody {
-    /// Texture type, two unidentified flags, GPU-optimized contents, usage and
-    /// pixel format, packed. Prefer the accessors below over reading this
+    /// Texture type, framebuffer/drawable flags, GPU-optimized contents, usage
+    /// and pixel format, packed. Prefer the accessors below over reading this
     /// directly; in particular bit 7 is **never written by the serializer**.
     pub packed: U32le,
     pub width: U32le,
@@ -107,30 +121,12 @@ pub struct TextureDescriptorBody {
     /// [`TextureDescriptorBody::cpu_cache_mode`] and
     /// [`TextureDescriptorBody::hazard_tracking_mode`].
     pub resource_options: U16le,
-    /// Read zero on every descriptor observed so far, so its meaning is
-    /// unsettled. The Objective-C encoding says a `u64` lives here, so this is
-    /// a real field that has not been made to move — not padding. The oracle's
-    /// written-bit measurement confirms the serializer does write all eight
-    /// bytes, so it is a zero the serializer chose rather than one it left.
+    /// Private texture-descriptor `protectionOptions` value.
     ///
-    /// Tried and still zero: the heap-placed form, which embeds this same body
-    /// (`heap_texture_baseline`, and see [`crate::ops::heap_texture`]); the
-    /// IOSurface-backed form, which was the last plausible way to move it and
-    /// carries its plane in a field of its own instead (see
-    /// [`crate::ops::backed_texture`]); and the wide descriptor, where the same
-    /// eight bytes sit in the same place relative to their neighbours and read
-    /// zero across the whole perturbation set. **That experiment is spent, not
-    /// pending** — do not re-run it.
-    ///
-    /// Nothing left in this crate's reach would settle it. `reims-vgpu`'s
-    /// ported decoder calls this word `protection_options` and refuses a
-    /// non-zero one, which is a reading this crate has no evidence for either
-    /// way; that device carries the same caveat at its own read site. Settling
-    /// it needs a serializer driven from something that sets a protection
-    /// option, and the only place this protocol is known to carry one is the
-    /// segment envelope (`ProtectionOptionsEnvelope`, [`crate::ops::segment`]),
-    /// which is a different record entirely.
-    pub unidentified_u64: U64le,
+    /// An independent `setProtectionOptions:` perturbation moved exactly these
+    /// eight bytes in both narrow and wide records. Resource index, rotation,
+    /// and sparse-surface-default perturbations left them unchanged.
+    pub protection_options: U64le,
 }
 
 // SAFETY: every field is an align-1 all-bytes-valid `le` scalar, so the struct
@@ -175,27 +171,20 @@ impl TextureDescriptorBody {
         self.packed.get() & (1 << 6) != 0
     }
 
-    /// `packed[5:4]` — two 1-bit fields the Objective-C encoding declares and
-    /// that no perturbation has moved.
+    /// `packed[4]` — the descriptor's private `framebufferOnly` property.
     ///
-    /// Read `0b00` on every descriptor observed, across type, format, usage,
-    /// geometry, mip count, sample count, array length, storage mode, cache
-    /// mode, hazard tracking and compression type. Naming them would be
-    /// inventing a contract.
-    ///
-    /// This used to be `packed[7:4]`, which was wrong twice over: bit 6 is
-    /// `allowGPUOptimizedContents` and bit 7 is never written at all. See the
-    /// module doc.
-    ///
-    /// To settle them: `reims-vgpu`'s ported descriptor decoder calls bits 4
-    /// and 5 `framebuffer_only` and `is_drawable`, which is a plausible reading
-    /// this crate cannot check, because neither is an `MTLTextureDescriptor`
-    /// property — `framebufferOnly` lives on `MTLTexture` and a drawable's
-    /// texture comes from `CAMetalLayer`. Settling them needs a serializer
-    /// driven from a layer's drawable rather than from a descriptor.
+    /// Setting only that property moved the packed byte from `0xc2` to `0xd2`.
     #[inline]
-    pub fn unidentified_flags(&self) -> u8 {
-        ((self.packed.get() >> 4) & 0x3) as u8
+    pub fn framebuffer_only(&self) -> bool {
+        self.packed.get() & (1 << 4) != 0
+    }
+
+    /// `packed[5]` — the descriptor's private `isDrawable` property.
+    ///
+    /// Setting only that property moved the packed byte from `0xc2` to `0xe2`.
+    #[inline]
+    pub fn is_drawable(&self) -> bool {
+        self.packed.get() & (1 << 5) != 0
     }
 
     /// `MTLTextureUsage` mask, `packed[15:8]`.
@@ -228,9 +217,47 @@ impl TextureDescriptorBody {
     /// mode ordinal shifted left by 4. That matches `MTLResourceOptions`'
     /// documented storage-mode shift, so the field is a `MTLResourceOptions`
     /// word rather than a bare mode.
+    ///
+    /// # This is an announcement contract, not an access contract
+    ///
+    /// It reads like a licence to skip coherence work for `Private` — the
+    /// device would not have to keep guest pages current for a resource the
+    /// guest has declared GPU-only. It is not one. Reading the emitting
+    /// serializer says why:
+    ///
+    /// - Backing is **mode-blind**. A `Private` texture still gets page-rounded
+    ///   guest backing allocated unconditionally, exactly as `Shared` does.
+    /// - The guest still **CPU-touches** it. Create-with-contents,
+    ///   region-replace and get-bytes each memcpy through that mapping with no
+    ///   storage-mode check on the path.
+    /// - What the mode actually gates is the **announcement**: the
+    ///   modified-range notification is emitted only for `Managed`.
+    ///
+    /// So `Private` means "I will not tell you when I write this", not "I will
+    /// not write this". Treating it as the latter converts silence into a
+    /// guarantee of inaction, which is the one reading the field does not
+    /// support, and the resulting stale-page bug would be invisible at every
+    /// counter because its failure mode is content.
+    ///
+    /// The experiment that would settle it, if the question is reopened: read
+    /// the *host* deserializer for a mode-dependent branch on the backing or
+    /// the coherence path. Absence of one on the emitting side is what is
+    /// established above; the receiving side has not been read.
+    ///
+    /// # The one consumer, and why it runs the other way
+    ///
+    /// This field is read exactly once outside this crate, by
+    /// `reims_vgpu_protocol::StorageMode::from_nibble`, and every decision
+    /// downstream of it *withholds* a claim rather than skipping work. The
+    /// gather witness may call a resource's content quiet only where the guest
+    /// is obliged to announce a write to it, which is `Managed` alone; the
+    /// silent modes lose the memoization and re-read their bytes. That is the
+    /// safe direction, and it is the exact inverse of the misreading this doc
+    /// warns about above — a bug in it costs throughput, not content. Adding a
+    /// consumer that reads the mode to *avoid* work reopens the hazard.
     #[inline]
     pub fn storage_mode(&self) -> u8 {
-        ((self.resource_options.get() >> 4) & 0xf) as u8
+        storage_mode_nibble(self.resource_options.get())
     }
 
     /// `MTLCPUCacheMode`, `resource_options[3:0]`.
@@ -328,8 +355,9 @@ pub const WIDE_TEXTURE_DESCRIPTOR_LEN: usize = 40;
 #[repr(C)]
 #[derive(Debug)]
 pub struct WideTextureDescriptorBody {
-    /// Texture type and three flags. The narrow form packs `usage` and
-    /// `pixel_format` into the same word; this one does not.
+    /// Texture type, framebuffer/drawable flags, GPU-optimized contents and
+    /// write-swizzle state. The narrow form packs `usage` and `pixel_format`
+    /// into the same word; this one does not.
     ///
     /// **Bit 7 is written here and is not written in the narrow form.** The
     /// narrow `texture_baseline` comes back with a written mask of `0x7f` on
@@ -355,10 +383,9 @@ pub struct WideTextureDescriptorBody {
     pub array_length: U16le,
     /// `MTLResourceOptions`, the same word [`TextureDescriptorBody`] carries.
     pub resource_options: U16le,
-    /// The same eight bytes [`TextureDescriptorBody::unidentified_u64`]
-    /// describes, in the same place relative to the fields around it, and still
-    /// zero on every fixture.
-    pub unidentified_u64: U64le,
+    /// The same private `protectionOptions` value as
+    /// [`TextureDescriptorBody::protection_options`].
+    pub protection_options: U64le,
     /// `MTLTextureSwizzleChannels`, one `MTLTextureSwizzle` ordinal per channel
     /// in red, green, blue, alpha order.
     ///
@@ -421,21 +448,35 @@ impl WideTextureDescriptorBody {
         self.type_and_flags & (1 << 6) != 0
     }
 
-    /// `type_and_flags[7:4]` minus bit 6 — the three `b1` flags nothing moves.
-    ///
-    /// Three rather than the narrow form's two, because bit 7 is written here.
-    /// Every one reads 0 across the whole perturbation set, so naming them would
-    /// be inventing a contract; see
-    /// [`TextureDescriptorBody::unidentified_flags`] for what would settle them.
+    /// `type_and_flags[4]` — the descriptor's private `framebufferOnly` property.
     #[inline]
-    pub fn unidentified_flags(&self) -> u8 {
-        ((self.type_and_flags >> 4) & 0xf) & !0b0100
+    pub fn framebuffer_only(&self) -> bool {
+        self.type_and_flags & (1 << 4) != 0
+    }
+
+    /// `type_and_flags[5]` — the descriptor's private `isDrawable` property.
+    #[inline]
+    pub fn is_drawable(&self) -> bool {
+        self.type_and_flags & (1 << 5) != 0
+    }
+
+    /// `type_and_flags[7]` — private `writeSwizzleEnabled`.
+    ///
+    /// This bit is encoded only by the wide serializer. The narrow serializer
+    /// leaves the corresponding bit unwritten.
+    #[inline]
+    pub fn write_swizzle_enabled(&self) -> bool {
+        self.type_and_flags & (1 << 7) != 0
     }
 
     /// `MTLStorageMode`, `resource_options[7:4]`.
+    ///
+    /// See [`TextureDescriptorBody::storage_mode`] for the derivation and for
+    /// why this field is an announcement contract rather than an access one —
+    /// it is not a licence to skip coherence work for `Private`.
     #[inline]
     pub fn storage_mode(&self) -> u8 {
-        ((self.resource_options.get() >> 4) & 0xf) as u8
+        storage_mode_nibble(self.resource_options.get())
     }
 
     /// `MTLCPUCacheMode`, `resource_options[3:0]`.
@@ -595,7 +636,9 @@ mod tests {
         let t = new_texture_wide(&o).expect("fits");
         assert_eq!(t.object_ref.get(), 3);
         assert_eq!(t.desc.texture_type(), 2);
-        assert_eq!(t.desc.unidentified_flags(), 0);
+        assert!(!t.desc.framebuffer_only());
+        assert!(!t.desc.is_drawable());
+        assert!(!t.desc.write_swizzle_enabled());
         assert!(t.desc.allow_gpu_optimized_contents());
         assert_eq!(t.desc.pixel_format.get(), 80);
         assert_eq!(t.desc.usage.get(), 5);
@@ -628,17 +671,17 @@ mod tests {
     /// that folded the two into one accessor would report a flag that is
     /// sometimes noise.
     #[test]
-    fn the_wide_form_writes_the_flag_bit_the_narrow_form_leaves_alone() {
+    fn the_wide_form_alone_exposes_write_swizzle_enabled() {
         let narrow = synth(0x0050_05c2, 0x1111, 0x2222, 1, 1, 1, 1, 0x0020);
         let o = op(&narrow, 0).expect("well formed");
         let n = new_texture(&o).expect("fits");
         // 0xc2's bit 7 is set and the narrow accessor must not carry it into
         // any field it names.
         assert_eq!(n.desc.texture_type(), 2);
-        assert_eq!(n.desc.unidentified_flags(), 0b00);
+        assert!(!n.desc.framebuffer_only());
+        assert!(!n.desc.is_drawable());
 
-        // The wide accessor spans four bits rather than two, and masks out the
-        // one that has a meaning.
+        // The wide accessor may read bit 7 because that form writes it.
         for raw in [0x42u8, 0xc2] {
             let mut b = [0u8; NEW_TEXTURE_WIDE_TOTAL_LEN as usize];
             b[0..4].copy_from_slice(&OPCODE_NEW_TEXTURE_WIDE.to_le_bytes());
@@ -648,8 +691,9 @@ mod tests {
             let w = new_texture_wide(&o).expect("fits");
             assert_eq!(w.desc.texture_type(), 2);
             assert!(w.desc.allow_gpu_optimized_contents());
-            let want = if raw == 0xc2 { 0b1000 } else { 0 };
-            assert_eq!(w.desc.unidentified_flags(), want);
+            assert_eq!(w.desc.write_swizzle_enabled(), raw == 0xc2);
+            assert!(!w.desc.framebuffer_only());
+            assert!(!w.desc.is_drawable());
         }
     }
 
@@ -666,7 +710,8 @@ mod tests {
 
         assert_eq!(t.object_ref.get(), 1);
         assert_eq!(t.desc.texture_type(), 2);
-        assert_eq!(t.desc.unidentified_flags(), 0b00);
+        assert!(!t.desc.framebuffer_only());
+        assert!(!t.desc.is_drawable());
         assert!(t.desc.allow_gpu_optimized_contents());
         assert_eq!(t.desc.usage(), 5);
         assert_eq!(t.desc.pixel_format(), 80);
@@ -687,7 +732,8 @@ mod tests {
         let o = op(&flipped, 0).expect("well formed");
         let f = new_texture(&o).expect("fits");
         assert_eq!(f.desc.texture_type(), t.desc.texture_type());
-        assert_eq!(f.desc.unidentified_flags(), t.desc.unidentified_flags());
+        assert_eq!(f.desc.framebuffer_only(), t.desc.framebuffer_only());
+        assert_eq!(f.desc.is_drawable(), t.desc.is_drawable());
         assert_eq!(
             f.desc.allow_gpu_optimized_contents(),
             t.desc.allow_gpu_optimized_contents()
@@ -736,9 +782,10 @@ mod tests {
         let base = synth(0x0050_05c2, 8, 8, 1, 1, 1, 1, 0);
         let o = op(&base, 0).expect("well formed");
         let b = new_texture(&o).expect("fits");
-        let (ty, fl, us, fmt, gpu) = (
+        let (ty, framebuffer, drawable, us, fmt, gpu) = (
             b.desc.texture_type(),
-            b.desc.unidentified_flags(),
+            b.desc.framebuffer_only(),
+            b.desc.is_drawable(),
             b.desc.usage(),
             b.desc.pixel_format(),
             b.desc.allow_gpu_optimized_contents(),
@@ -749,6 +796,8 @@ mod tests {
             (0x0050_01c2, "usage"),
             (0x0046_05c2, "format"),
             (0x0050_0582, "gpu_optimized_contents"),
+            (0x0050_05d2, "framebuffer_only"),
+            (0x0050_05e2, "is_drawable"),
         ] {
             let buf = synth(packed, 8, 8, 1, 1, 1, 1, 0);
             let o = op(&buf, 0).expect("well formed");
@@ -758,16 +807,13 @@ mod tests {
                 t.desc.usage() != us,
                 t.desc.pixel_format() != fmt,
                 t.desc.allow_gpu_optimized_contents() != gpu,
+                t.desc.framebuffer_only() != framebuffer,
+                t.desc.is_drawable() != drawable,
             ];
             assert_eq!(
                 moved.iter().filter(|m| **m).count(),
                 1,
                 "{label} perturbation moved more than its own field"
-            );
-            assert_eq!(
-                t.desc.unidentified_flags(),
-                fl,
-                "{label} disturbed the flags"
             );
         }
     }

@@ -218,7 +218,15 @@ def send_button(qmp: Qmp, down: bool):
     )
 
 
-def drag(qmp: Qmp, points, width: int, height: int, steps: int = 8, hold_s: float = 0.02):
+def drag(
+    qmp: Qmp,
+    points,
+    width: int,
+    height: int,
+    steps: int = 8,
+    hold_s: float = 0.02,
+    release_hold_s: float = 0.0,
+):
     """Press left button at points[0], glide through the rest (button held),
     release at the last. Interpolates `steps` sub-moves per segment so the guest
     sees a continuous drag (rubber-band selection), not two teleports."""
@@ -233,6 +241,8 @@ def drag(qmp: Qmp, points, width: int, height: int, steps: int = 8, hold_s: floa
             y = y0 + (y1 - y0) * s // steps
             send_pointer(qmp, x, y, width, height)
             time.sleep(hold_s)
+    if release_hold_s > 0:
+        time.sleep(release_hold_s)
     send_button(qmp, False)
 
 
@@ -349,8 +359,20 @@ def main(argv: list[str]) -> int:
         # (steps * hold_s per segment) the two cannot be told apart.
         steps = int(os.environ.get("QMP_DRAG_STEPS", "8"))
         hold_s = float(os.environ.get("QMP_DRAG_HOLD_S", "0.02"))
-        drag(qmp, points, w, h, steps=steps, hold_s=hold_s)
-        print(f"drag {points} steps={steps} hold_s={hold_s} ok")
+        release_hold_s = float(os.environ.get("QMP_DRAG_RELEASE_HOLD_S", "0"))
+        drag(
+            qmp,
+            points,
+            w,
+            h,
+            steps=steps,
+            hold_s=hold_s,
+            release_hold_s=release_hold_s,
+        )
+        print(
+            f"drag {points} steps={steps} hold_s={hold_s} "
+            f"release_hold_s={release_hold_s} ok"
+        )
         return 0
 
     if mode == "wheel":

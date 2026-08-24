@@ -6,20 +6,14 @@
 # branch host-reims-vgpu-vmapple) into vendor/qemu/build/qemu-system-<arch>.
 #
 # Targets:
-#   aarch64  — arm macOS guest rail for vm/boot-arm64.sh (macOS + HVF + Cocoa).
-#              Use --backend metal for host Metal or --backend vulkan for
-#              metal2vulkan through MoltenVK. Default target on Darwin.
-#   x86_64   — x86 macOS guest rail for vm/boot-x86.sh. Use --backend vulkan
-#              for metal2vulkan on the Linux host. Default target on Linux.
+#   aarch64  — arm macOS guest rail using Vulkan through MoltenVK.
+#   x86_64   — x86 macOS guest rail using the host's native Vulkan ICD.
 #
 # The vmapple enablement (RFC v7 patches 1-6; patch 7 excluded -- it needs SIP
 # disabled) is committed IN the submodule, so this script does not clone or
 # patch: future device work commits directly in vendor/qemu.
 #
-# Product device reims-vgpu-mmio links crates/reims-vgpu (Cargo staticlib). Backend
-# is selected at configure/build time via --backend metal|vulkan and baked into
-# the binary — never a runtime env sniff inside the device.
-# Metal is Apple-only; non-Apple hosts use the Vulkan backend.
+# Product device reims-vgpu-mmio links the Vulkan-only crates/reims-vgpu staticlib.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -27,13 +21,6 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 QEMU_SRC="$REPO_ROOT/vendor/qemu"
 # Vulkan paths: public metal2vulkan crate + in-crate ash engine. On macOS this
 # uses MoltenVK through the Vulkan loader; on Linux it uses the native ICD.
-# Metal is for Darwin (or intentional host stubs on Linux). Default follows host OS.
-if [ -z "${REIMS_VGPU_BACKEND:-}" ]; then
-  case "$(uname -s)" in
-    Darwin) REIMS_VGPU_BACKEND=metal ;;
-    *)      REIMS_VGPU_BACKEND=vulkan ;;
-  esac
-fi
 # Empty → auto: aarch64 on Darwin, x86_64 on Linux.
 QEMU_TARGET="${QEMU_TARGET:-}"
 
@@ -53,20 +40,14 @@ while [ "$#" -gt 0 ]; do
       cat <<'EOF'
 usage: scripts/qemu-build/qemu-build.sh [options]
 
-Build vendor/qemu (reims-vgpu-mmio + reims-vgpu for the selected target/backend).
+Build vendor/qemu (reims-vgpu-mmio + reims-vgpu for the selected target).
 
   --target aarch64|x86_64  softmmu target (default: aarch64 on Darwin, x86_64
                            on Linux). Env: QEMU_TARGET.
-  --backend metal|vulkan   host GPU backend linked into reims-vgpu-mmio.
-                           Defaults by host OS. Baked at build time. Env: REIMS_VGPU_BACKEND.
-                           On non-Apple hosts, metal = Rust host stubs (linkable;
-                           encode Unsupported until filled in).
-
 Examples:
   scripts/qemu-build/qemu-build.sh
-  scripts/qemu-build/qemu-build.sh --target aarch64 --backend metal
-  scripts/qemu-build/qemu-build.sh --target aarch64 --backend vulkan
-  scripts/qemu-build/qemu-build.sh --target x86_64 --backend vulkan
+  scripts/qemu-build/qemu-build.sh --target aarch64
+  scripts/qemu-build/qemu-build.sh --target x86_64
 EOF
       exit 0
       ;;
@@ -81,19 +62,6 @@ EOF
       ;;
     --target=*)
       QEMU_TARGET="${1#--target=}"
-      shift
-      ;;
-    --backend)
-      shift
-      REIMS_VGPU_BACKEND="${1:-}"
-      if [ -z "$REIMS_VGPU_BACKEND" ]; then
-        echo "[qemu-build] ERROR: --backend needs metal|vulkan" >&2
-        exit 1
-      fi
-      shift
-      ;;
-    --backend=*)
-      REIMS_VGPU_BACKEND="${1#--backend=}"
       shift
       ;;
     *)
@@ -123,27 +91,8 @@ case "$QEMU_TARGET" in
     ;;
 esac
 
-case "$REIMS_VGPU_BACKEND" in
-  metal|vulkan) ;;
-  *)
-    echo "[qemu-build] ERROR: unknown backend '$REIMS_VGPU_BACKEND' (metal | vulkan)" >&2
-    exit 1
-    ;;
-esac
-
-# Three supported arms: Metal on Apple, Vulkan/MoltenVK on Apple, Vulkan/native
-# on Linux. backend-metal off Apple has no Metal to call and is a compile_error!
-# in crates/reims-vgpu/src/lib.rs; catch it here so the message is about the build
-# choice rather than a rustc error inside meson.
-if [ "$REIMS_VGPU_BACKEND" = metal ] && [ "$(uname -s)" != Darwin ]; then
-  echo "[qemu-build] ERROR: --backend metal requires macOS (no host-stub Metal arm)" >&2
-  echo "[qemu-build]        use --backend vulkan on this host" >&2
-  exit 1
-fi
-
-export REIMS_VGPU_BACKEND
 echo "[qemu-build] target=$QEMU_TARGET"
-echo "[qemu-build] REIMS_VGPU_BACKEND=$REIMS_VGPU_BACKEND (reims-vgpu-mmio → reims-vgpu)"
+echo "[qemu-build] backend=vulkan (reims-vgpu-mmio → reims-vgpu)"
 
 # Product aarch64 path needs macOS (HVF + Cocoa). Fail early with a clear message.
 if [ "$QEMU_TARGET" = aarch64 ] && [ "$(uname -s)" != Darwin ]; then
@@ -153,7 +102,7 @@ if [ "$QEMU_TARGET" = aarch64 ] && [ "$(uname -s)" != Darwin ]; then
 fi
 
 # Prefer a known cargo if PATH is minimal (agent shells). Always needed: both
-# targets link libreims_vgpu.a (metal host stubs on non-Apple).
+# targets link libreims_vgpu.a.
 if ! command -v cargo >/dev/null 2>&1; then
   if [ -x "$HOME/.cargo/bin/cargo" ]; then
     export PATH="$HOME/.cargo/bin:$PATH"
@@ -186,14 +135,11 @@ fi
 # staticlib whose counters nothing ever wrote out — and reported every function
 # in the crate as never having run. The path and not just a flag, because a
 # different clang major is a different archive.
-STAMP_WANTED="${QEMU_TARGET}:${REIMS_VGPU_BACKEND}:reims-vgpu-crates:cov=${REIMS_VGPU_COVERAGE:-off}"
+STAMP_WANTED="${QEMU_TARGET}:vulkan-only:reims-vgpu-crates:cov=${REIMS_VGPU_COVERAGE:-off}"
 if [ -f "build/build.ninja" ]; then
   prev=""
   if [ -f "build/qemu-build.stamp" ]; then
     prev="$(cat build/qemu-build.stamp)"
-  elif [ -f "build/reims-vgpu-backend.stamp" ]; then
-    # Pre-x86 script only stamped the backend and always built aarch64.
-    prev="aarch64:$(cat build/reims-vgpu-backend.stamp)"
   fi
   if [ "$prev" != "$STAMP_WANTED" ]; then
     echo "[qemu-build] build stamp changed ($prev -> $STAMP_WANTED); reconfiguring ..."
@@ -201,14 +147,6 @@ if [ -f "build/build.ninja" ]; then
   fi
 fi
 
-# The backend travels as a meson option and not only as an exported variable.
-# Meson re-runs its build files whenever ninja finds them out of date, and that
-# regeneration inherits ninja's environment rather than this script's — so a
-# tree configured here for Vulkan silently became a Metal one the next time any
-# meson.build changed, and the boot that followed died in twenty Rust errors
-# from an Apple-only arm on a Linux host. An option is stored in the build
-# directory and survives regeneration.
-REIMS_VGPU_MESON_OPT="-Dreims_vgpu_backend=$REIMS_VGPU_BACKEND"
 if [ ! -f "build/build.ninja" ]; then
   case "$QEMU_TARGET" in
     aarch64)
@@ -220,8 +158,7 @@ if [ ! -f "build/build.ninja" ]; then
         --disable-docs \
         --disable-bsd-user \
         --disable-linux-user \
-        --disable-tools \
-        "$REIMS_VGPU_MESON_OPT"
+        --disable-tools
       ;;
     x86_64)
       echo "[qemu-build] configuring (x86_64-softmmu, no hvf/cocoa) ..."
@@ -232,20 +169,17 @@ if [ ! -f "build/build.ninja" ]; then
         --disable-docs \
         --disable-bsd-user \
         --disable-linux-user \
-        --disable-tools \
-        "$REIMS_VGPU_MESON_OPT"
+        --disable-tools
       ;;
   esac
 else
   echo "[qemu-build] already configured; skipping configure."
 fi
 printf '%s\n' "$STAMP_WANTED" > build/qemu-build.stamp
-# Keep the legacy stamp so older tooling that only checks REIMS_VGPU_BACKEND still works.
-printf '%s\n' "$REIMS_VGPU_BACKEND" > build/reims-vgpu-backend.stamp
 
 # --- Build ----------------------------------------------------------------------
 QEMU_BIN="$QEMU_SRC/build/qemu-system-${QEMU_TARGET}"
-echo "[qemu-build] building qemu-system-${QEMU_TARGET} (links reims-vgpu / $REIMS_VGPU_BACKEND) ..."
+echo "[qemu-build] building qemu-system-${QEMU_TARGET} (links reims-vgpu / Vulkan) ..."
 ninja -C build "qemu-system-${QEMU_TARGET}"
 
 # --- Verify (target-specific) ---------------------------------------------------
@@ -267,7 +201,7 @@ case "$QEMU_TARGET" in
     "$QEMU_BIN" --version | head -1
     echo "[qemu-build] vmapple present:"
     "$QEMU_BIN" -M help | grep -i vmapple || { echo "  ERROR: vmapple not listed" >&2; exit 1; }
-    echo "[qemu-build] backend=$REIMS_VGPU_BACKEND (gfx-device: apple-gfx-mmio | reims-vgpu-mmio)"
+    echo "[qemu-build] backend=vulkan (gfx-device: apple-gfx-mmio | reims-vgpu-mmio)"
     ;;
   x86_64)
     echo
@@ -275,7 +209,7 @@ case "$QEMU_TARGET" in
     "$QEMU_BIN" --version | head -1
     # SysBus devices are not always listed in plain `-device help`; probe type.
     if "$QEMU_BIN" -device reims-vgpu-mmio,help >/dev/null 2>&1; then
-      echo "[qemu-build] reims-vgpu-mmio device: present (reims-vgpu / $REIMS_VGPU_BACKEND linked)"
+      echo "[qemu-build] reims-vgpu-mmio device: present (reims-vgpu / Vulkan linked)"
     else
       echo "[qemu-build] WARNING: reims-vgpu-mmio type not registered" >&2
     fi
@@ -289,7 +223,7 @@ case "$QEMU_TARGET" in
     else
       echo "[qemu-build] kvm accel: not listed (TCG-only; install/enable KVM if you need it)"
     fi
-    echo "[qemu-build] backend=$REIMS_VGPU_BACKEND (reims-vgpu staticlib linked)"
+    echo "[qemu-build] backend=vulkan (reims-vgpu staticlib linked)"
     echo "[qemu-build] for vm/boot-x86.sh: QEMU_BIN=$QEMU_BIN vm/boot-x86.sh ..."
     ;;
 esac

@@ -7,7 +7,7 @@
 //! surface is the same shape on a build without the feature.
 //!
 //! `use super::*` rather than a named import list, for the reason
-//! `crate::runtime::draw::vulkan` gives: this is a chapter of the crate root that was
+//! `crate::runtime::draw::execution` gives: this is a chapter of the crate root that was
 //! lifted out whole, and it reaches back for the registry (`DEVICES`,
 //! `device_slot`, `BoundDevice`) that is the root's own job to own. Naming
 //! forty root items here would make the move look like a redesign and would go
@@ -34,17 +34,17 @@ type WindowFrameKey = (u32, u32, u32, u64);
 #[cfg(feature = "host-window")]
 pub(super) fn window_frame_key(present: &crate::model::PresentState) -> WindowFrameKey {
     #[cfg(target_os = "macos")]
-    let present_epoch = present.present_epoch;
+    let present_epoch = present.present_epoch();
     #[cfg(not(target_os = "macos"))]
     let present_epoch = 0;
     (
-        present.frame_mapping,
-        present.frame_generation,
-        // The pixel stamp beside the page stamp. A lazy type-11 Store publishes
+        present.frame().mapping(),
+        present.frame().generation(),
+        // The pixel stamp beside the page stamp. A lazy IOSurface texture Store publishes
         // a new frame without writing a guest page, so `frame_generation` holds
         // still across frames that genuinely differ and this is the only term
         // that moves — see `PresentState::frame_content_epoch`.
-        present.frame_content_epoch,
+        present.frame().content_epoch(),
         present_epoch,
     )
 }
@@ -118,9 +118,15 @@ pub(crate) struct EarlyFb {
 /// [`publish_window_frame`], called by the drain. Idempotent; `true` on success.
 #[cfg(feature = "host-window")]
 pub fn device_window_start(id: u64, width: u32, height: u32) -> bool {
-    use crate::host_window::present::{FrameSlot, InputSink, WindowConfig, WindowMode, WindowWaker};
+    use crate::host_window::present::{
+        FrameSlot, InputSink, WindowConfig, WindowMode, WindowWaker,
+    };
     let Some(slot) = device_slot(id) else {
         return false;
+    };
+    let executor = {
+        let inner = slot.inner.lock();
+        Arc::clone(&inner.device.executor)
     };
     let mut link = slot.window.lock();
     if link.is_some() {
@@ -175,13 +181,16 @@ pub fn device_window_start(id: u64, width: u32, height: u32) -> bool {
         let exited: crate::host_window::present::ExitedFlag =
             Arc::new(std::sync::atomic::AtomicBool::new(false));
         if let Err(error) = crate::host_window::present::start_main_thread(
-            id,
-            cfg,
-            on_input,
-            Arc::clone(&frames),
-            Arc::clone(&stop),
-            Arc::clone(&exited),
-            Arc::clone(&wake),
+            crate::host_window::present::MainThreadWindowStart {
+                id,
+                executor: Arc::clone(&executor),
+                config: cfg,
+                on_input,
+                frames: Arc::clone(&frames),
+                stop: Arc::clone(&stop),
+                exited: Arc::clone(&exited),
+                wake: Arc::clone(&wake),
+            },
         ) {
             crate::observe::Emit::decline("host_window_start", &error)
                 .field("id", id)
@@ -192,6 +201,7 @@ pub fn device_window_start(id: u64, width: u32, height: u32) -> bool {
     };
     #[cfg(not(target_os = "macos"))]
     let thread = Some(crate::host_window::present::spawn(
+        executor,
         cfg,
         on_input,
         Arc::clone(&frames),
@@ -257,19 +267,15 @@ pub fn device_window_run_main(_id: u64) -> bool {
 /// drain worker under no device lock of its own (its own small mutex), so it
 /// never contends the render tranche. Latest-wins.
 #[cfg(feature = "host-window")]
-pub(crate) fn publish_window_frame(slot: &BoundDevice, state: &mut crate::model::DeviceState) {
+pub(crate) fn publish_window_frame(slot: &BoundDevice, state: &mut crate::runtime::Device) {
     use crate::runtime::drain::{note_window_publish, WindowPublish};
     let mut guard = slot.window.lock();
     let Some(link) = guard.as_mut() else {
-        // No window consumes the capture: revert the next capture to the full
-        // readback path (a torn-down window must not leave `frame_bgra` stale
-        // behind an unreset `display_from_resident`).
-        state.present.display_from_resident = false;
         note_window_publish(WindowPublish::NoWindow);
         return;
     };
-    let p = &state.present;
-    if !p.frame_valid || p.frame_width == 0 || p.frame_height == 0 {
+    let p = &state.presentation.present;
+    if !p.frame().is_valid() || p.frame().width() == 0 || p.frame().height() == 0 {
         note_window_publish(WindowPublish::NoFrame);
         return;
     }
@@ -280,13 +286,13 @@ pub(crate) fn publish_window_frame(slot: &BoundDevice, state: &mut crate::model:
     }
     note_window_publish(WindowPublish::Fresh);
     // Copied out rather than held behind `p`: the branches below assign
-    // `state.present.display_from_resident`, and the frame bytes are the only
+    // the capture policy's resident-carried state, and the frame bytes are the only
     // thing that still has to be read through the borrow.
     let (mapping, width, height, generation) = (
-        p.frame_mapping,
-        p.frame_width,
-        p.frame_height,
-        p.frame_generation,
+        p.frame().mapping(),
+        p.frame().width(),
+        p.frame().height(),
+        p.frame().generation(),
     );
     let need = (width as usize)
         .saturating_mul(height as usize)
@@ -299,27 +305,23 @@ pub(crate) fn publish_window_frame(slot: &BoundDevice, state: &mut crate::model:
     // One engine operation keeps this resident alive across the idle sweep,
     // reclaims aged peers, and returns the direct-present decision for this
     // exact identity and geometry.
-    let resident_present = crate::backend::vulkan::engine::prepare_window_resident_present(
-        &present_identity,
-        width,
-        height,
-    );
+    let resident_source = reims_vgpu_core::PresentationSource::new(present_identity, width, height);
+    let resident_present = state
+        .executor
+        .prepare_window_resident_present(&resident_source);
     // The window presenting from the engine's own device can take the resident
-    // as it stands, so the frame never crosses host memory. `display_from_resident`
-    // is what tells the NEXT capture not to read it back, and it is only set
-    // when a resident actually carried this one.
-    if crate::backend::vulkan::engine::window_present_attached() && resident_present.is_ok()
-    {
-        let resident_source = crate::backend::vulkan::engine::WindowPresentSource {
-            width,
-            height,
-            identity: present_identity,
-        };
-        let published = window_write_frame(link, width, height, Vec::new(), Some(resident_source));
+    // as it stands, so the frame never crosses host memory. Capture already
+    // prepared this exact source and selected the current present's route;
+    // this second preparation is idempotent and keeps publication independently
+    // fail-closed if the presenter disappeared between the two operations.
+    if let Ok(resident_source) = resident_present {
+        let published = window_write_frame(
+            link,
+            crate::host_window::present::FramePayload::Resident(resident_source),
+        );
         crate::runtime::census::present_proxy::window_publish::note(published);
         if published {
             link.last = key;
-            state.present.display_from_resident = true;
         }
         return;
     }
@@ -327,18 +329,15 @@ pub(crate) fn publish_window_frame(slot: &BoundDevice, state: &mut crate::model:
     // copies the whole framebuffer through host memory on every frame and the
     // difference between the two is the window's frame rate. Silence here is
     // what let `direct_frac` sit at 0.00 for a whole boot with no cause named.
-    if !crate::backend::vulkan::engine::window_present_attached() {
-        crate::runtime::drain::note_store_route("winpub_window_not_attached");
-    } else if let Err(route) = resident_present {
-        crate::runtime::drain::note_store_route(route);
+    if let Err(route) = resident_present {
+        crate::runtime::drain::note_store_route(route.slug());
     }
     // No resident carries this present (firmware framebuffer, a mapping the
     // compositor cleared but never rendered into, the frames after a device
     // reset), or the window is driving its own device because the engine's
-    // cannot present to this surface. Either way the window needs CPU pixels,
-    // and the next capture must read them back.
-    state.present.display_from_resident = false;
-    if state.present.frame_bgra.len() < need {
+    // cannot present to this surface. Either way this present requires the CPU
+    // frame captured for it.
+    if state.presentation.present.frame().pixels().len() < need {
         // No usable CPU frame: nothing to publish. Reachable via keep-prior
         // when a capture FAILS at a new/larger geometry (dims advanced, the
         // buffer kept the smaller prior), and on the present right after a
@@ -356,7 +355,7 @@ pub(crate) fn publish_window_frame(slot: &BoundDevice, state: &mut crate::model:
                 mapping,
                 width,
                 height,
-                state.present.frame_bgra.len(),
+                state.presentation.present.frame().pixels().len(),
                 generation
             ));
         }
@@ -366,8 +365,15 @@ pub(crate) fn publish_window_frame(slot: &BoundDevice, state: &mut crate::model:
     // A well-formed frame cleared the short-buffer condition; re-arm the latch
     // so a later mismatch at the same geometry logs again.
     link.bgra_short_geom = None;
-    let bgra = state.present.frame_bgra[..need].to_vec();
-    let published = window_write_frame(link, width, height, bgra, None);
+    let bgra = state.presentation.present.frame().pixels()[..need].to_vec();
+    let published = window_write_frame(
+        link,
+        crate::host_window::present::FramePayload::CpuBgra {
+            bgra,
+            width,
+            height,
+        },
+    );
     crate::runtime::census::present_proxy::window_publish::note(published);
     if published {
         link.last = key;
@@ -387,18 +393,12 @@ pub(crate) fn publish_window_frame(slot: &BoundDevice, state: &mut crate::model:
 #[cfg(feature = "host-window")]
 fn window_write_frame(
     link: &mut WindowLink,
-    width: u32,
-    height: u32,
-    bgra: Vec<u8>,
-    resident: Option<crate::backend::vulkan::engine::WindowPresentSource>,
+    payload: crate::host_window::present::FramePayload,
 ) -> bool {
     link.seq = link.seq.wrapping_add(1);
     let frame = std::sync::Arc::new(crate::host_window::present::Frame {
         seq: link.seq,
-        width,
-        height,
-        bgra,
-        resident,
+        payload,
     });
     let stored = match link.frames.lock() {
         Ok(mut slot_frame) => {
@@ -519,7 +519,7 @@ pub(crate) fn publish_window_early_frame<
     M: crate::runtime::host::HostMemory + crate::runtime::host::HostOps,
 >(
     slot: &BoundDevice,
-    state: &crate::model::DeviceState,
+    state: &crate::runtime::Device,
     host: &M,
     now_ns: u64,
 ) {
@@ -531,7 +531,10 @@ pub(crate) fn publish_window_early_frame<
     // window while it is on the early console, never after the product present
     // owns it or a same-geom early front is latched (the drain publishes those).
     let early_latched = crate::runtime::scanout::early_scanout_target(state).is_some();
-    if !host_console_uses_bar1(state.present.frame_flush_seen, early_latched) {
+    if !host_console_uses_bar1(
+        state.presentation.present.content_boundary_crossed(),
+        early_latched,
+    ) {
         return;
     }
     // ~30 fps throttle (33 ms) on the 4 ms poll.
@@ -546,7 +549,7 @@ pub(crate) fn publish_window_early_frame<
     // Prefer the guest-programmed EFI FB (kernel-relocated console), else the
     // BAR1 GOP framebuffer the option ROM drives — the same order as C's
     // reims_vgpu_pci_copy_early_console.
-    let painted = if state.gfx.efi_fb_start != 0 {
+    let painted = if state.registers.gfx.efi_fb_start != 0 {
         crate::runtime::scanout::paint_efi_console(state, host, &mut buf, stride, w, h)
     } else {
         false
@@ -558,7 +561,14 @@ pub(crate) fn publish_window_early_frame<
     slot.early_last_ns.store(now_ns, Ordering::Relaxed);
     // Early boot frames come from the BAR1 GOP framebuffer, not a resident
     // target, so there is no resident source to hand over.
-    window_write_frame(link, w, h, buf, None);
+    window_write_frame(
+        link,
+        crate::host_window::present::FramePayload::CpuBgra {
+            bgra: buf,
+            width: w,
+            height: h,
+        },
+    );
 }
 
 /// Copy the registered BAR1 early framebuffer into `dst` (tight BGRA8). Returns

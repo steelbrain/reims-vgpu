@@ -236,7 +236,11 @@ static NSDictionary *caseFromCapture(NSString *name, NSString *cls, NSString *se
 // Everything the Rust view should report, taken from the descriptor object so
 // no Metal enum ordinal is transcribed by hand.
 static NSDictionary *expectFromTextureDescriptor(MTLTextureDescriptor *d) {
-  return @{
+  unsigned framebufferOnly = ((char (*)(id, SEL))objc_msgSend)(
+      d, sel_getUid("framebufferOnly"));
+  unsigned isDrawable = ((char (*)(id, SEL))objc_msgSend)(
+      d, sel_getUid("isDrawable"));
+  NSMutableDictionary *expect = [@{
     @"texture_type" : @((unsigned)d.textureType),
     @"usage" : @((unsigned)d.usage),
     @"pixel_format" : @((unsigned)d.pixelFormat),
@@ -248,6 +252,8 @@ static NSDictionary *expectFromTextureDescriptor(MTLTextureDescriptor *d) {
     @"array_length" : @((unsigned long long)d.arrayLength),
     @"storage_mode" : @((unsigned)d.storageMode),
     @"allow_gpu_optimized_contents" : @(d.allowGPUOptimizedContents ? 1 : 0),
+    @"framebuffer_only" : @(framebufferOnly),
+    @"is_drawable" : @(isDrawable),
     @"hazard_tracking_mode" : @((unsigned)d.hazardTrackingMode),
     @"cpu_cache_mode" : @((unsigned)d.cpuCacheMode),
     @"compression_type" : @((unsigned)d.compressionType),
@@ -259,7 +265,21 @@ static NSDictionary *expectFromTextureDescriptor(MTLTextureDescriptor *d) {
     @"swizzle_green" : @((unsigned)d.swizzle.green),
     @"swizzle_blue" : @((unsigned)d.swizzle.blue),
     @"swizzle_alpha" : @((unsigned)d.swizzle.alpha),
-  };
+  } mutableCopy];
+  expect[@"force_resource_index"] = @(((char (*)(id, SEL))objc_msgSend)(
+      d, sel_getUid("forceResourceIndex")) ? 1 : 0);
+  expect[@"write_swizzle_enabled"] = @(((char (*)(id, SEL))objc_msgSend)(
+      d, sel_getUid("writeSwizzleEnabled")) ? 1 : 0);
+  expect[@"resource_index"] = @(((unsigned long long (*)(id, SEL))objc_msgSend)(
+      d, sel_getUid("resourceIndex")));
+  expect[@"protection_options"] = @(((unsigned long long (*)(id, SEL))objc_msgSend)(
+      d, sel_getUid("protectionOptions")));
+  expect[@"rotation"] = @(((unsigned long long (*)(id, SEL))objc_msgSend)(
+      d, sel_getUid("rotation")));
+  expect[@"sparse_surface_default_value"] =
+      @(((unsigned long long (*)(id, SEL))objc_msgSend)(
+          d, sel_getUid("sparseSurfaceDefaultValue")));
+  return expect;
 }
 
 static MTLTextureDescriptor *baselineTexture(void) {
@@ -288,6 +308,48 @@ static void addTextureCase(NSMutableArray *cases, id ser, id cap, NSString *name
   if (c) [cases addObject:c];
 }
 
+/// Independently perturb the private descriptor properties that could account
+/// for the remaining written fields. `prefix` distinguishes the serializer's
+/// narrow and wide modes without changing the experiment.
+static void addPrivateTextureCases(NSMutableArray *cases, id ser, id cap,
+                                   NSString *prefix) {
+  MTLTextureDescriptor *d = baselineTexture();
+  ((void (*)(id, SEL, char))objc_msgSend)(
+      d, sel_getUid("setForceResourceIndex:"), (char)1);
+  addTextureCase(cases, ser, cap,
+                 [prefix stringByAppendingString:@"_force_resource_index"], d);
+
+  d = baselineTexture();
+  ((void (*)(id, SEL, char))objc_msgSend)(
+      d, sel_getUid("setWriteSwizzleEnabled:"), (char)1);
+  addTextureCase(cases, ser, cap,
+                 [prefix stringByAppendingString:@"_write_swizzle_enabled"], d);
+
+  d = baselineTexture();
+  ((void (*)(id, SEL, unsigned long long))objc_msgSend)(
+      d, sel_getUid("setResourceIndex:"), 0x1122334455667788ULL);
+  addTextureCase(cases, ser, cap,
+                 [prefix stringByAppendingString:@"_resource_index"], d);
+
+  d = baselineTexture();
+  ((void (*)(id, SEL, unsigned long long))objc_msgSend)(
+      d, sel_getUid("setProtectionOptions:"), 0x8877665544332211ULL);
+  addTextureCase(cases, ser, cap,
+                 [prefix stringByAppendingString:@"_protection_options"], d);
+
+  d = baselineTexture();
+  ((void (*)(id, SEL, unsigned long long))objc_msgSend)(
+      d, sel_getUid("setRotation:"), 3);
+  addTextureCase(cases, ser, cap,
+                 [prefix stringByAppendingString:@"_rotation"], d);
+
+  d = baselineTexture();
+  ((void (*)(id, SEL, unsigned long long))objc_msgSend)(
+      d, sel_getUid("setSparseSurfaceDefaultValue:"), 0x1234);
+  addTextureCase(cases, ser, cap,
+                 [prefix stringByAppendingString:@"_sparse_surface_default_value"], d);
+}
+
 // Perturbation sweep: baseline, then one property changed per case. Each is a
 // separate fixture so a layout error shows up as one failing case naming the
 // field, rather than as a diff a reader has to bisect.
@@ -307,6 +369,11 @@ static void addTextureCase(NSMutableArray *cases, id ser, id cap, NSString *name
 static void withCapability(id ser, NSString *flag, void (^body)(void)) {
   SEL getSel = sel_getUid([NSString stringWithFormat:@"supports%@", flag].UTF8String);
   SEL setSel = sel_getUid([NSString stringWithFormat:@"setSupports%@:", flag].UTF8String);
+  if (![ser respondsToSelector:getSel] || ![ser respondsToSelector:setSel]) {
+    fprintf(stderr, "capability %s is absent on this serializer; skipping\n",
+            flag.UTF8String);
+    return;
+  }
   char was = ((char (*)(id, SEL))objc_msgSend)(ser, getSel);
   fprintf(stderr, "capability %s was %d, forcing on\n", flag.UTF8String, (int)was);
   ((void (*)(id, SEL, char))objc_msgSend)(ser, setSel, (char)1);
@@ -360,7 +427,19 @@ static NSArray *textureCases(id ser, id cap) {
         MTLTextureSwizzleAlpha, MTLTextureSwizzleZero, MTLTextureSwizzleOne,
         MTLTextureSwizzleRed);
     addTextureCase(cases, ser, cap, @"texture_swizzled_permuted", sw);
+
+    MTLTextureDescriptor *framebuffer = baselineTexture();
+    ((void (*)(id, SEL, char))objc_msgSend)(
+        framebuffer, sel_getUid("setFramebufferOnly:"), (char)1);
+    addTextureCase(cases, ser, cap, @"texture_swizzled_framebuffer_only", framebuffer);
+    MTLTextureDescriptor *drawable = baselineTexture();
+    ((void (*)(id, SEL, char))objc_msgSend)(
+        drawable, sel_getUid("setIsDrawable:"), (char)1);
+    addTextureCase(cases, ser, cap, @"texture_swizzled_is_drawable", drawable);
+    addPrivateTextureCases(cases, ser, cap, @"texture_swizzled");
   });
+
+  addPrivateTextureCases(cases, ser, cap, @"texture");
 
   d = baselineTexture(); d.width = 0x3333;
   addTextureCase(cases, ser, cap, @"texture_width", d);
@@ -391,12 +470,18 @@ static NSArray *textureCases(id ser, id cap) {
   d = baselineTexture(); d.usage = MTLTextureUsageRenderTarget;
   addTextureCase(cases, ser, cap, @"texture_usage_rendertarget", d);
 
-  // The four properties `NewTextureBody::unidentified_flags` and
-  // `resource_options_raw` name as the experiments that would settle them.
+  // These properties independently attribute the remaining packed descriptor
+  // fields and the resource-options aggregate.
   // Each defaults to something other than the value set here, so each is a real
   // perturbation rather than a restatement of the baseline.
   d = baselineTexture(); d.allowGPUOptimizedContents = NO;
   addTextureCase(cases, ser, cap, @"texture_no_gpu_optimized_contents", d);
+  d = baselineTexture();
+  ((void (*)(id, SEL, char))objc_msgSend)(d, sel_getUid("setFramebufferOnly:"), (char)1);
+  addTextureCase(cases, ser, cap, @"texture_framebuffer_only", d);
+  d = baselineTexture();
+  ((void (*)(id, SEL, char))objc_msgSend)(d, sel_getUid("setIsDrawable:"), (char)1);
+  addTextureCase(cases, ser, cap, @"texture_is_drawable", d);
   d = baselineTexture(); d.hazardTrackingMode = MTLHazardTrackingModeUntracked;
   addTextureCase(cases, ser, cap, @"texture_hazard_untracked", d);
   d = baselineTexture(); d.hazardTrackingMode = MTLHazardTrackingModeTracked;
@@ -3680,14 +3765,34 @@ static NSArray *blitCases(id ser) {
                     enc, sel_getUid("beginSegment:protectionOptions:"), 0, 0x44);
               });
 
-  // The protection-options envelope, and the two conditions it needs.
-  //
-  // `SegmentHeader::unidentified_u8`'s doc predicted this before it was driven:
-  // "reims_vgpu::runtime::decode::stream has a whole
-  // SEGMENT_TYPE_PROTECTION_OPTIONS = 5 segment type with an Envelope
-  // disposition, so the prediction is a second segment rather than a field
-  // here". The prediction is exactly right, and the byte it was about stays
-  // unexplained.
+  // A continuation is relational state between two segment headers. The
+  // serializer writes the second header's continuation argument at +5, then
+  // asks the command stream to mark +6 in the preceding header. The capture
+  // stream is told which first header to mark so this case records both ends
+  // of that edge instead of inferring either direction from one nonzero byte.
+  addEncoderCaseSplit(cases, @"PGSerializerBlitCommandEncoder",
+                      ^id { return makeBlitEncoder(ser, stream); },
+                      @"blit_segment_continuation_pair",
+                      @"beginSegment:protectionOptions:",
+                      @[
+                        @{@"flag" : @0, @"protection_options" : @0,
+                          @"segment_type" : @2, @"continues_next" : @1},
+                        @{@"flag" : @1, @"protection_options" : @0,
+                          @"segment_type" : @2, @"continues_next" : @0},
+                      ],
+                      ^(id enc) {
+                        [stream setContinuationTarget:nil];
+                        ((void (*)(id, SEL, char, unsigned long))objc_msgSend)(
+                            enc, sel_getUid("beginSegment:protectionOptions:"), 0, 0);
+                        [stream setContinuationTarget:gArena + gOpOff[0]];
+                        ((void (*)(id, SEL, char, unsigned long))objc_msgSend)(
+                            enc, sel_getUid("beginSegment:protectionOptions:"), 1, 0);
+                        [stream setContinuationTarget:nil];
+                      });
+
+  // The protection-options envelope, and the two conditions it needs. The
+  // options arrive as a second segment rather than in either continuation
+  // byte of the ordinary segment header.
   //
   // Four cases, because two variables move and one observation of each cannot
   // separate them. The envelope needs the BOOL **clear** and the options
@@ -5297,7 +5402,7 @@ static void addCreationCase(NSMutableArray *cases, NSString *name, NSString *sel
 /// Metal normalizes some of these on the way in, so this runs *after* the
 /// properties are set and takes what Metal kept, not what it was handed.
 static NSMutableDictionary *expectFromSamplerDescriptor(MTLSamplerDescriptor *d) {
-  return [@{
+  NSMutableDictionary *expect = [@{
     @"min_filter" : @((unsigned)d.minFilter),
     @"mag_filter" : @((unsigned)d.magFilter),
     @"mip_filter" : @((unsigned)d.mipFilter),
@@ -5313,6 +5418,21 @@ static NSMutableDictionary *expectFromSamplerDescriptor(MTLSamplerDescriptor *d)
     @"normalized_coordinates" : @(d.normalizedCoordinates ? 1 : 0),
     @"support_argument_buffers" : @(d.supportArgumentBuffers ? 1 : 0),
   } mutableCopy];
+  expect[@"force_resource_index"] = @(((char (*)(id, SEL))objc_msgSend)(
+      d, sel_getUid("forceResourceIndex")) ? 1 : 0);
+  expect[@"force_seams_on_cubemap_filtering"] = @(((char (*)(id, SEL))objc_msgSend)(
+      d, sel_getUid("forceSeamsOnCubemapFiltering")) ? 1 : 0);
+  expect[@"resource_index"] = @(((unsigned long long (*)(id, SEL))objc_msgSend)(
+      d, sel_getUid("resourceIndex")));
+  expect[@"pixel_format"] = @(((unsigned long long (*)(id, SEL))objc_msgSend)(
+      d, sel_getUid("pixelFormat")));
+  expect[@"reduction_mode"] = @(((unsigned long long (*)(id, SEL))objc_msgSend)(
+      d, sel_getUid("reductionMode")));
+  expect[@"lod_bias"] = @(((float (*)(id, SEL))objc_msgSend)(
+      d, sel_getUid("lodBias")));
+  expect[@"border_color_spi"] = @(((unsigned long long (*)(id, SEL))objc_msgSend)(
+      d, sel_getUid("borderColorSPI")));
+  return expect;
 }
 
 /// Baseline sampler: Metal's own defaults, with one landmark.
@@ -5380,6 +5500,24 @@ static MTLDepthStencilDescriptor *baselineDepthStencil(void) {
   return d;
 }
 
+/// Clear one object slot in the descriptor-private structure after checking
+/// that the runtime still declares the expected object/object prefix. Public
+/// setters normalize `nil` back to a default face and cannot drive this state.
+static BOOL forceDepthStencilFaceAbsent(MTLDepthStencilDescriptor *d, unsigned face) {
+  SEL privateSel = sel_getUid("depthStencilPrivate");
+  Method method = class_getInstanceMethod(object_getClass(d), privateSel);
+  const char *encoding = method ? method_getTypeEncoding(method) : NULL;
+  if (!encoding || !strstr(encoding, "DepthStencilDescriptorPrivate=@@")) {
+    fprintf(stderr, "depth-stencil private layout lacks its object/object prefix\n");
+    return NO;
+  }
+  id __unsafe_unretained *fields = ((id __unsafe_unretained *(*)(id, SEL))objc_msgSend)(
+      d, privateSel);
+  if (!fields || face > 1) return NO;
+  fields[face] = nil;
+  return fields[face] == nil;
+}
+
 /// The two faces are read separately so a view that swaps them fails.
 ///
 /// Every case below moves exactly one face, and gives it a value the other face
@@ -5418,6 +5556,35 @@ static void addDepthStencilCase(NSMutableArray *cases, id ser, id cap, NSString 
                         ser, sel_getUid("newDepthStencilStateWithDescriptor:allocator:"),
                         d, cap);
                   });
+}
+
+/// Serialize a descriptor after clearing its private face objects without
+/// invoking the public getters, which normalize them back to defaults.
+static BOOL addPrivateAbsentDepthStencilCase(NSMutableArray *cases, id ser, id cap,
+                                             NSString *name, BOOL frontAbsent,
+                                             BOOL backAbsent) {
+  MTLDepthStencilDescriptor *d = baselineDepthStencil();
+  NSMutableDictionary *expect = expectFromDepthStencilDescriptor(d);
+  for (NSString *side in @[ @"front", @"back" ]) {
+    BOOL absent = [side isEqualToString:@"front"] ? frontAbsent : backAbsent;
+    if (!absent) continue;
+    unsigned face = [side isEqualToString:@"front"] ? 0 : 1;
+    if (!forceDepthStencilFaceAbsent(d, face)) return NO;
+    expect[[NSString stringWithFormat:@"%@_face_present", side]] = @0;
+    for (NSString *field in @[
+           @"stencil_compare_function", @"stencil_failure_operation",
+           @"depth_failure_operation", @"depth_stencil_pass_operation",
+           @"read_mask", @"write_mask"
+         ])
+      expect[[NSString stringWithFormat:@"%@_%@", side, field]] = @0;
+  }
+  addCreationCase(cases, name, @"newDepthStencilStateWithDescriptor:allocator:", expect,
+                  ^unsigned {
+                    return ((unsigned (*)(id, SEL, id, id))objc_msgSend)(
+                        ser, sel_getUid("newDepthStencilStateWithDescriptor:allocator:"),
+                        d, cap);
+                  });
+  return YES;
 }
 
 static NSArray *creationCases(id ser, id cap) {
@@ -5468,6 +5635,33 @@ static NSArray *creationCases(id ser, id cap) {
   addSamplerCase(cases, ser, cap, @"sampler_unnormalized_coordinates", s);
   s = baselineSampler(); s.supportArgumentBuffers = YES;
   addSamplerCase(cases, ser, cap, @"sampler_support_argument_buffers", s);
+  s = baselineSampler();
+  ((void (*)(id, SEL, char))objc_msgSend)(
+      s, sel_getUid("setForceSeamsOnCubemapFiltering:"), (char)1);
+  addSamplerCase(cases, ser, cap, @"sampler_force_seams_on_cubemap_filtering", s);
+  s = baselineSampler();
+  ((void (*)(id, SEL, char))objc_msgSend)(
+      s, sel_getUid("setForceResourceIndex:"), (char)1);
+  addSamplerCase(cases, ser, cap, @"sampler_force_resource_index", s);
+  s = baselineSampler();
+  ((void (*)(id, SEL, unsigned long long))objc_msgSend)(
+      s, sel_getUid("setResourceIndex:"), 0x1122334455667788ULL);
+  addSamplerCase(cases, ser, cap, @"sampler_resource_index", s);
+  s = baselineSampler();
+  ((void (*)(id, SEL, unsigned long long))objc_msgSend)(
+      s, sel_getUid("setPixelFormat:"), MTLPixelFormatBGRA8Unorm);
+  addSamplerCase(cases, ser, cap, @"sampler_pixel_format", s);
+  s = baselineSampler();
+  ((void (*)(id, SEL, unsigned long long))objc_msgSend)(
+      s, sel_getUid("setReductionMode:"), 1);
+  addSamplerCase(cases, ser, cap, @"sampler_reduction_mode", s);
+  s = baselineSampler();
+  ((void (*)(id, SEL, float))objc_msgSend)(s, sel_getUid("setLodBias:"), 2.5f);
+  addSamplerCase(cases, ser, cap, @"sampler_lod_bias", s);
+  s = baselineSampler();
+  ((void (*)(id, SEL, unsigned long long))objc_msgSend)(
+      s, sel_getUid("setBorderColorSPI:"), 3);
+  addSamplerCase(cases, ser, cap, @"sampler_border_color_spi", s);
 
   MTLDepthStencilDescriptor *ds;
 
@@ -5544,10 +5738,8 @@ static NSArray *creationCases(id ser, id cap) {
                                    0xffffffffu, 0xddeeff00u);
   addDepthStencilCase(cases, ser, cap, @"depth_stencil_back_write_mask", ds);
 
-  // A face may be absent entirely, and that is the only way to move the two
-  // state bits above `depthWriteEnabled`: every case so far sets both faces, so
-  // both bits read 1 in all of them and neither is derived. `nil` is what a
-  // guest sends for a state with no stencil test at all, which is most of them.
+  // Public `nil` assignments normalize back to default face objects. These
+  // cases pin that negative result.
   ds = baselineDepthStencil(); ds.frontFaceStencil = nil;
   addDepthStencilCase(cases, ser, cap, @"depth_stencil_front_face_absent", ds);
   ds = baselineDepthStencil(); ds.backFaceStencil = nil;
@@ -5556,6 +5748,16 @@ static NSArray *creationCases(id ser, id cap) {
   ds.frontFaceStencil = nil;
   ds.backFaceStencil = nil;
   addDepthStencilCase(cases, ser, cap, @"depth_stencil_both_faces_absent", ds);
+
+  // Drive the state the public setters make unreachable by clearing the two
+  // object slots in the runtime-typed private structure independently.
+  if (!addPrivateAbsentDepthStencilCase(
+          cases, ser, cap, @"depth_stencil_private_front_face_absent", YES, NO) ||
+      !addPrivateAbsentDepthStencilCase(
+          cases, ser, cap, @"depth_stencil_private_back_face_absent", NO, YES) ||
+      !addPrivateAbsentDepthStencilCase(
+          cases, ser, cap, @"depth_stencil_private_both_faces_absent", YES, YES))
+    return nil;
 
   // A fence carries no descriptor at all, so one case is the whole surface --
   // and that is the finding worth pinning: if the record is longer than a ref,
@@ -5690,10 +5892,8 @@ static NSArray *creationCases(id ser, id cap) {
                     });
   }
 
-  // An IOSurface-backed texture, in two planes. Named by
-  // `ops::texture::unidentified_u64` as the one remaining experiment that
-  // might move that word -- a plane index has to be carried somewhere, and the
-  // descriptor body has no field for it.
+  // An IOSurface-backed texture in two planes, proving that plane remains a
+  // field after the descriptor rather than aliasing descriptor state.
   for (NSArray *ios in @[ @[ @"iosurface_texture_plane0", @0 ],
                           @[ @"iosurface_texture_plane1", @1 ] ]) {
     MTLTextureDescriptor *td = baselineTexture();
@@ -6486,6 +6686,51 @@ static NSArray *onePass(id<MTLDevice> dev, id cap, unsigned char poison, BOOL re
   return cases;
 }
 
+/// Texture-only pass for comparing descriptor layouts across older serializer
+/// versions whose selector surface cannot run the full modern inventory.
+static NSArray *texturePass(id<MTLDevice> dev, id cap, unsigned char poison, BOOL record) {
+  gPoison = poison;
+  gRecordOutcomes = record;
+  gNextRef = 1;
+  id ser = ((id (*)(id, SEL, id, id))objc_msgSend)(
+      [objc_getClass("PGSerializer") alloc],
+      sel_getUid("initWithDevice:objectRefAllocator:"), dev,
+      [[RefAllocator alloc] init]);
+  if (!ser) return nil;
+  recordCapabilityDefaults(ser);
+  return textureCases(ser, cap);
+}
+
+/// Object-creation-only pass for older serializer versions that cannot run the
+/// full modern encoder inventory.
+static NSArray *creationPass(id<MTLDevice> dev, id cap, unsigned char poison, BOOL record) {
+  gPoison = poison;
+  gRecordOutcomes = record;
+  gNextRef = 1;
+  id ser = ((id (*)(id, SEL, id, id))objc_msgSend)(
+      [objc_getClass("PGSerializer") alloc],
+      sel_getUid("initWithDevice:objectRefAllocator:"), dev,
+      [[RefAllocator alloc] init]);
+  if (!ser) return nil;
+  recordCapabilityDefaults(ser);
+  return creationCases(ser, cap);
+}
+
+/// Blit-only pass, including segment framing, for older serializer versions
+/// whose later encoder families cannot run the full inventory.
+static NSArray *blitPass(id<MTLDevice> dev, id cap, unsigned char poison, BOOL record) {
+  gPoison = poison;
+  gRecordOutcomes = record;
+  gNextRef = 1;
+  id ser = ((id (*)(id, SEL, id, id))objc_msgSend)(
+      [objc_getClass("PGSerializer") alloc],
+      sel_getUid("initWithDevice:objectRefAllocator:"), dev,
+      [[RefAllocator alloc] init]);
+  if (!ser) return nil;
+  recordCapabilityDefaults(ser);
+  return blitCases(ser);
+}
+
 /// Attach each case's per-bit written mask, derived from its two passes.
 ///
 /// `mask = ~(a ^ b)`: a bit the serializer wrote holds the same value under
@@ -6669,7 +6914,8 @@ static void diffAgainstDefault(NSDictionary *base, NSArray *forced, NSString *fl
 int main(int argc, char **argv) {
   @autoreleasepool {
     if (argc < 3) {
-      fprintf(stderr, "usage: %s (fixtures|inventory) <out.json>\n", argv[0]);
+      fprintf(stderr, "usage: %s (fixtures|texture-fixtures|creation-fixtures|blit-fixtures|inventory) <out.json>\n",
+              argv[0]);
       return 2;
     }
     if (!dlopen(kBundleBin, RTLD_NOW | RTLD_LOCAL)) {
@@ -6711,6 +6957,66 @@ int main(int argc, char **argv) {
                 sig);
         return 1;
       }
+    }
+
+    if (strcmp(argv[1], "texture-fixtures") == 0) {
+      NSArray *first = texturePass(dev, cap, ARENA_POISON, YES);
+      NSArray *second = texturePass(dev, cap, ARENA_POISON_ALT, NO);
+      if (!first || !second) return 1;
+      NSMutableArray *unmasked = [NSMutableArray array];
+      NSArray *cases = mergeWrittenMasks(first, second, unmasked);
+      return writeJSON(@{
+        @"schema" : @3,
+        @"provenance" : provenance(),
+        @"host_gpu" : dev.name ?: @"(unknown)",
+        @"cases" : cases,
+        @"poison" : @[ @(ARENA_POISON), @(ARENA_POISON_ALT) ],
+        @"unmasked" : unmasked,
+        @"unsupported" : gUnsupported,
+        @"silent" : gSilent,
+        @"crashed" : gCrashed,
+        @"multi" : gMulti,
+      }, argv[2]);
+    }
+
+    if (strcmp(argv[1], "creation-fixtures") == 0) {
+      NSArray *first = creationPass(dev, cap, ARENA_POISON, YES);
+      NSArray *second = creationPass(dev, cap, ARENA_POISON_ALT, NO);
+      if (!first || !second) return 1;
+      NSMutableArray *unmasked = [NSMutableArray array];
+      NSArray *cases = mergeWrittenMasks(first, second, unmasked);
+      return writeJSON(@{
+        @"schema" : @3,
+        @"provenance" : provenance(),
+        @"host_gpu" : dev.name ?: @"(unknown)",
+        @"cases" : cases,
+        @"poison" : @[ @(ARENA_POISON), @(ARENA_POISON_ALT) ],
+        @"unmasked" : unmasked,
+        @"unsupported" : gUnsupported,
+        @"silent" : gSilent,
+        @"crashed" : gCrashed,
+        @"multi" : gMulti,
+      }, argv[2]);
+    }
+
+    if (strcmp(argv[1], "blit-fixtures") == 0) {
+      NSArray *first = blitPass(dev, cap, ARENA_POISON, YES);
+      NSArray *second = blitPass(dev, cap, ARENA_POISON_ALT, NO);
+      if (!first || !second) return 1;
+      NSMutableArray *unmasked = [NSMutableArray array];
+      NSArray *cases = mergeWrittenMasks(first, second, unmasked);
+      return writeJSON(@{
+        @"schema" : @3,
+        @"provenance" : provenance(),
+        @"host_gpu" : dev.name ?: @"(unknown)",
+        @"cases" : cases,
+        @"poison" : @[ @(ARENA_POISON), @(ARENA_POISON_ALT) ],
+        @"unmasked" : unmasked,
+        @"unsupported" : gUnsupported,
+        @"silent" : gSilent,
+        @"crashed" : gCrashed,
+        @"multi" : gMulti,
+      }, argv[2]);
     }
 
     NSArray *first = onePass(dev, cap, ARENA_POISON, YES);

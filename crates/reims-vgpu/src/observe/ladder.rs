@@ -231,6 +231,8 @@ impl RungReport {
 
 #[cfg(test)]
 mod tests {
+    use reims_vgpu_protocol::ObjectKind;
+
     /// The composition, stated once so a later edit to an arm is visible.
     #[test]
     fn a_role_and_a_rung_compose_into_the_slug_the_rail_emits() {
@@ -271,7 +273,9 @@ mod tests {
         use crate::runtime::objects::LadderRung;
         let rungs = [
             LadderRung::NoListEntry,
-            LadderRung::WrongType { got: 7 },
+            LadderRung::WrongType {
+                got: ObjectKind::SerializerResource,
+            },
             LadderRung::DescRead { declared_len: 32 },
         ];
 
@@ -315,10 +319,16 @@ mod tests {
         let report = super::RungReport::new("draw_load_mtlb", "func_ref");
 
         let cap = crate::observe::FailCapture::start();
-        report.rung(3, 9, LadderRung::WrongType { got: 11 });
+        report.rung(
+            3,
+            9,
+            LadderRung::WrongType {
+                got: ObjectKind::IOSurfaceTexture,
+            },
+        );
         assert_eq!(
             cap.one("draw_load_mtlb"),
-            "draw_load_mtlb fail reason=wrong_type task=3 func_ref=9 ot=11"
+            "draw_load_mtlb fail reason=wrong_type task=3 func_ref=9 ot=iosurface_texture"
         );
         drop(cap);
 

@@ -16,30 +16,38 @@
 //! payload +016  u64   bytes_per_row
 //! payload +024  32 bytes  the texture descriptor
 //!
-//! opcode 0x0c, total 48 bytes
+//! opcode 0x0c, total 48 bytes (legacy narrow)
 //! payload +000  u32   object_ref
 //! payload +004  32 bytes  the texture descriptor
 //! payload +036  u16   plane
 //! payload +038..+039  NEVER WRITTEN
+//!
+//! opcode 0x2f, total 48 bytes (rotation-capable narrow)
+//! payload +000  u32   object_ref
+//! payload +004  32 bytes  the texture descriptor
+//! payload +036  u16   plane
+//! payload +038  u8    rotation
+//! payload +039        NEVER WRITTEN
+//!
+//! opcode 0x39, total 56 bytes (rotation-capable wide)
+//! payload +000  u32   object_ref
+//! payload +004  40 bytes  the wide texture descriptor
+//! payload +044  u16   plane
+//! payload +046  u8    rotation
+//! payload +047        NEVER WRITTEN
 //! ```
 //!
-//! # The IOSurface plane is a `u16` in a four-byte slot
+//! # Plane and rotation are separate
 //!
-//! The serializer writes two bytes at payload +036 and leaves the two after
-//! them alone, so on a real wire those are the guest's stale ring. Measured
-//! under two arena fills, not read off a single `0xAA` capture — see the
-//! crate's `AGENTS.md`. A decoder that loads a `u32` there gets a plane index
-//! with sixteen bits of noise above it.
+//! Every IOSurface form writes a two-byte plane. Rotation-capable forms write
+//! the low byte of the following two-byte slot and leave its high byte alone;
+//! the legacy form leaves the complete slot alone. On a real wire every
+//! unwritten byte is stale ring content. A decoder that loads the final four
+//! bytes as one plane therefore folds rotation and stale data into the plane.
 //!
-//! # What this settles about the descriptor's trailing `u64`
-//!
-//! [`crate::ops::texture::TextureDescriptorBody::unidentified_u64`] has stood
-//! at zero in every capture, and its doc named the IOSurface form as the last
-//! plausible way to move it: a plane index has to live somewhere, and the
-//! descriptor had a spare 64-bit word. It does not live there. Both plane
-//! captures read that word as zero and carry the plane in a field of their own
-//! after the descriptor. The word stays unidentified and the experiment is now
-//! spent rather than pending.
+//! The plane and the descriptor's `protectionOptions` are independent fields.
+//! Plane perturbations move only the two-byte field after the descriptor;
+//! `setProtectionOptions:` moves only the descriptor's trailing `u64`.
 
 use crate::le::{U16le, U32le, U64le};
 use crate::op::Op;
@@ -50,11 +58,15 @@ use crate::view::{view, Wire, WireError};
 pub const OPCODE_BUFFER_TEXTURE: u32 = 9;
 /// Opcode for an IOSurface-backed texture.
 pub const OPCODE_IOSURFACE_TEXTURE: u32 = 0x0c;
+/// Rotation-capable narrow IOSurface-backed texture.
+pub const OPCODE_IOSURFACE_TEXTURE_ROTATED: u32 = 0x2f;
 
 /// Total wire length of a buffer-backed texture record, header included.
 pub const BUFFER_TEXTURE_TOTAL_LEN: u32 = 64;
 /// Total wire length of an IOSurface-backed texture record, header included.
 pub const IOSURFACE_TEXTURE_TOTAL_LEN: u32 = 48;
+/// Total wire length of the rotation-capable narrow IOSurface form.
+pub const IOSURFACE_TEXTURE_ROTATED_TOTAL_LEN: u32 = IOSURFACE_TEXTURE_TOTAL_LEN;
 
 /// Payload of a buffer-backed texture record.
 #[repr(C)]
@@ -98,6 +110,20 @@ pub struct IOSurfaceTextureBody {
 // SAFETY: align-1 all-bytes-valid `le` scalars and one align-1 `Wire` struct.
 unsafe impl Wire for IOSurfaceTextureBody {}
 
+/// Payload of the rotation-capable narrow IOSurface-backed texture record.
+#[repr(C)]
+#[derive(Debug)]
+pub struct IOSurfaceTextureRotatedBody {
+    pub object_ref: U32le,
+    pub desc: TextureDescriptorBody,
+    pub plane: U16le,
+    /// Rotation ordinal. The byte after this field is never written.
+    pub rotation: u8,
+}
+
+// SAFETY: align-1 all-bytes-valid scalars and one align-1 `Wire` struct.
+unsafe impl Wire for IOSurfaceTextureRotatedBody {}
+
 /// The same two records under `-setSupportsTextureDescriptor2:`.
 ///
 /// Each moves to its own opcode and carries
@@ -138,17 +164,11 @@ unsafe impl Wire for BufferTextureWideBody {}
 pub struct IOSurfaceTextureWideBody {
     pub object_ref: U32le,
     pub desc: crate::ops::texture::WideTextureDescriptorBody,
-    /// Which plane of the surface — **four bytes here and two in the narrow
-    /// form**.
-    ///
-    /// The slot is four wide in both. [`IOSurfaceTextureBody::plane`] is a
-    /// `U16le` because the serializer writes only the low half there and the
-    /// top two bytes come back as the arena fill; here the written mask says all
-    /// four are written. Same field, same slot, different written extent, and
-    /// only a measurement distinguishes them — which is the whole reason this
-    /// record was captured at both planes under the flag instead of assumed to
-    /// be the narrow one with a wider body.
-    pub plane: U32le,
+    /// Which plane of the surface. The following byte is rotation, not the high
+    /// half of a four-byte plane.
+    pub plane: U16le,
+    /// Rotation ordinal. The byte after this field is never written.
+    pub rotation: u8,
 }
 
 // SAFETY: align-1 all-bytes-valid `le` scalars and one align-1 `Wire` struct.
@@ -168,6 +188,13 @@ pub fn buffer_texture_wide<'a>(op: &Op<'a>) -> Result<&'a BufferTextureWideBody,
 pub fn iosurface_texture_wide<'a>(op: &Op<'a>) -> Result<&'a IOSurfaceTextureWideBody, WireError> {
     debug_assert_eq!(op.opcode(), OPCODE_IOSURFACE_TEXTURE_WIDE);
     view::<IOSurfaceTextureWideBody>(op.payload)
+}
+
+pub fn iosurface_texture_rotated<'a>(
+    op: &Op<'a>,
+) -> Result<&'a IOSurfaceTextureRotatedBody, WireError> {
+    debug_assert_eq!(op.opcode(), OPCODE_IOSURFACE_TEXTURE_ROTATED);
+    view::<IOSurfaceTextureRotatedBody>(op.payload)
 }
 
 /// View the payload of an IOSurface-backed texture record.
@@ -233,23 +260,26 @@ mod tests {
         );
         assert_eq!(core::mem::align_of::<IOSurfaceTextureBody>(), 1);
 
-        // The wide forms. Both bodies reach the record's end exactly, and the
-        // IOSurface one does so because its `plane` is four bytes here where the
-        // narrow form's is two — the arithmetic below is the check on that,
-        // stated rather than left to `size_of`.
+        // The wide buffer form reaches its record end. The IOSurface body's
+        // final byte is not part of a view because the serializer never writes
+        // it.
         assert_eq!(
             size_of::<BufferTextureWideBody>() + OP_HEADER_LEN,
             BUFFER_TEXTURE_WIDE_TOTAL_LEN as usize
         );
         assert_eq!(core::mem::align_of::<BufferTextureWideBody>(), 1);
         assert_eq!(
-            size_of::<IOSurfaceTextureWideBody>() + OP_HEADER_LEN,
+            size_of::<IOSurfaceTextureWideBody>() + OP_HEADER_LEN + 1,
             IOSURFACE_TEXTURE_WIDE_TOTAL_LEN as usize
         );
         assert_eq!(core::mem::align_of::<IOSurfaceTextureWideBody>(), 1);
+        assert_eq!(
+            size_of::<IOSurfaceTextureRotatedBody>() + OP_HEADER_LEN + 1,
+            IOSURFACE_TEXTURE_ROTATED_TOTAL_LEN as usize
+        );
+        assert_eq!(core::mem::align_of::<IOSurfaceTextureRotatedBody>(), 1);
         // Each wide record is its narrow twin plus the descriptor's eight
-        // bytes. The IOSurface pair also differs by two in `plane`, so its
-        // record grows eight while its *body* grows ten.
+        // bytes. Plane and rotation retain the same widths.
         assert_eq!(
             BUFFER_TEXTURE_WIDE_TOTAL_LEN - BUFFER_TEXTURE_TOTAL_LEN,
             8,
@@ -262,10 +292,9 @@ mod tests {
         );
         assert_eq!(
             size_of::<IOSurfaceTextureWideBody>() - size_of::<IOSurfaceTextureBody>(),
-            8 + 2,
-            "`plane` is measured four bytes wide in the wide form and two in the \
-             narrow one; if that stops holding this arithmetic is the first thing \
-             to check"
+            8 + 1,
+            "the wide descriptor adds eight bytes and the rotation-capable form \
+             adds one written byte after the common plane"
         );
     }
 
@@ -318,8 +347,36 @@ mod tests {
             assert_eq!(t.desc.texture_type(), 2);
             assert_eq!(t.desc.pixel_format(), 80);
             // The word the plane was hypothesised to live in, and does not.
-            assert_eq!(t.desc.unidentified_u64.get(), 0);
+            assert_eq!(t.desc.protection_options.get(), 0);
         }
+    }
+
+    #[test]
+    fn rotation_capable_forms_do_not_fold_rotation_or_stale_tail_into_plane() {
+        let mut narrow = [0xaau8; IOSURFACE_TEXTURE_ROTATED_TOTAL_LEN as usize];
+        narrow[0..4].copy_from_slice(&OPCODE_IOSURFACE_TEXTURE_ROTATED.to_le_bytes());
+        narrow[4..8].copy_from_slice(&IOSURFACE_TEXTURE_ROTATED_TOTAL_LEN.to_le_bytes());
+        narrow[8..12].copy_from_slice(&62u32.to_le_bytes());
+        put_desc(&mut narrow, 12);
+        narrow[44..46].copy_from_slice(&3u16.to_le_bytes());
+        narrow[46] = 7;
+        narrow[47] = 0xff;
+        let narrow_op = op(&narrow, 0).expect("well formed");
+        let rotated = iosurface_texture_rotated(&narrow_op).expect("fits");
+        assert_eq!(rotated.plane.get(), 3);
+        assert_eq!(rotated.rotation, 7);
+
+        let mut wide = [0xaau8; IOSURFACE_TEXTURE_WIDE_TOTAL_LEN as usize];
+        wide[0..4].copy_from_slice(&OPCODE_IOSURFACE_TEXTURE_WIDE.to_le_bytes());
+        wide[4..8].copy_from_slice(&IOSURFACE_TEXTURE_WIDE_TOTAL_LEN.to_le_bytes());
+        wide[8..12].copy_from_slice(&63u32.to_le_bytes());
+        wide[52..54].copy_from_slice(&5u16.to_le_bytes());
+        wide[54] = 9;
+        wide[55] = 0xff;
+        let wide_op = op(&wide, 0).expect("well formed");
+        let rotated = iosurface_texture_wide(&wide_op).expect("fits");
+        assert_eq!(rotated.plane.get(), 5);
+        assert_eq!(rotated.rotation, 9);
     }
 
     #[test]

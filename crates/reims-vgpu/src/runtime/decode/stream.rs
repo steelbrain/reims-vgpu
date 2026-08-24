@@ -1,7 +1,7 @@
 //! Command-stream framing decoder (port of `host/utils/reims-vgpu-stream-decode`).
 
-use crate::contract::endian::ld32;
-use crate::contract::size_fits_u32;
+use reims_vgpu_core::endian::ld32;
+use reims_vgpu_protocol::size_fits_u32;
 
 // Segment types and header length from `reims-vgpu-wire` (observed serializer
 // surface). Re-exported so stream walkers share one path with the wire crate.
@@ -23,19 +23,15 @@ pub const SEGMENT_TYPE_EVENT: u8 = 3;
 
 /// Segment-header field offsets, from the view that derived them.
 ///
-/// `SEGMENT_UNWRITTEN_OFFSET` is `size_of` rather than `offset_of` because the
-/// wire struct deliberately stops at seven bytes: the eighth is the one the
-/// serializer never writes, so it is the byte *after* the header rather than a
-/// field in it, and saying so here is the whole difference between reading it
-/// as ring contents and reading it as padding.
+/// The wire struct deliberately stops at seven bytes: the eighth is not written
+/// and therefore is not a field the semantic decoder may read.
 pub const SEGMENT_LENGTH_OFFSET: usize = core::mem::offset_of!(wire_segment::SegmentHeader, length);
 pub const SEGMENT_TYPE_OFFSET: usize =
     core::mem::offset_of!(wire_segment::SegmentHeader, segment_type);
-pub const SEGMENT_BEGIN_FLAG_OFFSET: usize =
-    core::mem::offset_of!(wire_segment::SegmentHeader, begin_flag);
-pub const SEGMENT_UNIDENTIFIED_OFFSET: usize =
-    core::mem::offset_of!(wire_segment::SegmentHeader, unidentified_u8);
-pub const SEGMENT_UNWRITTEN_OFFSET: usize = core::mem::size_of::<wire_segment::SegmentHeader>();
+pub const SEGMENT_CONTINUES_PREVIOUS_OFFSET: usize =
+    core::mem::offset_of!(wire_segment::SegmentHeader, continues_previous);
+pub const SEGMENT_CONTINUES_NEXT_OFFSET: usize =
+    core::mem::offset_of!(wire_segment::SegmentHeader, continues_next);
 
 /// Record-header field offsets. This is the serializer's op header, a different
 /// protocol level from the segment header above — see [`SEGMENT_HEADER_LEN`].
@@ -80,72 +76,31 @@ impl crate::observe::Refusal for DecodeStatus {
 
 /// One segment of the command stream, as decoded from its header.
 ///
-/// The three bytes after `type_` are carried but never acted on: the device
-/// reads the length and the type and nothing else, and their only reader is
-/// `validate_segment`, which re-reads the header and refuses a stream whose
-/// bytes moved under it. They are named for what the oracle measured, because
-/// the names they had were three claims it has since settled — `cont` for the
-/// `BOOL` argument of `-beginSegment:protectionOptions:`, `chain` for a byte
-/// that has never been made to move, and `pad` for one the serializer does not
-/// write at all. See [`reims_vgpu_wire::ops::segment::SegmentHeader`], which
-/// records what each was perturbed with.
-///
-/// # The two the reader's contract does act on
-///
-/// A conforming consumer of this stream treats `begin_flag` and
-/// `unidentified_u8` as **encoder-lifetime control**, and it is the only thing
-/// it treats them as. `begin_flag` set means this segment's records continue
+/// The two bytes after `type_` are encoder-lifetime control.
+/// `continues_previous` means this segment's records continue
 /// the encoder the previous segment left open, and are a protocol error if that
 /// encoder is absent or of a different type — the reader is required to refuse
-/// rather than quietly open a fresh one. `unidentified_u8` set means the
+/// rather than quietly open a fresh one. `continues_next` means the
 /// encoder survives this segment and the next one may continue it; clear means
 /// the encoder ends here. A render segment that does *not* continue a previous
 /// one begins by decoding a render-pass descriptor out of its own records.
 ///
-/// So one Metal render command encoder — one Vulkan render pass — may span an
-/// unbounded number of records across an unbounded number of segments, and this
-/// device instead opens and ends a render pass per draw.
-///
-/// **Whether that costs anything here is a question about this guest**, and
-/// [`SEGMENT_CHAIN_ROUTES`] answered it. Driven x86 Safari-drag boot:
-///
-/// ```text
-/// seg_chain_none    94 860
-/// seg_chain_next         0
-/// seg_chain_prev         0
-/// seg_chain_both         0
-/// ```
-///
-/// **Every segment of the boot.** This guest never asks for an encoder to
-/// outlive a segment, so there is nothing here to honour and no pass to hold
-/// open across one. Keep the routes: this is a property of a workload, not of
-/// the protocol, and a guest that did chain would arrive as a non-zero here
-/// rather than as a rendering defect.
-///
-/// The narrower question — whether a *single* segment carries more draws than
-/// the one render pass this device opens per draw — has the same answer, from
-/// the same boot: **94 860 segments against 96 351 draws**, so a render segment
-/// carries about one. A render pass per draw is what this guest asks for, not a
-/// translation artifact, and the contract permitting an unbounded number of
-/// draws per encoder does not mean this workload presents one.
-///
-/// So the submission and render-pass granularity are both already the guest's.
-/// Neither is where this device's remaining cost is.
+/// So one render command encoder — and therefore its pipeline, bind state and
+/// render pass — may span an unbounded number of records across an unbounded
+/// number of submitted child buffers. The executor carries the owning decoder
+/// state until `continues_next` clears; resetting it at a child-buffer boundary
+/// drops valid continuation draws that do not repeat their pipeline bind.
+/// [`SEGMENT_CHAIN_ROUTES`] remains the workload instrument for how often each
+/// lifetime form is used.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct Segment {
     pub offset: u32,
     pub length: u32,
     pub type_: u8,
-    /// `-beginSegment:`'s unnamed `BOOL` first argument, verbatim. The reader's
-    /// contract makes this "continue the open encoder"; see the type doc.
-    pub begin_flag: u8,
-    /// Written, always `0` in every fixture. The reader's contract makes this
-    /// "the encoder outlives this segment"; see the type doc.
-    pub unidentified_u8: u8,
-    /// The eighth header byte, which neither `-beginSegment:` call writes. On a
-    /// real wire it is whatever the ring last contained, so it is not padding
-    /// and nothing may read it as a value.
-    pub unwritten_u8: u8,
+    /// This segment continues the open encoder from its predecessor.
+    pub continues_previous: bool,
+    /// This segment leaves its encoder open for its successor.
+    pub continues_next: bool,
     pub command_offset: u32,
     pub command_length: u32,
     pub index: u32,
@@ -177,7 +132,7 @@ pub fn segment_type_name(type_: u32) -> &'static str {
 /// What the stream walker should do with a segment family.
 ///
 /// This exists so the walker's "everything else" arm is a decision rather than a
-/// fallthrough. It used to be `_ => {}`, which gave the same silence to a type-5
+/// fallthrough. It used to be `_ => {}`, which gave the same silence to a IOSurface plane view
 /// envelope the contract says to skip and to a segment family the host has never
 /// seen — and the second of those is unknown wire format.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -195,7 +150,7 @@ pub enum SegmentDisposition {
     /// The wording here was "raw envelope bytes carrying no decodable protection
     /// value", which was a guess written where a measurement now sits. Driven
     /// under `-setSupportsProtectionOptionsEnvelope:` the burst is exactly three
-    /// records: this type-5 header, then **eight fully-written bytes that are the
+    /// records: this IOSurface plane view header, then **eight fully-written bytes that are the
     /// `protectionOptions:` argument verbatim**, then the ordinary segment
     /// header. `reims_vgpu_wire::ops::segment::ProtectionOptionsEnvelope` is the
     /// view; `blit_begin_segment_protected` sends `0x44` and `..._alt` sends
@@ -297,17 +252,18 @@ pub fn decode_next_segment(bytes: &[u8], cursor: &mut usize) -> Result<Segment, 
         return Err(DecodeStatus::ErrBadLength("stream_seg_cursor_overflow"));
     }
     let segment_index = segment_index_for_offset(bytes, *cursor as u32)?;
+    let continues_previous = header[SEGMENT_CONTINUES_PREVIOUS_OFFSET] != 0;
+    let continues_next = header[SEGMENT_CONTINUES_NEXT_OFFSET] != 0;
     crate::runtime::drain::note_store_route(segment_chain_route(
-        header[SEGMENT_BEGIN_FLAG_OFFSET],
-        header[SEGMENT_UNIDENTIFIED_OFFSET],
+        continues_previous,
+        continues_next,
     ));
     let out = Segment {
         offset: *cursor as u32,
         length: segment_len as u32,
         type_: header[SEGMENT_TYPE_OFFSET],
-        begin_flag: header[SEGMENT_BEGIN_FLAG_OFFSET],
-        unidentified_u8: header[SEGMENT_UNIDENTIFIED_OFFSET],
-        unwritten_u8: header[SEGMENT_UNWRITTEN_OFFSET],
+        continues_previous,
+        continues_next,
         command_offset: (*cursor + SEGMENT_HEADER_LEN) as u32,
         command_length: (segment_len - SEGMENT_HEADER_LEN) as u32,
         index: segment_index,
@@ -331,12 +287,8 @@ pub const SEGMENT_CHAIN_ROUTES: [&str; 4] = [
 /// Which of [`SEGMENT_CHAIN_ROUTES`] a segment header's two encoder-lifetime
 /// bytes select.
 ///
-/// Any non-zero is a set flag: the bytes carry a `BOOL` and the stream is
-/// guest-controlled, so `!= 0` is the test rather than `== 1`. A guest that
-/// wrote `2` would otherwise be counted as "not chaining" and the whole reading
-/// would be wrong in the direction that reads as a settled question.
-pub fn segment_chain_route(continues_previous: u8, continues_into_next: u8) -> &'static str {
-    let index = usize::from(continues_previous != 0) << 1 | usize::from(continues_into_next != 0);
+pub fn segment_chain_route(continues_previous: bool, continues_into_next: bool) -> &'static str {
+    let index = usize::from(continues_previous) << 1 | usize::from(continues_into_next);
     SEGMENT_CHAIN_ROUTES[index]
 }
 
@@ -356,9 +308,8 @@ fn validate_segment(bytes: &[u8], segment: &Segment) -> Result<usize, DecodeStat
     let header = &bytes[segment.offset as usize..];
     if ld32(&header[SEGMENT_LENGTH_OFFSET..]) != segment.length
         || header[SEGMENT_TYPE_OFFSET] != segment.type_
-        || header[SEGMENT_BEGIN_FLAG_OFFSET] != segment.begin_flag
-        || header[SEGMENT_UNIDENTIFIED_OFFSET] != segment.unidentified_u8
-        || header[SEGMENT_UNWRITTEN_OFFSET] != segment.unwritten_u8
+        || (header[SEGMENT_CONTINUES_PREVIOUS_OFFSET] != 0) != segment.continues_previous
+        || (header[SEGMENT_CONTINUES_NEXT_OFFSET] != 0) != segment.continues_next
     {
         return Err(DecodeStatus::ErrBadLength("stream_reval_header_mismatch"));
     }
@@ -461,7 +412,7 @@ pub fn iter_segments(bytes: &[u8]) -> Result<Vec<Segment>, DecodeStatus> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::contract::endian::st32;
+    use reims_vgpu_core::endian::st32;
 
     /// The four chain routes are distinct, and each pair of flags selects its
     /// own. A collision would fold two populations into one bucket, which is
@@ -472,12 +423,15 @@ mod tests {
     fn each_pair_of_chain_flags_selects_its_own_route() {
         let mut seen = std::collections::HashSet::new();
         for route in SEGMENT_CHAIN_ROUTES {
-            assert!(seen.insert(route), "two chain routes share the name {route}");
+            assert!(
+                seen.insert(route),
+                "two chain routes share the name {route}"
+            );
         }
-        assert_eq!(segment_chain_route(0, 0), "seg_chain_none");
-        assert_eq!(segment_chain_route(0, 1), "seg_chain_next");
-        assert_eq!(segment_chain_route(1, 0), "seg_chain_prev");
-        assert_eq!(segment_chain_route(1, 1), "seg_chain_both");
+        assert_eq!(segment_chain_route(false, false), "seg_chain_none");
+        assert_eq!(segment_chain_route(false, true), "seg_chain_next");
+        assert_eq!(segment_chain_route(true, false), "seg_chain_prev");
+        assert_eq!(segment_chain_route(true, true), "seg_chain_both");
     }
 
     /// The bytes are guest-controlled, so the flag test is `!= 0` and not
@@ -486,12 +440,30 @@ mod tests {
     /// continues an open encoder into the bucket whose emptiness is the whole
     /// question.
     #[test]
-    fn any_non_zero_chain_byte_is_a_set_flag() {
+    fn decoder_normalizes_any_non_zero_chain_byte() {
         for v in [1u8, 2, 0x7f, 0x80, 0xff] {
-            assert_eq!(segment_chain_route(v, 0), "seg_chain_prev", "prev={v:#x}");
-            assert_eq!(segment_chain_route(0, v), "seg_chain_next", "next={v:#x}");
-            assert_eq!(segment_chain_route(v, v), "seg_chain_both", "both={v:#x}");
+            let mut bytes = [0u8; SEGMENT_HEADER_LEN];
+            st32(&mut bytes[..4], SEGMENT_HEADER_LEN as u32);
+            bytes[SEGMENT_CONTINUES_PREVIOUS_OFFSET] = v;
+            bytes[SEGMENT_CONTINUES_NEXT_OFFSET] = v;
+            let segment = decode_next_segment(&bytes, &mut 0).expect("segment");
+            assert!(segment.continues_previous, "prev={v:#x}");
+            assert!(segment.continues_next, "next={v:#x}");
         }
+    }
+
+    #[test]
+    fn unwritten_header_byte_is_not_semantic_input() {
+        let mut first = [0u8; SEGMENT_HEADER_LEN];
+        st32(&mut first[..4], SEGMENT_HEADER_LEN as u32);
+        first[SEGMENT_HEADER_LEN - 1] = 0xaa;
+        let mut second = first;
+        second[SEGMENT_HEADER_LEN - 1] = 0x55;
+
+        let a = decode_next_segment(&first, &mut 0).expect("first segment");
+        let b = decode_next_segment(&second, &mut 0).expect("second segment");
+        assert_eq!(a, b);
+        assert_eq!(validate_segment(&second, &a), Ok(SEGMENT_HEADER_LEN));
     }
 
     fn push_segment(buf: &mut Vec<u8>, type_: u8, payload: &[u8]) {

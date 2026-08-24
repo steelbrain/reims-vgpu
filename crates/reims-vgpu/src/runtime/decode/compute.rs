@@ -1,6 +1,7 @@
 //! Compute command decoder (port of `host/utils/reims-vgpu-compute-decode`).
 
-use crate::contract::endian::ld32;
+use reims_vgpu_core::endian::ld32;
+use reims_vgpu_protocol::{HeapObject, ObjectTableRef, ResourceObject, SerializerRef};
 use reims_vgpu_wire::ops::compute as wire;
 
 /// Shared serializer op-header length from `reims-vgpu-wire`.
@@ -191,8 +192,8 @@ pub struct Command {
     pub buffers: Vec<BufferBinding>,
     pub textures: Vec<RefBinding>,
     pub samplers: Vec<SamplerBinding>,
-    pub resources: Vec<RefBinding>,
-    pub heaps: Vec<RefBinding>,
+    pub resources: Vec<ObjectTableRef<ResourceObject>>,
+    pub heaps: Vec<SerializerRef<HeapObject>>,
     pub grid: Size3,
     pub threads_per_threadgroup: Size3,
     pub indirect_buffer_ref: u32,
@@ -293,11 +294,8 @@ pub fn opcode_confidence(opcode: u32) -> OpcodeConfidence {
 /// entries are known to be inside the record the guest itself sized. What the
 /// cap added was a second, lower bound with no derivation behind it.
 ///
-/// Which index a backend can actually bind is a *backend* question and is
-/// already answered there — `REIMS_VGPU_METAL_MAX_BUFFERS` and
-/// `valid_buffer_binding` on the Metal arm, the descriptor-set limits on the
-/// Vulkan one. A decoder that pre-empts them refuses guest work neither of them
-/// would have.
+/// Which index Vulkan can actually bind is a backend question. A decoder that
+/// pre-empts that answer can refuse otherwise valid guest work.
 ///
 /// **The limit those caps were reaching for has since been measured, and it is
 /// three numbers rather than one** — see [`reims_vgpu_wire::ops::bind_limit`],
@@ -360,9 +358,8 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
             out.kind = Kind::UseHeaps;
             out.count = count;
             for i in 0..count as usize {
-                out.heaps.push(RefBinding {
-                    ref_: ld32(&payload[4 + i * REF_SIZE..]),
-                });
+                out.heaps
+                    .push(SerializerRef::new(ld32(&payload[4 + i * REF_SIZE..])));
             }
             Ok(out)
         }
@@ -379,9 +376,8 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
             out.count = count;
             out.resource_usage = ld32(&payload[4..]);
             for i in 0..count as usize {
-                out.resources.push(RefBinding {
-                    ref_: ld32(&payload[8 + i * REF_SIZE..]),
-                });
+                out.resources
+                    .push(ObjectTableRef::new(ld32(&payload[8 + i * REF_SIZE..])));
             }
             Ok(out)
         }
@@ -613,9 +609,7 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
             out.kind = Kind::BarrierResources;
             out.count = head.count.get();
             for r in refs {
-                out.resources.push(RefBinding {
-                    ref_: r.object_ref.get(),
-                });
+                out.resources.push(ObjectTableRef::new(r.object_ref.get()));
             }
             Ok(out)
         }
@@ -709,7 +703,7 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::contract::endian::st32;
+    use reims_vgpu_core::endian::st32;
 
     /// Header plus two `Size3`, and taken from the crate that pins it.
     const DISPATCH_DIRECT_LEN: usize = wire::DISPATCH_TOTAL_LEN as usize;
@@ -972,7 +966,7 @@ mod tests {
     /// is refused.
     #[test]
     fn a_resource_barrier_is_the_length_the_serializer_writes() {
-        use crate::contract::endian::st32;
+        use reims_vgpu_core::endian::st32;
 
         const COUNT: u32 = 2;
         let apple_len = COUNT_BASE + (COUNT as usize) * REF_SIZE;
@@ -988,7 +982,7 @@ mod tests {
         let c = decode(&v).expect("the serializer's own record must decode");
         assert_eq!(c.kind, Kind::BarrierResources);
         assert_eq!(c.count, COUNT);
-        let refs: Vec<u32> = c.resources.iter().map(|r| r.ref_).collect();
+        let refs: Vec<u32> = c.resources.iter().map(|r| r.get()).collect();
         assert_eq!(
             refs,
             vec![5151, 4343],
@@ -1014,7 +1008,7 @@ mod tests {
     /// change grew a field into those bytes, this decodes `0xAAAA` into it.
     #[test]
     fn the_scope_barrier_reads_no_byte_the_serializer_left_alone() {
-        use crate::contract::endian::st32;
+        use reims_vgpu_core::endian::st32;
 
         let mut v = vec![0xAAu8; BARRIER_SCOPE_LEN];
         st32(&mut v[0..], wire::OPCODE_MEMORY_BARRIER_SCOPE);
@@ -1063,6 +1057,44 @@ mod tests {
         use reims_vgpu_wire::ops::render as wire;
         assert_ne!(OP_USE_HEAPS, wire::OPCODE_USE_HEAP);
         assert_ne!(OP_USE_RESOURCES, wire::OPCODE_USE_RESOURCE);
+    }
+
+    #[test]
+    fn inherited_residency_records_preserve_their_typed_reference_arrays() {
+        let mut heaps = vec![0u8; COUNT_BASE + 2 * REF_SIZE];
+        st32(&mut heaps, OP_USE_HEAPS);
+        st32(&mut heaps[4..], (COUNT_BASE + 2 * REF_SIZE) as u32);
+        st32(&mut heaps[OP_HEADER_LEN..], 2);
+        st32(&mut heaps[COUNT_BASE..], 5151);
+        st32(&mut heaps[COUNT_BASE + REF_SIZE..], 4343);
+        let heaps = decode(&heaps).expect("heap residency");
+        assert_eq!(heaps.kind, Kind::UseHeaps);
+        assert_eq!(
+            heaps
+                .heaps
+                .iter()
+                .map(|reference| reference.get())
+                .collect::<Vec<_>>(),
+            vec![5151, 4343]
+        );
+
+        let mut resources = vec![0u8; BIND_BASE + 2 * REF_SIZE];
+        st32(&mut resources, OP_USE_RESOURCES);
+        st32(&mut resources[4..], (BIND_BASE + 2 * REF_SIZE) as u32);
+        st32(&mut resources[OP_HEADER_LEN..], 2);
+        st32(&mut resources[COUNT_BASE..], 3);
+        st32(&mut resources[BIND_BASE..], 7171);
+        st32(&mut resources[BIND_BASE + REF_SIZE..], 8181);
+        let resources = decode(&resources).expect("resource residency");
+        assert_eq!(resources.kind, Kind::UseResources);
+        assert_eq!(
+            resources
+                .resources
+                .iter()
+                .map(|reference| reference.get())
+                .collect::<Vec<_>>(),
+            vec![7171, 8181]
+        );
     }
 
     /// Every compute opcode Apple's serializer emits has a constant here, and

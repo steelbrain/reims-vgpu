@@ -41,6 +41,11 @@
 # slow-regime draw, which is exactly what the interleaving rule above exists to
 # prevent.
 #
+# A pair whose name begins with `MAPS_` is likewise exported verbatim, which is
+# how a *presentation regime* gets priced instead of a switch:
+# `--probe scripts/maps-probe/maps-probe.sh --arms "MAPS_PRESENTATION=fullscreen
+# MAPS_PRESENTATION=windowed"` interleaves the two regimes the Maps goal names.
+#
 # Values use `+` where the variable wants a comma, because the arm string is
 # already comma-separated: `INTEL_DEBUG=no16+no32` exports `INTEL_DEBUG=no16,no32`.
 set -uo pipefail
@@ -86,7 +91,7 @@ say() { echo "perf-ab: $*"; }
 # issues, which kills this runner instead of the previous VM.
 if [ -z "${QEMU_BIN:-}" ]; then
   say "building QEMU once for the whole run ..."
-  if ! "$REPO/scripts/qemu-build/qemu-build.sh" --backend vulkan \
+  if ! "$REPO/scripts/qemu-build/qemu-build.sh" \
        >"$OUT/qemu-build.log" 2>&1; then
     say "qemu build failed; see $OUT/qemu-build.log"
     exit 2
@@ -107,11 +112,21 @@ printf 'round\tarm\tregime\tpresent_hz\toffered_hz\tdraws_s\tus_draw\tduty\tchai
 # would drag a mean anywhere.
 median() { sort -n | awk '{v[NR]=$1} END{ if(NR==0){print "-"} else if(NR%2){printf "%.2f", v[(NR+1)/2]} else {printf "%.2f",(v[NR/2]+v[NR/2+1])/2} }'; }
 
-# Sum of a per-window census field over the boot. `store_routes`-shaped counters
-# reset each window, so summing is the answer and taking the last sample is the
-# error; the reverse holds for the cumulative high-waters, which this does not
-# read.
-sum_field() { grep -ho "$1=[0-9]*" "$2" 2>/dev/null | cut -d= -f2 | awk '{s+=$1} END{print s+0}'; }
+# Sum one field from one per-window census record. Field names are not globally
+# unique: `draws` appears in both `drain_duty` and `draw_phase`, and `busy_us` in
+# both `drain_duty` and `gpu_span`. Scoping at the record is part of the metric's
+# contract; summing every spelling silently double-counts different instruments.
+sum_tag_field() {
+  awk -v tag="$1" -v field="$2" '
+    $1 == "OFF" && $2 == tag {
+      for (i = 3; i <= NF; i++) {
+        split($i, pair, "=")
+        if (pair[1] == field) sum += pair[2]
+      }
+    }
+    END { print sum + 0 }
+  ' "$3"
+}
 
 for round in $(seq 1 "$ROUNDS"); do
 for arm in $ARMS; do
@@ -119,10 +134,11 @@ for arm in $ARMS; do
   say "=== round $round arm $arm ==="
   "$REPO/scripts/app-sweep-probe/stop-previous-vm.sh" || say "$tag: previous VM still holds :2222"
   rm -f /tmp/reims-vgpu-fail.log
-  # Both namespaces are swept, or an `INTEL_*` arm would leak into every later
-  # round and quietly make the whole run one arm.
+  # Every namespace is swept, or an `INTEL_*` or `MAPS_*` arm would leak into
+  # every later round and quietly make the whole run one arm.
   for stale in $(env | sed -n 's/^\(REIMS_VGPU_[A-Z0-9_]*\)=.*/\1/p'); do unset "$stale"; done
   for stale in $(env | sed -n 's/^\(INTEL_[A-Z0-9_]*\)=.*/\1/p'); do unset "$stale"; done
+  for stale in $(env | sed -n 's/^\(MAPS_[A-Z0-9_]*\)=.*/\1/p'); do unset "$stale"; done
   if [ "$arm" != shipping ]; then
     old_ifs=$IFS; IFS=,
     for pair in $arm; do
@@ -131,6 +147,15 @@ for arm in $ARMS; do
         # A driver variable is exported under its own name; `+` becomes the
         # comma the arm string could not carry.
         INTEL_*) export "$name=${value//+/,}" ;;
+        # A probe parameter is likewise its own name. This is how a *regime*
+        # gets priced rather than a device switch: `MAPS_PRESENTATION=windowed`
+        # against `MAPS_PRESENTATION=fullscreen` are two different workloads --
+        # a composited window inset in a desktop, and an application owning the
+        # scanout -- and the goal for this device names both. Running them as
+        # separate blocks would score each against a different base rate of the
+        # slow-regime draw, which is the thing the interleaving above exists to
+        # cancel.
+        MAPS_*)  export "$name=${value//+/,}" ;;
         *)       export "REIMS_VGPU_$name=$value" ;;
       esac
     done
@@ -150,6 +175,7 @@ for arm in $ARMS; do
 
   timeout 300 "$REPO/vm/guest-authorize.sh" >/dev/null 2>&1
   "$REPO/scripts/app-sweep-probe/wait-for-desktop.sh" --timeout 400 \
+    --reports "$OUT/$tag-reports" \
     || { say "$tag: no desktop"; printf '%s\t%s\tNO-DESKTOP\n' "$round" "$arm" >>"$RESULTS"; \
          pkill -f 'qemu-system-x86_6[4].*reims-vgpu'; sleep 6; continue; }
   # A desktop is not a settled device. One boot scored here read 3.5 Hz and
@@ -166,8 +192,30 @@ for arm in $ARMS; do
     "$PROBE" "$OUT/$tag-work" "$SECS" >"$OUT/$tag-probe.log" 2>&1
   probe_exit=$?
   SLICE="$OUT/$tag-slice.log"
-  tail -n +"$((MARK + 1))" /tmp/reims-vgpu-fail.log >"$SLICE"
+  PROBE_SLICE="$OUT/$tag-probe-slice.log"
+  tail -n +"$((MARK + 1))" /tmp/reims-vgpu-fail.log >"$PROBE_SLICE"
+  # A probe may publish the exact interval in which it drove the guest. Prefer
+  # that contract over the broad launch-to-exit slice, which can include prompt
+  # dismissal, application setup, and post-interaction settling. Probes without
+  # an exact window retain the broad slice.
+  EXACT_SLICE="$OUT/$tag-work/window.log"
+  if [ -s "$EXACT_SLICE" ]; then
+    cp "$EXACT_SLICE" "$SLICE"
+  else
+    cp "$PROBE_SLICE" "$SLICE"
+  fi
   pkill -f 'qemu-system-x86_6[4].*reims-vgpu'; sleep 6
+
+  # Probe failure invalidates the population. In particular, Maps returns
+  # nonzero when the captured frames do not contain the declared geographic
+  # scene. Keeping its backend counters would reward an empty canvas for being
+  # cheap, so publish an explicitly unrankable row instead.
+  if [ "$probe_exit" -ne 0 ]; then
+    printf '%s\t%s\tINVALID-PROBE\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t%s\n' \
+      "$round" "$arm" "$PROBE_NAME" >>"$RESULTS"
+    say "$tag: invalid probe (exit=$probe_exit); see $OUT/$tag-probe.log and $OUT/$tag-work"
+    continue
+  fi
 
   present=$(grep -ho 'present_hz=[0-9.]*' "$SLICE" | cut -d= -f2 | median)
   offered=$(grep -ho 'offered_hz=[0-9.]*' "$SLICE" | cut -d= -f2 | median)
@@ -175,15 +223,15 @@ for arm in $ARMS; do
   # the probe has already reported success.
   panic=no; grep -q 'guest kernel panic' "$BOOTLOG" && panic=yes
 
-  draws=$(sum_field 'draws' "$SLICE")
-  draw_us=$(sum_field 'draw_us' "$SLICE")
-  busy_us=$(sum_field 'busy_us' "$SLICE")
+  draws=$(sum_tag_field drain_duty draws "$SLICE")
+  draw_us=$(sum_tag_field drain_duty draw_us "$SLICE")
+  busy_us=$(sum_tag_field drain_duty busy_us "$SLICE")
   windows=$(grep -c 'OFF drain_duty' "$SLICE")
-  chain=$(sum_field 'chains' "$SLICE")
-  sampled=$(sum_field 'sampled_us' "$SLICE")
-  engine=$(sum_field 'engine_us' "$SLICE")
-  store=$(sum_field 'store_us' "$SLICE")
-  binds=$(sum_field 'binds_us' "$SLICE")
+  chain=$(sum_tag_field chain_phase chains "$SLICE")
+  sampled=$(sum_tag_field chain_phase sampled_us "$SLICE")
+  engine=$(sum_tag_field chain_phase engine_us "$SLICE")
+  store=$(sum_tag_field chain_phase store_us "$SLICE")
+  binds=$(sum_tag_field chain_phase binds_us "$SLICE")
   total_us=$((sampled + engine + store + binds))
 
   read -r draws_s us_draw duty chain_us s_pct e_pct st_pct b_pct <<EOF

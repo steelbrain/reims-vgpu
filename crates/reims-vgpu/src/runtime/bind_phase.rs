@@ -30,7 +30,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use crate::observe::phase_clock::{charge_ns, to_us};
-use crate::runtime::spirv_bind::ReflectedBufferAccess;
+use reims_vgpu_core::ReflectedBufferAccess;
 
 /// The parts of the bind phase that are worth telling apart.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -53,7 +53,7 @@ static BINDS: AtomicU64 = AtomicU64::new(0);
 
 /// The render census deliberately folds the detailed access answer into the
 /// three decisions render makes. Compute consumes read-only versus writable;
-/// render only decides neutral, guest-backed, or no reflection answer.
+/// render records whether reflection says the guest bind is used.
 const ACCESS_CLASSES: usize = 3;
 
 static ACCESS: [AtomicU64; ACCESS_CLASSES] = [const { AtomicU64::new(0) }; ACCESS_CLASSES];
@@ -67,25 +67,15 @@ pub struct BindPhaseWindow {
     /// Bind phases entered in the window — the denominator the three share.
     pub binds: u64,
     /// Buffer binds whose stage's reflection says the shader never dereferences
-    /// them. These are the ones whose guest bytes need not be staged at all.
+    /// them. They still retain the guest's bytes; reflection is observational.
     pub access_unused: u64,
     /// Buffer binds reflection says the shader does touch.
     pub access_dereferenced: u64,
     /// Buffer binds reflection gives no answer for. Not a synonym for
     /// [`Self::access_unused`] — see [`ReflectedBufferAccess::Unknown`].
     pub access_undeclared: u64,
-    /// Of [`Self::access_unused`], those whose guest bytes were staged anyway.
-    ///
-    /// With the rail on this is the stage-in exclusion refusing a substitution,
-    /// which is expected rather than an error. With
-    /// [`crate::env::UNUSED_BINDS`] off it equals [`Self::access_unused`], which
-    /// is how the off arm is confirmed to have taken.
+    /// Of [`Self::access_unused`], those whose guest bytes were retained.
     pub access_unused_staged: u64,
-    /// Binds served the neutral page instead of the guest's bytes.
-    ///
-    /// Together with [`Self::access_unused_staged`] this partitions
-    /// [`Self::access_unused`], so the saving is read rather than assumed.
-    pub neutral_served: u64,
 }
 
 impl BindPhaseWindow {
@@ -110,7 +100,6 @@ pub fn take_window() -> Option<BindPhaseWindow> {
         access_dereferenced: ACCESS[1].swap(0, Ordering::Relaxed),
         access_undeclared: ACCESS[2].swap(0, Ordering::Relaxed),
         access_unused_staged: UNUSED_STAGED.swap(0, Ordering::Relaxed),
-        neutral_served: NEUTRAL_SERVED.swap(0, Ordering::Relaxed),
     };
     (binds > 0).then_some(w)
 }
@@ -132,27 +121,15 @@ pub fn note_access(class: ReflectedBufferAccess) {
 /// Count one bind that reflection called unused and that was staged from guest
 /// memory regardless.
 ///
-/// Called on the staging arm for *every* class and filtered here, rather than
-/// called only for `Unused` at the one site that knows, so that the two arms of
-/// the branch cannot drift: every bind goes through exactly one of
-/// [`note_neutral_served`] and this, and their sum over unused binds is
-/// `access_unused`.
-///
-/// A non-zero reading with the rail on is the reliance signal — the stage-in
-/// exclusion refusing a substitution — and not an error.
+/// Called for every class and filtered here so the observer cannot restate the
+/// reflection classification at a different call site.
 pub fn note_unused_staged(class: ReflectedBufferAccess) {
     if matches!(class, ReflectedBufferAccess::Unused) {
         UNUSED_STAGED.fetch_add(1, Ordering::Relaxed);
     }
 }
 
-/// Count one bind served the neutral page instead of the guest's bytes.
-pub fn note_neutral_served() {
-    NEUTRAL_SERVED.fetch_add(1, Ordering::Relaxed);
-}
-
 static UNUSED_STAGED: AtomicU64 = AtomicU64::new(0);
-static NEUTRAL_SERVED: AtomicU64 = AtomicU64::new(0);
 
 /// Count one entry into the bind phase, so the parts have a denominator that
 /// is theirs rather than `chain_phase`'s `chains`.
@@ -313,40 +290,26 @@ mod tests {
         }
     }
 
-    /// The neutral and staged tallies partition the unused binds, so the saving
-    /// the line reports is the substitutions that actually happened rather than
-    /// the classification restated.
-    ///
-    /// The staging arm is charged for every class and filters internally, which
-    /// is what this asserts: a `ReadOnly` bind that was staged must not
-    /// appear in `access_unused_staged`, or the identity would read as reliance
-    /// on guest bytes by binds the rail never had a claim on.
+    /// Every reflection-unused bind keeps the guest bytes, while other classes
+    /// do not enter the unused subset.
     #[test]
-    fn neutral_and_staged_partition_the_unused_binds() {
+    fn unused_bind_staging_tracks_only_the_unused_class() {
         let _ = take_window();
         note_bind();
-        // Two unused binds substituted, one refused (a stage-in index).
-        note_access(ReflectedBufferAccess::Unused);
-        note_neutral_served();
-        note_access(ReflectedBufferAccess::Unused);
-        note_neutral_served();
         note_access(ReflectedBufferAccess::Unused);
         note_unused_staged(ReflectedBufferAccess::Unused);
-        // A bind the rail has no claim on, staged as always.
+        note_access(ReflectedBufferAccess::Unused);
+        note_unused_staged(ReflectedBufferAccess::Unused);
+        note_access(ReflectedBufferAccess::Unused);
+        note_unused_staged(ReflectedBufferAccess::Unused);
         note_access(ReflectedBufferAccess::ReadOnly);
         note_unused_staged(ReflectedBufferAccess::ReadOnly);
 
         let w = take_window().expect("a bind was noted");
         assert_eq!(w.access_unused, 3, "{w:?}");
-        assert_eq!(w.neutral_served, 2, "{w:?}");
         assert_eq!(
-            w.access_unused_staged, 1,
-            "only the refused unused bind, not the dereferenced one: {w:?}"
-        );
-        assert_eq!(
-            w.access_unused_staged + w.neutral_served,
-            w.access_unused,
-            "the two arms partition the unused binds: {w:?}"
+            w.access_unused_staged, 3,
+            "only the reflection-unused binds enter the subset: {w:?}"
         );
     }
 

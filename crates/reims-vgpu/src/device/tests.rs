@@ -17,9 +17,8 @@ fn lifecycle() {
 }
 
 #[test]
-fn exactly_one_backend_name() {
-    let n = backend_name();
-    assert!(n == "metal" || n == "vulkan");
+fn backend_name_is_vulkan() {
+    assert_eq!(backend_name(), "vulkan");
 }
 
 #[test]
@@ -50,7 +49,13 @@ fn mmio_hooks() {
 fn a_failed_copy_still_frees_a_consumed_present_action() {
     let id = device_create(None, PAGE_SHIFT_ARM64E).expect("create");
     let slot = device_slot(id).expect("slot");
-    slot.inner.lock().device.state.present.unpainted_presents = 3;
+    slot.inner
+        .lock()
+        .device
+        .state
+        .presentation
+        .present
+        .set_unpainted_presents_for_test(3);
     slot.present_action_pending.store(true, Ordering::Release);
 
     let mut dst = [0u8; 4];
@@ -66,7 +71,13 @@ fn a_failed_copy_still_frees_a_consumed_present_action() {
         "the host consumed the action; C cannot replay it"
     );
     assert_eq!(
-        slot.inner.lock().device.state.present.unpainted_presents,
+        slot.inner
+            .lock()
+            .device
+            .state
+            .presentation
+            .present
+            .unpainted_presents(),
         0,
         "and the backpressure counter must agree with the flag"
     );
@@ -81,64 +92,165 @@ fn drain_without_ops_is_ok() {
     assert!(device_destroy(id));
 }
 
+/// The device drain owns one backend transaction, including work performed
+/// after the FIFO body. A session scope around `Device::drain` alone ends too
+/// early: the submission-tail flush then runs against another device's/default
+/// backend state and the window cannot see the resident just rendered.
+#[test]
+fn drain_tail_remains_in_the_device_executor_session() {
+    use crate::runtime::executor::*;
+    use reims_vgpu_core::{
+        CapabilityService, ComputeResidencyService, ExecutionPort, GuestWriteService,
+        PresentationService, ReadbackService, ResidentService,
+    };
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+
+    #[derive(Debug)]
+    struct ScopeGuard(Arc<AtomicUsize>);
+
+    impl Drop for ScopeGuard {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+
+    #[derive(Debug)]
+    struct ScopeProbe {
+        depth: Arc<AtomicUsize>,
+        tail_was_scoped: AtomicBool,
+    }
+
+    impl ExecutionPort for ScopeProbe {
+        type Submission = ResolvedSubmission;
+        type Completion = ExecutionCompletion;
+        type Error = DrawError;
+
+        fn execute(&self, _submission: Self::Submission) -> Result<Self::Completion, Self::Error> {
+            unreachable!("an empty drain executes no command buffer")
+        }
+    }
+    impl ResidentService for ScopeProbe {}
+    impl GuestWriteService for ScopeProbe {}
+    impl ComputeResidencyService for ScopeProbe {}
+    impl CapabilityService for ScopeProbe {}
+    impl PresentationService for ScopeProbe {}
+    impl ReadbackService for ScopeProbe {
+        type Error = DrawError;
+
+        fn read_target(
+            &self,
+            _identity: &crate::model::TargetIdentity,
+        ) -> Result<reims_vgpu_core::TargetReadback, Self::Error> {
+            unreachable!("an empty drain reads no target")
+        }
+    }
+    impl GuestPageTransferService for ScopeProbe {}
+    impl ResidentCopyService for ScopeProbe {}
+    impl CompletionService for ScopeProbe {}
+    impl SubmissionBatchService for ScopeProbe {
+        fn flush_submission_tail(&self) {
+            self.tail_was_scoped
+                .store(self.depth.load(Ordering::Acquire) != 0, Ordering::Release);
+        }
+    }
+    impl GuestImportService for ScopeProbe {}
+    impl MaintenanceService for ScopeProbe {}
+    impl SessionService for ScopeProbe {
+        fn enter(&self) -> ExecutionScope {
+            self.depth.fetch_add(1, Ordering::AcqRel);
+            ExecutionScope::test(ScopeGuard(Arc::clone(&self.depth)))
+        }
+    }
+    impl ObservationService for ScopeProbe {}
+    impl ShaderTranslationService for ScopeProbe {}
+    impl RenderBufferPlanningService for ScopeProbe {}
+    impl crate::runtime::executor::GuestImagePlanningService for ScopeProbe {}
+    impl WindowPresentationService for ScopeProbe {}
+    impl Executor for ScopeProbe {}
+
+    let probe = Arc::new(ScopeProbe {
+        depth: Arc::new(AtomicUsize::new(0)),
+        tail_was_scoped: AtomicBool::new(false),
+    });
+    let id = device_create(Some(ReimsVgpuHostOps::null()), PAGE_SHIFT_ARM64E).expect("create");
+    let slot = device_slot(id).expect("slot");
+    slot.inner.lock().device.executor = probe.clone();
+
+    assert!(device_drain(id));
+    assert!(
+        probe.tail_was_scoped.load(Ordering::Acquire),
+        "the submission tail must observe the same session as the drained work"
+    );
+    assert_eq!(
+        probe.depth.load(Ordering::Acquire),
+        0,
+        "the complete drain transaction releases its session before returning"
+    );
+    assert!(device_destroy(id));
+}
+
 #[cfg(all(feature = "host-window", target_os = "macos"))]
 #[test]
 fn window_publish_key_advances_for_in_place_present() {
     use super::window_publish::window_frame_key;
     let mut state = crate::model::DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_ARM64E);
-    state.present.frame_mapping = 7;
-    state.present.frame_generation = 11;
-    let first = window_frame_key(&state.present);
+    state
+        .presentation
+        .present
+        .set_frame_identity_for_test(7, 0, 0, 11, 0);
+    let first = window_frame_key(&state.presentation.present);
 
     state.advance_present_epoch();
     assert_ne!(
-        window_frame_key(&state.present),
+        window_frame_key(&state.presentation.present),
         first,
         "a repeated resource generation still represents a new DisplaySwap"
     );
 }
 
-/// A lazy type-11 Store publishes new pixels without writing a guest page, so
-/// the mapping's `content_generation` holds still across frames that genuinely
-/// differ — and the host window's publish key must move anyway.
-///
-/// Ungated, unlike its `present_epoch` sibling above: that term is macOS-only
-/// and this one is not, and the arm that measured the defect is x86/Vulkan.
-/// Without `frame_content_epoch` in the key, a driven macos-13 boot with
-/// `REIMS_VGPU_LAZY_WRITEBACK=on` published 60 fresh frames a second against 314
-/// `same_key`, where the eager arm published 81 against 131 — real frames
-/// discarded as unchanged, and the guest halved its own draw rate to match the
-/// vblank that follows the present.
+/// A host publication can advance without a guest-page generation change, so
+/// the host window's publish key includes the content epoch.
 #[cfg(feature = "host-window")]
 #[test]
-fn window_publish_key_moves_for_a_lazy_store_that_wrote_no_guest_page() {
+fn window_publish_key_moves_for_a_host_publication() {
     use super::window_publish::window_frame_key;
     let mut state = crate::model::DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_ARM64E);
     state.set_mapping_geom(7, 8, 4, 0x1e);
 
     fn publish(state: &mut crate::model::DeviceState) {
         let epoch = state.note_surface_content_published(7);
-        let generation = state.mappings.get(&7).expect("mapping 7").content_generation;
-        state.present.frame_generation = generation;
-        state.present.frame_content_epoch = epoch;
+        let generation = state
+            .surfaces
+            .mappings
+            .get(&7)
+            .expect("mapping 7")
+            .content
+            .guest_page_generation;
+        state
+            .presentation
+            .present
+            .set_frame_identity_for_test(7, 0, 0, generation, epoch);
     }
 
-    state.present.frame_mapping = 7;
+    state
+        .presentation
+        .present
+        .set_frame_identity_for_test(7, 0, 0, 0, 0);
     publish(&mut state);
-    let first = window_frame_key(&state.present);
-    let generation = state.present.frame_generation;
+    let first = window_frame_key(&state.presentation.present);
+    let generation = state.presentation.present.frame().generation();
 
     publish(&mut state);
 
     assert_eq!(
-        state.present.frame_generation, generation,
-        "a lazy Store writes no guest page, so the page stamp must not move — \
-         which is what makes the pixel stamp the only term that can"
+        state.presentation.present.frame().generation(),
+        generation,
+        "host publication does not itself change the guest-page generation"
     );
     assert_ne!(
-        window_frame_key(&state.present),
+        window_frame_key(&state.presentation.present),
         first,
-        "two lazy Stores into one surface are two frames and must publish twice"
+        "two host publications into one surface are two frames and must publish twice"
     );
 }
 
@@ -223,6 +335,7 @@ fn intr_status_atomics_survive_reset() {
         let d = slot.inner.lock();
         d.device
             .state
+            .registers
             .gfx
             .interrupt_status_gpu
             .fetch_or(0x9, Ordering::AcqRel);
@@ -248,18 +361,31 @@ fn host_console_bar1_until_present_boundary() {
     {
         let slot = device_slot(id).expect("device");
         let mut d = slot.inner.lock();
-        d.device.state.present.valid = true;
-        d.device.state.present.width = 1920;
-        d.device.state.present.height = 1080;
-        d.device.state.present.present_mapping = 3;
+        d.device
+            .state
+            .presentation
+            .present
+            .establish_console(1920, 1080, 0);
+        d.device
+            .state
+            .presentation
+            .present
+            .note_present_candidate(3);
     }
     assert_eq!(device_console_feed(id), Some(ConsoleFeed::Firmware));
 
     {
         let slot = device_slot(id).expect("device");
         let mut d = slot.inner.lock();
-        d.device.state.present.frame_flush_seen = true;
-        publish_present_boundary(&slot, d.device.state.present.frame_flush_seen);
+        d.device.state.presentation.present.cross_content_boundary();
+        publish_present_boundary(
+            &slot,
+            d.device
+                .state
+                .presentation
+                .present
+                .content_boundary_crossed(),
+        );
     }
     assert_eq!(device_console_feed(id), Some(ConsoleFeed::Product));
     assert!(device_destroy(id));
@@ -274,7 +400,7 @@ fn host_console_bar1_until_present_boundary() {
 /// the firmware console, and only one pathway refused it.
 #[test]
 fn only_the_latched_front_may_paint_before_the_present_boundary() {
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use reims_vgpu_core::pixel_format::MTL_FORMAT_BGRA8_UNORM;
 
     let id = device_create(None, PAGE_SHIFT_ARM64E).expect("create");
 
@@ -289,20 +415,15 @@ fn only_the_latched_front_may_paint_before_the_present_boundary() {
         let slot = device_slot(id).expect("device");
         let mut d = slot.inner.lock();
         let state = &mut d.device.state;
-        state.present.valid = true;
-        state.present.width = 1920;
-        state.present.height = 1080;
+        state.presentation.present.establish_console(1920, 1080, 0);
         assert!(state.map_surface(7));
-        let m = state.mappings.get_mut(&7).unwrap();
-        m.mapped = true;
-        m.has_geom = true;
-        m.width = 1920;
-        m.height = 1080;
-        m.format = MTL_FORMAT_BGRA8_UNORM;
-        m.content_generation = 4;
-        m.page_entries = vec![1];
+        let m = state.surfaces.mappings.get_mut(&7).unwrap();
+        m.lifecycle.active = true;
+        m.publish_geometry_for_test(1920, 1080, MTL_FORMAT_BGRA8_UNORM);
+        m.content.guest_page_generation = 4;
+        m.pages.entries = vec![1];
         state.note_surface_composite(7);
-        state.present.early_front_mapping = 7;
+        state.presentation.present.note_early_composite(7);
     }
     assert!(matches!(
         device_console_feed(id),
@@ -437,12 +558,12 @@ fn a_child_doorbell_never_queues_behind_the_render_worker() {
     assert!(device_drain(id));
     let inner = slot.inner.lock();
     assert_ne!(
-        inner.device.state.pending.child_mask & (1 << 4),
+        inner.device.state.scheduling.pending.child_mask() & (1 << 4),
         0,
         "the fold must turn the ring into pending work"
     );
     assert_ne!(
-        inner.device.state.active_child_mask & (1 << 4),
+        inner.device.state.scheduling.pending.active_child_mask() & (1 << 4),
         0,
         "and into an active channel, or the stranded-FIFO rescue cannot see it"
     );
@@ -450,6 +571,7 @@ fn a_child_doorbell_never_queues_behind_the_render_worker() {
         inner
             .device
             .state
+            .registers
             .gfx
             .child_doorbell_rung
             .load(Ordering::Acquire),
@@ -553,15 +675,17 @@ fn present_action_owns_worker_boundary_until_scanout_copy() {
     let slot = device_slot(id).expect("device");
     {
         let mut inner = slot.inner.lock();
-        let present = &mut inner.device.state.present;
-        present.frame_valid = true;
-        present.frame_mapping = 4;
-        present.frame_width = 2;
-        present.frame_height = 2;
-        present.frame_generation = 7;
-        present.frame_bgra = vec![0x55; 16];
-        present.unpainted_presents = 1;
-        inner.device.state.pending.host_action_yield = true;
+        let present = &mut inner.device.state.presentation.present;
+        present.set_frame_identity_for_test(4, 2, 2, 7, 0);
+        present.replace_frame_pixels_for_test(vec![0x55; 16]);
+        present.validate_frame_for_test();
+        present.set_unpainted_presents_for_test(1);
+        inner
+            .device
+            .state
+            .scheduling
+            .pending
+            .yield_for_host_action();
     }
     slot.present_action_pending.store(true, Ordering::Release);
     slot.gfx_ingress.lock().push_back(QueuedGfxWrite {
@@ -584,7 +708,14 @@ fn present_action_owns_worker_boundary_until_scanout_copy() {
         crate::runtime::scanout::ScanoutCopyResult::Painted
     );
     assert!(!slot.present_action_pending.load(Ordering::Acquire));
-    assert!(!slot.inner.lock().device.state.pending.host_action_yield);
+    assert!(!slot
+        .inner
+        .lock()
+        .device
+        .state
+        .scheduling
+        .pending
+        .host_action_yielded());
 
     assert!(device_drain(id));
     assert_eq!(slot.gfx_ingress.lock().len(), 0);

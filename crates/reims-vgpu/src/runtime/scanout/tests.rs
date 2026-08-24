@@ -4,9 +4,12 @@
 //! this have: colocated, these 1,266 lines were 53% of `scanout.rs`.
 
 use super::*;
-use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
 use crate::model::{DeviceId, PAGE_SHIFT_ARM64E};
 use crate::runtime::host::{FakeHost, HostActionKind};
+use reims_vgpu_paging::geometry::{
+    MAPPER_PAGE_ENTRY_PFN_SHIFT as PAGE_ENTRY_PFN_SHIFT,
+    MAPPER_PAGE_ENTRY_VALID as PAGE_ENTRY_VALID,
+};
 
 const ALL_CAPTURE: &[CaptureDecline] = &[
     CaptureDecline::NoMapping,
@@ -44,7 +47,7 @@ const ALL_CAPTURE: &[CaptureDecline] = &[
 /// Every capture reason names the rail that wrote it.
 ///
 /// Bare, three of these belonged to other rails too — `unmapped` and
-/// `short_view` to the guest-page import path and `no_mapping` to the type-5
+/// `short_view` to the guest-page import path and `no_mapping` to the IOSurface plane view
 /// loader — so a `grep reason=unmapped` over one boot returned a mix of
 /// subsystems. The prefix is what makes that grep answerable.
 #[test]
@@ -147,7 +150,7 @@ fn a_capture_refusal_carries_its_numbers() {
 
 #[test]
 fn missing_mapping_fails_without_latching() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     let w = 4u32;
     let h = 2u32;
@@ -159,24 +162,21 @@ fn missing_mapping_fails_without_latching() {
     );
     // Destination untouched; generation not latched.
     assert!(dst.iter().all(|&b| b == 0xAA));
-    assert!(!state.present.valid);
+    assert!(!state.presentation.present.console_valid());
 }
 
 #[test]
 fn early_boot_front_formats_and_geometry_barrier() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     let mapping_id = 7u32;
     assert!(state.map_surface(mapping_id));
     {
-        let m = state.mappings.get_mut(&mapping_id).unwrap();
-        m.mapped = true;
-        m.has_geom = true;
-        m.width = 1920;
-        m.height = 1080;
-        m.format = MTL_FORMAT_BGRA8_UNORM;
-        m.page_entries = vec![(1u32 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
-        m.content_generation = 3;
+        let m = state.surfaces.mappings.get_mut(&mapping_id).unwrap();
+        m.lifecycle.active = true;
+        m.publish_geometry_for_test(1920, 1080, MTL_FORMAT_BGRA8_UNORM);
+        m.pages.entries = vec![(1u32 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
+        m.content.guest_page_generation = 3;
     }
     // Live Monterey: first full-frame BGRA8 writeback enqueues at guest geom.
     note_front_buffer_writeback(
@@ -191,7 +191,7 @@ fn early_boot_front_formats_and_geometry_barrier() {
     assert_eq!(host.actions[0].kind, HostActionKind::ScanoutUpdate);
     assert_eq!(host.actions[0].a1, 1920);
     assert_eq!(host.actions[0].a2, 1080);
-    assert!(state.present.valid);
+    assert!(state.presentation.present.console_valid());
     host.actions.clear();
     // Same geom → paint again.
     note_front_buffer_writeback(
@@ -214,8 +214,8 @@ fn early_boot_front_formats_and_geometry_barrier() {
         MTL_FORMAT_BGRA8_UNORM,
     );
     assert!(host.actions.is_empty());
-    assert_eq!(state.present.width, 1920);
-    assert_eq!(state.present.height, 1080);
+    assert_eq!(state.presentation.present.console_width(), 1920);
+    assert_eq!(state.presentation.present.console_height(), 1080);
     // Non-front format → ignore.
     note_front_buffer_writeback(&mut state, &mut host, mapping_id, 1920, 1080, 0x9999);
     assert!(host.actions.is_empty());
@@ -223,21 +223,16 @@ fn early_boot_front_formats_and_geometry_barrier() {
 
 #[test]
 fn early_scanout_target_refuses_resize_geom() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     // Established console 1920×1080 after first paint.
-    state.present.valid = true;
-    state.present.width = 1920;
-    state.present.height = 1080;
-    state.present.early_front_mapping = 5;
+    state.presentation.present.establish_console(1920, 1080, 0);
+    state.presentation.present.note_early_composite(5);
     assert!(state.map_surface(5));
     {
-        let m = state.mappings.get_mut(&5).unwrap();
-        m.mapped = true;
-        m.has_geom = true;
-        m.width = 1440;
-        m.height = 1080;
-        m.format = MTL_FORMAT_RGBA16_FLOAT;
-        m.content_generation = 9;
+        let m = state.surfaces.mappings.get_mut(&5).unwrap();
+        m.lifecycle.active = true;
+        m.publish_geometry_for_test(1440, 1080, MTL_FORMAT_RGBA16_FLOAT);
+        m.content.guest_page_generation = 9;
     }
     // The composite front points at a new mode FB, but early gfx_update
     // must not resize — DisplaySwap owns modeChangeHandler sizeInPixels.
@@ -245,9 +240,8 @@ fn early_scanout_target_refuses_resize_geom() {
 
     // Same geom re-pull still allowed.
     {
-        let m = state.mappings.get_mut(&5).unwrap();
-        m.width = 1920;
-        m.height = 1080;
+        let m = state.surfaces.mappings.get_mut(&5).unwrap();
+        m.publish_geometry_for_test(1920, 1080, MTL_FORMAT_RGBA16_FLOAT);
     }
     let t = early_scanout_target(&state).expect("same-geom target");
     assert_eq!(t, (5, 1920, 1080, 9));
@@ -256,22 +250,16 @@ fn early_scanout_target_refuses_resize_geom() {
 /// ClearOnly init present_mapping must not early-paint (keep BAR1).
 #[test]
 fn early_scanout_target_refuses_clear_only_init() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-    state.present.valid = true;
-    state.present.width = 1920;
-    state.present.height = 1080;
-    state.present.early_front_mapping = 2;
-    state.present.frame_flush_seen = false;
-    state.present.frame_valid = false;
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    state.presentation.present.establish_console(1920, 1080, 0);
+    state.presentation.present.note_early_composite(2);
+    state.presentation.present.invalidate_frame_for_test();
     assert!(state.map_surface(2));
     {
-        let m = state.mappings.get_mut(&2).unwrap();
-        m.mapped = true;
-        m.has_geom = true;
-        m.width = 1920;
-        m.height = 1080;
-        m.format = MTL_FORMAT_BGRA8_UNORM;
-        m.content_generation = 1;
+        let m = state.surfaces.mappings.get_mut(&2).unwrap();
+        m.lifecycle.active = true;
+        m.publish_geometry_for_test(1920, 1080, MTL_FORMAT_BGRA8_UNORM);
+        m.content.guest_page_generation = 1;
     }
     state.note_surface_clear(2);
     assert!(early_scanout_target(&state).is_none());
@@ -294,26 +282,19 @@ fn early_scanout_target_refuses_clear_only_init() {
 /// last writeback of *any* kind with no sentence saying the guest meant it.
 #[test]
 fn early_scanout_ignores_a_present_mapping_that_is_not_the_composite_front() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-    state.present.valid = true;
-    state.present.width = 1920;
-    state.present.height = 1080;
-    state.present.frame_flush_seen = false;
-    state.present.frame_valid = false;
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    state.presentation.present.establish_console(1920, 1080, 0);
+    state.presentation.present.invalidate_frame_for_test();
     assert!(state.map_surface(7));
     {
-        let m = state.mappings.get_mut(&7).unwrap();
-        m.mapped = true;
-        m.has_geom = true;
-        m.width = 1920;
-        m.height = 1080;
-        m.format = MTL_FORMAT_BGRA8_UNORM;
-        m.content_generation = 4;
-        m.page_entries = vec![1];
+        let m = state.surfaces.mappings.get_mut(&7).unwrap();
+        m.lifecycle.active = true;
+        m.publish_geometry_for_test(1920, 1080, MTL_FORMAT_BGRA8_UNORM);
+        m.content.guest_page_generation = 4;
+        m.pages.entries = vec![1];
     }
     state.note_surface_composite(7);
-    state.present.present_mapping = 7;
-    state.present.early_front_mapping = 0;
+    state.presentation.present.note_present_candidate(7);
     assert!(
         early_scanout_target(&state).is_none(),
         "the last writeback of any kind is not a statement that the guest \
@@ -321,7 +302,7 @@ fn early_scanout_ignores_a_present_mapping_that_is_not_the_composite_front() {
     );
 
     // Naming it as the composited front is what licenses it.
-    state.present.early_front_mapping = 7;
+    state.presentation.present.note_early_composite(7);
     assert_eq!(
         early_scanout_target(&state),
         Some((7, 1920, 1080, 4)),
@@ -332,40 +313,31 @@ fn early_scanout_ignores_a_present_mapping_that_is_not_the_composite_front() {
 /// Sticky early_front survives ClearOnly present_mapping thrash.
 #[test]
 fn early_scanout_prefers_sticky_composite_over_clear_present() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-    state.present.valid = true;
-    state.present.width = 1920;
-    state.present.height = 1080;
-    state.present.frame_flush_seen = false;
-    state.present.frame_valid = false;
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    state.presentation.present.establish_console(1920, 1080, 0);
+    state.presentation.present.invalidate_frame_for_test();
     // Logo mid (composite writeback).
     assert!(state.map_surface(1));
     {
-        let m = state.mappings.get_mut(&1).unwrap();
-        m.mapped = true;
-        m.has_geom = true;
-        m.width = 1920;
-        m.height = 1080;
-        m.format = MTL_FORMAT_BGRA8_UNORM;
-        m.content_generation = 5;
-        m.page_entries = vec![1];
+        let m = state.surfaces.mappings.get_mut(&1).unwrap();
+        m.lifecycle.active = true;
+        m.publish_geometry_for_test(1920, 1080, MTL_FORMAT_BGRA8_UNORM);
+        m.content.guest_page_generation = 5;
+        m.pages.entries = vec![1];
     }
     state.note_surface_composite(1);
-    state.present.early_front_mapping = 1;
+    state.presentation.present.note_early_composite(1);
     // Guest ClearOnly flip mid overwrites present_mapping (buffer setup).
     assert!(state.map_surface(2));
     {
-        let m = state.mappings.get_mut(&2).unwrap();
-        m.mapped = true;
-        m.has_geom = true;
-        m.width = 1920;
-        m.height = 1080;
-        m.format = MTL_FORMAT_BGRA8_UNORM;
-        m.content_generation = 1;
-        m.page_entries = vec![1];
+        let m = state.surfaces.mappings.get_mut(&2).unwrap();
+        m.lifecycle.active = true;
+        m.publish_geometry_for_test(1920, 1080, MTL_FORMAT_BGRA8_UNORM);
+        m.content.guest_page_generation = 1;
+        m.pages.entries = vec![1];
     }
     state.note_surface_clear(2);
-    state.present.present_mapping = 2;
+    state.presentation.present.note_present_candidate(2);
     let t = early_scanout_target(&state).expect("sticky early front");
     assert_eq!(t.0, 1, "must keep logo mid, not ClearOnly flip");
     assert_eq!(t.3, 5);
@@ -375,27 +347,21 @@ fn early_scanout_prefers_sticky_composite_over_clear_present() {
 /// `present_mapping` (PGDisplay presents the surface named by DisplaySwap only).
 #[test]
 fn post_display_swap_writeback_does_not_rename_present_mapping() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     // Front mid from DisplaySwap (ch4 op8).
-    state.present.frame_flush_seen = true;
-    state.present.present_mapping = 3;
-    state.present.host_mapping = 3;
-    state.present.valid = true;
-    state.present.width = 1440;
-    state.present.height = 1080;
+    state.presentation.present.cross_content_boundary();
+    state.presentation.present.begin_present(3);
+    state.presentation.present.establish_console(1440, 1080, 0);
 
     // Back buffer mid=4 receives a full-frame composite writeback.
     assert!(state.map_surface(4));
     {
-        let m = state.mappings.get_mut(&4).unwrap();
-        m.mapped = true;
-        m.has_geom = true;
-        m.width = 1440;
-        m.height = 1080;
-        m.format = MTL_FORMAT_RGBA16_FLOAT;
-        m.page_entries = vec![(1u32 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
-        m.content_generation = 12;
+        let m = state.surfaces.mappings.get_mut(&4).unwrap();
+        m.lifecycle.active = true;
+        m.publish_geometry_for_test(1440, 1080, MTL_FORMAT_RGBA16_FLOAT);
+        m.pages.entries = vec![(1u32 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
+        m.content.guest_page_generation = 12;
     }
     note_front_buffer_writeback(
         &mut state,
@@ -407,8 +373,8 @@ fn post_display_swap_writeback_does_not_rename_present_mapping() {
     );
     // No early paint, no rename of the presented mid.
     assert!(host.actions.is_empty());
-    assert_eq!(state.present.present_mapping, 3);
-    assert_eq!(state.present.host_mapping, 3);
+    assert_eq!(state.presentation.present.presented_mapping(), 3);
+    assert_eq!(state.presentation.present.host_mapping(), 3);
     assert!(early_scanout_target(&state).is_none());
 }
 
@@ -416,11 +382,14 @@ fn post_display_swap_writeback_does_not_rename_present_mapping() {
 /// failing not_contig (live boot class: fullscreen present surfaces).
 #[test]
 fn paint_mapping_fragmented_pages_multi_import() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
     use crate::model::PAGE_SHIFT_X86;
     use crate::runtime::mapping_write::write_bgra8;
+    use reims_vgpu_paging::geometry::{
+        MAPPER_PAGE_ENTRY_PFN_SHIFT as PAGE_ENTRY_PFN_SHIFT,
+        MAPPER_PAGE_ENTRY_VALID as PAGE_ENTRY_VALID,
+    };
 
-    let mut state = DeviceState::new(DeviceId(1), crate::model::PAGE_SHIFT_X86);
+    let mut state = Device::new(DeviceId(1), crate::model::PAGE_SHIFT_X86);
     let mut host = FakeHost::new();
     host.strict_linux_map = true;
     let page = 1u64 << PAGE_SHIFT_X86;
@@ -433,10 +402,10 @@ fn paint_mapping_fragmented_pages_multi_import() {
     let mid = 7u32;
     assert!(state.map_surface(mid));
     {
-        let m = state.mappings.get_mut(&mid).unwrap();
-        m.mapped = true;
-        m.mapping_internal = 1;
-        m.page_entries = vec![
+        let m = state.surfaces.mappings.get_mut(&mid).unwrap();
+        m.lifecycle.active = true;
+        m.lifecycle.internal_kva = 1;
+        m.pages.entries = vec![
             (pfn0 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID,
             (pfn1 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID,
         ];
@@ -483,7 +452,7 @@ fn paint_mapping_fragmented_pages_multi_import() {
 fn capture_recycles_scratch_and_keeps_prior_retain_on_failure() {
     use crate::runtime::mapping_write::write_bgra8;
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     let mid = 6u32;
     let pfn = 0x90u32;
@@ -492,24 +461,35 @@ fn capture_recycles_scratch_and_keeps_prior_retain_on_failure() {
     let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
     assert!(state.map_surface(mid));
     {
-        let m = state.mappings.get_mut(&mid).unwrap();
-        m.mapped = true;
-        m.mapping_internal = 1;
-        m.page_entries = vec![entry];
+        let m = state.surfaces.mappings.get_mut(&mid).unwrap();
+        m.lifecycle.active = true;
+        m.lifecycle.internal_kva = 1;
+        m.pages.entries = vec![entry];
     }
     assert!(state.set_mapping_geom(mid, 2, 2, MTL_FORMAT_BGRA8_UNORM));
-    state.present.frame_flush_seen = true;
-    state.present.width = 2;
-    state.present.height = 2;
+    state.presentation.present.cross_content_boundary();
+    state
+        .presentation
+        .present
+        .set_console_geometry_for_test(2, 2);
 
     let frame_a = [
         0x10u8, 0x20, 0x30, 0xFF, 0x10, 0x20, 0x30, 0xFF, 0x10, 0x20, 0x30, 0xFF, 0x10, 0x20, 0x30,
         0xFF,
     ];
     assert!(write_bgra8(&mut state, &mut host, mid, &frame_a, 8, 2, 2));
-    let gen_a = state.mappings.get(&mid).unwrap().content_generation;
+    let gen_a = state
+        .surfaces
+        .mappings
+        .get(&mid)
+        .unwrap()
+        .content
+        .guest_page_generation;
     assert!(capture_present_frame(&mut state, mid, 2, 2, gen_a));
-    assert_eq!(&state.present.frame_bgra[..16], &frame_a[..]);
+    assert_eq!(
+        &state.presentation.present.frame().pixels()[..16],
+        &frame_a[..]
+    );
 
     // Second successful capture: the prior retain buffer is recycled into
     // capture_scratch (warm, exactly the frame size — no per-present alloc).
@@ -518,11 +498,20 @@ fn capture_recycles_scratch_and_keeps_prior_retain_on_failure() {
         0xFF,
     ];
     assert!(write_bgra8(&mut state, &mut host, mid, &frame_b, 8, 2, 2));
-    let gen_b = state.mappings.get(&mid).unwrap().content_generation;
+    let gen_b = state
+        .surfaces
+        .mappings
+        .get(&mid)
+        .unwrap()
+        .content
+        .guest_page_generation;
     assert!(capture_present_frame(&mut state, mid, 2, 2, gen_b));
-    assert_eq!(&state.present.frame_bgra[..16], &frame_b[..]);
     assert_eq!(
-        state.present.capture_scratch.len(),
+        &state.presentation.present.frame().pixels()[..16],
+        &frame_b[..]
+    );
+    assert_eq!(
+        state.presentation.present.frame().scratch_len(),
         16,
         "prior retain recycled as warm scratch of the frame size"
     );
@@ -531,16 +520,18 @@ fn capture_recycles_scratch_and_keeps_prior_retain_on_failure() {
     // and leave the frame_b retain intact.
     let bad = 99u32;
     assert!(state.map_surface(bad));
-    state.present.width = 2;
-    state.present.height = 2;
+    state
+        .presentation
+        .present
+        .set_console_geometry_for_test(2, 2);
     assert!(!capture_present_frame(&mut state, bad, 2, 2, gen_b + 1));
     assert_eq!(
-        &state.present.frame_bgra[..16],
+        &state.presentation.present.frame().pixels()[..16],
         &frame_b[..],
         "failed capture must not disturb the prior retain"
     );
     assert_eq!(
-        state.present.capture_scratch.len(),
+        state.presentation.present.frame().scratch_len(),
         16,
         "failed capture recycles its (untouched) scratch"
     );
@@ -552,7 +543,7 @@ fn capture_recycles_scratch_and_keeps_prior_retain_on_failure() {
 fn display_swap_snapshot_stable_against_post_swap_writeback() {
     use crate::runtime::mapping_write::write_bgra8;
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     let pfn = 0x20u32;
     let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
@@ -561,10 +552,10 @@ fn display_swap_snapshot_stable_against_post_swap_writeback() {
     let mid = 3u32;
     assert!(state.map_surface(mid));
     {
-        let m = state.mappings.get_mut(&mid).unwrap();
-        m.mapped = true;
-        m.mapping_internal = 1;
-        m.page_entries = vec![entry];
+        let m = state.surfaces.mappings.get_mut(&mid).unwrap();
+        m.lifecycle.active = true;
+        m.lifecycle.internal_kva = 1;
+        m.pages.entries = vec![entry];
     }
     assert!(state.set_mapping_geom(mid, 2, 2, MTL_FORMAT_BGRA8_UNORM));
     // Frame A: solid blue-ish BGRA.
@@ -573,16 +564,26 @@ fn display_swap_snapshot_stable_against_post_swap_writeback() {
         0xFF,
     ];
     assert!(write_bgra8(&mut state, &mut host, mid, &frame_a, 8, 2, 2));
-    let gen = state.mappings.get(&mid).unwrap().content_generation;
+    let gen = state
+        .surfaces
+        .mappings
+        .get(&mid)
+        .unwrap()
+        .content
+        .guest_page_generation;
     // Present path state as after DisplaySwap (encode pending → first paint).
-    state.present.frame_flush_seen = true;
-    state.present.host_mapping = mid;
-    state.present.present_mapping = mid;
-    state.present.width = 2;
-    state.present.height = 2;
-    state.present.generation = gen;
-    state.present.frame_encode_pending = true;
-    state.present.frame_valid = false;
+    state.presentation.present.cross_content_boundary();
+    state.presentation.present.begin_present(mid);
+    state
+        .presentation
+        .present
+        .set_console_geometry_for_test(2, 2);
+    state
+        .presentation
+        .present
+        .set_console_generation_for_test(gen);
+    state.presentation.present.mark_frame_encode_pending();
+    state.presentation.present.invalidate_frame_for_test();
 
     // First host paint encodes A.
     let mut dst = vec![0u8; 16];
@@ -591,8 +592,8 @@ fn display_swap_snapshot_stable_against_post_swap_writeback() {
         ScanoutCopyResult::Painted
     );
     assert_eq!(&dst[..], &frame_a[..]);
-    assert!(state.present.frame_valid);
-    assert!(!state.present.frame_encode_pending);
+    assert!(state.presentation.present.frame().is_valid());
+    assert!(!state.presentation.present.frame().encode_pending());
 
     // Post-encode composite mutates guest pages (mid-pass / next damage).
     let frame_b = [
@@ -607,7 +608,10 @@ fn display_swap_snapshot_stable_against_post_swap_writeback() {
         ScanoutCopyResult::Unchanged
     );
     // Force re-blit snapshot (generation match still A after paint).
-    state.present.painted_generation = 0;
+    state
+        .presentation
+        .present
+        .set_painted_generation_for_test(0);
     assert_eq!(
         copy_to_bgra8(&mut state, &mut host, mid, &mut dst, 8, 2, 2, gen),
         ScanoutCopyResult::Painted
@@ -623,7 +627,7 @@ fn display_swap_snapshot_stable_against_post_swap_writeback() {
 fn capture_forces_paint_even_when_painted_mid_gen_already_match() {
     use crate::runtime::mapping_write::write_bgra8;
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     let mid = 2u32;
     let pfn = 0x50u32;
@@ -632,10 +636,10 @@ fn capture_forces_paint_even_when_painted_mid_gen_already_match() {
     let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
     assert!(state.map_surface(mid));
     {
-        let m = state.mappings.get_mut(&mid).unwrap();
-        m.mapped = true;
-        m.mapping_internal = 1;
-        m.page_entries = vec![entry];
+        let m = state.surfaces.mappings.get_mut(&mid).unwrap();
+        m.lifecycle.active = true;
+        m.lifecycle.internal_kva = 1;
+        m.pages.entries = vec![entry];
     }
     assert!(state.set_mapping_geom(mid, 2, 2, MTL_FORMAT_BGRA8_UNORM));
     // Guest composite: logo-class sparse (non-black BGRA).
@@ -644,22 +648,32 @@ fn capture_forces_paint_even_when_painted_mid_gen_already_match() {
         0xFF,
     ];
     assert!(write_bgra8(&mut state, &mut host, mid, &logo, 8, 2, 2));
-    let gen = state.mappings.get(&mid).unwrap().content_generation;
+    let gen = state
+        .surfaces
+        .mappings
+        .get(&mid)
+        .unwrap()
+        .content
+        .guest_page_generation;
 
     // Early paint already "painted" this mid@gen (EFI path or prior live
     // paint) — the false Unchanged class without encode_pending.
-    state.present.painted_mapping = mid;
-    state.present.painted_generation = gen;
-    state.present.frame_flush_seen = true;
-    state.present.width = 2;
-    state.present.height = 2;
+    state.presentation.present.record_painted_identity(mid, gen);
+    state.presentation.present.cross_content_boundary();
+    state
+        .presentation
+        .present
+        .set_console_geometry_for_test(2, 2);
 
     assert!(capture_present_frame(&mut state, mid, 2, 2, gen));
     assert!(
-        state.present.frame_encode_pending,
+        state.presentation.present.frame().encode_pending(),
         "capture must force next paint of +0x188"
     );
-    assert_eq!(&state.present.frame_bgra[..16], &logo[..]);
+    assert_eq!(
+        &state.presentation.present.frame().pixels()[..16],
+        &logo[..]
+    );
 
     let mut dst = vec![0u8; 16];
     assert_eq!(
@@ -668,7 +682,7 @@ fn capture_forces_paint_even_when_painted_mid_gen_already_match() {
         "must blit retain even when painted mid/gen already match"
     );
     assert_eq!(&dst[..], &logo[..]);
-    assert!(!state.present.frame_encode_pending);
+    assert!(!state.presentation.present.frame().encode_pending());
     // Second paint: true Unchanged (console holds +0x188).
     assert_eq!(
         copy_to_bgra8(&mut state, &mut host, mid, &mut dst, 8, 2, 2, gen),
@@ -679,7 +693,7 @@ fn capture_forces_paint_even_when_painted_mid_gen_already_match() {
 /// The full-frame readback exists for exactly one reason: the DISPLAY needs
 /// CPU pixels. Two halves:
 ///
-/// - a resident carrying (`display_from_resident`) → NO readback, ever, however
+/// - a resident carrying the current present → NO readback, ever, however
 ///   long since the last one.
 ///   The proxies are fed by the GPU reduction instead, so there is no
 ///   sampling floor forcing a copy any more. `frame_bgra` is dropped rather
@@ -697,7 +711,7 @@ fn capture_forces_paint_even_when_painted_mid_gen_already_match() {
 fn readback_runs_only_for_the_display_never_for_the_proxies() {
     use crate::runtime::mapping_write::write_bgra8;
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     let mid = 2u32;
     let pfn = 0x20u32;
@@ -706,47 +720,62 @@ fn readback_runs_only_for_the_display_never_for_the_proxies() {
     let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
     assert!(state.map_surface(mid));
     {
-        let m = state.mappings.get_mut(&mid).unwrap();
-        m.mapped = true;
-        m.mapping_internal = 1;
-        m.page_entries = vec![entry];
+        let m = state.surfaces.mappings.get_mut(&mid).unwrap();
+        m.lifecycle.active = true;
+        m.lifecycle.internal_kva = 1;
+        m.pages.entries = vec![entry];
     }
     assert!(state.set_mapping_geom(mid, 2, 2, MTL_FORMAT_BGRA8_UNORM));
 
     // No resident carrying: the display needs pixels, so the readback runs.
     let frame_a = [0x11u8, 0x22, 0x33, 0xFF].repeat(4);
     assert!(write_bgra8(&mut state, &mut host, mid, &frame_a, 8, 2, 2));
-    let gen_a = state.mappings.get(&mid).unwrap().content_generation;
+    let gen_a = state
+        .surfaces
+        .mappings
+        .get(&mid)
+        .unwrap()
+        .content
+        .guest_page_generation;
     assert!(capture_present_frame(&mut state, mid, 2, 2, gen_a));
     assert_eq!(
-        &state.present.frame_bgra[..16],
+        &state.presentation.present.frame().pixels()[..16],
         &frame_a[..],
         "display fallback must read back when no resident carries the frame"
     );
-    assert_eq!(state.present.full_captures, 1);
-    assert_eq!(state.present.light_captures, 0);
+    assert_eq!(state.presentation.present.capture_counts(), (1, 0));
 
     // A resident carrying: there must be no readback.
-    state.present.display_from_resident = true;
+    state
+        .presentation
+        .present
+        .set_current_present_resident_carried(true);
     let frame_b = [0x44u8, 0x55, 0x66, 0xFF].repeat(4);
     assert!(write_bgra8(&mut state, &mut host, mid, &frame_b, 8, 2, 2));
-    let gen_b = state.mappings.get(&mid).unwrap().content_generation;
+    let gen_b = state
+        .surfaces
+        .mappings
+        .get(&mid)
+        .unwrap()
+        .content
+        .guest_page_generation;
     assert_ne!(gen_a, gen_b);
     assert!(capture_present_frame(&mut state, mid, 2, 2, gen_b));
     assert_eq!(
-        state.present.full_captures, 1,
+        state.presentation.present.capture_counts().0,
+        1,
         "no sampling floor may force a copy once the GPU oracle feeds proxies"
     );
     assert!(
-        state.present.frame_bgra.is_empty(),
+        state.presentation.present.frame().pixels().is_empty(),
         "the readback did not run, so no frame belongs to this present"
     );
-    assert_eq!(state.present.light_captures, 1);
+    assert_eq!(state.presentation.present.capture_counts().1, 1);
     // Present metadata still advances so the fresh resident gets exported.
-    assert_eq!(state.present.frame_generation, gen_b);
-    assert_eq!(state.present.frame_mapping, mid);
-    assert!(state.present.frame_valid);
-    assert!(state.present.frame_encode_pending);
+    assert_eq!(state.presentation.present.frame().generation(), gen_b);
+    assert_eq!(state.presentation.present.frame().mapping(), mid);
+    assert!(state.presentation.present.frame().is_valid());
+    assert!(state.presentation.present.frame().encode_pending());
 }
 
 /// qemu-shim DisplaySwap: guest pages are the single capture source
@@ -756,7 +785,7 @@ fn readback_runs_only_for_the_display_never_for_the_proxies() {
 fn capture_present_reads_pages_and_fails_when_unreadable() {
     use crate::runtime::mapping_write::write_bgra8;
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     let mid = 3u32;
     let pfn = 0x40u32;
@@ -765,25 +794,34 @@ fn capture_present_reads_pages_and_fails_when_unreadable() {
     let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
     assert!(state.map_surface(mid));
     {
-        let m = state.mappings.get_mut(&mid).unwrap();
-        m.mapped = true;
-        m.mapping_internal = 1;
-        m.page_entries = vec![entry];
+        let m = state.surfaces.mappings.get_mut(&mid).unwrap();
+        m.lifecycle.active = true;
+        m.lifecycle.internal_kva = 1;
+        m.pages.entries = vec![entry];
     }
     assert!(state.set_mapping_geom(mid, 2, 2, MTL_FORMAT_BGRA8_UNORM));
 
     // Finished composite in pages: solid white BGRA.
     let white = [0xFFu8; 16];
     assert!(write_bgra8(&mut state, &mut host, mid, &white, 8, 2, 2));
-    let gen = state.mappings.get(&mid).unwrap().content_generation;
+    let gen = state
+        .surfaces
+        .mappings
+        .get(&mid)
+        .unwrap()
+        .content
+        .guest_page_generation;
     assert!(capture_present_frame(&mut state, mid, 2, 2, gen));
-    assert_eq!(&state.present.frame_bgra[0..4], &[255, 255, 255, 255]);
+    assert_eq!(
+        &state.presentation.present.frame().pixels()[0..4],
+        &[255, 255, 255, 255]
+    );
 
     // Page table unreadable + host-cache evicted → capture fails
     // (guest pages unreadable and no host encode retain).
     {
-        let m = state.mappings.get_mut(&mid).unwrap();
-        m.page_entries.clear();
+        let m = state.surfaces.mappings.get_mut(&mid).unwrap();
+        m.pages.entries.clear();
     }
     crate::runtime::surface_cache::forget(&mut state, mid);
     assert!(!capture_present_frame(&mut state, mid, 2, 2, gen + 1));
@@ -797,17 +835,17 @@ fn capture_present_reads_pages_and_fails_when_unreadable() {
 fn dual_mid_host_action_paints_latest_plus188_not_recycled_pages() {
     use crate::runtime::mapping_write::write_bgra8;
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     for (mid, pfn) in [(3u32, 0x30u32), (4u32, 0x31u32)] {
         let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
         host.map_range(gpa, 0x4000, 0);
         let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
         assert!(state.map_surface(mid));
-        let m = state.mappings.get_mut(&mid).unwrap();
-        m.mapped = true;
-        m.mapping_internal = 1;
-        m.page_entries = vec![entry];
+        let m = state.surfaces.mappings.get_mut(&mid).unwrap();
+        m.lifecycle.active = true;
+        m.lifecycle.internal_kva = 1;
+        m.pages.entries = vec![entry];
         assert!(state.set_mapping_geom(mid, 2, 2, MTL_FORMAT_BGRA8_UNORM));
     }
 
@@ -815,32 +853,50 @@ fn dual_mid_host_action_paints_latest_plus188_not_recycled_pages() {
     let black = [0x00u8; 16];
     let logo = [0xAAu8; 16];
     assert!(write_bgra8(&mut state, &mut host, 3, &white, 8, 2, 2));
-    let gen3 = state.mappings.get(&3).unwrap().content_generation;
+    let gen3 = state
+        .surfaces
+        .mappings
+        .get(&3)
+        .unwrap()
+        .content
+        .guest_page_generation;
     // DisplaySwap mid3: +0x188 = white.
     assert!(capture_present_frame(&mut state, 3, 2, 2, gen3));
-    state.present.frame_flush_seen = true;
-    state.present.host_mapping = 3;
-    state.present.present_mapping = 3;
-    state.present.width = 2;
-    state.present.height = 2;
-    state.present.generation = gen3;
+    state.presentation.present.cross_content_boundary();
+    state.presentation.present.begin_present(3);
+    state
+        .presentation
+        .present
+        .set_console_geometry_for_test(2, 2);
+    state
+        .presentation
+        .present
+        .set_console_generation_for_test(gen3);
 
     // Guest recycles mid3 after stamp (logo damage / partial composite).
     assert!(write_bgra8(&mut state, &mut host, 3, &logo, 8, 2, 2));
 
     // DisplaySwap mid4: PGDisplay presentFrame installs named mid4 black.
     assert!(write_bgra8(&mut state, &mut host, 4, &black, 8, 2, 2));
-    let gen4 = state.mappings.get(&4).unwrap().content_generation;
+    let gen4 = state
+        .surfaces
+        .mappings
+        .get(&4)
+        .unwrap()
+        .content
+        .guest_page_generation;
     assert!(capture_present_frame(&mut state, 4, 2, 2, gen4));
-    state.present.host_mapping = 4;
-    state.present.present_mapping = 4;
-    state.present.generation = gen4;
+    state.presentation.present.begin_present(4);
+    state
+        .presentation
+        .present
+        .set_console_generation_for_test(gen4);
     assert_eq!(
-        &state.present.frame_bgra[..],
+        state.presentation.present.frame().pixels(),
         &black[..],
         "presentFrame replaces +0x188 with named mid"
     );
-    assert_eq!(state.present.frame_mapping, 4);
+    assert_eq!(state.presentation.present.frame().mapping(), 4);
 
     // Late HostAction for mid3 — encodeCurrentFrame shows current +0x188 (mid4).
     let mut dst = vec![0u8; 16];
@@ -869,7 +925,7 @@ fn dual_mid_host_action_paints_latest_plus188_not_recycled_pages() {
 fn capture_fail_keeps_prior_frame() {
     use crate::runtime::mapping_write::write_bgra8;
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     let pfn = 0x20u32;
     let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
@@ -877,10 +933,10 @@ fn capture_fail_keeps_prior_frame() {
     let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
     assert!(state.map_surface(1));
     {
-        let m = state.mappings.get_mut(&1).unwrap();
-        m.mapped = true;
-        m.mapping_internal = 1;
-        m.page_entries = vec![entry];
+        let m = state.surfaces.mappings.get_mut(&1).unwrap();
+        m.lifecycle.active = true;
+        m.lifecycle.internal_kva = 1;
+        m.pages.entries = vec![entry];
     }
     assert!(state.set_mapping_geom(1, 2, 2, MTL_FORMAT_BGRA8_UNORM));
     let mut content = [0u8; 16];
@@ -889,16 +945,22 @@ fn capture_fail_keeps_prior_frame() {
     content[2] = 80;
     content[3] = 255;
     assert!(write_bgra8(&mut state, &mut host, 1, &content, 8, 2, 2));
-    let gen1 = state.mappings.get(&1).unwrap().content_generation;
+    let gen1 = state
+        .surfaces
+        .mappings
+        .get(&1)
+        .unwrap()
+        .content
+        .guest_page_generation;
     assert!(capture_present_frame(&mut state, 1, 2, 2, gen1));
-    assert_eq!(&state.present.frame_bgra[..], &content[..]);
+    assert_eq!(state.presentation.present.frame().pixels(), &content[..]);
 
     // Mid2 never mapped — capture fails; prior retain intact.
     assert!(state.map_surface(2));
     assert!(state.set_mapping_geom(2, 2, 2, MTL_FORMAT_BGRA8_UNORM));
     assert!(!capture_present_frame(&mut state, 2, 2, 2, 1));
-    assert_eq!(&state.present.frame_bgra[..], &content[..]);
-    assert_eq!(state.present.frame_mapping, 1);
+    assert_eq!(state.presentation.present.frame().pixels(), &content[..]);
+    assert_eq!(state.presentation.present.frame().mapping(), 1);
 }
 
 /// Dual-mid qemu-shim: Clear Store (seed=None) on lagging mid must wipe prior
@@ -908,7 +970,7 @@ fn capture_fail_keeps_prior_frame() {
 fn dual_mid_clear_store_then_display_swap_both_composites() {
     use crate::runtime::mapping_write::{write_bgra8, write_rgba8_image_changed};
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     // Two 2x2 mids, separate pages.
     for (mid, pfn) in [(3u32, 0x30u32), (4u32, 0x31u32)] {
@@ -916,10 +978,10 @@ fn dual_mid_clear_store_then_display_swap_both_composites() {
         host.map_range(gpa, 0x4000, 0);
         let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
         assert!(state.map_surface(mid));
-        let m = state.mappings.get_mut(&mid).unwrap();
-        m.mapped = true;
-        m.mapping_internal = 1;
-        m.page_entries = vec![entry];
+        let m = state.surfaces.mappings.get_mut(&mid).unwrap();
+        m.lifecycle.active = true;
+        m.lifecycle.internal_kva = 1;
+        m.pages.entries = vec![entry];
         assert!(state.set_mapping_geom(mid, 2, 2, MTL_FORMAT_BGRA8_UNORM));
         // Boot logo seed on both.
         let logo = [0xAAu8; 16];
@@ -936,15 +998,25 @@ fn dual_mid_clear_store_then_display_swap_both_composites() {
     assert!(write_bgra8(&mut state, &mut host, 4, &full, 8, 2, 2));
 
     for (mid, expect) in [(3u32, clear.as_slice()), (4u32, full.as_slice())] {
-        let gen = state.mappings.get(&mid).unwrap().content_generation;
-        state.present.frame_flush_seen = true;
-        state.present.host_mapping = mid;
-        state.present.present_mapping = mid;
-        state.present.width = 2;
-        state.present.height = 2;
-        state.present.generation = gen;
-        state.present.frame_encode_pending = true;
-        state.present.frame_valid = false;
+        let gen = state
+            .surfaces
+            .mappings
+            .get(&mid)
+            .unwrap()
+            .content
+            .guest_page_generation;
+        state.presentation.present.cross_content_boundary();
+        state.presentation.present.begin_present(mid);
+        state
+            .presentation
+            .present
+            .set_console_geometry_for_test(2, 2);
+        state
+            .presentation
+            .present
+            .set_console_generation_for_test(gen);
+        state.presentation.present.mark_frame_encode_pending();
+        state.presentation.present.invalidate_frame_for_test();
         let mut dst = vec![0u8; 16];
         assert_eq!(
             copy_to_bgra8(&mut state, &mut host, mid, &mut dst, 8, 2, 2, gen),
@@ -962,35 +1034,29 @@ fn dual_mid_clear_store_then_display_swap_both_composites() {
 /// a later different-geom front only latches mapping (mode waits DisplaySwap).
 #[test]
 fn pre_boundary_writeback_latches_present_mapping() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
-    assert!(!state.present.frame_flush_seen);
+    assert!(!state.presentation.present.content_boundary_crossed());
     assert!(state.map_surface(1));
     {
-        let m = state.mappings.get_mut(&1).unwrap();
-        m.mapped = true;
-        m.has_geom = true;
-        m.width = 1920;
-        m.height = 1080;
-        m.format = MTL_FORMAT_BGRA8_UNORM;
-        m.page_entries = vec![(1u32 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
-        m.content_generation = 1;
+        let m = state.surfaces.mappings.get_mut(&1).unwrap();
+        m.lifecycle.active = true;
+        m.publish_geometry_for_test(1920, 1080, MTL_FORMAT_BGRA8_UNORM);
+        m.pages.entries = vec![(1u32 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
+        m.content.guest_page_generation = 1;
     }
     note_front_buffer_writeback(&mut state, &mut host, 1, 1920, 1080, MTL_FORMAT_BGRA8_UNORM);
-    assert_eq!(state.present.present_mapping, 1);
+    assert_eq!(state.presentation.present.presented_mapping(), 1);
     assert_eq!(host.actions.len(), 1);
 
     // Mode-switch size: latch new mid, no paint/resize.
     assert!(state.map_surface(3));
     {
-        let m = state.mappings.get_mut(&3).unwrap();
-        m.mapped = true;
-        m.has_geom = true;
-        m.width = 1440;
-        m.height = 1080;
-        m.format = MTL_FORMAT_RGBA16_FLOAT;
-        m.page_entries = vec![(2u32 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
-        m.content_generation = 2;
+        let m = state.surfaces.mappings.get_mut(&3).unwrap();
+        m.lifecycle.active = true;
+        m.publish_geometry_for_test(1440, 1080, MTL_FORMAT_RGBA16_FLOAT);
+        m.pages.entries = vec![(2u32 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
+        m.content.guest_page_generation = 2;
     }
     host.actions.clear();
     note_front_buffer_writeback(
@@ -1002,9 +1068,9 @@ fn pre_boundary_writeback_latches_present_mapping() {
         MTL_FORMAT_RGBA16_FLOAT,
     );
     assert!(host.actions.is_empty());
-    assert_eq!(state.present.present_mapping, 3);
-    assert_eq!(state.present.width, 1920);
-    assert_eq!(state.present.height, 1080);
+    assert_eq!(state.presentation.present.presented_mapping(), 3);
+    assert_eq!(state.presentation.present.console_width(), 1920);
+    assert_eq!(state.presentation.present.console_height(), 1080);
 }
 
 /// Regression guard for `present_dims`, the scanout sizing lookup. The
@@ -1016,23 +1082,23 @@ fn pre_boundary_writeback_latches_present_mapping() {
 /// axis must NOT be trusted (it falls through to the present dims).
 #[test]
 fn present_dims_precedence_mapping_then_present_then_zero() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mid = 5u32;
 
     // No mapping, no present -> (0, 0), never a partial/garbage size.
     assert_eq!(present_dims(&state, mid), (0, 0));
 
     // Present dims present but no valid mapping geometry -> present dims.
-    state.present.width = 1440;
-    state.present.height = 900;
+    state
+        .presentation
+        .present
+        .set_console_geometry_for_test(1440, 900);
     assert_eq!(present_dims(&state, mid), (1440, 900));
 
     assert!(state.map_surface(mid));
     {
-        let m = state.mappings.get_mut(&mid).unwrap();
-        m.width = 800;
-        m.height = 600;
-        m.has_geom = false; // geometry not yet valid
+        let m = state.surfaces.mappings.get_mut(&mid).unwrap();
+        m.clear_geometry_for_test(); // geometry not yet valid
     }
     assert_eq!(
         present_dims(&state, mid),
@@ -1042,9 +1108,8 @@ fn present_dims_precedence_mapping_then_present_then_zero() {
 
     // A zero axis is not valid mapping geometry either.
     {
-        let m = state.mappings.get_mut(&mid).unwrap();
-        m.has_geom = true;
-        m.height = 0;
+        let m = state.surfaces.mappings.get_mut(&mid).unwrap();
+        m.publish_geometry_for_test(800, 0, 0);
     }
     assert_eq!(
         present_dims(&state, mid),
@@ -1054,8 +1119,8 @@ fn present_dims_precedence_mapping_then_present_then_zero() {
 
     // Fully valid mapping geometry wins over the retained present dims.
     {
-        let m = state.mappings.get_mut(&mid).unwrap();
-        m.height = 600;
+        let m = state.surfaces.mappings.get_mut(&mid).unwrap();
+        m.publish_geometry_for_test(800, 600, 0);
     }
     assert_eq!(present_dims(&state, mid), (800, 600));
 }
@@ -1171,17 +1236,17 @@ fn blit_bgra_buffer_row_offsets_and_bounds_are_exact() {
 fn capture_reads_only_the_named_surface_never_a_same_geometry_peer() {
     use crate::runtime::mapping_write::write_bgra8;
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     for (mid, pfn) in [(1u32, 0x40u32), (5u32, 0x41u32)] {
         let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
         host.map_range(gpa, 0x4000, 0);
         let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
         assert!(state.map_surface(mid));
-        let m = state.mappings.get_mut(&mid).unwrap();
-        m.mapped = true;
-        m.mapping_internal = 1;
-        m.page_entries = vec![entry];
+        let m = state.surfaces.mappings.get_mut(&mid).unwrap();
+        m.lifecycle.active = true;
+        m.lifecycle.internal_kva = 1;
+        m.pages.entries = vec![entry];
         assert!(state.set_mapping_geom(mid, 2, 2, MTL_FORMAT_BGRA8_UNORM));
     }
 
@@ -1190,12 +1255,18 @@ fn capture_reads_only_the_named_surface_never_a_same_geometry_peer() {
     let grey = [0x55u8; 16];
     let white = [0xFFu8; 16];
     assert!(write_bgra8(&mut state, &mut host, 1, &grey, 8, 2, 2));
-    let gen1 = state.mappings.get(&1).unwrap().content_generation;
+    let gen1 = state
+        .surfaces
+        .mappings
+        .get(&1)
+        .unwrap()
+        .content
+        .guest_page_generation;
     assert!(write_bgra8(&mut state, &mut host, 5, &white, 8, 2, 2));
 
     // Capture the named mid with no peer published: the baseline frame.
     assert!(capture_present_frame(&mut state, 1, 2, 2, gen1));
-    let alone = state.present.frame_bgra.clone();
+    let alone = state.presentation.present.frame().pixels().to_vec();
     assert_eq!(&alone[..], &grey[..]);
 
     // Publish a full frame for the peer as well, then re-capture.
@@ -1208,65 +1279,68 @@ fn capture_reads_only_the_named_surface_never_a_same_geometry_peer() {
     // later write by program order. (The model tracks no cross-mapping write
     // stamp to assert that with: the one it had existed only to feed a
     // present-staleness census and went with it.)
-    let peer = state.mappings.get(&5).unwrap();
-    assert_eq!((peer.width, peer.height), (2, 2));
+    let peer = state.surfaces.mappings.get(&5).unwrap();
+    assert_eq!(peer.geometry().map(|g| (g.width, g.height)), Some((2, 2)));
     assert_ne!(&grey[..], &white[..]);
-    state.present.frame_bgra.clear();
-    state.present.frame_valid = false;
+    state.presentation.present.clear_frame_pixels_for_test();
+    state.presentation.present.invalidate_frame_for_test();
     assert!(capture_present_frame(&mut state, 1, 2, 2, gen1));
     assert_eq!(
-        &state.present.frame_bgra[..],
+        state.presentation.present.frame().pixels(),
         &alone[..],
         "a same-geometry peer must not change the named surface's frame"
     );
-    assert_eq!(state.present.frame_mapping, 1);
+    assert_eq!(state.presentation.present.frame().mapping(), 1);
 }
 
 /// A light capture must leave no frame behind, because everything
 /// downstream reads "is there a frame for this present" off
 /// `frame_bgra.is_empty()`.
 ///
-/// Skipping the readback only leaves the buffer empty if it was empty going
-/// in, and on a real boot it is not: the first present runs the full path
-/// before the guest has painted anything, capturing black, and direct
-/// present then carries every frame after it. Boot 86 on the x86/Vulkan rail
-/// judged that one frame `Black` on 481 of 481 presents — 0 `present_content`
-/// and 0 `present_content_unsampled` — while the host window rendered
-/// correctly from settle through an 11-minute idle.
+/// A prior CPU-backed present may have populated the buffer. The direct path
+/// must clear it so downstream consumers cannot mistake stale bytes for the
+/// current resident-carried present.
 #[test]
 fn a_light_capture_leaves_no_stale_frame_behind() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let (w, h) = (64u32, 64u32);
-    // The frame a full capture leaves: opaque, RGB black — the first present
-    // of a boot, before anything has been composited.
+    // The frame a prior CPU capture leaves: opaque RGB black.
     let stale: Vec<u8> = (0..(w * h) as usize).flat_map(|_| [0, 0, 0, 255]).collect();
-    state.present.frame_bgra = stale.clone();
-    state.present.frame_width = w;
-    state.present.frame_height = h;
+    state
+        .presentation
+        .present
+        .replace_frame_pixels_for_test(stale.clone());
+    state
+        .presentation
+        .present
+        .set_frame_identity_for_test(0, w, h, 0, 0);
 
     // Direct present is carrying the display, so this capture takes the
     // light path and reads back nothing.
-    state.present.display_from_resident = true;
-    let before = state.present.light_captures;
+    state
+        .presentation
+        .present
+        .set_current_present_resident_carried(true);
+    let before = state.presentation.present.capture_counts().1;
     assert!(capture_present_frame(&mut state, 1, w, h, 1));
     assert_eq!(
-        state.present.light_captures,
+        state.presentation.present.capture_counts().1,
         before.wrapping_add(1),
         "the light path is the one under test"
     );
     assert!(
-        state.present.frame_bgra.is_empty(),
+        state.presentation.present.frame().pixels().is_empty(),
         "a light capture wrote no pixels, so it must not leave {} bytes of an \
          earlier present for the content verdict and the console blit to read \
          as this one",
-        state.present.frame_bgra.len()
+        state.presentation.present.frame().pixels().len()
     );
 
     // And the verdict that reads it now says so, instead of reporting the
     // stale frame's colour as this present's.
     use crate::runtime::drain::present_content_verdict;
     assert_eq!(
-        present_content_verdict(&state.present.frame_bgra, 0),
+        present_content_verdict(state.presentation.present.frame().pixels(), 0),
         crate::runtime::drain::PresentContentVerdict::Unsampled
     );
     assert_eq!(
@@ -1307,9 +1381,9 @@ fn the_efi_console_paint_refuses_a_bar_backed_framebuffer_and_accepts_a_ram_one(
     let span = (h as u64) * (stride as u64);
 
     let paint = |non_ram: bool| {
-        let mut state = DeviceState::new(DeviceId(1), crate::model::PAGE_SHIFT_X86);
-        state.gfx.efi_fb_start = fb;
-        state.gfx.efi_fb_stride = stride;
+        let mut state = Device::new(DeviceId(1), crate::model::PAGE_SHIFT_X86);
+        state.registers.gfx.efi_fb_start = fb;
+        state.registers.gfx.efi_fb_stride = stride;
         let mut host = FakeHost::new();
         // Real bytes either way, so the two cases differ only in how the host
         // classifies the span -- which is what production refuses on.
@@ -1371,9 +1445,9 @@ fn a_console_row_that_leaves_ram_mid_copy_is_not_the_two_doors_disagreeing() {
     let span = (h as u64) * (stride as u64);
     let page = 1u64 << crate::model::PAGE_SHIFT_X86;
 
-    let mut state = DeviceState::new(DeviceId(1), crate::model::PAGE_SHIFT_X86);
-    state.gfx.efi_fb_start = fb;
-    state.gfx.efi_fb_stride = stride;
+    let mut state = Device::new(DeviceId(1), crate::model::PAGE_SHIFT_X86);
+    state.registers.gfx.efi_fb_start = fb;
+    state.registers.gfx.efi_fb_stride = stride;
 
     let mut host = FakeHost::new();
     host.map_range(fb, span as usize, 0);
@@ -1411,11 +1485,11 @@ fn the_efi_console_paint_refuses_a_span_whose_hole_is_not_at_either_end() {
     let span = (h as u64) * (stride as u64);
     let page = 1u64 << crate::model::PAGE_SHIFT_X86;
 
-    use crate::runtime::host::HostOps;
+    use crate::runtime::host::HostPageViews;
 
-    let mut state = DeviceState::new(DeviceId(1), crate::model::PAGE_SHIFT_X86);
-    state.gfx.efi_fb_start = fb;
-    state.gfx.efi_fb_stride = stride;
+    let mut state = Device::new(DeviceId(1), crate::model::PAGE_SHIFT_X86);
+    state.registers.gfx.efi_fb_start = fb;
+    state.registers.gfx.efi_fb_stride = stride;
 
     let mut host = FakeHost::new();
     host.map_range(fb, span as usize, 0);

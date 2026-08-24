@@ -34,10 +34,11 @@
 //! each face separately. Every case gives its face a value the other face does
 //! not hold, so a view that swapped them would report a value no case produced.
 //!
-//! `reims-vgpu`'s `decode/resource` reads this record with the same offsets
-//! and the same bit assignments. It also names bits 4 and 5 of `depth_state`
-//! `front_stencil_enabled` and `back_stencil_enabled`; see
-//! [`DepthStencilBody::unidentified_state_bits`] for why this crate does not.
+//! Bits 4 and 5 record whether the front and back face objects are present.
+//! Publicly assigning `nil` does not exercise absence because the descriptor
+//! normalizes it back to a default face. Clearing each private face slot before
+//! serialization independently clears its bit and leaves that 12-byte face
+//! slot unwritten.
 
 use crate::le::U32le;
 use crate::op::Op;
@@ -124,9 +125,13 @@ pub struct DepthStencilBody {
     /// Never written by the serializer; on a real wire the guest's stale ring.
     /// Named so nothing reads them by reaching past `depth_state`.
     pub unwritten_after_depth_state: [u8; 3],
-    /// Front-facing stencil.
+    /// Raw front-face slot. It is unwritten when
+    /// [`Self::front_stencil_present`] is false; semantic consumers use
+    /// [`Self::front_stencil`] instead.
     pub front: StencilFace,
-    /// Back-facing stencil.
+    /// Raw back-face slot. It is unwritten when
+    /// [`Self::back_stencil_present`] is false; semantic consumers use
+    /// [`Self::back_stencil`] instead.
     pub back: StencilFace,
 }
 
@@ -152,23 +157,40 @@ impl DepthStencilBody {
         self.depth_state & (1 << 3) != 0
     }
 
-    /// `depth_state[5:4]` — two bits the serializer writes that read `0b11` in
-    /// every case, and that no perturbation has moved.
+    /// Whether a front-face stencil object is present, `depth_state[4]`.
     ///
-    /// `reims-vgpu`'s ported decoder calls them `front_stencil_enabled` and
-    /// `back_stencil_enabled`. That is a plausible reading and the experiment
-    /// that would confirm it has been run and does **not**: setting
-    /// `frontFaceStencil`, `backFaceStencil` or both to `nil` produces a record
-    /// byte-identical to one with default faces, ref aside. Metal substitutes a
-    /// default face before the serializer sees the descriptor, so from this API
-    /// there is no such thing as a state with a face absent.
-    ///
-    /// To settle them: a source other than `MTLDepthStencilDescriptor` — the
-    /// guest driver's own builder, or a serializer driven from a decoded state
-    /// rather than a descriptor.
+    /// Clearing the descriptor's private front-face slot before serialization
+    /// clears this bit and leaves only the front-face body unwritten. This is
+    /// presence, not whether the face performs useful stencil reads or writes:
+    /// a default present face performs neither.
     #[inline]
-    pub fn unidentified_state_bits(&self) -> u8 {
-        (self.depth_state >> 4) & 0x3
+    pub fn front_stencil_present(&self) -> bool {
+        self.depth_state & (1 << 4) != 0
+    }
+
+    /// Whether a back-face stencil object is present, `depth_state[5]`.
+    ///
+    /// Clearing the descriptor's private back-face slot before serialization
+    /// clears this bit and leaves only the back-face body unwritten. Publicly
+    /// assigning `nil` is not equivalent: the descriptor substitutes a default
+    /// face.
+    #[inline]
+    pub fn back_stencil_present(&self) -> bool {
+        self.depth_state & (1 << 5) != 0
+    }
+
+    /// The front-face declaration, only when its presence bit makes the slot
+    /// initialized wire data.
+    #[inline]
+    pub fn front_stencil(&self) -> Option<&StencilFace> {
+        self.front_stencil_present().then_some(&self.front)
+    }
+
+    /// The back-face declaration, only when its presence bit makes the slot
+    /// initialized wire data.
+    #[inline]
+    pub fn back_stencil(&self) -> Option<&StencilFace> {
+        self.back_stencil_present().then_some(&self.back)
     }
 }
 
@@ -242,7 +264,8 @@ mod tests {
         assert_eq!(d.object_ref.get(), 11);
         assert_eq!(d.depth_compare_function(), 7);
         assert!(!d.depth_write_enabled());
-        assert_eq!(d.unidentified_state_bits(), 0b11);
+        assert!(d.front_stencil_present());
+        assert!(d.back_stencil_present());
         for face in [&d.front, &d.back] {
             assert_eq!(face.compare_function(), 7);
             assert_eq!(face.stencil_failure_operation(), 0);
@@ -334,8 +357,26 @@ mod tests {
         );
         assert_eq!(da.depth_compare_function(), db.depth_compare_function());
         assert_eq!(da.depth_write_enabled(), db.depth_write_enabled());
-        assert_eq!(da.unidentified_state_bits(), db.unidentified_state_bits());
+        assert_eq!(da.front_stencil_present(), db.front_stencil_present());
+        assert_eq!(da.back_stencil_present(), db.back_stencil_present());
         assert_eq!(da.front.ops.get(), db.front.ops.get());
+    }
+
+    #[test]
+    fn absent_face_slots_are_not_exposed_as_descriptors() {
+        let buf = synth(
+            0x07,
+            0xaaaa_aaaa,
+            0xaaaa_aaaa,
+            0xaaaa_aaaa,
+            0xaaaa_aaaa,
+            0xaaaa_aaaa,
+            0xaaaa_aaaa,
+        );
+        let o = op(&buf, 0).expect("well formed");
+        let d = new_depth_stencil(&o).expect("fits");
+        assert!(d.front_stencil().is_none());
+        assert!(d.back_stencil().is_none());
     }
 
     #[test]

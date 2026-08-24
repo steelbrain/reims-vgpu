@@ -1,12 +1,12 @@
 //! Host surface cache for Linux/Vulkan discrete-GPU present (kb tahoe-x86 §8.5).
 //!
-//! On Apple Metal hosts, GPU Stores land in guest IOSurface pages (unified
-//! memory). On this Linux product rail guest type-4 pages are **not** filled by
-//! the host GPU until encode writeback; historical product painted from a
+//! On Apple unified-memory hosts, GPU stores can land in guest IOSurface pages.
+//! On the Linux product rail guest surface backing pages are **not** filled by the host
+//! GPU until encode writeback; the product paints from a
 //! **host render-cache** keyed by surface_id. This module is that cache.
 //!
 //! Namespace split (2026-07-13 live x86):
-//! - [`store`] / [`get`] — **type-4 surface_id / mapping_id** only (`host_surfaces`)
+//! - [`store`] / [`get`] — **surface backing surface_id / mapping_id** only (`host_surfaces`)
 //! - [`store_texture`] / [`get_texture`] — type-2/3 color targets by task/object ref
 //! - [`store_gva_owned`] / [`get_gva`] — type-2/3 by target GVA (survives ref rebinding)
 //!
@@ -17,60 +17,51 @@
 //! store; [`crate::runtime::scanout::capture_present_frame`] prefers surface_id
 //! cache content when present so scanout matches what the host executed.
 
-use crate::contract::pixel_format::RGBA8_BPP;
-use crate::model::{scanout_extent_ok, DeviceState, GvaBacking, HostSurface};
+use crate::model::{scanout_extent_ok, GvaBacking, HostSurface};
+pub use crate::model::{LinearMaterializeDecline, LinearReplicaWindow as LinearWindow};
 use crate::runtime::host::HostMemory;
+use crate::runtime::Device;
+use reims_vgpu_core::pixel_format::RGBA8_BPP;
 
 /// `generation` is issued by
-/// [`DeviceState::next_sampled_content_generation`] and is never derived from
+/// [`Device::next_sampled_content_generation`] and is never derived from
 /// the entry being replaced: an entry-local counter restarts whenever the entry
 /// is re-created, and half of this cache's identity contract is that a
 /// generation names one content for the life of the device.
-fn store_into<K: Ord>(
-    map: &mut std::collections::BTreeMap<K, HostSurface>,
-    id: K,
+fn stored_surface(
     width: u32,
     height: u32,
     bgra: std::sync::Arc<Vec<u8>>,
     generation: u64,
-) {
+) -> Option<HostSurface> {
     if !scanout_extent_ok(width, height) {
-        return;
+        return None;
     }
     let need = (height as usize)
         .saturating_mul(width as usize)
         .saturating_mul(RGBA8_BPP as usize);
     if bgra.len() < need {
-        return;
+        return None;
     }
-    let entry = map.entry(id).or_default();
-    entry.host_gen = generation;
-    entry.width = width;
-    entry.height = height;
-    entry.bgra = bgra;
     // These two maps carry no byte cap, so nothing here ever consults the flag.
     // Set anyway rather than left at `Default`: `false` is the value that makes
     // the GVA cap refuse to evict, and an entry that inherits it from a derive
     // would be claiming something no store here has checked.
-    entry.guest_holds_bytes = true;
+    Some(HostSurface {
+        width,
+        height,
+        bgra,
+        host_gen: generation,
+        producer_object_type: 0,
+        last_touch: 0,
+        backing: None,
+        source_gva: 0,
+        guest_holds_bytes: true,
+    })
 }
 
-fn get_from<'a, K: Ord>(
-    map: &'a std::collections::BTreeMap<K, HostSurface>,
-    id: &K,
-    width: u32,
-    height: u32,
-) -> Option<&'a [u8]> {
-    get_from_with_gen(map, id, width, height).map(|(bgra, _)| bgra)
-}
-
-fn get_from_with_gen<'a, K: Ord>(
-    map: &'a std::collections::BTreeMap<K, HostSurface>,
-    id: &K,
-    width: u32,
-    height: u32,
-) -> Option<(&'a [u8], u64)> {
-    let e = map.get(id)?;
+fn get_surface(entry: Option<&HostSurface>, width: u32, height: u32) -> Option<(&[u8], u64)> {
+    let e = entry?;
     if e.width != width || e.height != height || e.bgra.is_empty() {
         return None;
     }
@@ -83,16 +74,36 @@ fn get_from_with_gen<'a, K: Ord>(
     Some((&e.bgra[..need], e.host_gen))
 }
 
-/// Insert/replace host-cache pixels for `surface_id` (type-4 present id).
-pub fn store(state: &mut DeviceState, surface_id: u32, width: u32, height: u32, bgra: Vec<u8>) {
+#[cfg(test)]
+fn get_from_with_gen<'a, K: Ord>(
+    map: &'a std::collections::BTreeMap<K, HostSurface>,
+    id: &K,
+    width: u32,
+    height: u32,
+) -> Option<(&'a [u8], u64)> {
+    get_surface(map.get(id), width, height)
+}
+
+#[cfg(test)]
+fn get_from<'a, K: Ord>(
+    map: &'a std::collections::BTreeMap<K, HostSurface>,
+    id: &K,
+    width: u32,
+    height: u32,
+) -> Option<&'a [u8]> {
+    get_from_with_gen(map, id, width, height).map(|(bytes, _)| bytes)
+}
+
+/// Insert/replace host-cache pixels for `surface_id` (surface backing present id).
+pub fn store(state: &mut Device, surface_id: u32, width: u32, height: u32, bgra: Vec<u8>) {
     store_shared(state, surface_id, width, height, std::sync::Arc::new(bgra));
 }
 
-/// [`store`] for a frame already held behind an `Arc` — the type-11 render Store
+/// [`store`] for a frame already held behind an `Arc` — the IOSurface texture render Store
 /// arms its deferred window with the same allocation, so the frame is stored
 /// once and referenced twice.
 pub fn store_shared(
-    state: &mut DeviceState,
+    state: &mut Device,
     surface_id: u32,
     width: u32,
     height: u32,
@@ -102,14 +113,9 @@ pub fn store_shared(
         return;
     }
     let generation = state.next_sampled_content_generation();
-    store_into(
-        &mut state.host_surfaces,
-        surface_id,
-        width,
-        height,
-        bgra,
-        generation,
-    );
+    if let Some(entry) = stored_surface(width, height, bgra, generation) {
+        state.host_replicas.restore_surface(surface_id, entry);
+    }
 }
 
 /// [`store`] from rows the caller only has as a borrow, reusing the entry's own
@@ -129,7 +135,7 @@ pub fn store_shared(
 /// capture can observe the mutation. When something does hold the frame, this
 /// allocates as before and the old bytes stay intact for their holder.
 pub fn store_rows(
-    state: &mut DeviceState,
+    state: &mut Device,
     surface_id: u32,
     width: u32,
     height: u32,
@@ -145,152 +151,48 @@ pub fn store_rows(
     if need == 0 || src.len() < (height as usize).saturating_mul(src_stride as usize) {
         return;
     }
-    let entry = state.host_surfaces.entry(surface_id).or_default();
-    match std::sync::Arc::get_mut(&mut entry.bgra) {
-        Some(buf) if buf.len() == need => fill_tight_rows(buf, src, src_stride, row, height),
-        _ => {
-            let mut buf = vec![0u8; need];
-            fill_tight_rows(&mut buf, src, src_stride, row, height);
-            entry.bgra = std::sync::Arc::new(buf);
-        }
-    }
-    entry.host_gen = generation;
-    entry.width = width;
-    entry.height = height;
-    // The same reason [`store_into`] sets it: this map has no byte cap, so
-    // nothing reads the flag, but `false` is the value that means "the cap must
-    // not evict this" and an entry reaching it through `or_default` would be
-    // asserting something no store here has checked.
-    entry.guest_holds_bytes = true;
-}
-
-/// Copy `height` rows of `row` bytes out of `src` at `src_stride` pitch into a
-/// tightly packed `dst`.
-///
-/// One `copy_from_slice` when the source is already tight, which is the shape
-/// every readback arrives in — a per-row loop over an 8 MB frame is 1079 calls
-/// that a single memcpy expresses exactly.
-fn fill_tight_rows(dst: &mut [u8], src: &[u8], src_stride: u32, row: usize, height: u32) {
-    if src_stride as usize == row {
-        let n = dst.len().min(src.len());
-        dst[..n].copy_from_slice(&src[..n]);
-        return;
-    }
-    for y in 0..height as usize {
-        let so = y.saturating_mul(src_stride as usize);
-        let doff = y.saturating_mul(row);
-        if so + row <= src.len() && doff + row <= dst.len() {
-            dst[doff..doff + row].copy_from_slice(&src[so..so + row]);
-        }
-    }
+    state
+        .host_replicas
+        .store_surface_rows(surface_id, width, height, src, src_stride, generation);
 }
 
 /// Borrow host-cache frame when geom matches request (surface_id namespace).
-pub fn get(state: &DeviceState, surface_id: u32, width: u32, height: u32) -> Option<&[u8]> {
-    get_from(&state.host_surfaces, &surface_id, width, height)
+pub fn get(state: &Device, surface_id: u32, width: u32, height: u32) -> Option<&[u8]> {
+    get_surface(state.host_replicas.surface(surface_id), width, height).map(|(bytes, _)| bytes)
 }
 
 /// [`get_shared`], plus the generation that names these exact bytes.
 ///
 /// The generation is the entry's `host_gen`, and it is a sampled-content
-/// identity rather than provenance: every writer of this map — [`store_into`],
-/// [`store_rows`] and [`cede_surface_to_resident`] — takes a fresh
-/// [`DeviceState::next_sampled_content_generation`] in the same breath as it
+/// identity rather than provenance: every writer of this map — [`stored_surface`]
+/// and [`store_rows`] — takes a fresh
+/// [`Device::next_sampled_content_generation`] in the same breath as it
 /// changes the bytes, and [`forget`] removes the entry outright. So a repeated
 /// `(surface_id, generation)` pair is a statement that the bytes have not moved,
 /// which is what lets the sampled cache skip re-hashing a frame it already holds.
 ///
-/// The caller is the type-11 sampled ladder's host-cache rung, which without
+/// The caller is the IOSurface texture sampled ladder's host-cache rung, which without
 /// this had no identity to offer and drove every bind through the content
 /// digest: 116 lookups a second over 201 MB, hashed twice each. It takes the
 /// frame as a handle rather than a slice because it hands the bytes to the
 /// engine, which outlives the borrow of `state` — so the rung costs a refcount
 /// and not a full-frame copy.
 pub fn get_shared_with_gen(
-    state: &DeviceState,
+    state: &Device,
     surface_id: u32,
     width: u32,
     height: u32,
 ) -> Option<(std::sync::Arc<Vec<u8>>, u64)> {
-    let (_, host_gen) = get_from_with_gen(&state.host_surfaces, &surface_id, width, height)?;
+    let (_, host_gen) = get_surface(state.host_replicas.surface(surface_id), width, height)?;
     // Deliberately delegated rather than reimplemented: `get_shared` owns the
     // rule for a stored buffer carrying slop past `width * height * 4`, and a
     // second copy of that rule here could drift from it.
     Some((get_shared(state, surface_id, width, height)?, host_gen))
 }
 
-/// Cede this mapping's cached frame to the engine resident a deferred type-11
-/// render Store just pinned: the entry keeps its geometry and its `host_gen`
-/// lineage, and holds no bytes.
-///
-/// The emptiness **is** the cession, and [`get_from`]'s `bgra.is_empty()` gate is
-/// what enforces it — so every reader that goes through [`get`] or [`get_shared`]
-/// misses and falls through to the source that does hold the frame:
-/// [`crate::runtime::scanout::capture_present_frame`] to
-/// `try_capture_from_resident`, and the type-11 LOAD seed to the surface's own
-/// guest pages, which lands this window first. Nothing has to be taught about a
-/// new state.
-///
-/// Retaining the stale bytes as a fallback would be worse than missing. A Store
-/// that skipped its readback has already superseded them, and a consumer served
-/// the previous frame renders a whole compositing layer one frame behind with no
-/// report — which is the class `deferred_flush_lost reason=cache_miss` cost 15
-/// layers in one boot to close.
-///
-/// Returns false for a geometry this cache would not have stored anyway, so the
-/// caller can refuse to arm rather than leave a live entry contradicting a
-/// resident-authoritative window.
-pub fn cede_surface_to_resident(
-    state: &mut DeviceState,
-    surface_id: u32,
-    width: u32,
-    height: u32,
-) -> bool {
-    if surface_id == 0 || !scanout_extent_ok(width, height) {
-        return false;
-    }
-    let generation = state.next_sampled_content_generation();
-    let entry = state.host_surfaces.entry(surface_id).or_default();
-    entry.host_gen = generation;
-    entry.width = width;
-    entry.height = height;
-    entry.bgra = std::sync::Arc::new(Vec::new());
-    true
-}
-
 /// Drop this mapping's cache entry outright.
-///
-/// Distinct from [`cede_surface_to_resident`], and the difference is which
-/// source the reader is being sent to. A cession says "the engine resident holds
-/// this frame"; this says "nothing host-side does — read the surface's own
-/// pages". It is what a writeback that deliberately left some of the guest's own
-/// bytes in place has to do, because after one of those neither the cache nor the
-/// resident holds the mapping's content: they hold the frame the device rendered,
-/// and the pages hold that frame with the guest's stores still in it.
-///
-/// Removes rather than emptying, so [`surface_ceded_to_resident`] does not read
-/// the result as a cession and report a decline that names the wrong source.
-pub fn forget(state: &mut DeviceState, surface_id: u32) {
-    state.host_surfaces.remove(&surface_id);
-}
-
-/// Whether this mapping's cache entry is the ceded shell
-/// [`cede_surface_to_resident`] leaves behind: present at exactly this geometry
-/// and carrying no bytes.
-///
-/// Read by the type-11 LOAD seed's decline classifier so a ceded entry is named
-/// as such instead of being reported as a stale-geometry hit — `get`'s miss is
-/// the same either way, and the two have different fixes.
-pub fn surface_ceded_to_resident(
-    state: &DeviceState,
-    surface_id: u32,
-    width: u32,
-    height: u32,
-) -> bool {
-    state
-        .host_surfaces
-        .get(&surface_id)
-        .is_some_and(|e| e.bgra.is_empty() && e.width == width && e.height == height)
+pub fn forget(state: &mut Device, surface_id: u32) {
+    state.host_replicas.forget_surface(surface_id);
 }
 
 /// [`get`] as a shared handle, for a caller that needs to own the frame past the
@@ -307,13 +209,15 @@ pub fn surface_ceded_to_resident(
 /// compositing layer going solid black. Matching [`get`] means a future producer
 /// with slop costs a copy rather than a defect.
 pub fn get_shared(
-    state: &DeviceState,
+    state: &Device,
     surface_id: u32,
     width: u32,
     height: u32,
 ) -> Option<std::sync::Arc<Vec<u8>>> {
-    let need = get_from(&state.host_surfaces, &surface_id, width, height)?.len();
-    let e = state.host_surfaces.get(&surface_id)?;
+    let need = get_surface(state.host_replicas.surface(surface_id), width, height)?
+        .0
+        .len();
+    let e = state.host_replicas.surface(surface_id)?;
     Some(if e.bgra.len() == need {
         std::sync::Arc::clone(&e.bgra)
     } else {
@@ -328,7 +232,7 @@ pub fn get_shared(
 /// came from the allocation it is about to be served as. Zero when the producer
 /// had no GVA.
 pub fn store_texture(
-    state: &mut DeviceState,
+    state: &mut Device,
     task_id: u32,
     texture_ref: u32,
     width: u32,
@@ -340,32 +244,27 @@ pub fn store_texture(
         return;
     }
     let generation = state.next_sampled_content_generation();
-    store_into(
-        &mut state.host_texture_surfaces,
-        (task_id, texture_ref),
-        width,
-        height,
-        std::sync::Arc::new(bgra),
-        generation,
-    );
-    if let Some(e) = state.host_texture_surfaces.get_mut(&(task_id, texture_ref)) {
-        e.source_gva = source_gva;
+    if let Some(mut entry) = stored_surface(width, height, std::sync::Arc::new(bgra), generation) {
+        entry.source_gva = source_gva;
+        state
+            .host_replicas
+            .restore_texture(task_id, texture_ref, entry);
     }
 }
 
 pub fn get_texture(
-    state: &DeviceState,
+    state: &Device,
     task_id: u32,
     texture_ref: u32,
     width: u32,
     height: u32,
 ) -> Option<&[u8]> {
-    get_from(
-        &state.host_texture_surfaces,
-        &(task_id, texture_ref),
+    get_surface(
+        state.host_replicas.texture(task_id, texture_ref),
         width,
         height,
     )
+    .map(|(bytes, _)| bytes)
 }
 
 /// The address the entry behind [`get_texture`] was produced over, or `None`
@@ -375,32 +274,44 @@ pub fn get_texture(
 /// serve site holds a shared borrow of `state` across the pixel slice, and the
 /// question is asked once per serve while the slice is used per texel.
 pub fn texture_source_gva(
-    state: &DeviceState,
+    state: &Device,
     task_id: u32,
     texture_ref: u32,
     width: u32,
     height: u32,
 ) -> Option<u64> {
-    get_from(
-        &state.host_texture_surfaces,
-        &(task_id, texture_ref),
-        width,
-        height,
-    )?;
     state
-        .host_texture_surfaces
-        .get(&(task_id, texture_ref))
-        .map(|e| e.source_gva)
+        .host_replicas
+        .texture(task_id, texture_ref)
+        .and_then(|entry| get_surface(Some(entry), width, height).map(|_| entry.source_gva))
 }
 
-pub fn evict_texture(state: &mut DeviceState, task_id: u32, texture_ref: u32) {
-    state.host_texture_surfaces.remove(&(task_id, texture_ref));
+pub fn evict_texture(state: &mut Device, task_id: u32, texture_ref: u32) {
+    state.host_replicas.forget_texture(task_id, texture_ref);
+}
+
+/// Drop both host replicas produced by one task texture's last materialized
+/// Store.
+///
+/// The object-keyed entry carries the GVA its pixels came from, so a decoded
+/// guest write can invalidate the two lookup doors as one authority change.
+/// Leaving the GVA door alive after removing only the object door lets a later
+/// attachment LOAD seed from pixels captured before the guest's write.
+pub fn evict_texture_allocation(state: &mut Device, task_id: u32, texture_ref: u32) {
+    let source_gva = state
+        .host_replicas
+        .texture(task_id, texture_ref)
+        .map_or(0, |entry| entry.source_gva);
+    state.host_replicas.forget_texture(task_id, texture_ref);
+    if source_gva != 0 {
+        evict_gva(state, source_gva);
+    }
 }
 
 /// The identity of one linear compute window: which object it is, where its
 /// guest backing sits, and the shape the guest declared over it.
 ///
-/// Every `DeviceState::host_linear_textures` entry is *keyed* by
+/// Every `HostReplicaState::linear_textures` entry is *keyed* by
 /// `(task_id, texture_ref)` and *described* by the remaining five fields, and
 /// the cache serves an entry only while the asking window still describes it.
 /// A window the guest re-declared at another address, format or geometry is a
@@ -411,117 +322,25 @@ pub fn evict_texture(state: &mut DeviceState, task_id: u32, texture_ref: u32) {
 /// apart — every operation here needs all of them, and the four that used to
 /// take them positionally could be, and were, called with two of them swapped
 /// without anything noticing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LinearWindow {
-    pub task_id: u32,
-    pub texture_ref: u32,
-    pub gva: u64,
-    pub pixel_format: u16,
-    pub width: u32,
-    pub height: u32,
-    pub row_stride: u64,
-}
-
-impl LinearWindow {
-    /// The `host_linear_textures` key this window addresses.
-    fn key(&self) -> (u32, u32) {
-        (self.task_id, self.texture_ref)
-    }
-
-    /// Bytes per pixel, but only for a window that can hold content at all:
-    /// a named object over a real address, with a nonzero extent and a stride
-    /// that reaches at least one tight row.
-    ///
-    /// This is the whole precondition both store paths share. `None` is a
-    /// refusal to create an entry, not a missing format lookup.
-    fn storable_bpp(&self) -> Option<u32> {
-        let bpp = crate::contract::pixel_format::bytes_per_pixel(self.pixel_format)?;
-        let ok = self.texture_ref != 0
-            && self.gva != 0
-            && self.width != 0
-            && self.height != 0
-            && self.row_stride >= (self.width as u64).saturating_mul(bpp as u64);
-        ok.then_some(bpp)
-    }
-
-    /// Length of one tightly packed image of this window, or `None` on overflow.
-    fn tight_len(&self, bpp: u32) -> Option<usize> {
-        (self.width as usize)
-            .checked_mul(self.height as usize)?
-            .checked_mul(bpp as usize)
-    }
-
-    /// Whether `entry` is the window this describes, rather than a later one
-    /// the guest re-declared over the same `(task, ref)` key.
-    fn describes(&self, entry: &crate::model::HostLinearTexture) -> bool {
-        entry.gva == self.gva
-            && entry.pixel_format == self.pixel_format
-            && entry.width == self.width
-            && entry.height == self.height
-            && entry.row_stride == self.row_stride
-    }
-
-    /// Take this window as `entry`'s descriptor, dropping whatever content the
-    /// previous descriptor held. Both store paths then set their own
-    /// generations; nothing else may reach these fields.
-    fn adopt(&self, entry: &mut crate::model::HostLinearTexture) {
-        entry.gva = self.gva;
-        entry.pixel_format = self.pixel_format;
-        entry.width = self.width;
-        entry.height = self.height;
-        entry.row_stride = self.row_stride;
-        entry.bytes.clear();
-    }
-}
-
 /// Store tight raw compute content for a type-2/3 texture object.
 ///
 /// This is the discrete GPU-private body. It deliberately survives
 /// MapMemory2/UnmapMemory; the guest GVA pages are only a pageable alias.
-pub fn store_linear_texture(state: &mut DeviceState, w: &LinearWindow, bytes: &[u8]) -> bool {
-    let Some(need) = w.storable_bpp().and_then(|bpp| w.tight_len(bpp)) else {
-        return false;
-    };
-    if bytes.len() < need {
-        return false;
-    }
-    let entry = state.host_linear_textures.entry(w.key()).or_default();
-    entry.host_gen = entry.host_gen.wrapping_add(1);
-    if entry.host_gen == 0 {
-        entry.host_gen = 1;
-    }
-    w.adopt(entry);
-    entry.bytes.extend_from_slice(&bytes[..need]);
-    entry.resident_gen = 0;
-    true
+pub fn store_linear_texture(state: &mut Device, w: &LinearWindow, bytes: &[u8]) -> bool {
+    state.host_replicas.store_linear(*w, bytes)
 }
 
 /// Deferred linear writeback: the engine's pinned resident storage image at
 /// `generation` becomes the authoritative content for this window; no bytes are
 /// stored. Same window precondition as [`store_linear_texture`].
-pub fn note_linear_texture_resident(
-    state: &mut DeviceState,
-    w: &LinearWindow,
-    generation: u32,
-) -> bool {
-    if generation == 0 || w.storable_bpp().is_none() {
-        return false;
-    }
-    let entry = state.host_linear_textures.entry(w.key()).or_default();
-    entry.host_gen = generation;
-    w.adopt(entry);
-    entry.resident_gen = generation;
-    true
+pub fn note_linear_texture_resident(state: &mut Device, w: &LinearWindow, generation: u32) -> bool {
+    state.host_replicas.note_linear_resident(*w, generation)
 }
 
 /// Resident generation of a linear window when the entry is still the one this
 /// window describes and is resident-authoritative (deferred writeback).
-pub fn linear_texture_resident_gen(state: &DeviceState, w: &LinearWindow) -> Option<u32> {
-    let entry = state.host_linear_textures.get(&w.key())?;
-    if entry.resident_gen == 0 || !w.describes(entry) {
-        return None;
-    }
-    Some(entry.resident_gen)
+pub fn linear_texture_resident_gen(state: &Device, w: &LinearWindow) -> Option<u32> {
+    state.host_replicas.linear_resident_generation(*w)
 }
 
 /// Why [`materialize_linear_resident`] did not land the flushed bytes.
@@ -531,21 +350,6 @@ pub fn linear_texture_resident_gen(state: &DeviceState, w: &LinearWindow) -> Opt
 /// has already been overtaken, so there is no frame here to lose. Every other
 /// arm means a live entry stayed empty, and `flush_linear_one` then decides
 /// whether to write guest pages on the assumption that it did not.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LinearMaterializeDecline {
-    /// The (task, ref) entry is gone, or a newer defer replaced this
-    /// generation. Expected control flow: the content this flush carries is no
-    /// longer the content anything would read.
-    Superseded { resident_gen: u32 },
-    /// The entry's own format has no bytes-per-pixel, so the tight size it
-    /// wants cannot be computed.
-    FormatUnsized { pixel_format: u16 },
-    /// `width * height * bpp` overflowed `usize`.
-    TightSizeOverflow { width: u32, height: u32, bpp: u32 },
-    /// The engine returned fewer bytes than one tight image.
-    ReadbackShort { got: usize, need: usize },
-}
-
 impl crate::observe::Decline for LinearMaterializeDecline {
     fn slug(&self) -> &'static str {
         match self {
@@ -585,56 +389,25 @@ impl crate::observe::Decline for LinearMaterializeDecline {
 /// cannot tell success from failure is asserting the one thing it needs to
 /// know. Every arm but `Superseded` means a live entry was left empty.
 pub fn materialize_linear_resident(
-    state: &mut DeviceState,
+    state: &mut Device,
     task_id: u32,
     texture_ref: u32,
     generation: u32,
     bytes: &[u8],
 ) -> Result<(), LinearMaterializeDecline> {
-    let Some(entry) = state.host_linear_textures.get_mut(&(task_id, texture_ref)) else {
-        return Err(LinearMaterializeDecline::Superseded { resident_gen: 0 });
-    };
-    if entry.resident_gen != generation {
-        return Err(LinearMaterializeDecline::Superseded {
-            resident_gen: entry.resident_gen,
-        });
-    }
-    let Some(bpp) = crate::contract::pixel_format::bytes_per_pixel(entry.pixel_format) else {
-        return Err(LinearMaterializeDecline::FormatUnsized {
-            pixel_format: entry.pixel_format,
-        });
-    };
-    let Some(need) = (entry.width as usize)
-        .checked_mul(entry.height as usize)
-        .and_then(|n| n.checked_mul(bpp as usize))
-    else {
-        return Err(LinearMaterializeDecline::TightSizeOverflow {
-            width: entry.width,
-            height: entry.height,
-            bpp,
-        });
-    };
-    if bytes.len() < need {
-        return Err(LinearMaterializeDecline::ReadbackShort {
-            got: bytes.len(),
-            need,
-        });
-    }
-    entry.bytes.clear();
-    entry.bytes.extend_from_slice(&bytes[..need]);
-    entry.resident_gen = 0;
-    Ok(())
+    state
+        .host_replicas
+        .materialize_linear(task_id, texture_ref, generation, bytes)
 }
 
 /// Borrow a raw compute encode only while the entry is still the window this
 /// describes.
-pub fn get_linear_texture<'a>(state: &'a DeviceState, w: &LinearWindow) -> Option<&'a [u8]> {
-    let entry = state.host_linear_textures.get(&w.key())?;
-    if !w.describes(entry) {
-        return None;
-    }
-    let bpp = crate::contract::pixel_format::bytes_per_pixel(w.pixel_format)?;
-    let need = w.tight_len(bpp)?;
+pub fn get_linear_texture<'a>(state: &'a Device, w: &LinearWindow) -> Option<&'a [u8]> {
+    let entry = state.host_replicas.linear(*w)?;
+    let bpp = reims_vgpu_core::pixel_format::bytes_per_pixel(w.pixel_format)?;
+    let need = (w.width as usize)
+        .checked_mul(w.height as usize)?
+        .checked_mul(bpp as usize)?;
     (entry.bytes.len() >= need).then(|| &entry.bytes[..need])
 }
 
@@ -642,7 +415,7 @@ pub fn get_linear_texture<'a>(state: &'a DeviceState, w: &LinearWindow) -> Optio
 /// the BGRA render-sample caches. Deferred linear writebacks are gated on
 /// `!linear_mirrorable` so render-side consumers never lose the mirror.
 pub fn linear_mirrorable(pixel_format: u16) -> bool {
-    use crate::contract::pixel_format::{
+    use reims_vgpu_core::pixel_format::{
         MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_BGRA8_UNORM_SRGB, MTL_FORMAT_RGBA8_UNORM,
         MTL_FORMAT_RGBA8_UNORM_SRGB,
     };
@@ -662,12 +435,12 @@ pub fn linear_mirrorable(pixel_format: u16) -> bool {
 /// rows, so the source stride is the one part of the window identity that does
 /// not travel with the content.
 pub fn mirror_linear_color_cache<M: HostMemory + crate::runtime::host::HostOps>(
-    state: &mut DeviceState,
+    state: &mut Device,
     host: &mut M,
     w: &LinearWindow,
     bytes: &[u8],
 ) {
-    use crate::contract::pixel_format::{
+    use reims_vgpu_core::pixel_format::{
         MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_BGRA8_UNORM_SRGB, MTL_FORMAT_RGBA8_UNORM,
         MTL_FORMAT_RGBA8_UNORM_SRGB,
     };
@@ -717,10 +490,8 @@ pub fn mirror_linear_color_cache<M: HostMemory + crate::runtime::host::HostOps>(
 ///
 /// Quiet on a `gva` with no entry: a store that was refused upstream (zero
 /// geometry, short buffer) leaves nothing to mark, and that is not a failure.
-pub fn note_gva_landed(state: &mut DeviceState, gva: u64) {
-    if let Some(entry) = state.host_gva_surfaces.get_mut(&gva) {
-        entry.guest_holds_bytes = true;
-    }
+pub fn note_gva_landed(state: &mut Device, gva: u64) {
+    state.host_replicas.note_gva_landed(gva);
 }
 
 /// The guest page currently backing `gva` under `task_id`, page-aligned.
@@ -733,7 +504,7 @@ pub fn note_gva_landed(state: &mut DeviceState, gva: u64) {
 /// The same call [`gva_backing_state`] makes to check the entry later, so the
 /// producer and the consumer cannot disagree about what names an allocation.
 pub fn gva_backing<M: HostMemory>(
-    state: &DeviceState,
+    state: &Device,
     host: &M,
     task_id: u32,
     gva: u64,
@@ -778,7 +549,7 @@ const fn page_mask(page_shift: u32) -> u64 {
     reason = "the cache identity is the GVA, its geometry, its producer, and its guest backing"
 )]
 pub fn store_gva_owned(
-    state: &mut DeviceState,
+    state: &mut Device,
     gva: u64,
     width: u32,
     height: u32,
@@ -801,22 +572,6 @@ pub fn store_gva_owned(
     // been charged for it is now a different question. Retiring the witness key
     // here keeps `gva_cap_wanted` a count of lookups the cap actually cost,
     // rather than one that keeps accruing against content that came back.
-    state.gva_eviction_witness.note_restored(gva, width, height);
-    let touch = state.next_gva_touch();
-    let entry = state.host_gva_surfaces.entry(gva).or_default();
-    entry.last_touch = touch;
-    entry.host_gen = generation;
-    entry.width = width;
-    entry.height = height;
-    // One of the two sites that change this map's byte total; see
-    // [`DeviceState::gva_cache_bytes`]. The replaced entry's bytes are
-    // reclaimed before the new ones are charged, so a store at an existing key
-    // nets to the difference instead of double-counting. Applied to the device
-    // below, once this borrow of the entry has ended.
-    let reclaimed = entry.bgra.len();
-    entry.bgra = std::sync::Arc::new(bgra);
-    let charged = entry.bgra.len();
-    entry.producer_object_type = object_type;
     // These bytes came from *this* backing, so it replaces whatever the
     // previous store recorded — including a `None` that says the walk could
     // not name it. Carrying the old list forward would let a validated entry
@@ -830,25 +585,22 @@ pub fn store_gva_owned(
     // on a 300 s boot — not because the guest had rewritten every entry, which
     // is how that zero was read, but because no set this rail ever created
     // outlived its own arming window.
-    entry.backing = backing;
     // Per store, not sticky: a later flush that *does* reach guest RAM makes
     // the same address evictable again, and a `true` left over from an earlier
     // store would let the cap take pixels this one never landed.
-    entry.guest_holds_bytes = guest_holds_bytes;
-    charge_gva_cache_bytes(state, reclaimed, charged);
+    let entry = crate::model::HostSurface {
+        width,
+        height,
+        bgra: std::sync::Arc::new(bgra),
+        host_gen: generation,
+        producer_object_type: object_type,
+        last_touch: 0,
+        backing,
+        source_gva: 0,
+        guest_holds_bytes,
+    };
+    state.host_replicas.restore_gva(gva, entry);
     enforce_gva_cache_cap(state, gva);
-}
-
-/// Move [`DeviceState::gva_cache_bytes`] by one entry's replacement.
-///
-/// Reclaim before charge so the running total never transiently exceeds the
-/// real one, and saturating so a bookkeeping slip can only under-report — an
-/// over-report would make the cap evict content it never needed to.
-fn charge_gva_cache_bytes(state: &mut DeviceState, reclaimed: usize, charged: usize) {
-    state.gva_cache_bytes = state
-        .gva_cache_bytes
-        .saturating_sub(reclaimed)
-        .saturating_add(charged);
 }
 
 /// The GVA encode cache is over its byte cap and every entry is excluded from
@@ -916,7 +668,7 @@ impl GvaCapDecline {
     }
 }
 
-/// Hold [`DeviceState::host_gva_surfaces`] at or under
+/// Hold [`HostReplicaState::gva_surfaces`] at or under
 /// [`GVA_ENCODE_CACHE_BYTE_CAP`], evicting the least-recently-**used** entries
 /// first.
 ///
@@ -952,32 +704,30 @@ impl GvaCapDecline {
 /// entry therefore rides alone and over the cap, matching the sibling memo,
 /// because refusing to cache a surface for being big is how a 4K wallpaper
 /// stops being cached at all.
-fn enforce_gva_cache_cap(state: &mut DeviceState, protect: u64) {
-    let cap = state.gva_cache_byte_cap;
+fn enforce_gva_cache_cap(state: &mut Device, protect: u64) {
+    let cap = state.host_replicas.gva_cache_byte_cap();
     let low_water = cap - cap / 8;
     // The running total, not a fresh sum: this runs on the store path, which is
-    // the draw path. See [`DeviceState::gva_cache_bytes`] — the census
+    // the draw path. See [`HostReplicaState::gva_cache_bytes`] — the census
     // recomputes the real figure once a second and reports any divergence, so
     // trusting it here is checked rather than assumed.
-    if state.gva_cache_bytes <= low_water {
+    if state.host_replicas.gva_cache_bytes() <= low_water {
         return;
     }
     // Coldest first. This only runs at the cap boundary, never on the steady
     // store path, so one ordered pass over the keys is acceptable.
     let mut by_touch: Vec<(u64, u64)> = state
-        .host_gva_surfaces
-        .iter()
-        .filter(|(gva, e)| {
-            **gva != protect && e.guest_holds_bytes
-        })
-        .map(|(&gva, e)| (e.last_touch, gva))
+        .host_replicas
+        .gva_entries()
+        .filter(|(gva, entry)| *gva != protect && entry.guest_holds_bytes)
+        .map(|(gva, entry)| (entry.last_touch, gva))
         .collect();
     by_touch.sort_unstable();
     if by_touch.is_empty() {
         GvaCapDecline::NothingEvictable {
-            bytes: state.gva_cache_bytes,
+            bytes: state.host_replicas.gva_cache_bytes(),
             cap,
-            entries: state.host_gva_surfaces.len(),
+            entries: state.host_replicas.counts().2,
         }
         .emit();
         return;
@@ -985,14 +735,14 @@ fn enforce_gva_cache_cap(state: &mut DeviceState, protect: u64) {
     for (_, gva) in by_touch {
         // `evict_gva` maintains the running total, so this reads the live
         // figure each round rather than tracking a second copy of it.
-        if state.gva_cache_bytes <= low_water {
+        if state.host_replicas.gva_cache_bytes() <= low_water {
             break;
         }
-        let Some(e) = state.host_gva_surfaces.get(&gva) else {
+        let Some(e) = state.host_replicas.gva(gva) else {
             continue;
         };
         let (width, height) = (e.width, e.height);
-        state.gva_eviction_witness.note_evicted(gva, width, height);
+        state.host_replicas.note_gva_evicted(gva, width, height);
         evict_gva(state, gva);
     }
 }
@@ -1007,7 +757,7 @@ fn enforce_gva_cache_cap(state: &mut DeviceState, protect: u64) {
 /// here instead would count two or three times for one frame's single logical
 /// lookup and make the figure uninterpretable.
 fn lookup_gva(
-    state: &DeviceState,
+    state: &Device,
     gva: u64,
     width: u32,
     height: u32,
@@ -1015,7 +765,7 @@ fn lookup_gva(
     let need = (height as usize)
         .saturating_mul(width as usize)
         .saturating_mul(RGBA8_BPP as usize);
-    let e = state.host_gva_surfaces.get(&gva)?;
+    let e = state.host_replicas.gva(gva)?;
     (e.width == width && e.height == height && !e.bgra.is_empty() && e.bgra.len() >= need)
         .then_some((e, need))
 }
@@ -1026,14 +776,14 @@ fn lookup_gva(
 /// A key that was never cached, or whose geometry never matched, is an ordinary
 /// miss and is not counted — see [`crate::model::GvaEvictionWitness`].
 fn read_gva(
-    state: &DeviceState,
+    state: &Device,
     gva: u64,
     width: u32,
     height: u32,
 ) -> Option<(&crate::model::HostSurface, usize)> {
     let hit = lookup_gva(state, gva, width, height);
     if hit.is_none() {
-        state.gva_eviction_witness.note_miss(gva, width, height);
+        state.host_replicas.note_gva_miss(gva, width, height);
     }
     hit
 }
@@ -1045,25 +795,22 @@ fn read_gva(
 /// the recency signal that keeps a stored-once-sampled-forever entry (the
 /// retained wallpaper class) alive, and charging recency for lookups that were
 /// then refused would keep entries warm that nothing can actually use.
-pub fn touch_gva(state: &mut DeviceState, gva: u64, width: u32, height: u32) {
+pub fn touch_gva(state: &mut Device, gva: u64, width: u32, height: u32) {
     if lookup_gva(state, gva, width, height).is_none() {
         return;
     }
-    let stamp = state.next_gva_touch();
-    if let Some(e) = state.host_gva_surfaces.get_mut(&gva) {
-        e.last_touch = stamp;
-    }
+    state.host_replicas.touch_gva(gva);
 }
 
-pub fn get_gva(state: &DeviceState, gva: u64, width: u32, height: u32) -> Option<&[u8]> {
+pub fn get_gva(state: &Device, gva: u64, width: u32, height: u32) -> Option<&[u8]> {
     get_gva_with_gen(state, gva, width, height).map(|(bgra, _)| bgra)
 }
 
 /// Whether a [`get_gva`] for this key would hit, without borrowing the bytes.
 ///
-/// Lets a caller that needs `&mut DeviceState` (backing revalidation) find out
+/// Lets a caller that needs `&mut Device` (backing revalidation) find out
 /// first whether there is anything to revalidate.
-pub fn has_gva(state: &DeviceState, gva: u64, width: u32, height: u32) -> bool {
+pub fn has_gva(state: &Device, gva: u64, width: u32, height: u32) -> bool {
     lookup_gva(state, gva, width, height).is_some()
 }
 
@@ -1071,24 +818,15 @@ pub fn has_gva(state: &DeviceState, gva: u64, width: u32, height: u32) -> bool {
 ///
 /// This is diagnostic provenance for the linear-sample loss proxy; selection
 /// semantics are identical to [`get_gva`].
-fn get_gva_with_gen(
-    state: &DeviceState,
-    gva: u64,
-    width: u32,
-    height: u32,
-) -> Option<(&[u8], u64)> {
+fn get_gva_with_gen(state: &Device, gva: u64, width: u32, height: u32) -> Option<(&[u8], u64)> {
     let (e, need) = read_gva(state, gva, width, height)?;
     Some((&e.bgra[..need], e.host_gen))
 }
 
 /// Explicit drop (tests / object delete). Unmap does **not** come through here;
 /// see [`store_gva_owned`] for why the map is retained across it.
-pub fn evict_gva(state: &mut DeviceState, gva: u64) {
-    if let Some(entry) = state.host_gva_surfaces.remove(&gva) {
-        // The other site that changes this map's byte total; see
-        // [`DeviceState::gva_cache_bytes`].
-        state.gva_cache_bytes = state.gva_cache_bytes.saturating_sub(entry.bgra.len());
-    }
+pub fn evict_gva(state: &mut Device, gva: u64) {
+    let _ = state.host_replicas.evict_gva(gva);
 }
 
 /// Entry count and resident bytes of one host-side pixel cache.
@@ -1099,24 +837,6 @@ pub struct CacheLevel {
     /// Bytes held by the single largest entry — the figure that separates "many
     /// small surfaces" from "a few 4K ones", which cost ~4x a 1080p entry each.
     pub largest: u64,
-}
-
-impl CacheLevel {
-    fn of<'a, K: 'a, V: 'a>(
-        map: &'a std::collections::BTreeMap<K, V>,
-        len: impl Fn(&V) -> usize,
-    ) -> Self {
-        let mut level = Self {
-            entries: map.len() as u64,
-            ..Self::default()
-        };
-        for value in map.values() {
-            let bytes = len(value) as u64;
-            level.bytes += bytes;
-            level.largest = level.largest.max(bytes);
-        }
-        level
-    }
 }
 
 /// Resident size of every host-side pixel cache, right now.
@@ -1179,12 +899,14 @@ impl CacheLevel {
 /// frame, at ~95 a second). And anyone wanting the tier's real occupancy needs a
 /// high-water mark maintained at insert time — a level read here cannot answer
 /// it, and reading zero here is not evidence that it is small.
-fn cache_levels(state: &DeviceState) -> (CacheLevel, CacheLevel, CacheLevel) {
-    (
-        CacheLevel::of(&state.host_surfaces, |e| e.bgra.len()),
-        CacheLevel::of(&state.host_gva_surfaces, |e| e.bgra.len()),
-        CacheLevel::of(&state.host_linear_textures, |e| e.bytes.len()),
-    )
+fn cache_levels(state: &Device) -> (CacheLevel, CacheLevel, CacheLevel) {
+    let [surface, gva, linear] = state.host_replicas.replica_levels();
+    let level = |(entries, bytes, largest)| CacheLevel {
+        entries: entries as u64,
+        bytes: bytes as u64,
+        largest: largest as u64,
+    };
+    (level(surface), level(gva), level(linear))
 }
 
 /// GVA-keyed entries whose key no longer translates to the backing the pixels
@@ -1225,9 +947,9 @@ fn cache_levels(state: &DeviceState) -> (CacheLevel, CacheLevel, CacheLevel) {
 ///
 /// Measure-only. Nothing may evict on this yet: it exists to size the rule
 /// before the rule is written.
-fn gva_backing_moved<H: HostMemory>(state: &DeviceState, host: &H) -> (u64, u64, u64) {
+fn gva_backing_moved<H: HostMemory>(state: &Device, host: &H) -> (u64, u64, u64) {
     let (mut moved, mut unmapped, mut checked) = (0, 0, 0);
-    for &gva in state.host_gva_surfaces.keys() {
+    for (gva, _) in state.host_replicas.gva_entries() {
         match gva_backing_state(state, host, gva) {
             GvaBackingState::Unrecorded => {}
             GvaBackingState::Same => checked += 1,
@@ -1272,13 +994,9 @@ pub enum GvaBackingState {
 /// [`GvaBackingState`] for one key. First recorded page only — enough to tell a
 /// reused address from a retained one, and a whole-list walk of a 4K entry is
 /// ~2 025 walks.
-pub fn gva_backing_state<H: HostMemory>(
-    state: &DeviceState,
-    host: &H,
-    gva: u64,
-) -> GvaBackingState {
+pub fn gva_backing_state<H: HostMemory>(state: &Device, host: &H, gva: u64) -> GvaBackingState {
     let page_shift = state.page_shift;
-    let Some(entry) = state.host_gva_surfaces.get(&gva) else {
+    let Some(entry) = state.host_replicas.gva(gva) else {
         return GvaBackingState::Unrecorded;
     };
     let Some(backing) = entry.backing.as_ref() else {
@@ -1287,11 +1005,7 @@ pub fn gva_backing_state<H: HostMemory>(
     let recorded = backing.first_gpa;
     // Same liveness test the walk itself applies: present in the table AND
     // flagged active. A dead task's page table cannot answer the question.
-    let Some(task) = state
-        .tasks
-        .get(backing.task_id)
-        .filter(|t| t.active)
-    else {
+    let Some(task) = state.tasks.get(backing.task_id).filter(|t| t.active) else {
         return GvaBackingState::Unrecorded;
     };
     match crate::runtime::gva_mem::translate_task_gva(host, task, gva, page_shift) {
@@ -1315,7 +1029,7 @@ pub fn gva_backing_state<H: HostMemory>(
 /// allocation". **That argument has two holes and this closes both.**
 ///
 /// - **A GVA is only an allocation inside one task's address space, and
-///   [`crate::model::state::DeviceState::host_gva_surfaces`] is keyed by the
+///   [`crate::model::state::HostReplicaState::gva_surfaces`] is keyed by the
 ///   address alone.** Every sibling structure here carries the task and says
 ///   why — `guest_linear_memo` keys on `(task_id, gva, …)`, and `node_guard`'s
 ///   own doc puts it as "these pages belong to the task's address space, so a
@@ -1365,12 +1079,12 @@ impl GvaSeedVerdict {
 
 /// [`GvaSeedVerdict`] for one key, asked by the task that wants to serve it.
 pub fn gva_seed_verdict<H: HostMemory>(
-    state: &DeviceState,
+    state: &Device,
     host: &H,
     task_id: u32,
     gva: u64,
 ) -> GvaSeedVerdict {
-    let Some(entry) = state.host_gva_surfaces.get(&gva) else {
+    let Some(entry) = state.host_replicas.gva(gva) else {
         return GvaSeedVerdict::Unrecorded;
     };
     let Some(backing) = entry.backing.as_ref() else {
@@ -1393,7 +1107,7 @@ pub fn gva_seed_verdict<H: HostMemory>(
 ///
 /// Shares the one-second cadence the drain census already runs on, so a boot's
 /// cache trend lines up row-for-row with `store_routes` and `drain_duty`.
-pub fn note_cache_levels<H: HostMemory>(state: &DeviceState, host: &H) {
+pub fn note_cache_levels<H: HostMemory>(state: &Device, host: &H) {
     use std::sync::atomic::{AtomicU64, Ordering};
     static LAST_MS: AtomicU64 = AtomicU64::new(0);
     static PEAK_BYTES: AtomicU64 = AtomicU64::new(0);
@@ -1419,12 +1133,12 @@ pub fn note_cache_levels<H: HostMemory>(state: &DeviceState, host: &H) {
     // witness accumulates for the life of the device, where every other field
     // here is a level. Take the last line for all of them either way; do not
     // sum any of it.
-    let (cap_evicted, cap_wanted, cap_forgotten) = state.gva_eviction_witness.counts();
+    let (cap_evicted, cap_wanted, cap_forgotten) = state.host_replicas.gva_eviction_counts();
     // The running total the cap actually tests against, minus the real sum this
     // census just computed for `gva_bytes`. Always 0; anything else means a
     // mutation site changed `bgra` without telling `gva_cache_bytes`, and the
     // cap is bounding a number that has stopped describing the map.
-    let cap_drift = state.gva_cache_bytes as i64 - gva.bytes as i64;
+    let cap_drift = state.host_replicas.gva_cache_bytes() as i64 - gva.bytes as i64;
     crate::observe::off(format!(
         "host_cache_levels (levels, not per-interval) total_bytes={total} peak_bytes={peak} \
          surfaces={} surface_bytes={} surface_largest={} \
@@ -1442,24 +1156,24 @@ pub fn note_cache_levels<H: HostMemory>(state: &DeviceState, host: &H) {
         gva.entries,
         gva.bytes,
         gva.largest,
-        state.gva_cache_byte_cap,
+        state.host_replicas.gva_cache_byte_cap(),
         linear.entries,
         linear.bytes,
         linear.largest,
         // The reach census for the id spaces — see
-        // [`DeviceState::max_task_id_seen`]. Here rather than in a line of their
+        // the device observation reach. Here rather than in a line of their
         // own because this is already the device's "levels, not per-interval"
         // line, and these are levels: the highest id the guest has named, beside
         // the bound that would have refused it.
         //
         // Both caps read the literal `none` because neither bound exists any
-        // more: `is_mapping_id` refuses only the unbound sentinel, and the task
+        // more: `is_surface_mapping_id` refuses only the unbound sentinel, and the task
         // table is a map keyed by the guest's `u32`. The two reaches stay, and
         // are now occupancy readings on those maps rather than distances to a
         // refusal — they are the only thing that says how far the guest spreads
         // either id space.
-        state.max_task_id_seen,
-        state.max_mapping_id_seen,
+        state.observations.max_task_id_seen(),
+        state.observations.max_mapping_id_seen(),
     ));
 }
 
@@ -1469,7 +1183,7 @@ mod tests;
 /// The GVA encode cache's byte cap: what it bounds, what it refuses to touch,
 /// and what it costs.
 ///
-/// Every test here sets [`DeviceState::gva_cache_byte_cap`] to a size a test can
+/// Every test here sets [`HostReplicaState::gva_cache_byte_cap`] to a size a test can
 /// allocate. The policy under test is identical at 128 MiB; only the arithmetic
 /// scales.
 #[cfg(test)]

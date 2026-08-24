@@ -1,0 +1,33 @@
+# Cases this device is known to fail, one name a line, `#` starts a comment.
+#
+# The comment is the point: a name with no comment is a case somebody silenced.
+# `verdict.py` reads this file in both directions -- an unlisted failure fails
+# the run, and so does a listed case that has started passing. Prune when you
+# fix something.
+#
+# Recorded on rail macos-13, x86 pathway, with the import capable and on.
+
+# ---------------------------------------------------------------------------
+# Nothing above mip level 0 arrives.
+#
+# All three ways of asking agree, which is what makes this one defect and not
+# three. A `sample` at level N returns level 0's texels (`got=0x10101010`, which
+# is level 0's fill) and a `fetch` or a blit-readback at level N returns zeros --
+# so the levels are not merely sampled at the wrong LOD, they are not populated.
+# Level 0 passes on all three.
+#
+# Not diagnosed. Unlike the family above there is no refusal in the fail log for
+# these, which makes it the more serious of the two: guest work is lost with
+# nothing saying so.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# A compute observer sees one sample in a four-sample texture.
+#
+# Native Metal retains four distinct per-sample colours across command buffers.
+# The guest render and observer both execute, and sample zero contains the
+# expected per-sample render value. The translated texture sample-count query
+# returns one, so the observer never visits samples one through three and those
+# output slots retain their sentinel values.
+# ---------------------------------------------------------------------------
+msaa4_color_store_no_resolve

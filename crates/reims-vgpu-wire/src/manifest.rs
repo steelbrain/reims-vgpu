@@ -287,7 +287,8 @@ pub const MANIFEST: &[Entry] = &[
         class: "PGSerializer",
         selector: "newIOSurfaceTextureWithDescriptor:plane:allocator:",
         opcodes: &[
-            0x0c,
+            crate::ops::backed_texture::OPCODE_IOSURFACE_TEXTURE,
+            crate::ops::backed_texture::OPCODE_IOSURFACE_TEXTURE_ROTATED,
             crate::ops::backed_texture::OPCODE_IOSURFACE_TEXTURE_WIDE,
         ],
         coverage: Coverage::Covered {

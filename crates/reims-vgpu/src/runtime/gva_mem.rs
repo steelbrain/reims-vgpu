@@ -146,7 +146,7 @@ pub fn read_task_gva_by_id<M: HostMemory>(
 ///
 /// There is exactly one such shape in this device and it is worth naming,
 /// because using the loud read for it put 18 lines per boot on the fail channel
-/// that meant nothing. `objects::type4_probe_order` walks the live tasks asking
+/// that meant nothing. `objects::surface_backing_probe_order` walks the live tasks asking
 /// "does this one own surface N?", and a task that does not own it has no entry
 /// at that slot — so the walk *must* miss on every task before the owner. The
 /// miss is how the search works.
@@ -208,7 +208,7 @@ fn note_read_refusal(task_id: u32, gva: u64, named: MemError) {
 /// is not a rule a reader has to hold, and it is not something to go looking
 /// for: this gate and the one on [`define_task_pages_arm64e`] are the only two
 /// arch-fixed functions in the crate, and behind them a product call is a
-/// `cannot find function` from rustc rather than a finding. `contract::gva`
+/// `cannot find function` from rustc rather than a finding. `reims_vgpu_paging::geometry`
 /// exposes the arch-fixed *constants* ungated, which is fine — a shift is
 /// picked from `state.page_shift` at the call site, and a constant cannot
 /// silently walk a page table at the wrong stride the way a helper can.
@@ -239,13 +239,13 @@ pub fn write_task_gva_arm64e<M: HostMemory>(host: &mut M, task: &TaskEntry, gva:
 #[track_caller]
 pub fn define_task_pages_arm64e(
     host: &mut crate::runtime::host::FakeHost,
-    state: &mut crate::model::DeviceState,
+    state: &mut crate::runtime::Device,
     data_base_pfn: u32,
     pages: u32,
 ) {
-    use crate::contract::endian::st32;
-    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
     use crate::model::PAGE_SHIFT_ARM64E;
+    use reims_vgpu_core::endian::st32;
+    use reims_vgpu_paging::geometry::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
     let dir_pfn = 2u32;
     let root_pfn = 3u32;
     let dir_gpa = (dir_pfn as u64) << PAGE_SHIFT_ARM64E;
@@ -354,10 +354,18 @@ pub fn any_task_gva_page_resolves<M: HostMemory>(
     page_shift: u32,
 ) -> bool {
     let mut found = false;
-    visit_task_gva_page_gpas(host, tasks, task_id, gva, span.max(1), page_shift, &mut |_| {
-        found = true;
-        false
-    });
+    visit_task_gva_page_gpas(
+        host,
+        tasks,
+        task_id,
+        gva,
+        span.max(1),
+        page_shift,
+        &mut |_| {
+            found = true;
+            false
+        },
+    );
     found
 }
 
@@ -402,7 +410,7 @@ pub fn any_task_gva_page_resolves<M: HostMemory>(
 /// failed for an unrelated reason; it is counted so the arm is measurable
 /// instead of assumed.
 pub fn dest_window<M: HostMemory>(
-    state: &crate::model::DeviceState,
+    state: &crate::runtime::Device,
     host: &M,
     task_id: u32,
     gva: u64,
@@ -459,7 +467,7 @@ pub fn dest_window<M: HostMemory>(
 /// population it cannot see.
 #[track_caller]
 pub fn write_task_gva_product_within<H: HostMemory + crate::runtime::host::HostOps>(
-    state: &mut crate::model::DeviceState,
+    state: &mut crate::runtime::Device,
     host: &mut H,
     task_id: u32,
     gva: u64,
@@ -523,12 +531,18 @@ pub fn visit_task_gva_page_gpas<M: HostMemory>(
     page_shift: u32,
     visit: &mut dyn FnMut(u64) -> bool,
 ) {
-    visit_task_gva_pages(host, tasks, task_id, gva, span, page_shift, &mut |gpa| {
-        match gpa {
+    visit_task_gva_pages(
+        host,
+        tasks,
+        task_id,
+        gva,
+        span,
+        page_shift,
+        &mut |gpa| match gpa {
             Some(gpa) => visit(gpa),
             None => true,
-        }
-    });
+        },
+    );
 }
 
 /// The resolved page GPAs of `[gva, gva+span)` under `task_id`'s page table, in
@@ -800,8 +814,8 @@ pub fn format_active_tasks(tasks: &TaskTable) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::contract::endian::st32;
     use crate::observe::Decline;
+    use reims_vgpu_core::endian::st32;
 
     /// The collapse this migration ended: every distinct check — the walk's own
     /// and four more here — answered `MemError::Unmapped`, and
@@ -879,10 +893,11 @@ mod tests {
         assert_eq!(MemError::Unresolved(R::Ok).slug(), "mem_unresolved_ok");
     }
 
-    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
-    use crate::model::{DeviceId, DeviceState, PAGE_SHIFT_ARM64E, PAGE_SHIFT_X86};
+    use crate::model::{DeviceId, PAGE_SHIFT_ARM64E, PAGE_SHIFT_X86};
     use crate::runtime::decode::resource::RESOURCE_PAGE_SHIFT;
     use crate::runtime::host::FakeHost;
+    use crate::runtime::Device;
+    use reims_vgpu_paging::geometry::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
 
     #[test]
     fn diagnose_reports_ok_and_zero_pfn() {
@@ -936,7 +951,7 @@ mod tests {
         st32(&mut d[..4], 4);
         let _ = host.write_gpa(root_gpa, &d[..4]);
 
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
         state.define_task(1, 0x1000, 2);
         let mut buf = [0u8; 4];
         assert!(read_task_gva(&host, &state.tasks[1], 0, &mut buf, PAGE_SHIFT_ARM64E).is_ok());
@@ -966,7 +981,7 @@ mod tests {
         st32(&mut d[..4], 4);
         let _ = host.write_gpa(root_gpa, &d[..4]);
 
-        let mut state = DeviceState::new(DeviceId(1), page_shift);
+        let mut state = Device::new(DeviceId(1), page_shift);
         state.define_task(1, 0x1000, 2);
         let mut buf = [0u8; 4];
         assert!(read_task_gva(&host, &state.tasks[1], 0, &mut buf, page_shift).is_ok());
@@ -993,7 +1008,7 @@ mod tests {
     fn the_page_table_is_the_only_bound_on_a_product_gva_write() {
         use crate::model::PAGE_SHIFT_ARM64E;
         let mut host = crate::runtime::host::FakeHost::new();
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
         // Task 1's own page tables map GVA 0.. onto four data pages.
         define_task_pages_arm64e(&mut host, &mut state, 0x100, 4);
         let page = 1u64 << PAGE_SHIFT_ARM64E;
@@ -1089,7 +1104,7 @@ mod tests {
         st32(&mut pte, 4);
         host.write_gpa(root_gpa + 4, &pte).unwrap();
 
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let mut state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
         state.define_task(2, 0x1_0000, 2);
         state.define_task(5, 0x1_0000, 9);
 
@@ -1143,7 +1158,7 @@ mod tests {
         st32(&mut pte, 4);
         host.write_gpa(root_gpa + 4, &pte).unwrap();
 
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let mut state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
         state.define_task(2, 0x1_0000, 2);
         state.define_task(5, 0x1_0000, 0);
         assert!(
@@ -1154,17 +1169,33 @@ mod tests {
         // The donor really can serve it — otherwise this test would pass for the
         // wrong reason.
         let mut donor = Vec::new();
-        visit_task_gva_page_gpas(&host, &state.tasks, 2, 0x1000, 4, PAGE_SHIFT_X86, &mut |gpa| {
-            donor.push(gpa);
-            true
-        });
+        visit_task_gva_page_gpas(
+            &host,
+            &state.tasks,
+            2,
+            0x1000,
+            4,
+            PAGE_SHIFT_X86,
+            &mut |gpa| {
+                donor.push(gpa);
+                true
+            },
+        );
         assert_eq!(donor, vec![data_gpa], "task 2 resolves GVA page 1");
 
         let mut pages = Vec::new();
-        visit_task_gva_page_gpas(&host, &state.tasks, 5, 0x1000, 4, PAGE_SHIFT_X86, &mut |gpa| {
-            pages.push(gpa);
-            true
-        });
+        visit_task_gva_page_gpas(
+            &host,
+            &state.tasks,
+            5,
+            0x1000,
+            4,
+            PAGE_SHIFT_X86,
+            &mut |gpa| {
+                pages.push(gpa);
+                true
+            },
+        );
         assert!(
             pages.is_empty(),
             "no neighbour's pages may be indexed under task 5, got {pages:x?}"
@@ -1181,7 +1212,7 @@ mod tests {
     #[test]
     fn a_failed_fallback_read_carries_the_named_tasks_own_refusal() {
         let host = FakeHost::new();
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let mut state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
         state.define_task(6, 0x1_0000, 0);
         assert!(
             state.tasks.is_active(6),
@@ -1216,7 +1247,7 @@ mod tests {
     #[test]
     fn the_quiet_read_answers_exactly_as_the_reporting_one_does() {
         let mut host = FakeHost::new();
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let mut state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
         let dir_gpa = 2u64 << PAGE_SHIFT_X86;
         let root_gpa = 3u64 << PAGE_SHIFT_X86;
         let data_gpa = 4u64 << PAGE_SHIFT_X86;
@@ -1261,7 +1292,7 @@ mod tests {
     #[test]
     fn a_read_for_an_undefined_task_word_still_reports_no_such_task() {
         let host = FakeHost::new();
-        let state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let state = Device::new(DeviceId(1), PAGE_SHIFT_X86);
         let mut buf = [0u8; 4];
         let err = read_task_gva_by_id(
             &host,

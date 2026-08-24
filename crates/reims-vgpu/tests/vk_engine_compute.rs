@@ -7,17 +7,30 @@
 //!
 //! **Serial:** process-global engine; suite takes a lock.
 
-#![cfg(feature = "backend-vulkan")]
-
-use reims_vgpu::backend::vulkan::engine::{
-    self, ComputeBufferResource, ComputeRequest, ComputeResidentSampleBind,
-    ComputeSampledImageResource, ComputeStorageImageResource, ComputeStorageResidency,
-    StorageImageFormat,
-};
 use reims_vgpu::model::ComputeStorageResidencyKey;
+use reims_vgpu_vulkan::engine::{
+    self, ComputeBufferBacking, ComputeBufferResource, ComputeRequest, ComputeResidentSampleBind,
+    ComputeSampledImageResource, ComputeSampledImageSource, ComputeStorageImageResource,
+    ComputeStorageImageSeed, ComputeStorageResidency, GuestRun, GuestRunSource, StorageImageFormat,
+};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
+
+/// A whole-workgroup dispatch of `counts` groups of `local` threads.
+///
+/// Fixtures here name workgroup counts, because that is what they dispatch.
+/// The plan also carries the exact thread grid a translated kernel would cull
+/// against, and for whole workgroups that is every thread of every group — so
+/// the local size has to be named rather than assumed, and a fixture whose
+/// SPIR-V declares `LocalSize 64 1 1` says so here too.
+fn whole_workgroups(
+    counts: [u32; 3],
+    local: [u32; 3],
+) -> reims_vgpu_protocol::dispatch::WorkgroupPlan {
+    reims_vgpu_protocol::dispatch::workgroup_counts(counts, local, false)
+        .expect("fixture dispatch dimensions are non-zero")
+}
 
 /// Acquire the process-global engine lock **and** reset the engine, in that
 /// order. Every engine-touching test must start from a fresh context:
@@ -50,6 +63,10 @@ fn skip_if_no_gpu(err: &str) -> bool {
         || lower.contains("no graphics")
         || lower.contains("vk_engine_init")
         || lower.contains("no combined")
+}
+
+fn prepare_test_program(words: Vec<u32>) -> reims_vgpu_core::PreparedShaderStage {
+    reims_vgpu_vulkan::m2v_cache::prepare_test_shader(words)
 }
 
 fn inc_comp_spirv() -> Option<Vec<u32>> {
@@ -149,6 +166,50 @@ const SAMPLED_IMAGE_FETCH_KERNEL: &str = r#"
                OpStore %ptr2 %lane2
        %ptr3 = OpAccessChain %_ptr_StorageBuffer_uint %out %uint_0 %uint_3
                OpStore %ptr3 %lane3
+               OpReturn
+               OpFunctionEnd
+"#;
+
+/// Read texel zero through a sampled binding and write it to texel one through
+/// a storage binding. The two descriptors may name the same texture object;
+/// that alias is part of the guest binding contract, not a request for a
+/// snapshot.
+const RESIDENT_SAMPLED_STORAGE_ALIAS_KERNEL: &str = r#"
+               OpCapability Shader
+               OpCapability StorageImageWriteWithoutFormat
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint GLCompute %main "main" %sampled %storage
+               OpExecutionMode %main LocalSize 1 1 1
+               OpDecorate %sampled DescriptorSet 0
+               OpDecorate %sampled Binding 32
+               OpDecorate %storage DescriptorSet 0
+               OpDecorate %storage Binding 1
+               OpDecorate %storage NonReadable
+       %void = OpTypeVoid
+       %uint = OpTypeInt 32 0
+        %int = OpTypeInt 32 1
+      %float = OpTypeFloat 32
+     %v2uint = OpTypeVector %uint 2
+      %v2int = OpTypeVector %int 2
+    %v4float = OpTypeVector %float 4
+     %uint_0 = OpConstant %uint 0
+       %int_0 = OpConstant %int 0
+       %int_1 = OpConstant %int 1
+      %sampled_image = OpTypeImage %float 2D 0 0 0 1 Unknown
+%_ptr_UniformConstant_sampled = OpTypePointer UniformConstant %sampled_image
+    %sampled = OpVariable %_ptr_UniformConstant_sampled UniformConstant
+      %storage_image = OpTypeImage %float 2D 0 0 0 2 Rgba8
+%_ptr_UniformConstant_storage = OpTypePointer UniformConstant %storage_image
+    %storage = OpVariable %_ptr_UniformConstant_storage UniformConstant
+    %fn_type = OpTypeFunction %void
+       %main = OpFunction %void None %fn_type
+      %entry = OpLabel
+         %src = OpLoad %sampled_image %sampled
+    %src_coord = OpCompositeConstruct %v2uint %uint_0 %uint_0
+       %texel = OpImageFetch %v4float %src %src_coord Lod %uint_0
+         %dst = OpLoad %storage_image %storage
+    %dst_coord = OpCompositeConstruct %v2int %int_1 %int_0
+               OpImageWrite %dst %dst_coord %texel
                OpReturn
                OpFunctionEnd
 "#;
@@ -274,12 +335,13 @@ fn compute_inc_ssbo_known_result() {
     let grid = (n as u32).div_ceil(64);
 
     let req = ComputeRequest {
-        spirv: words,
+        program: prepare_test_program(words),
         entry: "main".into(),
-        grid: [grid, 1, 1],
+        dispatch: whole_workgroups([grid, 1, 1], [64, 1, 1]),
+        barriers: Vec::new(),
         storage_buffers: vec![ComputeBufferResource {
             binding: 0,
-            bytes: input,
+            backing: ComputeBufferBacking::Bytes(input),
             writable: true,
         }],
         sampled_images: vec![],
@@ -291,7 +353,8 @@ fn compute_inc_ssbo_known_result() {
     };
     assert_eq!(out.buffers.len(), 1);
     let r: Vec<f32> = out.buffers[0]
-        .bytes
+        .bytes()
+        .expect("host-backed fixture returns bytes")
         .chunks_exact(4)
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
@@ -301,6 +364,118 @@ fn compute_inc_ssbo_known_result() {
         "expected all 11.0, got {:?}",
         &r[..4.min(r.len())]
     );
+}
+
+/// A guest-backed writable SSBO is the dispatch buffer and the destination.
+/// The result therefore names a queued landing rather than returning a second
+/// host copy, and the completion settle makes the shader's writes visible in
+/// the original allocation.
+#[test]
+fn compute_writable_guest_ssbo_lands_in_place() {
+    let _g = engine_test_session();
+    let Some(words) = inc_comp_spirv() else {
+        return;
+    };
+
+    // Initialize the device before asking for the host-pointer alignment. A
+    // machine without a Vulkan device is already a supported test skip, and a
+    // device without host import keeps the product on its typed host fallback.
+    let warm = ComputeRequest {
+        program: prepare_test_program(words.clone()),
+        entry: "main".into(),
+        dispatch: whole_workgroups([1, 1, 1], [1, 1, 1]),
+        barriers: Vec::new(),
+        storage_buffers: vec![ComputeBufferResource {
+            binding: 0,
+            backing: ComputeBufferBacking::Bytes(10.0f32.to_le_bytes().to_vec()),
+            writable: true,
+        }],
+        sampled_images: vec![],
+        samplers: vec![],
+        storage_images: vec![],
+    };
+    if engine_or_skip("compute guest SSBO warmup", &warm).is_none() {
+        return;
+    }
+    let Some(align) = reims_vgpu::runtime::guest_ram::granularity() else {
+        eprintln!("SKIP compute guest SSBO: host-pointer import unavailable");
+        return;
+    };
+
+    let n = 256usize;
+    let byte_len = n * std::mem::size_of::<f32>();
+    let alloc_len = byte_len
+        .max(align as usize)
+        .next_multiple_of(align as usize);
+    let layout = std::alloc::Layout::from_size_align(alloc_len, align as usize)
+        .expect("device alignment is a legal host allocation alignment");
+    let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+    assert!(!ptr.is_null(), "aligned guest fixture allocation");
+    unsafe {
+        std::slice::from_raw_parts_mut(ptr.cast::<f32>(), n).fill(10.0);
+    }
+
+    let import = std::sync::Arc::new(
+        reims_vgpu::runtime::guest_ram::GuestRamImport::new_host_allocation(
+            ptr as usize,
+            alloc_len as u64,
+            align,
+        )
+        .expect("aligned guest fixture import"),
+    );
+    let guest = reims_vgpu::runtime::guest_ram::GuestRef::new(
+        std::sync::Arc::clone(&import),
+        import
+            .slice(0, byte_len as u64)
+            .expect("fixture source lies in its import"),
+    )
+    .expect("fixture guest reference");
+    let source = GuestRunSource {
+        runs: std::sync::Arc::new(vec![GuestRun {
+            host_ptr: ptr as usize,
+            len: byte_len as u64,
+        }]),
+        source_offset: 0,
+        total_len: byte_len as u64,
+        row_length_texels: 0,
+        pages: Some(std::sync::Arc::new(vec![
+            reims_vgpu::runtime::guest_ram_map::GuestWindowRun {
+                window_offset: 0,
+                guest,
+            },
+        ])),
+        physical_pages: None,
+    };
+    let req = ComputeRequest {
+        program: prepare_test_program(words),
+        entry: "main".into(),
+        dispatch: whole_workgroups([(n as u32).div_ceil(64), 1, 1], [64, 1, 1]),
+        barriers: Vec::new(),
+        storage_buffers: vec![ComputeBufferResource {
+            binding: 0,
+            backing: ComputeBufferBacking::GuestPages {
+                source,
+                write_pages: vec![0],
+            },
+            writable: true,
+        }],
+        sampled_images: vec![],
+        samplers: vec![],
+        storage_images: vec![],
+    };
+    let out = engine::execute_compute_request(&req).expect("guest-backed compute dispatch");
+    assert!(matches!(
+        out.buffers[0].result,
+        engine::ComputeBufferResult::Landed { bytes } if bytes == byte_len as u64
+    ));
+    engine::quiesce_guest_writes();
+    let result = unsafe { std::slice::from_raw_parts(ptr.cast::<f32>(), n) };
+    assert!(result.iter().all(|&value| value == 11.0));
+
+    engine::retire_guest_import(import.id());
+    drop(req);
+    drop(import);
+    unsafe { std::alloc::dealloc(ptr, layout) };
 }
 
 /// Proven read-only SSBOs are uploaded and bound, but never mapped back to the
@@ -336,12 +511,13 @@ fn compute_readonly_ssbo_has_zero_readback() {
         return;
     };
     let req = ComputeRequest {
-        spirv: words,
+        program: prepare_test_program(words),
         entry: "main".into(),
-        grid: [1, 1, 1],
+        dispatch: whole_workgroups([1, 1, 1], [1, 1, 1]),
+        barriers: Vec::new(),
         storage_buffers: vec![ComputeBufferResource {
             binding: 0,
-            bytes: 0x1234_5678u32.to_le_bytes().to_vec(),
+            backing: ComputeBufferBacking::Bytes(0x1234_5678u32.to_le_bytes().to_vec()),
             writable: false,
         }],
         sampled_images: vec![],
@@ -412,12 +588,13 @@ fn compute_2d_grid_tiles_global_invocation_xy() {
     };
     let zeros = vec![0u8; 64 * 4];
     let req = ComputeRequest {
-        spirv: words.clone(),
+        program: prepare_test_program(words.clone()),
         entry: "main".into(),
-        grid: [8, 8, 1],
+        dispatch: whole_workgroups([8, 8, 1], [1, 1, 1]),
+        barriers: Vec::new(),
         storage_buffers: vec![ComputeBufferResource {
             binding: 0,
-            bytes: zeros.clone(),
+            backing: ComputeBufferBacking::Bytes(zeros.clone()),
             writable: true,
         }],
         sampled_images: vec![],
@@ -428,7 +605,8 @@ fn compute_2d_grid_tiles_global_invocation_xy() {
         return;
     };
     let vals: Vec<u32> = out.buffers[0]
-        .bytes
+        .bytes()
+        .expect("host-backed fixture returns bytes")
         .chunks_exact(4)
         .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
@@ -453,38 +631,30 @@ fn compute_storage_image_rgba8unorm_known_result() {
     let w = 4u32;
     let h = 4u32;
     let seed = vec![0u8; (w * h * 4) as usize];
-    let identity = ComputeStorageResidencyKey {
-        mapping_id: 77,
-        map_generation: 3,
-        surface_offset: 0,
-        surface_bpr: w * 4,
-        span_end: (w * h * 4) as u64,
-        width: w,
-        height: h,
-        pixel_format: 0x46,
-        texture_ref: 0,
-    };
+    let identity =
+        ComputeStorageResidencyKey::surface(77, 3, 0, w * 4, (w * h * 4) as u64, w, h, 0x46);
     let req = ComputeRequest {
-        spirv: words.clone(),
+        program: prepare_test_program(words.clone()),
         entry: "main".into(),
-        grid: [w, h, 1],
+        dispatch: whole_workgroups([w, h, 1], [1, 1, 1]),
+        barriers: Vec::new(),
         storage_buffers: vec![],
         sampled_images: vec![],
         samplers: vec![],
         storage_images: vec![ComputeStorageImageResource {
+            destination: Default::default(),
             binding: 0,
             array_element: 0,
             descriptor_count: 1,
             format: StorageImageFormat::Rgba8Unorm,
             width: w,
             height: h,
-            bytes: seed.clone(),
+            seed: ComputeStorageImageSeed::Bytes(seed.clone()),
             residency: Some(ComputeStorageResidency {
                 identity,
                 seed_generation: 1,
                 output_generation: 2,
             }),
-            seed_skipped: false,
         }],
     };
     let Some(out) = engine_or_skip("simg_rgba8", &req) else {
@@ -492,7 +662,11 @@ fn compute_storage_image_rgba8unorm_known_result() {
     };
     assert_eq!(out.images.len(), 1);
     // Every texel should be (255,0,0,255) approximately for unorm write of 1,0,0,1
-    for p in out.images[0].chunks_exact(4) {
+    for p in out.images[0]
+        .bytes()
+        .expect("a Host destination reads bytes back")
+        .chunks_exact(4)
+    {
         assert!(
             p[0] >= 254 && p[1] == 0 && p[2] == 0 && p[3] >= 254,
             "unexpected texel {p:?}"
@@ -504,32 +678,41 @@ fn compute_storage_image_rgba8unorm_known_result() {
     assert_eq!(snap.compute_sampled_uploads, 0);
 
     engine::reset_draw_counters();
-    let resident_seed = out.images[0].clone();
+    let resident_seed = out.images[0]
+        .bytes()
+        .expect("a Host destination reads bytes back")
+        .to_vec();
     let hit_req = ComputeRequest {
-        spirv: words.clone(),
+        program: prepare_test_program(words.clone()),
         entry: "main".into(),
-        grid: [w, h, 1],
+        dispatch: whole_workgroups([w, h, 1], [1, 1, 1]),
+        barriers: Vec::new(),
         storage_buffers: vec![],
         sampled_images: vec![],
         samplers: vec![],
         storage_images: vec![ComputeStorageImageResource {
+            destination: Default::default(),
             binding: 0,
             array_element: 0,
             descriptor_count: 1,
             format: StorageImageFormat::Rgba8Unorm,
             width: w,
             height: h,
-            bytes: resident_seed.clone(),
+            seed: ComputeStorageImageSeed::Bytes(resident_seed.clone()),
             residency: Some(ComputeStorageResidency {
                 identity,
                 seed_generation: 2,
                 output_generation: 3,
             }),
-            seed_skipped: false,
         }],
     };
     let hit = engine::execute_compute_request(&hit_req).expect("resident compute hit");
-    assert_eq!(hit.images[0], resident_seed);
+    assert_eq!(
+        hit.images[0]
+            .bytes()
+            .expect("a Host destination reads bytes back"),
+        &resident_seed[..]
+    );
     let hit_counters = engine::counter_snapshot();
     assert_eq!(hit_counters.compute_storage_seed_uploads, 0);
     assert_eq!(hit_counters.compute_storage_seed_upload_bytes, 0);
@@ -539,31 +722,45 @@ fn compute_storage_image_rgba8unorm_known_result() {
     // texel only so untouched texels prove the black seed replaced residency.
     engine::reset_draw_counters();
     let mismatch_req = ComputeRequest {
-        spirv: words,
+        program: prepare_test_program(words),
         entry: "main".into(),
-        grid: [1, 1, 1],
+        dispatch: whole_workgroups([1, 1, 1], [1, 1, 1]),
+        barriers: Vec::new(),
         storage_buffers: vec![],
         sampled_images: vec![],
         samplers: vec![],
         storage_images: vec![ComputeStorageImageResource {
+            destination: Default::default(),
             binding: 0,
             array_element: 0,
             descriptor_count: 1,
             format: StorageImageFormat::Rgba8Unorm,
             width: w,
             height: h,
-            bytes: seed.clone(),
+            seed: ComputeStorageImageSeed::Bytes(seed.clone()),
             residency: Some(ComputeStorageResidency {
                 identity,
                 seed_generation: 9,
                 output_generation: 10,
             }),
-            seed_skipped: false,
         }],
     };
     let mismatch = engine::execute_compute_request(&mismatch_req).expect("generation mismatch");
-    assert!(mismatch.images[0][0] >= 254 && mismatch.images[0][3] >= 254);
-    assert!(mismatch.images[0][4..].iter().all(|byte| *byte == 0));
+    assert!(
+        mismatch.images[0]
+            .bytes()
+            .expect("a Host destination reads bytes back")[0]
+            >= 254
+            && mismatch.images[0]
+                .bytes()
+                .expect("a Host destination reads bytes back")[3]
+                >= 254
+    );
+    assert!(mismatch.images[0]
+        .bytes()
+        .expect("a Host destination reads bytes back")[4..]
+        .iter()
+        .all(|byte| *byte == 0));
     let mismatch_counters = engine::counter_snapshot();
     assert_eq!(mismatch_counters.compute_storage_seed_uploads, 1);
     assert_eq!(
@@ -606,38 +803,31 @@ fn every_admitted_compute_storage_resident_survives_past_the_retired_slot_cap() 
     // real allocation failure is in play and the only thing that could remove one
     // of these is a count.
     const ADMITS: u32 = 80;
-    let identity = |i: u32| ComputeStorageResidencyKey {
-        mapping_id: 0x900 + i,
-        map_generation: 3,
-        surface_offset: 0,
-        surface_bpr: w * 4,
-        span_end: (w * h * 4) as u64,
-        width: w,
-        height: h,
-        pixel_format: 0x46,
-        texture_ref: 0,
+    let identity = |i: u32| {
+        ComputeStorageResidencyKey::surface(0x900 + i, 3, 0, w * 4, (w * h * 4) as u64, w, h, 0x46)
     };
     let request = |i: u32, seed_generation: u32| ComputeRequest {
-        spirv: words.clone(),
+        program: prepare_test_program(words.clone()),
         entry: "main".into(),
-        grid: [w, h, 1],
+        dispatch: whole_workgroups([w, h, 1], [1, 1, 1]),
+        barriers: Vec::new(),
         storage_buffers: vec![],
         sampled_images: vec![],
         samplers: vec![],
         storage_images: vec![ComputeStorageImageResource {
+            destination: Default::default(),
             binding: 0,
             array_element: 0,
             descriptor_count: 1,
             format: StorageImageFormat::Rgba8Unorm,
             width: w,
             height: h,
-            bytes: seed.clone(),
+            seed: ComputeStorageImageSeed::Bytes(seed.clone()),
             residency: Some(ComputeStorageResidency {
                 identity: identity(i),
                 seed_generation,
                 output_generation: 2,
             }),
-            seed_skipped: false,
         }],
     };
 
@@ -695,39 +885,39 @@ fn compute_storage_image_bgra8unorm_is_not_channel_swapped() {
     let w = 4u32;
     let h = 4u32;
     let seed = vec![0u8; (w * h * 4) as usize];
-    let identity = ComputeStorageResidencyKey {
-        mapping_id: 78,
-        map_generation: 3,
-        surface_offset: 0,
-        surface_bpr: w * 4,
-        span_end: (w * h * 4) as u64,
-        width: w,
-        height: h,
+    let identity = ComputeStorageResidencyKey::surface(
+        78,
+        3,
+        0,
+        w * 4,
+        (w * h * 4) as u64,
+        w,
+        h,
         // MTLPixelFormatBGRA8Unorm.
-        pixel_format: 0x50,
-        texture_ref: 0,
-    };
+        0x50,
+    );
     let req = ComputeRequest {
-        spirv: words,
+        program: prepare_test_program(words),
         entry: "main".into(),
-        grid: [w, h, 1],
+        dispatch: whole_workgroups([w, h, 1], [1, 1, 1]),
+        barriers: Vec::new(),
         storage_buffers: vec![],
         sampled_images: vec![],
         samplers: vec![],
         storage_images: vec![ComputeStorageImageResource {
+            destination: Default::default(),
             binding: 0,
             array_element: 0,
             descriptor_count: 1,
             format: StorageImageFormat::Bgra8Unorm,
             width: w,
             height: h,
-            bytes: seed,
+            seed: ComputeStorageImageSeed::Bytes(seed),
             residency: Some(ComputeStorageResidency {
                 identity,
                 seed_generation: 1,
                 output_generation: 2,
             }),
-            seed_skipped: false,
         }],
     };
     let Some(out) = engine_or_skip("simg_bgra8", &req) else {
@@ -736,7 +926,11 @@ fn compute_storage_image_bgra8unorm_is_not_channel_swapped() {
     assert_eq!(out.images.len(), 1);
     // Logical red stored into BGRA memory: B=0, G=0, R=255, A=255. A swap
     // (Rgba8Unorm view) would instead give byte0=255 — the bug.
-    for p in out.images[0].chunks_exact(4) {
+    for p in out.images[0]
+        .bytes()
+        .expect("a Host destination reads bytes back")
+        .chunks_exact(4)
+    {
         assert!(
             p[0] == 0 && p[1] == 0 && p[2] >= 254 && p[3] >= 254,
             "BGRA channel order wrong (R/B swap?): texel {p:?}"
@@ -759,39 +953,35 @@ fn compute_storage_image_seed_skip_and_lost_resident() {
     };
     let w = 4u32;
     let h = 4u32;
-    let identity = ComputeStorageResidencyKey {
-        mapping_id: 91,
-        map_generation: 1,
-        surface_offset: 0,
-        surface_bpr: w * 4,
-        span_end: (w * h * 4) as u64,
-        width: w,
-        height: h,
-        pixel_format: 0x46,
-        texture_ref: 0,
-    };
+    let identity =
+        ComputeStorageResidencyKey::surface(91, 1, 0, w * 4, (w * h * 4) as u64, w, h, 0x46);
     let make = |grid: [u32; 3], seed_generation: u32, output_generation: u32, skipped: bool| {
         ComputeRequest {
-            spirv: words.clone(),
+            program: prepare_test_program(words.clone()),
             entry: "main".into(),
-            grid,
+            dispatch: whole_workgroups(grid, [1, 1, 1]),
+            barriers: Vec::new(),
             storage_buffers: vec![],
             sampled_images: vec![],
             samplers: vec![],
             storage_images: vec![ComputeStorageImageResource {
+                destination: Default::default(),
                 binding: 0,
                 array_element: 0,
                 descriptor_count: 1,
                 format: StorageImageFormat::Rgba8Unorm,
                 width: w,
                 height: h,
-                bytes: vec![0u8; (w * h * 4) as usize],
+                seed: if skipped {
+                    ComputeStorageImageSeed::Resident
+                } else {
+                    ComputeStorageImageSeed::Bytes(vec![0u8; (w * h * 4) as usize])
+                },
                 residency: Some(ComputeStorageResidency {
                     identity,
                     seed_generation,
                     output_generation,
                 }),
-                seed_skipped: skipped,
             }],
         }
     };
@@ -799,14 +989,22 @@ fn compute_storage_image_seed_skip_and_lost_resident() {
     let Some(fill) = engine_or_skip("seed_skip_fill", &make([w, h, 1], 1, 2, false)) else {
         return;
     };
-    assert!(fill.images[0].chunks_exact(4).all(|p| p[0] >= 254));
+    assert!(fill.images[0]
+        .bytes()
+        .expect("a Host destination reads bytes back")
+        .chunks_exact(4)
+        .all(|p| p[0] >= 254));
 
     // Skip dispatch: one texel, zero-placeholder bytes, matching generation.
     // Untouched texels staying red prove the placeholder was never seeded.
     engine::reset_draw_counters();
     let skip = engine::execute_compute_request(&make([1, 1, 1], 2, 3, true))
         .expect("seed-skip resident hit");
-    for p in skip.images[0].chunks_exact(4) {
+    for p in skip.images[0]
+        .bytes()
+        .expect("a Host destination reads bytes back")
+        .chunks_exact(4)
+    {
         assert!(
             p[0] >= 254 && p[1] == 0 && p[2] == 0 && p[3] >= 254,
             "placeholder leaked into resident: {p:?}"
@@ -828,13 +1026,12 @@ fn compute_storage_image_seed_skip_and_lost_resident() {
     );
 }
 
-/// Copy-on-sample contract: a sampled input bound to a generation-matching
-/// resident storage image is seeded by a device-local copy (zero-placeholder
-/// `bytes` never uploaded, `compute_sampled_uploads == 0`) and fetches the
-/// resident content; a stale generation or evicted resident fails with
+/// Resident-sample contract: a sampled input bound to a generation-matching
+/// resident storage image binds that image directly (`compute_sampled_uploads
+/// == 0`) and fetches the resident content; a stale generation or evicted resident fails with
 /// `vk_compute_exec_resident_sample_*` — never a silent zero seed.
 #[test]
-fn compute_sampled_resident_copy_and_lost_resident() {
+fn compute_sampled_resident_direct_bind_and_lost_resident() {
     let _g = engine_test_session();
     // Same red-fill kernel as compute_storage_image_seed_skip_and_lost_resident.
     let fill_spvasm = &storage_image_write_red_kernel("Rgba8");
@@ -850,78 +1047,77 @@ fn compute_sampled_resident_copy_and_lost_resident() {
     };
     let w = 4u32;
     let h = 4u32;
-    let identity = ComputeStorageResidencyKey {
-        mapping_id: 93,
-        map_generation: 1,
-        surface_offset: 0,
-        surface_bpr: w * 4,
-        span_end: (w * h * 4) as u64,
-        width: w,
-        height: h,
-        pixel_format: 0x46,
-        texture_ref: 0,
-    };
+    let identity =
+        ComputeStorageResidencyKey::surface(93, 1, 0, w * 4, (w * h * 4) as u64, w, h, 0x46);
     // Full red fill establishes the resident at generation 2.
     let fill_req = ComputeRequest {
-        spirv: fill_words,
+        program: prepare_test_program(fill_words),
         entry: "main".into(),
-        grid: [w, h, 1],
+        dispatch: whole_workgroups([w, h, 1], [1, 1, 1]),
+        barriers: Vec::new(),
         storage_buffers: vec![],
         sampled_images: vec![],
         samplers: vec![],
         storage_images: vec![ComputeStorageImageResource {
+            destination: Default::default(),
             binding: 0,
             array_element: 0,
             descriptor_count: 1,
             format: StorageImageFormat::Rgba8Unorm,
             width: w,
             height: h,
-            bytes: vec![0u8; (w * h * 4) as usize],
+            seed: ComputeStorageImageSeed::Bytes(vec![0u8; (w * h * 4) as usize]),
             residency: Some(ComputeStorageResidency {
                 identity,
                 seed_generation: 1,
                 output_generation: 2,
             }),
-            seed_skipped: false,
         }],
     };
     let Some(fill) = engine_or_skip("resident_sample_fill", &fill_req) else {
         return;
     };
-    assert!(fill.images[0].chunks_exact(4).all(|p| p[0] >= 254));
+    assert!(fill.images[0]
+        .bytes()
+        .expect("a Host destination reads bytes back")
+        .chunks_exact(4)
+        .all(|p| p[0] >= 254));
 
     let make_fetch = |generation: u32| ComputeRequest {
-        spirv: fetch_words.clone(),
+        program: prepare_test_program(fetch_words.clone()),
         entry: "main".into(),
-        grid: [1, 1, 1],
+        dispatch: whole_workgroups([1, 1, 1], [1, 1, 1]),
+        barriers: Vec::new(),
         storage_buffers: vec![ComputeBufferResource {
             binding: 0,
-            bytes: vec![0; 16],
+            backing: ComputeBufferBacking::Bytes(vec![0; 16]),
             writable: true,
         }],
         sampled_images: vec![ComputeSampledImageResource {
             binding: 32,
             array_element: 0,
             descriptor_count: 1,
-            format: StorageImageFormat::Rgba8Unorm,
+            format: StorageImageFormat::Rgba8Unorm.into(),
             width: w,
             height: h,
-            bytes: vec![0u8; (w * h * 4) as usize],
-            resident_bind: Some(ComputeResidentSampleBind {
+            multisampled: false,
+            source: ComputeSampledImageSource::Resident(ComputeResidentSampleBind {
                 identity,
                 generation,
             }),
+            content: None,
         }],
         samplers: vec![],
         storage_images: vec![],
     };
 
-    // Resident hit: the sampled image is seeded device-locally from the red
-    // resident; the zero placeholder never uploads.
+    // Resident hit: the sampled descriptor binds the red resident itself; the
+    // zero placeholder never uploads and no image copy is needed.
     engine::reset_draw_counters();
     let hit = engine::execute_compute_request(&make_fetch(2)).expect("resident sample hit");
     let got: Vec<u32> = hit.buffers[0]
-        .bytes
+        .bytes()
+        .expect("host-backed fixture returns bytes")
         .chunks_exact(4)
         .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
@@ -938,8 +1134,8 @@ fn compute_sampled_resident_copy_and_lost_resident() {
     let snap = engine::counter_snapshot();
     assert_eq!(snap.compute_sampled_uploads, 0);
     assert_eq!(snap.compute_sampled_upload_bytes, 0);
-    assert_eq!(snap.compute_sampled_resident_copies, 1);
-    assert_eq!(snap.compute_sampled_resident_copy_bytes, (w * h * 4) as u64);
+    assert_eq!(snap.compute_sampled_resident_binds, 1);
+    assert_eq!(snap.compute_sampled_resident_bind_bytes, (w * h * 4) as u64);
 
     // Stale generation must fail visibly, never seed the placeholder.
     let err =
@@ -960,6 +1156,102 @@ fn compute_sampled_resident_copy_and_lost_resident() {
     );
 }
 
+#[test]
+fn compute_sampled_and_storage_bindings_preserve_one_resident_identity() {
+    let _g = engine_test_session();
+    let Some(fill_words) = assemble_spvasm(
+        &storage_image_write_red_kernel("Rgba8"),
+        "resident_alias_fill",
+    ) else {
+        return;
+    };
+    let Some(alias_words) = assemble_spvasm(
+        RESIDENT_SAMPLED_STORAGE_ALIAS_KERNEL,
+        "resident_alias_dispatch",
+    ) else {
+        return;
+    };
+    let (w, h) = (4u32, 1u32);
+    let identity =
+        ComputeStorageResidencyKey::surface(94, 1, 0, w * 4, (w * h * 4) as u64, w, h, 0x46);
+
+    let fill = ComputeRequest {
+        program: prepare_test_program(fill_words),
+        entry: "main".into(),
+        dispatch: whole_workgroups([1, 1, 1], [1, 1, 1]),
+        barriers: Vec::new(),
+        storage_buffers: vec![],
+        sampled_images: vec![],
+        samplers: vec![],
+        storage_images: vec![ComputeStorageImageResource {
+            destination: Default::default(),
+            binding: 0,
+            array_element: 0,
+            descriptor_count: 1,
+            format: StorageImageFormat::Rgba8Unorm,
+            width: w,
+            height: h,
+            seed: ComputeStorageImageSeed::Bytes(vec![0; (w * h * 4) as usize]),
+            residency: Some(ComputeStorageResidency {
+                identity,
+                seed_generation: 1,
+                output_generation: 2,
+            }),
+        }],
+    };
+    let Some(_) = engine_or_skip("resident_alias_fill", &fill) else {
+        return;
+    };
+
+    engine::reset_draw_counters();
+    let alias = ComputeRequest {
+        program: prepare_test_program(alias_words),
+        entry: "main".into(),
+        dispatch: whole_workgroups([1, 1, 1], [1, 1, 1]),
+        barriers: Vec::new(),
+        storage_buffers: vec![],
+        sampled_images: vec![ComputeSampledImageResource {
+            binding: 32,
+            array_element: 0,
+            descriptor_count: 1,
+            format: StorageImageFormat::Rgba8Unorm.into(),
+            width: w,
+            height: h,
+            multisampled: false,
+            source: ComputeSampledImageSource::Resident(ComputeResidentSampleBind {
+                identity,
+                generation: 2,
+            }),
+            content: None,
+        }],
+        samplers: vec![],
+        storage_images: vec![ComputeStorageImageResource {
+            destination: Default::default(),
+            binding: 1,
+            array_element: 0,
+            descriptor_count: 1,
+            format: StorageImageFormat::Rgba8Unorm,
+            width: w,
+            height: h,
+            seed: ComputeStorageImageSeed::Resident,
+            residency: Some(ComputeStorageResidency {
+                identity,
+                seed_generation: 2,
+                output_generation: 3,
+            }),
+        }],
+    };
+    let output = engine::execute_compute_request(&alias).expect("aliased resident dispatch");
+    let bytes = output.images[0]
+        .bytes()
+        .expect("host destination returns the resident result");
+    assert_eq!(&bytes[4..8], &[255, 0, 0, 255]);
+    let counters = engine::counter_snapshot();
+    assert_eq!(counters.compute_sampled_resident_binds, 1);
+    assert_eq!(counters.compute_sampled_uploads, 0);
+    assert_eq!(counters.compute_storage_seed_uploads, 0);
+}
+
 /// Sampled inputs must use SAMPLED_IMAGE descriptors and remain input-only.
 #[test]
 fn compute_sampled_image_fetch_preserves_float_bits() {
@@ -974,23 +1266,25 @@ fn compute_sampled_image_fetch_preserves_float_bits() {
         .flat_map(|value| value.to_le_bytes())
         .collect();
     let mut req = ComputeRequest {
-        spirv: words,
+        program: prepare_test_program(words),
         entry: "main".into(),
-        grid: [1, 1, 1],
+        dispatch: whole_workgroups([1, 1, 1], [1, 1, 1]),
+        barriers: Vec::new(),
         storage_buffers: vec![ComputeBufferResource {
             binding: 0,
-            bytes: vec![0; 16],
+            backing: ComputeBufferBacking::Bytes(vec![0; 16]),
             writable: true,
         }],
         sampled_images: vec![ComputeSampledImageResource {
             binding: 32,
             array_element: 0,
             descriptor_count: 1,
-            format: StorageImageFormat::Rgba32Float,
+            format: StorageImageFormat::Rgba32Float.into(),
             width: 1,
             height: 1,
-            bytes,
-            resident_bind: None,
+            multisampled: false,
+            source: ComputeSampledImageSource::Bytes(bytes),
+            content: None,
         }],
         samplers: vec![],
         storage_images: vec![],
@@ -999,7 +1293,8 @@ fn compute_sampled_image_fetch_preserves_float_bits() {
         return;
     };
     let got: Vec<u32> = out.buffers[0]
-        .bytes
+        .bytes()
+        .expect("host-backed fixture returns bytes")
         .chunks_exact(4)
         .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
@@ -1013,17 +1308,36 @@ fn compute_sampled_image_fetch_preserves_float_bits() {
 
     // RGB9E5 has no writable-storage selector in the guest ABI, but it is a
     // valid sampled texture. Zero packed RGB decodes to (0, 0, 0, 1).
-    req.sampled_images[0].format = StorageImageFormat::Rgb9e5Ufloat;
-    req.sampled_images[0].bytes = vec![0; 4];
+    req.sampled_images[0].format = StorageImageFormat::Rgb9e5Ufloat.into();
+    req.sampled_images[0].source = ComputeSampledImageSource::Bytes(vec![0; 4]);
     let Some(out) = engine_or_skip("compute sampled RGB9E5 image", &req) else {
         return;
     };
     let got: Vec<u32> = out.buffers[0]
-        .bytes
+        .bytes()
+        .expect("host-backed fixture returns bytes")
         .chunks_exact(4)
         .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
     assert_eq!(got, vec![0.0f32.to_bits(), 0, 0, 1.0f32.to_bits()]);
+
+    // A8 stores the same one byte as R8 but exposes it through alpha. Binding
+    // the allocation's identity R8 view would return `(a, 0, 0, 1)` instead.
+    req.sampled_images[0].format = reims_vgpu_core::pixel_format::compute_sampled_image_format(
+        reims_vgpu_core::pixel_format::MTL_FORMAT_A8_UNORM,
+    )
+    .expect("A8 is a sampled format");
+    req.sampled_images[0].source = ComputeSampledImageSource::Bytes(vec![0x7f]);
+    let Some(out) = engine_or_skip("compute sampled A8 image", &req) else {
+        return;
+    };
+    let got: Vec<u32> = out.buffers[0]
+        .bytes()
+        .expect("host-backed fixture returns bytes")
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    assert_eq!(got, vec![0, 0, 0, (127.0f32 / 255.0).to_bits()]);
 
     // Integer sampled views need an integer OpTypeImage and R32_UINT backing.
     let uint_spvasm = spvasm
@@ -1039,14 +1353,16 @@ fn compute_sampled_image_fetch_preserves_float_bits() {
     let Some(words) = assemble_spvasm(&uint_spvasm, "sampled_r32uint") else {
         return;
     };
-    req.spirv = words;
-    req.sampled_images[0].format = StorageImageFormat::R32Uint;
-    req.sampled_images[0].bytes = 0x1234_5678u32.to_le_bytes().to_vec();
+    req.program = prepare_test_program(words);
+    req.sampled_images[0].format = StorageImageFormat::R32Uint.into();
+    req.sampled_images[0].source =
+        ComputeSampledImageSource::Bytes(0x1234_5678u32.to_le_bytes().to_vec());
     let Some(out) = engine_or_skip("compute sampled R32Uint image", &req) else {
         return;
     };
     let got: Vec<u32> = out.buffers[0]
-        .bytes
+        .bytes()
+        .expect("host-backed fixture returns bytes")
         .chunks_exact(4)
         .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
@@ -1066,12 +1382,17 @@ fn compute_m2v_float_mul4_add3_known_result() {
     let input: Vec<u8> = inp.iter().flat_map(|x| x.to_le_bytes()).collect();
     let grid = 1u32; // LocalSize 64, one group covers ≤64
     let req = ComputeRequest {
-        spirv: words,
+        program: prepare_test_program(words),
         entry: "main".into(),
-        grid: [grid, 1, 1],
+        // The local size is this kernel's own, not a placeholder: the
+        // translated entry point culls every invocation outside the thread
+        // grid, and naming `[1, 1, 1]` here leaves 63 of the 64 threads
+        // culled and the buffer untouched.
+        dispatch: whole_workgroups([grid, 1, 1], [64, 1, 1]),
+        barriers: Vec::new(),
         storage_buffers: vec![ComputeBufferResource {
             binding: 0,
-            bytes: input,
+            backing: ComputeBufferBacking::Bytes(input),
             writable: true,
         }],
         sampled_images: vec![],
@@ -1082,7 +1403,8 @@ fn compute_m2v_float_mul4_add3_known_result() {
         return;
     };
     let got: Vec<f32> = out.buffers[0]
-        .bytes
+        .bytes()
+        .expect("host-backed fixture returns bytes")
         .chunks_exact(4)
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
@@ -1099,12 +1421,13 @@ fn warm_identical_dispatch_zero_creates_and_allocs() {
     let n = 64usize;
     let input: Vec<u8> = (0..n).flat_map(|_| 1.0f32.to_le_bytes()).collect();
     let make_req = || ComputeRequest {
-        spirv: words.clone(),
+        program: prepare_test_program(words.clone()),
         entry: "main".into(),
-        grid: [1, 1, 1],
+        dispatch: whole_workgroups([1, 1, 1], [1, 1, 1]),
+        barriers: Vec::new(),
         storage_buffers: vec![ComputeBufferResource {
             binding: 0,
-            bytes: input.clone(),
+            backing: ComputeBufferBacking::Bytes(input.clone()),
             writable: true,
         }],
         sampled_images: vec![],
@@ -1186,28 +1509,35 @@ fn compute_storage_image_r16float_if_supported() {
     };
     let seed = vec![0u8; 2 * 2 * 2]; // R16 = 2 bytes/texel
     let req = ComputeRequest {
-        spirv: words,
+        program: prepare_test_program(words),
         entry: "main".into(),
-        grid: [2, 2, 1],
+        dispatch: whole_workgroups([2, 2, 1], [1, 1, 1]),
+        barriers: Vec::new(),
         storage_buffers: vec![],
         sampled_images: vec![],
         samplers: vec![],
         storage_images: vec![ComputeStorageImageResource {
+            destination: Default::default(),
             binding: 0,
             array_element: 0,
             descriptor_count: 1,
             format: StorageImageFormat::R16Float,
             width: 2,
             height: 2,
-            bytes: seed,
+            seed: ComputeStorageImageSeed::Bytes(seed),
             residency: None,
-            seed_skipped: false,
         }],
     };
     match engine::execute_compute_request(&req) {
         Ok(out) => {
             assert_eq!(out.images.len(), 1);
-            assert_eq!(out.images[0].len(), 8);
+            assert_eq!(
+                out.images[0]
+                    .bytes()
+                    .expect("a Host destination reads bytes back")
+                    .len(),
+                8
+            );
         }
         Err(e) => {
             let s = e.to_string();
@@ -1281,12 +1611,13 @@ fn a_short_bind_cannot_read_the_tail_of_the_slot_it_was_given() {
     };
 
     let dispatch = |bytes: Vec<u8>| ComputeRequest {
-        spirv: words.clone(),
+        program: prepare_test_program(words.clone()),
         entry: "main".into(),
-        grid: [1, 1, 1],
+        dispatch: whole_workgroups([1, 1, 1], [1, 1, 1]),
+        barriers: Vec::new(),
         storage_buffers: vec![ComputeBufferResource {
             binding: 0,
-            bytes,
+            backing: ComputeBufferBacking::Bytes(bytes),
             writable: true,
         }],
         sampled_images: vec![],
@@ -1307,13 +1638,11 @@ fn a_short_bind_cannot_read_the_tail_of_the_slot_it_was_given() {
         return;
     };
     assert_eq!(out.buffers.len(), 1);
-    assert_eq!(out.buffers[0].bytes.len(), 100, "the bind's own length");
-    let seen = u32::from_le_bytes([
-        out.buffers[0].bytes[0],
-        out.buffers[0].bytes[1],
-        out.buffers[0].bytes[2],
-        out.buffers[0].bytes[3],
-    ]);
+    let bytes = out.buffers[0]
+        .bytes()
+        .expect("host-backed fixture returns bytes");
+    assert_eq!(bytes.len(), 100, "the bind's own length");
+    let seen = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
     assert_eq!(
         seen, 0,
         "a read past this bind's 100 bytes returned {seen:#010x} — the descriptor \

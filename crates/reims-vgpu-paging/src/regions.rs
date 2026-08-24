@@ -16,7 +16,7 @@
 //! of this module.
 //!
 //! It names nothing from `ash` and nothing from `metal` on purpose: a region
-//! here is four `u32`s and an offset, and both backends can build their own
+//! here is four `u32`s and an offset, and the backend can build its own
 //! descriptor from one. Pure logic in a gated backend tree is logic nobody on
 //! a Linux host ever runs, and this crate is what lets the tests below run on
 //! every arm instead of on none.

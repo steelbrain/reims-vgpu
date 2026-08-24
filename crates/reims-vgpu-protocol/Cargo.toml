@@ -1,0 +1,12 @@
+[package]
+name = "reims-vgpu-protocol"
+version = "0.1.0"
+edition = "2021"
+description = "Semantic protocol types for the Reims paravirtualized GPU"
+license = "GPL-2.0-or-later"
+
+[lib]
+name = "reims_vgpu_protocol"
+
+[dependencies]
+reims-vgpu-wire = { path = "../reims-vgpu-wire" }

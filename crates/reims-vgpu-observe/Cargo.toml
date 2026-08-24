@@ -1,0 +1,12 @@
+[package]
+name = "reims-vgpu-observe"
+version = "0.1.0"
+edition = "2021"
+description = "Shared failure visibility and measurement for Reims vGPU"
+license = "GPL-2.0-or-later"
+
+[lib]
+name = "reims_vgpu_observe"
+
+[features]
+test-fixtures = []

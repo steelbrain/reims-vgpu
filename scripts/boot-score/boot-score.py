@@ -17,35 +17,38 @@ a boot and pulls idle-desktop publishes into a driven band. The harness that had
 been scoring driven Maps boots did exactly that and reported ~31 fps where the
 same logs, joined by `t`, read 47-52.
 
-**It reports the GPU half.** On the x86/Vulkan iGPU pathway `gpu_span busy_us`
-per draw is *larger* than `drain_duty draw_us` per draw, and `(cpu + gpu) x
-draws/s` accounts for 95-100 % of every busy second — the device is saturated and
-the two halves barely overlap, so frames track their sum. A change ranked on
-`us/draw` alone is ranked on half of itself.
+**It reports both measured halves against their own populations.** CPU work is
+the whole packet-processing span (`proc_us`), not only the nested draw encoder.
+GPU time travels with `retired_draws` on the timestamped ring slot, so that is
+its exact denominator. A CPU census draw and a retired GPU draw usually converge
+over a sustained window, but assuming they are identical defeats the reason the
+GPU probe carries its own count.
 
 Columns:
 
-    n         busy census windows scored (drain duty >= 0.4, draws > 10)
-    cpu       drain_duty draw_us / draws
-    gpu       gpu_span busy_us / draws
-    sum       the two added, which is what frames track
-    fps       window_publish fresh / win_ms, over the same banded windows
+    n         busy census windows scored (drain duty >= 0.5, draws > 0)
+    cpu       drain_duty proc_us / guest draws
+    gpu       gpu_span busy_us / retired_draws
+    sum       the two per-draw prices added (interpret with overlap/occupancy)
+    fps       host-window presents / cadence window time over the probe slice
+    offered   host-window offers / cadence window time over the probe slice
     duty      mean drain_duty duty
-    draws/s   mean draws per banded window
-    occ       (cpu + gpu) x draws/s, the share of a second the two account for
+    draws/s   guest draws / summed matched window time
+    occ       measured CPU plus GPU busy time / summed matched window time
     d/frame   draws per frame, which is the workload and drifts between boots
 
-`occ` near 1.0 says both halves are the bottleneck and any microsecond off either
-converts. Well under 1.0 says something else paces the guest and neither does.
+`occ` is allowed to exceed 1.0 when CPU and GPU overlap. It is a measured-time
+sum, not evidence that the two phases serialize.
 
 `d/frame` is printed because frames are **not** comparable across boots without
-it: `fps = 1e6 / (sum x d/frame)` and the second term is what the guest chose to
-draw, which moves between boots of one binary.
+the amount of guest work in each frame. Do not derive FPS from `sum` unless the
+same workload has separately established how its CPU and GPU phases overlap.
 
 Usage:  scripts/boot-score/boot-score.py FAIL_LOG [FAIL_LOG ...]
 """
 
 import re
+import statistics
 import sys
 
 FIELD = re.compile(r"(\w+)=(-?[\d.]+)")
@@ -60,17 +63,27 @@ def _fields(line):
 
 
 def score(path):
-    gpu, pub, duty = {}, {}, []
+    gpu, pub, duty, cadence = {}, {}, [], []
+    legacy_gpu = False
     with open(path, errors="ignore") as handle:
         for line in handle:
             if line.startswith("OFF gpu_span "):
                 f = _fields(line)
-                if "t" in f and "busy_us" in f:
-                    gpu[int(float(f["t"]))] = float(f["busy_us"])
+                if "t" in f and "busy_us" in f and "retired_draws" in f:
+                    gpu[int(float(f["t"]))] = (
+                        float(f["busy_us"]),
+                        float(f["retired_draws"]),
+                    )
+                elif "t" in f and "busy_us" in f:
+                    legacy_gpu = True
             elif line.startswith("OFF window_publish "):
                 f = _fields(line)
                 if "t" in f and "fresh" in f and "win_ms" in f:
                     pub[int(float(f["t"]))] = (float(f["fresh"]), float(f["win_ms"]))
+            elif line.startswith("OFF host_window_cadence "):
+                f = _fields(line)
+                if "present_hz" in f and "offered_hz" in f:
+                    cadence.append((float(f["present_hz"]), float(f["offered_hz"])))
             elif line.startswith("OFF drain_duty "):
                 duty.append(_fields(line))
 
@@ -80,36 +93,47 @@ def score(path):
                 return table[t + k]
         return None
 
-    n = draws = cpu_us = gpu_us = duty_sum = fresh = win_ms = 0
+    n = draws = retired_draws = cpu_us = gpu_us = duty_sum = 0
+    fresh = frame_draws = busy_win_ms = publish_win_ms = 0
     for f in duty:
-        if "t" not in f:
+        if "t" not in f or "proc_us" not in f or "win_ms" not in f:
             continue
         d, count = float(f["duty"]), float(f["draws"])
-        if d < 0.4 or count <= 10:
+        if d < 0.5 or count <= 0:
             continue
-        busy = near(gpu, int(float(f["t"])))
-        if busy is None:
+        gpu_window = near(gpu, int(float(f["t"])))
+        if gpu_window is None or gpu_window[1] == 0:
             continue
         n += 1
         draws += count
-        cpu_us += float(f["draw_us"])
-        gpu_us += busy
+        cpu_us += float(f["proc_us"])
+        gpu_us += gpu_window[0]
+        retired_draws += gpu_window[1]
         duty_sum += d
+        busy_win_ms += float(f["win_ms"])
         published = near(pub, int(float(f["t"])))
         if published:
             fresh += published[0]
-            win_ms += published[1]
+            publish_win_ms += published[1]
+            frame_draws += count
 
     if not n:
+        if legacy_gpu:
+            return f"{path}: gpu_span lacks retired_draws — log predates the exact GPU denominator"
         return f"{path}: no joined busy windows — undriven, or a log from the test suite"
-    per_second = draws / n
-    total = (cpu_us + gpu_us) / draws
-    fps = fresh / (win_ms / 1000) if win_ms else 0.0
+    per_second = draws / (busy_win_ms / 1000)
+    cpu_per_draw = cpu_us / draws
+    gpu_per_draw = gpu_us / retired_draws
+    total = cpu_per_draw + gpu_per_draw
+    fps = statistics.median(sample[0] for sample in cadence) if cadence else 0.0
+    offered_fps = statistics.median(sample[1] for sample in cadence) if cadence else 0.0
+    occupancy = (cpu_us + gpu_us) / (busy_win_ms * 1000)
     return (
-        f"{path:<40} n={n:<3} cpu={cpu_us / draws:5.2f} gpu={gpu_us / draws:5.2f} "
-        f"sum={total:5.2f} fps={fps:5.1f} duty={duty_sum / n:.2f} "
-        f"draws/s={per_second:6.0f} occ={total * per_second / 1e6:.2f} "
-        f"d/frame={draws / n / fps if fps else 0:6.0f}"
+        f"{path:<40} n={n:<3} cpu={cpu_per_draw:5.2f} gpu={gpu_per_draw:5.2f} "
+        f"sum={total:5.2f} fps={fps:5.1f} offered={offered_fps:5.1f} "
+        f"duty={duty_sum / n:.2f} "
+        f"draws/s={per_second:6.0f} occ={occupancy:.2f} "
+        f"d/frame={frame_draws / fresh if fresh else 0:6.0f}"
     )
 
 

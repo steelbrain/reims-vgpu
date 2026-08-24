@@ -48,9 +48,8 @@ struct ThrashState {
 ///
 /// **This used to degrade the draw to single-RT and execute it**, which is why
 /// the class above was reachable. It now refuses the whole draw through
-/// [`crate::backend::vulkan::engine::DrawPreparationDecline::SecondaryTargetUnbuildable`],
+/// [`crate::runtime::draw::DrawPreparationDecline::SecondaryTargetUnbuildable`],
 /// so a guest that asks for N render targets never gets 1 without being told.
-/// What settled it was the other arm: `backend::metal::render` attaches every
 /// entry of the same colour list by its own slot number, so Metal already
 /// rendered what Vulkan was dropping, and the divergence — not a fresh argument
 /// about what Vulkan ought to do — is the finding.
@@ -58,58 +57,14 @@ struct ThrashState {
 /// The reasons are still reported through [`note_secondary_mrt_drop`] as well
 /// as carried in the refusal, because the census answers a question the decline
 /// cannot: which check bails, at what geometry, across a whole boot.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MrtDrop {
-    /// The requested slots are not a contiguous run from 0.
-    NonContiguousSlot,
-    /// A secondary attachment's geometry differs from the primary's.
-    GeometryMismatch,
-    /// The secondary's pixel format has no known engine mapping.
-    UnknownFormat,
-    /// The secondary target has no resident identity to render into.
-    NoIdentity,
-    /// The secondary resolves to the primary's own resident.
-    AliasesPrimary,
-}
+pub use reims_vgpu_core::MrtDrop;
 
 /// Which secondary colour attachment this device could not build, and why.
 ///
 /// A type rather than a `(u32, MrtDrop)` pair because both halves travel
 /// together from the producer to the refusal that names them, and the slot is
-/// the field a reader needs first: `mrt_drop_geometry_mismatch` says what
-/// failed and `slot=1` says which attachment of the guest's list it was.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SecondaryMrtRefusal {
-    /// The Metal colour-attachment slot the guest named for this attachment.
-    pub slot: u32,
-    /// Which build check refused it.
-    pub reason: MrtDrop,
-}
-
-impl crate::observe::Decline for MrtDrop {
-    fn slug(&self) -> &'static str {
-        match self {
-            Self::NonContiguousSlot => "mrt_drop_non_contiguous_slot",
-            Self::GeometryMismatch => "mrt_drop_geometry_mismatch",
-            Self::UnknownFormat => "mrt_drop_unknown_format",
-            Self::NoIdentity => "mrt_drop_no_identity",
-            Self::AliasesPrimary => "mrt_drop_aliases_primary",
-        }
-    }
-}
-
-impl MrtDrop {
-    /// Compact stable code for the dedup key.
-    fn code(self) -> u8 {
-        match self {
-            Self::NonContiguousSlot => 1,
-            Self::GeometryMismatch => 2,
-            Self::UnknownFormat => 3,
-            Self::NoIdentity => 4,
-            Self::AliasesPrimary => 5,
-        }
-    }
-}
+/// the field a reader needs first.
+pub use reims_vgpu_core::SecondaryMrtRefusal;
 
 impl ThrashState {
     const fn new() -> Self {
@@ -123,20 +78,12 @@ impl ThrashState {
 /// Single mutex so unit tests and concurrent presents cannot interleave counters.
 static STATE: Mutex<ThrashState> = Mutex::new(ThrashState::new());
 
-/// Always-on visibility for a **silently-degraded MRT draw**: a draw whose color
-/// list has >1 attachment (the guest asked for multiple render targets) but whose
-/// secondary attachments could not be built, so `build_secondary_targets`
-/// returned empty and the draw fell back to the single-RT path. The driving case
-/// is a vibrancy tile whose slot-1 RG16Float coverage mask is dropped: a later
-/// material draw then samples that mask GVA, finds no rendered resident, and reads
-/// zero alpha — the see-through frosted-material class.
-/// This path used to be silent (every early-return was a bare `Vec::new()`), so a
-/// dropped MRT looked identical to a legitimate single-RT draw.
+/// Always-on visibility for an MRT attachment that cannot be represented.
+/// The whole draw is refused; it never degrades to a single attachment.
 ///
 /// `reason` is a stable slug for WHICH build check bailed; deduped on
 /// `(reason, w, h)` so it fires once per distinct combination per boot (never per
 /// frame). Runs on the render/drain worker (`runtime::draw`), never the QEMU main loop.
-/// Measure-only — it does NOT change the fallback behavior, only reports it.
 pub fn note_secondary_mrt_drop(reason: MrtDrop, width: u32, height: u32) {
     let mut st = STATE.lock().unwrap_or_else(|e| e.into_inner());
     if !st
@@ -146,11 +93,6 @@ pub fn note_secondary_mrt_drop(reason: MrtDrop, width: u32, height: u32) {
         return;
     }
     drop(st);
-    // The parenthetical prose this line used to carry ("multi-RT draw degraded
-    // to single-RT…") moved to the doc comment above: `Emit` field values cannot
-    // hold whitespace, because the log is parsed by splitting on spaces, and a
-    // machine-readable line is worth more here than a sentence the reader can
-    // get from the slug.
     observe::Emit::decline("secondary_mrt_drop", &reason)
         .field("geom", format!("{width}x{height}"))
         .fail();
@@ -205,10 +147,8 @@ fn reset_state_inner() {
 ///
 /// The macOS/MoltenVK publish path drops a captured frame outright when no
 /// candidate resident has landed content, so the window keeps showing its
-/// previous (or slate) contents. That drop used to be completely silent — the
-/// only trace was `display_from_resident` flipping false. A sustained drop run is the
-/// "desktop frozen but the device is alive" class, so it needs a name and a
-/// count.
+/// previous (or slate) contents. A sustained drop run is the "desktop frozen
+/// but the device is alive" class, so it needs a name and a count.
 pub mod window_publish {
     use crate::observe;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -432,34 +372,34 @@ mod tests {
                 .matches(needle)
                 .count()
         };
-        let l0 = count("secondary_mrt_drop reason=mrt_drop_geometry_mismatch geom=214x54");
+        let l0 = count("secondary_mrt_drop reason=mrt_drop_unknown_format geom=214x54");
 
         // First drop at a geometry fires once.
-        note_secondary_mrt_drop(MrtDrop::GeometryMismatch, 214, 54);
+        note_secondary_mrt_drop(MrtDrop::UnknownFormat, 214, 54);
         assert_eq!(
-            count("secondary_mrt_drop reason=mrt_drop_geometry_mismatch geom=214x54"),
+            count("secondary_mrt_drop reason=mrt_drop_unknown_format geom=214x54"),
             l0 + 1
         );
         // Same reason+geometry → deduped (no per-frame re-fire).
-        note_secondary_mrt_drop(MrtDrop::GeometryMismatch, 214, 54);
-        note_secondary_mrt_drop(MrtDrop::GeometryMismatch, 214, 54);
+        note_secondary_mrt_drop(MrtDrop::UnknownFormat, 214, 54);
+        note_secondary_mrt_drop(MrtDrop::UnknownFormat, 214, 54);
         assert_eq!(
-            count("secondary_mrt_drop reason=mrt_drop_geometry_mismatch geom=214x54"),
+            count("secondary_mrt_drop reason=mrt_drop_unknown_format geom=214x54"),
             l0 + 1,
             "same reason+geometry must dedup"
         );
         // A different reason at the same geometry is its own episode.
-        let n_unknown = count("secondary_mrt_drop reason=mrt_drop_unknown_format geom=214x54");
-        note_secondary_mrt_drop(MrtDrop::UnknownFormat, 214, 54);
+        let n_identity = count("secondary_mrt_drop reason=mrt_drop_no_identity geom=214x54");
+        note_secondary_mrt_drop(MrtDrop::NoIdentity, 214, 54);
         assert_eq!(
-            count("secondary_mrt_drop reason=mrt_drop_unknown_format geom=214x54"),
-            n_unknown + 1
+            count("secondary_mrt_drop reason=mrt_drop_no_identity geom=214x54"),
+            n_identity + 1
         );
         // A different geometry, same reason, is its own episode.
-        let n_other = count("secondary_mrt_drop reason=mrt_drop_geometry_mismatch geom=100x40");
-        note_secondary_mrt_drop(MrtDrop::GeometryMismatch, 100, 40);
+        let n_other = count("secondary_mrt_drop reason=mrt_drop_unknown_format geom=100x40");
+        note_secondary_mrt_drop(MrtDrop::UnknownFormat, 100, 40);
         assert_eq!(
-            count("secondary_mrt_drop reason=mrt_drop_geometry_mismatch geom=100x40"),
+            count("secondary_mrt_drop reason=mrt_drop_unknown_format geom=100x40"),
             n_other + 1
         );
     }

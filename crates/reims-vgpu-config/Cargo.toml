@@ -1,0 +1,9 @@
+[package]
+name = "reims-vgpu-config"
+version = "0.1.0"
+edition = "2021"
+description = "Operator configuration vocabulary for Reims vGPU"
+license = "GPL-2.0-or-later"
+
+[lib]
+name = "reims_vgpu_config"

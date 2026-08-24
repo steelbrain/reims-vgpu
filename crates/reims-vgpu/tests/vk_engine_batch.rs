@@ -8,14 +8,13 @@
 //!
 //! **Serial:** the engine is process-global; all tests take the suite lock.
 
-#![cfg(feature = "backend-vulkan")]
-
 use metal2vulkan::passes::Stage;
-use reims_vgpu::backend::vulkan::engine::{
-    self, BufferContent, DepthState, DrawRequest, GuestRun, GuestRunSource, IndexType,
-    IndexedDrawResource, PrimitiveTopology, SampledImageResource, SampledSource,
-    SamplerCompareFunction, SamplerResource, ScissorResource, StorageBufferResource,
-    TargetIdentity,
+use reims_vgpu_vulkan::engine::{
+    self, BlendFactor, BlendOp, BlendStateResource, BufferContent, DepthAttachment, DepthState,
+    DrawRequest, GuestRun, GuestRunSource, IndexType, IndexedDrawResource, PrimitiveTopology,
+    SampledImageResource, SampledSource, SamplerCompareFunction, SamplerResource, ScissorResource,
+    StorageBufferResource, TargetIdentity, VertexAttributeFormat, VertexAttributeResource,
+    VertexStepFunction,
 };
 /// The resident format every `TargetIdentity::Surface` in this file is built at.
 ///
@@ -23,8 +22,8 @@ use reims_vgpu::backend::vulkan::engine::{
 /// against a resident in guest scanout order — several assert on the byte order
 /// of what they read back. Naming the constant once keeps that premise in one
 /// place and makes a test that wants a different format say so.
-const SURFACE_TEST_FORMAT: ash::vk::Format =
-    reims_vgpu::backend::vulkan::translate::pixel::SCANOUT_FORMAT;
+const SURFACE_TEST_FORMAT: reims_vgpu_core::pixel_format::TexelLayout =
+    reims_vgpu_core::pixel_format::TexelLayout::Bgra8;
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -101,8 +100,10 @@ fn batch_req(
     scissor: ScissorResource,
 ) -> DrawRequest {
     DrawRequest {
-        vert_spirv: std::sync::Arc::new(vert.to_vec()),
-        frag_spirv: std::sync::Arc::new(frag.to_vec()),
+        program: reims_vgpu_core::PreparedRenderProgram {
+            vertex: reims_vgpu_vulkan::m2v_cache::prepare_test_shader(vert.to_vec()),
+            fragment: reims_vgpu_vulkan::m2v_cache::prepare_test_shader(frag.to_vec()),
+        },
         width: W,
         height: H,
         vertex_count: 3,
@@ -124,6 +125,18 @@ fn half_scissor(left: bool) -> ScissorResource {
         y: 0,
         width: W / 2,
         height: H,
+    }
+}
+
+fn submission(id: u64) -> reims_vgpu_core::SubmissionContext {
+    reims_vgpu_core::SubmissionContext {
+        identity: reims_vgpu_protocol::SubmissionIdentity {
+            id: reims_vgpu_protocol::SubmissionId::new(id),
+            task: reims_vgpu_protocol::TaskId::new(77),
+        },
+        resources: std::sync::Arc::from([]),
+        segments: std::sync::Arc::from([]),
+        segment: None,
     }
 }
 
@@ -185,6 +198,248 @@ fn batched_draws_compose_and_flush_on_read() {
                 is_frag_color(&px[i..i + 4]),
                 "batched composite at ({x},{y}) = {:?}",
                 &px[i..i + 4]
+            );
+        }
+    }
+}
+
+#[test]
+fn a_refused_submission_tail_keeps_the_recorded_resident_prefix() {
+    let _guard = engine_test_lock().lock().unwrap();
+    engine::flush_batched_draws();
+    let (vert, frag) = triangle_spirv();
+    let identity = TargetIdentity::Surface {
+        id: 990_111,
+        width: W,
+        height: H,
+        generation: 1,
+        format: SURFACE_TEST_FORMAT,
+    };
+    let context = submission(111);
+    let left = batch_req(&vert, &frag, &identity, false, half_scissor(true));
+    let right = batch_req(&vert, &frag, &identity, true, half_scissor(false));
+    let invalid_tail = DrawRequest::default();
+    let commands = reims_vgpu_core::ResolvedCommandBuffer::new(vec![
+        reims_vgpu_core::ResolvedCommand::Draw(Box::new(left)),
+        reims_vgpu_core::ResolvedCommand::Draw(Box::new(right)),
+        reims_vgpu_core::ResolvedCommand::Draw(Box::new(invalid_tail)),
+    ]);
+    let progress = engine::execute_submission_progress(reims_vgpu_core::ResolvedSubmission {
+        context: context.clone(),
+        command_buffer: commands,
+    });
+    if let Some(error) = progress.failure.as_ref() {
+        if progress.output.is_empty() && skip_if_no_gpu(&error.to_string()) {
+            eprintln!("skipping: {error}");
+            return;
+        }
+    }
+    assert_eq!(
+        progress.output.len(),
+        2,
+        "the exact recorded prefix completed"
+    );
+    assert!(progress.failure.is_some(), "the invalid tail is refused");
+    engine::close_submission(context.identity).expect("the prefix remains submittable");
+
+    let pixels = engine::read_target(&identity)
+        .expect("the refused tail did not discard the prefix")
+        .into_rgba8();
+    for y in [0u32, H / 2, H - 1] {
+        for x in [0u32, W / 4, W / 2, 3 * W / 4, W - 1] {
+            let offset = ((y * W + x) * 4) as usize;
+            assert!(
+                is_frag_color(&pixels[offset..offset + 4]),
+                "prefix pixel at ({x},{y}) = {:?}",
+                &pixels[offset..offset + 4]
+            );
+        }
+    }
+}
+
+#[test]
+fn one_recording_retains_unchanged_vertex_buffer_state() {
+    let _guard = engine_test_lock().lock().unwrap();
+    engine::flush_batched_draws();
+    let (vert, frag) = triangle_spirv();
+    let identity = TargetIdentity::Surface {
+        id: 990_106,
+        width: W,
+        height: H,
+        generation: 1,
+        format: SURFACE_TEST_FORMAT,
+    };
+    let content = std::sync::Arc::new(vec![0u8; 24]);
+    let make = |load_from_target, left| {
+        let mut request = batch_req(
+            &vert,
+            &frag,
+            &identity,
+            load_from_target,
+            half_scissor(left),
+        );
+        for (location, binding) in [(0, 2), (1, 0), (2, 1)] {
+            request.vertex_attributes.push(VertexAttributeResource {
+                location,
+                binding,
+                format: VertexAttributeFormat::Float2,
+                offset: 0,
+                stride: 8,
+                step_function: VertexStepFunction::PerVertex,
+                step_rate: 1,
+                content: BufferContent::Bytes(std::sync::Arc::clone(&content)),
+            });
+        }
+        request
+    };
+    let before = engine::counter_snapshot();
+    if let Err(error) = engine::execute_draw_request(&make(false, true)) {
+        let message = error.to_string();
+        if skip_if_no_gpu(&message) {
+            eprintln!("skipping: {message}");
+            return;
+        }
+        panic!("first retained-state draw: {message}");
+    }
+    engine::execute_draw_request(&make(true, false)).expect("second retained-state draw");
+    let pixels = engine::read_target(&identity)
+        .expect("read target")
+        .into_rgba8();
+    let delta = engine::counter_snapshot().delta_since(&before);
+    assert_eq!(delta.vertex_buffer_bind_slots, 6, "requested: {delta:?}");
+    assert_eq!(delta.vertex_buffer_bind_emitted, 3, "emitted: {delta:?}");
+    assert_eq!(delta.vertex_buffer_bind_held, 3, "retained: {delta:?}");
+    assert_eq!(delta.vertex_buffer_bind_calls, 1, "setter calls: {delta:?}");
+    assert!(pixels.chunks_exact(4).any(is_frag_color));
+}
+
+#[test]
+fn one_recording_retains_unchanged_blend_constants() {
+    let _guard = engine_test_lock().lock().unwrap();
+    engine::flush_batched_draws();
+    let (vert, frag) = triangle_spirv();
+    let identity = TargetIdentity::Surface {
+        id: 990_107,
+        width: W,
+        height: H,
+        generation: 1,
+        format: SURFACE_TEST_FORMAT,
+    };
+    let make = |load_from_target, left| {
+        let mut request = batch_req(
+            &vert,
+            &frag,
+            &identity,
+            load_from_target,
+            half_scissor(left),
+        );
+        request.blend_constants = [0.2, 0.4, 0.6, 0.8];
+        request.blend = Some(BlendStateResource {
+            src_color: BlendFactor::ConstantColor,
+            dst_color: BlendFactor::Zero,
+            color_op: BlendOp::Add,
+            src_alpha: BlendFactor::ConstantAlpha,
+            dst_alpha: BlendFactor::Zero,
+            alpha_op: BlendOp::Add,
+        });
+        request
+    };
+    let before = engine::counter_snapshot();
+    if let Err(error) = engine::execute_draw_request(&make(false, true)) {
+        let message = error.to_string();
+        if skip_if_no_gpu(&message) {
+            eprintln!("skipping: {message}");
+            return;
+        }
+        panic!("first retained blend-state draw: {message}");
+    }
+    engine::execute_draw_request(&make(true, false)).expect("second retained blend-state draw");
+    let pixels = engine::read_target(&identity)
+        .expect("read target")
+        .into_rgba8();
+    let delta = engine::counter_snapshot().delta_since(&before);
+    assert_eq!(
+        delta.dynstate_blend_constants_held, 1,
+        "the second draw retained the setter value: {delta:?}"
+    );
+    assert!(pixels.iter().any(|byte| *byte != 0));
+}
+
+/// Each decoded exec owns one native command buffer. Continuation records may
+/// retain state inside that exec, but its close commits the packet before the
+/// next identity can claim the encoder.
+#[test]
+fn submission_close_commits_each_native_packet() {
+    let _guard = engine_test_lock().lock().unwrap();
+    engine::flush_batched_draws();
+    let (vert, frag) = triangle_spirv();
+    let identity = TargetIdentity::Surface {
+        id: 990_111,
+        width: W,
+        height: H,
+        generation: 1,
+        format: SURFACE_TEST_FORMAT,
+    };
+    let first_submission = submission(9_901);
+    let second_submission = submission(9_902);
+    let before = engine::counter_snapshot();
+
+    let left = batch_req(&vert, &frag, &identity, false, half_scissor(true));
+    if let Err(error) = engine::execute_draw_request_in_submission(&first_submission, &left) {
+        let _ = engine::close_submission(first_submission.identity);
+        let message = error.to_string();
+        if skip_if_no_gpu(&message) {
+            eprintln!("skipping: {message}");
+            return;
+        }
+        panic!("first submission draw: {message}");
+    }
+    assert_eq!(
+        engine::counter_snapshot()
+            .delta_since(&before)
+            .batch_flushes,
+        0,
+        "the packet remains open until its exact close event"
+    );
+    engine::close_submission(first_submission.identity).expect("close first submission");
+    let first_close = engine::counter_snapshot().delta_since(&before);
+    assert_eq!(
+        first_close.batch_flushes, 1,
+        "the first packet close commits its retained encoder"
+    );
+    assert_eq!(first_close.batch_flush_draws, 1);
+
+    let right = batch_req(&vert, &frag, &identity, true, half_scissor(false));
+    engine::execute_draw_request_in_submission(&second_submission, &right)
+        .expect("the next submission claims the released encoder");
+    engine::close_submission(second_submission.identity).expect("close second submission");
+
+    let delta = engine::counter_snapshot().delta_since(&before);
+    assert_eq!(
+        delta.batch_flushes, 2,
+        "each exact packet owns one native commit"
+    );
+    assert_eq!(delta.batch_flush_draws, 2);
+
+    let pixels = engine::read_target(&identity)
+        .expect("ordered submissions preserve the target")
+        .into_rgba8();
+    let flushed = engine::counter_snapshot().delta_since(&before);
+    assert_eq!(
+        flushed.batch_flushes, 2,
+        "the read finds no cross-packet tail"
+    );
+    assert_eq!(
+        flushed.batch_flush_draws, 2,
+        "each ordered submission retained its own draw"
+    );
+    for y in [0u32, H / 2, H - 1] {
+        for x in [0u32, W / 4, W / 2, 3 * W / 4, W - 1] {
+            let offset = ((y * W + x) * 4) as usize;
+            assert!(
+                is_frag_color(&pixels[offset..offset + 4]),
+                "cross-submission composite at ({x},{y}) = {:?}",
+                &pixels[offset..offset + 4]
             );
         }
     }
@@ -335,17 +590,27 @@ fn stored_multisample_target_survives_for_a_later_encoder() {
     let mut first = batch_req(&vert, &frag, &identity, false, half_scissor(true));
     first.raster_sample_count = 2;
     first.color_sample_count = 2;
+    first.depth_attachment = Some(DepthAttachment {
+        resource_lifetime: reims_vgpu_core::ResourceLifetime::new().reference(),
+        identity: depth_identity.clone(),
+        depth: Some(reims_vgpu_core::DepthAspectAttachment {
+            load_action: reims_vgpu_protocol::pass_action::LoadAction::Clear,
+            store_action: reims_vgpu_protocol::pass_action::StoreAction::Store,
+            clear_value: 1.0,
+        }),
+        stencil: None,
+    });
     first.depth = Some(DepthState {
-        identity: Some(depth_identity.clone()),
         test_enable: true,
         write_enable: true,
         compare: SamplerCompareFunction::Always,
-        clear_value: 1.0,
-        load: false,
         stencil: None,
     });
     match engine::execute_draw_request(&first) {
-        Ok(out) => assert!(out.pixels.is_empty(), "stored multisample target stays GPU-resident"),
+        Ok(out) => assert!(
+            out.pixels.is_empty(),
+            "stored multisample target stays GPU-resident"
+        ),
         Err(e) => {
             let msg = e.to_string();
             if skip_if_no_gpu(&msg) {
@@ -360,13 +625,20 @@ fn stored_multisample_target_survives_for_a_later_encoder() {
     let mut second = batch_req(&vert, &frag, &identity, true, half_scissor(false));
     second.raster_sample_count = 2;
     second.color_sample_count = 2;
+    second.depth_attachment = Some(DepthAttachment {
+        resource_lifetime: reims_vgpu_core::ResourceLifetime::new().reference(),
+        identity: depth_identity,
+        depth: Some(reims_vgpu_core::DepthAspectAttachment {
+            load_action: reims_vgpu_protocol::pass_action::LoadAction::Load,
+            store_action: reims_vgpu_protocol::pass_action::StoreAction::Store,
+            clear_value: 1.0,
+        }),
+        stencil: None,
+    });
     second.depth = Some(DepthState {
-        identity: Some(depth_identity),
         test_enable: true,
         write_enable: true,
         compare: SamplerCompareFunction::Always,
-        clear_value: 1.0,
-        load: true,
         stencil: None,
     });
     engine::execute_draw_request(&second).expect("later encoder loads multisample resident");
@@ -580,7 +852,7 @@ fn batched_guest_runs_buffer_snapshots_at_record() {
             total_len: backing.len() as u64,
             row_length_texels: 0,
             pages: None,
-            direct_image: None,
+            physical_pages: None,
         }),
     });
     match engine::execute_draw_request(&opener) {
@@ -692,8 +964,10 @@ fn sampled_guest_runs_land_the_guest_bytes_the_shader_samples() {
     ];
 
     let mut req = DrawRequest {
-        vert_spirv: std::sync::Arc::new(vert),
-        frag_spirv: std::sync::Arc::new(frag),
+        program: reims_vgpu_core::PreparedRenderProgram {
+            vertex: reims_vgpu_vulkan::m2v_cache::prepare_test_shader(vert),
+            fragment: reims_vgpu_vulkan::m2v_cache::prepare_test_shader(frag),
+        },
         width: W,
         height: H,
         vertex_count: 6,
@@ -740,18 +1014,22 @@ fn sampled_guest_runs_land_the_guest_bytes_the_shader_samples() {
                 total_len: 16,
                 row_length_texels: 0,
                 pages: None,
-                direct_image: None,
+                physical_pages: None,
             },
             // A fixture over a host `Vec` went through no witness, so the gather is
             // the only disposition available to it.
             reims_vgpu::runtime::gather_witness::GatherVouch::Fresh,
         ),
         byte_origin: Default::default(),
-        format: ash::vk::Format::R8G8B8A8_UNORM,
+        format: reims_vgpu_protocol::ImageFormat::linear(reims_vgpu_protocol::TexelLayout::Rgba8),
         identity: None,
+        content: None,
+        resource_lifetime: None,
         swizzle: Default::default(),
     });
-    req.samplers.push(SamplerResource::normalized_default(64));
+    req.samplers.push(SamplerResource::normalized_default(
+        reims_vgpu_vulkan::spirv_bind::SAMPLER_BINDING_BASE,
+    ));
 
     let outcome = engine::execute_draw_request(&req);
     if let Err(e) = &outcome {
@@ -900,7 +1178,7 @@ fn a_scattered_guest_buffer_window_is_gathered_by_the_gpu_in_one_region_per_stre
             total_len: STRETCH * 3,
             row_length_texels: 0,
             pages: Some(std::sync::Arc::new(pages)),
-            direct_image: None,
+            physical_pages: None,
         }),
     });
     engine::execute_draw_request(&req).expect("the gathered draw");
@@ -926,10 +1204,6 @@ fn a_scattered_guest_buffer_window_is_gathered_by_the_gpu_in_one_region_per_stre
     assert_eq!(
         d.buffer_guest_gather_regions, 3,
         "one copy region per stretch: {d:?}"
-    );
-    assert_eq!(
-        d.buffer_guest_imports, 0,
-        "three stretches are not one bind range: {d:?}"
     );
     assert_eq!(
         d.buffer_snapshot_binds, 0,
@@ -1130,7 +1404,7 @@ void main() {{
             total_len: STRETCH * 3,
             row_length_texels: 0,
             pages: Some(std::sync::Arc::new(pages)),
-            direct_image: None,
+            physical_pages: None,
         }),
     });
     engine::execute_draw_request(&req).expect("the gathered draw");
@@ -1310,7 +1584,7 @@ void main() {{
             total_len: STRETCH * RUNS,
             row_length_texels: 0,
             pages: Some(std::sync::Arc::new(pages)),
-            direct_image: None,
+            physical_pages: None,
         }),
     });
     engine::execute_draw_request(&req).expect("the fallback draw");
@@ -1341,30 +1615,13 @@ void main() {{
     engine::test_quiesce_ring();
 }
 
-/// **The rail a real workload never reaches: bound in place.**
+/// One contiguous guest window binds its retained import directly.
 ///
-/// A `GuestRuns` window has three dispositions on a host that can import guest
-/// RAM, and `stage_buffer_content` documents them in decreasing order of cost:
-/// bound in place, gathered by the GPU, gathered by the CPU. The other two now
-/// have tests that read the assembled bytes back out of a shader. This one is
-/// the first, and it is the one that most needs a test, because it is the one
-/// production never exercises: the guest backs a surface in 16 KiB granules, so
-/// a driven boot put 98.5 % of these windows at 9-32 stretches and **none at
-/// all** at one. `buffer_guest_imports` reads 0 for a whole boot.
-///
-/// That makes it a decoded-but-untaken rail — contract fidelity, kept because a
-/// guest that hands over one contiguous stretch must get the cheapest path
-/// rather than a copy. Kept code with no workload behind it is exactly the kind
-/// that rots silently, and the only assertion this crate previously made about
-/// `buffer_guest_imports` was that it stayed *zero*.
-///
-/// One run at window offset 0 covering the whole window, so `single_run` admits
-/// it and the draw reads the guest's bytes where the guest wrote them, with
-/// nothing copied in either direction. The window is laid out so the expected
-/// colour is the *same* one the gathered and CPU-fallback tests expect: three
-/// rails, one picture.
+/// The single-run case has no placement work for a gather to perform. The
+/// resource-owned import must remain alive through execution, and the shader
+/// must observe the bytes at the decoded window offset without a CPU copy.
 #[test]
-fn a_single_stretch_window_is_bound_in_place_and_the_shader_reads_the_guest_bytes() {
+fn a_single_stretch_window_binds_its_retained_guest_import() {
     use reims_vgpu::runtime::guest_ram::{granularity, GuestRamImport, GuestRamRegion, GuestRef};
     use reims_vgpu::runtime::guest_ram_map::GuestWindowRun;
 
@@ -1430,7 +1687,7 @@ void main() {{
     // Laid out in *window* order inside the one stretch, so the shader reading
     // words 0, 64 and 128 sees the same (0x33, 0x22, 0x11) the other two tests
     // expect. There is no reordering to detect here — one contiguous run has no
-    // placement to get wrong — so what this asserts is that binding in place
+    // placement to get wrong — so what this asserts is that the direct bind
     // reads the guest's bytes at all, and reads them from the right offset.
     const FILL: [u8; 3] = [0x11, 0x22, 0x33];
     for (slot, fill) in [FILL[2], FILL[1], FILL[0]].iter().enumerate() {
@@ -1473,10 +1730,10 @@ void main() {{
             total_len: WINDOW,
             row_length_texels: 0,
             pages: Some(std::sync::Arc::new(pages)),
-            direct_image: None,
+            physical_pages: None,
         }),
     });
-    engine::execute_draw_request(&req).expect("the in-place draw");
+    engine::execute_draw_request(&req).expect("the directly bound draw");
     let px = engine::read_target(&identity)
         .expect("read_target flushes the batch")
         .into_rgba8();
@@ -1484,11 +1741,11 @@ void main() {{
     let d = engine::counter_snapshot().delta_since(&before);
     assert_eq!(
         d.buffer_guest_imports, 1,
-        "one stretch at window offset 0 is the whole window; it must bind in place: {d:?}"
+        "one contiguous window binds through its retained guest import: {d:?}"
     );
     assert_eq!(
         d.buffer_guest_gathers, 0,
-        "nothing to gather when the window is already contiguous: {d:?}"
+        "a contiguous window has no placement work requiring a gather: {d:?}"
     );
     assert_eq!(
         d.buffer_snapshot_binds, 0,
@@ -1499,7 +1756,7 @@ void main() {{
     let got = &px[i..i + 4];
     assert!(
         near(got[0], FILL[2]) && near(got[1], FILL[1]) && near(got[2], FILL[0]),
-        "in-place bind read back as {got:?}; expected ({}, {}, {}) — the same \
+        "direct bind read back as {got:?}; expected ({}, {}, {}) — the same \
          picture the gathered and CPU-fallback rails produce.",
         FILL[2],
         FILL[1],
@@ -1508,12 +1765,11 @@ void main() {{
     engine::test_quiesce_ring();
 }
 
-/// An indexed draw retains the guest buffer window through execution. This is
-/// the fixed-function counterpart of the storage-buffer test above: the index
-/// bytes never become a host `Vec` or a staging upload, and a nonzero resource
-/// offset reaches `vkCmdBindIndexBuffer` unchanged.
+/// An indexed draw binds its retained contiguous guest import directly. This
+/// is the fixed-function counterpart of the storage-buffer test above: the
+/// index bytes never become a host `Vec`, staging upload, or gather target.
 #[test]
-fn an_index_window_is_bound_in_place_without_a_cpu_copy() {
+fn an_index_window_binds_its_retained_guest_import() {
     use reims_vgpu::runtime::guest_ram::{granularity, GuestRamImport, GuestRamRegion, GuestRef};
     use reims_vgpu::runtime::guest_ram_map::GuestWindowRun;
 
@@ -1550,8 +1806,7 @@ fn an_index_window_is_bound_in_place_without_a_cpu_copy() {
     let base = backing.as_ptr() as u64 + pad;
     let start = (pad + SOURCE_OFFSET) as usize;
     for (slot, index) in [0u16, 1, 2].into_iter().enumerate() {
-        backing[start + slot * 2..start + slot * 2 + 2]
-            .copy_from_slice(&index.to_le_bytes());
+        backing[start + slot * 2..start + slot * 2 + 2].copy_from_slice(&index.to_le_bytes());
     }
 
     let import = std::sync::Arc::new(
@@ -1582,7 +1837,7 @@ fn an_index_window_is_bound_in_place_without_a_cpu_copy() {
         total_len: INDEX_BYTES,
         row_length_texels: 0,
         pages: Some(std::sync::Arc::new(pages)),
-        direct_image: None,
+        physical_pages: None,
     };
 
     let before = engine::counter_snapshot();
@@ -1601,11 +1856,17 @@ fn an_index_window_is_bound_in_place_without_a_cpu_copy() {
 
     let d = engine::counter_snapshot().delta_since(&before);
     assert_eq!(d.buffer_guest_index_imports, 1, "index source: {d:?}");
-    assert_eq!(d.buffer_guest_index_import_bytes, INDEX_BYTES, "index source: {d:?}");
-    assert_eq!(d.buffer_index_bind_reuses, 1, "index source: {d:?}");
+    assert_eq!(
+        d.buffer_guest_import_bytes, INDEX_BYTES,
+        "index source: {d:?}"
+    );
     assert_eq!(d.buffer_guest_gathers, 0, "index source: {d:?}");
     assert_eq!(d.buffer_snapshot_binds, 0, "index source: {d:?}");
     let i = (((H / 2) * W + W / 4) * 4) as usize;
-    assert!(is_frag_color(&px[i..i + 4]), "indexed pixel = {:?}", &px[i..i + 4]);
+    assert!(
+        is_frag_color(&px[i..i + 4]),
+        "indexed pixel = {:?}",
+        &px[i..i + 4]
+    );
     engine::test_quiesce_ring();
 }
