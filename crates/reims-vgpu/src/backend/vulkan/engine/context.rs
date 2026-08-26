@@ -859,8 +859,10 @@ impl DeviceContext {
             instance.get_physical_device_properties2(*candidate, &mut props2);
             let driver_name = CStr::from_ptr(driver.driver_name.as_ptr()).to_string_lossy();
             let driver_info = CStr::from_ptr(driver.driver_info.as_ptr()).to_string_lossy();
-            let profile =
-                classify_memory(&instance.get_physical_device_memory_properties(*candidate));
+            let profile = classify_memory(
+                &instance.get_physical_device_memory_properties(*candidate),
+                *device_type,
+            );
             crate::observe::off(format!(
                 "vk_device_candidate index={index} of={} name={name:?} type={device_type:?} \
                  api={} above_floor={} rank={} driver_id={:?} driver={driver_name:?} \
@@ -1192,7 +1194,7 @@ impl DeviceContext {
         };
         let memory_properties = instance.get_physical_device_memory_properties(pd);
         let caps = HostGpuCaps {
-            memory: classify_memory(&memory_properties),
+            memory: classify_memory(&memory_properties, props.device_type),
             max_allocation_size,
             quirks: DriverQuirk::for_portability_subset(portability_subset),
             host_pointer,

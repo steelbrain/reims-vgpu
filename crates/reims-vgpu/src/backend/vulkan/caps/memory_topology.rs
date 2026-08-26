@@ -9,7 +9,7 @@
 //!
 //! ## The classification rule
 //!
-//! A device is `Unified` when **either** structural signal holds:
+//! A device is `Unified` when **any** of these signals holds:
 //!
 //! * **A — no separate host heap:** every advertised memory heap is
 //!   `DEVICE_LOCAL`. A discrete GPU always advertises the system-RAM heap
@@ -19,9 +19,13 @@
 //!   is mapped write-combining and is advertised `HOST_COHERENT` *without*
 //!   `HOST_CACHED` (this is what distinguishes a resizable-BAR discrete GPU,
 //!   which does expose a whole-VRAM host-visible type, from a real UMA part).
+//! * **C — integrated device type:** a nonempty layout reports
+//!   `VkPhysicalDeviceType::INTEGRATED_GPU`.
 //!
-//! Signal B exists so an AMD APU that advertises its GTT heap without
-//! `DEVICE_LOCAL` is not mistaken for a discrete part.
+//! Signal B covers AMD APUs whose GTT heap lacks `DEVICE_LOCAL`.
+//!
+//! Signal C covers integrated devices such as RADV Renoir whose split heaps match neither
+//! structural signal; A and B retain priority so existing diagnostic signals remain stable.
 //!
 //! ## Misclassification is a performance bug, never a correctness bug
 //!
@@ -191,7 +195,9 @@ pub enum TopologySignal {
     NoHostOnlyHeap,
     /// Signal B: a `DEVICE_LOCAL|HOST_VISIBLE|HOST_CACHED` type exists.
     CachedDeviceLocal,
-    /// Neither signal fired.
+    /// Signal C: neither structural signal fired and the device reports `INTEGRATED_GPU`.
+    IntegratedDeviceType,
+    /// No signal fired.
     SeparateHostHeap,
 }
 
@@ -200,15 +206,19 @@ impl TopologySignal {
         match self {
             Self::NoHostOnlyHeap => "no_host_only_heap",
             Self::CachedDeviceLocal => "cached_device_local",
+            Self::IntegratedDeviceType => "integrated_device_type",
             Self::SeparateHostHeap => "separate_host_heap",
         }
     }
 }
 
 /// Classify a device's memory layout. Pure over
-/// `VkPhysicalDeviceMemoryProperties`, so every row of the support matrix is
-/// testable without that GPU present.
-pub fn classify_memory(props: &vk::PhysicalDeviceMemoryProperties) -> MemoryProfile {
+/// `VkPhysicalDeviceMemoryProperties` and the reported physical-device type, so
+/// every support-matrix row is testable without its GPU.
+pub fn classify_memory(
+    props: &vk::PhysicalDeviceMemoryProperties,
+    device_type: vk::PhysicalDeviceType,
+) -> MemoryProfile {
     use vk::MemoryPropertyFlags as F;
     let heaps = &props.memory_heaps[..props.memory_heap_count as usize];
     let types = &props.memory_types[..props.memory_type_count as usize];
@@ -227,10 +237,19 @@ pub fn classify_memory(props: &vk::PhysicalDeviceMemoryProperties) -> MemoryProf
             .contains(F::DEVICE_LOCAL | F::HOST_VISIBLE | F::HOST_CACHED)
     });
 
+    // Structural signals retain diagnostic priority, and an empty layout cannot be unified.
+    let integrated_device_type =
+        !heaps.is_empty() && device_type == vk::PhysicalDeviceType::INTEGRATED_GPU;
+
     let (topology, signal) = if no_host_only_heap {
         (MemoryTopology::Unified, TopologySignal::NoHostOnlyHeap)
     } else if cached_device_local {
         (MemoryTopology::Unified, TopologySignal::CachedDeviceLocal)
+    } else if integrated_device_type {
+        (
+            MemoryTopology::Unified,
+            TopologySignal::IntegratedDeviceType,
+        )
     } else {
         (MemoryTopology::Discrete, TopologySignal::SeparateHostHeap)
     };
@@ -612,6 +631,35 @@ pub(crate) mod fixtures {
         )
     }
 
+    /// RADV Renoir layout transcribed from `vulkaninfo` on 2026-08-26; its split
+    /// heaps match neither structural unified-memory signal.
+    pub fn amd_apu_renoir() -> vk::PhysicalDeviceMemoryProperties {
+        use vk::MemoryPropertyFlags as F;
+        let amd = F::DEVICE_COHERENT_AMD | F::DEVICE_UNCACHED_AMD;
+        build(
+            &[
+                (5_683_822_592, vk::MemoryHeapFlags::empty()),
+                (11_367_645_184, vk::MemoryHeapFlags::DEVICE_LOCAL),
+            ],
+            &[
+                (1, F::DEVICE_LOCAL),
+                (1, F::DEVICE_LOCAL),
+                (0, F::HOST_VISIBLE | F::HOST_COHERENT),
+                (1, F::DEVICE_LOCAL | F::HOST_VISIBLE | F::HOST_COHERENT),
+                (1, F::DEVICE_LOCAL | F::HOST_VISIBLE | F::HOST_COHERENT),
+                (0, F::HOST_VISIBLE | F::HOST_COHERENT | F::HOST_CACHED),
+                (0, F::HOST_VISIBLE | F::HOST_COHERENT | F::HOST_CACHED),
+                (1, F::DEVICE_LOCAL | amd),
+                (0, F::HOST_VISIBLE | F::HOST_COHERENT | amd),
+                (
+                    1,
+                    F::DEVICE_LOCAL | F::HOST_VISIBLE | F::HOST_COHERENT | amd,
+                ),
+                (0, F::HOST_VISIBLE | F::HOST_COHERENT | F::HOST_CACHED | amd),
+            ],
+        )
+    }
+
     /// NVIDIA discrete without resizable BAR: a 256 MiB host-visible window into
     /// 16 GiB of VRAM, plus the system-RAM heap.
     pub fn nvidia_discrete() -> vk::PhysicalDeviceMemoryProperties {
@@ -682,21 +730,65 @@ mod tests {
             .map(|p| p.index)
     }
 
+    fn matrix() -> [(
+        &'static str,
+        vk::PhysicalDeviceMemoryProperties,
+        vk::PhysicalDeviceType,
+    ); 7] {
+        use vk::PhysicalDeviceType as T;
+        [
+            ("apple_m3_max", apple_m3_max(), T::INTEGRATED_GPU),
+            ("intel_igpu", intel_igpu(), T::INTEGRATED_GPU),
+            ("amd_apu_host_heap", amd_apu_host_heap(), T::INTEGRATED_GPU),
+            ("amd_apu_renoir", amd_apu_renoir(), T::INTEGRATED_GPU),
+            ("nvidia_discrete", nvidia_discrete(), T::DISCRETE_GPU),
+            (
+                "nvidia_discrete_rebar",
+                nvidia_discrete_rebar(),
+                T::DISCRETE_GPU,
+            ),
+            ("llvmpipe", llvmpipe(), T::CPU),
+        ]
+    }
+
     /// Every unified-memory device in the matrix classifies unified, and the
     /// signal that fired is recorded.
     #[test]
     fn unified_devices_classify_unified() {
-        for (name, props, signal) in [
-            ("apple", apple_m3_max(), TopologySignal::NoHostOnlyHeap),
-            ("intel", intel_igpu(), TopologySignal::NoHostOnlyHeap),
+        use vk::PhysicalDeviceType as T;
+        for (name, props, device_type, signal) in [
+            (
+                "apple",
+                apple_m3_max(),
+                T::INTEGRATED_GPU,
+                TopologySignal::NoHostOnlyHeap,
+            ),
+            (
+                "intel",
+                intel_igpu(),
+                T::INTEGRATED_GPU,
+                TopologySignal::NoHostOnlyHeap,
+            ),
             (
                 "amd-apu",
                 amd_apu_host_heap(),
+                T::INTEGRATED_GPU,
                 TopologySignal::CachedDeviceLocal,
             ),
-            ("llvmpipe", llvmpipe(), TopologySignal::NoHostOnlyHeap),
+            (
+                "amd-renoir",
+                amd_apu_renoir(),
+                T::INTEGRATED_GPU,
+                TopologySignal::IntegratedDeviceType,
+            ),
+            (
+                "llvmpipe",
+                llvmpipe(),
+                T::CPU,
+                TopologySignal::NoHostOnlyHeap,
+            ),
         ] {
-            let profile = classify_memory(&props);
+            let profile = classify_memory(&props, device_type);
             assert_eq!(
                 profile.topology,
                 MemoryTopology::Unified,
@@ -715,11 +807,35 @@ mod tests {
             ("nvidia", nvidia_discrete()),
             ("nvidia-rebar", nvidia_discrete_rebar()),
         ] {
-            let profile = classify_memory(&props);
+            let profile = classify_memory(&props, vk::PhysicalDeviceType::DISCRETE_GPU);
             assert_eq!(
                 profile.topology,
                 MemoryTopology::Discrete,
                 "{name} must classify discrete"
+            );
+            assert_eq!(profile.signal, TopologySignal::SeparateHostHeap);
+        }
+    }
+
+    /// Signal C depends on the standardized device type rather than GPU identity.
+    #[test]
+    fn the_integrated_signal_keys_on_the_reported_type_alone() {
+        let renoir = amd_apu_renoir();
+        assert_eq!(
+            classify_memory(&renoir, vk::PhysicalDeviceType::INTEGRATED_GPU).topology,
+            MemoryTopology::Unified,
+        );
+        for other in [
+            vk::PhysicalDeviceType::DISCRETE_GPU,
+            vk::PhysicalDeviceType::VIRTUAL_GPU,
+            vk::PhysicalDeviceType::CPU,
+            vk::PhysicalDeviceType::OTHER,
+        ] {
+            let profile = classify_memory(&renoir, other);
+            assert_eq!(
+                profile.topology,
+                MemoryTopology::Discrete,
+                "{other:?} is not the integrated signal"
             );
             assert_eq!(profile.signal, TopologySignal::SeparateHostHeap);
         }
@@ -730,25 +846,40 @@ mod tests {
     /// small a non-resizable BAR window really is.
     #[test]
     fn profile_reports_heap_sizes() {
-        let apple = classify_memory(&apple_m3_max());
+        use vk::PhysicalDeviceType as T;
+        let apple = classify_memory(&apple_m3_max(), T::INTEGRATED_GPU);
         assert_eq!(apple.device_local_bytes, 64 << 30);
         assert_eq!(apple.host_visible_device_local_bytes, 64 << 30);
 
-        let nv = classify_memory(&nvidia_discrete());
+        let nv = classify_memory(&nvidia_discrete(), T::DISCRETE_GPU);
         assert_eq!(nv.device_local_bytes, 16 << 30);
         assert_eq!(nv.host_visible_device_local_bytes, 256 << 20);
 
-        let rebar = classify_memory(&nvidia_discrete_rebar());
+        let rebar = classify_memory(&nvidia_discrete_rebar(), T::DISCRETE_GPU);
         assert_eq!(rebar.host_visible_device_local_bytes, 16 << 30);
+
+        let renoir = classify_memory(&amd_apu_renoir(), T::INTEGRATED_GPU);
+        assert_eq!(renoir.device_local_bytes, 11_367_645_184);
+        assert_eq!(renoir.host_visible_device_local_bytes, 11_367_645_184);
     }
 
-    /// An empty/absent memory layout must not be called unified by omission.
+    /// An empty memory layout stays discrete even when the device reports `INTEGRATED_GPU`.
     #[test]
     fn empty_properties_are_not_unified() {
         let empty = vk::PhysicalDeviceMemoryProperties::default();
-        let profile = classify_memory(&empty);
-        assert_eq!(profile.topology, MemoryTopology::Discrete);
-        assert_eq!(profile.device_local_bytes, 0);
+        for device_type in [
+            vk::PhysicalDeviceType::OTHER,
+            vk::PhysicalDeviceType::INTEGRATED_GPU,
+        ] {
+            let profile = classify_memory(&empty, device_type);
+            assert_eq!(
+                profile.topology,
+                MemoryTopology::Discrete,
+                "{device_type:?} with no heaps"
+            );
+            assert_eq!(profile.signal, TopologySignal::SeparateHostHeap);
+            assert_eq!(profile.device_local_bytes, 0);
+        }
     }
 
     /// Readback lands in cached memory on every device in the matrix — an
@@ -945,15 +1076,8 @@ mod tests {
     /// crate can see that from a single site.
     #[test]
     fn every_class_resolves_on_every_device_family() {
-        for (name, props) in [
-            ("apple_m3_max", apple_m3_max()),
-            ("intel_igpu", intel_igpu()),
-            ("amd_apu_host_heap", amd_apu_host_heap()),
-            ("nvidia_discrete", nvidia_discrete()),
-            ("nvidia_discrete_rebar", nvidia_discrete_rebar()),
-            ("llvmpipe", llvmpipe()),
-        ] {
-            let profile = classify_memory(&props);
+        for (name, props, device_type) in matrix() {
+            let profile = classify_memory(&props, device_type);
             for class in [
                 MemoryClass::Upload,
                 MemoryClass::Readback,
@@ -988,7 +1112,7 @@ mod tests {
     fn an_allocation_larger_than_a_heap_does_not_get_charged_to_it() {
         const GIB: u64 = 1 << 30;
         let props = amd_apu_host_heap();
-        let req = classify_memory(&props)
+        let req = classify_memory(&props, vk::PhysicalDeviceType::INTEGRATED_GPU)
             .topology
             .request(MemoryClass::Upload);
 
@@ -1026,7 +1150,7 @@ mod tests {
     fn a_size_past_the_device_maximum_is_refused_whatever_the_heaps_hold() {
         const GIB: u64 = 1 << 30;
         let props = amd_apu_host_heap();
-        let req = classify_memory(&props)
+        let req = classify_memory(&props, vk::PhysicalDeviceType::INTEGRATED_GPU)
             .topology
             .request(MemoryClass::Upload);
 
@@ -1055,15 +1179,8 @@ mod tests {
     /// performance bug, which is what the variant assertion below pins.
     #[test]
     fn a_size_no_heap_can_hold_is_refused_by_capacity_and_never_by_flags() {
-        for (name, props) in [
-            ("apple_m3_max", apple_m3_max()),
-            ("intel_igpu", intel_igpu()),
-            ("amd_apu_host_heap", amd_apu_host_heap()),
-            ("nvidia_discrete", nvidia_discrete()),
-            ("nvidia_discrete_rebar", nvidia_discrete_rebar()),
-            ("llvmpipe", llvmpipe()),
-        ] {
-            let profile = classify_memory(&props);
+        for (name, props, device_type) in matrix() {
+            let profile = classify_memory(&props, device_type);
             for class in [
                 MemoryClass::Upload,
                 MemoryClass::Readback,
