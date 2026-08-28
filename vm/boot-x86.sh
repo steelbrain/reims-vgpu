@@ -85,6 +85,10 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+# USB passthrough spec parsing is shared with boot-arm64.sh; see that file's
+# header for why the rule has one owner rather than a copy per boot script.
+# shellcheck source=vm/lib/usb-passthrough.sh
+. "$REPO_ROOT/vm/lib/usb-passthrough.sh"
 
 # --- Configuration (override via env or flags) ----------------------------------
 DISKS_DIR="${DISKS_DIR:-$SCRIPT_DIR/disks}"
@@ -109,10 +113,13 @@ RUN_DIR="${RUN_DIR:-$DISKS_DIR/run}"
 #   copy in /tmp prints this script's normal header and then dies on
 #   `failed to find romfile "efi-virtio.rom"` — a boot that looks started.
 # - Keep `qemu-system-x86_64` in the filename. Every VM sweep in this repo and
-#   in the repro scripts matches that pattern. A pin named anything else
-#   survives the sweep, keeps hostfwd 2222, and the next boot fails to bind and
-#   exits — after which the scoring script talks to the *pinned* guest and
-#   reports a clean run of the wrong binary.
+#   in the repro scripts matches that pattern, so a pin named anything else
+#   survives the sweep and the next boot then contends with it. Under NET=user
+#   that showed up as the survivor holding hostfwd 2222 and the new boot failing
+#   to bind; under the NET=bridge default there is no port to contend for, so
+#   the two guests simply collide on GUEST_MAC and nothing fails at all. Either
+#   way the scoring script goes on to talk to the *pinned* guest and reports a
+#   clean run of the wrong binary — the bridge case just does it silently.
 QEMU_BIN_DEFAULT="$REPO_ROOT/vendor/qemu/build/qemu-system-x86_64"
 QEMU_BIN="${QEMU_BIN:-$QEMU_BIN_DEFAULT}"
 REIMS_VGPU_EFI_ROM_SCRIPT="$REPO_ROOT/crates/reims-vgpu-efi/scripts/reims-vgpu-efi-rom/reims-vgpu-efi-rom.sh"
@@ -157,11 +164,59 @@ AUDIO_BUFFER_US="${AUDIO_BUFFER_US:-46440}"
 # notices.
 AUDIO_USB_BUFFER="${AUDIO_USB_BUFFER:-65536}"
 
+# --- USB passthrough ----------------------------------------------------------
+# Host USB devices to hand to the guest, one spec per `--usb`, plus whatever
+# USB_PASSTHROUGH names (whitespace-separated) so a harness can set it without
+# rewriting an argv. Empty means the guest sees only the emulated usb-kbd /
+# usb-tablet / usb-audio it has always had.
+#
+# THREE SPEC FORMS, and which one to pick is a real choice rather than taste:
+#
+#   VID:PID    four hex digits each, as `lsusb` prints them (e.g. 046d:c099).
+#              Follows the device across ports and replugs, because QEMU matches
+#              on the descriptor. Ambiguous if two identical devices are plugged
+#              in — QEMU takes the first it enumerates.
+#   BUS.ADDR   decimal bus and device address (e.g. 5.3), the numbers in
+#              `lsusb`'s "Bus 005 Device 003". Names exactly one device even
+#              among identical twins, but ADDR is reassigned on every replug and
+#              on some hub resets, so it is a spec for one boot.
+#   BUS-PORT   decimal bus and the physical port path (e.g. 5-1.2), the sysfs
+#              name. Pinned to the socket rather than to the device or to an
+#              enumeration order, so it survives replugs and disambiguates
+#              twins. This is the form to prefer for a fixed rig.
+#
+# All three are resolved against /sys/bus/usb/devices below so that a typo, an
+# unplugged device, or a /dev/bus/usb node this user cannot write is a named
+# refusal before QEMU starts rather than a guest that silently never sees the
+# device.
+#
+# WHAT THE HOST LOSES. A passed-through device is detached from the host driver
+# for the life of the boot. Passing the keyboard or mouse you are typing on
+# hands it to the guest, and the emulated usb-kbd/usb-tablet that the QMP input
+# helpers drive is a different device — so the host input you give up is not
+# given back until the VM exits. Each resolved device is printed with its
+# manufacturer and product string so what is being surrendered is on screen
+# before the boot starts.
+#
+# USB_SPEC_COUNT shadows ${#USB_SPECS[@]} on purpose: on an EMPTY array both
+# ${#arr[@]} and "${arr[@]}" are an unbound-variable error under `set -u` in
+# bash 3.2, which is the bash a stock macOS host gives boot-arm64.sh. The two
+# boot scripts share vm/lib/usb-passthrough.sh, so they share the idiom too.
+USB_SPECS=()
+USB_SPEC_COUNT=0
+if [ -n "${USB_PASSTHROUGH:-}" ]; then
+  # Deliberately unquoted: this knob is a whitespace-separated list.
+  # shellcheck disable=SC2206
+  USB_SPECS=($USB_PASSTHROUGH)
+  for _ in $USB_PASSTHROUGH; do USB_SPEC_COUNT=$((USB_SPEC_COUNT + 1)); done
+fi
+
 BOOT_CLASS="testing"          # testing | interactive | capture
 RAIL_LABEL="${RAIL:-}"        # empty = follow rails/current; else a rail name
 SNAPSHOT_LABEL=""             # empty = follow the rail's snapshots/current
 LIST_RAILS=0
 LIST_SNAPSHOTS=0
+LIST_USB=0
 # Default to the product device: it is the whole point of this tree, and its
 # host-owned Vulkan window (REIMS_VGPU_WINDOW=1, present + input) is what a human
 # expects to see. The legacy vmware-svga console is opt-in via --device — a bare
@@ -190,6 +245,11 @@ usage: vm/boot-x86.sh [--device reims-vgpu-pci|vmware-svga] [--testing|--interac
   --snapshot LABEL       snapshot WITHIN that rail. Default: the rail's own
                          \`snapshots/current\`. A bare --snapshot (no label) is
                          the old spelling of --capture.
+  --usb SPEC             pass a host USB device through to the guest; repeatable.
+                         SPEC is VID:PID (046d:c099), BUS.ADDR (5.3) or
+                         BUS-PORT (5-1.2). See --list-usb.
+  --list-usb             print the host USB devices with all three spec forms
+                         and exit
   --list-rails           print the rails and exit
   --list-snapshots       print the selected rail's snapshots and exit
 
@@ -202,7 +262,11 @@ Env: DISKS_DIR OVMF_DIR RAILS_DIR RAIL RUN_DIR QEMU_BIN OVMF_CODE OVMF_VARS_MAST
      OPENCORE_MASTER DISK_MASTER RAM CPU_SOCKETS CPU_CORES CPU_THREADS CPU_MODEL
      CPU_OPTIONS SSH_PORT TESTING_TIMEOUT QMP_DUMP_TIMEOUT GUEST_MAC REIMS_VGPU_BACKEND
      (metal|vulkan for qemu-build)
-     NET=user (SLIRP, default) | NET=none (no NIC)
+     NET=bridge (default; guest joins \$BRIDGE and takes a real DHCP lease)
+       | NET=user (SLIRP NAT + hostfwd \$SSH_PORT->22) | NET=none (no NIC)
+     BRIDGE=virbr0 (default) — host bridge for NET=bridge
+     BRIDGE_HELPER=path — override the qemu-bridge-helper this boot execs
+     USB_PASSTHROUGH="SPEC SPEC ..." — same specs as --usb
      REIMS_VGPU_PCI_ATTACH=pcibridge|bus0   (default pcibridge; product secondary bus)
      REIMS_VGPU_GOP_ROM=path | REIMS_VGPU_GOP_ROM= (option ROM on reims-vgpu-pci; auto if built)
      QEMU_REBOOT_ACTION=exit|pause|reset
@@ -252,6 +316,9 @@ while [ "$#" -gt 0 ]; do
       esac
       ;;
     --snapshot=*) SNAPSHOT_LABEL="${1#--snapshot=}"; shift ;;
+    --usb) shift; [ -n "${1:-}" ] || { echo "boot-x86.sh: --usb needs a spec (VID:PID | BUS.ADDR | BUS-PORT)" >&2; exit 64; }; USB_SPECS+=("$1"); USB_SPEC_COUNT=$((USB_SPEC_COUNT + 1)); shift ;;
+    --usb=*) USB_SPECS+=("${1#--usb=}"); USB_SPEC_COUNT=$((USB_SPEC_COUNT + 1)); shift ;;
+    --list-usb) LIST_USB=1; shift ;;
     --list-rails) LIST_RAILS=1; shift ;;
     --list-snapshots) LIST_SNAPSHOTS=1; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -278,6 +345,41 @@ require_plain_label() {
     */*|.|..|"") die "$1 takes a plain label, not a path: '$2'" ;;
   esac
 }
+
+# --- Resolve USB passthrough ------------------------------------------------------
+# Answered before anything is built, for the same reason as --list-rails below:
+# it is a question about the host, and a bad spec must cost a second rather than
+# a QEMU build and a boot.
+if [ "$LIST_USB" -eq 1 ]; then
+  usb_list_devices
+  echo
+  echo "pass one to a boot with --usb SPEC (repeatable), or USB_PASSTHROUGH=\"SPEC SPEC\"."
+  echo "prefer BUS-PORT: it is pinned to the socket, so it survives a replug and"
+  echo "distinguishes two identical devices, which VID:PID cannot and BUS.ADDR loses."
+  exit 0
+fi
+
+# Each spec becomes one `-device usb-host,...`. The properties differ per spec
+# form, so they are resolved once here and the QEMU arguments are assembled from
+# what came back — nothing downstream re-parses a spec.
+USB_QEMU_ARGS=()
+USB_QEMU_ARG_COUNT=0
+if [ "$USB_SPEC_COUNT" -gt 0 ]; then
+  [ "$(uname -s)" = "Linux" ] || die \
+    "--usb/USB_PASSTHROUGH resolves specs through $USB_SYSFS_ROOT, which is Linux-only ($(uname -s) here)"
+  _usb_index=0
+  for _usb_spec in "${USB_SPECS[@]}"; do
+    usb_resolve_spec "$_usb_spec" || die "usb: $USB_R_ERROR"
+    echo "boot-x86.sh: usb passthrough $_usb_spec -> $USB_R_DESC"
+    # bus=xhci.0 is the qemu-xhci this script already adds for usb-kbd and
+    # usb-tablet; a passed-through device shares that controller rather than
+    # getting one of its own, so the guest sees one USB topology.
+    USB_QEMU_ARGS+=(-device "usb-host,id=usbpt$_usb_index,bus=xhci.0,$USB_R_PROPS")
+    USB_QEMU_ARG_COUNT=$((USB_QEMU_ARG_COUNT + 2))
+    _usb_index=$((_usb_index + 1))
+  done
+  echo "boot-x86.sh: usb passthrough — the host loses these devices until this boot exits"
+fi
 
 # --- Resolve the rail ------------------------------------------------------------
 # Answered before anything is built — these are questions about the disk tree.
@@ -468,12 +570,206 @@ else
 fi
 
 # --- Network -------------------------------------------------------------------
-# SLIRP user-mode NAT; ipv6=off avoids a phantom IPv6 default that macOS prefers.
-NET="${NET:-user}"
+# NET=bridge (default): the guest joins the host bridge named by BRIDGE (virbr0,
+#   libvirt's `default` network) and takes a real DHCP lease from that network's
+#   dnsmasq, so it is a peer on the bridge's subnet rather than a client behind
+#   SLIRP's NAT. host->guest, guest->host and guest->guest all work, which SLIRP
+#   structurally cannot do: it has no route back in except an explicit hostfwd
+#   rule per port.
+#
+#   THE SSH ENDPOINT MOVES, and this is the part that breaks a harness silently.
+#   A bridge has no hostfwd, so `localhost:2222` is dead in this mode while
+#   every probe under `scripts/` still types `ssh macos-vm`. If that alias
+#   points at 127.0.0.1:2222 it will connect to whatever else is listening
+#   there, or fail in the way BatchMode=yes turns into "guest not up yet".
+#   `vm/guest-ip.sh` resolves the lease from $GUEST_MAC and
+#   `vm/guest-authorize.sh` writes the alias against it; both are driven from
+#   the SSH line this script prints below.
+#
+#   QEMU never opens the tap itself — it execs `qemu-bridge-helper`, which needs
+#   CAP_NET_ADMIN to enslave a tap to a bridge and therefore ships setuid root.
+#   This tree configures QEMU with --disable-tools, so no helper is built in
+#   `vendor/qemu/build/` and the compiled-in default path (relative to the
+#   binary) does not exist. The helper is resolved from the host below and
+#   passed explicitly with `helper=`; without that, a bridge boot dies on
+#   "failed to launch bridge helper" naming a path nobody installed.
+#
+# NET=user: QEMU SLIRP user-mode NAT with hostfwd ${SSH_PORT} -> 22. Needs no
+#   privilege and no host configuration, and is the ONLY mode in which
+#   `localhost:$SSH_PORT` reaches the guest. ipv6=off per QEMU's own
+#   vmapple.rst reference invocation: SLIRP's fec0::/64 RA otherwise gives the
+#   guest a phantom IPv6 default that macOS prefers and that goes nowhere, so
+#   outbound traffic (DNS first) stalls before falling back to v4.
+# NET=none: no NIC at all. QEMU adds a DEFAULT user-mode NIC when no
+#   -netdev/-nic is given, so genuinely disabling the network needs an explicit
+#   -nic none; omitting the netdev is not enough.
+NET="${NET:-bridge}"
+BRIDGE="${BRIDGE:-virbr0}"
+BRIDGE_HELPER_BIN=""
+
+# Where the setuid-root helper lives is a distro decision, so try the places
+# that ship it. An in-tree build is listed first for the day this tree is
+# configured without --disable-tools, but it will not be setuid and so only
+# qualifies if somebody gave it file capabilities.
+bridge_helper_candidates() {
+  if [ -n "${BRIDGE_HELPER:-}" ]; then printf '%s\n' "$BRIDGE_HELPER"; return; fi
+  printf '%s\n' \
+    "$REPO_ROOT/vendor/qemu/build/qemu-bridge-helper" \
+    /usr/lib/qemu/qemu-bridge-helper \
+    /usr/libexec/qemu-bridge-helper \
+    /usr/local/libexec/qemu-bridge-helper \
+    /usr/lib/x86_64-linux-gnu/qemu/qemu-bridge-helper
+}
+
+# A helper that cannot get CAP_NET_ADMIN will fail inside QEMU with an exit
+# status and no explanation, so decide here and say which file was rejected and
+# why. setuid-root is the shipped arrangement; file capabilities are the other
+# way to grant it, and both are accepted.
+resolve_bridge_helper() {
+  BRIDGE_HELPER_BIN=""
+  BRIDGE_HELPER_UNPRIVILEGED=""
+  local candidate
+  while IFS= read -r candidate; do
+    [ -n "$candidate" ] && [ -x "$candidate" ] || continue
+    if [ -u "$candidate" ] && [ "$(stat -c %u "$candidate" 2>/dev/null)" = "0" ]; then
+      BRIDGE_HELPER_BIN="$candidate"; return 0
+    fi
+    if command -v getcap >/dev/null 2>&1 \
+       && getcap "$candidate" 2>/dev/null | grep -q 'cap_net_admin'; then
+      BRIDGE_HELPER_BIN="$candidate"; return 0
+    fi
+    [ -n "$BRIDGE_HELPER_UNPRIVILEGED" ] || BRIDGE_HELPER_UNPRIVILEGED="$candidate"
+  done <<EOF
+$(bridge_helper_candidates)
+EOF
+  return 1
+}
+
+# The helper's first act is to open /dev/net/tun, and it reports a failure there
+# as the same opaque "bridge helper failed" it reports everything else as. The
+# node existing is not the check — a missing tun driver leaves the node in place
+# and fails the OPEN with ENODEV, so the only honest test is to open it.
+#
+# The interesting diagnosis is the second one below. `tun` is a module on every
+# distro kernel that has it, so it loads on demand; it CANNOT load when the
+# running kernel's module tree is absent, which is what a kernel upgrade without
+# a reboot leaves behind. That state breaks bridge networking while `lsmod`,
+# `modinfo` and `modprobe` all report something that reads like a missing
+# package, and the fix is a reboot rather than an install.
+# A kernel replaced on disk usually leaves its own package behind in the package
+# cache, and that package carries the module tree for the kernel that is STILL
+# RUNNING. `tun` declares no dependencies, so the single .ko out of that archive
+# loads with insmod and needs neither depmod nor a restored tree — which makes
+# the reboot avoidable rather than mandatory. Only mention this when the matching
+# package is actually there; a hint that names a file nobody has is worse than
+# no hint. Arch spells the release `7.1.8-arch1-3` as `7.1.8.arch1-3` in the
+# package name, hence the substitution.
+cached_kernel_package_hint() {
+  command -v bsdtar >/dev/null 2>&1 || return 0
+  local release pkgver candidate
+  release="$(uname -r)"
+  pkgver="${release/-arch/.arch}"
+  for candidate in /var/cache/pacman/pkg/linux-"$pkgver"-*.pkg.tar.zst; do
+    [ -f "$candidate" ] || continue
+    printf '%s' "
+Or load the running kernel's OWN tun module out of the package cache — no reboot:
+  d=\$(mktemp -d) && bsdtar -C \"\$d\" -xf $candidate \\
+    usr/lib/modules/$release/kernel/drivers/net/tun.ko.zst &&
+  unzstd \"\$d/usr/lib/modules/$release/kernel/drivers/net/tun.ko.zst\" -o \"\$d/tun.ko\" &&
+  sudo insmod \"\$d/tun.ko\"
+(tun declares no dependencies, so insmod needs no depmod and no restored tree.
+ Undo with: sudo rmmod tun)"
+    return 0
+  done
+  return 0
+}
+
+require_tun_device() {
+  if (exec 3<>/dev/net/tun) 2>/dev/null; then
+    exec 3>&- 2>/dev/null || true
+    return 0
+  fi
+  local detail=""
+  if [ ! -d "/lib/modules/$(uname -r)" ]; then
+    detail="
+The running kernel is $(uname -r) and /lib/modules/$(uname -r) does not exist, so NO
+module can load — this kernel was replaced on disk and not rebooted into. Installed trees:
+$(ls /lib/modules 2>/dev/null | sed 's/^/  /')
+A reboot into an installed kernel fixes it.$(cached_kernel_package_hint)"
+  elif ! lsmod 2>/dev/null | grep -q '^tun[[:space:]]'; then
+    detail="
+The tun module is not loaded. Load it, and make it persist:
+  sudo modprobe tun
+  echo tun | sudo tee /etc/modules-load.d/tun.conf"
+  fi
+  die "NET=bridge needs a working /dev/net/tun and this host cannot open it.$detail
+Every bridged netdev is a tap, so there is no bridge networking without tun.
+Fall back for now with:  NET=user vm/boot-x86.sh ..."
+}
+
+# The helper is the authority on its own ACL — it parses
+# CONFIG_QEMU_CONFDIR/bridge.conf relative to its own location, honours
+# `allow`/`deny`/`all` and follows `include` lines. Re-implementing that here
+# would be a second copy of the rule that can disagree with the first, so this
+# only reads the obvious file and WARNS. If the boot then dies in the helper,
+# the reason is already on screen.
+warn_unless_bridge_acl_allows() {
+  local conf=/etc/qemu/bridge.conf
+  if [ ! -r "$conf" ]; then
+    echo "boot-x86.sh: WARNING $conf is not readable; qemu-bridge-helper may refuse '$1'." >&2
+    echo "boot-x86.sh:   fix: echo 'allow $1' | sudo tee -a $conf && sudo chmod 0640 $conf" >&2
+    return
+  fi
+  if ! grep -Eq "^[[:space:]]*allow[[:space:]]+($1|all)[[:space:]]*\$" "$conf"; then
+    echo "boot-x86.sh: WARNING $conf has no 'allow $1' line; the bridge helper will refuse the tap." >&2
+    echo "boot-x86.sh:   fix: echo 'allow $1' | sudo tee -a $conf" >&2
+  fi
+}
+
 case "$NET" in
-  user) NETDEV="user,id=net0,ipv6=off,hostfwd=tcp::${SSH_PORT}-:22" ;;
-  none) NETDEV="" ;;
-  *) die "unknown NET: $NET (user | none)" ;;
+  bridge)
+    # qemu-bridge-helper is Linux-only (it speaks SIOCBRADDIF over
+    # linux/if_bridge.h), and virbr0 is a libvirt-on-Linux object. On the arm64
+    # macOS host there is neither, which is why boot-arm64.sh keeps NET=user as
+    # its default. Refuse by name rather than emitting a netdev that cannot work.
+    [ "$(uname -s)" = "Linux" ] || die \
+      "NET=bridge is Linux-only: qemu-bridge-helper and '$BRIDGE' do not exist on $(uname -s). Use NET=user."
+    ip link show "$BRIDGE" >/dev/null 2>&1 || die \
+      "no bridge '$BRIDGE' on this host.
+virbr0 belongs to libvirt's 'default' network; bring it up with:
+  sudo virsh --connect qemu:///system net-start default
+  sudo virsh --connect qemu:///system net-autostart default
+A bridge with no guest attached reports DOWN/NO-CARRIER — that is normal and not
+the failure; only 'does not exist' is. Point elsewhere with BRIDGE=<name>."
+    resolve_bridge_helper || die \
+      "no usable qemu-bridge-helper for NET=bridge.$(
+        [ -n "$BRIDGE_HELPER_UNPRIVILEGED" ] \
+          && printf '\n%s is present but is neither setuid root nor holds cap_net_admin.' \
+               "$BRIDGE_HELPER_UNPRIVILEGED"
+      )
+This tree builds QEMU with --disable-tools, so the helper comes from the host:
+  Arch/Fedora   /usr/lib/qemu/qemu-bridge-helper   (package qemu-common / qemu-system-x86)
+  Debian/Ubuntu /usr/lib/qemu/qemu-bridge-helper   (package qemu-system-common)
+Grant it the capability it needs, either way:
+  sudo chmod u+s <path>
+  sudo setcap cap_net_admin+ep <path>
+Or name one explicitly with BRIDGE_HELPER=<path>, or fall back to NET=user."
+    require_tun_device
+    warn_unless_bridge_acl_allows "$BRIDGE"
+    NETDEV="bridge,id=net0,br=$BRIDGE,helper=$BRIDGE_HELPER_BIN"
+    # No hostfwd exists on a bridge. Resolve the lease rather than printing a
+    # port that nothing is listening on.
+    SSH_TARGET_NOTE="ssh -> \$(vm/guest-ip.sh) [DHCP lease on $BRIDGE for $GUEST_MAC]"
+    ;;
+  user)
+    NETDEV="user,id=net0,ipv6=off,hostfwd=tcp::${SSH_PORT}-:22"
+    SSH_TARGET_NOTE="ssh -> localhost:$SSH_PORT"
+    ;;
+  none)
+    NETDEV=""
+    SSH_TARGET_NOTE="ssh -> (none: NET=none has no NIC)"
+    ;;
+  *) die "unknown NET: $NET (bridge | user | none)" ;;
 esac
 
 # Product Reims VGPU: Tahoe x86 kext path is sensitive to high SMP (StorageNode::init).
@@ -601,9 +897,14 @@ else
   QEMU_ARGS+=(-nic none)
 fi
 
+if [ "$USB_QEMU_ARG_COUNT" -gt 0 ]; then
+  QEMU_ARGS+=("${USB_QEMU_ARGS[@]}")
+fi
+
 echo "boot-x86.sh: device=$GFX_DEVICE class=$BOOT_CLASS rail=$RAIL_NAME snapshot=$SNAPSHOT_NAME cpu=$CPU_MODEL smp=${CPU_THREADS},cores=${CPU_CORES} mem=$RAM reboot=${QEMU_REBOOT_ACTION}"
 echo "boot-x86.sh: audiodev=$AUDIODEV out.buffer-length=${AUDIO_BUFFER_US}us usb-audio buffer=${AUDIO_USB_BUFFER}"
-echo "boot-x86.sh: ssh → localhost:$SSH_PORT   serial → $SERIAL_LOG   qmp → $QMP_SOCK"
+echo "boot-x86.sh: net=$NET$([ "$NET" = bridge ] && printf ' bridge=%s helper=%s' "$BRIDGE" "$BRIDGE_HELPER_BIN") mac=$GUEST_MAC"
+echo "boot-x86.sh: $SSH_TARGET_NOTE   serial → $SERIAL_LOG   qmp → $QMP_SOCK"
 [ -n "$TRACE_LOG" ] && echo "boot-x86.sh: trace → $TRACE_LOG ($TRACE_SPEC)"
 
 discard_clone() {

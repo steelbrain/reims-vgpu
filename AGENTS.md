@@ -632,8 +632,26 @@ yet". `vm/guest-authorize.sh` waits for sshd, installs the key into the running 
 `ssh macos-vm` before returning. It is idempotent and needs no password on a rail that already has
 the key, so a harness may call it unconditionally.
 
-It also forgets the host-key pin for `127.0.0.1:2222`, which is a different machine on every rail —
-without that, whichever rail booted first wins and every later rail fails the host-key check.
+**Which endpoint it authorizes depends on how the boot was networked, and the default moved.**
+`vm/boot-x86.sh` now defaults to `NET=bridge`: the guest is a peer on `virbr0` with its own DHCP
+lease and there is **no hostfwd**, so `127.0.0.1:2222` reaches nothing. `guest-authorize.sh` matches
+that default, resolves the lease through `vm/guest-ip.sh` keyed on the pinned `GUEST_MAC`, and
+writes the `macos-vm` alias for whichever endpoint the boot actually has into
+`vm/disks/run/ssh-config`. Pass `NET=user` when the boot used SLIRP. Under `NET=none` it refuses:
+that boot has no NIC.
+
+`ssh macos-vm` — what every probe types — reads `~/.ssh/config`, not the generated file, so the
+alias resolves only once that config carries `Include <repo>/vm/disks/run/ssh-config`.
+`--write-ssh-config` prepends it, once and idempotently; without it the script prints the line and
+**exits non-zero** rather than letting twenty probes fail at their first hop. Prepending is not
+tidiness: ssh takes the first value it finds for any keyword, so an Include below an existing
+`Host macos-vm` or `Host *` block loses to it.
+
+The generated alias sets `StrictHostKeyChecking no` with a `/dev/null` known-hosts, which replaces
+the old `ssh-keygen -R` dance. The reason is unchanged and applies to both modes: this endpoint is a
+different machine on every rail, whether it is spelled `127.0.0.1:2222` or a `virbr0` lease dnsmasq
+hands to whichever rail asked first. A pin can only produce a mismatch, and `BatchMode=yes` turns a
+mismatch into a silent probe failure that reads as a dead guest.
 
 **Bound every guest-side command with `timeout` on the host side.** An unattended harness cannot
 tell a wedged guest command from a wedged boot. `system_profiler SPDisplaysDataType` has been
@@ -672,9 +690,10 @@ six rails rots, and the rail it skips is the one with the open defects. `dock-ho
 state — a process list, a log — ssh remains the only route, but bound it with `timeout` and never
 read its absence as a device result.
 
-**sshd answers well before the desktop composites.** A probe started when port 2222 opens
-photographs the Apple logo and the boot progress bar. Wait for `pgrep -x Dock` over ssh, then give
-the dock and wallpaper a few seconds to settle.
+**sshd answers well before the desktop composites.** A probe started the moment the guest accepts
+ssh — port 2222 under `NET=user`, its DHCP lease under `NET=bridge` — photographs the Apple logo and
+the boot progress bar. Wait for `pgrep -x Dock` over ssh, then give the dock and wallpaper a few
+seconds to settle.
 
 ### `probe exit=0` is not a clean boot — grep the boot's own stdout for a panic
 
@@ -861,16 +880,23 @@ A `--testing` boot reaches the desktop and then sits there. Reading its counters
 behavior is how a rail gets called dead when the workload simply never asked for it. If a change is
 about throughput, caching, writeback or present cadence, the boot has to be driven.
 
-Run the boot in the background and drive the guest **while it is up** — the `--testing` boot exposes
-SSH on `localhost:2222` (`macos-vm` in `~/.ssh/config`) for its whole life, so a probe does not need
-its own boot:
+Run the boot in the background and drive the guest **while it is up** — the `--testing` boot keeps
+the guest reachable for its whole life, so a probe does not need its own boot. Where that is depends
+on `NET`: a bridged boot (the default) has a DHCP lease and no forwarded port, so `vm/guest-authorize.sh`
+resolves it and points `macos-vm` at it. Call it before the first probe rather than waiting on ssh
+directly:
 
 ```sh
 pkill -f 'qemu-system-x86_6[4].*reims-vgpu'; rm -f /tmp/reims-vgpu-fail.log
 vm/boot-x86.sh --device reims-vgpu-pci --testing &     # ~7 min before its own hard kill
-until [ -f /tmp/reims-vgpu-fail.log ] && ssh macos-vm true; do sleep 5; done
+until [ -f /tmp/reims-vgpu-fail.log ]; do sleep 5; done
+vm/guest-authorize.sh                                  # resolves the endpoint, points `macos-vm` at it
 scripts/window-drag-probe/window-drag-probe.sh --seconds 25 --app Safari
 ```
+
+The old spelling of the wait — `until [ -f ... ] && ssh macos-vm true` — is now wrong on a bridged
+boot for a reason worth keeping: it waits on an alias that does not point anywhere until
+`guest-authorize.sh` has run, so it spins until the boot's own hard kill and reports nothing.
 
 That produces real window-server compositing, against 0 draws/s idle. The probe refuses a verdict if
 the window never moved, so a run that produced no motion cannot be mistaken for a slow device.
@@ -962,6 +988,16 @@ counters and a screenshot of a working desktop, all from the binary you were try
 Only a live device creates `/tmp/reims-vgpu-fail.log`, so waiting on it catches the case, and
 killing any surviving QEMU first avoids the race. Confirm afterwards that the log is a boot's and
 not the test suite's, by the presence of `store_routes`/`present_page_identity`.
+
+**On a bridged boot that race loses its only loud symptom, so killing first is no longer optional.**
+The `hostfwd` bind failure above was a *signal*: two VMs could not both hold `localhost:2222`, so the
+second one died and said so. `NET=bridge` has no port to contend for — both guests attach to
+`virbr0` happily and then collide on `GUEST_MAC`, which is pinned precisely so the lease is stable
+across reverts. Nothing fails. dnsmasq hands the address to one of them, `vm/guest-ip.sh` returns
+that one address, and the probe drives whichever guest answers, with no line anywhere saying there
+were two. That is the same wrong-binary result as before with the diagnostic removed, so
+`pkill -f 'qemu-system-x86_6[4].*reims-vgpu'` before the boot is now load-bearing rather than
+merely tidy. Where two guests must genuinely run at once, give the second its own `GUEST_MAC`.
 
 ### A boot measured next to your own subagents measures the contention
 

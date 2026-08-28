@@ -1,0 +1,776 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>reims-vgpu control</title>
+<style>
+  :root {
+    --bg: #08090c; --bg2: #0d0f14; --panel: #11141b; --panel2: #161a23;
+    --line: #232937; --line2: #2e3648;
+    --text: #dfe4ee; --dim: #8b93a7; --faint: #5b6478;
+    --ok: #3ddc97; --warn: #f5b656; --bad: #ff6b6b; --info: #5eb3ff;
+    --gpu: #b28dff; --accent: #37d3c4;
+    --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+    --sans: ui-sans-serif, -apple-system, "Segoe UI", Inter, system-ui, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    background:
+      radial-gradient(1200px 600px at 12% -10%, #12212b 0%, transparent 60%),
+      radial-gradient(900px 500px at 100% 0%, #1a1430 0%, transparent 55%),
+      var(--bg);
+    color: var(--text); font-family: var(--sans); font-size: 14px; line-height: 1.5;
+    min-height: 100vh;
+  }
+  a { color: var(--info); }
+  code, .mono { font-family: var(--mono); }
+
+  /* ---------- header ---------- */
+  header {
+    position: sticky; top: 0; z-index: 20;
+    display: flex; flex-wrap: wrap; gap: 14px; align-items: center;
+    padding: 12px 20px; border-bottom: 1px solid var(--line);
+    background: rgba(8,9,12,.86); backdrop-filter: blur(12px);
+  }
+  .brand { display: flex; align-items: baseline; gap: 10px; }
+  .brand b { font-size: 16px; letter-spacing: .2px; }
+  .brand span { color: var(--faint); font-family: var(--mono); font-size: 11px; }
+  .spacer { flex: 1 1 auto; }
+  .badges { display: flex; flex-wrap: wrap; gap: 7px; }
+
+  .badge {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 3px 9px; border-radius: 999px; font-size: 11.5px;
+    font-family: var(--mono); border: 1px solid var(--line2);
+    background: var(--panel2); color: var(--dim); white-space: nowrap;
+  }
+  .badge b { color: var(--text); font-weight: 600; }
+  .badge.ok    { border-color: #1d5c46; background: #0e2a22; color: var(--ok); }
+  .badge.warn  { border-color: #6b5220; background: #2a2110; color: var(--warn); }
+  .badge.bad   { border-color: #6e2b2b; background: #2b1414; color: var(--bad); }
+  .badge.gpu   { border-color: #453a6b; background: #1c1730; color: var(--gpu); }
+  .badge.info  { border-color: #24486e; background: #0f1e2e; color: var(--info); }
+  .dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; flex: none; }
+  .dot.pulse { animation: pulse 1.6s ease-in-out infinite; }
+  @keyframes pulse { 0%,100% { opacity: 1 } 50% { opacity: .25 } }
+
+  /* ---------- layout ---------- */
+  main { padding: 18px 20px 60px; max-width: 1680px; margin: 0 auto; }
+  .grid { display: grid; gap: 16px; grid-template-columns: repeat(12, 1fr); }
+  .col4 { grid-column: span 4; } .col5 { grid-column: span 5; }
+  .col6 { grid-column: span 6; } .col7 { grid-column: span 7; }
+  .col8 { grid-column: span 8; } .col12 { grid-column: span 12; }
+  @media (max-width: 1250px) { .col4,.col5,.col6,.col7,.col8 { grid-column: span 12; } }
+
+  .panel {
+    background: linear-gradient(180deg, var(--panel2), var(--panel));
+    border: 1px solid var(--line); border-radius: 12px; overflow: hidden;
+  }
+  .panel > h2 {
+    margin: 0; padding: 11px 14px; font-size: 12px; letter-spacing: .09em;
+    text-transform: uppercase; color: var(--dim); font-weight: 600;
+    border-bottom: 1px solid var(--line);
+    display: flex; align-items: center; gap: 9px;
+  }
+  .panel > h2 .hint { text-transform: none; letter-spacing: 0; color: var(--faint); font-weight: 400; }
+  .body { padding: 14px; }
+  .body.tight { padding: 10px; }
+
+  /* ---------- form ---------- */
+  .row { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 11px; }
+  .field { display: flex; flex-direction: column; gap: 4px; flex: 1 1 140px; min-width: 0; }
+  .field > label { font-size: 11px; color: var(--faint); text-transform: uppercase; letter-spacing: .06em; }
+  select, input[type=text] {
+    background: #0a0c11; color: var(--text); border: 1px solid var(--line2);
+    border-radius: 7px; padding: 7px 9px; font-family: var(--mono); font-size: 12.5px;
+    width: 100%; min-width: 0;
+  }
+  select:focus, input:focus { outline: none; border-color: var(--accent); }
+  button {
+    background: var(--panel2); color: var(--text); border: 1px solid var(--line2);
+    border-radius: 8px; padding: 8px 14px; font-size: 13px; font-weight: 500;
+    cursor: pointer; font-family: var(--sans);
+  }
+  button:hover:not(:disabled) { border-color: var(--accent); color: #fff; }
+  button:disabled { opacity: .4; cursor: not-allowed; }
+  button.primary { background: linear-gradient(180deg,#1a6f63,#12564e); border-color: #23887a; color: #eafff9; }
+  button.primary:hover:not(:disabled) { background: linear-gradient(180deg,#1f8577,#16665c); }
+  button.danger  { background: #3a1a1a; border-color: #6e2b2b; color: #ffd9d9; }
+  button.danger:hover:not(:disabled) { background: #4a2020; }
+  button.mini { padding: 4px 9px; font-size: 11.5px; }
+  .actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+
+  .knob { display: flex; align-items: flex-start; gap: 9px; padding: 8px 0; border-top: 1px dashed var(--line); }
+  .knob:first-child { border-top: none; }
+  .knob input { margin-top: 3px; flex: none; accent-color: var(--accent); }
+  .knob .kb { min-width: 0; }
+  .knob .kb b { font-size: 12.5px; font-weight: 600; }
+  .knob .kb p { margin: 2px 0 0; font-size: 11.5px; color: var(--faint); line-height: 1.45; }
+
+  /* ---------- usb ---------- */
+  .usb-list { display: grid; gap: 8px; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); }
+  .usb {
+    border: 1px solid var(--line2); border-radius: 9px; padding: 9px 11px;
+    background: #0b0d13; cursor: pointer; display: flex; gap: 9px; align-items: flex-start;
+  }
+  .usb:hover { border-color: var(--line2); background: #0e1118; }
+  .usb.sel { border-color: var(--accent); background: #0c1a1a; box-shadow: inset 0 0 0 1px #37d3c433; }
+  .usb.locked { opacity: .55; cursor: not-allowed; }
+  .usb input { margin-top: 2px; flex: none; accent-color: var(--accent); }
+  .usb .name { font-size: 12.5px; font-weight: 600; }
+  .usb .specs { font-family: var(--mono); font-size: 10.5px; color: var(--faint); margin-top: 3px; }
+  .usb .flag { font-size: 10.5px; margin-top: 4px; }
+  .flag.bad { color: var(--bad); } .flag.warn { color: var(--warn); } .flag.ok { color: var(--ok); }
+
+  /* ---------- metrics ---------- */
+  .tiles { display: grid; gap: 9px; grid-template-columns: repeat(auto-fit, minmax(136px, 1fr)); }
+  .tile { background: #0b0d13; border: 1px solid var(--line); border-radius: 9px; padding: 9px 11px; }
+  .tile .k { font-size: 10.5px; color: var(--faint); text-transform: uppercase; letter-spacing: .05em; }
+  .tile .v { font-family: var(--mono); font-size: 20px; font-weight: 600; margin-top: 2px; letter-spacing: -.5px; }
+  .tile .u { font-size: 11px; color: var(--faint); margin-left: 3px; font-family: var(--sans); }
+  .tile .s { font-size: 10.5px; color: var(--faint); margin-top: 2px; }
+  .tile.pair { grid-column: span 2; }
+  .tile.pair .v { font-size: 17px; }
+  .v.ok { color: var(--ok); } .v.warn { color: var(--warn); } .v.bad { color: var(--bad); }
+  .v.gpu { color: var(--gpu); } .v.info { color: var(--info); }
+
+  .note {
+    font-size: 11.5px; color: var(--dim); background: #0a0f17; border-left: 2px solid var(--info);
+    padding: 7px 10px; border-radius: 0 6px 6px 0; margin-top: 10px; line-height: 1.5;
+  }
+  .note.warn { border-left-color: var(--warn); background: #14100a; }
+  .note.bad  { border-left-color: var(--bad); background: #150c0c; }
+  .note b { color: var(--text); }
+
+  pre.log {
+    margin: 0; font-family: var(--mono); font-size: 11px; line-height: 1.5;
+    white-space: pre-wrap; word-break: break-all; max-height: 300px; overflow: auto;
+    background: #070810; border: 1px solid var(--line); border-radius: 8px; padding: 10px;
+    color: var(--dim);
+  }
+  pre.log.tall { max-height: 460px; }
+  table.reasons { width: 100%; border-collapse: collapse; font-size: 11.5px; }
+  table.reasons td { padding: 3px 0; border-bottom: 1px solid #171b25; }
+  table.reasons td.n { text-align: right; font-family: var(--mono); color: var(--text); width: 60px; }
+  table.reasons td.r { font-family: var(--mono); color: var(--dim); word-break: break-all; }
+
+  .kv { display: grid; grid-template-columns: auto 1fr; gap: 3px 12px; font-size: 12px; }
+  .kv dt { color: var(--faint); font-size: 11.5px; }
+  .kv dd { margin: 0; font-family: var(--mono); font-size: 11.5px; word-break: break-all; }
+
+  .pad { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; max-width: 260px; }
+  #shot { width: 100%; border-radius: 8px; border: 1px solid var(--line); display: block; }
+  .toast {
+    position: fixed; right: 18px; bottom: 18px; z-index: 50; display: flex;
+    flex-direction: column; gap: 8px; max-width: 460px;
+  }
+  .toast > div {
+    background: var(--panel2); border: 1px solid var(--line2); border-left: 3px solid var(--info);
+    border-radius: 8px; padding: 9px 12px; font-size: 12px; box-shadow: 0 10px 30px #0009;
+  }
+  .toast > div.bad { border-left-color: var(--bad); }
+  .toast > div.ok { border-left-color: var(--ok); }
+  .toast .mono { font-size: 11px; color: var(--dim); display: block; margin-top: 3px; word-break: break-all; }
+</style>
+
+<header>
+  <div class="brand"><b>reims-vgpu</b> <span id="pathway">…</span></div>
+  <div class="spacer"></div>
+  <div class="badges" id="hdr-badges"></div>
+</header>
+
+<main>
+  <div class="grid">
+
+    <!-- ========================= LAUNCH ========================= -->
+    <section class="panel col5">
+      <h2>Launch <span class="hint" id="launch-hint"></span></h2>
+      <div class="body">
+        <div class="row">
+          <div class="field"><label>Boot class</label>
+            <select id="boot_class"></select></div>
+          <div class="field"><label>Display device</label>
+            <select id="device"></select></div>
+        </div>
+        <div class="row">
+          <div class="field"><label>Rail (guest OS line)</label>
+            <select id="rail"></select></div>
+          <div class="field"><label>Snapshot</label>
+            <select id="snapshot"></select></div>
+        </div>
+        <div class="row">
+          <div class="field"><label>Network</label>
+            <select id="net"></select></div>
+          <div class="field"><label>Bridge</label>
+            <select id="bridge"></select></div>
+        </div>
+        <div class="row">
+          <div class="field"><label>RAM</label><input type="text" id="ram" placeholder="16G"></div>
+          <div class="field"><label>Cores</label><input type="text" id="cpu_cores" placeholder="16"></div>
+          <div class="field"><label>Guest MAC</label><input type="text" id="guest_mac" placeholder="pinned default"></div>
+        </div>
+
+        <div id="knobs"></div>
+
+        <div class="knob">
+          <input type="checkbox" id="fresh_log" checked>
+          <div class="kb"><b>Truncate the fail log first</b>
+            <p>The device appends and never truncates, so a log you did not just create may hold
+               several boots of several builds — and because <code>first_sight</code> latches per
+               process, a stale log inflates in a way that reads as a finding rather than as noise.</p></div>
+        </div>
+
+        <div id="net-note"></div>
+
+        <div class="actions" style="margin-top:12px">
+          <button class="primary" id="btn-boot">Boot</button>
+          <button class="danger" id="btn-stop">Stop VM</button>
+          <button class="mini" id="btn-dry">Show command</button>
+        </div>
+        <pre class="log" id="dry" style="margin-top:10px; display:none"></pre>
+      </div>
+    </section>
+
+    <!-- ========================= USB ========================= -->
+    <section class="panel col7">
+      <h2>USB passthrough <span class="hint" id="usb-hint"></span></h2>
+      <div class="body">
+        <div class="row" style="margin-bottom:9px">
+          <div class="field" style="flex:0 0 190px"><label>Spec form to pass</label>
+            <select id="usb_form">
+              <option value="busport">BUS-PORT — pinned to the socket</option>
+              <option value="vidpid">VID:PID — follows the device</option>
+              <option value="busaddr">BUS.ADDR — this boot only</option>
+            </select></div>
+          <div class="field"><label>&nbsp;</label>
+            <div class="actions">
+              <button class="mini" id="usb-none">Clear</button>
+              <span id="usb-count" style="font-size:11.5px;color:var(--faint)"></span>
+            </div></div>
+        </div>
+        <div class="usb-list" id="usb-list"></div>
+        <div class="note" id="usb-note"></div>
+      </div>
+    </section>
+
+    <!-- ========================= TELEMETRY ========================= -->
+    <section class="panel col8">
+      <h2>Live telemetry <span class="hint" id="tele-hint"></span></h2>
+      <div class="body">
+        <div class="tiles" id="tiles"></div>
+        <div id="tele-notes"></div>
+      </div>
+    </section>
+
+    <!-- ========================= HOST ========================= -->
+    <section class="panel col4">
+      <h2>Host &amp; device</h2>
+      <div class="body">
+        <dl class="kv" id="hostkv"></dl>
+        <div id="host-notes"></div>
+      </div>
+    </section>
+
+    <!-- ========================= DRIVE ========================= -->
+    <section class="panel col4">
+      <h2>Drive the guest <span class="hint">host-side; no guest tooling</span></h2>
+      <div class="body">
+        <div class="pad">
+          <button class="mini" data-key="ret">Return</button>
+          <button class="mini" data-key="esc">Esc</button>
+          <button class="mini" data-key="meta_l-q">⌘Q</button>
+          <button class="mini" data-key="up">↑</button>
+          <button class="mini" data-key="down">↓</button>
+          <button class="mini" data-key="tab">Tab</button>
+        </div>
+        <div class="actions" style="margin-top:10px">
+          <button class="mini" id="btn-size">Display size</button>
+          <button class="mini" id="btn-shot">Screenshot</button>
+        </div>
+        <div class="note">QMP <code>shot</code>/<code>screendump</code> is not used and stays
+          disabled: with the host-owned window and QEMU at <code>-display none</code> the frame
+          never crosses into QEMU's address space, so a screendump shows something other than what
+          the window shows.</div>
+        <img id="shot" style="display:none; margin-top:10px" alt="guest screenshot">
+      </div>
+    </section>
+
+    <!-- ========================= PROBES ========================= -->
+    <section class="panel col8">
+      <h2>Probes</h2>
+      <div class="body" id="probes"></div>
+    </section>
+
+    <!-- ========================= LOG ========================= -->
+    <section class="panel col6">
+      <h2>Fail channel <span class="hint" id="chan-hint"></span></h2>
+      <div class="body">
+        <div id="chan-note"></div>
+        <table class="reasons" id="fail-reasons"></table>
+        <pre class="log" id="fail-recent" style="margin-top:10px"></pre>
+      </div>
+    </section>
+
+    <section class="panel col6">
+      <h2>Boot stdout <span class="hint">the panic verdict outranks a probe's exit</span></h2>
+      <div class="body">
+        <div id="boot-note"></div>
+        <pre class="log tall" id="boot-stdout"></pre>
+      </div>
+    </section>
+
+  </div>
+</main>
+<div class="toast" id="toast"></div>
+
+<script>
+"use strict";
+const TOKEN = new URLSearchParams(location.search).get("token") || "";
+let STATE = null;
+let USB_SEL = new Set();
+let dirty = false;               // once a human edits a field, stop re-defaulting it
+
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) =>
+  ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const num = (v, d = 1) => (v === null || v === undefined ? "—" : Number(v).toFixed(d));
+
+function toast(msg, kind = "", detail = "") {
+  const el = document.createElement("div");
+  el.className = kind;
+  el.innerHTML = esc(msg) + (detail ? `<span class="mono">${esc(detail)}</span>` : "");
+  $("toast").appendChild(el);
+  setTimeout(() => el.remove(), kind === "bad" ? 14000 : 6000);
+}
+
+async function api(path, opts = {}) {
+  const sep = path.includes("?") ? "&" : "?";
+  const res = await fetch(path + sep + "token=" + encodeURIComponent(TOKEN), {
+    ...opts,
+    headers: { "Content-Type": "application/json", ...(opts.headers || {}) },
+  });
+  const type = res.headers.get("Content-Type") || "";
+  if (type.startsWith("image/")) return res.blob();
+  const data = await res.json().catch(() => ({ error: "unparseable response" }));
+  if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+  return data;
+}
+
+/* ---------- form helpers ---------- */
+function fill(sel, values, current) {
+  const el = $(sel);
+  const want = current ?? el.value;
+  el.innerHTML = values.map((v) => {
+    const [val, label] = Array.isArray(v) ? v : [v, v];
+    return `<option value="${esc(val)}">${esc(label)}</option>`;
+  }).join("");
+  if (values.some((v) => (Array.isArray(v) ? v[0] : v) === want)) el.value = want;
+}
+
+/* ---------- header ---------- */
+function renderHeader(s) {
+  $("pathway").textContent = `${s.pathway} · ${s.repo_root}`;
+  const b = [];
+  const caps = s.log.vk_caps;
+  if (caps) {
+    b.push(`<span class="badge gpu"><span class="dot"></span><b>${esc(caps.name || "GPU")}</b></span>`);
+    b.push(`<span class="badge">mem <b>${esc(caps.memory || "?")}</b></span>`);
+    const imp = caps.host_pointer_import || "?";
+    b.push(`<span class="badge ${imp === "supported" ? "ok" : "warn"}">import <b>${esc(imp)}</b></span>`);
+  }
+  const q = s.qemu || [];
+  b.push(q.length
+    ? `<span class="badge ok"><span class="dot pulse"></span>VM up <b>${q.length}</b> · net <b>${esc(q[0].net)}</b>${q[0].usb_passthrough ? ` · usb <b>${q[0].usb_passthrough}</b>` : ""}</span>`
+    : `<span class="badge">no VM running</span>`);
+
+  if (s.boot && s.boot.panic)
+    b.push(`<span class="badge bad"><span class="dot"></span>GUEST KERNEL PANIC</span>`);
+
+  const load = s.host.load;
+  if (load) {
+    const hot = load["1m"] > (load.cpus || 8) * 0.5;
+    b.push(`<span class="badge ${hot ? "warn" : ""}">load <b>${num(load["1m"], 2)}</b>/${load.cpus}</span>`);
+  }
+  if (s.log.boots !== null && s.log.boots > 1)
+    b.push(`<span class="badge warn">log holds <b>${s.log.boots}</b> boots</span>`);
+  $("hdr-badges").innerHTML = b.join("");
+}
+
+/* ---------- host panel ---------- */
+function renderHost(s) {
+  const caps = s.log.vk_caps || {};
+  const rows = [
+    ["uname", s.host.uname],
+    ["kernel modules", s.host.kernel.module_tree_present ? "present" : "MISSING for the running kernel"],
+    ["/dev/net/tun", s.host.tun.ok ? "opens" : `refused — ${s.host.tun.error}`],
+    ["bridge helper", s.net.helper.path ? `${s.net.helper.path} (${s.net.helper.how})` : "none privileged"],
+    ["bridge ACL", s.net.acl.readable ? (s.net.acl.allows ? "allows" : "does NOT allow") : "unreadable"],
+    ["vulkan", caps.api ? `api ${caps.api} · baseline ${caps.baseline} · ${caps.memory_signal || ""}` : "—"],
+    ["fail log", `${s.log.path} · ${(s.log.size / 1e6).toFixed(1)} MB · ${s.log.boots ?? "?"} boot(s)`],
+  ];
+  $("hostkv").innerHTML = rows.map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`).join("");
+
+  let notes = "";
+  const k = s.host.kernel;
+  if (!k.module_tree_present) {
+    notes += `<div class="note bad"><b>No module tree for the running kernel
+      (${esc(k.release)}).</b> Nothing can be loaded — <code>tun</code> included — so bridged
+      networking cannot start. Installed: ${esc((k.installed_trees || []).join(", "))}.</div>`;
+    if (k.cached_package) {
+      // `tun` declares no dependencies, so the single .ko out of the cached
+      // package loads standalone and the reboot is avoidable.
+      notes += `<div class="note warn"><b>No reboot needed — the running kernel's own
+        <code>tun</code> is still in the package cache.</b> Run these, then click Boot:
+        <pre class="log" style="margin-top:6px">${esc(k.cached_package.commands.join("\n"))}</pre>
+        Undo with <code>${esc(k.cached_package.undo)}</code>.</div>`;
+    } else {
+      notes += `<div class="note warn">Reboot into an installed kernel to get
+        <code>tun</code> back.</div>`;
+    }
+  }
+  $("host-notes").innerHTML = notes;
+}
+
+/* ---------- launch panel ---------- */
+function renderLaunch(s) {
+  fill("boot_class", s.boot_classes, dirty ? undefined : "testing");
+  fill("device", s.devices, dirty ? undefined : s.devices[0]);
+  fill("net", s.net.modes, dirty ? undefined : (s.pathway === "x86" ? "bridge" : "user"));
+  fill("bridge", (s.net.bridges || []).map((b) => b.name).concat(
+    (s.net.bridges || []).length ? [] : ["virbr0"]), dirty ? undefined : "virbr0");
+
+  const rails = s.rails.rails || [];
+  fill("rail", rails.length ? rails : [["", "(no rails)"]],
+    dirty ? undefined : (s.rails.default || rails[0]));
+
+  if (!$("knobs").dataset.built) {
+    $("knobs").innerHTML = Object.entries(s.env_knobs).map(([key, spec]) => {
+      const on = spec.values.find((v) => v !== "") || "on";
+      return `<div class="knob">
+        <input type="checkbox" id="knob_${esc(key)}" data-knob="${esc(key)}" data-on="${esc(on)}">
+        <div class="kb"><b>${esc(spec.label)}</b> <code style="font-size:11px;color:var(--faint)">${esc(key)}=${esc(on)}</code>
+          <p>${esc(spec.note)}</p></div></div>`;
+    }).join("");
+    $("knobs").dataset.built = "1";
+  }
+
+  const nb = [];
+  if ($("net").value === "bridge") {
+    if (s.net.bridge_ready) {
+      nb.push(`<div class="note"><b>Bridged.</b> The guest takes a DHCP lease on
+        <code>${esc($("bridge").value)}</code>, so there is no <code>localhost:2222</code>.
+        Run <b>Authorize guest</b> after the desktop appears — it resolves the lease and points
+        the <code>macos-vm</code> alias every probe types at this boot.</div>`);
+    } else {
+      nb.push(`<div class="note bad"><b>Bridged networking cannot start on this host.</b><ul style="margin:5px 0 0 16px;padding:0">`
+        + s.net.blockers.map((x) => `<li>${esc(x)}</li>`).join("")
+        + `</ul>Pick <code>user</code> to boot now.</div>`);
+    }
+  } else if ($("net").value === "user") {
+    nb.push(`<div class="note"><b>SLIRP.</b> Guest reachable at
+      <code>localhost:${2222}</code> via hostfwd, no host setup needed. Pass
+      <code>NET=user</code> to Authorize guest so it targets the forwarded port.</div>`);
+  } else {
+    nb.push(`<div class="note warn"><b>No NIC.</b> Nothing can ssh in; device counters still work.</div>`);
+  }
+  if ((s.qemu || []).length)
+    nb.push(`<div class="note warn"><b>A VM is already running.</b> Booting a second one contends
+      for the machine, and on a bridge the two collide on the pinned <code>GUEST_MAC</code> with no
+      diagnostic at all. Stop it first.</div>`);
+  $("net-note").innerHTML = nb.join("");
+
+  const boot = s.boot || {};
+  $("btn-boot").disabled = !!boot.running;
+  $("launch-hint").textContent = boot.running
+    ? `running · pid ${boot.pid} · ${num(boot.elapsed, 0)}s`
+    : (boot.returncode !== null && boot.returncode !== undefined ? `last exit ${boot.returncode}` : "");
+}
+
+async function loadSnapshots() {
+  const rail = $("rail").value;
+  if (!rail) { fill("snapshot", [["", "(rail default)"]]); return; }
+  try {
+    const s = await api("/api/snapshots?rail=" + encodeURIComponent(rail));
+    fill("snapshot", [["", "(rail's current)"]].concat(s.snapshots || []));
+  } catch (e) { fill("snapshot", [["", "(unavailable)"]]); }
+}
+
+/* ---------- usb panel ---------- */
+function renderUsb(s) {
+  const devs = (s.usb.devices || []);
+  const form = $("usb_form").value;
+  const key = (d) => form === "vidpid" ? d.vidpid : form === "busaddr" ? d.busaddr : d.busport;
+
+  $("usb-list").innerHTML = devs.map((d) => {
+    const spec = key(d);
+    const sel = USB_SEL.has(spec);
+    const locked = d.writable === false;
+    const flags = [];
+    if (locked) flags.push(`<div class="flag bad">✕ ${esc(d.node)} is not writable by you — libusb
+      cannot claim the interface. Needs a udev rule.</div>`);
+    else if (d.writable) flags.push(`<div class="flag ok">✓ node writable</div>`);
+    if (d.looks_like_hub) flags.push(`<div class="flag warn">⚠ looks like a hub</div>`);
+    return `<label class="usb ${sel ? "sel" : ""} ${locked ? "locked" : ""}">
+      <input type="checkbox" data-spec="${esc(spec)}" ${sel ? "checked" : ""} ${locked ? "disabled" : ""}>
+      <div style="min-width:0">
+        <div class="name">${esc(d.description)}</div>
+        <div class="specs">${esc(d.busport)} &nbsp;·&nbsp; ${esc(d.vidpid)} &nbsp;·&nbsp; ${esc(d.busaddr)}</div>
+        ${flags.join("")}
+      </div></label>`;
+  }).join("") || `<div style="color:var(--faint);font-size:12px">No USB devices enumerated.</div>`;
+
+  $("usb-count").textContent = USB_SEL.size ? `${USB_SEL.size} selected` : "";
+  $("usb-hint").textContent = `${devs.length} on host`;
+
+  const notes = [`<b>${form === "busport" ? "BUS-PORT" : form === "vidpid" ? "VID:PID" : "BUS.ADDR"}</b> — `
+    + (form === "busport"
+      ? "pinned to the physical socket, so it survives a replug and separates two identical devices. Prefer this."
+      : form === "vidpid"
+        ? "matches the descriptor, so it follows the device between ports — but is ambiguous between two identical devices."
+        : "names one device exactly, right now. ADDR is reassigned on replug and on some hub resets.")
+    + ` A passed-through device is detached from the host driver for the life of the boot: pass the keyboard you are typing on and you do not get it back until the VM exits.`];
+  if (s.pathway !== "x86")
+    notes.push(`<b>This pathway cannot resolve specs</b> — the resolver reads <code>/sys</code> and an Apple host has none.`);
+  $("usb-note").innerHTML = notes.join("<br><br>");
+}
+
+/* ---------- telemetry ---------- */
+function renderTelemetry(s) {
+  const m = s.metrics || {};
+  const p = m.present, cpu = m.cpu, gpu = m.gpu, wl = m.workload;
+  const t = [];
+
+  if (p) {
+    const gapBad = p.presenter_is_ceiling;
+    t.push(`<div class="tile pair">
+      <div class="k">present_hz / offered_hz</div>
+      <div class="v ${gapBad ? "warn" : "ok"}">${num(p.present_hz)} <span class="u">/</span> ${num(p.offered_hz)}<span class="u">Hz</span></div>
+      <div class="s">${gapBad ? "presenter is a ceiling — check busy_fence" : "presenting everything offered"}
+        · fence ${p.busy_fence ?? "—"} · acquire ${p.busy_acquire ?? "—"}</div></div>`);
+    t.push(`<div class="tile"><div class="k">population</div>
+      <div class="v ${p.population === "paced-60" ? "info" : "gpu"}" style="font-size:15px">${esc(p.population || "—")}</div>
+      <div class="s">${p.population === "paced-60" ? "latched 16.67 ms" : "latched 0 — work-limited"}</div></div>`);
+  }
+  if (wl) t.push(`<div class="tile"><div class="k">regime</div>
+    <div class="v ${wl.regime === "sustained" ? "ok" : wl.regime === "bursty" ? "warn" : "bad"}" style="font-size:15px">${esc(wl.regime)}</div>
+    <div class="s">duty ${num(wl.duty, 2)} · ${wl.rankable ? "rankable" : "not rankable"}</div></div>`);
+  if (cpu) t.push(`<div class="tile"><div class="k">cpu per draw</div>
+    <div class="v">${num(cpu.us_per_draw, 2)}<span class="u">µs</span></div>
+    <div class="s">${(cpu.draws ?? 0).toLocaleString()} draws · ${cpu.samples} win</div></div>`);
+  if (gpu) t.push(`<div class="tile"><div class="k">gpu per draw</div>
+    <div class="v gpu">${num(gpu.us_per_draw, 2)}<span class="u">µs</span></div>
+    <div class="s">${(gpu.draw_n ?? 0).toLocaleString()} draws · ${gpu.samples} win</div></div>`);
+  if (m.per_draw_total_us !== undefined) t.push(`<div class="tile"><div class="k">cpu + gpu per draw</div>
+    <div class="v info">${num(m.per_draw_total_us, 2)}<span class="u">µs</span></div><div class="s">the score</div></div>`);
+  if (m.vbl) t.push(`<div class="tile"><div class="k">vbl grid</div>
+    <div class="v">${num(m.vbl.grid_hz)}<span class="u">Hz</span></div>
+    <div class="s">window ${num(m.vbl.window_hz)}Hz</div></div>`);
+  if (m.pressure) t.push(`<div class="tile"><div class="k">registry peak</div>
+    <div class="v">${m.pressure.peak ?? "—"}</div>
+    <div class="s">${m.pressure.peak_mib ?? "—"} MiB · levels</div></div>`);
+  if (m.publish) t.push(`<div class="tile"><div class="k">fresh frames</div>
+    <div class="v">${(m.publish.fresh ?? 0).toLocaleString()}</div>
+    <div class="s">same_key ${(m.publish.same_key ?? 0).toLocaleString()}</div></div>`);
+
+  $("tiles").innerHTML = t.join("") ||
+    `<div style="color:var(--faint);font-size:12px">No census in the parsed tail — boot the VM.</div>`;
+
+  const band = m.band || {};
+  $("tele-hint").textContent = band.span_ms
+    ? `${(band.span_ms / 1000).toFixed(0)}s band · ${band.tags.length} censuses joined by t=`
+    : "";
+
+  const n = [];
+  n.push(`<div class="note"><b>present_hz is never read alone.</b> The presenter passes everything
+    at the shipping depth, so it equals <code>offered_hz</code>, which is the device's own publish
+    rate: both up is the win, offered up alone means the presenter has become a ceiling, neither
+    moving means the change bought no frames.</div>`);
+  if (band.span_ms) n.push(`<div class="note"><b>Joined by <code>t=</code>, not by line order.</b>
+    Every census skips different windows, so pairing them by position drifts and pulls idle-desktop
+    samples into a driven band. Shared band here: ${(band.span_ms / 1000).toFixed(0)}s across
+    <code>${esc(band.tags.join(", "))}</code>.</div>`);
+  if (wl && !wl.rankable) n.push(`<div class="note warn"><b>Not a rankable measurement.</b> Drain
+    duty is ${num(wl.duty, 2)}, so this is an ${esc(wl.regime)} device. Only the sustained regime can
+    turn a per-draw CPU saving into frames — run the sustained-animation probe before comparing
+    anything.</div>`);
+  if (s.log.boots !== null && s.log.boots > 1) n.push(`<div class="note bad"><b>This log holds
+    ${s.log.boots} boots.</b> Every ranking above may mix builds. Truncate the log and boot again.</div>`);
+  if (s.log.boot_boundary_in_tail) n.push(`<div class="note warn"><b>A device restart was found
+    inside the parsed tail</b> — <code>t=</code> went backwards. Samples before it were dropped so the
+    band is one boot's.</div>`);
+  const load = s.host.load;
+  if (load && load["1m"] > (load.cpus || 8) * 0.5) n.push(`<div class="note warn"><b>The machine is
+    busy (load ${num(load["1m"], 2)}).</b> Every <code>us=</code> here is wall clock, so treat the
+    timings as upper bounds and reason from counts.</div>`);
+  $("tele-notes").innerHTML = n.join("");
+}
+
+/* ---------- channels, probes, boot log ---------- */
+function renderChannels(s) {
+  const c = s.log.counts || {};
+  $("chan-hint").textContent = `${c.fail ?? 0} fail · ${c.off ?? 0} off, in the parsed tail`;
+  $("chan-note").innerHTML = `<div class="note"><b>The channel is split before anything is ranked.</b>
+    <code>OFF</code> records carry <code>reason=</code> too — for ordering and control-flow events
+    that are not losses — so ranking without splitting inverts the queue. Only fail-channel reasons
+    are listed here.</div>`;
+  const rows = s.log.fail_reasons || [];
+  $("fail-reasons").innerHTML = rows.length
+    ? rows.map(([r, n]) => `<tr><td class="n">${n}</td><td class="r">${esc(r)}</td></tr>`).join("")
+    : `<tr><td class="r" style="color:var(--ok)">no fail-channel reasons in the parsed tail</td></tr>`;
+  $("fail-recent").textContent = (s.log.fail_recent || []).join("\n") || "(nothing on the fail channel)";
+}
+
+function renderProbes(s) {
+  const st = s.probe_status || {};
+  $("probes").innerHTML = Object.entries(s.probes).map(([name, spec]) => {
+    const r = st[name];
+    const running = r && r.running;
+    const badge = !r ? "" : running
+      ? `<span class="badge ok"><span class="dot pulse"></span>running ${num(r.elapsed, 0)}s</span>`
+      : `<span class="badge ${r.returncode === 0 ? "ok" : "bad"}">exit ${r.returncode}</span>`;
+    return `<div style="border-top:1px dashed var(--line);padding:10px 0">
+      <div style="display:flex;gap:9px;align-items:center;flex-wrap:wrap">
+        <button class="mini" data-probe="${esc(name)}" ${running ? "disabled" : ""}>${esc(spec.label)}</button>
+        ${badge}
+      </div>
+      <p style="margin:5px 0 0;font-size:11.5px;color:var(--faint)">${esc(spec.note)}</p>
+      ${r && r.tail ? `<pre class="log" style="margin-top:7px;max-height:150px">${esc(r.tail)}</pre>` : ""}
+    </div>`;
+  }).join("");
+}
+
+function renderBootLog(s) {
+  const b = s.boot || {};
+  $("boot-stdout").textContent = b.stdout_tail || "(no boot launched from this dashboard)";
+  $("boot-note").innerHTML = b.panic
+    ? `<div class="note bad"><b>Guest kernel panic in this boot's stdout.</b> This verdict outranks
+       any probe's exit status and a live device — both read green on a boot whose guest died.
+       A rail that panics on a third of its boots is not a rail that passes.</div>`
+    : (b.log ? `<div class="note"><b>Full log:</b> <code>${esc(b.log)}</code></div>` : "");
+}
+
+/* ---------- config + refresh ---------- */
+function collectConfig() {
+  const env = {};
+  document.querySelectorAll("[data-knob]").forEach((el) => {
+    if (el.checked) env[el.dataset.knob] = el.dataset.on;
+  });
+  const cfg = {
+    pathway: STATE.pathway,
+    boot_class: $("boot_class").value,
+    device: $("device").value,
+    rail: $("rail").value || undefined,
+    snapshot: $("snapshot").value || undefined,
+    net: $("net").value,
+    bridge: $("net").value === "bridge" ? $("bridge").value : undefined,
+    usb: [...USB_SEL],
+    env,
+    fresh_log: $("fresh_log").checked,
+  };
+  ["ram", "cpu_cores", "guest_mac"].forEach((k) => { if ($(k).value.trim()) cfg[k] = $(k).value.trim(); });
+  if (cfg.boot_class === "capture") cfg.confirm_capture = true;
+  return cfg;
+}
+
+async function refresh() {
+  try {
+    const bridge = $("bridge").value || "virbr0";
+    STATE = await api("/api/state?bridge=" + encodeURIComponent(bridge));
+    renderHeader(STATE); renderHost(STATE); renderLaunch(STATE);
+    renderUsb(STATE); renderTelemetry(STATE); renderChannels(STATE);
+    renderProbes(STATE); renderBootLog(STATE);
+    if (!$("snapshot").options.length) await loadSnapshots();
+  } catch (e) { toast("state refresh failed", "bad", e.message); }
+}
+
+/* ---------- wiring ---------- */
+["boot_class", "device", "rail", "snapshot", "net", "bridge", "ram", "cpu_cores", "guest_mac"]
+  .forEach((id) => $(id).addEventListener("change", () => {
+    dirty = true;
+    if (id === "rail") loadSnapshots();
+    if (id === "net" || id === "bridge") renderLaunch(STATE);
+  }));
+
+$("usb_form").addEventListener("change", () => { USB_SEL.clear(); renderUsb(STATE); });
+$("usb-none").addEventListener("click", () => { USB_SEL.clear(); renderUsb(STATE); });
+$("usb-list").addEventListener("change", (ev) => {
+  const box = ev.target.closest("input[data-spec]");
+  if (!box) return;
+  if (box.checked) USB_SEL.add(box.dataset.spec); else USB_SEL.delete(box.dataset.spec);
+  renderUsb(STATE);
+});
+
+$("btn-dry").addEventListener("click", async () => {
+  try {
+    const r = await api("/api/boot-argv?cfg=" + encodeURIComponent(JSON.stringify(collectConfig())));
+    $("dry").style.display = "block";
+    $("dry").textContent = r.shell;
+  } catch (e) { toast("cannot build that command", "bad", e.message); }
+});
+
+$("btn-boot").addEventListener("click", async () => {
+  const cfg = collectConfig();
+  if (cfg.boot_class === "capture" &&
+      !confirm("Capture writes a NEW SNAPSHOT into the rail on clean guest shutdown. Continue?")) return;
+  try {
+    const r = await api("/api/boot", { method: "POST", body: JSON.stringify(cfg) });
+    toast("boot started", "ok", `pid ${r.pid}`);
+    refresh();
+  } catch (e) { toast("boot refused", "bad", e.message); }
+});
+
+$("btn-stop").addEventListener("click", async () => {
+  if (!confirm("Stop the VM? A --testing boot discards its clone on exit.")) return;
+  try {
+    const r = await api("/api/stop", { method: "POST", body: "{}" });
+    toast("stop issued", "ok", (r.actions || []).join(" · "));
+    refresh();
+  } catch (e) { toast("stop failed", "bad", e.message); }
+});
+
+document.querySelectorAll("[data-key]").forEach((btn) => btn.addEventListener("click", async () => {
+  try {
+    const r = await api("/api/qmp", { method: "POST",
+      body: JSON.stringify({ action: "key", args: [btn.dataset.key.replace("-", "+")] }) });
+    toast(`key ${btn.dataset.key}`, r.rc === 0 ? "ok" : "bad", (r.stderr || "").slice(-200));
+  } catch (e) { toast("qmp failed", "bad", e.message); }
+}));
+
+$("btn-size").addEventListener("click", async () => {
+  try {
+    const r = await api("/api/qmp", { method: "POST", body: JSON.stringify({ action: "size", args: [] }) });
+    toast("display size", r.rc === 0 ? "ok" : "bad", (r.stdout || r.stderr || "").trim().slice(-200));
+  } catch (e) { toast("qmp failed", "bad", e.message); }
+});
+
+$("btn-shot").addEventListener("click", async () => {
+  try {
+    const blob = await api("/api/screenshot");
+    $("shot").src = URL.createObjectURL(blob);
+    $("shot").style.display = "block";
+  } catch (e) { toast("screenshot failed", "bad", e.message); }
+});
+
+$("probes").addEventListener("click", async (ev) => {
+  const btn = ev.target.closest("[data-probe]");
+  if (!btn) return;
+  const env = {};
+  if ($("net").value) env.NET = $("net").value;
+  if ($("net").value === "bridge") env.BRIDGE = $("bridge").value;
+  try {
+    const r = await api("/api/probe", { method: "POST",
+      body: JSON.stringify({ name: btn.dataset.probe, env }) });
+    toast(`probe ${btn.dataset.probe} started`, "ok", `pid ${r.pid}`);
+    refresh();
+  } catch (e) { toast("probe refused", "bad", e.message); }
+});
+
+if (!TOKEN) {
+  document.body.innerHTML =
+    '<main><section class="panel col12"><h2>No token</h2><div class="body">' +
+    'Open the URL this server printed on startup — it carries the token.</div></section></main>';
+} else {
+  refresh();
+  setInterval(refresh, 4000);
+}
+</script>

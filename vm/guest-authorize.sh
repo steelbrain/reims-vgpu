@@ -41,8 +41,32 @@
 #   vm/guest-authorize.sh --timeout 300   # bound the wait differently
 #   vm/guest-authorize.sh --no-automation # skip the Apple Events consent step
 #
+# THE ENDPOINT DEPENDS ON HOW THE BOOT WAS NETWORKED, and getting it wrong is
+# silent. boot-x86.sh defaults to NET=bridge, where the guest is a peer on
+# virbr0 with its own DHCP lease and there is NO hostfwd — so `127.0.0.1:2222`
+# reaches whatever else happens to be listening there, or nothing, and
+# BatchMode=yes renders both as "guest not up yet". Under NET=user the guest is
+# reachable only at `127.0.0.1:$SSH_PORT` and has no address of its own. This
+# script resolves whichever applies (`vm/guest-ip.sh` for the bridge) and prints
+# which one it used; set NET to match the boot if the default is wrong.
+#
+# IT ALSO WRITES THE `macos-vm` ALIAS, because that is the name every probe
+# types and its address moves with the endpoint. The alias is written to
+# `vm/disks/run/ssh-config` — inside the workspace, replaced per boot, nothing
+# outside it touched. For `ssh macos-vm` to see it, ~/.ssh/config needs one line
+# once:
+#
+#     Include /path/to/repo/vm/disks/run/ssh-config
+#
+# This script prints that line if the alias does not resolve, and `--write-ssh-
+# config` adds the Include for you (idempotent, in a delimited managed block).
+#
 # Environment:
-#   SSH_PORT              host port forwarded to the guest's 22 (default 2222)
+#   NET                   bridge (default, matches boot-x86.sh) | user | none
+#   BRIDGE                host bridge for NET=bridge (default virbr0)
+#   GUEST_MAC             the pinned guest MAC the lease is looked up by
+#   SSH_PORT              host port forwarded to the guest's 22 under NET=user
+#                         (default 2222); unused under NET=bridge
 #   REIMS_GUEST_USER      guest account (default aneesiqbal)
 #   REIMS_GUEST_PASSWORD  its password (default aneesiqbal) — a throwaway
 #                         credential for a local development VM, not a secret
@@ -60,6 +84,12 @@
 set -euo pipefail
 
 SSH_PORT="${SSH_PORT:-2222}"
+# Default must track boot-x86.sh's own NET default or this script authorizes the
+# wrong endpoint on a plain boot.
+NET="${NET:-bridge}"
+BRIDGE="${BRIDGE:-virbr0}"
+GUEST_MAC="${GUEST_MAC:-52:54:00:c9:18:27}"
+WRITE_SSH_CONFIG=0
 GUEST_USER="${REIMS_GUEST_USER:-aneesiqbal}"
 GUEST_PASSWORD="${REIMS_GUEST_PASSWORD:-aneesiqbal}"
 GUEST_KEY="${REIMS_GUEST_KEY:-$HOME/.ssh/macos_x86_guest}"
@@ -86,6 +116,7 @@ while [ $# -gt 0 ]; do
     --timeout) shift; WAIT_SECONDS="${1:-}"; [ -n "$WAIT_SECONDS" ] || die "--timeout needs seconds"; shift ;;
     --timeout=*) WAIT_SECONDS="${1#--timeout=}"; shift ;;
     --no-automation) WANT_AUTOMATION=0; shift ;;
+    --write-ssh-config) WRITE_SSH_CONFIG=1; shift ;;
     -h|--help) sed -n '2,60p' "$0"; exit 0 ;;
     *) die "unknown arg: $1" ;;
   esac
@@ -98,25 +129,46 @@ PUBKEY="$(cat "$GUEST_KEY.pub")"
 # The guest's host key changes with every rail and every reprovision, and this
 # is a loopback port on a development box — pinning it would only produce a
 # mismatch to click through. Keep that decision out of the user's known_hosts.
+# --- Resolve the endpoint ---------------------------------------------------
+# A bridged guest takes its lease late in macOS boot, well after this script is
+# usually called, so the lease lookup gets the same deadline as the sshd wait
+# rather than a short one — a missing lease here is "not up yet", not "broken".
+case "$NET" in
+  bridge)
+    GUEST_ADDR="$(BRIDGE="$BRIDGE" GUEST_MAC="$GUEST_MAC" \
+      "$REPO_ROOT/vm/guest-ip.sh" --wait "$WAIT_SECONDS")" || die \
+      "no DHCP lease for $GUEST_MAC on $BRIDGE within ${WAIT_SECONDS}s.
+If the boot used NET=user, re-run this with NET=user (its guest has no address of its own)."
+    GUEST_SSH_PORT=22
+    ;;
+  user)
+    GUEST_ADDR=127.0.0.1
+    GUEST_SSH_PORT="$SSH_PORT"
+    ;;
+  none) die "NET=none: that boot has no NIC, so there is nothing to authorize" ;;
+  *) die "unknown NET: $NET (bridge | user | none)" ;;
+esac
+echo "guest-authorize: net=$NET endpoint=$GUEST_USER@$GUEST_ADDR:$GUEST_SSH_PORT"
+
 SSH_COMMON=(
   -o StrictHostKeyChecking=no
   -o UserKnownHostsFile=/dev/null
   -o LogLevel=ERROR
   -o ConnectTimeout=8
-  -p "$SSH_PORT"
+  -p "$GUEST_SSH_PORT"
 )
 
 ssh_key() {
   timeout "$STEP_TIMEOUT" ssh "${SSH_COMMON[@]}" \
     -o BatchMode=yes -o IdentitiesOnly=yes -i "$GUEST_KEY" \
-    "$GUEST_USER@127.0.0.1" "$@"
+    "$GUEST_USER@$GUEST_ADDR" "$@"
 }
 
 ssh_password() {
   command -v sshpass >/dev/null 2>&1 || die "sshpass not found (needed to authorize a rail that has no key yet)"
   timeout "$STEP_TIMEOUT" sshpass -p "$GUEST_PASSWORD" ssh "${SSH_COMMON[@]}" \
     -o PubkeyAuthentication=no -o NumberOfPasswordPrompts=1 \
-    "$GUEST_USER@127.0.0.1" "$@"
+    "$GUEST_USER@$GUEST_ADDR" "$@"
 }
 
 # --- Wait for sshd ---------------------------------------------------------
@@ -130,11 +182,11 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
   if ssh_key true 2>/dev/null || ssh_password true 2>/dev/null; then up=1; break; fi
   sleep 5
 done
-[ "$up" -eq 1 ] || die "guest sshd did not answer on port $SSH_PORT within ${WAIT_SECONDS}s"
+[ "$up" -eq 1 ] || die "guest sshd did not answer at $GUEST_ADDR:$GUEST_SSH_PORT within ${WAIT_SECONDS}s"
 
 # --- Authorize -------------------------------------------------------------
 if ssh_key true 2>/dev/null; then
-  echo "guest-authorize: key auth already works (port $SSH_PORT, user $GUEST_USER)"
+  echo "guest-authorize: key auth already works ($GUEST_USER@$GUEST_ADDR:$GUEST_SSH_PORT)"
 else
   echo "guest-authorize: installing $GUEST_KEY.pub for $GUEST_USER ..."
   # Appending only when absent keeps a re-run from growing the file, and the
@@ -150,26 +202,89 @@ else
   echo "guest-authorize: key auth now works"
 fi
 
-# --- Report what a probe will see ------------------------------------------
-# `macos-vm` is what the probes actually type, and it authenticates against the
-# user's own ~/.ssh/known_hosts. That file cannot hold a useful entry for this
-# endpoint: `127.0.0.1:2222` is a different machine on every rail, so whichever
-# rail booted first wins and every other rail then fails the host-key check —
-# with `BatchMode=yes` turning the mismatch into a silent probe failure. Forget
-# the pin before verifying; `accept-new` re-learns it for the rail that is
-# actually running.
-for host in "[127.0.0.1]:$SSH_PORT" "[localhost]:$SSH_PORT"; do
-  timeout "$STEP_TIMEOUT" ssh-keygen -R "$host" >/dev/null 2>&1 || true
-done
+# --- Point the `macos-vm` alias at this boot -------------------------------
+# `macos-vm` is what the probes actually type, and where it points is now a
+# per-boot question rather than a constant: NET=user puts the guest on
+# 127.0.0.1:$SSH_PORT and NET=bridge gives it a lease of its own. Writing the
+# alias here is the same argument as installing the ssh key into the COW clone
+# rather than into the snapshot — it costs nothing, it is replaced by the next
+# boot, and every existing probe then works unchanged.
+#
+# The file lives in the workspace. StrictHostKeyChecking=no with a /dev/null
+# known-hosts is deliberate and is the same reasoning the ssh calls above use:
+# this endpoint is a DIFFERENT MACHINE on every rail, whether it is spelled
+# 127.0.0.1:2222 or a virbr0 lease that dnsmasq hands to whichever rail asked
+# first. A pin can only produce a mismatch, and BatchMode=yes turns a mismatch
+# into a silent probe failure that reads as a dead guest.
+SSH_CONFIG_FILE="$REPO_ROOT/vm/disks/run/ssh-config"
+mkdir -p "$(dirname "$SSH_CONFIG_FILE")"
+cat > "$SSH_CONFIG_FILE" <<EOF
+# Written by vm/guest-authorize.sh — regenerated on every run, do not edit.
+# net=$NET rail endpoint=$GUEST_USER@$GUEST_ADDR:$GUEST_SSH_PORT
+Host macos-vm
+  HostName $GUEST_ADDR
+  Port $GUEST_SSH_PORT
+  User $GUEST_USER
+  IdentityFile $GUEST_KEY
+  IdentitiesOnly yes
+  StrictHostKeyChecking no
+  UserKnownHostsFile /dev/null
+  LogLevel ERROR
+  ConnectTimeout 8
+EOF
+echo "guest-authorize: wrote $SSH_CONFIG_FILE (Host macos-vm -> $GUEST_ADDR:$GUEST_SSH_PORT)"
 
-# If ~/.ssh/config points `macos-vm` somewhere else, say so here rather than
-# letting a probe fail obscurely.
-if timeout "$STEP_TIMEOUT" ssh -o BatchMode=yes -o ConnectTimeout=8 \
-     -o StrictHostKeyChecking=accept-new macos-vm true 2>/dev/null; then
+INCLUDE_LINE="Include $SSH_CONFIG_FILE"
+MANAGED_BEGIN="# BEGIN reims-vgpu (vm/guest-authorize.sh)"
+MANAGED_END="# END reims-vgpu"
+
+# ssh reads the FIRST value it finds for any keyword, so an Include that is not
+# at the top of the file loses to any earlier `Host macos-vm` or `Host *` block.
+# Prepending is the only placement that is always correct.
+add_include_to_user_config() {
+  local cfg="$HOME/.ssh/config"
+  mkdir -p "$HOME/.ssh"; chmod 700 "$HOME/.ssh"
+  if [ -f "$cfg" ] && grep -qxF "$INCLUDE_LINE" "$cfg"; then
+    echo "guest-authorize: $cfg already includes the alias"
+    return 0
+  fi
+  local tmp
+  tmp="$(mktemp "$cfg.reims.XXXXXX")"
+  {
+    printf '%s\n%s\n%s\n\n' "$MANAGED_BEGIN" "$INCLUDE_LINE" "$MANAGED_END"
+    [ -f "$cfg" ] && cat "$cfg"
+  } > "$tmp"
+  chmod 600 "$tmp"
+  mv "$tmp" "$cfg"
+  echo "guest-authorize: prepended the alias Include to $cfg"
+}
+
+if [ "$WRITE_SSH_CONFIG" -eq 1 ]; then
+  add_include_to_user_config
+fi
+
+# --- Report what a probe will see ------------------------------------------
+if timeout "$STEP_TIMEOUT" ssh -F "$SSH_CONFIG_FILE" -o BatchMode=yes macos-vm true 2>/dev/null; then
+  echo "guest-authorize: ssh -F $SSH_CONFIG_FILE macos-vm ok"
+else
+  echo "guest-authorize: WARNING the generated alias does not connect even though direct key auth works." >&2
+  exit 1
+fi
+
+# The probes type a bare `ssh macos-vm`, which reads ~/.ssh/config and not the
+# file above. Verify the name the probes will actually use, and if it does not
+# resolve, print the one line that fixes it rather than leaving 20 probes to
+# fail at their first hop.
+if timeout "$STEP_TIMEOUT" ssh -o BatchMode=yes -o ConnectTimeout=8 macos-vm true 2>/dev/null; then
   echo "guest-authorize: ssh macos-vm ok — probes under scripts/ will reach this guest"
 else
-  echo "guest-authorize: WARNING ssh macos-vm failed even though direct key auth works." >&2
-  echo "guest-authorize: probes default to GUEST=macos-vm; check ~/.ssh/config names port $SSH_PORT and $GUEST_KEY." >&2
+  {
+    echo "guest-authorize: WARNING \`ssh macos-vm\` does not reach this guest, so every probe under scripts/ will fail at its first hop."
+    echo "guest-authorize: the alias itself is correct — it is just not on ssh's path. Add this line at the TOP of ~/.ssh/config:"
+    echo "guest-authorize:     $INCLUDE_LINE"
+    echo "guest-authorize: or re-run:  vm/guest-authorize.sh --write-ssh-config"
+    echo "guest-authorize: (if ~/.ssh/config already defines macos-vm, that definition wins; delete it or move the Include above it.)"
+  } >&2
   exit 1
 fi
 
@@ -178,8 +293,7 @@ fi
 # System Events and asks it something, which is the whole trigger. Its answer is
 # discarded — this is a consent probe, not a query.
 consent_probe() {
-  timeout "$CONSENT_PROBE_TIMEOUT" ssh -o BatchMode=yes -o ConnectTimeout=8 \
-    -o StrictHostKeyChecking=accept-new macos-vm \
+  timeout "$CONSENT_PROBE_TIMEOUT" ssh -F "$SSH_CONFIG_FILE" -o BatchMode=yes macos-vm \
     'osascript -e '\''tell application "System Events" to get name'\''' >/dev/null 2>&1
 }
 

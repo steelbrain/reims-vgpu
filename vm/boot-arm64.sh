@@ -53,6 +53,10 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+# USB passthrough spec parsing is shared with boot-x86.sh; see that file's
+# header for why the rule has one owner rather than a copy per boot script.
+# shellcheck source=vm/lib/usb-passthrough.sh
+. "$REPO_ROOT/vm/lib/usb-passthrough.sh"
 
 # --- Configuration (override via env or flags) ----------------------------------
 # Guest bundle provisioned by scripts/vmapple-provision (large + private, gitignored).
@@ -85,6 +89,32 @@ RAIL_LABEL="${RAIL:-}"   # empty = follow rails/current; else a rail name
 SNAPSHOT_LABEL=""        # empty = follow the rail's snapshots/current
 LIST_RAILS=0
 LIST_SNAPSHOTS=0
+LIST_USB=0
+
+# --- USB passthrough ----------------------------------------------------------
+# Same three spec forms as boot-x86.sh (VID:PID, BUS.ADDR, BUS-PORT), resolved
+# by the shared library above. See vm/lib/usb-passthrough.sh for what each form
+# pins and what the host gives up.
+#
+# TWO THINGS DIFFER ON THIS PATHWAY, and both are host-side rather than guest-
+# side. First, the `vmapple` machine builds its own qemu-xhci and attaches
+# usb-kbd and usb-tablet to it (hw/vmapple/vmapple.c, under defaults_enabled()),
+# so there is no controller id this script can name — a `-device usb-host` with
+# no `bus=` lands on that single USB bus, which is what we want. Second, the
+# resolver reads /sys/bus/usb/devices, which does not exist on a macOS host;
+# this pathway runs under HVF and is therefore always macOS, so a spec is
+# refused by name rather than silently resolving to nothing. Passing a device
+# through on an Apple host needs a sysfs-free resolver that nobody has written,
+# and QEMU's own hostbus/hostaddr properties are libusb's numbering, not
+# IOKit's — so this is an honest gap and not a rail to route around.
+USB_SPECS=()
+USB_SPEC_COUNT=0
+if [ -n "${USB_PASSTHROUGH:-}" ]; then
+  # Deliberately unquoted: this knob is a whitespace-separated list.
+  # shellcheck disable=SC2206
+  USB_SPECS=($USB_PASSTHROUGH)
+  for _ in $USB_PASSTHROUGH; do USB_SPEC_COUNT=$((USB_SPEC_COUNT + 1)); done
+fi
 GFX_DEVICE="apple-gfx-mmio"  # apple-gfx-mmio | reims-vgpu-mmio
 
 usage() {
@@ -103,6 +133,11 @@ usage: vm/boot-arm64.sh [--device apple-gfx-mmio|reims-vgpu-mmio] [--testing|--i
   --snapshot LABEL       snapshot WITHIN that rail. Default: the rail's own
                          \`snapshots/current\`. A bare --snapshot (no label) is
                          the old spelling of --capture.
+  --usb SPEC             pass a host USB device through to the guest; repeatable.
+                         SPEC is VID:PID (046d:c099), BUS.ADDR (5.3) or
+                         BUS-PORT (5-1.2). Needs a Linux host — see --list-usb.
+  --list-usb             print the host USB devices with all three spec forms
+                         and exit
   --list-rails           print the rails and exit
   --list-snapshots       print the selected rail's snapshots and exit
 
@@ -115,6 +150,13 @@ Env: GUEST_DIR RAILS_DIR RAIL RUN_DIR QEMU_BIN AVPBOOTER RAM CPUS SSH_PORT REIMS
      (vulkan default for reims-vgpu-mmio; metal default for apple-gfx-mmio)
      TESTING_TIMEOUT QMP_DUMP_TIMEOUT GUEST_MAC
      NET=user (SLIRP, default) | NET=none (no NIC — one-time offline Setup Assistant bootstrap)
+       This pathway has NO bridge mode. boot-x86.sh defaults to NET=bridge on
+       virbr0, but virbr0 is a libvirt-on-Linux object and qemu-bridge-helper
+       speaks SIOCBRADDIF over linux/if_bridge.h; neither exists on the Apple
+       host this pathway requires. The macOS equivalent is QEMU's vmnet
+       (-netdev vmnet-bridged), which needs its own entitlement and root, and
+       is not wired up here.
+     USB_PASSTHROUGH="SPEC SPEC ..." — same specs as --usb
      TRACE=1 — control-plane trace rail: the display device's QEMU trace events
      (MMIO order, ring records, map/unmap, IRQs, frames) → \$RUN_DIR/trace-<stamp>.log
      TRACE_PATTERN=glob — override the default display-device trace glob
@@ -165,6 +207,9 @@ while [ "$#" -gt 0 ]; do
       esac
       ;;
     --snapshot=*) SNAPSHOT_LABEL="${1#--snapshot=}"; shift ;;
+    --usb) shift; [ -n "${1:-}" ] || { echo "boot-arm64.sh: --usb needs a spec (VID:PID | BUS.ADDR | BUS-PORT)" >&2; exit 64; }; USB_SPECS+=("$1"); USB_SPEC_COUNT=$((USB_SPEC_COUNT + 1)); shift ;;
+    --usb=*) USB_SPECS+=("${1#--usb=}"); USB_SPEC_COUNT=$((USB_SPEC_COUNT + 1)); shift ;;
+    --list-usb) LIST_USB=1; shift ;;
     --list-rails) LIST_RAILS=1; shift ;;
     --list-snapshots) LIST_SNAPSHOTS=1; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -196,6 +241,43 @@ require_plain_label() {
 
 # --- Resolve the rail ------------------------------------------------------------
 # Answered before anything is built — these are questions about the disk tree.
+# --- Resolve USB passthrough ------------------------------------------------------
+# Answered before anything is built, for the same reason as --list-rails: it is a
+# question about the host, and a bad spec must cost a second rather than a QEMU
+# build and a boot.
+if [ "$LIST_USB" -eq 1 ]; then
+  if [ ! -d "$USB_SYSFS_ROOT" ]; then
+    die "--list-usb reads $USB_SYSFS_ROOT, which this host ($(uname -s)) does not have.
+This pathway requires an Apple host (-accel hvf), so USB passthrough is unavailable here;
+see the NET/USB_PASSTHROUGH notes in --help."
+  fi
+  usb_list_devices
+  echo
+  echo "pass one to a boot with --usb SPEC (repeatable), or USB_PASSTHROUGH=\"SPEC SPEC\"."
+  exit 0
+fi
+
+# Each spec becomes one `-device usb-host,...`. No `bus=`: the vmapple machine
+# builds exactly one qemu-xhci and gives it no id, so an unqualified usb-host
+# lands on that controller alongside the machine's own usb-kbd and usb-tablet.
+USB_QEMU_ARGS=()
+USB_QEMU_ARG_COUNT=0
+if [ "$USB_SPEC_COUNT" -gt 0 ]; then
+  [ -d "$USB_SYSFS_ROOT" ] || die \
+    "--usb/USB_PASSTHROUGH resolves specs through $USB_SYSFS_ROOT, which this host ($(uname -s)) does not have.
+This pathway runs under HVF and is therefore always macOS, so there is no sysfs to read.
+See the USB_PASSTHROUGH note in --help for why there is no Apple-host resolver."
+  _usb_index=0
+  for _usb_spec in "${USB_SPECS[@]}"; do
+    usb_resolve_spec "$_usb_spec" || die "usb: $USB_R_ERROR"
+    echo "boot-arm64.sh: usb passthrough $_usb_spec -> $USB_R_DESC"
+    USB_QEMU_ARGS+=(-device "usb-host,id=usbpt$_usb_index,$USB_R_PROPS")
+    USB_QEMU_ARG_COUNT=$((USB_QEMU_ARG_COUNT + 2))
+    _usb_index=$((_usb_index + 1))
+  done
+  echo "boot-arm64.sh: usb passthrough — the host loses these devices until this boot exits"
+fi
+
 if [ "$LIST_RAILS" -eq 1 ]; then
   echo "rails under $RAILS_DIR (current -> $(readlink "$RAILS_DIR/current" 2>/dev/null || echo '(unset)')):"
   list_rail_labels | while IFS= read -r label; do echo "  $label"; done
@@ -454,6 +536,10 @@ if [ -n "$NETDEV" ]; then
   QEMU_ARGS+=(-netdev "$NETDEV" -device "virtio-net-pci,netdev=net0,mac=$GUEST_MAC")
 else
   QEMU_ARGS+=(-nic none)   # suppress QEMU's implicit default user-mode NIC
+fi
+
+if [ "$USB_QEMU_ARG_COUNT" -gt 0 ]; then
+  QEMU_ARGS+=("${USB_QEMU_ARGS[@]}")
 fi
 
 # The Vulkan product build owns its AppKit window in Rust and therefore disables

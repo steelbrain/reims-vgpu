@@ -30,6 +30,11 @@ __pycache__/
 !/vm/boot-arm64.sh
 !/vm/boot-x86.sh
 !/vm/guest-authorize.sh
+!/vm/guest-ip.sh
+# `/vm/*` above stops git descending into vm/lib at all, so the directory has to
+# be un-ignored before the file in it can be.
+!/vm/lib/
+!/vm/lib/*.sh
 !/vm/rail-debug-posture.sh
 vm/debug/
 vm/logs/
