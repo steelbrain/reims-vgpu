@@ -251,6 +251,45 @@ fn strided_window_extent_measures_padded_rows_and_refuses_unrepresentable_stride
     assert_eq!(strided_window_extent(64, 0, 4, 256), None);
     // Single-byte texels (the type-5 NV12 luma plane) take every stride.
     assert_eq!(strided_window_extent(64, 4, 1, 64), Some((256, 0)));
+    // The block-aware level form, on the geometry the gather refused for a
+    // whole session: a 64x64 BC3 level is 16 rows of 16 blocks. Tight rows
+    // report `bufferRowLength = 0`; a padded stride reports it in **texels**
+    // (Vulkan's unit even for compressed copies) and block-aligned, so 320
+    // bytes of stride over 16-byte blocks is 20 blocks = 80 texels. A stride
+    // that does not divide into whole blocks cannot describe a block row and
+    // refuses rather than rounding into a shifted image.
+    let bc3 = crate::contract::pixel_format::block_geometry(
+        crate::contract::pixel_format::MTL_FORMAT_BC3_RGBA,
+    )
+    .unwrap();
+    let level = |bpr: u64| crate::runtime::decode::resource::TextureLevelLayout {
+        offset: 0,
+        size: 4096,
+        row_stride: bpr,
+        width: 64,
+        height: 64,
+        depth: 1,
+    };
+    assert_eq!(
+        strided_level_extent(&level(256), bc3),
+        Some((4096, 0)),
+        "sixteen tight block rows of 256 bytes, not sixty-four texel rows"
+    );
+    assert_eq!(
+        strided_level_extent(&level(320), bc3),
+        Some((320 * 15 + 256, 80)),
+        "a padded block row reports its stride in block-aligned texels"
+    );
+    assert_eq!(
+        strided_level_extent(&level(250), bc3),
+        None,
+        "a stride below one tight block row is not a level"
+    );
+    assert_eq!(
+        strided_level_extent(&level(264), bc3),
+        None,
+        "a stride that is not whole blocks cannot describe a block row"
+    );
     assert_eq!(strided_window_extent(64, 4, 1, 96), Some((96 * 3 + 64, 96)));
 }
 
@@ -480,7 +519,15 @@ fn linear_volume_gather_carries_every_depth_plane() {
         height,
         depth,
     };
-    let (span, row_length) = strided_level_extent(&layout, 4).unwrap();
+    let (span, row_length) = strided_level_extent(
+        &layout,
+        pixel_format::BlockGeometry {
+            width: 1,
+            height: 1,
+            bytes: 4,
+        },
+    )
+    .unwrap();
     assert_eq!(span, row_stride * u64::from(height) * u64::from(depth));
     assert_eq!(row_length, 0);
 }
@@ -3121,6 +3168,180 @@ fn mrt_draw_request_type8_swizzled_view_rejected_as_color_rt() {
         )
         .is_none(),
         "swizzled type-8 must not resolve as color RT"
+    );
+}
+
+/// The six faces of a cube texture load in slice order, one face-stride apart.
+///
+/// The regression this pins is the missing car model: Asphalt 8's paint shader
+/// samples a BC3 cube environment map, `sampled_image_shape` refused `Cube`,
+/// and — because a failed record abandons the rest of its serialized pass —
+/// the one refusal cost 44 of the packet's 87 draws every frame.
+///
+/// Two halves, because they fail differently. The RGBA8 case checks *content*:
+/// each face is filled with its own byte, so a wrong stride shows as face N
+/// carrying face M's bytes rather than as a length mismatch. The BC3 case
+/// checks the *stride arithmetic itself* at the allocation boundary: a 64x64
+/// BC3 face is 16 block rows of 256 bytes — 4096, not the 16384 a texel-height
+/// stride would claim — so an allocation sized exactly for six faces passes and
+/// one byte less refuses on the sixth by name.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn a_cube_texture_loads_six_faces_in_slice_order() {
+    use crate::contract::endian::{st16, st32, st64};
+    use crate::contract::pixel_format::{MTL_FORMAT_BC3_RGBA, MTL_FORMAT_RGBA8_UNORM};
+    use crate::runtime::decode::resource::{
+        list_object_entry_offset, LINEAR_DESC_HANDLE, LINEAR_DESC_SIZE, OBJECT_LIST_ENTRY_LEN,
+        OBJECT_TYPE_TEXTURE, RESOURCE_PAGE_SHIFT, TEXTURE_DESC_BASE_LEN, TEXTURE_DESC_HEIGHT,
+        TEXTURE_DESC_PIXEL_FORMAT, TEXTURE_DESC_ROW_STRIDE, TEXTURE_DESC_WIDTH,
+    };
+    use texture_view::{load_cube_faces, LinearLoadRefusal, NativeUploads};
+
+    // One writer for both cases: descriptor + object-list entry.
+    let install = |state: &mut DeviceState,
+                   host: &mut FakeHost,
+                   tex_ref: u32,
+                   w: u32,
+                   h: u32,
+                   bpr: u32,
+                   fmt: u16,
+                   alloc: u64,
+                   handle: u32| {
+        let mut desc = vec![0u8; TEXTURE_DESC_BASE_LEN];
+        st64(&mut desc[LINEAR_DESC_SIZE..], alloc);
+        st32(&mut desc[LINEAR_DESC_HANDLE..], handle);
+        st32(&mut desc[TEXTURE_DESC_ROW_STRIDE..], bpr);
+        st32(&mut desc[TEXTURE_DESC_WIDTH..], w);
+        st32(&mut desc[TEXTURE_DESC_HEIGHT..], h);
+        st16(&mut desc[TEXTURE_DESC_PIXEL_FORMAT..], fmt);
+        let desc_gva = 0x280u64;
+        write_task_gva_arm64e(host, &state.tasks[1], desc_gva, &desc);
+        let off = list_object_entry_offset(tex_ref, 256).unwrap();
+        let mut list_entry = [0u8; OBJECT_LIST_ENTRY_LEN];
+        let packed = (OBJECT_TYPE_TEXTURE as u32) | ((TEXTURE_DESC_BASE_LEN as u32) << 8);
+        st32(&mut list_entry[0..], packed);
+        list_entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
+        write_task_gva_arm64e(host, &state.tasks[1], off, &list_entry);
+    };
+
+    // --- RGBA8 8x8: content proves the face order and the stride ------------
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 16);
+    assert!(state.set_object_list(1, 0, 256));
+    let (w, h, bpr) = (8u32, 8u32, 32u32);
+    let face_bytes = (bpr * h) as usize;
+    let handle = 8u32;
+    install(
+        &mut state,
+        &mut host,
+        7,
+        w,
+        h,
+        bpr,
+        MTL_FORMAT_RGBA8_UNORM,
+        (face_bytes as u64) * 6,
+        handle,
+    );
+    let data_gva = (handle as u64) << RESOURCE_PAGE_SHIFT;
+    for face in 0u8..6 {
+        let fill = vec![(face + 1) * 10; face_bytes];
+        write_task_gva_arm64e(
+            &mut host,
+            &state.tasks[1],
+            data_gva + (face as u64) * face_bytes as u64,
+            &fill,
+        );
+    }
+    let (bytes, format) = load_cube_faces(
+        &mut state,
+        &mut host,
+        1,
+        7,
+        NativeUploads::NONE,
+        crate::runtime::render_writeback::SettleSite::LinearTextureSampled,
+    )
+    .expect("six RGBA8 faces load");
+    assert_eq!(
+        format.layout(),
+        crate::contract::pixel_format::TexelLayout::Rgba8
+    );
+    assert_eq!(bytes.len(), face_bytes * 6, "six tight faces, in one buffer");
+    for face in 0u8..6 {
+        let seg = &bytes[face as usize * face_bytes..(face as usize + 1) * face_bytes];
+        assert!(
+            seg.iter().all(|&b| b == (face + 1) * 10),
+            "face {face} must carry its own slice's bytes"
+        );
+    }
+
+    // --- BC3 64x64: the face stride is block rows, at the allocation edge ---
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 16);
+    assert!(state.set_object_list(1, 0, 256));
+    let bc_face = 256u64 * 16; // 16 block rows of 256 bytes: 4096, not 16384.
+    install(
+        &mut state,
+        &mut host,
+        9,
+        64,
+        64,
+        256,
+        MTL_FORMAT_BC3_RGBA,
+        bc_face * 6,
+        8,
+    );
+    let native_bc = NativeUploads {
+        block_compressed: true,
+        ..NativeUploads::NONE
+    };
+    let (bytes, format) = load_cube_faces(
+        &mut state,
+        &mut host,
+        1,
+        9,
+        native_bc,
+        crate::runtime::render_writeback::SettleSite::LinearTextureSampled,
+    )
+    .expect("an allocation sized exactly for six BC3 faces loads");
+    assert_eq!(
+        format.layout(),
+        crate::contract::pixel_format::TexelLayout::Bc3Rgba
+    );
+    assert_eq!(bytes.len() as u64, bc_face * 6);
+
+    // One byte short of six faces: face five's span crosses the allocation and
+    // refuses by name, which is the failure mode a wrong stride must take —
+    // never shifted faces.
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 16);
+    assert!(state.set_object_list(1, 0, 256));
+    install(
+        &mut state,
+        &mut host,
+        9,
+        64,
+        64,
+        256,
+        MTL_FORMAT_BC3_RGBA,
+        bc_face * 6 - 1,
+        8,
+    );
+    assert!(
+        matches!(
+            load_cube_faces(
+                &mut state,
+                &mut host,
+                1,
+                9,
+                native_bc,
+                crate::runtime::render_writeback::SettleSite::LinearTextureSampled,
+            ),
+            Err(LinearLoadRefusal::SpanExceedsAllocation { .. })
+        ),
+        "the sixth face must refuse past the allocation, not read past it"
     );
 }
 
@@ -6080,8 +6301,9 @@ fn a_draw_skipped_after_an_engine_refusal_is_counted_with_the_vertices_it_cost()
             slot: 0,
             texture_ref: 7,
             // 64x64 BGRA8 at a tight stride is exactly one 16 KiB page of the
-            // rig's walkable task, so the CLEAR seed Store lands and the tail's
-            // `any_store` precondition is met.
+            // rig's walkable task. The eager CLEAR seed is off by default now,
+            // so nothing stores and the tail reports NoMetal — the counter this
+            // test is about ticks on that same tail either way.
             target_gva: StoreRig::gva(1),
             row_stride: 64 * 4,
             width: 64,
@@ -6103,8 +6325,9 @@ fn a_draw_skipped_after_an_engine_refusal_is_counted_with_the_vertices_it_cost()
     drop(cap);
 
     assert!(
-        matches!(st, EncodeStatus::Ok),
-        "the CLEAR seed Store landed, so the record stored: {st:?}"
+        matches!(st, EncodeStatus::NoMetal("draw_vk_nothing_stored")),
+        "with the eager seed off nothing stored, and the tail says so by name \
+         (exec's clear fallback is what lands the clear for this packet): {st:?}"
     );
     assert!(
         lines.iter().any(|l| {
@@ -6843,12 +7066,18 @@ fn a_depth_attachment_is_keyed_on_the_guest_texture_the_pass_bound() {
         "a stencil-carrying depth attachment is its own resident"
     );
 
-    // No depth texture in the pass descriptor: nothing to key a resident on, and
-    // the engine's transient fallback is what runs.
-    assert_eq!(
-        id(&req(0, 1024, 768), false),
-        None,
-        "an unbound depth attachment names no resident"
+    // No depth texture in the pass descriptor: the resident is keyed on the
+    // pass's own geometry instead of on a texture, so the records of one
+    // serialized pass still share a single depth attachment. This used to be
+    // `None`, which handed every record its own empty transient buffer and lost
+    // occlusion between them — see
+    // `an_anonymous_depth_attachment_is_chain_stable_per_geometry` for the
+    // stability half of the rule; here the point is only that the anonymous
+    // key stays out of the texture namespace.
+    let anonymous = id(&req(0, 1024, 768), false).expect("an unbound depth still keys a resident");
+    assert!(
+        matches!(anonymous, TargetIdentity::Anonymous { .. }),
+        "an unbound depth attachment must not invent a texture identity: {anonymous:?}"
     );
     assert_eq!(
         depth_chain_identity(
@@ -6862,8 +7091,9 @@ fn a_depth_attachment_is_keyed_on_the_guest_texture_the_pass_bound() {
             },
             false
         ),
-        None,
-        "and neither does a pass with no depth attachment at all"
+        Some(anonymous),
+        "an absent depth attachment keys the same pass-geometry resident as a \
+         ref-0 one: the two spellings mean the same pass shape"
     );
 }
 

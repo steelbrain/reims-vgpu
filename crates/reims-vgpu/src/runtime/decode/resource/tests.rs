@@ -1514,6 +1514,130 @@ fn multi_mip_level_layouts() {
     assert!(d.level_gva(2, PAGE_SHIFT_ARM64E).is_none());
 }
 
+/// A level's read span counts rows of storage, which for a compressed level is a
+/// quarter of its texel height.
+///
+/// The bound this feeds is the descriptor's own `allocation_size`, so a span
+/// computed from the texel height overstates a BC level by roughly four and gets
+/// the texture refused against an allocation the guest sized correctly — the
+/// same shape as the 27x27 mask `read_span` was written for, one axis over.
+///
+/// The numbers are a 1024x1024 BC3 level as a guest sends it: 256 block rows of
+/// 4096 bytes, which is 1 MiB exactly and no trailing padding to discount.
+#[test]
+fn a_compressed_level_spans_its_block_rows_not_its_texel_rows() {
+    use crate::contract::pixel_format as pf;
+    let level = TextureLevelLayout {
+        offset: 0,
+        size: 1024 * 1024,
+        row_stride: 4096,
+        width: 1024,
+        height: 1024,
+        depth: 1,
+    };
+    let tight = pf::tight_row_bytes(1024, pf::MTL_FORMAT_BC3_RGBA).expect("tight row");
+    let rows = pf::tight_row_count(1024, pf::MTL_FORMAT_BC3_RGBA).expect("rows");
+    assert_eq!((tight, rows), (4096, 256));
+    assert_eq!(
+        level.slice_read_span_rows(rows, tight),
+        Some(1024 * 1024),
+        "256 rows of 4096 bytes is the whole level and nothing past it"
+    );
+    // What the texel-height reading would have claimed, named so the difference
+    // is on the record rather than implied.
+    assert_eq!(level.slice_read_span(tight), Some(1023 * 4096 + 4096));
+    assert!(
+        level.slice_read_span(tight) > level.slice_read_span_rows(rows, tight),
+        "the texel-row form overstates a compressed level, which is the refusal \
+         this distinction exists to avoid"
+    );
+    // An uncompressed level is unchanged: `tight_row_count` answers its height,
+    // so the two forms agree by construction.
+    let plain = TextureLevelLayout {
+        offset: 0,
+        size: 64 * 4 * 32,
+        row_stride: 384,
+        width: 64,
+        height: 32,
+        depth: 1,
+    };
+    let ptight = pf::tight_row_bytes(64, pf::MTL_FORMAT_BGRA8_UNORM).expect("tight");
+    let prows = pf::tight_row_count(32, pf::MTL_FORMAT_BGRA8_UNORM).expect("rows");
+    assert_eq!(prows, 32);
+    assert_eq!(
+        plain.slice_read_span_rows(prows, ptight),
+        plain.slice_read_span(ptight)
+    );
+}
+
+/// The mip-level count is the low byte, and the byte above it does not join it.
+///
+/// The bug class this fixes: a game's mipmapped textures carry `0x80` in the
+/// byte above the count, the two were read as one `u16`, and a seven-level
+/// pyramid was decoded as 32 775 levels. Nothing about that reads as a wrong
+/// number downstream — it puts the format trailer a megabyte past the body, so
+/// the descriptor carries **no pixel format**, and seven downstream gates fail
+/// closed on that. The guest loses the texture and the draw refuses with
+/// `draw_prepare_texture_resolve_missing`.
+///
+/// The body length is the derivation and it is asserted here rather than
+/// described: a descriptor is `TEXTURE_DESC_BASE_LEN + (levels - 1) * 36` bytes,
+/// so a 332-byte body *is* seven levels and cannot be 32 775 of them. The four
+/// lengths measured on the boot that found this are on
+/// [`TEXTURE_DESC_MIPMAP_LEVEL_COUNT`].
+#[test]
+fn the_mip_level_count_is_one_byte_and_its_neighbour_is_another_field() {
+    use crate::contract::endian::{st16, st32};
+    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    const LEVELS: usize = 7;
+    let body = TEXTURE_DESC_BASE_LEN + (LEVELS - 1) * TEXTURE_DESC_MIP_LEVEL_RECORD_LEN;
+    assert_eq!(body, 332, "the length identity this test turns on");
+    let mut b = vec![0u8; body];
+    b[TEXTURE_DESC_MIPMAP_LEVEL_COUNT] = LEVELS as u8;
+    // What the game sets and the desktop never does. Reading the pair as one
+    // count is what this asserts against.
+    b[TEXTURE_DESC_MIP_FIELD_UNDECODED] = 0x80;
+    st32(&mut b[TEXTURE_DESC_USED_SIZE..], 64 * 64 * 4);
+    st32(&mut b[TEXTURE_DESC_ROW_STRIDE..], 256);
+    st32(&mut b[TEXTURE_DESC_WIDTH..], 64);
+    st32(&mut b[TEXTURE_DESC_HEIGHT..], 64);
+    for extra in 0..LEVELS - 1 {
+        let rec = TEXTURE_DESC_LEVEL_RECORDS + extra * TEXTURE_DESC_MIP_LEVEL_RECORD_LEN;
+        let side = 32u32 >> extra;
+        st32(&mut b[rec + TEXTURE_LEVEL_WIDTH..], side.max(1));
+        st32(&mut b[rec + TEXTURE_LEVEL_HEIGHT..], side.max(1));
+        st32(&mut b[rec + TEXTURE_LEVEL_ROW_STRIDE..], side.max(1) * 4);
+    }
+    let pf_off = TEXTURE_DESC_PIXEL_FORMAT + (LEVELS - 1) * TEXTURE_DESC_MIP_LEVEL_RECORD_LEN;
+    st16(&mut b[pf_off..], MTL_FORMAT_BGRA8_UNORM);
+
+    let cap = crate::observe::FailCapture::start();
+    let d = decode_texture_descriptor(&b).expect("the descriptor decodes");
+    assert_eq!(d.mipmap_level_count, LEVELS as u32);
+    assert_eq!(d.levels.len(), LEVELS, "every level the body carries is read");
+    assert_eq!(
+        d.declared_pixel_format(),
+        Some(MTL_FORMAT_BGRA8_UNORM),
+        "the shifted format trailer must be inside the body, which is the whole \
+         thing the level count decides"
+    );
+    let lines = cap.lines();
+    assert!(
+        !lines
+            .iter()
+            .any(|l| l.starts_with("texture_desc_levels_over_cap")
+                || l.starts_with("texture_desc_format_unreachable")),
+        "neither corruption guard may fire on a well-formed seven-level \
+         descriptor: {lines:?}"
+    );
+    // The undecoded neighbour is on the record rather than merely absent.
+    let note = lines
+        .iter()
+        .find(|l| l.starts_with("texture_desc_mip_field_undecoded"))
+        .expect("a non-zero undecoded field must be reported once");
+    assert!(note.contains("value=0x80") && note.contains("levels=7"), "{note}");
+}
+
 /// A mip level the descriptor named but the body does not reach is a drop,
 /// and it says so.
 ///
@@ -1693,6 +1817,106 @@ fn a_depth_stencil_pipeline_with_a_sample_count_decodes() {
         d.raster_sample_count, 4,
         "the guest's requested sample count is read rather than defaulted"
     );
+}
+
+/// Build a type-7 render-pipeline descriptor out of a compact-TLV field list.
+///
+/// Three tests below differ only in the fields, and each hand-rolled the same
+/// header/offset arithmetic. One builder means a layout change fails once.
+#[cfg(test)]
+fn render_pipeline_desc(object_id: u32, fields: &[(u8, u32)]) -> Vec<u8> {
+    let mut b = vec![0u8; TYPE7_FIRST_TLVS + 1 + fields.len() * 6];
+    let len = b.len() as u32;
+    st32(&mut b[0..], TYPE7_OBJECT_RENDER_PIPELINE);
+    st32(&mut b[4..], len);
+    st32(&mut b[8..], object_id);
+    st32(&mut b[12..], len - TYPE7_FIRST_TLVS as u32);
+    b[TYPE7_FIRST_TLVS] = fields.len() as u8;
+    let mut p = TYPE7_FIRST_TLVS + 1;
+    for &(tag, value) in fields {
+        b[p] = tag;
+        b[p + 1] = 4;
+        st32(&mut b[p + 2..], value);
+        p += 6;
+    }
+    b
+}
+
+/// A pipeline carrying Metal's legacy alpha-test and logic-op **values** decodes.
+///
+/// The regression this pins is a game's whole canvas. Asphalt 8 on a macos-13
+/// x86/Vulkan boot builds pipelines carrying `0x2e` and `0x37` — private
+/// setters on `MTLRenderPipelineDescriptorInternal`, so no workload built out of
+/// Metal's public API had ever produced them — and while they were unidentified
+/// every draw through those three pipeline refs was refused: 1 348
+/// `draw_load_pipeline reason=desc_decode` and 8 604 clear-only fallbacks in one
+/// capture. Same shape as the map-view regression `0x04`/`0x09`/`0x0a` caused.
+///
+/// The field values are the ones the game actually sent, so this is that
+/// descriptor and not a synthetic stand-in for it.
+#[test]
+fn a_pipeline_with_legacy_alpha_test_and_logic_op_values_decodes() {
+    let b = render_pipeline_desc(
+        47,
+        &[
+            (PIPELINE_TAG_DEPTH_ATTACH_FORMAT, 252),
+            (PIPELINE_TAG_ALPHA_TEST_FUNCTION, 7),
+            (PIPELINE_TAG_LOGIC_OP, 2),
+            (PIPELINE_TAG_VERTEX_FUNC, 11),
+            (PIPELINE_TAG_FRAGMENT_FUNC, 12),
+        ],
+    );
+    let cap = crate::observe::FailCapture::start();
+    let d = decode_render_pipeline_descriptor(&b)
+        .expect("an alpha-test/logic-op pipeline is decoded, not refused");
+    assert_eq!((d.vertex_func_ref, d.fragment_func_ref), (11, 12));
+    assert!(
+        !cap.lines()
+            .iter()
+            .any(|l| l.contains("pipeline_descriptor_field_dropped")),
+        "a benign field is dropped with an argument, not on the fail channel: {:?}",
+        cap.lines()
+    );
+}
+
+/// The **enables** beside those two values are still refused, one at a time.
+///
+/// This is the load-bearing half of naming them. An alpha test that is on is a
+/// per-fragment discard this device does not implement and a logic op that is on
+/// replaces blending, so a pipeline asking for either must lose rather than
+/// render without it. Asserted against
+/// `RENDER_PIPELINE_TAGS_STILL_REFUSED` so adding one to the benign list fails
+/// here instead of silently rendering a frame the guest did not ask for.
+#[test]
+fn an_alpha_test_or_logic_op_enable_is_still_refused() {
+    for enable in RENDER_PIPELINE_TAGS_STILL_REFUSED {
+        assert!(
+            !RENDER_PIPELINE_TAGS_BENIGN.contains(&enable),
+            "{enable:#04x} enables a fixed-function stage this device does not \
+             implement and must never be treated as benign"
+        );
+        let b = render_pipeline_desc(
+            47,
+            &[
+                (enable, 1),
+                (PIPELINE_TAG_VERTEX_FUNC, 11),
+                (PIPELINE_TAG_FRAGMENT_FUNC, 12),
+            ],
+        );
+        let cap = crate::observe::FailCapture::start();
+        assert!(
+            decode_render_pipeline_descriptor(&b).is_err(),
+            "{enable:#04x} must refuse the pipeline"
+        );
+        // Named, not merely refused: the tag and its first value are what let a
+        // reader identify the next one without a debugger.
+        let line = cap
+            .lines()
+            .into_iter()
+            .find(|l| l.contains("pipeline_descriptor_field_dropped"))
+            .unwrap_or_else(|| panic!("{enable:#04x} refused without naming itself"));
+        assert!(line.contains(&format!("tag={enable:#04x}")), "{line}");
+    }
 }
 
 #[test]

@@ -407,12 +407,30 @@ struct DeviceCapabilitySnapshot(u64);
 
 const CAP_MAX_DIMENSION_BITS: u32 = u32::BITS;
 const CAP_LAYOUT_SHIFT: u32 = CAP_MAX_DIMENSION_BITS;
-const CAP_GPU_ONLY_BIT: u32 =
-    CAP_LAYOUT_SHIFT + crate::contract::pixel_format::TexelLayout::ALL.len() as u32;
+/// Both per-layout masks span the **uncompressed** vocabulary only.
+///
+/// Two masks of the full `TexelLayout::ALL` no longer fit beside a `u32`
+/// dimension and two flags in one word, and the assertion below is what said so
+/// — it failed the build the moment the ten BC layouts were declared, which is
+/// exactly what a `const` relation is for. Narrowing rather than widening is
+/// also the right answer on the merits: a block-compressed layout is never a
+/// colour attachment, and Vulkan's mandatory-format table already guarantees it
+/// linear filtering wherever `textureCompressionBC` is enabled. See
+/// `TexelLayout::UNCOMPRESSED_COUNT`.
+const CAP_LAYOUT_COUNT: u32 =
+    crate::contract::pixel_format::TexelLayout::UNCOMPRESSED_COUNT as u32;
+const CAP_GPU_ONLY_BIT: u32 = CAP_LAYOUT_SHIFT + CAP_LAYOUT_COUNT;
 const CAP_SAMPLED_FILTER_SHIFT: u32 = CAP_GPU_ONLY_BIT + 1;
-const CAP_PUBLISHED_BIT: u32 =
-    CAP_SAMPLED_FILTER_SHIFT + crate::contract::pixel_format::TexelLayout::ALL.len() as u32;
-const _: () = assert!(CAP_PUBLISHED_BIT < u64::BITS);
+const CAP_PUBLISHED_BIT: u32 = CAP_SAMPLED_FILTER_SHIFT + CAP_LAYOUT_COUNT;
+/// Whether this device can sample the BC block-compressed families.
+///
+/// One bit for the whole family, because Vulkan gates BC1 through BC7 behind one
+/// feature — see `caps::device_features::DeviceFeatures::texture_compression_bc`.
+/// It rides this word rather than being asked under the engine lock for the
+/// reason the rest of it does: the sampled ladder consults it while a draw
+/// request is being assembled, before the engine transaction opens.
+const CAP_TEXTURE_COMPRESSION_BC_BIT: u32 = CAP_PUBLISHED_BIT + 1;
+const _: () = assert!(CAP_TEXTURE_COMPRESSION_BC_BIT < u64::BITS);
 
 impl DeviceCapabilitySnapshot {
     const CONSERVATIVE: Self =
@@ -427,18 +445,26 @@ impl DeviceCapabilitySnapshot {
         quirks: crate::backend::vulkan::caps::DriverQuirk,
     ) -> Self {
         let mut word = u64::from(features.max_image_dimension_2d);
-        for (index, supported) in features.color_attachment_blend.iter().enumerate() {
-            if *supported {
-                word |= 1_u64 << (CAP_LAYOUT_SHIFT + index as u32);
+        // Walked by layout rather than by array position: the feature arrays are
+        // indexed by `TexelLayout::index()` over the whole vocabulary and the
+        // masks by `uncompressed_index()` over part of it, so enumerating the
+        // array would put a layout's answer in another layout's bit.
+        for layout in crate::contract::pixel_format::TexelLayout::ALL {
+            let Some(bit) = layout.uncompressed_index() else {
+                continue;
+            };
+            if features.color_attachment_blend[layout.index()] {
+                word |= 1_u64 << (CAP_LAYOUT_SHIFT + bit as u32);
+            }
+            if features.sampled_linear_filter[layout.index()] {
+                word |= 1_u64 << (CAP_SAMPLED_FILTER_SHIFT + bit as u32);
             }
         }
         if !quirks.guest_pages_stay_authoritative {
             word |= 1_u64 << CAP_GPU_ONLY_BIT;
         }
-        for (index, supported) in features.sampled_linear_filter.iter().enumerate() {
-            if *supported {
-                word |= 1_u64 << (CAP_SAMPLED_FILTER_SHIFT + index as u32);
-            }
+        if features.texture_compression_bc {
+            word |= 1_u64 << CAP_TEXTURE_COMPRESSION_BC_BIT;
         }
         word |= 1_u64 << CAP_PUBLISHED_BIT;
         Self(word)
@@ -452,19 +478,50 @@ impl DeviceCapabilitySnapshot {
         self,
         layout: crate::contract::pixel_format::TexelLayout,
     ) -> bool {
-        self.0 & (1_u64 << (CAP_LAYOUT_SHIFT + layout.index() as u32)) != 0
+        let Some(bit) = layout.uncompressed_index() else {
+            // No host renders into a block-compressed format, and this device
+            // does not ask it to: `pixel_format::render_target_bpp` has no BC
+            // arm, so the resolve refuses one before reaching here. Answering
+            // `false` keeps that true instead of reading a bit the word does not
+            // carry.
+            return false;
+        };
+        self.0 & (1_u64 << (CAP_LAYOUT_SHIFT + bit as u32)) != 0
     }
 
     fn deferred_gpu_only_content_allowed(self) -> bool {
         self.0 & (1_u64 << CAP_GPU_ONLY_BIT) != 0
     }
 
+    /// Whether the published device sampled BC formats, or `None` before any
+    /// device has published.
+    ///
+    /// `None` rather than `false` for the unpublished case, so a caller creates
+    /// the device and asks it rather than refusing every compressed texture for
+    /// the life of a process that simply had not drawn yet — the same shape
+    /// [`Self::sampled_layout_linear_filter_if_published`] has.
+    fn texture_compression_bc_if_published(self) -> Option<bool> {
+        (self.0 & (1_u64 << CAP_PUBLISHED_BIT) != 0)
+            .then_some(self.0 & (1_u64 << CAP_TEXTURE_COMPRESSION_BC_BIT) != 0)
+    }
+
     fn sampled_layout_linear_filter_if_published(
         self,
         layout: crate::contract::pixel_format::TexelLayout,
     ) -> Option<bool> {
-        (self.0 & (1_u64 << CAP_PUBLISHED_BIT) != 0)
-            .then_some(self.0 & (1_u64 << (CAP_SAMPLED_FILTER_SHIFT + layout.index() as u32)) != 0)
+        if self.0 & (1_u64 << CAP_PUBLISHED_BIT) == 0 {
+            return None;
+        }
+        let Some(bit) = layout.uncompressed_index() else {
+            // Vulkan's mandatory-format table requires
+            // `SAMPLED_IMAGE_FILTER_LINEAR` of every BC format on a device that
+            // enables `textureCompressionBC`, and that feature is what admits
+            // the format at `translate::pixel::sampled_pixels` in the first
+            // place. So there is nothing to query — the same unconditional
+            // reading `R16_SFLOAT` gets from the spec, one family over.
+            return Some(true);
+        };
+        Some(self.0 & (1_u64 << (CAP_SAMPLED_FILTER_SHIFT + bit as u32)) != 0)
     }
 }
 
@@ -2336,7 +2393,47 @@ pub fn supports_sampled_layout_linear_filter(
         ..
     } = &mut *guard;
     match owner.ensure(counters) {
-        Ok(ctx) => ctx.sampled_linear_filter[layout.index()],
+        Ok(ctx) => {
+            if layout.is_block_compressed() {
+                // Mandated by the spec wherever the family is available at all,
+                // so there is nothing in this array to read and its BC entries
+                // are never written. Same answer the published snapshot gives.
+                ctx.features.texture_compression_bc
+            } else {
+                ctx.sampled_linear_filter[layout.index()]
+            }
+        }
+        Err(error) => {
+            engine_probe_decline(EngineProbe::SampledLayoutLinearFilter, &error)
+                .fail_once(EngineProbe::SampledLayoutLinearFilter.discriminant());
+            false
+        }
+    }
+}
+
+/// Whether this host samples the BC block-compressed families.
+///
+/// The gate `runtime::draw::texture_view::NativeUploads` carries into the linear
+/// sampled loaders. Structured exactly like
+/// [`supports_sampled_layout_linear_filter`]: the lock-free snapshot when a
+/// device has published, and otherwise the first query is allowed to create one.
+///
+/// A `false` here is not a slow path — there is no CPU decompressor and there
+/// will not be one — so it becomes a typed refusal and the guest loses that
+/// texture. That is the honest answer for a host without the format: Apple GPUs
+/// carry ASTC instead, so the arm64 pathways and MoltenVK read `false`.
+pub fn supports_block_compressed_sampled() -> bool {
+    if let Some(supported) = device_capabilities().texture_compression_bc_if_published() {
+        return supported;
+    }
+    let mut guard = lock_engine();
+    let EngineState {
+        ref mut owner,
+        ref counters,
+        ..
+    } = &mut *guard;
+    match owner.ensure(counters) {
+        Ok(ctx) => ctx.features.texture_compression_bc,
         Err(error) => {
             engine_probe_decline(EngineProbe::SampledLayoutLinearFilter, &error)
                 .fail_once(EngineProbe::SampledLayoutLinearFilter.discriminant());

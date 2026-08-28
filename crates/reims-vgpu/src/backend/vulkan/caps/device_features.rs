@@ -328,6 +328,24 @@ pub struct DeviceFeatures {
     /// pipeline invalid. Same shape as [`Self::dual_src_blend`] — optional
     /// core, asked rather than assumed, declined by name where absent.
     pub fill_mode_non_solid: bool,
+    /// `VkPhysicalDeviceFeatures::textureCompressionBC` — whether this device
+    /// can sample the BC (DXT / S3TC) block-compressed families.
+    ///
+    /// One bit covers BC1 through BC7, which is why
+    /// `pixel_format::MTL_FORMAT_BC1_RGBA`'s doc admits the family whole: there
+    /// is no per-member capability to measure. Enabling it also brings the
+    /// guarantees the sampled rail relies on — Vulkan's mandatory-format table
+    /// requires `SAMPLED_IMAGE`, `SAMPLED_IMAGE_FILTER_LINEAR` and `BLIT_SRC`
+    /// of every BC format on a device that has this feature enabled, so no
+    /// per-format query is owed either.
+    ///
+    /// **Asked and enabled rather than assumed**, and this one genuinely
+    /// divides hosts: desktop GPUs have it and Apple GPUs do not — they carry
+    /// ASTC instead — so the arm64/Metal pathways and MoltenVK refuse a BC
+    /// bind by name. Creating a BC image without the feature enabled is invalid
+    /// use, not a slower path, which is why the gate is at
+    /// `draw::texture_view::NativeUploads` and not a `#[cfg]`.
+    pub texture_compression_bc: bool,
     /// `VkPhysicalDeviceFeatures::depthClamp` — whether a pipeline may set
     /// `depthClampEnable`.
     ///
@@ -422,6 +440,7 @@ impl DeviceFeatures {
             .shader_storage_image_read_without_format(self.storage_image_read_without_format)
             .dual_src_blend(self.dual_src_blend)
             .fill_mode_non_solid(self.fill_mode_non_solid)
+            .texture_compression_bc(self.texture_compression_bc)
             .depth_clamp(self.depth_clamp)
             .multi_viewport(self.multi_viewport)
             .occlusion_query_precise(self.occlusion_query_precise)
@@ -534,6 +553,7 @@ impl DeviceFeatures {
             storage_image_write_without_format,
             storage_image_read_without_format,
             bgra8_storage,
+            texture_compression_bc,
             sampled_linear_filter,
             color_attachment_blend,
             storage16,
@@ -579,6 +599,7 @@ impl DeviceFeatures {
              max_compute_shared_memory_bytes={max_compute_shared_memory_bytes} \
              max_sample_count={max_sample_count} d24_unorm_s8_attachment={d24_unorm_s8_attachment} \
              shader_int16={shader_int16} shader_int64={shader_int64} \
+             texture_compression_bc={texture_compression_bc} \
              sampled_image_array_dynamic_indexing={sampled_image_array_dynamic_indexing} \
              storage_image_array_dynamic_indexing={storage_image_array_dynamic_indexing} \
              sampled_image_descriptor_limit={sampled_image_descriptor_limit} \
@@ -762,6 +783,7 @@ pub unsafe fn query(
         sampler_anisotropy: supported.sampler_anisotropy == vk::TRUE,
         dual_src_blend: supported.dual_src_blend == vk::TRUE,
         fill_mode_non_solid: supported.fill_mode_non_solid == vk::TRUE,
+        texture_compression_bc: supported.texture_compression_bc == vk::TRUE,
         depth_clamp: supported.depth_clamp == vk::TRUE,
         multi_viewport: supported.multi_viewport == vk::TRUE,
         occlusion_query_precise: supported.occlusion_query_precise == vk::TRUE,
@@ -829,6 +851,7 @@ mod tests {
         DeviceFeatures {
             occlusion_query_precise: true,
             robust_buffer_access: true,
+            texture_compression_bc: true,
             sampler_anisotropy: true,
             max_sampler_anisotropy: 16.0,
             max_image_dimension_2d: 16384,

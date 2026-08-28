@@ -657,8 +657,8 @@ pub fn device_desc_format_to_mtl(raw: u32) -> u16 {
 /// Unknown formats fail closed.
 pub fn iosurface_pixel_format_to_mtl(pixel_format: u32) -> u16 {
     use crate::contract::pixel_format::{
-        MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_R8_UNORM, MTL_FORMAT_RG8_UNORM, MTL_FORMAT_RGBA16_FLOAT,
-        MTL_FORMAT_RGBA8_UNORM,
+        MTL_FORMAT_BGR10A2_UNORM, MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_R8_UNORM,
+        MTL_FORMAT_RG8_UNORM, MTL_FORMAT_RGBA16_FLOAT, MTL_FORMAT_RGBA8_UNORM,
     };
     if pixel_format == 0 {
         return 0;
@@ -686,6 +686,30 @@ pub fn iosurface_pixel_format_to_mtl(pixel_format: u32) -> u16 {
         0x5247_4241 => MTL_FORMAT_RGBA8_UNORM,
         // 'RGhA' / half-float variants seen as AhGR in notes
         0x5247_6841 | 0x4168_4752 => MTL_FORMAT_RGBA16_FLOAT,
+        // 'l10r' — `kCVPixelFormatType_ARGB2101010LEPacked`. One single-plane
+        // 32-bit little-endian word per texel: two bits of alpha in the high
+        // bits, then ten each of red, green and blue, with blue in the low
+        // bits. That is `MTLPixelFormatBGR10A2Unorm`'s word exactly, which is
+        // also `VK_FORMAT_A2R10G10B10_UNORM_PACK32`'s — see
+        // `contract::pixel_format::MTL_FORMAT_BGR10A2_UNORM` and
+        // `backend::vulkan::translate::pixel`, which already paired those two.
+        //
+        // Two independent sources agree on it, which is why it is stated rather
+        // than proposed. A driven macos-13 x86/Vulkan boot running Asphalt 8
+        // declares its 1280x720 render surface with this FourCC and then binds a
+        // **type-5 reference-texture view** over the same allocation whose own
+        // `pixel_format` field reads `0x5e` — the guest naming `BGR10A2Unorm`
+        // itself, reported as `rt_type5_view_differs sid=117 view=1280x720
+        // fmt=0x5e ... base fmt=0x0`. The surface geometry closes it: the type-4
+        // record's `bytes_per_row` is 5120 over a width of 1280, which is four
+        // bytes a texel, and its `length` 0x384000 is that stride times 720.
+        //
+        // Before this arm the surface reached `draw::render_target`'s
+        // `rt_type4_base_format` as a zero — that resolve's typed refusal for a
+        // multi-plane or unknown-FourCC surface — so **every** draw of the frame
+        // failed and the game's window was black. One 100 s capture of it held
+        // 20 822 `draw_fail_clear_fallback` records and 0 successful draws.
+        0x6c31_3072 => MTL_FORMAT_BGR10A2_UNORM,
         // Single-plane R8 / RG8 OSTypes used as plane textures (not biplanar media fourcc).
         // 'L008' / common R8 fourccs are rare on type-4; MTL ordinals already handled above.
         // 'R8  ' / 'RG08' if ever seen as OSType:

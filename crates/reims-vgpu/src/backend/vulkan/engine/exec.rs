@@ -1870,11 +1870,18 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
                 },
             ));
         }
-        // Footprint of one texel of the image's own format. `None` means a
-        // format whose bytes are not one number per texel (block-compressed,
-        // multi-planar) reached a rail that sizes a linear buffer — decline by
-        // name rather than compute a wrong length.
-        let Some(texel) = super::super::translate::pixel::bytes_per_texel(image.format) else {
+        // Storage grid of the image's own format. `None` means a format whose
+        // footprint this table cannot describe at all (multi-planar) reached a
+        // rail that sizes a linear buffer — decline by name rather than compute
+        // a wrong length.
+        //
+        // The **grid** and not a bytes-per-texel, because a block-compressed
+        // image is a legitimate sampled bind and its buffer is a quarter as wide
+        // and a quarter as tall in blocks as it is in texels. Sizing one per
+        // texel over-counts by sixteen and refuses the guest's own
+        // correctly-sized bytes as `SampledBytesLength` — which is a refusal
+        // wearing the name of a guest error.
+        let Some(block) = super::super::translate::pixel::vk_block_geometry(image.format) else {
             return Err(DrawError::DrawValidation(
                 DrawValidationDecline::SampledNoLinearTexelFootprint {
                     binding: image.binding,
@@ -1882,22 +1889,21 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
                 },
             ));
         };
-        let texel = texel as usize;
         // Four factors, so the widening the operands already carry is not
         // enough — see the target-seed check above for why two of them exhaust
         // a u64 on their own. `contract::extent` owns the checked form.
-        let Some(expected) = crate::contract::extent::tight_layered_image_bytes(
+        let Some(expected) = crate::contract::extent::tight_layered_block_bytes(
             image.width,
             image.height,
             image.layers,
-            texel,
+            block,
         ) else {
             return Err(DrawError::DrawValidation(
                 DrawValidationDecline::UnrepresentableImageBytes {
                     width: image.width,
                     height: image.height,
                     layers: image.layers,
-                    bytes_per_texel: texel as u32,
+                    bytes_per_texel: block.bytes,
                 },
             ));
         };
@@ -1943,12 +1949,42 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
                         },
                     ));
                 }
+                // Every count below is in units of the image's storage grid —
+                // rows of blocks and bytes per block — which for an
+                // uncompressed format is exactly the texel arithmetic this
+                // always was (a 1x1 block whose bytes are the bytes-per-texel).
+                // `bufferRowLength` stays Vulkan's unit, texels: the stride in
+                // bytes is `(row_length / block.width) * block.bytes`, and a
+                // row length that does not divide into whole blocks cannot
+                // describe a compressed row at all, so it refuses as a stride
+                // defect rather than rounding into a shifted image.
+                let texel = block.bytes as usize;
                 let planes = image.layers as usize;
+                let storage_rows = block.block_rows(image.height) as usize;
+                let tight_row = block.blocks_across(image.width) as usize * texel;
+                if storage_rows == 0 || tight_row == 0 {
+                    return Err(DrawError::DrawValidation(
+                        DrawValidationDecline::SampledZeroGeometry {
+                            binding: image.binding,
+                            width: image.width,
+                            height: image.height,
+                            layers: image.layers,
+                        },
+                    ));
+                }
                 let run_expected = if src.row_length_texels == 0 {
                     expected
                 } else {
-                    let stride = src.row_length_texels as usize * texel;
-                    let tight_row = image.width as usize * texel;
+                    if !src.row_length_texels.is_multiple_of(block.width) {
+                        return Err(DrawError::DrawValidation(
+                            DrawValidationDecline::GuestSampleRowStride {
+                                binding: image.binding,
+                                stride: src.row_length_texels as usize,
+                                tight_row,
+                            },
+                        ));
+                    }
+                    let stride = (src.row_length_texels / block.width) as usize * texel;
                     if stride < tight_row {
                         return Err(DrawError::DrawValidation(
                             DrawValidationDecline::GuestSampleRowStride {
@@ -1958,8 +1994,8 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
                             },
                         ));
                     }
-                    (planes - 1) * image.height as usize * stride
-                        + (image.height as usize - 1) * stride
+                    (planes - 1) * storage_rows * stride
+                        + (storage_rows - 1) * stride
                         + tight_row
                 };
                 if src.total_len as usize != run_expected {

@@ -126,6 +126,35 @@ pub fn tight_layered_image_bytes(
         .ok()
 }
 
+/// [`tight_layered_image_bytes`] over a storage **block** grid.
+///
+/// The same product with the grid stated, so it covers a block-compressed image
+/// as well as an uncompressed one: an uncompressed block is 1x1 and its `bytes`
+/// is the bytes-per-texel, so this reduces to the sibling above for every format
+/// that has one. Blocks round *up* on both axes, which is the contract — a 2x2
+/// BC3 level still occupies one whole sixteen-byte block.
+///
+/// Zero on either axis is `None` for [`tight_image_bytes`]'s reason: a zero
+/// length passes every "does the guest's buffer hold this" check there is.
+pub fn tight_layered_block_bytes(
+    width: u32,
+    height: u32,
+    layers: u32,
+    block: crate::contract::pixel_format::BlockGeometry,
+) -> Option<usize> {
+    if layers == 0 || width == 0 || height == 0 || block.bytes == 0 {
+        return None;
+    }
+    let across = u64::from(block.blocks_across(width));
+    let down = u64::from(block.block_rows(height));
+    across
+        .checked_mul(down)?
+        .checked_mul(u64::from(block.bytes))?
+        .checked_mul(u64::from(layers))?
+        .try_into()
+        .ok()
+}
+
 /// [`tight_image_bytes`] together with the row stride it implies, as one pair.
 ///
 /// For the callers that hand a buffer to a texel-copy API. Such a call is given

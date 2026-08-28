@@ -354,6 +354,17 @@ struct LinearTextureLevel {
     height: u32,
     depth: u32,
     bpp: u32,
+    /// The storage grid one `bpp` unit covers.
+    ///
+    /// 1x1 for every uncompressed format, so `bpp` and this agree for all of
+    /// them and nothing downstream changes. 4x4 for the BC families, where `bpp`
+    /// is bytes per **block** — which is why the one rail that admits a
+    /// compressed texture, `exec_copy_texture_to_texture`, converts its
+    /// coordinates into block space before using any of the per-unit helpers
+    /// below. A compressed copy is an uncompressed copy of the block image, and
+    /// converting once at the top is what lets that be true rather than
+    /// threading a grid through every helper.
+    block: pixel_format::BlockGeometry,
     pixel_format: u16,
 }
 
@@ -418,6 +429,20 @@ impl TextureBacking {
             TextureBacking::Type11(t) => t.bpp,
         }
     }
+    /// The storage grid one [`Self::bpp`] unit covers.
+    fn block(&self) -> pixel_format::BlockGeometry {
+        match self {
+            TextureBacking::Linear(t) => t.block,
+            // A type-11 IOSurface is never block-compressed: its resolve takes
+            // `bytes_per_pixel`, which has no answer for a compressed format, so
+            // such a surface is refused as `t11_fmt_bpp` long before here.
+            TextureBacking::Type11(t) => pixel_format::BlockGeometry {
+                width: 1,
+                height: 1,
+                bytes: t.bpp,
+            },
+        }
+    }
     fn pixel_format(&self) -> u16 {
         match self {
             TextureBacking::Linear(t) => t.pixel_format,
@@ -430,8 +455,16 @@ impl TextureBacking {
 }
 
 impl LinearTextureLevel {
+    /// Bytes one depth plane / array slice of this level occupies.
+    ///
+    /// Counted in rows of **storage**: a block-compressed level is a quarter as
+    /// tall in rows as it is in texels, so the texel form overstated one by four
+    /// and would have strided a `z` plane or an array slice past its own image.
+    /// `block_rows` answers `height` for every uncompressed format, so this is
+    /// the same product it always was for them.
     fn bytes_per_image(&self) -> Option<u64> {
-        self.row_stride.checked_mul(self.height as u64)
+        self.row_stride
+            .checked_mul(u64::from(self.block.block_rows(self.height)))
     }
 
     /// Byte offset of texel origin (x,y,z) within the allocation (includes slice).
@@ -891,13 +924,22 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
         ));
         return Err(br(BlitStatus::Unsupported, "tex_no_pixel_format"));
     }
-    let Some(bpp) = pixel_format::bytes_per_pixel(tex.pixel_format) else {
+    // The storage grid rather than a bytes-per-texel, so a block-compressed
+    // level resolves instead of being refused here. `tex_bad_bpp` fired 448
+    // times on one driven Asphalt 8 leg, every one of them a `kind=Copy` between
+    // two BC3 textures — a copy that moves whole blocks and converts nothing.
+    //
+    // Resolving is not admitting: only the texture-to-texture copy handles a
+    // compressed grid, and every other rail that takes this backing refuses one
+    // by name.
+    let Some(block) = pixel_format::block_geometry(tex.pixel_format) else {
         crate::observe::fail(format!(
             "blit tex bad_bpp ref={texture_ref} fmt={}",
             tex.pixel_format
         ));
         return Err(br(BlitStatus::Unsupported, "tex_bad_bpp"));
     };
+    let bpp = block.bytes;
     let Some((layout_gva, layout)) = tex.level_gva(level as u32, state.page_shift) else {
         crate::observe::fail(format!(
             "blit tex level_gva_shift fail ref={texture_ref} lvl={level} handle={} alloc={} mips={} page_shift={} w={} h={} fmt={:#x}",
@@ -979,6 +1021,7 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
         alloc_size: tex.allocation_size,
         level_offset,
         row_stride: layout.row_stride,
+        block,
         slice_stride: one_slice,
         slice_index: slice as u32,
         width: layout.width,
@@ -2483,6 +2526,15 @@ fn exec_copy_buffer_to_texture<M: HostMemory + HostOps>(
         Ok(t) => t,
         Err(st) => return st,
     };
+    // A compressed texture reaches this rail only because
+    // `resolve_texture_backing` now admits one for the texture-to-texture copy.
+    // Everything below this line strides in texels, and a block is four of them
+    // in each axis — so the honest answer is a named refusal rather than a
+    // buffer sized a sixteenth of what it needs. See
+    // `exec_copy_texture_to_texture`, which converts to block space instead.
+    if dst.block().is_compressed() {
+        return br(BlitStatus::Unsupported, "b2t_compressed");
+    }
     let (aspect, copy_bpp) = match copy_aspect_for_options(dst.pixel_format(), cmd) {
         Ok(v) => v,
         Err(st) => return st,
@@ -2729,6 +2781,15 @@ fn exec_copy_texture_to_buffer<M: HostMemory + HostOps>(
         Ok(t) => t,
         Err(st) => return st,
     };
+    // A compressed texture reaches this rail only because
+    // `resolve_texture_backing` now admits one for the texture-to-texture copy.
+    // Everything below this line strides in texels, and a block is four of them
+    // in each axis — so the honest answer is a named refusal rather than a
+    // buffer sized a sixteenth of what it needs. See
+    // `exec_copy_texture_to_texture`, which converts to block space instead.
+    if src.block().is_compressed() {
+        return br(BlitStatus::Unsupported, "t2b_compressed");
+    }
     let (aspect, copy_bpp) = match copy_aspect_for_options(src.pixel_format(), cmd) {
         Ok(v) => v,
         Err(st) => return st,
@@ -3062,6 +3123,72 @@ fn exec_copy_texture_to_texture<M: HostMemory + HostOps>(
         "blit_t2t_resolve_us",
         phase_started.elapsed().as_micros() as u64,
     );
+    // From here down the coordinates are in units of `copy_bpp`, and for a
+    // block-compressed format that unit is a 4x4 **block**.
+    //
+    // A compressed copy is an uncompressed copy of the block image — same row
+    // stride, same staging, same page window — so the conversion happens once,
+    // here, and every per-unit helper below runs unchanged: `texel_offset`
+    // multiplies x by `bpp` and y by `row_stride`, which in block space is
+    // exactly a block column and a block row. Threading a grid through each
+    // helper instead would put the same division in six places.
+    //
+    // Above this line everything is texels, which is what the bounds checks and
+    // `note_t2t_shape` want; below it nothing is. That is the whole reason the
+    // conversion is a single shadowing binding rather than a flag.
+    let block = src.block();
+    let (sox, soy, dox, doy, copy_w, copy_h) = if !block.is_compressed() {
+        (sox, soy, dox, doy, copy_w, copy_h)
+    } else {
+        // Each refusal below is a copy this rail could describe wrongly rather
+        // than one Metal forbids, so each is named and none is a clamp.
+        if aspect != blit::BlitAspect::Full || repack_src || repack_dst {
+            // There is no depth or stencil plane inside a colour block, and a
+            // repack pass rewrites texels.
+            return br(BlitStatus::Unsupported, "t2t_compressed_aspect");
+        }
+        if any_t11 {
+            return br(BlitStatus::Unsupported, "t2t_compressed_t11");
+        }
+        if dst.block() != block {
+            // One allocation reinterpreted at two grids is not a copy; the
+            // format-mismatch check above lets a format-0 side through, and this
+            // is where that pairing stops.
+            return br(BlitStatus::Unsupported, "t2t_compressed_grid_mismatch");
+        }
+        if copy_d > 1 || soz != 0 || doz != 0 {
+            // `bytes_per_image` strides a depth plane by the *texel* height, and
+            // this conversion does not reach it. A 2D copy never asks.
+            return br(BlitStatus::Unsupported, "t2t_compressed_volume");
+        }
+        let (bw, bh) = (u64::from(block.width), u64::from(block.height));
+        if !sox.is_multiple_of(bw)
+            || !dox.is_multiple_of(bw)
+            || !soy.is_multiple_of(bh)
+            || !doy.is_multiple_of(bh)
+        {
+            // A block is the smallest unit this copy can move, so an origin
+            // inside one names bytes it cannot address.
+            return br(BlitStatus::Unsupported, "t2t_compressed_origin_unaligned");
+        }
+        // An extent may end mid-block only where it reaches the level edge on
+        // *both* ends — the one case a partial trailing block is the whole
+        // remainder of the image rather than a slice of a block.
+        let w_edge = sox + copy_w == src.width() as u64 && dox + copy_w == dst.width() as u64;
+        let h_edge = soy + copy_h == src.height() as u64 && doy + copy_h == dst.height() as u64;
+        if (!copy_w.is_multiple_of(bw) && !w_edge) || (!copy_h.is_multiple_of(bh) && !h_edge) {
+            return br(BlitStatus::Unsupported, "t2t_compressed_extent_unaligned");
+        }
+        crate::runtime::drain::note_store_route("blit_t2t_compressed");
+        (
+            sox / bw,
+            soy / bh,
+            dox / bw,
+            doy / bh,
+            copy_w.div_ceil(bw),
+            copy_h.div_ceil(bh),
+        )
+    };
     let row_bytes = match copy_w.checked_mul(copy_bpp as u64) {
         Some(v) => v,
         None => return br(BlitStatus::Capacity, "t2t_row_bytes_overflow"),
@@ -3890,7 +4017,15 @@ fn exec_copy_texture_to_texture_slice_level<M: HostMemory + HostOps>(
             }
         }
         let bpp = src0.bpp();
-        let row_bytes = match (w as u64).checked_mul(bpp as u64) {
+        // Whole levels, so a compressed one needs no origin or partial-block
+        // reasoning — only its row width and row *count* in blocks. The grids
+        // must agree for the same reason the `bpp`s must.
+        let block = src0.block();
+        if dst0.block() != block {
+            return br(BlitStatus::Unsupported, "sl_compressed_grid_mismatch");
+        }
+        let rows = u64::from(block.block_rows(h));
+        let row_bytes = match u64::from(block.blocks_across(w)).checked_mul(bpp as u64) {
             Some(v) => v,
             None => return br(BlitStatus::Capacity, "sl_row_bytes_overflow"),
         };
@@ -3948,7 +4083,7 @@ fn exec_copy_texture_to_texture_slice_level<M: HostMemory + HostOps>(
             // Same allocation overlap check (conservative).
             if sl.base_gva == dl.base_gva {
                 let span = row_bytes
-                    .saturating_mul(h as u64)
+                    .saturating_mul(rows)
                     .saturating_mul(image_count);
                 if ranges_overlap(src_off, span, dst_off, span) {
                     return br(BlitStatus::Overlap, "sl_overlap");
@@ -3965,7 +4100,7 @@ fn exec_copy_texture_to_texture_slice_level<M: HostMemory + HostOps>(
                 dl.row_stride,
                 dst_img_stride,
                 row_bytes,
-                h as u64,
+                rows,
                 image_count,
             ) {
                 return st;
@@ -3984,7 +4119,7 @@ fn exec_copy_texture_to_texture_slice_level<M: HostMemory + HostOps>(
         // were never the cost — re-entering the mapping rail per row was. It
         // stages the slice whole now; see [`read_texture_rect`].
         let sl_mixed_started = std::time::Instant::now();
-        let mut staged = vec![0u8; (row_bytes.saturating_mul(h as u64)) as usize];
+        let mut staged = vec![0u8; (row_bytes.saturating_mul(rows)) as usize];
         for si in 0..cmd.slice_count {
             let ss = match cmd.source_slice.checked_add(si) {
                 Some(v) => v,
@@ -4015,7 +4150,7 @@ fn exec_copy_texture_to_texture_slice_level<M: HostMemory + HostOps>(
                 &dst,
                 Point { x: 0, y: 0, z: 0 },
                 w,
-                h as u64,
+                rows,
                 1,
                 bpp,
             ) {
@@ -4029,7 +4164,7 @@ fn exec_copy_texture_to_texture_slice_level<M: HostMemory + HostOps>(
                 &src,
                 Point { x: 0, y: 0, z: 0 },
                 row_bytes,
-                h as u64,
+                rows,
                 &mut staged,
             ) {
                 return st;

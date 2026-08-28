@@ -147,6 +147,48 @@ pub fn translate(mtl: u16) -> Result<PixelFormat, TranslateReason> {
             srgb(vk::Format::B8G8R8A8_SRGB, vk::Format::B8G8R8A8_UNORM, 4)
         }
         p::MTL_FORMAT_RGB9E5_FLOAT => linear(vk::Format::E5B9G9R9_UFLOAT_PACK32, 4),
+        // The BC block-compressed families. `bytes_per_texel` here is bytes per
+        // **4x4 block** — 8 or 16 — which is what `pixel_format::block_geometry`
+        // says and what every sizing expression on the sampled rail asks for.
+        // The uncompressed arms above are the same field with a 1x1 block, so
+        // this is not a second meaning; it is the same number with the grid
+        // stated. See `pixel_format::MTL_FORMAT_BC1_RGBA` for why the family
+        // arrives whole and `caps::device_features::DeviceFeatures::
+        // texture_compression_bc` for the one feature that gates all of it.
+        p::MTL_FORMAT_BC1_RGBA => linear(vk::Format::BC1_RGBA_UNORM_BLOCK, p::BC_BLOCK_BYTES_8),
+        p::MTL_FORMAT_BC1_RGBA_SRGB => srgb(
+            vk::Format::BC1_RGBA_SRGB_BLOCK,
+            vk::Format::BC1_RGBA_UNORM_BLOCK,
+            p::BC_BLOCK_BYTES_8,
+        ),
+        p::MTL_FORMAT_BC2_RGBA => linear(vk::Format::BC2_UNORM_BLOCK, p::BC_BLOCK_BYTES_16),
+        p::MTL_FORMAT_BC2_RGBA_SRGB => srgb(
+            vk::Format::BC2_SRGB_BLOCK,
+            vk::Format::BC2_UNORM_BLOCK,
+            p::BC_BLOCK_BYTES_16,
+        ),
+        p::MTL_FORMAT_BC3_RGBA => linear(vk::Format::BC3_UNORM_BLOCK, p::BC_BLOCK_BYTES_16),
+        p::MTL_FORMAT_BC3_RGBA_SRGB => srgb(
+            vk::Format::BC3_SRGB_BLOCK,
+            vk::Format::BC3_UNORM_BLOCK,
+            p::BC_BLOCK_BYTES_16,
+        ),
+        p::MTL_FORMAT_BC4_R_UNORM => linear(vk::Format::BC4_UNORM_BLOCK, p::BC_BLOCK_BYTES_8),
+        p::MTL_FORMAT_BC4_R_SNORM => linear(vk::Format::BC4_SNORM_BLOCK, p::BC_BLOCK_BYTES_8),
+        p::MTL_FORMAT_BC5_RG_UNORM => linear(vk::Format::BC5_UNORM_BLOCK, p::BC_BLOCK_BYTES_16),
+        p::MTL_FORMAT_BC5_RG_SNORM => linear(vk::Format::BC5_SNORM_BLOCK, p::BC_BLOCK_BYTES_16),
+        p::MTL_FORMAT_BC6H_RGB_FLOAT => {
+            linear(vk::Format::BC6H_SFLOAT_BLOCK, p::BC_BLOCK_BYTES_16)
+        }
+        p::MTL_FORMAT_BC6H_RGB_UFLOAT => {
+            linear(vk::Format::BC6H_UFLOAT_BLOCK, p::BC_BLOCK_BYTES_16)
+        }
+        p::MTL_FORMAT_BC7_RGBA_UNORM => linear(vk::Format::BC7_UNORM_BLOCK, p::BC_BLOCK_BYTES_16),
+        p::MTL_FORMAT_BC7_RGBA_UNORM_SRGB => srgb(
+            vk::Format::BC7_SRGB_BLOCK,
+            vk::Format::BC7_UNORM_BLOCK,
+            p::BC_BLOCK_BYTES_16,
+        ),
         // The packed 32-bit colour family. Each Vulkan spelling is the same
         // word cut the same way as its Metal one — `A2B10G10R10` puts red in
         // the low bits as `RGB10A2Unorm` does, `A2R10G10B10` puts blue there as
@@ -213,6 +255,14 @@ pub fn sampled_pixels(
     mtl: u16,
 ) -> Result<(TexelLayout, Option<TranslateReason>, SwizzlePlan), TranslateReason> {
     let f = translate(mtl)?;
+    // The compressed families answer from the contract rather than from a
+    // `linear_vk` arm here, because `runtime::draw::texture_view` needs the same
+    // answer and cannot reach this module. One mapping, asked twice — see
+    // `pixel_format::block_compressed_layout`. Whether this host can sample it
+    // is a capability the rail carries, not a fact of the translation.
+    if let Some(layout) = pixel_format::block_compressed_layout(mtl) {
+        return Ok((layout, None, pixel_format::swizzle_identity()));
+    }
     // A format whose Metal channels do not sit identically on its Vulkan
     // channels needs a component mapping on the view to sample correctly.
     let layout = match f.linear_vk {
@@ -289,6 +339,20 @@ pub fn vk_texel_layout(layout: TexelLayout) -> vk::Format {
         TexelLayout::Rgb10a2Unorm => vk::Format::A2B10G10R10_UNORM_PACK32,
         TexelLayout::Bgr10a2Unorm => vk::Format::A2R10G10B10_UNORM_PACK32,
         TexelLayout::Rg11b10Float => vk::Format::B10G11R11_UFLOAT_PACK32,
+        // The BC families. Each Metal spelling and its Vulkan counterpart are
+        // the same block layout with the same bytes in the same order, so the
+        // guest's payload is uploaded verbatim — which is why these need no
+        // conversion arm anywhere and are admitted as one family.
+        TexelLayout::Bc1Rgba => vk::Format::BC1_RGBA_UNORM_BLOCK,
+        TexelLayout::Bc2Rgba => vk::Format::BC2_UNORM_BLOCK,
+        TexelLayout::Bc3Rgba => vk::Format::BC3_UNORM_BLOCK,
+        TexelLayout::Bc4RUnorm => vk::Format::BC4_UNORM_BLOCK,
+        TexelLayout::Bc4RSnorm => vk::Format::BC4_SNORM_BLOCK,
+        TexelLayout::Bc5RgUnorm => vk::Format::BC5_UNORM_BLOCK,
+        TexelLayout::Bc5RgSnorm => vk::Format::BC5_SNORM_BLOCK,
+        TexelLayout::Bc6hRgbFloat => vk::Format::BC6H_SFLOAT_BLOCK,
+        TexelLayout::Bc6hRgbUfloat => vk::Format::BC6H_UFLOAT_BLOCK,
+        TexelLayout::Bc7Rgba => vk::Format::BC7_UNORM_BLOCK,
     }
 }
 
@@ -306,6 +370,13 @@ pub fn srgb_texel_layout(layout: TexelLayout) -> Option<vk::Format> {
     match layout {
         TexelLayout::Rgba8 => Some(vk::Format::R8G8B8A8_SRGB),
         TexelLayout::Bgra8 => Some(vk::Format::B8G8R8A8_SRGB),
+        // The four BC families Apple gives an sRGB spelling. BC4/BC5 are
+        // single- and two-channel data rather than colour and BC6H is HDR
+        // float, so none of the three has one on either side of the boundary.
+        TexelLayout::Bc1Rgba => Some(vk::Format::BC1_RGBA_SRGB_BLOCK),
+        TexelLayout::Bc2Rgba => Some(vk::Format::BC2_SRGB_BLOCK),
+        TexelLayout::Bc3Rgba => Some(vk::Format::BC3_SRGB_BLOCK),
+        TexelLayout::Bc7Rgba => Some(vk::Format::BC7_SRGB_BLOCK),
         _ => None,
     }
 }
@@ -384,6 +455,15 @@ pub fn storage_format(format: vk::Format) -> vk::Format {
     match format {
         vk::Format::R8G8B8A8_SRGB => vk::Format::R8G8B8A8_UNORM,
         vk::Format::B8G8R8A8_SRGB => vk::Format::B8G8R8A8_UNORM,
+        // The four BC families with an sRGB spelling. Same rule one storage
+        // shape over: a compressed image's blocks are identical bytes under
+        // either qualifier, so both spellings must resolve to one allocation
+        // and differ only in the view. `the_srgb_spelling_of_a_layout_stores_
+        // that_layout` is what holds this to `srgb_texel_layout`.
+        vk::Format::BC1_RGBA_SRGB_BLOCK => vk::Format::BC1_RGBA_UNORM_BLOCK,
+        vk::Format::BC2_SRGB_BLOCK => vk::Format::BC2_UNORM_BLOCK,
+        vk::Format::BC3_SRGB_BLOCK => vk::Format::BC3_UNORM_BLOCK,
+        vk::Format::BC7_SRGB_BLOCK => vk::Format::BC7_UNORM_BLOCK,
         other => other,
     }
 }
@@ -749,6 +829,30 @@ pub fn resident_color(bgra: bool) -> vk::Format {
 /// know is indistinguishable from a block-compressed one and declines by the
 /// same name. Same argument as [`texel_layout_of`] being a search rather than a
 /// second `match`.
+/// The storage **block** grid of a Vulkan format, for the formats this table can
+/// produce.
+///
+/// [`bytes_per_texel`] with the grid stated, and derived from the same
+/// [`texel_layout_of`] search so the two cannot disagree. A caller sizing a
+/// linear buffer for an image must ask this rather than `bytes_per_texel`:
+/// multiplying a block byte count by width and height over-counts a compressed
+/// image by sixteen, which is a refusal against the guest's own correctly-sized
+/// buffer rather than a wrong image.
+///
+/// sRGB spellings fold through [`storage_format`] onto the allocation they share
+/// with their linear sibling. That fold is what covers the four `BC*_SRGB_BLOCK`
+/// formats, which a sampled bind of an sRGB compressed texture is created as.
+pub fn vk_block_geometry(format: vk::Format) -> Option<pixel_format::BlockGeometry> {
+    if let Some(layout) = texel_layout_of(storage_format(format)) {
+        return Some(layout.block());
+    }
+    Some(pixel_format::BlockGeometry {
+        width: 1,
+        height: 1,
+        bytes: bytes_per_texel(format)?,
+    })
+}
+
 pub fn bytes_per_texel(format: vk::Format) -> Option<u32> {
     if let Some(layout) = texel_layout_of(format) {
         return Some(layout.bytes_per_texel());
@@ -1026,6 +1130,21 @@ mod tests {
     ///   pinning that. Admitting it silently here would break the symmetry the
     ///   crate relies on, so it waits for the rail to gain a warning channel.
     ///
+    /// - The **BC block-compressed families** cannot cross this rail at all,
+    ///   and that is structural rather than pending a channel. A
+    ///   [`StorageImageFormat`] is what a compute *storage* binding is created
+    ///   as, and Vulkan has no block-compressed storage-image format — a shader
+    ///   cannot write a block. The compute rail routes its sampled textures
+    ///   through that same selector, so a compressed texture sampled inside a
+    ///   dispatch is refused by name. Giving it a rail of its own means a
+    ///   compute sampled path that does not go through the storage selector,
+    ///   which is a change to that rail and not to this table.
+    ///
+    ///   Measured on the workload that brought the family in: Asphalt 8 samples
+    ///   its BC3 textures from **fragment** shaders only, so this refusal cost
+    ///   nothing there. A guest that samples one in a dispatch loses that
+    ///   dispatch's texture and says so.
+    ///
     /// The converse is deliberately not asserted: this rail carries the integer
     /// and packed formats a compute shader reads and [`sampled_pixels`] has no
     /// [`TexelLayout`] for, because that one answers a CPU-upload byte order and
@@ -1036,6 +1155,23 @@ mod tests {
             (p::MTL_FORMAT_A8_UNORM, "needs a component mapping"),
             (p::MTL_FORMAT_RGBA8_UNORM_SRGB, "would downgrade unrecorded"),
             (p::MTL_FORMAT_BGRA8_UNORM_SRGB, "would downgrade unrecorded"),
+            (p::MTL_FORMAT_BC1_RGBA, "no block-compressed storage image exists"),
+            (p::MTL_FORMAT_BC1_RGBA_SRGB, "no block-compressed storage image exists"),
+            (p::MTL_FORMAT_BC2_RGBA, "no block-compressed storage image exists"),
+            (p::MTL_FORMAT_BC2_RGBA_SRGB, "no block-compressed storage image exists"),
+            (p::MTL_FORMAT_BC3_RGBA, "no block-compressed storage image exists"),
+            (p::MTL_FORMAT_BC3_RGBA_SRGB, "no block-compressed storage image exists"),
+            (p::MTL_FORMAT_BC4_R_UNORM, "no block-compressed storage image exists"),
+            (p::MTL_FORMAT_BC4_R_SNORM, "no block-compressed storage image exists"),
+            (p::MTL_FORMAT_BC5_RG_UNORM, "no block-compressed storage image exists"),
+            (p::MTL_FORMAT_BC5_RG_SNORM, "no block-compressed storage image exists"),
+            (p::MTL_FORMAT_BC6H_RGB_FLOAT, "no block-compressed storage image exists"),
+            (p::MTL_FORMAT_BC6H_RGB_UFLOAT, "no block-compressed storage image exists"),
+            (p::MTL_FORMAT_BC7_RGBA_UNORM, "no block-compressed storage image exists"),
+            (
+                p::MTL_FORMAT_BC7_RGBA_UNORM_SRGB,
+                "no block-compressed storage image exists",
+            ),
         ];
 
         let mut refused = Vec::new();
@@ -1233,6 +1369,94 @@ mod tests {
             4,
             TransferFunction::Linear,
         ),
+        // The BC families. The width column is bytes per 4x4 **block** for
+        // these, which is what `pixel_format::block_geometry` says and what the
+        // sampled rail sizes rows and images from; the uncompressed rows above
+        // are the same field with a 1x1 block.
+        (
+            p::MTL_FORMAT_BC1_RGBA,
+            vk::Format::BC1_RGBA_UNORM_BLOCK,
+            p::BC_BLOCK_BYTES_8,
+            TransferFunction::Linear,
+        ),
+        (
+            p::MTL_FORMAT_BC1_RGBA_SRGB,
+            vk::Format::BC1_RGBA_SRGB_BLOCK,
+            p::BC_BLOCK_BYTES_8,
+            TransferFunction::Srgb,
+        ),
+        (
+            p::MTL_FORMAT_BC2_RGBA,
+            vk::Format::BC2_UNORM_BLOCK,
+            p::BC_BLOCK_BYTES_16,
+            TransferFunction::Linear,
+        ),
+        (
+            p::MTL_FORMAT_BC2_RGBA_SRGB,
+            vk::Format::BC2_SRGB_BLOCK,
+            p::BC_BLOCK_BYTES_16,
+            TransferFunction::Srgb,
+        ),
+        (
+            p::MTL_FORMAT_BC3_RGBA,
+            vk::Format::BC3_UNORM_BLOCK,
+            p::BC_BLOCK_BYTES_16,
+            TransferFunction::Linear,
+        ),
+        (
+            p::MTL_FORMAT_BC3_RGBA_SRGB,
+            vk::Format::BC3_SRGB_BLOCK,
+            p::BC_BLOCK_BYTES_16,
+            TransferFunction::Srgb,
+        ),
+        (
+            p::MTL_FORMAT_BC4_R_UNORM,
+            vk::Format::BC4_UNORM_BLOCK,
+            p::BC_BLOCK_BYTES_8,
+            TransferFunction::Linear,
+        ),
+        (
+            p::MTL_FORMAT_BC4_R_SNORM,
+            vk::Format::BC4_SNORM_BLOCK,
+            p::BC_BLOCK_BYTES_8,
+            TransferFunction::Linear,
+        ),
+        (
+            p::MTL_FORMAT_BC5_RG_UNORM,
+            vk::Format::BC5_UNORM_BLOCK,
+            p::BC_BLOCK_BYTES_16,
+            TransferFunction::Linear,
+        ),
+        (
+            p::MTL_FORMAT_BC5_RG_SNORM,
+            vk::Format::BC5_SNORM_BLOCK,
+            p::BC_BLOCK_BYTES_16,
+            TransferFunction::Linear,
+        ),
+        (
+            p::MTL_FORMAT_BC6H_RGB_FLOAT,
+            vk::Format::BC6H_SFLOAT_BLOCK,
+            p::BC_BLOCK_BYTES_16,
+            TransferFunction::Linear,
+        ),
+        (
+            p::MTL_FORMAT_BC6H_RGB_UFLOAT,
+            vk::Format::BC6H_UFLOAT_BLOCK,
+            p::BC_BLOCK_BYTES_16,
+            TransferFunction::Linear,
+        ),
+        (
+            p::MTL_FORMAT_BC7_RGBA_UNORM,
+            vk::Format::BC7_UNORM_BLOCK,
+            p::BC_BLOCK_BYTES_16,
+            TransferFunction::Linear,
+        ),
+        (
+            p::MTL_FORMAT_BC7_RGBA_UNORM_SRGB,
+            vk::Format::BC7_SRGB_BLOCK,
+            p::BC_BLOCK_BYTES_16,
+            TransferFunction::Srgb,
+        ),
         (
             p::MTL_FORMAT_R16_UNORM,
             vk::Format::R16_UNORM,
@@ -1334,12 +1558,19 @@ mod tests {
     /// The texel size this module reports is the decode contract's, not a
     /// second opinion — the drift `byte_size`-beside-`vk_format` was written to
     /// prevent.
+    ///
+    /// Compared against the contract's **block** size rather than its
+    /// bytes-per-texel. For every uncompressed format those are the same number
+    /// — the block is 1x1 — and for the BC families only the block form exists,
+    /// because a BC1 texel is half a byte and `bytes_per_pixel` says `None` on
+    /// purpose. So this is the stronger reading of the same invariant, not a
+    /// weakened one.
     #[test]
     fn texel_size_agrees_with_the_decode_contract() {
         for (mtl, _, _, _) in EXPECTED {
             assert_eq!(
                 Some(translate(*mtl).unwrap().bytes_per_texel),
-                pixel_format::bytes_per_pixel(*mtl),
+                pixel_format::block_geometry(*mtl).map(|block| block.bytes),
                 "MTL {mtl:#x}"
             );
         }
@@ -1917,6 +2148,27 @@ mod tests {
                 p::MTL_FORMAT_RGB10A2_UNORM,
                 p::MTL_FORMAT_RG11B10_FLOAT,
                 p::MTL_FORMAT_BGR10A2_UNORM,
+                // The BC block-compressed families, in `EXPECTED`'s order.
+                // Named unconditionally here because `sampled_pixels` is a
+                // decode fact: whether this host can sample one is
+                // `engine::supports_block_compressed_sampled`, which the rail
+                // carries in `NativeUploads::block_compressed`. A host without
+                // the feature refuses the bind by name — it does not make the
+                // format untranslatable.
+                p::MTL_FORMAT_BC1_RGBA,
+                p::MTL_FORMAT_BC1_RGBA_SRGB,
+                p::MTL_FORMAT_BC2_RGBA,
+                p::MTL_FORMAT_BC2_RGBA_SRGB,
+                p::MTL_FORMAT_BC3_RGBA,
+                p::MTL_FORMAT_BC3_RGBA_SRGB,
+                p::MTL_FORMAT_BC4_R_UNORM,
+                p::MTL_FORMAT_BC4_R_SNORM,
+                p::MTL_FORMAT_BC5_RG_UNORM,
+                p::MTL_FORMAT_BC5_RG_SNORM,
+                p::MTL_FORMAT_BC6H_RGB_FLOAT,
+                p::MTL_FORMAT_BC6H_RGB_UFLOAT,
+                p::MTL_FORMAT_BC7_RGBA_UNORM,
+                p::MTL_FORMAT_BC7_RGBA_UNORM_SRGB,
                 // The ten-bit biplanar video planes and the four-channel
                 // sixteen-bit unorm. These three were carried by `translate`
                 // and by the layout table but were absent from `EXPECTED`, so
@@ -1956,6 +2208,19 @@ mod tests {
                 p::MTL_FORMAT_RGBA8_UNORM_SRGB,
                 p::MTL_FORMAT_BGRA8_UNORM,
                 p::MTL_FORMAT_BGRA8_UNORM_SRGB,
+                // The first packed 32-bit colour attachment, and the first one
+                // admitted for a *game* rather than for the window server. An
+                // `'l10r'` IOSurface — `kCVPixelFormatType_ARGB2101010LEPacked`
+                // — is what Asphalt 8 renders into on a macos-13 x86/Vulkan
+                // boot, and every draw of it failed at
+                // `draw::render_target`'s `rt_type4_base_format` until the
+                // FourCC and `render_target_bpp` both named it.
+                //
+                // Unlike every other member here this one is not a format
+                // Vulkan mandates for `COLOR_ATTACHMENT_BIT`, so a host may
+                // decline it and this rail is where that decline appears. The
+                // NVIDIA host it was measured on advertises it.
+                p::MTL_FORMAT_BGR10A2_UNORM,
                 // Admitted since the two arms became one answer. The contract
                 // has said a half-float render target is renderable since one
                 // could be created at that format; only this side still refused

@@ -1361,14 +1361,25 @@ pub(crate) fn load_render_pipeline<M: HostMemory + HostOps>(
                 return None;
             }
         };
-    let Ok(p) = decode_render_pipeline_descriptor(&desc) else {
-        report.reason(
-            task_id,
-            pipeline_ref,
-            crate::observe::ladder_slug!("", desc_decode),
-            &format!("desc_len={}", desc.len()),
-        );
-        return None;
+    let p = match decode_render_pipeline_descriptor(&desc) {
+        Ok(p) => p,
+        Err(status) => {
+            // The decoder's own name for what it refused, carried through rather
+            // than collapsed into `desc_decode`. Without it this line said only
+            // that a 292-byte descriptor did not decode, and finding out *why*
+            // meant correlating its `t=` against an `OFF type7_pipeline_shape`
+            // line in the same millisecond — which is how the alpha-test and
+            // logic-op tags were found and is not a step the next reader should
+            // have to repeat.
+            use crate::observe::Decline;
+            report.reason(
+                task_id,
+                pipeline_ref,
+                crate::observe::ladder_slug!("", desc_decode),
+                &format!("desc_len={} decode={}", desc.len(), status.slug()),
+            );
+            return None;
+        }
     };
     // Both stages are required to build a pipeline, and the two are reported
     // apart because they are different guest mistakes — the compute sibling

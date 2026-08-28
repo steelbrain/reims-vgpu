@@ -1358,6 +1358,73 @@ fn type8_level_base_on_type11_rejected() {
     );
 }
 
+/// A compressed level's byte arithmetic is in blocks, in both axes.
+///
+/// The regression this pins is 448 refused copies on one driven Asphalt 8 leg:
+/// `blit_fail reason=tex_bad_bpp kind=Copy` between two BC3 textures, because
+/// the whole blit path asked `bytes_per_pixel` and a BC format has none. Now the
+/// backing carries its storage grid, and `exec_copy_texture_to_texture` converts
+/// the command's coordinates into block space once so every per-unit helper
+/// below it is correct unchanged.
+///
+/// Both halves are asserted because each fails differently. A wrong
+/// `bytes_per_image` strides an array slice or a `z` plane past its own image; a
+/// wrong `texel_offset` reads the right number of bytes from the wrong place.
+#[test]
+fn a_compressed_level_addresses_blocks_in_both_axes() {
+    use crate::contract::pixel_format::{self as pf, BlockGeometry};
+    // A 64x64 BC3 level as a guest sends it: 16 block columns of 16 bytes, and
+    // 16 block rows, so one image is 4096 bytes and not 16384.
+    let bc3 = LinearTextureLevel {
+        base_gva: 0,
+        alloc_size: 4096,
+        level_offset: 0,
+        row_stride: 256,
+        slice_stride: 4096,
+        slice_index: 0,
+        width: 64,
+        height: 64,
+        depth: 1,
+        bpp: pf::BC_BLOCK_BYTES_16,
+        block: pf::block_geometry(pf::MTL_FORMAT_BC3_RGBA).expect("bc3 has a grid"),
+        pixel_format: pf::MTL_FORMAT_BC3_RGBA,
+    };
+    assert_eq!(bc3.block, BlockGeometry { width: 4, height: 4, bytes: 16 });
+    assert_eq!(
+        bc3.bytes_per_image(),
+        Some(4096),
+        "16 block rows of 256 bytes — the texel form would say 16384 and stride \
+         a slice four times past its own image"
+    );
+    // Block coordinates, which is what the copy hands it: block (3, 2) starts at
+    // row 2 of blocks and column 3, i.e. 2*256 + 3*16.
+    assert_eq!(bc3.texel_offset(3, 2, 0), Some(2 * 256 + 3 * 16));
+    // The last block of the level is the last 16 bytes of the allocation, so the
+    // grid and the allocation agree exactly — a level that did not would be
+    // refused against `alloc_size` downstream.
+    assert_eq!(bc3.texel_offset(15, 15, 0), Some(4096 - 16));
+
+    // An uncompressed level is untouched by any of it: a 1x1 block whose bytes
+    // are the bytes-per-texel gives back the products this always computed.
+    let rgba = LinearTextureLevel {
+        base_gva: 0,
+        alloc_size: 0x1000,
+        level_offset: 0,
+        row_stride: 256,
+        slice_stride: 0,
+        slice_index: 0,
+        width: 64,
+        height: 4,
+        depth: 1,
+        bpp: 4,
+        block: pf::block_geometry(MTL_FORMAT_RGBA8_UNORM).expect("rgba8 has a grid"),
+        pixel_format: MTL_FORMAT_RGBA8_UNORM,
+    };
+    assert_eq!(rgba.block, BlockGeometry { width: 1, height: 1, bytes: 4 });
+    assert_eq!(rgba.bytes_per_image(), Some(256 * 4));
+    assert_eq!(rgba.texel_offset(3, 2, 0), Some(2 * 256 + 3 * 4));
+}
+
 #[test]
 fn texel_offset_math() {
     let t = LinearTextureLevel {
@@ -1371,6 +1438,11 @@ fn texel_offset_math() {
         height: 4,
         depth: 1,
         bpp: 4,
+        block: crate::contract::pixel_format::BlockGeometry {
+            width: 1,
+            height: 1,
+            bytes: 4,
+        },
         pixel_format: MTL_FORMAT_RGBA8_UNORM,
     };
     // (x=1,y=2) → 0x100 + 2*16 + 1*4 = 0x124
@@ -1413,6 +1485,11 @@ fn an_unmeasurable_copy_region_refuses_rather_than_writing_unbounded() {
         height: 1,
         depth: 1,
         bpp: 4,
+        block: crate::contract::pixel_format::BlockGeometry {
+            width: 1,
+            height: 1,
+            bytes: 4,
+        },
         pixel_format: MTL_FORMAT_RGBA8_UNORM,
     };
 

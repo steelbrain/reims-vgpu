@@ -342,8 +342,23 @@ impl TextureLevelLayout {
     /// `None` for zero height (no rows) or on overflow. A bound this feeds must
     /// treat `None` as a refusal, never as "no limit".
     pub fn read_span(&self, tight_row: u32) -> Option<u64> {
-        self.height
-            .checked_sub(1)
+        self.read_span_rows(self.height, tight_row)
+    }
+
+    /// [`Self::read_span`] over a caller-supplied row count.
+    ///
+    /// The row count is a parameter because a **block-compressed** level has
+    /// fewer rows of storage than it has rows of texels: a 64x64 BC3 level is
+    /// sixteen 256-byte rows, not sixty-four. `contract::pixel_format::
+    /// tight_row_count` is what a caller passes, and it answers `height` for
+    /// every uncompressed format — so `read_span` above is this with the count
+    /// it always used.
+    ///
+    /// Deriving the count here instead would need this type to know the pixel
+    /// format, which it deliberately does not: a `TextureLevelLayout` is
+    /// geometry, and the format lives on the descriptor that owns it.
+    pub fn read_span_rows(&self, rows: u32, tight_row: u32) -> Option<u64> {
+        rows.checked_sub(1)
             .map(u64::from)?
             .checked_mul(self.row_stride)?
             .checked_add(u64::from(tight_row))
@@ -392,10 +407,20 @@ impl TextureLevelLayout {
     /// receiver holds, travelling as a loose argument that a second caller could
     /// get wrong with nothing to notice.
     pub fn slice_read_span(&self, tight_row: u32) -> Option<u64> {
+        self.slice_read_span_rows(self.height, tight_row)
+    }
+
+    /// [`Self::slice_read_span`] over a caller-supplied row count, for
+    /// [`Self::read_span_rows`]'s reason.
+    ///
+    /// BC compresses in two dimensions only, so each depth plane of a
+    /// compressed level is its own `rows`-tall block grid and the planes stack
+    /// exactly as they do uncompressed.
+    pub fn slice_read_span_rows(&self, rows: u32, tight_row: u32) -> Option<u64> {
         u64::from(self.planes() - 1)
             .checked_mul(self.row_stride)?
-            .checked_mul(u64::from(self.height))?
-            .checked_add(self.read_span(tight_row)?)
+            .checked_mul(u64::from(rows))?
+            .checked_add(self.read_span_rows(rows, tight_row)?)
     }
 }
 
@@ -504,7 +529,35 @@ impl TextureDescriptor {
 
 /// Texture descriptor field offsets (geometry prefix + format trailer).
 pub const TEXTURE_DESC_GEOMETRY_LEN: usize = 68;
+/// Offset of the mip-level count, which is **one byte wide**.
+///
+/// This was read as a `u16` and the byte above it is a field of its own. The
+/// descriptor's own length is what settles it, and it settles it exactly. A
+/// multi-mip body is `TEXTURE_DESC_BASE_LEN + (levels - 1) *
+/// TEXTURE_DESC_MIP_LEVEL_RECORD_LEN` bytes long, and on a driven macos-13
+/// x86/Vulkan boot running Asphalt 8 four distinct descriptors read the `u16`
+/// as `0x8001`, `0x8007`, `0x800a` and `0x800b` with body lengths 116, 332, 440
+/// and 476. Taking the low byte as the count reproduces all four lengths to the
+/// byte — 116, 116+6*36, 116+9*36, 116+10*36 — and no other reading of the field
+/// does.
+///
+/// What the byte above it means is **not** decided here and is not guessed: it
+/// read `0x80` on every one of those four and zero on every descriptor the
+/// desktop workload produces, which is why reading the pair as one count
+/// survived until a game set it. `decode_texture_descriptor` reports a non-zero
+/// one by name so the next session has the value rather than an absence.
+///
+/// Reading the pair cost the game every mipmapped texture it bound: a declared
+/// count of 32 779 put the format trailer 1 180 094 bytes into a 476-byte body,
+/// so `texture_desc_format_unreachable` fired, the descriptor carried no pixel
+/// format, and the fragment bind refused with
+/// `draw_prepare_texture_resolve_missing`.
 pub const TEXTURE_DESC_MIPMAP_LEVEL_COUNT: usize = 12;
+/// The byte above the mip-level count: a field this device does not decode.
+///
+/// Named so the read site is not an unexplained `+ 1`. See
+/// [`TEXTURE_DESC_MIPMAP_LEVEL_COUNT`] for why the two are separate fields.
+pub const TEXTURE_DESC_MIP_FIELD_UNDECODED: usize = TEXTURE_DESC_MIPMAP_LEVEL_COUNT + 1;
 pub const TEXTURE_DESC_DATA_OFFSET: usize = 16;
 pub const TEXTURE_DESC_BYTES_PER_ELEMENT: usize = 35;
 pub const TEXTURE_DESC_USED_SIZE: usize = 44;
@@ -1261,6 +1314,35 @@ pub const PIPELINE_TAG_TESSELLATION_OUTPUT_WINDING_ORDER: u8 = 0x12;
 /// policy choice: a pipeline built at any other count would not be compatible
 /// with the pass it is used in.
 pub const DEFAULT_RASTER_SAMPLE_COUNT: u32 = 1;
+/// `alphaTestEnabled` on Metal's internal render-pipeline descriptor.
+///
+/// One of the fixed-function fields Metal still carries from the OpenGL era.
+/// They live in `MTLRenderPipelineDescriptorPrivate`'s `miscHash` bitfield
+/// — `alphaTestFunc b3` next to `alphaTestEnabled b1`, and `logicOp b4` next to
+/// `logicOpEnabled b1` — reachable only through private setters on
+/// `MTLRenderPipelineDescriptorInternal`, which is why no workload built out of
+/// the public API had ever produced them here.
+///
+/// **This tag is deliberately neither consumed nor benign, so a pipeline
+/// carrying it is refused.** Its companion
+/// [`PIPELINE_TAG_ALPHA_TEST_FUNCTION`] *is* benign, and the pairing is the
+/// whole argument: a compare function with the test off changes nothing, while
+/// the test being *on* is a per-fragment discard this device does not implement.
+/// Dropping the enable would render every alpha-tested fragment that the guest
+/// asked to be discarded.
+pub const PIPELINE_TAG_ALPHA_TEST_ENABLED: u8 = 0x2d;
+/// `alphaTestFunction`, an `MTLCompareFunction`. Inert unless
+/// [`PIPELINE_TAG_ALPHA_TEST_ENABLED`] is present; see
+/// [`RENDER_PIPELINE_TAGS_BENIGN`].
+pub const PIPELINE_TAG_ALPHA_TEST_FUNCTION: u8 = 0x2e;
+/// `logicOperationEnabled`. Refused for [`PIPELINE_TAG_ALPHA_TEST_ENABLED`]'s
+/// reason one field over: a logic op is a fixed-function blend replacement this
+/// device does not implement, and dropping the enable would composite with the
+/// ordinary blend the guest asked to be replaced.
+pub const PIPELINE_TAG_LOGIC_OP_ENABLED: u8 = 0x2f;
+/// `logicOperation`, the op a
+/// [`PIPELINE_TAG_LOGIC_OP_ENABLED`] pipeline would apply. Inert without it.
+pub const PIPELINE_TAG_LOGIC_OP: u8 = 0x37;
 /// Mesh SPI section offset (analog of classic [`PIPELINE_TAG_COLOR_ATTACH_OFFSET`]).
 ///
 /// Live host Metal `-[_MTLDevice serializeMeshRenderPipelineDescriptor:]`
@@ -1762,8 +1844,27 @@ pub fn decode_texture_descriptor(bytes: &[u8]) -> Result<TextureDescriptor, Deco
         handle: ld32(&bytes[LINEAR_DESC_HANDLE..]),
         ..Default::default()
     };
-    if bytes.len() >= TEXTURE_DESC_MIPMAP_LEVEL_COUNT + 2 {
-        out.mipmap_level_count = ld16(&bytes[TEXTURE_DESC_MIPMAP_LEVEL_COUNT..]) as u32;
+    if bytes.len() > TEXTURE_DESC_MIPMAP_LEVEL_COUNT {
+        out.mipmap_level_count = u32::from(bytes[TEXTURE_DESC_MIPMAP_LEVEL_COUNT]);
+    }
+    // The field above the count is not part of it. Reported once per distinct
+    // value rather than interpreted, because nothing here knows what it means
+    // and a guess at it would be a rule the guest never agreed to.
+    let undecoded = bytes
+        .get(TEXTURE_DESC_MIP_FIELD_UNDECODED)
+        .copied()
+        .unwrap_or(0);
+    if undecoded != 0
+        && crate::observe::first_sight(
+            "texture_desc_mip_field_undecoded",
+            u64::from(undecoded),
+        )
+    {
+        crate::observe::fail(format!(
+            "texture_desc_mip_field_undecoded value={undecoded:#04x}              levels={} len={} (the byte above the mip-level count carries              something this device does not decode; the count is the low byte              and the body length confirms it)",
+            out.mipmap_level_count,
+            bytes.len()
+        ));
     }
     if bytes.len() >= TEXTURE_DESC_DATA_OFFSET + 4 {
         out.data_offset = ld32(&bytes[TEXTURE_DESC_DATA_OFFSET..]);
@@ -2378,10 +2479,27 @@ pub const PIPELINE_TAG_COMPUTE_STAGE_INPUT_OFFSET: u8 = 0x03;
 /// must refuse rather than be waved through. The third,
 /// [`PIPELINE_TAG_RASTER_SAMPLE_COUNT`], is now read — it is consumed on both
 /// shapes and carried to the backend render-pass and pipeline keys.
-const RENDER_PIPELINE_TAGS_BENIGN: [u8; 3] = [
+const RENDER_PIPELINE_TAGS_BENIGN: [u8; 5] = [
     RENDER_PIPELINE_TAG_LABEL,
     PIPELINE_TAG_DEPTH_ATTACH_FORMAT,
     PIPELINE_TAG_STENCIL_ATTACH_FORMAT,
+    // The two legacy fixed-function *values* whose enables stay refused. See
+    // the reading under `note_pipeline_tlv_fields` for what measured them and
+    // `PIPELINE_TAG_ALPHA_TEST_ENABLED` for why the pairing is what licenses
+    // this.
+    PIPELINE_TAG_ALPHA_TEST_FUNCTION,
+    PIPELINE_TAG_LOGIC_OP,
+];
+/// The enables that make the two benign members above load-bearing.
+///
+/// Not a list this decoder reads — it is here so the pairing is expressible, and
+/// so `an_alpha_test_or_logic_op_enable_is_still_refused` can assert it rather
+/// than restate two hex numbers. A tag in here must never join
+/// [`RENDER_PIPELINE_TAGS_BENIGN`].
+#[cfg(test)]
+const RENDER_PIPELINE_TAGS_STILL_REFUSED: [u8; 2] = [
+    PIPELINE_TAG_ALPHA_TEST_ENABLED,
+    PIPELINE_TAG_LOGIC_OP_ENABLED,
 ];
 /// The compute half of [`RENDER_PIPELINE_TAGS_BENIGN`]; same rule, and listed
 /// apart for the same reason `COMPUTE_PIPELINE_TAGS_CONSUMED` is.
@@ -2498,6 +2616,76 @@ const COMPUTE_PIPELINE_TAGS_BENIGN: [u8; 2] = [
 /// identified: see [`PIPELINE_TAG_RASTER_SAMPLE_COUNT`],
 /// [`PIPELINE_TAG_DEPTH_ATTACH_FORMAT`] and
 /// [`PIPELINE_TAG_STENCIL_ATTACH_FORMAT`].
+///
+/// # A game fired it twice, and the tags were named by driving the serializer
+///
+/// A macos-13 x86/Vulkan boot running Asphalt 8 produced one shape this list had
+/// never seen, and three pipeline refs carrying it were refused on every draw
+/// that used them — 1 348 `draw_load_pipeline reason=desc_decode` and 8 604
+/// `draw_fail_clear_fallback` in one capture, which is the game's canvas black
+/// while its window chrome composited:
+///
+/// ```text
+/// kind=render nfields=7 tags=[03:4,08:4,09:4*,2e:4*!,37:4*!,01:4,02:4]
+///                                          unconsumed=3 unknown=2
+/// ```
+///
+/// The two were identified the way this file's other layouts were — by
+/// perturbation against Apple's own serializer, not by reading ordinals. In the
+/// guest, `-[_MTLDevice serializeRenderPipelineDescriptor:]` returns this exact
+/// compact-TLV block (its `NSData` **starts** at the `fieldCount` byte; the
+/// 16-byte type-7 header this decoder reads is added by the transport). Build a
+/// baseline descriptor, set exactly one property through the runtime, serialize,
+/// and the tag that appears is that property's. Fifty-odd scalar setters on
+/// `MTLRenderPipelineDescriptor` and `MTLRenderPipelineDescriptorInternal`, one
+/// `fork` per probe so an assertion inside Metal costs one line:
+///
+/// ```text
+/// 0x00 label            0x0b inputPrimitiveTopology  0x2d alphaTestEnabled
+/// 0x01 vertexFunction   0x0c tessellationPartitionMode
+/// 0x02 fragmentFunction 0x0d maxTessellationFactor   0x2e alphaTestFunction
+/// 0x03 vertexDescriptor 0x0e tessellationFactorScaleEnabled
+/// 0x04 rasterSampleCount (also sampleCount)          0x2f logicOperationEnabled
+/// 0x05 alphaToCoverageEnabled  0x11 tessellationFactorStepFunction
+/// 0x06 alphaToOneEnabled       0x19 supportIndirectCommandBuffers
+/// 0x07 rasterizationEnabled    0x1a maxVertexAmplificationCount
+/// 0x08 colorAttachments offset 0x1b sampleCoverage   0x30 clipDistanceEnableMask
+/// 0x09 depthAttachmentPixelFormat  0x1c sampleMask   0x31 pointSmoothEnabled
+/// 0x0a stencilAttachmentPixelFormat 0x1e textureWriteRoundingMode
+/// 0x32 pointCoordLowerLeft  0x33 pointSizeOutputVS   0x34 twoSideEnabled
+/// 0x35 vertexDepthCompareClampMask  0x36 fragmentDepthCompareClampMask
+/// 0x37 logicOperation       0x38 depthStencilWriteDisabled
+/// 0x39 needsCustomBorderColorSamplers  0x3a explicitVisibilityGroupID
+/// ```
+///
+/// Only the four this commit acts on are declared as constants; the rest are
+/// recorded here because the sweep is cheap to re-run and expensive to
+/// rediscover. Everything from `0x2d` up is a private setter on the internal
+/// class, which is why a workload built on the public API never emits one — and
+/// the block is Metal's fixed-function inheritance: alpha test, logic op, point
+/// size and smoothing, two-sided lighting, clip-distance masks.
+///
+/// # Why the two values are benign and their two enables are not
+///
+/// The bitfield pairs each of these with an enable — `alphaTestFunc b3` beside
+/// `alphaTestEnabled b1`, `logicOp b4` beside `logicOpEnabled b1` — and a
+/// property left at its Metal default is omitted from this block rather than
+/// sent as a zero. That is measured, not assumed: the baseline descriptor emits
+/// **one** tag, and each of the fifty perturbations added exactly one. A fresh
+/// descriptor reads `isAlphaTestEnabled = 0` and `isLogicOperationEnabled = 0`.
+///
+/// The game's shape carries `0x2e` and `0x37` and **neither** `0x2d` nor
+/// `0x2f`. So both features are off, and a compare function and a logic op that
+/// nothing applies cannot change a pixel. Its `alphaTestFunction` was `7`,
+/// which is `MTLCompareFunctionAlways` — the value that discards nothing even
+/// were the test on.
+///
+/// The enables stay unnamed in both lists, which is the load-bearing half of
+/// this change: an alpha test that is *on* is a per-fragment discard this device
+/// does not implement, and a logic op that is on replaces blending. A pipeline
+/// asking for either is still refused by name, which is the right answer to a
+/// request that cannot be represented. `RENDER_PIPELINE_TAGS_STILL_REFUSED`
+/// holds them so that pairing is a test rather than a paragraph.
 ///
 /// Deduped per distinct `(tag, len)` rather than per value: what a reader needs
 /// first is which properties arrive, and a per-value latch on a field like a
