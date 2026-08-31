@@ -599,6 +599,14 @@ pub(crate) struct WindowPresenter {
     /// They have opposite fixes, and one `busy` count cannot tell them apart.
     cadence_busy_fence: u64,
     cadence_busy_acquire: u64,
+    /// Guest-cursor overlay (opt-in via `REIMS_VGPU_CURSOR`). The per-image color
+    /// views and framebuffers are rebuilt on every swapchain recreation; the
+    /// pipeline/texture in `cursor_gpu` persist unless the surface format changes.
+    cursor_enabled: bool,
+    color_format: vk::Format,
+    image_views: Vec<vk::ImageView>,
+    framebuffers: Vec<vk::Framebuffer>,
+    cursor_gpu: Option<CursorGpu>,
 }
 
 /// Everything one in-flight present owns for as long as its blit is running.
@@ -853,6 +861,11 @@ impl WindowPresenter {
             cadence_last_offered: None,
             cadence_busy_fence: 0,
             cadence_busy_acquire: 0,
+            cursor_enabled: std::env::var_os("REIMS_VGPU_CURSOR").is_some(),
+            color_format: vk::Format::UNDEFINED,
+            image_views: Vec::new(),
+            framebuffers: Vec::new(),
+            cursor_gpu: None,
         };
         if let Err(error) = presenter.recreate_swapchain(ctx) {
             presenter.destroy(ctx, None);
@@ -934,6 +947,56 @@ impl WindowPresenter {
         }
     }
 
+    /// Create the cursor overlay's per-swapchain-image color views and
+    /// framebuffers. No-op when the overlay pipeline is absent.
+    unsafe fn build_overlay_targets(&mut self, ctx: &DeviceContext) -> Result<(), vk::Result> {
+        let Some(gpu) = self.cursor_gpu.as_ref() else {
+            return Ok(());
+        };
+        let render_pass = gpu.render_pass;
+        let mut views = Vec::with_capacity(self.images.len());
+        let mut framebuffers = Vec::with_capacity(self.images.len());
+        for &image in &self.images {
+            let view = ctx.device.create_image_view(
+                &vk::ImageViewCreateInfo::default()
+                    .image(image)
+                    .view_type(vk::ImageViewType::TYPE_2D)
+                    .format(self.color_format)
+                    .subresource_range(
+                        vk::ImageSubresourceRange::default()
+                            .aspect_mask(vk::ImageAspectFlags::COLOR)
+                            .level_count(1)
+                            .layer_count(1),
+                    ),
+                None,
+            )?;
+            let attachments = [view];
+            let framebuffer = ctx.device.create_framebuffer(
+                &vk::FramebufferCreateInfo::default()
+                    .render_pass(render_pass)
+                    .attachments(&attachments)
+                    .width(self.extent.width)
+                    .height(self.extent.height)
+                    .layers(1),
+                None,
+            )?;
+            views.push(view);
+            framebuffers.push(framebuffer);
+        }
+        self.image_views = views;
+        self.framebuffers = framebuffers;
+        Ok(())
+    }
+
+    unsafe fn destroy_overlay_targets(&mut self, ctx: &DeviceContext) {
+        for framebuffer in self.framebuffers.drain(..) {
+            ctx.device.destroy_framebuffer(framebuffer, None);
+        }
+        for view in self.image_views.drain(..) {
+            ctx.device.destroy_image_view(view, None);
+        }
+    }
+
     unsafe fn recreate_swapchain(&mut self, ctx: &DeviceContext) -> Result<(), DrawError> {
         ctx.queue_wait_idle()
             .map_err(|error| DrawError::VkCall(VkCall::new(VkOp::WindowQueueWaitIdle, error)))?;
@@ -949,6 +1012,26 @@ impl WindowPresenter {
                 super::reason::DrawReason::SwapchainLacksTransferDst,
             ));
         }
+        // The cursor overlay renders into the swapchain image, so it needs it
+        // usable as a color attachment. If the surface can't offer that, disable
+        // the overlay for this session rather than failing the present rail.
+        let mut image_usage = vk::ImageUsageFlags::TRANSFER_DST;
+        if self.cursor_enabled {
+            if caps
+                .supported_usage_flags
+                .contains(vk::ImageUsageFlags::COLOR_ATTACHMENT)
+            {
+                image_usage |= vk::ImageUsageFlags::COLOR_ATTACHMENT;
+            } else {
+                crate::observe::off(
+                    "host_window_cursor status=disabled reason=no_color_attachment_usage",
+                );
+                self.cursor_enabled = false;
+            }
+        }
+        // Old overlay views/framebuffers reference the outgoing swapchain images;
+        // the queue idled above, so release them before the images are replaced.
+        self.destroy_overlay_targets(ctx);
         let formats = self
             .surface_loader
             .get_physical_device_surface_formats(ctx.pd, self.surface)
@@ -1050,7 +1133,7 @@ impl WindowPresenter {
                     .image_color_space(format.color_space)
                     .image_extent(extent)
                     .image_array_layers(1)
-                    .image_usage(vk::ImageUsageFlags::TRANSFER_DST)
+                    .image_usage(image_usage)
                     .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
                     .pre_transform(caps.current_transform)
                     .composite_alpha(composite_alpha)
@@ -1122,6 +1205,34 @@ impl WindowPresenter {
         self.extent = extent;
         self.desired_extent = extent;
         self.recreate_pending = false;
+        // Rebuild the cursor overlay for the new swapchain: (re)create the
+        // pipeline if the surface format changed, then its per-image targets.
+        self.color_format = format.format;
+        if self.cursor_enabled {
+            if self.cursor_gpu.as_ref().map(|c| c.color_format) != Some(format.format) {
+                if let Some(old) = self.cursor_gpu.take() {
+                    old.destroy(&ctx.device);
+                }
+                match CursorGpu::new(ctx, format.format) {
+                    Ok(gpu) => self.cursor_gpu = Some(gpu),
+                    Err(error) => {
+                        crate::observe::off(format!(
+                            "host_window_cursor status=disabled reason=create_failed vk={error:?}"
+                        ));
+                        self.cursor_enabled = false;
+                    }
+                }
+            }
+            if self.cursor_enabled {
+                if let Err(error) = self.build_overlay_targets(ctx) {
+                    crate::observe::off(format!(
+                        "host_window_cursor status=disabled reason=targets_failed vk={error:?}"
+                    ));
+                    self.destroy_overlay_targets(ctx);
+                    self.cursor_enabled = false;
+                }
+            }
+        }
         if extent != from {
             // A geometry change is progress; only a same-extent suboptimal
             // loop should keep accumulating toward the alarm.
@@ -1144,6 +1255,7 @@ impl WindowPresenter {
         counters: &EngineCounters,
         source: Option<&WindowPresentSource>,
         cpu: Option<WindowCpuFrame<'_>>,
+        cursor: Option<&crate::host_window::present::CursorOverlay>,
     ) -> Result<WindowPresentDispatch, DrawError> {
         if let Some(seq) = cpu.map(|frame| frame.seq) {
             if self.cadence_last_offered != Some(seq) {
@@ -1318,6 +1430,12 @@ impl WindowPresenter {
                 ACQUIRE_WAIT_STAGE,
                 vk::PipelineStageFlags::TRANSFER,
             );
+            // Cursor overlay to draw after the frame lands, as (dst rect in
+            struct CursorDraw {
+                dst_rect: (f32, f32, f32, f32),
+                tex_wh: (u32, u32),
+            }
+            let mut cursor_draw: Option<CursorDraw> = None;
             if let Some(blit) = blit {
                 let (base_width, base_height) = blit.extent();
                 // Aspect-fit placement: the guest frame keeps its aspect ratio
@@ -1381,6 +1499,24 @@ impl WindowPresenter {
                         super::pools::ResidentAccess::transfer_read(*host_accessible),
                     );
                 }
+                // Map the guest cursor through the SAME viewport as the frame, so
+                // it lands correctly whether the host or the guest drives the
+                // pointer. Scaled by the frame's fit ratio (≈1 at full size).
+                if self.cursor_enabled
+                    && self.cursor_gpu.is_some()
+                    && (image_index as usize) < self.framebuffers.len()
+                {
+                    if let Some(ov) = cursor {
+                        let sx = vp.width as f32 / base_width.max(1) as f32;
+                        let sy = vp.height as f32 / base_height.max(1) as f32;
+                        let dx = vp.x as f32 + (ov.x as f32 - ov.hot_x as f32) * sx;
+                        let dy = vp.y as f32 + (ov.y as f32 - ov.hot_y as f32) * sy;
+                        cursor_draw = Some(CursorDraw {
+                            dst_rect: (dx, dy, ov.width as f32 * sx, ov.height as f32 * sy),
+                            tex_wh: (ov.width as u32, ov.height as u32),
+                        });
+                    }
+                }
             } else {
                 ctx.device.cmd_clear_color_image(
                     frame_cmd,
@@ -1392,17 +1528,47 @@ impl WindowPresenter {
                     &[color_range],
                 );
             }
-            image_barrier(
-                &ctx.device,
-                frame_cmd,
-                dst,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                vk::ImageLayout::PRESENT_SRC_KHR,
-                vk::AccessFlags::TRANSFER_WRITE,
-                vk::AccessFlags::empty(),
-                vk::PipelineStageFlags::TRANSFER,
-                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-            );
+            if let Some(CursorDraw { dst_rect, tex_wh }) = cursor_draw {
+                // Overlay path: move the image to COLOR_ATTACHMENT, upload the
+                // glyph, and draw it. The render pass leaves the image in
+                // PRESENT_SRC, so no separate present barrier is needed.
+                let cmd = frame_cmd;
+                let extent = self.extent;
+                let framebuffer = self.framebuffers[image_index as usize];
+                let overlay = cursor.expect("cursor_draw set implies a cursor");
+                image_barrier(
+                    &ctx.device,
+                    cmd,
+                    dst,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                    vk::AccessFlags::TRANSFER_WRITE,
+                    vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                );
+                let gpu = self.cursor_gpu.as_mut().expect("cursor_gpu present");
+                gpu.upload(
+                    ctx,
+                    cmd,
+                    &overlay.pixels,
+                    overlay.width as u32,
+                    overlay.height as u32,
+                );
+                gpu.record(ctx, cmd, framebuffer, extent, dst_rect, tex_wh);
+            } else {
+                image_barrier(
+                    &ctx.device,
+                    frame_cmd,
+                    dst,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    vk::ImageLayout::PRESENT_SRC_KHR,
+                    vk::AccessFlags::TRANSFER_WRITE,
+                    vk::AccessFlags::empty(),
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                );
+            }
             ctx.device.end_command_buffer(frame_cmd).map_err(|error| {
                 DrawError::VkCall(VkCall::new(VkOp::WindowEndCommandBuffer, error))
             })?;
@@ -1816,6 +1982,10 @@ impl WindowPresenter {
                 frame.pinned.clear();
             }
         }
+        self.destroy_overlay_targets(ctx);
+        if let Some(cursor_gpu) = self.cursor_gpu.take() {
+            cursor_gpu.destroy(&ctx.device);
+        }
         if let Some(staging) = self.staging.take() {
             staging.destroy(&ctx.device);
         }
@@ -1938,6 +2108,450 @@ unsafe fn image_barrier(
             .src_access_mask(src_access)
             .dst_access_mask(dst_access)],
     );
+}
+
+/// SPIR-V for the guest-cursor overlay. Regenerate after editing the GLSL with:
+///   glslc shaders/cursor_overlay.vert -o shaders/cursor_overlay.vert.spv
+///   glslc shaders/cursor_overlay.frag -o shaders/cursor_overlay.frag.spv
+const CURSOR_VERT_SPV: &[u8] = include_bytes!("shaders/cursor_overlay.vert.spv");
+const CURSOR_FRAG_SPV: &[u8] = include_bytes!("shaders/cursor_overlay.frag.spv");
+/// Fixed cursor-texture edge. macOS cursors are far smaller even at 2x; larger
+/// glyphs are clamped (only the top-left `CURSOR_TEX_DIM` square is uploaded).
+const CURSOR_TEX_DIM: u32 = 256;
+
+fn spv_words(bytes: &[u8]) -> Vec<u32> {
+    bytes
+        .chunks_exact(4)
+        .map(|c| u32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
+}
+
+/// GPU objects for compositing the guest hardware cursor over the presented
+/// frame with an alpha-blended quad. Best effort: construction or a draw that
+/// fails logs once and the overlay is dropped — the present itself never fails.
+struct CursorGpu {
+    color_format: vk::Format,
+    render_pass: vk::RenderPass,
+    set_layout: vk::DescriptorSetLayout,
+    pipeline_layout: vk::PipelineLayout,
+    pipeline: vk::Pipeline,
+    #[allow(dead_code)]
+    pool: vk::DescriptorPool,
+    set: vk::DescriptorSet,
+    sampler: vk::Sampler,
+    vert: vk::ShaderModule,
+    frag: vk::ShaderModule,
+    tex_image: vk::Image,
+    tex_mem: vk::DeviceMemory,
+    tex_view: vk::ImageView,
+    /// Whether the texture has been transitioned out of UNDEFINED at least once.
+    tex_ready: bool,
+    staging: vk::Buffer,
+    staging_mem: vk::DeviceMemory,
+    staging_ptr: MappedStaging,
+}
+
+impl CursorGpu {
+    unsafe fn new(ctx: &DeviceContext, color_format: vk::Format) -> Result<Self, vk::Result> {
+        let dev = &ctx.device;
+
+        // --- render pass: load the blitted frame, blend the cursor, end in PRESENT.
+        let attachment = vk::AttachmentDescription::default()
+            .format(color_format)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .load_op(vk::AttachmentLoadOp::LOAD)
+            .store_op(vk::AttachmentStoreOp::STORE)
+            .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+            .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+            .initial_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            .final_layout(vk::ImageLayout::PRESENT_SRC_KHR);
+        let color_ref = [vk::AttachmentReference::default()
+            .attachment(0)
+            .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)];
+        let subpass = [vk::SubpassDescription::default()
+            .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
+            .color_attachments(&color_ref)];
+        let dep = [vk::SubpassDependency::default()
+            .src_subpass(vk::SUBPASS_EXTERNAL)
+            .dst_subpass(0)
+            .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+            .dst_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+            .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+            .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)];
+        let attachments = [attachment];
+        let render_pass = dev.create_render_pass(
+            &vk::RenderPassCreateInfo::default()
+                .attachments(&attachments)
+                .subpasses(&subpass)
+                .dependencies(&dep),
+            None,
+        )?;
+
+        // --- descriptor set layout: one combined image sampler in the fragment stage.
+        let bindings = [vk::DescriptorSetLayoutBinding::default()
+            .binding(0)
+            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::FRAGMENT)];
+        let set_layout = dev.create_descriptor_set_layout(
+            &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
+            None,
+        )?;
+        let push = [vk::PushConstantRange::default()
+            .stage_flags(vk::ShaderStageFlags::VERTEX)
+            .offset(0)
+            .size(24)]; // vec4 rect + vec2 uv_scale
+        let set_layouts = [set_layout];
+        let pipeline_layout = dev.create_pipeline_layout(
+            &vk::PipelineLayoutCreateInfo::default()
+                .set_layouts(&set_layouts)
+                .push_constant_ranges(&push),
+            None,
+        )?;
+
+        // --- shaders + pipeline.
+        let vert = dev.create_shader_module(
+            &vk::ShaderModuleCreateInfo::default().code(&spv_words(CURSOR_VERT_SPV)),
+            None,
+        )?;
+        let frag = dev.create_shader_module(
+            &vk::ShaderModuleCreateInfo::default().code(&spv_words(CURSOR_FRAG_SPV)),
+            None,
+        )?;
+        let entry = c"main";
+        let stages = [
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::VERTEX)
+                .module(vert)
+                .name(entry),
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::FRAGMENT)
+                .module(frag)
+                .name(entry),
+        ];
+        let vertex_input = vk::PipelineVertexInputStateCreateInfo::default();
+        let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
+            .topology(vk::PrimitiveTopology::TRIANGLE_STRIP);
+        let viewport_state = vk::PipelineViewportStateCreateInfo::default()
+            .viewport_count(1)
+            .scissor_count(1);
+        let raster = vk::PipelineRasterizationStateCreateInfo::default()
+            .polygon_mode(vk::PolygonMode::FILL)
+            .cull_mode(vk::CullModeFlags::NONE)
+            .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
+            .line_width(1.0);
+        let multisample = vk::PipelineMultisampleStateCreateInfo::default()
+            .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+        let blend_attach = [vk::PipelineColorBlendAttachmentState::default()
+            .blend_enable(true)
+            .src_color_blend_factor(vk::BlendFactor::SRC_ALPHA)
+            .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+            .color_blend_op(vk::BlendOp::ADD)
+            .src_alpha_blend_factor(vk::BlendFactor::ONE)
+            .dst_alpha_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+            .alpha_blend_op(vk::BlendOp::ADD)
+            .color_write_mask(vk::ColorComponentFlags::RGBA)];
+        let blend = vk::PipelineColorBlendStateCreateInfo::default().attachments(&blend_attach);
+        let dyn_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+        let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dyn_states);
+        let gpci = [vk::GraphicsPipelineCreateInfo::default()
+            .stages(&stages)
+            .vertex_input_state(&vertex_input)
+            .input_assembly_state(&input_assembly)
+            .viewport_state(&viewport_state)
+            .rasterization_state(&raster)
+            .multisample_state(&multisample)
+            .color_blend_state(&blend)
+            .dynamic_state(&dynamic)
+            .layout(pipeline_layout)
+            .render_pass(render_pass)
+            .subpass(0)];
+        let pipeline = dev
+            .create_graphics_pipelines(ctx.pipeline_cache, &gpci, None)
+            .map_err(|(_, e)| e)?[0];
+
+        // --- descriptor pool + set.
+        let pool_sizes = [vk::DescriptorPoolSize::default()
+            .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .descriptor_count(1)];
+        let pool = dev.create_descriptor_pool(
+            &vk::DescriptorPoolCreateInfo::default()
+                .max_sets(1)
+                .pool_sizes(&pool_sizes),
+            None,
+        )?;
+        let set = dev.allocate_descriptor_sets(
+            &vk::DescriptorSetAllocateInfo::default()
+                .descriptor_pool(pool)
+                .set_layouts(&set_layouts),
+        )?[0];
+
+        // --- sampler (nearest; the cursor is drawn near 1:1).
+        let sampler = dev.create_sampler(
+            &vk::SamplerCreateInfo::default()
+                .mag_filter(vk::Filter::NEAREST)
+                .min_filter(vk::Filter::NEAREST)
+                .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE),
+            None,
+        )?;
+
+        // --- cursor texture (fixed square, device-local, sampled) + view.
+        let tex_image = dev.create_image(
+            &vk::ImageCreateInfo::default()
+                .image_type(vk::ImageType::TYPE_2D)
+                .format(vk::Format::B8G8R8A8_UNORM)
+                .extent(vk::Extent3D {
+                    width: CURSOR_TEX_DIM,
+                    height: CURSOR_TEX_DIM,
+                    depth: 1,
+                })
+                .mip_levels(1)
+                .array_layers(1)
+                .samples(vk::SampleCountFlags::TYPE_1)
+                .tiling(vk::ImageTiling::OPTIMAL)
+                .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST)
+                .initial_layout(vk::ImageLayout::UNDEFINED),
+            None,
+        )?;
+        let treq = dev.get_image_memory_requirements(tex_image);
+        let tmem_type = ctx
+            .memory_type_for(
+                treq.memory_type_bits,
+                treq.size,
+                crate::backend::vulkan::caps::MemoryClass::DeviceLocal,
+            )
+            .ok_or(vk::Result::ERROR_FEATURE_NOT_PRESENT)?;
+        let tex_mem = dev.allocate_memory(
+            &vk::MemoryAllocateInfo::default()
+                .allocation_size(treq.size)
+                .memory_type_index(tmem_type),
+            None,
+        )?;
+        dev.bind_image_memory(tex_image, tex_mem, 0)?;
+        let tex_view = dev.create_image_view(
+            &vk::ImageViewCreateInfo::default()
+                .image(tex_image)
+                .view_type(vk::ImageViewType::TYPE_2D)
+                .format(vk::Format::B8G8R8A8_UNORM)
+                .subresource_range(
+                    vk::ImageSubresourceRange::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .level_count(1)
+                        .layer_count(1),
+                ),
+            None,
+        )?;
+
+        // --- host-visible staging buffer for glyph uploads, persistently mapped.
+        let staging_size = (CURSOR_TEX_DIM * CURSOR_TEX_DIM * 4) as u64;
+        let staging = dev.create_buffer(
+            &vk::BufferCreateInfo::default()
+                .size(staging_size)
+                .usage(vk::BufferUsageFlags::TRANSFER_SRC)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE),
+            None,
+        )?;
+        let breq = dev.get_buffer_memory_requirements(staging);
+        let bmem_type = ctx
+            .memory_type_for(
+                breq.memory_type_bits,
+                breq.size,
+                crate::backend::vulkan::caps::MemoryClass::Upload,
+            )
+            .ok_or(vk::Result::ERROR_FEATURE_NOT_PRESENT)?;
+        let staging_mem = dev.allocate_memory(
+            &vk::MemoryAllocateInfo::default()
+                .allocation_size(breq.size)
+                .memory_type_index(bmem_type),
+            None,
+        )?;
+        dev.bind_buffer_memory(staging, staging_mem, 0)?;
+        let staging_ptr = MappedStaging(
+            dev.map_memory(staging_mem, 0, breq.size, vk::MemoryMapFlags::empty())? as *mut u8,
+        );
+
+        // Point the descriptor set at the texture (view + sampler are fixed).
+        let img_info = [vk::DescriptorImageInfo::default()
+            .sampler(sampler)
+            .image_view(tex_view)
+            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+        dev.update_descriptor_sets(
+            &[vk::WriteDescriptorSet::default()
+                .dst_set(set)
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(&img_info)],
+            &[],
+        );
+
+        Ok(Self {
+            color_format,
+            render_pass,
+            set_layout,
+            pipeline_layout,
+            pipeline,
+            pool,
+            set,
+            sampler,
+            vert,
+            frag,
+            tex_image,
+            tex_mem,
+            tex_view,
+            tex_ready: false,
+            staging,
+            staging_mem,
+            staging_ptr,
+        })
+    }
+
+    /// Copy the glyph into the staging buffer and record its upload into `cmd`,
+    /// leaving the texture in SHADER_READ_ONLY_OPTIMAL. `w`/`h` are clamped to
+    /// the fixed texture edge.
+    unsafe fn upload(&mut self, ctx: &DeviceContext, cmd: vk::CommandBuffer, pixels: &[u32], w: u32, h: u32) {
+        let w = w.min(CURSOR_TEX_DIM);
+        let h = h.min(CURSOR_TEX_DIM);
+        let count = (w * h) as usize;
+        if count == 0 || pixels.len() < count {
+            return;
+        }
+        std::ptr::copy_nonoverlapping(pixels.as_ptr(), self.staging_ptr.0 as *mut u32, count);
+        let old = if self.tex_ready {
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+        } else {
+            vk::ImageLayout::UNDEFINED
+        };
+        image_barrier(
+            &ctx.device,
+            cmd,
+            self.tex_image,
+            old,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            vk::AccessFlags::empty(),
+            vk::AccessFlags::TRANSFER_WRITE,
+            vk::PipelineStageFlags::TOP_OF_PIPE,
+            vk::PipelineStageFlags::TRANSFER,
+        );
+        let region = vk::BufferImageCopy::default()
+            .buffer_row_length(w)
+            .buffer_image_height(h)
+            .image_subresource(
+                vk::ImageSubresourceLayers::default()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                    .layer_count(1),
+            )
+            .image_extent(vk::Extent3D {
+                width: w,
+                height: h,
+                depth: 1,
+            });
+        ctx.device.cmd_copy_buffer_to_image(
+            cmd,
+            self.staging,
+            self.tex_image,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            &[region],
+        );
+        image_barrier(
+            &ctx.device,
+            cmd,
+            self.tex_image,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            vk::AccessFlags::TRANSFER_WRITE,
+            vk::AccessFlags::SHADER_READ,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::FRAGMENT_SHADER,
+        );
+        self.tex_ready = true;
+    }
+
+    /// Draw the cursor quad. `dst` is the sprite rect in drawable pixels (may be
+    /// fractional/negative near edges); `tex_wh` is the used glyph size. The
+    /// swapchain image must already be in COLOR_ATTACHMENT_OPTIMAL; the render
+    /// pass leaves it in PRESENT_SRC_KHR.
+    unsafe fn record(
+        &self,
+        ctx: &DeviceContext,
+        cmd: vk::CommandBuffer,
+        framebuffer: vk::Framebuffer,
+        extent: vk::Extent2D,
+        dst: (f32, f32, f32, f32),
+        tex_wh: (u32, u32),
+    ) {
+        let dev = &ctx.device;
+        let full = vk::Rect2D {
+            offset: vk::Offset2D { x: 0, y: 0 },
+            extent,
+        };
+        dev.cmd_begin_render_pass(
+            cmd,
+            &vk::RenderPassBeginInfo::default()
+                .render_pass(self.render_pass)
+                .framebuffer(framebuffer)
+                .render_area(full),
+            vk::SubpassContents::INLINE,
+        );
+        dev.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.pipeline);
+        dev.cmd_set_viewport(
+            cmd,
+            0,
+            &[vk::Viewport {
+                x: 0.0,
+                y: 0.0,
+                width: extent.width as f32,
+                height: extent.height as f32,
+                min_depth: 0.0,
+                max_depth: 1.0,
+            }],
+        );
+        dev.cmd_set_scissor(cmd, 0, &[full]);
+        dev.cmd_bind_descriptor_sets(
+            cmd,
+            vk::PipelineBindPoint::GRAPHICS,
+            self.pipeline_layout,
+            0,
+            &[self.set],
+            &[],
+        );
+        // Pixel rect -> NDC (Vulkan clip: x,y in [-1,1], y down matches framebuffer).
+        let (ew, eh) = (extent.width as f32, extent.height as f32);
+        let x0 = 2.0 * dst.0 / ew - 1.0;
+        let y0 = 2.0 * dst.1 / eh - 1.0;
+        let x1 = 2.0 * (dst.0 + dst.2) / ew - 1.0;
+        let y1 = 2.0 * (dst.1 + dst.3) / eh - 1.0;
+        let uv_sx = tex_wh.0 as f32 / CURSOR_TEX_DIM as f32;
+        let uv_sy = tex_wh.1 as f32 / CURSOR_TEX_DIM as f32;
+        let push: [f32; 6] = [x0, y0, x1, y1, uv_sx, uv_sy];
+        dev.cmd_push_constants(
+            cmd,
+            self.pipeline_layout,
+            vk::ShaderStageFlags::VERTEX,
+            0,
+            std::slice::from_raw_parts(push.as_ptr() as *const u8, 24),
+        );
+        dev.cmd_draw(cmd, 4, 1, 0, 0);
+        dev.cmd_end_render_pass(cmd);
+    }
+
+    unsafe fn destroy(self, dev: &ash::Device) {
+        dev.destroy_sampler(self.sampler, None);
+        dev.destroy_image_view(self.tex_view, None);
+        dev.destroy_image(self.tex_image, None);
+        dev.unmap_memory(self.staging_mem);
+        dev.destroy_buffer(self.staging, None);
+        dev.free_memory(self.staging_mem, None);
+        dev.free_memory(self.tex_mem, None);
+        dev.destroy_pipeline(self.pipeline, None);
+        dev.destroy_shader_module(self.vert, None);
+        dev.destroy_shader_module(self.frag, None);
+        dev.destroy_pipeline_layout(self.pipeline_layout, None);
+        dev.destroy_descriptor_pool(self.pool, None);
+        dev.destroy_descriptor_set_layout(self.set_layout, None);
+        dev.destroy_render_pass(self.render_pass, None);
+    }
 }
 
 unsafe fn blit_rect(

@@ -98,6 +98,38 @@ fn window_publish_key_advances_for_in_place_present() {
     );
 }
 
+/// Moving the cursor must NOT move the frame key.
+///
+/// This is the invariant behind the idle-cursor fix. The frame key drives the
+/// window wake: a fresh key publishes a frame and wakes the redraw, an unchanged
+/// key does not. The cursor is deliberately absent from it, so pointer motion
+/// over a static frame produces no wake and rides the separate cursor-republish
+/// path instead — which is why that path has to be reached by the 4 ms poll and
+/// not only by the guest-FIFO-driven drain, or an idle desktop steps the cursor
+/// at the drain rate.
+///
+/// If the cursor ever entered this key, every mouse move would republish a full
+/// fresh frame and this test would fail — a useful thing to be told.
+#[cfg(feature = "host-window")]
+#[test]
+fn window_publish_key_does_not_move_when_only_the_cursor_moves() {
+    use super::window_publish::window_frame_key;
+    let mut state = crate::model::DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_ARM64E);
+    state.present.frame_mapping = 7;
+    state.present.frame_generation = 11;
+    let before = window_frame_key(&state.present);
+
+    state.cursor.x = state.cursor.x.wrapping_add(40);
+    state.cursor.y = state.cursor.y.wrapping_add(25);
+
+    assert_eq!(
+        window_frame_key(&state.present),
+        before,
+        "cursor motion must leave the frame key unchanged, so it takes the \
+         cursor-republish path rather than a fresh-frame wake",
+    );
+}
+
 /// A lazy type-11 Store publishes new pixels without writing a guest page, so
 /// the mapping's `content_generation` holds still across frames that genuinely
 /// differ — and the host window's publish key must move anyway.

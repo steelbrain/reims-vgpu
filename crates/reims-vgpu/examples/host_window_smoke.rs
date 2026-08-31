@@ -87,5 +87,6 @@ fn gradient(w: u32, h: u32, t: u32) -> Frame {
         height: h,
         bgra,
         resident: None,
+        cursor: None,
     }
 }

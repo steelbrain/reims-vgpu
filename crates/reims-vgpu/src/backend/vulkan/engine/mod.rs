@@ -1111,6 +1111,7 @@ pub fn window_present_resize(width: u32, height: u32) {
 pub fn window_present_frame(
     source: Option<&WindowPresentSource>,
     cpu: Option<WindowCpuFrame<'_>>,
+    cursor: Option<&crate::host_window::present::CursorOverlay>,
 ) -> Result<WindowPresentOutcome, DrawError> {
     let dispatch = {
         let mut guard = lock_engine_at(EngineLockSite::Window);
@@ -1125,7 +1126,7 @@ pub fn window_present_frame(
         let presenter = window_presenter.as_mut().ok_or(DrawError::Facade(
             EngineFacadeDecline::WindowPresenterNotAttached,
         ))?;
-        unsafe { presenter.begin_present(ctx, pools, counters, source, cpu) }?
+        unsafe { presenter.begin_present(ctx, pools, counters, source, cpu, cursor) }?
     };
     let out = match dispatch {
         window_present::WindowPresentDispatch::Complete(out) => Ok(out),

@@ -2977,8 +2977,15 @@ fn fill_display_descriptor<H: HostMemory + HostOps>(
     }
 }
 
-/// Sample cursor x/y/show from the display shared-state page (GPA +0xe00).
-fn sample_cursor_position<M: HostMemory>(state: &mut DeviceState, mem: &M) {
+/// Re-read the guest's hardware-cursor position from the display shared page.
+///
+/// `pub(crate)` because the host-window overlay needs it once per drain tranche,
+/// not only on the two events that used to drive it. Inside the guest protocol
+/// the position is refreshed by the CURSOR_SHOW / CURSOR_GLYPH handlers and by
+/// the `GFX_REG_EFI_DISPLAY_IRQ` doorbell (see `runtime::mmio`) -- so a cursor
+/// that MOVES without changing shape, and without the guest ringing that
+/// doorbell, leaves x/y stale. The overlay then only tracked shape changes.
+pub(crate) fn sample_cursor_position<M: HostMemory>(state: &mut DeviceState, mem: &M) {
     if state.display.shared_gpa == 0 {
         return;
     }

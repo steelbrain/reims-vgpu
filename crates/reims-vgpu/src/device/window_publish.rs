@@ -84,6 +84,11 @@ pub(crate) struct WindowLink {
     /// (firmware framebuffer, a cleared-but-never-rendered mapping, the frames
     /// after a device reset) is normal on macOS too.
     bgra_short_geom: Option<(u32, u32)>,
+    /// Fingerprint of the guest cursor at the last publish, so the cursor
+    /// overlay re-presents the current frame when the hardware cursor moves
+    /// between guest frames (position changes carry no DisplaySwap). `None`
+    /// unless the overlay is enabled. See [`cursor_overlay_fingerprint`].
+    last_cursor: Option<(u16, u16, u16, u16, bool, u64)>,
     /// Set to ask the window thread to exit (VM teardown); the thread polls it.
     stop: crate::host_window::present::StopFlag,
     /// Window thread handle. `device_window_stop` sets `stop` and joins it, so
@@ -118,9 +123,7 @@ pub(crate) struct EarlyFb {
 /// [`publish_window_frame`], called by the drain. Idempotent; `true` on success.
 #[cfg(feature = "host-window")]
 pub fn device_window_start(id: u64, width: u32, height: u32) -> bool {
-    use crate::host_window::present::{
-        FrameSlot, InputSink, WindowConfig, WindowMode, WindowWaker,
-    };
+    use crate::host_window::present::{FrameSlot, InputSink, WindowConfig, WindowWaker};
     let Some(slot) = device_slot(id) else {
         return false;
     };
@@ -166,9 +169,7 @@ pub fn device_window_start(id: u64, width: u32, height: u32) -> bool {
         } else {
             height
         },
-        // Resolved here, once, on the thread that starts the window: the mode is
-        // an operator's answer about this boot, not a per-frame question.
-        mode: WindowMode::requested(),
+        mode: crate::host_window::present::WindowMode::requested(),
     };
     let stop: crate::host_window::present::StopFlag =
         Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -206,6 +207,7 @@ pub fn device_window_start(id: u64, width: u32, height: u32) -> bool {
         last: (u32::MAX, u32::MAX, u32::MAX, u64::MAX),
         seq: 0,
         bgra_short_geom: None,
+        last_cursor: None,
         stop,
         thread,
         #[cfg(target_os = "macos")]
@@ -259,6 +261,67 @@ pub fn device_window_run_main(_id: u64) -> bool {
 /// drain worker under no device lock of its own (its own small mutex), so it
 /// never contends the render tranche. Latest-wins.
 #[cfg(feature = "host-window")]
+/// Whether to snapshot the guest cursor for the host window to composite.
+/// Read once: opt-in via `REIMS_VGPU_CURSOR` so normal boots do no extra work.
+#[cfg(feature = "host-window")]
+fn cursor_overlay_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("REIMS_VGPU_CURSOR").is_some())
+}
+
+/// Cheap identity of the guest cursor: position, size, visibility and a hash of
+/// the glyph. Compared between drains so a cursor that MOVED without the guest
+/// producing a frame still re-presents — macOS uses a hardware cursor, so moving
+/// it over an idle desktop publishes no DisplaySwap at all, and the overlay
+/// would otherwise sit frozen until something else animated the screen.
+#[cfg(feature = "host-window")]
+fn cursor_overlay_fingerprint(
+    state: &crate::model::DeviceState,
+) -> Option<(u16, u16, u16, u16, bool, u64)> {
+    if !cursor_overlay_enabled() {
+        return None;
+    }
+    let c = &state.cursor;
+    // Hash a few sampled words rather than the whole sprite: this runs every
+    // drain, and a glyph swap changes size/hotspot or these samples in practice.
+    let mut glyph_hash = c.pixels.len() as u64;
+    for i in [0usize, 7, 31, 127] {
+        if let Some(px) = c.pixels.get(i) {
+            glyph_hash = glyph_hash
+                .rotate_left(13)
+                .wrapping_add(*px as u64)
+                .wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        }
+    }
+    Some((c.x, c.y, c.hot_x, c.hot_y, c.show && c.glyph_ready, glyph_hash))
+}
+
+/// Snapshot the guest hardware cursor for compositing, or `None` when disabled
+/// or the guest has no visible glyph. The pixel copy is small (a cursor sprite)
+/// and only taken when the feature is enabled.
+#[cfg(feature = "host-window")]
+fn cursor_overlay_snapshot(
+    state: &crate::model::DeviceState,
+) -> Option<crate::host_window::present::CursorOverlay> {
+    if !cursor_overlay_enabled() {
+        return None;
+    }
+    let c = &state.cursor;
+    if !c.show || !c.glyph_ready || c.pixels.is_empty() {
+        return None;
+    }
+    Some(crate::host_window::present::CursorOverlay {
+        x: c.x,
+        y: c.y,
+        width: c.width,
+        height: c.height,
+        hot_x: c.hot_x,
+        hot_y: c.hot_y,
+        pixels: std::sync::Arc::new(c.pixels.clone()),
+    })
+}
+
 pub(crate) fn publish_window_frame(slot: &BoundDevice, state: &mut crate::model::DeviceState) {
     use crate::runtime::drain::{note_window_publish, WindowPublish};
     let mut guard = slot.window.lock();
@@ -278,8 +341,20 @@ pub(crate) fn publish_window_frame(slot: &BoundDevice, state: &mut crate::model:
     let key = window_frame_key(p);
     if key == link.last {
         note_window_publish(WindowPublish::SameKey);
+        // The frame is unchanged, but the hardware cursor may have moved over
+        // it. Re-publish the frame already in the slot with the new cursor so
+        // the overlay tracks the pointer on an idle desktop; the window's seq
+        // gate then presents it. Pure cursor motion costs one small re-publish
+        // (the frame's bytes/resident are cloned by Arc, not copied).
+        let fingerprint = cursor_overlay_fingerprint(state);
+        if fingerprint.is_some() && fingerprint != link.last_cursor {
+            link.last_cursor = fingerprint;
+            let cursor = cursor_overlay_snapshot(state);
+            republish_with_cursor(link, cursor);
+        }
         return;
     }
+    link.last_cursor = cursor_overlay_fingerprint(state);
     note_window_publish(WindowPublish::Fresh);
     // Copied out rather than held behind `p`: the branches below assign
     // `state.present.display_from_resident`, and the frame bytes are the only
@@ -310,13 +385,16 @@ pub(crate) fn publish_window_frame(slot: &BoundDevice, state: &mut crate::model:
     // as it stands, so the frame never crosses host memory. `display_from_resident`
     // is what tells the NEXT capture not to read it back, and it is only set
     // when a resident actually carried this one.
-    if crate::backend::vulkan::engine::window_present_attached() && resident_present.is_ok() {
+    let cursor = cursor_overlay_snapshot(state);
+    if crate::backend::vulkan::engine::window_present_attached() && resident_present.is_ok()
+    {
         let resident_source = crate::backend::vulkan::engine::WindowPresentSource {
             width,
             height,
             identity: present_identity,
         };
-        let published = window_write_frame(link, width, height, Vec::new(), Some(resident_source));
+        let published =
+            window_write_frame(link, width, height, Vec::new(), Some(resident_source), cursor);
         crate::runtime::census::present_proxy::host_window_publish::note(published);
         if published {
             link.last = key;
@@ -368,10 +446,44 @@ pub(crate) fn publish_window_frame(slot: &BoundDevice, state: &mut crate::model:
     // so a later mismatch at the same geometry logs again.
     link.bgra_short_geom = None;
     let bgra = state.present.frame_bgra[..need].to_vec();
-    let published = window_write_frame(link, width, height, bgra, None);
+    let published = window_write_frame(link, width, height, bgra, None, cursor);
     crate::runtime::census::present_proxy::host_window_publish::note(published);
     if published {
         link.last = key;
+    }
+}
+
+/// Re-publish the frame currently in the slot with a new cursor overlay, under
+/// a fresh `seq` so the window's present gate treats it as new work.
+///
+/// Only the cursor changed, so the pixels are not re-copied: `bgra` is cloned
+/// (on the resident path — the normal one — it is empty) and the resident
+/// identity is copied. Returns quietly if the slot holds nothing yet.
+#[cfg(feature = "host-window")]
+fn republish_with_cursor(
+    link: &mut WindowLink,
+    cursor: Option<crate::host_window::present::CursorOverlay>,
+) {
+    let stored = match link.frames.lock() {
+        Ok(mut slot) => {
+            let Some(prev) = slot.as_ref() else {
+                return;
+            };
+            link.seq = link.seq.wrapping_add(1);
+            *slot = Some(std::sync::Arc::new(crate::host_window::present::Frame {
+                seq: link.seq,
+                width: prev.width,
+                height: prev.height,
+                bgra: prev.bgra.clone(),
+                resident: prev.resident.clone(),
+                cursor,
+            }));
+            true
+        }
+        Err(_) => false,
+    };
+    if stored {
+        link.wake.wake();
     }
 }
 
@@ -392,6 +504,7 @@ fn window_write_frame(
     height: u32,
     bgra: Vec<u8>,
     resident: Option<crate::backend::vulkan::engine::WindowPresentSource>,
+    cursor: Option<crate::host_window::present::CursorOverlay>,
 ) -> bool {
     link.seq = link.seq.wrapping_add(1);
     let frame = std::sync::Arc::new(crate::host_window::present::Frame {
@@ -400,6 +513,7 @@ fn window_write_frame(
         height,
         bgra,
         resident,
+        cursor,
     });
     let stored = match link.frames.lock() {
         Ok(mut slot_frame) => {
@@ -559,7 +673,7 @@ pub(crate) fn publish_window_early_frame<
     slot.early_last_ns.store(now_ns, Ordering::Relaxed);
     // Early boot frames come from the BAR1 GOP framebuffer, not a resident
     // target, so there is no resident source to hand over.
-    window_write_frame(link, w, h, buf, None);
+    window_write_frame(link, w, h, buf, None, None);
 }
 
 /// Copy the registered BAR1 early framebuffer into `dst` (tight BGRA8). Returns
@@ -590,3 +704,90 @@ fn copy_early_bar1(slot: &BoundDevice, dst: &mut [u8], dst_stride: u32, w: u32, 
     }
     true
 }
+
+#[cfg(all(test, feature = "host-window"))]
+mod tests {
+    use super::*;
+    use crate::host_window::present::{CursorOverlay, Frame, WindowWaker};
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn republish_with_cursor_increments_seq_and_updates_frame_cursor() {
+        let frames = Arc::new(Mutex::new(Some(Arc::new(Frame {
+            seq: 1,
+            width: 100,
+            height: 100,
+            bgra: vec![0x11; 40000],
+            resident: None,
+            cursor: None,
+        }))));
+        let wake = WindowWaker::new();
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut link = WindowLink {
+            frames: Arc::clone(&frames),
+            wake,
+            last: (1, 100, 100, 1),
+            seq: 1,
+            bgra_short_geom: None,
+            last_cursor: None,
+            stop,
+            thread: None,
+            #[cfg(target_os = "macos")]
+            exited: Arc::new(AtomicBool::new(false)),
+        };
+
+        let new_cursor = CursorOverlay {
+            x: 50,
+            y: 75,
+            width: 16,
+            height: 16,
+            hot_x: 1,
+            hot_y: 1,
+            pixels: Arc::new(vec![0xffffffff; 256]),
+        };
+
+        republish_with_cursor(&mut link, Some(new_cursor));
+
+        assert_eq!(
+            link.seq, 2,
+            "seq must advance so window treats it as new frame"
+        );
+        let guard = frames.lock().unwrap();
+        let current_frame = guard.as_ref().expect("frame in slot").clone();
+        assert_eq!(current_frame.seq, 2);
+        assert_eq!(current_frame.width, 100);
+        assert_eq!(current_frame.height, 100);
+        assert_eq!(current_frame.bgra.len(), 40000);
+        let cursor = current_frame
+            .cursor
+            .as_ref()
+            .expect("cursor should be updated");
+        assert_eq!(cursor.x, 50);
+        assert_eq!(cursor.y, 75);
+    }
+
+    #[test]
+    fn republish_with_cursor_on_empty_slot_is_safe_noop() {
+        let frames = Arc::new(Mutex::new(None));
+        let wake = WindowWaker::new();
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut link = WindowLink {
+            frames: Arc::clone(&frames),
+            wake,
+            last: (1, 100, 100, 1),
+            seq: 1,
+            bgra_short_geom: None,
+            last_cursor: None,
+            stop,
+            thread: None,
+            #[cfg(target_os = "macos")]
+            exited: Arc::new(AtomicBool::new(false)),
+        };
+
+        republish_with_cursor(&mut link, None);
+        assert_eq!(link.seq, 1, "seq must not change when slot holds nothing");
+        assert!(frames.lock().unwrap().is_none());
+    }
+}
+
