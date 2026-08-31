@@ -5528,11 +5528,9 @@ fn a_delete_object_never_retires_an_object_table_entry_its_ref_collides_with() {
     );
     #[cfg(feature = "backend-vulkan")]
     {
-        state.task_depth_stencil_states.register(
-            2,
-            12,
-            std::sync::Arc::new(Default::default()),
-        );
+        state
+            .task_depth_stencil_states
+            .register(2, 12, std::sync::Arc::new(Default::default()));
         state.task_render_pipeline_states.register(
             2,
             13,
@@ -5628,7 +5626,6 @@ fn a_delete_object_never_retires_an_object_table_entry_its_ref_collides_with() {
         state.objects.contains(&(2, 14)),
         "0x3ec is unclaimed inside the destroy span and names no destroy at all"
     );
-
 }
 
 /// The kind is decoded off the record and counted per kind.

@@ -51,6 +51,9 @@ pub(crate) struct ImportedHostRam {
     /// [`crate::runtime::guest_ram::BoundRange`] inside the import is a valid
     /// offset into this one buffer.
     pub size: vk::DeviceSize,
+    /// Constructed HostOps alias backing this import. RAMBlock imports have no
+    /// release; packed aliases are returned only after Vulkan destruction.
+    pub alias: Option<(usize, usize)>,
 }
 
 impl ImportedHostRam {
@@ -66,6 +69,9 @@ impl ImportedHostRam {
         unsafe {
             device.destroy_buffer(self.buffer, None);
             device.free_memory(self.memory, None);
+        }
+        if let Some(alias) = self.alias {
+            super::release_host_alias(alias);
         }
     }
 }
@@ -237,6 +243,14 @@ pub(crate) struct HostRamImports {
 }
 
 impl HostRamImports {
+    pub(crate) fn alias(
+        &self,
+        import_id: crate::runtime::guest_ram::ImportId,
+    ) -> Option<(usize, usize)> {
+        self.live
+            .get(&import_id.get())
+            .and_then(|live| live.allocation.alias)
+    }
     fn remove_live(&mut self, key: u64) -> Option<ImportedHostRam> {
         self.kinds.remove(&key);
         self.live.remove(&key).map(|entry| entry.allocation)
@@ -512,10 +526,8 @@ unsafe fn import_ramblock(
     // guest's bytes instead, and no `vkAllocateMemory` the specification forbids
     // is ever issued — which is the difference between the two drivers this was
     // reported on, one of which returns success and then loses the device.
-    let pick = picked.map_err(|refusal| HostRamDecline::NoImportableMemoryType {
-        host_base,
-        refusal,
-    })?;
+    let pick =
+        picked.map_err(|refusal| HostRamDecline::NoImportableMemoryType { host_base, refusal })?;
     let memory_type_index = pick.index;
     let alloc_started = Instant::now();
 
@@ -565,6 +577,10 @@ unsafe fn import_ramblock(
                 memory,
                 memory_type_index,
                 size,
+                alias: import.gpa_base().is_none().then_some((
+                    host_base,
+                    usize::try_from(size).expect("host allocation size fits this process"),
+                )),
             }),
             Err(result) => {
                 // Freeing the memory is what ends the GPU's access to the
@@ -815,6 +831,7 @@ mod tests {
             memory: vk::DeviceMemory::null(),
             memory_type_index: 0,
             size: 0x4000,
+            alias: Some((0x1000, 0x4000)),
         };
         let mut imports = HostRamImports::default();
         imports.live.insert(
@@ -830,6 +847,8 @@ mod tests {
         imports.retain_child(&import);
         import.retire();
 
+        assert_eq!(imports.alias(import.id()), Some((0x1000, 0x4000)));
+
         assert!(matches!(
             imports.retire(import.id()),
             ParentRetire::WaitingForChildren
@@ -843,8 +862,8 @@ mod tests {
             "the retirement barrier passed but one child remains"
         );
         assert_eq!(
-            imports.release_child(&import).map(|parent| parent.size),
-            Some(0x4000),
+            imports.release_child(&import).map(|parent| parent.alias),
+            Some(Some((0x1000, 0x4000))),
             "the last child hands the parent back exactly once"
         );
         assert!(!imports.live.contains_key(&key));
@@ -865,6 +884,7 @@ mod tests {
                     memory: vk::DeviceMemory::null(),
                     memory_type_index: 0,
                     size: 0x4000,
+                    alias: Some((0x5000, 0x4000)),
                 },
                 child_images: 0,
                 retired: false,
@@ -884,8 +904,8 @@ mod tests {
         assert_eq!(
             imports
                 .retirement_fences_cleared(import.id())
-                .map(|parent| parent.size),
-            Some(0x4000)
+                .map(|parent| parent.alias),
+            Some(Some((0x5000, 0x4000)))
         );
     }
 

@@ -330,8 +330,9 @@ impl BoundBuffers {
             {
                 Some(packed)
             }
-            PackedBufferResolution::Available(_)
-            | PackedBufferResolution::Unavailable { .. } => None,
+            PackedBufferResolution::Available(_) | PackedBufferResolution::Unavailable { .. } => {
+                None
+            }
         }
     }
 

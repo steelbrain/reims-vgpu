@@ -54,22 +54,34 @@ compile_error!(
      any other host."
 );
 
-// Vulkan reaches the GPU through MoltenVK on macOS and a native ICD on Linux.
-// Any other host is untested rather than known-broken — name it here so a new
-// port is a deliberate edit to this list, not an accident.
+// Vulkan reaches the GPU through MoltenVK on macOS and a native ICD on
+// Linux; Windows hosts use their native ICDs (NVIDIA/AMD/Intel ship
+// VK_KHR_win32_surface and Vulkan 1.2+). Any other host is untested rather
+// than known-broken — name it here so a new port is a deliberate edit to this
+// list, not an accident.
 #[cfg(all(
     feature = "backend-vulkan",
-    not(any(target_os = "macos", target_os = "linux"))
+    not(any(target_os = "macos", target_os = "linux", target_os = "windows"))
 ))]
 compile_error!(
-    "backend-vulkan is supported on target_os = \"macos\" (MoltenVK) and \
-     target_os = \"linux\" (native ICD) only"
+    "backend-vulkan is supported on target_os = \"macos\" (MoltenVK), \
+     target_os = \"linux\", and target_os = \"windows\" (native ICDs)"
 );
 
-pub mod contract;
+/// The backend-neutral protocol vocabulary, in the crate that owns it.
+///
+/// Re-exported under the path every caller already writes
+/// (`crate::contract::…`). See `reims_vgpu_contract` for what the crate
+/// boundary makes true that the module boundary only asserted.
+pub use reims_vgpu_contract as contract;
 /// Every environment variable this device reads, and the rule that an override
 /// may only narrow what it does — see the module doc.
-pub mod env;
+/// Operator switches, in the crate that owns their names and their parse.
+///
+/// Re-exported under the path every caller already writes (`crate::env::…`) so
+/// moving the module out did not move a call site. See `reims_vgpu_env` for why
+/// a switch may only narrow what this device does.
+pub use reims_vgpu_env as env;
 pub mod model;
 /// Crate-wide observability: the always-on fail sink and the decline
 /// vocabulary. Above `runtime/` because every subsystem owes the reader a

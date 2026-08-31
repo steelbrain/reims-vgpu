@@ -606,7 +606,10 @@ mod tests {
     #[test]
     fn the_env_switch_takes_a_capable_host_down() {
         assert_eq!(with_env(Some("0")), Some(HostPointerImport::DisabledByEnv));
-        assert_eq!(with_env(Some("off")), Some(HostPointerImport::DisabledByEnv));
+        assert_eq!(
+            with_env(Some("off")),
+            Some(HostPointerImport::DisabledByEnv)
+        );
         assert!(!HostPointerImport::DisabledByEnv.is_available());
         assert!(HostPointerImport::DisabledByEnv
             .required_extensions()

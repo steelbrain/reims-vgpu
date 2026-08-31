@@ -628,5 +628,7 @@ while kill -0 "$QEMU_PID" 2>/dev/null; do
   elapsed=$((elapsed + 5))
 done
 
-wait "$QEMU_PID" 2>/dev/null || true
-capture_then_revert "qemu exited"
+qemu_rc=0
+wait "$QEMU_PID" 2>/dev/null || qemu_rc=$?
+capture_then_revert "qemu exited rc=$qemu_rc"
+exit "$qemu_rc"

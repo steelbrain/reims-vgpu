@@ -1,97 +1,61 @@
-//! Crate-wide observability: the always-on log sink, and the decline
-//! vocabulary every subsystem reports failures through.
+//! This crate's half of observability, and the door to the rest of it.
 //!
-//! # Why this is not under `runtime/`
+//! # Where the parts live
 //!
-//! Fail-visibility is not a runtime concern — `backend/`, `contract/`,
-//! `model/` and `host_window/` all reject guest work and all owe the reader a
-//! reason. It lived under `runtime/` only because that is where the first
-//! caller happened to be, and the result was the lapse this module exists to
-//! close: 451 fail sites in `runtime/` against 0 in `backend/metal/`,
-//! `contract/` and `qemu/`.
+//! Everything below the device is `reims_vgpu_observe`: the always-on sink, the
+//! [`Decline`] and [`Refusal`] traits every subsystem names its refusals
+//! through, the `Emit` builder that cannot render a line without a reason, and
+//! the slug registry that keeps two checks from spelling one slug. It is a
+//! separate crate so the layers below this one can name their own refusal type
+//! without depending on the device, and so nothing in it can reach back up into
+//! `runtime`, `model`, or a backend — none of them is in scope there. Read that
+//! crate's own doc for the obligation, the slug-uniqueness failure it exists to
+//! prevent, and why it may describe a decision but never select one.
 //!
-//! `translate/` and `caps/` are the other half of the argument. They are pure —
-//! they return typed declines and log nothing, which is correct — so the sink
-//! must sit somewhere they can name their reason type without depending on
-//! `runtime/`. This module is that place.
+//! What is left here is the two emitters that are *about this crate's* types:
 //!
-//! # The parts
+//! - [`crate::observe::ladder`] — the four object-list resolution rungs, so a rail spells the
+//!   condition the same way every other rail does.
+//! - [`crate::observe::panic`] — a `catch_unwind` at a `reims_vgpu_qemu_*` entry point, which is
+//!   the one failure the sink cannot describe from below because the entry point
+//!   is this crate's.
 //!
-//! - [`sink`] — the always-on writer behind `/tmp/reims-vgpu-fail.log`, its background
-//!   thread, flood self-detector and test isolation. Moved here verbatim from
-//!   `runtime/draw_log.rs`; the machinery was never the problem, the vocabulary
-//!   on top of it was.
+//! Both name `runtime` types, which is exactly why they did not move.
 //!
-//! - [`decline`] — the [`Decline`] and [`Refusal`] traits every subsystem
-//!   names its refusals through.
-//! - [`driver_watch`] — the one failure a census cannot report, because a census
-//!   line is written at the end of a drain tranche and this one is a tranche
-//!   that never ends: a host driver call that does not return while the drain
-//!   thread holds the device lock.
-//! - [`emit`] — the one builder that renders `reason=<slug> k=v …`, and cannot
-//!   produce a line without a reason.
+//! # The paths did not change
 //!
-//! # The obligation
-//!
-//! Per `AGENTS.md`: every path that rejects, drops, degrades or mis-executes a
-//! decoded guest command returns a typed decline whose slug is unique crate-wide
-//! and reaches the sink at some call site. Both halves are the author's
-//! obligation — nothing enforces either. A typed decline nobody logs is still a
-//! silent failure.
-//!
-//! Uniqueness is not a tidiness rule, and this is the failure it prevents.
-//! [`Emit::fail_once`] latches on `(slug, discriminant)` through
-//! [`first_sight`], whose set is one process-global `HashSet`. Two declines
-//! sharing a slug therefore share a latch: whichever fires first for a given
-//! discriminant silences the other for that discriminant for the life of the
-//! boot, and the loss is invisible because the log looks healthy. That is not
-//! hypothetical — `mapping_gpa_span` had exactly this shape between its two
-//! emitters, and the silence it produced had already been written up as a
-//! finding about the device before the collision was noticed.
-//!
-//! **Nothing checks this.** A source scan over every `slug()` and `refusal()`
-//! body used to, and it went with the rest of them; a `gate` module before that
-//! checked it alongside a 2 700-line restatement of the vocabulary and was
-//! removed whole in `db80389`. Two shapes are the defect, at different radii:
-//! one slug claimed by two impls, and one slug returned by two arms of the same
-//! impl. Prefix every slug with the rail that owns it — that is what makes a
-//! collision unlikely by construction, since the audit that would catch one is
-//! gone.
-//!
-//! The judgement no gate can make stays with the author: do **not** log
-//! speculative returns (a resolver legitimately answering "not ready yet" every
-//! poll, a genuinely-unbound `ref==0`). Those flood the log.
+//! The crate's surface is re-exported under the paths callers already write, so
+//! `crate::observe::fail(…)`, `crate::observe::Decline` and
+//! `crate::observe::sink::…` mean what they always did. That is deliberate: a
+//! layering change that also rewrote three hundred call sites would be two
+//! changes reviewed as one.
 
-pub mod decline;
-pub mod driver_watch;
-pub mod emit;
-pub mod footprint;
 pub mod ladder;
 pub mod panic;
-pub mod phase_clock;
-pub mod sink;
 
-/// Re-exported so call sites write `crate::observe::decline_display!(..)`
-/// next to the trait it implements, rather than reaching into the submodule.
-pub(crate) use decline::decline_display;
-pub use decline::{Decline, Refusal};
-pub(crate) use emit::{first_sight, state_changed, Emit};
 /// The fail line a loader whose event name carries the domain emits for a rung.
 pub(crate) use ladder::RungReport;
 /// The four object-list resolution rungs, so a rail spells the condition the
-/// same way every other rail does. See [`ladder`] for why it is a macro.
+/// same way every other rail does. See [`crate::observe::ladder`] for why it is a
+/// macro.
 pub(crate) use ladder::{ladder_slug, ladder_slugs};
+/// Re-exported so call sites write `crate::observe::decline_display!(..)`
+/// next to the trait it implements, rather than reaching into the submodule.
+pub(crate) use reims_vgpu_observe::decline_display;
+pub use reims_vgpu_observe::{
+    decline, driver_watch, emit, footprint, phase_clock, sink, slugs, Decline, Refusal,
+};
+pub(crate) use reims_vgpu_observe::{first_sight, state_changed, Emit};
 
 // The sink's surface is re-exported flat so call sites read `observe::fail(…)`
-// rather than `observe::sink::fail(…)`. `sink` stays public for readers who
-// want the machinery.
-pub use sink::{
+// rather than `observe::sink::fail(…)`.
+pub use reims_vgpu_observe::{
     bgra_present_stats, bgra_rgb_stats, fail, line, nonzero_stats, off, redirect_logs_for_tests,
-    rgba_rgb_stats,
+    rgba_rgb_stats, verbose, when_verbose, RgbaRgbStats,
 };
-pub(crate) use sink::{draw_log_enabled, elapsed_ms, elapsed_us};
+pub(crate) use reims_vgpu_observe::{elapsed_ms, elapsed_us};
 
 // Path accessors and the line matcher exist so tests can assert against the
 // real sink rather than a mock; production never reads them back.
 #[cfg(test)]
-pub(crate) use sink::{fail_log_path, FailCapture};
+pub(crate) use reims_vgpu_observe::{fail_log_path, FailCapture};

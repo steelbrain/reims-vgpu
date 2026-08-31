@@ -7,6 +7,9 @@
 resolver = "2"
 members = [
   "crates/reims-vgpu",
+  "crates/reims-vgpu-contract",
+  "crates/reims-vgpu-env",
+  "crates/reims-vgpu-observe",
   "crates/reims-vgpu-paging",
   "crates/reims-vgpu-wire",
 ]

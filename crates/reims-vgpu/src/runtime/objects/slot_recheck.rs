@@ -669,7 +669,11 @@ mod tests {
         // Only the older watch: `(1, 2)` was admitted during this sweep's own
         // tranche and has not yet had a later one.
         assert_eq!(
-            ledger.begin_sweep().into_iter().map(|(k, _)| k).collect::<Vec<_>>(),
+            ledger
+                .begin_sweep()
+                .into_iter()
+                .map(|(k, _)| k)
+                .collect::<Vec<_>>(),
             vec![(1, 1)]
         );
     }

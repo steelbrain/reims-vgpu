@@ -244,9 +244,13 @@ printf '%s\n' "$STAMP_WANTED" > build/qemu-build.stamp
 printf '%s\n' "$REIMS_VGPU_BACKEND" > build/reims-vgpu-backend.stamp
 
 # --- Build ----------------------------------------------------------------------
-QEMU_BIN="$QEMU_SRC/build/qemu-system-${QEMU_TARGET}"
-echo "[qemu-build] building qemu-system-${QEMU_TARGET} (links reims-vgpu / $REIMS_VGPU_BACKEND) ..."
-ninja -C build "qemu-system-${QEMU_TARGET}"
+case "$(uname -s)" in
+  MINGW*|MSYS*) EXE_SUFFIX=".exe" ;;
+  *) EXE_SUFFIX="" ;;
+esac
+QEMU_BIN="$QEMU_SRC/build/qemu-system-${QEMU_TARGET}${EXE_SUFFIX}"
+echo "[qemu-build] building qemu-system-${QEMU_TARGET}${EXE_SUFFIX} (links reims-vgpu / $REIMS_VGPU_BACKEND) ..."
+ninja -C build "qemu-system-${QEMU_TARGET}${EXE_SUFFIX}"
 
 # --- Verify (target-specific) ---------------------------------------------------
 case "$QEMU_TARGET" in

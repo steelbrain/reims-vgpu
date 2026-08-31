@@ -139,6 +139,32 @@ impl crate::observe::Decline for DrawError {
         }
     }
 
+    /// Delegated arm for arm with `slug`.
+    ///
+    /// A delegating decline that kept the default owner would claim every
+    /// inner type's slug under its own name, and
+    /// [`crate::observe::slugs`] would report a collision on a wrapper that
+    /// shares no check with anything. The claim has to name the type that
+    /// spelled the slug, not the one that passed it on.
+    fn owner(&self) -> &'static str {
+        match self {
+            Self::TargetRead(d) => d.owner(),
+            Self::GuestPageWrite(d) => d.owner(),
+            Self::Unsupported(r) => r.owner(),
+            Self::VkCall(c) => c.owner(),
+            Self::Slab(d) => d.owner(),
+            Self::FenceTimeout => std::any::type_name::<Self>(),
+            Self::Init(d) => d.owner(),
+            Self::Facade(d) => d.owner(),
+            Self::DrawPreparation(d) => d.owner(),
+            Self::DrawValidation(d) => d.owner(),
+            Self::DrawExecution(d) => d.owner(),
+            Self::ComputeValidation(d) => d.owner(),
+            Self::ComputeExecution(d) => d.owner(),
+            Self::DeviceLost(d) => d.owner(),
+        }
+    }
+
     fn fields(&self) -> Vec<(&'static str, String)> {
         match self {
             Self::TargetRead(d) => d.fields(),
@@ -371,6 +397,76 @@ impl PipelineObjectIdentity {
     }
 }
 
+/// A colour-attachment clear after the attachment's numeric type is known.
+///
+/// Vulkan represents these three cases as members of a union. Keeping a bare
+/// `[f32; 4]` in [`DrawRequest`] lets an integer attachment reach the float
+/// member and turns the float's bits into an integer value. This enum makes
+/// that mismatch unrepresentable at the engine boundary: translation chooses
+/// the variant from the decoded pixel format, and execution only lowers it to
+/// the corresponding Vulkan union member.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ColorClearValue {
+    Float([f32; 4]),
+    Uint([u32; 4]),
+    Sint([i32; 4]),
+}
+
+impl ColorClearValue {
+    /// Convert Metal's double-precision component carrier according to the
+    /// attachment's declared numeric type.
+    pub(crate) fn from_components(
+        numeric: crate::contract::pixel_format::ColorNumericType,
+        components: [f64; 4],
+    ) -> Self {
+        use crate::contract::pixel_format::ClearComponents;
+        match numeric.clear_components(components) {
+            ClearComponents::Float(values) => Self::Float(values),
+            ClearComponents::Uint(values) => Self::Uint(values),
+            ClearComponents::Sint(values) => Self::Sint(values),
+        }
+    }
+
+    pub(crate) fn vk(self) -> vk::ClearColorValue {
+        match self {
+            Self::Float(float32) => vk::ClearColorValue { float32 },
+            Self::Uint(uint32) => vk::ClearColorValue { uint32 },
+            Self::Sint(int32) => vk::ClearColorValue { int32 },
+        }
+    }
+}
+
+impl Default for ColorClearValue {
+    fn default() -> Self {
+        Self::Float([0.0; 4])
+    }
+}
+
+/// One colour attachment's format and clear value as a single engine input.
+///
+/// Fields are private because the pair is constructed by pixel-format
+/// translation. This prevents a request from pairing an integer image format
+/// with a float clear (or the reverse) after translation chose them together.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ColorAttachmentState {
+    format: vk::Format,
+    clear: ColorClearValue,
+}
+
+impl ColorAttachmentState {
+    pub(crate) fn new(format: vk::Format, clear: ColorClearValue) -> Self {
+        Self { format, clear }
+    }
+
+    pub fn format(self) -> vk::Format {
+        self.format
+    }
+
+    pub(crate) fn clear(self) -> ColorClearValue {
+        self.clear
+    }
+}
+
 /// Inputs for one offscreen draw. Engine receives resolved bytes + post-reloc SPIR-V only.
 #[derive(Debug, Default)]
 pub struct DrawRequest {
@@ -382,6 +478,11 @@ pub struct DrawRequest {
     /// module words; `Arc` avoids a full-module copy per draw.
     pub vert_spirv: std::sync::Arc<Vec<u32>>,
     pub frag_spirv: std::sync::Arc<Vec<u32>>,
+    /// Statically used uniform-constant bindings derived once from the exact
+    /// executable variants above. The engine compares these with each draw's
+    /// layout before it lets the host compile the pipeline.
+    pub vert_used_descriptor_bindings: std::sync::Arc<[u32]>,
+    pub frag_used_descriptor_bindings: std::sync::Arc<[u32]>,
     pub width: u32,
     pub height: u32,
     pub vertex_count: u32,
@@ -460,13 +561,16 @@ pub struct DrawRequest {
     pub color_write_mask: ColorWriteMask,
     /// Protocol-derived target identity for GPU residency (workstream D).
     pub target_identity: Option<TargetIdentity>,
-    /// Format of colour attachment zero's texture view.
+    /// Format and clear value of colour attachment zero's texture view.
     ///
     /// This can differ from [`TargetIdentity::resident_format`] without naming
     /// another allocation. Metal texture views over one surface commonly use
     /// the linear and sRGB members of one format-compatibility class; Vulkan
-    /// represents that distinction on the image view and render pass.
-    pub color_attachment_format: Option<vk::Format>,
+    /// represents that distinction on the image view and render pass. The
+    /// paired clear keeps continuous and normalized formats as semantic floats,
+    /// while integer formats carry integer values rather than float bit
+    /// patterns. `None` means the ordinary format fallback and a zero clear.
+    pub color_attachment: Option<ColorAttachmentState>,
     /// Stable shared allocation that may back the primary resident image
     /// directly.
     ///
@@ -488,29 +592,28 @@ pub struct DrawRequest {
     /// Load the live GPU image for [`DrawRequest::target_identity`] instead of
     /// seeding the attachment from the CPU. Requires that resident to exist.
     ///
-    /// This, [`Self::target_rgba8`], [`Self::target_guest_seed`] and
-    /// [`DrawRequest::target_clear`] are the whole load action, and they are
-    /// ordered: `load_from_target` wins, else exactly one seed is copied, else
-    /// the attachment clears to `target_clear`.
+    /// This, [`Self::target_rgba8`], [`Self::target_guest_seed`],
+    /// [`Self::color0_declared`] and [`DrawRequest::color_attachment`] are the
+    /// whole load action, and they are ordered: `load_from_target` wins, else
+    /// exactly one seed is copied, else `color0_declared` decides between
+    /// clearing to [`Self::color_attachment`]'s value and beginning the pass
+    /// undefined.
     pub load_from_target: bool,
-    /// Clear value for the primary colour attachment, in semantic float
-    /// channels — the same shape [`SecondaryColorTarget::clear`] has carried all
-    /// along, and consulted only when the pass resolves to `loadOp = CLEAR`.
+    /// The load action the **guest** declared for slot 0, independent of
+    /// whether this device found any prior contents to honour it with.
     ///
-    /// This used to not exist. The primary's `VkClearValue` was `[0, 0, 0, 0]`
-    /// unconditionally, so a `MTLLoadActionClear` with a colour could not be
-    /// expressed — and the runtime met the contract by allocating a
-    /// whole-attachment RGBA8 bitmap of that solid colour on the CPU, handing it
-    /// over as `target_rgba8`, and paying a channel exchange and a staged upload
-    /// to put a constant into every texel. That also forced the pass key to a
-    /// LOAD pass, because a present seed is what `load_seed` means, so a draw
-    /// that asked to discard its attachment loaded it instead.
+    /// The seed fields above say what this device *can* offer; this says what
+    /// the guest *asked for*, and they are different questions. Without it the
+    /// engine cannot tell a pass that asked to clear from a pass that promised
+    /// to keep its contents and arrived with none — and it then has to invent a
+    /// colour for both. See [`super::caches::Color0Load`].
     ///
-    /// Floats rather than the unorm8 the seed quantised to, which is what the
-    /// contract says: an sRGB attachment takes its clear in linear space and the
-    /// driver encodes it, where the byte path wrote pre-quantised values past
-    /// the encode entirely.
-    pub target_clear: [f32; 4],
+    /// `None` means the caller did not state one, which is a different fact
+    /// from "the guest asked for a clear"; the engine keeps its historical
+    /// answer for it and clears. Only a caller that has decoded a real load
+    /// action fills this in, so an unfilled request cannot silently acquire a
+    /// preserving reading it was never given evidence for.
+    pub color0_declared: Option<crate::contract::pass_action::LoadAction>,
     /// When true, skip full-frame readback (non-Store / ticket path). Content
     /// remains on the GPU under `target_identity` when provided.
     pub skip_readback: bool,
@@ -702,15 +805,13 @@ pub struct SecondaryColorTarget {
     pub identity: TargetIdentity,
     pub width: u32,
     pub height: u32,
-    /// Attachment format, already resolved from the guest's `MTLPixelFormat` by
-    /// `translate::pixel::color_attachment`. A real `VkFormat` rather than a
-    /// three-way enum, so the render pass, the pipeline key and the image agree
-    /// by construction and an sRGB attachment is expressible the day the rail
-    /// flips.
-    pub format: vk::Format,
-    /// Clear value used when `load` is false (semantic float channels).
-    pub clear: [f32; 4],
-    /// true ⇒ LOAD the existing resident content; false ⇒ CLEAR to `clear`.
+    /// Attachment format and clear, resolved together from the guest's
+    /// `MTLPixelFormat` by `translate::pixel::color_attachment`. Keeping the
+    /// pair opaque makes the render pass, image and Vulkan clear union member
+    /// agree by construction.
+    pub attachment: ColorAttachmentState,
+    /// true ⇒ LOAD the existing resident content; false ⇒ CLEAR to this
+    /// attachment's paired clear value.
     pub load: bool,
     /// This slot's own blend state, from the pipeline's per-attachment blend
     /// descriptor. `None` ⇒ the slot writes unblended.
@@ -1027,20 +1128,20 @@ impl BufferContent {
                     if take == 0 {
                         break;
                     }
-                    if skip >= run.len {
-                        skip -= run.len;
+                    if skip >= run.len() {
+                        skip -= run.len();
                         continue;
                     }
                     let within = skip as usize;
                     skip = 0;
-                    let n = (run.len as usize).saturating_sub(within).min(take);
+                    let n = (run.len() as usize).saturating_sub(within).min(take);
                     // SAFETY: `host_ptr` is a stable RAMBlock alias from
                     // `HostOps::map_pages`, valid for the VM lifetime; the
                     // read races guest CPU writes exactly like the staging
                     // path's `read_task_gva_by_id` copy does.
                     unsafe {
                         let slice = std::slice::from_raw_parts(
-                            (run.host_ptr as *const u8).add(within),
+                            (run.host_ptr() as *const u8).add(within),
                             n,
                         );
                         out.extend_from_slice(slice);
@@ -1388,15 +1489,118 @@ pub(crate) struct BlendKey {
 /// Named compute failure. Same `vk_engine_*` prefix family as draw.
 pub type ComputeError = DrawError;
 
+/// The translator's per-region dispatch payload: logical thread grid, thread
+/// base, threadgroup base, and logical threadgroup grid, three `u32` each.
+///
+/// Named once so the payload the runtime copies, the field that carries it, and
+/// the byte range the pipeline layout declares are the same width by
+/// construction rather than by three matching literals.
+pub type ComputeDispatchPayload = [u32; 12];
+
+/// One Vulkan dispatch of a Metal exact-thread launch.
+///
+/// `dispatchThreads` may end a dimension in a partial threadgroup, and Vulkan
+/// fixes a workgroup size per pipeline. The translator answers that by cutting
+/// the launch into at most eight rectangular regions — the interior plus the
+/// boundary slab of each axis — and giving each its own local size and its own
+/// logical origin. A region is a whole dispatch, not a correction to one, so a
+/// dropped region is dropped guest work rather than a rounding error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ComputeDispatchRegion {
+    /// The workgroup size this region's pipeline is specialized to, written to
+    /// the translator's three local-size specialization constants.
+    pub local_size: [u32; 3],
+    /// Workgroup counts for this region's `vkCmdDispatch`.
+    pub group_count: [u32; 3],
+    /// The translator's complete dispatch payload for this region: logical
+    /// thread grid, thread base, threadgroup base, logical threadgroup grid.
+    pub push_constants: ComputeDispatchPayload,
+}
+
+/// How one compute request reaches the device.
+///
+/// The two forms are the translated kernel's own dispatch contract, not a
+/// device-side choice: a module built for whole workgroups bakes its local size
+/// as a constant and cannot serve a partial threadgroup, and a module built for
+/// exact threads leaves its local size specializable and reads its logical grid
+/// from push constants. Carrying them as one enum is what keeps an exact-thread
+/// launch from being issued as a single rounded-up dispatch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ComputeDispatch {
+    /// Whole-workgroup launch: one dispatch of these workgroup counts, no push
+    /// constants. Only for a module whose dispatch contract proved every
+    /// workgroup complete.
+    Workgroups([u32; 3]),
+    /// Exact-thread launch. Every region is issued, each against a pipeline
+    /// specialized to its own local size, each preceded by its own payload
+    /// written at `push_offset`.
+    Regions {
+        /// Reflected byte offset of the 48-byte dispatch payload.
+        push_offset: u32,
+        /// The logical threadgroup grid the regions tile. Census and
+        /// zero-work validation read this, so both stay answerable without
+        /// walking the regions.
+        threadgroups_per_grid: [u32; 3],
+        regions: Vec<ComputeDispatchRegion>,
+    },
+}
+
+impl Default for ComputeDispatch {
+    fn default() -> Self {
+        Self::Workgroups([0; 3])
+    }
+}
+
+impl ComputeDispatch {
+    /// The whole launch's workgroup counts, whichever form issues them.
+    pub fn threadgroups_per_grid(&self) -> [u32; 3] {
+        match self {
+            Self::Workgroups(grid) => *grid,
+            Self::Regions {
+                threadgroups_per_grid,
+                ..
+            } => *threadgroups_per_grid,
+        }
+    }
+
+    /// The push-constant range a pipeline layout for this launch must declare.
+    pub fn push_constant_range(&self) -> Option<(u32, u32)> {
+        match self {
+            Self::Workgroups(_) => None,
+            Self::Regions { push_offset, .. } => {
+                Some((*push_offset, COMPUTE_DISPATCH_PUSH_CONSTANT_SIZE))
+            }
+        }
+    }
+}
+
+/// Byte size of one region's dispatch payload.
+///
+/// Derived from the payload itself rather than restated, so the range a layout
+/// declares cannot drift from the bytes `vkCmdPushConstants` writes. The
+/// assertion below holds it against the translator's own published size; the
+/// two are independently derived — ours from the field, the translator's from
+/// its ABI — and a layout that declares fewer bytes than the shader reads is a
+/// validation error the driver reports, not a wrong answer we could see.
+pub const COMPUTE_DISPATCH_PUSH_CONSTANT_SIZE: u32 =
+    core::mem::size_of::<ComputeDispatchPayload>() as u32;
+
+const _: () = assert!(
+    COMPUTE_DISPATCH_PUSH_CONSTANT_SIZE
+        == metal2vulkan::reflect::KERNEL_DISPATCH_PUSH_CONSTANT_SIZE,
+    "the region payload must be exactly the translator's reflected dispatch range"
+);
+
 /// Inputs for one compute dispatch. Engine receives resolved bytes + SPIR-V only.
 #[derive(Debug, Default)]
 pub struct ComputeRequest {
-    /// Vulkan-dialect compute SPIR-V (LocalSize baked in by metal2vulkan).
+    /// Vulkan-dialect compute SPIR-V. A whole-workgroup module bakes its local
+    /// size; an exact-thread module leaves it specializable per region.
     pub spirv: Vec<u32>,
     /// Entry point name (m2v kernel entry is `"main"`).
     pub entry: String,
-    /// Workgroup counts in (x, y, z). Runtime converts threads→groups when needed.
-    pub grid: [u32; 3],
+    /// The launch form the translated kernel's dispatch contract requires.
+    pub dispatch: ComputeDispatch,
     /// Storage-buffer descriptors with reflected shader write access.
     pub storage_buffers: Vec<ComputeBufferResource>,
     /// Sampled images (binding, format, geometry, immutable input bytes).
@@ -1412,13 +1616,134 @@ pub struct ComputeOutput {
     /// Writable-buffer readbacks only. Read-only descriptors never cross the
     /// device→host boundary after dispatch.
     pub buffers: Vec<ComputeBufferOutput>,
-    /// Image readbacks in request order (same length as `storage_images`).
+    /// One result per requested storage image, in request order (same length as
+    /// `storage_images`).
     ///
-    /// A third case used to leave this empty too: the dispatch copied into an
-    /// imported view of the caller's guest window and `images_direct` said so,
-    /// so the caller skipped its own writeback. That window is gone, and with
-    /// it the flag — every non-deferred image now comes back through here.
-    pub images: Vec<Vec<u8>>,
+    /// Which variant comes back is decided entirely by the matching request's
+    /// [`ComputeStorageImageResource::destination`] — the engine does not choose
+    /// a rail here, it honours the one it was given, so the caller can pair
+    /// result `i` with its own destination without asking the engine what it
+    /// did.
+    pub images: Vec<ComputeImageResult>,
+}
+
+/// Where one storage image's post-dispatch pixels land.
+///
+/// The two variants are the two ways of naming the same landing site, which is
+/// why this is one field and not a `Vec<u8>` with a flag beside it: a request
+/// carrying both a host buffer and a guest window could name two destinations,
+/// and nothing downstream could say which one the guest would read.
+///
+/// This replaces a deleted `images_direct` boolean. The flag went when the
+/// deferred-flush rail was retired and the direct arm went with it; the render
+/// side got [`crate::runtime::render_writeback`] as its replacement and this
+/// rail got nothing, so every image came back through a host readback. See
+/// [`ComputeImageResult`].
+#[derive(Default)]
+pub enum ComputeImageDestination {
+    /// The engine reads the pixels back into host memory and the caller writes
+    /// guest memory itself.
+    ///
+    /// The default, and the *only* form available on a host whose
+    /// `VK_EXT_external_memory_host` capability is not
+    /// [`crate::backend::vulkan::caps::host_pointer::HostPointerImport::Supported`].
+    /// It is not a fallback bolted in front of a general path: on such a host it
+    /// is the general path, and it is what a discrete GPU takes whenever staging
+    /// is the correct answer.
+    #[default]
+    Host,
+    /// The dispatch's own image→buffer copy lands directly in these guest pages
+    /// and no pixels cross device→host.
+    ///
+    /// Carries the same [`super::GuestPageTarget`] the render rail writes through, so
+    /// the guest-window geometry has exactly one spelling in this crate.
+    ///
+    /// # Why the guest cannot see these pages before the copy lands
+    ///
+    /// The copy is only *submitted*, so the ordering argument is the whole
+    /// licence for this variant, and it is inherited rather than built. Arming
+    /// `record_guest_write_debt` sets the process-global `GUEST_WRITE_DEBT`,
+    /// which makes `guest_access_outstanding()` true, which removes
+    /// `StampOrder::CpuReady` from the answers
+    /// `runtime::drain::stamp_word_order_on_fifo` may give. The stamp is then
+    /// handed to `write_completion_stamp`, and the completion thread waits the
+    /// queue's monotonic timeline before it release-stores the word the guest
+    /// polls. This dispatch submitted through the same `ResourcePools` ring and
+    /// the same `submit_guest_work` the render rail uses, so its timeline value
+    /// is below the awaited one and the bytes are in RAM before the guest is
+    /// told anything.
+    ///
+    /// Nothing in that chain names a rail — it is the contract the render rail
+    /// happened to be the only caller of. Two things it is easy to misread:
+    /// the `settle_guest_writes` in `write_stamp` is on the *declined* path
+    /// only and is not what carries a healthy boot, and `write_completion_stamp`
+    /// takes only the *read* debt, deliberately leaving this write debt set so
+    /// later stamps stay ordered until a host reader settles it.
+    GuestPages {
+        target: Box<super::GuestPageTarget>,
+        /// The pages the copy is licensed over, in guest-virtual order.
+        ///
+        /// Carried beside the target and not derived from it, for the same
+        /// reason `copy_target_to_guest_pages` takes the two separately: the
+        /// target holds *host* references into those pages and the write debt
+        /// has to be armed on their guest-physical addresses, which a reference
+        /// cannot be turned back into. One walk produced both.
+        pages: Vec<u64>,
+    },
+}
+
+impl std::fmt::Debug for ComputeImageDestination {
+    /// Names the arm and the window's size, never the window's addresses. A
+    /// [`super::GuestPageTarget`] holds live host pointers into guest RAM, and a
+    /// derived `Debug` would put them in any log line that formats a
+    /// `ComputeRequest`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Host => f.write_str("Host"),
+            Self::GuestPages { target, pages } => write!(
+                f,
+                "GuestPages({}x{}, {} runs, {} pages)",
+                target.width,
+                target.height,
+                target.runs.len(),
+                pages.len()
+            ),
+        }
+    }
+}
+
+/// What one storage image's dispatch produced, paired with the destination that
+/// was asked for.
+#[derive(Debug)]
+pub enum ComputeImageResult {
+    /// Readback pixels, for [`ComputeImageDestination::Host`]. Tight rows: the
+    /// caller re-pitches them into the guest's window.
+    Bytes(Vec<u8>),
+    /// The copy into the guest's own pages is on the queue, for
+    /// [`ComputeImageDestination::GuestPages`]. There are no bytes to hand back
+    /// because none were read.
+    ///
+    /// The caller owes a settle before anything reads those pages, not a
+    /// writeback — the same debt the render rail arms through
+    /// `record_guest_write_debt`. `bytes` is what the copy will land, for the
+    /// census, and is not a length of anything the caller holds.
+    Landed { bytes: u64 },
+}
+
+impl ComputeImageResult {
+    /// The readback pixels, or `None` where the engine wrote guest pages
+    /// directly and never read any.
+    ///
+    /// `None` is not an error and not an empty frame — it means the bytes are
+    /// already where they were going. A caller that treats it as "no output"
+    /// would silently drop a landed frame, so match the variant where the two
+    /// cases need different work and use this only where they do not.
+    pub fn bytes(&self) -> Option<&[u8]> {
+        match self {
+            Self::Bytes(bytes) => Some(bytes),
+            Self::Landed { .. } => None,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1449,7 +1774,16 @@ pub struct ComputeStorageImageResource {
     pub format: StorageImageFormat,
     pub width: u32,
     pub height: u32,
+    /// Seed content, read *into* the image before the dispatch.
+    ///
+    /// Deliberately still a host allocation, and not paired with
+    /// [`Self::destination`]. The seed direction is the GPU *reading* guest
+    /// pages, which this device refuses on its own grounds: it acks a command
+    /// before the work runs, so the guest may repaint those pages first. Only
+    /// the output direction is routed.
     pub bytes: Vec<u8>,
+    /// Where the post-dispatch pixels go. See [`ComputeImageDestination`].
+    pub destination: ComputeImageDestination,
     /// Exact type-11 resource lifetime/view contract for persistent GPU
     /// storage. `None` keeps the conservative transient upload path.
     pub residency: Option<ComputeStorageResidency>,
@@ -1498,11 +1832,52 @@ pub struct ComputeSampledImageResource {
     pub format: StorageImageFormat,
     pub width: u32,
     pub height: u32,
-    pub bytes: Vec<u8>,
-    /// When set, `bytes` is a zero placeholder: the engine seeds the sampled
-    /// image with a device-local copy of the named resident storage image
-    /// instead of uploading from the host (see [`ComputeResidentSampleBind`]).
-    pub resident_bind: Option<ComputeResidentSampleBind>,
+    /// Levels `bytes` carries, base first, tightly packed by
+    /// [`crate::contract::extent::tight_pyramid_spans`] — `1` for every
+    /// binding but a guest mip chain sampled by an explicit LOD.
+    pub mip_levels: u32,
+    /// Where this binding's texels come from.
+    ///
+    /// One field rather than a `Vec<u8>` beside an `Option<ComputeResidentSampleBind>`,
+    /// for the reason [`ComputeSampledImageResource`]'s sibling
+    /// `StagedTexture::serve` already gives: those were the tag and the payload
+    /// of an enum stored apart, so every producer had to build both halves and
+    /// nothing made a producer that set one without the other fail to compile.
+    /// The third source below could not be expressed at all in that shape — it
+    /// has no bytes, valid or placeholder.
+    pub source: ComputeSampledSource,
+}
+
+/// Where a compute sampled binding's texels come from.
+#[derive(Clone, Debug)]
+pub enum ComputeSampledSource {
+    /// Host bytes uploaded into a pooled transient: every level the binding
+    /// declares, base first, tightly packed by
+    /// [`crate::contract::extent::tight_pyramid_spans`].
+    Bytes(Vec<u8>),
+    /// A device-local copy from the named resident storage image into a pooled
+    /// transient (copy-on-sample: the transient never aliases the live
+    /// resident, so the same dispatch may storage-write it).
+    ///
+    /// Only ever a single-level binding: a resident is one window at one level,
+    /// so seeding a pyramid from it would leave levels 1.. empty.
+    ///
+    /// The copy's byte weight is *derived* from the binding's own geometry
+    /// rather than carried. It used to travel as a zero-filled `Vec<u8>` of
+    /// exactly that length, which the request validation then checked against
+    /// the same derivation — a value that cannot disagree, checked as if it
+    /// could.
+    ResidentCopy(ComputeResidentSampleBind),
+    /// A retained multisample render target, bound through its own registry
+    /// view.
+    ///
+    /// Nothing is allocated, uploaded, or copied for this source, and that is
+    /// the contract rather than an optimisation: [`SampledResource::multisampled`]
+    /// states that such an image "can only come from a retained multisample
+    /// target; linear bytes cannot be uploaded into one with a buffer-to-image
+    /// copy". A Metal kernel reaches it by declaring
+    /// `texture2d_ms<T, access::read>` and calling `read(coord, sample)`.
+    MultisampleTarget(TargetIdentity),
 }
 
 /// Pixel formats the product compute path maps. Storage and sampled images
@@ -1520,6 +1895,20 @@ pub enum StorageImageFormat {
     Bgra8Unorm,
     Rg16Float,
     R8Unorm,
+    /// Metal `A8Unorm`: one byte, presenting `(0, 0, 0, a)`.
+    ///
+    /// Its own member rather than [`Self::R8Unorm`], which it shares a
+    /// `VkFormat` with, because the difference between them is not the format
+    /// but the component mapping its view needs — and
+    /// `translate::pixel::vk_component_mapping` states the rule this follows: the
+    /// plan is a property of the *Metal* format, so a rail that has reduced a
+    /// format to a host one can no longer derive it. This enum is that
+    /// reduction, so the distinction has to survive it.
+    ///
+    /// Sampled only. `contract::pixel_format::storage_selector` has no entry for
+    /// this format, and a Vulkan storage-image view must carry an identity
+    /// mapping, so a storage image of it is refused rather than built.
+    A8Unorm,
     Rg8Unorm,
     Rgba32Uint,
     R32Uint,
@@ -1556,6 +1945,20 @@ pub enum StorageImageFormat {
     /// `R16_UNORM`, so it is reachable by the same single route for the same
     /// reason.
     Rg16Unorm,
+    /// Two-channel sixteen-bit **unsigned integer**; **sampled-image only**, on
+    /// [`Self::Rg16Unorm`]'s terms and for a different guest.
+    ///
+    /// `MTLPixelFormatRG16Uint`. A macos-15 guest renders into linear textures
+    /// of this format, so a shader that reads one back binds it here. It shares
+    /// its bytes with the normalized member above and nothing else: an integer
+    /// texel is a count, so it is neither blended as an attachment nor filtered
+    /// when sampled, and both of `DeviceCapabilitySnapshot`'s per-layout masks
+    /// skip it for that reason.
+    ///
+    /// `STORAGE_IMAGE` is not mandatory for `R16G16_UINT`, so it is reachable
+    /// by the same single route as the normalized members and for the same
+    /// reason.
+    Rg16Uint,
     /// Four-channel sixteen-bit normalized; **sampled-image only**, the widest
     /// member of the same family.
     ///
@@ -1600,9 +2003,9 @@ impl StorageImageFormat {
             Self::Rgba16Float | Self::Rgba16Uint => 8,
             Self::Rg16Float => 4,
             Self::Rgba16Unorm => 8,
-            Self::Rg16Unorm => 4,
+            Self::Rg16Unorm | Self::Rg16Uint => 4,
             Self::R16Float | Self::Rg8Unorm | Self::R16Unorm => 2,
-            Self::R8Unorm => 1,
+            Self::R8Unorm | Self::A8Unorm => 1,
             Self::Rgba8Uint
             | Self::Rgba8Sint
             | Self::Rgba8Unorm
@@ -2019,13 +2422,12 @@ pub enum SampledSource {
 
 /// One packed-contiguous guest-RAM span (a direct RAMBlock alias from
 /// `HostOps::map_pages`; stable for the VM lifetime, unmap is a no-op).
-#[derive(Clone, Copy, Debug)]
-pub struct GuestRun {
-    /// Host VA of the span start (page-aligned base + in-page offset).
-    pub host_ptr: usize,
-    /// Byte length of the span.
-    pub len: u64,
-}
+///
+/// Owned by [`crate::runtime::guest_ram`] and re-exported here, because a host
+/// span over guest memory is the memory layer's vocabulary and not the
+/// engine's. It was a pair of public fields on this side of the boundary, and
+/// what that cost is written up on the type itself.
+pub use crate::runtime::guest_ram::GuestRun;
 
 /// Guest-RAM texel source: the requested window is
 /// `source_offset..source_offset + total_len` inside `runs`. With
@@ -2265,8 +2667,10 @@ mod tests {
             identity: surface(2),
             width: 64,
             height: 64,
-            format: vk::Format::B8G8R8A8_UNORM,
-            clear: [0.0; 4],
+            attachment: ColorAttachmentState::new(
+                vk::Format::B8G8R8A8_UNORM,
+                ColorClearValue::default(),
+            ),
             load: false,
             blend: None,
             color_write_mask: ColorWriteMask::default(),
@@ -2526,7 +2930,7 @@ mod tests {
         assert!(!draw.color_input);
 
         let compute = ComputeRequest::default();
-        assert_eq!(compute.grid, [0, 0, 0]);
+        assert_eq!(compute.dispatch, ComputeDispatch::Workgroups([0, 0, 0]));
         assert!(compute.storage_buffers.is_empty());
         assert!(compute.storage_images.is_empty());
     }

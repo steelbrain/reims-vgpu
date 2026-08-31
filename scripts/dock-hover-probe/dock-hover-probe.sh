@@ -134,7 +134,7 @@ HOVER_Y=$(( SH - 44 ))
 APPROACH_Y=$(( SH - 260 ))
 [ "$APPROACH_Y" -lt 0 ] && APPROACH_Y=0
 
-SHOT="$REPO_ROOT/scripts/screenshot-when-kde-plasma-host/screenshot-when-kde-plasma-host.sh"
+SHOT="$REPO_ROOT/scripts/screenshot/screenshot.sh"
 
 span=$(( SW / 2 ))
 left=$(( SW / 4 ))

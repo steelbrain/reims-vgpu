@@ -141,21 +141,26 @@ pub enum Phase {
     /// content key, and the global cache mutex. The translate itself is a miss
     /// path and this boot has none.
     PipelineXlate = 12,
-    /// The CLEAR-seed Store loop at the head of `draw_vk`: one full-surface
-    /// solid buffer per colour attachment, a channel swap for a type-11 target,
-    /// and the write of it into the guest's pages.
+    /// `sync_store_allowed_pages` — the page-table walk that bounds the eager
+    /// GVA fallback, taken before any GPU work so the set predates the submit.
     ///
     /// # Why the prep span is split at all
     ///
-    /// `prep_us` is 0.16 µs a chain on a compositing load and **9.27 µs** on the
-    /// `blur=40` load that runs the drain worker at duty 0.90 — 22.8 % of that
-    /// chain, second only to the engine. A bar that moves by a factor of 58
-    /// between two workloads is measuring something one of them does and the
-    /// other does not, and the span holds exactly two candidates.
-    PrepSeed = 13,
-    /// `sync_store_allowed_pages` — the page-table walk that bounds the eager
-    /// GVA fallback, taken before any GPU work so the set predates the submit.
-    PrepPages = 14,
+    /// `prep_us` was 0.16 µs a chain on a compositing load and **9.27 µs** on
+    /// the `blur=40` load that runs the drain worker at duty 0.90 — 22.8 % of
+    /// that chain, second only to the engine. A bar that moves by a factor of
+    /// 58 between two workloads is measuring something one of them does and the
+    /// other does not, and the span held exactly two candidates.
+    ///
+    /// It held two. The other was the CLEAR-seed Store loop at the head of
+    /// `draw_vk` — one full-surface solid buffer per colour attachment written
+    /// into the guest's pages before any GPU work — and that rail is gone: a
+    /// clear is pass state the guest declares in its render-pass descriptor, so
+    /// `runtime::exec::finish_stream` lands it after the work that might have
+    /// replaced it. Its phase went with it rather than being left to read zero
+    /// forever, which is a bar that looks measured and measures nothing; the
+    /// span it used to hold is now charged to [`Self::Prep`].
+    PrepPages = 13,
     /// The four target-identity rails: resident render chain, GVA deferred
     /// store, type-11 surface resident, and the Load-from-target identity.
     ///
@@ -175,11 +180,11 @@ pub enum Phase {
     /// [`Self::Assemble`] stays the leftover — the same method `ExecPhase` used
     /// on the exec packet, after nominating a part of the child-FIFO loop twice
     /// did not work.
-    AssembleTarget = 15,
+    AssembleTarget = 14,
     /// `load_depth_stencil_descriptor` and the depth/stencil state translation
     /// under it: a guest object-list read plus a descriptor read per draw, on
     /// every draw that binds any depth state at all.
-    AssembleDepth = 16,
+    AssembleDepth = 15,
     /// The GPU hang trail and the fragment binding-gap check that feeds it.
     ///
     /// `declared_binding_numbers` is a **linear walk of the whole fragment
@@ -187,7 +192,7 @@ pub enum Phase {
     /// — the same shape as the `pl_shader_us` finding, which was 63 ms of every
     /// second spent deriving a key for a module already in hand. Charged apart
     /// so the walk can be sized before it is memoized.
-    AssembleTrail = 17,
+    AssembleTrail = 16,
 }
 
 impl Phase {
@@ -231,9 +236,9 @@ pub struct ChainPhaseWindow {
     pub assemble_us: u64,
     pub engine_us: u64,
     pub store_us: u64,
-    /// The two spans carved out of `prep_us`; the three together are what
-    /// `prep_us` used to be alone.
-    pub prep_seed_us: u64,
+    /// The one span still carved out of `prep_us`; the two together are what
+    /// `prep_us` used to be alone. It was two until the CLEAR-seed rail was
+    /// retired — see [`Phase::PrepPages`].
     pub prep_pages_us: u64,
     /// The three spans carved out of `assemble_us`; the four together are what
     /// `assemble_us` used to be alone.
@@ -262,7 +267,6 @@ pub fn take_window() -> Option<ChainPhaseWindow> {
         assemble_us: to_us(ACC[Phase::Assemble as usize].swap(0, Ordering::Relaxed)),
         engine_us: to_us(ACC[Phase::Engine as usize].swap(0, Ordering::Relaxed)),
         store_us: to_us(ACC[Phase::Store as usize].swap(0, Ordering::Relaxed)),
-        prep_seed_us: to_us(ACC[Phase::PrepSeed as usize].swap(0, Ordering::Relaxed)),
         prep_pages_us: to_us(ACC[Phase::PrepPages as usize].swap(0, Ordering::Relaxed)),
         assemble_target_us: to_us(ACC[Phase::AssembleTarget as usize].swap(0, Ordering::Relaxed)),
         assemble_depth_us: to_us(ACC[Phase::AssembleDepth as usize].swap(0, Ordering::Relaxed)),

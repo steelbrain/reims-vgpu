@@ -11,6 +11,9 @@
 # compiles too. Compiling is not enough on its own: a test that compiles on an
 # arm but is cfg'd out still tests nothing, so the script also reports how many
 # tests each arm actually runs.
+#
+# It also gates formatting, which is arm-independent and which nothing else in
+# the toolchain can see — rustc and clippy are both silent on it.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -44,6 +47,10 @@ The three supported arms, one per host GPU API actually available:
 A fourth cell checks crates/reims-vgpu-efi, the PCI option ROM every x86 boot
 builds. It is a separate workspace targeting x86_64-unknown-uefi, so it is not
 a backend arm — but it ships, and nothing else in the repository checks it.
+
+Two cells before all of those run `cargo fmt --all -- --check`, once per
+workspace. rustfmt.toml at the repo root is the format and both workspaces are
+kept clean under it, so these are no-ops until a change leaves a diff.
 
 The feature sets are exactly what vendor/qemu/hw/display/meson.build passes for
 REIMS_VGPU_BACKEND=metal and REIMS_VGPU_BACKEND=vulkan. An Apple host builds
@@ -161,6 +168,29 @@ run_cell() {
   rm -f "$log"
 }
 
+# Formatting is one question for the whole tree, not one per arm, so it gets its
+# own cell shape rather than a feature set. `cargo fmt --all -- --check` exits
+# non-zero and prints the offending hunks; on a clean tree it is silent and
+# costs a second. A missing rustfmt is a FAIL and not a SKIP: a gate that
+# quietly stands down on the machine that lacks the tool is how the Metal arm
+# rotted to 11 errors.
+fmt_cell() {
+  local label="$1" dir="$2"
+  local log status
+  log="$(mktemp)"
+  if (cd "$dir" && cargo fmt --all -- --check) >"$log" 2>&1; then
+    status="PASS"
+    RESULTS+=("$(printf '%-4s %-46s %s' "$status" "$label" "clean")")
+  else
+    status="FAIL"
+    FAILED=1
+    RESULTS+=("$(printf '%-4s %-46s %s' "$status" "$label" "run: cargo fmt --all")")
+    echo "--- $label ---" >&2
+    head -40 "$log" >&2
+  fi
+  rm -f "$log"
+}
+
 # Enumerate an arm's tests without running them. `--list` makes the libtest
 # harness print one `path::name: test` line per test and exit, so the count is
 # what that arm would actually execute — cfg'd-out tests are simply absent.
@@ -199,6 +229,12 @@ count_cell() {
 }
 
 echo "[feature-matrix] host=$HOST_TRIPLE cross=$CROSS_TARGET cargo=$CARGO_CMD"
+
+# Cells 0a and 0b — formatting, one per workspace. These run first because they
+# are the cheapest and need no target installed, and because a formatting diff
+# is the one failure a reviewer should never have to read a compile log to find.
+fmt_cell "rustfmt / workspace" "$WORKSPACE_DIR"
+fmt_cell "rustfmt / reims-vgpu-efi" "$REPO/crates/reims-vgpu-efi"
 
 # Arm 1 — Metal. Native on Apple, cross-checked everywhere else: lib.rs gates
 # backend-metal on target_os, so an Apple *target* is all the arm needs. Only
@@ -240,6 +276,16 @@ esac
 # feature set; the host is what differs.
 run_cell "vulkan,host-window / $HOST_TRIPLE" "" "$FEATURES_VULKAN"
 count_cell "vulkan,host-window / $HOST_TRIPLE" "$FEATURES_VULKAN"
+
+# The supporting crates, counted separately because they are counted at all.
+# `reims-vgpu`'s own count is the number this file has always printed, and a
+# drop in it is supposed to mean a cfg change emptied an arm. When a module
+# moves out into a crate its tests move with it, and a reader with only the
+# first number would read that move as exactly the loss this cell exists to
+# catch. Every arm links these, so the feature set does not change them.
+count_cell "support crates / $HOST_TRIPLE" "" "$WORKSPACE_DIR" \
+  "-p reims-vgpu-contract -p reims-vgpu-env -p reims-vgpu-observe -p reims-vgpu-paging \
+   -p reims-vgpu-wire"
 if [ "$CROSS_TARGET" != "$HOST_TRIPLE" ]; then
   run_cell "vulkan,host-window / $CROSS_TARGET" "$CROSS_TARGET" "$FEATURES_VULKAN"
   if [ "$COUNT_TESTS" -eq 1 ]; then
@@ -284,7 +330,7 @@ if [ "${#COUNTS[@]}" -gt 0 ]; then
 fi
 
 if [ "$FAILED" -ne 0 ]; then
-  echo "[feature-matrix] FAILED: at least one supported arm does not compile" >&2
+  echo "[feature-matrix] FAILED: an arm does not compile, or the tree is unformatted" >&2
   exit 1
 fi
-echo "[feature-matrix] all supported arms compile"
+echo "[feature-matrix] all supported arms compile; both workspaces are rustfmt-clean"

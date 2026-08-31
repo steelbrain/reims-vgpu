@@ -28,12 +28,12 @@
 use foreign_types::{ForeignType, ForeignTypeRef};
 use metal::{
     ArgumentEncoder, BlitCommandEncoderRef, Buffer, BufferRef, CommandBufferRef, CommandQueueRef,
-    ComputeCommandEncoderRef, ComputePipelineState, DeviceRef, FunctionRef,
-    IndirectCommandBuffer, IndirectCommandBufferDescriptorRef, IndirectCommandBufferRef,
-    IndirectComputeCommandRef, IndirectRenderCommandRef, MTLDispatchType,
-    MTLIndexType, MTLPixelFormat, MTLPrimitiveType, MTLRegion, MTLResourceOptions, MTLSize,
-    MTLTextureType, NSInteger, NSRange, NSUInteger, RenderCommandEncoderRef,
-    RenderPassDescriptorRef, RenderPipelineDescriptorRef, Texture, TextureDescriptorRef, TextureRef,
+    ComputeCommandEncoderRef, ComputePipelineState, DeviceRef, FunctionRef, IndirectCommandBuffer,
+    IndirectCommandBufferDescriptorRef, IndirectCommandBufferRef, IndirectComputeCommandRef,
+    IndirectRenderCommandRef, MTLDispatchType, MTLIndexType, MTLPixelFormat, MTLPrimitiveType,
+    MTLRegion, MTLResourceOptions, MTLSize, MTLTextureType, NSInteger, NSRange, NSUInteger,
+    RenderCommandEncoderRef, RenderPassDescriptorRef, RenderPipelineDescriptorRef, Texture,
+    TextureDescriptorRef, TextureRef,
 };
 use objc::runtime::{Object, BOOL, NO, YES};
 use objc::{msg_send, sel, sel_impl};

@@ -1,0 +1,22 @@
+# Guest failures proved to be owned by shader translation.
+#
+# One case name per line. Every active entry must name its ignored `bugs/`
+# handoff package in the comment. The scorer fails if the case starts passing,
+# because that means either the translator was repaired or the case stopped
+# reaching the translated behavior.
+
+# `bugs/compute-multisample-query-reports-one/` -- a compute kernel's
+# `texture2d_ms` sample-count query is folded to the constant 1, so a loop
+# written over `get_num_samples()` runs once and every sample after zero is
+# unreachable. Present in the pinned revision and in published upstream.
+#
+# This case was carried in driver-errors.txt while this device refused the
+# multisample sampled image as `unstageable_multisampled` before translation
+# could execute -- the note kept there said so, and said the classification
+# would move when that stopped being true. It has: the bind is now served from
+# the target resident, the dispatch runs, and sample 0 reads back correctly
+# through a multisample descriptor while samples 1..3 keep the readback
+# buffer's fill. The sibling case `msaa4_color_store_host_sample_count` takes
+# the identical render and comparison through a kernel handed the count by the
+# host and passes, which is what isolates this failure to the query.
+msaa4_color_store_no_resolve # bugs/compute-multisample-query-reports-one

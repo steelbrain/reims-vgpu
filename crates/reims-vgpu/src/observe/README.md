@@ -1,31 +1,32 @@
-# Crate-wide observability
+# This crate's half of observability
 
-`observe/` owns the vocabulary and delivery path for every genuine refusal in
-`reims-vgpu`:
+The vocabulary and the delivery path are the `reims-vgpu-observe` crate:
 
-- `sink.rs` is the always-on `/tmp/reims-vgpu-fail.log` writer, background queue, and
-  flood self-detector.
-- `decline.rs` defines `Decline` and `Refusal`. The vocabulary lives in the
-  `slug()` arms and nowhere else — the 2 700-line `REGISTRY` that used to
-  restate every type's file, emission site and slug list was removed, because a
-  copy of the arms can only ever agree or disagree with them.
-- `emit.rs` is the only reason-bearing line builder. `Emit::decline` requires a
+- `sink.rs` — the always-on `/tmp/reims-vgpu-fail.log` writer, background queue,
+  flood self-detector, and the `verbose`/`when_verbose` entry points a hot path
+  hands diagnostic work to instead of asking whether the log is open.
+- `decline.rs` — `Decline` and `Refusal`. The vocabulary lives in the `slug()`
+  arms and nowhere else; the 2 700-line `REGISTRY` that used to restate every
+  type's file, emission site and slug list was removed, because a copy of the
+  arms can only ever agree or disagree with them.
+- `emit.rs` — the only reason-bearing line builder. `Emit::decline` requires a
   typed decline; `Emit::refusal` makes the successful status of a mixed status
   enum unrepresentable as a failure line.
-- `mod.rs` exposes the shared API and owns small integration tests for the
-  module boundary.
+- `slugs.rs` — crate-wide slug uniqueness, the one property no single `impl` can
+  see and the one that decides whether `Emit::fail_once`'s latch silences a
+  second check. Every rendered line claims its slug for the type that spelled
+  it; a second claimant is reported by name, and panics in a test build.
 
-Crate-wide slug uniqueness — the one property no single `impl` can see, and the
-one that decides whether `Emit::fail_once`'s latch silences a second check — is
-the author's obligation. A source scan used to check it; it is gone. So is any
-check that a slug actually reaches a sink at some call site. Prefix a new slug
-with the rail that owns it and the collision becomes unlikely by construction
-rather than by audit.
+It is a crate so the layers below the device can name their own refusal type
+without depending on the device, and so nothing in it can reach back up into
+`runtime`, `model`, or a backend.
 
-Pure layers may return a typed decline without logging it. The product boundary
-that decides the command really failed owns emission through `Emit`; expected
-speculative control flow remains silent. Re-attempted failures use
-`Emit::fail_once` with a discriminant that distinguishes independent events.
+What stays here is the two emitters that are *about this crate's* types:
 
-The authoritative policy and the exceptions that require judgement are in
-`AGENTS.md`; this file describes ownership, not a second copy of that policy.
+- `ladder.rs` — the four object-list resolution rungs.
+- `panic.rs` — a `catch_unwind` at a `reims_vgpu_qemu_*` entry point.
+
+Both name `runtime` types, which is why they did not move. `mod.rs` re-exports
+the crate's surface under the paths callers already write, so
+`crate::observe::fail(…)` and `crate::observe::Decline` mean what they always
+did.

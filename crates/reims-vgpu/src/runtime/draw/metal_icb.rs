@@ -910,7 +910,8 @@ pub fn encode_icb_execute_and_writeback<M: HostMemory + HostOps>(
     // Writeback each color RT (type-11 mapping or type-2/3 GVA).
     // Same one derivation as the seed side above, so the two halves of this
     // function cannot disagree about the layout of the buffer they share.
-    let Some((stride, need)) = crate::contract::extent::tight_image_layout(width, height, RGBA8_BPP)
+    let Some((stride, need)) =
+        crate::contract::extent::tight_image_layout(width, height, RGBA8_BPP)
     else {
         return EncodeStatus::BadArgs("icb_color_target_degenerate_geometry");
     };

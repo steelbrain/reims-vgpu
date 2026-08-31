@@ -48,7 +48,8 @@
 #
 # Exit 0 once `pgrep -x Dock` succeeds. Exit 1 on timeout, having said which of
 # the two states it timed out in, which is the part the old inline loop could not
-# report. Exit 3 when a crash report was collected and the login was refused.
+# report. Exit 2 when report age cannot be established, and exit 3 when a fresh
+# crash report was collected and the login was refused.
 set -uo pipefail
 export LC_ALL=C
 
@@ -88,11 +89,13 @@ gssh() { timeout 20 ssh -o BatchMode=yes -o ConnectTimeout=5 macos-vm "$1" 2>/de
 # authentication, and it needs no path quoting for names that carry spaces.
 collect_reports() {
   mkdir -p "$REPORTS"
+  local collection
+  collection=$(mktemp -d "$REPORTS/collection.XXXXXX") || return 2
   timeout 60 ssh -o BatchMode=yes -o ConnectTimeout=5 macos-vm \
     'tar -cf - -C / Library/Logs/DiagnosticReports 2>/dev/null; \
      tar -cf - -C "$HOME" Library/Logs/DiagnosticReports 2>/dev/null' \
-    2>/dev/null | tar -xf - -C "$REPORTS" 2>/dev/null
-  find "$REPORTS" \( -name '*.ips' -o -name '*.crash' -o -name '*.panic' \) \
+    2>/dev/null | tar -xf - -C "$collection" 2>/dev/null
+  find "$collection" \( -name '*.ips' -o -name '*.crash' -o -name '*.panic' \) \
     ! -name '._*' 2>/dev/null
 }
 
@@ -119,12 +122,19 @@ collect_reports() {
 # counting them doubled every tally this script has ever printed.
 crashes_since_boot() {
   local boot ref
-  boot=$(gssh 'sysctl -n kern.boottime' | sed -n 's/.*sec *= *\([0-9][0-9]*\).*/\1/p')
-  [ -z "$boot" ] && { printf '%s\n' "$@"; return; }
-  ref=$(mktemp) || { printf '%s\n' "$@"; return; }
+  for _ in 1 2 3; do
+    boot=$(gssh 'sysctl -n kern.boottime' | sed -n 's/.*sec *= *\([0-9][0-9]*\).*/\1/p')
+    [ -n "$boot" ] && break
+    sleep 2
+  done
+  # An unavailable timestamp is not evidence that every report is fresh. The
+  # caller must refuse to classify the login window rather than guess across
+  # the missing contract term.
+  [ -n "$boot" ] || return 2
+  ref=$(mktemp) || return 2
   # `date -d @epoch` on this Linux host; the epoch itself came from the guest, so
   # no clock comparison crosses the boundary.
-  touch -d "@$boot" "$ref" 2>/dev/null || { rm -f "$ref"; printf '%s\n' "$@"; return; }
+  touch -d "@$boot" "$ref" 2>/dev/null || { rm -f "$ref"; return 2; }
   local f
   for f in "$@"; do
     [ -n "$f" ] && [ "$f" -nt "$ref" ] && printf '%s\n' "$f"
@@ -153,7 +163,10 @@ while [ "$SECONDS" -lt "$deadline" ]; do
     # is sitting on the guest either way.
     crashes=$(collect_reports)
     fresh=$(crashes_since_boot $crashes)
-    if [ -n "$fresh" ]; then
+    age_status=$?
+    if [ "$age_status" -ne 0 ]; then
+      say "could not establish report age; leaving the collected files unclassified in $REPORTS"
+    elif [ -n "$fresh" ]; then
       say "crash reports from THIS boot on a guest that reached the desktop — $REPORTS:"
       printf '  %s\n' $fresh
     elif [ -n "$crashes" ]; then
@@ -177,7 +190,12 @@ than this boot (they came with the snapshot) — $REPORTS"
         collected=yes
         crashes=$(collect_reports)
         fresh=$(crashes_since_boot $crashes)
-        if [ -n "$fresh" ]; then
+        age_status=$?
+        if [ "$age_status" -ne 0 ]; then
+          say "cannot establish whether the collected reports predate this boot"
+          say "refusing to log in over evidence of unknown age — files are in $REPORTS"
+          exit 2
+        elif [ -n "$fresh" ]; then
           say "CRASH REPORTS from this boot collected into $REPORTS:"
           printf '  %s\n' $fresh
           if [ "$LOGIN_AFTER_CRASH" != yes ]; then

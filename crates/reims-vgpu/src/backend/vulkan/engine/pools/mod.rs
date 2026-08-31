@@ -633,6 +633,11 @@ pub(crate) struct ResourcePools {
     /// Cannot strand a pin: every entry that can submit passes through
     /// `seal_entry`, and every sealed cleanup belongs to one retiring slot.
     guest_write_pins_live: Vec<TargetIdentity>,
+    /// The compute-storage half of `guest_write_pins_live`, keyed in the other
+    /// registry. Separate because the release has to reach the registry that
+    /// holds the image; identical in discipline, and it travels to the same ring
+    /// slot in the same `seal_entry`.
+    compute_write_pins_live: Vec<crate::model::ComputeStorageResidencyKey>,
     initialized: bool,
 }
 
@@ -868,7 +873,9 @@ struct VertexBufferBinding {
 /// Duplicate bindings have already been rejected by draw validation.
 fn normalize_vertex_bindings(wanted: &mut [VertexBufferBinding]) {
     wanted.sort_unstable_by_key(|entry| entry.binding);
-    debug_assert!(wanted.windows(2).all(|pair| pair[0].binding != pair[1].binding));
+    debug_assert!(wanted
+        .windows(2)
+        .all(|pair| pair[0].binding != pair[1].binding));
 }
 
 /// End index of the maximal consecutive binding run beginning at `start`.
@@ -1193,6 +1200,8 @@ pub(crate) struct PendingGpuCleanup {
     /// Resident pins held by guest-page copies in this submission. The slot's
     /// fence is their lifetime boundary.
     unpin_residents: Vec<TargetIdentity>,
+    /// The same, in the compute-storage registry.
+    unpin_compute_residents: Vec<crate::model::ComputeStorageResidencyKey>,
 }
 
 /// What one sealed entry hands back: the cleanup its ring slot owes once the
@@ -1479,6 +1488,14 @@ pub(crate) struct StorageImageKey {
     pub format: StorageImageFormat,
     /// Read-only sampled descriptor instead of writable storage descriptor.
     pub sampled_only: bool,
+    /// Levels the image holds, `1` for everything but a sampled guest mip
+    /// chain.
+    ///
+    /// Part of the key, not a property set after the fact: a pooled image is
+    /// recycled by key, so a one-level free slot handed to a seven-level
+    /// request would answer `read(coord, 3)` with nothing at all — which is
+    /// indistinguishable from a texture whose upper levels were never written.
+    pub mip_levels: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -1609,6 +1626,14 @@ pub(crate) fn slot_presentable(slot: &ResidentTargetSlot, width: u32, height: u3
 pub(crate) struct NonPinnedTotals {
     pub count: usize,
     pub bytes: u64,
+}
+
+/// Instantaneous resident-registry populations, all measured from one walk.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RegistryLevels {
+    pub current: NonPinnedTotals,
+    pub recoverable: NonPinnedTotals,
+    pub pinned: NonPinnedTotals,
 }
 
 /// Where a registry-resident image sits, and what put it there, as one value.
@@ -1829,9 +1854,7 @@ impl ResidentMemory {
         }
     }
 
-    pub(crate) fn guest_footprint(
-        &self,
-    ) -> Option<crate::runtime::guest_ram::GuestPageFootprint> {
+    pub(crate) fn guest_footprint(&self) -> Option<crate::runtime::guest_ram::GuestPageFootprint> {
         match self {
             Self::GuestImported { guest, .. } => Some(guest.footprint.clone()),
             Self::Recyclable(_) => None,
@@ -2903,9 +2926,7 @@ const fn batch_default_draws(
 /// Called only while an uninitialized pool is being attached to its device.
 /// The chosen cap is then a field on that pool, so neither the environment nor
 /// topology is re-read on the draw path.
-fn batch_max_draws(
-    topology: crate::backend::vulkan::caps::memory_topology::MemoryTopology,
-) -> u64 {
+fn batch_max_draws(topology: crate::backend::vulkan::caps::memory_topology::MemoryTopology) -> u64 {
     let default = batch_default_draws(topology);
     let cap = match crate::env::count(crate::env::BATCH_DRAWS, default) {
         crate::env::Count::Narrowed(n) => n,
@@ -4104,7 +4125,13 @@ mod resident_reuse_tests {
         );
         assert!(!secondary.reusable_for(64, 32, 1, 7, translate::pixel::ResidentFormat::of(bgra)));
         assert!(
-            secondary.reusable_for(64, 32, 1, 7, translate::pixel::ResidentFormat::of(vk::Format::R16G16_SFLOAT)),
+            secondary.reusable_for(
+                64,
+                32,
+                1,
+                7,
+                translate::pixel::ResidentFormat::of(vk::Format::R16G16_SFLOAT)
+            ),
             "the secondary path must still get its own slot back"
         );
     }
@@ -4164,12 +4191,30 @@ mod resident_reuse_tests {
         let rgba = translate::pixel::resident_color(false);
         let s = slot(64, 32, 7, rgba);
         assert!(s.reusable_for(64, 32, 1, 7, translate::pixel::ResidentFormat::of(rgba)));
-        assert!(!s.reusable_for(65, 32, 1, 7, translate::pixel::ResidentFormat::of(rgba)), "width");
-        assert!(!s.reusable_for(64, 33, 1, 7, translate::pixel::ResidentFormat::of(rgba)), "height");
-        assert!(!s.reusable_for(64, 32, 1, 8, translate::pixel::ResidentFormat::of(rgba)), "generation");
-        assert!(!s.reusable_for(64, 32, 2, 7, translate::pixel::ResidentFormat::of(rgba)), "sample count");
         assert!(
-            !s.reusable_for(64, 32, 1, 7, translate::pixel::ResidentFormat::of(translate::pixel::resident_color(true))),
+            !s.reusable_for(65, 32, 1, 7, translate::pixel::ResidentFormat::of(rgba)),
+            "width"
+        );
+        assert!(
+            !s.reusable_for(64, 33, 1, 7, translate::pixel::ResidentFormat::of(rgba)),
+            "height"
+        );
+        assert!(
+            !s.reusable_for(64, 32, 1, 8, translate::pixel::ResidentFormat::of(rgba)),
+            "generation"
+        );
+        assert!(
+            !s.reusable_for(64, 32, 2, 7, translate::pixel::ResidentFormat::of(rgba)),
+            "sample count"
+        );
+        assert!(
+            !s.reusable_for(
+                64,
+                32,
+                1,
+                7,
+                translate::pixel::ResidentFormat::of(translate::pixel::resident_color(true))
+            ),
             "format still separates the two bgra orders"
         );
     }
@@ -4227,21 +4272,13 @@ mod vertex_binding_bulk_tests {
 
     #[test]
     fn attributes_are_sorted_by_binding_without_losing_values() {
-        let mut wanted = vec![
-            binding(3, 30, 3),
-            binding(1, 10, 1),
-            binding(2, 20, 200),
-        ];
+        let mut wanted = vec![binding(3, 30, 3), binding(1, 10, 1), binding(2, 20, 200)];
 
         normalize_vertex_bindings(&mut wanted);
 
         assert_eq!(
             wanted,
-            vec![
-                binding(1, 10, 1),
-                binding(2, 20, 200),
-                binding(3, 30, 3),
-            ]
+            vec![binding(1, 10, 1), binding(2, 20, 200), binding(3, 30, 3),]
         );
         assert_eq!(vertex_binding_run_end(&wanted, 0), 3);
     }
@@ -4268,9 +4305,7 @@ mod vertex_binding_bulk_tests {
 
 #[cfg(test)]
 mod dynamic_state_match_tests {
-    use super::{
-        push_descriptors_match, scissors_match, viewports_match, PushDescriptorBinding,
-    };
+    use super::{push_descriptors_match, scissors_match, viewports_match, PushDescriptorBinding};
     use ash::vk;
     use ash::vk::Handle;
 
@@ -4378,7 +4413,12 @@ mod dynamic_state_match_tests {
             offset: 64,
             range: 128,
         };
-        assert!(push_descriptors_match(Some(layout), &[binding], layout, &[binding]));
+        assert!(push_descriptors_match(
+            Some(layout),
+            &[binding],
+            layout,
+            &[binding]
+        ));
         assert!(!push_descriptors_match(
             Some(vk::PipelineLayout::from_raw(8)),
             &[binding],

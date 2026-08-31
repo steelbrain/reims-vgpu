@@ -157,8 +157,7 @@ fn rt_type4_declared_format(
         .filter(|view| view.width == base_w && view.height == base_h)
         .map(|view| view.pixel_format)
         .filter(|&fmt| fmt != 0);
-    effective_view_sample_format(base_fmt, view_fmt_override.or(type5_declared))
-        .unwrap_or(base_fmt)
+    effective_view_sample_format(base_fmt, view_fmt_override.or(type5_declared)).unwrap_or(base_fmt)
 }
 
 /// Report a type-5 colour attachment whose view record disagrees with the base
@@ -349,10 +348,26 @@ pub(super) struct ResolvedRenderTarget {
     /// Bytes per row of the target (archive `bpr`).
     pub(super) row_stride: u32,
     pub(super) format: u16,
-    /// Attachment samples requested for this encode. Linear texture resource
-    /// dimensions do not retain the creation descriptor's sample count, so the
-    /// Vulkan encode replaces this provisional single-sample value with the
-    /// bound pipeline's raster sample count before constructing an image.
+    /// Attachment samples this target's own declaration asks for.
+    ///
+    /// For a type-2/3 linear texture this is the descriptor's decoded sample
+    /// count — the texture says what it is, and on rail macos-15 four textures a
+    /// boot say four. It was a hardcoded provisional `1` until that field was
+    /// recovered, and the provisional was indistinguishable from a decoded one:
+    /// `attachment_sample_count_override` reported `target_samples=1` against a
+    /// pipeline's `4` on every boot and could not say which side was the
+    /// invention.
+    ///
+    /// It stays `1` on the two paths whose target is a *mapping* rather than a
+    /// texture (type-11 and type-4 surfaces). Those carry no creation
+    /// descriptor, so nothing there declares a sample count and `1` is the
+    /// display contract's own default rather than a stand-in for an unread
+    /// field.
+    ///
+    /// The Vulkan encode still takes the bound pipeline's raster sample count
+    /// when the pipeline declares one, because Metal requires the two to agree
+    /// and the pipeline is the one that must; this is what that agreement is
+    /// checked against.
     pub(super) sample_count: u32,
 }
 
@@ -778,13 +793,13 @@ fn resolve_render_target<M: HostMemory + HostOps>(
     // number, which is what keeps the type-11 and type-4 rungs — neither of
     // which has a mip layout — refusing an attachment level as loudly as they
     // already refuse a view level.
-    let level = view_level
-        .checked_add(att.level)
-        .ok_or(C::LevelOverflow {
+    let level = view_level.checked_add(att.level).ok_or(
+        C::LevelOverflow {
             view_level,
             attachment_level: att.level,
         }
-        .at(resolved_ref))?;
+        .at(resolved_ref),
+    )?;
     if resolved_ref == 0 {
         return Err(C::ViewBaseUnbound.at(resolved_ref));
     }
@@ -939,12 +954,8 @@ fn resolve_render_target<M: HostMemory + HostOps>(
             }
             .at(resolved_ref),
         )?;
-        let fmt = rt_type4_declared_format(
-            base_fmt,
-            (base_w, base_h),
-            type5_view,
-            view_fmt_override,
-        );
+        let fmt =
+            rt_type4_declared_format(base_fmt, (base_w, base_h), type5_view, view_fmt_override);
         if pixel_format::render_target_bpp(fmt).is_none() {
             return Err(C::Type4Format { surface_id, fmt }.at(resolved_ref));
         }
@@ -990,7 +1001,11 @@ fn resolve_render_target<M: HostMemory + HostOps>(
     }
     let base_fmt = tex.pixel_format;
     let fmt = effective_view_sample_format(base_fmt, view_fmt_override).unwrap_or(base_fmt);
-    // Refuses a format with no known bytes-per-texel; the value is not needed.
+    // Refuses a format this device will not render into; the width it returns
+    // is not needed here. That is a narrower question than "is the width known"
+    // — the contract defines a width for depth and block-compressed formats no
+    // colour attachment may name — and conflating the two is what made a
+    // missing width read as a missing capability. See `render_target_bpp`.
     if pixel_format::render_target_bpp(fmt).is_none() {
         return Err(C::LinearFormat { fmt }.at(resolved_ref));
     }
@@ -1103,7 +1118,15 @@ fn resolve_render_target<M: HostMemory + HostOps>(
         height: h,
         row_stride: bpr,
         format: fmt,
-        sample_count: 1,
+        // The texture's own declaration when it made one. `None` means this
+        // descriptor established no sample count -- not that the texture is
+        // single-sample -- but an attachment has to be built with some number,
+        // and one is the only one that is safe to build with: it is what every
+        // path here did before the field was recovered, so a descriptor that
+        // says nothing keeps exactly the behaviour it had. The distinction is
+        // not lost, because `decode_trailer_sample_count` emits
+        // `texture_desc_trailer_disagrees` on the way to `None`.
+        sample_count: tex.sample_count.unwrap_or(1).max(1),
     })
 }
 

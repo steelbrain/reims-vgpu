@@ -11,8 +11,8 @@
 
 use reims_vgpu::backend::vulkan::engine::{
     self, ComputeBufferResource, ComputeRequest, ComputeResidentSampleBind,
-    ComputeSampledImageResource, ComputeStorageImageResource, ComputeStorageResidency,
-    StorageImageFormat,
+    ComputeSampledImageResource, ComputeSampledSource, ComputeStorageImageResource,
+    ComputeStorageResidency, StorageImageFormat,
 };
 use reims_vgpu::model::ComputeStorageResidencyKey;
 use std::path::PathBuf;
@@ -153,6 +153,15 @@ const SAMPLED_IMAGE_FETCH_KERNEL: &str = r#"
                OpFunctionEnd
 "#;
 
+/// [`SAMPLED_IMAGE_FETCH_KERNEL`] with the fetch's explicit LOD named.
+///
+/// The level is in the instruction, not in a sampler's LOD computation, so a
+/// device that serves the wrong level here has the wrong *bytes* in that level
+/// and is not losing an LOD on the sampling path.
+fn sampled_image_fetch_lod_kernel(lod: u32) -> String {
+    SAMPLED_IMAGE_FETCH_KERNEL.replace("Lod %uint_0", &format!("Lod %uint_{lod}"))
+}
+
 fn storage_image_write_red_kernel(spirv_image_format: &str) -> String {
     KERNEL_TEMPLATE.replace("{FMT}", spirv_image_format)
 }
@@ -209,8 +218,19 @@ fn assemble_spvasm(asm: &str, name: &str) -> Option<Vec<u32>> {
         std::process::id()
     ));
     std::fs::write(&asm_path, asm).ok()?;
+    // Pinned to the device's own baseline. `spirv-as` defaults to whatever its
+    // build considers current — SPIR-V 1.6 on a recent SPIRV-Tools — and the
+    // engine validates every module under Vulkan 1.2 semantics, so an
+    // unpinned fixture is rejected for its header version before any of these
+    // tests reach the behaviour they assert.
     let status = Command::new("spirv-as")
-        .args([asm_path.to_str().unwrap(), "-o", spv_path.to_str().unwrap()])
+        .args([
+            "--target-env",
+            "vulkan1.2",
+            asm_path.to_str().unwrap(),
+            "-o",
+            spv_path.to_str().unwrap(),
+        ])
         .status();
     if !matches!(status, Ok(s) if s.success()) {
         eprintln!("SKIP {name}: no spirv-as");
@@ -276,7 +296,7 @@ fn compute_inc_ssbo_known_result() {
     let req = ComputeRequest {
         spirv: words,
         entry: "main".into(),
-        grid: [grid, 1, 1],
+        dispatch: engine::ComputeDispatch::Workgroups([grid, 1, 1]),
         storage_buffers: vec![ComputeBufferResource {
             binding: 0,
             bytes: input,
@@ -338,7 +358,7 @@ fn compute_readonly_ssbo_has_zero_readback() {
     let req = ComputeRequest {
         spirv: words,
         entry: "main".into(),
-        grid: [1, 1, 1],
+        dispatch: engine::ComputeDispatch::Workgroups([1, 1, 1]),
         storage_buffers: vec![ComputeBufferResource {
             binding: 0,
             bytes: 0x1234_5678u32.to_le_bytes().to_vec(),
@@ -414,7 +434,7 @@ fn compute_2d_grid_tiles_global_invocation_xy() {
     let req = ComputeRequest {
         spirv: words.clone(),
         entry: "main".into(),
-        grid: [8, 8, 1],
+        dispatch: engine::ComputeDispatch::Workgroups([8, 8, 1]),
         storage_buffers: vec![ComputeBufferResource {
             binding: 0,
             bytes: zeros.clone(),
@@ -467,11 +487,12 @@ fn compute_storage_image_rgba8unorm_known_result() {
     let req = ComputeRequest {
         spirv: words.clone(),
         entry: "main".into(),
-        grid: [w, h, 1],
+        dispatch: engine::ComputeDispatch::Workgroups([w, h, 1]),
         storage_buffers: vec![],
         sampled_images: vec![],
         samplers: vec![],
         storage_images: vec![ComputeStorageImageResource {
+            destination: Default::default(),
             binding: 0,
             array_element: 0,
             descriptor_count: 1,
@@ -492,7 +513,11 @@ fn compute_storage_image_rgba8unorm_known_result() {
     };
     assert_eq!(out.images.len(), 1);
     // Every texel should be (255,0,0,255) approximately for unorm write of 1,0,0,1
-    for p in out.images[0].chunks_exact(4) {
+    for p in out.images[0]
+        .bytes()
+        .expect("a Host destination reads bytes back")
+        .chunks_exact(4)
+    {
         assert!(
             p[0] >= 254 && p[1] == 0 && p[2] == 0 && p[3] >= 254,
             "unexpected texel {p:?}"
@@ -504,15 +529,19 @@ fn compute_storage_image_rgba8unorm_known_result() {
     assert_eq!(snap.compute_sampled_uploads, 0);
 
     engine::reset_draw_counters();
-    let resident_seed = out.images[0].clone();
+    let resident_seed = out.images[0]
+        .bytes()
+        .expect("a Host destination reads bytes back")
+        .to_vec();
     let hit_req = ComputeRequest {
         spirv: words.clone(),
         entry: "main".into(),
-        grid: [w, h, 1],
+        dispatch: engine::ComputeDispatch::Workgroups([w, h, 1]),
         storage_buffers: vec![],
         sampled_images: vec![],
         samplers: vec![],
         storage_images: vec![ComputeStorageImageResource {
+            destination: Default::default(),
             binding: 0,
             array_element: 0,
             descriptor_count: 1,
@@ -529,7 +558,12 @@ fn compute_storage_image_rgba8unorm_known_result() {
         }],
     };
     let hit = engine::execute_compute_request(&hit_req).expect("resident compute hit");
-    assert_eq!(hit.images[0], resident_seed);
+    assert_eq!(
+        hit.images[0]
+            .bytes()
+            .expect("a Host destination reads bytes back"),
+        &resident_seed[..]
+    );
     let hit_counters = engine::counter_snapshot();
     assert_eq!(hit_counters.compute_storage_seed_uploads, 0);
     assert_eq!(hit_counters.compute_storage_seed_upload_bytes, 0);
@@ -541,11 +575,12 @@ fn compute_storage_image_rgba8unorm_known_result() {
     let mismatch_req = ComputeRequest {
         spirv: words,
         entry: "main".into(),
-        grid: [1, 1, 1],
+        dispatch: engine::ComputeDispatch::Workgroups([1, 1, 1]),
         storage_buffers: vec![],
         sampled_images: vec![],
         samplers: vec![],
         storage_images: vec![ComputeStorageImageResource {
+            destination: Default::default(),
             binding: 0,
             array_element: 0,
             descriptor_count: 1,
@@ -562,8 +597,21 @@ fn compute_storage_image_rgba8unorm_known_result() {
         }],
     };
     let mismatch = engine::execute_compute_request(&mismatch_req).expect("generation mismatch");
-    assert!(mismatch.images[0][0] >= 254 && mismatch.images[0][3] >= 254);
-    assert!(mismatch.images[0][4..].iter().all(|byte| *byte == 0));
+    assert!(
+        mismatch.images[0]
+            .bytes()
+            .expect("a Host destination reads bytes back")[0]
+            >= 254
+            && mismatch.images[0]
+                .bytes()
+                .expect("a Host destination reads bytes back")[3]
+                >= 254
+    );
+    assert!(mismatch.images[0]
+        .bytes()
+        .expect("a Host destination reads bytes back")[4..]
+        .iter()
+        .all(|byte| *byte == 0));
     let mismatch_counters = engine::counter_snapshot();
     assert_eq!(mismatch_counters.compute_storage_seed_uploads, 1);
     assert_eq!(
@@ -620,11 +668,12 @@ fn every_admitted_compute_storage_resident_survives_past_the_retired_slot_cap() 
     let request = |i: u32, seed_generation: u32| ComputeRequest {
         spirv: words.clone(),
         entry: "main".into(),
-        grid: [w, h, 1],
+        dispatch: engine::ComputeDispatch::Workgroups([w, h, 1]),
         storage_buffers: vec![],
         sampled_images: vec![],
         samplers: vec![],
         storage_images: vec![ComputeStorageImageResource {
+            destination: Default::default(),
             binding: 0,
             array_element: 0,
             descriptor_count: 1,
@@ -710,11 +759,12 @@ fn compute_storage_image_bgra8unorm_is_not_channel_swapped() {
     let req = ComputeRequest {
         spirv: words,
         entry: "main".into(),
-        grid: [w, h, 1],
+        dispatch: engine::ComputeDispatch::Workgroups([w, h, 1]),
         storage_buffers: vec![],
         sampled_images: vec![],
         samplers: vec![],
         storage_images: vec![ComputeStorageImageResource {
+            destination: Default::default(),
             binding: 0,
             array_element: 0,
             descriptor_count: 1,
@@ -736,7 +786,11 @@ fn compute_storage_image_bgra8unorm_is_not_channel_swapped() {
     assert_eq!(out.images.len(), 1);
     // Logical red stored into BGRA memory: B=0, G=0, R=255, A=255. A swap
     // (Rgba8Unorm view) would instead give byte0=255 — the bug.
-    for p in out.images[0].chunks_exact(4) {
+    for p in out.images[0]
+        .bytes()
+        .expect("a Host destination reads bytes back")
+        .chunks_exact(4)
+    {
         assert!(
             p[0] == 0 && p[1] == 0 && p[2] >= 254 && p[3] >= 254,
             "BGRA channel order wrong (R/B swap?): texel {p:?}"
@@ -774,11 +828,12 @@ fn compute_storage_image_seed_skip_and_lost_resident() {
         ComputeRequest {
             spirv: words.clone(),
             entry: "main".into(),
-            grid,
+            dispatch: engine::ComputeDispatch::Workgroups(grid),
             storage_buffers: vec![],
             sampled_images: vec![],
             samplers: vec![],
             storage_images: vec![ComputeStorageImageResource {
+                destination: Default::default(),
                 binding: 0,
                 array_element: 0,
                 descriptor_count: 1,
@@ -799,14 +854,22 @@ fn compute_storage_image_seed_skip_and_lost_resident() {
     let Some(fill) = engine_or_skip("seed_skip_fill", &make([w, h, 1], 1, 2, false)) else {
         return;
     };
-    assert!(fill.images[0].chunks_exact(4).all(|p| p[0] >= 254));
+    assert!(fill.images[0]
+        .bytes()
+        .expect("a Host destination reads bytes back")
+        .chunks_exact(4)
+        .all(|p| p[0] >= 254));
 
     // Skip dispatch: one texel, zero-placeholder bytes, matching generation.
     // Untouched texels staying red prove the placeholder was never seeded.
     engine::reset_draw_counters();
     let skip = engine::execute_compute_request(&make([1, 1, 1], 2, 3, true))
         .expect("seed-skip resident hit");
-    for p in skip.images[0].chunks_exact(4) {
+    for p in skip.images[0]
+        .bytes()
+        .expect("a Host destination reads bytes back")
+        .chunks_exact(4)
+    {
         assert!(
             p[0] >= 254 && p[1] == 0 && p[2] == 0 && p[3] >= 254,
             "placeholder leaked into resident: {p:?}"
@@ -865,11 +928,12 @@ fn compute_sampled_resident_copy_and_lost_resident() {
     let fill_req = ComputeRequest {
         spirv: fill_words,
         entry: "main".into(),
-        grid: [w, h, 1],
+        dispatch: engine::ComputeDispatch::Workgroups([w, h, 1]),
         storage_buffers: vec![],
         sampled_images: vec![],
         samplers: vec![],
         storage_images: vec![ComputeStorageImageResource {
+            destination: Default::default(),
             binding: 0,
             array_element: 0,
             descriptor_count: 1,
@@ -888,26 +952,30 @@ fn compute_sampled_resident_copy_and_lost_resident() {
     let Some(fill) = engine_or_skip("resident_sample_fill", &fill_req) else {
         return;
     };
-    assert!(fill.images[0].chunks_exact(4).all(|p| p[0] >= 254));
+    assert!(fill.images[0]
+        .bytes()
+        .expect("a Host destination reads bytes back")
+        .chunks_exact(4)
+        .all(|p| p[0] >= 254));
 
     let make_fetch = |generation: u32| ComputeRequest {
         spirv: fetch_words.clone(),
         entry: "main".into(),
-        grid: [1, 1, 1],
+        dispatch: engine::ComputeDispatch::Workgroups([1, 1, 1]),
         storage_buffers: vec![ComputeBufferResource {
             binding: 0,
             bytes: vec![0; 16],
             writable: true,
         }],
         sampled_images: vec![ComputeSampledImageResource {
+            mip_levels: 1,
             binding: 32,
             array_element: 0,
             descriptor_count: 1,
             format: StorageImageFormat::Rgba8Unorm,
             width: w,
             height: h,
-            bytes: vec![0u8; (w * h * 4) as usize],
-            resident_bind: Some(ComputeResidentSampleBind {
+            source: ComputeSampledSource::ResidentCopy(ComputeResidentSampleBind {
                 identity,
                 generation,
             }),
@@ -976,21 +1044,21 @@ fn compute_sampled_image_fetch_preserves_float_bits() {
     let mut req = ComputeRequest {
         spirv: words,
         entry: "main".into(),
-        grid: [1, 1, 1],
+        dispatch: engine::ComputeDispatch::Workgroups([1, 1, 1]),
         storage_buffers: vec![ComputeBufferResource {
             binding: 0,
             bytes: vec![0; 16],
             writable: true,
         }],
         sampled_images: vec![ComputeSampledImageResource {
+            mip_levels: 1,
             binding: 32,
             array_element: 0,
             descriptor_count: 1,
             format: StorageImageFormat::Rgba32Float,
             width: 1,
             height: 1,
-            bytes,
-            resident_bind: None,
+            source: ComputeSampledSource::Bytes(bytes),
         }],
         samplers: vec![],
         storage_images: vec![],
@@ -1014,7 +1082,7 @@ fn compute_sampled_image_fetch_preserves_float_bits() {
     // RGB9E5 has no writable-storage selector in the guest ABI, but it is a
     // valid sampled texture. Zero packed RGB decodes to (0, 0, 0, 1).
     req.sampled_images[0].format = StorageImageFormat::Rgb9e5Ufloat;
-    req.sampled_images[0].bytes = vec![0; 4];
+    req.sampled_images[0].source = ComputeSampledSource::Bytes(vec![0; 4]);
     let Some(out) = engine_or_skip("compute sampled RGB9E5 image", &req) else {
         return;
     };
@@ -1041,7 +1109,8 @@ fn compute_sampled_image_fetch_preserves_float_bits() {
     };
     req.spirv = words;
     req.sampled_images[0].format = StorageImageFormat::R32Uint;
-    req.sampled_images[0].bytes = 0x1234_5678u32.to_le_bytes().to_vec();
+    req.sampled_images[0].source =
+        ComputeSampledSource::Bytes(0x1234_5678u32.to_le_bytes().to_vec());
     let Some(out) = engine_or_skip("compute sampled R32Uint image", &req) else {
         return;
     };
@@ -1064,11 +1133,21 @@ fn compute_m2v_float_mul4_add3_known_result() {
     let inp: Vec<f32> = vec![1., 2., 3., 4., 5., 6., 7., 8.];
     let want: Vec<f32> = vec![7., 11., 15., 19., 23., 27., 31., 35.];
     let input: Vec<u8> = inp.iter().flat_map(|x| x.to_le_bytes()).collect();
-    let grid = 1u32; // LocalSize 64, one group covers ≤64
+    // LocalSize 64 against 8 threads: v30 decomposes that into one boundary
+    // region whose pipeline specializes a workgroup size of 8, so exactly the
+    // eight authored elements are launched and no lane runs past the buffer.
     let req = ComputeRequest {
         spirv: words,
         entry: "main".into(),
-        grid: [grid, 1, 1],
+        dispatch: engine::ComputeDispatch::Regions {
+            push_offset: 0,
+            threadgroups_per_grid: [1, 1, 1],
+            regions: vec![engine::ComputeDispatchRegion {
+                local_size: [inp.len() as u32, 1, 1],
+                group_count: [1, 1, 1],
+                push_constants: [inp.len() as u32, 1, 1, 0, 0, 0, 0, 0, 0, 1, 1, 1],
+            }],
+        },
         storage_buffers: vec![ComputeBufferResource {
             binding: 0,
             bytes: input,
@@ -1101,7 +1180,7 @@ fn warm_identical_dispatch_zero_creates_and_allocs() {
     let make_req = || ComputeRequest {
         spirv: words.clone(),
         entry: "main".into(),
-        grid: [1, 1, 1],
+        dispatch: engine::ComputeDispatch::Workgroups([1, 1, 1]),
         storage_buffers: vec![ComputeBufferResource {
             binding: 0,
             bytes: input.clone(),
@@ -1188,11 +1267,12 @@ fn compute_storage_image_r16float_if_supported() {
     let req = ComputeRequest {
         spirv: words,
         entry: "main".into(),
-        grid: [2, 2, 1],
+        dispatch: engine::ComputeDispatch::Workgroups([2, 2, 1]),
         storage_buffers: vec![],
         sampled_images: vec![],
         samplers: vec![],
         storage_images: vec![ComputeStorageImageResource {
+            destination: Default::default(),
             binding: 0,
             array_element: 0,
             descriptor_count: 1,
@@ -1207,7 +1287,13 @@ fn compute_storage_image_r16float_if_supported() {
     match engine::execute_compute_request(&req) {
         Ok(out) => {
             assert_eq!(out.images.len(), 1);
-            assert_eq!(out.images[0].len(), 8);
+            assert_eq!(
+                out.images[0]
+                    .bytes()
+                    .expect("a Host destination reads bytes back")
+                    .len(),
+                8
+            );
         }
         Err(e) => {
             let s = e.to_string();
@@ -1283,7 +1369,7 @@ fn a_short_bind_cannot_read_the_tail_of_the_slot_it_was_given() {
     let dispatch = |bytes: Vec<u8>| ComputeRequest {
         spirv: words.clone(),
         entry: "main".into(),
-        grid: [1, 1, 1],
+        dispatch: engine::ComputeDispatch::Workgroups([1, 1, 1]),
         storage_buffers: vec![ComputeBufferResource {
             binding: 0,
             bytes,
@@ -1319,5 +1405,204 @@ fn a_short_bind_cannot_read_the_tail_of_the_slot_it_was_given() {
         "a read past this bind's 100 bytes returned {seen:#010x} — the descriptor \
          range let the shader reach the pooled slot's tail, which still holds the \
          previous bind's bytes"
+    );
+}
+
+/// Every level of a sampled mip pyramid reaches the device, at its own extent
+/// and its own bytes.
+///
+/// The runtime packs a guest mip chain into one upload, base first, and the
+/// engine apportions it to levels. If it built a single-level image — which it
+/// did — an `OpImageFetch ... Lod n` for any `n > 0` returns nothing at all,
+/// which is indistinguishable from a texture whose upper levels were never
+/// written. The layout is spelled out here by hand rather than taken from
+/// `tight_pyramid_spans`, so this checks the engine against the contract and
+/// not against the producer's copy of it.
+#[test]
+fn compute_sampled_image_serves_every_declared_mip_level() {
+    let _g = engine_test_session();
+    const BASE: u32 = 8;
+    const LEVELS: u32 = 4; // 8, 4, 2, 1
+                           // Marker bytes are all four channels of one level, chosen so a level served
+                           // from a neighbour's offset reads as that neighbour and not as noise.
+    let marker = |level: u32| (0x10 + level * 0x11) as u8;
+
+    let mut bytes = Vec::new();
+    let mut extents = Vec::new();
+    for level in 0..LEVELS {
+        let side = (BASE >> level).max(1);
+        extents.push(side);
+        bytes.extend(std::iter::repeat_n(
+            marker(level),
+            (side * side * 4) as usize,
+        ));
+    }
+
+    for level in 0..LEVELS {
+        let Some(words) = assemble_spvasm(
+            &sampled_image_fetch_lod_kernel(level),
+            &format!("mip_fetch_lod_{level}"),
+        ) else {
+            return;
+        };
+        let req = ComputeRequest {
+            spirv: words,
+            entry: "main".into(),
+            dispatch: engine::ComputeDispatch::Workgroups([1, 1, 1]),
+            storage_buffers: vec![ComputeBufferResource {
+                binding: 0,
+                bytes: vec![0; 16],
+                writable: true,
+            }],
+            sampled_images: vec![ComputeSampledImageResource {
+                binding: 32,
+                array_element: 0,
+                descriptor_count: 1,
+                format: StorageImageFormat::Rgba8Unorm,
+                width: BASE,
+                height: BASE,
+                mip_levels: LEVELS,
+                source: ComputeSampledSource::Bytes(bytes.clone()),
+            }],
+            samplers: vec![],
+            storage_images: vec![],
+        };
+        let Some(out) = engine_or_skip(&format!("mip_level_{level}"), &req) else {
+            return;
+        };
+        let got: Vec<f32> = out.buffers[0]
+            .bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let want = f32::from(marker(level)) / 255.0;
+        for (channel, value) in got.iter().enumerate() {
+            assert!(
+                (value - want).abs() < 1.0 / 255.0,
+                "level {level} channel {channel}: got {value}, want {want} \
+                 (level {level} is {}x{} and its marker is {:#04x})",
+                extents[level as usize],
+                extents[level as usize],
+                marker(level)
+            );
+        }
+    }
+}
+
+/// A resident source is one window at one level, so pairing it with a pyramid
+/// is refused by name rather than served as a base with empty levels above it.
+#[test]
+fn compute_sampled_resident_bind_refuses_a_pyramid() {
+    let _g = engine_test_session();
+    let Some(words) = assemble_spvasm(SAMPLED_IMAGE_FETCH_KERNEL, "resident_pyramid") else {
+        return;
+    };
+    let req = ComputeRequest {
+        spirv: words,
+        entry: "main".into(),
+        dispatch: engine::ComputeDispatch::Workgroups([1, 1, 1]),
+        storage_buffers: vec![ComputeBufferResource {
+            binding: 0,
+            bytes: vec![0; 16],
+            writable: true,
+        }],
+        sampled_images: vec![ComputeSampledImageResource {
+            binding: 32,
+            array_element: 0,
+            descriptor_count: 1,
+            format: StorageImageFormat::Rgba8Unorm,
+            width: 8,
+            height: 8,
+            mip_levels: 4,
+            source: ComputeSampledSource::ResidentCopy(ComputeResidentSampleBind {
+                identity: ComputeStorageResidencyKey {
+                    mapping_id: 94,
+                    map_generation: 1,
+                    surface_offset: 0,
+                    surface_bpr: 32,
+                    span_end: 256,
+                    width: 8,
+                    height: 8,
+                    pixel_format: 0x46,
+                    texture_ref: 0,
+                },
+                generation: 1,
+            }),
+        }],
+        samplers: vec![],
+        storage_images: vec![],
+    };
+    let err = engine::execute_compute_request(&req)
+        .expect_err("a resident source cannot answer for a pyramid");
+    let text = err.to_string();
+    if skip_if_no_gpu(&text) {
+        eprintln!("SKIP resident_pyramid: no GPU ({text})");
+        return;
+    }
+    assert!(
+        text.contains("vk_compute_exec_resident_sample_is_not_a_pyramid"),
+        "unexpected error: {text}"
+    );
+}
+
+/// `A8Unorm` samples in a dispatch as `(0, 0, 0, a)`, not as its byte in red.
+///
+/// The Vulkan 1.2 baseline has no single-channel alpha format, so the byte rides
+/// in `R8_UNORM` and a view component mapping puts it back. Both halves have to
+/// be right: the engine format has to stay distinct from `R8Unorm`, which it
+/// shares that `VkFormat` with, and the sampled view has to bind the mapping.
+/// Getting the second wrong is silent — the shader reads a plausible non-zero
+/// value in the wrong channel.
+#[test]
+fn compute_sampled_a8unorm_arrives_in_alpha() {
+    let _g = engine_test_session();
+    let Some(words) = assemble_spvasm(SAMPLED_IMAGE_FETCH_KERNEL, "a8unorm_fetch") else {
+        return;
+    };
+    let w = 4u32;
+    let h = 4u32;
+    // Not 0x00 or 0xff: a mapping that dropped the channel entirely and one that
+    // filled it with ONE both answer those.
+    const BYTE: u8 = 0x80;
+    let req = ComputeRequest {
+        spirv: words,
+        entry: "main".into(),
+        dispatch: engine::ComputeDispatch::Workgroups([1, 1, 1]),
+        storage_buffers: vec![ComputeBufferResource {
+            binding: 0,
+            bytes: vec![0; 16],
+            writable: true,
+        }],
+        sampled_images: vec![ComputeSampledImageResource {
+            binding: 32,
+            array_element: 0,
+            descriptor_count: 1,
+            format: StorageImageFormat::A8Unorm,
+            width: w,
+            height: h,
+            mip_levels: 1,
+            source: ComputeSampledSource::Bytes(vec![BYTE; (w * h) as usize]),
+        }],
+        samplers: vec![],
+        storage_images: vec![],
+    };
+    let Some(out) = engine_or_skip("a8unorm_fetch", &req) else {
+        return;
+    };
+    let got: Vec<f32> = out.buffers[0]
+        .bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    let want_alpha = f32::from(BYTE) / 255.0;
+    assert!(
+        got[0] == 0.0 && got[1] == 0.0 && got[2] == 0.0,
+        "A8Unorm has no colour channels; got rgb {:?} — the byte was sampled as red",
+        &got[..3]
+    );
+    assert!(
+        (got[3] - want_alpha).abs() < 1.0 / 255.0,
+        "alpha: got {}, want {want_alpha}",
+        got[3]
     );
 }

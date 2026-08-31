@@ -332,6 +332,17 @@ pub struct ShaderVariant {
     /// with nothing in the log to say so. Interleaving is not optional for a pin
     /// comparison on this host.
     pub samplers: Arc<[crate::runtime::spirv_bind::ReflectedSamplerDescriptor]>,
+    /// Uniform-constant descriptor bindings the executable module statically
+    /// uses, in this variant's binding numbering.
+    ///
+    /// Vulkan requires each of these to appear in the pipeline layout. The
+    /// engine checks that relation for every draw because a missing binding can
+    /// crash a host driver during pipeline creation, but the left-hand set is
+    /// immutable shader state: deriving it from the full module at every draw
+    /// reconstructed state already retained here. Keeping it beside `words`
+    /// also makes relocation agreement structural rather than a call-site
+    /// convention.
+    pub used_descriptor_bindings: Arc<[u32]>,
 }
 
 impl ShaderVariant {
@@ -339,7 +350,18 @@ impl ShaderVariant {
         words: Arc<Vec<u32>>,
         samplers: Arc<[crate::runtime::spirv_bind::ReflectedSamplerDescriptor]>,
     ) -> Arc<Self> {
-        Arc::new(Self { words, samplers })
+        let used_descriptor_bindings = crate::runtime::spirv_bind::declared_binding_numbers(&words)
+            .into_iter()
+            .filter(|binding| {
+                crate::runtime::spirv_bind::descriptor_static_use(&words, *binding).is_violation()
+            })
+            .collect::<Vec<_>>()
+            .into();
+        Arc::new(Self {
+            words,
+            samplers,
+            used_descriptor_bindings,
+        })
     }
 }
 
@@ -710,6 +732,61 @@ fn translation_lock() -> &'static Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
+/// Directory [`capture_air`] writes into.
+fn air_capture_dir() -> std::path::PathBuf {
+    std::path::PathBuf::from("/tmp/reims-vgpu-air")
+}
+
+/// Write one translated AIR blob beside the size of the SPIR-V it produced.
+///
+/// The name is the join this exists for. A driver quarantine line and a
+/// validator refusal both quote the emitted module's **word count**, and
+/// neither can name the AIR that produced it — so the count goes in the file
+/// name and a handover is a lookup rather than another boot.
+///
+/// Observation only, on both the guest path and the failure path: every write
+/// here is best-effort, and a failure is reported once and then ignored. This
+/// runs after the translation it describes, so it cannot change what that
+/// translation produced or whether it was cached.
+fn capture_air(air: &[u8], stage: Stage, spirv: &[u8]) {
+    if !matches!(
+        crate::env::switch(crate::env::AIR_CAPTURE),
+        crate::env::Switch::On
+    ) {
+        return;
+    }
+    let dir = air_capture_dir();
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        crate::observe::fail(format!(
+            "air_capture reason=mkdir_failed dir={} err={e}",
+            dir.display()
+        ));
+        return;
+    }
+    // The AIR digest disambiguates two shaders whose modules happen to be the
+    // same length; the word count is what a quarantine or validator line
+    // quotes, so it leads.
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    air.hash(&mut hasher);
+    let digest = hasher.finish();
+    let words = spirv.len() / 4;
+    let name = format!("{}-w{words}-{digest:016x}.air", stage_name(stage));
+    let path = dir.join(&name);
+    if path.exists() {
+        return;
+    }
+    match std::fs::write(&path, air) {
+        Ok(()) => crate::observe::fail(format!(
+            "air_capture ok stage={} air_bytes={} spirv_words={words} file={name}",
+            stage_name(stage),
+            air.len()
+        )),
+        Err(e) => crate::observe::fail(format!(
+            "air_capture reason=write_failed file={name} err={e}"
+        )),
+    }
+}
+
 fn translate_air(air: &[u8], stage: Stage) -> M2vResult<CachedShader> {
     // metal2vulkan's tool boundary uses fixed scratch names inside `tmp_dir`.
     // Serialize sync and background calls so their AIR/LLVM/SPIR-V files never
@@ -729,6 +806,7 @@ fn translate_air(air: &[u8], stage: Stage) -> M2vResult<CachedShader> {
     let (spirv, reflection) =
         metal2vulkan::translate_reflected(path.to_str().unwrap_or(name), stage, &tmp)
             .map_err(|e| translate_decline(stage, e.to_string()))?;
+    capture_air(air, stage, &spirv);
     finish_translated(spirv, reflection, stage)
 }
 
@@ -752,6 +830,7 @@ fn translate_kernel_air(air: &[u8], local_size: [u32; 3]) -> M2vResult<CachedSha
     .map_err(|e| M2vCacheDecline::KernelTranslate {
         detail: e.to_string(),
     })?;
+    capture_air(air, Stage::Kernel, &spirv);
     if reflection.local_size != Some(local_size) {
         return Err(M2vCacheDecline::KernelLocalSizeMismatch {
             requested: local_size,
@@ -1049,12 +1128,12 @@ pub fn translate_cached_reflected(
                 // (~1.1M lines / boot, drowning real failures) and paid a file write
                 // per draw on the render path. Verbose-gated only; the miss/`ok` line
                 // below stays always-on so cache lifecycle is still visible.
-                if crate::observe::draw_log_enabled() {
-                    crate::observe::line(format!(
+                crate::observe::verbose(|| {
+                    format!(
                         "linux_m2v_translate_hit pipe={pipeline_ref} stage={stage:?} spv={} hits={hits} misses={misses}",
                         shader.spirv.len()
-                    ));
-                }
+                    )
+                });
                 return Ok(shader);
             }
             Some(Entry::Failed(e)) => {
@@ -1112,12 +1191,12 @@ pub fn translate_cached_kernel_reflected(
                 drop(c);
                 // Verbose-gated (see `translate_cached_reflected`): a compute-kernel cache hit
                 // is the hot path and only carries a cumulative counter.
-                if crate::observe::draw_log_enabled() {
-                    crate::observe::line(format!(
+                crate::observe::verbose(|| {
+                    format!(
                         "linux_m2v_translate_hit pipe={pipeline_ref} stage=Kernel tg=[{},{},{}] spv={} hits={hits} misses={misses}",
                         local_size[0], local_size[1], local_size[2], shader.spirv.len()
-                    ));
-                }
+                    )
+                });
                 return Ok(shader);
             }
             Some(Entry::Failed(e)) => {
@@ -1243,10 +1322,42 @@ mod tests {
         }
     }
 
+    /// Static use belongs to the executable variant, not to each draw that
+    /// binds it. A declaration alone is legal to omit from a Vulkan layout;
+    /// only an instruction reference enters the retained guard set.
+    #[test]
+    fn a_variant_retains_only_statically_used_descriptor_bindings() {
+        let unused = crate::runtime::spirv_bind::test_support::module_with_descriptor(33, false);
+        let used = crate::runtime::spirv_bind::test_support::module_with_descriptor(34, true);
+
+        let unused_shader = synth_shader(
+            Stage::Fragment,
+            unused.iter().flat_map(|word| word.to_le_bytes()).collect(),
+        );
+        let used_shader = synth_shader(
+            Stage::Fragment,
+            used.iter().flat_map(|word| word.to_le_bytes()).collect(),
+        );
+
+        assert!(unused_shader
+            .variant(false, false)
+            .used_descriptor_bindings
+            .is_empty());
+        assert_eq!(
+            used_shader
+                .variant(false, false)
+                .used_descriptor_bindings
+                .as_ref(),
+            &[34]
+        );
+    }
+
     /// A minimal `CachedShader` wrapping raw bytes with an empty reflection —
     /// enough to prime the cache in unit tests that never call metal2vulkan.
     fn synth_shader(stage: Stage, spirv: Vec<u8>) -> Arc<CachedShader> {
-        use metal2vulkan::reflect::{ShaderReflection, ShaderStage, REFLECTION_VERSION};
+        use metal2vulkan::reflect::{
+            DescriptorLayout, ShaderReflection, ShaderStage, REFLECTION_VERSION,
+        };
         let stage = match stage {
             Stage::Vertex => ShaderStage::Vertex,
             Stage::Fragment => ShaderStage::Fragment,
@@ -1273,6 +1384,10 @@ mod tests {
                 implicit_imageblock_attachments: vec![],
                 fragment_imageblock: None,
                 datalayout: None,
+                descriptor_layout: DescriptorLayout::default(),
+                kernel_dispatch: None,
+                runtime_sampler_specializations: vec![],
+                runtime_storage_image_specializations: vec![],
                 function_constants: vec![],
             }),
         ))
@@ -1284,8 +1399,8 @@ mod tests {
         metal_indices: &[u32],
     ) -> Arc<CachedShader> {
         use metal2vulkan::reflect::{
-            DescriptorLocation, ResourceBinding, ResourceKind, ShaderReflection, ShaderStage,
-            REFLECTION_VERSION, RESOURCE_DESCRIPTOR_SET, SAMPLER_BINDING_BASE,
+            DescriptorLayout, DescriptorLocation, ResourceBinding, ResourceKind, ShaderReflection,
+            ShaderStage, REFLECTION_VERSION, RESOURCE_DESCRIPTOR_SET, SAMPLER_BINDING_BASE,
         };
         let reflected_stage = match stage {
             Stage::Vertex => ShaderStage::Vertex,
@@ -1338,6 +1453,10 @@ mod tests {
                 implicit_imageblock_attachments: vec![],
                 fragment_imageblock: None,
                 datalayout: None,
+                descriptor_layout: DescriptorLayout::default(),
+                kernel_dispatch: None,
+                runtime_sampler_specializations: vec![],
+                runtime_storage_image_specializations: vec![],
                 function_constants: vec![],
             }),
         ))
@@ -1379,11 +1498,11 @@ mod tests {
         let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let shader = synth_shader(Stage::Fragment, bytes);
 
-        // The stored module is the widened one: the sampler moved out of the
-        // texture band's way, the buffer and texture did not move at all.
+        // The translator's v22 layout is already wide, so the compatibility
+        // pass leaves all three bindings unchanged.
         let mut widened = words.clone();
         let moved = crate::runtime::spirv_bind::widen_sampled_bands(&mut widened);
-        assert_eq!(moved, 1, "only the sampler band moves");
+        assert_eq!(moved, 0, "the translator and device layouts agree");
         assert_eq!(*shader.words, widened);
         assert_eq!(shader.words[8], 3);
         assert_eq!(shader.words[12], M2V_TEXTURE_BINDING_BASE + 8);

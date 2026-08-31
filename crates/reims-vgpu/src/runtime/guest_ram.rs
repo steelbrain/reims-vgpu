@@ -997,6 +997,89 @@ pub struct BoundRange {
     pub len: u64,
 }
 
+/// One packed-contiguous span of guest RAM, as the host address that reads it.
+///
+/// # Why the fields are not public
+///
+/// This is the shape [`GuestRamImport::host_base`]'s doc rules out — "a
+/// per-slice host pointer is the raw-offset-plus-base arithmetic this module
+/// exists to make unwritable" — and it existed anyway, as a pair of public
+/// fields in the Vulkan engine's own types, built at call sites out of whatever
+/// base and offset were in scope. Its doc stated the obligation and nothing
+/// held it: "every run's `host_ptr..+len` must already be a live
+/// `HostOps::map_pages` alias when the source is built: the gather reads it
+/// directly and has nothing to check it against."
+///
+/// A packed buffer resolution then added a `map_pages` view's base to an offset
+/// measured from a RAMBlock import's `gpa_base`. Both names were `head`, both
+/// were byte offsets, and they differed by the window's distance into the
+/// block — so the run named an address outside the view by exactly that
+/// distance, and `write_staging_from_runs` read it. Two coordinate systems that
+/// look alike is not a mistake a reviewer reliably catches; it is one a
+/// constructor can refuse.
+///
+/// So there is one constructor, [`Self::in_mapping`], it takes the bound as an
+/// argument, and it returns `None` rather than a span reaching past it. The
+/// same window expressed in the wrong coordinates now fails the bound instead
+/// of producing a wild pointer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GuestRun {
+    host_ptr: usize,
+    len: u64,
+}
+
+impl GuestRun {
+    /// The `offset..offset + len` window of a live host mapping: `base` is its
+    /// first byte and `mapping_len` its length.
+    ///
+    /// `None` when the window is not inside the mapping, or when the address
+    /// arithmetic would wrap. Both are the caller's own coordinates being
+    /// wrong, and both used to be spendable.
+    ///
+    /// `base` must be a mapping the reader may dereference for as long as it
+    /// holds the run — a `HostOps::map_pages` alias, or a
+    /// [`GuestRamImport::host_base`] whose import is live. That obligation
+    /// cannot be checked here and stays the caller's; the *bound* is what this
+    /// takes over.
+    pub fn in_mapping(base: usize, mapping_len: u64, offset: u64, len: u64) -> Option<Self> {
+        if base == 0 {
+            return None;
+        }
+        let end = offset.checked_add(len)?;
+        if end > mapping_len {
+            return None;
+        }
+        let host_ptr = base.checked_add(usize::try_from(offset).ok()?)?;
+        host_ptr.checked_add(usize::try_from(len).ok()?)?;
+        Some(Self { host_ptr, len })
+    }
+
+    /// A run over the whole of one mapping: the mapping *is* the window.
+    ///
+    /// `in_mapping(base, len, 0, len)`, named because that case is common —
+    /// a whole import, a fixture's own buffer — and because spelling `len`
+    /// twice at a call site is an invitation for the two to drift apart.
+    pub fn whole(base: usize, len: u64) -> Option<Self> {
+        Self::in_mapping(base, len, 0, len)
+    }
+
+    /// Host address of the span's first byte.
+    pub fn host_ptr(&self) -> usize {
+        self.host_ptr
+    }
+
+    /// Bytes covered.
+    pub fn len(&self) -> u64 {
+        self.len
+    }
+
+    /// Never true through [`Self::in_mapping`] with a non-zero `len`; present
+    /// because a `len` without an `is_empty` is a lint.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1015,10 +1098,49 @@ mod tests {
         .expect("region is aligned and non-empty")
     }
 
+    /// A run may not name a byte past the mapping it was cut from.
+    ///
+    /// The refused case is the one that was reachable: a window expressed in a
+    /// second coordinate system — an offset measured from a RAMBlock import's
+    /// base rather than from the view over this window's own pages — is a
+    /// larger number against the same bound, so it fails here instead of
+    /// becoming a host address the gather dereferences.
+    #[test]
+    fn a_run_may_not_reach_past_the_mapping_it_was_cut_from() {
+        let base = 0x7f00_0000_0000usize;
+        let mapping = 0x4000u64;
+        let run = GuestRun::in_mapping(base, mapping, 0x800, 0x1800).expect("inside the mapping");
+        assert_eq!(run.host_ptr(), base + 0x800);
+        assert_eq!(run.len(), 0x1800);
+
+        assert_eq!(
+            GuestRun::in_mapping(base, mapping, 0x800, mapping),
+            None,
+            "a window that starts inside and ends outside is not a run"
+        );
+        assert_eq!(
+            GuestRun::in_mapping(base, mapping, mapping, 1),
+            None,
+            "an offset at the end covers nothing"
+        );
+        assert_eq!(
+            GuestRun::in_mapping(base, mapping, u64::MAX, 1),
+            None,
+            "the end of the window may not wrap"
+        );
+        assert_eq!(
+            GuestRun::in_mapping(0, mapping, 0, 1),
+            None,
+            "a null base is not a mapping"
+        );
+        assert!(GuestRun::in_mapping(base, mapping, 0, 0)
+            .expect("an empty window inside the mapping is representable")
+            .is_empty());
+    }
+
     #[test]
     fn a_page_footprint_derives_physical_runs_once_and_windows_them_exactly() {
-        let pages: std::sync::Arc<[u64]> =
-            [0x1000, 0x2000, 0x9000, 0xa000, 0xb000].into();
+        let pages: std::sync::Arc<[u64]> = [0x1000, 0x2000, 0x9000, 0xa000, 0xb000].into();
         let footprint = GuestPageFootprint::new(pages, 0x1000).expect("valid footprint");
         assert_eq!(footprint.runs(), &[0..2, 2..5]);
 
@@ -1068,7 +1190,10 @@ mod tests {
         assert!(footprint.contains_page(0x1000));
         assert!(footprint.contains_page(0xa000));
         assert!(!footprint.contains_page(0x5000));
-        assert!(!footprint.contains_page(0x9800), "only whole guest pages belong");
+        assert!(
+            !footprint.contains_page(0x9800),
+            "only whole guest pages belong"
+        );
         assert_eq!(footprint.page_span(), Some((0x1000, 0xa000)));
 
         let clone = footprint.clone();

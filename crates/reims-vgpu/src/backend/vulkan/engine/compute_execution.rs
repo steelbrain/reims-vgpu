@@ -5,7 +5,7 @@
 //! resident snapshot observed at execution no longer matches what the runtime
 //! staged.
 
-use super::types::StorageImageFormat;
+use super::types::{ResidentReclaim, StorageImageFormat, TargetIdentity};
 use crate::model::ComputeStorageResidencyKey;
 use crate::observe::Decline;
 
@@ -40,6 +40,19 @@ pub enum ComputeExecutionDecline {
         binding: u32,
         width: u32,
         height: u32,
+    },
+    /// A sampled binding named both a resident source and more than one mip
+    /// level. A resident is one window at one level, so the copy could only
+    /// fill the base and every level above it would sample as unwritten.
+    ResidentSampleIsNotAPyramid { binding: u32, mip_levels: u32 },
+    /// A sampled binding's geometry and level count admit no packed pyramid
+    /// layout — a zero extent, a zero texel size, or an overflow. The upload
+    /// bytes cannot be apportioned to levels, so nothing is copied.
+    SampledPyramidLayout {
+        binding: u32,
+        width: u32,
+        height: u32,
+        mip_levels: u32,
     },
     ResidentSeedGenerationLost {
         binding: u32,
@@ -91,6 +104,36 @@ pub enum ComputeExecutionDecline {
     /// the guest left empty, so a firing is a class those passes do not cover
     /// and is worth reading as a real gap.
     UsedBindingAbsentFromLayout { binding: u32 },
+    /// A kernel declared `texture2d_ms` at this binding and no retained target
+    /// answers to the identity the runtime resolved for it.
+    ///
+    /// There is no fallback, and that is the contract rather than a gap in this
+    /// rail: a multisample image cannot be uploaded from bytes or copied into,
+    /// so the target that rendered those samples is the only thing that can
+    /// serve the bind. `prior` separates a resident this device reclaimed from
+    /// one that was never created — opposite defects.
+    MultisampleSampleAbsent {
+        binding: u32,
+        identity: TargetIdentity,
+        prior: Option<ResidentReclaim>,
+    },
+    /// A retained target answers to the identity but cannot serve this bind.
+    ///
+    /// Three distinct losses under one name because they are one question asked
+    /// of one resident, and the fields say which: nothing has been rendered into
+    /// it yet, its extent is not the extent the bind names, or it is
+    /// single-sample and binding it to a multisampled shader image would be a
+    /// descriptor-type mismatch.
+    MultisampleSampleUnusable {
+        binding: u32,
+        identity: TargetIdentity,
+        content_ready: bool,
+        resident_width: u32,
+        resident_height: u32,
+        resident_samples: u32,
+        resource_width: u32,
+        resource_height: u32,
+    },
 }
 
 impl Decline for ComputeExecutionDecline {
@@ -106,6 +149,10 @@ impl Decline for ComputeExecutionDecline {
             Self::SeedSkippedWithoutResidency { .. } => {
                 "vk_compute_exec_seed_skipped_without_residency"
             }
+            Self::ResidentSampleIsNotAPyramid { .. } => {
+                "vk_compute_exec_resident_sample_is_not_a_pyramid"
+            }
+            Self::SampledPyramidLayout { .. } => "vk_compute_exec_sampled_pyramid_layout",
             Self::ResidentSeedGenerationLost { .. } => {
                 "vk_compute_exec_resident_seed_generation_lost"
             }
@@ -118,6 +165,8 @@ impl Decline for ComputeExecutionDecline {
             Self::UsedBindingAbsentFromLayout { .. } => {
                 "vk_compute_exec_used_binding_absent_from_layout"
             }
+            Self::MultisampleSampleAbsent { .. } => "vk_compute_exec_multisample_sample_absent",
+            Self::MultisampleSampleUnusable { .. } => "vk_compute_exec_multisample_sample_unusable",
         }
     }
 
@@ -183,6 +232,24 @@ impl Decline for ComputeExecutionDecline {
                 ("resource_width", width.to_string()),
                 ("resource_height", height.to_string()),
             ],
+            Self::ResidentSampleIsNotAPyramid {
+                binding,
+                mip_levels,
+            } => vec![
+                ("binding", binding.to_string()),
+                ("mip_levels", mip_levels.to_string()),
+            ],
+            Self::SampledPyramidLayout {
+                binding,
+                width,
+                height,
+                mip_levels,
+            } => vec![
+                ("binding", binding.to_string()),
+                ("resource_width", width.to_string()),
+                ("resource_height", height.to_string()),
+                ("mip_levels", mip_levels.to_string()),
+            ],
             Self::ResidentSeedGenerationLost {
                 binding,
                 identity,
@@ -228,6 +295,44 @@ impl Decline for ComputeExecutionDecline {
             }
             Self::UsedBindingAbsentFromLayout { binding } => {
                 vec![("binding", binding.to_string())]
+            }
+            Self::MultisampleSampleAbsent {
+                binding,
+                identity,
+                prior,
+            } => {
+                // Through the shared namespace renderer, not `{identity:?}`: a
+                // debug rendering carries spaces, and every field on this
+                // channel has to be one token.
+                let mut fields = vec![("binding", binding.to_string())];
+                fields.extend(super::draw_execution::identity_fields(identity));
+                fields.push((
+                    "prior",
+                    prior.map_or_else(|| "none".to_string(), |p| p.slug().to_string()),
+                ));
+                fields
+            }
+            Self::MultisampleSampleUnusable {
+                binding,
+                identity,
+                content_ready,
+                resident_width,
+                resident_height,
+                resident_samples,
+                resource_width,
+                resource_height,
+            } => {
+                let mut fields = vec![("binding", binding.to_string())];
+                fields.extend(super::draw_execution::identity_fields(identity));
+                fields.extend([
+                    ("content_ready", u8::from(*content_ready).to_string()),
+                    ("resident_width", resident_width.to_string()),
+                    ("resident_height", resident_height.to_string()),
+                    ("resident_samples", resident_samples.to_string()),
+                    ("resource_width", resource_width.to_string()),
+                    ("resource_height", resource_height.to_string()),
+                ]);
+                fields
             }
         }
     }
@@ -284,6 +389,16 @@ mod tests {
         }
     }
 
+    fn target_identity() -> TargetIdentity {
+        TargetIdentity::Gva {
+            gva: 0x350000,
+            width: 8,
+            height: 8,
+            generation: 241,
+            format: ash::vk::Format::R8G8B8A8_UNORM,
+        }
+    }
+
     fn all() -> Vec<ComputeExecutionDecline> {
         vec![
             ComputeExecutionDecline::ResidentSampleAbsent {
@@ -315,6 +430,16 @@ mod tests {
                 width: 64,
                 height: 32,
             },
+            ComputeExecutionDecline::ResidentSampleIsNotAPyramid {
+                binding: 34,
+                mip_levels: 7,
+            },
+            ComputeExecutionDecline::SampledPyramidLayout {
+                binding: 34,
+                width: 64,
+                height: 32,
+                mip_levels: 7,
+            },
             ComputeExecutionDecline::ResidentSeedGenerationLost {
                 binding: 34,
                 identity: identity(),
@@ -325,6 +450,31 @@ mod tests {
                 width: 64,
                 height: 32,
                 format: StorageImageFormat::Rgba8Unorm,
+            },
+            ComputeExecutionDecline::ResidentRekeyWouldDropPinned {
+                identity: identity(),
+                held_width: 64,
+                held_height: 32,
+                held_format: StorageImageFormat::Rgba8Unorm,
+                wanted_width: 32,
+                wanted_height: 32,
+                wanted_format: StorageImageFormat::Rgba8Unorm,
+            },
+            ComputeExecutionDecline::UsedBindingAbsentFromLayout { binding: 35 },
+            ComputeExecutionDecline::MultisampleSampleAbsent {
+                binding: 32,
+                identity: target_identity(),
+                prior: None,
+            },
+            ComputeExecutionDecline::MultisampleSampleUnusable {
+                binding: 32,
+                identity: target_identity(),
+                content_ready: true,
+                resident_width: 8,
+                resident_height: 8,
+                resident_samples: 1,
+                resource_width: 8,
+                resource_height: 8,
             },
         ]
     }
@@ -351,7 +501,18 @@ mod tests {
         // a pooled readback the runtime owns. Five more went with the
         // non-2D image shape: the compute rail stages one flat plane window
         // per binding and has no slice or depth axis to refuse.
-        assert_eq!(before, 6, "the compute executor's reason census moved");
+        //
+        // Back up to 8 with the sampled mip pyramid: a resident source cannot
+        // answer for a multi-level binding, and a geometry that admits no
+        // packed level layout has no way to apportion its upload.
+        //
+        // 12 now, and this list is complete for the first time. Two variants
+        // -- `ResidentRekeyWouldDropPinned` and `UsedBindingAbsentFromLayout`
+        // -- had never been in it, so the count they were compared against was
+        // never the enum's own size; they are here so that it is. The other two
+        // are the multisample pair: a `texture2d_ms` binding whose retained
+        // target is gone, and one whose target cannot serve it.
+        assert_eq!(before, 12, "the compute executor's reason census moved");
         assert_eq!(before, slugs.len(), "duplicate compute-execution slug");
     }
 

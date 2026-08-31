@@ -39,7 +39,7 @@ KEEP=""
 GUEST="${GUEST:-macos-vm}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-SHOT="$REPO_ROOT/scripts/screenshot-when-kde-plasma-host/screenshot-when-kde-plasma-host.sh"
+SHOT="$REPO_ROOT/scripts/screenshot/screenshot.sh"
 
 # 64 bars, two symbols. Fixed rather than generated at run time so a decode can
 # be reproduced from the log alone. Chosen by minimising agreement with every

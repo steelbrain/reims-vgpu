@@ -454,8 +454,36 @@ fn read_record(class: &str, bytes: &[u8], opcode: u32) -> Option<Reading> {
         "PGSerializerComputeCommandEncoder" => Some(compute_verdict(bytes)),
         "PGSerializerBlitCommandEncoder" => Some(blit_verdict(bytes)),
         "PGSerializerInfoCommandEncoder" => Some(info_verdict(bytes, opcode)),
+        "PGSerializerCommandEncoder" => Some(inherited_encoder_verdict(bytes)),
         _ => None,
     }
+}
+
+/// A record Apple's serializer defines on the **base** encoder class, read by
+/// every encoder decoder that can receive one.
+///
+/// `MTLCommandEncoder`'s residency selectors — `useHeap:`, `useHeaps:count:`,
+/// `useResource:usage:`, `useResources:count:usage:` — are inherited rather
+/// than reimplemented, so the serializer emits them under the base class and a
+/// record can then arrive in a render stream or a compute one. Both decoders
+/// carry the same two opcodes for them (`0x86` heaps, `0x87` resources), which
+/// makes a gap in *either* a gap for real guest residency, and neither arm's
+/// coverage is evidence about the other's.
+///
+/// So the base class is decoded only when both decoders read it: the first
+/// non-`Decoded` reading is what this returns, and a clean pair returns the
+/// render one. Routing the class to a single decoder would have passed while
+/// the other silently dropped every heap the guest made resident.
+fn inherited_encoder_verdict(bytes: &[u8]) -> Reading {
+    let render = render_verdict(bytes);
+    if !matches!(render.verdict, Verdict::Decoded) {
+        return render;
+    }
+    let compute = compute_verdict(bytes);
+    if !matches!(compute.verdict, Verdict::Decoded) {
+        return compute;
+    }
+    render
 }
 
 /// Classes with no record decoder in this crate, and why.

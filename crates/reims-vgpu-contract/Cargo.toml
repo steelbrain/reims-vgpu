@@ -1,0 +1,26 @@
+[package]
+name = "reims-vgpu-contract"
+version = "0.1.0"
+edition = "2021"
+description = "Backend-neutral protocol vocabulary: layouts, pixel formats, geometry, page arithmetic, and the refusals they name"
+license = "GPL-2.0-or-later"
+
+[lib]
+name = "reims_vgpu_contract"
+
+# The whole point of the crate is what is *not* here. No `ash`, no Metal, no
+# QEMU, no device state: a Vulkan handle, an image layout, a queue family or a
+# host capability cannot be named from this crate because none of them is in
+# scope, and that is a compiler's claim rather than a habit.
+[dependencies]
+# Zero-copy views over the wire format.
+reims-vgpu-wire = { path = "../reims-vgpu-wire" }
+# The guest page-table walk, whose statuses this crate names on the fail channel.
+reims-vgpu-paging = { path = "../reims-vgpu-paging" }
+# `Decline` and `Refusal`, so a contract check can name its own refusal without
+# depending on the device that logs it. This is the dependency the layering
+# exists for.
+reims-vgpu-observe = { path = "../reims-vgpu-observe" }
+
+[dev-dependencies]
+reims-vgpu-observe = { path = "../reims-vgpu-observe", features = ["testing"] }

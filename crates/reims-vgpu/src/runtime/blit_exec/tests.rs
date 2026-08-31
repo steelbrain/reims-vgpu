@@ -1358,6 +1358,87 @@ fn type8_level_base_on_type11_rejected() {
     );
 }
 
+/// A compressed level's byte arithmetic is in blocks, in both axes.
+///
+/// The regression this pins is 448 refused copies on one driven Asphalt 8 leg:
+/// `blit_fail reason=tex_bad_bpp kind=Copy` between two BC3 textures, because
+/// the whole blit path asked `bytes_per_pixel` and a BC format has none. Now the
+/// backing carries its storage grid, and `exec_copy_texture_to_texture` converts
+/// the command's coordinates into block space once so every per-unit helper
+/// below it is correct unchanged.
+///
+/// Both halves are asserted because each fails differently. A wrong
+/// `bytes_per_image` strides an array slice or a `z` plane past its own image; a
+/// wrong `texel_offset` reads the right number of bytes from the wrong place.
+#[test]
+fn a_compressed_level_addresses_blocks_in_both_axes() {
+    use crate::contract::pixel_format::{self as pf, BlockGeometry};
+    // A 64x64 BC3 level as a guest sends it: 16 block columns of 16 bytes, and
+    // 16 block rows, so one image is 4096 bytes and not 16384.
+    let bc3 = LinearTextureLevel {
+        base_gva: 0,
+        alloc_size: 4096,
+        level_offset: 0,
+        row_stride: 256,
+        slice_stride: 4096,
+        slice_index: 0,
+        width: 64,
+        height: 64,
+        depth: 1,
+        bpp: pf::BC_BLOCK_BYTES_16,
+        block: pf::block_geometry(pf::MTL_FORMAT_BC3_RGBA).expect("bc3 has a grid"),
+        pixel_format: pf::MTL_FORMAT_BC3_RGBA,
+    };
+    assert_eq!(
+        bc3.block,
+        BlockGeometry {
+            width: 4,
+            height: 4,
+            bytes: 16
+        }
+    );
+    assert_eq!(
+        bc3.bytes_per_image(),
+        Some(4096),
+        "16 block rows of 256 bytes — the texel form would say 16384 and stride \
+         a slice four times past its own image"
+    );
+    // Block coordinates, which is what the copy hands it: block (3, 2) starts at
+    // row 2 of blocks and column 3, i.e. 2*256 + 3*16.
+    assert_eq!(bc3.texel_offset(3, 2, 0), Some(2 * 256 + 3 * 16));
+    // The last block of the level is the last 16 bytes of the allocation, so the
+    // grid and the allocation agree exactly — a level that did not would be
+    // refused against `alloc_size` downstream.
+    assert_eq!(bc3.texel_offset(15, 15, 0), Some(4096 - 16));
+
+    // An uncompressed level is untouched by any of it: a 1x1 block whose bytes
+    // are the bytes-per-texel gives back the products this always computed.
+    let rgba = LinearTextureLevel {
+        base_gva: 0,
+        alloc_size: 0x1000,
+        level_offset: 0,
+        row_stride: 256,
+        slice_stride: 0,
+        slice_index: 0,
+        width: 64,
+        height: 4,
+        depth: 1,
+        bpp: 4,
+        block: pf::block_geometry(MTL_FORMAT_RGBA8_UNORM).expect("rgba8 has a grid"),
+        pixel_format: MTL_FORMAT_RGBA8_UNORM,
+    };
+    assert_eq!(
+        rgba.block,
+        BlockGeometry {
+            width: 1,
+            height: 1,
+            bytes: 4
+        }
+    );
+    assert_eq!(rgba.bytes_per_image(), Some(256 * 4));
+    assert_eq!(rgba.texel_offset(3, 2, 0), Some(2 * 256 + 3 * 4));
+}
+
 #[test]
 fn texel_offset_math() {
     let t = LinearTextureLevel {
@@ -1371,6 +1452,11 @@ fn texel_offset_math() {
         height: 4,
         depth: 1,
         bpp: 4,
+        block: crate::contract::pixel_format::BlockGeometry {
+            width: 1,
+            height: 1,
+            bytes: 4,
+        },
         pixel_format: MTL_FORMAT_RGBA8_UNORM,
     };
     // (x=1,y=2) → 0x100 + 2*16 + 1*4 = 0x124
@@ -1387,6 +1473,139 @@ fn texel_offset_math() {
     t1.slice_index = 2;
     // + 2 * 64 slice stride
     assert_eq!(t1.texel_offset(1, 2, 0), Some(0x124 + 128));
+}
+
+/// A linear rectangle resolves its pages once and round-trips row-exact —
+/// **including when the rectangle crosses guest pages**, which is the case the
+/// whole rail is made of.
+///
+/// The first version of this hoist required the rectangle's span to be one
+/// contiguous guest-physical run, and on a driven macos-13 boot that declined
+/// all 617 texture-to-texture blits: guest linear textures are scattered, so
+/// the "fast path" was never taken and the counter that recorded the decline
+/// was the only sign. So the rectangle here is deliberately **eight pages
+/// wide**, and the assertion that it walked once rather than once a row is
+/// what would have caught that.
+///
+/// The padding assertion is the other half. The row path writes `row_bytes`
+/// and never the gap between two rows, so a rectangle primitive that filled
+/// its span contiguously would round-trip every pixel correctly and destroy
+/// whatever the guest kept in the stride padding.
+#[test]
+fn a_linear_rectangle_lands_row_exact_through_one_page_table_walk() {
+    use crate::runtime::drain::census::store_route_count;
+
+    let (mut host, mut state) = blit_device();
+    // `blit_device` backs root PTE indices 0..8 with their own one-page RAM
+    // ranges, so a span from GVA 0 upwards is eight separate guest-physical
+    // pages: fragmented in exactly the way the real rail is.
+    let page = 1u64 << PAGE_SHIFT_ARM64E;
+    let base_gva = 0u64;
+    let pages = 8u64;
+    let (row_stride, row_bytes) = (page / 2, page / 4);
+    let row_count = pages * 2;
+
+    let pad = vec![0xeeu8; (row_stride * row_count) as usize];
+    for p in 0..pages {
+        let at = (p * page) as usize;
+        host.write_gpa((4 + p) << PAGE_SHIFT_ARM64E, &pad[at..at + page as usize])
+            .expect("seed the destination pages");
+    }
+
+    let t = LinearTextureLevel {
+        base_gva,
+        alloc_size: pages * page,
+        level_offset: 0,
+        row_stride,
+        slice_stride: 0,
+        slice_index: 0,
+        width: (row_bytes / 4) as u32,
+        height: row_count as u32,
+        depth: 1,
+        bpp: 4,
+        // This tree carries the block grid the v6 branch predates; an
+        // uncompressed format is a 1x1 grid, so `bpp` and the grid agree and the
+        // rectangle walk under test is unaffected by it.
+        block: crate::contract::pixel_format::block_geometry(MTL_FORMAT_RGBA8_UNORM)
+            .expect("rgba8 has a grid"),
+        pixel_format: MTL_FORMAT_RGBA8_UNORM,
+    };
+    let tex = TextureBacking::Linear(t);
+    let src: Vec<u8> = (0..(row_bytes * row_count))
+        .map(|i| (i % 251) as u8)
+        .collect();
+    let allowed: std::collections::HashSet<u64> =
+        (0..pages).map(|p| (4 + p) << PAGE_SHIFT_ARM64E).collect();
+
+    let walks_before = store_route_count("blit_rect_linear_walk");
+    let rows_before = store_route_count("blit_rect_linear_rows_hoisted");
+    write_texture_rect(
+        &mut state,
+        &mut host,
+        1,
+        &tex,
+        Point { x: 0, y: 0, z: 0 },
+        row_bytes,
+        row_count,
+        &src,
+        Some(&allowed),
+    )
+    .expect("a fragmented rectangle inside the authorised pages must land");
+    assert_eq!(
+        store_route_count("blit_rect_linear_walk") - walks_before,
+        1,
+        "the rectangle must walk the page table once, not once per row"
+    );
+    assert_eq!(
+        store_route_count("blit_rect_linear_rows_hoisted") - rows_before,
+        row_count - 1,
+        "every row after the first is a page-table walk not paid"
+    );
+
+    let mut got = vec![0u8; (row_stride * row_count) as usize];
+    for p in 0..pages {
+        let at = (p * page) as usize;
+        host.read_gpa(
+            (4 + p) << PAGE_SHIFT_ARM64E,
+            &mut got[at..at + page as usize],
+        )
+        .expect("read the landed pages");
+    }
+    for y in 0..row_count {
+        let at = (y * row_stride) as usize;
+        assert_eq!(
+            &got[at..at + row_bytes as usize],
+            &src[(y * row_bytes) as usize..((y + 1) * row_bytes) as usize],
+            "row {y} must land at its own texel offset"
+        );
+        assert!(
+            got[at + row_bytes as usize..at + row_stride as usize]
+                .iter()
+                .all(|&b| b == 0xee),
+            "row {y}'s stride padding is not the copy's to write"
+        );
+    }
+
+    // And back, through the read direction's own single walk.
+    let reads_before = store_route_count("blit_rect_linear_read_walk");
+    let mut back = vec![0u8; (row_bytes * row_count) as usize];
+    read_texture_rect(
+        &mut state,
+        &mut host,
+        1,
+        &tex,
+        Point { x: 0, y: 0, z: 0 },
+        row_bytes,
+        row_count,
+        &mut back,
+    )
+    .expect("the same rectangle must read back");
+    assert_eq!(
+        store_route_count("blit_rect_linear_read_walk") - reads_before,
+        1,
+        "the read direction must walk once too"
+    );
+    assert_eq!(back, src, "the rectangle must round-trip byte for byte");
 }
 
 /// Geometry this device cannot measure must refuse the copy, never hand the
@@ -1413,6 +1632,11 @@ fn an_unmeasurable_copy_region_refuses_rather_than_writing_unbounded() {
         height: 1,
         depth: 1,
         bpp: 4,
+        block: crate::contract::pixel_format::BlockGeometry {
+            width: 1,
+            height: 1,
+            bytes: 4,
+        },
         pixel_format: MTL_FORMAT_RGBA8_UNORM,
     };
 
@@ -1968,11 +2192,6 @@ fn t2t_identity_self_copy_is_noop_ok() {
         gva_mem::read_task_gva(&host, &state.tasks[1], gva, &mut back, PAGE_SHIFT_ARM64E).is_ok()
     );
     assert_eq!(back, pat, "identity self-copy left the bytes unchanged");
-    // No overlap enrichment line was emitted (it's not a genuine overlap).
-    assert!(
-        note_t2t_overlap(1, 2, 2, 0, 0, 16, 16, 2, 1),
-        "identity path must not have consumed the overlap dedup slot"
-    );
 }
 
 /// Regression guard for the strided-column false positive: a self-copy of a
@@ -2017,22 +2236,18 @@ fn t2t_shifted_column_self_copy_moves_bytes() {
         let dst_texel = &back[r * 16 + 8..r * 16 + 12];
         assert_eq!(dst_texel, src_texel, "row {r} column x=2 holds moved src");
     }
-    // No overlap enrichment (this is not a genuine overlap).
-    assert!(
-        note_t2t_overlap(9, 2, 2, 0, 8, 4, 16, 4, 1),
-        "shifted-column path must not have consumed the overlap dedup slot"
-    );
 }
 
-/// Regression guard: a GENUINELY overlapping self-copy (src rect x[0,2),
-/// dst rect x[1,3) — overlap on x) is undefined in Metal and must still be
-/// rejected as Overlap, with the enrichment line emitted for diagnosis.
+/// An overlapping same-texture region is admitted by the serialized copy
+/// contract. Snapshot the whole source before the first destination write so
+/// the traversal direction cannot change the bytes copied.
 #[test]
-fn t2t_overlapping_self_copy_still_rejected() {
+fn t2t_overlapping_self_copy_stages_the_source_region() {
     let (mut host, mut state) = blit_device();
-    // Unique ref (4) so the (task,src,dst) enrichment key is globally
-    // distinct from the identity/shifted tests' probes.
     install_linear_rgba(&mut host, &mut state, 4, 4, 4, 4, 16);
+    let gva = 4u64 << RESOURCE_PAGE_SHIFT;
+    let pat: Vec<u8> = (0..64).map(|i| i as u8).collect();
+    write_task_gva_arm64e(&mut host, &state.tasks[1], gva, &pat);
     let mut cmd = copy_cmd(CopyKind::TextureToTexture, 4, 4);
     cmd.destination_origin.x = 1; // src x[0,2), dst x[1,3) overlap at x=1
     cmd.source_size = Size {
@@ -2040,16 +2255,58 @@ fn t2t_overlapping_self_copy_still_rejected() {
         height: 4,
         depth: 1,
     };
-    assert_eq!(
-        execute_blit(&mut state, &mut host, 1, &cmd),
-        BlitStatus::Overlap,
-        "genuinely overlapping self-copy must be rejected"
-    );
-    // The enrichment slot WAS consumed (a real overlap was logged).
-    assert!(
-        !note_t2t_overlap(1, 4, 4, 0, 4, 8, 16, 4, 1),
-        "the reject path must have logged the overlap enrichment once"
-    );
+    assert_eq!(execute_blit(&mut state, &mut host, 1, &cmd), BlitStatus::Ok);
+    let mut back = vec![0u8; 64];
+    gva_mem::read_task_gva(&host, &state.tasks[1], gva, &mut back, PAGE_SHIFT_ARM64E)
+        .expect("copied texture remains readable");
+    for row in 0..4usize {
+        assert_eq!(
+            &back[row * 16 + 4..row * 16 + 12],
+            &pat[row * 16..row * 16 + 8],
+            "row {row} came from the pre-copy source"
+        );
+    }
+}
+
+/// The strided vertical overlap emitted by the UI workload: eighteen one-pixel
+/// rows move down twelve rows in one texture. Rows 12..17 are both source and
+/// destination, so staging a row at a time would feed written pixels back into
+/// the tail of the copy.
+#[test]
+fn t2t_vertical_overlap_reads_every_source_row_before_writing() {
+    const WIDTH: u32 = 256;
+    const HEIGHT: u32 = 30;
+    const STRIDE: u32 = WIDTH * 4;
+    let (mut host, mut state) = blit_device();
+    install_linear_rgba(&mut host, &mut state, 5, 5, WIDTH, HEIGHT, STRIDE);
+    let gva = 5u64 << RESOURCE_PAGE_SHIFT;
+    let mut pat = vec![0u8; STRIDE as usize * HEIGHT as usize];
+    for row in 0..HEIGHT as usize {
+        pat[row * STRIDE as usize..row * STRIDE as usize + 4]
+            .copy_from_slice(&(row as u32).to_le_bytes());
+    }
+    write_task_gva_arm64e(&mut host, &state.tasks[1], gva, &pat);
+
+    let mut cmd = copy_cmd(CopyKind::TextureToTexture, 5, 5);
+    cmd.destination_origin.y = 12;
+    cmd.source_size = Size {
+        width: 1,
+        height: 18,
+        depth: 1,
+    };
+    assert_eq!(execute_blit(&mut state, &mut host, 1, &cmd), BlitStatus::Ok);
+
+    let mut back = vec![0u8; pat.len()];
+    gva_mem::read_task_gva(&host, &state.tasks[1], gva, &mut back, PAGE_SHIFT_ARM64E)
+        .expect("copied texture remains readable");
+    for source_row in 0..18usize {
+        let destination_row = source_row + 12;
+        assert_eq!(
+            &back[destination_row * STRIDE as usize..destination_row * STRIDE as usize + 4],
+            &pat[source_row * STRIDE as usize..source_row * STRIDE as usize + 4],
+            "destination row {destination_row} came from the pre-copy source row {source_row}"
+        );
+    }
 }
 
 #[test]
@@ -2329,7 +2586,11 @@ fn blit_geometry_helpers_clamp_bpp_and_aspect() {
         None,
         "one past the edge refuses; it used to return 100 and copy less"
     );
-    assert_eq!(copy_extent("t", "w", 150, 100), None, "and so does far past");
+    assert_eq!(
+        copy_extent("t", "w", 150, 100),
+        None,
+        "and so does far past"
+    );
 
     // texture_storage_bpp: full-texel storage size per format; unknown fails.
     assert_eq!(texture_storage_bpp(MTL_FORMAT_BGRA8_UNORM), Ok(4));
@@ -2406,23 +2667,6 @@ fn tex_wrong_type_enrichment_dedups_per_ref_and_type() {
         0,
         0
     ));
-}
-
-/// Regression guard: the `t2t_overlap` enrichment dedups per
-/// `(task, src_ref, dst_ref)` — a self-overlapping copy re-issued every
-/// frame must not flood — while a distinct src/dst pair reports once so a
-/// genuine drop stays diagnosable.
-#[test]
-fn t2t_overlap_enrichment_dedups_per_pair() {
-    // Unique task namespace (3) so the process-global dedup set never
-    // collides with other tests; the set starts empty so first-insert is
-    // deterministic without a reset.
-    assert!(note_t2t_overlap(3, 0x10, 0x10, 0, 4096, 256, 1024, 8, 1));
-    for _ in 0..20 {
-        assert!(!note_t2t_overlap(3, 0x10, 0x10, 0, 4096, 256, 1024, 8, 1));
-    }
-    // A distinct destination ref is a distinct failure -> reports once.
-    assert!(note_t2t_overlap(3, 0x10, 0x11, 0, 4096, 256, 1024, 8, 1));
 }
 
 /// The precondition the `repack_storage_assumed` enrichment exists for.
@@ -2894,5 +3138,132 @@ fn the_gpu_whole_plane_arm_compares_stored_texels_and_not_transfer_functions() {
         ),
         Err(FormatDiffers),
         "three agreeing formats with no stored-texel layout are still not a byte copy"
+    );
+}
+
+/// The GPU arm for a whole-plane type-11 source going to a guest-linear
+/// destination, decided from the two endpoints alone.
+///
+/// The staging loop this stands in front of reads the source's *guest bytes*,
+/// and a mapping read must first settle: pay the surface's writeback debt and
+/// then wait for this device's own submitted writes to land. That wait, not the
+/// memcpy behind it, is what the rail costs. The GPU arm owes the source no
+/// settle at all, because the resident is the content — so every term below is
+/// about whether the resident and the destination plane are the two ends of one
+/// byte copy, and never about whether the guest's pages are readable.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn a_whole_surface_type11_source_reaches_the_destinations_own_guest_plane() {
+    use T2tGvaRefusal::*;
+
+    const W: u32 = 64;
+    const H: u32 = 32;
+    const BPR: u64 = 256;
+    let src = Type11Texture {
+        mapping_id: 7,
+        width: W,
+        height: H,
+        surface_offset: 0,
+        row_stride: BPR as u32,
+        span_end: BPR * H as u64,
+        bpp: 4,
+        pixel_format: MTL_FORMAT_BGRA8_UNORM,
+    };
+    let dst = LinearTextureLevel {
+        base_gva: 0x4000,
+        alloc_size: BPR * H as u64,
+        level_offset: 0,
+        row_stride: BPR,
+        slice_stride: 0,
+        slice_index: 0,
+        width: W,
+        height: H,
+        depth: 1,
+        bpp: 4,
+        // This tree carries the block grid the v6 branch predates. Bgra8 is a
+        // 1x1 grid, so it agrees with `bpp` and the whole-plane licence under
+        // test is unaffected by it.
+        block: crate::contract::pixel_format::block_geometry(MTL_FORMAT_BGRA8_UNORM)
+            .expect("bgra8 has a grid"),
+        pixel_format: MTL_FORMAT_BGRA8_UNORM,
+    };
+
+    let (plane, geometry) =
+        gpu_t2t_gva_plane(Some((W, H)), &src, &dst, 9).expect("one whole plane into another");
+    assert_eq!(
+        plane.target_gva, 0x4000,
+        "the level's own base is the plane"
+    );
+    assert_eq!(
+        plane.texture_ref, 9,
+        "the destination is the resource whose host-side pixel caches this invalidates"
+    );
+    assert_eq!(
+        geometry.extent,
+        (H as u64 - 1) * BPR + W as u64 * 4,
+        "the span is the copy's own bytes and not the row padding after the last of them"
+    );
+
+    assert_eq!(
+        gpu_t2t_gva_plane(None, &src, &dst, 9).unwrap_err(),
+        NoSurface,
+        "a mapping with no declared geometry has no surface identity to ask about"
+    );
+    // The resident is keyed by the mapping's own geometry and this copy lands it
+    // whole, so a source that is one plane of a larger surface would land the
+    // whole resident into a window that is not the whole of it.
+    assert_eq!(
+        gpu_t2t_gva_plane(
+            Some((W, H)),
+            &Type11Texture {
+                surface_offset: 0x8000,
+                ..src
+            },
+            &dst,
+            9
+        )
+        .unwrap_err(),
+        SrcNotWholeSurface,
+        "a second plane of a biplanar surface is not the resident"
+    );
+    assert_eq!(
+        gpu_t2t_gva_plane(Some((W, H * 2)), &src, &dst, 9).unwrap_err(),
+        SrcNotWholeSurface,
+        "a texture that disagrees with its mapping about the surface's size is not the resident"
+    );
+    // The class `texture_region_window` bounds the staging loop with: a copy that
+    // runs off its resource paints whatever the guest handed those pages to next.
+    assert_eq!(
+        gpu_t2t_gva_plane(
+            Some((W, H)),
+            &src,
+            &LinearTextureLevel {
+                alloc_size: BPR * H as u64 - 1,
+                ..dst
+            },
+            9
+        )
+        .unwrap_err(),
+        DstExtentOob,
+        "a plane running past its allocation is refused before anything is walked"
+    );
+    // Carried whole rather than collapsed, so the reading names the same check
+    // the copy itself would have named.
+    assert!(
+        matches!(
+            gpu_t2t_gva_plane(
+                Some((W, H)),
+                &src,
+                &LinearTextureLevel {
+                    row_stride: 3,
+                    ..dst
+                },
+                9
+            ),
+            Err(DstPlane(
+                crate::runtime::render_writeback::GvaWritebackDecline::PitchNotTexels { .. }
+            ))
+        ),
+        "a pitch that is not a whole number of texels is the plane's own refusal"
     );
 }

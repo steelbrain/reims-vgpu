@@ -82,7 +82,7 @@ mod sampled_identity_switch {
 #[cfg(test)]
 mod pass_echo_delta_order {
     use super::super::{PassEcho, ResourcePools};
-    use crate::backend::vulkan::engine::caches::PassKey;
+    use crate::backend::vulkan::engine::caches::{Color0Load, PassKey};
     use crate::backend::vulkan::engine::pools::PassEchoField;
     use ash::vk;
     use ash::vk::Handle as _;
@@ -92,7 +92,7 @@ mod pass_echo_delta_order {
     /// extent)` — so a shape change brings a new handle with it exactly as it
     /// does on the draw path, which is the whole condition under test.
     fn echo(image: u64, host_accessible: bool) -> PassEcho {
-        let mut key = PassKey::single(true, vk::Format::B8G8R8A8_UNORM);
+        let mut key = PassKey::single(Color0Load::Preserve, vk::Format::B8G8R8A8_UNORM);
         key.host_accessible_color0 = host_accessible;
         PassEcho {
             cb: vk::CommandBuffer::null(),
@@ -146,6 +146,13 @@ mod pass_echo_delta_order {
 }
 
 impl ResourcePools {
+    pub(crate) fn host_ram_import_alias(
+        &self,
+        import_id: crate::runtime::guest_ram::ImportId,
+    ) -> Option<(usize, usize)> {
+        self.host_ram_imports.alias(import_id)
+    }
+
     /// End one guest parent allocation's backend lifetime. If child images are
     /// still live, their deferred destruction releases it after the last fence.
     pub(crate) unsafe fn retire_guest_import(
@@ -298,6 +305,7 @@ impl ResourcePools {
             guest_reads_in_flight: false,
             guest_writes_in_flight: false,
             guest_write_pins_live: Vec::new(),
+            compute_write_pins_live: Vec::new(),
             initialized: false,
         }
     }
@@ -566,6 +574,23 @@ impl ResourcePools {
         let trim_buffers = self.note_maintenance_settled();
         self.trim_recycle_pools(&ctx.device, IDLE_RECYCLE_TRIM_PER_PASS, trim_buffers);
         self.trim_dead_guest_sampled(&ctx.device, IDLE_RECYCLE_TRIM_PER_PASS);
+    }
+
+    /// Submit a tail batch and retire every completed ring slot without waiting.
+    ///
+    /// Graveyard entries are fenced against the slots open when they were
+    /// parked. This periodic edge is required even after guest work stops: a
+    /// signalled fence is only a host-visible fact until slot retirement clears
+    /// that slot from the graveyard masks.
+    pub(crate) unsafe fn advance_graveyard_maintenance(
+        &mut self,
+        ctx: &DeviceContext,
+        counters: &EngineCounters,
+    ) -> Result<usize, DrawError> {
+        unsafe { self.batch_flush(ctx, counters)? };
+        unsafe {
+            self.retire_signaled_slots(ctx, counters, DeviceLostOp::PoolsFenceStatusMaintenance)
+        }
     }
 
     /// Cumulative transient sampled/snapshot pool recycle diagnostics:
@@ -1400,6 +1425,34 @@ impl ResourcePools {
         Ok(())
     }
 
+    /// Retire the oldest contiguous run of completed submissions. Never waits
+    /// on an unsignalled fence, so it is suitable for the periodic heartbeat.
+    unsafe fn retire_signaled_slots(
+        &mut self,
+        ctx: &DeviceContext,
+        counters: &EngineCounters,
+        status_op: DeviceLostOp,
+    ) -> Result<usize, DrawError> {
+        let mut retired = 0;
+        let n = self.slots.len();
+        for step in 1..=n {
+            let index = (self.cur + step) % n;
+            if self.slots[index].pending.is_none() {
+                continue;
+            }
+            let signaled = ctx
+                .device
+                .get_fence_status(self.slots[index].fence)
+                .map_err(|e| Self::wait_error(counters, e, status_op))?;
+            if !signaled {
+                break;
+            }
+            unsafe { self.retire_slot(ctx, counters, index)? };
+            retired += 1;
+        }
+        Ok(retired)
+    }
+
     /// The open batch's command buffer and the fence [`Self::batch_flush`] will
     /// submit it with, for a caller that wants to append to the run rather than
     /// end it.
@@ -1450,23 +1503,9 @@ impl ResourcePools {
         // `break` on the first unsignaled slot is load-bearing: reaping out of
         // order can drop `in_flight` to 0 while later slots still run, which
         // would let `gpu_work_open()` admit a graveyard drain under live work.
-        let n = self.slots.len();
-        for step in 1..=n {
-            let index = (self.cur + step) % n;
-            if self.slots[index].pending.is_none() {
-                continue;
-            }
-            let signaled = ctx
-                .device
-                .get_fence_status(self.slots[index].fence)
-                .map_err(|e| {
-                    Self::wait_error(counters, e, DeviceLostOp::PoolsFenceStatusBeginEntry)
-                })?;
-            if !signaled {
-                break;
-            }
-            self.retire_slot(ctx, counters, index)?;
-        }
+        unsafe {
+            self.retire_signaled_slots(ctx, counters, DeviceLostOp::PoolsFenceStatusBeginEntry)?
+        };
         let next = (self.cur + 1) % self.slots.len();
         if self.slots[next].pending.is_some() {
             // Count as a "block" only when the fence is genuinely unsignaled
@@ -1522,6 +1561,7 @@ impl ResourcePools {
                 attachment_snapshots: std::mem::take(&mut self.attachment_snapshot_live),
                 storage_images: std::mem::take(&mut self.storage_image_live),
                 unpin_residents: std::mem::take(&mut self.guest_write_pins_live),
+                unpin_compute_residents: std::mem::take(&mut self.compute_write_pins_live),
             },
             admissions,
         }
@@ -1794,7 +1834,10 @@ impl ResourcePools {
         let Some(open) = self.open_pass.take() else {
             return;
         };
-        debug_assert_eq!(open.cb, cb, "open render pass belongs to another command buffer");
+        debug_assert_eq!(
+            open.cb, cb,
+            "open render pass belongs to another command buffer"
+        );
         unsafe { device.cmd_end_render_pass(open.cb) };
     }
 
@@ -2304,13 +2347,16 @@ impl ResourcePools {
             .fetch_add(requested.len() as u64, Ordering::Relaxed);
 
         g.vertex_scratch.clear();
-        g.vertex_scratch.extend(requested.iter().map(|(binding, bound)| {
-            super::VertexBufferBinding {
-                binding: *binding,
-                buffer: bound.buffer,
-                offset: bound.offset,
-            }
-        }));
+        g.vertex_scratch
+            .extend(
+                requested
+                    .iter()
+                    .map(|(binding, bound)| super::VertexBufferBinding {
+                        binding: *binding,
+                        buffer: bound.buffer,
+                        offset: bound.offset,
+                    }),
+            );
         super::normalize_vertex_bindings(&mut g.vertex_scratch);
         counters
             .vertex_buffer_bind_emitted
@@ -2342,9 +2388,7 @@ impl ResourcePools {
     }
 
     /// Scratch in which the next draw normalizes its push-descriptor state.
-    pub(crate) fn push_descriptor_scratch(
-        &mut self,
-    ) -> &mut Vec<super::PushDescriptorBinding> {
+    pub(crate) fn push_descriptor_scratch(&mut self) -> &mut Vec<super::PushDescriptorBinding> {
         self.cb_graphics.push_scratch.clear();
         &mut self.cb_graphics.push_scratch
     }
@@ -2357,12 +2401,7 @@ impl ResourcePools {
         counters: &EngineCounters,
     ) -> bool {
         let g = &mut self.cb_graphics;
-        if super::push_descriptors_match(
-            g.push_layout,
-            &g.push_bindings,
-            layout,
-            &g.push_scratch,
-        ) {
+        if super::push_descriptors_match(g.push_layout, &g.push_bindings, layout, &g.push_scratch) {
             counters
                 .descriptor_push_held
                 .fetch_add(1, Ordering::Relaxed);
@@ -2445,16 +2484,35 @@ impl ResourcePools {
     /// on its behalf. A pin that cannot be taken — no slot, or content not ready
     /// — records the debt and nothing else, because there is then no image for
     /// the reclaim to take.
-    pub(crate) fn note_guest_write_recorded(&mut self, identity: &TargetIdentity) {
+    pub(crate) fn note_guest_write_recorded(&mut self, source: super::super::GuestWriteSource<'_>) {
         // A bind recorded after this must not reuse a copy taken before it: the
-        // Store lands in guest pages a later bind may name.
+        // Store lands in guest pages a later bind may name. True of every
+        // source — it is a fact about the destination pages, not about which
+        // image the bytes came from.
         self.forget_cb_bound_buffers(
             "bindmap_clear_guestwrite",
             "bindmap_clear_guestwrite_entries",
         );
         self.guest_writes_in_flight = true;
-        if self.pin_resident_target(identity, true) {
-            self.guest_write_pins_live.push(identity.clone());
+        match source {
+            super::super::GuestWriteSource::ResidentTarget(identity) => {
+                if self.pin_resident_target(identity, true) {
+                    self.guest_write_pins_live.push(identity.clone());
+                }
+            }
+            // Same ledger discipline, the other registry. Recorded separately
+            // because the two are keyed differently and the release has to reach
+            // the registry that holds the image.
+            super::super::GuestWriteSource::ResidentStorage(identity) => {
+                if self.pin_resident_storage(identity, true) {
+                    self.compute_write_pins_live.push(*identity);
+                }
+            }
+            // Nothing to pin: the ring entry this submission sealed already owns
+            // the image and will not recycle it before the fence retires, so a
+            // pin here would be a second owner of one lifetime and the ledger
+            // would have a release to get right for no gain.
+            super::super::GuestWriteSource::RingEntry => {}
         }
     }
 
@@ -2560,6 +2618,9 @@ impl ResourcePools {
     unsafe fn drain_cleanup(&mut self, device: &ash::Device, mut pending: PendingGpuCleanup) {
         for identity in pending.unpin_residents.drain(..) {
             self.pin_resident_target(&identity, false);
+        }
+        for identity in pending.unpin_compute_residents.drain(..) {
+            self.pin_resident_storage(&identity, false);
         }
         self.desc_arena.free(device, &pending.dsets);
         // The fence this entry waited on is exactly what makes a rewrite of
@@ -3039,20 +3100,20 @@ impl ResourcePools {
                 if off >= total {
                     break;
                 }
-                if skip >= run.len {
-                    skip -= run.len;
+                if skip >= run.len() {
+                    skip -= run.len();
                     continue;
                 }
                 let within = skip as usize;
                 skip = 0;
-                let available = (run.len as usize).saturating_sub(within);
+                let available = (run.len() as usize).saturating_sub(within);
                 let n = available.min(total - off);
                 // SAFETY: `host_ptr` is a stable RAMBlock alias from
                 // `HostOps::map_pages`, valid for the VM lifetime; `ptr` is the
                 // mapped staging span of `size >= total` bytes and `off + n <=
                 // total`, so the destination stays in bounds.
                 std::ptr::copy_nonoverlapping(
-                    (run.host_ptr as *const u8).add(within),
+                    (run.host_ptr() as *const u8).add(within),
                     ptr.add(off),
                     n,
                 );
@@ -3697,12 +3758,7 @@ impl ResourcePools {
         counters: &EngineCounters,
     ) -> Result<SampledSlot, DrawError> {
         unsafe {
-            self.acquire_sampled_for(
-                ctx,
-                sk,
-                counters,
-                SampledTransientUse::AttachmentSnapshot,
-            )
+            self.acquire_sampled_for(ctx, sk, counters, SampledTransientUse::AttachmentSnapshot)
         }
     }
 
@@ -3736,9 +3792,7 @@ impl ResourcePools {
             let handles = slot.handles();
             match use_ {
                 SampledTransientUse::Upload => self.sampled_live.push(slot),
-                SampledTransientUse::AttachmentSnapshot => {
-                    self.attachment_snapshot_live.push(slot)
-                }
+                SampledTransientUse::AttachmentSnapshot => self.attachment_snapshot_live.push(slot),
             }
             return Ok(handles);
         }
@@ -3850,9 +3904,7 @@ impl ResourcePools {
         let handles = slot.handles();
         match use_ {
             SampledTransientUse::Upload => self.sampled_live.push(slot),
-            SampledTransientUse::AttachmentSnapshot => {
-                self.attachment_snapshot_live.push(slot)
-            }
+            SampledTransientUse::AttachmentSnapshot => self.attachment_snapshot_live.push(slot),
         }
         Ok(handles)
     }
@@ -4607,6 +4659,7 @@ mod evict_route_tests {
 #[cfg(test)]
 mod recycle_tests {
     use super::*;
+    use crate::backend::vulkan::engine::GuestWriteSource;
 
     fn null_slot(w: u32, h: u32) -> SampledSlot {
         SampledSlot {
@@ -5157,6 +5210,7 @@ mod recycle_tests {
             memory: vk::DeviceMemory::null(),
             view: vk::ImageView::null(),
             key: StorageImageKey {
+                mip_levels: 1,
                 width: w,
                 height: h,
                 format: StorageImageFormat::default(),
@@ -5580,6 +5634,7 @@ mod recycle_tests {
         let pinned = admit_compute_resident(&mut pools, 1, 0, true);
         let unpinned = admit_compute_resident(&mut pools, 2, 0, false);
         let same = StorageImageKey {
+            mip_levels: 1,
             width: 8,
             height: 8,
             format: StorageImageFormat::default(),
@@ -5779,6 +5834,7 @@ mod recycle_tests {
                 attachment_snapshots: Vec::new(),
                 storage_images: Vec::new(),
                 unpin_residents: Vec::new(),
+                unpin_compute_residents: Vec::new(),
             }),
             span: super::gpu_span::SlotSpan::Idle,
             readback_span_armed: false,
@@ -5868,7 +5924,7 @@ mod recycle_tests {
             }),
             ("a staging recycle", &|p| p.recycle_staging()),
             ("a recorded guest-page write", &|p| {
-                p.note_guest_write_recorded(&identity)
+                p.note_guest_write_recorded(GuestWriteSource::ResidentTarget(&identity))
             }),
         ];
         for (what, end) in ends {
@@ -5953,15 +6009,15 @@ mod recycle_tests {
             "a device that has submitted no writeback owes no wait"
         );
 
-        pools.note_guest_write_recorded(&identity);
+        pools.note_guest_write_recorded(GuestWriteSource::ResidentTarget(&identity));
         assert!(pools.take_guest_write_debt());
         assert!(
             !pools.take_guest_write_debt(),
             "one settle covers the copies recorded before it, not every stamp after"
         );
 
-        pools.note_guest_write_recorded(&identity);
-        pools.note_guest_write_recorded(&identity);
+        pools.note_guest_write_recorded(GuestWriteSource::ResidentTarget(&identity));
+        pools.note_guest_write_recorded(GuestWriteSource::ResidentTarget(&identity));
         assert!(pools.take_guest_write_debt());
         assert!(!pools.take_guest_write_debt());
     }
@@ -5997,14 +6053,14 @@ mod recycle_tests {
         assert_eq!(pools.registry[&identity].pin_count, 0, "nobody has pinned");
 
         // Recording the copy is what pins: the caller holds nothing.
-        pools.note_guest_write_recorded(&identity);
+        pools.note_guest_write_recorded(GuestWriteSource::ResidentTarget(&identity));
         assert_eq!(
             pools.registry[&identity].pin_count, 1,
             "the submitted copy must hold the image against reclaim"
         );
 
         // A second window on the same resident inside one pass takes its own.
-        pools.note_guest_write_recorded(&identity);
+        pools.note_guest_write_recorded(GuestWriteSource::ResidentTarget(&identity));
         assert_eq!(pools.registry[&identity].pin_count, 2);
 
         // Sealing transfers the pins to the exact submission that references
@@ -6022,6 +6078,140 @@ mod recycle_tests {
             cleanup.unpin_residents.is_empty(),
             "a retired pin must not be released a second time"
         );
+    }
+
+    /// A ring-owned source records the same debt and takes no pin.
+    ///
+    /// This is the compute storage-image arm. Its image is a transient slot
+    /// sealed into the submission's own ring entry, which cannot be recycled
+    /// until the fence retires — so the lifetime is already held and a pin here
+    /// would be a second owner of it, with a release to get right for no gain.
+    ///
+    /// Both halves matter and they fail in opposite directions. Pinning would
+    /// leak: nothing releases a pin the ledger did not record in
+    /// `guest_write_pins_live`, so the image would never be reclaimable again.
+    /// Skipping the *debt* would be the correctness bug — the whole ordering
+    /// argument for a submitted-not-waited copy is that `GUEST_WRITE_DEBT`
+    /// removes `StampOrder::CpuReady` from the stamp's answers, so a guest told
+    /// the dispatch finished would read its pages before the copy landed.
+    #[test]
+    fn a_ring_owned_writeback_records_the_debt_without_pinning_anything() {
+        let mut pools = ResourcePools::new();
+        let identity = TargetIdentity::Surface {
+            id: 9,
+            width: 16,
+            height: 16,
+            generation: 1,
+            format: translate::pixel::SCANOUT_FORMAT,
+        };
+        pools.registry.insert(
+            identity.clone(),
+            crate::backend::vulkan::engine::pools::images_and_registry::pin_count_tests::ready_slot(
+            ),
+        );
+
+        pools.note_guest_write_recorded(GuestWriteSource::RingEntry);
+
+        assert!(
+            pools.take_guest_write_debt(),
+            "the stamp ordering hangs on this debt being owed"
+        );
+        assert_eq!(
+            pools.registry[&identity].pin_count, 0,
+            "a ring-owned source pins no resident"
+        );
+        assert!(
+            pools.guest_write_pins_live.is_empty(),
+            "and leaves the ledger nothing to release"
+        );
+        let cleanup = pools.seal_entry(Vec::new(), Vec::new()).cleanup;
+        assert!(
+            cleanup.unpin_residents.is_empty(),
+            "so its submission carries no unpin either"
+        );
+    }
+
+    /// A compute-storage resident's writeback pins in the *other* registry, and
+    /// the ring slot's cleanup releases it.
+    ///
+    /// The arm that lets a registered resident copy straight into guest pages. It
+    /// is not the ring-owned case above: a resident is popped out of the ring's
+    /// live set when it is acquired, so the submission's own cleanup does not own
+    /// its image and the pin is the only thing holding it.
+    ///
+    /// What the pin closes is narrower than it looks, and it is worth being exact
+    /// about because the wrong reading is what made this arm read back for a whole
+    /// boot. Both reclaim paths skip a resident whose `gpu_only_content` holds,
+    /// and every executed dispatch sets it — so the *reclaim* was never the
+    /// hazard. `acquire_resident_storage_image` is: it destroys the held image
+    /// when the same identity arrives at a different shape, and
+    /// `compute_rekey_refusal` is what stops it, reading `pinned` and nothing
+    /// else. Between this submit and its fence, that refusal is the whole defence.
+    ///
+    /// Fails without the ledger in either direction: no pin and a re-keying
+    /// dispatch frees an image the queue is still reading; no release and the
+    /// identity refuses every later re-shape for the life of the guest.
+    #[test]
+    fn a_compute_resident_writeback_pins_in_its_own_registry_until_the_slot_retires() {
+        let mut pools = ResourcePools::new();
+        let id = admit_compute_resident(&mut pools, 1, 1_000, false);
+
+        pools.note_guest_write_recorded(GuestWriteSource::ResidentStorage(&id));
+
+        assert!(
+            pools.take_guest_write_debt(),
+            "the stamp ordering hangs on this debt being owed, resident or not"
+        );
+        assert!(
+            pools.compute_storage_registry[&id].pinned,
+            "the copy is submitted and not waited, so the image must be held"
+        );
+        assert_eq!(
+            pools.compute_write_pins_live,
+            vec![id],
+            "and the ledger records the pin it actually took"
+        );
+
+        let mut cleanup = pools.seal_entry(Vec::new(), Vec::new()).cleanup;
+        assert!(
+            pools.compute_write_pins_live.is_empty(),
+            "sealing hands the pin to the slot rather than copying it"
+        );
+        assert_eq!(cleanup.unpin_compute_residents, vec![id]);
+
+        // What `drain_cleanup` does with them, once the fence has signalled.
+        for identity in cleanup.unpin_compute_residents.drain(..) {
+            pools.pin_resident_storage(&identity, false);
+        }
+        assert!(
+            !pools.compute_storage_registry[&id].pinned,
+            "and the fence is what ends the hold"
+        );
+    }
+
+    /// An identity with no slot records the debt and no pin.
+    ///
+    /// The pin is taken in the registry that owns the image, so an identity that
+    /// is not registered has no image for anything to remove and nothing to hold.
+    /// The ledger must not record a release for a pin it could not take: a stray
+    /// unpin would land on a future resident admitted under the same key.
+    #[test]
+    fn a_compute_writeback_against_an_unregistered_identity_records_no_pin() {
+        let mut pools = ResourcePools::new();
+        let absent = ComputeStorageResidencyKey::linear(0, 77, 0, 0, 0, 8, 8, 0);
+
+        pools.note_guest_write_recorded(GuestWriteSource::ResidentStorage(&absent));
+
+        assert!(
+            pools.take_guest_write_debt(),
+            "the pages are still being written, so the debt is still owed"
+        );
+        assert!(pools.compute_write_pins_live.is_empty());
+        assert!(pools
+            .seal_entry(Vec::new(), Vec::new())
+            .cleanup
+            .unpin_compute_residents
+            .is_empty());
     }
 
     /// Another holder's pin survives a writeback submission's retirement.
@@ -6051,7 +6241,7 @@ mod recycle_tests {
             "the window's pin"
         );
 
-        pools.note_guest_write_recorded(&identity);
+        pools.note_guest_write_recorded(GuestWriteSource::ResidentTarget(&identity));
         assert_eq!(pools.registry[&identity].pin_count, 2);
 
         let mut cleanup = pools.seal_entry(Vec::new(), Vec::new()).cleanup;
@@ -6079,7 +6269,7 @@ mod recycle_tests {
             format: translate::pixel::SCANOUT_FORMAT,
         };
         // No slot at all: nothing to pin, and nothing for a reclaim to take.
-        pools.note_guest_write_recorded(&identity);
+        pools.note_guest_write_recorded(GuestWriteSource::ResidentTarget(&identity));
         assert!(
             pools.guest_write_pins_live.is_empty(),
             "no pin was taken, so none may be released"
@@ -6611,9 +6801,7 @@ mod scatter_descriptor_sets_do_not_alias {
         let mut pools = ResourcePools::new();
         pools.configure_batch_capacity(super::DISCRETE_BATCH_MAX_DRAWS);
 
-        let expected = super::attachment_snapshot_batch_cap(
-            super::DISCRETE_BATCH_MAX_DRAWS,
-        );
+        let expected = super::attachment_snapshot_batch_cap(super::DISCRETE_BATCH_MAX_DRAWS);
         assert_eq!(pools.batch_max_draws, super::DISCRETE_BATCH_MAX_DRAWS);
         assert_eq!(pools.attachment_snapshot_free.per_key, expected);
         assert_eq!(pools.attachment_snapshot_free.total, expected);

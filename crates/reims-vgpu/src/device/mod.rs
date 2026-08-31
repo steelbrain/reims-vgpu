@@ -583,10 +583,7 @@ pub fn device_drain(id: u64) -> bool {
     let tail_us = tail_started.elapsed().as_micros() as u64;
     let boundary_started = std::time::Instant::now();
     publish_present_boundary(&slot, device.state.present.frame_flush_seen);
-    crate::runtime::drain::note_drain_tail(
-        tail_us,
-        boundary_started.elapsed().as_micros() as u64,
-    );
+    crate::runtime::drain::note_drain_tail(tail_us, boundary_started.elapsed().as_micros() as u64);
     let drain_us = tranche_started.elapsed().as_micros() as u64;
     let publish_started = std::time::Instant::now();
     // Push the finished present frame to the host-owned window (if running).
@@ -603,6 +600,7 @@ pub fn device_drain(id: u64) -> bool {
     #[cfg(feature = "host-window")]
     window_publish::publish_window_frame(&slot, &mut device.state);
     crate::runtime::drain::note_drain_tranche(
+        &host,
         drain_us,
         publish_started.elapsed().as_micros() as u64,
     );
@@ -610,7 +608,7 @@ pub fn device_drain(id: u64) -> bool {
     // sweeps below run on the worker's own wall clock and are outside both
     // `drain_us` and `publish_us`, so `duty` cannot see them.
     let busy_end_us = crate::observe::elapsed_us();
-    use crate::runtime::drain::{PostSweep, post_sweep};
+    use crate::runtime::drain::{post_sweep, PostSweep};
     // Same one-second cadence, so the cache trend lines up row-for-row with
     // `store_routes` and `drain_duty`. Measure-only; see `note_cache_levels`.
     post_sweep(PostSweep::CacheLevels, || {
@@ -729,6 +727,7 @@ pub fn device_poll(id: u64) -> bool {
     #[cfg(feature = "backend-vulkan")]
     {
         crate::backend::vulkan::engine::maintain_resources(crate::observe::elapsed_ms() as u64);
+        crate::runtime::mapper::drain_deferred_unmaps(&mut host);
     }
     // Pre-boundary early-console → host window (headless-safe: the heartbeat
     // drives poll even under -display none). No-op post-boundary or with no

@@ -115,8 +115,8 @@ macOS 13 Ventura is the recommended guest release for bring-up.
    REIMS_VGPU_BACKEND=vulkan scripts/qemu-build/qemu-build.sh --target x86_64
    vm/boot-x86.sh --testing --device reims-vgpu-pci --rail macos-15
 
-   # Host-window screenshot on the Linux/Plasma host
-   scripts/screenshot-when-kde-plasma-host/screenshot-when-kde-plasma-host.sh -o /tmp/screen.png
+   # Host-window screenshot (Linux/Plasma or macOS host)
+   scripts/screenshot/screenshot.sh -o /tmp/screen.png
    ```
 
    Without `--rail` a boot follows `vm/disks/rails/current`; change it with
@@ -147,7 +147,7 @@ Arm bring-up is **in-tree**: Virtualization.framework via Homebrew **`macosvm`**
    ```bash
    vm/boot-arm64.sh --testing --device reims-vgpu-mmio    # product
    vm/boot-arm64.sh --testing --device apple-gfx-mmio   # Apple ParavirtualizedGraphics A/B
-   scripts/screenshot-when-macos-host/screenshot-when-macos-host.sh /tmp/screen.png
+   scripts/screenshot/screenshot.sh /tmp/screen.png
    ```
 
    Optional **performance ceiling** reference: the same guest under native VZ via `macosvm --gui`.
@@ -162,6 +162,38 @@ Arm bring-up is **in-tree**: Virtualization.framework via Homebrew **`macosvm`**
 - Never commit disks, IPSWs, or OpenCore/OVMF runtime under `vm/`.
 - Device/backend work lives in `crates/reims-vgpu` + the thin shims in `vendor/qemu`; rebuild QEMU after
   product changes before claiming a live boot result.
+
+### The host window takes your keyboard shortcuts
+
+On the `reims-vgpu-pci` / `reims-vgpu-mmio` device the guest is displayed in a window this project
+owns, and while that window has keyboard focus it asks the host desktop to **stop acting on its own
+shortcuts** so they reach the guest instead. Without that the desktop consumes them first: a stock
+Plasma session claims 63 `Meta`/`Alt`/`Ctrl` combinations, and because a macOS guest reads host
+`Meta` as `Cmd`, that covers most of what the guest expects — `Cmd+A`, `Cmd+V`, `Cmd+Q`, `Cmd+W`,
+`Cmd+1`…`Cmd+9`, and `Alt+Tab`.
+
+**Press `Ctrl+Alt+Esc` to release the grab.** While it is held your own `Alt+Tab` goes to the guest,
+so this is how you get back to the host desktop. The chord is consumed rather than forwarded, and the
+grab re-arms by itself the next time you focus the window — it is an escape hatch, not a mode you
+have to remember you are in. The guest's own `Cmd+Option+Esc` (Force Quit) carries no `Ctrl` and is
+forwarded to the guest untouched.
+
+The window says so on stderr the first time it captures, and records it in the always-on log:
+
+```text
+window_capture_engaged mechanism=wayland_shortcuts_inhibit release=Ctrl+Alt+Esc
+```
+
+How much can be captured depends on the host, and the log names which mechanism a boot got:
+
+| Host | Mechanism | Coverage |
+|---|---|---|
+| Wayland | `zwp_keyboard_shortcuts_inhibit_v1` | full, when the compositor implements it |
+| X11 | `XGrabKeyboard` | full, unless another client holds the keyboard |
+| macOS | `NSApplicationPresentationDisableProcessSwitching` | partial — `Cmd+Tab` and `Cmd+H` only; the window server keeps its reserved chords |
+
+A host that cannot capture at all still runs; it emits a `window_capture_*` reason on
+`/tmp/reims-vgpu-fail.log` rather than silently dropping the keys.
 
 ### Environment overrides
 

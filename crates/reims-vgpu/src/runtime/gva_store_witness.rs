@@ -393,6 +393,62 @@ pub fn reach<H: HostOps>(state: &DeviceState, host: &H, key: GvaTargetKey) -> Gv
     }
 }
 
+/// Whether this device can name what the guest writes to `key` from now on.
+///
+/// True exactly when [`written_pages`] can answer, which is the question a
+/// **writer** has to ask before it defers a frame: a deferred Store is only
+/// recoverable from a guest write if the extent of that write is nameable
+/// afterwards. A reader asks [`reach`] instead — it is allowed to give up and
+/// re-read, and a writer that gives up has already lost the frame.
+///
+/// False for a target no Store has stamped and for one still inside the
+/// hypervisor's arming window, where the generation reads back 0 and no page
+/// stamp can be compared against it.
+pub fn armed(state: &DeviceState, key: GvaTargetKey) -> bool {
+    state
+        .gva_store_witness
+        .entries
+        .get(&key)
+        .is_some_and(|e| e.gen_at_store != 0)
+}
+
+/// Which of `key`'s pages the hypervisor has observed the guest write since the
+/// Store that stamped it, in ascending GPA order.
+///
+/// The extent behind a `GvaWriteReach::Guest(GuestWriteVerdict::Wrote)`, for the
+/// one caller that has something to do with it other than refuse: a deferred
+/// writeback deciding which of the frame's bytes the guest's own memory keeps
+/// instead of the device's. [`reach`] answers *whether*; this answers *where*,
+/// and the two must not be collapsed — a reader reusing a host-side copy is
+/// wrong if any page moved, while a writer landing a frame is wrong only on the
+/// pages that did.
+///
+/// `None` is "the host cannot name them" — no dirty bitmap, an unarmed token, a
+/// target this device never stamped, or more written pages than the host will
+/// enumerate — and every caller must read it as "assume the guest wrote all of
+/// them", which is the same direction [`reach`] refuses in. An empty `Some` is a
+/// real answer and says the harvest saw no page of this target move.
+pub fn written_pages<H: HostOps>(
+    state: &DeviceState,
+    host: &H,
+    key: GvaTargetKey,
+) -> Option<Vec<u64>> {
+    let Some(e) = state.gva_store_witness.entries.get(&key) else {
+        crate::runtime::drain::note_store_route("gvaw_pages_no_entry");
+        return None;
+    };
+    if e.gen_at_store == 0 {
+        crate::runtime::drain::note_store_route("gvaw_pages_unarmed");
+        return None;
+    }
+    let answer = host.guest_written_pages(e.token, e.gen_at_store);
+    crate::runtime::drain::note_store_route(match answer {
+        Some(_) => "gvaw_pages_named",
+        None => "gvaw_pages_unreadable",
+    });
+    answer
+}
+
 /// How far back the host-write record is being asked to reach for `key`, banded.
 ///
 /// `host_writes`'s own doc asks for exactly this distribution before anyone
@@ -405,7 +461,10 @@ pub fn note_host_reach(state: &DeviceState, key: GvaTargetKey) {
     let Some(e) = state.gva_store_witness.entries.get(&key) else {
         return;
     };
-    let reach = state.host_writes.epoch().saturating_sub(e.host_epoch_at_store);
+    let reach = state
+        .host_writes
+        .epoch()
+        .saturating_sub(e.host_epoch_at_store);
     crate::runtime::drain::note_store_route(if reach < 64 {
         "gvaw_reach_lt64"
     } else if reach < 512 {

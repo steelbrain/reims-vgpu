@@ -151,7 +151,81 @@ pub fn apply(
         }
         crate::runtime::drain::note_store_route(site.clear_host_route());
     }
+    if ops.clear_guest_valid != 0 {
+        // Byte +6 of the exec-table record, and the one op in the quad this
+        // device stores without anything reading it.
+        //
+        // Its name here is not settled. Under this crate's reading the guest is
+        // declaring its own copy stale; under the emitting driver's it is the
+        // page-off / synchronize-requested flag, the guest explicitly asking for
+        // host->guest visibility. The alarm below is deliberately built to be
+        // correct under *both*, because the two readings agree about what
+        // happens next: the guest is about to look at these guest pages. A frame
+        // this device still owes them is unserved guest work either way.
+        //
+        // Expected to stay at zero, and a firing is the bug — the shape
+        // `AGENTS.md` calls a healthy-zero alarm. It matters because the blit
+        // rail stopped manufacturing host visibility for every
+        // `copyFromTexture:toTexture:`, on the grounds that the command does not
+        // carry it; this is the counterpart check that the guest's *explicit*
+        // request is not being dropped on the floor at the same time.
+        let owed_gva =
+            state
+                .pending_writebacks
+                .has_gva(crate::runtime::writeback_debt::GvaResourceKey {
+                    task_id,
+                    texture_ref: object_id,
+                });
+        let owed_surface = targets
+            .iter()
+            .any(|id| state.pending_writebacks.get(id).is_some());
+        if owed_gva || owed_surface {
+            crate::observe::Emit::decline(
+                "validity_guest_read",
+                &GuestReadDecline::FrameStillOwed {
+                    gva: owed_gva,
+                    surface: owed_surface,
+                },
+            )
+            .field("task", task_id)
+            .field("object", object_id)
+            .fail_once(u64::from(object_id));
+            // Both, not either: the decline dedupes per object so a standing
+            // problem reads as one line, and the counter is what says whether
+            // that line stood for one occurrence or a million.
+            crate::runtime::drain::note_store_route("validity_guest_read_frame_owed");
+        }
+        crate::runtime::drain::note_store_route("validity_clr_guest");
+    }
     out
+}
+
+/// The guest signalled on byte +6 for a resource this device has not finished
+/// delivering.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GuestReadDecline {
+    /// A writeback is still owed to the pages the guest is about to read.
+    ///
+    /// Which ledger owes it is carried rather than collapsed: a GVA plane and a
+    /// surface are delivered by different rails, so a firing that named neither
+    /// would not say which one to go and look at.
+    FrameStillOwed { gva: bool, surface: bool },
+}
+
+impl crate::observe::Decline for GuestReadDecline {
+    fn slug(&self) -> &'static str {
+        match self {
+            Self::FrameStillOwed { .. } => "validity_guest_read_frame_owed",
+        }
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        let Self::FrameStillOwed { gva, surface } = self;
+        vec![
+            ("gva_owed", gva.to_string()),
+            ("surface_owed", surface.to_string()),
+        ]
+    }
 }
 
 /// The quad applied to one validity pair, clear before set.
@@ -329,6 +403,78 @@ mod tests {
         assert!(
             !state.mappings[&77].validity.host_valid,
             "clear_host_valid must reach the mapping the ref names"
+        );
+    }
+
+    /// Byte +6 arriving while a frame is still owed is the one thing that could
+    /// have been broken by the blit rail no longer settling every
+    /// `copyFromTexture:toTexture:`: the guest is about to read guest pages this
+    /// device has not delivered into.
+    ///
+    /// Asserted in both directions, because an alarm that cannot stay quiet is
+    /// worth as little as one that cannot fire — this one is expected to read
+    /// zero on every boot, so a version of it that fired on the ordinary case
+    /// would be indistinguishable from the bug it is watching for.
+    #[test]
+    fn byte_six_against_an_owed_frame_is_an_alarm_and_is_otherwise_quiet() {
+        let task_id = 4;
+        let texture_ref = 12;
+        let key = crate::runtime::writeback_debt::GvaResourceKey {
+            task_id,
+            texture_ref,
+        };
+        let debt = |state: &mut DeviceState| {
+            let before = state.buffer_write_gen.stamp(task_id, texture_ref);
+            let _ = state.pending_writebacks.arm_gva(
+                key,
+                crate::runtime::writeback_debt::GvaWritebackDebt {
+                    gva: 0x4000,
+                    row_stride: 256,
+                    width: 64,
+                    height: 64,
+                    format: crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM,
+                    generation: 7,
+                    guest_write: before,
+                    seq: 0,
+                },
+            );
+        };
+
+        // Nothing owed: the guest may read, and the alarm must not fire.
+        let mut quiet = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        quiet.mappings.entry(texture_ref).or_default().mapped = true;
+        let before_quiet =
+            crate::runtime::drain::store_route_count("validity_guest_read_frame_owed");
+        apply(
+            &mut quiet,
+            task_id,
+            texture_ref,
+            quad(0, 0, 1, 0),
+            ValiditySite::ExecTable,
+        );
+        assert_eq!(
+            crate::runtime::drain::store_route_count("validity_guest_read_frame_owed"),
+            before_quiet,
+            "no frame is owed, so byte +6 is ordinary traffic"
+        );
+
+        // A GVA frame owed for the very resource the guest is about to read.
+        let mut owed = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        owed.mappings.entry(texture_ref).or_default().mapped = true;
+        debt(&mut owed);
+        let before_owed =
+            crate::runtime::drain::store_route_count("validity_guest_read_frame_owed");
+        apply(
+            &mut owed,
+            task_id,
+            texture_ref,
+            quad(0, 0, 1, 0),
+            ValiditySite::ExecTable,
+        );
+        assert_eq!(
+            crate::runtime::drain::store_route_count("validity_guest_read_frame_owed"),
+            before_owed + 1,
+            "the guest is about to read pages this device has not delivered"
         );
     }
 

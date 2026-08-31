@@ -239,12 +239,8 @@ impl Decline for DrawValidationDecline {
             Self::SeedEqualsTarget => "vk_draw_validate_seed_equals_target",
             Self::SeedAlsoSampled => "vk_draw_validate_seed_also_sampled",
             Self::IndexBytesShort { .. } => "vk_draw_validate_index_bytes_short",
-            Self::IndexGuestRunsRowStride { .. } => {
-                "vk_draw_validate_index_guest_runs_row_stride"
-            }
-            Self::IndexGuestRunsCoverage { .. } => {
-                "vk_draw_validate_index_guest_runs_coverage"
-            }
+            Self::IndexGuestRunsRowStride { .. } => "vk_draw_validate_index_guest_runs_row_stride",
+            Self::IndexGuestRunsCoverage { .. } => "vk_draw_validate_index_guest_runs_coverage",
             Self::DuplicateVertexLocation { .. } => "vk_draw_validate_duplicate_vertex_location",
             Self::DuplicateVertexBinding { .. } => "vk_draw_validate_duplicate_vertex_binding",
             Self::ZeroVertexStepRate { .. } => "vk_draw_validate_zero_vertex_step_rate",

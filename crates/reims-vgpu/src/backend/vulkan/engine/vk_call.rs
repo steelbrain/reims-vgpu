@@ -192,6 +192,8 @@ pub enum VkOp {
     PoolsWaitFencesRetire,
     /// `vkGetFenceStatus` when beginning a batch entry.
     PoolsFenceStatusBeginEntry,
+    /// `vkGetFenceStatus` from periodic graveyard maintenance.
+    PoolsFenceStatusMaintenance,
     /// `vkWaitForFences` draining an in-flight batch entry.
     PoolsWaitFencesEntry,
     /// Bounded `vkWaitForFences` before destroying in-flight pool slots.
@@ -434,6 +436,7 @@ impl Decline for VkCall {
             VkOp::PoolsCreateFence => "vk_pools_create_fence",
             VkOp::PoolsWaitFencesRetire => "vk_pools_wait_fences_retire",
             VkOp::PoolsFenceStatusBeginEntry => "vk_pools_fence_status_begin_entry",
+            VkOp::PoolsFenceStatusMaintenance => "vk_pools_fence_status_maintenance",
             VkOp::PoolsWaitFencesEntry => "vk_pools_wait_fences_entry",
             VkOp::PoolsWaitFencesDestroy => "vk_pools_wait_fences_destroy",
             VkOp::PoolsResetFencesRetire => "vk_pools_reset_fences_retire",

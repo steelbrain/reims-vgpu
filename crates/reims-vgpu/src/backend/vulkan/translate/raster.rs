@@ -306,7 +306,10 @@ mod tests {
             assert!(fill_mode(mtl).is_ok(), "fill {mtl}");
             assert!(depth_clip_mode(mtl).is_ok(), "depth clip {mtl}");
         }
-        assert_eq!(fill_mode(2).unwrap_err(), TranslateReason::UnknownFillMode(2));
+        assert_eq!(
+            fill_mode(2).unwrap_err(),
+            TranslateReason::UnknownFillMode(2)
+        );
         assert_eq!(
             depth_clip_mode(2).unwrap_err(),
             TranslateReason::UnknownDepthClipMode(2)

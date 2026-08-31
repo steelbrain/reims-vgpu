@@ -1,0 +1,56 @@
+# Guest failures owned outside shader translation.
+#
+# One case name per line, followed by a comment naming the violated API
+# relation and the driver owner or rail. An unexplained mismatch does not
+# belong here: establish its owner first. Remove an entry when the scorer says
+# FIXED-DRIVER.
+
+# A buffer-backed alias used as a compute *storage* image is refused before
+# translation (`compute_buffer_texture_storage_unsupported`). The sampled forms
+# of the same rail now execute.
+buffer_backed_alias_incompatible_widths # buffer storage image refused before translation
+buffer_backed_alias_partial_row_range # buffer storage image refused before translation
+
+# The multisample pair is now split across the two inventories, which is the
+# whole reason there are two cases. This device serves the `texture2d_ms` bind
+# from the target resident, so `msaa4_color_store_host_sample_count` passes and
+# has no entry here. `msaa4_color_store_no_resolve` reads the same samples back
+# through `get_num_samples()`, which translation folds to 1, and it is recorded
+# in translation-errors.txt against its bugs/ package.
+
+# Depth/stencil attachment state or contents are lost in the device model. The
+# distinguishing colour shaders pass elsewhere; the log also names a depth
+# LOAD with no resident content.
+depth_attachment_isolated_across_tasks # task-local depth content aliases or disappears
+depth_attachment_clear_without_test_state # stored depth clear is absent on later LOAD
+stencil_only_attachment_clear_without_test_state # stencil-only attachment clear is absent
+combined_depth_stencil_default_buffer_copy_selects_depth # blit selects the wrong aspect bytes
+
+# `dispatchThreads` is widened to whole threadgroups by the command execution
+# rail. The divisible control passes and every non-divisible grid runs threads
+# outside the API extent.
+dispatch_threads_grid_218x16_tg8 # 96 threads ran past the requested width
+dispatch_threads_grid_54x15_tg8 # threads ran past both requested dimensions
+dispatch_threads_grid_57x9_tg8 # threads ran past both requested dimensions
+dispatch_threads_grid_31x31_tg16 # threads ran past both requested dimensions
+
+# Device API/state reporting; neither result executes translated GPU code.
+indirect_command_reset_copy_optimize # device reports indirect command buffers unavailable
+pipeline_information_lifetime # pipeline construction-owned information reports zero
+
+# The render path drops the declared array slice and samples slice zero.
+texture_view_array_slice_64x32x3_s1 # texture view base slice 1 dropped
+texture_view_array_slice_64x32x3_s2 # texture view base slice 2 dropped
+
+# A buffer-backed render target arrives as a texture view; the target resolver
+# rejects that object type and the following shaderless blit sees untouched bytes.
+srt_blit_buffer_backed_512x512 # rt_wrong_type followed by view_desc_decode
+
+# Direct indexed draw semantics. Both index widths and byte offsets match the
+# shared-shader control when baseVertex is zero. Either width fails only when
+# the signed base is -1, so the driver loses or misapplies baseVertex. General
+# non-indexed baseInstance passes; only the indexed base-instance opcode is
+# accepted without an executor and produces no pixels.
+draw_indexed_uint16_base_vertex_minus1 # signed baseVertex is lost or misapplied
+draw_indexed_uint32_offset_4_base_vertex_minus1 # signed baseVertex is lost or misapplied
+draw_indexed_two_instances_base_instance_5 # indexed base-instance opcode accepted without executor

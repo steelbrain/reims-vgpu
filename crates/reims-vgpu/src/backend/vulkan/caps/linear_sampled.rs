@@ -109,6 +109,16 @@ pub struct LinearFormatVerdict {
     /// The device reports `HOST_ALLOCATION_EXT` importable for a `LINEAR`,
     /// `SAMPLED` image of this format.
     pub importable: bool,
+    /// The device reports `DEDICATED_ONLY` for that import, meaning the memory
+    /// must be bound to an image created solely for it.
+    ///
+    /// This refuses the rail whatever shape it is given. Aliasing guest pages
+    /// means importing one host allocation that the guest's own whole-span
+    /// buffer already covers; a handle type that will only be imported into a
+    /// dedicated allocation cannot be that memory at the same time. So it is
+    /// not a narrowing of the design space, it is a "no" — and it is invisible
+    /// in `importable`, which reads `true` on exactly such a device.
+    pub dedicated_only: bool,
 }
 
 impl LinearFormatVerdict {
@@ -119,6 +129,7 @@ impl LinearFormatVerdict {
             sampled: features.contains(vk::FormatFeatureFlags::SAMPLED_IMAGE),
             filter_linear: features.contains(vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR),
             importable: false,
+            dedicated_only: false,
         }
     }
 
@@ -126,16 +137,22 @@ impl LinearFormatVerdict {
     /// own: the row-pitch agreement in this module's doc is a per-window
     /// question and is not represented here.
     pub fn device_conditions_hold(self) -> bool {
-        self.sampled && self.filter_linear && self.importable
+        self.sampled && self.filter_linear && self.importable && !self.dedicated_only
     }
 
     /// Stable slug for the report line, naming which condition refused.
     fn slug(self) -> &'static str {
-        match (self.sampled, self.filter_linear, self.importable) {
-            (true, true, true) => "alias_possible",
-            (true, true, false) => "not_importable",
-            (true, false, _) => "sampled_nearest_only",
-            (false, _, _) => "not_sampled",
+        match (
+            self.sampled,
+            self.filter_linear,
+            self.importable,
+            self.dedicated_only,
+        ) {
+            (true, true, true, false) => "alias_possible",
+            (true, true, true, true) => "dedicated_only",
+            (true, true, false, _) => "not_importable",
+            (true, false, _, _) => "sampled_nearest_only",
+            (false, _, _, _) => "not_sampled",
         }
     }
 }
@@ -170,10 +187,12 @@ pub unsafe fn report(instance: &ash::Instance, pd: vk::PhysicalDevice) {
         if unsafe { instance.get_physical_device_image_format_properties2(pd, &info, &mut out) }
             .is_ok()
         {
-            verdict.importable = ext_props
+            let features = ext_props
                 .external_memory_properties
-                .external_memory_features
-                .contains(vk::ExternalMemoryFeatureFlags::IMPORTABLE);
+                .external_memory_features;
+            verdict.importable = features.contains(vk::ExternalMemoryFeatureFlags::IMPORTABLE);
+            verdict.dedicated_only =
+                features.contains(vk::ExternalMemoryFeatureFlags::DEDICATED_ONLY);
         }
 
         if verdict.device_conditions_hold() {
@@ -203,6 +222,7 @@ mod tests {
             sampled: true,
             filter_linear: true,
             importable: true,
+            dedicated_only: false,
         };
         assert!(all.device_conditions_hold());
         assert_eq!(all.slug(), "alias_possible");
@@ -211,16 +231,57 @@ mod tests {
             ("filter", "sampled_nearest_only"),
             ("import", "not_importable"),
             ("sampled", "not_sampled"),
+            ("dedicated", "dedicated_only"),
         ] {
             let mut v = all;
             match drop_field {
                 "filter" => v.filter_linear = false,
                 "import" => v.importable = false,
+                "dedicated" => v.dedicated_only = true,
                 _ => v.sampled = false,
             }
             assert!(!v.device_conditions_hold(), "{drop_field} must be required");
             assert_eq!(v.slug(), want_slug, "{drop_field}");
         }
+    }
+
+    /// A dedicated-only import cannot alias an allocation the guest's own
+    /// buffer already covers, so it refuses the rail even though every other
+    /// device condition holds and `importable` reads true. Without this bit the
+    /// report counts such a device in `alias_possible`, which is the one
+    /// direction the answer must never be wrong in: it would send the next
+    /// reader to build a rail the device will not accept.
+    #[test]
+    fn a_dedicated_only_import_is_not_an_alias() {
+        let mut verdict = LinearFormatVerdict::from_tiling(
+            vk::FormatFeatureFlags::SAMPLED_IMAGE
+                | vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR,
+        );
+        verdict.importable = true;
+        assert!(verdict.device_conditions_hold());
+        assert_eq!(verdict.slug(), "alias_possible");
+
+        verdict.dedicated_only = true;
+        assert!(
+            !verdict.device_conditions_hold(),
+            "a dedicated allocation cannot also be the guest allocation's own buffer"
+        );
+        assert_eq!(
+            verdict.slug(),
+            "dedicated_only",
+            "the refusing condition must be named, not folded into not_importable"
+        );
+    }
+
+    /// `from_tiling` never claims a dedicated-only import either way: like
+    /// `importable`, that answer comes from the separate query.
+    #[test]
+    fn tiling_alone_never_claims_dedicated_only() {
+        let both = LinearFormatVerdict::from_tiling(
+            vk::FormatFeatureFlags::SAMPLED_IMAGE
+                | vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR,
+        );
+        assert!(!both.dedicated_only);
     }
 
     /// The tiling flags are read from `linearTilingFeatures`, not invented, and a

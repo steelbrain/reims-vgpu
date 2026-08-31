@@ -654,7 +654,7 @@ dependencies = [
 [[package]]
 name = "metal2vulkan"
 version = "0.1.0"
-source = "git+https://github.com/steelbrain/metal2vulkan.git?rev=8b78eaca3be72b4e596aa1c790a4cd114ac1e9ec#8b78eaca3be72b4e596aa1c790a4cd114ac1e9ec"
+source = "git+https://github.com/steelbrain/metal2vulkan.git?rev=47009b2693757b8d51b907bff37ce4fa4793293f#47009b2693757b8d51b907bff37ce4fa4793293f"
 dependencies = [
  "spirv",
  "wait-timeout",
@@ -1145,10 +1145,37 @@ dependencies = [
  "once_cell",
  "parking_lot",
  "raw-window-handle",
+ "reims-vgpu-contract",
+ "reims-vgpu-env",
+ "reims-vgpu-observe",
  "reims-vgpu-paging",
  "reims-vgpu-wire",
  "serde_json",
+ "wayland-backend",
+ "wayland-client",
+ "wayland-protocols",
  "winit",
+ "x11-dl",
+]
+
+[[package]]
+name = "reims-vgpu-contract"
+version = "0.1.0"
+dependencies = [
+ "reims-vgpu-observe",
+ "reims-vgpu-paging",
+ "reims-vgpu-wire",
+]
+
+[[package]]
+name = "reims-vgpu-env"
+version = "0.1.0"
+
+[[package]]
+name = "reims-vgpu-observe"
+version = "0.1.0"
+dependencies = [
+ "reims-vgpu-env",
 ]
 
 [[package]]

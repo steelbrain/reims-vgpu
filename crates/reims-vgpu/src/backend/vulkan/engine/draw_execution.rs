@@ -11,7 +11,6 @@
 //! happen now: guest runs are gathered by the CPU out of the mapped span, so
 //! there is no import to lose.
 
-
 use super::types::{ResidentReclaim, TargetIdentity};
 use crate::observe::Decline;
 
@@ -82,7 +81,9 @@ pub enum DrawExecutionDecline {
     /// Refused rather than staged short: staging an RGBA8 seed under a wider
     /// attachment reads past the slot and seeds the frame with whatever the
     /// pool put after it.
-    SeedFormatUnwritable { format: ash::vk::Format },
+    SeedFormatUnwritable {
+        format: ash::vk::Format,
+    },
     SampledResidentMissing {
         binding: u32,
         identity: TargetIdentity,

@@ -11,9 +11,7 @@ use crate::contract::pass_action::{
     MTL_STORE_ACTION_MULTISAMPLE_RESOLVE, MTL_STORE_ACTION_STORE,
     MTL_STORE_ACTION_STORE_AND_MULTISAMPLE_RESOLVE,
 };
-use crate::contract::pixel_format::{
-    f64_to_unorm8, solid_rgba8, MTL_FORMAT_BGRA8_UNORM, RGBA8_BPP,
-};
+use crate::contract::pixel_format::{self, ClearImageEncoding};
 use crate::model::DeviceState;
 use crate::runtime::blit_exec::{self, BlitStatus};
 use crate::runtime::compute_exec::{self, ComputeStatus};
@@ -859,7 +857,10 @@ fn preflight_render_translations<M: HostMemory + HostOps>(
     use crate::runtime::drain::{note_preflight_part, note_preflight_pipe, PreflightPart};
     let refs_started = std::time::Instant::now();
     let pipelines = render_pipeline_refs(stream);
-    note_preflight_part(PreflightPart::Refs, refs_started.elapsed().as_nanos() as u64);
+    note_preflight_part(
+        PreflightPart::Refs,
+        refs_started.elapsed().as_nanos() as u64,
+    );
     let mut pending = false;
     for pipeline_ref in pipelines {
         note_preflight_pipe();
@@ -868,12 +869,8 @@ fn preflight_render_translations<M: HostMemory + HostOps>(
         // resolves below. `translations_ready` states why that is not a weaker
         // answer — chiefly that the translate cache never evicts, so a shader
         // this memo saw translated is still translated.
-        if crate::runtime::pipeline_resolve::translations_ready(
-            state,
-            host,
-            task_id,
-            pipeline_ref,
-        ) {
+        if crate::runtime::pipeline_resolve::translations_ready(state, host, task_id, pipeline_ref)
+        {
             continue;
         }
         let air_started = std::time::Instant::now();
@@ -911,7 +908,10 @@ fn preflight_render_translations<M: HostMemory + HostOps>(
         ) {
             pending = true;
         }
-        note_preflight_part(PreflightPart::Cache, cache_started.elapsed().as_nanos() as u64);
+        note_preflight_part(
+            PreflightPart::Cache,
+            cache_started.elapsed().as_nanos() as u64,
+        );
     }
     pending
 }
@@ -961,7 +961,10 @@ fn preflight_compute_translations<M: HostMemory + HostOps>(
     use crate::runtime::drain::{note_preflight_part, note_preflight_pipe, PreflightPart};
     let refs_started = std::time::Instant::now();
     let inputs = compute_translation_inputs(stream);
-    note_preflight_part(PreflightPart::Refs, refs_started.elapsed().as_nanos() as u64);
+    note_preflight_part(
+        PreflightPart::Refs,
+        refs_started.elapsed().as_nanos() as u64,
+    );
     let mut pending = false;
     for (pipeline_ref, local_size) in inputs {
         note_preflight_pipe();
@@ -986,7 +989,10 @@ fn preflight_compute_translations<M: HostMemory + HostOps>(
         let cache_started = std::time::Instant::now();
         let cached =
             crate::runtime::m2v_cache::ensure_cached_kernel_async(air, local_size, pipeline_ref);
-        note_preflight_part(PreflightPart::Cache, cache_started.elapsed().as_nanos() as u64);
+        note_preflight_part(
+            PreflightPart::Cache,
+            cache_started.elapsed().as_nanos() as u64,
+        );
         if !cached {
             pending = true;
         }
@@ -1832,8 +1838,7 @@ fn handle_render_record<M: HostMemory + HostOps>(
                     Some(TextureBind {
                         index,
                         texture_ref,
-                        resource: objects::resolve_resource(state, host, task_id, texture_ref)
-                            .ok(),
+                        resource: objects::resolve_resource(state, host, task_id, texture_ref).ok(),
                     })
                 },
             );
@@ -1982,10 +1987,8 @@ fn handle_render_record<M: HostMemory + HostOps>(
                 // guest that wanted none also produces.
                 let depth = decode_depth_attachment(payload);
                 if depth.texture_ref != 0 {
-                    if attachment_subresource_is_bindable(
-                        depth.into(),
-                        LevelSupport::LevelZeroOnly,
-                    ) {
+                    if attachment_subresource_is_bindable(depth.into(), LevelSupport::LevelZeroOnly)
+                    {
                         acc.depth_attach = Some(depth);
                     } else {
                         let drop = note_depth_stencil_unsupported(task_id, "depth", &depth.into());
@@ -3111,6 +3114,19 @@ fn apply_binds<T: Copy, B: Clone>(
     cleared
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StreamDrawDelta {
+    ok: u32,
+    fail: u32,
+}
+
+fn stream_draw_delta(out: &ExecResult, at_entry: (u32, u32)) -> StreamDrawDelta {
+    StreamDrawDelta {
+        ok: out.metal_draws_ok.saturating_sub(at_entry.0),
+        fail: out.metal_draws_fail.saturating_sub(at_entry.1),
+    }
+}
+
 fn finish_stream<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -3118,6 +3134,8 @@ fn finish_stream<M: HostMemory + HostOps>(
     out: &mut ExecResult,
     acc: &StreamAccum,
 ) {
+    let draws_at_entry = (out.metal_draws_ok, out.metal_draws_fail);
+    let clears_at_entry = out.clears_applied;
     // Opens in `Prelude` and is charged to whichever part is open until it
     // drops, so the six tile this function rather than sampling it. See
     // [`finish_phase`] for what the split is for.
@@ -3605,16 +3623,18 @@ fn finish_stream<M: HostMemory + HostOps>(
         // CLEAR seed — not a content heuristic). Applies for any draw-fail
         // class, not only NoMetal: mrt_request fail used to skip this and left
         // mid pages empty → nz_swing thrash on x86 Linux product.
-        if out.metal_draws_ok == 0 && !acc.clears.is_empty() {
+        let stream_draws = stream_draw_delta(out, draws_at_entry);
+        if stream_draws.ok == 0 && !acc.clears.is_empty() {
             for att in acc.clears_reaching_guest_pages() {
                 if apply_clear(state, host, task_id, att) {
                     out.clears_applied = out.clears_applied.saturating_add(1);
                 }
             }
-            if out.clears_applied > 0 || saw_nometal || out.metal_draws_fail > 0 {
+            let stream_clears = out.clears_applied.saturating_sub(clears_at_entry);
+            if stream_clears > 0 || saw_nometal || stream_draws.fail > 0 {
                 crate::observe::fail(format!(
                     "draw_fail_clear_fallback task={task_id} clears={} draws_fail={} nometal={}",
-                    out.clears_applied, out.metal_draws_fail, saw_nometal as u8
+                    stream_clears, stream_draws.fail, saw_nometal as u8
                 ));
             }
         }
@@ -4105,42 +4125,113 @@ fn land_chain_before_abandon<M: HostMemory + HostOps>(
     dirty_color_targets(state, host, task_id, &acc.color_targets);
 }
 
+/// Where a clear-only pass publishes its single-sample result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClearPublish {
+    /// Publish into the attachment's own texture, exactly as declared.
+    Direct,
+    /// Publish into the resolve texture instead of the multisample one.
+    Resolved(u32),
+    /// Preserve the multisample attachment and publish its resolved value.
+    /// These are two distinct destinations and neither substitutes for the
+    /// other.
+    StoredAndResolved { source: u32, resolve: u32 },
+    /// This store action publishes no single-sample result, or there is no
+    /// attachment texture at all. Not a loss: the guest asked for nothing.
+    NotPublished,
+    /// A resolve-carrying store action naming no resolve texture. The guest
+    /// asked for a resolve and gave nowhere to put it.
+    ResolveTargetMissing,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StoreAndResolveClearDecline {
+    source: u32,
+    resolve: u32,
+}
+
+impl crate::observe::Decline for StoreAndResolveClearDecline {
+    fn slug(&self) -> &'static str {
+        "clear_store_and_multisample_resolve_unsupported"
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        vec![
+            ("source", self.source.to_string()),
+            ("resolve", self.resolve.to_string()),
+        ]
+    }
+}
+
+/// Which texture a clear-only pass's colour attachment publishes into.
+///
+/// `MTLLoadActionClear` with no draws leaves every sample holding `clearColor`,
+/// so a multisample resolve publishes that colour into `resolveTexture`.
+/// `MTLStoreActionStoreAndMultisampleResolve` additionally preserves the source
+/// attachment; it is therefore a distinct two-destination result.
+fn clear_publish_target(att: &ColorAttachment) -> ClearPublish {
+    if att.texture_ref == 0 || !store_action_publishes_single_sample(att.store_action) {
+        return ClearPublish::NotPublished;
+    }
+    if matches!(
+        att.store_action,
+        MTL_STORE_ACTION_MULTISAMPLE_RESOLVE | MTL_STORE_ACTION_STORE_AND_MULTISAMPLE_RESOLVE
+    ) {
+        if att.resolve_texture_ref == 0 {
+            return ClearPublish::ResolveTargetMissing;
+        }
+        if att.store_action == MTL_STORE_ACTION_STORE_AND_MULTISAMPLE_RESOLVE {
+            return ClearPublish::StoredAndResolved {
+                source: att.texture_ref,
+                resolve: att.resolve_texture_ref,
+            };
+        }
+        return ClearPublish::Resolved(att.resolve_texture_ref);
+    }
+    ClearPublish::Direct
+}
+
 fn apply_clear<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     task_id: u32,
     att: &ColorAttachment,
 ) -> bool {
-    if att.texture_ref == 0 || !store_action_publishes_single_sample(att.store_action) {
-        return false;
-    }
-    if att.store_action == MTL_STORE_ACTION_STORE_AND_MULTISAMPLE_RESOLVE {
-        crate::observe::fail(format!(
-            "render_clear reason=clear_store_and_multisample_resolve_unsupported \
-             source={} resolve={}",
-            att.texture_ref, att.resolve_texture_ref
-        ));
-        return false;
-    }
-    if att.store_action == MTL_STORE_ACTION_MULTISAMPLE_RESOLVE
-        && att.resolve_texture_ref == 0
-    {
-        crate::observe::fail(format!(
-            "render_clear reason=clear_multisample_resolve_target_missing source={}",
-            att.texture_ref
-        ));
-        return false;
-    }
-    let target = if att.resolve_texture_ref != 0 {
-        ColorAttachment {
-            texture_ref: att.resolve_texture_ref,
+    let target = match clear_publish_target(att) {
+        // Declared single-sample: published exactly as the guest stated it,
+        // level and all.
+        ClearPublish::Direct => *att,
+        // A resolve: the clear lands in the resolve texture as an ordinary
+        // single-sample store. Level zero because a resolve target has one.
+        ClearPublish::Resolved(texture_ref) => ColorAttachment {
+            texture_ref,
             resolve_texture_ref: 0,
             level: 0,
             store_action: MTL_STORE_ACTION_STORE,
             ..*att
+        },
+        ClearPublish::StoredAndResolved { source, resolve } => {
+            // This helper can publish one single-sample texture. Writing only
+            // `resolve` would silently discard the independently retained
+            // multisample `source`, while treating the source as a linear image
+            // would write only one sample. Refuse the unsupported pair as one
+            // contract operation.
+            crate::observe::Emit::decline(
+                "render_clear",
+                &StoreAndResolveClearDecline { source, resolve },
+            )
+            .fail();
+            return false;
         }
-    } else {
-        *att
+        ClearPublish::NotPublished => return false,
+        ClearPublish::ResolveTargetMissing => {
+            crate::observe::fail(format!(
+                "render_clear reason=clear_multisample_resolve_target_missing source={} \
+                 store={}",
+                att.texture_ref, att.store_action
+            ));
+            return false;
+        }
     };
     // Prefer full draw-path resolve (type-11 or type-2/3 GVA wallpaper targets).
     let Some(req) =
@@ -4159,43 +4250,116 @@ fn apply_clear<M: HostMemory + HostOps>(
         return false;
     };
     let c0 = req.colors.first().unwrap_or_else(|| unreachable!());
-    let w = c0.width;
-    let h = c0.height;
-    let rgba = solid_rgba8(w, h, &att.clear_color);
+    // A multisample attachment has no single-sample linear publication, and
+    // this is the first point at which that is knowable: `clear_publish_target`
+    // above decides from the store action alone, and the sample count arrives
+    // with the resolved target.
+    //
+    // The rule is the one the `StoredAndResolved` arm already states —
+    // "treating the source as a linear image would write only one sample" — and
+    // it applies just as much to a plain `MTLStoreActionStore` on a texture
+    // whose descriptor declares four samples. That arm could not reach this
+    // case because the store action does not name it.
+    //
+    // The guest sizes and strides these allocations for their samples. On rail
+    // macos-15 the 300x300 four-sample tiles carry `bpr = 4800`, exactly four
+    // times a 300-wide BGRA8 tight row, against `bpr = 1216` on the
+    // single-sample surfaces beside them. So writing a single-sample image here
+    // is not a partial answer: it fills 1200 bytes of every 4800-byte row with
+    // a solid colour and leaves the rest, in a sample layout this device has
+    // never established. Refusing leaves the guest the bytes it already had,
+    // which is what every other refusal on this rail promises.
+    //
+    // This narrows the clear rail; it does not close it. A resolve destination
+    // is single-sample by construction and still publishes, through
+    // `ClearPublish::Resolved` above.
+    if c0.sample_count > 1 {
+        note_clear_dropped(
+            "clear_multisample_source_not_linear",
+            att.texture_ref,
+            &format!(
+                "samples={} {}x{} bpr={} gva={:#x} mid={} store={} (the guest \
+                 strided this span for its samples; a one-sample image is the \
+                 wrong content for it, not a partial one)",
+                c0.sample_count,
+                c0.width,
+                c0.height,
+                c0.row_stride,
+                c0.target_gva,
+                c0.mapping_id,
+                att.store_action
+            ),
+        );
+        return false;
+    }
+    // Format and clear representation are one contract decision. Continuous
+    // colour keeps the semantic RGBA8 carrier the existing converters consume;
+    // integer targets carry their own texels, where `1` remains the integer 1.
+    let Some(clear) =
+        pixel_format::solid_clear_image(c0.format, c0.width, c0.height, &att.clear_color)
+    else {
+        note_clear_dropped(
+            "target_clear_image_unrepresentable",
+            att.texture_ref,
+            "the admitted target has no CPU clear representation",
+        );
+        return false;
+    };
     if c0.target_gva != 0 {
-        return draw::write_gva_rgba8(
+        let frame = match clear.encoding() {
+            ClearImageEncoding::Rgba8 => draw::FrameRows::Rgba8(clear.pixels()),
+            ClearImageEncoding::Native => draw::FrameRows::Native(clear.pixels()),
+        };
+        let ok = draw::write_gva_frame_within(
             state,
             host,
             task_id,
             c0.target_gva,
-            w,
-            h,
+            c0.width,
+            c0.height,
             c0.row_stride,
             c0.format,
-            &rgba,
+            frame,
+            None,
         )
         .is_ok();
+        if ok {
+            crate::runtime::surface_cache::forget_gva_copies(
+                state,
+                task_id,
+                c0.target_gva,
+                att.texture_ref,
+            );
+        }
+        return ok;
     }
     if c0.mapping_id == 0 {
         return false;
     }
-    let r = f64_to_unorm8(att.clear_color[0]);
-    let g = f64_to_unorm8(att.clear_color[1]);
-    let b = f64_to_unorm8(att.clear_color[2]);
-    let a = f64_to_unorm8(att.clear_color[3]);
-    let px = [b, g, r, a];
-    let stride = w.saturating_mul(RGBA8_BPP);
-    let mut img = vec![0u8; (stride as usize).saturating_mul(h as usize)];
-    for y in 0..h as usize {
-        for x in 0..w as usize {
-            let o = y * stride as usize + x * 4;
-            img[o..o + 4].copy_from_slice(&px);
-        }
+    let ok = match clear.encoding() {
+        ClearImageEncoding::Rgba8 => mapping_write::write_rgba8_image_changed(
+            state,
+            host,
+            c0.mapping_id,
+            clear.pixels(),
+            None,
+            c0.width,
+            c0.height,
+        ),
+        ClearImageEncoding::Native => mapping_write::write_native_image(
+            state,
+            host,
+            c0.mapping_id,
+            clear.pixels(),
+            clear.row_bytes(),
+            c0.width,
+            c0.height,
+            c0.format,
+        ),
+    };
+    if ok {
+        state.note_surface_clear(c0.mapping_id);
     }
-    let _ = MTL_FORMAT_BGRA8_UNORM;
-    let ok = mapping_write::write_bgra8(state, host, c0.mapping_id, &img, stride, w, h);
-    // host_cache also updated inside write_bgra8 (surface_cache::store).
-    state.note_surface_clear(c0.mapping_id);
     ok
 }
 

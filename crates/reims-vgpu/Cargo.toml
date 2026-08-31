@@ -33,6 +33,10 @@ host-window = [
     "dep:winit",
     "dep:ash-window",
     "dep:raw-window-handle",
+    "dep:wayland-client",
+    "dep:wayland-backend",
+    "dep:wayland-protocols",
+    "dep:x11-dl",
     "backend-vulkan",
 ]
 
@@ -45,12 +49,38 @@ reims-vgpu-wire = { path = "../reims-vgpu-wire" }
 # Guest address resolution above the wire page-table format: span walks, GPA
 # run coalescing, window region planning. `no_std` + alloc, no host traits.
 reims-vgpu-paging = { path = "../reims-vgpu-paging" }
+# Operator switches: one parser, four results, and the rule that a switch may
+# only ever narrow what this device does. No dependencies of its own.
+reims-vgpu-env = { path = "../reims-vgpu-env" }
+# The backend-neutral protocol vocabulary: layouts, formats, geometry, page
+# arithmetic. A crate so that nothing in it can name a Vulkan handle, a Metal
+# object, or this device's state.
+reims-vgpu-contract = { path = "../reims-vgpu-contract" }
+# The always-on sink, the decline vocabulary, and the slug registry. A crate so
+# that the layers below the device can name their own refusal type without
+# depending on the device, and so nothing in it can reach back up.
+reims-vgpu-observe = { path = "../reims-vgpu-observe" }
 ash = { version = "0.38", optional = true }
 # Always available for Linux MTLB→AIR→SPIR-V (encode path + probes).
-metal2vulkan = { git = "https://github.com/steelbrain/metal2vulkan.git", rev = "8b78eaca3be72b4e596aa1c790a4cd114ac1e9ec" }
+metal2vulkan = { git = "https://github.com/steelbrain/metal2vulkan.git", rev = "47009b2693757b8d51b907bff37ce4fa4793293f" }
 winit = { version = "0.30", optional = true }
 ash-window = { version = "0.13", optional = true }
 raw-window-handle = { version = "0.6", optional = true }
+
+# Keyboard shortcut capture for the host window (`host_window::capture`). The
+# desktop consumes chords before any client sees them; taking them back is a
+# per-window-system request, not something the windowing library exposes.
+#
+# Every one of these is already in the dependency graph as a transitive of
+# `winit` at the same version, so this adds no new code to the build — it only
+# names what this crate calls directly. `wayland-backend`'s `client_system` arm
+# is what `Backend::from_foreign_display` lives in, and it is the arm `winit`
+# itself selects, so both halves share one libwayland connection.
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+wayland-client = { version = "0.31", optional = true }
+wayland-backend = { version = "0.3", features = ["client_system"], optional = true }
+wayland-protocols = { version = "0.32", features = ["client", "unstable"], optional = true }
+x11-dl = { version = "2.21", optional = true }
 
 # Metal encode is macOS-only; `backend-metal` is rejected on any other host.
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -61,6 +91,12 @@ foreign-types = "0.5"
 libc = "0.2"
 
 [dev-dependencies]
+# Same dependency, with the test-only sink surface turned on. `FailCapture` and
+# the slug-collision panic are compiled separately from the crate that defines
+# them, so `#[cfg(test)]` cannot reach them; Cargo unifies this with the
+# `[dependencies]` entry above when a test target builds and leaves it off for
+# the staticlib QEMU links against.
+reims-vgpu-observe = { path = "../reims-vgpu-observe", features = ["testing"] }
 # Reads `reims-vgpu-wire`'s oracle fixtures — bytes Apple's own serializer
 # produced — so `wire_fixtures_reach_the_decoders` can run them through this
 # crate's decoders. Test-only: nothing here reaches the staticlib QEMU links.

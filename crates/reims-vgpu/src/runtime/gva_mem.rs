@@ -354,10 +354,18 @@ pub fn any_task_gva_page_resolves<M: HostMemory>(
     page_shift: u32,
 ) -> bool {
     let mut found = false;
-    visit_task_gva_page_gpas(host, tasks, task_id, gva, span.max(1), page_shift, &mut |_| {
-        found = true;
-        false
-    });
+    visit_task_gva_page_gpas(
+        host,
+        tasks,
+        task_id,
+        gva,
+        span.max(1),
+        page_shift,
+        &mut |_| {
+            found = true;
+            false
+        },
+    );
     found
 }
 
@@ -523,12 +531,18 @@ pub fn visit_task_gva_page_gpas<M: HostMemory>(
     page_shift: u32,
     visit: &mut dyn FnMut(u64) -> bool,
 ) {
-    visit_task_gva_pages(host, tasks, task_id, gva, span, page_shift, &mut |gpa| {
-        match gpa {
+    visit_task_gva_pages(
+        host,
+        tasks,
+        task_id,
+        gva,
+        span,
+        page_shift,
+        &mut |gpa| match gpa {
             Some(gpa) => visit(gpa),
             None => true,
-        }
-    });
+        },
+    );
 }
 
 /// The resolved page GPAs of `[gva, gva+span)` under `task_id`'s page table, in
@@ -1154,17 +1168,33 @@ mod tests {
         // The donor really can serve it — otherwise this test would pass for the
         // wrong reason.
         let mut donor = Vec::new();
-        visit_task_gva_page_gpas(&host, &state.tasks, 2, 0x1000, 4, PAGE_SHIFT_X86, &mut |gpa| {
-            donor.push(gpa);
-            true
-        });
+        visit_task_gva_page_gpas(
+            &host,
+            &state.tasks,
+            2,
+            0x1000,
+            4,
+            PAGE_SHIFT_X86,
+            &mut |gpa| {
+                donor.push(gpa);
+                true
+            },
+        );
         assert_eq!(donor, vec![data_gpa], "task 2 resolves GVA page 1");
 
         let mut pages = Vec::new();
-        visit_task_gva_page_gpas(&host, &state.tasks, 5, 0x1000, 4, PAGE_SHIFT_X86, &mut |gpa| {
-            pages.push(gpa);
-            true
-        });
+        visit_task_gva_page_gpas(
+            &host,
+            &state.tasks,
+            5,
+            0x1000,
+            4,
+            PAGE_SHIFT_X86,
+            &mut |gpa| {
+                pages.push(gpa);
+                true
+            },
+        );
         assert!(
             pages.is_empty(),
             "no neighbour's pages may be indexed under task 5, got {pages:x?}"

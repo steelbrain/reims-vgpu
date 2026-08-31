@@ -644,8 +644,8 @@ mod tests {
         st32(&mut p[0..], 3);
         st32(&mut p[4..], COUNT);
         for i in 0..COUNT as usize {
-            let at = CHILD_RESOURCE_LIST_HEADER_LEN as usize
-                + i * CHILD_INVALIDATE_RECORD_LEN as usize;
+            let at =
+                CHILD_RESOURCE_LIST_HEADER_LEN as usize + i * CHILD_INVALIDATE_RECORD_LEN as usize;
             st32(&mut p[at..], 0x100 + i as u32);
             st32(&mut p[at + 4..], CHILD_INVALIDATE_PAGEON_FLAGS);
         }

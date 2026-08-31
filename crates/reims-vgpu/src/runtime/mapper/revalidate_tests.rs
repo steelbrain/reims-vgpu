@@ -611,11 +611,9 @@ fn an_admitted_page_footprint_marks_its_window_without_filling_scatter_gaps() {
     let _fp = footprint::exclusive_for_tests();
     let page = 1u64 << PAGE_SHIFT_X86;
     let pages: std::sync::Arc<[u64]> = [0x1200_0000u64, 0x3200_0000u64].into();
-    let retained = crate::runtime::guest_ram::GuestPageFootprint::new(
-        std::sync::Arc::clone(&pages),
-        page,
-    )
-    .expect("non-empty page footprint");
+    let retained =
+        crate::runtime::guest_ram::GuestPageFootprint::new(std::sync::Arc::clone(&pages), page)
+            .expect("non-empty page footprint");
     note_physical_page_write_footprint(&retained, page - 8, 16);
 
     assert!(footprint::wrote_gpa(pages[0] + page - 8));

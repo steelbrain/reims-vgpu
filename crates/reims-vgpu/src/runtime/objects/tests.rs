@@ -211,7 +211,11 @@ fn task_lifetime_retires_all_of_its_resource_objects() {
 
     assert!(state.delete_task(1));
     assert!(state.task_resources.get(1, 1).is_none());
-    assert_eq!(ld32(&resource.descriptor), 9, "an outstanding host owner remains valid");
+    assert_eq!(
+        ld32(&resource.descriptor),
+        9,
+        "an outstanding host owner remains valid"
+    );
 }
 
 #[test]
@@ -452,6 +456,65 @@ fn decode_type4_plane0() {
     assert_eq!(
         iosurface_pixel_format_to_mtl(s.pixel_format),
         crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM
+    );
+}
+
+/// An `'l10r'` render surface reaches a colour attachment, end to end.
+///
+/// The bug class: a guest game creates its render surface as a single-plane
+/// `kCVPixelFormatType_ARGB2101010LEPacked` IOSurface, this table answered 0 for
+/// it, and 0 out of this table is `draw::render_target`'s
+/// `rt_type4_base_format` refusal — so every draw of every frame failed and the
+/// window was black. Two tables had to answer for that to stop, and a test on
+/// either one alone would have passed while the window stayed black, so this
+/// walks the whole chain the resolve walks.
+///
+/// The geometry is the surface measured on the boot that found it: width 1280 at
+/// a 5120-byte row is four bytes a texel, which is what the packed word is, and
+/// it is the reading that says this FourCC is not a multi-plane media format
+/// wearing a colour name.
+#[test]
+fn an_l10r_surface_resolves_as_a_packed_ten_bit_colour_attachment() {
+    use crate::contract::pixel_format as pf;
+
+    const FOURCC_L10R: u32 = 0x6c31_3072;
+    let built = Type4Builder::new(0x384000, 0x100, FOURCC_L10R, 1).plane(0, 0, 1280, 720, 5120, 0);
+    let surf = decode_type4_surface(built.bytes()).expect("type4 decodes");
+    assert!(
+        !type4_is_multiplanar(&surf),
+        "a packed single-plane colour surface must not read as biplanar"
+    );
+
+    // Step one: the FourCC names a Metal format at all. A zero here is the
+    // refusal the resolve turns into a dropped colour attachment.
+    let mtl = iosurface_pixel_format_to_mtl(surf.pixel_format);
+    assert_eq!(
+        mtl,
+        pf::MTL_FORMAT_BGR10A2_UNORM,
+        "'l10r' must name BGR10A2Unorm"
+    );
+
+    // Step two: that format is one this device will render into, which is what
+    // `translate::pixel::color_attachment` derives its answer from. Both steps
+    // were missing and either one alone leaves the frame black.
+    assert_eq!(
+        pf::render_target_bpp(mtl),
+        Some(4),
+        "a named format this device will not render into is still a black window"
+    );
+    // Step three: the frame can be landed in the guest's own pages by a copy
+    // that converts nothing, which is the only lossless route for a format whose
+    // channels do not sit on byte boundaries.
+    assert_eq!(
+        pf::store_texel_order(mtl),
+        Some(pf::TexelLayout::Bgr10a2Unorm)
+    );
+    // The row stride the surface declared is the tight stride for this format at
+    // this width, so the reading above is the surface's own and not an
+    // assumption about what a packed word costs.
+    assert_eq!(
+        pf::tight_row_bytes(surf.width, mtl),
+        Some(surf.bytes_per_row)
     );
 }
 
@@ -2330,4 +2393,47 @@ fn a_claimant_count_is_banded_against_the_tasks_that_could_have_claimed() {
     // a unanimous claim over an empty population.
     assert_eq!(band(0, 1), "list_miss_slot_empty_claimed_nowhere");
     assert_eq!(band(0, 0), "list_miss_slot_empty_claimed_nowhere");
+}
+
+/// A zero reusable slot has no resolvable tenant, even when an earlier tenant
+/// was observed successfully.
+#[test]
+fn a_freed_or_between_tenants_slot_never_answers_from_an_earlier_generation() {
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task_with_list(&mut host, &mut state);
+    let data_gpa = 4u64 << PAGE_SHIFT_ARM64E;
+    let slot = data_gpa + 12; // ref 1, at `ref * 12`
+
+    let first = lookup_list_entry(&state, &host, 1, 1).expect("the published ref resolves");
+    assert_eq!((first.object_type, first.descriptor_gva), (11, 0x40));
+
+    // Deletion clears the index. The packet has no generation with which to
+    // prove that the first tenant, rather than a later one, is the answer.
+    let _ = host.write_gpa(slot, &[0u8; 12]);
+    assert_eq!(
+        lookup_list_entry(&state, &host, 1, 1),
+        None,
+        "a zero reusable slot cannot name its earlier tenant"
+    );
+
+    // A later allocation reuses the same index for another object.
+    let mut reused = [0u8; 12];
+    st32(&mut reused[0..], 2u32 | (0x30u32 << 8));
+    reused[4..12].copy_from_slice(&0x80u64.to_le_bytes());
+    let _ = host.write_gpa(slot, &reused);
+    let now = lookup_list_entry(&state, &host, 1, 1).expect("the reused slot resolves");
+    assert_eq!(
+        (now.object_type, now.descriptor_gva),
+        (2, 0x80),
+        "a reused index must resolve to its new object, never the retired one"
+    );
+
+    // Clearing the reused tenant must not resurrect either generation.
+    let _ = host.write_gpa(slot, &[0u8; 12]);
+    assert_eq!(
+        lookup_list_entry(&state, &host, 1, 1),
+        None,
+        "a second empty tenancy gap cannot resurrect the first or second object"
+    );
 }

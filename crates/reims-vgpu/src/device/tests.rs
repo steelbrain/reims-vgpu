@@ -150,7 +150,11 @@ fn window_publish_key_moves_for_a_lazy_store_that_wrote_no_guest_page() {
 
     fn publish(state: &mut crate::model::DeviceState) {
         let epoch = state.note_surface_content_published(7);
-        let generation = state.mappings.get(&7).expect("mapping 7").content_generation;
+        let generation = state
+            .mappings
+            .get(&7)
+            .expect("mapping 7")
+            .content_generation;
         state.present.frame_generation = generation;
         state.present.frame_content_epoch = epoch;
     }

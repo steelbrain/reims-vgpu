@@ -395,7 +395,7 @@ pub(crate) fn publish_window_frame(slot: &BoundDevice, state: &mut crate::model:
         };
         let published =
             window_write_frame(link, width, height, Vec::new(), Some(resident_source), cursor);
-        crate::runtime::census::present_proxy::window_publish::note(published);
+        crate::runtime::census::present_proxy::host_window_publish::note(published);
         if published {
             link.last = key;
             state.present.display_from_resident = true;
@@ -439,7 +439,7 @@ pub(crate) fn publish_window_frame(slot: &BoundDevice, state: &mut crate::model:
                 generation
             ));
         }
-        crate::runtime::census::present_proxy::window_publish::note(false);
+        crate::runtime::census::present_proxy::host_window_publish::note(false);
         return;
     }
     // A well-formed frame cleared the short-buffer condition; re-arm the latch
@@ -447,7 +447,7 @@ pub(crate) fn publish_window_frame(slot: &BoundDevice, state: &mut crate::model:
     link.bgra_short_geom = None;
     let bgra = state.present.frame_bgra[..need].to_vec();
     let published = window_write_frame(link, width, height, bgra, None, cursor);
-    crate::runtime::census::present_proxy::window_publish::note(published);
+    crate::runtime::census::present_proxy::host_window_publish::note(published);
     if published {
         link.last = key;
     }

@@ -97,21 +97,86 @@ mod tests {
         use StorageImageSelector as S;
 
         let cases = [
-            (S::Rgba8Uint, MTLPixelFormat::RGBA8Uint, 4, pf::MTL_FORMAT_RGBA8_UINT),
-            (S::Rgba8Sint, MTLPixelFormat::RGBA8Sint, 4, pf::MTL_FORMAT_RGBA8_SINT),
-            (S::Rgba16Uint, MTLPixelFormat::RGBA16Uint, 8, pf::MTL_FORMAT_RGBA16_UINT),
-            (S::Rgba16Float, MTLPixelFormat::RGBA16Float, 8, pf::MTL_FORMAT_RGBA16_FLOAT),
-            (S::Rgba32Float, MTLPixelFormat::RGBA32Float, 16, pf::MTL_FORMAT_RGBA32_FLOAT),
-            (S::Rgba8Unorm, MTLPixelFormat::RGBA8Unorm, 4, pf::MTL_FORMAT_RGBA8_UNORM),
-            (S::Bgra8Unorm, MTLPixelFormat::BGRA8Unorm, 4, pf::MTL_FORMAT_BGRA8_UNORM),
-            (S::R16Float, MTLPixelFormat::R16Float, 2, pf::MTL_FORMAT_R16_FLOAT),
-            (S::Rg16Float, MTLPixelFormat::RG16Float, 4, pf::MTL_FORMAT_RG16_FLOAT),
-            (S::R8Unorm, MTLPixelFormat::R8Unorm, 1, pf::MTL_FORMAT_R8_UNORM),
-            (S::Rg8Unorm, MTLPixelFormat::RG8Unorm, 2, pf::MTL_FORMAT_RG8_UNORM),
-            (S::Rgba32Uint, MTLPixelFormat::RGBA32Uint, 16, pf::MTL_FORMAT_RGBA32_UINT),
+            (
+                S::Rgba8Uint,
+                MTLPixelFormat::RGBA8Uint,
+                4,
+                pf::MTL_FORMAT_RGBA8_UINT,
+            ),
+            (
+                S::Rgba8Sint,
+                MTLPixelFormat::RGBA8Sint,
+                4,
+                pf::MTL_FORMAT_RGBA8_SINT,
+            ),
+            (
+                S::Rgba16Uint,
+                MTLPixelFormat::RGBA16Uint,
+                8,
+                pf::MTL_FORMAT_RGBA16_UINT,
+            ),
+            (
+                S::Rgba16Float,
+                MTLPixelFormat::RGBA16Float,
+                8,
+                pf::MTL_FORMAT_RGBA16_FLOAT,
+            ),
+            (
+                S::Rgba32Float,
+                MTLPixelFormat::RGBA32Float,
+                16,
+                pf::MTL_FORMAT_RGBA32_FLOAT,
+            ),
+            (
+                S::Rgba8Unorm,
+                MTLPixelFormat::RGBA8Unorm,
+                4,
+                pf::MTL_FORMAT_RGBA8_UNORM,
+            ),
+            (
+                S::Bgra8Unorm,
+                MTLPixelFormat::BGRA8Unorm,
+                4,
+                pf::MTL_FORMAT_BGRA8_UNORM,
+            ),
+            (
+                S::R16Float,
+                MTLPixelFormat::R16Float,
+                2,
+                pf::MTL_FORMAT_R16_FLOAT,
+            ),
+            (
+                S::Rg16Float,
+                MTLPixelFormat::RG16Float,
+                4,
+                pf::MTL_FORMAT_RG16_FLOAT,
+            ),
+            (
+                S::R8Unorm,
+                MTLPixelFormat::R8Unorm,
+                1,
+                pf::MTL_FORMAT_R8_UNORM,
+            ),
+            (
+                S::Rg8Unorm,
+                MTLPixelFormat::RG8Unorm,
+                2,
+                pf::MTL_FORMAT_RG8_UNORM,
+            ),
+            (
+                S::Rgba32Uint,
+                MTLPixelFormat::RGBA32Uint,
+                16,
+                pf::MTL_FORMAT_RGBA32_UINT,
+            ),
             // Present in the contract with no arm here until 2026-08-10, which
             // cost the arm64 pathway every `R32Uint` storage bind.
-            (S::R32Uint, MTLPixelFormat::R32Uint, 4, pf::MTL_FORMAT_R32_UINT),
+            (
+                S::R32Uint,
+                MTLPixelFormat::R32Uint,
+                4,
+                pf::MTL_FORMAT_R32_UINT,
+            ),
         ];
         for (selector, metal, bytes, mtl) in cases {
             let (actual, actual_bytes) = storage_image_format(selector);

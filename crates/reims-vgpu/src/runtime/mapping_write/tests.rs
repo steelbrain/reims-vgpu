@@ -96,8 +96,8 @@ fn a_tight_window_names_the_pages_its_texels_occupy() {
     // 1920x1080 BGRA8, tight, starting at offset 0 of a 4 KiB-page guest.
     let (page, bpr) = (4096u64, 1920 * 4u32);
     let span = u64::from(bpr) * 1080;
-    let plan =
-        plan_guest_window(usize::MAX, page, 0, span, bpr, 1920, RGBA8_BPP).expect("a tight window plans");
+    let plan = plan_guest_window(usize::MAX, page, 0, span, bpr, 1920, RGBA8_BPP)
+        .expect("a tight window plans");
     assert_eq!(plan.first_page, 0);
     assert_eq!(plan.last_page, ((span - 1) / page) as usize);
     assert_eq!(plan.in_page, 0);
@@ -136,8 +136,10 @@ fn a_window_starting_inside_a_page_carries_the_offset_and_not_the_mapping_one() 
 fn the_same_window_spans_fewer_pages_on_a_sixteen_kilobyte_guest() {
     let bpr = 1024 * 4u32;
     let span = u64::from(bpr) * 64;
-    let x86 = plan_guest_window(usize::MAX, 4096, 0, span, bpr, 1024, RGBA8_BPP).expect("plans on x86");
-    let arm = plan_guest_window(usize::MAX, 16384, 0, span, bpr, 1024, RGBA8_BPP).expect("plans on arm64");
+    let x86 =
+        plan_guest_window(usize::MAX, 4096, 0, span, bpr, 1024, RGBA8_BPP).expect("plans on x86");
+    let arm = plan_guest_window(usize::MAX, 16384, 0, span, bpr, 1024, RGBA8_BPP)
+        .expect("plans on arm64");
     assert_eq!(x86.pages(), arm.pages() * 4);
 }
 
@@ -149,8 +151,16 @@ fn the_same_window_spans_fewer_pages_on_a_sixteen_kilobyte_guest() {
 #[test]
 fn a_padded_pitch_becomes_a_row_length_in_texels() {
     let bpr = 2048 * 4u32;
-    let plan =
-        plan_guest_window(usize::MAX, 4096, 0, u64::from(bpr) * 4, bpr, 1600, RGBA8_BPP).expect("plans");
+    let plan = plan_guest_window(
+        usize::MAX,
+        4096,
+        0,
+        u64::from(bpr) * 4,
+        bpr,
+        1600,
+        RGBA8_BPP,
+    )
+    .expect("plans");
     assert_eq!(plan.row_length_texels, 2048);
 }
 
@@ -338,7 +348,6 @@ fn unskipped_returns_exactly_the_bytes_no_range_covers() {
         vec![(12, 16), (18, 28)]
     );
 }
-
 
 /// A rect taller than the window it names is refused on **both** storage
 /// shapes, and writes nothing past the window.
@@ -660,6 +669,72 @@ fn a_writeback_refused_because_the_geometry_moved_says_so_by_name() {
     }
 }
 
+/// The type-11 licence judges the window it is given, not the surface's extent.
+///
+/// A render Store's destination *is* the surface, so that caller refuses a frame
+/// whose rect is not the mapping's latched geometry — the test above drives
+/// exactly that, and it stays where it belongs, in the caller. A compute
+/// dispatch's destination is not a scanout: writing a sub-rectangle of a surface
+/// is ordinary, and the licence resolving its own full-extent window refused
+/// every one of them. On a driven macos-13 boot that was 15 of the 19 remaining
+/// compute readbacks, all `GeometryMoved`, at extents like 44x26 of a 64x64
+/// surface and 128x512 of a 512x512 one.
+///
+/// So the assertion is that extent is no longer a *term*: a sub-rectangle and a
+/// whole-surface destination over the same mapping must reach the same decline,
+/// and it must not be `GeometryMoved`. `FakeHost` publishes no guest-RAM import,
+/// so both stop at the reference gate — which is downstream of every rule the
+/// licence still owns, and therefore says both got through all of them.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn a_type11_licence_judges_the_callers_window_and_not_the_surfaces_extent() {
+    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::model::PAGE_SHIFT_X86;
+    const PAGE: u64 = 1 << PAGE_SHIFT_X86;
+
+    let mut state = DeviceState::new(DeviceId(9), PAGE_SHIFT_X86);
+    let mut host = FakeHost::new();
+    let base_pfn = 0x40u32;
+    host.map_range(
+        (base_pfn as u64) << PAGE_SHIFT_X86,
+        16 * PAGE as usize,
+        0x55,
+    );
+    state.map_surface(7);
+    state.attach_mapping_internal(7, 0);
+    let m = state.mappings.get_mut(&7).unwrap();
+    m.mapping_internal = 1;
+    m.page_entries = (0..16)
+        .map(|i| ((base_pfn + i) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID)
+        .collect();
+    assert!(state.set_mapping_geom(7, 64, 64, MTL_FORMAT_BGRA8_UNORM));
+
+    let held = crate::backend::vulkan::translate::pixel::vk_texel_layout(
+        pixel_format::store_texel_order(MTL_FORMAT_BGRA8_UNORM).expect("BGRA8 has a linear texel"),
+    );
+    let dest = |width, height| Type11SurfaceDestination {
+        mapping_id: 7,
+        base_off: 0,
+        bpr: 64 * 4,
+        span_end: u64::from(height) * 64 * 4,
+        width,
+        height,
+        format: MTL_FORMAT_BGRA8_UNORM,
+    };
+
+    let whole = licence_type11_surface(&mut state, &mut host, held, &dest(64, 64));
+    let part = licence_type11_surface(&mut state, &mut host, held, &dest(44, 26));
+    for (what, got) in [("the whole surface", whole), ("a sub-rectangle", part)] {
+        match got {
+            Err(GpuWritebackDecline::GuestRefRefused { .. }) => {}
+            other => panic!(
+                "{what} must reach the reference gate, and only that gate; got {:?}",
+                other.err()
+            ),
+        }
+    }
+}
+
 #[test]
 fn writing_guest_pages_moves_the_host_write_record_and_reading_them_does_not() {
     use crate::model::PAGE_SHIFT_X86;
@@ -814,23 +889,21 @@ fn a_skipping_write_supersedes_the_debt_instead_of_paying_it_over_the_skip() {
 
     // The whole-frame writer is unchanged and still pays: it has no ranges to
     // protect, and a debt left standing there would be read straight past.
-    assert!(
-        state
-            .pending_writebacks
-            .arm(
+    assert!(state
+        .pending_writebacks
+        .arm(
+            7,
+            crate::runtime::writeback_debt::test_resident_identity(
                 7,
-                crate::runtime::writeback_debt::test_resident_identity(
-                    7,
-                    W,
-                    H,
-                    u64::from(map_generation),
-                ),
                 W,
                 H,
-                map_generation,
-            )
-            .is_none()
-    );
+                u64::from(map_generation),
+            ),
+            W,
+            H,
+            map_generation,
+        )
+        .is_none());
     assert!(write_bgra8(&mut state, &mut host, 7, &frame, W * 4, W, H));
     assert_eq!(
         count("wbdebt_paid_named"),
@@ -1530,6 +1603,101 @@ fn read_rect_raw_fragmented_pages_with_padded_rows() {
     assert_eq!(&dst[8..], &row1);
 }
 
+/// A sub-rectangle of a padded plane over scattered guest pages reads through
+/// one page-table walk, not through a plane-sized window.
+///
+/// This is the source half of every type-11 to linear blit. Before the
+/// rectangle shape reached this rail the arm below materialised the *whole*
+/// sample window into a fresh zeroed `Vec` and then copied the wanted rows out
+/// of it, so a rectangle covering a fraction of the plane still paid for all of
+/// it twice. The fixture is deliberately a strict sub-rectangle in both axes
+/// with a row stride wider than its rows, which is the shape the old arm could
+/// not narrow and the old full-plane-tight special case could not claim.
+#[test]
+fn a_packed_sub_rectangle_of_a_scattered_plane_reads_through_one_walk() {
+    use crate::model::PAGE_SHIFT_X86;
+    use crate::runtime::drain::store_route_count;
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut host = FakeHost::new();
+    host.strict_linux_map = true;
+    let page = 1u64 << PAGE_SHIFT_X86;
+    // Four pages, none adjacent, so the walk has to split into four runs.
+    let gpas = [0x5100_0000u64, 0x6200_0000, 0x4300_0000, 0x7400_0000];
+    let bpr = page as u32 / 2;
+    let rows = 8u32;
+    let bpp = 4u32;
+    // Plane bytes, distinct per byte, laid into the pages the mapping names.
+    let plane: Vec<u8> = (0..(bpr as u64 * rows as u64))
+        .map(|i| (i % 251) as u8)
+        .collect();
+    for (i, gpa) in gpas.iter().enumerate() {
+        host.map_range(*gpa, page as usize, 0);
+        let lo = i * page as usize;
+        host.write_gpa(*gpa, &plane[lo..lo + page as usize])
+            .unwrap();
+    }
+    let mid = 21u32;
+    state.map_surface(mid);
+    {
+        let m = state.mappings.get_mut(&mid).unwrap();
+        m.mapped = true;
+        m.mapping_internal = 1;
+        m.page_entries = gpas
+            .iter()
+            .map(|gpa| {
+                (((gpa >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID
+            })
+            .collect();
+    }
+
+    let origin_x = 3u32;
+    let origin_y = 2u32;
+    let width = 5u32;
+    let height = 4u32;
+    let rb = (width * bpp) as usize;
+    let mut dst = vec![0u8; rb * height as usize];
+    let walks = store_route_count("rectrd_rect_walk");
+    let windows = store_route_count("rectrd_window_padded_dst");
+    assert!(read_rect_raw_at(
+        &mut state,
+        &mut host,
+        mid,
+        SurfaceWindow {
+            base_off: 0,
+            bpr,
+            span_end: bpr as u64 * rows as u64,
+            bpp,
+        },
+        Rect {
+            origin_x,
+            origin_y,
+            width,
+            height,
+        },
+        &mut dst,
+        rb as u32,
+    ));
+    assert_eq!(
+        store_route_count("rectrd_rect_walk") - walks,
+        1,
+        "a packed destination must resolve the page table once for the rectangle"
+    );
+    assert_eq!(
+        store_route_count("rectrd_window_padded_dst") - windows,
+        0,
+        "the plane-sized window arm is for padded destinations only"
+    );
+    for y in 0..height as usize {
+        let src_off = (origin_y as usize + y) * bpr as usize + (origin_x * bpp) as usize;
+        assert_eq!(
+            &dst[y * rb..(y + 1) * rb],
+            &plane[src_off..src_off + rb],
+            "row {y} did not land at its texel offset"
+        );
+    }
+}
+
 /// A rect ending past the sample window must be refused the same way and
 /// named the same way whichever arm reads it. The bound used to live inside
 /// the contig arm, so the fragmented arm — the one a driven x86 boot takes —
@@ -1616,9 +1784,16 @@ fn a_rect_past_the_sample_window_is_named_on_both_read_arms() {
 /// compute_full_tight_scratch: an exact-pitch fragmented compute plane
 /// reads and writes directly through the caller's tight buffer. The
 /// always-on proxy proves this class is selected on a live dispatch.
+///
+/// The read half is the rectangle walk and the write half still has its own
+/// full-plane-tight arm, so the two proxies differ: a counter for the read, the
+/// `full_tight_direct` line for the write. The read's separate special case was
+/// retired because the rectangle subsumes it — a tight full plane is a
+/// rectangle whose rows happen to touch, and it moves as one piece.
 #[test]
 fn fragmented_full_tight_rect_uses_direct_mapping_window() {
     use crate::model::PAGE_SHIFT_X86;
+    use crate::runtime::drain::store_route_count;
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
     let mut host = FakeHost::new();
@@ -1643,6 +1818,7 @@ fn fragmented_full_tight_rect_uses_direct_mapping_window() {
     let bpr = page as u32;
     let span = page * 2;
     let mut tight = vec![0u8; span as usize];
+    let walks = store_route_count("rectrd_rect_walk");
     assert!(read_rect_raw_at(
         &mut state,
         &mut host,
@@ -1664,6 +1840,11 @@ fn fragmented_full_tight_rect_uses_direct_mapping_window() {
     ));
     assert!(tight[..page as usize].iter().all(|&v| v == 0x31));
     assert!(tight[page as usize..].iter().all(|&v| v == 0x42));
+    assert_eq!(
+        store_route_count("rectrd_rect_walk") - walks,
+        1,
+        "a tight full plane is a rectangle and must take the one-walk arm"
+    );
 
     tight.fill(0x5a);
     assert!(write_full_rect_raw_at(
@@ -1686,9 +1867,6 @@ fn fragmented_full_tight_rect_uses_direct_mapping_window() {
     assert_eq!(check, tight);
 
     let log = std::fs::read_to_string(crate::observe::fail_log_path()).expect("fail log");
-    assert!(log.contains(&format!(
-        "OFF mapping_read full_tight_direct mid={mid} bytes={span}"
-    )));
     assert!(log.contains(&format!(
         "OFF mapping_write full_tight_direct mid={mid} bytes={span}"
     )));

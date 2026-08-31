@@ -967,9 +967,7 @@ fn enforce_gva_cache_cap(state: &mut DeviceState, protect: u64) {
     let mut by_touch: Vec<(u64, u64)> = state
         .host_gva_surfaces
         .iter()
-        .filter(|(gva, e)| {
-            **gva != protect && e.guest_holds_bytes
-        })
+        .filter(|(gva, e)| **gva != protect && e.guest_holds_bytes)
         .map(|(&gva, e)| (e.last_touch, gva))
         .collect();
     by_touch.sort_unstable();
@@ -1088,6 +1086,18 @@ pub fn evict_gva(state: &mut DeviceState, gva: u64) {
         // The other site that changes this map's byte total; see
         // [`DeviceState::gva_cache_bytes`].
         state.gva_cache_bytes = state.gva_cache_bytes.saturating_sub(entry.bgra.len());
+    }
+}
+
+/// Drop both host-side pixel copies that can name one linear texture target.
+///
+/// Once a writer publishes new pixels into the guest pages, those pages are
+/// authoritative. Keeping either the address-keyed copy or the object-keyed
+/// copy would let a later sample observe the frame that preceded the write.
+pub fn forget_gva_copies(state: &mut DeviceState, task_id: u32, target_gva: u64, texture_ref: u32) {
+    evict_gva(state, target_gva);
+    if texture_ref != 0 {
+        evict_texture(state, task_id, texture_ref);
     }
 }
 
@@ -1287,11 +1297,7 @@ pub fn gva_backing_state<H: HostMemory>(
     let recorded = backing.first_gpa;
     // Same liveness test the walk itself applies: present in the table AND
     // flagged active. A dead task's page table cannot answer the question.
-    let Some(task) = state
-        .tasks
-        .get(backing.task_id)
-        .filter(|t| t.active)
-    else {
+    let Some(task) = state.tasks.get(backing.task_id).filter(|t| t.active) else {
         return GvaBackingState::Unrecorded;
     };
     match crate::runtime::gva_mem::translate_task_gva(host, task, gva, page_shift) {
@@ -1347,6 +1353,25 @@ pub enum GvaSeedVerdict {
     Unmapped,
     /// Nothing recorded, or the recording task is gone.
     Unrecorded,
+    /// The guest's own pages hold these same bytes, so this copy can only be
+    /// older than they are and never newer.
+    ///
+    /// Nothing in this map witnesses a guest CPU write — see
+    /// [`crate::model::HostSurface::guest_holds_bytes`], where that gap is
+    /// recorded. For an entry the guest's pages do *not* hold, the gap is a
+    /// price worth paying: the copy is the only place those pixels exist and
+    /// refusing it loses them. For an entry they do hold, there is nothing to
+    /// buy. Both sources start equal, only one of them tracks the guest CPU,
+    /// and the guest may write it with no device operation at all — so serving
+    /// the copy can differ from the truth only in the direction of the past.
+    ///
+    /// Live shape of that difference: a Store lands the frame in the guest's
+    /// pages and publishes it here, the guest CPU rasterizes into part of the
+    /// layer, and the next pass's `MTLLoadActionLoad` seed takes this copy and
+    /// loses everything the CPU wrote. The pass then Stores the result back
+    /// over the guest's own bytes, so the loss is not a stale read that the
+    /// next frame corrects — it is written into the layer.
+    GuestHolds,
 }
 
 impl GvaSeedVerdict {
@@ -1359,6 +1384,7 @@ impl GvaSeedVerdict {
             Self::Moved => "gva_seed_refused_moved",
             Self::Unmapped => "gva_seed_refused_unmapped",
             Self::Unrecorded => "gva_seed_refused_unrecorded",
+            Self::GuestHolds => "gva_seed_refused_guest_holds",
         }
     }
 }
@@ -1380,6 +1406,12 @@ pub fn gva_seed_verdict<H: HostMemory>(
     // question about another task's memory, however fresh it says the pages are.
     if backing.task_id != task_id {
         return GvaSeedVerdict::OtherTask;
+    }
+    // Before freshness, because it is not a freshness question: an entry the
+    // guest's pages also hold has no answer this door needs. See
+    // [`GvaSeedVerdict::GuestHolds`].
+    if entry.guest_holds_bytes {
+        return GvaSeedVerdict::GuestHolds;
     }
     match gva_backing_state(state, host, gva) {
         GvaBackingState::Same => GvaSeedVerdict::Admit,

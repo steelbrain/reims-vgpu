@@ -97,6 +97,15 @@ impl crate::observe::Decline for WindowRefusal {
         (*self).slug()
     }
 
+    /// Delegated with `slug`; see
+    /// [`crate::observe::slugs`].
+    fn owner(&self) -> &'static str {
+        match self {
+            Self::ParentImport(inner) => crate::observe::Decline::owner(inner),
+            _ => std::any::type_name::<Self>(),
+        }
+    }
+
     fn fields(&self) -> Vec<(&'static str, String)> {
         match self {
             Self::ParentImport(inner) => crate::observe::Decline::fields(inner),

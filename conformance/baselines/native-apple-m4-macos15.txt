@@ -1,0 +1,300 @@
+CASE clear_only_rg16uint_private_store PASS 1088 RG16Uint texels retained [1,258]
+CASE clear_only_rg16uint_shared_store PASS 1020 RG16Uint texels retained [1,258]
+CASE shader_compile PASS runtime library built
+CASE topology_point_three_islands PASS lit=27 point_centres=3/3
+CASE topology_line_horizontal PASS lit=52 rows=[31]
+CASE topology_line_strip_two_arms PASS lit=88 left=44 right=44
+CASE topology_triangle_filled PASS lit=1210 centre=0xff00ff00 corner=0xff000000
+CASE sample_rgba32float_compute_1x1 PASS 1 float4 texels exact
+CASE sample_rgba32float_compute_4x1 PASS 4 float4 texels exact
+CASE sample_rgba32float_vertex_positions_4x1 PASS lit=1094 centre=0xff00ff00 lower_left=0xff00ff00 corner=0xff000000
+CASE draw_nonindexed_shared_shader_control PASS lit=1094
+CASE draw_indexed_uint16_offset_4 PASS exactly matches non-indexed control
+CASE draw_indexed_uint32_offset_4 PASS exactly matches non-indexed control
+CASE draw_indexed_uint16_base_vertex_minus1 PASS exactly matches non-indexed control
+CASE draw_indexed_uint32_offset_4_base_vertex_minus1 PASS exactly matches non-indexed control
+CASE draw_nonindexed_two_instances_base_instance_5 PASS lit=416 left=0xff00ff00 right=0xff00ff00 centre=0xff000000
+CASE draw_indexed_two_instances_base_instance_5 PASS lit=416 left=0xff00ff00 right=0xff00ff00 centre=0xff000000 matches_nonindexed=true
+CASE depth_attachment_isolated_across_tasks PASS each task loaded its own stored depth
+CASE linear_r8Unorm_64x16_pitch_tight PASS 1024 texels exact
+CASE linear_r8Unorm_64x16_pitch_tight_sampled PASS 1024 texels exact
+CASE linear_a8Unorm_64x16_pitch_tight PASS 1024 texels exact
+CASE linear_a8Unorm_64x16_pitch_tight_sampled PASS 1024 texels exact
+CASE linear_rg8Unorm_64x16_pitch_tight PASS 1024 texels exact
+CASE linear_rg8Unorm_64x16_pitch_tight_sampled PASS 1024 texels exact
+CASE linear_rgba8Unorm_64x16_pitch_tight PASS 1024 texels exact
+CASE linear_rgba8Unorm_64x16_pitch_tight_sampled PASS 1024 texels exact
+CASE linear_bgra8Unorm_64x16_pitch_tight PASS 1024 texels exact
+CASE linear_bgra8Unorm_64x16_pitch_tight_sampled PASS 1024 texels exact
+CASE linear_a8Unorm_54x16_pitch_64 PASS 864 texels exact
+CASE linear_a8Unorm_54x16_pitch_64_sampled PASS 864 texels exact
+CASE linear_a8Unorm_218x16_pitch_256 PASS 3488 texels exact
+CASE linear_a8Unorm_85x85_pitch_128 PASS 7225 texels exact
+CASE linear_r8Unorm_128x16_pitch_128 PASS 2048 texels exact
+CASE linear_bgra8Unorm_60x8_pitch_256 PASS 480 texels exact
+CASE linear_r8Unorm_54x16_pitch_tight_plus1 PASS 864 texels exact
+CASE linear_r8Unorm_54x16_pitch_tight_plus2 PASS 864 texels exact
+CASE linear_a8Unorm_54x16_pitch_tight_plus1 PASS 864 texels exact
+CASE linear_a8Unorm_54x16_pitch_tight_plus2 PASS 864 texels exact
+CASE linear_rg8Unorm_54x16_pitch_tight_plus1 PASS 864 texels exact
+CASE linear_rg8Unorm_54x16_pitch_tight_plus2 PASS 864 texels exact
+CASE linear_rgba8Unorm_54x16_pitch_tight_plus1 PASS 864 texels exact
+CASE linear_rgba8Unorm_54x16_pitch_tight_plus2 PASS 864 texels exact
+CASE linear_bgra8Unorm_54x16_pitch_tight_plus1 PASS 864 texels exact
+CASE linear_bgra8Unorm_54x16_pitch_tight_plus2 PASS 864 texels exact
+CASE incremental_r8Unorm_compute_first_read PASS region A present, region B still zero
+CASE incremental_r8Unorm_compute_append_visible PASS post-read append visible
+CASE incremental_r8Unorm_compute_untouched_stable PASS region A unchanged
+CASE incremental_r8Unorm_compute_rewrite_visible PASS rewrite visible
+CASE incremental_a8Unorm_compute_first_read PASS region A present, region B still zero
+CASE incremental_a8Unorm_compute_append_visible PASS post-read append visible
+CASE incremental_a8Unorm_compute_untouched_stable PASS region A unchanged
+CASE incremental_a8Unorm_compute_rewrite_visible PASS rewrite visible
+CASE incremental_rg8Unorm_compute_first_read PASS region A present, region B still zero
+CASE incremental_rg8Unorm_compute_append_visible PASS post-read append visible
+CASE incremental_rg8Unorm_compute_untouched_stable PASS region A unchanged
+CASE incremental_rg8Unorm_compute_rewrite_visible PASS rewrite visible
+CASE incremental_rgba8Unorm_compute_first_read PASS region A present, region B still zero
+CASE incremental_rgba8Unorm_compute_append_visible PASS post-read append visible
+CASE incremental_rgba8Unorm_compute_untouched_stable PASS region A unchanged
+CASE incremental_rgba8Unorm_compute_rewrite_visible PASS rewrite visible
+CASE incremental_bgra8Unorm_compute_first_read PASS region A present, region B still zero
+CASE incremental_bgra8Unorm_compute_append_visible PASS post-read append visible
+CASE incremental_bgra8Unorm_compute_untouched_stable PASS region A unchanged
+CASE incremental_bgra8Unorm_compute_rewrite_visible PASS rewrite visible
+CASE rt_pipeline PASS solid_fs pipeline built
+CASE rt_render_then_sample PASS 4096 texels are the drawn colour
+CASE rt_blit_to_buffer PASS 4096 texels exact through blit
+CASE msaa4_color_store_no_resolve PASS 64 pixels retained four distinct samples
+CASE msaa4_color_store_host_sample_count PASS 64 pixels retained four distinct samples
+CASE depth_attachment_clear_without_test_state PASS stored depth clear rejected the later draw
+CASE depth_test_less_without_attachment PASS z=0 compared against the absent attachment value
+CASE depth_test_equal_without_attachment PASS z=0 compared against the absent attachment value
+CASE depth_test_greater_without_attachment PASS z=0 compared against the absent attachment value
+CASE depth_test_never_without_attachment PASS z=0 compared against the absent attachment value
+CASE depth_test_always_without_attachment PASS z=0 compared against the absent attachment value
+CASE stencil_attachment_clear_without_test_state PASS stored stencil clear passed the later equal test
+CASE stencil_only_attachment_clear_without_test_state PASS stored stencil-only clear passed the later equal test
+CASE stencil_test_equal_without_attachment_depth_false PASS reference zero compared against implicit stencil zero
+CASE stencil_test_not_equal_without_attachment_depth_false PASS reference zero compared against implicit stencil zero
+CASE stencil_test_equal_without_attachment_depth_true PASS reference zero compared against implicit stencil zero
+CASE stencil_test_not_equal_without_attachment_depth_true PASS reference zero compared against implicit stencil zero
+CASE combined_depth_stencil_default_buffer_copy_selects_depth PASS default copies selected depth and preserved stencil
+CASE mip_chain_create PASS levels=7
+CASE mip_fetch_level_0_size64 PASS 4096 texels are level 0's marker
+CASE mip_sample_level_0_size64 PASS 4096 texels are level 0's marker
+CASE mip_fetch_level_1_size32 PASS 1024 texels are level 1's marker
+CASE mip_sample_level_1_size32 PASS 1024 texels are level 1's marker
+CASE mip_fetch_level_2_size16 PASS 256 texels are level 2's marker
+CASE mip_sample_level_2_size16 PASS 256 texels are level 2's marker
+CASE mip_fetch_level_3_size8 PASS 64 texels are level 3's marker
+CASE mip_sample_level_3_size8 PASS 64 texels are level 3's marker
+CASE mip_fetch_level_4_size4 PASS 16 texels are level 4's marker
+CASE mip_sample_level_4_size4 PASS 16 texels are level 4's marker
+CASE mip_fetch_level_5_size2 PASS 4 texels are level 5's marker
+CASE mip_sample_level_5_size2 PASS 4 texels are level 5's marker
+CASE mip_fetch_level_6_size1 PASS 1 texels are level 6's marker
+CASE mip_sample_level_6_size1 PASS 1 texels are level 6's marker
+CASE mip_blit_level_0_size64 PASS 4096 texels are level 0's marker
+CASE mip_blit_level_1_size32 PASS 1024 texels are level 1's marker
+CASE mip_blit_level_2_size16 PASS 256 texels are level 2's marker
+CASE mip_blit_level_3_size8 PASS 64 texels are level 3's marker
+CASE mip_blit_level_4_size4 PASS 16 texels are level 4's marker
+CASE mip_blit_level_5_size2 PASS 4 texels are level 5's marker
+CASE mip_blit_level_6_size1 PASS 1 texels are level 6's marker
+CASE vb_first_submission_left PASS geometry landed in the left half
+CASE vb_second_submission_right PASS geometry landed in the right half
+CASE vb_third_submission_left_again PASS geometry landed in the left half
+CASE fb_offset_0 PASS slot 0 at offset 0 reached the fragment stage
+CASE fb_offset_256 PASS slot 1 at offset 256 reached the fragment stage
+CASE fb_offset_512 PASS slot 2 at offset 512 reached the fragment stage
+CASE fb_rebound_between_draws PASS each draw read the offset bound before it
+CASE render_barrier_resource_fragment PASS 8 alternating producer/consumer rounds were visible
+CASE compute_barrier_resource PASS 8 alternating concurrent producer/consumer rounds were visible
+CASE compute_barrier_scope_buffers PASS 8 alternating concurrent producer/consumer rounds were visible
+CASE compute_dispatch_threadgroups_indirect PASS groups=[3,2,1] local=[4,2,1] grid=[12, 4, 1] first_bad=none
+CASE synchronize_resource_gpu_to_cpu PASS managed/shared GPU writes visible to CPU after synchronize
+CASE heap_texture_alias_lifecycle PASS one live range was released, reused at offset=0, and addressed as the replacement
+CASE heap_texture_placement_overlap PASS two live definitions at offset=0 executed sequentially and addressed the replacement
+CASE heap_texture_placement_overlap_incompatible_widths PASS two live textures of different bit widths at offset=0 each addressed their own definition
+CASE buffer_backed_alias_incompatible_widths PASS every byte the rgba16Float alias wrote reached the rgba8Unorm one
+CASE buffer_backed_alias_partial_row_range PASS the four-row write landed on exactly its own rows of the wide alias
+CASE ebl_same_bind_second_encoder PASS the binding re-issued on the second encoder is the one that drew
+CASE ebl_changed_bind_second_encoder PASS the binding re-issued on the second encoder is the one that drew
+CASE ebl_same_bind_second_command_buffer PASS the binding re-issued on the second encoder is the one that drew
+CASE command_buffer_same_queue_order PASS producer=4 consumer=4 ordered=true
+CASE command_buffer_same_queue_completion_publication PASS published=[1, 2]
+CASE command_buffer_empty_completion PASS status=4 callback=true
+CASE command_buffer_independent_queue_publication PASS independent_published_before_signal=true
+CASE command_buffer_scheduled_before_completed PASS publications=["scheduled", "completed"]
+CASE command_buffer_default_retains_resource PASS retained_while_pending=true status=4
+CASE indirect_command_reset_copy_optimize PASS baseline=[11, 22, 33] mutated=[11, 0, 33]
+CASE pipeline_information_lifetime PASS compute_max=1024 width=32 static_plain=0 static_declared=80 render_imageblock=4
+CASE texture_view_identity_64x32_base PASS 64x32 slice=0 matched
+CASE texture_view_identity_64x32_view PASS 64x32 slice=0 matched
+CASE texture_view_identity_256x64_base PASS 256x64 slice=0 matched
+CASE texture_view_identity_256x64_view PASS 256x64 slice=0 matched
+CASE texture_view_array_slice_64x32x3_s0 PASS 64x32 slice=0 matched
+CASE texture_view_array_slice_64x32x3_s1 PASS 64x32 slice=1 matched
+CASE texture_view_array_slice_64x32x3_s2 PASS 64x32 slice=2 matched
+CASE texture_view_over_surface_64x32_base PASS 64x32 slice=0 matched
+CASE texture_view_over_surface_64x32_view PASS 64x32 slice=0 matched
+CASE self_copy_overlap_row_shift_14 PASS the overlapping copy read its source before writing its destination
+CASE self_copy_overlap_column_shift_12 PASS the overlapping copy read its source before writing its destination
+CASE self_copy_disjoint_control PASS the overlapping copy read its source before writing its destination
+CASE texture_view_over_surface_256x64_base PASS 256x64 slice=0 matched
+CASE texture_view_over_surface_256x64_view PASS 256x64 slice=0 matched
+CASE fragsample_a8Unorm_54x16_pitch_64_first_draw PASS 864 texels exact through the rasterizer
+CASE fragsample_a8Unorm_54x16_pitch_64_after_cpu_rewrite PASS 864 texels exact through the rasterizer
+CASE fragsample_a8Unorm_218x16_pitch_256_first_draw PASS 3488 texels exact through the rasterizer
+CASE fragsample_a8Unorm_218x16_pitch_256_after_cpu_rewrite PASS 3488 texels exact through the rasterizer
+CASE fragsample_a8Unorm_85x85_pitch_128_first_draw PASS 7225 texels exact through the rasterizer
+CASE fragsample_a8Unorm_85x85_pitch_128_after_cpu_rewrite PASS 7225 texels exact through the rasterizer
+CASE fragsample_rgba8Unorm_64x16_pitch_tight_first_draw PASS 1024 texels exact through the rasterizer
+CASE fragsample_rgba8Unorm_64x16_pitch_tight_after_cpu_rewrite PASS 1024 texels exact through the rasterizer
+CASE fragsample_bgra8Unorm_60x8_pitch_256_first_draw PASS 480 texels exact through the rasterizer
+CASE fragsample_bgra8Unorm_60x8_pitch_256_after_cpu_rewrite PASS 480 texels exact through the rasterizer
+CASE fragsample_a8Unorm_54x16_pitch_tight_plus1_first_draw PASS 864 texels exact through the rasterizer
+CASE fragsample_a8Unorm_54x16_pitch_tight_plus1_after_cpu_rewrite PASS 864 texels exact through the rasterizer
+CASE fragsample_bgra8Unorm_54x16_pitch_tight_plus1_first_draw PASS 864 texels exact through the rasterizer
+CASE fragsample_bgra8Unorm_54x16_pitch_tight_plus1_after_cpu_rewrite PASS 864 texels exact through the rasterizer
+CASE incremental_r8Unorm_fragment_first_read PASS region A present, region B still zero
+CASE incremental_r8Unorm_fragment_append_visible PASS post-read append visible
+CASE incremental_r8Unorm_fragment_untouched_stable PASS region A unchanged
+CASE incremental_r8Unorm_fragment_rewrite_visible PASS rewrite visible
+CASE incremental_a8Unorm_fragment_first_read PASS region A present, region B still zero
+CASE incremental_a8Unorm_fragment_append_visible PASS post-read append visible
+CASE incremental_a8Unorm_fragment_untouched_stable PASS region A unchanged
+CASE incremental_a8Unorm_fragment_rewrite_visible PASS rewrite visible
+CASE incremental_rg8Unorm_fragment_first_read PASS region A present, region B still zero
+CASE incremental_rg8Unorm_fragment_append_visible PASS post-read append visible
+CASE incremental_rg8Unorm_fragment_untouched_stable PASS region A unchanged
+CASE incremental_rg8Unorm_fragment_rewrite_visible PASS rewrite visible
+CASE incremental_rgba8Unorm_fragment_first_read PASS region A present, region B still zero
+CASE incremental_rgba8Unorm_fragment_append_visible PASS post-read append visible
+CASE incremental_rgba8Unorm_fragment_untouched_stable PASS region A unchanged
+CASE incremental_rgba8Unorm_fragment_rewrite_visible PASS rewrite visible
+CASE incremental_bgra8Unorm_fragment_first_read PASS region A present, region B still zero
+CASE incremental_bgra8Unorm_fragment_append_visible PASS post-read append visible
+CASE incremental_bgra8Unorm_fragment_untouched_stable PASS region A unchanged
+CASE incremental_bgra8Unorm_fragment_rewrite_visible PASS rewrite visible
+CASE replace_r8Unorm_fragment_first_read PASS the replaced strip is present and the rest is still zero
+CASE replace_r8Unorm_fragment_append_visible PASS a strip replaced after a read is visible
+CASE replace_r8Unorm_fragment_untouched_stable PASS the glyphs already in the atlas are untouched
+CASE replace_r8Unorm_fragment_rewrite_visible PASS a strip rewritten in place is visible
+CASE replace_a8Unorm_fragment_first_read PASS the replaced strip is present and the rest is still zero
+CASE replace_a8Unorm_fragment_append_visible PASS a strip replaced after a read is visible
+CASE replace_a8Unorm_fragment_untouched_stable PASS the glyphs already in the atlas are untouched
+CASE replace_a8Unorm_fragment_rewrite_visible PASS a strip rewritten in place is visible
+CASE replace_rg8Unorm_fragment_first_read PASS the replaced strip is present and the rest is still zero
+CASE replace_rg8Unorm_fragment_append_visible PASS a strip replaced after a read is visible
+CASE replace_rg8Unorm_fragment_untouched_stable PASS the glyphs already in the atlas are untouched
+CASE replace_rg8Unorm_fragment_rewrite_visible PASS a strip rewritten in place is visible
+CASE replace_rgba8Unorm_fragment_first_read PASS the replaced strip is present and the rest is still zero
+CASE replace_rgba8Unorm_fragment_append_visible PASS a strip replaced after a read is visible
+CASE replace_rgba8Unorm_fragment_untouched_stable PASS the glyphs already in the atlas are untouched
+CASE replace_rgba8Unorm_fragment_rewrite_visible PASS a strip rewritten in place is visible
+CASE replace_bgra8Unorm_fragment_first_read PASS the replaced strip is present and the rest is still zero
+CASE replace_bgra8Unorm_fragment_append_visible PASS a strip replaced after a read is visible
+CASE replace_bgra8Unorm_fragment_untouched_stable PASS the glyphs already in the atlas are untouched
+CASE replace_bgra8Unorm_fragment_rewrite_visible PASS a strip rewritten in place is visible
+CASE offset_oracle_256x16_pitch_tight_compute PASS 4096 texels at the offsets the contract names
+CASE offset_oracle_250x16_pitch_tight_compute PASS 4000 texels at the offsets the contract names
+CASE offset_oracle_218x16_pitch_tight_compute PASS 3488 texels at the offsets the contract names
+CASE offset_oracle_54x16_pitch_tight_plus1_compute PASS 864 texels at the offsets the contract names
+CASE offset_oracle_256x16_pitch_tight_fragment PASS 4096 texels at the offsets the contract names
+CASE offset_oracle_250x16_pitch_tight_fragment PASS 4000 texels at the offsets the contract names
+CASE offset_oracle_218x16_pitch_tight_fragment PASS 3488 texels at the offsets the contract names
+CASE offset_oracle_54x16_pitch_tight_plus1_fragment PASS 864 texels at the offsets the contract names
+CASE rt_width_256 PASS 4096 texels are the drawn colour
+CASE rt_width_250 PASS 4000 texels are the drawn colour
+CASE rt_width_218 PASS 3488 texels are the drawn colour
+CASE rt_width_64 PASS 1024 texels are the drawn colour
+CASE rt_width_60 PASS 960 texels are the drawn colour
+CASE rt_width_54 PASS 864 texels are the drawn colour
+CASE rt_width_63 PASS 1008 texels are the drawn colour
+CASE rt_width_57 PASS 912 texels are the drawn colour
+CASE dispatch_threads_grid_64x16_tg8 PASS 1024 threads ran and nothing outside the grid did
+CASE dispatch_threads_grid_218x16_tg8 PASS 3488 threads ran and nothing outside the grid did
+CASE dispatch_threads_grid_54x15_tg8 PASS 810 threads ran and nothing outside the grid did
+CASE dispatch_threads_grid_57x9_tg8 PASS 513 threads ran and nothing outside the grid did
+CASE dispatch_threads_grid_31x31_tg16 PASS 961 threads ran and nothing outside the grid did
+CASE cpu_write_after_render_64x32 PASS the GPU kept its half and the CPU kept its half
+CASE cpu_write_after_render_64x32_then_second_pass PASS the GPU kept its half and the CPU kept its half
+CASE cpu_write_after_render_256x64 PASS the GPU kept its half and the CPU kept its half
+CASE cpu_write_after_render_256x64_then_second_pass PASS the GPU kept its half and the CPU kept its half
+CASE offset_alias_a8Unorm_54x16_x4 PASS 4 tiles exact at their own offsets
+CASE offset_alias_rgba8Unorm_32x32_x3 PASS 3 tiles exact at their own offsets
+CASE replace_r8Unorm_compute_first_read PASS the replaced strip is present and the rest is still zero
+CASE replace_r8Unorm_compute_append_visible PASS a strip replaced after a read is visible
+CASE replace_r8Unorm_compute_untouched_stable PASS the glyphs already in the atlas are untouched
+CASE replace_r8Unorm_compute_rewrite_visible PASS a strip rewritten in place is visible
+CASE replace_a8Unorm_compute_first_read PASS the replaced strip is present and the rest is still zero
+CASE replace_a8Unorm_compute_append_visible PASS a strip replaced after a read is visible
+CASE replace_a8Unorm_compute_untouched_stable PASS the glyphs already in the atlas are untouched
+CASE replace_a8Unorm_compute_rewrite_visible PASS a strip rewritten in place is visible
+CASE replace_rg8Unorm_compute_first_read PASS the replaced strip is present and the rest is still zero
+CASE replace_rg8Unorm_compute_append_visible PASS a strip replaced after a read is visible
+CASE replace_rg8Unorm_compute_untouched_stable PASS the glyphs already in the atlas are untouched
+CASE replace_rg8Unorm_compute_rewrite_visible PASS a strip rewritten in place is visible
+CASE replace_rgba8Unorm_compute_first_read PASS the replaced strip is present and the rest is still zero
+CASE replace_rgba8Unorm_compute_append_visible PASS a strip replaced after a read is visible
+CASE replace_rgba8Unorm_compute_untouched_stable PASS the glyphs already in the atlas are untouched
+CASE replace_rgba8Unorm_compute_rewrite_visible PASS a strip rewritten in place is visible
+CASE replace_bgra8Unorm_compute_first_read PASS the replaced strip is present and the rest is still zero
+CASE replace_bgra8Unorm_compute_append_visible PASS a strip replaced after a read is visible
+CASE replace_bgra8Unorm_compute_untouched_stable PASS the glyphs already in the atlas are untouched
+CASE replace_bgra8Unorm_compute_rewrite_visible PASS a strip rewritten in place is visible
+CASE srt_draw_60x32 PASS the whole guest-backed target is the drawn colour
+CASE srt_load_preserves_60x32 PASS the second pass added to what the first pass left
+CASE srt_scissor_keeps_rest_60x32 PASS the scissored write landed on exactly its own rows
+CASE srt_sample_after_render_60x32 PASS a later pass sampled what the earlier pass rendered
+CASE srt_draw_256x64 PASS the whole guest-backed target is the drawn colour
+CASE srt_load_preserves_256x64 PASS the second pass added to what the first pass left
+CASE srt_scissor_keeps_rest_256x64 PASS the scissored write landed on exactly its own rows
+CASE srt_sample_after_render_256x64 PASS a later pass sampled what the earlier pass rendered
+CASE srt_draw_1000x40 PASS the whole guest-backed target is the drawn colour
+CASE srt_load_preserves_1000x40 PASS the second pass added to what the first pass left
+CASE srt_scissor_keeps_rest_1000x40 PASS the scissored write landed on exactly its own rows
+CASE srt_sample_after_render_1000x40 PASS a later pass sampled what the earlier pass rendered
+CASE srt_cpu_seed_then_load_60x32 PASS three loaded passes kept every texel the CPU wrote first
+CASE srt_cpu_seed_then_load_256x64 PASS three loaded passes kept every texel the CPU wrote first
+CASE srt_cpu_seed_then_load_1000x40 PASS three loaded passes kept every texel the CPU wrote first
+CASE srt_glyph_blend_60x32 PASS coverage type blended into a guest-backed layer, and the second pass kept the first
+CASE srt_glyph_blend_256x64 PASS coverage type blended into a guest-backed layer, and the second pass kept the first
+CASE srt_glyph_blend_1000x40 PASS coverage type blended into a guest-backed layer, and the second pass kept the first
+CASE biplanar_luma_64x32 PASS plane 0 reads its own 64x32 one-byte texels
+CASE biplanar_chroma_64x32 PASS plane 1 reads its own 32x16 two-byte texels
+CASE biplanar_luma_256x64 PASS plane 0 reads its own 256x64 one-byte texels
+CASE biplanar_chroma_256x64 PASS plane 1 reads its own 128x32 two-byte texels
+CASE iosrt_draw_60x32 PASS the whole IOSurface-backed target is the drawn colour
+CASE iosrt_load_preserves_60x32 PASS the second pass added to what the first pass left
+CASE iosrt_scissor_keeps_rest_60x32 PASS the scissored write landed on exactly its own rows
+CASE iosrt_glyph_blend_60x32 PASS coverage type blended into an IOSurface layer, and the second pass kept the first
+CASE iosrt_draw_256x64 PASS the whole IOSurface-backed target is the drawn colour
+CASE iosrt_load_preserves_256x64 PASS the second pass added to what the first pass left
+CASE iosrt_scissor_keeps_rest_256x64 PASS the scissored write landed on exactly its own rows
+CASE iosrt_glyph_blend_256x64 PASS coverage type blended into an IOSurface layer, and the second pass kept the first
+CASE iosrt_draw_1000x40 PASS the whole IOSurface-backed target is the drawn colour
+CASE iosrt_load_preserves_1000x40 PASS the second pass added to what the first pass left
+CASE iosrt_scissor_keeps_rest_1000x40 PASS the scissored write landed on exactly its own rows
+CASE iosrt_glyph_blend_1000x40 PASS coverage type blended into an IOSurface layer, and the second pass kept the first
+CASE srt_cpu_write_then_sample_60x32 PASS a sampled bind saw the texels the CPU wrote after the GPU rendered
+CASE iosrt_cpu_write_then_sample_60x32 PASS a sampled bind saw the texels the CPU wrote after the GPU rendered
+CASE srt_cpu_write_then_sample_256x64 PASS a sampled bind saw the texels the CPU wrote after the GPU rendered
+CASE iosrt_cpu_write_then_sample_256x64 PASS a sampled bind saw the texels the CPU wrote after the GPU rendered
+CASE srt_cpu_write_then_sample_1000x40 PASS a sampled bind saw the texels the CPU wrote after the GPU rendered
+CASE iosrt_cpu_write_then_sample_1000x40 PASS a sampled bind saw the texels the CPU wrote after the GPU rendered
+CASE srt_blit_after_render_1024x768 PASS the copy moved what the render ahead of it had written
+CASE srt_blit_after_render_1920x1080 PASS the copy moved what the render ahead of it had written
+CASE srt_blit_pipelined_1024x768_x8 PASS every frame's copy moved that frame's own pixels
+ROUTE srt_blit_iosurface_source_1024x768_x8 blit_t5_plane_device
+ROUTE srt_blit_iosurface_source_1024x768_x8 sl_gpu_landed
+CASE srt_blit_iosurface_source_1024x768_x8 PASS every surface-to-surface copy moved its own frame's pixels
+ROUTE srt_blit_iosurface_source_1920x1080_x4 blit_t5_plane_device
+ROUTE srt_blit_iosurface_source_1920x1080_x4 sl_gpu_landed
+CASE srt_blit_iosurface_source_1920x1080_x4 PASS every surface-to-surface copy moved its own frame's pixels
+CASE srt_blit_buffer_backed_512x512 PASS the copy out of a buffer-backed source moved what the render had written
+CASE command_buffer_cross_queue_shared_event_visibility PASS producer=4 consumer=4 completed_without_host_release=true visible=true
+SUMMARY cases=294 failures=0 skipped=0
+DEVICE name=Apple M4 unified=true

@@ -107,11 +107,21 @@ printf 'round\tarm\tregime\tpresent_hz\toffered_hz\tdraws_s\tus_draw\tduty\tchai
 # would drag a mean anywhere.
 median() { sort -n | awk '{v[NR]=$1} END{ if(NR==0){print "-"} else if(NR%2){printf "%.2f", v[(NR+1)/2]} else {printf "%.2f",(v[NR/2]+v[NR/2+1])/2} }'; }
 
-# Sum of a per-window census field over the boot. `store_routes`-shaped counters
-# reset each window, so summing is the answer and taking the last sample is the
-# error; the reverse holds for the cumulative high-waters, which this does not
-# read.
-sum_field() { grep -ho "$1=[0-9]*" "$2" 2>/dev/null | cut -d= -f2 | awk '{s+=$1} END{print s+0}'; }
+# Sum one field from one per-window census record. Field names are not globally
+# unique: `draws` appears in both `drain_duty` and `draw_phase`, and `busy_us` in
+# both `drain_duty` and `gpu_span`. Scoping at the record is part of the metric's
+# contract; summing every spelling silently double-counts different instruments.
+sum_tag_field() {
+  awk -v tag="$1" -v field="$2" '
+    $1 == "OFF" && $2 == tag {
+      for (i = 3; i <= NF; i++) {
+        split($i, pair, "=")
+        if (pair[1] == field) sum += pair[2]
+      }
+    }
+    END { print sum + 0 }
+  ' "$3"
+}
 
 for round in $(seq 1 "$ROUNDS"); do
 for arm in $ARMS; do
@@ -150,6 +160,7 @@ for arm in $ARMS; do
 
   timeout 300 "$REPO/vm/guest-authorize.sh" >/dev/null 2>&1
   "$REPO/scripts/app-sweep-probe/wait-for-desktop.sh" --timeout 400 \
+    --reports "$OUT/$tag-reports" \
     || { say "$tag: no desktop"; printf '%s\t%s\tNO-DESKTOP\n' "$round" "$arm" >>"$RESULTS"; \
          pkill -f 'qemu-system-x86_6[4].*reims-vgpu'; sleep 6; continue; }
   # A desktop is not a settled device. One boot scored here read 3.5 Hz and
@@ -166,7 +177,18 @@ for arm in $ARMS; do
     "$PROBE" "$OUT/$tag-work" "$SECS" >"$OUT/$tag-probe.log" 2>&1
   probe_exit=$?
   SLICE="$OUT/$tag-slice.log"
-  tail -n +"$((MARK + 1))" /tmp/reims-vgpu-fail.log >"$SLICE"
+  PROBE_SLICE="$OUT/$tag-probe-slice.log"
+  tail -n +"$((MARK + 1))" /tmp/reims-vgpu-fail.log >"$PROBE_SLICE"
+  # A probe may publish the exact interval in which it drove the guest. Prefer
+  # that contract over the broad launch-to-exit slice, which can include prompt
+  # dismissal, application setup, and post-interaction settling. Probes without
+  # an exact window retain the broad slice.
+  EXACT_SLICE="$OUT/$tag-work/window.log"
+  if [ -s "$EXACT_SLICE" ]; then
+    cp "$EXACT_SLICE" "$SLICE"
+  else
+    cp "$PROBE_SLICE" "$SLICE"
+  fi
   pkill -f 'qemu-system-x86_6[4].*reims-vgpu'; sleep 6
 
   present=$(grep -ho 'present_hz=[0-9.]*' "$SLICE" | cut -d= -f2 | median)
@@ -175,15 +197,15 @@ for arm in $ARMS; do
   # the probe has already reported success.
   panic=no; grep -q 'guest kernel panic' "$BOOTLOG" && panic=yes
 
-  draws=$(sum_field 'draws' "$SLICE")
-  draw_us=$(sum_field 'draw_us' "$SLICE")
-  busy_us=$(sum_field 'busy_us' "$SLICE")
+  draws=$(sum_tag_field drain_duty draws "$SLICE")
+  draw_us=$(sum_tag_field drain_duty draw_us "$SLICE")
+  busy_us=$(sum_tag_field drain_duty busy_us "$SLICE")
   windows=$(grep -c 'OFF drain_duty' "$SLICE")
-  chain=$(sum_field 'chains' "$SLICE")
-  sampled=$(sum_field 'sampled_us' "$SLICE")
-  engine=$(sum_field 'engine_us' "$SLICE")
-  store=$(sum_field 'store_us' "$SLICE")
-  binds=$(sum_field 'binds_us' "$SLICE")
+  chain=$(sum_tag_field chain_phase chains "$SLICE")
+  sampled=$(sum_tag_field chain_phase sampled_us "$SLICE")
+  engine=$(sum_tag_field chain_phase engine_us "$SLICE")
+  store=$(sum_tag_field chain_phase store_us "$SLICE")
+  binds=$(sum_tag_field chain_phase binds_us "$SLICE")
   total_us=$((sampled + engine + store + binds))
 
   read -r draws_s us_draw duty chain_us s_pct e_pct st_pct b_pct <<EOF

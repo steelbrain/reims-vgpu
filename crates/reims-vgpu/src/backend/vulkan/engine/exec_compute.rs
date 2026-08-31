@@ -16,10 +16,19 @@ use super::counters::EngineCounters;
 use super::device_lost::{DeviceLostDecline, DeviceLostOp};
 use super::pools::{BufferSlot, ResourcePools, StorageImageKey, StorageImageSlot};
 use super::types::{
-    ComputeBufferOutput, ComputeOutput, ComputeRequest, ComputeResidentSampleBind,
-    ComputeSampledImageResource, ComputeStorageResidency, DrawError,
+    ComputeBufferOutput, ComputeDispatch, ComputeDispatchPayload, ComputeOutput, ComputeRequest,
+    ComputeResidentSampleBind, ComputeSampledImageResource, ComputeSampledSource,
+    ComputeStorageResidency, DrawError, TargetIdentity,
 };
 use super::vk_call::{VkCall, VkOp};
+
+/// One recorded `vkCmdDispatch`, with the pipeline its workgroup size selected
+/// and the payload that names its place in the logical grid.
+struct DispatchStep {
+    pipeline: vk::Pipeline,
+    group_count: [u32; 3],
+    push: Option<(u32, ComputeDispatchPayload)>,
+}
 
 struct PreparedStorageImage {
     binding: u32,
@@ -39,28 +48,80 @@ struct PreparedStorageImage {
 
 /// One prepared sampled input: a transient sampled-only image seeded either
 /// from a host staging upload or from a device-local resident copy.
-struct PreparedSampledImage {
-    binding: u32,
-    array_element: u32,
-    img: StorageImageSlot,
-    upload: Option<BufferSlot>,
-    /// Copy-on-sample source `(resident image, what last touched it)`.
-    resident_src: Option<(vk::Image, super::pools::ResidentAccess)>,
-    width: u32,
-    height: u32,
+enum PreparedSampledImage {
+    /// A pooled transient this dispatch fills before it reads: from a staging
+    /// upload, or by a device-local copy out of a resident storage image.
+    Staged {
+        binding: u32,
+        array_element: u32,
+        img: StorageImageSlot,
+        upload: Option<BufferSlot>,
+        /// Copy-on-sample source `(resident image, what last touched it)`.
+        resident_src: Option<(vk::Image, super::pools::ResidentAccess)>,
+        width: u32,
+        height: u32,
+        mip_levels: u32,
+    },
+    /// A retained multisample render target, bound through its own registry
+    /// view. Nothing is acquired, uploaded or copied — see
+    /// [`ComputeSampledSource::MultisampleTarget`] for why there is no
+    /// alternative for this shape.
+    MultisampleTarget {
+        binding: u32,
+        array_element: u32,
+        identity: TargetIdentity,
+        image: vk::Image,
+        view: vk::ImageView,
+        access: super::pools::ResidentAccess,
+        next_access: super::pools::ResidentAccess,
+    },
+}
+
+impl PreparedSampledImage {
+    fn binding(&self) -> u32 {
+        match self {
+            Self::Staged { binding, .. } | Self::MultisampleTarget { binding, .. } => *binding,
+        }
+    }
+
+    fn array_element(&self) -> u32 {
+        match self {
+            Self::Staged { array_element, .. } | Self::MultisampleTarget { array_element, .. } => {
+                *array_element
+            }
+        }
+    }
+
+    /// The view the descriptor binds, and the layout it will be in when the
+    /// dispatch reads it.
+    fn descriptor_view(&self) -> (vk::ImageView, vk::ImageLayout) {
+        match self {
+            Self::Staged { img, .. } => (img.view, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
+            Self::MultisampleTarget {
+                view, next_access, ..
+            } => (*view, next_access.layout()),
+        }
+    }
 }
 
 /// Post-dispatch copy destination for one storage image.
 enum ComputeImageDst {
     /// Pooled host-visible buffer; the CPU reads it back and the runtime
     /// writes guest pages itself.
-    ///
-    /// This is now the only non-deferred destination. A third variant,
-    /// `Direct`, bound a transfer-dst buffer over an imported view of the
-    /// caller's guest window so the dispatch's own copy landed there and no
-    /// bytes crossed device→host. It is gone with the import: a buffer the GPU
-    /// can write, backed by guest pages, is the exposure this removal is about.
     Readback(BufferSlot),
+    /// The dispatch's own image→buffer copy lands in the guest's pages and no
+    /// pixels cross device→host.
+    ///
+    /// An older variant of this name bound a transfer-dst buffer over an
+    /// imported view of the caller's guest window and was removed, because a
+    /// raw buffer the GPU can write backed by guest pages is an unbounded
+    /// reach into this process's address space. This one is not that: it
+    /// carries a [`super::GuestCopyPlan`], built by the same `plan_guest_copy`
+    /// the render rail uses, whose every destination range is a `GuestSlice`
+    /// bounds-checked against the one RAMBlock import that produced it. The
+    /// bound is the type, which is the whole argument in
+    /// `runtime/guest_ram.rs`.
+    Direct(super::GuestCopyPlan),
 }
 
 pub(crate) fn validate_compute(req: &ComputeRequest) -> Result<(), DrawError> {
@@ -79,10 +140,31 @@ pub(crate) fn validate_compute(req: &ComputeRequest) -> Result<(), DrawError> {
             ComputeValidationDecline::EntryInteriorNul,
         ));
     }
-    if req.grid.contains(&0) {
+    let threadgroups_per_grid = req.dispatch.threadgroups_per_grid();
+    if threadgroups_per_grid.contains(&0) {
         return Err(DrawError::ComputeValidation(
-            ComputeValidationDecline::ZeroGrid { grid: req.grid },
+            ComputeValidationDecline::ZeroGrid {
+                grid: threadgroups_per_grid,
+            },
         ));
+    }
+    if let ComputeDispatch::Regions { regions, .. } = &req.dispatch {
+        if regions.is_empty() {
+            return Err(DrawError::ComputeValidation(
+                ComputeValidationDecline::NoDispatchRegions,
+            ));
+        }
+        for (index, region) in regions.iter().enumerate() {
+            if region.local_size.contains(&0) || region.group_count.contains(&0) {
+                return Err(DrawError::ComputeValidation(
+                    ComputeValidationDecline::ZeroDispatchRegion {
+                        region: index,
+                        local_size: region.local_size,
+                        group_count: region.group_count,
+                    },
+                ));
+            }
+        }
     }
     let mut bindings = BTreeSet::new();
     for b in &req.storage_buffers {
@@ -114,7 +196,7 @@ pub(crate) fn validate_compute(req: &ComputeRequest) -> Result<(), DrawError> {
                 },
             ));
         }
-        if img.width == 0 || img.height == 0 {
+        if img.width == 0 || img.height == 0 || img.mip_levels == 0 {
             return Err(DrawError::ComputeValidation(
                 ComputeValidationDecline::SampledZeroGeometry {
                     binding: img.binding,
@@ -123,17 +205,30 @@ pub(crate) fn validate_compute(req: &ComputeRequest) -> Result<(), DrawError> {
                 },
             ));
         }
-        let expected = (img.width as usize)
-            .saturating_mul(img.height as usize)
-            .saturating_mul(img.format.bytes_per_texel());
-        if img.bytes.len() != expected {
-            return Err(DrawError::ComputeValidation(
-                ComputeValidationDecline::SampledBytesLength {
-                    binding: img.binding,
-                    actual: img.bytes.len(),
-                    expected,
-                },
-            ));
+        // Only the source that actually carries bytes owes a length. The other
+        // two derive theirs from this same geometry, so there is nothing left
+        // for them to disagree with.
+        //
+        // The whole pyramid, not the base: `bytes` carries every level the
+        // binding declares, and checking only the base would let a request
+        // through whose upper levels the copy then reads past the end of.
+        if let ComputeSampledSource::Bytes(bytes) = &img.source {
+            let expected = crate::contract::extent::tight_pyramid_bytes(
+                img.width,
+                img.height,
+                img.mip_levels,
+                img.format.bytes_per_texel(),
+            )
+            .unwrap_or(usize::MAX);
+            if bytes.len() != expected {
+                return Err(DrawError::ComputeValidation(
+                    ComputeValidationDecline::SampledBytesLength {
+                        binding: img.binding,
+                        actual: bytes.len(),
+                        expected,
+                    },
+                ));
+            }
         }
     }
     for sampler in &req.samplers {
@@ -376,27 +471,70 @@ pub(crate) unsafe fn execute_compute_inner(
 
     let layout_key = LayoutKey {
         bindings: layout_bindings,
+        push_constant: req.dispatch.push_constant_range(),
     };
 
     let (spirv_digest, module) = caches.get_or_create_shader(ctx, &req.spirv, counters, pools)?;
     let (dsl, pipeline_layout) = caches.get_or_create_layout(ctx, &layout_key, counters, pools)?;
-    let cpipe_key = ComputePipelineKey {
-        spirv: spirv_digest,
-        entry: req.entry.clone(),
-        layout: layout_key.clone(),
+    let shader_source = super::caches::ShaderModuleSource {
+        module,
+        spirv: &req.spirv,
     };
-    // One cache, consulted once; `get_or_create_compute_pipeline` counts the hit.
-    let pipeline = caches.get_or_create_compute_pipeline(
-        ctx,
-        &cpipe_key,
-        super::caches::ShaderModuleSource {
-            module,
-            spirv: &req.spirv,
-        },
-        pipeline_layout,
-        counters,
-        pools,
-    )?;
+    // One pipeline per region workgroup size. A whole-workgroup module baked
+    // its local size and needs exactly one; an exact-thread launch needs the
+    // interior size plus whichever boundary sizes its grid produced. The cache
+    // is content-keyed on that size, so a steady dispatch shape pays no create
+    // after its first launch. `get_or_create_compute_pipeline` counts each hit.
+    let mut dispatch_steps: Vec<DispatchStep> = Vec::new();
+    match &req.dispatch {
+        ComputeDispatch::Workgroups(grid) => {
+            let cpipe_key = ComputePipelineKey {
+                spirv: spirv_digest,
+                entry: req.entry.clone(),
+                layout: layout_key.clone(),
+                local_size: None,
+            };
+            dispatch_steps.push(DispatchStep {
+                pipeline: caches.get_or_create_compute_pipeline(
+                    ctx,
+                    &cpipe_key,
+                    shader_source,
+                    pipeline_layout,
+                    counters,
+                    pools,
+                )?,
+                group_count: *grid,
+                push: None,
+            });
+        }
+        ComputeDispatch::Regions {
+            push_offset,
+            regions,
+            ..
+        } => {
+            dispatch_steps.reserve(regions.len());
+            for region in regions {
+                let cpipe_key = ComputePipelineKey {
+                    spirv: spirv_digest,
+                    entry: req.entry.clone(),
+                    layout: layout_key.clone(),
+                    local_size: Some(region.local_size),
+                };
+                dispatch_steps.push(DispatchStep {
+                    pipeline: caches.get_or_create_compute_pipeline(
+                        ctx,
+                        &cpipe_key,
+                        shader_source,
+                        pipeline_layout,
+                        counters,
+                        pools,
+                    )?,
+                    group_count: region.group_count,
+                    push: Some((*push_offset, region.push_constants)),
+                });
+            }
+        }
+    }
 
     // Storage buffers: host-visible staging used as SSBOs (same as draw path).
     let mut storage_slots = Vec::new();
@@ -421,17 +559,128 @@ pub(crate) unsafe fn execute_compute_inner(
     // aliases the live resident, so the same dispatch may storage-write it).
     let mut sampled_slots = Vec::new();
     for resource in &req.sampled_images {
+        // Ahead of the pooled transient, because this source does not want one.
+        // A multisample image cannot be filled by an upload or a copy, so
+        // acquiring a transient for it would allocate a single-sample image
+        // this dispatch then binds instead of the samples the guest rendered.
+        if let ComputeSampledSource::MultisampleTarget(identity) = &resource.source {
+            // Reading a resident is using it, and the mark goes ahead of the
+            // lookup so the refusals below cannot skip it — the render rail's
+            // `SampledSource::Target` arm states the reason: a resident whose
+            // content is not ready yet is still one the guest is actively
+            // sampling, and aging it out between two attempts turns a
+            // recoverable not-ready into a permanent missing.
+            pools.registry_note_sampled_use(identity);
+            let held = pools.registry_get(identity).map(|slot| {
+                (
+                    slot.image,
+                    slot.access,
+                    slot.content_ready,
+                    slot.width,
+                    slot.height,
+                    slot.sample_count,
+                    slot.memory.is_guest_imported(),
+                )
+            });
+            let Some((image, access, content_ready, width, height, samples, host_accessible)) =
+                held
+            else {
+                return Err(DrawError::ComputeExecution(
+                    ComputeExecutionDecline::MultisampleSampleAbsent {
+                        binding: resource.binding,
+                        identity: identity.clone(),
+                        prior: pools.prior_reclaim(identity),
+                    },
+                ));
+            };
+            // Each of the three is a distinct loss and none substitutes for
+            // another: nothing has been rendered yet, the samples are not the
+            // ones this bind names, or the resident is single-sample and would
+            // be a descriptor-type mismatch against the shader's declared
+            // multisampled image.
+            if !content_ready
+                || width != resource.width
+                || height != resource.height
+                || samples <= 1
+            {
+                return Err(DrawError::ComputeExecution(
+                    ComputeExecutionDecline::MultisampleSampleUnusable {
+                        binding: resource.binding,
+                        identity: identity.clone(),
+                        content_ready,
+                        resident_width: width,
+                        resident_height: height,
+                        resident_samples: samples,
+                        resource_width: resource.width,
+                        resource_height: resource.height,
+                    },
+                ));
+            }
+            // The view's format comes from the binding's own declared format,
+            // reduced to the `VkFormat` the registry stores — the same
+            // reduction `StorageImageFormat` already carries, so the descriptor
+            // and the image cannot disagree about how the texels are read.
+            let Some(view) = (unsafe {
+                pools.registry_sample_view(ctx, identity, resource.format.vk_format(), counters)?
+            }) else {
+                return Err(DrawError::ComputeExecution(
+                    ComputeExecutionDecline::MultisampleSampleAbsent {
+                        binding: resource.binding,
+                        identity: identity.clone(),
+                        prior: pools.prior_reclaim(identity),
+                    },
+                ));
+            };
+            sampled_slots.push(PreparedSampledImage::MultisampleTarget {
+                binding: resource.binding,
+                array_element: resource.array_element,
+                identity: identity.clone(),
+                image,
+                view,
+                access,
+                next_access: super::pools::ResidentAccess::shader_read(host_accessible),
+            });
+            continue;
+        }
         let key = StorageImageKey {
             width: resource.width,
             height: resource.height,
             format: resource.format,
             sampled_only: true,
+            mip_levels: resource.mip_levels.max(1),
         };
         let img = pools.acquire_storage_image(ctx, key, counters)?;
-        let (upload, resident_src) = if let Some(bind) = resource.resident_bind {
-            // The caller skipped the guest read; the placeholder bytes must
-            // never reach the GPU. Every mismatch names the check that
-            // refused.
+        // The byte weight of this binding, derived from its own geometry rather
+        // than carried beside it. Both arms below want it, and the upload arm's
+        // `bytes` is required to equal it by the request validation above.
+        let staged_bytes = crate::contract::extent::tight_pyramid_bytes(
+            resource.width,
+            resource.height,
+            resource.mip_levels.max(1),
+            resource.format.bytes_per_texel(),
+        )
+        .unwrap_or(0) as u64;
+        let resident_copy = match &resource.source {
+            ComputeSampledSource::ResidentCopy(bind) => Some(*bind),
+            ComputeSampledSource::Bytes(_) => None,
+            // Returned above.
+            ComputeSampledSource::MultisampleTarget(_) => unreachable!(),
+        };
+        if resident_copy.is_some() && resource.mip_levels > 1 {
+            // A resident is one window at one level. Seeding a pyramid's base
+            // from it would leave every level above it empty, which reads as a
+            // texture whose upper levels were never written — the exact defect
+            // the pyramid is here to repair.
+            return Err(DrawError::ComputeExecution(
+                ComputeExecutionDecline::ResidentSampleIsNotAPyramid {
+                    binding: resource.binding,
+                    mip_levels: resource.mip_levels,
+                },
+            ));
+        }
+        let (upload, resident_src) = if let Some(bind) = resident_copy {
+            // The caller skipped the guest read; nothing may be uploaded here.
+            // Every mismatch names the check that refused.
             let Some((src_image, src_key, generation, src_access)) =
                 pools.compute_resident_snapshot(&bind.identity)
             else {
@@ -457,20 +706,23 @@ pub(crate) unsafe fn execute_compute_inner(
             // The source must be byte-identical to the view; anything else is
             // a shape loss the runtime cannot have produced.
             resident_sample_exact(resource, bind, src_key)?;
-            counters.note_compute_sampled_resident_copy(resource.bytes.len() as u64);
+            counters.note_compute_sampled_resident_copy(staged_bytes);
             (None, Some((src_image, src_access)))
         } else {
+            let ComputeSampledSource::Bytes(bytes) = &resource.source else {
+                unreachable!("the resident and multisample sources are handled above")
+            };
             let st = pools.acquire_staging(
                 ctx,
-                resource.bytes.len() as u64,
+                bytes.len() as u64,
                 vk::BufferUsageFlags::TRANSFER_SRC,
                 counters,
             )?;
-            pools.write_staging(ctx, &st, &resource.bytes)?;
-            counters.note_compute_sampled_upload(resource.bytes.len() as u64);
+            pools.write_staging(ctx, &st, bytes)?;
+            counters.note_compute_sampled_upload(bytes.len() as u64);
             (Some(st), None)
         };
-        sampled_slots.push(PreparedSampledImage {
+        sampled_slots.push(PreparedSampledImage::Staged {
             binding: resource.binding,
             array_element: resource.array_element,
             img,
@@ -478,6 +730,7 @@ pub(crate) unsafe fn execute_compute_inner(
             resident_src,
             width: resource.width,
             height: resource.height,
+            mip_levels: resource.mip_levels.max(1),
         });
     }
 
@@ -495,6 +748,8 @@ pub(crate) unsafe fn execute_compute_inner(
             height: resource.height,
             format: resource.format,
             sampled_only: false,
+            // A compute write names one level, so a storage image is one level.
+            mip_levels: 1,
         };
         let (img, initial_access, generation_match) = if let Some(residency) = resource.residency {
             let resident = pools.acquire_resident_storage_image(
@@ -548,13 +803,19 @@ pub(crate) unsafe fn execute_compute_inner(
             counters.note_compute_storage_seed_upload(resource.bytes.len() as u64);
             Some(staging)
         };
-        // The dispatch's output crosses device→host and the runtime writes the
-        // guest pages, so it lands in a readback buffer.
-        let dst = ComputeImageDst::Readback(pools.acquire_readback_extra(
-            ctx,
-            resource.bytes.len() as u64,
-            counters,
-        )?);
+        // Where the output goes is the caller's decision, not this rail's: a
+        // request that named guest pages licensed them first, and one that did
+        // not gets the pooled readback and the device→host crossing with it.
+        let dst = match &resource.destination {
+            super::types::ComputeImageDestination::Host => ComputeImageDst::Readback(
+                pools.acquire_readback_extra(ctx, resource.bytes.len() as u64, counters)?,
+            ),
+            super::types::ComputeImageDestination::GuestPages { target, .. } => {
+                ComputeImageDst::Direct(unsafe {
+                    super::plan_guest_copy(ctx, pools, counters, target)?
+                })
+            }
+        };
         simg_slots.push(PreparedStorageImage {
             binding: resource.binding,
             array_element: resource.array_element,
@@ -592,9 +853,10 @@ pub(crate) unsafe fn execute_compute_inner(
     let sampled_infos: Vec<_> = sampled_slots
         .iter()
         .map(|prepared| {
+            let (view, layout) = prepared.descriptor_view();
             vk::DescriptorImageInfo::default()
-                .image_view(prepared.img.view)
-                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .image_view(view)
+                .image_layout(layout)
         })
         .collect();
     let sampler_infos: Vec<_> = sampler_handles
@@ -624,8 +886,8 @@ pub(crate) unsafe fn execute_compute_inner(
         descriptor_writes.push(
             vk::WriteDescriptorSet::default()
                 .dst_set(dst_set)
-                .dst_binding(prepared.binding)
-                .dst_array_element(prepared.array_element)
+                .dst_binding(prepared.binding())
+                .dst_array_element(prepared.array_element())
                 .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
                 .image_info(std::slice::from_ref(&sampled_infos[i])),
         );
@@ -651,7 +913,9 @@ pub(crate) unsafe fn execute_compute_inner(
     }
     if dset.is_some() {
         ctx.device.update_descriptor_sets(&descriptor_writes, &[]);
-        counters.descriptor_set_updates.fetch_add(1, Ordering::Relaxed);
+        counters
+            .descriptor_set_updates
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     // The ring slot's CB retired at begin_entry and its fence is unsignaled —
@@ -669,8 +933,25 @@ pub(crate) unsafe fn execute_compute_inner(
     // Seed sampled images (staging upload or resident device copy)
     // → SHADER_READ_ONLY_OPTIMAL.
     for prepared in &sampled_slots {
-        let img = &prepared.img;
-        let range = super::color_subresource_range();
+        let PreparedSampledImage::Staged {
+            binding,
+            img,
+            upload,
+            resident_src,
+            width,
+            height,
+            mip_levels,
+            ..
+        } = prepared
+        else {
+            // A multisample target is bound where it already lives; it is
+            // placed for the read below, not seeded here.
+            continue;
+        };
+        let (binding, width, height, mip_levels) = (*binding, *width, *height, *mip_levels);
+        // Every level of the pyramid, not just the base: a level left in
+        // `UNDEFINED` reads as a level nothing ever wrote.
+        let range = super::color_subresource_range_levels(mip_levels);
         let barrier = [vk::ImageMemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::empty())
             .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
@@ -687,14 +968,38 @@ pub(crate) unsafe fn execute_compute_inner(
             &[],
             &barrier,
         );
-        if let Some(st) = &prepared.upload {
-            let copy = [vk::BufferImageCopy::default()
-                .image_subresource(super::color_subresource_layers())
-                .image_extent(vk::Extent3D {
-                    width: prepared.width,
-                    height: prepared.height,
-                    depth: 1,
-                })];
+        if let Some(st) = upload {
+            // One region per level, at the offset the *producer* packed it at.
+            // Both ends read `tight_pyramid_spans`, so neither computes a
+            // layout of its own and the two cannot drift.
+            let Some(spans) = crate::contract::extent::tight_pyramid_spans(
+                width,
+                height,
+                mip_levels,
+                img.key.format.bytes_per_texel(),
+            ) else {
+                return Err(DrawError::ComputeExecution(
+                    ComputeExecutionDecline::SampledPyramidLayout {
+                        binding,
+                        width,
+                        height,
+                        mip_levels,
+                    },
+                ));
+            };
+            let copy: Vec<_> = spans
+                .iter()
+                .map(|span| {
+                    vk::BufferImageCopy::default()
+                        .buffer_offset(span.offset as u64)
+                        .image_subresource(super::color_subresource_layers().mip_level(span.level))
+                        .image_extent(vk::Extent3D {
+                            width: span.width,
+                            height: span.height,
+                            depth: 1,
+                        })
+                })
+                .collect();
             ctx.device.cmd_copy_buffer_to_image(
                 cb,
                 st.buffer,
@@ -702,7 +1007,7 @@ pub(crate) unsafe fn execute_compute_inner(
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                 &copy,
             );
-        } else if let Some((src_image, src_access)) = prepared.resident_src {
+        } else if let Some((src_image, src_access)) = *resident_src {
             // Copy-on-sample. The resident stays in its registry layout on
             // exit so the storage-acquire's captured initial_access (and the
             // storage pre-dispatch barrier, which syncs on TRANSFER when that
@@ -723,8 +1028,8 @@ pub(crate) unsafe fn execute_compute_inner(
                 .src_subresource(super::color_subresource_layers())
                 .dst_subresource(super::color_subresource_layers())
                 .extent(vk::Extent3D {
-                    width: prepared.width,
-                    height: prepared.height,
+                    width,
+                    height,
                     depth: 1,
                 })];
             ctx.device.cmd_copy_image(
@@ -747,7 +1052,11 @@ pub(crate) unsafe fn execute_compute_inner(
                     .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
                     .new_layout(src_access.layout())
                     .image(src_image)
-                    .subresource_range(range)];
+                    // The *source* resident's range, which is one level —
+                    // `range` above describes this binding's own pyramid and
+                    // naming it here would transition levels `src_image` has
+                    // not got.
+                    .subresource_range(super::color_subresource_range())];
                 ctx.device.cmd_pipeline_barrier(
                     cb,
                     vk::PipelineStageFlags::TRANSFER,
@@ -876,8 +1185,46 @@ pub(crate) unsafe fn execute_compute_inner(
         );
     }
 
-    ctx.device
-        .cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, pipeline);
+    // Place every multisample target this dispatch reads, and note where it
+    // left them. These are not seeded above — the loop skips them — so this is
+    // the only transition they get, and it is owed for the same reason the
+    // render rail's `PreparedSampled::Resident` arm owes one: the resident's
+    // last touch was a colour write by another submission.
+    for prepared in &sampled_slots {
+        let PreparedSampledImage::MultisampleTarget {
+            identity,
+            image,
+            access,
+            next_access,
+            ..
+        } = prepared
+        else {
+            continue;
+        };
+        if access != next_access {
+            let (src_stage, src_access) = access.source_scope();
+            let barrier = [vk::ImageMemoryBarrier::default()
+                .src_access_mask(src_access)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                .old_layout(access.layout())
+                .new_layout(next_access.layout())
+                .image(*image)
+                .subresource_range(super::color_subresource_range())];
+            ctx.device.cmd_pipeline_barrier(
+                cb,
+                src_stage,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &barrier,
+            );
+        }
+        // After the barrier is recorded, so the registry never claims a layout
+        // this command buffer has not been told to place the image in.
+        pools.registry_note_access(identity, *next_access);
+    }
+
     if push_descriptors {
         ctx.push_descriptor
             .as_ref()
@@ -899,10 +1246,37 @@ pub(crate) unsafe fn execute_compute_inner(
             &[dset],
             &[],
         );
-        counters.descriptor_set_binds.fetch_add(1, Ordering::Relaxed);
+        counters
+            .descriptor_set_binds
+            .fetch_add(1, Ordering::Relaxed);
     }
-    ctx.device
-        .cmd_dispatch(cb, req.grid[0], req.grid[1], req.grid[2]);
+    // Descriptors are bound once for the whole launch: every region pipeline
+    // shares this exact layout object, so a pipeline bind between them does not
+    // disturb the set. No barrier separates the regions either — they are one
+    // Metal `dispatchThreads`, whose threads have no ordering among themselves,
+    // and consecutive Vulkan dispatches without a barrier carry that same
+    // permission to overlap.
+    for step in &dispatch_steps {
+        ctx.device
+            .cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, step.pipeline);
+        if let Some((offset, payload)) = &step.push {
+            let bytes =
+                std::slice::from_raw_parts(payload.as_ptr().cast::<u8>(), size_of_val(payload));
+            ctx.device.cmd_push_constants(
+                cb,
+                pipeline_layout,
+                vk::ShaderStageFlags::COMPUTE,
+                *offset,
+                bytes,
+            );
+        }
+        ctx.device.cmd_dispatch(
+            cb,
+            step.group_count[0],
+            step.group_count[1],
+            step.group_count[2],
+        );
+    }
 
     // SSBO → host
     if storage_slots.iter().any(|(_, _, _, writable)| *writable) {
@@ -948,31 +1322,54 @@ pub(crate) unsafe fn execute_compute_inner(
             &[],
             &barrier,
         );
-        let dst_buffer = match &prepared.dst {
-            ComputeImageDst::Readback(slot) => slot.buffer,
-        };
-        // The pooled readback is always tightly packed from texel zero. The
-        // offset and row length were the imported window's, and it had a
-        // `buffer_offset` into the guest surface and a guest row stride.
-        let (buffer_offset, row_length_texels) = (0u64, 0u32);
-        let copy = [vk::BufferImageCopy::default()
-            .buffer_offset(buffer_offset)
-            .buffer_row_length(row_length_texels)
-            .image_subresource(super::color_subresource_layers())
-            .image_extent(vk::Extent3D {
-                width: prepared.width,
-                height: prepared.height,
-                depth: 1,
-            })];
-        ctx.device.cmd_copy_image_to_buffer(
-            cb,
-            img.image,
-            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-            dst_buffer,
-            &copy,
-        );
+        match &prepared.dst {
+            ComputeImageDst::Readback(slot) => {
+                // The pooled readback is always tightly packed from texel zero.
+                // A guest window's own offset and row stride belong to the
+                // plan on the direct arm, never to this one.
+                let copy = [vk::BufferImageCopy::default()
+                    .buffer_offset(0)
+                    .buffer_row_length(0)
+                    .image_subresource(super::color_subresource_layers())
+                    .image_extent(vk::Extent3D {
+                        width: prepared.width,
+                        height: prepared.height,
+                        depth: 1,
+                    })];
+                ctx.device.cmd_copy_image_to_buffer(
+                    cb,
+                    img.image,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    slot.buffer,
+                    &copy,
+                );
+            }
+            ComputeImageDst::Direct(plan) => {
+                // Recorded into the dispatch's own command buffer, so the whole
+                // thing is still one submission and one fence. Both calls are
+                // the render rail's, unchanged: the plan already describes
+                // every guest run, and the release is what makes the bytes
+                // visible to the guest's vCPU once the fence signals.
+                unsafe {
+                    super::record_guest_copy_plan(
+                        ctx,
+                        pools,
+                        cb,
+                        img.image,
+                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                        plan,
+                    );
+                    super::release_guest_copy_to_host(ctx, cb, plan);
+                }
+            }
+        }
     }
-    if !simg_slots.is_empty() {
+    // Only a readback owes the host-visibility barrier below; the direct arm
+    // released its own writes to `HOST` per plan, right where it recorded them.
+    if simg_slots
+        .iter()
+        .any(|prepared| matches!(prepared.dst, ComputeImageDst::Readback(_)))
+    {
         let barrier = [vk::MemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
             .dst_access_mask(vk::AccessFlags::HOST_READ)];
@@ -1014,6 +1411,32 @@ pub(crate) unsafe fn execute_compute_inner(
         Err(e) => return Err(DrawError::VkCall(VkCall::new(VkOp::ComputeExecSubmit, e))),
     }
 
+    // The copy into guest pages is on the queue now, so the debt is owed from
+    // here — before any fallible step below, because a failure past the submit
+    // does not un-submit the copy and the pages are being written either way.
+    //
+    // Read straight off the request rather than off `simg_slots`, so nothing
+    // depends on the two being the same length in the same order — and so the
+    // destination and the residency that decide the source are read off one
+    // record, which is the only way they cannot disagree.
+    //
+    // Which source applies is a fact about where the image lives. A transient
+    // slot is sealed into this submission's ring entry and cannot be recycled
+    // before the fence retires, so the ring is its lifetime. A registered
+    // resident was popped out of that live set at acquire and lives in the
+    // compute-storage registry instead, so it needs the pin.
+    for resource in &req.storage_images {
+        if let super::types::ComputeImageDestination::GuestPages { pages, .. } =
+            &resource.destination
+        {
+            let source = match &resource.residency {
+                Some(residency) => super::GuestWriteSource::ResidentStorage(&residency.identity),
+                None => super::GuestWriteSource::RingEntry,
+            };
+            super::record_guest_write_debt(pools, source, pages);
+        }
+    }
+
     // A dispatch whose every output stays on the GPU (deferred storage-image
     // writebacks, no writable SSBO readbacks, no direct guest-window DMA) has
     // nothing to hand the CPU — skip the post-submit fence wait and return
@@ -1022,8 +1445,15 @@ pub(crate) unsafe fn execute_compute_inner(
     // (read_resident_storage) waits it before copying, and the owed
     // descriptor-set/pool cleanup is stashed until a later wait proves the CB
     // retired (drain_pending_compute_cleanup).
-    let all_writeback_deferred =
-        storage_slots.iter().all(|(_, _, _, writable)| !writable) && simg_slots.is_empty();
+    // The test is whether anything owes the *CPU* bytes, not whether there were
+    // storage images: a direct image lands in the guest's own pages and there is
+    // nothing to read back, so it belongs on the deferred side exactly as a
+    // read-only SSBO does. Its ordering does not come from this wait — see
+    // `ComputeImageDestination::GuestPages` for the stamp chain that carries it.
+    let all_writeback_deferred = storage_slots.iter().all(|(_, _, _, writable)| !writable)
+        && simg_slots
+            .iter()
+            .all(|prepared| !matches!(prepared.dst, ComputeImageDst::Readback(_)));
     // Park the owed cleanup (descriptor set + transient pool slots) on this
     // ring slot in every mode; whichever entry retires the slot drains it. A
     // failed wait below leaves the slot pending, so no path ever reuses an
@@ -1063,7 +1493,7 @@ pub(crate) unsafe fn execute_compute_inner(
             VkOp::ComputeExecMapStorageReadback,
             VkOp::ComputeExecInvalidateStorageReadback,
         )?;
-        counters.note_readback(*len as u64);
+        counters.note_readback(*len as u64, super::counters::ReadbackSource::ComputeBuffer);
         buffers.push(ComputeBufferOutput {
             binding: *binding,
             bytes: out,
@@ -1071,16 +1501,31 @@ pub(crate) unsafe fn execute_compute_inner(
     }
     let mut images = Vec::with_capacity(simg_slots.len());
     for prepared in &simg_slots {
-        let ComputeImageDst::Readback(readback) = &prepared.dst;
-        let out = crate::backend::vulkan::engine::pools::read_back_slot(
-            ctx,
-            readback,
-            prepared.len as u64,
-            VkOp::ComputeExecMapImageReadback,
-            VkOp::ComputeExecInvalidateImageReadback,
-        )?;
-        counters.note_readback(prepared.len as u64);
-        images.push(out);
+        match &prepared.dst {
+            ComputeImageDst::Readback(readback) => {
+                let out = crate::backend::vulkan::engine::pools::read_back_slot(
+                    ctx,
+                    readback,
+                    prepared.len as u64,
+                    VkOp::ComputeExecMapImageReadback,
+                    VkOp::ComputeExecInvalidateImageReadback,
+                )?;
+                counters.note_readback(
+                    prepared.len as u64,
+                    super::counters::ReadbackSource::ComputeImage,
+                );
+                images.push(super::types::ComputeImageResult::Bytes(out));
+            }
+            // Nothing was read, so nothing is charged to the readback census —
+            // that is the saving this arm exists for, and a bump here would
+            // report it as still being paid. `bytes` is what the queued copy
+            // lands, for the caller's own census.
+            ComputeImageDst::Direct(_) => {
+                images.push(super::types::ComputeImageResult::Landed {
+                    bytes: prepared.len as u64,
+                });
+            }
+        }
     }
 
     // Cleanup was parked on the ring slot right after submit; nothing left
@@ -1113,8 +1558,8 @@ pub(super) unsafe fn copy_mapped_output(ptr: *const u8, len: usize) -> Vec<u8> {
 mod tests {
     use super::*;
     use crate::backend::vulkan::engine::{
-        ComputeResidentSampleBind, ComputeSampledImageResource, ComputeStorageImageResource,
-        SamplerResource, StorageImageFormat,
+        ComputeResidentSampleBind, ComputeSampledImageResource, ComputeSampledSource,
+        ComputeStorageImageResource, SamplerResource, StorageImageFormat,
     };
     use crate::model::ComputeStorageResidencyKey;
     use crate::observe::Decline;
@@ -1168,21 +1613,31 @@ mod tests {
 
     fn resident_sample_resource() -> ComputeSampledImageResource {
         ComputeSampledImageResource {
+            mip_levels: 1,
             binding: 32,
             array_element: 0,
             descriptor_count: 1,
             format: StorageImageFormat::Rgba8Unorm,
             width: 1,
             height: 1,
-            bytes: vec![0; 4],
-            resident_bind: Some(ComputeResidentSampleBind {
+            source: ComputeSampledSource::ResidentCopy(ComputeResidentSampleBind {
                 identity: residency_identity(),
                 generation: 9,
             }),
         }
     }
+
+    /// The bind a `ResidentCopy` resource names, for a test that asks about the
+    /// shape check rather than about the source enum.
+    fn resident_sample_bind(resource: &ComputeSampledImageResource) -> ComputeResidentSampleBind {
+        match &resource.source {
+            ComputeSampledSource::ResidentCopy(bind) => *bind,
+            other => panic!("expected a resident-copy source, got {other:?}"),
+        }
+    }
     fn resident_sample_key() -> StorageImageKey {
         StorageImageKey {
+            mip_levels: 1,
             width: 1,
             height: 1,
             format: StorageImageFormat::Rgba8Unorm,
@@ -1194,7 +1649,7 @@ mod tests {
         resource: &ComputeSampledImageResource,
         source: StorageImageKey,
     ) -> &'static str {
-        let bind = resource.resident_bind.unwrap();
+        let bind = resident_sample_bind(resource);
         match resident_sample_exact(resource, bind, source) {
             Err(DrawError::ComputeExecution(decline)) => decline.slug(),
             Err(other) => panic!("expected typed compute execution decline, got {other}"),
@@ -1214,7 +1669,7 @@ mod tests {
         let req = ComputeRequest {
             spirv: vec![0x0723_0203],
             entry: "ma\0in".into(),
-            grid: [1, 1, 1],
+            dispatch: ComputeDispatch::Workgroups([1, 1, 1]),
             ..Default::default()
         };
         let decline = match validate_compute(&req) {
@@ -1235,7 +1690,7 @@ mod tests {
         let request = ComputeRequest {
             spirv: vec![0x0723_0203],
             entry: "main".into(),
-            grid: [1, 1, 1],
+            dispatch: ComputeDispatch::Workgroups([1, 1, 1]),
             sampled_images: vec![first, second],
             ..Default::default()
         };
@@ -1259,7 +1714,7 @@ mod tests {
     fn resident_sample_shape_causes_are_not_collapsed() {
         let exact = resident_sample_resource();
         assert_eq!(
-            resident_sample_exact(&exact, exact.resident_bind.unwrap(), resident_sample_key()),
+            resident_sample_exact(&exact, resident_sample_bind(&exact), resident_sample_key()),
             Ok(())
         );
 
@@ -1270,7 +1725,6 @@ mod tests {
         let mut row_compatible = resident_sample_resource();
         row_compatible.width = 2;
         row_compatible.format = StorageImageFormat::Rg8Unorm;
-        row_compatible.bytes.resize(4, 0);
         assert_eq!(
             resident_sample_shape_slug(&row_compatible, resident_sample_key()),
             "vk_compute_exec_resident_sample_byte_shape_mismatch"
@@ -1278,7 +1732,6 @@ mod tests {
 
         let mut byte_mismatch = resident_sample_resource();
         byte_mismatch.width = 2;
-        byte_mismatch.bytes.resize(8, 0);
         assert_eq!(
             resident_sample_shape_slug(&byte_mismatch, resident_sample_key()),
             "vk_compute_exec_resident_sample_byte_shape_mismatch"
@@ -1290,19 +1743,20 @@ mod tests {
         let mut req = ComputeRequest {
             spirv: vec![0x0723_0203],
             entry: "main".into(),
-            grid: [1, 1, 1],
+            dispatch: ComputeDispatch::Workgroups([1, 1, 1]),
             sampled_images: vec![ComputeSampledImageResource {
+                mip_levels: 1,
                 binding: 32,
                 array_element: 0,
                 descriptor_count: 1,
                 format: StorageImageFormat::Rgba8Unorm,
                 width: 1,
                 height: 1,
-                bytes: vec![0; 4],
-                resident_bind: None,
+                source: ComputeSampledSource::Bytes(vec![0; 4]),
             }],
             samplers: vec![SamplerResource::normalized_default(64)],
             storage_images: vec![ComputeStorageImageResource {
+                destination: Default::default(),
                 binding: 34,
                 array_element: 0,
                 descriptor_count: 1,

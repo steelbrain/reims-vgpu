@@ -419,9 +419,29 @@ pub(super) fn resolve_texture_view<M: HostMemory + HostOps>(
 /// table was simply missing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ViewSampleRefusal {
-    BaseUndeclared { base: u16 },
-    ViewUndeclared { view: u16 },
-    WidthMismatch { base_bpp: u32, view_bpp: u32 },
+    BaseUndeclared {
+        base: u16,
+    },
+    ViewUndeclared {
+        view: u16,
+    },
+    WidthMismatch {
+        base_bpp: u32,
+        view_bpp: u32,
+    },
+    /// The two formats occupy the same bytes per addressable unit but address a
+    /// different **grid** of texels with them — one is block-compressed and the
+    /// other is not.
+    ///
+    /// Distinct from [`Self::WidthMismatch`] because the two numbers that
+    /// variant prints would be *equal* here and read as a contradiction:
+    /// `BC3_RGBA` and `RGBA32Float` are both sixteen bytes a unit, and one of
+    /// them spends those bytes on sixteen texels. Reinterpreting either as the
+    /// other is not a view of one allocation.
+    GridMismatch {
+        base_compressed: bool,
+        view_compressed: bool,
+    },
 }
 
 impl std::fmt::Display for ViewSampleRefusal {
@@ -439,14 +459,36 @@ impl std::fmt::Display for ViewSampleRefusal {
                     "view_width_mismatch base_bpp={base_bpp} view_bpp={view_bpp}"
                 )
             }
+            Self::GridMismatch {
+                base_compressed,
+                view_compressed,
+            } => {
+                write!(
+                    f,
+                    "view_grid_mismatch base_compressed={base_compressed} \
+                     view_compressed={view_compressed}"
+                )
+            }
         }
     }
 }
 
 /// Pick the sample format for a type-8 view over base storage.
 ///
-/// Metal texture views require the view format to be bpp-compatible with the base.
-/// Unknown formats (no `bytes_per_pixel`) fail visibly. `None` override inherits base.
+/// Metal texture views require the view format to be storage-compatible with the
+/// base. Compatibility is compared as a whole [`pixel_format::BlockGeometry`] —
+/// the grid *and* the bytes — rather than as a bytes-per-texel, because a
+/// block-compressed format has no bytes-per-texel at all and comparing two
+/// `None`s would have admitted a `BC1`-as-`BC3` reinterpretation while refusing
+/// every compressed texture outright.
+///
+/// That refusal was not theoretical: before this took the block form, **every**
+/// BC texture failed here as `linear_load_view_bpp_mismatch` — with no view
+/// override in play, because the base alone has no texel width — so a compressed
+/// bind never reached the loader at all.
+///
+/// Unknown formats (no [`pixel_format::block_geometry`]) fail visibly. `None`
+/// override inherits base.
 ///
 /// Almost every caller only needs "may I", which is what this answers. A caller
 /// that has to *print* a refusal wants [`effective_view_sample_format_reasoned`]
@@ -462,14 +504,22 @@ pub(crate) fn effective_view_sample_format_reasoned(
     view_fmt: Option<u16>,
 ) -> Result<u16, ViewSampleRefusal> {
     let sample = view_fmt.unwrap_or(base_fmt);
-    let base_bpp = pixel_format::bytes_per_pixel(base_fmt)
+    let base_block = pixel_format::block_geometry(base_fmt)
         .ok_or(ViewSampleRefusal::BaseUndeclared { base: base_fmt })?;
-    let sample_bpp = pixel_format::bytes_per_pixel(sample)
+    let sample_block = pixel_format::block_geometry(sample)
         .ok_or(ViewSampleRefusal::ViewUndeclared { view: sample })?;
-    if base_bpp != sample_bpp {
+    if base_block.bytes != sample_block.bytes {
         return Err(ViewSampleRefusal::WidthMismatch {
-            base_bpp,
-            view_bpp: sample_bpp,
+            base_bpp: base_block.bytes,
+            view_bpp: sample_block.bytes,
+        });
+    }
+    // Equal bytes over a different grid is its own refusal — see
+    // [`ViewSampleRefusal::GridMismatch`].
+    if (base_block.width, base_block.height) != (sample_block.width, sample_block.height) {
+        return Err(ViewSampleRefusal::GridMismatch {
+            base_compressed: base_block.is_compressed(),
+            view_compressed: sample_block.is_compressed(),
         });
     }
     Ok(sample)
@@ -559,6 +609,20 @@ pub(crate) enum LinearLoadRefusal {
     PaddedRowUnreadable { row: u32 },
     /// The format has a bytes-per-pixel but no row conversion to RGBA8.
     RowConvertUnsupported { format: u16 },
+    /// Two faces of one cube texture read back in different layouts.
+    ///
+    /// One descriptor names one pixel format, so the six faces cannot legally
+    /// differ. A disagreement is this loader's own defect rather than the
+    /// guest's, and it is named rather than folded into a format refusal so the
+    /// log says which face disagreed instead of reporting a format of zero that
+    /// no guest ever sent.
+    ///
+    /// Carries the same gate as [`load_cube_faces`], its only constructor. The
+    /// cube loader is Vulkan-only, so without this the variant is dead on the
+    /// Metal arm — which `-D warnings` reports, and only on the arm a Linux
+    /// host has to cross-compile to see.
+    #[cfg(feature = "backend-vulkan")]
+    CubeFaceLayoutMismatch { face: u32 },
 }
 
 impl crate::observe::Decline for LinearLoadRefusal {
@@ -579,6 +643,8 @@ impl crate::observe::Decline for LinearLoadRefusal {
             Self::TightImageUnreadable => "linear_load_tight_image_unreadable",
             Self::PaddedRowUnreadable { .. } => "linear_load_padded_row_unreadable",
             Self::RowConvertUnsupported { .. } => "linear_load_row_convert_unsupported",
+            #[cfg(feature = "backend-vulkan")]
+            Self::CubeFaceLayoutMismatch { .. } => "linear_load_cube_face_layout_mismatch",
         }
     }
 
@@ -601,6 +667,8 @@ impl crate::observe::Decline for LinearLoadRefusal {
                 vec![("end", end.to_string()), ("alloc", allocation.to_string())]
             }
             Self::PaddedRowUnreadable { row } => vec![("row", row.to_string())],
+            #[cfg(feature = "backend-vulkan")]
+            Self::CubeFaceLayoutMismatch { face } => vec![("face", face.to_string())],
             _ => Vec::new(),
         }
     }
@@ -634,11 +702,73 @@ pub(crate) fn load_linear_texture_host<M: HostMemory + HostOps>(
         task_id,
         texture_ref,
         level,
+        0,
         format_override,
         native,
         site,
     )
     .ok()
+}
+
+/// Load all six faces of a cube texture, tightly packed face after face — the
+/// layer order `VkBufferImageCopy` consumes with `layerCount = 6`.
+///
+/// Metal stores a cube as a six-slice array, and this device's measured
+/// array-packing rule (see [`load_linear_texture_impl`]'s `face` parameter) puts
+/// each face one face-stride after the last. Each face rides the ordinary 2D
+/// loader, so every conversion arm — native BC blocks, BGRA8, the RGBA8 convert
+/// fallback — serves a cube exactly as it serves the equivalent 2D texture, and
+/// a divergence between the two is not expressible.
+///
+/// Level 0 only, which is what the sampled bind path uploads for every shape
+/// (the engine creates its sampled images with one mip). The faces must agree
+/// on their byte layout by construction — one descriptor, one format — so the
+/// per-face formats are asserted equal rather than reconciled.
+// The Vulkan bind path is the only caller; the Metal arm's cube support is
+// native and never reloads faces on the CPU, so ungated this is dead code
+// there — which the cross-compiled clippy run is what catches.
+#[cfg(feature = "backend-vulkan")]
+pub(crate) fn load_cube_faces<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    texture_ref: u32,
+    native: NativeUploads,
+    site: crate::runtime::render_writeback::SettleSite,
+) -> Result<(Vec<u8>, SampledByteFormat), LinearLoadRefusal> {
+    /// Faces of a cube. Not configurable: five is not a cube and neither is
+    /// seven, and the engine refuses `cube` images whose layer count is not
+    /// exactly this.
+    const CUBE_FACES: u32 = 6;
+    // Face zero is read first so the format and the whole capacity are known
+    // before the loop, which is what lets the six faces pack with one
+    // allocation and leaves no "no face was read" case to invent a refusal for.
+    let (first_bytes, format) =
+        load_linear_texture_impl(state, host, task_id, texture_ref, 0, 0, None, native, site)?;
+    let mut packed: Vec<u8> = Vec::with_capacity(first_bytes.len() * CUBE_FACES as usize);
+    packed.extend_from_slice(&first_bytes);
+    drop(first_bytes);
+    for face in 1..CUBE_FACES {
+        let (bytes, byte_format) = load_linear_texture_impl(
+            state,
+            host,
+            task_id,
+            texture_ref,
+            0,
+            face,
+            None,
+            native,
+            site,
+        )?;
+        // One descriptor, one format — a disagreement here is this loader's own
+        // bug, not the guest's, so it is a named refusal rather than a debug
+        // assertion that vanishes in release.
+        if format.layout() != byte_format.layout() {
+            return Err(LinearLoadRefusal::CubeFaceLayoutMismatch { face });
+        }
+        packed.extend_from_slice(&bytes);
+    }
+    Ok((packed, format))
 }
 
 /// Which non-RGBA8 sampled layouts a caller of the linear loaders will carry.
@@ -667,6 +797,32 @@ pub(crate) struct NativeUploads {
     /// `f16_to_unorm8_lut`, which clamps to `[0, 1]` and quantizes to 256
     /// levels; see [`pixel_format::TexelLayout::cpu_loader_arm_is_lossy`].
     pub float16: bool,
+    /// Upload the guest's BC (DXT / S3TC) blocks verbatim as the matching
+    /// `VK_FORMAT_BC*_BLOCK`.
+    ///
+    /// Unlike the two above this is not a saved pass or an exactness question —
+    /// it is the **only** path. There is no CPU decompressor here and there will
+    /// not be one, so a host that clears this flag loses the texture and says
+    /// so; see [`pixel_format::TexelLayout::has_cpu_loader_arm`], which answers
+    /// `false` for every BC layout. Set from
+    /// `engine::supports_block_compressed_sampled`, which is one Vulkan feature
+    /// for the whole family. Desktop GPUs have it; Apple GPUs carry ASTC
+    /// instead and read `false`.
+    pub block_compressed: bool,
+    /// Upload guest four-channel `float32` (`RGBA32Float`) at its own sixteen
+    /// bytes, as `R32G32B32A32_SFLOAT`.
+    ///
+    /// Like [`Self::block_compressed`] and unlike [`Self::float16`], this is not
+    /// a choice between an exact rail and a lossy one — it is the **only** rail.
+    /// [`pixel_format::TexelLayout::Rgba32Float`] has no CPU loader arm and must
+    /// not gain one, so a host that clears this flag loses the texture and says
+    /// so rather than quantising a lookup table to unorm8.
+    ///
+    /// Set from `supports_sampled_layout_linear_filter(Rgba32Float)`: Vulkan
+    /// mandates `SAMPLED_IMAGE` for the format but not
+    /// `SAMPLED_IMAGE_FILTER_LINEAR`, so the filter is measured rather than
+    /// assumed.
+    pub float32: bool,
 }
 
 impl NativeUploads {
@@ -675,6 +831,8 @@ impl NativeUploads {
     pub const NONE: Self = Self {
         bgra8: false,
         float16: false,
+        block_compressed: false,
+        float32: false,
     };
 
     /// Native BGRA8 only — the answer this parameter carried when it was a
@@ -689,19 +847,59 @@ impl NativeUploads {
     pub const BGRA8: Self = Self {
         bgra8: true,
         float16: false,
+        block_compressed: false,
+        float32: false,
     };
 
-    /// Every native layout the loaders can produce.
+    /// Every native layout the loaders can produce — every gate open at once.
     ///
-    /// Test-only on purpose. Production reaches this answer through
-    /// `native_uploads_for_host`, which asks the host whether it can filter the
-    /// half-float formats; a constant that says yes without asking is exactly
-    /// the shape that would let a capability go unchecked.
-    #[cfg(test)]
+    /// **Never bind anything with this.** Production reaches its answer through
+    /// `native_uploads_for_host`, which asks the host; a constant that says yes
+    /// without asking is exactly the shape that lets a capability go unchecked.
+    /// Its two legitimate uses are a test fixture and one half of
+    /// [`native_bind_is_host_gated`]'s comparison, which asks whether an answer
+    /// *depends* on the host and binds nothing.
+    ///
+    /// It is one constant rather than two because it was two: an
+    /// `EVERY_GATE_OPEN` sitting beside this was a field-for-field copy with
+    /// nothing comparing them, so a fifth gate set here and forgotten there
+    /// would make `native_bind_is_host_gated` compare two equal answers, report
+    /// `false`, and skip asking the host — reproducing exactly the `RGBA32Float`
+    /// defect that function exists to have fixed. `AGENTS.md`: derive, don't
+    /// duplicate and compare.
+    #[cfg(any(test, feature = "backend-vulkan"))]
     pub const ALL: Self = Self {
         bgra8: true,
         float16: true,
+        block_compressed: true,
+        float32: true,
     };
+}
+
+/// Whether [`linear_native_upload_format`]'s answer for `sample_format` depends
+/// on what the host can do.
+///
+/// The question `native_uploads_for` needs before deciding whether to take the
+/// engine lock, and it is **derived** rather than listed: the answer is computed
+/// with every *host-gated* capability shut and again with every one open, and a
+/// format whose answer moves is one whose bind is host-gated.
+///
+/// The shut arm is [`NativeUploads::BGRA8`] rather than [`NativeUploads::NONE`]
+/// deliberately, and the difference is only `bgra8`, which is not a host gate at
+/// all — it is the loader's own eight-bit swap and is always available. Shutting
+/// it would make every BGRA8 format read as host-gated and send each one through
+/// the engine lock for an answer that cannot change.
+///
+/// It used to be approximated by [`pixel_format::narrows_to_unorm8`], which
+/// answers a different question — whether a format's *CPU* arm is lossy. The two
+/// coincided for exactly as long as every capability-gated layout also had a
+/// lossy CPU arm. `RGBA32Float` broke that: its bind is host-gated and it has no
+/// CPU arm at all, so the proxy said "no need to ask", the host was never asked,
+/// and every draw sampling one was refused.
+#[cfg(feature = "backend-vulkan")]
+pub(crate) fn native_bind_is_host_gated(sample_format: u16) -> bool {
+    linear_native_upload_format(sample_format, NativeUploads::BGRA8)
+        != linear_native_upload_format(sample_format, NativeUploads::ALL)
 }
 
 /// When a sampled format's guest bytes are ALREADY in the final upload order —
@@ -719,6 +917,15 @@ pub(crate) fn linear_native_upload_format(
     native: NativeUploads,
 ) -> Option<TexelLayout> {
     use pixel_format::SampledClass;
+    // The compressed families are answered before the sampled class, because
+    // that vocabulary has no block in it and because the answer here is not an
+    // optimisation: a BC bind is native or it is a refusal. `None` when the host
+    // cannot sample the family sends it to the convert path, which declines by
+    // name for a format with no CPU loader arm — which is what a refusal looks
+    // like on this rail.
+    if let Some(layout) = pixel_format::block_compressed_layout(sample_format) {
+        return native.block_compressed.then_some(layout);
+    }
     // The decode contract's sampled class is the one rule for "which channel
     // order and width is this"; it folds each sRGB format onto its linear
     // sibling's layout, which is right — they share a layout. The qualifier is
@@ -730,6 +937,16 @@ pub(crate) fn linear_native_upload_format(
         SampledClass::Bgra8Unorm if native.bgra8 => TexelLayout::Bgra8,
         SampledClass::Rgba16Float if native.float16 => TexelLayout::Rgba16Float,
         SampledClass::Rg16Float if native.float16 => TexelLayout::Rg16Float,
+        SampledClass::Rgba32Float if native.float32 => TexelLayout::Rgba32Float,
+        // Ungated, like `Rgba8Unorm` and unlike every layout above it. Vulkan
+        // mandates `SAMPLED_IMAGE` for `R16G16_UINT`, and the one capability
+        // the other native layouts are gated on — linear filtering — is not a
+        // question an integer layout is asked: it is sampled with
+        // `VK_FILTER_NEAREST` by construction. So there is nothing to gate on,
+        // and no CPU arm to fall back to either: `convert_row_to_rgba8` has no
+        // arm for an integer texel and must not gain one, so a `None` here is
+        // not a slower rail, it is `RowConvertUnsupported` and a lost sample.
+        SampledClass::Rg16Uint => TexelLayout::Rg16Uint,
         _ => return None,
     })
 }
@@ -745,6 +962,12 @@ fn load_linear_texture_impl<M: HostMemory + HostOps>(
     task_id: u32,
     texture_ref: u32,
     level: u32,
+    // Array slice / cube face to read. Slices pack as contiguous images at each
+    // mip — the rule `blit_exec`'s array copies measured against live guest
+    // traffic (opcode 0x12c, slices 1 and 2 at exact one-image offsets) — so a
+    // face is the level's own read one face-stride further in. 0 is every
+    // pre-existing caller, and everything below is unchanged for it.
+    face: u32,
     format_override: Option<u16>,
     native: NativeUploads,
     site: crate::runtime::render_writeback::SettleSite,
@@ -803,8 +1026,29 @@ fn load_linear_texture_impl<M: HostMemory + HostOps>(
         .ok_or(R::SizeOverflow)?;
     // Every depth plane belongs to the level; only the final plane's final-row
     // padding lies outside the bytes this loader reads.
-    let span = layout.slice_read_span(tight).ok_or(R::SizeOverflow)?;
-    let end = layout.offset.saturating_add(span);
+    //
+    // Counted in rows of storage rather than rows of texels, so a
+    // block-compressed level does not claim four times its own extent and get
+    // refused against the allocation the guest sized correctly.
+    let storage_rows = pixel_format::tight_row_count(h, base_fmt)
+        .ok_or(R::FormatBppUnknown { format: base_fmt })?;
+    // One face-stride per slice past the level base. The stride is a whole
+    // image *including* its final row's padding — the packing rule is
+    // contiguous images, so face N+1 starts where face N's allocation ends,
+    // not where its last read ends. Zero for face 0, which is every 2D caller.
+    let face_off = if face == 0 {
+        0
+    } else {
+        bpr.checked_mul(u64::from(storage_rows))
+            .and_then(|stride| stride.checked_mul(u64::from(planes)))
+            .and_then(|stride| stride.checked_mul(u64::from(face)))
+            .ok_or(R::SizeOverflow)?
+    };
+    let gva = gva.checked_add(face_off).ok_or(R::SizeOverflow)?;
+    let span = layout
+        .slice_read_span_rows(storage_rows, tight)
+        .ok_or(R::SizeOverflow)?;
+    let end = layout.offset.saturating_add(face_off).saturating_add(span);
     if tex.allocation_size != 0 && end > tex.allocation_size {
         return Err(R::SpanExceedsAllocation {
             end,
@@ -822,7 +1066,13 @@ fn load_linear_texture_impl<M: HostMemory + HostOps>(
     // Census, pay, settle — the whole obligation of a CPU read of one named
     // resource's guest bytes. See `writeback_debt::settle_for_texture`.
     crate::runtime::writeback_debt::settle_for_texture(
-        state, host, task_id, texture_ref, gva, span, site,
+        state,
+        host,
+        task_id,
+        texture_ref,
+        gva,
+        span,
+        site,
     );
     // Tight display textures are the common compositor source. Read the whole
     // image with one task-root/cache lifetime: the row loop below otherwise
@@ -856,11 +1106,11 @@ fn load_linear_texture_impl<M: HostMemory + HostOps>(
     // `need_rgba` is the RGBA8 figure. The tight-row check is the same
     // agreement one step earlier — a source row that is not exactly one tight
     // row of the upload layout cannot be copied straight through.
-    if let Some(fmt) = linear_native_upload_format(sample_fmt, native).filter(|fmt| {
-        (tight as u64) == (w as u64).saturating_mul(fmt.bytes_per_texel() as u64)
-    }) {
+    if let Some(fmt) = linear_native_upload_format(sample_fmt, native)
+        .filter(|fmt| fmt.tight_row_bytes(w) == Some(tight))
+    {
         let row_bytes = tight as usize;
-        let rows = (h as usize)
+        let rows = (fmt.tight_row_count(h) as usize)
             .checked_mul(planes as usize)
             .ok_or(R::SizeOverflow)?;
         let out_len = row_bytes.checked_mul(rows).ok_or(R::SizeOverflow)?;
@@ -890,7 +1140,7 @@ fn load_linear_texture_impl<M: HostMemory + HostOps>(
     }
     let mut rgba = vec![0u8; need_rgba];
     let mut row = vec![0u8; tight as usize];
-    let rows = h.checked_mul(planes).ok_or(R::SizeOverflow)?;
+    let rows = storage_rows.checked_mul(planes).ok_or(R::SizeOverflow)?;
     for row_index in 0..rows {
         let row_gva = (row_index as u64)
             .checked_mul(bpr)
@@ -911,7 +1161,10 @@ fn load_linear_texture_impl<M: HostMemory + HostOps>(
             return Err(R::RowConvertUnsupported { format: sample_fmt });
         }
     }
-    Ok((rgba, SampledByteFormat::from_source(TexelLayout::Rgba8, sample_fmt)))
+    Ok((
+        rgba,
+        SampledByteFormat::from_source(TexelLayout::Rgba8, sample_fmt),
+    ))
 }
 
 ///
@@ -934,7 +1187,16 @@ where
     let tight = pixel_format::tight_row_bytes(width, sample_format).ok_or(R::FormatBppUnknown {
         format: sample_format,
     })?;
-    let rows = height.checked_mul(planes).ok_or(R::SizeOverflow)?;
+    // Rows of storage, not rows of texels: a BC level is a quarter as tall in
+    // blocks as it is in texels, rounded up. `tight_row_count` is the one
+    // spelling of that and it answers `height` for every uncompressed format,
+    // so this is the same read it always was for them.
+    let rows = pixel_format::tight_row_count(height, sample_format)
+        .ok_or(R::FormatBppUnknown {
+            format: sample_format,
+        })?
+        .checked_mul(planes)
+        .ok_or(R::SizeOverflow)?;
     let native_len = (tight as u64)
         .checked_mul(rows as u64)
         .and_then(host_alloc_len)
@@ -963,7 +1225,8 @@ where
         return Ok((bytes, SampledByteFormat::from_source(layout, sample_format)));
     }
     if native_len == rgba_len
-        && pixel_format::sampled_class(sample_format) == Some(pixel_format::SampledClass::Bgra8Unorm)
+        && pixel_format::sampled_class(sample_format)
+            == Some(pixel_format::SampledClass::Bgra8Unorm)
     {
         // A channel exchange, which moves no value across the transfer
         // function: the bytes stay encoded exactly as the guest stored them.
@@ -1006,6 +1269,169 @@ where
 mod texture_view_split_tests {
     use super::*;
     use crate::runtime::decode::resource::TextureViewDescriptor;
+
+    /// View compatibility is a whole storage grid, which is what lets a
+    /// compressed texture past this gate at all.
+    ///
+    /// The blocker this pins: the check compared `bytes_per_pixel`, and a BC
+    /// format has none — so **every** compressed texture was refused here as
+    /// `linear_load_view_bpp_mismatch` with no view override in play, because
+    /// the base format alone could not answer. A compressed bind never reached
+    /// the loader, and it would have read as "BC is unsupported" rather than as
+    /// this one gate.
+    ///
+    /// The two mismatch directions matter separately and the second is why this
+    /// is a grid and not a byte count: `BC3_RGBA` and `RGBA32Float` are both
+    /// sixteen bytes per addressable unit, and one of them spends them on
+    /// sixteen texels.
+    #[test]
+    fn a_view_is_compatible_by_storage_grid_not_by_texel_width() {
+        use crate::contract::pixel_format as pf;
+
+        // No override: the base format alone must pass, which is the case that
+        // was refusing every compressed texture.
+        assert_eq!(
+            effective_view_sample_format(pf::MTL_FORMAT_BC3_RGBA, None),
+            Some(pf::MTL_FORMAT_BC3_RGBA)
+        );
+        for &format in &[
+            pf::MTL_FORMAT_BC1_RGBA,
+            pf::MTL_FORMAT_BC1_RGBA_SRGB,
+            pf::MTL_FORMAT_BC4_R_SNORM,
+            pf::MTL_FORMAT_BC6H_RGB_FLOAT,
+            pf::MTL_FORMAT_BC7_RGBA_UNORM_SRGB,
+        ] {
+            assert_eq!(
+                effective_view_sample_format(format, None),
+                Some(format),
+                "{format:#x} must pass its own compatibility gate"
+            );
+        }
+        // The transfer-function view of one allocation is compatible: same grid,
+        // same bytes.
+        assert_eq!(
+            effective_view_sample_format(
+                pf::MTL_FORMAT_BC3_RGBA,
+                Some(pf::MTL_FORMAT_BC3_RGBA_SRGB)
+            ),
+            Some(pf::MTL_FORMAT_BC3_RGBA_SRGB)
+        );
+        // Different weight class in the same grid: eight bytes a block is not
+        // sixteen.
+        assert!(matches!(
+            effective_view_sample_format_reasoned(
+                pf::MTL_FORMAT_BC1_RGBA,
+                Some(pf::MTL_FORMAT_BC3_RGBA)
+            ),
+            Err(ViewSampleRefusal::WidthMismatch {
+                base_bpp: 8,
+                view_bpp: 16
+            })
+        ));
+        // Same bytes, different grid — the case a byte-count comparison would
+        // have admitted, and the reason `GridMismatch` exists.
+        assert!(matches!(
+            effective_view_sample_format_reasoned(
+                pf::MTL_FORMAT_BC3_RGBA,
+                Some(pf::MTL_FORMAT_RGBA32_FLOAT)
+            ),
+            Err(ViewSampleRefusal::GridMismatch {
+                base_compressed: true,
+                view_compressed: false
+            })
+        ));
+        assert!(matches!(
+            effective_view_sample_format_reasoned(
+                pf::MTL_FORMAT_RGBA32_FLOAT,
+                Some(pf::MTL_FORMAT_BC3_RGBA)
+            ),
+            Err(ViewSampleRefusal::GridMismatch {
+                base_compressed: false,
+                view_compressed: true
+            })
+        ));
+        // And the uncompressed rule is unchanged in both directions.
+        assert_eq!(
+            effective_view_sample_format(
+                pf::MTL_FORMAT_BGRA8_UNORM,
+                Some(pf::MTL_FORMAT_RGBA8_UNORM)
+            ),
+            Some(pf::MTL_FORMAT_RGBA8_UNORM)
+        );
+        assert!(matches!(
+            effective_view_sample_format_reasoned(
+                pf::MTL_FORMAT_BGRA8_UNORM,
+                Some(pf::MTL_FORMAT_RGBA16_FLOAT)
+            ),
+            Err(ViewSampleRefusal::WidthMismatch { .. })
+        ));
+    }
+
+    /// A BC bind is native or it is nothing, and the host capability is what
+    /// decides which.
+    ///
+    /// There is no CPU decompressor here, so unlike the BGRA8 and half-float
+    /// flags this one does not choose between a fast path and a slow one — it
+    /// chooses between the guest keeping its texture and losing it. That makes
+    /// the gate load-bearing rather than a performance switch, which is why it
+    /// is asserted in both directions: a `Some` on a host that cannot sample the
+    /// family would create an image in a format the driver never advertised.
+    #[test]
+    fn a_compressed_bind_is_native_or_refused() {
+        use crate::contract::pixel_format::{self as pf, TexelLayout};
+
+        let capable = NativeUploads {
+            block_compressed: true,
+            ..NativeUploads::BGRA8
+        };
+        assert_eq!(
+            linear_native_upload_format(pf::MTL_FORMAT_BC3_RGBA, capable),
+            Some(TexelLayout::Bc3Rgba)
+        );
+        // The sRGB spelling folds onto the same layout — identical blocks — and
+        // the qualifier is carried by `SampledByteFormat`'s source format.
+        assert_eq!(
+            linear_native_upload_format(pf::MTL_FORMAT_BC3_RGBA_SRGB, capable),
+            Some(TexelLayout::Bc3Rgba)
+        );
+        // Every family, so a member admitted to the contract and forgotten here
+        // fails rather than silently refusing at run time.
+        for format in [
+            pf::MTL_FORMAT_BC1_RGBA,
+            pf::MTL_FORMAT_BC2_RGBA,
+            pf::MTL_FORMAT_BC4_R_UNORM,
+            pf::MTL_FORMAT_BC5_RG_SNORM,
+            pf::MTL_FORMAT_BC6H_RGB_UFLOAT,
+            pf::MTL_FORMAT_BC7_RGBA_UNORM,
+        ] {
+            assert_eq!(
+                linear_native_upload_format(format, capable),
+                pf::block_compressed_layout(format),
+                "{format:#x} must reach the native rail on a capable host"
+            );
+            // A host without the family refuses, and `NativeUploads::BGRA8` is
+            // exactly such a host: the flag defaults off.
+            assert_eq!(
+                linear_native_upload_format(format, NativeUploads::BGRA8),
+                None,
+                "{format:#x} must not be bound on a host that cannot sample it"
+            );
+            assert_eq!(
+                linear_native_upload_format(format, NativeUploads::NONE),
+                None
+            );
+        }
+        // The gate is per family, not per call: an uncompressed format is
+        // unaffected by it in either direction.
+        assert_eq!(
+            linear_native_upload_format(pf::MTL_FORMAT_BGRA8_UNORM, capable),
+            Some(TexelLayout::Bgra8)
+        );
+        assert_eq!(
+            linear_native_upload_format(pf::MTL_FORMAT_BGRA8_UNORM, NativeUploads::NONE),
+            None
+        );
+    }
 
     #[test]
     fn view_pixel_format_override_effective() {

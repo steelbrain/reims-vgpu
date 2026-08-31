@@ -8,6 +8,17 @@
 #[cfg(test)]
 use std::collections::BTreeMap;
 
+/// Packed page views currently owned by the host shim.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PageAliasCensus {
+    pub live: u64,
+    pub live_bytes: u64,
+    pub live_pages: u64,
+    pub created: u64,
+    pub destroyed: u64,
+}
+
 /// Guest-physical memory access error.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MemError {
@@ -121,7 +132,7 @@ impl crate::observe::Decline for MemError {
             Self::QemuReadXregCallbackFailed(_) => "mem_qemu_read_xreg_callback_failed",
             // Delegates, so the walk's own fifteen slugs stay the reason rather
             // than being flattened into one and reconstructed from a field.
-            Self::Unresolved(status) => match crate::observe::Refusal::refusal(status) {
+            Self::Unresolved(status) => match crate::contract::gva_resolve::walk_refusal(status) {
                 Some(slug) => slug,
                 // `Unresolved(Ok)` is a construction bug, not a walk failure.
                 // Naming it beats reporting a plausible walk reason for
@@ -443,10 +454,9 @@ pub trait HostOps {
     /// Release a view obtained from [`HostOps::map_pages`].
     fn unmap_pages(&mut self, _ptr: usize, _len: usize) {}
 
-    /// True when [`HostOps::map_pages`] returns a **stable** alias of guest
-    /// RAM: the pointer stays valid for the device lifetime,
-    /// [`HostOps::unmap_pages`] is a no-op, and the address is never recycled
-    /// for unrelated memory.
+    /// True when [`HostOps::map_pages`] returns an alias that remains valid
+    /// until its matching [`HostOps::unmap_pages`] call, so it may back a
+    /// retained GPU import.
     ///
     /// This is a claim about a CPU-side *view* only, and says nothing about the
     /// GPU rail: guest RAM reaches the GPU by importing the spans
@@ -457,6 +467,12 @@ pub trait HostOps {
     /// declared stability keeps the portable CPU writeback.
     fn map_pages_stable(&self) -> bool {
         false
+    }
+
+    /// Current packed-alias levels and cumulative lifetime totals. `None`
+    /// means this host does not construct or cannot report such aliases.
+    fn page_alias_census(&self) -> Option<PageAliasCensus> {
+        None
     }
 
     /// Where guest RAM lives in this process, as stable spans held for the VM's
@@ -691,6 +707,8 @@ pub struct FakeHost {
     pub stable_map_pages: bool,
     /// Number of HostOps page-import attempts (test proxy for import amplification).
     pub map_pages_calls: u64,
+    /// Number of page views the runtime explicitly retired.
+    pub unmap_pages_calls: u64,
     /// Half-open GPA ranges this host reports as **not** guest RAM, so a test
     /// can model device memory — a PCI BAR — and not only mapped vs unmapped.
     ///
@@ -1615,6 +1633,7 @@ impl HostOps for FakeHost {
     }
 
     fn unmap_pages(&mut self, ptr: usize, len: usize) {
+        self.unmap_pages_calls += 1;
         // A bounce view is a heap copy on every platform, so it is released the
         // same way on every platform — and it must be checked first, because
         // handing one to `mach_vm_deallocate` would free memory Mach never

@@ -53,7 +53,7 @@ OUT=""
 GUEST="${GUEST:-macos-vm}"
 FAILLOG="${REIMS_FAIL_LOG:-/tmp/reims-vgpu-fail.log}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-SHOT="$REPO_ROOT/scripts/screenshot-when-kde-plasma-host/screenshot-when-kde-plasma-host.sh"
+SHOT="$REPO_ROOT/scripts/screenshot/screenshot.sh"
 # The x86 boot's stable per-boot symlink; the drag rides `input-send-event`
 # through it. See scripts/qmp/README.md — the arm64 default does not apply here.
 QMP_SOCK="${QMP_SOCK:-$REPO_ROOT/vm/disks/run/qmp.sock}"

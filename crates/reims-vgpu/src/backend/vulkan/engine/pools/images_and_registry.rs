@@ -87,7 +87,7 @@ impl ResourcePools {
                         height: key.height.max(1),
                         depth: 1,
                     })
-                    .mip_levels(1)
+                    .mip_levels(key.mip_levels.max(1))
                     .array_layers(1)
                     .samples(vk::SampleCountFlags::TYPE_1)
                     .tiling(vk::ImageTiling::OPTIMAL)
@@ -154,6 +154,25 @@ impl ResourcePools {
                 ctx.device.destroy_image(image, None);
                 DrawError::VkCall(VkCall::new(VkOp::PoolsBindStorageImage, e))
             })?;
+        // A guest format whose channels do not sit identically on its Vulkan
+        // format samples through a component mapping instead of being rewritten
+        // on the CPU. Only a *sampled* view may carry one: Vulkan requires the
+        // identity mapping on a storage-image view, and no format admitted to
+        // that role has a non-identity plan, so a storage key that somehow named
+        // one is a contradiction and is refused rather than built.
+        let plan = translate::pixel::storage_image_components(key.format);
+        let components = if key.sampled_only {
+            translate::pixel::vk_component_mapping(&plan)
+        } else {
+            if !crate::contract::pixel_format::swizzle_is_identity(&plan) {
+                ctx.device.free_memory(memory, None);
+                ctx.device.destroy_image(image, None);
+                return Err(DrawError::Unsupported(
+                    reason::DrawReason::StorageImageNeedsComponentMapping { format: key.format },
+                ));
+            }
+            translate::pixel::vk_component_mapping(&plan)
+        };
         let view = ctx
             .device
             .create_image_view(
@@ -161,7 +180,10 @@ impl ResourcePools {
                     .image(image)
                     .view_type(vk::ImageViewType::TYPE_2D)
                     .format(format)
-                    .subresource_range(color_subresource_range()),
+                    .components(components)
+                    .subresource_range(super::super::color_subresource_range_levels(
+                        key.mip_levels,
+                    )),
                 None,
             )
             .map_err(|e| {
@@ -565,16 +587,35 @@ impl ResourcePools {
         self.set_compute_sole_copy(identity, false)
     }
 
-    /// Pin/unpin a resident against LRU eviction (deferred-writeback content
-    /// whose only copy is the GPU image). No-op for an absent identity.
+    /// Pin/unpin a resident against removal while its content exists nowhere but
+    /// the GPU image. Answers whether a slot was there to pin.
+    ///
+    /// The bool exists for the same reason [`Self::pin_resident_target`]'s does:
+    /// the guest-write ledger records the pins it actually took, so a release can
+    /// never be handed out for a pin that was never taken. An absent identity is
+    /// not an error — there is then no image for anything to remove.
+    ///
+    /// # What this holds that `gpu_only_content` does not
+    ///
+    /// Both reclaim paths already skip a sole-copy resident, so a dispatch's own
+    /// output is safe from *allocation-pressure recovery* without any pin. The
+    /// window this closes is the other removal: a re-key.
+    /// [`Self::acquire_resident_storage_image`] destroys the held image when the
+    /// same identity arrives at a different shape, and
+    /// [`Self::compute_rekey_refusal`] is what stops it — and that refusal reads
+    /// `pinned`, nothing else. A compute writeback copying straight into guest
+    /// pages is submitted and not waited, so between the submit and the fence a
+    /// re-shaped dispatch would hand the queue a destroyed image.
     pub(crate) fn pin_resident_storage(
         &mut self,
         identity: &ComputeStorageResidencyKey,
         pinned: bool,
-    ) {
+    ) -> bool {
         if let Some(resident) = self.compute_storage_registry.get_mut(identity) {
             resident.pinned = pinned;
+            return true;
         }
+        false
     }
 
     /// Generation of a resident compute storage image, if one is registered.
@@ -732,7 +773,11 @@ impl ResourcePools {
         if slot.format.allocation() == format {
             return Ok(Some(slot.view));
         }
-        if let Some((_, view)) = slot.alternate_views.iter().find(|(held, _)| *held == format) {
+        if let Some((_, view)) = slot
+            .alternate_views
+            .iter()
+            .find(|(held, _)| *held == format)
+        {
             return Ok(Some(*view));
         }
         let view = unsafe {
@@ -988,10 +1033,9 @@ impl ResourcePools {
                 // not is exactly the case the fast path must *not* take: the
                 // framebuffer it would hand back was built over the previous
                 // interpretation's view.
-                let attachment = unsafe {
-                    self.registry_view(ctx, &identity, format.declared(), counters)?
-                }
-                .expect("the slot reused on the line above is still registered");
+                let attachment =
+                    unsafe { self.registry_view(ctx, &identity, format.declared(), counters)? }
+                        .expect("the slot reused on the line above is still registered");
                 let slot = self.registry.get(&identity).unwrap();
                 if slot.framebuffer_compatibility == Some(framebuffer_compatibility)
                     && slot.format == format
@@ -1259,8 +1303,7 @@ impl ResourcePools {
                         }
                         ResidentMemory::GuestImported { guest } => {
                             ctx.device.destroy_image(image, None);
-                            if let Some(parent) =
-                                self.host_ram_imports.release_child(&guest.import)
+                            if let Some(parent) = self.host_ram_imports.release_child(&guest.import)
                             {
                                 parent.destroy(&ctx.device);
                             }
@@ -1383,10 +1426,9 @@ impl ResourcePools {
                     .gpu_load_hits
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let image = slot.image;
-                let view = unsafe {
-                    self.registry_view(ctx, &identity, format.declared(), counters)?
-                }
-                .expect("the slot reused on the line above is still registered");
+                let view =
+                    unsafe { self.registry_view(ctx, &identity, format.declared(), counters)? }
+                        .expect("the slot reused on the line above is still registered");
                 return Ok((image, view));
             }
             // Geometry / gen / allocation mismatch → destroy and recreate.
@@ -1753,8 +1795,9 @@ impl ResourcePools {
             crate::runtime::drain::note_store_route("adhoc_fb_hit");
             return Ok(*fb);
         }
-        let fb =
-            unsafe { self.create_mrt_framebuffer(ctx, render_pass, views, width, height, counters) }?;
+        let fb = unsafe {
+            self.create_mrt_framebuffer(ctx, render_pass, views, width, height, counters)
+        }?;
         crate::runtime::drain::note_store_route("adhoc_fb_miss");
         self.ad_hoc_framebuffers.insert(key, fb);
         Ok(fb)
@@ -2134,6 +2177,24 @@ impl ResourcePools {
     /// count of 320 costs. 320 slots is 5 MiB of 16x16 scratch or 10 GiB of 4K.
     fn non_pinned_registry_bytes(&self) -> u64 {
         self.registry_non_pinned.bytes
+    }
+
+    /// Instantaneous registry populations for the once-per-second census.
+    pub(crate) fn registry_levels(&self) -> RegistryLevels {
+        let mut levels = RegistryLevels::default();
+        for slot in self.registry.values() {
+            let bytes = Self::slot_attachment_bytes(slot);
+            levels.current.count += 1;
+            levels.current.bytes += bytes;
+            if slot.pin_count != 0 {
+                levels.pinned.count += 1;
+                levels.pinned.bytes += bytes;
+            } else if !slot.gpu_only_content {
+                levels.recoverable.count += 1;
+                levels.recoverable.bytes += bytes;
+            }
+        }
+        levels
     }
 
     /// One slot's contribution to [`Self::non_pinned_registry_bytes`].
@@ -2674,6 +2735,51 @@ pub(super) mod pin_count_tests {
         }
     }
 
+    #[test]
+    fn registry_levels_separate_recoverable_pinned_and_sole_copy_residents() {
+        let mut pools = ResourcePools::new();
+        for id in 1..=3 {
+            let identity = TargetIdentity::Surface {
+                id,
+                width: 16,
+                height: 16,
+                generation: 0,
+                format: translate::pixel::SCANOUT_FORMAT,
+            };
+            let mut slot = dummy_slot(true);
+            if id == 2 {
+                slot.pin_count = 1;
+            }
+            if id == 3 {
+                slot.gpu_only_content = true;
+            }
+            pools.registry.insert(identity, slot);
+        }
+
+        let levels = pools.registry_levels();
+        assert_eq!(
+            levels.current,
+            NonPinnedTotals {
+                count: 3,
+                bytes: 3072
+            }
+        );
+        assert_eq!(
+            levels.recoverable,
+            NonPinnedTotals {
+                count: 1,
+                bytes: 1024
+            }
+        );
+        assert_eq!(
+            levels.pinned,
+            NonPinnedTotals {
+                count: 1,
+                bytes: 1024
+            }
+        );
+    }
+
     /// The window presenter blits a resident with no format conversion and no
     /// source scaling, so every one of these four conditions is load-bearing.
     ///
@@ -2969,7 +3075,7 @@ pub(super) mod pin_count_tests {
     fn new_resident(framebuffer: vk::Framebuffer, render_pass: vk::RenderPass) -> NewResident {
         let framebuffer_compatibility = (framebuffer != vk::Framebuffer::null()).then(|| {
             crate::backend::vulkan::engine::caches::PassKey::single(
-                false,
+                crate::backend::vulkan::engine::caches::Color0Load::Clear,
                 translate::pixel::SCANOUT_FORMAT,
             )
             .framebuffer_compatibility()
@@ -3787,7 +3893,11 @@ pub(super) mod pin_count_tests {
             "clock still advances when throttled"
         );
         assert!(pools.plan_idle_maintenance(t0 + MAINTENANCE_INTERVAL_MS));
-        assert_eq!(pools.registry.len(), 2, "maintenance owns no live residents");
+        assert_eq!(
+            pools.registry.len(),
+            2,
+            "maintenance owns no live residents"
+        );
     }
 
     /// A maintenance pass cannot shrink a live registry, regardless of its size.
@@ -3837,9 +3947,15 @@ pub(super) mod pin_count_tests {
         }
         // Uploads stop: the gate reopens after the usual consecutive passes.
         for _ in 0..(SETTLED_PASSES_FOR_BUFFER_TRIM - 1) {
-            assert!(!pools.note_maintenance_settled(), "counter restarted from zero");
+            assert!(
+                !pools.note_maintenance_settled(),
+                "counter restarted from zero"
+            );
         }
-        assert!(pools.note_maintenance_settled(), "settled once uploads stopped");
+        assert!(
+            pools.note_maintenance_settled(),
+            "settled once uploads stopped"
+        );
     }
 
     /// The HOST_VISIBLE buffer trim gate: only permitted after
@@ -3861,12 +3977,21 @@ pub(super) mod pin_count_tests {
         assert!(pools.note_maintenance_settled(), "stays settled");
         // Upload activity resets the counter.
         pools.staging_hits += 1;
-        assert!(!pools.note_maintenance_settled(), "uploads reset settled state");
+        assert!(
+            !pools.note_maintenance_settled(),
+            "uploads reset settled state"
+        );
         // …and the gate stays closed until the run rebuilds.
         for _ in 0..(SETTLED_PASSES_FOR_BUFFER_TRIM - 1) {
-            assert!(!pools.note_maintenance_settled(), "counter restarted from zero");
+            assert!(
+                !pools.note_maintenance_settled(),
+                "counter restarted from zero"
+            );
         }
-        assert!(pools.note_maintenance_settled(), "settled again after rebuild");
+        assert!(
+            pools.note_maintenance_settled(),
+            "settled again after rebuild"
+        );
     }
 
     /// The presented target passed as `display` is stamped to the current clock

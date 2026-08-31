@@ -277,13 +277,14 @@ pub fn capture_present_frame(
     // path — kb tahoe-x86-host-reims_vgpu §8.5); otherwise the resident below.
     // There is no guest-page fallback any more — see the note at the resident
     // capture for why it was deleted rather than kept as a second vein.
-    let from_host_cache =
-        if let Some(cached) = crate::runtime::surface_cache::get(state, mapping_id, width, height) {
-            buf.copy_from_slice(cached);
-            true
-        } else {
-            false
-        };
+    let from_host_cache = if let Some(cached) =
+        crate::runtime::surface_cache::get(state, mapping_id, width, height)
+    {
+        buf.copy_from_slice(cached);
+        true
+    } else {
+        false
+    };
     // Resident-direct capture — the ONLY GPU-content capture source.
     //
     // The proxies need the finished frame's BYTES; they do not need those bytes
@@ -346,7 +347,7 @@ pub fn capture_present_frame(
     // about the contract. It is gone rather than re-tuned: a peer below the
     // threshold was invisible, so the field could not answer the question it
     // looked like it was answering.
-    if crate::observe::draw_log_enabled() {
+    crate::observe::when_verbose(|| {
         let (nz, maxb, rgb_nz, max_rgb, px0) = crate::observe::bgra_present_stats(&buf);
         crate::observe::line(format!(
             "present_capture mid={mapping_id} {width}x{height} gen={generation} src={src} host_cache={} rgb_nz={rgb_nz} max_rgb={max_rgb} byte_nz={nz} byte_max={maxb} px0=[{},{},{},{}] present_mapping={} frame_mapping={} frame_flush={}",
@@ -359,7 +360,7 @@ pub fn capture_present_frame(
             state.present.frame_mapping,
             state.present.frame_flush_seen as u8,
         ));
-    }
+    });
     // Publish the new frame and recycle the old retain buffer as the next
     // capture scratch (warm 8 MiB alloc, no per-present malloc/free/zero).
     let old_frame = std::mem::replace(&mut state.present.frame_bgra, buf);
@@ -504,7 +505,7 @@ pub fn copy_to_bgra8<M: HostMemory + crate::runtime::host::HostOps>(
             // REIMS_VGPU_DRAW_LOG: a normal boot pays neither the scan nor the flood.
             // The always-on present rate/occupancy signal lives in the
             // `present_proxy` summary.
-            if crate::observe::draw_log_enabled() {
+            crate::observe::when_verbose(|| {
                 let (nz, maxb, rgb_nz, max_rgb, px0) =
                     crate::observe::bgra_present_stats(&state.present.frame_bgra);
                 crate::observe::line(format!(
@@ -515,7 +516,7 @@ pub fn copy_to_bgra8<M: HostMemory + crate::runtime::host::HostOps>(
                     "present_paint Painted mid={shown_mid} (action mid={mapping_id} gen={expected_generation}) {width}x{height} rgb_nz={rgb_nz} max_rgb={max_rgb} px0=[{},{},{},{}] (this is what QMP shows)",
                     px0[0], px0[1], px0[2], px0[3]
                 ));
-            }
+            });
             state.present.valid = true;
             state.present.width = width;
             state.present.height = height;
@@ -1337,3 +1338,487 @@ pub fn early_scanout_target(state: &DeviceState) -> Option<(u32, u32, u32, u32)>
 
 #[cfg(test)]
 mod tests;
+
+/// Fractions of the frame that a settled macOS desktop paints with wallpaper:
+/// outside every restored window, and clear of the menu bar and the dock.
+///
+/// Fractions rather than pixels so one set describes any presented geometry;
+/// the same four are what the host-side grader crops, so a device record and a
+/// screenshot verdict can be read against each other without a scale factor.
+const FIELD_PATCHES: [(f32, f32); 4] = [(0.10, 0.22), (0.10, 0.72), (0.90, 0.22), (0.90, 0.72)];
+
+/// Texels per side of each sampled patch. 4 x 8 x 8 texels is the whole cost of
+/// this witness.
+const FIELD_PATCH_SIDE: u32 = 8;
+
+/// The last field pattern reported for each presented plane, so the witness can
+/// report a change rather than a sample. Keyed by mapping id: two planes of one
+/// swap chain hold different frames and a shared slot would report every
+/// alternation between them as a change.
+static FIELD_WITNESS_LAST: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<u32, u32>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Presents between samples once the power-of-two spacing has opened up.
+const FIELD_WITNESS_STRIDE: u64 = 64;
+
+/// What one background patch of the presented plane's guest pages holds.
+///
+/// The three that are not `Painted` are all fields nothing composited into, and
+/// they are kept apart because they say different things about who left them:
+/// `Black` is guest memory in the state the guest allocated it, `White` is
+/// something that wrote `0xff` over it, and `Flat` is a uniform colour that is
+/// neither.
+fn field_patch_verdict(mean: f32, sd: f32) -> &'static str {
+    if sd >= 12.0 {
+        "painted"
+    } else if mean > 200.0 {
+        "white"
+    } else if mean < 40.0 {
+        "black"
+    } else {
+        "flat"
+    }
+}
+
+/// The last field pattern reported for each large sampled surface, so the
+/// witness below reports a change rather than a sample.
+static SAMPLED_FIELD_LAST: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<(u32, u64), u64>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Texels of a sampled surface below which it is not worth asking this
+/// question. The subject is a full-screen compositor layer; a glyph atlas or an
+/// icon is a different population and there are thousands of them per frame.
+const SAMPLED_FIELD_MIN_TEXELS: u64 = 1 << 20;
+
+/// What a large sampled surface's own guest pages hold at the moment a draw
+/// binds it.
+///
+/// [`note_present_field_witness`] answers the same question for the plane a
+/// present names, which says what the composite *produced*. This says what the
+/// composite *read*, and the two together separate a composite that published a
+/// blank field from one that faithfully published a blank source: a full-screen
+/// desktop layer whose own pages are uniform cannot produce a painted plane, and
+/// a painted source under a uniform plane moves the question to the pass.
+///
+/// The mean is over every byte of the texel rather than over three colour bytes,
+/// because these surfaces are not all four-byte colour — the wallpaper layer on
+/// this rail is `RGBA16Float` — and "is this uniform `0xff`" is answerable in
+/// any layout while "what colour is it" is not. The first texel's bytes ride
+/// along so a uniform field names the byte that filled it.
+///
+/// Reads guest pages and settles nothing, for [`note_present_field_witness`]'s
+/// reason: settling here would make the instrument cause the visibility it is
+/// trying to observe.
+pub fn note_sampled_surface_field<M: HostMemory>(
+    state: &DeviceState,
+    host: &M,
+    mapping_id: u32,
+    texture_ref: u32,
+    route: &str,
+) {
+    let Some(window) = SampledFieldWindow::of_mapping(state, mapping_id) else {
+        return;
+    };
+    note_sampled_surface_field_window(state, host, mapping_id, texture_ref, route, window);
+}
+
+/// The texels a sampled bind reads out of one mapping, and where they sit in it.
+///
+/// A whole-surface bind takes its window from the mapping's own declared
+/// geometry. A serialized view over one plane of a multiplanar surface cannot:
+/// the mapping declares the surface's FourCC and the surface's height, and the
+/// plane the bind names has its own format, extent and offset. Handing the
+/// witness a window instead of a mapping is what lets both say what they read
+/// through the same code, and it is why the video planes were silently absent
+/// from this record -- a FourCC has no `bytes_per_pixel` and the mapping-derived
+/// path gave up before it sampled anything.
+#[derive(Clone, Copy)]
+pub struct SampledFieldWindow {
+    /// Texels across, in the bind's own view.
+    pub width: u32,
+    /// Texels down, in the bind's own view.
+    pub height: u32,
+    /// The format these texels are in, for the record rather than for the read.
+    pub format: u32,
+    /// Byte offset of the first texel within the mapping.
+    pub base_off: u64,
+    /// Bytes per row.
+    pub bpr: u32,
+    /// Bytes per texel.
+    pub bpp: u32,
+}
+
+impl SampledFieldWindow {
+    /// The window a whole-surface bind reads: the mapping's own geometry.
+    pub fn of_mapping(state: &DeviceState, mapping_id: u32) -> Option<Self> {
+        let (width, height, format) = state.mappings.get(&mapping_id).and_then(|m| {
+            (m.has_geom && m.mapped)
+                .then_some((m.width, m.height, m.format))
+                .filter(|(_, _, f)| *f != 0)
+        })?;
+        let bpp = pixel_format::bytes_per_pixel(format)?;
+        let (base_off, bpr, _) = state.mappings.get(&mapping_id).and_then(|m| {
+            crate::runtime::mapping_write::type11_sample_window(m, width, height, format)
+        })?;
+        Some(Self {
+            width,
+            height,
+            format: u32::from(format),
+            base_off,
+            bpr,
+            bpp,
+        })
+    }
+}
+
+/// [`note_sampled_surface_field`] over an explicitly named window, for a bind
+/// whose texels are not the mapping's own geometry.
+pub fn note_sampled_surface_field_window<M: HostMemory>(
+    state: &DeviceState,
+    host: &M,
+    mapping_id: u32,
+    texture_ref: u32,
+    route: &str,
+    window: SampledFieldWindow,
+) {
+    let SampledFieldWindow {
+        width,
+        height,
+        format,
+        base_off,
+        bpr,
+        bpp,
+    } = window;
+    if mapping_id == 0 || u64::from(width) * u64::from(height) < SAMPLED_FIELD_MIN_TEXELS {
+        return;
+    }
+    let page_shift = state.page_shift;
+    let Some(gpas) = state.mappings.get(&mapping_id).map(|m| {
+        m.page_entries
+            .iter()
+            .filter_map(|&e| crate::contract::iosurface_pages::entry_gpa_shift(e, page_shift))
+            .collect::<Vec<u64>>()
+    }) else {
+        return;
+    };
+    if gpas.is_empty() {
+        return;
+    }
+    let page = state.page_size();
+    let read = bpp.min(4) as usize;
+    let mut report = String::new();
+    let mut first_texel = String::new();
+    let mut verdicts: Vec<u8> = Vec::with_capacity(FIELD_PATCHES.len());
+    for (i, (fx, fy)) in FIELD_PATCHES.iter().enumerate() {
+        let cx = (width as f32 * fx) as u32;
+        let cy = (height as f32 * fy) as u32;
+        let x0 = cx.saturating_sub(FIELD_PATCH_SIDE / 2).min(width - 1);
+        let y0 = cy.saturating_sub(FIELD_PATCH_SIDE / 2).min(height - 1);
+        let mut samples = [0f32; (FIELD_PATCH_SIDE * FIELD_PATCH_SIDE) as usize];
+        let mut n = 0usize;
+        for dy in 0..FIELD_PATCH_SIDE {
+            for dx in 0..FIELD_PATCH_SIDE {
+                let (x, y) = (x0 + dx, y0 + dy);
+                if x >= width || y >= height {
+                    continue;
+                }
+                let off = base_off + u64::from(y) * u64::from(bpr) + u64::from(x) * u64::from(bpp);
+                let Some(&gpa) = gpas.get((off / page) as usize) else {
+                    continue;
+                };
+                let mut texel = [0u8; 4];
+                if host
+                    .read_gpa(gpa + (off % page), &mut texel[..read])
+                    .is_err()
+                {
+                    continue;
+                }
+                if first_texel.is_empty() {
+                    first_texel = texel[..read].iter().map(|b| format!("{b:02x}")).collect();
+                }
+                samples[n] = texel[..read].iter().map(|b| f32::from(*b)).sum::<f32>() / read as f32;
+                n += 1;
+            }
+        }
+        if n == 0 {
+            continue;
+        }
+        let mean = samples[..n].iter().sum::<f32>() / n as f32;
+        let sd = (samples[..n].iter().map(|v| (v - mean).powi(2)).sum::<f32>() / n as f32).sqrt();
+        let verdict = field_patch_verdict(mean, sd);
+        verdicts.push(verdict.as_bytes()[0]);
+        if i != 0 {
+            report.push(',');
+        }
+        report.push_str(&format!("{verdict}:{mean:.0}/{sd:.0}"));
+    }
+    if verdicts.is_empty() {
+        return;
+    }
+    let pattern = verdicts
+        .iter()
+        .fold(0u64, |acc, v| (acc << 8) | u64::from(*v));
+    let changed = {
+        let mut last = SAMPLED_FIELD_LAST
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        last.insert((mapping_id, base_off), pattern) != Some(pattern)
+    };
+    if !changed {
+        return;
+    }
+    // The draws that went into this surface since the last change of its field,
+    // for [`note_present_field_witness`]'s reason and drained the same way: a
+    // full-screen layer that turns uniform is either a pass that produced a
+    // uniform result or a surface nothing drew into, and the ring is what
+    // separates them. These layers are not the plane a present names, so the
+    // present witness never drains their rings and nothing else does either.
+    #[cfg(feature = "backend-vulkan")]
+    let ring = crate::runtime::draw::read_plane_draw_ring(
+        crate::runtime::draw::PlaneDrawReader::PresentedPlane,
+        mapping_id,
+    )
+    .to_string();
+    #[cfg(not(feature = "backend-vulkan"))]
+    let ring = String::new();
+    crate::observe::off(format!(
+        "sampled_surface_field mid={mapping_id} ref={texture_ref} {width}x{height} \
+         fmt={format:#x} off={base_off:#x} bpr={bpr} route={route} patches=[{report}] \
+         first=0x{first_texel}{ring} (guest pages, no settle)"
+    ));
+}
+
+/// The presented plane's own guest pages, sampled in the desktop background
+/// field, as a witness independent of the frame the host window shows.
+///
+/// The presented frame comes from the host surface cache or the GPU resident
+/// and never from guest pages ([`capture_present_frame`]), so the guest's copy
+/// of the same plane is the one reading that can say which of the two holds a
+/// blank field. On this rail a boot's background is sometimes the union of the
+/// compositor's damage rectangles over a uniform field nothing wrote; guest
+/// pages blank means the guest composited that field, and guest pages painted
+/// means this device presented something the guest's own copy did not contain.
+/// Nothing else on any channel separates those two.
+///
+/// **Reads texels and settles nothing.** The obvious instrument — reading the
+/// whole mapping through [`read_mapping_bgra8`] — pays a writeback settle, and
+/// landing deferred work into these pages is one of the repairs a blank field
+/// could need, so that instrument would report the frame it had just fixed.
+/// This walks the page list and reads the patches directly.
+///
+/// The mean is taken over the three colour bytes and skips byte 3, which is
+/// alpha in both BGRA8 and RGBA8 — so the reading does not depend on which of
+/// the two the plane declares, and no channel order has to be resolved here.
+pub fn note_present_field_witness<M: HostMemory>(
+    state: &mut DeviceState,
+    host: &M,
+    mapping_id: u32,
+    width: u32,
+    height: u32,
+) {
+    if mapping_id == 0 || !scanout_extent_ok(width, height) {
+        return;
+    }
+    // Sampled on every present, reported only when the answer changes.
+    //
+    // The defect this exists for is a *transition*: the plane's field is black
+    // for the whole early boot, then one composite makes it wallpaper or makes
+    // it a uniform 0xff field, and it never moves again. A heartbeat can only
+    // bracket that moment by however wide its spacing happens to be, and the
+    // spacing that keeps a heartbeat cheap is exactly what makes the bracket
+    // useless — the first sighting of the white field sat 7 000 presents after
+    // the last sighting of the black one. Emitting on change costs the same 256
+    // texel reads and names the present itself.
+    //
+    // The heartbeat is kept beside it so a field that never changes still says
+    // so, and so a reader can tell "nothing changed" from "nothing looked".
+    // Power-of-two spacing for the early boot, and a fixed stride after it.
+    // Power-of-two alone is readable from the first present onward and bounded
+    // by log2 of the present count (`maybe_log_capture_sampling`'s reason), but
+    // it is the wrong shape for this question: the defect is a property of the
+    // *settled* desktop, and by then the gaps are thousands of presents wide, so
+    // the one window that matters gets one or two samples. The stride restores a
+    // steady rate there and costs a bounded ~1 line/s at this rail's present
+    // rate.
+    let seq = state.present.present_epoch.saturating_add(1);
+    let heartbeat = seq.is_power_of_two() || seq.is_multiple_of(FIELD_WITNESS_STRIDE);
+    let Some((window, format, map_gen, epoch)) = state.mappings.get(&mapping_id).map(|m| {
+        let format = if m.format == 0 {
+            pixel_format::MTL_FORMAT_BGRA8_UNORM
+        } else {
+            m.format
+        };
+        (
+            crate::runtime::mapping_write::type11_sample_window(m, width, height, format),
+            format,
+            m.map_generation,
+            m.surface_content_epoch,
+        )
+    }) else {
+        return;
+    };
+    let Some((base_off, bpr, _)) = window else {
+        return;
+    };
+    let Some(bpp) = pixel_format::bytes_per_pixel(format) else {
+        return;
+    };
+    // The page list as it already stands, never a resolve. `mapping_page_gpas`
+    // would revalidate first, and a revalidate can run a resolve — which is a
+    // decision this witness would then have caused rather than observed. A
+    // mapping whose pages are not resolved at this present is simply not
+    // sampled; that is a gap in the record and not a change to the device.
+    let page_shift = state.page_shift;
+    let Some(gpas) = state
+        .mappings
+        .get(&mapping_id)
+        .filter(|m| m.mapped)
+        .map(|m| {
+            m.page_entries
+                .iter()
+                .filter_map(|&e| crate::contract::iosurface_pages::entry_gpa_shift(e, page_shift))
+                .collect::<Vec<u64>>()
+        })
+    else {
+        return;
+    };
+    if gpas.is_empty() {
+        return;
+    }
+    let page = state.page_size();
+    let mut report = String::new();
+    let mut blank = 0u32;
+    let mut verdicts: Vec<u8> = Vec::with_capacity(FIELD_PATCHES.len());
+    for (i, (fx, fy)) in FIELD_PATCHES.iter().enumerate() {
+        let cx = (width as f32 * fx) as u32;
+        let cy = (height as f32 * fy) as u32;
+        let x0 = cx.saturating_sub(FIELD_PATCH_SIDE / 2).min(width - 1);
+        let y0 = cy.saturating_sub(FIELD_PATCH_SIDE / 2).min(height - 1);
+        let mut texels = [0f32; (FIELD_PATCH_SIDE * FIELD_PATCH_SIDE) as usize];
+        let mut n = 0usize;
+        for dy in 0..FIELD_PATCH_SIDE {
+            for dx in 0..FIELD_PATCH_SIDE {
+                let (x, y) = (x0 + dx, y0 + dy);
+                if x >= width || y >= height {
+                    continue;
+                }
+                let off = base_off + u64::from(y) * u64::from(bpr) + u64::from(x) * u64::from(bpp);
+                let Some(&gpa) = gpas.get((off / page) as usize) else {
+                    continue;
+                };
+                let mut texel = [0u8; 4];
+                if host.read_gpa(gpa + (off % page), &mut texel).is_err() {
+                    continue;
+                }
+                texels[n] = (f32::from(texel[0]) + f32::from(texel[1]) + f32::from(texel[2])) / 3.0;
+                n += 1;
+            }
+        }
+        if n == 0 {
+            continue;
+        }
+        let mean = texels[..n].iter().sum::<f32>() / n as f32;
+        let sd = (texels[..n].iter().map(|v| (v - mean).powi(2)).sum::<f32>() / n as f32).sqrt();
+        // The same reading the host-side grader takes: a field nothing wrote is
+        // uniform as well as bright, and uniformity is what separates it from a
+        // pale wallpaper. Uniform-and-dark is equally a field nothing wrote, so
+        // the count is of unpainted patches and the verdict names which kind.
+        let verdict = field_patch_verdict(mean, sd);
+        verdicts.push(verdict.as_bytes()[0]);
+        if verdict != "painted" {
+            blank += 1;
+        }
+        if i != 0 {
+            report.push(',');
+        }
+        report.push_str(&format!("{verdict}:{mean:.0}/{sd:.0}"));
+    }
+    // The four verdicts as one word, so "did this plane's field change" is a
+    // comparison and not a string diff.
+    let pattern = verdicts
+        .iter()
+        .fold(0u32, |acc, v| (acc << 8) | u32::from(*v));
+    let changed = {
+        let mut last = FIELD_WITNESS_LAST
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        last.insert(mapping_id, pattern) != Some(pattern)
+    };
+    if !changed && !heartbeat {
+        return;
+    }
+    // On every change, not only on a change into a uniform field.
+    //
+    // Restricting it to uniform fields was meant to protect the ring from being
+    // drained by the ordinary black-to-wallpaper transition, but that
+    // transition is half the measurement: the question the ring exists to
+    // answer is whether the pass that paints the wallpaper and the pass that
+    // paints the flat field are the *same* pass, and the wallpaper transition is
+    // the only place the first one can be seen. Draining is not a loss here --
+    // the ring refills from the next frame's draws.
+    //
+    // Drained on the heartbeat as well, and this is the half of the record that
+    // decides between the two live readings of the white field. A plane that
+    // goes uniform white and stays that way produces no further change, so a
+    // change-only drain says nothing at all about the interval that matters --
+    // exactly the interval in which the defect is resident. On the heartbeat
+    // the drain answers, every stride: `draws=0` means the guest stopped
+    // compositing into this plane, and a non-zero count against an unchanged
+    // uniform field means the guest kept drawing and this device did not
+    // publish it. Those have opposite repairs and no other record separates
+    // them.
+    #[cfg(feature = "backend-vulkan")]
+    let ring = crate::runtime::draw::read_plane_draw_ring(
+        crate::runtime::draw::PlaneDrawReader::SampledLayer,
+        mapping_id,
+    )
+    .to_string();
+    // The ring is filled by the Vulkan draw encode; there is no such record on
+    // the Metal arm, so the field is simply absent there rather than empty.
+    #[cfg(not(feature = "backend-vulkan"))]
+    let ring = String::new();
+    // What the outstanding-write ledger says about the very pages just read.
+    //
+    // This witness reads guest pages without settling, which is deliberate --
+    // settling here would make the instrument cause the visibility it is trying
+    // to observe. But that also means a uniform field is two different findings
+    // wearing one number, and the whole blank-field investigation turns on which
+    // one it is:
+    //
+    // * `Overlap` -- a writeback is in flight into these pages. The bytes read
+    //   are then simply pre-write bytes, and the field being uniform says
+    //   nothing about what the guest composited. The question moves to whether
+    //   whatever presents this plane settles before it reads.
+    // * `Disjoint` -- nothing outstanding lands here at all. The stores this
+    //   boot records are landing in some other page set, so the plane being
+    //   published and the plane being presented are not the same pages.
+    // * `Unnamed` -- the ledger overflowed or raced and cannot say. Not evidence
+    //   either way, and counted separately so it cannot be read as `Disjoint`.
+    //
+    // Those three have different repairs, and no record on this rail separated
+    // them: a plane that reads uniform white with 409 stores publishing into it
+    // is consistent with all three.
+    #[cfg(feature = "backend-vulkan")]
+    let reach = format!(
+        " write_reach={:?}",
+        crate::backend::vulkan::engine::guest_writes_reaching(&gpas)
+    );
+    #[cfg(not(feature = "backend-vulkan"))]
+    let reach = String::new();
+    // The page span, so a store record naming its destination and this record
+    // naming the presented plane can be compared without either having to know
+    // about the other. First and last of the mapping's own order, not of the
+    // sorted set: that is the order the window's offsets index.
+    let span = match (gpas.first(), gpas.last()) {
+        (Some(f), Some(l)) => format!(" pages={} first={f:#x} last={l:#x}", gpas.len()),
+        _ => String::new(),
+    };
+    crate::observe::off(format!(
+        "present_field_witness mid={mapping_id} {width}x{height} map_gen={map_gen} \
+         epoch={epoch} seq={seq} why={} unpainted={blank}/4 patches=[{report}]{ring}\
+         {reach}{span} (guest pages, no settle)",
+        if changed { "changed" } else { "heartbeat" }
+    ));
+}

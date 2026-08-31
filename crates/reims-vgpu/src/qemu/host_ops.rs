@@ -7,9 +7,31 @@
 
 use crate::runtime::host::{
     GuestRamRegionsError, HostAction, HostActionKind, HostMemory, HostOps, MemError,
+    PageAliasCensus,
 };
 use std::collections::VecDeque;
 use std::os::raw::{c_int, c_void};
+
+const MAP_PAGES_FAILURE_NONE: u32 = 0;
+const MAP_PAGES_FAILURE_RESERVATION: u32 = 1;
+const MAP_PAGES_FAILURE_ALIAS: u32 = 2;
+const MAP_PAGES_FAILURE_INVALID_GUEST_PAGE: u32 = 3;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ReimsVgpuMapPagesFailure {
+    pub(crate) stage: u32,
+    pub(crate) host_errno: i32,
+    pub(crate) page_index: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MapPagesFailure {
+    ReservationFailed { host_errno: i32 },
+    AliasFailed { page_index: u64, host_errno: i32 },
+    InvalidGuestPage { page_index: u64 },
+    Unspecified { stage: u32, host_errno: i32 },
+}
 
 /// Versioned host callback table offered by QEMU C to Rust.
 ///
@@ -44,6 +66,7 @@ pub struct ReimsVgpuHostOps {
             gpas: *const u64,
             count: usize,
             out_ptr: *mut *mut c_void,
+            failure: *mut ReimsVgpuMapPagesFailure,
         ) -> i32,
     >,
     pub unmap_pages: Option<unsafe extern "C" fn(ctx: *mut c_void, ptr: *mut c_void, len: usize)>,
@@ -68,17 +91,13 @@ pub struct ReimsVgpuHostOps {
     /// thread. Distinct from `schedule_bh` (drain-worker wake): prompt actions
     /// (IRQ pulses, cursor moves) must be deliverable mid-drain.
     pub notify_actions: Option<unsafe extern "C" fn(ctx: *mut c_void)>,
-    /// 1 when `map_pages` owes no release: the pointer is guest RAM itself and
-    /// stays valid for the device lifetime, so a caller may hold it
-    /// indefinitely and `unmap_pages` has nothing to free.
+    /// 1 when a `map_pages` result remains valid until its matching
+    /// `unmap_pages` call, so a caller may retain it in a GPU import.
     ///
-    /// The two shims answer differently and the difference is real. x86 PCI
-    /// answers **1**: a contiguous run is the RAMBlock pointer, while a
-    /// fragmented list becomes a retained packed alias over the shared RAM
-    /// backing; both live until device teardown. arm MMIO answers **0**: a
-    /// contiguous run gets the direct HVA, but a fragmented one gets a packed
-    /// `mach_vm_remap` view with caller-owned lifetime, and a bare pointer
-    /// cannot say which it is.
+    /// x86 answers **1**: direct RAMBlock pointers remain borrowed, while a
+    /// fragmented list's packed alias remains valid until explicit retirement.
+    /// `unmap_pages` recognizes direct pointers by their absence from the
+    /// shim's live-view registry and leaves them alone. arm64 answers **0**.
     ///
     /// It used to also license retaining the pointer inside a cached host-pointer
     /// import, which is where the stronger promise came from — MMIO could claim
@@ -120,6 +139,8 @@ pub struct ReimsVgpuHostOps {
             max: usize,
         ) -> i64,
     >,
+    pub page_alias_census:
+        Option<unsafe extern "C" fn(ctx: *mut c_void, out: *mut PageAliasCensus) -> i32>,
 }
 
 // SAFETY: QEMU keeps the table valid for the device lifetime; callbacks only
@@ -155,6 +176,7 @@ impl ReimsVgpuHostOps {
             untrack_guest_writes: None,
             guest_write_gen: None,
             guest_written_pages: None,
+            page_alias_census: None,
             is_ram_gpa: None,
             guest_ram_regions: None,
             notify_actions: None,
@@ -180,6 +202,7 @@ enum QemuHostDecline {
     },
     MapPagesCallbackFailed {
         rc: i32,
+        failure: MapPagesFailure,
         first_gpa: u64,
         page_count: usize,
         page_size: usize,
@@ -201,7 +224,12 @@ impl crate::observe::Decline for QemuHostDecline {
             Self::MonoNsCallbackMissing => "qemu_mono_ns_callback_missing",
             Self::ScheduleBhCallbackMissing => "qemu_schedule_bh_callback_missing",
             Self::MapPagesCallbackMissing { .. } => "qemu_map_pages_callback_missing",
-            Self::MapPagesCallbackFailed { .. } => "qemu_map_pages_callback_failed",
+            Self::MapPagesCallbackFailed { failure, .. } => match failure {
+                MapPagesFailure::ReservationFailed { .. } => "qemu_map_pages_reservation_failed",
+                MapPagesFailure::AliasFailed { .. } => "qemu_map_pages_alias_failed",
+                MapPagesFailure::InvalidGuestPage { .. } => "qemu_map_pages_invalid_guest_page",
+                MapPagesFailure::Unspecified { .. } => "qemu_map_pages_failure_unspecified",
+            },
             Self::MapPagesNullPointer { .. } => "qemu_map_pages_null_pointer",
             Self::UnmapPagesCallbackMissing { .. } => "qemu_unmap_pages_callback_missing",
         }
@@ -226,15 +254,39 @@ impl crate::observe::Decline for QemuHostDecline {
             ],
             Self::MapPagesCallbackFailed {
                 rc,
+                failure,
                 first_gpa,
                 page_count,
                 page_size,
-            } => vec![
-                ("rc", rc.to_string()),
-                ("first_gpa", format!("{first_gpa:#x}")),
-                ("page_count", page_count.to_string()),
-                ("page_size", page_size.to_string()),
-            ],
+            } => {
+                let (stage, page_index, host_errno) = match failure {
+                    MapPagesFailure::ReservationFailed { host_errno } => {
+                        ("reservation", None, *host_errno)
+                    }
+                    MapPagesFailure::AliasFailed {
+                        page_index,
+                        host_errno,
+                    } => ("alias", Some(*page_index), *host_errno),
+                    MapPagesFailure::InvalidGuestPage { page_index } => {
+                        ("invalid_guest_page", Some(*page_index), 0)
+                    }
+                    MapPagesFailure::Unspecified { stage, host_errno } => {
+                        ("unspecified", Some(u64::from(*stage)), *host_errno)
+                    }
+                };
+                let mut fields = vec![
+                    ("rc", rc.to_string()),
+                    ("stage", stage.to_string()),
+                    ("errno", host_errno.to_string()),
+                    ("first_gpa", format!("{first_gpa:#x}")),
+                    ("page_count", page_count.to_string()),
+                    ("page_size", page_size.to_string()),
+                ];
+                if let Some(page_index) = page_index {
+                    fields.push(("page_index", page_index.to_string()));
+                }
+                fields
+            }
             Self::UnmapPagesCallbackMissing { ptr, len } => {
                 vec![("ptr", format!("{ptr:#x}")), ("len", len.to_string())]
             }
@@ -523,11 +575,41 @@ impl HostOps for QemuHost<'_> {
             return None;
         };
         let mut out: *mut c_void = std::ptr::null_mut();
+        let mut raw_failure = ReimsVgpuMapPagesFailure::default();
         // SAFETY: QEMU owns ctx; gpas valid for count; out is stack local.
-        let rc = unsafe { f(self.ops.ctx, gpas.as_ptr(), gpas.len(), &mut out) };
+        let rc = unsafe {
+            f(
+                self.ops.ctx,
+                gpas.as_ptr(),
+                gpas.len(),
+                &mut out,
+                &mut raw_failure,
+            )
+        };
         if rc != 0 {
+            let failure = match raw_failure.stage {
+                MAP_PAGES_FAILURE_RESERVATION => MapPagesFailure::ReservationFailed {
+                    host_errno: raw_failure.host_errno,
+                },
+                MAP_PAGES_FAILURE_ALIAS => MapPagesFailure::AliasFailed {
+                    page_index: raw_failure.page_index,
+                    host_errno: raw_failure.host_errno,
+                },
+                MAP_PAGES_FAILURE_INVALID_GUEST_PAGE => MapPagesFailure::InvalidGuestPage {
+                    page_index: raw_failure.page_index,
+                },
+                MAP_PAGES_FAILURE_NONE => MapPagesFailure::Unspecified {
+                    stage: MAP_PAGES_FAILURE_NONE,
+                    host_errno: raw_failure.host_errno,
+                },
+                stage => MapPagesFailure::Unspecified {
+                    stage,
+                    host_errno: raw_failure.host_errno,
+                },
+            };
             QemuHostDecline::MapPagesCallbackFailed {
                 rc,
+                failure,
                 first_gpa,
                 page_count: gpas.len(),
                 page_size,
@@ -549,6 +631,13 @@ impl HostOps for QemuHost<'_> {
 
     fn map_pages_stable(&self) -> bool {
         self.ops.map_pages_stable != 0
+    }
+
+    fn page_alias_census(&self) -> Option<PageAliasCensus> {
+        let callback = self.ops.page_alias_census?;
+        let mut out = PageAliasCensus::default();
+        // SAFETY: `out` is writable for this call and QEMU owns the live ctx.
+        (unsafe { callback(self.ops.ctx, &mut out) } == 0).then_some(out)
     }
 
     fn guest_ram_regions(
@@ -744,7 +833,16 @@ mod tests {
         _gpas: *const u64,
         _count: usize,
         _out: *mut *mut c_void,
+        failure: *mut ReimsVgpuMapPagesFailure,
     ) -> i32 {
+        // SAFETY: the HostOps callback contract supplies a writable failure slot.
+        unsafe {
+            *failure = ReimsVgpuMapPagesFailure {
+                stage: MAP_PAGES_FAILURE_ALIAS,
+                host_errno: 12,
+                page_index: 3,
+            };
+        }
         -11
     }
 
@@ -753,6 +851,7 @@ mod tests {
         _gpas: *const u64,
         _count: usize,
         out: *mut *mut c_void,
+        _failure: *mut ReimsVgpuMapPagesFailure,
     ) -> i32 {
         // SAFETY: the HostOps callback contract supplies a writable out slot.
         unsafe {
@@ -1018,6 +1117,10 @@ mod tests {
             },
             QemuHostDecline::MapPagesCallbackFailed {
                 rc: -11,
+                failure: MapPagesFailure::AliasFailed {
+                    page_index: 3,
+                    host_errno: 12,
+                },
                 first_gpa: 0x4000,
                 page_count: 2,
                 page_size: 0x4000,
@@ -1036,7 +1139,7 @@ mod tests {
             "qemu_mono_ns_callback_missing",
             "qemu_schedule_bh_callback_missing",
             "qemu_map_pages_callback_missing",
-            "qemu_map_pages_callback_failed",
+            "qemu_map_pages_alias_failed",
             "qemu_map_pages_null_pointer",
             "qemu_unmap_pages_callback_missing",
         ];
@@ -1049,8 +1152,9 @@ mod tests {
         }
         assert_eq!(
             crate::observe::Emit::decline("qemu_host_adapter", &declines[3]).render(),
-            "qemu_host_adapter reason=qemu_map_pages_callback_failed \
-             rc=-11 first_gpa=0x4000 page_count=2 page_size=16384"
+            "qemu_host_adapter reason=qemu_map_pages_alias_failed \
+             rc=-11 stage=alias errno=12 first_gpa=0x4000 page_count=2 \
+             page_size=16384 page_index=3"
         );
     }
 

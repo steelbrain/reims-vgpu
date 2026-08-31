@@ -103,6 +103,50 @@ pub fn contig_run_count(gpas: &[u64], page_size: u64) -> usize {
 
 #[cfg(test)]
 mod tests {
+    /// A stretch never names a byte past the pages it indexes.
+    ///
+    /// The device turns `pages` into a host view — `HostOps::map_pages` over
+    /// exactly those pages, so exactly `pages.len() * page` bytes long — and
+    /// then reads `start_offset..start_offset + len` of it. That bound is what
+    /// makes the view safe to dereference, and it lived only in the arithmetic
+    /// of `coalesce_window`: `len` is `min(avail, remaining)` where `avail` is
+    /// `pages.len() * page - start_offset`. Stating it here is what lets the
+    /// consumer's bounds check be a refusal it can prove is unreachable rather
+    /// than a guess.
+    #[test]
+    fn a_stretch_stays_inside_the_pages_it_names() {
+        const PAGE: u64 = 0x1000;
+        // Contiguous, fragmented, and fragmented-with-a-head-offset, at spans
+        // that stop inside a stretch as well as at one's edge.
+        let windows: [&[u64]; 3] = [
+            &[0x1000, 0x2000, 0x3000, 0x4000],
+            &[0x1000, 0x2000, 0x9000, 0xa000],
+            &[0x5000, 0x9000, 0xa000, 0xb000, 0x20000],
+        ];
+        for window in windows {
+            for head_off in [0, 1, 0x800, PAGE - 1] {
+                let reach = window.len() as u64 * PAGE - head_off;
+                for span in [0, 1, 0x800, PAGE, PAGE + 1, reach - 1, reach, reach + 1] {
+                    let Some(runs) = super::coalesce_window(window, PAGE, head_off, span) else {
+                        continue;
+                    };
+                    let mut covered = 0u64;
+                    for run in &runs {
+                        let bound = (run.pages.end - run.pages.start) as u64 * PAGE;
+                        assert!(
+                            run.start_offset
+                                .checked_add(run.len)
+                                .is_some_and(|end| end <= bound),
+                            "{run:?} reaches past its {bound}-byte view \
+                             (window {window:?}, head_off {head_off}, span {span})"
+                        );
+                        covered += run.len;
+                    }
+                    assert_eq!(covered, span, "the stretches cover the request exactly");
+                }
+            }
+        }
+    }
     use super::*;
     use alloc::vec;
 

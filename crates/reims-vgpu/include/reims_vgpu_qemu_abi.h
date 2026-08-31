@@ -21,7 +21,10 @@
 extern "C" {
 #endif
 
-/* v18: ReimsVgpuHostOps.dmabuf_for_pages and every REIMS_VGPU_DMABUF_* removed.
+/* v20: map_pages fills ReimsVgpuMapPagesFailure when it refuses a view.
+ * v19: ReimsVgpuHostOps.page_alias_census reports the packed page views the
+ *      shim currently owns and their cumulative lifetime totals.
+ * v18: ReimsVgpuHostOps.dmabuf_for_pages and every REIMS_VGPU_DMABUF_* removed.
  *      v17's spans replaced the mechanism outright: guest pages reach the host
  *      GPU by importing the RAMBlock mapping QEMU already holds, on Linux,
  *      Windows and macOS alike, rather than through a Linux-only udmabuf fd.
@@ -91,7 +94,12 @@ extern "C" {
  *     thread so IRQ pulses reach the guest mid-drain — ack fast).
  * v6: ReimsVgpuHostOps.is_ram_gpa (reject non-RAM PFNs on mapper / map_pages paths).
  * v5: ReimsVgpuQemuCreateInfo.guest_page_shift (12 = x86 Tahoe, 14 = arm64e). */
-#define REIMS_VGPU_QEMU_ABI_VERSION 18u
+#define REIMS_VGPU_QEMU_ABI_VERSION 20u
+
+#define REIMS_VGPU_MAP_PAGES_FAILURE_NONE 0u
+#define REIMS_VGPU_MAP_PAGES_FAILURE_RESERVATION 1u
+#define REIMS_VGPU_MAP_PAGES_FAILURE_ALIAS 2u
+#define REIMS_VGPU_MAP_PAGES_FAILURE_INVALID_GUEST_PAGE 3u
 
 #define REIMS_VGPU_QEMU_OK 0
 #define REIMS_VGPU_QEMU_ERR_ARGS 1
@@ -125,6 +133,20 @@ typedef struct ReimsVgpuGuestRamRegion {
     uint64_t host_va;
     uint64_t len;
 } ReimsVgpuGuestRamRegion;
+
+typedef struct ReimsVgpuPageAliasCensus {
+    uint64_t live;
+    uint64_t live_bytes;
+    uint64_t live_pages;
+    uint64_t created;
+    uint64_t destroyed;
+} ReimsVgpuPageAliasCensus;
+
+typedef struct ReimsVgpuMapPagesFailure {
+    uint32_t stage;
+    int32_t host_errno;
+    uint64_t page_index;
+} ReimsVgpuMapPagesFailure;
 
 /*
  * Largest scanout / surface edge the device accepts, in pixels.
@@ -256,10 +278,10 @@ typedef struct ReimsVgpuHostOps {
      * 0 = success, fills *out_ptr (view length = count * page size).
      */
     int (*map_pages)(void *ctx, const uint64_t *gpas, size_t count,
-                     void **out_ptr);
+                     void **out_ptr, ReimsVgpuMapPagesFailure *failure);
     /*
-     * Release a transient view from map_pages (len = count * page size).
-     * No-op when map_pages_stable is 1.
+     * Release a view from map_pages (len = count * page size). A shim may
+     * ignore borrowed direct-RAM pointers while releasing constructed aliases.
      */
     void (*unmap_pages)(void *ctx, void *ptr, size_t len);
     /*
@@ -299,10 +321,9 @@ typedef struct ReimsVgpuHostOps {
      */
     void (*notify_actions)(void *ctx);
     /*
-     * 1 if map_pages returns a *stable* alias of guest RAM: the pointer stays
-     * valid for the device lifetime, unmap_pages is a no-op, and the address
-     * is never recycled for other memory. 0 if the view is a transient mapping
-     * that unmap_pages tears down.
+     * 1 if map_pages returns an alias the caller may retain until its matching
+     * unmap_pages call. 0 if the view may be used only synchronously and cannot
+     * back a retained GPU import.
      *
      * Base guest RAM reaches the GPU through the spans guest_ram_regions names,
      * independently of this flag. A resource-shaped packed import may retain a
@@ -355,6 +376,8 @@ typedef struct ReimsVgpuHostOps {
      */
     int64_t (*guest_written_pages)(void *ctx, uint64_t token, uint64_t since_gen,
                                    uint64_t *out, size_t max);
+    /* Current packed map_pages aliases and cumulative lifetime totals. */
+    int (*page_alias_census)(void *ctx, ReimsVgpuPageAliasCensus *out);
 } ReimsVgpuHostOps;
 
 /*

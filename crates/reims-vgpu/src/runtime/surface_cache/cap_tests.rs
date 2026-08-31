@@ -23,7 +23,6 @@ fn store_frame(state: &mut DeviceState, gva: u64, fill: u8) {
     store_gva_owned(state, gva, W, H, vec![fill; FRAME_BYTES], 0, None, true);
 }
 
-
 /// The leak, and the bound.
 ///
 /// This map is keyed by guest *virtual* address and a store at an existing
@@ -131,7 +130,6 @@ fn the_same_entry_is_evicted_when_nothing_reports_reading_it() {
         "and the lookup that then wanted it is charged to the cap, not written off"
     );
 }
-
 
 /// The harm witness must charge the cap for its own misses and nothing
 /// else, or the number cannot be read.

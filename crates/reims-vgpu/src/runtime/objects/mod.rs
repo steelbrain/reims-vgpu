@@ -657,8 +657,8 @@ pub fn device_desc_format_to_mtl(raw: u32) -> u16 {
 /// Unknown formats fail closed.
 pub fn iosurface_pixel_format_to_mtl(pixel_format: u32) -> u16 {
     use crate::contract::pixel_format::{
-        MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_R8_UNORM, MTL_FORMAT_RG8_UNORM, MTL_FORMAT_RGBA16_FLOAT,
-        MTL_FORMAT_RGBA8_UNORM,
+        MTL_FORMAT_BGR10A2_UNORM, MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_R8_UNORM,
+        MTL_FORMAT_RG8_UNORM, MTL_FORMAT_RGBA16_FLOAT, MTL_FORMAT_RGBA8_UNORM,
     };
     if pixel_format == 0 {
         return 0;
@@ -686,6 +686,30 @@ pub fn iosurface_pixel_format_to_mtl(pixel_format: u32) -> u16 {
         0x5247_4241 => MTL_FORMAT_RGBA8_UNORM,
         // 'RGhA' / half-float variants seen as AhGR in notes
         0x5247_6841 | 0x4168_4752 => MTL_FORMAT_RGBA16_FLOAT,
+        // 'l10r' — `kCVPixelFormatType_ARGB2101010LEPacked`. One single-plane
+        // 32-bit little-endian word per texel: two bits of alpha in the high
+        // bits, then ten each of red, green and blue, with blue in the low
+        // bits. That is `MTLPixelFormatBGR10A2Unorm`'s word exactly, which is
+        // also `VK_FORMAT_A2R10G10B10_UNORM_PACK32`'s — see
+        // `contract::pixel_format::MTL_FORMAT_BGR10A2_UNORM` and
+        // `backend::vulkan::translate::pixel`, which already paired those two.
+        //
+        // Two independent sources agree on it, which is why it is stated rather
+        // than proposed. A driven macos-13 x86/Vulkan boot running Asphalt 8
+        // declares its 1280x720 render surface with this FourCC and then binds a
+        // **type-5 reference-texture view** over the same allocation whose own
+        // `pixel_format` field reads `0x5e` — the guest naming `BGR10A2Unorm`
+        // itself, reported as `rt_type5_view_differs sid=117 view=1280x720
+        // fmt=0x5e ... base fmt=0x0`. The surface geometry closes it: the type-4
+        // record's `bytes_per_row` is 5120 over a width of 1280, which is four
+        // bytes a texel, and its `length` 0x384000 is that stride times 720.
+        //
+        // Before this arm the surface reached `draw::render_target`'s
+        // `rt_type4_base_format` as a zero — that resolve's typed refusal for a
+        // multi-plane or unknown-FourCC surface — so **every** draw of the frame
+        // failed and the game's window was black. One 100 s capture of it held
+        // 20 822 `draw_fail_clear_fallback` records and 0 successful draws.
+        0x6c31_3072 => MTL_FORMAT_BGR10A2_UNORM,
         // Single-plane R8 / RG8 OSTypes used as plane textures (not biplanar media fourcc).
         // 'L008' / common R8 fourccs are rare on type-4; MTL ordinals already handled above.
         // 'R8  ' / 'RG08' if ever seen as OSType:
@@ -1196,9 +1220,13 @@ pub enum ListMiss {
     Unreadable(crate::runtime::host::MemError),
     /// The sixteen bytes read and are not an object-list entry.
     Undecodable,
-    /// The slot read and is zero: the list is where the guest said and this
-    /// entry has not been written yet. Not a device failure — a race with the
-    /// guest publishing the object.
+    /// The slot read and is zero. Not a device failure.
+    ///
+    /// Object refs are reusable indices: deletion clears the indexed slot and
+    /// allocation may assign that same index to a later object. The packet does
+    /// not carry the index generation, so neither an earlier entry nor a later
+    /// one can answer for a zero slot. The lookup must miss until the current
+    /// tenant is present in the list.
     SlotEmpty,
 }
 
@@ -1305,8 +1333,7 @@ fn list_entry<M: HostMemory>(
         Ok(entry) => {
             // Only a ref the guest named: a probe's success is the search
             // finding an owner, which says nothing about what this task's own
-            // list once held. One atomic bit — see `slot_recheck::ResolvedBits`
-            // for why this path cannot take a lock.
+            // list once held.
             if lookup == ListLookup::Named {
                 slot_recheck::note_ref_resolved(task_id, ref_);
                 // The control for the banding below, and the reason it is worth
@@ -1334,6 +1361,8 @@ fn list_entry<M: HostMemory>(
                     crate::runtime::drain::tranche_elapsed_us(),
                 );
                 if miss == ListMiss::SlotEmpty {
+                    // Both instruments measure the slot, not the packet's
+                    // outcome, so they run before this miss is returned.
                     note_slot_empty_claimants(state, host, task_id, ref_);
                     // The unconfounded half of the same question — see
                     // `slot_recheck` for why the claimant search above cannot
@@ -1458,8 +1487,8 @@ fn list_entry_or_miss<M: HostMemory>(
     if task.object_list_count == 0 {
         return Err(ListMiss::NoObjectList);
     }
-    let off = list_object_entry_offset(ref_, task.object_list_count)
-        .ok_or(ListMiss::RefBeyondList)?;
+    let off =
+        list_object_entry_offset(ref_, task.object_list_count).ok_or(ListMiss::RefBeyondList)?;
     let entry_gva = ((task.object_list_pfn as u64) << state.page_shift)
         .checked_add(off)
         .ok_or(ListMiss::AddressOverflow)?;
@@ -1631,6 +1660,67 @@ fn object_type_is_resource(object_type: u8) -> bool {
         .is_some_and(|bit| RESOURCE_CONSTRUCTOR_TYPE_MASK & (1u16 << bit) != 0)
 }
 
+/// Whether a cached resolution still describes the entry the guest's own object
+/// list holds for that reference.
+///
+/// The cache is keyed by `(task, ref)` and dropped on a new page-table root, a
+/// new object list, a deleted object, a deleted task, and a replaced physical
+/// page. The guest writes the list itself, in its own memory: none of those
+/// events accompanies a slot being *overwritten in place*, and a compositor
+/// recycles slots. A stale hit binds the bytes of whatever object used to live
+/// at that reference, which is a wrong texture rather than a missing one -- and
+/// on this rail one reference resolves to a small texture early in a boot and to
+/// a 3840x2160 video plane later.
+///
+/// Read-only, and it decides nothing: it reads the list entry the guest holds
+/// now and reports a disagreement. First sight per `(task, ref, kind of
+/// disagreement)`, so a steady bind is silent and a recycled slot names itself
+/// once.
+fn note_stale_task_resource<M: HostMemory>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    obj_ref: u32,
+    cached: &TaskResource,
+) {
+    let Some(entry) = lookup_list_entry(state, host, task_id, obj_ref) else {
+        return;
+    };
+    // The entry is half the snapshot. The other half is the descriptor bytes it
+    // points at, and a serializer that rewrites a descriptor in place leaves the
+    // entry byte-identical -- same type, same length, same address -- while the
+    // object it describes becomes a different surface, plane or extent. A
+    // witness that compared only the entry would call that agreement.
+    let live_descriptor = read_descriptor(state, host, task_id, &entry);
+    let descriptor_moved = live_descriptor
+        .as_ref()
+        .is_some_and(|bytes| bytes.as_slice() != &*cached.descriptor);
+    if entry == cached.entry && !descriptor_moved {
+        return;
+    }
+    let disc = crate::backend::hash::hash_u64(
+        u64::from(task_id) << 32 | u64::from(obj_ref),
+        entry.descriptor_gva
+            ^ (u64::from(entry.object_type) << 56)
+            ^ (u64::from(descriptor_moved) << 63),
+    );
+    if !crate::observe::first_sight("task_resource_stale", disc) {
+        return;
+    }
+    crate::observe::fail(format!(
+        "task_resource_stale task={task_id} ref={obj_ref} \
+         cached=[type={} len={} gva={:#x}] list=[type={} len={} gva={:#x}] \
+         desc_moved={descriptor_moved} \
+         (the guest overwrote the slot and the cached resolution outlived it)",
+        cached.entry.object_type,
+        cached.entry.descriptor_length,
+        cached.entry.descriptor_gva,
+        entry.object_type,
+        entry.descriptor_length,
+        entry.descriptor_gva,
+    ));
+}
+
 /// Retrieve or construct the resource named by `task_id` / `obj_ref`.
 ///
 /// A successful construction snapshots the object-list entry and descriptor
@@ -1645,6 +1735,7 @@ pub fn resolve_resource<M: HostMemory>(
     obj_ref: u32,
 ) -> Result<Arc<TaskResource>, LadderRung> {
     if let Some(resource) = state.task_resources.get(task_id, obj_ref) {
+        note_stale_task_resource(state, host, task_id, obj_ref, &resource);
         return Ok(resource);
     }
 
@@ -1766,8 +1857,8 @@ pub fn resolve_buffer_span<M: HostMemory>(
     task_id: u32,
     buffer_ref: u32,
 ) -> Result<(u64, u64), BufferSpanRefusal> {
-    let resource = resolve_resource(state, host, task_id, buffer_ref)
-        .map_err(BufferSpanRefusal::Rung)?;
+    let resource =
+        resolve_resource(state, host, task_id, buffer_ref).map_err(BufferSpanRefusal::Rung)?;
     resolve_buffer_span_from_resource(state, &resource)
 }
 

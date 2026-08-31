@@ -347,7 +347,10 @@ mod tests {
                 variable(3, 5, STORAGE_CLASS_INPUT),
             ],
         );
-        assert_eq!(VertexInputWidths::from_spirv(&words).at(7), InputWidth::Absent);
+        assert_eq!(
+            VertexInputWidths::from_spirv(&words).at(7),
+            InputWidth::Absent
+        );
     }
 
     /// A type the walk cannot reduce to a component count answers `Unreadable`

@@ -148,6 +148,19 @@ struct PageEpochs {
     /// Newest write that could not name its pages. Fail-closed for any reader
     /// older than it, exactly as the ring's `Unknown` entry is.
     unnamed_at: u64,
+    /// Pages currently armed: released by the guest and not mapped again.
+    /// Unbounded on purpose — its size is the guest's, and a cap here would be
+    /// a cap on what can be observed.
+    armed: u64,
+    /// Findings waiting to be drained. See [`RELEASED_REPORT_CAP`].
+    hits: Vec<ReleasedWrite>,
+    /// Findings the queue could not hold.
+    hits_dropped: u64,
+    /// Writes that named no pages while at least one page was armed. Such a
+    /// write cannot be attributed to a page, so it is neither a finding nor a
+    /// clean sheet, and saying so is the difference between a quiet instrument
+    /// and a blind one.
+    unnamed_while_armed: u64,
 }
 
 /// One minimum supported guest page per allocation. This is derived from the
@@ -162,6 +175,13 @@ struct EpochChunk {
     /// readers take whichever is newer.
     all_at: u64,
     cells: [u64; EPOCHS_PER_CHUNK],
+    /// Release epoch per page, or 0 for a page the guest has not taken back.
+    ///
+    /// Lazily allocated, because the pages a guest releases are a small part of
+    /// the pages this device writes and an unarmed chunk should not pay for the
+    /// array. See [`PageEpochs::arm`] for why the marker lives in this cell
+    /// rather than in a watch of its own.
+    released: Option<Box<[u64; EPOCHS_PER_CHUNK]>>,
 }
 
 impl Default for EpochChunk {
@@ -169,18 +189,97 @@ impl Default for EpochChunk {
         Self {
             all_at: 0,
             cells: [0; EPOCHS_PER_CHUNK],
+            released: None,
+        }
+    }
+}
+
+/// A write this device recorded against a page the guest had taken back.
+///
+/// Both epochs travel with it: `released_at` is the write census epoch current
+/// when the guest released the page, `wrote_at` the epoch of the write that
+/// landed on it. Their difference is how many writes this device recorded in
+/// between, which is the only interval that means anything here — wall time
+/// would say when the report was drained, not when the ordering broke.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReleasedWrite {
+    /// Guest-physical address of the page, at this guest's page geometry.
+    pub gpa: u64,
+    /// Write census epoch current when the guest released the page.
+    pub released_at: u64,
+    /// Write census epoch of the write that landed on it afterwards.
+    pub wrote_at: u64,
+}
+
+/// How many findings the report queue holds between drains.
+///
+/// This bounds the **derived alarm queue**, not the watch: the armed-page
+/// population has no bound, and a page that reports is disarmed, so one page
+/// can occupy this at most once. The queue is drained on every drain tranche.
+/// What does not fit is counted — see [`HostWrites::dropped_released_writes`] —
+/// because a defect that fires faster than the drain is itself a reading.
+const RELEASED_REPORT_CAP: usize = 64;
+
+/// Everything a hit needs that is not in the chunk: where to put it, and the
+/// counters it moves. Passed alongside the chunk so the borrow checker can see
+/// that the chunk and the queue are disjoint parts of [`PageEpochs`].
+struct HitSink<'a> {
+    armed: &'a mut u64,
+    hits: &'a mut Vec<ReleasedWrite>,
+    hits_dropped: &'a mut u64,
+    page_shift: u32,
+}
+
+impl HitSink<'_> {
+    /// Report and disarm every armed page in `chunk[slot..slot + take]`.
+    ///
+    /// Disarming is what makes one late write one finding: the page has now
+    /// been written and keeping it armed would re-report the same defect for
+    /// every later write to it.
+    fn check(&mut self, chunk: &mut EpochChunk, chunk_key: u64, slot: usize, take: usize, at: u64) {
+        let Some(released) = chunk.released.as_deref_mut() else {
+            return;
+        };
+        for (offset, cell) in released[slot..slot + take].iter_mut().enumerate() {
+            if *cell == 0 {
+                continue;
+            }
+            let released_at = std::mem::replace(cell, 0);
+            *self.armed = self.armed.saturating_sub(1);
+            let page = chunk_key * EPOCHS_PER_CHUNK as u64 + (slot + offset) as u64;
+            if self.hits.len() < RELEASED_REPORT_CAP {
+                self.hits.push(ReleasedWrite {
+                    gpa: page << self.page_shift,
+                    released_at,
+                    wrote_at: at,
+                });
+            } else {
+                *self.hits_dropped += 1;
+            }
         }
     }
 }
 
 impl PageEpochs {
-    fn note_page_range(&mut self, mut page: u64, mut count: usize, epoch: u64) {
+    fn note_page_range(&mut self, mut page: u64, mut count: usize, epoch: u64, page_shift: u32) {
+        let Self {
+            chunks,
+            armed,
+            hits,
+            hits_dropped,
+            ..
+        } = self;
+        let mut sink = HitSink {
+            armed,
+            hits,
+            hits_dropped,
+            page_shift,
+        };
         while count != 0 {
             let chunk_key = page / EPOCHS_PER_CHUNK as u64;
             let slot = (page % EPOCHS_PER_CHUNK as u64) as usize;
             let take = count.min(EPOCHS_PER_CHUNK - slot);
-            let chunk = self
-                .chunks
+            let chunk = chunks
                 .entry(chunk_key)
                 .or_insert_with(|| Box::new(EpochChunk::default()));
             if slot == 0 && take == EPOCHS_PER_CHUNK {
@@ -188,8 +287,56 @@ impl PageEpochs {
             } else {
                 chunk.cells[slot..slot + take].fill(epoch);
             }
+            sink.check(chunk, chunk_key, slot, take, epoch);
             page += take as u64;
             count -= take;
+        }
+    }
+
+    /// Record that the guest has taken `page` back.
+    ///
+    /// The marker lives in the same chunk the write census already touches, so
+    /// a write finds it without a second lookup and without a sweep. That is
+    /// the whole difference from the watch this replaced: a sweep costs the
+    /// watched population per drain tranche, which is why that watch had a cap,
+    /// and a cap on an instrument decides what it is able to see.
+    ///
+    /// A page released twice without an intervening map keeps its **first**
+    /// release epoch: the question is whether anything was written since the
+    /// guest stopped wanting us there, and re-stamping it would forgive a write
+    /// that had already happened.
+    fn arm(&mut self, page: u64, epoch: u64) {
+        let chunk_key = page / EPOCHS_PER_CHUNK as u64;
+        let slot = (page % EPOCHS_PER_CHUNK as u64) as usize;
+        let chunk = self
+            .chunks
+            .entry(chunk_key)
+            .or_insert_with(|| Box::new(EpochChunk::default()));
+        let released = chunk
+            .released
+            .get_or_insert_with(|| Box::new([0; EPOCHS_PER_CHUNK]));
+        if released[slot] != 0 {
+            return;
+        }
+        // Epoch 0 is "never written", so an arm at epoch 0 would be
+        // indistinguishable from an unarmed cell. Arm at 1 instead: no write
+        // has happened yet, so no write can be older than it.
+        released[slot] = epoch.max(1);
+        self.armed += 1;
+    }
+
+    /// The guest has mapped `page` again, so writing to it is legitimate.
+    fn disarm(&mut self, page: u64) {
+        let chunk_key = page / EPOCHS_PER_CHUNK as u64;
+        let Some(chunk) = self.chunks.get_mut(&chunk_key) else {
+            return;
+        };
+        let Some(released) = chunk.released.as_deref_mut() else {
+            return;
+        };
+        let slot = (page % EPOCHS_PER_CHUNK as u64) as usize;
+        if std::mem::replace(&mut released[slot], 0) != 0 {
+            self.armed = self.armed.saturating_sub(1);
         }
     }
 
@@ -197,16 +344,29 @@ impl PageEpochs {
     where
         I: IntoIterator<Item = u64>,
     {
+        let Self {
+            chunks,
+            armed,
+            hits,
+            hits_dropped,
+            ..
+        } = self;
+        let mut sink = HitSink {
+            armed,
+            hits,
+            hits_dropped,
+            page_shift,
+        };
         let mut pages = pages.into_iter().peekable();
         while let Some(gpa) = pages.next() {
             let page = gpa >> page_shift;
             let chunk_key = page / EPOCHS_PER_CHUNK as u64;
-            let chunk = self
-                .chunks
+            let chunk = chunks
                 .entry(chunk_key)
                 .or_insert_with(|| Box::new(EpochChunk::default()));
             let slot = (page % EPOCHS_PER_CHUNK as u64) as usize;
             chunk.cells[slot] = epoch;
+            sink.check(chunk, chunk_key, slot, 1, epoch);
             while pages
                 .peek()
                 .is_some_and(|&next| (next >> page_shift) / EPOCHS_PER_CHUNK as u64 == chunk_key)
@@ -214,12 +374,16 @@ impl PageEpochs {
                 let gpa = pages.next().expect("peeked page");
                 let slot = ((gpa >> page_shift) % EPOCHS_PER_CHUNK as u64) as usize;
                 chunk.cells[slot] = epoch;
+                sink.check(chunk, chunk_key, slot, 1, epoch);
             }
         }
     }
 
     fn note_unknown(&mut self, epoch: u64) {
         self.unnamed_at = epoch;
+        if self.armed != 0 {
+            self.unnamed_while_armed += 1;
+        }
     }
 
     /// The verdict this map would give, in the ring's own vocabulary.
@@ -343,10 +507,7 @@ impl HostWrites {
     /// Record the exact page runs retained with an admitted guest allocation.
     /// The run partition was derived once with the resource, so a repeated
     /// Store updates slices rather than rebuilding adjacency page by page.
-    pub fn note_footprint(
-        &mut self,
-        footprint: &crate::runtime::guest_ram::GuestPageFootprint,
-    ) {
+    pub fn note_footprint(&mut self, footprint: &crate::runtime::guest_ram::GuestPageFootprint) {
         self.epoch = self.epoch.wrapping_add(1);
         if footprint.page_size() != (1u64 << self.page_shift) {
             self.pages.note_unknown(self.epoch);
@@ -354,8 +515,12 @@ impl HostWrites {
         }
         for run in footprint.runs() {
             let first_page = footprint.pages()[run.start] >> self.page_shift;
-            self.pages
-                .note_page_range(first_page, run.end - run.start, self.epoch);
+            self.pages.note_page_range(
+                first_page,
+                run.end - run.start,
+                self.epoch,
+                self.page_shift,
+            );
         }
     }
 
@@ -381,6 +546,44 @@ impl HostWrites {
     /// mapping re-pointed afterwards cannot make the answer wrong.
     pub fn wrote_any_since(&self, since: u64, pages: &[u64]) -> HostWriteVerdict {
         self.pages.verdict(since, pages, self.page_shift)
+    }
+
+    /// Record that the guest has taken `gpa` back, so a write to it from here
+    /// on is a write this device was told not to make.
+    ///
+    /// See [`crate::runtime::released_pages`] for what a finding means. The
+    /// address is page-aligned at this guest's geometry by the same shift the
+    /// write census uses, so an arm and a write cannot disagree about which
+    /// cell they mean.
+    pub fn release_page(&mut self, gpa: u64) {
+        self.pages.arm(gpa >> self.page_shift, self.epoch);
+    }
+
+    /// The guest has mapped `gpa` again, so writing to it is legitimate.
+    pub fn remap_page(&mut self, gpa: u64) {
+        self.pages.disarm(gpa >> self.page_shift);
+    }
+
+    /// Take the findings recorded since the last drain.
+    pub fn take_released_writes(&mut self) -> Vec<ReleasedWrite> {
+        std::mem::take(&mut self.pages.hits)
+    }
+
+    /// How many pages are armed: released by the guest and not mapped again.
+    pub fn armed_pages(&self) -> u64 {
+        self.pages.armed
+    }
+
+    /// Findings the report queue could not hold. Non-zero means the readings
+    /// name fewer pages than were written after release.
+    pub fn dropped_released_writes(&self) -> u64 {
+        self.pages.hits_dropped
+    }
+
+    /// Writes that named no pages while something was armed, and so could
+    /// neither implicate nor clear it.
+    pub fn unnamed_writes_while_armed(&self) -> u64 {
+        self.pages.unnamed_while_armed
     }
 }
 

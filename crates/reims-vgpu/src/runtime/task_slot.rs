@@ -78,8 +78,6 @@ impl crate::observe::Decline for TaskWordDecode {
     }
 }
 
-
-
 /// Resolve the wire task word to the slot this crate will act on. **The word,
 /// or nothing.**
 ///

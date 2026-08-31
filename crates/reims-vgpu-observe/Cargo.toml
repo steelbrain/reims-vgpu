@@ -1,0 +1,24 @@
+[package]
+name = "reims-vgpu-observe"
+version = "0.1.0"
+edition = "2021"
+description = "Reims vGPU observability: the always-on sink, the decline vocabulary, and the slug registry"
+license = "GPL-2.0-or-later"
+
+[lib]
+name = "reims_vgpu_observe"
+
+[features]
+# The test-only surface — `FailCapture`, `fail_log_path`, `forget_all_latches`,
+# and the slug-collision panic — exists for the crates *above* this one, whose
+# tests are a different compilation from this crate's own. `#[cfg(test)]` cannot
+# reach across that boundary, so the same items are also gated on this feature
+# and the consumer turns it on from `[dev-dependencies]`: on when its tests
+# build, off in the staticlib QEMU links against.
+testing = []
+
+# The sink writes files and the decline vocabulary names types. Neither needs a
+# dependency, and both are named by the protocol layer below the device, so
+# anything added here would be added to that layer too.
+[dependencies]
+reims-vgpu-env = { path = "../reims-vgpu-env" }

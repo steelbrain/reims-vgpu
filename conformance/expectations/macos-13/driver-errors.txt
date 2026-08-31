@@ -1,0 +1,9 @@
+# Guest failures owned outside shader translation, on the macos-13 rail.
+#
+# One case name per line, followed by a comment naming the violated API
+# relation and the driver owner. An unexplained mismatch does not belong here:
+# establish its owner first. Remove an entry when the scorer says FIXED-DRIVER.
+#
+# This inventory is this rail's alone. A guest rail is a guest driver, so a
+# failure established on another rail says nothing about this one and may not
+# be copied across.

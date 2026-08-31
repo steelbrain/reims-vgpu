@@ -90,6 +90,95 @@ fn is_zero(px: &[u8]) -> bool {
     px == [0, 0, 0, 0]
 }
 
+/// Mapping retirement can be the last guest event. The heartbeat must submit
+/// the tail batch, observe its fence, release the graveyard parent, and return
+/// the constructed alias without relying on another draw to advance the ring.
+#[test]
+fn heartbeat_retires_a_guest_alias_after_its_fence_without_another_draw() {
+    use reims_vgpu::runtime::guest_ram::{granularity, GuestRamImport};
+    use reims_vgpu::runtime::host::{HostAction, HostOps};
+
+    #[derive(Default)]
+    struct UnmapHost {
+        calls: u64,
+    }
+    impl HostOps for UnmapHost {
+        fn mono_ns(&self) -> u64 {
+            0
+        }
+        fn enqueue(&mut self, _action: HostAction) {}
+        fn schedule_bh(&mut self) {}
+        fn unmap_pages(&mut self, _ptr: usize, _len: usize) {
+            self.calls += 1;
+        }
+    }
+
+    let _guard = engine_test_lock().lock().unwrap();
+    let (vert, frag) = triangle_spirv();
+    let identity = TargetIdentity::Surface {
+        id: 990_499,
+        width: W,
+        height: H,
+        generation: 1,
+        format: SURFACE_TEST_FORMAT,
+    };
+    let req = batch_req(&vert, &frag, &identity, false, half_scissor(true));
+    if let Err(error) = engine::execute_draw_request(&req) {
+        let message = error.to_string();
+        if skip_if_no_gpu(&message) {
+            eprintln!("skipping: {message}");
+            return;
+        }
+        panic!("opening draw: {message}");
+    }
+    let Some(align) = granularity() else {
+        eprintln!("skipping: this host cannot import guest RAM");
+        engine::test_quiesce_ring();
+        return;
+    };
+
+    let len = align * 2;
+    let backing = vec![0u8; usize::try_from(len + align).expect("test allocation fits")];
+    let base = (backing.as_ptr() as usize).next_multiple_of(align as usize);
+    let import = std::sync::Arc::new(
+        GuestRamImport::new_host_allocation(base, len, align)
+            .expect("aligned synthetic host allocation"),
+    );
+    assert_eq!(
+        engine::warm_guest_ram_imports(&[std::sync::Arc::clone(&import)]),
+        (1, len),
+        "the production HostRamImports table must own the alias"
+    );
+
+    let mut host = UnmapHost::default();
+    let mut state = reims_vgpu::model::DeviceState::new(reims_vgpu::model::DeviceId::default(), 12);
+    state.retired_guest_imports.push(import.id());
+    state.retired_views.push((base, len as usize));
+    reims_vgpu::runtime::mapper::flush_retired_views(&mut state, &mut host);
+    assert_eq!(
+        host.calls, 0,
+        "retiring the mapping must not unmap through a live batch"
+    );
+
+    for tick in 0..10_000 {
+        engine::maintain_resources(10_000 + tick);
+        if reims_vgpu::runtime::mapper::drain_deferred_unmaps(&mut host) != 0 {
+            break;
+        }
+        std::thread::yield_now();
+    }
+    assert_eq!(
+        host.calls, 1,
+        "heartbeat fence retirement must terminally destroy and return the alias"
+    );
+    assert_eq!(
+        reims_vgpu::runtime::mapper::drain_deferred_unmaps(&mut host),
+        0,
+        "the terminal release is published exactly once"
+    );
+    engine::test_quiesce_ring();
+}
+
 const W: u32 = 64;
 const H: u32 = 64;
 
@@ -165,7 +254,8 @@ fn batched_draws_compose_and_flush_on_read() {
 
     let px = engine::read_target(&identity)
         .expect("read_target flushes the batch")
-        .into_rgba8();
+        .into_rgba8()
+        .expect("an eight-bit colour readback");
     let after = engine::counter_snapshot().delta_since(&before);
     assert_eq!(after.batch_flushes, 1, "read_target submitted the batch");
     assert_eq!(
@@ -231,7 +321,8 @@ fn one_metal_encoder_continues_one_vulkan_render_pass() {
 
     let px = engine::read_target(&identity)
         .expect("flush continued pass")
-        .into_rgba8();
+        .into_rgba8()
+        .expect("an eight-bit colour readback");
     let delta = engine::counter_snapshot().delta_since(&before);
     assert_eq!(
         delta.render_pass_continuations, 1,
@@ -292,7 +383,8 @@ fn one_multisample_encoder_resolves_after_its_last_draw() {
 
     let px = engine::read_target(&identity)
         .expect("close and resolve the multisample encoder")
-        .into_rgba8();
+        .into_rgba8()
+        .expect("an eight-bit colour readback");
     let delta = engine::counter_snapshot().delta_since(&before);
     assert_eq!(
         delta.render_pass_continuations, 1,
@@ -345,7 +437,10 @@ fn stored_multisample_target_survives_for_a_later_encoder() {
         stencil: None,
     });
     match engine::execute_draw_request(&first) {
-        Ok(out) => assert!(out.pixels.is_empty(), "stored multisample target stays GPU-resident"),
+        Ok(out) => assert!(
+            out.pixels.is_empty(),
+            "stored multisample target stays GPU-resident"
+        ),
         Err(e) => {
             let msg = e.to_string();
             if skip_if_no_gpu(&msg) {
@@ -428,7 +523,10 @@ fn cross_target_draws_share_one_command_buffer_and_land_in_their_own_images() {
     assert_eq!(mid.batch_flushes, 0, "and nothing has consumed either yet");
 
     // A drew the left half; the read is what flushes the shared batch.
-    let px = engine::read_target(&a).expect("read A").into_rgba8();
+    let px = engine::read_target(&a)
+        .expect("read A")
+        .into_rgba8()
+        .expect("an eight-bit colour readback");
     let left = ((10 * W + 8) * 4) as usize;
     let right = ((10 * W + W / 2 + 8) * 4) as usize;
     assert!(
@@ -443,7 +541,10 @@ fn cross_target_draws_share_one_command_buffer_and_land_in_their_own_images() {
     );
 
     // B drew the right half, out of the same command buffer.
-    let px = engine::read_target(&b).expect("read B").into_rgba8();
+    let px = engine::read_target(&b)
+        .expect("read B")
+        .into_rgba8()
+        .expect("an eight-bit colour readback");
     assert!(
         is_zero(&px[left..left + 4]),
         "B left half = {:?}",
@@ -572,10 +673,11 @@ fn batched_guest_runs_buffer_snapshots_at_record() {
     opener.storage_buffers.push(StorageBufferResource {
         binding: 0,
         content: BufferContent::GuestRuns(GuestRunSource {
-            runs: std::sync::Arc::new(vec![GuestRun {
-                host_ptr: backing.as_ptr() as usize,
-                len: backing.len() as u64,
-            }]),
+            runs: std::sync::Arc::new(vec![GuestRun::whole(
+                backing.as_ptr() as usize,
+                backing.len() as u64,
+            )
+            .expect("a fixture run covers its own span")]),
             source_offset: 0,
             total_len: backing.len() as u64,
             row_length_texels: 0,
@@ -609,7 +711,8 @@ fn batched_guest_runs_buffer_snapshots_at_record() {
 
     let px = engine::read_target(&identity)
         .expect("read_target flushes the batch")
-        .into_rgba8();
+        .into_rgba8()
+        .expect("an eight-bit colour readback");
     for y in [0u32, H / 2, H - 1] {
         let i = ((y * W + W / 4) * 4) as usize;
         assert!(
@@ -727,14 +830,9 @@ fn sampled_guest_runs_land_the_guest_bytes_the_shader_samples() {
         source: SampledSource::GuestRuns(
             GuestRunSource {
                 runs: std::sync::Arc::new(vec![
-                    GuestRun {
-                        host_ptr: ptr as usize,
-                        len: 8,
-                    },
-                    GuestRun {
-                        host_ptr: ptr as usize + 8,
-                        len: 8,
-                    },
+                    GuestRun::whole(ptr as usize, 8).expect("a fixture run covers its own span"),
+                    GuestRun::whole(ptr as usize + 8, 8)
+                        .expect("a fixture run covers its own span"),
                 ]),
                 source_offset: 0,
                 total_len: 16,
@@ -751,7 +849,7 @@ fn sampled_guest_runs_land_the_guest_bytes_the_shader_samples() {
         identity: None,
         swizzle: Default::default(),
     });
-    req.samplers.push(SamplerResource::normalized_default(64));
+    req.samplers.push(SamplerResource::normalized_default(160));
 
     let outcome = engine::execute_draw_request(&req);
     if let Err(e) = &outcome {
@@ -765,7 +863,8 @@ fn sampled_guest_runs_land_the_guest_bytes_the_shader_samples() {
     outcome.expect("a CPU-gathered guest-run sampled draw must execute");
     let px = engine::read_target(&identity)
         .expect("read_target flushes the batch")
-        .into_rgba8();
+        .into_rgba8()
+        .expect("an eight-bit colour readback");
     engine::test_quiesce_ring();
     // The gather reads the page during `execute_draw_request`, so the page must
     // outlive that call and only that call.
@@ -884,10 +983,10 @@ fn a_scattered_guest_buffer_window_is_gathered_by_the_gpu_in_one_region_per_stre
             )
             .expect("the slice came from this import"),
         });
-        runs.push(GuestRun {
-            host_ptr: (base + import_offset) as usize,
-            len: STRETCH,
-        });
+        runs.push(
+            GuestRun::whole((base + import_offset) as usize, STRETCH)
+                .expect("a fixture run covers its own span"),
+        );
     }
 
     let before = engine::counter_snapshot();
@@ -1114,10 +1213,10 @@ void main() {{
             )
             .expect("the slice came from this import"),
         });
-        runs.push(GuestRun {
-            host_ptr: (base + import_offset) as usize,
-            len: STRETCH,
-        });
+        runs.push(
+            GuestRun::whole((base + import_offset) as usize, STRETCH)
+                .expect("a fixture run covers its own span"),
+        );
     }
 
     let before = engine::counter_snapshot();
@@ -1136,7 +1235,8 @@ void main() {{
     engine::execute_draw_request(&req).expect("the gathered draw");
     let px = engine::read_target(&identity)
         .expect("read_target flushes the batch")
-        .into_rgba8();
+        .into_rgba8()
+        .expect("an eight-bit colour readback");
 
     let d = engine::counter_snapshot().delta_since(&before);
     assert_eq!(
@@ -1294,10 +1394,10 @@ void main() {{
             )
             .expect("the slice came from this import"),
         });
-        runs.push(GuestRun {
-            host_ptr: (base + import_offset) as usize,
-            len: STRETCH,
-        });
+        runs.push(
+            GuestRun::whole((base + import_offset) as usize, STRETCH)
+                .expect("a fixture run covers its own span"),
+        );
     }
 
     let before = engine::counter_snapshot();
@@ -1316,7 +1416,8 @@ void main() {{
     engine::execute_draw_request(&req).expect("the fallback draw");
     let px = engine::read_target(&identity)
         .expect("read_target flushes the batch")
-        .into_rgba8();
+        .into_rgba8()
+        .expect("an eight-bit colour readback");
 
     let d = engine::counter_snapshot().delta_since(&before);
     assert_eq!(
@@ -1458,10 +1559,8 @@ void main() {{
         )
         .expect("the slice came from this import"),
     }];
-    let runs = vec![GuestRun {
-        host_ptr: base as usize,
-        len: WINDOW,
-    }];
+    let runs =
+        vec![GuestRun::whole(base as usize, WINDOW).expect("a fixture run covers its own span")];
 
     let before = engine::counter_snapshot();
     let mut req = batch_req(&vert, &frag, &identity, false, half_scissor(true));
@@ -1479,7 +1578,8 @@ void main() {{
     engine::execute_draw_request(&req).expect("the in-place draw");
     let px = engine::read_target(&identity)
         .expect("read_target flushes the batch")
-        .into_rgba8();
+        .into_rgba8()
+        .expect("an eight-bit colour readback");
 
     let d = engine::counter_snapshot().delta_since(&before);
     assert_eq!(
@@ -1550,8 +1650,7 @@ fn an_index_window_is_bound_in_place_without_a_cpu_copy() {
     let base = backing.as_ptr() as u64 + pad;
     let start = (pad + SOURCE_OFFSET) as usize;
     for (slot, index) in [0u16, 1, 2].into_iter().enumerate() {
-        backing[start + slot * 2..start + slot * 2 + 2]
-            .copy_from_slice(&index.to_le_bytes());
+        backing[start + slot * 2..start + slot * 2 + 2].copy_from_slice(&index.to_le_bytes());
     }
 
     let import = std::sync::Arc::new(
@@ -1574,10 +1673,9 @@ fn an_index_window_is_bound_in_place_without_a_cpu_copy() {
         .expect("the slice came from this import"),
     }];
     let source = GuestRunSource {
-        runs: std::sync::Arc::new(vec![GuestRun {
-            host_ptr: base as usize,
-            len: block_len,
-        }]),
+        runs: std::sync::Arc::new(vec![
+            GuestRun::whole(base as usize, block_len).expect("a fixture run covers its own span")
+        ]),
         source_offset: SOURCE_OFFSET,
         total_len: INDEX_BYTES,
         row_length_texels: 0,
@@ -1597,15 +1695,23 @@ fn an_index_window_is_bound_in_place_without_a_cpu_copy() {
     engine::execute_draw_request(&req).expect("repeated indexed draw");
     let px = engine::read_target(&identity)
         .expect("read_target flushes the indexed draw")
-        .into_rgba8();
+        .into_rgba8()
+        .expect("an eight-bit colour readback");
 
     let d = engine::counter_snapshot().delta_since(&before);
     assert_eq!(d.buffer_guest_index_imports, 1, "index source: {d:?}");
-    assert_eq!(d.buffer_guest_index_import_bytes, INDEX_BYTES, "index source: {d:?}");
+    assert_eq!(
+        d.buffer_guest_index_import_bytes, INDEX_BYTES,
+        "index source: {d:?}"
+    );
     assert_eq!(d.buffer_index_bind_reuses, 1, "index source: {d:?}");
     assert_eq!(d.buffer_guest_gathers, 0, "index source: {d:?}");
     assert_eq!(d.buffer_snapshot_binds, 0, "index source: {d:?}");
     let i = (((H / 2) * W + W / 4) * 4) as usize;
-    assert!(is_frag_color(&px[i..i + 4]), "indexed pixel = {:?}", &px[i..i + 4]);
+    assert!(
+        is_frag_color(&px[i..i + 4]),
+        "indexed pixel = {:?}",
+        &px[i..i + 4]
+    );
     engine::test_quiesce_ring();
 }

@@ -1,0 +1,15 @@
+[package]
+name = "reims-vgpu-env"
+version = "0.1.0"
+edition = "2021"
+description = "Every environment variable the Reims vGPU device reads, and the one way they parse"
+license = "GPL-2.0-or-later"
+
+[lib]
+name = "reims_vgpu_env"
+
+# No dependencies, on purpose. An operator switch is a name and a parse; a crate
+# that needed anything else to answer "what did the operator set" would be a
+# crate that could answer differently in two builds. See the module doc for why
+# the answer may only ever narrow what the device does.
+[dependencies]

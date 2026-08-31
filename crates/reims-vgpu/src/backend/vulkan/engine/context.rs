@@ -74,12 +74,55 @@ const PIPELINE_CACHE_HEADER_ONE_LEN: usize = 32;
 /// Why a large blob costs more per compile is the driver's business and is not
 /// measured here. Size is the observable, so size is what this bounds.
 ///
-/// 16 MiB is four times the ~3.9 MB a boot of this workload settles at, so a
-/// workload several times richer still warms fully, and it is half the 30.8 MB
-/// at which the penalty was measured. Growth at steady state is ~0.1 MB a boot
-/// (3.85 -> 3.95 across two boots), so this is ~120 boots of headroom before the
-/// bound is reached and the blob is rebuilt from one boot.
-const PIPELINE_CACHE_MAX_WARM_BYTES: usize = 16 * 1024 * 1024;
+/// Six interleaved driven macos-15 Maps boots repeated the shape on a second
+/// rail and a second host GPU, and moved the bound. Arms differ only in the blob
+/// the boot starts from; `misses` is `pipeline_misses + compute_pipeline_misses`:
+///
+/// ```text
+/// loaded    settled   misses   pl_compile_us   per compile
+/// 14.4 MB   14.4 MB     285        0.601 s       2.11 ms
+/// 14.4 MB   14.4 MB     285        0.603 s       2.12 ms
+///  0.00 MB   3.3 MB     278        0.158 s       0.57 ms
+///  0.00 MB   3.4 MB     301        0.153 s       0.51 ms
+///  3.3 MB    3.4 MB     275        0.156 s       0.57 ms
+///  3.3 MB    3.4 MB     283        0.148 s       0.52 ms
+/// ```
+///
+/// Two readings, and the arms are disjoint by 3.9x with the miss counts within
+/// 2.5 % of each other, so both are about what a compile costs and not about how
+/// many happen:
+///
+/// - **14.4 MB is already deep in the penalty region.** It is under the 16 MiB
+///   this constant used to be, so the old bound never fired, and the blob parked
+///   there and stayed — 0.45 s of extra drain CPU on every boot, forever, on the
+///   thread that holds the device lock.
+/// - **A right-sized blob and no blob at all are indistinguishable here** (0.545
+///   against 0.540 ms). The warm start pays on macos-13 and does not pay on
+///   macos-15, so it stays; what cannot stay is a size at which it charges 3.9x
+///   for a benefit that is, on at least one rail, zero.
+///
+/// So the bound is set from the two measured working sets rather than from
+/// headroom above them: 8 MiB is twice the larger (3.85 MB on macos-13, 3.4 MB
+/// on macos-15) and comfortably under the smallest size at which a penalty has
+/// ever been measured here (14.4 MB). A workload whose genuine working set
+/// exceeds it rebuilds every boot and says so by name, which costs a cold start
+/// and is what the arms above price at 0.5-1.4 ms a compile — the parked blob
+/// costs more than that and reports nothing.
+const PIPELINE_CACHE_MAX_WARM_BYTES: usize = 8 * 1024 * 1024;
+
+/// The largest blob a single boot has been measured to settle at: 3.85 MB on
+/// macos-13, 3.4 MB on macos-15, rounded up to a whole MiB.
+///
+/// Declared separately because it is a different kind of number from the bound —
+/// an observation about the guest's workload rather than a policy — and because
+/// the relation between the two is the one that must hold. A bound at or below
+/// one boot's working set makes *every* boot overflow and discard, so the warm
+/// start could never happen and the rail would silently become cold-only.
+const PIPELINE_CACHE_WORKING_SET_BYTES: usize = 4 * 1024 * 1024;
+
+/// The bound has to leave room for a boot's own working set, or the rebuild path
+/// below fires on every boot and the warm cache is dead code with a cost.
+const _: () = assert!(PIPELINE_CACHE_MAX_WARM_BYTES >= 2 * PIPELINE_CACHE_WORKING_SET_BYTES);
 
 /// On-disk pipeline-cache blob location for a device, keyed by its
 /// pipelineCacheUUID (hex) so blobs from other GPUs/driver versions land in
@@ -135,6 +178,14 @@ enum PipelineCacheDecline {
         errno: Option<i32>,
         kind: std::io::ErrorKind,
     },
+    /// The blob was past [`PIPELINE_CACHE_MAX_WARM_BYTES`] and could not be
+    /// removed, so the next boot will load the oversized file again and pay the
+    /// per-compile penalty for it. Separate from [`Self::TooLarge`], which says
+    /// the rebuild was *decided*: only this one says it did not happen.
+    Discard {
+        errno: Option<i32>,
+        kind: std::io::ErrorKind,
+    },
 }
 
 impl PipelineCacheDecline {
@@ -158,6 +209,13 @@ impl PipelineCacheDecline {
             kind: error.kind(),
         }
     }
+
+    fn discard(error: &std::io::Error) -> Self {
+        Self::Discard {
+            errno: error.raw_os_error(),
+            kind: error.kind(),
+        }
+    }
 }
 
 impl crate::observe::Decline for PipelineCacheDecline {
@@ -169,6 +227,7 @@ impl crate::observe::Decline for PipelineCacheDecline {
             Self::WarmCreate { .. } => "vk_pipeline_cache_warm_create",
             Self::Write { .. } => "vk_pipeline_cache_write",
             Self::Rename { .. } => "vk_pipeline_cache_rename",
+            Self::Discard { .. } => "vk_pipeline_cache_discard",
         }
     }
 
@@ -176,7 +235,8 @@ impl crate::observe::Decline for PipelineCacheDecline {
         match self {
             Self::Read { errno, kind }
             | Self::Write { errno, kind }
-            | Self::Rename { errno, kind } => vec![
+            | Self::Rename { errno, kind }
+            | Self::Discard { errno, kind } => vec![
                 (
                     "errno",
                     errno.map_or_else(|| "none".to_string(), |value| value.to_string()),
@@ -221,6 +281,30 @@ fn write_cache_atomic(
             let _ = std::fs::remove_file(tmp);
             Err(PipelineCacheDecline::rename(&e))
         }
+    }
+}
+
+/// Remove the on-disk blob and reset the newest-wins guard, so the next boot
+/// starts cold and the boot after it warms from a blob this workload's own
+/// working set produced.
+///
+/// Resetting `persisted_len` is load-bearing, not tidiness. It holds the largest
+/// length that has landed, and [`write_cache_atomic`] drops any save that is not
+/// larger. Leaving it at the discarded blob's length would supersede every save
+/// that follows — the file would never come back and the rail would be cold for
+/// the life of the process rather than for one boot.
+///
+/// A blob that is already gone is the outcome this wanted, so `NotFound` is
+/// success. Pure w.r.t. Vulkan (fs + atomic only) → unit-testable.
+fn discard_cache_blob(
+    path: &std::path::Path,
+    persisted_len: &AtomicUsize,
+) -> Result<(), PipelineCacheDecline> {
+    persisted_len.store(0, Ordering::Relaxed);
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(PipelineCacheDecline::discard(&error)),
     }
 }
 
@@ -706,7 +790,12 @@ impl DeviceContext {
                 ash::khr::xcb_surface::NAME,
                 ash::khr::wayland_surface::NAME,
             ];
-            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+            // VK_KHR_win32_surface is the Windows host-window surface
+            // extension; one arm per OS keeps each list exactly what that
+            // loader can advertise.
+            #[cfg(target_os = "windows")]
+            let platform: &[&CStr] = &[ash::khr::win32_surface::NAME];
+            #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
             let platform: &[&CStr] = &[];
             let available: Vec<&CStr> = platform
                 .iter()
@@ -1038,23 +1127,22 @@ impl DeviceContext {
         // One region per ring slot, for the reason `TimestampProbe`'s doc gives:
         // the guest-page writeback submits without waiting, so two of its copies
         // can be in flight at once and a shared region is reset under the first.
-        let timestamps = scale
-            .and_then(|scale| {
-                let ci = vk::QueryPoolCreateInfo::default()
-                    .query_type(vk::QueryType::TIMESTAMP)
-                    .query_count(TimestampProbe::PER_SLOT * super::pools::RING_DEPTH as u32);
-                device
-                    .create_query_pool(&ci, None)
-                    .map(|pool| TimestampProbe { pool, scale })
-                    .map_err(|e| {
-                        crate::observe::Emit::decline(
-                            "vk_timestamp_pool",
-                            &VkCall::new(VkOp::ContextCreateQueryPool, e),
-                        )
-                        .fail_once(0);
-                    })
-                    .ok()
-            });
+        let timestamps = scale.and_then(|scale| {
+            let ci = vk::QueryPoolCreateInfo::default()
+                .query_type(vk::QueryType::TIMESTAMP)
+                .query_count(TimestampProbe::PER_SLOT * super::pools::RING_DEPTH as u32);
+            device
+                .create_query_pool(&ci, None)
+                .map(|pool| TimestampProbe { pool, scale })
+                .map_err(|e| {
+                    crate::observe::Emit::decline(
+                        "vk_timestamp_pool",
+                        &VkCall::new(VkOp::ContextCreateQueryPool, e),
+                    )
+                    .fail_once(0);
+                })
+                .ok()
+        });
         let draw_spans = scale
             .filter(|_| crate::env::read(crate::env::GPU_SPANS).0 != crate::env::Switch::Off)
             .and_then(|scale| {
@@ -1265,6 +1353,18 @@ impl DeviceContext {
         let Some(path) = self.pipeline_cache_path.clone() else {
             return;
         };
+        // Largest cache length already landed on disk. The VkPipelineCache only
+        // grows, so `data.len()` orders the snapshots. Best-effort newest-wins:
+        // if a strictly larger snapshot already landed by the time this thread is
+        // about to rename, drop this smaller one rather than regress the on-disk
+        // cache to a stale subset. This narrows (does not fully serialize) the
+        // concurrent-save window — a residual reorder only costs one pipeline a
+        // warm-start miss next boot and self-heals on the next compile, so a lock
+        // is not warranted for a best-effort cache. Keyed per physical device via
+        // the UUID-derived path (a DEVICE_LOST recreate reuses the same file), so
+        // a process-wide static is correct.
+        static PERSISTED_LEN: AtomicUsize = AtomicUsize::new(0);
+
         let data = match unsafe { self.device.get_pipeline_cache_data(self.pipeline_cache) } {
             Ok(d) => d,
             Err(e) => {
@@ -1273,10 +1373,17 @@ impl DeviceContext {
                 return;
             }
         };
-        // Never write back a blob the next boot would refuse to load. Without
-        // this the bound above still self-heals — one cold boot rebuilds a small
-        // blob — but every boot in between pays a 30 MB write to produce a file
-        // whose only use is to be declined.
+        // Past the bound the blob costs more per compile than starting cold,
+        // so this is where it is rebuilt — not merely left alone.
+        //
+        // Declining the write on its own was never the self-heal it was written
+        // to be. The load refuses at this same bound, and a save that never
+        // writes anything larger means the file can never exceed it, so the
+        // load's refusal could not fire. The blob climbed to just under the cap
+        // and stayed there for the life of the machine, which is the state six
+        // interleaved macos-15 boots priced at 3.9x per compile against a
+        // right-sized one. Discarding it is what makes the next boot cold and
+        // the one after that warm at this workload's own working-set size.
         if data.len() > PIPELINE_CACHE_MAX_WARM_BYTES {
             crate::observe::Emit::decline(
                 "vk_pipeline_cache_save",
@@ -1286,6 +1393,9 @@ impl DeviceContext {
                 },
             )
             .fail_once(0);
+            if let Err(decline) = discard_cache_blob(&path, &PERSISTED_LEN) {
+                crate::observe::Emit::decline("vk_pipeline_cache_save", &decline).fail_once(0);
+            }
             return;
         }
         // Growth debounce: byte length is the proxy for "a new pipeline
@@ -1307,17 +1417,6 @@ impl DeviceContext {
         // A per-save sequence number makes each thread's tmp file private, so the
         // write→rename is race-free and the newest save always lands.
         static SAVE_SEQ: AtomicU64 = AtomicU64::new(0);
-        // Largest cache length already landed on disk. The VkPipelineCache only
-        // grows, so `data.len()` orders the snapshots. Best-effort newest-wins:
-        // if a strictly larger snapshot already landed by the time this thread is
-        // about to rename, drop this smaller one rather than regress the on-disk
-        // cache to a stale subset. This narrows (does not fully serialize) the
-        // concurrent-save window — a residual reorder only costs one pipeline a
-        // warm-start miss next boot and self-heals on the next compile, so a lock
-        // is not warranted for a best-effort cache. Keyed per physical device via
-        // the UUID-derived path (a DEVICE_LOST recreate reuses the same file), so
-        // a process-wide static is correct.
-        static PERSISTED_LEN: AtomicUsize = AtomicUsize::new(0);
         let seq = SAVE_SEQ.fetch_add(1, Ordering::Relaxed);
         std::thread::spawn(move || {
             let tmp = path.with_extension(format!("tmp.{}.{}", std::process::id(), seq));
@@ -1599,7 +1698,10 @@ impl DeviceContext {
             .wait_dst_stage_mask(transaction.wait_stages)
             .command_buffers(transaction.command_buffers)
             .signal_semaphores(transaction.signal_semaphores);
-        unsafe { self.device.queue_submit(self.queue(), &[info], transaction.fence) }?;
+        unsafe {
+            self.device
+                .queue_submit(self.queue(), &[info], transaction.fence)
+        }?;
         let waits = [transaction.present_wait];
         let swapchains = [transaction.swapchain];
         let indices = [transaction.image_index];
@@ -2198,6 +2300,57 @@ mod pipeline_cache_blob_tests {
             big,
             "larger snapshot upgraded the cache"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An oversized blob is discarded, and the newest-wins guard reopens so the
+    /// rebuilt (smaller) blob can land.
+    ///
+    /// The reset is the half that fails silently without this test. Leaving
+    /// `persisted_len` at the discarded blob's length makes every later save
+    /// `Superseded`, so the file never comes back and the rail is cold for the
+    /// life of the process — which reads in a log exactly like a machine that
+    /// simply never warmed.
+    #[test]
+    fn discard_reopens_the_guard_so_a_rebuilt_blob_lands() {
+        let dir =
+            std::env::temp_dir().join(format!("reims-vgpu-cache-test4-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cache.bin");
+        let persisted = AtomicUsize::new(0);
+        let oversized = vec![0x7Eu8; 8192];
+        assert_eq!(
+            write_cache_atomic(&path, &dir.join("t.0"), &oversized, &persisted).unwrap(),
+            CacheSaveOutcome::Landed
+        );
+        assert_eq!(persisted.load(Ordering::Relaxed), 8192);
+
+        discard_cache_blob(&path, &persisted).unwrap();
+        assert!(!path.exists(), "oversized blob discarded");
+        assert_eq!(persisted.load(Ordering::Relaxed), 0, "guard reopened");
+
+        // The rebuild is smaller than what was discarded, which is the whole
+        // point, so it must not be read as a regression of the on-disk cache.
+        let rebuilt = vec![0x2Au8; 1024];
+        assert_eq!(
+            write_cache_atomic(&path, &dir.join("t.1"), &rebuilt, &persisted).unwrap(),
+            CacheSaveOutcome::Landed
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), rebuilt);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Discarding a blob that is already gone is the outcome asked for, not a
+    /// failure — every save after the first overflow in one process takes this
+    /// path, and each one would otherwise report an error it cannot act on.
+    #[test]
+    fn discarding_an_absent_blob_is_success() {
+        let dir =
+            std::env::temp_dir().join(format!("reims-vgpu-cache-test5-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let persisted = AtomicUsize::new(4096);
+        discard_cache_blob(&dir.join("never-written.bin"), &persisted).unwrap();
+        assert_eq!(persisted.load(Ordering::Relaxed), 0);
         std::fs::remove_dir_all(&dir).ok();
     }
 

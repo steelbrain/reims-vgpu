@@ -581,43 +581,38 @@ fn run(device: &ash::Device, semaphore: vk::Semaphore, shared: &Shared) {
         let info = vk::SemaphoreWaitInfo::default()
             .semaphores(&semaphores)
             .values(&values);
-        // The same deadline every blocking wait in this backend uses. Reaching
-        // it means the queue has not run this submission, which is a device
-        // fault rather than a slow frame — announce anyway and say so, because
-        // the guest's own deadline is one second and a withheld stamp costs it
-        // that whether the GPU is wedged or not.
-        let completed =
-            match unsafe { device.wait_semaphores(&info, super::context::FENCE_TIMEOUT_NS) } {
-                Ok(()) => true,
-                Err(vk::Result::TIMEOUT) => {
-                    crate::observe::fail(format!(
-                        "stamp_wait_timeout reason=stamp_wait_timeout index={} value={} \
-                     (the submission carrying this stamp's word has not executed within the \
-                     fence deadline; announcing it anyway so the guest is not left asleep)",
-                        waiting.index, timeline
-                    ));
-                    false
+        // A deadline is not an answer about this submission, so it does not end
+        // the wait. See [`await_completion`].
+        let completed = await_completion(
+            || unsafe { device.wait_semaphores(&info, super::context::FENCE_TIMEOUT_NS) },
+            || shared.stop.load(Ordering::Acquire),
+            |deadlines| note_wait_timeout(device, semaphore, shared, &waiting, timeline, deadlines),
+            |e| {
+                crate::observe::fail(format!(
+                    "stamp_wait_failed reason=stamp_wait_failed index={} value={} err={e:?} \
+                     (announcing regardless, because a guest asleep on this word has no other \
+                     way to learn its device is gone)",
+                    waiting.index, timeline
+                ));
+                // Announcing is not recovering. This thread may not take the
+                // engine lock — it exists to announce guest fences while the
+                // drain worker holds it — so it latches the loss and the drain's
+                // end-of-tranche flush runs the recovery. Without this, a boot
+                // whose device dies *here* never rebuilds it: the guest stops
+                // drawing because its work stopped completing, and "the next
+                // draw will surface it" then waits forever.
+                if e == vk::Result::ERROR_DEVICE_LOST {
+                    super::device_lost::note_device_lost_seen();
                 }
-                Err(e) => {
-                    crate::observe::fail(format!(
-                        "stamp_wait_failed reason=stamp_wait_failed index={} value={} err={e:?} \
-                     (announcing regardless, for the reason a timeout does)",
-                        waiting.index, timeline
-                    ));
-                    // Announcing is not recovering. This thread may not take the
-                    // engine lock — it exists to announce guest fences while the
-                    // drain worker holds it — so it latches the loss and the drain's
-                    // end-of-tranche flush runs the recovery. Without this, a boot
-                    // whose device dies *here* never rebuilds it: the guest stops
-                    // drawing because its work stopped completing, and "the next
-                    // draw will surface it" then waits forever.
-                    if e == vk::Result::ERROR_DEVICE_LOST {
-                        super::device_lost::note_device_lost_seen();
-                    }
-                    false
-                }
-            };
+            },
+        );
         let stopping = shared.stop.load(Ordering::Acquire);
+        if !completed && !stopping {
+            // Size what is still lost after the deadline stopped being a
+            // verdict. Reaching here now means the device reported an error or
+            // is shutting down, not merely that the GPU was slow.
+            crate::runtime::drain::census::note_store_route("stamp_word_abandoned");
+        }
         if should_publish(completed, stopping) && !publish_stamp_word(&waiting) {
             crate::observe::fail(format!(
                 "stamp_cpu_store_failed reason=stamp_cpu_store_failed index={} value={:#x} \
@@ -639,6 +634,134 @@ fn run(device: &ash::Device, semaphore: vk::Semaphore, shared: &Shared) {
             return;
         }
     }
+}
+
+/// Wait out one stamp's timeline point, treating a fence deadline as news
+/// rather than as a verdict.
+///
+/// # Why a deadline may not end the wait
+///
+/// The guest owns exactly one way to learn that its work is done: the word this
+/// device stores into the stamp page. `waitForStamp` sleeps on that word's own
+/// address and re-reads it on every wake, so a wakeup that arrives without a
+/// new word is not a partial delivery — it is none. The guest's one-second
+/// deadline is a re-read timer, not a give-up.
+///
+/// Withholding the word when the submission has not completed is therefore
+/// right, and stays right: publishing it early would tell the guest its results
+/// are ready and its inputs are free, which is the late-write-after-release
+/// shape. But *abandoning* the entry is a different act, and it is the one that
+/// wedges the guest — a submission that completes a moment after the deadline
+/// then has nothing left that could store its word.
+///
+/// This is not hypothetical, and the surviving population is not the tail.
+/// Measured on rail macos-15 at the `srt_blit_after_render_1920x1080` case,
+/// which commits 256 heavy whole-target draws without waiting and then blocks
+/// in `waitUntilCompleted()` on a blit behind them:
+///
+/// ```text
+/// stamp_wait_timeout index=1 value=1594 counter=1592 reserved=1595 queued=1595
+///                    class=stamp_timeout_queued_not_run
+/// ```
+///
+/// The point was handed to the queue owner (`queued >= value`) and the timeline
+/// is **two points** behind. That is a GPU a little way behind a heavy pass, not
+/// a wedged one, and the old code answered it by discarding the word the guest
+/// was asleep on. A preserved run shows the consequence exactly: last device
+/// work at t=55073, then 575 s with `packets=0` because the guest had nothing
+/// left to send.
+///
+/// So the deadline is reported and the wait resumes. Only two things end it: the
+/// point arrives, or the device says something other than `TIMEOUT` — which is
+/// where `ERROR_DEVICE_LOST` is handled and recovery is latched. Shutdown ends
+/// it too, because [`StampCompletion::stop`] signals past every reserved value
+/// before joining, so a thread parked here returns.
+///
+/// Taking the wait, the shutdown test and the two reports as arguments is what
+/// makes this loop testable: the caller supplies a real `vkWaitSemaphores` and a
+/// test supplies a sequence, so the rule "a deadline does not abandon the word"
+/// is checked rather than asserted in a comment.
+fn await_completion(
+    mut wait: impl FnMut() -> Result<(), vk::Result>,
+    stopping: impl Fn() -> bool,
+    mut on_deadline: impl FnMut(u32),
+    on_error: impl FnOnce(vk::Result),
+) -> bool {
+    let mut deadlines = 0u32;
+    loop {
+        match wait() {
+            Ok(()) => return true,
+            Err(vk::Result::TIMEOUT) => {
+                deadlines += 1;
+                on_deadline(deadlines);
+                if stopping() {
+                    return false;
+                }
+            }
+            Err(e) => {
+                on_error(e);
+                return false;
+            }
+        }
+    }
+}
+
+/// Report a stamp whose timeline point did not arrive within the fence
+/// deadline, and say **which of the two very different things** happened.
+///
+/// The deadline alone does not distinguish them, and they have opposite
+/// repairs:
+///
+/// * `counter` has not reached `value`, but `queued` has — the submission was
+///   handed to the ordered queue owner and the GPU has not run it yet. That is
+///   a slow or wedged queue, and waiting longer would eventually publish a
+///   correct word.
+/// * `counter` has not reached `value` and neither has `queued` — the point was
+///   *reserved* and never handed to the owner at all. Nothing in flight will
+///   ever signal it. `submit_guest_work`'s contract says "a later successful
+///   value may legally skip the unused reservation", and that is sound only
+///   while later work keeps arriving: `vkWaitSemaphores` is a `>=` wait, so any
+///   higher signal releases the waiter. A guest blocked in `waitForStamp` is
+///   precisely a guest that has stopped producing that later work, so for the
+///   stamp that wedges it the skip is not repaired by anything.
+///
+/// Measured on rail macos-15: every occurrence is
+/// `stamp_timeout_queued_not_run`, with the counter two or three points behind
+/// a value the owner had already been handed. The second branch has not been
+/// seen, and is kept because it is the one that would need a different repair —
+/// [`await_completion`] waits a slow submission out, but nothing it can do
+/// rescues a point no submission will ever signal.
+///
+/// The counters are summable `store_routes` entries; the line is
+/// per-occurrence and always-on. `deadlines` counts how many fence deadlines
+/// this one stamp has now outlived, so a genuinely stuck point is visible as a
+/// climbing number rather than as one indistinguishable line per 5 s.
+fn note_wait_timeout(
+    device: &ash::Device,
+    semaphore: vk::Semaphore,
+    shared: &Shared,
+    waiting: &Waiting,
+    timeline: u64,
+    deadlines: u32,
+) {
+    let counter = unsafe { device.get_semaphore_counter_value(semaphore) }.ok();
+    let reserved = shared.next_value.load(Ordering::Acquire);
+    let queued = shared.latest_queued.load(Ordering::Acquire);
+    let route = if queued >= timeline {
+        "stamp_timeout_queued_not_run"
+    } else {
+        "stamp_timeout_never_submitted"
+    };
+    crate::runtime::drain::census::note_store_route(route);
+    crate::observe::fail(format!(
+        "stamp_wait_timeout reason=stamp_wait_timeout index={} value={timeline} counter={} \
+         reserved={reserved} queued={queued} class={route} deadlines={deadlines} \
+         (the submission carrying this stamp's word has not executed within the fence \
+         deadline; the wait resumes and the word is still owed, so this is how far behind \
+         the queue is and not a loss)",
+        waiting.index,
+        counter.map_or_else(|| "unknown".to_string(), |v| v.to_string()),
+    ));
 }
 
 fn should_publish(completed: bool, stopping: bool) -> bool {
@@ -684,6 +807,89 @@ fn note_publish_latency(elapsed: std::time::Duration) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A fence deadline is not an answer about the submission, so it must not
+    /// end the wait.
+    ///
+    /// The guest has one way to learn its work is done, and it is the word this
+    /// device stores. Abandoning the entry at a deadline destroys that word for
+    /// good: the submission completes a moment later and nothing is left that
+    /// could publish it, so a guest asleep in `waitForStamp` — which re-reads
+    /// on every wake and never gives up — sleeps forever. Measured on rail
+    /// macos-15 as a device that does its last work at t=55073 and then sees
+    /// `packets=0` for a further 575 s.
+    ///
+    /// The deadlines here are the shape the rail actually produces:
+    /// `class=stamp_timeout_queued_not_run`, the point already handed to the
+    /// queue owner, the timeline two points behind, and the work landing after
+    /// the wait resumes rather than never.
+    #[test]
+    fn a_fence_deadline_reports_and_resumes_instead_of_abandoning_the_word() {
+        let mut remaining = 2;
+        let mut deadlines_seen = Vec::new();
+        let mut errors = 0;
+        let completed = await_completion(
+            || {
+                if remaining > 0 {
+                    remaining -= 1;
+                    Err(vk::Result::TIMEOUT)
+                } else {
+                    Ok(())
+                }
+            },
+            || false,
+            |n| deadlines_seen.push(n),
+            |_| errors += 1,
+        );
+        assert!(
+            completed,
+            "a submission that lands after two fence deadlines has completed, and its word \
+             is owed to the guest; reporting `false` here is what drops it"
+        );
+        assert_eq!(
+            deadlines_seen,
+            vec![1, 2],
+            "every deadline is reported, and numbered, so a genuinely stuck point is a \
+             climbing count rather than one indistinguishable line per 5 s"
+        );
+        assert_eq!(errors, 0, "a deadline is not a device error");
+    }
+
+    /// Shutdown is the one thing that ends the wait without the point arriving.
+    ///
+    /// `StampCompletion::stop` signals past every reserved value before joining,
+    /// so this path exists for the case where that signal and this deadline
+    /// race. Publishing is separately refused while stopping, so returning
+    /// `false` here loses nothing that shutdown was not already discarding.
+    #[test]
+    fn shutdown_ends_the_wait_at_the_first_deadline() {
+        let mut waits = 0;
+        let completed = await_completion(
+            || {
+                waits += 1;
+                Err(vk::Result::TIMEOUT)
+            },
+            || true,
+            |_| {},
+            |_| panic!("a deadline is not an error"),
+        );
+        assert!(!completed);
+        assert_eq!(waits, 1, "shutdown is checked after the first deadline");
+    }
+
+    /// A device error still ends the wait, and still latches recovery.
+    #[test]
+    fn a_device_error_ends_the_wait() {
+        let mut seen = None;
+        let completed = await_completion(
+            || Err(vk::Result::ERROR_DEVICE_LOST),
+            || false,
+            |_| panic!("an error is not a deadline"),
+            |e| seen = Some(e),
+        );
+        assert!(!completed);
+        assert_eq!(seen, Some(vk::Result::ERROR_DEVICE_LOST));
+    }
 
     fn waiting(index: u32, stamp: u32) -> Waiting {
         let mut word = Box::new(0u32);

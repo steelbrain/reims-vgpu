@@ -40,8 +40,7 @@ Screenshot capture is intentionally handled by the host helpers, not by QMP.
 stale QEMU display surface is not mistaken for the host-owned window.
 
 ```sh
-scripts/screenshot-when-macos-host/screenshot-when-macos-host.sh out.png
-scripts/screenshot-when-kde-plasma-host/screenshot-when-kde-plasma-host.sh -o out.png
+scripts/screenshot/screenshot.sh out.png
 ```
 
 **`click` / `move` / `drag` still size the guest display through QMP
@@ -50,9 +49,8 @@ internally.** They are input helpers, not screenshot helpers.
 ## Why QMP Screenshots Are Blocked
 
 QMP display capture reads QEMU's `DisplaySurface`. The host-owned window presents through the Rust
-backend and the compositor, so QMP is the wrong observation surface for screenshots. Use
-`scripts/screenshot-when-macos-host/` on macOS or `scripts/screenshot-when-kde-plasma-host/` on KDE
-Plasma.
+backend and the compositor, so QMP is the wrong observation surface for screenshots. Use the
+cross-platform helper under `scripts/screenshot/`.
 
 **Input delivery is unaffected.** `click` / `move` / `drag` / `key` / `type` ride
 `input-send-event` to the guest's usb-kbd + usb-tablet, which is display-

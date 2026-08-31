@@ -16,16 +16,14 @@ use crate::runtime::decode::resource::{
     ICB_DESC_OPTIONS, ICB_FLAG_INHERIT_BUFFERS, ICB_LAYOUT_LEN,
     MTL_INDIRECT_CMD_CONCURRENT_DISPATCH, MTL_INDIRECT_CMD_DRAW, MTL_INDIRECT_CMD_DRAW_INDEXED,
     OBJECT_LIST_ENTRY_LEN, OBJECT_TYPE_BUFFER, OBJECT_TYPE_TYPE7, PIPELINE_TAG_FRAGMENT_FUNC,
-    PIPELINE_TAG_VERTEX_FUNC,
-    RESOURCE_PAGE_SHIFT, TYPE7_OBJECT_ICB, TYPE7_OBJECT_RENDER_PIPELINE,
+    PIPELINE_TAG_VERTEX_FUNC, RESOURCE_PAGE_SHIFT, TYPE7_OBJECT_ICB, TYPE7_OBJECT_RENDER_PIPELINE,
 };
 /// Compute-pipeline and function descriptor constants, used only by the
 /// Metal-arm execute tests below. Kept in their own gated `use` so the Vulkan arm
 /// does not carry unused imports.
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 use crate::runtime::decode::resource::{
-    OBJECT_TYPE_FUNCTION, PIPELINE_TAG_KERNEL_FUNC, TYPE7_FIRST_TLVS,
-    TYPE7_OBJECT_COMPUTE_PIPELINE,
+    OBJECT_TYPE_FUNCTION, PIPELINE_TAG_KERNEL_FUNC, TYPE7_FIRST_TLVS, TYPE7_OBJECT_COMPUTE_PIPELINE,
 };
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 use crate::runtime::draw::{
@@ -4980,11 +4978,7 @@ fn an_icb_execute_that_filled_no_slots_is_counted_and_not_swallowed() {
     // The unfilled case: control flow is unchanged so the caller still does its
     // writeback, but the lost commands are now counted.
     assert_eq!(
-        icb_fill_outcome(
-            Err(IcbStatus::Missing(ICB_FILL_NO_COMMAND_MEMORY)),
-            1,
-            9
-        ),
+        icb_fill_outcome(Err(IcbStatus::Missing(ICB_FILL_NO_COMMAND_MEMORY)), 1, 9),
         Ok(()),
         "an empty execute is a no-op, not a reason to skip the writeback"
     );

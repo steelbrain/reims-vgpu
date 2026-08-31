@@ -15,10 +15,11 @@ pub(crate) use regs::*;
 // `mod`, so this is the only path those links can name — and rustc's
 // unused-import lint cannot see a doc link, so it will call this dead.
 pub use state::{
-    ChannelRing, ComputeStorageResidencyKey, DeviceId, DeviceState, ExecFault,
-    FailEvent, GfxRegs, GuestLinearMemo, GvaBacking, GvaEvictionWitness,
-    GvaHostView, HostLinearTexture, HostSurface, MapperCapture, MappingEntry,
-    PacketFault, PresentBacking, PresentState, RenderFlushWitness, ResourceValidity, SurfaceWriteKind, TaskEntry, TaskResource, TaskResourceLifetimeRef, TaskSamplerState, TaskTable, Type4Walk, UnimplementedCommand, FENCE_DOMAIN_BLIT,
+    ChannelRing, ComputeStorageResidencyKey, DeviceId, DeviceState, ExecFault, FailEvent, GfxRegs,
+    GuestLinearMemo, GvaBacking, GvaEvictionWitness, GvaHostView, HostLinearTexture, HostSurface,
+    MapperCapture, MappingEntry, PacketFault, PresentBacking, PresentState, RenderFlushWitness,
+    ResourceValidity, SurfaceWriteKind, TaskEntry, TaskResource, TaskResourceLifetimeRef,
+    TaskSamplerState, TaskTable, Type4Walk, UnimplementedCommand, FENCE_DOMAIN_BLIT,
     FENCE_DOMAIN_COMPUTE, FENCE_DOMAIN_EVENT, FENCE_DOMAIN_RENDER, GVA_ENCODE_CACHE_BYTE_CAP,
     GVA_EVICTION_WITNESS_KEYS,
 };
@@ -56,9 +57,7 @@ impl<B: Backend> Device<B> {
         self.backend.reset();
         let views = self.state.take_all_host_views();
         let count = views.len();
-        for (ptr, len) in views {
-            host.unmap_pages(ptr, len);
-        }
+        self.state.retired_views.extend(views);
         // Before `reset`, not after: `take_all_host_views` parks the detached
         // guest-write tokens in `retired_guest_write_tokens`, and `reset`
         // replaces `DeviceState` wholesale — so a token still sitting there is
@@ -502,7 +501,10 @@ mod tests {
                 0xee,
             );
             let mut payload = vec![0u8; 12];
-            st32(&mut payload[DEVICE_INFO_TAHOE_KEY_TABLE_LEN..], key_table_len);
+            st32(
+                &mut payload[DEVICE_INFO_TAHOE_KEY_TABLE_LEN..],
+                key_table_len,
+            );
             st32(
                 &mut payload[DEVICE_INFO_TAHOE_COUNT..],
                 (PAGE_SIZE_ARM64E as usize / DEVICE_INFO_REPLY_PAIR_LEN) as u32,

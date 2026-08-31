@@ -36,7 +36,9 @@ use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::PhysicalKey;
 use winit::window::{Window, WindowId};
 
+use super::capture::{Capture, CaptureEngaged, CaptureMode};
 use super::input_map;
+use super::keyboard::{Grab, KeyEffect, Keyboard};
 use crate::runtime::host::HostAction;
 
 /// How long the loop may sleep when nothing has asked it to draw.
@@ -550,7 +552,7 @@ impl WindowError {
 
 /// Collapse whitespace runs to single `_` so a driver/winit string is safe as a
 /// log field value ([`crate::observe::Emit`] splits the line on spaces).
-fn detail_field(s: &str) -> String {
+pub(super) fn detail_field(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join("_")
 }
 
@@ -728,6 +730,14 @@ fn build_event_loop() -> Result<EventLoop<FramePublished>, WindowError> {
         EventLoopBuilderExtX11::with_any_thread(&mut builder, true);
         EventLoopBuilderExtWayland::with_any_thread(&mut builder, true);
     }
+    #[cfg(target_os = "windows")]
+    {
+        use winit::platform::windows::EventLoopBuilderExtWindows;
+        // Windows refuses a non-main-thread event loop unless the application
+        // opts in explicitly; reims owns a dedicated window thread on every
+        // host, so this is the same opt-in the X11/Wayland arms make above.
+        EventLoopBuilderExtWindows::with_any_thread(&mut builder, true);
+    }
     builder
         .build()
         .map_err(|e| WindowError::EventLoopBuild(e.to_string()))
@@ -745,6 +755,18 @@ struct App {
     window: Option<Arc<Window>>,
     /// Last cursor position in window pixels (for absolute pointer moves).
     cursor: (u32, u32),
+    /// What the guest believes it is holding, and whether the host desktop's
+    /// shortcuts are being captured. See [`super::keyboard`] — the rule that
+    /// every key-down is closed by a key-up lives there, not at these call
+    /// sites.
+    keyboard: Keyboard,
+    /// True once capture has actually engaged at least once, so the census
+    /// line that says so is emitted a single time rather than per focus change.
+    capture_engaged_logged: bool,
+    /// The platform's shortcut capture, built once the native window exists.
+    /// `None` before `resumed`; a [`super::capture::NoCapture`] on a window
+    /// system this build cannot ask, so the call sites never branch.
+    capture: Option<Box<dyn Capture>>,
     /// The engine presenter holds a swapchain on this window's surface. False
     /// before the attach in `resumed` and again after `exiting` releases it;
     /// there is no other presenter, so false means nothing can be drawn.
@@ -899,6 +921,10 @@ impl ApplicationHandler<FramePublished> for App {
                 return;
             }
         };
+        // Built before the engine attach so a window that fails to present
+        // still reports which capture it would have had, and torn down with the
+        // window in `exiting`.
+        self.capture = Some(Self::build_capture(&window));
         match Self::attach_engine(&window) {
             Ok(()) => {
                 self.engine_attached = true;
@@ -972,9 +998,23 @@ impl ApplicationHandler<FramePublished> for App {
                 if let PhysicalKey::Code(code) = event.physical_key {
                     if let Some(evdev) = input_map::keycode_to_evdev(code) {
                         let down = event.state == ElementState::Pressed;
-                        (self.on_input)(HostAction::input_key(evdev, down));
+                        // Not forwarded straight through: `keyboard` records
+                        // what the guest is holding so focus loss can close it,
+                        // and it consumes the ungrab chord rather than letting
+                        // the escape hatch reach the guest as a stray Esc.
+                        let effect = self.keyboard.key(evdev, down);
+                        self.apply_key_effect(effect);
                     }
                 }
+            }
+            WindowEvent::Focused(focused) => {
+                // The window system does not promise a key-up for a key held
+                // when focus is lost — Wayland promises the opposite, that the
+                // client treats them all as released — so a key left down here
+                // stays down in the guest for the rest of the boot. This is
+                // also where the desktop's shortcuts are taken and handed back.
+                let effect = self.keyboard.focus(focused);
+                self.apply_key_effect(effect);
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.pointer_move((position.x, position.y));
@@ -1016,6 +1056,13 @@ impl ApplicationHandler<FramePublished> for App {
             crate::backend::vulkan::engine::window_present_detach();
             self.engine_attached = false;
         }
+        // Close the guest's held keys and hand the desktop its shortcuts back
+        // while the native window is still alive. An X11 keyboard grab in
+        // particular outlives this process if it is not released, and would
+        // leave the whole session unable to type.
+        let effect = self.keyboard.shutdown();
+        self.apply_key_effect(effect);
+        self.capture = None;
         self.window = None;
     }
 
@@ -1108,6 +1155,9 @@ impl App {
             closed_sent: false,
             window: None,
             cursor: (0, 0),
+            keyboard: Keyboard::new(),
+            capture_engaged_logged: false,
+            capture: None,
             engine_attached: false,
             first_engine_present_logged: false,
             first_engine_guest_logged: false,
@@ -1123,6 +1173,58 @@ impl App {
             guest_extent: None,
             pending_guest_resize: None,
             loop_census: LoopCensus::new(),
+        }
+    }
+
+    /// Emit a [`KeyEffect`]'s guest input and settle the platform capture.
+    ///
+    /// One place, because the two halves of a keyboard transition are decided
+    /// together and applying only one of them is the defect this whole path
+    /// exists to remove: a grab dropped without releasing the held keys leaves
+    /// the guest holding a modifier, and keys released without dropping the grab
+    /// leaves the operator unable to reach their own desktop.
+    fn apply_key_effect(&mut self, effect: KeyEffect) {
+        for action in effect.actions {
+            (self.on_input)(action);
+        }
+        let Some(grab) = effect.grab else {
+            return;
+        };
+        let Some(capture) = self.capture.as_mut() else {
+            return;
+        };
+        let held = grab == Grab::Held;
+        match capture.set(held) {
+            Err(error) => {
+                // A capture that did not take means the host desktop is still
+                // eating guest keystrokes. Named on the always-on channel, once
+                // per reason: the window keeps running with whatever it is left.
+                crate::observe::Emit::decline("host_window_capture", &error)
+                    .fail_once(u64::from(held));
+            }
+            Ok(()) if held && !self.capture_engaged_logged => {
+                // Say once that the shortcuts were actually handed over. Without
+                // this the log cannot separate a capture that engaged from one
+                // that was built and never asked, because both are silent.
+                self.capture_engaged_logged = true;
+                let mechanism = capture.describe();
+                crate::observe::Emit::decline(
+                    "host_window_capture_engaged",
+                    &CaptureEngaged(mechanism),
+                )
+                .off();
+                // Also on stderr, once. This is the instant the operator's own
+                // desktop shortcuts stop working; the fail log is the wrong
+                // place to learn how to get them back, because reading it is
+                // itself a thing you need a working desktop to do.
+                eprintln!(
+                    "reims-vgpu-window: keyboard captured ({mechanism}) — \
+                     the guest now receives Cmd/Alt/Super chords. \
+                     Press {} to release it.",
+                    super::keyboard::UNGRAB_CHORD
+                );
+            }
+            Ok(()) => {}
         }
     }
 
@@ -1174,6 +1276,33 @@ impl App {
             pointer_report(position, self.surface_dims(), self.guest_extent);
         self.cursor = (x, y);
         (self.on_input)(HostAction::input_pointer_move(x, y, width, height));
+    }
+
+    /// Build the platform's shortcut capture for this window.
+    ///
+    /// Never fails into the caller: a window system this build cannot ask for
+    /// its shortcuts back yields a [`super::capture::NoCapture`] and a typed
+    /// reason, because a window that cannot capture must still present. The
+    /// describe string goes on the boot log so a run says which of the three
+    /// capture mechanisms it actually got.
+    fn build_capture(window: &Arc<Window>) -> Box<dyn Capture> {
+        let handles = window
+            .display_handle()
+            .map(|d| d.as_raw())
+            .ok()
+            .zip(window.window_handle().map(|w| w.as_raw()).ok());
+        let capture = match handles {
+            Some((display, handle)) => super::capture::for_window(display, handle),
+            None => {
+                // The same handles the engine attach needs; if they are gone the
+                // attach is about to fail too, and this is not the refusal that
+                // should be read as the cause.
+                Box::new(super::capture::NoCapture::new("no_window_handle"))
+            }
+        };
+        crate::observe::Emit::decline("host_window_capture_mode", &CaptureMode(capture.describe()))
+            .off();
+        capture
     }
 
     /// Build the engine-owned surface and swapchain over this native window.
@@ -1575,7 +1704,8 @@ mod wake_tests {
                 backstop = now + ENGINE_WINDOW_REDRAW_BACKSTOP;
             }
         }
-        let backstop_ticks = (second.as_millis() / ENGINE_WINDOW_REDRAW_BACKSTOP.as_millis()) as u32;
+        let backstop_ticks =
+            (second.as_millis() / ENGINE_WINDOW_REDRAW_BACKSTOP.as_millis()) as u32;
         assert!(
             requested <= publishes + backstop_ticks,
             "asked {requested} times for {publishes} frames — a pacing rule \

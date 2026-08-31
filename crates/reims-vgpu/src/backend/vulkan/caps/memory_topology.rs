@@ -778,8 +778,7 @@ mod tests {
         ];
         for (name, props, topology) in devices {
             let req = topology.request(MemoryClass::Readback);
-            let index =
-                pick_index(&props, !0, &req).unwrap_or_else(|| panic!("{name}: no type"));
+            let index = pick_index(&props, !0, &req).unwrap_or_else(|| panic!("{name}: no type"));
             let kind = MappedMemoryKind::of(&props, index);
             assert!(
                 kind.cached,
@@ -989,7 +988,9 @@ mod tests {
     fn an_allocation_larger_than_a_heap_does_not_get_charged_to_it() {
         const GIB: u64 = 1 << 30;
         let props = amd_apu_host_heap();
-        let req = classify_memory(&props).topology.request(MemoryClass::Upload);
+        let req = classify_memory(&props)
+            .topology
+            .request(MemoryClass::Upload);
 
         // Under the 2 GiB carve-out: the device-local preference still wins.
         let small = select_memory_type(&props, !0, &req, GIB, u64::MAX).expect("a type");
@@ -999,7 +1000,10 @@ mod tests {
         // Over it, and under the 14 GiB host heap: the preference loses to the
         // pool that can actually hold the allocation.
         let mid = select_memory_type(&props, !0, &req, 4 * GIB, u64::MAX).expect("a type");
-        assert_eq!(mid.index, 1, "the 14 GiB host heap, not the 2 GiB carve-out");
+        assert_eq!(
+            mid.index, 1,
+            "the 14 GiB host heap, not the 2 GiB carve-out"
+        );
         assert_eq!(mid.heap_index, 1);
 
         // Larger than every heap — a 16 GiB guest on this part. There is no
@@ -1022,7 +1026,9 @@ mod tests {
     fn a_size_past_the_device_maximum_is_refused_whatever_the_heaps_hold() {
         const GIB: u64 = 1 << 30;
         let props = amd_apu_host_heap();
-        let req = classify_memory(&props).topology.request(MemoryClass::Upload);
+        let req = classify_memory(&props)
+            .topology
+            .request(MemoryClass::Upload);
 
         assert!(
             select_memory_type(&props, !0, &req, 6 * GIB, u64::MAX).is_ok(),

@@ -1476,21 +1476,38 @@ fn revalidate_timing_is_slow(elapsed_us: u64) -> bool {
 /// Release contiguous views whose page tables changed.
 ///
 /// A GPU object can retain a view only when [`HostOps::map_pages_stable`]
-/// promises the address for the device lifetime; `unmap_pages` is a no-op on
-/// exactly that host. A transient view is never admitted to a backend import,
-/// so its only users are CPU copies that finish inside their own call.
+/// promises the address until explicit retirement. A transient view is never
+/// admitted to a backend import, so its only users are CPU copies that finish
+/// inside their own call.
 pub fn flush_retired_views<H: HostOps>(state: &mut DeviceState, host: &mut H) {
     // The backend allocation aliases the host view, so revoke the GPU parent
     // first. Existing child images and recorded buffers hold it through their
-    // fence-safe retirement; the host view is stable on every backend that can
-    // import it, making `unmap_pages` a no-op there until device teardown.
+    // fence-safe retirement; only then is the matching host view unmapped.
     #[cfg(feature = "backend-vulkan")]
-    for import in state.retired_guest_imports.drain(..) {
-        crate::backend::vulkan::engine::retire_guest_import(import);
-    }
+    let backend_owned: std::collections::HashSet<_> = state
+        .retired_guest_imports
+        .drain(..)
+        .filter_map(crate::backend::vulkan::engine::retire_guest_import)
+        .collect();
     #[cfg(not(feature = "backend-vulkan"))]
     state.retired_guest_imports.clear();
+
+    #[cfg(feature = "backend-vulkan")]
+    let mut released: std::collections::HashSet<_> =
+        crate::backend::vulkan::engine::take_released_host_aliases()
+            .into_iter()
+            .collect();
     for (ptr, len) in state.retired_views.drain(..) {
+        #[cfg(feature = "backend-vulkan")]
+        if backend_owned.contains(&(ptr, len)) {
+            continue;
+        }
+        #[cfg(feature = "backend-vulkan")]
+        released.remove(&(ptr, len));
+        host.unmap_pages(ptr, len);
+    }
+    #[cfg(feature = "backend-vulkan")]
+    for (ptr, len) in released {
         host.unmap_pages(ptr, len);
     }
     // Same shape and the same reason: a guest-write token is host-side state
@@ -1498,6 +1515,19 @@ pub fn flush_retired_views<H: HostOps>(state: &mut DeviceState, host: &mut H) {
     for token in state.retired_guest_write_tokens.drain(..) {
         host.untrack_guest_writes(token);
     }
+}
+
+/// Return Vulkan aliases whose terminal fence-safe destruction has completed
+/// to the host. Called from the device heartbeat so release does not depend on
+/// another guest mapping event arriving.
+#[cfg(feature = "backend-vulkan")]
+pub fn drain_deferred_unmaps<H: HostOps>(host: &mut H) -> usize {
+    let released = crate::backend::vulkan::engine::take_released_host_aliases();
+    let count = released.len();
+    for (ptr, len) in released {
+        host.unmap_pages(ptr, len);
+    }
+    count
 }
 
 /// The live guest-write token for this mapping's current page list, asking the
@@ -1950,11 +1980,7 @@ pub fn ensure_contig_view_with_pages<H: HostMemory + HostOps>(
             let Some(footprint) = &m.contig_footprint else {
                 return None;
             };
-            return Some((
-                m.contig_ptr,
-                m.contig_len,
-                footprint.pages_arc(),
-            ));
+            return Some((m.contig_ptr, m.contig_len, footprint.pages_arc()));
         }
         // The negative verdict caches on exactly the key that makes the
         // positive one above safe. Re-deriving it per call collected the page
@@ -2063,9 +2089,9 @@ pub(crate) fn note_mapping_write_footprint(
     let page_size = state.page_size();
     let page_shift = state.page_shift;
     note_page_write_footprint(page_size, off, len, |i| {
-        m.page_entries.get(i).map(|&entry| {
-            crate::contract::iosurface_pages::entry_gpa_shift(entry, page_shift)
-        })
+        m.page_entries
+            .get(i)
+            .map(|&entry| crate::contract::iosurface_pages::entry_gpa_shift(entry, page_shift))
     });
 }
 
@@ -2134,21 +2160,103 @@ fn note_page_write_footprint(
 /// mapping rail here and the GVA rail in [`super::gva_view`] — and both split
 /// into twin functions before this type existed, with the read side of each
 /// drifting from its write side in the same way: fewer named refusals.
+/// A rectangle's shape inside the guest span that holds it: `row_count` rows of
+/// `row_bytes` useful bytes, each `row_stride` apart.
+///
+/// The rectangle is the shape every texture copy actually has, and until this
+/// existed the only primitive that spoke it was the mapping rail's. A caller
+/// holding a rectangle over the GVA rail had one move available — a row — so it
+/// re-entered the guest page table `row_count` times to copy one region, and a
+/// driven macos-13 boot charged that re-entry 906 ms of a 916 ms
+/// texture-to-texture rail at ~7.6 us for a 4 KiB row.
+///
+/// The gap between `row_bytes` and `row_stride` is the guest's, not the copy's:
+/// a texture's row padding holds whatever the guest put there, so a rectangle
+/// copy that filled the span contiguously would land the right pixels and
+/// destroy it. That is why this is a shape rather than a length.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RectStride {
+    row_stride: usize,
+    row_bytes: usize,
+    row_count: usize,
+}
+
+impl RectStride {
+    /// A rectangle, or `None` where the shape cannot describe one.
+    ///
+    /// Every refusal here is a shape this type must not be able to hold, so it
+    /// is refused at construction rather than checked at each use: a zero
+    /// extent, rows wider than the stride that separates them (which would make
+    /// two rows overlap), or a span that does not fit a `usize`. After this,
+    /// [`RectStride::span`] is total and the packed-buffer offsets
+    /// [`RunCopy::apply`] computes are in range by construction.
+    pub(crate) fn new(row_stride: u64, row_bytes: u64, row_count: u64) -> Option<Self> {
+        if row_bytes == 0 || row_count == 0 || row_bytes > row_stride {
+            return None;
+        }
+        let span = row_count
+            .checked_sub(1)?
+            .checked_mul(row_stride)?
+            .checked_add(row_bytes)?;
+        let packed = row_bytes.checked_mul(row_count)?;
+        usize::try_from(span).ok()?;
+        usize::try_from(packed).ok()?;
+        Some(Self {
+            row_stride: row_stride as usize,
+            row_bytes: row_bytes as usize,
+            row_count: row_count as usize,
+        })
+    }
+
+    /// Bytes from the first row's first byte to the last row's last byte —
+    /// what the guest-side walk must resolve, padding included.
+    pub(crate) fn span(&self) -> usize {
+        (self.row_count - 1) * self.row_stride + self.row_bytes
+    }
+
+    /// Bytes of the caller's side, which holds rows back to back and no padding.
+    pub(crate) fn packed(&self) -> usize {
+        self.row_count * self.row_bytes
+    }
+}
+
 pub(crate) enum RunCopy<'a> {
     Write(&'a [u8]),
     Read(&'a mut [u8]),
+    /// A packed buffer into a strided guest rectangle.
+    WriteRect(&'a [u8], RectStride),
+    /// A strided guest rectangle into a packed buffer.
+    ReadRect(&'a mut [u8], RectStride),
+}
+
+impl<'a> RunCopy<'a> {
+    /// A rectangle write, or `None` when `src` is shorter than the rows.
+    pub(crate) fn write_rect(src: &'a [u8], rect: RectStride) -> Option<Self> {
+        (src.len() >= rect.packed()).then_some(Self::WriteRect(src, rect))
+    }
+
+    /// A rectangle read, or `None` when `dst` is shorter than the rows.
+    pub(crate) fn read_rect(dst: &'a mut [u8], rect: RectStride) -> Option<Self> {
+        (dst.len() >= rect.packed()).then_some(Self::ReadRect(dst, rect))
+    }
 }
 
 impl RunCopy<'_> {
+    /// How much guest span this copy covers.
+    ///
+    /// For a rectangle this is the **span**, not the buffer: the walk has to
+    /// resolve the padding it steps over even though no byte of it moves, and
+    /// the run bound in each caller is stated against this length.
     pub(crate) fn len(&self) -> usize {
         match self {
             Self::Write(buf) => buf.len(),
             Self::Read(buf) => buf.len(),
+            Self::WriteRect(_, rect) | Self::ReadRect(_, rect) => rect.span(),
         }
     }
 
     pub(crate) fn is_write(&self) -> bool {
-        matches!(self, Self::Write(_))
+        matches!(self, Self::Write(_) | Self::WriteRect(..))
     }
 
     /// Move `n` bytes between the caller's buffer at `buf_off` and the mapped
@@ -2157,8 +2265,14 @@ impl RunCopy<'_> {
     /// # Safety
     ///
     /// `host_ptr` must be a live mapping of at least `host_off + n` bytes, and
-    /// `buf_off + n` must be within the caller's buffer. The single caller
-    /// checks both against the run's mapped total before calling.
+    /// `buf_off + n` must be within [`RunCopy::len`]. The callers check both
+    /// against the run's mapped total before calling.
+    ///
+    /// For the rectangle forms `buf_off` is an offset into the *span*, and this
+    /// splits it into the rows it crosses, touching only their `row_bytes` and
+    /// stepping over the padding between them. `RectStride::new` has already
+    /// made the packed offsets that produces in range: `buf_off + n <= span`
+    /// puts every row index below `row_count`.
     pub(crate) unsafe fn apply(
         &mut self,
         host_ptr: usize,
@@ -2181,6 +2295,65 @@ impl RunCopy<'_> {
                     n,
                 );
             },
+            Self::WriteRect(buf, rect) => {
+                rect.for_each_piece(buf_off, host_off, n, |packed_off, host_at, len| unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        buf.as_ptr().add(packed_off),
+                        (host_ptr as *mut u8).add(host_at),
+                        len,
+                    );
+                });
+            }
+            Self::ReadRect(buf, rect) => {
+                rect.for_each_piece(buf_off, host_off, n, |packed_off, host_at, len| unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        (host_ptr as *const u8).add(host_at),
+                        buf.as_mut_ptr().add(packed_off),
+                        len,
+                    );
+                });
+            }
+        }
+    }
+}
+
+impl RectStride {
+    /// The `(packed_offset, host_offset, len)` pieces of `[buf_off, buf_off+n)`
+    /// that belong to rows, ascending, with the inter-row padding dropped.
+    ///
+    /// `buf_off` is a span offset and `host_off` the mapped address of that same
+    /// span offset, so the two move together and a run boundary falling mid-row
+    /// splits the row rather than the rectangle.
+    /// A rectangle with no padding is one piece however many rows it has: the
+    /// span and the packed buffer are the same bytes in the same order, so
+    /// splitting it per row would issue `row_count` memcpys where one describes
+    /// the identical move. Full-plane reads are the common shape on the blit
+    /// rail, and they are the widest rectangles here.
+    fn for_each_piece(
+        &self,
+        buf_off: usize,
+        host_off: usize,
+        n: usize,
+        mut piece: impl FnMut(usize, usize, usize),
+    ) {
+        if self.row_bytes == self.row_stride {
+            piece(buf_off, host_off, n);
+            return;
+        }
+        let end = buf_off + n;
+        let first = buf_off / self.row_stride;
+        let last = end.saturating_sub(1) / self.row_stride;
+        for row in first..=last {
+            let row_lo = row * self.row_stride;
+            let lo = buf_off.max(row_lo);
+            let hi = end.min(row_lo + self.row_bytes);
+            if lo < hi {
+                piece(
+                    row * self.row_bytes + (lo - row_lo),
+                    host_off + (lo - buf_off),
+                    hi - lo,
+                );
+            }
         }
     }
 }
@@ -2498,6 +2671,60 @@ pub fn read_mapping_bytes<H: HostMemory + HostOps>(
         RunCopy::Read(buf),
         None,
         "mapping_read",
+    )
+}
+
+/// Read a strided rectangle starting at mapping-linear `off` into a packed `dst`.
+///
+/// The rectangle's rows are `rect.row_stride` apart in the mapping and back to
+/// back in `dst`, which is the shape every texture read has. It resolves the
+/// mapping's page list and packed runs **once** for the whole rectangle, where a
+/// caller looping [`read_mapping_bytes`] per row pays that resolution
+/// `row_count` times — `O(pages)` each — and a caller materialising the whole
+/// sample window first pays a plane-sized allocation and a second copy out of it.
+///
+/// `dst` shorter than the rectangle's packed size is a refusal, not a partial
+/// read: the shape is checked at [`RunCopy::read_rect`] before any page is
+/// touched.
+pub(crate) fn read_mapping_rect<H: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut H,
+    mapping_id: u32,
+    off: u64,
+    rect: RectStride,
+    dst: &mut [u8],
+) -> bool {
+    // Same flush-on-access obligation as `read_mapping_bytes`, for the same
+    // reason and narrowed the same way: this read must observe the resident
+    // content and not the stale pre-dispatch guest bytes. It returns at once
+    // when nothing is armed, so a caller that has already settled pays a
+    // map-empty check.
+    crate::runtime::writeback_debt::settle_for_mapping(
+        state,
+        host,
+        mapping_id,
+        crate::runtime::render_writeback::SettleSite::MappingBytesRead,
+    );
+    if dst.len() < rect.packed() {
+        crate::observe::fail(format!(
+            "mapping_read_rect fail reason=rect_dst_short mid={mapping_id} off={off:#x} \
+             packed={} dst={}",
+            rect.packed(),
+            dst.len()
+        ));
+        return false;
+    }
+    let Some(copy) = RunCopy::read_rect(dst, rect) else {
+        return false;
+    };
+    copy_mapping_runs(
+        state,
+        host,
+        mapping_id,
+        off,
+        copy,
+        None,
+        "mapping_read_rect",
     )
 }
 

@@ -325,7 +325,6 @@ impl std::fmt::Display for DrawNote {
     }
 }
 
-
 /// The bindings a module declares that a layout will not describe: the count,
 /// and the lowest [`GAP_KEPT`] of them.
 ///
@@ -563,11 +562,20 @@ pub const SUBMIT_DRAWS_KEPT: usize = 4;
 
 impl std::fmt::Display for SubmitNote {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "#{} at_draw={} draws={}", self.seq, self.at_draw, self.draws)?;
+        write!(
+            f,
+            "#{} at_draw={} draws={}",
+            self.seq, self.at_draw, self.draws
+        )?;
         if let Some(note) = &self.heaviest {
             write!(f, " heaviest=[{note}]")?;
         }
-        for (ordinal, note) in self.kept.iter().enumerate().filter_map(|(i, n)| n.map(|n| (i, n))) {
+        for (ordinal, note) in self
+            .kept
+            .iter()
+            .enumerate()
+            .filter_map(|(i, n)| n.map(|n| (i, n)))
+        {
             write!(f, " d{ordinal}=[{note}]")?;
         }
         Ok(())
@@ -787,7 +795,10 @@ mod tests {
         let line = trail().expect("notes were recorded");
         let first = 1000 + CAPACITY as u32;
         let last = 1000 + CAPACITY as u32 * 2 - 1;
-        let pipes: Vec<&str> = line.match_indices("pipe=").map(|(i, _)| &line[i..]).collect();
+        let pipes: Vec<&str> = line
+            .match_indices("pipe=")
+            .map(|(i, _)| &line[i..])
+            .collect();
         assert_eq!(pipes.len(), CAPACITY, "the ring is full: {line}");
         assert!(
             line.contains(&format!("pipe={first} ")),

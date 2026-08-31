@@ -1499,7 +1499,10 @@ pub const DEVICE_INFO_CAPS: &[(u32, u32)] = &[
     (DEVICE_INFO_KEY_MIN_LINEAR_TEXTURE_ALIGN, 256),
     (DEVICE_INFO_KEY_TEXTURE_WRITE_ROUNDING, 7),
     (DEVICE_INFO_KEY_SUPPORT_FLAGS_2025, 2),
-    (DEVICE_INFO_KEY_HOST_GPU_FAMILIES, DEVICE_INFO_GPU_FAMILY_SET),
+    (
+        DEVICE_INFO_KEY_HOST_GPU_FAMILIES,
+        DEVICE_INFO_GPU_FAMILY_SET,
+    ),
 ];
 
 /// Wire key 18 — the **AIR version** this device's compiler targets, packed as
@@ -1819,7 +1822,10 @@ mod tests {
         let dpi_x10 = |px: u16, mm: u16| (px as u64 * 254 * 10) / (mm as u64 * 10);
         let horizontal = dpi_x10(DISPLAY_MODE_EFI_W, DISPLAY_WIDTH_MM);
         let vertical = dpi_x10(DISPLAY_MODE_EFI_H, DISPLAY_HEIGHT_MM);
-        assert_eq!(horizontal, vertical, "square pixels, or the guest is misled");
+        assert_eq!(
+            horizontal, vertical,
+            "square pixels, or the guest is misled"
+        );
         assert!(
             (900..1440).contains(&horizontal),
             "{horizontal} tenths of a DPI is outside the ordinary desktop band; \

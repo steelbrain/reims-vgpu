@@ -74,7 +74,9 @@ fn the_seed_door_refuses_an_address_recorded_by_another_task() {
     setup_depth1_task(&mut host, &mut st);
 
     let gva = 1u64 << PAGE_SHIFT_ARM64E;
-    store_gva_owned(&mut st, gva, 2, 2, vec![0u8; 2 * 2 * 4], 0, None, true);
+    // `guest_holds_bytes: false` — an entry the guest's pages also hold is
+    // refused before ownership is reached, and this test is about ownership.
+    store_gva_owned(&mut st, gva, 2, 2, vec![0u8; 2 * 2 * 4], 0, None, false);
     st.host_gva_surfaces.get_mut(&gva).unwrap().backing = Some(GvaBacking {
         task_id: 1,
         first_gpa: 5u64 << PAGE_SHIFT_ARM64E,
@@ -110,7 +112,9 @@ fn the_seed_door_refuses_a_backing_the_guest_has_re_pointed() {
     let root_gpa = setup_depth1_task(&mut host, &mut st);
 
     let gva = 2u64 << PAGE_SHIFT_ARM64E;
-    store_gva_owned(&mut st, gva, 2, 2, vec![0u8; 2 * 2 * 4], 0, None, true);
+    // See the sibling test: freshness is only reached for an entry the guest's
+    // own pages do not hold.
+    store_gva_owned(&mut st, gva, 2, 2, vec![0u8; 2 * 2 * 4], 0, None, false);
     st.host_gva_surfaces.get_mut(&gva).unwrap().backing = Some(GvaBacking {
         task_id: 1,
         first_gpa: 6u64 << PAGE_SHIFT_ARM64E,
@@ -143,6 +147,7 @@ fn the_seed_verdicts_have_distinct_route_names() {
         GvaSeedVerdict::Moved,
         GvaSeedVerdict::Unmapped,
         GvaSeedVerdict::Unrecorded,
+        GvaSeedVerdict::GuestHolds,
     ];
     let mut names: Vec<&str> = all.iter().map(|v| v.route()).collect();
     let distinct = names.len();
@@ -954,4 +959,52 @@ fn a_backing_the_probe_cannot_read_is_not_a_fresh_one() {
         GvaBackingState::Unrecorded,
         "a key that was never stored is not an answer about backing"
     );
+}
+
+/// An entry the guest's own pages also hold is not a seed source.
+///
+/// Both copies start equal and only the guest's tracks the guest CPU, which
+/// writes its own memory with no device operation at all. So this door can only
+/// serve bytes that are the same or older, and "older" here is not a stale read
+/// the next frame corrects: a `MTLLoadActionLoad` seed becomes the pass's prior
+/// content and the matching Store writes it back into the guest's pages, so
+/// whatever the CPU wrote in between is overwritten rather than missed once.
+///
+/// The refusal is deliberately narrow. An entry the guest's pages do *not* hold
+/// is the only copy of those pixels — the writeback was refused and this map is
+/// what the page-ownership guard promised would keep them — and it keeps
+/// serving.
+#[test]
+fn the_seed_door_refuses_an_entry_the_guests_own_pages_hold() {
+    use crate::model::GvaBacking;
+    let mut host = FakeHost::new();
+    let mut st = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_depth1_task(&mut host, &mut st);
+
+    let gva = 1u64 << PAGE_SHIFT_ARM64E;
+    for guest_holds in [false, true] {
+        store_gva_owned(
+            &mut st,
+            gva,
+            2,
+            2,
+            vec![0u8; 2 * 2 * 4],
+            0,
+            None,
+            guest_holds,
+        );
+        st.host_gva_surfaces.get_mut(&gva).unwrap().backing = Some(GvaBacking {
+            task_id: 1,
+            first_gpa: 5u64 << PAGE_SHIFT_ARM64E,
+        });
+        assert_eq!(
+            gva_seed_verdict(&st, &host, 1, gva),
+            if guest_holds {
+                GvaSeedVerdict::GuestHolds
+            } else {
+                GvaSeedVerdict::Admit
+            },
+            "guest_holds_bytes={guest_holds}"
+        );
+    }
 }

@@ -29,11 +29,34 @@ CAPTURES=20
 BROWSER=safari
 CHURN=1
 KEEP=""
+# Where the probe page is served from.
+#
+# `guest` runs `probe_server.py` inside the guest over ssh, which is how this
+# probe has always worked and is kept as the default so rails it already
+# measures are not changed underneath them.
+#
+# `host` serves the same file from this machine and points the browser at the
+# slirp gateway. It exists because the guest arm has a dependency the guest need
+# not satisfy: macOS ships `/usr/bin/python3` as a **stub** that answers
+# `command -v` but refuses to run until the Command Line Tools are installed,
+# and refuses by opening a GUI dialog. On a rail image without them the server
+# never starts, the page is never served, and the only symptom is "the page
+# never declared a layout" -- which reads as a rendering failure and is a
+# missing interpreter. Two boots of rail macos-15 were spent on that message.
+#
+# Serving from the host removes the guest dependency entirely and puts the
+# layout JSON on this side, so a postmortem no longer needs an ssh into a guest
+# that is about to be reverted.
+SERVE=guest
+# The slirp gateway: what 127.0.0.1 on the host looks like from inside a guest
+# on QEMU user networking. Not configurable, because it is a property of the
+# network backend rather than a preference.
+HOST_GATEWAY=10.0.2.2
 GUEST="${GUEST:-macos-vm}"
 PORT="${PROBE_PORT:-8997}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-SHOT="$REPO_ROOT/scripts/screenshot-when-kde-plasma-host/screenshot-when-kde-plasma-host.sh"
+SHOT="$REPO_ROOT/scripts/screenshot/screenshot.sh"
 SERVER="$REPO_ROOT/scripts/browser-probe/probe_server.py"
 
 while [ $# -gt 0 ]; do
@@ -42,6 +65,7 @@ while [ $# -gt 0 ]; do
     --browser) BROWSER="$2"; shift 2 ;;
     --churn) CHURN="$2"; shift 2 ;;
     --keep) KEEP="$2"; shift 2 ;;
+    --serve) SERVE="$2"; shift 2 ;;
     -h|--help) sed -n '2,24p' "${BASH_SOURCE[0]}" | sed 's/^# \?//'; exit 0 ;;
     *) echo "web-content-probe: unknown argument $1" >&2; exit 2 ;;
   esac
@@ -57,7 +81,11 @@ case "$CHURN" in
   0|1) ;;
   *) echo "web-content-probe: --churn takes 0 or 1" >&2; exit 2 ;;
 esac
-URL="http://127.0.0.1:$PORT/?churn=$CHURN"
+case "$SERVE" in
+  guest) URL="http://127.0.0.1:$PORT/?churn=$CHURN" ;;
+  host)  URL="http://$HOST_GATEWAY:$PORT/?churn=$CHURN" ;;
+  *) echo "web-content-probe: --serve takes guest or host" >&2; exit 2 ;;
+esac
 
 WORK="${KEEP:-$(mktemp -d)}"
 mkdir -p "$WORK"
@@ -77,13 +105,33 @@ for p in "$HOME/Library/Application Support/Firefox/Profiles/"*/; do
   printf %s\\n "user_pref(\"browser.shell.checkDefaultBrowser\", false);" >"$p/user.js"
 done' >/dev/null 2>&1 || true
 
-scp -q "$SERVER" "$SCRIPT_DIR/content-probe.html" "$GUEST:/tmp/"
+HOST_JSON="$WORK/content-probe.json"
+HOST_SERVER_LOG="$WORK/content-probe-server.log"
+if [ "$SERVE" = host ]; then
+  # Bound to the whole work directory's lifetime, and killed on exit whichever
+  # way this script leaves -- a server surviving a failed run would be picked up
+  # by the next one and report a layout for a page nobody loaded.
+  pkill -f "probe_server.py $PORT " >/dev/null 2>&1 || true
+  : > "$HOST_JSON"
+  nohup python3 "$SERVER" "$PORT" "$SCRIPT_DIR/content-probe.html" "$HOST_JSON" \
+    > "$HOST_SERVER_LOG" 2>&1 &
+  HOST_SERVER_PID=$!
+  trap 'kill "$HOST_SERVER_PID" 2>/dev/null || true; [ -n "$KEEP" ] || rm -rf "$WORK"' EXIT
+  sleep 2
+  kill -0 "$HOST_SERVER_PID" 2>/dev/null || {
+    say "the host probe server exited immediately; see $HOST_SERVER_LOG" >&2
+    exit 2; }
+else
+  scp -q "$SERVER" "$SCRIPT_DIR/content-probe.html" "$GUEST:/tmp/"
+fi
 ssh -o BatchMode=yes "$GUEST" "pkill -f probe_server.py >/dev/null 2>&1 || true
 pkill -f '$APP' >/dev/null 2>&1 || true
 sleep 2
-nohup python3 /tmp/probe_server.py $PORT /tmp/content-probe.html /tmp/content-probe.json \
-  >/tmp/content-probe-server.log 2>&1 &
-sleep 2
+if [ '$SERVE' = guest ]; then
+  nohup python3 /tmp/probe_server.py $PORT /tmp/content-probe.html /tmp/content-probe.json \
+    >/tmp/content-probe-server.log 2>&1 &
+  sleep 2
+fi
 open -a '$APP' '$URL'
 sleep 6
 # Dismiss whatever sheet the browser opened on us before reaching for the
@@ -107,7 +155,11 @@ LAYOUT="$WORK/layout.json"
 # otherwise be measured against rectangles for a window that no longer exists,
 # and every region would report a mismatch that is the probe's fault.
 refresh_layout() {
-  ssh -o BatchMode=yes "$GUEST" "cat /tmp/content-probe.json 2>/dev/null" >"$LAYOUT" || true
+  if [ "$SERVE" = host ]; then
+    cp "$HOST_JSON" "$LAYOUT" 2>/dev/null || true
+  else
+    ssh -o BatchMode=yes "$GUEST" "cat /tmp/content-probe.json 2>/dev/null" >"$LAYOUT" || true
+  fi
   grep -q '"kind":' "$LAYOUT" || return 1
   python3 - "$LAYOUT" "$WORK/regions.txt" <<'PY'
 import json, sys
@@ -138,7 +190,11 @@ PY
 beat_now() { awk '/^BEAT /{print $2; exit}' "$WORK/regions.txt"; }
 
 refresh_layout || {
-  say "the page never declared a layout — see /tmp/content-probe-server.log in the guest" >&2
+  if [ "$SERVE" = host ]; then
+    say "the page never declared a layout — see $HOST_SERVER_LOG on the host" >&2
+  else
+    say "the page never declared a layout — see /tmp/content-probe-server.log in the guest (note: macOS ships python3 as a stub that needs the Command Line Tools; try --serve host)" >&2
+  fi
   ssh -o BatchMode=yes "$GUEST" "pkill -f probe_server.py; pkill -f '$APP'" >/dev/null 2>&1 || true
   exit 2; }
 

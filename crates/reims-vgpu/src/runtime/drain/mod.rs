@@ -1031,13 +1031,22 @@ impl StampLedger {
         if self.owed.get(&slot).is_some_and(|v| wait.satisfied_by(*v)) {
             return UnmetSource::Coalesced;
         }
-        if self.written.get(&slot).is_some_and(|v| wait.satisfied_by(*v)) {
+        if self
+            .written
+            .get(&slot)
+            .is_some_and(|v| wait.satisfied_by(*v))
+        {
             return UnmetSource::Queued;
         }
         UnmetSource::Absent
     }
 
-    fn fold(map: &mut std::collections::BTreeMap<u32, u32>, slot: u32, value: u32, page_bytes: u64) {
+    fn fold(
+        map: &mut std::collections::BTreeMap<u32, u32>,
+        slot: u32,
+        value: u32,
+        page_bytes: u64,
+    ) {
         let slot = stamp_slot_index(slot);
         if stamp_slot_offset(slot, page_bytes).is_none() {
             return;
@@ -2907,8 +2916,20 @@ fn fill_display_descriptor<H: HostMemory + HostOps>(
     let (height_f32, height_mm) = display_dimension_mm(DISPLAY_HEIGHT_MM);
     shared_w16(host, gpa, DISPLAY_DESC_WIDTH_MM, width_mm, psz);
     shared_w16(host, gpa, DISPLAY_DESC_HEIGHT_MM, height_mm, psz);
-    shared_w32(host, gpa, DISPLAY_DESC_WIDTH_MM_F32, width_f32.to_bits(), psz);
-    shared_w32(host, gpa, DISPLAY_DESC_HEIGHT_MM_F32, height_f32.to_bits(), psz);
+    shared_w32(
+        host,
+        gpa,
+        DISPLAY_DESC_WIDTH_MM_F32,
+        width_f32.to_bits(),
+        psz,
+    );
+    shared_w32(
+        host,
+        gpa,
+        DISPLAY_DESC_HEIGHT_MM_F32,
+        height_f32.to_bits(),
+        psz,
+    );
     shared_w32(host, gpa, DISPLAY_DESC_FEATURES, 0, psz);
 
     // HW cursor capability so the guest doorbells glyph/show/move.
@@ -3373,6 +3394,9 @@ fn present_named_mapping<H: HostMemory + HostOps>(
         state.present.height = h;
         state.present.generation = gen;
         log_present_page_identity(state, mapping, w, h);
+        // Independent of everything below: the guest's own copy of the plane
+        // this present names, sampled where the desktop background belongs.
+        crate::runtime::scanout::note_present_field_witness(state, &*host, mapping, w, h);
         // Every present takes one route: capture the surface the transaction
         // named. A ClearOnly present — one whose named mid's most recent write
         // was a `display_clear`/CLEAR Store rather than a draw — used to take a
@@ -3717,21 +3741,16 @@ fn note_released_or_remapped<H: HostMemory + HostOps>(
     if pages.is_empty() {
         return;
     }
-    let now_us = crate::observe::elapsed_us();
-    let DeviceState {
-        host_writes,
-        released_pages: watch,
-        ..
-    } = state;
+    let writes = &mut state.host_writes;
     match family {
         MapFamily::UnmapMemory => {
             for gpa in pages {
-                watch.release(host_writes, task_id, gpa, now_us);
+                writes.release_page(gpa);
             }
         }
         _ => {
             for gpa in pages {
-                watch.remapped(gpa);
+                writes.remap_page(gpa);
             }
         }
     }
@@ -3894,7 +3913,7 @@ fn apply_map_family<H: HostMemory + HostOps>(
         // `REIMS_VGPU_DRAW_LOG=1` so a normal boot pays neither; the functional
         // view-retire below stays always-on. Wire has no PPNs — the probe
         // asks whether the guest PT is already walkable under wire task_id.
-        if crate::observe::draw_log_enabled() {
+        crate::observe::when_verbose(|| {
             let walk = crate::runtime::gva_mem::diagnose_gva_walk(
                 host,
                 &state.tasks,
@@ -3915,7 +3934,7 @@ fn apply_map_family<H: HostMemory + HostOps>(
                     state.map_family_events
                 ));
             }
-        }
+        });
         // RE (AppleParavirtMemoryMap): Unmap/Map only mutate the **task
         // page table** then notify — wire has no PPNs. Guest order is
         // deallocate/allocate **then** FIFO, so:
@@ -3994,11 +4013,11 @@ fn apply_map_family<H: HostMemory + HostOps>(
             "unmapped"
         };
         crate::runtime::mapper::flush_retired_views(state, host);
-        if crate::observe::draw_log_enabled() {
-            crate::observe::line(format!(
+        crate::observe::verbose(|| {
+            format!(
                 "map_family op=DeleteIOSurfaceBacking2 ch={channel_id} object={object_id} task={task_id} plen={plen} mode={mode}"
-            ));
-        }
+            )
+        });
     } else if family == MapFamily::InvalidateResources {
         // RE: {task_id, count} + count×{object_id, 4×u8 validity ops}.
         // Ops (PVG host layout): clr_host, set_host, clr_guest, set_guest.
@@ -4047,8 +4066,8 @@ fn apply_map_family<H: HostMemory + HostOps>(
                 // `decode_fail` and `inv_multi` paths below stay
                 // fail-visible, and the guard also skips the format alloc
                 // on a healthy boot.
-                if crate::observe::draw_log_enabled() {
-                    crate::observe::line(format!(
+                crate::observe::verbose(|| {
+                    format!(
                     "map_family op=InvalidateResources opcode={:#x} ch={channel_id} plen={plen} task={} count={} oid={oid:#x} flags={flags:#x} clr_h={} set_h={} clr_g={} set_g={} pageon={pageon} bumped={bumped} miss={miss}",
                     packet.opcode,
                     cmd.task_id,
@@ -4057,8 +4076,8 @@ fn apply_map_family<H: HostMemory + HostOps>(
                     ops.set_host_valid,
                     ops.clear_guest_valid,
                     ops.set_guest_valid
-                ));
-                }
+                )
+                });
                 if cmd.count > 1 {
                     let ids: Vec<String> = cmd
                         .records
@@ -4135,12 +4154,12 @@ fn apply_map_family<H: HostMemory + HostOps>(
                     }
                 }
                 let oid = cmd.object_ids.first().copied().unwrap_or(0);
-                if crate::observe::draw_log_enabled() {
-                    crate::observe::line(format!(
+                crate::observe::verbose(|| {
+                    format!(
                         "map_family op={name} opcode={:#x} ch={channel_id} plen={plen} task={} count={} oid={oid:#x}",
                         packet.opcode, cmd.task_id, cmd.count
-                    ));
-                }
+                    )
+                });
                 if cmd.count > 1 {
                     let ids: Vec<String> =
                         cmd.object_ids.iter().map(|id| format!("{id:#x}")).collect();
@@ -4498,8 +4517,10 @@ fn process_child_packet<H: HostMemory + HostOps>(
                     || result.compute_icb_fail > 0;
                 if packet_failed {
                     crate::observe::fail(exec_summary(channel_id, &result, packet.payload.len()));
-                } else if crate::observe::draw_log_enabled() {
-                    crate::observe::line(exec_summary(channel_id, &result, packet.payload.len()));
+                } else {
+                    crate::observe::verbose(|| {
+                        exec_summary(channel_id, &result, packet.payload.len())
+                    });
                 }
                 if sync_exec_stalled(result.total_us) {
                     crate::observe::fail(format!(
@@ -5047,11 +5068,9 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
                     // the latch above until this drain ends. That window is the
                     // only one a repair could shorten.
                     let page_bytes = state.page_size();
-                    state.stamp_ledger.owe(
-                        stamp_index_slot,
-                        packet.completion_stamp,
-                        page_bytes,
-                    );
+                    state
+                        .stamp_ledger
+                        .owe(stamp_index_slot, packet.completion_stamp, page_bytes);
                 } else {
                     let stamp_started = std::time::Instant::now();
                     write_stamp(state, host, stamp_index, packet.completion_stamp);

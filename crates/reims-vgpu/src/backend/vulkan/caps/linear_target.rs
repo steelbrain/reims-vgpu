@@ -39,6 +39,15 @@ struct LinearTargetVerdict {
     usable: bool,
     /// `HOST_ALLOCATION_EXT` is importable with [`BASE_USAGE`].
     importable: bool,
+    /// That import is reported `DEDICATED_ONLY`: the memory must be bound to an
+    /// image created solely for it.
+    ///
+    /// A shared-backing target imports the guest allocation that the guest's
+    /// own buffer already covers, so a handle type that will only be imported
+    /// into a dedicated allocation cannot serve it. `importable` reads `true`
+    /// on such a device, so without this bit the report claims a shape the
+    /// device will not build.
+    dedicated_only: bool,
 }
 
 impl LinearTargetVerdict {
@@ -51,18 +60,20 @@ impl LinearTargetVerdict {
         Self {
             usable: features.contains(required),
             importable: false,
+            dedicated_only: false,
         }
     }
 
     fn device_conditions_hold(self) -> bool {
-        self.usable && self.importable
+        self.usable && self.importable && !self.dedicated_only
     }
 
     fn slug(self) -> &'static str {
-        match (self.usable, self.importable) {
-            (true, true) => "alias_possible",
-            (true, false) => "not_importable",
-            (false, _) => "usage_unsupported",
+        match (self.usable, self.importable, self.dedicated_only) {
+            (true, true, false) => "alias_possible",
+            (true, true, true) => "dedicated_only",
+            (true, false, _) => "not_importable",
+            (false, _, _) => "usage_unsupported",
         }
     }
 }
@@ -92,10 +103,12 @@ pub(crate) unsafe fn report(instance: &ash::Instance, pd: vk::PhysicalDevice) {
         if unsafe { instance.get_physical_device_image_format_properties2(pd, &info, &mut out) }
             .is_ok()
         {
-            verdict.importable = external_props
+            let features = external_props
                 .external_memory_properties
-                .external_memory_features
-                .contains(vk::ExternalMemoryFeatureFlags::IMPORTABLE);
+                .external_memory_features;
+            verdict.importable = features.contains(vk::ExternalMemoryFeatureFlags::IMPORTABLE);
+            verdict.dedicated_only =
+                features.contains(vk::ExternalMemoryFeatureFlags::DEDICATED_ONLY);
         }
 
         if verdict.device_conditions_hold() {
@@ -147,6 +160,33 @@ mod tests {
         assert!(!verdict.importable);
         assert!(!verdict.device_conditions_hold());
         assert_eq!(verdict.slug(), "not_importable");
+    }
+
+    /// A dedicated-only import cannot alias an allocation the guest's own
+    /// buffer already covers, so it refuses the rail even though every other
+    /// device condition holds and `importable` reads true.
+    #[test]
+    fn a_dedicated_only_import_is_not_an_alias() {
+        let all = vk::FormatFeatureFlags::SAMPLED_IMAGE
+            | vk::FormatFeatureFlags::COLOR_ATTACHMENT
+            | vk::FormatFeatureFlags::COLOR_ATTACHMENT_BLEND
+            | vk::FormatFeatureFlags::TRANSFER_SRC
+            | vk::FormatFeatureFlags::TRANSFER_DST;
+        let mut verdict = LinearTargetVerdict::from_tiling(all);
+        verdict.importable = true;
+        assert!(verdict.device_conditions_hold());
+        assert_eq!(verdict.slug(), "alias_possible");
+
+        verdict.dedicated_only = true;
+        assert!(
+            !verdict.device_conditions_hold(),
+            "a dedicated allocation cannot also be the guest allocation's own buffer"
+        );
+        assert_eq!(
+            verdict.slug(),
+            "dedicated_only",
+            "the refusing condition must be named, not folded into not_importable"
+        );
     }
 
     #[test]

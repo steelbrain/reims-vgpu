@@ -228,6 +228,32 @@ impl TextureDescriptorBody {
     /// mode ordinal shifted left by 4. That matches `MTLResourceOptions`'
     /// documented storage-mode shift, so the field is a `MTLResourceOptions`
     /// word rather than a bare mode.
+    ///
+    /// # This is an announcement contract, not an access contract
+    ///
+    /// It reads like a licence to skip coherence work for `Private` — the
+    /// device would not have to keep guest pages current for a resource the
+    /// guest has declared GPU-only. It is not one, and the device deliberately
+    /// consumes this field nowhere. Reading the emitting serializer says why:
+    ///
+    /// - Backing is **mode-blind**. A `Private` texture still gets page-rounded
+    ///   guest backing allocated unconditionally, exactly as `Shared` does.
+    /// - The guest still **CPU-touches** it. Create-with-contents,
+    ///   region-replace and get-bytes each memcpy through that mapping with no
+    ///   storage-mode check on the path.
+    /// - What the mode actually gates is the **announcement**: the
+    ///   modified-range notification is emitted only for `Managed`.
+    ///
+    /// So `Private` means "I will not tell you when I write this", not "I will
+    /// not write this". Treating it as the latter converts silence into a
+    /// guarantee of inaction, which is the one reading the field does not
+    /// support, and the resulting stale-page bug would be invisible at every
+    /// counter because its failure mode is content.
+    ///
+    /// The experiment that would settle it, if the question is reopened: read
+    /// the *host* deserializer for a mode-dependent branch on the backing or
+    /// the coherence path. Absence of one on the emitting side is what is
+    /// established above; the receiving side has not been read.
     #[inline]
     pub fn storage_mode(&self) -> u8 {
         ((self.resource_options.get() >> 4) & 0xf) as u8
@@ -433,6 +459,10 @@ impl WideTextureDescriptorBody {
     }
 
     /// `MTLStorageMode`, `resource_options[7:4]`.
+    ///
+    /// See [`TextureDescriptorBody::storage_mode`] for the derivation and for
+    /// why this field is an announcement contract rather than an access one —
+    /// it is not a licence to skip coherence work for `Private`.
     #[inline]
     pub fn storage_mode(&self) -> u8 {
         ((self.resource_options.get() >> 4) & 0xf) as u8

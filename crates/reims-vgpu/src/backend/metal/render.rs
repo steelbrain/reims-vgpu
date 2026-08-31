@@ -2049,7 +2049,10 @@ pub fn render_core_mrt(
         None => None,
         Some(q) => {
             let Some(mode) = mtl_enum::visibility_result_mode(q.mode) else {
-                set_err(err, format!("unsupported visibility result mode {}", q.mode));
+                set_err(
+                    err,
+                    format!("unsupported visibility result mode {}", q.mode),
+                );
                 return Status::args("metal_render_visibility_result_mode_unsupported")
                     .field("mode", q.mode);
             };

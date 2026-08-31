@@ -116,11 +116,7 @@ fn window() -> &'static std::sync::Mutex<Window> {
 }
 
 /// Record that a sampled bind wanted this window, before any cache is consulted.
-pub(crate) fn note_wanted(
-    key: SampledKey,
-    identity: Option<SampledContentIdentity>,
-    bytes: usize,
-) {
+pub(crate) fn note_wanted(key: SampledKey, identity: Option<SampledContentIdentity>, bytes: usize) {
     window()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -217,7 +213,10 @@ mod tests {
         }
         w.want(key(), id(u64::MAX, 0), 0);
         let line = w.take().expect("a bind happened");
-        assert!(line.contains(&format!("distinct={}", Window::CAPACITY)), "{line}");
+        assert!(
+            line.contains(&format!("distinct={}", Window::CAPACITY)),
+            "{line}"
+        );
         assert!(line.contains("dropped=1"), "{line}");
     }
 }

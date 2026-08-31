@@ -433,7 +433,9 @@ pub struct ColorAttachment {
     pub depth_plane: u32,
     pub load_action: u16,
     pub store_action: u16,
-    /// MTLClearColor as RGBA doubles in `[0,1]`.
+    /// `MTLClearColor` as RGBA doubles. The attachment pixel format decides
+    /// whether those components are continuous values or integer counts; an
+    /// integer clear of `1.0` means `1`, not the format's normalized maximum.
     pub clear_color: [f64; 4],
 }
 

@@ -211,7 +211,7 @@ run_app() {
   # exactly the run that exists to find hangs. `--shots` chooses whether the
   # frame is *kept*, not whether it is taken.
   shot="$WORK/$slug.png"
-  if "$REPO/scripts/screenshot-when-kde-plasma-host/screenshot-when-kde-plasma-host.sh" \
+  if "$REPO/scripts/screenshot/screenshot.sh" \
     -o "$shot" >/dev/null 2>&1 && [ -f "$shot" ]; then
     hash=$(sha256sum "$shot" | cut -c1-16)
     [ -n "$SHOTS" ] && cp -f "$shot" "$SHOTS/${RAIL:-rail}-$slug.png"
@@ -279,7 +279,7 @@ if [ "$TORTURE_SECONDS" -gt 0 ]; then
     qmp key meta_l+w                      # close tab
   done
   if [ -n "$SHOTS" ]; then
-    "$REPO/scripts/screenshot-when-kde-plasma-host/screenshot-when-kde-plasma-host.sh" \
+    "$REPO/scripts/screenshot/screenshot.sh" \
       -o "$SHOTS/${RAIL:-rail}-safari-torture.png" >/dev/null 2>&1 || true
   fi
   tail -c "+$((off + 1))" "$FAILLOG" >"$WORK/safari-torture.log"
@@ -324,13 +324,13 @@ fi
 say "Launchpad -> Screenshot"
 off=$(stat -c %s "$FAILLOG")
 BEFORE="$WORK/launchpad-before.png"
-"$REPO/scripts/screenshot-when-kde-plasma-host/screenshot-when-kde-plasma-host.sh" \
+"$REPO/scripts/screenshot/screenshot.sh" \
   -o "$BEFORE" >/dev/null 2>&1 || true
 gssh 20 'open -a Launchpad' || true
 sleep 5
 LP_SHOT="$WORK/launchpad.png"
 LP_OPENED=unknown
-if "$REPO/scripts/screenshot-when-kde-plasma-host/screenshot-when-kde-plasma-host.sh" \
+if "$REPO/scripts/screenshot/screenshot.sh" \
   -o "$LP_SHOT" >/dev/null 2>&1 && [ -f "$LP_SHOT" ] && [ -f "$BEFORE" ]; then
   if [ "$(sha256sum <"$BEFORE" | cut -c1-16)" = "$(sha256sum <"$LP_SHOT" | cut -c1-16)" ]; then
     LP_OPENED=no
@@ -347,7 +347,7 @@ sleep 3
 qmp key ret
 sleep 6
 if [ -n "$SHOTS" ]; then
-  "$REPO/scripts/screenshot-when-kde-plasma-host/screenshot-when-kde-plasma-host.sh" \
+  "$REPO/scripts/screenshot/screenshot.sh" \
     -o "$SHOTS/${RAIL:-rail}-launchpad-screenshot-app.png" >/dev/null 2>&1 || true
 fi
 # Asked before the dismissal below, not after: Escape tears the capture UI down

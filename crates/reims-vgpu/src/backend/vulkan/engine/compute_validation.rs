@@ -15,6 +15,16 @@ pub enum ComputeValidationDecline {
     ZeroGrid {
         grid: [u32; 3],
     },
+    /// An exact-thread launch arrived with no regions to issue, so nothing
+    /// would reach the device for a dispatch the guest did ask for.
+    NoDispatchRegions,
+    /// A region that dispatches nothing, or one whose specialized workgroup
+    /// size has no threads. Either is guest work the device would silently drop.
+    ZeroDispatchRegion {
+        region: usize,
+        local_size: [u32; 3],
+        group_count: [u32; 3],
+    },
     DuplicateStorageBufferBinding {
         binding: u32,
     },
@@ -74,6 +84,8 @@ impl Decline for ComputeValidationDecline {
             Self::EmptyEntry => "vk_compute_validate_empty_entry",
             Self::EntryInteriorNul => "vk_compute_validate_entry_interior_nul",
             Self::ZeroGrid { .. } => "vk_compute_validate_zero_grid",
+            Self::NoDispatchRegions => "vk_compute_validate_no_dispatch_regions",
+            Self::ZeroDispatchRegion { .. } => "vk_compute_validate_zero_dispatch_region",
             Self::DuplicateStorageBufferBinding { .. } => {
                 "vk_compute_validate_duplicate_storage_buffer_binding"
             }
@@ -164,7 +176,25 @@ impl Decline for ComputeValidationDecline {
                 ("lod_min", f32::from_bits(*lod_min_bits).to_string()),
                 ("lod_max", f32::from_bits(*lod_max_bits).to_string()),
             ],
-            Self::EmptySpirv | Self::EmptyEntry | Self::EntryInteriorNul => Vec::new(),
+            Self::ZeroDispatchRegion {
+                region,
+                local_size,
+                group_count,
+            } => vec![
+                ("region", region.to_string()),
+                (
+                    "local_size",
+                    format!("{}x{}x{}", local_size[0], local_size[1], local_size[2]),
+                ),
+                (
+                    "group_count",
+                    format!("{}x{}x{}", group_count[0], group_count[1], group_count[2]),
+                ),
+            ],
+            Self::EmptySpirv
+            | Self::EmptyEntry
+            | Self::EntryInteriorNul
+            | Self::NoDispatchRegions => Vec::new(),
         }
     }
 }
@@ -181,6 +211,12 @@ mod tests {
             ComputeValidationDecline::EmptyEntry,
             ComputeValidationDecline::EntryInteriorNul,
             ComputeValidationDecline::ZeroGrid { grid: [1, 0, 1] },
+            ComputeValidationDecline::NoDispatchRegions,
+            ComputeValidationDecline::ZeroDispatchRegion {
+                region: 3,
+                local_size: [8, 1, 1],
+                group_count: [1, 0, 1],
+            },
             ComputeValidationDecline::DuplicateStorageBufferBinding { binding: 0 },
             ComputeValidationDecline::EmptyStorageBuffer { binding: 0 },
             ComputeValidationDecline::DuplicateSampledImageBinding { binding: 32 },
@@ -242,7 +278,9 @@ mod tests {
         // non-2D image shape. A compute texture binding is one flat plane
         // window or one linear GVA level, so there is no slice or depth axis
         // for a request to get wrong.
-        assert_eq!(before, 16, "the compute validator's reason census moved");
+        // Up from 16: an exact-thread launch is decomposed into regions, and
+        // both ways that decomposition can carry no work are their own reason.
+        assert_eq!(before, 18, "the compute validator's reason census moved");
         assert_eq!(before, slugs.len(), "duplicate compute-validation slug");
     }
 

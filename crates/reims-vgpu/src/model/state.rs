@@ -2384,19 +2384,6 @@ pub struct DeviceState {
     /// belong to the task's address space, so a reused id inheriting them would
     /// be watching memory that is now somebody else's.
     pub node_guard: std::collections::BTreeMap<u32, crate::runtime::node_guard::NodeWatch>,
-    /// Guest pages the guest has released, for the post-release write guard.
-    ///
-    /// Observation only — see [`crate::runtime::released_pages`], which exists
-    /// because [`Self::node_guard`] cannot see a write that lands on a page
-    /// *before* that page becomes part of a page table.
-    ///
-    /// **Not keyed by task, unlike the two ledgers above it, and that is the
-    /// point.** A guest page is guest-physical and more than one task can map
-    /// it, so a per-task watch reports the legitimate write that arrives through
-    /// another task's live mapping. Keyed globally, any task mapping the page
-    /// disarms it. For the same reason it is not dropped on task teardown: the
-    /// page stays released whatever happens to the task that let it go.
-    pub released_pages: crate::runtime::released_pages::ReleasedPages,
     /// Live object refs per task, as `(task_id, ref)`.
     ///
     /// This is membership for host-copy teardown. [`Self::task_resources`]
@@ -2766,7 +2753,6 @@ impl DeviceState {
             map_family_events: 0,
             map_audit: std::collections::BTreeMap::new(),
             node_guard: std::collections::BTreeMap::new(),
-            released_pages: crate::runtime::released_pages::ReleasedPages::default(),
             objects: std::collections::BTreeSet::new(),
             task_resources: TaskResources::default(),
             task_sampler_states: TaskSamplerStates::default(),
@@ -3024,6 +3010,11 @@ impl DeviceState {
     }
 
     fn forget_compositor_mapping(&mut self, mapping_id: u32) {
+        // The plane draw ring is keyed by mapping id and read by two witnesses,
+        // so it is dropped with the mapping: bounded by the live compositor
+        // surfaces, and a recycled id cannot inherit a predecessor's passes.
+        #[cfg(feature = "backend-vulkan")]
+        crate::runtime::draw::forget_plane_draw_ring(mapping_id);
         // Prune the dense-frame seq: a recycled mapping id must not inherit a
         // stale predecessor's dense seq.
         self.present.dense_frame_seq.remove(&mapping_id);
@@ -3288,8 +3279,7 @@ impl DeviceState {
         );
         self.retire_task_linear_residents(task_id);
         self.host_linear_textures.retain(|&(t, _), _| t != task_id);
-        self.host_texture_surfaces
-            .retain(|&(t, _), _| t != task_id);
+        self.host_texture_surfaces.retain(|&(t, _), _| t != task_id);
         // Clear texture→mapping latches for this task.
         self.texture_to_mapping.retain(|&(t, _), _| t != task_id);
         // GVA encode cache retained until Unmap of that range.

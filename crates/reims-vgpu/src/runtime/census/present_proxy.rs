@@ -11,8 +11,12 @@
 //! | `secondary_mrt_drop` | A multi-RT draw degraded to single-RT |
 //! | `empty_sample` | A resolved fragment/vertex sample whose payload was all-zero |
 //!
-//! [`window_publish`] emits one line per window and stays silent while its
-//! counters are zero.
+//! [`host_window_publish`] emits one line per window and stays silent while its
+//! counters are zero. It is named for the side it measures: this is the *host
+//! window's* accept-or-drop decision, whereas
+//! [`crate::runtime::drain::census::WindowPublish`] classifies what the drain
+//! offered. They are deliberately not duplicates and must not share a tag —
+//! see that type's doc.
 
 use std::sync::Mutex;
 
@@ -209,7 +213,7 @@ fn reset_state_inner() {
 /// only trace was `display_from_resident` flipping false. A sustained drop run is the
 /// "desktop frozen but the device is alive" class, so it needs a name and a
 /// count.
-pub mod window_publish {
+pub mod host_window_publish {
     use crate::observe;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -270,7 +274,7 @@ pub mod window_publish {
     impl crate::observe::Decline for WindowPublishDrop {
         fn slug(&self) -> &'static str {
             match self {
-                Self::ResidentNotReady => "window_publish_resident_not_ready",
+                Self::ResidentNotReady => "host_window_publish_resident_not_ready",
             }
         }
     }
@@ -281,10 +285,10 @@ pub mod window_publish {
     fn format_line(dt: u64, published: u64, dropped: u64) -> String {
         if dropped == 0 {
             return format!(
-                "window_publish window_ms={dt} published={published} dropped={dropped}"
+                "host_window_publish window_ms={dt} published={published} dropped={dropped}"
             );
         }
-        observe::Emit::decline("window_publish", &WindowPublishDrop::ResidentNotReady)
+        observe::Emit::decline("host_window_publish", &WindowPublishDrop::ResidentNotReady)
             .field("window_ms", dt)
             .field("published", published)
             .field("dropped", dropped)
@@ -317,7 +321,7 @@ pub mod window_publish {
             let line = format_line(1000, 0, 118);
             assert!(line.contains("dropped=118"), "{line}");
             assert!(
-                line.contains("reason=window_publish_resident_not_ready"),
+                line.contains("reason=host_window_publish_resident_not_ready"),
                 "{line}"
             );
         }

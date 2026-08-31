@@ -944,6 +944,7 @@ fn a_format_with_no_storage_selector_refuses_the_same_way_from_every_rail() {
         // no entry for it by design, which is exactly the class this refuses.
         pixel_format: crate::contract::pixel_format::MTL_FORMAT_R32_FLOAT,
         storage_selector: None,
+        mip_levels: 1,
         width: 4,
         height: 4,
         bytes: vec![0; 64],
@@ -1267,12 +1268,13 @@ fn stage_texture_type5_record_reshapes_stageable_single_plane_surface() {
             surface_bpr,
             width,
             height,
-            bpp,
+            format,
             ..
         } => {
             assert_eq!(mapping_id, sid);
             assert_eq!(surface_bpr, 128);
-            assert_eq!((width, height, bpp), (1, 4, 16));
+            assert_eq!((width, height), (1, 4));
+            assert_eq!(pixel_format::bytes_per_pixel(format), Some(16));
         }
         _ => panic!("expected Type11 writeback through the texture view"),
     }
@@ -1596,6 +1598,8 @@ fn linear_writeback_retains_cache_when_guest_gva_is_unmapped() {
     let gva = 0x101000u64;
     let rgba = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
     let staged = StagedTexture {
+        multisample_target: None,
+        mip_levels: 1,
         binding: 32,
         #[cfg(feature = "backend-vulkan")]
         array_element: 0,
@@ -1612,7 +1616,7 @@ fn linear_writeback_retains_cache_when_guest_gva_is_unmapped() {
         residency: None,
         serve: None,
         writeback: TextureWriteback::Linear {
-            pages: Default::default(),
+            pages: crate::runtime::draw::StoreTargetPages::empty(),
             texture_ref,
             gva,
             pixel_format: MTL_FORMAT_RGBA8_UNORM,
@@ -1767,7 +1771,7 @@ fn incomplete_compute_engine_call_fires_stall_proxy() {
     let req = ComputeRequest {
         spirv: vec![0x0723_0203],
         entry: "main".into(),
-        grid: [1, 1, 1],
+        dispatch: crate::backend::vulkan::engine::ComputeDispatch::Workgroups([1, 1, 1]),
         ..Default::default()
     };
     let done = spawn_compute_engine_stall_watchdog(pipe, &req, Duration::from_millis(10));
@@ -2276,6 +2280,299 @@ fn a_staged_buffer_carries_the_pages_its_writeback_is_bounded_to() {
     assert!(staged_span_pages(&state, &host, 1, page, 0).is_empty());
 }
 
+/// Every destination reaches a licence; nothing is turned away for its shape.
+///
+/// Both destination shapes have one, and the shapes differ only in which licence
+/// answers — a guest-linear plane goes to `licence_gva_plane` and a tiled surface
+/// mapping to `licence_type11_surface`. Residency is not a shape at all: a
+/// registered resident is a perfectly good source for a copy, and
+/// what holds it across a submitted-not-waited copy is the engine's pin, taken
+/// where the write debt is armed and released from the ring slot's cleanup.
+///
+/// That third case is the regression this test exists for. Residency *was* a
+/// refusal here, and it reached 81 of the 89 linear windows a driven macos-13
+/// boot produces — a rule written to be safe that turned out to be most of the
+/// traffic the arm exists to remove. Re-adding it would read as caution and cost
+/// 91 % of the saving, so it is asserted against directly.
+///
+/// Every refusal answers `Host`, so the return value alone cannot say *which*
+/// gate fired, and a window that fell through to the licence check reads
+/// identically to one an earlier gate caught. The census route is what
+/// distinguishes them, so each case is asserted on its own counter.
+///
+/// The type-11 cases assert the thing that is easiest to regress back to. That
+/// class was the largest this arm did not reach — 35 of the 51 storage
+/// destinations of a driven macos-13 boot — and the reason was a `return` on the
+/// destination's *shape*, before anything about the surface had been asked. A
+/// tiled surface mapping is not a guest-linear plane, which is true, and does
+/// not make it unreachable. So `compute_dst_host_not_linear` is asserted at
+/// zero: reintroducing that early answer would read as a correct statement about
+/// the GVA licence and put 91 % of the class back on the readback rail.
+///
+/// Vulkan-only: the direct arm is a `VK_EXT_external_memory_host` import, and
+/// `StagedTexture` does not carry a residency candidate on the Metal arm at all.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn a_licence_and_not_the_destinations_shape_decides_the_direct_arm() {
+    use crate::backend::vulkan::engine::ComputeImageDestination;
+    use crate::contract::pixel_format::MTL_FORMAT_RGBA8_UNORM;
+    use crate::runtime::drain::census::store_route_count;
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let held = crate::backend::vulkan::engine::StorageImageFormat::Rgba8Unorm.vk_format();
+
+    let linear = |pages: crate::runtime::draw::StoreTargetPages| TextureWriteback::Linear {
+        pages,
+        texture_ref: 44,
+        gva: 0x101000,
+        pixel_format: MTL_FORMAT_RGBA8_UNORM,
+        row_stride: 8,
+        width: 2,
+        height: 2,
+        bpp: 4,
+    };
+    let staged = |writeback, residency| StagedTexture {
+        multisample_target: None,
+        mip_levels: 1,
+        binding: 32,
+        #[cfg(feature = "backend-vulkan")]
+        array_element: 0,
+        #[cfg(feature = "backend-vulkan")]
+        descriptor_count: 1,
+        #[cfg(all(feature = "backend-metal", target_os = "macos"))]
+        texture_ref: 44,
+        pixel_format: MTL_FORMAT_RGBA8_UNORM,
+        storage_selector: Some(pixel_format::StorageImageSelector::Rgba8Unorm),
+        width: 2,
+        height: 2,
+        bytes: vec![0u8; 16],
+        is_storage: true,
+        residency,
+        serve: None,
+        writeback,
+    };
+    let is_host = |d: &ComputeImageDestination| matches!(d, ComputeImageDestination::Host);
+
+    // A window whose pages never resolved cannot be licensed, so even the
+    // transient linear shape reads back. This is also the arm that holds on a
+    // host with no guest-RAM import, where `references_for_runs` refuses.
+    let before = store_route_count("compute_dst_host_unlicensed");
+    assert!(
+        is_host(&direct_destination(
+            &mut state,
+            &mut host,
+            &staged(
+                linear(crate::runtime::draw::StoreTargetPages::empty()),
+                None
+            ),
+            held,
+        )),
+        "an unlicensed window reads back"
+    );
+    assert_eq!(
+        store_route_count("compute_dst_host_unlicensed"),
+        before + 1,
+        "the licence refusal is the gate that caught it"
+    );
+
+    // A type-11 destination is not a guest-linear plane at all. It is also the
+    // largest class this arm does not reach, so the same call must band whether
+    // a raw copy could ever have served it — the route counter says how many
+    // there are and the split says how many are reachable.
+    let type11 = |mapping_id, format| TextureWriteback::Type11 {
+        mapping_id,
+        surface_offset: 0,
+        surface_bpr: 8,
+        span_end: 16,
+        width: 2,
+        height: 2,
+        format,
+    };
+    let unlicensed = || store_route_count("compute_dst_host_type11_unlicensed");
+    for mapping_id in [1, 2] {
+        state.mappings.insert(
+            mapping_id,
+            crate::model::MappingEntry {
+                mapped: true,
+                has_geom: true,
+                width: 2,
+                height: 2,
+                format: MTL_FORMAT_RGBA8_UNORM,
+                ..Default::default()
+            },
+        );
+    }
+    // Mapping 1 is staged at the texel the dispatch holds, so a raw copy could
+    // serve it; mapping 2 is staged at a different one, and a copy converts
+    // nothing, so no licence could land it however the pages resolve. The format
+    // that decides is the bind's own, not the mapping's declaration — the bind
+    // may be a type-5 view reinterpreting the surface, and the staged format is
+    // the one both the seeding read and the landing write are arithmetic over.
+    //
+    // Mapping 3 is never registered, so there is nothing to write into.
+    //
+    // All three answer `Host` here, and for three different reasons, only one of
+    // which is about the format: `FakeHost` publishes no guest-RAM import, so
+    // even the agreeing mapping's licence is refused at the reference walk. What
+    // this asserts is that all three *reached* the licence — the arm no longer
+    // answers `Host` on the shape of the destination alone, which is what it did
+    // for 35 of the 51 storage destinations of a driven macos-13 boot.
+    let before = unlicensed();
+    let not_linear = store_route_count("compute_dst_host_not_linear");
+    for (mapping_id, format) in [
+        (1, MTL_FORMAT_RGBA8_UNORM),
+        (2, crate::contract::pixel_format::MTL_FORMAT_RGBA16_FLOAT),
+        (3, MTL_FORMAT_RGBA8_UNORM),
+    ] {
+        assert!(
+            is_host(&direct_destination(
+                &mut state,
+                &mut host,
+                &staged(type11(mapping_id, format), None),
+                held,
+            )),
+            "no guest-RAM import, so every type-11 licence is refused here"
+        );
+    }
+    assert_eq!(
+        unlicensed(),
+        before + 3,
+        "the type-11 licence is what refused, not the destination's shape"
+    );
+    // A delta and not an absolute: these counters are process-global and this
+    // suite runs serially in one binary, so a zero read absolutely would be
+    // asserting about every other test too.
+    assert_eq!(
+        store_route_count("compute_dst_host_not_linear"),
+        not_linear,
+        "a type-11 destination is no longer turned away for not being linear"
+    );
+
+    // And the case this test exists for: a resident window is routed on its
+    // destination like any other, so it reaches the licence. Asserted against
+    // the same linear writeback the first case used, so residency is the only
+    // term that differs — and on the *licence's* counter, which is what says it
+    // got that far. `FakeHost` publishes no guest-RAM import, so the licence
+    // itself refuses here and the answer is still `Host`; what this asserts is
+    // that residency was not what decided it.
+    let before = store_route_count("compute_dst_host_unlicensed");
+    assert!(
+        is_host(&direct_destination(
+            &mut state,
+            &mut host,
+            &staged(
+                linear(crate::runtime::draw::StoreTargetPages::empty()),
+                Some(ComputeStorageResidencyCandidate {
+                    key: crate::model::ComputeStorageResidencyKey::linear(
+                        1,
+                        44,
+                        0x101000,
+                        8,
+                        0x101010,
+                        2,
+                        2,
+                        MTL_FORMAT_RGBA8_UNORM,
+                    ),
+                    seed_generation: 0,
+                }),
+            ),
+            held,
+        )),
+        "the licence is what refuses on a host with no guest-RAM import"
+    );
+    assert_eq!(
+        store_route_count("compute_dst_host_unlicensed"),
+        before + 1,
+        "a resident window is routed on its destination, not on its residency"
+    );
+    assert_eq!(
+        store_route_count("compute_dst_host_resident"),
+        0,
+        "and nothing refuses on residency at all any more"
+    );
+}
+
+/// A staged window keeps the walk's *order*, and a scattered mapping proves it.
+///
+/// The compute rail carried its destination pages as a bare `HashSet`, which is
+/// enough to bound a write and not enough to place one: a direct copy into guest
+/// pages hands its runs to `references_for_runs`, which consumes them in
+/// **guest-virtual** order. For a scattered mapping that order is not ascending
+/// GPA, so recovering it by sorting the set would land the window's rows in the
+/// wrong pages — silently, with every page still inside the write bound.
+///
+/// The mapping here descends: virtual page `i` sits at pfn `pt_base + 7 - i`, so
+/// a sorted set would answer with the runs reversed. The second half pins the
+/// other thing a set cannot say — whether the walk resolved every page it was
+/// asked for.
+#[test]
+fn a_staged_window_records_its_pages_in_guest_virtual_order() {
+    use crate::contract::endian::st32;
+    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let (dir_pfn, root_pfn, pt_base) = (2u32, 3u32, 4u32);
+    let dir_gpa = (dir_pfn as u64) << PAGE_SHIFT_ARM64E;
+    let root_gpa = (root_pfn as u64) << PAGE_SHIFT_ARM64E;
+    host.map_range(dir_gpa, 0x20, 0);
+    host.map_range(root_gpa, 0x4000, 0);
+    let mut d = [0u8; 8];
+    st32(&mut d[DIRECTORY_ROOT_PFN as usize..], root_pfn);
+    st32(&mut d[DIRECTORY_DEPTH as usize..], 1);
+    let _ = host.write_gpa(dir_gpa, &d);
+    for i in 0..8u32 {
+        let pfn = pt_base + 7 - i;
+        host.map_range((pfn as u64) << PAGE_SHIFT_ARM64E, 0x4000, 0);
+        let mut pte = [0u8; 4];
+        st32(&mut pte, pfn);
+        let _ = host.write_gpa(root_gpa + (i as u64) * 4, &pte);
+    }
+    state.define_task(1, 0x1000, dir_pfn);
+
+    let page = 1u64 << PAGE_SHIFT_ARM64E;
+    let gpa_of = |pfn: u32| (pfn as u64) << PAGE_SHIFT_ARM64E;
+    let gva = page; // virtual page 1
+
+    let pages = staged_window_pages(&state, &host, 1, gva, page, 3);
+    let want = [
+        gpa_of(pt_base + 6),
+        gpa_of(pt_base + 5),
+        gpa_of(pt_base + 4),
+    ];
+    assert_eq!(
+        pages.ordered_complete(gva, page),
+        Some(&want[..]),
+        "the record must read in GVA order, not ascending GPA"
+    );
+    assert_eq!(
+        pages.membership().len(),
+        3,
+        "and it bounds the same three pages a set would have"
+    );
+
+    // A walk that could not resolve every page of its span refuses to place
+    // anything, rather than answering with the pages it did find.
+    let short_gva = page * 7;
+    let short = staged_window_pages(&state, &host, 1, short_gva, page, 2);
+    assert!(
+        !short.membership().is_empty(),
+        "the page that did resolve is still bound"
+    );
+    assert!(
+        short.ordered_complete(short_gva, page).is_none(),
+        "an incomplete walk cannot be placed"
+    );
+
+    // Nothing to walk records nothing, which is distinct from a complete record
+    // of zero pages — no span can produce one of those.
+    assert!(staged_window_pages(&state, &host, 1, 0, page, 3)
+        .membership()
+        .is_empty());
+    assert!(staged_window_pages(&state, &host, 1, gva, 0, 3)
+        .membership()
+        .is_empty());
+}
+
 /// The two halves of a resident answer partition; neither rail can see both.
 ///
 /// `StagedTexture` used to carry this enum as a `bool` and an `Option` side by
@@ -2473,6 +2770,8 @@ fn a_heap_texture_mirror_outlives_the_per_mapping_cap() {
     const HEAP_TEXTURES: u32 = 4 * STORAGE_RESIDENCY_WINDOWS_PER_MAPPING as u32;
 
     let staged = |key: ComputeStorageResidencyKey| StagedTexture {
+        multisample_target: None,
+        mip_levels: 1,
         binding: 33,
         #[cfg(feature = "backend-vulkan")]
         array_element: 0,
@@ -2618,4 +2917,523 @@ fn a_sampled_image_the_kernel_uses_and_the_guest_left_empty_gets_a_neutral_textu
     // A binding the guest supplied that the module does not carry is not
     // invented back into the list.
     assert_eq!(neutral_sampled_image_bindings(&spirv, &[99]), vec![33]);
+}
+
+/// A buffer-backed texture (opcode 9) bound to a compute *read* is staged from
+/// the type-1 buffer's own bytes, de-pitched to tight rows in its native
+/// format.
+///
+/// This arm refused the whole wire form until now, while `runtime::draw`
+/// decoded and executed it — two execution arms disagreeing about one record.
+///
+/// The row padding carries a value that appears nowhere in the texels, because
+/// the failure this guards against is not "no bytes" but "the padding folded
+/// into the image", which produces a plausible picture that is wrong by one
+/// stride per row. The conformance battery fills padding the same way and for
+/// the same reason.
+#[test]
+fn a_buffer_backed_texture_stages_its_texels_without_the_row_padding() {
+    use crate::contract::endian::st16;
+    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::runtime::decode::resource::{
+        BUF_TEX_DESC_BUFFER_REF, BUF_TEX_DESC_BYTES_PER_ROW, BUF_TEX_DESC_OFFSET,
+        BUF_TEX_WIDE_DESC_BODY, BUF_TEX_WIDE_LEN, TEXTURE_VIEW_DESC_LEN, TEXTURE_VIEW_DESC_OPCODE,
+        TEXTURE_VIEW_DESC_TEXTURE_REF, TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE_WIDE,
+    };
+    use reims_vgpu_wire::ops::texture::WideTextureDescriptorBody as W;
+
+    const W_TEXELS: usize = 4;
+    const H_ROWS: usize = 3;
+    const BPP: usize = 4; // BGRA8Unorm
+    const TIGHT: usize = W_TEXELS * BPP;
+    const PITCH: usize = TIGHT + 8; // eight bytes of padding per row
+    const PAD: u8 = 0xEE;
+
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
+    assert!(state.set_object_list(1, 0, 32));
+
+    // Texel bytes are position-dependent so a row served from the wrong offset
+    // is a different value, not merely a shifted one.
+    let mut pixels = vec![PAD; PITCH * H_ROWS];
+    for y in 0..H_ROWS {
+        for x in 0..TIGHT {
+            pixels[y * PITCH + x] = (y * 0x10 + x) as u8;
+        }
+    }
+    let buf_gva = 5u64 << RESOURCE_PAGE_SHIFT;
+    write_task_gva_arm64e(&mut host, &state.tasks[1], buf_gva, &pixels);
+
+    // Type-1 buffer object naming that storage.
+    let mut bdesc = vec![0u8; 16];
+    st64(&mut bdesc[0..], (PITCH * H_ROWS) as u64);
+    st32(&mut bdesc[8..], 5);
+    let bdesc_gva = 0x180u64;
+    write_task_gva_arm64e(&mut host, &state.tasks[1], bdesc_gva, &bdesc);
+    {
+        let off = list_object_entry_offset(7, 32).unwrap();
+        let mut le = [0u8; OBJECT_LIST_ENTRY_LEN];
+        st32(&mut le[0..], (OBJECT_TYPE_BUFFER as u32) | (16u32 << 8));
+        le[4..12].copy_from_slice(&bdesc_gva.to_le_bytes());
+        write_task_gva_arm64e(&mut host, &state.tasks[1], off, &le);
+    }
+
+    // Type-8 buffer-backed texture record over it.
+    let mut body = vec![0u8; crate::runtime::heap_query::WIDE_TEXTURE_BODY_LEN];
+    body[std::mem::offset_of!(W, type_and_flags)] = 0x02; // 2D
+    st16(
+        &mut body[std::mem::offset_of!(W, pixel_format)..],
+        MTL_FORMAT_BGRA8_UNORM,
+    );
+    st32(&mut body[std::mem::offset_of!(W, width)..], W_TEXELS as u32);
+    st32(&mut body[std::mem::offset_of!(W, height)..], H_ROWS as u32);
+    st32(&mut body[std::mem::offset_of!(W, depth)..], 1);
+    st16(&mut body[std::mem::offset_of!(W, mipmap_level_count)..], 1);
+    st16(&mut body[std::mem::offset_of!(W, sample_count)..], 1);
+    st16(&mut body[std::mem::offset_of!(W, array_length)..], 1);
+
+    let mut rec = vec![0u8; BUF_TEX_WIDE_LEN];
+    st32(
+        &mut rec[TEXTURE_VIEW_DESC_OPCODE..],
+        TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE_WIDE,
+    );
+    st32(&mut rec[TEXTURE_VIEW_DESC_LEN..], BUF_TEX_WIDE_LEN as u32);
+    st32(&mut rec[TEXTURE_VIEW_DESC_TEXTURE_REF..], 21);
+    st32(&mut rec[BUF_TEX_DESC_BUFFER_REF..], 7);
+    rec[BUF_TEX_DESC_OFFSET..BUF_TEX_DESC_OFFSET + 8].copy_from_slice(&0u64.to_le_bytes());
+    rec[BUF_TEX_DESC_BYTES_PER_ROW..BUF_TEX_DESC_BYTES_PER_ROW + 8]
+        .copy_from_slice(&(PITCH as u64).to_le_bytes());
+    rec[BUF_TEX_WIDE_DESC_BODY..].copy_from_slice(&body);
+
+    let rec_gva = 0x280u64;
+    write_task_gva_arm64e(&mut host, &state.tasks[1], rec_gva, &rec);
+    {
+        let off = list_object_entry_offset(21, 32).unwrap();
+        let mut le = [0u8; OBJECT_LIST_ENTRY_LEN];
+        st32(
+            &mut le[0..],
+            (crate::runtime::decode::resource::OBJECT_TYPE_TEXTURE_VIEW as u32)
+                | ((rec.len() as u32) << 8),
+        );
+        le[4..12].copy_from_slice(&rec_gva.to_le_bytes());
+        write_task_gva_arm64e(&mut host, &state.tasks[1], off, &le);
+    }
+
+    let staged = stage_texture_raw(&mut state, &mut host, 1, 21, 0, false)
+        .expect("a buffer-backed texture is a wire form this device decodes");
+
+    assert_eq!(staged.width, W_TEXELS as u32);
+    assert_eq!(staged.height, H_ROWS as u32);
+    assert_eq!(
+        staged.pixel_format, MTL_FORMAT_BGRA8_UNORM,
+        "the native format survives; this arm does not narrow to RGBA8"
+    );
+    assert_eq!(
+        staged.bytes.len(),
+        TIGHT * H_ROWS,
+        "the staged image is tight, not the guest's padded span"
+    );
+    assert!(
+        !staged.bytes.contains(&PAD),
+        "row padding must not reach the image"
+    );
+    for y in 0..H_ROWS {
+        for x in 0..TIGHT {
+            assert_eq!(
+                staged.bytes[y * TIGHT + x],
+                (y * 0x10 + x) as u8,
+                "row {y} byte {x} came from the wrong offset"
+            );
+        }
+    }
+
+    // The destination half is a separate contract with no evidence behind it,
+    // so a writable binding of the same record still refuses, under its own
+    // name rather than the retired blanket one.
+    match stage_texture_raw(&mut state, &mut host, 1, 21, 0, true) {
+        Err(ComputeStatus::Unsupported(slug)) => {
+            assert_eq!(slug, "compute_buffer_texture_storage_unsupported")
+        }
+        Err(other) => panic!("a storage binding must refuse by name, got {other:?}"),
+        Ok(_) => panic!("a storage binding must refuse; this arm has no destination contract"),
+    }
+}
+
+/// A guest mip chain reaches the compute rail as a whole pyramid, level by
+/// level, and not as its base with the levels above it missing.
+///
+/// The external invariant: `read(coord, lod)` and `sample(_, _, level(lod))`
+/// name a level of the chain the descriptor declares. Staging only level 0
+/// answers the first with nothing and the second with level 0's texels at every
+/// LOD — which is exactly what the rail did, and what the six `mip_fetch_level_*`
+/// and six `mip_sample_level_*` cases each read back.
+///
+/// Every level is filled with a constant that names it, so a level served from
+/// the wrong offset holds a *neighbour's* marker rather than plausible noise,
+/// and each level's rows are padded past its texels so a level read with
+/// another level's stride is a different value and not merely a shifted one.
+#[test]
+fn a_declared_mip_chain_stages_every_level_and_not_only_its_base() {
+    use crate::contract::endian::{st16, st32, st64};
+    use crate::contract::extent::mip_extent;
+    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::runtime::decode::resource::{
+        LINEAR_DESC_HANDLE, LINEAR_DESC_SIZE, OBJECT_TYPE_TEXTURE, TEXTURE_DESC_BASE_LEN,
+        TEXTURE_DESC_HEIGHT, TEXTURE_DESC_LEVEL_RECORDS, TEXTURE_DESC_MIPMAP_LEVEL_COUNT,
+        TEXTURE_DESC_MIP_LEVEL_RECORD_LEN, TEXTURE_DESC_PIXEL_FORMAT, TEXTURE_DESC_ROW_STRIDE,
+        TEXTURE_DESC_USED_SIZE, TEXTURE_DESC_WIDTH, TEXTURE_LEVEL_HEIGHT, TEXTURE_LEVEL_OFFSET,
+        TEXTURE_LEVEL_ROW_STRIDE, TEXTURE_LEVEL_SIZE, TEXTURE_LEVEL_WIDTH,
+    };
+
+    const BASE: u32 = 8;
+    const LEVELS: u32 = 4; // 8, 4, 2, 1
+    const BPP: u32 = 4; // BGRA8Unorm
+    const PAD: u8 = 0xEE;
+    // Each level's rows are wider than its texels, so a level read at another
+    // level's pitch reads padding.
+    let stride = |level: u32| (mip_extent(BASE, level) * BPP + 16) as u64;
+    let marker = |level: u32| (0x10 + level * 0x11) as u8;
+
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
+    assert!(state.set_object_list(1, 0, 32));
+
+    // Lay the pyramid out in guest pages: every level at its own offset, its
+    // rows padded, filled with its own marker.
+    let handle = 5u64;
+    let base_gva = handle << RESOURCE_PAGE_SHIFT;
+    let mut offsets = Vec::new();
+    let mut image = Vec::new();
+    for level in 0..LEVELS {
+        offsets.push(image.len() as u64);
+        let h = mip_extent(BASE, level);
+        let mut level_bytes = vec![PAD; (stride(level) * u64::from(h)) as usize];
+        for y in 0..h as usize {
+            let row = y * stride(level) as usize;
+            for x in 0..(mip_extent(BASE, level) * BPP) as usize {
+                level_bytes[row + x] = marker(level);
+            }
+        }
+        image.extend_from_slice(&level_bytes);
+    }
+    let allocation_size = image.len() as u64;
+    write_task_gva_arm64e(&mut host, &state.tasks[1], base_gva, &image);
+
+    // The type-2 descriptor that declares it: geometry prefix for level 0 and
+    // one 36-byte record for each level after it.
+    let desc_len =
+        TEXTURE_DESC_BASE_LEN + (LEVELS as usize - 1) * TEXTURE_DESC_MIP_LEVEL_RECORD_LEN;
+    let mut desc = vec![0u8; desc_len];
+    st64(&mut desc[LINEAR_DESC_SIZE..], allocation_size);
+    st64(&mut desc[LINEAR_DESC_HANDLE..], handle);
+    desc[TEXTURE_DESC_MIPMAP_LEVEL_COUNT] = LEVELS as u8;
+    st32(
+        &mut desc[TEXTURE_DESC_USED_SIZE..],
+        (stride(0) * u64::from(BASE)) as u32,
+    );
+    st32(&mut desc[TEXTURE_DESC_ROW_STRIDE..], stride(0) as u32);
+    st32(&mut desc[TEXTURE_DESC_WIDTH..], BASE);
+    st32(&mut desc[TEXTURE_DESC_HEIGHT..], BASE);
+    for level in 1..LEVELS {
+        let rec =
+            TEXTURE_DESC_LEVEL_RECORDS + (level as usize - 1) * TEXTURE_DESC_MIP_LEVEL_RECORD_LEN;
+        let side = mip_extent(BASE, level);
+        st64(
+            &mut desc[rec + TEXTURE_LEVEL_OFFSET..],
+            offsets[level as usize],
+        );
+        st64(
+            &mut desc[rec + TEXTURE_LEVEL_SIZE..],
+            stride(level) * u64::from(side),
+        );
+        st64(&mut desc[rec + TEXTURE_LEVEL_ROW_STRIDE..], stride(level));
+        st32(&mut desc[rec + TEXTURE_LEVEL_WIDTH..], side);
+        st32(&mut desc[rec + TEXTURE_LEVEL_HEIGHT..], side);
+    }
+    let pf_off =
+        TEXTURE_DESC_PIXEL_FORMAT + (LEVELS as usize - 1) * TEXTURE_DESC_MIP_LEVEL_RECORD_LEN;
+    st16(&mut desc[pf_off..], MTL_FORMAT_BGRA8_UNORM);
+
+    let desc_gva = 0x2000u64;
+    write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, &desc);
+    {
+        let off = list_object_entry_offset(11, 32).unwrap();
+        let mut le = [0u8; OBJECT_LIST_ENTRY_LEN];
+        st32(
+            &mut le[0..],
+            (OBJECT_TYPE_TEXTURE as u32) | ((desc.len() as u32) << 8),
+        );
+        le[4..12].copy_from_slice(&desc_gva.to_le_bytes());
+        write_task_gva_arm64e(&mut host, &state.tasks[1], off, &le);
+    }
+
+    let staged = stage_texture_raw(&mut state, &mut host, 1, 11, 0, false)
+        .expect("a declared mip chain is a wire form this device decodes");
+
+    assert_eq!(staged.width, BASE);
+    assert_eq!(staged.height, BASE);
+    assert_eq!(
+        staged.mip_levels, LEVELS,
+        "every level the descriptor declares is staged"
+    );
+    let spans =
+        crate::contract::extent::tight_pyramid_spans(BASE, BASE, LEVELS, BPP as usize).unwrap();
+    let want_len = spans.last().map(|l| l.offset + l.len).unwrap();
+    assert_eq!(
+        staged.bytes.len(),
+        want_len,
+        "the staged pyramid is tightly packed, not the guest's padded span"
+    );
+    assert!(
+        !staged.bytes.contains(&PAD),
+        "row padding must not reach the image"
+    );
+    for span in &spans {
+        let level_bytes = &staged.bytes[span.offset..span.offset + span.len];
+        assert!(
+            level_bytes.iter().all(|b| *b == marker(span.level)),
+            "level {} holds {:#04x}..; every byte must be its own marker {:#04x}",
+            span.level,
+            level_bytes[0],
+            marker(span.level)
+        );
+    }
+
+    // A storage binding of the same texture stays at the base: a compute write
+    // names one level, and the writeback window describes one.
+    let written = stage_texture_raw(&mut state, &mut host, 1, 11, 0, true)
+        .expect("the same texture stages as a storage destination");
+    assert_eq!(
+        written.mip_levels, 1,
+        "a storage binding is one level, whatever the chain declares"
+    );
+    assert_eq!(
+        written.bytes.len(),
+        (BASE * BASE * BPP) as usize,
+        "a storage binding stages the base alone"
+    );
+}
+
+/// A `dispatchThreads` launch whose thread grid is not a multiple of its
+/// threadgroup must reach the device as regions that tile that grid exactly.
+///
+/// This is the external invariant the v30 dispatch contract replaced culling
+/// with, and it is the one a wrong port loses silently. Rounding the grid up
+/// and issuing one dispatch runs invocations past the guest's thread count —
+/// the surplus lanes write past the end of whatever the kernel indexes. Issuing
+/// only the interior region drops the guest's boundary threads instead. Neither
+/// failure shows up as an error: both produce a dispatch that returns, with the
+/// wrong bytes in the guest's buffer.
+///
+/// So the assertion is coverage itself: walk every thread coordinate the
+/// regions launch and require that the multiset of them is exactly the logical
+/// grid — nothing outside it, nothing twice, nothing missing.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn exact_thread_regions_tile_the_logical_grid_exactly() {
+    use crate::backend::vulkan::engine::ComputeDispatch;
+    use std::collections::HashSet;
+
+    // A boundary in every axis at once (the eight-region case), a boundary in
+    // one axis only, and an exact multiple that needs no boundary at all.
+    for (threads, local) in [
+        ([130u32, 5, 3], [64u32, 2, 2]),
+        ([8, 1, 1], [64, 1, 1]),
+        ([128, 4, 2], [64, 2, 2]),
+        ([1, 1, 1], [64, 1, 1]),
+    ] {
+        let dispatch = kernel_dispatch_launch(
+            metal2vulkan::reflect::KernelDispatch::safe_default(),
+            local,
+            [0, 0, 0],
+            local,
+            Some(threads),
+        )
+        .expect("an exact-thread launch plans its regions");
+        let ComputeDispatch::Regions {
+            threadgroups_per_grid,
+            regions,
+            ..
+        } = &dispatch
+        else {
+            panic!("an exact-thread contract must not collapse to one whole-workgroup dispatch");
+        };
+
+        let mut covered = HashSet::new();
+        for region in regions {
+            assert!(
+                !region.local_size.contains(&0) && !region.group_count.contains(&0),
+                "a region that launches nothing is a region that was not needed",
+            );
+            // Words 3..6 are the region's thread base; words 6..9 its
+            // threadgroup base. Read them back out of the payload the device
+            // will actually push, not out of the planner, so a payload written
+            // in the wrong order fails here rather than in a guest.
+            let thread_base = [
+                region.push_constants[3],
+                region.push_constants[4],
+                region.push_constants[5],
+            ];
+            let threadgroup_base = [
+                region.push_constants[6],
+                region.push_constants[7],
+                region.push_constants[8],
+            ];
+            for dimension in 0..3 {
+                assert_eq!(
+                    thread_base[dimension],
+                    threadgroup_base[dimension] * local[dimension],
+                    "a region's thread base is its threadgroup base scaled by the nominal size",
+                );
+            }
+            assert_eq!(
+                [
+                    region.push_constants[0],
+                    region.push_constants[1],
+                    region.push_constants[2]
+                ],
+                threads,
+                "every region reports the same logical thread grid",
+            );
+            assert_eq!(
+                [
+                    region.push_constants[9],
+                    region.push_constants[10],
+                    region.push_constants[11]
+                ],
+                *threadgroups_per_grid,
+                "every region reports the same logical threadgroup grid",
+            );
+            for z in 0..region.local_size[2] * region.group_count[2] {
+                for y in 0..region.local_size[1] * region.group_count[1] {
+                    for x in 0..region.local_size[0] * region.group_count[0] {
+                        let thread = [thread_base[0] + x, thread_base[1] + y, thread_base[2] + z];
+                        for dimension in 0..3 {
+                            assert!(
+                                thread[dimension] < threads[dimension],
+                                "{thread:?} launches outside the guest's {threads:?} grid",
+                            );
+                        }
+                        assert!(
+                            covered.insert(thread),
+                            "{thread:?} is launched by more than one region",
+                        );
+                    }
+                }
+            }
+        }
+        let total = threads.iter().map(|&d| d as usize).product::<usize>();
+        assert_eq!(
+            covered.len(),
+            total,
+            "the regions for {threads:?} at local size {local:?} left threads unlaunched",
+        );
+        for dimension in 0..3 {
+            assert_eq!(
+                threadgroups_per_grid[dimension],
+                threads[dimension].div_ceil(local[dimension]),
+                "the logical threadgroup grid is the rounded-up thread grid",
+            );
+        }
+    }
+}
+
+/// A `dispatchThreadgroups` record reaches the device as the whole-workgroup
+/// dispatch it always was: one region, the nominal local size, and exactly the
+/// requested workgroup counts.
+///
+/// The device asks for one exact-thread translation per kernel and serves both
+/// Metal launch forms from it, so this is what keeps that sharing honest — a
+/// complete launch must not acquire a boundary region, an extra pipeline, or a
+/// group count other than the one the guest encoded.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn a_whole_workgroup_record_plans_one_region_at_the_nominal_local_size() {
+    use crate::backend::vulkan::engine::ComputeDispatch;
+
+    let dispatch = kernel_dispatch_launch(
+        metal2vulkan::reflect::KernelDispatch::safe_default(),
+        [64, 1, 1],
+        [3, 2, 1],
+        [64, 1, 1],
+        None,
+    )
+    .expect("a whole-workgroup record plans one region");
+    let ComputeDispatch::Regions {
+        threadgroups_per_grid,
+        regions,
+        ..
+    } = dispatch
+    else {
+        panic!("an exact-thread contract stays an exact-thread contract");
+    };
+    assert_eq!(threadgroups_per_grid, [3, 2, 1]);
+    assert_eq!(regions.len(), 1, "a complete launch has no boundary slab");
+    assert_eq!(regions[0].local_size, [64, 1, 1]);
+    assert_eq!(regions[0].group_count, [3, 2, 1]);
+    assert_eq!(regions[0].push_constants[0..3], [192, 2, 1]);
+}
+
+/// A module translated for whole workgroups baked its local size, so it is the
+/// one form that must stay a single unadorned dispatch.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn a_whole_workgroup_contract_declares_no_push_constant_range() {
+    use crate::backend::vulkan::engine::ComputeDispatch;
+
+    let dispatch = kernel_dispatch_launch(
+        metal2vulkan::reflect::KernelDispatch::Workgroups,
+        [64, 1, 1],
+        [3, 2, 1],
+        [64, 1, 1],
+        Some([8, 1, 1]),
+    )
+    .expect("a whole-workgroup contract needs no plan");
+    assert_eq!(dispatch, ComputeDispatch::Workgroups([3, 2, 1]));
+    assert_eq!(dispatch.push_constant_range(), None);
+    assert_eq!(dispatch.threadgroups_per_grid(), [3, 2, 1]);
+}
+
+/// A `dispatchThreadgroups` record whose logical thread grid does not fit a
+/// `u32` is refused, not wrapped. A wrapped grid is a launch of the wrong size
+/// that reports success.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn a_threadgroup_record_whose_thread_grid_overflows_is_refused() {
+    assert_eq!(
+        kernel_dispatch_launch(
+            metal2vulkan::reflect::KernelDispatch::safe_default(),
+            [64, 1, 1],
+            [u32::MAX, 1, 1],
+            [64, 1, 1],
+            None,
+        ),
+        Err(KernelDispatchDecline::GridOverflow),
+    );
+}
+
+/// The reflected payload offset the device declares is the translator's own,
+/// and the range it declares is exactly the payload the regions push.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn the_declared_push_range_is_the_reflected_offset_and_the_pushed_payload() {
+    let dispatch = kernel_dispatch_launch(
+        metal2vulkan::reflect::KernelDispatch::ThreadsDynamic { offset: 16 },
+        [64, 1, 1],
+        [1, 1, 1],
+        [64, 1, 1],
+        Some([8, 1, 1]),
+    )
+    .expect("a dynamic contract at a nonzero offset plans its regions");
+    let (offset, size) = dispatch
+        .push_constant_range()
+        .expect("an exact-thread launch declares a range");
+    assert_eq!(offset, 16, "the reflected offset is used, not assumed zero");
+    assert_eq!(
+        size as usize,
+        std::mem::size_of::<crate::backend::vulkan::engine::ComputeDispatchPayload>(),
+        "the declared range is exactly the bytes a region pushes",
+    );
 }

@@ -472,7 +472,10 @@ mod tests {
     fn each_pair_of_chain_flags_selects_its_own_route() {
         let mut seen = std::collections::HashSet::new();
         for route in SEGMENT_CHAIN_ROUTES {
-            assert!(seen.insert(route), "two chain routes share the name {route}");
+            assert!(
+                seen.insert(route),
+                "two chain routes share the name {route}"
+            );
         }
         assert_eq!(segment_chain_route(0, 0), "seg_chain_none");
         assert_eq!(segment_chain_route(0, 1), "seg_chain_next");

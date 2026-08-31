@@ -279,18 +279,64 @@ engine_counters! {
         /// Deliberately *not* pooled with `target_reads`. A composite Store that
         /// takes `skip_readback` moves its copy from here to there rather than
         /// deleting it, so one number over both populations cannot say whether the
-        /// deferral worked — it reads the same either way. On a desktop workload
-        /// `computes` is 0, so this is the draw rail alone.
+        /// deferral worked — it reads the same either way.
+        ///
+        /// **This is three rails, not one**, and the split below is what tells
+        /// them apart. A driven macos-13 x86/Vulkan boot reads `computes` at
+        /// 1288, so the claim this doc used to carry — that `computes` is 0 on a
+        /// desktop workload and therefore this is the draw rail alone — is false
+        /// on at least one first-class pathway. The total is still the total;
+        /// what it cannot do is say which rail to go and look at.
         readbacks,
         readback_bytes,
+        /// Readback taken as the tail of a draw ([`ReadbackSource::DrawTail`]).
+        readback_draw,
+        readback_draw_bytes,
+        /// Readback of a compute dispatch's writable storage *buffers*
+        /// ([`ReadbackSource::ComputeBuffer`]).
+        ///
+        /// These bytes end in guest pages: `ComputeOutput::buffers` is consumed
+        /// by `writeback_buffer`, so the rail is GPU → host staging → `Vec<u8>`
+        /// → guest, two host passes for a guest destination.
+        readback_compute_buffer,
+        readback_compute_buffer_bytes,
+        /// Readback of a compute dispatch's storage *images*
+        /// ([`ReadbackSource::ComputeImage`]).
+        ///
+        /// Also guest-destined, via `writeback_texture`. This is the rail that
+        /// had a direct arm — the dispatch wrote an imported view of the
+        /// caller's guest window and the caller skipped its own writeback —
+        /// which went with the deferred-flush window and was not replaced when
+        /// the render side gained `render_writeback`. Sizing that regression is
+        /// what this counter exists for.
+        readback_compute_image,
+        readback_compute_image_bytes,
         /// Full-frame reads of a pinned resident through `read_target`: the present
         /// capture and the deferred render window's on-access flush.
         ///
         /// These are the copies a deferred rail *keeps*, paid once when a consumer
         /// asks instead of once per Store. `target_reads / readbacks` is what
         /// separates "the readback moved" from "the readback went away".
+        ///
+        /// **Host deliveries only.** A full-frame read that lands in the guest's
+        /// own pages on the GPU queue is charged to `target_gpu_copies` below,
+        /// and [`TargetReadDelivery`] is what keeps the two apart.
         target_reads,
         target_read_bytes,
+        /// Full-frame reads of a pinned resident that never entered host address
+        /// space: `copy_target_to_guest_pages` puts them straight into the
+        /// guest's imported pages on the queue, so the bytes are what the host
+        /// copy *would* have cost.
+        ///
+        /// Split out because pooling them with `target_reads` made the one
+        /// instrument that answers "is this device zero-copy?" read the same
+        /// whether the frame crossed into this process or not — the GPU rail
+        /// inflated the host total by gigabytes a boot and looked like the host
+        /// rail still running. Read the pair: `target_reads` falling while
+        /// `target_gpu_copies` rises is the rail moving, and both falling is the
+        /// work going away.
+        target_gpu_copies,
+        target_gpu_copy_bytes,
         /// Completion stamps whose word was recorded into the GPU queue behind
         /// the writebacks they follow, rather than stored by this thread after
         /// blocking on them.
@@ -764,6 +810,15 @@ engine_counters! {
     }
 
     pool_levels {
+        /// Current resident registry population and attachment bytes.
+        registry_current_count,
+        registry_current_bytes,
+        /// Current unpinned residents whose content is reproducible.
+        registry_recoverable_count,
+        registry_recoverable_bytes,
+        /// Current residents held by one or more deferred-work pins.
+        registry_pinned_count,
+        registry_pinned_bytes,
         /// High-water mark of the non-pinned resident population, in slots.
         ///
         /// The demand, with no ceiling to read it against: this population is
@@ -842,6 +897,50 @@ engine_counters! {
         compute_storage_sole_copy_peak_bytes,
     }
 }
+/// Where a full-frame read of a pinned resident put the bytes.
+///
+/// The two are the same `vkCmdCopyImage*` shape and the same byte count, and
+/// they are opposite answers to this project's only question: one crosses into
+/// this process's address space and one does not. A single total over both is
+/// unreadable, and `copy_target_to_guest_pages` charged the host counter for
+/// gigabytes a boot that no CPU ever touched.
+///
+/// An argument rather than two methods, for the reason [`CreateSite`] is one:
+/// a new read site cannot be added without saying which of the two it is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TargetReadDelivery {
+    /// Into a mapped staging slot the CPU then reads — a real device→host copy.
+    Host,
+    /// Into the guest's imported pages, on the queue, with no host pass at all.
+    GuestPagesOnGpu,
+}
+
+/// Which rail a device→host readback was the tail of.
+///
+/// `readbacks` pools three call sites that answer different questions, and the
+/// pooled number was read for years as the draw rail alone on the strength of a
+/// doc claim that `computes` is 0 on a desktop workload. A driven macos-13
+/// x86/Vulkan boot puts `computes` at 1288, so that reading was wrong on a
+/// first-class pathway and nothing in the census could show it.
+///
+/// The distinction is not cosmetic. Two of the three end in **guest pages** —
+/// `ComputeOutput`'s buffers and images are consumed by `writeback_buffer` and
+/// `writeback_texture` — so they are a zero-copy failure with a known repair
+/// ([`super::copy_target_to_guest_pages`]), while a draw tail may not be. A
+/// single total cannot be used to size that repair.
+///
+/// An argument rather than three methods, for the reason [`TargetReadDelivery`]
+/// is one: a new readback site cannot be added without saying which rail it is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadbackSource {
+    /// The tail of a draw submission.
+    DrawTail,
+    /// A compute dispatch's writable storage buffers.
+    ComputeBuffer,
+    /// A compute dispatch's storage images.
+    ComputeImage,
+}
+
 macro_rules! create_sites {
     ($($variant:ident => $slug:literal),+ $(,)?) => {
         /// The Vulkan object lifetime a successful create call belongs to.
@@ -937,14 +1036,33 @@ impl EngineCounters {
         self.allocs.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub fn note_readback(&self, bytes: u64) {
+    pub fn note_readback(&self, bytes: u64, source: ReadbackSource) {
         self.readbacks.fetch_add(1, Ordering::Relaxed);
         self.readback_bytes.fetch_add(bytes, Ordering::Relaxed);
+        let (count, total) = match source {
+            ReadbackSource::DrawTail => (&self.readback_draw, &self.readback_draw_bytes),
+            ReadbackSource::ComputeBuffer => (
+                &self.readback_compute_buffer,
+                &self.readback_compute_buffer_bytes,
+            ),
+            ReadbackSource::ComputeImage => (
+                &self.readback_compute_image,
+                &self.readback_compute_image_bytes,
+            ),
+        };
+        count.fetch_add(1, Ordering::Relaxed);
+        total.fetch_add(bytes, Ordering::Relaxed);
     }
 
-    pub fn note_target_read(&self, bytes: u64) {
-        self.target_reads.fetch_add(1, Ordering::Relaxed);
-        self.target_read_bytes.fetch_add(bytes, Ordering::Relaxed);
+    pub fn note_target_read(&self, bytes: u64, delivery: TargetReadDelivery) {
+        let (count, total) = match delivery {
+            TargetReadDelivery::Host => (&self.target_reads, &self.target_read_bytes),
+            TargetReadDelivery::GuestPagesOnGpu => {
+                (&self.target_gpu_copies, &self.target_gpu_copy_bytes)
+            }
+        };
+        count.fetch_add(1, Ordering::Relaxed);
+        total.fetch_add(bytes, Ordering::Relaxed);
     }
 
     pub fn note_seed_upload(&self, bytes: u64) {
@@ -994,11 +1112,7 @@ impl EngineCounters {
         }
     }
 
-    pub(super) fn note_buffer_guest_import(
-        &self,
-        bytes: u64,
-        role: super::exec::BufferGatherRole,
-    ) {
+    pub(super) fn note_buffer_guest_import(&self, bytes: u64, role: super::exec::BufferGatherRole) {
         self.buffer_guest_imports.fetch_add(1, Ordering::Relaxed);
         self.buffer_guest_import_bytes
             .fetch_add(bytes, Ordering::Relaxed);
@@ -1130,12 +1244,39 @@ mod tests {
     use super::*;
     use crate::runtime::gather_witness::GatherVouch;
 
+    /// The pooled total is what the census used to carry alone, and it read the
+    /// same whether the bytes were a draw's tail or a compute output bound for
+    /// guest pages. Each rail is asserted **by name** rather than by the sum:
+    /// a sum-only assertion passes with any two of the three transposed, which
+    /// is exactly the confusion the split exists to prevent.
+    #[test]
+    fn a_readback_lands_on_the_rail_its_source_names() {
+        let counters = EngineCounters::default();
+        counters.note_readback(4096, ReadbackSource::DrawTail);
+        counters.note_readback(8192, ReadbackSource::ComputeBuffer);
+        counters.note_readback(16384, ReadbackSource::ComputeImage);
+
+        let s = counters.snapshot();
+        assert_eq!((s.readback_draw, s.readback_draw_bytes), (1, 4096));
+        assert_eq!(
+            (s.readback_compute_buffer, s.readback_compute_buffer_bytes),
+            (1, 8192)
+        );
+        assert_eq!(
+            (s.readback_compute_image, s.readback_compute_image_bytes),
+            (1, 16384)
+        );
+        // The pooled pair still counts every rail, so an existing reading of
+        // `readback_bytes` keeps its meaning across this change.
+        assert_eq!((s.readbacks, s.readback_bytes), (3, 4096 + 8192 + 16384));
+    }
+
     #[test]
     fn note_helpers_update_event_and_byte_counters_together() {
         let counters = EngineCounters::default();
         counters.note_create(CreateSite::ShaderModule);
         counters.note_alloc();
-        counters.note_readback(4096);
+        counters.note_readback(4096, ReadbackSource::DrawTail);
         counters.note_seed_upload(1024);
         counters.note_sampled_gather(2048);
         counters.note_sampled_gather_skipped(512);
@@ -1164,6 +1305,34 @@ mod tests {
                 snapshot.sampled_gather_skip_bytes
             ),
             (1, 512)
+        );
+    }
+
+    /// A full-frame read charged to the wrong half is the difference between
+    /// "this device is zero-copy" and "it is not", so the two deliveries are
+    /// asserted by name and with different byte counts.
+    ///
+    /// Asserting only the sum would pass with the arms swapped, and swapped is
+    /// exactly the state this split was written to end: `copy_target_to_guest_pages`
+    /// charged `target_reads` for gigabytes a boot that never entered host
+    /// address space, and the host total read the same whether the GPU rail was
+    /// carrying the frames or not.
+    #[test]
+    fn a_target_read_lands_on_the_half_its_delivery_names() {
+        let counters = EngineCounters::default();
+        counters.note_target_read(4096, TargetReadDelivery::Host);
+        counters.note_target_read(8192, TargetReadDelivery::GuestPagesOnGpu);
+
+        let snapshot = counters.snapshot();
+        assert_eq!(
+            (snapshot.target_reads, snapshot.target_read_bytes),
+            (1, 4096),
+            "host delivery: {snapshot:?}"
+        );
+        assert_eq!(
+            (snapshot.target_gpu_copies, snapshot.target_gpu_copy_bytes),
+            (1, 8192),
+            "guest-pages delivery: {snapshot:?}"
         );
     }
 

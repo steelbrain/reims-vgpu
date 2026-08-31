@@ -176,8 +176,6 @@ fn a_resource_record_that_populates_its_unrecovered_tail_says_so() {
     assert!(line.contains(" tail_nz=1"), "{line}");
 }
 
-
-
 /// One segment header whose declared length runs `overshoot` bytes past the
 /// buffer, followed by `tail` bytes of would-be records.
 fn truncated_segment(type_: u8, overshoot: usize, tail: usize) -> Vec<u8> {
@@ -1337,7 +1335,10 @@ fn every_decoded_draw_in_a_stream_reaches_the_draw_list() {
     }
 
     assert_eq!(acc.draws.len(), records, "no draw may be truncated away");
-    assert_eq!(acc.dropped_no_pipeline, 0, "all of these had a pipeline bound");
+    assert_eq!(
+        acc.dropped_no_pipeline, 0,
+        "all of these had a pipeline bound"
+    );
 
     // With no pipeline latched the same record is the other arm: still not
     // a `PendingDraw`, but counted rather than vanishing.
@@ -1498,15 +1499,9 @@ fn draw_preparation_keeps_every_recorded_bind_table_allocation() {
     assert!(Arc::ptr_eq(&req.vertex_buffers, &pd.vertex_buffers));
     assert!(Arc::ptr_eq(&req.fragment_buffers, &pd.fragment_buffers));
     assert!(Arc::ptr_eq(&req.vertex_textures, &pd.vertex_textures));
-    assert!(Arc::ptr_eq(
-        &req.fragment_textures,
-        &pd.fragment_textures
-    ));
+    assert!(Arc::ptr_eq(&req.fragment_textures, &pd.fragment_textures));
     assert!(Arc::ptr_eq(&req.vertex_samplers, &pd.vertex_samplers));
-    assert!(Arc::ptr_eq(
-        &req.fragment_samplers,
-        &pd.fragment_samplers
-    ));
+    assert!(Arc::ptr_eq(&req.fragment_samplers, &pd.fragment_samplers));
 }
 
 /// A bind that changes after a draw must not reach back into that draw.
@@ -1612,18 +1607,46 @@ fn a_recorded_buffer_bind_retains_its_object_across_offset_change_and_ref_reuse(
     st32(&mut bind[OP_HEADER_LEN + render::BIND_COUNT..], 1);
     st32(&mut bind[OP_HEADER_LEN + render::BIND_ENTRIES..], 7);
     let mut out = ExecResult::default();
-    let mut acc = StreamAccum { pipeline_ref: 61, ..Default::default() };
-    handle_render_record(&mut state, &host, 1, wire_render::OPCODE_SET_VERTEX_BUFFER, &bind, &mut out, &mut acc);
-    let first = acc.vertex_buffers[0].resource.clone().expect("setter retain");
+    let mut acc = StreamAccum {
+        pipeline_ref: 61,
+        ..Default::default()
+    };
+    handle_render_record(
+        &mut state,
+        &host,
+        1,
+        wire_render::OPCODE_SET_VERTEX_BUFFER,
+        &bind,
+        &mut out,
+        &mut acc,
+    );
+    let first = acc.vertex_buffers[0]
+        .resource
+        .clone()
+        .expect("setter retain");
 
     let offset_total = OP_HEADER_LEN + render::BUFFER_OFFSET_PAYLOAD_LEN;
     let mut offset = vec![0u8; offset_total];
     st32(&mut offset, wire_render::OPCODE_SET_VERTEX_BUFFER_OFFSET);
     st32(&mut offset[4..], offset_total as u32);
-    st64(&mut offset[OP_HEADER_LEN + render::BUFFER_OFFSET_VALUE..], 0x80);
-    handle_render_record(&mut state, &host, 1, wire_render::OPCODE_SET_VERTEX_BUFFER_OFFSET, &offset, &mut out, &mut acc);
+    st64(
+        &mut offset[OP_HEADER_LEN + render::BUFFER_OFFSET_VALUE..],
+        0x80,
+    );
+    handle_render_record(
+        &mut state,
+        &host,
+        1,
+        wire_render::OPCODE_SET_VERTEX_BUFFER_OFFSET,
+        &offset,
+        &mut out,
+        &mut acc,
+    );
     assert_eq!(acc.vertex_buffers[0].offset, 0x80);
-    assert!(Arc::ptr_eq(&first, acc.vertex_buffers[0].resource.as_ref().unwrap()));
+    assert!(Arc::ptr_eq(
+        &first,
+        acc.vertex_buffers[0].resource.as_ref().unwrap()
+    ));
 
     let mut draw = vec![0u8; 0x20];
     let draw_op = wire_render::OPCODE_DRAW_INDEXED_WIDE;
@@ -1665,8 +1688,19 @@ fn a_texture_slot_replaces_object_identity_only_on_a_later_setter() {
     st32(&mut command[OP_HEADER_LEN + render::BIND_ENTRIES..], 9);
     let mut out = ExecResult::default();
     let mut acc = StreamAccum::default();
-    handle_render_record(&mut state, &host, 1, wire_render::OPCODE_SET_FRAGMENT_TEXTURE, &command, &mut out, &mut acc);
-    assert!(Arc::ptr_eq(acc.fragment_textures[0].resource.as_ref().unwrap(), &first));
+    handle_render_record(
+        &mut state,
+        &host,
+        1,
+        wire_render::OPCODE_SET_FRAGMENT_TEXTURE,
+        &command,
+        &mut out,
+        &mut acc,
+    );
+    assert!(Arc::ptr_eq(
+        acc.fragment_textures[0].resource.as_ref().unwrap(),
+        &first
+    ));
 
     assert!(state.task_resources.delete(1, 9));
     let replacement = state.task_resources.register(
@@ -1674,9 +1708,23 @@ fn a_texture_slot_replaces_object_identity_only_on_a_later_setter() {
         9,
         Arc::new(TaskResource::new(ListObjectEntry::default(), Arc::from([]))),
     );
-    assert!(Arc::ptr_eq(acc.fragment_textures[0].resource.as_ref().unwrap(), &first));
-    handle_render_record(&mut state, &host, 1, wire_render::OPCODE_SET_FRAGMENT_TEXTURE, &command, &mut out, &mut acc);
-    assert!(Arc::ptr_eq(acc.fragment_textures[0].resource.as_ref().unwrap(), &replacement));
+    assert!(Arc::ptr_eq(
+        acc.fragment_textures[0].resource.as_ref().unwrap(),
+        &first
+    ));
+    handle_render_record(
+        &mut state,
+        &host,
+        1,
+        wire_render::OPCODE_SET_FRAGMENT_TEXTURE,
+        &command,
+        &mut out,
+        &mut acc,
+    );
+    assert!(Arc::ptr_eq(
+        acc.fragment_textures[0].resource.as_ref().unwrap(),
+        &replacement
+    ));
 }
 
 #[test]
@@ -2000,6 +2048,184 @@ fn finish_stream_clear_only_branch_without_draws() {
     finish_stream(&mut state, &mut host, 1, &mut out, &acc);
     assert_eq!(out.metal_draws_ok, 0);
     assert_eq!(out.metal_draws_fail, 0);
+}
+
+/// A clear-only integer attachment publishes the integer components themselves.
+///
+/// The GPU draw path already carries the clear as a typed union member. This
+/// exercises the other publication path: no draw exists, so `finish_stream`
+/// must materialize the result directly in the type-11 mapping's native texels.
+#[test]
+fn clear_only_rg16uint_publishes_native_guest_texels() {
+    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+    use crate::contract::pixel_format::{MTL_FORMAT_RG16_UINT, RG16_BPP};
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    let (task_id, texture_ref, mapping_id) = (1u32, 0x91u32, 17u32);
+    let pfn = 0x71u32;
+    let page = (pfn as u64) << PAGE_SHIFT_ARM64E;
+    host.map_range(page, 1usize << PAGE_SHIFT_ARM64E, 0xcc);
+
+    assert!(state.map_surface(mapping_id));
+    {
+        let mapping = state.mappings.get_mut(&mapping_id).expect("mapping");
+        mapping.mapped = true;
+        mapping.mapping_internal = 1;
+        mapping.page_entries = vec![(pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
+    }
+    assert!(state.set_mapping_geom(mapping_id, 2, 2, MTL_FORMAT_RG16_UINT));
+    state
+        .texture_to_mapping
+        .insert((task_id, texture_ref), mapping_id);
+
+    let (_, row_stride, _) = mapping_write::type11_sample_window(
+        state.mappings.get(&mapping_id).expect("mapping"),
+        2,
+        2,
+        MTL_FORMAT_RG16_UINT,
+    )
+    .expect("the type-11 texture has a sample window");
+    assert!(row_stride >= 2 * RG16_BPP);
+
+    let mut acc = StreamAccum::default();
+    acc.clears.push(ColorAttachment {
+        texture_ref,
+        load_action: MTL_LOAD_ACTION_CLEAR,
+        store_action: MTL_STORE_ACTION_STORE,
+        clear_color: [1.0, 258.0, 65_535.0, 0.0],
+        ..Default::default()
+    });
+    let mut out = ExecResult::default();
+    finish_stream(&mut state, &mut host, task_id, &mut out, &acc);
+
+    assert_eq!(out.clears_applied, 1, "the clear-only Store must publish");
+    let expected = [1u16.to_le_bytes(), 258u16.to_le_bytes()]
+        .concat()
+        .repeat(2);
+    for y in 0..2u64 {
+        let mut row = vec![0u8; expected.len()];
+        host.read_gpa(page + y * u64::from(row_stride), &mut row)
+            .expect("read clear result");
+        assert_eq!(row, expected, "row {y} keeps the integer clear values");
+    }
+    if row_stride > 2 * RG16_BPP {
+        let mut padding = [0u8; 1];
+        host.read_gpa(page + u64::from(2 * RG16_BPP), &mut padding)
+            .expect("read row padding");
+        assert_eq!(padding, [0xcc], "the writer must not clear row padding");
+    }
+}
+
+/// The same clear representation reaches a linear type-2/3 target, including
+/// its guest-declared row pitch rather than a tightly packed substitute.
+#[test]
+fn clear_only_rg16uint_publishes_native_linear_gva_rows() {
+    use crate::contract::pixel_format::MTL_FORMAT_RG16_UINT;
+    use crate::runtime::decode::resource::{
+        list_object_entry_offset, LINEAR_DESC_HANDLE, LINEAR_DESC_SIZE, OBJECT_LIST_ENTRY_LEN,
+        OBJECT_TYPE_TEXTURE, TEXTURE_DESC_BASE_LEN, TEXTURE_DESC_HEIGHT, TEXTURE_DESC_PIXEL_FORMAT,
+        TEXTURE_DESC_ROW_STRIDE, TEXTURE_DESC_WIDTH,
+    };
+    use crate::runtime::gva_mem::{
+        define_task_pages_arm64e, read_task_gva_by_id, write_task_gva_arm64e,
+    };
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    define_task_pages_arm64e(&mut host, &mut state, 4, 16);
+    assert!(state.set_object_list(1, 0, 256));
+
+    let (texture_ref, handle, width, height, row_stride) = (200u32, 8u32, 2u32, 2u32, 16u32);
+    let target_gva = (handle as u64) << PAGE_SHIFT_ARM64E;
+    let mut prior = vec![0xcc; (row_stride * height) as usize];
+    write_task_gva_arm64e(&mut host, &state.tasks[1], target_gva, &prior);
+    crate::runtime::surface_cache::store_texture(
+        &mut state,
+        1,
+        texture_ref,
+        width,
+        height,
+        vec![0x11; (width * height * 4) as usize],
+        target_gva,
+    );
+    crate::runtime::surface_cache::store_gva_owned(
+        &mut state,
+        target_gva,
+        width,
+        height,
+        vec![0x22; (width * height * 4) as usize],
+        OBJECT_TYPE_TEXTURE,
+        None,
+        true,
+    );
+
+    let mut desc = vec![0u8; TEXTURE_DESC_BASE_LEN];
+    st64(
+        &mut desc[LINEAR_DESC_SIZE..],
+        u64::from(row_stride) * u64::from(height),
+    );
+    st32(&mut desc[LINEAR_DESC_HANDLE..], handle);
+    st32(&mut desc[TEXTURE_DESC_ROW_STRIDE..], row_stride);
+    st32(&mut desc[TEXTURE_DESC_WIDTH..], width);
+    st32(&mut desc[TEXTURE_DESC_HEIGHT..], height);
+    st16(&mut desc[TEXTURE_DESC_PIXEL_FORMAT..], MTL_FORMAT_RG16_UINT);
+    let desc_gva = 0x280u64;
+    write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, &desc);
+    let entry_off = list_object_entry_offset(texture_ref, 256).expect("object-list ref");
+    let mut entry = [0u8; OBJECT_LIST_ENTRY_LEN];
+    st32(
+        &mut entry,
+        (OBJECT_TYPE_TEXTURE as u32) | ((desc.len() as u32) << 8),
+    );
+    entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
+    write_task_gva_arm64e(&mut host, &state.tasks[1], entry_off, &entry);
+
+    let mut acc = StreamAccum::default();
+    acc.clears.push(ColorAttachment {
+        texture_ref,
+        load_action: MTL_LOAD_ACTION_CLEAR,
+        store_action: MTL_STORE_ACTION_STORE,
+        clear_color: [1.0, 258.0, 0.0, 0.0],
+        ..Default::default()
+    });
+    let mut out = ExecResult::default();
+    finish_stream(&mut state, &mut host, 1, &mut out, &acc);
+    assert_eq!(
+        out.clears_applied, 1,
+        "the linear clear-only Store must publish"
+    );
+    assert!(
+        crate::runtime::surface_cache::get_texture(&state, 1, texture_ref, width, height).is_none(),
+        "the object-keyed copy must not outlive pixels published to guest pages"
+    );
+    assert!(
+        !crate::runtime::surface_cache::has_gva(&state, target_gva, width, height),
+        "the GVA-keyed copy must not outlive pixels published to guest pages"
+    );
+
+    read_task_gva_by_id(
+        &host,
+        &state.tasks,
+        1,
+        target_gva,
+        &mut prior,
+        PAGE_SHIFT_ARM64E,
+    )
+    .expect("read linear clear result");
+    let expected = [1u16.to_le_bytes(), 258u16.to_le_bytes()]
+        .concat()
+        .repeat(width as usize);
+    assert_eq!(&prior[..expected.len()], expected);
+    assert_eq!(
+        &prior[row_stride as usize..row_stride as usize + expected.len()],
+        expected
+    );
+    assert!(
+        prior[expected.len()..row_stride as usize]
+            .iter()
+            .all(|&byte| byte == 0xcc),
+        "the clear must leave guest row padding untouched"
+    );
 }
 
 #[test]
@@ -4946,7 +5172,10 @@ fn a_clear_seeds_the_pass_for_any_store_action_and_publishes_only_for_store() {
 
     let seeded = |store_action: u16| {
         let mut payload = vec![0u8; 0x400];
-        st32(&mut payload[PASS_COLOR_ATTACH_OFF + PASS_ATTACH_TEXREF..], 7);
+        st32(
+            &mut payload[PASS_COLOR_ATTACH_OFF + PASS_ATTACH_TEXREF..],
+            7,
+        );
         payload[PASS_COLOR_ATTACH_OFF + PASS_ATTACH_LOAD_ACTION
             ..PASS_COLOR_ATTACH_OFF + PASS_ATTACH_LOAD_ACTION + 2]
             .copy_from_slice(&MTL_LOAD_ACTION_CLEAR.to_le_bytes());
@@ -4997,5 +5226,270 @@ fn a_clear_seeds_the_pass_for_any_store_action_and_publishes_only_for_store() {
         0,
         "DontCare says the result is dropped, so writing the clear colour into \
          guest pages would be inventing content the guest declined"
+    );
+}
+
+/// The two resolve-carrying actions have different publication contracts.
+#[test]
+fn a_clear_distinguishes_resolve_only_from_store_and_resolve() {
+    use crate::contract::pass_action::{
+        MTL_STORE_ACTION_DONT_CARE, MTL_STORE_ACTION_MULTISAMPLE_RESOLVE,
+        MTL_STORE_ACTION_STORE_AND_MULTISAMPLE_RESOLVE,
+    };
+
+    let att = |store: u16, texture_ref: u32, resolve_texture_ref: u32| ColorAttachment {
+        texture_ref,
+        resolve_texture_ref,
+        store_action: store,
+        load_action: MTL_LOAD_ACTION_CLEAR,
+        ..Default::default()
+    };
+
+    assert_eq!(
+        clear_publish_target(&att(MTL_STORE_ACTION_STORE_AND_MULTISAMPLE_RESOLVE, 4, 3)),
+        ClearPublish::StoredAndResolved {
+            source: 4,
+            resolve: 3
+        },
+        "store-and-resolve retains the multisample source and publishes the resolve"
+    );
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    assert!(
+        !apply_clear(
+            &mut state,
+            &mut host,
+            1,
+            &att(MTL_STORE_ACTION_STORE_AND_MULTISAMPLE_RESOLVE, 4, 3),
+        ),
+        "the single-sample clear rail must not claim both destinations were published"
+    );
+    let log = std::fs::read_to_string(crate::observe::fail_log_path()).expect("fail log");
+    assert!(
+        log.lines().any(|line| {
+            line.contains("reason=clear_store_and_multisample_resolve_unsupported")
+                && line.contains("source=4")
+                && line.contains("resolve=3")
+        }),
+        "the unsupported two-destination clear must be fail-visible"
+    );
+    assert_eq!(
+        clear_publish_target(&att(MTL_STORE_ACTION_MULTISAMPLE_RESOLVE, 4, 3)),
+        ClearPublish::Resolved(3),
+        "resolve-only publishes only the single-sample destination"
+    );
+
+    // A plain single-sample store keeps the attachment the guest declared,
+    // level and all — it is not retargeted.
+    assert_eq!(
+        clear_publish_target(&att(MTL_STORE_ACTION_STORE, 4, 0)),
+        ClearPublish::Direct
+    );
+
+    // **And it keeps it even when a resolve texture is named**, which is a
+    // deliberate narrowing and the one case a reader is most likely to assume
+    // went the other way. The retarget used to key on `resolve_texture_ref != 0`
+    // alone, so a descriptor that set `resolveTexture` alongside
+    // `MTLStoreActionStore` landed its clear in the resolve texture at level
+    // zero — a different surface from the one the guest declared. The store
+    // action is what says whether a resolve happens; a resolve texture the
+    // action does not name is not this pass's destination.
+    assert_eq!(
+        clear_publish_target(&att(MTL_STORE_ACTION_STORE, 4, 3)),
+        ClearPublish::Direct,
+        "a non-resolving store publishes into the texture it declared, whatever \
+         resolve texture the descriptor also carries"
+    );
+
+    // A resolve with nowhere to resolve into is still a named refusal, for both
+    // actions. This is the half that must NOT be lost by admitting the pair
+    // above.
+    for store in [
+        MTL_STORE_ACTION_MULTISAMPLE_RESOLVE,
+        MTL_STORE_ACTION_STORE_AND_MULTISAMPLE_RESOLVE,
+    ] {
+        assert_eq!(
+            clear_publish_target(&att(store, 4, 0)),
+            ClearPublish::ResolveTargetMissing,
+            "a resolve naming no resolve texture has nowhere to publish"
+        );
+    }
+
+    // Nothing to publish: an action that keeps no single sample, and no
+    // attachment at all. Neither is a loss.
+    assert_eq!(
+        clear_publish_target(&att(MTL_STORE_ACTION_DONT_CARE, 4, 3)),
+        ClearPublish::NotPublished
+    );
+    assert_eq!(
+        clear_publish_target(&att(MTL_STORE_ACTION_STORE, 0, 0)),
+        ClearPublish::NotPublished
+    );
+}
+
+/// A successful draw in an earlier render stream does not suppress the clear
+/// fallback for a later stream whose own draw failed.
+#[test]
+fn clear_fallback_draw_accounting_is_scoped_to_one_render_stream() {
+    let at_entry = (7, 3);
+    let mut out = ExecResult {
+        metal_draws_ok: 7,
+        metal_draws_fail: 4,
+        ..Default::default()
+    };
+    assert_eq!(
+        stream_draw_delta(&out, at_entry),
+        StreamDrawDelta { ok: 0, fail: 1 },
+        "the earlier streams' seven successful draws are not this stream's success"
+    );
+
+    out.metal_draws_ok += 1;
+    assert_eq!(
+        stream_draw_delta(&out, at_entry),
+        StreamDrawDelta { ok: 1, fail: 1 },
+        "a draw that lands in this stream suppresses its destructive fallback"
+    );
+}
+
+/// A multisample colour attachment has no single-sample linear publication.
+///
+/// # The contract
+///
+/// On rail macos-15 the guest renders 300x300 tiles into type-2/3 linear
+/// textures whose descriptors declare `sampleCount = 4`, and it sizes those
+/// allocations to match: the boot's `gva_view_fragmented ... pages=352` at two
+/// separate targets fixes `height * bpr` inside `(351, 352] * 4096`, which for
+/// `height = 300` admits one plausible stride — `4800`, exactly four times the
+/// single-sample tight row of a 300-wide BGRA8 texture. Ordinary single-sample
+/// 300x300 surfaces in the same boot report `bpr=1216`.
+///
+/// So the guest strided that span for four samples per pixel, and this device
+/// has never established what the samples' layout inside it is. A single-sample
+/// image written there is not a partial answer, it is the wrong content: it
+/// fills 1200 of every 4800 bytes and leaves the rest.
+///
+/// `apply_clear`'s sibling arm already states the rule for
+/// `StoreAndMultisampleResolve` — "treating the source as a linear image would
+/// write only one sample" — and could not apply it to a plain `Store`, because
+/// `clear_publish_target` decides from the store action alone and never sees a
+/// sample count.
+///
+/// # What this guards
+///
+/// The clear fallback is reached exactly when the draw's Store was refused, and
+/// on this rail that refusal is `read_target_multisample_image`, which is
+/// itself correct. What followed it was a solid beige or near-black 300x300
+/// clear written over the guest's four-sample pages, twice a boot.
+#[test]
+fn a_multisample_linear_target_keeps_its_guest_bytes_instead_of_a_one_sample_clear() {
+    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::runtime::decode::resource::{
+        list_object_entry_offset, LINEAR_DESC_HANDLE, LINEAR_DESC_SIZE, OBJECT_LIST_ENTRY_LEN,
+        OBJECT_TYPE_TEXTURE, TEXTURE_DESC_BASE_LEN, TEXTURE_DESC_HEIGHT, TEXTURE_DESC_PIXEL_FORMAT,
+        TEXTURE_DESC_ROW_STRIDE, TEXTURE_DESC_SAMPLE_COUNT, TEXTURE_DESC_TRAILER_HEIGHT,
+        TEXTURE_DESC_TRAILER_WIDTH, TEXTURE_DESC_WIDTH,
+    };
+    use crate::runtime::gva_mem::{
+        define_task_pages_arm64e, read_task_gva_by_id, write_task_gva_arm64e,
+    };
+
+    // Both arms of one comparison: the same texture, the same clear, differing
+    // only in the sample count its descriptor declares. Single-sample must keep
+    // publishing — this narrows the clear rail, it does not close it.
+    let published = |sample_count: u16| -> (bool, Vec<u8>) {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let mut host = FakeHost::new();
+        define_task_pages_arm64e(&mut host, &mut state, 4, 16);
+        assert!(state.set_object_list(1, 0, 256));
+
+        // Four samples per pixel in the stride, as the rail's own span
+        // arithmetic gives it: `bpr = samples * width * 4`.
+        let (texture_ref, handle, width, height) = (200u32, 8u32, 2u32, 2u32);
+        let row_stride = u32::from(sample_count) * width * 4;
+        let target_gva = (handle as u64) << PAGE_SHIFT_ARM64E;
+        let mut pages = vec![0xcc; (row_stride * height) as usize];
+        write_task_gva_arm64e(&mut host, &state.tasks[1], target_gva, &pages);
+
+        let mut desc = vec![0u8; TEXTURE_DESC_BASE_LEN];
+        st64(
+            &mut desc[LINEAR_DESC_SIZE..],
+            u64::from(row_stride) * u64::from(height),
+        );
+        st32(&mut desc[LINEAR_DESC_HANDLE..], handle);
+        st32(&mut desc[TEXTURE_DESC_ROW_STRIDE..], row_stride);
+        st32(&mut desc[TEXTURE_DESC_WIDTH..], width);
+        st32(&mut desc[TEXTURE_DESC_HEIGHT..], height);
+        st16(
+            &mut desc[TEXTURE_DESC_PIXEL_FORMAT..],
+            MTL_FORMAT_BGRA8_UNORM,
+        );
+        // The trailer states the extent a second time, and the decode returns
+        // the sample count only when the two statements agree.
+        st32(&mut desc[TEXTURE_DESC_TRAILER_WIDTH..], width);
+        st32(&mut desc[TEXTURE_DESC_TRAILER_HEIGHT..], height);
+        st16(&mut desc[TEXTURE_DESC_SAMPLE_COUNT..], sample_count);
+        let desc_gva = 0x280u64;
+        write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, &desc);
+        let entry_off = list_object_entry_offset(texture_ref, 256).expect("object-list ref");
+        let mut entry = [0u8; OBJECT_LIST_ENTRY_LEN];
+        st32(
+            &mut entry,
+            (OBJECT_TYPE_TEXTURE as u32) | ((desc.len() as u32) << 8),
+        );
+        entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
+        write_task_gva_arm64e(&mut host, &state.tasks[1], entry_off, &entry);
+
+        let mut acc = StreamAccum::default();
+        acc.clears.push(ColorAttachment {
+            texture_ref,
+            load_action: MTL_LOAD_ACTION_CLEAR,
+            store_action: MTL_STORE_ACTION_STORE,
+            clear_color: [1.0, 1.0, 1.0, 1.0],
+            ..Default::default()
+        });
+        let mut out = ExecResult::default();
+        finish_stream(&mut state, &mut host, 1, &mut out, &acc);
+        read_task_gva_by_id(
+            &host,
+            &state.tasks,
+            1,
+            target_gva,
+            &mut pages,
+            PAGE_SHIFT_ARM64E,
+        )
+        .expect("read the target's guest pages");
+        (out.clears_applied == 1, pages)
+    };
+
+    let (one_published, one_pages) = published(1);
+    assert!(
+        one_published,
+        "a single-sample linear Store still publishes its clear"
+    );
+    assert!(
+        one_pages.contains(&0xff),
+        "the single-sample arm must actually have written the clear, or the \
+         multisample arm below proves nothing"
+    );
+
+    let (four_published, four_pages) = published(4);
+    assert!(
+        !four_published,
+        "a four-sample attachment has no single-sample linear publication"
+    );
+    assert!(
+        four_pages.iter().all(|&byte| byte == 0xcc),
+        "the guest's four-sample span must be left exactly as it was found, not \
+         overwritten with one sample's worth of clear colour"
+    );
+
+    let log = std::fs::read_to_string(crate::observe::fail_log_path()).expect("fail log");
+    assert!(
+        log.lines().any(|line| {
+            line.contains("reason=clear_multisample_source_not_linear")
+                && line.contains("samples=4")
+        }),
+        "the refused publication must be fail-visible: a clear this device drops \
+         silently is the one outcome the ground rules forbid"
     );
 }

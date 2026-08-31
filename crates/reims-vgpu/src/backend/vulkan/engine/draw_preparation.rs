@@ -116,6 +116,19 @@ pub enum DrawPreparationDecline {
         binding: u32,
         kind: String,
     },
+    /// A statically-used fragment texture is absent and its declared shape
+    /// cannot be represented by the neutral sampled-image rail.
+    UnboundTextureShapeUnsupported {
+        index: u32,
+        binding: u32,
+        kind: String,
+    },
+    /// A statically-used fragment storage buffer has no guest bind and no
+    /// contract-defined contents from which a neutral descriptor can be made.
+    UnboundStorageBuffer {
+        index: u32,
+        binding: u32,
+    },
     /// The render engine currently exposes guest textures as sampled images.
     /// Binding a reflected storage image through that descriptor type would be
     /// invalid Vulkan, so refuse before constructing the request.
@@ -306,6 +319,10 @@ impl Decline for DrawPreparationDecline {
             Self::TextureDimensionUnsupported { .. } => {
                 "draw_prepare_texture_dimension_unsupported"
             }
+            Self::UnboundTextureShapeUnsupported { .. } => {
+                "draw_prepare_unbound_texture_shape_unsupported"
+            }
+            Self::UnboundStorageBuffer { .. } => "draw_prepare_unbound_storage_buffer",
             Self::TextureAccessUnsupported { .. } => "draw_prepare_texture_access_unsupported",
             Self::ReflectedResourceUnsupported { .. } => {
                 "draw_prepare_reflected_resource_unsupported"
@@ -522,6 +539,19 @@ impl Decline for DrawPreparationDecline {
                 ("texture_ref", texture_ref.to_string()),
                 ("binding", binding.to_string()),
                 ("kind", log_token(kind)),
+            ],
+            Self::UnboundTextureShapeUnsupported {
+                index,
+                binding,
+                kind,
+            } => vec![
+                ("index", index.to_string()),
+                ("binding", binding.to_string()),
+                ("kind", log_token(kind)),
+            ],
+            Self::UnboundStorageBuffer { index, binding } => vec![
+                ("index", index.to_string()),
+                ("binding", binding.to_string()),
             ],
             Self::TextureAccessUnsupported {
                 stage,
@@ -820,6 +850,15 @@ mod tests {
                 binding: 34,
                 kind: "Cube".into(),
             },
+            DrawPreparationDecline::UnboundTextureShapeUnsupported {
+                index: 2,
+                binding: 34,
+                kind: "Cube".into(),
+            },
+            DrawPreparationDecline::UnboundStorageBuffer {
+                index: 2,
+                binding: 258,
+            },
             DrawPreparationDecline::TextureAccessUnsupported {
                 stage: "fragment",
                 index: 2,
@@ -956,7 +995,7 @@ mod tests {
         slugs.sort_unstable();
         let before = slugs.len();
         slugs.dedup();
-        assert_eq!(before, 41, "the draw-preparation reason census moved");
+        assert_eq!(before, 43, "the draw-preparation reason census moved");
         assert_eq!(before, slugs.len(), "duplicate draw-preparation slug");
     }
 

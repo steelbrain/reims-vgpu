@@ -877,11 +877,12 @@ pub fn pay_for_texture<M: HostMemory + HostOps>(
         // The split is emitted beside the total, so
         // `_resolved + _unresolved == wbdebt_texture_owes_nothing` is checkable
         // on the census itself.
-        crate::runtime::drain::note_store_route(match state.names_live_mapping(task_id, texture_ref)
-        {
-            true => "wbdebt_texture_owes_nothing_resolved",
-            false => "wbdebt_texture_owes_nothing_unresolved",
-        });
+        crate::runtime::drain::note_store_route(
+            match state.names_live_mapping(task_id, texture_ref) {
+                true => "wbdebt_texture_owes_nothing_resolved",
+                false => "wbdebt_texture_owes_nothing_unresolved",
+            },
+        );
         crate::runtime::drain::note_store_route("wbdebt_texture_owes_nothing");
     }
 }
@@ -1052,7 +1053,7 @@ fn reback_gva_resource<M: HostMemory>(
 #[cfg(feature = "backend-vulkan")]
 pub fn arm_gva<M: HostMemory + HostOps>(
     state: &mut DeviceState,
-    _host: &mut M,
+    host: &mut M,
     task_id: u32,
     c0: &crate::runtime::draw::ColorRtRequest,
     identity: &crate::backend::vulkan::engine::TargetIdentity,
@@ -1076,6 +1077,26 @@ pub fn arm_gva<M: HostMemory + HostOps>(
         task_id,
         texture_ref: c0.texture_ref,
     };
+    let plane = key.plane(c0.target_gva);
+    // Arm the guest-write witness *before* the ledger, because whether it arms
+    // decides whether this frame may be deferred at all.
+    //
+    // A deferred frame is a host-authoritative copy of guest pages the guest CPU
+    // may write at any moment with no device operation, and the only recovery
+    // from such a write is to land the frame everywhere the guest did not touch
+    // — which needs the hypervisor's per-page report. Deferring without it is
+    // not a cheaper Store, it is a Store that a single guest write anywhere in
+    // the plane deletes: the layer reverts to whatever its pages held and every
+    // pixel the GPU rendered outside the guest's own rectangle is gone.
+    //
+    // So the rule is the writer's, and stricter than the reader's: a Store may
+    // be deferred only while this device can still say what the guest wrote in
+    // the meantime. Everything else takes the eager copying rail the caller
+    // falls back to, which lands the frame in the guest's pages now and has
+    // nothing left to lose.
+    if !gva_writeback_is_recoverable(state, host, identity, plane) {
+        return false;
+    }
     let debt = GvaWritebackDebt {
         gva: c0.target_gva,
         row_stride: c0.row_stride,
@@ -1091,6 +1112,46 @@ pub fn arm_gva<M: HostMemory + HostOps>(
         release_gva(previous);
     }
     true
+}
+
+/// Whether a frame deferred into `plane`'s resident could still be landed after
+/// a guest CPU write into those pages.
+///
+/// The witness this arms used to be stamped only by the *eager* store, which is
+/// the one rail with nothing outstanding: after an eager store the guest's pages
+/// already hold the frame, so a guest write over them costs nothing. Here it
+/// costs the frame, so this is where the question has to become answerable.
+///
+/// The hypervisor's set has an arming window — its generation reads back 0 until
+/// a harvest has run over it — so the first Store into a fresh plane arms the
+/// set and answers `false`, and the next Store into it can defer. Measured on
+/// the macos-15 conformance battery: 229 of 1 349 GVA Stores were inside that
+/// window, and every one of the 7 frames the ledger lost to a guest write was
+/// one of them.
+#[cfg(feature = "backend-vulkan")]
+fn gva_writeback_is_recoverable<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    identity: &crate::backend::vulkan::engine::TargetIdentity,
+    plane: GvaPlaneKey,
+) -> bool {
+    let Some((_, _, ordered)) = state.pending_writebacks.gva_resource_backing(plane) else {
+        // No page list, so no set to watch and no destination to land into
+        // later either. Both halves of a deferral are missing.
+        crate::runtime::drain::note_store_route("gvadebt_arm_unbacked");
+        return false;
+    };
+    let Some(key) = crate::runtime::gva_store_witness::GvaTargetKey::of(identity) else {
+        crate::runtime::drain::note_store_route("gvadebt_arm_unnamed");
+        return false;
+    };
+    crate::runtime::gva_store_witness::note_store(state, host, key, &ordered);
+    if crate::runtime::gva_store_witness::armed(state, key) {
+        true
+    } else {
+        crate::runtime::drain::note_store_route("gvadebt_arm_unwitnessed");
+        false
+    }
 }
 
 /// Whether this exact GVA resident is the host-authoritative copy named by an
@@ -1336,8 +1397,9 @@ pub fn settle_for_texture<M: HostMemory + HostOps>(
     let (tasks, page_shift, page_size) = (&state.tasks, state.page_shift, state.page_size());
     crate::runtime::render_writeback::settle_guest_writes_unless_disjoint(site, || {
         let want = reims_vgpu_paging::span::pages_spanned(gva, span, page_size);
-        let gpas =
-            crate::runtime::gva_mem::task_gva_page_gpas(host, tasks, task_id, gva, span, page_shift);
+        let gpas = crate::runtime::gva_mem::task_gva_page_gpas(
+            host, tasks, task_id, gva, span, page_shift,
+        );
         (gpas.len() as u64 == want).then_some(gpas)
     });
 }
@@ -1405,7 +1467,6 @@ pub fn submit_for_resources<M: HostMemory + HostOps>(
         pay_for_texture(state, host, task_id, object_id);
     }
 }
-
 
 /// Run the Store the debt stands for, now.
 ///
@@ -1492,6 +1553,88 @@ impl GvaPaySite {
     }
 }
 
+/// The plane-relative byte ranges the guest CPU owns, from the pages the
+/// hypervisor reported it wrote.
+///
+/// `ordered` is the plane's own page list in plane order, so page `i` is the
+/// bytes at `[i * page_size, (i + 1) * page_size)` — the same identity
+/// `StoreTargetPages::from_ordered` builds the destination from, which is why
+/// this cannot be derived from a GPA alone: the same physical page may appear at
+/// more than one offset of a plane, and every appearance is the guest's.
+///
+/// The result is ascending, disjoint, and clamped to `span`, which is what
+/// [`crate::runtime::mapping_write::SkipRanges`] promises its readers.
+///
+/// Gated the way [`PendingWritebacks::gva_resource_backing`] is: only the Vulkan
+/// arm arms a GVA debt, so the Metal build has no caller — but the relation is
+/// plain arithmetic over a page list and its tests are worth running on every
+/// arm.
+#[cfg(any(feature = "backend-vulkan", test))]
+fn plane_offsets_of_pages(
+    ordered: &[u64],
+    page_size: u64,
+    span: u64,
+    written: &[u64],
+) -> Vec<(u64, u64)> {
+    let mut out: Vec<(u64, u64)> = Vec::new();
+    for (i, gpa) in ordered.iter().enumerate() {
+        if !written.contains(gpa) {
+            continue;
+        }
+        let from = (i as u64).saturating_mul(page_size);
+        if from >= span {
+            continue;
+        }
+        let to = from.saturating_add(page_size).min(span);
+        match out.last_mut() {
+            // Adjacent pages coalesce, so a whole-plane write is one range
+            // rather than one per page and the row walk below stays cheap.
+            Some(last) if last.1 == from => last.1 = to,
+            _ => out.push((from, to)),
+        }
+    }
+    out
+}
+
+/// Where the guest CPU wrote inside the plane this debt owes a frame to, or
+/// `None` when the host cannot say.
+///
+/// `None` covers every unknown, and each one means the same thing to the caller:
+/// the guest declared a write, this device cannot name the region, so the
+/// guest's pages keep what they hold. Serving the device's frame over an
+/// unnamed guest write is the one answer that destroys work nothing can
+/// recover.
+///
+/// An empty report is an unknown and not a finding. The hypervisor harvests at
+/// its own points, so "no page of this target has moved" from a harvest that
+/// has not yet run since the guest's store is indistinguishable from a guest
+/// that wrote nothing — and the guest's own declaration already said it wrote.
+/// Two witnesses disagreeing is not a licence to pick the convenient one.
+#[cfg(feature = "backend-vulkan")]
+fn guest_owned_plane_ranges<M: HostOps>(
+    state: &DeviceState,
+    host: &M,
+    identity: &crate::backend::vulkan::engine::TargetIdentity,
+    ordered: &[u64],
+    span: u64,
+) -> Option<Vec<(u64, u64)>> {
+    let Some(key) = crate::runtime::gva_store_witness::GvaTargetKey::of(identity) else {
+        crate::runtime::drain::note_store_route("gvadebt_merge_no_key");
+        return None;
+    };
+    let written = crate::runtime::gva_store_witness::written_pages(state, host, key)?;
+    if written.is_empty() {
+        crate::runtime::drain::note_store_route("gvadebt_merge_no_pages");
+        return None;
+    }
+    let ranges = plane_offsets_of_pages(ordered, state.page_size(), span, &written);
+    if ranges.is_empty() {
+        crate::runtime::drain::note_store_route("gvadebt_merge_no_offsets");
+        return None;
+    }
+    Some(ranges)
+}
+
 /// Materialize one host-authoritative GVA resource into its retained transfer
 /// backing. After explicit discard, synchronize lazily recreates that backing;
 /// ordinary virtual-memory unmap does not participate in resource lifetime.
@@ -1505,12 +1648,16 @@ fn pay_gva<M: HostMemory + HostOps>(
 ) -> bool {
     let key = plane.resource;
     let identity = gva_identity(debt);
-    let now = state.buffer_write_gen.stamp(key.task_id, key.texture_ref);
-    if !now.quiet_since(debt.guest_write) {
-        crate::runtime::drain::note_store_route("gvadebt_abandoned_guest_wrote");
-        release_gva(debt);
-        return true;
-    }
+    // Whether the guest has declared a CPU write to this resource since the
+    // Store. It is not yet a verdict: the declaration is one resource-wide bit
+    // (`shouldInvalidateHost`, a `lock btr` of the object's dirty flag) and the
+    // API relation it stands for is per region. Where the guest wrote is
+    // resolved below, once the plane's page list is back, because that is the
+    // only coordinate system the hypervisor's answer arrives in.
+    let guest_declared_write = !state
+        .buffer_write_gen
+        .stamp(key.task_id, key.texture_ref)
+        .quiet_since(debt.guest_write);
     let Some(span) = u64::from(debt.row_stride).checked_mul(u64::from(debt.height)) else {
         crate::observe::fail(format!(
             "gvadebt_pay_lost task={} texture={} reason=span_overflow",
@@ -1552,6 +1699,27 @@ fn pay_gva<M: HostMemory + HostOps>(
         release_gva(debt);
         return true;
     }
+    // The third answer. Writing the whole frame over a plane the guest CPU wrote
+    // part of loses the guest's stores; dropping the frame loses everything the
+    // GPU rendered, which is the whole layer minus the guest's rectangle. Only
+    // the hypervisor's per-page report separates them, and when it cannot the
+    // guest's bytes win — the same direction every other consumer of that
+    // witness fails in.
+    let skip = if guest_declared_write {
+        match guest_owned_plane_ranges(state, host, &identity, &ordered, span) {
+            Some(ranges) => {
+                crate::runtime::drain::note_store_route("gvadebt_merged_guest_wrote");
+                ranges
+            }
+            None => {
+                crate::runtime::drain::note_store_route("gvadebt_abandoned_guest_wrote");
+                release_gva(debt);
+                return true;
+            }
+        }
+    } else {
+        Vec::new()
+    };
     let pages = crate::runtime::draw::StoreTargetPages::from_ordered(&ordered, span);
     let request = crate::runtime::draw::ColorRtRequest {
         texture_ref: key.texture_ref,
@@ -1572,6 +1740,7 @@ fn pay_gva<M: HostMemory + HostOps>(
         &request,
         key.texture_ref,
         Some(&pages),
+        &skip,
     ) {
         // Through the builder rather than by interpolating the decline, which
         // renders its own `reason=` and produced `reason=reason=<slug>` — a line
@@ -1695,10 +1864,20 @@ mod tests {
     fn arming_past_the_bound_evicts_the_oldest_and_says_so() {
         let mut pending = PendingWritebacks::default();
         for id in 0..MAX_DEBTS as u32 {
-            assert_eq!(pending.arm(id, ident(id, 64, 64, 1), 64, 64, 1), None, "under the bound");
+            assert_eq!(
+                pending.arm(id, ident(id, 64, 64, 1), 64, 64, 1),
+                None,
+                "under the bound"
+            );
         }
         assert_eq!(pending.len(), MAX_DEBTS);
-        let evicted = pending.arm(MAX_DEBTS as u32, ident(MAX_DEBTS as u32, 64, 64, 1), 64, 64, 1);
+        let evicted = pending.arm(
+            MAX_DEBTS as u32,
+            ident(MAX_DEBTS as u32, 64, 64, 1),
+            64,
+            64,
+            1,
+        );
         assert_eq!(
             evicted,
             Some(WritebackKey::Mapping(0)),
@@ -1923,7 +2102,181 @@ mod tests {
                 "arming one level must not supersede another"
             );
         }
-        assert_eq!(pending.take_gva(key).len(), 3, "the resource owes all three");
+        assert_eq!(
+            pending.take_gva(key).len(),
+            3,
+            "the resource owes all three"
+        );
+    }
+
+    /// The plane's own page order decides the offsets, not the GPA order.
+    ///
+    /// A page list is what a plane *is*: the same physical page may appear at
+    /// more than one offset, and a writeback that resolved offsets by sorting
+    /// GPAs would skip the wrong bytes of a plane whose pages the guest
+    /// allocated out of order — which is every plane, since guest RAM is not
+    /// handed out contiguously.
+    #[test]
+    fn the_guests_pages_map_to_their_own_offsets_in_the_plane() {
+        const P: u64 = 0x1000;
+        // Descending GPAs, so an implementation that sorted them would produce
+        // the reverse of this.
+        let ordered = [9 * P, 4 * P, 7 * P, 2 * P];
+        let span = 4 * P;
+        assert_eq!(
+            plane_offsets_of_pages(&ordered, P, span, &[7 * P]),
+            vec![(2 * P, 3 * P)],
+            "page 7 is the plane's third page"
+        );
+        // Plane-adjacent pages coalesce; plane-separated ones do not.
+        assert_eq!(
+            plane_offsets_of_pages(&ordered, P, span, &[4 * P, 7 * P]),
+            vec![(P, 3 * P)]
+        );
+        assert_eq!(
+            plane_offsets_of_pages(&ordered, P, span, &[9 * P, 7 * P]),
+            vec![(0, P), (2 * P, 3 * P)]
+        );
+        // A page the plane does not own is not the plane's.
+        assert_eq!(plane_offsets_of_pages(&ordered, P, span, &[5 * P]), vec![]);
+    }
+
+    /// The last page of a plane whose span ends inside it is clamped, because
+    /// the skip list is read against the frame's own bytes and a range past the
+    /// end would exclude bytes that do not exist.
+    #[test]
+    fn the_last_page_of_a_plane_is_clamped_to_its_span() {
+        const P: u64 = 0x1000;
+        let ordered = [3 * P, 8 * P];
+        assert_eq!(
+            plane_offsets_of_pages(&ordered, P, P + 64, &[8 * P]),
+            vec![(P, P + 64)]
+        );
+        // A page wholly past the span belongs to no byte of the frame.
+        assert_eq!(plane_offsets_of_pages(&ordered, P, P, &[8 * P]), vec![]);
+    }
+
+    /// A Store may not be deferred while this device cannot say what the guest
+    /// writes to the plane in the meantime.
+    ///
+    /// The writer's rule, and stricter than the reader's. A deferred frame lives
+    /// only in a resident, and the sole recovery from a guest CPU write into its
+    /// pages is to land it everywhere the guest did not touch — which needs the
+    /// hypervisor's per-page report. Without one, a single guest write anywhere
+    /// in the plane deletes the whole frame, and on a compositing layer that is
+    /// every pixel the GPU rendered outside the guest's own rectangle.
+    ///
+    /// Both unwitnessed shapes are asked, because they arrive from opposite
+    /// directions: a host with no dirty bitmap at all, and the product host's
+    /// arming window, in which a freshly tracked set reads its generation back
+    /// as 0 until a harvest has run. The second is the one that bit — on the
+    /// macos-15 battery every frame the ledger lost to a guest write was a
+    /// first Store into a fresh plane.
+    #[cfg(feature = "backend-vulkan")]
+    #[test]
+    fn an_unwitnessed_gva_store_is_not_deferred() {
+        fn arm(host: &mut crate::runtime::FakeHost) -> (bool, DeviceState) {
+            let mut state = DeviceState::new(crate::model::DeviceId::default(), 12);
+            let debt = gva_debt(9);
+            let identity = gva_identity(debt);
+            let key = GvaResourceKey {
+                task_id: 3,
+                texture_ref: 12,
+            };
+            let span = u64::from(debt.row_stride) * u64::from(debt.height);
+            let pages: Vec<u64> = (0..span.div_ceil(state.page_size()))
+                .map(|i| 0x40_000 + i * state.page_size())
+                .collect();
+            let _ = state
+                .pending_writebacks
+                .ensure_gva_resource(key, debt.gva, span, Some(pages));
+            let c0 = crate::runtime::draw::ColorRtRequest {
+                texture_ref: key.texture_ref,
+                target_gva: debt.gva,
+                row_stride: debt.row_stride,
+                width: debt.width,
+                height: debt.height,
+                format: debt.format,
+                ..Default::default()
+            };
+            let armed = arm_gva(&mut state, host, key.task_id, &c0, &identity);
+            (armed, state)
+        }
+
+        let mut blind = crate::runtime::FakeHost::new();
+        blind.guest_writes_unobservable = true;
+        let (armed, state) = arm(&mut blind);
+        assert!(
+            !armed,
+            "a host with no dirty bitmap cannot recover a deferral"
+        );
+        assert_eq!(
+            state.pending_writebacks.len(),
+            0,
+            "a refused deferral must leave no debt for the caller's eager Store to fight with"
+        );
+
+        let mut waking = crate::runtime::FakeHost::new();
+        waking.guest_write_startup_window = true;
+        let (armed, state) = arm(&mut waking);
+        assert!(
+            !armed,
+            "a set still inside its arming window cannot date a frame"
+        );
+        assert_eq!(state.pending_writebacks.len(), 0);
+
+        // The same plane once the host can answer: deferral is licensed again,
+        // so this refusal is a gate and not a disabled rail.
+        let mut ready = crate::runtime::FakeHost::new();
+        let (armed, state) = arm(&mut ready);
+        assert!(armed, "a witnessed plane still defers");
+        assert_eq!(state.pending_writebacks.len(), 1);
+    }
+
+    /// A guest CPU write into part of a plane names that part, so the payment
+    /// can keep both writers.
+    ///
+    /// The relation `cpu_write_after_render` asks for, at the seam that decides
+    /// it. Before this, `pay_gva` had one answer to a guest write — release the
+    /// debt — and a guest that wrote one page of a layer lost every pixel the
+    /// GPU had rendered into the rest of it.
+    #[cfg(feature = "backend-vulkan")]
+    #[test]
+    fn a_partial_guest_write_names_the_pages_it_owns() {
+        let mut state = DeviceState::new(crate::model::DeviceId::default(), 12);
+        let mut host = crate::runtime::FakeHost::new();
+        let page = state.page_size();
+        let ordered: Vec<u64> = (0..4).map(|i| (0x40 + i) * page).collect();
+        let span = 4 * page;
+        let debt = gva_debt(9);
+        let identity = gva_identity(debt);
+        let key = crate::runtime::gva_store_witness::GvaTargetKey::of(&identity)
+            .expect("a GVA identity names a witness target");
+
+        // Nothing armed: the host cannot name a page, so the guest keeps
+        // everything — the direction every unknown answers in.
+        assert_eq!(
+            guest_owned_plane_ranges(&state, &host, &identity, &ordered, span),
+            None,
+            "an unstamped target has no extent to report"
+        );
+
+        crate::runtime::gva_store_witness::note_store(&mut state, &mut host, key, &ordered);
+        // Still nothing written since the Store. That is not a licence either:
+        // the guest's own declaration is what brought the caller here, and a
+        // harvest that has not run yet reports the same empty list.
+        assert_eq!(
+            guest_owned_plane_ranges(&state, &host, &identity, &ordered, span),
+            None,
+            "an empty report is an unknown, not a finding"
+        );
+
+        host.guest_wrote_page(ordered[2] + 8);
+        assert_eq!(
+            guest_owned_plane_ranges(&state, &host, &identity, &ordered, span),
+            Some(vec![(2 * page, 3 * page)]),
+            "only the page the guest wrote is the guest's"
+        );
     }
 
     /// A guest validity transition after the Store makes guest memory newer
@@ -1981,7 +2334,9 @@ mod tests {
         // emptiness check and neither counter is reached. Mapping 7 owes; the
         // three references below are about other surfaces.
         assert_eq!(
-            state.pending_writebacks.arm(7, ident(7, 64, 64, 1), 64, 64, 1),
+            state
+                .pending_writebacks
+                .arm(7, ident(7, 64, 64, 1), 64, 64, 1),
             None
         );
         // Reference 21 names mapping 9 through the per-task registration, and
@@ -2036,8 +2391,18 @@ mod tests {
     fn asynchronous_resource_synchronization_submits_only_named_objects() {
         let mut state = DeviceState::new(crate::model::DeviceId::default(), 12);
         let mut host = crate::runtime::FakeHost::new();
-        assert_eq!(state.pending_writebacks.arm(7, ident(7, 64, 64, 1), 64, 64, 1), None);
-        assert_eq!(state.pending_writebacks.arm(8, ident(8, 64, 64, 1), 64, 64, 1), None);
+        assert_eq!(
+            state
+                .pending_writebacks
+                .arm(7, ident(7, 64, 64, 1), 64, 64, 1),
+            None
+        );
+        assert_eq!(
+            state
+                .pending_writebacks
+                .arm(8, ident(8, 64, 64, 1), 64, 64, 1),
+            None
+        );
         submit_for_resources(&mut state, &mut host, 1, &[7]);
         assert!(state.pending_writebacks.get(7).is_none());
         assert!(state.pending_writebacks.get(8).is_some());

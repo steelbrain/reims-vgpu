@@ -21,6 +21,7 @@ pub enum DeviceLostOp {
     ComputeSubmit,
     PoolsWaitFencesRetire,
     PoolsFenceStatusBeginEntry,
+    PoolsFenceStatusMaintenance,
     PoolsWaitFencesEntry,
     PoolsSubmitBatch,
 }
@@ -35,6 +36,7 @@ impl DeviceLostOp {
             Self::ComputeSubmit => VkOp::ComputeExecSubmit,
             Self::PoolsWaitFencesRetire => VkOp::PoolsWaitFencesRetire,
             Self::PoolsFenceStatusBeginEntry => VkOp::PoolsFenceStatusBeginEntry,
+            Self::PoolsFenceStatusMaintenance => VkOp::PoolsFenceStatusMaintenance,
             Self::PoolsWaitFencesEntry => VkOp::PoolsWaitFencesEntry,
             Self::PoolsSubmitBatch => VkOp::PoolsSubmitBatch,
         }
@@ -131,6 +133,10 @@ impl Decline for DeviceLostDecline {
                 op: DeviceLostOp::PoolsFenceStatusBeginEntry,
                 ..
             } => "vk_device_lost_pools_fence_status_begin_entry",
+            Self::Driver {
+                op: DeviceLostOp::PoolsFenceStatusMaintenance,
+                ..
+            } => "vk_device_lost_pools_fence_status_maintenance",
             Self::Driver {
                 op: DeviceLostOp::PoolsWaitFencesEntry,
                 ..

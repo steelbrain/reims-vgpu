@@ -78,7 +78,7 @@ while [ $SECONDS -lt $end ]; do
     # closed Spotlight and a Spotlight that never received a keystroke both look
     # like — and the second is a probe bug reported as a clean result.
     if [ $round -le 3 ]; then
-      "$REPO/scripts/screenshot-when-kde-plasma-host/screenshot-when-kde-plasma-host.sh" \
+      "$REPO/scripts/screenshot/screenshot.sh" \
         -o "$OUT/typed-$round.png" >/dev/null 2>&1
     fi
     # Walk the results list and open the top hit: the list is what resizes the
@@ -99,7 +99,7 @@ done
 timeout 30 ssh -o BatchMode=yes macos-vm 'pgrep -x Spotlight' \
   >"$OUT/pid-after.txt" 2>/dev/null
 
-"$REPO/scripts/screenshot-when-kde-plasma-host/screenshot-when-kde-plasma-host.sh" \
+"$REPO/scripts/screenshot/screenshot.sh" \
   -o "$OUT/screen.png" >/dev/null 2>&1 || echo "screenshot failed" >>"$OUT/rounds.log"
 
 tail -c "+$(( OFFSET + 1 ))" "$FAILLOG" >"$OUT/window.log"

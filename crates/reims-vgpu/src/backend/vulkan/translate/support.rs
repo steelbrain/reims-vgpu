@@ -384,7 +384,9 @@ mod tests {
             TranslateReason::FormatNotVertexBuffer(vk::Format::R16G16B16_SFLOAT.as_raw())
         );
         // Exactly enough room is enough.
-        assert!(support.resolve(VertexAttributeFormat::Half3, 0, 8, three).is_ok());
+        assert!(support
+            .resolve(VertexAttributeFormat::Half3, 0, 8, three)
+            .is_ok());
     }
 
     /// A declined format with no wider sibling declines by name rather than

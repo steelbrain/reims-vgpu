@@ -330,7 +330,14 @@ pub fn walk<M: GuestMemory>(
     depth: u32,
     gva: u64,
 ) -> Result<Walk, WalkFailure> {
-    walk_recording_nodes(mem, geometry, root_pfn, depth, gva, &mut NodePath::default())
+    walk_recording_nodes(
+        mem,
+        geometry,
+        root_pfn,
+        depth,
+        gva,
+        &mut NodePath::default(),
+    )
 }
 
 /// [`walk`], additionally reporting the interior nodes the descent read.

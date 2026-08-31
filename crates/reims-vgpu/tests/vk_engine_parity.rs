@@ -10,12 +10,12 @@
 
 use metal2vulkan::passes::Stage;
 use reims_vgpu::backend::vulkan::engine::{
-    self, BlendFactor, BlendOp, BlendStateResource, BufferContent, CullMode, DepthState, DrawRequest,
-    IndexType, IndexedDrawResource, PrimitiveTopology, SampledContentIdentity, SampledImageResource,
-    SampledSource, SamplerCompareFunction, SamplerResource, ScissorResource, SecondaryColorTarget,
-    StencilFaceOps, StencilOp, StencilState, StorageBufferResource, TargetIdentity,
-    VertexAttributeFormat, VertexAttributeResource, VertexStepFunction, ViewportResource,
-    VisibilityResultMode, MAX_DEVICE_RECREATES,
+    self, BlendFactor, BlendOp, BlendStateResource, BufferContent, CullMode, DepthState,
+    DrawRequest, IndexType, IndexedDrawResource, PrimitiveTopology, SampledContentIdentity,
+    SampledImageResource, SampledSource, SamplerCompareFunction, SamplerResource, ScissorResource,
+    SecondaryColorTarget, StencilFaceOps, StencilOp, StencilState, StorageBufferResource,
+    TargetIdentity, VertexAttributeFormat, VertexAttributeResource, VertexStepFunction,
+    ViewportResource, VisibilityResultMode, MAX_DEVICE_RECREATES,
 };
 /// The resident format every `TargetIdentity::Surface` in this file is built at.
 ///
@@ -25,6 +25,16 @@ use reims_vgpu::backend::vulkan::engine::{
 /// place and makes a test that wants a different format say so.
 const SURFACE_TEST_FORMAT: ash::vk::Format =
     reims_vgpu::backend::vulkan::translate::pixel::SCANOUT_FORMAT;
+
+fn color_attachment(
+    format: u16,
+    clear: [f64; 4],
+) -> reims_vgpu::backend::vulkan::engine::ColorAttachmentState {
+    reims_vgpu::backend::vulkan::translate::pixel::color_attachment(format)
+        .expect("test attachment format is renderable")
+        .0
+        .with_clear(clear)
+}
 
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
@@ -775,7 +785,8 @@ fn depth_test_honored_on_resident_target_path() {
         }
         let px = engine::read_target(&identity)
             .expect("read resident depth target")
-            .into_rgba8();
+            .into_rgba8()
+            .expect("an eight-bit colour readback");
         Some(triangle_covered(&px, w, h))
     };
 
@@ -1414,7 +1425,8 @@ fn resident_sample_alias_uses_native_feedback_or_snapshot_fallback() {
     engine::execute_draw_request(&alias).expect("resident alias feedback");
     let out = engine::read_target(&identity)
         .expect("read native feedback result after deferred draw")
-        .into_rgba8();
+        .into_rgba8()
+        .expect("an eight-bit colour readback");
     assert_fullscreen_fragment_color("resident_sample_alias", &out, 16, 16);
     let delta = engine::counter_snapshot().delta_since(&before);
     assert_eq!(
@@ -1666,7 +1678,8 @@ fn warm_non_store_zero_readback_seed_create_alloc() {
     // fence first, so it returns the exact content of the skipped-wait draw.
     let px = engine::read_target(&identity)
         .expect("read_target after warm")
-        .into_rgba8();
+        .into_rgba8()
+        .expect("an eight-bit colour readback");
     assert_fullscreen_fragment_color("read_target", &px, 16, 16);
 }
 
@@ -2148,8 +2161,8 @@ fn reflected_static_sampler_descriptor_samples_texture() {
         .collect::<Vec<_>>();
     assert_eq!(
         reims_vgpu::runtime::spirv_bind::widen_sampled_bands(&mut frag),
-        1,
-        "fixture has one sampler in the translator's narrow tail band"
+        0,
+        "the translator already emits the device's full sampler band"
     );
     assert_eq!(
         reims_vgpu::runtime::spirv_bind::offset_fragment_sampled_resource_bindings(&mut frag),
@@ -2245,17 +2258,27 @@ fn reflected_static_sampler_descriptor_samples_texture() {
     assert!(second.pixels.is_empty());
     let pixels = engine::read_target(&target)
         .expect("read repeated static sampler target")
-        .into_rgba8();
+        .into_rgba8()
+        .expect("an eight-bit colour readback");
     let descriptors = engine::counter_snapshot().delta_since(&before);
     if descriptors.descriptor_set_updates == 0 {
-        assert_eq!(descriptors.descriptor_pushes, 1, "first draw pushes: {descriptors:?}");
+        assert_eq!(
+            descriptors.descriptor_pushes, 1,
+            "first draw pushes: {descriptors:?}"
+        );
         assert_eq!(
             descriptors.descriptor_push_held, 1,
             "the exact repeated state is retained by the command buffer: {descriptors:?}"
         );
     } else {
-        assert_eq!(descriptors.descriptor_set_updates, 2, "fallback updates: {descriptors:?}");
-        assert_eq!(descriptors.descriptor_set_binds, 2, "fallback binds: {descriptors:?}");
+        assert_eq!(
+            descriptors.descriptor_set_updates, 2,
+            "fallback updates: {descriptors:?}"
+        );
+        assert_eq!(
+            descriptors.descriptor_set_binds, 2,
+            "fallback binds: {descriptors:?}"
+        );
         assert_eq!(descriptors.descriptor_pushes, 0);
         assert_eq!(descriptors.descriptor_push_held, 0);
     }
@@ -2592,10 +2615,11 @@ fn partial_draw_preserves_a_native_guest_target_seed() {
     req.skip_readback = true;
     req.target_guest_seed = Some(engine::GuestTargetSeed {
         source: engine::GuestRunSource {
-            runs: std::sync::Arc::new(vec![engine::GuestRun {
-                host_ptr: backing.as_ptr() as usize,
-                len: backing.len() as u64,
-            }]),
+            runs: std::sync::Arc::new(vec![engine::GuestRun::whole(
+                backing.as_ptr() as usize,
+                backing.len() as u64,
+            )
+            .expect("a fixture run covers its own span")]),
             source_offset: 0,
             total_len: backing.len() as u64,
             row_length_texels: 0,
@@ -2621,7 +2645,8 @@ fn partial_draw_preserves_a_native_guest_target_seed() {
     }
     let rgba = engine::read_target(&identity)
         .expect("read guest-seeded target")
-        .into_rgba8();
+        .into_rgba8()
+        .expect("an eight-bit colour readback");
     let outside = ((h / 2) * w + w / 2) as usize * 4;
     assert_eq!(
         &rgba[outside..outside + 4],
@@ -2759,7 +2784,8 @@ fn a_bgra_ordered_seed_lands_the_same_pixels_as_the_rgba_ordered_one() {
         Some(
             engine::read_target(&identity)
                 .expect("read seed-order target")
-                .into_rgba8(),
+                .into_rgba8()
+                .expect("an eight-bit colour readback"),
         )
     };
 
@@ -2871,7 +2897,8 @@ fn skip_readback_store_then_load_from_target_preserves_content() {
     engine::execute_draw_request(&store2).expect("store2 LoadFromTarget");
     let px = engine::read_target(&identity)
         .expect("read_target after progressive Stores")
-        .into_rgba8();
+        .into_rgba8()
+        .expect("an eight-bit colour readback");
     assert_fullscreen_fragment_color("progressive_skip_readback", &px, 16, 16);
     // No seed_uploads on pass 2 (LoadFromTarget, not CPU seed).
     // Counters are process-global; just ensure content survived.
@@ -3176,7 +3203,8 @@ fn gva_deferred_store_flush_read_matches_sync_store() {
     let before_flush = engine::counter_snapshot();
     let p_flush = engine::read_target(&identity)
         .expect("flush read_target")
-        .into_rgba8();
+        .into_rgba8()
+        .expect("an eight-bit colour readback");
     let df = engine::counter_snapshot().delta_since(&before_flush);
     // The flush's copy is a resident read, not a draw readback — the two are
     // counted apart so that moving a copy from one rail to the other cannot look
@@ -3350,11 +3378,13 @@ fn alternating_target_no_readback_draws_stay_in_flight_and_read_back_exact() {
     // Boundary reads retire the in-flight work and see the final content.
     let px = engine::read_target(&id_a)
         .expect("ring boundary read a")
-        .into_rgba8();
+        .into_rgba8()
+        .expect("an eight-bit colour readback");
     assert_fullscreen_fragment_color("ring_read_a", &px, 16, 16);
     let px = engine::read_target(&id_b)
         .expect("ring boundary read b")
-        .into_rgba8();
+        .into_rgba8()
+        .expect("an eight-bit colour readback");
     assert_fullscreen_fragment_color("ring_read_b", &px, 16, 16);
 }
 
@@ -3459,8 +3489,10 @@ fn mrt_secondary_attachment_becomes_sampleable_resident() {
         identity: secondary.clone(),
         width: 16,
         height: 16,
-        format: ash::vk::Format::R8G8B8A8_UNORM,
-        clear: [0.0, 0.0, 1.0, 1.0],
+        attachment: color_attachment(
+            reims_vgpu::contract::pixel_format::MTL_FORMAT_RGBA8_UNORM,
+            [0.0, 0.0, 1.0, 1.0],
+        ),
         load: false,
         // Unblended: this parity case checks the attachment is written at
         // all, not how it composites.
@@ -3550,8 +3582,10 @@ fn mrt_rg16float_secondary_builds_and_renders() {
         identity: mask.clone(),
         width: 32,
         height: 32,
-        format: ash::vk::Format::R16G16_SFLOAT,
-        clear: [1.0, 0.5, 0.0, 0.0],
+        attachment: color_attachment(
+            reims_vgpu::contract::pixel_format::MTL_FORMAT_RG16_FLOAT,
+            [1.0, 0.5, 0.0, 0.0],
+        ),
         load: false,
         // Unblended: this is the vibrancy coverage-mask shape, and a mask is a
         // raw store. Which is exactly why every secondary used to be forced
@@ -3617,8 +3651,10 @@ fn depth_and_mrt_secondary_render_in_one_pass() {
             identity: secondary.clone(),
             width: w,
             height: h,
-            format: ash::vk::Format::R8G8B8A8_UNORM,
-            clear: [0.0, 0.0, 1.0, 1.0],
+            attachment: color_attachment(
+                reims_vgpu::contract::pixel_format::MTL_FORMAT_RGBA8_UNORM,
+                [0.0, 0.0, 1.0, 1.0],
+            ),
             load: false,
             blend: None,
             color_write_mask: Default::default(),

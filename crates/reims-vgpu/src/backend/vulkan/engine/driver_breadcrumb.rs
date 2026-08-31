@@ -262,18 +262,23 @@ mod tests {
     fn both_stages_of_a_graphics_compile_reach_disk_and_are_taken_back() {
         let vert = [0x0723_0203u32, 0x0001_0000, 1];
         let frag = [0x0723_0203u32, 0x0001_0000, 2, 3];
-        let crumb = super::DriverBreadcrumb::arm("test_graphics", &[("vert", &vert), ("frag", &frag)])
-            .expect("a module nothing has crashed on is not quarantined");
+        let crumb =
+            super::DriverBreadcrumb::arm("test_graphics", &[("vert", &vert), ("frag", &frag)])
+                .expect("a module nothing has crashed on is not quarantined");
 
         let vert_path = super::path("vert");
         let frag_path = super::path("frag");
         assert_eq!(
             std::fs::read(&vert_path).expect("the vertex module is on disk"),
-            vert.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<_>>()
+            vert.iter()
+                .flat_map(|w| w.to_le_bytes())
+                .collect::<Vec<_>>()
         );
         assert_eq!(
             std::fs::read(&frag_path).expect("the fragment module is on disk"),
-            frag.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<_>>()
+            frag.iter()
+                .flat_map(|w| w.to_le_bytes())
+                .collect::<Vec<_>>()
         );
         let meta = std::fs::read_to_string(super::meta_path()).expect("the meta line is on disk");
         assert!(meta.contains("vert words=3"), "{meta}");
@@ -281,7 +286,10 @@ mod tests {
 
         crumb.disarm();
         assert!(!vert_path.exists(), "a returned call leaves no vertex file");
-        assert!(!frag_path.exists(), "a returned call leaves no fragment file");
+        assert!(
+            !frag_path.exists(),
+            "a returned call leaves no fragment file"
+        );
     }
 
     /// Arming a breadcrumb also puts the call under the clock watch, and
@@ -330,6 +338,10 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let want: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         assert_eq!(got, want, "little-endian words, in order, nothing added");
-        assert_eq!(&got[..4], &[0x03, 0x02, 0x23, 0x07], "reads as SPIR-V magic");
+        assert_eq!(
+            &got[..4],
+            &[0x03, 0x02, 0x23, 0x07],
+            "reads as SPIR-V magic"
+        );
     }
 }
