@@ -149,8 +149,9 @@ mod tests {
     use memory_topology::fixtures;
 
     fn caps(api: u32, props: &vk::PhysicalDeviceMemoryProperties) -> HostGpuCaps {
+        let device_type = vk::PhysicalDeviceType::DISCRETE_GPU;
         HostGpuCaps {
-            memory: memory_topology::classify_memory(props),
+            memory: memory_topology::classify_memory(props, device_type),
             // A real reported limit rather than a sentinel: it is on the
             // selection line, and 4 GiB is the AMD APU value that made an
             // unchecked import invalid usage.
@@ -165,7 +166,7 @@ mod tests {
             push_descriptor: PushDescriptorCaps::default(),
             portability_subset: false,
             device_api_version: api,
-            device_type: vk::PhysicalDeviceType::DISCRETE_GPU,
+            device_type,
         }
     }
 

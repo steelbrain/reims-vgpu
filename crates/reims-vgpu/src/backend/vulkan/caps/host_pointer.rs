@@ -300,6 +300,8 @@ pub unsafe fn query(
     let mut host_props = vk::PhysicalDeviceExternalMemoryHostPropertiesEXT::default();
     let mut props2 = vk::PhysicalDeviceProperties2::default().push_next(&mut host_props);
     unsafe { instance.get_physical_device_properties2(pd, &mut props2) };
+    // Reuse this query because topology also needs the physical-device type.
+    let device_type = props2.properties.device_type;
     let min_alignment = host_props.min_imported_host_pointer_alignment;
     if min_alignment == 0 || !min_alignment.is_power_of_two() {
         return HostPointerCaps::refused(HostPointerImport::AlignmentUnsatisfiable);
@@ -319,7 +321,7 @@ pub unsafe fn query(
     let props = unsafe { instance.get_physical_device_memory_properties(pd) };
     let heap_budget = super::memory_topology::roomiest_heap_for(
         &props,
-        &super::memory_topology::classify_memory(&props)
+        &super::memory_topology::classify_memory(&props, device_type)
             .topology
             .request(super::MemoryClass::Upload),
     );
