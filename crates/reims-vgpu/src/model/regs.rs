@@ -1512,6 +1512,22 @@ pub const DEVICE_INFO_CAPS: &[(u32, u32)] = &[
 /// guest's compiler *emits against* — to satisfy an invariant that does not
 /// exist.
 ///
+/// # Binary-archive architecture is not an AIR-version answer
+///
+/// On the macOS 15 x86/PCI pathway, `AppleParavirtDevice` answers
+/// `supportsBinaryArchives` with a fixed false and inherits `_MTLDevice`'s
+/// `targetDeviceArchitecture`, which returns nil without reading device state.
+/// Metal's binary-archive loader requires that architecture object before it
+/// reads its driver version, CPU type or subtype to select an archive slice.
+/// Loading an archive through this device can therefore assert
+/// `Target device architecture is nil` before any slice compatibility check.
+///
+/// Neither this key nor the GPU-family keys supply that missing object.
+/// Changing their values cannot repair this loader precondition; it requires
+/// the guest driver to implement the architecture contract or the archive
+/// consumer to honor the unsupported capability. This does not establish the
+/// behavior of the sysbus plugin or of another guest OS rail.
+///
 /// # The guest's own window, which is why [`DEVICE_INFO_AIR_VERSION`] is bounded
 ///
 /// The value does not reach the plugin as sent. The guest kernel driver's

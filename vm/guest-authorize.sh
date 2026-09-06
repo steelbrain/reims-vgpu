@@ -40,6 +40,24 @@
 #   vm/guest-authorize.sh                 # wait for sshd, authorize, verify
 #   vm/guest-authorize.sh --timeout 300   # bound the wait differently
 #   vm/guest-authorize.sh --no-automation # skip the Apple Events consent step
+#   vm/guest-authorize.sh --screen-share  # also enable macOS Screen Sharing (VNC)
+#
+# SCREEN SHARING (--screen-share). A direct-from-a-VNC-client graphical login to
+# the guest, with no host desktop in the path. It does two things and neither
+# outlives the boot, exactly like the ssh key and the Apple Events grant above:
+#
+#   1. In the guest, over the key auth just established, it turns on Remote
+#      Management with LEGACY VNC auth and an 8-char VNC password. Legacy VNC is
+#      what a stock Windows client (TightVNC, TigerVNC, RealVNC Viewer) speaks;
+#      without it macOS offers only ARD auth, which those clients cannot answer.
+#   2. On the host, it adds a live `hostfwd` for the guest's 5900 through the
+#      already-running SLIRP netdev over QMP — no reboot of the running VM. The
+#      forward binds `0.0.0.0:VNC_PORT`, so a machine on the LAN reaches it the
+#      same way it reaches ssh on 2222. boot-x86.sh also forwards it natively on
+#      every future boot, so this QMP step only matters for the VM already up.
+#
+# Both are ephemeral: the boot is a COW clone that reverts on exit. To keep
+# Screen Sharing in the rail, boot `--capture` and enable it once in that boot.
 #
 # Environment:
 #   SSH_PORT              host port forwarded to the guest's 22 (default 2222)
@@ -49,9 +67,13 @@
 #   REIMS_GUEST_KEY       private key whose .pub gets installed
 #                         (default ~/.ssh/macos_x86_guest, the key `macos-vm`
 #                         names in ~/.ssh/config)
-#   QMP_SOCK              the running boot's QMP socket, used only to press
-#                         Return at the consent panel (default the x86 rail's
-#                         `vm/disks/run/qmp.sock`)
+#   REIMS_VNC_PORT        host port forwarded to the guest's 5900 (default 5900)
+#   REIMS_VNC_PASSWORD    legacy VNC password set in the guest (default reimsvnc).
+#                         macOS legacy VNC truncates it to 8 characters, and so
+#                         does the client — keep it to 8 or the two disagree.
+#   QMP_SOCK              the running boot's QMP socket, used to press Return at
+#                         the consent panel and to add the VNC forward live
+#                         (default the x86 rail's `vm/disks/run/qmp.sock`)
 #
 # Every guest-side step is bounded by `timeout` on the host side. A wedged
 # guest — a stuck `sshd`, a login shell waiting on something — must cost this
@@ -63,8 +85,11 @@ SSH_PORT="${SSH_PORT:-2222}"
 GUEST_USER="${REIMS_GUEST_USER:-aneesiqbal}"
 GUEST_PASSWORD="${REIMS_GUEST_PASSWORD:-aneesiqbal}"
 GUEST_KEY="${REIMS_GUEST_KEY:-$HOME/.ssh/macos_x86_guest}"
+VNC_PORT="${REIMS_VNC_PORT:-5900}"
+VNC_PASSWORD="${REIMS_VNC_PASSWORD:-reimsvnc}"
 WAIT_SECONDS=420
 WANT_AUTOMATION=1
+WANT_SCREEN_SHARE=0
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 QMP_SOCK="${QMP_SOCK:-$REPO_ROOT/vm/disks/run/qmp.sock}"
@@ -86,7 +111,8 @@ while [ $# -gt 0 ]; do
     --timeout) shift; WAIT_SECONDS="${1:-}"; [ -n "$WAIT_SECONDS" ] || die "--timeout needs seconds"; shift ;;
     --timeout=*) WAIT_SECONDS="${1#--timeout=}"; shift ;;
     --no-automation) WANT_AUTOMATION=0; shift ;;
-    -h|--help) sed -n '2,60p' "$0"; exit 0 ;;
+    --screen-share) WANT_SCREEN_SHARE=1; shift ;;
+    -h|--help) sed -n '2,78p' "$0"; exit 0 ;;
     *) die "unknown arg: $1" ;;
   esac
 done
@@ -170,7 +196,11 @@ if timeout "$STEP_TIMEOUT" ssh -o BatchMode=yes -o ConnectTimeout=8 \
 else
   echo "guest-authorize: WARNING ssh macos-vm failed even though direct key auth works." >&2
   echo "guest-authorize: probes default to GUEST=macos-vm; check ~/.ssh/config names port $SSH_PORT and $GUEST_KEY." >&2
-  exit 1
+  # --screen-share drives the guest over the direct key (ssh_key), not the
+  # `macos-vm` alias, so a mis-set config here does not block it. Only abort
+  # when the alias is the point of the run (the probe-authorize path).
+  [ "$WANT_SCREEN_SHARE" -eq 1 ] || exit 1
+  echo "guest-authorize: continuing anyway — --screen-share does not need the macos-vm alias." >&2
 fi
 
 # --- Consent to Apple Events ------------------------------------------------
@@ -207,4 +237,59 @@ if [ "$WANT_AUTOMATION" -eq 1 ]; then
       echo "guest-authorize: GUI probes will hang; device-side counters are unaffected." >&2
     fi
   fi
+fi
+
+# --- Screen Sharing (VNC) for a direct graphical login ----------------------
+# Opt-in. Everything here rides the key auth established above and the running
+# boot's SLIRP netdev; nothing outlives the boot.
+if [ "$WANT_SCREEN_SHARE" -eq 1 ]; then
+  # On an archive-incapable macOS 15 PCI device, RenderBox otherwise aborts
+  # while SSMenuAgent draws the observed-screen indicator. Configure its own
+  # archive gate before starting Screen Sharing; keep the capability probe and
+  # reversible preference state in the guest-side helper.
+  ssh_key 'bash -s -- --apply' < "$REPO_ROOT/scripts/screen-share-compat/guest.sh" \
+    || die "could not configure Screen Sharing archive compatibility"
+
+  # macOS legacy VNC and the client both truncate the password to 8 bytes. Say
+  # so rather than letting the two silently disagree on the 9th character.
+  if [ "${#VNC_PASSWORD}" -gt 8 ]; then
+    echo "guest-authorize: WARNING VNC password is ${#VNC_PASSWORD} chars; macOS legacy VNC uses only the first 8." >&2
+    VNC_PASSWORD="${VNC_PASSWORD:0:8}"
+  fi
+
+  # 1) Enable Remote Management with legacy VNC auth inside the guest. kickstart
+  #    is the one interface that turns the service on AND sets the VNC password
+  #    in a single privileged call; `sudo -S` reads the throwaway guest password
+  #    from stdin so no tty is needed. `-restart -agent` bounces the agent so the
+  #    new settings take without a reboot.
+  KICKSTART=/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart
+  echo "guest-authorize: enabling Screen Sharing (legacy VNC) in the guest ..."
+  if ssh_key "printf '%s\n' '$GUEST_PASSWORD' | sudo -S -p '' '$KICKSTART' \
+        -activate -configure -access -on \
+        -clientopts -setvnclegacy -vnclegacy yes -setvncpw -vncpw '$VNC_PASSWORD' \
+        -restart -agent -privs -all" >/dev/null 2>&1; then
+    echo "guest-authorize: Screen Sharing on; guest listening on 5900 (VNC password set)"
+  else
+    die "could not enable Screen Sharing in the guest (is passwordless-over-stdin sudo allowed for $GUEST_USER?)"
+  fi
+
+  # 2) Forward the guest's 5900 out of the live VM. The running boot only
+  #    forwards ssh; add VNC to the SAME user netdev over QMP so the VM already
+  #    up becomes reachable without a reboot. A re-run re-adds it and SLIRP
+  #    rejects the duplicate — that error means "already forwarded", not failure.
+  if [ ! -S "$QMP_SOCK" ]; then
+    echo "guest-authorize: WARNING no QMP socket at $QMP_SOCK — cannot add the live VNC forward." >&2
+    echo "guest-authorize: the guest listens on 5900, but this boot forwards only ssh. Reboot to pick up boot-x86.sh's native VNC forward." >&2
+  else
+    hmc="hostfwd_add net0 tcp::${VNC_PORT}-:5900"
+    out="$(QMP_SOCK="$QMP_SOCK" timeout "$STEP_TIMEOUT" "$QMP_PY" cmd human-monitor-command \
+             "{\"command-line\":\"$hmc\"}" 2>&1 || true)"
+    if printf '%s' "$out" | grep -qi 'Could not set up host forwarding'; then
+      echo "guest-authorize: host port $VNC_PORT already forwards to guest 5900 (left as is)"
+    else
+      echo "guest-authorize: forwarding host 0.0.0.0:$VNC_PORT -> guest 5900 (live)"
+    fi
+  fi
+
+  echo "guest-authorize: VNC ready — from Windows point a VNC client at <this-host-ip>:$VNC_PORT"
 fi
