@@ -3652,6 +3652,7 @@ impl DeviceState {
     /// Returning the views lets the runtime invalidate backend aliases first,
     /// then release them through the bound HostOps implementation.
     pub fn take_all_host_views(&mut self) -> Vec<(usize, usize)> {
+        self.bound_buffers.clear();
         let mut views = std::mem::take(&mut self.retired_views);
         let mut tokens = std::mem::take(&mut self.retired_guest_write_tokens);
         for mapping in self.mappings.values_mut() {

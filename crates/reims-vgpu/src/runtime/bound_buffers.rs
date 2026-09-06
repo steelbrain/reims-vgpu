@@ -264,6 +264,9 @@ pub fn note_registry_levels(state: &crate::model::DeviceState) {
 pub struct BoundBuffers {
     held: HashMap<Key, BoundBuffer>,
     packed: HashMap<(u32, u32), PackedBufferResolution>,
+    /// Allocation retirements owed to the backend/HostOps transaction. Dropping
+    /// an Arc alone releases neither the GPU import nor the packed host view.
+    retired_imports: Vec<Arc<crate::runtime::guest_ram::GuestRamImport>>,
 }
 
 impl BoundBuffers {
@@ -337,7 +340,42 @@ impl BoundBuffers {
     }
 
     pub fn insert_packed(&mut self, task_id: u32, buffer_ref: u32, packed: PackedBufferResolution) {
-        self.packed.insert((task_id, buffer_ref), packed);
+        if let Some(previous) = self.packed.insert((task_id, buffer_ref), packed) {
+            Self::retire_packed(&mut self.retired_imports, &previous);
+        }
+    }
+
+    fn retire_packed(
+        retired: &mut Vec<Arc<crate::runtime::guest_ram::GuestRamImport>>,
+        resolution: &PackedBufferResolution,
+    ) {
+        if let PackedBufferResolution::Available(buffer) = resolution {
+            // A direct RAMBlock answer borrows the VM-wide import; only a
+            // packed alias belongs to this task resource's lifetime.
+            if buffer.import.gpa_base().is_none() {
+                buffer.import.retire();
+                retired.push(Arc::clone(&buffer.import));
+            }
+        }
+    }
+
+    fn retain_packed(
+        &mut self,
+        mut keep: impl FnMut(&(u32, u32), &PackedBufferResolution) -> bool,
+    ) {
+        self.packed.retain(|key, resolution| {
+            let retained = keep(key, resolution);
+            if !retained {
+                Self::retire_packed(&mut self.retired_imports, resolution);
+            }
+            retained
+        });
+    }
+
+    /// Transfer ended allocations to the same fence-safe retirement transaction
+    /// used by IOSurface mappings. Host views remain mapped until it completes.
+    pub fn take_retired_imports(&mut self) -> Vec<Arc<crate::runtime::guest_ram::GuestRamImport>> {
+        std::mem::take(&mut self.retired_imports)
     }
 
     /// Drop everything held for one task.
@@ -347,7 +385,7 @@ impl BoundBuffers {
     pub fn retire_task(&mut self, task_id: u32) -> usize {
         let before = self.held.len();
         self.held.retain(|k, _| k.task != task_id);
-        self.packed.retain(|(task, _), _| *task != task_id);
+        self.retain_packed(|(task, _), _| *task != task_id);
         before - self.held.len()
     }
 
@@ -380,7 +418,9 @@ impl BoundBuffers {
         let before = self.held.len();
         self.held
             .retain(|k, _| k.task != task_id || k.buffer_ref != buffer_ref);
-        self.packed.remove(&(task_id, buffer_ref));
+        if let Some(previous) = self.packed.remove(&(task_id, buffer_ref)) {
+            Self::retire_packed(&mut self.retired_imports, &previous);
+        }
         before - self.held.len()
     }
 
@@ -391,15 +431,14 @@ impl BoundBuffers {
         let before = self.held.len();
         self.held
             .retain(|k, b| k.task != task_id || !b.overlaps(gva, len));
-        self.packed
-            .retain(|(task, _), b| *task != task_id || !b.overlaps(gva, len));
+        self.retain_packed(|(task, _), b| *task != task_id || !b.overlaps(gva, len));
         before - self.held.len()
     }
 
     /// Drop everything. Device reset, where no guest state survives.
     pub fn clear(&mut self) {
         self.held.clear();
-        self.packed.clear();
+        self.retain_packed(|_, _| false);
     }
 
     /// How many resolutions are held, for the census.
@@ -446,6 +485,84 @@ impl BoundBuffers {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn packed_import(
+        import: Arc<crate::runtime::guest_ram::GuestRamImport>,
+    ) -> PackedBufferResolution {
+        PackedBufferResolution::Available(PackedBuffer {
+            gva: 0x4000,
+            size: 0x2000,
+            head: 0,
+            import,
+            gpas: Arc::new(Vec::new()),
+            runs: Arc::new(Vec::new()),
+            pages: Arc::new(Vec::new()),
+        })
+    }
+
+    #[test]
+    fn every_packed_removal_retires_the_allocation_identity() {
+        for removal in 0..5 {
+            let import = Arc::new(
+                crate::runtime::guest_ram::GuestRamImport::new_host_allocation(
+                    0x10000, 0x2000, 0x1000,
+                )
+                .unwrap(),
+            );
+            let mut b = BoundBuffers::default();
+            b.insert_packed(1, 7, packed_import(Arc::clone(&import)));
+            match removal {
+                0 => {
+                    b.retire_ref(1, 7);
+                }
+                1 => {
+                    b.retire_task(1);
+                }
+                2 => {
+                    b.retire_range(1, 0x5000, 0x1000);
+                }
+                3 => b.clear(),
+                4 => b.insert_packed(
+                    1,
+                    7,
+                    PackedBufferResolution::Unavailable {
+                        gva: 0x4000,
+                        size: 0x2000,
+                    },
+                ),
+                _ => unreachable!(),
+            }
+            assert!(
+                import.is_retired(),
+                "removal {removal} must revoke stale import handles"
+            );
+            let retired = b.take_retired_imports();
+            assert_eq!(retired.len(), 1);
+            assert_eq!(retired[0].id(), import.id());
+            b.clear();
+            assert!(b.take_retired_imports().is_empty(), "release exactly once");
+        }
+    }
+
+    #[test]
+    fn retiring_a_packed_resource_preserves_its_borrowed_ramblock_import() {
+        let import = Arc::new(
+            crate::runtime::guest_ram::GuestRamImport::new(
+                crate::runtime::guest_ram::GuestRamRegion {
+                    gpa_base: 0x1000,
+                    host_va: 0x10000,
+                    len: 0x4000,
+                },
+                0x1000,
+            )
+            .unwrap(),
+        );
+        let mut b = BoundBuffers::default();
+        b.insert_packed(1, 7, packed_import(Arc::clone(&import)));
+        b.clear();
+        assert!(!import.is_retired());
+        assert!(b.take_retired_imports().is_empty());
+    }
 
     fn bound(gva: u64, span: u64) -> BoundBuffer {
         BoundBuffer {

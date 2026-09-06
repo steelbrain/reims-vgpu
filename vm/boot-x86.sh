@@ -131,6 +131,11 @@ CPU_SOCKETS="${CPU_SOCKETS:-1}"
 CPU_CORES="${CPU_CORES:-16}"
 CPU_THREADS="${CPU_THREADS:-16}"
 SSH_PORT="${SSH_PORT:-2222}"
+# Host port forwarded to the guest's Screen Sharing (VNC) on 5900. The guest
+# only listens once Screen Sharing is enabled (vm/guest-authorize.sh
+# --screen-share); until then this forward exists but refuses, exactly like ssh
+# before sshd is up. Set VNC_PORT= (empty) to omit the forward entirely.
+VNC_PORT="${VNC_PORT-5900}"
 TESTING_TIMEOUT="${TESTING_TIMEOUT:-420}" # 7-minute hard kill for testing boots
 # PIN the guest NIC MAC across reverts (load-bearing for DHCP/sshd).
 GUEST_MAC="${GUEST_MAC:-52:54:00:c9:18:27}"
@@ -200,7 +205,7 @@ Always builds reims-vgpu-efi and reims-vgpu before boot. In-tree QEMU is rebuilt
 unless QEMU_BIN is set to something other than the default path.
 Env: DISKS_DIR OVMF_DIR RAILS_DIR RAIL RUN_DIR QEMU_BIN OVMF_CODE OVMF_VARS_MASTER
      OPENCORE_MASTER DISK_MASTER RAM CPU_SOCKETS CPU_CORES CPU_THREADS CPU_MODEL
-     CPU_OPTIONS SSH_PORT TESTING_TIMEOUT QMP_DUMP_TIMEOUT GUEST_MAC REIMS_VGPU_BACKEND
+     CPU_OPTIONS SSH_PORT VNC_PORT TESTING_TIMEOUT QMP_DUMP_TIMEOUT GUEST_MAC REIMS_VGPU_BACKEND
      (metal|vulkan for qemu-build)
      NET=user (SLIRP, default) | NET=none (no NIC)
      REIMS_VGPU_PCI_ATTACH=pcibridge|bus0   (default pcibridge; product secondary bus)
@@ -471,7 +476,12 @@ fi
 # SLIRP user-mode NAT; ipv6=off avoids a phantom IPv6 default that macOS prefers.
 NET="${NET:-user}"
 case "$NET" in
-  user) NETDEV="user,id=net0,ipv6=off,hostfwd=tcp::${SSH_PORT}-:22" ;;
+  user)
+    NETDEV="user,id=net0,ipv6=off,hostfwd=tcp::${SSH_PORT}-:22"
+    # Screen Sharing (VNC) forward, on unless VNC_PORT is set empty. Same
+    # 0.0.0.0 bind as ssh; the guest listens only after --screen-share.
+    [ -n "$VNC_PORT" ] && NETDEV="${NETDEV},hostfwd=tcp::${VNC_PORT}-:5900"
+    ;;
   none) NETDEV="" ;;
   *) die "unknown NET: $NET (user | none)" ;;
 esac
@@ -604,6 +614,7 @@ fi
 echo "boot-x86.sh: device=$GFX_DEVICE class=$BOOT_CLASS rail=$RAIL_NAME snapshot=$SNAPSHOT_NAME cpu=$CPU_MODEL smp=${CPU_THREADS},cores=${CPU_CORES} mem=$RAM reboot=${QEMU_REBOOT_ACTION}"
 echo "boot-x86.sh: audiodev=$AUDIODEV out.buffer-length=${AUDIO_BUFFER_US}us usb-audio buffer=${AUDIO_USB_BUFFER}"
 echo "boot-x86.sh: ssh → localhost:$SSH_PORT   serial → $SERIAL_LOG   qmp → $QMP_SOCK"
+[ "$NET" = "user" ] && [ -n "$VNC_PORT" ] && echo "boot-x86.sh: vnc → 0.0.0.0:$VNC_PORT (guest 5900; enable with vm/guest-authorize.sh --screen-share)"
 [ -n "$TRACE_LOG" ] && echo "boot-x86.sh: trace → $TRACE_LOG ($TRACE_SPEC)"
 
 discard_clone() {
