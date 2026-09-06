@@ -1482,6 +1482,12 @@ fn revalidate_timing_is_slow(elapsed_us: u64) -> bool {
 /// admitted to a backend import, so its only users are CPU copies that finish
 /// inside their own call.
 pub fn flush_retired_views<H: HostOps>(state: &mut DeviceState, host: &mut H) {
+    for import in state.bound_buffers.take_retired_imports() {
+        state.retired_guest_imports.push(import.id());
+        state
+            .retired_views
+            .push((import.host_base(), import.len() as usize));
+    }
     // The backend allocation aliases the host view, so revoke the GPU parent
     // first. Existing child images and recorded buffers hold it through their
     // fence-safe retirement; only then is the matching host view unmapped.

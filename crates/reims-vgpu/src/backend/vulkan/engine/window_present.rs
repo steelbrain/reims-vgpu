@@ -105,6 +105,20 @@ fn end_present_in_flight(frame: &mut PresentFrame) {
     }
 }
 
+/// Poll completion independently of producing another frame. A quiet window
+/// must return its graveyard claim once the last submitted blit finishes.
+fn retire_present_frames(
+    frames: &mut [PresentFrame],
+    mut signaled: impl FnMut(vk::Fence) -> Result<bool, DrawError>,
+) -> Result<(), DrawError> {
+    for frame in frames {
+        if frame.submitted && signaled(frame.in_flight)? {
+            end_present_in_flight(frame);
+        }
+    }
+    Ok(())
+}
+
 /// Consecutive suboptimal-flagged presents (each of which arms a swapchain
 /// recreation) before the always-on alarm names the class. Recreation normally
 /// clears the flag on the next frame, and a live user resize clears the streak
@@ -850,20 +864,12 @@ impl WindowPresenter {
     /// shut, and with several in flight the round-robin might not revisit it for
     /// another two presents. The return value is still about one entry, because
     /// that is the only one the caller is about to record into.
-    unsafe fn retire(&mut self, ctx: &DeviceContext) -> Result<bool, DrawError> {
-        for ix in 0..self.frames.len() {
-            if !self.frames[ix].submitted {
-                continue;
-            }
-            let signaled = ctx
-                .device
-                .get_fence_status(self.frames[ix].in_flight)
-                .map_err(|error| DrawError::VkCall(VkCall::new(VkOp::WindowFenceStatus, error)))?;
-            if !signaled {
-                continue;
-            }
-            end_present_in_flight(&mut self.frames[ix]);
-        }
+    pub(super) unsafe fn retire(&mut self, ctx: &DeviceContext) -> Result<bool, DrawError> {
+        retire_present_frames(&mut self.frames, |fence| {
+            ctx.device
+                .get_fence_status(fence)
+                .map_err(|error| DrawError::VkCall(VkCall::new(VkOp::WindowFenceStatus, error)))
+        })?;
         Ok(!self.frames[self.frame_ix].submitted)
     }
 
@@ -1961,6 +1967,29 @@ unsafe fn blit_rect(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_idle_present_releases_only_completed_fences_and_releases_once() {
+        let before = WINDOW_PRESENTS_IN_FLIGHT.load(Ordering::Acquire);
+        let mut frames = [PresentFrame {
+            cmd: vk::CommandBuffer::null(),
+            image_available: vk::Semaphore::null(),
+            in_flight: vk::Fence::null(),
+            submitted: true,
+        }];
+        begin_present_in_flight();
+        retire_present_frames(&mut frames, |_| Ok(false)).unwrap();
+        assert!(frames[0].submitted, "submission is not completion");
+        assert_eq!(
+            WINDOW_PRESENTS_IN_FLIGHT.load(Ordering::Acquire),
+            before + 1
+        );
+        retire_present_frames(&mut frames, |_| Ok(true)).unwrap();
+        assert!(!frames[0].submitted);
+        assert_eq!(WINDOW_PRESENTS_IN_FLIGHT.load(Ordering::Acquire), before);
+        retire_present_frames(&mut frames, |_| panic!("already retired fence")).unwrap();
+        assert_eq!(WINDOW_PRESENTS_IN_FLIGHT.load(Ordering::Acquire), before);
+    }
 
     #[test]
     fn swapchain_recreation_line_names_geometry_and_reason() {

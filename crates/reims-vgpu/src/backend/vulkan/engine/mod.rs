@@ -5575,12 +5575,23 @@ pub fn maintain_resources(now_ms: u64) {
         ref mut owner,
         ref mut pools,
         ref counters,
+        #[cfg(feature = "host-window")]
+        ref mut window_presenter,
         ..
     } = &mut *guard;
     let Some(ctx) = owner.ctx.as_ref() else {
         return;
     };
-    let result = unsafe { pools.advance_graveyard_maintenance(ctx, counters) };
+    let result = (|| unsafe {
+        // The final frame may never be followed by another begin_present.
+        // Poll its fence before the pools inspect the window's graveyard bit,
+        // so completed presentation cannot retain unrelated dead allocations.
+        #[cfg(feature = "host-window")]
+        if let Some(presenter) = window_presenter.as_mut() {
+            presenter.retire(ctx)?;
+        }
+        pools.advance_graveyard_maintenance(ctx, counters)
+    })();
     if let Err(error) = result {
         if matches!(error, DrawError::DeviceLost(_)) {
             device_lost::note_device_lost_seen();

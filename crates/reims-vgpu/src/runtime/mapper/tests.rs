@@ -1238,6 +1238,47 @@ fn stable_view_without_a_vulkan_import_unmaps_at_mapping_retirement() {
     assert_eq!(host.unmap_pages_calls, 1);
 }
 
+#[test]
+fn a_packed_resource_releases_its_unimported_host_view_on_retirement_and_reset() {
+    use crate::runtime::bound_buffers::{PackedBuffer, PackedBufferResolution};
+    use std::sync::Arc;
+
+    for reset in [false, true] {
+        let mut state = DeviceState::new(crate::model::DeviceId::default(), 12);
+        let mut host = crate::runtime::FakeHost::new();
+        let import = Arc::new(
+            crate::runtime::guest_ram::GuestRamImport::new_host_allocation(0x10000, 0x2000, 0x1000)
+                .unwrap(),
+        );
+        state.bound_buffers.insert_packed(
+            1,
+            7,
+            PackedBufferResolution::Available(PackedBuffer {
+                gva: 0x4000,
+                size: 0x2000,
+                head: 0,
+                import: Arc::clone(&import),
+                gpas: Arc::new(Vec::new()),
+                runs: Arc::new(Vec::new()),
+                pages: Arc::new(Vec::new()),
+            }),
+        );
+        super::flush_retired_views(&mut state, &mut host);
+        assert_eq!(host.unmap_pages_calls, 0, "live resources stay mapped");
+        if reset {
+            let views = state.take_all_host_views();
+            state.retired_views.extend(views);
+        } else {
+            state.retire_bound_buffers_for_ref(1, 7);
+        }
+        assert!(import.is_retired());
+        super::flush_retired_views(&mut state, &mut host);
+        assert_eq!(host.unmap_pages_calls, 1);
+        super::flush_retired_views(&mut state, &mut host);
+        assert_eq!(host.unmap_pages_calls, 1, "terminal release occurs once");
+    }
+}
+
 /// The rail's half: an alias is handed back once, and only after its terminal
 /// destruction is published.
 ///
