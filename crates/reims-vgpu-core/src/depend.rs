@@ -68,10 +68,26 @@ pub struct Census {
 
 /// The live hazard state.
 ///
-/// Holds only accesses whose transactions have not retired. Retiring is the
-/// caller's obligation and is what keeps this bounded; nothing here evicts on
-/// its own, because an eviction would silently drop an edge a later
-/// transaction was owed.
+/// Answers only from accesses whose transactions have not retired. Retiring is
+/// the caller's obligation and is what keeps the *live* set bounded; nothing
+/// here evicts on its own, because an eviction would silently drop an edge a
+/// later transaction was owed.
+///
+/// # Retired slots are bounded by the live ones
+///
+/// A retired access keeps its slot and its index entries until compaction, and
+/// every candidate list `gather` hands back still names it, so each retired
+/// slot costs one comparison on every later admission that reaches its bucket.
+/// Left to a caller, that compaction never came: a session that admitted and
+/// retired sixty transactions a second for forty minutes was spending nine
+/// tenths of its drain thread walking dead slots, and the walk grew with the
+/// session's age rather than with its working set.
+///
+/// So the graph owns the bound. `admit` compacts once the retired slots
+/// outnumber the live ones, which charges each retirement a constant amount
+/// of rebuild work and keeps every candidate list within twice the working
+/// set. The rebuild reuses its buffers, so a warm admission still makes no
+/// trip into the allocator beyond the structural ones named on `scratch`.
 #[derive(Debug, Default)]
 pub struct DependencyGraph {
     entries: Vec<Entry>,
@@ -97,6 +113,24 @@ pub struct DependencyGraph {
     /// signature owns.
     scratch: Vec<usize>,
     waits: Vec<IngressOrdinal>,
+    /// Slots whose transaction has retired and that compaction has not yet
+    /// dropped. `entries.len() - dead` is the live count.
+    dead: usize,
+    /// Old slot index to new, filled by `compact` and kept for its capacity.
+    remap: Vec<usize>,
+}
+
+/// Drop every index that maps to no live slot and renumber the rest, in
+/// place, so a rebuild makes no trip into the allocator.
+fn remap_buckets<K>(buckets: &mut HashMap<K, Vec<usize>>, remap: &[usize]) {
+    for bucket in buckets.values_mut() {
+        bucket.retain_mut(|idx| {
+            let new = remap[*idx];
+            *idx = new;
+            new != usize::MAX
+        });
+    }
+    buckets.retain(|_, bucket| !bucket.is_empty());
 }
 
 impl DependencyGraph {
@@ -113,7 +147,15 @@ impl DependencyGraph {
     /// Live accesses, for a test or a report. Not a bound anything enforces.
     #[must_use]
     pub fn live_accesses(&self) -> usize {
-        self.entries.iter().filter(|e| e.live).count()
+        self.entries.len() - self.dead
+    }
+
+    /// Slots held, live and retired, for a test or a report. What every
+    /// admission's candidate lists are drawn from, and the figure the
+    /// amortised compaction keeps within twice [`Self::live_accesses`].
+    #[must_use]
+    pub fn entries(&self) -> usize {
+        self.entries.len()
     }
 
     /// Admit one transaction's accesses and return the ordinals it must wait
@@ -141,6 +183,14 @@ impl DependencyGraph {
                 .is_none_or(|last| ordinal > last.ordinal),
             "transactions are admitted in ingress order; {ordinal:?} arrived after a later one"
         );
+        // Charged to the admission that grows the graph, not to the
+        // completion that retired the slots. Retired slots may only ever
+        // reach parity with the live ones, so the rebuild is amortised to a
+        // constant per retirement and every candidate list stays within twice
+        // the working set.
+        if self.dead > self.live_accesses() {
+            self.compact();
+        }
         // Taken out so the gathering below can borrow the indexes; put back
         // before returning, so the next admission finds the capacity this one
         // grew. Both are cleared here rather than at the end, because a
@@ -261,31 +311,53 @@ impl DependencyGraph {
     /// that retires early publishes a hazard it still owes.
     pub fn retire(&mut self, ordinal: IngressOrdinal) {
         for &idx in self.by_ordinal.get(&ordinal).into_iter().flatten() {
-            self.entries[idx].live = false;
+            let entry = &mut self.entries[idx];
+            if entry.live {
+                entry.live = false;
+                self.dead += 1;
+            }
         }
         self.by_ordinal.remove(&ordinal);
     }
 
-    /// Drop retired entries and rebuild the indexes.
+    /// Drop retired entries and renumber the indexes.
     ///
     /// Separate from [`Self::retire`] because retirement is on the completion
     /// path and this is not: an index rebuild in a completion handler is work
     /// charged to the thing that finished rather than to the thing that grew.
+    /// [`Self::admit`] calls this on its own once retired slots outnumber live
+    /// ones; a caller may still call it early, and calling it changes no
+    /// answer and no census total — compaction is bookkeeping, and it did not
+    /// admit anything.
+    ///
+    /// Everything happens in place. The slot vector is retained, every index
+    /// bucket is renumbered through a remap the graph keeps for its capacity,
+    /// and empty buckets are dropped, so a warm compaction makes no trip into
+    /// the allocator.
     pub fn compact(&mut self) {
-        let live: Vec<_> = self.entries.iter().copied().filter(|e| e.live).collect();
-        self.entries.clear();
-        self.by_backing.clear();
-        self.by_heap.clear();
-        self.by_domain.clear();
-        self.domain_only.clear();
-        self.by_ordinal.clear();
-        // The census is a running total across the graph's life and is not
-        // rebuilt: compaction is bookkeeping, and it did not admit anything.
-        let saved = self.census;
-        for e in live {
-            self.insert(e.ordinal, e.intent);
+        if self.dead == 0 {
+            return;
         }
-        self.census = saved;
+        let mut remap = std::mem::take(&mut self.remap);
+        remap.clear();
+        remap.resize(self.entries.len(), usize::MAX);
+        let mut next = 0;
+        for (old, entry) in self.entries.iter().enumerate() {
+            if entry.live {
+                remap[old] = next;
+                next += 1;
+            }
+        }
+        self.entries.retain(|entry| entry.live);
+        debug_assert_eq!(self.entries.len(), next);
+        remap_buckets(&mut self.by_backing, &remap);
+        remap_buckets(&mut self.by_heap, &remap);
+        remap_buckets(&mut self.by_domain, &remap);
+        remap_buckets(&mut self.domain_only, &remap);
+        // Retired ordinals already left this index; its buckets only move.
+        remap_buckets(&mut self.by_ordinal, &remap);
+        self.dead = 0;
+        self.remap = remap;
     }
 }
 
@@ -524,6 +596,64 @@ mod tests {
             g.admit(ord(3), &[intent(k, AccessMode::Write)]),
             vec![ord(2)]
         );
+    }
+
+    /// **A steady working set keeps the graph the size of the working set.**
+    ///
+    /// The defect this pins: retirement cleared a flag and left the slot, so a
+    /// session that admitted and retired the same few resources for forty
+    /// minutes handed every admission a candidate list the length of the
+    /// session, and the drain thread spent nine tenths of its time walking
+    /// retired slots. Nobody called `compact`, because nothing made anyone.
+    ///
+    /// The bound is checked after every admission, not only at the end: a
+    /// graph that compacted once at the end would also pass a final reading.
+    #[test]
+    fn a_steady_working_set_keeps_the_graph_bounded_without_a_caller_compacting() {
+        let mut g = DependencyGraph::new();
+        let intents = [
+            intent(AccessKey::Whole(res(1)), AccessMode::Write),
+            intent(AccessKey::Whole(res(2)), AccessMode::Read),
+            intent(AccessKey::DomainOnly, AccessMode::Unknown),
+            intent(
+                AccessKey::Heap(HeapId {
+                    id: 3,
+                    membership_generation: 1,
+                }),
+                AccessMode::Read,
+            ),
+        ];
+        const IN_FLIGHT: u64 = 4;
+        for n in 1..=4096u64 {
+            let waits = g.admit(ord(n), &intents);
+            if n > 1 {
+                assert!(
+                    waits.contains(&ord(n - 1)),
+                    "ordinal {n} still meets the live writer just before it"
+                );
+            }
+            assert!(
+                waits.iter().all(|w| w.0 + IN_FLIGHT >= n),
+                "ordinal {n} waited for a retired transaction: {waits:?}"
+            );
+            // The bound holds at admission, which is when candidate lists are
+            // walked: the retirements below may push retired slots past the
+            // live ones, and the next admission is what pays to drop them.
+            assert!(
+                g.entries() <= 2 * g.live_accesses(),
+                "after admitting ordinal {n}: {} slots for {} live accesses",
+                g.entries(),
+                g.live_accesses()
+            );
+            if n > IN_FLIGHT {
+                g.retire(ord(n - IN_FLIGHT));
+            }
+            assert_eq!(
+                g.live_accesses(),
+                intents.len() * n.min(IN_FLIGHT) as usize,
+                "the live set is the in-flight window"
+            );
+        }
     }
 
     /// Ordering bought with ignorance is counted apart from ordering bought
