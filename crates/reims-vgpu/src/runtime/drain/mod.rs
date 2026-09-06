@@ -5118,6 +5118,111 @@ fn observe_page_table_nodes<H: HostMemory + HostOps>(
 /// to happen before the packet is applied. A range that no longer translates
 /// resolves to fewer pages than it spans, and that is not an error here — those
 /// pages are already gone and there is nothing left to watch.
+/// Hold the guest's hand-back of pages until every writeback this device has
+/// queued into them has landed.
+///
+/// The guest frees a span's pages before it submits the `UnmapMemory` that
+/// names it, on the strength of the completion it already read for the work
+/// that used them. A GPU-direct writeback is recorded into the command stream
+/// and not waited on, so between that completion and the copy landing there is
+/// a window in which the kernel can reuse the page — and the copy then lands in
+/// whatever it put there. One macOS 15 guest panicked in `kevent_register`
+/// with `RGBA16Float` texels inside a kqueue object, with every
+/// write-after-release guard at zero, because those guards run when a write is
+/// planned and nothing runs when it lands.
+///
+/// This is the release-side twin of the reader-side settles: cheap when the
+/// debt flag is clear (one atomic load, the common case), and a bounded fence
+/// wait otherwise. The page walk runs only when something is outstanding, and
+/// on this packet it often finds nothing — the guest unwired the span first —
+/// which reads as `Unnamed` and settles unconditionally, the fail-safe
+/// direction. An `Overlap` is the finding itself: a write still in flight into
+/// pages the guest has already released, reported once per task on the
+/// always-on channel so a later panic can be attributed rather than guessed.
+fn settle_released_span<H: HostMemory + HostOps>(
+    state: &DeviceState,
+    host: &H,
+    task_id: u32,
+    gva: u64,
+    length: u64,
+) {
+    use crate::runtime::render_writeback::SettleSite;
+    let backend = crate::backend::selected();
+    if !backend.guest_writes_outstanding() {
+        return;
+    }
+    let pages: Vec<u64> = crate::runtime::gva_mem::task_gva_page_gpa_set(
+        host,
+        &state.tasks,
+        task_id,
+        gva,
+        length,
+        state.page_shift,
+    )
+    .into_iter()
+    .collect();
+    let reach = if pages.is_empty() {
+        crate::backend::GuestWriteReach::Unnamed
+    } else {
+        backend.guest_writes_reaching(&pages)
+    };
+    settle_release(SettleSite::GuestRelease, reach, || {
+        format!(
+            "guest_release_reaches_outstanding_write family=unmap_memory task={task_id} \
+             gva={gva:#x} len={length:#x} pages={} (a writeback this device queued has not \
+             landed and the guest has already released these pages; settled here, which is \
+             the last point that can hold it)",
+            pages.len()
+        )
+    });
+}
+
+/// [`settle_released_span`] for `DeleteIOSurfaceBacking2`, whose pages are the
+/// mapping's own list rather than a span to walk.
+fn settle_released_mapping(state: &DeviceState, mapping_id: u32) {
+    use crate::runtime::render_writeback::SettleSite;
+    let backend = crate::backend::selected();
+    if !backend.guest_writes_outstanding() {
+        return;
+    }
+    let reach = match state.mapping_reach_pages(mapping_id) {
+        Some(pages) if !pages.is_empty() => backend.guest_writes_reaching(&pages),
+        _ => crate::backend::GuestWriteReach::Unnamed,
+    };
+    settle_release(SettleSite::BackingRelease, reach, || {
+        format!(
+            "guest_release_reaches_outstanding_write family=delete_iosurface_backing2 \
+             mid={mapping_id} (a writeback this device queued has not landed and the guest \
+             has already released this mapping's pages; settled here)"
+        )
+    });
+}
+
+/// The shared tail of the two release settles: count the answer under the
+/// site, report an overlap once per site, and wait unless the writeback is
+/// provably elsewhere.
+fn settle_release(
+    site: crate::runtime::render_writeback::SettleSite,
+    reach: crate::backend::GuestWriteReach,
+    finding: impl FnOnce() -> String,
+) {
+    use crate::backend::GuestWriteReach as Reach;
+    note_store_route(match reach {
+        Reach::Disjoint => site.route_disjoint(),
+        Reach::Overlap => site.route_overlap(),
+        Reach::Unnamed => site.route_unnamed(),
+    });
+    if reach == Reach::Overlap
+        && crate::observe::first_sight("guest_release_reaches_outstanding_write", site as u64)
+    {
+        crate::observe::fail(finding());
+    }
+    if reach == Reach::Disjoint {
+        return;
+    }
+    crate::runtime::render_writeback::settle_guest_writes(site);
+}
+
 fn note_released_or_remapped<H: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &H,
@@ -5421,6 +5526,12 @@ fn apply_map_family<H: HostMemory + HostOps>(
         // views so the next ensure_gva_view re-walks. Does not invent
         // PTEs and does not destroy host_gva_surfaces content.
         if gva != 0 && length != 0 {
+            // Before anything else, because everything else here forgets the
+            // span: a writeback this device queued into these pages must land
+            // before the guest's allocator hands them to someone else.
+            if matches!(family, MapFamily::UnmapMemory) {
+                settle_released_span(state, host, task_id, gva, length);
+            }
             // Held bind resolutions over this range name pages the guest
             // has just remapped. Retired by range, which is exactly what
             // this notify carries.
@@ -5483,6 +5594,9 @@ fn apply_map_family<H: HostMemory + HostOps>(
         // resolve proves which incarnation this delete was for
         // (fingerprint compare in mapper::resolve). A second delete
         // with no resolve between is genuinely dead: tear down fully.
+        // Same obligation as the unmap arm, keyed by the mapping whose pages
+        // are going back: a queued writeback into them must land first.
+        settle_released_mapping(state, object_id);
         let mode = if state.mapping_backing_condemned(object_id) {
             let _ = state.unmap_surface(object_id);
             "dead"

@@ -4238,6 +4238,48 @@ fn unmap_memory_retains_gva_host_cache_for_sample() {
     assert_eq!(state.retired_views, vec![(0xfeed_0000, 0x10000)]);
 }
 
+/// The guest hands a span's pages back on the strength of a completion it read
+/// before a writeback this device queued into them has landed, and the kernel
+/// can reuse the page before the copy arrives. The unmap is the last point that
+/// can hold that write, so it settles whenever a writeback is outstanding and
+/// the span cannot be proven disjoint — here the task has no page table, so the
+/// walk names nothing and the answer is `Unnamed`, the fail-safe direction.
+///
+/// Vulkan rail by name: the write debt is the Vulkan engine's, and with no
+/// device context its settle has nothing to wait on and clears the flag, which
+/// is the observable that proves the release asked.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn unmap_memory_settles_an_outstanding_writeback_before_the_pages_go_back() {
+    use crate::backend::vulkan::engine;
+    use crate::model::CHILD_OP_UNMAP_MEMORY;
+    use crate::protocol::endian::{st32, st64};
+
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    engine::arm_guest_write_debt_for_tests(&[0x1234_5000]);
+    assert!(engine::guest_writes_outstanding());
+
+    let mut unmap_pl = vec![0u8; 20];
+    st32(&mut unmap_pl[0..4], 1);
+    st64(&mut unmap_pl[4..12], 0x2c22000);
+    st64(&mut unmap_pl[12..20], 0x10000);
+    let unmap = Packet {
+        opcode: CHILD_OP_UNMAP_MEMORY,
+        stamp_waits: Vec::new(),
+        total_size: PACKET_HEADER_LEN + 20,
+        completion_stamp: 0,
+        payload: unmap_pl,
+        next_head: 0,
+    };
+    process_child_packet(&mut state, &mut host, 2, &unmap);
+
+    assert!(
+        !engine::guest_writes_outstanding(),
+        "the release must settle a writeback it cannot prove disjoint"
+    );
+}
+
 /// RE pageBacking Invalidate: clr hostValid → bump content_generation.
 #[test]
 fn invalidate_resources_bumps_mapping_content_generation() {

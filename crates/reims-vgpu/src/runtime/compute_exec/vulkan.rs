@@ -158,6 +158,22 @@ pub(super) fn direct_destination<M: HostMemory + HostOps>(
         Some(pages),
     ) {
         Ok(licence) => {
+            if let Some((need, have)) = licence.target.window_shortfall() {
+                if crate::observe::first_sight(
+                    "compute_dst_window_too_small",
+                    u64::from(tex.binding),
+                ) {
+                    crate::observe::fail(format!(
+                        "compute_dst_window_too_small bind={} gva={gva:#x} dims={width}x{height} \
+                         fmt={pixel_format:#x} need={need} have={have} (the storage image names \
+                         more texels than its guest pages hold; a direct landing would write \
+                         past them, so it takes the pooled readback)",
+                        tex.binding
+                    ));
+                }
+                crate::runtime::drain::note_store_route("compute_dst_host_window_too_small");
+                return ComputeImageDestination::Host;
+            }
             crate::runtime::drain::note_store_route("compute_dst_guest_pages");
             // A split of the line above, so the two add up to it. Worth counting
             // separately because the resident half is the half that needs the
@@ -248,6 +264,22 @@ pub(super) fn mapper_ref_texture_destination<M: HostMemory + HostOps>(
         },
     ) {
         Ok(licence) => {
+            if let Some((need, have)) = licence.target.window_shortfall() {
+                if crate::observe::first_sight(
+                    "compute_dst_window_too_small",
+                    u64::from(tex.binding),
+                ) {
+                    crate::observe::fail(format!(
+                        "compute_dst_window_too_small bind={} mid={mapping_id} dims={width}x{height} \
+                         need={need} have={have} (the storage image names more texels than its \
+                         guest pages hold; a direct landing would write past them, so it takes \
+                         the pooled readback)",
+                        tex.binding
+                    ));
+                }
+                crate::runtime::drain::note_store_route("compute_dst_host_window_too_small");
+                return ComputeImageDestination::Host;
+            }
             crate::runtime::drain::note_store_route("compute_dst_guest_pages");
             crate::runtime::drain::note_store_route(if tex.rail.residency.is_some() {
                 "compute_dst_guest_pages_mapper_ref_texture_resident"
