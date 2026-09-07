@@ -8145,8 +8145,18 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     0
                 };
                 let smp_bind = SAMPLER_BINDING_BASE + index + base_off;
+                // A guest bind landing on the translator's read-sampler
+                // placeholder describes some other shader's interface: this
+                // stage has no argument at that slot, and the read that
+                // consumes the placeholder ignores its state. The neutral
+                // default takes the slot exactly as it would for an empty bind.
+                let variant = if frag_stage { &f_variant } else { &v_variant };
+                let placeholder = variant
+                    .samplers
+                    .binary_search_by_key(&smp_bind, |sampler| sampler.binding)
+                    .is_ok_and(|at| !variant.samplers[at].accepts_guest_bind());
                 if sampler_binds.insert(smp_bind) {
-                    let mut sampler = if sampler_ref != 0 {
+                    let mut sampler = if sampler_ref != 0 && !placeholder {
                         sampler_origin.insert(smp_bind, b'g');
                         load_vulkan_sampler(state, host, req.task_id, sampler_ref, smp_bind)
                             .map_err(DrawError::DrawPreparation)?
@@ -8225,7 +8235,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 for reflected in variant.samplers.iter() {
                     if sampler_binds.insert(reflected.binding) {
                         let binding = reflected.binding;
-                        if let Some(state) = reflected.static_state {
+                        if let Some(state) = reflected.static_state() {
                             sampler_origin.insert(binding, b'c');
                             samplers.push(
                                 reflected_static_sampler_resource(stage, binding, state)

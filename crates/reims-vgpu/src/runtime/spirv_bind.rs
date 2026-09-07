@@ -2339,12 +2339,7 @@ pub fn reflected_sampler_binding(
     resource: &metal2vulkan::reflect::ResourceBinding,
     fragment_relocated: bool,
 ) -> Option<u32> {
-    if !matches!(
-        resource.kind,
-        ResourceKind::Sampler | ResourceKind::StaticSampler
-    ) {
-        return None;
-    }
+    reflected_sampler_source(resource)?;
     let descriptor = resource.descriptor?;
     let widened = descriptor.binding.checked_add(SAMPLED_TAIL_WIDEN_OFFSET)?;
     widened.checked_add(if fragment_relocated {
@@ -2354,13 +2349,83 @@ pub fn reflected_sampler_binding(
     })
 }
 
-/// One sampler in the executable descriptor interface. `static_state` is the
-/// exact AIR constexpr state; `None` means the guest supplies a sampler object
-/// or the runtime provisions the neutral default when that slot is unbound.
+/// Where the sampler behind one descriptor of the executable module comes from.
+///
+/// Three sources, because the module can declare a sampler descriptor for three
+/// different reasons and the runtime answers each one differently. Carrying the
+/// reason with the binding is what keeps a consumer from having to re-derive it
+/// from the binding number, which is the guess that left one of the three out.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ReflectedSamplerSource {
+    /// A `[[sampler(n)]]` argument. The guest binds a sampler object at `n`, or
+    /// the runtime provisions the neutral default when it left the slot empty.
+    Argument,
+    /// An AIR `constexpr` sampler. The exact state travels with the binding;
+    /// nothing the guest binds describes it.
+    Constexpr(metal2vulkan::reflect::StaticSamplerState),
+    /// The translator's placeholder for `air.get_read_sampler()`, bound at the
+    /// first sampler-band binding no Metal argument claims. No guest bind
+    /// corresponds to it and the lowering of `read` never consults its state,
+    /// so the runtime provisions the neutral default — but it **must**
+    /// provision one: Vulkan requires a descriptor for every binding the module
+    /// statically uses, and this one is used wherever the read is.
+    SynthesizedRead,
+}
+
+/// The source a reflected resource contributes to the sampler interface, or
+/// `None` for a resource that is not a sampler descriptor at all.
+///
+/// This is the one place the resource kinds that *are* samplers are named, so
+/// the binding walk and the source cannot disagree about which kinds count.
+/// [`ResourceKind::SynthesizedReadSampler`] belongs here as much as the two
+/// Metal-argument kinds do: it was the one kind left out, and a kernel that
+/// calls `texture.read` then declared a sampler descriptor the interface did
+/// not carry, which the engine refused as
+/// `vk_compute_exec_used_binding_absent_from_layout` on every dispatch.
+pub fn reflected_sampler_source(
+    resource: &metal2vulkan::reflect::ResourceBinding,
+) -> Option<ReflectedSamplerSource> {
+    match resource.kind {
+        ResourceKind::Sampler => Some(ReflectedSamplerSource::Argument),
+        // A static sampler whose AIR state reflection could not decode is still
+        // a sampler descriptor the module declares; it falls back to the
+        // argument treatment rather than to no descriptor at all.
+        ResourceKind::StaticSampler => Some(resource.static_sampler.map_or(
+            ReflectedSamplerSource::Argument,
+            ReflectedSamplerSource::Constexpr,
+        )),
+        ResourceKind::SynthesizedReadSampler => Some(ReflectedSamplerSource::SynthesizedRead),
+        _ => None,
+    }
+}
+
+/// One sampler in the executable descriptor interface, with the reason the
+/// module declares it — see [`ReflectedSamplerSource`].
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ReflectedSamplerDescriptor {
     pub binding: u32,
-    pub static_state: Option<metal2vulkan::reflect::StaticSamplerState>,
+    pub source: ReflectedSamplerSource,
+}
+
+impl ReflectedSamplerDescriptor {
+    /// The exact AIR constexpr state, when this descriptor carries one.
+    #[must_use]
+    pub const fn static_state(&self) -> Option<metal2vulkan::reflect::StaticSamplerState> {
+        match self.source {
+            ReflectedSamplerSource::Constexpr(state) => Some(state),
+            ReflectedSamplerSource::Argument | ReflectedSamplerSource::SynthesizedRead => None,
+        }
+    }
+
+    /// Whether a guest sampler bound at this binding's slot describes it.
+    ///
+    /// A synthesized read sampler sits at a slot the shader has no argument
+    /// for, so a guest bind that happens to land there belongs to some other
+    /// shader's interface and says nothing about this one.
+    #[must_use]
+    pub const fn accepts_guest_bind(&self) -> bool {
+        !matches!(self.source, ReflectedSamplerSource::SynthesizedRead)
+    }
 }
 
 /// Every sampler descriptor declared by a reflected shader, transformed into
@@ -2374,14 +2439,9 @@ pub fn reflected_sampler_descriptors(
         .bindings
         .iter()
         .filter_map(|resource| {
-            reflected_sampler_binding(resource, fragment_relocated).map(|binding| {
-                ReflectedSamplerDescriptor {
-                    binding,
-                    static_state: (resource.kind == ResourceKind::StaticSampler)
-                        .then_some(resource.static_sampler)
-                        .flatten(),
-                }
-            })
+            let source = reflected_sampler_source(resource)?;
+            let binding = reflected_sampler_binding(resource, fragment_relocated)?;
+            Some(ReflectedSamplerDescriptor { binding, source })
         })
         .collect();
     descriptors.sort_by_key(|descriptor| descriptor.binding);
@@ -4469,6 +4529,106 @@ mod more_tests {
         assert_eq!(
             reflected_sampler_binding(&sampler, true),
             Some(SAMPLER_BINDING_BASE + 5 + FRAG_SAMPLED_RESOURCE_BINDING_OFFSET)
+        );
+    }
+
+    /// A sampler-band resource of `kind` at the translator's `binding`, with no
+    /// AIR state — the shape of a `[[sampler(n)]]` argument and of the
+    /// translator's read-sampler placeholder alike.
+    fn sampler_resource(kind: ResourceKind, binding: u32) -> ResourceBinding {
+        ResourceBinding {
+            static_sampler: None,
+            kind,
+            ..static_sampler_binding(binding)
+        }
+    }
+
+    /// The translator declares a sampler descriptor for `air.get_read_sampler()`
+    /// with no Metal argument behind it, and the executable module statically
+    /// uses that descriptor wherever the read is lowered. The interface has to
+    /// carry it, in the same numbering as every argument sampler, and say that
+    /// it is the placeholder — because that is the one sampler a guest bind at
+    /// the same slot does not describe.
+    ///
+    /// Leaving it out was a live refusal: a kernel of `iconservicesagent` that
+    /// reads a texture declared binding 161 this way, the compute rail built
+    /// its layout from an interface without it, and the engine refused every
+    /// dispatch as `vk_compute_exec_used_binding_absent_from_layout binding=161`.
+    #[test]
+    fn the_translators_read_sampler_is_part_of_the_reflected_interface() {
+        let argument = sampler_resource(ResourceKind::Sampler, M2V_SAMPLER_BINDING_BASE);
+        let placeholder = sampler_resource(
+            ResourceKind::SynthesizedReadSampler,
+            M2V_SAMPLER_BINDING_BASE + 1,
+        );
+        let constexpr = static_sampler_binding(M2V_SAMPLER_BINDING_BASE + 2);
+        assert_eq!(
+            reflected_sampler_source(&argument),
+            Some(ReflectedSamplerSource::Argument)
+        );
+        assert_eq!(
+            reflected_sampler_source(&placeholder),
+            Some(ReflectedSamplerSource::SynthesizedRead)
+        );
+        assert!(matches!(
+            reflected_sampler_source(&constexpr),
+            Some(ReflectedSamplerSource::Constexpr(_))
+        ));
+
+        let mut reflection = ShaderReflection {
+            reflection_version: REFLECTION_VERSION,
+            stage: ShaderStage::Kernel,
+            entry_point: None,
+            bindings: vec![placeholder, constexpr, argument],
+            argument_buffer_fields: vec![],
+            vertex_attributes: vec![],
+            varyings: vec![],
+            render_targets: vec![],
+            depth_members: vec![],
+            depth_qualifier: None,
+            stencil_members: vec![],
+            local_size: Some([1, 1, 1]),
+            max_work_group_size: None,
+            vertex_builtins: None,
+            tessellation: None,
+            imageblock_layouts: vec![],
+            implicit_imageblock_attachments: vec![],
+            fragment_imageblock: None,
+            datalayout: None,
+            descriptor_layout: metal2vulkan::reflect::DescriptorLayout::default(),
+            kernel_dispatch: None,
+            runtime_sampler_specializations: vec![],
+            runtime_storage_image_specializations: vec![],
+            function_constants: vec![],
+        };
+        let descriptors = reflected_sampler_descriptors(&reflection, false);
+        assert_eq!(
+            descriptors
+                .iter()
+                .map(|descriptor| (descriptor.binding, descriptor.accepts_guest_bind()))
+                .collect::<Vec<_>>(),
+            vec![
+                (SAMPLER_BINDING_BASE, true),
+                (SAMPLER_BINDING_BASE + 1, false),
+                (SAMPLER_BINDING_BASE + 2, true),
+            ],
+            "every declared sampler descriptor, in the device's numbering, \
+             canonical order, and only the placeholder refusing a guest bind"
+        );
+        assert_eq!(
+            descriptors[1].source,
+            ReflectedSamplerSource::SynthesizedRead
+        );
+        assert_eq!(descriptors[1].static_state(), None);
+        assert!(descriptors[2].static_state().is_some());
+
+        // A placeholder the translator retracted reports no descriptor, and
+        // then it is not a sampler the interface can carry either.
+        reflection.bindings[0].descriptor = None;
+        assert_eq!(
+            reflected_sampler_descriptors(&reflection, false).len(),
+            2,
+            "a resource without a descriptor location contributes nothing"
         );
     }
 
