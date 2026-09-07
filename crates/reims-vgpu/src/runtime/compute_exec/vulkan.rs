@@ -1220,10 +1220,13 @@ pub(crate) fn execute_dispatch_linux<M: HostMemory + HostOps>(
     let mut samplers = Vec::new();
     for s in &acc.samplers {
         let binding = crate::runtime::spirv_bind::SAMPLER_BINDING_BASE + s.index;
-        if reflected_samplers
+        // A bind at a slot the kernel declares no argument for is another
+        // interface's, whether the module has no descriptor there or the
+        // descriptor there is the translator's own read-sampler placeholder.
+        let describes_a_declared_argument = reflected_samplers
             .binary_search_by_key(&binding, |sampler| sampler.binding)
-            .is_err()
-        {
+            .is_ok_and(|at| reflected_samplers[at].accepts_guest_bind());
+        if !describes_a_declared_argument {
             continue;
         }
         let mut sampler = match crate::runtime::draw::vulkan::load_vulkan_sampler(
@@ -1252,7 +1255,7 @@ pub(crate) fn execute_dispatch_linux<M: HostMemory + HostOps>(
             .iter()
             .any(|sampler| sampler.binding == reflected.binding)
         {
-            if let Some(state) = reflected.static_state {
+            if let Some(state) = reflected.static_state() {
                 let sampler = match crate::runtime::draw::vulkan::reflected_static_sampler_resource(
                     "kernel",
                     reflected.binding,

@@ -1389,6 +1389,61 @@ mod tests {
         }
     }
 
+    /// The translator's read-sampler placeholder is a sampler descriptor the
+    /// executable module declares with no Metal argument behind it. Every
+    /// variant's interface has to carry it in that variant's numbering, exactly
+    /// as it carries the argument samplers — the executable words are the
+    /// oracle, and they do not distinguish the two.
+    ///
+    /// The interface used to drop it, so a kernel that reads a texture had a
+    /// descriptor the layout built from this interface did not cover, and the
+    /// engine refused the dispatch rather than create a pipeline over a hole.
+    #[test]
+    fn every_variant_carries_the_translators_read_sampler_beside_the_arguments() {
+        use metal2vulkan::reflect::ResourceKind;
+        let translator_base = metal2vulkan::reflect::SAMPLER_BINDING_BASE;
+        let words = crate::runtime::spirv_bind::test_module_with_samplers(&[
+            translator_base,
+            translator_base + 1,
+        ]);
+        let spirv: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let shader = synth_shader_with_sampler_resources(
+            Stage::Kernel,
+            spirv,
+            vec![
+                sampler_resource(ResourceKind::Sampler, 0, translator_base),
+                // Index 0 of its own kind, at the first band binding no
+                // argument claims — the shape the translator reports.
+                sampler_resource(ResourceKind::SynthesizedReadSampler, 0, translator_base + 1),
+            ],
+        );
+
+        for (separate_sampled, buf_collide) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let v = shader.variant(separate_sampled, buf_collide);
+            let declared = crate::runtime::spirv_bind::sampler_bindings(&v.words);
+            assert_eq!(declared.len(), 2, "the fixture declares both samplers");
+            assert_eq!(
+                v.samplers
+                    .iter()
+                    .map(|sampler| sampler.binding)
+                    .collect::<Vec<_>>(),
+                declared,
+                "variant({separate_sampled}, {buf_collide})"
+            );
+            assert_eq!(
+                v.samplers
+                    .iter()
+                    .map(|sampler| sampler.accepts_guest_bind())
+                    .collect::<Vec<_>>(),
+                vec![true, false],
+                "variant({separate_sampled}, {buf_collide}): only the placeholder \
+                 declines a guest bind"
+            );
+        }
+    }
+
     /// A variant is computed once and handed out by pointer after that, which is
     /// what makes the walk a per-shader cost rather than a per-draw one.
     #[test]
@@ -1478,45 +1533,72 @@ mod tests {
         ))
     }
 
+    /// A sampler-band resource of `kind` for the translator's `metal_index`,
+    /// with its descriptor at `binding` in the translator's numbering.
+    fn sampler_resource(
+        kind: metal2vulkan::reflect::ResourceKind,
+        metal_index: u32,
+        binding: u32,
+    ) -> metal2vulkan::reflect::ResourceBinding {
+        use metal2vulkan::reflect::{DescriptorLocation, ResourceBinding, RESOURCE_DESCRIPTOR_SET};
+        ResourceBinding {
+            kind,
+            metal_index,
+            descriptor: Some(DescriptorLocation {
+                set: RESOURCE_DESCRIPTOR_SET,
+                binding,
+                count: 1,
+            }),
+            param_index: None,
+            stage_input_location: None,
+            address_space: None,
+            declared_size: None,
+            extent: None,
+            footprint: None,
+            type_layout: None,
+            type_name: None,
+            texture_shape: None,
+            embedded_source: None,
+            access: None,
+            static_sampler: None,
+        }
+    }
+
     fn synth_shader_with_samplers(
         stage: Stage,
         spirv: Vec<u8>,
         metal_indices: &[u32],
     ) -> Arc<CachedShader> {
+        use metal2vulkan::reflect::{ResourceKind, SAMPLER_BINDING_BASE};
+        synth_shader_with_sampler_resources(
+            stage,
+            spirv,
+            metal_indices
+                .iter()
+                .map(|&metal_index| {
+                    sampler_resource(
+                        ResourceKind::Sampler,
+                        metal_index,
+                        SAMPLER_BINDING_BASE + metal_index,
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    fn synth_shader_with_sampler_resources(
+        stage: Stage,
+        spirv: Vec<u8>,
+        bindings: Vec<metal2vulkan::reflect::ResourceBinding>,
+    ) -> Arc<CachedShader> {
         use metal2vulkan::reflect::{
-            DescriptorLayout, DescriptorLocation, ResourceBinding, ResourceKind, ShaderReflection,
-            ShaderStage, REFLECTION_VERSION, RESOURCE_DESCRIPTOR_SET, SAMPLER_BINDING_BASE,
+            DescriptorLayout, ShaderReflection, ShaderStage, REFLECTION_VERSION,
         };
         let reflected_stage = match stage {
             Stage::Vertex => ShaderStage::Vertex,
             Stage::Fragment => ShaderStage::Fragment,
             Stage::Kernel => ShaderStage::Kernel,
         };
-        let bindings = metal_indices
-            .iter()
-            .copied()
-            .map(|metal_index| ResourceBinding {
-                kind: ResourceKind::Sampler,
-                metal_index,
-                descriptor: Some(DescriptorLocation {
-                    set: RESOURCE_DESCRIPTOR_SET,
-                    binding: SAMPLER_BINDING_BASE + metal_index,
-                    count: 1,
-                }),
-                param_index: None,
-                stage_input_location: None,
-                address_space: None,
-                declared_size: None,
-                extent: None,
-                footprint: None,
-                type_layout: None,
-                type_name: None,
-                texture_shape: None,
-                embedded_source: None,
-                access: None,
-                static_sampler: None,
-            })
-            .collect();
         Arc::new(CachedShader::new(
             spirv,
             Arc::new(ShaderReflection {
