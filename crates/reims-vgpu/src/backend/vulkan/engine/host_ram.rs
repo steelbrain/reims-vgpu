@@ -621,6 +621,8 @@ unsafe fn import_ramblock(
 /// counted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GuestWriteDecline {
+    /// Copy geometry or byte range failed validation before recording.
+    InvalidCopyRegion,
     /// The named resident is an ordinary device allocation rather than the
     /// guest allocation synchronization requires.
     NoSharedBacking,
@@ -676,6 +678,7 @@ pub enum GuestWriteDecline {
 impl Decline for GuestWriteDecline {
     fn slug(&self) -> &'static str {
         match self {
+            Self::InvalidCopyRegion => "gpu_writeback_invalid_copy_region",
             Self::NoSharedBacking => "gpu_writeback_no_shared_backing",
             Self::Unsupported { .. } => "gpu_writeback_unsupported",
             Self::NoCompletionPoint => "gpu_completion_point_missing",
@@ -691,6 +694,7 @@ impl Decline for GuestWriteDecline {
 
     fn fields(&self) -> Vec<(&'static str, String)> {
         match self {
+            Self::InvalidCopyRegion => Vec::new(),
             Self::NoSharedBacking => Vec::new(),
             Self::Unsupported { rung } => vec![("rung", rung.slug().to_string())],
             Self::NoCompletionPoint => Vec::new(),

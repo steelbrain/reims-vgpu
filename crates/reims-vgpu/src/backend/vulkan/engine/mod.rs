@@ -3686,6 +3686,7 @@ impl GuestPageTarget {
     fn geometry(&self) -> reims_vgpu_paging::regions::WindowGeometry {
         reims_vgpu_paging::regions::WindowGeometry {
             pitch_bytes: self.pitch_bytes(),
+            bytes_per_texel: self.bytes_per_texel(),
             width_texels: self.width,
             height_texels: self.height,
         }
@@ -4651,20 +4652,79 @@ unsafe fn plan_guest_copies(
 ) -> Result<Vec<(ash::vk::Buffer, Vec<ash::vk::BufferImageCopy>)>, DrawError> {
     use host_ram::GuestWriteDecline;
     let geom = dst.geometry();
+    let invalid = || DrawError::GuestPageWrite(GuestWriteDecline::InvalidCopyRegion);
+    let bpt = crate::backend::vulkan::translate::pixel::bytes_per_texel(dst.format)
+        .map(u64::from)
+        .ok_or_else(invalid)?;
+    if bpt == 0
+        || geom.bytes_per_texel != bpt
+        || u64::from(dst.row_length_texels).checked_mul(bpt) != Some(geom.pitch_bytes)
+        || dst.row_length_texels < dst.width
+    {
+        return Err(invalid());
+    }
     let mut grouped: Vec<(ash::vk::Buffer, Vec<ash::vk::BufferImageCopy>)> = Vec::new();
     for run in &dst.runs {
         let bound = unsafe { pools.bind_guest_ram(ctx, &run.guest) }
             .map_err(|inner| DrawError::GuestPageWrite(GuestWriteDecline::Import { inner }))?;
         // `head` is what the granularity rounding added in front of the byte the
         // caller asked for, so the run's first requested byte sits here.
-        let base = bound.offset + bound.head;
+        let base = bound.offset.checked_add(bound.head).ok_or_else(invalid)?;
         let start = run.window_offset;
-        let end = start.saturating_add(run.guest.requested());
+        let end = start
+            .checked_add(run.guest.requested())
+            .ok_or_else(invalid)?;
+        let run_end = base
+            .checked_add(run.guest.requested())
+            .ok_or_else(invalid)?;
+        let bound_end = bound.offset.checked_add(bound.len).ok_or_else(invalid)?;
+        let allocation_size_bytes = run.guest.import().len();
+        if start % bpt != 0
+            || end % bpt != 0
+            || base % bpt != 0
+            || run_end > bound_end
+            || bound_end > allocation_size_bytes
+        {
+            return Err(invalid());
+        }
         for r in reims_vgpu_paging::regions::plan_regions(&geom, start, end) {
+            let offset = r
+                .window_offset
+                .checked_sub(start)
+                .and_then(|delta| base.checked_add(delta))
+                .ok_or_else(invalid)?;
+            let span = u64::from(r.height)
+                .checked_sub(1)
+                .and_then(|rows| rows.checked_mul(geom.pitch_bytes))
+                .and_then(|rows| {
+                    u64::from(r.width)
+                        .checked_mul(bpt)
+                        .and_then(|width| rows.checked_add(width))
+                })
+                .ok_or_else(invalid)?;
+            let planned_end = offset.checked_add(span).ok_or_else(invalid)?;
+            let expected = u64::from(r.y)
+                .checked_mul(geom.pitch_bytes)
+                .and_then(|row| {
+                    u64::from(r.x)
+                        .checked_mul(bpt)
+                        .and_then(|x| row.checked_add(x))
+                });
+            if r.width == 0
+                || r.height == 0
+                || offset % bpt != 0
+                || expected != Some(r.window_offset)
+                || u64::from(r.x) + u64::from(r.width) > u64::from(dst.width)
+                || u64::from(r.y) + u64::from(r.height) > u64::from(dst.height)
+                || planned_end > run_end
+                || planned_end > allocation_size_bytes
+            {
+                return Err(invalid());
+            }
             let region = ash::vk::BufferImageCopy::default()
                 // The rectangle's own offset is in window bytes; `- start`
                 // re-bases it onto this run, which is what `base` names.
-                .buffer_offset(base + (r.window_offset - start))
+                .buffer_offset(offset)
                 // In texels. This is the buffer-side row stride, and it is what
                 // makes a merged multi-row rectangle name consecutive guest
                 // rows — valid because within one run the guest bytes are
@@ -6655,4 +6715,26 @@ mod run_table_arena_tests {
         assert!(places.is_empty());
         assert_eq!(packed.len(), 4);
     }
+}
+
+#[cfg(test)]
+#[test]
+fn rgba32_destination_geometry_preserves_format_texel_size() {
+    let dst = GuestPageTarget {
+        runs: Vec::new(),
+        row_length_texels: 1536,
+        width: 1504,
+        height: 6016,
+        format: ash::vk::Format::R32G32B32A32_UINT,
+        shared_backing: None,
+    };
+    let geom = dst.geometry();
+    assert_eq!(geom.bytes_per_texel, 16);
+    assert_eq!(geom.pitch_bytes, 24576);
+    assert_eq!(geom.extent_end(), dst.extent_end());
+    assert_eq!(geom.extent_end(), 147848704);
+    let regions = reims_vgpu_paging::regions::plan_regions(&geom, 0, 4096);
+    assert_eq!(regions.len(), 1);
+    assert_eq!(regions[0].width, 256);
+    assert_eq!(u64::from(regions[0].width) * dst.bytes_per_texel(), 4096);
 }
