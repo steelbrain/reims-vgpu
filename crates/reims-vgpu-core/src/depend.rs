@@ -75,6 +75,10 @@ pub struct Census {
 #[derive(Debug, Default)]
 pub struct DependencyGraph {
     entries: Vec<Entry>,
+    /// Inactive entries still present in the candidate indexes.
+    retired_entries: usize,
+    /// Compaction must not erase the ingress-order contract.
+    last_admitted: Option<IngressOrdinal>,
     by_backing: HashMap<BackingId, Vec<usize>>,
     /// Keyed by the heap, not by `HeapId`: the membership generation says
     /// which set a record was written against and never which memory exists, so
@@ -136,11 +140,18 @@ impl DependencyGraph {
         accesses: &[AccessIntent],
     ) -> Vec<IngressOrdinal> {
         assert!(
-            self.entries
-                .last()
-                .is_none_or(|last| ordinal > last.ordinal),
+            self.last_admitted.is_none_or(|last| ordinal > last),
             "transactions are admitted in ingress order; {ordinal:?} arrived after a later one"
         );
+        self.last_admitted = Some(ordinal);
+        // Rebuild only after enough retirements to amortize the index walk.
+        // The threshold controls cleanup cost, never which live accesses survive.
+        const MIN_RETIRED_FOR_COMPACTION: usize = 1024;
+        if self.retired_entries >= MIN_RETIRED_FOR_COMPACTION
+            && self.retired_entries >= self.entries.len() - self.retired_entries
+        {
+            self.compact();
+        }
         // Taken out so the gathering below can borrow the indexes; put back
         // before returning, so the next admission finds the capacity this one
         // grew. Both are cleared here rather than at the end, because a
@@ -260,10 +271,12 @@ impl DependencyGraph {
     /// creating edges when the work that declared it has finished, and a caller
     /// that retires early publishes a hazard it still owes.
     pub fn retire(&mut self, ordinal: IngressOrdinal) {
-        for &idx in self.by_ordinal.get(&ordinal).into_iter().flatten() {
-            self.entries[idx].live = false;
+        if let Some(indices) = self.by_ordinal.remove(&ordinal) {
+            self.retired_entries += indices.len();
+            for idx in indices {
+                self.entries[idx].live = false;
+            }
         }
-        self.by_ordinal.remove(&ordinal);
     }
 
     /// Drop retired entries and rebuild the indexes.
@@ -274,6 +287,7 @@ impl DependencyGraph {
     pub fn compact(&mut self) {
         let live: Vec<_> = self.entries.iter().copied().filter(|e| e.live).collect();
         self.entries.clear();
+        self.retired_entries = 0;
         self.by_backing.clear();
         self.by_heap.clear();
         self.by_domain.clear();
@@ -857,5 +871,61 @@ mod tests {
         );
         assert!(retirements > 1_000, "transactions retired: {retirements}");
         assert!(compactions > 500, "compactions: {compactions}");
+    }
+    #[test]
+    fn automatic_compaction_bounds_retired_history_and_preserves_live_writer() {
+        let mut g = DependencyGraph::new();
+        let key = AccessKey::Whole(res(1));
+        assert!(g
+            .admit(ord(1), &[intent(key, AccessMode::Write)])
+            .is_empty());
+        for n in 2..=20_000 {
+            assert_eq!(
+                g.admit(ord(n), &[intent(key, AccessMode::Read)]),
+                vec![ord(1)]
+            );
+            g.retire(ord(n));
+            g.retire(ord(n)); // Repeated retirement must not inflate accounting.
+            assert_eq!(g.live_accesses(), 1);
+            assert!(
+                g.entries.len() <= 2048,
+                "retired history keeps growing: {}",
+                g.entries.len()
+            );
+        }
+        assert_eq!(g.census().accesses, 20_000);
+        assert_eq!(g.census().edges, 19_999);
+        g.retire(ord(1));
+        assert!(g
+            .admit(ord(20_001), &[intent(key, AccessMode::Write)])
+            .is_empty());
+    }
+
+    #[test]
+    fn compaction_keeps_all_live_dependencies_even_when_the_live_set_is_large() {
+        let mut g = DependencyGraph::new();
+        let key = AccessKey::Whole(res(1));
+        for n in 1..=4096 {
+            assert!(g.admit(ord(n), &[intent(key, AccessMode::Read)]).is_empty());
+        }
+        for n in 1..=2048 {
+            g.retire(ord(n));
+        }
+        assert_eq!(
+            g.admit(ord(4097), &[intent(key, AccessMode::Write)]),
+            (2049..=4096).map(ord).collect::<Vec<_>>()
+        );
+        assert_eq!(g.live_accesses(), 2049);
+    }
+
+    #[test]
+    #[should_panic(expected = "transactions are admitted in ingress order")]
+    fn compaction_cannot_erase_the_ingress_order_high_water_mark() {
+        let mut g = DependencyGraph::new();
+        let a = intent(AccessKey::Whole(res(1)), AccessMode::Write);
+        g.admit(ord(10), &[a]);
+        g.retire(ord(10));
+        g.compact();
+        g.admit(ord(9), &[a]);
     }
 }
