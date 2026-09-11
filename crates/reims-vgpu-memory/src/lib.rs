@@ -69,6 +69,9 @@
 //! the alias is optional; a driver may refuse it and the existing gather remains
 //! the correctness path. It is never attempted per draw.
 
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub mod dmabuf;
+
 use reims_vgpu_observe::{Decline, Emit};
 use reims_vgpu_protocol::checked::align_up_u64;
 
@@ -426,6 +429,8 @@ impl GuestRamError {
 /// nothing under `backend/metal/` runs its tests at all.
 #[derive(Debug)]
 pub struct GuestRamImport {
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    dmabuf: Option<std::sync::Arc<dmabuf::SharedDmaBuf>>,
     id: ImportId,
     /// Set once the guest allocation lifetime ends. The identity is never
     /// reusable, and a stale child holding this object may not recreate a
@@ -445,6 +450,24 @@ pub struct GuestRamImport {
 }
 
 impl GuestRamImport {
+    /// # Safety
+    /// `backing` must name exactly these guest pages in this import's order.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    pub unsafe fn attach_dmabuf(
+        &mut self,
+        backing: std::sync::Arc<dmabuf::SharedDmaBuf>,
+    ) -> Result<(), dmabuf::ExportError> {
+        if backing.len() != self.len {
+            return Err(dmabuf::ExportError::SizeMismatch);
+        }
+        self.dmabuf = Some(backing);
+        Ok(())
+    }
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    pub fn dmabuf(&self) -> Option<&std::sync::Arc<dmabuf::SharedDmaBuf>> {
+        self.dmabuf.as_ref()
+    }
+
     /// Take a RAMBlock the shim described and bound it to `align`.
     ///
     /// `align` is the backend's queried import granularity, never a guessed
@@ -507,6 +530,8 @@ impl GuestRamImport {
 
         Ok(Self {
             id: ImportId::allocate(),
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            dmabuf: None,
             retired: std::sync::atomic::AtomicBool::new(false),
             gpa_base: Some(region.gpa_base + head),
             host_base: host_base as usize,
@@ -546,6 +571,8 @@ impl GuestRamImport {
         }
         Ok(Self {
             id: ImportId::allocate(),
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            dmabuf: None,
             retired: std::sync::atomic::AtomicBool::new(false),
             gpa_base: None,
             host_base,

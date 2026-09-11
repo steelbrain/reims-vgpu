@@ -1698,3 +1698,36 @@ mod tests {
         });
     }
 }
+
+/// Attach the host-proven backing of this packed import. Other builds keep the
+/// existing pointer/copy paths and never request an export.
+pub(crate) fn with_optional_dmabuf<H: HostOps + ?Sized>(
+    _host: &mut H,
+    import: GuestRamImport,
+    _gpas: &[u64],
+    _page: usize,
+) -> GuestRamImport {
+    #[cfg(all(
+        feature = "experimental-dmabuf",
+        target_os = "linux",
+        target_arch = "x86_64"
+    ))]
+    {
+        let mut import = import;
+        let result = _host
+            .export_guest_pages(_gpas, _page)
+            .and_then(|backing| unsafe { import.attach_dmabuf(backing) });
+        if let Err(reason) = result {
+            crate::observe::Emit::decline("packed_dmabuf_export", &reason).fail_once(0);
+        }
+        import
+    }
+    #[cfg(not(all(
+        feature = "experimental-dmabuf",
+        target_os = "linux",
+        target_arch = "x86_64"
+    )))]
+    {
+        import
+    }
+}

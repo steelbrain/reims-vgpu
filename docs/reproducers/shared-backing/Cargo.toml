@@ -1,0 +1,9 @@
+[package]
+name="z13-dmabuf-gpu-probe"
+version="0.1.0"
+edition="2021"
+[workspace]
+[dependencies]
+ash="0.38"
+libc="0.2"
+serde_json="1"

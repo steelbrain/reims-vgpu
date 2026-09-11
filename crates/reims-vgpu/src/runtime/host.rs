@@ -491,6 +491,18 @@ pub trait HostOps {
     ///
     /// Default: unavailable. A host that cannot answer says so by name, and the
     /// caller runs the copying rails rather than reaching for `map_pages`.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn export_guest_pages(
+        &mut self,
+        _gpas: &[u64],
+        _page: usize,
+    ) -> Result<
+        std::sync::Arc<reims_vgpu_memory::dmabuf::SharedDmaBuf>,
+        reims_vgpu_memory::dmabuf::ExportError,
+    > {
+        Err(reims_vgpu_memory::dmabuf::ExportError::NoBacking)
+    }
+
     fn guest_ram_regions(
         &mut self,
     ) -> Result<Vec<crate::runtime::guest_ram::GuestRamRegion>, GuestRamRegionsError> {

@@ -141,6 +141,8 @@ pub struct ReimsVgpuHostOps {
     >,
     pub page_alias_census:
         Option<unsafe extern "C" fn(ctx: *mut c_void, out: *mut PageAliasCensus) -> i32>,
+    pub shared_page_backing:
+        Option<unsafe extern "C" fn(*mut c_void, *const u64, usize, usize, *mut c_void) -> i32>,
 }
 
 // SAFETY: QEMU keeps the table valid for the device lifetime; callbacks only
@@ -177,6 +179,7 @@ impl ReimsVgpuHostOps {
             guest_write_gen: None,
             guest_written_pages: None,
             page_alias_census: None,
+            shared_page_backing: None,
             is_ram_gpa: None,
             guest_ram_regions: None,
             notify_actions: None,
@@ -638,6 +641,37 @@ impl HostOps for QemuHost<'_> {
         let mut out = PageAliasCensus::default();
         // SAFETY: `out` is writable for this call and QEMU owns the live ctx.
         (unsafe { callback(self.ops.ctx, &mut out) } == 0).then_some(out)
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn export_guest_pages(
+        &mut self,
+        gpas: &[u64],
+        page: usize,
+    ) -> Result<
+        std::sync::Arc<reims_vgpu_memory::dmabuf::SharedDmaBuf>,
+        reims_vgpu_memory::dmabuf::ExportError,
+    > {
+        use reims_vgpu_memory::dmabuf::{ExportError, SharedDmaBuf, SharedPage};
+        let callback = self.ops.shared_page_backing.ok_or(ExportError::NoBacking)?;
+        if gpas.is_empty() || page == 0 {
+            return Err(ExportError::InvalidRange);
+        }
+        let mut pages = vec![SharedPage::default(); gpas.len()];
+        // The ABI guarantees borrowed fd lifetime through this synchronous export.
+        if unsafe {
+            callback(
+                self.ops.ctx,
+                gpas.as_ptr(),
+                gpas.len(),
+                page,
+                pages.as_mut_ptr().cast(),
+            )
+        } != 0
+        {
+            return Err(ExportError::NoBacking);
+        }
+        unsafe { SharedDmaBuf::export(&pages, page as u64) }.map(std::sync::Arc::new)
     }
 
     fn guest_ram_regions(

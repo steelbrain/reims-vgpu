@@ -93,8 +93,9 @@ use std::slice;
 /// [[host-window]]). The symbol is always present; when the staticlib was built
 /// without the `host-window` feature it returns `REIMS_VGPU_QEMU_ERR_STATE` so the C
 /// shim falls back to QEMU's own display.
+/// v21 adds shared-page backing resolution for the optional DMA-BUF transport.
 /// v20 gives `map_pages` a structured per-call failure output.
-pub const REIMS_VGPU_QEMU_ABI_VERSION: u32 = 20;
+pub const REIMS_VGPU_QEMU_ABI_VERSION: u32 = 21;
 
 #[repr(C)]
 pub struct ReimsVgpuQemuCreateInfo {
@@ -1226,6 +1227,23 @@ mod tests {
         assert_eq!(
             unsafe { reims_vgpu_qemu_device_destroy(dev.handle) },
             REIMS_VGPU_QEMU_OK
+        );
+    }
+}
+
+#[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+mod shared_page_layout_tests {
+    #[test]
+    fn c_and_rust_backing_layout_agree() {
+        use reims_vgpu_memory::dmabuf::SharedPage;
+        let define = |name| super::header_define(name) as usize;
+        assert_eq!(
+            define("REIMS_VGPU_SHARED_PAGE_SIZE"),
+            std::mem::size_of::<SharedPage>()
+        );
+        assert_eq!(
+            define("REIMS_VGPU_SHARED_PAGE_OFFSET_OFFSET"),
+            std::mem::offset_of!(SharedPage, offset)
         );
     }
 }

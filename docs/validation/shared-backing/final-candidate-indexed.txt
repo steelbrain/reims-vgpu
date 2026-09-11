@@ -1,0 +1,12 @@
+CASE shader_compile PASS runtime library built
+CASE draw_nonindexed_shared_shader_control PASS lit=1094
+CASE draw_indexed_uint16_offset_4 PASS exactly matches non-indexed control
+CASE draw_indexed_uint32_offset_4 PASS exactly matches non-indexed control
+CASE draw_indexed_uint16_base_vertex_minus1 FAIL pixel differences=4096
+CASE draw_indexed_uint32_offset_4_base_vertex_minus1 FAIL pixel differences=4096
+CASE draw_nonindexed_two_instances_base_instance_5 PASS lit=416 left=0xff00ff00 right=0xff00ff00 centre=0xff000000
+CASE draw_indexed_two_instances_base_instance_5 FAIL lit=0 left=0x00000000 right=0x00000000 centre=0x00000000 matches_nonindexed=false
+SUMMARY cases=8 failures=3 skipped=0
+DEVICE name=Apple Paravirtual device unified=false
+
+INDEXED_EXIT=1

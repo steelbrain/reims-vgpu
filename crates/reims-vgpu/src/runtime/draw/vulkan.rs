@@ -3270,12 +3270,17 @@ pub(super) fn ensure_packed_resource<M: HostMemory + HostOps>(
             None => {
                 crate::runtime::drain::note_store_route("zc_packed_alias_import");
                 crate::runtime::drain::note_store_route(packed_scatter_band(&gpas, page));
-                let import = std::sync::Arc::new(
-                    crate::runtime::guest_ram::GuestRamImport::new_host_allocation(
-                        host_base, map_len, align,
-                    )
-                    .ok()?,
+                let allocation = crate::runtime::guest_ram::GuestRamImport::new_host_allocation(
+                    host_base, map_len, align,
+                )
+                .ok()?;
+                let allocation = crate::runtime::guest_ram_map::with_optional_dmabuf(
+                    host,
+                    allocation,
+                    &gpas,
+                    page as usize,
                 );
+                let import = std::sync::Arc::new(allocation);
                 let whole = import.slice(head, backing.size).ok()?;
                 let guest =
                     crate::runtime::guest_ram::GuestRef::new(std::sync::Arc::clone(&import), whole)
