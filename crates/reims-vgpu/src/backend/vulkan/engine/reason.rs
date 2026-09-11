@@ -396,6 +396,19 @@ impl crate::observe::Decline for DrawReason {
             Self::SwapchainSurface(refusal) => refusal.slug(),
         }
     }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        match self {
+            Self::UsedBindingAbsentFromLayout { binding, fragment } => vec![
+                ("binding", binding.to_string()),
+                (
+                    "stage",
+                    if *fragment { "fragment" } else { "vertex" }.to_string(),
+                ),
+            ],
+            _ => Vec::new(),
+        }
+    }
 }
 
 impl std::fmt::Display for DrawReason {
@@ -978,5 +991,25 @@ mod tests {
             reason.to_string(),
             "reason=format_not_vertex_buffer value=97"
         );
+    }
+}
+
+#[cfg(test)]
+mod binding_diagnostic_tests {
+    use super::DrawReason;
+
+    #[test]
+    fn missing_binding_event_keeps_stage_and_number_through_draw_error() {
+        for (fragment, stage) in [(true, "fragment"), (false, "vertex")] {
+            let error = super::super::types::DrawError::Unsupported(
+                DrawReason::UsedBindingAbsentFromLayout {
+                    binding: 704,
+                    fragment,
+                },
+            );
+            let line = crate::observe::Emit::decline("linux_m2v_draw", &error).render();
+            assert!(line.contains("binding=704"), "{line}");
+            assert!(line.contains(&format!("stage={stage}")), "{line}");
+        }
     }
 }
