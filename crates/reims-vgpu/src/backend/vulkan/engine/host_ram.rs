@@ -39,8 +39,14 @@ use crate::runtime::guest_ram::{GuestRamError, GuestRamImport, GuestRef};
 
 /// One host allocation living on the GPU as a bindable buffer, with no copy
 /// between it and the guest's own view of those bytes.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct ImportedHostRam {
+    #[cfg(all(
+        feature = "experimental-dmabuf",
+        target_os = "linux",
+        target_arch = "x86_64"
+    ))]
+    pub dmabuf: Option<std::sync::Arc<super::dmabuf::Lease>>,
     pub buffer: vk::Buffer,
     pub memory: vk::DeviceMemory,
     /// Memory type selected when the parent allocation was imported. Child
@@ -66,6 +72,17 @@ impl ImportedHostRam {
     /// No submission may still reference `buffer`, and `device` must be the one
     /// the import was made against.
     pub(crate) unsafe fn destroy(self, device: &ash::Device) {
+        #[cfg(all(
+            feature = "experimental-dmabuf",
+            target_os = "linux",
+            target_arch = "x86_64"
+        ))]
+        if let Some(lease) = self.dmabuf.as_ref() {
+            lease.retire();
+            if lease.quarantined() {
+                return;
+            }
+        }
         unsafe {
             device.destroy_buffer(self.buffer, None);
             device.free_memory(self.memory, None);
@@ -85,6 +102,10 @@ impl ImportedHostRam {
 /// shared reason would leave a reader unable to tell them apart.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HostRamDecline {
+    DmaBufUnavailable,
+    DmaBufImport {
+        result: vk::Result,
+    },
     /// This device cannot import a host pointer at all. Carries the rung so the
     /// log says which check refused; expected on every host without the
     /// extension and on any host where an operator turned the rail off.
@@ -93,7 +114,9 @@ pub enum HostRamDecline {
     },
     /// The guest ended this parent allocation's lifetime. Old child objects
     /// may finish retiring, but no new view may resurrect its import identity.
-    Retired { import_id: u64 },
+    Retired {
+        import_id: u64,
+    },
     /// No memory type could be named for the pointer. Carries which of the two
     /// checks refused — see [`ImportTypeRefusal`], whose doc says why they are
     /// not one finding.
@@ -117,25 +140,38 @@ pub enum HostRamDecline {
         buffer_types: u32,
     },
     /// `vkCreateBuffer` over the whole span failed.
-    CreateBuffer { result: vk::Result },
+    CreateBuffer {
+        result: vk::Result,
+    },
     /// The buffer the driver made needs more bytes than the span has. The import
     /// is sized to the RAMBlock exactly and may not be rounded up: the bytes past
     /// the end are this process's own memory.
-    TooSmall { required: u64, available: u64 },
+    TooSmall {
+        required: u64,
+        available: u64,
+    },
     /// `vkAllocateMemory` with the chained import failed. On most drivers this
     /// is the pointer being refused — not fd-backed, not aligned, or not a
     /// mapping the driver can take a reference on.
-    AllocateMemory { result: vk::Result },
+    AllocateMemory {
+        result: vk::Result,
+    },
     /// `vkBindBufferMemory` failed after a successful import.
-    BindBuffer { result: vk::Result },
+    BindBuffer {
+        result: vk::Result,
+    },
     /// The reference did not survive its own bound. Carries the check that
     /// refused, from [`crate::runtime::guest_ram`].
-    Bound { inner: GuestRamError },
+    Bound {
+        inner: GuestRamError,
+    },
 }
 
 impl Decline for HostRamDecline {
     fn slug(&self) -> &'static str {
         match self {
+            Self::DmaBufUnavailable => "host_ram_import_dmabuf_unavailable",
+            Self::DmaBufImport { .. } => "host_ram_import_dmabuf_failed",
             Self::Unsupported { .. } => "host_ram_import_unsupported",
             Self::Retired { .. } => "host_ram_import_retired",
             Self::NoImportableMemoryType { .. } => "host_ram_import_no_importable_memory_type",
@@ -152,6 +188,8 @@ impl Decline for HostRamDecline {
 
     fn fields(&self) -> Vec<(&'static str, String)> {
         match self {
+            Self::DmaBufUnavailable => Vec::new(),
+            Self::DmaBufImport { result } => vec![("result", format!("{result:?}"))],
             Self::Unsupported { rung } => vec![("rung", rung.slug().to_string())],
             Self::Retired { import_id } => vec![("import_id", import_id.to_string())],
             Self::NoImportableMemoryType { host_base, refusal } => {
@@ -218,7 +256,7 @@ pub(crate) struct BoundGuestRam {
 }
 
 /// Every bounded host allocation this device has imported, keyed by identity.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct LiveImport {
     allocation: ImportedHostRam,
     child_images: usize,
@@ -315,7 +353,16 @@ impl HostRamImports {
         ctx: &super::context::DeviceContext,
         import: &GuestRamImport,
     ) -> Result<ImportedHostRam, HostRamDecline> {
-        unsafe { self.ensure(ctx, import) }.map(|(live, _)| live)
+        let (live, _) = unsafe { self.ensure(ctx, import) }?;
+        #[cfg(all(
+            feature = "experimental-dmabuf",
+            target_os = "linux",
+            target_arch = "x86_64"
+        ))]
+        if live.dmabuf.is_some() {
+            return Err(HostRamDecline::DmaBufUnavailable);
+        }
+        Ok(live)
     }
 
     /// Record one child image bound into this parent allocation.
@@ -393,12 +440,24 @@ impl HostRamImports {
             return Err(HostRamDecline::Retired { import_id: key });
         }
         if let Some(live) = self.live.get(&key) {
-            return Ok((live.allocation, false));
+            return Ok((live.allocation.clone(), false));
         }
         if let Some(decline) = self.declined.get(&key) {
             return Err(*decline);
         }
-        let made = match unsafe { import_ramblock(ctx, import) } {
+        let attempt = unsafe { import_ramblock(ctx, import) };
+        #[cfg(all(
+            feature = "experimental-dmabuf",
+            target_os = "linux",
+            target_arch = "x86_64"
+        ))]
+        let attempt = attempt.or_else(|original| {
+            if import.dmabuf().is_none() || ctx.dmabuf_loader.is_none() {
+                return Err(original);
+            }
+            unsafe { super::dmabuf::import(ctx, import) }
+        });
+        let made = match attempt {
             Ok(made) => made,
             Err(decline) => {
                 self.declined.insert(key, decline);
@@ -408,7 +467,7 @@ impl HostRamImports {
         self.live.insert(
             key,
             LiveImport {
-                allocation: made,
+                allocation: made.clone(),
                 child_images: 0,
                 retired: false,
                 retirement_fences_cleared: false,
@@ -573,6 +632,12 @@ unsafe fn import_ramblock(
 
         match unsafe { ctx.device.bind_buffer_memory(buffer, memory, 0) } {
             Ok(()) => Ok(ImportedHostRam {
+                #[cfg(all(
+                    feature = "experimental-dmabuf",
+                    target_os = "linux",
+                    target_arch = "x86_64"
+                ))]
+                dmabuf: None,
                 buffer,
                 memory,
                 memory_type_index,
@@ -827,6 +892,12 @@ mod tests {
             .expect("aligned synthetic import");
         let key = import.id().get();
         let allocation = ImportedHostRam {
+            #[cfg(all(
+                feature = "experimental-dmabuf",
+                target_os = "linux",
+                target_arch = "x86_64"
+            ))]
+            dmabuf: None,
             buffer: vk::Buffer::null(),
             memory: vk::DeviceMemory::null(),
             memory_type_index: 0,
@@ -880,6 +951,12 @@ mod tests {
             key,
             LiveImport {
                 allocation: ImportedHostRam {
+                    #[cfg(all(
+                        feature = "experimental-dmabuf",
+                        target_os = "linux",
+                        target_arch = "x86_64"
+                    ))]
+                    dmabuf: None,
                     buffer: vk::Buffer::null(),
                     memory: vk::DeviceMemory::null(),
                     memory_type_index: 0,

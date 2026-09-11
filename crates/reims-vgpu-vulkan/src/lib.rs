@@ -300,3 +300,5 @@ pub(crate) mod naming {
         }
     }
 }
+
+pub mod dmabuf;

@@ -389,7 +389,7 @@ pub(super) unsafe fn create(
         let explicit = unsafe {
             create_with_layout(
                 ctx,
-                allocation,
+                &allocation,
                 backing,
                 width,
                 height,
@@ -408,7 +408,7 @@ pub(super) unsafe fn create(
         let ordinary = unsafe {
             create_with_layout(
                 ctx,
-                allocation,
+                &allocation,
                 backing,
                 width,
                 height,
@@ -426,7 +426,7 @@ pub(super) unsafe fn create(
     let result = unsafe {
         create_with_layout(
             ctx,
-            allocation,
+            &allocation,
             backing,
             width,
             height,
@@ -444,7 +444,7 @@ pub(super) unsafe fn create(
 #[allow(clippy::too_many_arguments)]
 unsafe fn create_with_layout(
     ctx: &DeviceContext,
-    allocation: super::host_ram::ImportedHostRam,
+    allocation: &super::host_ram::ImportedHostRam,
     backing: GuestTargetBacking,
     width: u32,
     height: u32,

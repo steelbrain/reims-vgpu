@@ -1482,6 +1482,12 @@ fn revalidate_timing_is_slow(elapsed_us: u64) -> bool {
 /// admitted to a backend import, so its only users are CPU copies that finish
 /// inside their own call.
 pub fn flush_retired_views<H: HostOps>(state: &mut DeviceState, host: &mut H) {
+    for import in state.bound_buffers.take_retired_packed() {
+        state
+            .retired_views
+            .push((import.host_base(), import.len() as usize));
+        state.retired_guest_imports.push(import.id());
+    }
     // The backend allocation aliases the host view, so revoke the GPU parent
     // first. Existing child images and recorded buffers hold it through their
     // fence-safe retirement; only then is the matching host view unmapped.
@@ -2048,9 +2054,15 @@ pub fn ensure_contig_import_with_footprint<H: HostMemory + HostOps>(
             return Some((std::sync::Arc::clone(import), footprint));
         }
     }
-    let import = std::sync::Arc::new(
-        crate::runtime::guest_ram::GuestRamImport::new_host_allocation(ptr, len, align).ok()?,
+    let allocation =
+        crate::runtime::guest_ram::GuestRamImport::new_host_allocation(ptr, len, align).ok()?;
+    let allocation = crate::runtime::guest_ram_map::with_optional_dmabuf(
+        host,
+        allocation,
+        &_pages,
+        state.page_size() as usize,
     );
+    let import = std::sync::Arc::new(allocation);
     state.mappings.get_mut(&mapping_id)?.contig_import = Some(std::sync::Arc::clone(&import));
     Some((import, footprint))
 }

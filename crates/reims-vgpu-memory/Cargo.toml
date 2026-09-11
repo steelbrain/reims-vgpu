@@ -28,3 +28,6 @@ reims-vgpu-observe = { path = "../reims-vgpu-observe" }
 
 [dev-dependencies]
 reims-vgpu-observe = { path = "../reims-vgpu-observe", features = ["testing"] }
+
+[target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dependencies]
+libc = "0.2"

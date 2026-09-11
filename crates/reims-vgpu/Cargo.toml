@@ -14,6 +14,8 @@ crate-type = ["staticlib", "rlib"]
 name = "reims_vgpu"
 
 [features]
+# Isolated Linux transport experiment; host capabilities still gate use.
+experimental-dmabuf = ["backend-vulkan"]
 # The project supports exactly three arms, one per host GPU API actually
 # available: Metal on Apple, Vulkan through MoltenVK on Apple, and Vulkan on a
 # native Linux ICD. backend-metal is therefore **Apple-only** — src/lib.rs
@@ -151,3 +153,6 @@ required-features = ["host-window"]
 [[example]]
 name = "window_present_off_thread"
 required-features = ["host-window", "backend-vulkan"]
+
+[target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dev-dependencies]
+libc = "0.2"

@@ -16,6 +16,12 @@ mod counters;
 mod desc_arena;
 mod device_lost;
 mod digest;
+#[cfg(all(
+    feature = "experimental-dmabuf",
+    target_os = "linux",
+    target_arch = "x86_64"
+))]
+mod dmabuf;
 mod draw_execution;
 mod draw_phase;
 mod draw_preparation;

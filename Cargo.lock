@@ -1181,6 +1181,7 @@ dependencies = [
 name = "reims-vgpu-memory"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "reims-vgpu-observe",
  "reims-vgpu-paging",
  "reims-vgpu-protocol",

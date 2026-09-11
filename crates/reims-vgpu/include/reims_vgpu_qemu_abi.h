@@ -94,7 +94,7 @@ extern "C" {
  *     thread so IRQ pulses reach the guest mid-drain — ack fast).
  * v6: ReimsVgpuHostOps.is_ram_gpa (reject non-RAM PFNs on mapper / map_pages paths).
  * v5: ReimsVgpuQemuCreateInfo.guest_page_shift (12 = x86 Tahoe, 14 = arm64e). */
-#define REIMS_VGPU_QEMU_ABI_VERSION 20u
+#define REIMS_VGPU_QEMU_ABI_VERSION 21u
 
 #define REIMS_VGPU_MAP_PAGES_FAILURE_NONE 0u
 #define REIMS_VGPU_MAP_PAGES_FAILURE_RESERVATION 1u
@@ -256,6 +256,15 @@ typedef struct ReimsVgpuMapPagesFailure {
  * Host services QEMU provides to Rust (apple-gfx raiseInterrupt / readMemory
  * equivalents). QEMU owns the function pointers and ctx for the device life.
  */
+/* v21: borrowed shared backing for one page. fd remains valid throughout export. */
+typedef struct ReimsVgpuSharedPage {
+    int32_t fd;
+    uint32_t reserved;
+    uint64_t offset;
+} ReimsVgpuSharedPage;
+#define REIMS_VGPU_SHARED_PAGE_SIZE 16u
+#define REIMS_VGPU_SHARED_PAGE_OFFSET_OFFSET 8u
+
 typedef struct ReimsVgpuHostOps {
     uint32_t abi_version;
     uint32_t struct_size;
@@ -378,6 +387,10 @@ typedef struct ReimsVgpuHostOps {
                                    uint64_t *out, size_t max);
     /* Current packed map_pages aliases and cumulative lifetime totals. */
     int (*page_alias_census)(void *ctx, ReimsVgpuPageAliasCensus *out);
+    /* Resolve shared guest pages in order; return 0 only when all are backed.
+     * No export policy here: Rust owns coalescing, limits and udmabuf lifetime. */
+    int (*shared_page_backing)(void *ctx, const uint64_t *gpas, size_t count,
+                               size_t page_size, ReimsVgpuSharedPage *out);
 } ReimsVgpuHostOps;
 
 /*

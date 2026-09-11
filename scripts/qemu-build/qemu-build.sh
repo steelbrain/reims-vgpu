@@ -57,6 +57,7 @@ fi
 
 cd "$QEMU_SRC"
 
+REIMS_VGPU_DMABUF_EXPERIMENT=false
 while [ "$#" -gt 0 ]; do
   case "$1" in
     -h|--help)
@@ -67,6 +68,7 @@ Build vendor/qemu (reims-vgpu-mmio + reims-vgpu for the selected target/backend)
 
   --target aarch64|x86_64  softmmu target (default: aarch64 on Darwin, x86_64
                            on Linux). Env: QEMU_TARGET.
+  --experimental-dmabuf      build the serialized Linux x86_64 buffer experiment
   --backend metal|vulkan|both
                            host GPU backend(s) linked into reims-vgpu-mmio.
                            Defaults by host OS. Baked at build time. Env: REIMS_VGPU_BACKEND.
@@ -107,6 +109,10 @@ EOF
         echo "[qemu-build] ERROR: --backend needs metal|vulkan|both" >&2
         exit 1
       fi
+      shift
+      ;;
+    --experimental-dmabuf)
+      REIMS_VGPU_DMABUF_EXPERIMENT=true
       shift
       ;;
     --backend=*)
@@ -208,7 +214,7 @@ fi
 # staticlib whose counters nothing ever wrote out — and reported every function
 # in the crate as never having run. The path and not just a flag, because a
 # different clang major is a different archive.
-STAMP_WANTED="${QEMU_TARGET}:${REIMS_VGPU_BACKEND}:reims-vgpu-crates:cov=${REIMS_VGPU_COVERAGE:-off}"
+STAMP_WANTED="${QEMU_TARGET}:${REIMS_VGPU_BACKEND}:reims-vgpu-crates:cov=${REIMS_VGPU_COVERAGE:-off}:dmabuf=$REIMS_VGPU_DMABUF_EXPERIMENT"
 if [ -f "build/build.ninja" ]; then
   prev=""
   if [ -f "build/qemu-build.stamp" ]; then
@@ -243,7 +249,8 @@ if [ ! -f "build/build.ninja" ]; then
         --disable-bsd-user \
         --disable-linux-user \
         --disable-tools \
-        "$REIMS_VGPU_MESON_OPT"
+        "$REIMS_VGPU_MESON_OPT" \
+        "-Dreims_vgpu_dmabuf_experiment=$REIMS_VGPU_DMABUF_EXPERIMENT"
       ;;
     x86_64)
       echo "[qemu-build] configuring (x86_64-softmmu, no hvf/cocoa) ..."
@@ -255,7 +262,8 @@ if [ ! -f "build/build.ninja" ]; then
         --disable-bsd-user \
         --disable-linux-user \
         --disable-tools \
-        "$REIMS_VGPU_MESON_OPT"
+        "$REIMS_VGPU_MESON_OPT" \
+        "-Dreims_vgpu_dmabuf_experiment=$REIMS_VGPU_DMABUF_EXPERIMENT"
       ;;
   esac
 else

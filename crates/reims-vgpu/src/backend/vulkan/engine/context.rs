@@ -654,6 +654,18 @@ fn storage_buffer_offset_alignment(limits: &vk::PhysicalDeviceLimits) -> u64 {
 }
 
 pub(crate) struct DeviceContext {
+    #[cfg(all(
+        feature = "experimental-dmabuf",
+        target_os = "linux",
+        target_arch = "x86_64"
+    ))]
+    pub dmabuf_loader: Option<ash::khr::external_memory_fd::Device>,
+    #[cfg(all(
+        feature = "experimental-dmabuf",
+        target_os = "linux",
+        target_arch = "x86_64"
+    ))]
+    pub dmabuf_rail: super::dmabuf::Rail,
     pub _entry: ash::Entry,
     pub instance: ash::Instance,
     pub pd: vk::PhysicalDevice,
@@ -1182,7 +1194,27 @@ impl DeviceContext {
             max_divisor: divisor_properties.max_vertex_attrib_divisor,
         };
         let vertex_formats = crate::backend::vulkan::translate::support::probe(&instance, pd);
+        #[cfg(all(
+            feature = "experimental-dmabuf",
+            target_os = "linux",
+            target_arch = "x86_64"
+        ))]
+        let dmabuf_supported =
+            unsafe { reims_vgpu_vulkan::dmabuf::supported(&instance, pd, &device_extensions) };
         let mut enabled_device_extensions = Vec::new();
+        #[cfg(all(
+            feature = "experimental-dmabuf",
+            target_os = "linux",
+            target_arch = "x86_64"
+        ))]
+        if dmabuf_supported {
+            enabled_device_extensions.extend(
+                reims_vgpu_vulkan::dmabuf::EXTENSIONS
+                    .iter()
+                    .map(|name| name.as_ptr()),
+            );
+        }
+
         if portability_subset {
             enabled_device_extensions.push(vk::KHR_PORTABILITY_SUBSET_NAME.as_ptr());
         }
@@ -1317,7 +1349,7 @@ impl DeviceContext {
             .ok()
             .flatten();
         let queue = device.get_device_queue(gq, 0);
-        let queue_owner = match super::queue_owner::QueueOwner::start(&device, queue) {
+        let mut queue_owner = match super::queue_owner::QueueOwner::start(&device, queue) {
             Ok(owner) => Some(owner),
             Err(error) => {
                 crate::observe::fail(format!(
@@ -1327,6 +1359,18 @@ impl DeviceContext {
                 None
             }
         };
+        #[cfg(all(
+            feature = "experimental-dmabuf",
+            target_os = "linux",
+            target_arch = "x86_64"
+        ))]
+        if dmabuf_supported {
+            if let Some(mut owner) = queue_owner.take() {
+                owner.stop();
+            }
+        }
+        // Mutability is also used on ordinary builds to move the queue owner.
+        let queue_owner = queue_owner.take();
         let memory_properties = instance.get_physical_device_memory_properties(pd);
         let caps = HostGpuCaps {
             memory: classify_memory(&memory_properties),
@@ -1340,6 +1384,13 @@ impl DeviceContext {
         };
         // Loaded from the same answer that enabled the extension, so the two
         // cannot disagree about whether these entry points are legal to call.
+        #[cfg(all(
+            feature = "experimental-dmabuf",
+            target_os = "linux",
+            target_arch = "x86_64"
+        ))]
+        let dmabuf_loader =
+            dmabuf_supported.then(|| ash::khr::external_memory_fd::Device::new(&instance, &device));
         let external_memory_host = caps
             .host_pointer
             .is_available()
@@ -1454,6 +1505,18 @@ impl DeviceContext {
             device,
             caps,
             memory_properties,
+            #[cfg(all(
+                feature = "experimental-dmabuf",
+                target_os = "linux",
+                target_arch = "x86_64"
+            ))]
+            dmabuf_loader,
+            #[cfg(all(
+                feature = "experimental-dmabuf",
+                target_os = "linux",
+                target_arch = "x86_64"
+            ))]
+            dmabuf_rail: super::dmabuf::Rail::default(),
             external_memory_host,
             push_descriptor,
             extended_dynamic_state,
@@ -1563,6 +1626,12 @@ impl DeviceContext {
         self.device
             .destroy_pipeline_cache(self.pipeline_cache, None);
         self.device.destroy_device(None);
+        #[cfg(all(
+            feature = "experimental-dmabuf",
+            target_os = "linux",
+            target_arch = "x86_64"
+        ))]
+        self.dmabuf_rail.device_destroyed();
         self.instance.destroy_instance(None);
     }
 
@@ -1695,6 +1764,15 @@ impl DeviceContext {
             .stamp_completion
             .as_ref()
             .map(|completion| completion.reserve_submission());
+        #[cfg(all(
+            feature = "experimental-dmabuf",
+            target_os = "linux",
+            target_arch = "x86_64"
+        ))]
+        if self.dmabuf_rail.has_live() {
+            unsafe { self.dmabuf_rail.submit(self, command_buffers) }?;
+            return unsafe { self.submit_guest_work_reserved(&[], fence, timeline) };
+        }
         if let Some(owner) = self.queue_owner.as_ref() {
             return owner.submit_sync(command_buffers, fence, timeline);
         }
@@ -1709,6 +1787,14 @@ impl DeviceContext {
         command_buffers: &[vk::CommandBuffer],
         fence: vk::Fence,
     ) -> Result<(), vk::Result> {
+        #[cfg(all(
+            feature = "experimental-dmabuf",
+            target_os = "linux",
+            target_arch = "x86_64"
+        ))]
+        if self.dmabuf_rail.has_live() {
+            return unsafe { self.submit_guest_work(command_buffers, fence) };
+        }
         let timeline = self
             .stamp_completion
             .as_ref()
