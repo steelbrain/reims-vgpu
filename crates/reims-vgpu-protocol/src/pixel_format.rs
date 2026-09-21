@@ -391,6 +391,10 @@ pub enum SampledClass {
     /// nothing here moves such a bind to the CPU, which could not serve it
     /// anyway — its channels do not sit on byte boundaries.
     Bgr10a2Unorm,
+    /// The same packed word with red and blue exchanged —
+    /// `MTLPixelFormatRGB10A2Unorm` — declared for the same cross-check and on
+    /// the same terms as [`Self::Bgr10a2Unorm`].
+    Rgb10a2Unorm,
     /// The two `uint16` channels `MTLPixelFormatRG16Uint` stores a texel in.
     ///
     /// Declared for the cross-check, on [`Self::Bgr10a2Unorm`]'s terms and for
@@ -799,6 +803,7 @@ impl TexelLayout {
                 | Self::Rg16Float
                 | Self::Rgba16Float
                 | Self::Bgr10a2Unorm
+                | Self::Rgb10a2Unorm
                 | Self::Rg16Uint
         )
     }
@@ -1802,6 +1807,7 @@ pub fn sampled_class(format: u16) -> Option<SampledClass> {
         MTL_FORMAT_RGBA16_FLOAT => SampledClass::Rgba16Float,
         MTL_FORMAT_RG16_FLOAT => SampledClass::Rg16Float,
         MTL_FORMAT_BGR10A2_UNORM => SampledClass::Bgr10a2Unorm,
+        MTL_FORMAT_RGB10A2_UNORM => SampledClass::Rgb10a2Unorm,
         MTL_FORMAT_RG16_UINT => SampledClass::Rg16Uint,
         MTL_FORMAT_RGBA32_FLOAT => SampledClass::Rgba32Float,
         _ => return None,
@@ -2028,7 +2034,8 @@ pub fn render_target_numeric_type(format: u16) -> Option<ColorNumericType> {
         | MTL_FORMAT_RG16_FLOAT
         | MTL_FORMAT_R16_FLOAT
         | MTL_FORMAT_R8_UNORM
-        | MTL_FORMAT_BGR10A2_UNORM => ColorNumericType::Float,
+        | MTL_FORMAT_BGR10A2_UNORM
+        | MTL_FORMAT_RGB10A2_UNORM => ColorNumericType::Float,
         MTL_FORMAT_RG16_UINT => ColorNumericType::Uint,
         _ => return None,
     })
@@ -2098,6 +2105,9 @@ pub fn store_texel_order(format: u16) -> Option<TexelLayout> {
         // identical `VK_FORMAT_A2R10G10B10_UNORM_PACK32` word the guest's
         // destination does, so the copy converts nothing.
         MTL_FORMAT_BGR10A2_UNORM => TexelLayout::Bgr10a2Unorm,
+        // Its channel-order sibling, for the same reason: the resident is
+        // `VK_FORMAT_A2B10G10R10_UNORM_PACK32`, the identical word.
+        MTL_FORMAT_RGB10A2_UNORM => TexelLayout::Rgb10a2Unorm,
         // The integer colour target, and the member whose absence here would be
         // a **loss** rather than a slow path. Every other member declines to the
         // CPU converter; this one has no CPU converter to decline to, because
@@ -2503,7 +2513,9 @@ const fn unorm8_to_f16_lut() -> &'static [u16; 256] {
 /// 20..29 and alpha in 30..31. Those are the same bits in the same order as
 /// `VK_FORMAT_A2R10G10B10_UNORM_PACK32`, which is why the byte copy is exact and
 /// [`store_texel_order`] admits the format — the two functions below serve only
-/// the rails that cannot copy.
+/// the rails that cannot copy. `MTLPixelFormatRGB10A2Unorm` is the same word
+/// with red and blue exchanged, and `VK_FORMAT_A2B10G10R10_UNORM_PACK32` is its
+/// Vulkan twin; [`TenBitOrder`] names which of the two a word is.
 ///
 /// Stated as shifts rather than as a struct because the channels do not sit on
 /// byte boundaries, which is also why no byte-shaped loader can serve this
@@ -2524,7 +2536,35 @@ const _: () = assert!(
         && BGR10A2_ALPHA_SHIFT + BGR10A2_ALPHA_MASK.count_ones() == u32::BITS
 );
 
-/// One `BGR10A2Unorm` word read as the four channels a semantic RGBA8 frame
+/// Which end of the packed ten-bit word red occupies.
+///
+/// Green and alpha sit in the same bits either way; only red and blue trade
+/// places, the relation `Bgra8` has to `Rgba8` one storage shape up.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TenBitOrder {
+    /// `MTLPixelFormatBGR10A2Unorm`: blue low, red high.
+    Bgr,
+    /// `MTLPixelFormatRGB10A2Unorm`: red low, blue high.
+    Rgb,
+}
+
+impl TenBitOrder {
+    const fn red_shift(self) -> u32 {
+        match self {
+            Self::Bgr => BGR10A2_RED_SHIFT,
+            Self::Rgb => BGR10A2_BLUE_SHIFT,
+        }
+    }
+
+    const fn blue_shift(self) -> u32 {
+        match self {
+            Self::Bgr => BGR10A2_BLUE_SHIFT,
+            Self::Rgb => BGR10A2_RED_SHIFT,
+        }
+    }
+}
+
+/// One packed ten-bit word read as the four channels a semantic RGBA8 frame
 /// holds — the narrowing half of the pair, for the host readback rails.
 ///
 /// A truncation and nothing else: ten bits of unorm become the eight most
@@ -2533,13 +2573,13 @@ const _: () = assert!(
 /// That replication is what makes the pair below an identity on every value a
 /// widened channel can hold, which is the property
 /// `a_packed_ten_bit_texel_survives_the_seed_and_readback_round_trip` checks.
-fn bgr10a2_word_to_rgba8(word: u32) -> [u8; 4] {
+fn ten_bit_word_to_rgba8(word: u32, order: TenBitOrder) -> [u8; 4] {
     let channel = |shift: u32| (((word >> shift) & BGR10A2_COLOR_MASK) >> 2) as u8;
     let alpha = ((word >> BGR10A2_ALPHA_SHIFT) & BGR10A2_ALPHA_MASK) as u8;
     let mut out = [0u8; COMPONENT_COUNT];
-    out[COMPONENT_R] = channel(BGR10A2_RED_SHIFT);
+    out[COMPONENT_R] = channel(order.red_shift());
     out[COMPONENT_G] = channel(BGR10A2_GREEN_SHIFT);
-    out[COMPONENT_B] = channel(BGR10A2_BLUE_SHIFT);
+    out[COMPONENT_B] = channel(order.blue_shift());
     out[COMPONENT_A] = alpha * BGR10A2_ALPHA_REPLICATE;
     out
 }
@@ -2548,22 +2588,22 @@ fn bgr10a2_word_to_rgba8(word: u32) -> [u8; 4] {
 /// across the byte and maps `0b11` to full scale rather than to `0xc0`.
 const BGR10A2_ALPHA_REPLICATE: u8 = 0x55;
 
-/// Four semantic-RGBA8 channels written into one `BGR10A2Unorm` word — the
+/// Four semantic-RGBA8 channels written into one packed ten-bit word — the
 /// widening half, for a CPU `Load` seed and for the CPU Store converter.
 ///
 /// Each colour channel gains two bits and they are filled with the value's own
 /// top two, which is the unorm widening that keeps both endpoints: `0` stays `0`
 /// and `255` becomes `1023`. Alpha loses six bits and keeps its top two, which
-/// is [`bgr10a2_word_to_rgba8`]'s replication inverted.
-fn rgba8_to_bgr10a2_word(rgba: [u8; COMPONENT_COUNT]) -> u32 {
+/// is [`ten_bit_word_to_rgba8`]'s replication inverted.
+fn rgba8_to_ten_bit_word(rgba: [u8; COMPONENT_COUNT], order: TenBitOrder) -> u32 {
     let channel = |v: u8| {
         let v = u32::from(v);
         (v << 2) | (v >> 6)
     };
     (u32::from(rgba[COMPONENT_A]) >> 6) << BGR10A2_ALPHA_SHIFT
-        | channel(rgba[COMPONENT_R]) << BGR10A2_RED_SHIFT
+        | channel(rgba[COMPONENT_R]) << order.red_shift()
         | channel(rgba[COMPONENT_G]) << BGR10A2_GREEN_SHIFT
-        | channel(rgba[COMPONENT_B]) << BGR10A2_BLUE_SHIFT
+        | channel(rgba[COMPONENT_B]) << order.blue_shift()
 }
 
 /// Restate a semantic-RGBA8 frame as `layout`'s own texels.
@@ -2665,13 +2705,19 @@ pub fn expand_rgba8_to_texel(
         // into: an `'l10r'` IOSurface, named `BGR10A2Unorm` by
         // `runtime::objects::iosurface_pixel_format_to_mtl`. A seed is semantic
         // RGBA8, so each channel is widened into the bits it gains rather than
-        // shifted into place — see [`rgba8_to_bgr10a2_word`].
-        TexelLayout::Bgr10a2Unorm => {
+        // shifted into place — see [`rgba8_to_ten_bit_word`]. Its red-low
+        // sibling `RGB10A2Unorm` is what macOS 26's icon renderer draws into.
+        TexelLayout::Bgr10a2Unorm | TexelLayout::Rgb10a2Unorm => {
+            let order = if layout == TexelLayout::Rgb10a2Unorm {
+                TenBitOrder::Rgb
+            } else {
+                TenBitOrder::Bgr
+            };
             for i in 0..px {
                 let (s, d) = (i * RGBA8_BPP as usize, i * RGBA8_BPP as usize);
                 let mut rgba = [0u8; COMPONENT_COUNT];
                 rgba.copy_from_slice(&src_rgba[s..s + COMPONENT_COUNT]);
-                dst[d..d + 4].copy_from_slice(&rgba8_to_bgr10a2_word(rgba).to_le_bytes());
+                dst[d..d + 4].copy_from_slice(&rgba8_to_ten_bit_word(rgba, order).to_le_bytes());
             }
         }
         // Not colour-attachment layouts this device creates a render target at,
@@ -2685,13 +2731,13 @@ pub fn expand_rgba8_to_texel(
         // the arm is trivial to add when one is. Admitting a layout costs three
         // conversions and a census line, so they are added on measurement.
         //
-        // The two remaining packed 32-bit colour layouts are here because
-        // `render_target_bpp` does not admit their formats: no guest has been
+        // The remaining packed 32-bit colour layout is here because
+        // `render_target_bpp` does not admit its format: no guest has been
         // observed declaring a render target in one, so there is no seed to
         // convert and an arm would be a conversion written against nothing. Add
         // both halves together if one is ever measured — the obligation
         // `render_target_bpp` states runs in that direction, and `Bgr10a2Unorm`
-        // is the member that has now been measured and moved out.
+        // and `Rgb10a2Unorm` are the members that have been measured and moved out.
         TexelLayout::Rg8
         | TexelLayout::R32Float
         | TexelLayout::R16Unorm
@@ -2699,7 +2745,6 @@ pub fn expand_rgba8_to_texel(
         | TexelLayout::Rg16Uint
         | TexelLayout::Rgba32Float
         | TexelLayout::Rgba16Unorm
-        | TexelLayout::Rgb10a2Unorm
         | TexelLayout::Rg11b10Float => return false,
         // A BC layout is never a render target, so it never has a `Load` seed to
         // widen. `render_target_bpp` has no arm for any BC format, which is what
@@ -2809,11 +2854,17 @@ pub fn narrow_texel_to_rgba8(
         // two-bit alpha replicated out. `expand_rgba8_to_texel` is the inverse.
         // This is the *fallback* rail — a host with no guest-RAM import, where
         // refusing would lose the frame outright rather than quantize it.
-        TexelLayout::Bgr10a2Unorm => {
+        TexelLayout::Bgr10a2Unorm | TexelLayout::Rgb10a2Unorm => {
+            let order = if layout == TexelLayout::Rgb10a2Unorm {
+                TenBitOrder::Rgb
+            } else {
+                TenBitOrder::Bgr
+            };
             for i in 0..px {
                 let (s, d) = (i * RGBA8_BPP as usize, i * RGBA8_BPP as usize);
                 let word = u32::from_le_bytes([src[s], src[s + 1], src[s + 2], src[s + 3]]);
-                dst_rgba[d..d + COMPONENT_COUNT].copy_from_slice(&bgr10a2_word_to_rgba8(word));
+                dst_rgba[d..d + COMPONENT_COUNT]
+                    .copy_from_slice(&ten_bit_word_to_rgba8(word, order));
             }
         }
         TexelLayout::Rg8
@@ -2823,7 +2874,6 @@ pub fn narrow_texel_to_rgba8(
         | TexelLayout::Rg16Uint
         | TexelLayout::Rgba32Float
         | TexelLayout::Rgba16Unorm
-        | TexelLayout::Rgb10a2Unorm
         | TexelLayout::Rg11b10Float => return false,
         // Nothing reads a BC resident back: there is no BC render target to read
         // back from, and a sampled BC image is never the source of a readback.
@@ -2965,7 +3015,11 @@ pub fn rgba8_to_texel(format: u16, rgba: [u8; 4], dst: &mut [u8]) -> bool {
             // — a seed only ever carries eight bits — which is why
             // `store_texel_order` admits this format so the byte copy is what
             // normally runs.
-            dst[..4].copy_from_slice(&rgba8_to_bgr10a2_word(rgba).to_le_bytes());
+            dst[..4].copy_from_slice(&rgba8_to_ten_bit_word(rgba, TenBitOrder::Bgr).to_le_bytes());
+        }
+        MTL_FORMAT_RGB10A2_UNORM => {
+            // The same obligation for the red-low sibling.
+            dst[..4].copy_from_slice(&rgba8_to_ten_bit_word(rgba, TenBitOrder::Rgb).to_le_bytes());
         }
         _ => return false,
     }
@@ -3289,6 +3343,8 @@ pub enum Rgba8ToRow {
     Rgba16Float,
     /// Ten bits per colour channel and two of alpha in one packed word.
     Bgr10A2,
+    /// The same packed word with red in the low bits.
+    Rgb10A2,
 }
 
 impl Rgba8ToRow {
@@ -3303,6 +3359,7 @@ impl Rgba8ToRow {
             MTL_FORMAT_RG16_FLOAT => Self::Rg16Float,
             MTL_FORMAT_RGBA16_FLOAT => Self::Rgba16Float,
             MTL_FORMAT_BGR10A2_UNORM => Self::Bgr10A2,
+            MTL_FORMAT_RGB10A2_UNORM => Self::Rgb10A2,
             _ => return None,
         })
     }
@@ -3312,7 +3369,9 @@ impl Rgba8ToRow {
         match self {
             Self::R8 => 1,
             Self::R16Float => RG8_BPP,
-            Self::Rgba8 | Self::Bgra8 | Self::Rg16Float | Self::Bgr10A2 => RGBA8_BPP,
+            Self::Rgba8 | Self::Bgra8 | Self::Rg16Float | Self::Bgr10A2 | Self::Rgb10A2 => {
+                RGBA8_BPP
+            }
             Self::Rgba16Float => RGBA16F_BPP,
         }
     }
@@ -3376,11 +3435,16 @@ impl Rgba8ToRow {
                     d.copy_from_slice(&(r | (g << 16) | (b << 32) | (a << 48)).to_le_bytes());
                 }
             }
-            Self::Bgr10A2 => {
+            Self::Bgr10A2 | Self::Rgb10A2 => {
+                let order = if self == Self::Rgb10A2 {
+                    TenBitOrder::Rgb
+                } else {
+                    TenBitOrder::Bgr
+                };
                 for (s, d) in src.chunks_exact(4).zip(dst.chunks_exact_mut(4)) {
                     let mut texel = [0u8; 4];
                     texel.copy_from_slice(s);
-                    d.copy_from_slice(&rgba8_to_bgr10a2_word(texel).to_le_bytes());
+                    d.copy_from_slice(&rgba8_to_ten_bit_word(texel, order).to_le_bytes());
                 }
             }
         }
@@ -3777,7 +3841,7 @@ mod tests {
         }
         // A guard on the walk itself: an admission set that silently emptied
         // would satisfy every assertion above.
-        assert_eq!(admitted, 10, "the admitted colour render target formats");
+        assert_eq!(admitted, 11, "the admitted colour render target formats");
     }
 
     /// An integer texel has no semantic eight-bit solid colour.
@@ -3827,7 +3891,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("render target {format:#x} cannot publish its clear"));
             assert_eq!(image.pixels().len(), image.row_bytes() as usize * 2);
         }
-        assert_eq!(admitted, 10, "the admitted colour render target formats");
+        assert_eq!(admitted, 11, "the admitted colour render target formats");
 
         let integer = solid_clear_image(MTL_FORMAT_RG16_UINT, 2, 2, &clear)
             .expect("RG16Uint is an admitted render target");
@@ -3959,6 +4023,7 @@ mod tests {
                 SampledClass::Rgba16Float => TexelLayout::Rgba16Float,
                 SampledClass::Rg16Float => TexelLayout::Rg16Float,
                 SampledClass::Bgr10a2Unorm => TexelLayout::Bgr10a2Unorm,
+                SampledClass::Rgb10a2Unorm => TexelLayout::Rgb10a2Unorm,
                 SampledClass::Rg16Uint => TexelLayout::Rg16Uint,
                 SampledClass::Rgba32Float => TexelLayout::Rgba32Float,
             });
@@ -4810,6 +4875,7 @@ mod tests {
                     TexelLayout::Bgra8 => SampledClass::Bgra8Unorm,
                     TexelLayout::Rgba16Float => SampledClass::Rgba16Float,
                     TexelLayout::Bgr10a2Unorm => SampledClass::Bgr10a2Unorm,
+                    TexelLayout::Rgb10a2Unorm => SampledClass::Rgb10a2Unorm,
                     TexelLayout::Rg16Uint => SampledClass::Rg16Uint,
                     // Named rather than defaulted. This arm used to be
                     // `_ => SampledClass::Bgra8Unorm`, which was true only while
@@ -4870,9 +4936,9 @@ mod tests {
             for a in [0u8, 0x55, 0xaa, 0xff] {
                 let mut src = rgba;
                 src[COMPONENT_A] = a;
-                let word = rgba8_to_bgr10a2_word(src);
+                let word = rgba8_to_ten_bit_word(src, TenBitOrder::Bgr);
                 assert_eq!(
-                    bgr10a2_word_to_rgba8(word),
+                    ten_bit_word_to_rgba8(word, TenBitOrder::Bgr),
                     src,
                     "{src:?} did not survive the pair (word {word:#010x})"
                 );
@@ -4880,10 +4946,22 @@ mod tests {
         }
         // The endpoints of the widening, stated as words so a channel landing in
         // the wrong bits fails here rather than in a frame.
-        assert_eq!(rgba8_to_bgr10a2_word([0, 0, 0, 0xff]), 0xc000_0000);
-        assert_eq!(rgba8_to_bgr10a2_word([0xff, 0, 0, 0]), 0x3ff << 20);
-        assert_eq!(rgba8_to_bgr10a2_word([0, 0xff, 0, 0]), 0x3ff << 10);
-        assert_eq!(rgba8_to_bgr10a2_word([0, 0, 0xff, 0]), 0x3ff);
+        assert_eq!(
+            rgba8_to_ten_bit_word([0, 0, 0, 0xff], TenBitOrder::Bgr),
+            0xc000_0000
+        );
+        assert_eq!(
+            rgba8_to_ten_bit_word([0xff, 0, 0, 0], TenBitOrder::Bgr),
+            0x3ff << 20
+        );
+        assert_eq!(
+            rgba8_to_ten_bit_word([0, 0xff, 0, 0], TenBitOrder::Bgr),
+            0x3ff << 10
+        );
+        assert_eq!(
+            rgba8_to_ten_bit_word([0, 0, 0xff, 0], TenBitOrder::Bgr),
+            0x3ff
+        );
         // And the whole-frame wrappers agree with the per-texel pair, so a
         // caller cannot be served a different conversion by going through the
         // row functions the rails actually call.
@@ -4915,7 +4993,89 @@ mod tests {
         ));
         assert_eq!(
             u32::from_le_bytes(one),
-            rgba8_to_bgr10a2_word([12, 34, 56, 0xff])
+            rgba8_to_ten_bit_word([12, 34, 56, 0xff], TenBitOrder::Bgr)
+        );
+    }
+
+    /// `RGB10A2Unorm` is the same word with red and blue exchanged, on every
+    /// rail: red lands in the low ten bits — the bits
+    /// `VK_FORMAT_A2B10G10R10_UNORM_PACK32` reads red from — and the three
+    /// conversion rails round-trip a frame through that order.
+    ///
+    /// macOS 26's icon renderer draws into linear targets of this format; each
+    /// was refused as `rt_resolve reason=rt_linear_format fmt=0x5a` and every
+    /// app icon came back blank.
+    #[test]
+    fn the_red_low_ten_bit_word_is_the_blue_low_one_mirrored() {
+        assert_eq!(
+            rgba8_to_ten_bit_word([0xff, 0, 0, 0], TenBitOrder::Rgb),
+            0x3ff
+        );
+        assert_eq!(
+            rgba8_to_ten_bit_word([0, 0xff, 0, 0], TenBitOrder::Rgb),
+            0x3ff << 10
+        );
+        assert_eq!(
+            rgba8_to_ten_bit_word([0, 0, 0xff, 0], TenBitOrder::Rgb),
+            0x3ff << 20
+        );
+        assert_eq!(
+            rgba8_to_ten_bit_word([0, 0, 0, 0xff], TenBitOrder::Rgb),
+            0xc000_0000
+        );
+        assert_eq!(
+            ten_bit_word_to_rgba8(0x3ff, TenBitOrder::Rgb),
+            [0xff, 0, 0, 0],
+            "red is read from the low bits"
+        );
+
+        let rgba: Vec<u8> = (0u8..=63)
+            .flat_map(|v| [v << 2, 255 - v, v, 0xff])
+            .collect();
+        let pixels = (rgba.len() / 4) as u32;
+        let mut packed = vec![0u8; rgba.len()];
+        assert!(expand_rgba8_to_texel(
+            TexelLayout::Rgb10a2Unorm,
+            &rgba,
+            pixels,
+            &mut packed
+        ));
+        let mut back = vec![0u8; rgba.len()];
+        assert!(narrow_texel_to_rgba8(
+            TexelLayout::Rgb10a2Unorm,
+            &packed,
+            pixels,
+            &mut back
+        ));
+        assert_eq!(back, rgba, "the seed and readback rails disagree");
+        let mut row = vec![0u8; rgba.len()];
+        assert!(convert_rgba8_to_row(
+            MTL_FORMAT_RGB10A2_UNORM,
+            &rgba,
+            pixels,
+            &mut row
+        ));
+        assert_eq!(
+            row, packed,
+            "the CPU Store converter and the seed rail disagree"
+        );
+        let mut one = [0u8; 4];
+        assert!(rgba8_to_texel(
+            MTL_FORMAT_RGB10A2_UNORM,
+            [12, 34, 56, 0xff],
+            &mut one
+        ));
+        assert_eq!(
+            u32::from_le_bytes(one),
+            rgba8_to_ten_bit_word([12, 34, 56, 0xff], TenBitOrder::Rgb)
+        );
+        assert_eq!(
+            store_texel_order(MTL_FORMAT_RGB10A2_UNORM),
+            Some(TexelLayout::Rgb10a2Unorm)
+        );
+        assert_eq!(
+            render_target_numeric_type(MTL_FORMAT_RGB10A2_UNORM),
+            Some(ColorNumericType::Float)
         );
     }
 

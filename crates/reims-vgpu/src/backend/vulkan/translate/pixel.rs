@@ -767,6 +767,13 @@ mod tests {
                 // decline it and this rail is where that decline appears. The
                 // NVIDIA host it was measured on advertises it.
                 p::MTL_FORMAT_BGR10A2_UNORM,
+                // Its red-low sibling, which macOS 26's icon renderer draws
+                // into as linear GVA targets — every one refused as
+                // `rt_resolve reason=rt_linear_format fmt=0x5a`, and every app
+                // icon blank. Its Vulkan twin `A2B10G10R10_UNORM_PACK32`, unlike
+                // the member above, *is* mandated for colour attachment and
+                // blend, so no host can decline it.
+                p::MTL_FORMAT_RGB10A2_UNORM,
                 // The first **integer** colour attachment, and the one that
                 // could not be admitted by adding a table entry. A macos-15
                 // guest renders into linear `RG16Uint` targets, and every pass
