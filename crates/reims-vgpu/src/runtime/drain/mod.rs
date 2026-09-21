@@ -458,6 +458,31 @@ fn apply_delete_object<H: HostMemory + HostOps>(
                 } else {
                     "pipeline_retire_absent"
                 });
+                // **And the name ends with it.** The pipeline table's entry is a
+                // tombstone keyed by this name, so a name that outlived the
+                // delete is one the guest's *next* pipeline in this slot
+                // inherits: `name_resource` answers from the live name without
+                // re-reading the list, the table answers `Retired` for it, and
+                // `waits_for` reads `Retired` as nothing to wait on. The packet
+                // is released while the new pipeline's shaders are still
+                // translating and its first draw is dropped as
+                // `m2v_translation_pending_at_sync_boundary` with
+                // `model_pipeline=retired`. macOS 26's icon agent builds and
+                // deletes pipelines per icon, and lost the one draw each icon
+                // is made of — every app icon blank.
+                //
+                // The name only, under the same gate as the table entry above:
+                // the slot stops resolving, accepted work keeps what it
+                // resolved, and the next declaration in the slot mints a new
+                // generation the table has never seen. Not `delete_object` —
+                // the object table and the host copies are keyed by the same
+                // integer in the resource space, and
+                // `a_delete_object_never_retires_an_object_table_entry_its_ref_collides_with`
+                // holds that no destroy record crosses into them.
+                note_store_route(match state.retire_object_name(task_id, name) {
+                    Some(_) => "pipeline_name_retired",
+                    None => "pipeline_name_retire_absent",
+                });
             } else {
                 note_store_route("pipeline_retire_unnamed");
             }

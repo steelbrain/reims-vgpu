@@ -6270,6 +6270,101 @@ fn a_pipeline_destroy_whose_ref_names_another_kind_retires_no_pipeline() {
     );
 }
 
+/// A pipeline destroy ends the pipeline's *name*, so the slot's next pipeline is
+/// a new one the table waits on.
+///
+/// The table entry is a tombstone keyed by the name. When the name survived the
+/// destroy, the guest's next pipeline in the same slot resolved to it, the table
+/// answered `Retired`, and `waits_for` reads `Retired` as nothing to wait on: the
+/// packet ran while the new pipeline's shaders were still translating and its
+/// first draw was dropped (`m2v_translation_pending_at_sync_boundary`,
+/// `model_pipeline=retired`). macOS 26's icon agent builds and deletes a
+/// pipeline per icon and lost the one draw each icon is — every app icon blank.
+#[test]
+fn a_pipeline_destroy_ends_the_name_so_the_slots_next_pipeline_is_waited_on() {
+    use crate::protocol::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+    use reims_vgpu_core::pipeline::PipelineState;
+    use reims_vgpu_wire::ops::destroy::{DELETE_TOTAL_LEN, OPCODE_DELETE_RENDER_PIPELINE_STATE};
+
+    const TASK: u32 = 2;
+    const REF: u32 = 3;
+
+    // The sibling test's page table, with the list slot left zero: the guest
+    // clears its own entry before it sends the destroy, which is the ordinary
+    // case and the one that retires.
+    let mut host = FakeHost::new();
+    let dir_gpa = 2u64 << PAGE_SHIFT_X86;
+    let root_gpa = 3u64 << PAGE_SHIFT_X86;
+    let data_gpa = 4u64 << PAGE_SHIFT_X86;
+    host.map_range(dir_gpa, 0x20, 0);
+    host.map_range(root_gpa, 0x4000, 0);
+    host.map_range(data_gpa, 0x200, 0);
+    let mut d = [0u8; 8];
+    st32(&mut d[DIRECTORY_ROOT_PFN as usize..], 3);
+    st32(&mut d[DIRECTORY_DEPTH as usize..], 1);
+    let _ = host.write_gpa(dir_gpa, &d);
+    st32(&mut d[..4], 4);
+    let _ = host.write_gpa(root_gpa, &d[..4]);
+
+    let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
+    state.define_task(TASK, 0x1000, 2);
+    assert!(state.set_object_list(TASK, 0, 8));
+
+    let old = state
+        .declare_object(TASK, REF, reims_vgpu_core::lifecycle::Storage::NoBytes)
+        .expect("the task is open")
+        .id;
+    assert!(state.declare_pipeline(old));
+    state.advance_pipeline(old, PipelineState::Translating);
+    state.advance_pipeline(old, PipelineState::Compiling);
+    assert!(state.ready_pipeline(old));
+
+    let mut payload = vec![0u8; 4 + DELETE_TOTAL_LEN as usize];
+    st32(&mut payload[0..], TASK);
+    st32(&mut payload[4..], OPCODE_DELETE_RENDER_PIPELINE_STATE);
+    st32(&mut payload[8..], DELETE_TOTAL_LEN);
+    st32(&mut payload[12..], REF);
+    process_child_packet(
+        &mut state,
+        &mut host,
+        4,
+        &Packet {
+            opcode: CHILD_OP_DELETE_OBJECT,
+            stamp_waits: Vec::new(),
+            total_size: PACKET_HEADER_LEN + payload.len() as u32,
+            completion_stamp: 0,
+            payload,
+            next_head: 0,
+        },
+    );
+
+    assert_eq!(
+        state.pipeline_state(old),
+        Some("retired"),
+        "the guest deleted the pipeline"
+    );
+    assert_eq!(
+        state.object_name(TASK, REF),
+        None,
+        "a name that outlives the destroy is inherited by the slot's next pipeline"
+    );
+
+    // The guest's next pipeline in the slot.
+    let new = state
+        .declare_object(TASK, REF, reims_vgpu_core::lifecycle::Storage::NoBytes)
+        .expect("the task is open")
+        .id;
+    assert_ne!(new, old, "the slot's next occupant is a new generation");
+    assert!(
+        state.declare_pipeline(new),
+        "the table has never seen the new name"
+    );
+    assert!(
+        !state.pipeline_is_ready(new),
+        "and it is not ready until it is built, so a packet binding it waits"
+    );
+}
+
 /// `CmdDeleteObject` must not retire an object-table entry, however exactly its
 /// record's ref matches one.
 ///
