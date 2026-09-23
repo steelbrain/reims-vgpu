@@ -306,6 +306,11 @@ pub(crate) struct ResourcePools {
     /// `staging_hits + staging_misses` at the previous maintenance pass; see
     /// `note_maintenance_settled`.
     settled_staging_mark: u64,
+    /// Last maintenance clock at which a staging acquire was observed. A short
+    /// quiet gap is not sufficient evidence that the upload workload is done:
+    /// periodic guest updates can otherwise cause a staging buffer to be
+    /// destroyed and synchronously reallocated on the next update.
+    last_staging_activity_ms: Option<u64>,
     /// Target images + framebuffers keyed by geometry + render_pass identity.
     targets: HashMap<(TargetKey, u64), TargetSlot>, // u64 = render_pass as u64
     target_order: Vec<(TargetKey, u64)>,
@@ -2935,6 +2940,13 @@ const IDLE_RECYCLE_TRIM_PER_PASS: usize = 8;
 /// climbs and the buffers drain to zero within a few hundred ms of settling.
 const SETTLED_PASSES_FOR_BUFFER_TRIM: u32 = 3;
 
+/// Minimum quiet interval before trimming host-visible buffers. The pass count
+/// above rejects continuous traffic; this grace period also protects periodic
+/// workloads whose updates are farther apart than a few maintenance ticks.
+/// Keeping an idle buffer briefly is preferable to paying a synchronous Vulkan
+/// allocation on the next guest update.
+const STAGING_BUFFER_TRIM_IDLE_MS: u64 = 90_000;
+
 /// Empty image-slab blocks retained once idle has **settled**.
 /// `slab::SLAB_KEEP_EMPTY` (2) is the churn buffer the hot release path keeps
 /// mid-burst; at settled idle the drain trims all the way to zero so no empty
@@ -3405,6 +3417,10 @@ pub(crate) enum AllocSite {
     /// comparing a new `staging_block` figure against an old `staging` one
     /// would be comparing block allocations against buffer allocations.
     StagingBlock,
+    /// A dedicated HOST_VISIBLE staging allocation. This is the conservative
+    /// path for CPU-written staging slots: its mapping is created only for the
+    /// write and cannot outlive the slot's own allocation.
+    StagingBuffer,
     Readback,
     ReadbackMulti,
     SlabBlock,
@@ -3422,7 +3438,7 @@ pub(crate) enum AllocSite {
     GuestGatherBlock,
 }
 
-const ALLOC_SITE_N: usize = 9;
+const ALLOC_SITE_N: usize = 10;
 
 impl AllocSite {
     const fn idx(self) -> usize {
@@ -3432,10 +3448,11 @@ impl AllocSite {
             AllocSite::TransientDepth => 2,
             AllocSite::DepthResident => 3,
             AllocSite::StagingBlock => 4,
-            AllocSite::Readback => 5,
-            AllocSite::ReadbackMulti => 6,
-            AllocSite::SlabBlock => 7,
-            AllocSite::GuestGatherBlock => 8,
+            AllocSite::StagingBuffer => 5,
+            AllocSite::Readback => 6,
+            AllocSite::ReadbackMulti => 7,
+            AllocSite::SlabBlock => 8,
+            AllocSite::GuestGatherBlock => 9,
         }
     }
 }
@@ -3446,6 +3463,7 @@ const ALLOC_SITE_NAMES: [&str; ALLOC_SITE_N] = [
     "transient_depth",
     "depth_resident",
     "staging_block",
+    "staging_buffer",
     "readback",
     "readback_multi",
     "slab_block",
@@ -3530,6 +3548,7 @@ pub(crate) struct SlowStagingWrite {
     bytes: u64,
     runs: usize,
     started: std::time::Instant,
+    detail: Option<String>,
 }
 
 /// Below this a staging step is ordinary work. A frame at 60 Hz is 16.7 ms; the
@@ -3540,6 +3559,14 @@ const SLOW_STAGING_WRITE_US: u64 = 20_000;
 const SLOW_STAGING_LINE_CAP: u64 = 256;
 static SLOW_STAGING_LINES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Enable per-stage timestamps only in a diagnostic runtime. Pool misses are
+/// frequent enough that even a few extra clock reads should not tax normal
+/// rendering.
+pub(crate) fn slow_staging_detail_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("REIMS_VGPU_STAGING_DETAIL").is_some())
+}
+
 impl SlowStagingWrite {
     pub(crate) fn watch(kind: &'static str, bytes: u64, runs: usize) -> Self {
         Self {
@@ -3547,6 +3574,14 @@ impl SlowStagingWrite {
             bytes,
             runs,
             started: std::time::Instant::now(),
+            detail: None,
+        }
+    }
+
+    /// Attach expensive-path context without formatting it on ordinary calls.
+    pub(crate) fn detail_when_slow(&mut self, detail: impl FnOnce() -> String) {
+        if self.started.elapsed().as_micros() as u64 >= SLOW_STAGING_WRITE_US {
+            self.detail = Some(detail());
         }
     }
 }
@@ -3561,11 +3596,16 @@ impl Drop for SlowStagingWrite {
         if n >= SLOW_STAGING_LINE_CAP {
             return;
         }
+        let detail = self
+            .detail
+            .as_deref()
+            .map_or_else(String::new, |detail| format!(" detail={detail}"));
         crate::observe::off(format!(
-            "staging_write_slow kind={} us={us} bytes={} runs={}{}",
+            "staging_write_slow kind={} us={us} bytes={} runs={}{}{}",
             self.kind,
             self.bytes,
             self.runs,
+            detail,
             if n + 1 == SLOW_STAGING_LINE_CAP {
                 " (last: report cap reached)"
             } else {
@@ -3892,8 +3932,9 @@ pub(crate) fn slot_span_fits(size: u64, slot_size: u64) -> bool {
 /// Staging slots are mapped for their lifetime at allocation, so this is a field
 /// read. The fallback map exists for a slot that predates the persistent
 /// mapping or was built by a path that does not map — it is the same
-/// map-per-write the pools used to do everywhere, and it leaks nothing because
-/// `vkFreeMemory` unmaps implicitly.
+/// map-per-write the pools used to do everywhere. The boolean in the return
+/// value tells the caller to unmap after its copy; keeping that lifetime at the
+/// call site prevents a second map of the same dedicated allocation.
 ///
 /// # Why the length is checked here and not left to the caller
 ///
@@ -3914,7 +3955,7 @@ unsafe fn staging_write_ptr(
     ctx: &DeviceContext,
     slot: &BufferSlot,
     size: u64,
-) -> Result<*mut u8, DrawError> {
+) -> Result<(*mut u8, bool), DrawError> {
     if !slot_span_fits(size, slot.size) {
         return Err(DrawError::DrawExecution(
             super::draw_execution::DrawExecutionDecline::StagingWriteBeyondSlot {
@@ -3924,12 +3965,15 @@ unsafe fn staging_write_ptr(
         ));
     }
     if slot.mapped != 0 {
-        return Ok(slot.mapped as *mut u8);
+        return Ok((slot.mapped as *mut u8, false));
     }
-    Ok(ctx
-        .device
-        .map_memory(slot.memory, 0, size, vk::MemoryMapFlags::empty())
-        .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::PoolsMapStaging, e)))? as *mut u8)
+    Ok((
+        ctx.device
+            .map_memory(slot.memory, 0, size, vk::MemoryMapFlags::empty())
+            .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::PoolsMapStaging, e)))?
+            as *mut u8,
+        true,
+    ))
 }
 
 /// Copy the first `len` bytes out of a readback slot, invalidating first when the
@@ -4047,7 +4091,10 @@ pub(super) unsafe fn invalidate_slot_for_read(
 
 #[cfg(test)]
 mod staging_mapping_tests {
-    use super::{readback_leases_outstanding, return_readback_lease, DeviceContext, ResourcePools};
+    use super::{
+        readback_leases_outstanding, return_readback_lease, BufferBacking, DeviceContext,
+        ResourcePools,
+    };
     use crate::backend::vulkan::engine::counters::EngineCounters;
 
     /// A staging slot carries its own host mapping, and keeps it across recycle.
@@ -4091,6 +4138,57 @@ mod staging_mapping_tests {
             again.mapped, first.mapped,
             "a recycled slot lost its mapping and would map per write again"
         );
+
+        pools.recycle_staging();
+        unsafe { pools.destroy_all(&ctx.device) };
+        unsafe { ctx.destroy() };
+    }
+
+    /// CPU guest-run snapshots must not retain the persistent slab mapping.
+    #[test]
+    fn a_cpu_snapshot_slot_maps_only_for_the_write() {
+        crate::observe::redirect_logs_for_tests();
+        let mut ctx = match unsafe { DeviceContext::create() } {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("SKIP CPU snapshot mapping: no device ({e})");
+                return;
+            }
+        };
+        let counters = EngineCounters::default();
+        let mut pools = ResourcePools::new();
+
+        let persistent = unsafe { pools.acquire_staging(&ctx, 4096, &counters) }
+            .expect("a persistent staging slot must be available");
+        pools.recycle_staging();
+
+        let first = unsafe { pools.acquire_staging_cpu_snapshot(&ctx, 4096, &counters) }
+            .expect("a CPU snapshot slot must be available");
+        assert_ne!(
+            first.buffer, persistent.buffer,
+            "CPU snapshots must not reuse a persistent staging slot"
+        );
+        assert_eq!(
+            first.mapped, 0,
+            "CPU snapshots must not retain a host pointer"
+        );
+        assert!(
+            matches!(first.backing, BufferBacking::Dedicated),
+            "CPU snapshots must own their allocation"
+        );
+        let payload = vec![0x5a; 4096];
+        unsafe { pools.write_staging(&ctx, &first, &payload) }.expect("snapshot write must land");
+
+        pools.recycle_staging();
+        let again = unsafe { pools.acquire_staging_cpu_snapshot(&ctx, 4096, &counters) }
+            .expect("the CPU snapshot slot must recycle");
+        assert_eq!(again.buffer, first.buffer, "expected the recycled slot");
+        assert_eq!(
+            again.mapped, 0,
+            "recycling must not restore a stale pointer"
+        );
+        unsafe { pools.write_staging(&ctx, &again, &payload) }
+            .expect("a recycled CPU snapshot must map, write, and unmap again");
 
         pools.recycle_staging();
         unsafe { pools.destroy_all(&ctx.device) };

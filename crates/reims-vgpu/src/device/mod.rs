@@ -43,6 +43,8 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::qemu::host_ops::{NullHost, QemuHost, ReimsVgpuHostOps};
+#[cfg(feature = "host-window")]
+use crate::runtime::host::HostActionKind;
 // The four names the two chapter modules below reach through `use super::*`,
 // and this module uses itself. They were the crate root's "convenience
 // re-exports used by qemu ABI and tests" and came with the registry.
@@ -130,6 +132,14 @@ struct BoundDevice {
     /// boot (the window is opt-in behind `REIMS_VGPU_WINDOW`).
     #[cfg(feature = "host-window")]
     window: Mutex<Option<window_publish::WindowLink>>,
+    /// Cursor publication is deliberately independent from `window`: the
+    /// QEMU BH pops cursor actions on its main loop, while frame publication
+    /// can hold `window` across a Vulkan resident lookup/copy. Coupling the two
+    /// lets a cosmetic cursor update stall every guest-facing BH action.
+    #[cfg(feature = "host-window")]
+    window_cursor: crate::host_window::present::CursorSlot,
+    #[cfg(feature = "host-window")]
+    window_wake: crate::host_window::present::WindowWakeHandle,
     /// Early-boot framebuffer (BAR1 GOP) registered by the C shim, shown in the
     /// window until the product present path latches.
     #[cfg(feature = "host-window")]
@@ -258,6 +268,10 @@ pub fn device_create(ops: Option<ReimsVgpuHostOps>, page_shift: u32) -> Option<u
             ops,
             #[cfg(feature = "host-window")]
             window: Mutex::new(None),
+            #[cfg(feature = "host-window")]
+            window_cursor: Arc::new(std::sync::Mutex::new(Default::default())),
+            #[cfg(feature = "host-window")]
+            window_wake: crate::host_window::present::WindowWaker::new(),
             #[cfg(feature = "host-window")]
             early_fb: Mutex::new(None),
             #[cfg(feature = "host-window")]
@@ -793,11 +807,37 @@ pub fn device_pop_action(id: u64) -> Option<HostAction> {
             if q.is_empty() {
                 crate::runtime::drain::note_irq_delivered();
             }
+            #[cfg(feature = "host-window")]
+            if a.kind == HostActionKind::CursorUpdate {
+                drop(q);
+                window_publish::mirror_guest_cursor_update(&slot, a);
+                return Some(a);
+            }
             return Some(a);
         }
     }
     let mut d = slot.inner.try_lock()?;
-    d.actions.pop_front()
+    let action = d.actions.pop_front();
+    #[cfg(feature = "host-window")]
+    let cursor_snapshot = if action.is_some_and(|a| a.kind == HostActionKind::CursorGlyph) {
+        Some(crate::host_window::present::snapshot_guest_cursor(
+            &d.device.state.cursor,
+            0,
+        ))
+    } else {
+        None
+    };
+    drop(d);
+    #[cfg(feature = "host-window")]
+    if let Some(snapshot) = cursor_snapshot {
+        match snapshot {
+            Ok(snapshot) => window_publish::mirror_guest_cursor_glyph(&slot, snapshot),
+            Err(error) => {
+                crate::observe::fail(format!("host_window_guest_cursor_fail reason={error:?}"))
+            }
+        }
+    }
+    action
 }
 
 /// What the process's backend calls itself, for QEMU's realize trace.

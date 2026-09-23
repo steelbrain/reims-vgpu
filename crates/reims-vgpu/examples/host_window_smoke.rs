@@ -32,7 +32,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use reims_vgpu::host_window::present::{
-    spawn, Frame, FrameSlot, WindowConfig, WindowMode, WindowWaker,
+    spawn, CursorSlot, Frame, FrameSlot, FullscreenStrategy, GuestCursorState, WindowConfig,
+    WindowMode, WindowWaker,
 };
 
 fn main() {
@@ -42,6 +43,7 @@ fn main() {
     // for the device's publisher — without it the gradient would advance only at
     // the window's backstop rate rather than at the 62 Hz below.
     let wake = WindowWaker::new();
+    let cursor_slot: CursorSlot = Arc::new(Mutex::new(GuestCursorState::default()));
 
     // Animate the gradient on a helper thread so the window shows live updates.
     let anim = frames.clone();
@@ -69,9 +71,11 @@ fn main() {
             width: w,
             height: h,
             mode: WindowMode::requested(),
+            strategy: FullscreenStrategy::requested(WindowMode::requested()),
         },
         on_input,
         frames,
+        cursor_slot,
         stop,
         wake,
     );

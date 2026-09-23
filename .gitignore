@@ -33,6 +33,9 @@ __pycache__/
 !/vm/rail-debug-posture.sh
 !/vm/rail-sweep.sh
 !/vm/drive-desktop.sh
+!/vm/window-system-env.sh
+!/vm/tests/
+!/vm/tests/window-system-env-test.sh
 vm/debug/
 vm/logs/
 # OVMF firmware blobs (CODE/VARS .fd) — large binary runtime, never commit
@@ -55,6 +58,13 @@ Vulkan-Headers/
 
 # vendor/qemu is a git submodule (steelbrain/qemu-reims-vgpu, branch host-reims-vgpu-vmapple).
 # Its own build/ output is ignored by QEMU's own .gitignore.
+
+# OSX-KVM is an attributed source submodule; downloaded Apple media and local
+# conversion outputs remain outside Git.
+/third_party/OSX-KVM/BaseSystem.*
+/third_party/OSX-KVM/*.dmg
+/third_party/OSX-KVM/*.img
+/third_party/OSX-KVM/*.qcow2
 
 # In-workspace vmapple guest bundle (provisioned by scripts/vmapple-provision;
 # disk/aux images + instance-specific vm.json + per-boot run scratch). Large/private.

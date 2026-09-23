@@ -109,6 +109,18 @@ def main():
         d = msg(ctypes.c_void_p, arr, b"objectAtIndex:", ctypes.c_ulonglong(0))
         print("(reporting MTLCopyAllDevices[0] instead)")
     print("name                        :", nsstring(msg(ctypes.c_void_p, d, b"name")))
+    supports_opengl_sel = objc.sel_registerName(b"supportsOpenGL")
+    supports_opengl_available = msg(
+        ctypes.c_bool,
+        d,
+        b"respondsToSelector:",
+        ctypes.c_void_p(supports_opengl_sel),
+    )
+    if supports_opengl_available:
+        supports_opengl = msg(ctypes.c_bool, d, b"supportsOpenGL")
+        print("supportsOpenGL              :", supports_opengl)
+    else:
+        print("supportsOpenGL              :", "selector unavailable")
     print("registryID                  :", msg(ctypes.c_ulonglong, d, b"registryID"))
     print("location                    :", msg(ctypes.c_ulonglong, d, b"location"))
     print("lowPower                    :", msg(ctypes.c_bool, d, b"isLowPower"))

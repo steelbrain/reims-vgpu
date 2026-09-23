@@ -10,6 +10,7 @@
 use ash::vk;
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::OnceLock;
 use std::time::Instant;
 
 use super::context::DeviceContext;
@@ -43,6 +44,53 @@ use crate::backend::vulkan::translate;
 /// and a presenter that had to reach into it to say "I am still running" would
 /// be the coupling that move exists to remove.
 static WINDOW_PRESENTS_IN_FLIGHT: AtomicU32 = AtomicU32::new(0);
+
+/// Diagnostic A/B switch for the resident-vs-CPU window source.
+///
+/// The normal path prefers the engine resident. The screenshot evidence from
+/// T009 shows a stable, corrupted frame being reused, so this switch lets a
+/// controlled runtime bypass that choice without changing the production
+/// default or the guest protocol. A corrected image here implicates resident
+/// content or its handoff; an unchanged image implicates the guest CPU frame
+/// or its writeback instead.
+static FORCE_CPU_WINDOW_PRESENT: OnceLock<bool> = OnceLock::new();
+static FORCE_COPY_WINDOW_PRESENT: OnceLock<bool> = OnceLock::new();
+static FRAME_TIMING: OnceLock<bool> = OnceLock::new();
+
+fn frame_timing_enabled() -> bool {
+    *FRAME_TIMING.get_or_init(|| {
+        matches!(
+            crate::config::read(crate::config::FRAME_TIMING).0,
+            crate::config::Switch::On
+        )
+    })
+}
+
+fn force_cpu_window_present() -> bool {
+    *FORCE_CPU_WINDOW_PRESENT.get_or_init(|| {
+        std::env::var("REIMS_VGPU_WINDOW_FORCE_CPU")
+            .map(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "on" | "true"
+                )
+            })
+            .unwrap_or(false)
+    })
+}
+
+fn force_copy_window_present() -> bool {
+    *FORCE_COPY_WINDOW_PRESENT.get_or_init(|| {
+        std::env::var("REIMS_VGPU_WINDOW_FORCE_COPY")
+            .map(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "on" | "true"
+                )
+            })
+            .unwrap_or(false)
+    })
+}
 
 /// Whether any host-window present is submitted and unretired.
 pub(crate) fn window_presents_in_flight() -> bool {
@@ -546,6 +594,14 @@ pub(crate) struct WindowPresenter {
     /// no swapchain to acquire from. A minimized window, and its own counter
     /// because `busy = fence + acquire` was an identity worth keeping true.
     cadence_busy_no_area: u64,
+    timing_started: Instant,
+    timing_frames: u64,
+    timing_retire_us: u64,
+    timing_acquire_us: u64,
+    timing_record_us: u64,
+    timing_submit_us: u64,
+    timing_total_us: u64,
+    timing_max_total_us: u64,
     /// Whether the run in progress is a window with no area, so the reason is
     /// stated when the run starts and not on every frame of it.
     surface_had_no_area: bool,
@@ -815,6 +871,14 @@ impl WindowPresenter {
             cadence_busy_fence: 0,
             cadence_busy_acquire: 0,
             cadence_busy_no_area: 0,
+            timing_started: Instant::now(),
+            timing_frames: 0,
+            timing_retire_us: 0,
+            timing_acquire_us: 0,
+            timing_record_us: 0,
+            timing_submit_us: 0,
+            timing_total_us: 0,
+            timing_max_total_us: 0,
             surface_had_no_area: false,
             // Attach refused above unless this was true, so the presenter that
             // exists is one whose queue can address its surface.
@@ -1075,13 +1139,22 @@ impl WindowPresenter {
         source: Option<&WindowPresentSource>,
         cpu: Option<WindowCpuFrame<'_>>,
     ) -> Result<WindowPresentDispatch, DrawError> {
+        let timing = frame_timing_enabled();
+        let total_started = timing.then(Instant::now);
         if let Some(seq) = cpu.map(|frame| frame.seq) {
             if self.cadence_last_offered != Some(seq) {
                 self.cadence_last_offered = Some(seq);
                 self.cadence_offered = self.cadence_offered.saturating_add(1);
             }
         }
-        if !self.retire(ctx)? {
+        let retire_started = timing.then(Instant::now);
+        let retired = self.retire(ctx)?;
+        if let Some(started) = retire_started {
+            self.timing_retire_us = self
+                .timing_retire_us
+                .saturating_add(started.elapsed().as_micros() as u64);
+        }
+        if !retired {
             self.cadence_busy_fence = self.cadence_busy_fence.saturating_add(1);
             self.note_cadence(false, false);
             return Ok(WindowPresentDispatch::Complete(WindowPresentOutcome::Busy));
@@ -1104,9 +1177,15 @@ impl WindowPresenter {
         let frame_cmd = self.frames[frame_ix].cmd;
         let frame_image_available = self.frames[frame_ix].image_available;
         let frame_in_flight = self.frames[frame_ix].in_flight;
+        let acquire_timeout_ns: u64 = std::env::var("REIMS_VGPU_ACQUIRE_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(100)
+            * 1_000_000;
+        let acquire_started = timing.then(Instant::now);
         let (image_index, acquire_suboptimal) = match self.swapchain_loader.acquire_next_image(
             self.swapchain,
-            0,
+            acquire_timeout_ns,
             frame_image_available,
             vk::Fence::null(),
         ) {
@@ -1130,6 +1209,7 @@ impl WindowPresenter {
                 )));
             }
         };
+        let acquire_us = acquire_started.map(|started| started.elapsed().as_micros() as u64);
 
         // Keyed by the acquired image and not by the entry: the acquire is what
         // says this image's previous present has completed, and nothing says
@@ -1168,7 +1248,7 @@ impl WindowPresenter {
         let stale =
             source.is_some_and(|source| source.epoch != super::pools::window_source_epoch());
         let selected = source
-            .filter(|_| !stale)
+            .filter(|_| !stale && !force_cpu_window_present())
             .map(|source| (source.identity.clone(), source.resolved));
         // Only reached when no resident carries this present: upload the CPU
         // bytes instead. `None` here means the window shows slate.
@@ -1210,6 +1290,8 @@ impl WindowPresenter {
             })
             .or(staged);
 
+        let record_started = timing.then(Instant::now);
+        let mut submit_us = None;
         let submit_result = (|| {
             ctx.device
                 .reset_fences(&[frame_in_flight])
@@ -1304,15 +1386,33 @@ impl WindowPresenter {
                     );
                 }
                 let src_layout = blit.record_read_barrier(&ctx.device, frame_cmd);
-                blit_rect(
-                    &ctx.device,
-                    frame_cmd,
-                    blit.image(),
-                    dst,
-                    src_layout,
-                    (0, 0, base_width, base_height),
-                    (vp.x, vp.y, vp.x + vp.width, vp.y + vp.height),
-                );
+                let src_rect = (0, 0, base_width, base_height);
+                let dst_rect = (vp.x, vp.y, vp.x + vp.width, vp.y + vp.height);
+                if force_copy_window_present()
+                    && src_rect == dst_rect
+                    && base_width == self.extent.width
+                    && base_height == self.extent.height
+                {
+                    copy_rect(
+                        &ctx.device,
+                        frame_cmd,
+                        blit.image(),
+                        dst,
+                        src_layout,
+                        base_width,
+                        base_height,
+                    );
+                } else {
+                    blit_rect(
+                        &ctx.device,
+                        frame_cmd,
+                        blit.image(),
+                        dst,
+                        src_layout,
+                        src_rect,
+                        dst_rect,
+                    );
+                }
                 // The window's last contact with the resident registry, and the
                 // one that stays. Two ways out of it were looked for and both
                 // are unsound; recording that here so the third reader does not
@@ -1377,7 +1477,8 @@ impl WindowPresenter {
             let wait_stages = [ACQUIRE_WAIT_STAGE];
             let signals = [frame_render_finished];
             let commands = [frame_cmd];
-            ctx.submit_present_transaction(super::context::PresentTransaction {
+            let submit_started = timing.then(Instant::now);
+            let result = ctx.submit_present_transaction(super::context::PresentTransaction {
                 command_buffers: &commands,
                 wait_semaphores: &waits,
                 wait_stages: &wait_stages,
@@ -1387,12 +1488,33 @@ impl WindowPresenter {
                 present_wait: frame_render_finished,
                 swapchain: self.swapchain,
                 image_index,
-            })
-            .map_err(|error| DrawError::VkCall(VkCall::new(VkOp::WindowSubmitPresent, error)))
+            });
+            if let Some(started) = submit_started {
+                submit_us = Some(started.elapsed().as_micros() as u64);
+            }
+            result.map_err(|error| DrawError::VkCall(VkCall::new(VkOp::WindowSubmitPresent, error)))
         })();
         // A plain `?` now the failure arm has nothing to undo: it used to have to
         // drop the pins this present had taken before returning.
         let submission = submit_result?;
+        if timing {
+            let record_us = record_started
+                .map(|started| started.elapsed().as_micros() as u64)
+                .unwrap_or_default();
+            let submit_us = submit_us.unwrap_or_default();
+            let total_us = total_started
+                .map(|started| started.elapsed().as_micros() as u64)
+                .unwrap_or_default();
+            self.timing_frames = self.timing_frames.saturating_add(1);
+            self.timing_acquire_us = self
+                .timing_acquire_us
+                .saturating_add(acquire_us.unwrap_or_default());
+            self.timing_record_us = self.timing_record_us.saturating_add(record_us);
+            self.timing_submit_us = self.timing_submit_us.saturating_add(submit_us);
+            self.timing_total_us = self.timing_total_us.saturating_add(total_us);
+            self.timing_max_total_us = self.timing_max_total_us.max(total_us);
+            self.note_timing();
+        }
         // Claimed before the latch, so the slot is never observed clear while
         // the latch says an entry is outstanding.
         begin_present_in_flight();
@@ -1433,6 +1555,34 @@ impl WindowPresenter {
                 }))
             }
         }
+    }
+
+    fn note_timing(&mut self) {
+        let elapsed = self.timing_started.elapsed();
+        if elapsed < std::time::Duration::from_secs(1) {
+            return;
+        }
+        let frames = self.timing_frames.max(1);
+        crate::observe::off(format!(
+            "host_window_timing window_ms={} frames={} retire_avg_us={} acquire_avg_us={} \
+             record_avg_us={} submit_avg_us={} total_avg_us={} total_max_us={}",
+            elapsed.as_millis(),
+            self.timing_frames,
+            self.timing_retire_us / frames,
+            self.timing_acquire_us / frames,
+            self.timing_record_us / frames,
+            self.timing_submit_us / frames,
+            self.timing_total_us / frames,
+            self.timing_max_total_us,
+        ));
+        self.timing_started = Instant::now();
+        self.timing_frames = 0;
+        self.timing_retire_us = 0;
+        self.timing_acquire_us = 0;
+        self.timing_record_us = 0;
+        self.timing_submit_us = 0;
+        self.timing_total_us = 0;
+        self.timing_max_total_us = 0;
     }
 
     pub(crate) fn finish_present(
@@ -1955,6 +2105,35 @@ unsafe fn blit_rect(
                 },
             ])],
         crate::backend::vulkan::translate::sampler::PRESENT_BLIT_FILTER,
+    );
+}
+
+unsafe fn copy_rect(
+    device: &ash::Device,
+    cmd: vk::CommandBuffer,
+    src: vk::Image,
+    dst: vk::Image,
+    src_layout: vk::ImageLayout,
+    width: u32,
+    height: u32,
+) {
+    let layers = vk::ImageSubresourceLayers::default()
+        .aspect_mask(vk::ImageAspectFlags::COLOR)
+        .layer_count(1);
+    device.cmd_copy_image(
+        cmd,
+        src,
+        src_layout,
+        dst,
+        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        &[vk::ImageCopy::default()
+            .src_subresource(layers)
+            .dst_subresource(layers)
+            .extent(vk::Extent3D {
+                width,
+                height,
+                depth: 1,
+            })],
     );
 }
 

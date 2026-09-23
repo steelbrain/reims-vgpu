@@ -92,11 +92,25 @@ use ash::vk;
 
 use super::context::DeviceContext;
 use super::counters::EngineCounters;
-use super::pools::{allocate_memory_timed, AllocSite};
+use super::pools::{AllocSite, allocate_memory_timed};
 use super::slab::{BlockPlan, SlabDecline};
 use super::types::DrawError;
 use super::vk_call::{VkCall, VkOp};
 use crate::backend::vulkan::caps::MemoryClass;
+use std::time::Instant;
+
+/// Opt-in breakdown for a single buffer-slab miss. It is only constructed
+/// when `REIMS_VGPU_STAGING_DETAIL` is set for a diagnostic run.
+#[derive(Default)]
+pub(crate) struct BufferSlabAcquireTrace {
+    pub(crate) blocks_scanned: usize,
+    pub(crate) ranges_scanned: usize,
+    pub(crate) carve_us: u64,
+    pub(crate) check_us: u64,
+    pub(crate) memory_type_us: u64,
+    pub(crate) alloc_us: u64,
+    pub(crate) map_us: u64,
+}
 
 /// Which memory a [`BufferSlabPool`] instance suballocates, and the names it
 /// reports under.
@@ -366,9 +380,25 @@ impl BufferSlabPool {
         req: &vk::MemoryRequirements,
         counters: &EngineCounters,
     ) -> Result<BufferSlabToken, DrawError> {
+        self.acquire_traced(ctx, req, counters, None)
+    }
+
+    /// Diagnostic form of [`Self::acquire`]. The optional trace keeps clock
+    /// reads out of ordinary allocator traffic.
+    pub(crate) unsafe fn acquire_traced(
+        &mut self,
+        ctx: &DeviceContext,
+        req: &vk::MemoryRequirements,
+        counters: &EngineCounters,
+        mut trace: Option<&mut BufferSlabAcquireTrace>,
+    ) -> Result<BufferSlabToken, DrawError> {
+        let memory_type_started = trace.as_ref().map(|_| Instant::now());
         let mem_type = ctx
             .memory_type_for(req.memory_type_bits, req.size, self.kind.memory_class())
             .ok_or_else(|| self.kind.no_memory_type(req.memory_type_bits))?;
+        if let (Some(trace), Some(started)) = (trace.as_deref_mut(), memory_type_started) {
+            trace.memory_type_us += started.elapsed().as_micros() as u64;
+        }
         let size = req.size;
         if size == 0 {
             return Err(DrawError::Slab(SlabDecline::ZeroSize {
@@ -382,11 +412,17 @@ impl BufferSlabPool {
         let align = req.alignment.max(1);
 
         if size > BUFFER_SLAB_SIZE {
-            return self.new_block(ctx, size, mem_type, align, size, true, false, counters);
+            return self.new_block(
+                ctx, size, mem_type, align, size, true, false, counters, trace,
+            );
         }
 
         let want_small = size < BUFFER_SMALL_CLASS_MAX;
         for i in 0..self.blocks.len() {
+            if let Some(trace) = trace.as_deref_mut() {
+                trace.blocks_scanned += 1;
+            }
+            let carve_started = trace.as_ref().map(|_| Instant::now());
             let hit = match &mut self.blocks[i] {
                 Some(b)
                     if !b.poisoned
@@ -394,14 +430,27 @@ impl BufferSlabPool {
                         && b.small == want_small
                         && b.mem_type == mem_type =>
                 {
+                    if let Some(trace) = trace.as_deref_mut() {
+                        trace.ranges_scanned += b.plan.free_range_count();
+                    }
                     b.plan.carve(size, align)
                 }
                 _ => None,
             };
+            if let (Some(trace), Some(started)) = (trace.as_deref_mut(), carve_started) {
+                trace.carve_us += started.elapsed().as_micros() as u64;
+            }
             if let Some(offset) = hit {
+                let check_started = trace.as_ref().map(|_| Instant::now());
                 if !self.check_block(i) {
+                    if let (Some(trace), Some(started)) = (trace.as_deref_mut(), check_started) {
+                        trace.check_us += started.elapsed().as_micros() as u64;
+                    }
                     // The carve corrupted the free list — poisoned; try elsewhere.
                     continue;
+                }
+                if let (Some(trace), Some(started)) = (trace.as_deref_mut(), check_started) {
+                    trace.check_us += started.elapsed().as_micros() as u64;
                 }
                 let b = self.blocks[i].as_ref().expect("just carved");
                 self.sub_allocs += 1;
@@ -422,7 +471,7 @@ impl BufferSlabPool {
             BUFFER_SLAB_SIZE
         };
         self.new_block(
-            ctx, block_size, mem_type, align, size, false, want_small, counters,
+            ctx, block_size, mem_type, align, size, false, want_small, counters, trace,
         )
     }
 
@@ -437,7 +486,9 @@ impl BufferSlabPool {
         dedicated: bool,
         small: bool,
         counters: &EngineCounters,
+        mut trace: Option<&mut BufferSlabAcquireTrace>,
     ) -> Result<BufferSlabToken, DrawError> {
+        let alloc_started = trace.as_ref().map(|_| Instant::now());
         let memory = allocate_memory_timed(
             ctx,
             &vk::MemoryAllocateInfo::default()
@@ -446,6 +497,9 @@ impl BufferSlabPool {
             self.kind.alloc_site(),
         )
         .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::PoolsAllocStaging, e)))?;
+        if let (Some(trace), Some(started)) = (trace.as_deref_mut(), alloc_started) {
+            trace.alloc_us += started.elapsed().as_micros() as u64;
+        }
         counters.note_alloc();
         self.block_allocs += 1;
         // A device-local block is never mapped, so it has no host base and every
@@ -453,10 +507,14 @@ impl BufferSlabPool {
         // on the gather path reads these bytes with the CPU, and on a discrete
         // host the memory is not host-visible for a mapping to be possible.
         let base = if self.kind.maps_blocks() {
-            match ctx
+            let map_started = trace.as_ref().map(|_| Instant::now());
+            let mapped = ctx
                 .device
-                .map_memory(memory, 0, block_size, vk::MemoryMapFlags::empty())
-            {
+                .map_memory(memory, 0, block_size, vk::MemoryMapFlags::empty());
+            if let (Some(trace), Some(started)) = (trace.as_deref_mut(), map_started) {
+                trace.map_us += started.elapsed().as_micros() as u64;
+            }
+            match mapped {
                 Ok(p) => p as usize,
                 Err(e) => {
                     ctx.device.free_memory(memory, None);

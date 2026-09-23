@@ -67,7 +67,10 @@ use reims_vgpu::backend::vulkan::engine::{
     window_present_attached, window_present_frame, window_present_resize,
 };
 use reims_vgpu::backend::window::{WindowCpuFrame, WindowPresentOutcome};
-use reims_vgpu::host_window::present::{spawn, FrameSlot, WindowConfig, WindowMode, WindowWaker};
+use reims_vgpu::host_window::present::{
+    spawn, CursorSlot, FrameSlot, FullscreenStrategy, GuestCursorState, WindowConfig, WindowMode,
+    WindowWaker,
+};
 
 const W: u32 = 640;
 const H: u32 = 400;
@@ -83,6 +86,7 @@ fn main() {
     // present that lands is one this file's thread made.
     let frames: FrameSlot = Arc::new(Mutex::new(None));
     let wake = WindowWaker::new();
+    let cursor_slot: CursorSlot = Arc::new(Mutex::new(GuestCursorState::default()));
     let stop = Arc::new(AtomicBool::new(false));
 
     let recreate_every: u64 = std::env::var("REIMS_VGPU_PROBE_RECREATE_EVERY")
@@ -167,9 +171,11 @@ fn main() {
             width: W,
             height: H,
             mode: WindowMode::requested(),
+            strategy: FullscreenStrategy::requested(WindowMode::requested()),
         },
         Arc::new(|_action| {}),
         frames,
+        cursor_slot,
         stop,
         wake,
     );

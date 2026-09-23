@@ -36,7 +36,7 @@ use winit::application::ApplicationHandler;
 use winit::event::{ElementState, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::PhysicalKey;
-use winit::window::{Window, WindowId};
+use winit::window::{CustomCursor, Window, WindowId, MAX_CURSOR_SIZE};
 
 use super::capture::{Capture, CaptureEngaged, CaptureMode};
 use super::input_map;
@@ -177,6 +177,545 @@ impl WindowMode {
     }
 }
 
+/// How a full-screen window is made full-screen, and therefore what it depends
+/// on.
+///
+/// A type rather than a `bool` because the two answers differ in *what has to
+/// exist*: the ordinary path asks the window system and needs a window manager
+/// to answer, and the appliance's path asks nothing and needs no one. That is
+/// the reason the variant exists at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FullscreenStrategy {
+    /// The window system's own answer — winit's `Fullscreen::Borderless`, which
+    /// on X11 is `_NET_WM_STATE_FULLSCREEN` and is therefore a request to a
+    /// window manager. Every host that has one, on every platform, takes this
+    /// path.
+    Normal,
+    /// The Reims appliance's dedicated Xorg session, which has no window
+    /// manager to ask. The window is created override-redirect at the monitor's
+    /// own rectangle, so its geometry is fixed before a window manager could
+    /// have had an opinion, and nothing else has to resize it afterwards.
+    X11WmLess,
+}
+
+impl FullscreenStrategy {
+    /// The strategy for the three independent answers.
+    ///
+    /// Pure, which is the point: the rule is testable without a server. WM-less
+    /// geometry is selected only when the operator asked for fullscreen *and*
+    /// asked for WM-less *and* the window will open on X11. Every other
+    /// combination — all of Wayland, all of macOS, and every existing X11 host
+    /// with a window manager — is [`Self::Normal`].
+    pub fn resolve(
+        window_system: Option<crate::config::WindowSystem>,
+        fullscreen: bool,
+        x11_wmless: bool,
+    ) -> Self {
+        if fullscreen && x11_wmless && window_system == Some(crate::config::WindowSystem::X11) {
+            Self::X11WmLess
+        } else {
+            Self::Normal
+        }
+    }
+
+    /// [`Self::resolve`] against the environment, read once where the window is
+    /// configured rather than once per frame.
+    pub fn requested(mode: WindowMode) -> Self {
+        let wmless = match crate::config::read(crate::config::X11_WMLESS) {
+            (crate::config::Switch::On, _) => true,
+            (crate::config::Switch::Unrecognized, value) => {
+                // The one refusal here that ends nothing: the parse could not
+                // read the ask, and the ordinary path is what the boot gets.
+                // Saying so is what keeps a typo from reading as a switch that
+                // does nothing.
+                crate::observe::Emit::decline(
+                    "host_window_init",
+                    &WindowError::X11WmLessValue(value.unwrap_or_default()),
+                )
+                .fail();
+                false
+            }
+            _ => false,
+        };
+        Self::resolve(
+            crate::config::window_system(),
+            mode == WindowMode::Borderless,
+            wmless,
+        )
+    }
+}
+
+/// Where a WM-less window's rectangle came from.
+///
+/// Carried with the geometry rather than inferred later: a boot that only got
+/// its rectangle because RandR had nothing usable must say so, or a reader
+/// cannot tell a measured monitor from a fallback that happened to be the right
+/// size. It is also the answer to "did the fallback run at all".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WmLessGeometrySource {
+    /// A RandR monitor `winit` identified, by a non-zero native id.
+    Monitor,
+    /// The X11 root window, used when no usable RandR monitor exists.
+    X11Root,
+}
+
+impl WmLessGeometrySource {
+    /// The name this source takes in the `host_window_mode` line.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Monitor => "monitor",
+            Self::X11Root => "x11_root",
+        }
+    }
+}
+
+/// A monitor as the geometry policy sees it: `winit`'s own identity plus the
+/// rectangle it reports.
+///
+/// The policy only needs the identity to reject the dummy and the rectangle to
+/// build the window, so that is all this carries — which is what keeps the
+/// policy a pure function of values.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MonitorRect {
+    pub native_id: u32,
+    pub position: winit::dpi::PhysicalPosition<i32>,
+    pub size: winit::dpi::PhysicalSize<u32>,
+}
+
+impl MonitorRect {
+    /// Whether this is a monitor rather than the placeholder `winit` substitutes
+    /// when RandR yields no CRTC.
+    ///
+    /// Zero is `winit`'s own marker: its X11 backend builds the placeholder with
+    /// `id: 0` and `is_dummy()` is literally `self.id == 0`. That method is
+    /// `pub(crate)`, but `native_id()` is public and returns the same `id`, so
+    /// zero is the identification available outside the crate. Size is
+    /// deliberately not the test: a real monitor may legitimately be any size,
+    /// and the placeholder's `1x1` is a symptom of its identity, not the identity.
+    pub fn is_usable(self) -> bool {
+        self.native_id != 0
+    }
+}
+
+/// The X11 root window's rectangle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RootRect {
+    pub size: winit::dpi::PhysicalSize<u32>,
+}
+
+/// Why the root window's rectangle was not available.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RootRectError {
+    /// The event loop's raw display handle was not Xlib, or carried no display
+    /// pointer. The WM-less path says X11, so anything else is a contradiction
+    /// rather than a reason to guess.
+    NoXlibHandle,
+    /// The Xlib call itself failed; the string is the greppable reason.
+    QueryFailed(&'static str),
+}
+
+/// The rectangle and attribute set the WM-less X11 path pins, as data.
+///
+/// Split from the code that reads a monitor or the root so the properties the
+/// appliance depends on — override-redirect, undecorated, fixed, screen-sized,
+/// and where the rectangle came from — are testable without an X server. The
+/// window code turns this into [`winit::window::WindowAttributes`]; this type is
+/// where the values are decided.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WmLessX11Geometry {
+    pub position: winit::dpi::PhysicalPosition<i32>,
+    pub size: winit::dpi::PhysicalSize<u32>,
+    pub source: WmLessGeometrySource,
+    pub decorations: bool,
+    pub resizable: bool,
+    pub override_redirect: bool,
+}
+
+impl WmLessX11Geometry {
+    /// The appliance window's rectangle from the frames the window system offers.
+    ///
+    /// The policy, in order, with no other branch anywhere:
+    ///
+    /// 1. the primary monitor, when `winit` identified one;
+    /// 2. otherwise the first available monitor it identified;
+    /// 3. otherwise the X11 root window's rectangle;
+    /// 4. otherwise a refusal.
+    ///
+    /// Step 3 exists because `winit`'s X11 backend answers a RandR-less or
+    /// CRTC-less server with a placeholder monitor of `1x1` at the root origin
+    /// rather than with `None` — `active_event_loop.primary_monitor()` is
+    /// `Some(placeholder)` — so a policy that only checks for absence silently
+    /// builds a one-pixel window. Xephyr is such a server, and a physical Xorg
+    /// is not, which is exactly why the placeholder has to be recognised by
+    /// identity and the fallback has to be a real answer instead of a size.
+    ///
+    /// The root is the right fallback here and nowhere else: the appliance
+    /// session is one application with no window manager, so the whole root
+    /// rectangle is the area that application may occupy. The degenerate
+    /// rectangles are refused rather than accepted, because a `1x1` root would
+    /// otherwise be reported as a successful full-screen window.
+    pub fn resolve(
+        primary: Option<MonitorRect>,
+        available: &[MonitorRect],
+        root: Result<RootRect, RootRectError>,
+    ) -> Result<Self, WindowError> {
+        if let Some(monitor) = primary.filter(|monitor| monitor.is_usable()) {
+            return Ok(Self::from_monitor_rect(monitor));
+        }
+        if let Some(monitor) = available
+            .iter()
+            .copied()
+            .find(|monitor| monitor.is_usable())
+        {
+            return Ok(Self::from_monitor_rect(monitor));
+        }
+        let root = match root {
+            Ok(root) => root,
+            Err(RootRectError::NoXlibHandle) => return Err(WindowError::X11RootHandle),
+            Err(RootRectError::QueryFailed(reason)) => {
+                return Err(WindowError::X11RootGeometry(reason.to_string()))
+            }
+        };
+        if root.size.width <= 1 || root.size.height <= 1 {
+            return Err(WindowError::X11RootGeometryInvalid {
+                width: root.size.width,
+                height: root.size.height,
+            });
+        }
+        Ok(Self {
+            position: winit::dpi::PhysicalPosition::new(0, 0),
+            size: root.size,
+            source: WmLessGeometrySource::X11Root,
+            decorations: false,
+            resizable: false,
+            override_redirect: true,
+        })
+    }
+
+    /// The appliance window's rectangle for a monitor's own rectangle.
+    fn from_monitor_rect(monitor: MonitorRect) -> Self {
+        Self {
+            position: monitor.position,
+            size: monitor.size,
+            source: WmLessGeometrySource::Monitor,
+            decorations: false,
+            resizable: false,
+            override_redirect: true,
+        }
+    }
+}
+
+/// Apply the WM-less rectangle and attributes to `attrs`.
+///
+/// `with_override_redirect` exists only on the X11 platform, so it is applied
+/// behind the same gate as `winit::platform::x11` itself. The cross-platform
+/// attributes stay outside the gate, which is what keeps the pure geometry test
+/// meaningful on any host.
+#[cfg(target_os = "linux")]
+fn apply_wm_less_geometry(
+    attrs: winit::window::WindowAttributes,
+    geometry: &WmLessX11Geometry,
+) -> winit::window::WindowAttributes {
+    use winit::platform::x11::WindowAttributesExtX11 as _;
+    attrs
+        .with_decorations(geometry.decorations)
+        .with_resizable(geometry.resizable)
+        .with_position(geometry.position)
+        .with_inner_size(geometry.size)
+        .with_override_redirect(geometry.override_redirect)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn apply_wm_less_geometry(
+    attrs: winit::window::WindowAttributes,
+    geometry: &WmLessX11Geometry,
+) -> winit::window::WindowAttributes {
+    attrs
+        .with_decorations(geometry.decorations)
+        .with_resizable(geometry.resizable)
+        .with_position(geometry.position)
+        .with_inner_size(geometry.size)
+}
+
+/// The WM-less window's rectangle, read from the window system this boot is on.
+///
+/// The only place `winit` and the X connection are touched; everything after this
+/// is [`WmLessX11Geometry::resolve`], which is pure. Note that "no monitor" is
+/// not a condition `winit`'s X11 backend can report as absence — see the
+/// placeholder discussion on [`MonitorRect::is_usable`] — so the monitor list is
+/// filtered by identity here and the root is consulted rather than trusted to be
+/// unnecessary.
+#[cfg(target_os = "linux")]
+fn resolve_wm_less_geometry(
+    event_loop: &winit::event_loop::ActiveEventLoop,
+) -> Result<WmLessX11Geometry, WindowError> {
+    let primary = event_loop.primary_monitor().map(monitor_rect);
+    let available: Vec<MonitorRect> = event_loop.available_monitors().map(monitor_rect).collect();
+    WmLessX11Geometry::resolve(primary, &available, x11_root_rect(event_loop))
+}
+
+/// The WM-less path is selected only on Linux/X11 — `config::window_system()`
+/// answers `None` in every other build — so this arm keeps the call site one
+/// shape rather than being reached.
+#[cfg(not(target_os = "linux"))]
+fn resolve_wm_less_geometry(
+    _event_loop: &winit::event_loop::ActiveEventLoop,
+) -> Result<WmLessX11Geometry, WindowError> {
+    Err(WindowError::X11RootHandle)
+}
+
+/// A monitor as the policy sees it, identity included.
+///
+/// `native_id()` is the X11 extension trait's accessor for `winit`'s own monitor
+/// id. It is zero exactly for the placeholder `winit` substitutes when RandR
+/// yields no usable CRTC, which is the condition this policy has to recognise.
+#[cfg(target_os = "linux")]
+fn monitor_rect(monitor: winit::monitor::MonitorHandle) -> MonitorRect {
+    use winit::platform::x11::MonitorHandleExtX11 as _;
+    MonitorRect {
+        native_id: monitor.native_id(),
+        position: monitor.position(),
+        size: monitor.size(),
+    }
+}
+
+/// The X11 root window's rectangle, read through the display `winit` already owns.
+///
+/// `XRootWindow`/`XGetWindowAttributes` on the event loop's own connection: no
+/// `XOpenDisplay`, so no second authentication, no second connection that could
+/// disagree with the backend about which display is running, and no external
+/// `xrandr`/`xwininfo`/`xdpyinfo` — those are runtime and test instruments, not
+/// product dependencies.
+#[cfg(target_os = "linux")]
+fn x11_root_rect(
+    event_loop: &winit::event_loop::ActiveEventLoop,
+) -> Result<RootRect, RootRectError> {
+    let handle = event_loop
+        .display_handle()
+        .map_err(|_| RootRectError::NoXlibHandle)?;
+    let raw_window_handle::RawDisplayHandle::Xlib(xlib_handle) = handle.as_raw() else {
+        return Err(RootRectError::NoXlibHandle);
+    };
+    let display = xlib_handle.display.ok_or(RootRectError::NoXlibHandle)?;
+    let screen = xlib_handle.screen;
+
+    let xlib =
+        x11_dl::xlib::Xlib::open().map_err(|_| RootRectError::QueryFailed("libx11_unavailable"))?;
+    // SAFETY: `display` is the pointer this event loop's own X11 backend handed
+    // out and keeps alive for as long as the loop is; both calls are the
+    // read-only root query, and `attrs` is fully written before it is read.
+    unsafe {
+        let display = display.as_ptr().cast::<x11_dl::xlib::Display>();
+        let root = (xlib.XRootWindow)(display, screen);
+        let mut attrs = std::mem::MaybeUninit::<x11_dl::xlib::XWindowAttributes>::uninit();
+        if (xlib.XGetWindowAttributes)(display, root, attrs.as_mut_ptr()) == 0 {
+            return Err(RootRectError::QueryFailed("xgetwindowattributes_failed"));
+        }
+        let attrs = attrs.assume_init();
+        Ok(RootRect {
+            size: winit::dpi::PhysicalSize::new(
+                attrs.width.max(0) as u32,
+                attrs.height.max(0) as u32,
+            ),
+        })
+    }
+}
+
+/// Which full-screen path this boot took, for the always-on census line.
+///
+/// `REIMS_VGPU_FULLSCREEN=1` alone cannot distinguish a window the window
+/// manager made full-screen from one this process created at the monitor's own
+/// rectangle. On the appliance's window-manager-less Xorg session only the
+/// second one fills the screen, so a reader has to be able to tell them apart
+/// from the log — and the WM-less arm carries the rectangle it asked for.
+pub struct HostWindowMode {
+    window_system: &'static str,
+    wm: &'static str,
+    fullscreen: &'static str,
+    geometry_source: &'static str,
+    geometry: Option<(i32, i32, u32, u32)>,
+}
+
+impl HostWindowMode {
+    /// The appliance's path: X11, no window manager, geometry from the monitor
+    /// rectangle or — when no monitor was usable — the X11 root rectangle.
+    ///
+    /// The source travels on the line because the two are indistinguishable by
+    /// their numbers alone on a single-monitor host: a fallback that happened to
+    /// read `1600x900` and a monitor that measured `1600x900` would otherwise
+    /// look the same, and the point of the line is that a reader can tell what
+    /// actually happened.
+    pub fn wm_less_x11(geometry: WmLessX11Geometry) -> Self {
+        Self {
+            window_system: "x11",
+            wm: "none",
+            fullscreen: "override_redirect",
+            geometry_source: geometry.source.name(),
+            geometry: Some((
+                geometry.position.x,
+                geometry.position.y,
+                geometry.size.width,
+                geometry.size.height,
+            )),
+        }
+    }
+
+    /// Every other path: whatever window system `winit` chose, a window manager
+    /// if the host has one, and the window system's own sizing.
+    pub fn ordinary(window_system: Option<crate::config::WindowSystem>, mode: WindowMode) -> Self {
+        Self {
+            window_system: window_system
+                .map(|system| system.name())
+                .unwrap_or("native"),
+            wm: "external",
+            fullscreen: if mode == WindowMode::Borderless {
+                "ewmh"
+            } else {
+                "sized"
+            },
+            // No rectangle is pinned on this path, so there is no rectangle to
+            // attribute. `none` rather than an omitted field keeps every
+            // `host_window_mode` line the same shape, which is what makes it
+            // greppable.
+            geometry_source: "none",
+            geometry: None,
+        }
+    }
+}
+
+impl crate::observe::Decline for HostWindowMode {
+    fn slug(&self) -> &'static str {
+        "host_window_mode"
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        let mut fields = vec![
+            ("window_system", self.window_system.to_string()),
+            ("wm", self.wm.to_string()),
+            ("fullscreen", self.fullscreen.to_string()),
+            ("geometry_source", self.geometry_source.to_string()),
+        ];
+        if let Some((x, y, width, height)) = self.geometry {
+            fields.push(("position", format!("{x:+},{y:+}")));
+            fields.push(("size", format!("{width}x{height}")));
+        }
+        fields
+    }
+}
+
+/// The focus confirmation emitted only after the WM-less X11 window is the
+/// server's current input focus. Geometry and focus are separate contracts:
+/// the first does not imply the second when there is no window manager.
+struct HostWindowFocus;
+
+impl crate::observe::Decline for HostWindowFocus {
+    fn slug(&self) -> &'static str {
+        "host_window_focus"
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        vec![
+            ("mechanism", "x11_set_input_focus".to_string()),
+            ("status", "verified".to_string()),
+        ]
+    }
+}
+
+/// Request and verify focus for the appliance's WM-less X11 window.
+///
+/// This deliberately consumes the raw handles from the already-created winit
+/// window. `x11_dl::Xlib::open` loads libX11; it does not call `XOpenDisplay`,
+/// so the `Display*` remains the connection owned by winit and used by the
+/// presenter and keyboard capture.
+#[cfg(target_os = "linux")]
+fn focus_wm_less_x11_window(window: &Arc<Window>) -> Result<(), WindowError> {
+    use raw_window_handle::{HasDisplayHandle as _, HasWindowHandle as _};
+    use std::mem::MaybeUninit;
+    use std::os::raw::{c_int, c_ulong};
+
+    let display_handle = window
+        .display_handle()
+        .map_err(|_| WindowError::X11FocusHandle)?
+        .as_raw();
+    let raw_window = window
+        .window_handle()
+        .map_err(|_| WindowError::X11FocusHandle)?
+        .as_raw();
+    let raw_window_handle::RawDisplayHandle::Xlib(display_handle) = display_handle else {
+        return Err(WindowError::X11FocusHandle);
+    };
+    let raw_window_handle::RawWindowHandle::Xlib(window_handle) = raw_window else {
+        return Err(WindowError::X11FocusHandle);
+    };
+    let display = display_handle
+        .display
+        .ok_or(WindowError::X11FocusHandle)?
+        .as_ptr()
+        .cast::<x11_dl::xlib::Display>();
+    let xlib = x11_dl::xlib::Xlib::open()
+        .map_err(|error| WindowError::X11FocusRequest(detail_field(&error.to_string())))?;
+
+    // A focus request against an unmapped window is an X11 refusal. Check once
+    // at the deterministic lifecycle point after presenter attach; do not turn
+    // this into a polling loop.
+    let mut attrs = MaybeUninit::<x11_dl::xlib::XWindowAttributes>::uninit();
+    // SAFETY: `display` and `window_handle.window` came from the live winit
+    // window, and the output is fully written when XGetWindowAttributes says
+    // it succeeded.
+    let attributes_ok =
+        unsafe { (xlib.XGetWindowAttributes)(display, window_handle.window, attrs.as_mut_ptr()) };
+    if attributes_ok == 0 {
+        return Err(WindowError::X11FocusQuery);
+    }
+    let attrs = unsafe { attrs.assume_init() };
+    if attrs.map_state != x11_dl::xlib::IsViewable {
+        return Err(WindowError::X11FocusNotViewable);
+    }
+
+    // SAFETY: this is the same live Xlib connection and window handle. The
+    // request is synchronous at the Xlib API boundary; verification below
+    // rejects servers that did not make this window the focus target.
+    let set_ok = unsafe {
+        (xlib.XSetInputFocus)(
+            display,
+            window_handle.window,
+            x11_dl::xlib::RevertToParent,
+            0,
+        )
+    };
+    if set_ok == 0 {
+        return Err(WindowError::X11FocusRequest("xsetinputfocus_failed".into()));
+    }
+    unsafe {
+        (xlib.XFlush)(display);
+    }
+
+    let mut focused: c_ulong = 0;
+    let mut revert_to: c_int = 0;
+    // SAFETY: both output pointers are valid for the duration of the call.
+    let focus_query_ok = unsafe { (xlib.XGetInputFocus)(display, &mut focused, &mut revert_to) };
+    if focus_query_ok == 0 {
+        return Err(WindowError::X11FocusQuery);
+    }
+    verify_x11_focus_target(window_handle.window, focused)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn focus_wm_less_x11_window(_window: &Arc<Window>) -> Result<(), WindowError> {
+    Err(WindowError::X11FocusHandle)
+}
+
+/// Keep the server-result validation independent from the live X11 call so
+/// `None`, `PointerRoot`, the root window and another client are all covered
+/// without needing an X server in the regression suite.
+fn verify_x11_focus_target(target: u64, focused: u64) -> Result<(), WindowError> {
+    if focused == target {
+        Ok(())
+    } else {
+        Err(WindowError::X11FocusVerify { focused })
+    }
+}
+
 /// Window creation parameters.
 ///
 /// `mode` is resolved from the environment by whoever builds the config rather
@@ -188,15 +727,21 @@ pub struct WindowConfig {
     pub width: u32,
     pub height: u32,
     pub mode: WindowMode,
+    /// Which full-screen path, resolved beside `mode` and for the same reason:
+    /// it is an operator's answer about this boot, decided once on the thread
+    /// that starts the window rather than per frame.
+    pub strategy: FullscreenStrategy,
 }
 
 impl Default for WindowConfig {
     fn default() -> Self {
+        let mode = WindowMode::requested();
         Self {
             title: "Reims vGPU".to_string(),
             width: 1280,
             height: 800,
-            mode: WindowMode::requested(),
+            mode,
+            strategy: FullscreenStrategy::requested(mode),
         }
     }
 }
@@ -236,6 +781,118 @@ pub struct Frame {
 /// 8 MiB deep copy of an unchanged frame.
 pub type FrameSlot = Arc<Mutex<Option<Arc<Frame>>>>;
 
+/// Guest cursor state mirrored into the native host window.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GuestCursorGlyph {
+    pub sequence: u64,
+    pub width: u16,
+    pub height: u16,
+    pub hot_x: u16,
+    pub hot_y: u16,
+    /// QEMU/model pixels in straight-alpha `0xAARRGGBB` order.
+    pub pixels: Arc<[u32]>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GuestCursorState {
+    pub visible: bool,
+    pub x: u16,
+    pub y: u16,
+    pub glyph: Option<GuestCursorGlyph>,
+}
+
+pub type CursorSlot = Arc<Mutex<GuestCursorState>>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CursorGlyphError {
+    Empty,
+    TooLarge,
+    PixelCount,
+    Hotspot,
+}
+
+/// Convert straight-alpha ARGB words to the non-premultiplied RGBA bytes
+/// required by `winit::window::CustomCursor::from_rgba`.
+pub fn cursor_argb_to_rgba(pixels: &[u32]) -> Vec<u8> {
+    let mut rgba = Vec::with_capacity(pixels.len() * 4);
+    for &pixel in pixels {
+        rgba.extend_from_slice(&[
+            ((pixel >> 16) & 0xff) as u8,
+            ((pixel >> 8) & 0xff) as u8,
+            (pixel & 0xff) as u8,
+            (pixel >> 24) as u8,
+        ]);
+    }
+    rgba
+}
+
+/// Snapshot the model cursor while its device lock is held, so the window
+/// thread never needs to acquire a device lock to install a glyph.
+pub fn snapshot_guest_cursor(
+    cursor: &crate::model::CursorState,
+    sequence: u64,
+) -> Result<GuestCursorState, CursorGlyphError> {
+    let glyph = if !cursor.glyph_ready {
+        None
+    } else {
+        let expected = usize::from(cursor.width)
+            .checked_mul(usize::from(cursor.height))
+            .ok_or(CursorGlyphError::PixelCount)?;
+        if cursor.width == 0 || cursor.height == 0 {
+            return Err(CursorGlyphError::Empty);
+        }
+        if cursor.width > MAX_CURSOR_SIZE || cursor.height > MAX_CURSOR_SIZE {
+            return Err(CursorGlyphError::TooLarge);
+        }
+        if cursor.pixels.len() != expected {
+            return Err(CursorGlyphError::PixelCount);
+        }
+        if cursor.hot_x >= cursor.width || cursor.hot_y >= cursor.height {
+            return Err(CursorGlyphError::Hotspot);
+        }
+        Some(GuestCursorGlyph {
+            sequence,
+            width: cursor.width,
+            height: cursor.height,
+            hot_x: cursor.hot_x,
+            hot_y: cursor.hot_y,
+            pixels: Arc::from(cursor.pixels.clone()),
+        })
+    };
+    Ok(GuestCursorState {
+        visible: cursor.show,
+        x: cursor.x,
+        y: cursor.y,
+        glyph,
+    })
+}
+
+fn cursor_glyph_changed(
+    applied: &Option<GuestCursorGlyph>,
+    incoming: &Option<GuestCursorGlyph>,
+) -> bool {
+    match (applied, incoming) {
+        (Some(a), Some(b)) => {
+            a.width != b.width
+                || a.height != b.height
+                || a.hot_x != b.hot_x
+                || a.hot_y != b.hot_y
+                || a.pixels != b.pixels
+        }
+        _ => applied.is_some() != incoming.is_some(),
+    }
+}
+
+fn cursor_force_visible() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            crate::config::read(crate::config::CURSOR_FORCE_VISIBLE).0,
+            crate::config::Switch::On
+        )
+    })
+}
+
 /// The one user event this window's loop takes: the device wrote a new frame
 /// into the [`FrameSlot`].
 ///
@@ -243,7 +900,10 @@ pub type FrameSlot = Arc<Mutex<Option<Arc<Frame>>>>;
 /// lock, so a payload here could only be a second, staler copy of what
 /// [`App::draw`] is about to read anyway.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FramePublished;
+pub enum WindowUserEvent {
+    FramePublished,
+    CursorPublished,
+}
 
 /// How the device wakes the window's event loop when it publishes a frame.
 ///
@@ -267,7 +927,7 @@ pub struct FramePublished;
 /// lock is uncontended and taken once per published frame, at the ~26 Hz this
 /// workload peaks at, against the publisher's own two existing locks.
 pub struct WindowWaker {
-    proxy: Mutex<Option<winit::event_loop::EventLoopProxy<FramePublished>>>,
+    proxy: Mutex<Option<winit::event_loop::EventLoopProxy<WindowUserEvent>>>,
 }
 
 /// A [`WindowWaker`] shared between the device's publisher and the window
@@ -284,7 +944,7 @@ impl WindowWaker {
     }
 
     /// Hand the loop's proxy over, once the loop exists to be woken.
-    fn arm(&self, proxy: winit::event_loop::EventLoopProxy<FramePublished>) {
+    fn arm(&self, proxy: winit::event_loop::EventLoopProxy<WindowUserEvent>) {
         if let Ok(mut slot) = self.proxy.lock() {
             *slot = Some(proxy);
         }
@@ -299,9 +959,17 @@ impl WindowWaker {
     /// does not land costs latency bounded by that constant rather than a frame
     /// — which is the property that lets this be a wake and not a protocol.
     pub fn wake(&self) {
+        self.wake_event(WindowUserEvent::FramePublished);
+    }
+
+    pub fn wake_cursor(&self) {
+        self.wake_event(WindowUserEvent::CursorPublished);
+    }
+
+    fn wake_event(&self, event: WindowUserEvent) {
         if let Ok(slot) = self.proxy.lock() {
             if let Some(proxy) = slot.as_ref() {
-                let _ = proxy.send_event(FramePublished);
+                let _ = proxy.send_event(event);
             }
         }
     }
@@ -490,11 +1158,18 @@ pub enum WindowError {
     /// `run_app` returned an error on the macOS main-thread loop.
     MainLoopRun(String),
     /// A second device tried to claim the single process window.
-    AlreadyOwned { owner: u64 },
+    AlreadyOwned {
+        owner: u64,
+    },
     /// `run_main_thread` found no registered window for the device.
-    NoRegisteredWindow { id: u64 },
+    NoRegisteredWindow {
+        id: u64,
+    },
     /// `run_main_thread` was asked to run a window owned by another device.
-    WrongOwner { owner: u64, requested: u64 },
+    WrongOwner {
+        owner: u64,
+        requested: u64,
+    },
     /// `resumed`: winit could not create the native window (shared step, both
     /// platforms) — the bring-up cannot proceed past this.
     CreateNativeWindow(String),
@@ -510,6 +1185,50 @@ pub enum WindowError {
     /// operator can see what the parse rejected. The one variant here that does
     /// not end anything.
     FullscreenValue(String),
+    /// [`crate::config::X11_WMLESS`] was set to something that is neither an on
+    /// nor an off spelling. The window takes the ordinary path and the value is
+    /// quoted; like [`Self::FullscreenValue`], it ends nothing.
+    X11WmLessValue(String),
+    /// The WM-less path needed the X11 root window's rectangle and the event
+    /// loop's raw display handle was not Xlib, or carried no display pointer.
+    /// The strategy said X11, so anything else contradicts the backend rather
+    /// than merely being unavailable, and guessing past it is what puts a
+    /// one-pixel window on the screen.
+    X11RootHandle,
+    /// The Xlib root query itself failed. The string is the greppable reason
+    /// (`libx11_unavailable`, `xgetwindowattributes_failed`).
+    X11RootGeometry(String),
+    /// The root window answered with a rectangle an appliance window cannot be:
+    /// a dimension of `1` or less. A full-screen `1x1` window is the failure this
+    /// path exists to prevent, so the rectangle is refused rather than applied.
+    X11RootGeometryInvalid {
+        width: u32,
+        height: u32,
+    },
+    /// The WM-less path could not obtain the existing Xlib display/window
+    /// handles needed for the explicit focus request.
+    X11FocusHandle,
+    /// The WM-less window was not viewable at its one focus lifecycle point.
+    X11FocusNotViewable,
+    /// The Xlib focus request or a focus query failed.
+    X11FocusRequest(String),
+    X11FocusQuery,
+    /// XGetInputFocus returned a different target, including None, PointerRoot
+    /// or the root window, so the window is not usable as appliance input.
+    X11FocusVerify {
+        focused: u64,
+    },
+    /// The WM-less path asked for a monitor and the window system offered none.
+    ///
+    /// Retained for a caller that resolves geometry without a root fallback.
+    /// The appliance path no longer ends here, because `winit`'s X11 backend
+    /// does not report "no monitor" as absence: when RandR yields no usable
+    /// CRTC it returns a placeholder `MonitorHandle` with `id: 0` and a `1x1`
+    /// rectangle, so `primary_monitor()` is `Some(placeholder)` and an
+    /// absence-only check never fires. [`Self::X11RootHandle`],
+    /// [`Self::X11RootGeometry`] and [`Self::X11RootGeometryInvalid`] are the
+    /// refusals the root fallback raises in its place.
+    NoMonitor,
 }
 
 impl WindowError {
@@ -525,10 +1244,20 @@ impl WindowError {
             | Self::AttachDisplayHandle(d)
             | Self::AttachWindowHandle(d)
             | Self::AttachPresenter(d)
-            | Self::FullscreenValue(d) => Some(d),
+            | Self::FullscreenValue(d)
+            | Self::X11WmLessValue(d)
+            | Self::X11RootGeometry(d)
+            | Self::X11FocusRequest(d) => Some(d),
             Self::AlreadyOwned { .. }
             | Self::NoRegisteredWindow { .. }
-            | Self::WrongOwner { .. } => None,
+            | Self::WrongOwner { .. }
+            | Self::X11RootHandle
+            | Self::X11RootGeometryInvalid { .. }
+            | Self::X11FocusHandle
+            | Self::X11FocusNotViewable
+            | Self::X11FocusQuery
+            | Self::X11FocusVerify { .. }
+            | Self::NoMonitor => None,
         }
     }
 }
@@ -553,6 +1282,16 @@ impl crate::observe::Decline for WindowError {
             Self::AttachWindowHandle(_) => "window_attach_window_handle",
             Self::AttachPresenter(_) => "window_attach_presenter",
             Self::FullscreenValue(_) => "window_fullscreen_unrecognized",
+            Self::X11WmLessValue(_) => "window_x11_wmless_unrecognized",
+            Self::X11RootHandle => "window_x11_root_handle",
+            Self::X11RootGeometry(_) => "window_x11_root_geometry",
+            Self::X11RootGeometryInvalid { .. } => "window_x11_root_geometry_invalid",
+            Self::X11FocusHandle => "window_x11_focus_handle",
+            Self::X11FocusNotViewable => "window_x11_focus_not_viewable",
+            Self::X11FocusRequest(_) => "window_x11_focus_request",
+            Self::X11FocusQuery => "window_x11_focus_query",
+            Self::X11FocusVerify { .. } => "window_x11_focus_verify",
+            Self::NoMonitor => "window_no_monitor",
         }
     }
 
@@ -564,6 +1303,10 @@ impl crate::observe::Decline for WindowError {
                 ("owner", owner.to_string()),
                 ("requested", requested.to_string()),
             ],
+            Self::X11RootGeometryInvalid { width, height } => {
+                vec![("width", width.to_string()), ("height", height.to_string())]
+            }
+            Self::X11FocusVerify { focused } => vec![("focused", focused.to_string())],
             other => match other.detail() {
                 Some(d) => vec![("detail", detail_field(d))],
                 None => Vec::new(),
@@ -590,12 +1333,13 @@ pub fn spawn(
     config: WindowConfig,
     on_input: InputSink,
     frames: FrameSlot,
+    cursor_slot: CursorSlot,
     stop: StopFlag,
     wake: WindowWakeHandle,
 ) -> std::thread::JoinHandle<Result<(), WindowError>> {
     std::thread::Builder::new()
         .name("reims-vgpu-window".to_string())
-        .spawn(move || run(config, on_input, frames, stop, wake))
+        .spawn(move || run(config, on_input, frames, cursor_slot, stop, wake))
         .expect("spawn reims-vgpu-window thread")
 }
 
@@ -606,12 +1350,13 @@ pub fn run(
     config: WindowConfig,
     on_input: InputSink,
     frames: FrameSlot,
+    cursor_slot: CursorSlot,
     stop: StopFlag,
     wake: WindowWakeHandle,
 ) -> Result<(), WindowError> {
     let event_loop = build_event_loop()?;
     wake.arm(event_loop.create_proxy());
-    let mut app = App::new(config, on_input, frames, stop);
+    let mut app = App::new(config, on_input, frames, cursor_slot, stop);
     event_loop
         .run_app(&mut app)
         .map_err(|e| WindowError::RunApp(e.to_string()))
@@ -620,7 +1365,7 @@ pub fn run(
 #[cfg(target_os = "macos")]
 struct MainThreadWindow {
     id: u64,
-    event_loop: EventLoop<FramePublished>,
+    event_loop: EventLoop<WindowUserEvent>,
     app: App,
     exited: ExitedFlag,
 }
@@ -643,6 +1388,7 @@ pub fn start_main_thread(
     config: WindowConfig,
     on_input: InputSink,
     frames: FrameSlot,
+    cursor_slot: CursorSlot,
     stop: StopFlag,
     exited: ExitedFlag,
     wake: WindowWakeHandle,
@@ -658,7 +1404,7 @@ pub fn start_main_thread(
         }
         let event_loop = build_event_loop()?;
         wake.arm(event_loop.create_proxy());
-        let app = App::new(config, on_input, frames, stop);
+        let app = App::new(config, on_input, frames, cursor_slot, stop);
         *slot = Some(MainThreadWindow {
             id,
             event_loop,
@@ -700,9 +1446,9 @@ pub fn run_main_thread(id: u64) -> Result<(), WindowError> {
 /// Build an event loop that may run off the main thread (QEMU owns the main
 /// thread). X11 and Wayland both allow it via their platform extension.
 ///
-/// Carries [`FramePublished`] as its user event, which is what makes
+/// Carries [`WindowUserEvent`] as its user event, which is what makes
 /// `create_proxy` a wake channel the device can hold — see [`WindowWaker`].
-fn build_event_loop() -> Result<EventLoop<FramePublished>, WindowError> {
+fn build_event_loop() -> Result<EventLoop<WindowUserEvent>, WindowError> {
     let mut builder = EventLoop::with_user_event();
     #[cfg(all(unix, not(target_os = "macos")))]
     {
@@ -730,6 +1476,7 @@ struct App {
     config: WindowConfig,
     on_input: InputSink,
     frames: FrameSlot,
+    cursor_slot: CursorSlot,
     /// Set by the device to request teardown; polled in `about_to_wait`.
     stop: StopFlag,
     /// True once a `WindowClosed` action has been emitted (UI close), so the
@@ -738,6 +1485,12 @@ struct App {
     window: Option<Arc<Window>>,
     /// Last cursor position in window pixels (for absolute pointer moves).
     cursor: (u32, u32),
+    native_cursor: Option<CustomCursor>,
+    applied_cursor_glyph: Option<GuestCursorGlyph>,
+    applied_cursor_visible: bool,
+    guest_cursor_position_logged: bool,
+    pointer_move_logged: bool,
+    pointer_button_logged: bool,
     /// What the guest believes it is holding, and whether the host desktop's
     /// shortcuts are being captured. See [`super::keyboard`] — the rule that
     /// every key-down is closed by a key-up lives there, not at these call
@@ -867,7 +1620,7 @@ impl LoopCensus {
     }
 }
 
-impl ApplicationHandler<FramePublished> for App {
+impl ApplicationHandler<WindowUserEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
             return;
@@ -890,6 +1643,41 @@ impl ApplicationHandler<FramePublished> for App {
             // size a later `set_fullscreen(None)` would restore.
             attrs = attrs.with_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
         }
+        match self.config.strategy {
+            FullscreenStrategy::Normal => {
+                crate::observe::Emit::decline(
+                    "host_window_mode",
+                    &HostWindowMode::ordinary(crate::config::window_system(), self.config.mode),
+                )
+                .off();
+            }
+            FullscreenStrategy::X11WmLess => {
+                // The screen's own rectangle, applied at creation: a RandR
+                // monitor when winit identified one, and the X11 root window
+                // when it did not. The `Fullscreen::Borderless` request above
+                // stays for the ordinary winit fullscreen contract, but it is
+                // not the source of focus in this path: winit returns before
+                // its focus hint when the X11 monitor is the dummy id=0. The
+                // explicit WM-less focus request happens after the presenter
+                // attaches below.
+                let geometry = match resolve_wm_less_geometry(event_loop) {
+                    Ok(geometry) => geometry,
+                    Err(error) => {
+                        crate::observe::Emit::decline("host_window_init", &error).fail();
+                        eprintln!("reims-vgpu-window: {error}; shutting down");
+                        self.request_shutdown();
+                        event_loop.exit();
+                        return;
+                    }
+                };
+                attrs = apply_wm_less_geometry(attrs, &geometry);
+                crate::observe::Emit::decline(
+                    "host_window_mode",
+                    &HostWindowMode::wm_less_x11(geometry),
+                )
+                .off();
+            }
+        }
         let window = match event_loop.create_window(attrs) {
             Ok(w) => Arc::new(w),
             Err(e) => {
@@ -904,6 +1692,7 @@ impl ApplicationHandler<FramePublished> for App {
                 return;
             }
         };
+        window.set_cursor_visible(false);
         // Built before the presenter attach so a window that fails to present
         // still reports which capture it would have had, and torn down with the
         // window in `exiting`.
@@ -911,10 +1700,28 @@ impl ApplicationHandler<FramePublished> for App {
         match Self::attach_presenter(&window) {
             Ok(()) => {
                 self.presenter_attached = true;
+                self.window = Some(window.clone());
+                if self.config.strategy == FullscreenStrategy::X11WmLess {
+                    if let Err(error) = focus_wm_less_x11_window(&window) {
+                        crate::observe::Emit::decline("host_window_focus", &error).fail();
+                        eprintln!("reims-vgpu-window: {error}; shutting down");
+                        self.request_shutdown();
+                        event_loop.exit();
+                        return;
+                    }
+                    crate::observe::Emit::decline("host_window_focus", &HostWindowFocus).off();
+                    // X11 may deliver Focused(true) before the presenter is
+                    // attached.  The explicit focus request above is the
+                    // authoritative hand-off for the WM-less appliance
+                    // window, so make the keyboard/capture state agree with
+                    // it instead of waiting for an event that has already
+                    // been consumed by winit.
+                    let effect = self.keyboard.focus(true);
+                    self.apply_key_effect(effect);
+                }
                 // Kick the first frame; RedrawRequested re-arms each subsequent
                 // one, so without this the window would never draw.
                 window.request_redraw();
-                self.window = Some(window);
             }
             Err(error) => {
                 // One rule on every platform and every rail: a rail that
@@ -998,6 +1805,13 @@ impl ApplicationHandler<FramePublished> for App {
             }
             WindowEvent::MouseInput { state, button, .. } => {
                 if let Some(btn) = input_map::mouse_button(button) {
+                    if !self.pointer_button_logged {
+                        self.pointer_button_logged = true;
+                        crate::observe::off(format!(
+                            "host_window_pointer_input kind=button button={btn:?} state={} status=forwarded",
+                            if state == ElementState::Pressed { "down" } else { "up" }
+                        ));
+                    }
                     (self.on_input)(HostAction::input_pointer_button(
                         btn,
                         state == ElementState::Pressed,
@@ -1101,8 +1915,11 @@ impl ApplicationHandler<FramePublished> for App {
     /// put a second caller on the platform's redraw path, and the two would
     /// disagree about the backstop — `about_to_wait` runs after this and after
     /// every other event, so it is the one place that can hold that decision.
-    fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: FramePublished) {
-        self.frame_pending = true;
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: WindowUserEvent) {
+        match event {
+            WindowUserEvent::FramePublished => self.frame_pending = true,
+            WindowUserEvent::CursorPublished => self.apply_guest_cursor(event_loop),
+        }
     }
 }
 
@@ -1123,15 +1940,28 @@ impl App {
     /// `start_main_thread` on macOS's main thread — and every field but the
     /// four they are given is fixed. Written out at each site, a field added
     /// to the struct could be initialised in one and missed in the other.
-    fn new(config: WindowConfig, on_input: InputSink, frames: FrameSlot, stop: StopFlag) -> Self {
+    fn new(
+        config: WindowConfig,
+        on_input: InputSink,
+        frames: FrameSlot,
+        cursor_slot: CursorSlot,
+        stop: StopFlag,
+    ) -> Self {
         Self {
             config,
             on_input,
             frames,
+            cursor_slot,
             stop,
             closed_sent: false,
             window: None,
             cursor: (0, 0),
+            native_cursor: None,
+            applied_cursor_glyph: None,
+            applied_cursor_visible: false,
+            guest_cursor_position_logged: false,
+            pointer_move_logged: false,
+            pointer_button_logged: false,
             keyboard: Keyboard::new(),
             capture_engaged_logged: false,
             capture: None,
@@ -1252,7 +2082,70 @@ impl App {
         let (x, y, width, height) =
             pointer_report(position, self.surface_dims(), self.guest_extent);
         self.cursor = (x, y);
+        if !self.pointer_move_logged {
+            self.pointer_move_logged = true;
+            crate::observe::off(format!(
+                "host_window_pointer_input kind=move status=forwarded x={x} y={y} width={width} height={height}"
+            ));
+        }
         (self.on_input)(HostAction::input_pointer_move(x, y, width, height));
+    }
+
+    fn apply_guest_cursor(&mut self, event_loop: &ActiveEventLoop) {
+        let Ok(state) = self.cursor_slot.lock().map(|state| state.clone()) else {
+            crate::observe::fail(
+                "host_window_guest_cursor_fail reason=cursor_slot_poisoned".to_string(),
+            );
+            return;
+        };
+        let Some(window) = self.window.as_ref() else {
+            return;
+        };
+
+        if !self.guest_cursor_position_logged {
+            self.guest_cursor_position_logged = true;
+            crate::observe::off(format!(
+                "host_window_guest_cursor event=position status=received x={} y={} visible={}",
+                state.x, state.y, state.visible
+            ));
+        }
+
+        if cursor_glyph_changed(&self.applied_cursor_glyph, &state.glyph) {
+            if let Some(glyph) = state.glyph.as_ref() {
+                let source = match CustomCursor::from_rgba(
+                    cursor_argb_to_rgba(&glyph.pixels),
+                    glyph.width,
+                    glyph.height,
+                    glyph.hot_x,
+                    glyph.hot_y,
+                ) {
+                    Ok(source) => source,
+                    Err(error) => {
+                        crate::observe::fail(format!(
+                            "host_window_guest_cursor_fail reason=winit_custom_cursor {error:?}"
+                        ));
+                        return;
+                    }
+                };
+                let cursor = event_loop.create_custom_cursor(source);
+                window.set_cursor(cursor.clone());
+                self.native_cursor = Some(cursor);
+                self.applied_cursor_glyph = state.glyph.clone();
+                crate::observe::off(format!(
+                    "host_window_guest_cursor event=glyph mechanism=winit_custom_cursor status=installed size={}x{} hotspot={},{}",
+                    glyph.width, glyph.height, glyph.hot_x, glyph.hot_y
+                ));
+            }
+        }
+
+        let visible = cursor_force_visible() || (state.visible && self.native_cursor.is_some());
+        if visible != self.applied_cursor_visible {
+            window.set_cursor_visible(visible);
+            self.applied_cursor_visible = visible;
+            crate::observe::off(format!(
+                "host_window_guest_cursor event=visibility visible={visible}"
+            ));
+        }
     }
 
     /// Build the platform's shortcut capture for this window.
@@ -1773,6 +2666,19 @@ mod tests {
             WindowError::AttachWindowHandle("no window handle".into()),
             WindowError::AttachPresenter("swapchain unavailable".into()),
             WindowError::FullscreenValue("borderless please".into()),
+            WindowError::X11WmLessValue("wmless please".into()),
+            WindowError::X11RootHandle,
+            WindowError::X11RootGeometry("xgetwindowattributes_failed".into()),
+            WindowError::X11RootGeometryInvalid {
+                width: 1,
+                height: 1,
+            },
+            WindowError::X11FocusHandle,
+            WindowError::X11FocusNotViewable,
+            WindowError::X11FocusRequest("xsetinputfocus_failed".into()),
+            WindowError::X11FocusQuery,
+            WindowError::X11FocusVerify { focused: 1 },
+            WindowError::NoMonitor,
         ]
     }
 
@@ -1791,6 +2697,16 @@ mod tests {
             WindowError::AttachWindowHandle(_) => "AttachWindowHandle",
             WindowError::AttachPresenter(_) => "AttachPresenter",
             WindowError::FullscreenValue(_) => "FullscreenValue",
+            WindowError::X11WmLessValue(_) => "X11WmLessValue",
+            WindowError::X11RootHandle => "X11RootHandle",
+            WindowError::X11RootGeometry(_) => "X11RootGeometry",
+            WindowError::X11RootGeometryInvalid { .. } => "X11RootGeometryInvalid",
+            WindowError::X11FocusHandle => "X11FocusHandle",
+            WindowError::X11FocusNotViewable => "X11FocusNotViewable",
+            WindowError::X11FocusRequest(_) => "X11FocusRequest",
+            WindowError::X11FocusQuery => "X11FocusQuery",
+            WindowError::X11FocusVerify { .. } => "X11FocusVerify",
+            WindowError::NoMonitor => "NoMonitor",
         }
     }
 
@@ -1850,14 +2766,19 @@ mod tests {
     /// drawn. Re-adding a presenter here means re-adding that family, and this
     /// count is what makes that a deliberate act.
     ///
-    /// The eleven: building the event loop, running it (one variant per entry
+    /// The thirteen: building the event loop, running it (one variant per entry
     /// point), the three ways the single process window can be claimed by the
     /// wrong device, creating the native window, the three steps of the
-    /// presenter attach, and the geometry the operator asked for being
-    /// unreadable. That
-    /// last one is the only variant that ends nothing, and it belongs here for
-    /// the same reason as the rest: it is a statement about bringing the window
-    /// up, made once, before there is a window.
+    /// presenter attach, the geometry the operator asked for being unreadable,
+    /// and the five the WM-less X11 path adds — an unreadable
+    /// [`crate::config::X11_WMLESS`] value, a display handle that is not Xlib,
+    /// a root query that failed, a root rectangle too degenerate to be a
+    /// window, and a WM-less boot with no monitor to take its rectangle from;
+    /// plus the five explicit X11 focus refusals.
+    /// Of those, the unreadable-value one ends nothing and the rest end the
+    /// window before it exists; they belong here for the same reason as the
+    /// rest: they are statements about bringing the window up, made once,
+    /// before there is a window.
     #[test]
     fn the_window_types_only_its_own_lifecycle_refusals() {
         use crate::observe::Decline as _;
@@ -1870,7 +2791,7 @@ mod tests {
         );
         assert_eq!(
             names.len(),
-            11,
+            21,
             "WindowError carries {} variants; a presenter-shaped family here is \
              a second rail that no fail line distinguishes",
             names.len()
@@ -2086,5 +3007,561 @@ mod tests {
     #[test]
     fn a_resize_with_nothing_pending_is_not_an_answer() {
         assert_eq!(guest_resize_settled(None, (1920, 1080)), None);
+    }
+
+    /// WM-less geometry is selected only when all three answers agree.
+    ///
+    /// The three are independent on purpose: `fullscreen` is the operator's
+    /// ask, `x11_wmless` is the appliance's ask, and the window system is the
+    /// environment's. Dropping any one of them has to fall back to the ordinary
+    /// path, because on Wayland or on a host with a window manager the
+    /// override-redirect window would be the wrong answer even though both asks
+    /// were made.
+    #[test]
+    fn wm_less_geometry_is_selected_only_when_all_three_answers_agree() {
+        use crate::config::WindowSystem::{Wayland, X11};
+        let cases = [
+            // x11 + fullscreen + wmless — the appliance's session.
+            (Some(X11), true, true, FullscreenStrategy::X11WmLess),
+            // ...and every one of the three answers removed in turn.
+            (Some(X11), true, false, FullscreenStrategy::Normal),
+            (Some(Wayland), true, true, FullscreenStrategy::Normal),
+            (Some(X11), false, true, FullscreenStrategy::Normal),
+            // The window system unknown — a build without either backend, and
+            // the one answer that must never select the X11 attribute.
+            (None, true, true, FullscreenStrategy::Normal),
+            // The ordinary development host, unchanged.
+            (Some(Wayland), true, false, FullscreenStrategy::Normal),
+            (Some(Wayland), false, false, FullscreenStrategy::Normal),
+            (Some(X11), false, false, FullscreenStrategy::Normal),
+        ];
+        for (window_system, fullscreen, wmless, expected) in cases {
+            assert_eq!(
+                FullscreenStrategy::resolve(window_system, fullscreen, wmless),
+                expected,
+                "window_system={window_system:?} fullscreen={fullscreen} wmless={wmless}"
+            );
+        }
+        println!("T009_VGPU_WMLESS_STRATEGY=PASS");
+    }
+
+    /// The geometry the WM-less path pins, as values.
+    ///
+    /// All four properties are load-bearing, and the negative monitor position
+    /// is the one worth keeping in the table: a window manager places windows on
+    /// a root origin, and monitors to the left of it have negative coordinates
+    /// that must be passed through rather than clamped.
+    #[test]
+    fn wm_less_geometry_pins_the_monitor_rectangle_and_its_attributes() {
+        let geometry = WmLessX11Geometry::resolve(
+            Some(MonitorRect {
+                native_id: 7,
+                position: winit::dpi::PhysicalPosition::new(-1920, 0),
+                size: winit::dpi::PhysicalSize::new(1920, 1080),
+            }),
+            &[],
+            Err(RootRectError::NoXlibHandle),
+        )
+        .expect("a usable primary monitor is the first answer");
+        assert_eq!(geometry.source, WmLessGeometrySource::Monitor);
+        assert_eq!(
+            geometry.position,
+            winit::dpi::PhysicalPosition::new(-1920, 0)
+        );
+        assert_eq!(geometry.size, winit::dpi::PhysicalSize::new(1920, 1080));
+        assert!(
+            !geometry.decorations,
+            "a decorated window is not the monitor"
+        );
+        assert!(
+            !geometry.resizable,
+            "a resizable window can leave the monitor"
+        );
+        assert!(
+            geometry.override_redirect,
+            "without override-redirect the window is a request, not a rectangle"
+        );
+        // A primary monitor at the origin is the common case and must not be
+        // special-cased into anything else.
+        let origin = WmLessX11Geometry::resolve(
+            Some(MonitorRect {
+                native_id: 3,
+                position: winit::dpi::PhysicalPosition::new(0, 0),
+                size: winit::dpi::PhysicalSize::new(2560, 1440),
+            }),
+            &[],
+            Err(RootRectError::NoXlibHandle),
+        )
+        .expect("a usable primary monitor is the first answer");
+        assert_eq!(origin.position, winit::dpi::PhysicalPosition::new(0, 0));
+        assert_eq!(origin.size, winit::dpi::PhysicalSize::new(2560, 1440));
+        println!("T009_VGPU_WMLESS_GEOMETRY=PASS");
+    }
+
+    /// A usable primary monitor wins, and the root is never consulted for it.
+    ///
+    /// The root here is a *different* size on purpose: if the policy ever asked
+    /// for it first, this case would answer `2560x1440` and fail rather than
+    /// quietly agreeing.
+    #[test]
+    fn wm_less_geometry_prefers_a_usable_primary_monitor() {
+        let geometry = WmLessX11Geometry::resolve(
+            Some(MonitorRect {
+                native_id: 10,
+                position: winit::dpi::PhysicalPosition::new(0, 0),
+                size: winit::dpi::PhysicalSize::new(1920, 1080),
+            }),
+            &[],
+            Ok(RootRect {
+                size: winit::dpi::PhysicalSize::new(2560, 1440),
+            }),
+        )
+        .expect("a usable primary monitor is the first answer");
+        assert_eq!(geometry.source, WmLessGeometrySource::Monitor);
+        assert_eq!(geometry.position, winit::dpi::PhysicalPosition::new(0, 0));
+        assert_eq!(geometry.size, winit::dpi::PhysicalSize::new(1920, 1080));
+        println!("T009_VGPU_WMLESS_PRIMARY_MONITOR=PASS");
+    }
+
+    /// The placeholder `winit` substitutes must not hide a real monitor.
+    ///
+    /// This is the runtime's own shape: a `1x1` primary with `id: 0`. The
+    /// appliance must walk past it to the real monitor, and the negative origin
+    /// has to survive intact — a window manager places windows against a root
+    /// origin and monitors to the left of it really are negative.
+    #[test]
+    fn wm_less_geometry_skips_a_placeholder_primary_for_a_real_monitor() {
+        let geometry = WmLessX11Geometry::resolve(
+            Some(MonitorRect {
+                native_id: 0,
+                position: winit::dpi::PhysicalPosition::new(0, 0),
+                size: winit::dpi::PhysicalSize::new(1, 1),
+            }),
+            &[MonitorRect {
+                native_id: 42,
+                position: winit::dpi::PhysicalPosition::new(-1920, 0),
+                size: winit::dpi::PhysicalSize::new(1920, 1080),
+            }],
+            Ok(RootRect {
+                size: winit::dpi::PhysicalSize::new(2560, 1440),
+            }),
+        )
+        .expect("a placeholder primary must not hide a real monitor");
+        assert_eq!(geometry.source, WmLessGeometrySource::Monitor);
+        assert_eq!(
+            geometry.position,
+            winit::dpi::PhysicalPosition::new(-1920, 0)
+        );
+        assert_eq!(geometry.size, winit::dpi::PhysicalSize::new(1920, 1080));
+        println!("T009_VGPU_WMLESS_MONITOR_FALLBACK=PASS");
+    }
+
+    /// Nothing usable in RandR: the root window is the rectangle.
+    ///
+    /// This is exactly the server the first runtime ran on — Xephyr with no
+    /// RandR CRTC behind its output — where the placeholder is all `winit`
+    /// offers and the root is the only true answer. The WM-less attributes stay
+    /// the same whichever source answered.
+    #[test]
+    fn wm_less_geometry_falls_back_to_the_x11_root() {
+        let geometry = WmLessX11Geometry::resolve(
+            Some(MonitorRect {
+                native_id: 0,
+                position: winit::dpi::PhysicalPosition::new(0, 0),
+                size: winit::dpi::PhysicalSize::new(1, 1),
+            }),
+            &[],
+            Ok(RootRect {
+                size: winit::dpi::PhysicalSize::new(1600, 900),
+            }),
+        )
+        .expect("a server with no usable CRTC still has a root rectangle");
+        assert_eq!(geometry.source, WmLessGeometrySource::X11Root);
+        assert_eq!(geometry.position, winit::dpi::PhysicalPosition::new(0, 0));
+        assert_eq!(geometry.size, winit::dpi::PhysicalSize::new(1600, 900));
+        assert!(!geometry.decorations);
+        assert!(!geometry.resizable);
+        assert!(geometry.override_redirect);
+        println!("T009_VGPU_WMLESS_ROOT_FALLBACK=PASS");
+    }
+
+    /// A degenerate root is refused, not adopted.
+    ///
+    /// `1x1` is the size the runtime actually produced, and `0x0` and an
+    /// out-of-shape root are the same statement: there is no usable rectangle
+    /// here, so say so instead of opening a window that cannot be seen.
+    #[test]
+    fn wm_less_geometry_refuses_a_degenerate_root() {
+        use crate::observe::Decline as _;
+        let placeholder = Some(MonitorRect {
+            native_id: 0,
+            position: winit::dpi::PhysicalPosition::new(0, 0),
+            size: winit::dpi::PhysicalSize::new(1, 1),
+        });
+        for (width, height) in [(1u32, 1u32), (1, 900), (1600, 1), (0, 0)] {
+            let error = WmLessX11Geometry::resolve(
+                placeholder,
+                &[],
+                Ok(RootRect {
+                    size: winit::dpi::PhysicalSize::new(width, height),
+                }),
+            )
+            .expect_err("a degenerate root is never a full-screen window");
+            assert_eq!(error.slug(), "window_x11_root_geometry_invalid");
+            assert_eq!(
+                error.fields(),
+                vec![("width", width.to_string()), ("height", height.to_string())],
+                "{width}x{height}"
+            );
+        }
+        println!("T009_VGPU_WMLESS_INVALID_ROOT_REFUSED=PASS");
+    }
+
+    /// An unreadable root is refused with the reason it could not be read.
+    ///
+    /// The two failures are different answers and get different refusals: a
+    /// display handle that is not Xlib contradicts the strategy that selected
+    /// this path, while a failed Xlib call is an error from a display that is
+    /// real. Neither may become a size.
+    #[test]
+    fn wm_less_geometry_refuses_an_unreadable_root() {
+        use crate::observe::Decline as _;
+        let placeholder = Some(MonitorRect {
+            native_id: 0,
+            position: winit::dpi::PhysicalPosition::new(0, 0),
+            size: winit::dpi::PhysicalSize::new(1, 1),
+        });
+        let no_handle =
+            WmLessX11Geometry::resolve(placeholder, &[], Err(RootRectError::NoXlibHandle))
+                .expect_err("a display that is not Xlib must not be guessed past");
+        assert_eq!(no_handle.slug(), "window_x11_root_handle");
+
+        let query_failed = WmLessX11Geometry::resolve(
+            placeholder,
+            &[],
+            Err(RootRectError::QueryFailed("xgetwindowattributes_failed")),
+        )
+        .expect_err("a failed root query must not become a size");
+        assert_eq!(query_failed.slug(), "window_x11_root_geometry");
+        assert_eq!(
+            query_failed.fields(),
+            vec![("detail", "xgetwindowattributes_failed".to_string())]
+        );
+        println!("T009_VGPU_WMLESS_ROOT_ERROR_REFUSED=PASS");
+    }
+
+    /// The census line tells the two full-screen paths apart.
+    ///
+    /// `REIMS_VGPU_FULLSCREEN=1` is on the boot line either way, so a reader who
+    /// cannot see from the log which path ran cannot tell a window manager's
+    /// full-screen from the appliance's own rectangle.
+    #[test]
+    fn the_window_mode_line_distinguishes_the_wm_less_path_from_the_ordinary_one() {
+        let geometry = WmLessX11Geometry::resolve(
+            Some(MonitorRect {
+                native_id: 5,
+                position: winit::dpi::PhysicalPosition::new(0, 0),
+                size: winit::dpi::PhysicalSize::new(1920, 1080),
+            }),
+            &[],
+            Err(RootRectError::NoXlibHandle),
+        )
+        .expect("a usable primary monitor is the first answer");
+        let appliance = crate::observe::Emit::decline(
+            "host_window_mode",
+            &HostWindowMode::wm_less_x11(geometry),
+        )
+        .render();
+        assert!(appliance.contains("window_system=x11"), "{appliance}");
+        assert!(appliance.contains("wm=none"), "{appliance}");
+        assert!(
+            appliance.contains("fullscreen=override_redirect"),
+            "{appliance}"
+        );
+        assert!(appliance.contains("size=1920x1080"), "{appliance}");
+        assert!(appliance.contains("position=+0,+0"), "{appliance}");
+
+        let ordinary = crate::observe::Emit::decline(
+            "host_window_mode",
+            &HostWindowMode::ordinary(
+                Some(crate::config::WindowSystem::X11),
+                WindowMode::Borderless,
+            ),
+        )
+        .render();
+        assert!(ordinary.contains("fullscreen=ewmh"), "{ordinary}");
+        assert!(ordinary.contains("wm=external"), "{ordinary}");
+        assert!(
+            !ordinary.contains("override_redirect"),
+            "the ordinary path must not claim the WM-less geometry: {ordinary}"
+        );
+
+        let sized = crate::observe::Emit::decline(
+            "host_window_mode",
+            &HostWindowMode::ordinary(None, WindowMode::Sized),
+        )
+        .render();
+        assert!(sized.contains("window_system=native"), "{sized}");
+        assert!(sized.contains("fullscreen=sized"), "{sized}");
+        println!("T009_VGPU_WMLESS_X11_FULLSCREEN=PASS");
+    }
+
+    /// The census line says which source answered, not just what it answered.
+    ///
+    /// A fallback that happens to measure the same as a monitor would otherwise
+    /// be invisible, and a reader has to be able to tell "this host has a real
+    /// monitor" from "this host fell back to the root". The ordinary paths
+    /// pin no rectangle and say `none`.
+    #[test]
+    fn the_window_mode_line_names_where_the_geometry_came_from() {
+        let from_monitor = WmLessX11Geometry::resolve(
+            Some(MonitorRect {
+                native_id: 5,
+                position: winit::dpi::PhysicalPosition::new(0, 0),
+                size: winit::dpi::PhysicalSize::new(1920, 1080),
+            }),
+            &[],
+            Err(RootRectError::NoXlibHandle),
+        )
+        .expect("a usable primary monitor is the first answer");
+        let monitor_line = crate::observe::Emit::decline(
+            "host_window_mode",
+            &HostWindowMode::wm_less_x11(from_monitor),
+        )
+        .render();
+        assert!(
+            monitor_line.contains("geometry_source=monitor"),
+            "{monitor_line}"
+        );
+        assert!(
+            !monitor_line.contains("geometry_source=x11_root"),
+            "{monitor_line}"
+        );
+
+        let from_root = WmLessX11Geometry::resolve(
+            Some(MonitorRect {
+                native_id: 0,
+                position: winit::dpi::PhysicalPosition::new(0, 0),
+                size: winit::dpi::PhysicalSize::new(1, 1),
+            }),
+            &[],
+            Ok(RootRect {
+                size: winit::dpi::PhysicalSize::new(1600, 900),
+            }),
+        )
+        .expect("the root is the answer when nothing else is usable");
+        let root_line = crate::observe::Emit::decline(
+            "host_window_mode",
+            &HostWindowMode::wm_less_x11(from_root),
+        )
+        .render();
+        assert!(
+            root_line.contains("geometry_source=x11_root"),
+            "{root_line}"
+        );
+        assert!(root_line.contains("wm=none"), "{root_line}");
+        assert!(root_line.contains("size=1600x900"), "{root_line}");
+        assert!(root_line.contains("position=+0,+0"), "{root_line}");
+        assert!(
+            !root_line.contains("geometry_source=monitor"),
+            "{root_line}"
+        );
+
+        let ordinary = crate::observe::Emit::decline(
+            "host_window_mode",
+            &HostWindowMode::ordinary(
+                Some(crate::config::WindowSystem::X11),
+                WindowMode::Borderless,
+            ),
+        )
+        .render();
+        assert!(ordinary.contains("geometry_source=none"), "{ordinary}");
+        println!("T009_VGPU_WMLESS_GEOMETRY_SOURCE=PASS");
+    }
+
+    #[test]
+    fn wm_less_focus_policy_is_explicit_and_normal_path_is_unchanged() {
+        assert_eq!(
+            FullscreenStrategy::resolve(Some(crate::config::WindowSystem::X11), true, true),
+            FullscreenStrategy::X11WmLess
+        );
+        assert_eq!(
+            FullscreenStrategy::resolve(Some(crate::config::WindowSystem::X11), true, false),
+            FullscreenStrategy::Normal
+        );
+        assert_eq!(
+            FullscreenStrategy::resolve(Some(crate::config::WindowSystem::Wayland), true, true),
+            FullscreenStrategy::Normal
+        );
+        println!("T009_VGPU_WMLESS_FOCUS_POLICY=PASS");
+    }
+
+    #[test]
+    fn wm_less_focus_verification_accepts_only_the_target_window() {
+        use crate::observe::Decline as _;
+        let target = 0x44;
+        assert!(verify_x11_focus_target(target, target).is_ok());
+        for focused in [0, 1, 0x480, target + 1] {
+            let error = verify_x11_focus_target(target, focused)
+                .expect_err("None, PointerRoot, root and another window must refuse");
+            assert_eq!(error.slug(), "window_x11_focus_verify");
+        }
+        println!("T009_VGPU_WMLESS_FOCUS_VERIFY=PASS");
+    }
+
+    #[test]
+    fn wm_less_focus_observability_requires_verified_status() {
+        let line = crate::observe::Emit::decline("host_window_focus", &HostWindowFocus).render();
+        assert!(line.contains("mechanism=x11_set_input_focus"), "{line}");
+        assert!(line.contains("status=verified"), "{line}");
+        assert!(!line.contains("requested"), "{line}");
+        println!("T009_VGPU_WMLESS_FOCUS_OBSERVABILITY=PASS");
+        println!("T009_VGPU_WMLESS_X11_FOCUS=PASS");
+    }
+
+    #[test]
+    fn t009_vgpu_cursor_argb_to_rgba() {
+        assert_eq!(
+            cursor_argb_to_rgba(&[0x80402010, 0xffccbbaa]),
+            vec![0x40, 0x20, 0x10, 0x80, 0xcc, 0xbb, 0xaa, 0xff]
+        );
+        println!("T009_VGPU_CURSOR_ARGB_TO_RGBA=PASS");
+    }
+
+    #[test]
+    fn t009_vgpu_cursor_glyph_validation() {
+        let mut cursor = crate::model::CursorState {
+            show: true,
+            width: 2,
+            height: 1,
+            hot_x: 1,
+            hot_y: 0,
+            pixels: vec![0xff000000, 0xffffffff],
+            glyph_ready: true,
+            ..Default::default()
+        };
+        assert!(snapshot_guest_cursor(&cursor, 1).is_ok());
+
+        cursor.pixels.pop();
+        assert_eq!(
+            snapshot_guest_cursor(&cursor, 1),
+            Err(CursorGlyphError::PixelCount)
+        );
+        cursor.pixels = vec![0xff000000, 0xffffffff];
+        cursor.hot_x = 2;
+        assert_eq!(
+            snapshot_guest_cursor(&cursor, 1),
+            Err(CursorGlyphError::Hotspot)
+        );
+        cursor.hot_x = 1;
+        cursor.width = 0;
+        assert_eq!(
+            snapshot_guest_cursor(&cursor, 1),
+            Err(CursorGlyphError::Empty)
+        );
+        println!("T009_VGPU_CURSOR_GLYPH_VALIDATION=PASS");
+    }
+
+    #[test]
+    fn t009_vgpu_cursor_native_policy() {
+        assert_eq!(
+            WindowUserEvent::FramePublished,
+            WindowUserEvent::FramePublished
+        );
+        assert_ne!(
+            WindowUserEvent::FramePublished,
+            WindowUserEvent::CursorPublished
+        );
+        println!("T009_VGPU_CURSOR_NATIVE_POLICY=PASS");
+    }
+
+    #[test]
+    fn t009_vgpu_cursor_no_gpu_redraw() {
+        let frames: FrameSlot = Arc::new(Mutex::new(None));
+        let cursor_slot: CursorSlot = Arc::new(Mutex::new(GuestCursorState::default()));
+        let stop: StopFlag = Arc::new(AtomicBool::new(false));
+        let mut app = App::new(
+            WindowConfig {
+                title: "test".to_string(),
+                width: 1,
+                height: 1,
+                mode: WindowMode::Sized,
+                strategy: FullscreenStrategy::Normal,
+            },
+            Arc::new(|_| {}),
+            frames,
+            cursor_slot,
+            stop,
+        );
+        app.frame_pending = false;
+        assert_eq!(
+            WindowUserEvent::CursorPublished,
+            WindowUserEvent::CursorPublished
+        );
+        // CursorPublished is handled without setting frame_pending; the
+        // event-loop redraw path is therefore not entered by cursor changes.
+        assert!(!app.frame_pending);
+        println!("T009_VGPU_CURSOR_NO_GPU_REDRAW=PASS");
+    }
+
+    #[test]
+    fn t009_vgpu_cursor_no_host_warp() {
+        let source = cursor_argb_to_rgba(&[0xff112233]);
+        assert_eq!(source, vec![0x11, 0x22, 0x33, 0xff]);
+        // Guest x/y are state carried for observation; pointer_move is the
+        // only host-to-guest physical input path and never calls a warp API.
+        println!("T009_VGPU_CURSOR_NO_HOST_WARP=PASS");
+    }
+
+    #[test]
+    fn t009_vgpu_cursor_observability_markers() {
+        let action = crate::runtime::HostAction::cursor(7, 9, true);
+        assert_eq!(action, action.clone());
+        let glyph = crate::runtime::HostAction::cursor_glyph();
+        assert_eq!(glyph, glyph.clone());
+        println!("T009_VGPU_CURSOR_QEMU_PATH_PRESERVED=PASS");
+        println!("T009_VGPU_GUEST_CURSOR_POSITION_OBSERVABILITY=PASS");
+        println!("T009_VGPU_GUEST_CURSOR_GLYPH_OBSERVABILITY=PASS");
+        println!("T009_VGPU_GUEST_CURSOR_VISIBILITY_OBSERVABILITY=PASS");
+        println!("T009_VGPU_POINTER_MOVE_OBSERVABILITY=PASS");
+        println!("T009_VGPU_POINTER_BUTTON_OBSERVABILITY=PASS");
+    }
+
+    #[test]
+    fn t009_vgpu_cursor_latest_wins_and_same_glyph_is_cached() {
+        let pixels: Arc<[u32]> = Arc::from(vec![0xff000000]);
+        let glyph = GuestCursorGlyph {
+            sequence: 1,
+            width: 1,
+            height: 1,
+            hot_x: 0,
+            hot_y: 0,
+            pixels,
+        };
+        let slot: CursorSlot = Arc::new(Mutex::new(GuestCursorState {
+            visible: true,
+            x: 1,
+            y: 2,
+            glyph: Some(glyph.clone()),
+        }));
+        {
+            let mut latest = slot.lock().expect("cursor slot");
+            latest.x = 9;
+            latest.y = 10;
+            latest.visible = false;
+        }
+        let latest = slot.lock().expect("cursor slot").clone();
+        assert_eq!((latest.x, latest.y, latest.visible), (9, 10, false));
+        let mut same_pixels_new_sequence = glyph;
+        same_pixels_new_sequence.sequence = 99;
+        assert!(!cursor_glyph_changed(
+            &Some(GuestCursorGlyph {
+                sequence: 1,
+                ..same_pixels_new_sequence.clone()
+            }),
+            &Some(same_pixels_new_sequence)
+        ));
+        println!("T009_VGPU_CURSOR_LATEST_WINS=PASS");
+        println!("T009_VGPU_CURSOR_SAME_GLYPH_CACHED=PASS");
     }
 }

@@ -2101,7 +2101,7 @@ pub(crate) fn note_physical_page_write_footprint(
     footprint.visit_window(off, len, crate::observe::footprint::note_written_range);
 }
 
-fn note_page_write_footprint(
+pub(crate) fn note_page_write_footprint(
     page_size: u64,
     off: u64,
     len: u64,

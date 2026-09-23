@@ -21,6 +21,80 @@ use crate::runtime::mapper::{mapping_guest_write_verdict, GuestWriteVerdict};
 use crate::runtime::surface_currency::{surface_currency, CurrencyStandard, SurfaceCurrency};
 use reims_vgpu_protocol::pass_action::MTL_LOAD_ACTION_DONT_CARE;
 
+fn target_content_probe_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            crate::config::read(crate::config::TARGET_CONTENT_PROBE).0,
+            crate::config::Switch::On
+        )
+    })
+}
+
+fn blend_replace_probe_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            crate::config::read(crate::config::BLEND_REPLACE_PROBE).0,
+            crate::config::Switch::On
+        )
+    })
+}
+
+/// A cheap, stable fingerprint for diagnostic frame comparisons. Sampling one
+/// byte per 4 KiB keeps the probe bounded even for a full 4K target while still
+/// distinguishing the repeated corruption patterns seen in the VM.
+fn target_content_signature(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64 ^ bytes.len() as u64;
+    for &byte in bytes.iter().step_by(4096) {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    for &byte in bytes.iter().rev().take(64) {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+fn target_content_diff_outside(
+    before: &[u8],
+    after: &[u8],
+    width: u32,
+    height: u32,
+    scissor_x: u32,
+    scissor_y: u32,
+    scissor_width: u32,
+    scissor_height: u32,
+) -> (u64, u64) {
+    let pixels = (width as usize).saturating_mul(height as usize);
+    let available = before.len().min(after.len()) / 4;
+    let mut changed_outside = 0;
+    let mut changed_inside = 0;
+    let x_end = scissor_x.saturating_add(scissor_width).min(width);
+    let y_end = scissor_y.saturating_add(scissor_height).min(height);
+    for index in 0..pixels.min(available) {
+        let x = (index as u32) % width.max(1);
+        let y = (index as u32) / width.max(1);
+        let offset = index * 4;
+        if before[offset..offset + 4] == after[offset..offset + 4] {
+            continue;
+        }
+        if x >= scissor_x && x < x_end && y >= scissor_y && y < y_end {
+            changed_inside += 1;
+        } else {
+            changed_outside += 1;
+        }
+    }
+    (changed_outside, changed_inside)
+}
+
+fn target_content_probe_budget() -> Option<u64> {
+    static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    (n < 128).then_some(n)
+}
+
 /// Vulkan image shape for a reflected Metal sampled-image dimensionality.
 ///
 /// The engine caps array layers at 1 (a single-layer array is still a distinct
@@ -547,6 +621,15 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                     false
                 }
             } else if c0.target_gva != 0 {
+                // `execute_draw_request` reports the physical order of the
+                // resident readback separately from its byte vector.  GVA
+                // writeback and the GVA host caches consume semantic RGBA8,
+                // so normalize a BGRA resident before either consumer sees
+                // it.  Without this, a BGRA GVA Store is published as though
+                // it were RGBA8; the next partial LOAD then seeds the target
+                // with exchanged R/B channels and the corruption appears
+                // outside the draw's scissor.
+                reorder_rb_in_place(&mut rgba, draw_bgra, false);
                 // What this Store would cost if it were served the way the
                 // mapper-ref-texture surface Store is served.
                 //
@@ -8004,6 +8087,71 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 } else {
                     (tw, th)
                 };
+                let folded_swizzle = view_swizzle.unwrap_or_default().after(&sampled_components);
+                // The remaining live corruption is concentrated in small glyphs,
+                // list rows, and buttons. Keep one bounded breadcrumb for the
+                // texture classes most likely to explain those pixels: the R8
+                // representation used by A8, resident ref-textures, and any
+                // non-identity component mapping. This is intentionally keyed by
+                // the contract rather than by texture_ref: a ref can be reused
+                // for unrelated resources over the lifetime of the guest.
+                let source_route = match &source {
+                    crate::backend::vulkan::engine::SampledSource::Bytes(_) => "bytes",
+                    crate::backend::vulkan::engine::SampledSource::Target(_) => "target",
+                    crate::backend::vulkan::engine::SampledSource::GuestRuns(..) => "guest_runs",
+                };
+                let origin_code: u64 = match byte_origin {
+                    crate::backend::vulkan::engine::SampledByteOrigin::Synthetic => 0,
+                    crate::backend::vulkan::engine::SampledByteOrigin::AttachmentAlias => 1,
+                    crate::backend::vulkan::engine::SampledByteOrigin::BufferBackedTexture => 2,
+                    crate::backend::vulkan::engine::SampledByteOrigin::SerializedSurfaceView => 3,
+                    crate::backend::vulkan::engine::SampledByteOrigin::SurfaceHostCache => 4,
+                    crate::backend::vulkan::engine::SampledByteOrigin::SurfaceGuestFallback => 5,
+                    crate::backend::vulkan::engine::SampledByteOrigin::LinearTexture => 6,
+                };
+                let route_code: u64 = match source_route {
+                    "bytes" => 1,
+                    "target" => 2,
+                    _ => 3,
+                };
+                let swizzle_code = folded_swizzle
+                    .source
+                    .iter()
+                    .enumerate()
+                    .fold(0_u64, |packed, (slot, source)| {
+                        packed | ((*source as u64) << (slot * 8))
+                    });
+                let inspect_sampled_contract = sampled_vk_format == ash::vk::Format::R8_UNORM
+                    || source_is_target
+                    || !folded_swizzle.is_identity();
+                if inspect_sampled_contract {
+                    let key = crate::backend::hash::hash_u64(
+                        sampled_vk_format.as_raw() as u64
+                            ^ (origin_code << 32)
+                            ^ (route_code << 60),
+                        swizzle_code ^ (u64::from(tw) << 32) ^ u64::from(th),
+                    );
+                    if crate::observe::first_sight("sampled_texture_contract", key) {
+                        crate::observe::off(format!(
+                            "sampled_texture_contract task={} pipe={} stage={} idx={} ref={} bind={} size={}x{} layers={} vk={:?} origin={:?} route={} components={:?} view_swizzle={:?} folded={:?}",
+                            req.task_id,
+                            req.pipeline_ref,
+                            if frag_stage { "frag" } else { "vert" },
+                            index,
+                            texture_ref,
+                            img_bind,
+                            tw,
+                            th,
+                            layers,
+                            sampled_vk_format,
+                            byte_origin,
+                            source_route,
+                            sampled_components,
+                            view_swizzle,
+                            folded_swizzle,
+                        ));
+                    }
+                }
                 images.push(crate::backend::vulkan::engine::SampledImageResource {
                     binding: img_bind,
                     array_element,
@@ -8028,7 +8176,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     // "does this need it" branch: identity is the unit on both
                     // sides, so the fold is a no-op for every bind that does not
                     // need it, and there is no case left to forget.
-                    swizzle: view_swizzle.unwrap_or_default().after(&sampled_components),
+                    swizzle: folded_swizzle,
                 });
                 Ok(())
             };
@@ -8740,20 +8888,52 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // one scissor it is the whole answer, and with several it is the one a
         // single-rect damage bound would have to start from.
         if let Some(scissor) = req.scissors.first() {
+            let seeded = target_rgba8.is_some() || target_guest_seed.is_some();
+            let guest_backed = req
+                .colors
+                .first()
+                .is_some_and(|c| c.mapping_id != 0 || c.target_gva != 0);
+            if !scissor.covers(w, h)
+                && req.colors.first().is_some_and(|c| {
+                    reims_vgpu_protocol::pass_action::LoadAction::from_declared(c.load_action)
+                        .preserves_prior_contents()
+                })
+                && !seeded
+                && !chain_load_from_target
+                && crate::observe::first_sight(
+                    "partial_unseeded_draw",
+                    u64::from(req.pipeline_ref),
+                )
+            {
+                let color = req.colors.first();
+                crate::observe::off(format!(
+                    "partial_unseeded_draw pipe={} target_gva={:#x} mapping={} texture_ref={} target={}x{} scissor={},{},{},{} load={:#x} guest_backed={}",
+                    req.pipeline_ref,
+                    color.map(|c| c.target_gva).unwrap_or(0),
+                    color.map(|c| c.mapping_id).unwrap_or(0),
+                    color.map(|c| c.texture_ref).unwrap_or(0),
+                    w,
+                    h,
+                    scissor.x,
+                    scissor.y,
+                    scissor.width,
+                    scissor.height,
+                    color.map(|c| c.load_action).unwrap_or(0),
+                    guest_backed as u8,
+                ));
+            }
             note_draw_coverage(
                 *scissor,
                 w,
                 h,
                 req.colors.first().map(|c| c.load_action),
-                target_rgba8.is_some() || target_guest_seed.is_some(),
+                seeded,
                 chain_load_from_target,
                 // Guest-visible backing is a mapper-ref-texture mapping or a task GVA, and
                 // the two are exclusive — `ColorRtRequest::target_gva` documents
                 // that. Either one means the surface has pages the guest's own
                 // CPU can write without this device seeing it.
-                req.colors
-                    .first()
-                    .is_some_and(|c| c.mapping_id != 0 || c.target_gva != 0),
+                guest_backed,
             );
         }
         // The mode is the guest's raw `MTLVisibilityResultMode`; the engine
@@ -9026,6 +9206,15 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 dst_alpha: pd.color0.dst_alpha,
                 op_alpha: pd.color0.op_alpha,
             });
+        }
+        if blend_replace_probe_enabled() {
+            resources.blend = None;
+            if crate::observe::first_sight("blend_replace_probe", req.pipeline_ref as u64) {
+                crate::observe::off(format!(
+                    "blend_replace_probe pipe={} {}x{} declared_blend={}",
+                    req.pipeline_ref, w, h, pd.color0.blending_enabled as u8,
+                ));
+            }
         }
 
         // The engine ignores this when the draw is indexed (the index count
@@ -9548,12 +9737,162 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 )
             })?;
         }
+        let target_content_probe = target_content_probe_enabled()
+            && req.scissors.first().is_some_and(|scissor| {
+                !(scissor.x == 0 && scissor.y == 0 && scissor.width >= w && scissor.height >= h)
+            })
+            && req.colors.first().is_some_and(|color| {
+                reims_vgpu_protocol::pass_action::LoadAction::from_declared(color.load_action)
+                    .preserves_prior_contents()
+            });
+        // The probe needs the same resident bytes that the partial pass is
+        // supposed to preserve. A diagnostic readback is deliberately forced
+        // for this draw only; the normal resident/no-readback path remains
+        // unchanged when the switch is off.
+        let probe_id = target_content_probe
+            .then(target_content_probe_budget)
+            .flatten();
+        let mut probe_before_pixels = None;
+        let mut probe_resident_text = None;
+        if let Some(probe_id) = probe_id {
+            let before_pixels = if let Some(seed) = resources.target_rgba8.as_deref() {
+                let mut pixels = seed.to_vec();
+                if resources.target_seed_order == crate::backend::vulkan::engine::SeedOrder::Rgba8 {
+                    for pixel in pixels.chunks_exact_mut(4) {
+                        pixel.swap(0, 2);
+                    }
+                }
+                if let Some(identity) = resources.target_identity.as_ref() {
+                    probe_resident_text = crate::backend::vulkan::engine::read_target(identity)
+                        .ok()
+                        .and_then(|readback| readback.into_bgra8())
+                        .map(|resident| {
+                            format!(
+                                " resident_sig={:016x}",
+                                target_content_signature(&resident)
+                            )
+                        });
+                }
+                Some(pixels)
+            } else if let Some(identity) = resources.target_identity.as_ref() {
+                crate::backend::vulkan::engine::read_target(identity)
+                    .ok()
+                    .and_then(|readback| readback.into_bgra8())
+            } else {
+                None
+            };
+            let before = before_pixels.as_ref().map(|pixels| {
+                let source = if resources.target_rgba8.is_some() {
+                    "cpu_seed"
+                } else {
+                    "resident"
+                };
+                let first = pixels
+                    .get(..4)
+                    .map(|px| format!("[{},{},{},{}]", px[0], px[1], px[2], px[3]))
+                    .unwrap_or_else(|| "none".to_string());
+                (source, target_content_signature(pixels), first)
+            });
+            probe_before_pixels = before_pixels;
+            let before_text = before
+                .map(|(source, signature, first)| {
+                    format!("source={source} sig={signature:016x} first={first}")
+                })
+                .unwrap_or_else(|| "source=unavailable sig=none".to_string());
+            let before_text = format!(
+                "{before_text}{}",
+                probe_resident_text.as_deref().unwrap_or("")
+            );
+            let scissor = req.scissors.first().expect("probe requires a scissor");
+            crate::observe::off(format!(
+                "target_content_probe phase=before id={probe_id} pipe={} target={:?} mapping={} gva={:#x} size={}x{} scissor={},{},{},{} load={:#x} {before_text}",
+                req.pipeline_ref,
+                resources.target_identity,
+                req.colors.first().map(|color| color.mapping_id).unwrap_or(0),
+                req.colors.first().map(|color| color.target_gva).unwrap_or(0),
+                w,
+                h,
+                scissor.x,
+                scissor.y,
+                scissor.width,
+                scissor.height,
+                req.colors.first().map(|color| color.load_action).unwrap_or(0),
+            ));
+            resources.skip_readback = false;
+        }
         // The engine's own typed `DrawError` (a `vk_*` VkCall slug, a
         // `DrawReason` refusal, an interim `_untyped`) propagates unchanged so
         // the boundary below names the engine's specific check as the primary
         // `reason=` rather than flattening it into a `vk_engine: {e}` blob.
         crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Engine);
         let out = crate::backend::vulkan::engine::execute_draw_request(state, &resources)?;
+        if let Some(probe_id) = probe_id {
+            let after = if out.pixels.is_empty() {
+                "source=unavailable sig=none".to_string()
+            } else if let (Some(before), Some(scissor)) =
+                (probe_before_pixels.as_deref(), req.scissors.first())
+            {
+                let mut after_pixels = out.pixels.clone();
+                if !out.pixels_bgra {
+                    for pixel in after_pixels.chunks_exact_mut(4) {
+                        pixel.swap(0, 2);
+                    }
+                }
+                let (changed_outside, changed_inside) = target_content_diff_outside(
+                    before,
+                    &after_pixels,
+                    w,
+                    h,
+                    scissor.x,
+                    scissor.y,
+                    scissor.width,
+                    scissor.height,
+                );
+                let mut swapped_after = after_pixels.clone();
+                for pixel in swapped_after.chunks_exact_mut(4) {
+                    pixel.swap(0, 2);
+                }
+                let (changed_outside_swapped, changed_inside_swapped) =
+                    target_content_diff_outside(
+                        before,
+                        &swapped_after,
+                        w,
+                        h,
+                        scissor.x,
+                        scissor.y,
+                        scissor.width,
+                        scissor.height,
+                    );
+                let first = after_pixels
+                    .get(..4)
+                    .map(|px| format!("[{},{},{},{}]", px[0], px[1], px[2], px[3]))
+                    .unwrap_or_else(|| "none".to_string());
+                format!(
+                    "source=draw_readback sig={:016x} first={} readback_bgra={} \
+                     changed_outside={} changed_inside={} \
+                     swapped_outside={} swapped_inside={}",
+                    target_content_signature(&after_pixels),
+                    first,
+                    out.pixels_bgra as u8,
+                    changed_outside,
+                    changed_inside,
+                    changed_outside_swapped,
+                    changed_inside_swapped,
+                )
+            } else {
+                format!(
+                    "source=draw_readback sig={:016x}",
+                    target_content_signature(&out.pixels)
+                )
+            };
+            crate::observe::off(format!(
+                "target_content_probe phase=after id={probe_id} pipe={} target={:?} size={}x{} {after}",
+                req.pipeline_ref,
+                resources.target_identity,
+                w,
+                h,
+            ));
+        }
         // Carried back on the request so `runtime::exec` can sum the chain's
         // draws into the guest's buffer. The engine reports per draw because a
         // Metal pass whose counter spans several draws is several Vulkan

@@ -49,6 +49,106 @@ use reims_vgpu_wire::ops::render as wire;
 use reims_vgpu_wire::ops::render_pass as wire_pass;
 use reims_vgpu_wire::ops::tile as wire_tile;
 
+/// Metadata for an OpenGL compatibility record this decoder does not yet
+/// interpret. The PCI guest personality currently declines `supportsOpenGL`,
+/// so these records should not appear in the normal x86 path. This inventory
+/// is diagnostic only and does not authorize or decode their payloads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OpenGlCompatOpcode {
+    pub opcode: u32,
+    pub selector: &'static str,
+    pub body_len: usize,
+}
+
+/// Records unlocked by the serializer's OpenGL compatibility rung. Selector
+/// names and body lengths mirror the measured serializer inventory in
+/// `reims-vgpu-wire::manifest`.
+pub const OPENGL_COMPAT_OPCODES: &[OpenGlCompatOpcode] = &[
+    OpenGlCompatOpcode {
+        opcode: 0x8a,
+        selector: "setAlphaTestReferenceValue:",
+        body_len: 4,
+    },
+    OpenGlCompatOpcode {
+        opcode: 0x8b,
+        selector: "setPointSize:",
+        body_len: 4,
+    },
+    OpenGlCompatOpcode {
+        opcode: 0x8c,
+        selector: "setClipPlane:p2:p3:p4:atIndex:",
+        body_len: 20,
+    },
+    OpenGlCompatOpcode {
+        opcode: 0x8d,
+        selector: "setVertexSamplerState:lodMinClamp:lodMaxClamp:lodBias:atIndex:",
+        body_len: 20,
+    },
+    OpenGlCompatOpcode {
+        opcode: 0x8e,
+        selector: "setFragmentSamplerState:lodMinClamp:lodMaxClamp:lodBias:atIndex:",
+        body_len: 20,
+    },
+    OpenGlCompatOpcode {
+        opcode: 0x8f,
+        selector: "setViewportTransformEnabled:",
+        body_len: 4,
+    },
+    OpenGlCompatOpcode {
+        opcode: 0x90,
+        selector: "setProvokingVertexMode:",
+        body_len: 4,
+    },
+    OpenGlCompatOpcode {
+        opcode: 0x91,
+        selector: "setPrimitiveRestartEnabled:index:",
+        body_len: 8,
+    },
+    OpenGlCompatOpcode {
+        opcode: 0x92,
+        selector: "setTriangleFrontFillMode:backFillMode:",
+        body_len: 4,
+    },
+    OpenGlCompatOpcode {
+        opcode: 0x93,
+        selector: "setTransformFeedbackState:",
+        body_len: 4,
+    },
+    OpenGlCompatOpcode {
+        opcode: 0x94,
+        selector: "setDepthCleared",
+        body_len: 0,
+    },
+    OpenGlCompatOpcode {
+        opcode: 0x95,
+        selector: "setStencilCleared",
+        body_len: 0,
+    },
+    OpenGlCompatOpcode {
+        opcode: 0x96,
+        selector: "setColorResolveTexture:slice:depthPlane:level:yInvert:atIndex:",
+        body_len: 16,
+    },
+    OpenGlCompatOpcode {
+        opcode: 0x97,
+        selector: "setDepthResolveTexture:slice:depthPlane:level:yInvert:",
+        body_len: 12,
+    },
+    OpenGlCompatOpcode {
+        opcode: 0x98,
+        selector: "setStencilResolveTexture:slice:depthPlane:level:yInvert:",
+        body_len: 12,
+    },
+];
+
+/// Metadata for a known OpenGL compatibility opcode, if present.
+#[inline]
+pub fn opengl_compat_opcode(opcode: u32) -> Option<&'static OpenGlCompatOpcode> {
+    OPENGL_COMPAT_OPCODES
+        .iter()
+        .find(|record| record.opcode == opcode)
+}
+
 /// Which unsettled record this is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Kind {
@@ -485,6 +585,17 @@ mod tests {
     use super::*;
     use reims_vgpu_protocol::closure::{Rail, LEDGER};
     use reims_vgpu_wire::OP_HEADER_LEN;
+
+    #[test]
+    fn opengl_compatibility_inventory_is_explicit_and_closed() {
+        assert_eq!(OPENGL_COMPAT_OPCODES.len(), 15);
+        assert!(opengl_compat_opcode(0x8a).is_some());
+        assert!(opengl_compat_opcode(0x98).is_some());
+        assert_eq!(opengl_compat_opcode(0x94).unwrap().body_len, 0);
+        assert_eq!(opengl_compat_opcode(0x8d).unwrap().body_len, 20);
+        assert!(opengl_compat_opcode(0x89).is_none());
+        assert!(opengl_compat_opcode(0x99).is_none());
+    }
 
     fn record(opcode: u32, total_len: u32) -> Vec<u8> {
         let mut v = vec![0u8; total_len as usize];

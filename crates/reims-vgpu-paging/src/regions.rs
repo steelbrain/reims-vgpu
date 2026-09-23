@@ -103,14 +103,10 @@ pub struct WindowRegion {
 #[derive(Clone, Copy, Debug)]
 pub struct WindowGeometry {
     pub pitch_bytes: u64,
+    pub bytes_per_texel: u64,
     pub width_texels: u32,
     pub height_texels: u32,
 }
-
-/// Bytes per texel. This rail is BGRA8 only — the device's `mapping_write`
-/// refuses any other format by name before reaching here, so widening this is
-/// a format decision made there and not a constant to generalise on spec.
-const BYTES_PER_TEXEL: u64 = 4;
 
 impl WindowGeometry {
     /// One past the last byte the frame's texels occupy: the last texel of the
@@ -120,7 +116,7 @@ impl WindowGeometry {
             return 0;
         }
         u64::from(self.height_texels - 1) * self.pitch_bytes
-            + u64::from(self.width_texels) * BYTES_PER_TEXEL
+            + u64::from(self.width_texels) * self.bytes_per_texel
     }
 }
 
@@ -135,14 +131,18 @@ impl WindowGeometry {
 /// and two fragments, so merging is the difference between three rectangles per
 /// run and four, over five hundred runs. It is only valid because the copy
 /// descriptor carries the row stride separately — the caller must set its
-/// buffer row length to `pitch_bytes / 4` for a merged rectangle to name the
+/// buffer row length to `pitch_bytes / bytes_per_texel` for a merged rectangle to name the
 /// bytes this function thinks it names.
 pub fn plan_regions(geom: &WindowGeometry, start: u64, end: u64) -> Vec<WindowRegion> {
     let mut out = Vec::new();
-    if geom.pitch_bytes == 0 || geom.width_texels == 0 || geom.height_texels == 0 {
+    if geom.bytes_per_texel == 0
+        || geom.pitch_bytes == 0
+        || geom.width_texels == 0
+        || geom.height_texels == 0
+    {
         return out;
     }
-    let row_texel_bytes = u64::from(geom.width_texels) * BYTES_PER_TEXEL;
+    let row_texel_bytes = u64::from(geom.width_texels) * geom.bytes_per_texel;
     // Never past the frame: a window longer than the texels it describes must
     // not turn its tail into rows that do not exist.
     let end = end.min(geom.extent_end());
@@ -164,8 +164,8 @@ pub fn plan_regions(geom: &WindowGeometry, start: u64, end: u64) -> Vec<WindowRe
         if seg_start >= seg_end {
             continue;
         }
-        let x = (seg_start - row_start) / BYTES_PER_TEXEL;
-        let width = (seg_end - seg_start) / BYTES_PER_TEXEL;
+        let x = (seg_start - row_start) / geom.bytes_per_texel;
+        let width = (seg_end - seg_start) / geom.bytes_per_texel;
         if width == 0 {
             continue;
         }
@@ -207,9 +207,11 @@ pub fn plan_regions(geom: &WindowGeometry, start: u64, end: u64) -> Vec<WindowRe
 mod tests {
     use super::*;
     use alloc::vec;
+    const BYTES_PER_TEXEL: u64 = 4;
 
     fn tight(width: u32, height: u32) -> WindowGeometry {
         WindowGeometry {
+            bytes_per_texel: 4,
             pitch_bytes: u64::from(width) * BYTES_PER_TEXEL,
             width_texels: width,
             height_texels: height,
@@ -285,6 +287,7 @@ mod tests {
     #[test]
     fn each_rectangles_offset_names_the_byte_its_first_texel_sits_at() {
         let g = WindowGeometry {
+            bytes_per_texel: 4,
             pitch_bytes: 7808, // 1920 texels plus 128 bytes of padding
             width_texels: 1920,
             height_texels: 64,
@@ -308,6 +311,7 @@ mod tests {
     #[test]
     fn a_padded_pitch_never_covers_the_padding() {
         let g = WindowGeometry {
+            bytes_per_texel: 4,
             pitch_bytes: 4096,
             width_texels: 1000, // 4000 bytes of texels, 96 bytes of padding
             height_texels: 8,
@@ -349,6 +353,7 @@ mod tests {
     #[test]
     fn degenerate_geometry_plans_nothing() {
         let zero_pitch = WindowGeometry {
+            bytes_per_texel: 4,
             pitch_bytes: 0,
             width_texels: 4,
             height_texels: 4,
@@ -360,5 +365,20 @@ mod tests {
         let g = tight(16, 16);
         assert!(plan_regions(&g, 100, 100).is_empty());
         assert!(plan_regions(&g, 200, 100).is_empty());
+    }
+
+    #[test]
+    fn rgba32_geometry_uses_sixteen_bytes_per_texel() {
+        let g = WindowGeometry {
+            pitch_bytes: 24576,
+            bytes_per_texel: 16,
+            width_texels: 1504,
+            height_texels: 6016,
+        };
+        assert_eq!(g.extent_end(), 147848704);
+        let first = plan_regions(&g, 0, 4096);
+        assert_eq!((first[0].x, first[0].width), (0, 256));
+        let tail = plan_regions(&g, 16384, 24576);
+        assert_eq!((tail[0].x, tail[0].width), (1024, 480));
     }
 }

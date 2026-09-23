@@ -54,7 +54,6 @@ use crate::runtime::objects;
 use crate::runtime::render_pass::{
     ColorAttachment, DepthAttachment, ScissorRect, StencilAttachment,
 };
-#[cfg(test)]
 use reims_vgpu_protocol::pass_action::MTL_LOAD_ACTION_DONT_CARE;
 use reims_vgpu_protocol::pass_action::{is_declared_load_action, is_declared_store_action};
 use reims_vgpu_protocol::pass_action::{
@@ -65,6 +64,16 @@ use reims_vgpu_protocol::pass_action::{
 // sibling of `metal`, and gated once here rather than per item.
 #[cfg(feature = "backend-vulkan")]
 pub mod vulkan;
+
+fn dontcare_seed_probe_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            crate::config::read(crate::config::DONTCARE_SEED_PROBE).0,
+            crate::config::Switch::On
+        )
+    })
+}
 // Only for `exec`'s pass-extent census, which declares its own copy of these
 // bands because it runs on every backend. See
 // `the_two_coverage_censuses_use_the_same_bands`.
@@ -2548,7 +2557,21 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
             if mapping_id == 0 {
                 seed = Some(solid_rgba8(mw, mh, &att.clear_color));
             }
-        } else if att.load_action == MTL_LOAD_ACTION_LOAD && mapping_id == 0 {
+        } else if mapping_id == 0
+            && (att.load_action == MTL_LOAD_ACTION_LOAD
+                || (dontcare_seed_probe_enabled()
+                    && att.load_action == MTL_LOAD_ACTION_DONT_CARE))
+        {
+            if att.load_action == MTL_LOAD_ACTION_DONT_CARE
+                && crate::observe::first_sight("dontcare_seed_probe", u64::from(att.texture_ref))
+            {
+                crate::observe::off(format!(
+                    "dontcare_seed_probe texture_ref={} target={}x{}",
+                    att.texture_ref,
+                    mw,
+                    mh
+                ));
+            }
             // # This arm compares an ordinal, and the contract term is wider
             //
             // `MTLLoadActionDontCare` also promises the prior contents --

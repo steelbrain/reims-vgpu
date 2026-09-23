@@ -272,6 +272,59 @@ fn pass_churn_probe_enabled() -> bool {
     })
 }
 
+fn geometry_probe_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            crate::config::read(crate::config::TARGET_CONTENT_PROBE).0,
+            crate::config::Switch::On
+        )
+    })
+}
+
+fn first_materialization_clear_probe_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            crate::config::read(crate::config::FIRST_MATERIALIZATION_CLEAR_PROBE).0,
+            crate::config::Switch::On
+        )
+    })
+}
+
+fn first_materialization_zero_seed_probe_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            crate::config::read(crate::config::FIRST_MATERIALIZATION_ZERO_SEED_PROBE).0,
+            crate::config::Switch::On
+        )
+    })
+}
+
+fn first_materialization_explicit_barrier_probe_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            crate::config::read(crate::config::FIRST_MATERIALIZATION_EXPLICIT_BARRIER_PROBE).0,
+            crate::config::Switch::On
+        )
+    })
+}
+
+fn geometry_probe_budget(req: &DrawRequest) -> bool {
+    static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let partial = req.scissors.iter().any(|scissor| {
+        !(scissor.x == 0
+            && scissor.y == 0
+            && scissor.width >= req.width
+            && scissor.height >= req.height)
+    });
+    geometry_probe_enabled()
+        && partial
+        && COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 128
+}
+
 fn compute_gather_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
@@ -733,7 +786,7 @@ unsafe fn stage_buffer_content(
                 // deferred-submit hot path, ~4.8 binds/draw under compositing).
                 let slot = {
                     let _s = stage_phase::Span::open(stage_phase::Part::Acquire);
-                    pools.acquire_staging(ctx, src.total_len, counters)?
+                    pools.acquire_staging_cpu_snapshot(ctx, src.total_len, counters)?
                 };
                 let _s = stage_phase::Span::moving(stage_phase::Part::Runs, src.total_len);
                 pools.write_staging_from_runs(
@@ -3023,8 +3076,20 @@ pub(crate) unsafe fn execute_draw_inner(
             super::reason::DrawReason::UsedBindingAbsentFromLayout { binding, fragment },
         ));
     }
-    // Resolve load action: resident > guest/host seed > Clear black.
-    let mut load_uses_gpu_content = req.load_from_target;
+    // Resolve load action: resident > guest/host seed > Clear black. A
+    // preserving guest pass may arrive without an explicit seed: on a later
+    // compositor damage draw, the existing resident is itself the seed.
+    // Leaving that pass as DONT_CARE permits Vulkan to discard untouched
+    // regions, which appears as stale/duplicated UI in the host window.
+    let preserving_existing_target = req.color0_declared.is_some_and(|declared| {
+        declared.preserves_prior_contents()
+            && req.target_identity.as_ref().is_some_and(|identity| {
+                pools
+                    .registry_get(identity)
+                    .is_some_and(|slot| slot.content_ready)
+            })
+    });
+    let mut load_uses_gpu_content = req.load_from_target || preserving_existing_target;
     // output_bgra (computed with the batch decision above): BGRA output only
     // on the resident path (pooled targets stay RGBA); the whole
     // pass/pipeline/image chain then agrees on B8G8R8A8 so a raw image→buffer
@@ -3047,10 +3112,47 @@ pub(crate) unsafe fn execute_draw_inner(
     // The second question used to have no representation here, so both answers
     // resolved to `CLEAR` and an unseeded preserving pass was cleared to a
     // colour the guest never supplied. See [`Color0Load`].
-    let color0_load = if load_uses_gpu_content
+    let first_materialization_clear_probe = first_materialization_clear_probe_enabled()
+        && req.target_rgba8.is_some()
+        && req.target_identity.as_ref().is_some_and(|identity| {
+            !pools.registry_content_ready(identity)
+        })
+        && req.scissors.iter().any(|scissor| {
+            !(scissor.x == 0
+                && scissor.y == 0
+                && scissor.width >= req.width
+                && scissor.height >= req.height)
+        })
+        && req
+            .color0_declared
+            .is_some_and(|declared| declared.preserves_prior_contents());
+    let first_materialization_zero_seed_probe = first_materialization_zero_seed_probe_enabled()
+        && req.target_rgba8.is_some()
+        && req.target_identity.as_ref().is_some_and(|identity| {
+            !pools.registry_content_ready(identity)
+        })
+        && req.scissors.iter().any(|scissor| {
+            !(scissor.x == 0
+                && scissor.y == 0
+                && scissor.width >= req.width
+                && scissor.height >= req.height)
+        })
+        && req
+            .color0_declared
+            .is_some_and(|declared| declared.preserves_prior_contents());
+    let color0_load = if first_materialization_clear_probe {
+        Color0Load::Clear
+    } else if load_uses_gpu_content
         || seed_bytes.is_some()
         || req.target_guest_seed.is_some()
         || req.seed_from_target.is_some()
+        // The mapper-ref-texture path supplies the guest allocation as the
+        // attachment's backing after the request is assembled. Keep the pass
+        // on LOAD from the outset when that backing was admitted; otherwise a
+        // damage-only draw can enter with DONT_CARE/CLEAR and destroy the
+        // pixels its scissor does not repaint.
+        || (req.load_guest_target_backing && req.guest_target_memory.is_some())
+        || preserving_existing_target
     {
         Color0Load::Preserve
     } else if req
@@ -3545,13 +3647,19 @@ pub(crate) unsafe fn execute_draw_inner(
         }
         Some((rgba8, layout))
     });
-    let seed_slot = if let Some((rgba8, layout)) = seed_wide {
+    let seed_slot = if first_materialization_clear_probe {
+        None
+    } else if let Some((rgba8, layout)) = seed_wide {
         // The seed's own order first, because `expand_rgba8_to_texel` reads
         // semantic RGBA8 — the same normalization the four-byte arm folds into
         // its copy, done here as a step because a widening pass cannot also
         // exchange in place.
         let mut semantic;
-        let src = if matches!(req.target_seed_order, SeedOrder::Bgra8) {
+        let mut zero_seed = Vec::new();
+        let src = if first_materialization_zero_seed_probe {
+            zero_seed.resize(rgba8.len(), 0);
+            &zero_seed[..]
+        } else if matches!(req.target_seed_order, SeedOrder::Bgra8) {
             semantic = rgba8.to_vec();
             for px in semantic.chunks_exact_mut(4) {
                 px.swap(0, 2);
@@ -3590,7 +3698,10 @@ pub(crate) unsafe fn execute_draw_inner(
         // their damaged geometry. The attachment is BGRA when `output_bgra`; the
         // seed states its own order. Exchange exactly when they disagree, inside
         // the copy that has to happen anyway.
-        if matches!(req.target_seed_order, SeedOrder::Bgra8) != output_bgra {
+        if first_materialization_zero_seed_probe {
+            let zero_seed = vec![0; rgba8.len()];
+            pools.write_staging(ctx, &slot, &zero_seed)?;
+        } else if matches!(req.target_seed_order, SeedOrder::Bgra8) != output_bgra {
             let _s = stage_phase::Span::moving(stage_phase::Part::Swap, rgba8.len() as u64);
             pools.write_staging_swap_rb(ctx, &slot, rgba8)?;
         } else {
@@ -3658,6 +3769,11 @@ pub(crate) unsafe fn execute_draw_inner(
     }
     let mut target_guest_backed = false;
     let mut target_loads_guest_backing = false;
+    let mut target_content_ready = false;
+    let target_registry_ready_before = req
+        .target_identity
+        .as_ref()
+        .is_some_and(|identity| pools.registry_content_ready(identity));
     let mut target_guest_footprint: Option<crate::runtime::guest_ram::GuestPageFootprint> = None;
     let (target_image, mut target_fb, target_access, target_view) =
         if let Some(identity) = &req.target_identity {
@@ -3685,6 +3801,7 @@ pub(crate) unsafe fn execute_draw_inner(
                 counters,
             )?;
             target_guest_backed = t.memory.is_guest_imported();
+            target_content_ready = t.content_ready;
             target_guest_footprint = t.memory.guest_footprint();
             target_loads_guest_backing = target_guest_backed && req.load_guest_target_backing;
             if target_loads_guest_backing {
@@ -3777,6 +3894,58 @@ pub(crate) unsafe fn execute_draw_inner(
                 )
             }
         };
+    // The runtime-side coverage census runs before target admission and can
+    // therefore only see an explicit seed or a render-chain load. Record the
+    // engine's actual answer as well, at the point where the resident and its
+    // content state are known. This separates a conservative telemetry
+    // classification from a real partial preserving pass that entered without
+    // a readable source.
+    let partial_preserving_draw = req.scissors.iter().any(|scissor| {
+        !(scissor.x == 0
+            && scissor.y == 0
+            && scissor.width >= req.width
+            && scissor.height >= req.height)
+    }) && req
+        .color0_declared
+        .is_some_and(|declared| declared.preserves_prior_contents());
+    if partial_preserving_draw {
+        crate::runtime::drain::note_store_route(
+            match (
+                pass_key.color0_load,
+                load_uses_gpu_content,
+                target_guest_backed,
+                target_content_ready,
+            ) {
+                (Color0Load::Preserve, true, _, true) => "engine_partial_preserve_with_gpu_content",
+                (Color0Load::Preserve, false, true, _) => {
+                    "engine_partial_preserve_guest_backed_without_gpu_content"
+                }
+                (Color0Load::Preserve, false, false, _) => {
+                    "engine_partial_preserve_resident_without_gpu_content"
+                }
+                (Color0Load::Undefined, false, _, _) => "engine_partial_preserve_undefined",
+                (Color0Load::Clear, _, _, _) => "engine_partial_preserve_clear",
+                _ => "engine_partial_preserve_other",
+            },
+        );
+        if crate::observe::first_sight(
+            "target_registry_transition",
+            (u64::from(req.width) << 32) | u64::from(req.height),
+        ) {
+            crate::observe::off(format!(
+                "target_registry_transition target={:?} size={}x{} ready_before={} ready_after={} guest_backed={} load_gpu={} cpu_seed={} guest_seed={}",
+                req.target_identity,
+                req.width,
+                req.height,
+                u8::from(target_registry_ready_before),
+                u8::from(target_content_ready),
+                u8::from(target_guest_backed),
+                u8::from(load_uses_gpu_content),
+                u8::from(req.target_rgba8.is_some()),
+                u8::from(req.target_guest_seed.is_some()),
+            ));
+        }
+    }
     let _multisample_source_image = if req.multisample_resolve {
         let (image, _view, framebuffer) = pools.acquire_multisample_target(
             ctx,
@@ -3837,7 +4006,7 @@ pub(crate) unsafe fn execute_draw_inner(
                 None => {
                     let slot = {
                         let _s = stage_phase::Span::open(stage_phase::Part::Acquire);
-                        pools.acquire_staging(ctx, seed.source.total_len, counters)?
+                        pools.acquire_staging_cpu_snapshot(ctx, seed.source.total_len, counters)?
                     };
                     {
                         let _s = stage_phase::Span::moving(
@@ -3971,6 +4140,35 @@ pub(crate) unsafe fn execute_draw_inner(
                     .is_none()
                     .then(|| pools.prior_reclaim(identity))
                     .flatten();
+                let admission_suspect = match held.as_ref() {
+                    None => true,
+                    Some((_, _, _, _, ready, width, height, samples, _)) => {
+                        !*ready
+                            || *width != resource.width
+                            || *height != resource.height
+                            || (*samples > 1) != resource.multisampled
+                    }
+                };
+                if admission_suspect {
+                    let key = (u64::from(resource.binding) << 48)
+                        ^ (u64::from(resource.width) << 24)
+                        ^ u64::from(resource.height);
+                    if crate::observe::first_sight("sampled_resident_admission_suspect", key) {
+                        let detail = held.as_ref().map(|(_, _, access, _, ready, width, height, samples, guest_backed)| {
+                            format!(
+                                "held=true ready={ready} access={access:?} geom={width}x{height} samples={samples} guest_backed={guest_backed}"
+                            )
+                        }).unwrap_or_else(|| "held=false".to_string());
+                        crate::observe::off(format!(
+                            "sampled_resident_admission_suspect binding={} requested={}x{} multisampled={} generation={} prior_reclaim={prior:?} {detail} identity={identity:?}",
+                            resource.binding,
+                            resource.width,
+                            resource.height,
+                            resource.multisampled,
+                            identity.generation(),
+                        ));
+                    }
+                }
                 if let Some((_, _, _, _, ready, width, height, samples, _)) = held.as_ref() {
                     if *samples > 1 {
                         crate::runtime::drain::note_store_route("sampled_resident_multisample");
@@ -4202,7 +4400,8 @@ pub(crate) unsafe fn execute_draw_inner(
                         imported
                     }
                     None => {
-                        let scratch = pools.acquire_staging(ctx, src.total_len, counters)?;
+                        let scratch =
+                            pools.acquire_staging_cpu_snapshot(ctx, src.total_len, counters)?;
                         pools.write_staging_from_runs(
                             ctx,
                             &scratch,
@@ -4377,6 +4576,39 @@ pub(crate) unsafe fn execute_draw_inner(
         } else {
             vk::AccessFlags::empty()
         };
+    if partial_preserving_draw
+        && !target_registry_ready_before
+        && req.target_rgba8.is_some()
+        && crate::observe::first_sight(
+            "gva_first_materialization",
+            req.target_identity
+                .as_ref()
+                .map(|identity| identity.generation())
+                .unwrap_or_default(),
+        )
+    {
+        crate::observe::off(format!(
+            "gva_first_materialization target={:?} ready_before={} ready_after={} \
+             color0_load={:?} load_gpu={} seed_cpu={} seed_slot={} guest_backed={} \
+             color_input={} feedback={} adhoc={} target_access={:?} \
+             pass_layout={:?} dst_stage={:?} dst_access={:?}",
+            req.target_identity,
+            u8::from(target_registry_ready_before),
+            u8::from(target_content_ready),
+            pass_key.color0_load,
+            u8::from(load_uses_gpu_content),
+            u8::from(req.target_rgba8.is_some()),
+            u8::from(seed_slot.is_some()),
+            u8::from(target_guest_backed),
+            u8::from(req.color_input),
+            u8::from(pass_key.color_feedback(0)),
+            u8::from(ordinary_ad_hoc_framebuffer),
+            target_access.layout(),
+            target_pass_layout,
+            target_dst_stage,
+            target_dst_access,
+        ));
+    }
     let target_dependency = if target_feedback {
         vk::DependencyFlags::FEEDBACK_LOOP_EXT
     } else {
@@ -4515,9 +4747,25 @@ pub(crate) unsafe fn execute_draw_inner(
             vk::ImageLayout::TRANSFER_DST_OPTIMAL,
             &copy,
         );
+        let explicit_first_barrier = first_materialization_explicit_barrier_probe_enabled()
+            && !target_registry_ready_before
+            && req.target_rgba8.is_some()
+            && req.scissors.iter().any(|scissor| {
+                !(scissor.x == 0
+                    && scissor.y == 0
+                    && scissor.width >= req.width
+                    && scissor.height >= req.height)
+            })
+            && req
+                .color0_declared
+                .is_some_and(|declared| declared.preserves_prior_contents());
         let barrier = [vk::ImageMemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-            .dst_access_mask(target_dst_access)
+            .dst_access_mask(if explicit_first_barrier {
+                vk::AccessFlags::COLOR_ATTACHMENT_READ | vk::AccessFlags::COLOR_ATTACHMENT_WRITE
+            } else {
+                target_dst_access
+            })
             .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
             .new_layout(target_pass_layout)
             .image(target_image)
@@ -4525,8 +4773,16 @@ pub(crate) unsafe fn execute_draw_inner(
         ctx.device.cmd_pipeline_barrier(
             cb,
             vk::PipelineStageFlags::TRANSFER,
-            target_dst_stage,
-            target_dependency,
+            if explicit_first_barrier {
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
+            } else {
+                target_dst_stage
+            },
+            if explicit_first_barrier {
+                vk::DependencyFlags::empty()
+            } else {
+                target_dependency
+            },
             &[],
             &[],
             &barrier,
@@ -4695,21 +4951,27 @@ pub(crate) unsafe fn execute_draw_inner(
         // skip keyed on the layout alone is what `ResidentAccess` exists to
         // stop, since a layout can be reached by a write that shares its name.
         //
-        // The second skip is the layout one, and it is sound only because both
-        // halves are asked. `layout() == layout()` says there is nothing to
-        // *place*, which is true for every resident once a colour target rests
-        // in one layout; `covered_by_pass_entry` says the pass's own incoming
-        // external dependency already makes the prior access *visible* to this
-        // draw's sampled read, which is a separate question and the one that
-        // carries the hazard. Asking only the first is exactly the mistake
-        // `ResidentAccess` exists to stop — a layout can be reached by a write
-        // that shares its name.
+        // A same-layout skip is sound only for a read-after-read. A
+        // `ColorWrite`/`ColorFeedback` resident can share the resting layout
+        // with `ShaderRead`, but it still needs an explicit visibility
+        // dependency when it is not an attachment of this pass. The render
+        // pass's external dependency is scoped to the pass's attachment
+        // accesses; relying on it for these secondary resident images is what
+        // lets a small glyph or button sample stale pixels. Keep the layout
+        // skip for read-only predecessors, but retain the barrier for writes.
         //
         // This is what retires `passmerge_outside_resident_layout`: the barrier
         // it charged is not moved earlier or made cheaper, it stops being owed.
+        let prior_is_write = matches!(
+            access,
+            super::pools::ResidentAccess::ColorWrite(_)
+                | super::pools::ResidentAccess::ColorFeedback(_)
+        );
         if !transitioned_resident.insert(identity.clone())
             || access == next_access
-            || (access.layout() == next_access.layout() && access.covered_by_pass_entry())
+            || (access.layout() == next_access.layout()
+                && access.covered_by_pass_entry()
+                && !prior_is_write)
         {
             continue;
         }
@@ -5279,6 +5541,16 @@ pub(crate) unsafe fn execute_draw_inner(
             },
         }
     }));
+    if geometry_probe_budget(req) {
+        let raw_vp = req.viewports.first().copied().unwrap_or(default_vp);
+        let raw_sc = req.scissors.first().copied().unwrap_or(default_sc);
+        let effective_vp = vp_scratch.first().copied();
+        let effective_sc = sc_scratch.first().copied();
+        crate::observe::off(format!(
+            "geometry_probe target={:?} size={}x{} raw_vp={:?} vk_vp={:?} raw_sc={:?} vk_sc={:?}",
+            req.target_identity, req.width, req.height, raw_vp, effective_vp, raw_sc, effective_sc,
+        ));
+    }
     unsafe { pools.set_dynamic_viewport_scissor(&ctx.device, cb, counters) };
     // Dynamic blend colour (Metal `setBlendColorRed:green:blue:alpha:`) — one
     // encoder value, so one call per draw whatever the attachments declare,

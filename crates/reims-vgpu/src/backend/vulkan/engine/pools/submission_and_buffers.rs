@@ -279,6 +279,7 @@ impl ResourcePools {
             staging_miss_bins: [0; STAGING_BUCKET_BINS],
             staging_miss_us_bins: [0; STAGING_BUCKET_BINS],
             settled_staging_mark: 0,
+            last_staging_activity_ms: None,
             targets: HashMap::new(),
             target_order: Vec::new(),
             multisample_target: None,
@@ -563,7 +564,9 @@ impl ResourcePools {
     ///
     /// A pass is settled only if no staging buffer was acquired since the
     /// previous pass. The trim then needs
-    /// `SETTLED_PASSES_FOR_BUFFER_TRIM` consecutive settled passes.
+    /// `SETTLED_PASSES_FOR_BUFFER_TRIM` consecutive settled passes and
+    /// `STAGING_BUFFER_TRIM_IDLE_MS` since the last observed acquire. The grace
+    /// interval preserves staging allocations across periodic guest updates.
     ///
     /// Upload traffic is the direct signal for the failure this gate prevents:
     /// "a single quiet pass mid-playback
@@ -589,8 +592,12 @@ impl ResourcePools {
             self.settled_maintenance_passes = self.settled_maintenance_passes.saturating_add(1);
         } else {
             self.settled_maintenance_passes = 0;
+            self.last_staging_activity_ms = Some(self.idle_clock_ms);
         }
         self.settled_maintenance_passes >= SETTLED_PASSES_FOR_BUFFER_TRIM
+            && self.last_staging_activity_ms.is_none_or(|last| {
+                self.idle_clock_ms.saturating_sub(last) >= STAGING_BUFFER_TRIM_IDLE_MS
+            })
     }
 
     /// Run periodic maintenance for objects that are already outside live
@@ -2398,6 +2405,22 @@ impl ResourcePools {
             std::mem::swap(&mut g.viewports, &mut g.vp_scratch);
             unsafe { device.cmd_set_viewport(cb, 0, &g.viewports) };
         }
+        let scissor_key = g.sc_scratch.iter().fold(0u64, |key, scissor| {
+            key.rotate_left(7)
+                ^ u64::from(scissor.offset.x as u32)
+                ^ (u64::from(scissor.offset.y as u32) << 16)
+                ^ (u64::from(scissor.extent.width) << 32)
+                ^ (u64::from(scissor.extent.height) << 48)
+        });
+        if crate::observe::first_sight("dynstate_scissor_decision", scissor_key) {
+            let held = super::scissors_match(&g.sc_scratch, &g.scissors);
+            crate::observe::off(format!(
+                "dynstate_scissor_decision decision={} requested={:?} cached={:?}",
+                if held { "held" } else { "emitted" },
+                g.sc_scratch,
+                g.scissors
+            ));
+        }
         if super::scissors_match(&g.sc_scratch, &g.scissors) {
             counters
                 .dynstate_scissor_held
@@ -3245,20 +3268,52 @@ impl ResourcePools {
         size: u64,
         counters: &EngineCounters,
     ) -> Result<BufferSlot, DrawError> {
+        self.acquire_staging_with_mapping(ctx, size, counters, true)
+    }
+
+    /// Acquire a CPU snapshot slot without retaining a persistent host pointer.
+    /// The guest-run fallback uses this conservative path after runtime #3
+    /// reproduced a SIGSEGV in the persistent staging destination.
+    pub(crate) unsafe fn acquire_staging_cpu_snapshot(
+        &mut self,
+        ctx: &DeviceContext,
+        size: u64,
+        counters: &EngineCounters,
+    ) -> Result<BufferSlot, DrawError> {
+        self.acquire_staging_with_mapping(ctx, size, counters, false)
+    }
+
+    unsafe fn acquire_staging_with_mapping(
+        &mut self,
+        ctx: &DeviceContext,
+        size: u64,
+        counters: &EngineCounters,
+        persistent_mapping: bool,
+    ) -> Result<BufferSlot, DrawError> {
         let need = size.max(4);
         let bucket = Self::bucket(need);
         // Free slots in this bucket, whatever the caller is about to bind them
         // as: every slot carries [`POOL_SLOT_USAGE`], so there is no usage for
         // this list to be keyed by.
         if let Some(list) = self.staging_free.get_mut(&bucket) {
-            if let Some(slot) = list.pop() {
+            let slot_index = if persistent_mapping {
+                list.len().checked_sub(1)
+            } else {
+                list.iter().rposition(|slot| {
+                    slot.mapped == 0 && matches!(slot.backing, BufferBacking::Dedicated)
+                })
+            };
+            if let Some(index) = slot_index {
+                let slot = list.swap_remove(index);
                 self.note_staging_hit();
                 self.staging_live.push(slot);
                 return Ok(slot);
             }
         }
         let miss_started = Instant::now();
-        let _slow = SlowStagingWrite::watch("acquire", need, 0);
+        let mut slow = SlowStagingWrite::watch("acquire", need, 0);
+        let detail_enabled = super::slow_staging_detail_enabled();
+        let create_started = detail_enabled.then(Instant::now);
         let buffer = ctx
             .device
             .create_buffer(
@@ -3269,8 +3324,13 @@ impl ResourcePools {
                 None,
             )
             .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::PoolsCreateStaging, e)))?;
+        let create_us = create_started.map_or(0, |started| started.elapsed().as_micros() as u64);
         counters.note_create(CreateSite::StagingBuffer);
+        let requirements_started = detail_enabled.then(Instant::now);
         let req = ctx.device.get_buffer_memory_requirements(buffer);
+        let requirements_us =
+            requirements_started.map_or(0, |started| started.elapsed().as_micros() as u64);
+        let memory_type_started = detail_enabled.then(Instant::now);
         let mt = ctx
             .memory_type_for(req.memory_type_bits, req.size, MemoryClass::Upload)
             .ok_or({
@@ -3278,38 +3338,66 @@ impl ResourcePools {
                     memory_type_bits: req.memory_type_bits,
                 })
             })?;
-        // Carve out of a shared HOST_VISIBLE block rather than allocating one
-        // memory object per buffer. The block is allocated and mapped once; a
-        // miss here is a create + carve + bind, which is what turns the ~0.4 ms
-        // floor every miss used to pay into a handful of block allocations for
-        // the whole boot. The slab picks the same `MemoryClass::Upload` type
-        // `mt` resolves to and records it on the block, so a carve only ever
-        // lands in a block this bind can legally use; `mt` stays here because
-        // the slot still has to report that type's caching.
-        let token = self
-            .slabs
-            .upload()
-            .acquire(ctx, &req, counters)
-            .inspect_err(|_| ctx.device.destroy_buffer(buffer, None))?;
-        ctx.device
-            .bind_buffer_memory(buffer, token.memory, token.offset())
+        let memory_type_us =
+            memory_type_started.map_or(0, |started| started.elapsed().as_micros() as u64);
+        let mut slab_acquire_us = 0;
+        let mut allocation_us = 0;
+        let mut slab_trace = detail_enabled.then(Default::default);
+        let (memory, mapped, bind_offset, backing) = if persistent_mapping {
+            let slab_started = detail_enabled.then(Instant::now);
+            let token = self
+                .slabs
+                .upload()
+                .acquire_traced(ctx, &req, counters, slab_trace.as_mut())
+                .inspect_err(|_| ctx.device.destroy_buffer(buffer, None))?;
+            slab_acquire_us =
+                slab_started.map_or(0, |started| started.elapsed().as_micros() as u64);
+            let bind_offset = token.offset();
+            (
+                token.memory,
+                token.mapped,
+                bind_offset,
+                BufferBacking::Slab(token),
+            )
+        } else {
+            let allocation_started = detail_enabled.then(Instant::now);
+            let memory = allocate_memory_timed(
+                ctx,
+                &vk::MemoryAllocateInfo::default()
+                    .allocation_size(req.size)
+                    .memory_type_index(mt),
+                AllocSite::StagingBuffer,
+            )
             .map_err(|e| {
-                self.slabs.release(&ctx.device, token);
+                ctx.device.destroy_buffer(buffer, None);
+                DrawError::VkCall(VkCall::new(VkOp::PoolsAllocStaging, e))
+            })?;
+            allocation_us =
+                allocation_started.map_or(0, |started| started.elapsed().as_micros() as u64);
+            counters.note_alloc();
+            (memory, 0, 0, BufferBacking::Dedicated)
+        };
+        let bind_started = detail_enabled.then(Instant::now);
+        ctx.device
+            .bind_buffer_memory(buffer, memory, bind_offset)
+            .map_err(|e| {
+                match backing {
+                    BufferBacking::Dedicated => ctx.device.free_memory(memory, None),
+                    BufferBacking::Slab(token) => self.slabs.release(&ctx.device, token),
+                }
                 ctx.device.destroy_buffer(buffer, None);
                 DrawError::VkCall(VkCall::new(VkOp::PoolsBindStaging, e))
             })?;
+        let bind_us = bind_started.map_or(0, |started| started.elapsed().as_micros() as u64);
         let slot = BufferSlot {
             buffer,
-            memory: token.memory,
+            memory,
             size: bucket,
-            // The block's mapping covers every carve in it, so a slot's host
-            // address is a pointer into it. Nothing maps or unmaps per slot;
-            // the pool's whole point is that the allocation outlives the bind,
-            // and now so does the mapping of the block behind it.
-            mapped: token.mapped,
-            backing: BufferBacking::Slab(token),
+            mapped,
+            backing,
             // `MemoryClass::Upload` requires HOST_COHERENT, so a staging write
-            // needs no flush and the persistent mapping above is sound.
+            // needs no flush, whether the slot uses a persistent or transient
+            // mapping.
             coherent: true,
             // Read rather than asserted: `MemoryClass::Upload` says nothing
             // about caching, and nothing on the staging path reads this field —
@@ -3317,7 +3405,28 @@ impl ResourcePools {
             cached: ctx.mapped_memory_kind(mt).cached,
         };
         self.staging_live.push(slot);
-        self.note_staging_miss(bucket, miss_started.elapsed().as_micros() as u64);
+        let miss_us = miss_started.elapsed().as_micros() as u64;
+        if detail_enabled {
+            let slab = slab_trace.unwrap_or_default();
+            slow.detail_when_slow(|| {
+                format!(
+                    "bucket={bucket} persistent={} create_us={create_us} requirements_us={requirements_us} \
+                     memory_type_us={memory_type_us} slab_acquire_us={slab_acquire_us} \
+                     slab_blocks_scanned={} slab_ranges_scanned={} slab_carve_us={} \
+                     slab_check_us={} slab_memory_type_us={} slab_alloc_us={} slab_map_us={} \
+                     allocation_us={allocation_us} bind_us={bind_us}",
+                    u8::from(persistent_mapping),
+                    slab.blocks_scanned,
+                    slab.ranges_scanned,
+                    slab.carve_us,
+                    slab.check_us,
+                    slab.memory_type_us,
+                    slab.alloc_us,
+                    slab.map_us,
+                )
+            });
+        }
+        self.note_staging_miss(bucket, miss_us);
         Ok(slot)
     }
 
@@ -3420,7 +3529,7 @@ impl ResourcePools {
     ) -> Result<(), DrawError> {
         let _slow = SlowStagingWrite::watch("bytes", bytes.len() as u64, 0);
         let size = bytes.len().max(4) as u64;
-        let ptr = staging_write_ptr(ctx, slot, size)?;
+        let (ptr, transient) = staging_write_ptr(ctx, slot, size)?;
         unsafe {
             if bytes.is_empty() {
                 // Nothing to copy — the mapped span is the 4-byte minimum; zero it
@@ -3432,6 +3541,9 @@ impl ResourcePools {
                 // full-span zeroing would just be overwritten. Copy only.
                 std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len());
             }
+        }
+        if transient {
+            ctx.device.unmap_memory(slot.memory);
         }
         Ok(())
     }
@@ -3491,32 +3603,35 @@ impl ResourcePools {
         rgba: &[u8],
     ) -> Result<(), DrawError> {
         let size = rgba.len().max(4) as u64;
-        let ptr = staging_write_ptr(ctx, slot, size)?;
+        let (ptr, transient) = staging_write_ptr(ctx, slot, size)?;
         unsafe {
             if rgba.is_empty() {
                 std::ptr::write_bytes(ptr, 0, size as usize);
-                return Ok(());
+            } else {
+                // The mapped span is at least `rgba.len()` and is exclusively ours
+                // for the duration of this call, so a slice over it is sound. It
+                // exists so the transformation can be a plain function with a test
+                // rather than pointer arithmetic no test can reach.
+                //
+                // Timed on its own, because `draw_phase`'s `stage_us` also carries
+                // vertex, index and storage staging: dividing that by
+                // `seed_upload_bytes` gives a rate contaminated by whatever else the
+                // draw staged, which is enough to see the seed path is slow and not
+                // enough to say what limits it. `swap_rb_us` against `swap_rb_kb` is
+                // this write and nothing else, so it can be read against the memcpy
+                // rate `write_staging_from_runs` gets into the same memory class and
+                // convict either the loop or the memory.
+                let started = std::time::Instant::now();
+                exchange_rb_into(rgba, std::slice::from_raw_parts_mut(ptr, rgba.len()));
+                crate::runtime::drain::note_store_route_us(
+                    "swap_rb_us",
+                    started.elapsed().as_micros() as u64,
+                );
+                crate::runtime::drain::note_store_route_n("swap_rb_kb", (rgba.len() / 1024) as u64);
             }
-            // The mapped span is at least `rgba.len()` and is exclusively ours
-            // for the duration of this call, so a slice over it is sound. It
-            // exists so the transformation can be a plain function with a test
-            // rather than pointer arithmetic no test can reach.
-            //
-            // Timed on its own, because `draw_phase`'s `stage_us` also carries
-            // vertex, index and storage staging: dividing that by
-            // `seed_upload_bytes` gives a rate contaminated by whatever else the
-            // draw staged, which is enough to see the seed path is slow and not
-            // enough to say what limits it. `swap_rb_us` against `swap_rb_kb` is
-            // this write and nothing else, so it can be read against the memcpy
-            // rate `write_staging_from_runs` gets into the same memory class and
-            // convict either the loop or the memory.
-            let started = std::time::Instant::now();
-            exchange_rb_into(rgba, std::slice::from_raw_parts_mut(ptr, rgba.len()));
-            crate::runtime::drain::note_store_route_us(
-                "swap_rb_us",
-                started.elapsed().as_micros() as u64,
-            );
-            crate::runtime::drain::note_store_route_n("swap_rb_kb", (rgba.len() / 1024) as u64);
+        }
+        if transient {
+            ctx.device.unmap_memory(slot.memory);
         }
         Ok(())
     }
@@ -3541,7 +3656,7 @@ impl ResourcePools {
     ) -> Result<(), DrawError> {
         let _slow = SlowStagingWrite::watch("guest_runs", total_len, runs.len());
         let size = total_len.max(4);
-        let ptr = staging_write_ptr(ctx, slot, size)?;
+        let (ptr, transient) = staging_write_ptr(ctx, slot, size)?;
         let total = total_len as usize;
         let mut off = 0usize;
         let mut skip = source_offset;
@@ -3574,6 +3689,9 @@ impl ResourcePools {
             if off < size as usize {
                 std::ptr::write_bytes(ptr.add(off), 0, size as usize - off);
             }
+        }
+        if transient {
+            ctx.device.unmap_memory(slot.memory);
         }
         Ok(())
     }

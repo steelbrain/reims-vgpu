@@ -57,6 +57,11 @@ impl BlockPlan {
         self.size
     }
 
+    /// Number of free fragments; used only to attribute opt-in slab diagnostics.
+    pub(crate) fn free_range_count(&self) -> usize {
+        self.free.len()
+    }
+
     /// Sum of the currently-free byte ranges.
     pub(crate) fn free_bytes(&self) -> u64 {
         self.free.iter().map(|r| r.len).sum()

@@ -1994,7 +1994,7 @@ fn accepted_render_without_executor_is_fail_visible() {
     let body = std::fs::read_to_string(crate::observe::fail_log_path())
         .expect("reims-vgpu-fail.log readable");
     let want = format!(
-        "render_unimplemented reason=accepted_without_executor task=65261 opcode={op:#x} len=8"
+        "render_unimplemented reason=accepted_without_executor class=unknown selector=- expected_body_len=- actual_body_len=0 task=65261 opcode={op:#x} len=8"
     );
     assert!(
         body.lines()

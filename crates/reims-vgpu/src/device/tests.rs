@@ -211,6 +211,38 @@ fn prompt_actions_pop_while_device_lock_held() {
     assert!(device_destroy(id));
 }
 
+/// Cursor mirroring runs on QEMU's main-loop BH and must not wait for the
+/// frame-publish/Vulkan critical section represented by `slot.window`.
+#[cfg(feature = "host-window")]
+#[test]
+fn cursor_update_pops_while_window_publish_lock_held() {
+    let id = device_create(None, PAGE_SHIFT_ARM64E).expect("create");
+    let slot = device_slot(id).expect("slot");
+    slot.prompt_actions
+        .lock()
+        .push_back(HostAction::cursor(17, 23, true));
+    let window_guard = slot.window.lock();
+    let (sent, received) = std::sync::mpsc::channel();
+    let pop = std::thread::spawn(move || {
+        let action = device_pop_action(id);
+        sent.send(action).expect("test receiver lives");
+    });
+    let action = received
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("cursor action must not wait for window publish")
+        .expect("queued cursor action");
+    drop(window_guard);
+    pop.join().expect("pop thread");
+    assert_eq!(
+        action.kind,
+        crate::runtime::host::HostActionKind::CursorUpdate
+    );
+    let cursor = slot.window_cursor.lock().expect("cursor slot");
+    assert_eq!((cursor.x, cursor.y, cursor.visible), (17, 23, true));
+    drop(cursor);
+    assert!(device_destroy(id));
+}
+
 /// The interrupt-status atomics stay wired to the same slot across reset
 /// ([`crate::model::DeviceState::reset`] must preserve the shared `Arc`s and only
 /// zero the values they hold).

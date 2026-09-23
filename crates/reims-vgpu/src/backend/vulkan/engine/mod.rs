@@ -3686,6 +3686,7 @@ impl GuestPageTarget {
     fn geometry(&self) -> reims_vgpu_paging::regions::WindowGeometry {
         reims_vgpu_paging::regions::WindowGeometry {
             pitch_bytes: self.pitch_bytes(),
+            bytes_per_texel: self.bytes_per_texel(),
             width_texels: self.width,
             height_texels: self.height,
         }
@@ -3705,6 +3706,22 @@ impl GuestPageTarget {
     /// rectangle path, which does.
     fn rows_are_dense(&self) -> bool {
         self.pitch_bytes() == u64::from(self.width) * self.bytes_per_texel()
+    }
+
+    /// `Some((need, have))` when the texels this target describes do not fit
+    /// the guest pages its runs cover.
+    ///
+    /// The relation `plan_guest_copy` is documented to leave to its caller:
+    /// `references_for_runs` clips a window to the pages it was given and
+    /// never refuses a short one, so a target can name more texels than it has
+    /// pages for. The render rail checks this before planning
+    /// (`GuestWriteDecline::WindowTooSmall`); the compute rail called the
+    /// planner directly and did not. Neutral in its answer so a caller outside
+    /// the engine can name its own refusal.
+    pub(crate) fn window_shortfall(&self) -> Option<(u64, u64)> {
+        let need = self.extent_end();
+        let have = self.window_bytes();
+        (need > have).then_some((need, have))
     }
 }
 
@@ -4048,6 +4065,17 @@ pub(super) enum GuestWriteSource<'a> {
     /// through a residency registry, which is popped out of the ring's live set
     /// at acquire time and is therefore reclaimable while the fence still runs.
     RingEntry,
+}
+
+/// Arm the write debt and its page ledger without a device or a ledger entry,
+/// for a test of a caller that must settle before handing pages back. With no
+/// device context the settle has nothing to wait on and clears the flag, which
+/// is exactly the observable a caller's test needs: the flag going down proves
+/// the caller asked.
+#[cfg(test)]
+pub(crate) fn arm_guest_write_debt_for_tests(pages: &[u64]) {
+    arm_guest_write_pages(pages);
+    GUEST_WRITE_DEBT.store(true, std::sync::atomic::Ordering::Release);
 }
 
 pub(super) fn record_guest_write_debt(
@@ -4651,15 +4679,41 @@ unsafe fn plan_guest_copies(
 ) -> Result<Vec<(ash::vk::Buffer, Vec<ash::vk::BufferImageCopy>)>, DrawError> {
     use host_ram::GuestWriteDecline;
     let geom = dst.geometry();
+    let invalid = || DrawError::GuestPageWrite(GuestWriteDecline::InvalidCopyRegion);
+    let bpt = crate::backend::vulkan::translate::pixel::bytes_per_texel(dst.format)
+        .map(u64::from)
+        .ok_or_else(invalid)?;
+    if bpt == 0
+        || geom.bytes_per_texel != bpt
+        || u64::from(dst.row_length_texels).checked_mul(bpt) != Some(geom.pitch_bytes)
+        || dst.row_length_texels < dst.width
+    {
+        return Err(invalid());
+    }
     let mut grouped: Vec<(ash::vk::Buffer, Vec<ash::vk::BufferImageCopy>)> = Vec::new();
     for run in &dst.runs {
         let bound = unsafe { pools.bind_guest_ram(ctx, &run.guest) }
             .map_err(|inner| DrawError::GuestPageWrite(GuestWriteDecline::Import { inner }))?;
         // `head` is what the granularity rounding added in front of the byte the
         // caller asked for, so the run's first requested byte sits here.
-        let base = bound.offset + bound.head;
+        let base = bound.offset.checked_add(bound.head).ok_or_else(invalid)?;
         let start = run.window_offset;
-        let end = start.saturating_add(run.guest.requested());
+        let end = start
+            .checked_add(run.guest.requested())
+            .ok_or_else(invalid)?;
+        let run_end = base
+            .checked_add(run.guest.requested())
+            .ok_or_else(invalid)?;
+        let bound_end = bound.offset.checked_add(bound.len).ok_or_else(invalid)?;
+        let allocation_size_bytes = run.guest.import().len();
+        if start % bpt != 0
+            || end % bpt != 0
+            || base % bpt != 0
+            || run_end > bound_end
+            || bound_end > allocation_size_bytes
+        {
+            return Err(invalid());
+        }
         for r in reims_vgpu_paging::regions::plan_regions(&geom, start, end) {
             let region = ash::vk::BufferImageCopy::default()
                 // The rectangle's own offset is in window bytes; `- start`

@@ -435,6 +435,12 @@ pub const UNUSED_BINDS: &str = "REIMS_VGPU_UNUSED_BINDS";
 /// less concurrency than several, never more.
 pub const PRESENT_DEPTH: &str = "REIMS_VGPU_PRESENT_DEPTH";
 
+/// **Diagnostic, default off.** When enabled, the Vulkan window presenter
+/// emits one aggregate line per second with retire, acquire, command recording,
+/// queue-submit, and end-to-end CPU timings. It is intentionally opt-in: the
+/// clock reads and counters are themselves part of the path being measured.
+pub const FRAME_TIMING: &str = "REIMS_VGPU_FRAME_TIMING";
+
 /// **Default on.** Setting this off restores one completion-stamp write per
 /// packet, which is what `drain_child_fifo` did before the stamps in a single
 /// drain of one channel were collapsed into a single write at its end.
@@ -947,6 +953,28 @@ pub const LAYOUT_CHURN: &str = "REIMS_VGPU_LAYOUT_CHURN";
 /// us/draw — excluded as slow, and a single such boot says nothing either.
 pub const PASS_CHURN: &str = "REIMS_VGPU_PASS_CHURN";
 
+/// Diagnostic-only probe for partial render-target content. When enabled, the
+/// Vulkan draw rail samples the resident before and after a partial preserving
+/// draw and records compact content signatures. It is off by default and does
+/// not change the normal execution path unless explicitly requested.
+pub const TARGET_CONTENT_PROBE: &str = "REIMS_VGPU_TARGET_CONTENT_PROBE";
+
+/// Diagnostic-only blend control. When enabled, Vulkan ignores declared color
+/// blending and uses opaque replace for the draw, allowing UI corruption to be
+/// classified without changing the default renderer.
+pub const BLEND_REPLACE_PROBE: &str = "REIMS_VGPU_BLEND_REPLACE_PROBE";
+
+/// Diagnostic-only A/B: include `MTLLoadActionDontCare` in GVA load-seed
+/// resolution. This is intentionally opt-in because the broader behavior has
+/// compatibility cost on the heavy blit battery.
+pub const DONTCARE_SEED_PROBE: &str = "REIMS_VGPU_DONTCARE_SEED_PROBE";
+pub const FIRST_MATERIALIZATION_CLEAR_PROBE: &str =
+    "REIMS_VGPU_FIRST_MATERIALIZATION_CLEAR_PROBE";
+pub const FIRST_MATERIALIZATION_ZERO_SEED_PROBE: &str =
+    "REIMS_VGPU_FIRST_MATERIALIZATION_ZERO_SEED_PROBE";
+pub const FIRST_MATERIALIZATION_EXPLICIT_BARRIER_PROBE: &str =
+    "REIMS_VGPU_FIRST_MATERIALIZATION_EXPLICIT_BARRIER_PROBE";
+
 /// **Default on.** `off` stops the primary colour attachment being a linear
 /// `VkImage` bound to the guest surface's own pages, so the render target is an
 /// ordinary optimally-tiled device-local resident and its Store copies out.
@@ -1185,6 +1213,28 @@ pub const COLOR_GENERAL: &str = "REIMS_VGPU_COLOR_GENERAL";
 /// outcome a tiling compositor already produces. `host_window::present`'s
 /// `WindowMode` owns both halves.
 pub const FULLSCREEN: &str = "REIMS_VGPU_FULLSCREEN";
+
+/// **Narrowing only.** Make a full-screen X11 window independent of a window
+/// manager by creating it override-redirect at the monitor's own rectangle,
+/// instead of asking a window manager to honour `_NET_WM_STATE_FULLSCREEN`.
+///
+/// `winit`'s `Fullscreen::Borderless` is an EWMH request: on X11 it sets
+/// `_NET_WM_STATE_FULLSCREEN` and lets the window manager resize the window.
+/// A host with a window manager has one to answer; the appliance's dedicated
+/// Xorg session deliberately has none, and there the request is simply an
+/// unread client message — the window keeps the size it was created with.
+///
+/// This switch names the other path, and it is the appliance that sets it. It
+/// cannot add a window manager and it does not change what any host with one
+/// does: selected only together with [`FULLSCREEN`] and an X11 window system,
+/// it pins the window to the monitor rectangle in this process.
+///
+/// Distinct from [`WINDOW_SYSTEM`], which says *which* server the window opens
+/// on. This one says how the full-screen geometry is obtained from it.
+pub const X11_WMLESS: &str = "REIMS_VGPU_X11_WMLESS";
+/// Diagnostic-only host-window fallback that keeps a native pointer visible
+/// while the guest cursor glyph is changing between setup screens.
+pub const CURSOR_FORCE_VISIBLE: &str = "REIMS_VGPU_CURSOR_FORCE_VISIBLE";
 }
 
 counts! {
@@ -1241,6 +1291,26 @@ choices! {
 /// changed" ambiguous between "the build does not carry that rail" and "the
 /// device declined the ask".
 pub const RAIL: &str = "REIMS_VGPU_RAIL";
+
+/// **A choice, not a switch.** Which window system the host window is created
+/// on, when the operator wants to name it rather than let `winit` infer it.
+///
+/// `winit` 0.30 has no `WINIT_UNIX_BACKEND` and no backend knob of any kind: it
+/// reads `WAYLAND_DISPLAY`/`WAYLAND_SOCKET` first and `DISPLAY` second, and
+/// prefers Wayland whenever both are present. So the *names* in the
+/// environment are what select the backend, and a carefully set `DISPLAY` can
+/// be overridden by a leftover Wayland name that a development host exported.
+///
+/// `auto` is the default and means exactly `winit`'s own rule. `x11` and
+/// `wayland` say which one this boot is for, and the session's own environment
+/// script is what makes the names agree with the answer — it removes the
+/// Wayland names when `x11` is asked for, and refuses an `x11` boot with no
+/// `DISPLAY` rather than falling back. This crate reads no display names of its
+/// own except as that fallback.
+///
+/// It narrows: it may tell this process which of the two `winit` already
+/// offers to take, and it cannot make a Wayland-only build present on X11.
+pub const WINDOW_SYSTEM: &str = "REIMS_VGPU_WINDOW_SYSTEM";
 }
 
 /// What one variable says, including the two ways it says nothing usable.
@@ -1392,6 +1462,240 @@ pub fn read(name: &str) -> (Switch, Option<String>) {
 /// [`read`] for a caller that has nothing to say about the value.
 pub fn switch(name: &str) -> Switch {
     read(name).0
+}
+
+/// Which window system the host window is created on.
+///
+/// Two arms rather than a `bool` for the same reason [`Choice`] is not one: it
+/// is a name, and a caller that has to spell `!wayland` eventually spells one
+/// of the two wrong. The name it reports is the one `winit` uses and the one
+/// the session's environment uses, so a log line and a shell variable agree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WindowSystem {
+    /// X11, reached through `DISPLAY`.
+    X11,
+    /// Wayland, reached through `WAYLAND_DISPLAY` or `WAYLAND_SOCKET`.
+    Wayland,
+}
+
+impl WindowSystem {
+    /// The name this window system is spelled with everywhere else.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::X11 => "x11",
+            Self::Wayland => "wayland",
+        }
+    }
+}
+
+/// Whether the environment names a Wayland connection, which is the first
+/// question `winit` asks and the one it answers `yes` to even when `DISPLAY`
+/// is also set.
+#[cfg(target_os = "linux")]
+fn wayland_named() -> bool {
+    ["WAYLAND_DISPLAY", "WAYLAND_SOCKET"]
+        .iter()
+        .any(|name| std::env::var_os(name).is_some_and(|value| !value.is_empty()))
+}
+
+/// Which window system `winit` will select for the host window, or `None` on a
+/// build whose `winit` has neither an X11 nor a Wayland backend.
+///
+/// `winit` 0.30 exposes no backend getter, so the answer has to come from the
+/// same environment `winit` reads, and it has to come *before* the window
+/// exists — the WM-less geometry is a creation-time attribute. Keeping the
+/// question here rather than at the window means one place reads the display
+/// names, next to the one place that reads every [`WINDOW_SYSTEM`] ask.
+///
+/// The ask wins when it names one of its values. Otherwise — `auto`, unset, or
+/// text that is not one of the three — the fallback is `winit`'s own rule, the
+/// Wayland names before `DISPLAY`. A refused value is reported by the caller
+/// that adopts the answer, because only the caller knows what it gated.
+pub fn window_system() -> Option<WindowSystem> {
+    #[cfg(target_os = "linux")]
+    {
+        const ALLOWED: [&str; 3] = ["auto", "x11", "wayland"];
+        match choice(WINDOW_SYSTEM, &ALLOWED) {
+            Choice::Named("x11") => Some(WindowSystem::X11),
+            Choice::Named("wayland") => Some(WindowSystem::Wayland),
+            _ => Some(if wayland_named() {
+                WindowSystem::Wayland
+            } else {
+                WindowSystem::X11
+            }),
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // macOS and Windows have no `winit` X11 or Wayland backend, so there is
+        // no answer to give and no caller that may act on one. `None` rather
+        // than a plausible-looking arm: the WM-less path depends on this being
+        // *known* to be X11, and a default here would let it be selected on a
+        // host where the attribute cannot exist.
+        None
+    }
+}
+
+#[cfg(test)]
+mod window_system_tests {
+    use super::*;
+
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Set every display name, run `body`, and restore. `WINDOW_SYSTEM` is left
+    /// alone on purpose: each caller sets the ask it is testing.
+    fn with_display<R>(
+        display: Option<&str>,
+        wayland: Option<&str>,
+        socket: Option<&str>,
+        body: impl FnOnce() -> R,
+    ) -> R {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved = [
+            "DISPLAY",
+            "WAYLAND_DISPLAY",
+            "WAYLAND_SOCKET",
+            WINDOW_SYSTEM,
+        ]
+        .map(std::env::var_os);
+        // SAFETY: the lock serializes every mutation of these names here.
+        unsafe {
+            for (name, value) in [
+                ("DISPLAY", display),
+                ("WAYLAND_DISPLAY", wayland),
+                ("WAYLAND_SOCKET", socket),
+            ] {
+                match value {
+                    Some(v) => std::env::set_var(name, v),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+        let out = body();
+        // SAFETY: as above.
+        unsafe {
+            for (name, value) in [
+                "DISPLAY",
+                "WAYLAND_DISPLAY",
+                "WAYLAND_SOCKET",
+                WINDOW_SYSTEM,
+            ]
+            .into_iter()
+            .zip(saved)
+            {
+                match value {
+                    Some(v) => std::env::set_var(name, v),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+        out
+    }
+
+    fn ask(value: Option<&str>) {
+        // SAFETY: every caller holds the lock taken in `with_display`.
+        unsafe {
+            match value {
+                Some(v) => std::env::set_var(WINDOW_SYSTEM, v),
+                None => std::env::remove_var(WINDOW_SYSTEM),
+            }
+        }
+    }
+
+    /// The ask decides when it names a value, and it decides against a
+    /// conflicting environment in both directions.
+    #[test]
+    fn the_ask_wins_over_the_display_names() {
+        let x11_against_wayland = with_display(Some(":0"), Some("wayland-1"), None, || {
+            ask(Some("x11"));
+            window_system()
+        });
+        assert_eq!(x11_against_wayland, Some(WindowSystem::X11));
+        let wayland_against_x11 = with_display(Some(":0"), Some("wayland-1"), None, || {
+            ask(Some("wayland"));
+            window_system()
+        });
+        assert_eq!(wayland_against_x11, Some(WindowSystem::Wayland));
+    }
+
+    /// An x11 ask with no `DISPLAY` is still answered X11: the refusal for a
+    /// missing display belongs to the session script, which can exit before a
+    /// window is ever considered, and to `winit`, which will fail to open one.
+    /// Answering `None` here would silently turn the appliance's WM-less
+    /// request into the ordinary path.
+    #[test]
+    fn an_x11_ask_is_honoured_even_with_no_display() {
+        let answer = with_display(None, None, None, || {
+            ask(Some("x11"));
+            window_system()
+        });
+        assert_eq!(answer, Some(WindowSystem::X11));
+    }
+
+    /// `auto` and unset both mean `winit`'s own rule, so the Wayland names beat
+    /// `DISPLAY`. This is the rule that makes a leftover `WAYLAND_DISPLAY` on a
+    /// development host override a deliberate `DISPLAY`, and it is why the
+    /// session script removes the Wayland names rather than only setting
+    /// `DISPLAY`.
+    #[test]
+    fn auto_follows_the_wayland_names_before_display() {
+        for value in [None, Some("auto")] {
+            let wayland = with_display(Some(":0"), Some("wayland-1"), None, || {
+                ask(value);
+                window_system()
+            });
+            assert_eq!(wayland, Some(WindowSystem::Wayland), "ask={value:?}");
+            let socket = with_display(Some(":0"), None, Some("/run/user/1000/wayland-1"), || {
+                ask(value);
+                window_system()
+            });
+            assert_eq!(socket, Some(WindowSystem::Wayland), "ask={value:?}");
+            let x11 = with_display(Some(":0"), None, None, || {
+                ask(value);
+                window_system()
+            });
+            assert_eq!(x11, Some(WindowSystem::X11), "ask={value:?}");
+        }
+    }
+
+    /// An empty display name is not a connection, and neither is an empty ask:
+    /// both are how a shell spells "not set".
+    #[test]
+    fn empty_names_are_not_answers() {
+        let empty_wayland = with_display(Some(":0"), Some(""), None, || {
+            ask(Some(""));
+            window_system()
+        });
+        assert_eq!(empty_wayland, Some(WindowSystem::X11));
+    }
+
+    /// A name this module does not offer is refused by the parse, and the
+    /// fallback still answers — a typo must not leave the window system
+    /// unknown, because the WM-less decision depends on knowing it.
+    #[test]
+    fn an_unrecognized_ask_still_answers_from_the_environment() {
+        let answer = with_display(Some(":0"), None, None, || {
+            ask(Some("xorg"));
+            window_system()
+        });
+        assert_eq!(answer, Some(WindowSystem::X11));
+        assert_eq!(
+            with_display(Some(":0"), None, None, || {
+                ask(Some("xorg"));
+                choice(WINDOW_SYSTEM, &["auto", "x11", "wayland"])
+            }),
+            Choice::Refused("xorg".to_owned())
+        );
+    }
+
+    /// The two arms spell the names the shell and the log use, and they are not
+    /// the same string.
+    #[test]
+    fn the_arms_name_themselves_the_way_everything_else_does() {
+        assert_eq!(WindowSystem::X11.name(), "x11");
+        assert_eq!(WindowSystem::Wayland.name(), "wayland");
+        assert_ne!(WindowSystem::X11.name(), WindowSystem::Wayland.name());
+    }
 }
 
 /// The state of every variable in [`ALL`], for the one-shot boot line.

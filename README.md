@@ -239,3 +239,8 @@ Licensed under the [GNU Lesser General Public License v3.0 or later](LICENSE)
 
 Metal, macOS are trademarks of Apple Inc. reims-vgpu is an independent project and is not affiliated
 with, sponsored by, or endorsed by Apple Inc.
+
+## Reims OS appliance
+
+Appliance and product development moved to [felipeab10/reims-os](https://github.com/felipeab10/reims-os).
+This repository remains the Reims VGPU/QEMU integration component.

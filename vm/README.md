@@ -24,6 +24,32 @@ vm/boot-x86.sh --device reims-vgpu-pci --testing --rail macos-11   # a specific 
 
 Both scripts use a snapshot-revert lifecycle (testing vs interactive classes; testing hard kill).
 
+### Host window system
+
+`REIMS_VGPU_WINDOW_SYSTEM` decides which window system the host-owned window
+opens on (`vm/window-system-env.sh`, applied by `vm/boot-x86.sh`):
+
+- `auto` (default) — leave the environment as the caller set it, with the
+  historical development fallbacks that invent `WAYLAND_DISPLAY`/`DISPLAY`
+  when neither is present. Works on a Wayland desktop and on an X11 session.
+- `x11` — require a non-empty `DISPLAY` and remove `WAYLAND_DISPLAY` and
+  `WAYLAND_SOCKET` before QEMU/reims-vgpu start. winit 0.30 has no
+  `WINIT_UNIX_BACKEND` and prefers Wayland whenever both are set, so the
+  variables are what selects X11. A missing `DISPLAY` is a refusal.
+- `wayland` — require `WAYLAND_DISPLAY` or `WAYLAND_SOCKET`.
+
+Within an X11 session, `REIMS_VGPU_X11_WMLESS` decides *how* the window becomes
+full-screen (Rust side, `host_window::present`):
+
+- `0` (default) — winit's `Fullscreen::Borderless`, which on X11 is an EWMH
+  request (`_NET_WM_STATE_FULLSCREEN`) and needs a window manager to honour it.
+- `1` — require `REIMS_VGPU_FULLSCREEN` as well, and create the window
+  override-redirect at the monitor's own rectangle, so no window manager is
+  involved. This is the Reims OS appliance's session; a host with a window
+  manager is unaffected because the switch is off there.
+
+Contract test: `vm/tests/window-system-env-test.sh` (no VM, no display needed).
+
 ## Driving a guest, and sweeping every rail
 
 A boot that sits at an idle Finder produces no rates, and almost every reading
@@ -105,3 +131,37 @@ Pathway-specific trees hold provisioned disks, rails, and per-boot clones. The r
 
 Stop a wedged guest with the pathway's shutdown helper when available
 (`scripts/vmapple-shutdown` on arm); otherwise use QMP quit plus a process kill.
+
+## macOS Tahoe installer with Reims from first boot
+
+The Reims OS appliance owns the canonical OSX-KVM checkout:
+
+https://github.com/felipeab10/reims-os
+
+This component repository does not vendor OSX-KVM. Provisioning and appliance
+lifecycle belong to reims-os. For isolated low-level development, provide an
+external OSX-KVM checkout explicitly; downloaded Apple recovery media and guest
+disks remain local and are ignored.
+
+Prepare a Tahoe recovery image outside Git using an external checkout:
+
+```bash
+: "${OSX_KVM:?set OSX_KVM to an external OSX-KVM checkout}"
+TAHOE="${TAHOE:-$PWD/.local/tahoe-installer}"
+mkdir -p "$TAHOE"
+python3 "$OSX_KVM/fetch-macOS-v2.py" --action download --shortname tahoe --os-type latest   --outdir "$TAHOE" --basename Tahoe
+dmg2img -i "$TAHOE/Tahoe.dmg" "$TAHOE/Tahoe.img"
+qemu-img create -f qcow2 "$TAHOE/macos.img" 256G
+```
+
+Start the installer with the Reims PCI device already attached:
+
+```bash
+DISKS_DIR="$TAHOE" \
+DISK_MASTER="$TAHOE/macos.img" \
+OPENCORE_MASTER="$OSX_KVM/OpenCore/OpenCore.qcow2" \
+OVMF_VARS_MASTER="$OSX_KVM/OVMF_VARS-1920x1080.fd" \
+INSTALL_MEDIA="$TAHOE/Tahoe.img" \
+REIMS_VGPU_BACKEND=vulkan \
+./vm/boot-x86.sh --interactive --device reims-vgpu-pci --rail macos-26
+```

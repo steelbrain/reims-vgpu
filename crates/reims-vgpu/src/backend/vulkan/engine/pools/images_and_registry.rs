@@ -4992,7 +4992,8 @@ pub(super) mod pin_count_tests {
             pools.staging_misses += 1;
             assert!(!pools.note_maintenance_settled(), "still uploading");
         }
-        // Uploads stop: the gate reopens after the usual consecutive passes.
+        // A brief quiet gap is not enough to trim allocations used by periodic
+        // workloads, even after the consecutive-pass counter has settled.
         for _ in 0..(SETTLED_PASSES_FOR_BUFFER_TRIM - 1) {
             assert!(
                 !pools.note_maintenance_settled(),
@@ -5000,14 +5001,19 @@ pub(super) mod pin_count_tests {
             );
         }
         assert!(
+            !pools.note_maintenance_settled(),
+            "three quiet passes alone are not the minimum idle interval"
+        );
+        pools.idle_clock_ms = STAGING_BUFFER_TRIM_IDLE_MS;
+        assert!(
             pools.note_maintenance_settled(),
-            "settled once uploads stopped"
+            "settled once the minimum idle interval elapsed"
         );
     }
 
     /// The HOST_VISIBLE buffer trim gate: only permitted after
-    /// `SETTLED_PASSES_FOR_BUFFER_TRIM` consecutive passes without upload
-    /// activity, so a staging buffer cannot be freed and re-allocated mid-video.
+    /// consecutive passes without upload activity plus the minimum quiet
+    /// interval, so periodic guest updates reuse their staging allocations.
     #[test]
     fn note_maintenance_settled_gates_buffer_trim_on_consecutive_idle() {
         let mut pools = ResourcePools::new();
@@ -5024,6 +5030,7 @@ pub(super) mod pin_count_tests {
         assert!(pools.note_maintenance_settled(), "stays settled");
         // Upload activity resets the counter.
         pools.staging_hits += 1;
+        pools.idle_clock_ms = 60_000;
         assert!(
             !pools.note_maintenance_settled(),
             "uploads reset settled state"
@@ -5036,8 +5043,18 @@ pub(super) mod pin_count_tests {
             );
         }
         assert!(
+            !pools.note_maintenance_settled(),
+            "short quiet interval must not enable trim"
+        );
+        pools.idle_clock_ms = 60_000 + STAGING_BUFFER_TRIM_IDLE_MS - 1;
+        assert!(
+            !pools.note_maintenance_settled(),
+            "buffer used periodically at 60 seconds is retained"
+        );
+        pools.idle_clock_ms += 1;
+        assert!(
             pools.note_maintenance_settled(),
-            "settled again after rebuild"
+            "settled again after the minimum idle interval"
         );
     }
 

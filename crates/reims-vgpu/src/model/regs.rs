@@ -966,7 +966,7 @@ pub fn display_dimension_mm(millimetres: u16) -> (f32, u16) {
 /// because the two were allowed to drift apart: a hardcoded 8 ms delivered
 /// 125 Hz against the 120 advertised here, and the guest paces to what is
 /// delivered.
-pub const DISPLAY_REFRESH_HZ: u32 = 120;
+pub const DISPLAY_REFRESH_HZ: u32 = 60;
 pub const DISPLAY_PRODUCT_NAME: &[u8] = b"QEMU display\0";
 /// How many unacked ONLINE pulses this device sends before it stops.
 ///
