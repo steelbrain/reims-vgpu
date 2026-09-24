@@ -1104,9 +1104,16 @@ impl WindowPresenter {
         let frame_cmd = self.frames[frame_ix].cmd;
         let frame_image_available = self.frames[frame_ix].image_available;
         let frame_in_flight = self.frames[frame_ix].in_flight;
+        // Not 0: NVIDIA's Wayland WSI only reads the compositor's
+        // wl_buffer.release events while an acquire is allowed to wait, so a
+        // zero-timeout acquire never sees an image come back. After the first
+        // presents every acquire was NOT_READY and the window froze on its last
+        // frame (host_window_cadence presents=0 busy_acquire=13 per second).
+        // Mesa reads the socket either way, so this costs it nothing.
+        const ACQUIRE_TIMEOUT_NS: u64 = 2_000_000;
         let (image_index, acquire_suboptimal) = match self.swapchain_loader.acquire_next_image(
             self.swapchain,
-            0,
+            ACQUIRE_TIMEOUT_NS,
             frame_image_available,
             vk::Fence::null(),
         ) {
