@@ -862,6 +862,14 @@ pub(crate) fn licence_gva_plane<M: HostMemory + HostOps>(
     // under-recorded — the direction that costs a re-read instead of a wrong
     // frame.
     state.note_host_wrote_pages(gpas.to_vec());
+    // The boot-wide write footprint, so a panic's page number can be looked up
+    // against this rail too. The mapper-ref licence marks it; this one did not,
+    // and a page this rail wrote read as "never written by this device".
+    // Marked over the copy's extent within the walked pages, before the
+    // submit — the over-recording direction, as the mapper's own note says.
+    crate::runtime::mapper::note_page_write_footprint(page_size, in_page, extent, |i| {
+        gpas.get(i).map(|&gpa| Some(gpa))
+    });
     Ok(GvaPlaneLicence {
         target,
         gpas: gpas.to_vec(),

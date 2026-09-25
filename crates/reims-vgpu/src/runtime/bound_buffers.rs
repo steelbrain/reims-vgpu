@@ -235,10 +235,19 @@ pub fn note_registry_levels(state: &crate::model::DeviceState) {
     static LAST_MS: AtomicU64 = AtomicU64::new(0);
     static PEAK_ENTRIES: AtomicU64 = AtomicU64::new(0);
 
-    let shape = state.bound_buffers.shape();
-    let peak = PEAK_ENTRIES
-        .fetch_max(shape.entries as u64, Ordering::Relaxed)
-        .max(shape.entries as u64);
+    // The peak is tracked on every call, because a spike between two reports is
+    // exactly what it exists to catch — but from the O(1) count, not from
+    // `shape`. This runs once per drain tranche: 141 times a second on a driven
+    // boot, where `shape` walks every held entry and builds a map to group them.
+    // Measured at the busiest second of a soak, that walk was **66 ms of 877 ms
+    // busy** — 7 % of the device's own budget spent describing a line emitted
+    // once a second.
+    let peak = {
+        let entries = state.bound_buffers.entries() as u64;
+        PEAK_ENTRIES
+            .fetch_max(entries, Ordering::Relaxed)
+            .max(entries)
+    };
 
     let now = crate::observe::elapsed_ms() as u64;
     let last = LAST_MS.load(Ordering::Relaxed);
@@ -252,6 +261,9 @@ pub fn note_registry_levels(state: &crate::model::DeviceState) {
     {
         return;
     }
+    // Past the gate: this call is the one that reports, so it is the one that
+    // pays for the shape.
+    let shape = state.bound_buffers.shape();
     crate::observe::off(format!(
         "bound_buffers (levels, not per-interval) entries={} peak={} pairs={} \
          multi_offset_pairs={} max_offsets={}",
@@ -435,6 +447,16 @@ impl BoundBuffers {
             multi_offset_pairs: per_pair.values().filter(|n| **n > 1).count(),
             max_offsets: per_pair.values().copied().max().unwrap_or(0),
         }
+    }
+
+    /// How many resolutions are held, without describing their shape.
+    ///
+    /// [`Self::shape`] answers the same first field and three more, and the
+    /// three cost a walk of every entry plus the map that groups them. A caller
+    /// that only needs the count — the levels census tracking its peak on every
+    /// tranche — must not pay that walk to get it.
+    pub fn entries(&self) -> usize {
+        self.held.len()
     }
 
     /// Whether nothing is held.
