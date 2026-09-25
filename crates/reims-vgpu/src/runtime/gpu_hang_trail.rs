@@ -232,7 +232,8 @@ pub struct SamplerNote {
     /// Where the state came from: `g` a translated guest sampler object, `c` an
     /// AIR constexpr sampler carried in reflection, `d` this device's own
     /// [`SamplerResource::normalized_default`] — which is `LINEAR` and which no
-    /// guest asked for.
+    /// guest asked for — or `r` the translator's read-sampler placeholder,
+    /// bound with [`SamplerResource::read_placeholder`] (nearest, clamp).
     pub provenance: u8,
     /// Unnormalized texel coordinates, which changes what a UV in `[0, 1]`
     /// addresses and would move a chain walk off its cells on its own.

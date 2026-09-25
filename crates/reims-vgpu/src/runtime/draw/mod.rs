@@ -495,6 +495,40 @@ pub struct IndexedDrawInfo {
 /// Archive `ApplePVGPURenderTarget`: either mapper-ref-texture IOSurface (`mapping_id`) or
 /// normal-texture guest-VA linear (`target_gva` + `row_stride`). Wallpaper/background
 /// layers are the GVA form.
+/// One colour attachment's `MTLLoadActionLoad` seed: the contents this pass
+/// draws onto, and the texel those bytes are in.
+///
+/// The layout travels with the bytes because it is not always RGBA8 and the
+/// difference is not a rounding. A `RGBA16Float` attachment — macOS 26 builds
+/// its glass materials and its icon layers in them — has no eight-bit form:
+/// `TexelLayout::cpu_loader_arm_is_lossy` says the CPU arm for it clamps to
+/// `[0, 1]` at 256 levels, and a coverage layer seeded through that clamp
+/// composites flat. A seed read in the attachment's own texel states so and
+/// stages verbatim.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LoadSeed {
+    pub bytes: Vec<u8>,
+    pub layout: crate::protocol::pixel_format::TexelLayout,
+}
+
+impl LoadSeed {
+    /// A seed in semantic RGBA8, which is what every producer but the native
+    /// guest-page read hands back.
+    pub fn rgba8(bytes: Vec<u8>) -> Self {
+        Self {
+            bytes,
+            layout: crate::protocol::pixel_format::TexelLayout::Rgba8,
+        }
+    }
+
+    /// The bytes, when they are the eight-bit colour a consumer can read as
+    /// pixels; `None` for a seed carried in the attachment's own wider texel.
+    pub fn as_rgba8(&self) -> Option<&[u8]> {
+        (self.layout == crate::protocol::pixel_format::TexelLayout::Rgba8)
+            .then_some(&self.bytes[..])
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct ColorRtRequest {
     pub slot: u32,
@@ -513,7 +547,7 @@ pub struct ColorRtRequest {
     pub load_action: u16,
     pub store_action: u16,
     pub clear_color: [f64; 4],
-    pub target_seed_rgba: Option<Vec<u8>>,
+    pub target_seed: Option<LoadSeed>,
     /// Multisample attachment discarded into this request's single-sample
     /// target at pass end. Zero for an ordinary colour attachment.
     pub multisample_source_ref: u32,
@@ -642,7 +676,7 @@ pub struct DrawEncodeRequest {
     /// keys off it.
     ///
     /// **A `true` here obliges the encode side to produce content one way or the
-    /// other.** `colors[0].target_seed_rgba` is `None` and the attachment still
+    /// other.** `colors[0].target_seed` is `None` and the attachment still
     /// says LOAD, so an encode that neither chains nor re-seeds hands the pass an
     /// undefined attachment. The re-seed is not theoretical: the generation this
     /// was decided on is recomputed after the request is built, and a page set
@@ -897,15 +931,21 @@ pub(crate) fn load_render_pipeline<M: HostMemory + HostOps>(
             return None;
         }
     };
-    // Both stages are required to build a pipeline, and the two are reported
-    // apart because they are different guest mistakes — the compute sibling
-    // names its one stage the same way, as `kernel_func_zero`.
+    // A vertex function is required: without one there is nothing to
+    // rasterize, and the compute sibling names its one stage the same way, as
+    // `kernel_func_zero`.
+    //
+    // A fragment function is **not**. Metal accepts `fragmentFunction == nil`
+    // as a depth/stencil-only pipeline — rasterize, test, write depth and
+    // stencil, write no color — and macOS 26's RenderBox and window compositor
+    // draw their clip masks that way. Refusing it here dropped every such pass,
+    // and the content clipped through the mask (app icons, among others) came
+    // out blank. Each rail answers for the absent stage itself: the Vulkan rail
+    // stands in an empty fragment module and masks color writes off
+    // (`backend::vulkan::pipeline_resolve`); the Metal rail does not yet, and
+    // refuses when it cannot load a fragment container.
     if p.vertex_func_ref == 0 {
         report.reason(task_id, pipeline_ref, "vertex_func_zero", "");
-        return None;
-    }
-    if p.fragment_func_ref == 0 {
-        report.reason(task_id, pipeline_ref, "fragment_func_zero", "");
         return None;
     }
     // The guest has created this pipeline object, which is the semantic model's
@@ -2348,7 +2388,7 @@ pub fn color_target_request<M: HostMemory + HostOps>(
         load_action: 0,
         store_action: MTL_STORE_ACTION_STORE,
         clear_color: [0.0; 4],
-        target_seed_rgba: None,
+        target_seed: None,
         multisample_source_ref: 0,
     };
     Some(DrawEncodeRequest {
@@ -2542,11 +2582,11 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
             load_action = MTL_LOAD_ACTION_CLEAR;
             clear_color = cl.clear_color;
             if mapping_id == 0 {
-                seed = Some(solid_rgba8(mw, mh, &cl.clear_color));
+                seed = Some(LoadSeed::rgba8(solid_rgba8(mw, mh, &cl.clear_color)));
             }
         } else if att.load_action == MTL_LOAD_ACTION_CLEAR {
             if mapping_id == 0 {
-                seed = Some(solid_rgba8(mw, mh, &att.clear_color));
+                seed = Some(LoadSeed::rgba8(solid_rgba8(mw, mh, &att.clear_color)));
             }
         } else if att.load_action == MTL_LOAD_ACTION_LOAD && mapping_id == 0 {
             // # This arm compares an ordinal, and the contract term is wider
@@ -2567,7 +2607,7 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
             // `gva_load_from_resident` false, and every downstream door is then
             // shut to it -- `honour_gva_load_elision` returns on the flag, the
             // seed block's mapping door is guarded by `mapping_id != 0`, and
-            // `target_seed_rgba` is `None`. `PassKey::single` reads "no seed",
+            // `target_seed` is `None`. `PassKey::single` reads "no seed",
             // `caches.rs` resolves that to `vk::AttachmentLoadOp::CLEAR`, and
             // every texel outside the draw's scissor becomes `target_clear` --
             // untouched at `[0.0; 4]`, transparent black, because that variable
@@ -2714,7 +2754,16 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
                 let elided = elided && colors.is_empty();
                 gva_load_from_resident = elided;
                 if !elided {
-                    seed = seed_color_load(state, host, task_id, att.texture_ref, gva, mw, mh);
+                    seed = seed_color_load(
+                        state,
+                        host,
+                        task_id,
+                        att.texture_ref,
+                        gva,
+                        mw,
+                        mh,
+                        seed_native_uploads(mfmt),
+                    );
                     if seed.is_none() {
                         crate::observe::fail(format!(
                             "color LOAD seed miss ref={} {}x{} fmt={:#x} gva={:#x} (archive: still encode)",
@@ -2737,7 +2786,7 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
             load_action,
             store_action: att.store_action,
             clear_color,
-            target_seed_rgba: seed,
+            target_seed: seed,
             multisample_source_ref,
         });
     }
@@ -3355,6 +3404,33 @@ pub(crate) fn write_gva_rgba8_rect<M: HostMemory + HostOps>(
 /// place is deleted. This used to run only on the alias-reject fallback
 /// (unaligned offset or row stride, span out of range, no device), which is why
 /// it is already a complete path and not a new one.
+/// Which of the guest's own texels a colour LOAD seed for `format` may keep.
+///
+/// The engine stages a seed verbatim only when the seed's layout is the
+/// attachment's own, so this answers for exactly the layouts that are both the
+/// attachment's and unrepresentable in eight bits. Half-float colour is that
+/// set today: `TexelLayout::cpu_loader_arm_is_lossy` names the clamp, and
+/// `store_texel_order` is the same table the Store rails land through, so the
+/// seed and the Store agree about what a destination texel is.
+///
+/// Nothing here asks whether the host can *sample* the layout: a seed is copied
+/// into an attachment of that format and never sampled, so the filter support
+/// `NativeUploads` documents for the sampled rails is not this caller's
+/// question.
+fn seed_native_uploads(format: u16) -> NativeUploads {
+    use crate::protocol::pixel_format::TexelLayout;
+    match crate::protocol::pixel_format::store_texel_order(format) {
+        Some(layout @ (TexelLayout::Rgba16Float | TexelLayout::Rg16Float)) => {
+            let _ = layout;
+            NativeUploads {
+                float16: true,
+                ..NativeUploads::NONE
+            }
+        }
+        _ => NativeUploads::NONE,
+    }
+}
+
 fn seed_color_load<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -3363,7 +3439,8 @@ fn seed_color_load<M: HostMemory + HostOps>(
     target_gva: u64,
     width: u32,
     height: u32,
-) -> Option<Vec<u8>> {
+    native: NativeUploads,
+) -> Option<LoadSeed> {
     // Discrete GPU: exact target GVA is the strongest identity across object-ref
     // recycling. Fall back to the normal texture namespace, never the
     // unrelated backing record_id namespace. Guest memory is last.
@@ -3559,7 +3636,7 @@ fn seed_color_load<M: HostMemory + HostOps>(
             None
         };
         if let Some(bgra) = cached {
-            return Some(swap_rb_channels(bgra));
+            return Some(LoadSeed::rgba8(swap_rb_channels(bgra)));
         }
         // The third door, and the only one a target with no address of its own
         // can reach. Both doors above are keyed on `target_gva`, so a rail whose
@@ -3580,7 +3657,7 @@ fn seed_color_load<M: HostMemory + HostOps>(
         if let Some(seed) =
             seed_from_published_surface(state, host, task_id, texture_ref, width, height)
         {
-            return Some(seed);
+            return Some(LoadSeed::rgba8(seed));
         }
     }
     // normal-texture (or texture-view base) linear GVA → convert to RGBA8.
@@ -3599,18 +3676,23 @@ fn seed_color_load<M: HostMemory + HostOps>(
     // buffer leaf had no settle at all before that, on any of its four callers.
     // The seed arm: this leaf is shared with the sampled resolve and the two
     // want opposite repairs, so it is charged separately.
-    // A colour LOAD seed is copied into a render target through the RGBA8-shaped
-    // seed path, so this arm takes no native layout — the bytes must be what
-    // that path reads them as.
-    let (rgba, _layout) = load_sampled_rgba_static(
+    // The caller states which layouts the seed path it feeds can stage. An
+    // eight-bit-only caller passes `NativeUploads::NONE` and this arm converts,
+    // as it always did; a caller whose attachment has no eight-bit form passes
+    // the layout and takes the guest's own texel, because converting it is the
+    // clamp `TexelLayout::cpu_loader_arm_is_lossy` names.
+    let (bytes, format) = load_sampled_rgba_static(
         state,
         host,
         task_id,
         texture_ref,
-        NativeUploads::NONE,
+        native,
         crate::runtime::render_writeback::SettleSite::LinearTextureSeed,
     )?;
-    Some(rgba)
+    Some(LoadSeed {
+        bytes,
+        layout: format.layout(),
+    })
 }
 
 /// This device's own last publication of a mapper-ref-texture surface, when the

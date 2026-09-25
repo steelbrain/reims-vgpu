@@ -569,17 +569,44 @@ fn ready<M: HostMemory + HostOps>(
     );
 }
 
+/// Apply Metal's meaning of `fragmentFunction == nil` to a decoded descriptor,
+/// and say whether it applied.
+///
+/// Such a pipeline writes depth and stencil and no color. The fragment stage is
+/// represented by [`crate::runtime::m2v_cache::empty_fragment`], which writes no
+/// output location — and a Vulkan color attachment that is enabled for writes but
+/// not written by the fragment shader holds an **undefined** value afterwards, not
+/// its previous one. So "writes no color" has to be stated on the masks, and it is
+/// stated here, once, where the absence is decided.
+pub(crate) fn settle_absent_fragment(desc: &mut RenderPipelineDescriptor) -> bool {
+    if desc.fragment_func_ref != 0 {
+        return false;
+    }
+    for attachment in &mut desc.color_attachments {
+        attachment.write_mask = crate::runtime::decode::resource::ColorWriteMask::NONE;
+    }
+    true
+}
+
 fn resolve_uncached_inner<M: HostMemory + HostOps>(
     state: &DeviceState,
     host: &M,
     task_id: u32,
     pipeline_ref: u32,
 ) -> Result<ResolvedRenderPipeline, DrawPreparationDecline> {
-    let desc = crate::runtime::draw::load_render_pipeline(state, host, task_id, pipeline_ref)
+    let mut desc = crate::runtime::draw::load_render_pipeline(state, host, task_id, pipeline_ref)
         .ok_or(DrawPreparationDecline::PipelineMissing {
-            task_id,
-            pipeline_ref,
-        })?;
+        task_id,
+        pipeline_ref,
+    })?;
+    // A pipeline with no fragment function is a Metal depth/stencil-only
+    // pipeline: it rasterizes and runs the depth and stencil stages, and writes
+    // no color. The fragment stage is stood in for below by
+    // [`crate::runtime::m2v_cache::empty_fragment`], which outputs nothing; the
+    // "writes no color" half is stated here, on the masks, because a Vulkan
+    // fragment shader that does not write a location leaves an enabled color
+    // attachment undefined rather than untouched.
+    let fragment_absent = settle_absent_fragment(&mut desc);
     // The descriptor decoded and the pipeline is declared; the guest's shader
     // form is about to become the host's.
     crate::runtime::draw::advance_pipeline(
@@ -607,17 +634,23 @@ fn resolve_uncached_inner<M: HostMemory + HostOps>(
         task_id,
         function_ref: desc.vertex_func_ref,
     })?;
-    let f_mtlb = load_mtlb(
-        state,
-        host,
-        task_id,
-        desc.fragment_func_ref,
-        AirLoadRail::Draw,
-    )
-    .ok_or(DrawPreparationDecline::FragmentMtlbMissing {
-        task_id,
-        function_ref: desc.fragment_func_ref,
-    })?;
+    let f_mtlb = if fragment_absent {
+        None
+    } else {
+        Some(
+            load_mtlb(
+                state,
+                host,
+                task_id,
+                desc.fragment_func_ref,
+                AirLoadRail::Draw,
+            )
+            .ok_or(DrawPreparationDecline::FragmentMtlbMissing {
+                task_id,
+                function_ref: desc.fragment_func_ref,
+            })?,
+        )
+    };
     enter(Phase::PipelineAir);
     let v_air = crate::runtime::mtlb::extract_air(&v_mtlb).map_err(|reason| {
         DrawPreparationDecline::VertexAirExtract {
@@ -625,12 +658,17 @@ fn resolve_uncached_inner<M: HostMemory + HostOps>(
             reason,
         }
     })?;
-    let f_air = crate::runtime::mtlb::extract_air(&f_mtlb).map_err(|reason| {
-        DrawPreparationDecline::FragmentAirExtract {
-            function_ref: desc.fragment_func_ref,
-            reason,
-        }
-    })?;
+    let f_air = f_mtlb
+        .as_ref()
+        .map(|f_mtlb| {
+            crate::runtime::mtlb::extract_air(f_mtlb).map_err(|reason| {
+                DrawPreparationDecline::FragmentAirExtract {
+                    function_ref: desc.fragment_func_ref,
+                    reason,
+                }
+            })
+        })
+        .transpose()?;
     enter(Phase::PipelineXlate);
     let vertex = crate::runtime::m2v_cache::translate_cached_reflected(
         v_air,
@@ -641,15 +679,18 @@ fn resolve_uncached_inner<M: HostMemory + HostOps>(
         pipeline_ref,
         reason,
     })?;
-    let fragment = crate::runtime::m2v_cache::translate_cached_reflected(
-        f_air,
-        metal2vulkan::passes::Stage::Fragment,
-        pipeline_ref,
-    )
-    .map_err(|reason| DrawPreparationDecline::FragmentTranslate {
-        pipeline_ref,
-        reason,
-    })?;
+    let fragment = match f_air {
+        Some(f_air) => crate::runtime::m2v_cache::translate_cached_reflected(
+            f_air,
+            metal2vulkan::passes::Stage::Fragment,
+            pipeline_ref,
+        )
+        .map_err(|reason| DrawPreparationDecline::FragmentTranslate {
+            pipeline_ref,
+            reason,
+        })?,
+        None => crate::runtime::m2v_cache::empty_fragment(),
+    };
     // Both stages are SPIR-V now. What is left is this rail building the
     // pipeline object out of them, which is `Compiling`.
     crate::runtime::draw::advance_pipeline(
@@ -678,6 +719,55 @@ mod tests {
     /// rather than asked of `selected()`: the retention belongs to this rail
     /// and the assertions would mean something else on a build that latched
     /// the other one.
+    /// `fragmentFunction == nil` is a depth/stencil-only pipeline in Metal: the
+    /// resolver must turn every color write off rather than refuse it, and must
+    /// leave a pipeline that has a fragment function exactly as decoded.
+    #[test]
+    fn an_absent_fragment_function_turns_color_writes_off_and_nothing_else() {
+        use crate::runtime::decode::resource::{ColorWriteMask, PipelineColorAttachment};
+
+        let attachments = vec![
+            PipelineColorAttachment {
+                slot: 0,
+                write_mask: ColorWriteMask::ALL,
+                ..Default::default()
+            },
+            PipelineColorAttachment {
+                slot: 1,
+                write_mask: ColorWriteMask::ALL,
+                ..Default::default()
+            },
+        ];
+        let mut maskless = RenderPipelineDescriptor {
+            vertex_func_ref: 7,
+            fragment_func_ref: 0,
+            color_attachments: attachments.clone(),
+            ..Default::default()
+        };
+        assert!(settle_absent_fragment(&mut maskless));
+        assert!(
+            maskless
+                .color_attachments
+                .iter()
+                .all(|a| a.write_mask == ColorWriteMask::NONE),
+            "a depth/stencil-only pipeline must not write any color attachment"
+        );
+        assert_eq!(maskless.vertex_func_ref, 7, "the vertex stage is untouched");
+
+        let mut drawing = RenderPipelineDescriptor {
+            vertex_func_ref: 7,
+            fragment_func_ref: 9,
+            color_attachments: attachments.clone(),
+            ..Default::default()
+        };
+        let before = drawing.clone();
+        assert!(!settle_absent_fragment(&mut drawing));
+        assert_eq!(
+            drawing, before,
+            "a pipeline with a fragment function is left as decoded"
+        );
+    }
+
     fn pipelines(state: &DeviceState) -> &TaskRenderPipelineStates {
         retained(state).expect("this rail owns the device's rail-state slot")
     }

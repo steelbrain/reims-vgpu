@@ -850,7 +850,10 @@ pub fn encode_icb_execute_and_writeback<M: HostMemory + HostOps>(
             return EncodeStatus::BadArgs("icb_color_target_degenerate_geometry");
         };
         let mut seed = c
-            .target_seed_rgba
+            .target_seed
+            .as_ref()
+            .and_then(crate::runtime::draw::LoadSeed::as_rgba8)
+            .map(<[u8]>::to_vec)
             .clone()
             .unwrap_or_else(|| vec![0u8; nbytes]);
         if seed.len() < nbytes {

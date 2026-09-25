@@ -1448,12 +1448,12 @@ fn an_intermediate_record_can_still_ask_about_the_resident_it_renders_into() {
         "a CLEAR has no prior content to be current"
     );
     req.colors[0].load_action = MTL_LOAD_ACTION_LOAD;
-    req.colors[0].target_seed_rgba = Some(vec![0u8; 128 * 64 * 4]);
+    req.colors[0].target_seed = Some(LoadSeed::rgba8(vec![0u8; 128 * 64 * 4]));
     assert!(
         mapper_ref_texture_load_currency_query(&state, &req).is_none(),
         "an explicit seed was already selected by RT provenance"
     );
-    req.colors[0].target_seed_rgba = None;
+    req.colors[0].target_seed = None;
     req.colors[0].store_action = reims_vgpu_protocol::pass_action::MTL_STORE_ACTION_DONT_CARE;
     assert!(
         mapper_ref_texture_load_currency_query(&state, &req).is_none(),
@@ -1771,23 +1771,90 @@ fn attachment_alias_resident_chain_selection() {
         ..Default::default()
     });
     assert_eq!(
-        fragment_attachment_alias_sample(&req, 0, 42),
+        fragment_attachment_alias_sample(&req, 0, 42, None),
         None,
         "unarmed LOAD without seed must not alias"
     );
     req.chain_from_resident = true;
     assert_eq!(
-        fragment_attachment_alias_sample(&req, 0, 42),
-        Some((8, 8, AttachmentAliasSample::ResidentChain)),
+        fragment_attachment_alias_sample(&req, 0, 42, None),
+        Some((8, 8, AttachmentAliasSample::ResidentChain { slot: 0 })),
         "armed chain aliases from the resident target"
     );
     // CPU seed still wins when present (record after a non-resident hop).
     let seed = vec![0u8; 8 * 8 * 4];
-    req.colors[0].target_seed_rgba = Some(seed);
+    req.colors[0].target_seed = Some(LoadSeed::rgba8(seed));
     assert!(matches!(
-        fragment_attachment_alias_sample(&req, 0, 42),
+        fragment_attachment_alias_sample(&req, 0, 42, None),
         Some((8, 8, AttachmentAliasSample::Seed(_, _)))
     ));
+}
+
+/// A pass that reads its own attachments through texture indices that are not
+/// their slots still reads the attachments — macOS 26's RenderBox icon passes.
+///
+/// The icon pass renders into an RGBA16F primary and accumulates coverage in an
+/// RG16F secondary it never stores; later draws of the pass sample the
+/// secondary and the primary at other texture indices. Matched by index those
+/// reads fell through to guest pages that hold nothing until the pass stores,
+/// and every icon rendered empty (`m2v_store_gva ... rgb_nz=0`).
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn a_pass_reads_its_own_attachments_through_any_texture_index() {
+    let attachment = |slot, texture_ref, target_gva| ColorRtRequest {
+        slot,
+        texture_ref,
+        mapping_id: 0,
+        target_gva,
+        width: 128,
+        height: 128,
+        load_action: MTL_LOAD_ACTION_LOAD,
+        ..Default::default()
+    };
+    let mut req = DrawEncodeRequest::default();
+    req.colors.push(attachment(0, 19, 0x26_8000));
+    req.colors.push(attachment(1, 20, 0x28_8000));
+    req.chain_from_resident = true;
+
+    assert_eq!(
+        fragment_attachment_alias_sample(&req, 0, 20, None),
+        Some((128, 128, AttachmentAliasSample::ResidentChain { slot: 1 })),
+        "the secondary, read at index 0, is the secondary's resident"
+    );
+    assert_eq!(
+        fragment_attachment_alias_sample(&req, 1, 19, None),
+        Some((128, 128, AttachmentAliasSample::ResidentChain { slot: 0 })),
+        "the primary, read at index 1, is the chain's primary"
+    );
+    assert_eq!(
+        fragment_attachment_alias_sample(&req, 2, 21, None),
+        None,
+        "a texture that is no attachment of the pass is not an alias"
+    );
+
+    // A mip chain: level 1 of texture 19 is attached while level 0 of the same
+    // texture is sampled. Different subresources, so no alias — the read is
+    // level 0's stored pixels, not level 1's clear.
+    let mut mip = DrawEncodeRequest::default();
+    mip.colors.push(ColorRtRequest {
+        slot: 0,
+        texture_ref: 19,
+        mapping_id: 0,
+        target_gva: 0x4290000,
+        width: 32,
+        height: 32,
+        load_action: MTL_LOAD_ACTION_CLEAR,
+        ..Default::default()
+    });
+    assert_eq!(
+        fragment_attachment_alias_sample(&mip, 0, 19, Some(0x428c000)),
+        None,
+        "sampling level 0 while rendering level 1 is not reading the attachment"
+    );
+    assert!(
+        fragment_attachment_alias_sample(&mip, 0, 19, Some(0x4290000)).is_some(),
+        "the attached level itself still aliases"
+    );
 }
 
 /// Vulkan-arm only: `AttachmentAliasSample` and its resolver are
@@ -1809,31 +1876,36 @@ fn gva_attachment_alias_samples_the_in_process_chain() {
             width: 2,
             height: 1,
             load_action: MTL_LOAD_ACTION_LOAD,
-            target_seed_rgba: Some(seed.clone()),
+            target_seed: Some(LoadSeed::rgba8(seed.clone())),
             ..Default::default()
         }],
         ..Default::default()
     };
 
     let (width, height, sample) =
-        fragment_attachment_alias_sample(&req, 0, texture_ref).expect("GVA alias");
+        fragment_attachment_alias_sample(&req, 0, texture_ref, None).expect("GVA alias");
     assert_eq!((width, height), (2, 1));
     let AttachmentAliasSample::Seed(actual, _) = sample else {
         panic!("Load alias must use the chained seed");
     };
     assert_eq!(actual, seed);
-    assert!(fragment_attachment_alias_sample(&req, 1, texture_ref).is_none());
-    assert!(fragment_attachment_alias_sample(&req, 0, texture_ref + 1).is_none());
+    // The alias is the object: the same attachment read through another
+    // texture index is still the attachment.
+    assert!(matches!(
+        fragment_attachment_alias_sample(&req, 1, texture_ref, None),
+        Some((2, 1, AttachmentAliasSample::Seed(..)))
+    ));
+    assert!(fragment_attachment_alias_sample(&req, 0, texture_ref + 1, None).is_none());
 
     req.colors[0].mapping_id = 9;
-    assert!(fragment_attachment_alias_sample(&req, 0, texture_ref).is_none());
+    assert!(fragment_attachment_alias_sample(&req, 0, texture_ref, None).is_none());
     req.colors[0].mapping_id = 0;
     req.colors[0].load_action = MTL_LOAD_ACTION_DONT_CARE;
-    assert!(fragment_attachment_alias_sample(&req, 0, texture_ref).is_none());
+    assert!(fragment_attachment_alias_sample(&req, 0, texture_ref, None).is_none());
     req.colors[0].load_action = MTL_LOAD_ACTION_CLEAR;
     req.colors[0].clear_color = [0.25, 0.5, 0.75, 1.0];
     assert_eq!(
-        fragment_attachment_alias_sample(&req, 0, texture_ref),
+        fragment_attachment_alias_sample(&req, 0, texture_ref, None),
         Some((2, 1, AttachmentAliasSample::Clear([0.25, 0.5, 0.75, 1.0])))
     );
 }
@@ -2788,7 +2860,7 @@ fn mrt_draw_request_load_seed_miss_still_encodes() {
     // drop the pass — that freezes lagging dual-mid on stale logo.
     let req = req.expect("Load seed miss must still encode (archive NULL seed)");
     assert!(
-        req.colors[0].target_seed_rgba.is_none(),
+        req.colors[0].target_seed.is_none(),
         "seed miss leaves seed None (Metal Clear invent, full Store)"
     );
     assert_eq!(req.colors[0].load_action, MTL_LOAD_ACTION_LOAD);
@@ -4089,9 +4161,10 @@ fn color_load_seed_uses_provenance_and_preserves_black() {
         target_gva,
         w,
         h,
+        NativeUploads::NONE,
     )
     .expect("exact GVA cache seed");
-    assert_eq!(seed, vec![0, 0, 0, 255, 0, 0, 0, 255]);
+    assert_eq!(seed, LoadSeed::rgba8(vec![0, 0, 0, 255, 0, 0, 0, 255]));
 
     // A different address with no GVA entry of its own must NOT be handed the
     // ref entry: those pixels were produced over `target_gva`, and serving them
@@ -4106,6 +4179,7 @@ fn color_load_seed_uses_provenance_and_preserves_black() {
             target_gva + 0x1000,
             w,
             h,
+            NativeUploads::NONE,
         )
         .is_none(),
         "a ref entry produced at another address is not this attachment's prior content"
@@ -4122,9 +4196,13 @@ fn color_load_seed_uses_provenance_and_preserves_black() {
         target_gva,
         w,
         h,
+        NativeUploads::NONE,
     )
     .expect("texture-ref cache seed at the address that produced it");
-    assert_eq!(texture_seed, vec![0, 180, 0, 255, 0, 180, 0, 255]);
+    assert_eq!(
+        texture_seed,
+        LoadSeed::rgba8(vec![0, 180, 0, 255, 0, 180, 0, 255])
+    );
 }
 
 /// A colour LOAD seed for a mapper-ref-texture attachment is served from this
@@ -4247,10 +4325,19 @@ fn a_mapper_ref_texture_load_seed_serves_a_published_frame_only_on_a_watched_cle
     // been armed, so the strict standard refuses and the guest's pages answer.
     // This is the whole reason the standard is a parameter: the permissive one
     // serves here, and a rail that never stamps would serve here every time.
-    let unwatched = seed_color_load(&mut state, &mut host, task_id, texture_ref, 0, w, h)
-        .expect("the guest's own pages are always a seed");
+    let unwatched = seed_color_load(
+        &mut state,
+        &mut host,
+        task_id,
+        texture_ref,
+        0,
+        w,
+        h,
+        NativeUploads::NONE,
+    )
+    .expect("the guest's own pages are always a seed");
     assert_eq!(
-        &unwatched[..4],
+        &unwatched.bytes[..4],
         &GUEST_RGBA,
         "an unstamped surface has no witness to spend, and the cache must not be served"
     );
@@ -4264,10 +4351,19 @@ fn a_mapper_ref_texture_load_seed_serves_a_published_frame_only_on_a_watched_cle
         .get_mut(&mid)
         .expect("mapped above")
         .guest_write_gen_at_store = host.guest_write_gen(token).expect("a live token has one");
-    let served = seed_color_load(&mut state, &mut host, task_id, texture_ref, 0, w, h)
-        .expect("a published frame under a clean witness is the attachment's prior content");
+    let served = seed_color_load(
+        &mut state,
+        &mut host,
+        task_id,
+        texture_ref,
+        0,
+        w,
+        h,
+        NativeUploads::NONE,
+    )
+    .expect("a published frame under a clean witness is the attachment's prior content");
     assert_eq!(
-        &served[..4],
+        &served.bytes[..4],
         &PUBLISHED_RGBA,
         "with the witness clean the device's own publication is the surface, and \
          re-reading the guest's pages is the cost this door exists to remove"
@@ -4276,10 +4372,19 @@ fn a_mapper_ref_texture_load_seed_serves_a_published_frame_only_on_a_watched_cle
     // Leg 3 — repainted. The guest CPU stores into the surface with no device
     // operation at all, so this witness is the only thing that sees it.
     host.guest_wrote_page(page_gpa);
-    let repainted = seed_color_load(&mut state, &mut host, task_id, texture_ref, 0, w, h)
-        .expect("a repainted surface still seeds, from its own pages");
+    let repainted = seed_color_load(
+        &mut state,
+        &mut host,
+        task_id,
+        texture_ref,
+        0,
+        w,
+        h,
+        NativeUploads::NONE,
+    )
+    .expect("a repainted surface still seeds, from its own pages");
     assert_eq!(
-        &repainted[..4],
+        &repainted.bytes[..4],
         &GUEST_RGBA,
         "the cache is a frame the guest has since painted over; serving it would \
          composite this pass onto a stale layer and store the result back"
@@ -4291,7 +4396,7 @@ fn a_mapper_ref_texture_load_seed_serves_a_published_frame_only_on_a_watched_cle
 ///
 /// `mrt_draw_request` sets [`DrawEncodeRequest::gva_load_from_resident`] when the
 /// engine still holds what the render Store published into the target's guest
-/// pages, and it pays for that by leaving `colors[0].target_seed_rgba` as `None`
+/// pages, and it pays for that by leaving `colors[0].target_seed` as `None`
 /// while the attachment still says `MTL_LOAD_ACTION_LOAD`. The attachment is then
 /// only as defined as the encode side makes it: `honour_gva_load_elision` either
 /// chains off the resident or reads the seed back, and a pass that does neither
@@ -4396,7 +4501,7 @@ fn a_gva_load_from_resident_draw_with_no_resident_puts_the_seed_back() {
             format: MTL_FORMAT_BGRA8_UNORM,
             load_action: MTL_LOAD_ACTION_LOAD,
             store_action: MTL_STORE_ACTION_STORE,
-            target_seed_rgba: None,
+            target_seed: None,
             ..Default::default()
         }],
         ..Default::default()
@@ -4436,11 +4541,11 @@ fn a_gva_load_from_resident_draw_with_no_resident_puts_the_seed_back() {
     // The property, and the reason the counter alone is not enough: the seed is
     // back, and it holds the guest's pixels rather than an empty buffer.
     let seed = req.colors[0]
-        .target_seed_rgba
+        .target_seed
         .as_ref()
         .expect("a LOAD whose elision was not honoured must have its seed restored");
     assert_eq!(
-        seed.len(),
+        seed.bytes.len(),
         4 * 2 * 4,
         "the restored seed must cover the whole attachment"
     );
@@ -4450,12 +4555,12 @@ fn a_gva_load_from_resident_draw_with_no_resident_puts_the_seed_back() {
     // deliberate — it pins that these bytes came through the seed path and not
     // from some other buffer that happened to be the right length.
     assert_eq!(
-        &seed[..4],
+        &seed.bytes[..4],
         &[3, 5, 7, 255],
         "the restored seed must be the attachment's own guest texels"
     );
     assert!(
-        seed.chunks_exact(4).all(|px| px == [3, 5, 7, 255]),
+        seed.bytes.chunks_exact(4).all(|px| px == [3, 5, 7, 255]),
         "every texel of the re-read attachment, not just the first row"
     );
 }
@@ -6306,7 +6411,7 @@ fn a_synchronous_gva_store_is_bounded_to_the_pages_the_command_named() {
         load_action: MTL_LOAD_ACTION_LOAD,
         store_action: MTL_STORE_ACTION_STORE,
         clear_color: [0.0; 4],
-        target_seed_rgba: None,
+        target_seed: None,
         multisample_source_ref: 0,
     };
 
@@ -6514,7 +6619,7 @@ fn a_scissored_gva_store_is_bounded_on_both_its_rails() {
         load_action: MTL_LOAD_ACTION_LOAD,
         store_action: MTL_STORE_ACTION_STORE,
         clear_color: [0.0; 4],
-        target_seed_rgba: None,
+        target_seed: None,
         multisample_source_ref: 0,
     };
     // Full height, left half only: the partial store the Load seed forces, and
@@ -7520,7 +7625,7 @@ fn a_dontcare_colour_attachment_is_still_served_its_prior_contents() {
 
     let mut c0 = ColorRtRequest {
         load_action: MTL_LOAD_ACTION_LOAD,
-        target_seed_rgba: None,
+        target_seed: None,
         ..Default::default()
     };
     assert!(
@@ -7547,7 +7652,7 @@ fn a_dontcare_colour_attachment_is_still_served_its_prior_contents() {
     // DontCare exactly as on LOAD: the two gates are independent and widening
     // the action must not widen this one.
     c0.load_action = MTL_LOAD_ACTION_DONT_CARE;
-    c0.target_seed_rgba = Some(vec![0u8; 4]);
+    c0.target_seed = Some(LoadSeed::rgba8(vec![0u8; 4]));
     assert!(
         !mapper_ref_texture_load_is_a_seed_candidate(&c0),
         "an explicit provenance seed still excludes the resident candidate"
@@ -7818,12 +7923,12 @@ fn a_preserving_gva_attachment_reaches_the_encoder_able_to_preserve() {
         // BGRA in guest pages becomes RGBA here, so [7,5,3,255] reads back as
         // [3,5,7,255].
         let carries_attachment = c0
-            .target_seed_rgba
+            .target_seed
             .as_ref()
-            .is_some_and(|s| s.chunks_exact(4).all(|px| px == [3u8, 5, 7, 255]));
+            .is_some_and(|s| s.bytes.chunks_exact(4).all(|px| px == [3u8, 5, 7, 255]));
         (
             carries_attachment || req.gva_load_from_resident,
-            c0.target_seed_rgba.is_some(),
+            c0.target_seed.is_some(),
         )
     };
 

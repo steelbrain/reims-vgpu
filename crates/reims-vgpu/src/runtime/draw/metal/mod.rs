@@ -239,7 +239,12 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
     let mut color_seeds: Vec<Option<Vec<u8>>> = req
         .colors
         .iter_mut()
-        .map(|c| c.target_seed_rgba.take())
+        .map(|c| {
+            c.target_seed
+                .take()
+                .filter(|seed| seed.layout == crate::protocol::pixel_format::TexelLayout::Rgba8)
+                .map(|seed| seed.bytes)
+        })
         .collect();
     let color_list: Vec<ColorRtRequest> = req.colors.clone();
     let width = color_list[0].width;
@@ -939,8 +944,17 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
                 continue;
             }
             crate::runtime::drain::note_store_route("metal_seed_load_asked");
-            color_seeds[i] =
-                seed_color_load(state, host, req.task_id, c.texture_ref, 0, width, height);
+            color_seeds[i] = seed_color_load(
+                state,
+                host,
+                req.task_id,
+                c.texture_ref,
+                0,
+                width,
+                height,
+                // The Metal arm's seed consumer reads the bytes as RGBA8.
+                crate::runtime::draw::texture_view::NativeUploads::NONE,
+            );
             if color_seeds[i].is_none() {
                 crate::observe::fail(format!(
                     "metal_draw guest_attachment_fallback_seed fail \

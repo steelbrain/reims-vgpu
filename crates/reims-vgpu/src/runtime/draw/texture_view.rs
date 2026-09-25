@@ -710,6 +710,16 @@ pub(crate) fn load_linear_texture_host<M: HostMemory + HostOps>(
         native,
         site,
     )
+    // Named once per texture: the callers collapse this to "texture resolve
+    // missing", which says a draw lost a texture and not which rung refused it.
+    .map_err(|why| {
+        crate::observe::Emit::decline("linear_texture_load", &why)
+            .field("task", task_id)
+            .field("ref", texture_ref)
+            .field("level", level)
+            .field("fmt_ov", format!("{format_override:?}"))
+            .fail_once(u64::from(task_id) << 32 | u64::from(texture_ref));
+    })
     .ok()
 }
 

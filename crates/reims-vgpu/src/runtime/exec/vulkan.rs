@@ -70,10 +70,11 @@ pub(crate) fn preflight_render_translations<M: HostMemory + HostOps>(
         // A container whose AIR will not extract is the same "deterministic
         // missing plan input" as one that would not load: normal execution
         // reports it precisely, and there is no asynchronous work to await.
-        let (Ok(v_air), Ok(f_air)) = (
-            crate::runtime::mtlb::extract_air(&v_mtlb),
-            crate::runtime::mtlb::extract_air(&f_mtlb),
-        ) else {
+        let f_air = f_mtlb
+            .as_ref()
+            .map(|f_mtlb| crate::runtime::mtlb::extract_air(f_mtlb))
+            .transpose();
+        let (Ok(v_air), Ok(f_air)) = (crate::runtime::mtlb::extract_air(&v_mtlb), f_air) else {
             crate::runtime::drain::note_store_route("preflight_air_unextractable");
             continue;
         };
@@ -84,11 +85,15 @@ pub(crate) fn preflight_render_translations<M: HostMemory + HostOps>(
             v_air,
             metal2vulkan::passes::Stage::Vertex,
             pipeline_ref,
-        ) & crate::runtime::m2v_cache::ensure_cached_async(
-            f_air,
-            metal2vulkan::passes::Stage::Fragment,
-            pipeline_ref,
-        );
+        ) & f_air.map_or(true, |f_air| {
+            // A depth/stencil-only pipeline has no fragment AIR; its stand-in
+            // module is a constant and needs no translation.
+            crate::runtime::m2v_cache::ensure_cached_async(
+                f_air,
+                metal2vulkan::passes::Stage::Fragment,
+                pipeline_ref,
+            )
+        });
         note_preflight_part(
             PreflightPart::Cache,
             cache_started.elapsed().as_nanos() as u64,
@@ -130,7 +135,7 @@ fn publish_render_usage<M: HostMemory + HostOps>(
     task_id: u32,
     pipeline_ref: u32,
     v_air: &[u8],
-    f_air: &[u8],
+    f_air: Option<&[u8]>,
 ) {
     use crate::backend::vulkan::pipeline_resolve::VertexBindPlan;
 
@@ -151,17 +156,23 @@ fn publish_render_usage<M: HostMemory + HostOps>(
         crate::runtime::drain::note_store_route("render_usage_descriptor_lost");
         return;
     };
+    // No fragment AIR is a depth/stencil-only pipeline; it publishes the same
+    // stand-in stage the resolver builds, whose reflection names no resources.
+    let fragment = match f_air {
+        Some(f_air) => crate::runtime::m2v_cache::translate_cached_reflected(
+            f_air,
+            metal2vulkan::passes::Stage::Fragment,
+            pipeline_ref,
+        ),
+        None => Ok(crate::runtime::m2v_cache::empty_fragment()),
+    };
     let (Ok(vertex), Ok(fragment)) = (
         crate::runtime::m2v_cache::translate_cached_reflected(
             v_air,
             metal2vulkan::passes::Stage::Vertex,
             pipeline_ref,
         ),
-        crate::runtime::m2v_cache::translate_cached_reflected(
-            f_air,
-            metal2vulkan::passes::Stage::Fragment,
-            pipeline_ref,
-        ),
+        fragment,
     ) else {
         // Cached a moment ago and not now: the entry failed or was forgotten
         // between the two calls. Nothing is owed — the draw path reports the
