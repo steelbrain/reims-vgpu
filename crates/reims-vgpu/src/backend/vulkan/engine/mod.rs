@@ -2924,7 +2924,7 @@ pub fn read_resident_bgra(identity: &TargetIdentity, need: usize) -> Option<Vec<
             return None;
         }
     }
-    let mut px = match read_target_inner(identity) {
+    let mut px = match read_target_inner(identity, ReadbackWidth::EightBit) {
         // `into_bgra8` is a no-op for a resident already in scanout order, which
         // is every one this rail sees on a boot measured so far. A native frame
         // has no scanout order at all — there is nothing to present — so it
@@ -3706,6 +3706,22 @@ impl GuestPageTarget {
     fn rows_are_dense(&self) -> bool {
         self.pitch_bytes() == u64::from(self.width) * self.bytes_per_texel()
     }
+
+    /// `Some((need, have))` when the texels this target describes do not fit
+    /// the guest pages its runs cover.
+    ///
+    /// The relation `plan_guest_copy` is documented to leave to its caller:
+    /// `references_for_runs` clips a window to the pages it was given and
+    /// never refuses a short one, so a target can name more texels than it has
+    /// pages for. The render rail checks this before planning
+    /// (`GuestWriteDecline::WindowTooSmall`); the compute rail called the
+    /// planner directly and did not. Neutral in its answer so a caller outside
+    /// the engine can name its own refusal.
+    pub(crate) fn window_shortfall(&self) -> Option<(u64, u64)> {
+        let need = self.extent_end();
+        let have = self.window_bytes();
+        (need > have).then_some((need, have))
+    }
 }
 
 /// Copy a resident target straight into the guest's pages, with no host copy of
@@ -4048,6 +4064,17 @@ pub(super) enum GuestWriteSource<'a> {
     /// through a residency registry, which is popped out of the ring's live set
     /// at acquire time and is therefore reclaimable while the fence still runs.
     RingEntry,
+}
+
+/// Arm the write debt and its page ledger without a device or a ledger entry,
+/// for a test of a caller that must settle before handing pages back. With no
+/// device context the settle has nothing to wait on and clears the flag, which
+/// is exactly the observable a caller's test needs: the flag going down proves
+/// the caller asked.
+#[cfg(test)]
+pub(crate) fn arm_guest_write_debt_for_tests(pages: &[u64]) {
+    arm_guest_write_pages(pages);
+    GUEST_WRITE_DEBT.store(true, std::sync::atomic::Ordering::Release);
 }
 
 pub(super) fn record_guest_write_debt(
@@ -5520,7 +5547,28 @@ fn readback_snapshot(
     Ok((snap, layout))
 }
 
-fn read_target_inner(identity: &TargetIdentity) -> Result<TargetReadback, DrawError> {
+/// Whether a readback may quantize a wide resident to eight-bit colour.
+///
+/// The narrowing exists for consumers that can only read eight-bit colour — the
+/// scanout and the sampled-byte rails. A consumer landing the frame in a
+/// destination of the resident's *own* layout must not take it: sixteen-bit
+/// float channels carry values outside `[0, 1]`, which is what
+/// `TexelLayout::cpu_loader_arm_is_lossy` and the `target_read_narrowed` route
+/// have always said the narrowing destroys.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadbackWidth {
+    /// Quantize a wide resident to `Rgba8`, as every eight-bit consumer needs.
+    EightBit,
+    /// Carry the resident's own texel out untouched when no eight-bit form of
+    /// it can hold what it holds. The caller must check
+    /// [`ReadbackTexel::native_layout`] against its destination.
+    Native,
+}
+
+fn read_target_inner(
+    identity: &TargetIdentity,
+    width: ReadbackWidth,
+) -> Result<TargetReadback, DrawError> {
     let mut guard = lock_engine();
     let EngineState {
         ref mut owner,
@@ -5554,16 +5602,53 @@ fn read_target_inner(identity: &TargetIdentity) -> Result<TargetReadback, DrawEr
         pools.registry_note_access(identity, read_access);
         counters.note_target_read(rb_size, TargetReadDelivery::Host);
         // A wide resident is quantized here rather than refused; see
-        // `narrow_readback_to_rgba8` for why that direction is the safe one.
+        // `narrow_readback_to_rgba8` for why that direction is the safe one —
+        // and `ReadbackWidth::Native` for the caller that may not take it.
         let (pixels, texel) =
-            narrow_readback_to_rgba8(out, layout, snap.format, pixels, snap.bgra())?;
+            readback_in_width(width, out, layout, snap.format, pixels, snap.bgra())?;
         Ok(TargetReadback { pixels, texel })
+    }
+}
+
+/// The readback's texels, in the width its consumer asked for.
+///
+/// Split from [`read_target_inner`] because the policy is the whole of what
+/// [`ReadbackWidth`] decides and the rest of that function needs a device.
+fn readback_in_width(
+    width: ReadbackWidth,
+    out: Vec<u8>,
+    layout: crate::protocol::pixel_format::TexelLayout,
+    format: ash::vk::Format,
+    pixels: u64,
+    bgra: bool,
+) -> Result<(Vec<u8>, ReadbackTexel), DrawError> {
+    match width {
+        ReadbackWidth::EightBit => narrow_readback_to_rgba8(out, layout, format, pixels, bgra),
+        // Four-byte colour is eight-bit colour already: there is nothing wider
+        // to keep, and naming it `Native` would make every consumer of an
+        // ordinary frame check a layout it does not need.
+        ReadbackWidth::Native if layout.is_four_byte_color() => {
+            Ok((out, ReadbackTexel::eight_bit(bgra)))
+        }
+        ReadbackWidth::Native => Ok((out, ReadbackTexel::Native(layout))),
     }
 }
 
 /// Full-frame readback of a resident target (present / Synchronize / Map / Store boundary).
 pub fn read_target(identity: &TargetIdentity) -> Result<TargetReadback, DrawError> {
-    read_target_inner(identity)
+    read_target_inner(identity, ReadbackWidth::EightBit)
+}
+
+/// Full-frame readback that keeps a wide resident's own texel.
+///
+/// For the Store rails, whose destination is the guest texture the resident was
+/// created from: its layout is the resident's, so the frame lands verbatim and
+/// nothing is quantized. A `RGBA16Float` glass mask read through
+/// [`read_target`] came back clamped to `[0, 1]` at eight bits a channel, and
+/// the composite that sampled those guest pages afterwards drew flat rectangles
+/// where the material's coverage should have varied.
+pub fn read_target_native(identity: &TargetIdentity) -> Result<TargetReadback, DrawError> {
+    read_target_inner(identity, ReadbackWidth::Native)
 }
 
 /// Run bounded maintenance for dead resources and already-free pool entries.
@@ -6481,6 +6566,51 @@ mod readback_width_tests {
     /// have satisfied is the sizer being wrong, and that is the bug. Driving it
     /// off `TexelLayout::ALL` means a layout added to the contract is swept the
     /// moment it exists.
+    /// A Store landing a frame in the resident's own layout must not be handed
+    /// a narrowed one.
+    ///
+    /// `ReadbackWidth::EightBit` quantizes every wide layout, which clamps a
+    /// half-float channel to `[0, 1]` at 256 levels. macOS 26 renders its glass
+    /// materials and its icon layers into `RGBA16Float` GVA targets and samples
+    /// them back through guest memory, so a Store that took the narrowed frame
+    /// wrote the clamp into the guest's pages and the next composite drew flat
+    /// rectangles where the material's coverage should have varied.
+    ///
+    /// Both directions are asserted: the wide layouts keep their own texel under
+    /// `Native`, and four-byte colour still comes back as colour, because a
+    /// consumer of an ordinary frame must not have to ask about a layout.
+    #[test]
+    fn a_native_readback_keeps_every_layout_that_eight_bits_cannot_hold() {
+        const PIXELS: u64 = 7 * 5;
+        for &layout in TexelLayout::ALL {
+            let format = crate::backend::vulkan::translate::pixel::vk_texel_layout(layout);
+            let sized = (PIXELS * u64::from(readback_bytes_per_texel(format))) as usize;
+            let (pixels, texel) = readback_in_width(
+                ReadbackWidth::Native,
+                vec![0u8; sized],
+                layout,
+                format,
+                PIXELS,
+                true,
+            )
+            .expect("the native width refuses nothing");
+            assert_eq!(pixels.len(), sized, "{layout:?}: native carries the read");
+            if layout.is_four_byte_color() {
+                assert_eq!(
+                    texel,
+                    ReadbackTexel::Bgra8,
+                    "{layout:?}: colour stays colour"
+                );
+            } else {
+                assert_eq!(
+                    texel.native_layout(),
+                    Some(layout),
+                    "{layout:?}: a wide texel must reach the Store as itself"
+                );
+            }
+        }
+    }
+
     #[test]
     fn no_readback_layout_is_refused_for_being_short_sized() {
         const W: u64 = 7;

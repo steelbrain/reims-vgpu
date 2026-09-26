@@ -767,7 +767,7 @@ fn draw_request(mapping_id: u32) -> DrawEncodeRequest {
             height: 4,
             format: crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM,
             store_action: MTL_STORE_ACTION_STORE,
-            target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
+            target_seed: Some(crate::runtime::draw::LoadSeed::rgba8(vec![0u8; 4 * 4 * 4])),
             ..Default::default()
         }],
         ..Default::default()

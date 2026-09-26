@@ -365,6 +365,99 @@ impl ShaderVariant {
     }
 }
 
+/// The fragment stage of a render pipeline whose guest descriptor names **no**
+/// fragment function.
+///
+/// Metal allows `fragmentFunction == nil`: the pipeline rasterizes, runs the
+/// depth and stencil tests and writes, and produces no color. RenderBox and the
+/// window compositor use exactly that for clip masks and depth-only passes, so a
+/// device that refuses the pipeline drops the mask, and the content drawn through
+/// it — a macOS 26 app icon clipped to its shape — comes out blank.
+///
+/// Vulkan has no "absent" fragment stage that every consumer here can carry, so
+/// the absence is represented by a module that is one: an entry point with no
+/// inputs, no outputs and no resources. Its reflection is empty for the same
+/// reason, so nothing downstream binds a texture, sampler or buffer for it. The
+/// other half of the contract — no color is written — belongs to the pipeline's
+/// write masks, which the resolver sets to `NONE` beside choosing this module.
+///
+/// Built once: the module is a constant and the reflection has no inputs.
+pub fn empty_fragment() -> Arc<CachedShader> {
+    // `spirv-as --target-env vulkan1.2` of
+    //   OpCapability Shader / OpMemoryModel Logical GLSL450
+    //   OpEntryPoint Fragment %main "main" / OpExecutionMode %main OriginUpperLeft
+    //   %main = OpFunction %void None %fn / OpLabel / OpReturn / OpFunctionEnd
+    // and accepted by `spirv-val --target-env vulkan1.2`.
+    const WORDS: [u32; 32] = [
+        0x0723_0203,
+        0x0001_0500,
+        0x0007_0000,
+        0x0000_0005,
+        0x0000_0000,
+        0x0002_0011,
+        0x0000_0001,
+        0x0003_000e,
+        0x0000_0000,
+        0x0000_0001,
+        0x0005_000f,
+        0x0000_0004,
+        0x0000_0001,
+        0x6e69_616d,
+        0x0000_0000,
+        0x0003_0010,
+        0x0000_0001,
+        0x0000_0007,
+        0x0002_0013,
+        0x0000_0002,
+        0x0003_0021,
+        0x0000_0003,
+        0x0000_0002,
+        0x0005_0036,
+        0x0000_0002,
+        0x0000_0001,
+        0x0000_0000,
+        0x0000_0003,
+        0x0002_00f8,
+        0x0000_0004,
+        0x0001_00fd,
+        0x0001_0038,
+    ];
+    static EMPTY: OnceLock<Arc<CachedShader>> = OnceLock::new();
+    EMPTY
+        .get_or_init(|| {
+            use metal2vulkan::reflect::{DescriptorLayout, ShaderStage, REFLECTION_VERSION};
+            let reflection = ShaderReflection {
+                reflection_version: REFLECTION_VERSION,
+                stage: ShaderStage::Fragment,
+                entry_point: None,
+                bindings: vec![],
+                argument_buffer_fields: vec![],
+                vertex_attributes: vec![],
+                varyings: vec![],
+                render_targets: vec![],
+                depth_members: vec![],
+                depth_qualifier: None,
+                stencil_members: vec![],
+                local_size: None,
+                max_work_group_size: None,
+                vertex_builtins: None,
+                tessellation: None,
+                imageblock_layouts: vec![],
+                implicit_imageblock_attachments: vec![],
+                fragment_imageblock: None,
+                datalayout: None,
+                descriptor_layout: DescriptorLayout::default(),
+                kernel_dispatch: None,
+                runtime_sampler_specializations: vec![],
+                runtime_storage_image_specializations: vec![],
+                function_constants: vec![],
+            };
+            let spirv = WORDS.iter().flat_map(|w| w.to_le_bytes()).collect();
+            Arc::new(CachedShader::new(spirv, Arc::new(reflection)))
+        })
+        .clone()
+}
+
 impl CachedShader {
     /// Materialize a freshly translated module, in the device's binding
     /// numbering rather than the translator's.
@@ -2065,5 +2158,52 @@ mod tests {
         slugs.dedup();
         assert_eq!(before, 12, "the m2v cache decline census moved");
         assert_eq!(before, slugs.len(), "duplicate m2v cache decline");
+    }
+}
+
+#[cfg(test)]
+mod empty_fragment_tests {
+    use super::*;
+    use metal2vulkan::reflect::ShaderStage;
+
+    /// The stand-in for an absent fragment function must be a fragment entry
+    /// point that binds nothing and writes nothing — anything it declared would
+    /// be bound, or would write an attachment the guest never asked to write.
+    #[test]
+    fn the_absent_fragment_stand_in_is_an_inert_fragment_entry_point() {
+        let f = empty_fragment();
+        assert_eq!(f.words[0], 0x0723_0203, "a SPIR-V module");
+        assert_eq!(
+            f.spirv.len(),
+            f.words.len() * 4,
+            "bytes and words describe one module"
+        );
+
+        // OpEntryPoint is opcode 15; its first operand is the execution model,
+        // and 4 is Fragment. Its name must be "main", which every consumer of a
+        // translated module assumes.
+        let mut i = 5;
+        let mut entry = None;
+        while i < f.words.len() {
+            let (len, op) = ((f.words[i] >> 16) as usize, f.words[i] & 0xffff);
+            if op == 15 {
+                entry = Some((f.words[i + 1], f.words[i + 3]));
+            }
+            i += len.max(1);
+        }
+        assert_eq!(
+            entry,
+            Some((4, u32::from_le_bytes(*b"main"))),
+            "one Fragment entry named main"
+        );
+
+        let r = &f.reflection;
+        assert_eq!(r.stage, ShaderStage::Fragment);
+        assert!(r.bindings.is_empty(), "binds no resource");
+        assert!(r.render_targets.is_empty(), "writes no color output");
+        assert!(r.varyings.is_empty(), "consumes no varying");
+        assert!(r.depth_members.is_empty() && r.stencil_members.is_empty());
+
+        assert!(Arc::ptr_eq(&f, &empty_fragment()), "built once and shared");
     }
 }

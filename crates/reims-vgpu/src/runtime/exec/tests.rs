@@ -2739,13 +2739,13 @@ fn render_pass_template_reuses_attachment_without_load_seed() {
             load_action: MTL_LOAD_ACTION_CLEAR,
             store_action: MTL_STORE_ACTION_STORE,
             clear_color: [0.1, 0.2, 0.3, 1.0],
-            target_seed_rgba: Some(vec![0xbb; 16]),
+            target_seed: Some(crate::runtime::draw::LoadSeed::rgba8(vec![0xbb; 16])),
             multisample_source_ref: 0,
         }],
         ..Default::default()
     };
     let template = render_pass_attachment_template(&first);
-    assert!(template.colors[0].target_seed_rgba.is_none());
+    assert!(template.colors[0].target_seed.is_none());
     assert_eq!(template.colors[0].load_action, MTL_LOAD_ACTION_LOAD);
     assert_eq!(template.colors[0].mapping_id, 3);
     assert_eq!(
@@ -2778,7 +2778,7 @@ fn render_pass_template_reuses_attachment_without_load_seed() {
     assert_eq!(req.colors.len(), 1);
     assert_eq!(req.colors[0].mapping_id, 3);
     assert_eq!(
-        first.colors[0].target_seed_rgba.as_ref().map(Vec::len),
+        first.colors[0].target_seed.as_ref().map(|s| s.bytes.len()),
         Some(16)
     );
 }

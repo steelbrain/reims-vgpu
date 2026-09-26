@@ -48,6 +48,7 @@
 
 use crate::model::{DeviceState, ResourceValidity};
 use crate::protocol::fifo::InvalidateValidityOps;
+use crate::runtime::host::{HostMemory, HostOps};
 
 /// Which producer delivered a quad. Only used to name the counters, so an arm
 /// can tell an exec-table statement from an invalidate-command one.
@@ -73,6 +74,52 @@ pub struct ValidityOutcome {
     pub bumped: u32,
     /// The record named no mapping this device holds.
     pub missed: bool,
+    /// The record cleared the guest's copy (byte +6): the guest is about to
+    /// read this object's pages, so any frame this device owes them must land
+    /// first. The caller pays it through [`deliver_for_guest_read`], at the
+    /// point where the frame it owes exists — after the submission that renders
+    /// it, for a resource table.
+    pub guest_read_requested: bool,
+}
+
+/// Land every frame this device owes `object_id`'s guest pages, because the
+/// guest has said it is about to read them.
+///
+/// The debt ledger defers a render Store's writeback until a reader names the
+/// pages, and a guest CPU read names nothing the device can see — this
+/// statement is the only notice it gets. Unpaid, the guest reads whatever the
+/// pages held before the render: macOS 26 rasterises small symbol icons on the
+/// GPU and reads them back on the CPU, and every one came back empty
+/// (`validity_guest_read_frame_owed`).
+pub fn deliver_for_guest_read<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    object_id: u32,
+) {
+    let owed_gva =
+        state
+            .pending_writebacks
+            .has_gva(crate::runtime::writeback_debt::GvaResourceKey {
+                task_id,
+                texture_ref: object_id,
+            });
+    let mappings: Vec<u32> = state
+        .mappings_named_by(task_id, object_id)
+        .iter()
+        .filter(|&id| state.pending_writebacks.get(id).is_some())
+        .collect();
+    if !owed_gva && mappings.is_empty() {
+        return;
+    }
+    crate::runtime::writeback_debt::pay_for_texture(state, host, task_id, object_id);
+    for mapping_id in mappings {
+        crate::runtime::writeback_debt::pay_for_mapping(state, host, mapping_id);
+    }
+    crate::runtime::render_writeback::settle_guest_writes(
+        crate::runtime::render_writeback::SettleSite::GuestReadRequest,
+    );
+    crate::runtime::drain::note_store_route("validity_guest_read_delivered");
 }
 
 /// Apply one record's quad to whatever mapping state the object id names.
@@ -161,6 +208,7 @@ pub fn apply(
         crate::runtime::drain::note_store_route(site.clear_host_route());
     }
     if ops.clear_guest_valid != 0 {
+        out.guest_read_requested = true;
         // Byte +6 of the exec-table record, and the one op in the quad this
         // device stores without anything reading it.
         //

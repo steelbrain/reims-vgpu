@@ -180,6 +180,17 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
     crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Prep);
     // metal2vulkan path: load MTLB → AIR → SPIR-V → internal Vulkan engine offscreen.
     let mut draw_rgba: Option<Vec<u8>> = None;
+    // The same frame in the destination's own texel, for a GVA target whose
+    // declared format has no eight-bit form that holds what it holds.
+    //
+    // `read_resident_chain` narrows every readback to RGBA8 because its callers
+    // speak RGBA. That is a clamp to `[0, 1]` at eight bits a channel, and a
+    // `RGBA16Float` render target — macOS 26 builds its glass materials and its
+    // icon layers in one — carries values the clamp destroys. The copying arm in
+    // `render_writeback::vulkan` already lands such a frame verbatim; this is the
+    // eager arm's copy of that answer, kept beside the narrowed one because the
+    // host caches below still want eight-bit colour.
+    let mut gva_native: Option<Vec<u8>> = None;
     // Physical order of `draw_rgba`. A mapper-ref-texture composite Store renders into a
     // BGRA `Surface` resident, so its readback is already in guest scanout
     // order; the pooled and GVA targets stay RGBA. Carried instead of assumed —
@@ -256,6 +267,19 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                     // readback. `read_resident_chain` fail-logs a lost resident.
                     note_mapper_ref_texture_store_route("gva_store_sync");
                     draw_rgba = read_resident_chain(req, &identity);
+                    gva_native = req
+                        .colors
+                        .first()
+                        .and_then(|c0| pixel_format::store_texel_order(c0.format))
+                        .filter(|layout| !layout.is_four_byte_color())
+                        .and_then(|layout| {
+                            let rb = crate::backend::vulkan::engine::read_target_native(&identity)
+                                .ok()?;
+                            (rb.texel.native_layout() == Some(layout)).then_some(rb.pixels)
+                        });
+                    if gva_native.is_some() {
+                        crate::runtime::drain::note_store_route("gva_store_sync_native");
+                    }
                     crate::observe::line(format!(
                         "linux_m2v_draw ok resident_gva_store pipe={} {}x{} gva={:#x} rgba={}",
                         req.pipeline_ref,
@@ -588,7 +612,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                 // above. `None` only when that walk could not name the span,
                 // which is the pre-existing behaviour for a target this device
                 // cannot resolve at all.
-                let gva_ok = write_gva_rgba8_within(
+                let gva_ok = crate::runtime::draw::write_gva_frame_within(
                     state,
                     host,
                     req.task_id,
@@ -597,7 +621,10 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                     c0.height,
                     c0.row_stride,
                     c0.format,
-                    &rgba,
+                    match gva_native.as_deref() {
+                        Some(native) => crate::runtime::draw::FrameRows::Native(native),
+                        None => crate::runtime::draw::FrameRows::Rgba8(&rgba),
+                    },
                     sync_store_pages.as_ref().map(|p| p.membership()),
                 )
                 .is_ok();
@@ -912,7 +939,7 @@ type LoadedLinearSample = (
 ///
 /// A serialized Metal render stream may read `color(0)` through texture slot 0
 /// while several draws remain in one render pass. For GVA targets, records 2+
-/// carry the prior draw in `target_seed_rgba`; reloading guest pages here would
+/// carry the prior draw in `target_seed`; reloading guest pages here would
 /// expose the pre-pass image to the shader even though attachment Load sees the
 /// chained image.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -935,20 +962,75 @@ pub(super) enum AttachmentAliasSample<'a> {
     /// Records 2+ of a resident GVA chain: the prior record's content lives
     /// on the engine-resident target, not in a CPU seed. Bound as a resident
     /// sampled source (the engine snapshots on self-alias).
-    ResidentChain,
+    ///
+    /// `slot` is the attachment the texture names, because the resident is the
+    /// attachment's own: slot 0 is the chain's primary and an MRT secondary is
+    /// its own registry resident ([`secondary_target_identity`]).
+    ResidentChain { slot: u32 },
+}
+
+/// Whether a fragment texture reads one of the pass's own attachments.
+///
+/// The alias is the **object**, not the binding index. A texture bound at any
+/// index that names one of the pass's GVA attachments reads that attachment's
+/// contents as of this draw — which is what Metal defines for a pass sampling
+/// its own attachment, and what macOS 26's RenderBox does: its icon passes
+/// accumulate coverage in an MRT secondary and read it, and read the primary
+/// they are compositing into, at texture indices that are not the attachment
+/// slots. Matched by index, every such read fell through to the guest pages,
+/// which hold nothing until the pass stores, and every app icon rendered
+/// empty. An index match is still preferred, so the one case the index used to
+/// decide — a ref attached twice — keeps its answer.
+///
+/// The object is not the whole answer: the attachment is one **subresource**.
+/// A mip chain renders level N of a texture while sampling level N−1 of the
+/// same texture — macOS 26 builds its 32 and 16 pixel icon levels that way —
+/// and treating that read as the level being rendered handed the shader its own
+/// clear colour, so every small icon came out empty. `sampled_gva` is the guest
+/// address of the level the bind samples (level 0 of a plain texture); the
+/// attachment is aliased only when it is that level. `None` — the level could
+/// not be resolved — keeps the object match.
+/// The guest address of the level a plain bind of `texture_ref` samples: its
+/// level 0. `None` for a ref that is not a texture with a decodable level 0.
+fn sampled_base_level_gva<M: HostMemory + HostOps>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    texture_ref: u32,
+) -> Option<u64> {
+    use crate::runtime::decode::resource::{
+        OBJECT_TYPE_TEXTURE, OBJECT_TYPE_TEXTURE_GENERATE_MIPMAPS,
+    };
+    let (_entry, desc) = objects::resolve_descriptor(
+        state,
+        host,
+        task_id,
+        texture_ref,
+        &[OBJECT_TYPE_TEXTURE, OBJECT_TYPE_TEXTURE_GENERATE_MIPMAPS],
+    )
+    .ok()?;
+    let tex = decode_texture_descriptor(&desc).ok()?;
+    tex.level_gva(0, state.page_shift).map(|(gva, _)| gva)
 }
 
 pub(super) fn fragment_attachment_alias_sample<'a>(
     req: &'a DrawEncodeRequest,
     texture_index: u32,
     texture_ref: u32,
+    sampled_gva: Option<u64>,
 ) -> Option<(u32, u32, AttachmentAliasSample<'a>)> {
-    let color = req.colors.iter().find(|color| {
-        color.slot == texture_index
-            && color.texture_ref == texture_ref
+    let names_it = |color: &&ColorRtRequest| {
+        color.texture_ref == texture_ref
             && color.mapping_id == 0
             && color.target_gva != 0
-    })?;
+            && sampled_gva.is_none_or(|gva| gva == color.target_gva)
+    };
+    let color = req
+        .colors
+        .iter()
+        .filter(names_it)
+        .find(|color| color.slot == texture_index)
+        .or_else(|| req.colors.iter().find(names_it))?;
     let need = (color.width as usize)
         .checked_mul(color.height as usize)?
         .checked_mul(RGBA8_BPP as usize)?;
@@ -960,8 +1042,9 @@ pub(super) fn fragment_attachment_alias_sample<'a>(
         )),
         MTL_LOAD_ACTION_LOAD => {
             if let Some(seed) = color
-                .target_seed_rgba
-                .as_deref()
+                .target_seed
+                .as_ref()
+                .and_then(crate::runtime::draw::LoadSeed::as_rgba8)
                 .filter(|seed| seed.len() == need)
             {
                 return Some((
@@ -974,7 +1057,7 @@ pub(super) fn fragment_attachment_alias_sample<'a>(
                 return Some((
                     color.width,
                     color.height,
-                    AttachmentAliasSample::ResidentChain,
+                    AttachmentAliasSample::ResidentChain { slot: color.slot },
                 ));
             }
             None
@@ -1820,10 +1903,29 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
         native_uploads_asking_host(),
         crate::runtime::render_writeback::SettleSite::LinearTextureSampled,
     )?;
-    let (_entry, desc) = sampled_texture_descriptor(state, host, task_id, texture_ref)?;
-    let tex = decode_texture_descriptor(&desc).ok()?;
-    let (w, h) = tex.extent()?;
-    let planes = tex.levels.first()?.planes();
+    // The geometry is the texels' own, so for a texture view it is the **base's**
+    // at the view's level — the texels `load_sampled_rgba_static` just loaded.
+    // A view's descriptor is not a texture descriptor, and decoding it as one
+    // refused every view reaching this rung: macOS 26 draws each SF Symbol glyph
+    // through an `A8Unorm` view of an `R8Unorm` mask, and every Settings icon
+    // lost its glyph (`view_base_or_swizzle` beside
+    // `draw_sampled_texture_wrong_type object_type=8`).
+    let (w, h, planes) = match texture_view::resolve_texture_view(state, host, task_id, texture_ref)
+    {
+        Some(view) => {
+            let (_entry, desc) =
+                sampled_texture_descriptor(state, host, task_id, view.base_texture_ref)?;
+            let tex = decode_texture_descriptor(&desc).ok()?;
+            let (_gva, layout) = tex.level_gva(view.level, state.page_shift)?;
+            (layout.width, layout.height, layout.planes())
+        }
+        None => {
+            let (_entry, desc) = sampled_texture_descriptor(state, host, task_id, texture_ref)?;
+            let tex = decode_texture_descriptor(&desc).ok()?;
+            let (w, h) = tex.extent()?;
+            (w, h, tex.levels.first()?.planes())
+        }
+    };
     let need = (w as usize)
         .saturating_mul(h as usize)
         .saturating_mul(planes as usize)
@@ -1957,7 +2059,22 @@ pub(super) enum RefTextureViewDecline {
     /// The mapping's page table is not resident for scanout.
     Unresolved,
     /// The view's MTLPixelFormat has no known bytes-per-pixel.
-    FormatBpp,
+    ///
+    /// Carries what the guest's own surface descriptor says, because that is
+    /// what identifies the format: `bytes_per_row / width` is its width in
+    /// bytes, and an unknown ordinal plus its declared stride is the whole of
+    /// what a reader needs to add it to `bytes_per_pixel`. Without them the
+    /// line named a number and nothing else — `fmt=0xf1` on a QuickTime
+    /// playback, which refused the compositing draw and played the film black.
+    FormatBpp {
+        format: u16,
+        surface_bytes_per_row: u32,
+        surface_w: u32,
+        surface_h: u32,
+        /// The surface's own `CVPixelFormatType`, which is a FourCC and names
+        /// the video format outright where the Metal ordinal only indexes it.
+        surface_format: u32,
+    },
     /// The mapping id has no live entry.
     NoMapping,
     /// No sample window could be derived from the device descriptor for this
@@ -2004,7 +2121,7 @@ impl crate::observe::Decline for RefTextureViewDecline {
         match self {
             Self::UnsupportedDepth { .. } => "ref_texture_view_unsupported_depth",
             Self::Unresolved => "ref_texture_view_unresolved",
-            Self::FormatBpp => "ref_texture_view_format_bpp",
+            Self::FormatBpp { .. } => "ref_texture_view_format_bpp",
             Self::NoMapping => "ref_texture_view_no_mapping",
             Self::SampleWindow { .. } => "ref_texture_view_sample_window",
             Self::Span { .. } => "ref_texture_view_span",
@@ -2074,7 +2191,28 @@ impl crate::observe::Decline for RefTextureViewDecline {
             Self::Convert { row, bpp } => {
                 vec![("row", row.to_string()), ("bpp", bpp.to_string())]
             }
-            Self::Unresolved | Self::FormatBpp | Self::NoMapping | Self::RgbaStride => Vec::new(),
+            Self::Unresolved | Self::NoMapping | Self::RgbaStride => Vec::new(),
+            Self::FormatBpp {
+                format,
+                surface_bytes_per_row,
+                surface_w,
+                surface_h,
+                surface_format,
+            } => vec![
+                ("format", format!("{format:#x}")),
+                ("surface_bpr", surface_bytes_per_row.to_string()),
+                ("surface_w", surface_w.to_string()),
+                ("surface_h", surface_h.to_string()),
+                ("surface_fmt", format!("{surface_format:#x}")),
+                ("surface_fourcc", {
+                    let b = surface_format.to_be_bytes();
+                    if b.iter().all(|c| (0x20..0x7f).contains(c)) {
+                        String::from_utf8_lossy(&b).into_owned()
+                    } else {
+                        String::from("-")
+                    }
+                }),
+            ],
         }
     }
 }
@@ -2486,7 +2624,20 @@ pub(super) fn load_ref_texture_view_rgba<M: HostMemory + HostOps>(
         return fail(RefTextureViewDecline::Unresolved);
     }
     let Some(bpp) = pixel_format::bytes_per_pixel(view.pixel_format) else {
-        return fail(RefTextureViewDecline::FormatBpp);
+        // Read the guest's own descriptor for the decline rather than for the
+        // work: an unknown ordinal is only actionable beside the stride the
+        // surface declares for it.
+        let desc = state
+            .mappings
+            .get(&mapping_id)
+            .and_then(|m| crate::protocol::iosurface_pages::decode_device_surface(&m.device_desc));
+        return fail(RefTextureViewDecline::FormatBpp {
+            format: view.pixel_format,
+            surface_bytes_per_row: desc.as_ref().map(|d| d.bytes_per_row).unwrap_or(0),
+            surface_w: desc.as_ref().map(|d| d.width).unwrap_or(0),
+            surface_h: desc.as_ref().map(|d| d.height).unwrap_or(0),
+            surface_format: desc.as_ref().map(|d| d.pixel_format).unwrap_or(0),
+        });
     };
     let (base_off, surface_bpr, span_end, pages_n, base_w, base_h, base_fmt, map_gen) = {
         let Some(m) = state.mappings.get(&mapping_id) else {
@@ -2688,17 +2839,38 @@ pub(super) fn load_ref_texture_view_rgba<M: HostMemory + HostOps>(
             view.width,
             view.height,
         );
-        let Some(row_rail) = pixel_format::RowToRgba8::for_format(view.pixel_format) else {
-            return fail(RefTextureViewDecline::Convert { row: 0, bpp });
+        // A subsampled format converts a pair at a time and belongs to neither
+        // CPU rail; see `pixel_format::is_packed_422`. Taken before the row
+        // rail because `RowToRgba8::for_format` answers `None` for it, which
+        // this arm would otherwise report as a refusal — the black picture a
+        // QuickTime playback drew.
+        let packed_422 = pixel_format::is_packed_422(view.pixel_format);
+        let row_rail = if packed_422 {
+            None
+        } else {
+            match pixel_format::RowToRgba8::for_format(view.pixel_format) {
+                Some(rail) => Some(rail),
+                None => return fail(RefTextureViewDecline::Convert { row: 0, bpp }),
+            }
         };
         for y in 0..view.height as usize {
             let src_off = y.saturating_mul(tight as usize);
             let dst_off = y.saturating_mul(rgba_stride as usize);
-            if !row_rail.convert(
-                &native[src_off..src_off + tight as usize],
-                view.width,
-                &mut rgba[dst_off..dst_off + rgba_stride as usize],
-            ) {
+            let src = &native[src_off..src_off + tight as usize];
+            let dst = &mut rgba[dst_off..dst_off + rgba_stride as usize];
+            let converted = match row_rail {
+                Some(rail) => rail.convert(src, view.width, dst),
+                // A subsampled format converts a pair at a time and belongs to
+                // neither CPU rail; see `pixel_format::is_packed_422`. Without
+                // this arm `RowToRgba8::for_format` answered `None` for it and
+                // the refusal above was the whole of what a QuickTime playback
+                // got — the view failed, the fragment texture did not resolve,
+                // and the compositing draw was refused whole.
+                None => {
+                    pixel_format::packed_422_expand_row(view.pixel_format, src, view.width, dst)
+                }
+            };
+            if !converted {
                 return fail(RefTextureViewDecline::Convert { row: y, bpp });
             }
         }
@@ -4307,7 +4479,7 @@ mod gva_resident_ownership_tests {
 /// engine still holds what the render Store published into these pages?
 ///
 /// Answering `true` **obliges the encode side** to chain or to re-seed:
-/// `colors[0].target_seed_rgba` goes out `None` while the attachment still says
+/// `colors[0].target_seed` goes out `None` while the attachment still says
 /// LOAD, so a pass that does neither loads an undefined attachment.
 /// `try_metal2vulkan_draw` owns that obligation.
 ///
@@ -5189,6 +5361,12 @@ fn native_uploads_asking_host() -> NativeUploads {
         // filter by mandate. So this one is genuinely a per-host answer and the
         // conjunction above would hide it.
         float32: engine::supports_sampled_layout_linear_filter(TexelLayout::Rgba32Float),
+        // The conjunction, like `float16` and for the same reason: the two
+        // orders are one word with the channels exchanged. Vulkan mandates the
+        // filter for `A2B10G10R10_UNORM_PACK32` and not for its sibling, so the
+        // answer is measured rather than assumed.
+        ten_bit: engine::supports_sampled_layout_linear_filter(TexelLayout::Rgb10a2Unorm)
+            && engine::supports_sampled_layout_linear_filter(TexelLayout::Bgr10a2Unorm),
         ..NativeUploads::BGRA8
     }
 }
@@ -6559,6 +6737,63 @@ fn note_mapper_ref_texture_store_route(route: &'static str) {
     clippy::too_many_arguments,
     reason = "every argument is a distinct wire-derived input to the attachment set"
 )]
+/// The resident identity of an MRT secondary colour attachment.
+///
+/// One function because two producers must name the same registry slot: the
+/// attachment [`build_secondary_targets`] builds, and the sampled bind of that
+/// same attachment when a later draw of the pass reads it back
+/// ([`AttachmentAliasSample::ResidentChain`]). Spelled twice, a difference in
+/// the generation or the format would bind an image nothing rendered into.
+///
+/// `None` for an attachment with neither a GVA nor a mapping to name it.
+pub(super) fn secondary_target_identity<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    c: &ColorRtRequest,
+    format: ash::vk::Format,
+) -> Option<crate::backend::vulkan::engine::TargetIdentity> {
+    use crate::backend::vulkan::engine::TargetIdentity;
+    if c.target_gva != 0 {
+        Some(TargetIdentity::Gva {
+            gva: c.target_gva,
+            width: c.width,
+            height: c.height,
+            generation: if c.texture_ref != 0 {
+                crate::runtime::writeback_debt::gva_resource_generation(
+                    state,
+                    host,
+                    crate::runtime::writeback_debt::GvaResourceKey {
+                        task_id,
+                        texture_ref: c.texture_ref,
+                    },
+                    c.target_gva,
+                    u64::from(c.row_stride).saturating_mul(u64::from(c.height)),
+                )
+            } else {
+                gva_span_alloc_generation(
+                    state,
+                    host,
+                    task_id,
+                    c.target_gva,
+                    c.row_stride,
+                    c.height,
+                )
+            },
+            format,
+        })
+    } else if c.mapping_id != 0 {
+        Some(crate::backend::vulkan::present_identity::surface_identity(
+            state,
+            c.mapping_id,
+            c.width,
+            c.height,
+        ))
+    } else {
+        None
+    }
+}
+
 pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -6572,7 +6807,7 @@ pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
     Vec<crate::backend::vulkan::engine::SecondaryColorTarget>,
     crate::runtime::census::present_proxy::SecondaryMrtRefusal,
 > {
-    use crate::backend::vulkan::engine::{SecondaryColorTarget, TargetIdentity};
+    use crate::backend::vulkan::engine::SecondaryColorTarget;
     use crate::runtime::census::present_proxy::SecondaryMrtRefusal;
     if colors.len() <= 1 {
         return Ok(Vec::new());
@@ -6639,49 +6874,7 @@ pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
         // Without one this attachment is keyed on `(gva, width, height)` alone
         // and two guest allocations reusing that address at that geometry share
         // one GPU image — the wrong-content class `74748d2` closed for color0.
-        let identity = if c.target_gva != 0 {
-            TargetIdentity::Gva {
-                gva: c.target_gva,
-                width: c.width,
-                height: c.height,
-                generation: if c.texture_ref != 0 {
-                    crate::runtime::writeback_debt::gva_resource_generation(
-                        state,
-                        host,
-                        crate::runtime::writeback_debt::GvaResourceKey {
-                            task_id,
-                            texture_ref: c.texture_ref,
-                        },
-                        c.target_gva,
-                        u64::from(c.row_stride).saturating_mul(u64::from(c.height)),
-                    )
-                } else {
-                    gva_span_alloc_generation(
-                        state,
-                        host,
-                        task_id,
-                        c.target_gva,
-                        c.row_stride,
-                        c.height,
-                    )
-                },
-                // The format this attachment's image is actually created with,
-                // not a re-derivation of it. `registry_ensure_attachment` takes
-                // `format` — resolved just above by `color_attachment` — so
-                // answering the key from anything else lets the identity claim
-                // one format while the image holds another. It did: a
-                // `R16G16_SFLOAT` secondary is admitted by `color_attachment`
-                // and got an identity saying eight-bit RGBA.
-                format,
-            }
-        } else if c.mapping_id != 0 {
-            crate::backend::vulkan::present_identity::surface_identity(
-                state,
-                c.mapping_id,
-                c.width,
-                c.height,
-            )
-        } else {
+        let Some(identity) = secondary_target_identity(state, host, task_id, c, format) else {
             crate::runtime::census::present_proxy::note_secondary_mrt_drop(
                 crate::runtime::census::present_proxy::MrtDrop::NoIdentity,
                 c.width,
@@ -6692,11 +6885,6 @@ pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
                 reason: crate::runtime::census::present_proxy::MrtDrop::NoIdentity,
             });
         };
-        // A secondary aliasing the primary target is a degenerate feedback loop
-        // the engine rejects, and a pass that reads and writes one image through
-        // two attachments has no correct rendering — so the draw is refused
-        // rather than run with the alias quietly removed.
-        //
         // `aliases` and not `==`: the destination is the conflict, not the
         // registry slot. Two attachments over one guest span at two formats are
         // two images, so `==` says no and the span is still written twice.
@@ -6840,7 +7028,7 @@ pub(super) fn prepare_vertex_step_function(
 /// LOAD off the engine resident, or put the CPU seed back.
 ///
 /// `mrt_draw_request` skipped the seed because the engine still held what the
-/// render Store published into these guest pages, so `colors[0].target_seed_rgba`
+/// render Store published into these guest pages, so `colors[0].target_seed`
 /// arrives `None` while the attachment still says `MTL_LOAD_ACTION_LOAD`. **That
 /// makes producing content here an obligation, not an optimisation**: an encode
 /// that neither chains nor re-seeds hands the pass an undefined attachment, and
@@ -6903,6 +7091,7 @@ pub(super) fn honour_gva_load_elision<M: HostMemory + HostOps>(
                 gva,
                 cw,
                 ch,
+                crate::runtime::draw::seed_native_uploads(c0.format),
             );
             if seed.is_none() {
                 crate::observe::fail(format!(
@@ -6913,7 +7102,7 @@ pub(super) fn honour_gva_load_elision<M: HostMemory + HostOps>(
                 ));
             }
             if let Some(c0) = req.colors.first_mut() {
-                c0.target_seed_rgba = seed;
+                c0.target_seed = seed;
             }
             None
         }
@@ -7399,9 +7588,29 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // storage), so a vertex check would false-fire. Standard directly-bound
         // kinds only; ColorInput / ThreadgroupBuffer reach the shader by other
         // paths, while storage textures were declined before bind preparation.
-        // Verified non-flooding: 0 fires across a full x86 boot (desktop convergence
-        // + Safari + CSS gradients + a 23-binding compositor shader), so any fire is
-        // a genuine bind gap, not expected control flow.
+        // Not non-flooding, and the population is not what that reading assumed.
+        // The original measurement — 0 fires across a full x86 macOS 13 boot
+        // (desktop convergence + Safari + CSS gradients + a 23-binding compositor
+        // shader) — supported "any fire is a genuine bind gap". A driven macOS 26
+        // boot fires 12 436 times, and the shape says what they are: 6 318 of them
+        // report exactly one gap, always the lowest texture index the guest did not
+        // bind (`tex1` behind `provided_tex={0}` and `{0, 4}`, `tex0` behind `{3}`).
+        //
+        // These are real `ResourceKind::Texture` bindings — the synthesized kinds
+        // leave this scan by the `_ => continue` arm below — that the shader
+        // statically references and the guest deliberately leaves unbound. So a
+        // fire is *not* by itself a bind gap on this guest.
+        //
+        // Whether a draw reaches the instruction that reads the slot was the open
+        // half of that, and the modules answer it: in the four pipelines that fire
+        // most (`p31` 194 times, `p33`, `p35`, `p39`), every use of the unbound
+        // binding sits inside an `OpBranchConditional` whose condition is computed
+        // from the shader's own inputs — data-dependent, not a function constant,
+        // so it cannot be ruled out statically. It does not have to be: the
+        // substitute pushed after the texture loop is
+        // `solid_rgba8(1, 1, &[0.0; 4])`, so a branch that *is* taken samples
+        // zeros. The reliance stays on the fail channel because the device
+        // invented the texture, not because the picture is wrong.
         // The guard below reports; its value is the population the repair after
         // the texture loop acts on. Empty on every draw that binds what it
         // samples, which is the hot path.
@@ -7550,6 +7759,17 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         let mut images: Vec<crate::backend::vulkan::engine::SampledImageResource> = Vec::new();
         let mut samplers: Vec<crate::backend::vulkan::engine::SamplerResource> = Vec::new();
         let mut sampler_binds: std::collections::BTreeSet<u32> = Default::default();
+        // Bindings only the device may fill: a translator placeholder can share
+        // a guest sampler index the shader never declared, and a guest sampler
+        // there would describe nothing this shader reads. Same rule as the
+        // compute rail's `guest_bindable`.
+        let device_only_samplers: std::collections::BTreeSet<u32> = v_variant
+            .samplers
+            .iter()
+            .chain(f_variant.samplers.iter())
+            .filter(|reflected| !reflected.guest_bindable())
+            .map(|reflected| reflected.binding)
+            .collect();
         // Where each provisioned sampler's state came from, keyed by binding, for
         // the hang trail. A `SamplerResource` cannot be asked this after the
         // fact: a translated guest sampler that happens to be `Linear`/`Linear`
@@ -7645,8 +7865,16 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     let alias_span = crate::runtime::sampled_phase::Span::open(
                         crate::runtime::sampled_phase::Part::ResolveAlias,
                     );
+                    // The sampled level's address, asked only when an attachment
+                    // names this object — the one case the alias rule reads it.
+                    let sampled_gva = (frag_stage
+                        && req.colors.iter().any(|c| c.texture_ref == texture_ref))
+                    .then(|| sampled_base_level_gva(state, host, req.task_id, texture_ref))
+                    .flatten();
                     let attachment_alias = frag_stage
-                        .then(|| fragment_attachment_alias_sample(req, index, texture_ref))
+                        .then(|| {
+                            fragment_attachment_alias_sample(req, index, texture_ref, sampled_gva)
+                        })
                         .flatten();
                     if let Some((aw, ah, alias)) = attachment_alias {
                         match alias {
@@ -7670,8 +7898,32 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                                     crate::backend::vulkan::engine::SampledByteOrigin::AttachmentAlias,
                                 ),
                             ),
-                            AttachmentAliasSample::ResidentChain => {
-                                let identity = render_chain_identity(state, req).ok_or({
+                            AttachmentAliasSample::ResidentChain { slot } => {
+                                let color = req.colors.iter().find(|color| {
+                                    color.slot == slot && color.texture_ref == texture_ref
+                                });
+                                let attachment_format = color.and_then(|color| {
+                                    translate::pixel::color_attachment(color.format)
+                                        .ok()
+                                        .map(|resolved| resolved.0.vk)
+                                });
+                                // The primary is the chain's own identity; a
+                                // secondary is its own resident, named exactly as
+                                // `build_secondary_targets` names the attachment.
+                                let identity = if slot == 0 {
+                                    render_chain_identity(state, req)
+                                } else {
+                                    color.zip(attachment_format).and_then(|(color, format)| {
+                                        secondary_target_identity(
+                                            state,
+                                            host,
+                                            req.task_id,
+                                            color,
+                                            format,
+                                        )
+                                    })
+                                }
+                                .ok_or({
                                     DrawError::DrawPreparation(
                                         DrawPreparationDecline::AttachmentAliasIdentityMissing {
                                             index,
@@ -7684,17 +7936,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                                     identity.height(),
                                     SampledSourceRequest::Target(
                                         identity.clone(),
-                                        req.colors
-                                            .iter()
-                                            .find(|color| {
-                                                color.slot == index
-                                                    && color.texture_ref == texture_ref
-                                            })
-                                            .and_then(|color| {
-                                                translate::pixel::color_attachment(color.format)
-                                                    .ok()
-                                                    .map(|resolved| resolved.0.vk)
-                                            })
+                                        attachment_format
                                             .unwrap_or_else(|| identity.resident_format()),
                                     ),
                                 )
@@ -8145,6 +8387,9 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     0
                 };
                 let smp_bind = SAMPLER_BINDING_BASE + index + base_off;
+                if device_only_samplers.contains(&smp_bind) {
+                    return Ok(());
+                }
                 if sampler_binds.insert(smp_bind) {
                     let mut sampler = if sampler_ref != 0 {
                         sampler_origin.insert(smp_bind, b'g');
@@ -8225,11 +8470,22 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 for reflected in variant.samplers.iter() {
                     if sampler_binds.insert(reflected.binding) {
                         let binding = reflected.binding;
-                        if let Some(state) = reflected.static_state {
+                        if let crate::runtime::spirv_bind::ReflectedSamplerSource::Static(state) =
+                            reflected.source
+                        {
                             sampler_origin.insert(binding, b'c');
                             samplers.push(
                                 reflected_static_sampler_resource(stage, binding, state)
                                     .map_err(DrawError::DrawPreparation)?,
+                            );
+                        } else if reflected.source
+                            == crate::runtime::spirv_bind::ReflectedSamplerSource::SynthesizedRead
+                        {
+                            sampler_origin.insert(binding, b'r');
+                            samplers.push(
+                                crate::backend::vulkan::engine::SamplerResource::read_placeholder(
+                                    binding,
+                                ),
                             );
                         } else {
                             sampler_origin.insert(binding, b'd');
@@ -8502,12 +8758,21 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     // that layer being dropped, and everything outside the
                     // geometry this pass draws goes blank.
                     let mut seed_door = "none";
-                    if let Some(seed) = c0.target_seed_rgba.as_ref() {
+                    if let Some(seed) = c0.target_seed.as_ref() {
                         seed_door = "color_seed";
-                        if seed.len() == (w as usize) * (h as usize) * 4 {
+                        let texels = (w as usize) * (h as usize);
+                        let expected = texels * (seed.layout.bytes_per_texel() as usize);
+                        if seed.bytes.len() == expected {
                             // seed_color_load selected this by RT provenance.
                             // Black/transparent bytes are valid attachment data.
-                            target_rgba8 = Some(std::sync::Arc::new(seed.clone()));
+                            target_rgba8 = Some(std::sync::Arc::new(seed.bytes.clone()));
+                            // A seed in the attachment's own texel stages
+                            // verbatim; one in eight-bit colour is expanded by
+                            // the engine, which is the arm that clamps.
+                            if seed.layout != crate::protocol::pixel_format::TexelLayout::Rgba8 {
+                                seed_order =
+                                    crate::backend::vulkan::engine::SeedOrder::Native(seed.layout);
+                            }
                         }
                     } else if c0.mapping_id != 0 {
                         seed_door = "mapping";
@@ -8991,7 +9256,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     // attachment starts at a colour nothing asked for.
                     reims_vgpu_protocol::pass_action::LoadAction::from_declared(color.load_action)
                         .preserves_prior_contents()
-                        && color.target_seed_rgba.is_none()
+                        && color.target_seed.is_none()
                 });
         }
         // Mapper-ref-texture Load used to have a GPU rail here — ~170 lines of front-frame
@@ -10065,7 +10330,7 @@ fn mapper_ref_texture_guest_target_backing<H: HostMemory + HostOps>(
 pub(super) fn mapper_ref_texture_load_is_a_seed_candidate(c0: &ColorRtRequest) -> bool {
     reims_vgpu_protocol::pass_action::LoadAction::from_declared(c0.load_action)
         .preserves_prior_contents()
-        && c0.target_seed_rgba.is_none()
+        && c0.target_seed.is_none()
 }
 
 /// The `(resident, mapping epoch)` pair a record's mapper-ref-texture LOAD has to compare to
@@ -10673,10 +10938,35 @@ pub(crate) fn read_resident_chain(
             let texel = rb.texel;
             let landed = rb.into_rgba8();
             if landed.is_none() {
-                crate::observe::fail(format!(
+                // Not a loss when the destination has a native rail. The eager
+                // Store arm reads the same resident again through
+                // `read_target_native` whenever `store_texel_order` names a
+                // layout RGBA8 cannot hold, and lands *that* frame in the
+                // guest's pages — `gva_store_sync_native`, which a driven boot
+                // counted three of against exactly these three refusals. What
+                // fails here is the eight-bit copy the host caches take, and an
+                // integer texel has no eight-bit form for them to hold; see
+                // `TexelLayout::has_cpu_loader_arm`, which answers `false` for
+                // `Rg16Uint` on the same grounds.
+                //
+                // So the two are told apart rather than both called a lost
+                // resident: a destination with no native rail behind it is the
+                // one that really loses its pixels here.
+                let native_rail = req
+                    .colors
+                    .first()
+                    .and_then(|c0| pixel_format::store_texel_order(c0.format))
+                    .is_some_and(|layout| !layout.is_four_byte_color());
+                let line = format!(
                     "chain_resident_land_fail reason=readback_texel_not_rgba8 \
-                     target={identity:?} texel={texel:?}"
-                ));
+                     target={identity:?} texel={texel:?} native_rail={}",
+                    u8::from(native_rail)
+                );
+                if native_rail {
+                    crate::observe::line(line);
+                } else {
+                    crate::observe::fail(line);
+                }
             }
             landed
         }
@@ -11890,7 +12180,7 @@ mod vulkan_split_tests {
         };
         assert!(mapper_ref_texture_load_is_a_seed_candidate(&c0));
 
-        c0.target_seed_rgba = Some(vec![0u8; 4]);
+        c0.target_seed = Some(crate::runtime::draw::LoadSeed::rgba8(vec![0u8; 4]));
         assert!(!mapper_ref_texture_load_is_a_seed_candidate(&c0));
     }
 
@@ -13763,7 +14053,7 @@ pub(crate) fn load_render_mtlb_pair<M: HostMemory + HostOps>(
     host: &M,
     task_id: u32,
     pipeline_ref: u32,
-) -> Result<(Vec<u8>, Vec<u8>), DrawPreparationDecline> {
+) -> Result<(Vec<u8>, Option<Vec<u8>>), DrawPreparationDecline> {
     let pd = load_render_pipeline(state, host, task_id, pipeline_ref).ok_or(
         DrawPreparationDecline::PipelineMissing {
             task_id,
@@ -13776,17 +14066,26 @@ pub(crate) fn load_render_mtlb_pair<M: HostMemory + HostOps>(
             function_ref: pd.vertex_func_ref,
         },
     )?;
-    let f_mtlb = load_mtlb(
-        state,
-        host,
-        task_id,
-        pd.fragment_func_ref,
-        AirLoadRail::Draw,
-    )
-    .ok_or(DrawPreparationDecline::FragmentMtlbMissing {
-        task_id,
-        function_ref: pd.fragment_func_ref,
-    })?;
+    // No fragment function is a depth/stencil-only pipeline, not a missing
+    // input: the resolver stands in an empty module for it, so there is no
+    // fragment container to load or translate.
+    let f_mtlb = if pd.fragment_func_ref == 0 {
+        None
+    } else {
+        Some(
+            load_mtlb(
+                state,
+                host,
+                task_id,
+                pd.fragment_func_ref,
+                AirLoadRail::Draw,
+            )
+            .ok_or(DrawPreparationDecline::FragmentMtlbMissing {
+                task_id,
+                function_ref: pd.fragment_func_ref,
+            })?,
+        )
+    };
     Ok((v_mtlb, f_mtlb))
 }
 

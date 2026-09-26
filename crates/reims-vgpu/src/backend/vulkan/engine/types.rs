@@ -1223,6 +1223,19 @@ pub struct SamplerResource {
 }
 
 impl SamplerResource {
+    /// The sampler metal2vulkan's `SynthesizedReadSampler` placeholder must be
+    /// bound with: nearest filtering and clamp-to-edge, per the translator's
+    /// own statement of what its harness binds there. Nearest is also the only
+    /// filter Vulkan permits when the same placeholder pairs with an integer
+    /// sampled image, which the translator does for LOD queries.
+    pub fn read_placeholder(binding: u32) -> Self {
+        Self {
+            min_filter: sampler::MTL_SAMPLER_MIN_MAG_FILTER_NEAREST,
+            mag_filter: sampler::MTL_SAMPLER_MIN_MAG_FILTER_NEAREST,
+            ..Self::normalized_default(binding)
+        }
+    }
+
     pub fn normalized_default(binding: u32) -> Self {
         Self {
             binding,
@@ -2190,6 +2203,15 @@ pub enum SeedOrder {
     Rgba8,
     /// Guest scanout order — B, G, R, A in memory.
     Bgra8,
+    /// The attachment's own texel, already in its physical layout.
+    ///
+    /// The eight-bit orders above are a *statement about colour*, and a
+    /// half-float attachment has none: `f16_to_unorm8_lut` clamps it to
+    /// `[0, 1]` at 256 levels, which for a coverage or HDR layer is the frame
+    /// and not a rounding of it. A seed that arrives this way was read from the
+    /// guest's pages in the attachment's layout and stages verbatim, so nothing
+    /// narrows and nothing is expanded back.
+    Native(crate::protocol::pixel_format::TexelLayout),
 }
 
 /// Where a sampled image's content comes from.

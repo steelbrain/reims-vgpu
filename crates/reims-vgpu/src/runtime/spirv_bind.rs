@@ -2192,17 +2192,23 @@ pub fn reflected_storage_image_format(
         TextureFormat::R8 => ImageFormat::R8Unorm,
         TextureFormat::Rgba8 => ImageFormat::Rgba8Unorm,
         TextureFormat::R16f => ImageFormat::R16Float,
-        TextureFormat::R16ui => ImageFormat::Unsupported(16),
+        TextureFormat::R16ui => ImageFormat::Unsupported(38),
         TextureFormat::Rg16f => ImageFormat::Rg16Float,
         // SPIR-V `Rg32f`. The device has no two-channel 32-bit float storage
         // surface — neither `StorageImageSelector` nor `TexelLayout` names one
         // — so the honest answer is the format's own SPIR-V ordinal carried as
         // unsupported, which round-trips through `raw`/`from_raw` unchanged.
+        //
+        // Every `Unsupported` below is that same ordinal, as the `spirv` crate's
+        // `ImageFormat` spells it: `Rgba32i` 21, `R32i` 24, `R16ui` 38. The value reaches no module — `specialized_storage_image_-
+        // format` refuses an `Unsupported` before specialization — so it is read
+        // only by the decline it is logged in, which is exactly why it has to
+        // name the right format.
         TextureFormat::Rg32f => ImageFormat::Unsupported(6),
         TextureFormat::R32f => ImageFormat::R32Float,
-        TextureFormat::R32i => ImageFormat::Unsupported(17),
+        TextureFormat::R32i => ImageFormat::Unsupported(24),
         TextureFormat::R32ui => ImageFormat::R32ui,
-        TextureFormat::Rgba32i => ImageFormat::Unsupported(18),
+        TextureFormat::Rgba32i => ImageFormat::Unsupported(21),
         TextureFormat::Rgba32ui => ImageFormat::Rgba32Uint,
         TextureFormat::Rgba32f => ImageFormat::Rgba32Float,
         TextureFormat::Rgba16f => ImageFormat::Rgba16Float,
@@ -2341,7 +2347,7 @@ pub fn reflected_sampler_binding(
 ) -> Option<u32> {
     if !matches!(
         resource.kind,
-        ResourceKind::Sampler | ResourceKind::StaticSampler
+        ResourceKind::Sampler | ResourceKind::StaticSampler | ResourceKind::SynthesizedReadSampler
     ) {
         return None;
     }
@@ -2354,13 +2360,43 @@ pub fn reflected_sampler_binding(
     })
 }
 
-/// One sampler in the executable descriptor interface. `static_state` is the
-/// exact AIR constexpr state; `None` means the guest supplies a sampler object
-/// or the runtime provisions the neutral default when that slot is unbound.
+/// Who supplies the sampler at a reflected binding.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ReflectedSamplerSource {
+    /// A `[[sampler(n)]]` the guest binds; the runtime provisions the neutral
+    /// default when the slot is unbound.
+    Guest,
+    /// An AIR constexpr sampler: its exact state is the shader's.
+    Static(metal2vulkan::reflect::StaticSamplerState),
+    /// The translator's placeholder for `air.get_read_sampler()`, which AIR
+    /// threads into sampler-less `texture.read(coord)` and which the translator
+    /// also substitutes where AIR selects between constexpr sampler states. No
+    /// Metal argument backs it, so the guest never binds it, and the translator
+    /// states its state: nearest and clamp-to-edge (see
+    /// [`crate::backend::vulkan::engine::SamplerResource::read_placeholder`]).
+    ///
+    /// It used to be dropped from this interface, so nothing was bound there:
+    /// every CoreImage kernel that reads through it — macOS 26's
+    /// `ci_asgDownH_affine_nearest` family, which the window server's blur runs
+    /// on — was refused as `vk_compute_exec_used_binding_absent_from_layout`.
+    SynthesizedRead,
+}
+
+/// One sampler in the executable descriptor interface.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ReflectedSamplerDescriptor {
     pub binding: u32,
-    pub static_state: Option<metal2vulkan::reflect::StaticSamplerState>,
+    pub source: ReflectedSamplerSource,
+}
+
+impl ReflectedSamplerDescriptor {
+    /// Whether a sampler object the guest bound may fill this binding. Only a
+    /// `[[sampler(n)]]` is the guest's: a placeholder can share a guest index the
+    /// shader never declared, and the guest's sampler there describes nothing
+    /// this shader reads.
+    pub const fn guest_bindable(&self) -> bool {
+        matches!(self.source, ReflectedSamplerSource::Guest)
+    }
 }
 
 /// Every sampler descriptor declared by a reflected shader, transformed into
@@ -2377,9 +2413,15 @@ pub fn reflected_sampler_descriptors(
             reflected_sampler_binding(resource, fragment_relocated).map(|binding| {
                 ReflectedSamplerDescriptor {
                     binding,
-                    static_state: (resource.kind == ResourceKind::StaticSampler)
-                        .then_some(resource.static_sampler)
-                        .flatten(),
+                    source: match (resource.kind, resource.static_sampler) {
+                        (ResourceKind::SynthesizedReadSampler, _) => {
+                            ReflectedSamplerSource::SynthesizedRead
+                        }
+                        (ResourceKind::StaticSampler, Some(state)) => {
+                            ReflectedSamplerSource::Static(state)
+                        }
+                        _ => ReflectedSamplerSource::Guest,
+                    },
                 }
             })
         })
@@ -4469,6 +4511,46 @@ mod more_tests {
         assert_eq!(
             reflected_sampler_binding(&sampler, true),
             Some(SAMPLER_BINDING_BASE + 5 + FRAG_SAMPLED_RESOURCE_BINDING_OFFSET)
+        );
+    }
+
+    /// The translator's `air.get_read_sampler()` placeholder is part of the
+    /// sampler interface, and nobody but the device supplies it.
+    ///
+    /// It used to be filtered out with every kind that is not a Metal sampler, so
+    /// a CoreImage kernel reading through it — reflected here as a `[[sampler(0)]]`
+    /// at 160 and the placeholder at 161 — was dispatched with no descriptor at
+    /// 161 and refused (`vk_compute_exec_used_binding_absent_from_layout`).
+    #[test]
+    fn the_synthesized_read_sampler_is_in_the_interface_and_is_not_the_guests() {
+        let mut reflection = empty_reflection(ShaderStage::Kernel);
+        let mut guest = static_sampler_binding(M2V_SAMPLER_BINDING_BASE);
+        guest.kind = ResourceKind::Sampler;
+        guest.static_sampler = None;
+        let mut placeholder = static_sampler_binding(M2V_SAMPLER_BINDING_BASE + 1);
+        placeholder.kind = ResourceKind::SynthesizedReadSampler;
+        placeholder.static_sampler = None;
+        reflection.bindings.push(guest);
+        reflection.bindings.push(placeholder);
+
+        let samplers = reflected_sampler_descriptors(&reflection, false);
+        assert_eq!(
+            samplers,
+            vec![
+                ReflectedSamplerDescriptor {
+                    binding: SAMPLER_BINDING_BASE,
+                    source: ReflectedSamplerSource::Guest,
+                },
+                ReflectedSamplerDescriptor {
+                    binding: SAMPLER_BINDING_BASE + 1,
+                    source: ReflectedSamplerSource::SynthesizedRead,
+                },
+            ]
+        );
+        assert!(samplers[0].guest_bindable());
+        assert!(
+            !samplers[1].guest_bindable(),
+            "a guest sampler at index 1 is one this shader never declared"
         );
     }
 

@@ -1468,24 +1468,34 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
         ));
     }
     if let Some(target) = &req.target_rgba8 {
-        // The seed is one tightly-packed RGBA8 slice of the target, and the
-        // length is checked rather than taken. `w as usize * h as usize` widens
-        // its operands, which reads as safe and is — but only just: two u32
-        // maxima multiply to a hair under u64::MAX, so the bytes-per-texel is a
-        // third factor that overflows. A refusal rather than a clamp, because
-        // this length is what the next line compares the buffer against and a
+        // The seed is one tightly-packed slice of the target, and the length is
+        // checked rather than taken. `w as usize * h as usize` widens its
+        // operands, which reads as safe and is — but only just: two u32 maxima
+        // multiply to a hair under u64::MAX, so the bytes-per-texel is a third
+        // factor that overflows. A refusal rather than a clamp, because this
+        // length is what the next line compares the buffer against and a
         // wrapped one would let a short buffer match.
+        //
+        // The texel is the seed's own: eight-bit colour for every seed this
+        // device builds by conversion, and the attachment's own layout for one
+        // read from the guest's pages in a format eight bits cannot hold
+        // (`SeedOrder::Native`). Taking RGBA8 for both refused every native
+        // seed by its length.
+        let bytes_per_texel = match req.target_seed_order {
+            SeedOrder::Native(layout) => layout.bytes_per_texel(),
+            SeedOrder::Rgba8 | SeedOrder::Bgra8 => crate::protocol::pixel_format::RGBA8_BPP,
+        };
         let Some(expected) = reims_vgpu_protocol::extent::tight_image_bytes(
             req.width,
             req.height,
-            crate::protocol::pixel_format::RGBA8_BPP as usize,
+            bytes_per_texel as usize,
         ) else {
             return Err(DrawError::DrawValidation(
                 DrawValidationDecline::UnrepresentableImageBytes {
                     width: req.width,
                     height: req.height,
                     layers: 1,
-                    bytes_per_texel: crate::protocol::pixel_format::RGBA8_BPP,
+                    bytes_per_texel,
                 },
             ));
         };
@@ -3532,20 +3542,52 @@ pub(crate) unsafe fn execute_draw_inner(
     // arm is unchanged, which is every attachment this device had until render
     // targets began following the guest's declared format.
     phase.enter(super::draw_phase::Phase::StageSeed);
-    let seed_wide = seed_bytes.and_then(|rgba8| {
-        let layout = crate::backend::vulkan::translate::pixel::texel_layout_of(color0_format)?;
-        // Four-byte *colour*, not four bytes. A seed is eight-bit RGBA, and a
-        // four-byte texel that is not one of the two colour orders — a packed
-        // ten-bit word, an integer pair — cannot be staged as though it were:
-        // the copy converts nothing, so the attachment would be seeded with the
-        // seed's bytes reinterpreted. The wide arm below restates the seed in
-        // the attachment's texel, or refuses by name when it cannot.
-        if layout.is_four_byte_color() {
-            return None;
+    // A seed that already is the attachment's texel: stage it as it stands.
+    // Checked before the widening arm below, because that arm's input is
+    // semantic RGBA8 and this one's is not.
+    let seed_native = match (seed_bytes, req.target_seed_order) {
+        (Some(bytes), SeedOrder::Native(layout)) => {
+            let attachment =
+                crate::backend::vulkan::translate::pixel::texel_layout_of(color0_format);
+            if attachment != Some(layout) {
+                return Err(DrawError::DrawExecution(
+                    DrawExecutionDecline::SeedFormatUnwritable {
+                        format: color0_format,
+                    },
+                ));
+            }
+            Some(bytes)
         }
-        Some((rgba8, layout))
-    });
-    let seed_slot = if let Some((rgba8, layout)) = seed_wide {
+        _ => None,
+    };
+    let seed_wide = seed_bytes
+        .filter(|_| seed_native.is_none())
+        .and_then(|rgba8| {
+            let layout = crate::backend::vulkan::translate::pixel::texel_layout_of(color0_format)?;
+            // Four-byte *colour*, not four bytes. A seed is eight-bit RGBA, and a
+            // four-byte texel that is not one of the two colour orders — a packed
+            // ten-bit word, an integer pair — cannot be staged as though it were:
+            // the copy converts nothing, so the attachment would be seeded with the
+            // seed's bytes reinterpreted. The wide arm below restates the seed in
+            // the attachment's texel, or refuses by name when it cannot.
+            if layout.is_four_byte_color() {
+                return None;
+            }
+            Some((rgba8, layout))
+        });
+    let seed_slot = if let Some(native) = seed_native {
+        let slot = {
+            let _s = stage_phase::Span::open(stage_phase::Part::Acquire);
+            pools.acquire_staging(ctx, native.len() as u64, counters)?
+        };
+        {
+            let _s = stage_phase::Span::moving(stage_phase::Part::Bytes, native.len() as u64);
+            pools.write_staging(ctx, &slot, native)?;
+        }
+        counters.note_seed_upload(native.len() as u64);
+        crate::runtime::drain::note_store_route("seed_native");
+        Some(slot)
+    } else if let Some((rgba8, layout)) = seed_wide {
         // The seed's own order first, because `expand_rgba8_to_texel` reads
         // semantic RGBA8 — the same normalization the four-byte arm folds into
         // its copy, done here as a step because a widening pass cannot also

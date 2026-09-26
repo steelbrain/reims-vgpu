@@ -1004,7 +1004,7 @@ fn execute_submission<M: HostMemory + HostOps>(
     // pixels the guest has since overwritten has to go now — landing it later
     // would replace the guest's own bytes with a frame the guest has declared
     // stale.
-    consume_resource_table(state, task_id, resource_descs);
+    let guest_reads = consume_resource_table(state, task_id, resource_descs);
 
     // One cursor for the whole packet, not one per buffer: a packet's
     // command-buffer table is one submission and the model resolved all of it
@@ -1032,6 +1032,12 @@ fn execute_submission<M: HostMemory + HostOps>(
         let finish_ns = finish_started.elapsed().as_nanos() as u64;
         *measured_ns += finish_ns;
         crate::runtime::drain::note_exec_phase(crate::runtime::drain::ExecPhase::Finish, finish_ns);
+    }
+    // After the streams, because the frame the guest is about to read is the
+    // one this submission just rendered: the table is consumed before any
+    // record runs, when that frame's debt does not exist yet.
+    for object_id in guest_reads {
+        crate::runtime::resource_validity::deliver_for_guest_read(state, host, task_id, object_id);
     }
 }
 
@@ -1188,8 +1194,16 @@ fn note_exec_header(exec_started: std::time::Instant, measured_ns: u64) {
 ///
 /// The census that measured it is gone; a correlation with no counter-examples
 /// over 19 135 trials is a finding, not a thing to keep re-deriving per frame.
-fn consume_resource_table(state: &mut DeviceState, task_id: u32, descs: &[ExecResourceDesc]) {
+/// Returns the objects whose records asked for the guest's copy
+/// ([`crate::runtime::resource_validity::ValidityOutcome::guest_read_requested`]),
+/// for the caller to deliver once the submission has run.
+fn consume_resource_table(
+    state: &mut DeviceState,
+    task_id: u32,
+    descs: &[ExecResourceDesc],
+) -> Vec<u32> {
     use crate::runtime::resource_validity::{apply, ValiditySite};
+    let mut guest_reads = Vec::new();
     let mut no_surface = 0u32;
     let mut unknown = 0u32;
     for d in descs {
@@ -1201,6 +1215,9 @@ fn consume_resource_table(state: &mut DeviceState, task_id: u32, descs: &[ExecRe
                 .fail_once(0);
         }
         let outcome = apply(state, task_id, d.object_id, d.ops, ValiditySite::ExecTable);
+        if outcome.guest_read_requested {
+            guest_reads.push(d.object_id);
+        }
         if !outcome.missed {
             continue;
         }
@@ -1214,6 +1231,7 @@ fn consume_resource_table(state: &mut DeviceState, task_id: u32, descs: &[ExecRe
     // opcode in the device and a per-record line would bury the fail view.
     crate::runtime::drain::note_store_route_n("validity_no_surface", no_surface as u64);
     crate::runtime::drain::note_store_route_n("validity_unknown_object", unknown as u64);
+    guest_reads
 }
 
 /// The one part of an `EXEC_INDIRECT2` resource-table record this device cannot
@@ -5260,7 +5278,8 @@ fn finish_stream<M: HostMemory + HostOps>(
                         }
                         MultiDrawChainSource::Cpu => {
                             if let Some(c0) = req.colors.first_mut() {
-                                c0.target_seed_rgba = chain_rgba.take();
+                                c0.target_seed =
+                                    chain_rgba.take().map(crate::runtime::draw::LoadSeed::rgba8);
                             }
                         }
                         MultiDrawChainSource::Missing => {
@@ -5617,7 +5636,7 @@ fn render_pass_attachment_template(first: &draw::DrawEncodeRequest) -> draw::Dra
             load_action: MTL_LOAD_ACTION_LOAD,
             store_action: c.store_action,
             clear_color: c.clear_color,
-            target_seed_rgba: None,
+            target_seed: None,
             multisample_source_ref: c.multisample_source_ref,
         })
         .collect();

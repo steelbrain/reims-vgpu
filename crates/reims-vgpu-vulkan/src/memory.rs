@@ -142,7 +142,7 @@ impl MemoryTopology {
             },
             (MemoryClass::Upload, Self::Discrete) => MemoryRequest {
                 required: host,
-                preferred: Vec::new(),
+                preferred: vec![F::HOST_CACHED],
             },
             (MemoryClass::Readback, Self::Unified) => MemoryRequest {
                 required: F::HOST_VISIBLE,
@@ -664,6 +664,26 @@ pub mod fixtures {
         )
     }
 
+    /// NVIDIA NVK discrete layout observed on a GeForce MX450: the scarce
+    /// DEVICE_LOCAL|HOST_VISIBLE BAR type appears before cached system RAM.
+    /// A 256 MiB upload fits the BAR exactly, so required-flags-only selection
+    /// must not let type ordering charge the staging allocation to that heap.
+    pub fn nvidia_nvk_discrete() -> vk::PhysicalDeviceMemoryProperties {
+        use vk::MemoryPropertyFlags as F;
+        build(
+            &[
+                (2 * GIB, vk::MemoryHeapFlags::DEVICE_LOCAL),
+                (256 * 1024 * 1024, vk::MemoryHeapFlags::DEVICE_LOCAL),
+                (24 * GIB, vk::MemoryHeapFlags::empty()),
+            ],
+            &[
+                (0, F::DEVICE_LOCAL),
+                (1, F::DEVICE_LOCAL | F::HOST_VISIBLE | F::HOST_COHERENT),
+                (2, F::HOST_VISIBLE | F::HOST_COHERENT | F::HOST_CACHED),
+            ],
+        )
+    }
+
     /// NVIDIA discrete WITH resizable BAR: the whole 16 GiB of VRAM is
     /// host-visible, but write-combining — never `HOST_CACHED`. This is the
     /// fixture that would break a naive "has DEVICE_LOCAL|HOST_VISIBLE ⇒ UMA"
@@ -896,10 +916,28 @@ mod tests {
             .request(MemoryClass::Upload)
             .preferred
             .contains(&F::DEVICE_LOCAL));
-        assert!(MemoryTopology::Discrete
-            .request(MemoryClass::Upload)
-            .preferred
-            .is_empty());
+        assert_eq!(
+            MemoryTopology::Discrete
+                .request(MemoryClass::Upload)
+                .preferred,
+            vec![F::HOST_CACHED],
+        );
+    }
+
+    /// NVK exposes the 256 MiB BAR type before cached system RAM. An upload
+    /// exactly the size of that BAR must still land in system RAM rather than
+    /// consuming the entire host-visible device-local heap.
+    #[test]
+    fn discrete_upload_avoids_an_early_bar_even_when_allocation_fits_exactly() {
+        const MIB: u64 = 1 << 20;
+        let props = nvidia_nvk_discrete();
+        let req = MemoryTopology::Discrete.request(MemoryClass::Upload);
+
+        let pick =
+            select_memory_type(&props, !0, &req, 256 * MIB, u64::MAX).expect("an upload type");
+
+        assert_eq!(pick.index, 2, "upload must use cached system RAM, not BAR");
+        assert_eq!(pick.heap_index, 2);
     }
 
     /// Selection walks the preference list best-first on a unified device: the
