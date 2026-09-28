@@ -2666,6 +2666,44 @@ pub fn read_mapping_bytes<H: HostMemory + HostOps>(
     )
 }
 
+/// Read bytes the guest itself wrote since the mapping's guest-write stamp.
+///
+/// [`read_mapping_bytes`] settles the mapping's writeback debt first, because
+/// its callers want the surface's *content* and an unpaid resident is newer
+/// than the pages. This caller wants the opposite: exactly the guest's own
+/// stores, to lay over that resident. Paying the debt first would read the
+/// resident back and land it over those very pages — a whole-frame round trip
+/// that destroys what it was asked for. So the debt is left owed: after the
+/// overlay the resident holds the guest's stores too, and paying it later lands
+/// them unchanged.
+///
+/// A GPU copy into guest pages still in flight is a different obligation — the
+/// bytes would be torn — and the caller quiesces those before reading.
+///
+/// Compiled with the Vulkan rail only because its one caller, the resident
+/// overlay in `runtime::draw::vulkan`, is.
+#[cfg(feature = "backend-vulkan")]
+pub(crate) fn read_guest_owned_bytes<H: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut H,
+    mapping_id: u32,
+    off: u64,
+    buf: &mut [u8],
+) -> bool {
+    if buf.is_empty() {
+        return true;
+    }
+    copy_mapping_runs(
+        state,
+        host,
+        mapping_id,
+        off,
+        RunCopy::Read(buf),
+        None,
+        "mapping_read_guest_owned",
+    )
+}
+
 /// Read a strided rectangle starting at mapping-linear `off` into a packed `dst`.
 ///
 /// The rectangle's rows are `rect.row_stride` apart in the mapping and back to

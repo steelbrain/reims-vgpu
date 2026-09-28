@@ -3870,6 +3870,531 @@ pub fn copy_target_to_guest_pages(
     Ok(())
 }
 
+/// Guest bytes to lay over a resident, in the resident's own window terms.
+///
+/// Built by the runtime, which alone knows the mapping's page list and which of
+/// its pages the guest wrote. Each span is a contiguous stretch of the pixel
+/// window — `[window_start, window_end)`, byte offsets from the window's first
+/// texel — staged back to back in `bytes` starting at `staged_offset`.
+pub struct ResidentOverlay<'a> {
+    pub bytes: &'a [u8],
+    pub spans: &'a [ResidentOverlaySpan],
+    /// Guest row pitch in bytes.
+    pub pitch_bytes: u64,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// One contiguous stretch of a [`ResidentOverlay`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResidentOverlaySpan {
+    pub window_start: u64,
+    pub window_end: u64,
+    pub staged_offset: u64,
+}
+
+impl ResidentOverlaySpan {
+    /// The window spans a list of guest-owned mapping ranges covers, and the
+    /// staged byte total they need.
+    ///
+    /// `guest_owned` is mapping-linear `[start, end)` byte ranges, ascending —
+    /// the shape `SurfaceCurrency::WrotePixels` carries, page-granular because
+    /// that is what the host's dirty tracking names. The pixel window starts at
+    /// mapping offset `base_off` and its last texel ends `extent_end` bytes
+    /// later. Each range is clipped to that window and rebased onto it; a range
+    /// wholly before or past the window contributes nothing, because nothing of
+    /// the resident sits there. Row padding *inside* the window is kept — the
+    /// guest's bytes there are copied into staging and
+    /// [`overlay_guest_bytes_onto_resident`]'s rectangles simply never name
+    /// them — so a span's staged bytes stay a straight copy of the window and
+    /// its rows stay one pitch apart, which is what the copy's buffer row length
+    /// assumes.
+    pub fn from_guest_owned(
+        guest_owned: &[(u64, u64)],
+        base_off: u64,
+        extent_end: u64,
+    ) -> (Vec<Self>, u64) {
+        let mut spans = Vec::with_capacity(guest_owned.len());
+        let mut staged = 0u64;
+        for &(start, end) in guest_owned {
+            if end <= base_off {
+                continue;
+            }
+            let window_start = start.saturating_sub(base_off);
+            let window_end = (end - base_off).min(extent_end);
+            if window_start >= window_end {
+                continue;
+            }
+            spans.push(Self {
+                window_start,
+                window_end,
+                staged_offset: staged,
+            });
+            staged += window_end - window_start;
+        }
+        (spans, staged)
+    }
+}
+
+/// Why [`overlay_guest_bytes_onto_resident`] left the resident alone.
+///
+/// Every arm is a routing answer: nothing was recorded, and the caller still
+/// has its own way to reconcile the two halves of the surface.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OverlayDecline {
+    /// The resident is not a single-sample image with ready content.
+    NotReady,
+    /// The resident's extent is not the window's.
+    GeometryMoved,
+    /// The resident's stored texels are not four-byte scanout order, so guest
+    /// bytes copied in unconverted would land swapped or misaligned.
+    NotScanoutOrder,
+    /// The resident *is* the guest allocation; there is no second copy to fix.
+    GuestBacked,
+    /// A span is not whole texels inside the window, or the staged bytes do not
+    /// cover it.
+    SpanOutsideWindow,
+}
+
+impl OverlayDecline {
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::NotReady => "resident_overlay_not_ready",
+            Self::GeometryMoved => "resident_overlay_geometry_moved",
+            Self::NotScanoutOrder => "resident_overlay_not_scanout_order",
+            Self::GuestBacked => "resident_overlay_guest_backed",
+            Self::SpanOutsideWindow => "resident_overlay_span_outside_window",
+        }
+    }
+}
+
+/// Bytes per texel of every resident the overlay accepts: four-byte scanout
+/// order, which is also the only texel `reims_vgpu_paging::regions` plans for.
+const OVERLAY_BYTES_PER_TEXEL: u64 = 4;
+
+/// The copy regions that land `overlay`'s staged bytes in a resident of the
+/// overlay's own extent, or [`OverlayDecline::SpanOutsideWindow`] when a span
+/// cannot be copied as whole texels from bytes that exist.
+///
+/// Pure, so the arithmetic is testable without a device. Buffer offsets are
+/// into `overlay.bytes`; the buffer row length is the guest pitch in texels,
+/// which is what makes a merged multi-row rectangle name consecutive rows of a
+/// span's staged copy. An empty answer means every span fell in row padding or
+/// past the last texel — nothing of the resident differs from what the guest
+/// wrote.
+fn plan_overlay_regions(
+    overlay: &ResidentOverlay<'_>,
+) -> Result<Vec<ash::vk::BufferImageCopy>, OverlayDecline> {
+    const BPT: u64 = OVERLAY_BYTES_PER_TEXEL;
+    if !overlay.pitch_bytes.is_multiple_of(BPT)
+        || overlay.pitch_bytes < u64::from(overlay.width) * BPT
+    {
+        return Err(OverlayDecline::SpanOutsideWindow);
+    }
+    let Ok(row_length_texels) = u32::try_from(overlay.pitch_bytes / BPT) else {
+        return Err(OverlayDecline::SpanOutsideWindow);
+    };
+    let geom = reims_vgpu_paging::regions::WindowGeometry {
+        pitch_bytes: overlay.pitch_bytes,
+        width_texels: overlay.width,
+        height_texels: overlay.height,
+    };
+    let mut regions = Vec::new();
+    for span in overlay.spans {
+        let len = span.window_end.saturating_sub(span.window_start);
+        let staged_end = span.staged_offset.checked_add(len);
+        if !span.window_start.is_multiple_of(BPT)
+            || !span.window_end.is_multiple_of(BPT)
+            || !span.staged_offset.is_multiple_of(BPT)
+            || staged_end.is_none_or(|end| end > overlay.bytes.len() as u64)
+        {
+            return Err(OverlayDecline::SpanOutsideWindow);
+        }
+        for r in reims_vgpu_paging::regions::plan_regions(&geom, span.window_start, span.window_end)
+        {
+            regions.push(
+                ash::vk::BufferImageCopy::default()
+                    .buffer_offset(span.staged_offset + (r.window_offset - span.window_start))
+                    .buffer_row_length(row_length_texels)
+                    .buffer_image_height(0)
+                    .image_subresource(color_subresource_layers())
+                    .image_offset(ash::vk::Offset3D {
+                        x: r.x as i32,
+                        y: r.y as i32,
+                        z: 0,
+                    })
+                    .image_extent(ash::vk::Extent3D {
+                        width: r.width,
+                        height: r.height,
+                        depth: 1,
+                    }),
+            );
+        }
+    }
+    Ok(regions)
+}
+
+/// Lay the guest's own stores over a live resident, on the queue, and leave the
+/// resident as the surface.
+///
+/// # What this replaces
+///
+/// The sampled ladder's answer to "the guest CPU wrote pages under a live
+/// resident" was to read the whole resident back, wait for it, scatter it into
+/// every page the guest did *not* write, and then upload the whole surface again
+/// from those pages for the draw. On a Windows/WHPX x86 Ventura guest at
+/// 1920x1080 running a Safari animation on the copying rails, that merge ran
+/// 138 times a second and the sampled resolve cost ~269 ms/s; with this copy in
+/// its place the merges went to zero, the resolve to 21–32 ms/s, and each
+/// overlay moved 4 KB to 2.6 MB — typically 50–500 KB — of an 8.3 MB frame.
+///
+/// The merge it produced is page-granular: guest-written pages come from guest
+/// RAM, every other page from the resident. Copying the guest-written pages into
+/// the resident gives the same texels without either whole-frame pass, and
+/// without the wait.
+///
+/// # Ordering
+///
+/// Appended to the open batch when there is one — the draws already recorded
+/// there may have produced the resident, and the draw about to be recorded is
+/// the one that samples it — otherwise its own entry, submitted without a wait.
+/// The trailing barrier makes the transfer write visible to every later command
+/// in submission order and returns the image to the layout the registry already
+/// records, so the registry's access needs no change. The staging slot travels
+/// with the entry's cleanup and is recycled when its fence retires; the image
+/// itself is covered the way every recorded command's is, by the graveyard
+/// holding a reclaimed resident until the slots that could name it retire.
+pub fn overlay_guest_bytes_onto_resident(
+    identity: &TargetIdentity,
+    overlay: &ResidentOverlay<'_>,
+) -> Result<Result<u32, OverlayDecline>, DrawError> {
+    let mut guard = lock_engine();
+    let EngineState {
+        ref mut owner,
+        ref mut pools,
+        ref counters,
+        ..
+    } = &mut *guard;
+    let ctx = owner.ensure(counters)?;
+    unsafe { pools.ensure_init(ctx, counters)? };
+    let Ok(snap) = resident_read_snapshot(pools, identity) else {
+        return Ok(Err(OverlayDecline::NotReady));
+    };
+    if snap.guest_backing.is_some() {
+        return Ok(Err(OverlayDecline::GuestBacked));
+    }
+    // The copy returns the image to the layout the registry records, which has to
+    // be one a barrier may name as its destination and one that needs no
+    // feedback-loop dependency to leave and re-enter.
+    if matches!(
+        snap.layout,
+        ash::vk::ImageLayout::UNDEFINED
+            | ash::vk::ImageLayout::PREINITIALIZED
+            | ash::vk::ImageLayout::ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT
+    ) {
+        return Ok(Err(OverlayDecline::NotReady));
+    }
+    if snap.width != overlay.width || snap.height != overlay.height {
+        return Ok(Err(OverlayDecline::GeometryMoved));
+    }
+    let four_byte = crate::backend::vulkan::translate::pixel::bytes_per_texel(snap.format)
+        .is_some_and(|b| u64::from(b) == OVERLAY_BYTES_PER_TEXEL);
+    if !snap.bgra() || !four_byte {
+        return Ok(Err(OverlayDecline::NotScanoutOrder));
+    }
+    let regions = match plan_overlay_regions(overlay) {
+        Ok(regions) => regions,
+        Err(decline) => return Ok(Err(decline)),
+    };
+    if regions.is_empty() {
+        return Ok(Ok(0));
+    }
+    unsafe {
+        let staging = pools.acquire_staging(ctx, overlay.bytes.len() as u64, counters)?;
+        pools.write_staging(ctx, &staging, overlay.bytes)?;
+        let appended = pools.batch_open_recording();
+        let (cb, fence) = match appended {
+            Some(pair) => pair,
+            None => {
+                let pair = pools.begin_entry(ctx, counters)?;
+                pools.begin_slot_recording(
+                    ctx,
+                    pair.0,
+                    gpu_span::Kind::Draw,
+                    VkOp::ResidentOverlayResetCb,
+                    VkOp::ResidentOverlayBeginCb,
+                )?;
+                pair
+            }
+        };
+        pools.close_open_pass(&ctx.device, cb);
+        let to_transfer = [ash::vk::ImageMemoryBarrier::default()
+            .src_access_mask(RESIDENT_READ_SRC_ACCESS)
+            .dst_access_mask(ash::vk::AccessFlags::TRANSFER_WRITE)
+            .old_layout(snap.layout)
+            .new_layout(ash::vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .image(snap.image)
+            .subresource_range(color_subresource_range())];
+        ctx.device.cmd_pipeline_barrier(
+            cb,
+            ash::vk::PipelineStageFlags::ALL_COMMANDS,
+            ash::vk::PipelineStageFlags::TRANSFER,
+            feedback_transition_dependency(snap.layout),
+            &[],
+            &[],
+            &to_transfer,
+        );
+        ctx.device.cmd_copy_buffer_to_image(
+            cb,
+            staging.buffer,
+            snap.image,
+            ash::vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            &regions,
+        );
+        let back = [ash::vk::ImageMemoryBarrier::default()
+            .src_access_mask(ash::vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(RESIDENT_READ_SRC_ACCESS | ash::vk::AccessFlags::TRANSFER_READ)
+            .old_layout(ash::vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .new_layout(snap.layout)
+            .image(snap.image)
+            .subresource_range(color_subresource_range())];
+        ctx.device.cmd_pipeline_barrier(
+            cb,
+            ash::vk::PipelineStageFlags::TRANSFER,
+            ash::vk::PipelineStageFlags::ALL_COMMANDS,
+            ash::vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &back,
+        );
+        if appended.is_none() {
+            pools.gpu_span_seal_current(ctx, cb);
+            ctx.device
+                .end_command_buffer(cb)
+                .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::ResidentOverlayEndCb, e)))?;
+            let cbs = [cb];
+            ctx.submit_guest_work(&cbs, fence)
+                .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::ResidentOverlaySubmit, e)))?;
+            let sealed = pools.seal_entry(Vec::new(), Vec::new());
+            pools.finish_entry_async(&ctx.device, sealed);
+        }
+    }
+    Ok(Ok(regions.len() as u32))
+}
+
+#[cfg(test)]
+mod resident_overlay_tests {
+    use super::*;
+
+    const PAGE: u64 = 4096;
+
+    #[test]
+    fn a_range_is_rebased_onto_the_window_and_staged_back_to_back() {
+        let base = 0x2000;
+        let (spans, staged) = ResidentOverlaySpan::from_guest_owned(
+            &[(0x3000, 0x4000), (0x6000, 0x8000)],
+            base,
+            0x10000,
+        );
+        assert_eq!(
+            spans,
+            [
+                ResidentOverlaySpan {
+                    window_start: 0x1000,
+                    window_end: 0x2000,
+                    staged_offset: 0,
+                },
+                ResidentOverlaySpan {
+                    window_start: 0x4000,
+                    window_end: 0x6000,
+                    staged_offset: 0x1000,
+                },
+            ]
+        );
+        assert_eq!(staged, 0x3000);
+    }
+
+    /// A page before the window (a header, a sibling plane) and a page past its
+    /// last texel carry nothing of the resident, so they stage nothing; the
+    /// ranges that straddle either edge keep only their inside.
+    #[test]
+    fn ranges_are_clipped_to_the_window_at_both_edges() {
+        let base = 0x1800;
+        let extent = 3 * PAGE;
+        let owned = [
+            (0, PAGE),            // wholly before the window
+            (PAGE, 2 * PAGE),     // straddles its start
+            (3 * PAGE, 5 * PAGE), // straddles its end
+            (6 * PAGE, 7 * PAGE), // wholly past it
+        ];
+        let (spans, staged) = ResidentOverlaySpan::from_guest_owned(&owned, base, extent);
+        assert_eq!(
+            spans,
+            [
+                ResidentOverlaySpan {
+                    window_start: 0,
+                    window_end: 2 * PAGE - base,
+                    staged_offset: 0,
+                },
+                ResidentOverlaySpan {
+                    window_start: 3 * PAGE - base,
+                    window_end: extent,
+                    staged_offset: 2 * PAGE - base,
+                },
+            ]
+        );
+        assert_eq!(staged, (2 * PAGE - base) + (extent - (3 * PAGE - base)));
+    }
+
+    #[test]
+    fn nothing_inside_the_window_stages_nothing() {
+        let (spans, staged) =
+            ResidentOverlaySpan::from_guest_owned(&[(0, PAGE), (8 * PAGE, 9 * PAGE)], PAGE, PAGE);
+        assert!(spans.is_empty());
+        assert_eq!(staged, 0);
+        let (spans, staged) = ResidentOverlaySpan::from_guest_owned(&[], 0, PAGE);
+        assert!(spans.is_empty());
+        assert_eq!(staged, 0);
+    }
+
+    fn overlay<'a>(
+        bytes: &'a [u8],
+        spans: &'a [ResidentOverlaySpan],
+        pitch_bytes: u64,
+        width: u32,
+        height: u32,
+    ) -> ResidentOverlay<'a> {
+        ResidentOverlay {
+            bytes,
+            spans,
+            pitch_bytes,
+            width,
+            height,
+        }
+    }
+
+    /// A span that starts mid-row and runs past whole rows lands as a
+    /// fragment, a merged rectangle and a tail, each at the staged byte the
+    /// window offset names and with the guest pitch as its row length.
+    #[test]
+    fn a_span_lands_at_its_staged_bytes_with_the_guest_pitch() {
+        // 100 texels wide, 128 texels of pitch: 112 bytes of padding a row.
+        let (width, height, pitch) = (100u32, 8u32, 512u64);
+        let window_start = pitch + 40; // row 1, texel 10
+        let window_end = 4 * pitch + 80; // row 4, texel 20
+        let staged_offset = 64;
+        let bytes = vec![0u8; (staged_offset + window_end - window_start) as usize];
+        let spans = [ResidentOverlaySpan {
+            window_start,
+            window_end,
+            staged_offset,
+        }];
+        let regions = plan_overlay_regions(&overlay(&bytes, &spans, pitch, width, height))
+            .expect("whole texels inside the window");
+        let got: Vec<_> = regions
+            .iter()
+            .map(|r| {
+                (
+                    r.buffer_offset,
+                    r.buffer_row_length,
+                    r.image_offset.x,
+                    r.image_offset.y,
+                    r.image_extent.width,
+                    r.image_extent.height,
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (staged_offset, 128, 10, 1, 90, 1),
+                (staged_offset + pitch - 40, 128, 0, 2, 100, 2),
+                (staged_offset + 3 * pitch - 40, 128, 0, 4, 20, 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_span_inside_row_padding_plans_no_copy() {
+        let (width, height, pitch) = (100u32, 4u32, 512u64);
+        let bytes = vec![0u8; 64];
+        let spans = [ResidentOverlaySpan {
+            window_start: 400,
+            window_end: 464,
+            staged_offset: 0,
+        }];
+        let regions = plan_overlay_regions(&overlay(&bytes, &spans, pitch, width, height))
+            .expect("padding is inside the window");
+        assert!(regions.is_empty());
+    }
+
+    #[test]
+    fn a_span_that_is_not_whole_texels_or_not_staged_declines() {
+        let (width, height, pitch) = (16u32, 4u32, 64u64);
+        let bytes = vec![0u8; 64];
+        let decline = |span: ResidentOverlaySpan| {
+            plan_overlay_regions(&overlay(&bytes, &[span], pitch, width, height)).err()
+        };
+        let span = |window_start, window_end, staged_offset| ResidentOverlaySpan {
+            window_start,
+            window_end,
+            staged_offset,
+        };
+        assert_eq!(
+            decline(span(2, 64, 0)),
+            Some(OverlayDecline::SpanOutsideWindow)
+        );
+        assert_eq!(
+            decline(span(0, 62, 0)),
+            Some(OverlayDecline::SpanOutsideWindow)
+        );
+        assert_eq!(
+            decline(span(0, 32, 2)),
+            Some(OverlayDecline::SpanOutsideWindow)
+        );
+        // One byte more than was staged.
+        assert_eq!(
+            decline(span(0, 68, 0)),
+            Some(OverlayDecline::SpanOutsideWindow)
+        );
+        assert_eq!(decline(span(0, 64, 0)), None);
+    }
+
+    #[test]
+    fn a_pitch_that_cannot_hold_a_row_of_whole_texels_declines() {
+        let bytes = vec![0u8; 64];
+        let spans = [ResidentOverlaySpan {
+            window_start: 0,
+            window_end: 64,
+            staged_offset: 0,
+        }];
+        for pitch in [60u64, 66] {
+            assert_eq!(
+                plan_overlay_regions(&overlay(&bytes, &spans, pitch, 16, 4)).err(),
+                Some(OverlayDecline::SpanOutsideWindow),
+                "pitch {pitch}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_decline_has_its_own_slug() {
+        let all = [
+            OverlayDecline::NotReady,
+            OverlayDecline::GeometryMoved,
+            OverlayDecline::NotScanoutOrder,
+            OverlayDecline::GuestBacked,
+            OverlayDecline::SpanOutsideWindow,
+        ];
+        for (i, a) in all.iter().enumerate() {
+            assert!(a.slug().starts_with("resident_overlay_"), "{a:?}");
+            for b in &all[i + 1..] {
+                assert_ne!(a.slug(), b.slug());
+            }
+        }
+    }
+}
+
 /// Build the copy plan that lands one frame in a guest-page destination.
 ///
 /// # Why this is the half both rails share

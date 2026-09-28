@@ -65,6 +65,17 @@ pub enum VkOp {
     /// `vkQueueSubmit` of the guest-page copy.
     GuestWriteSubmit,
 
+    // ---- mod.rs `overlay_guest_bytes_onto_resident` — the guest's own stores
+    //      laid over a live resident on the queue ----
+    /// `vkResetCommandBuffer` before recording the resident overlay.
+    ResidentOverlayResetCb,
+    /// `vkBeginCommandBuffer` for the resident overlay.
+    ResidentOverlayBeginCb,
+    /// `vkEndCommandBuffer` closing the resident overlay.
+    ResidentOverlayEndCb,
+    /// `vkQueueSubmit` of the resident overlay.
+    ResidentOverlaySubmit,
+
     // ---- mod.rs `read_resident_storage` — the pinned deferred-writeback
     //      storage-image flush rail (GPU→host tight copy, then unpin) ----
     /// `vkResetCommandBuffer` before recording the storage flush copy.
@@ -377,6 +388,11 @@ impl Decline for VkCall {
             VkOp::GuestWriteEndCb => "vk_guest_write_end_cb",
             VkOp::GuestWriteSubmit => "vk_guest_write_submit",
 
+            VkOp::ResidentOverlayResetCb => "vk_resident_overlay_reset_cb",
+            VkOp::ResidentOverlayBeginCb => "vk_resident_overlay_begin_cb",
+            VkOp::ResidentOverlayEndCb => "vk_resident_overlay_end_cb",
+            VkOp::ResidentOverlaySubmit => "vk_resident_overlay_submit",
+
             VkOp::StorageReadResetCb => "vk_storage_read_reset_cb",
             VkOp::StorageReadBeginCb => "vk_storage_read_begin_cb",
             VkOp::StorageReadEndCb => "vk_storage_read_end_cb",
@@ -557,6 +573,10 @@ mod tests {
         VkOp::GuestWriteBeginCb,
         VkOp::GuestWriteEndCb,
         VkOp::GuestWriteSubmit,
+        VkOp::ResidentOverlayResetCb,
+        VkOp::ResidentOverlayBeginCb,
+        VkOp::ResidentOverlayEndCb,
+        VkOp::ResidentOverlaySubmit,
         VkOp::StorageReadResetCb,
         VkOp::StorageReadBeginCb,
         VkOp::StorageReadEndCb,

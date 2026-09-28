@@ -203,6 +203,39 @@ switches! {
 /// comparable across compositing regimes and only one pair matched.
 pub const GUEST_IMPORT: &str = "REIMS_VGPU_GUEST_IMPORT";
 
+/// `off` reconciles a surface the guest CPU wrote under a live resident by the
+/// whole-frame merge (read the resident back, land it around the guest's pages,
+/// upload the pages again) instead of laying the guest-written pages over the
+/// resident on the GPU.
+///
+/// Narrowing-only: both arms produce the same page-granular texels — pages the
+/// guest wrote come from guest RAM, every other page from the resident — and
+/// the overlay declines to the merge whenever it cannot copy the guest's bytes
+/// unconverted. What differs is the cost and where the reconciled surface
+/// lives afterwards: in the resident, or in the guest's pages.
+///
+/// # What the two arms cost, one host
+///
+/// Windows 11 / WHPX / RTX 4060, x86 Ventura guest at 1920x1080, a Safari
+/// CSS/canvas animation on the copying rails (`GUEST_IMPORT=off`), the same
+/// boot script and host state for both arms, this `off` against three boots
+/// with it unset:
+///
+/// ```text
+///                        off          unset (three boots)
+/// present_hz mean        27.9         35.5 - 52.9
+/// drain ms/frame         24.4          5.8 - 7.7
+/// us per draw           126.6           31 - 42
+/// drain duty             0.63         0.22 - 0.26
+/// sampled resolve ms/s   ~269           21 - 32
+/// resident merges/s       138            0
+/// ```
+///
+/// Each overlay copied 4 KB to 2.6 MB, typically 50-500 KB, of the 8.3 MB
+/// frame the merge moves three times. One host and one guest; it is not a
+/// claim about the other pathways.
+pub const RESIDENT_OVERLAY: &str = "REIMS_VGPU_RESIDENT_OVERLAY";
+
 /// `off` keeps descriptor state on the allocated Vulkan 1.2 set path even when
 /// the device advertises `VK_KHR_push_descriptor` and the layout fits its
 /// reported limit.
