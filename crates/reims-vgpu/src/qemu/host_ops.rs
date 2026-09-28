@@ -141,6 +141,10 @@ pub struct ReimsVgpuHostOps {
     >,
     pub page_alias_census:
         Option<unsafe extern "C" fn(ctx: *mut c_void, out: *mut PageAliasCensus) -> i32>,
+    /// Non-zero when every dirty-log harvest a register write asked for has
+    /// finished. Never blocks. `None` is a shim that harvests inline, which is
+    /// always settled. Must stay the last field: it is the header's.
+    pub harvests_settled: Option<unsafe extern "C" fn(ctx: *mut c_void) -> c_int>,
 }
 
 // SAFETY: QEMU keeps the table valid for the device lifetime; callbacks only
@@ -180,6 +184,7 @@ impl ReimsVgpuHostOps {
             is_ram_gpa: None,
             guest_ram_regions: None,
             notify_actions: None,
+            harvests_settled: None,
         }
     }
 }
@@ -633,6 +638,16 @@ impl HostOps for QemuHost<'_> {
         self.ops.map_pages_stable != 0
     }
 
+    fn harvests_settled(&self) -> bool {
+        match self.ops.harvests_settled {
+            // SAFETY: QEMU owns the live ctx; the callback never blocks.
+            Some(callback) => (unsafe { callback(self.ops.ctx) }) != 0,
+            // A shim with no callback harvests inline, before the write that
+            // hands the work over is forwarded at all.
+            None => true,
+        }
+    }
+
     fn page_alias_census(&self) -> Option<PageAliasCensus> {
         let callback = self.ops.page_alias_census?;
         let mut out = PageAliasCensus::default();
@@ -931,6 +946,40 @@ mod tests {
         let mut actions = VecDeque::new();
         let prompt = parking_lot::Mutex::new(VecDeque::new());
         QemuHost::new(&ops, &mut actions, &prompt).guest_ram_regions()
+    }
+
+    unsafe extern "C" fn harvest_outstanding(_ctx: *mut c_void) -> c_int {
+        0
+    }
+
+    unsafe extern "C" fn harvest_finished(_ctx: *mut c_void) -> c_int {
+        1
+    }
+
+    fn harvests_settled_with(callback: Option<unsafe extern "C" fn(*mut c_void) -> c_int>) -> bool {
+        let mut ops = ReimsVgpuHostOps::null();
+        ops.harvests_settled = callback;
+        let mut actions = VecDeque::new();
+        let prompt = parking_lot::Mutex::new(VecDeque::new());
+        let host = QemuHost::new(&ops, &mut actions, &prompt);
+        host.harvests_settled()
+    }
+
+    /// A shim with no `harvests_settled` harvests inline, before it forwards the
+    /// write that hands the work over, so every harvest a doorbell could have
+    /// asked for has already run. `true` is the answer, not a fallback: the
+    /// arm64 shim leaves the field NULL and must drain exactly as before.
+    #[test]
+    fn a_shim_without_harvests_settled_is_always_settled() {
+        assert!(harvests_settled_with(None));
+    }
+
+    /// The shim's answer is forwarded as it stands; zero is the one that makes
+    /// the drain hold work back.
+    #[test]
+    fn harvests_settled_forwards_the_shims_answer() {
+        assert!(!harvests_settled_with(Some(harvest_outstanding)));
+        assert!(harvests_settled_with(Some(harvest_finished)));
     }
 
     /// A shim older than v17 has no such callback, and that is a named refusal

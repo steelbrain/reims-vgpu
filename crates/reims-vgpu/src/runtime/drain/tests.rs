@@ -7543,3 +7543,118 @@ mod arrivals {
         ));
     }
 }
+
+/// A host whose harvests have not finished gets no pass at all, and the work
+/// the pass would have served is still there for the next one.
+///
+/// The drain cannot tell which of the writes folded or applied at its lock
+/// acquisition landed after the shim's pre-drain wait, so an unsettled answer
+/// holds back everything: the root FIFO, the pending channels, and the rings
+/// still in the doorbell word. Nothing may be consumed on the way out — the
+/// wakeup the shim owes is the only thing that brings this work back.
+#[test]
+fn an_unsettled_harvest_leaves_the_whole_pass_for_a_later_wakeup() {
+    use crate::runtime::drain::store_route_count;
+    use std::sync::atomic::Ordering;
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut host = FakeHost::new();
+    let pending_channel = 1u32 << 3;
+    let rung_channel = 1u32 << 5;
+    state.pending.main_drain = true;
+    state.pending.child_mask = pending_channel;
+    state
+        .gfx
+        .child_doorbell_rung
+        .store(rung_channel, Ordering::Release);
+    host.harvests_settled_answers.borrow_mut().push_back(false);
+    let deferred = store_route_count("drain_deferred_unharvested");
+
+    drain_pending(&mut state, &mut host);
+
+    assert_eq!(host.harvests_settled_calls.get(), 1);
+    assert_eq!(
+        store_route_count("drain_deferred_unharvested"),
+        deferred + 1,
+        "the deferral is counted where it happens"
+    );
+    assert!(
+        state.pending.main_drain,
+        "the root FIFO is still owed a pass"
+    );
+    assert_eq!(state.pending.child_mask, pending_channel);
+    assert_eq!(
+        state.gfx.child_doorbell_rung.load(Ordering::Acquire),
+        rung_channel,
+        "a ring is not folded by a pass that serves nothing"
+    );
+    assert!(
+        !host.bh_scheduled,
+        "the drain does not re-arm itself; the shim owes that wakeup"
+    );
+
+    // The owed wakeup, with the harvests finished: the same work is served.
+    drain_pending(&mut state, &mut host);
+    assert!(!state.pending.main_drain);
+    assert_eq!(state.pending.child_mask, 0);
+    assert_eq!(state.gfx.child_doorbell_rung.load(Ordering::Acquire), 0);
+    assert_eq!(
+        store_route_count("drain_deferred_unharvested"),
+        deferred + 1,
+        "and a settled host is never counted as deferred"
+    );
+}
+
+/// A channel rung while a pass is running is left in the doorbell word, not
+/// served by the refill, when its harvest has not finished.
+///
+/// The fixture rings the channel at the moment it answers unsettled, which is
+/// exactly when a shim would: the ring's harvest was asked for and is still
+/// running. What the pass had already folded is served; the new ring waits for
+/// the wakeup it scheduled, which is where the shim's wait covers it.
+#[test]
+fn the_child_refill_leaves_a_ring_whose_harvest_is_outstanding() {
+    use crate::runtime::drain::store_route_count;
+    use std::sync::atomic::Ordering;
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut host = FakeHost::new();
+    let served_channel = 1u32 << 3;
+    let late_ring = 1u32 << 6;
+    state.pending.child_mask = served_channel;
+    host.ring_when_unsettled = Some((
+        std::sync::Arc::clone(&state.gfx.child_doorbell_rung),
+        late_ring,
+    ));
+    // Settled at the top of the pass, unsettled when the refill looks again.
+    host.harvests_settled_answers
+        .borrow_mut()
+        .extend([true, false]);
+    let deferred = store_route_count("child_refill_deferred_unharvested");
+
+    drain_pending(&mut state, &mut host);
+
+    assert_eq!(
+        host.harvests_settled_calls.get(),
+        2,
+        "once for the pass, once before the refill folds"
+    );
+    assert_eq!(
+        store_route_count("child_refill_deferred_unharvested"),
+        deferred + 1
+    );
+    assert_eq!(
+        state.pending.child_mask, 0,
+        "the channel the pass had folded was served, and the late ring was not folded"
+    );
+    assert_eq!(
+        state.gfx.child_doorbell_rung.load(Ordering::Acquire),
+        late_ring,
+        "the late ring is still in the doorbell word"
+    );
+
+    // Its own wakeup, harvest finished: folded at the top and served.
+    drain_pending(&mut state, &mut host);
+    assert_eq!(state.gfx.child_doorbell_rung.load(Ordering::Acquire), 0);
+    assert_eq!(state.pending.child_mask, 0);
+}

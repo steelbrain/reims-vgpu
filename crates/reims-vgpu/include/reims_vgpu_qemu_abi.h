@@ -21,7 +21,12 @@
 extern "C" {
 #endif
 
-/* v20: map_pages fills ReimsVgpuMapPagesFailure when it refuses a view.
+/* v21: ReimsVgpuHostOps.harvests_settled — whether every dirty-log harvest a
+ *      register write has asked for has finished. A shim that harvests off the
+ *      vCPU lets the writing vCPU go at once; the drain asks this before it
+ *      serves work a doorbell handed over, and leaves the work for a later
+ *      wakeup rather than answer a currency question from an older harvest.
+ * v20: map_pages fills ReimsVgpuMapPagesFailure when it refuses a view.
  * v19: ReimsVgpuHostOps.page_alias_census reports the packed page views the
  *      shim currently owns and their cumulative lifetime totals.
  * v18: ReimsVgpuHostOps.dmabuf_for_pages and every REIMS_VGPU_DMABUF_* removed.
@@ -94,7 +99,7 @@ extern "C" {
  *     thread so IRQ pulses reach the guest mid-drain — ack fast).
  * v6: ReimsVgpuHostOps.is_ram_gpa (reject non-RAM PFNs on mapper / map_pages paths).
  * v5: ReimsVgpuQemuCreateInfo.guest_page_shift (12 = x86 Tahoe, 14 = arm64e). */
-#define REIMS_VGPU_QEMU_ABI_VERSION 20u
+#define REIMS_VGPU_QEMU_ABI_VERSION 21u
 
 #define REIMS_VGPU_MAP_PAGES_FAILURE_NONE 0u
 #define REIMS_VGPU_MAP_PAGES_FAILURE_RESERVATION 1u
@@ -378,6 +383,21 @@ typedef struct ReimsVgpuHostOps {
                                    uint64_t *out, size_t max);
     /* Current packed map_pages aliases and cumulative lifetime totals. */
     int (*page_alias_census)(void *ctx, ReimsVgpuPageAliasCensus *out);
+    /*
+     * Non-zero when every dirty-log harvest a register write has asked for has
+     * finished, so guest_write_gen and guest_written_pages reflect every guest
+     * store ordered before the doorbells seen so far. Never blocks; safe from
+     * any thread, including the drain with the device lock held.
+     *
+     * A zero answer makes the drain leave the work for a later wakeup, so a
+     * shim that answers zero must call schedule_bh once the harvests
+     * outstanding at that call have finished: the write that asked for one
+     * need not have been a doorbell, and then nothing else would wake it.
+     *
+     * NULL means the shim harvests inline, before it forwards the write, which
+     * is always settled.
+     */
+    int (*harvests_settled)(void *ctx);
 } ReimsVgpuHostOps;
 
 /*

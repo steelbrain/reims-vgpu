@@ -7899,6 +7899,17 @@ pub fn drain_pending<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mu
     if state.pending.host_action_yield {
         return;
     }
+    // Work a doorbell handed over may ask whether the guest wrote a surface's
+    // pages, and that answer is only as new as the last finished harvest. A
+    // shim that harvests off the vCPU waits for the harvests asked before this
+    // wakeup, but a write can land after that wait and still be folded or
+    // applied when this pass took the device lock. Leave everything for a later
+    // wakeup: the shim owes one once its outstanding harvests finish
+    // (`HostOps::harvests_settled`), and `pending` keeps the work until then.
+    if !host.harvests_settled() {
+        note_store_route("drain_deferred_unharvested");
+        return;
+    }
     release_translation_order_holds(state);
     // Retry an already translation-held EXEC before allowing either the root
     // FIFO or a sibling child FIFO to overtake it. The guest is free to queue
@@ -7965,6 +7976,16 @@ pub fn drain_pending<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mu
                     return;
                 }
             }
+        }
+        // A channel rung during this pass asked for its harvest when it rang,
+        // and serving it before that harvest finishes would answer its currency
+        // questions from an older one. Everything in `mask` has just been
+        // served; the new rings stay in the doorbell word, and each one rang
+        // `schedule_bh` for a wakeup that waits for its harvest.
+        if !host.harvests_settled() {
+            note_store_route("child_refill_deferred_unharvested");
+            mask = 0;
+            break;
         }
         fold_rung_child_doorbells(state);
         // Only channels this pass has not already run: a channel rung again

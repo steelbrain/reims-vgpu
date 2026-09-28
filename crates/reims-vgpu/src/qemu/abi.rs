@@ -94,7 +94,10 @@ use std::slice;
 /// without the `host-window` feature it returns `REIMS_VGPU_QEMU_ERR_STATE` so the C
 /// shim falls back to QEMU's own display.
 /// v20 gives `map_pages` a structured per-call failure output.
-pub const REIMS_VGPU_QEMU_ABI_VERSION: u32 = 20;
+/// v21 adds `harvests_settled` on [`ReimsVgpuHostOps`], so a shim can harvest the
+/// dirty log off the vCPU and the drain can still refuse to serve work whose
+/// harvest has not finished.
+pub const REIMS_VGPU_QEMU_ABI_VERSION: u32 = 21;
 
 #[repr(C)]
 pub struct ReimsVgpuQemuCreateInfo {
@@ -1021,6 +1024,36 @@ mod tests {
         assert_eq!(std::mem::offset_of!(GuestRamRegion, gpa_base), 0);
         assert_eq!(std::mem::offset_of!(GuestRamRegion, host_va), 8);
         assert_eq!(std::mem::offset_of!(GuestRamRegion, len), 16);
+    }
+
+    /// `harvests_settled` is the last member of `ReimsVgpuHostOps` on both sides.
+    ///
+    /// Nothing else compares the two declarations field by field, and a
+    /// callback slot that sits one pointer off on one side is called with the
+    /// wrong function. The new field is where a v21 table can disagree with a
+    /// v20 one, so that is what this pins: last in the header's struct, and
+    /// last in the Rust one.
+    #[test]
+    fn the_abi_header_agrees_that_harvests_settled_closes_the_host_ops_table() {
+        const HEADER: &str = include_str!("../../include/reims_vgpu_qemu_abi.h");
+        let body = HEADER
+            .split_once("typedef struct ReimsVgpuHostOps {")
+            .expect("the header must declare ReimsVgpuHostOps")
+            .1
+            .split_once("} ReimsVgpuHostOps;")
+            .expect("the declaration must be closed")
+            .0;
+        let last = body
+            .lines()
+            .map(str::trim)
+            .rfind(|l| !l.is_empty() && !l.starts_with("/*") && !l.starts_with('*'))
+            .expect("the table has members");
+        assert_eq!(last, "int (*harvests_settled)(void *ctx);");
+        assert_eq!(
+            std::mem::offset_of!(ReimsVgpuHostOps, harvests_settled),
+            std::mem::size_of::<ReimsVgpuHostOps>() - std::mem::size_of::<usize>(),
+            "and it is the last pointer of the Rust table"
+        );
     }
 
     #[test]

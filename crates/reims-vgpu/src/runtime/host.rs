@@ -469,6 +469,25 @@ pub trait HostOps {
         false
     }
 
+    /// Whether every dirty-log harvest a guest register write has asked for has
+    /// finished, so [`HostOps::guest_write_gen`] and
+    /// [`HostOps::guest_written_pages`] cover every guest store ordered before
+    /// the doorbells seen so far.
+    ///
+    /// A shim may harvest off the vCPU, so that a doorbell does not hold the
+    /// guest in the MMIO exit for the whole accelerator sync. The drain then asks
+    /// this before it serves work a doorbell handed over. `false` means that work
+    /// waits for a later wakeup, and the shim owes one: it calls
+    /// [`HostOps::schedule_bh`] once the harvests outstanding at the call have
+    /// finished, because the write that asked for them need not have been a
+    /// doorbell. Never blocks.
+    ///
+    /// Default `true`: a host that harvests inline, or has no witness at all, is
+    /// always settled.
+    fn harvests_settled(&self) -> bool {
+        true
+    }
+
     /// Current packed-alias levels and cumulative lifetime totals. `None`
     /// means this host does not construct or cannot report such aliases.
     fn page_alias_census(&self) -> Option<PageAliasCensus> {
@@ -755,6 +774,17 @@ pub struct FakeHost {
     /// hundred existing tests are asserting about; a rail that latches a
     /// baseline should turn it on and prove it recovers.
     pub guest_write_startup_window: bool,
+    /// Scripted answers for [`HostOps::harvests_settled`], one per call; once
+    /// they run out the fixture is settled, which is an inline-harvest host
+    /// and every existing test's assumption.
+    pub harvests_settled_answers: std::cell::RefCell<std::collections::VecDeque<bool>>,
+    /// A doorbell word and bits that an unsettled answer rings before it is
+    /// returned: a guest ring whose harvest was asked for and has not finished,
+    /// which is the one moment a shim answers `false`. Lets a test put a ring
+    /// inside a drain pass, where the refill loop meets it.
+    pub ring_when_unsettled: Option<(std::sync::Arc<std::sync::atomic::AtomicU32>, u32)>,
+    /// How many times [`HostOps::harvests_settled`] was asked.
+    pub harvests_settled_calls: std::cell::Cell<u64>,
 }
 
 #[cfg(test)]
@@ -1382,6 +1412,22 @@ impl HostOps for FakeHost {
 
     fn map_pages_stable(&self) -> bool {
         self.stable_map_pages
+    }
+
+    fn harvests_settled(&self) -> bool {
+        self.harvests_settled_calls
+            .set(self.harvests_settled_calls.get() + 1);
+        let settled = self
+            .harvests_settled_answers
+            .borrow_mut()
+            .pop_front()
+            .unwrap_or(true);
+        if !settled {
+            if let Some((word, bits)) = &self.ring_when_unsettled {
+                word.fetch_or(*bits, std::sync::atomic::Ordering::AcqRel);
+            }
+        }
+        settled
     }
 
     fn track_guest_writes(&mut self, gpas: &[u64], page_size: usize) -> Option<u64> {
