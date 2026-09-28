@@ -1007,6 +1007,62 @@ fn present_holds_for_translation_deferred_on_other_channel() {
     assert!(state.present.frame_flush_seen);
 }
 
+/// A DisplaySwap is what makes a surface a framebuffer, and once the guest has
+/// shown it copies between its framebuffers with the CPU, the swap is where the
+/// presented frame is paid — the buffer it presents, and no other.
+///
+/// The debts are armed at a generation the entries do not hold, so a payment
+/// takes `pay`'s void arm and needs no engine: the observable is that the
+/// ledger was asked.
+#[test]
+fn display_swap_marks_its_surface_presented_and_pays_it_once_the_guest_copies_framebuffers() {
+    use crate::runtime::writeback_debt::test_resident_identity;
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut host = FakeHost::new();
+    for mid in [2u32, 3] {
+        assert!(state.map_surface(mid));
+        assert_eq!(
+            state.pending_writebacks.arm(
+                mid,
+                test_resident_identity(mid, 64, 64, 1),
+                64,
+                64,
+                u32::MAX
+            ),
+            None
+        );
+    }
+
+    assert_eq!(
+        present_named_mapping(&mut state, &mut host, 5, 2),
+        ChildPacketDisposition::Complete
+    );
+    assert!(state.mappings[&2].scanout_presented);
+    assert!(
+        !state.mappings[&3].scanout_presented,
+        "only the surface the transaction names is presented"
+    );
+    assert!(
+        state.pending_writebacks.get(2).is_some(),
+        "until the guest copies between framebuffers, the swap leaves the lazy rail alone"
+    );
+
+    state.guest_copies_framebuffers = true;
+    assert_eq!(
+        present_named_mapping(&mut state, &mut host, 5, 3),
+        ChildPacketDisposition::Complete
+    );
+    assert!(
+        state.pending_writebacks.get(3).is_none(),
+        "the presented framebuffer's frame is owed to the pages the guest copies from next"
+    );
+    assert!(
+        state.pending_writebacks.get(2).is_some(),
+        "the swap pays the buffer it presents and no other"
+    );
+}
+
 /// The currently executing display channel cannot be an overtaken sibling
 /// and is excluded from the proxy mask.
 #[test]

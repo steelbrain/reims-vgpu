@@ -1481,6 +1481,15 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                     note_mapper_ref_texture_sample_rung("t11rung_resident_refused", guest_write);
                     match guest_owned {
                         Some(ranges) => {
+                            // Named pages inside the window are the evidence the
+                            // latch asks for; it decides whether this surface is
+                            // a presented framebuffer.
+                            crate::runtime::writeback_debt::note_guest_framebuffer_write(
+                                state,
+                                mid,
+                                crate::runtime::writeback_debt::FramebufferWriteWitness::SampledBind,
+                                |_| true,
+                            );
                             // The merge is what makes falling through sound: it
                             // puts the resident's half into every page the guest
                             // did not write, so the rungs below read a surface
@@ -8423,6 +8432,8 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                         crate::runtime::drain::note_store_route(
                             "mapper_ref_texture_seed_guest_wrote",
                         );
+                        let mapping_id = req.colors.first().map(|c| c.mapping_id).unwrap_or(0);
+                        note_load_seed_guest_write(state, &*host, mapping_id, w, h);
                     }
                 }
             }
@@ -10154,6 +10165,35 @@ pub(super) fn mapper_ref_texture_guest_wrote_since_store<M: HostOps>(
             true
         }
     }
+}
+
+/// The attachment-LOAD witness for
+/// [`crate::runtime::writeback_debt::note_guest_framebuffer_write`]: this pass
+/// re-seeds a copied resident's surface from the guest's pages because
+/// [`mapper_ref_texture_guest_wrote_since_store`] refused it.
+///
+/// That gate is deliberately coarse — it refuses on a write anywhere in the
+/// allocation and on every answer that is not about the guest — so the write is
+/// narrowed to the attachment's pixels here, and only when the latch can still
+/// move.
+fn note_load_seed_guest_write<M: HostOps>(
+    state: &mut DeviceState,
+    host: &M,
+    mapping_id: u32,
+    width: u32,
+    height: u32,
+) {
+    crate::runtime::writeback_debt::note_guest_framebuffer_write(
+        state,
+        mapping_id,
+        crate::runtime::writeback_debt::FramebufferWriteWitness::AttachmentLoad,
+        |s| {
+            matches!(
+                surface_currency(s, host, mapping_id, width, height),
+                SurfaceCurrency::WrotePixels(_)
+            )
+        },
+    );
 }
 
 /// Put both halves of a surface the guest wrote under a live resident into the
@@ -12344,6 +12384,75 @@ mod vulkan_split_tests {
             .expect("the native row pitch describes this image");
         assert_eq!(seed.source.total_len, span);
         assert_eq!(seed.source.row_length_texels, row_length_texels);
+    }
+
+    /// The attachment LOAD latches the framebuffer copy only on a guest write
+    /// inside a presented surface's pixels.
+    ///
+    /// The LOAD gate it rides on refuses on far more than that — no stamp, an
+    /// unreadable token, a write anywhere in the allocation — and a latch that
+    /// took the gate's word would pay every presented surface at every swap for
+    /// the rest of the boot.
+    #[test]
+    fn a_load_seed_latches_the_framebuffer_copy_only_on_a_presented_surfaces_pixels() {
+        use crate::protocol::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+        use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+        use crate::runtime::host::HostOps;
+
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let mut host = FakeHost::new();
+        let mid = 917u32;
+        let pfn = 0x2bu32;
+        let gpa = (pfn as u64) << PAGE_SHIFT_X86;
+        host.map_range(gpa, 0x4000, 0);
+        state.map_surface(mid);
+        {
+            let m = state.mappings.get_mut(&mid).expect("mapped above");
+            m.mapped = true;
+            m.mapping_internal = 1;
+            m.page_entries = vec![(pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
+            m.scanout_presented = true;
+        }
+        let (w, h) = (4u32, 2u32);
+        assert!(state.set_mapping_geom(mid, w, h, MTL_FORMAT_BGRA8_UNORM));
+
+        // Never stamped: the gate refuses, and that says nothing about the guest.
+        note_load_seed_guest_write(&mut state, &host, mid, w, h);
+        assert!(
+            !state.guest_copies_framebuffers,
+            "an unstamped surface is not evidence of a guest write"
+        );
+
+        let token = crate::runtime::mapper::ensure_guest_write_token(&mut state, &mut host, mid)
+            .expect("FakeHost observes guest writes");
+        state
+            .mappings
+            .get_mut(&mid)
+            .expect("mapped above")
+            .guest_write_gen_at_store = host.guest_write_gen(token).expect("a live token has one");
+        host.guest_wrote_page(gpa);
+
+        state
+            .mappings
+            .get_mut(&mid)
+            .expect("mapped above")
+            .scanout_presented = false;
+        note_load_seed_guest_write(&mut state, &host, mid, w, h);
+        assert!(
+            !state.guest_copies_framebuffers,
+            "a surface no DisplaySwap presented is not one of WindowServer's framebuffers"
+        );
+
+        state
+            .mappings
+            .get_mut(&mid)
+            .expect("mapped above")
+            .scanout_presented = true;
+        note_load_seed_guest_write(&mut state, &host, mid, w, h);
+        assert!(
+            state.guest_copies_framebuffers,
+            "a guest write inside a presented framebuffer's pixels is the copy"
+        );
     }
 
     #[test]

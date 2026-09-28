@@ -4748,6 +4748,13 @@ fn present_named_mapping<H: HostMemory + HostOps>(
     state.present.present_mapping = mapping;
     state.present.host_mapping = mapping;
     state.present.valid = true;
+    if let Some(m) = state.mappings.get_mut(&mapping) {
+        m.scanout_presented = true;
+    }
+    // A presented framebuffer is what WindowServer copies from with the CPU,
+    // unannounced, to fill the next back buffer. Its frame has to be in its
+    // pages before anything after this swap can reach the guest.
+    crate::runtime::writeback_debt::pay_cpu_shared_mapping(state, host, mapping);
     // x86: present surface_id → backing object-list slot (heap index =
     // IOSurface getSurfaceID). Arm: MappingInternal page-table resolve.
     // Always attempt backing when pages empty; then iosfc/mapper path.

@@ -2084,6 +2084,15 @@ pub struct MappingEntry {
     /// never compares equal to a live generation (the host's first readable
     /// generation is 1).
     pub guest_write_gen_at_store: u64,
+    /// A DisplaySwap has presented this surface since it was last unmapped.
+    ///
+    /// Presentation is what makes a surface one of WindowServer's framebuffers,
+    /// and those are the surfaces it copies between with the CPU — see
+    /// [`DeviceState::guest_copies_framebuffers`]. "The guest CPU wrote it" is
+    /// not the same set: Safari's content tiles are CPU-written too and never
+    /// presented, and writing every CPU-written surface back eagerly was
+    /// measured to cost what turning the lazy writeback off everywhere does.
+    pub scanout_presented: bool,
     /// Task id that last owned this surface as a backing `OBJECT_TYPE_BACKING`
     /// object (0 = no non-trivial hint; task 0 is always probed first anyway).
     /// `resolve_backing_ex` probes this task right after task 0 so a
@@ -3461,6 +3470,22 @@ pub struct DeviceState {
     /// answer to the one question its page-set guard cannot ask: was the guest
     /// told this render was done before we wrote its bytes?
     pub completion_stamp_seq: u64,
+    /// The guest CPU has written a presented framebuffer's pixels under a live
+    /// resident: its compositor fills each new back buffer by copying from the
+    /// front one with the CPU, without naming either in
+    /// `CmdSynchronizeResources`.
+    ///
+    /// On the device this protocol was written for, the GPU renders into guest
+    /// memory directly, so there is nothing to synchronize. Under the lazy
+    /// writeback the front buffer's frame is still in a host resident, and the
+    /// copy lands whole pages of an older frame. From the moment this is set,
+    /// every presented framebuffer's owed frame is paid when a DisplaySwap
+    /// presents it ([`crate::runtime::writeback_debt::pay_cpu_shared_mapping`]).
+    ///
+    /// One flag for the device rather than one per mapping, because the buffers
+    /// trade roles: latching them one by one left the ones not yet caught stale
+    /// as copy sources.
+    pub guest_copies_framebuffers: bool,
     /// Census only: what this device has stamped, split by whether the value is
     /// still owed by the coalescing rail or already handed to publication.
     ///
@@ -3596,6 +3621,7 @@ impl DeviceState {
             retired_linear_residents: Vec::new(),
             pending_writebacks: crate::runtime::writeback_debt::PendingWritebacks::default(),
             completion_stamp_seq: 0,
+            guest_copies_framebuffers: false,
             stamp_ledger: Default::default(),
             gva_resident_backing: std::collections::BTreeMap::new(),
             guest_linear_memo: LruBytesMemo::new(GUEST_LINEAR_MEMO_BYTE_CAP),
@@ -5463,6 +5489,8 @@ impl DeviceState {
         self.forget_compositor_mapping(mapping_id);
         if let Some(e) = self.mappings.get_mut(&mapping_id) {
             e.mapped = false;
+            // The surface is gone; a recycled id has presented nothing yet.
+            e.scanout_presented = false;
             e.page_entries.clear();
             e.page_table_kva = 0;
             e.condemned_entries = None;

@@ -37,6 +37,12 @@
 //! aliasing reader uses [`pay_all`]. Completion stamps alone do not publish
 //! resources.
 //!
+//! One reader names nothing: WindowServer fills each new back buffer by copying
+//! from the front one with the CPU, because on Apple's device the GPU renders
+//! into guest memory and there is nothing to synchronize. Once the guest has
+//! shown it does that ([`note_guest_framebuffer_write`]), a DisplaySwap pays
+//! the framebuffer it presents ([`pay_cpu_shared_mapping`]).
+//!
 //! The engine's `gpu_only_content` flag keeps an unpaid image alive. A
 //! successful payment calls `note_resident_content_copied_out`; replacement,
 //! invalidation, task retirement, and generation movement release the same
@@ -733,6 +739,94 @@ pub fn pay_for_mapping<M: HostMemory + HostOps>(
         return;
     };
     pay(state, host, mapping_id, debt, "wbdebt_paid_named");
+}
+
+/// Which draw-side reader saw the guest CPU write a presented framebuffer.
+///
+/// Carried onto the one line [`note_guest_framebuffer_write`] emits, so a boot
+/// can say which witness caught the compositor's copy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FramebufferWriteWitness {
+    /// A sampled bind refused a ready resident because the guest had written
+    /// pages inside the sampled window.
+    SampledBind,
+    /// An attachment LOAD re-seeded from the guest's pages because the guest
+    /// had written inside the attachment's pixels since the Store.
+    AttachmentLoad,
+}
+
+/// The guest CPU wrote `mapping_id`'s pixels while a device resident held newer
+/// content for it: latch [`DeviceState::guest_copies_framebuffers`] when that
+/// surface is a presented framebuffer.
+///
+/// The caller has established the resident. `wrote_pixels` is the evidence that
+/// the write landed inside the pixel window and not merely in the allocation —
+/// the coarse witness also moves for a header or a sibling plane, and
+/// WindowServer's scanouts carry such writes (see
+/// [`crate::runtime::surface_currency`]). It is asked only while its answer can
+/// still move the latch, because a caller may have to walk a page list for it.
+///
+/// A surface no DisplaySwap has presented never latches: see
+/// [`crate::model::MappingEntry::scanout_presented`] for why "the guest wrote
+/// it" is the wrong set.
+pub fn note_guest_framebuffer_write(
+    state: &mut DeviceState,
+    mapping_id: u32,
+    witness: FramebufferWriteWitness,
+    wrote_pixels: impl FnOnce(&DeviceState) -> bool,
+) {
+    if state.guest_copies_framebuffers {
+        return;
+    }
+    let Some((width, height)) = state
+        .mappings
+        .get(&mapping_id)
+        .filter(|m| m.scanout_presented)
+        .map(|m| (m.width, m.height))
+    else {
+        return;
+    };
+    if !wrote_pixels(state) {
+        return;
+    }
+    state.guest_copies_framebuffers = true;
+    crate::observe::off(format!(
+        "guest_copies_framebuffers mid={mapping_id} {width}x{height} witness={witness:?} \
+         (the guest CPU wrote a presented framebuffer under a live resident; presented \
+         framebuffers are paid at DisplaySwap from here on)"
+    ));
+}
+
+/// Pay the frame owed to the framebuffer a DisplaySwap has just presented, once
+/// [`DeviceState::guest_copies_framebuffers`] says the guest copies between its
+/// framebuffers with the CPU.
+///
+/// The presented buffer is the one WindowServer copies from next, and no
+/// synchronize names it first, so nothing else pays it before the copy. Paid at
+/// the swap rather than at each Store, so the passes that composite one frame
+/// replace one another in the ledger first and a frame costs one writeback.
+/// Paying every such debt at every completion stamp instead was measured at
+/// about 88 payments a second, against 29-35 here on the same boot script.
+///
+/// Free until the latch is set: one emptiness check and one flag.
+pub fn pay_cpu_shared_mapping<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    mapping_id: u32,
+) {
+    if state.pending_writebacks.is_empty()
+        || !state.guest_copies_framebuffers
+        || !state
+            .mappings
+            .get(&mapping_id)
+            .is_some_and(|m| m.scanout_presented)
+    {
+        return;
+    }
+    let Some(debt) = state.pending_writebacks.take(mapping_id) else {
+        return;
+    };
+    pay(state, host, mapping_id, debt, "wbdebt_paid_cpu_shared");
 }
 
 /// Pay every owed frame.
@@ -2595,5 +2689,102 @@ mod tests {
         submit_for_resources(&mut state, &mut host, 1, &[7]);
         assert!(state.pending_writebacks.get(7).is_none());
         assert!(state.pending_writebacks.get(8).is_some());
+    }
+
+    /// A DisplaySwap pays the frame it presents only once the guest has shown it
+    /// copies between its framebuffers, and only for a presented surface.
+    ///
+    /// Each flag is asked alone and must leave the frame owed: without the latch
+    /// this is the eager Store for every presented surface, and without the
+    /// presentation it pays a surface WindowServer never copies from. The
+    /// observable is that the ledger was asked. The debt is armed at a
+    /// generation the entry does not hold, so the payment takes `pay`'s void arm
+    /// and needs no engine.
+    #[test]
+    fn a_swap_pays_a_presented_framebuffer_only_once_the_guest_copies_between_them() {
+        let mut state = DeviceState::new(crate::model::DeviceId::default(), 12);
+        let mut host = crate::runtime::FakeHost::new();
+        state.mappings.entry(7).or_default().mapped = true;
+        assert_eq!(
+            state
+                .pending_writebacks
+                .arm(7, ident(7, 64, 64, 1), 64, 64, u32::MAX),
+            None
+        );
+
+        pay_cpu_shared_mapping(&mut state, &mut host, 7);
+        assert!(state.pending_writebacks.get(7).is_some(), "neither flag");
+
+        state.guest_copies_framebuffers = true;
+        pay_cpu_shared_mapping(&mut state, &mut host, 7);
+        assert!(
+            state.pending_writebacks.get(7).is_some(),
+            "a surface no DisplaySwap presented is not a framebuffer"
+        );
+
+        state.guest_copies_framebuffers = false;
+        state
+            .mappings
+            .get_mut(&7)
+            .expect("created above")
+            .scanout_presented = true;
+        pay_cpu_shared_mapping(&mut state, &mut host, 7);
+        assert!(
+            state.pending_writebacks.get(7).is_some(),
+            "until the guest copies between framebuffers, a presented one keeps the lazy rail"
+        );
+
+        state.guest_copies_framebuffers = true;
+        pay_cpu_shared_mapping(&mut state, &mut host, 7);
+        assert!(
+            state.pending_writebacks.get(7).is_none(),
+            "both hold: the presented frame is owed to the pages the guest copies from"
+        );
+    }
+
+    /// Only a write into a presented surface's pixels latches the device, and a
+    /// recycled id does not inherit its predecessor's presentation.
+    #[test]
+    fn only_a_write_into_a_presented_framebuffer_latches_the_copy() {
+        use FramebufferWriteWitness::SampledBind;
+        let mut state = DeviceState::new(crate::model::DeviceId::default(), 12);
+        assert!(state.map_surface(5));
+
+        note_guest_framebuffer_write(&mut state, 5, SampledBind, |_| true);
+        assert!(
+            !state.guest_copies_framebuffers,
+            "Safari's tiles are CPU-written too, and never presented"
+        );
+
+        state
+            .mappings
+            .get_mut(&5)
+            .expect("mapped above")
+            .scanout_presented = true;
+        note_guest_framebuffer_write(&mut state, 5, SampledBind, |_| false);
+        assert!(
+            !state.guest_copies_framebuffers,
+            "a write outside the pixel window is not the compositor's copy"
+        );
+
+        assert!(state.unmap_surface(5));
+        note_guest_framebuffer_write(&mut state, 5, SampledBind, |_| true);
+        assert!(
+            !state.guest_copies_framebuffers,
+            "a recycled id has presented nothing yet"
+        );
+
+        state
+            .mappings
+            .get_mut(&5)
+            .expect("the entry outlives the unmap")
+            .scanout_presented = true;
+        note_guest_framebuffer_write(&mut state, 5, SampledBind, |_| true);
+        assert!(state.guest_copies_framebuffers);
+
+        // Latched: nothing may pay for evidence that can no longer move it.
+        note_guest_framebuffer_write(&mut state, 5, SampledBind, |_| {
+            unreachable!("the latch is set; the evidence must not be asked for")
+        });
     }
 }
