@@ -642,6 +642,42 @@ pub fn write_bgra8_uncached<M: HostMemory + HostOps>(
     )
 }
 
+/// [`write_bgra8_uncached`], leaving `skip` untouched: the borrowed-frame
+/// writer for a caller that must also preserve the guest's own stores.
+///
+/// The resident merge in the sampled ladder is that caller. It reads a resident
+/// back through `engine::LeasedFrame` and lands it around the pages the guest
+/// wrote, so it holds a borrow of a staging buffer (no frame of its own for the
+/// cache to share) and a skip list (which the whole-frame writers do not take).
+/// The cache entry is dropped for the reason [`write_bgra8_uncached`] gives,
+/// and the pages this write lands are what a later reader falls through to.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the geometry the frame is in, plus the ranges its owner may not overwrite"
+)]
+pub fn write_bgra8_skipping_uncached<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    mapping_id: u32,
+    src: &[u8],
+    src_stride: u32,
+    width: u32,
+    height: u32,
+    skip: SkipRanges<'_>,
+) -> bool {
+    write_bgra8_inner(
+        state,
+        host,
+        mapping_id,
+        src,
+        CacheOutcome::Invalidate,
+        src_stride,
+        width,
+        height,
+        skip,
+    )
+}
+
 /// The plane of `m` that [`vulkan::write_bgra8_from_resident_gpu`] would write a frame
 /// of this extent into, as `(surface_offset, row_stride, pixel_format)`.
 ///

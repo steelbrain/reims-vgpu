@@ -10191,6 +10191,47 @@ fn merge_guest_writes_into_pages<M: HostMemory + HostOps>(
     identity: &crate::backend::vulkan::engine::TargetIdentity,
     guest_owned: &[(u64, u64)],
 ) -> bool {
+    let stride = width.saturating_mul(RGBA8_BPP);
+    // Consume the readback in place when the pool can lend it, as the deferred
+    // render flush does. The copying form below allocates a whole-frame `Vec`,
+    // fills it from the staging buffer, then publishes a second whole-frame
+    // copy to the surface cache — on a Windows/WHPX Safari animation that ran
+    // ~47 merges a second, and the fresh allocation's first-touch faults made
+    // its `memmove` the drain worker's largest single cost. The lease makes it
+    // one pass from the staging buffer into the guest's pages.
+    //
+    // Any `None` or refusal (uncached readback memory, a resident not in
+    // scanout order or too wide to lend) takes the copying form, unchanged.
+    match crate::backend::vulkan::engine::read_target_leased(identity) {
+        Ok(Some(leased)) if leased.bgra => {
+            let ok = mapping_write::write_bgra8_skipping_uncached(
+                state,
+                host,
+                mapping_id,
+                leased.bytes(),
+                stride,
+                width,
+                height,
+                guest_owned,
+            );
+            let bytes = leased.bytes().len();
+            // Ended before anything below can reach the engine: a lease holder
+            // may not take the engine lock (see `engine::LeasedFrame`).
+            drop(leased);
+            if !ok {
+                crate::observe::fail(format!(
+                    "sampled_resident_merge_fail mid={mapping_id} {width}x{height} \
+                     stage=writeback runs={} bytes={bytes} rail=leased",
+                    guest_owned.len(),
+                ));
+                return false;
+            }
+            crate::runtime::drain::note_store_route("t11sample_resident_merged_leased");
+            return true;
+        }
+        Ok(leased) => drop(leased),
+        Err(_) => {}
+    }
     let readback = match crate::backend::vulkan::engine::read_target(identity) {
         Ok(rb) => rb,
         Err(e) => {
@@ -10211,7 +10252,6 @@ fn merge_guest_writes_into_pages<M: HostMemory + HostOps>(
         ));
         return false;
     };
-    let stride = width.saturating_mul(RGBA8_BPP);
     if !mapping_write::write_bgra8_skipping(
         state,
         host,
