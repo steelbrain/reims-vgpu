@@ -5575,12 +5575,25 @@ pub fn maintain_resources(now_ms: u64) {
         ref mut owner,
         ref mut pools,
         ref counters,
+        #[cfg(feature = "host-window")]
+        ref mut window_presenter,
         ..
     } = &mut *guard;
     let Some(ctx) = owner.ctx.as_ref() else {
         return;
     };
-    let result = unsafe { pools.advance_graveyard_maintenance(ctx, counters) };
+    // Retire finished window presents first: the graveyard release below
+    // reads the in-flight count they hold, and nothing else lowers it while
+    // the window keeps presenting (see `WindowPresenter::retire_finished`).
+    #[cfg(feature = "host-window")]
+    let result = match window_presenter.as_mut() {
+        Some(presenter) => unsafe { presenter.retire_finished(ctx) },
+        None => Ok(()),
+    };
+    #[cfg(not(feature = "host-window"))]
+    let result: Result<(), DrawError> = Ok(());
+    let result =
+        result.and_then(|()| unsafe { pools.advance_graveyard_maintenance(ctx, counters) });
     if let Err(error) = result {
         if matches!(error, DrawError::DeviceLost(_)) {
             device_lost::note_device_lost_seen();

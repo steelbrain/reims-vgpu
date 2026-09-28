@@ -867,6 +867,26 @@ impl WindowPresenter {
         Ok(!self.frames[self.frame_ix].submitted)
     }
 
+    /// Release every entry whose blit has finished, for the maintenance tick.
+    ///
+    /// [`Self::retire`] otherwise runs only at the top of `begin_present`, which
+    /// then submits the next present. Under continuous presentation that left
+    /// the in-flight count non-zero at every moment another lock holder could
+    /// look, so `advance_graveyard_maintenance` never saw the window's slot
+    /// clear, and everything disposed while the window presented stayed parked —
+    /// its slab ranges carved — for as long as the window ran, and after the
+    /// last present for good. Measured on a Windows/WHPX host with the copying
+    /// path: 2600 live image sub-allocations against 146 registry residents,
+    /// 7.4 GiB carved and growing with gather volume until allocation failed.
+    ///
+    /// Polling the fences here makes the slot mean what `dispose` needs it to:
+    /// some submitted blit has not finished. It runs under the engine lock, the
+    /// same one `begin_present` submits under, so no present can be submitted
+    /// between this sweep and the graveyard release that reads it.
+    pub(crate) unsafe fn retire_finished(&mut self, ctx: &DeviceContext) -> Result<(), DrawError> {
+        unsafe { self.retire(ctx) }.map(|_next_free| ())
+    }
+
     /// Block until every submitted entry's blit has finished.
     ///
     /// Only the CPU-fallback staging path needs this, and only because that one
