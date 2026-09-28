@@ -832,6 +832,12 @@ pub(crate) fn licence_gva_plane<M: HostMemory + HostOps>(
     if !in_page.is_multiple_of(bpt) {
         return Err(GvaWritebackDecline::OffsetNotTexelAligned { in_page });
     }
+    // The GPU is about to write these pages: an operator who narrowed the
+    // import to reads sends this Store down the copying rail, the same decline
+    // a host without the import takes.
+    if let Some(refusal) = crate::runtime::guest_ram_map::write_refusal() {
+        return Err(GvaWritebackDecline::GuestRefRefused { refusal });
+    }
     let runs =
         crate::runtime::guest_ram_map::references_for_runs(host, gpas, page_size, in_page, extent)
             .map_err(|refusal| GvaWritebackDecline::GuestRefRefused { refusal })?;

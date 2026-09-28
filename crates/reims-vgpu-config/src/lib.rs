@@ -203,6 +203,83 @@ switches! {
 /// comparable across compositing regimes and only one pair matched.
 pub const GUEST_IMPORT: &str = "REIMS_VGPU_GUEST_IMPORT";
 
+/// `off` keeps the guest-RAM import for the GPU's *reads* of guest memory —
+/// gathers into device-local images and buffers, vertex and index binds — and
+/// takes every rail by which the GPU would *write* guest RAM through it onto
+/// the copying rails instead: the direct render/compute Store licences
+/// (`licence_gva_plane`, `licence_mapper_ref_texture_surface`), storage-buffer
+/// binds placed straight on the import, and shared (guest-backed) render
+/// targets.
+///
+/// # Why a narrowing exists
+///
+/// With the import on, GPU-direct writes have been seen landing in guest pages
+/// the guest had already released and reused — `AppleParavirtPageTable.cpp`
+/// assertion panics on x86 Ventura and Tahoe, over KVM and WHPX, and corrupted
+/// allocations on arm64 (upstream issues #70, #71, #100) — while the same boots
+/// with the import off run clean at roughly half the frame rate. This switch
+/// splits the two directions so the question "is it the reads or the writes"
+/// can be answered on a live guest: it keeps the reads and gives up the writes,
+/// whose fallbacks are the same CPU rails an import-off host runs.
+///
+/// It answered it: narrowed this way, a Windows/WHPX x86 Ventura guest that
+/// dies within ~40 s of boot with the import on runs clean — so the reads are
+/// not what corrupts it. It is not a speed-up on that host (an RTX 4060, where
+/// GPU-side gathers out of host memory are PCIe copies): the CPU gathers go to
+/// zero, but the readbacks the writes now need cost more than they save, and
+/// one boot drew 13.8 present_hz on a Safari animation against 25.5 on the
+/// copying rails. See [`GUEST_IMPORT_SURFACE_WRITES`] for the narrower switch
+/// that keeps most of the writes.
+///
+/// Narrowing only, as every switch here: it cannot enable an import the host
+/// refuses, and with the import off it changes nothing.
+///
+/// # What it does not preserve
+///
+/// Render-stage storage-buffer *writes*. With the import on they reach guest
+/// RAM only through a direct bind; with this narrowing (as with the import off)
+/// such a bind is gathered into a device-local copy that nothing reads back.
+/// Compute storage buffers are unaffected: they are staged and written back by
+/// the CPU on every rail.
+pub const GUEST_IMPORT_WRITES: &str = "REIMS_VGPU_GUEST_IMPORT_WRITES";
+
+/// `off` keeps every GPU-direct write into guest RAM except one: a render or
+/// compute Store landed straight into a mapper-ref-texture surface (an
+/// IOSurface mapping) through `licence_mapper_ref_texture_surface`. That write
+/// takes the copying rail — readback, then a CPU write over a fresh walk of the
+/// guest's page table.
+///
+/// # Why this one
+///
+/// Bisected on a Windows/WHPX x86 Ventura guest with the import on, one boot
+/// per arm, each arm leaving one GPU write class on and the others on the
+/// copying rails:
+///
+/// ```text
+/// GPU-direct writes left on                         guest
+/// all                                               dies ~40 s into boot
+/// all but deferred debt payments (local experiment) dies ~40 s into boot
+/// storage-buffer direct binds + mapping licence     dies ~40 s into boot
+/// storage-buffer direct binds + GVA-plane licence   boots, drives anim/scroll
+/// storage-buffer direct binds only                  boots, drives anim/scroll
+/// ```
+///
+/// So the mapping licence is the class that kills the guest here (the
+/// `AppleParavirtPageTable` assertion family of upstream #70/#71/#100), and it
+/// does so for eager Stores too, not only for debts. Narrowing it alone keeps
+/// the import's read side and its GVA and storage-buffer writes. Whether that
+/// is faster than the copying rails is not settled on this host: one fast boot
+/// each read 30.1 against 25.5 present_hz on a Safari animation, but boots here
+/// split between two frame-rate populations, so that is not an A/B.
+///
+/// The narrowed arm then ran a soak on the same host: boot plus 380 s of
+/// continuous Safari animation, wheel scrolling, window drags and Mission
+/// Control (16 scenarios), no panic — against four boots with the mapping
+/// licence on, all dead within ~40 s. One host and one guest, so this names
+/// the class that kills this pairing; it is not proof the other classes are
+/// safe everywhere.
+pub const GUEST_IMPORT_SURFACE_WRITES: &str = "REIMS_VGPU_GUEST_IMPORT_SURFACE_WRITES";
+
 /// `off` keeps descriptor state on the allocated Vulkan 1.2 set path even when
 /// the device advertises `VK_KHR_push_descriptor` and the layout fits its
 /// reported limit.

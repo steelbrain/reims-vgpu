@@ -116,6 +116,12 @@ impl BufferGatherRole {
         self.index_alignment.is_some()
     }
 
+    /// Bound as a storage buffer, which a shader may write — the one role a
+    /// direct bind on the import can land GPU output in guest RAM through.
+    pub(super) fn includes_storage(self) -> bool {
+        self.storage
+    }
+
     pub(super) fn is_storage_only(self) -> bool {
         self.storage && !self.vertex && self.index_alignment.is_none()
     }
@@ -776,6 +782,14 @@ unsafe fn import_guest_buffer_window(
     role: BufferGatherRole,
 ) -> Option<BoundBuffer> {
     if !ctx.caps.host_pointer.is_available() {
+        return None;
+    }
+    // A storage binding placed on the import is guest RAM a shader may store
+    // to. Narrowed to reads, the source is gathered into a device-local copy
+    // instead (the next arm down), which is how an import-off host binds it.
+    if role.includes_storage()
+        && !crate::backend::vulkan::caps::host_pointer::guest_writes_allowed()
+    {
         return None;
     }
     let stretch = src.single_stretch()?;

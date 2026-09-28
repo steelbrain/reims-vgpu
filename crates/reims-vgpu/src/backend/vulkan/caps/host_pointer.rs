@@ -222,6 +222,67 @@ impl HostPointerCaps {
     }
 }
 
+/// Whether the GPU may *write* guest RAM through the import, as
+/// [`crate::config::GUEST_IMPORT_WRITES`] narrows it.
+///
+/// A second axis beside the rung rather than a rung of its own: the rung is
+/// what every read and write site asks before touching the import at all, and
+/// the narrowing keeps the reads. Each site that would land GPU output in guest
+/// pages asks this as well, and declines onto the copying rail it already
+/// falls back to when the import is unavailable — so a narrowed boot runs the
+/// read half of the import-on arm and the write half of the import-off arm,
+/// both of which are tested end to end.
+///
+/// Read once and latched: the answer must not change under a running guest,
+/// since a write rail picked on one frame and refused on the next would land
+/// one surface two ways.
+pub fn guest_writes_allowed() -> bool {
+    static ALLOWED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ALLOWED.get_or_init(
+        || match crate::config::read(crate::config::GUEST_IMPORT_WRITES) {
+            (crate::config::Switch::Off, _) => {
+                crate::observe::off(format!(
+                    "vk_guest_import_writes narrowed=1 var={} (GPU reads of guest RAM keep the \
+                 import; GPU writes take the copying rails)",
+                    crate::config::GUEST_IMPORT_WRITES
+                ));
+                false
+            }
+            (crate::config::Switch::Unrecognized, value) => {
+                crate::observe::fail(format!(
+                    "vk_guest_import_writes_env_unrecognized var={} value={:?} (expected off; GPU \
+                 writes through the import stay enabled)",
+                    crate::config::GUEST_IMPORT_WRITES,
+                    value.unwrap_or_default()
+                ));
+                true
+            }
+            (crate::config::Switch::On | crate::config::Switch::Unset, _) => true,
+        },
+    )
+}
+
+/// Whether the GPU may write an IOSurface mapping directly, as
+/// [`crate::config::GUEST_IMPORT_SURFACE_WRITES`] narrows it; implies
+/// [`guest_writes_allowed`]. Latched for the same reason.
+pub fn guest_surface_writes_allowed() -> bool {
+    static ALLOWED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    guest_writes_allowed()
+        && *ALLOWED.get_or_init(|| {
+            let narrowed = matches!(
+                crate::config::read(crate::config::GUEST_IMPORT_SURFACE_WRITES).0,
+                crate::config::Switch::Off
+            );
+            if narrowed {
+                crate::observe::off(format!(
+                    "vk_guest_import_surface_writes narrowed=1 var={} (Stores into IOSurface                      mappings take the copying rail; other GPU writes stay direct)",
+                    crate::config::GUEST_IMPORT_SURFACE_WRITES
+                ));
+            }
+            !narrowed
+        })
+}
+
 /// What [`crate::config::GUEST_IMPORT`] says about running this rail at all.
 ///
 /// `None` to go on and ask the device. `Some` short-circuits [`query`], which is

@@ -180,6 +180,12 @@ pub enum MapRefusal {
         runs: usize,
         first: u64,
     },
+    /// The GPU would write these guest pages, and the operator narrowed the
+    /// import to reads ([`crate::config::GUEST_IMPORT_WRITES`]). Expected, like
+    /// [`Self::NoBackendImport`]: the write takes the copying rail an
+    /// import-off host always takes. Only the write sites produce it — see
+    /// [`write_refusal`].
+    WritesNarrowed,
 }
 
 impl crate::observe::Decline for MapRefusal {
@@ -191,6 +197,7 @@ impl crate::observe::Decline for MapRefusal {
             Self::ImportExceedsHeap { .. } => "guest_ram_map_import_exceeds_heap",
             Self::GpaNotInAnyImport { .. } => "guest_ram_map_gpa_not_in_any_import",
             Self::Scattered { .. } => "guest_ram_map_scattered",
+            Self::WritesNarrowed => "guest_ram_map_writes_narrowed",
             // The inner reason is the diagnosis; this wrapper only says where
             // it happened, so it forwards rather than adding a slug of its own.
             Self::OutsideImport(inner) => inner.slug(),
@@ -199,7 +206,7 @@ impl crate::observe::Decline for MapRefusal {
 
     fn fields(&self) -> Vec<(&'static str, String)> {
         match self {
-            Self::NoBackendImport => Vec::new(),
+            Self::NoBackendImport | Self::WritesNarrowed => Vec::new(),
             Self::HostRefused(inner) => {
                 let mut f = vec![("host_reason", inner.slug().to_string())];
                 f.extend(crate::observe::Decline::fields(inner));
@@ -427,6 +434,25 @@ fn with_map<H: HostOps + ?Sized, R>(host: &mut H, body: impl FnOnce(&Resolved) -
 /// of the four refusals and silence for the other three.
 pub fn standing_refusal<H: HostOps + ?Sized>(host: &mut H) -> Option<MapRefusal> {
     with_map(host, |resolved| resolved.refusal)
+}
+
+/// The refusal a site that would land GPU output in guest pages takes before
+/// asking for references, or `None` to go on.
+///
+/// Asked by the write licences only; reads never see it. A licence that gets
+/// `Some` declines exactly as it does for [`MapRefusal::NoBackendImport`], so
+/// the copying rail behind it is the same one an import-off host runs.
+pub fn write_refusal() -> Option<MapRefusal> {
+    (!crate::backend::vulkan::caps::host_pointer::guest_writes_allowed())
+        .then(|| report_once(MapRefusal::WritesNarrowed))
+}
+
+/// [`write_refusal`] for the one write class
+/// [`crate::config::GUEST_IMPORT_SURFACE_WRITES`] narrows: a Store landed
+/// straight into an IOSurface mapping. Asked only by that licence.
+pub fn surface_write_refusal() -> Option<MapRefusal> {
+    (!crate::backend::vulkan::caps::host_pointer::guest_surface_writes_allowed())
+        .then(|| report_once(MapRefusal::WritesNarrowed))
 }
 
 /// The whole admission rule for a packed-alias import, in one place.
@@ -839,6 +865,11 @@ fn report_once(refusal: MapRefusal) -> MapRefusal {
     match refusal {
         MapRefusal::NoBackendImport => {
             if crate::observe::first_sight("guest_ram_map_no_backend_import", 0) {
+                line.off();
+            }
+        }
+        MapRefusal::WritesNarrowed => {
+            if crate::observe::first_sight("guest_ram_map_writes_narrowed", 0) {
                 line.off();
             }
         }

@@ -3029,6 +3029,9 @@ fn guest_page_window<M: HostOps>(
                 // overflowing range. A merely scattered window is now a success
                 // with several runs, counted above.
                 MapRefusal::Scattered { .. } => "zc_buf_untileable",
+                // A read site: `references_for_runs` never produces this, only
+                // the write licences' `write_refusal` does.
+                MapRefusal::WritesNarrowed => "zc_buf_writes_narrowed",
             });
             None
         }

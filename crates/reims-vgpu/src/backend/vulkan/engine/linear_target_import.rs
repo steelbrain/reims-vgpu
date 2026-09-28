@@ -46,6 +46,10 @@ pub(super) enum WindowRefusal {
     /// discrete one has no choice about. First, because it is a policy answer
     /// and every check below it is a measurement of the host.
     DisabledByEnv,
+    /// [`crate::config::GUEST_IMPORT_WRITES`] narrowed the import to reads and
+    /// this image would be written by the GPU (an attachment, a copy or a
+    /// storage destination) with guest RAM as its storage.
+    WritesNarrowedByEnv,
     UnsupportedTopology,
     HostImportUnavailable,
     ParentAllocationMismatch,
@@ -66,6 +70,7 @@ impl WindowRefusal {
     pub(super) fn slug(self) -> &'static str {
         match self {
             Self::DisabledByEnv => "disabled_by_env",
+            Self::WritesNarrowedByEnv => "writes_narrowed_by_env",
             Self::UnsupportedTopology => "discrete_topology",
             Self::HostImportUnavailable => "no_host_import",
             Self::ParentAllocationMismatch => "parent_allocation_mismatch",
@@ -361,6 +366,16 @@ pub(super) unsafe fn create(
 
     if !shared_target_enabled() {
         return Err(WindowRefusal::DisabledByEnv);
+    }
+    // Keyed on usage so a sampled-only child — the direct sampled image, which
+    // the GPU only reads — keeps the import under the narrowing.
+    let writes = vk::ImageUsageFlags::COLOR_ATTACHMENT
+        | vk::ImageUsageFlags::TRANSFER_DST
+        | vk::ImageUsageFlags::STORAGE;
+    if usage.intersects(writes)
+        && !crate::backend::vulkan::caps::host_pointer::guest_writes_allowed()
+    {
+        return Err(WindowRefusal::WritesNarrowedByEnv);
     }
     if ctx.caps.memory.topology != MemoryTopology::Unified {
         return Err(WindowRefusal::UnsupportedTopology);
@@ -900,6 +915,7 @@ mod tests {
     fn no_two_refusals_share_a_slug() {
         let all = [
             WindowRefusal::DisabledByEnv,
+            WindowRefusal::WritesNarrowedByEnv,
             WindowRefusal::UnsupportedTopology,
             WindowRefusal::HostImportUnavailable,
             WindowRefusal::ParentAllocationMismatch,

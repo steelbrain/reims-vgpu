@@ -562,7 +562,10 @@ pub(crate) fn licence_mapper_ref_texture_surface<M: HostMemory + HostOps>(
     // refuse here — a shim that cannot say where guest RAM lives and a machine
     // whose every span failed the bound both leave a granularity published, and
     // used to walk the whole page list before finding that out.
-    if let Some(refusal) = crate::runtime::guest_ram_map::standing_refusal(host) {
+    if let Some(refusal) = crate::runtime::guest_ram_map::standing_refusal(host)
+        .or_else(crate::runtime::guest_ram_map::write_refusal)
+        .or_else(crate::runtime::guest_ram_map::surface_write_refusal)
+    {
         return Err(GpuWritebackDecline::GuestRefRefused { refusal });
     }
     // Timed on its own because it is the largest `O(pages)` step left and its

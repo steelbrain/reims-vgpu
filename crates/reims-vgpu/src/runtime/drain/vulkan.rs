@@ -57,6 +57,9 @@ fn note_stamp_guest_ref_refusal(refusal: &crate::runtime::guest_ram_map::MapRefu
         MapRefusal::GpaNotInAnyImport { .. } => "stamp_guest_ref_gpa_not_imported",
         MapRefusal::OutsideImport(_) => "stamp_guest_ref_outside_import",
         MapRefusal::Scattered { .. } => "stamp_guest_ref_scattered",
+        // The stamp is a CPU store through QEMU's own mapping, never a GPU
+        // write, so no stamp site asks `write_refusal`; the arm is for totality.
+        MapRefusal::WritesNarrowed => "stamp_guest_ref_writes_narrowed",
     };
     note_store_route(route);
 }
