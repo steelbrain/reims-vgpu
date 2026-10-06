@@ -675,13 +675,26 @@ if [ -n "${REIMS_VGPU_WINDOW:-}" ]; then
   REIMS_VGPU_DISPLAY="${REIMS_VGPU_DISPLAY:-none}"
   # winit (in the staticlib) needs a display connection to open the window, and
   # QEMU inherits these from this script's environment. When launched from a
-  # minimal/agent shell they are often unset, so fall back to this host's known
-  # session values (only when absent) and export them. XAUTHORITY carries a
-  # per-login random suffix; override any of these in the environment if yours
-  # differ (e.g. a different seat, DISPLAY, or Wayland socket).
+  # minimal/agent shell they are often unset, so default them from the sockets
+  # this host actually has and export them. XAUTHORITY carries a per-login
+  # random suffix; override any of these in the environment if yours differ
+  # (e.g. a different seat, DISPLAY, or Wayland socket).
   : "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"
-  : "${WAYLAND_DISPLAY:=wayland-0}"
-  : "${DISPLAY:=:0}"
+  # winit picks Wayland whenever WAYLAND_DISPLAY is non-empty and never falls
+  # back to X11, so a default naming an absent socket kills the window on an
+  # X11-only host. Default each display only when its socket exists.
+  if [ -z "${WAYLAND_DISPLAY:-}" ]; then
+    if [ -S "$XDG_RUNTIME_DIR/wayland-0" ]; then WAYLAND_DISPLAY=wayland-0; fi
+  else
+    case "$WAYLAND_DISPLAY" in
+      /*) _wl_sock="$WAYLAND_DISPLAY" ;;
+      *)  _wl_sock="$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" ;;
+    esac
+    if [ ! -S "$_wl_sock" ]; then
+      echo "boot-x86.sh: WARNING: WAYLAND_DISPLAY=$WAYLAND_DISPLAY has no socket at $_wl_sock; winit will not fall back to X11 (unset it to use DISPLAY)" >&2
+    fi
+  fi
+  if [ -z "${DISPLAY:-}" ] && [ -S /tmp/.X11-unix/X0 ]; then DISPLAY=:0; fi
   # XAUTHORITY's suffix is a per-login random string, so it cannot be written
   # down: a hardcoded one goes stale at the next login and then points at a file
   # that does not exist. Discover the newest cookie in the runtime dir instead.
@@ -691,7 +704,9 @@ if [ -n "${REIMS_VGPU_WINDOW:-}" ]; then
       break
     done
   fi
-  export XDG_RUNTIME_DIR WAYLAND_DISPLAY DISPLAY
+  export XDG_RUNTIME_DIR
+  if [ -n "${WAYLAND_DISPLAY:-}" ]; then export WAYLAND_DISPLAY; else unset WAYLAND_DISPLAY; fi
+  if [ -n "${DISPLAY:-}" ]; then export DISPLAY; else unset DISPLAY; fi
   [ -n "${XAUTHORITY:-}" ] && export XAUTHORITY
 
   # A window with no display server still opens, still says "first frame
@@ -703,7 +718,7 @@ if [ -n "${REIMS_VGPU_WINDOW:-}" ]; then
   if command -v xdpyinfo >/dev/null 2>&1 && ! xdpyinfo >/dev/null 2>&1; then
     if [ ! -S "$XDG_RUNTIME_DIR/${WAYLAND_DISPLAY:-wayland-0}" ]; then
       echo "boot-x86.sh: WARNING — no usable display connection." >&2
-      echo "boot-x86.sh:   DISPLAY=$DISPLAY XAUTHORITY=${XAUTHORITY:-unset}" >&2
+      echo "boot-x86.sh:   DISPLAY=${DISPLAY:-unset} XAUTHORITY=${XAUTHORITY:-unset}" >&2
       echo "boot-x86.sh:   The host window will open with nothing consuming it." >&2
       echo "boot-x86.sh:   Guest-side measurements stay valid; every host-window" >&2
       echo "boot-x86.sh:   number (host_window_cadence present_hz, busy_acquire," >&2
