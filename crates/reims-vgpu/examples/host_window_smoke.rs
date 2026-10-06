@@ -75,10 +75,11 @@ fn main() {
         stop,
         wake,
     );
-    match handle.join() {
-        Ok(Ok(())) => println!("window closed"),
-        Ok(Err(e)) => eprintln!("window error: {e}"),
-        Err(_) => eprintln!("window thread panicked"),
+    match handle.map(std::thread::JoinHandle::join) {
+        Err(e) => eprintln!("window error: {e}"),
+        Ok(Ok(Ok(()))) => println!("window closed"),
+        Ok(Ok(Err(e))) => eprintln!("window error: {e}"),
+        Ok(Err(_)) => eprintln!("window thread panicked"),
     }
 }
 

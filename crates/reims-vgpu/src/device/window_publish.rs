@@ -51,6 +51,9 @@ pub(super) fn window_frame_key(present: &crate::model::PresentState) -> WindowFr
 
 #[cfg(feature = "host-window")]
 pub(crate) struct WindowLink {
+    /// Device id the window was started for, so a refusal reported away from
+    /// the QEMU entry points still names its device.
+    id: u64,
     /// Shared latest-frame slot the window thread reads each redraw.
     frames: crate::host_window::present::FrameSlot,
     /// Wakes the window's event loop once a frame has landed in `frames`.
@@ -203,22 +206,30 @@ pub fn device_window_start(id: u64, width: u32, height: u32) -> bool {
             Arc::clone(&exited),
             Arc::clone(&wake),
         ) {
-            crate::observe::Emit::decline("host_window_start", &error)
-                .field("id", id)
-                .fail();
+            refuse_window_start(id, &error);
             return false;
         }
         (None, exited)
     };
+    // `spawn` returns only once the thread's event loop exists, so a display
+    // that cannot be reached is refused here and no link is installed for the
+    // drain to publish into.
     #[cfg(not(target_os = "macos"))]
-    let thread = Some(crate::host_window::present::spawn(
+    let thread = match crate::host_window::present::spawn(
         cfg,
         on_input,
         Arc::clone(&frames),
         Arc::clone(&stop),
         Arc::clone(&wake),
-    ));
+    ) {
+        Ok(thread) => Some(thread),
+        Err(error) => {
+            refuse_window_start(id, &error);
+            return false;
+        }
+    };
     *link = Some(WindowLink {
+        id,
         frames,
         wake,
         last: (u32::MAX, u32::MAX, u32::MAX, u64::MAX),
@@ -243,6 +254,29 @@ pub fn device_window_start(id: u64, width: u32, height: u32) -> bool {
         }
     ));
     true
+}
+
+/// Refuse a host-window start on both channels. The fail log is for analysis;
+/// stderr is for the operator, who otherwise sees a boot that seems to hang at
+/// the end of the EFI serial output, with no window and no reason.
+#[cfg(feature = "host-window")]
+fn refuse_window_start(id: u64, error: &crate::host_window::present::WindowError) {
+    use crate::host_window::present::WindowError;
+    crate::observe::Emit::decline("host_window_start", error)
+        .field("id", id)
+        .fail();
+    let hint = if cfg!(all(unix, not(target_os = "macos")))
+        && matches!(error, WindowError::EventLoopBuild(_))
+    {
+        " Check WAYLAND_DISPLAY and DISPLAY: winit uses Wayland whenever \
+         WAYLAND_DISPLAY is set and does not fall back to X11."
+    } else {
+        ""
+    };
+    eprintln!(
+        "reims-vgpu-window: cannot open the host window ({error}). QEMU's own \
+         display takes over, which shows nothing under -display none.{hint}"
+    );
 }
 
 /// No-op stub when the `host-window` feature is off: the FFI symbol still links
@@ -280,6 +314,14 @@ pub fn device_window_run_main(_id: u64) -> bool {
 pub(crate) fn publish_window_frame(slot: &BoundDevice, state: &mut crate::model::DeviceState) {
     use crate::runtime::drain::{note_window_publish, WindowPublish};
     let mut guard = slot.window.lock();
+    // A window thread that returned on its own (UI close, a failed `run_app`)
+    // leaves a link nothing reads, and publishing into it would count frames no
+    // window shows. Drop it so this and every later publish is `NoWindow`.
+    if guard.as_ref().is_some_and(WindowLink::thread_exited) {
+        if let Some(mut link) = guard.take() {
+            link.join_thread();
+        }
+    }
     let Some(link) = guard.as_mut() else {
         // No window consumes the capture: revert the next capture to the full
         // readback path (a torn-down window must not leave `frame_bgra` stale
@@ -449,17 +491,32 @@ pub fn device_window_stop(id: u64) -> bool {
             return false;
         }
     }
-    if let Some(thread) = link.thread.take() {
-        // The window thread's `WindowError` return was discarded here, so a
-        // `build_event_loop`/`run_app` failure on the Linux spawn path vanished
-        // with no line. Emit the typed decline instead. (macOS never takes this
-        // branch — its window runs on the process main thread, so `thread` is
-        // None; the join runs only on the Linux `spawn` path.)
+    link.join_thread();
+    true
+}
+
+#[cfg(feature = "host-window")]
+impl WindowLink {
+    /// True once the Linux window thread has returned. Always false on macOS,
+    /// whose window runs on the process main thread and leaves `thread` None.
+    fn thread_exited(&self) -> bool {
+        self.thread
+            .as_ref()
+            .is_some_and(std::thread::JoinHandle::is_finished)
+    }
+
+    /// Join the window thread and decline the `WindowError` it returned, if
+    /// any. Discarding that return is what once let a `run_app` failure on the
+    /// Linux spawn path vanish with no line. No-op on macOS (`thread` is None).
+    fn join_thread(&mut self) {
+        let Some(thread) = self.thread.take() else {
+            return;
+        };
         match thread.join() {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
                 crate::observe::Emit::decline("host_window_run", &error)
-                    .field("id", id)
+                    .field("id", self.id)
                     .fail();
             }
             // A panic in the window thread; the default panic hook already wrote
@@ -467,7 +524,6 @@ pub fn device_window_stop(id: u64) -> bool {
             Err(_) => {}
         }
     }
-    true
 }
 
 #[cfg(not(feature = "host-window"))]

@@ -584,19 +584,55 @@ impl std::fmt::Display for WindowError {
 
 impl std::error::Error for WindowError {}
 
-/// Spawn the window on a dedicated thread and return its join handle. The thread
-/// owns the winit event loop for its lifetime; it exits when the window closes.
+/// Spawn the window on a dedicated thread and return its join handle once the
+/// thread's event loop exists. The thread owns the winit event loop for its
+/// lifetime; it exits when the window closes.
+///
+/// A loop that cannot be built is this call's error rather than the thread's.
+/// winit picks Wayland whenever `WAYLAND_DISPLAY` is non-empty and does not
+/// retry X11, so a variable naming an absent socket fails here. Handing back a
+/// handle anyway is what let the device publish, and count, frames into a
+/// window that never existed until teardown joined the thread.
 pub fn spawn(
     config: WindowConfig,
     on_input: InputSink,
     frames: FrameSlot,
     stop: StopFlag,
     wake: WindowWakeHandle,
-) -> std::thread::JoinHandle<Result<(), WindowError>> {
-    std::thread::Builder::new()
+) -> Result<std::thread::JoinHandle<Result<(), WindowError>>, WindowError> {
+    spawn_built(build_event_loop, move |event_loop| {
+        run_event_loop(event_loop, config, on_input, frames, stop, wake)
+    })
+}
+
+/// The handshake behind [`spawn`], over any loop type: `build` runs on the new
+/// thread, and its outcome is known before this returns; `run` takes the built
+/// loop on that same thread. Generic so the handshake is testable without a
+/// display server.
+fn spawn_built<L>(
+    build: impl FnOnce() -> Result<L, WindowError> + Send + 'static,
+    run: impl FnOnce(L) -> Result<(), WindowError> + Send + 'static,
+) -> Result<std::thread::JoinHandle<Result<(), WindowError>>, WindowError> {
+    let (built_tx, built_rx) = std::sync::mpsc::sync_channel(1);
+    let thread = std::thread::Builder::new()
         .name("reims-vgpu-window".to_string())
-        .spawn(move || run(config, on_input, frames, stop, wake))
-        .expect("spawn reims-vgpu-window thread")
+        .spawn(move || {
+            let event_loop = build();
+            let _ = built_tx.send(event_loop.is_ok());
+            run(event_loop?)
+        })
+        .expect("spawn reims-vgpu-window thread");
+    if built_rx.recv() == Ok(true) {
+        return Ok(thread);
+    }
+    // The loop was not built, so the thread has returned or is returning: its
+    // error, or a panic inside `build` that the default hook already printed.
+    match thread.join() {
+        Ok(Err(error)) => Err(error),
+        Ok(Ok(())) | Err(_) => Err(WindowError::EventLoopBuild(
+            "window thread exited before its event loop was built".to_string(),
+        )),
+    }
 }
 
 /// Run the window event loop on the calling thread (blocks until the window
@@ -609,7 +645,17 @@ pub fn run(
     stop: StopFlag,
     wake: WindowWakeHandle,
 ) -> Result<(), WindowError> {
-    let event_loop = build_event_loop()?;
+    run_event_loop(build_event_loop()?, config, on_input, frames, stop, wake)
+}
+
+fn run_event_loop(
+    event_loop: EventLoop<FramePublished>,
+    config: WindowConfig,
+    on_input: InputSink,
+    frames: FrameSlot,
+    stop: StopFlag,
+    wake: WindowWakeHandle,
+) -> Result<(), WindowError> {
     wake.arm(event_loop.create_proxy());
     let mut app = App::new(config, on_input, frames, stop);
     event_loop
@@ -1588,6 +1634,67 @@ mod loop_census_tests {
             census.draws,
             census.draws_fresh + census.draws_stale + census.draws_held
         );
+    }
+}
+
+#[cfg(test)]
+mod spawn_tests {
+    use super::*;
+
+    /// A loop that cannot be built is the caller's answer, with the thread's
+    /// own error, and nothing runs. Returning a handle here is the shape of
+    /// the X11-only boot whose census reported 68 published frames a second
+    /// into a window that never opened.
+    #[test]
+    fn a_loop_that_cannot_be_built_refuses_the_spawn() {
+        let ran = Arc::new(AtomicBool::new(false));
+        let ran_in_thread = Arc::clone(&ran);
+        let result = spawn_built(
+            || Err::<(), _>(WindowError::EventLoopBuild("NoCompositor".to_string())),
+            move |()| {
+                ran_in_thread.store(true, Ordering::Relaxed);
+                Ok(())
+            },
+        );
+        match result {
+            Err(WindowError::EventLoopBuild(detail)) => assert_eq!(detail, "NoCompositor"),
+            Err(other) => panic!("wrong refusal: {other}"),
+            Ok(_) => panic!("a loop that was never built produced a window thread"),
+        }
+        assert!(
+            !ran.load(Ordering::Relaxed),
+            "run must not see an unbuilt loop"
+        );
+    }
+
+    /// A built loop is handed to `run` on the spawned thread, and that thread's
+    /// result is what the join reports.
+    #[test]
+    fn a_built_loop_runs_on_the_window_thread() {
+        let result = spawn_built(
+            || Ok(7u32),
+            |built| {
+                assert_eq!(built, 7);
+                assert_eq!(std::thread::current().name(), Some("reims-vgpu-window"));
+                Err(WindowError::RunApp("closed".to_string()))
+            },
+        );
+        let thread = result.expect("a built loop spawns");
+        match thread.join() {
+            Ok(Err(WindowError::RunApp(detail))) => assert_eq!(detail, "closed"),
+            other => panic!("join did not carry run's result: {other:?}"),
+        }
+    }
+
+    /// A panic while building still refuses, rather than handing back a thread
+    /// that is already dead.
+    #[test]
+    fn a_build_that_panics_refuses_the_spawn() {
+        let result = spawn_built(
+            || -> Result<(), WindowError> { panic!("build") },
+            |()| Ok(()),
+        );
+        assert!(matches!(result, Err(WindowError::EventLoopBuild(_))));
     }
 }
 

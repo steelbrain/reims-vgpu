@@ -161,7 +161,7 @@ fn main() {
         probe_stop.store(true, Ordering::Release);
     });
 
-    let handle = spawn(
+    let handle = match spawn(
         WindowConfig {
             title: "reims_vgpu off-thread present probe".to_string(),
             width: W,
@@ -172,7 +172,14 @@ fn main() {
         frames,
         stop,
         wake,
-    );
+    ) {
+        Ok(handle) => handle,
+        Err(e) => {
+            eprintln!("probe: window error: {e}");
+            println!("off_thread_present verdict=refused");
+            std::process::exit(1);
+        }
+    };
 
     let _ = probe.join();
     match handle.join() {
