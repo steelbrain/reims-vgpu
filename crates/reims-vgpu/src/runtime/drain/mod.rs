@@ -2417,6 +2417,10 @@ fn settle_model_work<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mu
     // this very drain published would wait on a doorbell instead.
     loop {
         observe_awaited_stamps(state, host);
+        // Before the pump, which would otherwise re-plan a position nothing can
+        // release; and inside the loop, because a refusal can land during a run
+        // below and the words it frees can release positions behind it.
+        let mut ran = complete_stranded(state, host);
         pump_translations(state, host);
         for ingress in state.take_ready() {
             // `false` is a position the model released and this device holds no
@@ -2424,7 +2428,6 @@ fn settle_model_work<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mu
             // here to run.
             let _ = state.parked.mark_ready(ingress);
         }
-        let mut ran = false;
         for ingress in state.parked.ready_in_order() {
             if declined_by_the_device(state, ingress) {
                 continue;
@@ -2636,7 +2639,22 @@ fn run_parked<H: HostMemory + HostOps>(
         }
         state.draining_channel = prev_channel;
     }
-    match state.complete_transaction(work.epoch(), ingress) {
+    complete_position(state, host, domain, work.epoch(), ingress);
+}
+
+/// Tell the model a position is finished and write whatever its channel
+/// published.
+///
+/// Shared by the two ways a position ends: [`run_parked`] after its work ran,
+/// and [`complete_stranded`] when its work never will.
+fn complete_position<H: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut H,
+    domain: u32,
+    epoch: reims_vgpu_core::identity::DeviceEpoch,
+    ingress: reims_vgpu_core::identity::IngressOrdinal,
+) {
+    match state.complete_transaction(epoch, ingress) {
         Ok(released) => {
             for release in released {
                 // **Counted here because the model cannot count it, and a
@@ -2672,6 +2690,53 @@ fn run_parked<H: HostMemory + HostOps>(
         // is nothing to publish and the name is the whole of what is owed.
         Err(refusal) => note_store_route(refusal.slug()),
     }
+}
+
+/// End every position a pipeline's refusal or retirement stranded, without
+/// running it. Returns whether any ended.
+///
+/// A stranded position waits on a build that will never land, so nothing else
+/// can release it. Left parked it holds its channel's publication head: every
+/// later completion on that channel queues behind it, the guest waits on words
+/// that never arrive, and [`pump_translations`] re-plans it on every pass. A
+/// driven macos-12 desktop froze exactly so, four positions stranded by one
+/// refused fragment shader and the pump re-planning them ~7000 times a second.
+///
+/// **Completed, not withdrawn.** `SessionModel::withdraw` drops the position's
+/// own word, and a guest blocked on that word hangs as surely as before. So
+/// the work is dropped, the reason is named, and the word publishes through
+/// the channel's order. That is the choice [`note_unadmitted`] makes for a
+/// packet that binds an already refused pipeline, here for one admitted before
+/// the refusal: the guest loses one packet's work rather than the channel.
+fn complete_stranded<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mut H) -> bool {
+    let mut any = false;
+    for stranded in state.take_stranded() {
+        let ingress = stranded.ingress;
+        let (Some(domain), Some(epoch)) = (
+            state.parked.domain_of(ingress),
+            state.parked.epoch_of(ingress),
+        ) else {
+            // Every admitted position is parked, and a stranded one never left
+            // the pipeline wait that would have released it to run.
+            note_store_route("parked_stranded_unheld");
+            continue;
+        };
+        let opcode = state.parked.opcode(ingress).unwrap_or_default();
+        let _ = state
+            .parked
+            .release(ingress, crate::runtime::parked::Release::Stranded);
+        if crate::observe::first_sight("parked_stranded", u64::from(stranded.pipeline.slot.0)) {
+            crate::observe::fail(format!(
+                "parked_stranded reason={} ch={domain} opcode={opcode:#x} pipeline={} gen={} \
+                 (a pipeline this position waited on will never build, so its work is \
+                 dropped and its completion word publishes in its channel's order)",
+                stranded.why, stranded.pipeline.slot.0, stranded.pipeline.generation.0,
+            ));
+        }
+        complete_position(state, host, domain, epoch, ingress);
+        any = true;
+    }
+    any
 }
 
 /// Take back the promise that a lease is usable, because this rail no longer

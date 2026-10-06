@@ -3009,6 +3009,19 @@ pub struct DeviceState {
     /// keep "which state changes, from where" a list a reader can enumerate,
     /// instead of a public field any call site can reach into.
     session: Mutex<reims_vgpu_core::session::SessionModel>,
+    /// Transactions a pipeline's end left waiting on a build that will never
+    /// land, until the drain takes them.
+    ///
+    /// `SessionModel::pipeline_refused` and `pipeline_retired` hand these back
+    /// exactly once and forget them: the scheduler drops its waiter list for
+    /// the pipeline, so a caller that discards the answer leaves positions no
+    /// event can ever release, each holding its channel's publication head. The
+    /// doors that end a pipeline run on the draw rails under `&DeviceState`,
+    /// where nothing can complete a transaction or write a completion word, so
+    /// they queue here and [`Self::take_stranded`] is how the drain, holding
+    /// `&mut`, collects them. Queued inside the door rather than by its callers
+    /// because a caller that forgot is exactly the hang this exists to close.
+    stranded: Mutex<Vec<Stranded>>,
     /// The bytes every admitted position is executed from, keyed by the
     /// ordinal [`Self::admit_packet`] issued.
     ///
@@ -3539,6 +3552,7 @@ impl DeviceState {
             session: Mutex::new(reims_vgpu_core::session::SessionModel::new(
                 reims_vgpu_core::identity::SessionId(id.0 as u32),
             )),
+            stranded: Mutex::new(Vec::new()),
             parked: crate::runtime::parked::ParkedStore::new(),
             translation_deferred_mask: 0,
             translation_order_hold_mask: 0,
@@ -4322,20 +4336,55 @@ impl DeviceState {
     /// the model's own.
     ///
     /// `Ended::stranded` is the transactions parked on a compilation that will
-    /// now never finish — empty today, because nothing is admitted into this
-    /// model yet, and counted rather than dropped so the day it stops being
-    /// empty is a number and not a hang. `Ended::took` is the other half, and a
-    /// driven boot needs it: the guest deletes render pipelines this device
-    /// never drew with, so 170 retirements a boot were 116 the table took and
-    /// 54 that named a slot it has no entry for.
+    /// now never finish. They are also queued for [`Self::take_stranded`]; the
+    /// list returned here is for the caller's count. `Ended::took` is the other
+    /// half, and a driven boot needs it: the guest deletes render pipelines
+    /// this device never drew with, so 170 retirements a boot were 116 the
+    /// table took and 54 that named a slot it has no entry for.
     pub fn retire_pipeline(
         &self,
         pipeline: reims_vgpu_core::identity::ResourceId,
     ) -> reims_vgpu_core::session::Ended {
-        self.session
+        let ended = self
+            .session
             .lock()
             .expect("session")
-            .pipeline_retired(pipeline)
+            .pipeline_retired(pipeline);
+        self.queue_stranded(pipeline, "pipeline_retired", &ended);
+        ended
+    }
+
+    /// Hold what a pipeline's end stranded until the drain takes it.
+    ///
+    /// Called after the session lock is released, so the two locks are never
+    /// held together and no order between them exists to get wrong.
+    fn queue_stranded(
+        &self,
+        pipeline: reims_vgpu_core::identity::ResourceId,
+        why: &'static str,
+        ended: &reims_vgpu_core::session::Ended,
+    ) {
+        if ended.stranded.is_empty() {
+            return;
+        }
+        self.stranded
+            .lock()
+            .expect("stranded")
+            .extend(ended.stranded.iter().map(|&ingress| Stranded {
+                ingress,
+                pipeline,
+                why,
+            }));
+    }
+
+    /// Take every transaction a pipeline's end has stranded since the last
+    /// call.
+    ///
+    /// Taken, not read, for `take_ready`'s reason: a caller that drops the
+    /// answer has positions nothing will ever release.
+    #[must_use = "a stranded position not completed holds its channel's publication head forever"]
+    pub fn take_stranded(&self) -> Vec<Stranded> {
+        std::mem::take(&mut *self.stranded.lock().expect("stranded"))
     }
 
     /// Step a declared pipeline along its build, from the rail that is
@@ -4487,19 +4536,22 @@ impl DeviceState {
     /// A pipeline will never build, with the reason the rail refused it.
     ///
     /// `Ended::stranded` is the transactions that can therefore never be ready.
-    /// They come back rather than being dropped for the same reason
-    /// [`Self::retire_pipeline`]'s do, and the caller withdraws each and says
-    /// why. Empty today, because nothing is admitted into this model yet.
-    /// `Ended::took` is whether the refusal was a legal step at all.
+    /// They are queued for [`Self::take_stranded`] for the same reason
+    /// [`Self::retire_pipeline`]'s are; the list returned here is for the
+    /// caller's count. `Ended::took` is whether the refusal was a legal step at
+    /// all.
     pub fn refuse_pipeline(
         &self,
         pipeline: reims_vgpu_core::identity::ResourceId,
         reason: reims_vgpu_core::pipeline::RefusalReason,
     ) -> reims_vgpu_core::session::Ended {
-        self.session
+        let ended = self
+            .session
             .lock()
             .expect("session")
-            .pipeline_refused(pipeline, reason)
+            .pipeline_refused(pipeline, reason);
+        self.queue_stranded(pipeline, reason.slug(), &ended);
+        ended
     }
 
     /// Give one packet an ordering position in the model.
@@ -5862,6 +5914,17 @@ impl DeviceState {
 
 /// What one admission established.
 ///
+/// One transaction a pipeline's end left waiting on a build that will never
+/// land, and which end it was.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Stranded {
+    pub ingress: reims_vgpu_core::identity::IngressOrdinal,
+    /// The pipeline whose end stranded it.
+    pub pipeline: reims_vgpu_core::identity::ResourceId,
+    /// The refusal's slug, or `pipeline_retired` for the guest's delete.
+    pub why: &'static str,
+}
+
 /// The model's answer and the host device incarnation it was admitted into,
 /// taken together because they are read under one lock. The epoch travels with
 /// the parked packet and comes back at completion — see

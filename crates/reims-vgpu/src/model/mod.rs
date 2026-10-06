@@ -19,7 +19,7 @@ pub use state::{
     DeviceState, ExecFault, FailEvent, GfxRegs, GuestLinearMemo, GvaBacking, GvaEvictionWitness,
     GvaHostView, HostLinearTexture, HostSurface, MapperCapture, MappingEntry, PacketFault,
     PresentBacking, PresentState, RailDeviceState, RailResourceState, RenderFlushWitness,
-    ResourceValidity, StampPublication, StorageIncarnation, SurfaceWriteKind, TaskEntry,
+    ResourceValidity, StampPublication, StorageIncarnation, Stranded, SurfaceWriteKind, TaskEntry,
     TaskReferenceStates, TaskResource, TaskResourceLifetimeRef, TaskSamplerState, TaskTable,
     UnimplementedCommand, FENCE_DOMAIN_BLIT, FENCE_DOMAIN_COMPUTE, FENCE_DOMAIN_EVENT,
     FENCE_DOMAIN_RENDER, GVA_ENCODE_CACHE_BYTE_CAP, GVA_EVICTION_WITNESS_KEYS,

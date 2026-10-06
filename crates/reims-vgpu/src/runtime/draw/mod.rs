@@ -1070,7 +1070,8 @@ pub(crate) fn refuse_pipeline<M: HostMemory + HostOps>(
     // The two facts apart. A refusal the table did not take is one that had
     // already ended — refused before, or retired by the guest mid-build — and
     // it is not the same event as a refusal that took and had nobody parked on
-    // it, which is every refusal until the cutover admits anything.
+    // it. What it stranded is already queued by the door for the drain to
+    // complete; the count here is the census of it.
     crate::runtime::drain::note_store_route(if ended.took {
         "pipeline_refused"
     } else {

@@ -5700,6 +5700,117 @@ fn a_packet_whose_stamp_wait_is_unmet_is_parked_until_the_slot_reaches_it() {
     );
 }
 
+/// A position parked on a pipeline that is then refused completes without
+/// running, and its completion word lands.
+///
+/// The refusal is the only event that could have released it, and the
+/// scheduler hands the stranded list back once and forgets it. Before the
+/// drain completed what the refusal stranded, the position stayed parked for
+/// the life of the device: its channel published nothing again, and a driven
+/// macos-12 desktop froze on exactly that with four positions behind one
+/// refused fragment shader.
+#[test]
+fn a_position_stranded_by_a_refused_pipeline_completes_and_publishes_its_word() {
+    use crate::model::DeviceId;
+    use crate::runtime::host::FakeHost;
+    use reims_vgpu_core::identity::{
+        ChannelId, CompletionStamp, ObjectListRef, ResourceId, SlotGeneration, StampSlot,
+        StampValue,
+    };
+    use reims_vgpu_core::pipeline::{PipelineState, RefusalReason};
+    use reims_vgpu_core::session::Packet as ModelPacket;
+    use reims_vgpu_core::transaction::Payload;
+    use reims_vgpu_protocol::packets::Channel;
+
+    const DOMAIN: u32 = 2;
+    const SLOT: u32 = 2;
+    const STAMP: u32 = 0x55;
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut host = FakeHost::new();
+    let page_size = 1usize << PAGE_SHIFT_X86;
+    let fifo_pfn = 0x40u32;
+    let fifo_gpa = u64::from(fifo_pfn) << PAGE_SHIFT_X86;
+    host.map_range(fifo_gpa, page_size, 0);
+    state.gfx.fifo_base_page = fifo_pfn;
+    state.open_child_domains_for_test(1 << DOMAIN);
+    let read_slot = |host: &FakeHost| {
+        let mut v = [0u8; 4];
+        let gpa = fifo_gpa + stamp_slot_offset(SLOT, page_size as u64).unwrap();
+        crate::runtime::host::HostMemory::read_gpa(host, gpa, &mut v).expect("slot");
+        ld32(&v)
+    };
+
+    let pipeline = ResourceId {
+        slot: ObjectListRef(165),
+        generation: SlotGeneration(1),
+    };
+    assert!(state.declare_pipeline(pipeline));
+    assert!(state.advance_pipeline(pipeline, PipelineState::Translating));
+
+    let mut work = reims_vgpu_core::exec::ExecWork::default();
+    work.pipeline_leases.push(pipeline);
+    let admission = state
+        .admit_packet(&ModelPacket {
+            channel: Channel::Child,
+            domain: ChannelId(DOMAIN),
+            session: state.session_generation(),
+            opcode: CHILD_OP_EXEC_INDIRECT2,
+            stamp_waits: Vec::new(),
+            completion: Some(CompletionStamp {
+                slot: StampSlot(SLOT),
+                value: StampValue(STAMP),
+            }),
+            payload: Payload::Exec(work),
+        })
+        .expect("an exec on an open domain is admitted");
+    assert!(
+        !admission.admitted.ready,
+        "a pipeline still translating holds the work"
+    );
+    let ingress = admission.admitted.transaction.identity.ingress;
+    state.parked.park(
+        ingress,
+        crate::runtime::parked::ParkedWork::new(
+            DOMAIN,
+            admission.epoch,
+            Packet {
+                opcode: CHILD_OP_EXEC_INDIRECT2,
+                stamp_waits: Vec::new(),
+                total_size: PACKET_HEADER_LEN,
+                completion_stamp: STAMP,
+                payload: Vec::new(),
+                next_head: 0,
+            },
+        ),
+    );
+
+    settle_model_work(&mut state, &mut host);
+    assert_eq!(state.parked.len(), 1, "still translating, still parked");
+    assert_eq!(read_slot(&host), 0, "and nothing published");
+
+    let ended = state.refuse_pipeline(
+        pipeline,
+        RefusalReason::TranslationFailed("fragment_translate"),
+    );
+    assert_eq!(ended.stranded, vec![ingress], "the refusal strands it");
+
+    settle_model_work(&mut state, &mut host);
+    assert!(
+        state.parked.is_empty(),
+        "a position no event can release is completed rather than held"
+    );
+    assert_eq!(
+        read_slot(&host),
+        STAMP,
+        "and its word publishes, or the guest waits on it forever"
+    );
+    assert!(
+        state.take_stranded().is_empty(),
+        "the drain took what the refusal queued"
+    );
+}
+
 /// A wait naming a slot past the stamp page runs the packet rather than holding
 /// it, and says why.
 ///

@@ -232,6 +232,10 @@ pub enum Release {
     /// lease, or a refusal the caller is naming on its failure channel. The
     /// bytes are dropped and nothing runs.
     Withdrawn,
+    /// A pipeline it waits on will never build. The bytes are dropped and
+    /// nothing runs, but unlike [`Self::Withdrawn`] the position is completed,
+    /// so its word publishes in its channel's order.
+    Stranded,
 }
 
 impl Release {
@@ -240,6 +244,7 @@ impl Release {
         match self {
             Self::Ready => "parked_taken_ready",
             Self::Withdrawn => "parked_withdrawn",
+            Self::Stranded => "parked_stranded",
         }
     }
 }
@@ -316,7 +321,7 @@ impl ParkedStore {
             Release::Ready => Some(work),
             // Dropped here rather than handed back, so a withdrawal cannot be
             // spelled as a run by a caller that ignores the reason it passed.
-            Release::Withdrawn => {
+            Release::Withdrawn | Release::Stranded => {
                 drop(work);
                 None
             }
@@ -398,6 +403,13 @@ impl ParkedStore {
     #[must_use]
     pub fn domain_of(&self, ingress: IngressOrdinal) -> Option<u32> {
         self.work.get(&ingress).map(ParkedWork::domain)
+    }
+
+    /// The incarnation a parked position was admitted into, for a caller that
+    /// completes it without running it.
+    #[must_use]
+    pub fn epoch_of(&self, ingress: IngressOrdinal) -> Option<DeviceEpoch> {
+        self.work.get(&ingress).map(ParkedWork::epoch)
     }
 
     /// The opcode of a parked position, for the gates that route on it.
