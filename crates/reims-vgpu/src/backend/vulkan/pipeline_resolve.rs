@@ -455,47 +455,82 @@ fn resolve_uncached<M: HostMemory + HostOps>(
     pipeline_ref: u32,
 ) -> Result<ResolvedRenderPipeline, DrawPreparationDecline> {
     resolve_uncached_inner(state, host, task_id, pipeline_ref).inspect_err(|decline| {
-        // A decline here is terminal for the pipeline, not for the draw that
-        // happened to ask: none of the seven inputs below is re-read on a later
-        // draw with a different answer, so retrying costs one guest walk per
-        // frame and produces the same refusal. The one exception is
-        // `PipelineMissing`, which is the *pipeline* not being there — nothing
-        // was declared, so there is nothing to refuse, and refusing it would
-        // name a slot the ordering plane has no entry for.
-        let reason = match decline {
-            DrawPreparationDecline::PipelineMissing { .. } => return,
-            DrawPreparationDecline::VertexMtlbMissing { .. } => {
-                RefusalReason::CompilationFailed("vertex_mtlb_missing")
+        match build_verdict(decline) {
+            BuildVerdict::Refuse(reason) => {
+                crate::runtime::draw::refuse_pipeline(state, host, task_id, pipeline_ref, reason);
             }
-            DrawPreparationDecline::FragmentMtlbMissing { .. } => {
-                RefusalReason::CompilationFailed("fragment_mtlb_missing")
+            // This draw is lost; the pipeline is not. The pump readies the
+            // lease again when the translation lands.
+            BuildVerdict::StillTranslating => note_store_route("pipeline_refuse_declined_pending"),
+            BuildVerdict::NotABuildDecline => {
+                note_store_route("pipeline_refuse_not_a_build_decline")
             }
-            DrawPreparationDecline::VertexAirExtract { .. } => {
-                RefusalReason::CompilationFailed("vertex_air_extract")
-            }
-            DrawPreparationDecline::FragmentAirExtract { .. } => {
-                RefusalReason::CompilationFailed("fragment_air_extract")
-            }
-            DrawPreparationDecline::VertexTranslate { .. } => {
-                RefusalReason::TranslationFailed("vertex_translate")
-            }
-            DrawPreparationDecline::FragmentTranslate { .. } => {
-                RefusalReason::TranslationFailed("fragment_translate")
-            }
-            // `DrawPreparationDecline` is the whole draw rail's decline set,
-            // three dozen variants of which only the seven above can be
-            // returned by `resolve_uncached_inner`. The rest are the encoder's
-            // and say nothing about whether the pipeline can be built, so they
-            // must not refuse it; counted so that "impossible" stays a
-            // measurement rather than an assumption.
-            other => {
-                let _ = other;
-                note_store_route("pipeline_refuse_not_a_build_decline");
-                return;
-            }
-        };
-        crate::runtime::draw::refuse_pipeline(state, host, task_id, pipeline_ref, reason);
+            BuildVerdict::Undeclared => {}
+        }
     })
+}
+
+/// What a resolve decline says about whether its pipeline can ever be built.
+#[derive(Debug, PartialEq, Eq)]
+enum BuildVerdict {
+    /// Terminal for the pipeline, not for the draw that happened to ask: none
+    /// of the inputs behind these is re-read on a later draw with a different
+    /// answer, so retrying costs one guest walk per frame and produces the same
+    /// refusal.
+    Refuse(RefusalReason),
+    /// The translation has not finished. It will, so refusing would make a
+    /// shader that is merely slow unbuildable for the life of the object, and
+    /// strand every position parked on it.
+    StillTranslating,
+    /// The *pipeline* not being there: nothing was declared, so there is
+    /// nothing to refuse, and refusing it would name a slot the ordering plane
+    /// has no entry for.
+    Undeclared,
+    /// The encoder's decline, which says nothing about whether the pipeline
+    /// can be built.
+    NotABuildDecline,
+}
+
+fn build_verdict(decline: &DrawPreparationDecline) -> BuildVerdict {
+    use crate::runtime::m2v_cache::M2vCacheDecline;
+
+    let reason = match decline {
+        DrawPreparationDecline::PipelineMissing { .. } => return BuildVerdict::Undeclared,
+        DrawPreparationDecline::VertexTranslate {
+            reason: M2vCacheDecline::TranslationPending { .. },
+            ..
+        }
+        | DrawPreparationDecline::FragmentTranslate {
+            reason: M2vCacheDecline::TranslationPending { .. },
+            ..
+        } => return BuildVerdict::StillTranslating,
+        DrawPreparationDecline::VertexMtlbMissing { .. } => {
+            RefusalReason::CompilationFailed("vertex_mtlb_missing")
+        }
+        DrawPreparationDecline::FragmentMtlbMissing { .. } => {
+            RefusalReason::CompilationFailed("fragment_mtlb_missing")
+        }
+        DrawPreparationDecline::VertexAirExtract { .. } => {
+            RefusalReason::CompilationFailed("vertex_air_extract")
+        }
+        DrawPreparationDecline::FragmentAirExtract { .. } => {
+            RefusalReason::CompilationFailed("fragment_air_extract")
+        }
+        DrawPreparationDecline::VertexTranslate { .. } => {
+            RefusalReason::TranslationFailed("vertex_translate")
+        }
+        DrawPreparationDecline::FragmentTranslate { .. } => {
+            RefusalReason::TranslationFailed("fragment_translate")
+        }
+        // `DrawPreparationDecline` is the whole draw rail's decline set, three
+        // dozen variants of which only the seven above can be returned by
+        // `resolve_uncached_inner`. The rest are the encoder's and say nothing
+        // about whether the pipeline can be built, so they must not refuse it;
+        // counted so that "impossible" stays a measurement rather than an
+        // assumption.
+        _ => return BuildVerdict::NotABuildDecline,
+    };
+    BuildVerdict::Refuse(reason)
 }
 
 /// The publish half of [`ready`], skipped when the pre-scan already answered.
@@ -680,6 +715,51 @@ mod tests {
     /// the other one.
     fn pipelines(state: &DeviceState) -> &TaskRenderPipelineStates {
         retained(state).expect("this rail owns the device's rail-state slot")
+    }
+
+    /// A translation that has not finished is not a translation that failed.
+    ///
+    /// Both arrive as the same `*Translate` decline. Refusing the pending one
+    /// made a shader the guest had just rewritten in place unbuildable for the
+    /// life of the object, and stranded every position parked on it: the
+    /// freeze a driven macos-12 desktop hit one second after its wallpaper.
+    #[test]
+    fn a_pending_translation_is_not_a_refusal_and_a_failed_one_is() {
+        use crate::runtime::m2v_cache::M2vCacheDecline;
+
+        for (decline, stage) in [
+            (
+                DrawPreparationDecline::FragmentTranslate {
+                    pipeline_ref: 165,
+                    reason: M2vCacheDecline::TranslationPending { stage: "fragment" },
+                },
+                "fragment",
+            ),
+            (
+                DrawPreparationDecline::VertexTranslate {
+                    pipeline_ref: 165,
+                    reason: M2vCacheDecline::TranslationPending { stage: "vertex" },
+                },
+                "vertex",
+            ),
+        ] {
+            assert_eq!(
+                build_verdict(&decline),
+                BuildVerdict::StillTranslating,
+                "a {stage} translation still running must not refuse its pipeline"
+            );
+        }
+
+        assert_eq!(
+            build_verdict(&DrawPreparationDecline::FragmentTranslate {
+                pipeline_ref: 165,
+                reason: M2vCacheDecline::FragmentTranslate {
+                    detail: "unsupported".to_string(),
+                },
+            }),
+            BuildVerdict::Refuse(RefusalReason::TranslationFailed("fragment_translate")),
+            "a translation that failed still refuses, once"
+        );
     }
 
     /// An empty retained registry must answer **not ready**, and that direction
