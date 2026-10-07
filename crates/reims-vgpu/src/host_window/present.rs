@@ -35,7 +35,6 @@ use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
-use winit::keyboard::PhysicalKey;
 use winit::window::{Window, WindowId};
 
 use super::capture::{Capture, CaptureEngaged, CaptureMode};
@@ -971,18 +970,15 @@ impl ApplicationHandler<FramePublished> for App {
                 // frame, leaving the resized window blank.
                 self.force_redraw();
             }
-            WindowEvent::KeyboardInput { event, .. } => {
-                if let PhysicalKey::Code(code) = event.physical_key {
-                    if let Some(evdev) = input_map::keycode_to_evdev(code) {
-                        let down = event.state == ElementState::Pressed;
-                        // Not forwarded straight through: `keyboard` records
-                        // what the guest is holding so focus loss can close it,
-                        // and it consumes the ungrab chord rather than letting
-                        // the escape hatch reach the guest as a stray Esc.
-                        let effect = self.keyboard.key(evdev, down);
-                        self.apply_key_effect(effect);
-                    }
-                }
+            WindowEvent::KeyboardInput {
+                event,
+                is_synthetic,
+                ..
+            } => {
+                let effect =
+                    self.keyboard
+                        .window_key(event.physical_key, event.state, is_synthetic);
+                self.apply_key_effect(effect);
             }
             WindowEvent::Focused(focused) => {
                 // The window system does not promise a key-up for a key held

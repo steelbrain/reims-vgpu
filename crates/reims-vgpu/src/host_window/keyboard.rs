@@ -54,6 +54,9 @@
 //! holds that apart — an escape hatch that ate the guest's own escape hatch
 //! would be a poor trade.
 
+use winit::event::ElementState;
+use winit::keyboard::PhysicalKey;
+
 use crate::runtime::host::HostAction;
 
 /// evdev `KEY_*` codes this module reasons about by name.
@@ -236,13 +239,38 @@ impl Keyboard {
         Self::default()
     }
 
+    /// Handle a window key event without turning focus changes into typing.
+    ///
+    /// winit synthesises presses on focus gain on Windows and X11. Those
+    /// describe host state, not a press made in this window, so they must not
+    /// enter the guest's held set or trigger the ungrab chord. Synthetic
+    /// releases still close a real press; `HeldKeys` makes them harmless when
+    /// focus loss has already released it.
+    pub fn window_key(
+        &mut self,
+        physical_key: PhysicalKey,
+        state: ElementState,
+        is_synthetic: bool,
+    ) -> KeyEffect {
+        if is_synthetic && state == ElementState::Pressed {
+            return KeyEffect::nothing();
+        }
+        let PhysicalKey::Code(code) = physical_key else {
+            return KeyEffect::nothing();
+        };
+        let Some(evdev) = super::input_map::keycode_to_evdev(code) else {
+            return KeyEffect::nothing();
+        };
+        self.key(evdev, state == ElementState::Pressed)
+    }
+
     /// Handle a physical key transition, in evdev codes.
     ///
     /// Returns the guest input to emit and any grab change. The [`UNGRAB_CHORD`]
     /// is recognised on the *press* of Esc while both a Ctrl and an Alt are
     /// held; it is consumed, and it takes the rest of the held set with it so
     /// the guest does not keep the modifiers that formed it.
-    pub fn key(&mut self, evdev: u32, down: bool) -> KeyEffect {
+    fn key(&mut self, evdev: u32, down: bool) -> KeyEffect {
         if down && evdev == key::ESC && self.chord_modifiers_held() {
             return self.release_grab();
         }
@@ -344,6 +372,97 @@ mod tests {
 
     fn is_key(a: &HostAction, evdev: u32, down: bool) -> bool {
         a.kind == HostActionKind::InputKey && a.a0 as u32 == evdev && (a.a1 != 0) == down
+    }
+
+    #[test]
+    fn focus_gain_does_not_press_synthetic_keys() {
+        let mut kb = Keyboard::new();
+        for _ in 0..3 {
+            kb.focus(true);
+            for code in [KeyCode::Backquote, KeyCode::KeyA, KeyCode::ShiftLeft] {
+                let effect = kb.window_key(PhysicalKey::Code(code), ElementState::Pressed, true);
+                assert_eq!(effect, KeyEffect::nothing(), "focus gain pressed {code:?}");
+                assert_eq!(kb.held_count(), 0);
+            }
+            assert!(kb.focus(false).actions.is_empty());
+        }
+    }
+
+    #[test]
+    fn synthetic_release_closes_a_real_press_once_in_either_focus_order() {
+        let key = PhysicalKey::Code(KeyCode::Backquote);
+        for focus_first in [false, true] {
+            let mut kb = Keyboard::new();
+            kb.focus(true);
+            let pressed = kb.window_key(key, ElementState::Pressed, false);
+            assert_eq!(pressed.actions, vec![HostAction::input_key(41, true)]);
+            let releases = if focus_first {
+                [
+                    kb.focus(false),
+                    kb.window_key(key, ElementState::Released, true),
+                ]
+            } else {
+                [
+                    kb.window_key(key, ElementState::Released, true),
+                    kb.focus(false),
+                ]
+            };
+            let actions: Vec<_> = releases
+                .into_iter()
+                .flat_map(|effect| effect.actions)
+                .collect();
+            assert_eq!(actions, vec![HostAction::input_key(41, false)]);
+            assert_eq!(kb.held_count(), 0);
+        }
+    }
+
+    #[test]
+    fn physical_backquote_keeps_presses_repeats_and_releases() {
+        let mut kb = Keyboard::new();
+        kb.focus(true);
+        let key = PhysicalKey::Code(KeyCode::Backquote);
+        let actions: Vec<_> = [
+            ElementState::Pressed,
+            ElementState::Pressed,
+            ElementState::Released,
+        ]
+        .into_iter()
+        .flat_map(|state| kb.window_key(key, state, false).actions)
+        .collect();
+        assert_eq!(
+            actions,
+            vec![
+                HostAction::input_key(41, true),
+                HostAction::input_key(41, true),
+                HostAction::input_key(41, false),
+            ]
+        );
+        assert_eq!(kb.held_count(), 0);
+        assert_eq!(
+            kb.window_key(
+                PhysicalKey::Code(KeyCode::F20),
+                ElementState::Pressed,
+                false
+            ),
+            KeyEffect::nothing(),
+        );
+    }
+
+    #[test]
+    fn synthetic_escape_does_not_trigger_the_ungrab_chord() {
+        let mut kb = Keyboard::new();
+        kb.focus(true);
+        for code in [KeyCode::ControlLeft, KeyCode::AltLeft] {
+            kb.window_key(PhysicalKey::Code(code), ElementState::Pressed, false);
+        }
+        let effect = kb.window_key(
+            PhysicalKey::Code(KeyCode::Escape),
+            ElementState::Pressed,
+            true,
+        );
+        assert_eq!(effect, KeyEffect::nothing());
+        assert!(kb.is_grabbed());
+        assert_eq!(kb.held_count(), 2);
     }
 
     /// The defect this module was written for: a key held when focus is lost
