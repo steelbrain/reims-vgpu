@@ -131,6 +131,13 @@ pub enum HostRamDecline {
     /// The reference did not survive its own bound. Carries the check that
     /// refused, from [`crate::runtime::guest_ram`].
     Bound { inner: GuestRamError },
+    /// The guest-RAM map already stands on a refusal, so no new RAMBlock
+    /// import is made: nothing may reference one, and on a driver that pins,
+    /// the import is seconds of work and gigabytes held for nothing. Carries
+    /// the map's refusal so the line says which.
+    MapRefused {
+        refusal: crate::runtime::guest_ram_map::MapRefusal,
+    },
 }
 
 impl Decline for HostRamDecline {
@@ -144,6 +151,7 @@ impl Decline for HostRamDecline {
             Self::TooSmall { .. } => "host_ram_import_too_small",
             Self::AllocateMemory { .. } => "host_ram_import_allocate_memory",
             Self::BindBuffer { .. } => "host_ram_import_bind_buffer",
+            Self::MapRefused { .. } => "host_ram_import_map_refused",
             // The inner check is the diagnosis. Forwarding rather than adding a
             // slug keeps one name per check across the two modules.
             Self::Bound { inner } => inner.slug(),
@@ -195,6 +203,15 @@ impl Decline for HostRamDecline {
                 ("available", available.to_string()),
             ],
             Self::Bound { inner } => inner.fields(),
+            Self::MapRefused { refusal } => vec![("map", refusal.slug().to_string())],
+        }
+    }
+
+    /// Delegated where `slug` is: the bound's check keeps the bound's name.
+    fn owner(&self) -> &'static str {
+        match self {
+            Self::Bound { inner } => inner.owner(),
+            _ => std::any::type_name::<Self>(),
         }
     }
 }
@@ -398,10 +415,38 @@ impl HostRamImports {
         if let Some(decline) = self.declined.get(&key) {
             return Err(*decline);
         }
+        // A RAMBlock the map already refuses is never imported: see
+        // `MapRefused`. Asked only on this, the first attempt for the block, so
+        // it costs one lock per block and none per bind.
+        if import.gpa_base().is_some() {
+            if let Some(refusal) = crate::runtime::guest_ram_map::refusal_now() {
+                return Err(HostRamDecline::MapRefused { refusal });
+            }
+        }
         let made = match unsafe { import_ramblock(ctx, import) } {
             Ok(made) => made,
             Err(decline) => {
                 self.declined.insert(key, decline);
+                // The line above is this device's last word on the block: it is
+                // never asked about again until teardown, whatever the reason —
+                // the driver refusing the memory or a heap full at this moment
+                // alike. So the map must stop licensing references into it, and
+                // into every other block with it, or the writeback paths hold
+                // the partial import `MapRefusal::BackendRefusedImport` names.
+                // A packed alias is the shim's own view and says nothing about
+                // the RAMBlock behind it.
+                //
+                // Reported here, unlatched, because this is the decline that
+                // took the rail off and `refuse_import` answers `true` once per
+                // map. The other lines that carry this slug latch on it, so the
+                // `result=` that decided could otherwise be the one never shown.
+                if let Some(gpa) = import.gpa_base() {
+                    if crate::runtime::guest_ram_map::refuse_import(import.id(), decline.slug()) {
+                        crate::observe::Emit::decline("vk_guest_ram_import_refused", &decline)
+                            .field("gpa", format!("{gpa:#x}"))
+                            .fail();
+                    }
+                }
                 return Err(decline);
             }
         };
@@ -713,6 +758,15 @@ impl Decline for GuestWriteDecline {
             Self::Import { inner } => inner.fields(),
         }
     }
+
+    /// Delegated where `slug` is: the import's check keeps the import's name,
+    /// or this wrapper reads as a second claimant for a slug it only passed on.
+    fn owner(&self) -> &'static str {
+        match self {
+            Self::Import { inner } => inner.owner(),
+            _ => std::any::type_name::<Self>(),
+        }
+    }
 }
 
 crate::observe::decline::decline_display!(GuestWriteDecline);
@@ -757,6 +811,9 @@ mod tests {
             },
             HostRamDecline::BindBuffer {
                 result: vk::Result::ERROR_UNKNOWN,
+            },
+            HostRamDecline::MapRefused {
+                refusal: crate::runtime::guest_ram_map::MapRefusal::NoBackendImport,
             },
         ];
         let mut slugs: Vec<_> = all.iter().map(|d| d.slug()).collect();
@@ -819,6 +876,52 @@ mod tests {
             .fields()
             .iter()
             .any(|(name, value)| *name == "pointer_types" && value == "0xa"));
+    }
+
+    /// An import decline passed on by the writeback rail is still the import's
+    /// check, so the slug is claimed for the import's type at every layer.
+    ///
+    /// `GuestWriteDecline::Import` forwards its inner slug and kept the default
+    /// owner, so the first line through the wrapper named a second claimant for
+    /// `host_ram_import_allocate_memory`. A radv boot whose memfd RAMBlock the
+    /// driver refused logged `observe_slug_collision` for exactly this pair, and
+    /// a test build panics on it — which is what this asserts against, by
+    /// emitting the inner decline and then each wrapper around it.
+    #[test]
+    fn an_import_decline_keeps_its_owner_through_the_writeback_wrapper() {
+        let inner = HostRamDecline::AllocateMemory {
+            result: vk::Result::ERROR_INVALID_EXTERNAL_HANDLE,
+        };
+        let wrapped = GuestWriteDecline::Import { inner };
+        let drawn = crate::backend::vulkan::engine::DrawError::GuestPageWrite(wrapped);
+        assert_eq!(wrapped.owner(), inner.owner());
+        assert_eq!(drawn.owner(), inner.owner());
+        crate::observe::Emit::decline("host_ram_test_inner", &inner).off();
+        crate::observe::Emit::decline("host_ram_test_wrapped", &wrapped).off();
+        crate::observe::Emit::decline("host_ram_test_drawn", &drawn).off();
+        // A variant that spells its own slug still owns it.
+        assert_eq!(
+            GuestWriteDecline::NoSharedBacking.owner(),
+            std::any::type_name::<GuestWriteDecline>()
+        );
+    }
+
+    /// The bound's own refusal, passed on by the import, is still the bound's.
+    #[test]
+    fn a_bound_refusal_keeps_its_owner_through_the_import() {
+        let bound = GuestRamError::RegionEmpty;
+        let declined = HostRamDecline::Bound { inner: bound };
+        assert_eq!(declined.owner(), bound.owner());
+        crate::observe::Emit::decline("host_ram_test_bound", &bound).off();
+        crate::observe::Emit::decline("host_ram_test_import_bound", &declined).off();
+        assert_eq!(
+            HostRamDecline::TooSmall {
+                required: 0,
+                available: 0
+            }
+            .owner(),
+            std::any::type_name::<HostRamDecline>()
+        );
     }
 
     #[test]
@@ -1019,6 +1122,126 @@ mod tests {
         crate::runtime::guest_ram_map::warm(&mut host);
         assert_eq!(super::super::guest_import_census().0, after);
         crate::runtime::guest_ram_map::reset();
+    }
+
+    /// A RAMBlock the driver will not import stands the whole guest-RAM map on
+    /// that refusal, and no later chunk is imported behind it.
+    ///
+    /// The stand-in is the memory that found this: a `MAP_SHARED` view of a
+    /// memfd, which is what QEMU's `memory-backend-memfd,share=on` gives
+    /// guest RAM. radv refuses it in `vkAllocateMemory` with
+    /// `VK_ERROR_INVALID_EXTERNAL_HANDLE` — amdgpu's userptr takes only
+    /// private anonymous pages — while the capability probe reports the import
+    /// supported. A second block over anonymous memory, which every driver
+    /// takes, follows it in GPA order, so the test also says the warm stops
+    /// importing once the map has refused.
+    ///
+    /// A driver that does import shared memory skips: there is no refusal to
+    /// observe on that host, and the map staying whole is the right answer.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_ramblock_the_driver_refuses_stands_the_map_and_nothing_is_imported_behind_it() {
+        {
+            let mut guard = super::super::lock_engine();
+            let super::super::EngineState {
+                ref mut owner,
+                ref counters,
+                ..
+            } = &mut *guard;
+            let Ok(ctx) = owner.ensure(counters) else {
+                eprintln!("skip: no Vulkan device");
+                return;
+            };
+            if !ctx.caps.host_pointer.is_available() {
+                eprintln!("skip: no host-pointer import on this device");
+                return;
+            }
+        }
+
+        // Both outlive the test, for the reason the warm test above gives: an
+        // import is released at device teardown, not when its test returns.
+        const LEN: usize = 64 << 10;
+        let shared = unsafe {
+            let fd = libc::memfd_create(c"reims-guest-ram-test".as_ptr(), libc::MFD_CLOEXEC);
+            assert!(fd >= 0, "memfd_create");
+            assert_eq!(libc::ftruncate(fd, LEN as libc::off_t), 0, "ftruncate");
+            let view = libc::mmap(
+                std::ptr::null_mut(),
+                LEN,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                fd,
+                0,
+            );
+            assert_ne!(view, libc::MAP_FAILED, "mmap");
+            view as u64
+        };
+        let layout = std::alloc::Layout::from_size_align(LEN, 4096).expect("valid layout");
+        let anonymous = unsafe { std::alloc::alloc_zeroed(layout) };
+        assert!(!anonymous.is_null(), "allocation for the anonymous block");
+
+        struct Blocks(u64, u64);
+        impl crate::runtime::host::HostOps for Blocks {
+            fn mono_ns(&self) -> u64 {
+                0
+            }
+            fn enqueue(&mut self, _action: crate::runtime::host::HostAction) {}
+            fn schedule_bh(&mut self) {}
+            fn guest_ram_regions(
+                &mut self,
+            ) -> Result<
+                Vec<crate::runtime::guest_ram::GuestRamRegion>,
+                crate::runtime::host::GuestRamRegionsError,
+            > {
+                Ok(vec![
+                    crate::runtime::guest_ram::GuestRamRegion {
+                        gpa_base: 0,
+                        host_va: self.0,
+                        len: LEN as u64,
+                    },
+                    crate::runtime::guest_ram::GuestRamRegion {
+                        gpa_base: 0x1_0000_0000,
+                        host_va: self.1,
+                        len: LEN as u64,
+                    },
+                ])
+            }
+        }
+
+        crate::runtime::guest_ram_map::reset();
+        let capture = crate::observe::FailCapture::start();
+        let before = super::super::guest_import_census().0;
+        let mut host = Blocks(shared, anonymous as u64);
+        crate::runtime::guest_ram_map::warm(&mut host);
+        let imported = super::super::guest_import_census().0 - before;
+        let refusal = crate::runtime::guest_ram_map::standing_refusal(&mut host);
+        crate::runtime::guest_ram_map::reset();
+        if refusal.is_none() {
+            assert_eq!(
+                imported,
+                2 * LEN as u64,
+                "a driver that takes shared memory imports both blocks"
+            );
+            eprintln!("skip: this driver imports shared memory");
+            return;
+        }
+        assert_eq!(
+            refusal,
+            Some(
+                crate::runtime::guest_ram_map::MapRefusal::BackendRefusedImport {
+                    gpa: 0,
+                    reason: "host_ram_import_allocate_memory",
+                }
+            ),
+            "the refused block stands the map, named by its own check"
+        );
+        assert_eq!(
+            imported, 0,
+            "nothing is imported behind a map that stands on a refusal"
+        );
+        let line = capture.one("vk_guest_ram_import_refused");
+        assert!(line.contains("result="), "{line}");
+        assert!(line.contains("gpa=0x0"), "{line}");
     }
 
     /// A fresh map holds nothing and reports nothing imported. The count is the

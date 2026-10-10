@@ -1478,11 +1478,14 @@ pub struct ComputeOutput {
     /// One result per requested storage image, in request order (same length as
     /// `storage_images`).
     ///
-    /// Which variant comes back is decided entirely by the matching request's
-    /// [`ComputeStorageImageResource::destination`] — the engine does not choose
-    /// a rail here, it honours the one it was given, so the caller can pair
-    /// result `i` with its own destination without asking the engine what it
-    /// did.
+    /// The variant says what the engine *did*, which is what the caller owes:
+    /// `Bytes` a writeback, `Landed` a settle. A `Host` request always comes
+    /// back `Bytes`. A [`ComputeImageDestination::GuestPages`] request comes
+    /// back `Landed`, unless the engine's import refused its pages
+    /// (`DrawError::GuestPageWrite`) — then it was read back like a `Host` one
+    /// and comes back `Bytes`, because a refused direct destination is a
+    /// routing answer and not a lost image. So match on the result, not on the
+    /// destination you asked for.
     pub images: Vec<ComputeImageResult>,
 }
 
@@ -1571,12 +1574,14 @@ impl std::fmt::Debug for ComputeImageDestination {
     }
 }
 
-/// What one storage image's dispatch produced, paired with the destination that
-/// was asked for.
+/// What one storage image's dispatch produced. See [`ComputeOutput::images`]
+/// for why this, and not the destination that was asked for, is what the
+/// caller acts on.
 #[derive(Debug)]
 pub enum ComputeImageResult {
-    /// Readback pixels, for [`ComputeImageDestination::Host`]. Tight rows: the
-    /// caller re-pitches them into the guest's window.
+    /// Readback pixels: every [`ComputeImageDestination::Host`] image, and a
+    /// [`ComputeImageDestination::GuestPages`] one whose import the engine
+    /// refused. Tight rows: the caller re-pitches them into the guest's window.
     Bytes(Vec<u8>),
     /// The copy into the guest's own pages is on the queue, for
     /// [`ComputeImageDestination::GuestPages`]. There are no bytes to hand back

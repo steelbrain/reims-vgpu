@@ -132,6 +132,49 @@ pub enum MapRefusal {
     /// every import fits. That cannot be measured on a host whose roomiest heap
     /// is four times its guest.
     ImportExceedsHeap { needed: u64, budget: u64 },
+    /// The backend's driver refused to import one of this map's chunks, so
+    /// nothing may import any of them.
+    ///
+    /// # Why the map cannot see this coming
+    ///
+    /// `resolve` decides from what was *published* — the shim's spans, the
+    /// backend's granularity and heap budget — and never asks the driver about
+    /// a pointer. The capability probe does not either: on radv,
+    /// `vkGetMemoryHostPointerPropertiesEXT` names memory types for a
+    /// `MAP_SHARED` memfd mapping, and `vkAllocateMemory` then refuses it with
+    /// `VK_ERROR_INVALID_EXTERNAL_HANDLE`, because amdgpu's userptr takes only
+    /// private anonymous pages. QEMU's `memory-backend-memfd,share=on` — the
+    /// guest RAM `vm/boot-x86.sh` builds — is exactly that memory, so on such
+    /// a host every RAMBlock chunk is refused while the map hands out
+    /// references the engine can never bind, and the one rail whose licence
+    /// had no copying arm behind it lost its work.
+    ///
+    /// The engine's import is the first place the driver answers, so it is the
+    /// engine that reports it, through [`refuse_import`] — for any refusal of a
+    /// chunk, because the engine keeps a declined chunk declined until device
+    /// teardown and never asks about it again. The map only stops licensing
+    /// references the engine will never bind. That includes running out of
+    /// memory: a host whose RAMBlock import fails with
+    /// `ERROR_OUT_OF_DEVICE_MEMORY` — the shape issue #29 reports on ANV — now
+    /// takes the copying rails for the boot instead of keeping a partial
+    /// import.
+    ///
+    /// # Why the whole map, when one chunk was named
+    ///
+    /// The argument [`Self::ImportExceedsHeap`] makes: a partial import leaves
+    /// the writeback paths holding references into one block and none into
+    /// another, which is a hard error at those sites and not a fallback.
+    ///
+    /// Once it stands, the engine makes no new RAMBlock import either
+    /// ([`refusal_now`]). An import made *before* the refusal — a chunk earlier
+    /// in GPA order that the driver did take — stays allocated until device
+    /// teardown with nothing left to reference it. On the radv host that
+    /// motivated this, the first chunk is refused and nothing is imported at
+    /// all.
+    ///
+    /// `reason` is the engine decline's slug; the engine reports the decline
+    /// itself, with its fields, once, as `vk_guest_ram_import_refused`.
+    BackendRefusedImport { gpa: u64, reason: &'static str },
     /// The address is not inside any imported span. Guest RAM the GPU can reach
     /// exists, and this address is not in it — a device MMIO address, a hole,
     /// or a page the guest named that this machine does not back.
@@ -189,6 +232,7 @@ impl crate::observe::Decline for MapRefusal {
             Self::HostRefused(_) => "guest_ram_map_host_refused",
             Self::NoUsableRegion { .. } => "guest_ram_map_no_usable_region",
             Self::ImportExceedsHeap { .. } => "guest_ram_map_import_exceeds_heap",
+            Self::BackendRefusedImport { .. } => "guest_ram_map_backend_refused_import",
             Self::GpaNotInAnyImport { .. } => "guest_ram_map_gpa_not_in_any_import",
             Self::Scattered { .. } => "guest_ram_map_scattered",
             // The inner reason is the diagnosis; this wrapper only says where
@@ -210,6 +254,12 @@ impl crate::observe::Decline for MapRefusal {
                 ("needed_mb", (needed >> 20).to_string()),
                 ("budget_mb", (budget >> 20).to_string()),
             ],
+            // `import`, not `via`: the writeback wrappers that restate a map
+            // refusal already name it under `via`, and a line with two of
+            // one key reads as whichever a parser keeps.
+            Self::BackendRefusedImport { gpa, reason } => {
+                vec![("gpa", format!("{gpa:#x}")), ("import", reason.to_string())]
+            }
             Self::GpaNotInAnyImport { gpa } => vec![("gpa", format!("{gpa:#x}"))],
             Self::Scattered { pages, runs, first } => vec![
                 ("pages", pages.to_string()),
@@ -217,6 +267,14 @@ impl crate::observe::Decline for MapRefusal {
                 ("first", format!("{first:#x}")),
             ],
             Self::OutsideImport(inner) => inner.fields(),
+        }
+    }
+
+    /// Delegated where `slug` is: the bound's check keeps the bound's name.
+    fn owner(&self) -> &'static str {
+        match self {
+            Self::OutsideImport(inner) => inner.owner(),
+            _ => std::any::type_name::<Self>(),
         }
     }
 }
@@ -242,7 +300,9 @@ struct Resolved {
     imports: Vec<Arc<GuestRamImport>>,
     /// Set when the resolution refused, so the next reference does not re-ask
     /// the shim for an answer that will not change. A refusal here is about the
-    /// host and the granularity, both of which are fixed for the device's life.
+    /// host and the granularity, both of which are fixed for the device's life
+    /// — or, once [`refuse_import`] sets it, about what the device's driver said
+    /// of the memory behind an import, which is fixed for it as well.
     refusal: Option<MapRefusal>,
 }
 
@@ -312,6 +372,65 @@ impl Resolved {
 /// it — see [`crate::runtime::guest_ram::ImportId`] for why that matters.
 pub fn reset() {
     *MAP.lock().unwrap_or_else(|p| p.into_inner()) = None;
+}
+
+/// Stand the whole map on the driver's refusal of one of its imports.
+///
+/// Called by the backend's import, the first place the driver answers about the
+/// memory behind a chunk, with the backend decline's slug as `reason`. See
+/// [`MapRefusal::BackendRefusedImport`] for why the map cannot learn this on
+/// its own and why one chunk refuses all of them.
+///
+/// Acts only when `id` is one of this map's own imports and the map is not
+/// already standing on a refusal. A device recreate [`reset`]s the map and the
+/// next one is built with fresh identities, so a refusal that names an import
+/// from before it — or arrives before any map exists — is about a device that
+/// is gone, and must not take the new one's rail off before its own driver has
+/// been asked.
+///
+/// Returns whether this call published the refusal, so the caller can report
+/// the decline that decided it exactly once. Safe to call with the engine lock
+/// held: nothing that holds `MAP` ever calls into the backend.
+pub fn refuse_import(id: crate::runtime::guest_ram::ImportId, reason: &'static str) -> bool {
+    let refusal = {
+        let mut guard = MAP.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(resolved) = guard.as_mut() else {
+            return false;
+        };
+        if resolved.refusal.is_some() {
+            return false;
+        }
+        let Some(gpa) = resolved
+            .imports
+            .iter()
+            .find(|import| import.id() == id)
+            .and_then(|import| import.gpa_base())
+        else {
+            return false;
+        };
+        let refusal = MapRefusal::BackendRefusedImport { gpa, reason };
+        resolved.imports.clear();
+        resolved.refusal = Some(refusal);
+        refusal
+    };
+    report_once(refusal);
+    true
+}
+
+/// The refusal the map stands on, without resolving one.
+///
+/// For the backend's import, which must not start a new import of a RAMBlock
+/// the map already refuses — nothing could reference it, and on a driver that
+/// pins, the import is seconds of work and gigabytes held for nothing. Unlike
+/// [`standing_refusal`] it never builds the map: the import is the map's
+/// consumer, and building it from there would take the shim's answer under the
+/// engine lock. `None` before the first resolution, which is the lazy path's
+/// to make.
+pub fn refusal_now() -> Option<MapRefusal> {
+    MAP.lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .as_ref()
+        .and_then(|resolved| resolved.refusal)
 }
 
 /// How many RAMBlock spans the shim reported, and how many bytes they cover.
@@ -927,6 +1046,39 @@ mod tests {
         out
     }
 
+    /// [`two_spans`]' shape over memory this process owns, for a test that
+    /// hands its imports to the backend.
+    ///
+    /// `two_spans` names host addresses nothing maps, which is all a test of
+    /// the map's own arithmetic needs. A warm hands every import to the
+    /// selected backend, though, and once an earlier test in the process has
+    /// made a device, that backend asks the real driver — which refuses a
+    /// pointer nothing maps, and that refusal stands the map on
+    /// [`MapRefusal::BackendRefusedImport`], as it should. Never freed, for the
+    /// reason the engine's own warm test gives: an import outlives the test
+    /// that made it, until device teardown.
+    fn owned_two_spans() -> Spans {
+        const LEN: usize = 64 << 10;
+        let block = || {
+            let layout = std::alloc::Layout::from_size_align(LEN, 0x1000).expect("valid layout");
+            let base = unsafe { std::alloc::alloc_zeroed(layout) };
+            assert!(!base.is_null(), "allocation for a stand-in RAMBlock");
+            base as u64
+        };
+        Spans(vec![
+            GuestRamRegion {
+                gpa_base: 0,
+                host_va: block(),
+                len: LEN as u64,
+            },
+            GuestRamRegion {
+                gpa_base: 0x1_0000_0000,
+                host_va: block(),
+                len: LEN as u64,
+            },
+        ])
+    }
+
     /// Run `body` with a granularity and an explicit span ceiling latched, so a
     /// test about chunking is not also a test about the heap.
     fn with_span_max<R>(align: u64, span_max: u64, body: impl FnOnce() -> R) -> R {
@@ -1179,6 +1331,104 @@ mod tests {
         });
     }
 
+    /// A RAMBlock whose memory the driver will not import puts the whole map on
+    /// a standing refusal, as a guest too big for the heap does and for the
+    /// same reason.
+    ///
+    /// [`resolve`] decides from what was published — spans, granularity,
+    /// budget — and never hears the driver. radv answers a `MAP_SHARED` memfd
+    /// RAMBlock, which is QEMU's `memory-backend-memfd,share=on`, with
+    /// `VK_ERROR_INVALID_EXTERNAL_HANDLE` while its capability probe reports
+    /// the import supported, so the map kept licensing references the engine
+    /// could never bind. Refusing only the chunk the driver named would leave
+    /// the partial import [`MapRefusal::ImportExceedsHeap`] exists to prevent.
+    #[test]
+    fn an_import_the_driver_refuses_stands_the_whole_map_on_its_refusal() {
+        with_granularity(Some(0x1000), || {
+            let capture = crate::observe::FailCapture::start();
+            let mut host = two_spans();
+            assert_eq!(standing_refusal(&mut host), None);
+            let held = imports();
+            assert_eq!(held.len(), 2);
+            let reason = "host_ram_import_allocate_memory";
+            assert!(refuse_import(held[1].id(), reason));
+            let want = MapRefusal::BackendRefusedImport {
+                gpa: 0x1_0000_0000,
+                reason,
+            };
+            assert_eq!(standing_refusal(&mut host), Some(want));
+            assert_eq!(imports().len(), 0, "no partial import is left behind");
+            assert_eq!(
+                reference(&mut host, 0x2000, 8).err(),
+                Some(want),
+                "the span the driver never named takes the copying rails too"
+            );
+            assert_eq!(packed_alias_import_align(&mut host, 0x1000), None);
+            assert!(
+                !refuse_import(held[0].id(), reason),
+                "a map already standing on a refusal has nothing left to refuse"
+            );
+            let line = capture.one(EVENT);
+            assert!(
+                line.contains("reason=guest_ram_map_backend_refused_import"),
+                "{line}"
+            );
+            assert!(line.contains("gpa=0x100000000"), "{line}");
+            assert!(line.contains(&format!("import={reason}")), "{line}");
+            assert!(!line.starts_with("OFF "), "a lost rail is a failure");
+        });
+    }
+
+    /// The refusal belongs to the device it was made against. A recreate
+    /// rebuilds the map with fresh identities, and a refusal that arrives naming
+    /// an import from before it must not take the new device's rail off — the
+    /// new device has not asked its driver yet.
+    #[test]
+    fn a_refusal_lasts_for_its_device_and_names_only_its_own_imports() {
+        with_granularity(Some(0x1000), || {
+            let mut host = two_spans();
+            assert_eq!(standing_refusal(&mut host), None);
+            let before = imports();
+            assert!(refuse_import(before[0].id(), "host_ram_import_too_small"));
+            assert!(standing_refusal(&mut host).is_some());
+            reset();
+            assert_eq!(
+                standing_refusal(&mut host),
+                None,
+                "a recreated device asks its own driver"
+            );
+            assert!(!refuse_import(
+                before[1].id(),
+                "host_ram_import_allocate_memory"
+            ));
+            assert_eq!(standing_refusal(&mut host), None);
+            assert_eq!(imports().len(), 2);
+        });
+    }
+
+    /// Before the map exists there is nothing to refuse, and the refusal must
+    /// not invent a map either: the warm that would build it may still be
+    /// waiting on a granularity.
+    #[test]
+    fn a_refusal_before_the_map_resolves_latches_nothing() {
+        with_granularity(Some(0x1000), || {
+            let stray = GuestRamImport::new(
+                GuestRamRegion {
+                    gpa_base: 0,
+                    host_va: 0x7f00_0000_0000,
+                    len: 0x1000,
+                },
+                0x1000,
+            )
+            .expect("a plausible region");
+            assert!(!refuse_import(
+                stray.id(),
+                "host_ram_import_allocate_memory"
+            ));
+            assert!(MAP.lock().unwrap_or_else(|p| p.into_inner()).is_none());
+        });
+    }
+
     /// A backend that publishes a granularity beside a zero budget has published
     /// nothing: the pair is withdrawn, and the map reads it as a host that cannot
     /// import. Without this, a zero budget would refuse every guest by name and
@@ -1208,7 +1458,7 @@ mod tests {
     #[test]
     fn warming_before_the_backend_publishes_a_granularity_latches_nothing() {
         with_granularity(None, || {
-            let mut host = two_spans();
+            let mut host = owned_two_spans();
             warm(&mut host);
             assert!(
                 MAP.lock().unwrap_or_else(|p| p.into_inner()).is_none(),
@@ -1233,12 +1483,12 @@ mod tests {
     #[test]
     fn warming_is_idempotent_and_equals_what_the_lazy_path_would_resolve() {
         let lazy = with_granularity(Some(0x1000), || {
-            let mut host = two_spans();
+            let mut host = owned_two_spans();
             let refusal = standing_refusal(&mut host);
             (refusal, imports().len())
         });
         let warmed = with_granularity(Some(0x1000), || {
-            let mut host = two_spans();
+            let mut host = owned_two_spans();
             warm(&mut host);
             warm(&mut host);
             let refusal = standing_refusal(&mut host);
@@ -1451,6 +1701,23 @@ mod tests {
                 Err(GuestRamError::SliceForeignImport { .. })
             ));
         });
+    }
+
+    /// The bound's refusal, restated by the map, is still the bound's: it
+    /// forwards the slug, so it forwards the owner, or the two read as two
+    /// claimants for one check.
+    #[test]
+    fn an_outside_import_refusal_keeps_the_bounds_owner() {
+        use crate::observe::Decline;
+        let bound = GuestRamError::RegionUnmapped;
+        let refusal = MapRefusal::OutsideImport(bound);
+        assert_eq!(refusal.owner(), bound.owner());
+        crate::observe::Emit::decline("guest_ram_map_test_bound", &bound).off();
+        crate::observe::Emit::decline("guest_ram_map_test_outside", &refusal).off();
+        assert_eq!(
+            MapRefusal::NoBackendImport.owner(),
+            std::any::type_name::<MapRefusal>()
+        );
     }
 
     /// The refusals reach the always-on log, and the expected one does not

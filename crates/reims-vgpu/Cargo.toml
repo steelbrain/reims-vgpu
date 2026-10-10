@@ -137,6 +137,12 @@ reims-vgpu-observe = { path = "../reims-vgpu-observe", features = ["testing"] }
 # crate's decoders. Test-only: nothing here reaches the staticlib QEMU links.
 serde_json = "1"
 
+# `memfd_create` and a `MAP_SHARED` view of it, for the test that hands the
+# driver guest RAM shaped like QEMU's `memory-backend-memfd,share=on`. Already
+# in the graph through the windowing stack; test-only.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+libc = "0.2"
+
 [build-dependencies]
 # The oracle-capture presence probe, shared with every suite that reads it.
 reims-vgpu-testkit = { path = "../reims-vgpu-testkit" }

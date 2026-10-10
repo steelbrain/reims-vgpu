@@ -170,6 +170,15 @@ impl crate::observe::Decline for GpuWritebackDecline {
             Self::Engine { inner } => crate::observe::Decline::fields(inner),
         }
     }
+
+    /// Delegated where `slug` is: the engine's check keeps the engine's name,
+    /// or this rail reads as a second claimant for a slug it only passed on.
+    fn owner(&self) -> &'static str {
+        match self {
+            Self::Engine { inner } => crate::observe::Decline::owner(inner),
+            _ => std::any::type_name::<Self>(),
+        }
+    }
 }
 
 crate::observe::decline::decline_display!(GpuWritebackDecline);
@@ -762,6 +771,26 @@ mod tests {
     use crate::model::DeviceId;
     use crate::protocol::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
     use crate::runtime::host::FakeHost;
+
+    /// An engine decline restated by this rail is still the engine's check, so
+    /// its slug stays claimed for the type that spelled it. See the same test on
+    /// `GuestWriteDecline` for the collision this was on a live boot.
+    #[test]
+    fn an_engine_decline_keeps_its_owner_through_this_rail() {
+        use crate::backend::vulkan::engine::GuestWriteDecline;
+        use crate::observe::Decline;
+        let engine = GuestWriteDecline::NoSharedBacking;
+        let declined = GpuWritebackDecline::Engine {
+            inner: crate::backend::vulkan::engine::DrawError::GuestPageWrite(engine),
+        };
+        assert_eq!(declined.owner(), engine.owner());
+        crate::observe::Emit::decline("mapping_write_test_engine", &engine).off();
+        crate::observe::Emit::decline("mapping_write_test_wrapped", &declined).off();
+        assert_eq!(
+            GpuWritebackDecline::NotWritable.owner(),
+            std::any::type_name::<GpuWritebackDecline>()
+        );
+    }
 
     #[test]
     fn a_store_recorded_by_its_draw_needs_no_second_engine_sync() {

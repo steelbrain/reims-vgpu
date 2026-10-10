@@ -28,12 +28,12 @@ struct DispatchStep {
     push: Option<(u32, ComputeDispatchPayload)>,
 }
 
-struct PreparedStorageImage {
+struct PreparedStorageImage<'r> {
     binding: u32,
     array_element: u32,
     slot: StorageImageSlot,
     seed: Option<BufferSlot>,
-    dst: ComputeImageDst,
+    dst: ComputeImageDst<'r>,
     len: usize,
     width: u32,
     height: u32,
@@ -103,7 +103,7 @@ impl PreparedSampledImage {
 }
 
 /// Post-dispatch copy destination for one storage image.
-enum ComputeImageDst {
+enum ComputeImageDst<'r> {
     /// Pooled host-visible buffer; the CPU reads it back and the runtime
     /// writes guest pages itself.
     Readback(BufferSlot),
@@ -119,7 +119,14 @@ enum ComputeImageDst {
     /// bounds-checked against the one RAMBlock import that produced it. The
     /// bound is the type, which is the whole argument in
     /// `runtime/guest_ram.rs`.
-    Direct(super::GuestCopyPlan),
+    ///
+    /// `pages` rides with the plan because the write debt is owed on exactly
+    /// the copies that were planned: a destination the engine refused never
+    /// becomes this arm, so it can never arm a debt on pages nothing writes.
+    Direct {
+        plan: super::GuestCopyPlan,
+        pages: &'r [u64],
+    },
 }
 
 pub(crate) fn validate_compute(req: &ComputeRequest) -> Result<(), DrawError> {
@@ -787,14 +794,37 @@ pub(crate) unsafe fn execute_compute_inner(
         // Where the output goes is the caller's decision, not this rail's: a
         // request that named guest pages licensed them first, and one that did
         // not gets the pooled readback and the device→host crossing with it.
+        //
+        // The licence is taken before anything has tried the import, though,
+        // and the import is what can still say no: a driver that will not take
+        // the RAMBlock's backing, a parent the guest has retired, a transient
+        // out-of-memory. `GuestPageWrite` is a routing answer by its own
+        // contract — the frame owes the CPU route — so a refused destination
+        // takes the readback the `Host` arm would have and the runtime lands it
+        // through its copying rail, exactly as the render and GVA Stores do
+        // after their own direct arm declines. Failing the dispatch instead
+        // wrote the image nowhere.
         let dst = match &resource.destination {
             super::types::ComputeImageDestination::Host => ComputeImageDst::Readback(
                 pools.acquire_readback_extra(ctx, resource.bytes.len() as u64, counters)?,
             ),
-            super::types::ComputeImageDestination::GuestPages { target, .. } => {
-                ComputeImageDst::Direct(unsafe {
-                    super::plan_guest_copy(ctx, pools, counters, target)?
-                })
+            super::types::ComputeImageDestination::GuestPages { target, pages } => {
+                match unsafe { super::plan_guest_copy(ctx, pools, counters, target) } {
+                    Ok(plan) => ComputeImageDst::Direct { plan, pages },
+                    Err(DrawError::GuestPageWrite(decline)) => {
+                        crate::observe::Emit::decline("compute_dst_gpu_declined", &decline)
+                            .field("binding", resource.binding)
+                            .field("geom", format!("{}x{}", resource.width, resource.height))
+                            .fail_once(0);
+                        crate::runtime::drain::note_store_route("compute_dst_host_engine_declined");
+                        ComputeImageDst::Readback(pools.acquire_readback_extra(
+                            ctx,
+                            resource.bytes.len() as u64,
+                            counters,
+                        )?)
+                    }
+                    Err(other) => return Err(other),
+                }
             }
         };
         simg_slots.push(PreparedStorageImage {
@@ -1325,7 +1355,7 @@ pub(crate) unsafe fn execute_compute_inner(
                     &copy,
                 );
             }
-            ComputeImageDst::Direct(plan) => {
+            ComputeImageDst::Direct { plan, .. } => {
                 // Recorded into the dispatch's own command buffer, so the whole
                 // thing is still one submission and one fence. Both calls are
                 // the render rail's, unchanged: the plan already describes
@@ -1396,9 +1426,11 @@ pub(crate) unsafe fn execute_compute_inner(
     // here — before any fallible step below, because a failure past the submit
     // does not un-submit the copy and the pages are being written either way.
     //
-    // Read straight off the request rather than off `simg_slots`, so nothing
-    // depends on the two being the same length in the same order — and so the
-    // destination and the residency that decide the source are read off one
+    // Read off the prepared record rather than the request, because the record
+    // is what was recorded: a destination the request named and the engine
+    // refused took the readback, and arming a debt for it would order every
+    // later stamp behind a copy that was never queued. The destination, its
+    // pages and the residency that decides the source are still read off one
     // record, which is the only way they cannot disagree.
     //
     // Which source applies is a fact about where the image lives. A transient
@@ -1406,11 +1438,9 @@ pub(crate) unsafe fn execute_compute_inner(
     // before the fence retires, so the ring is its lifetime. A registered
     // resident was popped out of that live set at acquire and lives in the
     // compute-storage registry instead, so it needs the pin.
-    for resource in &req.storage_images {
-        if let super::types::ComputeImageDestination::GuestPages { pages, .. } =
-            &resource.destination
-        {
-            let source = match &resource.residency {
+    for prepared in &simg_slots {
+        if let ComputeImageDst::Direct { pages, .. } = &prepared.dst {
+            let source = match &prepared.residency {
                 Some(residency) => super::GuestWriteSource::ResidentStorage(&residency.identity),
                 None => super::GuestWriteSource::RingEntry,
             };
@@ -1501,7 +1531,7 @@ pub(crate) unsafe fn execute_compute_inner(
             // that is the saving this arm exists for, and a bump here would
             // report it as still being paid. `bytes` is what the queued copy
             // lands, for the caller's own census.
-            ComputeImageDst::Direct(_) => {
+            ComputeImageDst::Direct { .. } => {
                 images.push(super::types::ComputeImageResult::Landed {
                     bytes: prepared.len as u64,
                 });

@@ -54,6 +54,7 @@ fn note_stamp_guest_ref_refusal(refusal: &crate::runtime::guest_ram_map::MapRefu
         MapRefusal::HostRefused(_) => "stamp_guest_ref_host_refused",
         MapRefusal::NoUsableRegion { .. } => "stamp_guest_ref_no_usable_region",
         MapRefusal::ImportExceedsHeap { .. } => "stamp_guest_ref_import_exceeds_heap",
+        MapRefusal::BackendRefusedImport { .. } => "stamp_guest_ref_backend_refused_import",
         MapRefusal::GpaNotInAnyImport { .. } => "stamp_guest_ref_gpa_not_imported",
         MapRefusal::OutsideImport(_) => "stamp_guest_ref_outside_import",
         MapRefusal::Scattered { .. } => "stamp_guest_ref_scattered",

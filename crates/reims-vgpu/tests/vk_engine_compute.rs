@@ -746,6 +746,116 @@ fn every_admitted_compute_storage_resident_survives_past_the_retired_slot_cap() 
     }
 }
 
+/// A storage image licensed to land in guest pages whose import the engine
+/// then refuses still produces its pixels, through the readback.
+///
+/// `ComputeImageDestination::GuestPages` is chosen by the runtime before the
+/// engine has tried the import, and the import is what can say no — a driver
+/// that will not take the RAMBlock's backing (radv refuses shared memfd memory
+/// with `VK_ERROR_INVALID_EXTERNAL_HANDLE`), a parent the guest retired, a
+/// transient out-of-memory. The refusal used to fail the whole dispatch, so the
+/// image was written nowhere: on that radv host every iOS Simulator frame,
+/// which SimRenderServer composites with exactly this dispatch, stayed zeros.
+///
+/// A retired parent is the deterministic stand-in for the driver: it reaches
+/// the same `GuestPageWrite(Import { .. })` answer with no GPU-specific setup.
+#[test]
+fn compute_storage_image_whose_guest_pages_are_refused_is_read_back() {
+    use reims_vgpu::backend::vulkan::engine::{ComputeImageDestination, GuestPageTarget};
+    use reims_vgpu::runtime::guest_ram::{GuestRamImport, GuestRamRegion, GuestRef};
+    use reims_vgpu::runtime::guest_ram_map::GuestWindowRun;
+
+    let _g = engine_test_session();
+    let spvasm = &storage_image_write_red_kernel("Rgba8");
+    let Some(words) = assemble_spvasm(spvasm, "simg_refused_guest_pages") else {
+        return;
+    };
+    let w = 4u32;
+    let h = 4u32;
+    let len = u64::from(w * h * 4);
+    // Never dereferenced: the retired parent is refused before any import.
+    let import = std::sync::Arc::new(
+        GuestRamImport::new(
+            GuestRamRegion {
+                gpa_base: 0x10_0000,
+                host_va: 0x7f00_0000_0000,
+                len: 0x10_0000,
+            },
+            4096,
+        )
+        .expect("a plausible RAMBlock"),
+    );
+    let guest = GuestRef::new(
+        std::sync::Arc::clone(&import),
+        import.slice(0, len).expect("inside the import"),
+    )
+    .expect("its own import");
+    import.retire();
+    let target = GuestPageTarget {
+        runs: vec![GuestWindowRun {
+            window_offset: 0,
+            guest,
+        }],
+        row_length_texels: w,
+        width: w,
+        height: h,
+        format: ash::vk::Format::R8G8B8A8_UNORM,
+        shared_backing: None,
+    };
+    let req = ComputeRequest {
+        spirv: words,
+        entry: "main".into(),
+        dispatch: engine::ComputeDispatch::Workgroups([w, h, 1]),
+        storage_buffers: vec![],
+        sampled_images: vec![],
+        samplers: vec![],
+        storage_images: vec![ComputeStorageImageResource {
+            destination: ComputeImageDestination::GuestPages {
+                target: Box::new(target),
+                pages: vec![0x10_0000],
+            },
+            binding: 0,
+            array_element: 0,
+            descriptor_count: 1,
+            format: StorageImageFormat::Rgba8Unorm,
+            width: w,
+            height: h,
+            bytes: vec![0u8; len as usize],
+            residency: None,
+            seed_skipped: false,
+        }],
+    };
+    engine::quiesce_guest_writes();
+    let capture = reims_vgpu_observe::FailCapture::start();
+    let Some(out) = engine_or_skip("simg_refused_guest_pages", &req) else {
+        return;
+    };
+    assert_eq!(out.images.len(), 1);
+    let bytes = out.images[0]
+        .bytes()
+        .expect("a refused direct destination is read back, not reported landed");
+    assert_eq!(bytes.len(), len as usize);
+    for p in bytes.as_chunks::<4>().0 {
+        assert!(
+            p[0] >= 254 && p[1] == 0 && p[2] == 0 && p[3] >= 254,
+            "unexpected texel {p:?}"
+        );
+    }
+    assert!(
+        !engine::guest_writes_outstanding(),
+        "no copy into guest pages was queued, so none may be owed"
+    );
+    // A degraded route, so it is named on the fail channel with the check that
+    // refused and the image it cost.
+    let line = capture.one("compute_dst_gpu_declined");
+    assert!(line.contains("reason=host_ram_import_retired"), "{line}");
+    assert!(line.contains("binding=0"), "{line}");
+    assert!(
+        !line.starts_with("OFF "),
+        "a degraded route is a failure line"
+    );
+}
+
 /// Regression lock for the BGRA storage-composite R/B fix: a guest `BGRA8Unorm`
 /// storage surface composites through a format-less (`Unknown`) SPIR-V storage
 /// image viewed `B8G8R8A8_UNORM`, so a shader that writes logical red `(1,0,0,1)`

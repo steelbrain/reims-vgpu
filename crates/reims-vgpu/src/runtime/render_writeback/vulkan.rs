@@ -403,6 +403,15 @@ impl crate::observe::Decline for GvaWritebackDecline {
             Self::CopiedWriteRefused { err } => vec![("err", format!("{err:?}"))],
         }
     }
+
+    /// Delegated where `slug` is: the engine's check keeps the engine's name,
+    /// or this rail reads as a second claimant for a slug it only passed on.
+    fn owner(&self) -> &'static str {
+        match self {
+            Self::Engine { inner } => crate::observe::Decline::owner(inner),
+            _ => std::any::type_name::<Self>(),
+        }
+    }
 }
 
 crate::observe::decline::decline_display!(GvaWritebackDecline);
@@ -937,6 +946,26 @@ mod gva_copying_arm_tests {
     const W: u32 = 4;
     const H: u32 = 2;
     const BPR: u32 = 16;
+
+    /// An engine decline restated by this rail is still the engine's check, so
+    /// its slug stays claimed for the type that spelled it. See the same test on
+    /// `GuestWriteDecline` for the collision this was on a live boot.
+    #[test]
+    fn an_engine_decline_keeps_its_owner_through_this_rail() {
+        use crate::backend::vulkan::engine::GuestWriteDecline;
+        use crate::observe::Decline;
+        let engine = GuestWriteDecline::NoSharedBacking;
+        let declined = GvaWritebackDecline::Engine {
+            inner: crate::backend::vulkan::engine::DrawError::GuestPageWrite(engine),
+        };
+        assert_eq!(declined.owner(), engine.owner());
+        crate::observe::Emit::decline("gva_writeback_test_engine", &engine).off();
+        crate::observe::Emit::decline("gva_writeback_test_wrapped", &declined).off();
+        assert_eq!(
+            GvaWritebackDecline::Unlicensed.owner(),
+            std::any::type_name::<GvaWritebackDecline>()
+        );
+    }
 
     fn fixture() -> (FakeHost, DeviceState) {
         let mut host = FakeHost::new();

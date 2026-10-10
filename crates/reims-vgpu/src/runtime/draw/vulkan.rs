@@ -3022,6 +3022,11 @@ fn guest_page_window<M: HostOps>(
                 // reading this is one where raising the heap or lowering `-m`
                 // would restore the rail, which is not true of any other band.
                 MapRefusal::ImportExceedsHeap { .. } => "zc_buf_over_heap",
+                // Also its own band: the host has the extension and the guest
+                // fits, and what refused is the driver, about the memory QEMU
+                // backs guest RAM with. A different `-object memory-backend-*`
+                // or another driver is the repair, which is true of no other.
+                MapRefusal::BackendRefusedImport { .. } => "zc_buf_backend_refused",
                 MapRefusal::GpaNotInAnyImport { .. } => "zc_buf_gpa_unbacked",
                 MapRefusal::OutsideImport(_) => "zc_buf_outside_import",
                 // `references_for_runs` reaches this only for a window it could

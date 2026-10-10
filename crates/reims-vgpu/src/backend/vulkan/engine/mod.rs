@@ -5031,8 +5031,11 @@ pub fn warm_guest_ram_imports(
             }
             Ok(false) => {}
             // The draw path asks again and declines there with the same reason,
-            // so this is reported and not propagated: a warm that could not
-            // import must not be the thing that decides the rail is off.
+            // so this is reported and not propagated. Whether the refusal takes
+            // the rail off is not the warm's call either way: the import made
+            // it, on what the driver said rather than on who asked, and told
+            // the guest-RAM map, which every later chunk of this loop then
+            // meets as `host_ram_import_map_refused` without a driver call.
             Err(inner) => crate::observe::Emit::decline("vk_guest_ram_warm", &inner).fail_once(0),
         }
     }
