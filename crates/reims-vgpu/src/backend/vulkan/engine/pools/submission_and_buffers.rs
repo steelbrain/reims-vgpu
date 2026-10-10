@@ -309,6 +309,7 @@ impl ResourcePools {
             registry_order: VecDeque::new(),
             reclaimed_recent: VecDeque::new(),
             window_published: Vec::new(),
+            window_shown: None,
             registry_non_pinned_peak: 0,
             registry_non_pinned: NonPinnedTotals::default(),
             registry_non_pinned_peak_bytes: 0,

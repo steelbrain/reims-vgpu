@@ -197,6 +197,13 @@ impl ResourcePools {
         // the loop below is the only `drain` this registry has, so no wholesale
         // destruction can reach it without passing this.
         self.invalidate_window_sources();
+        // Guarded where the publish half above is not: an empty publish set
+        // still has an epoch worth moving here, but a pools showing nothing has
+        // no shown licence left to end. `invalidate_window_shown` already moved
+        // the stamp when it cleared the last one.
+        if self.window_shown.is_some() {
+            self.invalidate_window_shown();
+        }
         for (_, t) in self.registry.drain() {
             device.destroy_framebuffer(t.framebuffer, None);
             for (_, view) in t.alternate_views {

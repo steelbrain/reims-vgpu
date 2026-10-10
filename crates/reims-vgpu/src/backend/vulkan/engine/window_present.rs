@@ -204,6 +204,50 @@ impl crate::observe::Decline for SlateReason {
     }
 }
 
+/// The resident the presenter's last direct present blitted, as that present
+/// left it.
+///
+/// This is what a resize shows. The window thread forces a redraw after every
+/// `Resized`, because the rebuilt swapchain's images hold nothing, and the
+/// redraw re-offers the source the window already presented. That source is
+/// stale by construction, because the present's own access write-back moved
+/// `WINDOW_SOURCE_EPOCH`. So the re-present fell to slate, and with no host
+/// copy behind it the window stayed blank until the guest drew again. On an idle
+/// desktop that is until the user clicks into it. The live log said
+/// `host_window_slate reason=slate_source_stale` once per resize.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ShownResident {
+    identity: super::types::TargetIdentity,
+    /// The publish's resolution with the access the write-back recorded. That
+    /// is the access the image is in now, and the one a barrier over it must
+    /// name.
+    resolved: super::pools::ResolvedResident,
+    /// `WINDOW_SHOWN_EPOCH` as `ResourcePools::note_window_shown` returned it,
+    /// taken right after the write-back and under the same lock.
+    stamp: u64,
+}
+
+/// The resolution a stale `source` may still be shown from, if it names the
+/// resident the presenter last showed and nothing has touched that resident
+/// since.
+///
+/// The publication the source came from is deliberately not compared. A stale
+/// source naming the shown identity is either the one the window already
+/// presented, or a later republish of the same surface. Either way the image
+/// has not been written since the shown blit, because any write moves its
+/// access and so the shown stamp. What it holds is what the window last put on
+/// screen, which is the most a re-show ever claims. The identity carries the
+/// extent and generation, so an equal identity is also an equal geometry.
+fn reshow_from(
+    shown: Option<&ShownResident>,
+    source: &WindowPresentSource,
+    shown_epoch_now: u64,
+) -> Option<(super::types::TargetIdentity, super::pools::ResolvedResident)> {
+    shown
+        .filter(|shown| shown.stamp == shown_epoch_now && shown.identity == source.identity)
+        .map(|shown| (shown.identity.clone(), shown.resolved))
+}
+
 /// Why the CPU fallback source could not be staged.
 ///
 /// Its own type rather than a `DrawError` because the present does not abort on
@@ -557,6 +601,9 @@ pub(crate) struct WindowPresenter {
     /// a second query is a second answer that could disagree with the one
     /// attach already refused on.
     present_family_supported: bool,
+    /// What the last direct present blitted, kept so a forced redraw can show
+    /// it again once its publish has gone stale. See [`ShownResident`].
+    shown: Option<ShownResident>,
 }
 
 /// Everything one in-flight present owns for as long as its blit is running.
@@ -819,6 +866,7 @@ impl WindowPresenter {
             // Attach refused above unless this was true, so the presenter that
             // exists is one whose queue can address its surface.
             present_family_supported: present_capable,
+            shown: None,
         };
         // A window created while minimized has no swapchain yet, which is not a
         // failure to attach: `begin_present` retries every frame until the
@@ -1165,11 +1213,32 @@ impl WindowPresenter {
         // still standing: the image is registered, its pixels landed, its byte
         // order is the scanout's, its extent is the one being presented, and the
         // barrier below names the access the image is actually in.
+        //
+        // A stale source still has one way to the screen. If it names the
+        // resident this presenter last showed, and that resident's shown stamp
+        // still holds, the image is exactly as the shown blit left it. That is
+        // how a forced redraw after a resize repaints the picture already on
+        // screen instead of slate. See [`ShownResident`].
         let stale =
             source.is_some_and(|source| source.epoch != super::pools::window_source_epoch());
-        let selected = source
-            .filter(|_| !stale)
-            .map(|source| (source.identity.clone(), source.resolved));
+        let selected = match source {
+            Some(source) if !stale => Some((source.identity.clone(), source.resolved)),
+            Some(source) => {
+                let reshown = reshow_from(
+                    self.shown.as_ref(),
+                    source,
+                    super::pools::window_shown_epoch(),
+                );
+                if let Some((_, now)) = reshown.as_ref() {
+                    crate::observe::off(format!(
+                        "host_window_reshow extent={}x{} into={}x{}",
+                        now.width, now.height, self.extent.width, self.extent.height
+                    ));
+                }
+                reshown
+            }
+            None => None,
+        };
         // Only reached when no resident carries this present: upload the CPU
         // bytes instead. `None` here means the window shows slate.
         let staged = if selected.is_some() {
@@ -1408,6 +1477,20 @@ impl WindowPresenter {
             if let Some(staging) = self.staging.as_mut() {
                 staging.transitioned = true;
             }
+        }
+        // The shown licence, taken only once the blit that earns it is queued.
+        // Still under the lock the write-back above was made under, so the
+        // stamp is the one that write left. A failed submit takes none and
+        // leaves any earlier licence to its own stamp.
+        if let Some((identity, now)) = selected.as_ref() {
+            self.shown = Some(ShownResident {
+                identity: identity.clone(),
+                resolved: super::pools::ResolvedResident {
+                    access: super::pools::ResidentAccess::transfer_read(now.guest_imported),
+                    ..*now
+                },
+                stamp: pools.note_window_shown(identity),
+            });
         }
 
         let direct = selected.is_some();
@@ -2150,6 +2233,99 @@ mod tests {
         assert!(
             images(2) < PRESENT_IN_FLIGHT,
             "a surface capped at two is the case the depth cannot be served in"
+        );
+    }
+
+    fn shown_surface(id: u32) -> super::super::types::TargetIdentity {
+        super::super::types::TargetIdentity::Surface {
+            id,
+            width: 1920,
+            height: 1080,
+            generation: 0,
+            format: translate::pixel::SCANOUT_FORMAT,
+        }
+    }
+
+    fn resolution(
+        access: super::super::pools::ResidentAccess,
+    ) -> super::super::pools::ResolvedResident {
+        super::super::pools::ResolvedResident {
+            image: vk::Image::null(),
+            access,
+            width: 1920,
+            height: 1080,
+            guest_imported: false,
+        }
+    }
+
+    /// A publish as the drain hands it over: the resident in the colour-write
+    /// access its last render left it in, stamped at `epoch`.
+    fn published(id: u32, epoch: u64) -> WindowPresentSource {
+        WindowPresentSource {
+            width: 1920,
+            height: 1080,
+            identity: shown_surface(id),
+            epoch,
+            resolved: resolution(super::super::pools::ResidentAccess::ColorWrite(
+                vk::ImageLayout::GENERAL,
+            )),
+        }
+    }
+
+    /// What `begin_present` records after blitting `id`: the publish's
+    /// resolution with the access its write-back left.
+    fn shown_after_blit(id: u32, stamp: u64) -> ShownResident {
+        ShownResident {
+            identity: shown_surface(id),
+            resolved: resolution(super::super::pools::ResidentAccess::transfer_read(false)),
+            stamp,
+        }
+    }
+
+    /// The resize case, which is the bug: the window re-offers the source it
+    /// has already presented, whose stamp its own write-back made stale. The
+    /// resident is shown again, and from the access the write-back left rather
+    /// than the colour-write access the publish resolved, which the image has
+    /// already left.
+    #[test]
+    fn a_stale_source_naming_the_shown_resident_is_shown_again_from_the_written_back_access() {
+        let source = published(1, 7);
+        let shown = shown_after_blit(1, 3);
+        let (identity, now) =
+            reshow_from(Some(&shown), &source, 3).expect("nothing has touched the shown resident");
+        assert_eq!(identity, source.identity);
+        assert_eq!(
+            now.access,
+            super::super::pools::ResidentAccess::transfer_read(false),
+            "the barrier must start from where the last blit left the image"
+        );
+        assert_eq!(
+            (now.image, now.width, now.height),
+            (vk::Image::null(), 1920, 1080)
+        );
+    }
+
+    /// Once anything has touched the shown resident (a render into it, a format
+    /// change, its removal, a device reset, or another resident shown in its
+    /// place), its stamp has moved and the stale source gets nothing.
+    #[test]
+    fn a_moved_shown_stamp_shows_nothing_again() {
+        let source = published(1, 7);
+        let shown = shown_after_blit(1, 3);
+        assert_eq!(reshow_from(Some(&shown), &source, 4), None);
+    }
+
+    /// A stale source naming a resident other than the one shown is never
+    /// carried by the shown one. That would put an older picture up for a newer
+    /// publish.
+    #[test]
+    fn a_stale_source_naming_another_resident_is_not_carried_by_the_shown_one() {
+        let shown = shown_after_blit(1, 3);
+        assert_eq!(reshow_from(Some(&shown), &published(2, 7), 3), None);
+        assert_eq!(
+            reshow_from(None, &published(1, 7), 3),
+            None,
+            "nothing shown yet"
         );
     }
 }

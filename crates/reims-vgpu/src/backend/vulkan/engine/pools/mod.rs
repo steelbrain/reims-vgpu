@@ -425,6 +425,21 @@ pub(crate) struct ResourcePools {
     /// what it has handed out, kept on the side of the boundary that has the
     /// device.
     window_published: Vec<TargetIdentity>,
+    /// The resident the host window's last direct present blitted from, and so
+    /// the picture on screen, from that present's access write-back until
+    /// something changes it. Answered for by [`WINDOW_SHOWN_EPOCH`].
+    ///
+    /// Not a member of `window_published`, and it cannot be one. The
+    /// write-back is a change under a published identity, so it empties that
+    /// set, and that is what keeps a double-buffered guest's next frame
+    /// presentable: the guest renders into the buffer the window has just shown
+    /// while the other one is published, and if the shown one were still
+    /// vouched for, that render would move [`WINDOW_SOURCE_EPOCH`] and stale the
+    /// publish the window is about to take.
+    ///
+    /// Written by the presenter alone, at the same site and under the same lock
+    /// as the write-back, and through [`ResourcePools::note_window_shown`].
+    window_shown: Option<TargetIdentity>,
     /// Highest non-pinned resident population this device has held, in slots.
     /// Reported as `registry_pressure`'s `peak`, beside the bytes the same
     /// sample occupied — the pair is what says a slot count was never a proxy
@@ -1223,6 +1238,34 @@ pub(crate) fn window_source_epoch() -> u64 {
     WINDOW_SOURCE_EPOCH.load(std::sync::atomic::Ordering::Acquire)
 }
 
+/// Bumped whenever the resident the host window last blitted from stops being
+/// what that blit left behind: its access or format changes, it leaves the
+/// registry, the registry goes away, or the window shows a different one.
+///
+/// The window's licence to show that resident again without a new publish,
+/// which is what a resize asks for. The swapchain is rebuilt, its images hold
+/// nothing, and the frame to fill them with is the one already on screen. That
+/// frame's [`WINDOW_SOURCE_EPOCH`] stamp cannot vouch for it, because the
+/// present's own write-back to `TransferRead` moved that epoch, and on purpose.
+/// So a resize showed slate until the guest drew again, which an idle desktop
+/// may not do for minutes.
+///
+/// This licence vouches for the access the presenter wrote back and not the
+/// one the publish resolved, which is why it can survive the write-back. It is
+/// a counter of its own rather than one more member of `window_published`,
+/// because that set's epoch has to keep moving for the reasons
+/// [`ResourcePools::window_shown`] gives. Like that epoch, it is global and
+/// moves conservatively. A spurious bump costs one present from host memory,
+/// or slate where no host copy exists, and a missed bump would be a barrier
+/// from an access the image has left.
+pub(crate) static WINDOW_SHOWN_EPOCH: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
+/// The stamp a re-show of the resident on screen must still match.
+pub(crate) fn window_shown_epoch() -> u64 {
+    WINDOW_SHOWN_EPOCH.load(std::sync::atomic::Ordering::Acquire)
+}
+
 pub(crate) type SlotMask = u32;
 
 /// The [`SlotMask`] bit standing for "a host-window present is submitted and not
@@ -1844,6 +1887,12 @@ impl Drop for ResourcePools {
     fn drop(&mut self) {
         if !self.window_published.is_empty() {
             self.invalidate_window_sources();
+        }
+        // On its own guard. The write-back has usually emptied the publish set
+        // by the time a resident is on screen, so the guard above would let a
+        // shown licence outlive its registry.
+        if self.window_shown.is_some() {
+            self.invalidate_window_shown();
         }
     }
 }

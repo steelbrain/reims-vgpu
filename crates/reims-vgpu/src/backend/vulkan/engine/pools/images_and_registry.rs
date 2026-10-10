@@ -697,6 +697,31 @@ impl ResourcePools {
         super::WINDOW_SOURCE_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);
     }
 
+    /// Record that the window's present has just blitted `identity` and
+    /// written its access back, and return the [`super::WINDOW_SHOWN_EPOCH`]
+    /// stamp a later re-show of it must still match.
+    ///
+    /// Called by the presenter right after its write-back, under the same lock,
+    /// so nothing can come between the access it wrote and the stamp. Showing
+    /// the same resident again moves nothing. Showing another one ends the
+    /// previous licence first, because only one picture is on screen.
+    pub(crate) fn note_window_shown(&mut self, identity: &TargetIdentity) -> u64 {
+        if self.window_shown.as_ref() != Some(identity) {
+            self.invalidate_window_shown();
+            self.window_shown = Some(identity.clone());
+        }
+        super::window_shown_epoch()
+    }
+
+    /// Move [`super::WINDOW_SHOWN_EPOCH`] and forget the resident it vouched
+    /// for, for the reason [`Self::invalidate_window_sources`] clears its set:
+    /// the bump has answered for it, and a later change to that resident must
+    /// not move the epoch again for a window that has moved on.
+    pub(super) fn invalidate_window_shown(&mut self) {
+        self.window_shown = None;
+        super::WINDOW_SHOWN_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);
+    }
+
     /// Pin/unpin a resident against removal while its content exists nowhere but
     /// the GPU image. Answers whether a slot was there to pin.
     ///
@@ -948,6 +973,11 @@ impl ResourcePools {
         // it says.
         if self.window_published.contains(identity) {
             self.invalidate_window_sources();
+        }
+        // The shown licence, for the same reason: the image the window would
+        // show again is the one being taken.
+        if self.window_shown.as_ref() == Some(identity) {
+            self.invalidate_window_shown();
         }
         if old.pin_count > 0 {
             // Latched per removal reason: a recreate storm re-enters this with
@@ -2369,6 +2399,9 @@ impl ResourcePools {
         if self.window_published.contains(identity) {
             self.invalidate_window_sources();
         }
+        if self.window_shown.as_ref() == Some(identity) {
+            self.invalidate_window_shown();
+        }
     }
 
     /// The one place a resident's access is written, and the place the host
@@ -2401,10 +2434,14 @@ impl ResourcePools {
     ///
     /// The window's own blit write-back is deliberately not exempt. It moves the
     /// access to `TransferRead`, which genuinely makes the resolution the window
-    /// is holding wrong; a re-present of that same source — reachable through
-    /// `needs_present`'s `redraw_required` on a resize or a suboptimal swapchain
-    /// — must take host memory rather than build a barrier from an access it has
-    /// itself invalidated.
+    /// is holding wrong, so a re-present of that same source must not build a
+    /// barrier from the published access. Such a re-present is reachable through
+    /// `needs_present`'s `redraw_required` on a resize or a suboptimal swapchain.
+    /// It is carried instead by the shown licence the presenter takes right
+    /// after the write-back ([`Self::note_window_shown`]), which vouches for
+    /// the access written here. That licence is checked against this same
+    /// write, below: any later change to the shown resident's access is a write
+    /// into the picture on screen, or a new use of it, and ends the licence.
     fn set_registry_access(&mut self, identity: &TargetIdentity, access: ResidentAccess) {
         let Some(slot) = self.registry.get_mut(identity) else {
             return;
@@ -2415,6 +2452,9 @@ impl ResourcePools {
         slot.access = access;
         if self.window_published.contains(identity) {
             self.invalidate_window_sources();
+        }
+        if self.window_shown.as_ref() == Some(identity) {
+            self.invalidate_window_shown();
         }
     }
 
@@ -3405,6 +3445,164 @@ pub(super) mod pin_count_tests {
             pools.note_window_published(None);
         }
         assert_eq!(super::window_source_epoch(), stamped);
+    }
+
+    /// Serializes the tests below against each other. They are the only code in
+    /// this test binary that moves `WINDOW_SHOWN_EPOCH`, so holding this is
+    /// enough for their equalities to mean what they say.
+    static SHOWN_EPOCH_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn shown_epoch_tests() -> std::sync::MutexGuard<'static, ()> {
+        SHOWN_EPOCH_TESTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Exactly what `begin_present` does to a resident it blits, in its order:
+    /// the access write-back, then the shown licence, under one lock.
+    fn show(pools: &mut ResourcePools, identity: &TargetIdentity) -> u64 {
+        pools.registry_note_access(identity, ResidentAccess::transfer_read(false));
+        pools.note_window_shown(identity)
+    }
+
+    /// A resident published and rendered as the drain leaves one: in a
+    /// colour-write access, and in the window's publish set.
+    fn publish_rendered(pools: &mut ResourcePools, identity: &TargetIdentity) {
+        admit_ready(pools, identity);
+        pools.registry_note_access(
+            identity,
+            ResidentAccess::ColorWrite(vk::ImageLayout::GENERAL),
+        );
+        pools.note_window_published(Some(identity));
+    }
+
+    /// The licence a resize re-shows from survives the write-back that stales
+    /// the publish, and showing the same resident again (a resize after a
+    /// resize) keeps it.
+    ///
+    /// This is the bug's own sequence. The write-back moves
+    /// `WINDOW_SOURCE_EPOCH` by design, so the published stamp cannot carry the
+    /// second present. Before the shown licence existed, nothing could, and the
+    /// window showed slate until the guest drew again.
+    #[test]
+    fn the_shown_licence_outlives_the_blits_own_write_back() {
+        let _serial = shown_epoch_tests();
+        let mut pools = ResourcePools::new();
+        let on_screen = surface(71);
+        publish_rendered(&mut pools, &on_screen);
+        let published = super::window_source_epoch();
+
+        let stamp = show(&mut pools, &on_screen);
+        assert_ne!(
+            super::window_source_epoch(),
+            published,
+            "the write-back stales the publish, which is why the licence exists"
+        );
+        assert_eq!(super::window_shown_epoch(), stamp);
+
+        // A re-show records the same write-back at an access the image already
+        // holds, and takes the same licence again.
+        assert_eq!(show(&mut pools, &on_screen), stamp);
+        assert_eq!(super::window_shown_epoch(), stamp);
+    }
+
+    /// Every way the shown resident can stop being what the blit left behind
+    /// ends the licence: a new use of it, a new interpretation of it, its
+    /// removal, and another resident shown in its place.
+    #[test]
+    fn every_change_to_the_shown_resident_ends_its_licence() {
+        type Change = fn(&mut ResourcePools, &TargetIdentity);
+        let _serial = shown_epoch_tests();
+        let changes: [(&str, Change); 4] = [
+            ("a render into it", |pools, id| {
+                pools
+                    .registry_note_access(id, ResidentAccess::ColorWrite(vk::ImageLayout::GENERAL));
+            }),
+            ("a re-declared format", |pools, id| {
+                pools.set_registry_format(id, rgba_format());
+            }),
+            ("its removal", |pools, id| {
+                assert!(pools
+                    .unregister_resident(id, ResidentReclaim::AllocationReclaimed)
+                    .is_some());
+            }),
+            ("another resident shown", |pools, _| {
+                let other = surface(79);
+                publish_rendered(pools, &other);
+                show(pools, &other);
+            }),
+        ];
+        for (what, change) in changes {
+            let mut pools = ResourcePools::new();
+            let on_screen = surface(72);
+            publish_rendered(&mut pools, &on_screen);
+            let stamp = show(&mut pools, &on_screen);
+            change(&mut pools, &on_screen);
+            assert_ne!(
+                super::window_shown_epoch(),
+                stamp,
+                "{what} must end the licence"
+            );
+        }
+    }
+
+    /// The licence is not a publish, and must not act like one. A guest that
+    /// double-buffers renders its next frame into the buffer the window has
+    /// just shown, while the other buffer is published and not yet presented.
+    /// That render ends the shown licence and leaves the newer publish standing.
+    ///
+    /// This is why the licence has its own counter. Had the presenter kept the
+    /// shown resident in `window_published` instead, the render would move
+    /// `WINDOW_SOURCE_EPOCH` and stale the frame the window is about to take.
+    #[test]
+    fn rendering_into_the_shown_resident_leaves_a_newer_publish_standing() {
+        let _serial = shown_epoch_tests();
+        let mut pools = ResourcePools::new();
+        let front = surface(73);
+        let back = surface(74);
+        publish_rendered(&mut pools, &front);
+        let shown = show(&mut pools, &front);
+
+        publish_rendered(&mut pools, &back);
+        let back_published = super::window_source_epoch();
+
+        pools.registry_note_access(&front, ResidentAccess::ColorWrite(vk::ImageLayout::GENERAL));
+        assert_eq!(
+            super::window_source_epoch(),
+            back_published,
+            "the publish of the other buffer still stands"
+        );
+        assert_ne!(
+            super::window_shown_epoch(),
+            shown,
+            "the shown buffer is being redrawn"
+        );
+    }
+
+    /// A pools that goes away with a resident on screen ends its licence, and
+    /// one that never showed anything moves nothing, for the reasons the
+    /// publish stamp's two drop tests above give.
+    #[test]
+    fn dropping_a_pools_ends_a_shown_licence_and_nothing_else() {
+        let _serial = shown_epoch_tests();
+        let stamp = {
+            let mut pools = ResourcePools::new();
+            let on_screen = surface(75);
+            publish_rendered(&mut pools, &on_screen);
+            show(&mut pools, &on_screen)
+        };
+        assert_ne!(
+            super::window_shown_epoch(),
+            stamp,
+            "the registry it named is gone"
+        );
+
+        let untouched = super::window_shown_epoch();
+        {
+            let mut pools = ResourcePools::new();
+            publish_rendered(&mut pools, &surface(76));
+        }
+        assert_eq!(super::window_shown_epoch(), untouched);
     }
 
     /// Every way out of the resident registry, counted in the source, because
