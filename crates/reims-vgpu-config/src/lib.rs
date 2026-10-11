@@ -1184,6 +1184,9 @@ pub const COLOR_GENERAL: &str = "REIMS_VGPU_COLOR_GENERAL";
 /// still gets its mode — letterboxed into the monitor — which is the same
 /// outcome a tiling compositor already produces. `host_window::present`'s
 /// `WindowMode` owns both halves.
+///
+/// This only picks the mode the window opens in; `Ctrl+Alt+Enter` flips it at run
+/// time either way.
 pub const FULLSCREEN: &str = "REIMS_VGPU_FULLSCREEN";
 }
 

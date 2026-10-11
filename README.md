@@ -178,6 +178,11 @@ grab re-arms by itself the next time you focus the window — it is an escape ha
 have to remember you are in. The guest's own `Cmd+Option+Esc` (Force Quit) carries no `Ctrl` and is
 forwarded to the guest untouched.
 
+**Press `Ctrl+Alt+Enter` to toggle full screen** — the window takes the whole monitor with no title bar,
+and the same chord brings the decorated window back at its old size. Like the release chord it is
+consumed rather than forwarded; `Enter` without both `Ctrl` and `Alt` still reaches the guest.
+`REIMS_VGPU_FULLSCREEN=1` opens the window full screen to begin with.
+
 The window says so on stderr the first time it captures, and records it in the always-on log:
 
 ```text

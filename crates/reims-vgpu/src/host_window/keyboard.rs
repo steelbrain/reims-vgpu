@@ -53,6 +53,15 @@
 //! no Ctrl and is therefore forwarded whole. `force_quit_chord_reaches_the_guest`
 //! holds that apart — an escape hatch that ate the guest's own escape hatch
 //! would be a poor trade.
+//!
+//! # Full screen is the window's, not the guest's
+//!
+//! With the compositor's shortcuts captured, the desktop's own full-screen
+//! binding goes to the guest like every other chord, so the window has to carry
+//! its own. [`FULLSCREEN_CHORD`] is the same Ctrl+Alt pair plus Enter — the binding
+//! VMware's viewers use for the same toggle. It is consumed like the ungrab
+//! chord, but it leaves the held set and the grab alone: the operator is staying
+//! in the window, so the Ctrl and Alt that formed it come up the ordinary way.
 
 use crate::runtime::host::HostAction;
 
@@ -65,6 +74,7 @@ use crate::runtime::host::HostAction;
 /// pins each one against that table so the two cannot drift.
 mod key {
     pub const ESC: u32 = 1;
+    pub const ENTER: u32 = 28;
     pub const LEFTCTRL: u32 = 29;
     pub const LEFTALT: u32 = 56;
     pub const RIGHTCTRL: u32 = 97;
@@ -78,6 +88,10 @@ mod key {
 /// [`GrabState::key_down`] and the operator-facing message must not be able to
 /// disagree about which keys they are.
 pub const UNGRAB_CHORD: &str = "Ctrl+Alt+Esc";
+
+/// The chord that toggles the host window between sized and full screen, as the
+/// operator presses it: Ctrl+Alt+Enter. Either hand, like [`UNGRAB_CHORD`].
+pub const FULLSCREEN_CHORD: &str = "Ctrl+Alt+Enter";
 
 /// Whether the host window is currently asking the compositor for its shortcuts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,6 +114,9 @@ pub struct KeyEffect {
     pub actions: Vec<HostAction>,
     /// The grab state that should now be in force, if it changed.
     pub grab: Option<Grab>,
+    /// The operator pressed [`FULLSCREEN_CHORD`]: the window should flip
+    /// between sized and full screen.
+    pub toggle_fullscreen: bool,
 }
 
 impl KeyEffect {
@@ -242,9 +259,18 @@ impl Keyboard {
     /// is recognised on the *press* of Esc while both a Ctrl and an Alt are
     /// held; it is consumed, and it takes the rest of the held set with it so
     /// the guest does not keep the modifiers that formed it.
+    ///
+    /// [`FULLSCREEN_CHORD`] is recognised the same way on the press of Enter.
+    /// Only the Enter is consumed; its later key-up finds nothing held and emits nothing.
     pub fn key(&mut self, evdev: u32, down: bool) -> KeyEffect {
         if down && evdev == key::ESC && self.chord_modifiers_held() {
             return self.release_grab();
+        }
+        if down && evdev == key::ENTER && self.chord_modifiers_held() {
+            return KeyEffect {
+                toggle_fullscreen: true,
+                ..KeyEffect::nothing()
+            };
         }
         let actions = if down {
             vec![self.held.press(evdev)]
@@ -253,7 +279,7 @@ impl Keyboard {
         };
         KeyEffect {
             actions,
-            grab: None,
+            ..KeyEffect::nothing()
         }
     }
 
@@ -274,6 +300,7 @@ impl Keyboard {
         KeyEffect {
             actions,
             grab: self.grab.transition(),
+            ..KeyEffect::nothing()
         }
     }
 
@@ -288,6 +315,7 @@ impl Keyboard {
         KeyEffect {
             actions: self.held.release_all(),
             grab: self.grab.transition(),
+            ..KeyEffect::nothing()
         }
     }
 
@@ -309,6 +337,7 @@ impl Keyboard {
         KeyEffect {
             actions: self.held.release_all(),
             grab: self.grab.transition(),
+            ..KeyEffect::nothing()
         }
     }
 
@@ -336,6 +365,7 @@ mod tests {
     fn chord_codes_match_input_map() {
         use super::super::input_map::keycode_to_evdev as ev;
         assert_eq!(ev(KeyCode::Escape), Some(key::ESC));
+        assert_eq!(ev(KeyCode::Enter), Some(key::ENTER));
         assert_eq!(ev(KeyCode::ControlLeft), Some(key::LEFTCTRL));
         assert_eq!(ev(KeyCode::ControlRight), Some(key::RIGHTCTRL));
         assert_eq!(ev(KeyCode::AltLeft), Some(key::LEFTALT));
@@ -579,6 +609,89 @@ mod tests {
         let again = kb.key(key::ESC, true);
         assert_eq!(again.grab, None, "already released; no second transition");
         assert!(!again.actions.iter().any(|a| is_key(a, key::ESC, true)));
+    }
+
+    /// Ctrl+Alt+Enter toggles full screen from either hand, never reaches the
+    /// guest — neither its press nor its later release — and leaves the grab
+    /// and the guest's modifiers as they were.
+    #[test]
+    fn fullscreen_chord_toggles_and_is_not_forwarded() {
+        for (ctrl, alt) in [
+            (key::LEFTCTRL, key::LEFTALT),
+            (key::RIGHTCTRL, key::RIGHTALT),
+        ] {
+            let mut kb = Keyboard::new();
+            kb.focus(true);
+            kb.key(ctrl, true);
+            kb.key(alt, true);
+
+            let effect = kb.key(key::ENTER, true);
+            assert!(effect.toggle_fullscreen, "ctrl={ctrl} alt={alt}");
+            assert!(
+                effect.actions.is_empty(),
+                "the chord's Enter must be consumed"
+            );
+            assert_eq!(effect.grab, None, "full screen does not touch the grab");
+            assert!(kb.is_grabbed());
+            assert_eq!(kb.held_count(), 2, "the guest still holds Ctrl and Alt");
+            assert!(
+                kb.key(key::ENTER, false).actions.is_empty(),
+                "the consumed Enter's key-up has no down to close"
+            );
+        }
+    }
+
+    /// Enter without both modifiers is an ordinary guest key, including with
+    /// Ctrl+Cmd, which carries no Alt.
+    #[test]
+    fn enter_without_both_modifiers_reaches_the_guest() {
+        const LEFTMETA: u32 = 125;
+        for held in [
+            vec![],
+            vec![key::LEFTCTRL],
+            vec![key::LEFTALT],
+            vec![key::LEFTCTRL, LEFTMETA],
+        ] {
+            let mut kb = Keyboard::new();
+            kb.focus(true);
+            for k in &held {
+                kb.key(*k, true);
+            }
+            let effect = kb.key(key::ENTER, true);
+            assert!(!effect.toggle_fullscreen, "held={held:?}");
+            assert!(
+                effect.actions.iter().any(|a| is_key(a, key::ENTER, true)),
+                "held={held:?} must forward Enter to the guest"
+            );
+        }
+    }
+
+    /// The advertised full-screen chord is the one the recogniser accepts, for
+    /// the same reason as [`UNGRAB_CHORD`]'s test above.
+    #[test]
+    fn the_advertised_fullscreen_chord_is_the_one_that_toggles() {
+        let named: Vec<&str> = FULLSCREEN_CHORD.split('+').collect();
+        assert_eq!(
+            named,
+            vec!["Ctrl", "Alt", "Enter"],
+            "chord spelling changed"
+        );
+        let code = |part: &str| match part {
+            "Ctrl" => key::LEFTCTRL,
+            "Alt" => key::LEFTALT,
+            "Enter" => key::ENTER,
+            other => panic!("no evdev code wired for advertised chord part {other:?}"),
+        };
+        let mut kb = Keyboard::new();
+        kb.focus(true);
+        let mut effect = KeyEffect::nothing();
+        for part in &named {
+            effect = kb.key(code(part), true);
+        }
+        assert!(
+            effect.toggle_fullscreen,
+            "pressing the advertised chord {FULLSCREEN_CHORD} must toggle full screen"
+        );
     }
 
     /// Teardown closes the held set even though no focus event arrives.

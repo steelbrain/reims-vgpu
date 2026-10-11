@@ -175,6 +175,34 @@ impl WindowMode {
             _ => Self::Sized,
         }
     }
+
+    /// The mode `window` is in right now, as the window system reports it.
+    fn of(window: &Window) -> Self {
+        if window.fullscreen().is_some() {
+            Self::Borderless
+        } else {
+            Self::Sized
+        }
+    }
+
+    /// The other mode: what [`super::keyboard::FULLSCREEN_CHORD`] switches to.
+    pub fn toggled(self) -> Self {
+        match self {
+            Self::Sized => Self::Borderless,
+            Self::Borderless => Self::Sized,
+        }
+    }
+
+    /// The winit full-screen request this mode makes, at creation and on every
+    /// toggle. `None` is winit's "leave full screen", which restores the size
+    /// the window had before it entered.
+    fn fullscreen(self) -> Option<winit::window::Fullscreen> {
+        match self {
+            Self::Sized => None,
+            // `None` means "the monitor this window is on" — see `resumed`.
+            Self::Borderless => Some(winit::window::Fullscreen::Borderless(None)),
+        }
+    }
 }
 
 /// Window creation parameters.
@@ -189,6 +217,10 @@ pub struct WindowConfig {
     pub height: u32,
     pub mode: WindowMode,
 }
+
+/// The application id the host window announces to the window system, and
+/// the basename of the `.desktop` file a desktop matches it against.
+pub const APP_ID: &str = "reims-vgpu";
 
 impl Default for WindowConfig {
     fn default() -> Self {
@@ -728,6 +760,11 @@ fn build_event_loop() -> Result<EventLoop<FramePublished>, WindowError> {
 
 struct App {
     config: WindowConfig,
+    /// What the window currently is. Starts as `config.mode` and flips on
+    /// [`super::keyboard::FULLSCREEN_CHORD`]; everything after creation reads
+    /// this rather than the config, so a window the operator took full screen
+    /// stops asking for native sizes it can no longer be granted.
+    mode: WindowMode,
     on_input: InputSink,
     frames: FrameSlot,
     /// Set by the device to request teardown; polled in `about_to_wait`.
@@ -878,7 +915,19 @@ impl ApplicationHandler<FramePublished> for App {
                 self.config.width,
                 self.config.height,
             ));
-        if self.config.mode == WindowMode::Borderless {
+        // The compositor identifies the window by this name: the Wayland
+        // `app_id`, the X11 `WM_CLASS`. Without one GNOME has no application to
+        // file the shortcut-inhibit grant under, so it shows "The app Unknown"
+        // and asks again every boot. A `reims-vgpu.desktop` is what lets that
+        // grant persist.
+        #[cfg(all(unix, not(target_vendor = "apple")))]
+        {
+            attrs = winit::platform::wayland::WindowAttributesExtWayland::with_name(
+                attrs, APP_ID, APP_ID,
+            );
+            attrs = winit::platform::x11::WindowAttributesExtX11::with_name(attrs, APP_ID, APP_ID);
+        }
+        if let Some(fullscreen) = self.mode.fullscreen() {
             // `None` means "the monitor this window opens on", which is the only
             // answer available before the window exists — winit has no monitor
             // handle to name until the window system has placed it, and picking
@@ -888,7 +937,7 @@ impl ApplicationHandler<FramePublished> for App {
             // The inner size above stays: it is what the window falls back to if
             // the window system declines the full-screen request, and it is the
             // size a later `set_fullscreen(None)` would restore.
-            attrs = attrs.with_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
+            attrs = attrs.with_fullscreen(Some(fullscreen));
         }
         let window = match event_loop.create_window(attrs) {
             Ok(w) => Arc::new(w),
@@ -961,6 +1010,7 @@ impl ApplicationHandler<FramePublished> for App {
                 event_loop.exit();
             }
             WindowEvent::Resized(size) => {
+                self.follow_window_mode();
                 let applied = (size.width.max(1), size.height.max(1));
                 if self.presenter_attached {
                     crate::backend::selected().window_resize(applied.0, applied.1);
@@ -1125,6 +1175,7 @@ impl App {
     /// to the struct could be initialised in one and missed in the other.
     fn new(config: WindowConfig, on_input: InputSink, frames: FrameSlot, stop: StopFlag) -> Self {
         Self {
+            mode: config.mode,
             config,
             on_input,
             frames,
@@ -1161,6 +1212,9 @@ impl App {
     /// the guest holding a modifier, and keys released without dropping the grab
     /// leaves the operator unable to reach their own desktop.
     fn apply_key_effect(&mut self, effect: KeyEffect) {
+        if effect.toggle_fullscreen {
+            self.toggle_fullscreen();
+        }
         for action in effect.actions {
             (self.on_input)(action);
         }
@@ -1197,8 +1251,9 @@ impl App {
                 eprintln!(
                     "reims-vgpu-window: keyboard captured ({mechanism}) — \
                      the guest now receives Cmd/Alt/Super chords. \
-                     Press {} to release it.",
-                    super::keyboard::UNGRAB_CHORD
+                     Press {} to release it, {} for full screen.",
+                    super::keyboard::UNGRAB_CHORD,
+                    super::keyboard::FULLSCREEN_CHORD
                 );
             }
             Ok(()) => {}
@@ -1221,6 +1276,47 @@ impl App {
     fn force_redraw(&mut self) {
         self.redraw_required = true;
         self.frame_pending = true;
+    }
+
+    /// Flip the window between sized and full screen.
+    ///
+    /// Entering full screen drops any outstanding guest resize: the window no
+    /// longer asks for one, so the hold would only sit out
+    /// [`GUEST_RESIZE_WARN_AFTER`] and then report a refusal the operator asked
+    /// for. Leaving restores the pre-full-screen size, and the guest's mode
+    /// letterboxes into it until the guest next changes mode.
+    fn toggle_fullscreen(&mut self) {
+        let Some(window) = self.window.as_ref() else {
+            return;
+        };
+        let next = WindowMode::of(window).toggled();
+        window.set_fullscreen(next.fullscreen());
+        self.enter_mode(next, "toggled");
+        self.force_redraw();
+    }
+
+    /// Adopt whatever mode the window system has put the window in.
+    ///
+    /// The compositor can change it without the chord — GNOME's window menu,
+    /// a desktop full-screen shortcut — and every such change arrives as a
+    /// resize. The window's own state is the owner; `self.mode` follows it so
+    /// guest resize requests are not aimed at a full-screen window.
+    fn follow_window_mode(&mut self) {
+        let Some(window) = self.window.as_ref() else {
+            return;
+        };
+        let actual = WindowMode::of(window);
+        if actual != self.mode {
+            self.enter_mode(actual, "followed");
+        }
+    }
+
+    fn enter_mode(&mut self, next: WindowMode, status: &str) {
+        self.mode = next;
+        if next == WindowMode::Borderless {
+            self.pending_guest_resize = None;
+        }
+        crate::observe::off(format!("host_window_mode status={status} mode={next:?}"));
     }
 
     fn request_shutdown(&mut self) {
@@ -1497,7 +1593,7 @@ impl App {
         };
         let size = window.inner_size();
         let actual = (size.width.max(1), size.height.max(1));
-        let request = guest_resize_request(self.config.mode, self.guest_extent, incoming, actual);
+        let request = guest_resize_request(self.mode, self.guest_extent, incoming, actual);
         self.guest_extent = Some(incoming);
         if !request {
             return;
@@ -1949,6 +2045,23 @@ mod tests {
             None,
             (1280, 1024),
             (3840, 2160)
+        ));
+    }
+
+    /// The full-screen chord is a round trip: two presses return the window to
+    /// the mode it started in, and each mode asks winit for exactly its own
+    /// geometry — leaving full screen is `None`, which restores the old size.
+    #[test]
+    fn toggling_the_mode_is_a_round_trip() {
+        use winit::window::Fullscreen;
+        use WindowMode::{Borderless, Sized};
+        assert_eq!(Sized.toggled(), Borderless);
+        assert_eq!(Borderless.toggled(), Sized);
+        assert_eq!(Sized.toggled().toggled(), Sized);
+        assert!(Sized.fullscreen().is_none());
+        assert!(matches!(
+            Borderless.fullscreen(),
+            Some(Fullscreen::Borderless(None))
         ));
     }
 
