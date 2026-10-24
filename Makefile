@@ -50,7 +50,7 @@ RUST_TARGET_REL := $(or $(CARGO_TARGET_DIR),target)
 RUST_TARGET := $(if $(filter /%,$(RUST_TARGET_REL)),$(RUST_TARGET_REL),$(CURDIR)/$(RUST_TARGET_REL))
 RUST_DIST := $(RUST_TARGET)/dist
 
-.PHONY: all smoke test bless coverage qemu vm clean
+.PHONY: all smoke test bless coverage qemu vm check-ctl clean
 
 all:
 	CARGO_TARGET_DIR="$(RUST_TARGET)" cargo xtask dist
@@ -117,6 +117,9 @@ vm:
 	fi
 	@$(MAKE) --no-print-directory qemu
 	QEMU="$(QEMU_BUILD)/qemu-system-aarch64" scripts/run_vmapple.sh "$(VM)" "$(CLONE)"
+
+check-ctl:
+	cargo xtask check-ctl
 
 clean:
 	rm -rf "$(BUILD_DIR)"

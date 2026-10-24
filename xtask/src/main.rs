@@ -55,6 +55,11 @@ const COMMANDS: &[Command] = &[
         about: "testkit, header --check, rustfmt, clippy, cargo nextest and the doc-tests; on a Mac, also clippy for x86-64 Linux and, where Rosetta runs x86-64 code, core's tests as x86-64",
         run: cmd_check,
     },
+    Command {
+        name: "check-ctl",
+        about: "rustfmt, clippy and tests for the separate reims-ctl workspace",
+        run: cmd_check_ctl,
+    },
 ];
 
 fn usage() {
@@ -246,5 +251,23 @@ fn cmd_check(args: &[String]) -> Res<bool> {
         ok &= cargo(&["test", "--workspace", "--features", features, "--doc"])?;
     }
     println!("check: {}", if ok { "ok" } else { "FAILED" });
+    Ok(ok)
+}
+
+fn cmd_check_ctl(_args: &[String]) -> Res<bool> {
+    const MANIFEST: &str = "crates/reims-ctl/Cargo.toml";
+    let mut ok = true;
+    ok &= cargo(&["fmt", "--manifest-path", MANIFEST, "--all", "--", "--check"])?;
+    ok &= cargo(&[
+        "clippy",
+        "--manifest-path",
+        MANIFEST,
+        "--all-targets",
+        "--",
+        "-D",
+        "warnings",
+    ])?;
+    ok &= cargo(&["test", "--manifest-path", MANIFEST])?;
+    println!("check-ctl: {}", if ok { "ok" } else { "FAILED" });
     Ok(ok)
 }
