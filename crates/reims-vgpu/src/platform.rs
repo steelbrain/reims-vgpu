@@ -52,6 +52,21 @@ pub trait ApiPlatform: Platform {
     /// `bytes_per_row` after the last. The caller has checked that `dst` holds them.
     fn read_pixels(&self, texture: &Self::Texture, dst: &mut [u8], bytes_per_row: usize);
 
+    /// Calls `read` with the bytes [`read_pixels`](Self::read_pixels) would copy, where the CPU
+    /// reaches them in place: the first byte of the texture's first row, the bytes from there to
+    /// the end of its last row's `width * 4`, and the bytes from one row to the next. False,
+    /// without calling it, where the texture is read only by copying (`read_pixels`), as by
+    /// default. The bytes may change under the reader as the GPU's or the guest's writes reach
+    /// them, as they may under `read_pixels`: read them through the pointer, never as a slice.
+    fn read_in_place(
+        &self,
+        texture: &Self::Texture,
+        read: &mut dyn FnMut(*const u8, usize, usize),
+    ) -> bool {
+        let _ = (texture, read);
+        false
+    }
+
     /// What the platform holds of the guest's RAM while a device made over `map` lives: the
     /// device takes it as it is created and drops it after core's teardown. Nothing by default.
     fn guest_memory(&self, map: &MemoryMap) -> Box<dyn Any + Send + Sync> {

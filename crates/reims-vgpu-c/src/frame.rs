@@ -175,6 +175,46 @@ pub unsafe extern "C" fn rvg_frame_target_read_pixels(
     })
 }
 
+/// Brings `dst` up to the target's pixels, laid out as rvg_frame_target_read_pixels lays them
+/// out: each row that differs from `dst`'s is written and `changed[row]` set to 1; each equal row
+/// is left as it is and `changed[row]` set to 0. A host that keeps `dst` as the last call left it
+/// learns which rows changed since, and only those are written. Where the library reads the
+/// display's frame in place (a frame on an IOSurface), each row is read once and nothing is
+/// copied whole. It reads what the GPU has written so far: wait for the frames that draw into it
+/// first. RVG_ERR_INVALID_ARGUMENT as for rvg_frame_target_read_pixels, and when
+/// `changed_length` is below the target's height. Calls back: never.
+///
+/// # Safety
+/// `target` is NULL or a live frame target; `dst` is NULL or holds `dst_length` writable bytes;
+/// `changed` is NULL or holds `changed_length` writable bytes, apart from `dst`'s.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rvg_frame_target_update_pixels(
+    target: *const RvgFrameTarget,
+    dst: *mut c_void,
+    bytes_per_row: usize,
+    dst_length: usize,
+    changed: *mut u8,
+    changed_length: usize,
+) -> RvgStatus {
+    ffi::export(|| {
+        // SAFETY: the caller's contract.
+        let Some(t) = (unsafe { handle::get(target) }) else {
+            return RVG_ERR_INVALID_ARGUMENT;
+        };
+        if dst.is_null() || changed.is_null() {
+            return RVG_ERR_INVALID_ARGUMENT;
+        }
+        // SAFETY: the caller's contract.
+        let dst = unsafe { std::slice::from_raw_parts_mut(dst.cast::<u8>(), dst_length) };
+        // SAFETY: the caller's contract.
+        let changed = unsafe { std::slice::from_raw_parts_mut(changed, changed_length) };
+        match t.target.update_pixels(dst, bytes_per_row, changed) {
+            Ok(()) => RVG_OK,
+            Err(e) => status(e),
+        }
+    })
+}
+
 /// Encodes the display's current frame into `target` over `region` (NULL: the whole target),
 /// on the process's frame queue, and writes the uncommitted frame through `frame`. The display
 /// counts the frame in flight until it completes; its presents wait for frames in flight. The
