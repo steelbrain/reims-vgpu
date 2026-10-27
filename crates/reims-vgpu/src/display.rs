@@ -486,10 +486,18 @@ impl<P: Platform> Display<P> {
             let Some(command_buffer) = no_catch(queue.command_buffer(OnFault::Die)) else {
                 return Err(Error::Metal);
             };
-            let encoded =
-                no_catch(d.encode_current_frame(&command_buffer, target.texture(), region));
-            if !encoded {
-                return Err(Error::InvalidArgument);
+            // The frame itself for a CPU read where the pass would leave it as it is (behind its
+            // switch), else the pass.
+            let source =
+                no_catch(d.encode_current_frame_by_copy(&command_buffer, target.texture(), region));
+            let copied = source.is_some();
+            target.set_source(source);
+            if !copied {
+                let encoded =
+                    no_catch(d.encode_current_frame(&command_buffer, target.texture(), region));
+                if !encoded {
+                    return Err(Error::InvalidArgument);
+                }
             }
             Ok(Frame::new(command_buffer, target.clone_ref()))
         })

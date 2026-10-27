@@ -40,6 +40,16 @@ impl ApiPlatform for VulkanPlatform {
         reims_vgpu_vulkan::api::read_pixels(texture, dst, bytes_per_row);
     }
 
+    /// The texels of a texture made on an IOSurface's plane, in the surface's memory
+    /// (`reims_vgpu_vulkan::api::read_in_place`).
+    fn read_in_place(
+        &self,
+        texture: &<Self as Platform>::Texture,
+        read: &mut dyn FnMut(*const u8, usize, usize),
+    ) -> bool {
+        reims_vgpu_vulkan::api::read_in_place(texture, read)
+    }
+
     /// The files behind the map's ranges, registered while the device lives
     /// (`reims_vgpu_vulkan::os::lease_guest_memory`): on Linux the platform makes its views of the
     /// guest's pages of them. A range without a file is not registered, and a view of its pages

@@ -428,6 +428,37 @@ static void check_frames(RvgDevice *dev, RvgDisplay *disp) {
     CHECK(uniform);
     CHECK(!(px[0] == 0xa5 && px[1] == 0xa5 && px[2] == 0xa5 && px[3] == 0xa5));
 
+    /* An update of pixels just read changes no row; one of a row written over restores that row
+     * alone and flags it. The padding stays as it was. */
+    unsigned char changed[32];
+    memset(changed, 0x77, sizeof changed);
+    CHECK_STATUS(rvg_frame_target_update_pixels(t, px, bpr, extent, changed, 31),
+                 RVG_ERR_INVALID_ARGUMENT);
+    CHECK_STATUS(rvg_frame_target_update_pixels(t, px, bpr, extent, NULL, 32),
+                 RVG_ERR_INVALID_ARGUMENT);
+    CHECK_STATUS(rvg_frame_target_update_pixels(t, NULL, bpr, extent, changed, 32),
+                 RVG_ERR_INVALID_ARGUMENT);
+    CHECK_STATUS(rvg_frame_target_update_pixels(NULL, px, bpr, extent, changed, 32),
+                 RVG_ERR_INVALID_ARGUMENT);
+    CHECK_STATUS(rvg_frame_target_update_pixels(t, px, bpr, extent - 1, changed, 32),
+                 RVG_ERR_INVALID_ARGUMENT);
+    CHECK_STATUS(rvg_frame_target_update_pixels(t, px, bpr, extent, changed, 32), RVG_OK);
+    int none_changed = 1;
+    for (size_t y = 0; y < 32; y++) {
+        none_changed &= changed[y] == 0;
+    }
+    CHECK(none_changed);
+    unsigned char first = px[5 * bpr];
+    px[5 * bpr] = (unsigned char)(first ^ 0xff);
+    CHECK_STATUS(rvg_frame_target_update_pixels(t, px, bpr, extent, changed, 32), RVG_OK);
+    int only_row_5 = 1;
+    for (size_t y = 0; y < 32; y++) {
+        only_row_5 &= changed[y] == (y == 5);
+    }
+    CHECK(only_row_5);
+    CHECK(px[5 * bpr] == first);
+    CHECK(px[5 * bpr + 64 * 4] == 0xa5);
+
     /* An uncommitted frame over a region, released: never drawn. */
     RvgRegion r = {8, 8, 16, 16};
     CHECK_STATUS(rvg_display_encode_frame(disp, t, &r, &f), RVG_OK);

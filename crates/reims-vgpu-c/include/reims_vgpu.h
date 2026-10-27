@@ -1116,6 +1116,25 @@ RvgStatus rvg_frame_target_read_pixels(const RvgFrameTarget *target,
                                        size_t bytes_per_row,
                                        size_t dst_length);
 
+// Brings `dst` up to the target's pixels, laid out as rvg_frame_target_read_pixels lays them
+// out: each row that differs from `dst`'s is written and `changed[row]` set to 1; each equal row
+// is left as it is and `changed[row]` set to 0. A host that keeps `dst` as the last call left it
+// learns which rows changed since, and only those are written. Where the library reads the
+// display's frame in place (a frame on an IOSurface), each row is read once and nothing is
+// copied whole. It reads what the GPU has written so far: wait for the frames that draw into it
+// first. RVG_ERR_INVALID_ARGUMENT as for rvg_frame_target_read_pixels, and when
+// `changed_length` is below the target's height. Calls back: never.
+//
+// # Safety
+// `target` is NULL or a live frame target; `dst` is NULL or holds `dst_length` writable bytes;
+// `changed` is NULL or holds `changed_length` writable bytes, apart from `dst`'s.
+RvgStatus rvg_frame_target_update_pixels(const RvgFrameTarget *target,
+                                         void *dst,
+                                         size_t bytes_per_row,
+                                         size_t dst_length,
+                                         uint8_t *changed,
+                                         size_t changed_length);
+
 // Encodes the display's current frame into `target` over `region` (NULL: the whole target),
 // on the process's frame queue, and writes the uncommitted frame through `frame`. The display
 // counts the frame in flight until it completes; its presents wait for frames in flight. The

@@ -381,7 +381,7 @@ hides its VM.
 `vendor/qemu`'s `apple-gfx` is three C files, `hw/display/apple-gfx.c`,
 `apple-gfx-mmio.c` and `apple-gfx-pci.c`, on the library's C API,
 `reims_vgpu.h`. They use no Objective-C, Metal, IOSurface, dispatch, blocks
-or autorelease pools, and call 21 of the header's 35 functions. Beside them,
+or autorelease pools, and call 21 of the header's 48 functions. Beside them,
 `apple-gfx-activity.m` holds Foundation's activity against App Nap while a
 device is realized, and calls nothing of the library ("App Nap", below).
 How it uses the API:
