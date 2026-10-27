@@ -95,6 +95,11 @@ struct Target<P: Platform> {
     format: PixelFormat,
     /// The platform it was made on.
     platform: Arc<P>,
+    /// The display's frame the last encode left for a CPU read in place of a draw
+    /// (`DisplayCore::encode_current_frame_by_copy`), or `None` after a draw: what
+    /// [`FrameTarget::read_pixels`] reads. Released inside the entry that replaces it, or the
+    /// target's own release.
+    source: reims_vgpu_core::sync::Mutex<Option<P::Texture>>,
 }
 
 /// A 2D texture the library draws frames into and reads pixels back from: one counted
@@ -146,6 +151,7 @@ impl<P: Platform> FrameTarget<P> {
                 height,
                 format,
                 platform: platform.clone(),
+                source: reims_vgpu_core::sync::Mutex::new(None),
             };
             Ok(FrameTarget {
                 inner: Ours::new(Arc::new(target)),
@@ -181,6 +187,13 @@ impl<P: Platform> FrameTarget<P> {
         &self.inner.texture
     }
 
+    /// What the last encode into this target left for [`read_pixels`](Self::read_pixels): the
+    /// display's frame to read on the CPU, or `None` for the texture the encode drew.
+    pub(crate) fn set_source(&self, source: Option<P::Texture>) {
+        let old = std::mem::replace(&mut *self.inner.source.lock(), source);
+        drop(old);
+    }
+
     /// Whether both are references to one target.
     pub fn ptr_eq(&self, other: &FrameTarget<P>) -> bool {
         Arc::ptr_eq(&self.inner, &other.inner)
@@ -207,9 +220,12 @@ impl<P: ApiPlatform> FrameTarget<P> {
                 return Err(Error::InvalidArgument);
             }
             let dst = dst.get_mut(..extent).ok_or(Error::InvalidArgument)?;
-            self.inner
-                .platform
-                .read_pixels(&self.inner.texture, dst, bytes_per_row);
+            // The display's frame where the last encode left it for a CPU read (its size and
+            // format are the target's), else the texture the encode drew.
+            let source = self.inner.source.lock();
+            let texture = source.as_ref().unwrap_or(&self.inner.texture);
+            self.inner.platform.read_pixels(texture, dst, bytes_per_row);
+            drop(source);
             Ok(())
         })
     }

@@ -2,6 +2,8 @@
 //! guest's sum, uploaded into a 1D-array texture of three slices, and its end slopes into the
 //! fragment properties.
 
+use std::sync::atomic::Ordering;
+
 use crate::device::tasks::MAX_LOCAL_TASK_LENGTH;
 use crate::display::{DeathKind, DisplayCore, DisplayLocked, RaiseKind};
 use crate::num::ToUsize;
@@ -224,6 +226,27 @@ impl<P: Platform> DisplayCore<P> {
             [red_zero, red_zero, red_zero],
             [red_one, green_one, blue_one],
         )?;
+        // Whether the gamma pass maps every 8-bit level to itself through this table: for a
+        // value v the shader's nearest sample takes entry floor(v n), clamped to the table, and a
+        // BGRA8 target stores round(255 x) of the entry, clamped to [0, 1]. The console's CPU copy
+        // relies on it (`render.rs`, `encode_current_frame_by_copy`).
+        #[allow(
+            clippy::as_conversions,
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            clippy::cast_precision_loss,
+            reason = "levels and entry indices are small; the float maths is the shader's"
+        )]
+        let maps_identity = (0..3u32).all(|channel| {
+            (0u32..=255).all(|level| {
+                let v = level as f32 / 255.0;
+                let index = ((v * n as f32).floor() as u32).min(n.wrapping_sub(1));
+                float_at(&table, channel.wrapping_mul(n).wrapping_add(index)).is_some_and(|x| {
+                    x.is_finite() && (x.clamp(0.0, 1.0) * 255.0).round() as u32 == level
+                })
+            })
+        });
+        self.gamma_identity.store(maps_identity, Ordering::SeqCst);
         drop(table);
         Ok(())
     }

@@ -7,12 +7,15 @@ use std::sync::atomic::Ordering;
 use crate::display::pipeline::PipelineKey;
 use crate::display::{DeathKind, Display, DisplayCore, DisplayLocked};
 use crate::guest::GuestPtr;
+use crate::platform::blit::{BlitCmd, BlitEncoder};
 use crate::platform::command::{CommandBuffer, CompletedInfo};
 use crate::platform::descriptor::RenderPassDescriptor;
 use crate::platform::device::GpuDevice;
 use crate::platform::render::{RenderCmd, RenderEncoder};
 use crate::platform::resource::{Buffer, GpuResource, Texture};
-use crate::platform::types::{ClearColor, CommandBufferStatus, MtlRegion, MtlViewport, NsRange};
+use crate::platform::types::{
+    ClearColor, CommandBufferStatus, MtlOrigin, MtlRegion, MtlSize, MtlViewport, NsRange,
+};
 use crate::platform::values::ColorAttachmentSet;
 use crate::platform::{Handle, Platform};
 use crate::raise::{OnFault, RaiseResult};
@@ -30,6 +33,22 @@ const MTL_LOAD_ACTION_CLEAR: u64 = 2;
 const MTL_STORE_ACTION_STORE: u64 = 1;
 /// `MTLPrimitiveTypeTriangleStrip`.
 const MTL_PRIMITIVE_TYPE_TRIANGLE_STRIP: u64 = 4;
+/// `MTLTextureType2D`.
+const MTL_TEXTURE_TYPE_2D: u64 = 2;
+/// `MTLStorageModePrivate`.
+const MTL_STORAGE_MODE_PRIVATE: u64 = 2;
+/// `MTLStorageModeMemoryless`.
+const MTL_STORAGE_MODE_MEMORYLESS: u64 = 3;
+
+/// The switch for the console's CPU copy (`encode_current_frame_by_copy`): `1` takes it where it
+/// is exact, anything else or unset never (measured on an Intel UHD 630 under Linux: the gamma
+/// pass over a 1920 × 1080 BGRA8 frame in guest memory took ~5 ms of the GPU per console render).
+pub const CONSOLE_CPU_COPY_ENV: &str = "REIMS_VGPU_CONSOLE_CPU_COPY";
+
+fn console_cpu_copy_requested() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os(CONSOLE_CPU_COPY_ENV).is_some_and(|value| value == "1"))
+}
 
 /// The full-screen triangle strip's positions (float4 × 4).
 pub const POS_DATA: [f32; 16] = [
@@ -152,23 +171,34 @@ impl<P: Platform> DisplayCore<P> {
         texture: &P::Texture,
         region: MtlRegion,
     ) -> RaiseResult<bool> {
-        let dev = self.mtl_device().map(Handle::id);
-        // Pointer identity, short-circuit.
-        if command_buffer.device().map(|d| d.id()) != dev
-            || texture.device().map(|d| d.id()) != dev
-            || (texture.usage() & self.minimum_texture_usage()) != self.minimum_texture_usage()
-        {
+        if !self.encodable(command_buffer, texture) {
             return Ok(false);
         }
         let mut g = self.display_mutex.lock();
         self.internal_encode_locked(&mut g, command_buffer, texture, region)?;
+        self.count_host_present_locked(&g);
+        Ok(true)
+    }
+
+    /// Whether `command_buffer` and `texture` are this display's device's and `texture` has the
+    /// usage the display's frames need: an encode takes no other.
+    fn encodable(&self, command_buffer: &P::CommandBuffer, texture: &P::Texture) -> bool {
+        let dev = self.mtl_device().map(Handle::id);
+        // Pointer identity, short-circuit.
+        command_buffer.device().map(|d| d.id()) == dev
+            && texture.device().map(|d| d.id()) == dev
+            && (texture.usage() & self.minimum_texture_usage()) == self.minimum_texture_usage()
+    }
+
+    /// A host present counted for the first encode of a new current frame, with the display
+    /// mutex held.
+    fn count_host_present_locked(&self, g: &DisplayLocked<P>) {
         if g.current_frame.is_some() && !self.current_frame_encoded.load(Ordering::SeqCst) {
             // A load and a store of the count.
             let host = self.host_present_count().wrapping_add(1);
             self.props.set_host_present_count(host);
             self.current_frame_encoded.store(true, Ordering::SeqCst);
         }
-        Ok(true)
     }
 
     /// The encode of the current frame, taking the display mutex (tests; the product holds it).
@@ -181,6 +211,86 @@ impl<P: Platform> DisplayCore<P> {
     ) -> RaiseResult<()> {
         let mut g = self.display_mutex.lock();
         self.internal_encode_locked(&mut g, command_buffer, texture, region)
+    }
+
+    /// Under `REIMS_VGPU_CONSOLE_CPU_COPY=1`, where the gamma pass would leave every byte of the
+    /// current frame as it is, the frame itself (a new reference) for the host to read on the CPU
+    /// in place of the pass's output: a BGRA8 2D frame the CPU reaches (not private, one sample,
+    /// no protection), `texture` BGRA8 of its size, `region` the whole of it, and either no gamma
+    /// table or one mapping every 8-bit level to itself with the colour matrix the identity. Into
+    /// `command_buffer` goes only a copy of the frame's first texel into `texture`, so that it
+    /// completes after the guest's writes of the frame; the frame counts in flight until then,
+    /// as the pass's does, and the first encode after a new guest frame counts a host present.
+    /// `None`, with nothing encoded, otherwise. The frame's alpha is the guest's, where the gamma
+    /// pass writes 1 (a host reading x8r8g8b8 ignores it).
+    pub fn encode_current_frame_by_copy(
+        &self,
+        command_buffer: &P::CommandBuffer,
+        texture: &P::Texture,
+        region: MtlRegion,
+    ) -> RaiseResult<Option<P::Texture>> {
+        if !console_cpu_copy_requested() || !self.encodable(command_buffer, texture) {
+            return Ok(None);
+        }
+        let dev = self.mtl_device().map(Handle::id);
+        let g = self.display_mutex.lock();
+        let Some(frame) = g.current_frame.as_ref() else {
+            return Ok(None);
+        };
+        let whole = region.origin.x == 0
+            && region.origin.y == 0
+            && region.size.width == texture.width()
+            && region.size.height == texture.height();
+        // Without a gamma table the pass samples the frame as it is (the colour matrix is the
+        // gamma pipeline's alone).
+        let exact = !g.pipeline.gamma
+            || (self.color_matrix_identity.load(Ordering::SeqCst)
+                && self.gamma_identity.load(Ordering::SeqCst));
+        if !whole
+            || !exact
+            || g.protection_requirements != 0
+            || frame.device().map(|d| d.id()) != dev
+            || frame.pixel_format() != MTL_PIXEL_FORMAT_BGRA8_UNORM
+            || texture.pixel_format() != MTL_PIXEL_FORMAT_BGRA8_UNORM
+            || frame.width() != texture.width()
+            || frame.height() != texture.height()
+            || frame.texture_type() != MTL_TEXTURE_TYPE_2D
+            || frame.sample_count() != 1
+            || frame.storage_mode() == MTL_STORAGE_MODE_PRIVATE
+            || frame.storage_mode() == MTL_STORAGE_MODE_MEMORYLESS
+        {
+            return Ok(None);
+        }
+        let frame = frame.clone_ref();
+        // Still under the display mutex, in a pool (Metal's `+0` encoder), as the pass is.
+        let encoded = pool::around(&*self.platform, || {
+            let Some(blit) = command_buffer.blit_encoder(OnFault::Die)? else {
+                return Ok(false);
+            };
+            blit.encode(
+                OnFault::Die,
+                BlitCmd::CopyTextureRegion {
+                    source_texture: &frame,
+                    source_slice: 0,
+                    source_level: 0,
+                    source_origin: MtlOrigin::new(0, 0, 0),
+                    source_size: MtlSize::new(1, 1, 1),
+                    destination_texture: texture,
+                    destination_slice: 0,
+                    destination_level: 0,
+                    destination_origin: MtlOrigin::new(0, 0, 0),
+                },
+            )?;
+            blit.encode(OnFault::Die, BlitCmd::EndEncoding)?;
+            Ok(true)
+        })?;
+        if !encoded {
+            return Ok(None);
+        }
+        self.count_frame_in_flight(command_buffer)?;
+        self.count_host_present_locked(&g);
+        drop(g);
+        Ok(Some(frame))
     }
 
     /// The current frame into `texture` over `region`, with the display mutex held.
@@ -354,6 +464,12 @@ impl<P: Platform> DisplayCore<P> {
             drop(pass);
             Ok(())
         })?;
+        self.count_frame_in_flight(command_buffer)
+    }
+
+    /// One frame counted in flight until `command_buffer` completes: its completion counts it out
+    /// and wakes the presents waiting for frames in flight.
+    fn count_frame_in_flight(&self, command_buffer: &P::CommandBuffer) -> RaiseResult<()> {
         self.in_flight_frame_count.fetch_add(1, Ordering::SeqCst);
         // The block holds the display (a display whose last release has begun: its core), and the
         // command buffer lets it go when it has run.
@@ -425,6 +541,25 @@ impl<P: Platform> DisplayCore<P> {
             &f32_bytes(columns.as_flattened()),
             DeathKind::NullContents,
         );
+        // Exactly the identity (-0.0 counts as 0.0; a NaN does not match): the gamma pass then
+        // changes no colour the table leaves alone, which the console's CPU copy relies on
+        // (`encode_current_frame_by_copy`).
+        const IDENTITY_COLUMNS: [[f32; 4]; 4] = [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0],
+        ];
+        #[expect(
+            clippy::float_cmp,
+            reason = "exact equality with the identity's entries"
+        )]
+        let identity = columns
+            .as_flattened()
+            .iter()
+            .zip(IDENTITY_COLUMNS.as_flattened())
+            .all(|(a, b)| a == b);
+        self.color_matrix_identity.store(identity, Ordering::SeqCst);
         Ok(crate::nil_send!(
             g.frag_shader_property_buf,
             did_modify_range(on, NsRange::new(0, FRAG_SHADER_PROPERTIES_SIZE))

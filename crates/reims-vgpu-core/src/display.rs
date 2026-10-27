@@ -506,6 +506,12 @@ pub struct DisplayCore<P: Platform> {
     current_frame_encoded: AtomicBool,
     /// Whether there is a current frame, for the unlocked `signal_current_frame`.
     pub(crate) has_current_frame: AtomicBool,
+    /// Whether the colour matrix the property buffer holds is the identity (written under the
+    /// display mutex; `render.rs`, the console's CPU copy).
+    pub(crate) color_matrix_identity: AtomicBool,
+    /// Whether the gamma table the display holds maps every 8-bit level to itself through the
+    /// gamma pass (or there is none; written under the display mutex; `gamma.rs`).
+    pub(crate) gamma_identity: AtomicBool,
     /// The mode-list responsiveness: 0 with no guest display, 1 with one, 2 with one that
     /// live-resizes.
     mode_list_responsiveness: AtomicI32,
@@ -644,6 +650,8 @@ impl<P: Platform> DisplayCore<P> {
                 guest_color_space_dirty: AtomicBool::new(false),
                 current_frame_encoded: AtomicBool::new(false),
                 has_current_frame: AtomicBool::new(false),
+                color_matrix_identity: AtomicBool::new(true),
+                gamma_identity: AtomicBool::new(true),
                 mode_list_responsiveness: AtomicI32::new(0),
                 protection_options: AtomicU64::new(0),
                 mode_list: Mutex::new(None),
