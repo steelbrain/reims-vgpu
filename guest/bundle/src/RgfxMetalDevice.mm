@@ -276,6 +276,14 @@ constexpr long kGpuFamilyMinus1009 = -1009;
 
 - (uint64_t)registryID
 {
+	// The guest's own accelerator's registry entry ID: WindowServer finds the Metal device
+	// that drives a display by matching this against the accelerator the display's
+	// framebuffer names, so the host GPU's ID would match no display. The host's ID is
+	// the answer only where the accelerator has none.
+	uint64_t entryId = 0;
+	if (_acceleratorPort != MACH_PORT_NULL &&
+	    IORegistryEntryGetRegistryEntryID(_acceleratorPort, &entryId) == KERN_SUCCESS && entryId != 0)
+		return entryId;
 	return _caps.valid() ? _caps.registryId() : 0;
 }
 
