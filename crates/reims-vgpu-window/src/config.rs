@@ -135,6 +135,11 @@ pub struct WindowConfig {
     /// width in whole centimetres (`policy::guest_scale`), it runs a HiDPI desktop at the mode's
     /// pixels. `None` is 110. Ignored without `mode`.
     pub mode_ppi: Option<f64>,
+    /// The guest follows the window: the window keeps the size it opened at, or the person gave
+    /// it, and never resizes for the guest's mode, whose image it fits between black bars as it
+    /// does once the person has resized it. The reims-graphics display's window, whose guest
+    /// takes the window's size as its mode.
+    pub keeps_its_size: bool,
     /// The callbacks.
     pub callbacks: WindowCallbacks,
 }

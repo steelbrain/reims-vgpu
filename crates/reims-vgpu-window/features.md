@@ -86,6 +86,10 @@ Unset or unparsable values give the defaults below.
 - After that, and always when borderless, a guest mode change re-fits the
   image at once; the window keeps its size.
   `test: geometry::a_mode_change_refits_the_image`, `manual`
+- A window that keeps its size (the reims-graphics display's, whose guest
+  takes the window's size in pixels as its mode) never follows the guest's
+  mode: it opens sized for the first mode offered, and from then on a guest
+  mode change re-fits the image, as after the person's resize. `manual`
 - Sharp on every screen: one drawable pixel per screen pixel, following the
   window across screens of different scale. `manual`
 - Native full screen (the green button, ⌃⌘F) keeps the ratio. `manual`
@@ -344,6 +348,8 @@ runtime's own device. The switches above apply, and `resolution=` too.
   `test: geometry::keeps_the_guest_ratio`,
   `test: sdl::shell::a_resize_within_a_point_of_the_asked_size_is_the_library_s`,
   `manual`
+- A window that keeps its size (the reims-graphics display's) never follows
+  the guest's mode, as on macOS. `manual`
 - Nothing is drawn while the window is hidden or minimized, nor before it
   and its layout exist; it redraws when it shows.
   `test: native::linux::render::a_hidden_window_is_drawn_when_it_shows`,

@@ -290,9 +290,11 @@ impl WindowDelegate {
         }
     }
 
-    /// Whether the window follows the guest's mode: windowed, and not sized by the person.
+    /// Whether the window follows the guest's mode: windowed, not sized by the person, and not
+    /// a window that keeps its size (`Window::keeps_its_size`).
     fn follows_guest_mode(&self) -> bool {
-        !self.ivars().borderless && !self.ivars().sized_by_person.get()
+        let ivars = self.ivars();
+        !ivars.borderless && !ivars.sized_by_person.get() && !ivars.view.keeps_its_size()
     }
 }
 

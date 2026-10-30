@@ -51,6 +51,7 @@ fn window_config<T: Send + Sync + 'static>(held: T, match_host_screen: bool) -> 
         match_host_screen,
         mode: None,
         mode_ppi: None,
+        keeps_its_size: false,
         callbacks: WindowCallbacks {
             close: Some(Arc::new(move || {
                 let _ = &held;

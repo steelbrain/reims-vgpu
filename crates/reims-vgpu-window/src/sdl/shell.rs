@@ -155,7 +155,7 @@ pub(crate) fn open(window: &Arc<Window>) {
             window: Arc::clone(window),
             sdl: opened.sdl,
             sdl_id,
-            follows_guest: !borderless,
+            follows_guest: !borderless && !window.keeps_its_size(),
             asked: opened.asked,
             layout: Layout::default(),
             density: 1.0,

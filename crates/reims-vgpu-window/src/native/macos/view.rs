@@ -449,6 +449,11 @@ impl DisplayView {
         self.ivars().window.guest_scale(mode)
     }
 
+    /// Whether the window never resizes for the guest's mode (`Window::keeps_its_size`).
+    pub(crate) fn keeps_its_size(&self) -> bool {
+        self.ivars().window.keeps_its_size()
+    }
+
     /// The window's title, without what the capture state adds.
     pub(crate) fn title(&self) -> &str {
         self.ivars().window.title()

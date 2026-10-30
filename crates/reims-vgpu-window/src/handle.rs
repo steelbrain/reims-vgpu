@@ -222,6 +222,8 @@ pub struct Window {
     chosen_mode: Option<(u16, u16)>,
     /// The config's density for the chosen mode.
     chosen_ppi: Option<f64>,
+    /// The config's `keeps_its_size`.
+    keeps_its_size: bool,
     /// The host's callbacks, until the window's end takes them out.
     callbacks: Mutex<Option<WindowCallbacks>>,
     /// What the guest last reported.
@@ -279,6 +281,7 @@ impl Window {
             match_host_screen: config.match_host_screen,
             chosen_mode: config.mode,
             chosen_ppi: config.mode_ppi,
+            keeps_its_size: config.keeps_its_size,
             callbacks: Mutex::new(Some(config.callbacks)),
             guest: Mutex::new(GuestState::default()),
             offered: Mutex::new(None),
@@ -470,6 +473,11 @@ impl Window {
     /// The config's density for its chosen mode (`WindowConfig::mode_ppi`).
     pub fn chosen_ppi(&self) -> Option<f64> {
         self.chosen_ppi
+    }
+
+    /// Whether the window never resizes for the guest's mode (`WindowConfig::keeps_its_size`).
+    pub fn keeps_its_size(&self) -> bool {
+        self.keeps_its_size
     }
 
     /// The display tells the guest it is `size_in_millimeters`: the window opens and resizes at

@@ -283,6 +283,7 @@ impl RvgWindowConfig {
             match_host_screen: self.flags & RVG_WINDOW_MATCH_HOST_SCREEN != 0,
             mode,
             mode_ppi: (ppi.is_finite() && ppi > 0.0).then_some(ppi),
+            keeps_its_size: false,
             callbacks,
         }
     }
