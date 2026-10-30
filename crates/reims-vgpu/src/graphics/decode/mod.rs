@@ -4,19 +4,29 @@
 //! the platform, so it drives Metal on macOS and the Vulkan platform on Linux,
 //! the same trait the Apple lane's deserializer drives.
 //!
-//! This first slice carries out the descriptor-free **state objects** — events,
-//! fences, shared events and command queues — and object destroy. Each maps
-//! straight to a [`GpuDevice`] call; the decoder keeps an `obj_id` → handle
-//! table, and a destroy drops the handle, releasing the object (handles are
-//! refcounted). These objects need none of the resource manager's paging or
-//! validity machinery, so a handle table is the whole of their lifetime; the
-//! memory resources (buffers, heaps, textures), which do need that machinery,
-//! and the command buffer's encoder-op stream follow in later increments and
-//! reuse `reims-vgpu-core`'s `resources::manager` (see the effort's notes).
+//! The decoder keeps an `obj_id` → handle table: a create ([`GpuDevice`] and the
+//! resource creators) inserts the new handle, a destroy drops it (handles are
+//! refcounted, so the drop releases the object). Everything the decoder drives is
+//! the library's `Platform` directly — this lane keeps no resource manager of the
+//! Apple lane's; the handle table is the whole of an object's host lifetime.
+//!
+//! What this covers:
+//! - the descriptor-free **state objects** (events, fences, shared events,
+//!   command queues) and the descriptor creates (samplers, depth/stencil,
+//!   libraries) and **memory resources** (buffers, heaps, textures), each on the
+//!   `decode` message dispatch;
+//! - the **command buffer** op stream ([`cmdbuf`]): a
+//!   [`RGFX_CMD_COMMAND_BUFFER`] opens a `Platform` command buffer on its queue,
+//!   walks the encoder ops (the render group in [`render`], the compute and blit
+//!   groups stubbed in [`compute`] and [`blit`]), commits, and registers the
+//!   completion path;
+//! - the **object-resolution API** (the `require_*`/`get_*` methods below) the
+//!   encoder-op decoders call to turn a wire `obj_id` into a host handle.
 //!
 //! The decoder runs under a live raise handler, as the Apple lane's command
 //! processing does: a platform raise propagates out of [`GraphicsDecoder::decode`]
-//! for the caller to catch.
+//! for the caller to catch. An op-stream reference the host cannot honour faults
+//! the exec the same way ([`bad_reference`], [`op_fault`]).
 //!
 //! Not yet wired into [`super::GraphicsDevice`] — that lands with the ring loop
 //! in a later increment; until then the decoder has no caller outside the tests.
@@ -26,24 +36,35 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use reims_graphics::wire::{
-    RGFX_CMD_BUFFER_AT_OFFSET, RGFX_CMD_BUFFER_CREATE, RGFX_CMD_DEPTH_STENCIL_CREATE,
-    RGFX_CMD_EVENT_CREATE, RGFX_CMD_FENCE_CREATE, RGFX_CMD_HEAP_CREATE, RGFX_CMD_LIBRARY_CREATE,
-    RGFX_CMD_OBJECT_DESTROY, RGFX_CMD_QUEUE_CREATE, RGFX_CMD_SAMPLER_CREATE,
-    RGFX_CMD_SHARED_EVENT_CREATE, RGFX_CMD_TEXTURE_CREATE, RGFX_CMD_TEXTURE_FROM_BUFFER,
-    RGFX_LIBRARY_BYTES_OFFSET, RgfxBufferAtOffset, RgfxBufferCreate, RgfxDepthStencilCreate,
-    RgfxHeapCreate, RgfxLibraryCreate, RgfxMsgHeader, RgfxObjectCreate, RgfxObjectDestroy,
-    RgfxQueueCreate, RgfxSamplerCreate, RgfxSharedEventCreate, RgfxStencilDescriptor,
-    RgfxTextureCreate, RgfxTextureDescriptor, RgfxTextureFromBuffer,
+    RGFX_CMD_BUFFER_AT_OFFSET, RGFX_CMD_BUFFER_CREATE, RGFX_CMD_COMMAND_BUFFER,
+    RGFX_CMD_DEPTH_STENCIL_CREATE, RGFX_CMD_EVENT_CREATE, RGFX_CMD_FENCE_CREATE,
+    RGFX_CMD_HEAP_CREATE, RGFX_CMD_LIBRARY_CREATE, RGFX_CMD_OBJECT_DESTROY, RGFX_CMD_QUEUE_CREATE,
+    RGFX_CMD_SAMPLER_CREATE, RGFX_CMD_SHARED_EVENT_CREATE, RGFX_CMD_TEXTURE_CREATE,
+    RGFX_CMD_TEXTURE_FROM_BUFFER, RGFX_LIBRARY_BYTES_OFFSET, RgfxBufferAtOffset, RgfxBufferCreate,
+    RgfxCbComplete, RgfxDepthStencilCreate, RgfxHeapCreate, RgfxLibraryCreate, RgfxMsgHeader,
+    RgfxObjectCreate, RgfxObjectDestroy, RgfxQueueCreate, RgfxSamplerCreate, RgfxSharedEventCreate,
+    RgfxStencilDescriptor, RgfxTextureCreate, RgfxTextureDescriptor, RgfxTextureFromBuffer,
 };
-use reims_vgpu_core::platform::Platform;
 use reims_vgpu_core::platform::device::GpuDevice;
 use reims_vgpu_core::platform::resource::{Buffer, Heap};
 use reims_vgpu_core::platform::types::Swizzle;
 use reims_vgpu_core::platform::values::{
     BufferDesc, DepthStencilDesc, HeapDesc, OptionSet, SamplerDesc, StencilDesc, TextureDesc,
 };
-use reims_vgpu_core::raise::{OnFault, RaiseResult};
+use reims_vgpu_core::platform::{Handle, Platform};
+use reims_vgpu_core::raise::{OnFault, Raise, RaiseResult};
 use zerocopy::FromBytes;
+
+mod blit;
+mod cmdbuf;
+mod compute;
+mod render;
+
+/// A sink the decoder calls with each command buffer's completion record once its
+/// work finishes (the handler the stream's close registers). The ring loop sets
+/// one that writes the record to the queue's completion ring; until it is set, a
+/// completion is built and dropped.
+pub(crate) type CompletionSink = Arc<dyn Fn(RgfxCbComplete) + Send + Sync>;
 
 /// A host handle for one guest object, by kind. Later increments read these to
 /// bind resources into command buffers; this slice only inserts them on a create
@@ -59,6 +80,9 @@ enum ObjHandle<P: Platform> {
     Buffer(P::Buffer),
     Texture(P::Texture),
     Heap(P::Heap),
+    RenderPipeline(P::RenderPipeline),
+    ComputePipeline(P::ComputePipeline),
+    Icb(P::Icb),
 }
 
 /// Why a message was not carried out.
@@ -81,6 +105,9 @@ pub struct GraphicsDecoder<P: Platform> {
     /// builders ([`Platform::texture_descriptor`]) some per-device creates need.
     platform: Arc<P>,
     objects: HashMap<u64, ObjHandle<P>>,
+    /// Where a command buffer's completion record goes once its work finishes;
+    /// `None` builds and drops it (the ring loop sets a sink later).
+    completion_sink: Option<CompletionSink>,
 }
 
 impl<P: Platform> GraphicsDecoder<P> {
@@ -89,7 +116,15 @@ impl<P: Platform> GraphicsDecoder<P> {
         GraphicsDecoder {
             platform,
             objects: HashMap::new(),
+            completion_sink: None,
         }
+    }
+
+    /// Sets the sink the decoder hands each command buffer's completion record to
+    /// once its work finishes (the ring loop's, writing the queue's completion
+    /// ring).
+    pub(crate) fn set_completion_sink(&mut self, sink: CompletionSink) {
+        self.completion_sink = Some(sink);
     }
 
     /// The objects the table holds.
@@ -330,6 +365,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                     None => Ok(Err(DecodeError::Refused)),
                 }
             }
+            RGFX_CMD_COMMAND_BUFFER => self.decode_command_buffer(message),
             _ => Ok(Err(DecodeError::UnknownCommand)),
         }
     }
@@ -343,6 +379,70 @@ impl<P: Platform> GraphicsDecoder<P> {
         self.objects.insert(obj_id, handle);
         Ok(Ok(()))
     }
+}
+
+/// An exec fault for an op that named an object the host does not hold, or of the
+/// wrong kind: the object-resolution API's raise, which propagates out of the op
+/// walk for the ring loop's handler to turn into a command-buffer error (as the
+/// design's "invalid guest input ends the process at the same op"). Unlike a
+/// control-ring create's [`DecodeError::BadReference`], an op-stream reference
+/// faults the exec, since the stream is already running on the GPU's queue.
+fn bad_reference() -> Raise {
+    Raise::foreign("rgfx.decode.object")
+        .with_detail("an op named an object the host does not hold, or of the wrong kind")
+}
+
+/// An exec fault for a structurally valid op the host cannot honour: an unknown
+/// op tag, an unknown group, or an encoder op with no matching open encoder. Like
+/// [`bad_reference`], it faults the exec rather than reporting a [`DecodeError`].
+pub(crate) fn op_fault(detail: impl std::fmt::Display) -> Raise {
+    Raise::foreign("rgfx.decode.op").with_detail(detail)
+}
+
+/// The object-resolution API: the contract the encoder-op decoders
+/// ([`render`], [`compute`], [`blit`]) call to turn a wire `obj_id` into a host
+/// handle. A `require_*` resolves a reference that must name an object of its kind
+/// (nil or a miss is an exec fault, [`bad_reference`]); a `get_*` resolves a
+/// nil-allowed reference (`0` is `None`, a non-zero miss is an exec fault). Each
+/// returns a fresh counted reference ([`Handle::clone_ref`]) the caller holds for
+/// the encode.
+macro_rules! resolvers {
+    ($( ($req:ident, $get:ident, $variant:ident, $assoc:ident, $what:literal) ),* $(,)?) => {
+        impl<P: Platform> GraphicsDecoder<P> {
+            $(
+                #[doc = concat!("The ", $what, " `id` names; an exec fault when `id` is 0 or names no ", $what, ".")]
+                pub(crate) fn $req(&self, id: u64) -> RaiseResult<P::$assoc> {
+                    match self.objects.get(&id) {
+                        Some(ObjHandle::$variant(h)) => Ok(h.clone_ref()),
+                        _ => Err(bad_reference()),
+                    }
+                }
+                #[doc = concat!("The ", $what, " `id` names, `None` for 0; an exec fault when a non-zero `id` names no ", $what, ".")]
+                pub(crate) fn $get(&self, id: u64) -> RaiseResult<Option<P::$assoc>> {
+                    if id == 0 {
+                        return Ok(None);
+                    }
+                    match self.objects.get(&id) {
+                        Some(ObjHandle::$variant(h)) => Ok(Some(h.clone_ref())),
+                        _ => Err(bad_reference()),
+                    }
+                }
+            )*
+        }
+    };
+}
+
+resolvers! {
+    (require_buffer, get_buffer, Buffer, Buffer, "buffer"),
+    (require_texture, get_texture, Texture, Texture, "texture"),
+    (require_sampler, get_sampler, Sampler, SamplerState, "sampler"),
+    (require_depth_stencil, get_depth_stencil, DepthStencil, DepthStencilState, "depth/stencil state"),
+    (require_render_pipeline, get_render_pipeline, RenderPipeline, RenderPipeline, "render pipeline"),
+    (require_compute_pipeline, get_compute_pipeline, ComputePipeline, ComputePipeline, "compute pipeline"),
+    (require_fence, get_fence, Fence, Fence, "fence"),
+    (require_event, get_event, Event, Event, "event"),
+    (require_heap, get_heap, Heap, Heap, "heap"),
+    (require_indirect_command_buffer, get_indirect_command_buffer, Icb, Icb, "indirect command buffer"),
 }
 
 /// Reads a message struct from the start of `message`, or `None` if it is too
