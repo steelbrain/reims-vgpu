@@ -423,6 +423,38 @@ How a Metal bundle plugs into macOS, in Apple's own terms (notes:
   compiler helpers and sandboxed apps needs relaxed library validation — a
   guest boot-policy step we control (OpenCore/boot-args), not a code concern.
 
+## Stage 3 accelerator kext (scaffold)
+
+`RgfxAccelerator` (`guest/kext/src/RgfxAccelerator.{hpp,cpp}`) is a second
+IOService in the one kext, on the same PCI device as the Stage-2 framebuffer:
+the framebuffer matches in category `IOFramebuffer`, the accelerator in category
+`IOAccelerator`, both children of the one `IOPCIDevice`. Its `Info.plist`
+personality carries `MetalPluginName
+= /Library/GPUBundles/reims-graphics.bundle` and `MetalPluginClassName
+= RgfxMetalDevice`, which is how Metal (`IOServiceMatching("IOAccelerator")`)
+finds and loads the bundle. The accelerator maps BAR 0 for the doorbell and
+holds BAR 2 to hand to the bundle; it touches no pixels and no control ring (the
+framebuffer owns those).
+
+`RgfxAcceleratorUserClient`
+(`guest/kext/src/RgfxAcceleratorUserClient.{hpp,cpp}`) is **our own** transport,
+not Apple's IOGPU user-client ABI: `clientMemoryForType(kRgfxAccelMemoryRegion)`
+maps the BAR-2 region into the Metal client's task (so the bundle's `RgfxRegion`
+/ `RgfxRingWriter` write into real device memory and read the caps page), and
+`externalMethod(kRgfxAccelMethodDoorbell)` writes a ring id to
+`RGFX_REG_DOORBELL`. These ids/selectors are defined in `RgfxAccelerator.hpp`;
+the bundle's wire handshake (a boot-gated stub in `RgfxMetalDevice` today) opens
+them with `IOServiceOpen` / `IOConnectMapMemory` / `IOConnectCallScalarMethod`.
+
+- **Boot-gated — base class / kernel family (notes UNKNOWN #1).** The scaffold
+  subclasses `IOAccelerator`, the base the macOS SDK and KDK expose (the IOGPU
+  kernel family — `IOGPU`, its device/queue classes and its submission/
+  allocation user-client ABI — is Apple-private and in neither, so it cannot be
+  subclassed or linked off the guest). On the guest the base very likely becomes
+  the IOGPU family class per Decided 15; the Metal discovery keys, the PCI match
+  and our region-map + doorbell user client are expected to carry over. The
+  IOGPU user-client ABI is deliberately not invented here.
+
 ## Open
 
 - **Stage 3 bundle placement — RESOLVED in principle:** the bundle sits in

@@ -39,11 +39,18 @@ FLAGS = $(ARCH) -mkernel -nostdinc -isystem $(KERNEL) -I../../crates/reims-graph
 CXXFLAGS = $(FLAGS) -std=c++17 -fapple-kext -fno-rtti -fno-exceptions
 CFLAGS   = $(FLAGS) -std=c11
 
-OBJECTS = $(BUILD)/obj/ReimsGraphics.o $(BUILD)/obj/kmod_info.o
+HEADERS = $(wildcard src/*.hpp)
+
+# The Stage-2 framebuffer (ReimsGraphics) and the Stage-3 Metal accelerator
+# (RgfxAccelerator) and its region-map + doorbell user client, all one kext.
+OBJECTS = $(BUILD)/obj/ReimsGraphics.o \
+	$(BUILD)/obj/RgfxAccelerator.o \
+	$(BUILD)/obj/RgfxAcceleratorUserClient.o \
+	$(BUILD)/obj/kmod_info.o
 
 all: $(BINARY)
 
-$(BUILD)/obj/%.o: src/%.cpp src/ReimsGraphics.hpp ../../crates/reims-graphics/include/reims_graphics_wire.h Makefile
+$(BUILD)/obj/%.o: src/%.cpp $(HEADERS) ../../crates/reims-graphics/include/reims_graphics_wire.h Makefile
 	@mkdir -p $(@D)
 	xcrun clang++ $(CXXFLAGS) -c $< -o $@
 

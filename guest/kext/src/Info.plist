@@ -39,6 +39,25 @@
 			<key>IOProviderClass</key>
 			<string>IOPCIDevice</string>
 		</dict>
+		<key>RgfxAccelerator</key>
+		<dict>
+			<key>CFBundleIdentifier</key>
+			<string>com.steelbrain.ReimsGraphics</string>
+			<key>IOClass</key>
+			<string>RgfxAccelerator</string>
+			<key>IOMatchCategory</key>
+			<string>IOAccelerator</string>
+			<key>IOPCIPrimaryMatch</key>
+			<string>0x52471234</string>
+			<key>IOProbeScore</key>
+			<integer>30000</integer>
+			<key>IOProviderClass</key>
+			<string>IOPCIDevice</string>
+			<key>MetalPluginName</key>
+			<string>/Library/GPUBundles/reims-graphics.bundle</string>
+			<key>MetalPluginClassName</key>
+			<string>RgfxMetalDevice</string>
+		</dict>
 	</dict>
 	<key>LSMinimumSystemVersion</key>
 	<string>26.0</string>
