@@ -12,7 +12,8 @@
 # for a .qcow2 name and raw otherwise; it must not exist, so SRC is never
 # written. The KEXTs go after the image's own entries, each after the given
 # kexts its OSBundleLibraries names. A kext the image already carries (by
-# bundle name) is replaced, files and entry, in its entry's place. Prints the
+# bundle name) is replaced, files and entry, in its entry's place, or moves to
+# the end where a given kext it links against comes later. Prints the
 # Kernel > Add entries of OUT.
 #
 # Needs qemu-img, mtools and python3. It edits a raw copy in a temporary
@@ -113,6 +114,14 @@ for name, info in ordered:
         "PlistPath": "Contents/Info.plist",
     })
     at = next((i for i, e in enumerate(add) if e.get("BundlePath") == name), None)
+    # A kext replaced in its entry's place must still come after the given
+    # kexts it links against, which may be new and so appended.
+    libs = set(info.get("OSBundleLibraries", {})) & ids
+    after = [i for i, e in enumerate(add) if e.get("BundlePath") in
+             {n for n, i2 in ordered if i2["CFBundleIdentifier"] in libs}]
+    if at is not None and after and max(after) > at:
+        del add[at]
+        at = None
     if at is None:
         add.append(entry)
     else:
