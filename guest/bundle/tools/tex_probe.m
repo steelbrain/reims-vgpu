@@ -10,6 +10,9 @@
 //                       off the main thread, once each, in commit order, the buffer filled by the
 //                       last; then 2 s idle, in which the process must use under 20 ms of CPU (the
 //                       completion thread sleeps in the kext)
+//   tex_probe big N     one command buffer of N fills, each 4 bytes of a Shared buffer with its
+//                       own value, far larger than its queue's ring for large N, waited for by its
+//                       handler alone: every word must hold its fill
 // Prints "TEX OK" when every check passes, else "TEX FAIL: why" and exits 1. A completion 20 s
 // late prints HANG and exits 3. The copy waits with waitUntilCompleted, or with its completed
 // handler alone (`handler`).
@@ -210,14 +213,52 @@ static int handlers_in_order(id<MTLDevice> device, id<MTLCommandQueue> queue, lo
 	return 0;
 }
 
+// One command buffer of `n` 4-byte fills, each of its own value, waited for by its handler.
+static int one_big_buffer(id<MTLDevice> device, id<MTLCommandQueue> queue, long n)
+{
+	id<MTLBuffer> buf = [device newBufferWithLength:(NSUInteger)(4 * n)
+	                                        options:MTLResourceStorageModeShared];
+	if (buf == nil)
+		return fail("no Shared buffer");
+	memset([buf contents], 0, (size_t)(4 * n));
+	id<MTLCommandBuffer> cb = [queue commandBuffer];
+	id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+	for (long i = 0; i < n; i++)
+		[blit fillBuffer:buf range:NSMakeRange((NSUInteger)(4 * i), 4) value:(uint8_t)(i * 7 + 1)];
+	[blit endEncoding];
+	dispatch_semaphore_t done = dispatch_semaphore_create(0);
+	[cb addCompletedHandler:^(id<MTLCommandBuffer> b) {
+		(void)b;
+		dispatch_semaphore_signal(done);
+	}];
+	struct watch *w = watch_start("the big command buffer");
+	double start = now_ms();
+	[cb commit];
+	dispatch_semaphore_wait(done, DISPATCH_TIME_FOREVER);
+	atomic_store(&w->done, 1);
+	double took = now_ms() - start;
+	const uint8_t *b = (const uint8_t *)[buf contents];
+	long wrong = 0;
+	for (long i = 0; i < 4 * n; i++)
+		wrong += b[i] != (uint8_t)((i / 4) * 7 + 1);
+	printf("big: %ld fills in %.1f ms, status=%ld, wrong bytes=%ld\n", n, took, (long)cb.status,
+	       wrong);
+	if (cb.status != MTLCommandBufferStatusCompleted)
+		return fail(cb.error ? [[cb.error description] UTF8String] : "not completed");
+	if (wrong)
+		return fail("a fill of the big command buffer is missing");
+	return 0;
+}
+
 int main(int argc, char **argv)
 {
 	@autoreleasepool {
 		int handler = argc >= 2 && strcmp(argv[1], "handler") == 0;
+		int big = argc >= 2 && strcmp(argv[1], "big") == 0;
 		if (argc < 2 ||
-		    (strcmp(argv[1], "copy") != 0 && strcmp(argv[1], "hold") != 0 && !handler) ||
+		    (strcmp(argv[1], "copy") != 0 && strcmp(argv[1], "hold") != 0 && !handler && !big) ||
 		    (strcmp(argv[1], "copy") != 0 && argc < 3)) {
-			fprintf(stderr, "usage: tex_probe copy | tex_probe hold N | tex_probe handler N\n");
+			fprintf(stderr, "usage: tex_probe copy | hold N | handler N | big N\n");
 			return 2;
 		}
 		id<MTLDevice> device = MTLCreateSystemDefaultDevice();
@@ -265,6 +306,13 @@ int main(int argc, char **argv)
 			// Every id held: give one back so the copy's texture has one, as an app would.
 			if ((long)held.count < n && held.count > 0)
 				[held removeLastObject];
+		}
+		if (big) {
+			int r = one_big_buffer(device, queue, strtol(argv[2], NULL, 10));
+			if (r != 0)
+				return r;
+			printf("TEX OK\n");
+			return 0;
 		}
 		int r = copy_through_texture(device, queue, handler);
 		if (r != 0)

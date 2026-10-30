@@ -706,15 +706,18 @@ fn a_full_completion_ring_holds_the_commands_back() {
 struct QueueTestHost {
     vectors: Arc<Mutex<Vec<u32>>>,
     handed: Arc<Mutex<Vec<u32>>>,
+    buffers: Arc<Mutex<Vec<Vec<u8>>>>,
     closed: Arc<Mutex<Vec<u32>>>,
     gate: Arc<AtomicBool>,
 }
 
-/// What a [`QueueTestHost`] records, and its gate, open.
+/// What a [`QueueTestHost`] records (the command buffers' whole messages among it), and its gate,
+/// open.
 #[derive(Default)]
 struct QueueTestSeen {
     vectors: Arc<Mutex<Vec<u32>>>,
     handed: Arc<Mutex<Vec<u32>>>,
+    buffers: Arc<Mutex<Vec<Vec<u8>>>>,
     closed: Arc<Mutex<Vec<u32>>>,
     gate: Arc<AtomicBool>,
 }
@@ -730,6 +733,7 @@ impl QueueTestSeen {
         Box::new(QueueTestHost {
             vectors: Arc::clone(&self.vectors),
             handed: Arc::clone(&self.handed),
+            buffers: Arc::clone(&self.buffers),
             closed: Arc::clone(&self.closed),
             gate: Arc::clone(&self.gate),
         })
@@ -776,6 +780,7 @@ impl Host for QueueTestHost {
                 completion.post(reflection.as_bytes());
             }
             RGFX_CMD_COMMAND_BUFFER => {
+                self.buffers.lock().push(message.to_vec());
                 let (cb, _) = crate::ops::RgfxCommandBuffer::read_from_prefix(message).unwrap();
                 let done = RgfxCbComplete {
                     header: RgfxMsgHeader {
@@ -898,6 +903,35 @@ fn first_queue_completion(rig: &Rig) -> Option<RgfxCbComplete> {
     None
 }
 
+/// A `COMMAND_BUFFER_IN_REGION` naming `byte_length` bytes at `region_offset`.
+fn command_buffer_in_region(region_offset: u64, byte_length: u64) -> Vec<u8> {
+    RgfxCommandBufferInRegion {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_COMMAND_BUFFER_IN_REGION,
+            size: size_of::<RgfxCommandBufferInRegion>() as u32,
+            seqno: 0,
+        },
+        region_offset,
+        byte_length,
+    }
+    .as_bytes()
+    .to_vec()
+}
+
+/// Publishes `message` at the tests' queue submission ring's count `at` with seqno `seqno`, and
+/// rings its doorbell; returns the count past it.
+fn publish_queue_message(rig: &Rig, at: u64, seqno: u64, mut message: Vec<u8>) -> u64 {
+    message[8..16].copy_from_slice(&seqno.to_le_bytes());
+    rig.region().write(QUEUE_SUBMIT + 256 + at, &message);
+    let end = at + message.len() as u64;
+    rig.region()
+        .atomic_u64(QUEUE_SUBMIT)
+        .store(end, Ordering::SeqCst);
+    rig.device
+        .mmio_write(RGFX_REG_DOORBELL.into(), QUEUE_SUBMIT as u32);
+    end
+}
+
 /// Waits about 2 s for the tests' queue submission ring to go idle: its thread sleeps, so the
 /// guest rings for its next message.
 fn wait_queue_idle(rig: &Rig) {
@@ -1016,6 +1050,58 @@ fn a_command_queue_gets_its_own_ring_loop() {
     assert_eq!(rig.complete(), (seqno, RGFX_STATUS_OK));
     assert_eq!(rig.device.queue_count(), 0);
     assert_eq!(*seen.closed.lock(), vec![7]);
+}
+
+/// A `COMMAND_BUFFER_IN_REGION` hands the host the whole `COMMAND_BUFFER` message in the block it
+/// names, with the reference's seqno, and the completion names that seqno; a reference outside
+/// the processes' blocks, or to bytes that are not a `COMMAND_BUFFER` of its length, is refused,
+/// and the ring goes on.
+#[test]
+fn a_command_buffer_in_region_is_taken_from_its_block() {
+    use crate::ops::{RGFX_COMMAND_BUFFER_OPS_OFFSET, RgfxCommandBuffer};
+    let seen = QueueTestSeen::new();
+    let mut rig = Rig::with_host(seen.host());
+    rig.start();
+    const QUEUE: u64 = (5 << RGFX_CONTEXT_OBJ_ID_SHIFT) | 1;
+    let seqno = rig.send(queue_create(QUEUE));
+    assert_eq!(rig.complete(), (seqno, RGFX_STATUS_OK));
+    wait_queue_idle(&rig);
+
+    // The buffer's whole message in a block past the rings: its header, then 64 bytes of ops.
+    const BLOCK: u64 = QUEUE_COMPLETE + 0x10_0000;
+    let mut message = RgfxCommandBuffer {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_COMMAND_BUFFER,
+            size: RGFX_COMMAND_BUFFER_OPS_OFFSET + 64,
+            seqno: 0,
+        },
+        queue_obj_id: QUEUE,
+        cb_obj_id: 200,
+        op_bytes: 64,
+    }
+    .as_bytes()
+    .to_vec();
+    message.extend((0..64u8).map(|i| i ^ 0x5a));
+    rig.region().write(BLOCK, &message);
+    let len = message.len() as u64;
+
+    // Refused: below the processes' blocks, a length past the message, and bytes that are not a
+    // COMMAND_BUFFER. Then the good one, taken with the reference's seqno.
+    let mut at = publish_queue_message(&rig, 0, 70, command_buffer_in_region(0x1000, len));
+    at = publish_queue_message(&rig, at, 71, command_buffer_in_region(BLOCK, len + 8));
+    at = publish_queue_message(&rig, at, 72, command_buffer_in_region(BLOCK + 8, len - 8));
+    publish_queue_message(&rig, at, 77, command_buffer_in_region(BLOCK, len));
+
+    let done = first_queue_completion(&rig).expect("a CB_COMPLETE for the buffer in its block");
+    assert_eq!(done.header.seqno, 77);
+    assert_eq!(done.cb_obj_id, 200);
+    let mut want = message.clone();
+    want[8..16].copy_from_slice(&77u64.to_le_bytes());
+    assert_eq!(*seen.buffers.lock(), vec![want]);
+    assert_eq!(
+        *seen.handed.lock(),
+        vec![RGFX_CMD_QUEUE_CREATE, RGFX_CMD_COMMAND_BUFFER]
+    );
 }
 
 /// A command buffer is decoded only once the creates published on ring 0 before it are carried

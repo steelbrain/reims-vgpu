@@ -91,12 +91,41 @@ uint64_t RgfxEncoder::opBytes() const
 	return m_buf.size() - RGFX_COMMAND_BUFFER_OPS_OFFSET;
 }
 
-bool RgfxEncoder::finish(uint64_t *out_seqno)
+bool RgfxEncoder::fitsRing() const
 {
+	return m_buf.size() <= UINT32_MAX && m_ring.fits(static_cast<uint32_t>(m_buf.size()));
+}
+
+bool RgfxEncoder::finish(uint64_t *out_seqno, const std::function<void()> &whileWaiting,
+                         const std::function<void(uint64_t)> &beforePublish)
+{
+	if (!fitsRing())
+		return false;
 	m_head.op_bytes = opBytes();
 	std::memcpy(m_buf.data(), &m_head, sizeof(m_head));
-	return m_ring.tryPost(RGFX_CMD_COMMAND_BUFFER, m_buf.data(),
-	                      static_cast<uint32_t>(m_buf.size()), out_seqno);
+	return m_ring.post(RGFX_CMD_COMMAND_BUFFER, m_buf.data(),
+	                   static_cast<uint32_t>(m_buf.size()), out_seqno, whileWaiting, beforePublish);
+}
+
+bool RgfxEncoder::finishInRegion(volatile uint8_t *block, uint64_t region_offset,
+                                 uint64_t *out_seqno, const std::function<void()> &whileWaiting,
+                                 const std::function<void(uint64_t)> &beforePublish)
+{
+	if (m_buf.size() > UINT32_MAX)
+		return false;
+	m_head.op_bytes = opBytes();
+	m_head.header.type = RGFX_CMD_COMMAND_BUFFER;
+	m_head.header.size = static_cast<uint32_t>(m_buf.size());
+	m_head.header.seqno = 0;
+	std::memcpy(m_buf.data(), &m_head, sizeof(m_head));
+	// Write-back memory the host reads once the reference's `producer` is published (a
+	// release store), so the copy is ordered before it.
+	std::memcpy(const_cast<uint8_t *>(block), m_buf.data(), m_buf.size());
+	RgfxCommandBufferInRegion ref = {};
+	ref.region_offset = region_offset;
+	ref.byte_length = m_buf.size();
+	return m_ring.post(RGFX_CMD_COMMAND_BUFFER_IN_REGION, &ref, sizeof(ref), out_seqno,
+	                   whileWaiting, beforePublish);
 }
 
 // --- framing ----------------------------------------------------------------

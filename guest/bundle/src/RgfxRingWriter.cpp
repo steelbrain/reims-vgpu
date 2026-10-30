@@ -6,8 +6,11 @@
 
 #include "RgfxRingWriter.hpp"
 
+#include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <memory>
+#include <thread>
 
 namespace {
 
@@ -70,8 +73,36 @@ RgfxRingWriter::RgfxRingWriter(RgfxForward forward, void *forward_context, uint3
 {
 }
 
+bool RgfxRingWriter::fits(uint32_t size) const
+{
+	if (size < kHeaderBytes || size % kMsgAlign != 0)
+		return false;
+	return m_forward ? size <= m_dataSize : size <= m_dataSize / 2;
+}
+
+bool RgfxRingWriter::post(uint32_t type, const void *message, uint32_t size, uint64_t *out_seqno,
+                          const std::function<void()> &whileWaiting,
+                          const std::function<void(uint64_t)> &beforePublish)
+{
+	if (!fits(size))
+		return false;
+	uint32_t sleepUs = 0;
+	for (;;) {
+		if (tryPost(type, message, size, out_seqno, nullptr, beforePublish))
+			return true;
+		// The host takes the ring on a thread of its own: make sure it is awake, then let it.
+		if (m_doorbell && (sleepUs == 0 || load32(m_header + kConsumerIdle) == 1))
+			m_doorbell(m_doorbellContext, m_ringId);
+		if (whileWaiting)
+			whileWaiting();
+		sleepUs = sleepUs == 0 ? 20 : std::min<uint32_t>(sleepUs * 2, 1000);
+		std::this_thread::sleep_for(std::chrono::microseconds(sleepUs));
+	}
+}
+
 bool RgfxRingWriter::tryPost(uint32_t type, const void *message, uint32_t size, uint64_t *out_seqno,
-                             uint32_t *out_status)
+                             uint32_t *out_status,
+                             const std::function<void(uint64_t)> &beforePublish)
 {
 	if (size < kHeaderBytes || size % kMsgAlign != 0 || size > m_dataSize)
 		return false;
@@ -93,6 +124,8 @@ bool RgfxRingWriter::tryPost(uint32_t type, const void *message, uint32_t size, 
 		uint64_t seqno = 0;
 		if (!m_forward(m_forwardContext, buf, size, &seqno, out_status))
 			return false;
+		if (beforePublish)
+			beforePublish(seqno);
 		if (out_seqno)
 			*out_seqno = seqno;
 		return true;
@@ -124,6 +157,8 @@ bool RgfxRingWriter::tryPost(uint32_t type, const void *message, uint32_t size, 
 	RgfxMsgHeader header = { type, size, seqno };
 	writeBytes(m_data, offset, &header, sizeof(header));
 	m_produced += size;
+	if (beforePublish)
+		beforePublish(seqno);
 
 	store64(m_header + kProducer, m_produced);
 	fullFence();

@@ -461,6 +461,19 @@ opens the `Platform` command buffer and walks the ops:
   outside the trait); `CB_COMMIT` closes the message — the host commits and
   registers an `add_completed_handler` that writes the completion record.
 
+A command buffer too large for half its queue's submission ring goes out of
+line: the bundle writes the whole `COMMAND_BUFFER` message into a block of the
+process's own and posts a `COMMAND_BUFFER_IN_REGION` (region offset and
+length) on the ring. The queue's service thread copies the message out of the
+block once, as it does a ring's, with the reference's seqno, and the bundle
+gives the block back when the buffer completes. Metal sets no maximum size, so
+nothing is refused for size. A queue holds `maxCommandBufferCount` buffers
+(64 by default) alive and not completed. `-commandBuffer` blocks past that, as
+Metal's does, which keeps the ring from filling in the common case. A commit
+that still finds the ring full rings the doorbell and sleeps 20 µs, doubling
+to 1 ms, between looks. Each buffer's completion is expected before the host
+can see it, under the ring's lock.
+
 Metal splits one command buffer into several kernel submissions (a render pass;
 a run of blits or of computes with no event between) — m2v's measured
 granularity. The host preserves it so IOGPU error reporting lines up.

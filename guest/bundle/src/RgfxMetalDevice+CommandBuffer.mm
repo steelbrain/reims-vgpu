@@ -76,6 +76,8 @@ constexpr uint32_t kQueueCompleteDataSize = 32768;
 	RgfxReplyReader *reader =
 	    new RgfxReplyReader(region->base() + rings.complete_offset, rings.complete_data_size);
 	[queue adoptReplyReader:reader];
+	// A command buffer too large for the ring puts its message in a block of the region.
+	queue.region = region;
 	// The process's completion thread takes the ring's completions from now on, whether or
 	// not anything waits for them.
 	if (RgfxCompletionThread *completions = [self completionThread])

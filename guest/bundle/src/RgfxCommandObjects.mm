@@ -37,6 +37,7 @@
 #include "RgfxCompletionThread.hpp"
 #include "RgfxEncoder.hpp"
 #include "RgfxObjectModel.hpp"
+#include "RgfxRegion.hpp"
 #include "RgfxReplyReader.hpp"
 #include "RgfxRingWriter.hpp"
 #include "RgfxSerializer.hpp"
@@ -204,10 +205,19 @@ uint32_t fillRenderPass(MTLRenderPassDescriptor *d, RgfxRenderPassDesc *desc,
 // RgfxCommandQueue
 // =============================================================================
 
+@interface RgfxCmdBuffer ()
+/// The buffer holds one of its queue's `slots` (maxCommandBufferCount), given back once it
+/// completes, or at its dealloc where it never does.
+- (void)rgfxHoldSlot:(dispatch_semaphore_t)slots;
+@end
+
 @implementation RgfxCommandQueue {
 	RgfxRingWriter *_submitRing;   // borrowed: the queue's submission ring
 	RgfxIdSpace *_ids;             // borrowed: the device id space, for cb ids
 	NSUInteger _maxCount;
+	// maxCommandBufferCount slots, one taken by each command buffer made while the queue has a
+	// reader, given back as it completes.
+	dispatch_semaphore_t _slots;
 	NSString *_queueLabel;
 	std::shared_ptr<RgfxReplyReader> _ownedReader; // adoptReplyReader:'s per-queue completion reader
 	dispatch_queue_t _submissionQueue; // kept for -submissionQueue (setSubmissionQueue: SPI)
@@ -240,9 +250,37 @@ uint32_t fillRenderPass(MTLRenderPassDescriptor *d, RgfxRenderPassDesc *desc,
 	if (q != nil) {
 		q->_submitRing = submitRing;
 		q->_ids = ids;
-		q->_maxCount = maxCount;
+		q->_maxCount = maxCount != 0 ? maxCount : 64;
+		q->_slots = dispatch_semaphore_create(static_cast<long>(q->_maxCount));
 	}
 	return q;
+}
+
+- (NSUInteger)maxCommandBufferCount
+{
+	return _maxCount;
+}
+
+// Takes one of the queue's slots, blocking while every one is held, as Metal's -commandBuffer
+// does. The completion thread gives them back as it delivers; where it does not drive the ring
+// (a unit test, or its thread has ended), or this is the delivering thread (a handler making a
+// buffer), the ring is taken here meanwhile.
+- (void)rgfxTakeSlot
+{
+	if (dispatch_semaphore_wait(_slots, DISPATCH_TIME_NOW) == 0)
+		return;
+	RgfxReplyReader *reader = self.replyReader;
+	bool delivering = t_delivering > 0 || RgfxCompletionThread::onCurrentThread();
+	for (;;) {
+		if (reader->driven() && !delivering) {
+			if (dispatch_semaphore_wait(_slots, dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC)) == 0)
+				return;
+			continue;
+		}
+		reader->pump();
+		if (dispatch_semaphore_wait(_slots, dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_MSEC)) == 0)
+			return;
+	}
 }
 
 // --- MTLCommandQueue ---------------------------------------------------------
@@ -266,13 +304,24 @@ uint32_t fillRenderPass(MTLRenderPassDescriptor *d, RgfxRenderPassDesc *desc,
 
 - (RgfxCmdBuffer *)rgfxCommandBufferRetained:(BOOL)retained
 {
+	// Only completions give a slot back: a queue without a reader (a unit test) takes none.
+	bool slotted = self.replyReader != nullptr;
+	if (slotted)
+		[self rgfxTakeSlot];
 	uint64_t cbObjId = _ids->allocObjId();
-	return [RgfxCmdBuffer commandBufferForQueue:self
-	                                           ring:_submitRing
-	                                        cbObjId:cbObjId
-	                                       retained:retained
-	                                         device:self.device
-	                                     serializer:[self serializer]];
+	RgfxCmdBuffer *cb = [RgfxCmdBuffer commandBufferForQueue:self
+	                                                    ring:_submitRing
+	                                                 cbObjId:cbObjId
+	                                                retained:retained
+	                                                  device:self.device
+	                                              serializer:[self serializer]];
+	if (slotted) {
+		if (cb != nil)
+			[cb rgfxHoldSlot:_slots];
+		else
+			dispatch_semaphore_signal(_slots);
+	}
+	return cb;
 }
 
 - (NSString *)label
@@ -368,6 +417,12 @@ uint32_t fillRenderPass(MTLRenderPassDescriptor *d, RgfxRenderPassDesc *desc,
 	// says it was left, so a buffer whose completion never came leaves it at dealloc.
 	dispatch_group_t _done;
 	std::atomic<bool> _left;
+	// The queue's slot this buffer holds (rgfxHoldSlot:), and whether it still does.
+	dispatch_semaphore_t _slots;
+	std::atomic<bool> _slotHeld;
+	// A buffer too large for its ring: the region block its message lies in until it completes.
+	RgfxRegion *_bodyRegion;
+	uint64_t _bodyOffset;
 	// The IOSurface copies this buffer writes, written back to their surfaces' pages
 	// when it completes (RgfxIOSurface.h).
 	std::vector<std::shared_ptr<void>> _surfaceWrites;
@@ -400,7 +455,21 @@ uint32_t fillRenderPass(MTLRenderPassDescriptor *d, RgfxRenderPassDesc *desc,
 	// (its reader went first) is left here.
 	if (_done != nil && !_left.exchange(true))
 		dispatch_group_leave(_done);
+	// A buffer never committed, or whose completion never came, gives its slot back.
+	[self rgfxGiveSlotBack];
 	delete _encoder;
+}
+
+- (void)rgfxHoldSlot:(dispatch_semaphore_t)slots
+{
+	_slots = slots;
+	_slotHeld.store(true);
+}
+
+- (void)rgfxGiveSlotBack
+{
+	if (_slots != nil && _slotHeld.exchange(false))
+		dispatch_semaphore_signal(_slots);
 }
 
 // --- vending the encoders ----------------------------------------------------
@@ -478,27 +547,70 @@ uint32_t fillRenderPass(MTLRenderPassDescriptor *d, RgfxRenderPassDesc *desc,
 	// completion.
 	rgfxIOSurfaceSyncBeforeCommit();
 	_surfaceWrites = _encoder->takeSurfaceWrites();
-	// Serialise the command-buffer header + op stream and post it on the queue's
-	// submission ring; `_seqno` is the submission the host's RgfxCbComplete carries.
-	_encoder->finish(&_seqno);
+	// Committed before the host can see it, so a completion never finds an older status.
 	_status.store(MTLCommandBufferStatusCommitted);
 
-	// Register with the queue's completion-ring reader (if it has one) so the
-	// RGFX_EVT_CB_COMPLETE for `_seqno` fires this buffer's handlers, flips its status
-	// and wakes a waiter. The handler captures `self` strongly, so a committed buffer
-	// lives until its completion lands (as Metal retains an in-flight command buffer);
-	// the reader removes the one-shot handler when it fires. Without a reader the
-	// status stays Committed and the handlers are held.
+	// With a reader, the RGFX_EVT_CB_COMPLETE for the buffer's seqno fires its handlers,
+	// flips its status and wakes a waiter. It is expected under the ring's lock, before the
+	// host can see the buffer, so the completion thread never takes the completion first.
+	// The handler captures `self` strongly, so a committed buffer lives until its completion
+	// lands (as Metal retains an in-flight command buffer); the reader removes the one-shot
+	// handler when it fires. Without a reader the status stays Committed and the handlers
+	// are held.
 	RgfxCommandQueue *queue = _queue;
 	_reader = queue.replyReader;
+	std::function<void(uint64_t)> expect;
+	std::function<void()> whileWaiting;
 	if (_reader != nullptr) {
 		_readerHold = [queue sharedReplyReader];
 		_done = dispatch_group_create();
 		dispatch_group_enter(_done);
 		RgfxCmdBuffer *strongSelf = self;
-		_reader->expectCompletion(_seqno, [strongSelf](const RgfxCbComplete &m) {
+		RgfxReplyReader *reader = _reader;
+		expect = [reader, strongSelf](uint64_t seqno) {
+			reader->expectCompletion(seqno, [strongSelf](const RgfxCbComplete &m) {
+				@autoreleasepool {
+					[strongSelf rgfxDeliverCompletion:&m];
+				}
+			});
+		};
+		// While the ring is full: where nothing else takes the queue's completions (this is
+		// the delivering thread, or no thread drives the ring), take them here, as the host
+		// may be waiting for room on the completion ring before it takes more.
+		if (t_delivering > 0 || RgfxCompletionThread::onCurrentThread() || !reader->driven())
+			whileWaiting = [reader] { reader->pump(); };
+	}
+
+	// Post the command buffer on the queue's submission ring, waiting for room; one too
+	// large for the ring goes in a block of the process's own, which the ring names.
+	bool posted = false;
+	if (_encoder->fitsRing()) {
+		posted = _encoder->finish(&_seqno, whileWaiting, expect);
+	} else if (RgfxRegion *region = queue.region) {
+		RgfxRegion::Block block = region->allocate(_encoder->messageSize());
+		if (block.ok) {
+			_bodyRegion = region;
+			_bodyOffset = block.offset;
+			posted = _encoder->finishInRegion(block.ptr, block.offset, &_seqno, whileWaiting,
+			                                  expect);
+		}
+	}
+	if (!posted) {
+		// No block for it: the buffer fails as Metal's does when memory runs out, and its
+		// handlers run off the committing thread.
+		NSLog(@"RGFX: command buffer 0x%llx: no region block for its %llu bytes: it fails "
+		      @"with MTLCommandBufferErrorOutOfMemory",
+		      (unsigned long long)[self rgfxObjId],
+		      (unsigned long long)_encoder->messageSize());
+		RgfxCbComplete failed = {};
+		failed.header.type = RGFX_EVT_CB_COMPLETE;
+		failed.cb_obj_id = [self rgfxObjId];
+		failed.status = RGFX_CB_INTERNAL;
+		failed.error_code = MTLCommandBufferErrorOutOfMemory;
+		RgfxCmdBuffer *strongSelf = self;
+		dispatch_async(dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{
 			@autoreleasepool {
-				[strongSelf rgfxDeliverCompletion:&m];
+				[strongSelf rgfxDeliverCompletion:&failed];
 			}
 		});
 	}
@@ -515,6 +627,14 @@ uint32_t fillRenderPass(MTLRenderPassDescriptor *d, RgfxRenderPassDesc *desc,
 	// The surfaces this buffer wrote hold its results before anyone sees it complete.
 	rgfxIOSurfaceWriteBack(_surfaceWrites);
 	_surfaceWrites.clear();
+	// The host read the message out of its block before it ran the buffer.
+	if (_bodyRegion != nullptr) {
+		_bodyRegion->release(_bodyOffset);
+		_bodyRegion = nullptr;
+	}
+	// The queue's slot goes back before the handlers run, so one that makes the next buffer
+	// does not wait for its own.
+	[self rgfxGiveSlotBack];
 	if (msg->status == RGFX_CB_OK) {
 		_status.store(MTLCommandBufferStatusCompleted);
 	} else {

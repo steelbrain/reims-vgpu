@@ -55,6 +55,7 @@ class RgfxRingWriter;
 class RgfxIdSpace;
 class RgfxEncoder;
 class RgfxReplyReader;
+class RgfxRegion;
 #endif
 
 NS_ASSUME_NONNULL_BEGIN
@@ -96,6 +97,18 @@ NS_ASSUME_NONNULL_BEGIN
 /// as before the reader landed). For a queue with its own per-queue completion ring, the
 /// device hands it an owned reader with -adoptReplyReader: (below).
 @property(nonatomic, nullable) RgfxReplyReader *replyReader;
+
+/// The device region (borrowed) a command buffer too large for the queue's submission ring
+/// puts its message in, a block of the process's own the ring then names
+/// (COMMAND_BUFFER_IN_REGION), kept until the buffer completes. Null in a unit test without
+/// one: such a buffer then completes with an out-of-memory error.
+@property(nonatomic, nullable) RgfxRegion *region;
+
+/// The most command buffers of this queue alive and not completed at once:
+/// `maxCommandBufferCount`, 64 where the queue was made with 0, as Metal's default.
+/// -commandBuffer blocks while that many are, as Metal's does, where the queue has a reader
+/// whose completions free them.
+@property(nonatomic, readonly) NSUInteger maxCommandBufferCount;
 
 /// Adopts `reader` as this queue's completion-ring reader and takes ownership of it: the
 /// queue shares it with its in-flight command buffers and the completion thread

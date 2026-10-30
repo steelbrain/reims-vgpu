@@ -298,6 +298,13 @@ pub const RGFX_CMD_RESOURCE_ID_CHUNK: u32 = 0x2f1;
 /// a later increment.
 pub const RGFX_CMD_COMMAND_BUFFER: u32 = 0x300;
 
+/// Command `COMMAND_BUFFER_IN_REGION` ([`RgfxCommandBufferInRegion`], a per-queue submission
+/// ring): one command buffer too large for its queue's ring, whose whole `COMMAND_BUFFER` message
+/// lies in a block of the process's own. The host takes the message from the block in place of
+/// the ring, with this reference's `seqno`, and carries it out as it does one from the ring; the
+/// completion names that seqno. The process keeps the block until the buffer completes.
+pub const RGFX_CMD_COMMAND_BUFFER_IN_REGION: u32 = 0x301;
+
 /// Event `CB_COMPLETE` ([`RgfxCbComplete`], a per-queue completion ring): a
 /// command buffer finished, with its status and GPU times.
 pub const RGFX_EVT_CB_COMPLETE: u32 = 0x400;
@@ -573,6 +580,7 @@ const _: () = {
     assert!(RGFX_CONTEXT_ALLOCATIONS_OFFSET.is_multiple_of(0x1000));
     assert!(size_of::<RgfxContextClose>() == 24);
     assert!(size_of::<RgfxResourceIdChunk>() == 24);
+    assert!(size_of::<RgfxCommandBufferInRegion>() == 32);
     // Every chunk's ids lie below the limit (the last chunk's last id is CHUNKS * CHUNK), and
     // no whole chunk more fits there.
     assert!(RGFX_RESOURCE_ID_CHUNKS as u64 * RGFX_RESOURCE_ID_CHUNK < RGFX_RESOURCE_ID_LIMIT);
@@ -670,6 +678,24 @@ pub struct RgfxContextClose {
     pub context: u32,
     /// Zero.
     pub reserved_14: u32,
+}
+
+/// `COMMAND_BUFFER_IN_REGION`: the `COMMAND_BUFFER` message of `byte_length` bytes at region
+/// offset `region_offset`. The message there is whole: its header's `type` is
+/// `COMMAND_BUFFER` and its `size` is `byte_length`; its `seqno` is this reference's. A span
+/// outside the processes' blocks, or a message there that is not such a `COMMAND_BUFFER`, is a
+/// guest protocol error, refused as a message the ring may not carry.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxCommandBufferInRegion {
+    /// [`RGFX_CMD_COMMAND_BUFFER_IN_REGION`].
+    pub header: RgfxMsgHeader,
+    /// Where the message starts in the device's region: 8-aligned.
+    pub region_offset: u64,
+    /// The message's length: a multiple of 8.
+    pub byte_length: u64,
 }
 
 /// `RESOURCE_ID_CHUNK`: context `context` holds chunk `chunk` of the texture resource ids.
@@ -1527,7 +1553,8 @@ const _: () = {
     // The stage-3 opcodes do not collide with the stage-2 ones or each other.
     assert!(RGFX_CMD_QUEUE_CREATE > RGFX_EVT_VBLANK);
     assert!(RGFX_CMD_COMMAND_BUFFER > RGFX_CMD_FENCE_CREATE);
-    assert!(RGFX_EVT_CB_COMPLETE > RGFX_CMD_COMMAND_BUFFER);
+    assert!(RGFX_EVT_CB_COMPLETE > RGFX_CMD_COMMAND_BUFFER_IN_REGION);
+    assert!(RGFX_CMD_COMMAND_BUFFER_IN_REGION > RGFX_CMD_COMMAND_BUFFER);
 };
 
 #[cfg(test)]

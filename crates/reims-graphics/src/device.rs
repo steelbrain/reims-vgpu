@@ -27,8 +27,10 @@
 //! handle (the `QUEUE_CREATE` handed to [`Host::stage3_message`]), then takes the queue's
 //! submission ring with the same `consumer_idle` handshake the control thread uses, hands each
 //! `COMMAND_BUFFER` to the host with a [`CompletionPoster`] onto the queue's completion ring (a
-//! message of any other type is refused there and goes no further: lifecycle messages ride ring 0,
-//! through the kext, which checks that their sender owns what they name), and the host
+//! `COMMAND_BUFFER_IN_REGION`'s message is taken from the process's block it names, with the
+//! reference's seqno; a message of any other type is refused there and goes no further:
+//! lifecycle messages ride ring 0, through the kext, which checks that their sender owns what
+//! they name), and the host
 //! posts what it owes there (a buffer's completion), raising the queue's own MSI-X vector. Its
 //! doorbell is the submission ring's region offset (the value the guest writes to `DOORBELL`, as
 //! the control ring's is 0). A command buffer is handed to the host only once the control thread
@@ -69,12 +71,13 @@ use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 
 use parking_lot::Mutex;
-use zerocopy::IntoBytes;
+use zerocopy::{FromBytes, IntoBytes};
 
 use crate::control;
 use crate::display::{Mode, Scanout, Screen};
+use crate::ops::RgfxCommandBuffer;
 use crate::region::Region;
-use crate::ring::{Consumer, Posted, Producer, RingAt, sized};
+use crate::ring::{Consumer, Message, Posted, Producer, RingAt, sized};
 use crate::wake::{self, Wake};
 use crate::wire::*;
 
@@ -917,7 +920,10 @@ impl Shared {
                     return;
                 }
                 match submit.consumer.next(&self.region) {
-                    Ok(Some(message)) if message.header.r#type == RGFX_CMD_COMMAND_BUFFER => {
+                    Ok(Some(message))
+                        if message.header.r#type == RGFX_CMD_COMMAND_BUFFER
+                            || message.header.r#type == RGFX_CMD_COMMAND_BUFFER_IN_REGION =>
+                    {
                         message
                     }
                     Ok(Some(message)) => {
@@ -944,6 +950,24 @@ impl Shared {
                     }
                 }
             };
+            // A buffer too large for the ring: its message, from the block, with nothing held.
+            let message = if message.header.r#type == RGFX_CMD_COMMAND_BUFFER_IN_REGION {
+                match self.command_buffer_in_region(&message) {
+                    Some(message) => message,
+                    None => {
+                        log::warn!(
+                            target: "reims_graphics",
+                            "queue {:#x}'s submission ring carried a COMMAND_BUFFER_IN_REGION \
+                             (seqno {}) that names no whole COMMAND_BUFFER in the processes' \
+                             blocks: refused",
+                            queue.obj_id, message.header.seqno
+                        );
+                        continue;
+                    }
+                }
+            } else {
+                message
+            };
             // Order this command buffer after the creates its process posted before it. Creates
             // ride ring 0, whose sole consumer is the control thread; command buffers ride the
             // queues' own rings (this thread). A create a buffer uses is posted before it in guest
@@ -962,6 +986,36 @@ impl Shared {
             }
             self.host.stage3_message(poster, &message.bytes);
         }
+    }
+
+    /// The `COMMAND_BUFFER` message a `COMMAND_BUFFER_IN_REGION` `reference` names, copied out of
+    /// the process's block once, as a ring's message is, with the reference's seqno; `None` where
+    /// the span lies outside the processes' blocks (past the control rings, the device info and
+    /// the scanout, before the cursor) or holds no whole `COMMAND_BUFFER` of its length.
+    fn command_buffer_in_region(&self, reference: &Message) -> Option<Message> {
+        let (r, _) = RgfxCommandBufferInRegion::read_from_prefix(&reference.bytes).ok()?;
+        let end = self.region.size().saturating_sub(RGFX_CURSOR_SPAN);
+        if !r.region_offset.is_multiple_of(8)
+            || !r.byte_length.is_multiple_of(8)
+            || r.byte_length < size_of::<RgfxCommandBuffer>() as u64
+            || r.byte_length > u64::from(u32::MAX)
+            || r.region_offset < RGFX_CONTEXT_ALLOCATIONS_OFFSET
+            || r.region_offset
+                .checked_add(r.byte_length)
+                .is_none_or(|e| e > end)
+        {
+            return None;
+        }
+        let mut bytes = self
+            .region
+            .read(r.region_offset, usize::try_from(r.byte_length).ok()?)?;
+        let (mut header, _) = RgfxMsgHeader::read_from_prefix(&bytes).ok()?;
+        if header.r#type != RGFX_CMD_COMMAND_BUFFER || u64::from(header.size) != r.byte_length {
+            return None;
+        }
+        header.seqno = reference.header.seqno;
+        bytes[..size_of::<RgfxMsgHeader>()].copy_from_slice(header.as_bytes());
+        Some(Message { header, bytes })
     }
 
     /// Posts `message` onto `queue`'s completion ring, waiting for room while the device is not

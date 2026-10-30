@@ -907,6 +907,13 @@
 // a later increment.
 #define RGFX_CMD_COMMAND_BUFFER 768
 
+// Command `COMMAND_BUFFER_IN_REGION` ([`RgfxCommandBufferInRegion`], a per-queue submission
+// ring): one command buffer too large for its queue's ring, whose whole `COMMAND_BUFFER` message
+// lies in a block of the process's own. The host takes the message from the block in place of
+// the ring, with this reference's `seqno`, and carries it out as it does one from the ring; the
+// completion names that seqno. The process keeps the block until the buffer completes.
+#define RGFX_CMD_COMMAND_BUFFER_IN_REGION 769
+
 // Event `CB_COMPLETE` ([`RgfxCbComplete`], a per-queue completion ring): a
 // command buffer finished, with its status and GPU times.
 #define RGFX_EVT_CB_COMPLETE 1024
@@ -3170,6 +3177,20 @@ typedef struct {
   // The MSI-X vector the completion ring raises.
   uint32_t vector;
 } RgfxQueueCreate;
+
+// `COMMAND_BUFFER_IN_REGION`: the `COMMAND_BUFFER` message of `byte_length` bytes at region
+// offset `region_offset`. The message there is whole: its header's `type` is
+// `COMMAND_BUFFER` and its `size` is `byte_length`; its `seqno` is this reference's. A span
+// outside the processes' blocks, or a message there that is not such a `COMMAND_BUFFER`, is a
+// guest protocol error, refused as a message the ring may not carry.
+typedef struct {
+  // [`RGFX_CMD_COMMAND_BUFFER_IN_REGION`].
+  RgfxMsgHeader header;
+  // Where the message starts in the device's region: 8-aligned.
+  uint64_t region_offset;
+  // The message's length: a multiple of 8.
+  uint64_t byte_length;
+} RgfxCommandBufferInRegion;
 
 // `CONTEXT_CLOSE`: context `context`'s process is gone.
 typedef struct {

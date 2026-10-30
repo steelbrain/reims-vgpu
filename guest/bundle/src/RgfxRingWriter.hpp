@@ -27,6 +27,7 @@
 #define RGFX_RING_WRITER_HPP_
 
 #include <cstdint>
+#include <functional>
 #include <mutex>
 
 #include "reims_graphics_wire.h"
@@ -67,9 +68,26 @@ public:
 	/// when the ring has no room until the host consumes more, or when the
 	/// arguments are out of range. On success `*out_seqno` (when not null) holds
 	/// the stamped seqno, and `*out_status` (when not null) the COMPLETE status the
-	/// forward handed back, or kRgfxNoAnswer.
+	/// forward handed back, or kRgfxNoAnswer. `beforePublish` (when set) is called with
+	/// the seqno before the host can see the message: under the ring's lock, before
+	/// `producer` moves (for a forwarding writer, once the kext has posted it).
 	bool tryPost(uint32_t type, const void *message, uint32_t size, uint64_t *out_seqno,
-	             uint32_t *out_status = nullptr);
+	             uint32_t *out_status = nullptr,
+	             const std::function<void(uint64_t)> &beforePublish = {});
+
+	/// Whether post() places a message of `size` bytes: a valid size of at most half the
+	/// byte ring, so the pad to the ring's end before it never keeps it out of an empty ring.
+	/// A larger message goes out of line (COMMAND_BUFFER_IN_REGION). A forwarding writer
+	/// takes up to its `max_size`.
+	bool fits(uint32_t size) const;
+
+	/// tryPost(), waiting while the ring has no room: the doorbell rung, so a host that went
+	/// idle takes the ring again, then a sleep of 20 µs doubling to 1 ms between looks, and
+	/// `whileWaiting` (when set) called before each, as the host consumes on its own thread.
+	/// False, writing nothing, only for a message that does not fit().
+	bool post(uint32_t type, const void *message, uint32_t size, uint64_t *out_seqno,
+	          const std::function<void()> &whileWaiting = {},
+	          const std::function<void(uint64_t)> &beforePublish = {});
 
 	/// The byte ring's size.
 	uint32_t dataSize() const { return m_dataSize; }

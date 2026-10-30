@@ -40,6 +40,8 @@
 #include <vector>
 #import "RgfxCommandObjects.h"
 
+#include <pthread.h>
+
 #include <chrono>
 #include <condition_variable>
 #include <mutex>
@@ -1659,12 +1661,16 @@ struct QueueFixture {
 	                             TestRing::doorbell, nullptr};
 	RgfxIdSpace ids;
 	RgfxSerializer ser{controlWriter, ids};
-	TestRing submit{0x8000};
-	RgfxRingWriter submitWriter{submit.base(), submit.dataSize, 1, TestRing::doorbell, nullptr};
+	TestRing submit;
+	RgfxRingWriter submitWriter;
 	TestRing completion{0x8000};
 	RgfxCommandQueue *queue = nil;
 
-	QueueFixture()
+	// A queue whose submission ring has `submitData` bytes, made with `maxCount`, its doorbell
+	// `doorbell` (with `doorbellContext`).
+	explicit QueueFixture(uint32_t submitData = 0x8000, NSUInteger maxCount = 0,
+	                      RgfxDoorbell doorbell = TestRing::doorbell, void *doorbellContext = nullptr)
+	    : submit(submitData), submitWriter(submit.base(), submit.dataSize, 1, doorbell, doorbellContext)
 	{
 		control.setConsumerIdle(1);
 		submit.setConsumerIdle(1);
@@ -1673,7 +1679,7 @@ struct QueueFixture {
 		                               completeOffset:0
 		                             completeDataSize:0
 		                                          ids:&ids
-		                                     maxCount:0
+		                                     maxCount:maxCount
 		                                       device:nil
 		                                   serializer:&ser];
 		[queue adoptReplyReader:new RgfxReplyReader(completion.base(), completion.dataSize)];
@@ -1895,6 +1901,220 @@ void test_completion_thread_stops()
 	}
 }
 
+// A command buffer too large for half its queue's ring puts its whole COMMAND_BUFFER message
+// in a region block, which the ring names with a COMMAND_BUFFER_IN_REGION whose seqno the
+// completion carries; the block goes back as the buffer completes.
+struct BlockLog {
+	std::vector<uint64_t> allocated;
+	std::vector<uint64_t> released;
+	uint64_t next = RGFX_ALLOCATIONS_OFFSET + 0x10000;
+	static bool alloc(void *c, uint64_t size, uint64_t align, uint64_t *offset)
+	{
+		BlockLog *log = static_cast<BlockLog *>(c);
+		uint64_t at = (log->next + align - 1) & ~(align - 1);
+		log->next = at + size;
+		log->allocated.push_back(at);
+		*offset = at;
+		return true;
+	}
+	static void release(void *c, uint64_t offset)
+	{
+		static_cast<BlockLog *>(c)->released.push_back(offset);
+	}
+};
+
+void test_command_buffer_out_of_line()
+{
+	@autoreleasepool {
+	QueueFixture f(0x1000); // up to 2 KiB on the ring
+	std::vector<uint8_t> mem(RGFX_ALLOCATIONS_OFFSET + 0x100000, 0);
+	RgfxRegion region(mem.data(), mem.size());
+	BlockLog blocks;
+	region.setBlockSource(&BlockLog::alloc, &BlockLog::release, &blocks);
+	f.queue.region = &region;
+
+	// A small buffer still rides the ring.
+	id<MTLCommandBuffer> small = [f.queue commandBuffer];
+	[small commit];
+	RgfxMsgHeader h = {};
+	std::vector<uint8_t> bytes;
+	CHECK(f.submit.next(&h, &bytes));
+	CHECK(h.type == RGFX_CMD_COMMAND_BUFFER);
+	CHECK(blocks.allocated.empty());
+
+	// 200 fills: far past half the ring.
+	id<MTLCommandBuffer> cb = [f.queue commandBuffer];
+	id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+	for (int i = 0; i < 200; i++)
+		[blit fillBuffer:handle(40) range:NSMakeRange(4 * i, 4) value:(uint8_t)i];
+	[blit endEncoding];
+	__block int fired = 0;
+	[cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+		(void)done;
+		fired++;
+	}];
+	[cb commit];
+	CHECK(f.submit.next(&h, &bytes));
+	CHECK(h.type == RGFX_CMD_COMMAND_BUFFER_IN_REGION);
+	CHECK(h.size == sizeof(RgfxCommandBufferInRegion));
+	RgfxCommandBufferInRegion ref = {};
+	std::memcpy(&ref, bytes.data(), sizeof(ref));
+	CHECK(blocks.allocated.size() == 1 && ref.region_offset == blocks.allocated[0]);
+	CHECK(ref.byte_length > 2048 && ref.byte_length % 8 == 0);
+
+	// The block holds the whole message: a COMMAND_BUFFER of that length, seqno 0, its ops.
+	RgfxCommandBuffer body = {};
+	std::memcpy(&body, mem.data() + ref.region_offset, sizeof(body));
+	CHECK(body.header.type == RGFX_CMD_COMMAND_BUFFER);
+	CHECK(body.header.size == ref.byte_length);
+	CHECK(body.header.seqno == 0);
+	CHECK(body.cb_obj_id == ((RgfxResource *)cb).rgfxObjId);
+	CHECK(body.op_bytes == ref.byte_length - RGFX_COMMAND_BUFFER_OPS_OFFSET);
+	RgfxOpHeader first = {};
+	std::memcpy(&first, mem.data() + ref.region_offset + RGFX_COMMAND_BUFFER_OPS_OFFSET,
+	            sizeof(first));
+	CHECK(first.tag == RGFX_OP_ENCODER_BEGIN_BLIT);
+
+	// Its completion carries the reference's seqno; the block goes back then.
+	CHECK(blocks.released.empty());
+	RgfxCbComplete done = cbComplete(h.seqno, ((RgfxResource *)cb).rgfxObjId);
+	CHECK(f.completion.postFromHost(&done, sizeof(done)));
+	[cb waitUntilCompleted];
+	CHECK(fired == 1);
+	CHECK(cb.status == MTLCommandBufferStatusCompleted);
+	CHECK(blocks.released.size() == 1 && blocks.released[0] == ref.region_offset);
+
+	// With no region, a buffer too large for the ring fails as out of memory, off the
+	// committing thread, and never reaches the ring.
+	QueueFixture g(0x1000);
+	id<MTLCommandBuffer> lost = [g.queue commandBuffer];
+	id<MTLBlitCommandEncoder> b2 = [lost blitCommandEncoder];
+	for (int i = 0; i < 200; i++)
+		[b2 fillBuffer:handle(40) range:NSMakeRange(4 * i, 4) value:1];
+	[b2 endEncoding];
+	dispatch_semaphore_t failed = dispatch_semaphore_create(0);
+	__block int failedOnMain = -1;
+	[lost addCompletedHandler:^(id<MTLCommandBuffer> d) {
+		failedOnMain = pthread_main_np();
+		(void)d;
+		dispatch_semaphore_signal(failed);
+	}];
+	[lost commit];
+	CHECK(dispatch_semaphore_wait(failed, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC)) == 0);
+	CHECK(lost.status == MTLCommandBufferStatusError);
+	CHECK(lost.error.code == MTLCommandBufferErrorOutOfMemory);
+	CHECK(failedOnMain == 0);
+	CHECK(!g.submit.next(&h, &bytes));
+	f.queue.region = nullptr;
+	}
+}
+
+// A buffer's completion is expected before the host can see the buffer: at the doorbell that
+// publishing it rings, the reader already awaits its seqno.
+struct ExpectAtDoorbell {
+	TestRing *submit = nullptr;
+	RgfxReplyReader *reader = nullptr;
+	int rung = 0;
+	bool awaited = false;
+	static void ring(void *c, uint32_t)
+	{
+		ExpectAtDoorbell *e = static_cast<ExpectAtDoorbell *>(c);
+		RgfxMsgHeader h = {};
+		std::vector<uint8_t> bytes;
+		if (e->submit->next(&h, &bytes)) {
+			e->rung++;
+			e->awaited = e->reader->awaitingCompletion(h.seqno);
+		}
+	}
+};
+
+void test_completion_expected_before_publish()
+{
+	@autoreleasepool {
+	ExpectAtDoorbell e;
+	QueueFixture f(0x8000, 0, &ExpectAtDoorbell::ring, &e);
+	e.submit = &f.submit;
+	e.reader = [f.queue sharedReplyReader].get();
+	id<MTLCommandBuffer> cb = [f.queue commandBuffer];
+	[cb commit];
+	CHECK(e.rung == 1);
+	CHECK(e.awaited);
+	CHECK(cb.status == MTLCommandBufferStatusCommitted);
+	}
+}
+
+// -commandBuffer blocks while maxCommandBufferCount buffers of the queue are alive and not
+// completed, as Metal's does; a buffer that completes, or one released uncommitted, gives its
+// slot back; and a completed handler that makes the next buffer does not wait for its own.
+void test_command_buffer_back_pressure()
+{
+	@autoreleasepool {
+	QueueFixture f(0x8000, 2);
+	CHECK(f.queue.maxCommandBufferCount == 2);
+	QueueFixture d;
+	CHECK(d.queue.maxCommandBufferCount == 64);
+
+	FakeKext *kext = new FakeKext();
+	RgfxCompletionThread thread(&FakeKext::wait, kext);
+	CHECK(thread.start());
+	thread.add([f.queue sharedReplyReader]);
+
+	id<MTLCommandBuffer> a = [f.queue commandBuffer];
+	id<MTLCommandBuffer> b = [f.queue commandBuffer];
+	[a commit];
+	uint64_t sa = f.nextSeqno();
+	[b commit];
+	(void)f.nextSeqno();
+
+	// A third waits for a's completion, posted 50 ms from now.
+	RgfxCommandQueue *queue = f.queue;
+	std::atomic<bool> got{false};
+	std::atomic<bool> *gotp = &got;
+	id<MTLCommandBuffer> third = nil;
+	id<MTLCommandBuffer> __strong *thirdp = &third;
+	dispatch_semaphore_t made = dispatch_semaphore_create(0);
+	std::thread maker([queue, gotp, made, thirdp] {
+		@autoreleasepool {
+			*thirdp = [queue commandBuffer];
+			gotp->store(true);
+			dispatch_semaphore_signal(made);
+		}
+	});
+	std::this_thread::sleep_for(std::chrono::milliseconds(50));
+	CHECK(!got.load()); // still blocked: two in flight
+	RgfxCbComplete done = cbComplete(sa, ((RgfxResource *)a).rgfxObjId);
+	hostPost(f.completion, *kext, &done, sizeof(done));
+	CHECK(dispatch_semaphore_wait(made, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC)) == 0);
+	maker.join();
+	CHECK(got.load() && third != nil);
+
+	// b and the third hold both slots. Released uncommitted, the third gives its slot back.
+	third = nil;
+	id<MTLCommandBuffer> fourth = nil;
+	@autoreleasepool {
+		fourth = [f.queue commandBuffer]; // did not block
+	}
+	CHECK(fourth != nil);
+	kext->close();
+	CHECK(eventually([&] { return !thread.running(); }));
+
+	// With one slot, a completed handler that makes the next buffer has the slot back.
+	QueueFixture g(0x8000, 1);
+	id<MTLCommandBuffer> first = [g.queue commandBuffer];
+	__block id<MTLCommandBuffer> next = nil;
+	RgfxCommandQueue *gq = g.queue;
+	[first addCompletedHandler:^(id<MTLCommandBuffer> x) {
+		(void)x;
+		next = [gq commandBuffer];
+	}];
+	[first commit];
+	RgfxCbComplete d1 = cbComplete(g.nextSeqno(), ((RgfxResource *)first).rgfxObjId);
+	CHECK(g.completion.postFromHost(&d1, sizeof(d1)));
+	[first waitUntilCompleted]; // pumps: the handler runs here, and gets its buffer
+	CHECK(next != nil);
+	}
+}
+
 // A buffer whose completion never comes, released with its queue and reader, ends
 // nothing (its completion group is left at dealloc).
 void test_uncompleted_buffer_releases()
@@ -1942,6 +2162,9 @@ int main()
 		test_wait_with_the_completion_thread();
 		test_completion_thread_stops();
 		test_uncompleted_buffer_releases();
+		test_command_buffer_out_of_line();
+		test_completion_expected_before_publish();
+		test_command_buffer_back_pressure();
 	}
 	std::printf("shell_tests: OK (%d checks)\n", g_checks);
 	return 0;

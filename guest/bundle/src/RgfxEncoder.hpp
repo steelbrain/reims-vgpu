@@ -38,6 +38,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <vector>
 
@@ -360,11 +361,31 @@ public:
 
 	// --- finish ---------------------------------------------------------------
 
-	/// Sets `op_bytes` and posts the command buffer on the ring. Returns whether it
-	/// reached the ring (false when the message does not fit); on success
-	/// `*out_seqno` (when not null) holds the stamped seqno. The built message
-	/// stays readable through [`message`] afterwards.
-	bool finish(uint64_t *out_seqno = nullptr);
+	/// Sets `op_bytes` and posts the command buffer on the ring, waiting for room
+	/// (RgfxRingWriter::post, `whileWaiting` called as it waits). Returns whether it
+	/// reached the ring: false, posting nothing, for a message the ring does not fit
+	/// (fitsRing()), which goes out of line with finishInRegion. On success
+	/// `*out_seqno` (when not null) holds the stamped seqno. The built message stays
+	/// readable through [`message`] afterwards. `beforePublish` gets the seqno before the
+	/// host can see the buffer (RgfxRingWriter::tryPost), so its completion is expected first.
+	bool finish(uint64_t *out_seqno = nullptr, const std::function<void()> &whileWaiting = {},
+	            const std::function<void(uint64_t)> &beforePublish = {});
+
+	/// Whether the finished message fits the ring (RgfxRingWriter::fits).
+	bool fitsRing() const;
+
+	/// The finished message's length: messageSize() bytes go to finishInRegion's block.
+	uint64_t messageSize() const { return m_buf.size(); }
+
+	/// Out of line: writes the whole COMMAND_BUFFER message (its header's `type` and `size`
+	/// stamped, `seqno` 0) to `block`, the CPU address of region offset `region_offset`, of at
+	/// least messageSize() bytes, then posts a COMMAND_BUFFER_IN_REGION naming it, waiting
+	/// for room as finish() does; its seqno is the one the completion carries. The block must
+	/// stay the process's until the buffer completes. False for a message too long for a
+	/// header's `size`.
+	bool finishInRegion(volatile uint8_t *block, uint64_t region_offset, uint64_t *out_seqno,
+	                    const std::function<void()> &whileWaiting = {},
+	                    const std::function<void(uint64_t)> &beforePublish = {});
 
 	/// The command-buffer bytes built so far: the `RgfxCommandBuffer` header (its
 	/// `op_bytes` is set by [`finish`]) then the op stream. For tests and

@@ -21,6 +21,9 @@
 #include "RgfxEncoder.hpp"
 #include "RgfxLibraryKey.hpp"
 #include "RgfxObjectModel.hpp"
+#include <chrono>
+#include <thread>
+
 #include "RgfxReplyReader.hpp"
 #include "RgfxRingWriter.hpp"
 #include "RgfxSerializer.hpp"
@@ -598,6 +601,55 @@ struct OpWalk {
 // `tag >> 12`, the op's group, as the host splits it.
 uint16_t opGroup(uint16_t tag) { return static_cast<uint16_t>(tag >> 12); }
 
+// post() waits while the ring is full, ringing the doorbell and calling its hook, until the
+// host takes room; a message over half the ring does not fit() and is refused at once; and
+// beforePublish sees the seqno before `producer` moves.
+void test_ring_post_waits_for_room()
+{
+	constexpr uint32_t kData = 0x1000;
+	TestRing ring(kData);
+	RgfxRingWriter writer(ring.base(), kData, 1, TestRing::doorbell, nullptr);
+	CHECK(writer.fits(kData / 2));
+	CHECK(!writer.fits(kData / 2 + 8));
+	CHECK(!writer.fits(12));
+	std::vector<uint8_t> big(kData / 2 + 8, 0);
+	CHECK(!writer.post(RGFX_CMD_COMMAND_BUFFER, big.data(), static_cast<uint32_t>(big.size()),
+	                   nullptr));
+	CHECK(ring.producer() == 0);
+
+	uint8_t msg[256] = {};
+	int filled = 0;
+	while (writer.tryPost(RGFX_CMD_COMMAND_BUFFER, msg, sizeof(msg), nullptr))
+		filled++;
+	CHECK(filled == kData / 256);
+	uint64_t full = ring.producer();
+	int before = TestRing::doorbells.load();
+
+	// The host takes everything 20 ms from now.
+	std::thread host([&ring, full] {
+		std::this_thread::sleep_for(std::chrono::milliseconds(20));
+		__atomic_store_n(reinterpret_cast<uint64_t *>(ring.mem.data() +
+		                                              __builtin_offsetof(RgfxRingHeader, consumer)),
+		                 full, __ATOMIC_RELEASE);
+	});
+	std::atomic<int> waits{0};
+	uint64_t seen = 0, producerAtPublish = ~0ull, seqno = 0;
+	auto start = std::chrono::steady_clock::now();
+	CHECK(writer.post(RGFX_CMD_COMMAND_BUFFER, msg, sizeof(msg), &seqno, [&] { waits++; },
+	                  [&](uint64_t s) {
+		                  seen = s;
+		                  producerAtPublish = ring.producer();
+	                  }));
+	auto took = std::chrono::steady_clock::now() - start;
+	host.join();
+	CHECK(took >= std::chrono::milliseconds(15));
+	CHECK(waits.load() >= 1);
+	CHECK(TestRing::doorbells.load() > before); // rung while it waited
+	CHECK(seen == seqno && seqno == static_cast<uint64_t>(filled) + 1);
+	CHECK(producerAtPublish == full);           // seen before the message was published
+	CHECK(ring.producer() == full + sizeof(msg));
+}
+
 void test_command_buffer_encoder()
 {
 	TestRing ring(0x8000);
@@ -999,6 +1051,7 @@ int main()
 	test_library_message();
 	test_pipeline_messages();
 	test_ring_wrap_and_no_room();
+	test_ring_post_waits_for_room();
 	test_command_buffer_encoder();
 	test_forwarded_lifecycle();
 	test_library_key();
