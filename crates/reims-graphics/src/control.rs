@@ -36,11 +36,30 @@ pub(crate) fn answer(shared: &Shared, message: &Message) -> Option<Vec<u8>> {
         RGFX_CMD_SET_VBLANK => read(message).map_or(RGFX_STATUS_INVALID_ARGUMENT, |command| {
             set_vblank(shared, &command)
         }),
-        // Stage 3: the object-lifecycle creates and destroy, the pipeline creates and the
-        // command buffer (every type at or above `QUEUE_CREATE`) go to the host's decoder. Its
-        // replies — a pipeline reflection, a command buffer's completion — come back on the
-        // completion ring through the device's poster, not from here, so there is no answer to
-        // post synchronously.
+        // Stage 3, `QUEUE_CREATE`: the host's decoder makes the queue handle first (so a command
+        // buffer can name it), then the device makes the queue's own submission+completion ring
+        // pair and service thread where the create's ring parameters are valid.
+        RGFX_CMD_QUEUE_CREATE => {
+            shared.host.stage3_message(&message.bytes);
+            if let Some(command) = read::<RgfxQueueCreate>(message) {
+                shared.create_queue(&command);
+            }
+            return None;
+        }
+        // Stage 3, `OBJECT_DESTROY`: the host's decoder drops the handle; where the object is a
+        // command queue, the device ends its per-queue service too.
+        RGFX_CMD_OBJECT_DESTROY => {
+            shared.host.stage3_message(&message.bytes);
+            if let Some(command) = read::<RgfxObjectDestroy>(message) {
+                shared.destroy_queue(command.obj_id);
+            }
+            return None;
+        }
+        // Stage 3: the other object-lifecycle creates, the pipeline creates and a command buffer
+        // on the control ring (every other type at or above `QUEUE_CREATE`) go to the host's
+        // decoder. Its replies — a pipeline reflection, a command buffer's completion — come back
+        // on the completion ring through the device's poster, not from here, so there is no answer
+        // to post synchronously.
         t if t >= RGFX_CMD_QUEUE_CREATE => {
             shared.host.stage3_message(&message.bytes);
             return None;

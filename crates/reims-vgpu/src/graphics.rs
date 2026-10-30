@@ -33,7 +33,8 @@ use reims_graphics::wire::{
     RgfxPipelineReflection,
 };
 use reims_graphics::{
-    ControlCompletionPoster, CursorImage, FixedScreen, Host, Mode, Scanout, Screen,
+    ControlCompletionPoster, CursorImage, FixedScreen, Host, Mode, QueueCompletionPoster, Scanout,
+    Screen,
 };
 use reims_vgpu_core::platform::device::GpuDevice;
 use reims_vgpu_core::sync::Mutex;
@@ -44,7 +45,7 @@ use crate::DefaultPlatform;
 use crate::entry;
 use crate::error::Error;
 use crate::graphics::completion::cb_failed;
-use crate::graphics::decode::GraphicsDecoder;
+use crate::graphics::decode::{CompletionSink, GraphicsDecoder};
 use crate::graphics::device_info::device_info;
 use crate::platform::ApiPlatform;
 use crate::window::WindowLink;
@@ -139,6 +140,7 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                 decoder: Mutex::new(GraphicsDecoder::new(Arc::clone(&platform))),
                 device: gpu_device,
                 poster: OnceLock::new(),
+                control_completion: OnceLock::new(),
             });
             let host = Box::new(CallbackHost {
                 callbacks: config.callbacks,
@@ -177,6 +179,13 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
     #[cfg(any(test, feature = "testkit"))]
     pub fn decoder_object_count(&self) -> usize {
         self.control.decoder.lock().object_count()
+    }
+
+    /// How many command queues have a per-queue ring and service thread: the tests check a
+    /// `QUEUE_CREATE` with valid ring parameters made one.
+    #[cfg(any(test, feature = "testkit"))]
+    pub fn graphics_queue_count(&self) -> usize {
+        self.device.queue_count()
     }
 
     /// The region's size: BAR 2's, a power of two.
@@ -230,6 +239,11 @@ struct GraphicsControl<P: ApiPlatform> {
     /// The control completion ring's poster, set once the device exists: the host posts a failed
     /// command buffer's completion through it.
     poster: OnceLock<ControlCompletionPoster>,
+    /// The decoder's completion sink onto the control completion ring, set once the device exists.
+    /// Each queue's submissions post onto their own ring, so the decoder's one completion sink is
+    /// set to the right ring before every decode; this is the control ring's, re-set before every
+    /// control-ring message.
+    control_completion: OnceLock<CompletionSink>,
 }
 
 impl<P: ApiPlatform> GraphicsControl<P> {
@@ -237,11 +251,13 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     /// completion ring through `poster`: a finished command buffer's [`RgfxCbComplete`] and a
     /// pipeline create's [`RgfxPipelineReflection`].
     fn set_sinks(&self, poster: &ControlCompletionPoster) {
-        let mut decoder = self.decoder.lock();
         let completion = poster.clone();
-        decoder.set_completion_sink(Arc::new(move |record: RgfxCbComplete| {
+        let sink: CompletionSink = Arc::new(move |record: RgfxCbComplete| {
             completion.post(record.as_bytes());
-        }));
+        });
+        let _ = self.control_completion.set(Arc::clone(&sink));
+        let mut decoder = self.decoder.lock();
+        decoder.set_completion_sink(sink);
         let reflection = poster.clone();
         decoder.set_reflection_sink(Arc::new(move |record: RgfxPipelineReflection| {
             reflection.post(record.as_bytes());
@@ -256,7 +272,16 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     /// internal-error one for it here.
     fn handle(&self, message: &[u8]) {
         entry::run(|_| {
-            let outcome = self.decoder.lock().decode(&self.device, message);
+            let outcome = {
+                let mut decoder = self.decoder.lock();
+                // A queue's submissions may have left the decoder's completion sink pointed at a
+                // per-queue ring; a control-ring command buffer's completion goes on the control
+                // ring, so re-point it before the decode.
+                if let Some(sink) = self.control_completion.get() {
+                    decoder.set_completion_sink(Arc::clone(sink));
+                }
+                decoder.decode(&self.device, message)
+            };
             match outcome {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
@@ -277,6 +302,43 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         });
     }
 
+    /// Carries out one `COMMAND_BUFFER` message taken from a command queue's own submission ring,
+    /// under a library entry. The decoder's completion sink is pointed at this queue's completion
+    /// ring (through `poster`) for the decode, so the buffer's completion handler, running on a GPU
+    /// thread, posts its `CB_COMPLETE` there and raises the queue's MSI-X vector. A command buffer
+    /// the host could not carry out owes the guest a completion that no handler will post, so the
+    /// host posts an internal-error one onto the queue's ring here.
+    fn handle_queue(&self, poster: &QueueCompletionPoster, message: &[u8]) {
+        entry::run(|_| {
+            let queue_poster = poster.clone();
+            let sink: CompletionSink = Arc::new(move |record: RgfxCbComplete| {
+                queue_poster.post(record.as_bytes());
+            });
+            let outcome = {
+                let mut decoder = self.decoder.lock();
+                decoder.set_completion_sink(sink);
+                decoder.decode(&self.device, message)
+            };
+            match outcome {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    log::warn!(
+                        target: "reims_vgpu::graphics",
+                        "a queue command buffer was not carried out: {e:?}"
+                    );
+                    self.fail_queue_command_buffer(poster, message);
+                }
+                Err(raise) => {
+                    log::warn!(
+                        target: "reims_vgpu::graphics",
+                        "a queue command buffer faulted: {raise}"
+                    );
+                    self.fail_queue_command_buffer(poster, message);
+                }
+            }
+        });
+    }
+
     /// Posts an internal-error completion for `message` where it is a `COMMAND_BUFFER` whose
     /// decode failed, so a guest blocked on the buffer unblocks; other failed messages are
     /// fire-and-forget and owe no completion.
@@ -284,6 +346,21 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         let Some(poster) = self.poster.get() else {
             return;
         };
+        let Ok((header, _)) = RgfxMsgHeader::read_from_prefix(message) else {
+            return;
+        };
+        if header.r#type != RGFX_CMD_COMMAND_BUFFER {
+            return;
+        }
+        let Ok((cb, _)) = RgfxCommandBuffer::read_from_prefix(message) else {
+            return;
+        };
+        poster.post(cb_failed(cb.cb_obj_id, header.seqno).as_bytes());
+    }
+
+    /// Posts an internal-error completion onto a queue's own completion ring for a `COMMAND_BUFFER`
+    /// its service thread took but the decode failed, so a guest blocked on the buffer unblocks.
+    fn fail_queue_command_buffer(&self, poster: &QueueCompletionPoster, message: &[u8]) {
         let Ok((header, _)) = RgfxMsgHeader::read_from_prefix(message) else {
             return;
         };
@@ -321,6 +398,10 @@ impl<P: ApiPlatform> Host for CallbackHost<P> {
 
     fn stage3_message(&self, message: &[u8]) {
         self.control.handle(message);
+    }
+
+    fn queue_message(&self, completion: &QueueCompletionPoster, message: &[u8]) {
+        self.control.handle_queue(completion, message);
     }
 }
 
