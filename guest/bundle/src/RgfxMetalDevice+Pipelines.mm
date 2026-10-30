@@ -11,6 +11,7 @@
 #import "RgfxMetalError.h"
 #import "RgfxRenderPipelineState.h"
 
+#include "RgfxRegion.hpp"
 #include "RgfxSerializer.hpp"
 
 #include <fcntl.h>
@@ -46,6 +47,11 @@ void rgfxLibraryDiag(const char *how, NSString *origin, NSUInteger length, BOOL 
 constexpr useconds_t kLibraryRetrySleepUs = 1000;
 constexpr int kLibraryRetries = 2000; // about two seconds
 
+// The largest library create sent inline in the ring (header and bytes): a quarter of
+// the device ring, so one create never holds most of it. Larger libraries go in a
+// region block (LIBRARY_FROM_REGION).
+constexpr uint64_t kLibraryInlineMax = RGFX_CONTROL_RING_DATA_SIZE / 4;
+
 } // namespace
 
 // Every library-from-bytes entry point funnels through here: posts the bytes as one
@@ -64,22 +70,33 @@ constexpr int kLibraryRetries = 2000; // about two seconds
 			*error = RgfxMakeError(RgfxMetalErrorNoRoute, @"library: no serialiser route");
 		return nil;
 	}
-	if (RGFX_LIBRARY_BYTES_OFFSET + static_cast<uint64_t>(length) + 8 > RGFX_CONTROL_RING_DATA_SIZE) {
+	// A small library travels inline in its create; a larger one is copied into a region
+	// block that the create names, so no library is bounded by the ring's size.
+	const bool inlineCreate =
+	    RGFX_LIBRARY_BYTES_OFFSET + static_cast<uint64_t>(length) + 8 <= kLibraryInlineMax;
+	RgfxRegion *region = [self region];
+	if (!inlineCreate && region == nullptr) {
 		rgfxLibraryDiag(how, origin, length, NO);
-		NSLog(@"RGFX: library %@ of %lu bytes does not fit one device-ring message", origin,
-		      (unsigned long)length);
 		if (error)
-			*error = RgfxMakeError(RgfxMetalErrorUnsupported,
-			                       [NSString stringWithFormat:@"library %@: %lu bytes do not fit "
-			                                                  @"one device-ring message",
-			                                                  origin, (unsigned long)length]);
+			*error = RgfxMakeError(RgfxMetalErrorNoRoute,
+			                       @"library: no device region for a large library");
 		return nil;
 	}
 	id<MTLLibrary> lib = nil;
-	for (int i = 0; i < kLibraryRetries && lib == nil; i++) {
-		lib = [RgfxLibrary libraryWithData:bytes length:length device:self serializer:ser];
-		if (lib == nil)
-			usleep(kLibraryRetrySleepUs);
+	if (inlineCreate) {
+		for (int i = 0; i < kLibraryRetries && lib == nil; i++) {
+			lib = [RgfxLibrary libraryWithData:bytes length:length device:self serializer:ser];
+			if (lib == nil)
+				usleep(kLibraryRetrySleepUs);
+		}
+	} else {
+		// One copy into a region block; the factory retries only the fixed-size create
+		// while the ring is momentarily full.
+		lib = [RgfxLibrary libraryWithRegionCopyOf:bytes
+		                                    length:length
+		                                    region:region
+		                                    device:self
+		                                serializer:ser];
 	}
 	rgfxLibraryDiag(how, origin, length, lib != nil);
 	if (lib == nil && error)

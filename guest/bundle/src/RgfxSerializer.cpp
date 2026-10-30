@@ -272,6 +272,18 @@ RgfxCreated RgfxSerializer::createLibrary(const void *bytes, uint64_t byte_lengt
 	return out;
 }
 
+RgfxCreated RgfxSerializer::createLibraryFromRegion(uint64_t region_offset, uint64_t byte_length)
+{
+	RgfxCreated out = {};
+	out.obj_id = m_ids.allocObjId();
+	RgfxLibraryFromRegion m = {};
+	m.obj_id = out.obj_id;
+	m.region_offset = region_offset;
+	m.byte_length = byte_length;
+	out.posted = m_control.tryPost(RGFX_CMD_LIBRARY_FROM_REGION, &m, sizeof(m), &out.seqno);
+	return out;
+}
+
 RgfxCreated RgfxSerializer::createRenderPipeline(const RgfxRenderPipelineParams &p)
 {
 	RgfxCreated out = {};

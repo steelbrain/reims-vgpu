@@ -18,6 +18,7 @@
 #import "RgfxResource.h"
 
 #ifdef __cplusplus
+class RgfxRegion;
 class RgfxSerializer;
 #endif
 
@@ -34,6 +35,17 @@ NS_ASSUME_NONNULL_BEGIN
                                   length:(NSUInteger)length
                                   device:(nullable id<MTLDevice>)device
                               serializer:(nullable RgfxSerializer *)serializer;
+
+/// Creates a library from `length` bytes of .metallib/AIR at `bytes` by copying
+/// them into a block of `region` and serialising an RGFX_CMD_LIBRARY_FROM_REGION
+/// naming it, for a library larger than one ring message. The library keeps the
+/// block for its life. Returns nil if `serializer` or `region` is null, the region
+/// has no room, or the create did not post (the ring had no room).
++ (nullable instancetype)libraryWithRegionCopyOf:(const void *)bytes
+                                         length:(NSUInteger)length
+                                         region:(nullable RgfxRegion *)region
+                                         device:(nullable id<MTLDevice>)device
+                                     serializer:(nullable RgfxSerializer *)serializer;
 
 @end
 

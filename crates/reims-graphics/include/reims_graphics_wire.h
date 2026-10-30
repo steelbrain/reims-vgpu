@@ -839,6 +839,11 @@
 // Command `FENCE_CREATE` ([`RgfxObjectCreate`]): a Metal fence.
 #define RGFX_CMD_FENCE_CREATE 529
 
+// Command `LIBRARY_FROM_REGION` ([`RgfxLibraryFromRegion`]): a library from
+// `.metallib`/AIR bytes the guest placed in a block of the device's region, for
+// a library larger than one ring message.
+#define RGFX_CMD_LIBRARY_FROM_REGION 530
+
 // Command `COMMAND_BUFFER` (a per-queue submission ring): one command buffer,
 // its `obj_id` followed by the encoder-op byte stream. Struct and op stream in
 // a later increment.
@@ -2103,6 +2108,22 @@ typedef struct {
   // The length of the `.metallib`/AIR bytes that follow.
   uint64_t byte_length;
 } RgfxLibraryCreate;
+
+// `LIBRARY_FROM_REGION`: a library from `byte_length` bytes of `.metallib` or
+// AIR at `region_offset` in the device's region, forwarded to the host
+// unchanged. The guest keeps the block for the library's life; the host reads
+// the bytes while it decodes the message. A span past the region's end is a
+// guest protocol error.
+typedef struct {
+  // [`RGFX_CMD_LIBRARY_FROM_REGION`].
+  RgfxMsgHeader header;
+  // The new library's guest-picked id.
+  uint64_t obj_id;
+  // The bytes' offset in the device's region.
+  uint64_t region_offset;
+  // The length of the `.metallib`/AIR bytes.
+  uint64_t byte_length;
+} RgfxLibraryFromRegion;
 
 // One mode of a display in a `DISPLAYS` message.
 typedef struct {

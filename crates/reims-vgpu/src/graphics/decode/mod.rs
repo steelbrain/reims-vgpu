@@ -44,7 +44,7 @@ use reims_graphics::wire::{
     RGFX_CMD_COMMAND_BUFFER,
     RGFX_CMD_COMPUTE_PIPELINE_CREATE, RGFX_CMD_DEPTH_STENCIL_CREATE, RGFX_CMD_EVENT_CREATE,
     RGFX_CMD_FENCE_CREATE, RGFX_CMD_HEAP_CREATE, RGFX_CMD_HEAP_OVER_HOST_MEMORY,
-    RGFX_CMD_LIBRARY_CREATE, RGFX_CMD_OBJECT_DESTROY,
+    RGFX_CMD_LIBRARY_CREATE, RGFX_CMD_LIBRARY_FROM_REGION, RGFX_CMD_OBJECT_DESTROY,
     RGFX_CMD_QUEUE_CREATE, RGFX_CMD_RENDER_PIPELINE_CREATE, RGFX_CMD_SAMPLER_CREATE,
     RGFX_CMD_SHARED_EVENT_CREATE, RGFX_CMD_TEXTURE_CREATE, RGFX_CMD_TEXTURE_FROM_BUFFER,
     RGFX_CMD_TEXTURE_FROM_IOSURFACE,
@@ -53,7 +53,7 @@ use reims_graphics::wire::{
     RGFX_PIPELINE_REFLECT_THREADGROUP_MATCHES_TILE, RGFX_PIPELINE_REFUSED, RgfxBufferAtOffset,
     RgfxBufferCreate, RgfxCbComplete, RgfxColorAttachmentDesc, RgfxComputePipelineCreate,
     RgfxBufferOverHostMemory, RgfxDepthStencilCreate, RgfxHeapCreate, RgfxHeapOverHostMemory,
-    RgfxLibraryCreate, RgfxMsgHeader, RgfxObjectCreate,
+    RgfxLibraryCreate, RgfxLibraryFromRegion, RgfxMsgHeader, RgfxObjectCreate,
     RgfxObjectDestroy, RgfxPipelineReflection, RgfxQueueCreate, RgfxRenderPipelineCreate,
     RgfxSamplerCreate, RgfxSharedEventCreate, RgfxStencilDescriptor, RgfxTextureCreate,
     RgfxTextureDescriptor, RgfxTextureFromBuffer, RgfxTextureFromIOSurface,
@@ -284,6 +284,26 @@ impl<P: Platform> GraphicsDecoder<P> {
                 // the compile error's text reaches the guest with the completion
                 // in a later increment.
                 match device.new_library(air)? {
+                    Ok(Some(library)) => self.insert(m.obj_id, ObjHandle::Library(library)),
+                    Ok(None) | Err(_) => Ok(Err(DecodeError::Refused)),
+                }
+            }
+            RGFX_CMD_LIBRARY_FROM_REGION => {
+                let Some(m) = read::<RgfxLibraryFromRegion>(message) else {
+                    return Ok(Err(DecodeError::Malformed));
+                };
+                // The `.metallib`/AIR bytes lie in a block of the device's
+                // region, for a library larger than one ring message. A span
+                // past the region's end is a guest protocol error. The bytes are
+                // copied out once, so the platform parses memory the guest cannot
+                // change under it.
+                let Some(air) = usize::try_from(m.byte_length)
+                    .ok()
+                    .and_then(|len| self.region.read(m.region_offset, len))
+                else {
+                    return Ok(Err(DecodeError::BadReference));
+                };
+                match device.new_library(&air)? {
                     Ok(Some(library)) => self.insert(m.obj_id, ObjHandle::Library(library)),
                     Ok(None) | Err(_) => Ok(Err(DecodeError::Refused)),
                 }
@@ -906,10 +926,53 @@ fn stencil(s: &RgfxStencilDescriptor) -> StencilDesc {
 mod tests {
     use std::sync::Arc;
 
-    use reims_vgpu_core::testkit::FakePlatform;
+    use reims_vgpu_core::testkit::{Arg, FakePlatform};
     use zerocopy::IntoBytes;
 
     use super::*;
+
+    /// A library from region bytes reads them at their offset and hands them to the
+    /// platform unchanged; a span past the region's end is refused as a bad reference.
+    #[test]
+    fn makes_a_library_from_region_bytes() {
+        let p = Arc::new(FakePlatform::new());
+        let device = p.device();
+        let region = Arc::new(reims_graphics::region::Region::new(0x10000).unwrap());
+        let air: Vec<u8> = (0..0x2345u32).map(|i| (i * 7) as u8).collect();
+        assert!(region.write(0x4000, &air));
+        let mut dec = GraphicsDecoder::<FakePlatform>::new(Arc::clone(&p), Arc::clone(&region));
+
+        let msg = |obj_id: u64, region_offset: u64, byte_length: u64| RgfxLibraryFromRegion {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_LIBRARY_FROM_REGION,
+                size: size_of::<RgfxLibraryFromRegion>() as u32,
+                seqno: 0,
+            },
+            obj_id,
+            region_offset,
+            byte_length,
+        };
+        assert_eq!(
+            dec.decode(&device, msg(20, 0x4000, air.len() as u64).as_bytes())
+                .unwrap(),
+            Ok(())
+        );
+        assert_eq!(dec.object_count(), 1);
+        let calls = p.call_log().calls_to("newLibraryWithData:error:");
+        assert_eq!(calls.len(), 1);
+        assert!(matches!(&calls[0].args[0], Arg::Bytes(b) if *b == air));
+
+        assert_eq!(
+            dec.decode(&device, msg(21, 0xf000, 0x2000).as_bytes())
+                .unwrap(),
+            Err(DecodeError::BadReference)
+        );
+        assert_eq!(
+            dec.decode(&device, msg(22, u64::MAX, 2).as_bytes()).unwrap(),
+            Err(DecodeError::BadReference)
+        );
+        assert_eq!(dec.object_count(), 1);
+    }
 
     /// A create of each state object calls the platform and holds its handle;
     /// an object destroy drops it; an unknown command and a short message are

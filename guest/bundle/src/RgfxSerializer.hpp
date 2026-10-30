@@ -182,6 +182,12 @@ public:
 	/// the bytes, rounded to a multiple of 8) does not fit the ring.
 	RgfxCreated createLibrary(const void *bytes, uint64_t byte_length);
 
+	/// A library from `byte_length` bytes of .metallib or AIR the caller placed
+	/// at `region_offset` in the device's region (LIBRARY_FROM_REGION), for a
+	/// library larger than one ring message. The caller keeps the block for the
+	/// library's life. `posted` is false when the ring has no room.
+	RgfxCreated createLibraryFromRegion(uint64_t region_offset, uint64_t byte_length);
+
 	// --- pipelines ------------------------------------------------------------
 
 	/// A render pipeline from `params`. The functions, label and vertex

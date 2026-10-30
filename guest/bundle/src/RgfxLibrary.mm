@@ -12,9 +12,11 @@
 #import "RgfxMetalError.h"
 
 #include <cstring>
+#include <unistd.h>
 #include <string>
 #include <vector>
 
+#include "RgfxRegion.hpp"
 #include "RgfxSerializer.hpp"
 
 namespace {
@@ -206,6 +208,11 @@ std::vector<RgfxFunctionConstant> indexedConstants(MTLFunctionConstantValues *va
 @implementation RgfxLibrary {
 	std::vector<MetallibFunction> _functions; // the .metallib's function list
 	BOOL _haveFunctionTable;                  // the bytes were a readable .metallib
+	// The region block holding the bytes of a LIBRARY_FROM_REGION create (size 0 for
+	// an inline create). Kept for the library's life: the region has no release yet,
+	// so the block stays allocated past it.
+	uint64_t _regionOffset;
+	uint64_t _regionSize;
 }
 
 + (instancetype)libraryWithData:(const void *)bytes
@@ -227,6 +234,46 @@ std::vector<RgfxFunctionConstant> indexedConstants(MTLFunctionConstantValues *va
 	if (lib != nil)
 		lib->_haveFunctionTable =
 		    readMetallibFunctions(static_cast<const uint8_t *>(bytes), length, lib->_functions);
+	return lib;
+}
+
++ (instancetype)libraryWithRegionCopyOf:(const void *)bytes
+                                length:(NSUInteger)length
+                                region:(RgfxRegion *)region
+                                device:(id<MTLDevice>)device
+                            serializer:(RgfxSerializer *)serializer
+{
+	if (serializer == nullptr || region == nullptr || bytes == nullptr || length == 0) {
+		return nil;
+	}
+	RgfxRegion::Block block = region->allocate(length);
+	if (!block.ok) {
+		return nil;
+	}
+	// The block is write-back memory; the ring's release store of `producer` orders
+	// these bytes before the host reads the create.
+	std::memcpy(const_cast<uint8_t *>(block.ptr), bytes, length);
+	// The create is a fixed-size message: retry it (not the copy) while the ring is
+	// momentarily full, about two seconds, as the host drains the ring as it runs.
+	RgfxCreated created = {};
+	for (int i = 0; i < 2000; i++) {
+		created = serializer->createLibraryFromRegion(block.offset, length);
+		if (created.posted)
+			break;
+		usleep(1000);
+	}
+	if (!created.posted) {
+		return nil; // the block stays allocated (the region has no release yet)
+	}
+	RgfxLibrary *lib = [[RgfxLibrary alloc] initWithObjId:created.obj_id
+	                                               device:device
+	                                           serializer:serializer];
+	if (lib != nil) {
+		lib->_regionOffset = block.offset;
+		lib->_regionSize = block.size;
+		lib->_haveFunctionTable =
+		    readMetallibFunctions(static_cast<const uint8_t *>(bytes), length, lib->_functions);
+	}
 	return lib;
 }
 

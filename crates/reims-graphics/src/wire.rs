@@ -242,6 +242,10 @@ pub const RGFX_CMD_EVENT_CREATE: u32 = 0x20f;
 pub const RGFX_CMD_SHARED_EVENT_CREATE: u32 = 0x210;
 /// Command `FENCE_CREATE` ([`RgfxObjectCreate`]): a Metal fence.
 pub const RGFX_CMD_FENCE_CREATE: u32 = 0x211;
+/// Command `LIBRARY_FROM_REGION` ([`RgfxLibraryFromRegion`]): a library from
+/// `.metallib`/AIR bytes the guest placed in a block of the device's region, for
+/// a library larger than one ring message.
+pub const RGFX_CMD_LIBRARY_FROM_REGION: u32 = 0x212;
 
 /// Command `COMMAND_BUFFER` (a per-queue submission ring): one command buffer,
 /// its `obj_id` followed by the encoder-op byte stream. Struct and op stream in
@@ -935,6 +939,26 @@ pub struct RgfxLibraryCreate {
     pub byte_length: u64,
 }
 
+/// `LIBRARY_FROM_REGION`: a library from `byte_length` bytes of `.metallib` or
+/// AIR at `region_offset` in the device's region, forwarded to the host
+/// unchanged. The guest keeps the block for the library's life; the host reads
+/// the bytes while it decodes the message. A span past the region's end is a
+/// guest protocol error.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxLibraryFromRegion {
+    /// [`RGFX_CMD_LIBRARY_FROM_REGION`].
+    pub header: RgfxMsgHeader,
+    /// The new library's guest-picked id.
+    pub obj_id: u64,
+    /// The bytes' offset in the device's region.
+    pub region_offset: u64,
+    /// The length of the `.metallib`/AIR bytes.
+    pub byte_length: u64,
+}
+
 /// Where a `LIBRARY_CREATE` message's bytes start: right after its header.
 pub const RGFX_LIBRARY_BYTES_OFFSET: u32 = 32;
 
@@ -1293,6 +1317,7 @@ const _: () = {
     assert!(size_of::<RgfxStencilDescriptor>() == 24);
     assert!(size_of::<RgfxDepthStencilCreate>() == 80);
     assert!(size_of::<RgfxLibraryCreate>() == 32);
+    assert!(size_of::<RgfxLibraryFromRegion>() == 40);
     assert!(RGFX_LIBRARY_BYTES_OFFSET as usize == size_of::<RgfxLibraryCreate>());
     assert!(size_of::<RgfxDeviceInfo>() == 376);
     // The device-info blob sits past the completion ring and before the allocations.

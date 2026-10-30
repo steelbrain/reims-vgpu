@@ -112,6 +112,7 @@ include = [
     "RgfxHeapCreate",
     "RgfxHeapOverHostMemory",
     "RgfxLibraryCreate",
+    "RgfxLibraryFromRegion",
     "RgfxModeEntry",
     "RgfxMoveCursor",
     "RgfxMsgHeader",
