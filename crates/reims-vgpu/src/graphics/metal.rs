@@ -16,7 +16,7 @@ use reims_vgpu_core::raise::OnFault;
 use reims_vgpu_metal::{MetalPlatform, Obj, msg};
 use reims_vgpu_window::{DrawnCursor, FrameSink, PixelRect};
 
-use super::Shown;
+use super::{Presented, Shown};
 use super::sink::ScanoutDraw;
 use crate::display::no_catch;
 use crate::entry;
@@ -27,8 +27,9 @@ pub(super) fn sink(
     platform: Arc<MetalPlatform>,
     region: &Arc<Region>,
     shown: &Arc<Shown>,
+    presented: &Arc<Presented<MetalPlatform>>,
 ) -> Option<Arc<dyn FrameSink>> {
-    let draw = ScanoutDraw::new(platform, region, shown)?;
+    let draw = ScanoutDraw::new(platform, region, shown, presented)?;
     Some(Arc::new(MetalScanoutSink { draw }))
 }
 

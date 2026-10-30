@@ -734,6 +734,9 @@
 // Command `SET_VBLANK` ([`RgfxSetVblank`]): answered by [`RGFX_EVT_COMPLETE`].
 #define RGFX_CMD_SET_VBLANK 5
 
+// Command `PRESENT_SURFACE` ([`RgfxPresentSurface`]): answered by [`RGFX_EVT_COMPLETE`].
+#define RGFX_CMD_PRESENT_SURFACE 6
+
 // Event `COMPLETE` ([`RgfxComplete`]): a command's answer, with its `seqno`.
 #define RGFX_EVT_COMPLETE 256
 
@@ -3377,6 +3380,25 @@ typedef struct {
   // Where the first row starts in the region: a multiple of 4, in the guest's allocations.
   uint64_t offset;
 } RgfxSetScanout;
+
+// `PRESENT_SURFACE`: the display shows the IOSurface of global ID `iosurface_id` (plane 0), the
+// display pipe's swap, in place of the scanout, until the next `PRESENT_SURFACE`; 0 shows the
+// scanout again. The host shows the texture the device's decoder made over that surface
+// (`TEXTURE_FROM_IOSURFACE`), and again each time a command buffer completes while it is shown,
+// so the GPU's writes reach the window. Answered [`RGFX_STATUS_INVALID_ARGUMENT`] where the
+// decoder holds no texture over that surface: the display keeps what it showed.
+typedef struct {
+  // [`RGFX_CMD_PRESENT_SURFACE`].
+  RgfxMsgHeader header;
+  // The display's id.
+  uint32_t display;
+  // The IOSurface's global ID; 0 shows the scanout.
+  uint32_t iosurface_id;
+  // The display pipe's transaction ID, for the host's log.
+  uint32_t transaction_id;
+  // Pads the message to a multiple of 8; 0.
+  uint32_t reserved_1c;
+} RgfxPresentSurface;
 
 // `SET_VBLANK`: the device sends `VBLANK` at each refresh of the display's host screen while
 // `enabled` is not 0.

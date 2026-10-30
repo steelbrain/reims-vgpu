@@ -153,6 +153,8 @@ pub const RGFX_CMD_SET_CURSOR: u32 = 3;
 pub const RGFX_CMD_MOVE_CURSOR: u32 = 4;
 /// Command `SET_VBLANK` ([`RgfxSetVblank`]): answered by [`RGFX_EVT_COMPLETE`].
 pub const RGFX_CMD_SET_VBLANK: u32 = 5;
+/// Command `PRESENT_SURFACE` ([`RgfxPresentSurface`]): answered by [`RGFX_EVT_COMPLETE`].
+pub const RGFX_CMD_PRESENT_SURFACE: u32 = 6;
 /// Event `COMPLETE` ([`RgfxComplete`]): a command's answer, with its `seqno`.
 pub const RGFX_EVT_COMPLETE: u32 = 0x100;
 /// Event `DISPLAYS` ([`RgfxDisplays`]): `GET_DISPLAYS`'s answer, with its `seqno`.
@@ -383,6 +385,29 @@ pub struct RgfxSetVblank {
     pub enabled: u32,
 }
 
+/// `PRESENT_SURFACE`: the display shows the IOSurface of global ID `iosurface_id` (plane 0), the
+/// display pipe's swap, in place of the scanout, until the next `PRESENT_SURFACE`; 0 shows the
+/// scanout again. The host shows the texture the device's decoder made over that surface
+/// (`TEXTURE_FROM_IOSURFACE`), and again each time a command buffer completes while it is shown,
+/// so the GPU's writes reach the window. Answered [`RGFX_STATUS_INVALID_ARGUMENT`] where the
+/// decoder holds no texture over that surface: the display keeps what it showed.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxPresentSurface {
+    /// [`RGFX_CMD_PRESENT_SURFACE`].
+    pub header: RgfxMsgHeader,
+    /// The display's id.
+    pub display: u32,
+    /// The IOSurface's global ID; 0 shows the scanout.
+    pub iosurface_id: u32,
+    /// The display pipe's transaction ID, for the host's log.
+    pub transaction_id: u32,
+    /// Pads the message to a multiple of 8; 0.
+    pub reserved_1c: u32,
+}
+
 /// `COMPLETE`: a command's answer.
 #[repr(C)]
 #[derive(
@@ -488,6 +513,7 @@ const _: () = {
     assert!(size_of::<RgfxSetCursor>() == 48);
     assert!(size_of::<RgfxMoveCursor>() == 32);
     assert!(size_of::<RgfxSetVblank>() == 24);
+    assert!(size_of::<RgfxPresentSurface>() == 32);
     assert!(size_of::<RgfxComplete>() == 24);
     assert!(offset_of!(RgfxDisplays, count) + 4 == RGFX_DISPLAYS_ENTRIES_OFFSET as usize);
     assert!(size_of::<RgfxDisplayEntry>() == 16);

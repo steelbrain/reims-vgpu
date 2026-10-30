@@ -13,7 +13,7 @@ use reims_vgpu_vulkan::VulkanPlatform;
 use reims_vgpu_vulkan::swapchain::{Acquired, Swapchain};
 use reims_vgpu_window::{Drawn, DrawnCursor, FrameSink, PixelRect, Presenter, VulkanTarget};
 
-use super::Shown;
+use super::{Presented, Shown};
 use super::sink::ScanoutDraw;
 use crate::display::no_catch;
 use crate::entry;
@@ -29,8 +29,9 @@ pub(super) fn sink(
     platform: Arc<VulkanPlatform>,
     region: &Arc<Region>,
     shown: &Arc<Shown>,
+    presented: &Arc<Presented<VulkanPlatform>>,
 ) -> Option<Arc<dyn FrameSink>> {
-    let draw = ScanoutDraw::new(platform, region, shown)?;
+    let draw = ScanoutDraw::new(platform, region, shown, presented)?;
     Some(Arc::new(VulkanScanoutSink {
         draw: Arc::new(draw),
     }))

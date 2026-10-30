@@ -24,6 +24,7 @@
 //! Every public method runs as an entry ([`crate::entry`]).
 
 use std::os::fd::RawFd;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use reims_graphics::ops::RgfxCommandBuffer;
@@ -37,6 +38,7 @@ use reims_graphics::{
     Screen,
 };
 use reims_vgpu_core::platform::device::GpuDevice;
+use reims_vgpu_core::platform::Platform;
 use reims_vgpu_core::sync::Mutex;
 use reims_vgpu_window::{FrameSink, Window, WindowConfig};
 use zerocopy::{FromBytes, IntoBytes};
@@ -144,6 +146,7 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                 device: gpu_device,
                 poster: OnceLock::new(),
                 control_completion: OnceLock::new(),
+                presented: Arc::new(Presented::default()),
             });
             let host = Box::new(CallbackHost {
                 callbacks: config.callbacks,
@@ -151,7 +154,12 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             });
             let (window, screen): (Option<WindowLink>, Box<dyn Screen>) = match config.window {
                 Some(window_config) => {
-                    let (link, screen) = WindowScreen::open(&platform, &region, window_config);
+                    let (link, screen) = WindowScreen::open(
+                        &platform,
+                        &region,
+                        &control.presented,
+                        window_config,
+                    );
                     (Some(link), Box::new(screen))
                 }
                 None => (None, Box::new(FixedScreen(FALLBACK_MODE))),
@@ -247,6 +255,83 @@ struct GraphicsControl<P: ApiPlatform> {
     /// set to the right ring before every decode; this is the control ring's, re-set before every
     /// control-ring message.
     control_completion: OnceLock<CompletionSink>,
+    /// The surface the display pipe shows, shared with the window's sink.
+    presented: Arc<Presented<P>>,
+}
+
+/// The IOSurface the display pipe shows in place of the scanout (`PRESENT_SURFACE`): the texture
+/// the decoder made over it, which the window's sink copies into each drawable (`sink`), and
+/// what asks the window for a frame when it changes or a command buffer completes.
+pub(crate) struct Presented<P: Platform> {
+    /// The texture shown; `None` shows the scanout.
+    pub(crate) texture: Mutex<Option<P::Texture>>,
+    /// The surface's IOSurface ID, 0 for none.
+    surface_id: AtomicU32,
+    /// The window, once it has opened.
+    window: OnceLock<Arc<Window>>,
+    /// A surface of a format the sink cannot copy was logged.
+    refused: AtomicBool,
+    /// A command buffer completed since the refresh last asked: the GPU may have written the
+    /// scanout, which the host's dirty log never sees.
+    gpu_wrote: AtomicBool,
+}
+
+impl<P: Platform> Default for Presented<P> {
+    fn default() -> Self {
+        Presented {
+            texture: Mutex::new(None),
+            surface_id: AtomicU32::new(0),
+            window: OnceLock::new(),
+            refused: AtomicBool::new(false),
+            gpu_wrote: AtomicBool::new(false),
+        }
+    }
+}
+
+impl<P: Platform> Presented<P> {
+    /// Shows `texture` (the surface `id`'s), or the scanout for `None`, and asks for a frame.
+    fn show(&self, id: u32, texture: Option<P::Texture>) {
+        let previous = self.surface_id.swap(id, Ordering::AcqRel);
+        if previous != id {
+            log::info!(
+                target: "reims_vgpu::graphics",
+                "the display shows IOSurface {id} (was {previous}; 0 is the scanout)"
+            );
+        }
+        *self.texture.lock() = texture;
+        self.frame();
+    }
+
+    /// A command buffer completed: the GPU may have written what the window shows.
+    fn completed(&self) {
+        self.gpu_wrote.store(true, Ordering::Release);
+        if self.texture.lock().is_some() {
+            self.frame();
+        }
+    }
+
+    /// Whether a command buffer completed since the last ask.
+    fn take_gpu_wrote(&self) -> bool {
+        self.gpu_wrote.swap(false, Ordering::AcqRel)
+    }
+
+    /// Asks the window for a frame.
+    fn frame(&self) {
+        if let Some(window) = self.window.get() {
+            window.new_frame();
+        }
+    }
+
+    /// The sink met a surface of `format`, which it cannot copy into its drawable: logged once.
+    pub(crate) fn refuse_format(&self, format: u64) {
+        if !self.refused.swap(true, Ordering::AcqRel) {
+            log::warn!(
+                target: "reims_vgpu::graphics",
+                "the presented IOSurface's texture has pixel format {format}, which the window \
+                 cannot copy (BGRA8 only): the scanout shows instead"
+            );
+        }
+    }
 }
 
 impl<P: ApiPlatform> GraphicsControl<P> {
@@ -255,8 +340,10 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     /// pipeline create's [`RgfxPipelineReflection`].
     fn set_sinks(&self, poster: &ControlCompletionPoster) {
         let completion = poster.clone();
+        let presented = Arc::clone(&self.presented);
         let sink: CompletionSink = Arc::new(move |record: RgfxCbComplete| {
             completion.post(record.as_bytes());
+            presented.completed();
         });
         let _ = self.control_completion.set(Arc::clone(&sink));
         let mut decoder = self.decoder.lock();
@@ -314,8 +401,10 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     fn handle_queue(&self, poster: &QueueCompletionPoster, message: &[u8]) {
         entry::run(|_| {
             let queue_poster = poster.clone();
+            let presented = Arc::clone(&self.presented);
             let sink: CompletionSink = Arc::new(move |record: RgfxCbComplete| {
                 queue_poster.post(record.as_bytes());
+                presented.completed();
             });
             let outcome = {
                 let mut decoder = self.decoder.lock();
@@ -340,6 +429,23 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                 }
             }
         });
+    }
+
+    /// Shows the IOSurface `iosurface_id` (0: the scanout): false, with nothing changed, where the
+    /// decoder holds no texture over it.
+    fn present_surface(&self, iosurface_id: u32) -> bool {
+        if iosurface_id == 0 {
+            self.presented.show(0, None);
+            return true;
+        }
+        let texture = self.decoder.lock().surface_texture(iosurface_id);
+        match texture {
+            Some(texture) => {
+                self.presented.show(iosurface_id, Some(texture));
+                true
+            }
+            None => false,
+        }
     }
 
     /// Posts an internal-error completion for `message` where it is a `COMMAND_BUFFER` whose
@@ -392,11 +498,20 @@ impl<P: ApiPlatform> Host for CallbackHost<P> {
         }
     }
 
+    /// The host's dirty log, or a command buffer's completion since the last ask: the GPU's
+    /// writes to the scanout never reach the dirty log.
     fn scanout_written(&self, offset: u64, length: u64) -> bool {
-        self.callbacks
+        let gpu = self.control.presented.take_gpu_wrote();
+        let cpu = self
+            .callbacks
             .scanout_written
             .as_ref()
-            .is_none_or(|f| f(offset, length))
+            .is_none_or(|f| f(offset, length));
+        gpu || cpu
+    }
+
+    fn present_surface(&self, iosurface_id: u32) -> bool {
+        self.control.present_surface(iosurface_id)
     }
 
     fn stage3_message(&self, message: &[u8]) {
@@ -459,6 +574,7 @@ impl WindowScreen {
     fn open<P: ApiPlatform>(
         platform: &Arc<P>,
         region: &Arc<Region>,
+        presented: &Arc<Presented<P>>,
         mut config: WindowConfig,
     ) -> (WindowLink, WindowScreen) {
         config.keeps_its_size = true;
@@ -468,9 +584,10 @@ impl WindowScreen {
         let refresh_mhz = reims_vgpu_window::screens::screen_for_port(0)
             .map_or(FALLBACK_MODE.refresh_mhz, |s| hz_to_mhz(s.refresh_hz));
         let shown = Arc::new(Shown::default());
-        if let Some(sink) = scanout_sink(platform, region, &shown) {
+        if let Some(sink) = scanout_sink(platform, region, &shown, presented) {
             window.attach(sink);
         }
+        let _ = presented.window.set(Arc::clone(&window));
         let screen = WindowScreen {
             window: Arc::clone(&window),
             shown,
@@ -563,19 +680,25 @@ fn scanout_sink<P: ApiPlatform>(
     platform: &Arc<P>,
     region: &Arc<Region>,
     shown: &Arc<Shown>,
+    presented: &Arc<Presented<P>>,
 ) -> Option<Arc<dyn FrameSink>> {
     let any: Arc<dyn std::any::Any + Send + Sync> = Arc::clone(platform) as _;
+    let presented_any: Arc<dyn std::any::Any + Send + Sync> = Arc::clone(presented) as _;
     #[cfg(target_os = "macos")]
-    let any = match any.downcast::<reims_vgpu_metal::MetalPlatform>() {
-        Ok(metal) => return metal::sink(metal, region, shown),
-        Err(other) => other,
-    };
+    if let (Ok(metal), Ok(presented)) = (
+        Arc::clone(&any).downcast::<reims_vgpu_metal::MetalPlatform>(),
+        Arc::clone(&presented_any).downcast::<Presented<reims_vgpu_metal::MetalPlatform>>(),
+    ) {
+        return metal::sink(metal, region, shown, &presented);
+    }
     #[cfg(feature = "vulkan")]
-    let any = match any.downcast::<reims_vgpu_vulkan::VulkanPlatform>() {
-        Ok(vulkan) => return vulkan::sink(vulkan, region, shown),
-        Err(other) => other,
-    };
-    let _ = (any, region, shown);
+    if let (Ok(vulkan), Ok(presented)) = (
+        Arc::clone(&any).downcast::<reims_vgpu_vulkan::VulkanPlatform>(),
+        Arc::clone(&presented_any).downcast::<Presented<reims_vgpu_vulkan::VulkanPlatform>>(),
+    ) {
+        return vulkan::sink(vulkan, region, shown, &presented);
+    }
+    let _ = (any, presented_any, region, shown);
     None
 }
 

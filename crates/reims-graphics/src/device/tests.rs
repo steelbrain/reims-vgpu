@@ -53,7 +53,11 @@ struct TestHost {
     interrupts: Arc<AtomicU32>,
     written: Arc<AtomicBool>,
     asked: Arc<Mutex<Vec<(u64, u64)>>>,
+    presented: Arc<Mutex<Vec<u32>>>,
 }
+
+/// The one IOSurface the test host holds a texture over.
+const HELD_SURFACE: u32 = 0x77;
 
 impl Host for TestHost {
     fn raise_interrupt(&self, vector: u32) {
@@ -63,6 +67,10 @@ impl Host for TestHost {
     fn scanout_written(&self, offset: u64, length: u64) -> bool {
         self.asked.lock().push((offset, length));
         self.written.load(Ordering::SeqCst)
+    }
+    fn present_surface(&self, iosurface_id: u32) -> bool {
+        self.presented.lock().push(iosurface_id);
+        iosurface_id == 0 || iosurface_id == HELD_SURFACE
     }
 }
 
@@ -74,6 +82,7 @@ struct Rig {
     interrupts: Arc<AtomicU32>,
     written: Arc<AtomicBool>,
     asked: Arc<Mutex<Vec<(u64, u64)>>>,
+    presented: Arc<Mutex<Vec<u32>>>,
     /// The guest's count of the submission ring.
     produced: u64,
     /// The guest's count of the completion ring.
@@ -94,6 +103,7 @@ impl Rig {
         let interrupts = Arc::new(AtomicU32::new(0));
         let written = Arc::new(AtomicBool::new(false));
         let asked = Arc::new(Mutex::new(Vec::new()));
+        let presented = Arc::new(Mutex::new(Vec::new()));
         let region = Arc::new(Region::new(REGION_SIZE as usize).unwrap());
         let device = Device::new(
             region,
@@ -101,6 +111,7 @@ impl Rig {
                 interrupts: Arc::clone(&interrupts),
                 written: Arc::clone(&written),
                 asked: Arc::clone(&asked),
+                presented: Arc::clone(&presented),
             }),
             Box::new(TestScreen {
                 mode: Arc::clone(&mode),
@@ -115,6 +126,7 @@ impl Rig {
             interrupts,
             written,
             asked,
+            presented,
             produced: 0,
             consumed: 0,
             seqno: 0,
@@ -274,6 +286,38 @@ fn vblank(enabled: u32) -> Vec<u8> {
         enabled,
     };
     c.as_bytes().to_vec()
+}
+
+fn present_surface(display: u32, iosurface_id: u32) -> Vec<u8> {
+    let c = RgfxPresentSurface {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_PRESENT_SURFACE,
+            ..Default::default()
+        },
+        display,
+        iosurface_id,
+        transaction_id: 9,
+        reserved_1c: 0,
+    };
+    c.as_bytes().to_vec()
+}
+
+/// `PRESENT_SURFACE` hands display 0's surface to the host and answers whether it shows it: a
+/// surface it holds, and 0 (the scanout again), succeed; one it holds no texture over is an
+/// invalid argument; another display is refused before the host is asked
+#[test]
+fn present_surface_asks_the_host_and_answers_its_word() {
+    let mut rig = Rig::new();
+    rig.start();
+    let seqno = rig.send(present_surface(0, HELD_SURFACE));
+    assert_eq!(rig.complete(), (seqno, RGFX_STATUS_OK));
+    let seqno = rig.send(present_surface(0, 5));
+    assert_eq!(rig.complete(), (seqno, RGFX_STATUS_INVALID_ARGUMENT));
+    let seqno = rig.send(present_surface(1, HELD_SURFACE));
+    assert_eq!(rig.complete(), (seqno, RGFX_STATUS_NO_DISPLAY));
+    let seqno = rig.send(present_surface(0, 0));
+    assert_eq!(rig.complete(), (seqno, RGFX_STATUS_OK));
+    assert_eq!(*rig.presented.lock(), [HELD_SURFACE, 5, 0]);
 }
 
 /// The registers read as the wire says, and `STATUS` follows the guest's writes

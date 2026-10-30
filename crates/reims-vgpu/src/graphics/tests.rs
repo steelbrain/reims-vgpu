@@ -584,3 +584,30 @@ fn the_cursor_shows_with_an_image_while_the_guest_shows_it() {
     assert_eq!(cursor.shown, Some(false));
     window.close();
 }
+
+/// The display pipe's present: a surface the decoder holds no texture over is refused with
+/// nothing shown, 0 shows the scanout; a command buffer's completion counts as a write of the
+/// scanout once, at the next refresh's ask, whatever the host's dirty log says
+#[test]
+fn a_present_needs_the_surface_s_texture_and_completions_mark_the_scanout() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let device = headless(&raised);
+    let control = Arc::clone(&device.control);
+    assert!(!control.present_surface(0x77), "no texture over the surface");
+    assert!(control.presented.texture.lock().is_none());
+    assert_eq!(control.presented.surface_id.load(Ordering::SeqCst), 0);
+    assert!(control.present_surface(0), "0 shows the scanout");
+
+    let never = GraphicsCallbacks {
+        raise_interrupt: None,
+        scanout_written: Some(Arc::new(|_, _| false)),
+    };
+    let host = CallbackHost {
+        callbacks: never,
+        control: Arc::clone(&control),
+    };
+    assert!(!host.scanout_written(0, 4096));
+    control.presented.completed();
+    assert!(host.scanout_written(0, 4096), "the GPU may have written it");
+    assert!(!host.scanout_written(0, 4096), "once per completion");
+}

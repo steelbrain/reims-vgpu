@@ -10,6 +10,11 @@
 //! image's top left, clipped to the drawable, after a clear of the drawable to black: a blit
 //! cannot scale, and the guest's next mode makes the sizes equal again.
 //!
+//! **A presented surface.** While the display pipe shows an IOSurface (`PRESENT_SURFACE`), the
+//! draw copies the texture the decoder made over it into the drawable instead, texture to
+//! texture on the GPU, where the two have one pixel format (BGRA8, with or without sRGB); a
+//! surface of another format is not shown, and the scanout shows meanwhile (logged once).
+//!
 //! **The import.** The buffer covers the whole region, so its deallocator, which holds the
 //! region, is what keeps the region mapped while a command buffer still reads it: Metal (or the
 //! runtime) runs it once the buffer has gone, after the sink and every command buffer that used
@@ -27,11 +32,11 @@ use reims_vgpu_core::platform::render::{RenderCmd, RenderEncoder as _};
 use reims_vgpu_core::platform::resource::Texture as _;
 use reims_vgpu_core::platform::types::{ClearColor, MtlOrigin, MtlSize};
 use reims_vgpu_core::platform::values::ColorAttachmentSet;
-use reims_vgpu_core::platform::{HostRange, Platform};
+use reims_vgpu_core::platform::{Handle, HostRange, Platform};
 use reims_vgpu_core::raise::OnFault;
 use reims_vgpu_window::PixelRect;
 
-use super::Shown;
+use super::{Presented, Shown};
 use crate::display::no_catch;
 use crate::platform::ApiPlatform;
 
@@ -54,7 +59,12 @@ pub(crate) struct ScanoutDraw<P: Platform> {
     buffer: P::Buffer,
     /// What the window shows.
     shown: Arc<Shown>,
+    /// The surface the display pipe shows, if any, in place of the scanout.
+    presented: Arc<Presented<P>>,
 }
+
+/// `MTLPixelFormatBGRA8Unorm` and its sRGB form, which copy into each other.
+const BGRA8_FORMATS: [u64; 2] = [80, 81];
 
 impl<P: ApiPlatform> ScanoutDraw<P> {
     /// The draw over `region` on `platform`'s default device, sharing `shown` with the window's
@@ -63,6 +73,7 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
         platform: Arc<P>,
         region: &Arc<Region>,
         shown: &Arc<Shown>,
+        presented: &Arc<Presented<P>>,
     ) -> Option<ScanoutDraw<P>> {
         let device = platform.metal_device(None)?;
         let queue = device.new_command_queue()?;
@@ -89,6 +100,7 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
             queue,
             buffer,
             shown: Arc::clone(shown),
+            presented: Arc::clone(presented),
         })
     }
 
@@ -106,6 +118,15 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
         texture: &P::Texture,
         region: PixelRect,
     ) -> Option<P::CommandBuffer> {
+        let surface = self.presented.texture.lock().as_ref().map(Handle::clone_ref);
+        if let Some(surface) = surface {
+            if BGRA8_FORMATS.contains(&surface.pixel_format())
+                && BGRA8_FORMATS.contains(&texture.pixel_format())
+            {
+                return self.encode_surface(&surface, texture, region);
+            }
+            self.presented.refuse_format(surface.pixel_format());
+        }
         let scanout = (*self.shown.scanout.lock())?;
         let command_buffer = no_catch(self.queue.command_buffer(OnFault::Die))?;
         let (texture_width, texture_height) = (texture.width(), texture.height());
@@ -130,6 +151,51 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
                     source_offset: scanout.offset,
                     source_bytes_per_row: stride,
                     source_bytes_per_image: stride * height,
+                    source_size: MtlSize::new(width, height, 1),
+                    destination_texture: texture,
+                    destination_slice: 0,
+                    destination_level: 0,
+                    destination_origin: MtlOrigin::new(x, y, 0),
+                },
+            ));
+            no_catch(blit.encode(OnFault::Die, BlitCmd::EndEncoding));
+        }
+        Some(command_buffer)
+    }
+
+    /// A command buffer of the sink's queue with the presented `surface` copied into `texture` at
+    /// `region`, clipped to both, after a clear where it does not cover the texture; not
+    /// committed.
+    fn encode_surface(
+        &self,
+        surface: &P::Texture,
+        texture: &P::Texture,
+        region: PixelRect,
+    ) -> Option<P::CommandBuffer> {
+        let command_buffer = no_catch(self.queue.command_buffer(OnFault::Die))?;
+        let (texture_width, texture_height) = (texture.width(), texture.height());
+        let x = region.x.min(texture_width);
+        let y = region.y.min(texture_height);
+        let width = surface
+            .width()
+            .min(region.width)
+            .min(texture_width - x);
+        let height = surface
+            .height()
+            .min(region.height)
+            .min(texture_height - y);
+        if (x, y, width, height) != (0, 0, texture_width, texture_height) {
+            self.clear(&command_buffer, texture);
+        }
+        if width > 0 && height > 0 {
+            let blit = no_catch(command_buffer.blit_encoder(OnFault::Die))?;
+            no_catch(blit.encode(
+                OnFault::Die,
+                BlitCmd::CopyTextureRegion {
+                    source_texture: surface,
+                    source_slice: 0,
+                    source_level: 0,
+                    source_origin: MtlOrigin::new(0, 0, 0),
                     source_size: MtlSize::new(width, height, 1),
                     destination_texture: texture,
                     destination_slice: 0,

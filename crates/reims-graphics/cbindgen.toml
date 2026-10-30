@@ -211,6 +211,7 @@ include = [
     "RgfxScissorRectElem",
     "RgfxSetCursor",
     "RgfxSetScanout",
+    "RgfxPresentSurface",
     "RgfxSetVblank",
     "RgfxSharedEventCreate",
     "RgfxStencilDescriptor",

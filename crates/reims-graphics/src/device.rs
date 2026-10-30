@@ -132,6 +132,14 @@ pub trait Host: Send + Sync + 'static {
     fn queue_message(&self, completion: &QueueCompletionPoster, message: &[u8]) {
         let _ = (completion, message);
     }
+
+    /// Shows the IOSurface of global ID `iosurface_id` on display 0 in place of the scanout
+    /// (`PRESENT_SURFACE`; 0 shows the scanout again), on the control thread. True where the host
+    /// shows it; false, with nothing changed, where it holds no texture over that surface. The
+    /// default shows nothing and refuses every surface but 0, for a host with no stage-3 decoder.
+    fn present_surface(&self, iosurface_id: u32) -> bool {
+        iosurface_id == 0
+    }
 }
 
 /// The device.
