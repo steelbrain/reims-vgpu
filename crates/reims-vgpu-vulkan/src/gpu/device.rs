@@ -29,7 +29,7 @@ use std::sync::{Arc, OnceLock, Weak};
 use metal2vulkan::pipeline::{ComputePipelineDescriptor, StageSource};
 use metal2vulkan_runtime as rt;
 use reims_vgpu_core::host::HostPtr;
-use reims_vgpu_core::platform::caps::DeviceCaps;
+use reims_vgpu_core::platform::caps::{DeviceCaps, IdentityCaps};
 use reims_vgpu_core::platform::device::{FunctionResolver, GpuDevice, NoCopyDeallocator};
 use reims_vgpu_core::platform::os::vm::HostVm;
 use reims_vgpu_core::platform::types::{
@@ -1496,6 +1496,11 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
             self.caps
                 .get_or_init(|| caps::read(&self.raw, self.registry_id, OsVm::new().page_size())),
         )
+    }
+
+    /// Read on each call ([`crate::gpu::identity`]).
+    fn identity_caps(&self) -> IdentityCaps {
+        crate::gpu::identity::read(&self.raw, &self.caps())
     }
 
     /// The runtime's buffer descriptor of the value: zero bytes, a copy of the contents, or,

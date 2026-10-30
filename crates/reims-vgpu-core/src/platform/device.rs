@@ -15,7 +15,7 @@
 
 use std::sync::Arc;
 
-use super::caps::DeviceCaps;
+use super::caps::{DeviceCaps, IdentityCaps};
 use super::host_range::HostRange;
 use super::types::{
     NsErrorText, PixelFormatInfo, SizeAndAlign, TextureLevelInfo, TextureLevelQuery,
@@ -206,6 +206,10 @@ pub trait GpuDevice<P: Platform>: Handle {
     // Capabilities and creators from values.
     /// The device's capabilities: read in full on the first call for this device, then shared.
     fn caps(&self) -> Arc<DeviceCaps>;
+    /// The device's identity and the capability answers beyond [`caps`](GpuDevice::caps): every
+    /// family and feature set of the SDK, and the identity and capability getters. Read on each
+    /// call; only the graphics lane asks it, once per device.
+    fn identity_caps(&self) -> IdentityCaps;
     /// sel: newBufferWithDescriptor: SPI — from a private `MTLBufferDescriptor` made from
     /// `desc`.
     fn new_buffer(&self, desc: BufferDesc<'_>) -> RaiseResult<Option<P::Buffer>>;

@@ -30,8 +30,9 @@ use objc2_metal::{MTLDevice, MTLGPUFamily, MTLPixelFormat, MTLResourceOptions};
 use reims_vgpu_core::num::{ToU64, ToUsize};
 use reims_vgpu_core::platform::HostRange;
 use reims_vgpu_core::platform::caps::{
-    DeviceCaps, FAMILIES, Flags, HEAP_QUERY_OPTIONS, LINEAR_ALIGNMENT_FORMAT, Limits,
-    SAMPLE_COUNTS, WRITE_ROUNDING_MODES,
+    COUNTER_SAMPLING_POINTS, DeviceCaps, FAMILIES, FEATURE_SETS, Flags, HEAP_QUERY_OPTIONS,
+    IdentityCaps, IdentityFlags, IdentitySizes, LARGEST_COUNT_ASKED, LINEAR_ALIGNMENT_FORMAT,
+    Limits, SAMPLE_COUNTS, SDK_FAMILIES, WRITE_ROUNDING_MODES,
 };
 use reims_vgpu_core::platform::device::{FunctionResolver, GpuDevice, NoCopyDeallocator};
 use reims_vgpu_core::platform::types::{
@@ -693,6 +694,11 @@ impl GpuDevice<MetalPlatform> for MetalDevice {
         CAPS.lock().entry(id).or_insert(read).clone()
     }
 
+    /// Every getter's answer, Metal's own (`read_identity_caps`).
+    fn identity_caps(&self) -> IdentityCaps {
+        read_identity_caps(self)
+    }
+
     // Each creator from a value makes the descriptor with its class's `new`, makes it hold the
     // value (`desc`'s `apply_*`), then sends the descriptor's creator.
 
@@ -988,6 +994,113 @@ fn read_caps(device: &MetalDevice, page_size: u64) -> DeviceCaps {
         }),
         heap_buffer_page_private: heap_buffer_size_and_align(d, page_size, HEAP_QUERY_OPTIONS),
         min_linear_alignment_bgra8: minimum_linear_alignment(d, LINEAR_ALIGNMENT_FORMAT),
+    }
+}
+
+/// The largest count in `1..=LARGEST_COUNT_ASKED` that `accepts` takes, counting up from 1 until
+/// it refuses one; 0 where it refuses 1.
+fn largest(accepts: impl Fn(u64) -> bool) -> u64 {
+    (1..=LARGEST_COUNT_ASKED)
+        .take_while(|&count| accepts(count))
+        .last()
+        .unwrap_or(0)
+}
+
+/// Every identity and capability answer of `device` [`IdentityCaps`] holds, each Metal's getter
+/// or query, sent once. Metal answers each of them, so none is `None`.
+#[allow(deprecated)] // `supportsFeatureSet:`, `location` and the peer getters, deprecated in the SDK
+fn read_identity_caps(device: &MetalDevice) -> IdentityCaps {
+    let d = device.get();
+    /// A `Fatal` getter of the device: one call, whose selector is the getter's name.
+    macro_rules! get {
+        ($getter:ident) => {
+            msg::get(stringify!($getter), || d.$getter())
+        };
+    }
+    let arch = msg::get("architecture", || d.architecture());
+    let architecture_name = msg::get("name", || arch.name());
+    // `supportsPlacementSparse` is the macOS 26 SDK's; a device of an older OS lacks it.
+    let placement_sparse = msg::get("respondsToSelector:", || {
+        d.respondsToSelector(sel!(supportsPlacementSparse))
+    })
+    .then(|| {
+        // SAFETY: the device responds to the getter, whose answer is a `BOOL`.
+        msg::get("supportsPlacementSparse", || unsafe {
+            objc2::msg_send![d, supportsPlacementSparse]
+        })
+    });
+    IdentityCaps {
+        families: SDK_FAMILIES.map(|family| {
+            // `NSInteger` is `i64` on arm64: lossless.
+            let family = MTLGPUFamily(family as isize);
+            Some(msg::get("supportsFamily:", || d.supportsFamily(family)))
+        }),
+        feature_sets: FEATURE_SETS.map(|set| {
+            let set = objc2_metal::MTLFeatureSet(set.to_usize());
+            Some(msg::get("supportsFeatureSet:", || {
+                d.supportsFeatureSet(set)
+            }))
+        }),
+        counter_sampling: COUNTER_SAMPLING_POINTS.map(|point| {
+            let point = objc2_metal::MTLCounterSamplingPoint(point.to_usize());
+            Some(msg::get("supportsCounterSampling:", || {
+                d.supportsCounterSampling(point)
+            }))
+        }),
+        architecture_name: Some(msg::string_text(&architecture_name)),
+        sizes: IdentitySizes {
+            recommended_max_working_set_size: Some(get!(recommendedMaxWorkingSetSize)),
+            location: Some(get!(location).0.to_u64()),
+            location_number: Some(get!(locationNumber).to_u64()),
+            max_transfer_rate: Some(get!(maxTransferRate)),
+            peer_group_id: Some(get!(peerGroupID)),
+            peer_index: Some(u64::from(get!(peerIndex))),
+            peer_count: Some(u64::from(get!(peerCount))),
+            max_buffer_length: Some(get!(maxBufferLength).to_u64()),
+            max_argument_buffer_sampler_count: Some(get!(maxArgumentBufferSamplerCount).to_u64()),
+            argument_buffers_support: Some(get!(argumentBuffersSupport).0.to_u64()),
+            read_write_texture_support: Some(get!(readWriteTextureSupport).0.to_u64()),
+            sparse_tile_size_in_bytes: Some(get!(sparseTileSizeInBytes).to_u64()),
+            maximum_concurrent_compilation_task_count: Some(
+                get!(maximumConcurrentCompilationTaskCount).to_u64(),
+            ),
+            largest_vertex_amplification_count: Some(largest(|count| {
+                let count = count.to_usize();
+                msg::get("supportsVertexAmplificationCount:", || {
+                    d.supportsVertexAmplificationCount(count)
+                })
+            })),
+            largest_rasterization_rate_map_layer_count: Some(largest(|count| {
+                let count = count.to_usize();
+                // SAFETY: a count is any `NSUInteger`; Metal answers no for one it does not take.
+                msg::get("supportsRasterizationRateMapWithLayerCount:", || unsafe {
+                    d.supportsRasterizationRateMapWithLayerCount(count)
+                })
+            })),
+        },
+        flags: IdentityFlags {
+            is_low_power: Some(get!(isLowPower)),
+            is_headless: Some(get!(isHeadless)),
+            is_removable: Some(get!(isRemovable)),
+            has_unified_memory: Some(get!(hasUnifiedMemory)),
+            supports_32bit_float_filtering: Some(get!(supports32BitFloatFiltering)),
+            supports_32bit_msaa: Some(get!(supports32BitMSAA)),
+            supports_query_texture_lod: Some(get!(supportsQueryTextureLOD)),
+            supports_bc_texture_compression: Some(get!(supportsBCTextureCompression)),
+            supports_pull_model_interpolation: Some(get!(supportsPullModelInterpolation)),
+            are_barycentric_coords_supported: Some(get!(areBarycentricCoordsSupported)),
+            supports_shader_barycentric_coordinates: Some(get!(
+                supportsShaderBarycentricCoordinates
+            )),
+            supports_dynamic_libraries: Some(get!(supportsDynamicLibraries)),
+            supports_render_dynamic_libraries: Some(get!(supportsRenderDynamicLibraries)),
+            supports_raytracing: Some(get!(supportsRaytracing)),
+            supports_function_pointers: Some(get!(supportsFunctionPointers)),
+            supports_function_pointers_from_render: Some(get!(supportsFunctionPointersFromRender)),
+            supports_raytracing_from_render: Some(get!(supportsRaytracingFromRender)),
+            supports_primitive_motion_blur: Some(get!(supportsPrimitiveMotionBlur)),
+            supports_placement_sparse: placement_sparse,
+        },
     }
 }
 
@@ -1472,6 +1585,33 @@ pub(crate) mod tests {
         assert_eq!(a.name, Some(d.get().name().to_string()));
         assert_eq!(a.sample_counts[0], Ok(true));
         assert!(a.heap_buffer_page_private.is_ok());
+    }
+
+    /// The identity is Metal's: every family and feature set answered, Apple5 to Apple10 as the
+    /// caps answer them, and the getters the device's own
+    #[test]
+    fn identity_caps_are_metals() {
+        let d = dev();
+        let caps = d.caps();
+        let identity = d.identity_caps();
+        assert!(identity.families.iter().all(Option::is_some));
+        assert!(identity.feature_sets.iter().all(Option::is_some));
+        // SDK_FAMILIES[4..10] are Apple5 to Apple10, core's FAMILIES[..6].
+        for (k, answer) in caps.families.iter().take(6).enumerate() {
+            assert_eq!(identity.families[4 + k], answer.clone().ok());
+        }
+        assert_eq!(
+            identity.flags.has_unified_memory,
+            Some(d.get().hasUnifiedMemory())
+        );
+        assert_eq!(
+            identity.sizes.max_buffer_length,
+            Some(d.get().maxBufferLength().to_u64())
+        );
+        assert_eq!(
+            identity.architecture_name,
+            Some(d.get().architecture().name().to_string())
+        );
     }
 
     /// Garbage is the NSError; a compiled metallib (the suite's one-kernel fixture) is a library

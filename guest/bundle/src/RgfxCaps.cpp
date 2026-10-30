@@ -9,8 +9,16 @@
 
 // The enum counts match the blob's arrays: a drift in either is caught here, at
 // the guest's own compile, beside wire.rs's assertions on the host side.
-static_assert(kRgfxFamilyCount == sizeof(RgfxDeviceInfo::families),
-              "family count must match RgfxDeviceInfo::families");
+static_assert(kRgfxSizeCount == RGFX_DEVICE_INFO_SIZES,
+              "size count must match RgfxDeviceInfo::sizes");
+static_assert(kRgfxIdentityCount == RGFX_DEVICE_INFO_IDENTITY_FLAGS,
+              "identity flag count must match RgfxDeviceInfo::identity_flags");
+static_assert(sizeof(RgfxDeviceInfo::family_values) / sizeof(int64_t) ==
+                  sizeof(RgfxDeviceInfo::family_answers),
+              "a family answer per family value");
+static_assert(sizeof(RgfxDeviceInfo::feature_set_values) / sizeof(uint64_t) ==
+                  sizeof(RgfxDeviceInfo::feature_set_answers),
+              "a feature set answer per feature set value");
 static_assert(kRgfxLimitCount == sizeof(RgfxDeviceInfo::limits) / sizeof(uint64_t),
               "limit count must match RgfxDeviceInfo::limits");
 static_assert(kRgfxFlagCount == sizeof(RgfxDeviceInfo::flags),
@@ -20,7 +28,19 @@ RgfxCaps::RgfxCaps() : m_valid(false)
 {
 	std::memset(&m_info, 0, sizeof(m_info));
 	m_name[0] = '\0';
+	m_architectureName[0] = '\0';
 }
+
+namespace {
+// `len` bytes of `text` (at most `cap`) into `out`, NUL-terminated.
+void copyText(char *out, const uint8_t *text, uint32_t len, uint32_t cap)
+{
+	if (len > cap)
+		len = cap;
+	std::memcpy(out, text, len);
+	out[len] = '\0';
+}
+} // namespace
 
 bool RgfxCaps::load(const RgfxDeviceInfo &info)
 {
@@ -29,22 +49,56 @@ bool RgfxCaps::load(const RgfxDeviceInfo &info)
 		return false;
 	}
 	m_info = info;
-	// Keep a NUL-terminated copy of the name for the C string accessor; the blob
-	// stores name_len bytes, the rest zero, and a longer name was truncated.
-	uint32_t len = info.name_len;
-	if (len > RGFX_DEVICE_NAME_LEN)
-		len = RGFX_DEVICE_NAME_LEN;
-	std::memcpy(m_name, info.name, len);
-	m_name[len] = '\0';
+	// Keep NUL-terminated copies of the names for the C string accessors; the blob
+	// stores each one's bytes in use, the rest zero.
+	copyText(m_name, info.name, info.name_len, RGFX_DEVICE_NAME_LEN);
+	copyText(m_architectureName, info.architecture_name, info.architecture_name_len,
+	         RGFX_DEVICE_ARCHITECTURE_NAME_LEN);
+	if (m_info.family_count > RGFX_DEVICE_INFO_FAMILIES)
+		m_info.family_count = RGFX_DEVICE_INFO_FAMILIES;
+	if (m_info.feature_set_count > RGFX_DEVICE_INFO_FEATURE_SETS)
+		m_info.feature_set_count = RGFX_DEVICE_INFO_FEATURE_SETS;
 	m_valid = true;
 	return true;
 }
 
-bool RgfxCaps::supportsFamily(RgfxFamily family) const
+bool RgfxCaps::supportsFamily(int64_t family) const
 {
-	if (family < 0 || family >= kRgfxFamilyCount)
+	for (uint32_t k = 0; k < m_info.family_count; k++) {
+		if (m_info.family_values[k] == family)
+			return m_info.family_answers[k] != 0;
+	}
+	return false;
+}
+
+bool RgfxCaps::supportsFeatureSet(uint64_t set) const
+{
+	for (uint32_t k = 0; k < m_info.feature_set_count; k++) {
+		if (m_info.feature_set_values[k] == set)
+			return m_info.feature_set_answers[k] != 0;
+	}
+	return false;
+}
+
+bool RgfxCaps::supportsCounterSampling(uint64_t point) const
+{
+	if (point >= RGFX_DEVICE_INFO_COUNTER_POINTS)
 		return false;
-	return m_info.families[family] != 0;
+	return m_info.counter_sampling[point] != 0;
+}
+
+uint64_t RgfxCaps::size(RgfxSize which) const
+{
+	if (which < 0 || which >= kRgfxSizeCount)
+		return 0;
+	return m_info.sizes[which];
+}
+
+bool RgfxCaps::identityFlag(RgfxIdentityFlag which) const
+{
+	if (which < 0 || which >= kRgfxIdentityCount)
+		return false;
+	return m_info.identity_flags[which] != 0;
 }
 
 bool RgfxCaps::supportsSampleCount(uint32_t count) const

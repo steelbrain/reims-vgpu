@@ -42,7 +42,10 @@ static_assert(sizeof(RgfxLibraryCreate) == 72, "RgfxLibraryCreate");
 static_assert(RGFX_LIBRARY_BYTES_OFFSET == sizeof(RgfxLibraryCreate), "library bytes offset");
 static_assert(sizeof(RgfxLibraryFromRegion) == 112, "RgfxLibraryFromRegion");
 static_assert(sizeof(RgfxLibraryLookup) == 64, "RgfxLibraryLookup");
-static_assert(sizeof(RgfxDeviceInfo) == 376, "RgfxDeviceInfo");
+static_assert(sizeof(RgfxDeviceInfo) == 1400, "RgfxDeviceInfo");
+static_assert(__builtin_offsetof(RgfxDeviceInfo, family_answers) == 944,
+              "RgfxDeviceInfo family_answers");
+static_assert(__builtin_offsetof(RgfxDeviceInfo, name) == 1080, "RgfxDeviceInfo name");
 
 // Stage-3 pipeline creates and reflection.
 static_assert(sizeof(RgfxFunctionConstant) == 16, "RgfxFunctionConstant");

@@ -31,6 +31,7 @@ pub mod format_info;
 #[cfg(test)]
 mod frame_cost;
 pub mod icb;
+pub mod identity;
 pub mod metal_space;
 pub mod no_texture;
 #[cfg(test)]

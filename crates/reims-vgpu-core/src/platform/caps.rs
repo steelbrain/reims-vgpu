@@ -128,6 +128,102 @@ pub struct DeviceCaps {
     pub min_linear_alignment_bgra8: RaiseResult<u64>,
 }
 
+/// Every `MTLGPUFamily` of the macOS 27 SDK, in its order: Apple1 to Apple11, Mac1 and Mac2,
+/// Common1 to Common3, MacCatalyst1 and MacCatalyst2, Metal3 and Metal4. [`IdentityCaps`]
+/// answers `supportsFamily:` of each.
+pub const SDK_FAMILIES: [i64; 20] = [
+    1001, 1002, 1003, 1004, 1005, 1006, 1007, 1008, 1009, 1010, 1011, 2001, 2002, 3001, 3002, 3003,
+    4001, 4002, 5001, 5002,
+];
+
+/// Every `MTLFeatureSet` of the SDK, in its order: iOS 0 to 16, macOS 10000 to 10005, tvOS 30000
+/// to 30005. [`IdentityCaps`] answers `supportsFeatureSet:` of each.
+pub const FEATURE_SETS: [u64; 29] = [
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 10000, 10001, 10002, 10003, 10004,
+    10005, 30000, 30001, 30002, 30003, 30004, 30005,
+];
+
+/// The `MTLCounterSamplingPoint`s [`IdentityCaps`] answers `supportsCounterSampling:` of, in order:
+/// at stage, draw, dispatch, tile and blit boundaries.
+pub const COUNTER_SAMPLING_POINTS: [u64; 5] = [0, 1, 2, 3, 4];
+
+/// The largest count `supportsVertexAmplificationCount:` and
+/// `supportsRasterizationRateMapWithLayerCount:` are asked about: each answer of
+/// [`IdentitySizes`] is the largest count up to it the query takes.
+pub const LARGEST_COUNT_ASKED: u64 = 16;
+
+caps_struct! {
+    /// The device's identity and size answers [`IdentityCaps`] holds, one field per selector:
+    /// `None` where the platform has no answer of its own.
+    IdentitySizes: Option<u64>;
+    recommended_max_working_set_size,
+    location,
+    location_number,
+    max_transfer_rate,
+    peer_group_id,
+    peer_index,
+    peer_count,
+    max_buffer_length,
+    max_argument_buffer_sampler_count,
+    argument_buffers_support,
+    read_write_texture_support,
+    sparse_tile_size_in_bytes,
+    maximum_concurrent_compilation_task_count,
+    largest_vertex_amplification_count,
+    largest_rasterization_rate_map_layer_count,
+}
+
+caps_struct! {
+    /// The device's `BOOL` identity and capability answers [`IdentityCaps`] holds, one field per
+    /// selector: `None` where the platform has no answer of its own.
+    IdentityFlags: Option<bool>;
+    is_low_power,
+    is_headless,
+    is_removable,
+    has_unified_memory,
+    supports_32bit_float_filtering,
+    supports_32bit_msaa,
+    supports_query_texture_lod,
+    supports_bc_texture_compression,
+    supports_pull_model_interpolation,
+    are_barycentric_coords_supported,
+    supports_shader_barycentric_coordinates,
+    supports_dynamic_libraries,
+    supports_render_dynamic_libraries,
+    supports_raytracing,
+    supports_function_pointers,
+    supports_function_pointers_from_render,
+    supports_raytracing_from_render,
+    supports_primitive_motion_blur,
+    supports_placement_sparse,
+}
+
+/// The device's answers a guest's own `MTLDevice` gives beyond [`DeviceCaps`]: `supportsFamily:`
+/// of every family of the SDK, `supportsFeatureSet:` of every feature set, and the identity and
+/// capability getters. Only the graphics lane asks it ([`GpuDevice::identity_caps`]), once per
+/// device; core's guest ABI never reads it.
+///
+/// Each answer is the platform's own: Metal's getter on the Metal platform, the runtime's answer
+/// on the Vulkan platform. `None` is a query the platform has no answer of, which the asker must
+/// not read as support.
+///
+/// [`GpuDevice::identity_caps`]: super::device::GpuDevice::identity_caps
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct IdentityCaps {
+    /// `supportsFamily:` of each of [`SDK_FAMILIES`].
+    pub families: [Option<bool>; 20],
+    /// `supportsFeatureSet:` of each of [`FEATURE_SETS`].
+    pub feature_sets: [Option<bool>; 29],
+    /// `supportsCounterSampling:` of each of [`COUNTER_SAMPLING_POINTS`].
+    pub counter_sampling: [Option<bool>; 5],
+    /// `architecture.name`.
+    pub architecture_name: Option<String>,
+    /// The integer answers.
+    pub sizes: IdentitySizes,
+    /// The `BOOL` answers.
+    pub flags: IdentityFlags,
+}
+
 /// `r` again: its value, or its raise thrown here, as `on` says.
 fn again<T: Clone>(on: OnFault, r: &RaiseResult<T>) -> RaiseResult<T> {
     match r {

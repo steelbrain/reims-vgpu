@@ -998,11 +998,29 @@
 #define RGFX_LIBRARY_FLAG_KEYED 1
 
 // The version of the [`RgfxDeviceInfo`] layout the host writes.
-#define RGFX_DEVICE_INFO_VERSION 1
+#define RGFX_DEVICE_INFO_VERSION 2
 
-// The most bytes of a device name [`RgfxDeviceInfo`] carries; a longer name is
-// truncated (it is a display string, never read back for correctness).
-#define RGFX_DEVICE_NAME_LEN 32
+// The most bytes of a device name [`RgfxDeviceInfo`] carries: Vulkan's
+// `VK_MAX_PHYSICAL_DEVICE_NAME_SIZE`, so no host GPU's name is cut short.
+#define RGFX_DEVICE_NAME_LEN 256
+
+// The most bytes of the device's `architecture.name` [`RgfxDeviceInfo`] carries.
+#define RGFX_DEVICE_ARCHITECTURE_NAME_LEN 64
+
+// The most families [`RgfxDeviceInfo`] answers `supportsFamily:` of.
+#define RGFX_DEVICE_INFO_FAMILIES 32
+
+// The most feature sets [`RgfxDeviceInfo`] answers `supportsFeatureSet:` of.
+#define RGFX_DEVICE_INFO_FEATURE_SETS 32
+
+// The integer identity answers [`RgfxDeviceInfo::sizes`] holds.
+#define RGFX_DEVICE_INFO_SIZES 15
+
+// The `BOOL` identity answers [`RgfxDeviceInfo::identity_flags`] holds.
+#define RGFX_DEVICE_INFO_IDENTITY_FLAGS 19
+
+// The counter sampling points [`RgfxDeviceInfo::counter_sampling`] answers.
+#define RGFX_DEVICE_INFO_COUNTER_POINTS 5
 
 // A pipeline reflection reply's status: the pipeline was created.
 #define RGFX_PIPELINE_OK 0
@@ -2097,17 +2115,28 @@ typedef struct {
 } RgfxDepthStencilCreate;
 
 // The device-info caps blob the host writes once at device init, read by the
-// guest bundle before it makes any queue. It mirrors the host device's
-// capabilities (every value Metal or metal2vulkan answers for a device that
-// does not change while the device lives); the bundle's `MTLDevice` answers
-// `supportsFamily:`, the limits and the feature queries from it. A feature the
-// host platform cannot answer (a runtime gap) reads 0 here — never a spurious
-// yes. This is a flat caps page, not a ring message.
+// guest bundle before it makes any queue. It holds every answer of the guest's
+// `MTLDevice` that does not change while the device lives: the host device's
+// capabilities (what Metal or metal2vulkan answers), but where the lane's own
+// device answers otherwise (the host's `device_info` table says where). The
+// bundle answers `supportsFamily:`, `supportsFeatureSet:`, the identity, the
+// limits and the feature queries from it. A query the host platform cannot
+// answer (a runtime gap) reads 0 here, never a spurious yes. This is a flat
+// caps page, not a ring message.
 typedef struct {
   // [`RGFX_DEVICE_INFO_VERSION`].
   uint32_t version;
   // The bytes of `name` in use, at most [`RGFX_DEVICE_NAME_LEN`].
   uint32_t name_len;
+  // The bytes of `architecture_name` in use, at most
+  // [`RGFX_DEVICE_ARCHITECTURE_NAME_LEN`]; 0 where the host has no answer.
+  uint32_t architecture_name_len;
+  // The entries of `family_values` and `family_answers` in use.
+  uint32_t family_count;
+  // The entries of `feature_set_values` and `feature_set_answers` in use.
+  uint32_t feature_set_count;
+  // Zero.
+  uint32_t reserved_14;
   // `registryID`.
   uint64_t registry_id;
   // `gpuCoreCount`, or 0 when the device does not answer it.
@@ -2125,9 +2154,20 @@ typedef struct {
   // (`device_linear_texture_alignment_bytes` first, `max_viewport_count`
   // last); the host fills them in that order.
   uint64_t limits[27];
-  // `supportsFamily:` of each of the 7 families the host asks (Apple5..Apple10
-  // then -1009), 1 or 0 by position; a gap reads 0.
-  uint8_t families[7];
+  // The integer identity answers, in the host `IdentitySizes` field order
+  // (`recommended_max_working_set_size` first,
+  // `largest_rasterization_rate_map_layer_count` last); 0 on a gap.
+  uint64_t sizes[RGFX_DEVICE_INFO_SIZES];
+  // The raw `MTLGPUFamily` values `family_answers` answers, by position.
+  int64_t family_values[RGFX_DEVICE_INFO_FAMILIES];
+  // The raw `MTLFeatureSet` values `feature_set_answers` answers, by position.
+  uint64_t feature_set_values[RGFX_DEVICE_INFO_FEATURE_SETS];
+  // `supportsFamily:` of each of `family_values`, 1 or 0; a family the blob does
+  // not list names no family the host knows, and is no.
+  uint8_t family_answers[RGFX_DEVICE_INFO_FAMILIES];
+  // `supportsFeatureSet:` of each of `feature_set_values`, 1 or 0; a feature set
+  // the blob does not list is no.
+  uint8_t feature_set_answers[RGFX_DEVICE_INFO_FEATURE_SETS];
   // `supportsTextureSampleCount:` of 1, 2, 4, 8 by position; a gap reads 0.
   uint8_t sample_counts[4];
   // `supportsPrimitiveType:` of 0..10 by position; a gap reads 0.
@@ -2138,8 +2178,20 @@ typedef struct {
   // (`are_raster_order_groups_supported` first, `supports_tile_shaders` last),
   // 1 or 0 by position.
   uint8_t flags[25];
+  // The `BOOL` identity answers, in the host `IdentityFlags` field order
+  // (`is_low_power` first, `supports_placement_sparse` last), 1 or 0 by
+  // position; a gap reads 0.
+  uint8_t identity_flags[RGFX_DEVICE_INFO_IDENTITY_FLAGS];
+  // `supportsCounterSampling:` of the stage, draw, dispatch, tile and blit
+  // boundaries by position; a gap reads 0.
+  uint8_t counter_sampling[RGFX_DEVICE_INFO_COUNTER_POINTS];
+  // Zero.
+  uint8_t reserved_431[7];
   // The device `name`, UTF-8, `name_len` bytes used, the rest 0.
   uint8_t name[RGFX_DEVICE_NAME_LEN];
+  // The device's `architecture.name`, UTF-8, `architecture_name_len` bytes
+  // used, the rest 0.
+  uint8_t architecture_name[RGFX_DEVICE_ARCHITECTURE_NAME_LEN];
 } RgfxDeviceInfo;
 
 // `DISPLAY_CHANGED`: what the display offers has changed; the guest asks `GET_DISPLAYS` again.

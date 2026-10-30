@@ -18,6 +18,8 @@
 #include <unistd.h>
 
 #include <IOKit/IOKitLib.h>
+#include <objc/message.h>
+#include <objc/runtime.h>
 
 #include <cstring>
 #include <memory>
@@ -182,19 +184,34 @@ void rgfxDeviceDoorbell(void *context, uint32_t ring_id)
 }
 } // namespace
 
-// MTLGPUFamily raw values, compared numerically so the build does not depend on
-// which Apple* families this SDK happens to name. The -1009 pseudo-family is the
-// device-info bit the host reports among the families (AGENTS.md).
-// measured: macOS 27 Metal.framework.
-namespace {
-constexpr long kGpuFamilyApple5 = 1005;
-constexpr long kGpuFamilyApple6 = 1006;
-constexpr long kGpuFamilyApple7 = 1007;
-constexpr long kGpuFamilyApple8 = 1008;
-constexpr long kGpuFamilyApple9 = 1009;
-constexpr long kGpuFamilyApple10 = 1010;
-constexpr long kGpuFamilyMinus1009 = -1009;
-} // namespace
+// The device's `architecture`: Metal's class, whose name is the host's answer in the caps blob.
+@interface RgfxArchitecture : MTLArchitecture
+- (instancetype)initWithArchitectureName:(NSString *)name;
+@end
+
+@implementation RgfxArchitecture {
+	NSString *_rgfxName;
+}
+
+- (instancetype)initWithArchitectureName:(NSString *)name
+{
+	self = [super init];
+	if (self)
+		_rgfxName = [name copy];
+	return self;
+}
+
+- (NSString *)name
+{
+	return _rgfxName;
+}
+
+- (id)copyWithZone:(NSZone *)zone
+{
+	(void)zone;
+	return self; // immutable
+}
+@end
 
 @implementation RgfxMetalDevice {
 	RgfxCaps _caps;              // host device caps; invalid until the region is read
@@ -434,49 +451,74 @@ constexpr long kGpuFamilyMinus1009 = -1009;
 	return MTLSizeMake(1024, 1024, 1024);
 }
 
+// Every identity and capability getter below answers the caps blob's value, which the host
+// writes from its platform's answers (and the lane's, where its device can do less); 0 or NO
+// where the blob is invalid or the host has no answer.
+
+- (MTLArchitecture *)architecture
+{
+	if (_caps.valid() && _caps.architectureName()[0] != '\0') {
+		NSString *name = [NSString stringWithUTF8String:_caps.architectureName()];
+		return [[RgfxArchitecture alloc] initWithArchitectureName:name];
+	}
+	// No answer from the host: the base's own, where it has one, else an empty name.
+	Class base = class_getSuperclass([RgfxMetalDevice class]);
+	if (class_getInstanceMethod(base, @selector(architecture)) != nullptr) {
+		struct objc_super sup = {self, base};
+		return ((MTLArchitecture * (*)(struct objc_super *, SEL)) objc_msgSendSuper)(
+		    &sup, @selector(architecture));
+	}
+	return [[RgfxArchitecture alloc] initWithArchitectureName:@""];
+}
+
 - (BOOL)hasUnifiedMemory
 {
-	return YES; // the guest's GPU memory is the host's; always unified
+	return _caps.valid() && _caps.identityFlag(kRgfxIdentityHasUnifiedMemory);
 }
 
 - (BOOL)isLowPower
 {
-	return NO;
+	return _caps.valid() && _caps.identityFlag(kRgfxIdentityIsLowPower);
 }
 
 - (BOOL)isHeadless
 {
-	return NO;
+	return _caps.valid() && _caps.identityFlag(kRgfxIdentityIsHeadless);
 }
 
 - (BOOL)isRemovable
 {
-	return NO;
+	return _caps.valid() && _caps.identityFlag(kRgfxIdentityIsRemovable);
 }
 
 - (MTLDeviceLocation)location
 {
-	return MTLDeviceLocationBuiltIn;
+	return static_cast<MTLDeviceLocation>(_caps.size(kRgfxSizeLocation));
 }
 
 - (NSUInteger)locationNumber
 {
-	return 0;
+	return _caps.size(kRgfxSizeLocationNumber);
+}
+
+- (uint64_t)maxTransferRate
+{
+	return _caps.size(kRgfxSizeMaxTransferRate);
 }
 
 - (uint64_t)peerGroupID
 {
-	return 0;
+	return _caps.size(kRgfxSizePeerGroupId);
 }
 
 - (uint32_t)peerIndex
 {
-	return 0;
+	return static_cast<uint32_t>(_caps.size(kRgfxSizePeerIndex));
 }
 
 - (uint32_t)peerCount
 {
-	return 0;
+	return static_cast<uint32_t>(_caps.size(kRgfxSizePeerCount));
 }
 
 - (NSUInteger)currentAllocatedSize
@@ -486,17 +528,19 @@ constexpr long kGpuFamilyMinus1009 = -1009;
 
 - (uint64_t)recommendedMaxWorkingSetSize
 {
-	// Placeholder until the host device-info carries it; a conservative 1 GiB so
-	// clients that size work against it do not over-commit.
-	return 1ull << 30;
+	return _caps.size(kRgfxSizeRecommendedMaxWorkingSetSize);
+}
+
+- (NSUInteger)maximumConcurrentCompilationTaskCount
+{
+	return _caps.size(kRgfxSizeMaximumConcurrentCompilationTaskCount);
 }
 
 // --- limits (RgfxCaps) -------------------------------------------------------
 
 - (NSUInteger)maxBufferLength
 {
-	// Not yet a field in the caps blob; a safe large default until it is carried.
-	return 1ull << 32;
+	return _caps.size(kRgfxSizeMaxBufferLength);
 }
 
 - (NSUInteger)maxThreadgroupMemoryLength
@@ -506,14 +550,22 @@ constexpr long kGpuFamilyMinus1009 = -1009;
 
 - (NSUInteger)maxArgumentBufferSamplerCount
 {
-	// Not yet in the caps blob; Metal's common floor.
-	return 16;
+	return _caps.size(kRgfxSizeMaxArgumentBufferSamplerCount);
 }
 
 - (MTLArgumentBuffersTier)argumentBuffersSupport
 {
-	// Not yet in the caps blob; Apple-family GPUs are Tier 2.
-	return MTLArgumentBuffersTier2;
+	return static_cast<MTLArgumentBuffersTier>(_caps.size(kRgfxSizeArgumentBuffersSupport));
+}
+
+- (MTLReadWriteTextureTier)readWriteTextureSupport
+{
+	return static_cast<MTLReadWriteTextureTier>(_caps.size(kRgfxSizeReadWriteTextureSupport));
+}
+
+- (NSUInteger)sparseTileSizeInBytes
+{
+	return _caps.size(kRgfxSizeSparseTileSizeInBytes);
 }
 
 // --- feature flags (RgfxCaps) ------------------------------------------------
@@ -533,37 +585,108 @@ constexpr long kGpuFamilyMinus1009 = -1009;
 	return _caps.valid() && _caps.flag(kRgfxFlagIsDepth24Stencil8PixelFormatSupported);
 }
 
+- (BOOL)supports32BitFloatFiltering
+{
+	return _caps.identityFlag(kRgfxIdentitySupports32BitFloatFiltering);
+}
+
+- (BOOL)supports32BitMSAA
+{
+	return _caps.identityFlag(kRgfxIdentitySupports32BitMSAA);
+}
+
+- (BOOL)supportsQueryTextureLOD
+{
+	return _caps.identityFlag(kRgfxIdentitySupportsQueryTextureLOD);
+}
+
+- (BOOL)supportsBCTextureCompression
+{
+	return _caps.identityFlag(kRgfxIdentitySupportsBCTextureCompression);
+}
+
+- (BOOL)supportsPullModelInterpolation
+{
+	return _caps.identityFlag(kRgfxIdentitySupportsPullModelInterpolation);
+}
+
+- (BOOL)areBarycentricCoordsSupported
+{
+	return _caps.identityFlag(kRgfxIdentityAreBarycentricCoordsSupported);
+}
+
+- (BOOL)supportsShaderBarycentricCoordinates
+{
+	return _caps.identityFlag(kRgfxIdentitySupportsShaderBarycentricCoordinates);
+}
+
+- (BOOL)supportsDynamicLibraries
+{
+	return _caps.identityFlag(kRgfxIdentitySupportsDynamicLibraries);
+}
+
+- (BOOL)supportsRenderDynamicLibraries
+{
+	return _caps.identityFlag(kRgfxIdentitySupportsRenderDynamicLibraries);
+}
+
+- (BOOL)supportsRaytracing
+{
+	return _caps.identityFlag(kRgfxIdentitySupportsRaytracing);
+}
+
+- (BOOL)supportsFunctionPointers
+{
+	return _caps.identityFlag(kRgfxIdentitySupportsFunctionPointers);
+}
+
+- (BOOL)supportsFunctionPointersFromRender
+{
+	return _caps.identityFlag(kRgfxIdentitySupportsFunctionPointersFromRender);
+}
+
+- (BOOL)supportsRaytracingFromRender
+{
+	return _caps.identityFlag(kRgfxIdentitySupportsRaytracingFromRender);
+}
+
+- (BOOL)supportsPrimitiveMotionBlur
+{
+	return _caps.identityFlag(kRgfxIdentitySupportsPrimitiveMotionBlur);
+}
+
+- (BOOL)supportsPlacementSparse
+{
+	return _caps.identityFlag(kRgfxIdentitySupportsPlacementSparse);
+}
+
 - (BOOL)supportsFamily:(MTLGPUFamily)gpuFamily
 {
-	if (!_caps.valid()) {
-		return NO;
-	}
-	switch (static_cast<long>(gpuFamily)) {
-	case kGpuFamilyApple5:
-		return _caps.supportsFamily(kRgfxFamilyApple5);
-	case kGpuFamilyApple6:
-		return _caps.supportsFamily(kRgfxFamilyApple6);
-	case kGpuFamilyApple7:
-		return _caps.supportsFamily(kRgfxFamilyApple7);
-	case kGpuFamilyApple8:
-		return _caps.supportsFamily(kRgfxFamilyApple8);
-	case kGpuFamilyApple9:
-		return _caps.supportsFamily(kRgfxFamilyApple9);
-	case kGpuFamilyApple10:
-		return _caps.supportsFamily(kRgfxFamilyApple10);
-	case kGpuFamilyMinus1009:
-		return _caps.supportsFamily(kRgfxFamilyMinus1009);
-	default:
-		return NO;
-	}
+	// By raw value: the blob lists every family of the host's SDK and -1009, the device-info
+	// bit the host reports among them; any other value names no family, and is no.
+	return _caps.supportsFamily(static_cast<int64_t>(gpuFamily));
 }
 
 - (BOOL)supportsFeatureSet:(MTLFeatureSet)featureSet
 {
-	// Feature sets are the legacy identity; families (above) are the live path and
-	// what the host caps blob carries. Report none.
-	(void)featureSet;
-	return NO;
+	return _caps.supportsFeatureSet(static_cast<uint64_t>(featureSet));
+}
+
+- (BOOL)supportsCounterSampling:(MTLCounterSamplingPoint)samplingPoint
+{
+	return _caps.supportsCounterSampling(static_cast<uint64_t>(samplingPoint));
+}
+
+- (BOOL)supportsVertexAmplificationCount:(NSUInteger)count
+{
+	// Metal takes every count from 0 up to its largest.
+	uint64_t largest = _caps.valid() ? _caps.size(kRgfxSizeLargestVertexAmplificationCount) : 1;
+	return count <= largest;
+}
+
+- (BOOL)supportsRasterizationRateMapWithLayerCount:(NSUInteger)layerCount
+{
+	return layerCount >= 1 && layerCount <= _caps.size(kRgfxSizeLargestRasterizationRateMapLayerCount);
 }
 
 - (BOOL)supportsTextureSampleCount:(NSUInteger)sampleCount

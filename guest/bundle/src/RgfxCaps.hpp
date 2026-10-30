@@ -4,12 +4,13 @@
  * device's region (docs/graphics-kext/design.md, Decided 10; the host filler is
  * crates/reims-vgpu/src/graphics/device_info.rs).
  *
- * The blob mirrors every value Metal or the Vulkan platform answers for a device
- * that does not change while the device lives. The bundle's MTLDevice answers
- * supportsFamily:, the limits and the feature queries from here, so the guest
- * sees exactly the host device's answers. A feature the host platform cannot
- * answer (a runtime gap) is 0 in the blob and so reads unsupported here, never a
- * spurious yes (the owner's rule).
+ * The blob holds every value Metal or the Vulkan platform answers for a device
+ * that does not change while the device lives, but where the lane's own device
+ * answers otherwise (the host's device_info.rs says where). The bundle's
+ * MTLDevice answers supportsFamily:, supportsFeatureSet:, its identity, the
+ * limits and the feature queries from here, so the guest sees the host's
+ * answers. A feature the host platform cannot answer (a runtime gap) is 0 in the
+ * blob and so reads unsupported here, never a spurious yes (the owner's rule).
  *
  * The enum order is the host's field order in device_info.rs: this file names
  * each slot so the Metal shell reads caps by name, never by a magic index. This
@@ -22,18 +23,6 @@
 #include <cstdint>
 
 #include "reims_graphics_wire.h"
-
-/// The 7 GPU families the host asks `supportsFamily:` of, in the blob's order.
-enum RgfxFamily {
-	kRgfxFamilyApple5 = 0,
-	kRgfxFamilyApple6,
-	kRgfxFamilyApple7,
-	kRgfxFamilyApple8,
-	kRgfxFamilyApple9,
-	kRgfxFamilyApple10,
-	kRgfxFamilyMinus1009, // the -1009 family bit
-	kRgfxFamilyCount
-};
 
 /// The 27 NSUInteger limits, in the host `Limits` field order.
 enum RgfxLimit {
@@ -97,6 +86,50 @@ enum RgfxFlag {
 	kRgfxFlagCount
 };
 
+/// The 15 integer identity answers, in the host `IdentitySizes` field order.
+enum RgfxSize {
+	kRgfxSizeRecommendedMaxWorkingSetSize = 0,
+	kRgfxSizeLocation,
+	kRgfxSizeLocationNumber,
+	kRgfxSizeMaxTransferRate,
+	kRgfxSizePeerGroupId,
+	kRgfxSizePeerIndex,
+	kRgfxSizePeerCount,
+	kRgfxSizeMaxBufferLength,
+	kRgfxSizeMaxArgumentBufferSamplerCount,
+	kRgfxSizeArgumentBuffersSupport,
+	kRgfxSizeReadWriteTextureSupport,
+	kRgfxSizeSparseTileSizeInBytes,
+	kRgfxSizeMaximumConcurrentCompilationTaskCount,
+	kRgfxSizeLargestVertexAmplificationCount,
+	kRgfxSizeLargestRasterizationRateMapLayerCount,
+	kRgfxSizeCount
+};
+
+/// The 19 BOOL identity answers, in the host `IdentityFlags` field order.
+enum RgfxIdentityFlag {
+	kRgfxIdentityIsLowPower = 0,
+	kRgfxIdentityIsHeadless,
+	kRgfxIdentityIsRemovable,
+	kRgfxIdentityHasUnifiedMemory,
+	kRgfxIdentitySupports32BitFloatFiltering,
+	kRgfxIdentitySupports32BitMSAA,
+	kRgfxIdentitySupportsQueryTextureLOD,
+	kRgfxIdentitySupportsBCTextureCompression,
+	kRgfxIdentitySupportsPullModelInterpolation,
+	kRgfxIdentityAreBarycentricCoordsSupported,
+	kRgfxIdentitySupportsShaderBarycentricCoordinates,
+	kRgfxIdentitySupportsDynamicLibraries,
+	kRgfxIdentitySupportsRenderDynamicLibraries,
+	kRgfxIdentitySupportsRaytracing,
+	kRgfxIdentitySupportsFunctionPointers,
+	kRgfxIdentitySupportsFunctionPointersFromRender,
+	kRgfxIdentitySupportsRaytracingFromRender,
+	kRgfxIdentitySupportsPrimitiveMotionBlur,
+	kRgfxIdentitySupportsPlacementSparse,
+	kRgfxIdentityCount
+};
+
 class RgfxCaps {
 public:
 	RgfxCaps();
@@ -109,8 +142,18 @@ public:
 	/// Whether a caps blob of a known version has been loaded.
 	bool valid() const { return m_valid; }
 
-	/// `supportsFamily:` of `family`.
-	bool supportsFamily(RgfxFamily family) const;
+	/// `supportsFamily:` of the raw `MTLGPUFamily` `family`: the blob's answer, and no for a
+	/// value it does not list (one that names no family the host knows).
+	bool supportsFamily(int64_t family) const;
+	/// `supportsFeatureSet:` of the raw `MTLFeatureSet` `set`, as `supportsFamily:`.
+	bool supportsFeatureSet(uint64_t set) const;
+	/// `supportsCounterSampling:` of the raw `MTLCounterSamplingPoint` `point` (0..4; any
+	/// other is no).
+	bool supportsCounterSampling(uint64_t point) const;
+	/// One of the 15 integer identity answers.
+	uint64_t size(RgfxSize which) const;
+	/// One of the 19 BOOL identity answers.
+	bool identityFlag(RgfxIdentityFlag which) const;
 	/// `supportsTextureSampleCount:` of `count` (1, 2, 4 or 8; any other is no).
 	bool supportsSampleCount(uint32_t count) const;
 	/// `supportsPrimitiveType:` of the raw `MTLPrimitiveType` `type` (0..9).
@@ -132,11 +175,14 @@ public:
 	uint64_t maxVertexAmplificationCount() const { return m_info.max_vertex_amplification_count; }
 	/// The device name, NUL-terminated (a display string, never read back).
 	const char *name() const { return m_name; }
+	/// The device's `architecture.name`, NUL-terminated; empty where the host has none.
+	const char *architectureName() const { return m_architectureName; }
 
 private:
 	bool m_valid;
 	RgfxDeviceInfo m_info;
 	char m_name[RGFX_DEVICE_NAME_LEN + 1];
+	char m_architectureName[RGFX_DEVICE_ARCHITECTURE_NAME_LEN + 1];
 };
 
 #endif // RGFX_CAPS_HPP_

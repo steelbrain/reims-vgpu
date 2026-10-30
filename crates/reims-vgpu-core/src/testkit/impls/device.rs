@@ -18,7 +18,7 @@ use super::rate_map::RateMapModel;
 use super::resource::PipelineModel;
 use super::{Backing, ResolveIds, common, new_buffer, new_state, new_texture};
 use crate::num;
-use crate::platform::caps::{self, DeviceCaps};
+use crate::platform::caps::{self, DeviceCaps, IdentityCaps, IdentityFlags, IdentitySizes};
 use crate::platform::device::*;
 use crate::platform::types::{
     MtlSize, NsErrorText, PixelFormatInfo, SizeAndAlign, TextureLevelInfo, TextureLevelQuery,
@@ -535,6 +535,11 @@ impl GpuDevice<FakePlatform> for Fk<kind::Device> {
         self.with_model(|m: &DeviceModel| m.caps.clone())
     }
 
+    /// [`fake_identity_caps`], neither logged nor scripted.
+    fn identity_caps(&self) -> IdentityCaps {
+        fake_identity_caps()
+    }
+
     /// The value's options folded as Metal's buffer descriptor folds them ([`fold_options`]), its
     /// contents, pin and deallocator.
     fn new_buffer(
@@ -779,5 +784,64 @@ pub fn fake_caps() -> DeviceCaps {
             align: 0x4000,
         }),
         min_linear_alignment_bgra8: Ok(16),
+    }
+}
+
+/// The fake device's identity answers: those of an Apple M3 Max under macOS 27 (measured with
+/// `guest/bundle/tools/metal_enum.m`), whose families are Apple1 to Apple9, Mac1 and Mac2, the
+/// Common families and Metal3 and Metal4, and whose feature sets are every iOS one and the macOS
+/// ones but `macOS_ReadWriteTextureTier2` (10002). The architecture's name is the fake's own.
+pub fn fake_identity_caps() -> IdentityCaps {
+    let families = caps::SDK_FAMILIES.map(|f| {
+        Some(matches!(
+            f,
+            1001..=1009 | 2001 | 2002 | 3001..=3003 | 5001 | 5002
+        ))
+    });
+    let feature_sets =
+        caps::FEATURE_SETS.map(|fs| Some(fs <= 16 || matches!(fs, 10000 | 10001 | 10003..=10005)));
+    IdentityCaps {
+        families,
+        feature_sets,
+        counter_sampling: caps::COUNTER_SAMPLING_POINTS.map(|p| Some(p == 0)),
+        architecture_name: Some(String::from("fake_gpu")),
+        sizes: IdentitySizes {
+            recommended_max_working_set_size: Some(0xcf5c_2c000),
+            location: Some(0),
+            location_number: Some(0),
+            max_transfer_rate: Some(0),
+            peer_group_id: Some(0),
+            peer_index: Some(0),
+            peer_count: Some(0),
+            max_buffer_length: Some(0x9_b852_0000),
+            max_argument_buffer_sampler_count: Some(500_000),
+            argument_buffers_support: Some(1),
+            read_write_texture_support: Some(2),
+            sparse_tile_size_in_bytes: Some(0x4000),
+            maximum_concurrent_compilation_task_count: Some(16),
+            largest_vertex_amplification_count: Some(8),
+            largest_rasterization_rate_map_layer_count: Some(2),
+        },
+        flags: IdentityFlags {
+            is_low_power: Some(false),
+            is_headless: Some(false),
+            is_removable: Some(false),
+            has_unified_memory: Some(true),
+            supports_32bit_float_filtering: Some(true),
+            supports_32bit_msaa: Some(true),
+            supports_query_texture_lod: Some(true),
+            supports_bc_texture_compression: Some(true),
+            supports_pull_model_interpolation: Some(true),
+            are_barycentric_coords_supported: Some(true),
+            supports_shader_barycentric_coordinates: Some(true),
+            supports_dynamic_libraries: Some(true),
+            supports_render_dynamic_libraries: Some(true),
+            supports_raytracing: Some(true),
+            supports_function_pointers: Some(true),
+            supports_function_pointers_from_render: Some(true),
+            supports_raytracing_from_render: Some(true),
+            supports_primitive_motion_blur: Some(true),
+            supports_placement_sparse: Some(true),
+        },
     }
 }

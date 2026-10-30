@@ -149,7 +149,7 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             let gpu_device = platform.metal_device(None).ok_or(Error::HostResources)?;
             region.write(
                 RGFX_DEVICE_INFO_OFFSET,
-                device_info(&gpu_device.caps()).as_bytes(),
+                device_info(&gpu_device.caps(), gpu_device.identity_caps()).as_bytes(),
             );
             let mut decoder = GraphicsDecoder::new(Arc::clone(&platform), Arc::clone(&region));
             // `Managed` resources are two copies, which hold Metal's contract on any GPU, until

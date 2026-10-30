@@ -1323,28 +1323,55 @@ pub struct RgfxLibraryLookup {
 }
 
 /// The version of the [`RgfxDeviceInfo`] layout the host writes.
-pub const RGFX_DEVICE_INFO_VERSION: u32 = 1;
+pub const RGFX_DEVICE_INFO_VERSION: u32 = 2;
 
-/// The most bytes of a device name [`RgfxDeviceInfo`] carries; a longer name is
-/// truncated (it is a display string, never read back for correctness).
-pub const RGFX_DEVICE_NAME_LEN: usize = 32;
+/// The most bytes of a device name [`RgfxDeviceInfo`] carries: Vulkan's
+/// `VK_MAX_PHYSICAL_DEVICE_NAME_SIZE`, so no host GPU's name is cut short.
+pub const RGFX_DEVICE_NAME_LEN: usize = 256;
+
+/// The most bytes of the device's `architecture.name` [`RgfxDeviceInfo`] carries.
+pub const RGFX_DEVICE_ARCHITECTURE_NAME_LEN: usize = 64;
+
+/// The most families [`RgfxDeviceInfo`] answers `supportsFamily:` of.
+pub const RGFX_DEVICE_INFO_FAMILIES: usize = 32;
+
+/// The most feature sets [`RgfxDeviceInfo`] answers `supportsFeatureSet:` of.
+pub const RGFX_DEVICE_INFO_FEATURE_SETS: usize = 32;
+
+/// The integer identity answers [`RgfxDeviceInfo::sizes`] holds.
+pub const RGFX_DEVICE_INFO_SIZES: usize = 15;
+
+/// The `BOOL` identity answers [`RgfxDeviceInfo::identity_flags`] holds.
+pub const RGFX_DEVICE_INFO_IDENTITY_FLAGS: usize = 19;
+
+/// The counter sampling points [`RgfxDeviceInfo::counter_sampling`] answers.
+pub const RGFX_DEVICE_INFO_COUNTER_POINTS: usize = 5;
 
 /// The device-info caps blob the host writes once at device init, read by the
-/// guest bundle before it makes any queue. It mirrors the host device's
-/// capabilities (every value Metal or metal2vulkan answers for a device that
-/// does not change while the device lives); the bundle's `MTLDevice` answers
-/// `supportsFamily:`, the limits and the feature queries from it. A feature the
-/// host platform cannot answer (a runtime gap) reads 0 here — never a spurious
-/// yes. This is a flat caps page, not a ring message.
+/// guest bundle before it makes any queue. It holds every answer of the guest's
+/// `MTLDevice` that does not change while the device lives: the host device's
+/// capabilities (what Metal or metal2vulkan answers), but where the lane's own
+/// device answers otherwise (the host's `device_info` table says where). The
+/// bundle answers `supportsFamily:`, `supportsFeatureSet:`, the identity, the
+/// limits and the feature queries from it. A query the host platform cannot
+/// answer (a runtime gap) reads 0 here, never a spurious yes. This is a flat
+/// caps page, not a ring message.
 #[repr(C)]
-#[derive(
-    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
-)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout)]
 pub struct RgfxDeviceInfo {
     /// [`RGFX_DEVICE_INFO_VERSION`].
     pub version: u32,
     /// The bytes of `name` in use, at most [`RGFX_DEVICE_NAME_LEN`].
     pub name_len: u32,
+    /// The bytes of `architecture_name` in use, at most
+    /// [`RGFX_DEVICE_ARCHITECTURE_NAME_LEN`]; 0 where the host has no answer.
+    pub architecture_name_len: u32,
+    /// The entries of `family_values` and `family_answers` in use.
+    pub family_count: u32,
+    /// The entries of `feature_set_values` and `feature_set_answers` in use.
+    pub feature_set_count: u32,
+    /// Zero.
+    pub reserved_14: u32,
     /// `registryID`.
     pub registry_id: u64,
     /// `gpuCoreCount`, or 0 when the device does not answer it.
@@ -1362,9 +1389,20 @@ pub struct RgfxDeviceInfo {
     /// (`device_linear_texture_alignment_bytes` first, `max_viewport_count`
     /// last); the host fills them in that order.
     pub limits: [u64; 27],
-    /// `supportsFamily:` of each of the 7 families the host asks (Apple5..Apple10
-    /// then -1009), 1 or 0 by position; a gap reads 0.
-    pub families: [u8; 7],
+    /// The integer identity answers, in the host `IdentitySizes` field order
+    /// (`recommended_max_working_set_size` first,
+    /// `largest_rasterization_rate_map_layer_count` last); 0 on a gap.
+    pub sizes: [u64; RGFX_DEVICE_INFO_SIZES],
+    /// The raw `MTLGPUFamily` values `family_answers` answers, by position.
+    pub family_values: [i64; RGFX_DEVICE_INFO_FAMILIES],
+    /// The raw `MTLFeatureSet` values `feature_set_answers` answers, by position.
+    pub feature_set_values: [u64; RGFX_DEVICE_INFO_FEATURE_SETS],
+    /// `supportsFamily:` of each of `family_values`, 1 or 0; a family the blob does
+    /// not list names no family the host knows, and is no.
+    pub family_answers: [u8; RGFX_DEVICE_INFO_FAMILIES],
+    /// `supportsFeatureSet:` of each of `feature_set_values`, 1 or 0; a feature set
+    /// the blob does not list is no.
+    pub feature_set_answers: [u8; RGFX_DEVICE_INFO_FEATURE_SETS],
     /// `supportsTextureSampleCount:` of 1, 2, 4, 8 by position; a gap reads 0.
     pub sample_counts: [u8; 4],
     /// `supportsPrimitiveType:` of 0..10 by position; a gap reads 0.
@@ -1375,8 +1413,27 @@ pub struct RgfxDeviceInfo {
     /// (`are_raster_order_groups_supported` first, `supports_tile_shaders` last),
     /// 1 or 0 by position.
     pub flags: [u8; 25],
+    /// The `BOOL` identity answers, in the host `IdentityFlags` field order
+    /// (`is_low_power` first, `supports_placement_sparse` last), 1 or 0 by
+    /// position; a gap reads 0.
+    pub identity_flags: [u8; RGFX_DEVICE_INFO_IDENTITY_FLAGS],
+    /// `supportsCounterSampling:` of the stage, draw, dispatch, tile and blit
+    /// boundaries by position; a gap reads 0.
+    pub counter_sampling: [u8; RGFX_DEVICE_INFO_COUNTER_POINTS],
+    /// Zero.
+    pub reserved_431: [u8; 7],
     /// The device `name`, UTF-8, `name_len` bytes used, the rest 0.
     pub name: [u8; RGFX_DEVICE_NAME_LEN],
+    /// The device's `architecture.name`, UTF-8, `architecture_name_len` bytes
+    /// used, the rest 0.
+    pub architecture_name: [u8; RGFX_DEVICE_ARCHITECTURE_NAME_LEN],
+}
+
+impl Default for RgfxDeviceInfo {
+    /// Every byte zero.
+    fn default() -> Self {
+        <Self as zerocopy::FromZeros>::new_zeroed()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1683,7 +1740,9 @@ const _: () = {
     assert!(size_of::<RgfxManagedTextureCreate>() == 112);
     assert!(size_of::<RgfxTextureReplaceRegion>() == 56);
     assert!(RGFX_LIBRARY_BYTES_OFFSET as usize == size_of::<RgfxLibraryCreate>());
-    assert!(size_of::<RgfxDeviceInfo>() == 376);
+    assert!(size_of::<RgfxDeviceInfo>() == 1400);
+    assert!(core::mem::offset_of!(RgfxDeviceInfo, family_answers) == 944);
+    assert!(core::mem::offset_of!(RgfxDeviceInfo, name) == 1080);
     // The device-info blob sits past the completion ring and before the allocations.
     assert!(
         RGFX_DEVICE_INFO_OFFSET
@@ -1850,14 +1909,17 @@ mod tests {
             gpu_core_count: 10,
             max_threads_per_threadgroup: [1024, 1024, 1024],
             max_vertex_amplification_count: 2,
-            families: [1, 1, 1, 1, 1, 1, 0],
+            family_count: 2,
             sample_counts: [1, 1, 1, 0],
             ..RgfxDeviceInfo::default()
         };
-        let name = b"NVIDIA GeForce RTX 5080";
+        info.family_values[..2].copy_from_slice(&[1009, -1009]);
+        info.family_answers[..2].copy_from_slice(&[1, 0]);
+        // Longer than v1's 32-byte name, which cut it short.
+        let name = b"NVIDIA GeForce RTX 5080 Laptop GPU";
         info.name[..name.len()].copy_from_slice(name);
         info.name_len = name.len() as u32;
-        assert_eq!(info.as_bytes().len(), 376);
+        assert_eq!(info.as_bytes().len(), 1400);
         assert_eq!(
             RgfxDeviceInfo::read_from_bytes(info.as_bytes()).unwrap(),
             info

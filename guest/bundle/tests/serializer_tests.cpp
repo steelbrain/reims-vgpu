@@ -200,8 +200,27 @@ void test_caps()
 	info.max_threads_per_threadgroup[1] = 512;
 	info.max_threads_per_threadgroup[2] = 64;
 	info.max_vertex_amplification_count = 2;
-	info.families[kRgfxFamilyApple5] = 1;
-	info.families[kRgfxFamilyMinus1009] = 1; // last by position
+	// The families and feature sets are looked up by value, not by position.
+	info.family_count = 3;
+	info.family_values[0] = 1005; // Apple5
+	info.family_answers[0] = 1;
+	info.family_values[1] = 1006; // Apple6, a present no
+	info.family_values[2] = -1009;
+	info.family_answers[2] = 1;
+	info.family_values[3] = 1007; // past family_count: not read
+	info.family_answers[3] = 1;
+	info.feature_set_count = 2;
+	info.feature_set_values[0] = 10005; // macOS_GPUFamily2_v1
+	info.feature_set_answers[0] = 1;
+	info.feature_set_values[1] = 10002; // macOS_ReadWriteTextureTier2, a present no
+	info.sizes[kRgfxSizeRecommendedMaxWorkingSetSize] = 1ull << 34; // first by position
+	info.sizes[kRgfxSizeLargestRasterizationRateMapLayerCount] = 2; // last by position
+	info.identity_flags[kRgfxIdentityIsLowPower] = 1;              // first by position
+	info.identity_flags[kRgfxIdentitySupportsPlacementSparse] = 1; // last by position
+	info.counter_sampling[0] = 1; // at stage boundaries
+	const char *arch = "test_arch";
+	info.architecture_name_len = static_cast<uint32_t>(std::strlen(arch));
+	std::memcpy(info.architecture_name, arch, info.architecture_name_len);
 	info.sample_counts[0] = 1;               // count 1
 	info.sample_counts[2] = 1;               // count 4
 	info.primitive_types[3] = 1;
@@ -210,7 +229,8 @@ void test_caps()
 	info.limits[kRgfxLimitMaxViewportCount] = 16; // last by position
 	info.flags[kRgfxFlagAreRasterOrderGroupsSupported] = 1; // first by position
 	info.flags[kRgfxFlagSupportsTileShaders] = 1;           // last by position
-	const char *nm = "Test GPU";
+	// Longer than the 32 bytes the first layout held.
+	const char *nm = "NVIDIA GeForce RTX 5080 Laptop GPU";
 	info.name_len = static_cast<uint32_t>(std::strlen(nm));
 	std::memcpy(info.name, nm, info.name_len);
 
@@ -221,9 +241,24 @@ void test_caps()
 	CHECK(caps.maxThreadsPerThreadgroup(0) == 1024);
 	CHECK(caps.maxThreadsPerThreadgroup(2) == 64);
 	CHECK(caps.maxVertexAmplificationCount() == 2);
-	CHECK(caps.supportsFamily(kRgfxFamilyApple5));
-	CHECK(caps.supportsFamily(kRgfxFamilyMinus1009));
-	CHECK(!caps.supportsFamily(kRgfxFamilyApple6));
+	CHECK(caps.supportsFamily(1005));
+	CHECK(caps.supportsFamily(-1009));
+	CHECK(!caps.supportsFamily(1006));
+	CHECK(!caps.supportsFamily(1007)); // listed past the count
+	CHECK(!caps.supportsFamily(42));   // names no family
+	CHECK(caps.supportsFeatureSet(10005));
+	CHECK(!caps.supportsFeatureSet(10002));
+	CHECK(!caps.supportsFeatureSet(0)); // not listed
+	CHECK(caps.size(kRgfxSizeRecommendedMaxWorkingSetSize) == 1ull << 34);
+	CHECK(caps.size(kRgfxSizeLargestRasterizationRateMapLayerCount) == 2);
+	CHECK(caps.size(kRgfxSizeMaxBufferLength) == 0); // a gap reads 0
+	CHECK(caps.identityFlag(kRgfxIdentityIsLowPower));
+	CHECK(caps.identityFlag(kRgfxIdentitySupportsPlacementSparse));
+	CHECK(!caps.identityFlag(kRgfxIdentityHasUnifiedMemory));
+	CHECK(caps.supportsCounterSampling(0));
+	CHECK(!caps.supportsCounterSampling(1));
+	CHECK(!caps.supportsCounterSampling(5));
+	CHECK(std::strcmp(caps.architectureName(), "test_arch") == 0);
 	CHECK(caps.supportsSampleCount(1));
 	CHECK(caps.supportsSampleCount(4));
 	CHECK(!caps.supportsSampleCount(2));
@@ -238,7 +273,7 @@ void test_caps()
 	CHECK(caps.flag(kRgfxFlagAreRasterOrderGroupsSupported));
 	CHECK(caps.flag(kRgfxFlagSupportsTileShaders));
 	CHECK(!caps.flag(kRgfxFlagSupportsImageBlocks));
-	CHECK(std::strcmp(caps.name(), "Test GPU") == 0);
+	CHECK(std::strcmp(caps.name(), "NVIDIA GeForce RTX 5080 Laptop GPU") == 0);
 }
 
 void test_lifecycle_messages()
