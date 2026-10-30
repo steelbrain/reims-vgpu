@@ -10,8 +10,36 @@
 
 #import "RgfxMetalDevice.h"
 
+// RGFX DIAG (Wall-2 trace; remove before merge): the guest's logd is broken, so
+// write diagnostics to a file any process (platform or not) can read.
+#include <fcntl.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <unistd.h>
+
 #include <memory>
 #include <vector>
+
+namespace {
+// RGFX DIAG (remove before merge): append one line to /tmp/rgfx-diag.log.
+void rgfxDiag(const char *fmt, ...)
+{
+	char line[512];
+	va_list ap;
+	va_start(ap, fmt);
+	int n = vsnprintf(line, sizeof(line), fmt, ap);
+	va_end(ap);
+	if (n <= 0)
+		return;
+	if (static_cast<size_t>(n) > sizeof(line))
+		n = sizeof(line);
+	int fd = open("/tmp/rgfx-diag.log", O_WRONLY | O_CREAT | O_APPEND, 0666);
+	if (fd < 0)
+		return;
+	(void)write(fd, line, static_cast<size_t>(n));
+	close(fd);
+}
+} // namespace
 
 #include "RgfxRegion.hpp"
 #include "RgfxReplyReader.hpp"
@@ -58,9 +86,35 @@ constexpr long kGpuFamilyMinus1009 = -1009;
 	uint32_t _nextRingId;        // the next queue ring's doorbell id (0 is the control ring)
 }
 
+// RGFX DIAG (Wall-2 trace; remove before merge): fires when the bundle is loaded
+// and this class is realized in the ObjC runtime. If this logs but no init below
+// does, Metal loaded the bundle but did not instantiate us by initWithAcceleratorPort
+// (wrong entry point or a pre-instantiation gate); if this never logs, the class is
+// not being realized at all.
++ (void)load
+{
+	rgfxDiag("RGFX: RgfxMetalDevice +load (class realized in runtime)\n");
+}
+
+// RGFX DIAG (remove before merge): catch a plain -init in case Metal instantiates us
+// that way rather than via initWithAcceleratorPort:.
+- (instancetype)init
+{
+	rgfxDiag("RGFX: -init called (not initWithAcceleratorPort:)\n");
+	NSLog(@"RGFX: -init called");
+	return [super init];
+}
+
 - (instancetype)initWithAcceleratorPort:(mach_port_t)port
 {
+	// RGFX DIAG (Wall-2 trace; remove before merge): confirm Metal enters our init
+	// and report whether the IOGPUMetalDevice base accepts or declines. To a file
+	// (the guest's logd is broken) plus the probe's stderr (NSLog).
+	rgfxDiag("RGFX: initWithAcceleratorPort entered, port=0x%x\n", (unsigned)port);
+	NSLog(@"RGFX: initWithAcceleratorPort entered, port=0x%x", (unsigned)port);
 	self = [super initWithAcceleratorPort:port];
+	rgfxDiag("RGFX: [super initWithAcceleratorPort] -> %s\n", self ? "non-nil" : "nil");
+	NSLog(@"RGFX: [super initWithAcceleratorPort] -> %@", self ? @"non-nil" : @"nil");
 	if (self == nil) {
 		return nil; // Apple's base declined (or the port is not ours)
 	}
@@ -77,6 +131,27 @@ constexpr long kGpuFamilyMinus1009 = -1009;
 	// from their documented defaults, and `_serializer`/`_region`/`_replyReader` are
 	// null (the resource and command-queue slices fall back while they are).
 	return self;
+}
+
+// RGFX DIAG (remove before merge): -[_MTLDevice initLimits] and other Metal bring-up code send
+// MTLDeviceSPI selectors straight to us without -respondsToSelector:; any that neither our shell
+// nor the IOGPUMetalDevice base implements hit -doesNotRecognizeSelector: and throw an
+// unhandled ObjC exception (crash). To enumerate the FULL set of missing selectors in one run
+// (instead of one crash per selector), forward every unimplemented selector here, log it, and
+// answer with a zero scalar so bring-up keeps going.
+- (NSMethodSignature *)methodSignatureForSelector:(SEL)aSelector
+{
+	NSMethodSignature *sig = [super methodSignatureForSelector:aSelector];
+	if (sig)
+		return sig;
+	rgfxDiag("RGFX: unimplemented selector (forwarded): %s\n", sel_getName(aSelector));
+	return [NSMethodSignature signatureWithObjCTypes:"Q@:"]; // assume an 8-byte scalar return
+}
+
+- (void)forwardInvocation:(NSInvocation *)anInvocation
+{
+	unsigned long long zero = 0;
+	[anInvocation setReturnValue:&zero];
 }
 
 // --- accessors the category slices route through -----------------------------

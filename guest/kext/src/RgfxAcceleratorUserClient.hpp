@@ -46,12 +46,17 @@ public:
 	                        IOExternalMethodDispatch *dispatch, OSObject *target,
 	                        void *reference) override;
 
+	// RGFX DIAG (Wall-2 trace; remove before merge): log the legacy dispatch paths.
+	IOExternalMethod *getTargetAndMethodForIndex(IOService **targetP, UInt32 index) override;
+	IOExternalTrap *getTargetAndTrapForIndex(IOService **targetP, UInt32 index) override;
+
 private:
 	static IOReturn doorbellMethod(OSObject *target, void *reference,
 	                               IOExternalMethodArguments *arguments);
 
 	task_t task;
 	RgfxAccelerator *owner;
+	UInt32 ucType; // RGFX DIAG (remove before merge): the opened user-client type
 };
 
 #endif // RGFX_ACCELERATOR_USER_CLIENT_HPP_

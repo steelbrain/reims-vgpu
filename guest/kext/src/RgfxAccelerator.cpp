@@ -110,8 +110,13 @@ void RgfxAccelerator::free()
 IOReturn RgfxAccelerator::newUserClient(task_t owningTask, void *securityID, UInt32 type,
                                         OSDictionary *properties, IOUserClient **handler)
 {
-	if (type != kRgfxAccelUserClientType)
-		return kIOReturnBadArgument;
+	// RGFX DIAG (Wall-2 trace; remove before merge): the IOGPUMetalDevice base opens a
+	// user client during initWithAcceleratorPort. Log the type it requests, and
+	// (diagnostic) accept ANY type so the base proceeds and reveals its subsequent
+	// clientMemoryForType / externalMethod handshake, instead of rejecting non-zero
+	// types up front. Only Metal's device-open path reaches this.
+	IOLog("RGFX: newUserClient type=%u task=%p (expected our type=%u)\n", type, owningTask,
+	      kRgfxAccelUserClientType);
 
 	RgfxAcceleratorUserClient *client = OSTypeAlloc(RgfxAcceleratorUserClient);
 	if (!client)

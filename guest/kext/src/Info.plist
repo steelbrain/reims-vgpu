@@ -41,8 +41,22 @@
 		</dict>
 		<key>RgfxAccelerator</key>
 		<dict>
+			<key>AcceleratorProperties</key>
+			<dict>
+				<key>IOAccelDisplayPipeCapabilities</key>
+				<dict>
+					<key>DisplayPipeSupported</key>
+					<true/>
+					<key>TransactionsSupported</key>
+					<true/>
+				</dict>
+				<key>IOMatchCategory</key>
+				<string>IOAccelerator</string>
+			</dict>
 			<key>CFBundleIdentifier</key>
 			<string>com.steelbrain.ReimsGraphics</string>
+			<key>DisplayPortCount</key>
+			<integer>1</integer>
 			<key>IOClass</key>
 			<string>RgfxAccelerator</string>
 			<key>IOMatchCategory</key>
@@ -53,10 +67,10 @@
 			<integer>30000</integer>
 			<key>IOProviderClass</key>
 			<string>IOPCIDevice</string>
-			<key>MetalPluginName</key>
-			<string>/Library/GPUBundles/reims-graphics.bundle</string>
 			<key>MetalPluginClassName</key>
 			<string>RgfxMetalDevice</string>
+			<key>MetalPluginName</key>
+			<string>reims-graphics</string>
 		</dict>
 	</dict>
 	<key>LSMinimumSystemVersion</key>
