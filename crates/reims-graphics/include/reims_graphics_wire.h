@@ -509,10 +509,10 @@ typedef struct {
   uint64_t gpu_address;
   // The heap's size in bytes.
   uint64_t size_bytes;
-  // The heap's storage/cache modes and type.
+  // `MTLResourceOptions`: storage mode, cache mode, hazard tracking.
   uint32_t options;
-  // Pads to a multiple of 8; 0.
-  uint32_t reserved_2c;
+  // `MTLHeapType` (Automatic, Placement or Sparse); widened on decode.
+  int32_t heap_type;
 } RgfxHeapCreate;
 
 // `HEAP_OVER_HOST_MEMORY`: a Shared heap of `size_bytes` over the block at
@@ -528,10 +528,10 @@ typedef struct {
   uint64_t region_offset;
   // The heap's size in bytes.
   uint64_t size_bytes;
-  // The heap's storage/cache modes and type.
+  // `MTLResourceOptions`: storage mode, cache mode, hazard tracking.
   uint32_t options;
-  // Pads to a multiple of 8; 0.
-  uint32_t reserved_34;
+  // `MTLHeapType` (Automatic, Placement or Sparse); widened on decode.
+  int32_t heap_type;
 } RgfxHeapOverHostMemory;
 
 // `BUFFER_CREATE`: a device buffer of `length` bytes at the guest-picked

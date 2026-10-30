@@ -562,10 +562,10 @@ pub struct RgfxHeapCreate {
     pub gpu_address: u64,
     /// The heap's size in bytes.
     pub size_bytes: u64,
-    /// The heap's storage/cache modes and type.
+    /// `MTLResourceOptions`: storage mode, cache mode, hazard tracking.
     pub options: u32,
-    /// Pads to a multiple of 8; 0.
-    pub reserved_2c: u32,
+    /// `MTLHeapType` (Automatic, Placement or Sparse); widened on decode.
+    pub heap_type: i32,
 }
 
 /// `HEAP_OVER_HOST_MEMORY`: a Shared heap of `size_bytes` over the block at
@@ -585,10 +585,10 @@ pub struct RgfxHeapOverHostMemory {
     pub region_offset: u64,
     /// The heap's size in bytes.
     pub size_bytes: u64,
-    /// The heap's storage/cache modes and type.
+    /// `MTLResourceOptions`: storage mode, cache mode, hazard tracking.
     pub options: u32,
-    /// Pads to a multiple of 8; 0.
-    pub reserved_34: u32,
+    /// `MTLHeapType` (Automatic, Placement or Sparse); widened on decode.
+    pub heap_type: i32,
 }
 
 /// `BUFFER_CREATE`: a device buffer of `length` bytes at the guest-picked

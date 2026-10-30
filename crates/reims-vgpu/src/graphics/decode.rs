@@ -27,19 +27,19 @@ use std::sync::Arc;
 
 use reims_graphics::wire::{
     RGFX_CMD_BUFFER_CREATE, RGFX_CMD_DEPTH_STENCIL_CREATE, RGFX_CMD_EVENT_CREATE,
-    RGFX_CMD_FENCE_CREATE, RGFX_CMD_LIBRARY_CREATE, RGFX_CMD_OBJECT_DESTROY, RGFX_CMD_QUEUE_CREATE,
-    RGFX_CMD_SAMPLER_CREATE, RGFX_CMD_SHARED_EVENT_CREATE, RGFX_CMD_TEXTURE_CREATE,
-    RGFX_CMD_TEXTURE_FROM_BUFFER, RGFX_LIBRARY_BYTES_OFFSET, RgfxBufferCreate,
-    RgfxDepthStencilCreate, RgfxLibraryCreate, RgfxMsgHeader, RgfxObjectCreate, RgfxObjectDestroy,
-    RgfxQueueCreate, RgfxSamplerCreate, RgfxSharedEventCreate, RgfxStencilDescriptor,
-    RgfxTextureCreate, RgfxTextureDescriptor, RgfxTextureFromBuffer,
+    RGFX_CMD_FENCE_CREATE, RGFX_CMD_HEAP_CREATE, RGFX_CMD_LIBRARY_CREATE, RGFX_CMD_OBJECT_DESTROY,
+    RGFX_CMD_QUEUE_CREATE, RGFX_CMD_SAMPLER_CREATE, RGFX_CMD_SHARED_EVENT_CREATE,
+    RGFX_CMD_TEXTURE_CREATE, RGFX_CMD_TEXTURE_FROM_BUFFER, RGFX_LIBRARY_BYTES_OFFSET,
+    RgfxBufferCreate, RgfxDepthStencilCreate, RgfxHeapCreate, RgfxLibraryCreate, RgfxMsgHeader,
+    RgfxObjectCreate, RgfxObjectDestroy, RgfxQueueCreate, RgfxSamplerCreate, RgfxSharedEventCreate,
+    RgfxStencilDescriptor, RgfxTextureCreate, RgfxTextureDescriptor, RgfxTextureFromBuffer,
 };
 use reims_vgpu_core::platform::Platform;
 use reims_vgpu_core::platform::device::GpuDevice;
 use reims_vgpu_core::platform::resource::Buffer;
 use reims_vgpu_core::platform::types::Swizzle;
 use reims_vgpu_core::platform::values::{
-    BufferDesc, DepthStencilDesc, OptionSet, SamplerDesc, StencilDesc, TextureDesc,
+    BufferDesc, DepthStencilDesc, HeapDesc, OptionSet, SamplerDesc, StencilDesc, TextureDesc,
 };
 use reims_vgpu_core::raise::{OnFault, RaiseResult};
 use zerocopy::FromBytes;
@@ -57,6 +57,7 @@ enum ObjHandle<P: Platform> {
     DepthStencil(P::DepthStencilState),
     Buffer(P::Buffer),
     Texture(P::Texture),
+    Heap(P::Heap),
 }
 
 /// Why a message was not carried out.
@@ -243,6 +244,25 @@ impl<P: Platform> GraphicsDecoder<P> {
                 };
                 match device.new_buffer(desc)? {
                     Some(buffer) => self.insert(m.obj_id, ObjHandle::Buffer(buffer)),
+                    None => Ok(Err(DecodeError::Refused)),
+                }
+            }
+            RGFX_CMD_HEAP_CREATE => {
+                let Some(m) = read::<RgfxHeapCreate>(message) else {
+                    return Ok(Err(DecodeError::Malformed));
+                };
+                // A device-placed heap at a guest-picked GPU address (0 lets the
+                // host choose). `heap_type` widens to the `MTLHeapType`. Heaps
+                // over host memory land with that region's decode.
+                let desc = HeapDesc {
+                    size: m.size_bytes,
+                    heap_type: m.heap_type as i64,
+                    options: vec![OptionSet::ResourceOptions(m.options.into())],
+                    address_ranges: None,
+                    pinned_gpu_address: (m.gpu_address != 0).then_some(m.gpu_address),
+                };
+                match device.new_heap(&desc)?.heap {
+                    Some(heap) => self.insert(m.obj_id, ObjHandle::Heap(heap)),
                     None => Ok(Err(DecodeError::Refused)),
                 }
             }
@@ -553,7 +573,22 @@ mod tests {
             Err(DecodeError::BadReference)
         );
 
-        assert_eq!(dec.object_count(), 10);
+        // A device-placed placement heap at a guest-picked address.
+        let heap = RgfxHeapCreate {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_HEAP_CREATE,
+                size: size_of::<RgfxHeapCreate>() as u32,
+                seqno: 0,
+            },
+            obj_id: 21,
+            gpu_address: 0x6_0000,
+            size_bytes: 1 << 20,
+            options: 0,
+            heap_type: 1, // Placement
+        };
+        assert_eq!(dec.decode(&device, heap.as_bytes()).unwrap(), Ok(()));
+
+        assert_eq!(dec.object_count(), 11);
         let log = p.call_log();
         assert_eq!(log.calls_to("newEvent").len(), 1);
         assert_eq!(log.calls_to("newFence").len(), 1);
@@ -569,6 +604,7 @@ mod tests {
                 .len(),
             1
         );
+        assert_eq!(log.calls_to("newHeapWithDescriptor:").len(), 1);
 
         // Destroying the event drops its handle; the others stay.
         let destroy = RgfxObjectDestroy {
@@ -580,7 +616,7 @@ mod tests {
             obj_id: 10,
         };
         assert_eq!(dec.decode(&device, destroy.as_bytes()).unwrap(), Ok(()));
-        assert_eq!(dec.object_count(), 9);
+        assert_eq!(dec.object_count(), 10);
         // Destroying an id the host never made is not an error.
         assert_eq!(dec.decode(&device, destroy.as_bytes()).unwrap(), Ok(()));
 
