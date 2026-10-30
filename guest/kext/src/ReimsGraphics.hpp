@@ -61,6 +61,12 @@ public:
 	IOReturn getTimingInfoForDisplayMode(IODisplayModeID displayMode,
 	                                     IOTimingInformation *info) override;
 
+	// IOFramebuffer: the timings the OS programs from the display's EDID, under the
+	// framebuffer's kIOFBTimingRangeKey. The driver takes a timing whose size and rate are a
+	// mode the device lists, and lists the programmed ones in place of its own.
+	IOReturn validateDetailedTiming(void *description, IOByteCount descripSize) override;
+	IOReturn setDetailedTimings(OSArray *array) override;
+
 	// IOFramebuffer: attributes and the display's connection
 	IOReturn getAttribute(IOSelect attribute, uintptr_t *value) override;
 	IOReturn setAttribute(IOSelect attribute, uintptr_t value) override;
@@ -110,8 +116,6 @@ public:
 	bool isConsoleDevice() override;
 	IOReturn setCLUTWithEntries(IOColorEntry *colors, UInt32 index, UInt32 numEntries,
 	                            IOOptionBits options) override;
-	IOReturn validateDetailedTiming(void *description, IOByteCount descripSize) override;
-	IOReturn setDetailedTimings(OSArray *array) override;
 	IOReturn connectFlags(IOIndex connectIndex, IODisplayModeID displayMode,
 	                      IOOptionBits *flags) override;
 #endif
@@ -188,6 +192,22 @@ private:
 	static constexpr UInt32 kPowerStateCount = 3;
 	void initPower();
 	IOReturn setPower(UInt32 state);
+
+	// A timing the OS programmed: its mode, under the ID the OS gave it, and the timing.
+	struct Programmed {
+		Mode mode;
+		IODetailedTimingInformationV2 timing;
+	};
+	// Whether the device lists a mode of this size and rate (within half a hertz), and which.
+	bool deviceMode(UInt32 width, UInt32 height, UInt32 refreshMhz, Mode *mode) const;
+	static UInt32 refreshMhzOf(const IODetailedTimingInformationV2 &timing);
+	const Programmed *programmedFor(IODisplayModeID id) const;
+	bool isPreferred(const Mode &mode) const;
+	// The modes IOFramebuffer sees, into `ids` (kMaxModes of room) when not null: the
+	// programmed timings the device lists, or, while there are none, the device's own.
+	UInt32 listModes(IODisplayModeID *ids) const;
+	// The physical size of a mode's display, in millimetres, as the EDID gives it.
+	void imageSize(const Mode &mode, UInt16 *width, UInt16 *height) const;
 
 	// One of IOFramebuffer's interrupt registrations.
 	struct Interrupt {
@@ -294,6 +314,8 @@ private:
 	bool haveCurrent;
 	Mode current;
 	IODisplayModeID startupId;
+	Programmed programmed[kMaxModes];
+	UInt32 programmedCount;
 
 	// Under interruptLock: IOFramebuffer's registrations, and whether it
 	// wants VBLANK events.

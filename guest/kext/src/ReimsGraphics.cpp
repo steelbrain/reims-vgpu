@@ -600,11 +600,87 @@ bool ReimsGraphics::modeFor(IODisplayModeID id, Mode *mode) const
 			return true;
 		}
 	}
+	if (const Programmed *p = programmedFor(id)) {
+		*mode = p->mode;
+		return true;
+	}
 	if (haveCurrent && current.id == id) {
 		*mode = current;
 		return true;
 	}
 	return false;
+}
+
+bool ReimsGraphics::deviceMode(UInt32 width, UInt32 height, UInt32 refreshMhz, Mode *mode) const
+{
+	for (UInt32 i = 0; i < modeCount; i++) {
+		const Mode &m = modes[i];
+		UInt32 diff = m.refreshMhz > refreshMhz ? m.refreshMhz - refreshMhz : refreshMhz - m.refreshMhz;
+		if (m.width == width && m.height == height && diff <= 500) {
+			if (mode)
+				*mode = m;
+			return true;
+		}
+	}
+	return false;
+}
+
+UInt32 ReimsGraphics::refreshMhzOf(const IODetailedTimingInformationV2 &t)
+{
+	UInt64 total = static_cast<UInt64>(t.horizontalActive + t.horizontalBlanking) *
+	               (t.verticalActive + t.verticalBlanking);
+	return total ? static_cast<UInt32>((t.pixelClock * 1000 + total / 2) / total) : 0;
+}
+
+const ReimsGraphics::Programmed *ReimsGraphics::programmedFor(IODisplayModeID id) const
+{
+	for (UInt32 i = 0; i < programmedCount; i++) {
+		if (programmed[i].mode.id == id)
+			return &programmed[i];
+	}
+	return nullptr;
+}
+
+bool ReimsGraphics::isPreferred(const Mode &m) const
+{
+	if (m.id == preferredId)
+		return true;
+	Mode host;
+	return programmedFor(m.id) && deviceMode(m.width, m.height, m.refreshMhz, &host) &&
+	       host.id == preferredId;
+}
+
+UInt32 ReimsGraphics::listModes(IODisplayModeID *ids) const
+{
+	UInt32 n = 0;
+	for (UInt32 i = 0; i < programmedCount; i++) {
+		const Mode &m = programmed[i].mode;
+		if (!deviceMode(m.width, m.height, m.refreshMhz, nullptr))
+			continue;
+		if (ids)
+			ids[n] = m.id;
+		n++;
+	}
+	if (n)
+		return n;
+	for (UInt32 i = 0; i < modeCount; i++) {
+		if (ids)
+			ids[i] = modes[i].id;
+	}
+	return modeCount;
+}
+
+void ReimsGraphics::imageSize(const Mode &m, UInt16 *width, UInt16 *height) const
+{
+	// The EDID's size, from the preferred mode.
+	Mode native = m;
+	for (UInt32 i = 0; i < modeCount; i++) {
+		if (modes[i].id == preferredId)
+			native = modes[i];
+	}
+	UInt32 ppi = native.width >= 2880 ? 220 : 110;
+	*width = static_cast<UInt16>((native.width * 254 + ppi * 5) / (ppi * 10));
+	*height = static_cast<UInt16>((native.height * 254 + ppi * 5) / (ppi * 10));
 }
 
 UInt32 ReimsGraphics::strideFor(UInt32 width)
@@ -761,6 +837,61 @@ bool ReimsGraphics::start(IOService *provider)
 		}
 	}
 	setProperty("IOAccelIndex", 0ull, 32);
+
+	// The timings the OS may program (validateDetailedTiming takes only the device's modes
+	// among them). The scanout has no signal of its own, so any sync and level goes, and
+	// nothing optional (interlace, DSC: a version 1 range); no link limits are given, as no
+	// link carries the pixels. RGB at 8 bits, in one-pixel steps.
+	{
+		IODisplayTimingRange range;
+		bzero(&range, sizeof(range));
+		range.version = kIOTimingRangeV1;
+		range.minPixelClock = 1000000;
+		range.maxPixelClock = 100000000000ull;
+		range.supportedSyncFlags = kIORangeSupportsSeparateSyncs | kIORangeSupportsSyncOnGreen |
+		                           kIORangeSupportsCompositeSync | kIORangeSupportsVSyncSerration;
+		range.supportedSignalLevels = kIORangeSupportsSignal_0700_0300 | kIORangeSupportsSignal_0714_0286 |
+		                              kIORangeSupportsSignal_1000_0400 | kIORangeSupportsSignal_0700_0000;
+		range.minFrameRate = 1;
+		range.maxFrameRate = 1000;
+		range.minLineRate = 1;
+		range.maxLineRate = 100000000;
+		range.maxHorizontalTotal = 2 * kMaxDimension;
+		range.maxVerticalTotal = 2 * kMaxDimension;
+		range.charSizeHorizontalActive = 1;
+		range.charSizeHorizontalBlanking = 1;
+		range.charSizeHorizontalSyncOffset = 1;
+		range.charSizeHorizontalSyncPulse = 1;
+		range.charSizeVerticalActive = 1;
+		range.charSizeVerticalBlanking = 1;
+		range.charSizeVerticalSyncOffset = 1;
+		range.charSizeVerticalSyncPulse = 1;
+		range.charSizeHorizontalBorderLeft = 1;
+		range.charSizeHorizontalBorderRight = 1;
+		range.charSizeVerticalBorderTop = 1;
+		range.charSizeVerticalBorderBottom = 1;
+		range.charSizeHorizontalTotal = 1;
+		range.charSizeVerticalTotal = 1;
+		range.minHorizontalActiveClocks = 1;
+		range.maxHorizontalActiveClocks = kMaxDimension;
+		range.maxHorizontalBlankingClocks = kMaxDimension;
+		range.maxHorizontalSyncOffsetClocks = kMaxDimension;
+		range.maxHorizontalPulseWidthClocks = kMaxDimension;
+		range.minVerticalActiveClocks = 1;
+		range.maxVerticalActiveClocks = kMaxDimension;
+		range.maxVerticalBlankingClocks = kMaxDimension;
+		range.maxVerticalSyncOffsetClocks = kMaxDimension;
+		range.maxVerticalPulseWidthClocks = kMaxDimension;
+		range.supportedPixelEncoding = kIORangePixelEncodingRGB444;
+		range.supportedBitsPerColorComponent = kIORangeBitsPerColorComponent8;
+		range.supportedColorimetryModes = kIORangeColorimetryNativeRGB | kIORangeColorimetrysRGB;
+		range.supportedDynamicRangeModes = kIORangeDynamicRangeSDR;
+		OSData *data = OSData::withBytes(&range, sizeof(range));
+		if (data) {
+			setProperty(kIOFBTimingRangeKey, data);
+			data->release();
+		}
+	}
 	setProperty("IOAccelRevision", 2ull, 32);
 
 	if (super::start(provider))
@@ -870,7 +1001,7 @@ const char *ReimsGraphics::getPixelFormats()
 IOItemCount ReimsGraphics::getDisplayModeCount()
 {
 	IOLockLock(stateLock);
-	reportedCount = modeCount;
+	reportedCount = listModes(nullptr);
 	IOLockUnlock(stateLock);
 	FBTRACE(16, "getDisplayModeCount -> %u", reportedCount);
 	return reportedCount;
@@ -881,9 +1012,11 @@ IOItemCount ReimsGraphics::getDisplayModeCount()
 // mode, and the connect interrupt that follows has IOFramebuffer ask again.
 IOReturn ReimsGraphics::getDisplayModes(IODisplayModeID *allDisplayModes)
 {
+	IODisplayModeID ids[kMaxModes];
 	IOLockLock(stateLock);
+	UInt32 n = listModes(ids);
 	for (UInt32 i = 0; i < reportedCount; i++)
-		allDisplayModes[i] = i < modeCount ? modes[i].id : preferredId;
+		allDisplayModes[i] = i < n ? ids[i] : (n ? ids[0] : preferredId);
 	FBTRACE(16, "getDisplayModes: %u modes, first %d", reportedCount,
 	        reportedCount ? static_cast<int>(allDisplayModes[0]) : -1);
 	IOLockUnlock(stateLock);
@@ -896,7 +1029,10 @@ IOReturn ReimsGraphics::getInformationForDisplayMode(IODisplayModeID displayMode
 	Mode m;
 	IOLockLock(stateLock);
 	bool ok = modeFor(displayMode, &m);
-	bool preferred = displayMode == preferredId;
+	bool preferred = ok && isPreferred(m);
+	UInt16 mmWide = 0, mmHigh = 0;
+	if (ok)
+		imageSize(m, &mmWide, &mmHigh);
 	IOLockUnlock(stateLock);
 	FBTRACE(48, "getInformationForDisplayMode %d: %s %ux%u", static_cast<int>(displayMode),
 	        ok ? "ok" : "UNKNOWN", ok ? m.width : 0, ok ? m.height : 0);
@@ -908,6 +1044,8 @@ IOReturn ReimsGraphics::getInformationForDisplayMode(IODisplayModeID displayMode
 	info->refreshRate = static_cast<IOFixed1616>((static_cast<UInt64>(m.refreshMhz) << 16) / 1000);
 	info->maxDepthIndex = 0;
 	info->flags = kDisplayModeValidFlag | kDisplayModeSafeFlag | (preferred ? kDisplayModeDefaultFlag : 0);
+	info->imageWidth = mmWide;
+	info->imageHeight = mmHigh;
 	return kIOReturnSuccess;
 }
 
@@ -1003,13 +1141,25 @@ IOReturn ReimsGraphics::getTimingInfoForDisplayMode(IODisplayModeID displayMode,
                                                     IOTimingInformation *info)
 {
 	Mode m;
+	IODetailedTimingInformationV2 given;
 	IOLockLock(stateLock);
 	bool ok = modeFor(displayMode, &m);
+	const Programmed *p = programmedFor(displayMode);
+	if (p)
+		given = p->timing;
 	IOLockUnlock(stateLock);
-	FBTRACE(48, "getTimingInfoForDisplayMode %d: %s, flags in 0x%x", static_cast<int>(displayMode),
-	        ok ? "ok" : "UNKNOWN", info ? static_cast<unsigned>(info->flags) : 0);
+	FBTRACE(48, "getTimingInfoForDisplayMode %d: %s%s, flags in 0x%x", static_cast<int>(displayMode),
+	        ok ? "ok" : "UNKNOWN", p ? " programmed" : "", info ? static_cast<unsigned>(info->flags) : 0);
 	if (!ok || !info)
 		return kIOReturnBadArgument;
+	if (p) {
+		// A programmed timing is no standard one: it is given back as the OS gave it.
+		bzero(info, sizeof(*info));
+		info->appleTimingID = kIOTimingIDInvalid;
+		info->flags = kIODetailedTimingValid;
+		info->detailedInfo.v2 = given;
+		return kIOReturnSuccess;
+	}
 	Timing timing;
 	timingFor(m, &timing);
 	bzero(info, sizeof(*info));
@@ -1030,6 +1180,102 @@ IOReturn ReimsGraphics::getTimingInfoForDisplayMode(IODisplayModeID displayMode,
 	// Reduced blanking's sync: horizontal positive, vertical negative.
 	t.horizontalSyncConfig = kIOSyncPositivePolarity;
 	t.verticalSyncConfig = 0;
+	return kIOReturnSuccess;
+}
+
+// A timing the device can show: a listed mode's size and rate, unscaled and progressive. For a
+// mode description, the description's mode information is filled in.
+IOReturn ReimsGraphics::validateDetailedTiming(void *description, IOByteCount descripSize)
+{
+	IOFBDisplayModeDescription *desc = nullptr;
+	IODetailedTimingInformationV2 *t = nullptr;
+	if (description && descripSize == sizeof(IOFBDisplayModeDescription)) {
+		desc = static_cast<IOFBDisplayModeDescription *>(description);
+		t = &desc->timingInfo.detailedInfo.v2;
+	} else if (description && descripSize == sizeof(IODetailedTimingInformationV2)) {
+		t = static_cast<IODetailedTimingInformationV2 *>(description);
+	} else {
+		FBTRACE(8, "validateDetailedTiming: %lu bytes: not a timing",
+		        static_cast<unsigned long>(descripSize));
+		return kIOReturnUnsupported;
+	}
+	bool scaled = (t->horizontalScaled && t->horizontalScaled != t->horizontalActive) ||
+	              (t->verticalScaled && t->verticalScaled != t->verticalActive) ||
+	              t->horizontalScaledInset || t->verticalScaledInset;
+	UInt32 refresh = refreshMhzOf(*t);
+	Mode host;
+	IOLockLock(stateLock);
+	bool ok = !scaled && !(t->signalConfig & kIOInterlacedCEATiming) &&
+	          deviceMode(t->horizontalActive, t->verticalActive, refresh, &host);
+	bool preferred = ok && host.id == preferredId;
+	UInt16 mmWide = 0, mmHigh = 0;
+	if (ok)
+		imageSize(host, &mmWide, &mmHigh);
+	IOLockUnlock(stateLock);
+	FBTRACE(32, "validateDetailedTiming %ux%u (scaled %ux%u) at %u mHz, clock %llu: %s",
+	        t->horizontalActive, t->verticalActive, t->horizontalScaled, t->verticalScaled, refresh,
+	        t->pixelClock, ok ? "ok" : "REFUSED");
+	if (!ok)
+		return kIOReturnUnsupportedMode;
+	if (desc) {
+		IODisplayModeInformation &info = desc->info;
+		bzero(&info, sizeof(info));
+		info.nominalWidth = t->horizontalActive;
+		info.nominalHeight = t->verticalActive;
+		info.refreshRate = static_cast<IOFixed1616>((static_cast<UInt64>(refresh) << 16) / 1000);
+		info.maxDepthIndex = 0;
+		info.flags = kDisplayModeValidFlag | kDisplayModeSafeFlag | (preferred ? kDisplayModeDefaultFlag : 0);
+		info.imageWidth = mmWide;
+		info.imageHeight = mmHigh;
+	}
+	return kIOReturnSuccess;
+}
+
+// Each element is an OSData of an IODetailedTimingInformationV2 whose first reserved word is
+// the mode ID the OS gave it, at or past kIODisplayModeIDReservedBase. The mode set takes the ID
+// of a programmed timing of its size and rate, as the list now names it.
+IOReturn ReimsGraphics::setDetailedTimings(OSArray *array)
+{
+	UInt32 taken = 0;
+	IOLockLock(stateLock);
+	programmedCount = 0;
+	for (UInt32 i = 0; array && i < array->getCount() && programmedCount < kMaxModes; i++) {
+		OSData *data = OSDynamicCast(OSData, array->getObject(i));
+		if (!data || data->getLength() < sizeof(IODetailedTimingInformationV2))
+			continue;
+		IODetailedTimingInformationV2 t;
+		memcpy(&t, data->getBytesNoCopy(), sizeof(t));
+		IODisplayModeID id = static_cast<IODisplayModeID>(t.__reservedA[0]);
+		if (static_cast<UInt32>(id) < static_cast<UInt32>(kIODisplayModeIDReservedBase) ||
+		    !t.horizontalActive || !t.verticalActive || t.horizontalActive > kMaxDimension ||
+		    t.verticalActive > kMaxDimension || programmedFor(id))
+			continue;
+		Programmed &p = programmed[programmedCount++];
+		p.mode = {id, t.horizontalActive, t.verticalActive, refreshMhzOf(t)};
+		p.timing = t;
+		if (deviceMode(p.mode.width, p.mode.height, p.mode.refreshMhz, nullptr))
+			taken++;
+	}
+	if (haveCurrent && !programmedFor(current.id)) {
+		for (UInt32 i = 0; i < programmedCount; i++) {
+			const Mode &m = programmed[i].mode;
+			UInt32 diff = m.refreshMhz > current.refreshMhz ? m.refreshMhz - current.refreshMhz
+			                                                : current.refreshMhz - m.refreshMhz;
+			if (m.width == current.width && m.height == current.height && diff <= 500 &&
+			    deviceMode(m.width, m.height, m.refreshMhz, nullptr)) {
+				current.id = m.id;
+				break;
+			}
+		}
+	}
+	UInt32 count = programmedCount;
+	IOLockUnlock(stateLock);
+	if (array)
+		setProperty(kIOFBDetailedTimingsKey, array);
+	else
+		removeProperty(kIOFBDetailedTimingsKey);
+	IOLog("ReimsGraphics: display %u: %u programmed timings, %u of them the device's modes\n",
+	      displayId, count, taken);
 	return kIOReturnSuccess;
 }
 
@@ -1678,20 +1924,6 @@ IOReturn ReimsGraphics::setCLUTWithEntries(IOColorEntry *colors, UInt32 index, U
 {
 	IOReturn r = super::setCLUTWithEntries(colors, index, numEntries, options);
 	FBTRACE(4, "setCLUTWithEntries %u+%u -> 0x%x", index, numEntries, r);
-	return r;
-}
-
-IOReturn ReimsGraphics::validateDetailedTiming(void *description, IOByteCount descripSize)
-{
-	IOReturn r = super::validateDetailedTiming(description, descripSize);
-	FBTRACE(16, "validateDetailedTiming %lu bytes -> 0x%x", static_cast<unsigned long>(descripSize), r);
-	return r;
-}
-
-IOReturn ReimsGraphics::setDetailedTimings(OSArray *array)
-{
-	IOReturn r = super::setDetailedTimings(array);
-	FBTRACE(8, "setDetailedTimings %u -> 0x%x", array ? array->getCount() : 0, r);
 	return r;
 }
 
