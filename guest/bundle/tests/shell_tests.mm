@@ -1177,7 +1177,7 @@ void test_queue_guards()
 // page below it, and places ring pairs with power-of-two byte rings.
 void test_region_allocator()
 {
-	std::vector<uint8_t> mem(0x200000, 0xff); // 2 MiB, pre-dirtied like BAR memory
+	std::vector<uint8_t> mem(0x800000, 0xff); // 8 MiB, pre-dirtied like BAR memory
 	RgfxRegion region(mem.data(), mem.size());
 	CHECK(region.floor() == RGFX_ALLOCATIONS_OFFSET);
 	CHECK(region.size() == mem.size());
@@ -1237,7 +1237,7 @@ void test_queue_carries_allocated_offsets()
 	RgfxIdSpace ids;
 	RgfxSerializer ser(controlWriter, ids);
 
-	std::vector<uint8_t> mem(0x200000, 0);
+	std::vector<uint8_t> mem(0x800000, 0);
 	RgfxRegion region(mem.data(), mem.size());
 	RgfxRegion::RingPair rings = region.allocateRingPair(0x8000, 0x8000);
 	CHECK(rings.ok);

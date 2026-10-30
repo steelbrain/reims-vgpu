@@ -41,7 +41,7 @@ use std::sync::Arc;
 use reims_graphics::region::Region;
 use reims_graphics::wire::{
     RGFX_CMD_BUFFER_AT_OFFSET, RGFX_CMD_BUFFER_CREATE, RGFX_CMD_BUFFER_OVER_HOST_MEMORY,
-    RGFX_CMD_COMMAND_BUFFER,
+    RGFX_CMD_COMMAND_BUFFER, RGFX_CONTEXT_OBJ_ID_SHIFT,
     RGFX_CMD_COMPUTE_PIPELINE_CREATE, RGFX_CMD_DEPTH_STENCIL_CREATE, RGFX_CMD_EVENT_CREATE,
     RGFX_CMD_FENCE_CREATE, RGFX_CMD_HEAP_CREATE, RGFX_CMD_HEAP_OVER_HOST_MEMORY,
     RGFX_CMD_LIBRARY_CREATE, RGFX_CMD_LIBRARY_FROM_REGION, RGFX_CMD_OBJECT_DESTROY,
@@ -201,11 +201,20 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// that drops objects other than by `OBJECT_DESTROY` (a context's whole id
     /// range at its close) calls it, so a later object that takes a dropped id is
     /// never taken for the surface's texture.
-    #[allow(dead_code)] // a context's close calls it
     pub(crate) fn forget_dropped_surfaces(&mut self) {
         let objects = &self.objects;
         self.surfaces
             .retain(|_, texture| matches!(objects.get(texture), Some(ObjHandle::Texture(_))));
+    }
+
+    /// Drops every object of context `context`: those whose id lies in its range,
+    /// `context << RGFX_CONTEXT_OBJ_ID_SHIFT` and up, below the next context's (its process closed
+    /// the device or died). How many were dropped.
+    pub(crate) fn drop_context(&mut self, context: u32) -> usize {
+        let before = self.objects.len();
+        self.objects
+            .retain(|id, _| (id >> RGFX_CONTEXT_OBJ_ID_SHIFT) != u64::from(context));
+        before - self.objects.len()
     }
 
     /// Carries out one wire message against `device`: a create inserts the new

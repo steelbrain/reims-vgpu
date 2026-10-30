@@ -84,6 +84,7 @@ struct RgfxSurfaceShadow {
 	PlaneShape shape = {};
 	uint64_t pitch = 0; // the copy's row pitch (kShadowRowAlign multiple)
 	RgfxRegion::Block block = {};
+	RgfxRegion *region = nullptr; // where the block goes back at the copy's end
 	id<MTLBuffer> buffer = nil; // the Shared buffer over the block
 	std::mutex lock;            // one sync at a time
 	uint32_t seed = 0;          // the surface's seed when the copy last matched it
@@ -146,12 +147,11 @@ struct RgfxSurfaceShadow {
 
 namespace {
 
-/// The process's copies by (IOSurfaceID, plane), and the blocks of dead copies by
-/// size, which the next copy of that size takes (the region frees nothing).
+/// The process's copies by (IOSurfaceID, plane). A dead copy's block goes back to the
+/// region (RgfxRegion::release), which hands it to the accelerator kext to give out again.
 struct Registry {
 	std::mutex lock;
 	std::map<std::pair<uint32_t, uint32_t>, std::weak_ptr<RgfxSurfaceShadow>> shadows;
-	std::multimap<uint64_t, RgfxRegion::Block> freeBlocks;
 };
 
 Registry &registry()
@@ -165,10 +165,8 @@ Registry &registry()
 RgfxSurfaceShadow::~RgfxSurfaceShadow()
 {
 	buffer = nil; // the host drops the buffer before the block is reused
-	if (block.ok) {
-		Registry &r = registry();
-		std::lock_guard<std::mutex> g(r.lock);
-		r.freeBlocks.emplace(block.size, block);
+	if (block.ok && region != nullptr) {
+		region->release(block.offset);
 	}
 	if (surface != nullptr) {
 		CFRelease(surface);
@@ -206,13 +204,8 @@ std::shared_ptr<RgfxSurfaceShadow> shadowFor(IOSurfaceRef surface, uint32_t plan
 		shadow->shape = shape;
 		shadow->pitch = alignUp(shape.rowBytes, kShadowRowAlign);
 		uint64_t size = alignUp(shadow->pitch * shape.rows, RgfxRegion::kDefaultBlockAlign);
-		auto fit = r.freeBlocks.find(size);
-		if (fit != r.freeBlocks.end()) {
-			shadow->block = fit->second;
-			r.freeBlocks.erase(fit);
-		} else {
-			shadow->block = region->allocate(size);
-		}
+		shadow->block = region->allocate(size);
+		shadow->region = region;
 		if (!shadow->block.ok) {
 			return nullptr;
 		}

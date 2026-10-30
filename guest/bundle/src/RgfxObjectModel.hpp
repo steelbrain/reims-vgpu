@@ -54,6 +54,11 @@ public:
 	/// two, at least 1). The guest owns the range; the host pins it.
 	uint64_t allocAddress(uint64_t size, uint64_t align);
 
+	/// Moves the three lines to the process's context's ranges, which the accelerator
+	/// kext hands out (its object-id base, GPU-address base and resource-id base), so no
+	/// two processes' numbers meet on the host. Called once, before any number is minted.
+	void setBases(uint64_t obj_id_base, uint64_t address_base, uint64_t resource_id_base);
+
 	/// Where this space's GPU addresses begin by default: above the low 4 GiB,
 	/// clear of any identity-mapped low range and of zero.
 	static const uint64_t kDefaultAddressBase = 0x1'0000'0000ull;

@@ -25,11 +25,39 @@ uint64_t RgfxRegion::used() const
 	return m_cursor - m_floor;
 }
 
+void RgfxRegion::setBlockSource(AllocFn alloc, ReleaseFn release, void *context)
+{
+	std::lock_guard<std::mutex> guard(m_lock);
+	m_alloc = alloc;
+	m_release = release;
+	m_sourceContext = context;
+}
+
+void RgfxRegion::release(uint64_t offset)
+{
+	if (m_release != nullptr) {
+		m_release(m_sourceContext, offset);
+	}
+}
+
 RgfxRegion::Block RgfxRegion::allocate(uint64_t size, uint64_t align)
 {
 	Block out = {};
 	if (!isPowerOfTwo(align)) {
 		return out; // ok == false
+	}
+
+	if (m_alloc != nullptr) {
+		uint64_t offset = 0;
+		if (!m_alloc(m_sourceContext, size, align, &offset) || offset < m_floor ||
+		    offset > m_size || size > m_size - offset) {
+			return out; // no room; ok == false
+		}
+		out.offset = offset;
+		out.ptr = m_base + offset;
+		out.size = size;
+		out.ok = true;
+		return out;
 	}
 
 	std::lock_guard<std::mutex> guard(m_lock);

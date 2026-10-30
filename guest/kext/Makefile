@@ -47,7 +47,9 @@ OBJECTS = $(BUILD)/obj/ReimsGraphics.o \
 	$(BUILD)/obj/RgfxAccelerator.o \
 	$(BUILD)/obj/RgfxAcceleratorUserClient.o \
 	$(BUILD)/obj/RgfxDisplayPipeUserClient.o \
-	$(BUILD)/obj/kmod_info.o
+	$(BUILD)/obj/kmod_info.o \
+	$(BUILD)/obj/RgfxAcceleratorContexts.o \
+	$(BUILD)/obj/RgfxAcceleratorUserClientContexts.o
 
 all: $(BINARY)
 

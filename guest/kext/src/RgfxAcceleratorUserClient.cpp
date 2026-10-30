@@ -21,7 +21,12 @@ bool RgfxAcceleratorUserClient::initWithTask(task_t owningTask, void *securityID
 	task = owningTask;
 	owner = nullptr;
 	ucType = type; // RGFX DIAG (remove before merge): correlate selectors to UC type
-	return true;
+	hasContext = false;
+	context = 0;
+	slot = 0;
+	queueCount = 0;
+	queueLock = IOLockAlloc();
+	return queueLock != nullptr;
 }
 
 bool RgfxAcceleratorUserClient::start(IOService *provider)
@@ -34,12 +39,29 @@ bool RgfxAcceleratorUserClient::start(IOService *provider)
 
 void RgfxAcceleratorUserClient::stop(IOService *provider)
 {
+	releaseContext();
 	owner = nullptr;
 	super::stop(provider);
 }
 
+void RgfxAcceleratorUserClient::free()
+{
+	if (queueLock)
+		IOLockFree(queueLock);
+	queueLock = nullptr;
+	super::free();
+}
+
+IOReturn RgfxAcceleratorUserClient::clientDied()
+{
+	// The process died: what it held of the device goes, as at a close.
+	releaseContext();
+	return super::clientDied();
+}
+
 IOReturn RgfxAcceleratorUserClient::clientClose()
 {
+	releaseContext();
 	// IOUserClient releases us when the last map is gone; detach from the accelerator
 	// so the connection ends.
 	if (!isInactive())
@@ -131,6 +153,12 @@ IOReturn RgfxAcceleratorUserClient::externalMethod(uint32_t selector,
 	      arguments ? arguments->structureOutputSize : 0,
 	      (arguments && scalarIn > 0) ? arguments->scalarInput[0] : 0ull,
 	      (arguments && scalarIn > 1) ? arguments->scalarInput[1] : 0ull);
+
+	// Our own protocol: the process's context (its ids, blocks and queues), on our own user
+	// client alone.
+	if (ucType == kRgfxAccelUserClientType && arguments && selector >= kRgfxAccelMethodOpenContext &&
+	    selector <= kRgfxAccelMethodQueueDestroy)
+		return contextMethod(selector, arguments);
 
 	// Our own protocol: the doorbell. ONLY on our own user client (type 0). Apple's IOGPU
 	// construction opens other UC types (5, 4) and also drives selector 0 on them -- type-5

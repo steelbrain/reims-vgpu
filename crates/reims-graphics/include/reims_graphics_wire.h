@@ -652,6 +652,35 @@
 // `DOORBELL`, WO: writing a ring's id wakes its consumer.
 #define RGFX_REG_DOORBELL 32
 
+// `QUEUE_OPEN`, WO: writing any value opens the command queue the mailbox holds, an
+// [`RgfxQueueOpen`] in its first words: the device makes the queue's ring pair (the submission
+// ring's `consumer_idle` 1) and starts its service before the write returns, and `MAILBOX_STATUS`
+// then reads [`RGFX_STATUS_OK`], or [`RGFX_STATUS_INVALID_ARGUMENT`] where the rings were refused.
+// The guest's accelerator kext writes it, the mailbox's only writer, when a process makes a queue.
+#define RGFX_REG_QUEUE_OPEN 36
+
+// `QUEUE_CLOSE`, WO: writing any value closes the queue whose id the mailbox's first two words
+// hold (low word first): the device takes nothing more from its ring and ends its service, and
+// the host drops the queue's handle.
+#define RGFX_REG_QUEUE_CLOSE 40
+
+// `CONTEXT_CLOSE`, WO: writing a context's number (its process's, which the kext hands out)
+// closes the context: the device ends the context's queues, and the host drops every object
+// whose id lies in the context's range ([`RGFX_CONTEXT_OBJ_ID_SHIFT`]). The kext writes it when
+// the process closes the device or dies, after it closed the process's queues and before it frees
+// the process's region blocks.
+#define RGFX_REG_CONTEXT_CLOSE 44
+
+// `MAILBOX_STATUS`, RO: the status of the last `QUEUE_OPEN`.
+#define RGFX_REG_MAILBOX_STATUS 48
+
+// `MAILBOX`, RW: [`RGFX_MAILBOX_WORDS`] 32-bit words from here, the arguments of `QUEUE_OPEN`
+// and `QUEUE_CLOSE`.
+#define RGFX_REG_MAILBOX 64
+
+// The mailbox's words.
+#define RGFX_MAILBOX_WORDS 16
+
 // What `MAGIC` reads: "RGFX", little-endian.
 #define RGFX_MAGIC 1481000786
 
@@ -675,32 +704,54 @@
 // The room each control ring has in the region, its header included.
 #define RGFX_CONTROL_RING_SPAN 65536
 
-// Where the device submission ring is in the region: ring id [`RGFX_DEVICE_RING_ID`], guest
-// (the Metal bundle) to host. It carries the object lifecycle (queue, heap, buffer, texture,
-// sampler, pipeline and sync-object creates and destroys) the bundle drives, so the control
-// ring stays the framebuffer kext's alone: each ring keeps a single producer and consumer.
-#define RGFX_DEVICE_SUBMIT_OFFSET 131072
+// Where the guest's allocations start in the region: the framebuffer's scanout first
+// ([`RGFX_SCANOUT_SPAN`] bytes), then the accelerator kext's blocks
+// ([`RGFX_CONTEXT_ALLOCATIONS_OFFSET`]), then the cursor image at the region's end
+// ([`RGFX_CURSOR_SPAN`]). Everything from here to the region's end is the guest's to place.
+#define RGFX_ALLOCATIONS_OFFSET 4194304
 
-// Where the device completion ring is in the region: host to guest (the Metal bundle), MSI-X
-// vector [`RGFX_DEVICE_VECTOR`]. It carries the stage-3 replies (pipeline reflection and the
-// command answers the bundle awaits).
-#define RGFX_DEVICE_COMPLETE_OFFSET 196608
+// The room the framebuffer keeps for its scanout at [`RGFX_ALLOCATIONS_OFFSET`]: one 8K
+// (7680 x 4320) BGRA8 frame with 256-byte rows fits.
+#define RGFX_SCANOUT_SPAN 134217728
 
-// Where the guest's allocations start in the region (the scanout buffers and the cursor
-// image): everything from here to the region's end is the guest's to place.
-#define RGFX_ALLOCATIONS_OFFSET 262144
+// The room the framebuffer keeps for its cursor image at the region's end: 256 x 256 BGRA8.
+#define RGFX_CURSOR_SPAN 262144
+
+// Where the accelerator kext's blocks start: the processes' rings, buffers, heaps and surfaces,
+// which the kext hands out and frees (each process's at its end), up to the cursor's span.
+#define RGFX_CONTEXT_ALLOCATIONS_OFFSET (RGFX_ALLOCATIONS_OFFSET + RGFX_SCANOUT_SPAN)
+
+// The object ids of context `c` (a process's, numbered from 1 by the kext) are
+// `c << RGFX_CONTEXT_OBJ_ID_SHIFT` and up, below the next context's: the guest bundle picks them
+// there, and `CONTEXT_CLOSE` drops the context's.
+#define RGFX_CONTEXT_OBJ_ID_SHIFT 40
+
+// How many processes hold the device at once: each holds one slot of the GPU address and texture
+// resource-id spaces, which the kext hands out with its context.
+#define RGFX_CONTEXT_SLOTS 32
+
+// Where slot 0's GPU addresses start; slot `s`'s start [`RGFX_CONTEXT_VA_SPAN`] bytes a slot
+// later.
+#define RGFX_CONTEXT_VA_BASE 4294967296
+
+// The GPU addresses each slot picks from.
+#define RGFX_CONTEXT_VA_SPAN 68719476736
+
+// The texture resource ids each slot picks from: slot `s`'s are `1 + s * RGFX_CONTEXT_RESOURCE_IDS`
+// and up.
+#define RGFX_CONTEXT_RESOURCE_IDS 2048
+
+// [`RgfxQueueOpen`]'s `flags`: the queue is its process's device queue, whose submission ring
+// carries the object lifecycle (creates and destroys) and whose completion ring the replies; a
+// command buffer on another queue of the process runs after every create the process published
+// on it before the buffer.
+#define RGFX_QUEUE_FLAG_DEVICE 1
 
 // The control submission ring's id, which the guest writes to `DOORBELL`.
 #define RGFX_CONTROL_RING_ID 0
 
 // The control completion ring's MSI-X vector.
 #define RGFX_CONTROL_VECTOR 0
-
-// The device submission ring's id, which the guest bundle writes to `DOORBELL`.
-#define RGFX_DEVICE_RING_ID 1
-
-// The device completion ring's MSI-X vector.
-#define RGFX_DEVICE_VECTOR 1
 
 // The size of a ring's header ([`RgfxRingHeader`]); its byte ring follows it.
 #define RGFX_RING_HEADER_SIZE 256
@@ -3060,6 +3111,29 @@ typedef struct {
   // The MSI-X vector the completion ring raises.
   uint32_t vector;
 } RgfxQueueCreate;
+
+// `QUEUE_OPEN`'s arguments, in the mailbox: a command queue's ring pair in the guest's
+// allocations, as a `QUEUE_CREATE` places one.
+typedef struct {
+  // The queue's guest-picked id, in its context's range.
+  uint64_t obj_id;
+  // Where the submission ring (guest to host) starts in the region; it is the ring's id.
+  uint64_t submit_offset;
+  // Where the completion ring (host to guest) starts in the region.
+  uint64_t complete_offset;
+  // The submission ring's byte-ring size, after its header: a power of two.
+  uint32_t submit_data_size;
+  // The completion ring's byte-ring size, after its header: a power of two.
+  uint32_t complete_data_size;
+  // The queue's priority: 0 is normal, higher is higher.
+  uint32_t priority;
+  // The MSI-X vector the completion ring raises.
+  uint32_t vector;
+  // The context (the process) the queue belongs to.
+  uint32_t context;
+  // [`RGFX_QUEUE_FLAG_DEVICE`] or 0.
+  uint32_t flags;
+} RgfxQueueOpen;
 
 // One colour attachment of a render pass (`colorAttachments[i]`). Absent (sets
 // nothing) when `texture_obj_id` is 0.

@@ -38,3 +38,11 @@ uint64_t RgfxIdSpace::allocAddress(uint64_t size, uint64_t align)
 			return base;
 	}
 }
+
+void RgfxIdSpace::setBases(uint64_t obj_id_base, uint64_t address_base, uint64_t resource_id_base)
+{
+	// 0 names no object, so a context's first id is its base + 1.
+	m_nextObjId.store(obj_id_base + 1, std::memory_order_relaxed);
+	m_nextAddress.store(address_base, std::memory_order_relaxed);
+	m_nextResourceId.store(resource_id_base, std::memory_order_relaxed);
+}

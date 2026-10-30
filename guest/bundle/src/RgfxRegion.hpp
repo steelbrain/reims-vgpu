@@ -8,21 +8,19 @@
  *   - resource blocks for Shared / no-copy buffers and Shared heaps (placed for
  *     createBufferOverHostMemory / createHeapOverHostMemory).
  *
- * THE RESERVED HEAD. The region's first RGFX_ALLOCATIONS_OFFSET (0x40000) bytes are
- * the host's: the control submission ring at RGFX_CONTROL_SUBMIT_OFFSET, the control
- * completion ring at RGFX_CONTROL_COMPLETE_OFFSET, the device submission and completion
- * rings (the bundle's own) at RGFX_DEVICE_SUBMIT_OFFSET and RGFX_DEVICE_COMPLETE_OFFSET,
- * and the device-info caps page at RGFX_DEVICE_INFO_OFFSET in the control completion
- * ring's tail. (The MSI-X table lives in BAR 0, not here.) The allocator never hands out
- * an offset below that floor, so it never collides with the rings or the caps page the
- * host owns.
+ * THE RESERVED HEAD. The region's first RGFX_ALLOCATIONS_OFFSET bytes are the host's:
+ * the control submission ring at RGFX_CONTROL_SUBMIT_OFFSET, the control completion ring
+ * at RGFX_CONTROL_COMPLETE_OFFSET, and the device-info caps page at
+ * RGFX_DEVICE_INFO_OFFSET in the control completion ring's tail. (The MSI-X table lives
+ * in BAR 0, not here.) The framebuffer's scanout follows (RGFX_SCANOUT_SPAN), and the
+ * accelerator kext's blocks start at RGFX_CONTEXT_ALLOCATIONS_OFFSET.
  *
- * THE POLICY. Deterministic bump allocation: a monotonic cursor that starts at the
- * floor and only moves up, each allocation rounded up to its alignment. Nothing is
- * freed yet (host handles are refcounted and ids are never reused while the device
- * lives, RgfxObjectModel), so a flat bump range is correct and reproducible; a real
- * free list / sub-allocator is a later piece. Allocation is thread-safe (Metal
- * creates resources and queues on the app's threads) under one lock. Rings are
+ * THE POLICY. In the bundle, every block comes from the accelerator kext (setBlockSource):
+ * the kext owns the region's blocks for every process, hands each out to one process and
+ * frees the process's at its end, so processes never place blocks over each other.
+ * release() hands a block back. Without a block source (the unit tests, over a plain
+ * buffer) it is deterministic bump allocation from the floor, and release() does nothing.
+ * Allocation is thread-safe (Metal creates resources and queues on the app's threads). Rings are
  * aligned to a cache line so the ring header's 64-byte lines never share one; resource
  * blocks default to a page so a block can later back a mapping.
  *
@@ -78,10 +76,21 @@ public:
 	/// Bytes handed out past the floor (diagnostics / the next free offset − floor).
 	uint64_t used() const;
 
-	/// A block of `size` bytes aligned up to `align` (a power of two, at least 1).
-	/// Deterministic bump allocation; never overlaps a previous block. `ok` is false
-	/// when `align` is not a power of two or the region has no room.
+	/// A block of `size` bytes aligned up to `align` (a power of two, at least 1), from the
+	/// block source where one is set, else bump-allocated; never overlaps another live block.
+	/// `ok` is false when `align` is not a power of two or the region has no room.
 	Block allocate(uint64_t size, uint64_t align = kDefaultBlockAlign);
+
+	/// Hands back the block at region offset `offset` (one allocate() returned) to the block
+	/// source; nothing without one.
+	void release(uint64_t offset);
+
+	/// Where blocks come from: `alloc` places `size` bytes aligned to `align` and writes the
+	/// region offset (false where it has no room), `release` frees one. Both are called with
+	/// `context`, from any thread.
+	typedef bool (*AllocFn)(void *context, uint64_t size, uint64_t align, uint64_t *offset);
+	typedef void (*ReleaseFn)(void *context, uint64_t offset);
+	void setBlockSource(AllocFn alloc, ReleaseFn release, void *context);
 
 	/// A submission + completion ring pair (see RingPair). Each data size must be a
 	/// power of two; `complete_data_size` may be 0 (no completion ring placed).
@@ -112,6 +121,9 @@ private:
 	uint64_t m_size;
 	uint64_t m_floor;   // RGFX_ALLOCATIONS_OFFSET
 	uint64_t m_cursor;  // the next free offset, at or above the floor
+	AllocFn m_alloc = nullptr;     // the block source, where set (the kext)
+	ReleaseFn m_release = nullptr;
+	void *m_sourceContext = nullptr;
 
 	std::mutex m_lock;
 };

@@ -76,6 +76,32 @@ enum {
 	kRgfxAccelMethodCount = 1,
 };
 
+// The process's device context (RgfxAcceleratorContexts.cpp), on our own user client (type
+// 0) only, numbered clear of the selectors Apple's IOGPU base drives on its type-0 client.
+enum {
+	// Opens the client's context. No input; out: the context number c, the object-id base
+	// (c << RGFX_CONTEXT_OBJ_ID_SHIFT), the GPU-address base and the texture resource-id
+	// base of the context's slot.
+	kRgfxAccelMethodOpenContext = 0x100,
+	// A region block: in size, align (a power of two); out: its region offset.
+	kRgfxAccelMethodAlloc = 0x101,
+	// Frees the client's block at the region offset scalarInput[0].
+	kRgfxAccelMethodFree = 0x102,
+	// Opens a command queue: in obj_id, submit offset, complete offset, submit data size,
+	// complete data size, priority, flags (RGFX_QUEUE_FLAG_DEVICE); out: the device's status
+	// (RGFX_STATUS_OK, or the refusal). Each ring must lie in one of the client's blocks.
+	kRgfxAccelMethodQueueCreate = 0x103,
+	// Closes the client's queue scalarInput[0].
+	kRgfxAccelMethodQueueDestroy = 0x104,
+};
+
+// A block the accelerator handed out of the region, and its owner.
+struct RgfxBlock {
+	UInt64 offset;
+	UInt64 size;
+	const void *owner;
+};
+
 class RgfxAcceleratorUserClient;
 class ReimsGraphics;
 
@@ -103,6 +129,20 @@ public:
 	// (IOAccelTypes), as a display pipe's accelerator does.
 	ReimsGraphics *copyFramebuffer();
 
+	// The processes' contexts (RgfxAcceleratorContexts.cpp). A context number is handed out once
+	// (from 1); a slot of the GPU-address and resource-id spaces is held until the close.
+	IOReturn openContext(UInt32 *context, UInt32 *slot);
+	void closeContext(UInt32 context, UInt32 slot);
+	// Blocks of the region past RGFX_CONTEXT_ALLOCATIONS_OFFSET, each owned by `owner`.
+	IOReturn allocBlock(const void *owner, UInt64 size, UInt64 align, UInt64 *offset);
+	IOReturn freeBlock(const void *owner, UInt64 offset);
+	void freeBlocks(const void *owner);
+	bool ownsRange(const void *owner, UInt64 offset, UInt64 length);
+	// The device's command queues, through the mailbox: the device has the queue's rings
+	// before openQueue returns.
+	UInt32 openQueue(const RgfxQueueOpen &open);
+	void closeQueue(UInt64 objId);
+
 private:
 	IOReturn newDisplayPipe(task_t owningTask, void *securityID, UInt32 type,
 	                        OSDictionary *properties, IOUserClient **handler);
@@ -118,6 +158,11 @@ private:
 
 	// Serialises doorbell writes (Metal rings from app threads).
 	IOSimpleLock *doorbellLock;
+
+	// The contexts' state lives in RgfxAcceleratorContexts.cpp, not in this class, so the
+	// class's layout and its own code stay as the loader's sites were taken from; it is made
+	// at the first context's open.
+	bool startContexts();
 };
 
 #endif // RGFX_ACCELERATOR_HPP_

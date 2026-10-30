@@ -118,6 +118,12 @@ public:
 	                        uint32_t submit_data_size, uint32_t complete_data_size,
 	                        uint32_t priority, uint32_t vector);
 
+	/// Where queues open: `open` hands the device the queue a createQueue() describes (the
+	/// accelerator kext's QUEUE_CREATE), and answers whether the device took it. With one
+	/// set, createQueue() posts nothing on the ring. Called with `context`.
+	typedef bool (*QueueOpenFn)(void *context, const RgfxQueueCreate &queue);
+	void setQueueOpener(QueueOpenFn open, void *context);
+
 	// --- heaps ----------------------------------------------------------------
 
 	/// A device heap of `size_bytes`. `options` is MTLResourceOptions, `heap_type`
@@ -233,6 +239,8 @@ public:
 private:
 	RgfxRingWriter &m_control;
 	RgfxIdSpace &m_ids;
+	QueueOpenFn m_queueOpen = nullptr;
+	void *m_queueOpenContext = nullptr;
 };
 
 #endif // RGFX_SERIALIZER_HPP_

@@ -34,8 +34,7 @@ use reims_graphics::wire::{
     RgfxCbComplete, RgfxMsgHeader, RgfxPipelineReflection,
 };
 use reims_graphics::{
-    ControlCompletionPoster, CursorImage, FixedScreen, Host, Mode, PresentAnswer,
-    QueueCompletionPoster, Scanout, Screen,
+    CursorImage, FixedScreen, Host, Mode, PresentAnswer, QueueCompletionPoster, Scanout, Screen,
 };
 use reims_vgpu_core::platform::device::GpuDevice;
 use reims_vgpu_core::platform::Platform;
@@ -47,7 +46,7 @@ use crate::DefaultPlatform;
 use crate::entry;
 use crate::error::Error;
 use crate::graphics::completion::cb_failed;
-use crate::graphics::decode::{CompletionSink, GraphicsDecoder};
+use crate::graphics::decode::{CompletionSink, GraphicsDecoder, ReflectionSink};
 use crate::graphics::device_info::device_info;
 use crate::platform::ApiPlatform;
 use crate::window::WindowLink;
@@ -144,8 +143,6 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                     Arc::clone(&region),
                 )),
                 device: gpu_device,
-                poster: OnceLock::new(),
-                control_completion: OnceLock::new(),
                 presented: Arc::new(Presented::default()),
             });
             let host = Box::new(CallbackHost {
@@ -166,12 +163,6 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             };
             let device =
                 reims_graphics::Device::new(region, host, screen).ok_or(Error::HostResources)?;
-            // The completion ring exists now: let the decoder post its command-buffer completions
-            // and pipeline reflections onto it, and keep a poster for the command buffers the host
-            // could not carry out at all (which owe the guest a completion too).
-            let poster = device.completion_poster();
-            let _ = control.poster.set(poster.clone());
-            control.set_sinks(&poster);
             Ok(GraphicsDevice {
                 window,
                 device,
@@ -236,25 +227,16 @@ impl<P: ApiPlatform> Drop for GraphicsDevice<P> {
     }
 }
 
-/// The stage-3 decoder and the device handle it drives, shared by the device's [`Host`] (which
-/// feeds it the control ring's stage-3 messages on the control thread) and [`GraphicsDevice`]
-/// (which, once the reims-graphics device and so its completion ring exist, gives the decoder the
-/// sinks that post onto it). The decoder is behind a [`Mutex`]: the control thread drives it one
-/// message at a time, and a command buffer's completion, which runs on a GPU thread of its own,
-/// never touches the decoder — it only posts through the poster.
+/// The stage-3 decoder and the device handle it drives, shared by the device's [`Host`], which
+/// feeds it the messages of the command queues' own rings on their service threads. The decoder is
+/// behind a [`Mutex`]: a message is decoded whole under it, and a command buffer's completion,
+/// which runs on a GPU thread of its own, never touches the decoder — it only posts through the
+/// queue's poster.
 struct GraphicsControl<P: ApiPlatform> {
     /// The decoder.
     decoder: Mutex<GraphicsDecoder<P>>,
     /// The GPU device it drives.
     device: P::Device,
-    /// The control completion ring's poster, set once the device exists: the host posts a failed
-    /// command buffer's completion through it.
-    poster: OnceLock<ControlCompletionPoster>,
-    /// The decoder's completion sink onto the control completion ring, set once the device exists.
-    /// Each queue's submissions post onto their own ring, so the decoder's one completion sink is
-    /// set to the right ring before every decode; this is the control ring's, re-set before every
-    /// control-ring message.
-    control_completion: OnceLock<CompletionSink>,
     /// The surface the display pipe shows, shared with the window's sink.
     presented: Arc<Presented<P>>,
 }
@@ -350,67 +332,29 @@ impl<P: Platform> Presented<P> {
 }
 
 impl<P: ApiPlatform> GraphicsControl<P> {
-    /// Gives the decoder its completion and reflection sinks, each posting onto the control
-    /// completion ring through `poster`: a finished command buffer's [`RgfxCbComplete`] and a
-    /// pipeline create's [`RgfxPipelineReflection`].
-    fn set_sinks(&self, poster: &ControlCompletionPoster) {
-        let completion = poster.clone();
-        let sink: CompletionSink = Arc::new(move |record: RgfxCbComplete| {
-            completion.post(record.as_bytes());
-        });
-        let _ = self.control_completion.set(Arc::clone(&sink));
-        let mut decoder = self.decoder.lock();
-        decoder.set_completion_sink(sink);
-        let reflection = poster.clone();
-        decoder.set_reflection_sink(Arc::new(move |record: RgfxPipelineReflection| {
-            reflection.post(record.as_bytes());
-        }));
-    }
-
-    /// Carries out one stage-3 control message against the GPU device, under a library entry (an
-    /// autorelease pool and the thread marked as ours). The decoder posts a command buffer's
-    /// completion and a pipeline create's reflection through its sinks; a command buffer the host
-    /// could not carry out — a malformed stream, a bad reference, or an exec fault before it was
-    /// committed — owes the guest a completion that no handler will post, so the host posts an
-    /// internal-error one for it here.
-    fn handle(&self, message: &[u8]) {
+    /// Drops every object of context `context` (its process closed the device or died), and the
+    /// surfaces' entries whose objects went with them.
+    fn close_context(&self, context: u32) {
         entry::run(|_| {
-            let outcome = {
+            let dropped = {
                 let mut decoder = self.decoder.lock();
-                // A queue's submissions may have left the decoder's completion sink pointed at a
-                // per-queue ring; a control-ring command buffer's completion goes on the control
-                // ring, so re-point it before the decode.
-                if let Some(sink) = self.control_completion.get() {
-                    decoder.set_completion_sink(Arc::clone(sink));
-                }
-                decoder.decode(&self.device, message)
+                let dropped = decoder.drop_context(context);
+                decoder.forget_dropped_surfaces();
+                dropped
             };
-            match outcome {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    let (ty, seqno, obj_id) = message_identity(message);
-                    log::warn!(
-                        target: "reims_vgpu::graphics",
-                        "a stage-3 control message (type {ty:#x}, seqno {seqno}, object {obj_id:#x}) \
-                         was not carried out: {e:?}"
-                    );
-                    self.fail_command_buffer(message);
-                }
-                Err(raise) => {
-                    log::warn!(
-                        target: "reims_vgpu::graphics",
-                        "a stage-3 control message faulted: {raise}"
-                    );
-                    self.fail_command_buffer(message);
-                }
-            }
+            log::info!(
+                target: "reims_vgpu::graphics",
+                "context {context} closed: {dropped} objects dropped"
+            );
         });
     }
 
-    /// Carries out one `COMMAND_BUFFER` message taken from a command queue's own submission ring,
-    /// under a library entry. The decoder's completion sink is pointed at this queue's completion
-    /// ring (through `poster`) for the decode, so the buffer's completion handler, running on a GPU
-    /// thread, posts its `CB_COMPLETE` there and raises the queue's MSI-X vector. A command buffer
+    /// Carries out one message taken from a command queue's own submission ring (a `COMMAND_BUFFER`,
+    /// or on a device queue a create or destroy), under a library entry. The decoder's completion
+    /// and reflection sinks are pointed at this queue's completion ring (through `poster`) for the
+    /// decode, so a buffer's completion handler, running on a GPU thread, posts its `CB_COMPLETE`
+    /// there, and a pipeline create's reflection lands there too, raising the queue's MSI-X
+    /// vector. A command buffer
     /// the host could not carry out owes the guest a completion that no handler will post, so the
     /// host posts an internal-error one onto the queue's ring here.
     fn handle_queue(&self, poster: &QueueCompletionPoster, message: &[u8]) {
@@ -419,9 +363,14 @@ impl<P: ApiPlatform> GraphicsControl<P> {
             let sink: CompletionSink = Arc::new(move |record: RgfxCbComplete| {
                 queue_poster.post(record.as_bytes());
             });
+            let reflection_poster = poster.clone();
+            let reflection: ReflectionSink = Arc::new(move |record: RgfxPipelineReflection| {
+                reflection_poster.post(record.as_bytes());
+            });
             let outcome = {
                 let mut decoder = self.decoder.lock();
                 decoder.set_completion_sink(sink);
+                decoder.set_reflection_sink(reflection);
                 decoder.decode(&self.device, message)
             };
             match outcome {
@@ -460,24 +409,6 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         }
     }
 
-    /// Posts an internal-error completion for `message` where it is a `COMMAND_BUFFER` whose
-    /// decode failed, so a guest blocked on the buffer unblocks; other failed messages are
-    /// fire-and-forget and owe no completion.
-    fn fail_command_buffer(&self, message: &[u8]) {
-        let Some(poster) = self.poster.get() else {
-            return;
-        };
-        let Ok((header, _)) = RgfxMsgHeader::read_from_prefix(message) else {
-            return;
-        };
-        if header.r#type != RGFX_CMD_COMMAND_BUFFER {
-            return;
-        }
-        let Ok((cb, _)) = RgfxCommandBuffer::read_from_prefix(message) else {
-            return;
-        };
-        poster.post(cb_failed(cb.cb_obj_id, header.seqno).as_bytes());
-    }
 
     /// Posts an internal-error completion onto a queue's own completion ring for a `COMMAND_BUFFER`
     /// its service thread took but the decode failed, so a guest blocked on the buffer unblocks.
@@ -521,8 +452,8 @@ impl<P: ApiPlatform> Host for CallbackHost<P> {
         self.control.present_surface(iosurface_id, answer);
     }
 
-    fn stage3_message(&self, message: &[u8]) {
-        self.control.handle(message);
+    fn context_closed(&self, context: u32) {
+        self.control.close_context(context);
     }
 
     fn queue_message(&self, completion: &QueueCompletionPoster, message: &[u8]) {

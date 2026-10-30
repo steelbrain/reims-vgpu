@@ -36,6 +36,8 @@ public:
 	bool start(IOService *provider) override;
 	void stop(IOService *provider) override;
 	IOReturn clientClose() override;
+	IOReturn clientDied() override;
+	void free() override;
 
 	// Map the device region (kRgfxAccelMemoryRegion) into the client task.
 	IOReturn clientMemoryForType(UInt32 type, IOOptionBits *options,
@@ -53,6 +55,19 @@ public:
 private:
 	static IOReturn doorbellMethod(OSObject *target, void *reference,
 	                               IOExternalMethodArguments *arguments);
+
+	// The process's context (RgfxAcceleratorUserClientContexts.cpp): its selectors, and its
+	// release at the client's close or death (its queues, then the context, then its blocks).
+	IOReturn contextMethod(uint32_t selector, IOExternalMethodArguments *arguments);
+	void releaseContext();
+
+	static const UInt32 kMaxQueues = 256;
+	bool hasContext;
+	UInt32 context;
+	UInt32 slot;
+	UInt32 queueCount;
+	UInt64 queues[kMaxQueues];
+	IOLock *queueLock;
 
 	task_t task;
 	RgfxAccelerator *owner;

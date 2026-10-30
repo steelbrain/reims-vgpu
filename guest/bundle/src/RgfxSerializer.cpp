@@ -46,8 +46,18 @@ RgfxCreated RgfxSerializer::createQueue(uint64_t submit_offset, uint64_t complet
 	msg.complete_data_size = complete_data_size;
 	msg.priority = priority;
 	msg.vector = vector;
+	if (m_queueOpen != nullptr) {
+		out.posted = m_queueOpen(m_queueOpenContext, msg);
+		return out;
+	}
 	out.posted = m_control.tryPost(RGFX_CMD_QUEUE_CREATE, &msg, sizeof(msg), &out.seqno);
 	return out;
+}
+
+void RgfxSerializer::setQueueOpener(QueueOpenFn open, void *context)
+{
+	m_queueOpen = open;
+	m_queueOpenContext = context;
 }
 
 RgfxCreated RgfxSerializer::createHeap(uint64_t size_bytes, uint32_t options, int32_t heap_type,

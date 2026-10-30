@@ -56,7 +56,54 @@ enum {
 	kRgfxAccelUserClientType = 0,
 	kRgfxAccelMemoryRegion = 0,
 	kRgfxAccelMethodDoorbell = 0,
+	kRgfxAccelMethodOpenContext = 0x100,
+	kRgfxAccelMethodAlloc = 0x101,
+	kRgfxAccelMethodFree = 0x102,
+	kRgfxAccelMethodQueueCreate = 0x103,
 };
+
+// The process's device queue: its submission ring carries the object lifecycle (creates and
+// destroys, library bytes among them), its completion ring the replies.
+namespace {
+constexpr uint32_t kDeviceSubmitDataSize = 0x40000;
+constexpr uint32_t kDeviceCompleteDataSize = 0x8000;
+
+// The kext's blocks, as RgfxRegion's block source; `context` is the user client's connect.
+bool rgfxKextAlloc(void *context, uint64_t size, uint64_t align, uint64_t *offset)
+{
+	io_connect_t conn = static_cast<io_connect_t>(reinterpret_cast<uintptr_t>(context));
+	uint64_t in[2] = {size, align};
+	uint32_t outCount = 1;
+	return IOConnectCallScalarMethod(conn, kRgfxAccelMethodAlloc, in, 2, offset, &outCount) ==
+	       KERN_SUCCESS;
+}
+
+void rgfxKextRelease(void *context, uint64_t offset)
+{
+	io_connect_t conn = static_cast<io_connect_t>(reinterpret_cast<uintptr_t>(context));
+	IOConnectCallScalarMethod(conn, kRgfxAccelMethodFree, &offset, 1, nullptr, nullptr);
+}
+
+// Opens a queue through the kext, which tells the device before it returns; `flags` is
+// RGFX_QUEUE_FLAG_DEVICE for the device queue.
+bool rgfxKextOpenQueue(io_connect_t conn, const RgfxQueueCreate &q, uint32_t flags)
+{
+	uint64_t in[7] = {q.obj_id, q.submit_offset, q.complete_offset, q.submit_data_size,
+	                  q.complete_data_size, q.priority, flags};
+	uint64_t status = ~0ull;
+	uint32_t outCount = 1;
+	kern_return_t kr =
+	    IOConnectCallScalarMethod(conn, kRgfxAccelMethodQueueCreate, in, 7, &status, &outCount);
+	return kr == KERN_SUCCESS && status == RGFX_STATUS_OK;
+}
+
+// The serializer's queue opener: every queue but the device queue.
+bool rgfxKextQueueOpener(void *context, const RgfxQueueCreate &q)
+{
+	return rgfxKextOpenQueue(static_cast<io_connect_t>(reinterpret_cast<uintptr_t>(context)), q,
+	                         0);
+}
+} // namespace
 
 // The device's doorbell trampoline the queue submission rings ring: it forwards the
 // ring id to the device, which (once BAR 0's registers are mapped) writes it to the
@@ -96,7 +143,7 @@ constexpr long kGpuFamilyMinus1009 = -1009;
 	RgfxReplyReader *_replyReader; // device-completion-ring reader; null until the handshake
 	std::vector<std::unique_ptr<RgfxRingWriter>> _queueRings; // owned queue submit-ring writers
 	io_connect_t _conn;          // our accelerator user client (BAR-2 region map + doorbell)
-	std::unique_ptr<RgfxRingWriter> _controlRing; // device submission ring (ring id RGFX_DEVICE_RING_ID)
+	std::unique_ptr<RgfxRingWriter> _controlRing; // the device queue's submission ring (the lifecycle)
 	mach_vm_address_t _mapBase;  // mapped device-region base (0 until the handshake maps it)
 	mach_vm_size_t _mapSize;     // mapped device-region size
 }
@@ -175,15 +222,46 @@ constexpr long kGpuFamilyMinus1009 = -1009;
 	if (!_caps.load(info))
 		rgfxDiag("RGFX: caps blob invalid (version/zero); using defaults\n");
 
+	// The process's context: its id, address and resource-id ranges, and its blocks, from the
+	// kext, so no two processes' rings, blocks or numbers meet.
+	uint64_t ctx[4] = {};
+	uint32_t ctxCount = 4;
+	kr = IOConnectCallScalarMethod(_conn, kRgfxAccelMethodOpenContext, nullptr, 0, ctx, &ctxCount);
+	if (kr != KERN_SUCCESS) {
+		rgfxDiag("RGFX: OPEN_CONTEXT failed kr=0x%x; transport stubbed\n", kr);
+		IOServiceClose(_conn);
+		_conn = IO_OBJECT_NULL;
+		return self;
+	}
+	_ids.setBases(ctx[1], ctx[2], ctx[3]);
+	void *connContext = reinterpret_cast<void *>(static_cast<uintptr_t>(_conn));
 	_region = new RgfxRegion(base, mapSize);
-	// The bundle drives its own ring pair (the device ring, id RGFX_DEVICE_RING_ID), parallel to
-	// the framebuffer kext's control ring, so each ring keeps a single producer and consumer.
-	_controlRing = std::make_unique<RgfxRingWriter>(base + RGFX_DEVICE_SUBMIT_OFFSET,
-	                                                RGFX_CONTROL_RING_DATA_SIZE, RGFX_DEVICE_RING_ID,
-	                                                &rgfxDeviceDoorbell, (__bridge void *)self);
+	_region->setBlockSource(&rgfxKextAlloc, &rgfxKextRelease, connContext);
+
+	// The device queue: an ordinary queue ring pair, opened through the kext, whose submission
+	// ring carries the object lifecycle and whose completion ring the replies.
+	RgfxRegion::RingPair rings =
+	    _region->allocateRingPair(kDeviceSubmitDataSize, kDeviceCompleteDataSize);
+	RgfxQueueCreate deviceQueue = {};
+	deviceQueue.obj_id = _ids.allocObjId();
+	deviceQueue.submit_offset = rings.submit_offset;
+	deviceQueue.complete_offset = rings.complete_offset;
+	deviceQueue.submit_data_size = kDeviceSubmitDataSize;
+	deviceQueue.complete_data_size = kDeviceCompleteDataSize;
+	if (!rings.ok || !rgfxKextOpenQueue(_conn, deviceQueue, RGFX_QUEUE_FLAG_DEVICE)) {
+		rgfxDiag("RGFX: the device queue was refused (rings %s); transport stubbed\n",
+		         rings.ok ? "placed" : "not placed");
+		return self;
+	}
+	_controlRing = std::make_unique<RgfxRingWriter>(
+	    base + rings.submit_offset, kDeviceSubmitDataSize, static_cast<uint32_t>(rings.submit_offset),
+	    &rgfxDeviceDoorbell, (__bridge void *)self);
 	_serializer = new RgfxSerializer(*_controlRing, _ids);
-	_replyReader = new RgfxReplyReader(base + RGFX_DEVICE_COMPLETE_OFFSET,
-	                                   RGFX_CONTROL_RING_DATA_SIZE);
+	_serializer->setQueueOpener(&rgfxKextQueueOpener, connContext);
+	_replyReader = new RgfxReplyReader(base + rings.complete_offset, kDeviceCompleteDataSize);
+	rgfxDiag("RGFX: context %llu: ids 0x%llx, va 0x%llx, resource ids %llu; device queue at 0x%llx\n",
+	         (unsigned long long)ctx[0], (unsigned long long)ctx[1], (unsigned long long)ctx[2],
+	         (unsigned long long)ctx[3], (unsigned long long)rings.submit_offset);
 	rgfxDiag("RGFX: transport up: region=%llu bytes, caps=%s\n", (unsigned long long)mapSize,
 	         _caps.valid() ? "valid" : "default");
 	return self;
