@@ -29,12 +29,14 @@ use reims_graphics::wire::{
     RGFX_CMD_BUFFER_CREATE, RGFX_CMD_DEPTH_STENCIL_CREATE, RGFX_CMD_EVENT_CREATE,
     RGFX_CMD_FENCE_CREATE, RGFX_CMD_LIBRARY_CREATE, RGFX_CMD_OBJECT_DESTROY, RGFX_CMD_QUEUE_CREATE,
     RGFX_CMD_SAMPLER_CREATE, RGFX_CMD_SHARED_EVENT_CREATE, RGFX_CMD_TEXTURE_CREATE,
-    RGFX_LIBRARY_BYTES_OFFSET, RgfxBufferCreate, RgfxDepthStencilCreate, RgfxLibraryCreate,
-    RgfxMsgHeader, RgfxObjectCreate, RgfxObjectDestroy, RgfxQueueCreate, RgfxSamplerCreate,
-    RgfxSharedEventCreate, RgfxStencilDescriptor, RgfxTextureCreate, RgfxTextureDescriptor,
+    RGFX_CMD_TEXTURE_FROM_BUFFER, RGFX_LIBRARY_BYTES_OFFSET, RgfxBufferCreate,
+    RgfxDepthStencilCreate, RgfxLibraryCreate, RgfxMsgHeader, RgfxObjectCreate, RgfxObjectDestroy,
+    RgfxQueueCreate, RgfxSamplerCreate, RgfxSharedEventCreate, RgfxStencilDescriptor,
+    RgfxTextureCreate, RgfxTextureDescriptor, RgfxTextureFromBuffer,
 };
 use reims_vgpu_core::platform::Platform;
 use reims_vgpu_core::platform::device::GpuDevice;
+use reims_vgpu_core::platform::resource::Buffer;
 use reims_vgpu_core::platform::types::Swizzle;
 use reims_vgpu_core::platform::values::{
     BufferDesc, DepthStencilDesc, OptionSet, SamplerDesc, StencilDesc, TextureDesc,
@@ -66,6 +68,8 @@ pub enum DecodeError {
     UnknownCommand,
     /// The platform made no object.
     Refused,
+    /// The message named an object the host does not hold, or of the wrong kind.
+    BadReference,
 }
 
 /// The stage-3 decoder for one device: the `obj_id` → handle table and the
@@ -259,6 +263,25 @@ impl<P: Platform> GraphicsDecoder<P> {
                 // it read from a real descriptor.
                 let descriptor = self.platform.texture_descriptor(&desc);
                 match device.new_texture(OnFault::Return, &descriptor)? {
+                    Some(texture) => self.insert(m.obj_id, ObjHandle::Texture(texture)),
+                    None => Ok(Err(DecodeError::Refused)),
+                }
+            }
+            RGFX_CMD_TEXTURE_FROM_BUFFER => {
+                let Some(m) = read::<RgfxTextureFromBuffer>(message) else {
+                    return Ok(Err(DecodeError::Malformed));
+                };
+                let desc = texture_desc(&m.desc, m.resource_id);
+                let descriptor = self.platform.texture_descriptor(&desc);
+                // The texture reads the guest's named buffer; a buffer the host
+                // does not hold is a guest protocol error, not a refusal.
+                let made = {
+                    let Some(ObjHandle::Buffer(buffer)) = self.objects.get(&m.buffer_obj_id) else {
+                        return Ok(Err(DecodeError::BadReference));
+                    };
+                    buffer.new_texture(OnFault::Return, &descriptor, m.offset, m.bytes_per_row)?
+                };
+                match made {
                     Some(texture) => self.insert(m.obj_id, ObjHandle::Texture(texture)),
                     None => Ok(Err(DecodeError::Refused)),
                 }
@@ -486,7 +509,51 @@ mod tests {
         };
         assert_eq!(dec.decode(&device, texture.as_bytes()).unwrap(), Ok(()));
 
-        assert_eq!(dec.object_count(), 9);
+        // A texture over the buffer just made, read from an offset.
+        let tex_from_buf = RgfxTextureFromBuffer {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_TEXTURE_FROM_BUFFER,
+                size: size_of::<RgfxTextureFromBuffer>() as u32,
+                seqno: 0,
+            },
+            obj_id: 19,
+            resource_id: 0x43,
+            buffer_obj_id: 17,
+            offset: 0,
+            bytes_per_row: 1920 * 4,
+            desc: RgfxTextureDescriptor {
+                pixel_format: 80,
+                texture_type: 2,
+                width: 1920,
+                height: 1200,
+                depth: 1,
+                mipmap_level_count: 1,
+                array_length: 1,
+                sample_count: 1,
+                usage: 1, // ShaderRead
+                options: 0,
+                swizzle: 0,
+                reserved_2c: 0,
+            },
+        };
+        assert_eq!(
+            dec.decode(&device, tex_from_buf.as_bytes()).unwrap(),
+            Ok(())
+        );
+
+        // A texture over a buffer the host never made is a bad reference, not a
+        // refusal, and makes no object.
+        let bad = RgfxTextureFromBuffer {
+            obj_id: 20,
+            buffer_obj_id: 999,
+            ..tex_from_buf
+        };
+        assert_eq!(
+            dec.decode(&device, bad.as_bytes()).unwrap(),
+            Err(DecodeError::BadReference)
+        );
+
+        assert_eq!(dec.object_count(), 10);
         let log = p.call_log();
         assert_eq!(log.calls_to("newEvent").len(), 1);
         assert_eq!(log.calls_to("newFence").len(), 1);
@@ -497,6 +564,11 @@ mod tests {
         assert_eq!(log.calls_to("newDepthStencilStateWithDescriptor:").len(), 1);
         assert_eq!(log.calls_to("newBufferWithDescriptor:").len(), 1);
         assert_eq!(log.calls_to("newTextureWithDescriptor:").len(), 1);
+        assert_eq!(
+            log.calls_to("newTextureWithDescriptor:offset:bytesPerRow:")
+                .len(),
+            1
+        );
 
         // Destroying the event drops its handle; the others stay.
         let destroy = RgfxObjectDestroy {
@@ -508,7 +580,7 @@ mod tests {
             obj_id: 10,
         };
         assert_eq!(dec.decode(&device, destroy.as_bytes()).unwrap(), Ok(()));
-        assert_eq!(dec.object_count(), 8);
+        assert_eq!(dec.object_count(), 9);
         // Destroying an id the host never made is not an error.
         assert_eq!(dec.decode(&device, destroy.as_bytes()).unwrap(), Ok(()));
 
