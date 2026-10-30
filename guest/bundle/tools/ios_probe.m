@@ -4,6 +4,7 @@
 //                              pixels, (B) a blit into the texture reaches the surface's
 //                              pages, (C) a render-pass clear reaches them; print the id,
 //                              then keep the surface alive HOLD_SECONDS for a reader.
+//   (IOS_W/IOS_H set the surface size, 64x64 by default)
 //   ios_probe read ID HEX      another process: look the surface up by id, lock it, check
 //                              every pixel is HEX.
 // Build: xcrun clang -arch x86_64 -fobjc-arc -framework Metal -framework IOSurface
@@ -16,7 +17,7 @@
 #include <string.h>
 #include <unistd.h>
 
-static const int W = 64, H = 64;
+static int W = 64, H = 64; // IOS_W / IOS_H override
 
 static int checkSurface(IOSurfaceRef s, uint32_t want, const char *what)
 {
@@ -74,10 +75,13 @@ static int waitCB(id<MTLCommandBuffer> cb, const char *what)
 
 int main(int argc, char **argv)
 {
+	setvbuf(stdout, NULL, _IONBF, 0);
 	@autoreleasepool {
 		if (argc >= 4 && strcmp(argv[1], "read") == 0) {
 			IOSurfaceID sid = (IOSurfaceID)strtoul(argv[2], NULL, 0);
 			uint32_t want = (uint32_t)strtoul(argv[3], NULL, 16);
+			if (getenv("IOS_W")) W = atoi(getenv("IOS_W"));
+			if (getenv("IOS_H")) H = atoi(getenv("IOS_H"));
 			IOSurfaceRef s = IOSurfaceLookup(sid);
 			if (s == NULL) {
 				printf("reader: IOSurfaceLookup(%u) = NULL\n", sid);
@@ -88,6 +92,8 @@ int main(int argc, char **argv)
 			return rc;
 		}
 		int hold = argc >= 2 ? atoi(argv[1]) : 0;
+		if (getenv("IOS_W")) W = atoi(getenv("IOS_W"));
+		if (getenv("IOS_H")) H = atoi(getenv("IOS_H"));
 
 		id<MTLDevice> dev = nil;
 		for (id<MTLDevice> d in MTLCopyAllDevices()) {
@@ -206,6 +212,43 @@ int main(int argc, char **argv)
 			[[cb renderCommandEncoderWithDescriptor:rp] endEncoding];
 			fails += waitCB(cb, "E");
 			fails += checkSurface(s, 0xffff0000, "E (red clear, left for the reader)");
+		}
+		// IOS_BENCH=N: N full-surface render clears, each committed and waited for alone,
+		// timed from commit to completion (the GPU's clear plus the write-back to the
+		// surface's pages), as a compositor's frame pays it.
+		// The same clears of a Private texture of the surface's size (no surface sync)
+		// follow, for comparison.
+		int bench = getenv("IOS_BENCH") ? atoi(getenv("IOS_BENCH")) : 0;
+		MTLTextureDescriptor *pd =
+		    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+		                                                       width:W
+		                                                      height:H
+		                                                   mipmapped:NO];
+		pd.usage = MTLTextureUsageRenderTarget;
+		pd.storageMode = MTLStorageModePrivate;
+		id<MTLTexture> priv = bench > 0 ? [dev newTextureWithDescriptor:pd] : nil;
+		for (int pass = 0; pass < (bench > 0 ? 2 : 0); pass++) {
+		double sum = 0, lo = 1e9, hi = 0;
+		for (int i = 0; i < bench; i++) {
+			MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+			rp.colorAttachments[0].texture = pass == 0 ? tex : priv;
+			rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+			rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+			rp.colorAttachments[0].clearColor = MTLClearColorMake(1, 0, 0, 1);
+			id<MTLCommandBuffer> cb = [q commandBuffer];
+			[[cb renderCommandEncoderWithDescriptor:rp] endEncoding];
+			NSTimeInterval t0 = [NSDate timeIntervalSinceReferenceDate];
+			[cb commit];
+			[cb waitUntilCompleted];
+			double ms = ([NSDate timeIntervalSinceReferenceDate] - t0) * 1e3;
+			sum += ms;
+			lo = ms < lo ? ms : lo;
+			hi = ms > hi ? ms : hi;
+		}
+		printf("BENCH %s %dx%d bpr %zu: %d clears, commit->complete ms min %.3f avg %.3f max %.3f\n",
+		       pass == 0 ? "iosurface" : "private", W, H, IOSurfaceGetBytesPerRow(s), bench, lo,
+		       sum / bench, hi);
+		if (pass == 0) fails += checkSurface(s, 0xffff0000, "BENCH (last clear in the pages)");
 		}
 		printf("RESULT %s (%d failures) SURFACE_ID=%u\n", fails ? "FAIL" : "PASS", fails,
 		       IOSurfaceGetID(s));
