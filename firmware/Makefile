@@ -2,7 +2,7 @@
 # EFI boot-service driver and packaged as a PCI option ROM
 # (docs/architecture.md 11.4). ReimsVgpu is apple-gfx-pci's; ReimsGraphics is
 # the reims-graphics device's (docs/graphics-kext/design.md), built on the
-# guest's wire protocol header in ../guest/include.
+# host's wire protocol header in ../crates/reims-graphics/include.
 #
 #   make        build/ReimsVgpu.{efi,rom} and build/ReimsGraphics.{efi,rom}
 #   make clean  remove build/
@@ -40,7 +40,18 @@ LDFLAGS = /nologo /nodefaultlib /dll /driver /base:0 /machine:x64 \
 OBJECTS = $(patsubst src/%,$(BUILD)/obj/%.obj,$(basename $(SOURCES)))
 
 GNAME = ReimsGraphics
-WIRE  = ../guest/include
+WIRE  = ../crates/reims-graphics/include
+
+# The ROM's PCI identity is the host wire header's. It is generated C, not
+# assembler, so its macro values are read with the preprocessor and passed to
+# ReimsGraphicsRom.S. ROM_CLASS_CODE is the 24-bit class code: the header's
+# 16-bit class and subclass over a zero programming-interface byte.
+RGFX_DUMP   = $(CC) --target=x86_64-unknown-none-elf -E -dM -x c $(WIRE)/reims_graphics_wire.h
+ROM_VENDOR  = $(shell $(RGFX_DUMP) 2>/dev/null | sed -n 's/^\#define RGFX_PCI_VENDOR_ID //p')
+ROM_DEVICE  = $(shell $(RGFX_DUMP) 2>/dev/null | sed -n 's/^\#define RGFX_PCI_DEVICE_ID //p')
+ROM_CLASS16 = $(shell $(RGFX_DUMP) 2>/dev/null | sed -n 's/^\#define RGFX_PCI_CLASS //p')
+GROMDEFS    = -DROM_VENDOR_ID=$(ROM_VENDOR) -DROM_DEVICE_ID=$(ROM_DEVICE) \
+	'-DROM_CLASS_CODE=(($(ROM_CLASS16)) << 8)'
 
 GSOURCES = \
 	src/ReimsGraphics.c \
@@ -68,9 +79,9 @@ $(BUILD)/$(NAME).rom: src/OptionRom.S src/ReimsVgpu.h $(BUILD)/$(NAME).efi
 $(BUILD)/$(NAME).efi: $(OBJECTS)
 	$(LD) $(LDFLAGS) /out:$@ $^
 
-$(BUILD)/$(GNAME).rom: src/ReimsGraphicsRom.S src/OptionRom.S src/ReimsGraphics.h \
+$(BUILD)/$(GNAME).rom: src/ReimsGraphicsRom.S src/OptionRom.S \
 		$(WIRE)/reims_graphics_wire.h $(BUILD)/$(GNAME).efi
-	$(CC) --target=x86_64-unknown-none-elf -I$(WIRE) -DEFI_IMAGE='"$(BUILD)/$(GNAME).efi"' \
+	$(CC) --target=x86_64-unknown-none-elf $(GROMDEFS) -DEFI_IMAGE='"$(BUILD)/$(GNAME).efi"' \
 		-c $< -o $(BUILD)/obj/ReimsGraphicsRom.o
 	$(ROMLD) --oformat binary -o $@ $(BUILD)/obj/ReimsGraphicsRom.o
 

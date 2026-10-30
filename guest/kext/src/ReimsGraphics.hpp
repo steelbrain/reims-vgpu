@@ -107,9 +107,11 @@ private:
 	UInt32 readRegister(UInt32 offset) const;
 	void writeRegister(UInt32 offset, UInt32 value);
 	volatile UInt8 *ring(UInt32 offset) const;
-	bool tryPost(UInt32 type, const void *payload, UInt32 payloadSize, UInt64 *seqno);
-	IOReturn post(UInt32 type, const void *payload, UInt32 payloadSize, UInt64 *seqno);
-	IOReturn command(UInt32 type, const void *payload, UInt32 payloadSize);
+	// A message is a full struct (RgfxSetScanout and the like) whose header
+	// tryPost stamps with the type, size and seqno; the caller fills the rest.
+	bool tryPost(UInt32 type, const void *message, UInt32 size, UInt64 *seqno);
+	IOReturn post(UInt32 type, const void *message, UInt32 size, UInt64 *seqno);
+	IOReturn command(UInt32 type, const void *message, UInt32 size);
 	void kickWorkLoop();
 
 	// The work loop: the completion ring and what follows from it.

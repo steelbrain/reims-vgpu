@@ -8,10 +8,9 @@
 #ifndef REIMS_GRAPHICS_H_
 #define REIMS_GRAPHICS_H_
 
-#include "reims_graphics_wire.h"
-
 #ifndef __ASSEMBLER__
 
+#include "reims_graphics_wire.h"
 #include "Uefi.h"
 
 #define EFI_DEVICE_ERROR  EFIERR (7)
@@ -96,7 +95,7 @@ extern EFI_COMPONENT_NAME_PROTOCOL   gReimsGraphicsComponentName;
 extern EFI_COMPONENT_NAME2_PROTOCOL  gReimsGraphicsComponentName2;
 
 /**
-  Send SET_SCANOUT for the private data's mode at RG_GUEST_ALLOC_OFFSET, or
+  Send SET_SCANOUT for the private data's mode at RGFX_ALLOCATIONS_OFFSET, or
   blank the display when Blank is set, and wait for its COMPLETE.
 **/
 EFI_STATUS

@@ -1,12 +1,11 @@
 /** @file
   The reims-graphics device's option ROM: OptionRom.S's layout around its
-  driver's image, with the device's PCI identity.
+  driver's image.
+
+  Its PCI identity (ROM_VENDOR_ID, ROM_DEVICE_ID and ROM_CLASS_CODE) comes from
+  the host wire header. That header is generated C and cannot be assembled, so
+  the Makefile reads the three values from it with the preprocessor and passes
+  them in; OptionRom.S then takes them in place of apple-gfx-pci's.
 **/
-
-#include "ReimsGraphics.h"
-
-#define ROM_VENDOR_ID   RG_PCI_VENDOR_ID
-#define ROM_DEVICE_ID   RG_PCI_DEVICE_ID
-#define ROM_CLASS_CODE  RG_PCI_CLASS_CODE
 
 #include "OptionRom.S"

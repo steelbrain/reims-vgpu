@@ -1,6 +1,6 @@
 /** @file
   Graphics Output Protocol of the reims-graphics device: one mode, a linear
-  32-bit BGRX framebuffer in the region at RG_GUEST_ALLOC_OFFSET, whose rows
+  32-bit BGRX framebuffer in the region at RGFX_ALLOCATIONS_OFFSET, whose rows
   are the private data's Stride bytes apart.
 **/
 
@@ -12,7 +12,7 @@ FrameBuffer (
   IN REIMS_GRAPHICS_PRIVATE_DATA  *Private
   )
 {
-  return (UINT8 *)(UINTN)(Private->RegionBase + RG_GUEST_ALLOC_OFFSET);
+  return (UINT8 *)(UINTN)(Private->RegionBase + RGFX_ALLOCATIONS_OFFSET);
 }
 
 STATIC
@@ -87,7 +87,7 @@ ReimsGraphicsGraphicsOutputSetMode (
 
   This->Mode->Mode            = ModeNumber;
   This->Mode->SizeOfInfo      = sizeof (EFI_GRAPHICS_OUTPUT_MODE_INFORMATION);
-  This->Mode->FrameBufferBase = Private->RegionBase + RG_GUEST_ALLOC_OFFSET;
+  This->Mode->FrameBufferBase = Private->RegionBase + RGFX_ALLOCATIONS_OFFSET;
   This->Mode->FrameBufferSize = Size;
   SetModeInformation (Private, This->Mode->Info);
   return EFI_SUCCESS;

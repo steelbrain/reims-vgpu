@@ -31,7 +31,7 @@ BOOT_KC    ?=
 
 ARCH = -arch x86_64 -isysroot $(SDK) -mmacosx-version-min=26.0
 
-FLAGS = $(ARCH) -mkernel -nostdinc -isystem $(KERNEL) -I../include \
+FLAGS = $(ARCH) -mkernel -nostdinc -isystem $(KERNEL) -I../../crates/reims-graphics/include \
 	-DKERNEL -DBUNDLE_VERSION='"$(VERSION)"' \
 	-Os -Wall -Wextra -Werror -Wno-unused-parameter \
 	-Wno-deprecated-declarations
@@ -43,7 +43,7 @@ OBJECTS = $(BUILD)/obj/ReimsGraphics.o $(BUILD)/obj/kmod_info.o
 
 all: $(BINARY)
 
-$(BUILD)/obj/%.o: src/%.cpp src/ReimsGraphics.hpp ../include/reims_graphics_wire.h Makefile
+$(BUILD)/obj/%.o: src/%.cpp src/ReimsGraphics.hpp ../../crates/reims-graphics/include/reims_graphics_wire.h Makefile
 	@mkdir -p $(@D)
 	xcrun clang++ $(CXXFLAGS) -c $< -o $@
 
@@ -53,7 +53,7 @@ $(BUILD)/obj/%.o: src/%.c Makefile
 
 # The driver's source with its debug information, which check-layout.py reads
 # for the SDK's IOFramebuffer.
-$(BUILD)/obj/layout.o: src/ReimsGraphics.cpp src/ReimsGraphics.hpp ../include/reims_graphics_wire.h Makefile
+$(BUILD)/obj/layout.o: src/ReimsGraphics.cpp src/ReimsGraphics.hpp ../../crates/reims-graphics/include/reims_graphics_wire.h Makefile
 	@mkdir -p $(@D)
 	xcrun clang++ $(CXXFLAGS) -g -fstandalone-debug -c $< -o $@
 

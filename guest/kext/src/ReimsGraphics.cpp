@@ -14,8 +14,20 @@ OSDefineMetaClassAndStructors(ReimsGraphics, IOFramebuffer);
 
 namespace {
 
-constexpr UInt32 kRingBytes = RG_CONTROL_RING_BYTES;
-constexpr UInt32 kHeaderBytes = sizeof(struct rg_msg_header);
+// The control ring's byte ring is a power of two, so an index wraps with a mask.
+constexpr UInt32 kRingBytes = RGFX_CONTROL_RING_DATA_SIZE;
+constexpr UInt32 kRingMask = kRingBytes - 1;
+static_assert((kRingBytes & kRingMask) == 0, "the ring size is not a power of two");
+constexpr UInt32 kHeaderBytes = sizeof(RgfxMsgHeader);
+
+// A message's size is a multiple of this.
+constexpr UInt32 kMsgAlign = 8;
+
+// The ring header's fields, by their offset in it (each in a 64-byte line).
+constexpr UInt32 kRingProducer = __builtin_offsetof(RgfxRingHeader, producer);
+constexpr UInt32 kRingConsumer = __builtin_offsetof(RgfxRingHeader, consumer);
+constexpr UInt32 kRingConsumerIdle = __builtin_offsetof(RgfxRingHeader, consumer_idle);
+constexpr UInt32 kRingArmed = __builtin_offsetof(RgfxRingHeader, armed);
 
 // The cursor image's slot, at the region's end: 256 x 256 BGRA8, the largest
 // image the hardware cursor takes. A larger one is IOFramebuffer's to draw.
@@ -88,18 +100,17 @@ volatile UInt8 *ReimsGraphics::ring(UInt32 offset) const
 
 // Puts one command on ring 0 if it fits, without blocking: callable with a
 // spin lock held. The doorbell rings only when the host's consumer sleeps.
-bool ReimsGraphics::tryPost(UInt32 type, const void *payload, UInt32 payloadSize, UInt64 *seqno)
+bool ReimsGraphics::tryPost(UInt32 type, const void *message, UInt32 size, UInt64 *seqno)
 {
 	UInt64 words[8] = {};
-	UInt32 size = RG_MSG_SIZE(payloadSize);
-	if (size > sizeof(words) || !ready)
+	if (size < kHeaderBytes || size % kMsgAlign || size > sizeof(words) || !ready)
 		return false;
-	volatile UInt8 *header = ring(RG_CONTROL_SUBMIT_OFFSET);
-	volatile UInt8 *bytes = header + RG_RING_HEADER_SIZE;
+	volatile UInt8 *header = ring(RGFX_CONTROL_SUBMIT_OFFSET);
+	volatile UInt8 *bytes = header + RGFX_RING_HEADER_SIZE;
 
 	IOSimpleLockLock(submitLock);
-	UInt64 used = produced - load64(header + RG_RING_CONSUMER);
-	UInt32 offset = static_cast<UInt32>(produced % kRingBytes);
+	UInt64 used = produced - load64(header + kRingConsumer);
+	UInt32 offset = static_cast<UInt32>(produced) & kRingMask;
 	UInt32 tail = kRingBytes - offset;
 	UInt32 pad = tail < size ? tail : 0;
 	if (used > kRingBytes || kRingBytes - used < static_cast<UInt64>(pad) + size) {
@@ -110,7 +121,7 @@ bool ReimsGraphics::tryPost(UInt32 type, const void *payload, UInt32 payloadSize
 		// A message never wraps: type 0 pads to the ring's end. When 8
 		// bytes are left, they hold its type and size alone.
 		volatile UInt32 *p = reinterpret_cast<volatile UInt32 *>(bytes + offset);
-		p[0] = RG_MSG_PAD;
+		p[0] = RGFX_MSG_PAD;
 		p[1] = pad;
 		if (pad >= kHeaderBytes)
 			*reinterpret_cast<volatile UInt64 *>(bytes + offset + 8) = 0;
@@ -118,18 +129,20 @@ bool ReimsGraphics::tryPost(UInt32 type, const void *payload, UInt32 payloadSize
 		offset = 0;
 	}
 	UInt64 s = nextSeqno++;
-	struct rg_msg_header h = {type, size, s};
-	memcpy(words, &h, sizeof(h));
-	if (payloadSize)
-		memcpy(reinterpret_cast<UInt8 *>(words) + sizeof(h), payload, payloadSize);
+	// The caller filled the payload fields; the header is stamped here.
+	memcpy(words, message, size);
+	RgfxMsgHeader *h = reinterpret_cast<RgfxMsgHeader *>(words);
+	h->type = type;
+	h->size = size;
+	h->seqno = s;
 	volatile UInt64 *dst = reinterpret_cast<volatile UInt64 *>(bytes + offset);
 	for (UInt32 i = 0; i < size / 8; i++)
 		dst[i] = words[i];
 	produced += size;
-	store64(header + RG_RING_PRODUCER, produced);
+	store64(header + kRingProducer, produced);
 	fullFence();
-	if (load32(header + RG_RING_CONSUMER_IDLE) == 1)
-		writeRegister(RG_REG_DOORBELL, RG_CONTROL_RING_ID);
+	if (load32(header + kRingConsumerIdle) == 1)
+		writeRegister(RGFX_REG_DOORBELL, RGFX_CONTROL_RING_ID);
 	IOSimpleLockUnlock(submitLock);
 
 	if (seqno)
@@ -138,10 +151,10 @@ bool ReimsGraphics::tryPost(UInt32 type, const void *payload, UInt32 payloadSize
 }
 
 // Puts one command on ring 0, waiting for space: thread context only.
-IOReturn ReimsGraphics::post(UInt32 type, const void *payload, UInt32 payloadSize, UInt64 *seqno)
+IOReturn ReimsGraphics::post(UInt32 type, const void *message, UInt32 size, UInt64 *seqno)
 {
 	for (UInt32 waited = 0;; waited++) {
-		if (tryPost(type, payload, payloadSize, seqno))
+		if (tryPost(type, message, size, seqno))
 			return kIOReturnSuccess;
 		if (!ready)
 			return kIOReturnNotReady;
@@ -155,10 +168,10 @@ IOReturn ReimsGraphics::post(UInt32 type, const void *payload, UInt32 payloadSiz
 
 // Sends a command and waits for its answer, COMPLETE or DISPLAYS, which the
 // work loop hands over: thread context only, never on the work loop.
-IOReturn ReimsGraphics::command(UInt32 type, const void *payload, UInt32 payloadSize)
+IOReturn ReimsGraphics::command(UInt32 type, const void *message, UInt32 size)
 {
 	UInt64 seqno = 0;
-	IOReturn r = post(type, payload, payloadSize, &seqno);
+	IOReturn r = post(type, message, size, &seqno);
 	if (r != kIOReturnSuccess)
 		return r;
 
@@ -212,12 +225,12 @@ void ReimsGraphics::service()
 {
 	if (!ready)
 		return;
-	volatile UInt8 *events = ring(RG_CONTROL_EVENT_OFFSET);
+	volatile UInt8 *events = ring(RGFX_CONTROL_COMPLETE_OFFSET);
 	for (;;) {
 		drainEvents();
-		store32(events + RG_RING_ARMED, 1);
+		store32(events + kRingArmed, 1);
 		fullFence();
-		if (load64(events + RG_RING_PRODUCER) == consumed)
+		if (load64(events + kRingProducer) == consumed)
 			break;
 	}
 
@@ -225,13 +238,16 @@ void ReimsGraphics::service()
 	bool want = vblankWanted;
 	IOSimpleLockUnlock(interruptLock);
 	if (want != vblankSent) {
-		struct rg_set_vblank v = {displayId, want ? 1u : 0u};
-		if (tryPost(RG_CMD_SET_VBLANK, &v, sizeof(v), nullptr))
+		RgfxSetVblank v = {};
+		v.display = displayId;
+		v.enabled = want ? 1u : 0u;
+		if (tryPost(RGFX_CMD_SET_VBLANK, &v, sizeof(v), nullptr))
 			vblankSent = want;
 	}
 	if (refreshWanted) {
 		UInt64 seqno = 0;
-		if (tryPost(RG_CMD_GET_DISPLAYS, nullptr, 0, &seqno)) {
+		RgfxGetDisplays getDisplays = {};
+		if (tryPost(RGFX_CMD_GET_DISPLAYS, &getDisplays, sizeof(getDisplays), &seqno)) {
 			refreshWanted = false;
 			refreshSeqno = seqno;
 		}
@@ -240,9 +256,9 @@ void ReimsGraphics::service()
 
 bool ReimsGraphics::drainEvents()
 {
-	volatile UInt8 *header = ring(RG_CONTROL_EVENT_OFFSET);
-	volatile UInt8 *bytes = header + RG_RING_HEADER_SIZE;
-	UInt64 end = load64(header + RG_RING_PRODUCER);
+	volatile UInt8 *header = ring(RGFX_CONTROL_COMPLETE_OFFSET);
+	volatile UInt8 *bytes = header + RGFX_RING_HEADER_SIZE;
+	UInt64 end = load64(header + kRingProducer);
 	bool any = consumed != end;
 	while (consumed != end) {
 		if (end - consumed > kRingBytes) {
@@ -261,11 +277,11 @@ bool ReimsGraphics::drainEvents()
 		UInt32 type = field32(m, 0);
 		UInt32 size = field32(m, 4);
 		UInt64 seqno = *reinterpret_cast<const volatile UInt64 *>(m + 8);
-		if (type == RG_MSG_PAD) {
+		if (type == RGFX_MSG_PAD) {
 			consumed += tail;
 			continue;
 		}
-		if (size < kHeaderBytes || size % RG_MSG_ALIGN || size > tail || size > end - consumed) {
+		if (size < kHeaderBytes || size % kMsgAlign || size > tail || size > end - consumed) {
 			IOLog("ReimsGraphics: malformed event (type %u, size %u); skipping the ring's contents\n",
 			      type, size);
 			consumed = end;
@@ -274,7 +290,7 @@ bool ReimsGraphics::drainEvents()
 		handleEvent(type, seqno, m + kHeaderBytes, size - kHeaderBytes);
 		consumed += size;
 	}
-	store64(header + RG_RING_CONSUMER, consumed);
+	store64(header + kRingConsumer, consumed);
 	return any;
 }
 
@@ -282,10 +298,10 @@ void ReimsGraphics::handleEvent(UInt32 type, UInt64 seqno, const volatile UInt8 
 {
 	Interrupt fire = {};
 	switch (type) {
-	case RG_EVT_COMPLETE:
-		answer(seqno, size >= sizeof(struct rg_complete) ? field32(payload, 0) : kStatusUnreadable);
+	case RGFX_EVT_COMPLETE:
+		answer(seqno, size >= sizeof(uint32_t) ? field32(payload, 0) : kStatusUnreadable);
 		return;
-	case RG_EVT_DISPLAYS: {
+	case RGFX_EVT_DISPLAYS: {
 		answer(seqno, parseDisplays(payload, size));
 		if (seqno != refreshSeqno)
 			return;
@@ -297,10 +313,10 @@ void ReimsGraphics::handleEvent(UInt32 type, UInt64 seqno, const volatile UInt8 
 		IOSimpleLockUnlock(interruptLock);
 		break;
 	}
-	case RG_EVT_DISPLAY_CHANGED:
+	case RGFX_EVT_DISPLAY_CHANGED:
 		refreshWanted = true;
 		return;
-	case RG_EVT_VBLANK:
+	case RGFX_EVT_VBLANK:
 		IOSimpleLockLock(interruptLock);
 		fire = vblank;
 		IOSimpleLockUnlock(interruptLock);
@@ -327,23 +343,24 @@ void ReimsGraphics::answer(UInt64 seqno, UInt32 status)
 // scanout space cannot hold are left out. Returns the answer's status.
 UInt32 ReimsGraphics::parseDisplays(const volatile UInt8 *payload, UInt32 size)
 {
-	if (size < sizeof(struct rg_displays))
+	if (size < sizeof(uint32_t))
 		return kStatusUnreadable;
 	UInt32 count = field32(payload, 0);
-	UInt32 offset = sizeof(struct rg_displays);
+	// The first display record follows count, past the message header.
+	UInt32 offset = RGFX_DISPLAYS_ENTRIES_OFFSET - kHeaderBytes;
 
 	IOLockLock(stateLock);
 	bool found = false;
 	UInt32 id = 0, isConnected = 0, preferred = 0, listed = 0, listAt = 0;
 	for (UInt32 i = 0; i < count; i++) {
-		if (size - offset < sizeof(struct rg_display)) {
+		if (size - offset < sizeof(RgfxDisplayEntry)) {
 			IOLockUnlock(stateLock);
 			return kStatusUnreadable;
 		}
 		UInt32 did = field32(payload, offset);
 		UInt32 n = field32(payload, offset + 12);
-		UInt32 at = offset + sizeof(struct rg_display);
-		if (static_cast<UInt64>(n) * sizeof(struct rg_mode) > size - at) {
+		UInt32 at = offset + sizeof(RgfxDisplayEntry);
+		if (static_cast<UInt64>(n) * sizeof(RgfxModeEntry) > size - at) {
 			IOLockUnlock(stateLock);
 			return kStatusUnreadable;
 		}
@@ -355,7 +372,7 @@ UInt32 ReimsGraphics::parseDisplays(const volatile UInt8 *payload, UInt32 size)
 			listed = n;
 			listAt = at;
 		}
-		offset = at + n * sizeof(struct rg_mode);
+		offset = at + n * sizeof(RgfxModeEntry);
 	}
 	if (!found) {
 		connected = false;
@@ -368,7 +385,7 @@ UInt32 ReimsGraphics::parseDisplays(const volatile UInt8 *payload, UInt32 size)
 	IODisplayModeID freshPreferred = 0;
 	UInt64 limit = scanoutLimit();
 	for (UInt32 j = 0; j < listed && freshCount < kMaxModes; j++) {
-		UInt32 at = listAt + j * sizeof(struct rg_mode);
+		UInt32 at = listAt + j * sizeof(RgfxModeEntry);
 		Mode m = {0, field32(payload, at), field32(payload, at + 4), field32(payload, at + 8)};
 		if (!m.width || !m.height || m.width > kMaxDimension || m.height > kMaxDimension ||
 		    static_cast<UInt64>(strideFor(m.width)) * m.height > limit) {
@@ -427,7 +444,7 @@ UInt32 ReimsGraphics::strideFor(UInt32 width)
 // The scanout buffer's room: from the guest's allocations up to the cursor.
 UInt64 ReimsGraphics::scanoutLimit() const
 {
-	return regionSize - RG_GUEST_ALLOC_OFFSET - kCursorSlot;
+	return regionSize - RGFX_ALLOCATIONS_OFFSET - kCursorSlot;
 }
 
 IOReturn ReimsGraphics::setScanout(const Mode &mode)
@@ -435,8 +452,13 @@ IOReturn ReimsGraphics::setScanout(const Mode &mode)
 	UInt32 stride = strideFor(mode.width);
 	if (static_cast<UInt64>(stride) * mode.height > scanoutLimit())
 		return kIOReturnNoSpace;
-	struct rg_set_scanout s = {displayId, mode.width, mode.height, stride, RG_GUEST_ALLOC_OFFSET};
-	IOReturn r = command(RG_CMD_SET_SCANOUT, &s, sizeof(s));
+	RgfxSetScanout s = {};
+	s.display = displayId;
+	s.width = mode.width;
+	s.height = mode.height;
+	s.stride = stride;
+	s.offset = RGFX_ALLOCATIONS_OFFSET;
+	IOReturn r = command(RGFX_CMD_SET_SCANOUT, &s, sizeof(s));
 	if (r != kIOReturnSuccess)
 		return r;
 	IOLockLock(stateLock);
@@ -469,6 +491,7 @@ bool ReimsGraphics::start(IOService *provider)
 	int msixIndex = -1;
 	IOReturn r = kIOReturnSuccess;
 	UInt32 count = 0;
+	RgfxGetDisplays getDisplays = {};
 
 	registerMap = pci->mapDeviceMemoryWithRegister(kIOPCIConfigBaseAddress0);
 	if (!registerMap) {
@@ -476,9 +499,9 @@ bool ReimsGraphics::start(IOService *provider)
 		goto fail;
 	}
 	registers = reinterpret_cast<volatile UInt8 *>(registerMap->getVirtualAddress());
-	if (readRegister(RG_REG_MAGIC) != RG_MAGIC || readRegister(RG_REG_VERSION) != RG_VERSION) {
+	if (readRegister(RGFX_REG_MAGIC) != RGFX_MAGIC || readRegister(RGFX_REG_VERSION) != RGFX_VERSION) {
 		IOLog("ReimsGraphics: not the device: magic 0x%x, version %u\n",
-		      readRegister(RG_REG_MAGIC), readRegister(RG_REG_VERSION));
+		      readRegister(RGFX_REG_MAGIC), readRegister(RGFX_REG_VERSION));
 		goto fail;
 	}
 
@@ -488,16 +511,16 @@ bool ReimsGraphics::start(IOService *provider)
 		goto fail;
 	}
 	region->retain();
-	regionSize = (static_cast<UInt64>(readRegister(RG_REG_REGION_SIZE_HI)) << 32) |
-	             readRegister(RG_REG_REGION_SIZE_LO);
+	regionSize = (static_cast<UInt64>(readRegister(RGFX_REG_REGION_SIZE_HI)) << 32) |
+	             readRegister(RGFX_REG_REGION_SIZE_LO);
 	if (regionSize > region->getLength())
 		regionSize = region->getLength();
-	if (regionSize <= RG_GUEST_ALLOC_OFFSET + kCursorSlot) {
+	if (regionSize <= RGFX_ALLOCATIONS_OFFSET + kCursorSlot) {
 		IOLog("ReimsGraphics: the region is too small: 0x%llx bytes\n", regionSize);
 		goto fail;
 	}
 	ringMap = region->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapCopybackCache, 0,
-	                                      RG_GUEST_ALLOC_OFFSET);
+	                                      RGFX_ALLOCATIONS_OFFSET);
 	cursorMap = region->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapCopybackCache,
 	                                        regionSize - kCursorSlot, kCursorSlot);
 	if (!ringMap || !cursorMap) {
@@ -534,16 +557,16 @@ bool ReimsGraphics::start(IOService *provider)
 
 	// The device from scratch: reset, then take the rings' counters as
 	// they stand and say the driver is ready.
-	writeRegister(RG_REG_STATUS, RG_STATUS_RESET);
-	produced = load64(ring(RG_CONTROL_SUBMIT_OFFSET) + RG_RING_PRODUCER);
-	consumed = load64(ring(RG_CONTROL_EVENT_OFFSET) + RG_RING_CONSUMER);
-	writeRegister(RG_REG_STATUS, RG_STATUS_DRIVER_READY);
+	writeRegister(RGFX_REG_STATUS, RGFX_STATUS_RESET);
+	produced = load64(ring(RGFX_CONTROL_SUBMIT_OFFSET) + kRingProducer);
+	consumed = load64(ring(RGFX_CONTROL_COMPLETE_OFFSET) + kRingConsumer);
+	writeRegister(RGFX_REG_STATUS, RGFX_STATUS_DRIVER_READY);
 	ready = true;
 	msix->enable();
 	kick->enable();
 	kickWorkLoop();
 
-	r = command(RG_CMD_GET_DISPLAYS, nullptr, 0);
+	r = command(RGFX_CMD_GET_DISPLAYS, &getDisplays, sizeof(getDisplays));
 	IOLockLock(stateLock);
 	startupId = preferredId;
 	count = haveDisplay ? modeCount : 0;
@@ -589,7 +612,7 @@ void ReimsGraphics::quiesce()
 void ReimsGraphics::teardown()
 {
 	if (registers)
-		writeRegister(RG_REG_STATUS, RG_STATUS_RESET);
+		writeRegister(RGFX_REG_STATUS, RGFX_STATUS_RESET);
 	OSSafeReleaseNULL(msix);
 	OSSafeReleaseNULL(kick);
 	OSSafeReleaseNULL(workLoop);
@@ -637,14 +660,14 @@ IODeviceMemory *ReimsGraphics::getApertureRange(IOPixelAperture aperture)
 	if (!ok)
 		return nullptr;
 	UInt64 length = round_page_64(static_cast<UInt64>(strideFor(m.width)) * m.height);
-	return IODeviceMemory::withSubRange(region, RG_GUEST_ALLOC_OFFSET, length);
+	return IODeviceMemory::withSubRange(region, RGFX_ALLOCATIONS_OFFSET, length);
 }
 
 IODeviceMemory *ReimsGraphics::getVRAMRange()
 {
 	if (!region)
 		return nullptr;
-	return IODeviceMemory::withSubRange(region, RG_GUEST_ALLOC_OFFSET, scanoutLimit());
+	return IODeviceMemory::withSubRange(region, RGFX_ALLOCATIONS_OFFSET, scanoutLimit());
 }
 
 const char *ReimsGraphics::getPixelFormats()
@@ -891,9 +914,14 @@ IOReturn ReimsGraphics::setCursorImage(void *cursorImage)
 	info.hardwareCursorData = cursorPixels;
 	if (!convertCursorImage(cursorImage, &desc, &info) || !info.cursorWidth || !info.cursorHeight)
 		return kIOReturnUnsupported;
-	struct rg_set_cursor c = {displayId, info.cursorWidth, info.cursorHeight, info.cursorHotSpotX,
-	                          info.cursorHotSpotY, 0, regionSize - kCursorSlot};
-	IOReturn r = command(RG_CMD_SET_CURSOR, &c, sizeof(c));
+	RgfxSetCursor c = {};
+	c.display = displayId;
+	c.width = info.cursorWidth;
+	c.height = info.cursorHeight;
+	c.hot_x = info.cursorHotSpotX;
+	c.hot_y = info.cursorHotSpotY;
+	c.offset = regionSize - kCursorSlot;
+	IOReturn r = command(RGFX_CMD_SET_CURSOR, &c, sizeof(c));
 	if (r == kIOReturnSuccess) {
 		hotX = info.cursorHotSpotX;
 		hotY = info.cursorHotSpotY;
@@ -905,9 +933,12 @@ IOReturn ReimsGraphics::setCursorImage(void *cursorImage)
 // hotspot's place. Never blocks.
 IOReturn ReimsGraphics::setCursorState(SInt32 x, SInt32 y, bool visible)
 {
-	struct rg_move_cursor m = {displayId, x + static_cast<SInt32>(hotX), y + static_cast<SInt32>(hotY),
-	                           visible ? 1u : 0u};
-	return tryPost(RG_CMD_MOVE_CURSOR, &m, sizeof(m), nullptr) ? kIOReturnSuccess : kIOReturnBusy;
+	RgfxMoveCursor m = {};
+	m.display = displayId;
+	m.x = x + static_cast<SInt32>(hotX);
+	m.y = y + static_cast<SInt32>(hotY);
+	m.visible = visible ? 1u : 0u;
+	return tryPost(RGFX_CMD_MOVE_CURSOR, &m, sizeof(m), nullptr) ? kIOReturnSuccess : kIOReturnBusy;
 }
 
 // MARK: - IOFramebuffer: vblank and connect interrupts

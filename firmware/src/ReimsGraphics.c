@@ -5,7 +5,7 @@
   Start resets the device, adopts the control rings' counters, asks the
   device for its displays and offers one mode: the preferred mode of the
   first connected display, or 1920x1080 when there is none. The framebuffer
-  is the region's memory from RG_GUEST_ALLOC_OFFSET, and SetMode points the
+  is the region's memory from RGFX_ALLOCATIONS_OFFSET, and SetMode points the
   display at it with SET_SCANOUT. Firmware takes no interrupts: a command
   polls the completion ring for its answer.
 **/
@@ -31,11 +31,22 @@ EFI_GUID  gEfiGraphicsOutputProtocolGuid      = EFI_GRAPHICS_OUTPUT_PROTOCOL_GUI
 //
 #define RING_HEADER(Private, Offset) \
   ((volatile UINT8 *)(UINTN)((Private)->RegionBase + (Offset)))
-#define SUBMIT_RING(Private)  RING_HEADER (Private, RG_CONTROL_SUBMIT_OFFSET)
-#define EVENT_RING(Private)   RING_HEADER (Private, RG_CONTROL_EVENT_OFFSET)
+#define SUBMIT_RING(Private)  RING_HEADER (Private, RGFX_CONTROL_SUBMIT_OFFSET)
+#define EVENT_RING(Private)   RING_HEADER (Private, RGFX_CONTROL_COMPLETE_OFFSET)
 #define RING_U64(Ring, Field)  ((volatile UINT64 *)((Ring) + (Field)))
 #define RING_U32(Ring, Field)  ((volatile UINT32 *)((Ring) + (Field)))
-#define RING_BYTES(Ring)       ((Ring) + RG_RING_HEADER_SIZE)
+#define RING_BYTES(Ring)       ((Ring) + RGFX_RING_HEADER_SIZE)
+
+//
+// The ring header's fields, by their offset in it, and the control ring's
+// byte-ring size (a power of two, so an index wraps with a mask) and
+// alignment.
+//
+#define RING_PRODUCER_OFFSET       __builtin_offsetof (RgfxRingHeader, producer)
+#define RING_CONSUMER_OFFSET       __builtin_offsetof (RgfxRingHeader, consumer)
+#define RING_CONSUMER_IDLE_OFFSET  __builtin_offsetof (RgfxRingHeader, consumer_idle)
+#define RING_MASK                  (RGFX_CONTROL_RING_DATA_SIZE - 1)
+#define RING_MSG_ALIGN             8
 
 STATIC
 VOID
@@ -76,7 +87,7 @@ ReadRegister (
   UINT32  Value;
 
   Value = MAX_UINT32;
-  Private->PciIo->Mem.Read (Private->PciIo, EfiPciIoWidthUint32, RG_BAR_REGISTERS, Offset, 1, &Value);
+  Private->PciIo->Mem.Read (Private->PciIo, EfiPciIoWidthUint32, RGFX_PCI_BAR_REGISTERS, Offset, 1, &Value);
   return Value;
 }
 
@@ -88,7 +99,7 @@ WriteRegister (
   IN UINT32                       Value
   )
 {
-  Private->PciIo->Mem.Write (Private->PciIo, EfiPciIoWidthUint32, RG_BAR_REGISTERS, Offset, 1, &Value);
+  Private->PciIo->Mem.Write (Private->PciIo, EfiPciIoWidthUint32, RGFX_PCI_BAR_REGISTERS, Offset, 1, &Value);
 }
 
 /**
@@ -113,41 +124,43 @@ CopyQwords (
 /**
   Put a command on the submission ring, padding to the ring's end first when
   it does not fit before it, and ring the doorbell if the device's consumer
-  sleeps. Payload's size, rounded up to 8 bytes, is copied, so its buffer
-  must hold that many.
+  sleeps. Message is a full message struct, its payload fields filled; its
+  header is stamped here. Size is a multiple of 8.
 **/
 STATIC
 EFI_STATUS
 Submit (
   IN  REIMS_GRAPHICS_PRIVATE_DATA  *Private,
   IN  UINT32                       Type,
-  IN  CONST VOID                   *Payload,
-  IN  UINT32                       PayloadSize,
+  IN  CONST VOID                   *Message,
+  IN  UINT32                       Size,
   OUT UINT64                       *Seqno
   )
 {
-  volatile UINT8        *Ring;
-  volatile UINT8        *Bytes;
-  UINT64                Producer;
-  UINT64                Consumer;
-  UINT32                Size;
-  UINT32                Offset;
-  UINT32                Left;
-  UINT32                Need;
-  UINTN                 Poll;
-  struct rg_msg_header  Header;
+  volatile UINT8  *Ring;
+  volatile UINT8  *Bytes;
+  UINT64          Producer;
+  UINT64          Consumer;
+  UINT32          Offset;
+  UINT32          Left;
+  UINT32          Need;
+  UINTN           Poll;
+  UINT64          Words[8];
+  RgfxMsgHeader   Pad;
 
   Ring     = SUBMIT_RING (Private);
   Bytes    = RING_BYTES (Ring);
-  Size     = RG_MSG_SIZE (PayloadSize);
   Producer = Private->SubmitProducer;
+  if ((Size < sizeof (RgfxMsgHeader)) || ((Size % RING_MSG_ALIGN) != 0) || (Size > sizeof (Words))) {
+    return EFI_INVALID_PARAMETER;
+  }
 
   for (Poll = 0; ; Poll++) {
-    Consumer = __atomic_load_n (RING_U64 (Ring, RG_RING_CONSUMER), __ATOMIC_ACQUIRE);
-    Offset   = (UINT32)(Producer % RG_CONTROL_RING_BYTES);
-    Left     = RG_CONTROL_RING_BYTES - Offset;
+    Consumer = __atomic_load_n (RING_U64 (Ring, RING_CONSUMER_OFFSET), __ATOMIC_ACQUIRE);
+    Offset   = (UINT32)Producer & RING_MASK;
+    Left     = RGFX_CONTROL_RING_DATA_SIZE - Offset;
     Need     = Size + ((Left < Size) ? Left : 0);
-    if (Producer - Consumer + Need <= RG_CONTROL_RING_BYTES) {
+    if (Producer - Consumer + Need <= RGFX_CONTROL_RING_DATA_SIZE) {
       break;
     }
 
@@ -163,29 +176,32 @@ Submit (
   // with only 8 left, its type and size alone.
   //
   if (Left < Size) {
-    Header.type  = RG_MSG_PAD;
-    Header.size  = Left;
-    Header.seqno = 0;
-    CopyQwords ((volatile UINT64 *)(Bytes + Offset), (UINT64 *)&Header, (Left < sizeof (Header)) ? Left : sizeof (Header));
+    Pad.type  = RGFX_MSG_PAD;
+    Pad.size  = Left;
+    Pad.seqno = 0;
+    CopyQwords ((volatile UINT64 *)(Bytes + Offset), (UINT64 *)&Pad, (Left < sizeof (Pad)) ? Left : sizeof (Pad));
     Producer += Left;
     Offset    = 0;
   }
 
-  Header.type  = Type;
-  Header.size  = Size;
-  Header.seqno = ++Private->Seqno;
-  CopyQwords ((volatile UINT64 *)(Bytes + Offset), (UINT64 *)&Header, sizeof (Header));
-  CopyQwords ((volatile UINT64 *)(Bytes + Offset + sizeof (Header)), Payload, Size - sizeof (Header));
+  //
+  // The caller filled the payload fields; the header is stamped here.
+  //
+  CopyQwords (Words, (CONST UINT64 *)Message, Size);
+  ((RgfxMsgHeader *)Words)->type  = Type;
+  ((RgfxMsgHeader *)Words)->size  = Size;
+  ((RgfxMsgHeader *)Words)->seqno = ++Private->Seqno;
+  CopyQwords ((volatile UINT64 *)(Bytes + Offset), Words, Size);
   Producer += Size;
 
   Private->SubmitProducer = Producer;
-  __atomic_store_n (RING_U64 (Ring, RG_RING_PRODUCER), Producer, __ATOMIC_RELEASE);
+  __atomic_store_n (RING_U64 (Ring, RING_PRODUCER_OFFSET), Producer, __ATOMIC_RELEASE);
   __atomic_thread_fence (__ATOMIC_SEQ_CST);
-  if (__atomic_load_n (RING_U32 (Ring, RG_RING_CONSUMER_IDLE), __ATOMIC_ACQUIRE) == 1) {
-    WriteRegister (Private, RG_REG_DOORBELL, RG_CONTROL_RING_ID);
+  if (__atomic_load_n (RING_U32 (Ring, RING_CONSUMER_IDLE_OFFSET), __ATOMIC_ACQUIRE) == 1) {
+    WriteRegister (Private, RGFX_REG_DOORBELL, RGFX_CONTROL_RING_ID);
   }
 
-  *Seqno = Header.seqno;
+  *Seqno = ((RgfxMsgHeader *)Words)->seqno;
   return EFI_SUCCESS;
 }
 
@@ -213,10 +229,10 @@ WaitFor (
   UINT64                Consumer;
   UINT32                Offset;
   UINT32                Left;
-  UINT32                Copy;
-  UINTN                 Poll;
-  BOOLEAN               Found;
-  struct rg_msg_header  Header;
+  UINT32          Copy;
+  UINTN           Poll;
+  BOOLEAN         Found;
+  RgfxMsgHeader   Header;
 
   Ring     = EVENT_RING (Private);
   Bytes    = RING_BYTES (Ring);
@@ -224,10 +240,10 @@ WaitFor (
   Found    = FALSE;
 
   for (Poll = 0; !Found; Poll++) {
-    Producer = __atomic_load_n (RING_U64 (Ring, RG_RING_PRODUCER), __ATOMIC_ACQUIRE);
+    Producer = __atomic_load_n (RING_U64 (Ring, RING_PRODUCER_OFFSET), __ATOMIC_ACQUIRE);
     while (!Found && (Consumer != Producer)) {
-      Offset = (UINT32)(Consumer % RG_CONTROL_RING_BYTES);
-      Left   = RG_CONTROL_RING_BYTES - Offset;
+      Offset = (UINT32)Consumer & RING_MASK;
+      Left   = RGFX_CONTROL_RING_DATA_SIZE - Offset;
       if (Left < sizeof (Header)) {
         if (Left > Producer - Consumer) {
           return EFI_DEVICE_ERROR;
@@ -238,16 +254,16 @@ WaitFor (
       }
 
       CopyQwords ((UINT64 *)&Header, (volatile UINT64 *)(Bytes + Offset), sizeof (Header));
-      if ((Header.size < ((Header.type == RG_MSG_PAD) ? RG_MSG_ALIGN : sizeof (Header))) ||
-          ((Header.size % RG_MSG_ALIGN) != 0) ||
+      if ((Header.size < ((Header.type == RGFX_MSG_PAD) ? RING_MSG_ALIGN : sizeof (Header))) ||
+          ((Header.size % RING_MSG_ALIGN) != 0) ||
           (Header.size > Left) ||
           (Header.size > Producer - Consumer))
       {
         return EFI_DEVICE_ERROR;
       }
 
-      if ((Header.type != RG_MSG_PAD) && (Header.seqno == Seqno) &&
-          ((Header.type == RG_EVT_COMPLETE) || (Header.type == Reply)))
+      if ((Header.type != RGFX_MSG_PAD) && (Header.seqno == Seqno) &&
+          ((Header.type == RGFX_EVT_COMPLETE) || (Header.type == Reply)))
       {
         *Type        = Header.type;
         *PayloadSize = Header.size - sizeof (Header);
@@ -260,7 +276,7 @@ WaitFor (
     }
 
     Private->EventConsumer = Consumer;
-    __atomic_store_n (RING_U64 (Ring, RG_RING_CONSUMER), Consumer, __ATOMIC_RELEASE);
+    __atomic_store_n (RING_U64 (Ring, RING_CONSUMER_OFFSET), Consumer, __ATOMIC_RELEASE);
     if (!Found) {
       if (Poll == REIMS_GRAPHICS_POLL_LIMIT) {
         return EFI_TIMEOUT;
@@ -297,12 +313,12 @@ Command (
   }
 
   Answer = MAX_UINT32;
-  Status = WaitFor (Private, Seqno, RG_EVT_COMPLETE, &Answer, sizeof (Answer), &AnswerType, &AnswerSize);
+  Status = WaitFor (Private, Seqno, RGFX_EVT_COMPLETE, &Answer, sizeof (Answer), &AnswerType, &AnswerSize);
   if (EFI_ERROR (Status)) {
     return Status;
   }
 
-  if ((AnswerSize < sizeof (struct rg_complete)) || ((UINT32)Answer != 0)) {
+  if ((AnswerSize < sizeof (UINT32)) || ((UINT32)Answer != 0)) {
     return EFI_DEVICE_ERROR;
   }
 
@@ -315,14 +331,14 @@ ReimsGraphicsSetScanout (
   IN BOOLEAN                      Blank
   )
 {
-  struct rg_set_scanout  Scanout;
+  RgfxSetScanout  Scanout = { 0 };
 
   Scanout.display = Private->Display;
   Scanout.width   = Blank ? 0 : Private->Width;
   Scanout.height  = Blank ? 0 : Private->Height;
   Scanout.stride  = Blank ? 0 : Private->Stride;
-  Scanout.offset  = Blank ? 0 : RG_GUEST_ALLOC_OFFSET;
-  return Command (Private, RG_CMD_SET_SCANOUT, &Scanout, sizeof (Scanout));
+  Scanout.offset  = Blank ? 0 : RGFX_ALLOCATIONS_OFFSET;
+  return Command (Private, RGFX_CMD_SET_SCANOUT, &Scanout, sizeof (Scanout));
 }
 
 /**
@@ -340,33 +356,38 @@ ChooseMode (
   UINT64              Seqno;
   UINT32              Type;
   UINT32              Size;
-  UINT32              Count;
-  UINT32              Index;
-  UINTN               Offset;
-  struct rg_display   *Display;
-  struct rg_mode      *Mode;
+  UINT32             Count;
+  UINT32             Index;
+  UINTN              Offset;
+  RgfxDisplayEntry   *Display;
+  RgfxModeEntry      *Mode;
+  RgfxGetDisplays    GetDisplays = { 0 };
 
   Private->Display = 0;
   Private->Width   = 0;
   Private->Height  = 0;
 
-  if (EFI_ERROR (Submit (Private, RG_CMD_GET_DISPLAYS, NULL, 0, &Seqno)) ||
-      EFI_ERROR (WaitFor (Private, Seqno, RG_EVT_DISPLAYS, Answer, sizeof (Answer), &Type, &Size)) ||
-      (Type != RG_EVT_DISPLAYS))
+  if (EFI_ERROR (Submit (Private, RGFX_CMD_GET_DISPLAYS, &GetDisplays, sizeof (GetDisplays), &Seqno)) ||
+      EFI_ERROR (WaitFor (Private, Seqno, RGFX_EVT_DISPLAYS, Answer, sizeof (Answer), &Type, &Size)) ||
+      (Type != RGFX_EVT_DISPLAYS))
   {
     return;
   }
 
+  //
+  // The answer's payload, after the message header: the display count, then
+  // the display records at RGFX_DISPLAYS_ENTRIES_OFFSET into the message.
+  //
   Bytes = (UINT8 *)Answer;
   Size  = (Size < sizeof (Answer)) ? Size : sizeof (Answer);
-  if (Size < sizeof (struct rg_displays)) {
+  if (Size < sizeof (UINT32)) {
     return;
   }
 
-  Count  = ((struct rg_displays *)Bytes)->count;
-  Offset = sizeof (struct rg_displays);
+  Count  = *(UINT32 *)Bytes;
+  Offset = RGFX_DISPLAYS_ENTRIES_OFFSET - sizeof (RgfxMsgHeader);
   for (Index = 0; Index < Count && Offset + sizeof (*Display) <= Size; Index++) {
-    Display = (struct rg_display *)(Bytes + Offset);
+    Display = (RgfxDisplayEntry *)(Bytes + Offset);
     Offset += sizeof (*Display);
     if (Index == 0) {
       Private->Display = Display->id;
@@ -376,7 +397,7 @@ ChooseMode (
         (Display->preferred_mode < Display->mode_count) &&
         (Offset + (UINTN)(Display->preferred_mode + 1) * sizeof (*Mode) <= Size))
     {
-      Mode = (struct rg_mode *)(Bytes + Offset) + Display->preferred_mode;
+      Mode = (RgfxModeEntry *)(Bytes + Offset) + Display->preferred_mode;
       if ((Mode->width != 0) && (Mode->height != 0)) {
         Private->Display = Display->id;
         Private->Width   = Mode->width;
@@ -399,11 +420,11 @@ OpenRings (
   IN REIMS_GRAPHICS_PRIVATE_DATA  *Private
   )
 {
-  WriteRegister (Private, RG_REG_STATUS, RG_STATUS_RESET);
-  Private->SubmitProducer = __atomic_load_n (RING_U64 (SUBMIT_RING (Private), RG_RING_PRODUCER), __ATOMIC_ACQUIRE);
-  Private->EventConsumer  = __atomic_load_n (RING_U64 (EVENT_RING (Private), RG_RING_CONSUMER), __ATOMIC_ACQUIRE);
+  WriteRegister (Private, RGFX_REG_STATUS, RGFX_STATUS_RESET);
+  Private->SubmitProducer = __atomic_load_n (RING_U64 (SUBMIT_RING (Private), RING_PRODUCER_OFFSET), __ATOMIC_ACQUIRE);
+  Private->EventConsumer  = __atomic_load_n (RING_U64 (EVENT_RING (Private), RING_CONSUMER_OFFSET), __ATOMIC_ACQUIRE);
   Private->Seqno          = 0;
-  WriteRegister (Private, RG_REG_STATUS, RG_STATUS_DRIVER_READY);
+  WriteRegister (Private, RGFX_REG_STATUS, RGFX_STATUS_DRIVER_READY);
 }
 
 /**
@@ -419,9 +440,9 @@ FindRegion (
   EFI_ACPI_ADDRESS_SPACE_DESCRIPTOR  *Bar;
   BOOLEAN                            Usable;
 
-  Private->RegionSize = ReadRegister (Private, RG_REG_REGION_SIZE_LO) |
-                        ((UINT64)ReadRegister (Private, RG_REG_REGION_SIZE_HI) << 32);
-  if (EFI_ERROR (Private->PciIo->GetBarAttributes (Private->PciIo, RG_BAR_REGION, NULL, (VOID **)&Bar))) {
+  Private->RegionSize = ReadRegister (Private, RGFX_REG_REGION_SIZE_LO) |
+                        ((UINT64)ReadRegister (Private, RGFX_REG_REGION_SIZE_HI) << 32);
+  if (EFI_ERROR (Private->PciIo->GetBarAttributes (Private->PciIo, RGFX_PCI_BAR_REGION, NULL, (VOID **)&Bar))) {
     return EFI_UNSUPPORTED;
   }
 
@@ -430,14 +451,14 @@ FindRegion (
                         (Bar->ResType == ACPI_ADDRESS_SPACE_TYPE_MEM) &&
                         (Bar->AddrTranslationOffset == 0) &&
                         (Bar->AddrLen >= Private->RegionSize) &&
-                        (Private->RegionSize > RG_GUEST_ALLOC_OFFSET);
+                        (Private->RegionSize > RGFX_ALLOCATIONS_OFFSET);
   gBS->FreePool (Bar);
   return Usable ? EFI_SUCCESS : EFI_UNSUPPORTED;
 }
 
 /**
   The mode's row bytes, and whether its framebuffer fits the region from
-  RG_GUEST_ALLOC_OFFSET.
+  RGFX_ALLOCATIONS_OFFSET.
 **/
 STATIC
 BOOLEAN
@@ -450,7 +471,7 @@ ModeFits (
   Stride = ((UINT64)Private->Width * 4 + REIMS_GRAPHICS_STRIDE_ALIGN - 1) &
            ~(UINT64)(REIMS_GRAPHICS_STRIDE_ALIGN - 1);
   if ((Private->Width == 0) || (Private->Height == 0) || (Stride > MAX_UINT32) ||
-      (Stride * Private->Height > Private->RegionSize - RG_GUEST_ALLOC_OFFSET))
+      (Stride * Private->Height > Private->RegionSize - RGFX_ALLOCATIONS_OFFSET))
   {
     return FALSE;
   }
@@ -502,7 +523,7 @@ ReimsGraphicsDriverBindingSupported (
 
   Status = PciIo->Pci.Read (PciIo, EfiPciIoWidthUint32, 0, sizeof (Pci) / sizeof (UINT32), &Pci);
   if (!EFI_ERROR (Status) &&
-      ((Pci.Hdr.VendorId != RG_PCI_VENDOR_ID) || (Pci.Hdr.DeviceId != RG_PCI_DEVICE_ID)))
+      ((Pci.Hdr.VendorId != RGFX_PCI_VENDOR_ID) || (Pci.Hdr.DeviceId != RGFX_PCI_DEVICE_ID)))
   {
     Status = EFI_UNSUPPORTED;
   }
@@ -594,8 +615,8 @@ ReimsGraphicsDriverBindingStart (
                              NULL
                              );
   if (!EFI_ERROR (Status) &&
-      ((ReadRegister (Private, RG_REG_MAGIC) != RG_MAGIC) ||
-       (ReadRegister (Private, RG_REG_VERSION) != RG_VERSION)))
+      ((ReadRegister (Private, RGFX_REG_MAGIC) != RGFX_MAGIC) ||
+       (ReadRegister (Private, RGFX_REG_VERSION) != RGFX_VERSION)))
   {
     Status = EFI_UNSUPPORTED;
   }
