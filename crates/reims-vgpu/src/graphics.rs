@@ -38,6 +38,7 @@ use crate::error::Error;
 use crate::platform::ApiPlatform;
 use crate::window::WindowLink;
 
+mod completion;
 mod decode;
 mod device_info;
 #[cfg(target_os = "macos")]

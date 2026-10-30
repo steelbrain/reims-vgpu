@@ -659,8 +659,8 @@ pub struct RgfxBufferAtOffset {
 }
 
 /// `CB_COMPLETE`: a command buffer finished. `status` is an `RGFX_CB_*`, and
-/// `error_code` carries the raw IOGPU code for diagnostics (0 when `status` is
-/// [`RGFX_CB_OK`]).
+/// `error_code` carries the host's raw `MTLCommandBufferError` code for
+/// diagnostics (0 when `status` is [`RGFX_CB_OK`]).
 #[repr(C)]
 #[derive(
     Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
@@ -677,7 +677,8 @@ pub struct RgfxCbComplete {
     pub gpu_end_ns: u64,
     /// An `RGFX_CB_*`.
     pub status: u32,
-    /// The raw IOGPU code behind `status`, for diagnostics; 0 on success.
+    /// The host's raw `MTLCommandBufferError` code behind `status`, for
+    /// diagnostics; 0 on success.
     pub error_code: u32,
 }
 

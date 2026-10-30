@@ -590,8 +590,8 @@ typedef struct {
 } RgfxBufferAtOffset;
 
 // `CB_COMPLETE`: a command buffer finished. `status` is an `RGFX_CB_*`, and
-// `error_code` carries the raw IOGPU code for diagnostics (0 when `status` is
-// [`RGFX_CB_OK`]).
+// `error_code` carries the host's raw `MTLCommandBufferError` code for
+// diagnostics (0 when `status` is [`RGFX_CB_OK`]).
 typedef struct {
   // [`RGFX_EVT_CB_COMPLETE`], with the command buffer's submission `seqno`.
   RgfxMsgHeader header;
@@ -604,7 +604,8 @@ typedef struct {
   uint64_t gpu_end_ns;
   // An `RGFX_CB_*`.
   uint32_t status;
-  // The raw IOGPU code behind `status`, for diagnostics; 0 on success.
+  // The host's raw `MTLCommandBufferError` code behind `status`, for
+  // diagnostics; 0 on success.
   uint32_t error_code;
 } RgfxCbComplete;
 
