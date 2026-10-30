@@ -19,6 +19,7 @@
 
 #include "RgfxCaps.hpp"
 #include "RgfxEncoder.hpp"
+#include "RgfxLibraryKey.hpp"
 #include "RgfxObjectModel.hpp"
 #include "RgfxReplyReader.hpp"
 #include "RgfxRingWriter.hpp"
@@ -256,11 +257,14 @@ void test_library_message()
 	std::vector<uint8_t> bytes;
 	CHECK(ring.next(&h, &bytes));
 	CHECK(h.type == RGFX_CMD_LIBRARY_CREATE);
-	// header struct (32) + 6 bytes, rounded up to a multiple of 8 = 40.
-	CHECK(h.size == 40);
+	// header struct (72) + 6 bytes, rounded up to a multiple of 8 = 80.
+	CHECK(h.size == 80);
 	RgfxLibraryCreate head;
 	std::memcpy(&head, bytes.data(), sizeof(head));
 	CHECK(head.obj_id == lib.obj_id && head.byte_length == 6);
+	CHECK(head.flags == 0); // no key
+	// A ring the process writes itself hands back no answer.
+	CHECK(lib.status == kRgfxNoAnswer);
 	CHECK(std::memcmp(bytes.data() + RGFX_LIBRARY_BYTES_OFFSET, air, sizeof(air)) == 0);
 
 	// A library larger than the ring cannot be posted in one message.
@@ -696,9 +700,11 @@ struct ForwardLog {
 	std::vector<std::vector<uint8_t>> messages;
 	bool refuse = false;
 	uint64_t nextSeqno = 41;
+	uint32_t answer = kRgfxNoAnswer; // the COMPLETE status the "kext" hands back
 };
 
-bool forwardTo(void *context, const void *message, uint32_t size, uint64_t *out_seqno)
+bool forwardTo(void *context, const void *message, uint32_t size, uint64_t *out_seqno,
+               uint32_t *out_status)
 {
 	ForwardLog *log = static_cast<ForwardLog *>(context);
 	if (log->refuse)
@@ -706,6 +712,8 @@ bool forwardTo(void *context, const void *message, uint32_t size, uint64_t *out_
 	const uint8_t *b = static_cast<const uint8_t *>(message);
 	log->messages.emplace_back(b, b + size);
 	*out_seqno = log->nextSeqno++;
+	if (out_status)
+		*out_status = log->answer;
 	return true;
 }
 
@@ -753,6 +761,100 @@ void test_forwarded_lifecycle()
 	CHECK(!reader.awaitingReflection(8));
 }
 
+// A synthetic .metallib: its header (the bitcode section at 0x60, 16 bytes), a stand-in for the
+// function list, the bitcode, and a tail.
+std::vector<uint8_t> syntheticMetallib()
+{
+	std::vector<uint8_t> b(0x58, 0);
+	std::memcpy(b.data(), "MTLB", 4);
+	const uint64_t at = 0x60, size = 0x10;
+	std::memcpy(b.data() + 0x48, &at, 8);
+	std::memcpy(b.data() + 0x50, &size, 8);
+	for (const char *part : { "funclist", "BITCODE-BITCODE!", "tail-end" })
+		b.insert(b.end(), part, part + std::strlen(part));
+	return b;
+}
+
+// A library's content key is the SHA-256 of the prefix and the bytes around the bitcode section:
+// the digest computed independently (and pinned on the host's side too), the same whatever the
+// section holds, and none for bytes that are no .metallib or whose section lies outside them.
+void test_library_key()
+{
+	static const uint8_t expect[32] = {
+		0xc0, 0x99, 0x93, 0x08, 0x93, 0xa6, 0x91, 0xa1, 0xaa, 0xed, 0xfa, 0x6d, 0xee, 0xd4, 0x1a, 0x58,
+		0x09, 0x95, 0x3e, 0x36, 0xa8, 0xe6, 0x9e, 0xd9, 0x86, 0xe1, 0xb2, 0x11, 0xff, 0x4e, 0x21, 0x7d,
+	};
+	std::vector<uint8_t> lib = syntheticMetallib();
+	CHECK(lib.size() == 0x78);
+	uint8_t key[32] = {};
+	CHECK(rgfxLibraryKey(lib.data(), lib.size(), key));
+	CHECK(std::memcmp(key, expect, sizeof(key)) == 0);
+	// The bitcode is not keyed (its HASH tags are); the bytes around it are.
+	lib[0x65] ^= 0xff;
+	CHECK(rgfxLibraryKey(lib.data(), lib.size(), key));
+	CHECK(std::memcmp(key, expect, sizeof(key)) == 0);
+	lib[0x75] ^= 0xff;
+	CHECK(rgfxLibraryKey(lib.data(), lib.size(), key));
+	CHECK(std::memcmp(key, expect, sizeof(key)) != 0);
+	// No key: not a .metallib, a section past the end, too short for a header.
+	std::vector<uint8_t> other = syntheticMetallib();
+	other[0] = 'X';
+	CHECK(!rgfxLibraryKey(other.data(), other.size(), key));
+	other = syntheticMetallib();
+	const uint64_t past = 0x70;
+	std::memcpy(other.data() + 0x50, &past, 8);
+	CHECK(!rgfxLibraryKey(other.data(), other.size(), key));
+	CHECK(!rgfxLibraryKey(other.data(), 0x40, key));
+}
+
+// Keyed library messages through the kext's route: the create carries its key and hands back the
+// device's answer; a lookup is one LIBRARY_LOOKUP of its own, answered; a streamed library's
+// chunks carry the key and its answer.
+void test_keyed_library_messages()
+{
+	ForwardLog log;
+	RgfxRingWriter writer(&forwardTo, &log, 4096);
+	RgfxIdSpace ids;
+	RgfxSerializer ser(writer, ids);
+	std::vector<uint8_t> lib = syntheticMetallib();
+	uint8_t key[32] = {};
+	CHECK(rgfxLibraryKey(lib.data(), lib.size(), key));
+
+	log.answer = RGFX_STATUS_NOT_FOUND;
+	RgfxCreated found = ser.lookupLibrary(key, lib.size());
+	CHECK(found.posted && found.status == RGFX_STATUS_NOT_FOUND);
+	CHECK(log.messages.size() == 1);
+	RgfxLibraryLookup lookup = {};
+	CHECK(log.messages[0].size() == sizeof(lookup));
+	std::memcpy(&lookup, log.messages[0].data(), sizeof(lookup));
+	CHECK(lookup.header.type == RGFX_CMD_LIBRARY_LOOKUP);
+	CHECK(lookup.header.size == sizeof(RgfxLibraryLookup));
+	CHECK(lookup.obj_id == found.obj_id);
+	CHECK(lookup.slice_size == lib.size());
+	CHECK(std::memcmp(lookup.key, key, 32) == 0);
+
+	log.answer = RGFX_STATUS_OK;
+	RgfxCreated made = ser.createLibrary(lib.data(), lib.size(), key);
+	CHECK(made.posted && made.status == RGFX_STATUS_OK);
+	RgfxLibraryCreate head = {};
+	std::memcpy(&head, log.messages[1].data(), sizeof(head));
+	CHECK(head.header.type == RGFX_CMD_LIBRARY_CREATE);
+	CHECK(head.flags == RGFX_LIBRARY_FLAG_KEYED);
+	CHECK(std::memcmp(head.key, key, 32) == 0);
+	CHECK(std::memcmp(log.messages[1].data() + RGFX_LIBRARY_BYTES_OFFSET, lib.data(), lib.size()) ==
+	      0);
+
+	log.answer = RGFX_STATUS_REFUSED;
+	uint32_t status = 0;
+	CHECK(ser.postLibraryChunk(made.obj_id, 0x1000, 8, 8, 0, 0x2000, 1, key, &status));
+	CHECK(status == RGFX_STATUS_REFUSED);
+	RgfxLibraryFromRegion chunk = {};
+	std::memcpy(&chunk, log.messages[2].data(), sizeof(chunk));
+	CHECK(chunk.header.type == RGFX_CMD_LIBRARY_FROM_REGION);
+	CHECK(chunk.flags == RGFX_LIBRARY_FLAG_KEYED);
+	CHECK(std::memcmp(chunk.key, key, 32) == 0);
+}
+
 int main()
 {
 	test_id_space();
@@ -763,6 +865,8 @@ int main()
 	test_ring_wrap_and_no_room();
 	test_command_buffer_encoder();
 	test_forwarded_lifecycle();
+	test_library_key();
+	test_keyed_library_messages();
 	std::printf("serializer_tests: OK (%d checks)\n", g_checks);
 	return 0;
 }

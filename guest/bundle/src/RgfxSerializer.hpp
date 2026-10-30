@@ -94,13 +94,16 @@ struct RgfxComputePipelineParams {
 /// the guest picked (valid whether or not the message reached the ring, so a
 /// caller that retries keeps the same handle); `gpu_address`/`resource_id` are 0
 /// where the create has none. `seqno` is the ring seqno when `posted`. `posted`
-/// is false when the ring had no room — the caller retries the create.
+/// is false when the ring had no room — the caller retries the create. `status` is
+/// the device's COMPLETE status for a create the device answers through the ring's
+/// forward (a library's), kRgfxNoAnswer where none came back; 0 for the others.
 struct RgfxCreated {
 	RgfxObjId obj_id;
 	uint64_t gpu_address;
 	uint64_t resource_id;
 	uint64_t seqno;
 	bool posted;
+	uint32_t status;
 };
 
 class RgfxSerializer {
@@ -184,9 +187,17 @@ public:
 	// --- shaders --------------------------------------------------------------
 
 	/// A library from `byte_length` bytes of .metallib or AIR at `bytes`,
-	/// forwarded unchanged. `posted` is false when the message (its header plus
-	/// the bytes, rounded to a multiple of 8) does not fit the ring.
-	RgfxCreated createLibrary(const void *bytes, uint64_t byte_length);
+	/// forwarded unchanged, with their content key where `key` (32 bytes) is not
+	/// null. `posted` is false when the message (its header plus the bytes, rounded
+	/// to a multiple of 8) does not fit the ring; `status` is the device's answer.
+	RgfxCreated createLibrary(const void *bytes, uint64_t byte_length,
+	                          const uint8_t *key = nullptr);
+
+	/// A LIBRARY_LOOKUP of the library whose `slice_size` bytes have the content
+	/// key `key` (32 bytes), under a new id: `status` RGFX_STATUS_OK where the device
+	/// holds it, and the id names it; any other where it does not, and the caller
+	/// makes the library from its bytes (kRgfxNoAnswer where no answer came back).
+	RgfxCreated lookupLibrary(const uint8_t *key, uint64_t slice_size);
 
 	/// A new object id for a library streamed in chunks (postLibraryChunk), which
 	/// every chunk of that library names.
@@ -196,10 +207,13 @@ public:
 	/// at `chunk_offset` of its `total_length`, which the caller copied to
 	/// `region_offset` in the device's region. The host writes `ack_value` at
 	/// `ack_offset` once it has copied them out. Returns whether the message posted
-	/// (false when the ring has no room).
+	/// (false when the ring has no room). `key` (32 bytes) is the library's content
+	/// key, or null. The library's last chunk is answered once the library is made:
+	/// `*out_status` (when not null) is the answer, or kRgfxNoAnswer.
 	bool postLibraryChunk(RgfxObjId obj_id, uint64_t region_offset, uint64_t byte_length,
 	                      uint64_t total_length, uint64_t chunk_offset, uint64_t ack_offset,
-	                      uint64_t ack_value);
+	                      uint64_t ack_value, const uint8_t *key = nullptr,
+	                      uint32_t *out_status = nullptr);
 
 	// --- pipelines ------------------------------------------------------------
 

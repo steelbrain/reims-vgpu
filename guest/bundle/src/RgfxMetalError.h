@@ -29,6 +29,8 @@ typedef NS_ENUM(NSInteger, RgfxMetalErrorCode) {
 	/// A path the shell does not implement off the host compiler (source→AIR
 	/// compilation, a default library baked into the bundle).
 	RgfxMetalErrorUnsupported = 4,
+	/// The device's GPU refused the object (a library whose bytes it could not build).
+	RgfxMetalErrorRefused = 5,
 };
 
 /// Builds an NSError in RgfxMetalErrorDomain with `code` and `message`.

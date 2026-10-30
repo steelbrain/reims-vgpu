@@ -30,9 +30,10 @@ use std::sync::{Arc, OnceLock};
 use reims_graphics::ops::RgfxCommandBuffer;
 use reims_graphics::region::Region;
 use reims_graphics::wire::{
-    RGFX_CMD_COMMAND_BUFFER, RGFX_CMD_COMPUTE_PIPELINE_CREATE, RGFX_CMD_OBJECT_DESTROY,
+    RGFX_CMD_COMMAND_BUFFER, RGFX_CMD_COMPUTE_PIPELINE_CREATE, RGFX_CMD_LIBRARY_CREATE,
+    RGFX_CMD_LIBRARY_FROM_REGION, RGFX_CMD_LIBRARY_LOOKUP, RGFX_CMD_OBJECT_DESTROY,
     RGFX_CMD_RENDER_PIPELINE_CREATE, RGFX_DEVICE_INFO_OFFSET, RGFX_STATUS_INVALID_ARGUMENT,
-    RGFX_STATUS_OK, RgfxCbComplete, RgfxMsgHeader, RgfxPipelineReflection,
+    RGFX_STATUS_OK, RgfxCbComplete, RgfxLibraryLookup, RgfxMsgHeader, RgfxPipelineReflection,
 };
 use reims_graphics::{
     CompletionPoster, CursorImage, FixedScreen, Host, Mode, PresentAnswer, Scanout, Screen,
@@ -49,8 +50,8 @@ use crate::error::Error;
 use crate::graphics::compile::{CompilePool, Pending};
 use crate::graphics::completion::cb_failed;
 use crate::graphics::decode::{
-    CompiledPipeline, CompletionSink, GraphicsDecoder, PipelineJob, ReflectionSink,
-    compile_pipeline,
+    CompiledPipeline, CompletionSink, GraphicsDecoder, LibraryJob, LibraryStart, MadeLibrary,
+    PipelineJob, ReflectionSink, compile_pipeline, complete, make_library,
 };
 use crate::graphics::device_info::device_info;
 use crate::platform::ApiPlatform;
@@ -243,7 +244,7 @@ struct GraphicsControl<P: ApiPlatform> {
     device: P::Device,
     /// The surface the display pipe shows, shared with the window's sink.
     presented: Arc<Presented<P>>,
-    /// The threads ring 0's pipeline creates compile on (`compile`).
+    /// The threads ring 0's pipeline and library creates compile on (`compile`, `make`).
     pool: CompilePool,
     /// The pipelines being compiled, which a command buffer naming one waits for.
     pending: Pending,
@@ -367,13 +368,23 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     /// buffer the host could not carry out owes the guest a completion that no handler will post,
     /// so the host posts an internal-error one onto the queue's ring here.
     ///
-    /// A pipeline create is compiled on the compile pool instead ([`Self::start_pipeline`]), and a
-    /// command buffer that names a pipeline still compiling waits for it first (`compile`).
+    /// A pipeline or library create is made on the compile pool instead
+    /// ([`Self::start_pipeline`], [`Self::start_library`]), and a command buffer that names a
+    /// pipeline still compiling waits for it first (`compile`). A library lookup is answered here
+    /// ([`Self::lookup_library`]).
     fn handle_stage3(self: &Arc<Self>, poster: &CompletionPoster, message: &[u8]) {
         let r#type = RgfxMsgHeader::read_from_prefix(message).map_or(0, |(h, _)| h.r#type);
         match r#type {
             RGFX_CMD_RENDER_PIPELINE_CREATE | RGFX_CMD_COMPUTE_PIPELINE_CREATE => {
                 self.start_pipeline(poster, message);
+                return;
+            }
+            RGFX_CMD_LIBRARY_CREATE | RGFX_CMD_LIBRARY_FROM_REGION => {
+                self.start_library(poster, message);
+                return;
+            }
+            RGFX_CMD_LIBRARY_LOOKUP => {
+                self.lookup_library(poster, message);
                 return;
             }
             RGFX_CMD_COMMAND_BUFFER => self.pending.wait_for_command_buffer(message),
@@ -483,6 +494,77 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                 self.pending.finish(obj_id);
             }
             poster.post(reflection.as_bytes());
+        });
+    }
+
+    /// A library lookup from ring 0, answered at once: a hit binds the library's new id to the
+    /// library the device keeps under its key, and no bytes cross.
+    fn lookup_library(&self, poster: &CompletionPoster, message: &[u8]) {
+        let (seqno, status) = entry::run(|_| self.decoder.lock().lookup_library(message));
+        let (obj_id, size) = RgfxLibraryLookup::read_from_prefix(message)
+            .map_or((0, 0), |(m, _)| (m.obj_id, m.slice_size));
+        log::info!(
+            target: "reims_vgpu::graphics",
+            "library lookup (object {obj_id:#x}, {size} bytes): {}",
+            if status == RGFX_STATUS_OK { "hit" } else { "miss" }
+        );
+        if let Some(seqno) = seqno {
+            poster.post(complete(seqno, status).as_bytes());
+        }
+    }
+
+    /// A library create from ring 0 (a `LIBRARY_CREATE`, or a `LIBRARY_FROM_REGION` chunk):
+    /// prepared here, on the control thread, with the decoder's table (a malformed message is
+    /// refused here, as the decoder refuses it, and answered where the guest waits), then made on
+    /// the compile pool ([`Self::make`]), so ring 0 goes on meanwhile.
+    fn start_library(self: &Arc<Self>, poster: &CompletionPoster, message: &[u8]) {
+        let start = entry::run(|_| self.decoder.lock().prepare_library(message));
+        let job = match start {
+            LibraryStart::Make(job) => job,
+            LibraryStart::Chunk => return,
+            LibraryStart::Refused { error, answer } => {
+                let (ty, seqno, obj_id) = message_identity(message);
+                log::warn!(
+                    target: "reims_vgpu::graphics",
+                    "a library create (type {ty:#x}, seqno {seqno}, object {obj_id:#x}) was not \
+                     carried out: {error:?}"
+                );
+                if let Some(seqno) = answer {
+                    poster.post(complete(seqno, RGFX_STATUS_INVALID_ARGUMENT).as_bytes());
+                }
+                return;
+            }
+        };
+        let me = Arc::clone(self);
+        let poster = poster.clone();
+        if let Err(make) = self.pool.submit(Box::new(move || me.make(job, &poster))) {
+            make();
+        }
+    }
+
+    /// Makes a prepared library under a library entry, with no lock held; stores it, hands it to
+    /// the pipeline creates waiting on it, and posts the create's `COMPLETE` through `poster`.
+    fn make(&self, job: LibraryJob<P>, poster: &CompletionPoster) {
+        entry::run(|_| {
+            let (obj_id, seqno) = (job.obj_id, job.seqno);
+            let made = match make_library::<P>(&self.device, &job) {
+                Ok(made) => made,
+                Err(raise) => {
+                    log::warn!(
+                        target: "reims_vgpu::graphics",
+                        "a library create (seqno {seqno}, object {obj_id:#x}) faulted: {raise}"
+                    );
+                    MadeLibrary::refused(job)
+                }
+            };
+            let status = self.decoder.lock().finish_library(made);
+            if status != RGFX_STATUS_OK {
+                log::warn!(
+                    target: "reims_vgpu::graphics",
+                    "a library create (seqno {seqno}, object {obj_id:#x}) was refused"
+                );
+            }
+            poster.post(complete(seqno, status).as_bytes());
         });
     }
 

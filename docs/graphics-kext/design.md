@@ -385,7 +385,7 @@ memory) — m2v's "take state answers from the created pipeline".
 |---|---|---|
 | memory | `HEAP_OVER_HOST_MEMORY`, `HEAP_CREATE`, `BUFFER_CREATE`, `BUFFER_OVER_HOST_MEMORY`, `BUFFER_AT_OFFSET`, `TEXTURE_CREATE`, `TEXTURE_FROM_BUFFER`, `TEXTURE_FROM_IOSURFACE`, `*_DESTROY` | `new_heap_over_host_memory`, `new_heap`, `new_buffer`, `Heap::new_buffer_at_offset`, `new_texture`, `Buffer::new_texture`, drop |
 | state | `SAMPLER_CREATE`, `DEPTH_STENCIL_CREATE`, `*_DESTROY` | `new_sampler_state`, `new_depth_stencil_state` |
-| shaders | `LIBRARY_CREATE` (`.metallib`/AIR bytes forwarded unchanged), `RENDER_PIPELINE_CREATE`, `COMPUTE_PIPELINE_CREATE`, `*_DESTROY` | `new_library_with_data`, `new_render_pipeline_state`, `new_compute_pipeline_state` |
+| shaders | `LIBRARY_LOOKUP` (the content key of the `.metallib`'s AIR slice: a hit binds the library the device made for any process, and no bytes cross), `LIBRARY_CREATE` and `LIBRARY_FROM_REGION` (the slice's bytes forwarded unchanged on a miss, answered once made), `RENDER_PIPELINE_CREATE`, `COMPUTE_PIPELINE_CREATE`, `*_DESTROY` | the device's library cache, `new_library_with_data`, `new_render_pipeline_state`, `new_compute_pipeline_state` |
 | sync | `EVENT_CREATE`, `SHARED_EVENT_CREATE`, `FENCE_CREATE`, `*_DESTROY` | `new_event`, `new_shared_event`, `new_fence` |
 | queue | `QUEUE_CREATE` (priority, region offset, vector), `QUEUE_DESTROY` | `new_command_queue` |
 
@@ -450,7 +450,9 @@ How a Metal bundle plugs into macOS, in Apple's own terms (notes:
   limit tables (zero limits make CoreImage refuse), and the bundle implements
   the whole `MTLDevice` object graph plus enough of the GL/OpenCL private
   selectors. AIR arrives as `.metallib` through `newLibraryWith*`; the bundle
-  forwards those bytes over the wire (`LIBRARY_CREATE`), the host compiles them.
+  takes the AIR slice, asks the host for it by its content key
+  (`LIBRARY_LOOKUP`), and forwards the slice's bytes over the wire only where
+  the host holds none (`LIBRARY_CREATE`), which the host compiles.
 - **Kernel family — the fork.** The prior art builds its accelerator on the
   older `IOAcceleratorFamily2`, but our guest already runs the **ported
   IOGPUFamily stack**, and IOAccel2 cannot start in a kernel where IOGPU runs.

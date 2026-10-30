@@ -114,8 +114,21 @@ IOReturn RgfxAcceleratorUserClient::contextMethod(uint32_t selector,
 	}
 }
 
+// Whether a LIBRARY_FROM_REGION message is its library's last chunk, the one the device answers:
+// its end reaches the library's length, or overflows. A message too short to be one is not.
+static bool lastLibraryChunk(const UInt8 *message, UInt64 size)
+{
+	RgfxLibraryFromRegion chunk;
+	if (size < sizeof(chunk))
+		return false;
+	memcpy(&chunk, message, sizeof(chunk));
+	const UInt64 end = chunk.chunk_offset + chunk.byte_length;
+	return end < chunk.chunk_offset || end >= chunk.total_length;
+}
+
 // kRgfxAccelMethodSubmit (RgfxAccelerator.hpp): one create or destroy of the client's onto the
-// control ring, and a pipeline create's reflection back.
+// control ring, and the device's answer back where the create has one: a pipeline's reflection,
+// a library create's or lookup's COMPLETE.
 IOReturn RgfxAcceleratorUserClient::submitMethod(IOExternalMethodArguments *a)
 {
 	if (!hasContext || a->scalarOutputCount != 1)
@@ -149,9 +162,14 @@ IOReturn RgfxAcceleratorUserClient::submitMethod(IOExternalMethodArguments *a)
 	    (type <= RGFX_CMD_QUEUE_CREATE || type >= RGFX_CMD_CONTEXT_CLOSE ||
 	     (objId >> RGFX_CONTEXT_OBJ_ID_SHIFT) != context))
 		r = kIOReturnBadArgument;
+	// The answers the client waits for: a pipeline create's reflection, and a library create's
+	// or lookup's COMPLETE (a library's last region chunk is its create).
 	UInt32 replyType = 0;
 	if (type == RGFX_CMD_RENDER_PIPELINE_CREATE || type == RGFX_CMD_COMPUTE_PIPELINE_CREATE)
 		replyType = RGFX_EVT_PIPELINE_REFLECTION;
+	else if (type == RGFX_CMD_LIBRARY_CREATE || type == RGFX_CMD_LIBRARY_LOOKUP ||
+	         (type == RGFX_CMD_LIBRARY_FROM_REGION && lastLibraryChunk(message, size)))
+		replyType = RGFX_EVT_COMPLETE;
 	UInt8 reply[ReimsGraphics::kLifecycleReplyMax];
 	UInt32 replyLength = 0;
 	UInt64 seqno = 0;

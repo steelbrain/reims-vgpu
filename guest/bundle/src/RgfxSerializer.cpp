@@ -255,7 +255,8 @@ RgfxCreated RgfxSerializer::createDepthStencil(uint32_t depth_compare, bool dept
 	return out;
 }
 
-RgfxCreated RgfxSerializer::createLibrary(const void *bytes, uint64_t byte_length)
+RgfxCreated RgfxSerializer::createLibrary(const void *bytes, uint64_t byte_length,
+                                          const uint8_t *key)
 {
 	RgfxCreated out = {};
 	out.obj_id = m_ids.allocObjId();
@@ -273,12 +274,29 @@ RgfxCreated RgfxSerializer::createLibrary(const void *bytes, uint64_t byte_lengt
 	RgfxLibraryCreate head = {};
 	head.obj_id = out.obj_id;
 	head.byte_length = byte_length;
+	if (key) {
+		head.flags = RGFX_LIBRARY_FLAG_KEYED;
+		std::memcpy(head.key, key, sizeof(head.key));
+	}
 	std::memcpy(buf.data(), &head, sizeof(head));
 	if (byte_length)
 		std::memcpy(buf.data() + RGFX_LIBRARY_BYTES_OFFSET, bytes,
 		            static_cast<size_t>(byte_length));
 	out.posted = m_control.tryPost(RGFX_CMD_LIBRARY_CREATE, buf.data(),
-	                               static_cast<uint32_t>(total), &out.seqno);
+	                               static_cast<uint32_t>(total), &out.seqno, &out.status);
+	return out;
+}
+
+RgfxCreated RgfxSerializer::lookupLibrary(const uint8_t *key, uint64_t slice_size)
+{
+	RgfxCreated out = {};
+	out.obj_id = m_ids.allocObjId();
+	RgfxLibraryLookup m = {};
+	m.obj_id = out.obj_id;
+	m.slice_size = slice_size;
+	std::memcpy(m.key, key, sizeof(m.key));
+	out.posted =
+	    m_control.tryPost(RGFX_CMD_LIBRARY_LOOKUP, &m, sizeof(m), &out.seqno, &out.status);
 	return out;
 }
 
@@ -289,7 +307,8 @@ RgfxObjId RgfxSerializer::allocLibraryId()
 
 bool RgfxSerializer::postLibraryChunk(RgfxObjId obj_id, uint64_t region_offset, uint64_t byte_length,
                                       uint64_t total_length, uint64_t chunk_offset,
-                                      uint64_t ack_offset, uint64_t ack_value)
+                                      uint64_t ack_offset, uint64_t ack_value, const uint8_t *key,
+                                      uint32_t *out_status)
 {
 	RgfxLibraryFromRegion m = {};
 	m.obj_id = obj_id;
@@ -299,7 +318,11 @@ bool RgfxSerializer::postLibraryChunk(RgfxObjId obj_id, uint64_t region_offset, 
 	m.chunk_offset = chunk_offset;
 	m.ack_offset = ack_offset;
 	m.ack_value = ack_value;
-	return m_control.tryPost(RGFX_CMD_LIBRARY_FROM_REGION, &m, sizeof(m), nullptr);
+	if (key) {
+		m.flags = RGFX_LIBRARY_FLAG_KEYED;
+		std::memcpy(m.key, key, sizeof(m.key));
+	}
+	return m_control.tryPost(RGFX_CMD_LIBRARY_FROM_REGION, &m, sizeof(m), nullptr, out_status);
 }
 
 RgfxCreated RgfxSerializer::createRenderPipeline(const RgfxRenderPipelineParams &p)

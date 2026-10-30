@@ -266,8 +266,9 @@ bool awaitBlock(LibraryStaging &st, int i)
 
 // Streams `length` bytes to the host as one library: each chunk copied into the next
 // staging block once the host has copied out what it last held, then posted.
+// The last chunk's answer is `*outStatus`.
 bool streamLibrary(RgfxRegion &region, RgfxSerializer &ser, const uint8_t *bytes, uint64_t length,
-                   RgfxObjId *outObjId)
+                   const uint8_t *key, RgfxObjId *outObjId, uint32_t *outStatus)
 {
 	LibraryStaging &st = libraryStaging();
 	std::lock_guard<std::mutex> guard(st.lock);
@@ -284,7 +285,8 @@ bool streamLibrary(RgfxRegion &region, RgfxSerializer &ser, const uint8_t *bytes
 		st.expected[i] = token;
 		bool posted = false;
 		for (int r = 0; r < 2000 && !posted; r++) {
-			posted = ser.postLibraryChunk(objId, st.blockOffset[i], n, length, at, st.ackOffset[i], token);
+			posted = ser.postLibraryChunk(objId, st.blockOffset[i], n, length, at, st.ackOffset[i],
+			                              token, key, outStatus);
 			if (!posted)
 				usleep(1000);
 		}
@@ -340,46 +342,93 @@ void rgfxConstantsDiag(NSString *fn, MTLFunctionConstantValues *values, uint32_t
 	BOOL _haveFunctionTable;                  // the bytes were a readable .metallib
 }
 
-+ (instancetype)libraryWithData:(const void *)bytes
-                         length:(NSUInteger)length
-                         device:(id<MTLDevice>)device
-                     serializer:(RgfxSerializer *)serializer
+// Whether a create's answer is the device's library: it made it (RGFX_STATUS_OK), or the
+// route hands no answer back (a ring the process writes itself).
+static bool rgfxMade(uint32_t status)
 {
-	if (serializer == nullptr) {
-		return nil; // a library must have a route to the host
-	}
-	RgfxCreated created = serializer->createLibrary(bytes, length);
-	if (!created.posted) {
-		return nil; // the bytes did not fit the control ring (a later transport
-		            // piece places large AIR in a region block)
-	}
-	RgfxLibrary *lib = [[RgfxLibrary alloc] initWithObjId:created.obj_id
-	                                               device:device
-	                                           serializer:serializer];
+	return status == RGFX_STATUS_OK || status == kRgfxNoAnswer;
+}
+
+// The library `objId` over `bytes`, its function table read from them.
++ (instancetype)rgfxLibraryWithObjId:(RgfxObjId)objId
+                               bytes:(const void *)bytes
+                              length:(NSUInteger)length
+                              device:(id<MTLDevice>)device
+                          serializer:(RgfxSerializer *)serializer
+{
+	RgfxLibrary *lib = [[RgfxLibrary alloc] initWithObjId:objId device:device serializer:serializer];
 	if (lib != nil)
 		lib->_haveFunctionTable =
 		    readMetallibFunctions(static_cast<const uint8_t *>(bytes), length, lib->_functions);
 	return lib;
 }
 
++ (instancetype)libraryWithData:(const void *)bytes
+                         length:(NSUInteger)length
+                            key:(const uint8_t *)key
+                         device:(id<MTLDevice>)device
+                     serializer:(RgfxSerializer *)serializer
+                         status:(uint32_t *)status
+{
+	*status = kRgfxNoAnswer;
+	if (serializer == nullptr) {
+		return nil; // a library must have a route to the host
+	}
+	RgfxCreated created = serializer->createLibrary(bytes, length, key);
+	if (!created.posted) {
+		return nil; // the bytes did not fit the control ring
+	}
+	*status = created.status;
+	if (!rgfxMade(created.status))
+		return nil;
+	return [self rgfxLibraryWithObjId:created.obj_id
+	                            bytes:bytes
+	                           length:length
+	                           device:device
+	                       serializer:serializer];
+}
+
++ (instancetype)libraryFoundWithKey:(const uint8_t *)key
+                              bytes:(const void *)bytes
+                             length:(NSUInteger)length
+                             device:(id<MTLDevice>)device
+                         serializer:(RgfxSerializer *)serializer
+{
+	if (serializer == nullptr)
+		return nil;
+	RgfxCreated found = serializer->lookupLibrary(key, length);
+	if (!found.posted || found.status != RGFX_STATUS_OK)
+		return nil;
+	return [self rgfxLibraryWithObjId:found.obj_id
+	                            bytes:bytes
+	                           length:length
+	                           device:device
+	                       serializer:serializer];
+}
+
 + (instancetype)libraryStreamingBytes:(const void *)bytes
                               length:(NSUInteger)length
+                                 key:(const uint8_t *)key
                               region:(RgfxRegion *)region
                               device:(id<MTLDevice>)device
                           serializer:(RgfxSerializer *)serializer
+                              status:(uint32_t *)status
 {
+	*status = kRgfxNoAnswer;
 	if (serializer == nullptr || region == nullptr || bytes == nullptr || length == 0) {
 		return nil;
 	}
 	RgfxObjId objId = 0;
-	if (!streamLibrary(*region, *serializer, static_cast<const uint8_t *>(bytes), length, &objId)) {
+	if (!streamLibrary(*region, *serializer, static_cast<const uint8_t *>(bytes), length, key,
+	                   &objId, status) ||
+	    !rgfxMade(*status)) {
 		return nil;
 	}
-	RgfxLibrary *lib = [[RgfxLibrary alloc] initWithObjId:objId device:device serializer:serializer];
-	if (lib != nil)
-		lib->_haveFunctionTable =
-		    readMetallibFunctions(static_cast<const uint8_t *>(bytes), length, lib->_functions);
-	return lib;
+	return [self rgfxLibraryWithObjId:objId
+	                            bytes:bytes
+	                           length:length
+	                           device:device
+	                       serializer:serializer];
 }
 
 // The table entry for `name`, or null when the table does not hold it.

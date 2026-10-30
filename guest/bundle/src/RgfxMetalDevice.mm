@@ -75,8 +75,11 @@ struct RgfxKextLink {
 };
 
 // The serializer's lifecycle route: the kext posts the message on the control ring, stamping
-// its seqno, and hands back a pipeline create's reflection once the host has answered it.
-bool rgfxKextSubmit(void *context, const void *message, uint32_t size, uint64_t *out_seqno)
+// its seqno, and hands back the answer the device owes it: a pipeline create's reflection, which
+// goes to the reply reader, or a library create's or lookup's COMPLETE, whose status is
+// `*out_status`.
+bool rgfxKextSubmit(void *context, const void *message, uint32_t size, uint64_t *out_seqno,
+                    uint32_t *out_status)
 {
 	RgfxKextLink *link = static_cast<RgfxKextLink *>(context);
 	uint64_t seqno = 0;
@@ -87,8 +90,17 @@ bool rgfxKextSubmit(void *context, const void *message, uint32_t size, uint64_t 
 	                                       size, &seqno, &outCount, reply, &replySize);
 	if (kr != KERN_SUCCESS)
 		return false;
-	if (replySize >= sizeof(RgfxMsgHeader) && link->reader)
+	RgfxMsgHeader header = {};
+	if (replySize >= sizeof(header))
+		std::memcpy(&header, reply, sizeof(header));
+	if (header.type == RGFX_EVT_COMPLETE && replySize >= sizeof(RgfxComplete)) {
+		RgfxComplete complete = {};
+		std::memcpy(&complete, reply, sizeof(complete));
+		if (out_status)
+			*out_status = complete.status;
+	} else if (replySize >= sizeof(RgfxMsgHeader) && link->reader) {
 		link->reader->deliver(reply, static_cast<uint32_t>(replySize));
+	}
 	*out_seqno = seqno;
 	return true;
 }

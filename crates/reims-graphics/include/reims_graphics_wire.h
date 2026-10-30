@@ -779,6 +779,14 @@
 // command); nothing was done.
 #define RGFX_STATUS_INVALID_ARGUMENT 3
 
+// `COMPLETE`'s status: the device holds nothing the command names (a `LIBRARY_LOOKUP` whose key
+// it holds no library for); nothing was done.
+#define RGFX_STATUS_NOT_FOUND 4
+
+// `COMPLETE`'s status: the device's GPU refused to make the object (a library whose bytes it
+// could not build); nothing was made.
+#define RGFX_STATUS_REFUSED 5
+
 // Scanout pixels: 32-bit BGRA8, `kIO32BGRAPixelFormat`, the one format there is.
 #define RGFX_SCANOUT_BYTES_PER_PIXEL 4
 
@@ -838,8 +846,8 @@
 // Struct later.
 #define RGFX_CMD_DEPTH_STENCIL_CREATE 523
 
-// Command `LIBRARY_CREATE`: a library from `.metallib`/AIR bytes, forwarded
-// unchanged. Struct later (a header followed by the bytes).
+// Command `LIBRARY_CREATE` ([`RgfxLibraryCreate`]): a library from `.metallib`/AIR bytes,
+// forwarded unchanged; answered by [`RGFX_EVT_COMPLETE`].
 #define RGFX_CMD_LIBRARY_CREATE 524
 
 // Command `RENDER_PIPELINE_CREATE`: a render pipeline from a descriptor;
@@ -862,8 +870,13 @@
 
 // Command `LIBRARY_FROM_REGION` ([`RgfxLibraryFromRegion`]): one chunk of a
 // library's `.metallib`/AIR bytes the guest placed in a block of the device's
-// region, for a library larger than one ring message.
+// region, for a library larger than one ring message. The library's last chunk is
+// answered by [`RGFX_EVT_COMPLETE`]; the others are not answered.
 #define RGFX_CMD_LIBRARY_FROM_REGION 530
+
+// Command `LIBRARY_LOOKUP` ([`RgfxLibraryLookup`]): a library by its content key, from the
+// libraries the device made for any process of the guest; answered by [`RGFX_EVT_COMPLETE`].
+#define RGFX_CMD_LIBRARY_LOOKUP 531
 
 // `CONTEXT_CLOSE` ([`RgfxContextClose`]), on ring 0 from the accelerator kext: the process that
 // held context `context` closed the device or died. The host ends the context's command queues
@@ -913,7 +926,10 @@
 #define RGFX_DISPLAYS_ENTRIES_OFFSET 20
 
 // Where a `LIBRARY_CREATE` message's bytes start: right after its header.
-#define RGFX_LIBRARY_BYTES_OFFSET 32
+#define RGFX_LIBRARY_BYTES_OFFSET 72
+
+// A library create's `flags`: its `key` is the bytes' content key.
+#define RGFX_LIBRARY_FLAG_KEYED 1
 
 // The version of the [`RgfxDeviceInfo`] layout the host writes.
 #define RGFX_DEVICE_INFO_VERSION 1
@@ -2127,7 +2143,14 @@ typedef struct {
 // `LIBRARY_CREATE`: a library from `byte_length` bytes of `.metallib` or AIR
 // that follow this header at [`RGFX_LIBRARY_BYTES_OFFSET`], forwarded to the
 // host unchanged. The message's `size` is `RGFX_LIBRARY_BYTES_OFFSET +
-// byte_length` rounded up to a multiple of 8.
+// byte_length` rounded up to a multiple of 8. Answered by [`RGFX_EVT_COMPLETE`]
+// once the library is made: [`RGFX_STATUS_OK`], [`RGFX_STATUS_REFUSED`] where the
+// GPU could not build the bytes, or [`RGFX_STATUS_INVALID_ARGUMENT`] for a message
+// shorter than its bytes.
+//
+// With [`RGFX_LIBRARY_FLAG_KEYED`] in `flags`, `key` is the bytes' content key
+// ([`RgfxLibraryLookup`]): the device keeps the library under it, for later lookups,
+// where the key it computes from the bytes is the same.
 typedef struct {
   // [`RGFX_CMD_LIBRARY_CREATE`].
   RgfxMsgHeader header;
@@ -2135,6 +2158,12 @@ typedef struct {
   uint64_t obj_id;
   // The length of the `.metallib`/AIR bytes that follow.
   uint64_t byte_length;
+  // [`RGFX_LIBRARY_FLAG_KEYED`], or 0.
+  uint32_t flags;
+  // Zero.
+  uint32_t reserved_24;
+  // The bytes' content key, where `flags` has [`RGFX_LIBRARY_FLAG_KEYED`].
+  uint8_t key[32];
 } RgfxLibraryCreate;
 
 // `LIBRARY_FROM_REGION`: one chunk of a library's `.metallib`/AIR bytes, which
@@ -2147,6 +2176,10 @@ typedef struct {
 // region), so the guest may write that block again: the ring's consumer count
 // moves when the host takes the message, not when it carries it out. A span
 // past the region's end, or a chunk out of order, is a guest protocol error.
+//
+// The library's last chunk, the one whose `chunk_offset + byte_length` reaches
+// `total_length` (or overflows), is answered as [`RgfxLibraryCreate`] is, and its
+// `flags` and `key` are the library's as there; the other chunks are not answered.
 typedef struct {
   // [`RGFX_CMD_LIBRARY_FROM_REGION`].
   RgfxMsgHeader header;
@@ -2164,7 +2197,37 @@ typedef struct {
   uint64_t ack_offset;
   // The value the host writes at `ack_offset`.
   uint64_t ack_value;
+  // [`RGFX_LIBRARY_FLAG_KEYED`], or 0.
+  uint32_t flags;
+  // Zero.
+  uint32_t reserved_4c;
+  // The library's content key, where `flags` has [`RGFX_LIBRARY_FLAG_KEYED`].
+  uint8_t key[32];
 } RgfxLibraryFromRegion;
+
+// `LIBRARY_LOOKUP`: library `obj_id` from the libraries the device holds, by their content key.
+//
+// The bytes keyed are a `.metallib` (`MTLB`), the AIR slice of a fat file. `key` is the SHA-256
+// of the 15 bytes `rgfx-library-v1`, then the bytes before the bitcode section, then the bytes
+// after it; the section is the `u64` offset and size at 0x48 and 0x50 of the `.metallib`'s
+// header. Each function's bitcode is named by its `HASH` tag, its SHA-256, which lies outside
+// the section, so the key names every byte a function is built from. `slice_size` is the bytes'
+// length.
+//
+// Answered by [`RGFX_EVT_COMPLETE`]: [`RGFX_STATUS_OK`] where the device holds a library of
+// `slice_size` bytes under `key`, which `obj_id` now names; [`RGFX_STATUS_NOT_FOUND`] where it
+// holds none, and the guest makes the library from its bytes; [`RGFX_STATUS_INVALID_ARGUMENT`]
+// for a message shorter than this record.
+typedef struct {
+  // [`RGFX_CMD_LIBRARY_LOOKUP`].
+  RgfxMsgHeader header;
+  // The library's guest-picked id.
+  uint64_t obj_id;
+  // The keyed bytes' length.
+  uint64_t slice_size;
+  // The bytes' content key.
+  uint8_t key[32];
+} RgfxLibraryLookup;
 
 // One mode of a display in a `DISPLAYS` message.
 typedef struct {

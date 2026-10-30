@@ -48,6 +48,13 @@ CHECK(RGFX_CONTEXT_ALLOCATIONS_OFFSET == 0x8400000);
 CHECK(RGFX_CONTEXT_OBJ_ID_SHIFT == 40);
 CHECK(sizeof(RgfxContextClose) == 24);
 CHECK(RGFX_CMD_CONTEXT_CLOSE == 0x2f0);
+CHECK(sizeof(RgfxLibraryCreate) == RGFX_LIBRARY_BYTES_OFFSET);
+CHECK(offsetof(RgfxLibraryCreate, key) == 0x28);
+CHECK(sizeof(RgfxLibraryFromRegion) == 112);
+CHECK(offsetof(RgfxLibraryFromRegion, key) == 0x50);
+CHECK(sizeof(RgfxLibraryLookup) == 64);
+CHECK(offsetof(RgfxLibraryLookup, key) == 0x20);
+CHECK(RGFX_CMD_LIBRARY_LOOKUP == 0x213);
 CHECK(RGFX_CONTROL_RING_ID == 0);
 CHECK(RGFX_CONTROL_VECTOR == 0);
 int main(void) { return 0; }

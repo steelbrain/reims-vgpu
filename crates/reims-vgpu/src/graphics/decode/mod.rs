@@ -48,13 +48,13 @@ use reims_graphics::wire::{
     RGFX_CMD_QUEUE_CREATE, RGFX_CMD_RENDER_PIPELINE_CREATE, RGFX_CMD_SAMPLER_CREATE,
     RGFX_CMD_SHARED_EVENT_CREATE, RGFX_CMD_TEXTURE_CREATE, RGFX_CMD_TEXTURE_FROM_BUFFER,
     RGFX_CMD_TEXTURE_FROM_IOSURFACE,
-    RGFX_EVT_PIPELINE_REFLECTION, RGFX_LIBRARY_BYTES_OFFSET, RGFX_PIPELINE_KIND_COMPUTE,
+    RGFX_EVT_PIPELINE_REFLECTION, RGFX_PIPELINE_KIND_COMPUTE,
     RGFX_PIPELINE_KIND_RENDER, RGFX_PIPELINE_OK, RGFX_PIPELINE_REFLECT_SUPPORT_ICB,
     RGFX_PIPELINE_REFLECT_THREADGROUP_MATCHES_TILE, RGFX_PIPELINE_REFUSED, RgfxBufferAtOffset,
     RgfxBufferCreate, RgfxCbComplete, RgfxColorAttachmentDesc, RgfxComputePipelineCreate,
     RgfxFunctionConstant,
     RgfxBufferOverHostMemory, RgfxDepthStencilCreate, RgfxHeapCreate, RgfxHeapOverHostMemory,
-    RgfxLibraryCreate, RgfxLibraryFromRegion, RgfxMsgHeader, RgfxObjectCreate,
+    RgfxMsgHeader, RgfxObjectCreate,
     RgfxObjectDestroy, RgfxPipelineReflection, RgfxQueueCreate, RgfxRenderPipelineCreate,
     RgfxSamplerCreate, RgfxSharedEventCreate, RgfxStencilDescriptor, RgfxTextureCreate,
     RgfxTextureDescriptor, RgfxTextureFromBuffer, RgfxTextureFromIOSurface,
@@ -76,7 +76,17 @@ use zerocopy::FromBytes;
 mod blit;
 mod cmdbuf;
 mod compute;
+mod library;
 mod render;
+
+#[cfg(test)]
+pub(crate) use library::tests::{metallib as test_metallib, sha as test_sha};
+#[cfg(test)]
+pub(crate) use library::verified_key as test_key;
+use library::{LibraryCache, LibraryKey, LibraryRef, LibrarySlot};
+pub(crate) use library::{
+    LibraryJob, LibraryStart, MadeLibrary, RELEASED_BUDGET, complete, make_library,
+};
 
 /// A sink the decoder calls with each command buffer's completion record once its
 /// work finishes (the handler the stream's close registers). The ring loop sets
@@ -139,7 +149,13 @@ pub struct GraphicsDecoder<P: Platform> {
     surfaces: HashMap<u32, u64>,
     /// The bytes of each library whose `LIBRARY_FROM_REGION` chunks have not yet
     /// reached its length, by the library's id.
-    pending_libraries: HashMap<u64, Vec<u8>>,
+    library_chunks: HashMap<u64, Vec<u8>>,
+    /// The libraries being made, by id, until each is stored or cancelled (`library`).
+    making_libraries: HashMap<u64, Arc<LibrarySlot<P>>>,
+    /// The libraries made from keyed bytes, by key, across every process (`library`).
+    library_cache: LibraryCache<P>,
+    /// The key of each id the cache's entries are named by.
+    cached_libraries: HashMap<u64, LibraryKey>,
     /// Where a command buffer's completion record goes once its work finishes;
     /// `None` builds and drops it (the ring loop sets a sink later).
     completion_sink: Option<CompletionSink>,
@@ -160,7 +176,10 @@ impl<P: Platform> GraphicsDecoder<P> {
             platform,
             objects: HashMap::new(),
             surfaces: HashMap::new(),
-            pending_libraries: HashMap::new(),
+            library_chunks: HashMap::new(),
+            making_libraries: HashMap::new(),
+            library_cache: LibraryCache::new(RELEASED_BUDGET),
+            cached_libraries: HashMap::new(),
             completion_sink: None,
             reflection_sink: None,
             region,
@@ -211,9 +230,18 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// `context << RGFX_CONTEXT_OBJ_ID_SHIFT` and up, below the next context's (its process closed
     /// the device or died). How many were dropped.
     pub(crate) fn drop_context(&mut self, context: u32) -> usize {
+        let ours = |id: &u64| (id >> RGFX_CONTEXT_OBJ_ID_SHIFT) == u64::from(context);
         let before = self.objects.len();
-        self.objects
-            .retain(|id, _| (id >> RGFX_CONTEXT_OBJ_ID_SHIFT) != u64::from(context));
+        self.objects.retain(|id, _| !ours(id));
+        let libraries: Vec<u64> = (self.making_libraries.keys())
+            .chain(self.library_chunks.keys())
+            .chain(self.cached_libraries.keys())
+            .copied()
+            .filter(ours)
+            .collect();
+        for id in libraries {
+            self.forget_library(id);
+        }
         before - self.objects.len()
     }
 
@@ -236,6 +264,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                 };
                 // A missing id is not an error: the guest may destroy an object
                 // the host never made (a create that the platform refused).
+                self.forget_library(m.obj_id);
                 if matches!(self.objects.remove(&m.obj_id), Some(ObjHandle::Texture(_))) {
                     self.surfaces.retain(|_, texture| *texture != m.obj_id);
                 }
@@ -283,32 +312,8 @@ impl<P: Platform> GraphicsDecoder<P> {
                     None => Ok(Err(DecodeError::Refused)),
                 }
             }
-            RGFX_CMD_LIBRARY_CREATE => {
-                let Some(m) = read::<RgfxLibraryCreate>(message) else {
-                    return Ok(Err(DecodeError::Malformed));
-                };
-                // The `.metallib`/AIR bytes follow the header; forward them to
-                // the platform unchanged.
-                let start = RGFX_LIBRARY_BYTES_OFFSET as usize;
-                let Some(air) = (m.byte_length as usize)
-                    .checked_add(start)
-                    .and_then(|end| message.get(start..end))
-                else {
-                    return Ok(Err(DecodeError::Malformed));
-                };
-                // A nil library and a build failure both mean no usable library;
-                // the compile error's text reaches the guest with the completion
-                // in a later increment.
-                match device.new_library(air)? {
-                    Ok(Some(library)) => self.insert(m.obj_id, ObjHandle::Library(library)),
-                    Ok(None) | Err(_) => Ok(Err(DecodeError::Refused)),
-                }
-            }
-            RGFX_CMD_LIBRARY_FROM_REGION => {
-                let Some(m) = read::<RgfxLibraryFromRegion>(message) else {
-                    return Ok(Err(DecodeError::Malformed));
-                };
-                self.decode_library_chunk(device, &m)
+            RGFX_CMD_LIBRARY_CREATE | RGFX_CMD_LIBRARY_FROM_REGION => {
+                self.decode_library(device, message)
             }
             RGFX_CMD_SAMPLER_CREATE => {
                 let Some(m) = read::<RgfxSamplerCreate>(message) else {
@@ -564,56 +569,14 @@ impl<P: Platform> GraphicsDecoder<P> {
         obj_id: u64,
         handle: ObjHandle<P>,
     ) -> RaiseResult<Result<(), DecodeError>> {
-        self.objects.insert(obj_id, handle);
+        self.store(obj_id, handle);
         Ok(Ok(()))
     }
 
-    /// `LIBRARY_FROM_REGION`: one chunk of a library's bytes, which lie in a block
-    /// of the device's region. The bytes are copied out once (so the platform parses
-    /// memory the guest cannot change under it), the chunk's ack is written so the
-    /// guest may reuse the block, and the library is made from the whole once the
-    /// chunks reach its length. A span past the region's end is a bad reference; a
-    /// chunk out of order or past the length is malformed and drops what came before.
-    fn decode_library_chunk(
-        &mut self,
-        device: &P::Device,
-        m: &RgfxLibraryFromRegion,
-    ) -> RaiseResult<Result<(), DecodeError>> {
-        let Some(chunk) = usize::try_from(m.byte_length)
-            .ok()
-            .and_then(|len| self.region.read(m.region_offset, len))
-        else {
-            self.pending_libraries.remove(&m.obj_id);
-            return Ok(Err(DecodeError::BadReference));
-        };
-        // The bytes are out of the block: the guest may write it again.
-        if m.ack_offset % 8 != 0 || !self.region.write(m.ack_offset, &m.ack_value.to_le_bytes()) {
-            self.pending_libraries.remove(&m.obj_id);
-            return Ok(Err(DecodeError::BadReference));
-        }
-        let mut bytes = if m.chunk_offset == 0 {
-            self.pending_libraries.remove(&m.obj_id);
-            Vec::with_capacity(usize::try_from(m.total_length).unwrap_or(0).min(1 << 30))
-        } else {
-            match self.pending_libraries.remove(&m.obj_id) {
-                Some(b) => b,
-                None => return Ok(Err(DecodeError::Malformed)),
-            }
-        };
-        if bytes.len() as u64 != m.chunk_offset
-            || m.chunk_offset.checked_add(m.byte_length).is_none_or(|end| end > m.total_length)
-        {
-            return Ok(Err(DecodeError::Malformed));
-        }
-        bytes.extend_from_slice(&chunk);
-        if (bytes.len() as u64) < m.total_length {
-            self.pending_libraries.insert(m.obj_id, bytes);
-            return Ok(Ok(()));
-        }
-        match device.new_library(&bytes)? {
-            Ok(Some(library)) => self.insert(m.obj_id, ObjHandle::Library(library)),
-            Ok(None) | Err(_) => Ok(Err(DecodeError::Refused)),
-        }
+    /// Stores `handle` under `obj_id`, in place of what the id named.
+    fn store(&mut self, obj_id: u64, handle: ObjHandle<P>) {
+        self.forget_library(obj_id);
+        self.objects.insert(obj_id, handle);
     }
 
     /// `RENDER_PIPELINE_CREATE` and `COMPUTE_PIPELINE_CREATE`, carried out at once: the create is
@@ -659,10 +622,7 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// serialized-descriptor deserializer, which is the Apple lane's; carrying the whole
     /// descriptor on the wire keeps the guest ABI stable for when the platform value grows.
     pub(crate) fn prepare_pipeline(&self, message: &[u8]) -> Result<PipelineJob<P>, DecodeError> {
-        let library = |obj_id: u64| match self.objects.get(&obj_id) {
-            Some(ObjHandle::Library(l)) => Ok(l.clone_ref()),
-            _ => Err(DecodeError::BadReference),
-        };
+        let library = |obj_id: u64| self.library_ref(obj_id);
         let header = read::<RgfxMsgHeader>(message).ok_or(DecodeError::Malformed)?;
         if header.r#type == RGFX_CMD_COMPUTE_PIPELINE_CREATE {
             let m = read::<RgfxComputePipelineCreate>(message).ok_or(DecodeError::Malformed)?;
@@ -760,10 +720,10 @@ impl<P: Platform> PipelineJob<P> {
 /// A prepared pipeline's functions and descriptor.
 enum PipelineShape<P: Platform> {
     Render {
-        vertex_library: P::Library,
+        vertex_library: LibraryRef<P>,
         vertex_name: String,
         vertex_constants: Vec<FunctionConstant>,
-        fragment_library: P::Library,
+        fragment_library: LibraryRef<P>,
         fragment_name: String,
         fragment_constants: Vec<FunctionConstant>,
         label: Option<String>,
@@ -771,7 +731,7 @@ enum PipelineShape<P: Platform> {
         blend_over: bool,
     },
     Compute {
-        library: P::Library,
+        library: LibraryRef<P>,
         name: String,
         constants: Vec<FunctionConstant>,
     },
@@ -834,6 +794,13 @@ pub(crate) fn compile_pipeline<P: Platform>(
             color0_pixel_format,
             blend_over,
         } => {
+            // A library being made is waited for here; one the platform refused refuses the
+            // pipeline.
+            let (Some(vertex_library), Some(fragment_library)) =
+                (vertex_library.resolve(), fragment_library.resolve())
+            else {
+                return Ok(refused());
+            };
             let Some(vertex) = specialised::<P>(&vertex_library, &vertex_name, &vertex_constants)?
             else {
                 return Ok(refused());
@@ -867,6 +834,9 @@ pub(crate) fn compile_pipeline<P: Platform>(
             name,
             constants,
         } => {
+            let Some(library) = library.resolve() else {
+                return Ok(refused());
+            };
             let Some(function) = specialised::<P>(&library, &name, &constants)? else {
                 return Ok(refused());
             };
@@ -1132,6 +1102,9 @@ fn stencil(s: &RgfxStencilDescriptor) -> StencilDesc {
 mod tests {
     use std::sync::Arc;
 
+    use reims_graphics::wire::{
+        RGFX_LIBRARY_BYTES_OFFSET, RgfxLibraryCreate, RgfxLibraryFromRegion,
+    };
     use reims_vgpu_core::testkit::{Arg, FakePlatform};
     use zerocopy::IntoBytes;
 
@@ -1163,6 +1136,7 @@ mod tests {
                 chunk_offset: at,
                 ack_offset: 0x100,
                 ack_value: ack,
+                ..RgfxLibraryFromRegion::default()
             }
         };
         let total = air.len() as u64;
@@ -1270,6 +1244,7 @@ mod tests {
             },
             obj_id: 14,
             byte_length: air.len() as u64,
+            ..RgfxLibraryCreate::default()
         }
         .as_bytes()
         .to_vec();
@@ -1602,6 +1577,7 @@ mod tests {
             },
             obj_id: 1,
             byte_length: air.len() as u64,
+            ..RgfxLibraryCreate::default()
         }
         .as_bytes()
         .to_vec();

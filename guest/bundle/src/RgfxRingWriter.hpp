@@ -35,11 +35,17 @@
 /// device's `DOORBELL` register; in a test, records the wake.
 typedef void (*RgfxDoorbell)(void *context, uint32_t ring_id);
 
+/// What tryPost() gives as a message's answer where none came back: the message is not one the
+/// device answers, or the ring is one the process writes itself, whose answers come later.
+constexpr uint32_t kRgfxNoAnswer = 0xffff'ffffu;
+
 /// Hands one whole message (its header's `type` and `size` stamped) to a ring the process
 /// does not write itself: in the bundle, the accelerator kext, which posts it on the control
-/// ring and stamps its seqno; true once it is posted, with `*out_seqno` the seqno.
+/// ring and stamps its seqno; true once it is posted, with `*out_seqno` the seqno. Where the
+/// device answers the message with RGFX_EVT_COMPLETE, the kext waits for the answer and
+/// `*out_status` (when not null) is its status; kRgfxNoAnswer otherwise.
 typedef bool (*RgfxForward)(void *context, const void *message, uint32_t size,
-                            uint64_t *out_seqno);
+                            uint64_t *out_seqno, uint32_t *out_status);
 
 class RgfxRingWriter {
 public:
@@ -60,8 +66,10 @@ public:
 	/// the header's `type`, `size` and `seqno`. Returns false, writing nothing,
 	/// when the ring has no room until the host consumes more, or when the
 	/// arguments are out of range. On success `*out_seqno` (when not null) holds
-	/// the stamped seqno.
-	bool tryPost(uint32_t type, const void *message, uint32_t size, uint64_t *out_seqno);
+	/// the stamped seqno, and `*out_status` (when not null) the COMPLETE status the
+	/// forward handed back, or kRgfxNoAnswer.
+	bool tryPost(uint32_t type, const void *message, uint32_t size, uint64_t *out_seqno,
+	             uint32_t *out_status = nullptr);
 
 	/// The byte ring's size.
 	uint32_t dataSize() const { return m_dataSize; }

@@ -38,8 +38,10 @@ static_assert(sizeof(RgfxTextureFromIOSurface) == 112, "RgfxTextureFromIOSurface
 static_assert(sizeof(RgfxSamplerCreate) == 72, "RgfxSamplerCreate");
 static_assert(sizeof(RgfxStencilDescriptor) == 24, "RgfxStencilDescriptor");
 static_assert(sizeof(RgfxDepthStencilCreate) == 80, "RgfxDepthStencilCreate");
-static_assert(sizeof(RgfxLibraryCreate) == 32, "RgfxLibraryCreate");
+static_assert(sizeof(RgfxLibraryCreate) == 72, "RgfxLibraryCreate");
 static_assert(RGFX_LIBRARY_BYTES_OFFSET == sizeof(RgfxLibraryCreate), "library bytes offset");
+static_assert(sizeof(RgfxLibraryFromRegion) == 112, "RgfxLibraryFromRegion");
+static_assert(sizeof(RgfxLibraryLookup) == 64, "RgfxLibraryLookup");
 static_assert(sizeof(RgfxDeviceInfo) == 376, "RgfxDeviceInfo");
 
 // Stage-3 pipeline creates and reflection.

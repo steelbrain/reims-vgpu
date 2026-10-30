@@ -293,7 +293,7 @@ fn a_command_buffer_submission_completes_on_the_ring() {
     let context = 2;
     let mut guest = Guest::new(&device);
     assert_eq!(
-        open_queue(
+        answered(
             &device,
             &mut guest,
             queue_create(context, 1, SUBMIT_OFF, COMPLETE_OFF, RING_DATA, 0)
@@ -323,7 +323,7 @@ fn a_command_buffer_submission_completes_on_the_ring() {
     // The context's close drops its objects, the queue and the event, before it is answered.
     assert_eq!(device.decoder_object_count(), 2);
     assert_eq!(
-        open_queue(&device, &mut guest, context_close(context)),
+        answered(&device, &mut guest, context_close(context)),
         RGFX_STATUS_OK
     );
     assert_eq!(device.graphics_queue_count(), 0);
@@ -391,9 +391,10 @@ fn object_destroy(obj_id: u64) -> Vec<u8> {
     .to_vec()
 }
 
-/// Sends `command` (a `QUEUE_CREATE` or a `CONTEXT_CLOSE`) on ring 0, as the guest's kext does, and
-/// waits for its `COMPLETE`: its status.
-fn open_queue(device: &GraphicsDevice<FakePlatform>, guest: &mut Guest, command: Vec<u8>) -> u32 {
+/// Sends `command` (one answered by `COMPLETE`: a `QUEUE_CREATE`, a `CONTEXT_CLOSE`, a library
+/// create or lookup) on ring 0, as the guest's kext does, and waits for its `COMPLETE`: its
+/// status.
+fn answered(device: &GraphicsDevice<FakePlatform>, guest: &mut Guest, command: Vec<u8>) -> u32 {
     guest.send(device, command);
     let bytes = guest.event().expect("a COMPLETE");
     let complete = RgfxComplete::read_from_bytes(&bytes).unwrap();
@@ -541,7 +542,7 @@ fn a_per_queue_ring_decodes_and_completes_a_command_buffer() {
     let queue = obj(context, 1);
     let mut guest = Guest::new(&device);
     assert_eq!(
-        open_queue(
+        answered(
             &device,
             &mut guest,
             queue_create(context, 1, SUBMIT_OFF, COMPLETE_OFF, RING_DATA, 1)
@@ -698,21 +699,71 @@ fn a_present_needs_the_surface_s_texture() {
 
 /// A `LIBRARY_CREATE` of library `obj_id`, whose bytes the fake platform takes as a library.
 fn library_create(obj_id: u64) -> Vec<u8> {
-    let air = [1u8, 2, 3, 4];
-    let mut bytes = RgfxLibraryCreate {
+    keyed_library_create(obj_id, &[1, 2, 3, 4], None)
+}
+
+/// A `LIBRARY_CREATE` of library `obj_id` from `bytes`, with `key` where there is one.
+fn keyed_library_create(obj_id: u64, bytes: &[u8], key: Option<[u8; 32]>) -> Vec<u8> {
+    let mut message = RgfxLibraryCreate {
         header: RgfxMsgHeader {
             r#type: RGFX_CMD_LIBRARY_CREATE,
             size: 0,
             seqno: 0,
         },
         obj_id,
-        byte_length: air.len() as u64,
+        byte_length: bytes.len() as u64,
+        flags: if key.is_some() {
+            RGFX_LIBRARY_FLAG_KEYED
+        } else {
+            0
+        },
+        reserved_24: 0,
+        key: key.unwrap_or_default(),
     }
     .as_bytes()
     .to_vec();
-    bytes.extend_from_slice(&air);
-    bytes.resize(bytes.len().next_multiple_of(8), 0);
-    bytes
+    message.extend_from_slice(bytes);
+    message.resize(message.len().next_multiple_of(8), 0);
+    message
+}
+
+/// A `LIBRARY_LOOKUP` of library `obj_id` by `key`, for `size` bytes.
+fn library_lookup(obj_id: u64, size: usize, key: [u8; 32]) -> Vec<u8> {
+    RgfxLibraryLookup {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_LIBRARY_LOOKUP,
+            size: 0,
+            seqno: 0,
+        },
+        obj_id,
+        slice_size: size as u64,
+        key,
+    }
+    .as_bytes()
+    .to_vec()
+}
+
+/// A `.metallib` of two functions whose `HASH` tags are their bitcode's, and its key.
+fn keyed_metallib() -> (Vec<u8>, [u8; 32]) {
+    let bitcode = b"vertex-bitcode fragment-bitcode";
+    let bytes = decode::test_metallib(
+        bitcode,
+        &[
+            (0, 15, decode::test_sha(&bitcode[..15])),
+            (15, 16, decode::test_sha(&bitcode[15..])),
+        ],
+    );
+    let key = decode::test_key(&bytes).expect("the test library's key");
+    (bytes, key)
+}
+
+/// Makes library `obj_id` as the guest's bundle does: its create, then the wait for its
+/// `COMPLETE`, which must be OK.
+fn make_library(device: &GraphicsDevice<FakePlatform>, guest: &mut Guest, obj_id: u64) {
+    assert_eq!(
+        answered(device, guest, library_create(obj_id)),
+        RGFX_STATUS_OK
+    );
 }
 
 /// A `RENDER_PIPELINE_CREATE` of pipeline `obj_id` from functions `vmain` and `fmain` of library
@@ -847,7 +898,7 @@ fn another_context_s_command_buffer_is_not_held_by_a_slow_compile() {
     let (device, platform) = headless_on(&raised);
     device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
     let mut guest = Guest::new(&device);
-    guest.send(&device, library_create(obj(1, 10)));
+    make_library(&device, &mut guest, obj(1, 10));
     device.control.pool.hold();
     guest.send(&device, render_pipeline_create(obj(1, 11), obj(1, 10)));
     let create = guest.seqno;
@@ -856,7 +907,7 @@ fn another_context_s_command_buffer_is_not_held_by_a_slow_compile() {
     const COMPLETE_OFF: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x2_0000;
     const RING_DATA: u32 = 0x1_0000;
     assert_eq!(
-        open_queue(
+        answered(
             &device,
             &mut guest,
             queue_create(2, 1, SUBMIT_OFF, COMPLETE_OFF, RING_DATA, 0)
@@ -891,7 +942,7 @@ fn a_display_command_behind_a_slow_compile_is_answered() {
     let (device, _platform) = headless_on(&raised);
     device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
     let mut guest = Guest::new(&device);
-    guest.send(&device, library_create(obj(1, 10)));
+    make_library(&device, &mut guest, obj(1, 10));
     device.control.pool.hold();
     guest.send(&device, compute_pipeline_create(obj(1, 11), obj(1, 10)));
     let create = guest.seqno;
@@ -927,14 +978,14 @@ fn a_command_buffer_naming_a_pending_pipeline_waits_for_it() {
     const COMPLETE_OFF: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x2_0000;
     const RING_DATA: u32 = 0x1_0000;
     assert_eq!(
-        open_queue(
+        answered(
             &device,
             &mut guest,
             queue_create(3, 1, SUBMIT_OFF, COMPLETE_OFF, RING_DATA, 0)
         ),
         RGFX_STATUS_OK
     );
-    guest.send(&device, library_create(obj(3, 10)));
+    make_library(&device, &mut guest, obj(3, 10));
     device.control.pool.hold();
     guest.send(&device, compute_pipeline_create(obj(3, 11), obj(3, 10)));
     let mut ring = QueueRing::new(&device, SUBMIT_OFF, COMPLETE_OFF, u64::from(RING_DATA));
@@ -967,7 +1018,7 @@ fn a_destroy_of_a_pending_pipeline_cancels_it() {
     let (device, _platform) = headless_on(&raised);
     device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
     let mut guest = Guest::new(&device);
-    guest.send(&device, library_create(obj(1, 10)));
+    make_library(&device, &mut guest, obj(1, 10));
     device.control.pool.hold();
     guest.send(&device, compute_pipeline_create(obj(1, 11), obj(1, 10)));
     guest.send(&device, object_destroy(obj(1, 11)));
@@ -985,5 +1036,273 @@ fn a_destroy_of_a_pending_pipeline_cancels_it() {
     next_event(&mut guest, RGFX_EVT_DISPLAYS);
     device.control.pool.release();
     next_event(&mut guest, RGFX_EVT_PIPELINE_REFLECTION);
+    assert_eq!(device.decoder_object_count(), 1);
+}
+
+/// The calls the platform had to make a library from bytes.
+fn library_makes(platform: &FakePlatform) -> usize {
+    platform
+        .call_log()
+        .calls_to("newLibraryWithData:error:")
+        .len()
+}
+
+/// A library one process made from keyed bytes is found by another's lookup: the first lookup
+/// misses, the create makes the library and keeps it, and the second process's lookup binds its
+/// own id to that library, with no bytes sent and nothing made; a pipeline from it compiles
+#[test]
+fn a_library_lookup_misses_then_hits_across_two_contexts() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform) = headless_on(&raised);
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    let (bytes, key) = keyed_metallib();
+    assert_eq!(
+        answered(
+            &device,
+            &mut guest,
+            library_lookup(obj(1, 10), bytes.len(), key)
+        ),
+        RGFX_STATUS_NOT_FOUND
+    );
+    assert_eq!(
+        answered(
+            &device,
+            &mut guest,
+            keyed_library_create(obj(1, 10), &bytes, Some(key))
+        ),
+        RGFX_STATUS_OK
+    );
+    assert_eq!(library_makes(&platform), 1);
+
+    let lookup = library_lookup(obj(2, 10), bytes.len(), key);
+    assert_eq!(lookup.len(), size_of::<RgfxLibraryLookup>());
+    assert_eq!(answered(&device, &mut guest, lookup), RGFX_STATUS_OK);
+    assert_eq!(library_makes(&platform), 1);
+    assert_eq!(device.decoder_object_count(), 2);
+    // The same key at another size is not that library.
+    assert_eq!(
+        answered(
+            &device,
+            &mut guest,
+            library_lookup(obj(2, 11), bytes.len() + 8, key)
+        ),
+        RGFX_STATUS_NOT_FOUND
+    );
+
+    // Each id is a handle of its own: the first process's destroy leaves the second's.
+    guest.send(&device, object_destroy(obj(1, 10)));
+    guest.send(&device, compute_pipeline_create(obj(2, 12), obj(2, 10)));
+    let bytes = next_event(&mut guest, RGFX_EVT_PIPELINE_REFLECTION);
+    let reflection = RgfxPipelineReflection::read_from_bytes(&bytes).unwrap();
+    assert_eq!(reflection.obj_id, obj(2, 12));
+    assert_eq!(reflection.status, RGFX_PIPELINE_OK);
+}
+
+/// A create whose key is not the one the host computes from its bytes makes the library for its
+/// request, and keeps it under no key: neither key finds it
+#[test]
+fn a_library_with_a_wrong_key_is_not_kept() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform) = headless_on(&raised);
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    let (bytes, key) = keyed_metallib();
+    let mut wrong = key;
+    wrong[0] ^= 1;
+    assert_eq!(
+        answered(
+            &device,
+            &mut guest,
+            keyed_library_create(obj(1, 10), &bytes, Some(wrong))
+        ),
+        RGFX_STATUS_OK
+    );
+    assert_eq!(device.decoder_object_count(), 1);
+    for key in [wrong, key] {
+        assert_eq!(
+            answered(
+                &device,
+                &mut guest,
+                library_lookup(obj(2, 10), bytes.len(), key)
+            ),
+            RGFX_STATUS_NOT_FOUND
+        );
+    }
+    // Bytes with no key are made, and kept under none either.
+    assert_eq!(
+        answered(
+            &device,
+            &mut guest,
+            keyed_library_create(obj(1, 11), &bytes, None)
+        ),
+        RGFX_STATUS_OK
+    );
+    assert_eq!(
+        answered(
+            &device,
+            &mut guest,
+            library_lookup(obj(2, 10), bytes.len(), key)
+        ),
+        RGFX_STATUS_NOT_FOUND
+    );
+    assert_eq!(library_makes(&platform), 2);
+}
+
+/// A library no id names any more stays in the cache: after its process closes, the next
+/// process's lookup still finds it
+#[test]
+fn a_released_library_stays_in_the_cache() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform) = headless_on(&raised);
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    let (bytes, key) = keyed_metallib();
+    assert_eq!(
+        answered(
+            &device,
+            &mut guest,
+            keyed_library_create(obj(1, 10), &bytes, Some(key))
+        ),
+        RGFX_STATUS_OK
+    );
+    assert_eq!(
+        answered(&device, &mut guest, context_close(1)),
+        RGFX_STATUS_OK
+    );
+    assert_eq!(device.decoder_object_count(), 0);
+    assert_eq!(
+        answered(
+            &device,
+            &mut guest,
+            library_lookup(obj(2, 10), bytes.len(), key)
+        ),
+        RGFX_STATUS_OK
+    );
+    assert_eq!(library_makes(&platform), 1);
+    assert_eq!(device.decoder_object_count(), 1);
+}
+
+/// A display command behind a library create on ring 0 is answered while the library is made
+#[test]
+fn a_display_command_behind_a_slow_library_create_is_answered() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, _platform) = headless_on(&raised);
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    device.control.pool.hold();
+    guest.send(&device, library_create(obj(1, 10)));
+    let create = guest.seqno;
+    guest.send(
+        &device,
+        RgfxMsgHeader {
+            r#type: RGFX_CMD_GET_DISPLAYS,
+            size: 0,
+            seqno: 0,
+        }
+        .as_bytes()
+        .to_vec(),
+    );
+    let displays = next_event(&mut guest, RGFX_EVT_DISPLAYS);
+    let (header, _) = RgfxMsgHeader::read_from_prefix(&displays).unwrap();
+    assert_eq!(header.seqno, guest.seqno);
+    assert_eq!(device.decoder_object_count(), 0);
+
+    device.control.pool.release();
+    let done = RgfxComplete::read_from_bytes(&next_event(&mut guest, RGFX_EVT_COMPLETE)).unwrap();
+    assert_eq!(done.header.seqno, create);
+    assert_eq!(done.status, RGFX_STATUS_OK);
+    assert_eq!(device.decoder_object_count(), 1);
+}
+
+/// The events of ring 0's completion ring until `n` have come, by type.
+fn events(guest: &mut Guest, n: usize) -> Vec<(u32, Vec<u8>)> {
+    (0..n)
+        .map(|_| {
+            let bytes = guest.event().expect("an event on ring 0");
+            let (header, _) = RgfxMsgHeader::read_from_prefix(&bytes).unwrap();
+            (header.r#type, bytes)
+        })
+        .collect()
+}
+
+/// A pipeline create that names a library still being made is prepared at once, ring 0 going on,
+/// and compiles once the library is made
+#[test]
+fn a_pipeline_naming_a_pending_library_waits_for_it() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform) = headless_on(&raised);
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    device.control.pool.hold();
+    guest.send(&device, library_create(obj(1, 10)));
+    guest.send(&device, compute_pipeline_create(obj(1, 11), obj(1, 10)));
+    let pipeline = guest.seqno;
+    guest.send(
+        &device,
+        RgfxMsgHeader {
+            r#type: RGFX_CMD_GET_DISPLAYS,
+            size: 0,
+            seqno: 0,
+        }
+        .as_bytes()
+        .to_vec(),
+    );
+    next_event(&mut guest, RGFX_EVT_DISPLAYS);
+    assert_eq!(library_makes(&platform), 0);
+
+    device.control.pool.release();
+    let mut got = events(&mut guest, 2);
+    got.sort_by_key(|(r#type, _)| *r#type);
+    assert_eq!(got[0].0, RGFX_EVT_COMPLETE);
+    assert_eq!(
+        RgfxComplete::read_from_bytes(&got[0].1).unwrap().status,
+        RGFX_STATUS_OK
+    );
+    assert_eq!(got[1].0, RGFX_EVT_PIPELINE_REFLECTION);
+    let reflection = RgfxPipelineReflection::read_from_bytes(&got[1].1).unwrap();
+    assert_eq!(reflection.header.seqno, pipeline);
+    assert_eq!(reflection.status, RGFX_PIPELINE_OK);
+    assert_eq!(device.decoder_object_count(), 2);
+}
+
+/// An `OBJECT_DESTROY` of a library still being made keeps ring order: the pipeline created from
+/// it before the destroy compiles with it, and the library is not stored
+#[test]
+fn a_destroy_of_a_pending_library_keeps_the_pipeline_before_it() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, _platform) = headless_on(&raised);
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    device.control.pool.hold();
+    guest.send(&device, library_create(obj(1, 10)));
+    guest.send(&device, compute_pipeline_create(obj(1, 11), obj(1, 10)));
+    guest.send(&device, object_destroy(obj(1, 10)));
+    // A pipeline create after the destroy names no library.
+    guest.send(&device, compute_pipeline_create(obj(1, 12), obj(1, 10)));
+    guest.send(
+        &device,
+        RgfxMsgHeader {
+            r#type: RGFX_CMD_GET_DISPLAYS,
+            size: 0,
+            seqno: 0,
+        }
+        .as_bytes()
+        .to_vec(),
+    );
+    next_event(&mut guest, RGFX_EVT_DISPLAYS);
+    device.control.pool.release();
+    let got = events(&mut guest, 2);
+    let reflection = got
+        .iter()
+        .find(|(r#type, _)| *r#type == RGFX_EVT_PIPELINE_REFLECTION)
+        .map(|(_, bytes)| RgfxPipelineReflection::read_from_bytes(bytes).unwrap())
+        .expect("the pipeline's reflection");
+    assert_eq!(reflection.obj_id, obj(1, 11));
+    assert_eq!(reflection.status, RGFX_PIPELINE_OK);
+    assert!(
+        guest.event().is_none(),
+        "the create after the destroy was answered"
+    );
     assert_eq!(device.decoder_object_count(), 1);
 }

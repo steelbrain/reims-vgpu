@@ -70,10 +70,13 @@ RgfxRingWriter::RgfxRingWriter(RgfxForward forward, void *forward_context, uint3
 {
 }
 
-bool RgfxRingWriter::tryPost(uint32_t type, const void *message, uint32_t size, uint64_t *out_seqno)
+bool RgfxRingWriter::tryPost(uint32_t type, const void *message, uint32_t size, uint64_t *out_seqno,
+                             uint32_t *out_status)
 {
 	if (size < kHeaderBytes || size % kMsgAlign != 0 || size > m_dataSize)
 		return false;
+	if (out_status)
+		*out_status = kRgfxNoAnswer;
 
 	if (m_forward) {
 		// The kext stamps the seqno; the type and size are the message's own.
@@ -88,7 +91,7 @@ bool RgfxRingWriter::tryPost(uint32_t type, const void *message, uint32_t size, 
 		RgfxMsgHeader header = { type, size, 0 };
 		std::memcpy(buf, &header, sizeof(header));
 		uint64_t seqno = 0;
-		if (!m_forward(m_forwardContext, buf, size, &seqno))
+		if (!m_forward(m_forwardContext, buf, size, &seqno, out_status))
 			return false;
 		if (out_seqno)
 			*out_seqno = seqno;

@@ -11,6 +11,7 @@
 #import "RgfxMetalError.h"
 #import "RgfxRenderPipelineState.h"
 
+#include "RgfxLibraryKey.hpp"
 #include "RgfxRegion.hpp"
 #include "RgfxSerializer.hpp"
 
@@ -27,12 +28,13 @@ namespace {
 // RGFX DIAG (WindowServer bring-up; remove before merge): one line per library
 // create to /tmp/rgfx-diag.log, so a guest without logd shows which entry point a
 // client loads its shaders through and whether the create posted.
-void rgfxLibraryDiag(const char *how, NSString *origin, NSUInteger length, BOOL posted)
+void rgfxLibraryDiag(const char *how, NSString *origin, NSUInteger length, BOOL posted,
+                     const char *found = "-")
 {
 	char line[600];
-	int n = snprintf(line, sizeof(line), "RGFX: library %s %s bytes=%lu posted=%d pid=%d\n", how,
-	                 origin.UTF8String ? origin.UTF8String : "-", (unsigned long)length,
-	                 posted ? 1 : 0, getpid());
+	int n = snprintf(line, sizeof(line), "RGFX: library %s %s bytes=%lu posted=%d key=%s pid=%d\n",
+	                 how, origin.UTF8String ? origin.UTF8String : "-", (unsigned long)length,
+	                 posted ? 1 : 0, found, getpid());
 	if (n <= 0)
 		return;
 	int fd = open("/tmp/rgfx-diag.log", O_WRONLY | O_CREAT | O_APPEND, 0666);
@@ -115,9 +117,11 @@ void selectAirSlice(const void *&bytes, NSUInteger &length)
 
 } // namespace
 
-// Every library-from-bytes entry point funnels through here: posts the bytes as one
-// LIBRARY_CREATE, waiting for room while the ring is momentarily full. A library
-// larger than the ring cannot be posted in one message and is refused.
+// Every library-from-bytes entry point funnels through here. A .metallib (or a fat file's AIR
+// slice) is first looked up by its content key, which finds a library the device made for any
+// process with no bytes sent; otherwise the bytes go as one LIBRARY_CREATE (waiting for room
+// while the ring is momentarily full) or stream through region blocks, with the key, and the
+// device's answer is waited for, so a library it refuses is nil and an NSError here, as Metal's.
 - (nullable id<MTLLibrary>)rgfxLibraryWithBytes:(const void *)bytes
                                          length:(NSUInteger)length
                                             how:(const char *)how
@@ -132,6 +136,19 @@ void selectAirSlice(const void *&bytes, NSUInteger &length)
 			*error = RgfxMakeError(RgfxMetalErrorNoRoute, @"library: no serialiser route");
 		return nil;
 	}
+	uint8_t key[32];
+	const bool keyed = rgfxLibraryKey(static_cast<const uint8_t *>(bytes), length, key);
+	if (keyed) {
+		id<MTLLibrary> found = [RgfxLibrary libraryFoundWithKey:key
+		                                                  bytes:bytes
+		                                                 length:length
+		                                                 device:self
+		                                             serializer:ser];
+		if (found != nil) {
+			rgfxLibraryDiag(how, origin, length, YES, "hit");
+			return found;
+		}
+	}
 	// A small library travels inline in its create; a larger one streams through region
 	// blocks that its chunks name, so no library is bounded by the ring's or region's size.
 	const bool inlineCreate =
@@ -145,10 +162,17 @@ void selectAirSlice(const void *&bytes, NSUInteger &length)
 		return nil;
 	}
 	id<MTLLibrary> lib = nil;
+	uint32_t status = kRgfxNoAnswer;
 	if (inlineCreate) {
-		for (int i = 0; i < kLibraryRetries && lib == nil; i++) {
-			lib = [RgfxLibrary libraryWithData:bytes length:length device:self serializer:ser];
-			if (lib == nil)
+		// Retried only while the create did not post; an answered refusal is final.
+		for (int i = 0; i < kLibraryRetries && lib == nil && status == kRgfxNoAnswer; i++) {
+			lib = [RgfxLibrary libraryWithData:bytes
+			                            length:length
+			                               key:keyed ? key : nullptr
+			                            device:self
+			                        serializer:ser
+			                            status:&status];
+			if (lib == nil && status == kRgfxNoAnswer)
 				usleep(kLibraryRetrySleepUs);
 		}
 	} else {
@@ -157,14 +181,23 @@ void selectAirSlice(const void *&bytes, NSUInteger &length)
 		const uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
 		lib = [RgfxLibrary libraryStreamingBytes:bytes
 		                                  length:length
+		                                     key:keyed ? key : nullptr
 		                                  region:region
 		                                  device:self
-		                              serializer:ser];
+		                              serializer:ser
+		                                  status:&status];
 		rgfxUploadDiag(origin, length, clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0);
 	}
-	rgfxLibraryDiag(how, origin, length, lib != nil);
-	if (lib == nil && error)
-		*error = RgfxMakeError(RgfxMetalErrorRingFull, @"library: the device ring stayed full");
+	rgfxLibraryDiag(how, origin, length, lib != nil, keyed ? "miss" : "none");
+	if (lib == nil && error) {
+		if (status == kRgfxNoAnswer)
+			*error = RgfxMakeError(RgfxMetalErrorRingFull, @"library: the device ring stayed full");
+		else
+			*error = RgfxMakeError(RgfxMetalErrorRefused,
+			                       [NSString stringWithFormat:@"library: the device refused the "
+			                                                  @"library (status %u)",
+			                                                  status]);
+	}
 	return lib;
 }
 

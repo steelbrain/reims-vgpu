@@ -2,8 +2,9 @@
 # shell that drives it.
 #
 # The serialiser core (src/Rgfx{ObjectModel,Caps,RingWriter,Serializer,Encoder,
-# WireLayout}.*) is our own code, depends only on the committed wire header, needs
-# no Apple Metal SPI, and builds for the guest's arch (x86_64).
+# WireLayout}.* and the rest of CORE_SRCS) is our own code, depends only on the
+# committed wire header (and CommonCrypto, for a library's key), needs no Apple
+# Metal SPI, and builds for the guest's arch (x86_64).
 #
 # The Metal shell is the ObjC++ layer Apple's Metal loads as the guest's MTLDevice:
 #   - the NSObject-based object wrappers (src/RgfxResource.*, src/RgfxBuffer.*, and
@@ -76,7 +77,7 @@ TESTHEADERS  = $(wildcard tests/*.hpp)
 # Serialiser core (C++).
 CORE_SRCS = src/RgfxObjectModel.cpp src/RgfxCaps.cpp src/RgfxRingWriter.cpp \
 	src/RgfxSerializer.cpp src/RgfxEncoder.cpp src/RgfxWireLayout.cpp \
-	src/RgfxRegion.cpp src/RgfxReplyReader.cpp
+	src/RgfxRegion.cpp src/RgfxReplyReader.cpp src/RgfxLibraryKey.cpp
 
 # The whole Metal shell (ObjC++): wrappers + the device. Goes in the bundle. Globbed
 # so each later slice's wrappers + category are picked up with no Makefile edit.

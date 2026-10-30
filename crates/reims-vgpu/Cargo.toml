@@ -30,6 +30,9 @@ reims-vgpu-video-core.workspace = true
 reims-graphics.workspace = true
 # Reads the reims-graphics device's wire messages into their records (`graphics::decode`).
 zerocopy.workspace = true
+# A library's content key, by which the reims-graphics device keeps the libraries it made
+# (`graphics::decode::library`).
+sha2.workspace = true
 # A window frame that fails, or a window that gets no sink (`window::vulkan`).
 log.workspace = true
 # KVM's dirty-log ioctls, in a host's dirty source's harvest (`dirty`); on Linux, the guest's RAM

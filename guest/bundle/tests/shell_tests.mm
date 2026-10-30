@@ -505,10 +505,13 @@ void test_library_and_function_routing()
 	Fixture fx;
 
 	const uint8_t libBytes[] = {0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03};
+	uint32_t libStatus = 0;
 	RgfxLibrary *lib = [RgfxLibrary libraryWithData:libBytes
 	                                        length:sizeof(libBytes)
+	                                           key:nullptr
 	                                        device:nil
-	                                    serializer:&fx.ser];
+	                                    serializer:&fx.ser
+	                                        status:&libStatus];
 	CHECK(lib != nil);
 	CHECK(lib.rgfxObjId == 1); // first object on this device
 	CHECK([lib conformsToProtocol:@protocol(MTLLibrary)]);
@@ -539,8 +542,10 @@ void test_library_and_function_routing()
 	// A library with no route cannot be created.
 	RgfxLibrary *none = [RgfxLibrary libraryWithData:libBytes
 	                                         length:sizeof(libBytes)
+	                                            key:nullptr
 	                                         device:nil
-	                                     serializer:nullptr];
+	                                     serializer:nullptr
+	                                         status:&libStatus];
 	CHECK(none == nil);
 }
 
@@ -552,10 +557,13 @@ void test_render_pipeline_routing()
 	Fixture fx;
 
 	const uint8_t libBytes[] = {1, 2, 3, 4};
+	uint32_t libStatus = 0;
 	RgfxLibrary *lib = [RgfxLibrary libraryWithData:libBytes
 	                                        length:sizeof(libBytes)
+	                                           key:nullptr
 	                                        device:nil
-	                                    serializer:&fx.ser];
+	                                    serializer:&fx.ser
+	                                        status:&libStatus];
 	(void)nextMessage(fx.ring, RGFX_CMD_LIBRARY_CREATE); // drain the library create
 
 	id<MTLFunction> vfn = [lib newFunctionWithName:@"vmain"];
@@ -655,10 +663,13 @@ void test_compute_pipeline_routing()
 	Fixture fx;
 
 	const uint8_t libBytes[] = {9, 9, 9};
+	uint32_t libStatus = 0;
 	RgfxLibrary *lib = [RgfxLibrary libraryWithData:libBytes
 	                                        length:sizeof(libBytes)
+	                                           key:nullptr
 	                                        device:nil
-	                                    serializer:&fx.ser];
+	                                    serializer:&fx.ser
+	                                        status:&libStatus];
 	(void)nextMessage(fx.ring, RGFX_CMD_LIBRARY_CREATE);
 
 	id<MTLFunction> kfn = [lib newFunctionWithName:@"kmain"];
@@ -1359,10 +1370,13 @@ void test_reply_reader_reflection()
 	Fixture fx; // control ring + serialiser
 
 	const uint8_t libBytes[] = { 1, 2, 3, 4 };
+	uint32_t libStatus = 0;
 	RgfxLibrary *lib = [RgfxLibrary libraryWithData:libBytes
 	                                        length:sizeof(libBytes)
+	                                           key:nullptr
 	                                        device:nil
-	                                    serializer:&fx.ser];
+	                                    serializer:&fx.ser
+	                                        status:&libStatus];
 	(void)nextMessage(fx.ring, RGFX_CMD_LIBRARY_CREATE);
 	id<MTLFunction> cfn = [lib newFunctionWithName:@"kmain"];
 
