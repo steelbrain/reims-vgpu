@@ -598,6 +598,7 @@ dependencies = [
  "reims-vgpu-video-videotoolbox",
  "reims-vgpu-vulkan",
  "reims-vgpu-window",
+ "zerocopy",
 ]
 
 [[package]]

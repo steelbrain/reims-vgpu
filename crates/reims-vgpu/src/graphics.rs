@@ -38,6 +38,7 @@ use crate::error::Error;
 use crate::platform::ApiPlatform;
 use crate::window::WindowLink;
 
+mod decode;
 #[cfg(target_os = "macos")]
 mod metal;
 mod sink;
