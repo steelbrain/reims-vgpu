@@ -1156,18 +1156,21 @@ fn control_completion_posts_from_several_threads_land_whole() {
     let posters: Vec<_> = (0..THREADS)
         .map(|t| {
             let poster = rig.device.shared.control_poster();
-            std::thread::spawn(move || {
-                for i in 0..EACH {
-                    let mut reflection = RgfxPipelineReflection::new_zeroed();
-                    reflection.header = RgfxMsgHeader {
-                        r#type: RGFX_EVT_PIPELINE_REFLECTION,
-                        size: size_of::<RgfxPipelineReflection>() as u32,
-                        seqno: t * EACH + i + 1,
-                    };
-                    reflection.obj_id = t;
-                    poster.post(reflection.as_bytes());
-                }
-            })
+            let thread = std::thread::Builder::new().name(format!("poster-{t}"));
+            thread
+                .spawn(move || {
+                    for i in 0..EACH {
+                        let mut reflection = RgfxPipelineReflection::new_zeroed();
+                        reflection.header = RgfxMsgHeader {
+                            r#type: RGFX_EVT_PIPELINE_REFLECTION,
+                            size: size_of::<RgfxPipelineReflection>() as u32,
+                            seqno: t * EACH + i + 1,
+                        };
+                        reflection.obj_id = t;
+                        poster.post(reflection.as_bytes());
+                    }
+                })
+                .expect("a poster thread")
         })
         .collect();
     let mut next = [0u64; THREADS as usize];

@@ -508,7 +508,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             return Err(DecodeError::BadReference);
         };
         // The bytes are out of the block: the guest may write it again.
-        if m.ack_offset % 8 != 0
+        if !m.ack_offset.is_multiple_of(8)
             || !self.in_process_blocks(m.ack_offset, 8)
             || !self.region.write(m.ack_offset, &m.ack_value.to_le_bytes())
         {

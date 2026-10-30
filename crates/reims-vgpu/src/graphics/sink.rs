@@ -221,7 +221,12 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
         texture: &P::Texture,
         region: PixelRect,
     ) -> Option<P::CommandBuffer> {
-        let surface = self.presented.texture.lock().as_ref().map(Handle::clone_ref);
+        let surface = self
+            .presented
+            .texture
+            .lock()
+            .as_ref()
+            .map(Handle::clone_ref);
         if let Some(surface) = surface {
             let (from, to) = (surface.pixel_format(), texture.pixel_format());
             self.presented.seen_format(from, to);
@@ -290,14 +295,8 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
         let (texture_width, texture_height) = (texture.width(), texture.height());
         let x = region.x.min(texture_width);
         let y = region.y.min(texture_height);
-        let width = surface
-            .width()
-            .min(region.width)
-            .min(texture_width - x);
-        let height = surface
-            .height()
-            .min(region.height)
-            .min(texture_height - y);
+        let width = surface.width().min(region.width).min(texture_width - x);
+        let height = surface.height().min(region.height).min(texture_height - y);
         if (x, y, width, height) != (0, 0, texture_width, texture_height) {
             self.clear(&command_buffer, texture);
         }

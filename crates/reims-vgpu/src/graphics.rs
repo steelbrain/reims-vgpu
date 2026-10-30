@@ -23,6 +23,7 @@
 //!
 //! Every public method runs as an entry ([`crate::entry`]).
 
+use std::marker::PhantomData;
 use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -112,8 +113,11 @@ pub struct GraphicsDevice<P: ApiPlatform = DefaultPlatform> {
     /// The device.
     device: reims_graphics::Device,
     /// The stage-3 decoder and the device handle it drives, shared with the device's [`Host`],
-    /// which feeds it the control ring's stage-3 messages.
+    /// which feeds it the control ring's stage-3 messages; held here for the tests' look at it.
+    #[cfg(any(test, feature = "testkit"))]
     control: Arc<GraphicsControl<P>>,
+    /// The platform the decoder runs on.
+    platform: PhantomData<fn() -> P>,
 }
 
 impl<P: ApiPlatform> std::fmt::Debug for GraphicsDevice<P> {
@@ -174,7 +178,9 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             Ok(GraphicsDevice {
                 window,
                 device,
+                #[cfg(any(test, feature = "testkit"))]
                 control,
+                platform: PhantomData,
             })
         })
     }

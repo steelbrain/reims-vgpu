@@ -16,8 +16,8 @@ use reims_vgpu_core::raise::OnFault;
 use reims_vgpu_metal::{MetalPlatform, Obj, msg};
 use reims_vgpu_window::{DrawnCursor, FrameSink, PixelRect};
 
-use super::{Presented, Shown};
 use super::sink::ScanoutDraw;
+use super::{Presented, Shown};
 use crate::display::no_catch;
 use crate::entry;
 

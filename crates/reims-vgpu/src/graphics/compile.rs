@@ -16,8 +16,8 @@
 //! set's.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Mutex as StdMutex};
 
 use reims_graphics::ops::compute::{
     RGFX_OP_COMPUTE_SET_COMPUTE_PIPELINE_STATE, RgfxComputeOpSetComputePipelineState,
@@ -56,7 +56,7 @@ impl CompilePool {
             .map_or(2, |n| n.get())
             .clamp(2, MAX_THREADS);
         let (sender, receiver) = mpsc::channel::<CompileJob>();
-        let receiver = Arc::new(StdMutex::new(receiver));
+        let receiver = Arc::new(Mutex::new(receiver));
         #[cfg(test)]
         let gate = Arc::new(Gate::default());
         let mut started = 0;
@@ -112,9 +112,8 @@ impl CompilePool {
 }
 
 /// The next compile from the shared queue; `None` once the pool is gone.
-fn next_job(receiver: &StdMutex<Receiver<CompileJob>>) -> Option<CompileJob> {
-    let receiver = receiver.lock().unwrap_or_else(|e| e.into_inner());
-    receiver.recv().ok()
+fn next_job(receiver: &Mutex<Receiver<CompileJob>>) -> Option<CompileJob> {
+    receiver.lock().recv().ok()
 }
 
 /// A gate the tests shut to hold every compile.
@@ -214,7 +213,7 @@ pub(crate) fn named_pipelines(message: &[u8]) -> Vec<u64> {
             break;
         };
         let len = header.len as usize;
-        if len < RGFX_OP_BODY_OFFSET as usize || len % 8 != 0 || len > op.len() {
+        if len < RGFX_OP_BODY_OFFSET as usize || !len.is_multiple_of(8) || len > op.len() {
             break;
         }
         let body = &op[RGFX_OP_BODY_OFFSET as usize..len];

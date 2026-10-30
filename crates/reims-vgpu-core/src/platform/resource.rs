@@ -316,7 +316,7 @@ impl FunctionConstant {
             40 | 44 | 19 | 30 | 34 | 4 | 81 | 85 => 8,
             _ => return None,
         };
-        Some(self.value.to_le_bytes()[..len].to_vec())
+        self.value.to_le_bytes().get(..len).map(<[u8]>::to_vec)
     }
 }
 

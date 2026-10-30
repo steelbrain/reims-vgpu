@@ -327,15 +327,13 @@ constexpr long kGpuFamilyMinus1009 = -1009;
 // RGFX DIAG (remove before merge): -[_MTLDevice initLimits] and other Metal bring-up code send
 // MTLDeviceSPI selectors straight to us without -respondsToSelector:; any that neither our shell
 // nor the IOGPUMetalDevice base implements hit -doesNotRecognizeSelector: and throw an
-// unhandled ObjC exception (crash). To enumerate the FULL set of missing selectors in one run
-// (instead of one crash per selector), forward every unimplemented selector here, log it, and
-// answer with a zero scalar so bring-up keeps going.
+// unhandled ObjC exception (crash). Every unimplemented selector is forwarded here and answered
+// with a zero scalar, so bring-up keeps going.
 - (NSMethodSignature *)methodSignatureForSelector:(SEL)aSelector
 {
 	NSMethodSignature *sig = [super methodSignatureForSelector:aSelector];
 	if (sig)
 		return sig;
-	rgfxDiag("RGFX: unimplemented selector (forwarded): %s\n", sel_getName(aSelector));
 	return [NSMethodSignature signatureWithObjCTypes:"Q@:"]; // assume an 8-byte scalar return
 }
 

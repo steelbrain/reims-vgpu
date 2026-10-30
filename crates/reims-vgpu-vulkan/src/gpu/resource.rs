@@ -2066,9 +2066,10 @@ impl Library<VulkanPlatform> for VulkanLibrary {
         let sel = "newFunctionWithName:constantValues:error:";
         let mut values = metal2vulkan::library::FunctionConstantValues::defaults();
         for c in constants {
-            let (Ok(ty), Some(bytes)) =
-                (metal2vulkan::metal::DataType::try_from(c.data_type), c.bytes())
-            else {
+            let (Ok(ty), Some(bytes)) = (
+                metal2vulkan::metal::DataType::try_from(c.data_type),
+                c.bytes(),
+            ) else {
                 log::warn!(
                     "function {function_name:?}: constant {} of MTLDataType {} cannot be carried",
                     c.index,

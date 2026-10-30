@@ -13,8 +13,8 @@ use reims_vgpu_vulkan::VulkanPlatform;
 use reims_vgpu_vulkan::swapchain::{Acquired, Swapchain};
 use reims_vgpu_window::{Drawn, DrawnCursor, FrameSink, PixelRect, Presenter, VulkanTarget};
 
-use super::{Presented, Shown};
 use super::sink::ScanoutDraw;
+use super::{Presented, Shown};
 use crate::display::no_catch;
 use crate::entry;
 

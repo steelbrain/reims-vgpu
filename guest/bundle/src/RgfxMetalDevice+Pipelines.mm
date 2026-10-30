@@ -15,8 +15,6 @@
 #include "RgfxRegion.hpp"
 #include "RgfxSerializer.hpp"
 
-#include <fcntl.h>
-#include <stdio.h>
 #include <unistd.h>
 
 @implementation RgfxMetalDevice (Pipelines)
@@ -24,41 +22,6 @@
 // --- libraries ---------------------------------------------------------------
 
 namespace {
-
-// RGFX DIAG (WindowServer bring-up; remove before merge): one line per library
-// create to /tmp/rgfx-diag.log, so a guest without logd shows which entry point a
-// client loads its shaders through and whether the create posted.
-void rgfxLibraryDiag(const char *how, NSString *origin, NSUInteger length, BOOL posted,
-                     const char *found = "-")
-{
-	char line[600];
-	int n = snprintf(line, sizeof(line), "RGFX: library %s %s bytes=%lu posted=%d key=%s pid=%d\n",
-	                 how, origin.UTF8String ? origin.UTF8String : "-", (unsigned long)length,
-	                 posted ? 1 : 0, found, getpid());
-	if (n <= 0)
-		return;
-	int fd = open("/tmp/rgfx-diag.log", O_WRONLY | O_CREAT | O_APPEND, 0666);
-	if (fd < 0)
-		return;
-	(void)!write(fd, line, static_cast<size_t>(n < (int)sizeof(line) ? n : (int)sizeof(line)));
-	close(fd);
-}
-
-// RGFX DIAG (remove before merge): how long a streamed library's upload took.
-void rgfxUploadDiag(NSString *origin, NSUInteger length, uint64_t ns)
-{
-	char line[600];
-	int n = snprintf(line, sizeof(line), "RGFX: library upload %s bytes=%lu ms=%.1f pid=%d\n",
-	                 origin.UTF8String ? origin.UTF8String : "-", (unsigned long)length,
-	                 static_cast<double>(ns) / 1e6, getpid());
-	if (n <= 0)
-		return;
-	int fd = open("/tmp/rgfx-diag.log", O_WRONLY | O_CREAT | O_APPEND, 0666);
-	if (fd < 0)
-		return;
-	(void)!write(fd, line, static_cast<size_t>(n < (int)sizeof(line) ? n : (int)sizeof(line)));
-	close(fd);
-}
 
 // How long a library create waits for room on the device ring before it reports the
 // ring full: the host drains the ring as it runs, so a full ring is transient.
@@ -124,14 +87,11 @@ void selectAirSlice(const void *&bytes, NSUInteger &length)
 // device's answer is waited for, so a library it refuses is nil and an NSError here, as Metal's.
 - (nullable id<MTLLibrary>)rgfxLibraryWithBytes:(const void *)bytes
                                          length:(NSUInteger)length
-                                            how:(const char *)how
-                                         origin:(NSString *)origin
                                           error:(__autoreleasing NSError **)error
 {
 	selectAirSlice(bytes, length);
 	RgfxSerializer *ser = [self serializer];
 	if (ser == nullptr) {
-		rgfxLibraryDiag(how, origin, length, NO);
 		if (error)
 			*error = RgfxMakeError(RgfxMetalErrorNoRoute, @"library: no serialiser route");
 		return nil;
@@ -144,10 +104,8 @@ void selectAirSlice(const void *&bytes, NSUInteger &length)
 		                                                 length:length
 		                                                 device:self
 		                                             serializer:ser];
-		if (found != nil) {
-			rgfxLibraryDiag(how, origin, length, YES, "hit");
+		if (found != nil)
 			return found;
-		}
 	}
 	// A small library travels inline in its create; a larger one streams through region
 	// blocks that its chunks name, so no library is bounded by the ring's or region's size.
@@ -155,7 +113,6 @@ void selectAirSlice(const void *&bytes, NSUInteger &length)
 	    RGFX_LIBRARY_BYTES_OFFSET + static_cast<uint64_t>(length) + 8 <= kLibraryInlineMax;
 	RgfxRegion *region = [self region];
 	if (!inlineCreate && region == nullptr) {
-		rgfxLibraryDiag(how, origin, length, NO);
 		if (error)
 			*error = RgfxMakeError(RgfxMetalErrorNoRoute,
 			                       @"library: no device region for a large library");
@@ -176,9 +133,7 @@ void selectAirSlice(const void *&bytes, NSUInteger &length)
 				usleep(kLibraryRetrySleepUs);
 		}
 	} else {
-		// Streamed through the process's double-buffered staging window, timed for the
-		// diagnostic line (RGFX DIAG).
-		const uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+		// Streamed through the process's double-buffered staging window.
 		lib = [RgfxLibrary libraryStreamingBytes:bytes
 		                                  length:length
 		                                     key:keyed ? key : nullptr
@@ -186,9 +141,7 @@ void selectAirSlice(const void *&bytes, NSUInteger &length)
 		                                  device:self
 		                              serializer:ser
 		                                  status:&status];
-		rgfxUploadDiag(origin, length, clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0);
 	}
-	rgfxLibraryDiag(how, origin, length, lib != nil, keyed ? "miss" : "none");
 	if (lib == nil && error) {
 		if (status == kRgfxNoAnswer)
 			*error = RgfxMakeError(RgfxMetalErrorRingFull, @"library: the device ring stayed full");
@@ -214,11 +167,7 @@ void selectAirSlice(const void *&bytes, NSUInteger &length)
 	const void *bytes = nullptr;
 	size_t size = 0;
 	dispatch_data_t map = dispatch_data_create_map(data, &bytes, &size);
-	id<MTLLibrary> lib = [self rgfxLibraryWithBytes:bytes
-	                                         length:size
-	                                            how:"data"
-	                                         origin:@"(data)"
-	                                          error:error];
+	id<MTLLibrary> lib = [self rgfxLibraryWithBytes:bytes length:size error:error];
 	(void)map; // released by ARC; `bytes` stayed valid for the create above
 	return lib;
 }
@@ -230,17 +179,12 @@ void selectAirSlice(const void *&bytes, NSUInteger &length)
 	                                             error:&readError]
 	                   : nil;
 	if (data == nil) {
-		rgfxLibraryDiag("url-unreadable", url.path, 0, NO);
 		if (error)
 			*error = readError ?: RgfxMakeError(RgfxMetalErrorInvalidDescriptor,
 			                                    @"newLibraryWithURL: could not read URL");
 		return nil;
 	}
-	return [self rgfxLibraryWithBytes:data.bytes
-	                           length:data.length
-	                              how:"url"
-	                           origin:url.path
-	                            error:error];
+	return [self rgfxLibraryWithBytes:data.bytes length:data.length error:error];
 }
 
 - (id<MTLLibrary>)newLibraryWithFile:(NSString *)filepath error:(__autoreleasing NSError **)error
@@ -259,7 +203,6 @@ void selectAirSlice(const void *&bytes, NSUInteger &length)
 	// A bundle's default library is its default.metallib resource, as Metal finds it.
 	NSURL *url = [bundle URLForResource:@"default" withExtension:@"metallib"];
 	if (url == nil) {
-		rgfxLibraryDiag("default-missing", bundle.bundlePath, 0, NO);
 		if (error)
 			*error = RgfxMakeError(RgfxMetalErrorInvalidDescriptor,
 			                       [NSString stringWithFormat:@"no default.metallib in %@",

@@ -13,7 +13,6 @@
 
 #include <cstring>
 #include <mutex>
-#include <fcntl.h>
 #include <unistd.h>
 #include <string>
 #include <vector>
@@ -162,20 +161,14 @@ uint32_t inlineConstantSize(MTLDataType type)
 // The index-keyed constants set on `values`, read through the object's own
 // `newIndexedConstantArray` (each element answering `index`, `dataType` and `data`).
 // Constants set by name, and values wider than the wire's inline eight bytes, are
-// not carried: `*dropped` counts them. measured: macOS 27 Metal
+// not carried. measured: macOS 27 Metal
 // (MTLFunctionConstantValuesInternal, MTLIndexedConstantValue).
-std::vector<RgfxFunctionConstant> indexedConstants(MTLFunctionConstantValues *values, uint32_t *dropped)
+std::vector<RgfxFunctionConstant> indexedConstants(MTLFunctionConstantValues *values)
 {
 	std::vector<RgfxFunctionConstant> out;
-	*dropped = 0;
 	if (values == nil)
 		return out;
 	SEL indexedSel = sel_registerName("newIndexedConstantArray");
-	SEL namedSel = sel_registerName("newNamedConstantArray");
-	if ([values respondsToSelector:namedSel]) {
-		NSArray *named = ((NSArray * (*)(id, SEL)) objc_msgSend)(values, namedSel);
-		*dropped += static_cast<uint32_t>(named.count);
-	}
 	if (![values respondsToSelector:indexedSel])
 		return out;
 	NSArray *indexed = ((NSArray * (*)(id, SEL)) objc_msgSend)(values, indexedSel);
@@ -184,18 +177,14 @@ std::vector<RgfxFunctionConstant> indexedConstants(MTLFunctionConstantValues *va
 	SEL dataSel = sel_registerName("data");
 	for (id c in indexed) {
 		if (![c respondsToSelector:indexSel] || ![c respondsToSelector:typeSel] ||
-		    ![c respondsToSelector:dataSel]) {
-			(*dropped)++;
+		    ![c respondsToSelector:dataSel])
 			continue;
-		}
 		NSUInteger index = ((NSUInteger(*)(id, SEL))objc_msgSend)(c, indexSel);
 		MTLDataType type = static_cast<MTLDataType>(((NSUInteger(*)(id, SEL))objc_msgSend)(c, typeSel));
 		const void *data = ((const void *(*)(id, SEL))objc_msgSend)(c, dataSel);
 		uint32_t size = inlineConstantSize(type);
-		if (size == 0 || data == nullptr) {
-			(*dropped)++;
+		if (size == 0 || data == nullptr)
 			continue;
-		}
 		RgfxFunctionConstant k = {};
 		k.index = static_cast<uint32_t>(index);
 		k.data_type = static_cast<uint32_t>(type);
@@ -295,44 +284,6 @@ bool streamLibrary(RgfxRegion &region, RgfxSerializer &ser, const uint8_t *bytes
 	}
 	*outObjId = objId;
 	return true;
-}
-
-// RGFX DIAG (WindowServer bring-up; remove before merge): which constants a function
-// was given that the wire does not carry (by name, or wider than eight bytes), one
-// line to /tmp/rgfx-diag.log (the guest has no logd).
-void rgfxConstantsDiag(NSString *fn, MTLFunctionConstantValues *values, uint32_t dropped)
-{
-	NSMutableString *line = [NSMutableString
-	    stringWithFormat:@"RGFX: constants %@ dropped=%u pid=%d:", fn, dropped, getpid()];
-	SEL namedSel = sel_registerName("newNamedConstantArray");
-	SEL indexedSel = sel_registerName("newIndexedConstantArray");
-	if ([values respondsToSelector:namedSel]) {
-		NSArray *named = ((NSArray * (*)(id, SEL)) objc_msgSend)(values, namedSel);
-		for (id c in named) {
-			NSString *n = [c respondsToSelector:@selector(name)] ? [c name] : @"?";
-			NSUInteger t = [c respondsToSelector:sel_registerName("dataType")]
-			                   ? ((NSUInteger(*)(id, SEL))objc_msgSend)(c, sel_registerName("dataType"))
-			                   : 0;
-			[line appendFormat:@" name=%@/type%lu", n, (unsigned long)t];
-		}
-	}
-	if ([values respondsToSelector:indexedSel]) {
-		NSArray *indexed = ((NSArray * (*)(id, SEL)) objc_msgSend)(values, indexedSel);
-		for (id c in indexed) {
-			NSUInteger i = ((NSUInteger(*)(id, SEL))objc_msgSend)(c, sel_registerName("index"));
-			NSUInteger t = ((NSUInteger(*)(id, SEL))objc_msgSend)(c, sel_registerName("dataType"));
-			[line appendFormat:@" idx=%lu/type%lu", (unsigned long)i, (unsigned long)t];
-		}
-	} else {
-		[line appendString:@" (no newIndexedConstantArray)"];
-	}
-	[line appendString:@"\n"];
-	int fd = open("/tmp/rgfx-diag.log", O_WRONLY | O_CREAT | O_APPEND, 0666);
-	if (fd < 0)
-		return;
-	const char *u = line.UTF8String;
-	(void)!write(fd, u, strlen(u));
-	close(fd);
 }
 
 } // namespace
@@ -484,10 +435,7 @@ static bool rgfxMade(uint32_t status)
 	// by name needs the function's constant table to find its index, which the shell
 	// does not read; such constants are not carried (the host then compiles the
 	// function unspecialised for them).
-	uint32_t dropped = 0;
-	std::vector<RgfxFunctionConstant> constants = indexedConstants(constantValues, &dropped);
-	if (dropped)
-		rgfxConstantsDiag(name, constantValues, dropped);
+	std::vector<RgfxFunctionConstant> constants = indexedConstants(constantValues);
 	id<MTLFunction> fn = [self rgfxFunctionNamed:name constants:constants];
 	if (error)
 		*error = fn ? nil

@@ -614,7 +614,10 @@ impl reims_vgpu_core::platform::resource::Library<MetalPlatform> for MetalLibrar
         msg::send(
             "newFunctionWithName:constantValues:error:",
             Policy::Caught,
-            || l.newFunctionWithName_constantValues_error(&name, &values).ok(),
+            || {
+                l.newFunctionWithName_constantValues_error(&name, &values)
+                    .ok()
+            },
         )
         .map(created)
     }

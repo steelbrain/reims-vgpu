@@ -41,25 +41,23 @@ use std::sync::Arc;
 use reims_graphics::region::Region;
 use reims_graphics::wire::{
     RGFX_CMD_BUFFER_AT_OFFSET, RGFX_CMD_BUFFER_CREATE, RGFX_CMD_BUFFER_OVER_HOST_MEMORY,
-    RGFX_CMD_COMMAND_BUFFER, RGFX_CONTEXT_ALLOCATIONS_OFFSET, RGFX_CONTEXT_OBJ_ID_SHIFT,
-    RGFX_CURSOR_SPAN,
-    RGFX_CMD_COMPUTE_PIPELINE_CREATE, RGFX_CMD_DEPTH_STENCIL_CREATE, RGFX_CMD_EVENT_CREATE,
-    RGFX_CMD_FENCE_CREATE, RGFX_CMD_HEAP_CREATE, RGFX_CMD_HEAP_OVER_HOST_MEMORY,
-    RGFX_CMD_LIBRARY_CREATE, RGFX_CMD_LIBRARY_FROM_REGION, RGFX_CMD_OBJECT_DESTROY,
-    RGFX_CMD_QUEUE_CREATE, RGFX_CMD_RENDER_PIPELINE_CREATE, RGFX_CMD_RESOURCE_ID_CHUNK,
-    RGFX_CMD_SAMPLER_CREATE, RGFX_CMD_SHARED_EVENT_CREATE, RGFX_CMD_TEXTURE_CREATE,
-    RGFX_CMD_TEXTURE_FROM_BUFFER, RGFX_CMD_TEXTURE_FROM_IOSURFACE, RGFX_RESOURCE_ID_CHUNK,
-    RGFX_RESOURCE_ID_CHUNKS, RGFX_RESOURCE_ID_LIMIT,
-    RGFX_EVT_PIPELINE_REFLECTION, RGFX_PIPELINE_KIND_COMPUTE,
-    RGFX_PIPELINE_KIND_RENDER, RGFX_PIPELINE_OK, RGFX_PIPELINE_REFLECT_SUPPORT_ICB,
-    RGFX_PIPELINE_REFLECT_THREADGROUP_MATCHES_TILE, RGFX_PIPELINE_REFUSED, RgfxBufferAtOffset,
-    RgfxBufferCreate, RgfxCbComplete, RgfxColorAttachmentDesc, RgfxComputePipelineCreate,
-    RgfxFunctionConstant,
-    RgfxBufferOverHostMemory, RgfxDepthStencilCreate, RgfxHeapCreate, RgfxHeapOverHostMemory,
-    RgfxMsgHeader, RgfxObjectCreate,
-    RgfxObjectDestroy, RgfxPipelineReflection, RgfxQueueCreate, RgfxRenderPipelineCreate,
-    RgfxResourceIdChunk, RgfxSamplerCreate, RgfxSharedEventCreate, RgfxStencilDescriptor,
-    RgfxTextureCreate, RgfxTextureDescriptor, RgfxTextureFromBuffer, RgfxTextureFromIOSurface,
+    RGFX_CMD_COMMAND_BUFFER, RGFX_CMD_COMPUTE_PIPELINE_CREATE, RGFX_CMD_DEPTH_STENCIL_CREATE,
+    RGFX_CMD_EVENT_CREATE, RGFX_CMD_FENCE_CREATE, RGFX_CMD_HEAP_CREATE,
+    RGFX_CMD_HEAP_OVER_HOST_MEMORY, RGFX_CMD_LIBRARY_CREATE, RGFX_CMD_LIBRARY_FROM_REGION,
+    RGFX_CMD_OBJECT_DESTROY, RGFX_CMD_QUEUE_CREATE, RGFX_CMD_RENDER_PIPELINE_CREATE,
+    RGFX_CMD_RESOURCE_ID_CHUNK, RGFX_CMD_SAMPLER_CREATE, RGFX_CMD_SHARED_EVENT_CREATE,
+    RGFX_CMD_TEXTURE_CREATE, RGFX_CMD_TEXTURE_FROM_BUFFER, RGFX_CMD_TEXTURE_FROM_IOSURFACE,
+    RGFX_CONTEXT_ALLOCATIONS_OFFSET, RGFX_CONTEXT_OBJ_ID_SHIFT, RGFX_CURSOR_SPAN,
+    RGFX_EVT_PIPELINE_REFLECTION, RGFX_PIPELINE_KIND_COMPUTE, RGFX_PIPELINE_KIND_RENDER,
+    RGFX_PIPELINE_OK, RGFX_PIPELINE_REFLECT_SUPPORT_ICB,
+    RGFX_PIPELINE_REFLECT_THREADGROUP_MATCHES_TILE, RGFX_PIPELINE_REFUSED, RGFX_RESOURCE_ID_CHUNK,
+    RGFX_RESOURCE_ID_CHUNKS, RGFX_RESOURCE_ID_LIMIT, RgfxBufferAtOffset, RgfxBufferCreate,
+    RgfxBufferOverHostMemory, RgfxCbComplete, RgfxColorAttachmentDesc, RgfxComputePipelineCreate,
+    RgfxDepthStencilCreate, RgfxFunctionConstant, RgfxHeapCreate, RgfxHeapOverHostMemory,
+    RgfxMsgHeader, RgfxObjectCreate, RgfxObjectDestroy, RgfxPipelineReflection, RgfxQueueCreate,
+    RgfxRenderPipelineCreate, RgfxResourceIdChunk, RgfxSamplerCreate, RgfxSharedEventCreate,
+    RgfxStencilDescriptor, RgfxTextureCreate, RgfxTextureDescriptor, RgfxTextureFromBuffer,
+    RgfxTextureFromIOSurface,
 };
 use reims_vgpu_core::host::HostPtr;
 use reims_vgpu_core::platform::device::GpuDevice;
@@ -283,7 +281,8 @@ impl<P: Platform> GraphicsDecoder<P> {
             && offset.checked_add(len).is_some_and(|e| e <= end)
     }
 
-    /// The objects the table holds.
+    /// The objects the table holds (for the tests).
+    #[cfg(any(test, feature = "testkit"))]
     pub fn object_count(&self) -> usize {
         self.objects.len()
     }
@@ -589,8 +588,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                 }
                 // SAFETY: the block lies inside the region (checked above), one
                 // allocation, so the offset is in bounds.
-                let address =
-                    unsafe { self.region.base().add(m.region_offset as usize) } as u64;
+                let address = unsafe { self.region.base().add(m.region_offset as usize) } as u64;
                 let range = ResourceAddressRange {
                     address,
                     length: m.size_bytes,
@@ -1542,7 +1540,10 @@ mod tests {
     fn creates_and_destroys_the_state_objects() {
         let p = Arc::new(FakePlatform::new());
         let device = p.device();
-        let mut dec = GraphicsDecoder::<FakePlatform>::new(Arc::clone(&p), Arc::new(reims_graphics::region::Region::new(0x10000).unwrap()));
+        let mut dec = GraphicsDecoder::<FakePlatform>::new(
+            Arc::clone(&p),
+            Arc::new(reims_graphics::region::Region::new(0x10000).unwrap()),
+        );
 
         let obj = |ty: u32, obj_id: u64| RgfxObjectCreate {
             header: RgfxMsgHeader {
@@ -2147,7 +2148,10 @@ mod tests {
 
         let p = Arc::new(FakePlatform::new());
         let device = p.device();
-        let mut dec = GraphicsDecoder::<FakePlatform>::new(Arc::clone(&p), Arc::new(reims_graphics::region::Region::new(0x10000).unwrap()));
+        let mut dec = GraphicsDecoder::<FakePlatform>::new(
+            Arc::clone(&p),
+            Arc::new(reims_graphics::region::Region::new(0x10000).unwrap()),
+        );
 
         let replies = Arc::new(Mutex::new(Vec::<RgfxPipelineReflection>::new()));
         let sink_replies = Arc::clone(&replies);

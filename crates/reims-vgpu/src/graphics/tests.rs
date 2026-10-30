@@ -1581,7 +1581,6 @@ fn texture_from_buffer(obj_id: u64, resource_id: u64, buffer: u64) -> Vec<u8> {
         offset: 0,
         bytes_per_row: 256,
         desc: create.desc,
-        ..RgfxTextureFromBuffer::default()
     }
     .as_bytes()
     .to_vec()
