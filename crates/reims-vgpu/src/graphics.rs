@@ -388,9 +388,11 @@ impl<P: ApiPlatform> GraphicsControl<P> {
             match outcome {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
+                    let (ty, seqno, obj_id) = message_identity(message);
                     log::warn!(
                         target: "reims_vgpu::graphics",
-                        "a stage-3 control message was not carried out: {e:?}"
+                        "a stage-3 control message (type {ty:#x}, seqno {seqno}, object {obj_id:#x}) \
+                         was not carried out: {e:?}"
                     );
                     self.fail_command_buffer(message);
                 }
@@ -425,9 +427,11 @@ impl<P: ApiPlatform> GraphicsControl<P> {
             match outcome {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
+                    let (ty, seqno, obj_id) = message_identity(message);
                     log::warn!(
                         target: "reims_vgpu::graphics",
-                        "a queue command buffer was not carried out: {e:?}"
+                        "a queue message (type {ty:#x}, seqno {seqno}, object {obj_id:#x}) was not \
+                         carried out: {e:?}"
                     );
                     self.fail_queue_command_buffer(poster, message);
                 }
@@ -708,3 +712,16 @@ fn scanout_sink<P: ApiPlatform>(
 
 #[cfg(test)]
 mod tests;
+
+/// A message's type and seqno (its header) and the object id that follows the header in every
+/// create, destroy and command buffer (0 where the message is shorter), for a refusal's log line.
+fn message_identity(message: &[u8]) -> (u32, u64, u64) {
+    let word = |at: usize, len: usize| {
+        message.get(at..at + len).map_or(0, |b| {
+            let mut v = [0u8; 8];
+            v[..len].copy_from_slice(b);
+            u64::from_le_bytes(v)
+        })
+    };
+    (word(0, 4) as u32, word(8, 8), word(16, 8))
+}
