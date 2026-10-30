@@ -94,7 +94,9 @@ impl Rig {
         let interrupts = Arc::new(AtomicU32::new(0));
         let written = Arc::new(AtomicBool::new(false));
         let asked = Arc::new(Mutex::new(Vec::new()));
+        let region = Arc::new(Region::new(REGION_SIZE as usize).unwrap());
         let device = Device::new(
+            region,
             Box::new(TestHost {
                 interrupts: Arc::clone(&interrupts),
                 written: Arc::clone(&written),
@@ -534,7 +536,7 @@ fn a_reset_puts_the_device_back_as_new() {
         [
             Told::Scanout(None),
             Told::Cursor(None),
-            Told::Moved(0, 0, false)
+            Told::Moved(0, 0, true)
         ]
     );
     for header in [RGFX_CONTROL_SUBMIT_OFFSET, RGFX_CONTROL_COMPLETE_OFFSET] {

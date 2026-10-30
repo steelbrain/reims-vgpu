@@ -21,12 +21,14 @@
 //!
 //! **The end.** The last [`Device`] handle's drop ends both threads without waiting for them: each
 //! sees the end at its next wake (the control thread at once, the refresh thread within a
-//! refresh), and the last of them to let go drops the region and the host's callbacks.
+//! refresh), and the last of them to let go drops its reference to the region and the host's
+//! callbacks.
 //!
 //! **Reset.** Writing `STATUS` 0, and the host's reset, put the device back as it was made: no
 //! command is taken until the guest writes `STATUS` 1, both rings are as nothing had passed
 //! through them (the submission ring's `consumer_idle` 1, so the guest rings for its first
-//! message), the display has no scanout, no cursor and no `VBLANK`, and its refresh count is 0.
+//! message), the display has no scanout, no cursor image (and shows its cursor once it has one)
+//! and no `VBLANK`, and its refresh count is 0.
 //! What the guest wrote in its allocations stays.
 //!
 //! **A broken ring.** A count or a message size the protocol refuses (`ring::Broken`) is logged,
@@ -100,8 +102,8 @@ pub(crate) struct Shared {
     host: Box<dyn Host>,
     /// What shows the display.
     pub(crate) screen: Box<dyn Screen>,
-    /// BAR 2.
-    pub(crate) region: Region,
+    /// BAR 2, which what shows the display may hold too.
+    pub(crate) region: Arc<Region>,
     /// `STATUS`.
     status: AtomicU32,
     /// Moved on at each reset: work begun before one drops what it would send.
@@ -144,10 +146,18 @@ pub(crate) struct DisplayState {
 }
 
 impl Device {
-    /// A device over `host` and `screen`, its region [`REGION_SIZE`] bytes, with its two threads
-    /// started; `None` where the host refuses the region, a pipe or a thread.
-    pub fn new(host: Box<dyn Host>, screen: Box<dyn Screen>) -> Option<Device> {
-        let region = Region::new(usize::try_from(REGION_SIZE).ok()?)?;
+    /// A device over `region` (BAR 2: [`REGION_SIZE`] bytes, of which what shows the display
+    /// may hold a reference to read the scanout from), `host` and `screen`, with its two threads
+    /// started; `None` where the region is smaller than the rings and a page of allocations, or
+    /// the host refuses a pipe or a thread.
+    pub fn new(
+        region: Arc<Region>,
+        host: Box<dyn Host>,
+        screen: Box<dyn Screen>,
+    ) -> Option<Device> {
+        if region.size() < RGFX_ALLOCATIONS_OFFSET + 4096 {
+            return None;
+        }
         let mut consumer = Consumer::new(SUBMIT);
         consumer.reset(&region);
         let mut producer = Producer::new(COMPLETE);
@@ -294,7 +304,7 @@ impl Shared {
         drop(submit);
         self.screen.scanout(None);
         self.screen.cursor_image(None);
-        self.screen.cursor_moved(0, 0, false);
+        self.screen.cursor_moved(0, 0, true);
     }
 
     /// The control thread (the module doc).
@@ -323,26 +333,33 @@ impl Shared {
     }
 
     /// Takes and answers every message the guest has published, while the device is started and
-    /// the ring is not broken.
+    /// the ring is not broken. Each message is taken and done with the ring held, so a reset
+    /// comes before or after it whole; its answer is posted with nothing held, so the interrupt
+    /// is raised with no lock of the device's held, and dropped where a reset came between.
     fn take_messages(&self) {
-        let mut submit = self.submit.lock();
-        let epoch = self.epoch.load(Ordering::Acquire);
-        while self.started() && !submit.broken && !self.ending() {
-            match submit.consumer.next(&self.region) {
-                Ok(Some(message)) => {
-                    if let Some(answer) = control::answer(self, &message) {
-                        self.post_waiting(&answer, epoch);
+        loop {
+            let (answer, epoch) = {
+                let mut submit = self.submit.lock();
+                if !self.started() || submit.broken || self.ending() {
+                    return;
+                }
+                let epoch = self.epoch.load(Ordering::Acquire);
+                match submit.consumer.next(&self.region) {
+                    Ok(Some(message)) => (control::answer(self, &message), epoch),
+                    Ok(None) => return,
+                    Err(broken) => {
+                        log::error!(
+                            target: "reims_graphics",
+                            "the control submission ring is broken ({broken}): it takes nothing \
+                             more until the device is reset"
+                        );
+                        submit.broken = true;
+                        return;
                     }
                 }
-                Ok(None) => break,
-                Err(broken) => {
-                    log::error!(
-                        target: "reims_graphics",
-                        "the control submission ring is broken ({broken}): it takes nothing \
-                         more until the device is reset"
-                    );
-                    submit.broken = true;
-                }
+            };
+            if let Some(answer) = answer {
+                self.post_waiting(&answer, epoch);
             }
         }
     }
