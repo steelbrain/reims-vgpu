@@ -25,15 +25,18 @@
 use std::collections::HashMap;
 
 use reims_graphics::wire::{
-    RGFX_CMD_DEPTH_STENCIL_CREATE, RGFX_CMD_EVENT_CREATE, RGFX_CMD_FENCE_CREATE,
-    RGFX_CMD_LIBRARY_CREATE, RGFX_CMD_OBJECT_DESTROY, RGFX_CMD_QUEUE_CREATE,
+    RGFX_CMD_BUFFER_CREATE, RGFX_CMD_DEPTH_STENCIL_CREATE, RGFX_CMD_EVENT_CREATE,
+    RGFX_CMD_FENCE_CREATE, RGFX_CMD_LIBRARY_CREATE, RGFX_CMD_OBJECT_DESTROY, RGFX_CMD_QUEUE_CREATE,
     RGFX_CMD_SAMPLER_CREATE, RGFX_CMD_SHARED_EVENT_CREATE, RGFX_LIBRARY_BYTES_OFFSET,
-    RgfxDepthStencilCreate, RgfxLibraryCreate, RgfxMsgHeader, RgfxObjectCreate, RgfxObjectDestroy,
-    RgfxQueueCreate, RgfxSamplerCreate, RgfxSharedEventCreate, RgfxStencilDescriptor,
+    RgfxBufferCreate, RgfxDepthStencilCreate, RgfxLibraryCreate, RgfxMsgHeader, RgfxObjectCreate,
+    RgfxObjectDestroy, RgfxQueueCreate, RgfxSamplerCreate, RgfxSharedEventCreate,
+    RgfxStencilDescriptor,
 };
 use reims_vgpu_core::platform::Platform;
 use reims_vgpu_core::platform::device::GpuDevice;
-use reims_vgpu_core::platform::values::{DepthStencilDesc, SamplerDesc, StencilDesc};
+use reims_vgpu_core::platform::values::{
+    BufferDesc, DepthStencilDesc, OptionSet, SamplerDesc, StencilDesc,
+};
 use reims_vgpu_core::raise::{OnFault, RaiseResult};
 use zerocopy::FromBytes;
 
@@ -48,6 +51,7 @@ enum ObjHandle<P: Platform> {
     Library(P::Library),
     Sampler(P::SamplerState),
     DepthStencil(P::DepthStencilState),
+    Buffer(P::Buffer),
 }
 
 /// Why a message was not carried out.
@@ -217,6 +221,26 @@ impl<P: Platform> GraphicsDecoder<P> {
                     None => Ok(Err(DecodeError::Refused)),
                 }
             }
+            RGFX_CMD_BUFFER_CREATE => {
+                let Some(m) = read::<RgfxBufferCreate>(message) else {
+                    return Ok(Err(DecodeError::Malformed));
+                };
+                // A device-placed (Private/Shared-on-UMA) buffer. The guest picks
+                // the GPU address and the host pins it; a 0 address lets the host
+                // choose. `options` carries the whole MTLResourceOptions.
+                let desc = BufferDesc {
+                    length: m.length,
+                    options: vec![OptionSet::ResourceOptions(m.options.into())],
+                    pinned_gpu_address: (m.gpu_address != 0).then_some(m.gpu_address),
+                    contents: None,
+                    no_copy: false,
+                    deallocator: None,
+                };
+                match device.new_buffer(desc)? {
+                    Some(buffer) => self.insert(m.obj_id, ObjHandle::Buffer(buffer)),
+                    None => Ok(Err(DecodeError::Refused)),
+                }
+            }
             _ => Ok(Err(DecodeError::UnknownCommand)),
         }
     }
@@ -364,7 +388,22 @@ mod tests {
         };
         assert_eq!(dec.decode(&device, ds.as_bytes()).unwrap(), Ok(()));
 
-        assert_eq!(dec.object_count(), 7);
+        // A device-placed buffer at a guest-picked GPU address.
+        let buffer = RgfxBufferCreate {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_BUFFER_CREATE,
+                size: size_of::<RgfxBufferCreate>() as u32,
+                seqno: 0,
+            },
+            obj_id: 17,
+            gpu_address: 0x4_0000,
+            length: 65536,
+            options: 0,
+            ..RgfxBufferCreate::default()
+        };
+        assert_eq!(dec.decode(&device, buffer.as_bytes()).unwrap(), Ok(()));
+
+        assert_eq!(dec.object_count(), 8);
         let log = p.call_log();
         assert_eq!(log.calls_to("newEvent").len(), 1);
         assert_eq!(log.calls_to("newFence").len(), 1);
@@ -373,6 +412,7 @@ mod tests {
         assert_eq!(log.calls_to("newLibraryWithData:error:").len(), 1);
         assert_eq!(log.calls_to("newSamplerStateWithDescriptor:").len(), 1);
         assert_eq!(log.calls_to("newDepthStencilStateWithDescriptor:").len(), 1);
+        assert_eq!(log.calls_to("newBufferWithDescriptor:").len(), 1);
 
         // Destroying the event drops its handle; the others stay.
         let destroy = RgfxObjectDestroy {
@@ -384,7 +424,7 @@ mod tests {
             obj_id: 10,
         };
         assert_eq!(dec.decode(&device, destroy.as_bytes()).unwrap(), Ok(()));
-        assert_eq!(dec.object_count(), 6);
+        assert_eq!(dec.object_count(), 7);
         // Destroying an id the host never made is not an error.
         assert_eq!(dec.decode(&device, destroy.as_bytes()).unwrap(), Ok(()));
 
