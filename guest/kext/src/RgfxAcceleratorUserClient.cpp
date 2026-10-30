@@ -143,17 +143,6 @@ IOReturn RgfxAcceleratorUserClient::externalMethod(uint32_t selector,
 		{ &RgfxAcceleratorUserClient::doorbellMethod, 1, 0, 0, 0 },
 	};
 
-	// RGFX DIAG (Wall-2 trace; remove before merge): which method the base calls via
-	// the modern dispatch, its argument shape, and its scalar inputs (the input values
-	// may reveal selector 7's semantics -- a port, a size, an address).
-	uint32_t scalarIn = arguments ? arguments->scalarInputCount : 0;
-	IOLog("RGFX: externalMethod ucType=%u selector=%u scalarIn=%u structIn=%u scalarOut=%u structOut=%u in0=0x%llx in1=0x%llx\n",
-	      ucType, selector, scalarIn, arguments ? arguments->structureInputSize : 0,
-	      arguments ? arguments->scalarOutputCount : 0,
-	      arguments ? arguments->structureOutputSize : 0,
-	      (arguments && scalarIn > 0) ? arguments->scalarInput[0] : 0ull,
-	      (arguments && scalarIn > 1) ? arguments->scalarInput[1] : 0ull);
-
 	// Our own protocol: the process's context (its ids, blocks and queues), on our own user
 	// client alone.
 	if (ucType == kRgfxAccelUserClientType && arguments && selector >= kRgfxAccelMethodOpenContext &&
