@@ -1661,6 +1661,59 @@ fn a_block_is_released_only_once_nothing_lies_in_it() {
     assert_eq!(status, RGFX_STATUS_OK);
 }
 
+/// A library from region chunks is checked against its own process's blocks, whichever process
+/// sent the message before it: process 1's chunk over its block, sent after process 2's create,
+/// is made; process 2's chunk over process 1's block is refused
+#[test]
+fn a_library_chunk_is_checked_against_its_sender_s_blocks() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, _platform) = headless_on(&raised);
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    const BLOCK: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x10_0000;
+    const SIZE: u64 = 0x1_0000;
+    let bytes = [1u8, 2, 3, 4];
+    // SAFETY: as `Guest`'s helpers; the span lies in the region.
+    unsafe { guest.write((BLOCK + 0x1000) as usize, &bytes) };
+    guest.send(&device, block_grant(1, BLOCK, SIZE));
+    let chunk = |obj_id: u64| {
+        RgfxLibraryFromRegion {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_LIBRARY_FROM_REGION,
+                size: 0,
+                seqno: 0,
+            },
+            obj_id,
+            region_offset: BLOCK + 0x1000,
+            byte_length: bytes.len() as u64,
+            total_length: bytes.len() as u64,
+            chunk_offset: 0,
+            ack_offset: BLOCK,
+            ack_value: 7,
+            ..RgfxLibraryFromRegion::default()
+        }
+        .as_bytes()
+        .to_vec()
+    };
+    // The control thread's last message is process 2's (refused: its block is not process 2's).
+    guest.send(&device, buffer_over_host_memory(obj(2, 1), BLOCK, 0x1000));
+    assert_eq!(
+        answered(&device, &mut guest, chunk(obj(1, 10))),
+        RGFX_STATUS_OK
+    );
+    // SAFETY: as above.
+    assert_eq!(
+        unsafe { guest.load_u64(BLOCK as usize) },
+        7,
+        "the chunk is acked"
+    );
+    // Now the last message is process 1's.
+    assert_eq!(
+        answered(&device, &mut guest, chunk(obj(2, 10))),
+        RGFX_STATUS_INVALID_ARGUMENT
+    );
+}
+
 /// A block's release, and a context's close, wait for the command buffers the context committed
 /// before them, and only those: another context's in-flight buffer, and the context's own buffer
 /// committed after the release, hold neither

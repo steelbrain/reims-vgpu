@@ -552,7 +552,11 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     /// A library lookup from ring 0, answered at once: a hit binds the library's new id to the
     /// library the device keeps under its key, and no bytes cross.
     fn lookup_library(&self, poster: &CompletionPoster, message: &[u8]) {
-        let (seqno, status) = entry::run(|_| self.decoder.lock().lookup_library(message));
+        let (seqno, status) = entry::run(|_| {
+            let mut decoder = self.decoder.lock();
+            decoder.set_context(Some(sender_context(poster, message)));
+            decoder.lookup_library(message)
+        });
         let (obj_id, size) = RgfxLibraryLookup::read_from_prefix(message)
             .map_or((0, 0), |(m, _)| (m.obj_id, m.slice_size));
         log::info!(
@@ -570,7 +574,11 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     /// refused here, as the decoder refuses it, and answered where the guest waits), then made on
     /// the compile pool ([`Self::make`]), so ring 0 goes on meanwhile.
     fn start_library(self: &Arc<Self>, poster: &CompletionPoster, message: &[u8]) {
-        let start = entry::run(|_| self.decoder.lock().prepare_library(message));
+        let start = entry::run(|_| {
+            let mut decoder = self.decoder.lock();
+            decoder.set_context(Some(sender_context(poster, message)));
+            decoder.prepare_library(message)
+        });
         let job = match start {
             LibraryStart::Make(job) => job,
             LibraryStart::Chunk => return,
