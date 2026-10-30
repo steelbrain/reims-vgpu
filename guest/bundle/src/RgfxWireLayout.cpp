@@ -109,83 +109,83 @@ static_assert(sizeof(RgfxOpSetVertexBuffers) == 16, "RgfxOpSetVertexBuffers");
 static_assert(sizeof(RgfxOpUseResources) == 16, "RgfxOpUseResources render head");
 static_assert(sizeof(RgfxOpUseResourcesStages) == 24, "RgfxOpUseResourcesStages");
 
-// The compute-encoder op bodies and element records, hand-mirrored in
-// RgfxEncoder.hpp from crates/reims-graphics/src/ops/compute.rs (the committed
-// header does not carry them). These sizes are that file's `const _` asserts.
-static_assert(sizeof(rgfx_compute::RgfxOpSetComputePipelineState) == 8, "compute pipeline state");
-static_assert(sizeof(rgfx_compute::RgfxOpSetBufferOffset) == 16, "compute buffer offset");
-static_assert(sizeof(rgfx_compute::RgfxOpSetBufferOffsetAttributeStride) == 24,
+// The compute-encoder op bodies (`RgfxComputeOp*`) and element records, from the
+// committed header (crates/reims-graphics/src/ops/compute.rs). These sizes are that
+// file's `const _` asserts.
+static_assert(sizeof(RgfxComputeOpSetComputePipelineState) == 8, "compute pipeline state");
+static_assert(sizeof(RgfxComputeOpSetBufferOffset) == 16, "compute buffer offset");
+static_assert(sizeof(RgfxComputeOpSetBufferOffsetAttributeStride) == 24,
               "compute buffer offset stride");
-static_assert(sizeof(rgfx_compute::RgfxOpSetBuffers) == 16, "compute set buffers head");
-static_assert(sizeof(rgfx_compute::RgfxComputeBufferBinding) == 16, "compute buffer binding");
-static_assert(sizeof(rgfx_compute::RgfxOpSetBuffersAttributeStrides) == 16,
+static_assert(sizeof(RgfxComputeOpSetBuffers) == 16, "compute set buffers head");
+static_assert(sizeof(RgfxComputeBufferBinding) == 16, "compute buffer binding");
+static_assert(sizeof(RgfxComputeOpSetBuffersAttributeStrides) == 16,
               "compute set buffers stride head");
-static_assert(sizeof(rgfx_compute::RgfxComputeBufferStrideBinding) == 24,
+static_assert(sizeof(RgfxComputeBufferStrideBinding) == 24,
               "compute buffer stride binding");
-static_assert(sizeof(rgfx_compute::RgfxOpSetTexture) == 16, "compute set texture");
-static_assert(sizeof(rgfx_compute::RgfxOpSetTextures) == 16, "compute set textures head");
-static_assert(sizeof(rgfx_compute::RgfxComputeTextureBinding) == 8, "compute texture binding");
-static_assert(sizeof(rgfx_compute::RgfxOpSetSamplerStates) == 16, "compute set samplers head");
-static_assert(sizeof(rgfx_compute::RgfxComputeSamplerBinding) == 8, "compute sampler binding");
-static_assert(sizeof(rgfx_compute::RgfxOpSetSamplerStatesLodClamps) == 16,
+static_assert(sizeof(RgfxComputeOpSetTexture) == 16, "compute set texture");
+static_assert(sizeof(RgfxComputeOpSetTextures) == 16, "compute set textures head");
+static_assert(sizeof(RgfxComputeTextureBinding) == 8, "compute texture binding");
+static_assert(sizeof(RgfxComputeOpSetSamplerStates) == 16, "compute set samplers head");
+static_assert(sizeof(RgfxComputeSamplerBinding) == 8, "compute sampler binding");
+static_assert(sizeof(RgfxComputeOpSetSamplerStatesLodClamps) == 16,
               "compute set samplers lod head");
-static_assert(sizeof(rgfx_compute::RgfxComputeSamplerLodBinding) == 16, "compute sampler lod");
-static_assert(sizeof(rgfx_compute::RgfxOpSetThreadgroupMemoryLength) == 16,
+static_assert(sizeof(RgfxComputeSamplerLodBinding) == 16, "compute sampler lod");
+static_assert(sizeof(RgfxComputeOpSetThreadgroupMemoryLength) == 16,
               "compute threadgroup memory length");
-static_assert(sizeof(rgfx_compute::RgfxOpSetStageInRegion) == 48, "compute stage-in region");
-static_assert(sizeof(rgfx_compute::RgfxOpSetStageInRegionIndirect) == 16,
+static_assert(sizeof(RgfxComputeOpSetStageInRegion) == 48, "compute stage-in region");
+static_assert(sizeof(RgfxComputeOpSetStageInRegionIndirect) == 16,
               "compute stage-in region indirect");
-static_assert(sizeof(rgfx_compute::RgfxOpSetImageblockWidth) == 16, "compute imageblock width");
-static_assert(sizeof(rgfx_compute::RgfxOpDispatchThreadgroups) == 48, "compute dispatch tg");
-static_assert(sizeof(rgfx_compute::RgfxOpDispatchThreadgroupsIndirect) == 40,
+static_assert(sizeof(RgfxComputeOpSetImageblockWidth) == 16, "compute imageblock width");
+static_assert(sizeof(RgfxComputeOpDispatchThreadgroups) == 48, "compute dispatch tg");
+static_assert(sizeof(RgfxComputeOpDispatchThreadgroupsIndirect) == 40,
               "compute dispatch tg indirect");
-static_assert(sizeof(rgfx_compute::RgfxOpDispatchThreads) == 48, "compute dispatch threads");
-static_assert(sizeof(rgfx_compute::RgfxOpDispatchThreadsIndirect) == 16,
+static_assert(sizeof(RgfxComputeOpDispatchThreads) == 48, "compute dispatch threads");
+static_assert(sizeof(RgfxComputeOpDispatchThreadsIndirect) == 16,
               "compute dispatch threads indirect");
-static_assert(sizeof(rgfx_compute::RgfxOpUseResources) == 16, "compute use resources head");
-static_assert(sizeof(rgfx_compute::RgfxComputeResourceRef) == 16, "compute resource ref");
-static_assert(sizeof(rgfx_compute::RgfxOpUseHeaps) == 8, "compute use heaps head");
-static_assert(sizeof(rgfx_compute::RgfxComputeHeapBinding) == 8, "compute heap binding");
-static_assert(sizeof(rgfx_compute::RgfxOpMemoryBarrierResources) == 8,
+static_assert(sizeof(RgfxComputeOpUseResources) == 16, "compute use resources head");
+static_assert(sizeof(RgfxComputeResourceRef) == 16, "compute resource ref");
+static_assert(sizeof(RgfxComputeOpUseHeaps) == 8, "compute use heaps head");
+static_assert(sizeof(RgfxComputeHeapBinding) == 8, "compute heap binding");
+static_assert(sizeof(RgfxComputeOpMemoryBarrierResources) == 8,
               "compute memory barrier resources head");
-static_assert(sizeof(rgfx_compute::RgfxOpMemoryBarrierScope) == 8, "compute memory barrier scope");
-static_assert(sizeof(rgfx_compute::RgfxOpUpdateFence) == 8, "compute update fence");
-static_assert(sizeof(rgfx_compute::RgfxOpWaitForFence) == 8, "compute wait for fence");
-static_assert(sizeof(rgfx_compute::RgfxOpExecuteCommandsIndirect) == 24,
+static_assert(sizeof(RgfxComputeOpMemoryBarrierScope) == 8, "compute memory barrier scope");
+static_assert(sizeof(RgfxComputeOpUpdateFence) == 8, "compute update fence");
+static_assert(sizeof(RgfxComputeOpWaitForFence) == 8, "compute wait for fence");
+static_assert(sizeof(RgfxComputeOpExecuteCommandsIndirect) == 24,
               "compute execute commands indirect");
-static_assert(sizeof(rgfx_compute::RgfxOpExecuteCommandsInBuffer) == 24,
+static_assert(sizeof(RgfxComputeOpExecuteCommandsInBuffer) == 24,
               "compute execute commands in buffer");
-static_assert(sizeof(rgfx_compute::RgfxOpEncodeStartIf) == 32, "compute encode start if");
-static_assert(sizeof(rgfx_compute::RgfxOpEncodeStartWhile) == 32, "compute encode start while");
+static_assert(sizeof(RgfxComputeOpEncodeStartIf) == 32, "compute encode start if");
+static_assert(sizeof(RgfxComputeOpEncodeStartWhile) == 32, "compute encode start while");
 
-// The blit-encoder op bodies, hand-mirrored from
-// crates/reims-graphics/src/ops/blit.rs. These sizes are that file's asserts.
-static_assert(sizeof(rgfx_blit::RgfxOpCopyBufferToBuffer) == 40, "blit copy b2b");
-static_assert(sizeof(rgfx_blit::RgfxOpCopyBufferToTexture) == 104, "blit copy b2t");
-static_assert(sizeof(rgfx_blit::RgfxOpCopyBufferToTextureOptions) == 112, "blit copy b2t options");
-static_assert(sizeof(rgfx_blit::RgfxOpCopyTextureToBuffer) == 104, "blit copy t2b");
-static_assert(sizeof(rgfx_blit::RgfxOpCopyTextureToBufferOptions) == 112, "blit copy t2b options");
-static_assert(sizeof(rgfx_blit::RgfxOpCopyTextureRegion) == 120, "blit copy region");
-static_assert(sizeof(rgfx_blit::RgfxOpCopyTextureRegionOptions) == 128, "blit copy region options");
-static_assert(sizeof(rgfx_blit::RgfxOpCopyTextureSlices) == 64, "blit copy slices");
-static_assert(sizeof(rgfx_blit::RgfxOpCopyIndirectCommandBuffer) == 40, "blit copy icb");
-static_assert(sizeof(rgfx_blit::RgfxOpFillBuffer) == 32, "blit fill buffer");
-static_assert(sizeof(rgfx_blit::RgfxOpFillBufferPattern4) == 32, "blit fill buffer pattern4");
-static_assert(sizeof(rgfx_blit::RgfxOpFillTexture) == 80, "blit fill texture head");
-static_assert(RGFX_OP_BLIT_FILL_TEXTURE_BYTES_OFFSET == sizeof(rgfx_blit::RgfxOpFillTexture),
+// The blit-encoder op bodies (`RgfxBlitOp*`), from the committed header
+// (crates/reims-graphics/src/ops/blit.rs). These sizes are that file's asserts.
+static_assert(sizeof(RgfxBlitOpCopyBufferToBuffer) == 40, "blit copy b2b");
+static_assert(sizeof(RgfxBlitOpCopyBufferToTexture) == 104, "blit copy b2t");
+static_assert(sizeof(RgfxBlitOpCopyBufferToTextureOptions) == 112, "blit copy b2t options");
+static_assert(sizeof(RgfxBlitOpCopyTextureToBuffer) == 104, "blit copy t2b");
+static_assert(sizeof(RgfxBlitOpCopyTextureToBufferOptions) == 112, "blit copy t2b options");
+static_assert(sizeof(RgfxBlitOpCopyTextureRegion) == 120, "blit copy region");
+static_assert(sizeof(RgfxBlitOpCopyTextureRegionOptions) == 128, "blit copy region options");
+static_assert(sizeof(RgfxBlitOpCopyTextureSlices) == 64, "blit copy slices");
+static_assert(sizeof(RgfxBlitOpCopyIndirectCommandBuffer) == 40, "blit copy icb");
+static_assert(sizeof(RgfxBlitOpFillBuffer) == 32, "blit fill buffer");
+static_assert(sizeof(RgfxBlitOpFillBufferPattern4) == 32, "blit fill buffer pattern4");
+static_assert(sizeof(RgfxBlitOpFillTexture) == 80, "blit fill texture head");
+static_assert(RGFX_OP_BLIT_FILL_TEXTURE_BYTES_OFFSET == sizeof(RgfxBlitOpFillTexture),
               "blit fill texture bytes offset");
-static_assert(sizeof(rgfx_blit::RgfxOpFillTextureColor) == 112, "blit fill texture color");
-static_assert(sizeof(rgfx_blit::RgfxOpGenerateMipmaps) == 8, "blit generate mipmaps");
-static_assert(sizeof(rgfx_blit::RgfxOpInvalidateCompressedTexture) == 8, "blit invalidate");
-static_assert(sizeof(rgfx_blit::RgfxOpInvalidateCompressedTextureSlice) == 24,
+static_assert(sizeof(RgfxBlitOpFillTextureColor) == 112, "blit fill texture color");
+static_assert(sizeof(RgfxBlitOpGenerateMipmaps) == 8, "blit generate mipmaps");
+static_assert(sizeof(RgfxBlitOpInvalidateCompressedTexture) == 8, "blit invalidate");
+static_assert(sizeof(RgfxBlitOpInvalidateCompressedTextureSlice) == 24,
               "blit invalidate slice");
-static_assert(sizeof(rgfx_blit::RgfxOpOptimizeForCpu) == 8, "blit optimize cpu");
-static_assert(sizeof(rgfx_blit::RgfxOpOptimizeForCpuSlice) == 24, "blit optimize cpu slice");
-static_assert(sizeof(rgfx_blit::RgfxOpOptimizeForGpu) == 8, "blit optimize gpu");
-static_assert(sizeof(rgfx_blit::RgfxOpOptimizeForGpuSlice) == 24, "blit optimize gpu slice");
-static_assert(sizeof(rgfx_blit::RgfxOpOptimizeIndirectCommandBuffer) == 24, "blit optimize icb");
-static_assert(sizeof(rgfx_blit::RgfxOpResetCommandsInBuffer) == 24, "blit reset commands");
-static_assert(sizeof(rgfx_blit::RgfxOpSynchronizeResource) == 16, "blit synchronize resource");
-static_assert(sizeof(rgfx_blit::RgfxOpSynchronizeTexture) == 24, "blit synchronize texture");
-static_assert(sizeof(rgfx_blit::RgfxOpUpdateFence) == 8, "blit update fence");
-static_assert(sizeof(rgfx_blit::RgfxOpWaitForFence) == 8, "blit wait for fence");
+static_assert(sizeof(RgfxBlitOpOptimizeForCpu) == 8, "blit optimize cpu");
+static_assert(sizeof(RgfxBlitOpOptimizeForCpuSlice) == 24, "blit optimize cpu slice");
+static_assert(sizeof(RgfxBlitOpOptimizeForGpu) == 8, "blit optimize gpu");
+static_assert(sizeof(RgfxBlitOpOptimizeForGpuSlice) == 24, "blit optimize gpu slice");
+static_assert(sizeof(RgfxBlitOpOptimizeIndirectCommandBuffer) == 24, "blit optimize icb");
+static_assert(sizeof(RgfxBlitOpResetCommandsInBuffer) == 24, "blit reset commands");
+static_assert(sizeof(RgfxBlitOpSynchronizeResource) == 16, "blit synchronize resource");
+static_assert(sizeof(RgfxBlitOpSynchronizeTexture) == 24, "blit synchronize texture");
+static_assert(sizeof(RgfxBlitOpUpdateFence) == 8, "blit update fence");
+static_assert(sizeof(RgfxBlitOpWaitForFence) == 8, "blit wait for fence");

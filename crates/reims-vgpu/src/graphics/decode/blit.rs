@@ -48,7 +48,7 @@ pub(crate) fn decode_op<P: Platform>(
 ) -> RaiseResult<bool> {
     match tag {
         RGFX_OP_BLIT_COPY_BUFFER_TO_BUFFER => {
-            let m: RgfxOpCopyBufferToBuffer = body(tag, payload)?;
+            let m: RgfxBlitOpCopyBufferToBuffer = body(tag, payload)?;
             let source = objs.get_buffer(m.source_buffer_obj_id)?;
             let destination = objs.get_buffer(m.destination_buffer_obj_id)?;
             enc.encode(
@@ -63,7 +63,7 @@ pub(crate) fn decode_op<P: Platform>(
             )?;
         }
         RGFX_OP_BLIT_COPY_BUFFER_TO_TEXTURE => {
-            let m: RgfxOpCopyBufferToTexture = body(tag, payload)?;
+            let m: RgfxBlitOpCopyBufferToTexture = body(tag, payload)?;
             let source = objs.require_buffer(m.source_buffer_obj_id)?;
             let destination = objs.require_texture(m.destination_texture_obj_id)?;
             enc.encode(
@@ -90,7 +90,7 @@ pub(crate) fn decode_op<P: Platform>(
             )?;
         }
         RGFX_OP_BLIT_COPY_BUFFER_TO_TEXTURE_OPTIONS => {
-            let m: RgfxOpCopyBufferToTextureOptions = body(tag, payload)?;
+            let m: RgfxBlitOpCopyBufferToTextureOptions = body(tag, payload)?;
             let source = objs.get_buffer(m.source_buffer_obj_id)?;
             let destination = objs.get_texture(m.destination_texture_obj_id)?;
             enc.encode(
@@ -118,7 +118,7 @@ pub(crate) fn decode_op<P: Platform>(
             )?;
         }
         RGFX_OP_BLIT_COPY_TEXTURE_TO_BUFFER => {
-            let m: RgfxOpCopyTextureToBuffer = body(tag, payload)?;
+            let m: RgfxBlitOpCopyTextureToBuffer = body(tag, payload)?;
             let source = objs.require_texture(m.source_texture_obj_id)?;
             let destination = objs.require_buffer(m.destination_buffer_obj_id)?;
             enc.encode(
@@ -145,7 +145,7 @@ pub(crate) fn decode_op<P: Platform>(
             )?;
         }
         RGFX_OP_BLIT_COPY_TEXTURE_TO_BUFFER_OPTIONS => {
-            let m: RgfxOpCopyTextureToBufferOptions = body(tag, payload)?;
+            let m: RgfxBlitOpCopyTextureToBufferOptions = body(tag, payload)?;
             let source = objs.get_texture(m.source_texture_obj_id)?;
             let destination = objs.get_buffer(m.destination_buffer_obj_id)?;
             enc.encode(
@@ -173,7 +173,7 @@ pub(crate) fn decode_op<P: Platform>(
             )?;
         }
         RGFX_OP_BLIT_COPY_TEXTURE_REGION => {
-            let m: RgfxOpCopyTextureRegion = body(tag, payload)?;
+            let m: RgfxBlitOpCopyTextureRegion = body(tag, payload)?;
             let source = objs.require_texture(m.source_texture_obj_id)?;
             let destination = objs.require_texture(m.destination_texture_obj_id)?;
             enc.encode(
@@ -204,7 +204,7 @@ pub(crate) fn decode_op<P: Platform>(
             )?;
         }
         RGFX_OP_BLIT_COPY_TEXTURE_REGION_OPTIONS => {
-            let m: RgfxOpCopyTextureRegionOptions = body(tag, payload)?;
+            let m: RgfxBlitOpCopyTextureRegionOptions = body(tag, payload)?;
             let source = objs.require_texture(m.source_texture_obj_id)?;
             let destination = objs.require_texture(m.destination_texture_obj_id)?;
             enc.encode(
@@ -236,7 +236,7 @@ pub(crate) fn decode_op<P: Platform>(
             )?;
         }
         RGFX_OP_BLIT_COPY_TEXTURE_SLICES => {
-            let m: RgfxOpCopyTextureSlices = body(tag, payload)?;
+            let m: RgfxBlitOpCopyTextureSlices = body(tag, payload)?;
             let source = objs.require_texture(m.source_texture_obj_id)?;
             let destination = objs.require_texture(m.destination_texture_obj_id)?;
             enc.encode(
@@ -254,7 +254,7 @@ pub(crate) fn decode_op<P: Platform>(
             )?;
         }
         RGFX_OP_BLIT_COPY_INDIRECT_COMMAND_BUFFER => {
-            let m: RgfxOpCopyIndirectCommandBuffer = body(tag, payload)?;
+            let m: RgfxBlitOpCopyIndirectCommandBuffer = body(tag, payload)?;
             let source = objs.require_indirect_command_buffer(m.source_obj_id)?;
             let destination = objs.require_indirect_command_buffer(m.destination_obj_id)?;
             enc.encode(
@@ -268,7 +268,7 @@ pub(crate) fn decode_op<P: Platform>(
             )?;
         }
         RGFX_OP_BLIT_FILL_BUFFER => {
-            let m: RgfxOpFillBuffer = body(tag, payload)?;
+            let m: RgfxBlitOpFillBuffer = body(tag, payload)?;
             let buffer = objs.require_buffer(m.buffer_obj_id)?;
             enc.encode(
                 on,
@@ -280,7 +280,7 @@ pub(crate) fn decode_op<P: Platform>(
             )?;
         }
         RGFX_OP_BLIT_FILL_BUFFER_PATTERN4 => {
-            let m: RgfxOpFillBufferPattern4 = body(tag, payload)?;
+            let m: RgfxBlitOpFillBufferPattern4 = body(tag, payload)?;
             let buffer = objs.require_buffer(m.buffer_obj_id)?;
             enc.encode(
                 on,
@@ -292,7 +292,7 @@ pub(crate) fn decode_op<P: Platform>(
             )?;
         }
         RGFX_OP_BLIT_FILL_TEXTURE => {
-            let m: RgfxOpFillTexture = body(tag, payload)?;
+            let m: RgfxBlitOpFillTexture = body(tag, payload)?;
             let texture = objs.require_texture(m.texture_obj_id)?;
             // The `length` fill bytes follow the fixed head in the op body; a body
             // too short for them faults the exec.
@@ -320,7 +320,7 @@ pub(crate) fn decode_op<P: Platform>(
             )?;
         }
         RGFX_OP_BLIT_FILL_TEXTURE_COLOR => {
-            let m: RgfxOpFillTextureColor = body(tag, payload)?;
+            let m: RgfxBlitOpFillTextureColor = body(tag, payload)?;
             let texture = objs.require_texture(m.texture_obj_id)?;
             enc.encode(
                 on,
@@ -342,7 +342,7 @@ pub(crate) fn decode_op<P: Platform>(
             )?;
         }
         RGFX_OP_BLIT_GENERATE_MIPMAPS => {
-            let m: RgfxOpGenerateMipmaps = body(tag, payload)?;
+            let m: RgfxBlitOpGenerateMipmaps = body(tag, payload)?;
             let texture = objs.get_texture(m.texture_obj_id)?;
             enc.encode(
                 on,
@@ -352,7 +352,7 @@ pub(crate) fn decode_op<P: Platform>(
             )?;
         }
         RGFX_OP_BLIT_INVALIDATE_COMPRESSED_TEXTURE => {
-            let m: RgfxOpInvalidateCompressedTexture = body(tag, payload)?;
+            let m: RgfxBlitOpInvalidateCompressedTexture = body(tag, payload)?;
             let texture = objs.require_texture(m.texture_obj_id)?;
             enc.encode(
                 on,
@@ -360,7 +360,7 @@ pub(crate) fn decode_op<P: Platform>(
             )?;
         }
         RGFX_OP_BLIT_INVALIDATE_COMPRESSED_TEXTURE_SLICE => {
-            let m: RgfxOpInvalidateCompressedTextureSlice = body(tag, payload)?;
+            let m: RgfxBlitOpInvalidateCompressedTextureSlice = body(tag, payload)?;
             let texture = objs.require_texture(m.texture_obj_id)?;
             enc.encode(
                 on,
@@ -372,12 +372,12 @@ pub(crate) fn decode_op<P: Platform>(
             )?;
         }
         RGFX_OP_BLIT_OPTIMIZE_FOR_CPU => {
-            let m: RgfxOpOptimizeForCpu = body(tag, payload)?;
+            let m: RgfxBlitOpOptimizeForCpu = body(tag, payload)?;
             let texture = objs.require_texture(m.texture_obj_id)?;
             enc.encode(on, BlitCmd::OptimizeForCpu { texture: &texture })?;
         }
         RGFX_OP_BLIT_OPTIMIZE_FOR_CPU_SLICE => {
-            let m: RgfxOpOptimizeForCpuSlice = body(tag, payload)?;
+            let m: RgfxBlitOpOptimizeForCpuSlice = body(tag, payload)?;
             let texture = objs.require_texture(m.texture_obj_id)?;
             enc.encode(
                 on,
@@ -389,12 +389,12 @@ pub(crate) fn decode_op<P: Platform>(
             )?;
         }
         RGFX_OP_BLIT_OPTIMIZE_FOR_GPU => {
-            let m: RgfxOpOptimizeForGpu = body(tag, payload)?;
+            let m: RgfxBlitOpOptimizeForGpu = body(tag, payload)?;
             let texture = objs.require_texture(m.texture_obj_id)?;
             enc.encode(on, BlitCmd::OptimizeForGpu { texture: &texture })?;
         }
         RGFX_OP_BLIT_OPTIMIZE_FOR_GPU_SLICE => {
-            let m: RgfxOpOptimizeForGpuSlice = body(tag, payload)?;
+            let m: RgfxBlitOpOptimizeForGpuSlice = body(tag, payload)?;
             let texture = objs.require_texture(m.texture_obj_id)?;
             enc.encode(
                 on,
@@ -406,7 +406,7 @@ pub(crate) fn decode_op<P: Platform>(
             )?;
         }
         RGFX_OP_BLIT_OPTIMIZE_INDIRECT_COMMAND_BUFFER => {
-            let m: RgfxOpOptimizeIndirectCommandBuffer = body(tag, payload)?;
+            let m: RgfxBlitOpOptimizeIndirectCommandBuffer = body(tag, payload)?;
             let icb = objs.require_indirect_command_buffer(m.icb_obj_id)?;
             enc.encode(
                 on,
@@ -417,7 +417,7 @@ pub(crate) fn decode_op<P: Platform>(
             )?;
         }
         RGFX_OP_BLIT_RESET_COMMANDS_IN_BUFFER => {
-            let m: RgfxOpResetCommandsInBuffer = body(tag, payload)?;
+            let m: RgfxBlitOpResetCommandsInBuffer = body(tag, payload)?;
             let icb = objs.require_indirect_command_buffer(m.icb_obj_id)?;
             enc.encode(
                 on,
@@ -428,7 +428,7 @@ pub(crate) fn decode_op<P: Platform>(
             )?;
         }
         RGFX_OP_BLIT_SYNCHRONIZE_RESOURCE => {
-            let m: RgfxOpSynchronizeResource = body(tag, payload)?;
+            let m: RgfxBlitOpSynchronizeResource = body(tag, payload)?;
             // The resource is any `id<MTLResource>`: `resource_kind` picks the
             // resolver. A nil kind (or a 0 id) is a nil resource; an unknown kind
             // faults. The resolved handle is held for the encode.
@@ -471,7 +471,7 @@ pub(crate) fn decode_op<P: Platform>(
             }
         }
         RGFX_OP_BLIT_SYNCHRONIZE_TEXTURE => {
-            let m: RgfxOpSynchronizeTexture = body(tag, payload)?;
+            let m: RgfxBlitOpSynchronizeTexture = body(tag, payload)?;
             let texture = objs.require_texture(m.texture_obj_id)?;
             enc.encode(
                 on,
@@ -483,12 +483,12 @@ pub(crate) fn decode_op<P: Platform>(
             )?;
         }
         RGFX_OP_BLIT_UPDATE_FENCE => {
-            let m: RgfxOpUpdateFence = body(tag, payload)?;
+            let m: RgfxBlitOpUpdateFence = body(tag, payload)?;
             let fence = objs.require_fence(m.fence_obj_id)?;
             enc.encode(on, BlitCmd::UpdateFence { fence: &fence })?;
         }
         RGFX_OP_BLIT_WAIT_FOR_FENCE => {
-            let m: RgfxOpWaitForFence = body(tag, payload)?;
+            let m: RgfxBlitOpWaitForFence = body(tag, payload)?;
             let fence = objs.require_fence(m.fence_obj_id)?;
             enc.encode(on, BlitCmd::WaitForFence { fence: &fence })?;
         }
@@ -635,7 +635,7 @@ mod tests {
 
         // copyFromBuffer:...:toBuffer:...
         let mark = p.call_log().mark();
-        let m = RgfxOpCopyBufferToBuffer {
+        let m = RgfxBlitOpCopyBufferToBuffer {
             source_buffer_obj_id: 2,
             destination_buffer_obj_id: 3,
             source_offset: 16,
@@ -671,7 +671,7 @@ mod tests {
 
         // copyFromBuffer:...:toTexture:... (both required)
         let mark = p.call_log().mark();
-        let m = RgfxOpCopyBufferToTexture {
+        let m = RgfxBlitOpCopyBufferToTexture {
             source_buffer_obj_id: 2,
             destination_texture_obj_id: 4,
             source_offset: 0,
@@ -708,12 +708,12 @@ mod tests {
 
         // copyFromBuffer:...:toTexture:...:options: (nil-allowed, with a nil source)
         let mark = p.call_log().mark();
-        let m = RgfxOpCopyBufferToTextureOptions {
+        let m = RgfxBlitOpCopyBufferToTextureOptions {
             source_buffer_obj_id: 0,
             destination_texture_obj_id: 4,
             options: 1,
             source_size_width: 1,
-            ..RgfxOpCopyBufferToTextureOptions::default()
+            ..RgfxBlitOpCopyBufferToTextureOptions::default()
         };
         assert!(
             decode_op(
@@ -732,7 +732,7 @@ mod tests {
 
         // copyFromTexture:...:toBuffer:... (both required)
         let mark = p.call_log().mark();
-        let m = RgfxOpCopyTextureToBuffer {
+        let m = RgfxBlitOpCopyTextureToBuffer {
             source_texture_obj_id: 4,
             destination_buffer_obj_id: 2,
             source_slice: 1,
@@ -764,12 +764,12 @@ mod tests {
 
         // copyFromTexture:...:toBuffer:...:options: (nil-allowed)
         let mark = p.call_log().mark();
-        let m = RgfxOpCopyTextureToBufferOptions {
+        let m = RgfxBlitOpCopyTextureToBufferOptions {
             source_texture_obj_id: 4,
             destination_buffer_obj_id: 0,
             options: 2,
             source_size_width: 1,
-            ..RgfxOpCopyTextureToBufferOptions::default()
+            ..RgfxBlitOpCopyTextureToBufferOptions::default()
         };
         assert!(
             decode_op(
@@ -788,14 +788,14 @@ mod tests {
 
         // copyFromTexture:...:toTexture:... (region form)
         let mark = p.call_log().mark();
-        let m = RgfxOpCopyTextureRegion {
+        let m = RgfxBlitOpCopyTextureRegion {
             source_texture_obj_id: 4,
             destination_texture_obj_id: 5,
             source_size_width: 16,
             source_size_height: 16,
             source_size_depth: 1,
             destination_origin_x: 4,
-            ..RgfxOpCopyTextureRegion::default()
+            ..RgfxBlitOpCopyTextureRegion::default()
         };
         assert!(
             decode_op(
@@ -813,12 +813,12 @@ mod tests {
 
         // copyFromTexture:...:toTexture:...:options:
         let mark = p.call_log().mark();
-        let m = RgfxOpCopyTextureRegionOptions {
+        let m = RgfxBlitOpCopyTextureRegionOptions {
             source_texture_obj_id: 4,
             destination_texture_obj_id: 5,
             options: 4,
             source_size_width: 16,
-            ..RgfxOpCopyTextureRegionOptions::default()
+            ..RgfxBlitOpCopyTextureRegionOptions::default()
         };
         assert!(
             decode_op(
@@ -835,7 +835,7 @@ mod tests {
 
         // copyFromTexture:...:toTexture:...:sliceCount:levelCount:
         let mark = p.call_log().mark();
-        let m = RgfxOpCopyTextureSlices {
+        let m = RgfxBlitOpCopyTextureSlices {
             source_texture_obj_id: 4,
             destination_texture_obj_id: 5,
             source_slice: 0,
@@ -861,7 +861,7 @@ mod tests {
 
         // copyIndirectCommandBuffer:sourceRange:destination:destinationIndex:
         let mark = p.call_log().mark();
-        let m = RgfxOpCopyIndirectCommandBuffer {
+        let m = RgfxBlitOpCopyIndirectCommandBuffer {
             source_obj_id: 7,
             destination_obj_id: 8,
             source_range_location: 0,
@@ -886,7 +886,7 @@ mod tests {
 
         // fillBuffer:range:value:
         let mark = p.call_log().mark();
-        let m = RgfxOpFillBuffer {
+        let m = RgfxBlitOpFillBuffer {
             buffer_obj_id: 2,
             range_location: 0,
             range_length: 1024,
@@ -916,7 +916,7 @@ mod tests {
 
         // fillBuffer:range:pattern4:
         let mark = p.call_log().mark();
-        let m = RgfxOpFillBufferPattern4 {
+        let m = RgfxBlitOpFillBufferPattern4 {
             buffer_obj_id: 2,
             range_location: 8,
             range_length: 16,
@@ -938,7 +938,7 @@ mod tests {
 
         // generateMipmapsForTexture:
         let mark = p.call_log().mark();
-        let m = RgfxOpGenerateMipmaps { texture_obj_id: 4 };
+        let m = RgfxBlitOpGenerateMipmaps { texture_obj_id: 4 };
         assert!(
             decode_op(
                 RGFX_OP_BLIT_GENERATE_MIPMAPS,
@@ -973,7 +973,7 @@ mod tests {
             ),
         ] {
             let mark = p.call_log().mark();
-            let m = RgfxOpSynchronizeTexture {
+            let m = RgfxBlitOpSynchronizeTexture {
                 texture_obj_id: 4,
                 slice: 1,
                 level: 2,
@@ -1003,7 +1003,7 @@ mod tests {
             ),
         ] {
             let mark = p.call_log().mark();
-            let m = RgfxOpOptimizeForCpu { texture_obj_id: 4 };
+            let m = RgfxBlitOpOptimizeForCpu { texture_obj_id: 4 };
             assert!(decode_op(tag, &body_of(&m), &dec, &enc, OnFault::Return).unwrap());
             let c = p.call_log().since(mark);
             assert_eq!(c[0].sel, sel);
@@ -1022,7 +1022,7 @@ mod tests {
             ),
         ] {
             let mark = p.call_log().mark();
-            let m = RgfxOpResetCommandsInBuffer {
+            let m = RgfxBlitOpResetCommandsInBuffer {
                 icb_obj_id: 7,
                 range_location: 0,
                 range_length: 8,
@@ -1042,7 +1042,7 @@ mod tests {
             (RGFX_OP_BLIT_WAIT_FOR_FENCE, "waitForFence:"),
         ] {
             let mark = p.call_log().mark();
-            let m = RgfxOpUpdateFence { fence_obj_id: 6 };
+            let m = RgfxBlitOpUpdateFence { fence_obj_id: 6 };
             assert!(decode_op(tag, &body_of(&m), &dec, &enc, OnFault::Return).unwrap());
             let c = p.call_log().since(mark);
             assert_eq!(c[0].sel, sel);
@@ -1056,7 +1056,7 @@ mod tests {
     fn fill_texture_color_carries_the_colour() {
         let (p, dec, enc) = setup();
         let mark = p.call_log().mark();
-        let m = RgfxOpFillTextureColor {
+        let m = RgfxBlitOpFillTextureColor {
             texture_obj_id: 4,
             level: 0,
             slice: 0,
@@ -1116,7 +1116,7 @@ mod tests {
         let (p, dec, enc) = setup();
         let mark = p.call_log().mark();
         let fill = [0x11u8, 0x22, 0x33, 0x44];
-        let head = RgfxOpFillTexture {
+        let head = RgfxBlitOpFillTexture {
             texture_obj_id: 4,
             level: 0,
             slice: 0,
@@ -1159,7 +1159,7 @@ mod tests {
             (RGFX_BLIT_RESOURCE_ICB, 7),
         ] {
             let mark = p.call_log().mark();
-            let m = RgfxOpSynchronizeResource {
+            let m = RgfxBlitOpSynchronizeResource {
                 resource_obj_id: obj_id,
                 resource_kind: kind,
                 reserved_0c: 0,
@@ -1181,7 +1181,7 @@ mod tests {
 
         // The nil kind sends a nil resource.
         let mark = p.call_log().mark();
-        let m = RgfxOpSynchronizeResource {
+        let m = RgfxBlitOpSynchronizeResource {
             resource_obj_id: 0,
             resource_kind: RGFX_BLIT_RESOURCE_NIL,
             reserved_0c: 0,
@@ -1200,7 +1200,7 @@ mod tests {
         assert_eq!(c[0].args[0], Arg::Obj(None));
 
         // An unknown kind faults.
-        let m = RgfxOpSynchronizeResource {
+        let m = RgfxBlitOpSynchronizeResource {
             resource_obj_id: 2,
             resource_kind: 99,
             reserved_0c: 0,
@@ -1247,7 +1247,7 @@ mod tests {
         let (p, dec, enc) = setup();
 
         // A required buffer the host does not hold raises.
-        let m = RgfxOpFillBuffer {
+        let m = RgfxBlitOpFillBuffer {
             buffer_obj_id: 999,
             range_location: 0,
             range_length: 8,
@@ -1267,7 +1267,7 @@ mod tests {
 
         // A nil-allowed texture of 0 sends a nil mipmap target, no fault.
         let mark = p.call_log().mark();
-        let m = RgfxOpGenerateMipmaps { texture_obj_id: 0 };
+        let m = RgfxBlitOpGenerateMipmaps { texture_obj_id: 0 };
         assert!(
             decode_op(
                 RGFX_OP_BLIT_GENERATE_MIPMAPS,
@@ -1282,7 +1282,7 @@ mod tests {
         assert_eq!(c[0].args[0], Arg::Obj(None));
 
         // A nil-allowed texture that is non-zero but missing still raises.
-        let m = RgfxOpGenerateMipmaps {
+        let m = RgfxBlitOpGenerateMipmaps {
             texture_obj_id: 999,
         };
         assert!(

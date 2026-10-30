@@ -581,7 +581,7 @@ void test_command_buffer_encoder()
 	enc.beginComputePass();
 	enc.computeSetComputePipelineState(8);
 	enc.computeDispatchThreadgroups(16, 8, 1, 32, 1, 1);
-	rgfx_compute::RgfxComputeBufferBinding cbs[2] = {};
+	RgfxComputeBufferBinding cbs[2] = {};
 	cbs[0].buffer_obj_id = 2;
 	cbs[0].offset = 0;
 	cbs[1].buffer_obj_id = 3;
@@ -721,37 +721,37 @@ void test_command_buffer_encoder()
 		} else if (tag == RGFX_OP_ENCODER_BEGIN_COMPUTE) {
 			CHECK(len == 8 && body_len == 0); // default pass: empty body
 		} else if (tag == RGFX_OP_COMPUTE_DISPATCH_THREADGROUPS) {
-			rgfx_compute::RgfxOpDispatchThreadgroups b;
+			RgfxComputeOpDispatchThreadgroups b;
 			std::memcpy(&b, body, sizeof(b));
 			CHECK(b.threadgroups_width == 16 && b.threadgroups_height == 8);
 			CHECK(b.threads_width == 32 && b.threads_height == 1 && b.threads_depth == 1);
 		} else if (tag == RGFX_OP_COMPUTE_SET_BUFFERS) {
-			CHECK(len == 8 + sizeof(rgfx_compute::RgfxOpSetBuffers) +
-			                 2 * sizeof(rgfx_compute::RgfxComputeBufferBinding));
-			rgfx_compute::RgfxOpSetBuffers head;
+			CHECK(len == 8 + sizeof(RgfxComputeOpSetBuffers) +
+			                 2 * sizeof(RgfxComputeBufferBinding));
+			RgfxComputeOpSetBuffers head;
 			std::memcpy(&head, body, sizeof(head));
 			CHECK(head.location == 0 && head.length == 2);
-			rgfx_compute::RgfxComputeBufferBinding e1;
+			RgfxComputeBufferBinding e1;
 			std::memcpy(&e1, body + sizeof(head) + sizeof(e1), sizeof(e1));
 			CHECK(e1.buffer_obj_id == 3 && e1.offset == 512);
 		} else if (tag == RGFX_OP_COMPUTE_ENCODE_START_ELSE) {
 			CHECK(len == 8 && body_len == 0); // no-body compute op
 		} else if (tag == RGFX_OP_BLIT_COPY_BUFFER_TO_BUFFER) {
-			rgfx_blit::RgfxOpCopyBufferToBuffer b;
+			RgfxBlitOpCopyBufferToBuffer b;
 			std::memcpy(&b, body, sizeof(b));
 			CHECK(b.source_buffer_obj_id == 2 && b.destination_buffer_obj_id == 3);
 			CHECK(b.source_offset == 16 && b.destination_offset == 32 && b.size == 4096);
 		} else if (tag == RGFX_OP_BLIT_FILL_TEXTURE) {
 			// Head then `length` fill bytes at offset 80, padded to a multiple of 8.
 			CHECK(len == 8 + 88); // 80-byte head + 5 fill bytes padded to 88
-			rgfx_blit::RgfxOpFillTexture head;
+			RgfxBlitOpFillTexture head;
 			std::memcpy(&head, body, sizeof(head));
 			CHECK(head.texture_obj_id == 4 && head.length == 5);
 			CHECK(head.region_size_width == 32 && head.region_size_height == 32);
 			const uint8_t expect[5] = { 0xde, 0xad, 0xbe, 0xef, 0x01 };
 			CHECK(std::memcmp(body + RGFX_OP_BLIT_FILL_TEXTURE_BYTES_OFFSET, expect, 5) == 0);
 		} else if (tag == RGFX_OP_BLIT_WAIT_FOR_FENCE) {
-			rgfx_blit::RgfxOpWaitForFence b;
+			RgfxBlitOpWaitForFence b;
 			std::memcpy(&b, body, sizeof(b));
 			CHECK(b.fence_obj_id == 9);
 		}

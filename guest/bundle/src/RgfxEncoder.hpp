@@ -18,15 +18,15 @@
  *   - `finish` fills `op_bytes` and posts via the ring writer.
  *
  * Every wire write goes through a struct type so the layout stays locked. The
- * render-encoder op bodies and the render pass's records are the committed header
- * (`reims_graphics_wire.h`). The compute-only and blit op bodies, and the compute
- * element records, are not emitted into that header (cbindgen reaches only the
- * render-op module), so this file mirrors them from
- * crates/reims-graphics/src/ops/{compute,blit}.rs under the `rgfx_compute` and
- * `rgfx_blit` namespaces — our own code, their layouts pinned by RgfxWireLayout's
- * static_asserts. The names are namespaced because several (`RgfxOpUpdateFence`,
- * `RgfxOpWaitForFence`, `RgfxOpExecuteCommandsInBuffer`, ...) collide with the
- * header's render variants, which differ in their fields.
+ * render-encoder op bodies (`RgfxOp*`), the compute-encoder op bodies
+ * (`RgfxComputeOp*`) and the blit-encoder op bodies (`RgfxBlitOp*`), together with
+ * the pass and element records, all come from the committed header
+ * (`reims_graphics_wire.h`), generated from the crates/reims-graphics/src/ops
+ * modules. The
+ * op structs carry a per-group prefix because several names (`UpdateFence`,
+ * `WaitForFence`, `ExecuteCommandsInBuffer`, ...) recur across the render, compute
+ * and blit groups with different fields, which a flat C namespace cannot hold.
+ * RgfxWireLayout's static_asserts pin every size against the header.
  *
  * This is our own code: it knows nothing of Apple's Metal SPI. The Metal device
  * shell (built later) translates each encoder selector into these plain fields and
@@ -43,389 +43,6 @@
 #include "RgfxObjectModel.hpp"
 #include "RgfxRingWriter.hpp"
 #include "reims_graphics_wire.h"
-
-// The compute-encoder op bodies and element records, mirrored from
-// crates/reims-graphics/src/ops/compute.rs (the committed header does not carry
-// them). Object references are `u64` obj_id (0 = nil); floats travel as their
-// `f32`/`f64` bits. Sizes are locked in RgfxWireLayout.cpp.
-namespace rgfx_compute {
-
-struct RgfxOpSetComputePipelineState {
-	uint64_t pipeline_obj_id;
-};
-struct RgfxOpSetBufferOffset {
-	uint64_t offset;
-	uint64_t index;
-};
-struct RgfxOpSetBufferOffsetAttributeStride {
-	uint64_t offset;
-	uint64_t stride;
-	uint64_t index;
-};
-struct RgfxOpSetBuffers { // head; `length` RgfxComputeBufferBinding follow
-	uint64_t location;
-	uint64_t length;
-};
-struct RgfxComputeBufferBinding {
-	uint64_t buffer_obj_id;
-	uint64_t offset;
-};
-struct RgfxOpSetBuffersAttributeStrides { // head; `length` stride bindings follow
-	uint64_t location;
-	uint64_t length;
-};
-struct RgfxComputeBufferStrideBinding {
-	uint64_t buffer_obj_id;
-	uint64_t offset;
-	uint64_t stride;
-};
-struct RgfxOpSetTexture {
-	uint64_t texture_obj_id;
-	uint64_t index;
-};
-struct RgfxOpSetTextures { // head; `length` RgfxComputeTextureBinding follow
-	uint64_t location;
-	uint64_t length;
-};
-struct RgfxComputeTextureBinding {
-	uint64_t texture_obj_id;
-};
-struct RgfxOpSetSamplerStates { // head; `length` RgfxComputeSamplerBinding follow
-	uint64_t location;
-	uint64_t length;
-};
-struct RgfxComputeSamplerBinding {
-	uint64_t sampler_obj_id;
-};
-struct RgfxOpSetSamplerStatesLodClamps { // head; `length` lod bindings follow
-	uint64_t location;
-	uint64_t length;
-};
-struct RgfxComputeSamplerLodBinding {
-	uint64_t sampler_obj_id;
-	uint32_t lod_min_clamp_bits;
-	uint32_t lod_max_clamp_bits;
-};
-struct RgfxOpSetThreadgroupMemoryLength {
-	uint64_t length;
-	uint64_t index;
-};
-struct RgfxOpSetStageInRegion {
-	uint64_t origin_x;
-	uint64_t origin_y;
-	uint64_t origin_z;
-	uint64_t width;
-	uint64_t height;
-	uint64_t depth;
-};
-struct RgfxOpSetStageInRegionIndirect {
-	uint64_t indirect_buffer_obj_id;
-	uint64_t indirect_buffer_offset;
-};
-struct RgfxOpSetImageblockWidth {
-	uint64_t width;
-	uint64_t height;
-};
-struct RgfxOpDispatchThreadgroups {
-	uint64_t threadgroups_width;
-	uint64_t threadgroups_height;
-	uint64_t threadgroups_depth;
-	uint64_t threads_width;
-	uint64_t threads_height;
-	uint64_t threads_depth;
-};
-struct RgfxOpDispatchThreadgroupsIndirect {
-	uint64_t indirect_buffer_obj_id;
-	uint64_t indirect_buffer_offset;
-	uint64_t threads_width;
-	uint64_t threads_height;
-	uint64_t threads_depth;
-};
-struct RgfxOpDispatchThreads {
-	uint64_t grid_width;
-	uint64_t grid_height;
-	uint64_t grid_depth;
-	uint64_t threads_width;
-	uint64_t threads_height;
-	uint64_t threads_depth;
-};
-struct RgfxOpDispatchThreadsIndirect {
-	uint64_t indirect_buffer_obj_id;
-	uint64_t indirect_buffer_offset;
-};
-struct RgfxOpUseResources { // head; `count` RgfxComputeResourceRef follow
-	uint64_t count;
-	uint64_t usage;
-};
-struct RgfxComputeResourceRef {
-	uint32_t kind; // RGFX_RESOURCE_KIND_*
-	uint32_t reserved_04;
-	uint64_t obj_id;
-};
-struct RgfxOpUseHeaps { // head; `count` RgfxComputeHeapBinding follow
-	uint64_t count;
-};
-struct RgfxComputeHeapBinding {
-	uint64_t heap_obj_id;
-};
-struct RgfxOpMemoryBarrierResources { // head; `count` RgfxComputeResourceRef follow
-	uint64_t count;
-};
-struct RgfxOpMemoryBarrierScope {
-	uint64_t scope;
-};
-struct RgfxOpUpdateFence {
-	uint64_t fence_obj_id;
-};
-struct RgfxOpWaitForFence {
-	uint64_t fence_obj_id;
-};
-struct RgfxOpExecuteCommandsIndirect {
-	uint64_t indirect_commandbuffer_obj_id;
-	uint64_t indirect_range_buffer_obj_id;
-	uint64_t indirect_buffer_offset;
-};
-struct RgfxOpExecuteCommandsInBuffer {
-	uint64_t indirect_command_buffer_obj_id;
-	uint64_t location;
-	uint64_t length;
-};
-struct RgfxOpEncodeStartIf {
-	uint64_t buffer_obj_id;
-	uint64_t offset;
-	uint64_t comparison;
-	uint32_t reference_value;
-	uint32_t reserved_1c;
-};
-struct RgfxOpEncodeStartWhile {
-	uint64_t buffer_obj_id;
-	uint64_t offset;
-	uint64_t comparison;
-	uint32_t reference_value;
-	uint32_t reserved_1c;
-};
-
-} // namespace rgfx_compute
-
-// The blit-encoder op bodies, mirrored from crates/reims-graphics/src/ops/blit.rs
-// (the committed header does not carry them). Sizes locked in RgfxWireLayout.cpp.
-namespace rgfx_blit {
-
-struct RgfxOpCopyBufferToBuffer {
-	uint64_t source_buffer_obj_id;
-	uint64_t destination_buffer_obj_id;
-	uint64_t source_offset;
-	uint64_t destination_offset;
-	uint64_t size;
-};
-struct RgfxOpCopyBufferToTexture {
-	uint64_t source_buffer_obj_id;
-	uint64_t destination_texture_obj_id;
-	uint64_t source_offset;
-	uint64_t source_bytes_per_row;
-	uint64_t source_bytes_per_image;
-	uint64_t source_size_width;
-	uint64_t source_size_height;
-	uint64_t source_size_depth;
-	uint64_t destination_slice;
-	uint64_t destination_level;
-	uint64_t destination_origin_x;
-	uint64_t destination_origin_y;
-	uint64_t destination_origin_z;
-};
-struct RgfxOpCopyBufferToTextureOptions {
-	uint64_t source_buffer_obj_id;
-	uint64_t destination_texture_obj_id;
-	uint64_t source_offset;
-	uint64_t source_bytes_per_row;
-	uint64_t source_bytes_per_image;
-	uint64_t source_size_width;
-	uint64_t source_size_height;
-	uint64_t source_size_depth;
-	uint64_t destination_slice;
-	uint64_t destination_level;
-	uint64_t destination_origin_x;
-	uint64_t destination_origin_y;
-	uint64_t destination_origin_z;
-	uint64_t options;
-};
-struct RgfxOpCopyTextureToBuffer {
-	uint64_t source_texture_obj_id;
-	uint64_t destination_buffer_obj_id;
-	uint64_t source_slice;
-	uint64_t source_level;
-	uint64_t source_origin_x;
-	uint64_t source_origin_y;
-	uint64_t source_origin_z;
-	uint64_t source_size_width;
-	uint64_t source_size_height;
-	uint64_t source_size_depth;
-	uint64_t destination_offset;
-	uint64_t destination_bytes_per_row;
-	uint64_t destination_bytes_per_image;
-};
-struct RgfxOpCopyTextureToBufferOptions {
-	uint64_t source_texture_obj_id;
-	uint64_t destination_buffer_obj_id;
-	uint64_t source_slice;
-	uint64_t source_level;
-	uint64_t source_origin_x;
-	uint64_t source_origin_y;
-	uint64_t source_origin_z;
-	uint64_t source_size_width;
-	uint64_t source_size_height;
-	uint64_t source_size_depth;
-	uint64_t destination_offset;
-	uint64_t destination_bytes_per_row;
-	uint64_t destination_bytes_per_image;
-	uint64_t options;
-};
-struct RgfxOpCopyTextureRegion {
-	uint64_t source_texture_obj_id;
-	uint64_t destination_texture_obj_id;
-	uint64_t source_slice;
-	uint64_t source_level;
-	uint64_t source_origin_x;
-	uint64_t source_origin_y;
-	uint64_t source_origin_z;
-	uint64_t source_size_width;
-	uint64_t source_size_height;
-	uint64_t source_size_depth;
-	uint64_t destination_slice;
-	uint64_t destination_level;
-	uint64_t destination_origin_x;
-	uint64_t destination_origin_y;
-	uint64_t destination_origin_z;
-};
-struct RgfxOpCopyTextureRegionOptions {
-	uint64_t source_texture_obj_id;
-	uint64_t destination_texture_obj_id;
-	uint64_t source_slice;
-	uint64_t source_level;
-	uint64_t source_origin_x;
-	uint64_t source_origin_y;
-	uint64_t source_origin_z;
-	uint64_t source_size_width;
-	uint64_t source_size_height;
-	uint64_t source_size_depth;
-	uint64_t destination_slice;
-	uint64_t destination_level;
-	uint64_t destination_origin_x;
-	uint64_t destination_origin_y;
-	uint64_t destination_origin_z;
-	uint64_t options;
-};
-struct RgfxOpCopyTextureSlices {
-	uint64_t source_texture_obj_id;
-	uint64_t destination_texture_obj_id;
-	uint64_t source_slice;
-	uint64_t source_level;
-	uint64_t destination_slice;
-	uint64_t destination_level;
-	uint64_t slice_count;
-	uint64_t level_count;
-};
-struct RgfxOpCopyIndirectCommandBuffer {
-	uint64_t source_obj_id;
-	uint64_t destination_obj_id;
-	uint64_t source_range_location;
-	uint64_t source_range_length;
-	uint64_t destination_index;
-};
-struct RgfxOpFillBuffer {
-	uint64_t buffer_obj_id;
-	uint64_t range_location;
-	uint64_t range_length;
-	uint8_t value;
-	uint8_t reserved_19[7];
-};
-struct RgfxOpFillBufferPattern4 {
-	uint64_t buffer_obj_id;
-	uint64_t range_location;
-	uint64_t range_length;
-	uint32_t pattern;
-	uint32_t reserved_1c;
-};
-struct RgfxOpFillTexture { // head; `length` fill bytes follow at offset 80
-	uint64_t texture_obj_id;
-	uint64_t level;
-	uint64_t slice;
-	uint64_t region_origin_x;
-	uint64_t region_origin_y;
-	uint64_t region_origin_z;
-	uint64_t region_size_width;
-	uint64_t region_size_height;
-	uint64_t region_size_depth;
-	uint64_t length;
-};
-struct RgfxOpFillTextureColor {
-	uint64_t texture_obj_id;
-	uint64_t level;
-	uint64_t slice;
-	uint64_t region_origin_x;
-	uint64_t region_origin_y;
-	uint64_t region_origin_z;
-	uint64_t region_size_width;
-	uint64_t region_size_height;
-	uint64_t region_size_depth;
-	uint64_t color_bits[4]; // MTLClearColor as four f64 bits (r, g, b, a)
-	uint64_t pixel_format;
-};
-struct RgfxOpGenerateMipmaps {
-	uint64_t texture_obj_id;
-};
-struct RgfxOpInvalidateCompressedTexture {
-	uint64_t texture_obj_id;
-};
-struct RgfxOpInvalidateCompressedTextureSlice {
-	uint64_t texture_obj_id;
-	uint64_t slice;
-	uint64_t level;
-};
-struct RgfxOpOptimizeForCpu {
-	uint64_t texture_obj_id;
-};
-struct RgfxOpOptimizeForCpuSlice {
-	uint64_t texture_obj_id;
-	uint64_t slice;
-	uint64_t level;
-};
-struct RgfxOpOptimizeForGpu {
-	uint64_t texture_obj_id;
-};
-struct RgfxOpOptimizeForGpuSlice {
-	uint64_t texture_obj_id;
-	uint64_t slice;
-	uint64_t level;
-};
-struct RgfxOpOptimizeIndirectCommandBuffer {
-	uint64_t icb_obj_id;
-	uint64_t range_location;
-	uint64_t range_length;
-};
-struct RgfxOpResetCommandsInBuffer {
-	uint64_t icb_obj_id;
-	uint64_t range_location;
-	uint64_t range_length;
-};
-struct RgfxOpSynchronizeResource {
-	uint64_t resource_obj_id;
-	uint32_t resource_kind; // RGFX_BLIT_RESOURCE_*
-	uint32_t reserved_0c;
-};
-struct RgfxOpSynchronizeTexture {
-	uint64_t texture_obj_id;
-	uint64_t slice;
-	uint64_t level;
-};
-struct RgfxOpUpdateFence {
-	uint64_t fence_obj_id;
-};
-struct RgfxOpWaitForFence {
-	uint64_t fence_obj_id;
-};
-
-} // namespace rgfx_blit
 
 /// Builds one `RGFX_CMD_COMMAND_BUFFER` message — its header, then a stream of
 /// encoder ops — and posts it on a queue's submission ring. One encoder is open
@@ -607,19 +224,19 @@ public:
 	void computeSetComputePipelineState(RgfxObjId pipeline);
 	void computeSetBufferOffset(uint64_t offset, uint64_t index);
 	void computeSetBufferOffsetAttributeStride(uint64_t offset, uint64_t stride, uint64_t index);
-	void computeSetBuffers(uint64_t location, const rgfx_compute::RgfxComputeBufferBinding *bindings,
+	void computeSetBuffers(uint64_t location, const RgfxComputeBufferBinding *bindings,
 	                       uint32_t count);
 	void computeSetBuffersAttributeStrides(
-	    uint64_t location, const rgfx_compute::RgfxComputeBufferStrideBinding *bindings,
+	    uint64_t location, const RgfxComputeBufferStrideBinding *bindings,
 	    uint32_t count);
 	void computeSetTexture(RgfxObjId texture, uint64_t index);
 	void computeSetTextures(uint64_t location,
-	                        const rgfx_compute::RgfxComputeTextureBinding *textures, uint32_t count);
+	                        const RgfxComputeTextureBinding *textures, uint32_t count);
 	void computeSetSamplerStates(uint64_t location,
-	                             const rgfx_compute::RgfxComputeSamplerBinding *samplers,
+	                             const RgfxComputeSamplerBinding *samplers,
 	                             uint32_t count);
 	void computeSetSamplerStatesLodClamps(
-	    uint64_t location, const rgfx_compute::RgfxComputeSamplerLodBinding *samplers,
+	    uint64_t location, const RgfxComputeSamplerLodBinding *samplers,
 	    uint32_t count);
 	void computeSetThreadgroupMemoryLength(uint64_t length, uint64_t index);
 	void computeSetStageInRegion(uint64_t origin_x, uint64_t origin_y, uint64_t origin_z,
@@ -637,10 +254,10 @@ public:
 	                            uint64_t threads_width, uint64_t threads_height,
 	                            uint64_t threads_depth);
 	void computeDispatchThreadsIndirect(RgfxObjId indirect_buffer, uint64_t indirect_buffer_offset);
-	void computeUseResources(const rgfx_compute::RgfxComputeResourceRef *resources, uint32_t count,
+	void computeUseResources(const RgfxComputeResourceRef *resources, uint32_t count,
 	                         uint64_t usage);
-	void computeUseHeaps(const rgfx_compute::RgfxComputeHeapBinding *heaps, uint32_t count);
-	void computeMemoryBarrierResources(const rgfx_compute::RgfxComputeResourceRef *resources,
+	void computeUseHeaps(const RgfxComputeHeapBinding *heaps, uint32_t count);
+	void computeMemoryBarrierResources(const RgfxComputeResourceRef *resources,
 	                                   uint32_t count);
 	void computeMemoryBarrierScope(uint64_t scope);
 	void computeUpdateFence(RgfxObjId fence);

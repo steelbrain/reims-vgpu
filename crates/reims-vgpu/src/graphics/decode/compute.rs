@@ -34,17 +34,20 @@ use reims_graphics::ops::compute::{
     RGFX_OP_COMPUTE_USE_HEAPS, RGFX_OP_COMPUTE_USE_RESOURCES, RGFX_OP_COMPUTE_WAIT_FOR_FENCE,
     RGFX_RESOURCE_KIND_BUFFER, RGFX_RESOURCE_KIND_ICB, RGFX_RESOURCE_KIND_NONE,
     RGFX_RESOURCE_KIND_TEXTURE, RgfxComputeBufferBinding, RgfxComputeBufferStrideBinding,
-    RgfxComputeHeapBinding, RgfxComputeResourceRef, RgfxComputeSamplerBinding,
-    RgfxComputeSamplerLodBinding, RgfxComputeTextureBinding, RgfxOpDispatchThreadgroups,
-    RgfxOpDispatchThreadgroupsIndirect, RgfxOpDispatchThreads, RgfxOpDispatchThreadsIndirect,
-    RgfxOpEncodeStartIf, RgfxOpEncodeStartWhile, RgfxOpExecuteCommandsInBuffer,
-    RgfxOpExecuteCommandsIndirect, RgfxOpMemoryBarrierResources, RgfxOpMemoryBarrierScope,
-    RgfxOpSetBufferOffset, RgfxOpSetBufferOffsetAttributeStride, RgfxOpSetBuffers,
-    RgfxOpSetBuffersAttributeStrides, RgfxOpSetComputePipelineState, RgfxOpSetImageblockWidth,
-    RgfxOpSetSamplerStates, RgfxOpSetSamplerStatesLodClamps, RgfxOpSetStageInRegion,
-    RgfxOpSetStageInRegionIndirect, RgfxOpSetTexture, RgfxOpSetTextures,
-    RgfxOpSetThreadgroupMemoryLength, RgfxOpUpdateFence, RgfxOpUseHeaps, RgfxOpUseResources,
-    RgfxOpWaitForFence,
+    RgfxComputeHeapBinding, RgfxComputeOpDispatchThreadgroups,
+    RgfxComputeOpDispatchThreadgroupsIndirect, RgfxComputeOpDispatchThreads,
+    RgfxComputeOpDispatchThreadsIndirect, RgfxComputeOpEncodeStartIf,
+    RgfxComputeOpEncodeStartWhile, RgfxComputeOpExecuteCommandsInBuffer,
+    RgfxComputeOpExecuteCommandsIndirect, RgfxComputeOpMemoryBarrierResources,
+    RgfxComputeOpMemoryBarrierScope, RgfxComputeOpSetBufferOffset,
+    RgfxComputeOpSetBufferOffsetAttributeStride, RgfxComputeOpSetBuffers,
+    RgfxComputeOpSetBuffersAttributeStrides, RgfxComputeOpSetComputePipelineState,
+    RgfxComputeOpSetImageblockWidth, RgfxComputeOpSetSamplerStates,
+    RgfxComputeOpSetSamplerStatesLodClamps, RgfxComputeOpSetStageInRegion,
+    RgfxComputeOpSetStageInRegionIndirect, RgfxComputeOpSetTexture, RgfxComputeOpSetTextures,
+    RgfxComputeOpSetThreadgroupMemoryLength, RgfxComputeOpUpdateFence, RgfxComputeOpUseHeaps,
+    RgfxComputeOpUseResources, RgfxComputeOpWaitForFence, RgfxComputeResourceRef,
+    RgfxComputeSamplerBinding, RgfxComputeSamplerLodBinding, RgfxComputeTextureBinding,
 };
 use reims_vgpu_core::platform::Platform;
 use reims_vgpu_core::platform::blit::ResourceRef;
@@ -157,7 +160,7 @@ pub(crate) fn decode_op<P: Platform>(
 ) -> RaiseResult<bool> {
     match tag {
         RGFX_OP_COMPUTE_SET_COMPUTE_PIPELINE_STATE => {
-            let m: RgfxOpSetComputePipelineState = body(tag, payload)?;
+            let m: RgfxComputeOpSetComputePipelineState = body(tag, payload)?;
             let state = objs.get_compute_pipeline(m.pipeline_obj_id)?;
             enc.encode(
                 on,
@@ -167,7 +170,7 @@ pub(crate) fn decode_op<P: Platform>(
             )?;
         }
         RGFX_OP_COMPUTE_SET_BUFFER_OFFSET => {
-            let m: RgfxOpSetBufferOffset = body(tag, payload)?;
+            let m: RgfxComputeOpSetBufferOffset = body(tag, payload)?;
             enc.encode(
                 on,
                 ComputeCmd::SetBufferOffset {
@@ -177,7 +180,7 @@ pub(crate) fn decode_op<P: Platform>(
             )?;
         }
         RGFX_OP_COMPUTE_SET_BUFFER_OFFSET_ATTRIBUTE_STRIDE => {
-            let m: RgfxOpSetBufferOffsetAttributeStride = body(tag, payload)?;
+            let m: RgfxComputeOpSetBufferOffsetAttributeStride = body(tag, payload)?;
             enc.encode(
                 on,
                 ComputeCmd::SetBufferOffsetAttributeStride {
@@ -188,11 +191,11 @@ pub(crate) fn decode_op<P: Platform>(
             )?;
         }
         RGFX_OP_COMPUTE_SET_BUFFERS => {
-            let m: RgfxOpSetBuffers = body(tag, payload)?;
+            let m: RgfxComputeOpSetBuffers = body(tag, payload)?;
             let recs: Vec<RgfxComputeBufferBinding> = tail(
                 tag,
                 payload,
-                size_of::<RgfxOpSetBuffers>(),
+                size_of::<RgfxComputeOpSetBuffers>(),
                 m.length as usize,
             )?;
             let owned: Vec<Option<P::Buffer>> = recs
@@ -211,11 +214,11 @@ pub(crate) fn decode_op<P: Platform>(
             )?;
         }
         RGFX_OP_COMPUTE_SET_BUFFERS_ATTRIBUTE_STRIDES => {
-            let m: RgfxOpSetBuffersAttributeStrides = body(tag, payload)?;
+            let m: RgfxComputeOpSetBuffersAttributeStrides = body(tag, payload)?;
             let recs: Vec<RgfxComputeBufferStrideBinding> = tail(
                 tag,
                 payload,
-                size_of::<RgfxOpSetBuffersAttributeStrides>(),
+                size_of::<RgfxComputeOpSetBuffersAttributeStrides>(),
                 m.length as usize,
             )?;
             let owned: Vec<Option<P::Buffer>> = recs
@@ -236,7 +239,7 @@ pub(crate) fn decode_op<P: Platform>(
             )?;
         }
         RGFX_OP_COMPUTE_SET_TEXTURE => {
-            let m: RgfxOpSetTexture = body(tag, payload)?;
+            let m: RgfxComputeOpSetTexture = body(tag, payload)?;
             let texture = objs.get_texture(m.texture_obj_id)?;
             enc.encode(
                 on,
@@ -247,11 +250,11 @@ pub(crate) fn decode_op<P: Platform>(
             )?;
         }
         RGFX_OP_COMPUTE_SET_TEXTURES => {
-            let m: RgfxOpSetTextures = body(tag, payload)?;
+            let m: RgfxComputeOpSetTextures = body(tag, payload)?;
             let recs: Vec<RgfxComputeTextureBinding> = tail(
                 tag,
                 payload,
-                size_of::<RgfxOpSetTextures>(),
+                size_of::<RgfxComputeOpSetTextures>(),
                 m.length as usize,
             )?;
             let owned: Vec<Option<P::Texture>> = recs
@@ -268,11 +271,11 @@ pub(crate) fn decode_op<P: Platform>(
             )?;
         }
         RGFX_OP_COMPUTE_SET_SAMPLER_STATES => {
-            let m: RgfxOpSetSamplerStates = body(tag, payload)?;
+            let m: RgfxComputeOpSetSamplerStates = body(tag, payload)?;
             let recs: Vec<RgfxComputeSamplerBinding> = tail(
                 tag,
                 payload,
-                size_of::<RgfxOpSetSamplerStates>(),
+                size_of::<RgfxComputeOpSetSamplerStates>(),
                 m.length as usize,
             )?;
             let owned: Vec<Option<P::SamplerState>> = recs
@@ -290,11 +293,11 @@ pub(crate) fn decode_op<P: Platform>(
             )?;
         }
         RGFX_OP_COMPUTE_SET_SAMPLER_STATES_LOD_CLAMPS => {
-            let m: RgfxOpSetSamplerStatesLodClamps = body(tag, payload)?;
+            let m: RgfxComputeOpSetSamplerStatesLodClamps = body(tag, payload)?;
             let recs: Vec<RgfxComputeSamplerLodBinding> = tail(
                 tag,
                 payload,
-                size_of::<RgfxOpSetSamplerStatesLodClamps>(),
+                size_of::<RgfxComputeOpSetSamplerStatesLodClamps>(),
                 m.length as usize,
             )?;
             let owned: Vec<Option<P::SamplerState>> = recs
@@ -322,7 +325,7 @@ pub(crate) fn decode_op<P: Platform>(
             )?;
         }
         RGFX_OP_COMPUTE_SET_THREADGROUP_MEMORY_LENGTH => {
-            let m: RgfxOpSetThreadgroupMemoryLength = body(tag, payload)?;
+            let m: RgfxComputeOpSetThreadgroupMemoryLength = body(tag, payload)?;
             enc.encode(
                 on,
                 ComputeCmd::SetThreadgroupMemoryLength {
@@ -332,7 +335,7 @@ pub(crate) fn decode_op<P: Platform>(
             )?;
         }
         RGFX_OP_COMPUTE_SET_STAGE_IN_REGION => {
-            let m: RgfxOpSetStageInRegion = body(tag, payload)?;
+            let m: RgfxComputeOpSetStageInRegion = body(tag, payload)?;
             enc.encode(
                 on,
                 ComputeCmd::SetStageInRegion {
@@ -344,7 +347,7 @@ pub(crate) fn decode_op<P: Platform>(
             )?;
         }
         RGFX_OP_COMPUTE_SET_STAGE_IN_REGION_INDIRECT => {
-            let m: RgfxOpSetStageInRegionIndirect = body(tag, payload)?;
+            let m: RgfxComputeOpSetStageInRegionIndirect = body(tag, payload)?;
             // The indirect buffer must name an object (nil faults the stream).
             let indirect_buffer = objs.require_buffer(m.indirect_buffer_obj_id)?;
             enc.encode(
@@ -356,7 +359,7 @@ pub(crate) fn decode_op<P: Platform>(
             )?;
         }
         RGFX_OP_COMPUTE_SET_IMAGEBLOCK_WIDTH => {
-            let m: RgfxOpSetImageblockWidth = body(tag, payload)?;
+            let m: RgfxComputeOpSetImageblockWidth = body(tag, payload)?;
             enc.encode(
                 on,
                 ComputeCmd::SetImageblockWidth {
@@ -366,7 +369,7 @@ pub(crate) fn decode_op<P: Platform>(
             )?;
         }
         RGFX_OP_COMPUTE_DISPATCH_THREADGROUPS => {
-            let m: RgfxOpDispatchThreadgroups = body(tag, payload)?;
+            let m: RgfxComputeOpDispatchThreadgroups = body(tag, payload)?;
             enc.encode(
                 on,
                 ComputeCmd::DispatchThreadgroups {
@@ -384,7 +387,7 @@ pub(crate) fn decode_op<P: Platform>(
             )?;
         }
         RGFX_OP_COMPUTE_DISPATCH_THREADGROUPS_INDIRECT => {
-            let m: RgfxOpDispatchThreadgroupsIndirect = body(tag, payload)?;
+            let m: RgfxComputeOpDispatchThreadgroupsIndirect = body(tag, payload)?;
             let indirect_buffer = objs.get_buffer(m.indirect_buffer_obj_id)?;
             enc.encode(
                 on,
@@ -400,7 +403,7 @@ pub(crate) fn decode_op<P: Platform>(
             )?;
         }
         RGFX_OP_COMPUTE_DISPATCH_THREADS => {
-            let m: RgfxOpDispatchThreads = body(tag, payload)?;
+            let m: RgfxComputeOpDispatchThreads = body(tag, payload)?;
             enc.encode(
                 on,
                 ComputeCmd::DispatchThreads {
@@ -414,7 +417,7 @@ pub(crate) fn decode_op<P: Platform>(
             )?;
         }
         RGFX_OP_COMPUTE_DISPATCH_THREADS_INDIRECT => {
-            let m: RgfxOpDispatchThreadsIndirect = body(tag, payload)?;
+            let m: RgfxComputeOpDispatchThreadsIndirect = body(tag, payload)?;
             let indirect_buffer = objs.get_buffer(m.indirect_buffer_obj_id)?;
             enc.encode(
                 on,
@@ -425,11 +428,11 @@ pub(crate) fn decode_op<P: Platform>(
             )?;
         }
         RGFX_OP_COMPUTE_USE_RESOURCES => {
-            let m: RgfxOpUseResources = body(tag, payload)?;
+            let m: RgfxComputeOpUseResources = body(tag, payload)?;
             let recs: Vec<RgfxComputeResourceRef> = tail(
                 tag,
                 payload,
-                size_of::<RgfxOpUseResources>(),
+                size_of::<RgfxComputeOpUseResources>(),
                 m.count as usize,
             )?;
             let owned = resolve_resources(objs, &recs)?;
@@ -446,9 +449,13 @@ pub(crate) fn decode_op<P: Platform>(
             )?;
         }
         RGFX_OP_COMPUTE_USE_HEAPS => {
-            let m: RgfxOpUseHeaps = body(tag, payload)?;
-            let recs: Vec<RgfxComputeHeapBinding> =
-                tail(tag, payload, size_of::<RgfxOpUseHeaps>(), m.count as usize)?;
+            let m: RgfxComputeOpUseHeaps = body(tag, payload)?;
+            let recs: Vec<RgfxComputeHeapBinding> = tail(
+                tag,
+                payload,
+                size_of::<RgfxComputeOpUseHeaps>(),
+                m.count as usize,
+            )?;
             let owned: Vec<Option<P::Heap>> = recs
                 .iter()
                 .map(|r| objs.get_heap(r.heap_obj_id))
@@ -457,11 +464,11 @@ pub(crate) fn decode_op<P: Platform>(
             enc.encode(on, ComputeCmd::UseHeaps { heaps: &heaps })?;
         }
         RGFX_OP_COMPUTE_MEMORY_BARRIER_RESOURCES => {
-            let m: RgfxOpMemoryBarrierResources = body(tag, payload)?;
+            let m: RgfxComputeOpMemoryBarrierResources = body(tag, payload)?;
             let recs: Vec<RgfxComputeResourceRef> = tail(
                 tag,
                 payload,
-                size_of::<RgfxOpMemoryBarrierResources>(),
+                size_of::<RgfxComputeOpMemoryBarrierResources>(),
                 m.count as usize,
             )?;
             let owned = resolve_resources(objs, &recs)?;
@@ -477,23 +484,23 @@ pub(crate) fn decode_op<P: Platform>(
             )?;
         }
         RGFX_OP_COMPUTE_MEMORY_BARRIER_SCOPE => {
-            let m: RgfxOpMemoryBarrierScope = body(tag, payload)?;
+            let m: RgfxComputeOpMemoryBarrierScope = body(tag, payload)?;
             enc.encode(on, ComputeCmd::MemoryBarrierWithScope { scope: m.scope })?;
         }
         RGFX_OP_COMPUTE_UPDATE_FENCE => {
-            let m: RgfxOpUpdateFence = body(tag, payload)?;
+            let m: RgfxComputeOpUpdateFence = body(tag, payload)?;
             // The fence must name an object (nil faults the stream).
             let fence = objs.require_fence(m.fence_obj_id)?;
             enc.encode(on, ComputeCmd::UpdateFence { fence: &fence })?;
         }
         RGFX_OP_COMPUTE_WAIT_FOR_FENCE => {
-            let m: RgfxOpWaitForFence = body(tag, payload)?;
+            let m: RgfxComputeOpWaitForFence = body(tag, payload)?;
             // The fence must name an object (nil faults the stream).
             let fence = objs.require_fence(m.fence_obj_id)?;
             enc.encode(on, ComputeCmd::WaitForFence { fence: &fence })?;
         }
         RGFX_OP_COMPUTE_EXECUTE_COMMANDS_INDIRECT => {
-            let m: RgfxOpExecuteCommandsIndirect = body(tag, payload)?;
+            let m: RgfxComputeOpExecuteCommandsIndirect = body(tag, payload)?;
             // Both the ICB and the range buffer must name an object.
             let icb = objs.require_indirect_command_buffer(m.indirect_commandbuffer_obj_id)?;
             let range_buffer = objs.require_buffer(m.indirect_range_buffer_obj_id)?;
@@ -507,7 +514,7 @@ pub(crate) fn decode_op<P: Platform>(
             )?;
         }
         RGFX_OP_COMPUTE_EXECUTE_COMMANDS_IN_BUFFER => {
-            let m: RgfxOpExecuteCommandsInBuffer = body(tag, payload)?;
+            let m: RgfxComputeOpExecuteCommandsInBuffer = body(tag, payload)?;
             // The ICB must name an object.
             let icb = objs.require_indirect_command_buffer(m.indirect_command_buffer_obj_id)?;
             enc.encode(
@@ -519,7 +526,7 @@ pub(crate) fn decode_op<P: Platform>(
             )?;
         }
         RGFX_OP_COMPUTE_ENCODE_START_IF => {
-            let m: RgfxOpEncodeStartIf = body(tag, payload)?;
+            let m: RgfxComputeOpEncodeStartIf = body(tag, payload)?;
             let buffer = objs.get_buffer(m.buffer_obj_id)?;
             enc.encode(
                 on,
@@ -532,7 +539,7 @@ pub(crate) fn decode_op<P: Platform>(
             )?;
         }
         RGFX_OP_COMPUTE_ENCODE_START_WHILE => {
-            let m: RgfxOpEncodeStartWhile = body(tag, payload)?;
+            let m: RgfxComputeOpEncodeStartWhile = body(tag, payload)?;
             let buffer = objs.get_buffer(m.buffer_obj_id)?;
             enc.encode(
                 on,
@@ -680,7 +687,7 @@ mod tests {
             &dec,
             &enc,
             RGFX_OP_COMPUTE_SET_BUFFER_OFFSET,
-            RgfxOpSetBufferOffset {
+            RgfxComputeOpSetBufferOffset {
                 offset: 128,
                 index: 2,
             }
@@ -690,7 +697,7 @@ mod tests {
             &dec,
             &enc,
             RGFX_OP_COMPUTE_DISPATCH_THREADGROUPS,
-            RgfxOpDispatchThreadgroups {
+            RgfxComputeOpDispatchThreadgroups {
                 threadgroups_width: 16,
                 threadgroups_height: 8,
                 threadgroups_depth: 1,
@@ -704,7 +711,7 @@ mod tests {
             &dec,
             &enc,
             RGFX_OP_COMPUTE_SET_STAGE_IN_REGION,
-            RgfxOpSetStageInRegion {
+            RgfxComputeOpSetStageInRegion {
                 origin_x: 0,
                 origin_y: 0,
                 origin_z: 0,
@@ -718,7 +725,7 @@ mod tests {
             &dec,
             &enc,
             RGFX_OP_COMPUTE_MEMORY_BARRIER_SCOPE,
-            RgfxOpMemoryBarrierScope { scope: 3 }.as_bytes(),
+            RgfxComputeOpMemoryBarrierScope { scope: 3 }.as_bytes(),
         );
         drive(&dec, &enc, RGFX_OP_COMPUTE_ENCODE_START_ELSE, &[]);
 
@@ -757,7 +764,7 @@ mod tests {
             &dec,
             &enc,
             RGFX_OP_COMPUTE_SET_TEXTURE,
-            RgfxOpSetTexture {
+            RgfxComputeOpSetTexture {
                 texture_obj_id: 4,
                 index: 1,
             }
@@ -778,7 +785,7 @@ mod tests {
             &dec,
             &enc,
             RGFX_OP_COMPUTE_UPDATE_FENCE,
-            RgfxOpUpdateFence { fence_obj_id: 5 }.as_bytes(),
+            RgfxComputeOpUpdateFence { fence_obj_id: 5 }.as_bytes(),
         );
         let want = Arg::Obj(Some(dec.require_fence(5).unwrap().id()));
         assert_eq!(p.call_log().calls_to("updateFence:")[0].args, vec![want]);
@@ -789,7 +796,7 @@ mod tests {
     #[test]
     fn set_buffers_decodes_its_tail() {
         let (p, dec, enc) = setup();
-        let mut msg = RgfxOpSetBuffers {
+        let mut msg = RgfxComputeOpSetBuffers {
             location: 3,
             length: 3,
         }
@@ -825,7 +832,7 @@ mod tests {
     #[test]
     fn sampler_lod_clamps_decode() {
         let (p, dec, enc) = setup();
-        let mut msg = RgfxOpSetSamplerStatesLodClamps {
+        let mut msg = RgfxComputeOpSetSamplerStatesLodClamps {
             location: 0,
             length: 1,
         }
@@ -865,7 +872,7 @@ mod tests {
     #[test]
     fn use_resources_decodes_mixed_kinds() {
         let (p, dec, enc) = setup();
-        let mut msg = RgfxOpUseResources { count: 3, usage: 1 }
+        let mut msg = RgfxComputeOpUseResources { count: 3, usage: 1 }
             .as_bytes()
             .to_vec();
         for (kind, obj_id) in [
@@ -912,7 +919,7 @@ mod tests {
     fn a_short_tail_faults() {
         let (_p, dec, enc) = setup();
         // Claims three bindings but carries none.
-        let msg = RgfxOpSetBuffers {
+        let msg = RgfxComputeOpSetBuffers {
             location: 0,
             length: 3,
         }
@@ -936,7 +943,7 @@ mod tests {
         // A fence the host never made.
         let r = decode_op(
             RGFX_OP_COMPUTE_UPDATE_FENCE,
-            RgfxOpUpdateFence { fence_obj_id: 999 }.as_bytes(),
+            RgfxComputeOpUpdateFence { fence_obj_id: 999 }.as_bytes(),
             &dec,
             &enc,
             OnFault::Return,
@@ -945,7 +952,7 @@ mod tests {
         // A nil required indirect buffer for the stage-in region.
         let r = decode_op(
             RGFX_OP_COMPUTE_SET_STAGE_IN_REGION_INDIRECT,
-            RgfxOpSetStageInRegionIndirect {
+            RgfxComputeOpSetStageInRegionIndirect {
                 indirect_buffer_obj_id: 0,
                 indirect_buffer_offset: 0,
             }
@@ -961,7 +968,7 @@ mod tests {
     #[test]
     fn an_unknown_resource_kind_faults() {
         let (_p, dec, enc) = setup();
-        let mut msg = RgfxOpUseResources { count: 1, usage: 0 }
+        let mut msg = RgfxComputeOpUseResources { count: 1, usage: 0 }
             .as_bytes()
             .to_vec();
         msg.extend_from_slice(
@@ -998,19 +1005,19 @@ mod tests {
             &dec,
             &enc,
             RGFX_OP_COMPUTE_USE_HEAPS,
-            RgfxOpUseHeaps { count: 0 }.as_bytes(),
+            RgfxComputeOpUseHeaps { count: 0 }.as_bytes(),
         );
         drive(
             &dec,
             &enc,
             RGFX_OP_COMPUTE_MEMORY_BARRIER_RESOURCES,
-            RgfxOpMemoryBarrierResources { count: 0 }.as_bytes(),
+            RgfxComputeOpMemoryBarrierResources { count: 0 }.as_bytes(),
         );
         drive(
             &dec,
             &enc,
             RGFX_OP_COMPUTE_SET_TEXTURES,
-            RgfxOpSetTextures {
+            RgfxComputeOpSetTextures {
                 location: 0,
                 length: 0,
             }

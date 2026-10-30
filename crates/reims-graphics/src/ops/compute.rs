@@ -25,96 +25,82 @@
 
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
-/// The standard derives every op body and element record carries.
-macro_rules! op_body {
-    ($(#[$m:meta])* $name:ident { $($(#[$fm:meta])* $f:ident : $t:ty),* $(,)? }) => {
-        $(#[$m])*
-        #[repr(C)]
-        #[derive(
-            Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
-        )]
-        pub struct $name {
-            $($(#[$fm])* pub $f : $t),*
-        }
-    };
-}
-
 // The op tags, in the compute group's `0x2xxx` range.
 
-/// Op `SET_COMPUTE_PIPELINE_STATE` ([`RgfxOpSetComputePipelineState`]):
+/// Op `SET_COMPUTE_PIPELINE_STATE` ([`RgfxComputeOpSetComputePipelineState`]):
 /// `setComputePipelineState:`.
 pub const RGFX_OP_COMPUTE_SET_COMPUTE_PIPELINE_STATE: u16 = 0x2000;
-/// Op `SET_BUFFER_OFFSET` ([`RgfxOpSetBufferOffset`]): `setBufferOffset:atIndex:`.
+/// Op `SET_BUFFER_OFFSET` ([`RgfxComputeOpSetBufferOffset`]): `setBufferOffset:atIndex:`.
 pub const RGFX_OP_COMPUTE_SET_BUFFER_OFFSET: u16 = 0x2001;
-/// Op `SET_BUFFER_OFFSET_ATTRIBUTE_STRIDE` ([`RgfxOpSetBufferOffsetAttributeStride`]):
+/// Op `SET_BUFFER_OFFSET_ATTRIBUTE_STRIDE` ([`RgfxComputeOpSetBufferOffsetAttributeStride`]):
 /// `setBufferOffset:attributeStride:atIndex:`.
 pub const RGFX_OP_COMPUTE_SET_BUFFER_OFFSET_ATTRIBUTE_STRIDE: u16 = 0x2002;
-/// Op `SET_BUFFERS` ([`RgfxOpSetBuffers`] then [`RgfxComputeBufferBinding`] records):
+/// Op `SET_BUFFERS` ([`RgfxComputeOpSetBuffers`] then [`RgfxComputeBufferBinding`] records):
 /// `setBuffers:offsets:withRange:`.
 pub const RGFX_OP_COMPUTE_SET_BUFFERS: u16 = 0x2003;
-/// Op `SET_BUFFERS_ATTRIBUTE_STRIDES` ([`RgfxOpSetBuffersAttributeStrides`] then
+/// Op `SET_BUFFERS_ATTRIBUTE_STRIDES` ([`RgfxComputeOpSetBuffersAttributeStrides`] then
 /// [`RgfxComputeBufferStrideBinding`] records):
 /// `setBuffers:offsets:attributeStrides:withRange:`.
 pub const RGFX_OP_COMPUTE_SET_BUFFERS_ATTRIBUTE_STRIDES: u16 = 0x2004;
-/// Op `SET_TEXTURE` ([`RgfxOpSetTexture`]): `setTexture:atIndex:`.
+/// Op `SET_TEXTURE` ([`RgfxComputeOpSetTexture`]): `setTexture:atIndex:`.
 pub const RGFX_OP_COMPUTE_SET_TEXTURE: u16 = 0x2005;
-/// Op `SET_TEXTURES` ([`RgfxOpSetTextures`] then [`RgfxComputeTextureBinding`] records):
+/// Op `SET_TEXTURES` ([`RgfxComputeOpSetTextures`] then [`RgfxComputeTextureBinding`] records):
 /// `setTextures:withRange:`.
 pub const RGFX_OP_COMPUTE_SET_TEXTURES: u16 = 0x2006;
-/// Op `SET_SAMPLER_STATES` ([`RgfxOpSetSamplerStates`] then
+/// Op `SET_SAMPLER_STATES` ([`RgfxComputeOpSetSamplerStates`] then
 /// [`RgfxComputeSamplerBinding`] records): `setSamplerStates:withRange:`.
 pub const RGFX_OP_COMPUTE_SET_SAMPLER_STATES: u16 = 0x2007;
-/// Op `SET_SAMPLER_STATES_LOD_CLAMPS` ([`RgfxOpSetSamplerStatesLodClamps`] then
+/// Op `SET_SAMPLER_STATES_LOD_CLAMPS` ([`RgfxComputeOpSetSamplerStatesLodClamps`] then
 /// [`RgfxComputeSamplerLodBinding`] records):
 /// `setSamplerStates:lodMinClamps:lodMaxClamps:withRange:`.
 pub const RGFX_OP_COMPUTE_SET_SAMPLER_STATES_LOD_CLAMPS: u16 = 0x2008;
-/// Op `SET_THREADGROUP_MEMORY_LENGTH` ([`RgfxOpSetThreadgroupMemoryLength`]):
+/// Op `SET_THREADGROUP_MEMORY_LENGTH` ([`RgfxComputeOpSetThreadgroupMemoryLength`]):
 /// `setThreadgroupMemoryLength:atIndex:`.
 pub const RGFX_OP_COMPUTE_SET_THREADGROUP_MEMORY_LENGTH: u16 = 0x2009;
-/// Op `SET_STAGE_IN_REGION` ([`RgfxOpSetStageInRegion`]): `setStageInRegion:`.
+/// Op `SET_STAGE_IN_REGION` ([`RgfxComputeOpSetStageInRegion`]): `setStageInRegion:`.
 pub const RGFX_OP_COMPUTE_SET_STAGE_IN_REGION: u16 = 0x200a;
-/// Op `SET_STAGE_IN_REGION_INDIRECT` ([`RgfxOpSetStageInRegionIndirect`]):
+/// Op `SET_STAGE_IN_REGION_INDIRECT` ([`RgfxComputeOpSetStageInRegionIndirect`]):
 /// `setStageInRegionWithIndirectBuffer:indirectBufferOffset:`.
 pub const RGFX_OP_COMPUTE_SET_STAGE_IN_REGION_INDIRECT: u16 = 0x200b;
-/// Op `SET_IMAGEBLOCK_WIDTH` ([`RgfxOpSetImageblockWidth`]): `setImageblockWidth:height:`.
+/// Op `SET_IMAGEBLOCK_WIDTH` ([`RgfxComputeOpSetImageblockWidth`]): `setImageblockWidth:height:`.
 pub const RGFX_OP_COMPUTE_SET_IMAGEBLOCK_WIDTH: u16 = 0x200c;
-/// Op `DISPATCH_THREADGROUPS` ([`RgfxOpDispatchThreadgroups`]):
+/// Op `DISPATCH_THREADGROUPS` ([`RgfxComputeOpDispatchThreadgroups`]):
 /// `dispatchThreadgroups:threadsPerThreadgroup:`.
 pub const RGFX_OP_COMPUTE_DISPATCH_THREADGROUPS: u16 = 0x200d;
-/// Op `DISPATCH_THREADGROUPS_INDIRECT` ([`RgfxOpDispatchThreadgroupsIndirect`]):
+/// Op `DISPATCH_THREADGROUPS_INDIRECT` ([`RgfxComputeOpDispatchThreadgroupsIndirect`]):
 /// `dispatchThreadgroupsWithIndirectBuffer:indirectBufferOffset:threadsPerThreadgroup:`.
 pub const RGFX_OP_COMPUTE_DISPATCH_THREADGROUPS_INDIRECT: u16 = 0x200e;
-/// Op `DISPATCH_THREADS` ([`RgfxOpDispatchThreads`]):
+/// Op `DISPATCH_THREADS` ([`RgfxComputeOpDispatchThreads`]):
 /// `dispatchThreads:threadsPerThreadgroup:`.
 pub const RGFX_OP_COMPUTE_DISPATCH_THREADS: u16 = 0x200f;
-/// Op `DISPATCH_THREADS_INDIRECT` ([`RgfxOpDispatchThreadsIndirect`]):
+/// Op `DISPATCH_THREADS_INDIRECT` ([`RgfxComputeOpDispatchThreadsIndirect`]):
 /// `dispatchThreadsWithIndirectBuffer:indirectBufferOffset:`.
 pub const RGFX_OP_COMPUTE_DISPATCH_THREADS_INDIRECT: u16 = 0x2010;
-/// Op `USE_RESOURCES` ([`RgfxOpUseResources`] then [`RgfxComputeResourceRef`] records):
+/// Op `USE_RESOURCES` ([`RgfxComputeOpUseResources`] then [`RgfxComputeResourceRef`] records):
 /// `useResources:count:usage:`.
 pub const RGFX_OP_COMPUTE_USE_RESOURCES: u16 = 0x2011;
-/// Op `USE_HEAPS` ([`RgfxOpUseHeaps`] then [`RgfxComputeHeapBinding`] records):
+/// Op `USE_HEAPS` ([`RgfxComputeOpUseHeaps`] then [`RgfxComputeHeapBinding`] records):
 /// `useHeaps:count:`.
 pub const RGFX_OP_COMPUTE_USE_HEAPS: u16 = 0x2012;
-/// Op `MEMORY_BARRIER_RESOURCES` ([`RgfxOpMemoryBarrierResources`] then
+/// Op `MEMORY_BARRIER_RESOURCES` ([`RgfxComputeOpMemoryBarrierResources`] then
 /// [`RgfxComputeResourceRef`] records): `memoryBarrierWithResources:count:`.
 pub const RGFX_OP_COMPUTE_MEMORY_BARRIER_RESOURCES: u16 = 0x2013;
-/// Op `MEMORY_BARRIER_SCOPE` ([`RgfxOpMemoryBarrierScope`]): `memoryBarrierWithScope:`.
+/// Op `MEMORY_BARRIER_SCOPE` ([`RgfxComputeOpMemoryBarrierScope`]): `memoryBarrierWithScope:`.
 pub const RGFX_OP_COMPUTE_MEMORY_BARRIER_SCOPE: u16 = 0x2014;
-/// Op `UPDATE_FENCE` ([`RgfxOpUpdateFence`]): `updateFence:`.
+/// Op `UPDATE_FENCE` ([`RgfxComputeOpUpdateFence`]): `updateFence:`.
 pub const RGFX_OP_COMPUTE_UPDATE_FENCE: u16 = 0x2015;
-/// Op `WAIT_FOR_FENCE` ([`RgfxOpWaitForFence`]): `waitForFence:`.
+/// Op `WAIT_FOR_FENCE` ([`RgfxComputeOpWaitForFence`]): `waitForFence:`.
 pub const RGFX_OP_COMPUTE_WAIT_FOR_FENCE: u16 = 0x2016;
-/// Op `EXECUTE_COMMANDS_INDIRECT` ([`RgfxOpExecuteCommandsIndirect`]):
+/// Op `EXECUTE_COMMANDS_INDIRECT` ([`RgfxComputeOpExecuteCommandsIndirect`]):
 /// `executeCommandsInBuffer:indirectBuffer:indirectBufferOffset:`.
 pub const RGFX_OP_COMPUTE_EXECUTE_COMMANDS_INDIRECT: u16 = 0x2017;
-/// Op `EXECUTE_COMMANDS_IN_BUFFER` ([`RgfxOpExecuteCommandsInBuffer`]):
+/// Op `EXECUTE_COMMANDS_IN_BUFFER` ([`RgfxComputeOpExecuteCommandsInBuffer`]):
 /// `executeCommandsInBuffer:withRange:`.
 pub const RGFX_OP_COMPUTE_EXECUTE_COMMANDS_IN_BUFFER: u16 = 0x2018;
-/// Op `ENCODE_START_IF` ([`RgfxOpEncodeStartIf`]):
+/// Op `ENCODE_START_IF` ([`RgfxComputeOpEncodeStartIf`]):
 /// `encodeStartIf:offset:comparison:referenceValue:` (SPI).
 pub const RGFX_OP_COMPUTE_ENCODE_START_IF: u16 = 0x2019;
-/// Op `ENCODE_START_WHILE` ([`RgfxOpEncodeStartWhile`]):
+/// Op `ENCODE_START_WHILE` ([`RgfxComputeOpEncodeStartWhile`]):
 /// `encodeStartWhile:offset:comparison:referenceValue:` (SPI).
 pub const RGFX_OP_COMPUTE_ENCODE_START_WHILE: u16 = 0x201a;
 /// Op `ENCODE_START_ELSE`: `encodeStartElse` (SPI). No body.
@@ -137,438 +123,506 @@ pub use super::{
     RGFX_RESOURCE_KIND_TEXTURE,
 };
 
-op_body! {
-    /// `setComputePipelineState:`. The pipeline may be nil (`0`).
-    RgfxOpSetComputePipelineState {
-        /// The compute pipeline state, or 0 for nil.
-        pipeline_obj_id: u64,
-    }
+/// `setComputePipelineState:`. The pipeline may be nil (`0`).
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxComputeOpSetComputePipelineState {
+    /// The compute pipeline state, or 0 for nil.
+    pub pipeline_obj_id: u64,
 }
 
-op_body! {
-    /// `setBufferOffset:atIndex:`.
-    RgfxOpSetBufferOffset {
-        /// The new offset into the bound buffer.
-        offset: u64,
-        /// The buffer binding index.
-        index: u64,
-    }
+/// `setBufferOffset:atIndex:`.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxComputeOpSetBufferOffset {
+    /// The new offset into the bound buffer.
+    pub offset: u64,
+    /// The buffer binding index.
+    pub index: u64,
 }
 
-op_body! {
-    /// `setBufferOffset:attributeStride:atIndex:`.
-    RgfxOpSetBufferOffsetAttributeStride {
-        /// The new offset into the bound buffer.
-        offset: u64,
-        /// The attribute stride.
-        stride: u64,
-        /// The buffer binding index.
-        index: u64,
-    }
+/// `setBufferOffset:attributeStride:atIndex:`.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxComputeOpSetBufferOffsetAttributeStride {
+    /// The new offset into the bound buffer.
+    pub offset: u64,
+    /// The attribute stride.
+    pub stride: u64,
+    /// The buffer binding index.
+    pub index: u64,
 }
 
-op_body! {
-    /// `setBuffers:offsets:withRange:` head. `length` [`RgfxComputeBufferBinding`]
-    /// records follow at [`size_of`](core::mem::size_of)`::<RgfxOpSetBuffers>()`.
-    RgfxOpSetBuffers {
-        /// The first binding index (the range's `location`).
-        location: u64,
-        /// How many bindings follow (the range's `length`).
-        length: u64,
-    }
+/// `setBuffers:offsets:withRange:` head. `length` [`RgfxComputeBufferBinding`]
+/// records follow at [`size_of`](core::mem::size_of)`::<RgfxComputeOpSetBuffers>()`.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxComputeOpSetBuffers {
+    /// The first binding index (the range's `location`).
+    pub location: u64,
+    /// How many bindings follow (the range's `length`).
+    pub length: u64,
 }
 
-op_body! {
-    /// One `setBuffers:offsets:withRange:` binding.
-    RgfxComputeBufferBinding {
-        /// The buffer, or 0 for nil.
-        buffer_obj_id: u64,
-        /// The offset into the buffer.
-        offset: u64,
-    }
+/// One `setBuffers:offsets:withRange:` binding.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxComputeBufferBinding {
+    /// The buffer, or 0 for nil.
+    pub buffer_obj_id: u64,
+    /// The offset into the buffer.
+    pub offset: u64,
 }
 
-op_body! {
-    /// `setBuffers:offsets:attributeStrides:withRange:` head. `length`
-    /// [`RgfxComputeBufferStrideBinding`] records follow.
-    RgfxOpSetBuffersAttributeStrides {
-        /// The first binding index (the range's `location`).
-        location: u64,
-        /// How many bindings follow (the range's `length`).
-        length: u64,
-    }
+/// `setBuffers:offsets:attributeStrides:withRange:` head. `length`
+/// [`RgfxComputeBufferStrideBinding`] records follow.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxComputeOpSetBuffersAttributeStrides {
+    /// The first binding index (the range's `location`).
+    pub location: u64,
+    /// How many bindings follow (the range's `length`).
+    pub length: u64,
 }
 
-op_body! {
-    /// One `setBuffers:offsets:attributeStrides:withRange:` binding.
-    RgfxComputeBufferStrideBinding {
-        /// The buffer, or 0 for nil.
-        buffer_obj_id: u64,
-        /// The offset into the buffer.
-        offset: u64,
-        /// The attribute stride.
-        stride: u64,
-    }
+/// One `setBuffers:offsets:attributeStrides:withRange:` binding.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxComputeBufferStrideBinding {
+    /// The buffer, or 0 for nil.
+    pub buffer_obj_id: u64,
+    /// The offset into the buffer.
+    pub offset: u64,
+    /// The attribute stride.
+    pub stride: u64,
 }
 
-op_body! {
-    /// `setTexture:atIndex:`. The texture may be nil (`0`).
-    RgfxOpSetTexture {
-        /// The texture, or 0 for nil.
-        texture_obj_id: u64,
-        /// The texture binding index.
-        index: u64,
-    }
+/// `setTexture:atIndex:`. The texture may be nil (`0`).
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxComputeOpSetTexture {
+    /// The texture, or 0 for nil.
+    pub texture_obj_id: u64,
+    /// The texture binding index.
+    pub index: u64,
 }
 
-op_body! {
-    /// `setTextures:withRange:` head. `length` [`RgfxComputeTextureBinding`] records
-    /// follow.
-    RgfxOpSetTextures {
-        /// The first binding index (the range's `location`).
-        location: u64,
-        /// How many bindings follow (the range's `length`).
-        length: u64,
-    }
+/// `setTextures:withRange:` head. `length` [`RgfxComputeTextureBinding`] records
+/// follow.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxComputeOpSetTextures {
+    /// The first binding index (the range's `location`).
+    pub location: u64,
+    /// How many bindings follow (the range's `length`).
+    pub length: u64,
 }
 
-op_body! {
-    /// One `setTextures:withRange:` binding.
-    RgfxComputeTextureBinding {
-        /// The texture, or 0 for nil.
-        texture_obj_id: u64,
-    }
+/// One `setTextures:withRange:` binding.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxComputeTextureBinding {
+    /// The texture, or 0 for nil.
+    pub texture_obj_id: u64,
 }
 
-op_body! {
-    /// `setSamplerStates:withRange:` head. `length` [`RgfxComputeSamplerBinding`]
-    /// records follow.
-    RgfxOpSetSamplerStates {
-        /// The first binding index (the range's `location`).
-        location: u64,
-        /// How many bindings follow (the range's `length`).
-        length: u64,
-    }
+/// `setSamplerStates:withRange:` head. `length` [`RgfxComputeSamplerBinding`]
+/// records follow.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxComputeOpSetSamplerStates {
+    /// The first binding index (the range's `location`).
+    pub location: u64,
+    /// How many bindings follow (the range's `length`).
+    pub length: u64,
 }
 
-op_body! {
-    /// One `setSamplerStates:withRange:` binding.
-    RgfxComputeSamplerBinding {
-        /// The sampler, or 0 for nil.
-        sampler_obj_id: u64,
-    }
+/// One `setSamplerStates:withRange:` binding.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxComputeSamplerBinding {
+    /// The sampler, or 0 for nil.
+    pub sampler_obj_id: u64,
 }
 
-op_body! {
-    /// `setSamplerStates:lodMinClamps:lodMaxClamps:withRange:` head. `length`
-    /// [`RgfxComputeSamplerLodBinding`] records follow.
-    RgfxOpSetSamplerStatesLodClamps {
-        /// The first binding index (the range's `location`).
-        location: u64,
-        /// How many bindings follow (the range's `length`).
-        length: u64,
-    }
+/// `setSamplerStates:lodMinClamps:lodMaxClamps:withRange:` head. `length`
+/// [`RgfxComputeSamplerLodBinding`] records follow.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxComputeOpSetSamplerStatesLodClamps {
+    /// The first binding index (the range's `location`).
+    pub location: u64,
+    /// How many bindings follow (the range's `length`).
+    pub length: u64,
 }
 
-op_body! {
-    /// One `setSamplerStates:lodMinClamps:lodMaxClamps:withRange:` binding. The LOD
-    /// clamps travel as the bits of their `f32`.
-    RgfxComputeSamplerLodBinding {
-        /// The sampler, or 0 for nil.
-        sampler_obj_id: u64,
-        /// `lodMinClamp` as `f32` bits.
-        lod_min_clamp_bits: u32,
-        /// `lodMaxClamp` as `f32` bits.
-        lod_max_clamp_bits: u32,
-    }
+/// One `setSamplerStates:lodMinClamps:lodMaxClamps:withRange:` binding. The LOD
+/// clamps travel as the bits of their `f32`.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxComputeSamplerLodBinding {
+    /// The sampler, or 0 for nil.
+    pub sampler_obj_id: u64,
+    /// `lodMinClamp` as `f32` bits.
+    pub lod_min_clamp_bits: u32,
+    /// `lodMaxClamp` as `f32` bits.
+    pub lod_max_clamp_bits: u32,
 }
 
-op_body! {
-    /// `setThreadgroupMemoryLength:atIndex:`.
-    RgfxOpSetThreadgroupMemoryLength {
-        /// The threadgroup memory length in bytes.
-        length: u64,
-        /// The threadgroup memory binding index.
-        index: u64,
-    }
+/// `setThreadgroupMemoryLength:atIndex:`.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxComputeOpSetThreadgroupMemoryLength {
+    /// The threadgroup memory length in bytes.
+    pub length: u64,
+    /// The threadgroup memory binding index.
+    pub index: u64,
 }
 
-op_body! {
-    /// `setStageInRegion:`. The `MTLRegion`'s six fields are `NSUInteger`.
-    RgfxOpSetStageInRegion {
-        /// `origin.x`.
-        origin_x: u64,
-        /// `origin.y`.
-        origin_y: u64,
-        /// `origin.z`.
-        origin_z: u64,
-        /// `size.width`.
-        width: u64,
-        /// `size.height`.
-        height: u64,
-        /// `size.depth`.
-        depth: u64,
-    }
+/// `setStageInRegion:`. The `MTLRegion`'s six fields are `NSUInteger`.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxComputeOpSetStageInRegion {
+    /// `origin.x`.
+    pub origin_x: u64,
+    /// `origin.y`.
+    pub origin_y: u64,
+    /// `origin.z`.
+    pub origin_z: u64,
+    /// `size.width`.
+    pub width: u64,
+    /// `size.height`.
+    pub height: u64,
+    /// `size.depth`.
+    pub depth: u64,
 }
 
-op_body! {
-    /// `setStageInRegionWithIndirectBuffer:indirectBufferOffset:`. The buffer must
-    /// name an object (nil faults the stream).
-    RgfxOpSetStageInRegionIndirect {
-        /// The indirect buffer (must not be nil).
-        indirect_buffer_obj_id: u64,
-        /// The offset into the indirect buffer.
-        indirect_buffer_offset: u64,
-    }
+/// `setStageInRegionWithIndirectBuffer:indirectBufferOffset:`. The buffer must
+/// name an object (nil faults the stream).
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxComputeOpSetStageInRegionIndirect {
+    /// The indirect buffer (must not be nil).
+    pub indirect_buffer_obj_id: u64,
+    /// The offset into the indirect buffer.
+    pub indirect_buffer_offset: u64,
 }
 
-op_body! {
-    /// `setImageblockWidth:height:`.
-    RgfxOpSetImageblockWidth {
-        /// The imageblock width in pixels.
-        width: u64,
-        /// The imageblock height in pixels.
-        height: u64,
-    }
+/// `setImageblockWidth:height:`.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxComputeOpSetImageblockWidth {
+    /// The imageblock width in pixels.
+    pub width: u64,
+    /// The imageblock height in pixels.
+    pub height: u64,
 }
 
-op_body! {
-    /// `dispatchThreadgroups:threadsPerThreadgroup:`. Each `MTLSize` is three
-    /// `NSUInteger`.
-    RgfxOpDispatchThreadgroups {
-        /// `threadgroupsPerGrid.width`.
-        threadgroups_width: u64,
-        /// `threadgroupsPerGrid.height`.
-        threadgroups_height: u64,
-        /// `threadgroupsPerGrid.depth`.
-        threadgroups_depth: u64,
-        /// `threadsPerThreadgroup.width`.
-        threads_width: u64,
-        /// `threadsPerThreadgroup.height`.
-        threads_height: u64,
-        /// `threadsPerThreadgroup.depth`.
-        threads_depth: u64,
-    }
+/// `dispatchThreadgroups:threadsPerThreadgroup:`. Each `MTLSize` is three
+/// `NSUInteger`.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxComputeOpDispatchThreadgroups {
+    /// `threadgroupsPerGrid.width`.
+    pub threadgroups_width: u64,
+    /// `threadgroupsPerGrid.height`.
+    pub threadgroups_height: u64,
+    /// `threadgroupsPerGrid.depth`.
+    pub threadgroups_depth: u64,
+    /// `threadsPerThreadgroup.width`.
+    pub threads_width: u64,
+    /// `threadsPerThreadgroup.height`.
+    pub threads_height: u64,
+    /// `threadsPerThreadgroup.depth`.
+    pub threads_depth: u64,
 }
 
-op_body! {
-    /// `dispatchThreadgroupsWithIndirectBuffer:indirectBufferOffset:threadsPerThreadgroup:`.
-    /// The indirect buffer may be nil (`0`); the platform aborts on a nil buffer.
-    RgfxOpDispatchThreadgroupsIndirect {
-        /// The indirect buffer, or 0 for nil.
-        indirect_buffer_obj_id: u64,
-        /// The offset into the indirect buffer.
-        indirect_buffer_offset: u64,
-        /// `threadsPerThreadgroup.width`.
-        threads_width: u64,
-        /// `threadsPerThreadgroup.height`.
-        threads_height: u64,
-        /// `threadsPerThreadgroup.depth`.
-        threads_depth: u64,
-    }
+/// `dispatchThreadgroupsWithIndirectBuffer:indirectBufferOffset:threadsPerThreadgroup:`.
+/// The indirect buffer may be nil (`0`); the platform aborts on a nil buffer.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxComputeOpDispatchThreadgroupsIndirect {
+    /// The indirect buffer, or 0 for nil.
+    pub indirect_buffer_obj_id: u64,
+    /// The offset into the indirect buffer.
+    pub indirect_buffer_offset: u64,
+    /// `threadsPerThreadgroup.width`.
+    pub threads_width: u64,
+    /// `threadsPerThreadgroup.height`.
+    pub threads_height: u64,
+    /// `threadsPerThreadgroup.depth`.
+    pub threads_depth: u64,
 }
 
-op_body! {
-    /// `dispatchThreads:threadsPerThreadgroup:`. Each `MTLSize` is three `NSUInteger`.
-    RgfxOpDispatchThreads {
-        /// `threadsPerGrid.width`.
-        grid_width: u64,
-        /// `threadsPerGrid.height`.
-        grid_height: u64,
-        /// `threadsPerGrid.depth`.
-        grid_depth: u64,
-        /// `threadsPerThreadgroup.width`.
-        threads_width: u64,
-        /// `threadsPerThreadgroup.height`.
-        threads_height: u64,
-        /// `threadsPerThreadgroup.depth`.
-        threads_depth: u64,
-    }
+/// `dispatchThreads:threadsPerThreadgroup:`. Each `MTLSize` is three `NSUInteger`.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxComputeOpDispatchThreads {
+    /// `threadsPerGrid.width`.
+    pub grid_width: u64,
+    /// `threadsPerGrid.height`.
+    pub grid_height: u64,
+    /// `threadsPerGrid.depth`.
+    pub grid_depth: u64,
+    /// `threadsPerThreadgroup.width`.
+    pub threads_width: u64,
+    /// `threadsPerThreadgroup.height`.
+    pub threads_height: u64,
+    /// `threadsPerThreadgroup.depth`.
+    pub threads_depth: u64,
 }
 
-op_body! {
-    /// `dispatchThreadsWithIndirectBuffer:indirectBufferOffset:` (SPI). The indirect
-    /// buffer may be nil (`0`); the platform aborts on a nil buffer.
-    RgfxOpDispatchThreadsIndirect {
-        /// The indirect buffer, or 0 for nil.
-        indirect_buffer_obj_id: u64,
-        /// The offset into the indirect buffer.
-        indirect_buffer_offset: u64,
-    }
+/// `dispatchThreadsWithIndirectBuffer:indirectBufferOffset:` (SPI). The indirect
+/// buffer may be nil (`0`); the platform aborts on a nil buffer.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxComputeOpDispatchThreadsIndirect {
+    /// The indirect buffer, or 0 for nil.
+    pub indirect_buffer_obj_id: u64,
+    /// The offset into the indirect buffer.
+    pub indirect_buffer_offset: u64,
 }
 
-op_body! {
-    /// `useResources:count:usage:` head. `count` [`RgfxComputeResourceRef`] records
-    /// follow.
-    RgfxOpUseResources {
-        /// How many resource records follow.
-        count: u64,
-        /// The `MTLResourceUsage`.
-        usage: u64,
-    }
+/// `useResources:count:usage:` head. `count` [`RgfxComputeResourceRef`] records
+/// follow.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxComputeOpUseResources {
+    /// How many resource records follow.
+    pub count: u64,
+    /// The `MTLResourceUsage`.
+    pub usage: u64,
 }
 
-op_body! {
-    /// One resource reference of `useResources:count:usage:` or
-    /// `memoryBarrierWithResources:count:`. `kind` picks the resolver `obj_id` is
-    /// resolved through (`RGFX_RESOURCE_KIND_*`); `RGFX_RESOURCE_KIND_NONE` is a nil
-    /// entry.
-    RgfxComputeResourceRef {
-        /// The kind of resource (`RGFX_RESOURCE_KIND_*`).
-        kind: u32,
-        /// Padding, 0.
-        reserved_04: u32,
-        /// The resource, resolved through the kind's resolver.
-        obj_id: u64,
-    }
+/// One resource reference of `useResources:count:usage:` or
+/// `memoryBarrierWithResources:count:`. `kind` picks the resolver `obj_id` is
+/// resolved through (`RGFX_RESOURCE_KIND_*`); `RGFX_RESOURCE_KIND_NONE` is a nil
+/// entry.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxComputeResourceRef {
+    /// The kind of resource (`RGFX_RESOURCE_KIND_*`).
+    pub kind: u32,
+    /// Padding, 0.
+    pub reserved_04: u32,
+    /// The resource, resolved through the kind's resolver.
+    pub obj_id: u64,
 }
 
-op_body! {
-    /// `useHeaps:count:` head. `count` [`RgfxComputeHeapBinding`] records follow.
-    RgfxOpUseHeaps {
-        /// How many heap records follow.
-        count: u64,
-    }
+/// `useHeaps:count:` head. `count` [`RgfxComputeHeapBinding`] records follow.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxComputeOpUseHeaps {
+    /// How many heap records follow.
+    pub count: u64,
 }
 
-op_body! {
-    /// One `useHeaps:count:` heap.
-    RgfxComputeHeapBinding {
-        /// The heap, or 0 for nil.
-        heap_obj_id: u64,
-    }
+/// One `useHeaps:count:` heap.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxComputeHeapBinding {
+    /// The heap, or 0 for nil.
+    pub heap_obj_id: u64,
 }
 
-op_body! {
-    /// `memoryBarrierWithResources:count:` head. `count` [`RgfxComputeResourceRef`]
-    /// records follow.
-    RgfxOpMemoryBarrierResources {
-        /// How many resource records follow.
-        count: u64,
-    }
+/// `memoryBarrierWithResources:count:` head. `count` [`RgfxComputeResourceRef`]
+/// records follow.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxComputeOpMemoryBarrierResources {
+    /// How many resource records follow.
+    pub count: u64,
 }
 
-op_body! {
-    /// `memoryBarrierWithScope:`.
-    RgfxOpMemoryBarrierScope {
-        /// The `MTLBarrierScope`.
-        scope: u64,
-    }
+/// `memoryBarrierWithScope:`.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxComputeOpMemoryBarrierScope {
+    /// The `MTLBarrierScope`.
+    pub scope: u64,
 }
 
-op_body! {
-    /// `updateFence:`. The fence must name an object (nil faults the stream).
-    RgfxOpUpdateFence {
-        /// The fence (must not be nil).
-        fence_obj_id: u64,
-    }
+/// `updateFence:`. The fence must name an object (nil faults the stream).
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxComputeOpUpdateFence {
+    /// The fence (must not be nil).
+    pub fence_obj_id: u64,
 }
 
-op_body! {
-    /// `waitForFence:`. The fence must name an object (nil faults the stream).
-    RgfxOpWaitForFence {
-        /// The fence (must not be nil).
-        fence_obj_id: u64,
-    }
+/// `waitForFence:`. The fence must name an object (nil faults the stream).
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxComputeOpWaitForFence {
+    /// The fence (must not be nil).
+    pub fence_obj_id: u64,
 }
 
-op_body! {
-    /// `executeCommandsInBuffer:indirectBuffer:indirectBufferOffset:`. Both the
-    /// indirect command buffer and the range buffer must name an object.
-    RgfxOpExecuteCommandsIndirect {
-        /// The indirect command buffer (must not be nil).
-        indirect_commandbuffer_obj_id: u64,
-        /// The buffer holding the execution range (must not be nil).
-        indirect_range_buffer_obj_id: u64,
-        /// The offset into the range buffer.
-        indirect_buffer_offset: u64,
-    }
+/// `executeCommandsInBuffer:indirectBuffer:indirectBufferOffset:`. Both the
+/// indirect command buffer and the range buffer must name an object.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxComputeOpExecuteCommandsIndirect {
+    /// The indirect command buffer (must not be nil).
+    pub indirect_commandbuffer_obj_id: u64,
+    /// The buffer holding the execution range (must not be nil).
+    pub indirect_range_buffer_obj_id: u64,
+    /// The offset into the range buffer.
+    pub indirect_buffer_offset: u64,
 }
 
-op_body! {
-    /// `executeCommandsInBuffer:withRange:`. The indirect command buffer must name
-    /// an object.
-    RgfxOpExecuteCommandsInBuffer {
-        /// The indirect command buffer (must not be nil).
-        indirect_command_buffer_obj_id: u64,
-        /// The execution range's `location`.
-        location: u64,
-        /// The execution range's `length`.
-        length: u64,
-    }
+/// `executeCommandsInBuffer:withRange:`. The indirect command buffer must name
+/// an object.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxComputeOpExecuteCommandsInBuffer {
+    /// The indirect command buffer (must not be nil).
+    pub indirect_command_buffer_obj_id: u64,
+    /// The execution range's `location`.
+    pub location: u64,
+    /// The execution range's `length`.
+    pub length: u64,
 }
 
-op_body! {
-    /// `encodeStartIf:offset:comparison:referenceValue:` (SPI). The buffer may be
-    /// nil (`0`).
-    RgfxOpEncodeStartIf {
-        /// The buffer, or 0 for nil.
-        buffer_obj_id: u64,
-        /// The offset into the buffer.
-        offset: u64,
-        /// The `MTLComparisonFunction`.
-        comparison: u64,
-        /// The reference value.
-        reference_value: u32,
-        /// Padding, 0.
-        reserved_1c: u32,
-    }
+/// `encodeStartIf:offset:comparison:referenceValue:` (SPI). The buffer may be
+/// nil (`0`).
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxComputeOpEncodeStartIf {
+    /// The buffer, or 0 for nil.
+    pub buffer_obj_id: u64,
+    /// The offset into the buffer.
+    pub offset: u64,
+    /// The `MTLComparisonFunction`.
+    pub comparison: u64,
+    /// The reference value.
+    pub reference_value: u32,
+    /// Padding, 0.
+    pub reserved_1c: u32,
 }
 
-op_body! {
-    /// `encodeStartWhile:offset:comparison:referenceValue:` (SPI). The buffer may be
-    /// nil (`0`).
-    RgfxOpEncodeStartWhile {
-        /// The buffer, or 0 for nil.
-        buffer_obj_id: u64,
-        /// The offset into the buffer.
-        offset: u64,
-        /// The `MTLComparisonFunction`.
-        comparison: u64,
-        /// The reference value.
-        reference_value: u32,
-        /// Padding, 0.
-        reserved_1c: u32,
-    }
+/// `encodeStartWhile:offset:comparison:referenceValue:` (SPI). The buffer may be
+/// nil (`0`).
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxComputeOpEncodeStartWhile {
+    /// The buffer, or 0 for nil.
+    pub buffer_obj_id: u64,
+    /// The offset into the buffer.
+    pub offset: u64,
+    /// The `MTLComparisonFunction`.
+    pub comparison: u64,
+    /// The reference value.
+    pub reference_value: u32,
+    /// Padding, 0.
+    pub reserved_1c: u32,
 }
 
 // The compute ops' layout.
 const _: () = {
     use core::mem::size_of;
-    assert!(size_of::<RgfxOpSetComputePipelineState>() == 8);
-    assert!(size_of::<RgfxOpSetBufferOffset>() == 16);
-    assert!(size_of::<RgfxOpSetBufferOffsetAttributeStride>() == 24);
-    assert!(size_of::<RgfxOpSetBuffers>() == 16);
+    assert!(size_of::<RgfxComputeOpSetComputePipelineState>() == 8);
+    assert!(size_of::<RgfxComputeOpSetBufferOffset>() == 16);
+    assert!(size_of::<RgfxComputeOpSetBufferOffsetAttributeStride>() == 24);
+    assert!(size_of::<RgfxComputeOpSetBuffers>() == 16);
     assert!(size_of::<RgfxComputeBufferBinding>() == 16);
-    assert!(size_of::<RgfxOpSetBuffersAttributeStrides>() == 16);
+    assert!(size_of::<RgfxComputeOpSetBuffersAttributeStrides>() == 16);
     assert!(size_of::<RgfxComputeBufferStrideBinding>() == 24);
-    assert!(size_of::<RgfxOpSetTexture>() == 16);
-    assert!(size_of::<RgfxOpSetTextures>() == 16);
+    assert!(size_of::<RgfxComputeOpSetTexture>() == 16);
+    assert!(size_of::<RgfxComputeOpSetTextures>() == 16);
     assert!(size_of::<RgfxComputeTextureBinding>() == 8);
-    assert!(size_of::<RgfxOpSetSamplerStates>() == 16);
+    assert!(size_of::<RgfxComputeOpSetSamplerStates>() == 16);
     assert!(size_of::<RgfxComputeSamplerBinding>() == 8);
-    assert!(size_of::<RgfxOpSetSamplerStatesLodClamps>() == 16);
+    assert!(size_of::<RgfxComputeOpSetSamplerStatesLodClamps>() == 16);
     assert!(size_of::<RgfxComputeSamplerLodBinding>() == 16);
-    assert!(size_of::<RgfxOpSetThreadgroupMemoryLength>() == 16);
-    assert!(size_of::<RgfxOpSetStageInRegion>() == 48);
-    assert!(size_of::<RgfxOpSetStageInRegionIndirect>() == 16);
-    assert!(size_of::<RgfxOpSetImageblockWidth>() == 16);
-    assert!(size_of::<RgfxOpDispatchThreadgroups>() == 48);
-    assert!(size_of::<RgfxOpDispatchThreadgroupsIndirect>() == 40);
-    assert!(size_of::<RgfxOpDispatchThreads>() == 48);
-    assert!(size_of::<RgfxOpDispatchThreadsIndirect>() == 16);
-    assert!(size_of::<RgfxOpUseResources>() == 16);
+    assert!(size_of::<RgfxComputeOpSetThreadgroupMemoryLength>() == 16);
+    assert!(size_of::<RgfxComputeOpSetStageInRegion>() == 48);
+    assert!(size_of::<RgfxComputeOpSetStageInRegionIndirect>() == 16);
+    assert!(size_of::<RgfxComputeOpSetImageblockWidth>() == 16);
+    assert!(size_of::<RgfxComputeOpDispatchThreadgroups>() == 48);
+    assert!(size_of::<RgfxComputeOpDispatchThreadgroupsIndirect>() == 40);
+    assert!(size_of::<RgfxComputeOpDispatchThreads>() == 48);
+    assert!(size_of::<RgfxComputeOpDispatchThreadsIndirect>() == 16);
+    assert!(size_of::<RgfxComputeOpUseResources>() == 16);
     assert!(size_of::<RgfxComputeResourceRef>() == 16);
-    assert!(size_of::<RgfxOpUseHeaps>() == 8);
+    assert!(size_of::<RgfxComputeOpUseHeaps>() == 8);
     assert!(size_of::<RgfxComputeHeapBinding>() == 8);
-    assert!(size_of::<RgfxOpMemoryBarrierResources>() == 8);
-    assert!(size_of::<RgfxOpMemoryBarrierScope>() == 8);
-    assert!(size_of::<RgfxOpUpdateFence>() == 8);
-    assert!(size_of::<RgfxOpWaitForFence>() == 8);
-    assert!(size_of::<RgfxOpExecuteCommandsIndirect>() == 24);
-    assert!(size_of::<RgfxOpExecuteCommandsInBuffer>() == 24);
-    assert!(size_of::<RgfxOpEncodeStartIf>() == 32);
-    assert!(size_of::<RgfxOpEncodeStartWhile>() == 32);
+    assert!(size_of::<RgfxComputeOpMemoryBarrierResources>() == 8);
+    assert!(size_of::<RgfxComputeOpMemoryBarrierScope>() == 8);
+    assert!(size_of::<RgfxComputeOpUpdateFence>() == 8);
+    assert!(size_of::<RgfxComputeOpWaitForFence>() == 8);
+    assert!(size_of::<RgfxComputeOpExecuteCommandsIndirect>() == 24);
+    assert!(size_of::<RgfxComputeOpExecuteCommandsInBuffer>() == 24);
+    assert!(size_of::<RgfxComputeOpEncodeStartIf>() == 32);
+    assert!(size_of::<RgfxComputeOpEncodeStartWhile>() == 32);
     // The compute tags stay in the compute group.
     assert!(
         super::op_group(RGFX_OP_COMPUTE_SET_COMPUTE_PIPELINE_STATE) == super::RGFX_OP_GROUP_COMPUTE
@@ -587,13 +641,13 @@ mod tests {
     /// The scalar and region op bodies round-trip, floats travelling as bits.
     #[test]
     fn scalar_ops_round_trip() {
-        let p = RgfxOpSetComputePipelineState { pipeline_obj_id: 7 };
+        let p = RgfxComputeOpSetComputePipelineState { pipeline_obj_id: 7 };
         assert_eq!(
-            RgfxOpSetComputePipelineState::read_from_bytes(p.as_bytes()).unwrap(),
+            RgfxComputeOpSetComputePipelineState::read_from_bytes(p.as_bytes()).unwrap(),
             p
         );
 
-        let d = RgfxOpDispatchThreadgroups {
+        let d = RgfxComputeOpDispatchThreadgroups {
             threadgroups_width: 16,
             threadgroups_height: 8,
             threadgroups_depth: 1,
@@ -602,11 +656,11 @@ mod tests {
             threads_depth: 1,
         };
         assert_eq!(
-            RgfxOpDispatchThreadgroups::read_from_bytes(d.as_bytes()).unwrap(),
+            RgfxComputeOpDispatchThreadgroups::read_from_bytes(d.as_bytes()).unwrap(),
             d
         );
 
-        let r = RgfxOpSetStageInRegion {
+        let r = RgfxComputeOpSetStageInRegion {
             origin_x: 0,
             origin_y: 1,
             origin_z: 2,
@@ -615,11 +669,11 @@ mod tests {
             depth: 1,
         };
         assert_eq!(
-            RgfxOpSetStageInRegion::read_from_bytes(r.as_bytes()).unwrap(),
+            RgfxComputeOpSetStageInRegion::read_from_bytes(r.as_bytes()).unwrap(),
             r
         );
 
-        let sif = RgfxOpEncodeStartIf {
+        let sif = RgfxComputeOpEncodeStartIf {
             buffer_obj_id: 4,
             offset: 16,
             comparison: 3,
@@ -627,7 +681,7 @@ mod tests {
             reserved_1c: 0,
         };
         assert_eq!(
-            RgfxOpEncodeStartIf::read_from_bytes(sif.as_bytes()).unwrap(),
+            RgfxComputeOpEncodeStartIf::read_from_bytes(sif.as_bytes()).unwrap(),
             sif
         );
     }
@@ -636,12 +690,12 @@ mod tests {
     /// clamps travelling as bits.
     #[test]
     fn array_tailed_ops_round_trip() {
-        let head = RgfxOpSetBuffers {
+        let head = RgfxComputeOpSetBuffers {
             location: 2,
             length: 3,
         };
         assert_eq!(
-            RgfxOpSetBuffers::read_from_bytes(head.as_bytes()).unwrap(),
+            RgfxComputeOpSetBuffers::read_from_bytes(head.as_bytes()).unwrap(),
             head
         );
 

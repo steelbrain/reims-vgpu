@@ -930,14 +930,14 @@ void RgfxEncoder::renderUseResourcesStages(const RgfxResourceBinding *resources,
 
 void RgfxEncoder::computeSetComputePipelineState(RgfxObjId pipeline)
 {
-	rgfx_compute::RgfxOpSetComputePipelineState b = {};
+	RgfxComputeOpSetComputePipelineState b = {};
 	b.pipeline_obj_id = pipeline;
 	appendOp(RGFX_OP_COMPUTE_SET_COMPUTE_PIPELINE_STATE, &b, sizeof(b));
 }
 
 void RgfxEncoder::computeSetBufferOffset(uint64_t offset, uint64_t index)
 {
-	rgfx_compute::RgfxOpSetBufferOffset b = {};
+	RgfxComputeOpSetBufferOffset b = {};
 	b.offset = offset;
 	b.index = index;
 	appendOp(RGFX_OP_COMPUTE_SET_BUFFER_OFFSET, &b, sizeof(b));
@@ -946,7 +946,7 @@ void RgfxEncoder::computeSetBufferOffset(uint64_t offset, uint64_t index)
 void RgfxEncoder::computeSetBufferOffsetAttributeStride(uint64_t offset, uint64_t stride,
                                                         uint64_t index)
 {
-	rgfx_compute::RgfxOpSetBufferOffsetAttributeStride b = {};
+	RgfxComputeOpSetBufferOffsetAttributeStride b = {};
 	b.offset = offset;
 	b.stride = stride;
 	b.index = index;
@@ -954,69 +954,69 @@ void RgfxEncoder::computeSetBufferOffsetAttributeStride(uint64_t offset, uint64_
 }
 
 void RgfxEncoder::computeSetBuffers(uint64_t location,
-                                    const rgfx_compute::RgfxComputeBufferBinding *bindings,
+                                    const RgfxComputeBufferBinding *bindings,
                                     uint32_t count)
 {
-	rgfx_compute::RgfxOpSetBuffers h = {};
+	RgfxComputeOpSetBuffers h = {};
 	h.location = location;
 	h.length = count;
 	appendArrayOp(RGFX_OP_COMPUTE_SET_BUFFERS, &h, sizeof(h), bindings, count,
-	              sizeof(rgfx_compute::RgfxComputeBufferBinding));
+	              sizeof(RgfxComputeBufferBinding));
 }
 
 void RgfxEncoder::computeSetBuffersAttributeStrides(
-    uint64_t location, const rgfx_compute::RgfxComputeBufferStrideBinding *bindings, uint32_t count)
+    uint64_t location, const RgfxComputeBufferStrideBinding *bindings, uint32_t count)
 {
-	rgfx_compute::RgfxOpSetBuffersAttributeStrides h = {};
+	RgfxComputeOpSetBuffersAttributeStrides h = {};
 	h.location = location;
 	h.length = count;
 	appendArrayOp(RGFX_OP_COMPUTE_SET_BUFFERS_ATTRIBUTE_STRIDES, &h, sizeof(h), bindings, count,
-	              sizeof(rgfx_compute::RgfxComputeBufferStrideBinding));
+	              sizeof(RgfxComputeBufferStrideBinding));
 }
 
 void RgfxEncoder::computeSetTexture(RgfxObjId texture, uint64_t index)
 {
-	rgfx_compute::RgfxOpSetTexture b = {};
+	RgfxComputeOpSetTexture b = {};
 	b.texture_obj_id = texture;
 	b.index = index;
 	appendOp(RGFX_OP_COMPUTE_SET_TEXTURE, &b, sizeof(b));
 }
 
 void RgfxEncoder::computeSetTextures(uint64_t location,
-                                     const rgfx_compute::RgfxComputeTextureBinding *textures,
+                                     const RgfxComputeTextureBinding *textures,
                                      uint32_t count)
 {
-	rgfx_compute::RgfxOpSetTextures h = {};
+	RgfxComputeOpSetTextures h = {};
 	h.location = location;
 	h.length = count;
 	appendArrayOp(RGFX_OP_COMPUTE_SET_TEXTURES, &h, sizeof(h), textures, count,
-	              sizeof(rgfx_compute::RgfxComputeTextureBinding));
+	              sizeof(RgfxComputeTextureBinding));
 }
 
 void RgfxEncoder::computeSetSamplerStates(uint64_t location,
-                                          const rgfx_compute::RgfxComputeSamplerBinding *samplers,
+                                          const RgfxComputeSamplerBinding *samplers,
                                           uint32_t count)
 {
-	rgfx_compute::RgfxOpSetSamplerStates h = {};
+	RgfxComputeOpSetSamplerStates h = {};
 	h.location = location;
 	h.length = count;
 	appendArrayOp(RGFX_OP_COMPUTE_SET_SAMPLER_STATES, &h, sizeof(h), samplers, count,
-	              sizeof(rgfx_compute::RgfxComputeSamplerBinding));
+	              sizeof(RgfxComputeSamplerBinding));
 }
 
 void RgfxEncoder::computeSetSamplerStatesLodClamps(
-    uint64_t location, const rgfx_compute::RgfxComputeSamplerLodBinding *samplers, uint32_t count)
+    uint64_t location, const RgfxComputeSamplerLodBinding *samplers, uint32_t count)
 {
-	rgfx_compute::RgfxOpSetSamplerStatesLodClamps h = {};
+	RgfxComputeOpSetSamplerStatesLodClamps h = {};
 	h.location = location;
 	h.length = count;
 	appendArrayOp(RGFX_OP_COMPUTE_SET_SAMPLER_STATES_LOD_CLAMPS, &h, sizeof(h), samplers, count,
-	              sizeof(rgfx_compute::RgfxComputeSamplerLodBinding));
+	              sizeof(RgfxComputeSamplerLodBinding));
 }
 
 void RgfxEncoder::computeSetThreadgroupMemoryLength(uint64_t length, uint64_t index)
 {
-	rgfx_compute::RgfxOpSetThreadgroupMemoryLength b = {};
+	RgfxComputeOpSetThreadgroupMemoryLength b = {};
 	b.length = length;
 	b.index = index;
 	appendOp(RGFX_OP_COMPUTE_SET_THREADGROUP_MEMORY_LENGTH, &b, sizeof(b));
@@ -1025,7 +1025,7 @@ void RgfxEncoder::computeSetThreadgroupMemoryLength(uint64_t length, uint64_t in
 void RgfxEncoder::computeSetStageInRegion(uint64_t origin_x, uint64_t origin_y, uint64_t origin_z,
                                           uint64_t width, uint64_t height, uint64_t depth)
 {
-	rgfx_compute::RgfxOpSetStageInRegion b = {};
+	RgfxComputeOpSetStageInRegion b = {};
 	b.origin_x = origin_x;
 	b.origin_y = origin_y;
 	b.origin_z = origin_z;
@@ -1038,7 +1038,7 @@ void RgfxEncoder::computeSetStageInRegion(uint64_t origin_x, uint64_t origin_y, 
 void RgfxEncoder::computeSetStageInRegionIndirect(RgfxObjId indirect_buffer,
                                                   uint64_t indirect_buffer_offset)
 {
-	rgfx_compute::RgfxOpSetStageInRegionIndirect b = {};
+	RgfxComputeOpSetStageInRegionIndirect b = {};
 	b.indirect_buffer_obj_id = indirect_buffer;
 	b.indirect_buffer_offset = indirect_buffer_offset;
 	appendOp(RGFX_OP_COMPUTE_SET_STAGE_IN_REGION_INDIRECT, &b, sizeof(b));
@@ -1046,7 +1046,7 @@ void RgfxEncoder::computeSetStageInRegionIndirect(RgfxObjId indirect_buffer,
 
 void RgfxEncoder::computeSetImageblockWidth(uint64_t width, uint64_t height)
 {
-	rgfx_compute::RgfxOpSetImageblockWidth b = {};
+	RgfxComputeOpSetImageblockWidth b = {};
 	b.width = width;
 	b.height = height;
 	appendOp(RGFX_OP_COMPUTE_SET_IMAGEBLOCK_WIDTH, &b, sizeof(b));
@@ -1057,7 +1057,7 @@ void RgfxEncoder::computeDispatchThreadgroups(uint64_t threadgroups_width,
                                               uint64_t threadgroups_depth, uint64_t threads_width,
                                               uint64_t threads_height, uint64_t threads_depth)
 {
-	rgfx_compute::RgfxOpDispatchThreadgroups b = {};
+	RgfxComputeOpDispatchThreadgroups b = {};
 	b.threadgroups_width = threadgroups_width;
 	b.threadgroups_height = threadgroups_height;
 	b.threadgroups_depth = threadgroups_depth;
@@ -1072,7 +1072,7 @@ void RgfxEncoder::computeDispatchThreadgroupsIndirect(RgfxObjId indirect_buffer,
                                                       uint64_t threads_width, uint64_t threads_height,
                                                       uint64_t threads_depth)
 {
-	rgfx_compute::RgfxOpDispatchThreadgroupsIndirect b = {};
+	RgfxComputeOpDispatchThreadgroupsIndirect b = {};
 	b.indirect_buffer_obj_id = indirect_buffer;
 	b.indirect_buffer_offset = indirect_buffer_offset;
 	b.threads_width = threads_width;
@@ -1085,7 +1085,7 @@ void RgfxEncoder::computeDispatchThreads(uint64_t grid_width, uint64_t grid_heig
                                          uint64_t grid_depth, uint64_t threads_width,
                                          uint64_t threads_height, uint64_t threads_depth)
 {
-	rgfx_compute::RgfxOpDispatchThreads b = {};
+	RgfxComputeOpDispatchThreads b = {};
 	b.grid_width = grid_width;
 	b.grid_height = grid_height;
 	b.grid_depth = grid_depth;
@@ -1098,56 +1098,56 @@ void RgfxEncoder::computeDispatchThreads(uint64_t grid_width, uint64_t grid_heig
 void RgfxEncoder::computeDispatchThreadsIndirect(RgfxObjId indirect_buffer,
                                                  uint64_t indirect_buffer_offset)
 {
-	rgfx_compute::RgfxOpDispatchThreadsIndirect b = {};
+	RgfxComputeOpDispatchThreadsIndirect b = {};
 	b.indirect_buffer_obj_id = indirect_buffer;
 	b.indirect_buffer_offset = indirect_buffer_offset;
 	appendOp(RGFX_OP_COMPUTE_DISPATCH_THREADS_INDIRECT, &b, sizeof(b));
 }
 
-void RgfxEncoder::computeUseResources(const rgfx_compute::RgfxComputeResourceRef *resources,
+void RgfxEncoder::computeUseResources(const RgfxComputeResourceRef *resources,
                                       uint32_t count, uint64_t usage)
 {
-	rgfx_compute::RgfxOpUseResources h = {};
+	RgfxComputeOpUseResources h = {};
 	h.count = count;
 	h.usage = usage;
 	appendArrayOp(RGFX_OP_COMPUTE_USE_RESOURCES, &h, sizeof(h), resources, count,
-	              sizeof(rgfx_compute::RgfxComputeResourceRef));
+	              sizeof(RgfxComputeResourceRef));
 }
 
-void RgfxEncoder::computeUseHeaps(const rgfx_compute::RgfxComputeHeapBinding *heaps, uint32_t count)
+void RgfxEncoder::computeUseHeaps(const RgfxComputeHeapBinding *heaps, uint32_t count)
 {
-	rgfx_compute::RgfxOpUseHeaps h = {};
+	RgfxComputeOpUseHeaps h = {};
 	h.count = count;
 	appendArrayOp(RGFX_OP_COMPUTE_USE_HEAPS, &h, sizeof(h), heaps, count,
-	              sizeof(rgfx_compute::RgfxComputeHeapBinding));
+	              sizeof(RgfxComputeHeapBinding));
 }
 
 void RgfxEncoder::computeMemoryBarrierResources(
-    const rgfx_compute::RgfxComputeResourceRef *resources, uint32_t count)
+    const RgfxComputeResourceRef *resources, uint32_t count)
 {
-	rgfx_compute::RgfxOpMemoryBarrierResources h = {};
+	RgfxComputeOpMemoryBarrierResources h = {};
 	h.count = count;
 	appendArrayOp(RGFX_OP_COMPUTE_MEMORY_BARRIER_RESOURCES, &h, sizeof(h), resources, count,
-	              sizeof(rgfx_compute::RgfxComputeResourceRef));
+	              sizeof(RgfxComputeResourceRef));
 }
 
 void RgfxEncoder::computeMemoryBarrierScope(uint64_t scope)
 {
-	rgfx_compute::RgfxOpMemoryBarrierScope b = {};
+	RgfxComputeOpMemoryBarrierScope b = {};
 	b.scope = scope;
 	appendOp(RGFX_OP_COMPUTE_MEMORY_BARRIER_SCOPE, &b, sizeof(b));
 }
 
 void RgfxEncoder::computeUpdateFence(RgfxObjId fence)
 {
-	rgfx_compute::RgfxOpUpdateFence b = {};
+	RgfxComputeOpUpdateFence b = {};
 	b.fence_obj_id = fence;
 	appendOp(RGFX_OP_COMPUTE_UPDATE_FENCE, &b, sizeof(b));
 }
 
 void RgfxEncoder::computeWaitForFence(RgfxObjId fence)
 {
-	rgfx_compute::RgfxOpWaitForFence b = {};
+	RgfxComputeOpWaitForFence b = {};
 	b.fence_obj_id = fence;
 	appendOp(RGFX_OP_COMPUTE_WAIT_FOR_FENCE, &b, sizeof(b));
 }
@@ -1156,7 +1156,7 @@ void RgfxEncoder::computeExecuteCommandsIndirect(RgfxObjId indirect_command_buff
                                                  RgfxObjId indirect_range_buffer,
                                                  uint64_t indirect_buffer_offset)
 {
-	rgfx_compute::RgfxOpExecuteCommandsIndirect b = {};
+	RgfxComputeOpExecuteCommandsIndirect b = {};
 	b.indirect_commandbuffer_obj_id = indirect_command_buffer;
 	b.indirect_range_buffer_obj_id = indirect_range_buffer;
 	b.indirect_buffer_offset = indirect_buffer_offset;
@@ -1166,7 +1166,7 @@ void RgfxEncoder::computeExecuteCommandsIndirect(RgfxObjId indirect_command_buff
 void RgfxEncoder::computeExecuteCommandsInBuffer(RgfxObjId indirect_command_buffer,
                                                  uint64_t location, uint64_t length)
 {
-	rgfx_compute::RgfxOpExecuteCommandsInBuffer b = {};
+	RgfxComputeOpExecuteCommandsInBuffer b = {};
 	b.indirect_command_buffer_obj_id = indirect_command_buffer;
 	b.location = location;
 	b.length = length;
@@ -1176,7 +1176,7 @@ void RgfxEncoder::computeExecuteCommandsInBuffer(RgfxObjId indirect_command_buff
 void RgfxEncoder::computeEncodeStartIf(RgfxObjId buffer, uint64_t offset, uint64_t comparison,
                                        uint32_t reference_value)
 {
-	rgfx_compute::RgfxOpEncodeStartIf b = {};
+	RgfxComputeOpEncodeStartIf b = {};
 	b.buffer_obj_id = buffer;
 	b.offset = offset;
 	b.comparison = comparison;
@@ -1187,7 +1187,7 @@ void RgfxEncoder::computeEncodeStartIf(RgfxObjId buffer, uint64_t offset, uint64
 void RgfxEncoder::computeEncodeStartWhile(RgfxObjId buffer, uint64_t offset, uint64_t comparison,
                                           uint32_t reference_value)
 {
-	rgfx_compute::RgfxOpEncodeStartWhile b = {};
+	RgfxComputeOpEncodeStartWhile b = {};
 	b.buffer_obj_id = buffer;
 	b.offset = offset;
 	b.comparison = comparison;
@@ -1216,7 +1216,7 @@ void RgfxEncoder::blitCopyBufferToBuffer(RgfxObjId source_buffer, RgfxObjId dest
                                          uint64_t source_offset, uint64_t destination_offset,
                                          uint64_t size)
 {
-	rgfx_blit::RgfxOpCopyBufferToBuffer b = {};
+	RgfxBlitOpCopyBufferToBuffer b = {};
 	b.source_buffer_obj_id = source_buffer;
 	b.destination_buffer_obj_id = destination_buffer;
 	b.source_offset = source_offset;
@@ -1232,7 +1232,7 @@ void RgfxEncoder::blitCopyBufferToTexture(
     uint64_t destination_level, uint64_t destination_origin_x, uint64_t destination_origin_y,
     uint64_t destination_origin_z)
 {
-	rgfx_blit::RgfxOpCopyBufferToTexture b = {};
+	RgfxBlitOpCopyBufferToTexture b = {};
 	b.source_buffer_obj_id = source_buffer;
 	b.destination_texture_obj_id = destination_texture;
 	b.source_offset = source_offset;
@@ -1256,7 +1256,7 @@ void RgfxEncoder::blitCopyBufferToTextureOptions(
     uint64_t destination_level, uint64_t destination_origin_x, uint64_t destination_origin_y,
     uint64_t destination_origin_z, uint64_t options)
 {
-	rgfx_blit::RgfxOpCopyBufferToTextureOptions b = {};
+	RgfxBlitOpCopyBufferToTextureOptions b = {};
 	b.source_buffer_obj_id = source_buffer;
 	b.destination_texture_obj_id = destination_texture;
 	b.source_offset = source_offset;
@@ -1281,7 +1281,7 @@ void RgfxEncoder::blitCopyTextureToBuffer(
     uint64_t source_size_depth, uint64_t destination_offset, uint64_t destination_bytes_per_row,
     uint64_t destination_bytes_per_image)
 {
-	rgfx_blit::RgfxOpCopyTextureToBuffer b = {};
+	RgfxBlitOpCopyTextureToBuffer b = {};
 	b.source_texture_obj_id = source_texture;
 	b.destination_buffer_obj_id = destination_buffer;
 	b.source_slice = source_slice;
@@ -1305,7 +1305,7 @@ void RgfxEncoder::blitCopyTextureToBufferOptions(
     uint64_t source_size_depth, uint64_t destination_offset, uint64_t destination_bytes_per_row,
     uint64_t destination_bytes_per_image, uint64_t options)
 {
-	rgfx_blit::RgfxOpCopyTextureToBufferOptions b = {};
+	RgfxBlitOpCopyTextureToBufferOptions b = {};
 	b.source_texture_obj_id = source_texture;
 	b.destination_buffer_obj_id = destination_buffer;
 	b.source_slice = source_slice;
@@ -1330,7 +1330,7 @@ void RgfxEncoder::blitCopyTextureRegion(
     uint64_t source_size_depth, uint64_t destination_slice, uint64_t destination_level,
     uint64_t destination_origin_x, uint64_t destination_origin_y, uint64_t destination_origin_z)
 {
-	rgfx_blit::RgfxOpCopyTextureRegion b = {};
+	RgfxBlitOpCopyTextureRegion b = {};
 	b.source_texture_obj_id = source_texture;
 	b.destination_texture_obj_id = destination_texture;
 	b.source_slice = source_slice;
@@ -1357,7 +1357,7 @@ void RgfxEncoder::blitCopyTextureRegionOptions(
     uint64_t destination_origin_x, uint64_t destination_origin_y, uint64_t destination_origin_z,
     uint64_t options)
 {
-	rgfx_blit::RgfxOpCopyTextureRegionOptions b = {};
+	RgfxBlitOpCopyTextureRegionOptions b = {};
 	b.source_texture_obj_id = source_texture;
 	b.destination_texture_obj_id = destination_texture;
 	b.source_slice = source_slice;
@@ -1382,7 +1382,7 @@ void RgfxEncoder::blitCopyTextureSlices(RgfxObjId source_texture, RgfxObjId dest
                                         uint64_t destination_slice, uint64_t destination_level,
                                         uint64_t slice_count, uint64_t level_count)
 {
-	rgfx_blit::RgfxOpCopyTextureSlices b = {};
+	RgfxBlitOpCopyTextureSlices b = {};
 	b.source_texture_obj_id = source_texture;
 	b.destination_texture_obj_id = destination_texture;
 	b.source_slice = source_slice;
@@ -1399,7 +1399,7 @@ void RgfxEncoder::blitCopyIndirectCommandBuffer(RgfxObjId source, RgfxObjId dest
                                                 uint64_t source_range_length,
                                                 uint64_t destination_index)
 {
-	rgfx_blit::RgfxOpCopyIndirectCommandBuffer b = {};
+	RgfxBlitOpCopyIndirectCommandBuffer b = {};
 	b.source_obj_id = source;
 	b.destination_obj_id = destination;
 	b.source_range_location = source_range_location;
@@ -1411,7 +1411,7 @@ void RgfxEncoder::blitCopyIndirectCommandBuffer(RgfxObjId source, RgfxObjId dest
 void RgfxEncoder::blitFillBuffer(RgfxObjId buffer, uint64_t range_location, uint64_t range_length,
                                  uint8_t value)
 {
-	rgfx_blit::RgfxOpFillBuffer b = {};
+	RgfxBlitOpFillBuffer b = {};
 	b.buffer_obj_id = buffer;
 	b.range_location = range_location;
 	b.range_length = range_length;
@@ -1422,7 +1422,7 @@ void RgfxEncoder::blitFillBuffer(RgfxObjId buffer, uint64_t range_location, uint
 void RgfxEncoder::blitFillBufferPattern4(RgfxObjId buffer, uint64_t range_location,
                                          uint64_t range_length, uint32_t pattern)
 {
-	rgfx_blit::RgfxOpFillBufferPattern4 b = {};
+	RgfxBlitOpFillBufferPattern4 b = {};
 	b.buffer_obj_id = buffer;
 	b.range_location = range_location;
 	b.range_length = range_length;
@@ -1438,7 +1438,7 @@ void RgfxEncoder::blitFillTexture(RgfxObjId texture, uint64_t level, uint64_t sl
 {
 	// Head at body offset 0, the `length` fill bytes at RGFX_OP_BLIT_FILL_TEXTURE_BYTES_OFFSET
 	// (== sizeof head), then pad the op to a multiple of 8.
-	rgfx_blit::RgfxOpFillTexture h = {};
+	RgfxBlitOpFillTexture h = {};
 	h.texture_obj_id = texture;
 	h.level = level;
 	h.slice = slice;
@@ -1472,7 +1472,7 @@ void RgfxEncoder::blitFillTextureColor(RgfxObjId texture, uint64_t level, uint64
                                        double red, double green, double blue, double alpha,
                                        uint64_t pixel_format)
 {
-	rgfx_blit::RgfxOpFillTextureColor b = {};
+	RgfxBlitOpFillTextureColor b = {};
 	b.texture_obj_id = texture;
 	b.level = level;
 	b.slice = slice;
@@ -1492,14 +1492,14 @@ void RgfxEncoder::blitFillTextureColor(RgfxObjId texture, uint64_t level, uint64
 
 void RgfxEncoder::blitGenerateMipmaps(RgfxObjId texture)
 {
-	rgfx_blit::RgfxOpGenerateMipmaps b = {};
+	RgfxBlitOpGenerateMipmaps b = {};
 	b.texture_obj_id = texture;
 	appendOp(RGFX_OP_BLIT_GENERATE_MIPMAPS, &b, sizeof(b));
 }
 
 void RgfxEncoder::blitInvalidateCompressedTexture(RgfxObjId texture)
 {
-	rgfx_blit::RgfxOpInvalidateCompressedTexture b = {};
+	RgfxBlitOpInvalidateCompressedTexture b = {};
 	b.texture_obj_id = texture;
 	appendOp(RGFX_OP_BLIT_INVALIDATE_COMPRESSED_TEXTURE, &b, sizeof(b));
 }
@@ -1507,7 +1507,7 @@ void RgfxEncoder::blitInvalidateCompressedTexture(RgfxObjId texture)
 void RgfxEncoder::blitInvalidateCompressedTextureSlice(RgfxObjId texture, uint64_t slice,
                                                        uint64_t level)
 {
-	rgfx_blit::RgfxOpInvalidateCompressedTextureSlice b = {};
+	RgfxBlitOpInvalidateCompressedTextureSlice b = {};
 	b.texture_obj_id = texture;
 	b.slice = slice;
 	b.level = level;
@@ -1516,14 +1516,14 @@ void RgfxEncoder::blitInvalidateCompressedTextureSlice(RgfxObjId texture, uint64
 
 void RgfxEncoder::blitOptimizeForCpu(RgfxObjId texture)
 {
-	rgfx_blit::RgfxOpOptimizeForCpu b = {};
+	RgfxBlitOpOptimizeForCpu b = {};
 	b.texture_obj_id = texture;
 	appendOp(RGFX_OP_BLIT_OPTIMIZE_FOR_CPU, &b, sizeof(b));
 }
 
 void RgfxEncoder::blitOptimizeForCpuSlice(RgfxObjId texture, uint64_t slice, uint64_t level)
 {
-	rgfx_blit::RgfxOpOptimizeForCpuSlice b = {};
+	RgfxBlitOpOptimizeForCpuSlice b = {};
 	b.texture_obj_id = texture;
 	b.slice = slice;
 	b.level = level;
@@ -1532,14 +1532,14 @@ void RgfxEncoder::blitOptimizeForCpuSlice(RgfxObjId texture, uint64_t slice, uin
 
 void RgfxEncoder::blitOptimizeForGpu(RgfxObjId texture)
 {
-	rgfx_blit::RgfxOpOptimizeForGpu b = {};
+	RgfxBlitOpOptimizeForGpu b = {};
 	b.texture_obj_id = texture;
 	appendOp(RGFX_OP_BLIT_OPTIMIZE_FOR_GPU, &b, sizeof(b));
 }
 
 void RgfxEncoder::blitOptimizeForGpuSlice(RgfxObjId texture, uint64_t slice, uint64_t level)
 {
-	rgfx_blit::RgfxOpOptimizeForGpuSlice b = {};
+	RgfxBlitOpOptimizeForGpuSlice b = {};
 	b.texture_obj_id = texture;
 	b.slice = slice;
 	b.level = level;
@@ -1549,7 +1549,7 @@ void RgfxEncoder::blitOptimizeForGpuSlice(RgfxObjId texture, uint64_t slice, uin
 void RgfxEncoder::blitOptimizeIndirectCommandBuffer(RgfxObjId icb, uint64_t range_location,
                                                     uint64_t range_length)
 {
-	rgfx_blit::RgfxOpOptimizeIndirectCommandBuffer b = {};
+	RgfxBlitOpOptimizeIndirectCommandBuffer b = {};
 	b.icb_obj_id = icb;
 	b.range_location = range_location;
 	b.range_length = range_length;
@@ -1559,7 +1559,7 @@ void RgfxEncoder::blitOptimizeIndirectCommandBuffer(RgfxObjId icb, uint64_t rang
 void RgfxEncoder::blitResetCommandsInBuffer(RgfxObjId icb, uint64_t range_location,
                                             uint64_t range_length)
 {
-	rgfx_blit::RgfxOpResetCommandsInBuffer b = {};
+	RgfxBlitOpResetCommandsInBuffer b = {};
 	b.icb_obj_id = icb;
 	b.range_location = range_location;
 	b.range_length = range_length;
@@ -1568,7 +1568,7 @@ void RgfxEncoder::blitResetCommandsInBuffer(RgfxObjId icb, uint64_t range_locati
 
 void RgfxEncoder::blitSynchronizeResource(RgfxObjId resource, uint32_t resource_kind)
 {
-	rgfx_blit::RgfxOpSynchronizeResource b = {};
+	RgfxBlitOpSynchronizeResource b = {};
 	b.resource_obj_id = resource;
 	b.resource_kind = resource_kind;
 	appendOp(RGFX_OP_BLIT_SYNCHRONIZE_RESOURCE, &b, sizeof(b));
@@ -1576,7 +1576,7 @@ void RgfxEncoder::blitSynchronizeResource(RgfxObjId resource, uint32_t resource_
 
 void RgfxEncoder::blitSynchronizeTexture(RgfxObjId texture, uint64_t slice, uint64_t level)
 {
-	rgfx_blit::RgfxOpSynchronizeTexture b = {};
+	RgfxBlitOpSynchronizeTexture b = {};
 	b.texture_obj_id = texture;
 	b.slice = slice;
 	b.level = level;
@@ -1585,14 +1585,14 @@ void RgfxEncoder::blitSynchronizeTexture(RgfxObjId texture, uint64_t slice, uint
 
 void RgfxEncoder::blitUpdateFence(RgfxObjId fence)
 {
-	rgfx_blit::RgfxOpUpdateFence b = {};
+	RgfxBlitOpUpdateFence b = {};
 	b.fence_obj_id = fence;
 	appendOp(RGFX_OP_BLIT_UPDATE_FENCE, &b, sizeof(b));
 }
 
 void RgfxEncoder::blitWaitForFence(RgfxObjId fence)
 {
-	rgfx_blit::RgfxOpWaitForFence b = {};
+	RgfxBlitOpWaitForFence b = {};
 	b.fence_obj_id = fence;
 	appendOp(RGFX_OP_BLIT_WAIT_FOR_FENCE, &b, sizeof(b));
 }
