@@ -393,10 +393,13 @@ RgfxBlockShape rgfxBlockShapeOf(MTLPixelFormat f)
 	// The host drops the texture once every command buffer in flight now has completed (one
 	// may still name it), then its id goes back to the process's chunks, so a texture made
 	// with the id later is created on ring 0 after this one's destroy.
+	// A texture over a buffer keeps the buffer until then: the host's texture lies in it.
 	RgfxSerializer *serializer = _serializer;
 	uint64_t resourceId = _resourceId;
 	uint64_t address = _gpuAddress; // a device-placed texture's, picked by its create
-	[self rgfxRetireThen:[serializer, resourceId, address] {
+	id<MTLBuffer> buffer = _buffer;
+	[self rgfxRetireThen:[serializer, resourceId, address, buffer]() mutable {
+		buffer = nil;
 		if (serializer == nullptr)
 			return;
 		serializer->releaseResourceId(resourceId);
