@@ -2,11 +2,12 @@
 //! at fixed offsets and the guest's allocations after them (`wire`).
 //!
 //! It is private anonymous memory of the host's process (`mmap` with `MAP_PRIVATE |
-//! MAP_ANONYMOUS`), zeroed with stores, so that every page is the process's own before the guest
-//! or a GPU import touches it: RADV refuses to import a memfd's or any shared mapping (measured on
-//! the 780M and the RX 7900 XTX; `docs/graphics-kext/design.md`, Decided 5). The host maps it into
-//! the guest once, at the device's start, and it stays mapped, at the same address, until the
-//! device's end.
+//! MAP_ANONYMOUS`): RADV refuses to import a memfd's or any shared mapping (measured on the 780M
+//! and the RX 7900 XTX; `docs/graphics-kext/design.md`, Decided 5). The kernel hands it out
+//! zeroed and commits a page only when something first touches it, so a page neither the guest
+//! nor the host has used costs no host memory; a GPU import that pins the region commits what it
+//! pins. The host maps it into the guest once, at the device's start, and it stays mapped, at the
+//! same address, until the device's end.
 //!
 //! **Guest writes.** The guest writes the region while the host reads it. The host reads the
 //! rings' counters and flags with atomic loads and stores at their offsets, and copies out what a
@@ -40,8 +41,8 @@ impl std::fmt::Debug for Region {
 }
 
 impl Region {
-    /// `len` bytes of private anonymous memory, every byte written with zero. `None` where the
-    /// host refuses the mapping, or `len` is 0.
+    /// `len` bytes of private anonymous memory, which read as zero and are committed as they are
+    /// first touched. `None` where the host refuses the mapping, or `len` is 0.
     pub fn new(len: usize) -> Option<Region> {
         if len == 0 {
             return None;
@@ -60,11 +61,10 @@ impl Region {
         if base == libc::MAP_FAILED {
             return None;
         }
-        let base = base.cast::<u8>();
-        // Zeroed with stores, so each page is faulted in as the process's own (the module doc).
-        // SAFETY: the mapping is `len` bytes, readable and writable, and nothing else holds it.
-        unsafe { std::ptr::write_bytes(base, 0, len) };
-        Some(Region { base, len })
+        Some(Region {
+            base: base.cast::<u8>(),
+            len,
+        })
     }
 
     /// The region's first byte: what the host maps into the guest.
@@ -162,5 +162,35 @@ mod tests {
         assert!(region.read(64 * 1024 - 2, 3).is_none());
         assert!(region.read(u64::MAX, 1).is_none());
         assert!(Region::new(0).is_none());
+    }
+
+    /// The process's peak resident size in bytes: `ru_maxrss` is in bytes on macOS and in KiB
+    /// on Linux.
+    fn peak_resident() -> u64 {
+        // SAFETY: getrusage writes the struct it is given.
+        let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) }, 0);
+        let maxrss = u64::try_from(usage.ru_maxrss).unwrap();
+        if cfg!(target_os = "macos") {
+            maxrss
+        } else {
+            maxrss * 1024
+        }
+    }
+
+    /// A region costs host memory only for the pages that are touched: making a 1 GiB one does
+    /// not raise the process's peak resident size by anything near its size.
+    #[test]
+    fn a_region_commits_only_the_pages_that_are_touched() {
+        const LEN: usize = 1 << 30;
+        let before = peak_resident();
+        let region = Region::new(LEN).unwrap();
+        assert!(region.write(0, &[1]));
+        assert_eq!(region.read(LEN as u64 - 4096, 4096).unwrap(), vec![0; 4096]);
+        let grown = peak_resident().saturating_sub(before);
+        assert!(
+            grown < (LEN as u64) / 4,
+            "a 1 GiB region raised the peak by {grown} bytes"
+        );
     }
 }
