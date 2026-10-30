@@ -479,6 +479,24 @@ them with `IOServiceOpen` / `IOConnectMapMemory` / `IOConnectCallScalarMethod`.
   and our region-map + doorbell user client are expected to carry over. The
   IOGPU user-client ABI is deliberately not invented here.
 
+## Stage 3 device control
+
+`RgfxDeviceControl` (`guest/kext/src/RgfxDeviceControl.{hpp,cpp}`) is the
+third service on the PCI device, in a category of its own: an
+`AppleGraphicsDeviceControl` (AGDC), the System-KC library class
+AppleGraphicsControl.kext's plug-in defines. WindowServer's IOPresentment
+builds a display pipe only for a framebuffer whose PCI device has an AGDC,
+and AppleGPUWrangler pairs the AGDC with the GPU's record and sets its
+attribute 3 to its `InitFlags`. Without one, CoreDisplay logs "Unable to find
+display pipe for IOFB service" and WindowServer picks the software
+compositor. The kext names the library in `OSBundleLibraries`; the loader
+binds its base-class sites as it binds IOGraphicsFamily's.
+`AppleGraphicsDeviceControl.hpp` is our declaration of the base class, from
+the names and vtable order the KDK's x86_64 binary exports. The control
+answers attributes 1 (its description), 3 (what it makes), 0x301 (the
+wrangler's GPU index), 0x921 and 0x980 (which IOPresentment reads before it
+builds a pipe), and refuses the rest.
+
 ## Open
 
 - **Stage 3 bundle placement — RESOLVED in principle:** the bundle sits in

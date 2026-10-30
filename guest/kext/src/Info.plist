@@ -39,6 +39,21 @@
 			<key>IOProviderClass</key>
 			<string>IOPCIDevice</string>
 		</dict>
+		<key>RgfxDeviceControl</key>
+		<dict>
+			<key>CFBundleIdentifier</key>
+			<string>com.steelbrain.ReimsGraphics</string>
+			<key>IOClass</key>
+			<string>RgfxDeviceControl</string>
+			<key>IOMatchCategory</key>
+			<string>RgfxDeviceControl</string>
+			<key>IOPCIPrimaryMatch</key>
+			<string>0x52471234</string>
+			<key>IOProbeScore</key>
+			<integer>30000</integer>
+			<key>IOProviderClass</key>
+			<string>IOPCIDevice</string>
+		</dict>
 		<key>RgfxAccelerator</key>
 		<dict>
 			<key>AcceleratorProperties</key>
@@ -77,6 +92,8 @@
 	<string>26.0</string>
 	<key>OSBundleLibraries</key>
 	<dict>
+		<key>com.apple.AppleGraphicsDeviceControl</key>
+		<string>1.0.0</string>
 		<key>com.apple.iokit.IOGraphicsFamily</key>
 		<string>1.0.0b1</string>
 		<key>com.apple.iokit.IOPCIFamily</key>

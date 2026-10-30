@@ -41,10 +41,12 @@ CFLAGS   = $(FLAGS) -std=c11
 
 HEADERS = $(wildcard src/*.hpp)
 
-# The Stage-2 framebuffer (ReimsGraphics) and the Stage-3 Metal accelerator
-# (RgfxAccelerator) and its region-map + doorbell user client, all one kext.
+# The Stage-2 framebuffer (ReimsGraphics), the Stage-3 Metal accelerator
+# (RgfxAccelerator) and its region-map + doorbell user client, and the device
+# control (RgfxDeviceControl), all one kext.
 OBJECTS = $(BUILD)/obj/ReimsGraphics.o \
 	$(BUILD)/obj/RgfxAccelerator.o \
+	$(BUILD)/obj/RgfxDeviceControl.o \
 	$(BUILD)/obj/RgfxAcceleratorUserClient.o \
 	$(BUILD)/obj/RgfxDisplayPipeUserClient.o \
 	$(BUILD)/obj/kmod_info.o \
