@@ -25,9 +25,10 @@
 use std::collections::HashMap;
 
 use reims_graphics::wire::{
-    RGFX_CMD_EVENT_CREATE, RGFX_CMD_FENCE_CREATE, RGFX_CMD_OBJECT_DESTROY, RGFX_CMD_QUEUE_CREATE,
-    RGFX_CMD_SHARED_EVENT_CREATE, RgfxMsgHeader, RgfxObjectCreate, RgfxObjectDestroy,
-    RgfxQueueCreate, RgfxSharedEventCreate,
+    RGFX_CMD_EVENT_CREATE, RGFX_CMD_FENCE_CREATE, RGFX_CMD_LIBRARY_CREATE, RGFX_CMD_OBJECT_DESTROY,
+    RGFX_CMD_QUEUE_CREATE, RGFX_CMD_SHARED_EVENT_CREATE, RGFX_LIBRARY_BYTES_OFFSET,
+    RgfxLibraryCreate, RgfxMsgHeader, RgfxObjectCreate, RgfxObjectDestroy, RgfxQueueCreate,
+    RgfxSharedEventCreate,
 };
 use reims_vgpu_core::platform::Platform;
 use reims_vgpu_core::platform::device::GpuDevice;
@@ -42,6 +43,7 @@ enum ObjHandle<P: Platform> {
     Fence(P::Fence),
     SharedEvent(P::SharedEvent),
     CommandQueue(P::CommandQueue),
+    Library(P::Library),
 }
 
 /// Why a message was not carried out.
@@ -144,6 +146,27 @@ impl<P: Platform> GraphicsDecoder<P> {
                     None => Ok(Err(DecodeError::Refused)),
                 }
             }
+            RGFX_CMD_LIBRARY_CREATE => {
+                let Some(m) = read::<RgfxLibraryCreate>(message) else {
+                    return Ok(Err(DecodeError::Malformed));
+                };
+                // The `.metallib`/AIR bytes follow the header; forward them to
+                // the platform unchanged.
+                let start = RGFX_LIBRARY_BYTES_OFFSET as usize;
+                let Some(air) = (m.byte_length as usize)
+                    .checked_add(start)
+                    .and_then(|end| message.get(start..end))
+                else {
+                    return Ok(Err(DecodeError::Malformed));
+                };
+                // A nil library and a build failure both mean no usable library;
+                // the compile error's text reaches the guest with the completion
+                // in a later increment.
+                match device.new_library(air)? {
+                    Ok(Some(library)) => self.insert(m.obj_id, ObjHandle::Library(library)),
+                    Ok(None) | Err(_) => Ok(Err(DecodeError::Refused)),
+                }
+            }
             _ => Ok(Err(DecodeError::UnknownCommand)),
         }
     }
@@ -231,12 +254,29 @@ mod tests {
         };
         assert_eq!(dec.decode(&device, queue.as_bytes()).unwrap(), Ok(()));
 
-        assert_eq!(dec.object_count(), 4);
+        // A library from its AIR bytes, which follow the header.
+        let air = [1u8, 2, 3, 4, 5, 6];
+        let mut lib_msg = RgfxLibraryCreate {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_LIBRARY_CREATE,
+                size: (RGFX_LIBRARY_BYTES_OFFSET as usize + air.len()).next_multiple_of(8) as u32,
+                seqno: 0,
+            },
+            obj_id: 14,
+            byte_length: air.len() as u64,
+        }
+        .as_bytes()
+        .to_vec();
+        lib_msg.extend_from_slice(&air);
+        assert_eq!(dec.decode(&device, &lib_msg).unwrap(), Ok(()));
+
+        assert_eq!(dec.object_count(), 5);
         let log = p.call_log();
         assert_eq!(log.calls_to("newEvent").len(), 1);
         assert_eq!(log.calls_to("newFence").len(), 1);
         assert_eq!(log.calls_to("newSharedEvent").len(), 1);
         assert_eq!(log.calls_to("newCommandQueue").len(), 1);
+        assert_eq!(log.calls_to("newLibraryWithData:error:").len(), 1);
 
         // Destroying the event drops its handle; the others stay.
         let destroy = RgfxObjectDestroy {
@@ -248,7 +288,7 @@ mod tests {
             obj_id: 10,
         };
         assert_eq!(dec.decode(&device, destroy.as_bytes()).unwrap(), Ok(()));
-        assert_eq!(dec.object_count(), 3);
+        assert_eq!(dec.object_count(), 4);
         // Destroying an id the host never made is not an error.
         assert_eq!(dec.decode(&device, destroy.as_bytes()).unwrap(), Ok(()));
 
