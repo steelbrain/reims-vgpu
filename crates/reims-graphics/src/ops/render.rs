@@ -242,12 +242,12 @@ pub const RGFX_OP_RENDER_USE_RESOURCES: u16 = 0x104d;
 /// `useResources:count:usage:stages:`.
 pub const RGFX_OP_RENDER_USE_RESOURCES_STAGES: u16 = 0x104e;
 
-/// A [`RgfxResourceBinding`] names an `id<MTLBuffer>`.
-pub const RGFX_RESOURCE_KIND_BUFFER: u32 = 0;
-/// A [`RgfxResourceBinding`] names an `id<MTLTexture>`.
-pub const RGFX_RESOURCE_KIND_TEXTURE: u32 = 1;
-/// A [`RgfxResourceBinding`] names an `id<MTLIndirectCommandBuffer>`.
-pub const RGFX_RESOURCE_KIND_ICB: u32 = 2;
+// The resource-kind tags are shared across the encoder groups (defined once in the parent
+// module) so the guest-facing ABI has a single numbering.
+pub use super::{
+    RGFX_RESOURCE_KIND_BUFFER, RGFX_RESOURCE_KIND_ICB, RGFX_RESOURCE_KIND_NONE,
+    RGFX_RESOURCE_KIND_TEXTURE,
+};
 
 /// `setRenderPipelineState:`. The pipeline may be nil (`0`).
 #[repr(C)]

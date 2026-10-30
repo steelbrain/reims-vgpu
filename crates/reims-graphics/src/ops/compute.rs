@@ -130,14 +130,12 @@ pub const RGFX_OP_COMPUTE_COMPRESSED_TEXTURE_REINTERPRETATION_FLUSH: u16 = 0x201
 // the kind names, so one array can mix buffers, textures and indirect command
 // buffers, as `id<MTLResource>` does.
 
-/// A [`RgfxComputeResourceRef`] that names nothing (a nil entry, `obj_id` ignored).
-pub const RGFX_RESOURCE_KIND_NONE: u32 = 0;
-/// A [`RgfxComputeResourceRef`] whose `obj_id` names a buffer.
-pub const RGFX_RESOURCE_KIND_BUFFER: u32 = 1;
-/// A [`RgfxComputeResourceRef`] whose `obj_id` names a texture.
-pub const RGFX_RESOURCE_KIND_TEXTURE: u32 = 2;
-/// A [`RgfxComputeResourceRef`] whose `obj_id` names an indirect command buffer.
-pub const RGFX_RESOURCE_KIND_ICB: u32 = 3;
+// The resource-kind tags are shared across the encoder groups (defined once in the parent
+// module) so the guest-facing ABI has a single numbering.
+pub use super::{
+    RGFX_RESOURCE_KIND_BUFFER, RGFX_RESOURCE_KIND_ICB, RGFX_RESOURCE_KIND_NONE,
+    RGFX_RESOURCE_KIND_TEXTURE,
+};
 
 op_body! {
     /// `setComputePipelineState:`. The pipeline may be nil (`0`).

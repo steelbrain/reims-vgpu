@@ -65,6 +65,18 @@
 // A compute pass's `dispatch_type` is set (else Metal's default stands).
 #define RGFX_COMPUTE_PASS_FLAG_DISPATCH_TYPE (1 << 0)
 
+// A resource reference that names nothing (a nil entry; `obj_id` is ignored).
+#define RGFX_RESOURCE_KIND_NONE 0
+
+// A resource reference whose `obj_id` names an `id<MTLBuffer>`.
+#define RGFX_RESOURCE_KIND_BUFFER 1
+
+// A resource reference whose `obj_id` names an `id<MTLTexture>`.
+#define RGFX_RESOURCE_KIND_TEXTURE 2
+
+// A resource reference whose `obj_id` names an `id<MTLIndirectCommandBuffer>`.
+#define RGFX_RESOURCE_KIND_ICB 3
+
 // Op `COPY_BUFFER_TO_BUFFER` ([`RgfxOpCopyBufferToBuffer`]):
 // `copyFromBuffer:sourceOffset:toBuffer:destinationOffset:size:`.
 #define RGFX_OP_BLIT_COPY_BUFFER_TO_BUFFER 12288
@@ -290,18 +302,6 @@
 // Op `COMPRESSED_TEXTURE_REINTERPRETATION_FLUSH`:
 // `insertCompressedTextureReinterpretationFlush` (SPI). No body.
 #define RGFX_OP_COMPUTE_COMPRESSED_TEXTURE_REINTERPRETATION_FLUSH 8221
-
-// A [`RgfxComputeResourceRef`] that names nothing (a nil entry, `obj_id` ignored).
-#define RGFX_RESOURCE_KIND_NONE 0
-
-// A [`RgfxComputeResourceRef`] whose `obj_id` names a buffer.
-#define RGFX_RESOURCE_KIND_BUFFER 1
-
-// A [`RgfxComputeResourceRef`] whose `obj_id` names a texture.
-#define RGFX_RESOURCE_KIND_TEXTURE 2
-
-// A [`RgfxComputeResourceRef`] whose `obj_id` names an indirect command buffer.
-#define RGFX_RESOURCE_KIND_ICB 3
 
 // Op `SET_RENDER_PIPELINE_STATE` ([`RgfxOpSetRenderPipelineState`]):
 // `setRenderPipelineState:`.

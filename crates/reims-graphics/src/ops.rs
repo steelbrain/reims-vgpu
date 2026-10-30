@@ -285,6 +285,19 @@ pub struct RgfxComputePassDesc {
 /// A compute pass's `dispatch_type` is set (else Metal's default stands).
 pub const RGFX_COMPUTE_PASS_FLAG_DISPATCH_TYPE: u32 = 1 << 0;
 
+// Resource-kind tags for a resource reference inside an encoder op (`useResources:`,
+// `memoryBarrierWithResources:`, `synchronizeResource:`): they pick the resolver the host runs
+// `obj_id` through. Defined once here so the guest-facing ABI has a single numbering for every
+// encoder group.
+/// A resource reference that names nothing (a nil entry; `obj_id` is ignored).
+pub const RGFX_RESOURCE_KIND_NONE: u32 = 0;
+/// A resource reference whose `obj_id` names an `id<MTLBuffer>`.
+pub const RGFX_RESOURCE_KIND_BUFFER: u32 = 1;
+/// A resource reference whose `obj_id` names an `id<MTLTexture>`.
+pub const RGFX_RESOURCE_KIND_TEXTURE: u32 = 2;
+/// A resource reference whose `obj_id` names an `id<MTLIndirectCommandBuffer>`.
+pub const RGFX_RESOURCE_KIND_ICB: u32 = 3;
+
 // The op-stream layout.
 const _: () = {
     use core::mem::size_of;

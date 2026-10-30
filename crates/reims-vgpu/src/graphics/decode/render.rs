@@ -105,6 +105,7 @@ fn resolve_resource<P: Platform>(
         return Ok(None);
     }
     Ok(Some(match e.kind {
+        RGFX_RESOURCE_KIND_NONE => return Ok(None),
         RGFX_RESOURCE_KIND_BUFFER => OwnedResource::Buffer(objs.require_buffer(e.obj_id)?),
         RGFX_RESOURCE_KIND_TEXTURE => OwnedResource::Texture(objs.require_texture(e.obj_id)?),
         RGFX_RESOURCE_KIND_ICB => {
