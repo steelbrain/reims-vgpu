@@ -70,6 +70,12 @@ public:
 	IOReturn setAttributeForConnection(IOIndex connectIndex, IOSelect attribute,
 	                                   uintptr_t value) override;
 
+	// IOFramebuffer: the display's EDID, made by the driver from the display's modes
+	// (makeEdid), which IODisplay reads for the display's identity.
+	bool hasDDCConnect(IOIndex connectIndex) override;
+	IOReturn getDDCBlock(IOIndex connectIndex, UInt32 blockNumber, IOSelect blockType,
+	                     IOOptionBits options, UInt8 *data, IOByteCount *length) override;
+
 	// IOFramebuffer: the hardware cursor
 	IOReturn setCursorImage(void *cursorImage) override;
 	IOReturn setCursorState(SInt32 x, SInt32 y, bool visible) override;
@@ -108,9 +114,6 @@ public:
 	IOReturn setDetailedTimings(OSArray *array) override;
 	IOReturn connectFlags(IOIndex connectIndex, IODisplayModeID displayMode,
 	                      IOOptionBits *flags) override;
-	bool hasDDCConnect(IOIndex connectIndex) override;
-	IOReturn getDDCBlock(IOIndex connectIndex, UInt32 blockNumber, IOSelect blockType,
-	                     IOOptionBits options, UInt8 *data, IOByteCount *length) override;
 #endif
 
 	// The display pipe (RgfxDisplayPipeUserClient, on the accelerator) presents through the
@@ -155,6 +158,27 @@ private:
 		UInt32 refreshMhz;
 	};
 	static constexpr UInt32 kMaxModes = 64;
+
+	// A mode's timing: the active size with reduced blanking (VESA CVT's second reduced
+	// blanking: a fixed 80-pixel horizontal blank and at least 460 us of vertical blank),
+	// its pixel clock in 10 kHz steps, as an EDID carries it. The EDID and
+	// getTimingInfoForDisplayMode both give it, so IODisplay and WindowServer find the
+	// driver's modes among the display's.
+	struct Timing {
+		UInt64 pixelClock;
+		UInt32 hActive, hBlank, hFront, hSync;
+		UInt32 vActive, vBlank, vFront, vSync;
+	};
+	static void timingFor(const Mode &mode, Timing *timing);
+
+	// The display's EDID: a base block, then DisplayID extension blocks listing every mode,
+	// since a mode's pixel clock can be past the base block's limit. makeEdid fills block
+	// `index` (0 the base) and returns false past the last. Call with stateLock held.
+	static constexpr UInt32 kEdidBlockBytes = 128;
+	static constexpr UInt32 kEdidModesPerBlock = 5;
+	static constexpr UInt32 kEdidMaxExtensions = (kMaxModes + kEdidModesPerBlock - 1) / kEdidModesPerBlock;
+	UInt32 edidExtensionCount() const;
+	bool makeEdid(UInt32 index, UInt8 *block) const;
 
 	// Power: IOFramebuffer sets kIOPowerAttribute to one of the driver's three power
 	// states (off, doze, on); the driver tells IOFramebuffer as it leaves and reaches on.

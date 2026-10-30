@@ -998,8 +998,7 @@ IOReturn ReimsGraphics::setStartupDisplayMode(IODisplayModeID displayMode, IOInd
 	return ok ? kIOReturnSuccess : kIOReturnBadArgument;
 }
 
-// The display has no EDID: each mode is a fixed-rate panel's, with no
-// blanking, so the pixel clock gives back the mode's rate.
+// Each mode is a fixed-rate panel's, with the timing its EDID entry gives.
 IOReturn ReimsGraphics::getTimingInfoForDisplayMode(IODisplayModeID displayMode,
                                                     IOTimingInformation *info)
 {
@@ -1011,15 +1010,26 @@ IOReturn ReimsGraphics::getTimingInfoForDisplayMode(IODisplayModeID displayMode,
 	        ok ? "ok" : "UNKNOWN", info ? static_cast<unsigned>(info->flags) : 0);
 	if (!ok || !info)
 		return kIOReturnBadArgument;
+	Timing timing;
+	timingFor(m, &timing);
 	bzero(info, sizeof(*info));
 	info->appleTimingID = kIOTimingIDApple_FixedRateLCD;
 	info->flags = kIODetailedTimingValid;
 	IODetailedTimingInformationV2 &t = info->detailedInfo.v2;
-	t.pixelClock = static_cast<UInt64>(m.width) * m.height * m.refreshMhz / 1000;
-	t.minPixelClock = t.pixelClock;
-	t.maxPixelClock = t.pixelClock;
-	t.horizontalActive = m.width;
-	t.verticalActive = m.height;
+	t.pixelClock = timing.pixelClock;
+	t.minPixelClock = timing.pixelClock;
+	t.maxPixelClock = timing.pixelClock;
+	t.horizontalActive = timing.hActive;
+	t.horizontalBlanking = timing.hBlank;
+	t.horizontalSyncOffset = timing.hFront;
+	t.horizontalSyncPulseWidth = timing.hSync;
+	t.verticalActive = timing.vActive;
+	t.verticalBlanking = timing.vBlank;
+	t.verticalSyncOffset = timing.vFront;
+	t.verticalSyncPulseWidth = timing.vSync;
+	// Reduced blanking's sync: horizontal positive, vertical negative.
+	t.horizontalSyncConfig = kIOSyncPositivePolarity;
+	t.verticalSyncConfig = 0;
 	return kIOReturnSuccess;
 }
 
@@ -1087,9 +1097,11 @@ IOReturn ReimsGraphics::connectionAttribute(IOIndex connectIndex, IOSelect attri
 		*value = 0;
 		return kIOReturnSuccess;
 	case kConnectionSupportsHLDDCSense:
+		// The driver's own EDID, block by block (getDDCBlock); value may be null.
+		return kIOReturnSuccess;
 	case kConnectionSupportsLLDDCSense:
 	case kConnectionSupportsAppleSense:
-		// No EDID and no sense lines.
+		// No I2C lines and no sense lines.
 		return kIOReturnUnsupported;
 	default:
 		return super::getAttributeForConnection(connectIndex, attribute, value);
@@ -1121,6 +1133,270 @@ IOReturn ReimsGraphics::setConnectionAttribute(IOIndex connectIndex, IOSelect at
 	default:
 		return super::setAttributeForConnection(connectIndex, attribute, value);
 	}
+}
+
+// MARK: - The display's timings and EDID
+
+void ReimsGraphics::timingFor(const Mode &mode, Timing *t)
+{
+	// Reduced blanking: 80 pixels of horizontal blank (8 front porch, 32 sync), and enough
+	// lines of vertical blank to last 460 us at the mode's rate, at least the sync's 8 and
+	// the back porch's 6 and one front porch line. 460 us is the fraction
+	// refreshMhz * 460 / 1e9 of a frame, so the blank is vActive * f / (1 - f) lines.
+	t->hActive = mode.width;
+	t->hBlank = 80;
+	t->hFront = 8;
+	t->hSync = 32;
+	t->vActive = mode.height;
+	t->vSync = 8;
+	UInt64 blankPart = static_cast<UInt64>(mode.refreshMhz) * 460;
+	UInt64 activePart = 1000000000ull > blankPart ? 1000000000ull - blankPart : 1;
+	UInt64 vBlank = (static_cast<UInt64>(mode.height) * blankPart + activePart - 1) / activePart;
+	if (vBlank < 8 + 6 + 1)
+		vBlank = 8 + 6 + 1;
+	t->vBlank = static_cast<UInt32>(vBlank);
+	t->vFront = t->vBlank - t->vSync - 6;
+	UInt64 total = static_cast<UInt64>(t->hActive + t->hBlank) * (t->vActive + t->vBlank);
+	UInt64 clock = total * mode.refreshMhz / 1000;
+	t->pixelClock = (clock + 5000) / 10000 * 10000;
+}
+
+UInt32 ReimsGraphics::edidExtensionCount() const
+{
+	UInt32 n = (modeCount + kEdidModesPerBlock - 1) / kEdidModesPerBlock;
+	return n ? n : 1;
+}
+
+namespace {
+
+// The EDID's identity: our own three-letter PNP manufacturer ID "RVG", packed as five
+// bits a letter ('A' is 1), and our product code.
+constexpr UInt16 kEdidManufacturer = ((('R' - '@') << 10) | (('V' - '@') << 5) | ('G' - '@'));
+constexpr UInt16 kEdidProduct = 0x5247;
+constexpr char kEdidName[] = "Reims Display";
+
+// The largest pixel clock a base block's detailed timing holds: 16 bits of 10 kHz.
+constexpr UInt64 kEdidDetailedClockMax = 0xffffull * 10000;
+
+// The size, in millimetres, the EDID gives a mode's display: at 220 pixels per inch for a
+// mode at least 2880 pixels wide, as a high-density panel, and 110 otherwise.
+UInt32 edidMillimetres(UInt32 pixels, UInt32 width)
+{
+	UInt32 ppi = width >= 2880 ? 220 : 110;
+	return (pixels * 254 + ppi * 5) / (ppi * 10);
+}
+
+void edidChecksum(UInt8 *block)
+{
+	UInt8 sum = 0;
+	for (UInt32 i = 0; i < 127; i++)
+		sum = static_cast<UInt8>(sum + block[i]);
+	block[127] = static_cast<UInt8>(-sum);
+}
+
+// One 10-bit chromaticity coordinate, from thousandths.
+constexpr UInt32 chroma(UInt32 thousandths)
+{
+	return (thousandths * 1024 + 500) / 1000;
+}
+
+} // namespace
+
+// Block 0 is the base block: the identity, sRGB colour, the preferred mode's detailed timing
+// when its clock fits one (else the largest mode whose does), and the product name. Each
+// extension is a DisplayID 1.3 section with a type I timing block of up to five modes, the
+// preferred mode first and marked so.
+bool ReimsGraphics::makeEdid(UInt32 index, UInt8 *b) const
+{
+	UInt32 extensions = edidExtensionCount();
+	if (index > extensions)
+		return false;
+	bzero(b, kEdidBlockBytes);
+
+	// The modes, the preferred one first.
+	Mode order[kMaxModes];
+	UInt32 n = 0;
+	for (UInt32 i = 0; i < modeCount; i++) {
+		if (modes[i].id == preferredId)
+			order[n++] = modes[i];
+	}
+	for (UInt32 i = 0; i < modeCount; i++) {
+		if (modes[i].id != preferredId)
+			order[n++] = modes[i];
+	}
+
+	if (index > 0) {
+		UInt32 first = (index - 1) * kEdidModesPerBlock;
+		UInt32 count = first < n ? n - first : 0;
+		if (count > kEdidModesPerBlock)
+			count = kEdidModesPerBlock;
+		b[0] = 0x70; // DisplayID
+		b[1] = 0x13; // version 1.3
+		b[3] = 0x00; // an extension section
+		b[4] = 0x00; // no further sections
+		UInt32 at = 5;
+		if (count) {
+			b[at++] = 0x03; // type I detailed timings
+			b[at++] = 0x00;
+			b[at++] = static_cast<UInt8>(count * 20);
+			for (UInt32 j = 0; j < count; j++, at += 20) {
+				Timing t;
+				timingFor(order[first + j], &t);
+				UInt32 clock = static_cast<UInt32>(t.pixelClock / 10000) - 1;
+				UInt8 *d = b + at;
+				d[0] = static_cast<UInt8>(clock);
+				d[1] = static_cast<UInt8>(clock >> 8);
+				d[2] = static_cast<UInt8>(clock >> 16);
+				// Preferred (bit 7) for the first mode of the first block; aspect undefined.
+				d[3] = static_cast<UInt8>((index == 1 && j == 0 ? 0x80 : 0x00) | 0x08);
+				UInt16 fields[8] = {
+				    static_cast<UInt16>(t.hActive - 1), static_cast<UInt16>(t.hBlank - 1),
+				    // Bit 15: positive horizontal sync.
+				    static_cast<UInt16>((t.hFront - 1) | 0x8000), static_cast<UInt16>(t.hSync - 1),
+				    static_cast<UInt16>(t.vActive - 1), static_cast<UInt16>(t.vBlank - 1),
+				    static_cast<UInt16>(t.vFront - 1), static_cast<UInt16>(t.vSync - 1),
+				};
+				for (UInt32 f = 0; f < 8; f++) {
+					d[4 + f * 2] = static_cast<UInt8>(fields[f]);
+					d[5 + f * 2] = static_cast<UInt8>(fields[f] >> 8);
+				}
+			}
+		}
+		b[2] = static_cast<UInt8>(at - 5);
+		UInt8 sum = 0;
+		for (UInt32 i = 1; i < at; i++)
+			sum = static_cast<UInt8>(sum + b[i]);
+		b[at] = static_cast<UInt8>(-sum);
+		edidChecksum(b);
+		return true;
+	}
+
+	// The base block's detailed timing: the preferred mode, or the largest that fits.
+	const Mode *detailed = nullptr;
+	for (UInt32 i = 0; i < n; i++) {
+		Timing t;
+		timingFor(order[i], &t);
+		if (t.pixelClock > kEdidDetailedClockMax || order[i].width > 4095 || order[i].height > 4095)
+			continue;
+		if (!detailed || i == 0 ||
+		    static_cast<UInt64>(order[i].width) * order[i].height >
+		        static_cast<UInt64>(detailed->width) * detailed->height)
+			detailed = &order[i];
+		if (i == 0)
+			break;
+	}
+	const Mode &native = n ? order[0] : current;
+
+	static const UInt8 header[8] = {0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00};
+	memcpy(b, header, sizeof(header));
+	b[8] = static_cast<UInt8>(kEdidManufacturer >> 8);
+	b[9] = static_cast<UInt8>(kEdidManufacturer);
+	b[10] = static_cast<UInt8>(kEdidProduct);
+	b[11] = static_cast<UInt8>(kEdidProduct >> 8);
+	// The serial: the product code over the device's display id, so each display keeps its own.
+	UInt32 serial = (static_cast<UInt32>(kEdidProduct) << 16) | ((displayId + 1) & 0xffff);
+	b[12] = static_cast<UInt8>(serial);
+	b[13] = static_cast<UInt8>(serial >> 8);
+	b[14] = static_cast<UInt8>(serial >> 16);
+	b[15] = static_cast<UInt8>(serial >> 24);
+	b[16] = 0;    // week unspecified
+	b[17] = 36;   // 2026
+	b[18] = 1;    // EDID 1.4
+	b[19] = 4;
+	b[20] = 0xa5; // digital, 8 bits a component, DisplayPort
+	b[21] = static_cast<UInt8>((edidMillimetres(native.width, native.width) + 5) / 10);
+	b[22] = static_cast<UInt8>((edidMillimetres(native.height, native.width) + 5) / 10);
+	b[23] = 120;  // gamma 2.2
+	// RGB 4:4:4, sRGB the default colour space, and the first timing the preferred one
+	// where it is.
+	b[24] = static_cast<UInt8>(0x04 | (detailed == &order[0] ? 0x02 : 0x00));
+
+	// sRGB's primaries and D65 white, 10 bits each.
+	const UInt32 rx = chroma(640), ry = chroma(330), gx = chroma(300), gy = chroma(600);
+	const UInt32 bx = chroma(150), by = chroma(60), wx = chroma(313), wy = chroma(329);
+	b[25] = static_cast<UInt8>(((rx & 3) << 6) | ((ry & 3) << 4) | ((gx & 3) << 2) | (gy & 3));
+	b[26] = static_cast<UInt8>(((bx & 3) << 6) | ((by & 3) << 4) | ((wx & 3) << 2) | (wy & 3));
+	b[27] = static_cast<UInt8>(rx >> 2);
+	b[28] = static_cast<UInt8>(ry >> 2);
+	b[29] = static_cast<UInt8>(gx >> 2);
+	b[30] = static_cast<UInt8>(gy >> 2);
+	b[31] = static_cast<UInt8>(bx >> 2);
+	b[32] = static_cast<UInt8>(by >> 2);
+	b[33] = static_cast<UInt8>(wx >> 2);
+	b[34] = static_cast<UInt8>(wy >> 2);
+	// No established timings; no standard timings (01 01 each).
+	for (UInt32 i = 38; i < 54; i++)
+		b[i] = 0x01;
+
+	UInt8 *d = b + 54;
+	if (detailed) {
+		Timing t;
+		timingFor(*detailed, &t);
+		UInt32 clock = static_cast<UInt32>(t.pixelClock / 10000);
+		UInt32 hmm = edidMillimetres(t.hActive, native.width);
+		UInt32 vmm = edidMillimetres(t.vActive, native.width);
+		d[0] = static_cast<UInt8>(clock);
+		d[1] = static_cast<UInt8>(clock >> 8);
+		d[2] = static_cast<UInt8>(t.hActive);
+		d[3] = static_cast<UInt8>(t.hBlank);
+		d[4] = static_cast<UInt8>(((t.hActive >> 8) << 4) | (t.hBlank >> 8));
+		d[5] = static_cast<UInt8>(t.vActive);
+		d[6] = static_cast<UInt8>(t.vBlank);
+		d[7] = static_cast<UInt8>(((t.vActive >> 8) << 4) | (t.vBlank >> 8));
+		d[8] = static_cast<UInt8>(t.hFront);
+		d[9] = static_cast<UInt8>(t.hSync);
+		d[10] = static_cast<UInt8>(((t.vFront & 0xf) << 4) | (t.vSync & 0xf));
+		d[11] = static_cast<UInt8>(((t.hFront >> 8) << 6) | ((t.hSync >> 8) << 4) |
+		                           ((t.vFront >> 4) << 2) | (t.vSync >> 4));
+		d[12] = static_cast<UInt8>(hmm);
+		d[13] = static_cast<UInt8>(vmm);
+		d[14] = static_cast<UInt8>(((hmm >> 8) << 4) | ((vmm >> 8) & 0xf));
+		// Digital separate sync, vertical negative, horizontal positive.
+		d[17] = 0x1a;
+	} else {
+		d[3] = 0x10; // a dummy descriptor
+	}
+	d += 18;
+
+	// The product name, padded as the descriptor asks.
+	d[3] = 0xfc;
+	UInt32 len = sizeof(kEdidName) - 1;
+	for (UInt32 i = 0; i < 13; i++)
+		d[5 + i] = i < len ? static_cast<UInt8>(kEdidName[i]) : (i == len ? 0x0a : 0x20);
+	d += 18;
+	d[3] = 0x10;
+	d += 18;
+	d[3] = 0x10;
+
+	b[126] = static_cast<UInt8>(extensions);
+	edidChecksum(b);
+	return true;
+}
+
+bool ReimsGraphics::hasDDCConnect(IOIndex connectIndex)
+{
+	IOLockLock(stateLock);
+	bool r = connectIndex == 0 && haveDisplay && connected;
+	IOLockUnlock(stateLock);
+	FBTRACE(8, "hasDDCConnect %d -> %d", static_cast<int>(connectIndex), r);
+	return r;
+}
+
+// Block 1 is the base block and 2 on its extensions, as IODisplay asks for them.
+IOReturn ReimsGraphics::getDDCBlock(IOIndex connectIndex, UInt32 blockNumber, IOSelect blockType,
+                                    IOOptionBits options, UInt8 *data, IOByteCount *length)
+{
+	if (connectIndex != 0 || blockType != kIODDCBlockTypeEDID || !blockNumber || !data || !length ||
+	    *length < kEdidBlockBytes)
+		return kIOReturnBadArgument;
+	IOLockLock(stateLock);
+	bool ok = haveDisplay && makeEdid(blockNumber - 1, data);
+	IOLockUnlock(stateLock);
+	FBTRACE(16, "getDDCBlock %d block %u -> %d", static_cast<int>(connectIndex), blockNumber, ok);
+	if (!ok)
+		return kIOReturnUnsupported;
+	*length = kEdidBlockBytes;
+	return kIOReturnSuccess;
 }
 
 // MARK: - Power
@@ -1428,18 +1704,4 @@ IOReturn ReimsGraphics::connectFlags(IOIndex connectIndex, IODisplayModeID displ
 	return r;
 }
 
-bool ReimsGraphics::hasDDCConnect(IOIndex connectIndex)
-{
-	bool r = super::hasDDCConnect(connectIndex);
-	FBTRACE(8, "hasDDCConnect %d -> %d", static_cast<int>(connectIndex), r);
-	return r;
-}
-
-IOReturn ReimsGraphics::getDDCBlock(IOIndex connectIndex, UInt32 blockNumber, IOSelect blockType,
-                                    IOOptionBits options, UInt8 *data, IOByteCount *length)
-{
-	IOReturn r = super::getDDCBlock(connectIndex, blockNumber, blockType, options, data, length);
-	FBTRACE(8, "getDDCBlock %d block %u -> 0x%x", static_cast<int>(connectIndex), blockNumber, r);
-	return r;
-}
 #endif
