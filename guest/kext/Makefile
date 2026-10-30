@@ -23,7 +23,7 @@ VERSION  = 1.0.0
 SDK     ?= $(shell xcrun --sdk macosx --show-sdk-path)
 KERNEL   = $(SDK)/System/Library/Frameworks/Kernel.framework/Headers
 
-BUILD    = build
+BUILD   ?= build
 KEXT     = $(BUILD)/$(NAME).kext
 BINARY   = $(KEXT)/Contents/MacOS/$(NAME)
 
@@ -31,10 +31,12 @@ KDK        ?=
 KEXTINJECT ?=
 BOOT_KC    ?=
 
+TRACE   ?= 0
+
 ARCH = -arch x86_64 -isysroot $(SDK) -mmacosx-version-min=26.0
 
 FLAGS = $(ARCH) -mkernel -nostdinc -isystem $(KERNEL) -I../../crates/reims-graphics/include \
-	-DKERNEL -DBUNDLE_VERSION='"$(VERSION)"' \
+	-DKERNEL -DBUNDLE_VERSION='"$(VERSION)"' -DRGFX_FB_TRACE=$(TRACE) \
 	-Os -Wall -Wextra -Werror -Wno-unused-parameter \
 	-Wno-deprecated-declarations
 

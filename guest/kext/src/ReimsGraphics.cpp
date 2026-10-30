@@ -79,6 +79,52 @@ inline UInt32 field32(const volatile UInt8 *payload, UInt32 offset)
 	return *reinterpret_cast<const volatile UInt32 *>(payload + offset);
 }
 
+#if RGFX_FB_TRACE
+// A trace line, logged for a site's first `limit` calls.
+#define FBTRACE(limit, fmt, ...)                                                             \
+	do {                                                                                 \
+		static UInt32 traced_;                                                       \
+		if (__atomic_fetch_add(&traced_, 1, __ATOMIC_RELAXED) < (limit))           \
+			IOLog("RGFX fb " fmt "\n", ##__VA_ARGS__);                          \
+	} while (0)
+
+// An attribute's call, logged for the first few calls of each (kind, attribute).
+void traceAttribute(const char *kind, IOIndex connect, IOSelect attribute, uintptr_t value,
+                    IOReturn r)
+{
+	struct Seen {
+		const char *kind;
+		IOSelect attribute;
+		UInt32 count;
+	};
+	static Seen seen[128];
+	UInt32 i = 0;
+	for (; i < 128 && seen[i].kind; i++) {
+		if (seen[i].kind == kind && seen[i].attribute == attribute)
+			break;
+	}
+	if (i == 128)
+		return;
+	if (!seen[i].kind) {
+		seen[i].kind = kind;
+		seen[i].attribute = attribute;
+	}
+	if (seen[i].count++ >= 4)
+		return;
+	char cc[5];
+	for (int b = 0; b < 4; b++) {
+		char c = static_cast<char>((attribute >> (24 - 8 * b)) & 0xff);
+		cc[b] = c >= 0x20 && c < 0x7f ? c : '.';
+	}
+	cc[4] = 0;
+	IOLog("RGFX fb %s conn %d '%s' (0x%x) value 0x%lx -> 0x%x\n", kind, static_cast<int>(connect),
+	      cc, attribute, static_cast<unsigned long>(value), r);
+}
+#else
+#define FBTRACE(...) do {} while (0)
+inline void traceAttribute(const char *, IOIndex, IOSelect, uintptr_t, IOReturn) {}
+#endif
+
 } // namespace
 
 // MARK: - Registers and the control rings
@@ -787,7 +833,9 @@ IOReturn ReimsGraphics::enableController()
 	IOLockLock(stateLock);
 	bool ok = modeFor(startupId, &m);
 	IOLockUnlock(stateLock);
-	return ok ? setScanout(m) : kIOReturnNotReady;
+	IOReturn r = ok ? setScanout(m) : kIOReturnNotReady;
+	FBTRACE(8, "enableController: startup mode %d -> 0x%x", static_cast<int>(startupId), r);
+	return r;
 }
 
 IODeviceMemory *ReimsGraphics::getApertureRange(IOPixelAperture aperture)
@@ -801,6 +849,7 @@ IODeviceMemory *ReimsGraphics::getApertureRange(IOPixelAperture aperture)
 	if (!ok)
 		return nullptr;
 	UInt64 length = round_page_64(static_cast<UInt64>(strideFor(m.width)) * m.height);
+	FBTRACE(8, "getApertureRange: %ux%u, 0x%llx bytes", m.width, m.height, length);
 	return IODeviceMemory::withSubRange(region, RGFX_ALLOCATIONS_OFFSET, length);
 }
 
@@ -822,6 +871,7 @@ IOItemCount ReimsGraphics::getDisplayModeCount()
 	IOLockLock(stateLock);
 	reportedCount = modeCount;
 	IOLockUnlock(stateLock);
+	FBTRACE(16, "getDisplayModeCount -> %u", reportedCount);
 	return reportedCount;
 }
 
@@ -833,6 +883,8 @@ IOReturn ReimsGraphics::getDisplayModes(IODisplayModeID *allDisplayModes)
 	IOLockLock(stateLock);
 	for (UInt32 i = 0; i < reportedCount; i++)
 		allDisplayModes[i] = i < modeCount ? modes[i].id : preferredId;
+	FBTRACE(16, "getDisplayModes: %u modes, first %d", reportedCount,
+	        reportedCount ? static_cast<int>(allDisplayModes[0]) : -1);
 	IOLockUnlock(stateLock);
 	return kIOReturnSuccess;
 }
@@ -845,6 +897,8 @@ IOReturn ReimsGraphics::getInformationForDisplayMode(IODisplayModeID displayMode
 	bool ok = modeFor(displayMode, &m);
 	bool preferred = displayMode == preferredId;
 	IOLockUnlock(stateLock);
+	FBTRACE(48, "getInformationForDisplayMode %d: %s %ux%u", static_cast<int>(displayMode),
+	        ok ? "ok" : "UNKNOWN", ok ? m.width : 0, ok ? m.height : 0);
 	if (!ok || !info)
 		return kIOReturnBadArgument;
 	bzero(info, sizeof(*info));
@@ -864,6 +918,8 @@ UInt64 ReimsGraphics::getPixelFormatsForDisplayMode(IODisplayModeID, IOIndex)
 IOReturn ReimsGraphics::getPixelInformation(IODisplayModeID displayMode, IOIndex depth,
                                             IOPixelAperture aperture, IOPixelInformation *pixelInfo)
 {
+	FBTRACE(48, "getPixelInformation mode %d depth %d aperture %d", static_cast<int>(displayMode),
+	        static_cast<int>(depth), static_cast<int>(aperture));
 	if (depth != 0 || aperture != kIOFBSystemAperture || !pixelInfo)
 		return kIOReturnUnsupportedMode;
 	Mode m;
@@ -893,6 +949,7 @@ IOReturn ReimsGraphics::getCurrentDisplayMode(IODisplayModeID *displayMode, IOIn
 	IOLockLock(stateLock);
 	IODisplayModeID id = haveCurrent ? current.id : startupId;
 	IOLockUnlock(stateLock);
+	FBTRACE(32, "getCurrentDisplayMode -> %d", static_cast<int>(id));
 	if (displayMode)
 		*displayMode = id;
 	if (depth)
@@ -902,6 +959,7 @@ IOReturn ReimsGraphics::getCurrentDisplayMode(IODisplayModeID *displayMode, IOIn
 
 IOReturn ReimsGraphics::setDisplayMode(IODisplayModeID displayMode, IOIndex depth)
 {
+	FBTRACE(16, "setDisplayMode %d depth %d", static_cast<int>(displayMode), static_cast<int>(depth));
 	if (depth != 0)
 		return kIOReturnUnsupportedMode;
 	Mode m;
@@ -916,6 +974,7 @@ IOReturn ReimsGraphics::getStartupDisplayMode(IODisplayModeID *displayMode, IOIn
 	IOLockLock(stateLock);
 	IODisplayModeID id = startupId;
 	IOLockUnlock(stateLock);
+	FBTRACE(16, "getStartupDisplayMode -> %d", static_cast<int>(id));
 	if (displayMode)
 		*displayMode = id;
 	if (depth)
@@ -925,6 +984,8 @@ IOReturn ReimsGraphics::getStartupDisplayMode(IODisplayModeID *displayMode, IOIn
 
 IOReturn ReimsGraphics::setStartupDisplayMode(IODisplayModeID displayMode, IOIndex depth)
 {
+	FBTRACE(16, "setStartupDisplayMode %d depth %d", static_cast<int>(displayMode),
+	        static_cast<int>(depth));
 	if (depth != 0)
 		return kIOReturnUnsupportedMode;
 	Mode m;
@@ -945,6 +1006,8 @@ IOReturn ReimsGraphics::getTimingInfoForDisplayMode(IODisplayModeID displayMode,
 	IOLockLock(stateLock);
 	bool ok = modeFor(displayMode, &m);
 	IOLockUnlock(stateLock);
+	FBTRACE(48, "getTimingInfoForDisplayMode %d: %s, flags in 0x%x", static_cast<int>(displayMode),
+	        ok ? "ok" : "UNKNOWN", info ? static_cast<unsigned>(info->flags) : 0);
 	if (!ok || !info)
 		return kIOReturnBadArgument;
 	bzero(info, sizeof(*info));
@@ -966,17 +1029,24 @@ IOReturn ReimsGraphics::getAttribute(IOSelect attribute, uintptr_t *value)
 	if (attribute == kIOHardwareCursorAttribute) {
 		if (value)
 			*value = 1;
+		traceAttribute("getAttribute", -1, attribute, 1, kIOReturnSuccess);
 		return kIOReturnSuccess;
 	}
-	return super::getAttribute(attribute, value);
+	IOReturn r = super::getAttribute(attribute, value);
+	traceAttribute("getAttribute", -1, attribute, value ? *value : 0, r);
+	return r;
 }
 
 IOReturn ReimsGraphics::setAttribute(IOSelect attribute, uintptr_t value)
 {
 	// The device has no power states of its own.
-	if (attribute == kIOPowerAttribute)
+	if (attribute == kIOPowerAttribute) {
+		traceAttribute("setAttribute", -1, attribute, value, kIOReturnSuccess);
 		return kIOReturnSuccess;
-	return super::setAttribute(attribute, value);
+	}
+	IOReturn r = super::setAttribute(attribute, value);
+	traceAttribute("setAttribute", -1, attribute, value, r);
+	return r;
 }
 
 IOItemCount ReimsGraphics::getConnectionCount()
@@ -987,6 +1057,17 @@ IOItemCount ReimsGraphics::getConnectionCount()
 IOReturn ReimsGraphics::getAttributeForConnection(IOIndex connectIndex, IOSelect attribute,
                                                   uintptr_t *value)
 {
+#if RGFX_FB_TRACE
+	IOReturn r = connectionAttribute(connectIndex, attribute, value);
+	traceAttribute("getAttributeForConnection", connectIndex, attribute,
+	               value && r == kIOReturnSuccess ? *value : 0, r);
+	return r;
+}
+
+IOReturn ReimsGraphics::connectionAttribute(IOIndex connectIndex, IOSelect attribute,
+                                            uintptr_t *value)
+{
+#endif
 	if (connectIndex != 0)
 		return kIOReturnBadArgument;
 	switch (attribute) {
@@ -1017,6 +1098,16 @@ IOReturn ReimsGraphics::getAttributeForConnection(IOIndex connectIndex, IOSelect
 IOReturn ReimsGraphics::setAttributeForConnection(IOIndex connectIndex, IOSelect attribute,
                                                   uintptr_t value)
 {
+#if RGFX_FB_TRACE
+	IOReturn r = setConnectionAttribute(connectIndex, attribute, value);
+	traceAttribute("setAttributeForConnection", connectIndex, attribute, value, r);
+	return r;
+}
+
+IOReturn ReimsGraphics::setConnectionAttribute(IOIndex connectIndex, IOSelect attribute,
+                                               uintptr_t value)
+{
+#endif
 	if (connectIndex != 0)
 		return kIOReturnBadArgument;
 	switch (attribute) {
@@ -1092,6 +1183,9 @@ IOReturn ReimsGraphics::registerForInterruptType(IOSelect interruptType, IOFBInt
 	Interrupt *i = interruptType == kIOFBVBLInterruptType       ? &vblank
 	               : interruptType == kIOFBConnectInterruptType ? &connect
 	                                                            : nullptr;
+	FBTRACE(8, "registerForInterruptType '%c%c%c%c'", static_cast<char>(interruptType >> 24),
+	        static_cast<char>(interruptType >> 16), static_cast<char>(interruptType >> 8),
+	        static_cast<char>(interruptType));
 	if (!i)
 		return kIOReturnUnsupported;
 	IOSimpleLockLock(interruptLock);
@@ -1168,3 +1262,135 @@ void ReimsGraphics::setPipeVblankEnabled(bool enabled)
 	IOSimpleLockUnlock(interruptLock);
 	kickWorkLoop();
 }
+
+#if RGFX_FB_TRACE
+// MARK: - The trace build's forwarding overrides
+
+IOReturn ReimsGraphics::open()
+{
+	IOReturn r = super::open();
+	FBTRACE(8, "open -> 0x%x", r);
+	return r;
+}
+
+void ReimsGraphics::close()
+{
+	FBTRACE(8, "close");
+	super::close();
+}
+
+IOReturn ReimsGraphics::setGammaTable(UInt32 channelCount, UInt32 dataCount, UInt32 dataWidth,
+                                      void *data)
+{
+	IOReturn r = super::setGammaTable(channelCount, dataCount, dataWidth, data);
+	FBTRACE(4, "setGammaTable %u x %u x %u bits -> 0x%x", channelCount, dataCount, dataWidth, r);
+	return r;
+}
+
+IOReturn ReimsGraphics::setPowerState(unsigned long powerStateOrdinal, IOService *device)
+{
+	IOReturn r = super::setPowerState(powerStateOrdinal, device);
+	FBTRACE(16, "setPowerState %lu -> 0x%x", powerStateOrdinal, r);
+	return r;
+}
+
+IOReturn ReimsGraphics::powerStateWillChangeTo(IOPMPowerFlags flags, unsigned long state,
+                                               IOService *device)
+{
+	IOReturn r = super::powerStateWillChangeTo(flags, state, device);
+	FBTRACE(16, "powerStateWillChangeTo flags 0x%lx state %lu -> 0x%x",
+	        static_cast<unsigned long>(flags), state, r);
+	return r;
+}
+
+IOReturn ReimsGraphics::powerStateDidChangeTo(IOPMPowerFlags flags, unsigned long state,
+                                              IOService *device)
+{
+	IOReturn r = super::powerStateDidChangeTo(flags, state, device);
+	FBTRACE(16, "powerStateDidChangeTo flags 0x%lx state %lu -> 0x%x",
+	        static_cast<unsigned long>(flags), state, r);
+	return r;
+}
+
+IOReturn ReimsGraphics::newUserClient(task_t owningTask, void *securityID, UInt32 type,
+                                      IOUserClient **clientH)
+{
+	IOReturn r = super::newUserClient(owningTask, securityID, type, clientH);
+	FBTRACE(32, "newUserClient type %u -> 0x%x", type, r);
+	return r;
+}
+
+IOReturn ReimsGraphics::requestProbe(IOOptionBits options)
+{
+	IOReturn r = super::requestProbe(options);
+	FBTRACE(8, "requestProbe 0x%x -> 0x%x", static_cast<unsigned>(options), r);
+	return r;
+}
+
+IOReturn ReimsGraphics::message(UInt32 type, IOService *provider, void *argument)
+{
+	IOReturn r = super::message(type, provider, argument);
+	FBTRACE(16, "message 0x%x -> 0x%x", type, r);
+	return r;
+}
+
+IOReturn ReimsGraphics::setupForCurrentConfig()
+{
+	IOReturn r = super::setupForCurrentConfig();
+	FBTRACE(8, "setupForCurrentConfig -> 0x%x", r);
+	return r;
+}
+
+bool ReimsGraphics::isConsoleDevice()
+{
+	bool r = super::isConsoleDevice();
+	FBTRACE(8, "isConsoleDevice -> %d", r);
+	return r;
+}
+
+IOReturn ReimsGraphics::setCLUTWithEntries(IOColorEntry *colors, UInt32 index, UInt32 numEntries,
+                                           IOOptionBits options)
+{
+	IOReturn r = super::setCLUTWithEntries(colors, index, numEntries, options);
+	FBTRACE(4, "setCLUTWithEntries %u+%u -> 0x%x", index, numEntries, r);
+	return r;
+}
+
+IOReturn ReimsGraphics::validateDetailedTiming(void *description, IOByteCount descripSize)
+{
+	IOReturn r = super::validateDetailedTiming(description, descripSize);
+	FBTRACE(16, "validateDetailedTiming %lu bytes -> 0x%x", static_cast<unsigned long>(descripSize), r);
+	return r;
+}
+
+IOReturn ReimsGraphics::setDetailedTimings(OSArray *array)
+{
+	IOReturn r = super::setDetailedTimings(array);
+	FBTRACE(8, "setDetailedTimings %u -> 0x%x", array ? array->getCount() : 0, r);
+	return r;
+}
+
+IOReturn ReimsGraphics::connectFlags(IOIndex connectIndex, IODisplayModeID displayMode,
+                                     IOOptionBits *flags)
+{
+	IOReturn r = super::connectFlags(connectIndex, displayMode, flags);
+	FBTRACE(48, "connectFlags conn %d mode %d -> 0x%x flags 0x%x", static_cast<int>(connectIndex),
+	        static_cast<int>(displayMode), r, flags ? static_cast<unsigned>(*flags) : 0);
+	return r;
+}
+
+bool ReimsGraphics::hasDDCConnect(IOIndex connectIndex)
+{
+	bool r = super::hasDDCConnect(connectIndex);
+	FBTRACE(8, "hasDDCConnect %d -> %d", static_cast<int>(connectIndex), r);
+	return r;
+}
+
+IOReturn ReimsGraphics::getDDCBlock(IOIndex connectIndex, UInt32 blockNumber, IOSelect blockType,
+                                    IOOptionBits options, UInt8 *data, IOByteCount *length)
+{
+	IOReturn r = super::getDDCBlock(connectIndex, blockNumber, blockType, options, data, length);
+	FBTRACE(8, "getDDCBlock %d block %u -> 0x%x", static_cast<int>(connectIndex), blockNumber, r);
+	return r;
+}
+#endif

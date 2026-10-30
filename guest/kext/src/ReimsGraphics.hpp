@@ -81,6 +81,38 @@ public:
 	IOReturn unregisterInterrupt(void *interruptRef) override;
 	IOReturn setInterruptState(void *interruptRef, UInt32 state) override;
 
+#if RGFX_FB_TRACE
+	// A trace build (make TRACE=1) logs what IOFramebuffer and its clients call on the
+	// driver, forwarding each of these to IOFramebuffer.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Woverloaded-virtual"
+	IOReturn open() override;
+	void close() override;
+	IOReturn setGammaTable(UInt32 channelCount, UInt32 dataCount, UInt32 dataWidth,
+	                       void *data) override;
+#pragma clang diagnostic pop
+	IOReturn setPowerState(unsigned long powerStateOrdinal, IOService *device) override;
+	IOReturn powerStateWillChangeTo(IOPMPowerFlags flags, unsigned long state,
+	                                IOService *device) override;
+	IOReturn powerStateDidChangeTo(IOPMPowerFlags flags, unsigned long state,
+	                               IOService *device) override;
+	IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type,
+	                       IOUserClient **clientH) override;
+	IOReturn requestProbe(IOOptionBits options) override;
+	IOReturn message(UInt32 type, IOService *provider, void *argument = 0) override;
+	IOReturn setupForCurrentConfig() override;
+	bool isConsoleDevice() override;
+	IOReturn setCLUTWithEntries(IOColorEntry *colors, UInt32 index, UInt32 numEntries,
+	                            IOOptionBits options) override;
+	IOReturn validateDetailedTiming(void *description, IOByteCount descripSize) override;
+	IOReturn setDetailedTimings(OSArray *array) override;
+	IOReturn connectFlags(IOIndex connectIndex, IODisplayModeID displayMode,
+	                      IOOptionBits *flags) override;
+	bool hasDDCConnect(IOIndex connectIndex) override;
+	IOReturn getDDCBlock(IOIndex connectIndex, UInt32 blockNumber, IOSelect blockType,
+	                     IOOptionBits options, UInt8 *data, IOByteCount *length) override;
+#endif
+
 	// The display pipe (RgfxDisplayPipeUserClient, on the accelerator) presents through the
 	// framebuffer, which owns the control ring. postPresent puts PRESENT_SURFACE for the
 	// IOSurface of global ID `surfaceId` on the ring without waiting (thread context only); the
@@ -109,6 +141,11 @@ public:
 	                       UInt32 timeoutMs);
 
 private:
+#if RGFX_FB_TRACE
+	IOReturn connectionAttribute(IOIndex connectIndex, IOSelect attribute, uintptr_t *value);
+	IOReturn setConnectionAttribute(IOIndex connectIndex, IOSelect attribute, uintptr_t value);
+#endif
+
 	// The display's modes. IDs stay with a mode (its size and rate) for the
 	// driver's life, as IOFramebuffer asks, and are never reused.
 	struct Mode {
