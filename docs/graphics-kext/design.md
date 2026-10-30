@@ -157,14 +157,20 @@ Stages:
     matches any display-class device. WindowServer composites in software
     with no Metal device: x86-64 macOS 26.5.2, 26.6.1 and 26.7.1 reach the
     desktop that way ("Software compositor activated"; measured).
-13. **Loading: through OpenCore.** The OpenCore image reims-util makes
-    injects the kext, as it injects the x86-64 port's GPU and display kexts.
-    Libraries outside the Boot kernel collection (IOGraphicsFamily,
-    IOGPUFamily) are reached through the same loader bridge those kexts use.
-    So no install, approval or signing happens in the guest. Iterating means
-    replacing the kext in the OpenCore image and booting, with nothing
-    rebuilt inside the guest. Apple's paravirt kext is never blocked or
-    changed: it doesn't match our device.
+13. **Loading: through OpenCore, with a bridge for our kext only.** OpenCore
+    injects kexts into the Boot kernel collection and links them only against
+    Boot-collection symbols, but a display kext uses IOGraphicsFamily, which
+    is in the System collection. So our kext needs a loader bridge (a Lilu
+    plugin plus a generated shim) to reach it, exactly as the x86-64 port's
+    kexts do. That bridge is infrastructure, separate from the port's GPU
+    driver kexts: our lane replaces those driver kexts with our own and keeps
+    none of them. The clean image carries only Lilu, the loader, our shim and
+    ReimsGraphics.kext. Nothing of the guest OS is patched or hooked beyond
+    what this bridge already does for the existing lane.
+    - Iterating: patch a copy of a VM's OpenCore image directly
+      (scripts/internal/opencore-add-kexts.sh). No rebuild inside the guest.
+    - Shipping (later): reims-util injects the set when it builds an image.
+      Not needed to prototype.
 14. **IOSurfaces follow the discrete model.** IOSurface.kext allocates
     surfaces in guest RAM, CAMetalLayer drawables and window backing stores
     included. The accelerator gets a per-surface device cache with a sync
