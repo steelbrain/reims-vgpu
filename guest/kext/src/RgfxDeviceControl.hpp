@@ -8,24 +8,36 @@
  * AGDC. AppleGPUWrangler, which matches IOResources, pairs each AGDC it sees
  * published with its GPU's record, asks it what it is and what it can make,
  * and tells it what to make. The library class does all of that talking; a
- * subclass only answers the device's attributes (vendor_doDeviceAttribute):
+ * subclass only answers the device's attributes (vendor_doDeviceAttribute).
+ * A get answers only an output of the attribute's exact size, and every
+ * attribute the control does not answer is unsupported.
  *
+ * The control's own attributes:
  * - 0x1, the device's description, 0x2c bytes. AGDC's start, the wrangler
  *   and IOPresentment (its user client's selector 1) read it. The word at
  *   +0x28 must be 1, 2 or 7 for the wrangler to pair the control, and 1 or 2
  *   for IOPresentment to build a pipe; we answer 2. IOPresentment's platform
  *   check reads the half-word at +0x24, which 0x106b passes.
- * - 0x3, what to make. A get answers the mask of what the control can make
- *   (bit 0 the framebuffers, bit 1 the accelerator); the wrangler goes on
- *   only for a mask with both. A set is the wrangler's InitFlags, which we
- *   record: ReimsGraphics and RgfxAccelerator match the device on their own.
- * - 0x301, set: the GPU's index in the wrangler, recorded.
+ * - 0x3, what to make. A get (a 4-byte output) answers the mask of what the
+ *   control can make (bit 0 the framebuffers, bit 1 the accelerator); the
+ *   wrangler goes on only for a mask with both. A set (a 4-byte input) is
+ *   the wrangler's InitFlags, which we record: ReimsGraphics and
+ *   RgfxAccelerator match the device on their own.
  * - 0x980, the displays, 0xdc bytes: AGDC's start and IOPresentment read it,
  *   and IOPresentment builds no pipe without it ("Unable to get AGDC GPU
  *   capabilities").
  * - 0x921, 0xb0 bytes, which IOPresentment reads once it has a pipe.
- * Every other attribute is unsupported. The first calls are logged, so a boot
- * shows what was asked.
+ *
+ * The display's attributes, answered from the framebuffer's state through
+ * IOFramebuffer's own interface, so they follow what ReimsGraphics tells
+ * IOFramebuffer. IOPresentment asks them once it has the pipe, naming the
+ * display by its index (0, the one framebuffer) or that index plus 1:
+ * - 0x925, 12 bytes each way: whether the display is connected.
+ * - 0x711, 0x196c bytes each way: one query about the display, by a
+ *   request bit; the current mode's size is the one answer with content.
+ * - 0x986, 0x90 bytes each way: one 128-byte block of the display's EDID.
+ *
+ * The first calls are logged, so a boot shows what was asked.
  *
  * The library (com.apple.AppleGraphicsDeviceControl) is in the System KC; the
  * kext names it in OSBundleLibraries, and its base-class sites are bound as
@@ -51,13 +63,17 @@ public:
 	using AppleGraphicsDeviceControl::vendor_doDeviceAttribute;
 
 private:
-	static IOFramebuffer *framebuffer(IOService *provider);
-	IOReturn answer(UInt32 attribute, uintptr_t *input, size_t inputSize, uintptr_t *output,
-	                size_t *outputSize);
+	// The provider's framebuffer, retained, or null before it attaches.
+	IOFramebuffer *copyFramebuffer() const;
+	IOReturn answer(UInt32 attribute, const void *input, size_t inputSize, void *output,
+	                size_t outputSize);
+	IOReturn answerConnection(const void *input, size_t inputSize, void *output,
+	                          size_t outputSize);
+	IOReturn answerQuery(const void *input, size_t inputSize, void *output, size_t outputSize);
+	IOReturn answerEdid(const void *input, size_t inputSize, void *output, size_t outputSize);
 
 	SInt32 loggedCalls;
 	UInt32 initFlags;
-	UInt16 gpuIndex;
 };
 
 #endif /* RGFX_DEVICE_CONTROL_HPP_ */
