@@ -77,8 +77,16 @@ use crate::wake::{self, Wake};
 use crate::wire::*;
 
 /// The region's size: the control rings, the framebuffer's scanout span and cursor, and room for
-/// the guest processes' rings, buffers, heaps and surfaces; a power of two, as a BAR's size is.
-pub const REGION_SIZE: u64 = 256 << 20;
+/// the guest processes' rings, buffers, heaps and surfaces (a 3840x2400 BGRA8 surface is 37 MB);
+/// a power of two, as a BAR's size is.
+///
+/// 1 GiB is the most an x86-64 macOS guest takes (measured on macOS 26, q35, OVMF): macOS's PCI
+/// configurator lays the bus out again at boot and places every 64-bit prefetchable BAR below
+/// 4 GiB, never in the host bridge's 64-bit window, and it misreads a 4 GiB BAR. Below 4 GiB the
+/// window ends at 0xE000_0000 (the ECAM area follows), so a 1 GiB BAR needs the window to start
+/// at or below 0x4000_0000: the host caps the guest's RAM below 4 GiB at 1 GiB (QEMU's
+/// `-machine max-ram-below-4g=1G`). With q35's default of 2 GiB there the BAR gets no address.
+pub const REGION_SIZE: u64 = 1 << 30;
 
 /// How long the control thread waits before it looks for room in the completion ring again.
 const ROOM_POLL: Duration = Duration::from_millis(1);
