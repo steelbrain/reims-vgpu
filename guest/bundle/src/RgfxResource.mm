@@ -7,12 +7,16 @@
 
 #import <Metal/Metal.h>
 
+#include <unistd.h>
+
 #include "RgfxRetirement.hpp"
 #include "RgfxSerializer.hpp"
 
 @implementation RgfxResource {
 	__weak id<MTLDevice> _device;
 	id<MTLHeap> _heap; // the heap the resource lies in, kept alive
+	// The process the resource is used for (setResponsibleProcess:): this one until told.
+	int _responsibleProcess;
 }
 
 - (instancetype)initWithObjId:(uint64_t)objId
@@ -24,6 +28,7 @@
 		_objId = objId;
 		_device = device;
 		_serializer = serializer;
+		_responsibleProcess = getpid();
 	}
 	return self;
 }
@@ -67,6 +72,19 @@
 		if (after)
 			after();
 	});
+}
+
+// The resource SPI WindowServer calls as it prepares a window's surface for its compositor:
+// the process the resource is used for. The device accounts memory to no process, so it is
+// kept and answered.
+- (void)setResponsibleProcess:(int)pid
+{
+	_responsibleProcess = pid;
+}
+
+- (int)responsibleProcess
+{
+	return _responsibleProcess;
 }
 
 @end

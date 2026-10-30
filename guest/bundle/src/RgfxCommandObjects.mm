@@ -225,6 +225,9 @@ uint32_t fillRenderPass(MTLRenderPassDescriptor *d, RgfxRenderPassDesc *desc,
 	dispatch_queue_t _submissionQueue; // kept for -submissionQueue (setSubmissionQueue: SPI)
 	dispatch_queue_t _completionQueue; // kept for -completionQueue (setCompletionQueue: SPI)
 	NSUInteger _gpuPriority;           // kept for -GPUPriority (setGPUPriority: SPI)
+	unsigned short _gpuPriorityOffset; // and the offsets and background priority with it
+	NSUInteger _backgroundGpuPriority;
+	unsigned short _backgroundGpuPriorityOffset;
 }
 
 + (instancetype)queueWithSubmitRing:(RgfxRingWriter *)submitRing
@@ -397,14 +400,48 @@ uint32_t fillRenderPass(MTLRenderPassDescriptor *d, RgfxRenderPassDesc *desc,
 	return _completionQueue;
 }
 
-- (void)setGPUPriority:(NSUInteger)priority
+// The runtime's setter answers whether the priority was taken (`c24@0:8Q16`): it always is.
+- (BOOL)setGPUPriority:(NSUInteger)priority
 {
 	_gpuPriority = priority;
+	return YES;
 }
 
 - (NSUInteger)GPUPriority
 {
 	return _gpuPriority;
+}
+
+// RenderBox reads the priority back as it sets up its queue (`Q16@0:8`), and the background
+// priority with it; the rest of the family is the runtime's too (MTLCommandQueueSPI).
+- (NSUInteger)getGPUPriority
+{
+	return _gpuPriority;
+}
+
+- (BOOL)setGPUPriority:(NSUInteger)priority offset:(unsigned short)offset
+{
+	_gpuPriority = priority;
+	_gpuPriorityOffset = offset;
+	return YES;
+}
+
+- (BOOL)setBackgroundGPUPriority:(NSUInteger)priority
+{
+	_backgroundGpuPriority = priority;
+	return YES;
+}
+
+- (BOOL)setBackgroundGPUPriority:(NSUInteger)priority offset:(unsigned short)offset
+{
+	_backgroundGpuPriority = priority;
+	_backgroundGpuPriorityOffset = offset;
+	return YES;
+}
+
+- (NSUInteger)getBackgroundGPUPriority
+{
+	return _backgroundGpuPriority;
 }
 
 @end
@@ -429,6 +466,8 @@ uint32_t fillRenderPass(MTLRenderPassDescriptor *d, RgfxRenderPassDesc *desc,
 	// Written by the thread that delivers the completion, read by any: atomic.
 	std::atomic<MTLCommandBufferStatus> _status;
 	NSString *_cbLabel;
+	// What the client asked of the buffer's content protection (setProtectionOptions:).
+	uint64_t _protectionOptions;
 	NSError *_cbError;
 	NSMutableArray *_completedHandlers;
 	NSMutableArray *_scheduledHandlers;
@@ -725,6 +764,15 @@ uint32_t fillRenderPass(MTLRenderPassDescriptor *d, RgfxRenderPassDesc *desc,
 	}
 }
 
+// The command-buffer SPI VideoToolbox calls: commits, then waits until the buffer is
+// submitted, which here is once it is scheduled (waitUntilScheduled); YES unless it failed.
+- (BOOL)commitAndWaitUntilSubmitted
+{
+	[self commit];
+	[self waitUntilScheduled];
+	return self.status != MTLCommandBufferStatusError;
+}
+
 - (void)waitUntilScheduled
 {
 	// We have no separate scheduled signal: a buffer is taken as scheduled once its
@@ -830,6 +878,20 @@ uint32_t fillRenderPass(MTLRenderPassDescriptor *d, RgfxRenderPassDesc *desc,
 - (void)setLabel:(NSString *)label
 {
 	_cbLabel = [label copy];
+}
+
+// The command-buffer SPI WindowServer's CoreDisplay calls before it fills a display surface.
+// The device protects no content, so the options are kept and change nothing; options asking
+// for protection are logged once.
+- (void)setProtectionOptions:(uint64_t)options
+{
+	_protectionOptions = options;
+	static std::atomic<bool> logged{false};
+	if (options != 0 && !logged.exchange(true)) {
+		NSLog(@"RGFX: a command buffer asks for protection options 0x%llx; the device protects "
+		      @"no content",
+		      static_cast<unsigned long long>(options));
+	}
 }
 
 - (void)pushDebugGroup:(NSString *)string

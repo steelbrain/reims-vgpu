@@ -69,16 +69,33 @@
 @end
 
 // measured: macOS 27 Metal.framework — the private command-queue SPI our queue
-// wrapper will conform to (the command-buffer/encoders slice). The shell overrides
-// none of its selectors yet, so this is a bare forward-declaration establishing
-// the adoption; that slice adds the selectors it overrides, each tagged measured.
+// wrapper conforms to, with the selectors it overrides.
 @protocol MTLCommandQueueSPI <MTLCommandQueue>
+// measured: macOS 26 Metal.framework, required: `c24@0:8Q16`, `c28@0:8Q16S24` and `Q16@0:8`.
+- (BOOL)setGPUPriority:(NSUInteger)priority;
+- (BOOL)setGPUPriority:(NSUInteger)priority offset:(unsigned short)offset;
+- (NSUInteger)getGPUPriority;
+- (BOOL)setBackgroundGPUPriority:(NSUInteger)priority;
+- (BOOL)setBackgroundGPUPriority:(NSUInteger)priority offset:(unsigned short)offset;
+- (NSUInteger)getBackgroundGPUPriority;
 @end
 
 // measured: macOS 27 Metal.framework — the private command-buffer SPI our command
-// buffer wrapper will conform to (the command-buffer/encoders slice). As above, a
-// bare forward-declaration until that slice overrides selectors here.
+// buffer wrapper will conform to (the command-buffer/encoders slice), with the selectors it
+// overrides.
 @protocol MTLCommandBufferSPI <MTLCommandBuffer>
+// measured: macOS 26 Metal.framework, optional, `v24@0:8Q16`.
+- (void)setProtectionOptions:(uint64_t)options;
+// measured: macOS 26 Metal.framework, optional, `c16@0:8`.
+- (BOOL)commitAndWaitUntilSubmitted;
+@end
+
+// measured: macOS 26 Metal.framework — the private resource SPI our resources answer, with the
+// selectors they override (RgfxResource).
+@protocol MTLResourceSPI <MTLResource>
+// measured: required, `v20@0:8i16` and `i16@0:8`.
+- (void)setResponsibleProcess:(int)pid;
+- (int)responsibleProcess;
 @end
 
 #endif // RGFX_METAL_PRIVATE_H_

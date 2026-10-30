@@ -152,6 +152,12 @@
 	return _length;
 }
 
+// The bytes the buffer takes: its length.
+- (NSUInteger)allocatedSize
+{
+	return _length;
+}
+
 - (uint64_t)gpuAddress
 {
 	return _gpuAddress;

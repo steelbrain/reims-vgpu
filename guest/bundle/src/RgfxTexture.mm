@@ -14,6 +14,8 @@
 #include "RgfxRetirement.hpp"
 #include "RgfxSerializer.hpp" // RgfxSerializer, RgfxTextureDescriptor (wire)
 
+#include <algorithm>
+
 namespace {
 
 /// Maps an MTLTextureDescriptor into the wire's RgfxTextureDescriptor. Each Metal
@@ -38,6 +40,173 @@ RgfxTextureDescriptor rgfxTextureDescriptorFromMTL(MTLTextureDescriptor *d)
 	out.swizzle = static_cast<uint32_t>(sw.red) | (static_cast<uint32_t>(sw.green) << 8) |
 	              (static_cast<uint32_t>(sw.blue) << 16) | (static_cast<uint32_t>(sw.alpha) << 24);
 	return out;
+}
+
+
+// A block of a pixel format: its bytes and its width and height in pixels (1 x 1 where the
+// format is not block-compressed). 0 bytes for a format this does not size.
+struct RgfxBlockShape {
+	uint32_t bytes, width, height;
+};
+
+RgfxBlockShape rgfxBlockShapeOf(MTLPixelFormat f)
+{
+	switch (f) {
+	case MTLPixelFormatA8Unorm:
+	case MTLPixelFormatR8Unorm:
+	case MTLPixelFormatR8Unorm_sRGB:
+	case MTLPixelFormatR8Snorm:
+	case MTLPixelFormatR8Uint:
+	case MTLPixelFormatR8Sint:
+	case MTLPixelFormatStencil8:
+		return {1, 1, 1};
+	case MTLPixelFormatR16Unorm:
+	case MTLPixelFormatR16Snorm:
+	case MTLPixelFormatR16Uint:
+	case MTLPixelFormatR16Sint:
+	case MTLPixelFormatR16Float:
+	case MTLPixelFormatRG8Unorm:
+	case MTLPixelFormatRG8Unorm_sRGB:
+	case MTLPixelFormatRG8Snorm:
+	case MTLPixelFormatRG8Uint:
+	case MTLPixelFormatRG8Sint:
+	case MTLPixelFormatB5G6R5Unorm:
+	case MTLPixelFormatA1BGR5Unorm:
+	case MTLPixelFormatABGR4Unorm:
+	case MTLPixelFormatBGR5A1Unorm:
+	case MTLPixelFormatDepth16Unorm:
+		return {2, 1, 1};
+	case MTLPixelFormatGBGR422:
+	case MTLPixelFormatBGRG422:
+		return {4, 2, 1};
+	case MTLPixelFormatR32Uint:
+	case MTLPixelFormatR32Sint:
+	case MTLPixelFormatR32Float:
+	case MTLPixelFormatRG16Unorm:
+	case MTLPixelFormatRG16Snorm:
+	case MTLPixelFormatRG16Uint:
+	case MTLPixelFormatRG16Sint:
+	case MTLPixelFormatRG16Float:
+	case MTLPixelFormatRGBA8Unorm:
+	case MTLPixelFormatRGBA8Unorm_sRGB:
+	case MTLPixelFormatRGBA8Snorm:
+	case MTLPixelFormatRGBA8Uint:
+	case MTLPixelFormatRGBA8Sint:
+	case MTLPixelFormatBGRA8Unorm:
+	case MTLPixelFormatBGRA8Unorm_sRGB:
+	case MTLPixelFormatRGB10A2Unorm:
+	case MTLPixelFormatRGB10A2Uint:
+	case MTLPixelFormatRG11B10Float:
+	case MTLPixelFormatRGB9E5Float:
+	case MTLPixelFormatBGR10A2Unorm:
+	case MTLPixelFormatBGR10_XR:
+	case MTLPixelFormatBGR10_XR_sRGB:
+	case MTLPixelFormatDepth32Float:
+	case MTLPixelFormatDepth24Unorm_Stencil8:
+	case MTLPixelFormatX24_Stencil8:
+		return {4, 1, 1};
+	case MTLPixelFormatRG32Uint:
+	case MTLPixelFormatRG32Sint:
+	case MTLPixelFormatRG32Float:
+	case MTLPixelFormatRGBA16Unorm:
+	case MTLPixelFormatRGBA16Snorm:
+	case MTLPixelFormatRGBA16Uint:
+	case MTLPixelFormatRGBA16Sint:
+	case MTLPixelFormatRGBA16Float:
+	case MTLPixelFormatBGRA10_XR:
+	case MTLPixelFormatBGRA10_XR_sRGB:
+	case MTLPixelFormatDepth32Float_Stencil8:
+	case MTLPixelFormatX32_Stencil8:
+		return {8, 1, 1};
+	case MTLPixelFormatRGBA32Uint:
+	case MTLPixelFormatRGBA32Sint:
+	case MTLPixelFormatRGBA32Float:
+		return {16, 1, 1};
+	case MTLPixelFormatBC1_RGBA:
+	case MTLPixelFormatBC1_RGBA_sRGB:
+	case MTLPixelFormatBC4_RUnorm:
+	case MTLPixelFormatBC4_RSnorm:
+	case MTLPixelFormatEAC_R11Unorm:
+	case MTLPixelFormatEAC_R11Snorm:
+	case MTLPixelFormatETC2_RGB8:
+	case MTLPixelFormatETC2_RGB8_sRGB:
+	case MTLPixelFormatETC2_RGB8A1:
+	case MTLPixelFormatETC2_RGB8A1_sRGB:
+		return {8, 4, 4};
+	case MTLPixelFormatBC2_RGBA:
+	case MTLPixelFormatBC2_RGBA_sRGB:
+	case MTLPixelFormatBC3_RGBA:
+	case MTLPixelFormatBC3_RGBA_sRGB:
+	case MTLPixelFormatBC5_RGUnorm:
+	case MTLPixelFormatBC5_RGSnorm:
+	case MTLPixelFormatBC6H_RGBFloat:
+	case MTLPixelFormatBC6H_RGBUfloat:
+	case MTLPixelFormatBC7_RGBAUnorm:
+	case MTLPixelFormatBC7_RGBAUnorm_sRGB:
+	case MTLPixelFormatEAC_RG11Unorm:
+	case MTLPixelFormatEAC_RG11Snorm:
+	case MTLPixelFormatEAC_RGBA8:
+	case MTLPixelFormatEAC_RGBA8_sRGB:
+		return {16, 4, 4};
+	case MTLPixelFormatASTC_4x4_sRGB:
+	case MTLPixelFormatASTC_4x4_LDR:
+	case MTLPixelFormatASTC_4x4_HDR:
+		return {16, 4, 4};
+	case MTLPixelFormatASTC_5x4_sRGB:
+	case MTLPixelFormatASTC_5x4_LDR:
+	case MTLPixelFormatASTC_5x4_HDR:
+		return {16, 5, 4};
+	case MTLPixelFormatASTC_5x5_sRGB:
+	case MTLPixelFormatASTC_5x5_LDR:
+	case MTLPixelFormatASTC_5x5_HDR:
+		return {16, 5, 5};
+	case MTLPixelFormatASTC_6x5_sRGB:
+	case MTLPixelFormatASTC_6x5_LDR:
+	case MTLPixelFormatASTC_6x5_HDR:
+		return {16, 6, 5};
+	case MTLPixelFormatASTC_6x6_sRGB:
+	case MTLPixelFormatASTC_6x6_LDR:
+	case MTLPixelFormatASTC_6x6_HDR:
+		return {16, 6, 6};
+	case MTLPixelFormatASTC_8x5_sRGB:
+	case MTLPixelFormatASTC_8x5_LDR:
+	case MTLPixelFormatASTC_8x5_HDR:
+		return {16, 8, 5};
+	case MTLPixelFormatASTC_8x6_sRGB:
+	case MTLPixelFormatASTC_8x6_LDR:
+	case MTLPixelFormatASTC_8x6_HDR:
+		return {16, 8, 6};
+	case MTLPixelFormatASTC_8x8_sRGB:
+	case MTLPixelFormatASTC_8x8_LDR:
+	case MTLPixelFormatASTC_8x8_HDR:
+		return {16, 8, 8};
+	case MTLPixelFormatASTC_10x5_sRGB:
+	case MTLPixelFormatASTC_10x5_LDR:
+	case MTLPixelFormatASTC_10x5_HDR:
+		return {16, 10, 5};
+	case MTLPixelFormatASTC_10x6_sRGB:
+	case MTLPixelFormatASTC_10x6_LDR:
+	case MTLPixelFormatASTC_10x6_HDR:
+		return {16, 10, 6};
+	case MTLPixelFormatASTC_10x8_sRGB:
+	case MTLPixelFormatASTC_10x8_LDR:
+	case MTLPixelFormatASTC_10x8_HDR:
+		return {16, 10, 8};
+	case MTLPixelFormatASTC_10x10_sRGB:
+	case MTLPixelFormatASTC_10x10_LDR:
+	case MTLPixelFormatASTC_10x10_HDR:
+		return {16, 10, 10};
+	case MTLPixelFormatASTC_12x10_sRGB:
+	case MTLPixelFormatASTC_12x10_LDR:
+	case MTLPixelFormatASTC_12x10_HDR:
+		return {16, 12, 10};
+	case MTLPixelFormatASTC_12x12_sRGB:
+	case MTLPixelFormatASTC_12x12_LDR:
+	case MTLPixelFormatASTC_12x12_HDR:
+		return {16, 12, 12};
+	default:
+		return {0, 1, 1};
+	}
 }
 
 } // namespace
@@ -145,6 +314,30 @@ RgfxTextureDescriptor rgfxTextureDescriptorFromMTL(MTLTextureDescriptor *d)
 - (id<MTLBuffer>)buffer
 {
 	return _buffer;
+}
+
+// The bytes the texture takes: its rows in its buffer, for one made over a buffer; else every
+// level of every slice and sample, in its format's blocks (0 for a format not sized here).
+- (NSUInteger)allocatedSize
+{
+	if (_buffer != nil) {
+		return static_cast<NSUInteger>(_bufferBytesPerRow * _desc.height);
+	}
+	RgfxBlockShape b = rgfxBlockShapeOf(static_cast<MTLPixelFormat>(_desc.pixel_format));
+	uint64_t slices = _desc.array_length ? _desc.array_length : 1;
+	if (_desc.texture_type == MTLTextureTypeCube || _desc.texture_type == MTLTextureTypeCubeArray) {
+		slices *= 6;
+	}
+	uint64_t samples = _desc.sample_count ? _desc.sample_count : 1;
+	uint64_t total = 0;
+	uint32_t levels = _desc.mipmap_level_count ? _desc.mipmap_level_count : 1;
+	for (uint32_t level = 0; level < levels; level++) {
+		uint64_t w = std::max<uint64_t>(1, _desc.width >> level);
+		uint64_t h = std::max<uint64_t>(1, _desc.height >> level);
+		uint64_t d = std::max<uint64_t>(1, _desc.depth >> level);
+		total += ((w + b.width - 1) / b.width) * ((h + b.height - 1) / b.height) * d * b.bytes;
+	}
+	return static_cast<NSUInteger>(total * slices * samples);
 }
 
 - (NSUInteger)bufferOffset

@@ -315,6 +315,13 @@ RgfxTextureDescriptor wireDescriptor(MTLTextureDescriptor *d)
 	return _shadow->plane;
 }
 
+// The bytes the texture takes: its copy of the plane in the region (SecurityAgent's RenderBox
+// asks as it accounts a surface's texture).
+- (NSUInteger)allocatedSize
+{
+	return static_cast<NSUInteger>(_shadow->block.size);
+}
+
 // The texture's own CPU access reads and writes the copy, for formats of one element
 // per pixel at level 0 / slice 0; a write also goes to the surface's pages.
 
