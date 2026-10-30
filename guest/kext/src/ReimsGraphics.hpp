@@ -15,6 +15,11 @@
  * driver's work loop is the control completion ring's only consumer: it
  * drains it on MSI-X vector 0, hands answers to the waiting threads, and
  * turns VBLANK and DISPLAY_CHANGED into IOFramebuffer's interrupts.
+ *
+ * The control ring is the guest's one ring to the device besides the command
+ * queues' own, so the accelerator posts the Metal processes' object lifecycle
+ * on it too (postLifecycle), under the same lock; the work loop hands each of
+ * those its answer (a COMPLETE, a pipeline's reflection) by seqno.
  */
 
 #ifndef REIMS_GRAPHICS_HPP_
@@ -90,6 +95,19 @@ public:
 	void setPipe(OSObject *client, PipeVblankHook vblank, PipePresentHook present);
 	void setPipeVblankEnabled(bool enabled);
 
+	// The accelerator's object lifecycle (a create or destroy, QUEUE_CREATE, CONTEXT_CLOSE) on
+	// the control ring: `message` is the whole message in kernel memory, at most
+	// kLifecycleMessageMax bytes, whose header is stamped here with `type`, its size and the
+	// seqno (*seqno, when not null). With `replyType` 0 it returns once the message is on the
+	// ring; else it waits up to `timeoutMs` for the device's answer of that type to this
+	// seqno and copies it, header and all, into `reply` (*replyLength its bytes, at most
+	// `replyCapacity`). Thread context only, never on the work loop.
+	static constexpr UInt32 kLifecycleMessageMax = RGFX_CONTROL_RING_DATA_SIZE / 2;
+	static constexpr UInt32 kLifecycleReplyMax = 128;
+	IOReturn postLifecycle(UInt32 type, const void *message, UInt32 size, UInt32 replyType,
+	                       void *reply, UInt32 replyCapacity, UInt32 *replyLength, UInt64 *seqno,
+	                       UInt32 timeoutMs);
+
 private:
 	// The display's modes. IDs stay with a mode (its size and rate) for the
 	// driver's life, as IOFramebuffer asks, and are never reused.
@@ -117,14 +135,29 @@ private:
 	};
 	static constexpr UInt32 kAnswers = 16;
 
+	// A thread waiting for a lifecycle message's answer: free while replyType is 0; its seqno
+	// is 0 until the message is on the ring.
+	struct LifecycleWaiter {
+		UInt64 seqno;
+		UInt32 replyType;
+		UInt32 length;
+		bool done;
+		UInt8 reply[kLifecycleReplyMax];
+	};
+	static constexpr UInt32 kLifecycleWaiters = 32;
+
 	// Registers and the control rings.
 	UInt32 readRegister(UInt32 offset) const;
 	void writeRegister(UInt32 offset, UInt32 value);
 	volatile UInt8 *ring(UInt32 offset) const;
 	// A message is a full struct (RgfxSetScanout and the like) whose header
 	// tryPost stamps with the type, size and seqno; the caller fills the rest.
-	bool tryPost(UInt32 type, const void *message, UInt32 size, UInt64 *seqno);
-	IOReturn post(UInt32 type, const void *message, UInt32 size, UInt64 *seqno);
+	// `waiterSeqno`, when not null, gets the seqno before the message is
+	// published, so its answer finds its waiter.
+	bool tryPost(UInt32 type, const void *message, UInt32 size, UInt64 *seqno,
+	             UInt64 *waiterSeqno = nullptr);
+	IOReturn post(UInt32 type, const void *message, UInt32 size, UInt64 *seqno,
+	              UInt64 *waiterSeqno = nullptr);
 	IOReturn command(UInt32 type, const void *message, UInt32 size);
 	void kickWorkLoop();
 
@@ -135,6 +168,7 @@ private:
 	void handleEvent(UInt32 type, UInt64 seqno, const volatile UInt8 *payload, UInt32 size);
 	UInt32 parseDisplays(const volatile UInt8 *payload, UInt32 size);
 	void answer(UInt64 seqno, UInt32 status);
+	bool answerLifecycle(UInt32 type, UInt64 seqno, const volatile UInt8 *payload, UInt32 size);
 
 	// Ending: no more work loop actions, then the device and mappings go.
 	void quiesce();
@@ -173,10 +207,12 @@ private:
 	// The completion ring's bytes consumed: the work loop's alone.
 	UInt64 consumed;
 
-	// Under stateLock: answers, the display and its modes, the mode set.
+	// Under stateLock: answers, the lifecycle's waiters, the display and its modes, the mode
+	// set.
 	IOLock *stateLock;
 	Answer answers[kAnswers];
 	UInt32 nextAnswer;
+	LifecycleWaiter lifecycleWaiters[kLifecycleWaiters];
 	bool haveDisplay;
 	UInt32 displayId;
 	bool connected;

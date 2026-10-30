@@ -63,30 +63,6 @@ pub const RGFX_REG_REGION_SIZE_LO: u32 = 0x014;
 pub const RGFX_REG_REGION_SIZE_HI: u32 = 0x018;
 /// `DOORBELL`, WO: writing a ring's id wakes its consumer.
 pub const RGFX_REG_DOORBELL: u32 = 0x020;
-/// `QUEUE_OPEN`, WO: writing any value opens the command queue the mailbox holds, an
-/// [`RgfxQueueOpen`] in its first words: the device makes the queue's ring pair (the submission
-/// ring's `consumer_idle` 1) and starts its service before the write returns, and `MAILBOX_STATUS`
-/// then reads [`RGFX_STATUS_OK`], or [`RGFX_STATUS_INVALID_ARGUMENT`] where the rings were refused.
-/// The guest's accelerator kext writes it, the mailbox's only writer, when a process makes a queue.
-pub const RGFX_REG_QUEUE_OPEN: u32 = 0x024;
-/// `QUEUE_CLOSE`, WO: writing any value closes the queue whose id the mailbox's first two words
-/// hold (low word first): the device takes nothing more from its ring and ends its service, and
-/// the host drops the queue's handle.
-pub const RGFX_REG_QUEUE_CLOSE: u32 = 0x028;
-/// `CONTEXT_CLOSE`, WO: writing a context's number (its process's, which the kext hands out)
-/// closes the context: the device ends the context's queues, and the host drops every object
-/// whose id lies in the context's range ([`RGFX_CONTEXT_OBJ_ID_SHIFT`]). The kext writes it when
-/// the process closes the device or dies, after it closed the process's queues and before it frees
-/// the process's region blocks.
-pub const RGFX_REG_CONTEXT_CLOSE: u32 = 0x02c;
-/// `MAILBOX_STATUS`, RO: the status of the last `QUEUE_OPEN`.
-pub const RGFX_REG_MAILBOX_STATUS: u32 = 0x030;
-/// `MAILBOX`, RW: [`RGFX_MAILBOX_WORDS`] 32-bit words from here, the arguments of `QUEUE_OPEN`
-/// and `QUEUE_CLOSE`.
-pub const RGFX_REG_MAILBOX: u32 = 0x040;
-/// The mailbox's words.
-pub const RGFX_MAILBOX_WORDS: u32 = 16;
-
 /// What `MAGIC` reads: "RGFX", little-endian.
 pub const RGFX_MAGIC: u32 = 0x5846_4752;
 /// What `VERSION` reads.
@@ -132,11 +108,6 @@ pub const RGFX_CONTEXT_VA_SPAN: u64 = 0x10_0000_0000;
 /// The texture resource ids each slot picks from: slot `s`'s are `1 + s * RGFX_CONTEXT_RESOURCE_IDS`
 /// and up.
 pub const RGFX_CONTEXT_RESOURCE_IDS: u64 = 2048;
-/// [`RgfxQueueOpen`]'s `flags`: the queue is its process's device queue, whose submission ring
-/// carries the object lifecycle (creates and destroys) and whose completion ring the replies; a
-/// command buffer on another queue of the process runs after every create the process published
-/// on it before the buffer.
-pub const RGFX_QUEUE_FLAG_DEVICE: u32 = 1;
 /// The control submission ring's id, which the guest writes to `DOORBELL`.
 pub const RGFX_CONTROL_RING_ID: u32 = 0;
 /// The control completion ring's MSI-X vector.
@@ -232,8 +203,10 @@ pub const RGFX_DISPLAY_COUNT: u32 = 1;
 // interrupt handshake, `RgfxMsgHeader`) is the stage-2 one, unchanged.
 // ---------------------------------------------------------------------------
 
-/// Device-level object lifecycle (ring 0). Creates with a guest-picked id or
-/// address are fire-and-forget; pipeline creates are answered with reflection.
+/// Device-level object lifecycle (ring 0, which the accelerator kext posts for
+/// the guest's processes). Creates with a guest-picked id or address are
+/// fire-and-forget; pipeline creates are answered with reflection on the
+/// control completion ring, and `QUEUE_CREATE` with `COMPLETE`.
 /// Command `QUEUE_CREATE` ([`RgfxQueueCreate`]): make a submission+completion
 /// ring pair for a command queue; answered by [`RGFX_EVT_COMPLETE`].
 pub const RGFX_CMD_QUEUE_CREATE: u32 = 0x200;
@@ -288,6 +261,13 @@ pub const RGFX_CMD_FENCE_CREATE: u32 = 0x211;
 /// library's `.metallib`/AIR bytes the guest placed in a block of the device's
 /// region, for a library larger than one ring message.
 pub const RGFX_CMD_LIBRARY_FROM_REGION: u32 = 0x212;
+
+/// `CONTEXT_CLOSE` ([`RgfxContextClose`]), on ring 0 from the accelerator kext: the process that
+/// held context `context` closed the device or died. The host ends the context's command queues
+/// and drops every object whose id lies in its range ([`RGFX_CONTEXT_OBJ_ID_SHIFT`]), then answers
+/// [`RGFX_EVT_COMPLETE`]; the kext destroyed its queues before it, and frees its blocks once it is
+/// answered.
+pub const RGFX_CMD_CONTEXT_CLOSE: u32 = 0x2f0;
 
 /// Command `COMMAND_BUFFER` (a per-queue submission ring): one command buffer,
 /// its `obj_id` followed by the encoder-op byte stream. Struct and op stream in
@@ -540,33 +520,6 @@ pub struct RgfxVblank {
     pub host_time_ns: u64,
 }
 
-/// `QUEUE_OPEN`'s arguments, in the mailbox: a command queue's ring pair in the guest's
-/// allocations, as a `QUEUE_CREATE` places one.
-#[repr(C)]
-#[derive(
-    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
-)]
-pub struct RgfxQueueOpen {
-    /// The queue's guest-picked id, in its context's range.
-    pub obj_id: u64,
-    /// Where the submission ring (guest to host) starts in the region; it is the ring's id.
-    pub submit_offset: u64,
-    /// Where the completion ring (host to guest) starts in the region.
-    pub complete_offset: u64,
-    /// The submission ring's byte-ring size, after its header: a power of two.
-    pub submit_data_size: u32,
-    /// The completion ring's byte-ring size, after its header: a power of two.
-    pub complete_data_size: u32,
-    /// The queue's priority: 0 is normal, higher is higher.
-    pub priority: u32,
-    /// The MSI-X vector the completion ring raises.
-    pub vector: u32,
-    /// The context (the process) the queue belongs to.
-    pub context: u32,
-    /// [`RGFX_QUEUE_FLAG_DEVICE`] or 0.
-    pub flags: u32,
-}
-
 // The layout the tables of the design give.
 const _: () = {
     use core::mem::{offset_of, size_of};
@@ -594,7 +547,7 @@ const _: () = {
     assert!(RGFX_CONTROL_COMPLETE_OFFSET + RGFX_CONTROL_RING_SPAN <= RGFX_ALLOCATIONS_OFFSET);
     assert!(RGFX_ALLOCATIONS_OFFSET.is_multiple_of(0x1000));
     assert!(RGFX_CONTEXT_ALLOCATIONS_OFFSET.is_multiple_of(0x1000));
-    assert!(size_of::<RgfxQueueOpen>() <= RGFX_MAILBOX_WORDS as usize * 4);
+    assert!(size_of::<RgfxContextClose>() == 24);
     // Every slot's GPU addresses lie below the Metal address space's end, 2^47.
     assert!(RGFX_CONTEXT_VA_BASE + RGFX_CONTEXT_SLOTS as u64 * RGFX_CONTEXT_VA_SPAN <= 1u64 << 47);
 };
@@ -670,6 +623,20 @@ pub struct RgfxQueueCreate {
     pub priority: u32,
     /// The MSI-X vector the completion ring raises.
     pub vector: u32,
+}
+
+/// `CONTEXT_CLOSE`: context `context`'s process is gone.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxContextClose {
+    /// [`RGFX_CMD_CONTEXT_CLOSE`].
+    pub header: RgfxMsgHeader,
+    /// The context.
+    pub context: u32,
+    /// Zero.
+    pub reserved_14: u32,
 }
 
 /// `HEAP_CREATE`: a device heap of `size_bytes` at the guest-picked

@@ -63,6 +63,16 @@ public:
 	/// host-to-guest: the host produces, this consumes.
 	RgfxReplyReader(volatile uint8_t *ring_base, uint32_t data_size);
 
+	/// A reader with no ring: the replies the kext hands back from the control ring
+	/// (deliver), for the process's object lifecycle. pump() reads nothing.
+	RgfxReplyReader();
+
+	/// Dispatches one reply the kext handed back (a whole message): a pipeline create's
+	/// RGFX_EVT_PIPELINE_REFLECTION, which arrives before its wrapper registers, so one
+	/// with no handler yet is kept and handed to the expectReflection that registers for
+	/// its seqno. Other types are ignored.
+	void deliver(const void *message, uint32_t size);
+
 	/// Registers `handler` for the command buffer submitted at `seqno`; fired once,
 	/// when its RGFX_EVT_CB_COMPLETE arrives, then removed. A second registration for
 	/// the same seqno replaces the first.
@@ -111,6 +121,7 @@ private:
 
 	std::unordered_map<uint64_t, CompletionHandler> m_completions;
 	std::unordered_map<uint64_t, ReflectionHandler> m_reflections;
+	std::unordered_map<uint64_t, RgfxPipelineReflection> m_earlyReflections;
 	std::unordered_map<uint64_t, EventListener> m_eventListeners;
 	uint64_t m_nextToken;
 };

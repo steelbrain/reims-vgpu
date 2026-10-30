@@ -100,10 +100,10 @@ volatile UInt8 *ReimsGraphics::ring(UInt32 offset) const
 
 // Puts one command on ring 0 if it fits, without blocking: callable with a
 // spin lock held. The doorbell rings only when the host's consumer sleeps.
-bool ReimsGraphics::tryPost(UInt32 type, const void *message, UInt32 size, UInt64 *seqno)
+bool ReimsGraphics::tryPost(UInt32 type, const void *message, UInt32 size, UInt64 *seqno,
+                            UInt64 *waiterSeqno)
 {
-	UInt64 words[8] = {};
-	if (size < kHeaderBytes || size % kMsgAlign || size > sizeof(words) || !ready)
+	if (size < kHeaderBytes || size % kMsgAlign || size > kLifecycleMessageMax || !ready)
 		return false;
 	volatile UInt8 *header = ring(RGFX_CONTROL_SUBMIT_OFFSET);
 	volatile UInt8 *bytes = header + RGFX_RING_HEADER_SIZE;
@@ -129,15 +129,21 @@ bool ReimsGraphics::tryPost(UInt32 type, const void *message, UInt32 size, UInt6
 		offset = 0;
 	}
 	UInt64 s = nextSeqno++;
+	if (waiterSeqno)
+		__atomic_store_n(waiterSeqno, s, __ATOMIC_RELEASE);
 	// The caller filled the payload fields; the header is stamped here.
-	memcpy(words, message, size);
-	RgfxMsgHeader *h = reinterpret_cast<RgfxMsgHeader *>(words);
-	h->type = type;
-	h->size = size;
-	h->seqno = s;
+	RgfxMsgHeader h = {type, size, s};
+	UInt64 words[2];
+	memcpy(words, &h, sizeof(words));
 	volatile UInt64 *dst = reinterpret_cast<volatile UInt64 *>(bytes + offset);
-	for (UInt32 i = 0; i < size / 8; i++)
-		dst[i] = words[i];
+	dst[0] = words[0];
+	dst[1] = words[1];
+	const UInt8 *src = static_cast<const UInt8 *>(message);
+	for (UInt32 i = kHeaderBytes / 8; i < size / 8; i++) {
+		UInt64 w;
+		memcpy(&w, src + i * 8, sizeof(w));
+		dst[i] = w;
+	}
 	produced += size;
 	store64(header + kRingProducer, produced);
 	fullFence();
@@ -151,10 +157,11 @@ bool ReimsGraphics::tryPost(UInt32 type, const void *message, UInt32 size, UInt6
 }
 
 // Puts one command on ring 0, waiting for space: thread context only.
-IOReturn ReimsGraphics::post(UInt32 type, const void *message, UInt32 size, UInt64 *seqno)
+IOReturn ReimsGraphics::post(UInt32 type, const void *message, UInt32 size, UInt64 *seqno,
+                             UInt64 *waiterSeqno)
 {
 	for (UInt32 waited = 0;; waited++) {
-		if (tryPost(type, message, size, seqno))
+		if (tryPost(type, message, size, seqno, waiterSeqno))
 			return kIOReturnSuccess;
 		if (!ready)
 			return kIOReturnNotReady;
@@ -201,6 +208,65 @@ IOReturn ReimsGraphics::command(UInt32 type, const void *message, UInt32 size)
 		return kIOReturnError;
 	}
 	return kIOReturnSuccess;
+}
+
+IOReturn ReimsGraphics::postLifecycle(UInt32 type, const void *message, UInt32 size,
+                                      UInt32 replyType, void *reply, UInt32 replyCapacity,
+                                      UInt32 *replyLength, UInt64 *seqno, UInt32 timeoutMs)
+{
+	if (replyLength)
+		*replyLength = 0;
+	if (!replyType)
+		return post(type, message, size, seqno);
+
+	// Take a waiter, so the answer finds this thread once the message is on the ring.
+	uint64_t deadline = 0;
+	clock_interval_to_deadline(timeoutMs, kMillisecondScale, &deadline);
+	LifecycleWaiter *w = nullptr;
+	IOLockLock(stateLock);
+	while (!w) {
+		for (UInt32 i = 0; i < kLifecycleWaiters && !w; i++) {
+			if (lifecycleWaiters[i].replyType == 0)
+				w = &lifecycleWaiters[i];
+		}
+		if (!w && IOLockSleepDeadline(stateLock, lifecycleWaiters, deadline, THREAD_UNINT) ==
+		              THREAD_TIMED_OUT)
+			break;
+	}
+	if (!w) {
+		IOLockUnlock(stateLock);
+		IOLog("ReimsGraphics: lifecycle %u: every waiter is taken\n", type);
+		return kIOReturnBusy;
+	}
+	w->seqno = 0;
+	w->replyType = replyType;
+	w->length = 0;
+	w->done = false;
+	IOLockUnlock(stateLock);
+
+	UInt64 s = 0;
+	IOReturn r = post(type, message, size, &s, &w->seqno);
+	IOLockLock(stateLock);
+	while (r == kIOReturnSuccess && !w->done) {
+		if (IOLockSleepDeadline(stateLock, lifecycleWaiters, deadline, THREAD_UNINT) ==
+		    THREAD_TIMED_OUT && !w->done)
+			r = kIOReturnTimeout;
+	}
+	if (r == kIOReturnSuccess) {
+		UInt32 n = w->length < replyCapacity ? w->length : replyCapacity;
+		memcpy(reply, w->reply, n);
+		if (replyLength)
+			*replyLength = n;
+	}
+	w->replyType = 0;
+	w->seqno = 0;
+	IOLockWakeup(stateLock, lifecycleWaiters, false);
+	IOLockUnlock(stateLock);
+	if (r == kIOReturnTimeout)
+		IOLog("ReimsGraphics: lifecycle %u (seqno %llu): no answer\n", type, s);
+	if (seqno)
+		*seqno = s;
+	return r;
 }
 
 void ReimsGraphics::kickWorkLoop()
@@ -299,6 +365,8 @@ void ReimsGraphics::handleEvent(UInt32 type, UInt64 seqno, const volatile UInt8 
 	Interrupt fire = {};
 	switch (type) {
 	case RGFX_EVT_COMPLETE: {
+		if (answerLifecycle(type, seqno, payload, size))
+			return;
 		UInt32 status = size >= sizeof(uint32_t) ? field32(payload, 0) : kStatusUnreadable;
 		answer(seqno, status);
 		IOSimpleLockLock(interruptLock);
@@ -329,6 +397,9 @@ void ReimsGraphics::handleEvent(UInt32 type, UInt64 seqno, const volatile UInt8 
 	case RGFX_EVT_DISPLAY_CHANGED:
 		refreshWanted = true;
 		return;
+	case RGFX_EVT_PIPELINE_REFLECTION:
+		answerLifecycle(type, seqno, payload, size);
+		return;
 	case RGFX_EVT_VBLANK: {
 		IOSimpleLockLock(interruptLock);
 		fire = vblank;
@@ -351,6 +422,35 @@ void ReimsGraphics::handleEvent(UInt32 type, UInt64 seqno, const volatile UInt8 
 	}
 	if (fire.enabled && fire.proc)
 		fire.proc(fire.target, fire.ref);
+}
+
+// Hands a lifecycle message's answer to its waiting thread: false where no thread waits for an
+// answer of this type to `seqno`.
+bool ReimsGraphics::answerLifecycle(UInt32 type, UInt64 seqno, const volatile UInt8 *payload,
+                                    UInt32 size)
+{
+	if (seqno == 0)
+		return false;
+	bool found = false;
+	IOLockLock(stateLock);
+	for (UInt32 i = 0; i < kLifecycleWaiters && !found; i++) {
+		LifecycleWaiter &w = lifecycleWaiters[i];
+		if (w.replyType != type || w.done ||
+		    __atomic_load_n(&w.seqno, __ATOMIC_ACQUIRE) != seqno)
+			continue;
+		found = true;
+		RgfxMsgHeader h = {type, size + kHeaderBytes, seqno};
+		UInt32 n = size + kHeaderBytes < kLifecycleReplyMax ? size + kHeaderBytes
+		                                                    : kLifecycleReplyMax;
+		memcpy(w.reply, &h, kHeaderBytes);
+		for (UInt32 b = kHeaderBytes; b < n; b++)
+			w.reply[b] = payload[b - kHeaderBytes];
+		w.length = n;
+		w.done = true;
+		IOLockWakeup(stateLock, lifecycleWaiters, false);
+	}
+	IOLockUnlock(stateLock);
+	return found;
 }
 
 void ReimsGraphics::answer(UInt64 seqno, UInt32 status)

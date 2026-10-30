@@ -258,27 +258,18 @@ fn device_info_is_written_into_the_region_at_init() {
     );
 }
 
-/// An object-create message on a context's device queue reaches the decoder: its handle is held
-/// (the object count grows past the queue's own)
+/// An object-create message on ring 0 reaches the decoder: its handle is held
 #[test]
 fn an_object_create_reaches_the_decoder() {
     let raised = Arc::new(AtomicU32::new(0));
     let (device, _platform) = headless_on(&raised);
     device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
     assert_eq!(device.decoder_object_count(), 0);
-    const SUBMIT_OFF: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET;
-    const COMPLETE_OFF: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x10_0000;
-    const RING_DATA: u32 = 0x1_0000;
-    let context = 1;
-    open_queue(
-        &device,
-        &queue_open(context, 1, SUBMIT_OFF, COMPLETE_OFF, RING_DATA, 0, RGFX_QUEUE_FLAG_DEVICE),
-    );
-    let mut ring = QueueRing::new(&device, SUBMIT_OFF, COMPLETE_OFF, u64::from(RING_DATA));
-    ring.send(&device, event_create(obj(context, 10)));
+    let mut guest = Guest::new(&device);
+    guest.send(&device, event_create(obj(1, 10)));
     let mut grew = false;
     for _ in 0..2000 {
-        if device.decoder_object_count() == 2 {
+        if device.decoder_object_count() == 1 {
             grew = true;
             break;
         }
@@ -287,50 +278,33 @@ fn an_object_create_reaches_the_decoder() {
     assert!(grew, "the create never reached the decoder");
 }
 
-/// A command buffer on a queue whose context has a device queue is decoded and committed once the
-/// device queue has carried out what was published before it; completing it on the GPU posts a
-/// `CB_COMPLETE` onto the queue's completion ring, raising the queue's vector (0 here) when the
-/// guest armed it
+/// A command buffer on a queue is decoded and committed once ring 0 has carried out what was
+/// published on it before; completing it on the GPU posts a `CB_COMPLETE` onto the queue's
+/// completion ring, raising the queue's vector (0 here) when the guest armed it; the context's
+/// close drops its objects and is answered
 #[test]
 fn a_command_buffer_submission_completes_on_the_ring() {
     let raised = Arc::new(AtomicU32::new(0));
     let (device, platform) = headless_on(&raised);
     device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
-    const DEVICE_SUBMIT: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET;
-    const DEVICE_COMPLETE: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x2_0000;
-    const SUBMIT_OFF: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x4_0000;
-    const COMPLETE_OFF: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x6_0000;
+    const SUBMIT_OFF: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET;
+    const COMPLETE_OFF: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x2_0000;
     const RING_DATA: u32 = 0x1_0000;
     let context = 2;
+    let mut guest = Guest::new(&device);
     assert_eq!(
         open_queue(
             &device,
-            &queue_open(
-                context,
-                1,
-                DEVICE_SUBMIT,
-                DEVICE_COMPLETE,
-                RING_DATA,
-                0,
-                RGFX_QUEUE_FLAG_DEVICE
-            ),
+            &mut guest,
+            queue_create(context, 1, SUBMIT_OFF, COMPLETE_OFF, RING_DATA, 0)
         ),
         RGFX_STATUS_OK
     );
-    assert_eq!(
-        open_queue(
-            &device,
-            &queue_open(context, 2, SUBMIT_OFF, COMPLETE_OFF, RING_DATA, 0, 0)
-        ),
-        RGFX_STATUS_OK
-    );
-    // A create on the device queue, then the buffer on the other queue, which runs after it.
-    let mut device_ring =
-        QueueRing::new(&device, DEVICE_SUBMIT, DEVICE_COMPLETE, u64::from(RING_DATA));
-    device_ring.send(&device, event_create(obj(context, 10)));
+    // A create on ring 0, then the buffer on the queue, which runs after it.
+    guest.send(&device, event_create(obj(context, 10)));
     let mut ring = QueueRing::new(&device, SUBMIT_OFF, COMPLETE_OFF, u64::from(RING_DATA));
     ring.arm();
-    ring.send(&device, command_buffer(obj(context, 2), 100));
+    ring.send(&device, command_buffer(obj(context, 1), 100));
     // The host decodes and commits asynchronously; complete the committed buffer on the GPU once
     // it is there (a no-op before it is), until the handler posts onto the completion ring.
     for _ in 0..3000 {
@@ -346,17 +320,14 @@ fn a_command_buffer_submission_completes_on_the_ring() {
     assert_eq!(done.cb_obj_id, 100);
     assert_eq!(done.status, RGFX_CB_OK);
     assert_eq!(raised.load(Ordering::SeqCst), 1);
-    // The context's close drops its objects: both queues and the event.
-    device.mmio_write(RGFX_REG_CONTEXT_CLOSE.into(), context);
-    let mut dropped = false;
-    for _ in 0..2000 {
-        if device.decoder_object_count() == 0 {
-            dropped = true;
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
-    assert!(dropped, "the context's objects were never dropped");
+    // The context's close drops its objects, the queue and the event, before it is answered.
+    assert_eq!(device.decoder_object_count(), 2);
+    assert_eq!(
+        open_queue(&device, &mut guest, context_close(context)),
+        RGFX_STATUS_OK
+    );
+    assert_eq!(device.graphics_queue_count(), 0);
+    assert_eq!(device.decoder_object_count(), 0);
 }
 
 /// Object id `n` of context `context`.
@@ -364,17 +335,21 @@ fn obj(context: u32, n: u64) -> u64 {
     (u64::from(context) << RGFX_CONTEXT_OBJ_ID_SHIFT) | n
 }
 
-/// A `QUEUE_OPEN` of queue `n` of `context` with both rings `data` bytes, MSI-X vector `vector`.
-fn queue_open(
+/// A `QUEUE_CREATE` of queue `n` of `context` with both rings `data` bytes, MSI-X vector `vector`.
+fn queue_create(
     context: u32,
     n: u64,
     submit_offset: u64,
     complete_offset: u64,
     data: u32,
     vector: u32,
-    flags: u32,
-) -> RgfxQueueOpen {
-    RgfxQueueOpen {
+) -> Vec<u8> {
+    RgfxQueueCreate {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_QUEUE_CREATE,
+            size: 0,
+            seqno: 0,
+        },
         obj_id: obj(context, n),
         submit_offset,
         complete_offset,
@@ -382,19 +357,49 @@ fn queue_open(
         complete_data_size: data,
         priority: 2,
         vector,
-        context,
-        flags,
     }
+    .as_bytes()
+    .to_vec()
 }
 
-/// Writes `open` into the mailbox and opens the queue, as the guest's kext does; the status.
-fn open_queue(device: &GraphicsDevice<FakePlatform>, open: &RgfxQueueOpen) -> u32 {
-    for (i, word) in open.as_bytes().chunks(4).enumerate() {
-        let word = u32::from_le_bytes(word.try_into().unwrap());
-        device.mmio_write(u64::from(RGFX_REG_MAILBOX) + 4 * i as u64, word);
+/// A `CONTEXT_CLOSE` of `context`.
+fn context_close(context: u32) -> Vec<u8> {
+    RgfxContextClose {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_CONTEXT_CLOSE,
+            size: 0,
+            seqno: 0,
+        },
+        context,
+        reserved_14: 0,
     }
-    device.mmio_write(RGFX_REG_QUEUE_OPEN.into(), 1);
-    device.mmio_read(RGFX_REG_MAILBOX_STATUS.into())
+    .as_bytes()
+    .to_vec()
+}
+
+/// An `OBJECT_DESTROY` of `obj_id`.
+fn object_destroy(obj_id: u64) -> Vec<u8> {
+    RgfxObjectDestroy {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_OBJECT_DESTROY,
+            size: 0,
+            seqno: 0,
+        },
+        obj_id,
+    }
+    .as_bytes()
+    .to_vec()
+}
+
+/// Sends `command` (a `QUEUE_CREATE` or a `CONTEXT_CLOSE`) on ring 0, as the guest's kext does, and
+/// waits for its `COMPLETE`: its status.
+fn open_queue(device: &GraphicsDevice<FakePlatform>, guest: &mut Guest, command: Vec<u8>) -> u32 {
+    guest.send(device, command);
+    let bytes = guest.event().expect("a COMPLETE");
+    let complete = RgfxComplete::read_from_bytes(&bytes).unwrap();
+    assert_eq!(complete.header.r#type, RGFX_EVT_COMPLETE);
+    assert_eq!(complete.header.seqno, guest.seqno);
+    complete.status
 }
 
 /// A stand-in guest driving one command queue's own submission and completion rings, at the region
@@ -530,14 +535,16 @@ fn a_per_queue_ring_decodes_and_completes_a_command_buffer() {
     const COMPLETE_OFF: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x10_0000;
     const RING_DATA: u32 = 0x1_0000;
 
-    // Open the queue (queue 1 of context 3) with its own rings and MSI-X vector 1, through the
-    // mailbox: it is there when the write returns.
+    // Create the queue (queue 1 of context 3) with its own rings and MSI-X vector 1, on ring 0: it
+    // is there when the create is answered.
     let context = 3;
     let queue = obj(context, 1);
+    let mut guest = Guest::new(&device);
     assert_eq!(
         open_queue(
             &device,
-            &queue_open(context, 1, SUBMIT_OFF, COMPLETE_OFF, RING_DATA, 1, 0)
+            &mut guest,
+            queue_create(context, 1, SUBMIT_OFF, COMPLETE_OFF, RING_DATA, 1)
         ),
         RGFX_STATUS_OK
     );
@@ -566,11 +573,17 @@ fn a_per_queue_ring_decodes_and_completes_a_command_buffer() {
     // The queue's own vector was raised, not the control vector.
     assert_eq!(*vectors.lock(), vec![1]);
 
-    // Closing the queue ends its per-queue service when the write returns.
-    device.mmio_write(u64::from(RGFX_REG_MAILBOX), queue as u32);
-    device.mmio_write(u64::from(RGFX_REG_MAILBOX) + 4, (queue >> 32) as u32);
-    device.mmio_write(RGFX_REG_QUEUE_CLOSE.into(), 1);
-    assert_eq!(device.graphics_queue_count(), 0);
+    // Destroying the queue ends its per-queue service, and its handle goes.
+    guest.send(&device, object_destroy(queue));
+    let mut gone = false;
+    for _ in 0..2000 {
+        if device.graphics_queue_count() == 0 && device.decoder_object_count() == 0 {
+            gone = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(gone, "the queue's destroy never ended it");
 }
 
 /// The window shows the guest's cursor once it has an image and while the guest shows it,

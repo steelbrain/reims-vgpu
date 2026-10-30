@@ -59,6 +59,7 @@ private:
 	// The process's context (RgfxAcceleratorUserClientContexts.cpp): its selectors, and its
 	// release at the client's close or death (its queues, then the context, then its blocks).
 	IOReturn contextMethod(uint32_t selector, IOExternalMethodArguments *arguments);
+	IOReturn submitMethod(IOExternalMethodArguments *arguments);
 	void releaseContext();
 
 	static const UInt32 kMaxQueues = 256;

@@ -55,10 +55,47 @@ void RgfxReplyReader::expectCompletion(uint64_t seqno, CompletionHandler handler
 	m_completions[seqno] = std::move(handler);
 }
 
+RgfxReplyReader::RgfxReplyReader()
+    : m_header(nullptr), m_data(nullptr), m_dataSize(0), m_mask(0), m_consumed(0), m_nextToken(1)
+{
+}
+
 void RgfxReplyReader::expectReflection(uint64_t seqno, ReflectionHandler handler)
 {
-	std::lock_guard<std::mutex> guard(m_lock);
-	m_reflections[seqno] = std::move(handler);
+	RgfxPipelineReflection early = {};
+	{
+		std::lock_guard<std::mutex> guard(m_lock);
+		auto it = m_earlyReflections.find(seqno);
+		if (it == m_earlyReflections.end()) {
+			m_reflections[seqno] = std::move(handler);
+			return;
+		}
+		early = it->second;
+		m_earlyReflections.erase(it);
+	}
+	handler(early);
+}
+
+void RgfxReplyReader::deliver(const void *message, uint32_t size)
+{
+	RgfxPipelineReflection msg = {};
+	if (size < sizeof(msg))
+		return;
+	std::memcpy(&msg, message, sizeof(msg));
+	if (msg.header.type != RGFX_EVT_PIPELINE_REFLECTION)
+		return;
+	ReflectionHandler handler;
+	{
+		std::lock_guard<std::mutex> guard(m_lock);
+		auto it = m_reflections.find(msg.header.seqno);
+		if (it == m_reflections.end()) {
+			m_earlyReflections[msg.header.seqno] = msg;
+			return;
+		}
+		handler = std::move(it->second);
+		m_reflections.erase(it);
+	}
+	handler(msg);
 }
 
 uint64_t RgfxReplyReader::addEventListener(uint64_t obj_id, EventHandler handler)
@@ -93,6 +130,8 @@ uint32_t RgfxReplyReader::pump()
 	// after releasing it (a handler may register again or release its wrapper without
 	// re-entering the reader's lock).
 	std::vector<std::function<void()>> calls;
+	if (m_header == nullptr)
+		return 0;
 	{
 		std::lock_guard<std::mutex> guard(m_lock);
 		uint64_t producer = load64(m_header + kProducer);

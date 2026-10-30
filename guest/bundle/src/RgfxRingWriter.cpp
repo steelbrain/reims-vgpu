@@ -8,6 +8,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <fcntl.h>
 #include <unistd.h>
 
@@ -76,7 +77,8 @@ RgfxRingWriter::RgfxRingWriter(volatile uint8_t *ring_base, uint32_t data_size, 
                                RgfxDoorbell doorbell, void *doorbell_context)
     : m_header(ring_base), m_data(ring_base + RGFX_RING_HEADER_SIZE), m_dataSize(data_size),
       m_mask(data_size - 1), m_ringId(ring_id), m_doorbell(doorbell),
-      m_doorbellContext(doorbell_context), m_produced(0), m_nextSeqno(1)
+      m_doorbellContext(doorbell_context), m_forward(nullptr), m_forwardContext(nullptr),
+      m_produced(0), m_nextSeqno(1)
 {
 	// The bundle's rings (the device ring and the per-queue rings) are its own: fresh, and the
 	// host resets each at device init and at reset, so the writer starts from 0. (The interim
@@ -84,10 +86,37 @@ RgfxRingWriter::RgfxRingWriter(volatile uint8_t *ring_base, uint32_t data_size, 
 	// device ring replaced that, so each ring has a single producer and starts clean.)
 }
 
+RgfxRingWriter::RgfxRingWriter(RgfxForward forward, void *forward_context, uint32_t max_size)
+    : m_header(nullptr), m_data(nullptr), m_dataSize(max_size), m_mask(0), m_ringId(0),
+      m_doorbell(nullptr), m_doorbellContext(nullptr), m_forward(forward),
+      m_forwardContext(forward_context), m_produced(0), m_nextSeqno(1)
+{
+}
+
 bool RgfxRingWriter::tryPost(uint32_t type, const void *message, uint32_t size, uint64_t *out_seqno)
 {
 	if (size < kHeaderBytes || size % kMsgAlign != 0 || size > m_dataSize)
 		return false;
+
+	if (m_forward) {
+		// The kext stamps the seqno; the type and size are the message's own.
+		uint8_t stack[256];
+		std::unique_ptr<uint8_t[]> heap;
+		uint8_t *buf = stack;
+		if (size > sizeof(stack)) {
+			heap.reset(new uint8_t[size]);
+			buf = heap.get();
+		}
+		std::memcpy(buf, message, size);
+		RgfxMsgHeader header = { type, size, 0 };
+		std::memcpy(buf, &header, sizeof(header));
+		uint64_t seqno = 0;
+		if (!m_forward(m_forwardContext, buf, size, &seqno))
+			return false;
+		if (out_seqno)
+			*out_seqno = seqno;
+		return true;
+	}
 
 	std::lock_guard<std::mutex> guard(m_lock);
 

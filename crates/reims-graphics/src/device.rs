@@ -7,7 +7,11 @@
 //! the guest's `STATUS`, it takes every message the guest has published, answers each on the
 //! completion ring, then sleeps with the ring's `consumer_idle` handshake (`ring`). While the
 //! completion ring has no room, it waits for the guest to take more, polling, and takes no
-//! command meanwhile. The framebuffer kext is its sole producer (the display commands).
+//! command meanwhile. The guest's kexts are its sole producer, under one lock: the framebuffer's
+//! display commands, and the object lifecycle the accelerator posts for the guest's processes
+//! (creates and destroys, `QUEUE_CREATE`, `CONTEXT_CLOSE`), which the control thread hands to the
+//! host's decoder ([`Host::stage3_message`]) with no ring held, in ring order; their replies (a
+//! pipeline's reflection, a `COMPLETE`) come back on the control completion ring.
 //! Every other ring is a command queue's own (below), so each ring keeps a single producer and a
 //! single consumer, and their `consumer_idle` handshakes never race.
 //! `reims-vgpu.graphics-refresh` runs at the display's refresh rate
@@ -16,21 +20,19 @@
 //! guest has it on (dropping one the completion ring has no room for), and sends
 //! `DISPLAY_CHANGED` once the display's mode is not the one the guest was last told.
 //!
-//! **Per-queue rings.** The guest's accelerator kext opens a command queue through the mailbox
-//! (`QUEUE_OPEN`, on the vCPU): where its ring parameters are valid, the device makes the queue's
-//! own submission+completion ring pair at the guest-given region offsets and starts a service
-//! thread of its own (`reims-vgpu.graphics-queue-*`) before the write returns, so the process may
-//! write the ring at once. The thread first has the host make the queue's handle (a
-//! `QUEUE_CREATE` handed to [`Host::queue_message`]), then takes the queue's submission ring with
-//! the same `consumer_idle` handshake the control thread uses, hands each message to the host with
-//! a [`QueueCompletionPoster`] onto the queue's completion ring, and the host posts what it owes
-//! there (a buffer's completion, a pipeline's reflection), raising the queue's own MSI-X vector.
-//! Its doorbell is the submission ring's region offset (the value the guest writes to `DOORBELL`,
-//! as the control ring's is 0). A process's device queue ([`RGFX_QUEUE_FLAG_DEVICE`]) carries its
-//! object lifecycle; a command buffer on another of its queues is decoded only once the device
-//! queue's thread has taken every create the process published before the buffer.
-//! `QUEUE_CLOSE`, `CONTEXT_CLOSE` (every queue of the process; the host then drops the process's
-//! objects, [`Host::context_closed`], on a thread of its own), a reset and the device's end, end a
+//! **Per-queue rings.** A `QUEUE_CREATE` on ring 0, where its ring parameters are valid, makes the
+//! queue's own submission+completion ring pair at the guest-given region offsets and starts a
+//! service thread of its own (`reims-vgpu.graphics-queue-*`) before it is answered, so the process
+//! may write the ring once the create returns. The thread first has the host make the queue's
+//! handle (the `QUEUE_CREATE` handed to [`Host::stage3_message`]), then takes the queue's
+//! submission ring with the same `consumer_idle` handshake the control thread uses, hands each
+//! message to the host with a [`CompletionPoster`] onto the queue's completion ring, and the host
+//! posts what it owes there (a buffer's completion), raising the queue's own MSI-X vector. Its
+//! doorbell is the submission ring's region offset (the value the guest writes to `DOORBELL`, as
+//! the control ring's is 0). A command buffer is decoded only once the control thread has carried
+//! out every ring-0 message published before the thread took the buffer, so the creates it names
+//! are made. An `OBJECT_DESTROY` of the queue, a `CONTEXT_CLOSE` of its process (the host then
+//! drops the process's objects, [`Host::context_closed`]), a reset and the device's end, end a
 //! queue's service.
 //!
 //! **The host's calls.** No call of the host's into the device waits for either thread, and no
@@ -63,7 +65,7 @@ use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 
 use parking_lot::Mutex;
-use zerocopy::{FromBytes, IntoBytes};
+use zerocopy::IntoBytes;
 
 use crate::control;
 use crate::display::{Mode, Scanout, Screen};
@@ -109,20 +111,21 @@ pub trait Host: Send + Sync + 'static {
 
     /// Context `context` was closed (its process closed the device or died): the host drops every
     /// object whose id lies in the context's range (`context << RGFX_CONTEXT_OBJ_ID_SHIFT` and up,
-    /// below the next context's). Called on a thread of the device's own, after the context's
-    /// queues were ended. The default does nothing.
+    /// below the next context's). Called on the control thread, in ring order, after the
+    /// context's queues were ended. The default does nothing.
     fn context_closed(&self, context: u32) {
         let _ = context;
     }
 
-    /// Hands a message taken from a command queue's own submission ring — a `COMMAND_BUFFER`, or on
-    /// a device queue a stage-3 create or destroy — to the host's decoder, to run on that queue. A
-    /// queue's service thread calls this with the message's whole bytes, in the order the guest
-    /// published them (after a `QUEUE_CREATE` of the queue the device makes first), and
-    /// `completion` to post what the host owes (a buffer's `CB_COMPLETE`, a pipeline's reflection)
-    /// onto that queue's completion ring, raising the queue's MSI-X vector; this returns nothing.
-    /// The default does nothing, for a host with no stage-3 decoder.
-    fn queue_message(&self, completion: &QueueCompletionPoster, message: &[u8]) {
+    /// Hands a stage-3 message to the host's decoder: from ring 0, on the control thread, an
+    /// object-lifecycle create or destroy; from a command queue's own submission ring, on its
+    /// service thread, a `COMMAND_BUFFER` (after the queue's `QUEUE_CREATE`, which the device
+    /// hands over first, and before its `OBJECT_DESTROY`). Each ring's messages come whole, in the
+    /// order the guest published them, with `completion` to post what the host owes onto that
+    /// ring's completion ring (a pipeline's reflection on the control one, a buffer's
+    /// `CB_COMPLETE` on the queue's), raising its MSI-X vector; this returns nothing. The default
+    /// does nothing, for a host with no stage-3 decoder.
+    fn stage3_message(&self, completion: &CompletionPoster, message: &[u8]) {
         let _ = (completion, message);
     }
 
@@ -181,10 +184,9 @@ pub(crate) struct Shared {
     pub(crate) display: Mutex<DisplayState>,
     /// The control completion ring.
     completion: Mutex<Producer>,
-    /// The mailbox's words, as the guest's kext last wrote them.
-    mailbox: Mutex<[u32; RGFX_MAILBOX_WORDS as usize]>,
-    /// The status of the last `QUEUE_OPEN`.
-    mailbox_status: AtomicU32,
+    /// The control submission ring's count through the last message the control thread has
+    /// carried out: a command buffer waits for it to pass what was published before it.
+    control_done: AtomicU64,
     /// The command queues' own rings and service threads, by queue id and by ring id.
     queues: Mutex<Queues>,
     /// A weak handle to this shared state, set at the device's make: a queue's service thread and
@@ -200,8 +202,6 @@ struct Queues {
     by_obj: HashMap<u64, Arc<QueueShared>>,
     /// By the queue's ring id (its submission ring's region offset).
     by_ring: HashMap<u64, Arc<QueueShared>>,
-    /// Each context's device queue ([`RGFX_QUEUE_FLAG_DEVICE`]), by the context.
-    device_by_context: HashMap<u32, Arc<QueueShared>>,
 }
 
 impl Queues {
@@ -221,13 +221,6 @@ impl Queues {
         {
             self.by_ring.remove(&queue.ring_id);
         }
-        if self
-            .device_by_context
-            .get(&queue.context)
-            .is_some_and(|q| Arc::ptr_eq(q, queue))
-        {
-            self.device_by_context.remove(&queue.context);
-        }
         queue.end();
     }
 }
@@ -236,14 +229,10 @@ impl Queues {
 pub(crate) struct QueueShared {
     /// The queue's guest-picked id.
     obj_id: u64,
-    /// The context (the process) it belongs to.
+    /// The context (the process) it belongs to: its id's bits from [`RGFX_CONTEXT_OBJ_ID_SHIFT`].
     context: u32,
-    /// It is its context's device queue.
-    device_queue: bool,
-    /// Its priority, as the guest opened it.
-    priority: u32,
-    /// Its ring sizes and offsets, as the guest opened it: the `QUEUE_CREATE` the host is handed.
-    open: RgfxQueueOpen,
+    /// The `QUEUE_CREATE` that made it, which the host is handed first.
+    create: RgfxQueueCreate,
     /// The ring id: the submission ring's region offset, the `DOORBELL` value that wakes it.
     ring_id: u64,
     /// The completion ring's MSI-X vector.
@@ -256,10 +245,6 @@ pub(crate) struct QueueShared {
     wake: Wake,
     /// Set when the queue is destroyed, or at a reset or the device's end.
     ending: AtomicBool,
-    /// The submission ring's count through the last message the host has carried out: a command
-    /// buffer on another queue of the context waits for its device queue's to pass what was
-    /// published before it.
-    done: AtomicU64,
 }
 
 impl QueueShared {
@@ -330,8 +315,7 @@ impl Device {
             }),
             display: Mutex::new(DisplayState::default()),
             completion: Mutex::new(producer),
-            mailbox: Mutex::new([0; RGFX_MAILBOX_WORDS as usize]),
-            mailbox_status: AtomicU32::new(RGFX_STATUS_OK),
+            control_done: AtomicU64::new(0),
             queues: Mutex::new(Queues::default()),
             weak_self: OnceLock::new(),
         });
@@ -378,21 +362,14 @@ impl Device {
             RGFX_REG_STATUS => self.shared.status.load(Ordering::Acquire),
             RGFX_REG_REGION_SIZE_LO => (size & 0xffff_ffff) as u32,
             RGFX_REG_REGION_SIZE_HI => (size >> 32) as u32,
-            RGFX_REG_MAILBOX_STATUS => self.shared.mailbox_status.load(Ordering::Acquire),
-            o if (RGFX_REG_MAILBOX..RGFX_REG_MAILBOX + RGFX_MAILBOX_WORDS * 4).contains(&o)
-                && o.is_multiple_of(4) =>
-            {
-                self.shared.mailbox.lock()[((o - RGFX_REG_MAILBOX) / 4) as usize]
-            }
             _ => 0,
         }
     }
 
     /// A 32-bit write of BAR 0 at `offset`: `STATUS` 0 resets the device and 1 starts it taking
-    /// commands; `DOORBELL` with ring 0 wakes the control thread; the mailbox's words, then
-    /// `QUEUE_OPEN`, `QUEUE_CLOSE` and `CONTEXT_CLOSE`, open and close command queues and contexts
-    /// (the module doc). Other values and offsets are ignored. A reset waits for the message the
-    /// control thread is taking, and no write waits for the host's decoder.
+    /// commands; `DOORBELL` with a ring's id wakes its consumer. Other values and offsets are
+    /// ignored. A reset waits for the message the control thread is taking from the ring, and no
+    /// write waits for the host's decoder.
     pub fn mmio_write(&self, offset: u64, value: u32) {
         match u32::try_from(offset).unwrap_or(u32::MAX) {
             RGFX_REG_STATUS if value == RGFX_STATUS_RESET => self.reset(),
@@ -406,25 +383,6 @@ impl Device {
                 }
             }
             RGFX_REG_DOORBELL => self.shared.ring_doorbell(u64::from(value)),
-            o if (RGFX_REG_MAILBOX..RGFX_REG_MAILBOX + RGFX_MAILBOX_WORDS * 4).contains(&o)
-                && o.is_multiple_of(4) =>
-            {
-                self.shared.mailbox.lock()[((o - RGFX_REG_MAILBOX) / 4) as usize] = value;
-            }
-            RGFX_REG_QUEUE_OPEN => {
-                let words = *self.shared.mailbox.lock();
-                let status = match RgfxQueueOpen::read_from_prefix(words.as_bytes()) {
-                    Ok((open, _)) => self.shared.create_queue(&open),
-                    Err(_) => RGFX_STATUS_INVALID_ARGUMENT,
-                };
-                self.shared.mailbox_status.store(status, Ordering::Release);
-            }
-            RGFX_REG_QUEUE_CLOSE => {
-                let words = *self.shared.mailbox.lock();
-                let obj_id = u64::from(words[0]) | (u64::from(words[1]) << 32);
-                self.shared.destroy_queue(obj_id);
-            }
-            RGFX_REG_CONTEXT_CLOSE => self.shared.close_context(value),
             _ => {}
         }
     }
@@ -447,7 +405,6 @@ impl Device {
     pub fn reset(&self) {
         self.shared.reset();
     }
-
 }
 
 /// The `COMPLETE` a `PRESENT_SURFACE` owes, which the host gives from any thread once the display
@@ -479,31 +436,39 @@ impl PresentAnswer {
     }
 }
 
-/// A handle that posts events onto one command queue's completion ring from any thread: the
-/// stage-3 decoder's command-buffer completions for buffers submitted on that queue, which the GPU
-/// raises on a thread of its own. It writes the message and raises the queue's own MSI-X vector
-/// where the guest armed the ring, through that queue's [`Producer`]. It holds weak references to
-/// the device and the queue, so it keeps neither alive; a post after the device has ended, after
-/// the queue is destroyed, or while the device is reset, is dropped.
+/// A handle that posts events from any thread onto the completion ring of the ring a stage-3
+/// message came from: a command queue's (the decoder's command-buffer completions for buffers
+/// submitted on that queue, which the GPU raises on a thread of its own), or the control one (a
+/// pipeline create's reflection). It writes the message and raises the ring's MSI-X vector where
+/// the guest armed it, through that ring's [`Producer`]. It holds weak references to the device
+/// and the queue, so it keeps neither alive; a post after the device has ended, after the queue is
+/// destroyed, or while the device is reset, is dropped.
 #[derive(Clone)]
-pub struct QueueCompletionPoster {
+pub struct CompletionPoster {
     /// The device's shared state, weakly.
     shared: Weak<Shared>,
-    /// The queue's own rings, weakly.
-    queue: Weak<QueueShared>,
+    /// The queue's own rings, weakly; `None` for the control completion ring.
+    queue: Option<Weak<QueueShared>>,
 }
 
-impl QueueCompletionPoster {
-    /// Posts `message` (a whole event, its `size` set and a multiple of 8) onto the queue's
-    /// completion ring, waiting for room while the device and the queue live and the device is not
-    /// reset, and raising the queue's MSI-X vector where the guest armed the ring. Does nothing
-    /// where the device has ended or the queue is gone.
+impl CompletionPoster {
+    /// Posts `message` (a whole event, its `size` set and a multiple of 8) onto the ring's
+    /// completion ring, waiting for room while the device (and the queue) live and the device is
+    /// not reset, and raising the ring's MSI-X vector where the guest armed it. Does nothing where
+    /// the device has ended or the queue is gone.
     pub fn post(&self, message: &[u8]) {
-        let (Some(shared), Some(queue)) = (self.shared.upgrade(), self.queue.upgrade()) else {
+        let Some(shared) = self.shared.upgrade() else {
             return;
         };
         let epoch = shared.epoch.load(Ordering::Acquire);
-        shared.post_queue_waiting(&queue, message, epoch);
+        match &self.queue {
+            None => shared.post_waiting(message, epoch),
+            Some(queue) => {
+                if let Some(queue) = queue.upgrade() {
+                    shared.post_queue_waiting(&queue, message, epoch);
+                }
+            }
+        }
     }
 }
 
@@ -553,6 +518,7 @@ impl Shared {
         let mut completion = self.completion.lock();
         submit.consumer.reset(&self.region);
         submit.broken = false;
+        self.control_done.store(0, Ordering::Release);
         completion.reset(&self.region);
         *display = DisplayState::default();
         drop(completion);
@@ -565,7 +531,6 @@ impl Shared {
         }
         queues.by_obj.clear();
         queues.by_ring.clear();
-        queues.device_by_context.clear();
         drop(queues);
         self.screen.scanout(None);
         self.screen.cursor_image(None);
@@ -598,9 +563,11 @@ impl Shared {
     }
 
     /// Takes and answers every message the guest has published, while the device is started and
-    /// the ring is not broken. Each message is taken and done with the ring held, so a reset
-    /// comes before or after it whole; its answer is posted with nothing held, so the interrupt
-    /// is raised with no lock of the device's held, and dropped where a reset came between.
+    /// the ring is not broken. A display command is taken and done with the ring held, so a reset
+    /// comes before or after it whole; an object-lifecycle message is taken with it held and
+    /// carried out with nothing held, so a reset never waits for the host's decoder. An answer is
+    /// posted with nothing held, so the interrupt is raised with no lock of the device's held, and
+    /// dropped where a reset came between.
     fn take_messages(&self) {
         loop {
             let (answer, epoch) = {
@@ -610,7 +577,22 @@ impl Shared {
                 }
                 let epoch = self.epoch.load(Ordering::Acquire);
                 match submit.consumer.next(&self.region) {
-                    Ok(Some(message)) => (control::answer(self, &message), epoch),
+                    Ok(Some(message)) if control::is_lifecycle(&message) => {
+                        let through = submit.consumer.consumed();
+                        drop(submit);
+                        let answer = control::lifecycle(self, &message);
+                        // A reset meanwhile restarted the count; this message's is moot.
+                        if self.epoch.load(Ordering::Acquire) == epoch {
+                            self.control_done.store(through, Ordering::Release);
+                        }
+                        (answer, epoch)
+                    }
+                    Ok(Some(message)) => {
+                        let answer = control::answer(self, &message);
+                        self.control_done
+                            .store(submit.consumer.consumed(), Ordering::Release);
+                        (answer, epoch)
+                    }
                     Ok(None) => return,
                     Err(broken) => {
                         log::error!(
@@ -665,8 +647,8 @@ impl Shared {
         Post::Done
     }
 
-    /// `CONTEXT_CLOSE` of `context` (the module doc): its queues end now, and the host drops its
-    /// objects on a thread of its own, so the write never waits for the decoder.
+    /// `CONTEXT_CLOSE` of `context` (the module doc), on the control thread: its queues end, then
+    /// the host drops its objects.
     pub(crate) fn close_context(&self, context: u32) {
         {
             let mut queues = self.queues.lock();
@@ -680,19 +662,16 @@ impl Shared {
                 queues.remove(queue);
             }
         }
-        let Some(me) = self.weak_self.get().and_then(Weak::upgrade) else {
-            return;
-        };
-        let started = std::thread::Builder::new()
-            .name(format!("reims-vgpu.graphics-close-{context}"))
-            .spawn(move || me.host.context_closed(context));
-        if started.is_err() {
-            log::error!(
-                target: "reims_graphics",
-                "context {context}: no thread to drop its objects on; they stay"
-            );
-        }
+        self.host.context_closed(context);
         log::info!(target: "reims_graphics", "context {context} closed");
+    }
+
+    /// A completion poster onto the control completion ring, for a ring-0 message's replies.
+    pub(crate) fn control_poster(&self) -> CompletionPoster {
+        CompletionPoster {
+            shared: self.weak_self.get().cloned().unwrap_or_else(Weak::new),
+            queue: None,
+        }
     }
 
     /// A doorbell write of ring id `ring_id`: wakes the control thread (ring id 0) or the service
@@ -708,11 +687,11 @@ impl Shared {
         }
     }
 
-    /// A `QUEUE_OPEN`'s ring pair, where its parameters are valid: each data ring a power of two
+    /// A `QUEUE_CREATE`'s ring pair, where its parameters are valid: each data ring a power of two
     /// no smaller than [`MIN_QUEUE_RING_DATA`], each ring 8-aligned in the guest's allocations and
     /// within the region, and the two not overlapping. `None` where any is refused, so the queue
     /// is refused.
-    fn validate_rings(&self, q: &RgfxQueueOpen) -> Option<(RingAt, RingAt)> {
+    fn validate_rings(&self, q: &RgfxQueueCreate) -> Option<(RingAt, RingAt)> {
         let submit_data = u64::from(q.submit_data_size);
         let complete_data = u64::from(q.complete_data_size);
         if !submit_data.is_power_of_two() || !complete_data.is_power_of_two() {
@@ -754,10 +733,10 @@ impl Shared {
         ))
     }
 
-    /// `QUEUE_OPEN` (the module doc): makes a command queue's own submission+completion ring pair
-    /// and starts its service thread, where the ring parameters are valid; the status the mailbox
-    /// then reads. Waits for no thread of the device's and nothing of the host's.
-    pub(crate) fn create_queue(&self, q: &RgfxQueueOpen) -> u32 {
+    /// `QUEUE_CREATE` (the module doc): makes a command queue's own submission+completion ring pair
+    /// and starts its service thread, where the ring parameters are valid; the status its
+    /// `COMPLETE` carries. Waits for no thread of the device's and nothing of the host's.
+    pub(crate) fn create_queue(&self, q: &RgfxQueueCreate) -> u32 {
         let Some((submit_at, complete_at)) = self.validate_rings(q) else {
             log::warn!(
                 target: "reims_graphics",
@@ -780,18 +759,16 @@ impl Shared {
         };
         // Take the ring headers as the guest left them: it zeroes both before the create, and may
         // publish its first command buffer on the submission ring before the host gets here (the
-        // create rides the device ring, the buffer the queue's own). A reset here would clear
-        // that producer count and lose the buffer, and the guest, seeing `consumer_idle` 0, rang
-        // no doorbell for it. The service thread takes what is published before it first sleeps,
-        // and sets `consumer_idle` itself when it does.
+        // create rides ring 0, the buffer the queue's own). A reset here would clear that producer
+        // count and lose the buffer, and the guest, seeing `consumer_idle` 0, rang no doorbell for
+        // it. The service thread takes what is published before it first sleeps, and sets
+        // `consumer_idle` itself when it does.
         let consumer = Consumer::new(submit_at);
         let producer = Producer::new(complete_at);
         let queue = Arc::new(QueueShared {
             obj_id: q.obj_id,
-            context: q.context,
-            device_queue: q.flags & RGFX_QUEUE_FLAG_DEVICE != 0,
-            priority: q.priority,
-            open: *q,
+            context: (q.obj_id >> RGFX_CONTEXT_OBJ_ID_SHIFT) as u32,
+            create: *q,
             ring_id: q.submit_offset,
             vector: q.vector,
             submit: Mutex::new(Submit {
@@ -801,7 +778,6 @@ impl Shared {
             complete: Mutex::new(producer),
             wake,
             ending: AtomicBool::new(false),
-            done: AtomicU64::new(0),
         });
         {
             let mut queues = self.queues.lock();
@@ -812,16 +788,8 @@ impl Shared {
             if let Some(old) = queues.by_ring.get(&q.submit_offset).cloned() {
                 queues.remove(&old);
             }
-            if queue.device_queue
-                && let Some(old) = queues.device_by_context.get(&q.context).cloned()
-            {
-                queues.remove(&old);
-            }
             queues.by_obj.insert(q.obj_id, Arc::clone(&queue));
             queues.by_ring.insert(q.submit_offset, Arc::clone(&queue));
-            if queue.device_queue {
-                queues.device_by_context.insert(q.context, Arc::clone(&queue));
-            }
         }
         let service = Arc::clone(&queue);
         let started = std::thread::Builder::new()
@@ -838,13 +806,15 @@ impl Shared {
         RGFX_STATUS_OK
     }
 
-    /// Ends and forgets the queue `obj_id`'s per-queue service, where it has one (`QUEUE_CLOSE`).
-    /// An id that is not a queue's is ignored.
-    pub(crate) fn destroy_queue(&self, obj_id: u64) {
+    /// Ends and forgets the queue `obj_id`'s per-queue service, where it has one (an
+    /// `OBJECT_DESTROY` of it); false where `obj_id` is no queue's.
+    pub(crate) fn destroy_queue(&self, obj_id: u64) -> bool {
         let mut queues = self.queues.lock();
-        if let Some(queue) = queues.by_obj.get(&obj_id).cloned() {
-            queues.remove(&queue);
-        }
+        let Some(queue) = queues.by_obj.get(&obj_id).cloned() else {
+            return false;
+        };
+        queues.remove(&queue);
+        true
     }
 
     /// The answer `PRESENT_SURFACE` command `seqno` owes ([`PresentAnswer`]).
@@ -857,11 +827,11 @@ impl Shared {
     }
 
     /// A completion poster onto `queue`'s completion ring, held by its service thread (the module
-    /// doc and [`QueueCompletionPoster`]).
-    fn queue_poster(&self, queue: &Arc<QueueShared>) -> QueueCompletionPoster {
-        QueueCompletionPoster {
+    /// doc and [`CompletionPoster`]).
+    fn queue_poster(&self, queue: &Arc<QueueShared>) -> CompletionPoster {
+        CompletionPoster {
             shared: self.weak_self.get().cloned().unwrap_or_else(Weak::new),
-            queue: Arc::downgrade(queue),
+            queue: Some(Arc::downgrade(queue)),
         }
     }
 
@@ -871,21 +841,7 @@ impl Shared {
     fn queue_service(&self, queue: &Arc<QueueShared>) {
         let poster = self.queue_poster(queue);
         // The host makes the queue's handle first, so a command buffer on it can name it.
-        let create = RgfxQueueCreate {
-            header: RgfxMsgHeader {
-                r#type: RGFX_CMD_QUEUE_CREATE,
-                size: size_of::<RgfxQueueCreate>() as u32,
-                seqno: 0,
-            },
-            obj_id: queue.obj_id,
-            submit_offset: queue.open.submit_offset,
-            complete_offset: queue.open.complete_offset,
-            submit_data_size: queue.open.submit_data_size,
-            complete_data_size: queue.open.complete_data_size,
-            priority: queue.priority,
-            vector: queue.vector,
-        };
-        self.host.queue_message(&poster, create.as_bytes());
+        self.host.stage3_message(&poster, queue.create.as_bytes());
         self.queue_loop(queue, &poster);
         // A closed queue's handle goes with it (a process's other objects go at its context's
         // close). Nothing is posted for it: the queue has ended.
@@ -898,12 +854,12 @@ impl Shared {
                 },
                 obj_id: queue.obj_id,
             };
-            self.host.queue_message(&poster, destroy.as_bytes());
+            self.host.stage3_message(&poster, destroy.as_bytes());
         }
     }
 
     /// The loop of a queue's service thread: take, then sleep, until the queue or the device ends.
-    fn queue_loop(&self, queue: &Arc<QueueShared>, poster: &QueueCompletionPoster) {
+    fn queue_loop(&self, queue: &Arc<QueueShared>, poster: &CompletionPoster) {
         while !self.ending() && !queue.ended() {
             self.take_queue_messages(queue, poster);
             let idle = {
@@ -930,15 +886,15 @@ impl Shared {
     /// ring, while the device is started and the ring is not broken. Each message is taken with the
     /// ring held and handed over with nothing held; the completion the host owes is posted onto the
     /// queue's completion ring through `poster`, from the GPU's thread.
-    fn take_queue_messages(&self, queue: &Arc<QueueShared>, poster: &QueueCompletionPoster) {
+    fn take_queue_messages(&self, queue: &Arc<QueueShared>, poster: &CompletionPoster) {
         loop {
-            let (message, through) = {
+            let message = {
                 let mut submit = queue.submit.lock();
                 if !self.started() || submit.broken || self.ending() || queue.ended() {
                     return;
                 }
                 match submit.consumer.next(&self.region) {
-                    Ok(Some(message)) => (message, submit.consumer.consumed()),
+                    Ok(Some(message)) => message,
                     Ok(None) => return,
                     Err(broken) => {
                         log::error!(
@@ -952,28 +908,25 @@ impl Shared {
                 }
             };
             // Order this command buffer after the creates its process posted before it. Creates
-            // ride the process's device queue, whose sole consumer is that queue's thread; command
-            // buffers ride the other queues (this thread). A create a buffer uses is posted before
-            // it in guest order, so it is within the device queue's producer at the moment this
-            // thread takes the buffer. Wait for the device queue's thread to have carried out every
-            // message up to there, so the resource is registered before the buffer's ops name it. This thread only
-            // reads the device queue's counts; it never consumes that ring, so it keeps one
-            // consumer and its `consumer_idle` handshake is untouched.
-            if !queue.device_queue && message.header.r#type == RGFX_CMD_COMMAND_BUFFER {
-                let device = self.queues.lock().device_by_context.get(&queue.context).cloned();
-                if let Some(device) = device {
-                    let created_through =
-                        { device.submit.lock().consumer.published_count(&self.region) };
-                    while device.done.load(Ordering::Acquire) < created_through {
-                        if self.ending() || queue.ended() || device.ended() {
-                            break;
-                        }
-                        std::thread::sleep(ROOM_POLL);
+            // ride ring 0, whose sole consumer is the control thread; command buffers ride the
+            // queues' own rings (this thread). A create a buffer uses is posted before it in guest
+            // order, so it is within ring 0's producer at the moment this thread takes the buffer.
+            // Wait for the control thread to have carried out every message up to there, so the
+            // resource is registered before the buffer's ops name it. This thread only reads ring
+            // 0's counts; it never consumes that ring, so it keeps one consumer and its
+            // `consumer_idle` handshake is untouched.
+            if message.header.r#type == RGFX_CMD_COMMAND_BUFFER {
+                let epoch = self.epoch.load(Ordering::Acquire);
+                let created_through = self.submit.lock().consumer.published_count(&self.region);
+                while self.control_done.load(Ordering::Acquire) < created_through {
+                    if self.ending() || queue.ended() || self.epoch.load(Ordering::Acquire) != epoch
+                    {
+                        break;
                     }
+                    std::thread::sleep(ROOM_POLL);
                 }
             }
-            self.host.queue_message(poster, &message.bytes);
-            queue.done.store(through, Ordering::Release);
+            self.host.stage3_message(poster, &message.bytes);
         }
     }
 

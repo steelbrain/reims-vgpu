@@ -11,13 +11,15 @@
  *   - Region blocks past RGFX_CONTEXT_ALLOCATIONS_OFFSET (rings, Shared buffers and heaps,
  *     surfaces), from a first-fit allocator over a table sorted by offset, each owned by the
  *     client that asked; the client's are freed at its close.
- *   - Command queues, opened and closed through the device's mailbox on the vCPU, so the host
- *     has a queue's ring pair before openQueue returns and the process writes it at once.
+ *   - The object lifecycle, on the framebuffer's control ring: creates and destroys, a
+ *     QUEUE_CREATE answered once the host has the queue's ring pair (so the process writes it at
+ *     once), and a CONTEXT_CLOSE answered once the host has dropped the context's objects.
  *
  * Our own code; it names only SDK-public IOKit calls.
  */
 
 #include "RgfxAccelerator.hpp"
+#include "ReimsGraphics.hpp"
 
 #include <IOKit/IOLib.h>
 #include <libkern/libkern.h>
@@ -25,6 +27,10 @@
 namespace {
 // The most blocks handed out at once.
 constexpr UInt32 kMaxBlocks = 16384;
+// How long a QUEUE_CREATE and a CONTEXT_CLOSE wait for their answers: the host takes the
+// control ring in order, behind whatever pipeline compiles were posted before them.
+constexpr UInt32 kQueueAnswerMs = 30000;
+constexpr UInt32 kCloseAnswerMs = 10000;
 // Every block is page-aligned and a whole number of pages, so a block can back a mapping.
 constexpr UInt64 kPage = 0x1000;
 
@@ -50,10 +56,8 @@ struct ContextState {
 	UInt32 blockCount;
 	UInt64 blocksStart;
 	UInt64 blocksEnd;
-	// Serialises the mailbox and its register writes.
-	IOLock *mailboxLock;
 };
-ContextState state = {nullptr, 0, 0, 1, nullptr, 0, 0, 0, nullptr};
+ContextState state = {nullptr, 0, 0, 1, nullptr, 0, 0, 0};
 IOLock *&contextLock = state.contextLock;
 UInt32 &slotsHeld = state.slotsHeld;
 UInt32 &nextSlot = state.nextSlot;
@@ -62,7 +66,6 @@ RgfxBlock *&blocks = state.blocks;
 UInt32 &blockCount = state.blockCount;
 UInt64 &blocksStart = state.blocksStart;
 UInt64 &blocksEnd = state.blocksEnd;
-IOLock *&mailboxLock = state.mailboxLock;
 } // namespace
 
 bool RgfxAccelerator::startContexts()
@@ -75,13 +78,11 @@ bool RgfxAccelerator::startContexts()
 	}
 	// The first opener makes the state; one that loses the race frees what it made.
 	IOLock *lock = IOLockAlloc();
-	IOLock *mbox = IOLockAlloc();
 	RgfxBlock *table = static_cast<RgfxBlock *>(IOMalloc(sizeof(RgfxBlock) * kMaxBlocks));
-	IOLock *expected = nullptr;
-	if (lock && mbox && table && __atomic_compare_exchange_n(&mailboxLock, &expected, mbox, false,
-	                                                         __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+	RgfxBlock *expected = nullptr;
+	if (lock && table && __atomic_compare_exchange_n(&blocks, &expected, table, false,
+	                                                 __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
 		bzero(table, sizeof(RgfxBlock) * kMaxBlocks);
-		blocks = table;
 		blocksStart = RGFX_CONTEXT_ALLOCATIONS_OFFSET;
 		blocksEnd = (regionSize - RGFX_CURSOR_SPAN) & ~(kPage - 1);
 		__atomic_store_n(&contextLock, lock, __ATOMIC_RELEASE);
@@ -91,8 +92,6 @@ bool RgfxAccelerator::startContexts()
 	}
 	if (lock)
 		IOLockFree(lock);
-	if (mbox)
-		IOLockFree(mbox);
 	if (table)
 		IOFree(table, sizeof(RgfxBlock) * kMaxBlocks);
 	// Another opener is making it: wait for it to publish.
@@ -132,13 +131,17 @@ IOReturn RgfxAccelerator::openContext(UInt32 *context, UInt32 *slot)
 
 void RgfxAccelerator::closeContext(UInt32 context, UInt32 slot)
 {
-	// The device ends the context's queues and drops its objects; the caller has closed its
-	// queues already, and frees its blocks after this.
-	if (registers && mailboxLock) {
-		IOLockLock(mailboxLock);
-		writeRegister(RGFX_REG_CONTEXT_CLOSE, context);
-		IOLockUnlock(mailboxLock);
-	}
+	// The device ends the context's queues and drops its objects before it answers; the
+	// caller has closed its queues already, and frees its blocks after this.
+	RgfxContextClose close = {};
+	close.context = context;
+	UInt8 reply[ReimsGraphics::kLifecycleReplyMax];
+	UInt32 length = 0;
+	IOReturn r = postLifecycle(RGFX_CMD_CONTEXT_CLOSE, &close, sizeof(close), RGFX_EVT_COMPLETE,
+	                           reply, sizeof(reply), &length, nullptr, kCloseAnswerMs);
+	if (r != kIOReturnSuccess)
+		IOLog("RgfxAccelerator: context %u: the device did not answer its close (0x%x)\n",
+		      context, r);
 	if (contextLock && slot < RGFX_CONTEXT_SLOTS) {
 		IOLockLock(contextLock);
 		slotsHeld &= ~(1u << slot);
@@ -248,31 +251,38 @@ bool RgfxAccelerator::ownsRange(const void *owner, UInt64 offset, UInt64 length)
 	return owned;
 }
 
-// MARK: - Command queues
+// MARK: - The object lifecycle
 
-UInt32 RgfxAccelerator::openQueue(const RgfxQueueOpen &open)
+IOReturn RgfxAccelerator::postLifecycle(UInt32 type, const void *message, UInt32 size,
+                                        UInt32 replyType, void *reply, UInt32 replyCapacity,
+                                        UInt32 *replyLength, UInt64 *seqno, UInt32 timeoutMs)
 {
-	if (!registers || !mailboxLock)
+	ReimsGraphics *fb = copyFramebuffer();
+	if (!fb)
+		return kIOReturnNotReady;
+	IOReturn r = fb->postLifecycle(type, message, size, replyType, reply, replyCapacity,
+	                               replyLength, seqno, timeoutMs);
+	fb->release();
+	return r;
+}
+
+UInt32 RgfxAccelerator::openQueue(const RgfxQueueCreate &create)
+{
+	RgfxComplete answer = {};
+	UInt32 length = 0;
+	IOReturn r = postLifecycle(RGFX_CMD_QUEUE_CREATE, &create, sizeof(create), RGFX_EVT_COMPLETE,
+	                           &answer, sizeof(answer), &length, nullptr, kQueueAnswerMs);
+	if (r != kIOReturnSuccess || length < sizeof(answer)) {
+		IOLog("RgfxAccelerator: queue 0x%llx: no answer to its create (0x%x)\n", create.obj_id, r);
 		return RGFX_STATUS_INVALID_ARGUMENT;
-	static_assert(sizeof(RgfxQueueOpen) <= RGFX_MAILBOX_WORDS * 4, "the mailbox holds the open");
-	UInt32 words[RGFX_MAILBOX_WORDS] = {};
-	memcpy(words, &open, sizeof(open));
-	IOLockLock(mailboxLock);
-	for (UInt32 i = 0; i < (sizeof(open) + 3) / 4; i++)
-		writeRegister(RGFX_REG_MAILBOX + i * 4, words[i]);
-	writeRegister(RGFX_REG_QUEUE_OPEN, 1);
-	UInt32 status = readRegister(RGFX_REG_MAILBOX_STATUS);
-	IOLockUnlock(mailboxLock);
-	return status;
+	}
+	return answer.status;
 }
 
 void RgfxAccelerator::closeQueue(UInt64 objId)
 {
-	if (!registers || !mailboxLock)
-		return;
-	IOLockLock(mailboxLock);
-	writeRegister(RGFX_REG_MAILBOX, static_cast<UInt32>(objId));
-	writeRegister(RGFX_REG_MAILBOX + 4, static_cast<UInt32>(objId >> 32));
-	writeRegister(RGFX_REG_QUEUE_CLOSE, 1);
-	IOLockUnlock(mailboxLock);
+	RgfxObjectDestroy destroy = {};
+	destroy.obj_id = objId;
+	postLifecycle(RGFX_CMD_OBJECT_DESTROY, &destroy, sizeof(destroy), 0, nullptr, 0, nullptr,
+	              nullptr, 0);
 }

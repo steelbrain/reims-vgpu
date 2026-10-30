@@ -35,6 +35,12 @@
 /// device's `DOORBELL` register; in a test, records the wake.
 typedef void (*RgfxDoorbell)(void *context, uint32_t ring_id);
 
+/// Hands one whole message (its header's `type` and `size` stamped) to a ring the process
+/// does not write itself: in the bundle, the accelerator kext, which posts it on the control
+/// ring and stamps its seqno; true once it is posted, with `*out_seqno` the seqno.
+typedef bool (*RgfxForward)(void *context, const void *message, uint32_t size,
+                            uint64_t *out_seqno);
+
 class RgfxRingWriter {
 public:
 	/// A writer over the ring whose header is at `ring_base`, with a byte ring
@@ -43,6 +49,11 @@ public:
 	/// the device is marked ready.
 	RgfxRingWriter(volatile uint8_t *ring_base, uint32_t data_size, uint32_t ring_id,
 	               RgfxDoorbell doorbell, void *doorbell_context);
+
+	/// A writer that hands each message to `forward` instead of writing a ring: the
+	/// process's object lifecycle, which the kext posts on the control ring. `max_size` is
+	/// the largest message it takes (dataSize()).
+	RgfxRingWriter(RgfxForward forward, void *forward_context, uint32_t max_size);
 
 	/// Writes a message of `size` bytes (its payload in `message`, a multiple of
 	/// 8, at least the header and at most `data_size`) and publishes it, stamping
@@ -63,6 +74,8 @@ private:
 	uint32_t m_ringId;
 	RgfxDoorbell m_doorbell;
 	void *m_doorbellContext;
+	RgfxForward m_forward;
+	void *m_forwardContext;
 
 	std::mutex m_lock;
 	uint64_t m_produced;

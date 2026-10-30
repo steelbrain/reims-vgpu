@@ -60,13 +60,38 @@ enum {
 	kRgfxAccelMethodAlloc = 0x101,
 	kRgfxAccelMethodFree = 0x102,
 	kRgfxAccelMethodQueueCreate = 0x103,
+	kRgfxAccelMethodSubmit = 0x105,
 };
 
-// The process's device queue: its submission ring carries the object lifecycle (creates and
-// destroys, library bytes among them), its completion ring the replies.
 namespace {
-constexpr uint32_t kDeviceSubmitDataSize = 0x40000;
-constexpr uint32_t kDeviceCompleteDataSize = 0x8000;
+// The largest object-lifecycle message the kext takes (ReimsGraphics::kLifecycleMessageMax):
+// half the control ring.
+constexpr uint32_t kLifecycleMessageMax = RGFX_CONTROL_RING_DATA_SIZE / 2;
+
+// What the lifecycle's forward reaches: the user client, and the reader its replies go to.
+struct RgfxKextLink {
+	io_connect_t conn;
+	RgfxReplyReader *reader;
+};
+
+// The serializer's lifecycle route: the kext posts the message on the control ring, stamping
+// its seqno, and hands back a pipeline create's reflection once the host has answered it.
+bool rgfxKextSubmit(void *context, const void *message, uint32_t size, uint64_t *out_seqno)
+{
+	RgfxKextLink *link = static_cast<RgfxKextLink *>(context);
+	uint64_t seqno = 0;
+	uint32_t outCount = 1;
+	uint8_t reply[128];
+	size_t replySize = sizeof(reply);
+	kern_return_t kr = IOConnectCallMethod(link->conn, kRgfxAccelMethodSubmit, nullptr, 0, message,
+	                                       size, &seqno, &outCount, reply, &replySize);
+	if (kr != KERN_SUCCESS)
+		return false;
+	if (replySize >= sizeof(RgfxMsgHeader) && link->reader)
+		link->reader->deliver(reply, static_cast<uint32_t>(replySize));
+	*out_seqno = seqno;
+	return true;
+}
 
 // The kext's blocks, as RgfxRegion's block source; `context` is the user client's connect.
 bool rgfxKextAlloc(void *context, uint64_t size, uint64_t align, uint64_t *offset)
@@ -84,24 +109,18 @@ void rgfxKextRelease(void *context, uint64_t offset)
 	IOConnectCallScalarMethod(conn, kRgfxAccelMethodFree, &offset, 1, nullptr, nullptr);
 }
 
-// Opens a queue through the kext, which tells the device before it returns; `flags` is
-// RGFX_QUEUE_FLAG_DEVICE for the device queue.
-bool rgfxKextOpenQueue(io_connect_t conn, const RgfxQueueCreate &q, uint32_t flags)
+// The serializer's queue opener: the kext posts the queue's create on the control ring and
+// returns once the device has its rings.
+bool rgfxKextQueueOpener(void *context, const RgfxQueueCreate &q)
 {
-	uint64_t in[7] = {q.obj_id, q.submit_offset, q.complete_offset, q.submit_data_size,
-	                  q.complete_data_size, q.priority, flags};
+	io_connect_t conn = static_cast<io_connect_t>(reinterpret_cast<uintptr_t>(context));
+	uint64_t in[6] = {q.obj_id, q.submit_offset, q.complete_offset, q.submit_data_size,
+	                  q.complete_data_size, q.priority};
 	uint64_t status = ~0ull;
 	uint32_t outCount = 1;
 	kern_return_t kr =
-	    IOConnectCallScalarMethod(conn, kRgfxAccelMethodQueueCreate, in, 7, &status, &outCount);
+	    IOConnectCallScalarMethod(conn, kRgfxAccelMethodQueueCreate, in, 6, &status, &outCount);
 	return kr == KERN_SUCCESS && status == RGFX_STATUS_OK;
-}
-
-// The serializer's queue opener: every queue but the device queue.
-bool rgfxKextQueueOpener(void *context, const RgfxQueueCreate &q)
-{
-	return rgfxKextOpenQueue(static_cast<io_connect_t>(reinterpret_cast<uintptr_t>(context)), q,
-	                         0);
 }
 } // namespace
 
@@ -140,10 +159,11 @@ constexpr long kGpuFamilyMinus1009 = -1009;
 	RgfxSerializer *_serializer; // the create route; null until the ring transport lands
 	mach_port_t _acceleratorPort;
 	RgfxRegion *_region;         // BAR-region allocator; null until the handshake maps it
-	RgfxReplyReader *_replyReader; // device-completion-ring reader; null until the handshake
+	RgfxReplyReader *_replyReader; // the lifecycle's replies, from the kext; null until the handshake
+	RgfxKextLink _link;          // the lifecycle's route to the kext
 	std::vector<std::unique_ptr<RgfxRingWriter>> _queueRings; // owned queue submit-ring writers
 	io_connect_t _conn;          // our accelerator user client (BAR-2 region map + doorbell)
-	std::unique_ptr<RgfxRingWriter> _controlRing; // the device queue's submission ring (the lifecycle)
+	std::unique_ptr<RgfxRingWriter> _controlRing; // the lifecycle, forwarded to the kext
 	mach_vm_address_t _mapBase;  // mapped device-region base (0 until the handshake maps it)
 	mach_vm_size_t _mapSize;     // mapped device-region size
 }
@@ -238,30 +258,17 @@ constexpr long kGpuFamilyMinus1009 = -1009;
 	_region = new RgfxRegion(base, mapSize);
 	_region->setBlockSource(&rgfxKextAlloc, &rgfxKextRelease, connContext);
 
-	// The device queue: an ordinary queue ring pair, opened through the kext, whose submission
-	// ring carries the object lifecycle and whose completion ring the replies.
-	RgfxRegion::RingPair rings =
-	    _region->allocateRingPair(kDeviceSubmitDataSize, kDeviceCompleteDataSize);
-	RgfxQueueCreate deviceQueue = {};
-	deviceQueue.obj_id = _ids.allocObjId();
-	deviceQueue.submit_offset = rings.submit_offset;
-	deviceQueue.complete_offset = rings.complete_offset;
-	deviceQueue.submit_data_size = kDeviceSubmitDataSize;
-	deviceQueue.complete_data_size = kDeviceCompleteDataSize;
-	if (!rings.ok || !rgfxKextOpenQueue(_conn, deviceQueue, RGFX_QUEUE_FLAG_DEVICE)) {
-		rgfxDiag("RGFX: the device queue was refused (rings %s); transport stubbed\n",
-		         rings.ok ? "placed" : "not placed");
-		return self;
-	}
-	_controlRing = std::make_unique<RgfxRingWriter>(
-	    base + rings.submit_offset, kDeviceSubmitDataSize, static_cast<uint32_t>(rings.submit_offset),
-	    &rgfxDeviceDoorbell, (__bridge void *)self);
+	// The object lifecycle goes to the kext, which posts it on the control ring and hands back
+	// the replies (a pipeline's reflection).
+	_replyReader = new RgfxReplyReader();
+	_link.conn = _conn;
+	_link.reader = _replyReader;
+	_controlRing = std::make_unique<RgfxRingWriter>(&rgfxKextSubmit, &_link, kLifecycleMessageMax);
 	_serializer = new RgfxSerializer(*_controlRing, _ids);
 	_serializer->setQueueOpener(&rgfxKextQueueOpener, connContext);
-	_replyReader = new RgfxReplyReader(base + rings.complete_offset, kDeviceCompleteDataSize);
-	rgfxDiag("RGFX: context %llu: ids 0x%llx, va 0x%llx, resource ids %llu; device queue at 0x%llx\n",
+	rgfxDiag("RGFX: context %llu: ids 0x%llx, va 0x%llx, resource ids %llu\n",
 	         (unsigned long long)ctx[0], (unsigned long long)ctx[1], (unsigned long long)ctx[2],
-	         (unsigned long long)ctx[3], (unsigned long long)rings.submit_offset);
+	         (unsigned long long)ctx[3]);
 	rgfxDiag("RGFX: transport up: region=%llu bytes, caps=%s\n", (unsigned long long)mapSize,
 	         _caps.valid() ? "valid" : "default");
 	return self;

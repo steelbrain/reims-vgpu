@@ -44,11 +44,59 @@ pub(crate) fn answer(shared: &Shared, message: &Message) -> Option<Vec<u8>> {
             Some(_) => RGFX_STATUS_NO_DISPLAY,
             None => RGFX_STATUS_INVALID_ARGUMENT,
         },
-        // Stage 3 (every type at or above `QUEUE_CREATE`) rides the command queues' own rings,
-        // never the control ring: one that reaches it is a command the control ring has not.
+        // A command buffer rides a command queue's own ring, never the control ring.
         _ => RGFX_STATUS_UNKNOWN_COMMAND,
     };
     Some(complete(seqno, status))
+}
+
+/// Whether `message` is of the object lifecycle the accelerator kext posts on ring 0 (every
+/// stage-3 type from `QUEUE_CREATE` below `COMMAND_BUFFER`), which [`lifecycle`] carries out.
+pub(crate) fn is_lifecycle(message: &Message) -> bool {
+    (RGFX_CMD_QUEUE_CREATE..RGFX_CMD_COMMAND_BUFFER).contains(&message.header.r#type)
+}
+
+/// Carries out one object-lifecycle message from ring 0, with no ring held: what answers it, or
+/// `None` for one the host answers itself (a pipeline's reflection, through the control poster)
+/// or not at all. A `QUEUE_CREATE` makes the queue's own ring pair and service thread, answered
+/// with whether its rings were taken; an `OBJECT_DESTROY` of a command queue ends the queue's
+/// service, which drops its handle; a `CONTEXT_CLOSE` ends the context's queues and drops its
+/// objects, then is answered. Every other message goes to the host's decoder.
+pub(crate) fn lifecycle(shared: &Shared, message: &Message) -> Option<Vec<u8>> {
+    let seqno = message.header.seqno;
+    match message.header.r#type {
+        RGFX_CMD_QUEUE_CREATE => {
+            let status = read::<RgfxQueueCreate>(message)
+                .map_or(RGFX_STATUS_INVALID_ARGUMENT, |command| {
+                    shared.create_queue(&command)
+                });
+            Some(complete(seqno, status))
+        }
+        RGFX_CMD_OBJECT_DESTROY => {
+            let queue = read::<RgfxObjectDestroy>(message)
+                .is_some_and(|command| shared.destroy_queue(command.obj_id));
+            if !queue {
+                shared
+                    .host
+                    .stage3_message(&shared.control_poster(), &message.bytes);
+            }
+            None
+        }
+        RGFX_CMD_CONTEXT_CLOSE => {
+            let status =
+                read::<RgfxContextClose>(message).map_or(RGFX_STATUS_INVALID_ARGUMENT, |command| {
+                    shared.close_context(command.context);
+                    RGFX_STATUS_OK
+                });
+            Some(complete(seqno, status))
+        }
+        _ => {
+            shared
+                .host
+                .stage3_message(&shared.control_poster(), &message.bytes);
+            None
+        }
+    }
 }
 
 /// `message`'s bytes as command `T`, or `None` where they are fewer than it.

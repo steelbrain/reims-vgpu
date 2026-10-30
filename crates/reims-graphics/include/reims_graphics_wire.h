@@ -652,35 +652,6 @@
 // `DOORBELL`, WO: writing a ring's id wakes its consumer.
 #define RGFX_REG_DOORBELL 32
 
-// `QUEUE_OPEN`, WO: writing any value opens the command queue the mailbox holds, an
-// [`RgfxQueueOpen`] in its first words: the device makes the queue's ring pair (the submission
-// ring's `consumer_idle` 1) and starts its service before the write returns, and `MAILBOX_STATUS`
-// then reads [`RGFX_STATUS_OK`], or [`RGFX_STATUS_INVALID_ARGUMENT`] where the rings were refused.
-// The guest's accelerator kext writes it, the mailbox's only writer, when a process makes a queue.
-#define RGFX_REG_QUEUE_OPEN 36
-
-// `QUEUE_CLOSE`, WO: writing any value closes the queue whose id the mailbox's first two words
-// hold (low word first): the device takes nothing more from its ring and ends its service, and
-// the host drops the queue's handle.
-#define RGFX_REG_QUEUE_CLOSE 40
-
-// `CONTEXT_CLOSE`, WO: writing a context's number (its process's, which the kext hands out)
-// closes the context: the device ends the context's queues, and the host drops every object
-// whose id lies in the context's range ([`RGFX_CONTEXT_OBJ_ID_SHIFT`]). The kext writes it when
-// the process closes the device or dies, after it closed the process's queues and before it frees
-// the process's region blocks.
-#define RGFX_REG_CONTEXT_CLOSE 44
-
-// `MAILBOX_STATUS`, RO: the status of the last `QUEUE_OPEN`.
-#define RGFX_REG_MAILBOX_STATUS 48
-
-// `MAILBOX`, RW: [`RGFX_MAILBOX_WORDS`] 32-bit words from here, the arguments of `QUEUE_OPEN`
-// and `QUEUE_CLOSE`.
-#define RGFX_REG_MAILBOX 64
-
-// The mailbox's words.
-#define RGFX_MAILBOX_WORDS 16
-
 // What `MAGIC` reads: "RGFX", little-endian.
 #define RGFX_MAGIC 1481000786
 
@@ -740,12 +711,6 @@
 // The texture resource ids each slot picks from: slot `s`'s are `1 + s * RGFX_CONTEXT_RESOURCE_IDS`
 // and up.
 #define RGFX_CONTEXT_RESOURCE_IDS 2048
-
-// [`RgfxQueueOpen`]'s `flags`: the queue is its process's device queue, whose submission ring
-// carries the object lifecycle (creates and destroys) and whose completion ring the replies; a
-// command buffer on another queue of the process runs after every create the process published
-// on it before the buffer.
-#define RGFX_QUEUE_FLAG_DEVICE 1
 
 // The control submission ring's id, which the guest writes to `DOORBELL`.
 #define RGFX_CONTROL_RING_ID 0
@@ -823,8 +788,10 @@
 // The displays the device has: display 0.
 #define RGFX_DISPLAY_COUNT 1
 
-// Device-level object lifecycle (ring 0). Creates with a guest-picked id or
-// address are fire-and-forget; pipeline creates are answered with reflection.
+// Device-level object lifecycle (ring 0, which the accelerator kext posts for
+// the guest's processes). Creates with a guest-picked id or address are
+// fire-and-forget; pipeline creates are answered with reflection on the
+// control completion ring, and `QUEUE_CREATE` with `COMPLETE`.
 // Command `QUEUE_CREATE` ([`RgfxQueueCreate`]): make a submission+completion
 // ring pair for a command queue; answered by [`RGFX_EVT_COMPLETE`].
 #define RGFX_CMD_QUEUE_CREATE 512
@@ -897,6 +864,13 @@
 // library's `.metallib`/AIR bytes the guest placed in a block of the device's
 // region, for a library larger than one ring message.
 #define RGFX_CMD_LIBRARY_FROM_REGION 530
+
+// `CONTEXT_CLOSE` ([`RgfxContextClose`]), on ring 0 from the accelerator kext: the process that
+// held context `context` closed the device or died. The host ends the context's command queues
+// and drops every object whose id lies in its range ([`RGFX_CONTEXT_OBJ_ID_SHIFT`]), then answers
+// [`RGFX_EVT_COMPLETE`]; the kext destroyed its queues before it, and frees its blocks once it is
+// answered.
+#define RGFX_CMD_CONTEXT_CLOSE 752
 
 // Command `COMMAND_BUFFER` (a per-queue submission ring): one command buffer,
 // its `obj_id` followed by the encoder-op byte stream. Struct and op stream in
@@ -3112,28 +3086,15 @@ typedef struct {
   uint32_t vector;
 } RgfxQueueCreate;
 
-// `QUEUE_OPEN`'s arguments, in the mailbox: a command queue's ring pair in the guest's
-// allocations, as a `QUEUE_CREATE` places one.
+// `CONTEXT_CLOSE`: context `context`'s process is gone.
 typedef struct {
-  // The queue's guest-picked id, in its context's range.
-  uint64_t obj_id;
-  // Where the submission ring (guest to host) starts in the region; it is the ring's id.
-  uint64_t submit_offset;
-  // Where the completion ring (host to guest) starts in the region.
-  uint64_t complete_offset;
-  // The submission ring's byte-ring size, after its header: a power of two.
-  uint32_t submit_data_size;
-  // The completion ring's byte-ring size, after its header: a power of two.
-  uint32_t complete_data_size;
-  // The queue's priority: 0 is normal, higher is higher.
-  uint32_t priority;
-  // The MSI-X vector the completion ring raises.
-  uint32_t vector;
-  // The context (the process) the queue belongs to.
+  // [`RGFX_CMD_CONTEXT_CLOSE`].
+  RgfxMsgHeader header;
+  // The context.
   uint32_t context;
-  // [`RGFX_QUEUE_FLAG_DEVICE`] or 0.
-  uint32_t flags;
-} RgfxQueueOpen;
+  // Zero.
+  uint32_t reserved_14;
+} RgfxContextClose;
 
 // One colour attachment of a render pass (`colorAttachments[i]`). Absent (sets
 // nothing) when `texture_obj_id` is 0.

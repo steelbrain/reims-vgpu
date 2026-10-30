@@ -223,11 +223,6 @@ sit in BAR0 from 0x800.
 | 0x014 | `REGION_SIZE_LO` | RO | BAR2's size, low 32 bits |
 | 0x018 | `REGION_SIZE_HI` | RO | BAR2's size, high 32 bits |
 | 0x020 | `DOORBELL` | WO | writing a ring's id wakes its consumer (an `ioeventfd`) |
-| 0x024 | `QUEUE_OPEN` | WO | opens the command queue the mailbox holds (`RgfxQueueOpen`): the host has its ring pair before the write returns |
-| 0x028 | `QUEUE_CLOSE` | WO | closes the queue whose id is in the mailbox's first two words |
-| 0x02c | `CONTEXT_CLOSE` | WO | closes context `value`: its queues end, and the host drops its objects |
-| 0x030 | `MAILBOX_STATUS` | RO | the last `QUEUE_OPEN`'s status |
-| 0x040 | `MAILBOX` | RW | 16 words, the arguments of `QUEUE_OPEN` and `QUEUE_CLOSE`; the accelerator kext is their only writer |
 
 **BAR2: the region.** A 64-bit prefetchable BAR over host memory (256 MiB),
 mapped write-back by the guest. The device places the control rings at fixed
@@ -235,29 +230,33 @@ offsets; the guest places everything else.
 
 | offset | size | what |
 |---|---|---|
-| 0x00000 | 64 KiB | control submission ring, id 0 (framebuffer kext to host) |
+| 0x00000 | 64 KiB | control submission ring, id 0 (the kexts to host) |
 | 0x10000 | 64 KiB | control completion ring (host to kext), MSI-X vector 0; the device info at 0x18100 |
 | 0x400000 | 128 MiB | the framebuffer's scanout (`RGFX_SCANOUT_SPAN`) |
 | 0x8400000 | to the cursor | the accelerator kext's blocks: every process's queue rings, Shared buffers and heaps, surfaces |
 | end − 256 KiB | 256 KiB | the framebuffer's cursor image |
 
-The control ring is the framebuffer kext's alone. Every other ring is one
-command queue's own ring pair, in a block the accelerator kext handed to the
-queue's process, so each ring keeps a single producer and a single consumer
-however many processes run Metal.
+The control ring is the kexts' alone: the framebuffer's display commands, and
+the object lifecycle the accelerator posts for the Metal processes, under the
+framebuffer's ring lock. Every other ring is one command queue's own ring pair,
+in a block the accelerator kext handed to the queue's process, so each ring
+keeps a single producer and a single consumer however many processes run
+Metal.
 
 **Contexts.** Each process that opens the accelerator's user client gets a
 context from the kext: a number `c`, handed out once from 1 (its object ids are
 `c << 40` and up), and one of 32 slots, held until its close, for its GPU
 addresses (`0x1_0000_0000 + s << 36`) and texture resource ids
 (`1 + s * 2048`). The kext hands out its region blocks (first fit, page
-granular) and opens its queues through the mailbox. At the process's close or
-death the kext closes its queues, then its context (`CONTEXT_CLOSE`: the host
-drops its objects), then frees its blocks. Each process makes one device queue
-(`RGFX_QUEUE_FLAG_DEVICE`): its submission ring carries the object lifecycle
-and its completion ring the replies, and a command buffer on another of its
-queues is decoded once the device queue has taken every create published
-before it.
+granular). The process hands each create and destroy of its objects (ids in its
+range) to the kext by a user-client call; the kext posts it on the control ring
+and, for a pipeline create, hands the reflection back once the host answers
+it. A queue's `QUEUE_CREATE` goes the same way, its rings checked to lie in the
+process's blocks, and is answered once the host has the rings. At the
+process's close or death the kext destroys its queues, then closes its context
+(`CONTEXT_CLOSE`: the host drops its objects, then answers), then frees its
+blocks. A command buffer is decoded once the host has carried out every
+control-ring message published before its queue's thread took it.
 
 **Rings.** A 256-byte header, then a byte ring whose size is a power of two
 (64 KiB minus the header for the control rings). Each header field sits in its
@@ -344,15 +343,15 @@ them — the host never hands a host device address to the guest (m2v's rule). A
 destroy carries the `ObjId` alone; the host drops its handle.
 
 **Rings.** Ring 0 stays the control ring: the framebuffer kext's stage-2
-display commands alone. Every other ring is one `MTLCommandQueue`'s ring pair
-(one submission and one completion ring per queue, created on demand), which
-the bundle places in its kext-given blocks and opens through the accelerator
-kext (`QUEUE_OPEN`, above). Each process's device queue carries the
-device-level object lifecycle below. Each ring keeps a single producer and a
+display commands, and the device-level object lifecycle below, which the
+accelerator kext posts there for each process. Every other ring is one
+`MTLCommandQueue`'s ring pair (one submission and one completion ring per
+queue, created on demand), which the bundle places in its kext-given blocks and
+creates through the accelerator kext. Each ring keeps a single producer and a
 single consumer, so their `consumer_idle` handshakes never race. A create carries a priority, and the host gives that ring's VkQueue a
 matching priority, so WindowServer's queue runs high.
 
-**Object lifecycle** (the process's device queue, request/reply). Each `*_CREATE` carries our
+**Object lifecycle** (ring 0, through the accelerator kext, request/reply). Each `*_CREATE` carries our
 schema for the Metal descriptor (plain little-endian fields, decoded straight
 into the `Platform` descriptor struct — core keeps descriptors as public-field
 structs), the guest-picked `ObjId`, and, where it applies, the address, id or

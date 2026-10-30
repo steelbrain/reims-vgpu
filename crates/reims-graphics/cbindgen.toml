@@ -198,7 +198,7 @@ include = [
     "RgfxOpWaitForFence",
     "RgfxPipelineReflection",
     "RgfxQueueCreate",
-    "RgfxQueueOpen",
+    "RgfxContextClose",
     "RgfxRenderPassColorAttachment",
     "RgfxRenderPassDepthAttachment",
     "RgfxRenderPassDesc",

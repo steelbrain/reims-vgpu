@@ -23,5 +23,5 @@ mod ring;
 mod wake;
 pub mod wire;
 
-pub use device::{Device, Host, PresentAnswer, QueueCompletionPoster, REGION_SIZE};
+pub use device::{CompletionPoster, Device, Host, PresentAnswer, REGION_SIZE};
 pub use display::{CursorImage, FixedScreen, Mode, Scanout, Screen};

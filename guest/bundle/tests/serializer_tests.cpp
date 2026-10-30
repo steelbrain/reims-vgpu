@@ -20,6 +20,7 @@
 #include "RgfxCaps.hpp"
 #include "RgfxEncoder.hpp"
 #include "RgfxObjectModel.hpp"
+#include "RgfxReplyReader.hpp"
 #include "RgfxRingWriter.hpp"
 #include "RgfxSerializer.hpp"
 #include "reims_graphics_wire.h"
@@ -688,6 +689,70 @@ void test_command_buffer_encoder()
 
 } // namespace
 
+// A forwarding writer hands each whole message, its type and size stamped, to its forward,
+// whose seqno it returns; a refusal posts nothing. A reflection the kext hands back before its
+// wrapper registers is kept for the registration.
+struct ForwardLog {
+	std::vector<std::vector<uint8_t>> messages;
+	bool refuse = false;
+	uint64_t nextSeqno = 41;
+};
+
+bool forwardTo(void *context, const void *message, uint32_t size, uint64_t *out_seqno)
+{
+	ForwardLog *log = static_cast<ForwardLog *>(context);
+	if (log->refuse)
+		return false;
+	const uint8_t *b = static_cast<const uint8_t *>(message);
+	log->messages.emplace_back(b, b + size);
+	*out_seqno = log->nextSeqno++;
+	return true;
+}
+
+void test_forwarded_lifecycle()
+{
+	ForwardLog log;
+	RgfxRingWriter writer(&forwardTo, &log, 4096);
+	CHECK(writer.dataSize() == 4096);
+	RgfxIdSpace ids;
+	RgfxSerializer ser(writer, ids);
+	RgfxCreated ev = ser.createEvent();
+	CHECK(ev.posted);
+	CHECK(ev.seqno == 41);
+	CHECK(log.messages.size() == 1);
+	RgfxObjectCreate m = {};
+	std::memcpy(&m, log.messages[0].data(), sizeof(m));
+	CHECK(m.header.type == RGFX_CMD_EVENT_CREATE);
+	CHECK(m.header.size == sizeof(RgfxObjectCreate));
+	CHECK(m.header.seqno == 0); // the kext stamps it
+	CHECK(m.obj_id == ev.obj_id);
+	log.refuse = true;
+	CHECK(!ser.createEvent().posted);
+	CHECK(log.messages.size() == 1);
+	// Too large for the forward: refused before it is handed over.
+	std::vector<uint8_t> big(8192, 0);
+	CHECK(!writer.tryPost(RGFX_CMD_LIBRARY_CREATE, big.data(), 8192, nullptr));
+
+	RgfxReplyReader reader;
+	CHECK(reader.pump() == 0);
+	RgfxPipelineReflection r = {};
+	r.header.type = RGFX_EVT_PIPELINE_REFLECTION;
+	r.header.size = sizeof(r);
+	r.header.seqno = 7;
+	r.obj_id = 99;
+	reader.deliver(&r, sizeof(r));
+	uint64_t got = 0;
+	reader.expectReflection(7, [&got](const RgfxPipelineReflection &m) { got = m.obj_id; });
+	CHECK(got == 99);
+	CHECK(!reader.awaitingReflection(7));
+	reader.expectReflection(8, [&got](const RgfxPipelineReflection &m) { got = m.obj_id + 1; });
+	CHECK(reader.awaitingReflection(8));
+	r.header.seqno = 8;
+	reader.deliver(&r, sizeof(r));
+	CHECK(got == 100);
+	CHECK(!reader.awaitingReflection(8));
+}
+
 int main()
 {
 	test_id_space();
@@ -697,6 +762,7 @@ int main()
 	test_pipeline_messages();
 	test_ring_wrap_and_no_room();
 	test_command_buffer_encoder();
+	test_forwarded_lifecycle();
 	std::printf("serializer_tests: OK (%d checks)\n", g_checks);
 	return 0;
 }

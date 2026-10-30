@@ -5,7 +5,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use parking_lot::Mutex;
-use zerocopy::{FromBytes, IntoBytes};
+use zerocopy::{FromBytes, FromZeros, IntoBytes};
 
 use super::*;
 use crate::display::CursorImage;
@@ -102,6 +102,26 @@ const MODE: Mode = Mode {
 
 impl Rig {
     fn new() -> Rig {
+        let interrupts = Arc::new(AtomicU32::new(0));
+        let written = Arc::new(AtomicBool::new(false));
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let presented = Arc::new(Mutex::new(Vec::new()));
+        let host = TestHost {
+            interrupts: Arc::clone(&interrupts),
+            written: Arc::clone(&written),
+            asked: Arc::clone(&asked),
+            presented: Arc::clone(&presented),
+        };
+        let mut rig = Rig::with_host(Box::new(host));
+        rig.interrupts = interrupts;
+        rig.written = written;
+        rig.asked = asked;
+        rig.presented = presented;
+        rig
+    }
+
+    /// A rig whose device has `host` (what the rig records of the host's stays empty).
+    fn with_host(host: Box<dyn Host>) -> Rig {
         let mode = Arc::new(Mutex::new(MODE));
         let told = Arc::new(Mutex::new(Vec::new()));
         let interrupts = Arc::new(AtomicU32::new(0));
@@ -111,12 +131,7 @@ impl Rig {
         let region = Arc::new(Region::new(REGION_SIZE as usize).unwrap());
         let device = Device::new(
             region,
-            Box::new(TestHost {
-                interrupts: Arc::clone(&interrupts),
-                written: Arc::clone(&written),
-                asked: Arc::clone(&asked),
-                presented: Arc::clone(&presented),
-            }),
+            host,
             Box::new(TestScreen {
                 mode: Arc::clone(&mode),
                 told: Arc::clone(&told),
@@ -684,13 +699,52 @@ fn a_full_completion_ring_holds_the_commands_back() {
     }
 }
 
-/// A host that records the vectors it raises and, for each queue message, posts the command
-/// buffer's completion back through the queue's poster: a stand-in for the stage-3 decoder, so the
-/// device's per-queue ring loop can be exercised on its own.
+/// A host that records the vectors it raises and the types of the stage-3 messages it is handed,
+/// and posts what a decoder would: a command buffer's completion through the queue's poster, and a
+/// render pipeline's reflection through ring 0's. A buffer create waits while `gate` is shut: a
+/// stand-in for the stage-3 decoder, so the device's rings can be exercised on their own.
 struct QueueTestHost {
     vectors: Arc<Mutex<Vec<u32>>>,
-    queue_messages: Arc<AtomicU32>,
+    handed: Arc<Mutex<Vec<u32>>>,
     closed: Arc<Mutex<Vec<u32>>>,
+    gate: Arc<AtomicBool>,
+}
+
+/// What a [`QueueTestHost`] records, and its gate, open.
+#[derive(Default)]
+struct QueueTestSeen {
+    vectors: Arc<Mutex<Vec<u32>>>,
+    handed: Arc<Mutex<Vec<u32>>>,
+    closed: Arc<Mutex<Vec<u32>>>,
+    gate: Arc<AtomicBool>,
+}
+
+impl QueueTestSeen {
+    fn new() -> QueueTestSeen {
+        let seen = QueueTestSeen::default();
+        seen.gate.store(true, Ordering::SeqCst);
+        seen
+    }
+
+    fn host(&self) -> Box<dyn Host> {
+        Box::new(QueueTestHost {
+            vectors: Arc::clone(&self.vectors),
+            handed: Arc::clone(&self.handed),
+            closed: Arc::clone(&self.closed),
+            gate: Arc::clone(&self.gate),
+        })
+    }
+
+    /// Waits about 2 s for `done` to hold.
+    fn wait(&self, what: &str, done: impl Fn(&QueueTestSeen) -> bool) {
+        for _ in 0..2000 {
+            if done(self) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        panic!("{what}");
+    }
 }
 
 impl Host for QueueTestHost {
@@ -703,261 +757,303 @@ impl Host for QueueTestHost {
     fn context_closed(&self, context: u32) {
         self.closed.lock().push(context);
     }
-    fn queue_message(&self, completion: &crate::device::QueueCompletionPoster, message: &[u8]) {
-        self.queue_messages.fetch_add(1, Ordering::SeqCst);
+    fn stage3_message(&self, completion: &crate::device::CompletionPoster, message: &[u8]) {
         let (header, _) = RgfxMsgHeader::read_from_prefix(message).unwrap();
-        if header.r#type != RGFX_CMD_COMMAND_BUFFER {
-            return;
+        self.handed.lock().push(header.r#type);
+        match header.r#type {
+            RGFX_CMD_BUFFER_CREATE => {
+                while !self.gate.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+            RGFX_CMD_RENDER_PIPELINE_CREATE => {
+                let mut reflection = RgfxPipelineReflection::new_zeroed();
+                reflection.header = RgfxMsgHeader {
+                    r#type: RGFX_EVT_PIPELINE_REFLECTION,
+                    size: size_of::<RgfxPipelineReflection>() as u32,
+                    seqno: header.seqno,
+                };
+                completion.post(reflection.as_bytes());
+            }
+            RGFX_CMD_COMMAND_BUFFER => {
+                let (cb, _) = crate::ops::RgfxCommandBuffer::read_from_prefix(message).unwrap();
+                let done = RgfxCbComplete {
+                    header: RgfxMsgHeader {
+                        r#type: RGFX_EVT_CB_COMPLETE,
+                        size: size_of::<RgfxCbComplete>() as u32,
+                        seqno: header.seqno,
+                    },
+                    cb_obj_id: cb.cb_obj_id,
+                    gpu_start_ns: 0,
+                    gpu_end_ns: 0,
+                    status: RGFX_CB_OK,
+                    error_code: 0,
+                };
+                completion.post(done.as_bytes());
+            }
+            _ => {}
         }
-        let (cb, _) = crate::ops::RgfxCommandBuffer::read_from_prefix(message).unwrap();
-        let done = RgfxCbComplete {
-            header: RgfxMsgHeader {
-                r#type: RGFX_EVT_CB_COMPLETE,
-                size: size_of::<RgfxCbComplete>() as u32,
-                seqno: header.seqno,
-            },
-            cb_obj_id: cb.cb_obj_id,
-            gpu_start_ns: 0,
-            gpu_end_ns: 0,
-            status: RGFX_CB_OK,
-            error_code: 0,
-        };
-        completion.post(done.as_bytes());
     }
 }
 
-/// Writes `open` into the mailbox and opens the queue (`QUEUE_OPEN`), as the guest's kext does;
-/// the status `MAILBOX_STATUS` then reads.
-fn open_queue(device: &Device, open: &RgfxQueueOpen) -> u32 {
-    for (i, word) in open.as_bytes().chunks(4).enumerate() {
-        let word = u32::from_le_bytes(word.try_into().unwrap());
-        device.mmio_write(u64::from(RGFX_REG_MAILBOX) + 4 * i as u64, word);
+/// Where the tests' queue rings are, and their size.
+const QUEUE_SUBMIT: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET;
+const QUEUE_COMPLETE: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x10_0000;
+const QUEUE_RING_DATA: u32 = 0x1_0000;
+
+/// A `QUEUE_CREATE` of queue `obj_id` over the tests' rings, raising MSI-X vector 3.
+fn queue_create(obj_id: u64) -> Vec<u8> {
+    RgfxQueueCreate {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_QUEUE_CREATE,
+            size: 0,
+            seqno: 0,
+        },
+        obj_id,
+        submit_offset: QUEUE_SUBMIT,
+        complete_offset: QUEUE_COMPLETE,
+        submit_data_size: QUEUE_RING_DATA,
+        complete_data_size: QUEUE_RING_DATA,
+        priority: 2,
+        vector: 3,
     }
-    device.mmio_write(RGFX_REG_QUEUE_OPEN.into(), 1);
-    device.mmio_read(RGFX_REG_MAILBOX_STATUS.into())
+    .as_bytes()
+    .to_vec()
 }
 
-/// A command buffer the guest publishes on a queue's submission ring before the queue is opened,
-/// with no doorbell since the ring's `consumer_idle` was still the 0 the guest zeroed it to, is
-/// still taken and completed: the open keeps the guest's producer count
-#[test]
-fn a_command_buffer_published_before_its_queue_create_completes() {
+/// A ring-0 message of `type` whose payload is `obj_id`: an `OBJECT_DESTROY`, or a create the
+/// test host does not read.
+fn object_message(r#type: u32, obj_id: u64) -> Vec<u8> {
+    RgfxObjectDestroy {
+        header: RgfxMsgHeader {
+            r#type,
+            size: 0,
+            seqno: 0,
+        },
+        obj_id,
+    }
+    .as_bytes()
+    .to_vec()
+}
+
+/// A `CONTEXT_CLOSE` of `context`.
+fn context_close(context: u32) -> Vec<u8> {
+    RgfxContextClose {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_CONTEXT_CLOSE,
+            size: 0,
+            seqno: 0,
+        },
+        context,
+        reserved_14: 0,
+    }
+    .as_bytes()
+    .to_vec()
+}
+
+/// Publishes an empty `COMMAND_BUFFER` `cb_obj_id` of queue `queue` at the start of the tests'
+/// queue submission ring, with seqno `seqno`, ringing its doorbell where `doorbell`.
+fn publish_command_buffer(rig: &Rig, queue: u64, cb_obj_id: u64, seqno: u64, doorbell: bool) {
     use crate::ops::{RGFX_COMMAND_BUFFER_OPS_OFFSET, RgfxCommandBuffer};
-
-    let vectors = Arc::new(Mutex::new(Vec::<u32>::new()));
-    let queue_messages = Arc::new(AtomicU32::new(0));
-    let region = Arc::new(Region::new(REGION_SIZE as usize).unwrap());
-    let device = Device::new(
-        region,
-        Box::new(QueueTestHost {
-            vectors: Arc::clone(&vectors),
-            queue_messages: Arc::clone(&queue_messages),
-            closed: Arc::new(Mutex::new(Vec::new())),
-        }),
-        Box::new(crate::display::FixedScreen(Mode {
-            width: 1920,
-            height: 1080,
-            refresh_mhz: NEVER_MHZ,
-        })),
-    )
-    .unwrap();
-    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
-    let region = &device.shared.region;
-
-    // The guest's first command buffer, published on the queue's zeroed submission ring with no
-    // doorbell.
-    const SUBMIT_OFF: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET;
-    const COMPLETE_OFF: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x10_0000;
-    const QUEUE: u64 = (3 << RGFX_CONTEXT_OBJ_ID_SHIFT) | 1;
-    const RING_DATA: u32 = 0x1_0000;
     let cb = RgfxCommandBuffer {
         header: RgfxMsgHeader {
             r#type: RGFX_CMD_COMMAND_BUFFER,
             size: RGFX_COMMAND_BUFFER_OPS_OFFSET,
-            seqno: 1,
+            seqno,
         },
-        queue_obj_id: QUEUE,
-        cb_obj_id: 100,
+        queue_obj_id: queue,
+        cb_obj_id,
         op_bytes: 0,
     };
     let bytes = cb.as_bytes();
-    region.write(SUBMIT_OFF + 256, bytes);
-    region
-        .atomic_u64(SUBMIT_OFF)
+    rig.region().write(QUEUE_SUBMIT + 256, bytes);
+    rig.region()
+        .atomic_u64(QUEUE_SUBMIT)
         .store(bytes.len() as u64, Ordering::SeqCst);
+    if doorbell {
+        rig.device
+            .mmio_write(RGFX_REG_DOORBELL.into(), QUEUE_SUBMIT as u32);
+    }
+}
 
-    // Then the queue opens.
-    let qc = RgfxQueueOpen {
-        obj_id: QUEUE,
-        submit_offset: SUBMIT_OFF,
-        complete_offset: COMPLETE_OFF,
-        submit_data_size: RING_DATA,
-        complete_data_size: RING_DATA,
-        priority: 2,
-        vector: 3,
-        context: 3,
-        flags: 0,
-    };
-    assert_eq!(open_queue(&device, &qc), RGFX_STATUS_OK);
-
-    // The command buffer completes on the queue's completion ring.
-    let mut done = None;
+/// The first message of the tests' queue completion ring, waiting about 2 s.
+fn first_queue_completion(rig: &Rig) -> Option<RgfxCbComplete> {
     for _ in 0..2000 {
-        if region.atomic_u64(COMPLETE_OFF).load(Ordering::SeqCst) != 0 {
-            let header = region.read(COMPLETE_OFF + 256, 8).unwrap();
+        if rig
+            .region()
+            .atomic_u64(QUEUE_COMPLETE)
+            .load(Ordering::SeqCst)
+            != 0
+        {
+            let header = rig.region().read(QUEUE_COMPLETE + 256, 8).unwrap();
             let size = u32::from_le_bytes(header[4..8].try_into().unwrap()) as usize;
-            let msg = region.read(COMPLETE_OFF + 256, size).unwrap();
-            done = Some(RgfxCbComplete::read_from_bytes(&msg).unwrap());
-            break;
+            let msg = rig.region().read(QUEUE_COMPLETE + 256, size).unwrap();
+            rig.region()
+                .atomic_u64(QUEUE_COMPLETE + 0x40)
+                .store(size as u64, Ordering::SeqCst);
+            return Some(RgfxCbComplete::read_from_bytes(&msg).unwrap());
         }
         std::thread::sleep(Duration::from_millis(1));
     }
-    let done = done.expect("the command buffer published before its queue's create completed");
+    None
+}
+
+/// Waits about 2 s for the tests' queue submission ring to go idle: its thread sleeps, so the
+/// guest rings for its next message.
+fn wait_queue_idle(rig: &Rig) {
+    for _ in 0..2000 {
+        if rig
+            .region()
+            .atomic_u32(QUEUE_SUBMIT + 0x80)
+            .load(Ordering::SeqCst)
+            == 1
+        {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    panic!("the queue's submission ring never went idle");
+}
+
+/// A command buffer the guest publishes on a queue's submission ring before the queue is created,
+/// with no doorbell since the ring's `consumer_idle` was still the 0 the guest zeroed it to, is
+/// still taken and completed: the create keeps the guest's producer count.
+#[test]
+fn a_command_buffer_published_before_its_queue_create_completes() {
+    let seen = QueueTestSeen::new();
+    let mut rig = Rig::with_host(seen.host());
+    rig.start();
+    const QUEUE: u64 = (3 << RGFX_CONTEXT_OBJ_ID_SHIFT) | 1;
+
+    // The guest's first command buffer, published on the queue's zeroed submission ring with no
+    // doorbell; then the queue's create.
+    publish_command_buffer(&rig, QUEUE, 100, 1, false);
+    let seqno = rig.send(queue_create(QUEUE));
+    assert_eq!(rig.complete(), (seqno, RGFX_STATUS_OK));
+
+    // The command buffer completes on the queue's completion ring.
+    let done = first_queue_completion(&rig)
+        .expect("the command buffer published before its queue's create completed");
     assert_eq!(done.header.r#type, RGFX_EVT_CB_COMPLETE);
     assert_eq!(done.cb_obj_id, 100);
     // The queue's create, then the buffer.
-    assert_eq!(queue_messages.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        *seen.handed.lock(),
+        vec![RGFX_CMD_QUEUE_CREATE, RGFX_CMD_COMMAND_BUFFER]
+    );
 }
 
-/// A `QUEUE_OPEN` with valid ring parameters makes a command queue's own submission and
-/// completion rings and a service thread before the write returns, and the host is handed the
+/// A `QUEUE_CREATE` on ring 0 with valid ring parameters makes a command queue's own submission and
+/// completion rings and a service thread before it is answered, and the host is handed the
 /// queue's `QUEUE_CREATE` first; a `COMMAND_BUFFER` published on the queue's submission ring
-/// reaches [`Host::queue_message`], whose completion lands on the queue's own completion ring and
-/// raises that queue's MSI-X vector; a `QUEUE_OPEN` with no ring parameters is refused, and
-/// `QUEUE_CLOSE` and `CONTEXT_CLOSE` end the service.
+/// reaches [`Host::stage3_message`], whose completion lands on the queue's own completion ring and
+/// raises that queue's MSI-X vector; a `QUEUE_CREATE` with no ring parameters is refused; a
+/// pipeline create's reflection comes back on ring 0's completion ring; and an `OBJECT_DESTROY` of
+/// the queue and a `CONTEXT_CLOSE` end its service, the close answered once the host has dropped
+/// the context's objects.
 #[test]
 fn a_command_queue_gets_its_own_ring_loop() {
-    use crate::ops::{RGFX_COMMAND_BUFFER_OPS_OFFSET, RgfxCommandBuffer};
-
-    let vectors = Arc::new(Mutex::new(Vec::<u32>::new()));
-    let queue_messages = Arc::new(AtomicU32::new(0));
-    let closed = Arc::new(Mutex::new(Vec::<u32>::new()));
-    let region = Arc::new(Region::new(REGION_SIZE as usize).unwrap());
-    let device = Device::new(
-        region,
-        Box::new(QueueTestHost {
-            vectors: Arc::clone(&vectors),
-            queue_messages: Arc::clone(&queue_messages),
-            closed: Arc::clone(&closed),
-        }),
-        Box::new(crate::display::FixedScreen(Mode {
-            width: 1920,
-            height: 1080,
-            refresh_mhz: NEVER_MHZ,
-        })),
-    )
-    .unwrap();
-    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
-    let region = &device.shared.region;
-
-    // A QUEUE_OPEN with no ring parameters is refused.
-    let bare = RgfxQueueOpen {
-        obj_id: (7 << RGFX_CONTEXT_OBJ_ID_SHIFT) | 9,
-        context: 7,
-        ..RgfxQueueOpen::default()
-    };
-    assert_eq!(open_queue(&device, &bare), RGFX_STATUS_INVALID_ARGUMENT);
-    assert_eq!(device.queue_count(), 0);
-
-    // A QUEUE_OPEN with valid rings in the guest's allocations and MSI-X vector 3: the queue is
-    // there when the write returns.
-    const SUBMIT_OFF: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET;
-    const COMPLETE_OFF: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x10_0000;
-    const RING_DATA: u32 = 0x1_0000;
+    let seen = QueueTestSeen::new();
+    let mut rig = Rig::with_host(seen.host());
+    rig.start();
     const QUEUE: u64 = (7 << RGFX_CONTEXT_OBJ_ID_SHIFT) | 1;
-    let qc = RgfxQueueOpen {
-        obj_id: QUEUE,
-        submit_offset: SUBMIT_OFF,
-        complete_offset: COMPLETE_OFF,
-        submit_data_size: RING_DATA,
-        complete_data_size: RING_DATA,
-        priority: 2,
-        vector: 3,
-        context: 7,
-        flags: 0,
-    };
-    assert_eq!(open_queue(&device, &qc), RGFX_STATUS_OK);
-    assert_eq!(device.queue_count(), 1);
-    // The submission ring goes idle once its thread sleeps, so the guest rings for its first
-    // message.
-    let mut idle = false;
-    for _ in 0..2000 {
-        if region.atomic_u32(SUBMIT_OFF + 0x80).load(Ordering::SeqCst) == 1 {
-            idle = true;
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
-    assert!(idle, "the queue's submission ring never went idle");
+
+    // A QUEUE_CREATE with no ring parameters is refused.
+    let seqno = rig.send(
+        object_message(RGFX_CMD_QUEUE_CREATE, QUEUE)
+            .into_iter()
+            .chain([0; 32])
+            .collect(),
+    );
+    assert_eq!(rig.complete(), (seqno, RGFX_STATUS_INVALID_ARGUMENT));
+    assert_eq!(rig.device.queue_count(), 0);
+
+    // A QUEUE_CREATE with valid rings in the guest's allocations and MSI-X vector 3: the queue is
+    // there when it is answered.
+    let seqno = rig.send(queue_create(QUEUE));
+    assert_eq!(rig.complete(), (seqno, RGFX_STATUS_OK));
+    assert_eq!(rig.device.queue_count(), 1);
+    wait_queue_idle(&rig);
 
     // Arm the queue's completion ring and publish a COMMAND_BUFFER on its submission ring.
-    region
-        .atomic_u32(COMPLETE_OFF + 0xc0)
+    rig.region()
+        .atomic_u32(QUEUE_COMPLETE + 0xc0)
         .store(1, Ordering::SeqCst);
-    let cb = RgfxCommandBuffer {
-        header: RgfxMsgHeader {
-            r#type: RGFX_CMD_COMMAND_BUFFER,
-            size: RGFX_COMMAND_BUFFER_OPS_OFFSET,
-            seqno: 55,
-        },
-        queue_obj_id: QUEUE,
-        cb_obj_id: 100,
-        op_bytes: 0,
-    };
-    let bytes = cb.as_bytes();
-    region.write(SUBMIT_OFF + 256, bytes);
-    region
-        .atomic_u64(SUBMIT_OFF)
-        .store(bytes.len() as u64, Ordering::SeqCst);
-    device.mmio_write(RGFX_REG_DOORBELL.into(), SUBMIT_OFF as u32);
+    publish_command_buffer(&rig, QUEUE, 100, 55, true);
 
     // The completion lands on the queue's completion ring, with the submission seqno.
-    let qdata = u64::from(RING_DATA);
-    let mut consumed = 0u64;
-    let mut done = None;
-    for _ in 0..2000 {
-        let qp = region.atomic_u64(COMPLETE_OFF).load(Ordering::SeqCst);
-        if qp != consumed {
-            let at = COMPLETE_OFF + 256 + consumed % qdata;
-            let header = region.read(at, 8).unwrap();
-            let size = u32::from_le_bytes(header[4..8].try_into().unwrap()) as usize;
-            let msg = region.read(at, size).unwrap();
-            consumed += size as u64;
-            region
-                .atomic_u64(COMPLETE_OFF + 0x40)
-                .store(consumed, Ordering::SeqCst);
-            done = Some(RgfxCbComplete::read_from_bytes(&msg).unwrap());
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
-    let done = done.expect("a CB_COMPLETE on the queue ring");
+    let done = first_queue_completion(&rig).expect("a CB_COMPLETE on the queue ring");
     assert_eq!(done.header.r#type, RGFX_EVT_CB_COMPLETE);
     assert_eq!(done.header.seqno, 55);
     assert_eq!(done.cb_obj_id, 100);
     // The queue's create, then the buffer.
-    assert_eq!(queue_messages.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        *seen.handed.lock(),
+        vec![RGFX_CMD_QUEUE_CREATE, RGFX_CMD_COMMAND_BUFFER]
+    );
     // The queue's own vector was raised, not the control vector.
-    assert_eq!(*vectors.lock(), vec![3]);
+    assert_eq!(*seen.vectors.lock(), vec![3]);
 
-    // QUEUE_CLOSE ends the queue's service when the write returns.
-    device.mmio_write(u64::from(RGFX_REG_MAILBOX), QUEUE as u32);
-    device.mmio_write(u64::from(RGFX_REG_MAILBOX) + 4, (QUEUE >> 32) as u32);
-    device.mmio_write(RGFX_REG_QUEUE_CLOSE.into(), 1);
-    assert_eq!(device.queue_count(), 0);
+    // A pipeline create's reflection comes back on ring 0's completion ring, with its seqno.
+    let seqno = rig.send(object_message(RGFX_CMD_RENDER_PIPELINE_CREATE, QUEUE + 1));
+    let reflection = rig.event().expect("a reflection on ring 0");
+    let (header, _) = RgfxMsgHeader::read_from_prefix(&reflection).unwrap();
+    assert_eq!(header.r#type, RGFX_EVT_PIPELINE_REFLECTION);
+    assert_eq!(header.seqno, seqno);
 
-    // CONTEXT_CLOSE ends the context's queues at once and has the host drop its objects.
-    assert_eq!(open_queue(&device, &qc), RGFX_STATUS_OK);
-    assert_eq!(device.queue_count(), 1);
-    device.mmio_write(RGFX_REG_CONTEXT_CLOSE.into(), 7);
-    assert_eq!(device.queue_count(), 0);
-    let mut dropped = false;
-    for _ in 0..2000 {
-        if *closed.lock() == vec![7] {
-            dropped = true;
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
-    assert!(dropped, "the host was not told to drop the context's objects");
+    // An OBJECT_DESTROY of the queue ends its service, and the host drops its handle.
+    rig.send(object_message(RGFX_CMD_OBJECT_DESTROY, QUEUE));
+    seen.wait("the queue's destroy never reached the host", |seen| {
+        seen.handed.lock().last() == Some(&RGFX_CMD_OBJECT_DESTROY)
+    });
+    assert_eq!(rig.device.queue_count(), 0);
+
+    // CONTEXT_CLOSE ends the context's queues and has the host drop its objects, then is answered.
+    let seqno = rig.send(queue_create(QUEUE));
+    assert_eq!(rig.complete(), (seqno, RGFX_STATUS_OK));
+    assert_eq!(rig.device.queue_count(), 1);
+    let seqno = rig.send(context_close(7));
+    assert_eq!(rig.complete(), (seqno, RGFX_STATUS_OK));
+    assert_eq!(rig.device.queue_count(), 0);
+    assert_eq!(*seen.closed.lock(), vec![7]);
+}
+
+/// A command buffer is decoded only once the creates published on ring 0 before it are carried
+/// out, though the control thread is still in one when the buffer's queue takes it.
+#[test]
+fn a_command_buffer_waits_for_the_creates_before_it() {
+    let seen = QueueTestSeen::new();
+    let mut rig = Rig::with_host(seen.host());
+    rig.start();
+    const QUEUE: u64 = (5 << RGFX_CONTEXT_OBJ_ID_SHIFT) | 1;
+    let seqno = rig.send(queue_create(QUEUE));
+    assert_eq!(rig.complete(), (seqno, RGFX_STATUS_OK));
+    wait_queue_idle(&rig);
+
+    // A buffer create the host is slow to carry out, then a command buffer that uses it.
+    seen.gate.store(false, Ordering::SeqCst);
+    rig.send(object_message(RGFX_CMD_BUFFER_CREATE, QUEUE + 1));
+    seen.wait("the buffer create never reached the host", |seen| {
+        seen.handed.lock().last() == Some(&RGFX_CMD_BUFFER_CREATE)
+    });
+    publish_command_buffer(&rig, QUEUE, 100, 1, true);
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(
+        *seen.handed.lock(),
+        vec![RGFX_CMD_QUEUE_CREATE, RGFX_CMD_BUFFER_CREATE],
+        "the command buffer ran before the create it follows was carried out"
+    );
+
+    // Once the create is carried out, the buffer runs.
+    seen.gate.store(true, Ordering::SeqCst);
+    let done = first_queue_completion(&rig).expect("the command buffer completed");
+    assert_eq!(done.cb_obj_id, 100);
+    assert_eq!(
+        *seen.handed.lock(),
+        vec![
+            RGFX_CMD_QUEUE_CREATE,
+            RGFX_CMD_BUFFER_CREATE,
+            RGFX_CMD_COMMAND_BUFFER
+        ]
+    );
 }

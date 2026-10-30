@@ -88,11 +88,18 @@ enum {
 	// Frees the client's block at the region offset scalarInput[0].
 	kRgfxAccelMethodFree = 0x102,
 	// Opens a command queue: in obj_id, submit offset, complete offset, submit data size,
-	// complete data size, priority, flags (RGFX_QUEUE_FLAG_DEVICE); out: the device's status
-	// (RGFX_STATUS_OK, or the refusal). Each ring must lie in one of the client's blocks.
+	// complete data size, priority; out: the device's status (RGFX_STATUS_OK, or the
+	// refusal). Each ring must lie in one of the client's blocks. The device has the queue's
+	// rings when it returns.
 	kRgfxAccelMethodQueueCreate = 0x103,
 	// Closes the client's queue scalarInput[0].
 	kRgfxAccelMethodQueueDestroy = 0x104,
+	// Posts one object-lifecycle message on the control ring: struct in, the whole message
+	// (its header's type set; the kext stamps its size and seqno), a create or destroy of an
+	// object in the client's context (its obj_id, 16 bytes in, in the context's range), at most
+	// ReimsGraphics::kLifecycleMessageMax bytes; out: the seqno, and for a pipeline create, its
+	// reflection (RgfxPipelineReflection) as struct out, once the device has answered.
+	kRgfxAccelMethodSubmit = 0x105,
 };
 
 // A block the accelerator handed out of the region, and its owner.
@@ -138,9 +145,14 @@ public:
 	IOReturn freeBlock(const void *owner, UInt64 offset);
 	void freeBlocks(const void *owner);
 	bool ownsRange(const void *owner, UInt64 offset, UInt64 length);
-	// The device's command queues, through the mailbox: the device has the queue's rings
-	// before openQueue returns.
-	UInt32 openQueue(const RgfxQueueOpen &open);
+	// The processes' object lifecycle, on the framebuffer's control ring
+	// (ReimsGraphics::postLifecycle). openQueue's QUEUE_CREATE is answered once the device has
+	// the queue's rings; closeContext's CONTEXT_CLOSE once the device has dropped the context's
+	// objects.
+	IOReturn postLifecycle(UInt32 type, const void *message, UInt32 size, UInt32 replyType,
+	                       void *reply, UInt32 replyCapacity, UInt32 *replyLength, UInt64 *seqno,
+	                       UInt32 timeoutMs);
+	UInt32 openQueue(const RgfxQueueCreate &create);
 	void closeQueue(UInt64 objId);
 
 private:
