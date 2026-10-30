@@ -1,7 +1,7 @@
 # The reims-graphics display kext for x86-64 macOS 26 guests: ReimsGraphics,
 # an IOFramebuffer on the device's PCI function (src/ReimsGraphics.hpp; the
 # protocol is docs/graphics-kext/design.md). Builds on a Mac with Xcode's
-# clang and ld, against the macOS 27.0 SDK's Kernel.framework, for macOS 26.
+# clang and ld, against the macOS SDK's Kernel.framework, for macOS 26.
 #
 #   make        build/ReimsGraphics.kext
 #   make check  check its imports and IOFramebuffer's layout against the
@@ -18,7 +18,7 @@
 
 NAME     = ReimsGraphics
 VERSION  = 1.0.0
-SDK     ?= $(shell xcrun --sdk macosx27.0 --show-sdk-path)
+SDK     ?= $(shell xcrun --sdk macosx --show-sdk-path)
 KERNEL   = $(SDK)/System/Library/Frameworks/Kernel.framework/Headers
 
 BUILD    = build
