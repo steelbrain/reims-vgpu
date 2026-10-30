@@ -38,29 +38,34 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use reims_graphics::region::Region;
 use reims_graphics::wire::{
-    RGFX_CMD_BUFFER_AT_OFFSET, RGFX_CMD_BUFFER_CREATE, RGFX_CMD_COMMAND_BUFFER,
+    RGFX_CMD_BUFFER_AT_OFFSET, RGFX_CMD_BUFFER_CREATE, RGFX_CMD_BUFFER_OVER_HOST_MEMORY,
+    RGFX_CMD_COMMAND_BUFFER,
     RGFX_CMD_COMPUTE_PIPELINE_CREATE, RGFX_CMD_DEPTH_STENCIL_CREATE, RGFX_CMD_EVENT_CREATE,
-    RGFX_CMD_FENCE_CREATE, RGFX_CMD_HEAP_CREATE, RGFX_CMD_LIBRARY_CREATE, RGFX_CMD_OBJECT_DESTROY,
+    RGFX_CMD_FENCE_CREATE, RGFX_CMD_HEAP_CREATE, RGFX_CMD_HEAP_OVER_HOST_MEMORY,
+    RGFX_CMD_LIBRARY_CREATE, RGFX_CMD_OBJECT_DESTROY,
     RGFX_CMD_QUEUE_CREATE, RGFX_CMD_RENDER_PIPELINE_CREATE, RGFX_CMD_SAMPLER_CREATE,
     RGFX_CMD_SHARED_EVENT_CREATE, RGFX_CMD_TEXTURE_CREATE, RGFX_CMD_TEXTURE_FROM_BUFFER,
     RGFX_EVT_PIPELINE_REFLECTION, RGFX_LIBRARY_BYTES_OFFSET, RGFX_PIPELINE_KIND_COMPUTE,
     RGFX_PIPELINE_KIND_RENDER, RGFX_PIPELINE_OK, RGFX_PIPELINE_REFLECT_SUPPORT_ICB,
     RGFX_PIPELINE_REFLECT_THREADGROUP_MATCHES_TILE, RGFX_PIPELINE_REFUSED, RgfxBufferAtOffset,
     RgfxBufferCreate, RgfxCbComplete, RgfxColorAttachmentDesc, RgfxComputePipelineCreate,
-    RgfxDepthStencilCreate, RgfxHeapCreate, RgfxLibraryCreate, RgfxMsgHeader, RgfxObjectCreate,
+    RgfxBufferOverHostMemory, RgfxDepthStencilCreate, RgfxHeapCreate, RgfxHeapOverHostMemory,
+    RgfxLibraryCreate, RgfxMsgHeader, RgfxObjectCreate,
     RgfxObjectDestroy, RgfxPipelineReflection, RgfxQueueCreate, RgfxRenderPipelineCreate,
     RgfxSamplerCreate, RgfxSharedEventCreate, RgfxStencilDescriptor, RgfxTextureCreate,
     RgfxTextureDescriptor, RgfxTextureFromBuffer,
 };
+use reims_vgpu_core::host::HostPtr;
 use reims_vgpu_core::platform::device::GpuDevice;
 use reims_vgpu_core::platform::resource::{Buffer, ComputePipeline, Heap, Library, RenderPipeline};
-use reims_vgpu_core::platform::types::Swizzle;
+use reims_vgpu_core::platform::types::{ResourceAddressRange, Swizzle};
 use reims_vgpu_core::platform::values::{
     BufferDesc, DepthStencilDesc, HeapDesc, OptionSet, RenderPipelineDesc, SamplerDesc,
     StencilDesc, TextureDesc,
 };
-use reims_vgpu_core::platform::{Handle, Platform};
+use reims_vgpu_core::platform::{Handle, HostRange, Platform};
 use reims_vgpu_core::raise::{OnFault, Raise, RaiseResult};
 use zerocopy::FromBytes;
 
@@ -130,16 +135,22 @@ pub struct GraphicsDecoder<P: Platform> {
     /// Where a pipeline create's reflection reply goes; `None` builds and drops
     /// it (the ring loop sets a sink later).
     reflection_sink: Option<ReflectionSink>,
+    /// The device's BAR 2 region: the host memory the over-host-memory buffers
+    /// and heaps are placed over. Held so it stays mapped while the decoder's
+    /// objects live; declared last so the object table drops before it (a buffer
+    /// also keeps its own clone alive in its no-copy deallocator).
+    region: Arc<Region>,
 }
 
 impl<P: Platform> GraphicsDecoder<P> {
-    /// A new decoder for `platform`, with no objects.
-    pub fn new(platform: Arc<P>) -> Self {
+    /// A new decoder for `platform` over its `region`, with no objects.
+    pub fn new(platform: Arc<P>, region: Arc<Region>) -> Self {
         GraphicsDecoder {
             platform,
             objects: HashMap::new(),
             completion_sink: None,
             reflection_sink: None,
+            region,
         }
     }
 
@@ -312,6 +323,39 @@ impl<P: Platform> GraphicsDecoder<P> {
                     None => Ok(Err(DecodeError::Refused)),
                 }
             }
+            RGFX_CMD_BUFFER_OVER_HOST_MEMORY => {
+                let Some(m) = read::<RgfxBufferOverHostMemory>(message) else {
+                    return Ok(Err(DecodeError::Malformed));
+                };
+                // A Shared buffer placed over the guest's own memory in the
+                // device's region, `length` bytes at `region_offset`: the same
+                // zero-copy import the scanout uses, so a blit reads and writes the
+                // guest's pages in place. A span past the region's end is a guest
+                // protocol error.
+                if !self.region.contains(m.region_offset, m.length) {
+                    return Ok(Err(DecodeError::BadReference));
+                }
+                let keep = Arc::clone(&self.region);
+                // SAFETY: the block lies inside the region (checked above), which
+                // stays mapped until its last reference goes; the deallocator holds
+                // one until Metal frees the buffer.
+                let bytes = unsafe {
+                    HostRange::new(
+                        HostPtr::from_ptr(self.region.base().add(m.region_offset as usize)),
+                        m.length,
+                    )
+                };
+                let made = device.new_buffer_over_host_memory(
+                    OnFault::Return,
+                    bytes,
+                    m.options as u64,
+                    Some(Box::new(move || drop(keep))),
+                )?;
+                match made {
+                    Some(buffer) => self.insert(m.obj_id, ObjHandle::Buffer(buffer)),
+                    None => Ok(Err(DecodeError::Refused)),
+                }
+            }
             RGFX_CMD_HEAP_CREATE => {
                 let Some(m) = read::<RgfxHeapCreate>(message) else {
                     return Ok(Err(DecodeError::Malformed));
@@ -324,6 +368,40 @@ impl<P: Platform> GraphicsDecoder<P> {
                     heap_type: m.heap_type as i64,
                     options: vec![OptionSet::ResourceOptions(m.options.into())],
                     address_ranges: None,
+                    pinned_gpu_address: (m.gpu_address != 0).then_some(m.gpu_address),
+                };
+                match device.new_heap(&desc)?.heap {
+                    Some(heap) => self.insert(m.obj_id, ObjHandle::Heap(heap)),
+                    None => Ok(Err(DecodeError::Refused)),
+                }
+            }
+            RGFX_CMD_HEAP_OVER_HOST_MEMORY => {
+                let Some(m) = read::<RgfxHeapOverHostMemory>(message) else {
+                    return Ok(Err(DecodeError::Malformed));
+                };
+                // A Shared heap placed over the guest's own memory in the device's
+                // region, `size_bytes` at `region_offset`: its address range is the
+                // host VA of that block, as the detached-heap path builds a heap
+                // over host pages. A span past the region's end is a guest protocol
+                // error. The region stays mapped while the decoder holds it, and the
+                // heap (in the object table) drops before the region (field order).
+                if !self.region.contains(m.region_offset, m.size_bytes) {
+                    return Ok(Err(DecodeError::BadReference));
+                }
+                // SAFETY: the block lies inside the region (checked above), one
+                // allocation, so the offset is in bounds.
+                let address =
+                    unsafe { self.region.base().add(m.region_offset as usize) } as u64;
+                let range = ResourceAddressRange {
+                    address,
+                    length: m.size_bytes,
+                };
+                let ranges = self.platform.new_address_range_array(&[range])?;
+                let desc = HeapDesc {
+                    size: m.size_bytes,
+                    heap_type: m.heap_type as i64,
+                    options: vec![OptionSet::ResourceOptions(m.options.into())],
+                    address_ranges: Some(&ranges),
                     pinned_gpu_address: (m.gpu_address != 0).then_some(m.gpu_address),
                 };
                 match device.new_heap(&desc)?.heap {
@@ -784,7 +862,7 @@ mod tests {
     fn creates_and_destroys_the_state_objects() {
         let p = Arc::new(FakePlatform::new());
         let device = p.device();
-        let mut dec = GraphicsDecoder::<FakePlatform>::new(Arc::clone(&p));
+        let mut dec = GraphicsDecoder::<FakePlatform>::new(Arc::clone(&p), Arc::new(reims_graphics::region::Region::new(0x10000).unwrap()));
 
         let obj = |ty: u32, obj_id: u64| RgfxObjectCreate {
             header: RgfxMsgHeader {
@@ -1091,7 +1169,7 @@ mod tests {
 
         let p = Arc::new(FakePlatform::new());
         let device = p.device();
-        let mut dec = GraphicsDecoder::<FakePlatform>::new(Arc::clone(&p));
+        let mut dec = GraphicsDecoder::<FakePlatform>::new(Arc::clone(&p), Arc::new(reims_graphics::region::Region::new(0x10000).unwrap()));
 
         let replies = Arc::new(Mutex::new(Vec::<RgfxPipelineReflection>::new()));
         let sink_replies = Arc::clone(&replies);

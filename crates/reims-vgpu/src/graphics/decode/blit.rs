@@ -537,7 +537,7 @@ mod tests {
     ) {
         let p = Arc::new(FakePlatform::new());
         let device = p.device();
-        let mut dec = GraphicsDecoder::<FakePlatform>::new(Arc::clone(&p));
+        let mut dec = GraphicsDecoder::<FakePlatform>::new(Arc::clone(&p), Arc::new(reims_graphics::region::Region::new(0x10000).unwrap()));
 
         for id in [2, 3] {
             let b = RgfxBufferCreate {

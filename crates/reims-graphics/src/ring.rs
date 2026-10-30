@@ -149,6 +149,20 @@ impl Consumer {
         Ok(self.published(region)? > 0)
     }
 
+    /// The host's count: how many bytes it has taken. A reader on another thread waits for this to
+    /// reach a snapshot of [`Self::published_count`] to order work that depends on messages the
+    /// guest published before it; it never consumes the ring itself, so this ring keeps one consumer.
+    pub(crate) fn consumed(&self) -> u64 {
+        self.count
+    }
+
+    /// The guest's published count (the ring's producer), read with an acquire load.
+    pub(crate) fn published_count(&self, region: &Region) -> u64 {
+        region
+            .atomic_u64(self.at.header + PRODUCER)
+            .load(Ordering::Acquire)
+    }
+
     /// The next message, with the pads before it skipped, and the host's count moved past it and
     /// written to the header; `None` where the guest has published no more.
     pub(crate) fn next(&mut self, region: &Region) -> Result<Option<Message>, Broken> {

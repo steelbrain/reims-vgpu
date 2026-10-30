@@ -137,7 +137,10 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                 device_info(&gpu_device.caps()).as_bytes(),
             );
             let control = Arc::new(GraphicsControl {
-                decoder: Mutex::new(GraphicsDecoder::new(Arc::clone(&platform))),
+                decoder: Mutex::new(GraphicsDecoder::new(
+                    Arc::clone(&platform),
+                    Arc::clone(&region),
+                )),
                 device: gpu_device,
                 poster: OnceLock::new(),
                 control_completion: OnceLock::new(),

@@ -1419,7 +1419,7 @@ mod tests {
     fn setup() -> (Arc<Fp>, GraphicsDecoder<Fp>) {
         let p = Arc::new(FakePlatform::new());
         let device = p.device();
-        let mut dec = GraphicsDecoder::<Fp>::new(Arc::clone(&p));
+        let mut dec = GraphicsDecoder::<Fp>::new(Arc::clone(&p), Arc::new(reims_graphics::region::Region::new(0x10000).unwrap()));
 
         for id in [BUF_VERTEX, BUF_INDEX, BUF_INDIRECT, BUF_AUX] {
             let b = RgfxBufferCreate {

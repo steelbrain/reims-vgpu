@@ -769,6 +769,21 @@ impl Shared {
                     }
                 }
             };
+            // Order this command buffer after the resource creates the guest posted before it.
+            // Creates ride the control ring, whose sole consumer is the control thread; command
+            // buffers ride per-queue rings (this thread). A create a buffer uses is posted before
+            // it in guest order, so it is within the control ring's producer at the moment this
+            // thread takes the buffer. Wait for the control thread to consume up to there, so the
+            // resource is registered before the buffer's ops name it. This thread only reads the
+            // control ring's counts; it never consumes it, so the control ring keeps one consumer
+            // and its `consumer_idle` handshake is untouched (draining it here would break both).
+            let created_through = { self.submit.lock().consumer.published_count(&self.region) };
+            while self.submit.lock().consumer.consumed() < created_through {
+                if self.ending() || queue.ended() {
+                    return;
+                }
+                std::thread::sleep(ROOM_POLL);
+            }
             self.host.queue_message(poster, &message.bytes);
         }
     }

@@ -404,7 +404,7 @@ mod tests {
     fn setup() -> (Arc<FakePlatform>, GraphicsDecoder<FakePlatform>) {
         let p = Arc::new(FakePlatform::new());
         let device = p.device();
-        let mut dec = GraphicsDecoder::<FakePlatform>::new(Arc::clone(&p));
+        let mut dec = GraphicsDecoder::<FakePlatform>::new(Arc::clone(&p), Arc::new(reims_graphics::region::Region::new(0x10000).unwrap()));
 
         let queue = RgfxQueueCreate {
             header: RgfxMsgHeader {
