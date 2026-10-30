@@ -607,6 +607,62 @@ fn the_cursor_shows_with_an_image_while_the_guest_shows_it() {
     window.close();
 }
 
+/// The window's sink imports nothing at its making, then only the host pages under the scanout
+/// it draws (to `stride × height` bytes on), again only when the scanout moves or changes size,
+/// and kept to the region
+#[test]
+fn the_sink_imports_only_the_scanout_s_pages() {
+    use reims_vgpu_core::platform::resource::Buffer as _;
+
+    const IMPORT: &str = "newBufferWithBytesNoCopy:length:options:deallocator:";
+    let platform = Arc::new(FakePlatform::new());
+    let region = Arc::new(Region::new(reims_graphics::REGION_SIZE as usize).unwrap());
+    let shown = Arc::new(Shown::default());
+    let presented = Arc::new(Presented::<FakePlatform>::default());
+    let draw = sink::ScanoutDraw::new(Arc::clone(&platform), &region, &shown, &presented).unwrap();
+    assert_eq!(platform.call_log().count(IMPORT), 0);
+
+    // SAFETY: sysconf reads a constant of the host's.
+    let page = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap();
+    let base = region.base() as u64;
+    let addr = |b: &<FakePlatform as Platform>::Buffer| b.contents().addr() as u64;
+    let scanout = |width: u32, height: u32, offset: u64| Scanout {
+        width,
+        height,
+        stride: (width * 4).next_multiple_of(256),
+        offset,
+    };
+    let at = RGFX_ALLOCATIONS_OFFSET;
+    let full_hd = scanout(1920, 1080, at);
+    let (buffer, source) = draw.scanout_buffer(&full_hd).unwrap();
+    assert_eq!(source, 0);
+    assert_eq!(addr(&buffer), base + at);
+    assert_eq!(buffer.length(), (7680 * 1080u64).next_multiple_of(page));
+    assert_eq!(platform.call_log().count(IMPORT), 1);
+    // The same scanout again: the same import.
+    draw.scanout_buffer(&full_hd).unwrap();
+    assert_eq!(platform.call_log().count(IMPORT), 1);
+
+    // Moved off a page boundary: the import starts at its page, the copy past it.
+    let moved = scanout(640, 480, at + page + 0x100);
+    let (buffer, source) = draw.scanout_buffer(&moved).unwrap();
+    assert_eq!(source, 0x100);
+    assert_eq!(addr(&buffer), base + at + page);
+    assert_eq!(
+        buffer.length(),
+        (0x100 + 2560 * 480u64).next_multiple_of(page)
+    );
+    assert_eq!(platform.call_log().count(IMPORT), 2);
+
+    // At the region's end, the rows' padding past it is not imported.
+    let size = region.size();
+    let last = scanout(600, 4, size - 2560 * 3 - 2400);
+    let (buffer, source) = draw.scanout_buffer(&last).unwrap();
+    assert_eq!(addr(&buffer) + source, base + last.offset);
+    assert_eq!(addr(&buffer) + buffer.length(), base + size);
+    assert_eq!(platform.call_log().count(IMPORT), 3);
+}
+
 /// The display pipe's present: a surface the decoder holds no texture over is answered invalid
 /// with nothing shown, and 0 (the scanout) is answered at once on a device with no window
 #[test]

@@ -21,8 +21,7 @@ use super::sink::ScanoutDraw;
 use crate::display::no_catch;
 use crate::entry;
 
-/// The sink of a graphics display on Metal, over `region`; `None` where Metal refuses a queue
-/// or the region's import.
+/// The sink of a graphics display on Metal, over `region`; `None` where Metal refuses a queue.
 pub(super) fn sink(
     platform: Arc<MetalPlatform>,
     region: &Arc<Region>,
@@ -35,7 +34,7 @@ pub(super) fn sink(
 
 /// What blits a graphics display's scanout into its window's drawables on Metal.
 struct MetalScanoutSink {
-    /// The region's buffer, the queue and the scanout.
+    /// The scanout's buffer, the queue and the scanout.
     draw: ScanoutDraw<MetalPlatform>,
 }
 

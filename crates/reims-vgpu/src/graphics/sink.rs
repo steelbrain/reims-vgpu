@@ -1,8 +1,8 @@
 //! [`ScanoutDraw`]: what a graphics display's window sink draws with, on any platform: the
-//! device's region, imported once as a no-copy buffer, and a command queue of its own on the
-//! platform's default device. Each draw blits the guest's scanout out of the buffer into the
-//! drawable's texture, at the image's place, in one command buffer: the GPU reads the guest's
-//! pixels in place, and the CPU copies nothing.
+//! region's pages under the guest's scanout, imported as a no-copy buffer, and a command queue
+//! of its own on the platform's default device. Each draw blits the guest's scanout out of the
+//! buffer into the drawable's texture, at the image's place, in one command buffer: the GPU reads
+//! the guest's pixels in place, and the CPU copies nothing.
 //!
 //! **Sizes.** The guest sets a scanout of the size the display offers, the window's size in
 //! pixels, so the image is the whole drawable and the blit covers it. While the two differ (the
@@ -17,13 +17,19 @@
 //! sample the surface in its own format (WindowServer's display surfaces are 10-bit,
 //! `BGR10A2Unorm`) and write the drawable's. The first surface of each format is logged.
 //!
-//! **The import.** The buffer covers the whole region, so its deallocator, which holds the
-//! region, is what keeps the region mapped while a command buffer still reads it: Metal (or the
-//! runtime) runs it once the buffer has gone, after the sink and every command buffer that used
-//! it.
+//! **The import.** The buffer covers the scanout's pages only: the host pages from the one its
+//! first row starts in to the one `stride × height` bytes on ends in, kept to the region. It is
+//! made at the first draw of a scanout and again only when the guest moves the scanout or changes
+//! its size, so the region's other pages stay the guest's alone: an import pins what it covers
+//! (the Vulkan platform's does, on every driver), and the region's untouched pages then cost the
+//! host nothing (`Region`). A refused import is logged once for its pages, and the window shows
+//! nothing of that scanout. The buffer's deallocator holds the region, which keeps the region
+//! mapped while a command buffer still reads it: Metal (or the runtime) runs it once the buffer
+//! has gone, after the sink, a later import and every command buffer that used it.
 
 use std::sync::Arc;
 
+use reims_graphics::Scanout;
 use reims_graphics::region::Region;
 use reims_vgpu_core::host::HostPtr;
 use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder as _};
@@ -36,6 +42,7 @@ use reims_vgpu_core::platform::types::{ClearColor, MtlOrigin, MtlSize};
 use reims_vgpu_core::platform::values::ColorAttachmentSet;
 use reims_vgpu_core::platform::{Handle, HostRange, Platform};
 use reims_vgpu_core::raise::OnFault;
+use reims_vgpu_core::sync::Mutex;
 use reims_vgpu_window::PixelRect;
 
 use reims_vgpu_core::display::pipeline::{DisplayPipelineCache, PipelineKey};
@@ -61,8 +68,12 @@ pub(crate) struct ScanoutDraw<P: Platform> {
     pub(crate) device: P::Device,
     /// The sink's command queue.
     pub(crate) queue: P::CommandQueue,
-    /// The region, as a no-copy buffer.
-    buffer: P::Buffer,
+    /// The device's region.
+    region: Arc<Region>,
+    /// The host's page size, which an import's start and length are multiples of.
+    page: u64,
+    /// The pages under the scanout last drawn, as a no-copy buffer (the module doc).
+    import: Mutex<Option<ScanoutImport<P>>>,
     /// What the window shows.
     shown: Arc<Shown>,
     /// The surface the display pipe shows, if any, in place of the scanout.
@@ -70,6 +81,16 @@ pub(crate) struct ScanoutDraw<P: Platform> {
     /// The present shaders' pipelines and the strip's two buffers, made at the first surface
     /// whose format a copy cannot carry; `None` inside where the platform refused them.
     converter: std::sync::OnceLock<Option<Converter<P>>>,
+}
+
+/// The region's pages under a scanout, imported (the module doc).
+pub(crate) struct ScanoutImport<P: Platform> {
+    /// The first page's offset in the region.
+    pub(crate) start: u64,
+    /// The pages' length in bytes.
+    pub(crate) length: u64,
+    /// The pages as a no-copy buffer; `None` where the platform refused them.
+    pub(crate) buffer: Option<P::Buffer>,
 }
 
 /// What draws a presented surface of another format into the drawable: core's display pipelines
@@ -96,7 +117,8 @@ const BGRA8_FORMATS: [u64; 2] = [80, 81];
 
 impl<P: ApiPlatform> ScanoutDraw<P> {
     /// The draw over `region` on `platform`'s default device, sharing `shown` with the window's
-    /// screen; `None` where the platform has no device, or refuses a queue or the import.
+    /// screen; `None` where the platform has no device, or refuses a queue. It imports nothing
+    /// until it draws a scanout.
     pub(crate) fn new(
         platform: Arc<P>,
         region: &Arc<Region>,
@@ -105,32 +127,84 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
     ) -> Option<ScanoutDraw<P>> {
         let device = platform.metal_device(None)?;
         let queue = device.new_command_queue()?;
-        let keep = Arc::clone(region);
-        // SAFETY: the region is mapped from its making until its last reference goes, and the
-        // deallocator holds one until the platform runs it, once the buffer has gone.
-        let bytes = unsafe { HostRange::new(HostPtr::from_ptr(region.base()), region.size()) };
-        let buffer = no_catch(device.new_buffer_over_host_memory(
+        // SAFETY: sysconf reads a constant of the host's.
+        let page = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })
+            .ok()
+            .filter(|p| p.is_power_of_two())
+            .unwrap_or(0x4000);
+        Some(ScanoutDraw {
+            platform,
+            device,
+            queue,
+            region: Arc::clone(region),
+            page,
+            import: Mutex::new(None),
+            shown: Arc::clone(shown),
+            presented: Arc::clone(presented),
+            converter: std::sync::OnceLock::new(),
+        })
+    }
+
+    /// The buffer over `scanout`'s pages and where its first row starts in it, imported where
+    /// the last import covers other pages (the module doc); `None` where the platform refuses
+    /// them.
+    pub(crate) fn scanout_buffer(&self, scanout: &Scanout) -> Option<(P::Buffer, u64)> {
+        let size = self.region.size();
+        let first = scanout.offset.min(size);
+        let end = scanout
+            .offset
+            .saturating_add(u64::from(scanout.stride) * u64::from(scanout.height));
+        let start = first & !(self.page - 1);
+        let length = end
+            .checked_next_multiple_of(self.page)
+            .unwrap_or(u64::MAX)
+            .min(size)
+            .saturating_sub(start);
+        let mut import = self.import.lock();
+        if !import
+            .as_ref()
+            .is_some_and(|i| (i.start, i.length) == (start, length))
+        {
+            *import = Some(ScanoutImport {
+                start,
+                length,
+                buffer: self.import_pages(start, length),
+            });
+        }
+        let buffer = import.as_ref()?.buffer.as_ref()?.clone_ref();
+        Some((buffer, first - start))
+    }
+
+    /// The `length` bytes of the region at `start` as a no-copy buffer; `None`, logged, where
+    /// the platform refuses them.
+    fn import_pages(&self, start: u64, length: u64) -> Option<P::Buffer> {
+        if length == 0 {
+            return None;
+        }
+        let keep = Arc::clone(&self.region);
+        // SAFETY: the pages lie inside the region (`scanout_buffer` keeps them to it), which is
+        // mapped from its making until its last reference goes, and the deallocator holds one
+        // until the platform runs it, once the buffer has gone.
+        let bytes = unsafe {
+            HostRange::new(
+                HostPtr::from_ptr(self.region.base().add(start as usize)),
+                length,
+            )
+        };
+        let buffer = no_catch(self.device.new_buffer_over_host_memory(
             OnFault::Die,
             bytes,
             0,
             Some(Box::new(move || drop(keep))),
         ));
-        let Some(buffer) = buffer else {
+        if buffer.is_none() {
             log::warn!(
                 target: "reims_vgpu::graphics",
-                "the platform refused the region's import: the window stays empty"
+                "the platform refused the scanout's pages (0x{length:x} bytes at 0x{start:x} in \
+                 the region): the window shows nothing of this scanout"
             );
-            return None;
-        };
-        Some(ScanoutDraw {
-            platform,
-            device,
-            queue,
-            buffer,
-            shown: Arc::clone(shown),
-            presented: Arc::clone(presented),
-            converter: std::sync::OnceLock::new(),
-        })
+        }
+        buffer
     }
 
     /// The window's render thread draws into a drawable of `size` pixels: the window's size,
@@ -167,6 +241,7 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
             self.presented.drawn();
         }
         let scanout = (*self.shown.scanout.lock())?;
+        let (buffer, source_offset) = self.scanout_buffer(&scanout)?;
         let command_buffer = no_catch(self.queue.command_buffer(OnFault::Die))?;
         let (texture_width, texture_height) = (texture.width(), texture.height());
         let x = region.x.min(texture_width);
@@ -186,8 +261,8 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
             no_catch(blit.encode(
                 OnFault::Die,
                 BlitCmd::CopyBufferToTexture {
-                    source_buffer: &self.buffer,
-                    source_offset: scanout.offset,
+                    source_buffer: &buffer,
+                    source_offset,
                     source_bytes_per_row: stride,
                     source_bytes_per_image: stride * height,
                     source_size: MtlSize::new(width, height, 1),

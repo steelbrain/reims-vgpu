@@ -2,11 +2,11 @@
 //! with its display shown in a window of the library's, made from a [`GraphicsConfig`].
 //!
 //! The device's region (BAR 2) is made here and shared: the device takes the guest's commands
-//! from its rings, and the window's sink imports it once as a no-copy buffer on the platform
-//! (Metal on macOS, the Vulkan platform's runtime with the `vulkan` feature) and blits the
-//! scanout out of it into each drawable, on the GPU, with no copy on the CPU (`sink`). The
-//! buffer's deallocator holds the region, so it stays mapped until the GPU has let the buffer
-//! go, after the device and the window.
+//! from its rings, and the window's sink imports the region's pages under the scanout as a
+//! no-copy buffer on the platform (Metal on macOS, the Vulkan platform's runtime with the
+//! `vulkan` feature) and blits the scanout out of it into each drawable, on the GPU, with no copy
+//! on the CPU (`sink`). The buffer's deallocator holds the region, so it stays mapped until the
+//! GPU has let the buffer go, after the device and the window.
 //!
 //! **The window** ([`WindowScreen`]) is a display window of `reims-vgpu-window` that keeps its
 //! size (`WindowConfig::keeps_its_size`): the guest follows it. It opens sized for the config's
@@ -703,8 +703,7 @@ impl Screen for WindowScreen {
 
 /// The window's sink over `region` on `platform` ([`sink::ScanoutDraw`]): Metal's on macOS's
 /// product platform, the Vulkan platform's swapchain presenter with the `vulkan` feature;
-/// `None` on any other platform (the testkit's), or where the platform refuses the region's
-/// import or a command queue.
+/// `None` on any other platform (the testkit's), or where the platform refuses a command queue.
 fn scanout_sink<P: ApiPlatform>(
     platform: &Arc<P>,
     region: &Arc<Region>,

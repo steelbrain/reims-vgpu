@@ -24,7 +24,7 @@ mod linux;
 mod macos;
 
 /// The sink of a graphics display on the Vulkan platform, over `region`; `None` where the
-/// runtime refuses a queue or the region's import.
+/// runtime refuses a queue.
 pub(super) fn sink(
     platform: Arc<VulkanPlatform>,
     region: &Arc<Region>,
@@ -39,7 +39,7 @@ pub(super) fn sink(
 
 /// What presents a graphics display's scanout in its window on the Vulkan platform.
 pub(super) struct VulkanScanoutSink {
-    /// The region's buffer, the queue and the scanout; shared with the presenters.
+    /// The scanout's buffer, the queue and the scanout; shared with the presenters.
     draw: Arc<ScanoutDraw<VulkanPlatform>>,
 }
 
@@ -72,7 +72,7 @@ impl VulkanScanoutSink {
 /// A graphics window's presenter: the scanout's draw and the window's swapchain, on its render
 /// thread.
 struct ScanoutPresenter {
-    /// The region's buffer, the queue and the scanout.
+    /// The scanout's buffer, the queue and the scanout.
     draw: Arc<ScanoutDraw<VulkanPlatform>>,
     /// The swapchain.
     swapchain: Swapchain,
