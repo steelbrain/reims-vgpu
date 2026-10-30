@@ -111,6 +111,99 @@ fn headless_on(raised: &Arc<AtomicU32>) -> (GraphicsDevice<FakePlatform>, Arc<Fa
     (device, platform)
 }
 
+/// The control ring's data-ring size.
+const RING_DATA: u64 = RGFX_CONTROL_RING_DATA_SIZE as u64;
+
+/// A stand-in guest driving the control rings of a headless device through its region.
+struct Guest {
+    base: *mut u8,
+    produced: u64,
+    consumed: u64,
+    seqno: u64,
+}
+
+impl Guest {
+    fn new(device: &GraphicsDevice<FakePlatform>) -> Guest {
+        Guest {
+            base: device.region_base(),
+            produced: 0,
+            consumed: 0,
+            seqno: 0,
+        }
+    }
+
+    // SAFETY (all the pointer helpers): the region is the device's, mapped at this address while
+    // the device lives, and each access lies in the ring fields the wire names; nothing else
+    // writes the guest's side.
+    unsafe fn write(&self, off: usize, bytes: &[u8]) {
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.base.add(off), bytes.len()) };
+    }
+    unsafe fn read(&self, off: usize, len: usize) -> Vec<u8> {
+        let mut v = vec![0u8; len];
+        unsafe { std::ptr::copy_nonoverlapping(self.base.add(off), v.as_mut_ptr(), len) };
+        v
+    }
+    unsafe fn store_u64(&self, off: usize, val: u64) {
+        unsafe { AtomicU64::from_ptr(self.base.add(off).cast()).store(val, Ordering::SeqCst) };
+    }
+    unsafe fn load_u64(&self, off: usize) -> u64 {
+        unsafe { AtomicU64::from_ptr(self.base.add(off).cast()).load(Ordering::SeqCst) }
+    }
+
+    /// Publishes `command` on the submission ring (its `seqno` the next, its `size` its length)
+    /// and rings the doorbell.
+    fn send(&mut self, device: &GraphicsDevice<FakePlatform>, mut command: Vec<u8>) {
+        self.seqno += 1;
+        command[8..16].copy_from_slice(&self.seqno.to_le_bytes());
+        let len = command.len() as u32;
+        command[4..8].copy_from_slice(&len.to_le_bytes());
+        let at =
+            |count: u64| RGFX_CONTROL_SUBMIT_OFFSET as usize + 256 + (count % RING_DATA) as usize;
+        let left = RING_DATA - self.produced % RING_DATA;
+        // SAFETY: as the helpers above.
+        unsafe {
+            if left < command.len() as u64 {
+                let mut pad = [0u8; 8];
+                pad[4..8].copy_from_slice(&(left as u32).to_le_bytes());
+                self.write(at(self.produced), &pad);
+                self.produced += left;
+            }
+            self.write(at(self.produced), &command);
+            self.produced += command.len() as u64;
+            self.store_u64(RGFX_CONTROL_SUBMIT_OFFSET as usize, self.produced);
+        }
+        device.mmio_write(RGFX_REG_DOORBELL.into(), RGFX_CONTROL_RING_ID);
+    }
+
+    /// The next completion-ring event, waiting about 2 s; `None` where none came.
+    fn event(&mut self) -> Option<Vec<u8>> {
+        let at =
+            |count: u64| RGFX_CONTROL_COMPLETE_OFFSET as usize + 256 + (count % RING_DATA) as usize;
+        for _ in 0..2000 {
+            // SAFETY: as the helpers above.
+            let produced = unsafe { self.load_u64(RGFX_CONTROL_COMPLETE_OFFSET as usize) };
+            if produced != self.consumed {
+                // SAFETY: as the helpers above; the host published the message before producer.
+                let header = unsafe { self.read(at(self.consumed), 8) };
+                let size = u32::from_le_bytes(header[4..8].try_into().unwrap()) as usize;
+                let r#type = u32::from_le_bytes(header[0..4].try_into().unwrap());
+                let bytes = unsafe { self.read(at(self.consumed), size) };
+                self.consumed += size as u64;
+                // SAFETY: as the helpers above.
+                unsafe {
+                    self.store_u64(RGFX_CONTROL_COMPLETE_OFFSET as usize + 0x40, self.consumed)
+                };
+                if r#type == RGFX_MSG_PAD {
+                    continue;
+                }
+                return Some(bytes);
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        None
+    }
+}
+
 /// An object-create message ([`RGFX_CMD_EVENT_CREATE`]) for `obj_id`.
 fn event_create(obj_id: u64) -> Vec<u8> {
     RgfxObjectCreate {
