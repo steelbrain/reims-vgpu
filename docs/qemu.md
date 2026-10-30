@@ -111,6 +111,7 @@ merge into staging of 2026-06-19), and upstream master is merged into it
 | the IOSurface device over PCI for x86-64 guests that run Apple's arm64 GPU driver: `apple-gfx-iosurface-pci` (106b:eeef, ours), whose presence is the only switch: `apple-gfx-pci` isolates a task, and offers argument buffers, only while the guest's mapper has a descriptor table, and has no option for either; and a reset of the IOSurface device's registers ("The IOSurface device over PCI", below) | `bd95509aa3` |
 | the VideoToolbox device's transport for macOS guests' AppleVideoToolboxParavirtualization: `apple-videotoolbox-pci` (106b:1a03, Apple's IDs; subsystem 106b:1a03 and class 0x120000 ours), modern virtio, two queues, on the library's video device (`rvg_video_device_*`), its IOSurfaces resolved through the process's latest IOSurface device, with no properties: the library picks what it decodes and encodes with, on the GPU its GPU device runs on; the guest-to-host queue holds 1024 descriptors, where Apple's hold 256, so that an x86-64 guest's largest message fits; a readable part over 16 MiB is answered -12904 before it is copied; each of its elements answered on a worker thread of the device's, in the guest's order, each status before the messages sent while it was answered ("The VideoToolbox device", below) | `4895365e5b` |
 | the M2 scaler device's transport for macOS guests' AppleM2ScalerParavirtDriver: `apple-m2scaler-pci` (106b:1a0b, subsystem 106b:1a0b and class 0x1200, Apple's), modern virtio, one queue, on the library's scaler device (`rvg_scaler_device_*`), the guest's memory reached through the device's DMA address space, with no properties, as the VideoToolbox device; realized on every host, it refuses the guest's features where the host has no GPU for it; a readable part over 64 KiB is a needs-reset before it is copied; each element answered on a worker thread of the device's, in the guest's order ("The M2 scaler device", below) | `4895365e5b` |
+| the reims-graphics device's transport, for the library's own guest driver: `reims-graphics-pci` (1234:5247, class 0x0380), on the library's graphics device (`rvg_graphics_device_*`); BAR 0 its registers with MSI-X from 0x800, the doorbell an ioeventfd, BAR 2 the library's region as RAM, its allocations dirty-logged for the scanout; built for every target where the library is found (`CONFIG_REIMS_GRAPHICS`), x86-64 under TCG on a Mac among them ("The reims-graphics device", below) | `77ee6c6b` |
 | `vmapple`'s AES engine refuses to realize in a QEMU built with no crypto library, which has no AES: QEMU stops at start with an error that names what the build lacks, where a macOS guest would hang as it mounted its root volume ("A QEMU without a crypto library", below) | `c7a4f0700f` |
 
 The branch's other commits are earlier ways of building `apple-gfx`
@@ -300,6 +301,55 @@ hides its VM.
 Realized paused on q35 under KVM, the device is 106b:1a0b, class
 0x120000, subsystem 106b:1a0b, with BAR 1 (4 KiB, MSI-X) and BAR 4
 (16 KiB, 64-bit prefetchable) (**measured**).
+
+## The reims-graphics device
+
+`reims-graphics-pci` is the device of the library's own guest driver for
+x86-64 macOS guests (`docs/graphics-kext/design.md`): its own PCI ID,
+1234:5247, class 0x0380, which Apple's paravirtualized graphics kext never
+matches. Its host side is the library's graphics device
+(`rvg_graphics_device_*`, docs/api.md); `hw/display/reims-graphics-pci.c`
+is its transport:
+- **BAR 0**, 4 KiB: the library's 32-bit registers below 0x800, the MSI-X
+  table at 0x800 and its PBA at 0xc00, one vector. The vCPU calls the
+  library itself, with no BQL: an access waits at most for the command the
+  control thread is taking. A write of 0, the control ring's id, to
+  DOORBELL (0x20) is taken by an ioeventfd (an eventfd on Linux, a pipe on
+  a Mac), whose file the library's control thread polls.
+- **BAR 2**, 64-bit and prefetchable: the library's region, 256 MiB of
+  private anonymous memory of QEMU's process, as two RAM regions over the
+  one mapping: the control rings, below 0x20000, and the guest's
+  allocations. Only the allocations are dirty-logged (`DIRTY_MEMORY_VGA`),
+  where the guest's scanout lies; the library asks at each refresh whether
+  the guest wrote the scanout (`scanout_written`), which takes the BQL to
+  snapshot and clear that log.
+- An interrupt the library raises, on its control or refresh thread, is
+  sent by a BH under the BQL.
+- Under `-display none` the library opens a window for the display, unless
+  `REIMS_VGPU_WINDOW` is `0`, as `apple-gfx` does. The window keeps the size
+  the person gives it, and the display offers the guest that size in pixels
+  at the host screen's rate. Its input is queued for a BH and reaches the
+  guest's tablet and keyboard through the device's console, which shows
+  nothing in QEMU's own displays. Closing the window powers the VM off.
+- It has no default option ROM: `romfile=` names one.
+
+`CONFIG_REIMS_GRAPHICS` is set for every target when the library is found,
+not only the HVF and KVM targets `MAC_PVG` is limited to. A Mac builds it
+into `qemu-system-x86_64` with
+`make qemu QEMU_CONFIGURE='--target-list=aarch64-softmmu,x86_64-softmmu'`
+and `make -C build/qemu qemu-system-x86_64`.
+
+**Measured** on the M3 Max, under TCG on q35, paused (`-S`):
+- headless (`REIMS_VGPU_WINDOW=0`), QMP's `query-pci` shows 1234:5247,
+  class 0x0380, BAR 0 4 KiB of 32-bit memory and BAR 2 256 MiB of 64-bit
+  prefetchable memory; `system_reset` and `quit` exit 0;
+- under the qtest accelerator, with the BARs programmed by hand, MAGIC reads
+  0x58464752, VERSION 1 and the region size 0x10000000; a GET_DISPLAYS
+  written into the submission ring and rung through DOORBELL's ioeventfd is
+  answered with DISPLAYS, one display of one mode, 1920 x 1080 at 60000
+  mHz; STATUS 0 empties the completion ring;
+- under `-display none`, the window opens and the library imports the
+  region for it with no refusal.
 
 ## apple-gfx on reims-vgpu
 
