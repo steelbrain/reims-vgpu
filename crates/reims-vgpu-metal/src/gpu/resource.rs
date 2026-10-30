@@ -587,6 +587,37 @@ impl reims_vgpu_core::platform::resource::Library<MetalPlatform> for MetalLibrar
         })
         .map(created)
     }
+
+    /// Metal's `newFunctionWithName:constantValues:error:`, each constant set by its index. A
+    /// constant wider than its eight inline bytes, or an `NSError`, answers nil.
+    fn new_function_with_constants(
+        &self,
+        _on: OnFault,
+        function_name: &str,
+        constants: &[reims_vgpu_core::platform::resource::FunctionConstant],
+    ) -> RaiseResult<Option<<MetalPlatform as Platform>::Function>> {
+        let (l, name) = (self.get(), msg::new_string(function_name));
+        let values = MTLFunctionConstantValues::new();
+        for c in constants {
+            let Some(bytes) = c.bytes() else {
+                return Ok(None);
+            };
+            // SAFETY: `bytes` holds as many bytes as `data_type` names; Metal copies them.
+            unsafe {
+                values.setConstantValue_type_atIndex(
+                    NonNull::new(bytes.as_ptr().cast_mut().cast()).unwrap_or(NonNull::dangling()),
+                    MTLDataType(c.data_type.to_usize()),
+                    c.index.to_usize(),
+                );
+            }
+        }
+        msg::send(
+            "newFunctionWithName:constantValues:error:",
+            Policy::Caught,
+            || l.newFunctionWithName_constantValues_error(&name, &values).ok(),
+        )
+        .map(created)
+    }
 }
 
 /// `id<MTLFunction>`.

@@ -285,6 +285,41 @@ pub trait RenderPipeline: Handle {
     }
 }
 
+/// One function-constant value, keyed by its index (`setConstantValue:type:atIndex:`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FunctionConstant {
+    /// The constant's index.
+    pub index: u32,
+    /// `MTLDataType` of the value.
+    pub data_type: u32,
+    /// The value's raw little-endian bits, zero-extended to eight bytes.
+    pub value: u64,
+}
+
+impl FunctionConstant {
+    /// The value's bytes, as many as `data_type` holds: `None` for a type wider than eight
+    /// bytes, or not a scalar or small vector of one.
+    pub fn bytes(&self) -> Option<Vec<u8>> {
+        // `MTLDataType` raw values (Metal's MTLDataType.h).
+        let len = match self.data_type {
+            // Bool, Char, UChar
+            53 | 45 | 49 => 1,
+            // Bool2, Char2, UChar2, Short, UShort, Half
+            54 | 46 | 50 | 37 | 41 | 16 => 2,
+            // Bool3, Char3, UChar3
+            55 | 47 | 51 => 3,
+            // Bool4, Char4, UChar4, Short2, UShort2, Half2, Int, UInt, Float
+            56 | 48 | 52 | 38 | 42 | 17 | 29 | 33 | 3 => 4,
+            // Short3, UShort3, Half3
+            39 | 43 | 18 => 6,
+            // Short4, UShort4, Half4, Int2, UInt2, Float2, Long, ULong
+            40 | 44 | 19 | 30 | 34 | 4 | 81 | 85 => 8,
+            _ => return None,
+        };
+        Some(self.value.to_le_bytes()[..len].to_vec())
+    }
+}
+
 /// `MTLLibrary`.
 pub trait Library<P: Platform>: Handle {
     /// sel: functionNames
@@ -292,4 +327,14 @@ pub trait Library<P: Platform>: Handle {
     /// sel: newFunctionWithName:
     /// Reached both under a handler and with none: `on` says which this call is.
     fn new_function(&self, on: OnFault, function_name: &str) -> RaiseResult<Option<P::Function>>;
+    /// sel: newFunctionWithName:constantValues:error:
+    /// The function named `function_name`, specialised by `constants`, each keyed by its
+    /// index. Nil for a name the library does not hold, or a specialisation the platform
+    /// refuses. Reached with no handler.
+    fn new_function_with_constants(
+        &self,
+        on: OnFault,
+        function_name: &str,
+        constants: &[FunctionConstant],
+    ) -> RaiseResult<Option<P::Function>>;
 }

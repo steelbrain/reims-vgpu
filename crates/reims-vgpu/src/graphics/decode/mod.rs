@@ -52,6 +52,7 @@ use reims_graphics::wire::{
     RGFX_PIPELINE_KIND_RENDER, RGFX_PIPELINE_OK, RGFX_PIPELINE_REFLECT_SUPPORT_ICB,
     RGFX_PIPELINE_REFLECT_THREADGROUP_MATCHES_TILE, RGFX_PIPELINE_REFUSED, RgfxBufferAtOffset,
     RgfxBufferCreate, RgfxCbComplete, RgfxColorAttachmentDesc, RgfxComputePipelineCreate,
+    RgfxFunctionConstant,
     RgfxBufferOverHostMemory, RgfxDepthStencilCreate, RgfxHeapCreate, RgfxHeapOverHostMemory,
     RgfxLibraryCreate, RgfxLibraryFromRegion, RgfxMsgHeader, RgfxObjectCreate,
     RgfxObjectDestroy, RgfxPipelineReflection, RgfxQueueCreate, RgfxRenderPipelineCreate,
@@ -60,7 +61,9 @@ use reims_graphics::wire::{
 };
 use reims_vgpu_core::host::HostPtr;
 use reims_vgpu_core::platform::device::GpuDevice;
-use reims_vgpu_core::platform::resource::{Buffer, ComputePipeline, Heap, Library, RenderPipeline};
+use reims_vgpu_core::platform::resource::{
+    Buffer, ComputePipeline, FunctionConstant, Heap, Library, RenderPipeline,
+};
 use reims_vgpu_core::platform::types::{ResourceAddressRange, Swizzle};
 use reims_vgpu_core::platform::values::{
     BufferDesc, DepthStencilDesc, HeapDesc, OptionSet, RenderPipelineDesc, SamplerDesc,
@@ -574,9 +577,9 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// functions, colour attachment 0's pixel format and the one source-over
     /// blend it can express, and a label; the rest of the wire descriptor (colour
     /// attachments 1..8, arbitrary blend state, depth/stencil formats, the raster
-    /// sample count, the vertex descriptor and the pipeline flags, and the
-    /// functions' constant specialisation) has no place in that value and is not
-    /// applied here. The full path is Metal's serialized-descriptor deserializer,
+    /// sample count, the vertex descriptor and the pipeline flags) has no place in
+    /// that value and is not applied here. Each function is specialised by the
+    /// index-keyed constants the wire carries for it. The full path is Metal's serialized-descriptor deserializer,
     /// which is the Apple lane's; carrying the whole descriptor on the wire keeps
     /// the guest ABI stable for when the platform value grows.
     fn decode_render_pipeline(
@@ -614,13 +617,22 @@ impl<P: Platform> GraphicsDecoder<P> {
                 None => return Ok(Err(DecodeError::Malformed)),
             }
         };
-        // Resolve the functions. A nil function (the library has no such entry
-        // point) refuses the pipeline. Function-constant specialisation on the
-        // wire is not applied: `Library::new_function` takes only a name.
-        let Some(vertex) = vertex_lib.new_function(OnFault::Return, vertex_name)? else {
+        // Each function's constants (index-keyed) are in the tail; a span the
+        // message does not cover is malformed.
+        let (Some(vertex_constants), Some(fragment_constants)) = (
+            constants_tail(message, m.vertex_constants_offset, m.vertex_constant_count),
+            constants_tail(message, m.fragment_constants_offset, m.fragment_constant_count),
+        ) else {
+            return Ok(Err(DecodeError::Malformed));
+        };
+        // Resolve the functions, each specialised by its constants. A nil function
+        // (the library has no such entry point, or refuses the specialisation)
+        // refuses the pipeline.
+        let Some(vertex) = specialised::<P>(&vertex_lib, vertex_name, &vertex_constants)? else {
             return self.emit_pipeline_refused(m.header.seqno, m.obj_id, RGFX_PIPELINE_KIND_RENDER);
         };
-        let Some(fragment) = fragment_lib.new_function(OnFault::Return, fragment_name)? else {
+        let Some(fragment) = specialised::<P>(&fragment_lib, fragment_name, &fragment_constants)?
+        else {
             return self.emit_pipeline_refused(m.header.seqno, m.obj_id, RGFX_PIPELINE_KIND_RENDER);
         };
         let desc = RenderPipelineDesc::<P> {
@@ -651,8 +663,9 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// make the pipeline through [`GpuDevice::new_compute_pipeline_state_for_function`],
     /// store it and emit its reflection reply. As the render form, the wire
     /// carries the whole descriptor but the function-from-a-name creator applies
-    /// only the function; the flags, limits and constant specialisation are not
-    /// applied here (the serialized-descriptor path is the Apple lane's).
+    /// only the function, specialised by its index-keyed constants; the flags and
+    /// limits are not applied here (the serialized-descriptor path is the Apple
+    /// lane's).
     fn decode_compute_pipeline(
         &mut self,
         device: &P::Device,
@@ -668,7 +681,10 @@ impl<P: Platform> GraphicsDecoder<P> {
         let Some(name) = str_tail(message, m.name_offset, m.name_len) else {
             return Ok(Err(DecodeError::Malformed));
         };
-        let Some(function) = function_lib.new_function(OnFault::Return, name)? else {
+        let Some(constants) = constants_tail(message, m.constants_offset, m.constant_count) else {
+            return Ok(Err(DecodeError::Malformed));
+        };
+        let Some(function) = specialised::<P>(&function_lib, name, &constants)? else {
             return self.emit_pipeline_refused(
                 m.header.seqno,
                 m.obj_id,
@@ -722,6 +738,39 @@ fn reflection_header(seqno: u64) -> RgfxMsgHeader {
 
 /// A UTF-8 string at `[offset, offset + len)` of `message`, or `None` when the
 /// span lies outside the message or is not UTF-8.
+/// The `count` [`RgfxFunctionConstant`]s at byte `offset` of `message`, or `None`
+/// where the message does not cover them.
+fn constants_tail(message: &[u8], offset: u32, count: u32) -> Option<Vec<FunctionConstant>> {
+    let size = size_of::<RgfxFunctionConstant>();
+    let start = offset as usize;
+    let end = start.checked_add((count as usize).checked_mul(size)?)?;
+    let bytes = message.get(start..end)?;
+    Some(
+        bytes
+            .chunks_exact(size)
+            .filter_map(|b| RgfxFunctionConstant::read_from_bytes(b).ok())
+            .map(|c| FunctionConstant {
+                index: c.index,
+                data_type: c.data_type,
+                value: c.value,
+            })
+            .collect(),
+    )
+}
+
+/// The function `name` of `library`, specialised by `constants` when there are any.
+fn specialised<P: Platform>(
+    library: &P::Library,
+    name: &str,
+    constants: &[FunctionConstant],
+) -> RaiseResult<Option<P::Function>> {
+    if constants.is_empty() {
+        library.new_function(OnFault::Return, name)
+    } else {
+        library.new_function_with_constants(OnFault::Return, name, constants)
+    }
+}
+
 fn str_tail(message: &[u8], offset: u32, len: u32) -> Option<&str> {
     let start = offset as usize;
     let end = start.checked_add(len as usize)?;

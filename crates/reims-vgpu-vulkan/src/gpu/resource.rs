@@ -2053,6 +2053,52 @@ impl Library<VulkanPlatform> for VulkanLibrary {
         )
         .map(|made| made.map(Obj::new))
     }
+
+    /// The runtime's `newFunctionWithName:constantValues:error:`: each constant by its index.
+    /// A constant whose type the runtime does not know, or wider than its eight inline bytes,
+    /// answers nil, as a refused specialisation.
+    fn new_function_with_constants(
+        &self,
+        _on: OnFault,
+        function_name: &str,
+        constants: &[reims_vgpu_core::platform::resource::FunctionConstant],
+    ) -> RaiseResult<Option<VulkanFunction>> {
+        let sel = "newFunctionWithName:constantValues:error:";
+        let mut values = metal2vulkan::library::FunctionConstantValues::defaults();
+        for c in constants {
+            let (Ok(ty), Some(bytes)) =
+                (metal2vulkan::metal::DataType::try_from(c.data_type), c.bytes())
+            else {
+                log::warn!(
+                    "function {function_name:?}: constant {} of MTLDataType {} cannot be carried",
+                    c.index,
+                    c.data_type
+                );
+                return Ok(None);
+            };
+            values = values.with_index(
+                c.index,
+                metal2vulkan::library::FunctionConstantValue::new(ty, bytes),
+            );
+        }
+        crate::gpu::timing::creation(
+            sel,
+            "",
+            || {
+                create(sel, Policy::Dies, Nil::MissingFunction, || {
+                    self.raw
+                        .new_function_with_name_constant_values(function_name, &values)
+                })
+            },
+            || format!("{function_name:?} with {} constants", constants.len()),
+            |made| match made {
+                Ok(Some(_)) => "found".to_owned(),
+                Ok(None) => "nil".to_owned(),
+                Err(_) => "raised".to_owned(),
+            },
+        )
+        .map(|made| made.map(Obj::new))
+    }
 }
 
 #[cfg(test)]
