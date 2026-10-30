@@ -16,6 +16,7 @@ namespace {
 // The ring header fields, by their offsets in RgfxRingHeader (as ring.rs names them).
 constexpr uint32_t kProducer = __builtin_offsetof(RgfxRingHeader, producer);
 constexpr uint32_t kConsumer = __builtin_offsetof(RgfxRingHeader, consumer);
+constexpr uint32_t kArmed = __builtin_offsetof(RgfxRingHeader, armed);
 
 // A non-pad message has at least its 16-byte header; a pad has an 8-byte one. Sizes
 // are a multiple of 8.
@@ -110,6 +111,21 @@ void RgfxReplyReader::removeEventListener(uint64_t token)
 {
 	std::lock_guard<std::mutex> guard(m_lock);
 	m_eventListeners.erase(token);
+}
+
+bool RgfxReplyReader::armAndCheck()
+{
+	if (m_header == nullptr)
+		return false;
+	// The host's post publishes `producer`, fences, then reads and clears `armed`; this
+	// sets `armed`, fences, then reads `producer`. One of the two sees the other's write:
+	// either the host raises the vector, or this sees the record and pumps again.
+	__atomic_store_n(reinterpret_cast<volatile uint32_t *>(m_header + kArmed), 1u,
+	                 __ATOMIC_SEQ_CST);
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	uint64_t producer = load64(m_header + kProducer);
+	std::lock_guard<std::mutex> guard(m_lock);
+	return producer != m_consumed;
 }
 
 bool RgfxReplyReader::awaitingCompletion(uint64_t seqno)

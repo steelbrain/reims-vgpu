@@ -16,22 +16,23 @@
  * crates/reims-vgpu/src/graphics/completion.rs (cb_complete / cb_failed) and
  * decode/mod.rs (render_reflection / compute_reflection / emit_pipeline_refused).
  *
- * THE SINGLE-RING MODEL. The host posts all three replies on the one control
- * completion ring (control.rs: "replies … come back on the completion ring through
- * the device's poster"), so for now the reader reads that ring. When the host grows
- * per-queue completion rings, a reader per queue reads each; the dispatch is the same.
+ * ONE READER PER QUEUE. Each command queue has a completion ring of its own, which the
+ * host posts its command buffers' completions on, and a reader over it; the device's
+ * ringless reader takes the replies the kext hands back from the control ring (deliver).
  *
- * DRIVEN BY POLLING. The read is driven by `pump()` (alias `drainReplies()`), which
- * the device calls from a boot thread (or a waiter from waitUntilCompleted). It is
- * not interrupt-driven yet: it does not set the ring's `armed` flag, so the host
- * raises no vector; a boot thread that sleeps on the completion vector, arming the
- * ring, is a follow-up. The reader is testable off the guest by feeding ring bytes
- * and calling pump().
+ * DRIVEN BY THE COMPLETION THREAD. The read is `pump()` (alias `drainReplies()`). The
+ * process's completion thread (RgfxCompletionThread) drives each queue's reader: it
+ * pumps, arms the ring (armAndCheck: `armed` set, so the host raises the vector for its
+ * next completion) and sleeps in the kext until the vector shows a record for it. While
+ * a reader is driven() the thread is its only consumer; an undriven one (no thread, or
+ * its thread has ended) is pumped by the waiters in waitUntilCompleted. The reader is
+ * testable off the guest by feeding ring bytes and calling pump().
  *
  * THREADING. Registration (the expect / addEventListener calls) runs on the app's threads while
- * a boot thread pumps; one lock guards the registries and the consume cursor. A
+ * the completion thread pumps; one lock guards the registries and the consume cursor. A
  * matched handler is moved out and invoked after the lock is released, so a handler
- * may register again or release the wrapper without re-entering the lock.
+ * may register again or release the wrapper without re-entering the lock. One consumer
+ * at a time runs the handlers, so they run in ring order.
  *
  * Our own C++; depends only on the committed wire header. The handlers are supplied
  * by the ObjC++ wrappers (which capture their Metal object), so this file names no
@@ -41,6 +42,7 @@
 #ifndef RGFX_REPLY_READER_HPP_
 #define RGFX_REPLY_READER_HPP_
 
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <mutex>
@@ -100,6 +102,15 @@ public:
 	/// Alias for pump() (the device's boot-thread name).
 	uint32_t drainReplies() { return pump(); }
 
+	/// Arms the ring (its `armed` set to 1, so the host raises the vector with its next
+	/// completion), then, after a full fence, whether the host published records this has
+	/// not taken: true means pump again before sleeping. False for a ringless reader.
+	bool armAndCheck();
+
+	/// Whether the completion thread drives this reader (it is then the only consumer).
+	void setDriven(bool driven) { m_driven.store(driven, std::memory_order_release); }
+	bool driven() const { return m_driven.load(std::memory_order_acquire); }
+
 	/// Whether a completion / reflection is still awaited for `seqno` (tests).
 	bool awaitingCompletion(uint64_t seqno);
 	bool awaitingReflection(uint64_t seqno);
@@ -118,6 +129,7 @@ private:
 
 	std::mutex m_lock;
 	uint64_t m_consumed; // the guest's count: what it has taken
+	std::atomic<bool> m_driven{false};
 
 	std::unordered_map<uint64_t, CompletionHandler> m_completions;
 	std::unordered_map<uint64_t, ReflectionHandler> m_reflections;

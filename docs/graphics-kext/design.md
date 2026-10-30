@@ -472,6 +472,22 @@ command-buffer `ObjId`, status, GPU start/end time, and on error the
 the map m2v gave). A shared event posts `EVENT_SIGNALLED` (`ObjId`, value) as it
 fires. The ring's armed/interrupt handshake is the stage-2 one.
 
+**Who takes the completions.** Every queue raises the device's one vector,
+the control ring's. The accelerator kext maps each queue's completion-ring
+header into the kernel at its `QUEUE_CREATE`. The framebuffer's work loop
+services the vector, and then the accelerator scans the watched rings: a ring
+whose `producer` moved since the last scan, and still holds records its process
+has not taken, wakes that process. The scan takes only the watch table's lock,
+which no submit path takes. Each process has one completion thread in the bundle.
+It sleeps in the kext (user-client selector `0x107`, an interruptible wait on a
+per-client wake count it passes back), and each pass it drains every queue's
+ring, arms it, fences and looks again. A completion posted while it works shows
+in the count or in its last look, so none is missed and nothing polls. The
+thread runs each command buffer's scheduled then completed handlers in ring
+order, whether or not anything waits. `waitUntilCompleted` waits for the
+thread to have run them. It takes the ring itself only inside a handler, or
+once the thread has ended (its context closed).
+
 **Left for later** (extends the same op families, not the transport): enqueue
 ordering held in the decoder; command-buffer/queue descriptors and
 `errorOptions`; labels and debug groups answered guest-side; residency sets

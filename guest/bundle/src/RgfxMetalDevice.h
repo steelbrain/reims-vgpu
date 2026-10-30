@@ -56,6 +56,7 @@ class RgfxSerializer;
 class RgfxRegion;
 class RgfxReplyReader;
 class RgfxRingWriter;
+class RgfxCompletionThread;
 #endif
 
 NS_ASSUME_NONNULL_BEGIN
@@ -90,6 +91,11 @@ NS_ASSUME_NONNULL_BEGIN
 /// completions, pipeline reflections and shared-event signals. Null until the
 /// handshake stands it up over the region.
 - (nullable RgfxReplyReader *)replyReader;
+
+/// The process's completion thread (RgfxCompletionThread), which takes each queue's
+/// completions off its ring as the kext wakes it. Null until the handshake opens the
+/// context, or where the thread could not start (the waiters then take the rings).
+- (nullable RgfxCompletionThread *)completionThread;
 
 /// Places a queue submission ring at `regionOffset` in the device region with a byte
 /// ring of `dataSize` bytes, owns the RgfxRingWriter over it for the device's life, and

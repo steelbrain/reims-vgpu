@@ -11,6 +11,7 @@
 #import "RgfxCommandObjects.h"
 
 #include "RgfxRegion.hpp"
+#include "RgfxCompletionThread.hpp"
 #include "RgfxReplyReader.hpp"
 #include "RgfxRingWriter.hpp"
 #include "RgfxSerializer.hpp"
@@ -75,6 +76,10 @@ constexpr uint32_t kQueueCompleteDataSize = 32768;
 	RgfxReplyReader *reader =
 	    new RgfxReplyReader(region->base() + rings.complete_offset, rings.complete_data_size);
 	[queue adoptReplyReader:reader];
+	// The process's completion thread takes the ring's completions from now on, whether or
+	// not anything waits for them.
+	if (RgfxCompletionThread *completions = [self completionThread])
+		completions->add([queue sharedReplyReader]);
 	return queue;
 }
 

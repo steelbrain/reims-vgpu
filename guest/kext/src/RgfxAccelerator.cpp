@@ -95,6 +95,11 @@ fail:
 
 void RgfxAccelerator::stop(IOService *provider)
 {
+	// The framebuffer stops calling queueInterrupt (and lets this accelerator go).
+	if (ReimsGraphics *fb = copyFramebuffer()) {
+		fb->setQueueInterrupt(nullptr, nullptr);
+		fb->release();
+	}
 	super::stop(provider);
 	teardown();
 }

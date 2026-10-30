@@ -134,6 +134,13 @@ public:
 	void setPipe(OSObject *client, PipeVblankHook vblank, PipePresentHook present);
 	void setPipeVblankEnabled(bool enabled);
 
+	// The device's one MSI-X vector also carries the command queues' completion interrupts
+	// (each QUEUE_CREATE names it). setQueueInterrupt names the accelerator (retained) and its
+	// hook, which the work loop calls after each pass over the control ring, so the
+	// accelerator looks at its queues' completion rings once per interrupt. nullptr clears it.
+	typedef void (*QueueInterruptHook)(OSObject *target);
+	void setQueueInterrupt(OSObject *target, QueueInterruptHook hook);
+
 	// The accelerator's object lifecycle (a create or destroy, QUEUE_CREATE, CONTEXT_CLOSE) on
 	// the control ring: `message` is the whole message in kernel memory, at most
 	// kLifecycleMessageMax bytes, whose header is stamped here with `type`, its size and the
@@ -328,6 +335,9 @@ private:
 	PipeVblankHook pipeVblankHook;
 	PipePresentHook pipePresentHook;
 	bool pipeVblankEnabled;
+	// The accelerator (retained) and its queue-interrupt hook.
+	OSObject *queueTarget;
+	QueueInterruptHook queueHook;
 
 	// The work loop's alone: what SET_VBLANK last asked, and a display
 	// refresh after DISPLAY_CHANGED, waiting to be sent or answered.

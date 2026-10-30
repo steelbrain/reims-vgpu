@@ -26,7 +26,10 @@ bool RgfxAcceleratorUserClient::initWithTask(task_t owningTask, void *securityID
 	slot = 0;
 	queueCount = 0;
 	queueLock = IOLockAlloc();
-	return queueLock != nullptr;
+	completionLock = IOLockAlloc();
+	completionCount = 0;
+	completionsClosed = false;
+	return queueLock != nullptr && completionLock != nullptr;
 }
 
 bool RgfxAcceleratorUserClient::start(IOService *provider)
@@ -49,6 +52,9 @@ void RgfxAcceleratorUserClient::free()
 	if (queueLock)
 		IOLockFree(queueLock);
 	queueLock = nullptr;
+	if (completionLock)
+		IOLockFree(completionLock);
+	completionLock = nullptr;
 	super::free();
 }
 
@@ -146,7 +152,7 @@ IOReturn RgfxAcceleratorUserClient::externalMethod(uint32_t selector,
 	// Our own protocol: the process's context (its ids, blocks and queues), on our own user
 	// client alone.
 	if (ucType == kRgfxAccelUserClientType && arguments && selector >= kRgfxAccelMethodOpenContext &&
-	    selector <= kRgfxAccelMethodResourceIds)
+	    selector <= kRgfxAccelMethodWaitCompletions)
 		return contextMethod(selector, arguments);
 
 	// Our own protocol: the doorbell. ONLY on our own user client (type 0). Apple's IOGPU

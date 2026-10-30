@@ -346,6 +346,18 @@ void ReimsGraphics::service()
 			break;
 	}
 
+	// The queues' completions share the vector: the accelerator looks at its rings.
+	IOSimpleLockLock(interruptLock);
+	OSObject *queues = queueTarget;
+	QueueInterruptHook queuesHook = queueHook;
+	if (queues)
+		queues->retain();
+	IOSimpleLockUnlock(interruptLock);
+	if (queues) {
+		queuesHook(queues);
+		queues->release();
+	}
+
 	IOSimpleLockLock(interruptLock);
 	bool want = vblankWanted || (pipeClient && pipeVblankEnabled);
 	IOSimpleLockUnlock(interruptLock);
@@ -953,6 +965,7 @@ void ReimsGraphics::free()
 	submitLock = interruptLock = nullptr;
 	stateLock = nullptr;
 	OSSafeReleaseNULL(pipeClient);
+	OSSafeReleaseNULL(queueTarget);
 	super::free();
 }
 
@@ -1824,6 +1837,21 @@ void ReimsGraphics::setPipe(OSObject *client, PipeVblankHook vblankHook, PipePre
 	if (old)
 		old->release();
 	kickWorkLoop();
+}
+
+void ReimsGraphics::setQueueInterrupt(OSObject *target, QueueInterruptHook hook)
+{
+	if (!hook)
+		target = nullptr;
+	if (target)
+		target->retain();
+	IOSimpleLockLock(interruptLock);
+	OSObject *old = queueTarget;
+	queueTarget = target;
+	queueHook = target ? hook : nullptr;
+	IOSimpleLockUnlock(interruptLock);
+	if (old)
+		old->release();
 }
 
 void ReimsGraphics::setPipeVblankEnabled(bool enabled)

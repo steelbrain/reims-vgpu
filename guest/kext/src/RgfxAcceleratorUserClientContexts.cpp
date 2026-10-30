@@ -99,9 +99,17 @@ IOReturn RgfxAcceleratorUserClient::contextMethod(uint32_t selector,
 			IOLockUnlock(queueLock);
 			return kIOReturnNoResources;
 		}
+		// Watched before the device has it, so no completion comes before the watch.
+		IOReturn watch = owner->watchQueue(this, open.obj_id, open.complete_offset);
+		if (watch != kIOReturnSuccess) {
+			IOLockUnlock(queueLock);
+			return watch;
+		}
 		UInt32 status = owner->openQueue(open);
 		if (status == RGFX_STATUS_OK)
 			queues[queueCount++] = open.obj_id;
+		else
+			owner->unwatchQueue(this, open.obj_id);
 		IOLockUnlock(queueLock);
 		out[0] = status;
 		return kIOReturnSuccess;
@@ -112,6 +120,7 @@ IOReturn RgfxAcceleratorUserClient::contextMethod(uint32_t selector,
 		IOLockLock(queueLock);
 		for (UInt32 i = 0; i < queueCount; i++) {
 			if (queues[i] == in[0]) {
+				owner->unwatchQueue(this, in[0]);
 				owner->closeQueue(in[0]);
 				queues[i] = queues[--queueCount];
 				break;
@@ -122,6 +131,8 @@ IOReturn RgfxAcceleratorUserClient::contextMethod(uint32_t selector,
 	}
 	case kRgfxAccelMethodSubmit:
 		return submitMethod(a);
+	case kRgfxAccelMethodWaitCompletions:
+		return waitCompletionsMethod(a);
 	default:
 		return kIOReturnUnsupported;
 	}
@@ -220,12 +231,49 @@ IOReturn RgfxAcceleratorUserClient::submitMethod(IOExternalMethodArguments *a)
 	return kIOReturnSuccess;
 }
 
+// kRgfxAccelMethodWaitCompletions (RgfxAccelerator.hpp): the bundle's completion thread
+// sleeps here, interruptibly, until a completion ring of the client's holds records for it.
+IOReturn RgfxAcceleratorUserClient::waitCompletionsMethod(IOExternalMethodArguments *a)
+{
+	if (a->scalarInputCount != 1 || a->scalarOutputCount != 1)
+		return kIOReturnBadArgument;
+	IOReturn r = kIOReturnSuccess;
+	IOLockLock(completionLock);
+	while (completionCount == a->scalarInput[0] && !completionsClosed) {
+		if (IOLockSleep(completionLock, &completionCount, THREAD_ABORTSAFE) != THREAD_AWAKENED) {
+			r = kIOReturnAborted;
+			break;
+		}
+	}
+	if (completionsClosed)
+		r = kIOReturnNotOpen;
+	a->scalarOutput[0] = completionCount;
+	IOLockUnlock(completionLock);
+	return r;
+}
+
+void RgfxAcceleratorUserClient::wakeCompletions()
+{
+	IOLockLock(completionLock);
+	completionCount++;
+	IOLockWakeup(completionLock, &completionCount, false);
+	IOLockUnlock(completionLock);
+}
+
 void RgfxAcceleratorUserClient::releaseContext()
 {
 	if (!queueLock)
 		return;
+	// The completion waiters return, and no ring of the client's wakes it any more.
+	IOLockLock(completionLock);
+	completionsClosed = true;
+	IOLockWakeup(completionLock, &completionCount, false);
+	IOLockUnlock(completionLock);
 	IOLockLock(queueLock);
 	RgfxAccelerator *accel = owner;
+	// Under the queue lock, which a QUEUE_CREATE watches its ring under, so none is left.
+	if (accel)
+		accel->unwatchClient(this);
 	if (!hasContext || !accel) {
 		IOLockUnlock(queueLock);
 		return;

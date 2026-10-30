@@ -44,6 +44,7 @@ void rgfxDiag(const char *fmt, ...)
 }
 } // namespace
 
+#include "RgfxCompletionThread.hpp"
 #include "RgfxRegion.hpp"
 #include "RgfxReplyReader.hpp"
 #include "RgfxRingWriter.hpp"
@@ -62,6 +63,7 @@ enum {
 	kRgfxAccelMethodQueueCreate = 0x103,
 	kRgfxAccelMethodSubmit = 0x105,
 	kRgfxAccelMethodResourceIds = 0x106,
+	kRgfxAccelMethodWaitCompletions = 0x107,
 };
 
 namespace {
@@ -126,6 +128,24 @@ bool rgfxKextResourceIds(void *context, uint64_t *first_id)
 	                                 &outCount) == KERN_SUCCESS;
 }
 
+// The completion thread's wait: the kext returns once a completion ring of the process's holds
+// records its last pass did not see (the wake count differs from `last`), or at once where it
+// already does. `context` is the user client's connect.
+RgfxCompletionThread::WaitResult rgfxKextWaitCompletions(void *context, uint64_t last,
+                                                         uint64_t *now)
+{
+	io_connect_t conn = static_cast<io_connect_t>(reinterpret_cast<uintptr_t>(context));
+	uint32_t outCount = 1;
+	kern_return_t kr =
+	    IOConnectCallScalarMethod(conn, kRgfxAccelMethodWaitCompletions, &last, 1, now, &outCount);
+	if (kr == KERN_SUCCESS)
+		return RgfxCompletionThread::kWoke;
+	if (kr == kIOReturnAborted)
+		return RgfxCompletionThread::kRetry; // a signal broke the sleep
+	rgfxDiag("RGFX: the completion wait ended kr=0x%x; waiters take the rings\n", kr);
+	return RgfxCompletionThread::kStop;
+}
+
 void rgfxKextRelease(void *context, uint64_t offset)
 {
 	io_connect_t conn = static_cast<io_connect_t>(reinterpret_cast<uintptr_t>(context));
@@ -183,6 +203,7 @@ constexpr long kGpuFamilyMinus1009 = -1009;
 	mach_port_t _acceleratorPort;
 	RgfxRegion *_region;         // BAR-region allocator; null until the handshake maps it
 	RgfxReplyReader *_replyReader; // the lifecycle's replies, from the kext; null until the handshake
+	std::unique_ptr<RgfxCompletionThread> _completions; // the queues' completions; null until then
 	RgfxKextLink _link;          // the lifecycle's route to the kext
 	std::vector<std::unique_ptr<RgfxRingWriter>> _queueRings; // owned queue submit-ring writers
 	io_connect_t _conn;          // our accelerator user client (BAR-2 region map + doorbell)
@@ -290,6 +311,12 @@ constexpr long kGpuFamilyMinus1009 = -1009;
 	_controlRing = std::make_unique<RgfxRingWriter>(&rgfxKextSubmit, &_link, kLifecycleMessageMax);
 	_serializer = new RgfxSerializer(*_controlRing, _ids);
 	_serializer->setQueueOpener(&rgfxKextQueueOpener, connContext);
+	// The queues' completions, taken as the kext wakes the thread for them.
+	_completions = std::make_unique<RgfxCompletionThread>(&rgfxKextWaitCompletions, connContext);
+	if (!_completions->start()) {
+		rgfxDiag("RGFX: no completion thread; waiters take the rings\n");
+		_completions.reset();
+	}
 	rgfxDiag("RGFX: context %llu: ids 0x%llx, va 0x%llx\n", (unsigned long long)ctx[0],
 	         (unsigned long long)ctx[1], (unsigned long long)ctx[2]);
 	rgfxDiag("RGFX: transport up: region=%llu bytes, caps=%s\n", (unsigned long long)mapSize,
@@ -343,6 +370,11 @@ constexpr long kGpuFamilyMinus1009 = -1009;
 - (RgfxReplyReader *)replyReader
 {
 	return _replyReader;
+}
+
+- (RgfxCompletionThread *)completionThread
+{
+	return _completions.get();
 }
 
 - (RgfxRingWriter *)addQueueSubmitRingAtOffset:(uint64_t)regionOffset dataSize:(uint32_t)dataSize

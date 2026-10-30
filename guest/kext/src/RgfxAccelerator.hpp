@@ -106,6 +106,26 @@ enum {
 	// kIOReturnNoResources once every chunk is held. The device has the grant
 	// (RESOURCE_ID_CHUNK) before it returns; the context holds the chunk until its close.
 	kRgfxAccelMethodResourceIds = 0x106,
+	// Waits for the client's command buffers to complete: in the last count this returned (0
+	// at first); out: the count now. Returns once the count is not the one given, which it
+	// becomes when a completion ring of one of the client's queues holds records the client
+	// has not taken (the device's interrupt, RgfxAccelerator::queueInterrupt). kIOReturnAborted
+	// when the thread is interrupted, kIOReturnNotOpen once the client's context is released.
+	kRgfxAccelMethodWaitCompletions = 0x107,
+};
+
+class RgfxAcceleratorUserClient;
+class ReimsGraphics;
+
+// A command queue's completion ring the accelerator watches for its client
+// (RgfxAcceleratorContexts.cpp): the ring's header, mapped into the kernel, and the producer
+// count last seen there.
+struct RgfxWatchedRing {
+	RgfxAcceleratorUserClient *client;
+	UInt64 objId;
+	IOMemoryMap *map;
+	volatile UInt8 *header;
+	UInt64 lastProducer;
 };
 
 // A block the accelerator handed out of the region, and its owner.
@@ -115,8 +135,6 @@ struct RgfxBlock {
 	const void *owner;
 };
 
-class RgfxAcceleratorUserClient;
-class ReimsGraphics;
 
 class RgfxAccelerator : public IOAccelerator {
 	OSDeclareDefaultStructors(RgfxAccelerator);
@@ -167,6 +185,14 @@ public:
 	                       UInt32 timeoutMs);
 	UInt32 openQueue(const RgfxQueueCreate &create);
 	void closeQueue(UInt64 objId);
+	// The completion rings of the clients' queues: watchQueue maps queue `objId`'s ring header
+	// at region offset `completeOffset`, and from then on each interrupt of the device's vector
+	// that finds records the client has not taken there wakes the client's completion waiters
+	// (queueInterrupt, on the framebuffer's work loop). unwatchQueue and unwatchClient stop it.
+	IOReturn watchQueue(RgfxAcceleratorUserClient *client, UInt64 objId, UInt64 completeOffset);
+	void unwatchQueue(RgfxAcceleratorUserClient *client, UInt64 objId);
+	void unwatchClient(RgfxAcceleratorUserClient *client);
+	void queueInterrupt();
 
 private:
 	IOReturn newDisplayPipe(task_t owningTask, void *securityID, UInt32 type,

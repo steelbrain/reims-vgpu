@@ -30,9 +30,11 @@
 #import "RgfxCommandObjects.h"
 #import "RgfxIOSurface.h"
 
+#include <atomic>
 #include <cstring>
 #include <vector>
 
+#include "RgfxCompletionThread.hpp"
 #include "RgfxEncoder.hpp"
 #include "RgfxObjectModel.hpp"
 #include "RgfxReplyReader.hpp"
@@ -41,6 +43,22 @@
 #include "reims_graphics_wire.h"
 
 namespace {
+
+/// How many command buffers' completions this thread is delivering (their handlers run
+/// inside): a waitUntilCompleted there takes the ring itself, as the thread that would
+/// otherwise deliver may be this one.
+thread_local int t_delivering = 0;
+
+/// Whether the `n`th (from 0) unhonoured command-buffer event op is logged: the first 16,
+/// then every power of two, so a frame loop's ops stay visible without flooding the log.
+bool logEventOp(std::atomic<uint64_t> &count, uint64_t *n)
+{
+	*n = count.fetch_add(1, std::memory_order_relaxed);
+	return *n < 16 || (*n & (*n - 1)) == 0;
+}
+
+std::atomic<uint64_t> g_eventWaits{0};
+std::atomic<uint64_t> g_eventSignals{0};
 
 /// The host handle naming `obj` (0 = nil). Every Metal object the guest sees is one
 /// of our RgfxResource wrappers.
@@ -191,7 +209,7 @@ uint32_t fillRenderPass(MTLRenderPassDescriptor *d, RgfxRenderPassDesc *desc,
 	RgfxIdSpace *_ids;             // borrowed: the device id space, for cb ids
 	NSUInteger _maxCount;
 	NSString *_queueLabel;
-	RgfxReplyReader *_ownedReader; // owned (adoptReplyReader:): the per-queue completion reader
+	std::shared_ptr<RgfxReplyReader> _ownedReader; // adoptReplyReader:'s per-queue completion reader
 	dispatch_queue_t _submissionQueue; // kept for -submissionQueue (setSubmissionQueue: SPI)
 	dispatch_queue_t _completionQueue; // kept for -completionQueue (setCompletionQueue: SPI)
 	NSUInteger _gpuPriority;           // kept for -GPUPriority (setGPUPriority: SPI)
@@ -268,23 +286,21 @@ uint32_t fillRenderPass(MTLRenderPassDescriptor *d, RgfxRenderPassDesc *desc,
 
 - (void)adoptReplyReader:(RgfxReplyReader *)reader
 {
-	if (_ownedReader != nullptr && _ownedReader != reader) {
-		delete _ownedReader;
-	}
-	_ownedReader = reader;
+	if (_ownedReader.get() != reader)
+		_ownedReader.reset(reader);
 	self.replyReader = reader;
 }
 
-- (void)dealloc
+- (std::shared_ptr<RgfxReplyReader>)sharedReplyReader
 {
-	delete _ownedReader;
+	return _ownedReader;
 }
 
 // --- dispatch queues and priority (MTLCommandQueue SPI WindowServer sets) -----------
 // WindowServer hands its queues the dispatch queues Metal is to run submission and
 // completion work on, and a GPU priority. Our queue submits on the caller's thread and
-// completes on its reply reader's, and the host schedules every queue alike, so each is
-// kept and answered back, and changes nothing the queue does.
+// completes on the process's completion thread, and the host schedules every queue alike,
+// so each is kept and answered back, and changes nothing the queue does.
 
 - (void)setSubmissionQueue:(dispatch_queue_t)queue
 {
@@ -335,15 +351,23 @@ uint32_t fillRenderPass(MTLRenderPassDescriptor *d, RgfxRenderPassDesc *desc,
 	BOOL _committed;
 	BOOL _enqueued;
 	uint64_t _seqno;
-	MTLCommandBufferStatus _status;
+	// Written by the thread that delivers the completion, read by any: atomic.
+	std::atomic<MTLCommandBufferStatus> _status;
 	NSString *_cbLabel;
 	NSError *_cbError;
 	NSMutableArray *_completedHandlers;
 	NSMutableArray *_scheduledHandlers;
-	// Borrowed: the device's reader of the control completion ring, taken from the
-	// queue at commit. Null when the queue has no reader (a unit test driving the
-	// queue without one), in which case the buffer holds its seqno as before.
+	// The queue's completion-ring reader, taken at commit; null when the queue has none
+	// (a unit test driving the queue without one), in which case the buffer holds its
+	// seqno. `_readerHold` keeps a reader the queue owns alive while the buffer is in
+	// flight, though the queue may go first.
 	RgfxReplyReader *_reader;
+	std::shared_ptr<RgfxReplyReader> _readerHold;
+	// Entered at commit with a reader, left once the completion's handlers have run:
+	// what waitUntilCompleted waits on while the completion thread delivers. `_left`
+	// says it was left, so a buffer whose completion never came leaves it at dealloc.
+	dispatch_group_t _done;
+	std::atomic<bool> _left;
 	// The IOSurface copies this buffer writes, written back to their surfaces' pages
 	// when it completes (RgfxIOSurface.h).
 	std::vector<std::shared_ptr<void>> _surfaceWrites;
@@ -362,7 +386,7 @@ uint32_t fillRenderPass(MTLRenderPassDescriptor *d, RgfxRenderPassDesc *desc,
 	if (cb != nil) {
 		cb->_queue = queue;
 		cb->_retained = retained;
-		cb->_status = MTLCommandBufferStatusNotEnqueued;
+		cb->_status.store(MTLCommandBufferStatusNotEnqueued);
 		cb->_completedHandlers = [NSMutableArray array];
 		cb->_scheduledHandlers = [NSMutableArray array];
 		cb->_encoder = new RgfxEncoder(*ring, queue.rgfxObjId, cbObjId);
@@ -372,6 +396,10 @@ uint32_t fillRenderPass(MTLRenderPassDescriptor *d, RgfxRenderPassDesc *desc,
 
 - (void)dealloc
 {
+	// A group released while entered ends the process: one whose completion never came
+	// (its reader went first) is left here.
+	if (_done != nil && !_left.exchange(true))
+		dispatch_group_leave(_done);
 	delete _encoder;
 }
 
@@ -435,9 +463,8 @@ uint32_t fillRenderPass(MTLRenderPassDescriptor *d, RgfxRenderPassDesc *desc,
 {
 	// Ordering across command buffers is a later transport piece; record the intent.
 	_enqueued = YES;
-	if (_status == MTLCommandBufferStatusNotEnqueued) {
-		_status = MTLCommandBufferStatusEnqueued;
-	}
+	MTLCommandBufferStatus expected = MTLCommandBufferStatusNotEnqueued;
+	_status.compare_exchange_strong(expected, MTLCommandBufferStatusEnqueued);
 }
 
 - (void)commit
@@ -454,41 +481,49 @@ uint32_t fillRenderPass(MTLRenderPassDescriptor *d, RgfxRenderPassDesc *desc,
 	// Serialise the command-buffer header + op stream and post it on the queue's
 	// submission ring; `_seqno` is the submission the host's RgfxCbComplete carries.
 	_encoder->finish(&_seqno);
-	_status = MTLCommandBufferStatusCommitted;
+	_status.store(MTLCommandBufferStatusCommitted);
 
-	// Register with the device's completion-ring reader (if the queue has one) so the
+	// Register with the queue's completion-ring reader (if it has one) so the
 	// RGFX_EVT_CB_COMPLETE for `_seqno` fires this buffer's handlers, flips its status
 	// and wakes a waiter. The handler captures `self` strongly, so a committed buffer
 	// lives until its completion lands (as Metal retains an in-flight command buffer);
 	// the reader removes the one-shot handler when it fires. Without a reader the
-	// status stays Committed and the handlers are held, as before the reader landed.
-	_reader = _queue.replyReader;
+	// status stays Committed and the handlers are held.
+	RgfxCommandQueue *queue = _queue;
+	_reader = queue.replyReader;
 	if (_reader != nullptr) {
+		_readerHold = [queue sharedReplyReader];
+		_done = dispatch_group_create();
+		dispatch_group_enter(_done);
 		RgfxCmdBuffer *strongSelf = self;
 		_reader->expectCompletion(_seqno, [strongSelf](const RgfxCbComplete &m) {
-			[strongSelf rgfxDeliverCompletion:&m];
+			@autoreleasepool {
+				[strongSelf rgfxDeliverCompletion:&m];
+			}
 		});
 	}
 }
 
-// Delivers the host's completion for this command buffer: fires the scheduled then the
-// completed handlers (in the order added) with this buffer, records any error, and
-// flips the status so waitUntilCompleted wakes. We have no separate scheduled signal,
-// so the scheduled handlers fire here too (a completed buffer was scheduled).
+// Delivers the host's completion for this command buffer, on the thread that took it off
+// the ring (the completion thread, or a waiter where none drives the ring): records any
+// error, flips the status, then fires the scheduled then the completed handlers (in the
+// order added) with this buffer, and lets the waiters go. We have no separate scheduled
+// signal, so the scheduled handlers fire here too (a completed buffer was scheduled).
 - (void)rgfxDeliverCompletion:(const RgfxCbComplete *)msg
 {
+	t_delivering++;
 	// The surfaces this buffer wrote hold its results before anyone sees it complete.
 	rgfxIOSurfaceWriteBack(_surfaceWrites);
 	_surfaceWrites.clear();
 	if (msg->status == RGFX_CB_OK) {
-		_status = MTLCommandBufferStatusCompleted;
+		_status.store(MTLCommandBufferStatusCompleted);
 	} else {
 		// The host preserved the raw MTLCommandBufferError code behind the status; it
 		// travels back in the native command-buffer error domain for the guest.
 		_cbError = [NSError errorWithDomain:MTLCommandBufferErrorDomain
 		                               code:static_cast<NSInteger>(msg->error_code)
 		                           userInfo:nil];
-		_status = MTLCommandBufferStatusError;
+		_status.store(MTLCommandBufferStatusError);
 	}
 	for (MTLCommandBufferHandler block in _scheduledHandlers) {
 		block(self);
@@ -498,12 +533,21 @@ uint32_t fillRenderPass(MTLRenderPassDescriptor *d, RgfxRenderPassDesc *desc,
 		block(self);
 	}
 	[_completedHandlers removeAllObjects];
+	t_delivering--;
+	if (_done != nil && !_left.exchange(true))
+		dispatch_group_leave(_done);
+}
+
+- (BOOL)rgfxFinished
+{
+	MTLCommandBufferStatus status = _status.load();
+	return status == MTLCommandBufferStatusCompleted || status == MTLCommandBufferStatusError;
 }
 
 - (void)addCompletedHandler:(MTLCommandBufferHandler)block
 {
-	// Held until the completion ring's reader lands (documented stub); then invoked
-	// with this command buffer, in the order added.
+	// Invoked with this command buffer when its completion is delivered, in the order
+	// added (rgfxDeliverCompletion:).
 	if (block != nil) {
 		[_completedHandlers addObject:[block copy]];
 	}
@@ -526,31 +570,56 @@ uint32_t fillRenderPass(MTLRenderPassDescriptor *d, RgfxRenderPassDesc *desc,
 
 - (void)waitUntilCompleted
 {
-	// With a reader, pump the completion ring until this buffer's RGFX_EVT_CB_COMPLETE
-	// has flipped the status (the handler registered on commit). The host fills the
-	// ring asynchronously, so this blocks until it does, as Metal's does. Without a
-	// reader (a unit test without one, or before commit) there is nothing to wait on,
-	// so this returns at once.
+	// Blocks until this buffer's RGFX_EVT_CB_COMPLETE has been delivered: its status
+	// flipped and its handlers run, as Metal's does. Without a reader (a unit test
+	// without one, or before commit) there is nothing to wait on, so this returns at once.
 	if (_reader == nullptr) {
 		return;
 	}
-	while (_status != MTLCommandBufferStatusCompleted && _status != MTLCommandBufferStatusError) {
+	// Inside a completion's handlers, the delivering thread is this one: the group would
+	// never be left, so the ring is taken here.
+	bool delivering = t_delivering > 0 || RgfxCompletionThread::onCurrentThread();
+	while (![self rgfxFinished]) {
+		if (_reader->driven() && !delivering) {
+			// The completion thread takes the ring. A thread that ends (the process's
+			// context gone) leaves the reader undriven, so look again each second.
+			if (dispatch_group_wait(_done, dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC)) == 0)
+				return;
+			continue;
+		}
 		_reader->pump();
 	}
+	// Finished, perhaps on another thread that is still running the handlers.
+	if (!delivering)
+		dispatch_group_wait(_done, DISPATCH_TIME_FOREVER);
 }
 
 - (void)encodeWaitForEvent:(id<MTLEvent>)event value:(uint64_t)value
 {
-	// Command-buffer-scope event wait: no RgfxEncoder op / wire message in this slice
-	// (events are the sync slice). Follow-up: add the command-buffer-scope event ops.
-	(void)event;
-	(void)value;
+	// Command-buffer-scope event waits are not carried yet: no op names one, and no
+	// command buffer signals an event (encodeSignalEvent: below), so the buffer runs
+	// without waiting. Said in the log, so work that relied on the wait is seen.
+	uint64_t n = 0;
+	if (logEventOp(g_eventWaits, &n)) {
+		NSLog(@"RGFX: command buffer 0x%llx: encodeWaitForEvent 0x%llx value %llu is not "
+		      @"carried (no command-buffer event op yet); the buffer runs without the wait "
+		      @"(unhonoured waits so far: %llu)",
+		      (unsigned long long)[self rgfxObjId], (unsigned long long)rgfxId(event),
+		      (unsigned long long)value, (unsigned long long)(n + 1));
+	}
 }
 
 - (void)encodeSignalEvent:(id<MTLEvent>)event value:(uint64_t)value
 {
-	(void)event;
-	(void)value;
+	// Not carried yet either: a listener or a wait for this value never fires. Logged.
+	uint64_t n = 0;
+	if (logEventOp(g_eventSignals, &n)) {
+		NSLog(@"RGFX: command buffer 0x%llx: encodeSignalEvent 0x%llx value %llu is not "
+		      @"carried (no command-buffer event op yet); nothing waiting for it wakes "
+		      @"(unhonoured signals so far: %llu)",
+		      (unsigned long long)[self rgfxObjId], (unsigned long long)rgfxId(event),
+		      (unsigned long long)value, (unsigned long long)(n + 1));
+	}
 }
 
 - (void)presentDrawable:(id<MTLDrawable>)drawable
@@ -583,7 +652,7 @@ uint32_t fillRenderPass(MTLRenderPassDescriptor *d, RgfxRenderPassDesc *desc,
 }
 - (MTLCommandBufferStatus)status
 {
-	return _status;
+	return _status.load();
 }
 - (NSError *)error
 {

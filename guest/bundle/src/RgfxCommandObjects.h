@@ -27,12 +27,15 @@
  * base and so lives in its own bundle-only file; these wrappers do not, and are built
  * into both the unit test and the bundle.
  *
- * LIFECYCLE BITS THAT WAIT ON THE RING TRANSPORT (documented stubs, as slice 0's
- * device does): the completion ring's reader is a later transport piece, so
- * `addCompletedHandler:`/`addScheduledHandler:` hold their blocks and `commit`
- * records the submission seqno; the handlers fire and `waitUntilCompleted`/
- * `waitUntilScheduled` return once that reader lands. `presentDrawable:` and the
- * command-buffer-scope event ops wait on their own later pieces (see the .mm).
+ * COMPLETION. `commit` registers the buffer's submission seqno with its queue's
+ * completion-ring reader (RgfxReplyReader). When the host's RGFX_EVT_CB_COMPLETE for
+ * it is taken off the ring, the buffer's status flips and its scheduled then completed
+ * handlers run, in the ring's order. The process's completion thread
+ * (RgfxCompletionThread) takes it, whether or not anything waits for the buffer;
+ * `waitUntilCompleted` blocks until the thread has run the handlers, and takes the ring
+ * itself only where no thread drives it (a unit test) or inside a handler.
+ * `presentDrawable:` and the command-buffer-scope event ops wait on their own later
+ * pieces (see the .mm).
  *
  * Our own ObjC++; the only Apple names are the real Metal protocols these conform to.
  */
@@ -45,6 +48,8 @@
 #import "RgfxResource.h"
 
 #ifdef __cplusplus
+#include <memory>
+
 class RgfxSerializer;
 class RgfxRingWriter;
 class RgfxIdSpace;
@@ -93,10 +98,18 @@ NS_ASSUME_NONNULL_BEGIN
 @property(nonatomic, nullable) RgfxReplyReader *replyReader;
 
 /// Adopts `reader` as this queue's completion-ring reader and takes ownership of it: the
-/// queue deletes it on dealloc and sets `replyReader` to it. The host posts a queue's
+/// queue shares it with its in-flight command buffers and the completion thread
+/// (sharedReplyReader), and sets `replyReader` to it. The host posts a queue's
 /// command-buffer completions on the queue's own completion ring (the ring loop), so the
 /// device creates a reader over that ring and hands it here.
 - (void)adoptReplyReader:(nullable RgfxReplyReader *)reader;
+
+#ifdef __cplusplus
+/// The reader adoptReplyReader: took, shared: the completion thread drives it, and each
+/// command buffer committed on the queue holds it until its completion. Empty for a
+/// borrowed reader (the `replyReader` a unit test sets).
+- (std::shared_ptr<RgfxReplyReader>)sharedReplyReader;
+#endif
 
 @end
 

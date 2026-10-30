@@ -16,6 +16,11 @@
  *   - Region blocks past RGFX_CONTEXT_ALLOCATIONS_OFFSET (rings, Shared buffers and heaps,
  *     surfaces), from a first-fit allocator over a table sorted by offset, each owned by the
  *     client that asked; the client's are freed at its close.
+ *   - The completion rings of the clients' queues, watched: the device raises its one vector
+ *     for a queue's completion as for the control ring's, and the framebuffer's work loop then
+ *     calls queueInterrupt, which wakes the client of each ring whose producer moved and
+ *     holds records the client has not taken. Each ring's header is mapped into the kernel
+ *     at its queue's create; the scan takes only the watch table's lock.
  *   - The object lifecycle, on the framebuffer's control ring: creates and destroys, a
  *     QUEUE_CREATE answered once the host has the queue's ring pair (so the process writes it at
  *     once), and a CONTEXT_CLOSE answered once the host has dropped the context's objects.
@@ -24,6 +29,7 @@
  */
 
 #include "RgfxAccelerator.hpp"
+#include "RgfxAcceleratorUserClient.hpp"
 #include "ReimsGraphics.hpp"
 
 #include <IOKit/IOLib.h>
@@ -32,6 +38,11 @@
 namespace {
 // The most blocks handed out at once.
 constexpr UInt32 kMaxBlocks = 16384;
+// The most command queues watched at once, over every client.
+constexpr UInt32 kMaxWatched = 2048;
+// A ring header's fields (RgfxRingHeader).
+constexpr UInt32 kRingProducer = 0x00;
+constexpr UInt32 kRingConsumer = 0x40;
 // How long a QUEUE_CREATE and a CONTEXT_CLOSE wait for their answers: the host takes the
 // control ring in order, behind whatever pipeline compiles were posted before them.
 constexpr UInt32 kQueueAnswerMs = 30000;
@@ -64,8 +75,14 @@ struct ContextState {
 	// Under contextLock: the client holding each chunk of the texture resource ids, null where
 	// none does.
 	const void *idChunkOwners[RGFX_RESOURCE_ID_CHUNKS];
+	// Under watchLock: the watched completion rings, and whether the framebuffer calls
+	// queueInterrupt yet.
+	IOLock *watchLock;
+	RgfxWatchedRing *watched;
+	UInt32 watchedCount;
+	bool hooked;
 };
-ContextState state = {nullptr, 0, 0, 1, nullptr, 0, 0, 0, {}};
+ContextState state = {nullptr, 0, 0, 1, nullptr, 0, 0, 0, {}, nullptr, nullptr, 0, false};
 IOLock *&contextLock = state.contextLock;
 UInt32 &slotsHeld = state.slotsHeld;
 UInt32 &nextSlot = state.nextSlot;
@@ -75,6 +92,22 @@ UInt32 &blockCount = state.blockCount;
 UInt64 &blocksStart = state.blocksStart;
 UInt64 &blocksEnd = state.blocksEnd;
 const void *(&idChunkOwners)[RGFX_RESOURCE_ID_CHUNKS] = state.idChunkOwners;
+IOLock *&watchLock = state.watchLock;
+RgfxWatchedRing *&watched = state.watched;
+UInt32 &watchedCount = state.watchedCount;
+bool &hooked = state.hooked;
+
+UInt64 loadHeader64(const volatile UInt8 *header, UInt32 field)
+{
+	return __atomic_load_n(reinterpret_cast<const volatile UInt64 *>(header + field),
+	                       __ATOMIC_ACQUIRE);
+}
+
+void queueInterruptHook(OSObject *target)
+{
+	if (RgfxAccelerator *accel = OSDynamicCast(RgfxAccelerator, target))
+		accel->queueInterrupt();
+}
 } // namespace
 
 bool RgfxAccelerator::startContexts()
@@ -87,11 +120,18 @@ bool RgfxAccelerator::startContexts()
 	}
 	// The first opener makes the state; one that loses the race frees what it made.
 	IOLock *lock = IOLockAlloc();
+	IOLock *wlock = IOLockAlloc();
 	RgfxBlock *table = static_cast<RgfxBlock *>(IOMalloc(sizeof(RgfxBlock) * kMaxBlocks));
+	RgfxWatchedRing *rings =
+	    static_cast<RgfxWatchedRing *>(IOMalloc(sizeof(RgfxWatchedRing) * kMaxWatched));
 	RgfxBlock *expected = nullptr;
-	if (lock && table && __atomic_compare_exchange_n(&blocks, &expected, table, false,
-	                                                 __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+	if (lock && wlock && table && rings &&
+	    __atomic_compare_exchange_n(&blocks, &expected, table, false, __ATOMIC_ACQ_REL,
+	                                __ATOMIC_ACQUIRE)) {
 		bzero(table, sizeof(RgfxBlock) * kMaxBlocks);
+		bzero(rings, sizeof(RgfxWatchedRing) * kMaxWatched);
+		watched = rings;
+		watchLock = wlock;
 		blocksStart = RGFX_CONTEXT_ALLOCATIONS_OFFSET;
 		blocksEnd = (regionSize - RGFX_CURSOR_SPAN) & ~(kPage - 1);
 		__atomic_store_n(&contextLock, lock, __ATOMIC_RELEASE);
@@ -101,8 +141,12 @@ bool RgfxAccelerator::startContexts()
 	}
 	if (lock)
 		IOLockFree(lock);
+	if (wlock)
+		IOLockFree(wlock);
 	if (table)
 		IOFree(table, sizeof(RgfxBlock) * kMaxBlocks);
+	if (rings)
+		IOFree(rings, sizeof(RgfxWatchedRing) * kMaxWatched);
 	// Another opener is making it: wait for it to publish.
 	while (expected && !__atomic_load_n(&contextLock, __ATOMIC_ACQUIRE))
 		IOSleep(1);
@@ -309,6 +353,110 @@ bool RgfxAccelerator::ownsRange(const void *owner, UInt64 offset, UInt64 length)
 	}
 	IOLockUnlock(contextLock);
 	return owned;
+}
+
+// MARK: - The queues' completion rings
+
+IOReturn RgfxAccelerator::watchQueue(RgfxAcceleratorUserClient *client, UInt64 objId,
+                                     UInt64 completeOffset)
+{
+	if (!contextLock || !region || completeOffset % 8 ||
+	    completeOffset + RGFX_RING_HEADER_SIZE > regionSize)
+		return kIOReturnBadArgument;
+	// The header's page or pages, write-back as the bundle maps the region.
+	UInt64 page = completeOffset & ~(kPage - 1);
+	UInt64 length = alignUp(completeOffset + RGFX_RING_HEADER_SIZE, kPage) - page;
+	IOMemoryMap *map = region->createMappingInTask(kernel_task, 0,
+	                                               kIOMapAnywhere | kIOMapCopybackCache, page,
+	                                               length);
+	if (!map)
+		return kIOReturnNoMemory;
+	volatile UInt8 *header =
+	    reinterpret_cast<volatile UInt8 *>(map->getVirtualAddress()) + (completeOffset - page);
+	IOLockLock(watchLock);
+	if (watchedCount == kMaxWatched) {
+		IOLockUnlock(watchLock);
+		map->release();
+		IOLog("RgfxAccelerator: queue 0x%llx: every watched ring is taken\n", objId);
+		return kIOReturnNoResources;
+	}
+	RgfxWatchedRing &w = watched[watchedCount++];
+	w.client = client;
+	w.objId = objId;
+	w.map = map;
+	w.header = header;
+	w.lastProducer = loadHeader64(header, kRingProducer);
+	bool hook = !hooked;
+	hooked = true;
+	IOLockUnlock(watchLock);
+	// The first watched ring has the framebuffer call queueInterrupt from now on.
+	if (hook) {
+		ReimsGraphics *fb = copyFramebuffer();
+		if (fb) {
+			fb->setQueueInterrupt(this, &queueInterruptHook);
+			fb->release();
+		} else {
+			IOLockLock(watchLock);
+			hooked = false;
+			IOLockUnlock(watchLock);
+		}
+	}
+	return kIOReturnSuccess;
+}
+
+void RgfxAccelerator::unwatchQueue(RgfxAcceleratorUserClient *client, UInt64 objId)
+{
+	if (!watchLock)
+		return;
+	IOMemoryMap *map = nullptr;
+	IOLockLock(watchLock);
+	for (UInt32 i = 0; i < watchedCount; i++) {
+		if (watched[i].client == client && watched[i].objId == objId) {
+			map = watched[i].map;
+			watched[i] = watched[--watchedCount];
+			break;
+		}
+	}
+	IOLockUnlock(watchLock);
+	if (map)
+		map->release();
+}
+
+void RgfxAccelerator::unwatchClient(RgfxAcceleratorUserClient *client)
+{
+	if (!watchLock)
+		return;
+	IOLockLock(watchLock);
+	for (UInt32 i = 0; i < watchedCount;) {
+		if (watched[i].client == client) {
+			// Released under the lock: the scan never meets a ring whose map is gone.
+			watched[i].map->release();
+			watched[i] = watched[--watchedCount];
+		} else {
+			i++;
+		}
+	}
+	IOLockUnlock(watchLock);
+}
+
+// On the framebuffer's work loop, once per pass over the control ring: the device raised its
+// vector, for a completion on some queue's ring or the control ring's. A ring whose producer
+// moved since the last look and that holds records its client has not taken wakes the client.
+void RgfxAccelerator::queueInterrupt()
+{
+	if (!watchLock)
+		return;
+	IOLockLock(watchLock);
+	for (UInt32 i = 0; i < watchedCount; i++) {
+		RgfxWatchedRing &w = watched[i];
+		UInt64 producer = loadHeader64(w.header, kRingProducer);
+		if (producer == w.lastProducer)
+			continue;
+		w.lastProducer = producer;
+		if (producer != loadHeader64(w.header, kRingConsumer))
+			w.client->wakeCompletions();
+	}
+	IOLockUnlock(watchLock);
 }
 
 // MARK: - The object lifecycle

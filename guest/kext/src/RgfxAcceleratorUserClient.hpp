@@ -39,6 +39,11 @@ public:
 	IOReturn clientDied() override;
 	void free() override;
 
+	// Wakes the client's completion waiters (kRgfxAccelMethodWaitCompletions): a completion
+	// ring of one of its queues holds records it has not taken. Any thread, no lock of the
+	// client's held but its own.
+	void wakeCompletions();
+
 	// Map the device region (kRgfxAccelMemoryRegion) into the client task.
 	IOReturn clientMemoryForType(UInt32 type, IOOptionBits *options,
 	                             IOMemoryDescriptor **memory) override;
@@ -60,6 +65,7 @@ private:
 	// release at the client's close or death (its queues, then the context, then its blocks).
 	IOReturn contextMethod(uint32_t selector, IOExternalMethodArguments *arguments);
 	IOReturn submitMethod(IOExternalMethodArguments *arguments);
+	IOReturn waitCompletionsMethod(IOExternalMethodArguments *arguments);
 	void releaseContext();
 
 	static const UInt32 kMaxQueues = 256;
@@ -69,6 +75,12 @@ private:
 	UInt32 queueCount;
 	UInt64 queues[kMaxQueues];
 	IOLock *queueLock;
+
+	// Under completionLock: the count wakeCompletions raises, which a waiter sleeps on, and
+	// whether the context is released (every waiter then returns).
+	IOLock *completionLock;
+	UInt64 completionCount;
+	bool completionsClosed;
 
 	task_t task;
 	RgfxAccelerator *owner;

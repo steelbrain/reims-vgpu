@@ -80,16 +80,20 @@ struct TestRing {
 	// ring has no room.
 	uint64_t produced = 0; // the host's producer count, for host -> guest rings
 
+	// Atomic, as the host's are: a reader on another thread (the completion thread)
+	// publishes `consumer` and reads `producer` meanwhile.
 	uint64_t consumerCount()
 	{
-		uint64_t v;
-		std::memcpy(&v, mem.data() + __builtin_offsetof(RgfxRingHeader, consumer), 8);
-		return v;
+		return __atomic_load_n(reinterpret_cast<uint64_t *>(
+		                           mem.data() + __builtin_offsetof(RgfxRingHeader, consumer)),
+		                       __ATOMIC_ACQUIRE);
 	}
 
 	void setProducer(uint64_t v)
 	{
-		std::memcpy(mem.data() + __builtin_offsetof(RgfxRingHeader, producer), &v, 8);
+		__atomic_store_n(reinterpret_cast<uint64_t *>(mem.data() +
+		                                              __builtin_offsetof(RgfxRingHeader, producer)),
+		                 v, __ATOMIC_RELEASE);
 	}
 
 	bool postFromHost(const void *msg, uint32_t size)

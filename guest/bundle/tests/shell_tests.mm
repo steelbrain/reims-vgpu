@@ -40,6 +40,13 @@
 #include <vector>
 #import "RgfxCommandObjects.h"
 
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
+#include <string>
+#include <thread>
+
+#include "RgfxCompletionThread.hpp"
 #include "RgfxObjectModel.hpp"
 #include "RgfxRegion.hpp"
 #include "RgfxReplyReader.hpp"
@@ -1560,6 +1567,347 @@ void test_reply_reader_event()
 	} // @autoreleasepool: ev drains here, while reader still lives
 }
 
+// --- the completion thread ---------------------------------------------------
+
+// The kext's side of the completion thread, in user space: the wake count the thread
+// sleeps on (kRgfxAccelMethodWaitCompletions), and the host's post, which raises the
+// vector where the ring is armed and so wakes the thread (queueInterrupt).
+struct FakeKext {
+	std::mutex lock;
+	std::condition_variable changed;
+	uint64_t count = 0;
+	bool closed = false;
+	int waits = 0;
+
+	void wake()
+	{
+		std::lock_guard<std::mutex> hold(lock);
+		count++;
+		changed.notify_all();
+	}
+
+	void close()
+	{
+		std::lock_guard<std::mutex> hold(lock);
+		closed = true;
+		changed.notify_all();
+	}
+
+	int waitCount()
+	{
+		std::lock_guard<std::mutex> hold(lock);
+		return waits;
+	}
+
+	static RgfxCompletionThread::WaitResult wait(void *context, uint64_t last, uint64_t *now)
+	{
+		FakeKext *k = static_cast<FakeKext *>(context);
+		std::unique_lock<std::mutex> hold(k->lock);
+		k->waits++;
+		k->changed.wait(hold, [&] { return k->count != last || k->closed; });
+		*now = k->count;
+		return k->closed ? RgfxCompletionThread::kStop : RgfxCompletionThread::kWoke;
+	}
+};
+
+uint32_t ringArmed(TestRing &ring)
+{
+	return __atomic_load_n(reinterpret_cast<uint32_t *>(ring.mem.data() +
+	                                                    __builtin_offsetof(RgfxRingHeader, armed)),
+	                       __ATOMIC_SEQ_CST);
+}
+
+// The host's post (ring.rs Producer::post): the record published, a full fence, then
+// `armed` read and cleared, the vector raised where it was set.
+void hostPost(TestRing &ring, FakeKext &kext, const void *msg, uint32_t size)
+{
+	CHECK(ring.postFromHost(msg, size));
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	uint32_t *armed = reinterpret_cast<uint32_t *>(ring.mem.data() +
+	                                               __builtin_offsetof(RgfxRingHeader, armed));
+	if (__atomic_exchange_n(armed, 0u, __ATOMIC_SEQ_CST) == 1)
+		kext.wake();
+}
+
+RgfxCbComplete cbComplete(uint64_t seqno, uint64_t cbObjId)
+{
+	RgfxCbComplete done = {};
+	done.header.type = RGFX_EVT_CB_COMPLETE;
+	done.header.size = sizeof(done);
+	done.header.seqno = seqno;
+	done.cb_obj_id = cbObjId;
+	done.status = RGFX_CB_OK;
+	return done;
+}
+
+// Waits up to 5 s for `pred`, polling.
+template <typename F> bool eventually(F pred)
+{
+	for (int i = 0; i < 5000; i++) {
+		if (pred())
+			return true;
+		std::this_thread::sleep_for(std::chrono::milliseconds(1));
+	}
+	return pred();
+}
+
+// A queue over its own submission and completion rings, as the device makes one, with an
+// owned reader the completion thread can drive.
+struct QueueFixture {
+	TestRing control{0x8000};
+	RgfxRingWriter controlWriter{control.base(), control.dataSize, RGFX_CONTROL_RING_ID,
+	                             TestRing::doorbell, nullptr};
+	RgfxIdSpace ids;
+	RgfxSerializer ser{controlWriter, ids};
+	TestRing submit{0x8000};
+	RgfxRingWriter submitWriter{submit.base(), submit.dataSize, 1, TestRing::doorbell, nullptr};
+	TestRing completion{0x8000};
+	RgfxCommandQueue *queue = nil;
+
+	QueueFixture()
+	{
+		control.setConsumerIdle(1);
+		submit.setConsumerIdle(1);
+		queue = [RgfxCommandQueue queueWithSubmitRing:&submitWriter
+		                                 submitOffset:0
+		                               completeOffset:0
+		                             completeDataSize:0
+		                                          ids:&ids
+		                                     maxCount:0
+		                                       device:nil
+		                                   serializer:&ser];
+		[queue adoptReplyReader:new RgfxReplyReader(completion.base(), completion.dataSize)];
+	}
+
+	// The submission seqno of the next command buffer committed on the queue.
+	uint64_t nextSeqno()
+	{
+		RgfxMsgHeader h = {};
+		std::vector<uint8_t> bytes;
+		CHECK(submit.next(&h, &bytes));
+		CHECK(h.type == RGFX_CMD_COMMAND_BUFFER);
+		return h.seqno;
+	}
+};
+
+// armAndCheck sets the ring's `armed` and says whether records wait; a ringless reader
+// has nothing to arm.
+void test_reply_reader_arm()
+{
+	RgfxReplyReader ringless;
+	CHECK(!ringless.armAndCheck());
+	TestRing ring(0x1000);
+	RgfxReplyReader reader(ring.base(), ring.dataSize);
+	CHECK(!reader.driven());
+	CHECK(!reader.armAndCheck());
+	CHECK(ringArmed(ring) == 1);
+	RgfxCbComplete done = cbComplete(7, 1);
+	CHECK(ring.postFromHost(&done, sizeof(done)));
+	CHECK(reader.armAndCheck()); // a record waits: pump before sleeping
+	reader.pump();
+	CHECK(!reader.armAndCheck());
+	reader.setDriven(true);
+	CHECK(reader.driven());
+}
+
+// With nobody waiting, the completion thread runs each command buffer's scheduled then
+// completed handlers as the host posts its completion, in the ring's order, on its own
+// thread, and leaves the ring drained and armed.
+void test_completion_thread_runs_handlers()
+{
+	@autoreleasepool {
+	QueueFixture f;
+	FakeKext *kext = new FakeKext(); // outlives the thread, which may sleep in it
+	RgfxCompletionThread thread(&FakeKext::wait, kext);
+	thread.add([f.queue sharedReplyReader]);
+	CHECK(![f.queue sharedReplyReader]->driven()); // not started: the waiters pump
+	CHECK(thread.start());
+	CHECK(thread.running());
+	CHECK([f.queue sharedReplyReader]->driven());
+	CHECK(ringArmed(f.completion) == 1);
+	CHECK(eventually([&] { return kext->waitCount() >= 1; })); // asleep in the kext
+
+	std::mutex lock;
+	std::vector<std::string> order;
+	__block std::mutex *orderLock = &lock;
+	__block std::vector<std::string> *orderLog = &order;
+	__block int offThread = 0;
+	dispatch_semaphore_t last = dispatch_semaphore_create(0);
+	NSMutableArray<id<MTLCommandBuffer>> *cbs = [NSMutableArray array];
+	std::vector<uint64_t> seqnos;
+	for (int i = 0; i < 3; i++) {
+		id<MTLCommandBuffer> cb = [f.queue commandBuffer];
+		std::string n = std::to_string(i);
+		[cb addScheduledHandler:^(id<MTLCommandBuffer> done) {
+			(void)done;
+			std::lock_guard<std::mutex> hold(*orderLock);
+			orderLog->push_back("s" + n);
+			if (!RgfxCompletionThread::onCurrentThread())
+				offThread++;
+		}];
+		[cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+			std::lock_guard<std::mutex> hold(*orderLock);
+			orderLog->push_back("c" + n + (done.status == MTLCommandBufferStatusCompleted ? "" : "!"));
+			if (!RgfxCompletionThread::onCurrentThread())
+				offThread++;
+			if (n == "2")
+				dispatch_semaphore_signal(last);
+		}];
+		[cb commit];
+		[cbs addObject:cb];
+		seqnos.push_back(f.nextSeqno());
+	}
+	// The first completion wakes the thread; the next two land while it may be busy, and
+	// are taken by the same pass or the next.
+	for (int i = 0; i < 3; i++) {
+		RgfxCbComplete done = cbComplete(seqnos[i], ((RgfxResource *)cbs[i]).rgfxObjId);
+		hostPost(f.completion, *kext, &done, sizeof(done));
+	}
+	CHECK(dispatch_semaphore_wait(last, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC)) == 0);
+	{
+		std::lock_guard<std::mutex> hold(lock);
+		std::vector<std::string> want = {"s0", "c0", "s1", "c1", "s2", "c2"};
+		CHECK(order == want);
+		CHECK(offThread == 0);
+	}
+	for (id<MTLCommandBuffer> cb in cbs)
+		CHECK(cb.status == MTLCommandBufferStatusCompleted);
+	CHECK(eventually([&] { return f.completion.consumerCount() == f.completion.produced; }));
+	CHECK(eventually([&] { return ringArmed(f.completion) == 1; })); // armed for the next
+
+	// A waiter after the fact returns at once; the handlers ran once.
+	[cbs[0] waitUntilCompleted];
+	{
+		std::lock_guard<std::mutex> hold(lock);
+		CHECK(order.size() == 6);
+	}
+	kext->close();
+	CHECK(eventually([&] { return !thread.running(); }));
+	}
+}
+
+// waitUntilCompleted on a driven reader blocks until the thread delivers, and the
+// handlers run once, before the wait returns.
+void test_wait_with_the_completion_thread()
+{
+	@autoreleasepool {
+	QueueFixture f;
+	FakeKext *kext = new FakeKext();
+	RgfxCompletionThread thread(&FakeKext::wait, kext);
+	CHECK(thread.start());
+	thread.add([f.queue sharedReplyReader]);
+	CHECK([f.queue sharedReplyReader]->driven());
+
+	std::atomic<int> fired{0};
+	std::atomic<int> *firedp = &fired;
+	id<MTLCommandBuffer> cb = [f.queue commandBuffer];
+	[cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+		(void)done;
+		std::this_thread::sleep_for(std::chrono::milliseconds(20)); // the waiter must outwait it
+		(*firedp)++;
+	}];
+	[cb commit];
+	uint64_t seqno = f.nextSeqno();
+	uint64_t cbObjId = ((RgfxResource *)cb).rgfxObjId;
+	TestRing *ring = &f.completion;
+	std::thread host([ring, kext, seqno, cbObjId] {
+		std::this_thread::sleep_for(std::chrono::milliseconds(50));
+		RgfxCbComplete done = cbComplete(seqno, cbObjId);
+		hostPost(*ring, *kext, &done, sizeof(done));
+	});
+	[cb waitUntilCompleted];
+	CHECK(fired.load() == 1); // the handler ran before the wait returned
+	CHECK(cb.status == MTLCommandBufferStatusCompleted);
+	host.join();
+	[cb waitUntilCompleted];
+	CHECK(fired.load() == 1); // and only once
+
+	// A handler waiting for a later buffer, on the completion thread: it takes the ring
+	// itself, so neither hangs.
+	id<MTLCommandBuffer> first = [f.queue commandBuffer];
+	id<MTLCommandBuffer> second = [f.queue commandBuffer];
+	std::atomic<int> nested{0};
+	std::atomic<int> *nestedp = &nested;
+	dispatch_semaphore_t both = dispatch_semaphore_create(0);
+	[first addCompletedHandler:^(id<MTLCommandBuffer> done) {
+		(void)done;
+		[second waitUntilCompleted];
+		*nestedp = second.status == MTLCommandBufferStatusCompleted ? 1 : 2;
+		dispatch_semaphore_signal(both);
+	}];
+	[first commit];
+	uint64_t s1 = f.nextSeqno();
+	[second commit];
+	uint64_t s2 = f.nextSeqno();
+	RgfxCbComplete d1 = cbComplete(s1, ((RgfxResource *)first).rgfxObjId);
+	hostPost(f.completion, *kext, &d1, sizeof(d1));
+	std::this_thread::sleep_for(std::chrono::milliseconds(20));
+	RgfxCbComplete d2 = cbComplete(s2, ((RgfxResource *)second).rgfxObjId);
+	hostPost(f.completion, *kext, &d2, sizeof(d2));
+	CHECK(dispatch_semaphore_wait(both, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC)) == 0);
+	CHECK(nested.load() == 1);
+	[second waitUntilCompleted];
+	kext->close();
+	CHECK(eventually([&] { return !thread.running(); }));
+	}
+}
+
+// Once the kext ends the wait (the process's context is gone) or the thread is
+// destroyed, the readers go undriven, and waitUntilCompleted takes the ring itself.
+void test_completion_thread_stops()
+{
+	@autoreleasepool {
+	QueueFixture f;
+	FakeKext *kext = new FakeKext();
+	RgfxCompletionThread thread(&FakeKext::wait, kext);
+	CHECK(thread.start());
+	thread.add([f.queue sharedReplyReader]);
+	CHECK([f.queue sharedReplyReader]->driven());
+	kext->close();
+	CHECK(eventually([&] { return !thread.running(); }));
+	CHECK(![f.queue sharedReplyReader]->driven());
+
+	__block int fired = 0;
+	id<MTLCommandBuffer> cb = [f.queue commandBuffer];
+	[cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+		(void)done;
+		fired++;
+	}];
+	[cb commit];
+	RgfxCbComplete done = cbComplete(f.nextSeqno(), ((RgfxResource *)cb).rgfxObjId);
+	CHECK(f.completion.postFromHost(&done, sizeof(done)));
+	[cb waitUntilCompleted]; // pumps: nothing else takes the ring
+	CHECK(fired == 1);
+	CHECK(cb.status == MTLCommandBufferStatusCompleted);
+
+	// A thread destroyed while it sleeps lets its readers go at once.
+	QueueFixture g;
+	FakeKext *kext2 = new FakeKext();
+	{
+		RgfxCompletionThread doomed(&FakeKext::wait, kext2);
+		CHECK(doomed.start());
+		doomed.add([g.queue sharedReplyReader]);
+		CHECK([g.queue sharedReplyReader]->driven());
+		CHECK(eventually([&] { return kext2->waitCount() >= 1; }));
+	}
+	CHECK(![g.queue sharedReplyReader]->driven());
+	kext2->wake(); // the detached thread wakes, sees it is stopping, and ends
+	}
+}
+
+// A buffer whose completion never comes, released with its queue and reader, ends
+// nothing (its completion group is left at dealloc).
+void test_uncompleted_buffer_releases()
+{
+	@autoreleasepool {
+		QueueFixture f;
+		id<MTLCommandBuffer> cb = [f.queue commandBuffer];
+		[cb commit];
+		(void)f.nextSeqno();
+		CHECK(cb.status == MTLCommandBufferStatusCommitted);
+	}
+}
+
 } // namespace
 
 int main()
@@ -1589,6 +1937,11 @@ int main()
 		test_reply_reader_completion();
 		test_reply_reader_reflection();
 		test_reply_reader_event();
+		test_reply_reader_arm();
+		test_completion_thread_runs_handlers();
+		test_wait_with_the_completion_thread();
+		test_completion_thread_stops();
+		test_uncompleted_buffer_releases();
 	}
 	std::printf("shell_tests: OK (%d checks)\n", g_checks);
 	return 0;
