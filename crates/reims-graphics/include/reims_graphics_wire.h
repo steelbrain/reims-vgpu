@@ -65,6 +65,244 @@
 // A compute pass's `dispatch_type` is set (else Metal's default stands).
 #define RGFX_COMPUTE_PASS_FLAG_DISPATCH_TYPE (1 << 0)
 
+// Op `COPY_BUFFER_TO_BUFFER` ([`RgfxOpCopyBufferToBuffer`]):
+// `copyFromBuffer:sourceOffset:toBuffer:destinationOffset:size:`.
+#define RGFX_OP_BLIT_COPY_BUFFER_TO_BUFFER 12288
+
+// Op `COPY_BUFFER_TO_TEXTURE` ([`RgfxOpCopyBufferToTexture`]):
+// `copyFromBuffer:sourceOffset:sourceBytesPerRow:sourceBytesPerImage:sourceSize:toTexture:destinationSlice:destinationLevel:destinationOrigin:`.
+#define RGFX_OP_BLIT_COPY_BUFFER_TO_TEXTURE 12289
+
+// Op `COPY_BUFFER_TO_TEXTURE_OPTIONS` ([`RgfxOpCopyBufferToTextureOptions`]): the
+// `:options:` form of the above.
+#define RGFX_OP_BLIT_COPY_BUFFER_TO_TEXTURE_OPTIONS 12290
+
+// Op `COPY_TEXTURE_TO_BUFFER` ([`RgfxOpCopyTextureToBuffer`]):
+// `copyFromTexture:sourceSlice:sourceLevel:sourceOrigin:sourceSize:toBuffer:destinationOffset:destinationBytesPerRow:destinationBytesPerImage:`.
+#define RGFX_OP_BLIT_COPY_TEXTURE_TO_BUFFER 12291
+
+// Op `COPY_TEXTURE_TO_BUFFER_OPTIONS` ([`RgfxOpCopyTextureToBufferOptions`]): the
+// `:options:` form of the above.
+#define RGFX_OP_BLIT_COPY_TEXTURE_TO_BUFFER_OPTIONS 12292
+
+// Op `COPY_TEXTURE_REGION` ([`RgfxOpCopyTextureRegion`]):
+// `copyFromTexture:sourceSlice:sourceLevel:sourceOrigin:sourceSize:toTexture:destinationSlice:destinationLevel:destinationOrigin:`.
+#define RGFX_OP_BLIT_COPY_TEXTURE_REGION 12293
+
+// Op `COPY_TEXTURE_REGION_OPTIONS` ([`RgfxOpCopyTextureRegionOptions`]): the
+// `:options:` form of the above (SPI).
+#define RGFX_OP_BLIT_COPY_TEXTURE_REGION_OPTIONS 12294
+
+// Op `COPY_TEXTURE_SLICES` ([`RgfxOpCopyTextureSlices`]):
+// `copyFromTexture:sourceSlice:sourceLevel:toTexture:destinationSlice:destinationLevel:sliceCount:levelCount:`.
+#define RGFX_OP_BLIT_COPY_TEXTURE_SLICES 12295
+
+// Op `COPY_INDIRECT_COMMAND_BUFFER` ([`RgfxOpCopyIndirectCommandBuffer`]):
+// `copyIndirectCommandBuffer:sourceRange:destination:destinationIndex:`.
+#define RGFX_OP_BLIT_COPY_INDIRECT_COMMAND_BUFFER 12296
+
+// Op `FILL_BUFFER` ([`RgfxOpFillBuffer`]): `fillBuffer:range:value:`.
+#define RGFX_OP_BLIT_FILL_BUFFER 12297
+
+// Op `FILL_BUFFER_PATTERN4` ([`RgfxOpFillBufferPattern4`]): `fillBuffer:range:pattern4:` (SPI).
+#define RGFX_OP_BLIT_FILL_BUFFER_PATTERN4 12298
+
+// Op `FILL_TEXTURE` ([`RgfxOpFillTexture`]): `fillTexture:level:slice:region:bytes:length:` (SPI).
+#define RGFX_OP_BLIT_FILL_TEXTURE 12299
+
+// Op `FILL_TEXTURE_COLOR` ([`RgfxOpFillTextureColor`]):
+// `fillTexture:level:slice:region:color:pixelFormat:` (SPI).
+#define RGFX_OP_BLIT_FILL_TEXTURE_COLOR 12300
+
+// Op `GENERATE_MIPMAPS` ([`RgfxOpGenerateMipmaps`]): `generateMipmapsForTexture:`.
+#define RGFX_OP_BLIT_GENERATE_MIPMAPS 12301
+
+// Op `INVALIDATE_COMPRESSED_TEXTURE` ([`RgfxOpInvalidateCompressedTexture`]):
+// `invalidateCompressedTexture:` (SPI).
+#define RGFX_OP_BLIT_INVALIDATE_COMPRESSED_TEXTURE 12302
+
+// Op `INVALIDATE_COMPRESSED_TEXTURE_SLICE` ([`RgfxOpInvalidateCompressedTextureSlice`]):
+// `invalidateCompressedTexture:slice:level:` (SPI).
+#define RGFX_OP_BLIT_INVALIDATE_COMPRESSED_TEXTURE_SLICE 12303
+
+// Op `OPTIMIZE_FOR_CPU` ([`RgfxOpOptimizeForCpu`]): `optimizeContentsForCPUAccess:`.
+#define RGFX_OP_BLIT_OPTIMIZE_FOR_CPU 12304
+
+// Op `OPTIMIZE_FOR_CPU_SLICE` ([`RgfxOpOptimizeForCpuSlice`]):
+// `optimizeContentsForCPUAccess:slice:level:`.
+#define RGFX_OP_BLIT_OPTIMIZE_FOR_CPU_SLICE 12305
+
+// Op `OPTIMIZE_FOR_GPU` ([`RgfxOpOptimizeForGpu`]): `optimizeContentsForGPUAccess:`.
+#define RGFX_OP_BLIT_OPTIMIZE_FOR_GPU 12306
+
+// Op `OPTIMIZE_FOR_GPU_SLICE` ([`RgfxOpOptimizeForGpuSlice`]):
+// `optimizeContentsForGPUAccess:slice:level:`.
+#define RGFX_OP_BLIT_OPTIMIZE_FOR_GPU_SLICE 12307
+
+// Op `OPTIMIZE_INDIRECT_COMMAND_BUFFER` ([`RgfxOpOptimizeIndirectCommandBuffer`]):
+// `optimizeIndirectCommandBuffer:withRange:`.
+#define RGFX_OP_BLIT_OPTIMIZE_INDIRECT_COMMAND_BUFFER 12308
+
+// Op `RESET_COMMANDS_IN_BUFFER` ([`RgfxOpResetCommandsInBuffer`]):
+// `resetCommandsInBuffer:withRange:`.
+#define RGFX_OP_BLIT_RESET_COMMANDS_IN_BUFFER 12309
+
+// Op `SYNCHRONIZE_RESOURCE` ([`RgfxOpSynchronizeResource`]): `synchronizeResource:`.
+#define RGFX_OP_BLIT_SYNCHRONIZE_RESOURCE 12310
+
+// Op `SYNCHRONIZE_TEXTURE` ([`RgfxOpSynchronizeTexture`]): `synchronizeTexture:slice:level:`.
+#define RGFX_OP_BLIT_SYNCHRONIZE_TEXTURE 12311
+
+// Op `UPDATE_FENCE` ([`RgfxOpUpdateFence`]): `updateFence:`.
+#define RGFX_OP_BLIT_UPDATE_FENCE 12312
+
+// Op `WAIT_FOR_FENCE` ([`RgfxOpWaitForFence`]): `waitForFence:`.
+#define RGFX_OP_BLIT_WAIT_FOR_FENCE 12313
+
+// The kind of resource a [`RgfxOpSynchronizeResource`] names, which picks the
+// resolver the host turns its `obj_id` into (`synchronizeResource:` takes any
+// `id<MTLResource>`: a buffer, a texture or an indirect command buffer).
+// A nil resource (`resource_kind` [`RGFX_BLIT_RESOURCE_NIL`]).
+#define RGFX_BLIT_RESOURCE_NIL 0
+
+// An `id<MTLBuffer>` resource.
+#define RGFX_BLIT_RESOURCE_BUFFER 1
+
+// An `id<MTLTexture>` resource.
+#define RGFX_BLIT_RESOURCE_TEXTURE 2
+
+// An `id<MTLIndirectCommandBuffer>` resource.
+#define RGFX_BLIT_RESOURCE_ICB 3
+
+// Where a `FILL_TEXTURE` op's fill bytes start in its body: right after the fixed
+// [`RgfxOpFillTexture`] head.
+#define RGFX_OP_BLIT_FILL_TEXTURE_BYTES_OFFSET 80
+
+// Op `SET_COMPUTE_PIPELINE_STATE` ([`RgfxOpSetComputePipelineState`]):
+// `setComputePipelineState:`.
+#define RGFX_OP_COMPUTE_SET_COMPUTE_PIPELINE_STATE 8192
+
+// Op `SET_BUFFER_OFFSET` ([`RgfxOpSetBufferOffset`]): `setBufferOffset:atIndex:`.
+#define RGFX_OP_COMPUTE_SET_BUFFER_OFFSET 8193
+
+// Op `SET_BUFFER_OFFSET_ATTRIBUTE_STRIDE` ([`RgfxOpSetBufferOffsetAttributeStride`]):
+// `setBufferOffset:attributeStride:atIndex:`.
+#define RGFX_OP_COMPUTE_SET_BUFFER_OFFSET_ATTRIBUTE_STRIDE 8194
+
+// Op `SET_BUFFERS` ([`RgfxOpSetBuffers`] then [`RgfxComputeBufferBinding`] records):
+// `setBuffers:offsets:withRange:`.
+#define RGFX_OP_COMPUTE_SET_BUFFERS 8195
+
+// Op `SET_BUFFERS_ATTRIBUTE_STRIDES` ([`RgfxOpSetBuffersAttributeStrides`] then
+// [`RgfxComputeBufferStrideBinding`] records):
+// `setBuffers:offsets:attributeStrides:withRange:`.
+#define RGFX_OP_COMPUTE_SET_BUFFERS_ATTRIBUTE_STRIDES 8196
+
+// Op `SET_TEXTURE` ([`RgfxOpSetTexture`]): `setTexture:atIndex:`.
+#define RGFX_OP_COMPUTE_SET_TEXTURE 8197
+
+// Op `SET_TEXTURES` ([`RgfxOpSetTextures`] then [`RgfxComputeTextureBinding`] records):
+// `setTextures:withRange:`.
+#define RGFX_OP_COMPUTE_SET_TEXTURES 8198
+
+// Op `SET_SAMPLER_STATES` ([`RgfxOpSetSamplerStates`] then
+// [`RgfxComputeSamplerBinding`] records): `setSamplerStates:withRange:`.
+#define RGFX_OP_COMPUTE_SET_SAMPLER_STATES 8199
+
+// Op `SET_SAMPLER_STATES_LOD_CLAMPS` ([`RgfxOpSetSamplerStatesLodClamps`] then
+// [`RgfxComputeSamplerLodBinding`] records):
+// `setSamplerStates:lodMinClamps:lodMaxClamps:withRange:`.
+#define RGFX_OP_COMPUTE_SET_SAMPLER_STATES_LOD_CLAMPS 8200
+
+// Op `SET_THREADGROUP_MEMORY_LENGTH` ([`RgfxOpSetThreadgroupMemoryLength`]):
+// `setThreadgroupMemoryLength:atIndex:`.
+#define RGFX_OP_COMPUTE_SET_THREADGROUP_MEMORY_LENGTH 8201
+
+// Op `SET_STAGE_IN_REGION` ([`RgfxOpSetStageInRegion`]): `setStageInRegion:`.
+#define RGFX_OP_COMPUTE_SET_STAGE_IN_REGION 8202
+
+// Op `SET_STAGE_IN_REGION_INDIRECT` ([`RgfxOpSetStageInRegionIndirect`]):
+// `setStageInRegionWithIndirectBuffer:indirectBufferOffset:`.
+#define RGFX_OP_COMPUTE_SET_STAGE_IN_REGION_INDIRECT 8203
+
+// Op `SET_IMAGEBLOCK_WIDTH` ([`RgfxOpSetImageblockWidth`]): `setImageblockWidth:height:`.
+#define RGFX_OP_COMPUTE_SET_IMAGEBLOCK_WIDTH 8204
+
+// Op `DISPATCH_THREADGROUPS` ([`RgfxOpDispatchThreadgroups`]):
+// `dispatchThreadgroups:threadsPerThreadgroup:`.
+#define RGFX_OP_COMPUTE_DISPATCH_THREADGROUPS 8205
+
+// Op `DISPATCH_THREADGROUPS_INDIRECT` ([`RgfxOpDispatchThreadgroupsIndirect`]):
+// `dispatchThreadgroupsWithIndirectBuffer:indirectBufferOffset:threadsPerThreadgroup:`.
+#define RGFX_OP_COMPUTE_DISPATCH_THREADGROUPS_INDIRECT 8206
+
+// Op `DISPATCH_THREADS` ([`RgfxOpDispatchThreads`]):
+// `dispatchThreads:threadsPerThreadgroup:`.
+#define RGFX_OP_COMPUTE_DISPATCH_THREADS 8207
+
+// Op `DISPATCH_THREADS_INDIRECT` ([`RgfxOpDispatchThreadsIndirect`]):
+// `dispatchThreadsWithIndirectBuffer:indirectBufferOffset:`.
+#define RGFX_OP_COMPUTE_DISPATCH_THREADS_INDIRECT 8208
+
+// Op `USE_RESOURCES` ([`RgfxOpUseResources`] then [`RgfxComputeResourceRef`] records):
+// `useResources:count:usage:`.
+#define RGFX_OP_COMPUTE_USE_RESOURCES 8209
+
+// Op `USE_HEAPS` ([`RgfxOpUseHeaps`] then [`RgfxComputeHeapBinding`] records):
+// `useHeaps:count:`.
+#define RGFX_OP_COMPUTE_USE_HEAPS 8210
+
+// Op `MEMORY_BARRIER_RESOURCES` ([`RgfxOpMemoryBarrierResources`] then
+// [`RgfxComputeResourceRef`] records): `memoryBarrierWithResources:count:`.
+#define RGFX_OP_COMPUTE_MEMORY_BARRIER_RESOURCES 8211
+
+// Op `MEMORY_BARRIER_SCOPE` ([`RgfxOpMemoryBarrierScope`]): `memoryBarrierWithScope:`.
+#define RGFX_OP_COMPUTE_MEMORY_BARRIER_SCOPE 8212
+
+// Op `UPDATE_FENCE` ([`RgfxOpUpdateFence`]): `updateFence:`.
+#define RGFX_OP_COMPUTE_UPDATE_FENCE 8213
+
+// Op `WAIT_FOR_FENCE` ([`RgfxOpWaitForFence`]): `waitForFence:`.
+#define RGFX_OP_COMPUTE_WAIT_FOR_FENCE 8214
+
+// Op `EXECUTE_COMMANDS_INDIRECT` ([`RgfxOpExecuteCommandsIndirect`]):
+// `executeCommandsInBuffer:indirectBuffer:indirectBufferOffset:`.
+#define RGFX_OP_COMPUTE_EXECUTE_COMMANDS_INDIRECT 8215
+
+// Op `EXECUTE_COMMANDS_IN_BUFFER` ([`RgfxOpExecuteCommandsInBuffer`]):
+// `executeCommandsInBuffer:withRange:`.
+#define RGFX_OP_COMPUTE_EXECUTE_COMMANDS_IN_BUFFER 8216
+
+// Op `ENCODE_START_IF` ([`RgfxOpEncodeStartIf`]):
+// `encodeStartIf:offset:comparison:referenceValue:` (SPI).
+#define RGFX_OP_COMPUTE_ENCODE_START_IF 8217
+
+// Op `ENCODE_START_WHILE` ([`RgfxOpEncodeStartWhile`]):
+// `encodeStartWhile:offset:comparison:referenceValue:` (SPI).
+#define RGFX_OP_COMPUTE_ENCODE_START_WHILE 8218
+
+// Op `ENCODE_START_ELSE`: `encodeStartElse` (SPI). No body.
+#define RGFX_OP_COMPUTE_ENCODE_START_ELSE 8219
+
+// Op `ENCODE_START_DO_WHILE`: `encodeStartDoWhile` (SPI). No body.
+#define RGFX_OP_COMPUTE_ENCODE_START_DO_WHILE 8220
+
+// Op `COMPRESSED_TEXTURE_REINTERPRETATION_FLUSH`:
+// `insertCompressedTextureReinterpretationFlush` (SPI). No body.
+#define RGFX_OP_COMPUTE_COMPRESSED_TEXTURE_REINTERPRETATION_FLUSH 8221
+
+// A [`RgfxComputeResourceRef`] that names nothing (a nil entry, `obj_id` ignored).
+#define RGFX_RESOURCE_KIND_NONE 0
+
+// A [`RgfxComputeResourceRef`] whose `obj_id` names a buffer.
+#define RGFX_RESOURCE_KIND_BUFFER 1
+
+// A [`RgfxComputeResourceRef`] whose `obj_id` names a texture.
+#define RGFX_RESOURCE_KIND_TEXTURE 2
+
+// A [`RgfxComputeResourceRef`] whose `obj_id` names an indirect command buffer.
+#define RGFX_RESOURCE_KIND_ICB 3
+
 // Op `SET_RENDER_PIPELINE_STATE` ([`RgfxOpSetRenderPipelineState`]):
 // `setRenderPipelineState:`.
 #define RGFX_OP_RENDER_SET_RENDER_PIPELINE_STATE 4096
@@ -94,6 +332,275 @@
 // Op `DRAW_INDEXED_PRIMITIVES` ([`RgfxOpDrawIndexedPrimitives`]):
 // `drawIndexedPrimitives:indexCount:indexType:indexBuffer:indexBufferOffset:`.
 #define RGFX_OP_RENDER_DRAW_INDEXED_PRIMITIVES 4103
+
+// Op `DRAW_PRIMITIVES_INSTANCES` ([`RgfxOpDrawPrimitivesInstances`]):
+// `drawPrimitives:vertexStart:vertexCount:instanceCount:`.
+#define RGFX_OP_RENDER_DRAW_PRIMITIVES_INSTANCES 4104
+
+// Op `DRAW_PRIMITIVES_BASE` ([`RgfxOpDrawPrimitivesBase`]):
+// `drawPrimitives:vertexStart:vertexCount:instanceCount:baseInstance:`.
+#define RGFX_OP_RENDER_DRAW_PRIMITIVES_BASE 4105
+
+// Op `DRAW_PRIMITIVES_INDIRECT` ([`RgfxOpDrawPrimitivesIndirect`]):
+// `drawPrimitives:indirectBuffer:indirectBufferOffset:`.
+#define RGFX_OP_RENDER_DRAW_PRIMITIVES_INDIRECT 4106
+
+// Op `DRAW_INDEXED_PRIMITIVES_INSTANCES` ([`RgfxOpDrawIndexedPrimitivesInstances`]):
+// `drawIndexedPrimitives:indexCount:indexType:indexBuffer:indexBufferOffset:instanceCount:`.
+#define RGFX_OP_RENDER_DRAW_INDEXED_PRIMITIVES_INSTANCES 4107
+
+// Op `DRAW_INDEXED_PRIMITIVES_BASE` ([`RgfxOpDrawIndexedPrimitivesBase`]):
+// `drawIndexedPrimitives:indexCount:indexType:indexBuffer:indexBufferOffset:instanceCount:baseVertex:baseInstance:`.
+#define RGFX_OP_RENDER_DRAW_INDEXED_PRIMITIVES_BASE 4108
+
+// Op `DRAW_INDEXED_PRIMITIVES_INDIRECT` ([`RgfxOpDrawIndexedPrimitivesIndirect`]):
+// `drawIndexedPrimitives:indexType:indexBuffer:indexBufferOffset:indirectBuffer:indirectBufferOffset:`.
+#define RGFX_OP_RENDER_DRAW_INDEXED_PRIMITIVES_INDIRECT 4109
+
+// Op `DRAW_PATCHES` ([`RgfxOpDrawPatches`]):
+// `drawPatches:patchStart:patchCount:patchIndexBuffer:patchIndexBufferOffset:instanceCount:baseInstance:`.
+#define RGFX_OP_RENDER_DRAW_PATCHES 4110
+
+// Op `DRAW_PATCHES_INDIRECT` ([`RgfxOpDrawPatchesIndirect`]):
+// `drawPatches:patchIndexBuffer:patchIndexBufferOffset:indirectBuffer:indirectBufferOffset:`.
+#define RGFX_OP_RENDER_DRAW_PATCHES_INDIRECT 4111
+
+// Op `DRAW_INDEXED_PATCHES` ([`RgfxOpDrawIndexedPatches`]):
+// `drawIndexedPatches:patchStart:patchCount:patchIndexBuffer:patchIndexBufferOffset:controlPointIndexBuffer:controlPointIndexBufferOffset:instanceCount:baseInstance:`.
+#define RGFX_OP_RENDER_DRAW_INDEXED_PATCHES 4112
+
+// Op `DRAW_INDEXED_PATCHES_INDIRECT` ([`RgfxOpDrawIndexedPatchesIndirect`]):
+// `drawIndexedPatches:patchIndexBuffer:patchIndexBufferOffset:controlPointIndexBuffer:controlPointIndexBufferOffset:indirectBuffer:indirectBufferOffset:`.
+#define RGFX_OP_RENDER_DRAW_INDEXED_PATCHES_INDIRECT 4113
+
+// Op `DISPATCH_THREADS_PER_TILE` ([`RgfxOpDispatchThreadsPerTile`]):
+// `dispatchThreadsPerTile:`.
+#define RGFX_OP_RENDER_DISPATCH_THREADS_PER_TILE 4114
+
+// Op `DISPATCH_THREADS_PER_TILE_IN_REGION` ([`RgfxOpDispatchThreadsPerTileInRegion`]):
+// `dispatchThreadsPerTile:inRegion:` (SPI).
+#define RGFX_OP_RENDER_DISPATCH_THREADS_PER_TILE_IN_REGION 4115
+
+// Op `DISPATCH_THREADS_PER_TILE_IN_REGION_INDEX`
+// ([`RgfxOpDispatchThreadsPerTileInRegionIndex`]):
+// `dispatchThreadsPerTile:inRegion:withRenderTargetArrayIndex:` (SPI).
+#define RGFX_OP_RENDER_DISPATCH_THREADS_PER_TILE_IN_REGION_INDEX 4116
+
+// Op `EXECUTE_COMMANDS_IN_BUFFER` ([`RgfxOpExecuteCommandsInBuffer`]):
+// `executeCommandsInBuffer:withRange:`.
+#define RGFX_OP_RENDER_EXECUTE_COMMANDS_IN_BUFFER 4117
+
+// Op `EXECUTE_COMMANDS_INDIRECT` ([`RgfxOpExecuteCommandsIndirect`]):
+// `executeCommandsInBuffer:indirectBuffer:indirectBufferOffset:`.
+#define RGFX_OP_RENDER_EXECUTE_COMMANDS_INDIRECT 4118
+
+// Op `MEMORY_BARRIER_WITH_SCOPE` ([`RgfxOpMemoryBarrierWithScope`]):
+// `memoryBarrierWithScope:afterStages:beforeStages:`.
+#define RGFX_OP_RENDER_MEMORY_BARRIER_WITH_SCOPE 4119
+
+// Op `UPDATE_FENCE` ([`RgfxOpUpdateFence`]): `updateFence:afterStages:`.
+#define RGFX_OP_RENDER_UPDATE_FENCE 4120
+
+// Op `WAIT_FOR_FENCE` ([`RgfxOpWaitForFence`]): `waitForFence:beforeStages:`.
+#define RGFX_OP_RENDER_WAIT_FOR_FENCE 4121
+
+// Op `SET_CULL_MODE` ([`RgfxOpSetCullMode`]): `setCullMode:`.
+#define RGFX_OP_RENDER_SET_CULL_MODE 4122
+
+// Op `SET_FRONT_FACING_WINDING` ([`RgfxOpSetFrontFacingWinding`]):
+// `setFrontFacingWinding:`.
+#define RGFX_OP_RENDER_SET_FRONT_FACING_WINDING 4123
+
+// Op `SET_TRIANGLE_FILL_MODE` ([`RgfxOpSetTriangleFillMode`]): `setTriangleFillMode:`.
+#define RGFX_OP_RENDER_SET_TRIANGLE_FILL_MODE 4124
+
+// Op `SET_DEPTH_CLIP_MODE_SPI` ([`RgfxOpSetDepthClipModeSpi`]): `setDepthClipModeSPI:`
+// (SPI).
+#define RGFX_OP_RENDER_SET_DEPTH_CLIP_MODE_SPI 4125
+
+// Op `SET_PROVOKING_VERTEX_MODE` ([`RgfxOpSetProvokingVertexMode`]):
+// `setProvokingVertexMode:` (SPI).
+#define RGFX_OP_RENDER_SET_PROVOKING_VERTEX_MODE 4126
+
+// Op `SET_DEPTH_STORE_ACTION` ([`RgfxOpSetDepthStoreAction`]): `setDepthStoreAction:`.
+#define RGFX_OP_RENDER_SET_DEPTH_STORE_ACTION 4127
+
+// Op `SET_STENCIL_STORE_ACTION` ([`RgfxOpSetStencilStoreAction`]):
+// `setStencilStoreAction:`.
+#define RGFX_OP_RENDER_SET_STENCIL_STORE_ACTION 4128
+
+// Op `SET_STENCIL_STORE_ACTION_OPTIONS` ([`RgfxOpSetStencilStoreActionOptions`]):
+// `setStencilStoreActionOptions:`.
+#define RGFX_OP_RENDER_SET_STENCIL_STORE_ACTION_OPTIONS 4129
+
+// Op `SET_COLOR_STORE_ACTION` ([`RgfxOpSetColorStoreAction`]):
+// `setColorStoreAction:atIndex:`.
+#define RGFX_OP_RENDER_SET_COLOR_STORE_ACTION 4130
+
+// Op `SET_COLOR_STORE_ACTION_OPTIONS` ([`RgfxOpSetColorStoreActionOptions`]):
+// `setColorStoreActionOptions:atIndex:`.
+#define RGFX_OP_RENDER_SET_COLOR_STORE_ACTION_OPTIONS 4131
+
+// Op `SET_VISIBILITY_RESULT_MODE` ([`RgfxOpSetVisibilityResultMode`]):
+// `setVisibilityResultMode:offset:`.
+#define RGFX_OP_RENDER_SET_VISIBILITY_RESULT_MODE 4132
+
+// Op `SET_VERTEX_AMPLIFICATION_MODE` ([`RgfxOpSetVertexAmplificationMode`]):
+// `setVertexAmplificationMode:value:` (SPI).
+#define RGFX_OP_RENDER_SET_VERTEX_AMPLIFICATION_MODE 4133
+
+// Op `SET_VERTEX_BUFFER_OFFSET` ([`RgfxOpSetVertexBufferOffset`]):
+// `setVertexBufferOffset:atIndex:`.
+#define RGFX_OP_RENDER_SET_VERTEX_BUFFER_OFFSET 4134
+
+// Op `SET_FRAGMENT_BUFFER_OFFSET` ([`RgfxOpSetFragmentBufferOffset`]):
+// `setFragmentBufferOffset:atIndex:`.
+#define RGFX_OP_RENDER_SET_FRAGMENT_BUFFER_OFFSET 4135
+
+// Op `SET_TILE_BUFFER_OFFSET` ([`RgfxOpSetTileBufferOffset`]):
+// `setTileBufferOffset:atIndex:`.
+#define RGFX_OP_RENDER_SET_TILE_BUFFER_OFFSET 4136
+
+// Op `SET_VERTEX_BUFFER_OFFSET_ATTRIBUTE_STRIDE`
+// ([`RgfxOpSetVertexBufferOffsetAttributeStride`]):
+// `setVertexBufferOffset:attributeStride:atIndex:`.
+#define RGFX_OP_RENDER_SET_VERTEX_BUFFER_OFFSET_ATTRIBUTE_STRIDE 4137
+
+// Op `SET_THREADGROUP_MEMORY_LENGTH` ([`RgfxOpSetThreadgroupMemoryLength`]):
+// `setThreadgroupMemoryLength:offset:atIndex:`.
+#define RGFX_OP_RENDER_SET_THREADGROUP_MEMORY_LENGTH 4138
+
+// Op `SET_ALPHA_TEST_REFERENCE_VALUE` ([`RgfxOpSetAlphaTestReferenceValue`]):
+// `setAlphaTestReferenceValue:` (SPI).
+#define RGFX_OP_RENDER_SET_ALPHA_TEST_REFERENCE_VALUE 4139
+
+// Op `SET_LINE_WIDTH` ([`RgfxOpSetLineWidth`]): `setLineWidth:` (SPI).
+#define RGFX_OP_RENDER_SET_LINE_WIDTH 4140
+
+// Op `SET_POINT_SIZE` ([`RgfxOpSetPointSize`]): `setPointSize:` (SPI).
+#define RGFX_OP_RENDER_SET_POINT_SIZE 4141
+
+// Op `SET_TESSELLATION_FACTOR_SCALE` ([`RgfxOpSetTessellationFactorScale`]):
+// `setTessellationFactorScale:`.
+#define RGFX_OP_RENDER_SET_TESSELLATION_FACTOR_SCALE 4142
+
+// Op `SET_BLEND_COLOR_RED` ([`RgfxOpSetBlendColorRed`]):
+// `setBlendColorRed:green:blue:alpha:`.
+#define RGFX_OP_RENDER_SET_BLEND_COLOR_RED 4143
+
+// Op `SET_DEPTH_BIAS` ([`RgfxOpSetDepthBias`]): `setDepthBias:slopeScale:clamp:`.
+#define RGFX_OP_RENDER_SET_DEPTH_BIAS 4144
+
+// Op `SET_VIEWPORT_TRANSFORM_ENABLED` ([`RgfxOpSetViewportTransformEnabled`]):
+// `setViewportTransformEnabled:` (SPI).
+#define RGFX_OP_RENDER_SET_VIEWPORT_TRANSFORM_ENABLED 4145
+
+// Op `SET_PRIMITIVE_RESTART_ENABLED` ([`RgfxOpSetPrimitiveRestartEnabled`]):
+// `setPrimitiveRestartEnabled:index:` (SPI).
+#define RGFX_OP_RENDER_SET_PRIMITIVE_RESTART_ENABLED 4146
+
+// Op `SET_STENCIL_FRONT_REFERENCE_VALUE` ([`RgfxOpSetStencilFrontReferenceValue`]):
+// `setStencilFrontReferenceValue:backReferenceValue:`.
+#define RGFX_OP_RENDER_SET_STENCIL_FRONT_REFERENCE_VALUE 4147
+
+// Op `SET_DEPTH_CLEARED` ([`RgfxOpSetDepthCleared`]): `setDepthCleared` (SPI, no body).
+#define RGFX_OP_RENDER_SET_DEPTH_CLEARED 4148
+
+// Op `SET_STENCIL_CLEARED` ([`RgfxOpSetStencilCleared`]): `setStencilCleared` (SPI, no
+// body).
+#define RGFX_OP_RENDER_SET_STENCIL_CLEARED 4149
+
+// Op `SET_DEPTH_STENCIL_STATE` ([`RgfxOpSetDepthStencilState`]): `setDepthStencilState:`.
+#define RGFX_OP_RENDER_SET_DEPTH_STENCIL_STATE 4150
+
+// Op `SET_COLOR_RESOLVE_TEXTURE` ([`RgfxOpSetColorResolveTexture`]):
+// `setColorResolveTexture:slice:depthPlane:level:yInvert:atIndex:` (SPI).
+#define RGFX_OP_RENDER_SET_COLOR_RESOLVE_TEXTURE 4151
+
+// Op `SET_DEPTH_RESOLVE_TEXTURE` ([`RgfxOpSetDepthResolveTexture`]):
+// `setDepthResolveTexture:slice:depthPlane:level:yInvert:` (SPI).
+#define RGFX_OP_RENDER_SET_DEPTH_RESOLVE_TEXTURE 4152
+
+// Op `SET_STENCIL_RESOLVE_TEXTURE` ([`RgfxOpSetStencilResolveTexture`]):
+// `setStencilResolveTexture:slice:depthPlane:level:yInvert:` (SPI).
+#define RGFX_OP_RENDER_SET_STENCIL_RESOLVE_TEXTURE 4153
+
+// Op `SET_TESSELLATION_FACTOR_BUFFER` ([`RgfxOpSetTessellationFactorBuffer`]):
+// `setTessellationFactorBuffer:offset:instanceStride:`.
+#define RGFX_OP_RENDER_SET_TESSELLATION_FACTOR_BUFFER 4154
+
+// Op `SET_VERTEX_BUFFERS` ([`RgfxOpSetVertexBuffers`]):
+// `setVertexBuffers:offsets:withRange:`.
+#define RGFX_OP_RENDER_SET_VERTEX_BUFFERS 4155
+
+// Op `SET_FRAGMENT_BUFFERS` ([`RgfxOpSetFragmentBuffers`]):
+// `setFragmentBuffers:offsets:withRange:`.
+#define RGFX_OP_RENDER_SET_FRAGMENT_BUFFERS 4156
+
+// Op `SET_TILE_BUFFERS` ([`RgfxOpSetTileBuffers`]): `setTileBuffers:offsets:withRange:`.
+#define RGFX_OP_RENDER_SET_TILE_BUFFERS 4157
+
+// Op `SET_VERTEX_BUFFERS_ATTRIBUTE_STRIDES` ([`RgfxOpSetVertexBuffersAttributeStrides`]):
+// `setVertexBuffers:offsets:attributeStrides:withRange:`.
+#define RGFX_OP_RENDER_SET_VERTEX_BUFFERS_ATTRIBUTE_STRIDES 4158
+
+// Op `SET_VERTEX_TEXTURES` ([`RgfxOpSetVertexTextures`]): `setVertexTextures:withRange:`.
+#define RGFX_OP_RENDER_SET_VERTEX_TEXTURES 4159
+
+// Op `SET_FRAGMENT_TEXTURES` ([`RgfxOpSetFragmentTextures`]):
+// `setFragmentTextures:withRange:`.
+#define RGFX_OP_RENDER_SET_FRAGMENT_TEXTURES 4160
+
+// Op `SET_TILE_TEXTURES` ([`RgfxOpSetTileTextures`]): `setTileTextures:withRange:`.
+#define RGFX_OP_RENDER_SET_TILE_TEXTURES 4161
+
+// Op `SET_VERTEX_SAMPLER_STATES` ([`RgfxOpSetVertexSamplerStates`]):
+// `setVertexSamplerStates:withRange:`.
+#define RGFX_OP_RENDER_SET_VERTEX_SAMPLER_STATES 4162
+
+// Op `SET_FRAGMENT_SAMPLER_STATES` ([`RgfxOpSetFragmentSamplerStates`]):
+// `setFragmentSamplerStates:withRange:`.
+#define RGFX_OP_RENDER_SET_FRAGMENT_SAMPLER_STATES 4163
+
+// Op `SET_TILE_SAMPLER_STATES` ([`RgfxOpSetTileSamplerStates`]):
+// `setTileSamplerStates:withRange:`.
+#define RGFX_OP_RENDER_SET_TILE_SAMPLER_STATES 4164
+
+// Op `SET_VERTEX_SAMPLER_STATES_LOD_CLAMPS` ([`RgfxOpSetVertexSamplerStatesLodClamps`]):
+// `setVertexSamplerStates:lodMinClamps:lodMaxClamps:withRange:`.
+#define RGFX_OP_RENDER_SET_VERTEX_SAMPLER_STATES_LOD_CLAMPS 4165
+
+// Op `SET_FRAGMENT_SAMPLER_STATES_LOD_CLAMPS`
+// ([`RgfxOpSetFragmentSamplerStatesLodClamps`]):
+// `setFragmentSamplerStates:lodMinClamps:lodMaxClamps:withRange:`.
+#define RGFX_OP_RENDER_SET_FRAGMENT_SAMPLER_STATES_LOD_CLAMPS 4166
+
+// Op `SET_TILE_SAMPLER_STATES_LOD_CLAMPS` ([`RgfxOpSetTileSamplerStatesLodClamps`]):
+// `setTileSamplerStates:lodMinClamps:lodMaxClamps:withRange:`.
+#define RGFX_OP_RENDER_SET_TILE_SAMPLER_STATES_LOD_CLAMPS 4167
+
+// Op `SET_SCISSOR_RECTS` ([`RgfxOpSetScissorRects`]): `setScissorRects:count:`.
+#define RGFX_OP_RENDER_SET_SCISSOR_RECTS 4168
+
+// Op `SET_VIEWPORTS` ([`RgfxOpSetViewports`]): `setViewports:count:`.
+#define RGFX_OP_RENDER_SET_VIEWPORTS 4169
+
+// Op `SET_VERTEX_AMPLIFICATION_COUNT` ([`RgfxOpSetVertexAmplificationCount`]):
+// `setVertexAmplificationCount:viewMappings:`.
+#define RGFX_OP_RENDER_SET_VERTEX_AMPLIFICATION_COUNT 4170
+
+// Op `USE_HEAPS` ([`RgfxOpUseHeaps`]): `useHeaps:count:`.
+#define RGFX_OP_RENDER_USE_HEAPS 4171
+
+// Op `USE_HEAPS_STAGES` ([`RgfxOpUseHeapsStages`]): `useHeaps:count:stages:`.
+#define RGFX_OP_RENDER_USE_HEAPS_STAGES 4172
+
+// Op `USE_RESOURCES` ([`RgfxOpUseResources`]): `useResources:count:usage:`.
+#define RGFX_OP_RENDER_USE_RESOURCES 4173
+
+// Op `USE_RESOURCES_STAGES` ([`RgfxOpUseResourcesStages`]):
+// `useResources:count:usage:stages:`.
+#define RGFX_OP_RENDER_USE_RESOURCES_STAGES 4174
 
 // The device's PCI vendor ID: a placeholder until the owner picks the device's own.
 #define RGFX_PCI_VENDOR_ID 4660
@@ -357,27 +864,43 @@
 // truncated (it is a display string, never read back for correctness).
 #define RGFX_DEVICE_NAME_LEN 32
 
-// A ring's header, at the start of the ring: each field in a 64-byte line of its own, so the
-// producer's and the consumer's writes never share a cache line.
-typedef struct {
-  // The producer's free-running byte count, written by the producer.
-  uint64_t producer;
-  // The rest of `producer`'s line.
-  uint8_t reserved_08[56];
-  // The consumer's free-running byte count, written by the consumer.
-  uint64_t consumer;
-  // The rest of `consumer`'s line.
-  uint8_t reserved_48[56];
-  // 1 while the consumer sleeps until a doorbell, written by the consumer.
-  uint32_t consumer_idle;
-  // The rest of `consumer_idle`'s line.
-  uint8_t reserved_84[60];
-  // 1 when the guest wants an interrupt, set by the guest on a completion ring and cleared by
-  // the host as it raises one.
-  uint32_t armed;
-  // The rest of `armed`'s line.
-  uint8_t reserved_c4[60];
-} RgfxRingHeader;
+// A pipeline reflection reply's status: the pipeline was created.
+#define RGFX_PIPELINE_OK 0
+
+// A pipeline reflection reply's status: the host made no pipeline (a nil or
+// invalid function, or Metal refused the descriptor); no handle was stored.
+#define RGFX_PIPELINE_REFUSED 1
+
+// A pipeline reflection reply's kind: a render pipeline.
+#define RGFX_PIPELINE_KIND_RENDER 0
+
+// A pipeline reflection reply's kind: a compute pipeline.
+#define RGFX_PIPELINE_KIND_COMPUTE 1
+
+// [`RgfxPipelineReflection`] `flags`: the state supports indirect command
+// buffers (`supportIndirectCommandBuffers`).
+#define RGFX_PIPELINE_REFLECT_SUPPORT_ICB (1 << 0)
+
+// [`RgfxPipelineReflection`] `flags`: a render pipeline's threadgroup size
+// matches its tile size (`threadgroupSizeMatchesTileSize`).
+#define RGFX_PIPELINE_REFLECT_THREADGROUP_MATCHES_TILE (1 << 1)
+
+// [`RgfxRenderPipelineCreate`] `flags`: `alphaToCoverageEnabled`.
+#define RGFX_RENDER_PIPELINE_ALPHA_TO_COVERAGE (1 << 0)
+
+// [`RgfxRenderPipelineCreate`] `flags`: `alphaToOneEnabled`.
+#define RGFX_RENDER_PIPELINE_ALPHA_TO_ONE (1 << 1)
+
+// [`RgfxRenderPipelineCreate`] `flags`: `rasterizationEnabled` (set when the
+// pipeline rasterizes; a vertex-only pipeline clears it).
+#define RGFX_RENDER_PIPELINE_RASTERIZATION_ENABLED (1 << 2)
+
+// [`RgfxComputePipelineCreate`] `flags`:
+// `threadGroupSizeIsMultipleOfThreadExecutionWidth`.
+#define RGFX_COMPUTE_PIPELINE_TG_MULTIPLE_OF_EXEC_WIDTH (1 << 0)
+
+// [`RgfxComputePipelineCreate`] `flags`: `supportIndirectCommandBuffers`.
+#define RGFX_COMPUTE_PIPELINE_SUPPORT_ICB (1 << 1)
 
 // Every message's header.
 typedef struct {
@@ -390,229 +913,33 @@ typedef struct {
   uint64_t seqno;
 } RgfxMsgHeader;
 
-// `GET_DISPLAYS`: no payload.
+// `BUFFER_AT_OFFSET`: a buffer of `length` bytes at `offset` in the heap
+// `heap_obj_id`.
 typedef struct {
-  // [`RGFX_CMD_GET_DISPLAYS`].
+  // [`RGFX_CMD_BUFFER_AT_OFFSET`].
   RgfxMsgHeader header;
-} RgfxGetDisplays;
-
-// `SET_SCANOUT`: the display shows `height` rows of `width` BGRA8 pixels, each row `stride`
-// bytes after the one before, from `offset` in the region. A `width` of 0 blanks the display.
-typedef struct {
-  // [`RGFX_CMD_SET_SCANOUT`].
-  RgfxMsgHeader header;
-  // The display's id.
-  uint32_t display;
-  // Pixels a row; 0 blanks the display.
-  uint32_t width;
-  // Rows.
-  uint32_t height;
-  // Bytes from one row's start to the next's: a multiple of 4, at least `width * 4`.
-  uint32_t stride;
-  // Where the first row starts in the region: a multiple of 4, in the guest's allocations.
+  // The new buffer's guest-picked id.
+  uint64_t obj_id;
+  // The heap the buffer lies in.
+  uint64_t heap_obj_id;
+  // The buffer's offset in the heap.
   uint64_t offset;
-} RgfxSetScanout;
-
-// `SET_CURSOR`: the display's cursor is `height` rows of `width` premultiplied BGRA8 pixels,
-// `width * 4` bytes a row, from `offset` in the region, its hot spot at (`hot_x`, `hot_y`). A
-// `width` of 0 removes the image.
-typedef struct {
-  // [`RGFX_CMD_SET_CURSOR`].
-  RgfxMsgHeader header;
-  // The display's id.
-  uint32_t display;
-  // Pixels a row, up to [`RGFX_CURSOR_MAX_SIZE`]; 0 removes the image.
-  uint32_t width;
-  // Rows, up to [`RGFX_CURSOR_MAX_SIZE`].
-  uint32_t height;
-  // The hot spot's column, below `width`.
-  uint32_t hot_x;
-  // The hot spot's row, below `height`.
-  uint32_t hot_y;
-  // Keeps `offset` 8-aligned; 0.
-  uint32_t reserved_24;
-  // Where the image starts in the region: a multiple of 4, in the guest's allocations.
-  uint64_t offset;
-} RgfxSetCursor;
-
-// `MOVE_CURSOR`: the cursor's hot spot is at (`x`, `y`) in the display's pixels, and shows
-// where `visible` is not 0.
-typedef struct {
-  // [`RGFX_CMD_MOVE_CURSOR`].
-  RgfxMsgHeader header;
-  // The display's id.
-  uint32_t display;
-  // The hot spot's column.
-  int32_t x;
-  // The hot spot's row.
-  int32_t y;
-  // Whether the cursor shows: 0 hides it.
-  uint32_t visible;
-} RgfxMoveCursor;
-
-// `SET_VBLANK`: the device sends `VBLANK` at each refresh of the display's host screen while
-// `enabled` is not 0.
-typedef struct {
-  // [`RGFX_CMD_SET_VBLANK`].
-  RgfxMsgHeader header;
-  // The display's id.
-  uint32_t display;
-  // Whether `VBLANK` is sent: 0 stops it.
-  uint32_t enabled;
-} RgfxSetVblank;
-
-// `COMPLETE`: a command's answer.
-typedef struct {
-  // [`RGFX_EVT_COMPLETE`], with the command's `seqno`.
-  RgfxMsgHeader header;
-  // An `RGFX_STATUS_*`: 0 for success.
-  uint32_t status;
-  // Pads the message to a multiple of 8; 0.
-  uint32_t reserved_14;
-} RgfxComplete;
-
-// `DISPLAYS`: `GET_DISPLAYS`'s answer. `count` [`RgfxDisplayEntry`] records follow it, at
-// [`RGFX_DISPLAYS_ENTRIES_OFFSET`], each followed by its `mode_count` [`RgfxModeEntry`] records;
-// the message's `size` is rounded up to a multiple of 8 after the last. The struct is the
-// message's start: C's `sizeof` pads it past `count`, where the first record already is.
-typedef struct {
-  // [`RGFX_EVT_DISPLAYS`], with `GET_DISPLAYS`' `seqno`.
-  RgfxMsgHeader header;
-  // The displays that follow.
-  uint32_t count;
-} RgfxDisplays;
-
-// One display in a `DISPLAYS` message.
-typedef struct {
-  // The display's id, which the commands name.
-  uint32_t id;
-  // 1 where a display is connected, else 0.
-  uint32_t connected;
-  // The index of the mode the display prefers, among the modes that follow.
-  uint32_t preferred_mode;
-  // The modes that follow this record.
-  uint32_t mode_count;
-} RgfxDisplayEntry;
-
-// One mode of a display in a `DISPLAYS` message.
-typedef struct {
-  // Pixels a row.
-  uint32_t width;
-  // Rows.
-  uint32_t height;
-  // The refresh rate, in thousandths of a hertz.
-  uint32_t refresh_mhz;
-} RgfxModeEntry;
-
-// `DISPLAY_CHANGED`: what the display offers has changed; the guest asks `GET_DISPLAYS` again.
-typedef struct {
-  // [`RGFX_EVT_DISPLAY_CHANGED`], `seqno` 0.
-  RgfxMsgHeader header;
-  // The display's id.
-  uint32_t display;
-  // Pads the message to a multiple of 8; 0.
-  uint32_t reserved_14;
-} RgfxDisplayChanged;
-
-// `VBLANK`: the display's host screen refreshed.
-typedef struct {
-  // [`RGFX_EVT_VBLANK`], `seqno` 0.
-  RgfxMsgHeader header;
-  // The display's id.
-  uint32_t display;
-  // Keeps `count` 8-aligned; 0.
-  uint32_t reserved_14;
-  // The display's refreshes since it was made, this one included.
-  uint64_t count;
-  // The host's monotonic clock at the refresh, in nanoseconds.
-  uint64_t host_time_ns;
-} RgfxVblank;
-
-// `OBJECT_DESTROY`: drop the host handle for `obj_id`. The handle table knows
-// the kind, so one message destroys an object of any kind.
-typedef struct {
-  // [`RGFX_CMD_OBJECT_DESTROY`].
-  RgfxMsgHeader header;
-  // The object to drop.
-  uint64_t obj_id;
-} RgfxObjectDestroy;
-
-// `EVENT_CREATE` and `FENCE_CREATE`: a sync object with no payload but its id.
-typedef struct {
-  // [`RGFX_CMD_EVENT_CREATE`] or [`RGFX_CMD_FENCE_CREATE`].
-  RgfxMsgHeader header;
-  // The new object's guest-picked id.
-  uint64_t obj_id;
-} RgfxObjectCreate;
-
-// `SHARED_EVENT_CREATE`: a shared event starting at `initial_value`.
-typedef struct {
-  // [`RGFX_CMD_SHARED_EVENT_CREATE`].
-  RgfxMsgHeader header;
-  // The new event's guest-picked id.
-  uint64_t obj_id;
-  // The event's value when it is made.
-  uint64_t initial_value;
-} RgfxSharedEventCreate;
-
-// `QUEUE_CREATE`: a command queue and its submission+completion ring pair, each
-// a [`RgfxRingHeader`] followed by a byte ring of the given data size (a power
-// of two) at the given region offset. The completion ring raises `vector`.
-typedef struct {
-  // [`RGFX_CMD_QUEUE_CREATE`].
-  RgfxMsgHeader header;
-  // The new queue's guest-picked id.
-  uint64_t obj_id;
-  // Where the submission ring (guest to host) starts in the region.
-  uint64_t submit_offset;
-  // Where the completion ring (host to guest) starts in the region.
-  uint64_t complete_offset;
-  // The submission ring's byte-ring size, after its header: a power of two.
-  uint32_t submit_data_size;
-  // The completion ring's byte-ring size, after its header: a power of two.
-  uint32_t complete_data_size;
-  // The queue's priority; the host gives its VkQueue a matching priority so
-  // WindowServer's queue runs high. 0 is normal, higher is higher.
-  uint32_t priority;
-  // The MSI-X vector the completion ring raises.
-  uint32_t vector;
-} RgfxQueueCreate;
-
-// `HEAP_CREATE`: a device heap of `size_bytes` at the guest-picked
-// `gpu_address`. `options` carries the heap's storage and cache modes and type.
-typedef struct {
-  // [`RGFX_CMD_HEAP_CREATE`].
-  RgfxMsgHeader header;
-  // The new heap's guest-picked id.
-  uint64_t obj_id;
-  // The heap's guest-picked GPU address.
-  uint64_t gpu_address;
-  // The heap's size in bytes.
-  uint64_t size_bytes;
+  // The buffer's length in bytes.
+  uint64_t length;
   // `MTLResourceOptions`: storage mode, cache mode, hazard tracking.
   uint32_t options;
-  // `MTLHeapType` (Automatic, Placement or Sparse); widened on decode.
-  int32_t heap_type;
-} RgfxHeapCreate;
+  // Pads to a multiple of 8; 0.
+  uint32_t reserved_34;
+} RgfxBufferAtOffset;
 
-// `HEAP_OVER_HOST_MEMORY`: a Shared heap of `size_bytes` over the block at
-// `region_offset` in the region, at the guest-picked `gpu_address`.
+// One element of a buffer-binding array ([`RgfxOpSetVertexBuffers`] and the like):
+// a buffer (0 = nil) and its offset.
 typedef struct {
-  // [`RGFX_CMD_HEAP_OVER_HOST_MEMORY`].
-  RgfxMsgHeader header;
-  // The new heap's guest-picked id.
-  uint64_t obj_id;
-  // The heap's guest-picked GPU address.
-  uint64_t gpu_address;
-  // Where the heap's block starts in the region.
-  uint64_t region_offset;
-  // The heap's size in bytes.
-  uint64_t size_bytes;
-  // `MTLResourceOptions`: storage mode, cache mode, hazard tracking.
-  uint32_t options;
-  // `MTLHeapType` (Automatic, Placement or Sparse); widened on decode.
-  int32_t heap_type;
-} RgfxHeapOverHostMemory;
+  // The buffer, or 0 for nil.
+  uint64_t buffer_obj_id;
+  // The offset into the buffer.
+  uint64_t offset;
+} RgfxBufferBinding;
 
 // `BUFFER_CREATE`: a device buffer of `length` bytes at the guest-picked
 // `gpu_address`. `options` carries `MTLResourceOptions`.
@@ -650,24 +977,17 @@ typedef struct {
   uint32_t reserved_34;
 } RgfxBufferOverHostMemory;
 
-// `BUFFER_AT_OFFSET`: a buffer of `length` bytes at `offset` in the heap
-// `heap_obj_id`.
+// One element of an attribute-stride buffer-binding array
+// ([`RgfxOpSetVertexBuffersAttributeStrides`]): a buffer (0 = nil), its offset and
+// its attribute stride.
 typedef struct {
-  // [`RGFX_CMD_BUFFER_AT_OFFSET`].
-  RgfxMsgHeader header;
-  // The new buffer's guest-picked id.
-  uint64_t obj_id;
-  // The heap the buffer lies in.
-  uint64_t heap_obj_id;
-  // The buffer's offset in the heap.
+  // The buffer, or 0 for nil.
+  uint64_t buffer_obj_id;
+  // The offset into the buffer.
   uint64_t offset;
-  // The buffer's length in bytes.
-  uint64_t length;
-  // `MTLResourceOptions`: storage mode, cache mode, hazard tracking.
-  uint32_t options;
-  // Pads to a multiple of 8; 0.
-  uint32_t reserved_34;
-} RgfxBufferAtOffset;
+  // The attribute stride.
+  uint64_t stride;
+} RgfxBufferStrideBinding;
 
 // `CB_COMPLETE`: a command buffer finished. `status` is an `RGFX_CB_*`, and
 // `error_code` carries the host's raw `MTLCommandBufferError` code for
@@ -689,122 +1009,99 @@ typedef struct {
   uint32_t error_code;
 } RgfxCbComplete;
 
-// `EVENT_SIGNALLED`: the shared event `obj_id` reached `value`.
+// One colour attachment of a render pipeline
+// (`MTLRenderPipelineColorAttachmentDescriptor`). Each enum is its Metal raw
+// value (`MTLPixelFormat`, `MTLBlendFactor`, `MTLBlendOperation`,
+// `MTLColorWriteMask`).
 typedef struct {
-  // [`RGFX_EVT_EVENT_SIGNALLED`], `seqno` 0.
-  RgfxMsgHeader header;
-  // The shared event that fired.
-  uint64_t obj_id;
-  // The value it reached.
-  uint64_t value;
-} RgfxEventSignalled;
-
-// A texture's shape, as `MTLTextureDescriptor` gives it. Each enum is its Metal
-// raw value (`MTLPixelFormat`, `MTLTextureType`, `MTLTextureUsage`,
-// `MTLResourceOptions`); `swizzle` packs the four `MTLTextureSwizzle` channels,
-// one byte each, red in the low byte.
-typedef struct {
-  // `MTLPixelFormat`.
+  // `MTLPixelFormat`; 0 (`Invalid`) for an unused attachment.
   uint32_t pixel_format;
-  // `MTLTextureType`.
-  uint32_t texture_type;
-  // Pixels a row.
-  uint32_t width;
-  // Rows.
-  uint32_t height;
-  // Slices, for a 3D texture; 1 otherwise.
-  uint32_t depth;
-  // Mip levels.
-  uint32_t mipmap_level_count;
-  // Array elements, for an array texture; 1 otherwise.
-  uint32_t array_length;
-  // Samples a pixel, for a multisample texture; 1 otherwise.
-  uint32_t sample_count;
-  // `MTLTextureUsage`.
-  uint32_t usage;
-  // `MTLResourceOptions`: the storage, cache and hazard-tracking modes.
-  uint32_t options;
-  // The four `MTLTextureSwizzle` channels, one byte each, red lowest.
-  uint32_t swizzle;
+  // Whether blending is enabled: 0 off.
+  uint32_t blending_enabled;
+  // `MTLBlendFactor` for the source RGB.
+  uint32_t source_rgb_blend_factor;
+  // `MTLBlendFactor` for the destination RGB.
+  uint32_t destination_rgb_blend_factor;
+  // `MTLBlendOperation` for RGB.
+  uint32_t rgb_blend_operation;
+  // `MTLBlendFactor` for the source alpha.
+  uint32_t source_alpha_blend_factor;
+  // `MTLBlendFactor` for the destination alpha.
+  uint32_t destination_alpha_blend_factor;
+  // `MTLBlendOperation` for alpha.
+  uint32_t alpha_blend_operation;
+  // `MTLColorWriteMask`.
+  uint32_t write_mask;
   // Pads to a multiple of 8; 0.
-  uint32_t reserved_2c;
-} RgfxTextureDescriptor;
+  uint32_t reserved_24;
+} RgfxColorAttachmentDesc;
 
-// `TEXTURE_CREATE`: a texture of shape `desc` at the guest-picked `gpu_address`
-// (device-placed, `heap_obj_id` 0) or at `heap_offset` in `heap_obj_id`, with
-// the guest-picked `resource_id`.
+// `COMMAND_BUFFER` ([`RGFX_CMD_COMMAND_BUFFER`](crate::wire::RGFX_CMD_COMMAND_BUFFER)):
+// one command buffer on a queue's submission ring. The op stream (`op_bytes`
+// bytes) follows this message at [`RGFX_COMMAND_BUFFER_OPS_OFFSET`]; the host
+// opens a command buffer on the queue `queue_obj_id`, walks the ops, commits,
+// and answers an [`RgfxCbComplete`](crate::wire::RgfxCbComplete) carrying
+// `cb_obj_id` when the work finishes.
 typedef struct {
-  // [`RGFX_CMD_TEXTURE_CREATE`].
+  // [`RGFX_CMD_COMMAND_BUFFER`](crate::wire::RGFX_CMD_COMMAND_BUFFER).
   RgfxMsgHeader header;
-  // The new texture's guest-picked id.
-  uint64_t obj_id;
-  // The texture's guest-picked GPU address when device-placed.
-  uint64_t gpu_address;
-  // The texture's guest-picked resource id.
-  uint64_t resource_id;
-  // The heap the texture lies in, or 0 when device-placed at `gpu_address`.
-  uint64_t heap_obj_id;
-  // The texture's offset in the heap, when `heap_obj_id` is not 0.
-  uint64_t heap_offset;
-  // The texture's shape.
-  RgfxTextureDescriptor desc;
-} RgfxTextureCreate;
+  // The command queue this buffer belongs to.
+  uint64_t queue_obj_id;
+  // The command buffer's guest-picked id, which its completion names.
+  uint64_t cb_obj_id;
+  // The bytes of op stream that follow this message.
+  uint64_t op_bytes;
+} RgfxCommandBuffer;
 
-// `TEXTURE_FROM_BUFFER`: a texture of shape `desc` over the buffer
-// `buffer_obj_id` from `offset`, each row `bytes_per_row` apart, with the
-// guest-picked `resource_id`.
+// `COMPLETE`: a command's answer.
 typedef struct {
-  // [`RGFX_CMD_TEXTURE_FROM_BUFFER`].
+  // [`RGFX_EVT_COMPLETE`], with the command's `seqno`.
   RgfxMsgHeader header;
-  // The new texture's guest-picked id.
-  uint64_t obj_id;
-  // The new texture's guest-picked resource id.
-  uint64_t resource_id;
-  // The buffer the texture reads.
-  uint64_t buffer_obj_id;
-  // The texture's first byte in the buffer.
-  uint64_t offset;
-  // Bytes from one row's start to the next's.
-  uint64_t bytes_per_row;
-  // The texture's shape.
-  RgfxTextureDescriptor desc;
-} RgfxTextureFromBuffer;
+  // An `RGFX_STATUS_*`: 0 for success.
+  uint32_t status;
+  // Pads the message to a multiple of 8; 0.
+  uint32_t reserved_14;
+} RgfxComplete;
 
-// `SAMPLER_CREATE`: a sampler as `MTLSamplerDescriptor` gives it. Each enum is
-// its Metal raw value; `lod_min_clamp_bits`/`lod_max_clamp_bits` are the `f32`
-// clamps' bits (so the wire stays all-integer and comparable); `flags` packs
-// the booleans.
+// The body of an `ENCODER_BEGIN_COMPUTE` op: the compute pass's properties.
 typedef struct {
-  // [`RGFX_CMD_SAMPLER_CREATE`].
-  RgfxMsgHeader header;
-  // The new sampler's guest-picked id.
-  uint64_t obj_id;
-  // `MTLSamplerMinMagFilter` for minification.
-  uint32_t min_filter;
-  // `MTLSamplerMinMagFilter` for magnification.
-  uint32_t mag_filter;
-  // `MTLSamplerMipFilter`.
-  uint32_t mip_filter;
-  // `MTLSamplerAddressMode` for s.
-  uint32_t s_address_mode;
-  // `MTLSamplerAddressMode` for t.
-  uint32_t t_address_mode;
-  // `MTLSamplerAddressMode` for r.
-  uint32_t r_address_mode;
-  // `MTLSamplerBorderColor`.
-  uint32_t border_color;
-  // `MTLCompareFunction` for the sampler's compare.
-  uint32_t compare_function;
-  // The maximum anisotropy.
-  uint32_t max_anisotropy;
-  // The minimum LOD clamp, as `f32` bits.
-  uint32_t lod_min_clamp_bits;
-  // The maximum LOD clamp, as `f32` bits.
-  uint32_t lod_max_clamp_bits;
-  // Bit 0: normalized coordinates. Bit 1: LOD average. Bit 2: usable from an
-  // argument buffer.
+  // `MTLDispatchType`, when [`RGFX_COMPUTE_PASS_FLAG_DISPATCH_TYPE`] is set.
+  uint32_t dispatch_type;
+  // An `RGFX_COMPUTE_PASS_FLAG_*` set.
   uint32_t flags;
-} RgfxSamplerCreate;
+} RgfxComputePassDesc;
+
+// `COMPUTE_PIPELINE_CREATE`: a compute pipeline from a function, answered by
+// [`RgfxPipelineReflection`] with this create's `seqno`. The compute function is
+// named by `function_library_obj_id` and an entry-point name in the tail
+// (`name_offset`/`name_len`, byte offsets from the message start), optionally
+// specialised by `constant_count` [`RgfxFunctionConstant`] in the tail. The
+// message's `size` is the fixed head plus the tail, rounded up to a multiple of
+// 8.
+typedef struct {
+  // [`RGFX_CMD_COMPUTE_PIPELINE_CREATE`].
+  RgfxMsgHeader header;
+  // The new pipeline's guest-picked id.
+  uint64_t obj_id;
+  // The library the compute function comes from.
+  uint64_t function_library_obj_id;
+  // The compute entry-point name's byte offset from the message start.
+  uint32_t name_offset;
+  // The compute entry-point name's length in bytes.
+  uint32_t name_len;
+  // The function constants' byte offset from the message start.
+  uint32_t constants_offset;
+  // The number of [`RgfxFunctionConstant`] for the function.
+  uint32_t constant_count;
+  // The `RGFX_COMPUTE_PIPELINE_*` boolean flags.
+  uint32_t flags;
+  // `maxTotalThreadsPerThreadgroup` the guest set, or 0 to leave Metal's.
+  uint32_t max_total_threads_per_threadgroup;
+  // `maxCallStackDepth`.
+  uint32_t max_call_stack_depth;
+  // Pads to a multiple of 8; 0.
+  uint32_t reserved_3c;
+} RgfxComputePipelineCreate;
 
 // One face's stencil state, as `MTLStencilDescriptor` gives it.
 typedef struct {
@@ -838,19 +1135,6 @@ typedef struct {
   // The back faces' stencil state.
   RgfxStencilDescriptor back;
 } RgfxDepthStencilCreate;
-
-// `LIBRARY_CREATE`: a library from `byte_length` bytes of `.metallib` or AIR
-// that follow this header at [`RGFX_LIBRARY_BYTES_OFFSET`], forwarded to the
-// host unchanged. The message's `size` is `RGFX_LIBRARY_BYTES_OFFSET +
-// byte_length` rounded up to a multiple of 8.
-typedef struct {
-  // [`RGFX_CMD_LIBRARY_CREATE`].
-  RgfxMsgHeader header;
-  // The new library's guest-picked id.
-  uint64_t obj_id;
-  // The length of the `.metallib`/AIR bytes that follow.
-  uint64_t byte_length;
-} RgfxLibraryCreate;
 
 // The device-info caps blob the host writes once at device init, read by the
 // guest bundle before it makes any queue. It mirrors the host device's
@@ -898,6 +1182,443 @@ typedef struct {
   uint8_t name[RGFX_DEVICE_NAME_LEN];
 } RgfxDeviceInfo;
 
+// `DISPLAY_CHANGED`: what the display offers has changed; the guest asks `GET_DISPLAYS` again.
+typedef struct {
+  // [`RGFX_EVT_DISPLAY_CHANGED`], `seqno` 0.
+  RgfxMsgHeader header;
+  // The display's id.
+  uint32_t display;
+  // Pads the message to a multiple of 8; 0.
+  uint32_t reserved_14;
+} RgfxDisplayChanged;
+
+// One display in a `DISPLAYS` message.
+typedef struct {
+  // The display's id, which the commands name.
+  uint32_t id;
+  // 1 where a display is connected, else 0.
+  uint32_t connected;
+  // The index of the mode the display prefers, among the modes that follow.
+  uint32_t preferred_mode;
+  // The modes that follow this record.
+  uint32_t mode_count;
+} RgfxDisplayEntry;
+
+// `DISPLAYS`: `GET_DISPLAYS`'s answer. `count` [`RgfxDisplayEntry`] records follow it, at
+// [`RGFX_DISPLAYS_ENTRIES_OFFSET`], each followed by its `mode_count` [`RgfxModeEntry`] records;
+// the message's `size` is rounded up to a multiple of 8 after the last. The struct is the
+// message's start: C's `sizeof` pads it past `count`, where the first record already is.
+typedef struct {
+  // [`RGFX_EVT_DISPLAYS`], with `GET_DISPLAYS`' `seqno`.
+  RgfxMsgHeader header;
+  // The displays that follow.
+  uint32_t count;
+} RgfxDisplays;
+
+// `EVENT_SIGNALLED`: the shared event `obj_id` reached `value`.
+typedef struct {
+  // [`RGFX_EVT_EVENT_SIGNALLED`], `seqno` 0.
+  RgfxMsgHeader header;
+  // The shared event that fired.
+  uint64_t obj_id;
+  // The value it reached.
+  uint64_t value;
+} RgfxEventSignalled;
+
+// One function-constant value a pipeline specialises its function with
+// (`MTLFunctionConstantValues`, by index). `value` holds the constant's raw
+// bits; a scalar or small vector up to eight bytes fits inline (a larger value
+// is a gap the host would flag rather than guess). The constant is keyed by
+// `index`; name-keyed constants are resolved to an index by the guest before it
+// serialises.
+typedef struct {
+  // The constant's index (`constantValues.setConstantValue:type:atIndex:`).
+  uint32_t index;
+  // `MTLDataType` of the constant's value.
+  uint32_t data_type;
+  // The constant's value, its raw little-endian bits, zero-extended.
+  uint64_t value;
+} RgfxFunctionConstant;
+
+// `GET_DISPLAYS`: no payload.
+typedef struct {
+  // [`RGFX_CMD_GET_DISPLAYS`].
+  RgfxMsgHeader header;
+} RgfxGetDisplays;
+
+// One element of a heap array ([`RgfxOpUseHeaps`] and the like): a heap (0 = nil).
+typedef struct {
+  // The heap, or 0 for nil.
+  uint64_t heap_obj_id;
+} RgfxHeapBinding;
+
+// `HEAP_CREATE`: a device heap of `size_bytes` at the guest-picked
+// `gpu_address`. `options` carries the heap's storage and cache modes and type.
+typedef struct {
+  // [`RGFX_CMD_HEAP_CREATE`].
+  RgfxMsgHeader header;
+  // The new heap's guest-picked id.
+  uint64_t obj_id;
+  // The heap's guest-picked GPU address.
+  uint64_t gpu_address;
+  // The heap's size in bytes.
+  uint64_t size_bytes;
+  // `MTLResourceOptions`: storage mode, cache mode, hazard tracking.
+  uint32_t options;
+  // `MTLHeapType` (Automatic, Placement or Sparse); widened on decode.
+  int32_t heap_type;
+} RgfxHeapCreate;
+
+// `HEAP_OVER_HOST_MEMORY`: a Shared heap of `size_bytes` over the block at
+// `region_offset` in the region, at the guest-picked `gpu_address`.
+typedef struct {
+  // [`RGFX_CMD_HEAP_OVER_HOST_MEMORY`].
+  RgfxMsgHeader header;
+  // The new heap's guest-picked id.
+  uint64_t obj_id;
+  // The heap's guest-picked GPU address.
+  uint64_t gpu_address;
+  // Where the heap's block starts in the region.
+  uint64_t region_offset;
+  // The heap's size in bytes.
+  uint64_t size_bytes;
+  // `MTLResourceOptions`: storage mode, cache mode, hazard tracking.
+  uint32_t options;
+  // `MTLHeapType` (Automatic, Placement or Sparse); widened on decode.
+  int32_t heap_type;
+} RgfxHeapOverHostMemory;
+
+// `LIBRARY_CREATE`: a library from `byte_length` bytes of `.metallib` or AIR
+// that follow this header at [`RGFX_LIBRARY_BYTES_OFFSET`], forwarded to the
+// host unchanged. The message's `size` is `RGFX_LIBRARY_BYTES_OFFSET +
+// byte_length` rounded up to a multiple of 8.
+typedef struct {
+  // [`RGFX_CMD_LIBRARY_CREATE`].
+  RgfxMsgHeader header;
+  // The new library's guest-picked id.
+  uint64_t obj_id;
+  // The length of the `.metallib`/AIR bytes that follow.
+  uint64_t byte_length;
+} RgfxLibraryCreate;
+
+// One mode of a display in a `DISPLAYS` message.
+typedef struct {
+  // Pixels a row.
+  uint32_t width;
+  // Rows.
+  uint32_t height;
+  // The refresh rate, in thousandths of a hertz.
+  uint32_t refresh_mhz;
+} RgfxModeEntry;
+
+// `MOVE_CURSOR`: the cursor's hot spot is at (`x`, `y`) in the display's pixels, and shows
+// where `visible` is not 0.
+typedef struct {
+  // [`RGFX_CMD_MOVE_CURSOR`].
+  RgfxMsgHeader header;
+  // The display's id.
+  uint32_t display;
+  // The hot spot's column.
+  int32_t x;
+  // The hot spot's row.
+  int32_t y;
+  // Whether the cursor shows: 0 hides it.
+  uint32_t visible;
+} RgfxMoveCursor;
+
+// `EVENT_CREATE` and `FENCE_CREATE`: a sync object with no payload but its id.
+typedef struct {
+  // [`RGFX_CMD_EVENT_CREATE`] or [`RGFX_CMD_FENCE_CREATE`].
+  RgfxMsgHeader header;
+  // The new object's guest-picked id.
+  uint64_t obj_id;
+} RgfxObjectCreate;
+
+// `OBJECT_DESTROY`: drop the host handle for `obj_id`. The handle table knows
+// the kind, so one message destroys an object of any kind.
+typedef struct {
+  // [`RGFX_CMD_OBJECT_DESTROY`].
+  RgfxMsgHeader header;
+  // The object to drop.
+  uint64_t obj_id;
+} RgfxObjectDestroy;
+
+// `dispatchThreadsPerTile:`. The `MTLSize` fields are `NSUInteger`.
+typedef struct {
+  // `threadsPerTile.width`.
+  uint64_t width;
+  // `threadsPerTile.height`.
+  uint64_t height;
+  // `threadsPerTile.depth`.
+  uint64_t depth;
+} RgfxOpDispatchThreadsPerTile;
+
+// `dispatchThreadsPerTile:inRegion:` (SPI). The region is in pixels.
+typedef struct {
+  // `threadsPerTile.width`.
+  uint64_t width;
+  // `threadsPerTile.height`.
+  uint64_t height;
+  // `threadsPerTile.depth`.
+  uint64_t depth;
+  // `region.origin.x`.
+  uint64_t origin_x;
+  // `region.origin.y`.
+  uint64_t origin_y;
+  // `region.origin.z`.
+  uint64_t origin_z;
+  // `region.size.width`.
+  uint64_t region_width;
+  // `region.size.height`.
+  uint64_t region_height;
+  // `region.size.depth`.
+  uint64_t region_depth;
+} RgfxOpDispatchThreadsPerTileInRegion;
+
+// `dispatchThreadsPerTile:inRegion:withRenderTargetArrayIndex:` (SPI). The index is
+// a `uint32_t`.
+typedef struct {
+  // `threadsPerTile.width`.
+  uint64_t width;
+  // `threadsPerTile.height`.
+  uint64_t height;
+  // `threadsPerTile.depth`.
+  uint64_t depth;
+  // `region.origin.x`.
+  uint64_t origin_x;
+  // `region.origin.y`.
+  uint64_t origin_y;
+  // `region.origin.z`.
+  uint64_t origin_z;
+  // `region.size.width`.
+  uint64_t region_width;
+  // `region.size.height`.
+  uint64_t region_height;
+  // `region.size.depth`.
+  uint64_t region_depth;
+  // `renderTargetArrayIndex`.
+  uint32_t render_target_array_index;
+  // Pads to a multiple of 8; 0.
+  uint32_t reserved_4c;
+} RgfxOpDispatchThreadsPerTileInRegionIndex;
+
+// `drawIndexedPatches:patchStart:patchCount:patchIndexBuffer:patchIndexBufferOffset:controlPointIndexBuffer:controlPointIndexBufferOffset:instanceCount:baseInstance:`.
+// The patch index buffer may be nil; the control-point index buffer must name an
+// object.
+typedef struct {
+  // Control points per patch.
+  uint64_t number_of_patch_control_points;
+  // The first patch.
+  uint64_t patch_start;
+  // The patches to draw.
+  uint64_t patch_count;
+  // The patch index buffer, or 0 for nil.
+  uint64_t patch_index_buffer_obj_id;
+  // The offset into the patch index buffer.
+  uint64_t patch_index_buffer_offset;
+  // The control-point index buffer (must not be nil).
+  uint64_t control_point_index_buffer_obj_id;
+  // The offset into the control-point index buffer.
+  uint64_t control_point_index_buffer_offset;
+  // The instances to draw.
+  uint64_t instance_count;
+  // The first instance.
+  uint64_t base_instance;
+} RgfxOpDrawIndexedPatches;
+
+// `drawIndexedPatches:patchIndexBuffer:patchIndexBufferOffset:controlPointIndexBuffer:controlPointIndexBufferOffset:indirectBuffer:indirectBufferOffset:`.
+// The patch index buffer may be nil; the control-point index and indirect buffers
+// must name an object.
+typedef struct {
+  // Control points per patch.
+  uint64_t number_of_patch_control_points;
+  // The patch index buffer, or 0 for nil.
+  uint64_t patch_index_buffer_obj_id;
+  // The offset into the patch index buffer.
+  uint64_t patch_index_buffer_offset;
+  // The control-point index buffer (must not be nil).
+  uint64_t control_point_index_buffer_obj_id;
+  // The offset into the control-point index buffer.
+  uint64_t control_point_index_buffer_offset;
+  // The indirect-arguments buffer (must not be nil).
+  uint64_t indirect_buffer_obj_id;
+  // The offset into the indirect buffer.
+  uint64_t indirect_buffer_offset;
+} RgfxOpDrawIndexedPatchesIndirect;
+
+// `drawIndexedPrimitives:indexCount:indexType:indexBuffer:indexBufferOffset:`.
+// The index buffer must name an object (nil faults the stream).
+typedef struct {
+  // `MTLPrimitiveType`.
+  uint64_t primitive_type;
+  // The indices to draw.
+  uint64_t index_count;
+  // `MTLIndexType`.
+  uint64_t index_type;
+  // The index buffer (must not be nil).
+  uint64_t index_buffer_obj_id;
+  // The offset into the index buffer.
+  uint64_t index_buffer_offset;
+} RgfxOpDrawIndexedPrimitives;
+
+// `drawIndexedPrimitives:indexCount:indexType:indexBuffer:indexBufferOffset:instanceCount:baseVertex:baseInstance:`.
+// The index buffer must name an object; `base_vertex` is signed.
+typedef struct {
+  // `MTLPrimitiveType`.
+  uint64_t primitive_type;
+  // The indices to draw.
+  uint64_t index_count;
+  // `MTLIndexType`.
+  uint64_t index_type;
+  // The index buffer (must not be nil).
+  uint64_t index_buffer_obj_id;
+  // The offset into the index buffer.
+  uint64_t index_buffer_offset;
+  // The instances to draw.
+  uint64_t instance_count;
+  // The value added to each index before fetching a vertex (`NSInteger`).
+  int64_t base_vertex;
+  // The first instance.
+  uint64_t base_instance;
+} RgfxOpDrawIndexedPrimitivesBase;
+
+// `drawIndexedPrimitives:indexType:indexBuffer:indexBufferOffset:indirectBuffer:indirectBufferOffset:`.
+// Both buffers must name an object.
+typedef struct {
+  // `MTLPrimitiveType`.
+  uint64_t primitive_type;
+  // `MTLIndexType`.
+  uint64_t index_type;
+  // The index buffer (must not be nil).
+  uint64_t index_buffer_obj_id;
+  // The offset into the index buffer.
+  uint64_t index_buffer_offset;
+  // The indirect-arguments buffer (must not be nil).
+  uint64_t indirect_buffer_obj_id;
+  // The offset into the indirect buffer.
+  uint64_t indirect_buffer_offset;
+} RgfxOpDrawIndexedPrimitivesIndirect;
+
+// `drawIndexedPrimitives:indexCount:indexType:indexBuffer:indexBufferOffset:instanceCount:`.
+// The index buffer must name an object.
+typedef struct {
+  // `MTLPrimitiveType`.
+  uint64_t primitive_type;
+  // The indices to draw.
+  uint64_t index_count;
+  // `MTLIndexType`.
+  uint64_t index_type;
+  // The index buffer (must not be nil).
+  uint64_t index_buffer_obj_id;
+  // The offset into the index buffer.
+  uint64_t index_buffer_offset;
+  // The instances to draw.
+  uint64_t instance_count;
+} RgfxOpDrawIndexedPrimitivesInstances;
+
+// `drawPatches:patchStart:patchCount:patchIndexBuffer:patchIndexBufferOffset:instanceCount:baseInstance:`.
+// The patch index buffer may be nil (`0`).
+typedef struct {
+  // Control points per patch.
+  uint64_t number_of_patch_control_points;
+  // The first patch.
+  uint64_t patch_start;
+  // The patches to draw.
+  uint64_t patch_count;
+  // The patch index buffer, or 0 for nil.
+  uint64_t patch_index_buffer_obj_id;
+  // The offset into the patch index buffer.
+  uint64_t patch_index_buffer_offset;
+  // The instances to draw.
+  uint64_t instance_count;
+  // The first instance.
+  uint64_t base_instance;
+} RgfxOpDrawPatches;
+
+// `drawPatches:patchIndexBuffer:patchIndexBufferOffset:indirectBuffer:indirectBufferOffset:`.
+// The patch index buffer may be nil; the indirect buffer must name an object.
+typedef struct {
+  // Control points per patch.
+  uint64_t number_of_patch_control_points;
+  // The patch index buffer, or 0 for nil.
+  uint64_t patch_index_buffer_obj_id;
+  // The offset into the patch index buffer.
+  uint64_t patch_index_buffer_offset;
+  // The indirect-arguments buffer (must not be nil).
+  uint64_t indirect_buffer_obj_id;
+  // The offset into the indirect buffer.
+  uint64_t indirect_buffer_offset;
+} RgfxOpDrawPatchesIndirect;
+
+// `drawPrimitives:vertexStart:vertexCount:`.
+typedef struct {
+  // `MTLPrimitiveType`.
+  uint64_t primitive_type;
+  // The first vertex.
+  uint64_t vertex_start;
+  // The vertices to draw.
+  uint64_t vertex_count;
+} RgfxOpDrawPrimitives;
+
+// `drawPrimitives:vertexStart:vertexCount:instanceCount:baseInstance:`.
+typedef struct {
+  // `MTLPrimitiveType`.
+  uint64_t primitive_type;
+  // The first vertex.
+  uint64_t vertex_start;
+  // The vertices to draw.
+  uint64_t vertex_count;
+  // The instances to draw.
+  uint64_t instance_count;
+  // The first instance.
+  uint64_t base_instance;
+} RgfxOpDrawPrimitivesBase;
+
+// `drawPrimitives:indirectBuffer:indirectBufferOffset:`. The indirect buffer must
+// name an object (nil faults the stream).
+typedef struct {
+  // `MTLPrimitiveType`.
+  uint64_t primitive_type;
+  // The indirect-arguments buffer (must not be nil).
+  uint64_t indirect_buffer_obj_id;
+  // The offset into the indirect buffer.
+  uint64_t indirect_buffer_offset;
+} RgfxOpDrawPrimitivesIndirect;
+
+// `drawPrimitives:vertexStart:vertexCount:instanceCount:`.
+typedef struct {
+  // `MTLPrimitiveType`.
+  uint64_t primitive_type;
+  // The first vertex.
+  uint64_t vertex_start;
+  // The vertices to draw.
+  uint64_t vertex_count;
+  // The instances to draw.
+  uint64_t instance_count;
+} RgfxOpDrawPrimitivesInstances;
+
+// `executeCommandsInBuffer:withRange:`. The indirect command buffer must name an
+// object.
+typedef struct {
+  // The indirect command buffer (must not be nil).
+  uint64_t indirect_command_buffer_obj_id;
+  // `range.location`.
+  uint64_t range_location;
+  // `range.length`.
+  uint64_t range_length;
+} RgfxOpExecuteCommandsInBuffer;
+
+// `executeCommandsInBuffer:indirectBuffer:indirectBufferOffset:`. Both the indirect
+// command buffer and the range buffer must name an object.
+typedef struct {
+  // The indirect command buffer (must not be nil).
+  uint64_t indirect_command_buffer_obj_id;
+  // The buffer holding the execution range (must not be nil).
+  uint64_t indirect_range_buffer_obj_id;
+  // The offset into the range buffer.
+  uint64_t indirect_buffer_offset;
+} RgfxOpExecuteCommandsIndirect;
+
 // Every op's header: its tag, its flags and its total byte count.
 typedef struct {
   // The op's tag: its group ([`op_group`]) and its op within the group.
@@ -908,22 +1629,597 @@ typedef struct {
   uint32_t len;
 } RgfxOpHeader;
 
-// `COMMAND_BUFFER` ([`RGFX_CMD_COMMAND_BUFFER`](crate::wire::RGFX_CMD_COMMAND_BUFFER)):
-// one command buffer on a queue's submission ring. The op stream (`op_bytes`
-// bytes) follows this message at [`RGFX_COMMAND_BUFFER_OPS_OFFSET`]; the host
-// opens a command buffer on the queue `queue_obj_id`, walks the ops, commits,
-// and answers an [`RgfxCbComplete`](crate::wire::RgfxCbComplete) carrying
-// `cb_obj_id` when the work finishes.
+// `memoryBarrierWithScope:afterStages:beforeStages:`.
 typedef struct {
-  // [`RGFX_CMD_COMMAND_BUFFER`](crate::wire::RGFX_CMD_COMMAND_BUFFER).
+  // `MTLBarrierScope`.
+  uint64_t scope;
+  // `MTLRenderStages` the barrier is after.
+  uint64_t after;
+  // `MTLRenderStages` the barrier is before.
+  uint64_t before;
+} RgfxOpMemoryBarrierWithScope;
+
+// `setAlphaTestReferenceValue:` (SPI). The value travels as its `f32` bits.
+typedef struct {
+  // `referenceValue` as `f32` bits.
+  uint32_t reference_value_bits;
+  // Pads to a multiple of 8; 0.
+  uint32_t reserved_04;
+} RgfxOpSetAlphaTestReferenceValue;
+
+// `setBlendColorRed:green:blue:alpha:`. Each channel travels as its `f32` bits.
+typedef struct {
+  // `red` as `f32` bits.
+  uint32_t red_bits;
+  // `green` as `f32` bits.
+  uint32_t green_bits;
+  // `blue` as `f32` bits.
+  uint32_t blue_bits;
+  // `alpha` as `f32` bits.
+  uint32_t alpha_bits;
+} RgfxOpSetBlendColorRed;
+
+// `setColorResolveTexture:slice:depthPlane:level:yInvert:atIndex:` (SPI). The
+// texture may be nil (`0`).
+typedef struct {
+  // The resolve texture, or 0 for nil.
+  uint64_t texture_obj_id;
+  // The slice.
+  uint64_t slice;
+  // The depth plane.
+  uint64_t depth_plane;
+  // The mip level.
+  uint64_t level;
+  // The colour attachment index.
+  uint64_t index;
+  // `yInvert` (0 or 1).
+  uint32_t y_invert;
+  // Pads to a multiple of 8; 0.
+  uint32_t reserved_2c;
+} RgfxOpSetColorResolveTexture;
+
+// `setColorStoreAction:atIndex:`.
+typedef struct {
+  // `MTLStoreAction`.
+  uint64_t store_action;
+  // The colour attachment index.
+  uint64_t color_attachment_index;
+} RgfxOpSetColorStoreAction;
+
+// `setColorStoreActionOptions:atIndex:`.
+typedef struct {
+  // `MTLStoreActionOptions`.
+  uint64_t store_action_options;
+  // The colour attachment index.
+  uint64_t color_attachment_index;
+} RgfxOpSetColorStoreActionOptions;
+
+// `setCullMode:`.
+typedef struct {
+  // `MTLCullMode`.
+  uint64_t cull_mode;
+} RgfxOpSetCullMode;
+
+// `setDepthBias:slopeScale:clamp:`. Each argument travels as its `f32` bits.
+typedef struct {
+  // `depthBias` as `f32` bits.
+  uint32_t depth_bias_bits;
+  // `slopeScale` as `f32` bits.
+  uint32_t slope_scale_bits;
+  // `clamp` as `f32` bits.
+  uint32_t clamp_bits;
+  // Pads to a multiple of 8; 0.
+  uint32_t reserved_0c;
+} RgfxOpSetDepthBias;
+
+// `setDepthClipModeSPI:` (SPI).
+typedef struct {
+  // `MTLDepthClipMode`.
+  uint64_t mode;
+} RgfxOpSetDepthClipModeSpi;
+
+// `setDepthResolveTexture:slice:depthPlane:level:yInvert:` (SPI). The texture may be
+// nil (`0`).
+typedef struct {
+  // The resolve texture, or 0 for nil.
+  uint64_t texture_obj_id;
+  // The slice.
+  uint64_t slice;
+  // The depth plane.
+  uint64_t depth_plane;
+  // The mip level.
+  uint64_t level;
+  // `yInvert` (0 or 1).
+  uint32_t y_invert;
+  // Pads to a multiple of 8; 0.
+  uint32_t reserved_24;
+} RgfxOpSetDepthResolveTexture;
+
+// `setDepthStencilState:`. The state may be nil (`0`).
+typedef struct {
+  // The depth/stencil state, or 0 for nil.
+  uint64_t depth_stencil_state_obj_id;
+} RgfxOpSetDepthStencilState;
+
+// `setDepthStoreAction:`.
+typedef struct {
+  // `MTLStoreAction`.
+  uint64_t store_action;
+} RgfxOpSetDepthStoreAction;
+
+// `setFragmentBuffer:offset:atIndex:`. The buffer may be nil (`0`).
+typedef struct {
+  // The buffer, or 0 for nil.
+  uint64_t buffer_obj_id;
+  // The offset into the buffer.
+  uint64_t offset;
+  // The buffer binding index.
+  uint64_t index;
+} RgfxOpSetFragmentBuffer;
+
+// `setFragmentBufferOffset:atIndex:`.
+typedef struct {
+  // The new offset.
+  uint64_t offset;
+  // The buffer binding index.
+  uint64_t index;
+} RgfxOpSetFragmentBufferOffset;
+
+// `setFragmentBuffers:offsets:withRange:`. `range.length` [`RgfxBufferBinding`]
+// records follow at `size_of::<Self>()`.
+typedef struct {
+  // `range.location`: the first binding index.
+  uint64_t range_location;
+  // `range.length`: the [`RgfxBufferBinding`] records that follow.
+  uint64_t range_length;
+} RgfxOpSetFragmentBuffers;
+
+// `setFragmentSamplerStates:withRange:`. `range.length` [`RgfxSamplerBinding`]
+// records follow at `size_of::<Self>()`.
+typedef struct {
+  // `range.location`: the first binding index.
+  uint64_t range_location;
+  // `range.length`: the [`RgfxSamplerBinding`] records that follow.
+  uint64_t range_length;
+} RgfxOpSetFragmentSamplerStates;
+
+// `setFragmentSamplerStates:lodMinClamps:lodMaxClamps:withRange:`. `range.length`
+// [`RgfxSamplerLodBinding`] records follow at `size_of::<Self>()`.
+typedef struct {
+  // `range.location`: the first binding index.
+  uint64_t range_location;
+  // `range.length`: the [`RgfxSamplerLodBinding`] records that follow.
+  uint64_t range_length;
+} RgfxOpSetFragmentSamplerStatesLodClamps;
+
+// `setFragmentTexture:atIndex:`. The texture may be nil (`0`).
+typedef struct {
+  // The texture, or 0 for nil.
+  uint64_t texture_obj_id;
+  // The texture binding index.
+  uint64_t index;
+} RgfxOpSetFragmentTexture;
+
+// `setFragmentTextures:withRange:`. `range.length` [`RgfxTextureBinding`] records
+// follow at `size_of::<Self>()`.
+typedef struct {
+  // `range.location`: the first binding index.
+  uint64_t range_location;
+  // `range.length`: the [`RgfxTextureBinding`] records that follow.
+  uint64_t range_length;
+} RgfxOpSetFragmentTextures;
+
+// `setFrontFacingWinding:`.
+typedef struct {
+  // `MTLWinding`.
+  uint64_t front_facing_winding;
+} RgfxOpSetFrontFacingWinding;
+
+// `setLineWidth:` (SPI). The width travels as its `f32` bits.
+typedef struct {
+  // `lineWidth` as `f32` bits.
+  uint32_t line_width_bits;
+  // Pads to a multiple of 8; 0.
+  uint32_t reserved_04;
+} RgfxOpSetLineWidth;
+
+// `setPointSize:` (SPI). The size travels as its `f32` bits.
+typedef struct {
+  // `pointSize` as `f32` bits.
+  uint32_t point_size_bits;
+  // Pads to a multiple of 8; 0.
+  uint32_t reserved_04;
+} RgfxOpSetPointSize;
+
+// `setPrimitiveRestartEnabled:index:` (SPI). `enabled` is a `BOOL` (0 or 1).
+typedef struct {
+  // The restart index.
+  uint64_t index;
+  // `enabled` (0 or 1).
+  uint32_t enabled;
+  // Pads to a multiple of 8; 0.
+  uint32_t reserved_0c;
+} RgfxOpSetPrimitiveRestartEnabled;
+
+// `setProvokingVertexMode:` (SPI).
+typedef struct {
+  // The provoking-vertex mode.
+  uint64_t mode;
+} RgfxOpSetProvokingVertexMode;
+
+// `setRenderPipelineState:`. The pipeline may be nil (`0`).
+typedef struct {
+  // The render pipeline state, or 0 for nil.
+  uint64_t pipeline_obj_id;
+} RgfxOpSetRenderPipelineState;
+
+// `setScissorRect:`. The four `MTLScissorRect` fields are `NSUInteger`.
+typedef struct {
+  // `x`.
+  uint64_t x;
+  // `y`.
+  uint64_t y;
+  // `width`.
+  uint64_t width;
+  // `height`.
+  uint64_t height;
+} RgfxOpSetScissorRect;
+
+// `setScissorRects:count:`. `count` [`RgfxScissorRectElem`] records follow at
+// `size_of::<Self>()`.
+typedef struct {
+  // The [`RgfxScissorRectElem`] records that follow.
+  uint64_t count;
+} RgfxOpSetScissorRects;
+
+// `setStencilFrontReferenceValue:backReferenceValue:`. Each value is a `uint32_t`.
+typedef struct {
+  // The front reference value.
+  uint32_t front_reference_value;
+  // The back reference value.
+  uint32_t back_reference_value;
+} RgfxOpSetStencilFrontReferenceValue;
+
+// `setStencilResolveTexture:slice:depthPlane:level:yInvert:` (SPI). The texture may
+// be nil (`0`).
+typedef struct {
+  // The resolve texture, or 0 for nil.
+  uint64_t texture_obj_id;
+  // The slice.
+  uint64_t slice;
+  // The depth plane.
+  uint64_t depth_plane;
+  // The mip level.
+  uint64_t level;
+  // `yInvert` (0 or 1).
+  uint32_t y_invert;
+  // Pads to a multiple of 8; 0.
+  uint32_t reserved_24;
+} RgfxOpSetStencilResolveTexture;
+
+// `setStencilStoreAction:`.
+typedef struct {
+  // `MTLStoreAction`.
+  uint64_t store_action;
+} RgfxOpSetStencilStoreAction;
+
+// `setStencilStoreActionOptions:`.
+typedef struct {
+  // `MTLStoreActionOptions`.
+  uint64_t store_action_options;
+} RgfxOpSetStencilStoreActionOptions;
+
+// `setTessellationFactorBuffer:offset:instanceStride:`. The buffer may be nil (`0`).
+typedef struct {
+  // The tessellation factor buffer, or 0 for nil.
+  uint64_t buffer_obj_id;
+  // The offset into the buffer.
+  uint64_t offset;
+  // The instance stride.
+  uint64_t instance_stride;
+} RgfxOpSetTessellationFactorBuffer;
+
+// `setTessellationFactorScale:`. The scale travels as its `f32` bits.
+typedef struct {
+  // `scale` as `f32` bits.
+  uint32_t scale_bits;
+  // Pads to a multiple of 8; 0.
+  uint32_t reserved_04;
+} RgfxOpSetTessellationFactorScale;
+
+// `setThreadgroupMemoryLength:offset:atIndex:`.
+typedef struct {
+  // The threadgroup memory length.
+  uint64_t length;
+  // The offset.
+  uint64_t offset;
+  // The binding index.
+  uint64_t index;
+} RgfxOpSetThreadgroupMemoryLength;
+
+// `setTileBufferOffset:atIndex:`.
+typedef struct {
+  // The new offset.
+  uint64_t offset;
+  // The buffer binding index.
+  uint64_t index;
+} RgfxOpSetTileBufferOffset;
+
+// `setTileBuffers:offsets:withRange:`. `range.length` [`RgfxBufferBinding`] records
+// follow at `size_of::<Self>()`.
+typedef struct {
+  // `range.location`: the first binding index.
+  uint64_t range_location;
+  // `range.length`: the [`RgfxBufferBinding`] records that follow.
+  uint64_t range_length;
+} RgfxOpSetTileBuffers;
+
+// `setTileSamplerStates:withRange:`. `range.length` [`RgfxSamplerBinding`] records
+// follow at `size_of::<Self>()`.
+typedef struct {
+  // `range.location`: the first binding index.
+  uint64_t range_location;
+  // `range.length`: the [`RgfxSamplerBinding`] records that follow.
+  uint64_t range_length;
+} RgfxOpSetTileSamplerStates;
+
+// `setTileSamplerStates:lodMinClamps:lodMaxClamps:withRange:`. `range.length`
+// [`RgfxSamplerLodBinding`] records follow at `size_of::<Self>()`.
+typedef struct {
+  // `range.location`: the first binding index.
+  uint64_t range_location;
+  // `range.length`: the [`RgfxSamplerLodBinding`] records that follow.
+  uint64_t range_length;
+} RgfxOpSetTileSamplerStatesLodClamps;
+
+// `setTileTextures:withRange:`. `range.length` [`RgfxTextureBinding`] records follow
+// at `size_of::<Self>()`.
+typedef struct {
+  // `range.location`: the first binding index.
+  uint64_t range_location;
+  // `range.length`: the [`RgfxTextureBinding`] records that follow.
+  uint64_t range_length;
+} RgfxOpSetTileTextures;
+
+// `setTriangleFillMode:`.
+typedef struct {
+  // `MTLTriangleFillMode`.
+  uint64_t fill_mode;
+} RgfxOpSetTriangleFillMode;
+
+// `setVertexAmplificationCount:viewMappings:`. `count` [`RgfxViewMapping`] records
+// follow at `size_of::<Self>()`; the amplification count is `count`.
+typedef struct {
+  // The [`RgfxViewMapping`] records that follow, and the amplification count.
+  uint64_t count;
+} RgfxOpSetVertexAmplificationCount;
+
+// `setVertexAmplificationMode:value:` (SPI).
+typedef struct {
+  // The amplification mode.
+  uint64_t mode;
+  // The amplification value.
+  uint64_t value;
+} RgfxOpSetVertexAmplificationMode;
+
+// `setVertexBuffer:offset:atIndex:`. The buffer may be nil (`0`).
+typedef struct {
+  // The buffer, or 0 for nil.
+  uint64_t buffer_obj_id;
+  // The offset into the buffer.
+  uint64_t offset;
+  // The buffer binding index.
+  uint64_t index;
+} RgfxOpSetVertexBuffer;
+
+// `setVertexBufferOffset:atIndex:`.
+typedef struct {
+  // The new offset.
+  uint64_t offset;
+  // The buffer binding index.
+  uint64_t index;
+} RgfxOpSetVertexBufferOffset;
+
+// `setVertexBufferOffset:attributeStride:atIndex:`.
+typedef struct {
+  // The new offset.
+  uint64_t offset;
+  // The attribute stride.
+  uint64_t stride;
+  // The buffer binding index.
+  uint64_t index;
+} RgfxOpSetVertexBufferOffsetAttributeStride;
+
+// `setVertexBuffers:offsets:withRange:`. `range.length` [`RgfxBufferBinding`]
+// records follow at `size_of::<Self>()`.
+typedef struct {
+  // `range.location`: the first binding index.
+  uint64_t range_location;
+  // `range.length`: the [`RgfxBufferBinding`] records that follow.
+  uint64_t range_length;
+} RgfxOpSetVertexBuffers;
+
+// `setVertexBuffers:offsets:attributeStrides:withRange:`. `range.length`
+// [`RgfxBufferStrideBinding`] records follow at `size_of::<Self>()`.
+typedef struct {
+  // `range.location`: the first binding index.
+  uint64_t range_location;
+  // `range.length`: the [`RgfxBufferStrideBinding`] records that follow.
+  uint64_t range_length;
+} RgfxOpSetVertexBuffersAttributeStrides;
+
+// `setVertexSamplerStates:withRange:`. `range.length` [`RgfxSamplerBinding`] records
+// follow at `size_of::<Self>()`.
+typedef struct {
+  // `range.location`: the first binding index.
+  uint64_t range_location;
+  // `range.length`: the [`RgfxSamplerBinding`] records that follow.
+  uint64_t range_length;
+} RgfxOpSetVertexSamplerStates;
+
+// `setVertexSamplerStates:lodMinClamps:lodMaxClamps:withRange:`. `range.length`
+// [`RgfxSamplerLodBinding`] records follow at `size_of::<Self>()`.
+typedef struct {
+  // `range.location`: the first binding index.
+  uint64_t range_location;
+  // `range.length`: the [`RgfxSamplerLodBinding`] records that follow.
+  uint64_t range_length;
+} RgfxOpSetVertexSamplerStatesLodClamps;
+
+// `setVertexTextures:withRange:`. `range.length` [`RgfxTextureBinding`] records
+// follow at `size_of::<Self>()`.
+typedef struct {
+  // `range.location`: the first binding index.
+  uint64_t range_location;
+  // `range.length`: the [`RgfxTextureBinding`] records that follow.
+  uint64_t range_length;
+} RgfxOpSetVertexTextures;
+
+// `setViewport:`. The six `MTLViewport` fields travel as the bits of their `f64`.
+typedef struct {
+  // `originX` as `f64` bits.
+  uint64_t origin_x_bits;
+  // `originY` as `f64` bits.
+  uint64_t origin_y_bits;
+  // `width` as `f64` bits.
+  uint64_t width_bits;
+  // `height` as `f64` bits.
+  uint64_t height_bits;
+  // `znear` as `f64` bits.
+  uint64_t znear_bits;
+  // `zfar` as `f64` bits.
+  uint64_t zfar_bits;
+} RgfxOpSetViewport;
+
+// `setViewportTransformEnabled:` (SPI). `enabled` is a `BOOL` (0 or 1).
+typedef struct {
+  // `enabled` (0 or 1).
+  uint32_t enabled;
+  // Pads to a multiple of 8; 0.
+  uint32_t reserved_04;
+} RgfxOpSetViewportTransformEnabled;
+
+// `setViewports:count:`. `count` [`RgfxViewportElem`] records follow at
+// `size_of::<Self>()`.
+typedef struct {
+  // The [`RgfxViewportElem`] records that follow.
+  uint64_t count;
+} RgfxOpSetViewports;
+
+// `setVisibilityResultMode:offset:`.
+typedef struct {
+  // `MTLVisibilityResultMode`.
+  uint64_t mode;
+  // The offset into the visibility result buffer.
+  uint64_t offset;
+} RgfxOpSetVisibilityResultMode;
+
+// `updateFence:afterStages:`. The fence must name an object.
+typedef struct {
+  // The fence (must not be nil).
+  uint64_t fence_obj_id;
+  // `MTLRenderStages`.
+  uint64_t stages;
+} RgfxOpUpdateFence;
+
+// `useHeaps:count:`. `count` [`RgfxHeapBinding`] records follow at
+// `size_of::<Self>()`.
+typedef struct {
+  // The [`RgfxHeapBinding`] records that follow.
+  uint64_t count;
+} RgfxOpUseHeaps;
+
+// `useHeaps:count:stages:`. `count` [`RgfxHeapBinding`] records follow at
+// `size_of::<Self>()`.
+typedef struct {
+  // The [`RgfxHeapBinding`] records that follow.
+  uint64_t count;
+  // `MTLRenderStages`.
+  uint64_t stages;
+} RgfxOpUseHeapsStages;
+
+// `useResources:count:usage:`. `count` [`RgfxResourceBinding`] records follow at
+// `size_of::<Self>()`.
+typedef struct {
+  // The [`RgfxResourceBinding`] records that follow.
+  uint64_t count;
+  // `MTLResourceUsage`.
+  uint64_t usage;
+} RgfxOpUseResources;
+
+// `useResources:count:usage:stages:`. `count` [`RgfxResourceBinding`] records follow
+// at `size_of::<Self>()`.
+typedef struct {
+  // The [`RgfxResourceBinding`] records that follow.
+  uint64_t count;
+  // `MTLResourceUsage`.
+  uint64_t usage;
+  // `MTLRenderStages`.
+  uint64_t stages;
+} RgfxOpUseResourcesStages;
+
+// `waitForFence:beforeStages:`. The fence must name an object.
+typedef struct {
+  // The fence (must not be nil).
+  uint64_t fence_obj_id;
+  // `MTLRenderStages`.
+  uint64_t stages;
+} RgfxOpWaitForFence;
+
+// `PIPELINE_REFLECTION`: a pipeline create's answer, with the pipeline state's
+// own queries (the host platform exposes no per-argument binding reflection, so
+// the argument tables Metal's `MTLRenderPipelineReflection` would carry are not
+// here — a platform gap recorded with the host decoder). On a refusal `status`
+// is [`RGFX_PIPELINE_REFUSED`] and the metrics are 0.
+typedef struct {
+  // [`RGFX_EVT_PIPELINE_REFLECTION`], with the create's `seqno`.
   RgfxMsgHeader header;
-  // The command queue this buffer belongs to.
-  uint64_t queue_obj_id;
-  // The command buffer's guest-picked id, which its completion names.
-  uint64_t cb_obj_id;
-  // The bytes of op stream that follow this message.
-  uint64_t op_bytes;
-} RgfxCommandBuffer;
+  // The pipeline the create named.
+  uint64_t obj_id;
+  // `gpuResourceID` (`MTLResourceID._impl`).
+  uint64_t gpu_resource_id;
+  // `uniqueIdentifier`, as the guest reads it (the state's identity).
+  uint64_t unique_identifier;
+  // `maxTotalThreadsPerThreadgroup`.
+  uint64_t max_total_threads_per_threadgroup;
+  // `staticThreadgroupMemoryLength` (compute; 0 for render).
+  uint64_t static_threadgroup_memory_length;
+  // `threadExecutionWidth` (compute; 0 for render).
+  uint32_t thread_execution_width;
+  // `imageblockSampleLength` (render; 0 for compute).
+  uint32_t imageblock_sample_length;
+  // `resourceIndex` (the state's argument-buffer index).
+  uint32_t resource_index;
+  // An `RGFX_PIPELINE_*` status.
+  uint32_t status;
+  // An `RGFX_PIPELINE_KIND_*`.
+  uint32_t kind;
+  // The `RGFX_PIPELINE_REFLECT_*` flags.
+  uint32_t flags;
+} RgfxPipelineReflection;
+
+// `QUEUE_CREATE`: a command queue and its submission+completion ring pair, each
+// a [`RgfxRingHeader`] followed by a byte ring of the given data size (a power
+// of two) at the given region offset. The completion ring raises `vector`.
+typedef struct {
+  // [`RGFX_CMD_QUEUE_CREATE`].
+  RgfxMsgHeader header;
+  // The new queue's guest-picked id.
+  uint64_t obj_id;
+  // Where the submission ring (guest to host) starts in the region.
+  uint64_t submit_offset;
+  // Where the completion ring (host to guest) starts in the region.
+  uint64_t complete_offset;
+  // The submission ring's byte-ring size, after its header: a power of two.
+  uint32_t submit_data_size;
+  // The completion ring's byte-ring size, after its header: a power of two.
+  uint32_t complete_data_size;
+  // The queue's priority; the host gives its VkQueue a matching priority so
+  // WindowServer's queue runs high. 0 is normal, higher is higher.
+  uint32_t priority;
+  // The MSI-X vector the completion ring raises.
+  uint32_t vector;
+} RgfxQueueCreate;
 
 // One colour attachment of a render pass (`colorAttachments[i]`). Absent (sets
 // nothing) when `texture_obj_id` is 0.
@@ -1044,49 +2340,370 @@ typedef struct {
   RgfxRenderPassStencilAttachment stencil;
 } RgfxRenderPassDesc;
 
-// The body of an `ENCODER_BEGIN_COMPUTE` op: the compute pass's properties.
+// `RENDER_PIPELINE_CREATE`: a render pipeline from a descriptor, answered by
+// [`RgfxPipelineReflection`] on the queue's completion ring with this create's
+// `seqno`.
+//
+// The vertex and fragment functions are each named by a library `obj_id` and an
+// entry-point name in the message tail (`*_name_offset`/`*_name_len`, byte
+// offsets from the message start), optionally specialised by a run of
+// [`RgfxFunctionConstant`] in the tail (`*_constants_offset`/`*_constant_count`).
+// The vertex descriptor's layouts and attributes are runs of
+// [`RgfxVertexBufferLayout`] and [`RgfxVertexAttribute`] in the tail. The colour
+// attachments are inline, `color_attachment_count` of
+// [`RgfxColorAttachmentDesc`] in use. The optional pipeline `label` is tail
+// bytes (`label_len` 0 for none). The whole message's `size` is the fixed head
+// plus the tail, rounded up to a multiple of 8.
 typedef struct {
-  // `MTLDispatchType`, when [`RGFX_COMPUTE_PASS_FLAG_DISPATCH_TYPE`] is set.
-  uint32_t dispatch_type;
-  // An `RGFX_COMPUTE_PASS_FLAG_*` set.
+  // [`RGFX_CMD_RENDER_PIPELINE_CREATE`].
+  RgfxMsgHeader header;
+  // The new pipeline's guest-picked id.
+  uint64_t obj_id;
+  // The library the vertex function comes from.
+  uint64_t vertex_library_obj_id;
+  // The library the fragment function comes from.
+  uint64_t fragment_library_obj_id;
+  // The vertex entry-point name's byte offset from the message start.
+  uint32_t vertex_name_offset;
+  // The vertex entry-point name's length in bytes.
+  uint32_t vertex_name_len;
+  // The fragment entry-point name's byte offset from the message start.
+  uint32_t fragment_name_offset;
+  // The fragment entry-point name's length in bytes.
+  uint32_t fragment_name_len;
+  // The pipeline label's byte offset from the message start (0-length: none).
+  uint32_t label_offset;
+  // The pipeline label's length in bytes; 0 for no label.
+  uint32_t label_len;
+  // The vertex function constants' byte offset from the message start.
+  uint32_t vertex_constants_offset;
+  // The number of [`RgfxFunctionConstant`] for the vertex function.
+  uint32_t vertex_constant_count;
+  // The fragment function constants' byte offset from the message start.
+  uint32_t fragment_constants_offset;
+  // The number of [`RgfxFunctionConstant`] for the fragment function.
+  uint32_t fragment_constant_count;
+  // The vertex buffer layouts' byte offset from the message start.
+  uint32_t vertex_layouts_offset;
+  // The number of [`RgfxVertexBufferLayout`] in the vertex descriptor.
+  uint32_t vertex_layout_count;
+  // The vertex attributes' byte offset from the message start.
+  uint32_t vertex_attributes_offset;
+  // The number of [`RgfxVertexAttribute`] in the vertex descriptor.
+  uint32_t vertex_attribute_count;
+  // `rasterSampleCount` (the raster/colour sample count).
+  uint32_t raster_sample_count;
+  // The colour attachments in use, up to 8 (the length of `colors`).
+  uint32_t color_attachment_count;
+  // `depthAttachmentPixelFormat` (`MTLPixelFormat`; 0 for none).
+  uint32_t depth_pixel_format;
+  // `stencilAttachmentPixelFormat` (`MTLPixelFormat`; 0 for none).
+  uint32_t stencil_pixel_format;
+  // The `RGFX_RENDER_PIPELINE_*` boolean flags.
   uint32_t flags;
-} RgfxComputePassDesc;
+  // `inputPrimitiveTopology` (`MTLPrimitiveTopologyClass`).
+  uint32_t input_primitive_topology;
+  // `maxVertexAmplificationCount`.
+  uint32_t max_vertex_amplification_count;
+  // Pads `colors` to an 8-aligned offset; 0.
+  uint32_t reserved_7c;
+  // The eight colour attachments; `color_attachment_count` are in use, the
+  // rest zeroed.
+  RgfxColorAttachmentDesc colors[8];
+} RgfxRenderPipelineCreate;
 
-// `setRenderPipelineState:`. The pipeline may be nil (`0`).
+// One element of a resource array ([`RgfxOpUseResources`] and the like): a resource
+// (0 = nil) and its [kind](RGFX_RESOURCE_KIND_BUFFER), which says how the host
+// resolves it.
 typedef struct {
-  // The render pipeline state, or 0 for nil.
-  uint64_t pipeline_obj_id;
-} RgfxOpSetRenderPipelineState;
+  // The resource, or 0 for nil.
+  uint64_t obj_id;
+  // `RGFX_RESOURCE_KIND_*`: whether a buffer, a texture or an indirect command
+  // buffer.
+  uint32_t kind;
+  // Pads to a multiple of 8; 0.
+  uint32_t reserved_0c;
+} RgfxResourceBinding;
 
-// `setVertexBuffer:offset:atIndex:`. The buffer may be nil (`0`).
+// A ring's header, at the start of the ring: each field in a 64-byte line of its own, so the
+// producer's and the consumer's writes never share a cache line.
 typedef struct {
-  // The buffer, or 0 for nil.
-  uint64_t buffer_obj_id;
-  // The offset into the buffer.
+  // The producer's free-running byte count, written by the producer.
+  uint64_t producer;
+  // The rest of `producer`'s line.
+  uint8_t reserved_08[56];
+  // The consumer's free-running byte count, written by the consumer.
+  uint64_t consumer;
+  // The rest of `consumer`'s line.
+  uint8_t reserved_48[56];
+  // 1 while the consumer sleeps until a doorbell, written by the consumer.
+  uint32_t consumer_idle;
+  // The rest of `consumer_idle`'s line.
+  uint8_t reserved_84[60];
+  // 1 when the guest wants an interrupt, set by the guest on a completion ring and cleared by
+  // the host as it raises one.
+  uint32_t armed;
+  // The rest of `armed`'s line.
+  uint8_t reserved_c4[60];
+} RgfxRingHeader;
+
+// One element of a sampler-binding array ([`RgfxOpSetVertexSamplerStates`] and the
+// like): a sampler (0 = nil).
+typedef struct {
+  // The sampler, or 0 for nil.
+  uint64_t sampler_obj_id;
+} RgfxSamplerBinding;
+
+// `SAMPLER_CREATE`: a sampler as `MTLSamplerDescriptor` gives it. Each enum is
+// its Metal raw value; `lod_min_clamp_bits`/`lod_max_clamp_bits` are the `f32`
+// clamps' bits (so the wire stays all-integer and comparable); `flags` packs
+// the booleans.
+typedef struct {
+  // [`RGFX_CMD_SAMPLER_CREATE`].
+  RgfxMsgHeader header;
+  // The new sampler's guest-picked id.
+  uint64_t obj_id;
+  // `MTLSamplerMinMagFilter` for minification.
+  uint32_t min_filter;
+  // `MTLSamplerMinMagFilter` for magnification.
+  uint32_t mag_filter;
+  // `MTLSamplerMipFilter`.
+  uint32_t mip_filter;
+  // `MTLSamplerAddressMode` for s.
+  uint32_t s_address_mode;
+  // `MTLSamplerAddressMode` for t.
+  uint32_t t_address_mode;
+  // `MTLSamplerAddressMode` for r.
+  uint32_t r_address_mode;
+  // `MTLSamplerBorderColor`.
+  uint32_t border_color;
+  // `MTLCompareFunction` for the sampler's compare.
+  uint32_t compare_function;
+  // The maximum anisotropy.
+  uint32_t max_anisotropy;
+  // The minimum LOD clamp, as `f32` bits.
+  uint32_t lod_min_clamp_bits;
+  // The maximum LOD clamp, as `f32` bits.
+  uint32_t lod_max_clamp_bits;
+  // Bit 0: normalized coordinates. Bit 1: LOD average. Bit 2: usable from an
+  // argument buffer.
+  uint32_t flags;
+} RgfxSamplerCreate;
+
+// One element of a sampler-with-LOD-clamps array
+// ([`RgfxOpSetVertexSamplerStatesLodClamps`] and the like): a sampler (0 = nil) and
+// its LOD clamps, which travel as their `f32` bits.
+typedef struct {
+  // The sampler, or 0 for nil.
+  uint64_t sampler_obj_id;
+  // `lodMinClamp` as `f32` bits.
+  uint32_t lod_min_clamp_bits;
+  // `lodMaxClamp` as `f32` bits.
+  uint32_t lod_max_clamp_bits;
+} RgfxSamplerLodBinding;
+
+// One element of a scissor-rect array ([`RgfxOpSetScissorRects`]): an
+// `MTLScissorRect`.
+typedef struct {
+  // `x`.
+  uint64_t x;
+  // `y`.
+  uint64_t y;
+  // `width`.
+  uint64_t width;
+  // `height`.
+  uint64_t height;
+} RgfxScissorRectElem;
+
+// `SET_CURSOR`: the display's cursor is `height` rows of `width` premultiplied BGRA8 pixels,
+// `width * 4` bytes a row, from `offset` in the region, its hot spot at (`hot_x`, `hot_y`). A
+// `width` of 0 removes the image.
+typedef struct {
+  // [`RGFX_CMD_SET_CURSOR`].
+  RgfxMsgHeader header;
+  // The display's id.
+  uint32_t display;
+  // Pixels a row, up to [`RGFX_CURSOR_MAX_SIZE`]; 0 removes the image.
+  uint32_t width;
+  // Rows, up to [`RGFX_CURSOR_MAX_SIZE`].
+  uint32_t height;
+  // The hot spot's column, below `width`.
+  uint32_t hot_x;
+  // The hot spot's row, below `height`.
+  uint32_t hot_y;
+  // Keeps `offset` 8-aligned; 0.
+  uint32_t reserved_24;
+  // Where the image starts in the region: a multiple of 4, in the guest's allocations.
   uint64_t offset;
-  // The buffer binding index.
-  uint64_t index;
-} RgfxOpSetVertexBuffer;
+} RgfxSetCursor;
 
-// `setFragmentBuffer:offset:atIndex:`. The buffer may be nil (`0`).
+// `SET_SCANOUT`: the display shows `height` rows of `width` BGRA8 pixels, each row `stride`
+// bytes after the one before, from `offset` in the region. A `width` of 0 blanks the display.
 typedef struct {
-  // The buffer, or 0 for nil.
-  uint64_t buffer_obj_id;
-  // The offset into the buffer.
+  // [`RGFX_CMD_SET_SCANOUT`].
+  RgfxMsgHeader header;
+  // The display's id.
+  uint32_t display;
+  // Pixels a row; 0 blanks the display.
+  uint32_t width;
+  // Rows.
+  uint32_t height;
+  // Bytes from one row's start to the next's: a multiple of 4, at least `width * 4`.
+  uint32_t stride;
+  // Where the first row starts in the region: a multiple of 4, in the guest's allocations.
   uint64_t offset;
-  // The buffer binding index.
-  uint64_t index;
-} RgfxOpSetFragmentBuffer;
+} RgfxSetScanout;
 
-// `setFragmentTexture:atIndex:`. The texture may be nil (`0`).
+// `SET_VBLANK`: the device sends `VBLANK` at each refresh of the display's host screen while
+// `enabled` is not 0.
+typedef struct {
+  // [`RGFX_CMD_SET_VBLANK`].
+  RgfxMsgHeader header;
+  // The display's id.
+  uint32_t display;
+  // Whether `VBLANK` is sent: 0 stops it.
+  uint32_t enabled;
+} RgfxSetVblank;
+
+// `SHARED_EVENT_CREATE`: a shared event starting at `initial_value`.
+typedef struct {
+  // [`RGFX_CMD_SHARED_EVENT_CREATE`].
+  RgfxMsgHeader header;
+  // The new event's guest-picked id.
+  uint64_t obj_id;
+  // The event's value when it is made.
+  uint64_t initial_value;
+} RgfxSharedEventCreate;
+
+// One element of a texture-binding array ([`RgfxOpSetVertexTextures`] and the like):
+// a texture (0 = nil).
 typedef struct {
   // The texture, or 0 for nil.
   uint64_t texture_obj_id;
-  // The texture binding index.
-  uint64_t index;
-} RgfxOpSetFragmentTexture;
+} RgfxTextureBinding;
 
-// `setViewport:`. The six `MTLViewport` fields travel as the bits of their `f64`.
+// A texture's shape, as `MTLTextureDescriptor` gives it. Each enum is its Metal
+// raw value (`MTLPixelFormat`, `MTLTextureType`, `MTLTextureUsage`,
+// `MTLResourceOptions`); `swizzle` packs the four `MTLTextureSwizzle` channels,
+// one byte each, red in the low byte.
+typedef struct {
+  // `MTLPixelFormat`.
+  uint32_t pixel_format;
+  // `MTLTextureType`.
+  uint32_t texture_type;
+  // Pixels a row.
+  uint32_t width;
+  // Rows.
+  uint32_t height;
+  // Slices, for a 3D texture; 1 otherwise.
+  uint32_t depth;
+  // Mip levels.
+  uint32_t mipmap_level_count;
+  // Array elements, for an array texture; 1 otherwise.
+  uint32_t array_length;
+  // Samples a pixel, for a multisample texture; 1 otherwise.
+  uint32_t sample_count;
+  // `MTLTextureUsage`.
+  uint32_t usage;
+  // `MTLResourceOptions`: the storage, cache and hazard-tracking modes.
+  uint32_t options;
+  // The four `MTLTextureSwizzle` channels, one byte each, red lowest.
+  uint32_t swizzle;
+  // Pads to a multiple of 8; 0.
+  uint32_t reserved_2c;
+} RgfxTextureDescriptor;
+
+// `TEXTURE_CREATE`: a texture of shape `desc` at the guest-picked `gpu_address`
+// (device-placed, `heap_obj_id` 0) or at `heap_offset` in `heap_obj_id`, with
+// the guest-picked `resource_id`.
+typedef struct {
+  // [`RGFX_CMD_TEXTURE_CREATE`].
+  RgfxMsgHeader header;
+  // The new texture's guest-picked id.
+  uint64_t obj_id;
+  // The texture's guest-picked GPU address when device-placed.
+  uint64_t gpu_address;
+  // The texture's guest-picked resource id.
+  uint64_t resource_id;
+  // The heap the texture lies in, or 0 when device-placed at `gpu_address`.
+  uint64_t heap_obj_id;
+  // The texture's offset in the heap, when `heap_obj_id` is not 0.
+  uint64_t heap_offset;
+  // The texture's shape.
+  RgfxTextureDescriptor desc;
+} RgfxTextureCreate;
+
+// `TEXTURE_FROM_BUFFER`: a texture of shape `desc` over the buffer
+// `buffer_obj_id` from `offset`, each row `bytes_per_row` apart, with the
+// guest-picked `resource_id`.
+typedef struct {
+  // [`RGFX_CMD_TEXTURE_FROM_BUFFER`].
+  RgfxMsgHeader header;
+  // The new texture's guest-picked id.
+  uint64_t obj_id;
+  // The new texture's guest-picked resource id.
+  uint64_t resource_id;
+  // The buffer the texture reads.
+  uint64_t buffer_obj_id;
+  // The texture's first byte in the buffer.
+  uint64_t offset;
+  // Bytes from one row's start to the next's.
+  uint64_t bytes_per_row;
+  // The texture's shape.
+  RgfxTextureDescriptor desc;
+} RgfxTextureFromBuffer;
+
+// `VBLANK`: the display's host screen refreshed.
+typedef struct {
+  // [`RGFX_EVT_VBLANK`], `seqno` 0.
+  RgfxMsgHeader header;
+  // The display's id.
+  uint32_t display;
+  // Keeps `count` 8-aligned; 0.
+  uint32_t reserved_14;
+  // The display's refreshes since it was made, this one included.
+  uint64_t count;
+  // The host's monotonic clock at the refresh, in nanoseconds.
+  uint64_t host_time_ns;
+} RgfxVblank;
+
+// One vertex attribute of a render pipeline's vertex descriptor
+// (`MTLVertexAttributeDescriptor`), at `attribute_index`.
+typedef struct {
+  // The attribute index this record describes.
+  uint32_t attribute_index;
+  // `MTLVertexFormat`.
+  uint32_t format;
+  // The attribute's byte offset in its vertex buffer.
+  uint32_t offset;
+  // The vertex buffer the attribute reads.
+  uint32_t buffer_index;
+} RgfxVertexAttribute;
+
+// One vertex buffer layout of a render pipeline's vertex descriptor
+// (`MTLVertexBufferLayoutDescriptor`), at `buffer_index`.
+typedef struct {
+  // The vertex buffer index this layout describes.
+  uint32_t buffer_index;
+  // Bytes from one element to the next.
+  uint32_t stride;
+  // `MTLVertexStepFunction`.
+  uint32_t step_function;
+  // The step rate.
+  uint32_t step_rate;
+} RgfxVertexBufferLayout;
+
+// One element of a vertex-amplification view-mapping array
+// ([`RgfxOpSetVertexAmplificationCount`]): an `MTLVertexAmplificationViewMapping`.
+typedef struct {
+  // `viewportArrayIndexOffset`.
+  uint32_t viewport_array_index_offset;
+  // `renderTargetArrayIndexOffset`.
+  uint32_t render_target_array_index_offset;
+} RgfxViewMapping;
+
+// One element of a viewport array ([`RgfxOpSetViewports`]): an `MTLViewport`, its
+// `f64` fields as bits.
 typedef struct {
   // `originX` as `f64` bits.
   uint64_t origin_x_bits;
@@ -1100,43 +2717,6 @@ typedef struct {
   uint64_t znear_bits;
   // `zfar` as `f64` bits.
   uint64_t zfar_bits;
-} RgfxOpSetViewport;
-
-// `setScissorRect:`. The four `MTLScissorRect` fields are `NSUInteger`.
-typedef struct {
-  // `x`.
-  uint64_t x;
-  // `y`.
-  uint64_t y;
-  // `width`.
-  uint64_t width;
-  // `height`.
-  uint64_t height;
-} RgfxOpSetScissorRect;
-
-// `drawPrimitives:vertexStart:vertexCount:`.
-typedef struct {
-  // `MTLPrimitiveType`.
-  uint64_t primitive_type;
-  // The first vertex.
-  uint64_t vertex_start;
-  // The vertices to draw.
-  uint64_t vertex_count;
-} RgfxOpDrawPrimitives;
-
-// `drawIndexedPrimitives:indexCount:indexType:indexBuffer:indexBufferOffset:`.
-// The index buffer must name an object (nil faults the stream).
-typedef struct {
-  // `MTLPrimitiveType`.
-  uint64_t primitive_type;
-  // The indices to draw.
-  uint64_t index_count;
-  // `MTLIndexType`.
-  uint64_t index_type;
-  // The index buffer (must not be nil).
-  uint64_t index_buffer_obj_id;
-  // The offset into the index buffer.
-  uint64_t index_buffer_offset;
-} RgfxOpDrawIndexedPrimitives;
+} RgfxViewportElem;
 
 #endif  /* REIMS_GRAPHICS_WIRE_H */
