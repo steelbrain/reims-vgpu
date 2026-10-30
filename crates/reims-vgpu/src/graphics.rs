@@ -39,6 +39,7 @@ use crate::platform::ApiPlatform;
 use crate::window::WindowLink;
 
 mod decode;
+mod device_info;
 #[cfg(target_os = "macos")]
 mod metal;
 mod sink;

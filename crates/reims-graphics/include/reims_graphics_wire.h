@@ -270,6 +270,13 @@
 // Where a `LIBRARY_CREATE` message's bytes start: right after its header.
 #define RGFX_LIBRARY_BYTES_OFFSET 32
 
+// The version of the [`RgfxDeviceInfo`] layout the host writes.
+#define RGFX_DEVICE_INFO_VERSION 1
+
+// The most bytes of a device name [`RgfxDeviceInfo`] carries; a longer name is
+// truncated (it is a display string, never read back for correctness).
+#define RGFX_DEVICE_NAME_LEN 32
+
 // A ring's header, at the start of the ring: each field in a 64-byte line of its own, so the
 // producer's and the consumer's writes never share a cache line.
 typedef struct {
@@ -763,5 +770,51 @@ typedef struct {
   // The length of the `.metallib`/AIR bytes that follow.
   uint64_t byte_length;
 } RgfxLibraryCreate;
+
+// The device-info caps blob the host writes once at device init, read by the
+// guest bundle before it makes any queue. It mirrors the host device's
+// capabilities (every value Metal or metal2vulkan answers for a device that
+// does not change while the device lives); the bundle's `MTLDevice` answers
+// `supportsFamily:`, the limits and the feature queries from it. A feature the
+// host platform cannot answer (a runtime gap) reads 0 here — never a spurious
+// yes. This is a flat caps page, not a ring message.
+typedef struct {
+  // [`RGFX_DEVICE_INFO_VERSION`].
+  uint32_t version;
+  // The bytes of `name` in use, at most [`RGFX_DEVICE_NAME_LEN`].
+  uint32_t name_len;
+  // `registryID`.
+  uint64_t registry_id;
+  // `gpuCoreCount`, or 0 when the device does not answer it.
+  uint64_t gpu_core_count;
+  // `maxThreadsPerThreadgroup`: width, height, depth.
+  uint64_t max_threads_per_threadgroup[3];
+  // `maxVertexAmplificationCount`.
+  uint64_t max_vertex_amplification_count;
+  // `heapBufferSizeAndAlignWithLength:options:`(`vm_page_size`, Private): the
+  // size then the alignment; both 0 when the query is a host gap.
+  uint64_t heap_buffer_page_private[2];
+  // `minimumLinearTextureAlignmentForPixelFormat:`(BGRA8Unorm); 0 on a gap.
+  uint64_t min_linear_alignment_bgra8;
+  // The 27 `NSUInteger` limits, in the host `Limits` field order
+  // (`device_linear_texture_alignment_bytes` first, `max_viewport_count`
+  // last); the host fills them in that order.
+  uint64_t limits[27];
+  // `supportsFamily:` of each of the 7 families the host asks (Apple5..Apple10
+  // then -1009), 1 or 0 by position; a gap reads 0.
+  uint8_t families[7];
+  // `supportsTextureSampleCount:` of 1, 2, 4, 8 by position; a gap reads 0.
+  uint8_t sample_counts[4];
+  // `supportsPrimitiveType:` of 0..10 by position; a gap reads 0.
+  uint8_t primitive_types[10];
+  // `supportsTextureWriteRoundingMode:` of 1, 2 by position; a gap reads 0.
+  uint8_t write_rounding_modes[2];
+  // The 25 `BOOL` properties, in the host `Flags` field order
+  // (`are_raster_order_groups_supported` first, `supports_tile_shaders` last),
+  // 1 or 0 by position.
+  uint8_t flags[25];
+  // The device `name`, UTF-8, `name_len` bytes used, the rest 0.
+  uint8_t name[RGFX_DEVICE_NAME_LEN];
+} RgfxDeviceInfo;
 
 #endif  /* REIMS_GRAPHICS_WIRE_H */

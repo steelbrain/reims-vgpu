@@ -879,6 +879,63 @@ pub struct RgfxLibraryCreate {
 /// Where a `LIBRARY_CREATE` message's bytes start: right after its header.
 pub const RGFX_LIBRARY_BYTES_OFFSET: u32 = 32;
 
+/// The version of the [`RgfxDeviceInfo`] layout the host writes.
+pub const RGFX_DEVICE_INFO_VERSION: u32 = 1;
+
+/// The most bytes of a device name [`RgfxDeviceInfo`] carries; a longer name is
+/// truncated (it is a display string, never read back for correctness).
+pub const RGFX_DEVICE_NAME_LEN: usize = 32;
+
+/// The device-info caps blob the host writes once at device init, read by the
+/// guest bundle before it makes any queue. It mirrors the host device's
+/// capabilities (every value Metal or metal2vulkan answers for a device that
+/// does not change while the device lives); the bundle's `MTLDevice` answers
+/// `supportsFamily:`, the limits and the feature queries from it. A feature the
+/// host platform cannot answer (a runtime gap) reads 0 here — never a spurious
+/// yes. This is a flat caps page, not a ring message.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxDeviceInfo {
+    /// [`RGFX_DEVICE_INFO_VERSION`].
+    pub version: u32,
+    /// The bytes of `name` in use, at most [`RGFX_DEVICE_NAME_LEN`].
+    pub name_len: u32,
+    /// `registryID`.
+    pub registry_id: u64,
+    /// `gpuCoreCount`, or 0 when the device does not answer it.
+    pub gpu_core_count: u64,
+    /// `maxThreadsPerThreadgroup`: width, height, depth.
+    pub max_threads_per_threadgroup: [u64; 3],
+    /// `maxVertexAmplificationCount`.
+    pub max_vertex_amplification_count: u64,
+    /// `heapBufferSizeAndAlignWithLength:options:`(`vm_page_size`, Private): the
+    /// size then the alignment; both 0 when the query is a host gap.
+    pub heap_buffer_page_private: [u64; 2],
+    /// `minimumLinearTextureAlignmentForPixelFormat:`(BGRA8Unorm); 0 on a gap.
+    pub min_linear_alignment_bgra8: u64,
+    /// The 27 `NSUInteger` limits, in the host `Limits` field order
+    /// (`device_linear_texture_alignment_bytes` first, `max_viewport_count`
+    /// last); the host fills them in that order.
+    pub limits: [u64; 27],
+    /// `supportsFamily:` of each of the 7 families the host asks (Apple5..Apple10
+    /// then -1009), 1 or 0 by position; a gap reads 0.
+    pub families: [u8; 7],
+    /// `supportsTextureSampleCount:` of 1, 2, 4, 8 by position; a gap reads 0.
+    pub sample_counts: [u8; 4],
+    /// `supportsPrimitiveType:` of 0..10 by position; a gap reads 0.
+    pub primitive_types: [u8; 10],
+    /// `supportsTextureWriteRoundingMode:` of 1, 2 by position; a gap reads 0.
+    pub write_rounding_modes: [u8; 2],
+    /// The 25 `BOOL` properties, in the host `Flags` field order
+    /// (`are_raster_order_groups_supported` first, `supports_tile_shaders` last),
+    /// 1 or 0 by position.
+    pub flags: [u8; 25],
+    /// The device `name`, UTF-8, `name_len` bytes used, the rest 0.
+    pub name: [u8; RGFX_DEVICE_NAME_LEN],
+}
+
 // The stage-3 messages' layout.
 const _: () = {
     use core::mem::size_of;
@@ -901,6 +958,7 @@ const _: () = {
     assert!(size_of::<RgfxDepthStencilCreate>() == 80);
     assert!(size_of::<RgfxLibraryCreate>() == 32);
     assert!(RGFX_LIBRARY_BYTES_OFFSET as usize == size_of::<RgfxLibraryCreate>());
+    assert!(size_of::<RgfxDeviceInfo>() == 376);
     // Each exact size above is a multiple of 8, as a ring message must be.
     // The stage-3 opcodes do not collide with the stage-2 ones or each other.
     assert!(RGFX_CMD_QUEUE_CREATE > RGFX_EVT_VBLANK);
@@ -1034,5 +1092,30 @@ mod tests {
             RGFX_LIBRARY_BYTES_OFFSET as usize,
             size_of::<RgfxLibraryCreate>()
         );
+    }
+
+    /// The device-info caps blob writes to bytes and reads back unchanged; its
+    /// name sits inline up to its cap.
+    #[test]
+    fn device_info_round_trips() {
+        let mut info = RgfxDeviceInfo {
+            version: RGFX_DEVICE_INFO_VERSION,
+            registry_id: 0x1234,
+            gpu_core_count: 10,
+            max_threads_per_threadgroup: [1024, 1024, 1024],
+            max_vertex_amplification_count: 2,
+            families: [1, 1, 1, 1, 1, 1, 0],
+            sample_counts: [1, 1, 1, 0],
+            ..RgfxDeviceInfo::default()
+        };
+        let name = b"NVIDIA GeForce RTX 5080";
+        info.name[..name.len()].copy_from_slice(name);
+        info.name_len = name.len() as u32;
+        assert_eq!(info.as_bytes().len(), 376);
+        assert_eq!(
+            RgfxDeviceInfo::read_from_bytes(info.as_bytes()).unwrap(),
+            info
+        );
+        assert_eq!(&info.name[..info.name_len as usize], name);
     }
 }
