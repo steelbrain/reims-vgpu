@@ -8,10 +8,9 @@
 //! other `MTLCommandBufferError` is reported as a generic internal error, with
 //! the raw code kept for diagnostics.
 //!
-//! The host emits this from the ring loop once a submitted command buffer's work
-//! lands; the loop is a later increment, so this has no caller outside the tests
-//! yet.
-#![allow(dead_code)]
+//! The host emits [`cb_complete`] from the decoder's completion sink once a
+//! submitted command buffer's work lands, and [`cb_failed`] when the host could
+//! not carry a command buffer out at all, so a guest blocked on it unblocks.
 
 use reims_graphics::wire::{
     RGFX_CB_ACCESS_REVOKED, RGFX_CB_INTERNAL, RGFX_CB_INVALID_RESOURCE, RGFX_CB_OK,
@@ -73,6 +72,25 @@ pub fn cb_complete(
         gpu_end_ns,
         status,
         error_code,
+    }
+}
+
+/// The completion record for a command buffer the host could not carry out: a malformed op
+/// stream, a reference the host does not hold, or an exec fault before the buffer was committed.
+/// No GPU ran it and no completion handler will fire for it, so the host posts this itself — an
+/// internal error with no GPU times — and the guest blocked on the buffer unblocks.
+pub fn cb_failed(cb_obj_id: u64, seqno: u64) -> RgfxCbComplete {
+    RgfxCbComplete {
+        header: RgfxMsgHeader {
+            r#type: RGFX_EVT_CB_COMPLETE,
+            size: size_of::<RgfxCbComplete>() as u32,
+            seqno,
+        },
+        cb_obj_id,
+        gpu_start_ns: 0,
+        gpu_end_ns: 0,
+        status: RGFX_CB_INTERNAL,
+        error_code: 0,
     }
 }
 

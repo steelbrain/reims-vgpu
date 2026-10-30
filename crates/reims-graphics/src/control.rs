@@ -36,6 +36,15 @@ pub(crate) fn answer(shared: &Shared, message: &Message) -> Option<Vec<u8>> {
         RGFX_CMD_SET_VBLANK => read(message).map_or(RGFX_STATUS_INVALID_ARGUMENT, |command| {
             set_vblank(shared, &command)
         }),
+        // Stage 3: the object-lifecycle creates and destroy, the pipeline creates and the
+        // command buffer (every type at or above `QUEUE_CREATE`) go to the host's decoder. Its
+        // replies — a pipeline reflection, a command buffer's completion — come back on the
+        // completion ring through the device's poster, not from here, so there is no answer to
+        // post synchronously.
+        t if t >= RGFX_CMD_QUEUE_CREATE => {
+            shared.host.stage3_message(&message.bytes);
+            return None;
+        }
         _ => RGFX_STATUS_UNKNOWN_COMMAND,
     };
     Some(complete(seqno, status))

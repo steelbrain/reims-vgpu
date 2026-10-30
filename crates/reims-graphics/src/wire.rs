@@ -95,6 +95,15 @@ pub const RGFX_RING_HEADER_SIZE: u32 = 256;
 /// the header, 32 KiB. The rest of the span is unused.
 pub const RGFX_CONTROL_RING_DATA_SIZE: u32 = 0x8000;
 
+/// Where the device-info caps blob ([`RgfxDeviceInfo`]) sits in the region: the host writes it
+/// once at the device's init, and the guest bundle reads it before it makes any queue. It lies in
+/// the unused tail of the control completion ring's span (whose byte ring is a power of two, 32
+/// KiB, smaller than the 64 KiB span), after the ring and before the guest's allocations, so it
+/// adds no offset the rings or the allocations move for. It is a flat caps page, never a ring.
+pub const RGFX_DEVICE_INFO_OFFSET: u64 = RGFX_CONTROL_COMPLETE_OFFSET
+    + RGFX_RING_HEADER_SIZE as u64
+    + RGFX_CONTROL_RING_DATA_SIZE as u64;
+
 /// A ring's header, at the start of the ring: each field in a 64-byte line of its own, so the
 /// producer's and the consumer's writes never share a cache line.
 #[repr(C)]
@@ -1236,6 +1245,16 @@ const _: () = {
     assert!(size_of::<RgfxLibraryCreate>() == 32);
     assert!(RGFX_LIBRARY_BYTES_OFFSET as usize == size_of::<RgfxLibraryCreate>());
     assert!(size_of::<RgfxDeviceInfo>() == 376);
+    // The device-info blob sits past the completion ring and before the allocations.
+    assert!(
+        RGFX_DEVICE_INFO_OFFSET
+            == RGFX_CONTROL_COMPLETE_OFFSET
+                + RGFX_RING_HEADER_SIZE as u64
+                + RGFX_CONTROL_RING_DATA_SIZE as u64
+    );
+    assert!(
+        RGFX_DEVICE_INFO_OFFSET + size_of::<RgfxDeviceInfo>() as u64 <= RGFX_ALLOCATIONS_OFFSET
+    );
     // Pipeline creates and reflection.
     assert!(size_of::<RgfxFunctionConstant>() == 16);
     assert!(size_of::<RgfxColorAttachmentDesc>() == 40);

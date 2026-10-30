@@ -6,10 +6,10 @@
 //! supports; a query the platform cannot answer (a runtime gap, an `Err` in the
 //! caps) is reported as unsupported here, never guessed yes.
 //!
-//! The decoder does not touch this: it is written once at device init, not a
-//! guest command. Where in the device's region the host writes it, and the
-//! offset the bundle reads, land with the ring loop.
-#![allow(dead_code)]
+//! The decoder does not touch this: [`super::GraphicsDevice`] writes it once at
+//! the device's init into the region at
+//! [`RGFX_DEVICE_INFO_OFFSET`](reims_graphics::wire::RGFX_DEVICE_INFO_OFFSET),
+//! and the guest bundle reads it there, not a guest command.
 
 use reims_graphics::wire::{RGFX_DEVICE_INFO_VERSION, RGFX_DEVICE_NAME_LEN, RgfxDeviceInfo};
 use reims_vgpu_core::platform::caps::DeviceCaps;

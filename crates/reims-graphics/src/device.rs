@@ -38,7 +38,7 @@
 
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 
 use parking_lot::Mutex;
@@ -79,6 +79,17 @@ pub trait Host: Send + Sync + 'static {
     /// time this asked, which starts the next span: the host's dirty log of the range, taken and
     /// cleared. On the refresh thread.
     fn scanout_written(&self, offset: u64, length: u64) -> bool;
+
+    /// Hands a stage-3 control message — one whose type is not a stage-2 display command (the
+    /// object-lifecycle creates and destroy, the pipeline creates, and `COMMAND_BUFFER`) — to the
+    /// host's decoder. The control thread calls this with the message's whole bytes, in the order
+    /// the guest published them. Any reply the host owes (a pipeline reflection, a command
+    /// buffer's completion) it posts onto the control completion ring itself, through
+    /// [`Device::completion_poster`]; this returns nothing. The default does nothing, for a host
+    /// with no stage-3 decoder.
+    fn stage3_message(&self, message: &[u8]) {
+        let _ = message;
+    }
 }
 
 /// The device.
@@ -99,7 +110,7 @@ impl std::fmt::Debug for Device {
 /// What the device's handle and its threads share.
 pub(crate) struct Shared {
     /// The host's callbacks.
-    host: Box<dyn Host>,
+    pub(crate) host: Box<dyn Host>,
     /// What shows the display.
     pub(crate) screen: Box<dyn Screen>,
     /// BAR 2, which what shows the display may hold too.
@@ -251,6 +262,40 @@ impl Device {
     /// The host's reset of the device, as `STATUS` 0 (the module doc).
     pub fn reset(&self) {
         self.shared.reset();
+    }
+
+    /// A handle onto the control completion ring that posts host-to-guest events from any thread:
+    /// the stage-3 decoder's command-buffer completions, which the GPU raises on a thread of its
+    /// own, and its pipeline-reflection replies. The handle holds no strong reference to the
+    /// device, so it never keeps it alive; a post after the device has ended is dropped.
+    pub fn completion_poster(&self) -> ControlCompletionPoster {
+        ControlCompletionPoster {
+            shared: Arc::downgrade(&self.shared),
+        }
+    }
+}
+
+/// A handle that posts events onto the control completion ring from any thread ([`Device`]'s
+/// module doc and [`Device::completion_poster`]): it writes the message and raises the control
+/// vector where the guest armed the ring, through the same [`Producer`] and interrupt path the
+/// control thread uses. It holds a weak reference to the device, so it does not keep it alive; a
+/// post after the device has ended, or dropped while it is reset, is dropped.
+#[derive(Clone)]
+pub struct ControlCompletionPoster {
+    /// The device's shared state, weakly, so the handle outlives nothing.
+    shared: Weak<Shared>,
+}
+
+impl ControlCompletionPoster {
+    /// Posts `message` (a whole event, its `size` set and a multiple of 8) onto the control
+    /// completion ring, waiting for room while the device lives and is not reset, and raising the
+    /// control vector where the guest armed the ring. Does nothing where the device has ended.
+    pub fn post(&self, message: &[u8]) {
+        let Some(shared) = self.shared.upgrade() else {
+            return;
+        };
+        let epoch = shared.epoch.load(Ordering::Acquire);
+        shared.post_waiting(message, epoch);
     }
 }
 

@@ -28,9 +28,12 @@
 //! for the caller to catch. An op-stream reference the host cannot honour faults
 //! the exec the same way ([`bad_reference`], [`op_fault`]).
 //!
-//! Not yet wired into [`super::GraphicsDevice`] — that lands with the ring loop
-//! in a later increment; until then the decoder has no caller outside the tests.
-#![allow(dead_code)]
+//! [`super::GraphicsControl`] drives it from the device's control thread, one
+//! message at a time, and gives it the sinks that post onto the control
+//! completion ring. The object-resolution API below ([`GraphicsDecoder::require_buffer`]
+//! and the rest) is the whole contract the encoder-op decoders call; some of its
+//! resolvers are for ops the first op slice does not emit yet, and so are not
+//! reached, but they are kept whole (project rule "Unread is not dead").
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -94,6 +97,10 @@ enum ObjHandle<P: Platform> {
     Heap(P::Heap),
     RenderPipeline(P::RenderPipeline),
     ComputePipeline(P::ComputePipeline),
+    // No create makes an indirect command buffer yet (the guest produces one on a queue, an op
+    // the first slice does not emit), so this is matched by `require_indirect_command_buffer` but
+    // not yet constructed; kept whole for when that op lands (project rule "Unread is not dead").
+    #[allow(dead_code)]
     Icb(P::Icb),
 }
 
@@ -671,6 +678,9 @@ pub(crate) fn op_fault(detail: impl std::fmt::Display) -> Raise {
 /// the encode.
 macro_rules! resolvers {
     ($( ($req:ident, $get:ident, $variant:ident, $assoc:ident, $what:literal) ),* $(,)?) => {
+        // The whole object-resolution API: some resolvers are for ops the first slice does not
+        // emit yet, so they are not reached but are kept whole (project rule "Unread is not dead").
+        #[allow(dead_code)]
         impl<P: Platform> GraphicsDecoder<P> {
             $(
                 #[doc = concat!("The ", $what, " `id` names; an exec fault when `id` is 0 or names no ", $what, ".")]

@@ -692,6 +692,13 @@
 // the header, 32 KiB. The rest of the span is unused.
 #define RGFX_CONTROL_RING_DATA_SIZE 32768
 
+// Where the device-info caps blob ([`RgfxDeviceInfo`]) sits in the region: the host writes it
+// once at the device's init, and the guest bundle reads it before it makes any queue. It lies in
+// the unused tail of the control completion ring's span (whose byte ring is a power of two, 32
+// KiB, smaller than the 64 KiB span), after the ring and before the guest's allocations, so it
+// adds no offset the rings or the allocations move for. It is a flat caps page, never a ring.
+#define RGFX_DEVICE_INFO_OFFSET ((RGFX_CONTROL_COMPLETE_OFFSET + (uint64_t)RGFX_RING_HEADER_SIZE) + (uint64_t)RGFX_CONTROL_RING_DATA_SIZE)
+
 // A pad to the ring's end: its `size` covers the bytes left, 8 or more, and it has no `seqno`.
 #define RGFX_MSG_PAD 0
 

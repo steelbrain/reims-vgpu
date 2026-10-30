@@ -660,12 +660,6 @@ mod tests {
         (p, dec, enc)
     }
 
-    /// The fake `ObjId` of the object the decoder holds under guest `obj_id`
-    /// `id`, as a non-nil object argument.
-    fn buffer_arg(dec: &GraphicsDecoder<FakePlatform>, id: u64) -> Arg {
-        Arg::Obj(Some(dec.require_buffer(id).unwrap().id()))
-    }
-
     /// One op body of bytes to the decoder, asserting it was handled.
     fn drive(
         dec: &GraphicsDecoder<FakePlatform>,
