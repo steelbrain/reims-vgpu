@@ -1,0 +1,178 @@
+/*
+ * RgfxReplyReader: the guest completion-ring consumer (RgfxReplyReader.hpp). Mirrors
+ * the host producer in crates/reims-graphics/src/ring.rs: the host writes a message,
+ * publishes `producer` with a release store and pads to the ring's end so a message
+ * never wraps; this reads `producer` with an acquire load, walks whole messages from
+ * its own `consumer` count skipping pads, and publishes `consumer` with a release
+ * store so the host sees the room freed.
+ */
+
+#include "RgfxReplyReader.hpp"
+
+#include <cstring>
+
+namespace {
+
+// The ring header fields, by their offsets in RgfxRingHeader (as ring.rs names them).
+constexpr uint32_t kProducer = __builtin_offsetof(RgfxRingHeader, producer);
+constexpr uint32_t kConsumer = __builtin_offsetof(RgfxRingHeader, consumer);
+
+// A non-pad message has at least its 16-byte header; a pad has an 8-byte one. Sizes
+// are a multiple of 8.
+constexpr uint32_t kHeaderBytes = sizeof(RgfxMsgHeader);
+constexpr uint32_t kPadBytes = 8;
+constexpr uint32_t kMsgAlign = 8;
+
+uint64_t load64(const volatile uint8_t *p)
+{
+	return __atomic_load_n(reinterpret_cast<const volatile uint64_t *>(p), __ATOMIC_ACQUIRE);
+}
+
+void store64(volatile uint8_t *p, uint64_t value)
+{
+	__atomic_store_n(reinterpret_cast<volatile uint64_t *>(p), value, __ATOMIC_RELEASE);
+}
+
+// Copies `len` bytes out of the ring at byte offset `at` (already within the data
+// area, no wrap). The region is write-back memory; the acquire load of `producer`
+// ordered this read after the host's write of the bytes.
+void readBytes(const volatile uint8_t *data, uint32_t at, void *dst, uint32_t len)
+{
+	std::memcpy(dst, const_cast<const uint8_t *>(data + at), len);
+}
+
+} // namespace
+
+RgfxReplyReader::RgfxReplyReader(volatile uint8_t *ring_base, uint32_t data_size)
+    : m_header(ring_base), m_data(ring_base + RGFX_RING_HEADER_SIZE), m_dataSize(data_size),
+      m_mask(data_size - 1), m_consumed(0), m_nextToken(1)
+{
+}
+
+void RgfxReplyReader::expectCompletion(uint64_t seqno, CompletionHandler handler)
+{
+	std::lock_guard<std::mutex> guard(m_lock);
+	m_completions[seqno] = std::move(handler);
+}
+
+void RgfxReplyReader::expectReflection(uint64_t seqno, ReflectionHandler handler)
+{
+	std::lock_guard<std::mutex> guard(m_lock);
+	m_reflections[seqno] = std::move(handler);
+}
+
+uint64_t RgfxReplyReader::addEventListener(uint64_t obj_id, EventHandler handler)
+{
+	std::lock_guard<std::mutex> guard(m_lock);
+	uint64_t token = m_nextToken++;
+	m_eventListeners[token] = EventListener{ obj_id, std::move(handler) };
+	return token;
+}
+
+void RgfxReplyReader::removeEventListener(uint64_t token)
+{
+	std::lock_guard<std::mutex> guard(m_lock);
+	m_eventListeners.erase(token);
+}
+
+bool RgfxReplyReader::awaitingCompletion(uint64_t seqno)
+{
+	std::lock_guard<std::mutex> guard(m_lock);
+	return m_completions.find(seqno) != m_completions.end();
+}
+
+bool RgfxReplyReader::awaitingReflection(uint64_t seqno)
+{
+	std::lock_guard<std::mutex> guard(m_lock);
+	return m_reflections.find(seqno) != m_reflections.end();
+}
+
+uint32_t RgfxReplyReader::pump()
+{
+	// Collect the matched handlers and their messages under the lock, then invoke them
+	// after releasing it (a handler may register again or release its wrapper without
+	// re-entering the reader's lock).
+	std::vector<std::function<void()>> calls;
+	{
+		std::lock_guard<std::mutex> guard(m_lock);
+		uint64_t producer = load64(m_header + kProducer);
+		while (m_consumed != producer) {
+			uint32_t offset = static_cast<uint32_t>(m_consumed) & m_mask;
+			// Read `type` and `size` first (they fit before the ring's end, as the
+			// host pads so a message never wraps).
+			uint32_t type = 0;
+			uint32_t size = 0;
+			{
+				uint8_t head[8];
+				readBytes(m_data, offset, head, sizeof(head));
+				std::memcpy(&type, head, 4);
+				std::memcpy(&size, head + 4, 4);
+			}
+			uint32_t least = type == RGFX_MSG_PAD ? kPadBytes : kHeaderBytes;
+			// A broken size would spin or read out of the ring; stop and publish what
+			// was taken (the host decoder treats such a ring as broken too).
+			if (size % kMsgAlign != 0 || size < least || size > m_dataSize) {
+				break;
+			}
+			if (type == RGFX_MSG_PAD) {
+				m_consumed += size;
+				continue;
+			}
+
+			switch (type) {
+			case RGFX_EVT_CB_COMPLETE: {
+				RgfxCbComplete msg = {};
+				if (size >= sizeof(msg)) {
+					readBytes(m_data, offset, &msg, sizeof(msg));
+					auto it = m_completions.find(msg.header.seqno);
+					if (it != m_completions.end()) {
+						CompletionHandler handler = std::move(it->second);
+						m_completions.erase(it);
+						calls.emplace_back([handler, msg]() { handler(msg); });
+					}
+				}
+				break;
+			}
+			case RGFX_EVT_PIPELINE_REFLECTION: {
+				RgfxPipelineReflection msg = {};
+				if (size >= sizeof(msg)) {
+					readBytes(m_data, offset, &msg, sizeof(msg));
+					auto it = m_reflections.find(msg.header.seqno);
+					if (it != m_reflections.end()) {
+						ReflectionHandler handler = std::move(it->second);
+						m_reflections.erase(it);
+						calls.emplace_back([handler, msg]() { handler(msg); });
+					}
+				}
+				break;
+			}
+			case RGFX_EVT_EVENT_SIGNALLED: {
+				RgfxEventSignalled msg = {};
+				if (size >= sizeof(msg)) {
+					readBytes(m_data, offset, &msg, sizeof(msg));
+					for (const auto &entry : m_eventListeners) {
+						if (entry.second.obj_id == msg.obj_id) {
+							EventHandler handler = entry.second.handler;
+							calls.emplace_back([handler, msg]() { handler(msg); });
+						}
+					}
+				}
+				break;
+			}
+			default:
+				// A control-command answer (COMPLETE / DISPLAYS / VBLANK) or a type
+				// this reader does not own: skip its bytes. (Follow-up: a reply type
+				// the host posts that is not yet dispatched here lands in this arm.)
+				break;
+			}
+			m_consumed += size;
+		}
+		// Publish the consumer count so the host's producer sees the room freed.
+		store64(m_header + kConsumer, m_consumed);
+	}
+
+	for (auto &call : calls) {
+		call();
+	}
+	return static_cast<uint32_t>(calls.size());
+}

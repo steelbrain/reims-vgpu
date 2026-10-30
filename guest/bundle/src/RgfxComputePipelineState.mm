@@ -10,6 +10,7 @@
 #import "RgfxFunction.h"
 #import "RgfxMetalError.h"
 
+#include "RgfxReplyReader.hpp"
 #include "RgfxSerializer.hpp"
 
 namespace {
@@ -47,10 +48,17 @@ bool fillComputeParams(RgfxComputePipelineParams &p, id<MTLFunction> fn, uint32_
                                      device:(nullable id<MTLDevice>)device
                                  serializer:(nullable RgfxSerializer *)serializer
                                       error:(__autoreleasing NSError *_Nullable *_Nullable)error;
+// Defined in the main implementation; declared here so the lambda in
+// rgfxRegisterWithReplyReader: sees its signature.
+- (void)rgfxFillReflection:(const RgfxPipelineReflection *)r;
 @end
 
 @implementation RgfxComputePipelineState {
 	uint64_t _seqno;
+	// The host's reflection, filled once RGFX_EVT_PIPELINE_REFLECTION for `_seqno`
+	// arrives; until then `_haveReflection` is NO and the getters answer placeholders.
+	RgfxPipelineReflection _reflection;
+	BOOL _haveReflection;
 }
 
 + (instancetype)computePipelineStateWithFunction:(id<MTLFunction>)function
@@ -142,28 +150,60 @@ bool fillComputeParams(RgfxComputePipelineParams &p, id<MTLFunction> fn, uint32_
 	return _seqno;
 }
 
-// --- MTLComputePipelineState: reflection (DOCUMENTED PLACEHOLDERS) ------------
-// As with the render pipeline, the host's RgfxPipelineReflection reply is read by a
-// later transport piece; until then these answer documented placeholders rather than
-// fabricating the host's values.
+- (void)rgfxRegisterWithReplyReader:(RgfxReplyReader *)reader
+{
+	if (reader == nullptr) {
+		return;
+	}
+	__weak RgfxComputePipelineState *weakSelf = self;
+	reader->expectReflection(_seqno, [weakSelf](const RgfxPipelineReflection &r) {
+		RgfxComputePipelineState *strongSelf = weakSelf;
+		if (strongSelf != nil) {
+			[strongSelf rgfxFillReflection:&r];
+		}
+	});
+}
+
+- (void)rgfxFillReflection:(const RgfxPipelineReflection *)r
+{
+	_reflection = *r;
+	_haveReflection = YES;
+}
+
+// --- MTLComputePipelineState: reflection --------------------------------------
+// The host's RgfxPipelineReflection reply is read by the reply reader. Before it
+// arrives these answer documented placeholders; after it they report the host's
+// values.
 
 - (NSUInteger)maxTotalThreadsPerThreadgroup
 {
+	if (_haveReflection) {
+		return static_cast<NSUInteger>(_reflection.max_total_threads_per_threadgroup);
+	}
 	return 1024; // Metal's common threadgroup floor until reflection is read
 }
 
 - (NSUInteger)threadExecutionWidth
 {
+	if (_haveReflection) {
+		return _reflection.thread_execution_width;
+	}
 	return 32; // the common Apple-GPU SIMD width until reflection is read
 }
 
 - (NSUInteger)staticThreadgroupMemoryLength
 {
+	if (_haveReflection) {
+		return static_cast<NSUInteger>(_reflection.static_threadgroup_memory_length);
+	}
 	return 0;
 }
 
 - (MTLResourceID)gpuResourceID
 {
+	if (_haveReflection) {
+		return (MTLResourceID){ _reflection.gpu_resource_id };
+	}
 	return (MTLResourceID){0}; // 0 until the reflection reply carries the real id
 }
 

@@ -40,13 +40,40 @@ NS_ASSUME_NONNULL_BEGIN
                                    device:(nullable id<MTLDevice>)device
                                serializer:(nullable RgfxSerializer *)serializer;
 
+/// Creates a buffer backed by a block of the device region at `regionOffset`,
+/// serialising an `RGFX_CMD_BUFFER_OVER_HOST_MEMORY` through `serializer` (which picks
+/// the objId and GPU address). `contents` is the CPU pointer the buffer vends (the
+/// region block, or the caller's pages for a no-copy buffer); it is NOT owned here —
+/// `deallocator` (may be nil) is called on dealloc instead of freeing it. The host
+/// sees the bytes in place, so no copy is made. Returns nil if `serializer` is null.
++ (nullable instancetype)bufferOverHostMemoryWithContents:(void *)contents
+                                             regionOffset:(uint64_t)regionOffset
+                                                   length:(NSUInteger)length
+                                                  options:(MTLResourceOptions)options
+                                              deallocator:(nullable void (^)(void))deallocator
+                                                   device:(nullable id<MTLDevice>)device
+                                               serializer:(nullable RgfxSerializer *)serializer;
+
 /// Designated initialiser: wraps an already-created host buffer. `objId` and
 /// `gpuAddress` are the guest-picked values the create returned; `length` and
-/// `options` are the buffer's. Allocates the CPU-visible backing `contents` vends.
+/// `options` are the buffer's. Allocates the CPU-visible backing `contents` vends,
+/// which this owns and frees.
 - (nullable instancetype)initWithObjId:(uint64_t)objId
                             gpuAddress:(uint64_t)gpuAddress
                                 length:(NSUInteger)length
                                options:(MTLResourceOptions)options
+                                device:(nullable id<MTLDevice>)device
+                            serializer:(nullable RgfxSerializer *)serializer
+    NS_DESIGNATED_INITIALIZER;
+
+/// Designated initialiser for a region-backed buffer: `contents` is the CPU pointer
+/// the buffer vends, not owned here; `deallocator` (may be nil) is called on dealloc.
+- (nullable instancetype)initWithObjId:(uint64_t)objId
+                            gpuAddress:(uint64_t)gpuAddress
+                                length:(NSUInteger)length
+                               options:(MTLResourceOptions)options
+                              contents:(nullable void *)contents
+                           deallocator:(nullable void (^)(void))deallocator
                                 device:(nullable id<MTLDevice>)device
                             serializer:(nullable RgfxSerializer *)serializer
     NS_DESIGNATED_INITIALIZER;

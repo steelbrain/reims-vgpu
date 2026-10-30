@@ -53,6 +53,9 @@
 
 #ifdef __cplusplus
 class RgfxSerializer;
+class RgfxRegion;
+class RgfxReplyReader;
+class RgfxRingWriter;
 #endif
 
 NS_ASSUME_NONNULL_BEGIN
@@ -76,6 +79,23 @@ NS_ASSUME_NONNULL_BEGIN
 /// The host device's caps (identity, limits, features). Invalid until the device
 /// region's caps blob is read.
 - (const RgfxCaps *)caps;
+
+/// The BAR-region allocator (RgfxRegion), from which queue rings and Shared/no-copy
+/// resource blocks are placed. Null until the wire handshake maps the region (a later
+/// piece); the resource and command-queue slices fall back to their non-region path
+/// (or nil) while it is null.
+- (nullable RgfxRegion *)region;
+
+/// The reader of the control completion ring (RgfxReplyReader): command-buffer
+/// completions, pipeline reflections and shared-event signals. Null until the
+/// handshake stands it up over the region.
+- (nullable RgfxReplyReader *)replyReader;
+
+/// Places a queue submission ring at `regionOffset` in the device region with a byte
+/// ring of `dataSize` bytes, owns the RgfxRingWriter over it for the device's life, and
+/// returns it (null when there is no region). The command-queue slice calls this.
+- (nullable RgfxRingWriter *)addQueueSubmitRingAtOffset:(uint64_t)regionOffset
+                                              dataSize:(uint32_t)dataSize;
 
 @end
 

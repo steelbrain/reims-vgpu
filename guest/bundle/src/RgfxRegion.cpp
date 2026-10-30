@@ -1,0 +1,113 @@
+/*
+ * RgfxRegion: the BAR-region bump allocator (RgfxRegion.hpp). The policy and the
+ * reserved head are documented in the header.
+ */
+
+#include "RgfxRegion.hpp"
+
+#include <cstring>
+
+RgfxRegion::RgfxRegion(volatile uint8_t *base, uint64_t size)
+    : m_base(base), m_size(size), m_floor(RGFX_ALLOCATIONS_OFFSET), m_cursor(RGFX_ALLOCATIONS_OFFSET)
+{
+}
+
+uint64_t RgfxRegion::alignUp(uint64_t value, uint64_t align)
+{
+	return (value + (align - 1)) & ~(align - 1);
+}
+
+uint64_t RgfxRegion::used() const
+{
+	// m_cursor only grows and never drops below the floor, so the subtraction is safe
+	// without the lock (a racing allocate may make this a slight under-count; it is a
+	// diagnostic).
+	return m_cursor - m_floor;
+}
+
+RgfxRegion::Block RgfxRegion::allocate(uint64_t size, uint64_t align)
+{
+	Block out = {};
+	if (!isPowerOfTwo(align)) {
+		return out; // ok == false
+	}
+
+	std::lock_guard<std::mutex> guard(m_lock);
+
+	uint64_t offset = alignUp(m_cursor, align);
+	// Overflow-safe room check: the end must not pass the region's size.
+	if (offset < m_cursor || offset > m_size || size > m_size - offset) {
+		return out; // no room; ok == false
+	}
+	m_cursor = offset + size;
+
+	out.offset = offset;
+	out.ptr = m_base + offset;
+	out.size = size;
+	out.ok = true;
+	return out;
+}
+
+RgfxRegion::RingPair RgfxRegion::allocateRingPair(uint32_t submit_data_size,
+                                                  uint32_t complete_data_size)
+{
+	RingPair out = {};
+	out.submit_data_size = submit_data_size;
+	out.complete_data_size = complete_data_size;
+
+	// Each ring's byte ring is a power of two (the host reads it with a mask); the
+	// completion ring is optional (0 == none in the single-ring model).
+	if (!isPowerOfTwo(submit_data_size) ||
+	    (complete_data_size != 0 && !isPowerOfTwo(complete_data_size))) {
+		return out; // ok == false
+	}
+
+	Block submit = allocate(RGFX_RING_HEADER_SIZE + submit_data_size, kRingAlign);
+	if (!submit.ok) {
+		return out;
+	}
+	Block complete = {};
+	if (complete_data_size != 0) {
+		complete = allocate(RGFX_RING_HEADER_SIZE + complete_data_size, kRingAlign);
+		if (!complete.ok) {
+			return out;
+		}
+	}
+
+	// Zero each ring's header + byte ring so a fresh RgfxRingWriter (producer 0,
+	// consumer 0, consumer_idle 0, armed 0) starts clean over BAR memory whose
+	// contents are otherwise undefined. The region is plain write-back memory.
+	std::memset(const_cast<uint8_t *>(submit.ptr), 0, submit.size);
+	if (complete_data_size != 0) {
+		std::memset(const_cast<uint8_t *>(complete.ptr), 0, complete.size);
+	}
+
+	out.submit_offset = submit.offset;
+	out.complete_offset = complete_data_size != 0 ? complete.offset : 0;
+	out.ok = true;
+	return out;
+}
+
+bool RgfxRegion::contains(const void *p, uint64_t len) const
+{
+	if (p == nullptr) {
+		return false;
+	}
+	const uint8_t *q = static_cast<const uint8_t *>(p);
+	const uint8_t *base = const_cast<const uint8_t *>(m_base);
+	if (q < base) {
+		return false;
+	}
+	uint64_t offset = static_cast<uint64_t>(q - base);
+	// Inside the guest-allocable region, and the whole span fits before its end.
+	return offset >= m_floor && offset <= m_size && len <= m_size - offset;
+}
+
+uint64_t RgfxRegion::offsetOf(const void *p) const
+{
+	if (!contains(p, 0)) {
+		return 0;
+	}
+	return static_cast<uint64_t>(static_cast<const uint8_t *>(p) -
+	                             const_cast<const uint8_t *>(m_base));
+}

@@ -4,13 +4,31 @@
 
 #import "RgfxSharedEvent.h"
 
+#include "RgfxReplyReader.hpp"
 #include "RgfxSerializer.hpp"
 
+// One pending notifyListener registration: the value at which the block fires.
+@interface RgfxSharedEventPending : NSObject
+@property(nonatomic) uint64_t value;
+@property(nonatomic, copy) MTLSharedEventNotificationBlock block;
+@end
+@implementation RgfxSharedEventPending
+@end
+
+@interface RgfxSharedEvent ()
+- (void)rgfxEventSignalled:(const RgfxEventSignalled *)msg;
+@end
+
 @implementation RgfxSharedEvent {
-	// Local mirror of the host-side counter. Seeded from the create's initial
-	// value; the host->guest sync that updates it from RGFX_EVT_EVENT_SIGNALLED is
-	// a later transport piece (see the header).
+	// Local mirror of the host-side counter. Seeded from the create's initial value
+	// and updated from RGFX_EVT_EVENT_SIGNALLED once registered with the reply reader.
 	uint64_t _signaledValue;
+	// Pending notifyListener registrations, fired when the value reaches theirs.
+	NSMutableArray<RgfxSharedEventPending *> *_pending;
+	// Borrowed: the reader this event is registered with, and the listener token to
+	// remove on dealloc.
+	RgfxReplyReader *_reader;
+	uint64_t _eventToken;
 }
 
 + (instancetype)sharedEventWithInitialValue:(uint64_t)initialValue
@@ -26,16 +44,56 @@
 	                                                 serializer:serializer];
 	if (ev != nil) {
 		ev->_signaledValue = initialValue;
+		ev->_pending = [NSMutableArray array];
 	}
 	return ev;
+}
+
+- (void)dealloc
+{
+	if (_reader != nullptr && _eventToken != 0) {
+		_reader->removeEventListener(_eventToken);
+	}
+}
+
+- (void)rgfxRegisterWithReplyReader:(RgfxReplyReader *)reader
+{
+	if (reader == nullptr) {
+		return;
+	}
+	_reader = reader;
+	__weak RgfxSharedEvent *weakSelf = self;
+	_eventToken = reader->addEventListener([self rgfxObjId], [weakSelf](const RgfxEventSignalled &m) {
+		RgfxSharedEvent *strongSelf = weakSelf;
+		if (strongSelf != nil) {
+			[strongSelf rgfxEventSignalled:&m];
+		}
+	});
+}
+
+// The host signalled this event to `msg->value`: update the mirror and fire every
+// pending notifyListener block whose value has been reached, in registration order.
+- (void)rgfxEventSignalled:(const RgfxEventSignalled *)msg
+{
+	_signaledValue = msg->value;
+	NSMutableArray<RgfxSharedEventPending *> *fired = [NSMutableArray array];
+	for (RgfxSharedEventPending *p in _pending) {
+		if (msg->value >= p.value) {
+			[fired addObject:p];
+		}
+	}
+	for (RgfxSharedEventPending *p in fired) {
+		[_pending removeObjectIdenticalTo:p];
+		p.block(self, msg->value);
+	}
 }
 
 // --- MTLSharedEvent ----------------------------------------------------------
 
 - (uint64_t)signaledValue
 {
-	// The host holds the authoritative counter; this returns the local mirror
-	// until the EVENT_SIGNALLED reader lands (see the header).
+	// The host holds the authoritative counter; this returns the local mirror, which
+	// the reply reader updates from RGFX_EVT_EVENT_SIGNALLED once registered.
 	return _signaledValue;
 }
 
@@ -54,14 +112,23 @@
                atValue:(uint64_t)value
                  block:(MTLSharedEventNotificationBlock)block
 {
-	// Registering a CPU completion callback needs the host->guest value stream
-	// (RGFX_EVT_EVENT_SIGNALLED) to know when `value` is reached. That reader is a
-	// later transport piece, so this is a documented stub: no listener is recorded
-	// and no block is scheduled yet. FOLLOW-UP: keep the (listener, value, block)
-	// tuples and fire them from the EVENT_SIGNALLED handler.
+	// A CPU completion callback fires when the event's value reaches `value`. If the
+	// mirror has already reached it, fire now; otherwise keep the (value, block) until
+	// an RGFX_EVT_EVENT_SIGNALLED through the reply reader reaches it (rgfxEventSignalled:).
+	// `listener` names the dispatch queue Metal would fire the block on; we fire
+	// synchronously (a documented simplification until the listener's queue is wired).
 	(void)listener;
-	(void)value;
-	(void)block;
+	if (block == nil) {
+		return;
+	}
+	if (_signaledValue >= value) {
+		block(self, _signaledValue);
+		return;
+	}
+	RgfxSharedEventPending *p = [[RgfxSharedEventPending alloc] init];
+	p.value = value;
+	p.block = block;
+	[_pending addObject:p];
 }
 
 - (MTLSharedEventHandle *)newSharedEventHandle

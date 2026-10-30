@@ -10,7 +10,28 @@
 
 #import "RgfxMetalDevice.h"
 
+#include <memory>
+#include <vector>
+
+#include "RgfxRegion.hpp"
+#include "RgfxReplyReader.hpp"
+#include "RgfxRingWriter.hpp"
 #include "RgfxSerializer.hpp"
+
+// The device's doorbell trampoline the queue submission rings ring: it forwards the
+// ring id to the device, which (once BAR 0's registers are mapped) writes it to the
+// DOORBELL register. `context` is the device, valid for each ring writer's life (the
+// device owns them).
+@interface RgfxMetalDevice ()
+- (void)rgfxRingDoorbell:(uint32_t)ringId;
+@end
+
+namespace {
+void rgfxDeviceDoorbell(void *context, uint32_t ring_id)
+{
+	[(__bridge RgfxMetalDevice *)context rgfxRingDoorbell:ring_id];
+}
+} // namespace
 
 // MTLGPUFamily raw values, compared numerically so the build does not depend on
 // which Apple* families this SDK happens to name. The -1009 pseudo-family is the
@@ -31,6 +52,10 @@ constexpr long kGpuFamilyMinus1009 = -1009;
 	RgfxIdSpace _ids;            // this device's id/address/resource-id lines
 	RgfxSerializer *_serializer; // the create route; null until the ring transport lands
 	mach_port_t _acceleratorPort;
+	RgfxRegion *_region;         // BAR-region allocator; null until the handshake maps it
+	RgfxReplyReader *_replyReader; // control-completion-ring reader; null until the handshake
+	std::vector<std::unique_ptr<RgfxRingWriter>> _queueRings; // owned queue submit-ring writers
+	uint32_t _nextRingId;        // the next queue ring's doorbell id (0 is the control ring)
 }
 
 - (instancetype)initWithAcceleratorPort:(mach_port_t)port
@@ -41,12 +66,16 @@ constexpr long kGpuFamilyMinus1009 = -1009;
 	}
 	_acceleratorPort = port;
 	_serializer = nullptr;
+	_region = nullptr;
+	_replyReader = nullptr;
+	_nextRingId = 1;
 	// Wire handshake stub: when the device-region/ring transport lands, this maps
 	// the device region off `port`, reads the RgfxDeviceInfo caps blob into
-	// `_caps` (RgfxCaps::load), and stands up the control ring + RgfxSerializer
-	// over it. Until then `_caps` stays invalid and the getters below answer from
-	// their documented defaults, and `_serializer` is null (the resource slice's
-	// creates return nil until it exists).
+	// `_caps` (RgfxCaps::load), stands up the control ring + RgfxSerializer and the
+	// completion-ring RgfxReplyReader, and builds the RgfxRegion over the region's
+	// base and size. Until then `_caps` stays invalid and the getters below answer
+	// from their documented defaults, and `_serializer`/`_region`/`_replyReader` are
+	// null (the resource and command-queue slices fall back while they are).
 	return self;
 }
 
@@ -65,6 +94,36 @@ constexpr long kGpuFamilyMinus1009 = -1009;
 - (const RgfxCaps *)caps
 {
 	return &_caps;
+}
+
+- (RgfxRegion *)region
+{
+	return _region;
+}
+
+- (RgfxReplyReader *)replyReader
+{
+	return _replyReader;
+}
+
+- (RgfxRingWriter *)addQueueSubmitRingAtOffset:(uint64_t)regionOffset dataSize:(uint32_t)dataSize
+{
+	if (_region == nullptr) {
+		return nullptr;
+	}
+	uint32_t ringId = _nextRingId++;
+	auto writer = std::make_unique<RgfxRingWriter>(_region->base() + regionOffset, dataSize, ringId,
+	                                               &rgfxDeviceDoorbell, (__bridge void *)self);
+	RgfxRingWriter *raw = writer.get();
+	_queueRings.push_back(std::move(writer));
+	return raw;
+}
+
+- (void)rgfxRingDoorbell:(uint32_t)ringId
+{
+	// Stub until BAR 0's registers are mapped (the wire handshake): then this writes
+	// `ringId` to RGFX_REG_DOORBELL to wake the host's consumer of that ring.
+	(void)ringId;
 }
 
 // --- identity ----------------------------------------------------------------

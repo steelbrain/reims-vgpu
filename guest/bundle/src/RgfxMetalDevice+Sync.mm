@@ -26,7 +26,13 @@
 
 - (id<MTLSharedEvent>)newSharedEvent
 {
-	return [RgfxSharedEvent sharedEventWithInitialValue:0 device:self serializer:[self serializer]];
+	RgfxSharedEvent *event = [RgfxSharedEvent sharedEventWithInitialValue:0
+	                                                              device:self
+	                                                          serializer:[self serializer]];
+	// Register for the host's RGFX_EVT_EVENT_SIGNALLED so the value mirror tracks the
+	// host counter and notifyListener blocks fire.
+	[event rgfxRegisterWithReplyReader:[self replyReader]];
+	return event;
 }
 
 - (id<MTLSharedEvent>)newSharedEventWithHandle:(MTLSharedEventHandle *)sharedEventHandle

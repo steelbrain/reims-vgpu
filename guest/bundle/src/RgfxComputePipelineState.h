@@ -21,6 +21,7 @@
 
 #ifdef __cplusplus
 class RgfxSerializer;
+class RgfxReplyReader;
 #endif
 
 NS_ASSUME_NONNULL_BEGIN
@@ -58,6 +59,12 @@ NS_ASSUME_NONNULL_BEGIN
 /// The create's ring seqno, the key the host's RgfxPipelineReflection reply is
 /// matched by.
 @property(nonatomic, readonly) uint64_t rgfxSeqno;
+
+/// Registers with `reader` for the RgfxPipelineReflection the host posts for this
+/// create's seqno; after it arrives the reflection getters report the host's values
+/// instead of placeholders. The Sync/Pipelines device slice calls this after the
+/// create; a unit test calls it directly before feeding the reply.
+- (void)rgfxRegisterWithReplyReader:(RgfxReplyReader *)reader;
 
 @end
 

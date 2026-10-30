@@ -49,6 +49,7 @@ class RgfxSerializer;
 class RgfxRingWriter;
 class RgfxIdSpace;
 class RgfxEncoder;
+class RgfxReplyReader;
 #endif
 
 NS_ASSUME_NONNULL_BEGIN
@@ -63,11 +64,17 @@ NS_ASSUME_NONNULL_BEGIN
 
 /// Creates a queue, serialising an RGFX_CMD_QUEUE_CREATE through `serializer` (which
 /// picks the objId). `submitRing` is the queue's submission ring (guest -> host),
-/// borrowed; `ids` is the device's id space, borrowed, from which command-buffer ids
-/// are minted; `maxCount` is `maxCommandBufferCount` (0 means unbounded). `device`
-/// is the owning shell (nil in a unit test). Returns nil if `serializer`, `ids` or
-/// `submitRing` is null (a queue must have a route and a ring).
+/// borrowed; `submitOffset`, `completeOffset` and `completeDataSize` are the ring
+/// placement the region allocator (RgfxRegion) picked, carried in the QUEUE_CREATE so
+/// the host can map the rings (the submission ring's data size is `submitRing`'s);
+/// `ids` is the device's id space, borrowed, from which command-buffer ids are minted;
+/// `maxCount` is `maxCommandBufferCount` (0 means unbounded). `device` is the owning
+/// shell (nil in a unit test). Returns nil if `serializer`, `ids` or `submitRing` is
+/// null (a queue must have a route and a ring).
 + (nullable instancetype)queueWithSubmitRing:(nullable RgfxRingWriter *)submitRing
+                                submitOffset:(uint64_t)submitOffset
+                              completeOffset:(uint64_t)completeOffset
+                            completeDataSize:(uint32_t)completeDataSize
                                          ids:(nullable RgfxIdSpace *)ids
                                     maxCount:(NSUInteger)maxCount
                                       device:(nullable id<MTLDevice>)device
@@ -76,6 +83,13 @@ NS_ASSUME_NONNULL_BEGIN
 - (instancetype)initWithObjId:(uint64_t)objId
                        device:(nullable id<MTLDevice>)device
                    serializer:(nullable RgfxSerializer *)serializer NS_UNAVAILABLE;
+
+/// The device-wide reader of the control completion ring (RgfxReplyReader), borrowed.
+/// Set by the device after the queue is made; the queue's command buffers register
+/// their submission seqno with it on commit so their completion handlers fire and
+/// waitUntilCompleted wakes. Null in a unit test that drives the queue without a
+/// reader (the command buffer then holds its seqno, as before the reader landed).
+@property(nonatomic, nullable) RgfxReplyReader *replyReader;
 
 @end
 

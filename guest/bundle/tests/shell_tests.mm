@@ -41,6 +41,8 @@
 #import "RgfxCommandObjects.h"
 
 #include "RgfxObjectModel.hpp"
+#include "RgfxRegion.hpp"
+#include "RgfxReplyReader.hpp"
 #include "RgfxRingWriter.hpp"
 #include "RgfxSerializer.hpp"
 #include "reims_graphics_wire.h"
@@ -787,10 +789,13 @@ void test_command_graph()
 
 	// The queue: its create routes a QUEUE_CREATE on the control ring and picks objId 1.
 	RgfxCommandQueue *queue = [RgfxCommandQueue queueWithSubmitRing:&submitWriter
-	                                                            ids:&ids
-	                                                       maxCount:0
-	                                                         device:nil
-	                                                     serializer:&ser];
+	                                                  submitOffset:0
+	                                                completeOffset:0
+	                                              completeDataSize:0
+	                                                           ids:&ids
+	                                                      maxCount:0
+	                                                        device:nil
+	                                                    serializer:&ser];
 	CHECK(queue != nil);
 	CHECK(queue.rgfxObjId == 1);
 	CHECK([queue conformsToProtocol:@protocol(MTLCommandQueue)]);
@@ -1069,10 +1074,13 @@ void test_parallel_render_encoder()
 	RgfxRingWriter submitWriter(submit.base(), submit.dataSize, 1, TestRing::doorbell, nullptr);
 
 	RgfxCommandQueue *queue = [RgfxCommandQueue queueWithSubmitRing:&submitWriter
-	                                                            ids:&ids
-	                                                       maxCount:0
-	                                                         device:nil
-	                                                     serializer:&ser];
+	                                                  submitOffset:0
+	                                                completeOffset:0
+	                                              completeDataSize:0
+	                                                           ids:&ids
+	                                                      maxCount:0
+	                                                        device:nil
+	                                                    serializer:&ser];
 	(void)expectMessage<RgfxQueueCreate>(control, RGFX_CMD_QUEUE_CREATE);
 	id<MTLCommandBuffer> cb = [queue commandBuffer];
 
@@ -1135,20 +1143,323 @@ void test_queue_guards()
 	RgfxRingWriter submitWriter(submit.base(), submit.dataSize, 1, TestRing::doorbell, nullptr);
 
 	CHECK([RgfxCommandQueue queueWithSubmitRing:&submitWriter
+	                               submitOffset:0
+	                             completeOffset:0
+	                           completeDataSize:0
 	                                        ids:&ids
 	                                   maxCount:0
 	                                     device:nil
 	                                 serializer:nullptr] == nil);
 	CHECK([RgfxCommandQueue queueWithSubmitRing:&submitWriter
+	                               submitOffset:0
+	                             completeOffset:0
+	                           completeDataSize:0
 	                                        ids:nullptr
 	                                   maxCount:0
 	                                     device:nil
 	                                 serializer:&ser] == nil);
 	CHECK([RgfxCommandQueue queueWithSubmitRing:nullptr
+	                               submitOffset:0
+	                             completeOffset:0
+	                           completeDataSize:0
 	                                        ids:&ids
 	                                   maxCount:0
 	                                     device:nil
 	                                 serializer:&ser] == nil);
+}
+
+// =============================================================================
+// The transport layer: the region allocator and the reply reader
+// =============================================================================
+
+// The region allocator hands out aligned, non-overlapping blocks past the floor
+// (RGFX_ALLOCATIONS_OFFSET), never touching the host-reserved control rings / caps
+// page below it, and places ring pairs with power-of-two byte rings.
+void test_region_allocator()
+{
+	std::vector<uint8_t> mem(0x200000, 0xff); // 2 MiB, pre-dirtied like BAR memory
+	RgfxRegion region(mem.data(), mem.size());
+	CHECK(region.floor() == RGFX_ALLOCATIONS_OFFSET);
+	CHECK(region.size() == mem.size());
+
+	RgfxRegion::Block a = region.allocate(0x1000);
+	CHECK(a.ok);
+	CHECK(a.offset >= RGFX_ALLOCATIONS_OFFSET); // never below the floor
+	CHECK(a.offset % 0x1000 == 0);              // aligned (default page)
+	CHECK(a.ptr == region.base() + a.offset);
+	CHECK(a.size == 0x1000);
+
+	RgfxRegion::Block b = region.allocate(0x800, 256);
+	CHECK(b.ok);
+	CHECK(b.offset % 256 == 0);
+	CHECK(a.offset + a.size <= b.offset); // non-overlap with a
+
+	RgfxRegion::Block c = region.allocate(0x1234, 64);
+	CHECK(c.ok);
+	CHECK(b.offset + b.size <= c.offset); // non-overlap with b
+	CHECK(region.used() >= (c.offset - region.floor()) + c.size);
+
+	// A non-power-of-two alignment, and a request past the region's end, both fail.
+	CHECK(!region.allocate(16, 3).ok);
+	CHECK(!region.allocate(mem.size(), 0x1000).ok);
+
+	// A submission + completion ring pair: both offsets past the floor, non-overlapping,
+	// each a ring header plus a power-of-two byte ring.
+	RgfxRegion::RingPair rings = region.allocateRingPair(0x8000, 0x8000);
+	CHECK(rings.ok);
+	CHECK(rings.submit_offset >= RGFX_ALLOCATIONS_OFFSET);
+	CHECK(rings.submit_data_size == 0x8000);
+	CHECK(rings.complete_data_size == 0x8000);
+	CHECK(rings.complete_offset >= rings.submit_offset + RGFX_RING_HEADER_SIZE + 0x8000);
+	// A completion ring of 0 places none (the single-ring model).
+	RgfxRegion::RingPair submitOnly = region.allocateRingPair(0x1000, 0);
+	CHECK(submitOnly.ok);
+	CHECK(submitOnly.complete_offset == 0);
+	// A non-power-of-two byte ring is refused.
+	CHECK(!region.allocateRingPair(0x7000, 0).ok);
+
+	// contains / offsetOf: inside the allocable region, below the floor is out.
+	CHECK(region.contains(mem.data() + RGFX_ALLOCATIONS_OFFSET, 16));
+	CHECK(!region.contains(mem.data(), 16)); // below the floor
+	CHECK(!region.contains(mem.data() + mem.size() - 8, 16)); // runs off the end
+	CHECK(region.offsetOf(mem.data() + a.offset) == a.offset);
+}
+
+// newCommandQueue's path: a queue built over a ring pair the region allocator placed
+// carries those offsets in its RGFX_CMD_QUEUE_CREATE (the device category does the same
+// with its region; here the factory is driven directly with a fixture region).
+void test_queue_carries_allocated_offsets()
+{
+	TestRing control(0x8000);
+	control.setConsumerIdle(1);
+	RgfxRingWriter controlWriter(control.base(), control.dataSize, RGFX_CONTROL_RING_ID,
+	                             TestRing::doorbell, nullptr);
+	RgfxIdSpace ids;
+	RgfxSerializer ser(controlWriter, ids);
+
+	std::vector<uint8_t> mem(0x200000, 0);
+	RgfxRegion region(mem.data(), mem.size());
+	RgfxRegion::RingPair rings = region.allocateRingPair(0x8000, 0x8000);
+	CHECK(rings.ok);
+
+	// The submission ring's writer over the region at the allocated submit offset.
+	RgfxRingWriter submitWriter(region.base() + rings.submit_offset, rings.submit_data_size, 1,
+	                            TestRing::doorbell, nullptr);
+
+	RgfxCommandQueue *queue = [RgfxCommandQueue queueWithSubmitRing:&submitWriter
+	                                                  submitOffset:rings.submit_offset
+	                                                completeOffset:rings.complete_offset
+	                                              completeDataSize:rings.complete_data_size
+	                                                           ids:&ids
+	                                                      maxCount:0
+	                                                        device:nil
+	                                                    serializer:&ser];
+	CHECK(queue != nil);
+	RgfxQueueCreate qc = expectMessage<RgfxQueueCreate>(control, RGFX_CMD_QUEUE_CREATE);
+	CHECK(qc.submit_offset == rings.submit_offset);
+	CHECK(qc.complete_offset == rings.complete_offset);
+	CHECK(qc.submit_data_size == rings.submit_data_size);
+	CHECK(qc.complete_data_size == rings.complete_data_size);
+	CHECK(qc.submit_offset >= RGFX_ALLOCATIONS_OFFSET);
+}
+
+// A host command-buffer completion the reader dispatches: the CB's completed handler
+// fires with the buffer, its status flips, and an error completion carries the error.
+void test_reply_reader_completion()
+{
+	TestRing control(0x8000);
+	control.setConsumerIdle(1);
+	RgfxRingWriter controlWriter(control.base(), control.dataSize, RGFX_CONTROL_RING_ID,
+	                             TestRing::doorbell, nullptr);
+	RgfxIdSpace ids;
+	RgfxSerializer ser(controlWriter, ids);
+	TestRing submit(0x8000);
+	submit.setConsumerIdle(1);
+	RgfxRingWriter submitWriter(submit.base(), submit.dataSize, 1, TestRing::doorbell, nullptr);
+
+	TestRing completion(0x8000);
+	RgfxReplyReader reader(completion.base(), completion.dataSize);
+
+	RgfxCommandQueue *queue = [RgfxCommandQueue queueWithSubmitRing:&submitWriter
+	                                                  submitOffset:0
+	                                                completeOffset:0
+	                                              completeDataSize:0
+	                                                           ids:&ids
+	                                                      maxCount:0
+	                                                        device:nil
+	                                                    serializer:&ser];
+	queue.replyReader = &reader;
+	(void)expectMessage<RgfxQueueCreate>(control, RGFX_CMD_QUEUE_CREATE);
+
+	// --- a clean completion ---
+	__block int fired = 0;
+	__block id<MTLCommandBuffer> handlerGot = nil;
+	id<MTLCommandBuffer> cb = [queue commandBuffer];
+	uint64_t cbObjId = ((RgfxResource *)cb).rgfxObjId;
+	[cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+		fired++;
+		handlerGot = done;
+	}];
+	[cb commit];
+	CHECK(cb.status == MTLCommandBufferStatusCommitted);
+
+	// Read the submission seqno the host's completion must carry.
+	RgfxMsgHeader submitHdr = {};
+	std::vector<uint8_t> submitBytes;
+	CHECK(submit.next(&submitHdr, &submitBytes));
+	CHECK(submitHdr.type == RGFX_CMD_COMMAND_BUFFER);
+	uint64_t seqno = submitHdr.seqno;
+
+	// Nothing has arrived: no dispatch, handler unfired.
+	CHECK(reader.pump() == 0);
+	CHECK(fired == 0);
+	CHECK(reader.awaitingCompletion(seqno));
+
+	RgfxCbComplete done = {};
+	done.header.type = RGFX_EVT_CB_COMPLETE;
+	done.header.size = sizeof(done);
+	done.header.seqno = seqno;
+	done.cb_obj_id = cbObjId;
+	done.status = RGFX_CB_OK;
+	CHECK(completion.postFromHost(&done, sizeof(done)));
+	CHECK(reader.pump() == 1);
+	CHECK(fired == 1);
+	CHECK(handlerGot == cb);
+	CHECK(cb.status == MTLCommandBufferStatusCompleted);
+	CHECK(cb.error == nil);
+	CHECK(!reader.awaitingCompletion(seqno)); // the one-shot was removed
+
+	// --- an error completion on a second buffer, waited on ---
+	id<MTLCommandBuffer> cb2 = [queue commandBuffer];
+	uint64_t cb2ObjId = ((RgfxResource *)cb2).rgfxObjId;
+	[cb2 commit];
+	RgfxMsgHeader submitHdr2 = {};
+	std::vector<uint8_t> submitBytes2;
+	CHECK(submit.next(&submitHdr2, &submitBytes2));
+	uint64_t seqno2 = submitHdr2.seqno;
+
+	RgfxCbComplete failed = {};
+	failed.header.type = RGFX_EVT_CB_COMPLETE;
+	failed.header.size = sizeof(failed);
+	failed.header.seqno = seqno2;
+	failed.cb_obj_id = cb2ObjId;
+	failed.status = RGFX_CB_TIMEOUT;
+	failed.error_code = 2; // MTLCommandBufferErrorTimeout
+	CHECK(completion.postFromHost(&failed, sizeof(failed)));
+	[cb2 waitUntilCompleted]; // pumps until the completion lands
+	CHECK(cb2.status == MTLCommandBufferStatusError);
+	CHECK(cb2.error != nil);
+	CHECK(cb2.error.code == 2);
+}
+
+// A host pipeline reflection the reader dispatches fills the pipeline-state wrapper, so
+// its reflection getters report the host's values instead of placeholders.
+void test_reply_reader_reflection()
+{
+	Fixture fx; // control ring + serialiser
+
+	const uint8_t libBytes[] = { 1, 2, 3, 4 };
+	RgfxLibrary *lib = [RgfxLibrary libraryWithData:libBytes
+	                                        length:sizeof(libBytes)
+	                                        device:nil
+	                                    serializer:&fx.ser];
+	(void)nextMessage(fx.ring, RGFX_CMD_LIBRARY_CREATE);
+	id<MTLFunction> cfn = [lib newFunctionWithName:@"kmain"];
+
+	NSError *err = nil;
+	RgfxComputePipelineState *ps =
+	    [RgfxComputePipelineState computePipelineStateWithFunction:cfn
+	                                                        device:nil
+	                                                    serializer:&fx.ser
+	                                                         error:&err];
+	CHECK(ps != nil);
+	(void)nextMessage(fx.ring, RGFX_CMD_COMPUTE_PIPELINE_CREATE);
+
+	TestRing completion(0x8000);
+	RgfxReplyReader reader(completion.base(), completion.dataSize);
+	[ps rgfxRegisterWithReplyReader:&reader];
+	CHECK(reader.awaitingReflection(ps.rgfxSeqno));
+
+	// Before the reply the getters answer placeholders.
+	CHECK([ps maxTotalThreadsPerThreadgroup] == 1024);
+	CHECK(ps.gpuResourceID._impl == 0);
+
+	RgfxPipelineReflection refl = {};
+	refl.header.type = RGFX_EVT_PIPELINE_REFLECTION;
+	refl.header.size = sizeof(refl);
+	refl.header.seqno = ps.rgfxSeqno;
+	refl.obj_id = ps.rgfxObjId;
+	refl.gpu_resource_id = 0xABCDEF;
+	refl.max_total_threads_per_threadgroup = 512;
+	refl.static_threadgroup_memory_length = 2048;
+	refl.thread_execution_width = 64;
+	refl.status = RGFX_PIPELINE_OK;
+	refl.kind = RGFX_PIPELINE_KIND_COMPUTE;
+	CHECK(completion.postFromHost(&refl, sizeof(refl)));
+	CHECK(reader.pump() == 1);
+
+	CHECK([ps maxTotalThreadsPerThreadgroup] == 512);
+	CHECK([ps threadExecutionWidth] == 64);
+	CHECK([ps staticThreadgroupMemoryLength] == 2048);
+	CHECK(ps.gpuResourceID._impl == 0xABCDEF);
+	CHECK(!reader.awaitingReflection(ps.rgfxSeqno)); // one-shot removed
+}
+
+// A host event-signalled message the reader dispatches updates the shared-event value
+// mirror and fires the notifyListener blocks that have been reached.
+void test_reply_reader_event()
+{
+	// The reader is declared before the inner pool so it outlives the autoreleased
+	// event, whose dealloc deregisters its listener from the reader (as the device's
+	// reader outlives its events in the guest).
+	TestRing completion(0x8000);
+	RgfxReplyReader reader(completion.base(), completion.dataSize);
+	@autoreleasepool {
+	Fixture fx;
+
+	const uint64_t initial = 5;
+	RgfxSharedEvent *ev = [RgfxSharedEvent sharedEventWithInitialValue:initial
+	                                                           device:nil
+	                                                       serializer:&fx.ser];
+	CHECK(ev != nil);
+	(void)expectMessage<RgfxSharedEventCreate>(fx.ring, RGFX_CMD_SHARED_EVENT_CREATE);
+
+	[ev rgfxRegisterWithReplyReader:&reader];
+	CHECK(ev.signaledValue == initial);
+
+	// A listener that fires only once the value reaches 50.
+	__block uint64_t notified = 0;
+	MTLSharedEventListener *listener = [[MTLSharedEventListener alloc] init];
+	[ev notifyListener:listener
+	           atValue:50
+	             block:^(id<MTLSharedEvent> e, uint64_t v) {
+		             (void)e;
+		             notified = v;
+	             }];
+
+	// The host raises the event to 42: the mirror updates, the 50-listener holds.
+	RgfxEventSignalled sig = {};
+	sig.header.type = RGFX_EVT_EVENT_SIGNALLED;
+	sig.header.size = sizeof(sig);
+	sig.header.seqno = 0;
+	sig.obj_id = ev.rgfxObjId;
+	sig.value = 42;
+	CHECK(completion.postFromHost(&sig, sizeof(sig)));
+	CHECK(reader.pump() == 1);
+	CHECK(ev.signaledValue == 42);
+	CHECK(notified == 0);
+
+	// The host raises it to 50: the mirror updates and the listener fires.
+	RgfxEventSignalled sig2 = {};
+	sig2.header.type = RGFX_EVT_EVENT_SIGNALLED;
+	sig2.header.size = sizeof(sig2);
+	sig2.obj_id = ev.rgfxObjId;
+	sig2.value = 50;
+	CHECK(completion.postFromHost(&sig2, sizeof(sig2)));
+	CHECK(reader.pump() == 1);
+	CHECK(ev.signaledValue == 50);
+	CHECK(notified == 50);
+	} // @autoreleasepool: ev drains here, while reader still lives
 }
 
 } // namespace
@@ -1174,6 +1485,11 @@ int main()
 		test_command_graph();
 		test_parallel_render_encoder();
 		test_queue_guards();
+		test_region_allocator();
+		test_queue_carries_allocated_offsets();
+		test_reply_reader_completion();
+		test_reply_reader_reflection();
+		test_reply_reader_event();
 	}
 	std::printf("shell_tests: OK (%d checks)\n", g_checks);
 	return 0;

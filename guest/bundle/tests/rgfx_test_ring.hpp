@@ -72,6 +72,50 @@ struct TestRing {
 
 	static void doorbell(void *, uint32_t) { doorbells.fetch_add(1); }
 
+	// --- the host-producer side (host -> guest rings, for RgfxReplyReader) --------
+	// A completion ring the reader drains: the test plays the host here, writing a
+	// reply message and publishing `producer`, mirroring crates/reims-graphics/src/
+	// ring.rs Producer::post (pad to the end so a message never wraps). `msg` already
+	// holds its header (type, size, seqno). Returns false with nothing written when the
+	// ring has no room.
+	uint64_t produced = 0; // the host's producer count, for host -> guest rings
+
+	uint64_t consumerCount()
+	{
+		uint64_t v;
+		std::memcpy(&v, mem.data() + __builtin_offsetof(RgfxRingHeader, consumer), 8);
+		return v;
+	}
+
+	void setProducer(uint64_t v)
+	{
+		std::memcpy(mem.data() + __builtin_offsetof(RgfxRingHeader, producer), &v, 8);
+	}
+
+	bool postFromHost(const void *msg, uint32_t size)
+	{
+		uint64_t guest = consumerCount();
+		uint64_t used = produced - guest;
+		if (used > dataSize)
+			return false;
+		uint32_t off = static_cast<uint32_t>(produced) & (dataSize - 1);
+		uint32_t tail = dataSize - off;
+		uint32_t pad = tail < size ? tail : 0;
+		if (static_cast<uint64_t>(pad) + size > dataSize - used)
+			return false;
+		if (pad) {
+			uint32_t padHeader[2] = { RGFX_MSG_PAD, pad };
+			std::memcpy(const_cast<uint8_t *>(data()) + off, padHeader, sizeof(padHeader));
+			produced += pad;
+			off = 0;
+		}
+		std::memcpy(const_cast<uint8_t *>(data()) + off, msg, size);
+		produced += size;
+		std::atomic_thread_fence(std::memory_order_release);
+		setProducer(produced);
+		return true;
+	}
+
 	// The next message from the host's count, pads skipped; false when none more.
 	bool next(RgfxMsgHeader *header, std::vector<uint8_t> *bytes)
 	{

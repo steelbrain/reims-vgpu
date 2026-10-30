@@ -37,6 +37,29 @@
 	return heap;
 }
 
++ (instancetype)heapOverHostMemoryWithDescriptor:(MTLHeapDescriptor *)descriptor
+                                    regionOffset:(uint64_t)regionOffset
+                                          device:(id<MTLDevice>)device
+                                      serializer:(RgfxSerializer *)serializer
+{
+	if (serializer == nullptr || descriptor == nil) {
+		return nil; // a heap must have a route and a shape
+	}
+	RgfxCreated created = serializer->createHeapOverHostMemory(
+	    static_cast<uint64_t>(descriptor.size),
+	    static_cast<uint32_t>(descriptor.resourceOptions),
+	    static_cast<int32_t>(descriptor.type), regionOffset);
+	RgfxHeap *heap = [[RgfxHeap alloc] initWithObjId:created.obj_id
+	                                          device:device
+	                                      serializer:serializer];
+	if (heap) {
+		heap->_size = static_cast<uint64_t>(descriptor.size);
+		heap->_options = descriptor.resourceOptions;
+		heap->_type = descriptor.type;
+	}
+	return heap;
+}
+
 // --- MTLHeap shape (from the stored descriptor) ------------------------------
 
 - (NSUInteger)size

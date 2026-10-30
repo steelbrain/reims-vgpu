@@ -65,7 +65,8 @@ TESTHEADERS  = $(wildcard tests/*.hpp)
 
 # Serialiser core (C++).
 CORE_SRCS = src/RgfxObjectModel.cpp src/RgfxCaps.cpp src/RgfxRingWriter.cpp \
-	src/RgfxSerializer.cpp src/RgfxEncoder.cpp src/RgfxWireLayout.cpp
+	src/RgfxSerializer.cpp src/RgfxEncoder.cpp src/RgfxWireLayout.cpp \
+	src/RgfxRegion.cpp src/RgfxReplyReader.cpp
 
 # The whole Metal shell (ObjC++): wrappers + the device. Goes in the bundle. Globbed
 # so each later slice's wrappers + category are picked up with no Makefile edit.

@@ -108,14 +108,27 @@
 
 // --- render pipelines --------------------------------------------------------
 
+// Creates a render pipeline state and registers it with the device's reply reader, so
+// its reflection fills when the host answers this create's seqno. Every render-pipeline
+// entry point funnels through here.
+- (nullable id<MTLRenderPipelineState>)
+    rgfxRenderPipelineForDescriptor:(MTLRenderPipelineDescriptor *)descriptor
+                              error:(__autoreleasing NSError **)error
+{
+	RgfxRenderPipelineState *state =
+	    [RgfxRenderPipelineState renderPipelineStateWithDescriptor:descriptor
+	                                                        device:self
+	                                                    serializer:[self serializer]
+	                                                         error:error];
+	[state rgfxRegisterWithReplyReader:[self replyReader]];
+	return state;
+}
+
 - (id<MTLRenderPipelineState>)
     newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)descriptor
                                    error:(__autoreleasing NSError **)error
 {
-	return [RgfxRenderPipelineState renderPipelineStateWithDescriptor:descriptor
-	                                                          device:self
-	                                                      serializer:[self serializer]
-	                                                           error:error];
+	return [self rgfxRenderPipelineForDescriptor:descriptor error:error];
 }
 
 - (id<MTLRenderPipelineState>)
@@ -129,10 +142,7 @@
 	// later transport piece), so there is none to hand back synchronously.
 	if (reflection)
 		*reflection = nil;
-	return [RgfxRenderPipelineState renderPipelineStateWithDescriptor:descriptor
-	                                                          device:self
-	                                                      serializer:[self serializer]
-	                                                           error:error];
+	return [self rgfxRenderPipelineForDescriptor:descriptor error:error];
 }
 
 - (void)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)descriptor
@@ -162,13 +172,38 @@
 
 // --- compute pipelines -------------------------------------------------------
 
-- (id<MTLComputePipelineState>)newComputePipelineStateWithFunction:(id<MTLFunction>)computeFunction
-                                                            error:(__autoreleasing NSError **)error
+// Creates a compute pipeline state (from a function or a descriptor) and registers it
+// with the device's reply reader so its reflection fills on the host's answer. Every
+// compute-pipeline entry point funnels through one of these two.
+- (nullable id<MTLComputePipelineState>)rgfxComputePipelineForFunction:(id<MTLFunction>)function
+                                                               error:(__autoreleasing NSError **)error
 {
-	return [RgfxComputePipelineState computePipelineStateWithFunction:computeFunction
+	RgfxComputePipelineState *state =
+	    [RgfxComputePipelineState computePipelineStateWithFunction:function
+	                                                        device:self
+	                                                    serializer:[self serializer]
+	                                                         error:error];
+	[state rgfxRegisterWithReplyReader:[self replyReader]];
+	return state;
+}
+
+- (nullable id<MTLComputePipelineState>)
+    rgfxComputePipelineForDescriptor:(MTLComputePipelineDescriptor *)descriptor
+                               error:(__autoreleasing NSError **)error
+{
+	RgfxComputePipelineState *state =
+	    [RgfxComputePipelineState computePipelineStateWithDescriptor:descriptor
 	                                                          device:self
 	                                                      serializer:[self serializer]
 	                                                           error:error];
+	[state rgfxRegisterWithReplyReader:[self replyReader]];
+	return state;
+}
+
+- (id<MTLComputePipelineState>)newComputePipelineStateWithFunction:(id<MTLFunction>)computeFunction
+                                                            error:(__autoreleasing NSError **)error
+{
+	return [self rgfxComputePipelineForFunction:computeFunction error:error];
 }
 
 - (id<MTLComputePipelineState>)
@@ -180,10 +215,7 @@
 	(void)options;
 	if (reflection)
 		*reflection = nil;
-	return [RgfxComputePipelineState computePipelineStateWithFunction:computeFunction
-	                                                          device:self
-	                                                      serializer:[self serializer]
-	                                                           error:error];
+	return [self rgfxComputePipelineForFunction:computeFunction error:error];
 }
 
 - (void)newComputePipelineStateWithFunction:(id<MTLFunction>)computeFunction
@@ -220,10 +252,7 @@
 	(void)options;
 	if (reflection)
 		*reflection = nil;
-	return [RgfxComputePipelineState computePipelineStateWithDescriptor:descriptor
-	                                                            device:self
-	                                                        serializer:[self serializer]
-	                                                             error:error];
+	return [self rgfxComputePipelineForDescriptor:descriptor error:error];
 }
 
 - (void)newComputePipelineStateWithDescriptor:(MTLComputePipelineDescriptor *)descriptor
@@ -234,11 +263,8 @@
 {
 	(void)options;
 	NSError *err = nil;
-	id<MTLComputePipelineState> state =
-	    [RgfxComputePipelineState computePipelineStateWithDescriptor:descriptor
-	                                                         device:self
-	                                                     serializer:[self serializer]
-	                                                          error:&err];
+	id<MTLComputePipelineState> state = [self rgfxComputePipelineForDescriptor:descriptor
+	                                                                    error:&err];
 	if (completionHandler)
 		completionHandler(state, nil, err);
 }

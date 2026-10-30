@@ -10,7 +10,14 @@
 #import "RgfxFunction.h"
 #import "RgfxMetalError.h"
 
+#include "RgfxReplyReader.hpp"
 #include "RgfxSerializer.hpp"
+
+// The reflection-fill entry the reader's handler calls (defined below); declared here
+// so the lambda in rgfxRegisterWithReplyReader: sees its signature.
+@interface RgfxRenderPipelineState ()
+- (void)rgfxFillReflection:(const RgfxPipelineReflection *)r;
+@end
 
 namespace {
 
@@ -41,6 +48,11 @@ void fillFunctionRef(RgfxFunctionRef &fr, id<MTLFunction> fn)
 
 @implementation RgfxRenderPipelineState {
 	uint64_t _seqno;
+	// The host's reflection, filled once RGFX_EVT_PIPELINE_REFLECTION for `_seqno`
+	// arrives through the reply reader; until then `_haveReflection` is NO and the
+	// getters answer documented placeholders.
+	RgfxPipelineReflection _reflection;
+	BOOL _haveReflection;
 }
 
 + (instancetype)renderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)descriptor
@@ -175,29 +187,64 @@ void fillFunctionRef(RgfxFunctionRef &fr, id<MTLFunction> fn)
 	return _seqno;
 }
 
-// --- MTLRenderPipelineState: reflection (DOCUMENTED PLACEHOLDERS) -------------
-// The host answers the create with an RgfxPipelineReflection over the queue's
-// completion ring, matched by `rgfxSeqno`; the reply-ring reader is a later
-// transport piece. Until it lands these answer documented placeholders rather than
-// fabricating the host's values (the caps-placeholder pattern of slice 0).
+- (void)rgfxRegisterWithReplyReader:(RgfxReplyReader *)reader
+{
+	if (reader == nullptr) {
+		return;
+	}
+	// Weak capture: if the caller releases this state before its reflection arrives,
+	// the one-shot handler is a no-op (the reflection is then moot).
+	__weak RgfxRenderPipelineState *weakSelf = self;
+	reader->expectReflection(_seqno, [weakSelf](const RgfxPipelineReflection &r) {
+		RgfxRenderPipelineState *strongSelf = weakSelf;
+		if (strongSelf != nil) {
+			[strongSelf rgfxFillReflection:&r];
+		}
+	});
+}
+
+// Stores the host's reflection; the getters below then report it.
+- (void)rgfxFillReflection:(const RgfxPipelineReflection *)r
+{
+	_reflection = *r;
+	_haveReflection = YES;
+}
+
+// --- MTLRenderPipelineState: reflection --------------------------------------
+// The host answers the create with an RgfxPipelineReflection over the completion
+// ring, matched by `rgfxSeqno` and read by the reply reader. Before it arrives these
+// answer documented placeholders (the caps-placeholder pattern of slice 0); after it
+// they report the host's values.
 
 - (NSUInteger)maxTotalThreadsPerThreadgroup
 {
+	if (_haveReflection) {
+		return static_cast<NSUInteger>(_reflection.max_total_threads_per_threadgroup);
+	}
 	return 1024; // Metal's common threadgroup floor until reflection is read
 }
 
 - (BOOL)threadgroupSizeMatchesTileSize
 {
+	if (_haveReflection) {
+		return (_reflection.flags & RGFX_PIPELINE_REFLECT_THREADGROUP_MATCHES_TILE) != 0;
+	}
 	return NO;
 }
 
 - (NSUInteger)imageblockSampleLength
 {
+	if (_haveReflection) {
+		return _reflection.imageblock_sample_length;
+	}
 	return 0;
 }
 
 - (MTLResourceID)gpuResourceID
 {
+	if (_haveReflection) {
+		return (MTLResourceID){ _reflection.gpu_resource_id };
+	}
 	return (MTLResourceID){0}; // 0 until the reflection reply carries the real id
 }
 

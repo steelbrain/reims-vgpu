@@ -32,6 +32,7 @@
 
 #ifdef __cplusplus
 class RgfxSerializer;
+class RgfxReplyReader;
 #endif
 
 NS_ASSUME_NONNULL_BEGIN
@@ -45,6 +46,13 @@ NS_ASSUME_NONNULL_BEGIN
 + (nullable instancetype)sharedEventWithInitialValue:(uint64_t)initialValue
                                              device:(nullable id<MTLDevice>)device
                                          serializer:(nullable RgfxSerializer *)serializer;
+
+/// Registers with `reader` for the host's RGFX_EVT_EVENT_SIGNALLED for this event's
+/// obj_id: each one updates the value mirror (so `signaledValue` reflects the host's
+/// counter) and fires the notifyListener blocks that have been reached. The listener
+/// is removed on dealloc. The Sync device slice calls this after the create; a unit
+/// test calls it directly before feeding the signal.
+- (void)rgfxRegisterWithReplyReader:(RgfxReplyReader *)reader;
 
 @end
 
