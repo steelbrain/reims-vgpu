@@ -25,13 +25,15 @@
 use std::collections::HashMap;
 
 use reims_graphics::wire::{
-    RGFX_CMD_EVENT_CREATE, RGFX_CMD_FENCE_CREATE, RGFX_CMD_LIBRARY_CREATE, RGFX_CMD_OBJECT_DESTROY,
-    RGFX_CMD_QUEUE_CREATE, RGFX_CMD_SHARED_EVENT_CREATE, RGFX_LIBRARY_BYTES_OFFSET,
-    RgfxLibraryCreate, RgfxMsgHeader, RgfxObjectCreate, RgfxObjectDestroy, RgfxQueueCreate,
-    RgfxSharedEventCreate,
+    RGFX_CMD_DEPTH_STENCIL_CREATE, RGFX_CMD_EVENT_CREATE, RGFX_CMD_FENCE_CREATE,
+    RGFX_CMD_LIBRARY_CREATE, RGFX_CMD_OBJECT_DESTROY, RGFX_CMD_QUEUE_CREATE,
+    RGFX_CMD_SAMPLER_CREATE, RGFX_CMD_SHARED_EVENT_CREATE, RGFX_LIBRARY_BYTES_OFFSET,
+    RgfxDepthStencilCreate, RgfxLibraryCreate, RgfxMsgHeader, RgfxObjectCreate, RgfxObjectDestroy,
+    RgfxQueueCreate, RgfxSamplerCreate, RgfxSharedEventCreate, RgfxStencilDescriptor,
 };
 use reims_vgpu_core::platform::Platform;
 use reims_vgpu_core::platform::device::GpuDevice;
+use reims_vgpu_core::platform::values::{DepthStencilDesc, SamplerDesc, StencilDesc};
 use reims_vgpu_core::raise::{OnFault, RaiseResult};
 use zerocopy::FromBytes;
 
@@ -44,6 +46,8 @@ enum ObjHandle<P: Platform> {
     SharedEvent(P::SharedEvent),
     CommandQueue(P::CommandQueue),
     Library(P::Library),
+    Sampler(P::SamplerState),
+    DepthStencil(P::DepthStencilState),
 }
 
 /// Why a message was not carried out.
@@ -167,6 +171,52 @@ impl<P: Platform> GraphicsDecoder<P> {
                     Ok(None) | Err(_) => Ok(Err(DecodeError::Refused)),
                 }
             }
+            RGFX_CMD_SAMPLER_CREATE => {
+                let Some(m) = read::<RgfxSamplerCreate>(message) else {
+                    return Ok(Err(DecodeError::Malformed));
+                };
+                // Our wire sends the whole descriptor, so every field is set;
+                // the LOD clamps travel as `f32` bits, and `flags` packs the
+                // booleans. `reduction_mode` is not on the wire yet (the Metal
+                // default stands).
+                let desc = SamplerDesc {
+                    min_filter: Some(m.min_filter.into()),
+                    mag_filter: Some(m.mag_filter.into()),
+                    mip_filter: Some(m.mip_filter.into()),
+                    s_address_mode: Some(m.s_address_mode.into()),
+                    t_address_mode: Some(m.t_address_mode.into()),
+                    r_address_mode: Some(m.r_address_mode.into()),
+                    border_color: Some(m.border_color.into()),
+                    compare_function: Some(m.compare_function.into()),
+                    max_anisotropy: Some(m.max_anisotropy.into()),
+                    lod_min_clamp: Some(f32::from_bits(m.lod_min_clamp_bits)),
+                    lod_max_clamp: Some(f32::from_bits(m.lod_max_clamp_bits)),
+                    normalized_coordinates: Some((m.flags & 1) != 0),
+                    lod_average: Some((m.flags & 2) != 0),
+                    support_argument_buffers: Some((m.flags & 4) != 0),
+                    reduction_mode: None,
+                    resource_index: None,
+                };
+                match device.new_sampler_state(&desc)? {
+                    Some(sampler) => self.insert(m.obj_id, ObjHandle::Sampler(sampler)),
+                    None => Ok(Err(DecodeError::Refused)),
+                }
+            }
+            RGFX_CMD_DEPTH_STENCIL_CREATE => {
+                let Some(m) = read::<RgfxDepthStencilCreate>(message) else {
+                    return Ok(Err(DecodeError::Malformed));
+                };
+                let desc = DepthStencilDesc {
+                    depth_compare_function: Some(m.depth_compare.into()),
+                    depth_write_enabled: Some(m.depth_write_enabled != 0),
+                    front: Some(stencil(&m.front)),
+                    back: Some(stencil(&m.back)),
+                };
+                match device.new_depth_stencil_state(&desc)? {
+                    Some(state) => self.insert(m.obj_id, ObjHandle::DepthStencil(state)),
+                    None => Ok(Err(DecodeError::Refused)),
+                }
+            }
             _ => Ok(Err(DecodeError::UnknownCommand)),
         }
     }
@@ -186,6 +236,18 @@ impl<P: Platform> GraphicsDecoder<P> {
 /// short.
 fn read<T: FromBytes>(message: &[u8]) -> Option<T> {
     T::read_from_prefix(message).ok().map(|(t, _)| t)
+}
+
+/// The core stencil descriptor for one face from its wire record.
+fn stencil(s: &RgfxStencilDescriptor) -> StencilDesc {
+    StencilDesc {
+        stencil_compare_function: s.stencil_compare.into(),
+        stencil_failure_operation: s.stencil_fail_op.into(),
+        depth_failure_operation: s.depth_fail_op.into(),
+        depth_stencil_pass_operation: s.pass_op.into(),
+        read_mask: s.read_mask,
+        write_mask: s.write_mask,
+    }
 }
 
 #[cfg(test)]
@@ -270,13 +332,47 @@ mod tests {
         lib_msg.extend_from_slice(&air);
         assert_eq!(dec.decode(&device, &lib_msg).unwrap(), Ok(()));
 
-        assert_eq!(dec.object_count(), 5);
+        // A sampler and a depth/stencil state, each from a full descriptor.
+        let sampler = RgfxSamplerCreate {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_SAMPLER_CREATE,
+                size: size_of::<RgfxSamplerCreate>() as u32,
+                seqno: 0,
+            },
+            obj_id: 15,
+            max_anisotropy: 1,
+            flags: 0b101,
+            lod_max_clamp_bits: f32::MAX.to_bits(),
+            ..RgfxSamplerCreate::default()
+        };
+        assert_eq!(dec.decode(&device, sampler.as_bytes()).unwrap(), Ok(()));
+        let ds = RgfxDepthStencilCreate {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_DEPTH_STENCIL_CREATE,
+                size: size_of::<RgfxDepthStencilCreate>() as u32,
+                seqno: 0,
+            },
+            obj_id: 16,
+            depth_compare: 1,
+            depth_write_enabled: 1,
+            front: RgfxStencilDescriptor {
+                read_mask: 0xff,
+                write_mask: 0xff,
+                ..RgfxStencilDescriptor::default()
+            },
+            back: RgfxStencilDescriptor::default(),
+        };
+        assert_eq!(dec.decode(&device, ds.as_bytes()).unwrap(), Ok(()));
+
+        assert_eq!(dec.object_count(), 7);
         let log = p.call_log();
         assert_eq!(log.calls_to("newEvent").len(), 1);
         assert_eq!(log.calls_to("newFence").len(), 1);
         assert_eq!(log.calls_to("newSharedEvent").len(), 1);
         assert_eq!(log.calls_to("newCommandQueue").len(), 1);
         assert_eq!(log.calls_to("newLibraryWithData:error:").len(), 1);
+        assert_eq!(log.calls_to("newSamplerStateWithDescriptor:").len(), 1);
+        assert_eq!(log.calls_to("newDepthStencilStateWithDescriptor:").len(), 1);
 
         // Destroying the event drops its handle; the others stay.
         let destroy = RgfxObjectDestroy {
@@ -288,7 +384,7 @@ mod tests {
             obj_id: 10,
         };
         assert_eq!(dec.decode(&device, destroy.as_bytes()).unwrap(), Ok(()));
-        assert_eq!(dec.object_count(), 4);
+        assert_eq!(dec.object_count(), 6);
         // Destroying an id the host never made is not an error.
         assert_eq!(dec.decode(&device, destroy.as_bytes()).unwrap(), Ok(()));
 
