@@ -12,6 +12,8 @@
 #import "RgfxMetalError.h"
 
 #include <cstring>
+#include <mutex>
+#include <fcntl.h>
 #include <unistd.h>
 #include <string>
 #include <vector>
@@ -203,16 +205,139 @@ std::vector<RgfxFunctionConstant> indexedConstants(MTLFunctionConstantValues *va
 	return out;
 }
 
+// The process's staging window for streamed libraries: two blocks of the device
+// region used in turn, each with an ack slot the host writes once it has copied the
+// block's chunk out. Made on the first large library and kept for the process's life
+// (one device a process). The lock serialises streams, which share the window.
+struct LibraryStaging {
+	std::mutex lock;
+	bool made = false;
+	uint64_t chunk = 0;            // each block's size
+	uint64_t blockOffset[2] = {};  // region offsets of the two blocks
+	volatile uint8_t *block[2] = {};
+	uint64_t ackOffset[2] = {};    // region offsets of the two ack slots
+	volatile uint64_t *ack[2] = {};
+	uint64_t expected[2] = {};     // the ack each block's last chunk asked for (0: none)
+	uint64_t nextToken = 1;
+};
+
+LibraryStaging &libraryStaging()
+{
+	static LibraryStaging staging;
+	return staging;
+}
+
+// Each staging block's size: 32 MiB, so QuartzCore's 160 MB library goes in five
+// chunks per block; a smaller window when the region has no room for two of those.
+constexpr uint64_t kStagingChunkSizes[] = { 32ull << 20, 8ull << 20, 1ull << 20 };
+
+bool makeStaging(LibraryStaging &st, RgfxRegion &region)
+{
+	for (uint64_t chunk : kStagingChunkSizes) {
+		// One block: a page of ack slots (one a cache line), then the two chunk blocks.
+		RgfxRegion::Block b = region.allocate(0x1000 + 2 * chunk);
+		if (!b.ok)
+			continue;
+		st.chunk = chunk;
+		for (int i = 0; i < 2; i++) {
+			st.ackOffset[i] = b.offset + 64 * static_cast<uint64_t>(i);
+			st.ack[i] = reinterpret_cast<volatile uint64_t *>(b.ptr + 64 * i);
+			__atomic_store_n(st.ack[i], 0, __ATOMIC_RELEASE);
+			st.blockOffset[i] = b.offset + 0x1000 + chunk * static_cast<uint64_t>(i);
+			st.block[i] = b.ptr + 0x1000 + chunk * i;
+			st.expected[i] = 0;
+		}
+		st.made = true;
+		return true;
+	}
+	return false;
+}
+
+// Waits, about ten seconds at most, for the host to have copied block `i`'s last chunk.
+bool awaitBlock(LibraryStaging &st, int i)
+{
+	for (int t = 0; t < 50000; t++) {
+		if (__atomic_load_n(st.ack[i], __ATOMIC_ACQUIRE) == st.expected[i])
+			return true;
+		usleep(200);
+	}
+	return false;
+}
+
+// Streams `length` bytes to the host as one library: each chunk copied into the next
+// staging block once the host has copied out what it last held, then posted.
+bool streamLibrary(RgfxRegion &region, RgfxSerializer &ser, const uint8_t *bytes, uint64_t length,
+                   RgfxObjId *outObjId)
+{
+	LibraryStaging &st = libraryStaging();
+	std::lock_guard<std::mutex> guard(st.lock);
+	if (!st.made && !makeStaging(st, region))
+		return false;
+	const RgfxObjId objId = ser.allocLibraryId();
+	int i = 0;
+	for (uint64_t at = 0; at < length; at += st.chunk, i ^= 1) {
+		const uint64_t n = length - at < st.chunk ? length - at : st.chunk;
+		if (!awaitBlock(st, i))
+			return false;
+		std::memcpy(const_cast<uint8_t *>(st.block[i]), bytes + at, n);
+		const uint64_t token = st.nextToken++;
+		st.expected[i] = token;
+		bool posted = false;
+		for (int r = 0; r < 2000 && !posted; r++) {
+			posted = ser.postLibraryChunk(objId, st.blockOffset[i], n, length, at, st.ackOffset[i], token);
+			if (!posted)
+				usleep(1000);
+		}
+		if (!posted)
+			return false;
+	}
+	*outObjId = objId;
+	return true;
+}
+
+// RGFX DIAG (WindowServer bring-up; remove before merge): which constants a function
+// was given that the wire does not carry (by name, or wider than eight bytes), one
+// line to /tmp/rgfx-diag.log (the guest has no logd).
+void rgfxConstantsDiag(NSString *fn, MTLFunctionConstantValues *values, uint32_t dropped)
+{
+	NSMutableString *line = [NSMutableString
+	    stringWithFormat:@"RGFX: constants %@ dropped=%u pid=%d:", fn, dropped, getpid()];
+	SEL namedSel = sel_registerName("newNamedConstantArray");
+	SEL indexedSel = sel_registerName("newIndexedConstantArray");
+	if ([values respondsToSelector:namedSel]) {
+		NSArray *named = ((NSArray * (*)(id, SEL)) objc_msgSend)(values, namedSel);
+		for (id c in named) {
+			NSString *n = [c respondsToSelector:@selector(name)] ? [c name] : @"?";
+			NSUInteger t = [c respondsToSelector:sel_registerName("dataType")]
+			                   ? ((NSUInteger(*)(id, SEL))objc_msgSend)(c, sel_registerName("dataType"))
+			                   : 0;
+			[line appendFormat:@" name=%@/type%lu", n, (unsigned long)t];
+		}
+	}
+	if ([values respondsToSelector:indexedSel]) {
+		NSArray *indexed = ((NSArray * (*)(id, SEL)) objc_msgSend)(values, indexedSel);
+		for (id c in indexed) {
+			NSUInteger i = ((NSUInteger(*)(id, SEL))objc_msgSend)(c, sel_registerName("index"));
+			NSUInteger t = ((NSUInteger(*)(id, SEL))objc_msgSend)(c, sel_registerName("dataType"));
+			[line appendFormat:@" idx=%lu/type%lu", (unsigned long)i, (unsigned long)t];
+		}
+	} else {
+		[line appendString:@" (no newIndexedConstantArray)"];
+	}
+	[line appendString:@"\n"];
+	int fd = open("/tmp/rgfx-diag.log", O_WRONLY | O_CREAT | O_APPEND, 0666);
+	if (fd < 0)
+		return;
+	const char *u = line.UTF8String;
+	(void)!write(fd, u, strlen(u));
+	close(fd);
+}
+
 } // namespace
 
 @implementation RgfxLibrary {
 	std::vector<MetallibFunction> _functions; // the .metallib's function list
 	BOOL _haveFunctionTable;                  // the bytes were a readable .metallib
-	// The region block holding the bytes of a LIBRARY_FROM_REGION create (size 0 for
-	// an inline create). Kept for the library's life: the region has no release yet,
-	// so the block stays allocated past it.
-	uint64_t _regionOffset;
-	uint64_t _regionSize;
 }
 
 + (instancetype)libraryWithData:(const void *)bytes
@@ -237,43 +362,23 @@ std::vector<RgfxFunctionConstant> indexedConstants(MTLFunctionConstantValues *va
 	return lib;
 }
 
-+ (instancetype)libraryWithRegionCopyOf:(const void *)bytes
-                                length:(NSUInteger)length
-                                region:(RgfxRegion *)region
-                                device:(id<MTLDevice>)device
-                            serializer:(RgfxSerializer *)serializer
++ (instancetype)libraryStreamingBytes:(const void *)bytes
+                              length:(NSUInteger)length
+                              region:(RgfxRegion *)region
+                              device:(id<MTLDevice>)device
+                          serializer:(RgfxSerializer *)serializer
 {
 	if (serializer == nullptr || region == nullptr || bytes == nullptr || length == 0) {
 		return nil;
 	}
-	RgfxRegion::Block block = region->allocate(length);
-	if (!block.ok) {
+	RgfxObjId objId = 0;
+	if (!streamLibrary(*region, *serializer, static_cast<const uint8_t *>(bytes), length, &objId)) {
 		return nil;
 	}
-	// The block is write-back memory; the ring's release store of `producer` orders
-	// these bytes before the host reads the create.
-	std::memcpy(const_cast<uint8_t *>(block.ptr), bytes, length);
-	// The create is a fixed-size message: retry it (not the copy) while the ring is
-	// momentarily full, about two seconds, as the host drains the ring as it runs.
-	RgfxCreated created = {};
-	for (int i = 0; i < 2000; i++) {
-		created = serializer->createLibraryFromRegion(block.offset, length);
-		if (created.posted)
-			break;
-		usleep(1000);
-	}
-	if (!created.posted) {
-		return nil; // the block stays allocated (the region has no release yet)
-	}
-	RgfxLibrary *lib = [[RgfxLibrary alloc] initWithObjId:created.obj_id
-	                                               device:device
-	                                           serializer:serializer];
-	if (lib != nil) {
-		lib->_regionOffset = block.offset;
-		lib->_regionSize = block.size;
+	RgfxLibrary *lib = [[RgfxLibrary alloc] initWithObjId:objId device:device serializer:serializer];
+	if (lib != nil)
 		lib->_haveFunctionTable =
 		    readMetallibFunctions(static_cast<const uint8_t *>(bytes), length, lib->_functions);
-	}
 	return lib;
 }
 
@@ -333,8 +438,7 @@ std::vector<RgfxFunctionConstant> indexedConstants(MTLFunctionConstantValues *va
 	uint32_t dropped = 0;
 	std::vector<RgfxFunctionConstant> constants = indexedConstants(constantValues, &dropped);
 	if (dropped)
-		NSLog(@"RGFX: %@: %u function constant(s) set by name or wider than 8 bytes are not carried",
-		      name, dropped);
+		rgfxConstantsDiag(name, constantValues, dropped);
 	id<MTLFunction> fn = [self rgfxFunctionNamed:name constants:constants];
 	if (error)
 		*error = fn ? nil

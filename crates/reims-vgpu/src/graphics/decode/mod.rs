@@ -137,6 +137,9 @@ pub struct GraphicsDecoder<P: Platform> {
     /// the latest `TEXTURE_FROM_IOSURFACE` naming the surface, until that
     /// texture's destroy. A present names its surface by that id.
     surfaces: HashMap<u32, u64>,
+    /// The bytes of each library whose `LIBRARY_FROM_REGION` chunks have not yet
+    /// reached its length, by the library's id.
+    pending_libraries: HashMap<u64, Vec<u8>>,
     /// Where a command buffer's completion record goes once its work finishes;
     /// `None` builds and drops it (the ring loop sets a sink later).
     completion_sink: Option<CompletionSink>,
@@ -157,6 +160,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             platform,
             objects: HashMap::new(),
             surfaces: HashMap::new(),
+            pending_libraries: HashMap::new(),
             completion_sink: None,
             reflection_sink: None,
             region,
@@ -295,21 +299,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                 let Some(m) = read::<RgfxLibraryFromRegion>(message) else {
                     return Ok(Err(DecodeError::Malformed));
                 };
-                // The `.metallib`/AIR bytes lie in a block of the device's
-                // region, for a library larger than one ring message. A span
-                // past the region's end is a guest protocol error. The bytes are
-                // copied out once, so the platform parses memory the guest cannot
-                // change under it.
-                let Some(air) = usize::try_from(m.byte_length)
-                    .ok()
-                    .and_then(|len| self.region.read(m.region_offset, len))
-                else {
-                    return Ok(Err(DecodeError::BadReference));
-                };
-                match device.new_library(&air)? {
-                    Ok(Some(library)) => self.insert(m.obj_id, ObjHandle::Library(library)),
-                    Ok(None) | Err(_) => Ok(Err(DecodeError::Refused)),
-                }
+                self.decode_library_chunk(device, &m)
             }
             RGFX_CMD_SAMPLER_CREATE => {
                 let Some(m) = read::<RgfxSamplerCreate>(message) else {
@@ -566,6 +556,54 @@ impl<P: Platform> GraphicsDecoder<P> {
     ) -> RaiseResult<Result<(), DecodeError>> {
         self.objects.insert(obj_id, handle);
         Ok(Ok(()))
+    }
+
+    /// `LIBRARY_FROM_REGION`: one chunk of a library's bytes, which lie in a block
+    /// of the device's region. The bytes are copied out once (so the platform parses
+    /// memory the guest cannot change under it), the chunk's ack is written so the
+    /// guest may reuse the block, and the library is made from the whole once the
+    /// chunks reach its length. A span past the region's end is a bad reference; a
+    /// chunk out of order or past the length is malformed and drops what came before.
+    fn decode_library_chunk(
+        &mut self,
+        device: &P::Device,
+        m: &RgfxLibraryFromRegion,
+    ) -> RaiseResult<Result<(), DecodeError>> {
+        let Some(chunk) = usize::try_from(m.byte_length)
+            .ok()
+            .and_then(|len| self.region.read(m.region_offset, len))
+        else {
+            self.pending_libraries.remove(&m.obj_id);
+            return Ok(Err(DecodeError::BadReference));
+        };
+        // The bytes are out of the block: the guest may write it again.
+        if m.ack_offset % 8 != 0 || !self.region.write(m.ack_offset, &m.ack_value.to_le_bytes()) {
+            self.pending_libraries.remove(&m.obj_id);
+            return Ok(Err(DecodeError::BadReference));
+        }
+        let mut bytes = if m.chunk_offset == 0 {
+            self.pending_libraries.remove(&m.obj_id);
+            Vec::with_capacity(usize::try_from(m.total_length).unwrap_or(0).min(1 << 30))
+        } else {
+            match self.pending_libraries.remove(&m.obj_id) {
+                Some(b) => b,
+                None => return Ok(Err(DecodeError::Malformed)),
+            }
+        };
+        if bytes.len() as u64 != m.chunk_offset
+            || m.chunk_offset.checked_add(m.byte_length).is_none_or(|end| end > m.total_length)
+        {
+            return Ok(Err(DecodeError::Malformed));
+        }
+        bytes.extend_from_slice(&chunk);
+        if (bytes.len() as u64) < m.total_length {
+            self.pending_libraries.insert(m.obj_id, bytes);
+            return Ok(Ok(()));
+        }
+        match device.new_library(&bytes)? {
+            Ok(Some(library)) => self.insert(m.obj_id, ObjHandle::Library(library)),
+            Ok(None) | Err(_) => Ok(Err(DecodeError::Refused)),
+        }
     }
 
     /// `RENDER_PIPELINE_CREATE`: resolve the vertex and fragment functions from
@@ -980,45 +1018,68 @@ mod tests {
 
     use super::*;
 
-    /// A library from region bytes reads them at their offset and hands them to the
-    /// platform unchanged; a span past the region's end is refused as a bad reference.
+    /// A library from region chunks: each chunk is read at its offset and acked, and
+    /// the library is made, from the bytes unchanged, when the chunks reach its length;
+    /// a span past the region's end is a bad reference and a chunk out of order is
+    /// malformed.
     #[test]
-    fn makes_a_library_from_region_bytes() {
+    fn makes_a_library_from_region_chunks() {
         let p = Arc::new(FakePlatform::new());
         let device = p.device();
         let region = Arc::new(reims_graphics::region::Region::new(0x10000).unwrap());
         let air: Vec<u8> = (0..0x2345u32).map(|i| (i * 7) as u8).collect();
-        assert!(region.write(0x4000, &air));
         let mut dec = GraphicsDecoder::<FakePlatform>::new(Arc::clone(&p), Arc::clone(&region));
 
-        let msg = |obj_id: u64, region_offset: u64, byte_length: u64| RgfxLibraryFromRegion {
-            header: RgfxMsgHeader {
-                r#type: RGFX_CMD_LIBRARY_FROM_REGION,
-                size: size_of::<RgfxLibraryFromRegion>() as u32,
-                seqno: 0,
-            },
-            obj_id,
-            region_offset,
-            byte_length,
+        let msg = |obj_id: u64, region_offset: u64, len: u64, total: u64, at: u64, ack: u64| {
+            RgfxLibraryFromRegion {
+                header: RgfxMsgHeader {
+                    r#type: RGFX_CMD_LIBRARY_FROM_REGION,
+                    size: size_of::<RgfxLibraryFromRegion>() as u32,
+                    seqno: 0,
+                },
+                obj_id,
+                region_offset,
+                byte_length: len,
+                total_length: total,
+                chunk_offset: at,
+                ack_offset: 0x100,
+                ack_value: ack,
+            }
         };
+        let total = air.len() as u64;
+        // Two chunks through one staging block at 0x4000, each acked once copied out.
+        let first = 0x1000usize;
+        assert!(region.write(0x4000, &air[..first]));
         assert_eq!(
-            dec.decode(&device, msg(20, 0x4000, air.len() as u64).as_bytes())
+            dec.decode(&device, msg(20, 0x4000, first as u64, total, 0, 1).as_bytes())
                 .unwrap(),
             Ok(())
         );
+        assert_eq!(region.read(0x100, 8).unwrap(), 1u64.to_le_bytes());
+        assert_eq!(dec.object_count(), 0);
+        assert!(region.write(0x4000, &air[first..]));
+        let rest = total - first as u64;
+        assert_eq!(
+            dec.decode(&device, msg(20, 0x4000, rest, total, first as u64, 2).as_bytes())
+                .unwrap(),
+            Ok(())
+        );
+        assert_eq!(region.read(0x100, 8).unwrap(), 2u64.to_le_bytes());
         assert_eq!(dec.object_count(), 1);
         let calls = p.call_log().calls_to("newLibraryWithData:error:");
         assert_eq!(calls.len(), 1);
         assert!(matches!(&calls[0].args[0], Arg::Bytes(b) if *b == air));
 
+        // A span past the region's end, and a chunk with no first chunk before it.
         assert_eq!(
-            dec.decode(&device, msg(21, 0xf000, 0x2000).as_bytes())
+            dec.decode(&device, msg(21, 0xf000, 0x2000, 0x2000, 0, 3).as_bytes())
                 .unwrap(),
             Err(DecodeError::BadReference)
         );
         assert_eq!(
-            dec.decode(&device, msg(22, u64::MAX, 2).as_bytes()).unwrap(),
-            Err(DecodeError::BadReference)
+            dec.decode(&device, msg(22, 0x4000, 0x10, 0x20, 0x10, 4).as_bytes())
+                .unwrap(),
+            Err(DecodeError::Malformed)
         );
         assert_eq!(dec.object_count(), 1);
     }

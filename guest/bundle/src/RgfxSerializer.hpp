@@ -182,11 +182,18 @@ public:
 	/// the bytes, rounded to a multiple of 8) does not fit the ring.
 	RgfxCreated createLibrary(const void *bytes, uint64_t byte_length);
 
-	/// A library from `byte_length` bytes of .metallib or AIR the caller placed
-	/// at `region_offset` in the device's region (LIBRARY_FROM_REGION), for a
-	/// library larger than one ring message. The caller keeps the block for the
-	/// library's life. `posted` is false when the ring has no room.
-	RgfxCreated createLibraryFromRegion(uint64_t region_offset, uint64_t byte_length);
+	/// A new object id for a library streamed in chunks (postLibraryChunk), which
+	/// every chunk of that library names.
+	RgfxObjId allocLibraryId();
+
+	/// One LIBRARY_FROM_REGION chunk of library `obj_id`: the `byte_length` bytes
+	/// at `chunk_offset` of its `total_length`, which the caller copied to
+	/// `region_offset` in the device's region. The host writes `ack_value` at
+	/// `ack_offset` once it has copied them out. Returns whether the message posted
+	/// (false when the ring has no room).
+	bool postLibraryChunk(RgfxObjId obj_id, uint64_t region_offset, uint64_t byte_length,
+	                      uint64_t total_length, uint64_t chunk_offset, uint64_t ack_offset,
+	                      uint64_t ack_value);
 
 	// --- pipelines ------------------------------------------------------------
 

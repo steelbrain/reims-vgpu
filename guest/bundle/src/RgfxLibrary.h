@@ -36,16 +36,18 @@ NS_ASSUME_NONNULL_BEGIN
                                   device:(nullable id<MTLDevice>)device
                               serializer:(nullable RgfxSerializer *)serializer;
 
-/// Creates a library from `length` bytes of .metallib/AIR at `bytes` by copying
-/// them into a block of `region` and serialising an RGFX_CMD_LIBRARY_FROM_REGION
-/// naming it, for a library larger than one ring message. The library keeps the
-/// block for its life. Returns nil if `serializer` or `region` is null, the region
-/// has no room, or the create did not post (the ring had no room).
-+ (nullable instancetype)libraryWithRegionCopyOf:(const void *)bytes
-                                         length:(NSUInteger)length
-                                         region:(nullable RgfxRegion *)region
-                                         device:(nullable id<MTLDevice>)device
-                                     serializer:(nullable RgfxSerializer *)serializer;
+/// Creates a library from `length` bytes of .metallib/AIR at `bytes` by streaming
+/// them through the process's staging window in `region` (two blocks, used in
+/// turn, so the copy of one chunk overlaps the host's copy-out of the one before),
+/// one RGFX_CMD_LIBRARY_FROM_REGION per chunk, for a library larger than one ring
+/// message. Waits for the host to have copied a block out before writing it again.
+/// Returns nil if `serializer` or `region` is null, the region has no room for the
+/// window, or the host did not take a chunk.
++ (nullable instancetype)libraryStreamingBytes:(const void *)bytes
+                                       length:(NSUInteger)length
+                                       region:(nullable RgfxRegion *)region
+                                       device:(nullable id<MTLDevice>)device
+                                   serializer:(nullable RgfxSerializer *)serializer;
 
 @end
 

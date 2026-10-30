@@ -842,9 +842,9 @@
 // Command `FENCE_CREATE` ([`RgfxObjectCreate`]): a Metal fence.
 #define RGFX_CMD_FENCE_CREATE 529
 
-// Command `LIBRARY_FROM_REGION` ([`RgfxLibraryFromRegion`]): a library from
-// `.metallib`/AIR bytes the guest placed in a block of the device's region, for
-// a library larger than one ring message.
+// Command `LIBRARY_FROM_REGION` ([`RgfxLibraryFromRegion`]): one chunk of a
+// library's `.metallib`/AIR bytes the guest placed in a block of the device's
+// region, for a library larger than one ring message.
 #define RGFX_CMD_LIBRARY_FROM_REGION 530
 
 // Command `COMMAND_BUFFER` (a per-queue submission ring): one command buffer,
@@ -2112,20 +2112,33 @@ typedef struct {
   uint64_t byte_length;
 } RgfxLibraryCreate;
 
-// `LIBRARY_FROM_REGION`: a library from `byte_length` bytes of `.metallib` or
-// AIR at `region_offset` in the device's region, forwarded to the host
-// unchanged. The guest keeps the block for the library's life; the host reads
-// the bytes while it decodes the message. A span past the region's end is a
-// guest protocol error.
+// `LIBRARY_FROM_REGION`: one chunk of a library's `.metallib`/AIR bytes, which
+// the guest copied to `region_offset` in the device's region: the `byte_length`
+// bytes at `chunk_offset` of the library's `total_length`. A library goes in one
+// or more chunks in order, the first at `chunk_offset` 0; the host appends each
+// and makes the library, unchanged bytes, when the chunks reach `total_length`.
+// Once the host has copied a chunk's bytes out of the region it writes
+// `ack_value` as a little-endian `u64` at `ack_offset` (8-aligned, in the
+// region), so the guest may write that block again: the ring's consumer count
+// moves when the host takes the message, not when it carries it out. A span
+// past the region's end, or a chunk out of order, is a guest protocol error.
 typedef struct {
   // [`RGFX_CMD_LIBRARY_FROM_REGION`].
   RgfxMsgHeader header;
   // The new library's guest-picked id.
   uint64_t obj_id;
-  // The bytes' offset in the device's region.
+  // The chunk's bytes' offset in the device's region.
   uint64_t region_offset;
-  // The length of the `.metallib`/AIR bytes.
+  // The chunk's length.
   uint64_t byte_length;
+  // The whole library's length.
+  uint64_t total_length;
+  // Where the chunk lies in the library.
+  uint64_t chunk_offset;
+  // Where the host writes `ack_value` once it has copied the chunk out.
+  uint64_t ack_offset;
+  // The value the host writes at `ack_offset`.
+  uint64_t ack_value;
 } RgfxLibraryFromRegion;
 
 // One mode of a display in a `DISPLAYS` message.

@@ -42,6 +42,22 @@ void rgfxLibraryDiag(const char *how, NSString *origin, NSUInteger length, BOOL 
 	close(fd);
 }
 
+// RGFX DIAG (remove before merge): how long a streamed library's upload took.
+void rgfxUploadDiag(NSString *origin, NSUInteger length, uint64_t ns)
+{
+	char line[600];
+	int n = snprintf(line, sizeof(line), "RGFX: library upload %s bytes=%lu ms=%.1f pid=%d\n",
+	                 origin.UTF8String ? origin.UTF8String : "-", (unsigned long)length,
+	                 static_cast<double>(ns) / 1e6, getpid());
+	if (n <= 0)
+		return;
+	int fd = open("/tmp/rgfx-diag.log", O_WRONLY | O_CREAT | O_APPEND, 0666);
+	if (fd < 0)
+		return;
+	(void)!write(fd, line, static_cast<size_t>(n < (int)sizeof(line) ? n : (int)sizeof(line)));
+	close(fd);
+}
+
 // How long a library create waits for room on the device ring before it reports the
 // ring full: the host drains the ring as it runs, so a full ring is transient.
 constexpr useconds_t kLibraryRetrySleepUs = 1000;
@@ -70,8 +86,8 @@ constexpr uint64_t kLibraryInlineMax = RGFX_CONTROL_RING_DATA_SIZE / 4;
 			*error = RgfxMakeError(RgfxMetalErrorNoRoute, @"library: no serialiser route");
 		return nil;
 	}
-	// A small library travels inline in its create; a larger one is copied into a region
-	// block that the create names, so no library is bounded by the ring's size.
+	// A small library travels inline in its create; a larger one streams through region
+	// blocks that its chunks name, so no library is bounded by the ring's or region's size.
 	const bool inlineCreate =
 	    RGFX_LIBRARY_BYTES_OFFSET + static_cast<uint64_t>(length) + 8 <= kLibraryInlineMax;
 	RgfxRegion *region = [self region];
@@ -90,13 +106,15 @@ constexpr uint64_t kLibraryInlineMax = RGFX_CONTROL_RING_DATA_SIZE / 4;
 				usleep(kLibraryRetrySleepUs);
 		}
 	} else {
-		// One copy into a region block; the factory retries only the fixed-size create
-		// while the ring is momentarily full.
-		lib = [RgfxLibrary libraryWithRegionCopyOf:bytes
-		                                    length:length
-		                                    region:region
-		                                    device:self
-		                                serializer:ser];
+		// Streamed through the process's double-buffered staging window, timed for the
+		// diagnostic line (RGFX DIAG).
+		const uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+		lib = [RgfxLibrary libraryStreamingBytes:bytes
+		                                  length:length
+		                                  region:region
+		                                  device:self
+		                              serializer:ser];
+		rgfxUploadDiag(origin, length, clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0);
 	}
 	rgfxLibraryDiag(how, origin, length, lib != nil);
 	if (lib == nil && error)

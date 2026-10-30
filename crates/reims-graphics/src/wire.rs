@@ -244,9 +244,9 @@ pub const RGFX_CMD_EVENT_CREATE: u32 = 0x20f;
 pub const RGFX_CMD_SHARED_EVENT_CREATE: u32 = 0x210;
 /// Command `FENCE_CREATE` ([`RgfxObjectCreate`]): a Metal fence.
 pub const RGFX_CMD_FENCE_CREATE: u32 = 0x211;
-/// Command `LIBRARY_FROM_REGION` ([`RgfxLibraryFromRegion`]): a library from
-/// `.metallib`/AIR bytes the guest placed in a block of the device's region, for
-/// a library larger than one ring message.
+/// Command `LIBRARY_FROM_REGION` ([`RgfxLibraryFromRegion`]): one chunk of a
+/// library's `.metallib`/AIR bytes the guest placed in a block of the device's
+/// region, for a library larger than one ring message.
 pub const RGFX_CMD_LIBRARY_FROM_REGION: u32 = 0x212;
 
 /// Command `COMMAND_BUFFER` (a per-queue submission ring): one command buffer,
@@ -965,11 +965,16 @@ pub struct RgfxLibraryCreate {
     pub byte_length: u64,
 }
 
-/// `LIBRARY_FROM_REGION`: a library from `byte_length` bytes of `.metallib` or
-/// AIR at `region_offset` in the device's region, forwarded to the host
-/// unchanged. The guest keeps the block for the library's life; the host reads
-/// the bytes while it decodes the message. A span past the region's end is a
-/// guest protocol error.
+/// `LIBRARY_FROM_REGION`: one chunk of a library's `.metallib`/AIR bytes, which
+/// the guest copied to `region_offset` in the device's region: the `byte_length`
+/// bytes at `chunk_offset` of the library's `total_length`. A library goes in one
+/// or more chunks in order, the first at `chunk_offset` 0; the host appends each
+/// and makes the library, unchanged bytes, when the chunks reach `total_length`.
+/// Once the host has copied a chunk's bytes out of the region it writes
+/// `ack_value` as a little-endian `u64` at `ack_offset` (8-aligned, in the
+/// region), so the guest may write that block again: the ring's consumer count
+/// moves when the host takes the message, not when it carries it out. A span
+/// past the region's end, or a chunk out of order, is a guest protocol error.
 #[repr(C)]
 #[derive(
     Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
@@ -979,10 +984,18 @@ pub struct RgfxLibraryFromRegion {
     pub header: RgfxMsgHeader,
     /// The new library's guest-picked id.
     pub obj_id: u64,
-    /// The bytes' offset in the device's region.
+    /// The chunk's bytes' offset in the device's region.
     pub region_offset: u64,
-    /// The length of the `.metallib`/AIR bytes.
+    /// The chunk's length.
     pub byte_length: u64,
+    /// The whole library's length.
+    pub total_length: u64,
+    /// Where the chunk lies in the library.
+    pub chunk_offset: u64,
+    /// Where the host writes `ack_value` once it has copied the chunk out.
+    pub ack_offset: u64,
+    /// The value the host writes at `ack_offset`.
+    pub ack_value: u64,
 }
 
 /// Where a `LIBRARY_CREATE` message's bytes start: right after its header.
@@ -1343,7 +1356,7 @@ const _: () = {
     assert!(size_of::<RgfxStencilDescriptor>() == 24);
     assert!(size_of::<RgfxDepthStencilCreate>() == 80);
     assert!(size_of::<RgfxLibraryCreate>() == 32);
-    assert!(size_of::<RgfxLibraryFromRegion>() == 40);
+    assert!(size_of::<RgfxLibraryFromRegion>() == 72);
     assert!(RGFX_LIBRARY_BYTES_OFFSET as usize == size_of::<RgfxLibraryCreate>());
     assert!(size_of::<RgfxDeviceInfo>() == 376);
     // The device-info blob sits past the completion ring and before the allocations.
