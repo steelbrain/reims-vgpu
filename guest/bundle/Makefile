@@ -67,13 +67,12 @@ TESTHEADERS  = $(wildcard tests/*.hpp)
 CORE_SRCS = src/RgfxObjectModel.cpp src/RgfxCaps.cpp src/RgfxRingWriter.cpp \
 	src/RgfxSerializer.cpp src/RgfxEncoder.cpp src/RgfxWireLayout.cpp
 
-# The whole Metal shell (ObjC++): wrappers + the device. Goes in the bundle.
-SHELL_SRCS = src/RgfxResource.mm src/RgfxBuffer.mm \
-	src/RgfxEvent.mm src/RgfxFence.mm src/RgfxSharedEvent.mm \
-	src/RgfxMetalDevice.mm src/RgfxMetalDevice+Sync.mm
-# The NSObject-based wrappers alone (no Apple-private base): goes in the unit test.
-WRAP_SRCS  = src/RgfxResource.mm src/RgfxBuffer.mm \
-	src/RgfxEvent.mm src/RgfxFence.mm src/RgfxSharedEvent.mm
+# The whole Metal shell (ObjC++): wrappers + the device. Goes in the bundle. Globbed
+# so each later slice's wrappers + category are picked up with no Makefile edit.
+SHELL_SRCS = $(wildcard src/*.mm)
+# The NSObject-based wrappers alone: the device shell + its category slices subclass the
+# Apple-private base, so they compile only into the bundle, never the native unit test.
+WRAP_SRCS  = $(filter-out $(wildcard src/RgfxMetalDevice*.mm),$(wildcard src/*.mm))
 
 # Objects are kept per-arch (so the x86_64 and native builds never clobber) and
 # split core/ (C++) vs shell/ (ObjC++) so each compile rule has a unique target
