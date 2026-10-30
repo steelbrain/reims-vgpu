@@ -55,6 +55,9 @@ LICENSE                     the license, and LICENSES/ its texts (README.md, Lic
 
 - **`cargo xtask check`** runs the lints, rustfmt, clippy and every unit test. Run it once before a
   branch that changes code merges.
+- **`cargo xtask check-ctl`** runs rustfmt, clippy and the tests for `reims-ctl`, whose separate
+  workspace is intentionally outside `cargo xtask check`. `make check-ctl` is the equivalent
+  Makefile target.
 - **`make smoke`** (`cargo xtask smoke`) links a guest program with the library the way QEMU links
   it and runs an isolated guest task.
 - **The behaviour-lock suite** (`tests/suite`, `make test`) plays the hypervisor and the guest, and
@@ -102,6 +105,7 @@ Run from the repository root. `cargo xtask` is an alias for `cargo run --package
 cargo build --workspace
 cargo nextest run --workspace
 cargo xtask check          # the lints, rustfmt, clippy and every test; run it once before a merge
+cargo xtask check-ctl      # rustfmt, clippy and tests for the separate reims-ctl workspace
 cargo xtask dist           # target/dist: the library, its header, reims-vgpu.pc and
                            # the option ROM, for a host that links it through pkg-config
 cargo xtask smoke          # a guest linked with the library as QEMU links it (make smoke)
