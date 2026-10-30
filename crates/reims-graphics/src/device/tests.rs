@@ -1057,3 +1057,43 @@ fn a_command_buffer_waits_for_the_creates_before_it() {
         ]
     );
 }
+
+/// The control completion ring takes posts from several threads at once (the control thread's
+/// answers and the host's compile threads' replies): each lands whole, once, in its thread's order.
+#[test]
+fn control_completion_posts_from_several_threads_land_whole() {
+    const THREADS: u64 = 8;
+    const EACH: u64 = 100;
+    let mut rig = Rig::new();
+    rig.start();
+    let posters: Vec<_> = (0..THREADS)
+        .map(|t| {
+            let poster = rig.device.shared.control_poster();
+            std::thread::spawn(move || {
+                for i in 0..EACH {
+                    let mut reflection = RgfxPipelineReflection::new_zeroed();
+                    reflection.header = RgfxMsgHeader {
+                        r#type: RGFX_EVT_PIPELINE_REFLECTION,
+                        size: size_of::<RgfxPipelineReflection>() as u32,
+                        seqno: t * EACH + i + 1,
+                    };
+                    reflection.obj_id = t;
+                    poster.post(reflection.as_bytes());
+                }
+            })
+        })
+        .collect();
+    let mut next = [0u64; THREADS as usize];
+    for _ in 0..THREADS * EACH {
+        let bytes = rig.event().expect("a reply");
+        let reflection = RgfxPipelineReflection::read_from_bytes(&bytes).unwrap();
+        assert_eq!(reflection.header.r#type, RGFX_EVT_PIPELINE_REFLECTION);
+        let t = reflection.obj_id;
+        assert_eq!(reflection.header.seqno, t * EACH + next[t as usize] + 1);
+        next[t as usize] += 1;
+    }
+    for poster in posters {
+        poster.join().unwrap();
+    }
+    assert_eq!(next, [EACH; THREADS as usize]);
+}

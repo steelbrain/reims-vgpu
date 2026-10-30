@@ -639,3 +639,295 @@ fn a_present_needs_the_surface_s_texture() {
         assert!(device.control.presented.texture.lock().is_none());
     }
 }
+
+/// A `LIBRARY_CREATE` of library `obj_id`, whose bytes the fake platform takes as a library.
+fn library_create(obj_id: u64) -> Vec<u8> {
+    let air = [1u8, 2, 3, 4];
+    let mut bytes = RgfxLibraryCreate {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_LIBRARY_CREATE,
+            size: 0,
+            seqno: 0,
+        },
+        obj_id,
+        byte_length: air.len() as u64,
+    }
+    .as_bytes()
+    .to_vec();
+    bytes.extend_from_slice(&air);
+    bytes.resize(bytes.len().next_multiple_of(8), 0);
+    bytes
+}
+
+/// A `RENDER_PIPELINE_CREATE` of pipeline `obj_id` from functions `vmain` and `fmain` of library
+/// `library`, colour attachment 0 BGRA8Unorm.
+fn render_pipeline_create(obj_id: u64, library: u64) -> Vec<u8> {
+    let head = size_of::<RgfxRenderPipelineCreate>() as u32;
+    let (vertex, fragment) = (b"vmain".as_slice(), b"fmain".as_slice());
+    let mut colors = [RgfxColorAttachmentDesc::default(); 8];
+    colors[0].pixel_format = 80;
+    colors[0].write_mask = 0xf;
+    let m = RgfxRenderPipelineCreate {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_RENDER_PIPELINE_CREATE,
+            size: 0,
+            seqno: 0,
+        },
+        obj_id,
+        vertex_library_obj_id: library,
+        fragment_library_obj_id: library,
+        vertex_name_offset: head,
+        vertex_name_len: vertex.len() as u32,
+        fragment_name_offset: head + vertex.len() as u32,
+        fragment_name_len: fragment.len() as u32,
+        raster_sample_count: 1,
+        color_attachment_count: 1,
+        colors,
+        ..RgfxRenderPipelineCreate::default()
+    };
+    let mut bytes = m.as_bytes().to_vec();
+    bytes.extend_from_slice(vertex);
+    bytes.extend_from_slice(fragment);
+    bytes.resize(bytes.len().next_multiple_of(8), 0);
+    bytes
+}
+
+/// A `COMPUTE_PIPELINE_CREATE` of pipeline `obj_id` from function `cmain` of library `library`.
+fn compute_pipeline_create(obj_id: u64, library: u64) -> Vec<u8> {
+    let head = size_of::<RgfxComputePipelineCreate>() as u32;
+    let name = b"cmain".as_slice();
+    let m = RgfxComputePipelineCreate {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_COMPUTE_PIPELINE_CREATE,
+            size: 0,
+            seqno: 0,
+        },
+        obj_id,
+        function_library_obj_id: library,
+        name_offset: head,
+        name_len: name.len() as u32,
+        ..RgfxComputePipelineCreate::default()
+    };
+    let mut bytes = m.as_bytes().to_vec();
+    bytes.extend_from_slice(name);
+    bytes.resize(bytes.len().next_multiple_of(8), 0);
+    bytes
+}
+
+/// A `COMMAND_BUFFER` `cb_obj_id` on queue `queue_obj_id` whose one compute encoder sets compute
+/// pipeline `pipeline`.
+fn compute_command_buffer(queue_obj_id: u64, cb_obj_id: u64, pipeline: u64) -> Vec<u8> {
+    use reims_graphics::ops::compute::{
+        RGFX_OP_COMPUTE_SET_COMPUTE_PIPELINE_STATE, RgfxComputeOpSetComputePipelineState,
+    };
+    use reims_graphics::ops::{
+        RGFX_OP_ENCODER_BEGIN_COMPUTE, RGFX_OP_ENCODER_END, RgfxComputePassDesc, RgfxOpHeader,
+    };
+    let op = |tag: u16, body: &[u8]| {
+        let mut bytes = RgfxOpHeader {
+            tag,
+            flags: 0,
+            len: (8 + body.len()) as u32,
+        }
+        .as_bytes()
+        .to_vec();
+        bytes.extend_from_slice(body);
+        bytes
+    };
+    let mut ops = op(
+        RGFX_OP_ENCODER_BEGIN_COMPUTE,
+        RgfxComputePassDesc::default().as_bytes(),
+    );
+    ops.extend(op(
+        RGFX_OP_COMPUTE_SET_COMPUTE_PIPELINE_STATE,
+        RgfxComputeOpSetComputePipelineState {
+            pipeline_obj_id: pipeline,
+        }
+        .as_bytes(),
+    ));
+    ops.extend(op(RGFX_OP_ENCODER_END, &[]));
+    let mut bytes = RgfxCommandBuffer {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_COMMAND_BUFFER,
+            size: 0,
+            seqno: 0,
+        },
+        queue_obj_id,
+        cb_obj_id,
+        op_bytes: ops.len() as u64,
+    }
+    .as_bytes()
+    .to_vec();
+    bytes.extend(ops);
+    bytes
+}
+
+/// The next event of ring 0's completion ring, which must be of `type`.
+fn next_event(guest: &mut Guest, r#type: u32) -> Vec<u8> {
+    let bytes = guest.event().expect("an event on ring 0");
+    let (header, _) = RgfxMsgHeader::read_from_prefix(&bytes).unwrap();
+    assert_eq!(header.r#type, r#type);
+    bytes
+}
+
+/// Completes the platform's committed command buffers until `ring` has an event, about 3 s.
+fn complete_until_event(platform: &FakePlatform, ring: &QueueRing) -> bool {
+    for _ in 0..3000 {
+        platform.world().complete_all(CompleteOn::Caller);
+        if ring.has_event() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    false
+}
+
+/// One process's pipeline compile holds nothing of another's: while context 1's render pipeline
+/// compiles, context 2's queue is created and its command buffer runs and completes; context 1's
+/// reflection comes once the compile ends
+#[test]
+fn another_context_s_command_buffer_is_not_held_by_a_slow_compile() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform) = headless_on(&raised);
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    guest.send(&device, library_create(obj(1, 10)));
+    device.control.pool.hold();
+    guest.send(&device, render_pipeline_create(obj(1, 11), obj(1, 10)));
+    let create = guest.seqno;
+
+    const SUBMIT_OFF: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET;
+    const COMPLETE_OFF: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x2_0000;
+    const RING_DATA: u32 = 0x1_0000;
+    assert_eq!(
+        open_queue(
+            &device,
+            &mut guest,
+            queue_create(2, 1, SUBMIT_OFF, COMPLETE_OFF, RING_DATA, 0)
+        ),
+        RGFX_STATUS_OK
+    );
+    let mut ring = QueueRing::new(&device, SUBMIT_OFF, COMPLETE_OFF, u64::from(RING_DATA));
+    ring.send(&device, command_buffer(obj(2, 1), 100));
+    assert!(
+        complete_until_event(&platform, &ring),
+        "context 2's command buffer was held by context 1's compile"
+    );
+    let done = RgfxCbComplete::read_from_bytes(&ring.event().unwrap()).unwrap();
+    assert_eq!(done.cb_obj_id, 100);
+    assert_eq!(done.status, RGFX_CB_OK);
+    // The library and the queue; the pipeline is still compiling.
+    assert_eq!(device.decoder_object_count(), 2);
+
+    device.control.pool.release();
+    let bytes = next_event(&mut guest, RGFX_EVT_PIPELINE_REFLECTION);
+    let reflection = RgfxPipelineReflection::read_from_bytes(&bytes).unwrap();
+    assert_eq!(reflection.header.seqno, create);
+    assert_eq!(reflection.obj_id, obj(1, 11));
+    assert_eq!(reflection.status, RGFX_PIPELINE_OK);
+    assert_eq!(device.decoder_object_count(), 3);
+}
+
+/// A display command behind a pipeline create on ring 0 is answered while the pipeline compiles
+#[test]
+fn a_display_command_behind_a_slow_compile_is_answered() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, _platform) = headless_on(&raised);
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    guest.send(&device, library_create(obj(1, 10)));
+    device.control.pool.hold();
+    guest.send(&device, compute_pipeline_create(obj(1, 11), obj(1, 10)));
+    let create = guest.seqno;
+    guest.send(
+        &device,
+        RgfxMsgHeader {
+            r#type: RGFX_CMD_GET_DISPLAYS,
+            size: 0,
+            seqno: 0,
+        }
+        .as_bytes()
+        .to_vec(),
+    );
+    let displays = next_event(&mut guest, RGFX_EVT_DISPLAYS);
+    let (header, _) = RgfxMsgHeader::read_from_prefix(&displays).unwrap();
+    assert_eq!(header.seqno, guest.seqno);
+
+    device.control.pool.release();
+    let bytes = next_event(&mut guest, RGFX_EVT_PIPELINE_REFLECTION);
+    let reflection = RgfxPipelineReflection::read_from_bytes(&bytes).unwrap();
+    assert_eq!(reflection.header.seqno, create);
+    assert_eq!(reflection.status, RGFX_PIPELINE_OK);
+}
+
+/// A command buffer that names a pipeline still compiling waits for it, then runs with it
+#[test]
+fn a_command_buffer_naming_a_pending_pipeline_waits_for_it() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform) = headless_on(&raised);
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    const SUBMIT_OFF: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET;
+    const COMPLETE_OFF: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x2_0000;
+    const RING_DATA: u32 = 0x1_0000;
+    assert_eq!(
+        open_queue(
+            &device,
+            &mut guest,
+            queue_create(3, 1, SUBMIT_OFF, COMPLETE_OFF, RING_DATA, 0)
+        ),
+        RGFX_STATUS_OK
+    );
+    guest.send(&device, library_create(obj(3, 10)));
+    device.control.pool.hold();
+    guest.send(&device, compute_pipeline_create(obj(3, 11), obj(3, 10)));
+    let mut ring = QueueRing::new(&device, SUBMIT_OFF, COMPLETE_OFF, u64::from(RING_DATA));
+    ring.send(&device, compute_command_buffer(obj(3, 1), 100, obj(3, 11)));
+    for _ in 0..100 {
+        platform.world().complete_all(CompleteOn::Caller);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(
+        !ring.has_event(),
+        "the command buffer ran before the pipeline it names was made"
+    );
+
+    device.control.pool.release();
+    assert!(
+        complete_until_event(&platform, &ring),
+        "the command buffer never ran"
+    );
+    let done = RgfxCbComplete::read_from_bytes(&ring.event().unwrap()).unwrap();
+    assert_eq!(done.cb_obj_id, 100);
+    assert_eq!(done.status, RGFX_CB_OK);
+    next_event(&mut guest, RGFX_EVT_PIPELINE_REFLECTION);
+}
+
+/// An `OBJECT_DESTROY` of a pipeline still compiling keeps its place in ring order: the pipeline
+/// is not stored when its compile ends, and its create is still answered
+#[test]
+fn a_destroy_of_a_pending_pipeline_cancels_it() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, _platform) = headless_on(&raised);
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    guest.send(&device, library_create(obj(1, 10)));
+    device.control.pool.hold();
+    guest.send(&device, compute_pipeline_create(obj(1, 11), obj(1, 10)));
+    guest.send(&device, object_destroy(obj(1, 11)));
+    // The destroy is carried out before the GET_DISPLAYS after it is answered.
+    guest.send(
+        &device,
+        RgfxMsgHeader {
+            r#type: RGFX_CMD_GET_DISPLAYS,
+            size: 0,
+            seqno: 0,
+        }
+        .as_bytes()
+        .to_vec(),
+    );
+    next_event(&mut guest, RGFX_EVT_DISPLAYS);
+    device.control.pool.release();
+    next_event(&mut guest, RGFX_EVT_PIPELINE_REFLECTION);
+    assert_eq!(device.decoder_object_count(), 1);
+}

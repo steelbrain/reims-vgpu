@@ -30,8 +30,9 @@ use std::sync::{Arc, OnceLock};
 use reims_graphics::ops::RgfxCommandBuffer;
 use reims_graphics::region::Region;
 use reims_graphics::wire::{
-    RGFX_CMD_COMMAND_BUFFER, RGFX_DEVICE_INFO_OFFSET, RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK,
-    RgfxCbComplete, RgfxMsgHeader, RgfxPipelineReflection,
+    RGFX_CMD_COMMAND_BUFFER, RGFX_CMD_COMPUTE_PIPELINE_CREATE, RGFX_CMD_OBJECT_DESTROY,
+    RGFX_CMD_RENDER_PIPELINE_CREATE, RGFX_DEVICE_INFO_OFFSET, RGFX_STATUS_INVALID_ARGUMENT,
+    RGFX_STATUS_OK, RgfxCbComplete, RgfxMsgHeader, RgfxPipelineReflection,
 };
 use reims_graphics::{
     CompletionPoster, CursorImage, FixedScreen, Host, Mode, PresentAnswer, Scanout, Screen,
@@ -45,12 +46,17 @@ use zerocopy::{FromBytes, IntoBytes};
 use crate::DefaultPlatform;
 use crate::entry;
 use crate::error::Error;
+use crate::graphics::compile::{CompilePool, Pending};
 use crate::graphics::completion::cb_failed;
-use crate::graphics::decode::{CompletionSink, GraphicsDecoder, ReflectionSink};
+use crate::graphics::decode::{
+    CompiledPipeline, CompletionSink, GraphicsDecoder, PipelineJob, ReflectionSink,
+    compile_pipeline,
+};
 use crate::graphics::device_info::device_info;
 use crate::platform::ApiPlatform;
 use crate::window::WindowLink;
 
+mod compile;
 mod completion;
 mod decode;
 mod device_info;
@@ -144,6 +150,8 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                 )),
                 device: gpu_device,
                 presented: Arc::new(Presented::default()),
+                pool: CompilePool::new(),
+                pending: Pending::default(),
             });
             let host = Box::new(CallbackHost {
                 callbacks: config.callbacks,
@@ -235,6 +243,10 @@ struct GraphicsControl<P: ApiPlatform> {
     device: P::Device,
     /// The surface the display pipe shows, shared with the window's sink.
     presented: Arc<Presented<P>>,
+    /// The threads ring 0's pipeline creates compile on (`compile`).
+    pool: CompilePool,
+    /// The pipelines being compiled, which a command buffer naming one waits for.
+    pending: Pending,
 }
 
 /// The IOSurface the display pipe shows in place of the scanout (`PRESENT_SURFACE`): the texture
@@ -336,6 +348,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                 let mut decoder = self.decoder.lock();
                 let dropped = decoder.drop_context(context);
                 decoder.forget_dropped_surfaces();
+                self.pending.cancel_context(context);
                 dropped
             };
             log::info!(
@@ -353,7 +366,19 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     /// create's reflection lands on ring 0's, each raising its ring's MSI-X vector. A command
     /// buffer the host could not carry out owes the guest a completion that no handler will post,
     /// so the host posts an internal-error one onto the queue's ring here.
-    fn handle_stage3(&self, poster: &CompletionPoster, message: &[u8]) {
+    ///
+    /// A pipeline create is compiled on the compile pool instead ([`Self::start_pipeline`]), and a
+    /// command buffer that names a pipeline still compiling waits for it first (`compile`).
+    fn handle_stage3(self: &Arc<Self>, poster: &CompletionPoster, message: &[u8]) {
+        let r#type = RgfxMsgHeader::read_from_prefix(message).map_or(0, |(h, _)| h.r#type);
+        match r#type {
+            RGFX_CMD_RENDER_PIPELINE_CREATE | RGFX_CMD_COMPUTE_PIPELINE_CREATE => {
+                self.start_pipeline(poster, message);
+                return;
+            }
+            RGFX_CMD_COMMAND_BUFFER => self.pending.wait_for_command_buffer(message),
+            _ => {}
+        }
         entry::run(|_| {
             let queue_poster = poster.clone();
             let sink: CompletionSink = Arc::new(move |record: RgfxCbComplete| {
@@ -367,6 +392,10 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                 let mut decoder = self.decoder.lock();
                 decoder.set_completion_sink(sink);
                 decoder.set_reflection_sink(reflection);
+                if r#type == RGFX_CMD_OBJECT_DESTROY {
+                    let (_, _, obj_id) = message_identity(message);
+                    self.pending.cancel(obj_id);
+                }
                 decoder.decode(&self.device, message)
             };
             match outcome {
@@ -388,6 +417,72 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                     self.fail_queue_command_buffer(poster, message);
                 }
             }
+        });
+    }
+
+    /// A pipeline create from ring 0: prepared here, on the control thread, with the decoder's
+    /// table (a malformed create or one naming no library is refused here, unanswered, as the
+    /// decoder refuses it), marked pending, and compiled on the compile pool, so ring 0 goes on
+    /// meanwhile; its reply goes through `poster` when the compile ends ([`Self::compile`]).
+    fn start_pipeline(self: &Arc<Self>, poster: &CompletionPoster, message: &[u8]) {
+        let prepared = entry::run(|_| {
+            let decoder = self.decoder.lock();
+            let prepared = decoder.prepare_pipeline(message);
+            if let Ok(job) = &prepared {
+                self.pending.begin(job.obj_id);
+            }
+            prepared
+        });
+        let job = match prepared {
+            Ok(job) => job,
+            Err(e) => {
+                let (ty, seqno, obj_id) = message_identity(message);
+                log::warn!(
+                    target: "reims_vgpu::graphics",
+                    "a pipeline create (type {ty:#x}, seqno {seqno}, object {obj_id:#x}) was not \
+                     carried out: {e:?}"
+                );
+                return;
+            }
+        };
+        let me = Arc::clone(self);
+        let poster = poster.clone();
+        if let Err(compile) = self.pool.submit(Box::new(move || me.compile(job, &poster))) {
+            compile();
+        }
+    }
+
+    /// Compiles a prepared pipeline create under a library entry, with no lock held; stores the
+    /// pipeline where no destroy or close cancelled it meanwhile, lets the command buffers that
+    /// wait for it go on, and posts its reply (its reflection, or a refusal) through `poster`.
+    fn compile(&self, job: PipelineJob<P>, poster: &CompletionPoster) {
+        entry::run(|_| {
+            let (obj_id, seqno, kind) = (job.obj_id, job.seqno, job.kind());
+            let compiled = match compile_pipeline::<P>(&self.device, job) {
+                Ok(compiled) => compiled,
+                Err(raise) => {
+                    log::warn!(
+                        target: "reims_vgpu::graphics",
+                        "a pipeline create (seqno {seqno}, object {obj_id:#x}) faulted: {raise}"
+                    );
+                    CompiledPipeline::refused(obj_id, seqno, kind)
+                }
+            };
+            if compiled.is_refused() {
+                log::warn!(
+                    target: "reims_vgpu::graphics",
+                    "a pipeline create (seqno {seqno}, object {obj_id:#x}) was refused"
+                );
+            }
+            let reflection = compiled.reflection;
+            {
+                let mut decoder = self.decoder.lock();
+                if self.pending.live(obj_id) {
+                    decoder.finish_pipeline(compiled);
+                }
+                self.pending.finish(obj_id);
+            }
+            poster.post(reflection.as_bytes());
         });
     }
 

@@ -550,8 +550,9 @@ impl<P: Platform> GraphicsDecoder<P> {
                     None => Ok(Err(DecodeError::Refused)),
                 }
             }
-            RGFX_CMD_RENDER_PIPELINE_CREATE => self.decode_render_pipeline(device, message),
-            RGFX_CMD_COMPUTE_PIPELINE_CREATE => self.decode_compute_pipeline(device, message),
+            RGFX_CMD_RENDER_PIPELINE_CREATE | RGFX_CMD_COMPUTE_PIPELINE_CREATE => {
+                self.decode_pipeline(device, message)
+            }
             RGFX_CMD_COMMAND_BUFFER => self.decode_command_buffer(message),
             _ => Ok(Err(DecodeError::UnknownCommand)),
         }
@@ -615,162 +616,271 @@ impl<P: Platform> GraphicsDecoder<P> {
         }
     }
 
-    /// `RENDER_PIPELINE_CREATE`: resolve the vertex and fragment functions from
-    /// their libraries, build the platform's render pipeline descriptor, make the
-    /// pipeline, store it and emit its reflection reply.
-    ///
-    /// The host drives [`GpuDevice::new_render_pipeline_state`], the platform's
-    /// descriptor-value creator. That value carries the vertex and fragment
-    /// functions, colour attachment 0's pixel format and the one source-over
-    /// blend it can express, and a label; the rest of the wire descriptor (colour
-    /// attachments 1..8, arbitrary blend state, depth/stencil formats, the raster
-    /// sample count, the vertex descriptor and the pipeline flags) has no place in
-    /// that value and is not applied here. Each function is specialised by the
-    /// index-keyed constants the wire carries for it. The full path is Metal's serialized-descriptor deserializer,
-    /// which is the Apple lane's; carrying the whole descriptor on the wire keeps
-    /// the guest ABI stable for when the platform value grows.
-    fn decode_render_pipeline(
+    /// `RENDER_PIPELINE_CREATE` and `COMPUTE_PIPELINE_CREATE`, carried out at once: the create is
+    /// prepared ([`Self::prepare_pipeline`]), compiled ([`compile_pipeline`]) and stored
+    /// ([`Self::finish_pipeline`]), and its reflection reply goes to the reflection sink. The
+    /// device's host runs the same three steps with the compile on a thread of its own.
+    fn decode_pipeline(
         &mut self,
         device: &P::Device,
         message: &[u8],
     ) -> RaiseResult<Result<(), DecodeError>> {
-        let Some(m) = read::<RgfxRenderPipelineCreate>(message) else {
-            return Ok(Err(DecodeError::Malformed));
+        let job = match self.prepare_pipeline(message) {
+            Ok(job) => job,
+            Err(e) => return Ok(Err(e)),
         };
-        // Resolve both function libraries (which may be the same). A reference
-        // that names no library is a guest protocol error, as the other
-        // control-ring creates treat one.
-        let vertex_lib = match self.objects.get(&m.vertex_library_obj_id) {
-            Some(ObjHandle::Library(l)) => l.clone_ref(),
-            _ => return Ok(Err(DecodeError::BadReference)),
+        let compiled = compile_pipeline::<P>(device, job)?;
+        let refused = compiled.is_refused();
+        if let Some(sink) = self.reflection_sink.clone() {
+            sink(compiled.reflection);
+        }
+        self.finish_pipeline(compiled);
+        Ok(if refused {
+            Err(DecodeError::Refused)
+        } else {
+            Ok(())
+        })
+    }
+
+    /// The first step of a pipeline create, with the table at hand: its libraries resolved from
+    /// the table, its entry points, constants and descriptor fields read from the message, so the
+    /// compile needs nothing of the decoder's. A library reference that names no library is a
+    /// guest protocol error, as the other creates treat one ([`DecodeError::BadReference`]); a
+    /// span the message does not cover, or a name that is not UTF-8, is
+    /// [`DecodeError::Malformed`]. Neither is answered.
+    ///
+    /// The render form carries the vertex and fragment functions, colour attachment 0's pixel
+    /// format and the one source-over blend [`RenderPipelineDesc`] can express, and a label; the
+    /// rest of the wire descriptor (colour attachments 1..8, arbitrary blend state,
+    /// depth/stencil formats, the raster sample count, the vertex descriptor and the pipeline
+    /// flags) has no place in that value and is not applied. The compute form applies only the
+    /// function; its flags and limits are not applied. Each function is specialised by the
+    /// index-keyed constants the wire carries for it. The full path is Metal's
+    /// serialized-descriptor deserializer, which is the Apple lane's; carrying the whole
+    /// descriptor on the wire keeps the guest ABI stable for when the platform value grows.
+    pub(crate) fn prepare_pipeline(&self, message: &[u8]) -> Result<PipelineJob<P>, DecodeError> {
+        let library = |obj_id: u64| match self.objects.get(&obj_id) {
+            Some(ObjHandle::Library(l)) => Ok(l.clone_ref()),
+            _ => Err(DecodeError::BadReference),
         };
-        let fragment_lib = match self.objects.get(&m.fragment_library_obj_id) {
-            Some(ObjHandle::Library(l)) => l.clone_ref(),
-            _ => return Ok(Err(DecodeError::BadReference)),
-        };
-        // The entry-point names and the optional label live in the message tail;
-        // a span the message does not cover, or non-UTF-8, is malformed.
+        let header = read::<RgfxMsgHeader>(message).ok_or(DecodeError::Malformed)?;
+        if header.r#type == RGFX_CMD_COMPUTE_PIPELINE_CREATE {
+            let m = read::<RgfxComputePipelineCreate>(message).ok_or(DecodeError::Malformed)?;
+            let library = library(m.function_library_obj_id)?;
+            let name =
+                str_tail(message, m.name_offset, m.name_len).ok_or(DecodeError::Malformed)?;
+            let constants = constants_tail(message, m.constants_offset, m.constant_count)
+                .ok_or(DecodeError::Malformed)?;
+            return Ok(PipelineJob {
+                obj_id: m.obj_id,
+                seqno: m.header.seqno,
+                shape: PipelineShape::Compute {
+                    library,
+                    name: name.to_owned(),
+                    constants,
+                },
+            });
+        }
+        let m = read::<RgfxRenderPipelineCreate>(message).ok_or(DecodeError::Malformed)?;
+        // Both function libraries (which may be the same).
+        let vertex_library = library(m.vertex_library_obj_id)?;
+        let fragment_library = library(m.fragment_library_obj_id)?;
         let (Some(vertex_name), Some(fragment_name)) = (
             str_tail(message, m.vertex_name_offset, m.vertex_name_len),
             str_tail(message, m.fragment_name_offset, m.fragment_name_len),
         ) else {
-            return Ok(Err(DecodeError::Malformed));
+            return Err(DecodeError::Malformed);
         };
         let label = if m.label_len == 0 {
             None
         } else {
-            match str_tail(message, m.label_offset, m.label_len) {
-                Some(s) => Some(s),
-                None => return Ok(Err(DecodeError::Malformed)),
-            }
+            Some(
+                str_tail(message, m.label_offset, m.label_len)
+                    .ok_or(DecodeError::Malformed)?
+                    .to_owned(),
+            )
         };
-        // Each function's constants (index-keyed) are in the tail; a span the
-        // message does not cover is malformed.
         let (Some(vertex_constants), Some(fragment_constants)) = (
             constants_tail(message, m.vertex_constants_offset, m.vertex_constant_count),
-            constants_tail(message, m.fragment_constants_offset, m.fragment_constant_count),
+            constants_tail(
+                message,
+                m.fragment_constants_offset,
+                m.fragment_constant_count,
+            ),
         ) else {
-            return Ok(Err(DecodeError::Malformed));
+            return Err(DecodeError::Malformed);
         };
-        // Resolve the functions, each specialised by its constants. A nil function
-        // (the library has no such entry point, or refuses the specialisation)
-        // refuses the pipeline.
-        let Some(vertex) = specialised::<P>(&vertex_lib, vertex_name, &vertex_constants)? else {
-            return self.emit_pipeline_refused(m.header.seqno, m.obj_id, RGFX_PIPELINE_KIND_RENDER);
-        };
-        let Some(fragment) = specialised::<P>(&fragment_lib, fragment_name, &fragment_constants)?
-        else {
-            return self.emit_pipeline_refused(m.header.seqno, m.obj_id, RGFX_PIPELINE_KIND_RENDER);
-        };
-        let desc = RenderPipelineDesc::<P> {
-            label,
-            vertex: &vertex,
-            fragment: &fragment,
-            color0_pixel_format: m.colors[0].pixel_format.into(),
-            blend_over: is_source_over(&m.colors[0]),
-            resource_index: None,
-        };
-        // `new_render_pipeline_state` returns a plain `Result` (no path reaches it
-        // under a handler in the Apple lane); a nil state or an `NSError` refuses.
-        match device.new_render_pipeline_state(&desc) {
-            Ok(Some(pipeline)) => {
-                let reflection = render_reflection::<P>(&pipeline, m.header.seqno, m.obj_id);
-                if let Some(sink) = self.reflection_sink.clone() {
-                    sink(reflection);
-                }
-                self.insert(m.obj_id, ObjHandle::RenderPipeline(pipeline))
-            }
-            Ok(None) | Err(_) => {
-                self.emit_pipeline_refused(m.header.seqno, m.obj_id, RGFX_PIPELINE_KIND_RENDER)
-            }
-        }
+        Ok(PipelineJob {
+            obj_id: m.obj_id,
+            seqno: m.header.seqno,
+            shape: PipelineShape::Render {
+                vertex_library,
+                vertex_name: vertex_name.to_owned(),
+                vertex_constants,
+                fragment_library,
+                fragment_name: fragment_name.to_owned(),
+                fragment_constants,
+                label,
+                color0_pixel_format: m.colors[0].pixel_format.into(),
+                blend_over: is_source_over(&m.colors[0]),
+            },
+        })
     }
 
-    /// `COMPUTE_PIPELINE_CREATE`: resolve the compute function from its library,
-    /// make the pipeline through [`GpuDevice::new_compute_pipeline_state_for_function`],
-    /// store it and emit its reflection reply. As the render form, the wire
-    /// carries the whole descriptor but the function-from-a-name creator applies
-    /// only the function, specialised by its index-keyed constants; the flags and
-    /// limits are not applied here (the serialized-descriptor path is the Apple
-    /// lane's).
-    fn decode_compute_pipeline(
-        &mut self,
-        device: &P::Device,
-        message: &[u8],
-    ) -> RaiseResult<Result<(), DecodeError>> {
-        let Some(m) = read::<RgfxComputePipelineCreate>(message) else {
-            return Ok(Err(DecodeError::Malformed));
-        };
-        let function_lib = match self.objects.get(&m.function_library_obj_id) {
-            Some(ObjHandle::Library(l)) => l.clone_ref(),
-            _ => return Ok(Err(DecodeError::BadReference)),
-        };
-        let Some(name) = str_tail(message, m.name_offset, m.name_len) else {
-            return Ok(Err(DecodeError::Malformed));
-        };
-        let Some(constants) = constants_tail(message, m.constants_offset, m.constant_count) else {
-            return Ok(Err(DecodeError::Malformed));
-        };
-        let Some(function) = specialised::<P>(&function_lib, name, &constants)? else {
-            return self.emit_pipeline_refused(
-                m.header.seqno,
-                m.obj_id,
-                RGFX_PIPELINE_KIND_COMPUTE,
-            );
-        };
-        match device.new_compute_pipeline_state_for_function(Some(&function)) {
-            Ok(Some(pipeline)) => {
-                let reflection = compute_reflection::<P>(&pipeline, m.header.seqno, m.obj_id);
-                if let Some(sink) = self.reflection_sink.clone() {
-                    sink(reflection);
-                }
-                self.insert(m.obj_id, ObjHandle::ComputePipeline(pipeline))
-            }
-            Ok(None) | Err(_) => {
-                self.emit_pipeline_refused(m.header.seqno, m.obj_id, RGFX_PIPELINE_KIND_COMPUTE)
-            }
+    /// The last step of a pipeline create: stores the compiled pipeline under its id (a refused
+    /// one stores nothing).
+    pub(crate) fn finish_pipeline(&mut self, compiled: CompiledPipeline<P>) {
+        if let Some(handle) = compiled.handle {
+            self.objects.insert(compiled.obj_id, handle);
         }
     }
+}
 
-    /// Emits a refused reflection reply for a pipeline the host could not make
-    /// (a nil function, or the platform refusing the descriptor) and reports the
-    /// create as [`DecodeError::Refused`], so a guest blocked on the reply unblocks.
-    fn emit_pipeline_refused(
-        &self,
-        seqno: u64,
-        obj_id: u64,
-        kind: u32,
-    ) -> RaiseResult<Result<(), DecodeError>> {
-        if let Some(sink) = self.reflection_sink.clone() {
-            sink(RgfxPipelineReflection {
+/// A pipeline create the decoder has prepared ([`GraphicsDecoder::prepare_pipeline`]): what its
+/// compile needs, owned, so it runs with no lock of the decoder's held.
+pub(crate) struct PipelineJob<P: Platform> {
+    /// The pipeline's guest-picked id.
+    pub(crate) obj_id: u64,
+    /// The create's seqno, which its reply carries.
+    pub(crate) seqno: u64,
+    /// The pipeline's functions and descriptor.
+    shape: PipelineShape<P>,
+}
+
+impl<P: Platform> PipelineJob<P> {
+    /// [`RGFX_PIPELINE_KIND_RENDER`] or [`RGFX_PIPELINE_KIND_COMPUTE`].
+    pub(crate) fn kind(&self) -> u32 {
+        match self.shape {
+            PipelineShape::Render { .. } => RGFX_PIPELINE_KIND_RENDER,
+            PipelineShape::Compute { .. } => RGFX_PIPELINE_KIND_COMPUTE,
+        }
+    }
+}
+
+/// A prepared pipeline's functions and descriptor.
+enum PipelineShape<P: Platform> {
+    Render {
+        vertex_library: P::Library,
+        vertex_name: String,
+        vertex_constants: Vec<FunctionConstant>,
+        fragment_library: P::Library,
+        fragment_name: String,
+        fragment_constants: Vec<FunctionConstant>,
+        label: Option<String>,
+        color0_pixel_format: u64,
+        blend_over: bool,
+    },
+    Compute {
+        library: P::Library,
+        name: String,
+        constants: Vec<FunctionConstant>,
+    },
+}
+
+/// A compiled pipeline create: the pipeline (none where it was refused) and the reflection reply
+/// the create owes.
+pub(crate) struct CompiledPipeline<P: Platform> {
+    /// The pipeline's guest-picked id.
+    obj_id: u64,
+    /// The pipeline, or `None` where it was refused.
+    handle: Option<ObjHandle<P>>,
+    /// The reply: the pipeline's reflection, or a refusal.
+    pub(crate) reflection: RgfxPipelineReflection,
+}
+
+impl<P: Platform> CompiledPipeline<P> {
+    /// A refused create of `kind` (a nil function, the platform refusing the descriptor, or a
+    /// raise in the compile).
+    pub(crate) fn refused(obj_id: u64, seqno: u64, kind: u32) -> Self {
+        CompiledPipeline {
+            obj_id,
+            handle: None,
+            reflection: RgfxPipelineReflection {
                 header: reflection_header(seqno),
                 obj_id,
                 status: RGFX_PIPELINE_REFUSED,
                 kind,
                 ..RgfxPipelineReflection::default()
-            });
+            },
         }
-        Ok(Err(DecodeError::Refused))
+    }
+
+    /// The platform made no pipeline.
+    pub(crate) fn is_refused(&self) -> bool {
+        self.handle.is_none()
+    }
+}
+
+/// The middle step of a pipeline create, with no lock held: the functions specialised by their
+/// constants and the pipeline made on `device`. A nil function (the library has no such entry
+/// point, or refuses the specialisation) refuses the pipeline, as a nil state or an `NSError`
+/// from the creator does; a platform raise propagates.
+pub(crate) fn compile_pipeline<P: Platform>(
+    device: &P::Device,
+    job: PipelineJob<P>,
+) -> RaiseResult<CompiledPipeline<P>> {
+    let kind = job.kind();
+    let (obj_id, seqno) = (job.obj_id, job.seqno);
+    let refused = || CompiledPipeline::refused(obj_id, seqno, kind);
+    match job.shape {
+        PipelineShape::Render {
+            vertex_library,
+            vertex_name,
+            vertex_constants,
+            fragment_library,
+            fragment_name,
+            fragment_constants,
+            label,
+            color0_pixel_format,
+            blend_over,
+        } => {
+            let Some(vertex) = specialised::<P>(&vertex_library, &vertex_name, &vertex_constants)?
+            else {
+                return Ok(refused());
+            };
+            let Some(fragment) =
+                specialised::<P>(&fragment_library, &fragment_name, &fragment_constants)?
+            else {
+                return Ok(refused());
+            };
+            let desc = RenderPipelineDesc::<P> {
+                label: label.as_deref(),
+                vertex: &vertex,
+                fragment: &fragment,
+                color0_pixel_format,
+                blend_over,
+                resource_index: None,
+            };
+            // `new_render_pipeline_state` returns a plain `Result` (no path reaches it under a
+            // handler in the Apple lane); a nil state or an `NSError` refuses.
+            Ok(match device.new_render_pipeline_state(&desc) {
+                Ok(Some(pipeline)) => CompiledPipeline {
+                    obj_id,
+                    reflection: render_reflection::<P>(&pipeline, seqno, obj_id),
+                    handle: Some(ObjHandle::RenderPipeline(pipeline)),
+                },
+                Ok(None) | Err(_) => refused(),
+            })
+        }
+        PipelineShape::Compute {
+            library,
+            name,
+            constants,
+        } => {
+            let Some(function) = specialised::<P>(&library, &name, &constants)? else {
+                return Ok(refused());
+            };
+            Ok(
+                match device.new_compute_pipeline_state_for_function(Some(&function)) {
+                    Ok(Some(pipeline)) => CompiledPipeline {
+                        obj_id,
+                        reflection: compute_reflection::<P>(&pipeline, seqno, obj_id),
+                        handle: Some(ObjHandle::ComputePipeline(pipeline)),
+                    },
+                    Ok(None) | Err(_) => refused(),
+                },
+            )
+        }
     }
 }
 

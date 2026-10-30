@@ -29,9 +29,11 @@
 //! message to the host with a [`CompletionPoster`] onto the queue's completion ring, and the host
 //! posts what it owes there (a buffer's completion), raising the queue's own MSI-X vector. Its
 //! doorbell is the submission ring's region offset (the value the guest writes to `DOORBELL`, as
-//! the control ring's is 0). A command buffer is decoded only once the control thread has carried
-//! out every ring-0 message published before the thread took the buffer, so the creates it names
-//! are made. An `OBJECT_DESTROY` of the queue, a `CONTEXT_CLOSE` of its process (the host then
+//! the control ring's is 0). A command buffer is handed to the host only once the control thread
+//! has handed it every ring-0 message published before the thread took the buffer, so the creates
+//! it names are made, or, for a pipeline the host compiles on threads of its own, known to the host,
+//! which holds a buffer that names it until it is made. An `OBJECT_DESTROY` of the queue, a
+//! `CONTEXT_CLOSE` of its process (the host then
 //! drops the process's objects, [`Host::context_closed`]), a reset and the device's end, end a
 //! queue's service.
 //!
@@ -123,8 +125,11 @@ pub trait Host: Send + Sync + 'static {
     /// hands over first, and before its `OBJECT_DESTROY`). Each ring's messages come whole, in the
     /// order the guest published them, with `completion` to post what the host owes onto that
     /// ring's completion ring (a pipeline's reflection on the control one, a buffer's
-    /// `CB_COMPLETE` on the queue's), raising its MSI-X vector; this returns nothing. The default
-    /// does nothing, for a host with no stage-3 decoder.
+    /// `CB_COMPLETE` on the queue's), raising its MSI-X vector; this returns nothing. A ring-0
+    /// message may be carried out after this returns (a pipeline compile on the host's own
+    /// threads, so ring 0 goes on meanwhile): the host then posts its reply when it is done, from
+    /// that thread, and holds a later command buffer that names its object until it is. The
+    /// default does nothing, for a host with no stage-3 decoder.
     fn stage3_message(&self, completion: &CompletionPoster, message: &[u8]) {
         let _ = (completion, message);
     }
@@ -185,7 +190,8 @@ pub(crate) struct Shared {
     /// The control completion ring.
     completion: Mutex<Producer>,
     /// The control submission ring's count through the last message the control thread has
-    /// carried out: a command buffer waits for it to pass what was published before it.
+    /// carried out or handed to the host: a command buffer waits for it to pass what was
+    /// published before it.
     control_done: AtomicU64,
     /// The command queues' own rings and service threads, by queue id and by ring id.
     queues: Mutex<Queues>,
