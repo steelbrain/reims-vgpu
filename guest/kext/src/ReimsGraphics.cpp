@@ -829,6 +829,7 @@ void ReimsGraphics::free()
 
 IOReturn ReimsGraphics::enableController()
 {
+	initPower();
 	Mode m;
 	IOLockLock(stateLock);
 	bool ok = modeFor(startupId, &m);
@@ -1039,10 +1040,10 @@ IOReturn ReimsGraphics::getAttribute(IOSelect attribute, uintptr_t *value)
 
 IOReturn ReimsGraphics::setAttribute(IOSelect attribute, uintptr_t value)
 {
-	// The device has no power states of its own.
 	if (attribute == kIOPowerAttribute) {
-		traceAttribute("setAttribute", -1, attribute, value, kIOReturnSuccess);
-		return kIOReturnSuccess;
+		IOReturn r = setPower(static_cast<UInt32>(value));
+		traceAttribute("setAttribute", -1, attribute, value, r);
+		return r;
 	}
 	IOReturn r = super::setAttribute(attribute, value);
 	traceAttribute("setAttribute", -1, attribute, value, r);
@@ -1120,6 +1121,54 @@ IOReturn ReimsGraphics::setConnectionAttribute(IOIndex connectIndex, IOSelect at
 	default:
 		return super::setAttributeForConnection(connectIndex, attribute, value);
 	}
+}
+
+// MARK: - Power
+
+// Three states, as IOFramebuffer expects of its subclasses: off; doze, the driver's floor
+// while the system is up; and on, usable, which the display's own power asks for. The
+// clamp holds it on until the display's driver joins.
+void ReimsGraphics::initPower()
+{
+	if (powerRegistered)
+		return;
+	static IOPMPowerState states[kPowerStateCount] = {
+	    {kIOPMPowerStateVersion1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+	    {kIOPMPowerStateVersion1, 0, 0, kIOPMPowerOn, 0, 0, 0, 0, 0, 0, 0, 0},
+	    {kIOPMPowerStateVersion1, kIOPMDeviceUsable, kIOPMPowerOn, kIOPMPowerOn, 0, 0, 0, 0, 0, 0, 0, 0},
+	};
+	IOReturn r = registerPowerDriver(this, states, kPowerStateCount);
+	FBTRACE(4, "registerPowerDriver -> 0x%x", r);
+	if (r != kIOReturnSuccess) {
+		IOLog("ReimsGraphics: power management refused the driver: 0x%x\n", r);
+		return;
+	}
+	powerRegistered = true;
+	temporaryPowerClampOn();
+	changePowerStateTo(kPowerStateDoze);
+}
+
+// The device has no power states of its own; IOFramebuffer hears of each step to or from on.
+IOReturn ReimsGraphics::setPower(UInt32 state)
+{
+	if (state >= kPowerStateCount)
+		state = kPowerStateOn;
+	UInt32 old = powerState;
+	if (state == old)
+		return kIOReturnSuccess;
+	IOIndex after = 0;
+	if (old == kPowerStateOn) {
+		super::handleEvent(kIOFBNotifyWillPowerOff);
+		after = kIOFBNotifyDidPowerOff;
+	} else if (state == kPowerStateOn) {
+		super::handleEvent(kIOFBNotifyWillPowerOn);
+		after = kIOFBNotifyDidPowerOn;
+	}
+	powerState = state;
+	if (after)
+		super::handleEvent(after);
+	FBTRACE(16, "power %u -> %u", old, state);
+	return kIOReturnSuccess;
 }
 
 // MARK: - IOFramebuffer: the hardware cursor

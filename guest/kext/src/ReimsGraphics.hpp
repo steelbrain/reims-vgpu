@@ -156,6 +156,15 @@ private:
 	};
 	static constexpr UInt32 kMaxModes = 64;
 
+	// Power: IOFramebuffer sets kIOPowerAttribute to one of the driver's three power
+	// states (off, doze, on); the driver tells IOFramebuffer as it leaves and reaches on.
+	static constexpr UInt32 kPowerStateOff = 0;
+	static constexpr UInt32 kPowerStateDoze = 1;
+	static constexpr UInt32 kPowerStateOn = 2;
+	static constexpr UInt32 kPowerStateCount = 3;
+	void initPower();
+	IOReturn setPower(UInt32 state);
+
 	// One of IOFramebuffer's interrupt registrations.
 	struct Interrupt {
 		IOFBInterruptProc proc;
@@ -279,6 +288,10 @@ private:
 	bool vblankSent;
 	bool refreshWanted;
 	UInt64 refreshSeqno;
+
+	// IOFramebuffer's thread alone: the power state and whether it is registered.
+	bool powerRegistered;
+	UInt32 powerState;
 
 	bool ready;
 };
