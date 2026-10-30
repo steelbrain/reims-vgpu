@@ -39,6 +39,9 @@ pub enum Error {
     Gpu,
     /// A frame committed twice, or waited on before its commit.
     FrameState,
+    /// The host refused the memory, a pipe or a thread a device needs: the graphics device's
+    /// region, or its threads.
+    HostResources,
 }
 
 impl std::fmt::Display for Error {
@@ -59,6 +62,7 @@ impl std::fmt::Display for Error {
             Error::Resume(_) => "the resume state was refused",
             Error::Gpu => "the frame's GPU work failed",
             Error::FrameState => "the frame is not in a state for this call",
+            Error::HostResources => "the host refused memory, a pipe or a thread",
         })
     }
 }

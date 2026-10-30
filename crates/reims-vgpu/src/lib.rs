@@ -38,6 +38,7 @@ mod display;
 mod entry;
 mod error;
 mod frame;
+mod graphics;
 mod iosurface;
 pub mod platform;
 mod retained;
@@ -55,6 +56,9 @@ pub use display::{
 };
 pub use error::{Error, ResumeError};
 pub use frame::{Frame, FrameTarget, MAX_FRAME_TARGET_SIZE, PixelFormat, Region};
+pub use graphics::{
+    GraphicsCallbacks, GraphicsConfig, GraphicsDevice, GraphicsRaiseFn, ScanoutWrittenFn,
+};
 pub use iosurface::{IoSurfaceDevice, IoSurfaceDeviceConfig};
 pub use platform::ApiPlatform;
 pub use reims_vgpu_core::host::{
