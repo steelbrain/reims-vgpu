@@ -295,12 +295,141 @@ enabled, the host sends `VBLANK` at each refresh of the window's screen.
 **Boot display.** The device's option ROM gives firmware a GOP framebuffer in
 BAR2, and the kext takes the display over when it starts.
 
+## Stage 3 wire protocol: the Metal-call stream
+
+Stage 3 keeps the stage-2 transport unchanged — the registers, the region, the
+256-byte ring header, the doorbell and interrupt handshake, and the 16-byte
+message header (`type`, `size`, `seqno`). It adds rings per command queue, a
+family of device-level object-lifecycle messages, command-buffer encodings on
+the per-queue submission rings, and completion records on the per-queue
+completion rings.
+
+Our guest Metal GPU bundle is the host of Apple's Metal SPI: every Metal call
+an app makes lands in one of the bundle's objects, and the bundle serialises it
+into this stream. The host reads the stream and drives the library's `Platform`
+(Metal on the Mac, metal2vulkan on Linux), the same trait reims-vgpu-core
+already drives from the Apple-lane command stream. So the host decoder is: wire
+message → handle-table lookup/insert → `Platform` call → completion. The
+bundle's serialiser is the mirror of that decoder.
+
+**Handles and addresses.** Every guest Metal object has a 64-bit `ObjId` the
+guest picks, unique per device; the host keeps an `ObjId` → `Platform` handle
+table (handles are refcounted in core, `clone_ref`/`Drop`). The guest also
+picks buffer/texture/heap GPU addresses and resource IDs, and the host pins
+them — the host never hands a host device address to the guest (m2v's rule). A
+destroy carries the `ObjId` alone; the host drops its handle.
+
+**Rings.** Ring 0 stays the control ring: the stage-2 display commands, plus
+the device-level object lifecycle below. A `QUEUE_CREATE` on ring 0 makes a
+submission+completion ring pair at a guest-given region offset with its own
+MSI-X vector (one submission + one completion ring per `MTLCommandQueue`,
+created on demand); `QUEUE_DESTROY` frees it. A create carries a priority, and
+the host gives that ring's VkQueue a matching priority, so WindowServer's queue
+runs high.
+
+**Object lifecycle** (ring 0, request/reply). Each `*_CREATE` carries our
+schema for the Metal descriptor (plain little-endian fields, decoded straight
+into the `Platform` descriptor struct — core keeps descriptors as public-field
+structs), the guest-picked `ObjId`, and, where it applies, the address, id or
+offset. Resource creates with a guest-picked id/address are fire-and-forget
+(the host builds the mirror and pins lazily on first use); pipeline creates
+block for the reply, which carries the reflection the guest needs
+(`threadExecutionWidth`, max total threads per threadgroup, static threadgroup
+memory) — m2v's "take state answers from the created pipeline".
+
+| group | messages | `Platform` call |
+|---|---|---|
+| memory | `HEAP_OVER_HOST_MEMORY`, `HEAP_CREATE`, `BUFFER_CREATE`, `BUFFER_OVER_HOST_MEMORY`, `BUFFER_AT_OFFSET`, `TEXTURE_CREATE`, `TEXTURE_FROM_BUFFER`, `TEXTURE_FROM_IOSURFACE`, `*_DESTROY` | `new_heap_over_host_memory`, `new_heap`, `new_buffer`, `Heap::new_buffer_at_offset`, `new_texture`, `Buffer::new_texture`, drop |
+| state | `SAMPLER_CREATE`, `DEPTH_STENCIL_CREATE`, `*_DESTROY` | `new_sampler_state`, `new_depth_stencil_state` |
+| shaders | `LIBRARY_CREATE` (`.metallib`/AIR bytes forwarded unchanged), `RENDER_PIPELINE_CREATE`, `COMPUTE_PIPELINE_CREATE`, `*_DESTROY` | `new_library_with_data`, `new_render_pipeline_state`, `new_compute_pipeline_state` |
+| sync | `EVENT_CREATE`, `SHARED_EVENT_CREATE`, `FENCE_CREATE`, `*_DESTROY` | `new_event`, `new_shared_event`, `new_fence` |
+| queue | `QUEUE_CREATE` (priority, region offset, vector), `QUEUE_DESTROY` | `new_command_queue` |
+
+`*_OVER_HOST_MEMORY` map guest region blocks (Shared) and the host builds a
+placement heap/buffer over them. Managed is backed as Shared tonight (one
+coherent copy, allowed by Metal's contract), behind one function so the
+two-copy VRAM form drops in when m2v ships it.
+
+**Command buffers** (per-queue submission ring). A `COMMAND_BUFFER` message is
+one command buffer: its `ObjId`, then a byte stream of encoder ops. The decoder
+opens the `Platform` command buffer and walks the ops:
+- `ENCODER_BEGIN_RENDER` (our render-pass schema: colour/depth/stencil
+  attachments by texture `ObjId`, load/store actions, clears),
+  `ENCODER_BEGIN_BLIT`, `ENCODER_BEGIN_COMPUTE`; `ENCODER_END`.
+- one op per `Platform` encoder method — set pipeline/buffer/texture/sampler/
+  bytes, viewport, scissor, draw / draw-indexed / dispatch, copy/blit, update/
+  wait fence, `useResource`/`useHeap`. The op set is the trait's encoder
+  methods; the first slice is the subset WindowServer and simple Metal apps
+  issue.
+- `CB_SIGNAL` / `CB_WAIT` (event `ObjId`, value) → `encode_signal` /
+  `encode_wait`; `CB_PRESENT` ties a drawable to the scanout (the present path,
+  outside the trait); `CB_COMMIT` closes the message — the host commits and
+  registers an `add_completed_handler` that writes the completion record.
+
+Metal splits one command buffer into several kernel submissions (a render pass;
+a run of blits or of computes with no event between) — m2v's measured
+granularity. The host preserves it so IOGPU error reporting lines up.
+
+**Completion** (per-queue completion ring). A `CB_COMPLETE` record: the
+command-buffer `ObjId`, status, GPU start/end time, and on error the
+`CommandBufferError` the host maps 1:1 from the IOGPU code the runtime returns
+(page fault, hang/timeout, recovery victim, access revoked, invalid resource —
+the map m2v gave). A shared event posts `EVENT_SIGNALLED` (`ObjId`, value) as it
+fires. The ring's armed/interrupt handshake is the stage-2 one.
+
+**Left for later** (extends the same op families, not the transport): enqueue
+ordering held in the decoder; command-buffer/queue descriptors and
+`errorOptions`; labels and debug groups answered guest-side; residency sets
+(`useResource`/`useHeap` are in); `MTLIOCommandQueue`; Metal 4.
+
+**Where the decoder lives.** In reims-vgpu-core, generic over `P: Platform`,
+beside the Apple-lane decode it mirrors (same handle machinery, descriptor
+structs and `Platform` calls). The reims-graphics crate stays the transport
+(rings, region, registers); the decoder consumes ring bytes and drives
+`Platform`.
+
+## Stage 3 guest stack (from the prior-art study)
+
+How a Metal bundle plugs into macOS, in Apple's own terms (notes:
+`stage3-apple-metal-iface.md`):
+
+- **Discovery/load.** The bundle installs under `/Library/GPUBundles/`. Metal
+  does not scan that directory; it loads the bundle from two properties on the
+  accelerator service's IOKit personality — `MetalPluginName` (the path) and
+  `MetalPluginClassName` (the Obj-C class Metal instantiates as the
+  `MTLDevice`) — under `IOMatchCategory IOAccelerator`. So stage 3 needs a
+  guest **accelerator kext** that matches our PCI device and publishes those
+  two keys; the bundle ships beside it.
+- **Device class.** The bundle's device subclasses Apple's private IOAccel
+  Metal base class and conforms to `<MTLDevice, MTLDeviceSPI>`; entry
+  `-initWithAcceleratorPort:` (may return `nil` to decline). The base fills the
+  limit tables (zero limits make CoreImage refuse), and the bundle implements
+  the whole `MTLDevice` object graph plus enough of the GL/OpenCL private
+  selectors. AIR arrives as `.metallib` through `newLibraryWith*`; the bundle
+  forwards those bytes over the wire (`LIBRARY_CREATE`), the host compiles them.
+- **Kernel family — the fork.** The prior art builds its accelerator on the
+  older `IOAcceleratorFamily2`, but our guest already runs the **ported
+  IOGPUFamily stack**, and IOAccel2 cannot start in a kernel where IOGPU runs.
+  So our accelerator aligns with **IOGPU** (owner's correction, 2026-10-30),
+  and the IOAccel2 user-client selectors do not transfer; our accelerator
+  exposes the alloc/map + submit + completion-stamp + IOSurface-sharing
+  boundary over our own protocol, not Apple's IOGPU user client.
+- **Compositor/present.** WindowServer composites into IOSurfaces and presents
+  through a display pipe. Our ported IOGPU stack already runs Metal compositing
+  through its IOSurface display pipe (type-4 adapter), and we already have the
+  framebuffer/display kext; stage 3's display work is making the accelerator and
+  the framebuffer agree on the IOSurface scanout (flip, else copy).
+- **Load policy.** Loading an unsigned bundle into WindowServer, the Metal
+  compiler helpers and sandboxed apps needs relaxed library validation — a
+  guest boot-policy step we control (OpenCore/boot-args), not a code concern.
+
 ## Open
 
-- **Stage 3 bundle placement:** how our user-space Metal bundle reaches the
-  guest's `/Library/GPUBundles`, which OpenCore can't write, and whether
-  WindowServer, sandboxed apps and `MTLCompilerService` load it (library
-  validation).
+- **Stage 3 bundle placement — RESOLVED in principle:** the bundle sits in
+  `/Library/GPUBundles` and our accelerator kext's personality carries
+  `MetalPluginName`/`MetalPluginClassName`. Open: the exact IOGPU accelerator
+  user-client ABI our kext exposes, and the library-validation boot state —
+  both settled by a guest experiment, not desk work.
 - **IOSurface details:** whether the device-cache sync runs on every CPU
   access path and on unlock (window buffers wrapped no-copy are written
   without a lock); whether IOGPU accepts a device cache that holds a host
