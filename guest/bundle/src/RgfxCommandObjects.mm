@@ -39,6 +39,7 @@
 #include "RgfxObjectModel.hpp"
 #include "RgfxRegion.hpp"
 #include "RgfxReplyReader.hpp"
+#include "RgfxRetirement.hpp"
 #include "RgfxRingWriter.hpp"
 #include "RgfxSerializer.hpp"
 #include "reims_graphics_wire.h"
@@ -423,6 +424,9 @@ uint32_t fillRenderPass(MTLRenderPassDescriptor *d, RgfxRenderPassDesc *desc,
 	// A buffer too large for its ring: the region block its message lies in until it completes.
 	RgfxRegion *_bodyRegion;
 	uint64_t _bodyOffset;
+	// The process's retirement ticket a buffer that will complete holds from its commit to its
+	// completion (RgfxRetirement), 0 for none: objects let go meanwhile stay on the host.
+	std::atomic<uint64_t> _ticket;
 	// The IOSurface copies this buffer writes, written back to their surfaces' pages
 	// when it completes (RgfxIOSurface.h).
 	std::vector<std::shared_ptr<void>> _surfaceWrites;
@@ -455,8 +459,11 @@ uint32_t fillRenderPass(MTLRenderPassDescriptor *d, RgfxRenderPassDesc *desc,
 	// (its reader went first) is left here.
 	if (_done != nil && !_left.exchange(true))
 		dispatch_group_leave(_done);
-	// A buffer never committed, or whose completion never came, gives its slot back.
+	// A buffer never committed, or whose completion never came, gives its slot back, and its
+	// ticket.
 	[self rgfxGiveSlotBack];
+	if (uint64_t ticket = _ticket.exchange(0))
+		RgfxRetirement::process().end(ticket);
 	delete _encoder;
 }
 
@@ -562,6 +569,8 @@ uint32_t fillRenderPass(MTLRenderPassDescriptor *d, RgfxRenderPassDesc *desc,
 	std::function<void(uint64_t)> expect;
 	std::function<void()> whileWaiting;
 	if (_reader != nullptr) {
+		// Before the host can see it: an object let go from now on outlives it on the host.
+		_ticket.store(RgfxRetirement::process().begin());
 		_readerHold = [queue sharedReplyReader];
 		_done = dispatch_group_create();
 		dispatch_group_enter(_done);
@@ -656,6 +665,10 @@ uint32_t fillRenderPass(MTLRenderPassDescriptor *d, RgfxRenderPassDesc *desc,
 	t_delivering--;
 	if (_done != nil && !_left.exchange(true))
 		dispatch_group_leave(_done);
+	// The objects let go while it ran may go from the host now, after its handlers, which
+	// may still name them.
+	if (uint64_t ticket = _ticket.exchange(0))
+		RgfxRetirement::process().end(ticket);
 }
 
 - (BOOL)rgfxFinished

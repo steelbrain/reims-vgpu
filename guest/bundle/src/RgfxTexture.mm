@@ -4,6 +4,7 @@
 
 #import "RgfxTexture.h"
 
+#include "RgfxRetirement.hpp"
 #include "RgfxSerializer.hpp" // RgfxSerializer, RgfxTextureDescriptor (wire)
 
 namespace {
@@ -80,9 +81,17 @@ RgfxTextureDescriptor rgfxTextureDescriptorFromMTL(MTLTextureDescriptor *d)
 
 - (void)dealloc
 {
-	// The id goes back to the process's chunks, for its next texture.
-	if (_serializer != nullptr) {
-		_serializer->releaseResourceId(_resourceId);
+	// The host drops the texture once every command buffer in flight now has completed (one
+	// may still name it), then its id goes back to the process's chunks, so a texture made
+	// with the id later is created on ring 0 after this one's destroy.
+	RgfxSerializer *serializer = _serializer;
+	if (serializer != nullptr) {
+		uint64_t objId = [self rgfxObjId];
+		uint64_t resourceId = _resourceId;
+		RgfxRetirement::process().retire([serializer, objId, resourceId] {
+			serializer->destroy(objId);
+			serializer->releaseResourceId(resourceId);
+		});
 	}
 }
 

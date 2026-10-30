@@ -10,6 +10,11 @@
 //                       off the main thread, once each, in commit order, the buffer filled by the
 //                       last; then 2 s idle, in which the process must use under 20 ms of CPU (the
 //                       completion thread sleeps in the kext)
+//   tex_probe churn N   N times: a new 64 x 64 Private texture, one command buffer copying a
+//                       pattern of its own through it, committed, and the texture let go before
+//                       the buffer completes; each buffer must complete with its own bytes back
+//                       (its texture outlives it on the host), and N past the device's 16320
+//                       resource ids needs each texture's id back once it is gone
 //   tex_probe big N     one command buffer of N fills, each 4 bytes of a Shared buffer with its
 //                       own value, far larger than its queue's ring for large N, waited for by its
 //                       handler alone: every word must hold its fill
@@ -213,6 +218,81 @@ static int handlers_in_order(id<MTLDevice> device, id<MTLCommandQueue> queue, lo
 	return 0;
 }
 
+// `n` textures, each let go right after the command buffer that copies through it is committed.
+static int churn(id<MTLDevice> device, id<MTLCommandQueue> queue, long n)
+{
+	const NSUInteger side = 64, row = side * 4, size = row * side;
+	id<MTLBuffer> src = [device newBufferWithLength:size options:MTLResourceStorageModeShared];
+	id<MTLBuffer> dst = [device newBufferWithLength:size options:MTLResourceStorageModeShared];
+	if (src == nil || dst == nil)
+		return fail("no Shared buffer");
+	MTLTextureDescriptor *d =
+	    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+	                                                       width:side
+	                                                      height:side
+	                                                   mipmapped:NO];
+	d.storageMode = MTLStorageModePrivate;
+	d.usage = MTLTextureUsageShaderRead;
+	double start = now_ms();
+	long bad = 0, failed = 0, noTexture = 0;
+	for (long i = 0; i < n; i++) {
+		struct watch *w = watch_start("a churn command buffer");
+		memset([src contents], (int)(i * 13 + 5), size);
+		memset([dst contents], 0, size);
+		dispatch_semaphore_t done = dispatch_semaphore_create(0);
+		__block MTLCommandBufferStatus status = MTLCommandBufferStatusNotEnqueued;
+		@autoreleasepool {
+			id<MTLTexture> tex = [device newTextureWithDescriptor:d];
+			if (tex == nil) {
+				noTexture++;
+				atomic_store(&w->done, 1);
+				continue;
+			}
+			id<MTLCommandBuffer> cb = [queue commandBuffer];
+			id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+			[blit copyFromBuffer:src
+			           sourceOffset:0
+			      sourceBytesPerRow:row
+			    sourceBytesPerImage:size
+			             sourceSize:MTLSizeMake(side, side, 1)
+			              toTexture:tex
+			       destinationSlice:0
+			       destinationLevel:0
+			      destinationOrigin:MTLOriginMake(0, 0, 0)];
+			[blit copyFromTexture:tex
+			                 sourceSlice:0
+			                 sourceLevel:0
+			                sourceOrigin:MTLOriginMake(0, 0, 0)
+			                  sourceSize:MTLSizeMake(side, side, 1)
+			                    toBuffer:dst
+			           destinationOffset:0
+			      destinationBytesPerRow:row
+			    destinationBytesPerImage:size];
+			[blit endEncoding];
+			[cb addCompletedHandler:^(id<MTLCommandBuffer> b) {
+				status = b.status;
+				dispatch_semaphore_signal(done);
+			}];
+			[cb commit];
+		} // the texture goes now, while its buffer is in flight
+		dispatch_semaphore_wait(done, DISPATCH_TIME_FOREVER);
+		atomic_store(&w->done, 1);
+		if (status != MTLCommandBufferStatusCompleted)
+			failed++;
+		else if (memcmp([src contents], [dst contents], size) != 0)
+			bad++;
+	}
+	printf("churn: %ld textures in %.0f ms, failed=%ld, wrong bytes=%ld, no texture=%ld\n", n,
+	       now_ms() - start, failed, bad, noTexture);
+	if (noTexture)
+		return fail("a texture could not be made: an id never came back");
+	if (failed)
+		return fail("a command buffer failed: its texture went before it ran");
+	if (bad)
+		return fail("a copy came back wrong");
+	return 0;
+}
+
 // One command buffer of `n` 4-byte fills, each of its own value, waited for by its handler.
 static int one_big_buffer(id<MTLDevice> device, id<MTLCommandQueue> queue, long n)
 {
@@ -255,10 +335,12 @@ int main(int argc, char **argv)
 	@autoreleasepool {
 		int handler = argc >= 2 && strcmp(argv[1], "handler") == 0;
 		int big = argc >= 2 && strcmp(argv[1], "big") == 0;
+		int churning = argc >= 2 && strcmp(argv[1], "churn") == 0;
 		if (argc < 2 ||
-		    (strcmp(argv[1], "copy") != 0 && strcmp(argv[1], "hold") != 0 && !handler && !big) ||
+		    (strcmp(argv[1], "copy") != 0 && strcmp(argv[1], "hold") != 0 && !handler && !big &&
+		     !churning) ||
 		    (strcmp(argv[1], "copy") != 0 && argc < 3)) {
-			fprintf(stderr, "usage: tex_probe copy | hold N | handler N | big N\n");
+			fprintf(stderr, "usage: tex_probe copy | hold N | handler N | big N | churn N\n");
 			return 2;
 		}
 		id<MTLDevice> device = MTLCreateSystemDefaultDevice();
@@ -307,8 +389,9 @@ int main(int argc, char **argv)
 			if ((long)held.count < n && held.count > 0)
 				[held removeLastObject];
 		}
-		if (big) {
-			int r = one_big_buffer(device, queue, strtol(argv[2], NULL, 10));
+		if (big || churning) {
+			long n = strtol(argv[2], NULL, 10);
+			int r = big ? one_big_buffer(device, queue, n) : churn(device, queue, n);
 			if (r != 0)
 				return r;
 			printf("TEX OK\n");

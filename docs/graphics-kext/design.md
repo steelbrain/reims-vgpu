@@ -286,7 +286,14 @@ posting the grant (`RESOURCE_ID_CHUNK`: context, chunk) on the control ring
 before it returns, so the host has it before any create naming its ids. The
 bundle keeps each chunk's free ids in one 64-bit mask, takes the lowest free id
 of the first chunk taken that has one, asks for a chunk only when all of its are
-in use, and gives an id back as its texture goes. A process keeps its chunks
+in use, and gives an id back as its texture goes. A texture goes from the host
+too: its dealloc posts its `OBJECT_DESTROY` once every command buffer the
+process had in flight then has completed. Those ride their queues' own rings and
+may name it, and Metal keeps an in-flight buffer's resources alive. Only then is
+its id given back, so a later create with the id follows the destroy on ring 0.
+The host names an IOSurface by every live texture over its plane 0, and shows
+the latest. A present holds its own reference to the texture it shows, so a
+destroy after the present leaves the window's frame drawable. A process keeps its chunks
 until its close. With every chunk held, a texture create answers nil, as Metal
 answers a texture it cannot make. The host carries out a texture create only
 where its id lies in a chunk of its own context (by the object id's context);

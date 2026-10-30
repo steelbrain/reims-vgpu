@@ -50,6 +50,7 @@
 
 #include "RgfxCompletionThread.hpp"
 #include "RgfxObjectModel.hpp"
+#include "RgfxRetirement.hpp"
 #include "RgfxRegion.hpp"
 #include "RgfxReplyReader.hpp"
 #include "RgfxRingWriter.hpp"
@@ -288,6 +289,8 @@ void test_shared_event_routing()
 void test_texture_routing()
 {
 	Fixture fx;
+	// Drained while fx lives: a texture's dealloc posts its destroy through fx.
+	@autoreleasepool {
 
 	MTLTextureDescriptor *desc =
 	    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
@@ -330,6 +333,7 @@ void test_texture_routing()
 	CHECK(msg.desc.width == 1920 && msg.desc.height == 1080);
 	CHECK(msg.desc.usage == (uint32_t)(MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead));
 	CHECK(msg.desc.options == (uint32_t)desc.resourceOptions);
+	}
 }
 
 // One chunk of texture resource ids (ids 1 + 4 * 64 to 64 + 4 * 64), as the kext would hand
@@ -349,6 +353,8 @@ bool oneChunk(void *context, uint64_t *first_id)
 void test_texture_resource_ids()
 {
 	Fixture fx;
+	// Drained while fx lives: a texture's dealloc posts its destroy through fx.
+	@autoreleasepool {
 	int calls = 0;
 	fx.ids.setResourceIdSource(&oneChunk, &calls);
 	MTLTextureDescriptor *desc =
@@ -359,15 +365,18 @@ void test_texture_resource_ids()
 	const uint64_t first = 1 + 4 * RGFX_RESOURCE_ID_CHUNK;
 	NSMutableArray<RgfxTexture *> *held = [NSMutableArray array];
 	for (uint64_t i = 0; i < RGFX_RESOURCE_ID_CHUNK; i++) {
-		RgfxTexture *tex = [RgfxTexture textureWithDescriptor:desc
-		                                                 heap:RGFX_OBJ_NONE
-		                                           heapOffset:0
-		                                               device:nil
-		                                           serializer:&fx.ser];
-		CHECK(tex != nil && [tex gpuResourceID]._impl == first + i);
-		auto msg = expectMessage<RgfxTextureCreate>(fx.ring, RGFX_CMD_TEXTURE_CREATE);
-		CHECK(msg.resource_id == first + i);
-		[held addObject:tex];
+		// Each texture's autoreleased return drains here, so `held` alone keeps it.
+		@autoreleasepool {
+			RgfxTexture *tex = [RgfxTexture textureWithDescriptor:desc
+			                                                 heap:RGFX_OBJ_NONE
+			                                           heapOffset:0
+			                                               device:nil
+			                                           serializer:&fx.ser];
+			CHECK(tex != nil && [tex gpuResourceID]._impl == first + i);
+			auto msg = expectMessage<RgfxTextureCreate>(fx.ring, RGFX_CMD_TEXTURE_CREATE);
+			CHECK(msg.resource_id == first + i);
+			[held addObject:tex];
+		}
 	}
 	CHECK(calls == 1);
 	RgfxTexture *none = [RgfxTexture textureWithDescriptor:desc
@@ -379,10 +388,15 @@ void test_texture_resource_ids()
 	RgfxMsgHeader h = {};
 	std::vector<uint8_t> bytes;
 	CHECK(!fx.ring.next(&h, &bytes));
-	// The texture holding id first + 10 goes; the next texture takes its id.
+	// The texture holding id first + 10 goes: the host drops it (no command buffer is in
+	// flight), then the next texture takes its id, after the destroy on the ring.
+	uint64_t goneObjId = 0;
 	@autoreleasepool {
+		goneObjId = held[10].rgfxObjId;
 		[held removeObjectAtIndex:10];
 	}
+	auto gone = expectMessage<RgfxObjectDestroy>(fx.ring, RGFX_CMD_OBJECT_DESTROY);
+	CHECK(gone.obj_id == goneObjId);
 	RgfxTexture *again = [RgfxTexture textureWithDescriptor:desc
 	                                                   heap:RGFX_OBJ_NONE
 	                                             heapOffset:0
@@ -391,6 +405,7 @@ void test_texture_resource_ids()
 	CHECK(again != nil && [again gpuResourceID]._impl == first + 10);
 	auto msg = expectMessage<RgfxTextureCreate>(fx.ring, RGFX_CMD_TEXTURE_CREATE);
 	CHECK(msg.resource_id == first + 10 && msg.obj_id == again.rgfxObjId);
+	}
 }
 
 // A sampler wrapper's create routes an RGFX_CMD_SAMPLER_CREATE, mapping every
@@ -478,6 +493,8 @@ void test_depth_stencil_routing()
 void test_heap_routing_and_suballoc()
 {
 	Fixture fx;
+	// Drained while fx lives: a texture's dealloc posts its destroy through fx.
+	@autoreleasepool {
 
 	MTLHeapDescriptor *hd = [[MTLHeapDescriptor alloc] init];
 	hd.size = 0x100000;
@@ -527,6 +544,7 @@ void test_heap_routing_and_suballoc()
 	// The offset-less (Automatic-placement) variants are nil stubs this slice.
 	CHECK([heap newBufferWithLength:0x100 options:MTLResourceStorageModePrivate] == nil);
 	CHECK([heap newTextureWithDescriptor:td] == nil);
+	}
 }
 
 // A wrapper with no serialiser route cannot be created (each resource must reach
@@ -1941,6 +1959,9 @@ void test_command_buffer_out_of_line()
 	CHECK(f.submit.next(&h, &bytes));
 	CHECK(h.type == RGFX_CMD_COMMAND_BUFFER);
 	CHECK(blocks.allocated.empty());
+	RgfxCbComplete smallDone = cbComplete(h.seqno, ((RgfxResource *)small).rgfxObjId);
+	CHECK(f.completion.postFromHost(&smallDone, sizeof(smallDone)));
+	[small waitUntilCompleted];
 
 	// 200 fills: far past half the ring.
 	id<MTLCommandBuffer> cb = [f.queue commandBuffer];
@@ -2016,6 +2037,7 @@ struct ExpectAtDoorbell {
 	RgfxReplyReader *reader = nullptr;
 	int rung = 0;
 	bool awaited = false;
+	uint64_t seqno = 0;
 	static void ring(void *c, uint32_t)
 	{
 		ExpectAtDoorbell *e = static_cast<ExpectAtDoorbell *>(c);
@@ -2023,6 +2045,7 @@ struct ExpectAtDoorbell {
 		std::vector<uint8_t> bytes;
 		if (e->submit->next(&h, &bytes)) {
 			e->rung++;
+			e->seqno = h.seqno;
 			e->awaited = e->reader->awaitingCompletion(h.seqno);
 		}
 	}
@@ -2040,6 +2063,9 @@ void test_completion_expected_before_publish()
 	CHECK(e.rung == 1);
 	CHECK(e.awaited);
 	CHECK(cb.status == MTLCommandBufferStatusCommitted);
+	RgfxCbComplete done = cbComplete(e.seqno, ((RgfxResource *)cb).rgfxObjId);
+	CHECK(f.completion.postFromHost(&done, sizeof(done)));
+	[cb waitUntilCompleted];
 	}
 }
 
@@ -2064,7 +2090,7 @@ void test_command_buffer_back_pressure()
 	[a commit];
 	uint64_t sa = f.nextSeqno();
 	[b commit];
-	(void)f.nextSeqno();
+	uint64_t sb = f.nextSeqno();
 
 	// A third waits for a's completion, posted 50 ms from now.
 	RgfxCommandQueue *queue = f.queue;
@@ -2095,6 +2121,9 @@ void test_command_buffer_back_pressure()
 		fourth = [f.queue commandBuffer]; // did not block
 	}
 	CHECK(fourth != nil);
+	RgfxCbComplete bDone = cbComplete(sb, ((RgfxResource *)b).rgfxObjId);
+	hostPost(f.completion, *kext, &bDone, sizeof(bDone));
+	[b waitUntilCompleted];
 	kext->close();
 	CHECK(eventually([&] { return !thread.running(); }));
 
@@ -2115,16 +2144,117 @@ void test_command_buffer_back_pressure()
 	}
 }
 
+// A release waits for every command buffer begun before it, and runs at once with none in
+// flight; one begun after it does not hold it; releases run in the order retired.
+void test_retirement()
+{
+	RgfxRetirement r;
+	std::vector<int> ran;
+	r.retire([&] { ran.push_back(0); });
+	CHECK(ran == std::vector<int>({0}));
+	uint64_t a = r.begin();
+	uint64_t b = r.begin();
+	r.retire([&] { ran.push_back(1); });
+	uint64_t c = r.begin(); // after the release: does not hold it
+	r.retire([&] { ran.push_back(2); });
+	CHECK(r.waiting() == 2);
+	r.end(b);
+	CHECK(ran.size() == 1);
+	r.end(a);
+	CHECK(ran == std::vector<int>({0, 1})); // 2 waits for c
+	r.end(c);
+	CHECK(ran == std::vector<int>({0, 1, 2}));
+	CHECK(r.waiting() == 0);
+}
+
+// A texture let go while a command buffer is in flight stays on the host until the buffer
+// completes: its OBJECT_DESTROY comes after the buffer's handlers, and its resource id goes
+// to the next texture only after that.
+void test_texture_destroy_waits_for_buffers()
+{
+	// Nothing left in flight by earlier tests.
+	CHECK(RgfxRetirement::process().waiting() == 0 && RgfxRetirement::process().live() == 0);
+	@autoreleasepool {
+	QueueFixture f;
+	(void)expectMessage<RgfxQueueCreate>(f.control, RGFX_CMD_QUEUE_CREATE);
+	int calls = 0;
+	f.ids.setResourceIdSource(&oneChunk, &calls);
+	MTLTextureDescriptor *desc =
+	    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+	                                                       width:8
+	                                                      height:8
+	                                                   mipmapped:NO];
+	uint64_t texObjId = 0, texResourceId = 0;
+	id<MTLCommandBuffer> cb = [f.queue commandBuffer];
+	@autoreleasepool {
+		RgfxTexture *tex = [RgfxTexture textureWithDescriptor:desc
+		                                                 heap:RGFX_OBJ_NONE
+		                                           heapOffset:0
+		                                               device:nil
+		                                           serializer:&f.ser];
+		CHECK(tex != nil);
+		texObjId = tex.rgfxObjId;
+		texResourceId = [tex gpuResourceID]._impl;
+		(void)expectMessage<RgfxTextureCreate>(f.control, RGFX_CMD_TEXTURE_CREATE);
+		id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+		[blit generateMipmapsForTexture:tex];
+		[blit endEncoding];
+		[cb commit];
+	} // the app lets the texture go while the buffer is in flight
+	RgfxMsgHeader h = {};
+	std::vector<uint8_t> bytes;
+	CHECK(!f.control.next(&h, &bytes)); // no destroy yet
+	CHECK(RgfxRetirement::process().waiting() == 1);
+	// A texture made meanwhile gets another id: the first's is still the host's.
+	@autoreleasepool {
+		RgfxTexture *other = [RgfxTexture textureWithDescriptor:desc
+		                                                   heap:RGFX_OBJ_NONE
+		                                             heapOffset:0
+		                                                 device:nil
+		                                             serializer:&f.ser];
+		CHECK(other != nil && [other gpuResourceID]._impl != texResourceId);
+		(void)expectMessage<RgfxTextureCreate>(f.control, RGFX_CMD_TEXTURE_CREATE);
+	}
+	CHECK(RgfxRetirement::process().waiting() == 2);
+
+	__block bool destroyedBeforeHandler = true;
+	TestRing *control = &f.control;
+	[cb addCompletedHandler:^(id<MTLCommandBuffer> d) {
+		(void)d;
+		RgfxMsgHeader hh = {};
+		std::vector<uint8_t> bb;
+		destroyedBeforeHandler = control->next(&hh, &bb);
+	}];
+	RgfxCbComplete done = cbComplete(f.nextSeqno(), ((RgfxResource *)cb).rgfxObjId);
+	CHECK(f.completion.postFromHost(&done, sizeof(done)));
+	[cb waitUntilCompleted];
+	CHECK(!destroyedBeforeHandler);
+	auto gone = expectMessage<RgfxObjectDestroy>(f.control, RGFX_CMD_OBJECT_DESTROY);
+	CHECK(gone.obj_id == texObjId);
+	(void)expectMessage<RgfxObjectDestroy>(f.control, RGFX_CMD_OBJECT_DESTROY); // `other`'s
+	CHECK(RgfxRetirement::process().waiting() == 0);
+	}
+}
+
 // A buffer whose completion never comes, released with its queue and reader, ends
 // nothing (its completion group is left at dealloc).
 void test_uncompleted_buffer_releases()
 {
 	@autoreleasepool {
 		QueueFixture f;
-		id<MTLCommandBuffer> cb = [f.queue commandBuffer];
-		[cb commit];
-		(void)f.nextSeqno();
-		CHECK(cb.status == MTLCommandBufferStatusCommitted);
+		{
+			RgfxReplyReader reader(f.completion.base(), f.completion.dataSize);
+			f.queue.replyReader = &reader;
+			@autoreleasepool {
+				id<MTLCommandBuffer> cb = [f.queue commandBuffer];
+				[cb commit];
+				(void)f.nextSeqno();
+				CHECK(cb.status == MTLCommandBufferStatusCommitted);
+			}
+			CHECK(RgfxRetirement::process().live() == 1);
+			f.queue.replyReader = nullptr;
+		} // the reader goes, and with it its handler, the buffer's last hold
+		CHECK(RgfxRetirement::process().live() == 0); // its ticket ended at its dealloc
 	}
 }
 
@@ -2165,6 +2295,8 @@ int main()
 		test_command_buffer_out_of_line();
 		test_completion_expected_before_publish();
 		test_command_buffer_back_pressure();
+		test_retirement();
+		test_texture_destroy_waits_for_buffers();
 	}
 	std::printf("shell_tests: OK (%d checks)\n", g_checks);
 	return 0;

@@ -150,6 +150,8 @@ template <typename T> T expectMessage(TestRing &ring, uint32_t type)
 	RgfxMsgHeader h = {};
 	std::vector<uint8_t> bytes;
 	CHECK(ring.next(&h, &bytes));
+	if (h.type != type)
+		std::fprintf(stderr, "expectMessage: type 0x%x, expected 0x%x\n", h.type, type);
 	CHECK(h.type == type);
 	CHECK(h.size == sizeof(T));
 	CHECK(bytes.size() == sizeof(T));

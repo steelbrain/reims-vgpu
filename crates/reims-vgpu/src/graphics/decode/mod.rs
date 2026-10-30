@@ -150,10 +150,12 @@ pub struct GraphicsDecoder<P: Platform> {
     /// builders ([`Platform::texture_descriptor`]) some per-device creates need.
     platform: Arc<P>,
     objects: HashMap<u64, ObjHandle<P>>,
-    /// The texture over each IOSurface's plane 0, by the surface's global id:
-    /// the latest `TEXTURE_FROM_IOSURFACE` naming the surface, until that
-    /// texture's destroy. A present names its surface by that id.
-    surfaces: HashMap<u32, u64>,
+    /// The textures over each IOSurface's plane 0, by the surface's global id:
+    /// every `TEXTURE_FROM_IOSURFACE` naming the surface whose texture the table
+    /// holds, in the order made, so a destroy of one leaves the others (another
+    /// process's, or an older one's) to name the surface. A present names its
+    /// surface by that id and shows the latest.
+    surfaces: HashMap<u32, Vec<u64>>,
     /// The bytes of each library whose `LIBRARY_FROM_REGION` chunks have not yet
     /// reached its length, by the library's id.
     library_chunks: HashMap<u64, Vec<u8>>,
@@ -257,13 +259,22 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// The texture over plane 0 of the IOSurface whose global id is
     /// `iosurface_id`: the latest one a guest process made with
     /// `TEXTURE_FROM_IOSURFACE` and has not destroyed. Its pixels are what that
-    /// process's command buffers wrote, as of their completion.
+    /// process's command buffers wrote, as of their completion. The caller holds
+    /// its own reference: a destroy of the texture after this leaves it drawable.
     #[allow(dead_code)] // the present path reads it
     pub(crate) fn surface_texture(&self, iosurface_id: u32) -> Option<P::Texture> {
-        match self.objects.get(self.surfaces.get(&iosurface_id)?) {
+        match self.objects.get(self.surfaces.get(&iosurface_id)?.last()?) {
             Some(ObjHandle::Texture(texture)) => Some(texture.clone_ref()),
             _ => None,
         }
+    }
+
+    /// Forgets texture `obj_id` as a name of the surfaces it lies over.
+    fn forget_surface_texture(&mut self, obj_id: u64) {
+        self.surfaces.retain(|_, textures| {
+            textures.retain(|t| *t != obj_id);
+            !textures.is_empty()
+        });
     }
 
     /// Forgets the surface names of textures the table no longer holds: a caller
@@ -272,8 +283,10 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// never taken for the surface's texture.
     pub(crate) fn forget_dropped_surfaces(&mut self) {
         let objects = &self.objects;
-        self.surfaces
-            .retain(|_, texture| matches!(objects.get(texture), Some(ObjHandle::Texture(_))));
+        self.surfaces.retain(|_, textures| {
+            textures.retain(|t| matches!(objects.get(t), Some(ObjHandle::Texture(_))));
+            !textures.is_empty()
+        });
     }
 
     /// Drops every object of context `context`: those whose id lies in its range,
@@ -343,7 +356,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                 // the host never made (a create that the platform refused).
                 self.forget_library(m.obj_id);
                 if matches!(self.objects.remove(&m.obj_id), Some(ObjHandle::Texture(_))) {
-                    self.surfaces.retain(|_, texture| *texture != m.obj_id);
+                    self.forget_surface_texture(m.obj_id);
                 }
                 Ok(Ok(()))
             }
@@ -646,8 +659,13 @@ impl<P: Platform> GraphicsDecoder<P> {
                 };
                 match made {
                     Some(texture) => {
+                        // An id made again names only its new texture's surface.
+                        self.forget_surface_texture(m.obj_id);
                         if m.plane == 0 {
-                            self.surfaces.insert(m.iosurface_id, m.obj_id);
+                            self.surfaces
+                                .entry(m.iosurface_id)
+                                .or_default()
+                                .push(m.obj_id);
                         }
                         self.insert(m.obj_id, ObjHandle::Texture(texture))
                     }
@@ -1777,6 +1795,31 @@ mod tests {
             Ok(())
         );
         assert!(dec.surface_texture(0x77).is_some());
+        // Another texture over the surface (another process's, say) is the one shown. A
+        // present holds its own reference: its destroy leaves that reference drawable, and
+        // the surface named by the older texture until that one goes too.
+        let first = format!("{:?}", dec.surface_texture(0x77).unwrap());
+        let second = RgfxTextureFromIOSurface {
+            obj_id: 33,
+            ..tex_from_surface
+        };
+        assert_eq!(dec.decode(&device, second.as_bytes()).unwrap(), Ok(()));
+        let shown = dec.surface_texture(0x77).unwrap();
+        assert_ne!(format!("{shown:?}"), first);
+        let destroy_second = RgfxObjectDestroy {
+            obj_id: 33,
+            ..destroy_plane1
+        };
+        assert_eq!(
+            dec.decode(&device, destroy_second.as_bytes()).unwrap(),
+            Ok(())
+        );
+        assert_eq!(format!("{:?}", dec.surface_texture(0x77).unwrap()), first);
+        assert_eq!(
+            reims_vgpu_core::platform::resource::Texture::width(&shown),
+            64
+        );
+        drop(shown);
         let destroy_surface = RgfxObjectDestroy {
             obj_id: 30,
             ..destroy_plane1
@@ -1786,6 +1829,29 @@ mod tests {
             Ok(())
         );
         assert!(dec.surface_texture(0x77).is_none());
+        // An id made again over another surface names only that one.
+        let again = RgfxTextureFromIOSurface {
+            obj_id: 34,
+            ..tex_from_surface
+        };
+        assert_eq!(dec.decode(&device, again.as_bytes()).unwrap(), Ok(()));
+        let moved = RgfxTextureFromIOSurface {
+            obj_id: 34,
+            iosurface_id: 0x78,
+            ..tex_from_surface
+        };
+        assert_eq!(dec.decode(&device, moved.as_bytes()).unwrap(), Ok(()));
+        assert!(dec.surface_texture(0x77).is_none());
+        assert!(dec.surface_texture(0x78).is_some());
+        let destroy_moved = RgfxObjectDestroy {
+            obj_id: 34,
+            ..destroy_plane1
+        };
+        assert_eq!(
+            dec.decode(&device, destroy_moved.as_bytes()).unwrap(),
+            Ok(())
+        );
+        assert!(dec.surface_texture(0x78).is_none());
         // Over a buffer the host never made: a bad reference, and no name.
         let bad_surface = RgfxTextureFromIOSurface {
             obj_id: 32,
