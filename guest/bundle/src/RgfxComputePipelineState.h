@@ -66,6 +66,10 @@ NS_ASSUME_NONNULL_BEGIN
 /// create; a unit test calls it directly before feeding the reply.
 - (void)rgfxRegisterWithReplyReader:(RgfxReplyReader *)reader;
 
+/// Whether the host answered the create with a refusal (RGFX_PIPELINE_REFUSED): it made no
+/// pipeline, so the device's creators answer nil and an NSError, as Metal's do.
+@property(nonatomic, readonly) BOOL rgfxRefused;
+
 @end
 
 NS_ASSUME_NONNULL_END

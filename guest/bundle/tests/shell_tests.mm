@@ -1478,6 +1478,29 @@ void test_reply_reader_reflection()
 	CHECK([ps staticThreadgroupMemoryLength] == 2048);
 	CHECK(ps.gpuResourceID._impl == 0xABCDEF);
 	CHECK(!reader.awaitingReflection(ps.rgfxSeqno)); // one-shot removed
+	CHECK(![ps rgfxRefused]);
+
+	// A refused create: the state reports the refusal, which the device's creators answer as
+	// nil and an NSError.
+	RgfxComputePipelineState *refusedPs =
+	    [RgfxComputePipelineState computePipelineStateWithFunction:cfn
+	                                                        device:nil
+	                                                    serializer:&fx.ser
+	                                                         error:&err];
+	CHECK(refusedPs != nil);
+	(void)nextMessage(fx.ring, RGFX_CMD_COMPUTE_PIPELINE_CREATE);
+	[refusedPs rgfxRegisterWithReplyReader:&reader];
+	CHECK(![refusedPs rgfxRefused]);
+	RgfxPipelineReflection no = {};
+	no.header.type = RGFX_EVT_PIPELINE_REFLECTION;
+	no.header.size = sizeof(no);
+	no.header.seqno = refusedPs.rgfxSeqno;
+	no.obj_id = refusedPs.rgfxObjId;
+	no.status = RGFX_PIPELINE_REFUSED;
+	no.kind = RGFX_PIPELINE_KIND_COMPUTE;
+	CHECK(completion.postFromHost(&no, sizeof(no)));
+	CHECK(reader.pump() == 1);
+	CHECK([refusedPs rgfxRefused]);
 }
 
 // A host event-signalled message the reader dispatches updates the shared-event value

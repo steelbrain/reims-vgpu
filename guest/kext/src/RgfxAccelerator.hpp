@@ -96,8 +96,10 @@ enum {
 	// Posts one object-lifecycle message on the control ring: struct in, the whole message
 	// (its header's type set; the kext stamps its size and seqno), a create or destroy of an
 	// object in the client's context (its obj_id, 16 bytes in, in the context's range), at most
-	// ReimsGraphics::kLifecycleMessageMax bytes; out: the seqno, and for a pipeline create, its
-	// reflection (RgfxPipelineReflection) as struct out, once the device has answered.
+	// ReimsGraphics::kLifecycleMessageMax bytes, naming only the client's own blocks of the region
+	// (RgfxRegionSpans.hpp); out: the seqno, and for a create the device answers (a pipeline's,
+	// a library's), its answer as struct out once the device has given it. A create not answered
+	// in time fails, and the kext destroys its object behind it.
 	kRgfxAccelMethodSubmit = 0x105,
 	// Gives the client's context a chunk of RGFX_RESOURCE_ID_CHUNK texture resource ids, from
 	// the guest's one pool of RGFX_RESOURCE_ID_CHUNKS: no input; out: the chunk's first id.

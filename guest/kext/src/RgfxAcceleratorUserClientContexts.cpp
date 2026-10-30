@@ -10,6 +10,7 @@
 
 #include "RgfxAcceleratorUserClient.hpp"
 #include "ReimsGraphics.hpp"
+#include "RgfxRegionSpans.hpp"
 
 #include <IOKit/IOLib.h>
 #include <IOKit/IOMemoryDescriptor.h>
@@ -174,6 +175,16 @@ IOReturn RgfxAcceleratorUserClient::submitMethod(IOExternalMethodArguments *a)
 	    (type <= RGFX_CMD_QUEUE_CREATE || type >= RGFX_CMD_CONTEXT_CLOSE ||
 	     (objId >> RGFX_CONTEXT_OBJ_ID_SHIFT) != context))
 		r = kIOReturnBadArgument;
+	// The region the message names lies in the client's own blocks: a process places its heaps,
+	// buffers and library chunks in no one else's memory, nor in the rings or the scanout.
+	RgfxRegionSpan spans[kRgfxMaxRegionSpans];
+	int spanCount = r == kIOReturnSuccess ? rgfxRegionSpans(type, message, size, spans) : 0;
+	if (spanCount < 0)
+		r = kIOReturnBadArgument;
+	for (int i = 0; i < spanCount && r == kIOReturnSuccess; i++) {
+		if (!owner->ownsRange(this, spans[i].offset, spans[i].length))
+			r = kIOReturnBadArgument;
+	}
 	// The answers the client waits for: a pipeline create's reflection, and a library create's
 	// or lookup's COMPLETE (a library's last region chunk is its create).
 	UInt32 replyType = 0;
@@ -189,6 +200,16 @@ IOReturn RgfxAcceleratorUserClient::submitMethod(IOExternalMethodArguments *a)
 		r = owner->postLifecycle(type, message, static_cast<UInt32>(size), replyType, reply,
 		                         sizeof(reply), &replyLength, &seqno, kReflectionMs);
 	IOFree(message, size);
+	if (r == kIOReturnTimeout) {
+		// Posted, but not answered in time: the client takes the create as failed, and may make
+		// it again under a new id. Destroy this one, so the device keeps nothing of it: the
+		// destroy follows the create on the ring, and cancels it where it is still being made.
+		RgfxObjectDestroy destroy = {};
+		destroy.header.type = RGFX_CMD_OBJECT_DESTROY;
+		destroy.obj_id = objId;
+		owner->postLifecycle(RGFX_CMD_OBJECT_DESTROY, &destroy, sizeof(destroy), 0, nullptr, 0,
+		                     nullptr, nullptr, 0);
+	}
 	if (r != kIOReturnSuccess)
 		return r;
 	a->scalarOutput[0] = seqno;

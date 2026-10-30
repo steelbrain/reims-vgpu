@@ -32,8 +32,9 @@ use reims_graphics::region::Region;
 use reims_graphics::wire::{
     RGFX_CMD_COMMAND_BUFFER, RGFX_CMD_COMPUTE_PIPELINE_CREATE, RGFX_CMD_LIBRARY_CREATE,
     RGFX_CMD_LIBRARY_FROM_REGION, RGFX_CMD_LIBRARY_LOOKUP, RGFX_CMD_OBJECT_DESTROY,
-    RGFX_CMD_RENDER_PIPELINE_CREATE, RGFX_DEVICE_INFO_OFFSET, RGFX_STATUS_INVALID_ARGUMENT,
-    RGFX_STATUS_OK, RgfxCbComplete, RgfxLibraryLookup, RgfxMsgHeader, RgfxPipelineReflection,
+    RGFX_CMD_RENDER_PIPELINE_CREATE, RGFX_CONTEXT_OBJ_ID_SHIFT, RGFX_DEVICE_INFO_OFFSET,
+    RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK, RgfxCbComplete, RgfxLibraryLookup, RgfxMsgHeader,
+    RgfxPipelineReflection,
 };
 use reims_graphics::{
     CompletionPoster, CursorImage, FixedScreen, Host, Mode, PresentAnswer, Scanout, Screen,
@@ -50,8 +51,9 @@ use crate::error::Error;
 use crate::graphics::compile::{CompilePool, Pending};
 use crate::graphics::completion::cb_failed;
 use crate::graphics::decode::{
-    CompiledPipeline, CompletionSink, GraphicsDecoder, LibraryJob, LibraryStart, MadeLibrary,
-    PipelineJob, ReflectionSink, compile_pipeline, complete, make_library,
+    CompiledPipeline, CompletionSink, DecodeError, GraphicsDecoder, LibraryJob, LibraryStart,
+    MadeLibrary, PipelineJob, ReflectionSink, compile_pipeline, complete, make_library,
+    refused_reply,
 };
 use crate::graphics::device_info::device_info;
 use crate::platform::ApiPlatform;
@@ -403,11 +405,16 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                 let mut decoder = self.decoder.lock();
                 decoder.set_completion_sink(sink);
                 decoder.set_reflection_sink(reflection);
+                decoder.set_context(Some(sender_context(poster, message)));
                 if r#type == RGFX_CMD_OBJECT_DESTROY {
                     let (_, _, obj_id) = message_identity(message);
                     self.pending.cancel(obj_id);
                 }
-                decoder.decode(&self.device, message)
+                if foreign_queue(poster, message) {
+                    Ok(Err(DecodeError::BadReference))
+                } else {
+                    decoder.decode(&self.device, message)
+                }
             };
             match outcome {
                 Ok(Ok(())) => {}
@@ -437,7 +444,8 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     /// meanwhile; its reply goes through `poster` when the compile ends ([`Self::compile`]).
     fn start_pipeline(self: &Arc<Self>, poster: &CompletionPoster, message: &[u8]) {
         let prepared = entry::run(|_| {
-            let decoder = self.decoder.lock();
+            let mut decoder = self.decoder.lock();
+            decoder.set_context(Some(sender_context(poster, message)));
             let prepared = decoder.prepare_pipeline(message);
             if let Ok(job) = &prepared {
                 self.pending.begin(job.obj_id);
@@ -453,6 +461,10 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                     "a pipeline create (type {ty:#x}, seqno {seqno}, object {obj_id:#x}) was not \
                      carried out: {e:?}"
                 );
+                // Refused at its op, and answered at once: its process waits for the reply.
+                if let Some(refused) = refused_reply(message) {
+                    poster.post(refused.as_bytes());
+                }
                 return;
             }
         };
@@ -814,6 +826,29 @@ fn scanout_sink<P: ApiPlatform>(
 
 #[cfg(test)]
 mod tests;
+
+/// The context (the process) `message` came from: for a message off a queue's ring, the queue's;
+/// on ring 0, that of the object it creates or destroys, which the kext checked is the sender's.
+fn sender_context(poster: &CompletionPoster, message: &[u8]) -> u32 {
+    let obj_id = poster
+        .queue_obj_id()
+        .unwrap_or_else(|| message_identity(message).2);
+    (obj_id >> RGFX_CONTEXT_OBJ_ID_SHIFT) as u32
+}
+
+/// Whether `message` is a `COMMAND_BUFFER` off a queue's ring that names another queue to run on:
+/// a buffer runs on the queue whose ring carried it.
+fn foreign_queue(poster: &CompletionPoster, message: &[u8]) -> bool {
+    match (
+        poster.queue_obj_id(),
+        RgfxCommandBuffer::read_from_prefix(message),
+    ) {
+        (Some(queue), Ok((cb, _))) => {
+            cb.header.r#type == RGFX_CMD_COMMAND_BUFFER && cb.queue_obj_id != queue
+        }
+        _ => false,
+    }
+}
 
 /// A message's type and seqno (its header) and the object id that follows the header in every
 /// create, destroy and command buffer (0 where the message is shorter), for a refusal's log line.

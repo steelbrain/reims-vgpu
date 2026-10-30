@@ -1353,7 +1353,8 @@ fn a_pipeline_naming_a_pending_library_waits_for_it() {
 }
 
 /// An `OBJECT_DESTROY` of a library still being made keeps ring order: the pipeline created from
-/// it before the destroy compiles with it, and the library is not stored
+/// it before the destroy compiles with it, the one after is refused and answered at once, and the
+/// library is not stored
 #[test]
 fn a_destroy_of_a_pending_library_keeps_the_pipeline_before_it() {
     let raised = Arc::new(AtomicU32::new(0));
@@ -1376,6 +1377,10 @@ fn a_destroy_of_a_pending_library_keeps_the_pipeline_before_it() {
         .as_bytes()
         .to_vec(),
     );
+    let refused = next_event(&mut guest, RGFX_EVT_PIPELINE_REFLECTION);
+    let refused = RgfxPipelineReflection::read_from_bytes(&refused).unwrap();
+    assert_eq!(refused.obj_id, obj(1, 12));
+    assert_eq!(refused.status, RGFX_PIPELINE_REFUSED);
     next_event(&mut guest, RGFX_EVT_DISPLAYS);
     device.control.pool.release();
     let got = events(&mut guest, 2);
@@ -1386,9 +1391,139 @@ fn a_destroy_of_a_pending_library_keeps_the_pipeline_before_it() {
         .expect("the pipeline's reflection");
     assert_eq!(reflection.obj_id, obj(1, 11));
     assert_eq!(reflection.status, RGFX_PIPELINE_OK);
-    assert!(
-        guest.event().is_none(),
-        "the create after the destroy was answered"
-    );
+    assert!(guest.event().is_none());
     assert_eq!(device.decoder_object_count(), 1);
+}
+
+/// A pipeline create refused at its op is answered at once, refused, as its process waits for the
+/// reply: one naming another process's library, and one whose function name lies outside it
+#[test]
+fn a_pipeline_create_refused_at_its_op_is_answered_at_once() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, _platform) = headless_on(&raised);
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    make_library(&device, &mut guest, obj(1, 10));
+    // A function name past the message's end.
+    let mut malformed = compute_pipeline_create(obj(1, 12), obj(1, 10));
+    let (mut head, _) = RgfxComputePipelineCreate::read_from_prefix(&malformed).unwrap();
+    head.name_len = 0x1_0000;
+    malformed[..size_of::<RgfxComputePipelineCreate>()].copy_from_slice(head.as_bytes());
+    for (create, obj_id) in [
+        (compute_pipeline_create(obj(2, 11), obj(1, 10)), obj(2, 11)),
+        (render_pipeline_create(obj(2, 13), obj(1, 10)), obj(2, 13)),
+        (malformed, obj(1, 12)),
+    ] {
+        guest.send(&device, create);
+        let bytes = next_event(&mut guest, RGFX_EVT_PIPELINE_REFLECTION);
+        let reflection = RgfxPipelineReflection::read_from_bytes(&bytes).unwrap();
+        assert_eq!(reflection.header.seqno, guest.seqno);
+        assert_eq!(reflection.obj_id, obj_id);
+        assert_eq!(reflection.status, RGFX_PIPELINE_REFUSED);
+    }
+    // Only the library.
+    assert_eq!(device.decoder_object_count(), 1);
+}
+
+/// A process's command buffer names only its own objects, and runs only on the queue whose ring
+/// carried it: one naming another process's pipeline, and one naming another process's queue,
+/// each fail; a queue's ring carries nothing but command buffers; and the other process's objects
+/// are untouched
+#[test]
+fn a_command_buffer_names_only_its_own_process_s_objects() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform) = headless_on(&raised);
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    const SUBMIT_1: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET;
+    const COMPLETE_1: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x2_0000;
+    const SUBMIT_2: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x4_0000;
+    const COMPLETE_2: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x6_0000;
+    const RING_DATA: u32 = 0x1_0000;
+    for (context, submit, complete) in [(1, SUBMIT_1, COMPLETE_1), (2, SUBMIT_2, COMPLETE_2)] {
+        assert_eq!(
+            answered(
+                &device,
+                &mut guest,
+                queue_create(context, 1, submit, complete, RING_DATA, 0)
+            ),
+            RGFX_STATUS_OK
+        );
+    }
+    make_library(&device, &mut guest, obj(1, 10));
+    guest.send(&device, compute_pipeline_create(obj(1, 11), obj(1, 10)));
+    next_event(&mut guest, RGFX_EVT_PIPELINE_REFLECTION);
+
+    let mut ring = QueueRing::new(&device, SUBMIT_2, COMPLETE_2, u64::from(RING_DATA));
+    for (cb, message) in [
+        (100, compute_command_buffer(obj(2, 1), 100, obj(1, 11))),
+        (101, command_buffer(obj(1, 1), 101)),
+    ] {
+        ring.send(&device, message);
+        assert!(
+            complete_until_event(&platform, &ring),
+            "command buffer {cb} was not answered"
+        );
+        let done = RgfxCbComplete::read_from_bytes(&ring.event().unwrap()).unwrap();
+        assert_eq!(done.cb_obj_id, cb);
+        assert_ne!(done.status, RGFX_CB_OK, "command buffer {cb} ran");
+    }
+    // A queue's ring carries only command buffers: a destroy or a create on it, which would pass
+    // the kext by, is refused there. Process 2's own empty buffer behind them shows they were
+    // taken.
+    ring.send(&device, object_destroy(obj(1, 11)));
+    ring.send(&device, library_create(obj(2, 30)));
+    ring.send(&device, command_buffer(obj(2, 1), 103));
+    assert!(complete_until_event(&platform, &ring));
+    let done = RgfxCbComplete::read_from_bytes(&ring.event().unwrap()).unwrap();
+    assert_eq!((done.cb_obj_id, done.status), (103, RGFX_CB_OK));
+    assert_eq!(library_makes(&platform), 1);
+    // Process 1's own buffer on its own queue still runs with its pipeline.
+    let mut ring1 = QueueRing::new(&device, SUBMIT_1, COMPLETE_1, u64::from(RING_DATA));
+    ring1.send(&device, compute_command_buffer(obj(1, 1), 102, obj(1, 11)));
+    assert!(complete_until_event(&platform, &ring1));
+    let done = RgfxCbComplete::read_from_bytes(&ring1.event().unwrap()).unwrap();
+    assert_eq!((done.cb_obj_id, done.status), (102, RGFX_CB_OK));
+}
+
+/// A create the kext posted but whose answer it gave up on is destroyed right behind it, and the
+/// process makes it again under a new id: the device then holds the retry alone, though the
+/// first was still being made when its destroy came
+#[test]
+fn a_timed_out_create_s_destroy_leaves_only_the_retry() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform) = headless_on(&raised);
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    device.control.pool.hold();
+    guest.send(&device, library_create(obj(1, 10)));
+    guest.send(&device, object_destroy(obj(1, 10)));
+    guest.send(&device, library_create(obj(1, 11)));
+    let retry = guest.seqno;
+    device.control.pool.release();
+    let got = events(&mut guest, 2);
+    assert!(got.iter().all(|(r#type, _)| *r#type == RGFX_EVT_COMPLETE));
+    let retried = got
+        .iter()
+        .map(|(_, bytes)| RgfxComplete::read_from_bytes(bytes).unwrap())
+        .find(|c| c.header.seqno == retry)
+        .expect("the retry's answer");
+    assert_eq!(retried.status, RGFX_STATUS_OK);
+    assert_eq!(library_makes(&platform), 2);
+    assert_eq!(device.decoder_object_count(), 1);
+    // The retry's id names the library; the destroyed one's names nothing.
+    guest.send(&device, compute_pipeline_create(obj(1, 12), obj(1, 11)));
+    let ok = RgfxPipelineReflection::read_from_bytes(&next_event(
+        &mut guest,
+        RGFX_EVT_PIPELINE_REFLECTION,
+    ))
+    .unwrap();
+    assert_eq!(ok.status, RGFX_PIPELINE_OK);
+    guest.send(&device, compute_pipeline_create(obj(1, 13), obj(1, 10)));
+    let refused = RgfxPipelineReflection::read_from_bytes(&next_event(
+        &mut guest,
+        RGFX_EVT_PIPELINE_REFLECTION,
+    ))
+    .unwrap();
+    assert_eq!(refused.status, RGFX_PIPELINE_REFUSED);
 }

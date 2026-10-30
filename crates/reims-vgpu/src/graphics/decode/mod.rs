@@ -41,7 +41,8 @@ use std::sync::Arc;
 use reims_graphics::region::Region;
 use reims_graphics::wire::{
     RGFX_CMD_BUFFER_AT_OFFSET, RGFX_CMD_BUFFER_CREATE, RGFX_CMD_BUFFER_OVER_HOST_MEMORY,
-    RGFX_CMD_COMMAND_BUFFER, RGFX_CONTEXT_OBJ_ID_SHIFT,
+    RGFX_CMD_COMMAND_BUFFER, RGFX_CONTEXT_ALLOCATIONS_OFFSET, RGFX_CONTEXT_OBJ_ID_SHIFT,
+    RGFX_CURSOR_SPAN,
     RGFX_CMD_COMPUTE_PIPELINE_CREATE, RGFX_CMD_DEPTH_STENCIL_CREATE, RGFX_CMD_EVENT_CREATE,
     RGFX_CMD_FENCE_CREATE, RGFX_CMD_HEAP_CREATE, RGFX_CMD_HEAP_OVER_HOST_MEMORY,
     RGFX_CMD_LIBRARY_CREATE, RGFX_CMD_LIBRARY_FROM_REGION, RGFX_CMD_OBJECT_DESTROY,
@@ -173,6 +174,9 @@ pub struct GraphicsDecoder<P: Platform> {
     /// Where a pipeline create's reflection reply goes; `None` builds and drops
     /// it (the ring loop sets a sink later).
     reflection_sink: Option<ReflectionSink>,
+    /// The context (the process) of the message being carried out, whose objects alone it may
+    /// name ([`Self::named`]); `None` names any (the decoder's own tests).
+    context: Option<u32>,
     /// The device's BAR 2 region: the host memory the over-host-memory buffers
     /// and heaps are placed over. Held so it stays mapped while the decoder's
     /// objects live; declared last so the object table drops before it (a buffer
@@ -194,6 +198,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             id_chunks: vec![None; RGFX_RESOURCE_ID_CHUNKS as usize].into_boxed_slice(),
             completion_sink: None,
             reflection_sink: None,
+            context: None,
             region,
         }
     }
@@ -209,6 +214,39 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// (the ring loop's, writing the queue's completion ring).
     pub(crate) fn set_reflection_sink(&mut self, sink: ReflectionSink) {
         self.reflection_sink = Some(sink);
+    }
+
+    /// Sets the context of the messages carried out next: the process that sent them, whose
+    /// objects alone they may name. On ring 0 it is the context of the object a message creates or
+    /// destroys, which the kext checked is the sender's; on a queue's ring, the queue's.
+    pub(crate) fn set_context(&mut self, context: Option<u32>) {
+        self.context = context;
+    }
+
+    /// Whether `obj_id` is the current context's to name (any where none is set).
+    fn owned(&self, obj_id: u64) -> bool {
+        self.context
+            .is_none_or(|context| obj_id >> RGFX_CONTEXT_OBJ_ID_SHIFT == u64::from(context))
+    }
+
+    /// The object `obj_id` names, where it is the current context's: a process names only its own
+    /// objects, and an id of another's resolves to nothing (a bad reference where it is named).
+    fn named(&self, obj_id: u64) -> Option<&ObjHandle<P>> {
+        if self.owned(obj_id) {
+            self.objects.get(&obj_id)
+        } else {
+            None
+        }
+    }
+
+    /// Whether `len` bytes at region offset `offset` lie in the processes' part of the region,
+    /// where the kext places their blocks: past the control rings, the device-info blob and the
+    /// scanout ([`RGFX_CONTEXT_ALLOCATIONS_OFFSET`]), before the cursor's span at the end. The kext
+    /// checks a process names only its own blocks there.
+    fn in_process_blocks(&self, offset: u64, len: u64) -> bool {
+        let end = self.region.size().saturating_sub(RGFX_CURSOR_SPAN);
+        offset >= RGFX_CONTEXT_ALLOCATIONS_OFFSET
+            && offset.checked_add(len).is_some_and(|e| e <= end)
     }
 
     /// The objects the table holds.
@@ -439,9 +477,10 @@ impl<P: Platform> GraphicsDecoder<P> {
                 // A Shared buffer placed over the guest's own memory in the
                 // device's region, `length` bytes at `region_offset`: the same
                 // zero-copy import the scanout uses, so a blit reads and writes the
-                // guest's pages in place. A span past the region's end is a guest
+                // guest's pages in place. A span outside the processes' blocks (past
+                // the region's end, or over its rings, scanout or cursor) is a guest
                 // protocol error.
-                if !self.region.contains(m.region_offset, m.length) {
+                if !self.in_process_blocks(m.region_offset, m.length) {
                     return Ok(Err(DecodeError::BadReference));
                 }
                 let keep = Arc::clone(&self.region);
@@ -491,10 +530,10 @@ impl<P: Platform> GraphicsDecoder<P> {
                 // A Shared heap placed over the guest's own memory in the device's
                 // region, `size_bytes` at `region_offset`: its address range is the
                 // host VA of that block, as the detached-heap path builds a heap
-                // over host pages. A span past the region's end is a guest protocol
-                // error. The region stays mapped while the decoder holds it, and the
+                // over host pages. A span outside the processes' blocks is a guest
+                // protocol error. The region stays mapped while the decoder holds it, and the
                 // heap (in the object table) drops before the region (field order).
-                if !self.region.contains(m.region_offset, m.size_bytes) {
+                if !self.in_process_blocks(m.region_offset, m.size_bytes) {
                     return Ok(Err(DecodeError::BadReference));
                 }
                 // SAFETY: the block lies inside the region (checked above), one
@@ -535,7 +574,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                 let made = if m.heap_obj_id != 0 {
                     // Heap-placed at `heap_offset` in the named heap; a heap the
                     // host does not hold is a guest protocol error.
-                    let Some(ObjHandle::Heap(heap)) = self.objects.get(&m.heap_obj_id) else {
+                    let Some(ObjHandle::Heap(heap)) = self.named(m.heap_obj_id) else {
                         return Ok(Err(DecodeError::BadReference));
                     };
                     heap.new_texture(&descriptor, m.heap_offset)?
@@ -555,7 +594,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                 // A buffer at an offset in an existing heap; a heap the host does
                 // not hold is a guest protocol error.
                 let made = {
-                    let Some(ObjHandle::Heap(heap)) = self.objects.get(&m.heap_obj_id) else {
+                    let Some(ObjHandle::Heap(heap)) = self.named(m.heap_obj_id) else {
                         return Ok(Err(DecodeError::BadReference));
                     };
                     heap.new_buffer_of_length(m.length, m.options.into(), m.offset)?
@@ -577,7 +616,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                 // The texture reads the guest's named buffer; a buffer the host
                 // does not hold is a guest protocol error, not a refusal.
                 let made = {
-                    let Some(ObjHandle::Buffer(buffer)) = self.objects.get(&m.buffer_obj_id) else {
+                    let Some(ObjHandle::Buffer(buffer)) = self.named(m.buffer_obj_id) else {
                         return Ok(Err(DecodeError::BadReference));
                     };
                     buffer.new_texture(OnFault::Return, &descriptor, m.offset, m.bytes_per_row)?
@@ -600,7 +639,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                 let desc = texture_desc(&m.desc, m.resource_id);
                 let descriptor = self.platform.texture_descriptor(&desc);
                 let made = {
-                    let Some(ObjHandle::Buffer(buffer)) = self.objects.get(&m.buffer_obj_id) else {
+                    let Some(ObjHandle::Buffer(buffer)) = self.named(m.buffer_obj_id) else {
                         return Ok(Err(DecodeError::BadReference));
                     };
                     buffer.new_texture(OnFault::Return, &descriptor, m.offset, m.bytes_per_row)?
@@ -650,7 +689,13 @@ impl<P: Platform> GraphicsDecoder<P> {
     ) -> RaiseResult<Result<(), DecodeError>> {
         let job = match self.prepare_pipeline(message) {
             Ok(job) => job,
-            Err(e) => return Ok(Err(e)),
+            Err(e) => {
+                if let (Some(sink), Some(refused)) = (&self.reflection_sink, refused_reply(message))
+                {
+                    sink(refused);
+                }
+                return Ok(Err(e));
+            }
         };
         let compiled = compile_pipeline::<P>(device, job)?;
         let refused = compiled.is_refused();
@@ -815,13 +860,7 @@ impl<P: Platform> CompiledPipeline<P> {
         CompiledPipeline {
             obj_id,
             handle: None,
-            reflection: RgfxPipelineReflection {
-                header: reflection_header(seqno),
-                obj_id,
-                status: RGFX_PIPELINE_REFUSED,
-                kind,
-                ..RgfxPipelineReflection::default()
-            },
+            reflection: refused_reflection(obj_id, seqno, kind),
         }
     }
 
@@ -911,6 +950,31 @@ pub(crate) fn compile_pipeline<P: Platform>(
                 },
             )
         }
+    }
+}
+
+/// The reply a pipeline create refused at its op owes: a refusal, keyed to the create by its
+/// seqno, for the object its header names (`None` for a message too short to name one). The
+/// create's process waits for it, so a create the host will not carry out is still answered.
+pub(crate) fn refused_reply(message: &[u8]) -> Option<RgfxPipelineReflection> {
+    let header = read::<RgfxMsgHeader>(message)?;
+    let obj_id = u64::from_le_bytes(message.get(16..24)?.try_into().ok()?);
+    let kind = if header.r#type == RGFX_CMD_RENDER_PIPELINE_CREATE {
+        RGFX_PIPELINE_KIND_RENDER
+    } else {
+        RGFX_PIPELINE_KIND_COMPUTE
+    };
+    Some(refused_reflection(obj_id, header.seqno, kind))
+}
+
+/// A refused `PIPELINE_REFLECTION` for the create of `kind` at `seqno` of pipeline `obj_id`.
+fn refused_reflection(obj_id: u64, seqno: u64, kind: u32) -> RgfxPipelineReflection {
+    RgfxPipelineReflection {
+        header: reflection_header(seqno),
+        obj_id,
+        status: RGFX_PIPELINE_REFUSED,
+        kind,
+        ..RgfxPipelineReflection::default()
     }
 }
 
@@ -1075,7 +1139,7 @@ macro_rules! resolvers {
             $(
                 #[doc = concat!("The ", $what, " `id` names; an exec fault when `id` is 0 or names no ", $what, ".")]
                 pub(crate) fn $req(&self, id: u64) -> RaiseResult<P::$assoc> {
-                    match self.objects.get(&id) {
+                    match self.named(id) {
                         Some(ObjHandle::$variant(h)) => Ok(h.clone_ref()),
                         _ => Err(bad_reference()),
                     }
@@ -1085,7 +1149,7 @@ macro_rules! resolvers {
                     if id == 0 {
                         return Ok(None);
                     }
-                    match self.objects.get(&id) {
+                    match self.named(id) {
                         Some(ObjHandle::$variant(h)) => Ok(Some(h.clone_ref())),
                         _ => Err(bad_reference()),
                     }
@@ -1172,69 +1236,181 @@ mod tests {
 
     /// A library from region chunks: each chunk is read at its offset and acked, and
     /// the library is made, from the bytes unchanged, when the chunks reach its length;
-    /// a span past the region's end is a bad reference and a chunk out of order is
-    /// malformed.
+    /// a span outside the processes' blocks is a bad reference and a chunk out of order
+    /// is malformed.
     #[test]
     fn makes_a_library_from_region_chunks() {
         let p = Arc::new(FakePlatform::new());
         let device = p.device();
-        let region = Arc::new(reims_graphics::region::Region::new(0x10000).unwrap());
+        // The processes' blocks start past the rings and scanout; one MiB of them, then the
+        // cursor's span.
+        let blocks = RGFX_CONTEXT_ALLOCATIONS_OFFSET;
+        let size = blocks + 0x10_0000 + RGFX_CURSOR_SPAN;
+        let region = Arc::new(reims_graphics::region::Region::new(size as usize).unwrap());
+        let (staging, ack) = (blocks + 0x4000, blocks + 0x100);
         let air: Vec<u8> = (0..0x2345u32).map(|i| (i * 7) as u8).collect();
         let mut dec = GraphicsDecoder::<FakePlatform>::new(Arc::clone(&p), Arc::clone(&region));
 
-        let msg = |obj_id: u64, region_offset: u64, len: u64, total: u64, at: u64, ack: u64| {
-            RgfxLibraryFromRegion {
-                header: RgfxMsgHeader {
-                    r#type: RGFX_CMD_LIBRARY_FROM_REGION,
-                    size: size_of::<RgfxLibraryFromRegion>() as u32,
-                    seqno: 0,
-                },
-                obj_id,
-                region_offset,
-                byte_length: len,
-                total_length: total,
-                chunk_offset: at,
-                ack_offset: 0x100,
-                ack_value: ack,
-                ..RgfxLibraryFromRegion::default()
-            }
-        };
+        let msg =
+            |obj_id: u64, region_offset: u64, len: u64, total: u64, at: u64, ack_value: u64| {
+                RgfxLibraryFromRegion {
+                    header: RgfxMsgHeader {
+                        r#type: RGFX_CMD_LIBRARY_FROM_REGION,
+                        size: size_of::<RgfxLibraryFromRegion>() as u32,
+                        seqno: 0,
+                    },
+                    obj_id,
+                    region_offset,
+                    byte_length: len,
+                    total_length: total,
+                    chunk_offset: at,
+                    ack_offset: ack,
+                    ack_value,
+                    ..RgfxLibraryFromRegion::default()
+                }
+            };
         let total = air.len() as u64;
-        // Two chunks through one staging block at 0x4000, each acked once copied out.
+        // Two chunks through one staging block, each acked once copied out.
         let first = 0x1000usize;
-        assert!(region.write(0x4000, &air[..first]));
+        assert!(region.write(staging, &air[..first]));
         assert_eq!(
-            dec.decode(&device, msg(20, 0x4000, first as u64, total, 0, 1).as_bytes())
-                .unwrap(),
+            dec.decode(
+                &device,
+                msg(20, staging, first as u64, total, 0, 1).as_bytes()
+            )
+            .unwrap(),
             Ok(())
         );
-        assert_eq!(region.read(0x100, 8).unwrap(), 1u64.to_le_bytes());
+        assert_eq!(region.read(ack, 8).unwrap(), 1u64.to_le_bytes());
         assert_eq!(dec.object_count(), 0);
-        assert!(region.write(0x4000, &air[first..]));
+        assert!(region.write(staging, &air[first..]));
         let rest = total - first as u64;
         assert_eq!(
-            dec.decode(&device, msg(20, 0x4000, rest, total, first as u64, 2).as_bytes())
-                .unwrap(),
+            dec.decode(
+                &device,
+                msg(20, staging, rest, total, first as u64, 2).as_bytes()
+            )
+            .unwrap(),
             Ok(())
         );
-        assert_eq!(region.read(0x100, 8).unwrap(), 2u64.to_le_bytes());
+        assert_eq!(region.read(ack, 8).unwrap(), 2u64.to_le_bytes());
         assert_eq!(dec.object_count(), 1);
         let calls = p.call_log().calls_to("newLibraryWithData:error:");
         assert_eq!(calls.len(), 1);
         assert!(matches!(&calls[0].args[0], Arg::Bytes(b) if *b == air));
 
-        // A span past the region's end, and a chunk with no first chunk before it.
+        // A span past the processes' blocks, one over the scanout, and a chunk with no first
+        // chunk before it.
+        for offset in [size - RGFX_CURSOR_SPAN - 0x1000, blocks - 0x1000] {
+            assert_eq!(
+                dec.decode(&device, msg(21, offset, 0x2000, 0x2000, 0, 3).as_bytes())
+                    .unwrap(),
+                Err(DecodeError::BadReference)
+            );
+        }
         assert_eq!(
-            dec.decode(&device, msg(21, 0xf000, 0x2000, 0x2000, 0, 3).as_bytes())
-                .unwrap(),
-            Err(DecodeError::BadReference)
-        );
-        assert_eq!(
-            dec.decode(&device, msg(22, 0x4000, 0x10, 0x20, 0x10, 4).as_bytes())
+            dec.decode(&device, msg(22, staging, 0x10, 0x20, 0x10, 4).as_bytes())
                 .unwrap(),
             Err(DecodeError::Malformed)
         );
         assert_eq!(dec.object_count(), 1);
+    }
+
+    /// Host-memory buffers and heaps lie in the processes' blocks: a span over the rings and
+    /// scanout, past the blocks' end or past the region's is refused, one inside is made; and a
+    /// create names only its own process's objects once a context is set
+    #[test]
+    fn host_memory_and_references_stay_in_their_process() {
+        let p = Arc::new(FakePlatform::new());
+        let device = p.device();
+        let blocks = RGFX_CONTEXT_ALLOCATIONS_OFFSET;
+        let size = blocks + 0x10_0000 + RGFX_CURSOR_SPAN;
+        let region = Arc::new(reims_graphics::region::Region::new(size as usize).unwrap());
+        let mut dec = GraphicsDecoder::<FakePlatform>::new(Arc::clone(&p), region);
+        let buffer = |obj_id: u64, region_offset: u64, length: u64| RgfxBufferOverHostMemory {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_BUFFER_OVER_HOST_MEMORY,
+                size: size_of::<RgfxBufferOverHostMemory>() as u32,
+                seqno: 0,
+            },
+            obj_id,
+            gpu_address: 0x1_0000_0000,
+            region_offset,
+            length,
+            options: 0,
+            reserved_34: 0,
+        };
+        let heap = |obj_id: u64, region_offset: u64, size_bytes: u64| RgfxHeapOverHostMemory {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_HEAP_OVER_HOST_MEMORY,
+                size: size_of::<RgfxHeapOverHostMemory>() as u32,
+                seqno: 0,
+            },
+            obj_id,
+            gpu_address: 0x2_0000_0000,
+            region_offset,
+            size_bytes,
+            ..RgfxHeapOverHostMemory::default()
+        };
+        let outside = [
+            (0, 0x1000),
+            (blocks - 0x1000, 0x2000),
+            (size - RGFX_CURSOR_SPAN - 0x1000, 0x2000),
+            (size - 0x1000, 0x1000),
+            (u64::MAX - 0xfff, 0x1000),
+        ];
+        for (offset, len) in outside {
+            assert_eq!(
+                dec.decode(&device, buffer(1, offset, len).as_bytes())
+                    .unwrap(),
+                Err(DecodeError::BadReference),
+                "a buffer at {offset:#x}"
+            );
+            assert_eq!(
+                dec.decode(&device, heap(2, offset, len).as_bytes())
+                    .unwrap(),
+                Err(DecodeError::BadReference),
+                "a heap at {offset:#x}"
+            );
+        }
+        assert_eq!(dec.object_count(), 0);
+        let one = 1u64 << RGFX_CONTEXT_OBJ_ID_SHIFT;
+        let two = 2u64 << RGFX_CONTEXT_OBJ_ID_SHIFT;
+        dec.set_context(Some(1));
+        assert_eq!(
+            dec.decode(&device, heap(one | 2, blocks, 0x1_0000).as_bytes())
+                .unwrap(),
+            Ok(())
+        );
+        assert_eq!(
+            dec.decode(
+                &device,
+                buffer(one | 3, blocks + 0x1_0000, 0x1000).as_bytes()
+            )
+            .unwrap(),
+            Ok(())
+        );
+        // Process 2 names process 1's heap and buffer: refused, nothing made.
+        dec.set_context(Some(2));
+        let at_offset = RgfxBufferAtOffset {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_BUFFER_AT_OFFSET,
+                size: size_of::<RgfxBufferAtOffset>() as u32,
+                seqno: 0,
+            },
+            obj_id: two | 4,
+            heap_obj_id: one | 2,
+            length: 0x100,
+            ..RgfxBufferAtOffset::default()
+        };
+        assert_eq!(
+            dec.decode(&device, at_offset.as_bytes()).unwrap(),
+            Err(DecodeError::BadReference)
+        );
+        assert!(dec.require_buffer(one | 3).is_err());
+        dec.set_context(Some(1));
+        assert!(dec.require_buffer(one | 3).is_ok());
+        assert_eq!(dec.object_count(), 2);
     }
 
     /// A create of each state object calls the platform and holds its handle;
@@ -1938,13 +2114,19 @@ mod tests {
         // Both pipelines are held alongside the library.
         assert_eq!(dec.object_count(), 3);
 
-        // A render create that names a non-library is a bad reference; no reply,
-        // no handle.
+        // A render create that names a non-library is a bad reference: no handle, and a
+        // refusal for its reply, which its process waits for.
         assert_eq!(
             dec.decode(&device, &render_msg(102, 9, 999, 999)).unwrap(),
             Err(DecodeError::BadReference)
         );
         assert_eq!(dec.object_count(), 3);
-        assert_eq!(replies.lock().len(), 2);
+        let r = replies.lock();
+        assert_eq!(r.len(), 3);
+        assert_eq!((r[2].obj_id, r[2].header.seqno), (102, 9));
+        assert_eq!(
+            (r[2].status, r[2].kind),
+            (RGFX_PIPELINE_REFUSED, RGFX_PIPELINE_KIND_RENDER)
+        );
     }
 }

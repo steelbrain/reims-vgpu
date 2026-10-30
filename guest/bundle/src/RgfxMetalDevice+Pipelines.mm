@@ -303,6 +303,19 @@ void selectAirSlice(const void *&bytes, NSUInteger &length)
 
 // --- render pipelines --------------------------------------------------------
 
+// `state`, or nil and an NSError where the host refused its create: the kext hands the create's
+// reply back before the create returns, so a refusal is known here, as Metal's creators know
+// theirs.
+template <typename State>
+static State rgfxUnlessRefused(State state, NSError *__autoreleasing *error)
+{
+	if (state == nil || ![state rgfxRefused])
+		return state;
+	if (error)
+		*error = RgfxMakeError(RgfxMetalErrorRefused, @"pipeline: the device refused the pipeline");
+	return nil;
+}
+
 // Creates a render pipeline state and registers it with the device's reply reader, so
 // its reflection fills when the host answers this create's seqno. Every render-pipeline
 // entry point funnels through here.
@@ -316,7 +329,7 @@ void selectAirSlice(const void *&bytes, NSUInteger &length)
 	                                                    serializer:[self serializer]
 	                                                         error:error];
 	[state rgfxRegisterWithReplyReader:[self replyReader]];
-	return state;
+	return rgfxUnlessRefused(state, error);
 }
 
 - (id<MTLRenderPipelineState>)
@@ -379,7 +392,7 @@ void selectAirSlice(const void *&bytes, NSUInteger &length)
 	                                                    serializer:[self serializer]
 	                                                         error:error];
 	[state rgfxRegisterWithReplyReader:[self replyReader]];
-	return state;
+	return rgfxUnlessRefused(state, error);
 }
 
 - (nullable id<MTLComputePipelineState>)
@@ -392,7 +405,7 @@ void selectAirSlice(const void *&bytes, NSUInteger &length)
 	                                                      serializer:[self serializer]
 	                                                           error:error];
 	[state rgfxRegisterWithReplyReader:[self replyReader]];
-	return state;
+	return rgfxUnlessRefused(state, error);
 }
 
 - (id<MTLComputePipelineState>)newComputePipelineStateWithFunction:(id<MTLFunction>)computeFunction

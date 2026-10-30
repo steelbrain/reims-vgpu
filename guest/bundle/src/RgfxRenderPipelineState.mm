@@ -227,6 +227,11 @@ bool fillFunctionRef(RgfxFunctionRef &fr, id<MTLFunction> fn)
 	_haveReflection = YES;
 }
 
+- (BOOL)rgfxRefused
+{
+	return _haveReflection && _reflection.status == RGFX_PIPELINE_REFUSED;
+}
+
 // --- MTLRenderPipelineState: reflection --------------------------------------
 // The host answers the create with an RgfxPipelineReflection over the completion
 // ring, matched by `rgfxSeqno` and read by the reply reader. Before it arrives these

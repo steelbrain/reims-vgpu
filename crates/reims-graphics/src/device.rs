@@ -26,7 +26,9 @@
 //! may write the ring once the create returns. The thread first has the host make the queue's
 //! handle (the `QUEUE_CREATE` handed to [`Host::stage3_message`]), then takes the queue's
 //! submission ring with the same `consumer_idle` handshake the control thread uses, hands each
-//! message to the host with a [`CompletionPoster`] onto the queue's completion ring, and the host
+//! `COMMAND_BUFFER` to the host with a [`CompletionPoster`] onto the queue's completion ring (a
+//! message of any other type is refused there and goes no further: lifecycle messages ride ring 0,
+//! through the kext, which checks that their sender owns what they name), and the host
 //! posts what it owes there (a buffer's completion), raising the queue's own MSI-X vector. Its
 //! doorbell is the submission ring's region offset (the value the guest writes to `DOORBELL`, as
 //! the control ring's is 0). A command buffer is handed to the host only once the control thread
@@ -461,11 +463,18 @@ impl PresentAnswer {
 pub struct CompletionPoster {
     /// The device's shared state, weakly.
     shared: Weak<Shared>,
-    /// The queue's own rings, weakly; `None` for the control completion ring.
-    queue: Option<Weak<QueueShared>>,
+    /// The queue's own rings, weakly, and its id; `None` for the control completion ring.
+    queue: Option<(Weak<QueueShared>, u64)>,
 }
 
 impl CompletionPoster {
+    /// The id of the queue whose ring the poster posts on; `None` for the control ring. A message
+    /// the host takes off a queue's submission ring is handed with that queue's poster, so this
+    /// names the queue (and the context) the message came from, whatever the message says.
+    pub fn queue_obj_id(&self) -> Option<u64> {
+        self.queue.as_ref().map(|(_, obj_id)| *obj_id)
+    }
+
     /// Posts `message` (a whole event, its `size` set and a multiple of 8) onto the ring's
     /// completion ring, waiting for room while the device (and the queue) live and the device is
     /// not reset, and raising the ring's MSI-X vector where the guest armed it. Does nothing where
@@ -477,7 +486,7 @@ impl CompletionPoster {
         let epoch = shared.epoch.load(Ordering::Acquire);
         match &self.queue {
             None => shared.post_waiting(message, epoch),
-            Some(queue) => {
+            Some((queue, _)) => {
                 if let Some(queue) = queue.upgrade() {
                     shared.post_queue_waiting(&queue, message, epoch);
                 }
@@ -845,7 +854,7 @@ impl Shared {
     fn queue_poster(&self, queue: &Arc<QueueShared>) -> CompletionPoster {
         CompletionPoster {
             shared: self.weak_self.get().cloned().unwrap_or_else(Weak::new),
-            queue: Some(Arc::downgrade(queue)),
+            queue: Some((Arc::downgrade(queue), queue.obj_id)),
         }
     }
 
@@ -908,7 +917,21 @@ impl Shared {
                     return;
                 }
                 match submit.consumer.next(&self.region) {
-                    Ok(Some(message)) => message,
+                    Ok(Some(message)) if message.header.r#type == RGFX_CMD_COMMAND_BUFFER => {
+                        message
+                    }
+                    Ok(Some(message)) => {
+                        // A queue's ring carries only its process's command buffers; every other
+                        // message rides ring 0, through the kext, which checks that its sender
+                        // owns the object it names. Refused here, and the ring goes on.
+                        log::warn!(
+                            target: "reims_graphics",
+                            "queue {:#x}'s submission ring carried a message of type {:#x} \
+                             (seqno {}), which it may not carry: refused",
+                            queue.obj_id, message.header.r#type, message.header.seqno
+                        );
+                        continue;
+                    }
                     Ok(None) => return,
                     Err(broken) => {
                         log::error!(
@@ -929,16 +952,13 @@ impl Shared {
             // resource is registered before the buffer's ops name it. This thread only reads ring
             // 0's counts; it never consumes that ring, so it keeps one consumer and its
             // `consumer_idle` handshake is untouched.
-            if message.header.r#type == RGFX_CMD_COMMAND_BUFFER {
-                let epoch = self.epoch.load(Ordering::Acquire);
-                let created_through = self.submit.lock().consumer.published_count(&self.region);
-                while self.control_done.load(Ordering::Acquire) < created_through {
-                    if self.ending() || queue.ended() || self.epoch.load(Ordering::Acquire) != epoch
-                    {
-                        break;
-                    }
-                    std::thread::sleep(ROOM_POLL);
+            let epoch = self.epoch.load(Ordering::Acquire);
+            let created_through = self.submit.lock().consumer.published_count(&self.region);
+            while self.control_done.load(Ordering::Acquire) < created_through {
+                if self.ending() || queue.ended() || self.epoch.load(Ordering::Acquire) != epoch {
+                    break;
                 }
+                std::thread::sleep(ROOM_POLL);
             }
             self.host.stage3_message(poster, &message.bytes);
         }

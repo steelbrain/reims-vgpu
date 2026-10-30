@@ -12,6 +12,8 @@
 #                 KEXTINJECT=<OpenCorePkg's TestKextInject binary>
 #                 BOOT_KC=<the guest's x86_64 BootKernelExtensions.kc>
 #               Without KEXTINJECT and BOOT_KC the link is skipped, saying so.
+#   make test   build and run the native tests of the kext's own rules
+#               (tests/*.cpp, against the headers they test)
 #   make clean  remove build/
 #
 # Everything lands in build/, never committed.
@@ -80,7 +82,17 @@ check: $(BINARY) $(BUILD)/obj/layout.o
 	python3 -I tools/check-layout.py "$(KDK)/IOGraphicsFamily.kext.dSYM" $(BUILD)/obj/layout.o
 	bash tools/oc-link-check.sh "$(KEXTINJECT)" "$(BOOT_KC)" "$(KDK)" $(KEXT) $(BUILD)/oc-link
 
+# The native tests: header-only rules of the kext's, built for this Mac.
+TESTS = $(BUILD)/tests/spans_test
+
+$(BUILD)/tests/%: tests/%.cpp $(HEADERS) ../../crates/reims-graphics/include/reims_graphics_wire.h Makefile
+	@mkdir -p $(@D)
+	xcrun clang++ -std=c++17 -Wall -Wextra -Werror -Isrc -I../../crates/reims-graphics/include $< -o $@
+
+test: $(TESTS)
+	@for t in $(TESTS); do $$t || exit 1; done
+
 clean:
 	rm -rf $(BUILD)
 
-.PHONY: all check clean
+.PHONY: all check test clean

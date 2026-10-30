@@ -81,7 +81,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         // The queue the buffer runs on; a missing or wrong-kind queue is a
         // message-level bad reference (the op stream has not started).
         let cb = {
-            let Some(ObjHandle::CommandQueue(queue)) = self.objects.get(&m.queue_obj_id) else {
+            let Some(ObjHandle::CommandQueue(queue)) = self.named(m.queue_obj_id) else {
                 return Ok(Err(DecodeError::BadReference));
             };
             match queue.command_buffer(ON)? {

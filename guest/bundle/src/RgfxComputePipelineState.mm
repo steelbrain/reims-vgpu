@@ -176,6 +176,11 @@ bool fillComputeParams(RgfxComputePipelineParams &p, id<MTLFunction> fn, uint32_
 	_haveReflection = YES;
 }
 
+- (BOOL)rgfxRefused
+{
+	return _haveReflection && _reflection.status == RGFX_PIPELINE_REFUSED;
+}
+
 // --- MTLComputePipelineState: reflection --------------------------------------
 // The host's RgfxPipelineReflection reply is read by the reply reader. Before it
 // arrives these answer documented placeholders; after it they report the host's

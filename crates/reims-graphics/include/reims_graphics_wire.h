@@ -1501,7 +1501,8 @@ typedef struct {
 } RgfxBufferCreate;
 
 // `BUFFER_OVER_HOST_MEMORY`: a Shared buffer of `length` bytes over the block at
-// `region_offset` in the region, at the guest-picked `gpu_address`.
+// `region_offset` in the region, at the guest-picked `gpu_address`. The block is one
+// of the creating process's own, as [`RgfxHeapOverHostMemory`]'s is.
 typedef struct {
   // [`RGFX_CMD_BUFFER_OVER_HOST_MEMORY`].
   RgfxMsgHeader header;
@@ -2139,7 +2140,9 @@ typedef struct {
 } RgfxHeapCreate;
 
 // `HEAP_OVER_HOST_MEMORY`: a Shared heap of `size_bytes` over the block at
-// `region_offset` in the region, at the guest-picked `gpu_address`.
+// `region_offset` in the region, at the guest-picked `gpu_address`. The block is one
+// of the creating process's own, which the kext checks; a span outside the processes'
+// blocks ([`RGFX_CONTEXT_ALLOCATIONS_OFFSET`] up to the cursor's span) is refused.
 typedef struct {
   // [`RGFX_CMD_HEAP_OVER_HOST_MEMORY`].
   RgfxMsgHeader header;
@@ -2191,8 +2194,10 @@ typedef struct {
 // Once the host has copied a chunk's bytes out of the region it writes
 // `ack_value` as a little-endian `u64` at `ack_offset` (8-aligned, in the
 // region), so the guest may write that block again: the ring's consumer count
-// moves when the host takes the message, not when it carries it out. A span
-// past the region's end, or a chunk out of order, is a guest protocol error.
+// moves when the host takes the message, not when it carries it out. The chunk
+// and the ack slot lie in the process's own blocks, as [`RgfxHeapOverHostMemory`]'s
+// block does; a span outside the processes' blocks, or a chunk out of order, is a
+// guest protocol error.
 //
 // The library's last chunk, the one whose `chunk_offset + byte_length` reaches
 // `total_length` (or overflows), is answered as [`RgfxLibraryCreate`] is, and its

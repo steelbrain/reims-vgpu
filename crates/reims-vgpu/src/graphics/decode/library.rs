@@ -493,21 +493,25 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// One `LIBRARY_FROM_REGION` chunk: its bytes are copied out once (so the platform parses
     /// memory the guest cannot change under it), its ack is written so the guest may reuse the
     /// block, and the library's whole bytes are handed back once the chunks reach its length. A
-    /// span past the region's end is a bad reference; a chunk out of order or past the length is
-    /// malformed and drops what came before.
+    /// span outside the processes' blocks is a bad reference; a chunk out of order or past the
+    /// length is malformed and drops what came before.
     fn take_library_chunk(
         &mut self,
         m: &RgfxLibraryFromRegion,
     ) -> Result<Option<Vec<u8>>, DecodeError> {
         let Some(chunk) = usize::try_from(m.byte_length)
             .ok()
+            .filter(|_| self.in_process_blocks(m.region_offset, m.byte_length))
             .and_then(|len| self.region.read(m.region_offset, len))
         else {
             self.library_chunks.remove(&m.obj_id);
             return Err(DecodeError::BadReference);
         };
         // The bytes are out of the block: the guest may write it again.
-        if m.ack_offset % 8 != 0 || !self.region.write(m.ack_offset, &m.ack_value.to_le_bytes()) {
+        if m.ack_offset % 8 != 0
+            || !self.in_process_blocks(m.ack_offset, 8)
+            || !self.region.write(m.ack_offset, &m.ack_value.to_le_bytes())
+        {
             self.library_chunks.remove(&m.obj_id);
             return Err(DecodeError::BadReference);
         }
@@ -589,13 +593,15 @@ impl<P: Platform> GraphicsDecoder<P> {
         })
     }
 
-    /// The library a pipeline create names: in the table, or being made.
+    /// The library a pipeline create names: in the table, or being made, and the current
+    /// context's.
     pub(super) fn library_ref(&self, obj_id: u64) -> Result<LibraryRef<P>, DecodeError> {
-        match self.objects.get(&obj_id) {
+        match self.named(obj_id) {
             Some(ObjHandle::Library(library)) => Ok(LibraryRef::Ready(library.clone_ref())),
             _ => self
                 .making_libraries
                 .get(&obj_id)
+                .filter(|_| self.owned(obj_id))
                 .map(|slot| LibraryRef::Making(Arc::clone(slot)))
                 .ok_or(DecodeError::BadReference),
         }

@@ -375,6 +375,37 @@ already drives from the Apple-lane command stream. So the host decoder is: wire
 message → handle-table lookup/insert → `Platform` call → completion. The
 bundle's serialiser is the mirror of that decoder.
 
+**Guest input the host refuses.** Everything on the wire comes from the guest,
+which the host does not trust, and no guest input ends QEMU. A message the host
+cannot carry out (one shorter than its record, a span it does not cover, an
+object it does not hold or of the wrong kind, the platform refusing the create)
+is refused at its op, and nothing of it is made. A create the guest waits on (a
+pipeline's reflection, a library create or lookup, a queue's create, a
+context's close) is answered at that op: a refused `PIPELINE_REFLECTION`, or a
+`COMPLETE` with the refusal's status, so no guest thread waits out the kext's
+timeout. A refused command buffer completes with an error status. Nothing in
+this lane ends the offending context or its process on malformed input. This
+is the lane's own rule: the paravirt device's rule of ending the process at the
+op (AGENTS.md, the contract) is Apple's framework's behaviour, which that
+device keeps.
+
+**Processes name only their own.** A process names only its own objects and
+its own memory. The accelerator kext checks, before it posts a lifecycle
+message, that the object the message creates or destroys is in the process's
+id range, and that the region the message names lies in the process's own
+blocks: a queue's rings, a heap's or a buffer's block over host memory, and a
+library chunk's bytes and ack slot. The host also refuses any of these spans
+outside the processes' part of the region (the rings, the device-info blob and
+the scanout before it, the cursor after it). Command buffers do not pass
+through the kext, so the host checks each object a message names: it must be
+of the message's context, which is the context of the object a ring-0 message
+creates or destroys, or the context of the queue whose ring carried the
+command buffer. A command buffer runs only on the queue whose ring carried it,
+and a queue's ring carries nothing but command buffers: a message of any other
+type there is refused, since it would pass the kext's checks by.
+A create the kext posted but whose answer did not come in time is destroyed by
+the kext right behind it, so a retry under a new id leaves nothing behind.
+
 **Handles and addresses.** Every guest Metal object has a 64-bit `ObjId` the
 guest picks, unique per device; the host keeps an `ObjId` → `Platform` handle
 table (handles are refcounted in core, `clone_ref`/`Drop`). The guest also
