@@ -130,6 +130,8 @@ public:
 	// host's consumer of ring `ringId`.
 	IODeviceMemory *copyRegion() const;
 	void ringDoorbell(UInt32 ringId);
+	// BAR 2's size, as the device's REGION_SIZE registers give it (no more than the BAR's).
+	UInt64 getRegionSize() const { return regionSize; }
 
 	// The framebuffer on our PCI device (ReimsGraphics), retained for the caller, or nullptr
 	// before it has started. The first lookup that finds it names this accelerator on it

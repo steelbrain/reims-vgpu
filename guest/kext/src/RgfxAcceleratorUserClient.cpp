@@ -113,7 +113,7 @@ enum {
 };
 static const uint32_t kRgfxIOGPUStructOutMax = 1024;       // largest construction struct-out is 536
 static const uint64_t kRgfxWorkingSetBytes   = 8ull << 30;  // Config64 0x10: working-set budget (8 GiB)
-static const uint64_t kRgfxSharedMemBytes    = 256ull << 20; // Config64 0x20: shared-memory size (256 MiB)
+// Config64 0x20, the shared-memory size, is the region's: BAR 2's size, from the device.
 
 // Copy a reply into the method's struct-output, whether IOKit provided an inline buffer or an
 // output memory descriptor, and report the exact length written.
@@ -189,7 +189,7 @@ IOReturn RgfxAcceleratorUserClient::externalMethod(uint32_t selector,
 			if ((ucType & 0xffff) == kRgfxIOGPUDeviceInfoType &&
 			    selector == kRgfxIOGPUSelConfig64 && len >= 0x28) {
 				*reinterpret_cast<uint64_t *>(buf + 0x10) = kRgfxWorkingSetBytes;
-				*reinterpret_cast<uint64_t *>(buf + 0x20) = kRgfxSharedMemBytes;
+				*reinterpret_cast<uint64_t *>(buf + 0x20) = owner ? owner->getRegionSize() : 0;
 			}
 			// selector 2 (536): the 0x14 entry count stays 0 (skip the base's loop).
 			return rgfxWriteStructOut(arguments, buf, len);
