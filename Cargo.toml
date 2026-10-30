@@ -14,6 +14,7 @@ members = [
     "crates/reims-vgpu-video-nvidia",
     "crates/reims-vgpu-video-videotoolbox",
     "crates/reims-vgpu-video-conformance",
+    "crates/reims-graphics",
     "xtask",
 ]
 
@@ -32,6 +33,8 @@ reims-vgpu-metal = { path = "crates/reims-vgpu-metal" }
 reims-vgpu-window = { path = "crates/reims-vgpu-window", default-features = false }
 reims-vgpu = { path = "crates/reims-vgpu", default-features = false }
 reims-vgpu-vulkan = { path = "crates/reims-vgpu-vulkan" }
+# The reims-graphics device: its wire format and host side.
+reims-graphics = { path = "crates/reims-graphics" }
 # The VideoToolbox device's host side (`crate::video` of `reims-vgpu`).
 reims-vgpu-video-core = { path = "crates/reims-vgpu-video-core" }
 # Its decoders on the host's GPU through libva, on Linux.

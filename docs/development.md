@@ -11,7 +11,7 @@ AGENTS.md                   the rules for working on the repository
 Cargo.toml                  the Cargo workspace, with Cargo.lock,
                             rust-toolchain.toml, clippy.toml and
                             .cargo/config.toml
-crates/                     its twelve crates (below), and reims-ctl, a
+crates/                     its thirteen crates (below), and reims-ctl, a
                             workspace of its own that links none of them
 xtask/                      cargo xtask (below)
 firmware/                   the option ROM: the PCI device's UEFI driver,
@@ -91,6 +91,7 @@ doc holds its area's ordering contracts and the measured platform facts it relie
 | `reims-vgpu-video-nvidia` | `crates/reims-vgpu-video-nvidia` | the NVIDIA backend (Linux): NVDEC and NVENC over the CUDA driver API, loaded at run time |
 | `reims-vgpu-video-videotoolbox` | `crates/reims-vgpu-video-videotoolbox` | the VideoToolbox backend (macOS) |
 | `reims-vgpu-video-conformance` | `crates/reims-vgpu-video-conformance` | the conformance suite every backend runs: a stand-in guest drives core's devices on it |
+| `reims-graphics` | `crates/reims-graphics` | the reims-graphics device (1234:5247, `docs/graphics-kext/design.md`): its wire format, whose C header (`include/reims_graphics_wire.h`) the guest's kext and option ROM include, and its host side |
 | `xtask` | `xtask` | `cargo xtask`, below |
 
 ### Build and test

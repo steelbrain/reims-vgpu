@@ -1,0 +1,15 @@
+[package]
+name = "reims-graphics"
+description = "The reims-graphics device's wire format and host side: its registers, rings, control commands and display state"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# The wire's records, read from and written into the rings as bytes.
+zerocopy.workspace = true

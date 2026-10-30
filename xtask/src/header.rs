@@ -1,6 +1,8 @@
-//! `cargo xtask header`: generate the C header, `crates/reims-vgpu-c/include/reims_vgpu.h`, with
-//! cbindgen from the crate's `cbindgen.toml`, or, with `--check`, check that the committed header
-//! equals cbindgen's output.
+//! `cargo xtask header`: generate the C headers with cbindgen, each from its crate's
+//! `cbindgen.toml`, or, with `--check`, check that each committed header equals cbindgen's output:
+//! the C API's, `crates/reims-vgpu-c/include/reims_vgpu.h`, and the reims-graphics device's wire
+//! format, `crates/reims-graphics/include/reims_graphics_wire.h`, which the guest's kext and option
+//! ROM include.
 //!
 //! cbindgen is an external binary (`cargo install cbindgen --version 0.29.4`, or Homebrew's).
 //! Its output depends on its version, so a different version is reported rather than compared,
@@ -15,7 +17,10 @@ use crate::util::{Res, read, repo_root, run_capture, write_if_changed};
 pub const CBINDGEN_VERSION: &str = "0.29.4";
 
 /// Each header's crate and file name.
-pub const HEADERS: [(&str, &str); 1] = [("reims-vgpu-c", "reims_vgpu.h")];
+pub const HEADERS: [(&str, &str); 2] = [
+    ("reims-vgpu-c", "reims_vgpu.h"),
+    ("reims-graphics", "reims_graphics_wire.h"),
+];
 
 /// A crate cbindgen reads.
 fn crate_dir(krate: &str) -> PathBuf {
@@ -117,7 +122,11 @@ mod tests {
 
     #[test]
     fn headers_live_in_their_crates() {
-        let [(api, api_h)] = HEADERS;
+        let [(api, api_h), (wire, wire_h)] = HEADERS;
         assert!(header_path(api, api_h).ends_with("crates/reims-vgpu-c/include/reims_vgpu.h"));
+        assert!(
+            header_path(wire, wire_h)
+                .ends_with("crates/reims-graphics/include/reims_graphics_wire.h")
+        );
     }
 }
