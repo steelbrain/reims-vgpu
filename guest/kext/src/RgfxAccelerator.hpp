@@ -60,8 +60,11 @@
 // region with IOConnectMapMemory(kRgfxAccelMemoryRegion), and rings a ring's doorbell
 // with IOConnectCallScalarMethod(kRgfxAccelMethodDoorbell, {ringId}).
 
-// The only user-client type this accelerator vends.
+// Our own user-client type.
 static const UInt32 kRgfxAccelUserClientType = 0;
+// The type Apple's IOGPUMetalDevice base opens to build its device
+// (RgfxAcceleratorUserClient::deviceMethod).
+static const UInt32 kRgfxIOGPUDeviceUserClientType = 5;
 
 // clientMemoryForType ids: the whole BAR-2 device region (control rings, caps page
 // and the allocations past RGFX_ALLOCATIONS_OFFSET), mapped into the client task.

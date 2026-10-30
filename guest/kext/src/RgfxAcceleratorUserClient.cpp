@@ -22,7 +22,7 @@ bool RgfxAcceleratorUserClient::initWithTask(task_t owningTask, void *securityID
 		return false;
 	task = owningTask;
 	owner = nullptr;
-	ucType = type; // RGFX DIAG (remove before merge): correlate selectors to UC type
+	ucType = type;
 	hasContext = false;
 	context = 0;
 	slot = 0;
@@ -115,15 +115,20 @@ IOReturn RgfxAcceleratorUserClient::doorbellMethod(OSObject *target, void *,
 	return kIOReturnSuccess;
 }
 
-// RGFX DIAG (IOGPU construction handshake; remove before merge): constants + a struct-output
-// helper used by externalMethod to answer Apple's IOGPU device-creation ABI.
+// The user client Apple's IOGPU base opens to build the Metal device
+// (kRgfxIOGPUDeviceUserClientType, from IOGPUDeviceCreateWithOptions inside [super
+// initWithAcceleratorPort:]), and the two calls it
+// makes there, measured: selector 2, the device's info (536 bytes out), then selector 0, its
+// configuration (64 bytes out). Each must succeed at its exact size, or the device is nil.
 enum {
-	kRgfxIOGPUDeviceInfoType = 5, // the UC type IOGPUDeviceCreateWithOptions opens for device info
-	kRgfxIOGPUSelConfig64    = 0, // its selector 0: the 64-byte "Config64" struct
+	kRgfxIOGPUSelConfig = 0,
+	kRgfxIOGPUSelDeviceInfo = 2,
 };
-static const uint32_t kRgfxIOGPUStructOutMax = 1024;       // largest construction struct-out is 536
-static const uint64_t kRgfxWorkingSetBytes   = 8ull << 30;  // Config64 0x10: working-set budget (8 GiB)
-// Config64 0x20, the shared-memory size, is the region's: BAR 2's size, from the device.
+static const uint32_t kRgfxIOGPUConfigSize = 64;
+static const uint32_t kRgfxIOGPUDeviceInfoSize = 536;
+// The configuration's working-set budget (at 0x10). Its shared-memory size (at 0x20) is the
+// region's: BAR 2's size, from the device.
+static const uint64_t kRgfxWorkingSetBytes = 8ull << 30;
 
 // Copy a reply into the method's struct-output, whether IOKit provided an inline buffer or an
 // output memory descriptor, and report the exact length written.
@@ -140,6 +145,21 @@ static IOReturn rgfxWriteStructOut(IOExternalMethodArguments *a, const void *buf
 	}
 	a->structureOutputSize = len;
 	return kIOReturnSuccess;
+}
+
+IOReturn RgfxAcceleratorUserClient::deviceMethod(uint32_t selector,
+                                                 IOExternalMethodArguments *arguments)
+{
+	if (selector == kRgfxIOGPUSelConfig) {
+		uint8_t config[kRgfxIOGPUConfigSize] = {};
+		*reinterpret_cast<uint64_t *>(config + 0x10) = kRgfxWorkingSetBytes;
+		*reinterpret_cast<uint64_t *>(config + 0x20) = owner ? owner->getRegionSize() : 0;
+		return rgfxWriteStructOut(arguments, config, sizeof(config));
+	}
+	// The device info, all zero: its u32 at 0x14 counts the u32 entries of a table at 0x18,
+	// which the base reads, so the device has none.
+	uint8_t info[kRgfxIOGPUDeviceInfoSize] = {};
+	return rgfxWriteStructOut(arguments, info, sizeof(info));
 }
 
 IOReturn RgfxAcceleratorUserClient::externalMethod(uint32_t selector,
@@ -195,39 +215,28 @@ IOReturn RgfxAcceleratorUserClient::externalMethod(uint32_t selector,
 		return super::externalMethod(selector, arguments, dispatch, target, reference);
 	}
 
-	// RGFX DIAG IOGPU construction handshake (remove before merge): answer Apple's IOGPU
-	// device-creation ABI so IOGPUDeviceCreateWithOptions (run inside [super
-	// initWithAcceleratorPort:]) can build the IOGPUMetalDevice base. During construction the
-	// base opens a type-5 UC and calls selector 2 (536-byte device-info) then selector 0
-	// (64-byte Config64); each MUST return success at its EXACT requested size, or Create
-	// returns NULL and the device inits to nil. In the 536-byte blob, offset 0x14 is a u32
-	// entry count the base mallocs (count*8) and loops over reading a u32 table at 0x18 --
-	// garbage there faults it -- so we keep it 0 to skip the loop. In Config64, offset 0x10 is
-	// the working-set budget and 0x20 the shared-memory size; both must be non-zero for a
-	// usable device. Every other selector (the lazy command-queue / resource paths: type-0
-	// sel 3/7/9/17 and all of type-4) is NOT reached during construction; a zeroed struct-out
-	// plus benign scalar success keeps anything that does reach them moving until they are
-	// built out.
-	if (arguments) {
-		for (uint32_t i = 0; i < arguments->scalarOutputCount; ++i)
-			arguments->scalarOutput[i] = (i == 0) ? 1ull : 0ull;
+	// The IOGPU base's device calls, on its own client.
+	if (ucType == kRgfxIOGPUDeviceUserClientType && arguments && arguments->scalarInputCount == 0 &&
+	    arguments->scalarOutputCount == 0 && arguments->structureInputSize == 0 &&
+	    ((selector == kRgfxIOGPUSelConfig &&
+	      arguments->structureOutputSize == kRgfxIOGPUConfigSize) ||
+	     (selector == kRgfxIOGPUSelDeviceInfo &&
+	      arguments->structureOutputSize == kRgfxIOGPUDeviceInfoSize)))
+		return deviceMethod(selector, arguments);
 
-		if (arguments->structureOutputSize > 0) {
-			uint8_t buf[kRgfxIOGPUStructOutMax];
-			uint32_t len = arguments->structureOutputSize;
-			if (len > sizeof(buf))
-				len = sizeof(buf);
-			bzero(buf, len);
-			if ((ucType & 0xffff) == kRgfxIOGPUDeviceInfoType &&
-			    selector == kRgfxIOGPUSelConfig64 && len >= 0x28) {
-				*reinterpret_cast<uint64_t *>(buf + 0x10) = kRgfxWorkingSetBytes;
-				*reinterpret_cast<uint64_t *>(buf + 0x20) = owner ? owner->getRegionSize() : 0;
-			}
-			// selector 2 (536): the 0x14 entry count stays 0 (skip the base's loop).
-			return rgfxWriteStructOut(arguments, buf, len);
-		}
+	// Nothing else is ours to answer. A caller of a selector we do not implement gets
+	// kIOReturnUnsupported and no output, logged once per (user-client type, selector).
+	static char site;
+	if (rgfxFirstCalls(&site, (static_cast<UInt64>(ucType) << 32) | selector, 1)) {
+		RgfxCaller caller;
+		IOLog("RGFX: user client type %u: selector 0x%x from %s[%d] is not supported "
+		      "(scalars %u/%u, struct %u/%u)\n",
+		      ucType, selector, caller.name, caller.pid, arguments ? arguments->scalarInputCount : 0,
+		      arguments ? arguments->scalarOutputCount : 0,
+		      arguments ? arguments->structureInputSize : 0,
+		      arguments ? arguments->structureOutputSize : 0);
 	}
-	return kIOReturnSuccess;
+	return kIOReturnUnsupported;
 }
 
 // RGFX DIAG (Wall-2 trace; remove before merge): the legacy external-method and trap

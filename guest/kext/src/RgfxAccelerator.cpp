@@ -126,16 +126,20 @@ void RgfxAccelerator::free()
 IOReturn RgfxAccelerator::newUserClient(task_t owningTask, void *securityID, UInt32 type,
                                         OSDictionary *properties, IOUserClient **handler)
 {
-	// RGFX DIAG (Wall-2 trace; remove before merge): the IOGPUMetalDevice base opens a
-	// user client during initWithAcceleratorPort. Log the type it requests, and
-	// (diagnostic) accept ANY type so the base proceeds and reveals its subsequent
-	// clientMemoryForType / externalMethod handshake, instead of rejecting non-zero
-	// types up front. Only Metal's device-open path reaches this.
+	// The types callers open, measured: ours (0), the display pipe (4), and the one the
+	// IOGPUMetalDevice base builds its device over (5). Any other is refused, logged once per
+	// type.
 	RgfxCaller caller;
-	IOLog("RGFX: newUserClient type=%u from %s[%d] (expected our type=%u)\n", type, caller.name,
-	      caller.pid, kRgfxAccelUserClientType);
+	IOLog("RGFX: newUserClient type=%u from %s[%d]\n", type, caller.name, caller.pid);
 	if (type == kRgfxDisplayPipeUserClientType)
 		return newDisplayPipe(owningTask, securityID, type, properties, handler);
+	if (type != kRgfxAccelUserClientType && type != kRgfxIOGPUDeviceUserClientType) {
+		static char site;
+		if (rgfxFirstCalls(&site, type, 1))
+			IOLog("RGFX: user client type %u from %s[%d] is not supported\n", type, caller.name,
+			      caller.pid);
+		return kIOReturnUnsupported;
+	}
 
 	RgfxAcceleratorUserClient *client = OSTypeAlloc(RgfxAcceleratorUserClient);
 	if (!client)

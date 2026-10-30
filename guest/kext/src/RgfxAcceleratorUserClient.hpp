@@ -64,6 +64,8 @@ private:
 	// The process's context (RgfxAcceleratorUserClientContexts.cpp): its selectors, and its
 	// release at the client's close or death (its queues, then the context, then its blocks).
 	IOReturn contextMethod(uint32_t selector, IOExternalMethodArguments *arguments);
+	// The IOGPU base's device calls on its type-5 client: its configuration and device info.
+	IOReturn deviceMethod(uint32_t selector, IOExternalMethodArguments *arguments);
 	IOReturn submitMethod(IOExternalMethodArguments *arguments);
 	IOReturn waitCompletionsMethod(IOExternalMethodArguments *arguments);
 	void releaseContext();
@@ -84,7 +86,9 @@ private:
 
 	task_t task;
 	RgfxAccelerator *owner;
-	UInt32 ucType; // RGFX DIAG (remove before merge): the opened user-client type
+	// The type it was opened as: ours (kRgfxAccelUserClientType) or the IOGPU base's device
+	// client (kRgfxIOGPUDeviceUserClientType); it decides which selectors it answers.
+	UInt32 ucType;
 };
 
 #endif // RGFX_ACCELERATOR_USER_CLIENT_HPP_
