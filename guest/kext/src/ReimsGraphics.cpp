@@ -602,9 +602,18 @@ bool ReimsGraphics::start(IOService *provider)
 	}
 	IOLog("ReimsGraphics: display %u, %u modes, region 0x%llx bytes\n", displayId, count, regionSize);
 
-	// The display pipe's index, which the wrangler and IOPresentment read off the framebuffer
-	// before it is published: our one display is pipe 0 of the accelerator (RgfxAccelerator sets
-	// IOAccelTypes once it has started).
+	// The display's accelerator and pipe, which the wrangler, CoreDisplay and IOPresentment read
+	// off the framebuffer when it is published: our one display is pipe 0 of the accelerator on
+	// the same PCI device, named by its service-plane path, which is the PCI device's path and
+	// the accelerator's class name whichever of the two starts first.
+	{
+		char path[512];
+		int length = sizeof(path) - sizeof("/RgfxAccelerator");
+		if (pci->getPath(path, &length, gIOServicePlane)) {
+			strlcat(path, "/RgfxAccelerator", sizeof(path));
+			setProperty("IOAccelTypes", path);
+		}
+	}
 	setProperty("IOAccelIndex", 0ull, 32);
 	setProperty("IOAccelRevision", 2ull, 32);
 
