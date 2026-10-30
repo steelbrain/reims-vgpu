@@ -180,6 +180,9 @@ pub(crate) struct Shared {
     device_submit: Mutex<Submit>,
     /// The device completion ring (the bundle's own): the stage-3 replies the host posts it.
     device_completion: Mutex<Producer>,
+    /// The device submission ring's count through the last message the host has carried out: a
+    /// command buffer waits for it to pass the creates published before it (`take_queue_messages`).
+    device_done: AtomicU64,
     /// The command queues' own rings and service threads, by queue id and by ring id.
     queues: Mutex<Queues>,
     /// A weak handle to this shared state, set at the device's make: a queue's service thread and
@@ -293,6 +296,7 @@ impl Device {
                 broken: false,
             }),
             device_completion: Mutex::new(device_producer),
+            device_done: AtomicU64::new(0),
             queues: Mutex::new(Queues::default()),
             weak_self: OnceLock::new(),
         });
@@ -506,6 +510,7 @@ impl Shared {
         completion.reset(&self.region);
         device_submit.consumer.reset(&self.region);
         device_submit.broken = false;
+        self.device_done.store(0, Ordering::Release);
         device_completion.reset(&self.region);
         *display = DisplayState::default();
         drop(device_completion);
@@ -690,13 +695,13 @@ impl Shared {
     /// host owes it posts on the device completion ring itself, so nothing is posted here.
     fn take_device_messages(&self) {
         loop {
-            let message = {
+            let (message, through) = {
                 let mut submit = self.device_submit.lock();
                 if !self.started() || submit.broken || self.ending() {
                     return;
                 }
                 match submit.consumer.next(&self.region) {
-                    Ok(Some(message)) => message,
+                    Ok(Some(message)) => (message, submit.consumer.consumed()),
                     Ok(None) => return,
                     Err(broken) => {
                         log::error!(
@@ -710,6 +715,7 @@ impl Shared {
                 }
             };
             control::device_message(self, &message);
+            self.device_done.store(through, Ordering::Release);
         }
     }
 
@@ -926,17 +932,19 @@ impl Shared {
             // Creates ride the device ring, whose sole consumer is the device thread; command
             // buffers ride per-queue rings (this thread). A create a buffer uses is posted before
             // it in guest order, so it is within the device ring's producer at the moment this
-            // thread takes the buffer. Wait for the device thread to consume up to there, so the
-            // resource is registered before the buffer's ops name it. This thread only reads the
-            // device ring's counts; it never consumes it, so the device ring keeps one consumer
-            // and its `consumer_idle` handshake is untouched (draining it here would break both).
+            // thread takes the buffer. Wait for the device thread to have carried out every message
+            // up to there, so the resource is registered before the buffer's ops name it: the
+            // consumer's own count moves when a message is taken, before it is decoded, so it
+            // is not enough. This thread only reads the device ring's counts; it never consumes
+            // it, so the device ring keeps one consumer and its `consumer_idle` handshake is
+            // untouched (draining it here would break both).
             let created_through = {
                 self.device_submit
                     .lock()
                     .consumer
                     .published_count(&self.region)
             };
-            while self.device_submit.lock().consumer.consumed() < created_through {
+            while self.device_done.load(Ordering::Acquire) < created_through {
                 if self.ending() || queue.ended() {
                     return;
                 }
