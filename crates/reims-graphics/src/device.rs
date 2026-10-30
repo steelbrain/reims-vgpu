@@ -126,10 +126,25 @@ pub trait Host: Send + Sync + 'static {
 
     /// Context `context` was closed (its process closed the device or died): the host drops every
     /// object whose id lies in the context's range (`context << RGFX_CONTEXT_OBJ_ID_SHIFT` and up,
-    /// below the next context's). Called on the control thread, in ring order, after the
-    /// context's queues were ended. The default does nothing.
-    fn context_closed(&self, context: u32) {
+    /// below the next context's), and gives `answer` ([`RGFX_STATUS_OK`]) once every command
+    /// buffer of the context it had committed has finished, from any thread: the kext then gives
+    /// the context's blocks out again. Called on the control thread, in ring order, after the
+    /// context's queues were ended. The default drops nothing and answers at once, for a host with
+    /// no stage-3 decoder.
+    fn context_closed(&self, context: u32, answer: CompleteAnswer) {
         let _ = context;
+        answer.answer(RGFX_STATUS_OK);
+    }
+
+    /// `BLOCK_RELEASE`: context `release.context` freed its region block (`release.offset`,
+    /// `release.size`), in which no live queue's ring lies. The host gives `answer` from any
+    /// thread: [`RGFX_STATUS_REFUSED`] at once where an object it holds lies in the block, else
+    /// [`RGFX_STATUS_OK`] once every command buffer of the context it had committed has finished.
+    /// The kext gives the block out again only on OK. Called on the control thread, in ring order.
+    /// The default answers OK at once, for a host with no stage-3 decoder.
+    fn block_released(&self, release: &RgfxBlockRelease, answer: CompleteAnswer) {
+        let _ = release;
+        answer.answer(RGFX_STATUS_OK);
     }
 
     /// Hands a stage-3 message to the host's decoder: from ring 0, on the control thread, an
@@ -276,6 +291,15 @@ impl QueueShared {
     fn end(&self) {
         self.ending.store(true, Ordering::Release);
         self.wake.wake();
+    }
+
+    /// Waits out a take of the submission ring or a post onto the completion ring that was under
+    /// way when the queue ended: each checks [`Self::ended`] with its ring held, so none starts
+    /// after this, and the queue's rings are not touched again.
+    fn fence(&self) {
+        debug_assert!(self.ended());
+        drop(self.submit.lock());
+        drop(self.complete.lock());
     }
 }
 
@@ -426,10 +450,13 @@ impl Device {
     }
 }
 
-/// The `COMPLETE` a `PRESENT_SURFACE` owes, which the host gives from any thread once the display
-/// shows the surface ([`Host::present_surface`]). It holds a weak reference to the device; an
-/// answer after the device has ended, or for a command taken before a reset, is dropped.
-pub struct PresentAnswer {
+/// The `COMPLETE` a ring-0 command owes, which the host gives from any thread once it has carried
+/// the command out: a `PRESENT_SURFACE` once the display shows the surface
+/// ([`Host::present_surface`]), a `CONTEXT_CLOSE` and a `BLOCK_RELEASE` once the command buffers
+/// they wait for have finished ([`Host::context_closed`], [`Host::block_released`]). It holds a
+/// weak reference to the device; an answer after the device has ended, or for a command taken
+/// before a reset, is dropped, and so is one never given.
+pub struct CompleteAnswer {
     /// The device's shared state, weakly.
     shared: Weak<Shared>,
     /// The command's `seqno`.
@@ -438,15 +465,18 @@ pub struct PresentAnswer {
     epoch: u64,
 }
 
-impl std::fmt::Debug for PresentAnswer {
+/// A `PRESENT_SURFACE`'s answer.
+pub type PresentAnswer = CompleteAnswer;
+
+impl std::fmt::Debug for CompleteAnswer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PresentAnswer")
+        f.debug_struct("CompleteAnswer")
             .field("seqno", &self.seqno)
             .finish_non_exhaustive()
     }
 }
 
-impl PresentAnswer {
+impl CompleteAnswer {
     /// Posts the `COMPLETE` with `status` onto the control completion ring, waiting for room.
     pub fn answer(self, status: u32) {
         if let Some(shared) = self.shared.upgrade() {
@@ -674,9 +704,9 @@ impl Shared {
     }
 
     /// `CONTEXT_CLOSE` of `context` (the module doc), on the control thread: its queues end, then
-    /// the host drops its objects.
-    pub(crate) fn close_context(&self, context: u32) {
-        {
+    /// the host drops its objects and gives `answer` once its command buffers have finished.
+    pub(crate) fn close_context(&self, context: u32, answer: CompleteAnswer) {
+        let ended: Vec<Arc<QueueShared>> = {
             let mut queues = self.queues.lock();
             let ended: Vec<Arc<QueueShared>> = queues
                 .by_obj
@@ -687,9 +717,29 @@ impl Shared {
             for queue in &ended {
                 queues.remove(queue);
             }
+            ended
+        };
+        // No ended queue's thread reads or writes its rings past this, so the kext may give
+        // their blocks out again once the close is answered.
+        for queue in &ended {
+            queue.fence();
         }
-        self.host.context_closed(context);
+        self.host.context_closed(context, answer);
         log::info!(target: "reims_graphics", "context {context} closed");
+    }
+
+    /// Whether a live queue's submission or completion ring lies in the `size` bytes at `offset`
+    /// (a `BLOCK_RELEASE` of a block that holds one is refused).
+    pub(crate) fn rings_in(&self, offset: u64, size: u64) -> bool {
+        let end = offset.saturating_add(size);
+        let meets = |at: u64, data: u32| {
+            let ring_end = at.saturating_add(u64::from(RGFX_RING_HEADER_SIZE) + u64::from(data));
+            at < end && offset < ring_end
+        };
+        self.queues.lock().by_obj.values().any(|q| {
+            meets(q.create.submit_offset, q.create.submit_data_size)
+                || meets(q.create.complete_offset, q.create.complete_data_size)
+        })
     }
 
     /// A completion poster onto the control completion ring, for a ring-0 message's replies.
@@ -805,17 +855,25 @@ impl Shared {
             wake,
             ending: AtomicBool::new(false),
         });
-        {
+        let ended: Vec<Arc<QueueShared>> = {
             let mut queues = self.queues.lock();
             // A re-open under the same queue id or ring offset ends the old one first.
-            if let Some(old) = queues.by_obj.get(&q.obj_id).cloned() {
-                queues.remove(&old);
-            }
-            if let Some(old) = queues.by_ring.get(&q.submit_offset).cloned() {
-                queues.remove(&old);
+            let ended: Vec<Arc<QueueShared>> = [
+                queues.by_obj.get(&q.obj_id).cloned(),
+                queues.by_ring.get(&q.submit_offset).cloned(),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            for old in &ended {
+                queues.remove(old);
             }
             queues.by_obj.insert(q.obj_id, Arc::clone(&queue));
             queues.by_ring.insert(q.submit_offset, Arc::clone(&queue));
+            ended
+        };
+        for old in &ended {
+            old.fence();
         }
         let service = Arc::clone(&queue);
         let started = std::thread::Builder::new()
@@ -835,17 +893,22 @@ impl Shared {
     /// Ends and forgets the queue `obj_id`'s per-queue service, where it has one (an
     /// `OBJECT_DESTROY` of it); false where `obj_id` is no queue's.
     pub(crate) fn destroy_queue(&self, obj_id: u64) -> bool {
-        let mut queues = self.queues.lock();
-        let Some(queue) = queues.by_obj.get(&obj_id).cloned() else {
-            return false;
+        let queue = {
+            let mut queues = self.queues.lock();
+            let Some(queue) = queues.by_obj.get(&obj_id).cloned() else {
+                return false;
+            };
+            queues.remove(&queue);
+            queue
         };
-        queues.remove(&queue);
+        // Its rings are no longer a live queue's (`rings_in`): nothing touches them past this.
+        queue.fence();
         true
     }
 
-    /// The answer `PRESENT_SURFACE` command `seqno` owes ([`PresentAnswer`]).
-    pub(crate) fn present_answer(&self, seqno: u64) -> PresentAnswer {
-        PresentAnswer {
+    /// The answer ring-0 command `seqno` owes ([`CompleteAnswer`]).
+    pub(crate) fn complete_answer(&self, seqno: u64) -> CompleteAnswer {
+        CompleteAnswer {
             shared: self.weak_self.get().cloned().unwrap_or_else(Weak::new),
             seqno,
             epoch: self.epoch.load(Ordering::Acquire),
@@ -903,7 +966,11 @@ impl Shared {
             }
             queue.wake.sleep(None);
             if idle {
-                queue.submit.lock().consumer.awake(&self.region);
+                // An ended queue's rings may be another process's block by now (`fence`).
+                let submit = queue.submit.lock();
+                if !queue.ended() {
+                    submit.consumer.awake(&self.region);
+                }
             }
         }
     }

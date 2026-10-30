@@ -272,7 +272,8 @@ the host answers it. A queue's `QUEUE_CREATE` goes the same way, its rings
 checked to lie in the process's blocks, and is answered once the host has the
 rings. At the process's close or death the kext destroys its queues, then
 closes its context (`CONTEXT_CLOSE`: the host drops its objects, then
-answers), then frees its chunks of resource ids and its blocks. A command
+answers once the context's command buffers have finished), then frees its
+chunks of resource ids and, on that answer only, its blocks. A command
 buffer is decoded once the host has carried out every control-ring message
 published before its queue's thread took it.
 
@@ -412,6 +413,27 @@ and a queue's ring carries nothing but command buffers: a message of any other
 type there is refused, since it would pass the kext's checks by.
 A create the kext posted but whose answer did not come in time is destroyed by
 the kext right behind it, so a retry under a new id leaves nothing behind.
+
+**A block outlives what lies in it.** A region block is given out again only
+once the host has said that nothing of it is in use. A process's free marks the
+block freed: from then on no message of the process can name it, and no one can
+take it. The free returns at once, as Metal's releases never block. A thread
+call of the kext's own then posts the block's `BLOCK_RELEASE` on ring 0, behind
+every message the process posted before the free, and waits for the answer.
+The host refuses the release at once where an object it holds lies in the
+block: a buffer or heap over host memory, or a buffer, texture or heap placed
+in one, which keeps its parent's span after the parent's destroy. It also
+refuses one where a live queue's ring lies in the block. Otherwise it answers
+OK once every command buffer the context committed before the release has run
+its completion handler. Command buffers committed later do not hold it up. On
+OK the block goes back to the pool; on a refusal, or no answer in time, it
+stays out of use until its process's close. A block a create in flight names
+is pinned from the kext's check until the create is answered, and a free of it
+meanwhile fails busy, so no block changes hands between the check and the
+host's carrying out of the message. A context's close is answered under the
+same rule, after its objects are dropped and its queues' threads are past
+their rings, and the kext frees the process's blocks only on that answer. A
+close that is not answered keeps them from use for good.
 
 **Handles and addresses.** Every guest Metal object has a 64-bit `ObjId` the
 guest picks, unique per device; the host keeps an `ObjId` → `Platform` handle

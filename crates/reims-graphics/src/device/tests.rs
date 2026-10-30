@@ -758,8 +758,9 @@ impl Host for QueueTestHost {
     fn scanout_written(&self, _offset: u64, _length: u64) -> bool {
         false
     }
-    fn context_closed(&self, context: u32) {
+    fn context_closed(&self, context: u32, answer: crate::device::CompleteAnswer) {
         self.closed.lock().push(context);
+        answer.answer(RGFX_STATUS_OK);
     }
     fn stage3_message(&self, completion: &crate::device::CompletionPoster, message: &[u8]) {
         let (header, _) = RgfxMsgHeader::read_from_prefix(message).unwrap();

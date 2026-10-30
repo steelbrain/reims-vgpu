@@ -51,6 +51,7 @@
 #include <IOKit/graphics/IOAccelerator.h>
 #include <IOKit/pci/IOPCIDevice.h>
 
+#include "RgfxBlockTable.hpp"
 #include "reims_graphics_wire.h"
 
 // OUR user-client protocol (not Apple's IOGPU ABI). The bundle's wire handshake
@@ -84,7 +85,10 @@ enum {
 	kRgfxAccelMethodOpenContext = 0x100,
 	// A region block: in size, align (a power of two); out: its region offset.
 	kRgfxAccelMethodAlloc = 0x101,
-	// Frees the client's block at the region offset scalarInput[0].
+	// Frees the client's block at the region offset scalarInput[0], and returns at once: the
+	// block is no longer the client's to name, and is given out again once the device answers
+	// its BLOCK_RELEASE OK (RgfxBlockTable.hpp). kIOReturnBusy while a create naming it is in
+	// flight.
 	kRgfxAccelMethodFree = 0x102,
 	// Opens a command queue: in obj_id, submit offset, complete offset, submit data size,
 	// complete data size, priority; out: the device's status (RGFX_STATUS_OK, or the
@@ -128,14 +132,6 @@ struct RgfxWatchedRing {
 	UInt64 lastProducer;
 };
 
-// A block the accelerator handed out of the region, and its owner.
-struct RgfxBlock {
-	UInt64 offset;
-	UInt64 size;
-	const void *owner;
-};
-
-
 class RgfxAccelerator : public IOAccelerator {
 	OSDeclareDefaultStructors(RgfxAccelerator);
 
@@ -165,17 +161,29 @@ public:
 	// The processes' contexts (RgfxAcceleratorContexts.cpp). A context number is handed out once
 	// (from 1); a slot of the GPU-address space is held until the close.
 	IOReturn openContext(UInt32 *context, UInt32 *slot);
-	void closeContext(UInt32 context, UInt32 slot);
+	// True where the device answered the close OK: it holds nothing of the context, and every
+	// command buffer of it has finished.
+	bool closeContext(UInt32 context, UInt32 slot);
 	// Chunks of the texture resource ids, each owned by `owner` for context `context` and posted
 	// to the device (RESOURCE_ID_CHUNK) before takeIdChunk returns its first id; the owner's are
 	// freed after its context's close is answered.
 	IOReturn takeIdChunk(const void *owner, UInt32 context, UInt64 *firstId);
 	void freeIdChunks(const void *owner);
-	// Blocks of the region past RGFX_CONTEXT_ALLOCATIONS_OFFSET, each owned by `owner`.
-	IOReturn allocBlock(const void *owner, UInt64 size, UInt64 align, UInt64 *offset);
+	// Blocks of the region past RGFX_CONTEXT_ALLOCATIONS_OFFSET (RgfxBlockTable.hpp), each owned
+	// by `owner` of context `context`. freeBlock returns at once; the block is given out again
+	// once the device answers its BLOCK_RELEASE OK, posted from a thread of the kext's own, and
+	// is kIOReturnBusy while a create naming it is in flight (pinRange). freeBlocks frees the
+	// owner's blocks after its close is answered; keepBlocks keeps them from use for good after
+	// a close that was not.
+	IOReturn allocBlock(const void *owner, UInt32 context, UInt64 size, UInt64 align,
+	                    UInt64 *offset);
 	IOReturn freeBlock(const void *owner, UInt64 offset);
 	void freeBlocks(const void *owner);
-	bool ownsRange(const void *owner, UInt64 offset, UInt64 length);
+	void keepBlocks(const void *owner);
+	// Pins the owner's live block that holds the `length` bytes at `offset`, for a create that
+	// names them, until unpinBlock: false where no block of the owner's does.
+	bool pinRange(const void *owner, UInt64 offset, UInt64 length, RgfxBlockPin *pin);
+	void unpinBlock(const RgfxBlockPin &pin);
 	// The processes' object lifecycle, on the framebuffer's control ring
 	// (ReimsGraphics::postLifecycle). openQueue's QUEUE_CREATE is answered once the device has
 	// the queue's rings; closeContext's CONTEXT_CLOSE once the device has dropped the context's

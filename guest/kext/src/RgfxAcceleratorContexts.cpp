@@ -14,8 +14,11 @@
  *     (RESOURCE_ID_CHUNK) before the process learns of it, and the client's are freed at its
  *     close, after its CONTEXT_CLOSE is answered.
  *   - Region blocks past RGFX_CONTEXT_ALLOCATIONS_OFFSET (rings, Shared buffers and heaps,
- *     surfaces), from a first-fit allocator over a table sorted by offset, each owned by the
- *     client that asked; the client's are freed at its close.
+ *     surfaces), from a first-fit allocator over a table sorted by offset (RgfxBlockTable.hpp),
+ *     each owned by the client that asked. A freed block is given out again once the device
+ *     answers its BLOCK_RELEASE OK, which a thread call of the kext's own posts, so a free
+ *     returns at once; the client's are freed after its close is answered, and kept from use
+ *     for good where it is not.
  *   - The completion rings of the clients' queues, watched: the device raises its one vector
  *     for a queue's completion as for the control ring's, and the framebuffer's work loop then
  *     calls queueInterrupt, which wakes the client of each ring whose producer moved and
@@ -33,6 +36,7 @@
 #include "ReimsGraphics.hpp"
 
 #include <IOKit/IOLib.h>
+#include <kern/thread_call.h>
 #include <libkern/libkern.h>
 
 namespace {
@@ -47,6 +51,9 @@ constexpr UInt32 kRingConsumer = 0x40;
 // control ring in order, behind whatever pipeline compiles were posted before them.
 constexpr UInt32 kQueueAnswerMs = 30000;
 constexpr UInt32 kCloseAnswerMs = 10000;
+// How long a BLOCK_RELEASE waits for its answer, which comes once the context's command buffers
+// committed before it have finished. One not answered in time keeps its block.
+constexpr UInt32 kReleaseAnswerMs = 10000;
 // Every block is page-aligned and a whole number of pages, so a block can back a mapping.
 constexpr UInt64 kPage = 0x1000;
 
@@ -68,10 +75,7 @@ struct ContextState {
 	UInt32 slotsHeld;
 	UInt32 nextSlot;
 	UInt32 nextContext;
-	RgfxBlock *blocks;
-	UInt32 blockCount;
-	UInt64 blocksStart;
-	UInt64 blocksEnd;
+	RgfxBlockTable blockTable;
 	// Under contextLock: the client holding each chunk of the texture resource ids, null where
 	// none does.
 	const void *idChunkOwners[RGFX_RESOURCE_ID_CHUNKS];
@@ -81,16 +85,20 @@ struct ContextState {
 	RgfxWatchedRing *watched;
 	UInt32 watchedCount;
 	bool hooked;
+	// The thread call that posts freed blocks' releases (releaseFreedBlocks).
+	thread_call_t releaseCall;
 };
-ContextState state = {nullptr, 0, 0, 1, nullptr, 0, 0, 0, {}, nullptr, nullptr, 0, false};
+ContextState state = {
+    nullptr, 0, 0, 1, {nullptr, 0, kMaxBlocks, 0, 0, 0}, {}, nullptr, nullptr, 0, false, nullptr};
 IOLock *&contextLock = state.contextLock;
 UInt32 &slotsHeld = state.slotsHeld;
 UInt32 &nextSlot = state.nextSlot;
 UInt32 &nextContext = state.nextContext;
-RgfxBlock *&blocks = state.blocks;
-UInt32 &blockCount = state.blockCount;
-UInt64 &blocksStart = state.blocksStart;
-UInt64 &blocksEnd = state.blocksEnd;
+RgfxBlockTable &blockTable = state.blockTable;
+RgfxBlock *&blocks = state.blockTable.blocks;
+UInt64 &blocksStart = state.blockTable.start;
+UInt64 &blocksEnd = state.blockTable.end;
+thread_call_t &releaseCall = state.releaseCall;
 const void *(&idChunkOwners)[RGFX_RESOURCE_ID_CHUNKS] = state.idChunkOwners;
 IOLock *&watchLock = state.watchLock;
 RgfxWatchedRing *&watched = state.watched;
@@ -108,6 +116,41 @@ void queueInterruptHook(OSObject *target)
 	if (RgfxAccelerator *accel = OSDynamicCast(RgfxAccelerator, target))
 		accel->queueInterrupt();
 }
+
+// The release thread call: posts each freed block's BLOCK_RELEASE in turn and waits for its
+// answer here, never on the freeing thread. OK gives the block out again; a refusal, or no answer
+// in time, keeps it until its owner's close is answered.
+void releaseFreedBlocks(thread_call_param_t accelerator, thread_call_param_t)
+{
+	RgfxAccelerator *accel = static_cast<RgfxAccelerator *>(accelerator);
+	for (;;) {
+		RgfxBlock block;
+		IOLockLock(contextLock);
+		bool any = rgfxBlockNextRelease(blockTable, &block);
+		IOLockUnlock(contextLock);
+		if (!any)
+			return;
+		RgfxBlockRelease release = {};
+		release.context = block.context;
+		release.offset = block.offset;
+		release.size = block.size;
+		RgfxComplete answer = {};
+		UInt32 length = 0;
+		IOReturn r = accel->postLifecycle(RGFX_CMD_BLOCK_RELEASE, &release, sizeof(release),
+		                                  RGFX_EVT_COMPLETE, &answer, sizeof(answer), &length,
+		                                  nullptr, kReleaseAnswerMs);
+		bool ok = r == kIOReturnSuccess && length >= sizeof(answer) &&
+		          answer.status == RGFX_STATUS_OK;
+		IOLockLock(contextLock);
+		rgfxBlockReleased(blockTable, block.offset, block.serial, ok);
+		IOLockUnlock(contextLock);
+		if (!ok)
+			IOLog("RgfxAccelerator: context %u's block 0x%llx (0x%llx bytes) is kept: %s\n",
+			      block.context, block.offset, block.size,
+			      r == kIOReturnSuccess ? "the device refused its release"
+			                            : "its release was not answered");
+	}
+}
 } // namespace
 
 bool RgfxAccelerator::startContexts()
@@ -124,14 +167,17 @@ bool RgfxAccelerator::startContexts()
 	RgfxBlock *table = static_cast<RgfxBlock *>(IOMalloc(sizeof(RgfxBlock) * kMaxBlocks));
 	RgfxWatchedRing *rings =
 	    static_cast<RgfxWatchedRing *>(IOMalloc(sizeof(RgfxWatchedRing) * kMaxWatched));
+	// The accelerator is the device's one, for the kernel's life, as the state is.
+	thread_call_t call = thread_call_allocate(releaseFreedBlocks, this);
 	RgfxBlock *expected = nullptr;
-	if (lock && wlock && table && rings &&
+	if (lock && wlock && table && rings && call &&
 	    __atomic_compare_exchange_n(&blocks, &expected, table, false, __ATOMIC_ACQ_REL,
 	                                __ATOMIC_ACQUIRE)) {
 		bzero(table, sizeof(RgfxBlock) * kMaxBlocks);
 		bzero(rings, sizeof(RgfxWatchedRing) * kMaxWatched);
 		watched = rings;
 		watchLock = wlock;
+		releaseCall = call;
 		blocksStart = RGFX_CONTEXT_ALLOCATIONS_OFFSET;
 		blocksEnd = (regionSize - RGFX_CURSOR_SPAN) & ~(kPage - 1);
 		__atomic_store_n(&contextLock, lock, __ATOMIC_RELEASE);
@@ -147,6 +193,8 @@ bool RgfxAccelerator::startContexts()
 		IOFree(table, sizeof(RgfxBlock) * kMaxBlocks);
 	if (rings)
 		IOFree(rings, sizeof(RgfxWatchedRing) * kMaxWatched);
+	if (call)
+		thread_call_free(call);
 	// Another opener is making it: wait for it to publish.
 	while (expected && !__atomic_load_n(&contextLock, __ATOMIC_ACQUIRE))
 		IOSleep(1);
@@ -182,25 +230,30 @@ IOReturn RgfxAccelerator::openContext(UInt32 *context, UInt32 *slot)
 	return kIOReturnSuccess;
 }
 
-void RgfxAccelerator::closeContext(UInt32 context, UInt32 slot)
+bool RgfxAccelerator::closeContext(UInt32 context, UInt32 slot)
 {
-	// The device ends the context's queues and drops its objects before it answers; the
-	// caller has closed its queues already, and frees its blocks after this.
+	// The device ends the context's queues and drops its objects, and answers once the
+	// context's command buffers have finished; the caller has closed its queues already, and
+	// frees its blocks after this only where the close was answered OK.
 	RgfxContextClose close = {};
 	close.context = context;
-	UInt8 reply[ReimsGraphics::kLifecycleReplyMax];
+	RgfxComplete answer = {};
 	UInt32 length = 0;
 	IOReturn r = postLifecycle(RGFX_CMD_CONTEXT_CLOSE, &close, sizeof(close), RGFX_EVT_COMPLETE,
-	                           reply, sizeof(reply), &length, nullptr, kCloseAnswerMs);
-	if (r != kIOReturnSuccess)
-		IOLog("RgfxAccelerator: context %u: the device did not answer its close (0x%x)\n",
-		      context, r);
+	                           &answer, sizeof(answer), &length, nullptr, kCloseAnswerMs);
+	bool closed = r == kIOReturnSuccess && length >= sizeof(answer) &&
+	              answer.status == RGFX_STATUS_OK;
+	if (!closed)
+		IOLog("RgfxAccelerator: context %u: the device did not answer its close (0x%x, "
+		      "status %u)\n",
+		      context, r, length >= sizeof(answer) ? answer.status : 0);
 	if (contextLock && slot < RGFX_CONTEXT_SLOTS) {
 		IOLockLock(contextLock);
 		slotsHeld &= ~(1u << slot);
 		IOLockUnlock(contextLock);
 	}
 	IOLog("RgfxAccelerator: context %u closed (slot %u)\n", context, slot);
+	return closed;
 }
 
 // MARK: - Resource ids
@@ -256,41 +309,24 @@ void RgfxAccelerator::freeIdChunks(const void *owner)
 
 // MARK: - Blocks
 
-IOReturn RgfxAccelerator::allocBlock(const void *owner, UInt64 size, UInt64 align, UInt64 *offset)
+IOReturn RgfxAccelerator::allocBlock(const void *owner, UInt32 context, UInt64 size, UInt64 align,
+                                    UInt64 *offset)
 {
-	if (!contextLock || size == 0 || align == 0 || (align & (align - 1)) != 0)
+	if (!contextLock)
 		return kIOReturnBadArgument;
-	if (align < kPage)
-		align = kPage;
-	if (size > blocksEnd - blocksStart)
-		return kIOReturnNoSpace;
-	size = alignUp(size, kPage);
 	IOLockLock(contextLock);
-	if (blockCount == kMaxBlocks) {
-		IOLockUnlock(contextLock);
-		return kIOReturnNoResources;
-	}
-	// First fit: the first gap, in offset order, that holds the aligned block.
-	UInt64 cursor = blocksStart;
-	UInt32 at = 0;
-	for (; at <= blockCount; at++) {
-		UInt64 start = alignUp(cursor, align);
-		UInt64 gapEnd = at < blockCount ? blocks[at].offset : blocksEnd;
-		if (start <= gapEnd && size <= gapEnd - start) {
-			memmove(&blocks[at + 1], &blocks[at], sizeof(RgfxBlock) * (blockCount - at));
-			blocks[at].offset = start;
-			blocks[at].size = size;
-			blocks[at].owner = owner;
-			blockCount++;
-			*offset = start;
-			IOLockUnlock(contextLock);
-			return kIOReturnSuccess;
-		}
-		if (at < blockCount)
-			cursor = blocks[at].offset + blocks[at].size;
-	}
+	RgfxBlockResult r = rgfxBlockAlloc(blockTable, owner, context, size, align, offset);
 	IOLockUnlock(contextLock);
-	return kIOReturnNoSpace;
+	switch (r) {
+	case kRgfxBlockOk:
+		return kIOReturnSuccess;
+	case kRgfxBlockNoSpace:
+		return kIOReturnNoSpace;
+	case kRgfxBlockTableFull:
+		return kIOReturnNoResources;
+	default:
+		return kIOReturnBadArgument;
+	}
 }
 
 IOReturn RgfxAccelerator::freeBlock(const void *owner, UInt64 offset)
@@ -298,22 +334,15 @@ IOReturn RgfxAccelerator::freeBlock(const void *owner, UInt64 offset)
 	if (!contextLock)
 		return kIOReturnNotReady;
 	IOLockLock(contextLock);
-	// Binary search: the table is sorted by offset.
-	UInt32 lo = 0, hi = blockCount;
-	while (lo < hi) {
-		UInt32 mid = (lo + hi) / 2;
-		if (blocks[mid].offset < offset)
-			lo = mid + 1;
-		else
-			hi = mid;
-	}
-	if (lo == blockCount || blocks[lo].offset != offset || blocks[lo].owner != owner) {
-		IOLockUnlock(contextLock);
-		return kIOReturnBadArgument;
-	}
-	memmove(&blocks[lo], &blocks[lo + 1], sizeof(RgfxBlock) * (blockCount - lo - 1));
-	blockCount--;
+	RgfxBlockResult r = rgfxBlockFree(blockTable, owner, offset);
 	IOLockUnlock(contextLock);
+	if (r == kRgfxBlockBusy)
+		return kIOReturnBusy;
+	if (r != kRgfxBlockOk)
+		return kIOReturnBadArgument;
+	// The release goes from the thread call, after every message the client posted before
+	// this free; the block is no one's to name meanwhile.
+	thread_call_enter(releaseCall);
 	return kIOReturnSuccess;
 }
 
@@ -322,37 +351,42 @@ void RgfxAccelerator::freeBlocks(const void *owner)
 	if (!contextLock)
 		return;
 	IOLockLock(contextLock);
-	UInt32 kept = 0, freed = 0;
-	for (UInt32 i = 0; i < blockCount; i++) {
-		if (blocks[i].owner == owner) {
-			freed++;
-			continue;
-		}
-		blocks[kept++] = blocks[i];
-	}
-	blockCount = kept;
+	UInt32 freed = rgfxBlockFreeOwner(blockTable, owner);
 	IOLockUnlock(contextLock);
 	if (freed)
 		IOLog("RgfxAccelerator: %u blocks freed\n", freed);
 }
 
-bool RgfxAccelerator::ownsRange(const void *owner, UInt64 offset, UInt64 length)
+void RgfxAccelerator::keepBlocks(const void *owner)
+{
+	if (!contextLock)
+		return;
+	IOLockLock(contextLock);
+	UInt32 kept = rgfxBlockKeepOwner(blockTable, owner);
+	IOLockUnlock(contextLock);
+	if (kept)
+		IOLog("RgfxAccelerator: %u blocks kept from use: their context's close was not "
+		      "answered\n",
+		      kept);
+}
+
+bool RgfxAccelerator::pinRange(const void *owner, UInt64 offset, UInt64 length, RgfxBlockPin *pin)
 {
 	if (!contextLock)
 		return false;
 	IOLockLock(contextLock);
-	bool owned = false;
-	for (UInt32 i = 0; i < blockCount; i++) {
-		const RgfxBlock &b = blocks[i];
-		if (b.offset > offset)
-			break;
-		if (offset - b.offset <= b.size && length <= b.size - (offset - b.offset)) {
-			owned = b.owner == owner;
-			break;
-		}
-	}
+	bool pinned = rgfxBlockPin(blockTable, owner, offset, length, pin);
 	IOLockUnlock(contextLock);
-	return owned;
+	return pinned;
+}
+
+void RgfxAccelerator::unpinBlock(const RgfxBlockPin &pin)
+{
+	if (!contextLock)
+		return;
+	IOLockLock(contextLock);
+	rgfxBlockUnpin(blockTable, pin);
+	IOLockUnlock(contextLock);
 }
 
 // MARK: - The queues' completion rings

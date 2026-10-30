@@ -33,11 +33,12 @@ use reims_graphics::wire::{
     RGFX_CMD_COMMAND_BUFFER, RGFX_CMD_COMPUTE_PIPELINE_CREATE, RGFX_CMD_LIBRARY_CREATE,
     RGFX_CMD_LIBRARY_FROM_REGION, RGFX_CMD_LIBRARY_LOOKUP, RGFX_CMD_OBJECT_DESTROY,
     RGFX_CMD_RENDER_PIPELINE_CREATE, RGFX_CONTEXT_OBJ_ID_SHIFT, RGFX_DEVICE_INFO_OFFSET,
-    RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK, RgfxCbComplete, RgfxLibraryLookup, RgfxMsgHeader,
-    RgfxPipelineReflection,
+    RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK, RGFX_STATUS_REFUSED, RgfxBlockRelease,
+    RgfxCbComplete, RgfxLibraryLookup, RgfxMsgHeader, RgfxPipelineReflection,
 };
 use reims_graphics::{
-    CompletionPoster, CursorImage, FixedScreen, Host, Mode, PresentAnswer, Scanout, Screen,
+    CompleteAnswer, CompletionPoster, CursorImage, FixedScreen, Host, Mode, PresentAnswer, Scanout,
+    Screen,
 };
 use reims_vgpu_core::platform::Platform;
 use reims_vgpu_core::platform::device::GpuDevice;
@@ -344,21 +345,54 @@ impl<P: Platform> Presented<P> {
 
 impl<P: ApiPlatform> GraphicsControl<P> {
     /// Drops every object of context `context` (its process closed the device or died), and the
-    /// surfaces' entries whose objects went with them.
-    fn close_context(&self, context: u32) {
+    /// surfaces' entries whose objects went with them, then gives `answer` once every command
+    /// buffer of the context the decoder committed has finished: the kext then gives the
+    /// context's blocks out again.
+    fn close_context(&self, context: u32, answer: CompleteAnswer) {
         entry::run(|_| {
-            let dropped = {
+            let (dropped, drain) = {
                 let mut decoder = self.decoder.lock();
                 let dropped = decoder.drop_context(context);
                 decoder.forget_dropped_surfaces();
                 self.pending.cancel_context(context);
-                dropped
+                let drain = decoder.drain_context(
+                    context,
+                    true,
+                    Box::new(move || answer.answer(RGFX_STATUS_OK)),
+                );
+                (dropped, drain)
             };
             log::info!(
                 target: "reims_vgpu::graphics",
                 "context {context} closed: {dropped} objects dropped"
             );
+            drop(drain);
         });
+    }
+
+    /// `BLOCK_RELEASE` (`Host::block_released`): refused at once where an object the decoder
+    /// holds lies in the block, else answered once every command buffer of the block's context
+    /// the decoder committed has finished.
+    fn release_block(&self, release: &RgfxBlockRelease, answer: CompleteAnswer) {
+        let mut decoder = self.decoder.lock();
+        if decoder.span_in_use(release.offset, release.size) {
+            drop(decoder);
+            log::warn!(
+                target: "reims_vgpu::graphics",
+                "context {} freed its block of {:#x} bytes at {:#x} while an object lies in it: \
+                 the block is kept",
+                release.context, release.size, release.offset
+            );
+            answer.answer(RGFX_STATUS_REFUSED);
+            return;
+        }
+        let drain = decoder.drain_context(
+            release.context,
+            false,
+            Box::new(move || answer.answer(RGFX_STATUS_OK)),
+        );
+        drop(decoder);
+        drop(drain);
     }
 
     /// Carries out one stage-3 message under a library entry: from ring 0 an object-lifecycle create
@@ -636,8 +670,12 @@ impl<P: ApiPlatform> Host for CallbackHost<P> {
         self.control.present_surface(iosurface_id, answer);
     }
 
-    fn context_closed(&self, context: u32) {
-        self.control.close_context(context);
+    fn context_closed(&self, context: u32, answer: CompleteAnswer) {
+        self.control.close_context(context, answer);
+    }
+
+    fn block_released(&self, release: &RgfxBlockRelease, answer: CompleteAnswer) {
+        self.control.release_block(release, answer);
     }
 
     fn stage3_message(&self, completion: &CompletionPoster, message: &[u8]) {

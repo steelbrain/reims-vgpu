@@ -21,6 +21,8 @@
 //! the GPU's queue; the ring loop's handler turns the fault into a command-buffer
 //! error.
 
+use std::sync::Arc;
+
 use reims_graphics::ops::{
     RGFX_COMMAND_BUFFER_OPS_OFFSET, RGFX_COMPUTE_PASS_FLAG_DISPATCH_TYPE, RGFX_OP_BODY_OFFSET,
     RGFX_OP_ENCODER_BEGIN_BLIT, RGFX_OP_ENCODER_BEGIN_COMPUTE, RGFX_OP_ENCODER_BEGIN_RENDER,
@@ -44,7 +46,9 @@ use reims_vgpu_core::raise::{OnFault, Raise, RaiseResult};
 use zerocopy::FromBytes;
 
 use super::super::completion::cb_complete;
-use super::{DecodeError, GraphicsDecoder, ObjHandle, blit, compute, op_fault, read, render};
+use super::{
+    DecodeError, Drain, GraphicsDecoder, ObjHandle, blit, compute, op_fault, read, render,
+};
 
 /// The op stream runs under a live raise handler (the ring loop's), so an encode's
 /// raise returns for the handler to catch.
@@ -62,10 +66,11 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// Carries out one `COMMAND_BUFFER` message (`decode`'s
     /// [`RGFX_CMD_COMMAND_BUFFER`](reims_graphics::wire::RGFX_CMD_COMMAND_BUFFER)
     /// arm): opens a command buffer on the named queue, walks the op stream, and
-    /// commits with a completion handler.
+    /// commits with a completion handler, which holds `drain` (its context's) until it has run.
     pub(super) fn decode_command_buffer(
         &self,
         message: &[u8],
+        drain: Option<Arc<Drain>>,
     ) -> RaiseResult<Result<(), DecodeError>> {
         let Some(m) = read::<RgfxCommandBuffer>(message) else {
             return Ok(Err(DecodeError::Malformed));
@@ -107,6 +112,8 @@ impl<P: Platform> GraphicsDecoder<P> {
                 if let Some(sink) = &sink {
                     sink(record);
                 }
+                // The buffer's work and its completion are done: a drain of its context may end.
+                drop(drain);
             }),
         )?;
         cb.commit(ON)?;

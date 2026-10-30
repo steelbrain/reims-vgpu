@@ -3,7 +3,9 @@ use std::time::Duration;
 
 use reims_graphics::ops::{RGFX_COMMAND_BUFFER_OPS_OFFSET, RgfxCommandBuffer};
 use reims_graphics::wire::*;
+use reims_vgpu_core::platform::ObjId;
 use reims_vgpu_core::platform::device::GpuDevice;
+use reims_vgpu_core::platform::types::CommandBufferStatus;
 use reims_vgpu_core::testkit::FakePlatform;
 use reims_vgpu_core::testkit::objects::CompleteOn;
 use zerocopy::{FromBytes, IntoBytes};
@@ -1526,4 +1528,203 @@ fn a_timed_out_create_s_destroy_leaves_only_the_retry() {
     ))
     .unwrap();
     assert_eq!(refused.status, RGFX_PIPELINE_REFUSED);
+}
+
+/// A `BLOCK_RELEASE` of context `context`'s block of `size` bytes at `offset`, as the kext posts
+/// it.
+fn block_release(context: u32, offset: u64, size: u64) -> Vec<u8> {
+    RgfxBlockRelease {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_BLOCK_RELEASE,
+            size: 0,
+            seqno: 0,
+        },
+        context,
+        reserved_14: 0,
+        offset,
+        size,
+    }
+    .as_bytes()
+    .to_vec()
+}
+
+/// A `BUFFER_OVER_HOST_MEMORY` of `length` bytes at region offset `offset`.
+fn buffer_over_host_memory(obj_id: u64, offset: u64, length: u64) -> Vec<u8> {
+    RgfxBufferOverHostMemory {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_BUFFER_OVER_HOST_MEMORY,
+            size: 0,
+            seqno: 0,
+        },
+        obj_id,
+        region_offset: offset,
+        length,
+        ..RgfxBufferOverHostMemory::default()
+    }
+    .as_bytes()
+    .to_vec()
+}
+
+/// A `TEXTURE_FROM_BUFFER`: a 64x64 BGRA8 texture at resource id `resource_id` over the start of
+/// `buffer`.
+fn texture_from_buffer(obj_id: u64, resource_id: u64, buffer: u64) -> Vec<u8> {
+    let (create, _) = RgfxTextureCreate::read_from_prefix(&texture_create(0, 0)).unwrap();
+    RgfxTextureFromBuffer {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_TEXTURE_FROM_BUFFER,
+            size: 0,
+            seqno: 0,
+        },
+        obj_id,
+        resource_id,
+        buffer_obj_id: buffer,
+        offset: 0,
+        bytes_per_row: 256,
+        desc: create.desc,
+        ..RgfxTextureFromBuffer::default()
+    }
+    .as_bytes()
+    .to_vec()
+}
+
+/// Whether ring 0's completion ring stays without a new event for about 100 ms.
+fn quiet(guest: &Guest) -> bool {
+    std::thread::sleep(Duration::from_millis(100));
+    // SAFETY: as `Guest`'s helpers.
+    unsafe { guest.load_u64(RGFX_CONTROL_COMPLETE_OFFSET as usize) == guest.consumed }
+}
+
+/// The `COMPLETE` of ring-0 command `seqno`, the next event: its status.
+fn answer_of(guest: &mut Guest, seqno: u64) -> u32 {
+    let complete = RgfxComplete::read_from_bytes(&next_event(guest, RGFX_EVT_COMPLETE)).unwrap();
+    assert_eq!(complete.header.seqno, seqno);
+    complete.status
+}
+
+/// Waits about 2 s for the platform to hold `n` committed command buffers not yet completed;
+/// their ids, in commit order.
+fn committed(platform: &FakePlatform, n: usize) -> Vec<ObjId> {
+    for _ in 0..2000 {
+        let ids = platform.world().committed();
+        if ids.len() == n {
+            return ids;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    panic!("{n} command buffers were not committed");
+}
+
+/// A block is given out again only once nothing the host holds lies in it: its release is refused
+/// while a buffer over it lives, and still while a texture made over that buffer lives after the
+/// buffer's destroy; once both are destroyed it is answered OK. A block nothing lies in is
+/// released at once, whatever lies in the blocks beside it
+#[test]
+fn a_block_is_released_only_once_nothing_lies_in_it() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, _platform) = headless_on(&raised);
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    const BLOCK: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x10_0000;
+    const SIZE: u64 = 0x1_0000;
+    guest.send(&device, resource_id_chunk(1, 0));
+    guest.send(&device, buffer_over_host_memory(obj(1, 1), BLOCK, 0x4000));
+    guest.send(&device, texture_from_buffer(obj(1, 2), 1, obj(1, 1)));
+    let status = answered(&device, &mut guest, block_release(1, BLOCK + SIZE, SIZE));
+    assert_eq!(status, RGFX_STATUS_OK, "the block beside them");
+    let status = answered(&device, &mut guest, block_release(1, BLOCK, SIZE));
+    assert_eq!(status, RGFX_STATUS_REFUSED, "the buffer lies in it");
+    guest.send(&device, object_destroy(obj(1, 1)));
+    let status = answered(&device, &mut guest, block_release(1, BLOCK, SIZE));
+    assert_eq!(
+        status, RGFX_STATUS_REFUSED,
+        "the texture over the buffer lies in it"
+    );
+    guest.send(&device, object_destroy(obj(1, 2)));
+    let status = answered(&device, &mut guest, block_release(1, BLOCK, SIZE));
+    assert_eq!(status, RGFX_STATUS_OK);
+}
+
+/// A block's release, and a context's close, wait for the command buffers the context committed
+/// before them, and only those: another context's in-flight buffer, and the context's own buffer
+/// committed after the release, hold neither
+#[test]
+fn a_release_and_a_close_wait_for_their_context_s_command_buffers() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform) = headless_on(&raised);
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    const SUBMIT_1: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET;
+    const COMPLETE_1: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x2_0000;
+    const SUBMIT_2: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x4_0000;
+    const COMPLETE_2: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x6_0000;
+    const BLOCK: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x10_0000;
+    const RING_DATA: u32 = 0x1_0000;
+    for (context, submit, complete) in [(1, SUBMIT_1, COMPLETE_1), (2, SUBMIT_2, COMPLETE_2)] {
+        assert_eq!(
+            answered(
+                &device,
+                &mut guest,
+                queue_create(context, 1, submit, complete, RING_DATA, 0)
+            ),
+            RGFX_STATUS_OK
+        );
+    }
+    let mut ring1 = QueueRing::new(&device, SUBMIT_1, COMPLETE_1, u64::from(RING_DATA));
+    let mut ring2 = QueueRing::new(&device, SUBMIT_2, COMPLETE_2, u64::from(RING_DATA));
+    ring1.send(&device, command_buffer(obj(1, 1), 100));
+    let first = committed(&platform, 1)[0];
+    ring2.send(&device, command_buffer(obj(2, 1), 200));
+    let other = committed(&platform, 2)[1];
+
+    guest.send(&device, block_release(1, BLOCK, 0x1_0000));
+    let release = guest.seqno;
+    assert!(quiet(&guest), "answered with context 1's buffer in flight");
+    ring1.send(&device, command_buffer(obj(1, 1), 101));
+    let later = committed(&platform, 3)[2];
+    let world = platform.world();
+    let done = |id| world.complete(id, CommandBufferStatus::COMPLETED, None, CompleteOn::Caller);
+    assert!(done(other));
+    assert!(
+        quiet(&guest),
+        "answered when another context's buffer finished"
+    );
+    assert!(done(first));
+    assert_eq!(answer_of(&mut guest, release), RGFX_STATUS_OK);
+
+    // The close waits for the buffer committed after the release.
+    guest.send(&device, context_close(1));
+    let close = guest.seqno;
+    assert!(
+        quiet(&guest),
+        "the close was answered with its buffer in flight"
+    );
+    assert!(done(later));
+    assert_eq!(answer_of(&mut guest, close), RGFX_STATUS_OK);
+}
+
+/// A block a live queue's ring lies in is not released; once the queue is destroyed, it is
+#[test]
+fn a_queue_s_rings_keep_their_block() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, _platform) = headless_on(&raised);
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    const SUBMIT: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET;
+    const COMPLETE: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x2_0000;
+    const RING_DATA: u32 = 0x1_0000;
+    assert_eq!(
+        answered(
+            &device,
+            &mut guest,
+            queue_create(1, 1, SUBMIT, COMPLETE, RING_DATA, 0)
+        ),
+        RGFX_STATUS_OK
+    );
+    for at in [SUBMIT, COMPLETE] {
+        let status = answered(&device, &mut guest, block_release(1, at, 0x2_0000));
+        assert_eq!(status, RGFX_STATUS_REFUSED, "a ring at {at:#x}");
+    }
+    guest.send(&device, object_destroy(obj(1, 1)));
+    let status = answered(&device, &mut guest, block_release(1, SUBMIT, 0x4_0000));
+    assert_eq!(status, RGFX_STATUS_OK);
 }

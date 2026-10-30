@@ -73,6 +73,7 @@ use reims_vgpu_core::platform::values::{
 };
 use reims_vgpu_core::platform::{Handle, HostRange, Platform};
 use reims_vgpu_core::raise::{OnFault, Raise, RaiseResult};
+use reims_vgpu_core::sync::Mutex;
 use zerocopy::FromBytes;
 
 mod blit;
@@ -101,6 +102,27 @@ pub(crate) type CompletionSink = Arc<dyn Fn(RgfxCbComplete) + Send + Sync>;
 /// the queue's completion ring, keyed to the create by its `seqno`; until it is
 /// set, the reply is built and dropped.
 pub(crate) type ReflectionSink = Arc<dyn Fn(RgfxPipelineReflection) + Send + Sync>;
+
+/// An answer the host gives once a context's command buffers have finished (a `CONTEXT_CLOSE`'s,
+/// a `BLOCK_RELEASE`'s).
+pub(crate) type DrainAnswer = Box<dyn FnOnce() + Send>;
+
+/// The command buffers one context committed since its last drain began: each holds a clone
+/// until its completion handler has run, and the answers waiting on them are given when the last
+/// clone goes ([`GraphicsDecoder::drain_context`]).
+#[derive(Default)]
+pub(crate) struct Drain {
+    /// Given when the drain drops.
+    answers: Mutex<Vec<DrainAnswer>>,
+}
+
+impl Drop for Drain {
+    fn drop(&mut self) {
+        for answer in self.answers.get_mut().drain(..) {
+            answer();
+        }
+    }
+}
 
 /// A host handle for one guest object, by kind. Later increments read these to
 /// bind resources into command buffers; this slice only inserts them on a create
@@ -179,6 +201,14 @@ pub struct GraphicsDecoder<P: Platform> {
     /// The context (the process) of the message being carried out, whose objects alone it may
     /// name ([`Self::named`]); `None` names any (the decoder's own tests).
     context: Option<u32>,
+    /// The region span (offset, length) each object lies over, for those over the region's
+    /// memory: a buffer or heap over host memory, and what is placed in one (a buffer at an
+    /// offset, a texture in the heap or over the buffer), with its parent's span. A block is not
+    /// given out again while an object lies in it ([`Self::span_in_use`]).
+    spans: HashMap<u64, (u64, u64)>,
+    /// Each context's command buffers in flight since its last drain began
+    /// ([`Self::drain_context`]).
+    drains: HashMap<u32, Arc<Drain>>,
     /// The device's BAR 2 region: the host memory the over-host-memory buffers
     /// and heaps are placed over. Held so it stays mapped while the decoder's
     /// objects live; declared last so the object table drops before it (a buffer
@@ -201,6 +231,8 @@ impl<P: Platform> GraphicsDecoder<P> {
             completion_sink: None,
             reflection_sink: None,
             context: None,
+            spans: HashMap::new(),
+            drains: HashMap::new(),
             region,
         }
     }
@@ -302,6 +334,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         let ours = |id: &u64| (id >> RGFX_CONTEXT_OBJ_ID_SHIFT) == u64::from(context);
         let before = self.objects.len();
         self.objects.retain(|id, _| !ours(id));
+        self.spans.retain(|id, _| !ours(id));
         let libraries: Vec<u64> = (self.making_libraries.keys())
             .chain(self.library_chunks.keys())
             .chain(self.cached_libraries.keys())
@@ -355,6 +388,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                 // A missing id is not an error: the guest may destroy an object
                 // the host never made (a create that the platform refused).
                 self.forget_library(m.obj_id);
+                self.spans.remove(&m.obj_id);
                 if matches!(self.objects.remove(&m.obj_id), Some(ObjHandle::Texture(_))) {
                     self.forget_surface_texture(m.obj_id);
                 }
@@ -513,7 +547,11 @@ impl<P: Platform> GraphicsDecoder<P> {
                     Some(Box::new(move || drop(keep))),
                 )?;
                 match made {
-                    Some(buffer) => self.insert(m.obj_id, ObjHandle::Buffer(buffer)),
+                    Some(buffer) => self.insert_over(
+                        m.obj_id,
+                        ObjHandle::Buffer(buffer),
+                        Some((m.region_offset, m.length)),
+                    ),
                     None => Ok(Err(DecodeError::Refused)),
                 }
             }
@@ -566,7 +604,11 @@ impl<P: Platform> GraphicsDecoder<P> {
                     pinned_gpu_address: (m.gpu_address != 0).then_some(m.gpu_address),
                 };
                 match device.new_heap(&desc)?.heap {
-                    Some(heap) => self.insert(m.obj_id, ObjHandle::Heap(heap)),
+                    Some(heap) => self.insert_over(
+                        m.obj_id,
+                        ObjHandle::Heap(heap),
+                        Some((m.region_offset, m.size_bytes)),
+                    ),
                     None => Ok(Err(DecodeError::Refused)),
                 }
             }
@@ -584,6 +626,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                 // only ever sends one it read from a real descriptor.
                 let desc = texture_desc(&m.desc, m.resource_id);
                 let descriptor = self.platform.texture_descriptor(&desc);
+                let span = self.span_of(m.heap_obj_id);
                 let made = if m.heap_obj_id != 0 {
                     // Heap-placed at `heap_offset` in the named heap; a heap the
                     // host does not hold is a guest protocol error.
@@ -596,7 +639,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                     device.new_texture(OnFault::Return, &descriptor)?
                 };
                 match made {
-                    Some(texture) => self.insert(m.obj_id, ObjHandle::Texture(texture)),
+                    Some(texture) => self.insert_over(m.obj_id, ObjHandle::Texture(texture), span),
                     None => Ok(Err(DecodeError::Refused)),
                 }
             }
@@ -612,8 +655,9 @@ impl<P: Platform> GraphicsDecoder<P> {
                     };
                     heap.new_buffer_of_length(m.length, m.options.into(), m.offset)?
                 };
+                let span = self.span_of(m.heap_obj_id);
                 match made {
-                    Some(buffer) => self.insert(m.obj_id, ObjHandle::Buffer(buffer)),
+                    Some(buffer) => self.insert_over(m.obj_id, ObjHandle::Buffer(buffer), span),
                     None => Ok(Err(DecodeError::Refused)),
                 }
             }
@@ -634,8 +678,9 @@ impl<P: Platform> GraphicsDecoder<P> {
                     };
                     buffer.new_texture(OnFault::Return, &descriptor, m.offset, m.bytes_per_row)?
                 };
+                let span = self.span_of(m.buffer_obj_id);
                 match made {
-                    Some(texture) => self.insert(m.obj_id, ObjHandle::Texture(texture)),
+                    Some(texture) => self.insert_over(m.obj_id, ObjHandle::Texture(texture), span),
                     None => Ok(Err(DecodeError::Refused)),
                 }
             }
@@ -657,6 +702,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                     };
                     buffer.new_texture(OnFault::Return, &descriptor, m.offset, m.bytes_per_row)?
                 };
+                let span = self.span_of(m.buffer_obj_id);
                 match made {
                     Some(texture) => {
                         // An id made again names only its new texture's surface.
@@ -667,7 +713,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                                 .or_default()
                                 .push(m.obj_id);
                         }
-                        self.insert(m.obj_id, ObjHandle::Texture(texture))
+                        self.insert_over(m.obj_id, ObjHandle::Texture(texture), span)
                     }
                     None => Ok(Err(DecodeError::Refused)),
                 }
@@ -675,7 +721,12 @@ impl<P: Platform> GraphicsDecoder<P> {
             RGFX_CMD_RENDER_PIPELINE_CREATE | RGFX_CMD_COMPUTE_PIPELINE_CREATE => {
                 self.decode_pipeline(device, message)
             }
-            RGFX_CMD_COMMAND_BUFFER => self.decode_command_buffer(message),
+            RGFX_CMD_COMMAND_BUFFER => {
+                // The buffer's context's drain, held until its completion handler has run.
+                let drain = (self.context)
+                    .map(|context| Arc::clone(self.drains.entry(context).or_default()));
+                self.decode_command_buffer(message, drain)
+            }
             _ => Ok(Err(DecodeError::UnknownCommand)),
         }
     }
@@ -686,14 +737,66 @@ impl<P: Platform> GraphicsDecoder<P> {
         obj_id: u64,
         handle: ObjHandle<P>,
     ) -> RaiseResult<Result<(), DecodeError>> {
+        self.insert_over(obj_id, handle, None)
+    }
+
+    /// Inserts a new object's handle under its guest-picked id, with the region span it lies over
+    /// (`spans`), where it lies over one.
+    fn insert_over(
+        &mut self,
+        obj_id: u64,
+        handle: ObjHandle<P>,
+        span: Option<(u64, u64)>,
+    ) -> RaiseResult<Result<(), DecodeError>> {
         self.store(obj_id, handle);
+        if let Some(span) = span {
+            self.spans.insert(obj_id, span);
+        }
         Ok(Ok(()))
     }
 
     /// Stores `handle` under `obj_id`, in place of what the id named.
     fn store(&mut self, obj_id: u64, handle: ObjHandle<P>) {
         self.forget_library(obj_id);
+        self.spans.remove(&obj_id);
         self.objects.insert(obj_id, handle);
+    }
+
+    /// The region span `obj_id`'s object lies over (`spans`), where it is one the current
+    /// context may name and lies over one.
+    fn span_of(&self, obj_id: u64) -> Option<(u64, u64)> {
+        self.named(obj_id)
+            .and_then(|_| self.spans.get(&obj_id).copied())
+    }
+
+    /// Whether an object the decoder holds lies in the `size` bytes at region offset `offset`:
+    /// the block they make is not to be given out again while it does.
+    pub(crate) fn span_in_use(&self, offset: u64, size: u64) -> bool {
+        let end = offset.saturating_add(size);
+        self.spans
+            .values()
+            .any(|&(at, length)| at < end && offset < at.saturating_add(length))
+    }
+
+    /// Begins a drain of `context`'s command buffers: `answer` is given once every one the decoder
+    /// has committed for the context has finished its completion handler, and not later ones. The
+    /// drain is returned for the caller to drop with no lock held: the answer goes then where no
+    /// buffer is in flight, else on the GPU thread of the last to finish. `closed` ends the
+    /// context's drains (its `CONTEXT_CLOSE`); else a new one begins for its later buffers.
+    pub(crate) fn drain_context(
+        &mut self,
+        context: u32,
+        closed: bool,
+        answer: DrainAnswer,
+    ) -> Arc<Drain> {
+        let drain = if closed {
+            self.drains.remove(&context)
+        } else {
+            self.drains.insert(context, Arc::default())
+        }
+        .unwrap_or_default();
+        drain.answers.lock().push(answer);
+        drain
     }
 
     /// `RENDER_PIPELINE_CREATE` and `COMPUTE_PIPELINE_CREATE`, carried out at once: the create is
@@ -814,6 +917,7 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// one stores nothing).
     pub(crate) fn finish_pipeline(&mut self, compiled: CompiledPipeline<P>) {
         if let Some(handle) = compiled.handle {
+            self.spans.remove(&compiled.obj_id);
             self.objects.insert(compiled.obj_id, handle);
         }
     }

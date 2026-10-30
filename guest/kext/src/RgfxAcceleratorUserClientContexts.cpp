@@ -66,7 +66,7 @@ IOReturn RgfxAcceleratorUserClient::contextMethod(uint32_t selector,
 		if (a->scalarInputCount != 2 || a->scalarOutputCount != 1 || !hasContext)
 			return kIOReturnBadArgument;
 		UInt64 offset = 0;
-		IOReturn r = owner->allocBlock(this, in[0], in[1], &offset);
+		IOReturn r = owner->allocBlock(this, context, in[0], in[1], &offset);
 		out[0] = offset;
 		return r;
 	}
@@ -86,23 +86,36 @@ IOReturn RgfxAcceleratorUserClient::contextMethod(uint32_t selector,
 		open.priority = static_cast<uint32_t>(in[5]);
 		open.vector = RGFX_CONTROL_VECTOR;
 		// The queue's id is in the context's range, and each of its rings lies in one of the
-		// client's own blocks, so a process names nothing of another's.
-		if ((open.obj_id >> RGFX_CONTEXT_OBJ_ID_SHIFT) != context ||
-		    !owner->ownsRange(this, open.submit_offset,
-		                      RGFX_RING_HEADER_SIZE + static_cast<uint64_t>(open.submit_data_size)) ||
-		    !owner->ownsRange(this, open.complete_offset,
-		                      RGFX_RING_HEADER_SIZE +
-		                          static_cast<uint64_t>(open.complete_data_size)))
+		// client's own blocks, so a process names nothing of another's. The blocks stay pinned
+		// until the device has answered the create, so neither is freed under it.
+		if ((open.obj_id >> RGFX_CONTEXT_OBJ_ID_SHIFT) != context)
 			return kIOReturnBadArgument;
+		RgfxBlockPin pins[2];
+		if (!owner->pinRange(this, open.submit_offset,
+		                     RGFX_RING_HEADER_SIZE + static_cast<uint64_t>(open.submit_data_size),
+		                     &pins[0]))
+			return kIOReturnBadArgument;
+		if (!owner->pinRange(this, open.complete_offset,
+		                     RGFX_RING_HEADER_SIZE + static_cast<uint64_t>(open.complete_data_size),
+		                     &pins[1])) {
+			owner->unpinBlock(pins[0]);
+			return kIOReturnBadArgument;
+		}
+		auto unpin = [&] {
+			owner->unpinBlock(pins[0]);
+			owner->unpinBlock(pins[1]);
+		};
 		IOLockLock(queueLock);
 		if (queueCount == kMaxQueues) {
 			IOLockUnlock(queueLock);
+			unpin();
 			return kIOReturnNoResources;
 		}
 		// Watched before the device has it, so no completion comes before the watch.
 		IOReturn watch = owner->watchQueue(this, open.obj_id, open.complete_offset);
 		if (watch != kIOReturnSuccess) {
 			IOLockUnlock(queueLock);
+			unpin();
 			return watch;
 		}
 		UInt32 status = owner->openQueue(open);
@@ -111,6 +124,7 @@ IOReturn RgfxAcceleratorUserClient::contextMethod(uint32_t selector,
 		else
 			owner->unwatchQueue(this, open.obj_id);
 		IOLockUnlock(queueLock);
+		unpin();
 		out[0] = status;
 		return kIOReturnSuccess;
 	}
@@ -187,13 +201,19 @@ IOReturn RgfxAcceleratorUserClient::submitMethod(IOExternalMethodArguments *a)
 	     (objId >> RGFX_CONTEXT_OBJ_ID_SHIFT) != context))
 		r = kIOReturnBadArgument;
 	// The region the message names lies in the client's own blocks: a process places its heaps,
-	// buffers and library chunks in no one else's memory, nor in the rings or the scanout.
+	// buffers and library chunks in no one else's memory, nor in the rings or the scanout. Each
+	// block stays pinned until the message is posted and answered, so none is freed, and given
+	// to another process, between this check and the device carrying the message out.
 	RgfxRegionSpan spans[kRgfxMaxRegionSpans];
+	RgfxBlockPin pins[kRgfxMaxRegionSpans];
+	int pinned = 0;
 	int spanCount = r == kIOReturnSuccess ? rgfxRegionSpans(type, message, size, spans) : 0;
 	if (spanCount < 0)
 		r = kIOReturnBadArgument;
 	for (int i = 0; i < spanCount && r == kIOReturnSuccess; i++) {
-		if (!owner->ownsRange(this, spans[i].offset, spans[i].length))
+		if (owner->pinRange(this, spans[i].offset, spans[i].length, &pins[pinned]))
+			pinned++;
+		else
 			r = kIOReturnBadArgument;
 	}
 	// The answers the client waits for: a pipeline create's reflection, and a library create's
@@ -221,6 +241,9 @@ IOReturn RgfxAcceleratorUserClient::submitMethod(IOExternalMethodArguments *a)
 		owner->postLifecycle(RGFX_CMD_OBJECT_DESTROY, &destroy, sizeof(destroy), 0, nullptr, 0,
 		                     nullptr, nullptr, 0);
 	}
+	// A free of a block from here posts its release behind the message (and its destroy).
+	for (int i = 0; i < pinned; i++)
+		owner->unpinBlock(pins[i]);
 	if (r != kIOReturnSuccess)
 		return r;
 	a->scalarOutput[0] = seqno;
@@ -281,9 +304,14 @@ void RgfxAcceleratorUserClient::releaseContext()
 	for (UInt32 i = 0; i < queueCount; i++)
 		accel->closeQueue(queues[i]);
 	queueCount = 0;
-	accel->closeContext(context, slot);
+	// The blocks go only once the device has answered the close: it then holds nothing of
+	// them, and the context's command buffers have finished.
+	bool closed = accel->closeContext(context, slot);
 	accel->freeIdChunks(this);
-	accel->freeBlocks(this);
+	if (closed)
+		accel->freeBlocks(this);
+	else
+		accel->keepBlocks(this);
 	hasContext = false;
 	IOLockUnlock(queueLock);
 }

@@ -85,7 +85,7 @@ check: $(BINARY) $(BUILD)/obj/layout.o
 	bash tools/oc-link-check.sh "$(KEXTINJECT)" "$(BOOT_KC)" "$(KDK)" $(KEXT) $(BUILD)/oc-link
 
 # The native tests: header-only rules of the kext's, built for this Mac.
-TESTS = $(BUILD)/tests/spans_test
+TESTS = $(BUILD)/tests/spans_test $(BUILD)/tests/blocks_test
 
 $(BUILD)/tests/%: tests/%.cpp $(HEADERS) ../../crates/reims-graphics/include/reims_graphics_wire.h Makefile
 	@mkdir -p $(@D)

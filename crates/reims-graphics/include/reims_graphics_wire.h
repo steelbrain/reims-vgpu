@@ -891,8 +891,9 @@
 // `CONTEXT_CLOSE` ([`RgfxContextClose`]), on ring 0 from the accelerator kext: the process that
 // held context `context` closed the device or died. The host ends the context's command queues
 // and drops every object whose id lies in its range ([`RGFX_CONTEXT_OBJ_ID_SHIFT`]), then answers
-// [`RGFX_EVT_COMPLETE`]; the kext destroyed its queues before it, and frees its blocks once it is
-// answered.
+// [`RGFX_EVT_COMPLETE`] once every command buffer of the context it had committed has finished;
+// the kext destroyed its queues before it, and frees its blocks once it is answered, and only
+// then.
 #define RGFX_CMD_CONTEXT_CLOSE 752
 
 // `RESOURCE_ID_CHUNK` ([`RgfxResourceIdChunk`]), on ring 0 from the accelerator kext: the kext
@@ -901,6 +902,15 @@
 // comes before every create naming one of its ids. Not answered. A texture create whose id lies
 // in no chunk of its context is refused.
 #define RGFX_CMD_RESOURCE_ID_CHUNK 753
+
+// `BLOCK_RELEASE` ([`RgfxBlockRelease`]), on ring 0 from the accelerator kext: context `context`
+// freed its region block of `size` bytes at `offset`, which the kext gives out again only once
+// this is answered [`RGFX_EVT_COMPLETE`] with [`RGFX_STATUS_OK`]. The host answers
+// [`RGFX_STATUS_REFUSED`] at once where an object it holds, or a live queue's ring, still lies in
+// the block; otherwise it answers OK once every command buffer of the context it had committed
+// has finished. Posted after every message the process posted before its free, and nothing the
+// process posts after it can name the block.
+#define RGFX_CMD_BLOCK_RELEASE 754
 
 // Command `COMMAND_BUFFER` (a per-queue submission ring): one command buffer,
 // its `obj_id` followed by the encoder-op byte stream. Struct and op stream in
@@ -1461,6 +1471,20 @@ typedef struct {
   // command's, and an event that answers nothing carries 0.
   uint64_t seqno;
 } RgfxMsgHeader;
+
+// `BLOCK_RELEASE`: context `context` freed its region block of `size` bytes at `offset`.
+typedef struct {
+  // [`RGFX_CMD_BLOCK_RELEASE`].
+  RgfxMsgHeader header;
+  // The context that held the block.
+  uint32_t context;
+  // Zero.
+  uint32_t reserved_14;
+  // The block's region offset.
+  uint64_t offset;
+  // The block's size in bytes.
+  uint64_t size;
+} RgfxBlockRelease;
 
 // `BUFFER_AT_OFFSET`: a buffer of `length` bytes at `offset` in the heap
 // `heap_obj_id`.

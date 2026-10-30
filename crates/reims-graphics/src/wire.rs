@@ -283,8 +283,9 @@ pub const RGFX_CMD_LIBRARY_LOOKUP: u32 = 0x213;
 /// `CONTEXT_CLOSE` ([`RgfxContextClose`]), on ring 0 from the accelerator kext: the process that
 /// held context `context` closed the device or died. The host ends the context's command queues
 /// and drops every object whose id lies in its range ([`RGFX_CONTEXT_OBJ_ID_SHIFT`]), then answers
-/// [`RGFX_EVT_COMPLETE`]; the kext destroyed its queues before it, and frees its blocks once it is
-/// answered.
+/// [`RGFX_EVT_COMPLETE`] once every command buffer of the context it had committed has finished;
+/// the kext destroyed its queues before it, and frees its blocks once it is answered, and only
+/// then.
 pub const RGFX_CMD_CONTEXT_CLOSE: u32 = 0x2f0;
 /// `RESOURCE_ID_CHUNK` ([`RgfxResourceIdChunk`]), on ring 0 from the accelerator kext: the kext
 /// gave context `context` chunk `chunk` of the texture resource ids ([`RGFX_RESOURCE_ID_CHUNK`]),
@@ -292,6 +293,14 @@ pub const RGFX_CMD_CONTEXT_CLOSE: u32 = 0x2f0;
 /// comes before every create naming one of its ids. Not answered. A texture create whose id lies
 /// in no chunk of its context is refused.
 pub const RGFX_CMD_RESOURCE_ID_CHUNK: u32 = 0x2f1;
+/// `BLOCK_RELEASE` ([`RgfxBlockRelease`]), on ring 0 from the accelerator kext: context `context`
+/// freed its region block of `size` bytes at `offset`, which the kext gives out again only once
+/// this is answered [`RGFX_EVT_COMPLETE`] with [`RGFX_STATUS_OK`]. The host answers
+/// [`RGFX_STATUS_REFUSED`] at once where an object it holds, or a live queue's ring, still lies in
+/// the block; otherwise it answers OK once every command buffer of the context it had committed
+/// has finished. Posted after every message the process posted before its free, and nothing the
+/// process posts after it can name the block.
+pub const RGFX_CMD_BLOCK_RELEASE: u32 = 0x2f2;
 
 /// Command `COMMAND_BUFFER` (a per-queue submission ring): one command buffer,
 /// its `obj_id` followed by the encoder-op byte stream. Struct and op stream in
@@ -581,6 +590,7 @@ const _: () = {
     assert!(size_of::<RgfxContextClose>() == 24);
     assert!(size_of::<RgfxResourceIdChunk>() == 24);
     assert!(size_of::<RgfxCommandBufferInRegion>() == 32);
+    assert!(size_of::<RgfxBlockRelease>() == 40);
     // Every chunk's ids lie below the limit (the last chunk's last id is CHUNKS * CHUNK), and
     // no whole chunk more fits there.
     assert!(RGFX_RESOURCE_ID_CHUNKS as u64 * RGFX_RESOURCE_ID_CHUNK < RGFX_RESOURCE_ID_LIMIT);
@@ -711,6 +721,24 @@ pub struct RgfxResourceIdChunk {
     /// The chunk, below [`RGFX_RESOURCE_ID_CHUNKS`]: ids `1 + chunk * RGFX_RESOURCE_ID_CHUNK` and
     /// up.
     pub chunk: u32,
+}
+
+/// `BLOCK_RELEASE`: context `context` freed its region block of `size` bytes at `offset`.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxBlockRelease {
+    /// [`RGFX_CMD_BLOCK_RELEASE`].
+    pub header: RgfxMsgHeader,
+    /// The context that held the block.
+    pub context: u32,
+    /// Zero.
+    pub reserved_14: u32,
+    /// The block's region offset.
+    pub offset: u64,
+    /// The block's size in bytes.
+    pub size: u64,
 }
 
 /// `HEAP_CREATE`: a device heap of `size_bytes` at the guest-picked
