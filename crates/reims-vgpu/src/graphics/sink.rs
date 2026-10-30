@@ -125,7 +125,8 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
             {
                 return self.encode_surface(&surface, texture, region);
             }
-            self.presented.refuse_format(surface.pixel_format());
+            self.presented
+                .refuse_format(surface.pixel_format(), texture.pixel_format());
         }
         let scanout = (*self.shown.scanout.lock())?;
         let command_buffer = no_catch(self.queue.command_buffer(OnFault::Die))?;

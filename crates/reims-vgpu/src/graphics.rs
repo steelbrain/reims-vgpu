@@ -322,13 +322,15 @@ impl<P: Platform> Presented<P> {
         }
     }
 
-    /// The sink met a surface of `format`, which it cannot copy into its drawable: logged once.
-    pub(crate) fn refuse_format(&self, format: u64) {
+    /// The sink cannot copy a surface of pixel format `surface` into a drawable of `drawable`:
+    /// logged once.
+    pub(crate) fn refuse_format(&self, surface: u64, drawable: u64) {
         if !self.refused.swap(true, Ordering::AcqRel) {
             log::warn!(
                 target: "reims_vgpu::graphics",
-                "the presented IOSurface's texture has pixel format {format}, which the window \
-                 cannot copy (BGRA8 only): the scanout shows instead"
+                "the presented IOSurface's texture (pixel format {surface}) cannot be copied into \
+                 the window's drawable (pixel format {drawable}; BGRA8 only): the scanout shows \
+                 instead"
             );
         }
     }
