@@ -26,7 +26,7 @@ CXXFLAGS = -arch $(ARCH) -isysroot $(SDK) -std=c++17 -Os \
 
 HEADERS  = $(wildcard src/*.hpp)
 SRCS     = src/RgfxObjectModel.cpp src/RgfxCaps.cpp src/RgfxRingWriter.cpp \
-	src/RgfxSerializer.cpp src/RgfxWireLayout.cpp
+	src/RgfxSerializer.cpp src/RgfxEncoder.cpp src/RgfxWireLayout.cpp
 OBJECTS  = $(SRCS:src/%.cpp=$(BUILD)/obj/%.o)
 TESTBIN  = $(BUILD)/$(NAME)
 

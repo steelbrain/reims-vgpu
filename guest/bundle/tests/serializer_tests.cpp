@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "RgfxCaps.hpp"
+#include "RgfxEncoder.hpp"
 #include "RgfxObjectModel.hpp"
 #include "RgfxRingWriter.hpp"
 #include "RgfxSerializer.hpp"
@@ -504,6 +505,270 @@ void test_ring_wrap_and_no_room()
 	CHECK(posted == static_cast<int>(kData / sizeof(RgfxObjectDestroy))); // 256/24 = 10
 }
 
+// A minimal host-side op-stream consumer, the mirror of
+// crates/reims-vgpu/src/graphics/decode/cmdbuf.rs's walk: it reads each
+// RgfxOpHeader, checks `len`, splits the body, and tracks which encoder is open.
+struct OpWalk {
+	const uint8_t *ops;
+	size_t size; // op_bytes
+	size_t pos = 0;
+
+	OpWalk(const uint8_t *p, size_t n) : ops(p), size(n) {}
+
+	bool done() const { return pos >= size; }
+
+	// Reads the next op; fills `tag`, `flags`, `len` and points `body`/`body_len`
+	// at its body. Returns false (and does not advance) on a structural fault.
+	bool next(uint16_t *tag, uint16_t *flags, uint32_t *len, const uint8_t **body,
+	          size_t *body_len)
+	{
+		if (size - pos < sizeof(RgfxOpHeader))
+			return false;
+		RgfxOpHeader h;
+		std::memcpy(&h, ops + pos, sizeof(h));
+		if (h.len < RGFX_OP_BODY_OFFSET || (h.len % 8) != 0 || h.len > size - pos)
+			return false;
+		*tag = h.tag;
+		*flags = h.flags;
+		*len = h.len;
+		*body = ops + pos + RGFX_OP_BODY_OFFSET;
+		*body_len = h.len - RGFX_OP_BODY_OFFSET;
+		pos += h.len;
+		return true;
+	}
+};
+
+// `tag >> 12`, the op's group, as the host splits it.
+uint16_t opGroup(uint16_t tag) { return static_cast<uint16_t>(tag >> 12); }
+
+void test_command_buffer_encoder()
+{
+	TestRing ring(0x8000);
+	ring.setConsumerIdle(1);
+	RgfxRingWriter writer(ring.base(), ring.dataSize, RGFX_CONTROL_RING_ID, TestRing::doorbell,
+	                      nullptr);
+
+	RgfxEncoder enc(writer, /*queue*/ 1, /*cb*/ 100);
+
+	// Render encoder: a pass with one colour attachment, then a scalar op, an
+	// array-tailed op (setVertexBuffers), a no-arg op (setDepthCleared) and a draw.
+	RgfxRenderPassDesc pass = {};
+	pass.flags = RGFX_PASS_FLAG_RT_SIZE;
+	pass.render_target_width = 1920;
+	pass.render_target_height = 1080;
+	RgfxRenderPassColorAttachment color = {};
+	color.texture_obj_id = 4;
+	color.load_action = 2;  // Clear
+	color.store_action = 1; // Store
+	double one = 1.0;
+	std::memcpy(&color.clear_color_bits[3], &one, 8);
+	enc.beginRenderPass(pass, &color, 1);
+	enc.renderSetRenderPipelineState(7);
+	enc.renderSetVertexBuffer(2, 0, 0);
+	enc.renderSetViewport(0.0, 0.0, 1920.0, 1080.0, 0.0, 1.0);
+	RgfxBufferBinding vbs[2] = {};
+	vbs[0].buffer_obj_id = 2;
+	vbs[0].offset = 0;
+	vbs[1].buffer_obj_id = 3;
+	vbs[1].offset = 256;
+	enc.renderSetVertexBuffers(0, vbs, 2);
+	enc.renderSetDepthCleared();
+	enc.renderDrawPrimitives(3, 0, 3);
+	enc.endEncoder();
+
+	// Compute encoder: default pass, a scalar, a dispatch, an array-tailed op and a
+	// no-body op.
+	enc.beginComputePass();
+	enc.computeSetComputePipelineState(8);
+	enc.computeDispatchThreadgroups(16, 8, 1, 32, 1, 1);
+	rgfx_compute::RgfxComputeBufferBinding cbs[2] = {};
+	cbs[0].buffer_obj_id = 2;
+	cbs[0].offset = 0;
+	cbs[1].buffer_obj_id = 3;
+	cbs[1].offset = 512;
+	enc.computeSetBuffers(0, cbs, 2);
+	enc.computeEncodeStartElse();
+	enc.endEncoder();
+
+	// Blit encoder: a copy, a fill-texture (trailing bytes), and a fence wait.
+	enc.beginBlitPass();
+	enc.blitCopyBufferToBuffer(2, 3, 16, 32, 4096);
+	const uint8_t fill[5] = { 0xde, 0xad, 0xbe, 0xef, 0x01 };
+	enc.blitFillTexture(4, 0, 0, 0, 0, 0, 32, 32, 1, fill, sizeof(fill));
+	enc.blitWaitForFence(9);
+	enc.endEncoder();
+
+	uint64_t seqno = 0;
+	CHECK(enc.finish(&seqno));
+	CHECK(seqno == 1);
+
+	// Read the command-buffer message back off the ring and check its framing.
+	RgfxMsgHeader h = {};
+	std::vector<uint8_t> bytes;
+	CHECK(ring.next(&h, &bytes));
+	CHECK(h.type == RGFX_CMD_COMMAND_BUFFER);
+	CHECK(h.size == bytes.size());
+	CHECK(h.size % 8 == 0);
+	CHECK(h.seqno == 1);
+
+	RgfxCommandBuffer cb = {};
+	std::memcpy(&cb, bytes.data(), sizeof(cb));
+	CHECK(cb.queue_obj_id == 1);
+	CHECK(cb.cb_obj_id == 100);
+	CHECK(cb.op_bytes == bytes.size() - RGFX_COMMAND_BUFFER_OPS_OFFSET);
+	CHECK(cb.op_bytes == enc.opBytes());
+
+	// The op stream follows the header at RGFX_COMMAND_BUFFER_OPS_OFFSET.
+	OpWalk walk(bytes.data() + RGFX_COMMAND_BUFFER_OPS_OFFSET, cb.op_bytes);
+
+	// The exact op sequence the encoder wrote.
+	const uint16_t want[] = {
+	    RGFX_OP_ENCODER_BEGIN_RENDER,
+	    RGFX_OP_RENDER_SET_RENDER_PIPELINE_STATE,
+	    RGFX_OP_RENDER_SET_VERTEX_BUFFER,
+	    RGFX_OP_RENDER_SET_VIEWPORT,
+	    RGFX_OP_RENDER_SET_VERTEX_BUFFERS,
+	    RGFX_OP_RENDER_SET_DEPTH_CLEARED,
+	    RGFX_OP_RENDER_DRAW_PRIMITIVES,
+	    RGFX_OP_ENCODER_END,
+	    RGFX_OP_ENCODER_BEGIN_COMPUTE,
+	    RGFX_OP_COMPUTE_SET_COMPUTE_PIPELINE_STATE,
+	    RGFX_OP_COMPUTE_DISPATCH_THREADGROUPS,
+	    RGFX_OP_COMPUTE_SET_BUFFERS,
+	    RGFX_OP_COMPUTE_ENCODE_START_ELSE,
+	    RGFX_OP_ENCODER_END,
+	    RGFX_OP_ENCODER_BEGIN_BLIT,
+	    RGFX_OP_BLIT_COPY_BUFFER_TO_BUFFER,
+	    RGFX_OP_BLIT_FILL_TEXTURE,
+	    RGFX_OP_BLIT_WAIT_FOR_FENCE,
+	    RGFX_OP_ENCODER_END,
+	};
+	const size_t want_n = sizeof(want) / sizeof(want[0]);
+
+	int open = 0; // 0 none, 1 render, 2 compute, 3 blit
+	int begins = 0, ends = 0;
+	size_t i = 0;
+	while (!walk.done()) {
+		uint16_t tag = 0, flags = 0;
+		uint32_t len = 0;
+		const uint8_t *body = nullptr;
+		size_t body_len = 0;
+		CHECK(walk.next(&tag, &flags, &len, &body, &body_len));
+		CHECK(len % 8 == 0);
+		CHECK(i < want_n);
+		CHECK(tag == want[i]);
+
+		// Framing is balanced: a begin opens exactly one encoder, an end closes it,
+		// and every body op's group matches the open encoder.
+		if (opGroup(tag) == RGFX_OP_GROUP_FRAMING) {
+			if (tag == RGFX_OP_ENCODER_BEGIN_RENDER) {
+				CHECK(open == 0);
+				open = 1;
+				begins++;
+			} else if (tag == RGFX_OP_ENCODER_BEGIN_COMPUTE) {
+				CHECK(open == 0);
+				open = 2;
+				begins++;
+			} else if (tag == RGFX_OP_ENCODER_BEGIN_BLIT) {
+				CHECK(open == 0);
+				open = 3;
+				begins++;
+			} else if (tag == RGFX_OP_ENCODER_END) {
+				CHECK(open != 0);
+				open = 0;
+				ends++;
+			}
+		} else {
+			CHECK(static_cast<int>(opGroup(tag)) == open);
+		}
+
+		// Spot-check the bodies of representative ops across all three encoders.
+		if (tag == RGFX_OP_ENCODER_BEGIN_RENDER) {
+			CHECK(len == 8 + sizeof(RgfxRenderPassDesc) + 1 * sizeof(RgfxRenderPassColorAttachment));
+			RgfxRenderPassDesc gotPass;
+			std::memcpy(&gotPass, body, sizeof(gotPass));
+			CHECK(gotPass.color_count == 1);
+			CHECK(gotPass.flags == RGFX_PASS_FLAG_RT_SIZE);
+			CHECK(gotPass.render_target_width == 1920 && gotPass.render_target_height == 1080);
+			RgfxRenderPassColorAttachment gotColor;
+			std::memcpy(&gotColor, body + RGFX_RENDER_PASS_COLOR_OFFSET, sizeof(gotColor));
+			CHECK(gotColor.texture_obj_id == 4);
+			CHECK(gotColor.load_action == 2 && gotColor.store_action == 1);
+			double a;
+			std::memcpy(&a, &gotColor.clear_color_bits[3], 8);
+			CHECK(a == 1.0);
+		} else if (tag == RGFX_OP_RENDER_SET_VERTEX_BUFFER) {
+			RgfxOpSetVertexBuffer b;
+			std::memcpy(&b, body, sizeof(b));
+			CHECK(b.buffer_obj_id == 2 && b.offset == 0 && b.index == 0);
+		} else if (tag == RGFX_OP_RENDER_SET_VERTEX_BUFFERS) {
+			// Array-tailed: head's range then two RgfxBufferBinding records.
+			CHECK(len == 8 + sizeof(RgfxOpSetVertexBuffers) + 2 * sizeof(RgfxBufferBinding));
+			RgfxOpSetVertexBuffers head;
+			std::memcpy(&head, body, sizeof(head));
+			CHECK(head.range_location == 0 && head.range_length == 2);
+			RgfxBufferBinding e0, e1;
+			std::memcpy(&e0, body + sizeof(head), sizeof(e0));
+			std::memcpy(&e1, body + sizeof(head) + sizeof(e0), sizeof(e1));
+			CHECK(e0.buffer_obj_id == 2 && e0.offset == 0);
+			CHECK(e1.buffer_obj_id == 3 && e1.offset == 256);
+		} else if (tag == RGFX_OP_RENDER_SET_DEPTH_CLEARED) {
+			CHECK(len == 8 && body_len == 0); // no-arg render op: header only
+		} else if (tag == RGFX_OP_RENDER_DRAW_PRIMITIVES) {
+			RgfxOpDrawPrimitives b;
+			std::memcpy(&b, body, sizeof(b));
+			CHECK(b.primitive_type == 3 && b.vertex_start == 0 && b.vertex_count == 3);
+		} else if (tag == RGFX_OP_ENCODER_BEGIN_COMPUTE) {
+			CHECK(len == 8 && body_len == 0); // default pass: empty body
+		} else if (tag == RGFX_OP_COMPUTE_DISPATCH_THREADGROUPS) {
+			rgfx_compute::RgfxOpDispatchThreadgroups b;
+			std::memcpy(&b, body, sizeof(b));
+			CHECK(b.threadgroups_width == 16 && b.threadgroups_height == 8);
+			CHECK(b.threads_width == 32 && b.threads_height == 1 && b.threads_depth == 1);
+		} else if (tag == RGFX_OP_COMPUTE_SET_BUFFERS) {
+			CHECK(len == 8 + sizeof(rgfx_compute::RgfxOpSetBuffers) +
+			                 2 * sizeof(rgfx_compute::RgfxComputeBufferBinding));
+			rgfx_compute::RgfxOpSetBuffers head;
+			std::memcpy(&head, body, sizeof(head));
+			CHECK(head.location == 0 && head.length == 2);
+			rgfx_compute::RgfxComputeBufferBinding e1;
+			std::memcpy(&e1, body + sizeof(head) + sizeof(e1), sizeof(e1));
+			CHECK(e1.buffer_obj_id == 3 && e1.offset == 512);
+		} else if (tag == RGFX_OP_COMPUTE_ENCODE_START_ELSE) {
+			CHECK(len == 8 && body_len == 0); // no-body compute op
+		} else if (tag == RGFX_OP_BLIT_COPY_BUFFER_TO_BUFFER) {
+			rgfx_blit::RgfxOpCopyBufferToBuffer b;
+			std::memcpy(&b, body, sizeof(b));
+			CHECK(b.source_buffer_obj_id == 2 && b.destination_buffer_obj_id == 3);
+			CHECK(b.source_offset == 16 && b.destination_offset == 32 && b.size == 4096);
+		} else if (tag == RGFX_OP_BLIT_FILL_TEXTURE) {
+			// Head then `length` fill bytes at offset 80, padded to a multiple of 8.
+			CHECK(len == 8 + 88); // 80-byte head + 5 fill bytes padded to 88
+			rgfx_blit::RgfxOpFillTexture head;
+			std::memcpy(&head, body, sizeof(head));
+			CHECK(head.texture_obj_id == 4 && head.length == 5);
+			CHECK(head.region_size_width == 32 && head.region_size_height == 32);
+			const uint8_t expect[5] = { 0xde, 0xad, 0xbe, 0xef, 0x01 };
+			CHECK(std::memcmp(body + RGFX_OP_BLIT_FILL_TEXTURE_BYTES_OFFSET, expect, 5) == 0);
+		} else if (tag == RGFX_OP_BLIT_WAIT_FOR_FENCE) {
+			rgfx_blit::RgfxOpWaitForFence b;
+			std::memcpy(&b, body, sizeof(b));
+			CHECK(b.fence_obj_id == 9);
+		}
+		i++;
+	}
+
+	// The whole stream was consumed: the tag sequence matched and the framing is
+	// balanced (three encoders opened and closed).
+	CHECK(i == want_n);
+	CHECK(open == 0);
+	CHECK(begins == 3 && ends == 3);
+
+	// op_bytes is the stream the walk consumed, 8-aligned.
+	CHECK(walk.pos == cb.op_bytes);
+	CHECK(cb.op_bytes % 8 == 0);
+}
+
 } // namespace
 
 int main()
@@ -514,6 +779,7 @@ int main()
 	test_library_message();
 	test_pipeline_messages();
 	test_ring_wrap_and_no_room();
+	test_command_buffer_encoder();
 	std::printf("serializer_tests: OK (%d checks)\n", g_checks);
 	return 0;
 }
