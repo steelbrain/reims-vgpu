@@ -301,7 +301,6 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 [[package]]
 name = "metal2vulkan"
 version = "0.2.0"
-source = "git+https://github.com/steelbrain/metal2vulkan?rev=219f01365dc4c8eb346816c405b5b17403793764#219f01365dc4c8eb346816c405b5b17403793764"
 dependencies = [
  "ash",
  "metal2vulkan-air",
@@ -312,7 +311,6 @@ dependencies = [
 [[package]]
 name = "metal2vulkan-air"
 version = "0.2.0"
-source = "git+https://github.com/steelbrain/metal2vulkan?rev=219f01365dc4c8eb346816c405b5b17403793764#219f01365dc4c8eb346816c405b5b17403793764"
 dependencies = [
  "sha2 0.11.1",
 ]
@@ -320,7 +318,6 @@ dependencies = [
 [[package]]
 name = "metal2vulkan-runtime"
 version = "0.2.0"
-source = "git+https://github.com/steelbrain/metal2vulkan?rev=219f01365dc4c8eb346816c405b5b17403793764#219f01365dc4c8eb346816c405b5b17403793764"
 dependencies = [
  "ash",
  "libc",
@@ -572,6 +569,9 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 name = "reims-graphics"
 version = "0.1.0"
 dependencies = [
+ "libc",
+ "log",
+ "parking_lot",
  "zerocopy",
 ]
 

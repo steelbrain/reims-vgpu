@@ -13,3 +13,8 @@ workspace = true
 [dependencies]
 # The wire's records, read from and written into the rings as bytes.
 zerocopy.workspace = true
+# The region's mapping, the control thread's pipe and poll, and the monotonic clock.
+libc.workspace = true
+# The device's locks, reims-vgpu-core's (`sync`).
+parking_lot.workspace = true
+log.workspace = true

@@ -1,0 +1,495 @@
+//! The two ends of a ring the host holds (`wire`'s module doc has the protocol): [`Consumer`], the
+//! host's end of a submission ring the guest writes, and [`Producer`], its end of a completion
+//! ring the guest reads.
+//!
+//! The host keeps its own count of each ring, and writes it to the header for the guest; it never
+//! reads its own count back from guest memory. The guest's count is read with an acquire load,
+//! and checked against the host's before anything is read of the ring: a count that runs ahead by
+//! more than the ring holds, or behind the host's, is a broken ring ([`Broken`]).
+
+use std::sync::atomic::{Ordering, fence};
+
+use zerocopy::{FromBytes, IntoBytes};
+
+use crate::region::Region;
+use crate::wire::{RGFX_MSG_PAD, RgfxMsgHeader};
+
+/// Where a ring is in the region: its header, and its byte ring of `data_size` bytes, a power of
+/// two, right after it.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RingAt {
+    /// The header's offset in the region.
+    pub(crate) header: u64,
+    /// The byte ring's size.
+    pub(crate) data_size: u64,
+}
+
+/// The header fields' offsets, from `wire::RgfxRingHeader`.
+const PRODUCER: u64 = 0x00;
+const CONSUMER: u64 = 0x40;
+const CONSUMER_IDLE: u64 = 0x80;
+const ARMED: u64 = 0xc0;
+/// Where the byte ring starts, after the header.
+const DATA: u64 = crate::wire::RGFX_RING_HEADER_SIZE as u64;
+/// A message header's bytes: `type` and `size`, then `seqno`.
+const HEADER_SIZE: u64 = size_of::<RgfxMsgHeader>() as u64;
+
+/// What makes a ring broken: the guest wrote counts or a message the protocol does not allow.
+/// The host takes nothing more from the ring until the device is reset.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Broken {
+    /// The guest's count is behind the host's, or ahead of it by more than the ring holds.
+    Count {
+        /// The guest's count.
+        guest: u64,
+        /// The host's.
+        host: u64,
+    },
+    /// A message's `size` is not a multiple of 8, is below its header (16 bytes, 8 for a pad),
+    /// reaches past the ring's end, or past what the producer published.
+    Size {
+        /// Where the message starts, as a count.
+        at: u64,
+        /// Its `size`.
+        size: u32,
+    },
+}
+
+impl std::fmt::Display for Broken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            Broken::Count { guest, host } => {
+                write!(
+                    f,
+                    "the guest's count {guest} is out of reach of the host's {host}"
+                )
+            }
+            Broken::Size { at, size } => write!(f, "the message at {at} has a size of {size}"),
+        }
+    }
+}
+
+impl RingAt {
+    /// Writes the header of a ring nothing has passed through: both counts 0, `armed` 0, and
+    /// `consumer_idle` as given.
+    pub(crate) fn initialize(&self, region: &Region, consumer_idle: bool) {
+        region
+            .atomic_u64(self.header + PRODUCER)
+            .store(0, Ordering::Release);
+        region
+            .atomic_u64(self.header + CONSUMER)
+            .store(0, Ordering::Release);
+        region
+            .atomic_u32(self.header + CONSUMER_IDLE)
+            .store(u32::from(consumer_idle), Ordering::Release);
+        region
+            .atomic_u32(self.header + ARMED)
+            .store(0, Ordering::Release);
+    }
+
+    /// The byte ring's offset in the region for count `count`.
+    fn data_at(&self, count: u64) -> u64 {
+        self.header + DATA + (count & (self.data_size - 1))
+    }
+
+    /// The bytes from count `count` to the byte ring's end.
+    fn left_to_end(&self, count: u64) -> u64 {
+        self.data_size - (count & (self.data_size - 1))
+    }
+}
+
+/// A message taken from a submission ring: its header and its whole bytes, header included.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Message {
+    /// Its header.
+    pub(crate) header: RgfxMsgHeader,
+    /// Its `size` bytes, copied out of the ring.
+    pub(crate) bytes: Vec<u8>,
+}
+
+/// The host's end of a submission ring: it reads what the guest produces.
+#[derive(Debug)]
+pub(crate) struct Consumer {
+    /// The ring.
+    at: RingAt,
+    /// The host's count: what it has taken.
+    count: u64,
+}
+
+impl Consumer {
+    /// The consumer of a ring at `at`, nothing taken yet.
+    pub(crate) fn new(at: RingAt) -> Consumer {
+        Consumer { at, count: 0 }
+    }
+
+    /// Back to a ring nothing has passed through, as [`RingAt::initialize`] writes it, with
+    /// `consumer_idle` 1: the guest rings the doorbell for its first message.
+    pub(crate) fn reset(&mut self, region: &Region) {
+        self.count = 0;
+        self.at.initialize(region, true);
+    }
+
+    /// The guest's count, checked against the host's: how far it runs ahead.
+    fn published(&self, region: &Region) -> Result<u64, Broken> {
+        let guest = region
+            .atomic_u64(self.at.header + PRODUCER)
+            .load(Ordering::Acquire);
+        let ahead = guest.wrapping_sub(self.count);
+        if ahead > self.at.data_size {
+            return Err(Broken::Count {
+                guest,
+                host: self.count,
+            });
+        }
+        Ok(ahead)
+    }
+
+    /// Whether the guest has published bytes the host has not taken.
+    pub(crate) fn has_pending(&self, region: &Region) -> Result<bool, Broken> {
+        Ok(self.published(region)? > 0)
+    }
+
+    /// The next message, with the pads before it skipped, and the host's count moved past it and
+    /// written to the header; `None` where the guest has published no more.
+    pub(crate) fn next(&mut self, region: &Region) -> Result<Option<Message>, Broken> {
+        loop {
+            let ahead = self.published(region)?;
+            if ahead == 0 {
+                return Ok(None);
+            }
+            let left = self.at.left_to_end(self.count);
+            let broken = |size| Broken::Size {
+                at: self.count,
+                size,
+            };
+            // A published message has at least its `type` and `size`, which fit before the end:
+            // the bytes left there are a multiple of 8.
+            let Some(start) = region.read(self.at.data_at(self.count), 8) else {
+                return Err(broken(0));
+            };
+            let r#type = u32::from_le_bytes([start[0], start[1], start[2], start[3]]);
+            let size = u32::from_le_bytes([start[4], start[5], start[6], start[7]]);
+            let least = if r#type == RGFX_MSG_PAD {
+                8
+            } else {
+                HEADER_SIZE
+            };
+            let size64 = u64::from(size);
+            if size % 8 != 0 || size64 < least || size64 > left || size64 > ahead {
+                return Err(broken(size));
+            }
+            if r#type == RGFX_MSG_PAD {
+                self.consume(region, size64);
+                continue;
+            }
+            let Some(bytes) = region.read(self.at.data_at(self.count), size as usize) else {
+                return Err(broken(size));
+            };
+            let Ok((header, _)) = RgfxMsgHeader::read_from_prefix(&bytes) else {
+                return Err(broken(size));
+            };
+            self.consume(region, size64);
+            return Ok(Some(Message { header, bytes }));
+        }
+    }
+
+    /// Moves the host's count on by `size` and publishes it: the guest may write those bytes
+    /// again.
+    fn consume(&mut self, region: &Region, size: u64) {
+        self.count = self.count.wrapping_add(size);
+        region
+            .atomic_u64(self.at.header + CONSUMER)
+            .store(self.count, Ordering::Release);
+    }
+
+    /// Before the host sleeps: sets `consumer_idle`, issues a full fence, and answers whether the
+    /// guest published more meanwhile, which the host takes before it sleeps (clearing the flag
+    /// again). A broken count answers true, so the host finds it.
+    pub(crate) fn sleep_or_pending(&self, region: &Region) -> bool {
+        let idle = region.atomic_u32(self.at.header + CONSUMER_IDLE);
+        idle.store(1, Ordering::SeqCst);
+        fence(Ordering::SeqCst);
+        let pending = self.has_pending(region).unwrap_or(true);
+        if pending {
+            idle.store(0, Ordering::SeqCst);
+        }
+        pending
+    }
+
+    /// The host woke: clears `consumer_idle`, so the guest rings no doorbell while it takes.
+    pub(crate) fn awake(&self, region: &Region) {
+        region
+            .atomic_u32(self.at.header + CONSUMER_IDLE)
+            .store(0, Ordering::SeqCst);
+    }
+}
+
+/// What [`Producer::post`] did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Posted {
+    /// The message is in the ring and published. `raise` is whether the guest had armed the
+    /// ring, which the post cleared: the host raises the ring's vector.
+    Yes {
+        /// Raise the ring's interrupt.
+        raise: bool,
+    },
+    /// The ring has no room for it until the guest takes more: nothing was written.
+    NoRoom,
+    /// The guest's count is out of reach of the host's: nothing was written.
+    Broken(Broken),
+}
+
+/// The host's end of a completion ring: it writes what the guest reads.
+#[derive(Debug)]
+pub(crate) struct Producer {
+    /// The ring.
+    at: RingAt,
+    /// The host's count: what it has published.
+    count: u64,
+}
+
+impl Producer {
+    /// The producer of a ring at `at`, nothing published yet.
+    pub(crate) fn new(at: RingAt) -> Producer {
+        Producer { at, count: 0 }
+    }
+
+    /// Back to a ring nothing has passed through ([`RingAt::initialize`]), `consumer_idle` 0.
+    pub(crate) fn reset(&mut self, region: &Region) {
+        self.count = 0;
+        self.at.initialize(region, false);
+    }
+
+    /// Writes `message` (its header first, its `size` its length, a multiple of 8, at least 16
+    /// and at most the ring) and publishes it: first a pad to the ring's end where the bytes left
+    /// there are fewer than the message. Then a full fence, and `armed` read and cleared
+    /// ([`Posted::Yes`]).
+    pub(crate) fn post(&mut self, region: &Region, message: &[u8]) -> Posted {
+        let len = message.len() as u64;
+        debug_assert!(len.is_multiple_of(8) && len >= HEADER_SIZE && len <= self.at.data_size);
+        let guest = region
+            .atomic_u64(self.at.header + CONSUMER)
+            .load(Ordering::Acquire);
+        let used = self.count.wrapping_sub(guest);
+        if used > self.at.data_size {
+            return Posted::Broken(Broken::Count {
+                guest,
+                host: self.count,
+            });
+        }
+        let free = self.at.data_size - used;
+        let left = self.at.left_to_end(self.count);
+        let pad = if left < len { left } else { 0 };
+        if pad + len > free {
+            return Posted::NoRoom;
+        }
+        if pad > 0 {
+            let mut header = [0u8; 8];
+            header[0..4].copy_from_slice(&RGFX_MSG_PAD.to_le_bytes());
+            // The bytes left are below the ring's size, a u32.
+            header[4..8].copy_from_slice(&(pad as u32).to_le_bytes());
+            region.write(self.at.data_at(self.count), &header);
+            self.count = self.count.wrapping_add(pad);
+        }
+        region.write(self.at.data_at(self.count), message);
+        self.count = self.count.wrapping_add(len);
+        region
+            .atomic_u64(self.at.header + PRODUCER)
+            .store(self.count, Ordering::Release);
+        fence(Ordering::SeqCst);
+        let raise = region
+            .atomic_u32(self.at.header + ARMED)
+            .swap(0, Ordering::SeqCst)
+            == 1;
+        Posted::Yes { raise }
+    }
+}
+
+/// A message's bytes: `record` (whose first 16 bytes are its header, its `type` and `seqno` set)
+/// with its `size` set to its length.
+pub(crate) fn sized<T: IntoBytes + zerocopy::Immutable>(record: &T) -> Vec<u8> {
+    let mut bytes = record.as_bytes().to_vec();
+    set_size(&mut bytes);
+    bytes
+}
+
+/// Sets the `size` of the message `bytes` holds to its length, which is a multiple of 8.
+pub(crate) fn set_size(bytes: &mut [u8]) {
+    let size = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
+    if let Some(field) = bytes.get_mut(4..8) {
+        field.copy_from_slice(&size.to_le_bytes());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::wire::{RgfxComplete, RgfxMsgHeader};
+
+    const AT: RingAt = RingAt {
+        header: 0,
+        data_size: 256,
+    };
+
+    /// A guest writing messages into a submission ring at `AT`.
+    struct Guest {
+        count: u64,
+    }
+
+    impl Guest {
+        fn write(&mut self, region: &Region, bytes: &[u8]) {
+            let left = AT.left_to_end(self.count);
+            if left < bytes.len() as u64 {
+                let mut pad = [0u8; 8];
+                pad[4..8].copy_from_slice(&(left as u32).to_le_bytes());
+                region.write(AT.data_at(self.count), &pad);
+                self.count += left;
+            }
+            region.write(AT.data_at(self.count), bytes);
+            self.count += bytes.len() as u64;
+            region
+                .atomic_u64(PRODUCER)
+                .store(self.count, Ordering::Release);
+        }
+    }
+
+    fn message(r#type: u32, seqno: u64, len: usize) -> Vec<u8> {
+        let mut bytes = vec![0xab; len];
+        bytes[..16].copy_from_slice(
+            RgfxMsgHeader {
+                r#type,
+                size: len as u32,
+                seqno,
+            }
+            .as_bytes(),
+        );
+        bytes
+    }
+
+    /// Messages come out in order, the pads before the ring's end skipped, and the host's count
+    /// reaches the header
+    #[test]
+    fn a_consumer_takes_messages_in_order_across_the_end() {
+        let region = Region::new(4096).unwrap();
+        let mut consumer = Consumer::new(AT);
+        consumer.reset(&region);
+        let mut guest = Guest { count: 0 };
+        for seqno in 1..=40u64 {
+            let len = 16 + 8 * (seqno as usize % 5);
+            guest.write(&region, &message(7, seqno, len));
+            let got = consumer.next(&region).unwrap().unwrap();
+            assert_eq!(got.header.seqno, seqno);
+            assert_eq!(got.bytes.len(), len);
+            assert_eq!(consumer.next(&region).unwrap(), None);
+            assert_eq!(
+                region.atomic_u64(CONSUMER).load(Ordering::Acquire),
+                guest.count
+            );
+        }
+    }
+
+    /// A pad of 8 bytes, the least the end can leave, is skipped
+    #[test]
+    fn an_eight_byte_pad_is_taken() {
+        let region = Region::new(4096).unwrap();
+        let mut consumer = Consumer::new(AT);
+        consumer.reset(&region);
+        let mut guest = Guest { count: 0 };
+        guest.write(&region, &message(1, 1, 248));
+        assert_eq!(consumer.next(&region).unwrap().unwrap().header.seqno, 1);
+        guest.write(&region, &message(1, 2, 16));
+        assert_eq!(guest.count, 248 + 8 + 16);
+        assert_eq!(consumer.next(&region).unwrap().unwrap().header.seqno, 2);
+    }
+
+    /// A count out of reach and a size the protocol refuses break the ring
+    #[test]
+    fn bad_counts_and_sizes_break_the_ring() {
+        let region = Region::new(4096).unwrap();
+        let mut consumer = Consumer::new(AT);
+        consumer.reset(&region);
+        region.atomic_u64(PRODUCER).store(257, Ordering::Release);
+        assert!(matches!(consumer.next(&region), Err(Broken::Count { .. })));
+        for size in [0u32, 12, 8, 264] {
+            let mut consumer = Consumer::new(AT);
+            consumer.reset(&region);
+            let mut bytes = message(1, 1, 16);
+            bytes[4..8].copy_from_slice(&size.to_le_bytes());
+            region.write(AT.data_at(0), &bytes);
+            region.atomic_u64(PRODUCER).store(16, Ordering::Release);
+            assert!(
+                matches!(consumer.next(&region), Err(Broken::Size { .. })),
+                "size {size}"
+            );
+        }
+    }
+
+    /// The idle flag is set before the host sleeps, and cleared where the guest published
+    /// meanwhile
+    #[test]
+    fn the_consumer_sleeps_only_on_an_empty_ring() {
+        let region = Region::new(4096).unwrap();
+        let mut consumer = Consumer::new(AT);
+        consumer.reset(&region);
+        assert_eq!(region.atomic_u32(CONSUMER_IDLE).load(Ordering::Acquire), 1);
+        assert!(!consumer.sleep_or_pending(&region));
+        assert_eq!(region.atomic_u32(CONSUMER_IDLE).load(Ordering::Acquire), 1);
+        consumer.awake(&region);
+        assert_eq!(region.atomic_u32(CONSUMER_IDLE).load(Ordering::Acquire), 0);
+        Guest { count: 0 }.write(&region, &message(1, 1, 16));
+        assert!(consumer.sleep_or_pending(&region));
+        assert_eq!(region.atomic_u32(CONSUMER_IDLE).load(Ordering::Acquire), 0);
+    }
+
+    /// The producer pads to the end, waits for room, and raises only where the guest armed the
+    /// ring, clearing `armed`
+    #[test]
+    fn a_producer_pads_waits_for_room_and_raises_when_armed() {
+        let region = Region::new(4096).unwrap();
+        let mut producer = Producer::new(AT);
+        producer.reset(&region);
+        let complete = |seqno| {
+            sized(&RgfxComplete {
+                header: RgfxMsgHeader {
+                    r#type: crate::wire::RGFX_EVT_COMPLETE,
+                    size: 0,
+                    seqno,
+                },
+                status: 0,
+                reserved_14: 0,
+            })
+        };
+        // 10 of 24 bytes fill 240 of 256.
+        for seqno in 0..10 {
+            assert_eq!(
+                producer.post(&region, &complete(seqno)),
+                Posted::Yes { raise: false }
+            );
+        }
+        assert_eq!(producer.post(&region, &complete(10)), Posted::NoRoom);
+        region.atomic_u64(CONSUMER).store(48, Ordering::Release);
+        region.atomic_u32(ARMED).store(1, Ordering::Release);
+        // 16 bytes to the end: a pad, then the message from the ring's start.
+        assert_eq!(
+            producer.post(&region, &complete(10)),
+            Posted::Yes { raise: true }
+        );
+        assert_eq!(region.atomic_u32(ARMED).load(Ordering::Acquire), 0);
+        assert_eq!(
+            region.atomic_u64(PRODUCER).load(Ordering::Acquire),
+            256 + 24
+        );
+        let pad = region.read(AT.data_at(240), 8).unwrap();
+        assert_eq!(pad, [0, 0, 0, 0, 16, 0, 0, 0]);
+        let first = region.read(AT.data_at(256), 24).unwrap();
+        assert_eq!(
+            RgfxComplete::read_from_bytes(&first).unwrap().header.seqno,
+            10
+        );
+        region.atomic_u64(CONSUMER).store(1000, Ordering::Release);
+        assert!(matches!(
+            producer.post(&region, &complete(11)),
+            Posted::Broken(_)
+        ));
+    }
+}

@@ -1,6 +1,9 @@
 //! The committed wire header, `include/reims_graphics_wire.h`, as the guest's kext and option
 //! ROM compile it: as C11 and as C++17, with no warning, its records laid out as `wire`'s.
 
+// A failure is the assertion (architecture 17.4).
+#![allow(clippy::unwrap_used)]
+
 use std::path::PathBuf;
 use std::process::Command;
 
