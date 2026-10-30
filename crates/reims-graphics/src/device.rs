@@ -74,7 +74,7 @@ use crate::wire::*;
 
 /// The region's size: the control rings, the framebuffer's scanout span and cursor, and room for
 /// the guest processes' rings, buffers, heaps and surfaces; a power of two, as a BAR's size is.
-pub const REGION_SIZE: u64 = 1 << 30;
+pub const REGION_SIZE: u64 = 256 << 20;
 
 /// How long the control thread waits before it looks for room in the completion ring again.
 const ROOM_POLL: Duration = Duration::from_millis(1);
@@ -256,6 +256,10 @@ pub(crate) struct QueueShared {
     wake: Wake,
     /// Set when the queue is destroyed, or at a reset or the device's end.
     ending: AtomicBool,
+    /// The submission ring's count through the last message the host has carried out: a command
+    /// buffer on another queue of the context waits for its device queue's to pass what was
+    /// published before it.
+    done: AtomicU64,
 }
 
 impl QueueShared {
@@ -797,6 +801,7 @@ impl Shared {
             complete: Mutex::new(producer),
             wake,
             ending: AtomicBool::new(false),
+            done: AtomicU64::new(0),
         });
         {
             let mut queues = self.queues.lock();
@@ -927,13 +932,13 @@ impl Shared {
     /// queue's completion ring through `poster`, from the GPU's thread.
     fn take_queue_messages(&self, queue: &Arc<QueueShared>, poster: &QueueCompletionPoster) {
         loop {
-            let message = {
+            let (message, through) = {
                 let mut submit = queue.submit.lock();
                 if !self.started() || submit.broken || self.ending() || queue.ended() {
                     return;
                 }
                 match submit.consumer.next(&self.region) {
-                    Ok(Some(message)) => message,
+                    Ok(Some(message)) => (message, submit.consumer.consumed()),
                     Ok(None) => return,
                     Err(broken) => {
                         log::error!(
@@ -950,8 +955,8 @@ impl Shared {
             // ride the process's device queue, whose sole consumer is that queue's thread; command
             // buffers ride the other queues (this thread). A create a buffer uses is posted before
             // it in guest order, so it is within the device queue's producer at the moment this
-            // thread takes the buffer. Wait for the device queue's thread to consume up to there,
-            // so the resource is registered before the buffer's ops name it. This thread only
+            // thread takes the buffer. Wait for the device queue's thread to have carried out every
+            // message up to there, so the resource is registered before the buffer's ops name it. This thread only
             // reads the device queue's counts; it never consumes that ring, so it keeps one
             // consumer and its `consumer_idle` handshake is untouched.
             if !queue.device_queue && message.header.r#type == RGFX_CMD_COMMAND_BUFFER {
@@ -959,7 +964,7 @@ impl Shared {
                 if let Some(device) = device {
                     let created_through =
                         { device.submit.lock().consumer.published_count(&self.region) };
-                    while device.submit.lock().consumer.consumed() < created_through {
+                    while device.done.load(Ordering::Acquire) < created_through {
                         if self.ending() || queue.ended() || device.ended() {
                             break;
                         }
@@ -968,6 +973,7 @@ impl Shared {
                 }
             }
             self.host.queue_message(poster, &message.bytes);
+            queue.done.store(through, Ordering::Release);
         }
     }
 
