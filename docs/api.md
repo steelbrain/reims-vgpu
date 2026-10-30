@@ -36,6 +36,7 @@ Each object is made from one config struct, which is borrowed for the call. The 
 | `RvgIOSurfaceDevice` | `rvg_iosurface_device_create` | `rvg_iosurface_device_release` | — | teardown at its last release; it waits for its own thread |
 | `RvgVideoDevice` | `rvg_video_device_create` | `rvg_video_device_release` | — (its IOSurface device is borrowed: unretained) | a reset at its last release; it waits for its host session's threads |
 | `RvgScalerDevice` | `rvg_scaler_device_create` | `rvg_scaler_device_release` | — (its IOSurface device is borrowed: unretained) | its accelerator goes at its last release |
+| `RvgGraphicsDevice` | `rvg_graphics_device_create` | `rvg_graphics_device_release` | — | its window closes and its threads end at its last release, waited for by nothing; its region stays mapped until both threads and the window's GPU work have let it go |
 | `RvgTraceRangeHandler` | the device, handed to `add_trace_range` | `rvg_trace_range_handler_release` (with `_retain`) | the EFI display's present source | at its last reference |
 | `RvgBytes` | `rvg_device_finish_suspend` | `rvg_bytes_free` | — | — |
 
@@ -91,6 +92,7 @@ Functions that can fail return `RvgStatus` (a `uint32_t`). `rvg_status_message` 
 | 14 | `RVG_ERR_RESUME` | `will_resume` refused the state |
 | 15 | `RVG_ERR_GPU` | the frame's GPU work ended with an error |
 | 16 | `RVG_ERR_FRAME_STATE` | a frame committed twice, or waited on before its commit |
+| 17 | `RVG_ERR_HOST_RESOURCES` | the host refused a graphics device's region (its memory), a pipe or a thread |
 
 Each create checks in this order, which is core's:
 
@@ -131,6 +133,7 @@ The resume reasons are the codes 0 to 5 (`RVG_RESUME_ERROR_*`), with `RVG_RESUME
 | the IOSurface `raise_interrupt` | every function except releasing its own IOSurface device, which ends the process |
 | the video `send_to_guest` | `rvg_status_message` |
 | the scaler's `is_ram`, `read`, `write` | nothing |
+| the graphics device's `raise_interrupt`, `scanout_written` | `rvg_status_message` and the `rvg_graphics_device_*` functions, except the release of its own device |
 | the log handler | nothing |
 | a `destroy` | nothing |
 
@@ -158,7 +161,7 @@ Every export is `extern "C"`: nothing unwinds out of one into the host, and a pa
 
 ## 2. The C header
 
-The header has 48 functions and every type, callback typedef and constant, with the thread and ordering rules on each callback and each function. It has no Objective-C types, no `id<…>`, no `dispatch_queue_t` and no `__OBJC__` block. The C API's tests compile it as C11, as C++17 and as Objective-C.
+The header has 55 functions and every type, callback typedef and constant, with the thread and ordering rules on each callback and each function. It has no Objective-C types, no `id<…>`, no `dispatch_queue_t` and no `__OBJC__` block. The C API's tests compile it as C11, as C++17 and as Objective-C.
 
 | group | items |
 |---|---|
@@ -172,6 +175,7 @@ The header has 48 functions and every type, callback typedef and constant, with 
 | IOSurface device | `RvgIOSurfaceDeviceConfig`, `RvgIOSurfaceCallbacks`; `rvg_iosurface_device_create`, `_release`, `_mmio_read`, `_mmio_write` |
 | video device | `RvgVideoDeviceConfig`, `RvgVideoCallbacks`, `RvgVideoSendToGuestFn`, the `RVG_VIDEO_*` constants (Apple's PCI IDs 0x106b and 0x1a03, two queues, the guest's 0x4000-byte buffers, `RVG_VIDEO_INVALID_SESSION` -12903, `RVG_VIDEO_MAX_MESSAGE_SIZE` 16 MiB, `RVG_VIDEO_ALLOCATION_FAILED` -12904); `rvg_video_device_create`, `_release`, `_start`, `_deliver`, `_invalidate`, `_reset` |
 | scaler device | `RvgScalerDeviceConfig`, `RvgScalerGuestMemory`, `RvgScalerIsRamFn`, `RvgScalerReadFn`, `RvgScalerWriteFn`, `RvgScalerOutcome` and its `RVG_SCALER_REPLY`, `_NEEDS_RESET`, `_END_VM`, the `RVG_SCALER_*` constants (Apple's PCI IDs 0x106b and 0x1a0b, one queue); `rvg_scaler_device_create`, `_release`, `_scales`, `_start`, `_process`, `_reset` |
+| graphics device | `RvgGraphicsDeviceConfig`, `RvgGraphicsCallbacks`, `RvgGraphicsRaiseFn`, `RvgGraphicsScanoutWrittenFn`, the `RVG_GRAPHICS_*` constants (PCI IDs 0x1234 and 0x5247, class 0x0380, BAR 0's 4 KiB of registers with the MSI-X table and PBA from 0x800, one vector, BAR 2 the region, the DOORBELL register 0x20 and the control ring's id 0, the guest's allocations from 0x20000); `rvg_graphics_device_create`, `_release`, `_region`, `_mmio_read`, `_mmio_write`, `_set_doorbell`, `_reset` |
 | trace ranges | `rvg_trace_range_handler_invoke`, `_retain`, `_release` |
 
 ### What the header fixes
@@ -307,7 +311,7 @@ pub const MAX_FRAME_TARGET_SIZE: u32 = 16384;
 pub enum Error {
     InvalidArgument, DisplayPortCount, NoMetalDevice, MemoryConflict, MemoryMap,
     IsolationWithoutMap, Metal, PortOutOfRange, PortInUse, SerialInUse, NoMemoryMap,
-    Suspend, Resume(Option<ResumeError>), Gpu, FrameState,
+    Suspend, Resume(Option<ResumeError>), Gpu, FrameState, HostResources,
 }
 impl std::fmt::Display for Error {}
 impl std::error::Error for Error {}
@@ -601,6 +605,33 @@ impl<P: ApiPlatform> ScalerDevice<P> {
     pub fn reset(&self);
 }
 
+// The reims-graphics device (1234:5247), over crate reims_graphics's protocol.
+pub type GraphicsRaiseFn = Arc<dyn Fn(u32) + Send + Sync>;           // MSI-X vector
+pub type ScanoutWrittenFn = Arc<dyn Fn(u64, u64) -> bool + Send + Sync>; // the host's dirty log
+#[derive(Clone, Default)]
+pub struct GraphicsCallbacks {
+    pub raise_interrupt: Option<GraphicsRaiseFn>,
+    pub scanout_written: Option<ScanoutWrittenFn>, // None: every refresh shows the scanout
+}
+#[derive(Clone, Default)]
+pub struct GraphicsConfig {
+    pub callbacks: GraphicsCallbacks,
+    pub window: Option<WindowConfig>,              // None: 1920 × 1080 at 60 Hz, shown nowhere
+}
+pub struct GraphicsDevice<P: ApiPlatform = DefaultPlatform> { /* the device, its window */ }
+impl GraphicsDevice {
+    pub fn new(config: GraphicsConfig) -> Result<GraphicsDevice, Error>; // Error::HostResources
+}
+impl<P: ApiPlatform> GraphicsDevice<P> {
+    pub fn with_platform(platform: Arc<P>, config: GraphicsConfig) -> Result<Self, Error>;
+    pub fn region_base(&self) -> *mut u8;
+    pub fn region_size(&self) -> u64;
+    pub fn mmio_read(&self, offset: u64) -> u32;
+    pub fn mmio_write(&self, offset: u64, value: u32);
+    pub fn set_doorbell(&self, fd: RawFd) -> bool;
+    pub fn reset(&self);
+}
+
 // One plane of a surface, as a platform gives it to the video devices.
 pub struct SurfacePlane {
     pub offset: u64,
@@ -659,7 +690,7 @@ With the `testkit` feature, `Device`, `Display` and `IoSurfaceDevice` also give 
 
 ## 4. The functions
 
-The header's 48 functions, in its order. "May" is the header's mark "may call back": the device's callbacks may run on the calling thread before the function returns. A function without the mark never runs one there. A release may also run its table's `destroy` on the calling thread (section 5).
+The header's 55 functions, in its order. "May" is the header's mark "may call back": the device's callbacks may run on the calling thread before the function returns. A function without the mark never runs one there. A release may also run its table's `destroy` on the calling thread (section 5).
 
 | # | function | calls back | what it does |
 |---|---|---|---|
@@ -711,8 +742,15 @@ The header's 48 functions, in its order. "May" is the header's mark "may call ba
 | 46 | `rvg_scaler_device_start` | | the guest's DRIVER_OK: a new accelerator; false where none can be made, as on a device that does not scale, a needs-reset |
 | 47 | `rvg_scaler_device_process` | may | one element of the queue, answered in place: `RVG_SCALER_REPLY`, `_NEEDS_RESET` or `_END_VM`, with Apple's reason for the last two |
 | 48 | `rvg_scaler_device_reset` | | a reset or a stop: the accelerator goes |
+| 49 | `rvg_graphics_device_create` | | the reims-graphics device (1234:5247), from an `RvgGraphicsDeviceConfig`: its region mapped and zeroed, its control and refresh threads started, and a window for its display where the config gives one |
+| 50 | `rvg_graphics_device_release` | | drops the host's reference; the last one closes the window and ends the threads, waiting for neither, and the callbacks' `destroy` runs once both threads have ended |
+| 51 | `rvg_graphics_device_region` | | the region's first byte and its size: what the host maps into the guest as BAR 2 |
+| 52 | `rvg_graphics_device_mmio_read` | | a 32-bit read of BAR 0's registers |
+| 53 | `rvg_graphics_device_mmio_write` | | a 32-bit write of BAR 0's registers: STATUS, and DOORBELL where the host's ioeventfd did not take it; STATUS 0 resets the device |
+| 54 | `rvg_graphics_device_set_doorbell` | | the host's doorbell file for the control ring (QEMU's ioeventfd), which the device polls with its own wake |
+| 55 | `rvg_graphics_device_reset` | | the guest's bus reset, as STATUS 0 |
 
-QEMU's `apple-gfx` calls 21 of them (docs/qemu.md), the suite's runner 33 (all but `rvg_log_set_handler` and `rvg_frame_target_retain`), and the C harness (`tests/c/harness.c`) all 47, the scaler's process and reset after a start only where the device scales (elsewhere it checks that the start fails). What the runner leaves out is covered in the C API's tests: `api.log.handler` pins the log hook, and `frame::tests::a_retained_target_lives_until_its_last_release` checks that a retained target keeps its texture until its last release.
+QEMU's `apple-gfx` calls 21 of them (docs/qemu.md), its `reims-graphics-pci` the graphics device's seven, the suite's runner 33 (all but `rvg_log_set_handler` and `rvg_frame_target_retain`), and the C harness (`tests/c/harness.c`) all 55, the scaler's process and reset after a start only where the device scales (elsewhere it checks that the start fails). What the runner leaves out is covered in the C API's tests: `api.log.handler` pins the log hook, and `frame::tests::a_retained_target_lives_until_its_last_release` checks that a retained target keeps its texture until its last release.
 
 ## 5. Callbacks and threads
 
@@ -730,10 +768,12 @@ QEMU's `apple-gfx` calls 21 of them (docs/qemu.md), the suite's runner 33 (all b
 | video `send_to_guest` | the host session's threads, or the host's own inside `rvg_video_device_deliver` | nothing: the host copies each message and keeps the calls' order for the guest | the session's |
 | dirty source `start`, `flush_vcpus`, `for_each_slot` (and the `rvg_dirty_slot` calls inside it), `take_host_writes` | the device's harvest thread, `reims-vgpu.dirty`; never inside a call of the host's | the device's harvests: one at a time | each harvest's: `start` once, before the first; then `flush_vcpus` (only where `pml` is on), `for_each_slot`, inside each `rvg_dirty_slot` the slot's `KVM_GET_DIRTY_LOG`, `KVM_CLEAR_DIRTY_LOG` and `take_host_writes` |
 | scaler `is_ram`, `read`, `write` | the host's own, inside `rvg_scaler_device_process` | the host's calls of `rvg_scaler_device_process` | the request's: Apple's checks, then its gathers, then its scatters |
+| graphics `raise_interrupt` | the device's control thread, `reims-vgpu.graphics-control`, or its refresh thread, `reims-vgpu.graphics-refresh`; never inside a call of the host's, and with no lock of the library's held | nothing: the two threads may call at once | each after the completion ring's message it raises for is published |
+| graphics `scanout_written` | the device's refresh thread, `reims-vgpu.graphics-refresh`, once a refresh while the guest has a scanout; never inside a call of the host's, and with no lock of the library's held | the refreshes: one at a time | the refreshes' |
 | `destroy` (each table) | whichever thread drops the last reference: the host's in a release or a refused create, or a library thread; a window table's, the releasing thread, or the window's thread (the main thread on macOS, `reims-vgpu.ui` on Linux) | nothing | once, after every call of its table |
 | the log handler | any | nothing | none |
 
-Threads and queues are named `reims-vgpu.<role>`: `reims-vgpu.fifo` (a FIFO's thread), `reims-vgpu.fifo-control`, `reims-vgpu.reporting`, `reims-vgpu.efi-present`, `reims-vgpu.display`, `reims-vgpu.iosurface`, `reims-vgpu.release`, `reims-vgpu.timer`, `reims-vgpu.window` (a window's drawing thread), `reims-vgpu.ui` (on Linux, the thread every window's events and callbacks run on), `reims-vgpu.stats` (the frame statistics' reporter, with `REIMS_VGPU_STATS`), `reims-vgpu.dirty` (a device's harvest of its host's dirty source), an isolated task's `reims-vgpu.task-service`, `reims-vgpu.task-connection` and `reims-vgpu.task-link`, and the video device's host session's, which its crate names `reims-vgpu-video.<role>`: `decoder`, `decoder-copy`, `encoder`, `motion`, `jpeg` and `imports` (Linux keeps 15 bytes of a name, `reims-vgpu-vide`). The names are diagnostics, not contract. A queue's worker, the display thread among them, has core's `WORKER_STACK`, 512 KiB.
+Threads and queues are named `reims-vgpu.<role>`: `reims-vgpu.fifo` (a FIFO's thread), `reims-vgpu.fifo-control`, `reims-vgpu.reporting`, `reims-vgpu.efi-present`, `reims-vgpu.display`, `reims-vgpu.iosurface`, `reims-vgpu.release`, `reims-vgpu.timer`, `reims-vgpu.window` (a window's drawing thread), `reims-vgpu.ui` (on Linux, the thread every window's events and callbacks run on), `reims-vgpu.stats` (the frame statistics' reporter, with `REIMS_VGPU_STATS`), `reims-vgpu.dirty` (a device's harvest of its host's dirty source), `reims-vgpu.graphics-control` and `reims-vgpu.graphics-refresh` (a graphics device's), an isolated task's `reims-vgpu.task-service`, `reims-vgpu.task-connection` and `reims-vgpu.task-link`, and the video device's host session's, which its crate names `reims-vgpu-video.<role>`: `decoder`, `decoder-copy`, `encoder`, `motion`, `jpeg` and `imports` (Linux keeps 15 bytes of a name, `reims-vgpu-vide`). The names are diagnostics, not contract. A queue's worker, the display thread among them, has core's `WORKER_STACK`, 512 KiB.
 
 ### The order of VM-memory operations is core's
 
@@ -787,6 +827,7 @@ A display with a window has two tables, the display's and the window's, and `rvg
 - A task, memory or trace callback may block, but must not wait for a host thread that is itself inside a call on the same device that may call back: that call may be waiting for the callback's thread. A host whose callback waits for its main loop keeps that loop running while its other threads wait in the library. QEMU gives none of these callbacks, so its vCPU threads call the library directly (docs/qemu.md, "apple-gfx on reims-vgpu").
 - `raise_interrupt` runs under the device's signal lock and must not wait for a host thread that is in a call on the device.
 - A window callback must not block at all ("The main thread", above).
+- The graphics device's callbacks may wait for a lock the host holds while it calls the device (QEMU's BQL): no function of the graphics device waits for its threads, and the library calls them with none of its locks held. A STATUS write of 0 and `rvg_graphics_device_reset` wait only for the command the control thread is taking, which waits for nothing of the host's.
 - The IOSurface raise must not release its own IOSurface device: the teardown's wait for the device's thread would run on that thread, and ends the process.
 
 ## 6. Where the API differs from Apple's SDK
@@ -852,7 +893,7 @@ A host of this API cannot observe, and the suite does not record:
 
 - **The header.** `cargo xtask header` regenerates `include/reims_vgpu.h` with cbindgen 0.29.4, and `--check`, part of `cargo xtask check`, fails when the committed header differs from cbindgen's output. A different cbindgen version is reported, not compared. The C API's `header_has_no_drift` test runs the same comparison when cbindgen 0.29.4 is installed.
 - **The exports** (`tests/exports.rs`): every export is `#[unsafe(no_mangle)] pub [unsafe] extern "C" fn rvg_…` whose whole body is one call of `ffi::export`; no other function or function-pointer type of the product code has a C ABI, except the host's callback types, which are `extern "C-unwind"` for `ffi::host_call`'s catch; the header declares exactly the exports, and the dylib exports every one.
-- **The C harness** (`tests/c_harness.rs`) builds `tests/c/harness.c` against the committed header with `-std=c11 -Wall -Wextra -Werror -pedantic`, links it to the crate's dylib and runs it. It checks that the header declares 48 functions and that the harness calls each, and that the header compiles alone as C++17 and as Objective-C.
+- **The C harness** (`tests/c_harness.rs`) builds `tests/c/harness.c` against the committed header with `-std=c11 -Wall -Wextra -Werror -pedantic`, links it to the crate's dylib and runs it. It checks that the header declares 55 functions and that the harness calls each, and that the header compiles alone as C++17 and as Objective-C.
 - **The pins** (`tests/pins`): `api_pins.c`, a C program a host could be, pins what the suite's records do not show: the order, arguments and thread of the device's callbacks; each table's `destroy`; the display thread; a display kept alive through a frame; a display with a window created and released in a process whose main thread runs no run loop (`api.window.no_run_loop`); `add_trace_range` alone as a refusal; the registers a fresh device reads, a resume's refusals and a display's first cursor position; the EFI display's traced range; resume-child writes (0x1028) of IDs past the 64 child FIFOs; the feature level and the connection types as the guest reads them; the log hook; and the deaths that remain. `tests/pins/main.rs` compares its output with `expected.tsv`, and `RVG_PINS_RECORD=1` records it again.
 - **The suite** drives the API through the runner (section 7), against its expected files (docs/testing.md).
 - **Versioning.** A change to the API is additive (section 1).

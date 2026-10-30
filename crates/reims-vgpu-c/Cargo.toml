@@ -25,6 +25,8 @@ vulkan = ["reims-vgpu/vulkan"]
 
 [dependencies]
 reims-vgpu.workspace = true
+# The graphics device's wire constants, which the C API's PCI constants are checked against.
+reims-graphics.workspace = true
 # The platform trait's associated types (the unit tests' testkit platform stands where
 # MetalPlatform stands in the product), and the log hook.
 reims-vgpu-core.workspace = true

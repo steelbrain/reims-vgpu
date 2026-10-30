@@ -38,6 +38,9 @@ pub mod window;
 // The scaler device after the rest, so that the functions before it keep their places.
 pub mod scaler;
 
+// The graphics device after the scaler, for the same reason.
+pub mod graphics;
+
 mod ffi;
 mod handle;
 mod sized;

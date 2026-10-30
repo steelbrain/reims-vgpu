@@ -609,6 +609,7 @@ dependencies = [
  "objc2",
  "objc2-foundation",
  "parking_lot",
+ "reims-graphics",
  "reims-vgpu",
  "reims-vgpu-core",
  "tikv-jemallocator",

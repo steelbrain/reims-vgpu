@@ -75,6 +75,10 @@ pub const RVG_ERR_GPU: u32 = 15;
 /// A frame committed twice, or waited on before its commit.
 pub const RVG_ERR_FRAME_STATE: u32 = 16;
 
+/// The host refused the memory, a pipe or a thread the call needs: the graphics device's region
+/// or its threads (rvg_graphics_device_create).
+pub const RVG_ERR_HOST_RESOURCES: u32 = 17;
+
 /// The status of a Rust API error.
 pub(crate) fn status(e: Error) -> RvgStatus {
     match e {
@@ -92,13 +96,14 @@ pub(crate) fn status(e: Error) -> RvgStatus {
         Error::Resume(_) => RVG_ERR_RESUME,
         Error::Gpu => RVG_ERR_GPU,
         Error::FrameState => RVG_ERR_FRAME_STATE,
+        Error::HostResources => RVG_ERR_HOST_RESOURCES,
         // InvalidArgument, and any error a later Rust API adds before this layer names it.
         _ => RVG_ERR_INVALID_ARGUMENT,
     }
 }
 
 /// The messages, by code.
-const MESSAGES: [&std::ffi::CStr; 17] = [
+const MESSAGES: [&std::ffi::CStr; 18] = [
     c"success",
     c"invalid argument",
     c"unsupported struct size",
@@ -116,6 +121,7 @@ const MESSAGES: [&std::ffi::CStr; 17] = [
     c"resume state refused",
     c"GPU error",
     c"frame committed twice or waited on before its commit",
+    c"the host refused memory, a pipe or a thread",
 ];
 
 /// A static, NUL-terminated description of `status`; "unknown status" for a value this
@@ -151,7 +157,11 @@ mod tests {
     fn messages() {
         assert_eq!(message(RVG_OK), "success");
         assert_eq!(message(RVG_ERR_FRAME_STATE), MESSAGES[16].to_str().unwrap());
-        assert_eq!(message(17), "unknown status");
+        assert_eq!(
+            message(RVG_ERR_HOST_RESOURCES),
+            "the host refused memory, a pipe or a thread"
+        );
+        assert_eq!(message(18), "unknown status");
         assert_eq!(message(u32::MAX), "unknown status");
     }
 
@@ -175,6 +185,7 @@ mod tests {
             (Error::Resume(Some(ResumeError::InvalidContent)), 14),
             (Error::Gpu, 15),
             (Error::FrameState, 16),
+            (Error::HostResources, 17),
         ] {
             assert_eq!(status(e), s, "{e:?}");
         }

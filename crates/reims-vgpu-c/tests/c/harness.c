@@ -4,8 +4,8 @@
  * It drives the API end to end on the library's platform, as a C host does: a device over a
  * memory map, its MMIO, a display, a frame encoded into a frame target and copied into memory,
  * suspend and resume, an IOSurface device, a video device, a scaler device where the host has
- * a GPU for it (its refusal elsewhere), the refusals, the files behind the map's ranges,
- * and each table's one destroy.
+ * a GPU for it (its refusal elsewhere), a graphics device with no window, the refusals, the
+ * files behind the map's ranges, and each table's one destroy.
  *
  * Every rvg_ function the header declares is called at least once (tests/c_harness.rs checks
  * that). The device checks need a GPU: a Metal device, or with the vulkan feature a Vulkan one.
@@ -187,8 +187,8 @@ static RvgDeviceConfig device_config(const RvgHostCallbacks *cb) {
 
 static void check_status_and_log(void) {
     CHECK(strcmp(rvg_status_message(RVG_OK), "success") == 0);
-    CHECK(strcmp(rvg_status_message(RVG_ERR_FRAME_STATE), "unknown status") != 0);
-    CHECK(strcmp(rvg_status_message(RVG_ERR_FRAME_STATE + 1), "unknown status") == 0);
+    CHECK(strcmp(rvg_status_message(RVG_ERR_HOST_RESOURCES), "unknown status") != 0);
+    CHECK(strcmp(rvg_status_message(RVG_ERR_HOST_RESOURCES + 1), "unknown status") == 0);
     rvg_log_set_handler(on_log, NULL, RVG_LOG_TRACE);
     rvg_log_set_handler(NULL, NULL, RVG_LOG_OFF);
     CHECK(RVG_MAX_DISPLAY_PORTS == 8 && RVG_DEVICE_MMIO_SIZE == 0x4000);
@@ -716,6 +716,84 @@ static void check_scaler(void) {
     rvg_scaler_device_release(NULL);
 }
 
+static _Atomic int graphics_destroyed;
+static _Atomic int graphics_raised;
+
+static void on_graphics_destroy(void *ctx) {
+    atomic_fetch_add((_Atomic int *)ctx, 1);
+}
+
+static void on_graphics_raise(void *ctx, uint32_t vector) {
+    (void)ctx;
+    if (vector == 0) {
+        graphics_raised++;
+    }
+}
+
+static bool on_graphics_scanout_written(void *ctx, uint64_t offset, uint64_t length) {
+    (void)ctx;
+    (void)offset;
+    (void)length;
+    return true;
+}
+
+/* A graphics device with no window, on every host: its registers, its region, its doorbell, a
+ * GET_DISPLAYS the guest writes into the control ring answered with DISPLAYS and an interrupt,
+ * its reset, and its release, which ends its table once its threads have ended. */
+static void check_graphics(void) {
+    RvgGraphicsCallbacks cb = {sizeof cb, &graphics_destroyed, on_graphics_destroy,
+                               on_graphics_raise, on_graphics_scanout_written};
+    RvgGraphicsDeviceConfig c = {sizeof c, &cb, NULL};
+    RvgGraphicsDevice *d = NULL;
+    graphics_destroyed = 0;
+    graphics_raised = 0;
+    CHECK_STATUS(rvg_graphics_device_create(NULL, &d), RVG_ERR_INVALID_ARGUMENT);
+    CHECK_STATUS(rvg_graphics_device_create(&c, &d), RVG_OK);
+    CHECK(d != NULL);
+    if (!d) {
+        return;
+    }
+    uint64_t size = 0;
+    uint8_t *region = rvg_graphics_device_region(d, &size);
+    CHECK(region != NULL && ((uintptr_t)region & 0xfff) == 0);
+    CHECK(size >= RVG_GRAPHICS_ALLOCATIONS_OFFSET && (size & (size - 1)) == 0);
+    CHECK(rvg_graphics_device_mmio_read(d, 0x000) == 0x58464752); /* MAGIC, "RGFX" */
+    CHECK(rvg_graphics_device_mmio_read(d, 0x014) == (uint32_t)size);
+    CHECK(rvg_graphics_device_mmio_read(d, 0x018) == (uint32_t)(size >> 32));
+    CHECK(rvg_graphics_device_mmio_read(d, 0x7fc) == 0);
+
+    int doorbell[2];
+    CHECK(pipe(doorbell) == 0);
+    CHECK_STATUS(rvg_graphics_device_set_doorbell(d, -1), RVG_ERR_INVALID_ARGUMENT);
+    CHECK_STATUS(rvg_graphics_device_set_doorbell(d, doorbell[0]), RVG_OK);
+    CHECK_STATUS(rvg_graphics_device_set_doorbell(d, doorbell[0]), RVG_ERR_INVALID_ARGUMENT);
+    close(doorbell[0]);
+
+    /* The guest starts the device, arms the completion ring (at 0x10000, its armed word 0xc0
+     * in), writes GET_DISPLAYS (type 1, 16 bytes, seqno 1) at the submission ring's data, 256
+     * bytes in, publishes it and rings. */
+    rvg_graphics_device_mmio_write(d, 0x010, 1);
+    atomic_store((_Atomic uint32_t *)(void *)(region + 0x10000 + 0xc0), 1);
+    CHECK(rvg_graphics_device_mmio_read(d, 0x010) == 1);
+    uint32_t command[4] = {1, 16, 1, 0};
+    memcpy(region + 256, command, sizeof command);
+    atomic_store((_Atomic uint64_t *)(void *)region, 16);
+    CHECK(write(doorbell[1], "\1\0\0\0\0\0\0\0", 8) == 8);
+    CHECK(wait_for(&graphics_raised, 1));
+    /* The completion ring, at 0x10000: DISPLAYS (0x101) answering seqno 1. */
+    uint64_t produced = atomic_load((_Atomic uint64_t *)(void *)(region + 0x10000));
+    uint32_t answer[4];
+    memcpy(answer, region + 0x10000 + 256, sizeof answer);
+    CHECK(produced >= 16 && answer[0] == 0x101 && answer[2] == 1);
+
+    rvg_graphics_device_reset(d);
+    CHECK(rvg_graphics_device_mmio_read(d, 0x010) == 0);
+    rvg_graphics_device_release(d);
+    close(doorbell[1]);
+    CHECK(wait_for(&graphics_destroyed, 1));
+    rvg_graphics_device_release(NULL);
+}
+
 static void check_trace_handlers(void) {
     RvgPhysicalMemoryRange r = {0, 0};
     rvg_trace_range_handler_invoke(NULL, r);
@@ -748,6 +826,7 @@ int main(int argc, char **argv) {
     check_iosurface();
     check_video();
     check_scaler();
+    check_graphics();
     check_trace_handlers();
     if (failures) {
         fprintf(stderr, "harness: %d failures\n", failures);
