@@ -95,7 +95,6 @@ constexpr long kGpuFamilyMinus1009 = -1009;
 	RgfxRegion *_region;         // BAR-region allocator; null until the handshake maps it
 	RgfxReplyReader *_replyReader; // control-completion-ring reader; null until the handshake
 	std::vector<std::unique_ptr<RgfxRingWriter>> _queueRings; // owned queue submit-ring writers
-	uint32_t _nextRingId;        // the next queue ring's doorbell id (0 is the control ring)
 	io_connect_t _conn;          // our accelerator user client (BAR-2 region map + doorbell)
 	std::unique_ptr<RgfxRingWriter> _controlRing; // control submission ring (ring id 0)
 	mach_vm_address_t _mapBase;  // mapped device-region base (0 until the handshake maps it)
@@ -141,7 +140,6 @@ constexpr long kGpuFamilyMinus1009 = -1009;
 	_replyReader = nullptr;
 	_mapBase = 0;
 	_mapSize = 0;
-	_nextRingId = 1;
 
 	// Wire transport handshake: open our own user client on the accelerator and map the
 	// device region (BAR 2) into this task. Read the caps blob the host wrote, build the
@@ -242,7 +240,11 @@ constexpr long kGpuFamilyMinus1009 = -1009;
 	if (_region == nullptr) {
 		return nullptr;
 	}
-	uint32_t ringId = _nextRingId++;
+	// The host keys a per-queue ring's doorbell by its submission ring's region offset
+	// (device.rs `ring_doorbell` -> `by_ring`, keyed on `submit_offset`), the control
+	// ring's id being its offset 0. So the doorbell id is the region offset itself, not a
+	// serial counter, or the host finds no ring for the wake and the queue never runs.
+	uint32_t ringId = static_cast<uint32_t>(regionOffset);
 	auto writer = std::make_unique<RgfxRingWriter>(_region->base() + regionOffset, dataSize, ringId,
 	                                               &rgfxDeviceDoorbell, (__bridge void *)self);
 	RgfxRingWriter *raw = writer.get();

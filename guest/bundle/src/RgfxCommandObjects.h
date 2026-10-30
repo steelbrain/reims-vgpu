@@ -84,12 +84,19 @@ NS_ASSUME_NONNULL_BEGIN
                        device:(nullable id<MTLDevice>)device
                    serializer:(nullable RgfxSerializer *)serializer NS_UNAVAILABLE;
 
-/// The device-wide reader of the control completion ring (RgfxReplyReader), borrowed.
-/// Set by the device after the queue is made; the queue's command buffers register
-/// their submission seqno with it on commit so their completion handlers fire and
-/// waitUntilCompleted wakes. Null in a unit test that drives the queue without a
-/// reader (the command buffer then holds its seqno, as before the reader landed).
+/// The reader of the completion ring this queue's command buffers wait on (borrowed by
+/// default). The queue's command buffers register their submission seqno with it on
+/// commit so their completion handlers fire and waitUntilCompleted wakes. Null in a unit
+/// test that drives the queue without a reader (the command buffer then holds its seqno,
+/// as before the reader landed). For a queue with its own per-queue completion ring, the
+/// device hands it an owned reader with -adoptReplyReader: (below).
 @property(nonatomic, nullable) RgfxReplyReader *replyReader;
+
+/// Adopts `reader` as this queue's completion-ring reader and takes ownership of it: the
+/// queue deletes it on dealloc and sets `replyReader` to it. The host posts a queue's
+/// command-buffer completions on the queue's own completion ring (the ring loop), so the
+/// device creates a reader over that ring and hands it here.
+- (void)adoptReplyReader:(nullable RgfxReplyReader *)reader;
 
 @end
 

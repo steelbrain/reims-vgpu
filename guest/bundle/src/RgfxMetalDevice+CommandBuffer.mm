@@ -11,14 +11,15 @@
 #import "RgfxCommandObjects.h"
 
 #include "RgfxRegion.hpp"
+#include "RgfxReplyReader.hpp"
 #include "RgfxRingWriter.hpp"
 #include "RgfxSerializer.hpp"
 
 namespace {
 // A queue's submission and completion ring byte-ring sizes (each a power of two). The
-// completion ring is allocated for the pair but unused by the host yet: replies come
-// back on the control completion ring (the single-ring model, RgfxReplyReader); when
-// the host grows per-queue completion rings, the reader reads this one.
+// host's ring loop (crates/reims-graphics/src/device.rs) posts this queue's command-
+// buffer completions on its own completion ring, so the queue reads that ring (not the
+// device's control completion ring); see newCommandQueue.
 constexpr uint32_t kQueueSubmitDataSize = 32768;
 constexpr uint32_t kQueueCompleteDataSize = 32768;
 } // namespace
@@ -44,9 +45,7 @@ constexpr uint32_t kQueueCompleteDataSize = 32768;
 
 	// Place the queue's submission + completion ring pair in the device region, then
 	// construct the submission ring's writer (owned by the device) and route an
-	// RGFX_CMD_QUEUE_CREATE carrying the allocated offsets. The device-wide reader of
-	// the control completion ring is handed to the queue so its command buffers'
-	// completions, reflections and event signals are dispatched.
+	// RGFX_CMD_QUEUE_CREATE carrying the allocated offsets.
 	RgfxRegion::RingPair rings =
 	    region->allocateRingPair(kQueueSubmitDataSize, kQueueCompleteDataSize);
 	if (!rings.ok) {
@@ -66,7 +65,16 @@ constexpr uint32_t kQueueCompleteDataSize = 32768;
 	                                 maxCount:maxCommandBufferCount
 	                                   device:self
 	                               serializer:ser];
-	queue.replyReader = [self replyReader];
+	if (queue == nil) {
+		return nil;
+	}
+	// The host's ring loop posts this queue's command-buffer completions on the queue's
+	// own completion ring (device.rs: QueueCompletionPoster on the guest-given
+	// complete_offset), raising the queue's vector. So the queue reads THAT ring, not the
+	// device's control completion ring; it owns the reader for the queue's lifetime.
+	RgfxReplyReader *reader =
+	    new RgfxReplyReader(region->base() + rings.complete_offset, rings.complete_data_size);
+	[queue adoptReplyReader:reader];
 	return queue;
 }
 

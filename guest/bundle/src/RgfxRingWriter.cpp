@@ -6,9 +6,32 @@
 
 #include "RgfxRingWriter.hpp"
 
+#include <cstdio>
 #include <cstring>
+#include <fcntl.h>
+#include <unistd.h>
 
 namespace {
+
+// RGFX DIAG (remove before merge): append one post's trace to /tmp/rgfx-diag.log, to see the
+// control vs per-queue submission handshake (ring id, counts, idle, wake) from the guest side.
+void rgfxRingDiag(uint32_t ring_id, uint32_t type, uint32_t size, uint64_t seqno, uint64_t producer,
+                  uint64_t consumer, uint32_t idle, bool rang)
+{
+	char line[200];
+	int n = snprintf(line, sizeof(line),
+	                 "RGFX: post ring=0x%x type=0x%x size=%u seqno=%llu producer=%llu "
+	                 "consumer=%llu idle=%u rang=%d\n",
+	                 ring_id, type, size, (unsigned long long)seqno, (unsigned long long)producer,
+	                 (unsigned long long)consumer, idle, rang ? 1 : 0);
+	if (n <= 0)
+		return;
+	int fd = open("/tmp/rgfx-diag.log", O_WRONLY | O_CREAT | O_APPEND, 0666);
+	if (fd < 0)
+		return;
+	(void)!write(fd, line, static_cast<size_t>(n < (int)sizeof(line) ? n : (int)sizeof(line)));
+	close(fd);
+}
 
 // The ring header fields, by their offsets in RgfxRingHeader.
 constexpr uint32_t kProducer = __builtin_offsetof(RgfxRingHeader, producer);
@@ -55,6 +78,14 @@ RgfxRingWriter::RgfxRingWriter(volatile uint8_t *ring_base, uint32_t data_size, 
       m_mask(data_size - 1), m_ringId(ring_id), m_doorbell(doorbell),
       m_doorbellContext(doorbell_context), m_produced(0), m_nextSeqno(1)
 {
+	// Join the ring at its current producer count, as the framebuffer kext does
+	// (ReimsGraphics.cpp reads the header's producer at start). A freshly allocated ring
+	// (per-queue, zeroed by the region allocator) reads 0; the control ring, already driven
+	// by the framebuffer, continues from where it stands, so the room check (producer -
+	// consumer) is right rather than underflowing from a 0 start and refusing every post.
+	// NOTE: the control ring is shared with the framebuffer kext; a single owner / separate
+	// accelerator ring is the robust fix (concurrent producers still race) — interim here.
+	m_produced = load64(m_header + kProducer);
 }
 
 bool RgfxRingWriter::tryPost(uint32_t type, const void *message, uint32_t size, uint64_t *out_seqno)
@@ -91,8 +122,13 @@ bool RgfxRingWriter::tryPost(uint32_t type, const void *message, uint32_t size, 
 
 	store64(m_header + kProducer, m_produced);
 	fullFence();
-	if (m_doorbell && load32(m_header + kConsumerIdle) == 1)
+	uint32_t idle = load32(m_header + kConsumerIdle);
+	bool rang = m_doorbell && idle == 1;
+	if (rang)
 		m_doorbell(m_doorbellContext, m_ringId);
+
+	// RGFX DIAG (remove before merge): trace this post's ring state and wake.
+	rgfxRingDiag(m_ringId, type, size, seqno, m_produced, load64(m_header + kConsumer), idle, rang);
 
 	if (out_seqno)
 		*out_seqno = seqno;

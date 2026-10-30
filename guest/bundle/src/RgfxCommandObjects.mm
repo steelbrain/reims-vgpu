@@ -172,10 +172,11 @@ uint32_t fillRenderPass(MTLRenderPassDescriptor *d, RgfxRenderPassDesc *desc,
 // =============================================================================
 
 @implementation RgfxCommandQueue {
-	RgfxRingWriter *_submitRing; // borrowed: the queue's submission ring
-	RgfxIdSpace *_ids;           // borrowed: the device id space, for cb ids
+	RgfxRingWriter *_submitRing;   // borrowed: the queue's submission ring
+	RgfxIdSpace *_ids;             // borrowed: the device id space, for cb ids
 	NSUInteger _maxCount;
 	NSString *_queueLabel;
+	RgfxReplyReader *_ownedReader; // owned (adoptReplyReader:): the per-queue completion reader
 }
 
 + (instancetype)queueWithSubmitRing:(RgfxRingWriter *)submitRing
@@ -245,6 +246,20 @@ uint32_t fillRenderPass(MTLRenderPassDescriptor *d, RgfxRenderPassDesc *desc,
 - (void)setLabel:(NSString *)label
 {
 	_queueLabel = [label copy];
+}
+
+- (void)adoptReplyReader:(RgfxReplyReader *)reader
+{
+	if (_ownedReader != nullptr && _ownedReader != reader) {
+		delete _ownedReader;
+	}
+	_ownedReader = reader;
+	self.replyReader = reader;
+}
+
+- (void)dealloc
+{
+	delete _ownedReader;
 }
 
 @end
