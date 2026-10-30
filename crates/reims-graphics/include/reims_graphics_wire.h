@@ -912,6 +912,13 @@
 // process posts after it can name the block.
 #define RGFX_CMD_BLOCK_RELEASE 754
 
+// `BLOCK_GRANT` ([`RgfxBlockGrant`]), on ring 0 from the accelerator kext: it gave context
+// `context` the region block of `size` bytes at `offset`. Posted before the process learns of the
+// block, so it comes before every message naming it. Not answered. A span a message names, on
+// ring 0 or on a queue's ring, must lie in one block its context holds: from its grant until its
+// `BLOCK_RELEASE` or the context's `CONTEXT_CLOSE`.
+#define RGFX_CMD_BLOCK_GRANT 755
+
 // Command `COMMAND_BUFFER` (a per-queue submission ring): one command buffer,
 // its `obj_id` followed by the encoder-op byte stream. Struct and op stream in
 // a later increment.
@@ -1471,6 +1478,20 @@ typedef struct {
   // command's, and an event that answers nothing carries 0.
   uint64_t seqno;
 } RgfxMsgHeader;
+
+// `BLOCK_GRANT`: the kext gave context `context` the region block of `size` bytes at `offset`.
+typedef struct {
+  // [`RGFX_CMD_BLOCK_GRANT`].
+  RgfxMsgHeader header;
+  // The context given the block.
+  uint32_t context;
+  // Zero.
+  uint32_t reserved_14;
+  // The block's region offset.
+  uint64_t offset;
+  // The block's size in bytes.
+  uint64_t size;
+} RgfxBlockGrant;
 
 // `BLOCK_RELEASE`: context `context` freed its region block of `size` bytes at `offset`.
 typedef struct {

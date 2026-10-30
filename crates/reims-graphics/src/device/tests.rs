@@ -1054,9 +1054,9 @@ fn a_command_queue_gets_its_own_ring_loop() {
 }
 
 /// A `COMMAND_BUFFER_IN_REGION` hands the host the whole `COMMAND_BUFFER` message in the block it
-/// names, with the reference's seqno, and the completion names that seqno; a reference outside
-/// the processes' blocks, or to bytes that are not a `COMMAND_BUFFER` of its length, is refused,
-/// and the ring goes on.
+/// names, with the reference's seqno, and the completion names that seqno; a reference to no
+/// block its process holds (none granted, another process's, its own once released), or to bytes
+/// that are not a `COMMAND_BUFFER` of its length, is refused, and the ring goes on.
 #[test]
 fn a_command_buffer_in_region_is_taken_from_its_block() {
     use crate::ops::{RGFX_COMMAND_BUFFER_OPS_OFFSET, RgfxCommandBuffer};
@@ -1069,7 +1069,11 @@ fn a_command_buffer_in_region_is_taken_from_its_block() {
     wait_queue_idle(&rig);
 
     // The buffer's whole message in a block past the rings: its header, then 64 bytes of ops.
+    // The kext granted the block to the queue's context, and another to context 6.
     const BLOCK: u64 = QUEUE_COMPLETE + 0x10_0000;
+    const OTHER: u64 = BLOCK + 0x10_0000;
+    rig.send(block_message(RGFX_CMD_BLOCK_GRANT, 5, BLOCK, 0x1_0000));
+    rig.send(block_message(RGFX_CMD_BLOCK_GRANT, 6, OTHER, 0x1_0000));
     let mut message = RgfxCommandBuffer {
         header: RgfxMsgHeader {
             r#type: RGFX_CMD_COMMAND_BUFFER,
@@ -1084,25 +1088,54 @@ fn a_command_buffer_in_region_is_taken_from_its_block() {
     .to_vec();
     message.extend((0..64u8).map(|i| i ^ 0x5a));
     rig.region().write(BLOCK, &message);
+    rig.region().write(OTHER, &message);
     let len = message.len() as u64;
 
-    // Refused: below the processes' blocks, a length past the message, and bytes that are not a
-    // COMMAND_BUFFER. Then the good one, taken with the reference's seqno.
+    // Refused: in no granted block, a length past the message, bytes that are not a
+    // COMMAND_BUFFER, and another process's block. Then the good one, taken with the reference's
+    // seqno.
     let mut at = publish_queue_message(&rig, 0, 70, command_buffer_in_region(0x1000, len));
     at = publish_queue_message(&rig, at, 71, command_buffer_in_region(BLOCK, len + 8));
     at = publish_queue_message(&rig, at, 72, command_buffer_in_region(BLOCK + 8, len - 8));
-    publish_queue_message(&rig, at, 77, command_buffer_in_region(BLOCK, len));
+    at = publish_queue_message(&rig, at, 73, command_buffer_in_region(OTHER, len));
+    at = publish_queue_message(&rig, at, 77, command_buffer_in_region(BLOCK, len));
 
     let done = first_queue_completion(&rig).expect("a CB_COMPLETE for the buffer in its block");
     assert_eq!(done.header.seqno, 77);
     assert_eq!(done.cb_obj_id, 200);
     let mut want = message.clone();
     want[8..16].copy_from_slice(&77u64.to_le_bytes());
+    assert_eq!(*seen.buffers.lock(), vec![want.clone()]);
+
+    // Released, the block is no longer the process's to name.
+    let seqno = rig.send(block_message(RGFX_CMD_BLOCK_RELEASE, 5, BLOCK, 0x1_0000));
+    assert_eq!(rig.complete(), (seqno, RGFX_STATUS_OK));
+    publish_queue_message(&rig, at, 78, command_buffer_in_region(BLOCK, len));
+    std::thread::sleep(Duration::from_millis(50));
+    wait_queue_idle(&rig);
     assert_eq!(*seen.buffers.lock(), vec![want]);
     assert_eq!(
         *seen.handed.lock(),
         vec![RGFX_CMD_QUEUE_CREATE, RGFX_CMD_COMMAND_BUFFER]
     );
+}
+
+/// A `BLOCK_GRANT` or `BLOCK_RELEASE` (their layouts are one) of `type` for `context`'s block of
+/// `size` bytes at `offset`.
+fn block_message(r#type: u32, context: u32, offset: u64, size: u64) -> Vec<u8> {
+    RgfxBlockGrant {
+        header: RgfxMsgHeader {
+            r#type,
+            size: size_of::<RgfxBlockGrant>() as u32,
+            seqno: 0,
+        },
+        context,
+        reserved_14: 0,
+        offset,
+        size,
+    }
+    .as_bytes()
+    .to_vec()
 }
 
 /// A command buffer is decoded only once the creates published on ring 0 before it are carried

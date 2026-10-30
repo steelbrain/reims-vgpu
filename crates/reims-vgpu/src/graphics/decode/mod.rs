@@ -271,14 +271,20 @@ impl<P: Platform> GraphicsDecoder<P> {
         }
     }
 
-    /// Whether `len` bytes at region offset `offset` lie in the processes' part of the region,
-    /// where the kext places their blocks: past the control rings, the device-info blob and the
-    /// scanout ([`RGFX_CONTEXT_ALLOCATIONS_OFFSET`]), before the cursor's span at the end. The kext
-    /// checks a process names only its own blocks there.
-    fn in_process_blocks(&self, offset: u64, len: u64) -> bool {
-        let end = self.region.size().saturating_sub(RGFX_CURSOR_SPAN);
-        offset >= RGFX_CONTEXT_ALLOCATIONS_OFFSET
-            && offset.checked_add(len).is_some_and(|e| e <= end)
+    /// Whether `len` bytes at region offset `offset` lie in one block the current context holds
+    /// (`BLOCK_GRANT`, [`Region::held_by`]). With no context set (the decoder's own tests), in the
+    /// processes' part of the region, where the kext places their blocks: past the control rings,
+    /// the device-info blob and the scanout ([`RGFX_CONTEXT_ALLOCATIONS_OFFSET`]), before the
+    /// cursor's span at the end.
+    fn in_own_block(&self, offset: u64, len: u64) -> bool {
+        match self.context {
+            Some(context) => self.region.held_by(context, offset, len),
+            None => {
+                let end = self.region.size().saturating_sub(RGFX_CURSOR_SPAN);
+                offset >= RGFX_CONTEXT_ALLOCATIONS_OFFSET
+                    && offset.checked_add(len).is_some_and(|e| e <= end)
+            }
+        }
     }
 
     /// The objects the table holds (for the tests).
@@ -523,10 +529,9 @@ impl<P: Platform> GraphicsDecoder<P> {
                 // A Shared buffer placed over the guest's own memory in the
                 // device's region, `length` bytes at `region_offset`: the same
                 // zero-copy import the scanout uses, so a blit reads and writes the
-                // guest's pages in place. A span outside the processes' blocks (past
-                // the region's end, or over its rings, scanout or cursor) is a guest
-                // protocol error.
-                if !self.in_process_blocks(m.region_offset, m.length) {
+                // guest's pages in place. A span in no block of the sender's
+                // (`in_own_block`) is a guest protocol error.
+                if !self.in_own_block(m.region_offset, m.length) {
                     return Ok(Err(DecodeError::BadReference));
                 }
                 let keep = Arc::clone(&self.region);
@@ -580,10 +585,10 @@ impl<P: Platform> GraphicsDecoder<P> {
                 // A Shared heap placed over the guest's own memory in the device's
                 // region, `size_bytes` at `region_offset`: its address range is the
                 // host VA of that block, as the detached-heap path builds a heap
-                // over host pages. A span outside the processes' blocks is a guest
+                // over host pages. A span in no block of the sender's is a guest
                 // protocol error. The region stays mapped while the decoder holds it, and the
                 // heap (in the object table) drops before the region (field order).
-                if !self.in_process_blocks(m.region_offset, m.size_bytes) {
+                if !self.in_own_block(m.region_offset, m.size_bytes) {
                     return Ok(Err(DecodeError::BadReference));
                 }
                 // SAFETY: the block lies inside the region (checked above), one
@@ -1446,7 +1451,7 @@ mod tests {
         let blocks = RGFX_CONTEXT_ALLOCATIONS_OFFSET;
         let size = blocks + 0x10_0000 + RGFX_CURSOR_SPAN;
         let region = Arc::new(reims_graphics::region::Region::new(size as usize).unwrap());
-        let mut dec = GraphicsDecoder::<FakePlatform>::new(Arc::clone(&p), region);
+        let mut dec = GraphicsDecoder::<FakePlatform>::new(Arc::clone(&p), Arc::clone(&region));
         let buffer = |obj_id: u64, region_offset: u64, length: u64| RgfxBufferOverHostMemory {
             header: RgfxMsgHeader {
                 r#type: RGFX_CMD_BUFFER_OVER_HOST_MEMORY,
@@ -1496,7 +1501,22 @@ mod tests {
         assert_eq!(dec.object_count(), 0);
         let one = 1u64 << RGFX_CONTEXT_OBJ_ID_SHIFT;
         let two = 2u64 << RGFX_CONTEXT_OBJ_ID_SHIFT;
+        // With a context, a span must lie in one block the kext granted that context.
+        region.grant(1, blocks, 0x2_0000);
+        region.grant(2, blocks + 0x8_0000, 0x1_0000);
         dec.set_context(Some(1));
+        for (offset, len, what) in [
+            (blocks + 0x4_0000, 0x1000, "in no block"),
+            (blocks + 0x8_0000, 0x1000, "in another process's block"),
+            (blocks + 0x1_f000, 0x2000, "past its block's end"),
+        ] {
+            assert_eq!(
+                dec.decode(&device, buffer(one | 9, offset, len).as_bytes())
+                    .unwrap(),
+                Err(DecodeError::BadReference),
+                "a buffer {what}"
+            );
+        }
         assert_eq!(
             dec.decode(&device, heap(one | 2, blocks, 0x1_0000).as_bytes())
                 .unwrap(),

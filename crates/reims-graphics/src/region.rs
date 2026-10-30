@@ -13,8 +13,17 @@
 //! rings' counters and flags with atomic loads and stores at their offsets, and copies out what a
 //! message or an image holds before it reads it ([`Region::read`]), so a value the guest changes
 //! later never changes what the host has checked.
+//!
+//! **Blocks.** The guest's accelerator kext hands the processes blocks of the region and tells
+//! the host of each (`BLOCK_GRANT`) before the process learns of it. The region keeps which
+//! context holds each block until the block's `BLOCK_RELEASE` or the context's `CONTEXT_CLOSE`,
+//! so a span a message names is checked against the sender's own blocks ([`Region::held_by`]),
+//! on the queues' rings, which bypass the kext, as on ring 0.
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU32, AtomicU64};
+
+use parking_lot::Mutex;
 
 /// The region's memory.
 pub struct Region {
@@ -22,6 +31,8 @@ pub struct Region {
     base: *mut u8,
     /// Its length in bytes.
     len: usize,
+    /// The blocks the processes hold, by offset: each one's size and its holder's context.
+    blocks: Mutex<BTreeMap<u64, (u64, u32)>>,
 }
 
 // SAFETY: the region is plain memory the struct owns, reached only through the methods below,
@@ -36,7 +47,7 @@ impl std::fmt::Debug for Region {
         f.debug_struct("Region")
             .field("base", &self.base)
             .field("len", &self.len)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -64,7 +75,56 @@ impl Region {
         Some(Region {
             base: base.cast::<u8>(),
             len,
+            blocks: Mutex::new(BTreeMap::new()),
         })
+    }
+
+    /// Context `context` holds the `size` bytes at `offset` (`BLOCK_GRANT`), in place of what
+    /// was held there.
+    pub fn grant(&self, context: u32, offset: u64, size: u64) {
+        let mut blocks = self.blocks.lock();
+        let end = offset.saturating_add(size);
+        blocks.retain(|&at, &mut (held, _)| at.saturating_add(held) <= offset || end <= at);
+        blocks.insert(offset, (size, context));
+    }
+
+    /// The block at `offset` is no longer its holder's to name (`BLOCK_RELEASE`).
+    pub fn revoke(&self, offset: u64) {
+        self.blocks.lock().remove(&offset);
+    }
+
+    /// No block is context `context`'s any more (`CONTEXT_CLOSE`).
+    pub fn revoke_context(&self, context: u32) {
+        self.blocks
+            .lock()
+            .retain(|_, &mut (_, holder)| holder != context);
+    }
+
+    /// Whether the `len` bytes at `offset` lie in one block context `context` holds.
+    pub fn held_by(&self, context: u32, offset: u64, len: u64) -> bool {
+        Self::in_held(&self.blocks.lock(), context, offset, len)
+    }
+
+    /// A copy of the `len` bytes at `offset`, where they lie in one block context `context`
+    /// holds; the block cannot be revoked, and so given to another process, while it is copied.
+    pub fn read_held(&self, context: u32, offset: u64, len: usize) -> Option<Vec<u8>> {
+        let blocks = self.blocks.lock();
+        if !Self::in_held(&blocks, context, offset, len as u64) {
+            return None;
+        }
+        self.read(offset, len)
+    }
+
+    fn in_held(blocks: &BTreeMap<u64, (u64, u32)>, context: u32, offset: u64, len: u64) -> bool {
+        blocks
+            .range(..=offset)
+            .next_back()
+            .is_some_and(|(&at, &(size, holder))| {
+                holder == context
+                    && offset
+                        .checked_add(len)
+                        .is_some_and(|end| end <= at.saturating_add(size))
+            })
     }
 
     /// The region's first byte: what the host maps into the guest.

@@ -493,7 +493,7 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// One `LIBRARY_FROM_REGION` chunk: its bytes are copied out once (so the platform parses
     /// memory the guest cannot change under it), its ack is written so the guest may reuse the
     /// block, and the library's whole bytes are handed back once the chunks reach its length. A
-    /// span outside the processes' blocks is a bad reference; a chunk out of order or past the
+    /// span in no block of the sender's is a bad reference; a chunk out of order or past the
     /// length is malformed and drops what came before.
     fn take_library_chunk(
         &mut self,
@@ -501,7 +501,7 @@ impl<P: Platform> GraphicsDecoder<P> {
     ) -> Result<Option<Vec<u8>>, DecodeError> {
         let Some(chunk) = usize::try_from(m.byte_length)
             .ok()
-            .filter(|_| self.in_process_blocks(m.region_offset, m.byte_length))
+            .filter(|_| self.in_own_block(m.region_offset, m.byte_length))
             .and_then(|len| self.region.read(m.region_offset, len))
         else {
             self.library_chunks.remove(&m.obj_id);
@@ -509,7 +509,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         };
         // The bytes are out of the block: the guest may write it again.
         if !m.ack_offset.is_multiple_of(8)
-            || !self.in_process_blocks(m.ack_offset, 8)
+            || !self.in_own_block(m.ack_offset, 8)
             || !self.region.write(m.ack_offset, &m.ack_value.to_le_bytes())
         {
             self.library_chunks.remove(&m.obj_id);

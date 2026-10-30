@@ -63,7 +63,8 @@ pub(crate) fn is_lifecycle(message: &Message) -> bool {
 /// service, which drops its handle; a `CONTEXT_CLOSE` ends the context's queues and has the host
 /// drop its objects, and the host answers it once the context's command buffers have finished; a
 /// `BLOCK_RELEASE` is refused where a live queue's ring lies in the block, and else the host answers
-/// it. Every other message goes to the host's decoder.
+/// it; a `BLOCK_GRANT` is kept with the region (`Region::grant`). Every other message goes to the
+/// host's decoder.
 pub(crate) fn lifecycle(shared: &Shared, message: &Message) -> Option<Vec<u8>> {
     let seqno = message.header.seqno;
     match message.header.r#type {
@@ -91,15 +92,24 @@ pub(crate) fn lifecycle(shared: &Shared, message: &Message) -> Option<Vec<u8>> {
             }
             None => Some(complete(seqno, RGFX_STATUS_INVALID_ARGUMENT)),
         },
-        RGFX_CMD_BLOCK_RELEASE => match read::<RgfxBlockRelease>(message) {
-            Some(release) if shared.rings_in(release.offset, release.size) => {
-                Some(complete(seqno, RGFX_STATUS_REFUSED))
+        RGFX_CMD_BLOCK_GRANT => {
+            if let Some(grant) = read::<RgfxBlockGrant>(message) {
+                shared.grant_block(&grant);
             }
+            None
+        }
+        RGFX_CMD_BLOCK_RELEASE => match read::<RgfxBlockRelease>(message) {
+            // Whatever the answer, the block is no longer its process's to name.
             Some(release) => {
-                shared
-                    .host
-                    .block_released(&release, shared.complete_answer(seqno));
-                None
+                shared.region.revoke(release.offset);
+                if shared.rings_in(release.offset, release.size) {
+                    Some(complete(seqno, RGFX_STATUS_REFUSED))
+                } else {
+                    shared
+                        .host
+                        .block_released(&release, shared.complete_answer(seqno));
+                    None
+                }
             }
             None => Some(complete(seqno, RGFX_STATUS_INVALID_ARGUMENT)),
         },

@@ -402,10 +402,15 @@ its own memory. The accelerator kext checks, before it posts a lifecycle
 message, that the object the message creates or destroys is in the process's
 id range, and that the region the message names lies in the process's own
 blocks: a queue's rings, a heap's or a buffer's block over host memory, and a
-library chunk's bytes and ack slot. The host also refuses any of these spans
-outside the processes' part of the region (the rings, the device-info blob and
-the scanout before it, the cursor after it). Command buffers do not pass
-through the kext, so the host checks each object a message names: it must be
+library chunk's bytes and ack slot. The host checks these spans too, and also
+the span a `COMMAND_BUFFER_IN_REGION` on a queue's ring names, which never
+passes the kext. Each span must lie in one block the sender holds. The kext
+posts a block's `BLOCK_GRANT` (context, offset, size) on ring 0 before its
+allocation returns, keeping the block pinned until then so no free overtakes
+it. The host keeps the grant until the block's `BLOCK_RELEASE` or the context's
+`CONTEXT_CLOSE`, and copies a buffer out of a block only while the grant
+stands. Command buffers do not pass through the kext, so the host checks each
+object a message names: it must be
 of the message's context, which is the context of the object a ring-0 message
 creates or destroys, or the context of the queue whose ring carried the
 command buffer. A command buffer runs only on the queue whose ring carried it,

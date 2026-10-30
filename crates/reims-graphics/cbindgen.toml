@@ -55,6 +55,7 @@ include = [
     "RgfxBlitOpSynchronizeTexture",
     "RgfxBlitOpUpdateFence",
     "RgfxBlitOpWaitForFence",
+    "RgfxBlockGrant",
     "RgfxBlockRelease",
     "RgfxBufferAtOffset",
     "RgfxBufferBinding",

@@ -315,11 +315,28 @@ IOReturn RgfxAccelerator::allocBlock(const void *owner, UInt32 context, UInt64 s
 	if (!contextLock)
 		return kIOReturnBadArgument;
 	IOLockLock(contextLock);
-	RgfxBlockResult r = rgfxBlockAlloc(blockTable, owner, context, size, align, offset);
+	RgfxBlockPin pin = {};
+	RgfxBlockResult r = rgfxBlockAlloc(blockTable, owner, context, size, align, offset, &pin);
 	IOLockUnlock(contextLock);
 	switch (r) {
-	case kRgfxBlockOk:
-		return kIOReturnSuccess;
+	case kRgfxBlockOk: {
+		// The device learns of the block before the process does, so the grant is on the
+		// control ring before any message naming it, on that ring or a queue's; the block is
+		// pinned until then, so no free's release overtakes it.
+		RgfxBlockGrant grant = {};
+		grant.context = context;
+		grant.offset = pin.offset;
+		grant.size = rgfxBlockAlignUp(size, kRgfxBlockPage); // the block's, as allocated
+		IOReturn posted = postLifecycle(RGFX_CMD_BLOCK_GRANT, &grant, sizeof(grant), 0, nullptr, 0,
+		                                nullptr, nullptr, 0);
+		IOLockLock(contextLock);
+		if (posted == kIOReturnSuccess)
+			rgfxBlockUnpin(blockTable, pin);
+		else
+			rgfxBlockDrop(blockTable, pin);
+		IOLockUnlock(contextLock);
+		return posted;
+	}
 	case kRgfxBlockNoSpace:
 		return kIOReturnNoSpace;
 	case kRgfxBlockTableFull:

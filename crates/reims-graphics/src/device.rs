@@ -724,8 +724,26 @@ impl Shared {
         for queue in &ended {
             queue.fence();
         }
+        self.region.revoke_context(context);
         self.host.context_closed(context, answer);
         log::info!(target: "reims_graphics", "context {context} closed");
+    }
+
+    /// `BLOCK_GRANT`: the region keeps the block as its context's, where it lies in the
+    /// processes' part of the region (past the device info and the scanout, before the cursor).
+    pub(crate) fn grant_block(&self, grant: &RgfxBlockGrant) {
+        let end = self.region.size().saturating_sub(RGFX_CURSOR_SPAN);
+        if grant.offset < RGFX_CONTEXT_ALLOCATIONS_OFFSET
+            || grant.offset.checked_add(grant.size).is_none_or(|e| e > end)
+        {
+            log::warn!(
+                target: "reims_graphics",
+                "a BLOCK_GRANT of {:#x} bytes at {:#x} lies outside the processes' blocks: ignored",
+                grant.size, grant.offset
+            );
+            return;
+        }
+        self.region.grant(grant.context, grant.offset, grant.size);
     }
 
     /// Whether a live queue's submission or completion ring lies in the `size` bytes at `offset`
@@ -1017,24 +1035,6 @@ impl Shared {
                     }
                 }
             };
-            // A buffer too large for the ring: its message, from the block, with nothing held.
-            let message = if message.header.r#type == RGFX_CMD_COMMAND_BUFFER_IN_REGION {
-                match self.command_buffer_in_region(&message) {
-                    Some(message) => message,
-                    None => {
-                        log::warn!(
-                            target: "reims_graphics",
-                            "queue {:#x}'s submission ring carried a COMMAND_BUFFER_IN_REGION \
-                             (seqno {}) that names no whole COMMAND_BUFFER in the processes' \
-                             blocks: refused",
-                            queue.obj_id, message.header.seqno
-                        );
-                        continue;
-                    }
-                }
-            } else {
-                message
-            };
             // Order this command buffer after the creates its process posted before it. Creates
             // ride ring 0, whose sole consumer is the control thread; command buffers ride the
             // queues' own rings (this thread). A create a buffer uses is posted before it in guest
@@ -1051,31 +1051,51 @@ impl Shared {
                 }
                 std::thread::sleep(ROOM_POLL);
             }
+            // A buffer too large for the ring: its message, from the block, with nothing held,
+            // once the block's grant (posted before the buffer) has been carried out.
+            let message = if message.header.r#type == RGFX_CMD_COMMAND_BUFFER_IN_REGION {
+                match self.command_buffer_in_region(queue, &message) {
+                    Some(message) => message,
+                    None => {
+                        log::warn!(
+                            target: "reims_graphics",
+                            "queue {:#x}'s submission ring carried a COMMAND_BUFFER_IN_REGION \
+                             (seqno {}) that names no whole COMMAND_BUFFER in a block of its \
+                             process's: refused",
+                            queue.obj_id, message.header.seqno
+                        );
+                        continue;
+                    }
+                }
+            } else {
+                message
+            };
             self.host.stage3_message(poster, &message.bytes);
         }
     }
 
-    /// The `COMMAND_BUFFER` message a `COMMAND_BUFFER_IN_REGION` `reference` names, copied out of
-    /// the process's block once, as a ring's message is, with the reference's seqno; `None` where
-    /// the span lies outside the processes' blocks (past the control rings, the device info and
-    /// the scanout, before the cursor) or holds no whole `COMMAND_BUFFER` of its length.
-    fn command_buffer_in_region(&self, reference: &Message) -> Option<Message> {
+    /// The `COMMAND_BUFFER` message a `COMMAND_BUFFER_IN_REGION` `reference` on `queue`'s ring
+    /// names, copied out of the block once, as a ring's message is, with the reference's seqno;
+    /// `None` where the span lies in no block of the queue's process ([`Region::held_by`]) or
+    /// holds no whole `COMMAND_BUFFER` of its length.
+    fn command_buffer_in_region(
+        &self,
+        queue: &QueueShared,
+        reference: &Message,
+    ) -> Option<Message> {
         let (r, _) = RgfxCommandBufferInRegion::read_from_prefix(&reference.bytes).ok()?;
-        let end = self.region.size().saturating_sub(RGFX_CURSOR_SPAN);
         if !r.region_offset.is_multiple_of(8)
             || !r.byte_length.is_multiple_of(8)
             || r.byte_length < size_of::<RgfxCommandBuffer>() as u64
             || r.byte_length > u64::from(u32::MAX)
-            || r.region_offset < RGFX_CONTEXT_ALLOCATIONS_OFFSET
-            || r.region_offset
-                .checked_add(r.byte_length)
-                .is_none_or(|e| e > end)
         {
             return None;
         }
-        let mut bytes = self
-            .region
-            .read(r.region_offset, usize::try_from(r.byte_length).ok()?)?;
+        let mut bytes = self.region.read_held(
+            queue.context,
+            r.region_offset,
+            usize::try_from(r.byte_length).ok()?,
+        )?;
         let (mut header, _) = RgfxMsgHeader::read_from_prefix(&bytes).ok()?;
         if header.r#type != RGFX_CMD_COMMAND_BUFFER || u64::from(header.size) != r.byte_length {
             return None;

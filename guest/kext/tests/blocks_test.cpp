@@ -134,6 +134,26 @@ int main()
 		check(rgfxBlockIndex(y.t, releasing) < 0, "a releasing one answered OK goes");
 	}
 	{
+		// A block given out pinned is busy until its grant is posted, and dropped where it
+		// could not be.
+		Table x;
+		uint64_t at = 0, next = 0;
+		RgfxBlockPin pin;
+		check(rgfxBlockAlloc(x.t, a, 1, 0x1000, 0x1000, &at, &pin) == kRgfxBlockOk &&
+		          pin.offset == at,
+		      "a block given out pinned");
+		check(rgfxBlockFree(x.t, a, at) == kRgfxBlockBusy, "is busy before its grant");
+		rgfxBlockUnpin(x.t, pin);
+		check(rgfxBlockFree(x.t, a, at) == kRgfxBlockOk, "and freed after it");
+		check(rgfxBlockAlloc(x.t, b, 2, 0x1000, 0x1000, &next, &pin) == kRgfxBlockOk &&
+		          next == at + 0x1000,
+		      "another");
+		rgfxBlockDrop(x.t, RgfxBlockPin{next, pin.serial + 1});
+		check(rgfxBlockIndex(x.t, next) >= 0, "a drop of another allocation keeps it");
+		rgfxBlockDrop(x.t, pin);
+		check(rgfxBlockIndex(x.t, next) < 0, "a drop takes it back");
+	}
+	{
 		Table x;
 		uint64_t at = 0;
 		check(rgfxBlockAlloc(x.t, a, 1, 0, 0x1000, &at) == kRgfxBlockBadArgument, "size 0");

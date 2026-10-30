@@ -1548,6 +1548,14 @@ fn block_release(context: u32, offset: u64, size: u64) -> Vec<u8> {
     .to_vec()
 }
 
+/// A `BLOCK_GRANT` of the region block of `size` bytes at `offset` to context `context`, as the
+/// kext posts it.
+fn block_grant(context: u32, offset: u64, size: u64) -> Vec<u8> {
+    let mut grant = block_release(context, offset, size);
+    grant[0..4].copy_from_slice(&RGFX_CMD_BLOCK_GRANT.to_le_bytes());
+    grant
+}
+
 /// A `BUFFER_OVER_HOST_MEMORY` of `length` bytes at region offset `offset`.
 fn buffer_over_host_memory(obj_id: u64, offset: u64, length: u64) -> Vec<u8> {
     RgfxBufferOverHostMemory {
@@ -1616,7 +1624,8 @@ fn committed(platform: &FakePlatform, n: usize) -> Vec<ObjId> {
 /// A block is given out again only once nothing the host holds lies in it: its release is refused
 /// while a buffer over it lives, and still while a texture made over that buffer lives after the
 /// buffer's destroy; once both are destroyed it is answered OK. A block nothing lies in is
-/// released at once, whatever lies in the blocks beside it
+/// released at once, whatever lies in the blocks beside it. Only the process the kext granted a
+/// block places objects over it
 #[test]
 fn a_block_is_released_only_once_nothing_lies_in_it() {
     let raised = Arc::new(AtomicU32::new(0));
@@ -1625,11 +1634,20 @@ fn a_block_is_released_only_once_nothing_lies_in_it() {
     let mut guest = Guest::new(&device);
     const BLOCK: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x10_0000;
     const SIZE: u64 = 0x1_0000;
+    guest.send(&device, block_grant(1, BLOCK, SIZE));
+    guest.send(&device, block_grant(1, BLOCK + SIZE, SIZE));
     guest.send(&device, resource_id_chunk(1, 0));
+    // Process 2's buffer over process 1's block is refused.
+    guest.send(&device, buffer_over_host_memory(obj(2, 1), BLOCK, 0x4000));
     guest.send(&device, buffer_over_host_memory(obj(1, 1), BLOCK, 0x4000));
     guest.send(&device, texture_from_buffer(obj(1, 2), 1, obj(1, 1)));
     let status = answered(&device, &mut guest, block_release(1, BLOCK + SIZE, SIZE));
     assert_eq!(status, RGFX_STATUS_OK, "the block beside them");
+    assert_eq!(
+        device.decoder_object_count(),
+        2,
+        "process 2's buffer was made"
+    );
     let status = answered(&device, &mut guest, block_release(1, BLOCK, SIZE));
     assert_eq!(status, RGFX_STATUS_REFUSED, "the buffer lies in it");
     guest.send(&device, object_destroy(obj(1, 1)));

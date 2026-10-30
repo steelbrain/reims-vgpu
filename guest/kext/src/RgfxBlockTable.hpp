@@ -103,9 +103,12 @@ inline void rgfxBlockRemove(RgfxBlockTable &t, uint32_t at)
 }
 
 // A block of `size` bytes (rounded up to pages), aligned to `align` (a power of two, at least a
-// page), for `owner` of context `context`: the first gap, in offset order, that holds it.
+// page), for `owner` of context `context`: the first gap, in offset order, that holds it. Where
+// `pin` is not null the block starts pinned, so it is not freed until the caller unpins it (once
+// the device has its grant).
 inline RgfxBlockResult rgfxBlockAlloc(RgfxBlockTable &t, const void *owner, uint32_t context,
-                                      uint64_t size, uint64_t align, uint64_t *offset)
+                                      uint64_t size, uint64_t align, uint64_t *offset,
+                                      RgfxBlockPin *pin = nullptr)
 {
 	if (size == 0 || align == 0 || (align & (align - 1)) != 0)
 		return kRgfxBlockBadArgument;
@@ -129,10 +132,12 @@ inline RgfxBlockResult rgfxBlockAlloc(RgfxBlockTable &t, const void *owner, uint
 			b.owner = owner;
 			b.serial = ++t.nextSerial;
 			b.context = context;
-			b.pins = 0;
+			b.pins = pin ? 1 : 0;
 			b.state = kRgfxBlockLive;
 			t.count++;
 			*offset = start;
+			if (pin)
+				*pin = {b.offset, b.serial};
 			return kRgfxBlockOk;
 		}
 		if (at < t.count)
@@ -167,6 +172,14 @@ inline void rgfxBlockUnpin(RgfxBlockTable &t, const RgfxBlockPin &pin)
 	int64_t at = rgfxBlockIndex(t, pin.offset);
 	if (at >= 0 && t.blocks[at].serial == pin.serial && t.blocks[at].pins)
 		t.blocks[at].pins--;
+}
+
+// Takes back the block `pin` names, as if never given out (the device was not told of it).
+inline void rgfxBlockDrop(RgfxBlockTable &t, const RgfxBlockPin &pin)
+{
+	int64_t at = rgfxBlockIndex(t, pin.offset);
+	if (at >= 0 && t.blocks[at].serial == pin.serial)
+		rgfxBlockRemove(t, static_cast<uint32_t>(at));
 }
 
 // `owner` frees its live block at `offset`: it is freed, for its release to be posted. Busy while

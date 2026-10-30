@@ -301,6 +301,12 @@ pub const RGFX_CMD_RESOURCE_ID_CHUNK: u32 = 0x2f1;
 /// has finished. Posted after every message the process posted before its free, and nothing the
 /// process posts after it can name the block.
 pub const RGFX_CMD_BLOCK_RELEASE: u32 = 0x2f2;
+/// `BLOCK_GRANT` ([`RgfxBlockGrant`]), on ring 0 from the accelerator kext: it gave context
+/// `context` the region block of `size` bytes at `offset`. Posted before the process learns of the
+/// block, so it comes before every message naming it. Not answered. A span a message names, on
+/// ring 0 or on a queue's ring, must lie in one block its context holds: from its grant until its
+/// `BLOCK_RELEASE` or the context's `CONTEXT_CLOSE`.
+pub const RGFX_CMD_BLOCK_GRANT: u32 = 0x2f3;
 
 /// Command `COMMAND_BUFFER` (a per-queue submission ring): one command buffer,
 /// its `obj_id` followed by the encoder-op byte stream. Struct and op stream in
@@ -591,6 +597,7 @@ const _: () = {
     assert!(size_of::<RgfxResourceIdChunk>() == 24);
     assert!(size_of::<RgfxCommandBufferInRegion>() == 32);
     assert!(size_of::<RgfxBlockRelease>() == 40);
+    assert!(size_of::<RgfxBlockGrant>() == 40);
     // Every chunk's ids lie below the limit (the last chunk's last id is CHUNKS * CHUNK), and
     // no whole chunk more fits there.
     assert!(RGFX_RESOURCE_ID_CHUNKS as u64 * RGFX_RESOURCE_ID_CHUNK < RGFX_RESOURCE_ID_LIMIT);
@@ -732,6 +739,24 @@ pub struct RgfxBlockRelease {
     /// [`RGFX_CMD_BLOCK_RELEASE`].
     pub header: RgfxMsgHeader,
     /// The context that held the block.
+    pub context: u32,
+    /// Zero.
+    pub reserved_14: u32,
+    /// The block's region offset.
+    pub offset: u64,
+    /// The block's size in bytes.
+    pub size: u64,
+}
+
+/// `BLOCK_GRANT`: the kext gave context `context` the region block of `size` bytes at `offset`.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxBlockGrant {
+    /// [`RGFX_CMD_BLOCK_GRANT`].
+    pub header: RgfxMsgHeader,
+    /// The context given the block.
     pub context: u32,
     /// Zero.
     pub reserved_14: u32,
