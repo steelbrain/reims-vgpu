@@ -68,6 +68,51 @@ constexpr int kLibraryRetries = 2000; // about two seconds
 // region block (LIBRARY_FROM_REGION).
 constexpr uint64_t kLibraryInlineMax = RGFX_CONTROL_RING_DATA_SIZE / 4;
 
+// A universal .metallib's slice of generic AIR bitcode: the cputype its fat_arch entry
+// carries. measured: macOS 26.6.1 x86_64 guest, QuartzCore's default.metallib (19
+// slices, one of them this, the rest code compiled for particular GPUs).
+constexpr uint32_t kMetallibAirCpuType = 0x0100'0017;
+
+uint32_t rdBe32(const uint8_t *p)
+{
+	return (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) | (uint32_t(p[2]) << 8) | p[3];
+}
+
+uint64_t rdBe64(const uint8_t *p)
+{
+	return (uint64_t(rdBe32(p)) << 32) | rdBe32(p + 4);
+}
+
+// Narrows a universal .metallib (big-endian fat header, magic CA FE BA BE, or CA FE BA
+// BF with 64-bit offsets) to its generic AIR slice, the only one the host compiles:
+// for QuartzCore's library that is 1.6 MB of 160 MB. Other bytes are left as they are.
+void selectAirSlice(const void *&bytes, NSUInteger &length)
+{
+	const uint8_t *p = static_cast<const uint8_t *>(bytes);
+	if (p == nullptr || length < 8)
+		return;
+	const uint32_t magic = rdBe32(p);
+	if (magic != 0xCAFE'BABE && magic != 0xCAFE'BABF)
+		return;
+	const bool wide = magic == 0xCAFE'BABF;
+	const uint64_t entrySize = wide ? 32 : 20;
+	const uint32_t count = rdBe32(p + 4);
+	if (count > (length - 8) / entrySize)
+		return;
+	for (uint32_t i = 0; i < count; i++) {
+		const uint8_t *e = p + 8 + i * entrySize;
+		if (rdBe32(e) != kMetallibAirCpuType)
+			continue;
+		const uint64_t offset = wide ? rdBe64(e + 8) : rdBe32(e + 8);
+		const uint64_t size = wide ? rdBe64(e + 16) : rdBe32(e + 12);
+		if (offset > length || size > length - offset || size == 0)
+			return;
+		bytes = p + offset;
+		length = static_cast<NSUInteger>(size);
+		return;
+	}
+}
+
 } // namespace
 
 // Every library-from-bytes entry point funnels through here: posts the bytes as one
@@ -79,6 +124,7 @@ constexpr uint64_t kLibraryInlineMax = RGFX_CONTROL_RING_DATA_SIZE / 4;
                                          origin:(NSString *)origin
                                           error:(__autoreleasing NSError **)error
 {
+	selectAirSlice(bytes, length);
 	RgfxSerializer *ser = [self serializer];
 	if (ser == nullptr) {
 		rgfxLibraryDiag(how, origin, length, NO);
