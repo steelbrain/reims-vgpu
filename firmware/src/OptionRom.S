@@ -4,10 +4,17 @@
   structure, the image itself, and 0xFF padding to a multiple of 512 bytes.
 
   The Makefile assembles this with EFI_IMAGE set to the linked image's path
-  and flattens the result to raw bytes.
+  and flattens the result to raw bytes. It is the apple-gfx-pci device's ROM
+  unless an including file defines ROM_VENDOR_ID, ROM_DEVICE_ID and
+  ROM_CLASS_CODE for another device first.
 **/
 
+#ifndef ROM_VENDOR_ID
 #include "ReimsVgpu.h"
+#define ROM_VENDOR_ID   REIMS_VGPU_VENDOR_ID
+#define ROM_DEVICE_ID   REIMS_VGPU_DEVICE_ID
+#define ROM_CLASS_CODE  REIMS_VGPU_CLASS_CODE
+#endif
 
 #define ROM_BLOCKS  ((RomEnd - RomStart) / 512)
 
@@ -27,12 +34,12 @@ RomStart:
   .balign 4, 0
 Pcir:
   .ascii  "PCIR"
-  .short  REIMS_VGPU_VENDOR_ID
-  .short  REIMS_VGPU_DEVICE_ID
+  .short  ROM_VENDOR_ID
+  .short  ROM_DEVICE_ID
   .short  0                     // DeviceListOffset
   .short  PcirEnd - Pcir        // Length
   .byte   3                     // Revision
-  .byte   REIMS_VGPU_CLASS_CODE & 0xFF, (REIMS_VGPU_CLASS_CODE >> 8) & 0xFF, REIMS_VGPU_CLASS_CODE >> 16
+  .byte   ROM_CLASS_CODE & 0xFF, (ROM_CLASS_CODE >> 8) & 0xFF, ROM_CLASS_CODE >> 16
   .short  ROM_BLOCKS            // ImageLength, in 512-byte units
   .short  0                     // CodeRevision
   .byte   3                     // CodeType: EFI image

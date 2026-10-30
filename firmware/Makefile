@@ -1,8 +1,10 @@
-# The option ROM: the PCI device's UEFI driver (src/), linked as an x86-64
+# The option ROMs: each PCI device's UEFI driver (src/), linked as an x86-64
 # EFI boot-service driver and packaged as a PCI option ROM
-# (docs/architecture.md 11.4).
+# (docs/architecture.md 11.4). ReimsVgpu is apple-gfx-pci's; ReimsGraphics is
+# the reims-graphics device's (docs/graphics-kext/design.md), built on the
+# guest's wire protocol header in ../guest/include.
 #
-#   make        build/ReimsVgpu.efi and build/ReimsVgpu.rom
+#   make        build/ReimsVgpu.{efi,rom} and build/ReimsGraphics.{efi,rom}
 #   make clean  remove build/
 #
 # BUILD moves the output: cargo xtask dist runs `make rom` with BUILD set to
@@ -37,11 +39,24 @@ LDFLAGS = /nologo /nodefaultlib /dll /driver /base:0 /machine:x64 \
 
 OBJECTS = $(patsubst src/%,$(BUILD)/obj/%.obj,$(basename $(SOURCES)))
 
+GNAME = ReimsGraphics
+WIRE  = ../guest/include
+
+GSOURCES = \
+	src/ReimsGraphics.c \
+	src/ReimsGraphicsOutput.c \
+	src/ReimsGraphicsName.c
+
+GOBJECTS = $(patsubst src/%,$(BUILD)/obj/%.obj,$(basename $(GSOURCES)))
+GLDFLAGS = $(filter-out /entry:%,$(LDFLAGS)) /entry:ReimsGraphicsEntryPoint
+
+$(GOBJECTS): CFLAGS += -I$(WIRE)
+
 all: rom
 
-efi: $(BUILD)/$(NAME).efi
+efi: $(BUILD)/$(NAME).efi $(BUILD)/$(GNAME).efi
 
-rom: $(BUILD)/$(NAME).rom
+rom: $(BUILD)/$(NAME).rom $(BUILD)/$(GNAME).rom
 
 # OptionRom.S lays out the ROM header around the linked image; ld.lld
 # flattens it to raw bytes.
@@ -53,6 +68,15 @@ $(BUILD)/$(NAME).rom: src/OptionRom.S src/ReimsVgpu.h $(BUILD)/$(NAME).efi
 $(BUILD)/$(NAME).efi: $(OBJECTS)
 	$(LD) $(LDFLAGS) /out:$@ $^
 
+$(BUILD)/$(GNAME).rom: src/ReimsGraphicsRom.S src/OptionRom.S src/ReimsGraphics.h \
+		$(WIRE)/reims_graphics_wire.h $(BUILD)/$(GNAME).efi
+	$(CC) --target=x86_64-unknown-none-elf -I$(WIRE) -DEFI_IMAGE='"$(BUILD)/$(GNAME).efi"' \
+		-c $< -o $(BUILD)/obj/ReimsGraphicsRom.o
+	$(ROMLD) --oformat binary -o $@ $(BUILD)/obj/ReimsGraphicsRom.o
+
+$(BUILD)/$(GNAME).efi: $(GOBJECTS)
+	$(LD) $(GLDFLAGS) /out:$@ $^
+
 $(BUILD)/obj/%.obj: src/%.c
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
@@ -62,4 +86,4 @@ clean:
 
 .PHONY: all efi rom clean
 
--include $(OBJECTS:.obj=.d)
+-include $(OBJECTS:.obj=.d) $(GOBJECTS:.obj=.d)

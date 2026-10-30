@@ -1,0 +1,769 @@
+/** @file
+  Entry point, driver binding and control ring of the reims-graphics device's
+  UEFI driver.
+
+  Start resets the device, adopts the control rings' counters, asks the
+  device for its displays and offers one mode: the preferred mode of the
+  first connected display, or 1920x1080 when there is none. The framebuffer
+  is the region's memory from RG_GUEST_ALLOC_OFFSET, and SetMode points the
+  display at it with SET_SCANOUT. Firmware takes no interrupts: a command
+  polls the completion ring for its answer.
+**/
+
+#include "ReimsGraphics.h"
+
+EFI_HANDLE         gImageHandle;
+EFI_BOOT_SERVICES  *gBS;
+
+STATIC EFI_DEVICE_PATH_UTILITIES_PROTOCOL  *mDevicePathUtilities;
+STATIC REIMS_GRAPHICS_PRIVATE_DATA         *mControllers;
+
+EFI_GUID  gEfiDevicePathProtocolGuid          = EFI_DEVICE_PATH_PROTOCOL_GUID;
+EFI_GUID  gEfiDevicePathUtilitiesProtocolGuid = EFI_DEVICE_PATH_UTILITIES_PROTOCOL_GUID;
+EFI_GUID  gEfiDriverBindingProtocolGuid       = EFI_DRIVER_BINDING_PROTOCOL_GUID;
+EFI_GUID  gEfiComponentNameProtocolGuid       = EFI_COMPONENT_NAME_PROTOCOL_GUID;
+EFI_GUID  gEfiComponentName2ProtocolGuid      = EFI_COMPONENT_NAME2_PROTOCOL_GUID;
+EFI_GUID  gEfiPciIoProtocolGuid               = EFI_PCI_IO_PROTOCOL_GUID;
+EFI_GUID  gEfiGraphicsOutputProtocolGuid      = EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID;
+
+//
+// The control rings in the region, and their header fields.
+//
+#define RING_HEADER(Private, Offset) \
+  ((volatile UINT8 *)(UINTN)((Private)->RegionBase + (Offset)))
+#define SUBMIT_RING(Private)  RING_HEADER (Private, RG_CONTROL_SUBMIT_OFFSET)
+#define EVENT_RING(Private)   RING_HEADER (Private, RG_CONTROL_EVENT_OFFSET)
+#define RING_U64(Ring, Field)  ((volatile UINT64 *)((Ring) + (Field)))
+#define RING_U32(Ring, Field)  ((volatile UINT32 *)((Ring) + (Field)))
+#define RING_BYTES(Ring)       ((Ring) + RG_RING_HEADER_SIZE)
+
+STATIC
+VOID
+Stall (
+  IN UINTN  Microseconds
+  )
+{
+  ((EFI_STALL)gBS->Stall)(Microseconds);
+}
+
+STATIC
+VOID *
+AllocateZeroPool (
+  IN UINTN  Size
+  )
+{
+  UINT8  *Memory;
+  UINTN  Index;
+
+  if (EFI_ERROR (gBS->AllocatePool (EfiBootServicesData, Size, (VOID **)&Memory))) {
+    return NULL;
+  }
+
+  for (Index = 0; Index < Size; Index++) {
+    Memory[Index] = 0;
+  }
+
+  return Memory;
+}
+
+STATIC
+UINT32
+ReadRegister (
+  IN REIMS_GRAPHICS_PRIVATE_DATA  *Private,
+  IN UINT64                       Offset
+  )
+{
+  UINT32  Value;
+
+  Value = MAX_UINT32;
+  Private->PciIo->Mem.Read (Private->PciIo, EfiPciIoWidthUint32, RG_BAR_REGISTERS, Offset, 1, &Value);
+  return Value;
+}
+
+STATIC
+VOID
+WriteRegister (
+  IN REIMS_GRAPHICS_PRIVATE_DATA  *Private,
+  IN UINT64                       Offset,
+  IN UINT32                       Value
+  )
+{
+  Private->PciIo->Mem.Write (Private->PciIo, EfiPciIoWidthUint32, RG_BAR_REGISTERS, Offset, 1, &Value);
+}
+
+/**
+  Copy Size bytes, a multiple of 8, to or from ring memory, 8 bytes at a
+  time.
+**/
+STATIC
+VOID
+CopyQwords (
+  OUT volatile UINT64       *Destination,
+  IN  CONST volatile UINT64 *Source,
+  IN  UINTN                 Size
+  )
+{
+  UINTN  Index;
+
+  for (Index = 0; Index < Size / sizeof (UINT64); Index++) {
+    Destination[Index] = Source[Index];
+  }
+}
+
+/**
+  Put a command on the submission ring, padding to the ring's end first when
+  it does not fit before it, and ring the doorbell if the device's consumer
+  sleeps. Payload's size, rounded up to 8 bytes, is copied, so its buffer
+  must hold that many.
+**/
+STATIC
+EFI_STATUS
+Submit (
+  IN  REIMS_GRAPHICS_PRIVATE_DATA  *Private,
+  IN  UINT32                       Type,
+  IN  CONST VOID                   *Payload,
+  IN  UINT32                       PayloadSize,
+  OUT UINT64                       *Seqno
+  )
+{
+  volatile UINT8        *Ring;
+  volatile UINT8        *Bytes;
+  UINT64                Producer;
+  UINT64                Consumer;
+  UINT32                Size;
+  UINT32                Offset;
+  UINT32                Left;
+  UINT32                Need;
+  UINTN                 Poll;
+  struct rg_msg_header  Header;
+
+  Ring     = SUBMIT_RING (Private);
+  Bytes    = RING_BYTES (Ring);
+  Size     = RG_MSG_SIZE (PayloadSize);
+  Producer = Private->SubmitProducer;
+
+  for (Poll = 0; ; Poll++) {
+    Consumer = __atomic_load_n (RING_U64 (Ring, RG_RING_CONSUMER), __ATOMIC_ACQUIRE);
+    Offset   = (UINT32)(Producer % RG_CONTROL_RING_BYTES);
+    Left     = RG_CONTROL_RING_BYTES - Offset;
+    Need     = Size + ((Left < Size) ? Left : 0);
+    if (Producer - Consumer + Need <= RG_CONTROL_RING_BYTES) {
+      break;
+    }
+
+    if (Poll == REIMS_GRAPHICS_POLL_LIMIT) {
+      return EFI_TIMEOUT;
+    }
+
+    Stall (REIMS_GRAPHICS_POLL_US);
+  }
+
+  //
+  // A message never wraps. The pad is a type 0 message of the bytes left;
+  // with only 8 left, its type and size alone.
+  //
+  if (Left < Size) {
+    Header.type  = RG_MSG_PAD;
+    Header.size  = Left;
+    Header.seqno = 0;
+    CopyQwords ((volatile UINT64 *)(Bytes + Offset), (UINT64 *)&Header, (Left < sizeof (Header)) ? Left : sizeof (Header));
+    Producer += Left;
+    Offset    = 0;
+  }
+
+  Header.type  = Type;
+  Header.size  = Size;
+  Header.seqno = ++Private->Seqno;
+  CopyQwords ((volatile UINT64 *)(Bytes + Offset), (UINT64 *)&Header, sizeof (Header));
+  CopyQwords ((volatile UINT64 *)(Bytes + Offset + sizeof (Header)), Payload, Size - sizeof (Header));
+  Producer += Size;
+
+  Private->SubmitProducer = Producer;
+  __atomic_store_n (RING_U64 (Ring, RG_RING_PRODUCER), Producer, __ATOMIC_RELEASE);
+  __atomic_thread_fence (__ATOMIC_SEQ_CST);
+  if (__atomic_load_n (RING_U32 (Ring, RG_RING_CONSUMER_IDLE), __ATOMIC_ACQUIRE) == 1) {
+    WriteRegister (Private, RG_REG_DOORBELL, RG_CONTROL_RING_ID);
+  }
+
+  *Seqno = Header.seqno;
+  return EFI_SUCCESS;
+}
+
+/**
+  Poll the completion ring for the answer to command Seqno: a COMPLETE, or
+  a message of type Reply. Every other message is consumed and dropped. Up
+  to Capacity bytes of the answer's payload go to Payload, and its type and
+  payload size to Type and PayloadSize.
+**/
+STATIC
+EFI_STATUS
+WaitFor (
+  IN  REIMS_GRAPHICS_PRIVATE_DATA  *Private,
+  IN  UINT64                       Seqno,
+  IN  UINT32                       Reply,
+  OUT VOID                         *Payload,
+  IN  UINT32                       Capacity,
+  OUT UINT32                       *Type,
+  OUT UINT32                       *PayloadSize
+  )
+{
+  volatile UINT8        *Ring;
+  volatile UINT8        *Bytes;
+  UINT64                Producer;
+  UINT64                Consumer;
+  UINT32                Offset;
+  UINT32                Left;
+  UINT32                Copy;
+  UINTN                 Poll;
+  BOOLEAN               Found;
+  struct rg_msg_header  Header;
+
+  Ring     = EVENT_RING (Private);
+  Bytes    = RING_BYTES (Ring);
+  Consumer = Private->EventConsumer;
+  Found    = FALSE;
+
+  for (Poll = 0; !Found; Poll++) {
+    Producer = __atomic_load_n (RING_U64 (Ring, RG_RING_PRODUCER), __ATOMIC_ACQUIRE);
+    while (!Found && (Consumer != Producer)) {
+      Offset = (UINT32)(Consumer % RG_CONTROL_RING_BYTES);
+      Left   = RG_CONTROL_RING_BYTES - Offset;
+      if (Left < sizeof (Header)) {
+        if (Left > Producer - Consumer) {
+          return EFI_DEVICE_ERROR;
+        }
+
+        Consumer += Left;
+        continue;
+      }
+
+      CopyQwords ((UINT64 *)&Header, (volatile UINT64 *)(Bytes + Offset), sizeof (Header));
+      if ((Header.size < ((Header.type == RG_MSG_PAD) ? RG_MSG_ALIGN : sizeof (Header))) ||
+          ((Header.size % RG_MSG_ALIGN) != 0) ||
+          (Header.size > Left) ||
+          (Header.size > Producer - Consumer))
+      {
+        return EFI_DEVICE_ERROR;
+      }
+
+      if ((Header.type != RG_MSG_PAD) && (Header.seqno == Seqno) &&
+          ((Header.type == RG_EVT_COMPLETE) || (Header.type == Reply)))
+      {
+        *Type        = Header.type;
+        *PayloadSize = Header.size - sizeof (Header);
+        Copy         = (*PayloadSize < Capacity) ? *PayloadSize : Capacity;
+        CopyQwords (Payload, (volatile UINT64 *)(Bytes + Offset + sizeof (Header)), Copy & ~(UINT32)7);
+        Found = TRUE;
+      }
+
+      Consumer += Header.size;
+    }
+
+    Private->EventConsumer = Consumer;
+    __atomic_store_n (RING_U64 (Ring, RG_RING_CONSUMER), Consumer, __ATOMIC_RELEASE);
+    if (!Found) {
+      if (Poll == REIMS_GRAPHICS_POLL_LIMIT) {
+        return EFI_TIMEOUT;
+      }
+
+      Stall (REIMS_GRAPHICS_POLL_US);
+    }
+  }
+
+  return EFI_SUCCESS;
+}
+
+/**
+  Send a command answered by COMPLETE alone, and check its status.
+**/
+STATIC
+EFI_STATUS
+Command (
+  IN REIMS_GRAPHICS_PRIVATE_DATA  *Private,
+  IN UINT32                       Type,
+  IN CONST VOID                   *Payload,
+  IN UINT32                       PayloadSize
+  )
+{
+  EFI_STATUS  Status;
+  UINT64      Seqno;
+  UINT64      Answer;
+  UINT32      AnswerType;
+  UINT32      AnswerSize;
+
+  Status = Submit (Private, Type, Payload, PayloadSize, &Seqno);
+  if (EFI_ERROR (Status)) {
+    return Status;
+  }
+
+  Answer = MAX_UINT32;
+  Status = WaitFor (Private, Seqno, RG_EVT_COMPLETE, &Answer, sizeof (Answer), &AnswerType, &AnswerSize);
+  if (EFI_ERROR (Status)) {
+    return Status;
+  }
+
+  if ((AnswerSize < sizeof (struct rg_complete)) || ((UINT32)Answer != 0)) {
+    return EFI_DEVICE_ERROR;
+  }
+
+  return EFI_SUCCESS;
+}
+
+EFI_STATUS
+ReimsGraphicsSetScanout (
+  IN REIMS_GRAPHICS_PRIVATE_DATA  *Private,
+  IN BOOLEAN                      Blank
+  )
+{
+  struct rg_set_scanout  Scanout;
+
+  Scanout.display = Private->Display;
+  Scanout.width   = Blank ? 0 : Private->Width;
+  Scanout.height  = Blank ? 0 : Private->Height;
+  Scanout.stride  = Blank ? 0 : Private->Stride;
+  Scanout.offset  = Blank ? 0 : RG_GUEST_ALLOC_OFFSET;
+  return Command (Private, RG_CMD_SET_SCANOUT, &Scanout, sizeof (Scanout));
+}
+
+/**
+  Ask GET_DISPLAYS for the first connected display and its preferred mode.
+  The display stays 0 and the mode 0x0 when the answer names none.
+**/
+STATIC
+VOID
+ChooseMode (
+  IN REIMS_GRAPHICS_PRIVATE_DATA  *Private
+  )
+{
+  UINT64              Answer[512];
+  UINT8               *Bytes;
+  UINT64              Seqno;
+  UINT32              Type;
+  UINT32              Size;
+  UINT32              Count;
+  UINT32              Index;
+  UINTN               Offset;
+  struct rg_display   *Display;
+  struct rg_mode      *Mode;
+
+  Private->Display = 0;
+  Private->Width   = 0;
+  Private->Height  = 0;
+
+  if (EFI_ERROR (Submit (Private, RG_CMD_GET_DISPLAYS, NULL, 0, &Seqno)) ||
+      EFI_ERROR (WaitFor (Private, Seqno, RG_EVT_DISPLAYS, Answer, sizeof (Answer), &Type, &Size)) ||
+      (Type != RG_EVT_DISPLAYS))
+  {
+    return;
+  }
+
+  Bytes = (UINT8 *)Answer;
+  Size  = (Size < sizeof (Answer)) ? Size : sizeof (Answer);
+  if (Size < sizeof (struct rg_displays)) {
+    return;
+  }
+
+  Count  = ((struct rg_displays *)Bytes)->count;
+  Offset = sizeof (struct rg_displays);
+  for (Index = 0; Index < Count && Offset + sizeof (*Display) <= Size; Index++) {
+    Display = (struct rg_display *)(Bytes + Offset);
+    Offset += sizeof (*Display);
+    if (Index == 0) {
+      Private->Display = Display->id;
+    }
+
+    if (Display->connected &&
+        (Display->preferred_mode < Display->mode_count) &&
+        (Offset + (UINTN)(Display->preferred_mode + 1) * sizeof (*Mode) <= Size))
+    {
+      Mode = (struct rg_mode *)(Bytes + Offset) + Display->preferred_mode;
+      if ((Mode->width != 0) && (Mode->height != 0)) {
+        Private->Display = Display->id;
+        Private->Width   = Mode->width;
+        Private->Height  = Mode->height;
+        return;
+      }
+    }
+
+    Offset += (UINTN)Display->mode_count * sizeof (*Mode);
+  }
+}
+
+/**
+  Reset the device, adopt the control rings' counters and tell the device
+  the driver is ready.
+**/
+STATIC
+VOID
+OpenRings (
+  IN REIMS_GRAPHICS_PRIVATE_DATA  *Private
+  )
+{
+  WriteRegister (Private, RG_REG_STATUS, RG_STATUS_RESET);
+  Private->SubmitProducer = __atomic_load_n (RING_U64 (SUBMIT_RING (Private), RG_RING_PRODUCER), __ATOMIC_ACQUIRE);
+  Private->EventConsumer  = __atomic_load_n (RING_U64 (EVENT_RING (Private), RG_RING_CONSUMER), __ATOMIC_ACQUIRE);
+  Private->Seqno          = 0;
+  WriteRegister (Private, RG_REG_STATUS, RG_STATUS_DRIVER_READY);
+}
+
+/**
+  The region's address: BAR 2, a memory BAR with no address translation that
+  holds the size the device gives.
+**/
+STATIC
+EFI_STATUS
+FindRegion (
+  IN REIMS_GRAPHICS_PRIVATE_DATA  *Private
+  )
+{
+  EFI_ACPI_ADDRESS_SPACE_DESCRIPTOR  *Bar;
+  BOOLEAN                            Usable;
+
+  Private->RegionSize = ReadRegister (Private, RG_REG_REGION_SIZE_LO) |
+                        ((UINT64)ReadRegister (Private, RG_REG_REGION_SIZE_HI) << 32);
+  if (EFI_ERROR (Private->PciIo->GetBarAttributes (Private->PciIo, RG_BAR_REGION, NULL, (VOID **)&Bar))) {
+    return EFI_UNSUPPORTED;
+  }
+
+  Private->RegionBase = Bar->AddrRangeMin;
+  Usable              = (Bar->Desc == ACPI_ADDRESS_SPACE_DESCRIPTOR) &&
+                        (Bar->ResType == ACPI_ADDRESS_SPACE_TYPE_MEM) &&
+                        (Bar->AddrTranslationOffset == 0) &&
+                        (Bar->AddrLen >= Private->RegionSize) &&
+                        (Private->RegionSize > RG_GUEST_ALLOC_OFFSET);
+  gBS->FreePool (Bar);
+  return Usable ? EFI_SUCCESS : EFI_UNSUPPORTED;
+}
+
+/**
+  The mode's row bytes, and whether its framebuffer fits the region from
+  RG_GUEST_ALLOC_OFFSET.
+**/
+STATIC
+BOOLEAN
+ModeFits (
+  IN REIMS_GRAPHICS_PRIVATE_DATA  *Private
+  )
+{
+  UINT64  Stride;
+
+  Stride = ((UINT64)Private->Width * 4 + REIMS_GRAPHICS_STRIDE_ALIGN - 1) &
+           ~(UINT64)(REIMS_GRAPHICS_STRIDE_ALIGN - 1);
+  if ((Private->Width == 0) || (Private->Height == 0) || (Stride > MAX_UINT32) ||
+      (Stride * Private->Height > Private->RegionSize - RG_GUEST_ALLOC_OFFSET))
+  {
+    return FALSE;
+  }
+
+  Private->Stride = (UINT32)Stride;
+  return TRUE;
+}
+
+STATIC
+REIMS_GRAPHICS_PRIVATE_DATA *
+FindController (
+  IN EFI_HANDLE  Controller
+  )
+{
+  REIMS_GRAPHICS_PRIVATE_DATA  *Private;
+
+  for (Private = mControllers; Private != NULL && Private->Controller != Controller; Private = Private->Next) {
+  }
+
+  return Private;
+}
+
+/**
+  Check whether Controller is the reims-graphics device.
+**/
+EFI_STATUS
+EFIAPI
+ReimsGraphicsDriverBindingSupported (
+  IN EFI_DRIVER_BINDING_PROTOCOL  *This,
+  IN EFI_HANDLE                   Controller,
+  IN EFI_DEVICE_PATH_PROTOCOL     *RemainingDevicePath
+  )
+{
+  EFI_STATUS           Status;
+  EFI_PCI_IO_PROTOCOL  *PciIo;
+  PCI_TYPE00           Pci;
+
+  Status = gBS->OpenProtocol (
+                  Controller,
+                  &gEfiPciIoProtocolGuid,
+                  (VOID **)&PciIo,
+                  This->DriverBindingHandle,
+                  Controller,
+                  EFI_OPEN_PROTOCOL_BY_DRIVER
+                  );
+  if (EFI_ERROR (Status)) {
+    return Status;
+  }
+
+  Status = PciIo->Pci.Read (PciIo, EfiPciIoWidthUint32, 0, sizeof (Pci) / sizeof (UINT32), &Pci);
+  if (!EFI_ERROR (Status) &&
+      ((Pci.Hdr.VendorId != RG_PCI_VENDOR_ID) || (Pci.Hdr.DeviceId != RG_PCI_DEVICE_ID)))
+  {
+    Status = EFI_UNSUPPORTED;
+  }
+
+  gBS->CloseProtocol (Controller, &gEfiPciIoProtocolGuid, This->DriverBindingHandle, Controller);
+  return Status;
+}
+
+/**
+  Undo Start's steps on the controller: the PCI attributes it changed and
+  its PCI I/O open.
+**/
+STATIC
+VOID
+ReleaseController (
+  IN EFI_DRIVER_BINDING_PROTOCOL  *This,
+  IN REIMS_GRAPHICS_PRIVATE_DATA  *Private,
+  IN BOOLEAN                      RestoreAttributes
+  )
+{
+  if (RestoreAttributes) {
+    Private->PciIo->Attributes (
+                      Private->PciIo,
+                      EfiPciIoAttributeOperationSet,
+                      Private->OriginalPciAttributes,
+                      NULL
+                      );
+  }
+
+  gBS->CloseProtocol (Private->Controller, &gEfiPciIoProtocolGuid, This->DriverBindingHandle, Private->Controller);
+  gBS->FreePool (Private);
+}
+
+/**
+  Bind to Controller: check the device, open its rings, choose the mode, and
+  install Device Path and Graphics Output protocols on a child handle with
+  that mode set.
+**/
+EFI_STATUS
+EFIAPI
+ReimsGraphicsDriverBindingStart (
+  IN EFI_DRIVER_BINDING_PROTOCOL  *This,
+  IN EFI_HANDLE                   Controller,
+  IN EFI_DEVICE_PATH_PROTOCOL     *RemainingDevicePath
+  )
+{
+  EFI_STATUS                   Status;
+  REIMS_GRAPHICS_PRIVATE_DATA  *Private;
+  EFI_DEVICE_PATH_PROTOCOL     *ParentDevicePath;
+  ACPI_ADR_DEVICE_PATH         AcpiDeviceNode;
+  EFI_PCI_IO_PROTOCOL          *ChildPciIo;
+
+  Private = AllocateZeroPool (sizeof (*Private));
+  if (Private == NULL) {
+    return EFI_OUT_OF_RESOURCES;
+  }
+
+  Private->Signature  = REIMS_GRAPHICS_PRIVATE_DATA_SIGNATURE;
+  Private->Controller = Controller;
+
+  Status = gBS->OpenProtocol (
+                  Controller,
+                  &gEfiPciIoProtocolGuid,
+                  (VOID **)&Private->PciIo,
+                  This->DriverBindingHandle,
+                  Controller,
+                  EFI_OPEN_PROTOCOL_BY_DRIVER
+                  );
+  if (EFI_ERROR (Status)) {
+    gBS->FreePool (Private);
+    return Status;
+  }
+
+  Status = Private->PciIo->Attributes (
+                             Private->PciIo,
+                             EfiPciIoAttributeOperationGet,
+                             0,
+                             &Private->OriginalPciAttributes
+                             );
+  if (EFI_ERROR (Status)) {
+    ReleaseController (This, Private, FALSE);
+    return Status;
+  }
+
+  Status = Private->PciIo->Attributes (
+                             Private->PciIo,
+                             EfiPciIoAttributeOperationEnable,
+                             EFI_PCI_IO_ATTRIBUTE_MEMORY | EFI_PCI_IO_ATTRIBUTE_BUS_MASTER,
+                             NULL
+                             );
+  if (!EFI_ERROR (Status) &&
+      ((ReadRegister (Private, RG_REG_MAGIC) != RG_MAGIC) ||
+       (ReadRegister (Private, RG_REG_VERSION) != RG_VERSION)))
+  {
+    Status = EFI_UNSUPPORTED;
+  }
+
+  if (!EFI_ERROR (Status)) {
+    Status = FindRegion (Private);
+  }
+
+  if (!EFI_ERROR (Status)) {
+    OpenRings (Private);
+    ChooseMode (Private);
+    if (!ModeFits (Private)) {
+      Private->Width  = REIMS_GRAPHICS_FALLBACK_WIDTH;
+      Private->Height = REIMS_GRAPHICS_FALLBACK_HEIGHT;
+      if (!ModeFits (Private)) {
+        Status = EFI_UNSUPPORTED;
+      }
+    }
+  }
+
+  if (!EFI_ERROR (Status)) {
+    Status = gBS->HandleProtocol (Controller, &gEfiDevicePathProtocolGuid, (VOID **)&ParentDevicePath);
+  }
+
+  if (EFI_ERROR (Status)) {
+    ReleaseController (This, Private, TRUE);
+    return Status;
+  }
+
+  //
+  // The Graphics Output child is an ACPI _ADR node below the controller.
+  //
+  AcpiDeviceNode.Header.Type      = ACPI_DEVICE_PATH;
+  AcpiDeviceNode.Header.SubType   = ACPI_ADR_DP;
+  AcpiDeviceNode.ADR              = ACPI_DISPLAY_ADR (1, 0, 0, 1, 0, ACPI_ADR_DISPLAY_TYPE_OTHER, 0, 0);
+  AcpiDeviceNode.Header.Length[0] = (UINT8)sizeof (ACPI_ADR_DEVICE_PATH);
+  AcpiDeviceNode.Header.Length[1] = 0;
+  Private->GopDevicePath          = mDevicePathUtilities->AppendDeviceNode (ParentDevicePath, &AcpiDeviceNode.Header);
+  if (Private->GopDevicePath == NULL) {
+    ReleaseController (This, Private, TRUE);
+    return EFI_OUT_OF_RESOURCES;
+  }
+
+  ReimsGraphicsGraphicsOutputInit (Private);
+  Status = Private->GraphicsOutput.SetMode (&Private->GraphicsOutput, 0);
+  if (!EFI_ERROR (Status)) {
+    Status = gBS->InstallMultipleProtocolInterfaces (
+                    &Private->Handle,
+                    &gEfiDevicePathProtocolGuid,
+                    Private->GopDevicePath,
+                    &gEfiGraphicsOutputProtocolGuid,
+                    &Private->GraphicsOutput,
+                    NULL
+                    );
+  }
+
+  if (EFI_ERROR (Status)) {
+    gBS->FreePool (Private->GopDevicePath);
+    ReleaseController (This, Private, TRUE);
+    return Status;
+  }
+
+  gBS->OpenProtocol (
+         Controller,
+         &gEfiPciIoProtocolGuid,
+         (VOID **)&ChildPciIo,
+         This->DriverBindingHandle,
+         Private->Handle,
+         EFI_OPEN_PROTOCOL_BY_CHILD_CONTROLLER
+         );
+
+  Private->Next = mControllers;
+  mControllers  = Private;
+  return EFI_SUCCESS;
+}
+
+/**
+  Remove the Graphics Output child, then release the controller. The display
+  keeps its scanout, so the frame stays up for whatever drives it next.
+**/
+EFI_STATUS
+EFIAPI
+ReimsGraphicsDriverBindingStop (
+  IN EFI_DRIVER_BINDING_PROTOCOL  *This,
+  IN EFI_HANDLE                   Controller,
+  IN UINTN                        NumberOfChildren,
+  IN EFI_HANDLE                   *ChildHandleBuffer
+  )
+{
+  REIMS_GRAPHICS_PRIVATE_DATA  **Link;
+  REIMS_GRAPHICS_PRIVATE_DATA  *Private;
+  EFI_STATUS                   Status;
+
+  Private = FindController (Controller);
+  if (Private == NULL) {
+    return EFI_SUCCESS;
+  }
+
+  if (Private->Handle != NULL) {
+    gBS->CloseProtocol (Controller, &gEfiPciIoProtocolGuid, This->DriverBindingHandle, Private->Handle);
+    Status = gBS->UninstallMultipleProtocolInterfaces (
+                    Private->Handle,
+                    &gEfiDevicePathProtocolGuid,
+                    Private->GopDevicePath,
+                    &gEfiGraphicsOutputProtocolGuid,
+                    &Private->GraphicsOutput,
+                    NULL
+                    );
+    if (EFI_ERROR (Status)) {
+      return Status;
+    }
+
+    gBS->FreePool (Private->GopDevicePath);
+    Private->Handle = NULL;
+  }
+
+  if (NumberOfChildren != 0) {
+    return EFI_SUCCESS;
+  }
+
+  for (Link = &mControllers; *Link != Private; Link = &(*Link)->Next) {
+  }
+
+  *Link = Private->Next;
+  ReleaseController (This, Private, TRUE);
+  return EFI_SUCCESS;
+}
+
+EFI_DRIVER_BINDING_PROTOCOL  gReimsGraphicsDriverBinding = {
+  ReimsGraphicsDriverBindingSupported,
+  ReimsGraphicsDriverBindingStart,
+  ReimsGraphicsDriverBindingStop,
+  0x10,
+  NULL,
+  NULL
+};
+
+/**
+  Image entry point: install the driver binding and component names on the
+  image handle.
+**/
+EFI_STATUS
+EFIAPI
+ReimsGraphicsEntryPoint (
+  IN EFI_HANDLE        ImageHandle,
+  IN EFI_SYSTEM_TABLE  *SystemTable
+  )
+{
+  EFI_STATUS  Status;
+
+  gImageHandle = ImageHandle;
+  gBS          = SystemTable->BootServices;
+
+  Status = gBS->LocateProtocol (&gEfiDevicePathUtilitiesProtocolGuid, NULL, (VOID **)&mDevicePathUtilities);
+  if (EFI_ERROR (Status)) {
+    return Status;
+  }
+
+  gReimsGraphicsDriverBinding.ImageHandle         = ImageHandle;
+  gReimsGraphicsDriverBinding.DriverBindingHandle = ImageHandle;
+  return gBS->InstallMultipleProtocolInterfaces (
+                &gReimsGraphicsDriverBinding.DriverBindingHandle,
+                &gEfiDriverBindingProtocolGuid,
+                &gReimsGraphicsDriverBinding,
+                &gEfiComponentNameProtocolGuid,
+                &gReimsGraphicsComponentName,
+                &gEfiComponentName2ProtocolGuid,
+                &gReimsGraphicsComponentName2,
+                NULL
+                );
+}
