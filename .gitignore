@@ -5,6 +5,9 @@
 # it under the target directory).
 /firmware/build/
 
+# The guest display kext's build.
+/guest/kext/build/
+
 # Python's bytecode caches.
 __pycache__/
 
