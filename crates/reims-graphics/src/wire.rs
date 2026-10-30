@@ -695,6 +695,89 @@ pub struct RgfxEventSignalled {
     pub value: u64,
 }
 
+/// A texture's shape, as `MTLTextureDescriptor` gives it. Each enum is its Metal
+/// raw value (`MTLPixelFormat`, `MTLTextureType`, `MTLTextureUsage`,
+/// `MTLResourceOptions`); `swizzle` packs the four `MTLTextureSwizzle` channels,
+/// one byte each, red in the low byte.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxTextureDescriptor {
+    /// `MTLPixelFormat`.
+    pub pixel_format: u32,
+    /// `MTLTextureType`.
+    pub texture_type: u32,
+    /// Pixels a row.
+    pub width: u32,
+    /// Rows.
+    pub height: u32,
+    /// Slices, for a 3D texture; 1 otherwise.
+    pub depth: u32,
+    /// Mip levels.
+    pub mipmap_level_count: u32,
+    /// Array elements, for an array texture; 1 otherwise.
+    pub array_length: u32,
+    /// Samples a pixel, for a multisample texture; 1 otherwise.
+    pub sample_count: u32,
+    /// `MTLTextureUsage`.
+    pub usage: u32,
+    /// `MTLResourceOptions`: the storage, cache and hazard-tracking modes.
+    pub options: u32,
+    /// The four `MTLTextureSwizzle` channels, one byte each, red lowest.
+    pub swizzle: u32,
+    /// Pads to a multiple of 8; 0.
+    pub reserved_2c: u32,
+}
+
+/// `TEXTURE_CREATE`: a texture of shape `desc` at the guest-picked `gpu_address`
+/// (device-placed, `heap_obj_id` 0) or at `heap_offset` in `heap_obj_id`, with
+/// the guest-picked `resource_id`.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxTextureCreate {
+    /// [`RGFX_CMD_TEXTURE_CREATE`].
+    pub header: RgfxMsgHeader,
+    /// The new texture's guest-picked id.
+    pub obj_id: u64,
+    /// The texture's guest-picked GPU address when device-placed.
+    pub gpu_address: u64,
+    /// The texture's guest-picked resource id.
+    pub resource_id: u64,
+    /// The heap the texture lies in, or 0 when device-placed at `gpu_address`.
+    pub heap_obj_id: u64,
+    /// The texture's offset in the heap, when `heap_obj_id` is not 0.
+    pub heap_offset: u64,
+    /// The texture's shape.
+    pub desc: RgfxTextureDescriptor,
+}
+
+/// `TEXTURE_FROM_BUFFER`: a texture of shape `desc` over the buffer
+/// `buffer_obj_id` from `offset`, each row `bytes_per_row` apart, with the
+/// guest-picked `resource_id`.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxTextureFromBuffer {
+    /// [`RGFX_CMD_TEXTURE_FROM_BUFFER`].
+    pub header: RgfxMsgHeader,
+    /// The new texture's guest-picked id.
+    pub obj_id: u64,
+    /// The new texture's guest-picked resource id.
+    pub resource_id: u64,
+    /// The buffer the texture reads.
+    pub buffer_obj_id: u64,
+    /// The texture's first byte in the buffer.
+    pub offset: u64,
+    /// Bytes from one row's start to the next's.
+    pub bytes_per_row: u64,
+    /// The texture's shape.
+    pub desc: RgfxTextureDescriptor,
+}
+
 // The stage-3 messages' layout.
 const _: () = {
     use core::mem::size_of;
@@ -709,6 +792,9 @@ const _: () = {
     assert!(size_of::<RgfxBufferAtOffset>() == 56);
     assert!(size_of::<RgfxCbComplete>() == 48);
     assert!(size_of::<RgfxEventSignalled>() == 32);
+    assert!(size_of::<RgfxTextureDescriptor>() == 48);
+    assert!(size_of::<RgfxTextureCreate>() == 104);
+    assert!(size_of::<RgfxTextureFromBuffer>() == 104);
     // Each exact size above is a multiple of 8, as a ring message must be.
     // The stage-3 opcodes do not collide with the stage-2 ones or each other.
     assert!(RGFX_CMD_QUEUE_CREATE > RGFX_EVT_VBLANK);
@@ -773,6 +859,33 @@ mod tests {
         assert_eq!(
             RgfxCbComplete::read_from_bytes(done.as_bytes()).unwrap(),
             done
+        );
+
+        let texture = RgfxTextureCreate {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_TEXTURE_CREATE,
+                size: size_of::<RgfxTextureCreate>() as u32,
+                seqno: 3,
+            },
+            obj_id: 5,
+            gpu_address: 0x1_0000,
+            resource_id: 11,
+            heap_obj_id: 0,
+            heap_offset: 0,
+            desc: RgfxTextureDescriptor {
+                width: 1920,
+                height: 1080,
+                depth: 1,
+                mipmap_level_count: 1,
+                array_length: 1,
+                sample_count: 1,
+                ..RgfxTextureDescriptor::default()
+            },
+        };
+        assert_eq!(texture.header.size as usize, size_of::<RgfxTextureCreate>());
+        assert_eq!(
+            RgfxTextureCreate::read_from_bytes(texture.as_bytes()).unwrap(),
+            texture
         );
     }
 }

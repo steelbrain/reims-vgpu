@@ -53,6 +53,9 @@ include = [
     "RgfxBufferAtOffset",
     "RgfxCbComplete",
     "RgfxEventSignalled",
+    "RgfxTextureDescriptor",
+    "RgfxTextureCreate",
+    "RgfxTextureFromBuffer",
 ]
 
 [struct]

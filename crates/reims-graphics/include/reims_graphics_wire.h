@@ -608,4 +608,75 @@ typedef struct {
   uint64_t value;
 } RgfxEventSignalled;
 
+// A texture's shape, as `MTLTextureDescriptor` gives it. Each enum is its Metal
+// raw value (`MTLPixelFormat`, `MTLTextureType`, `MTLTextureUsage`,
+// `MTLResourceOptions`); `swizzle` packs the four `MTLTextureSwizzle` channels,
+// one byte each, red in the low byte.
+typedef struct {
+  // `MTLPixelFormat`.
+  uint32_t pixel_format;
+  // `MTLTextureType`.
+  uint32_t texture_type;
+  // Pixels a row.
+  uint32_t width;
+  // Rows.
+  uint32_t height;
+  // Slices, for a 3D texture; 1 otherwise.
+  uint32_t depth;
+  // Mip levels.
+  uint32_t mipmap_level_count;
+  // Array elements, for an array texture; 1 otherwise.
+  uint32_t array_length;
+  // Samples a pixel, for a multisample texture; 1 otherwise.
+  uint32_t sample_count;
+  // `MTLTextureUsage`.
+  uint32_t usage;
+  // `MTLResourceOptions`: the storage, cache and hazard-tracking modes.
+  uint32_t options;
+  // The four `MTLTextureSwizzle` channels, one byte each, red lowest.
+  uint32_t swizzle;
+  // Pads to a multiple of 8; 0.
+  uint32_t reserved_2c;
+} RgfxTextureDescriptor;
+
+// `TEXTURE_CREATE`: a texture of shape `desc` at the guest-picked `gpu_address`
+// (device-placed, `heap_obj_id` 0) or at `heap_offset` in `heap_obj_id`, with
+// the guest-picked `resource_id`.
+typedef struct {
+  // [`RGFX_CMD_TEXTURE_CREATE`].
+  RgfxMsgHeader header;
+  // The new texture's guest-picked id.
+  uint64_t obj_id;
+  // The texture's guest-picked GPU address when device-placed.
+  uint64_t gpu_address;
+  // The texture's guest-picked resource id.
+  uint64_t resource_id;
+  // The heap the texture lies in, or 0 when device-placed at `gpu_address`.
+  uint64_t heap_obj_id;
+  // The texture's offset in the heap, when `heap_obj_id` is not 0.
+  uint64_t heap_offset;
+  // The texture's shape.
+  RgfxTextureDescriptor desc;
+} RgfxTextureCreate;
+
+// `TEXTURE_FROM_BUFFER`: a texture of shape `desc` over the buffer
+// `buffer_obj_id` from `offset`, each row `bytes_per_row` apart, with the
+// guest-picked `resource_id`.
+typedef struct {
+  // [`RGFX_CMD_TEXTURE_FROM_BUFFER`].
+  RgfxMsgHeader header;
+  // The new texture's guest-picked id.
+  uint64_t obj_id;
+  // The new texture's guest-picked resource id.
+  uint64_t resource_id;
+  // The buffer the texture reads.
+  uint64_t buffer_obj_id;
+  // The texture's first byte in the buffer.
+  uint64_t offset;
+  // Bytes from one row's start to the next's.
+  uint64_t bytes_per_row;
+  // The texture's shape.
+  RgfxTextureDescriptor desc;
+} RgfxTextureFromBuffer;
+
 #endif  /* REIMS_GRAPHICS_WIRE_H */
