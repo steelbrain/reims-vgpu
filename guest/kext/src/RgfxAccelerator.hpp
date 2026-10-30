@@ -77,6 +77,7 @@ enum {
 };
 
 class RgfxAcceleratorUserClient;
+class ReimsGraphics;
 
 class RgfxAccelerator : public IOAccelerator {
 	OSDeclareDefaultStructors(RgfxAccelerator);
@@ -97,7 +98,14 @@ public:
 	IODeviceMemory *copyRegion() const;
 	void ringDoorbell(UInt32 ringId);
 
+	// The framebuffer on our PCI device (ReimsGraphics), retained for the caller, or nullptr
+	// before it has started. The first lookup that finds it names this accelerator on it
+	// (IOAccelTypes), as a display pipe's accelerator does.
+	ReimsGraphics *copyFramebuffer();
+
 private:
+	IOReturn newDisplayPipe(task_t owningTask, void *securityID, UInt32 type,
+	                        OSDictionary *properties, IOUserClient **handler);
 	UInt32 readRegister(UInt32 offset) const;
 	void writeRegister(UInt32 offset, UInt32 value);
 	void teardown();

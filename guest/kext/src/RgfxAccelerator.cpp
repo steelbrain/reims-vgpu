@@ -5,7 +5,9 @@
 
 #include "RgfxAccelerator.hpp"
 
+#include "ReimsGraphics.hpp"
 #include "RgfxAcceleratorUserClient.hpp"
+#include "RgfxDisplayPipeUserClient.hpp"
 
 #include <IOKit/IOLib.h>
 
@@ -28,6 +30,7 @@ void RgfxAccelerator::writeRegister(UInt32 offset, UInt32 value)
 
 bool RgfxAccelerator::start(IOService *provider)
 {
+	ReimsGraphics *fb = nullptr;
 	pci = OSDynamicCast(IOPCIDevice, provider);
 	if (!pci)
 		return false;
@@ -76,8 +79,14 @@ bool RgfxAccelerator::start(IOService *provider)
 	// notification see it.
 	if (!super::start(provider))
 		goto fail;
+	// Name this accelerator on the framebuffer, if it has started already (else the display
+	// pipe's first association does).
+	OSSafeReleaseNULL(fb);
+	fb = copyFramebuffer();
 	registerService();
-	IOLog("RgfxAccelerator: ready, region 0x%llx bytes\n", regionSize);
+	IOLog("RgfxAccelerator: ready, region 0x%llx bytes, framebuffer %s\n", regionSize,
+	      fb ? "named" : "not yet started");
+	OSSafeReleaseNULL(fb);
 	return true;
 fail:
 	teardown();
@@ -117,6 +126,8 @@ IOReturn RgfxAccelerator::newUserClient(task_t owningTask, void *securityID, UIn
 	// types up front. Only Metal's device-open path reaches this.
 	IOLog("RGFX: newUserClient type=%u task=%p (expected our type=%u)\n", type, owningTask,
 	      kRgfxAccelUserClientType);
+	if (type == kRgfxDisplayPipeUserClientType)
+		return newDisplayPipe(owningTask, securityID, type, properties, handler);
 
 	RgfxAcceleratorUserClient *client = OSTypeAlloc(RgfxAcceleratorUserClient);
 	if (!client)
@@ -138,7 +149,56 @@ IOReturn RgfxAccelerator::newUserClient(task_t owningTask, void *securityID, UIn
 	return kIOReturnSuccess;
 }
 
+// The display pipe WindowServer presents through (RgfxDisplayPipeUserClient).
+IOReturn RgfxAccelerator::newDisplayPipe(task_t owningTask, void *securityID, UInt32 type,
+                                         OSDictionary *properties, IOUserClient **handler)
+{
+	RgfxDisplayPipeUserClient *client = OSTypeAlloc(RgfxDisplayPipeUserClient);
+	if (!client)
+		return kIOReturnNoMemory;
+	if (!client->initWithTask(owningTask, securityID, type, properties)) {
+		client->release();
+		return kIOReturnBadArgument;
+	}
+	if (!client->attach(this)) {
+		client->release();
+		return kIOReturnInternalError;
+	}
+	if (!client->start(this)) {
+		client->detach(this);
+		client->release();
+		return kIOReturnInternalError;
+	}
+	*handler = client;
+	return kIOReturnSuccess;
+}
+
 // MARK: - Reached from the user client
+
+ReimsGraphics *RgfxAccelerator::copyFramebuffer()
+{
+	if (!pci)
+		return nullptr;
+	ReimsGraphics *found = nullptr;
+	OSIterator *clients = pci->getClientIterator();
+	if (clients) {
+		while (OSObject *o = clients->getNextObject()) {
+			found = OSDynamicCast(ReimsGraphics, o);
+			if (found) {
+				found->retain();
+				break;
+			}
+		}
+		clients->release();
+	}
+	if (found && !found->getProperty("IOAccelTypes")) {
+		char path[512];
+		int length = sizeof(path);
+		if (getPath(path, &length, gIOServicePlane))
+			found->setProperty("IOAccelTypes", path);
+	}
+	return found;
+}
 
 IODeviceMemory *RgfxAccelerator::copyRegion() const
 {

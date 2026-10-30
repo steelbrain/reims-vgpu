@@ -76,6 +76,16 @@ public:
 	IOReturn unregisterInterrupt(void *interruptRef) override;
 	IOReturn setInterruptState(void *interruptRef, UInt32 state) override;
 
+	// The display pipe (RgfxDisplayPipeUserClient, on the accelerator) presents through the
+	// framebuffer, which owns the control ring. presentSurface shows the IOSurface of global ID
+	// `surfaceId` on the display (0 goes back to the scanout) and waits for the host's answer:
+	// thread context only. setPipeVblank gives the pipe the display's VBLANK events: while
+	// `client` is set, the device sends them and each calls `hook(client, count, time)` on the
+	// work loop, `time` the guest's mach_absolute_time at the event; nullptr stops them.
+	typedef void (*PipeVblankHook)(OSObject *client, UInt64 count, UInt64 time);
+	IOReturn presentSurface(UInt32 surfaceId, UInt32 transactionId);
+	void setPipeVblank(OSObject *client, PipeVblankHook hook);
+
 private:
 	// The display's modes. IDs stay with a mode (its size and rate) for the
 	// driver's life, as IOFramebuffer asks, and are never reused.
@@ -181,6 +191,9 @@ private:
 	Interrupt vblank;
 	Interrupt connect;
 	bool vblankWanted;
+	// The display pipe's VBLANK client (retained) and its hook.
+	OSObject *pipeVblankClient;
+	PipeVblankHook pipeVblankHook;
 
 	// The work loop's alone: what SET_VBLANK last asked, and a display
 	// refresh after DISPLAY_CHANGED, waiting to be sent or answered.

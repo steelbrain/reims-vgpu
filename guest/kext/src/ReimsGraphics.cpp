@@ -235,7 +235,7 @@ void ReimsGraphics::service()
 	}
 
 	IOSimpleLockLock(interruptLock);
-	bool want = vblankWanted;
+	bool want = vblankWanted || pipeVblankClient;
 	IOSimpleLockUnlock(interruptLock);
 	if (want != vblankSent) {
 		RgfxSetVblank v = {};
@@ -316,11 +316,22 @@ void ReimsGraphics::handleEvent(UInt32 type, UInt64 seqno, const volatile UInt8 
 	case RGFX_EVT_DISPLAY_CHANGED:
 		refreshWanted = true;
 		return;
-	case RGFX_EVT_VBLANK:
+	case RGFX_EVT_VBLANK: {
 		IOSimpleLockLock(interruptLock);
 		fire = vblank;
+		OSObject *client = pipeVblankClient;
+		PipeVblankHook hook = pipeVblankHook;
+		if (client)
+			client->retain();
 		IOSimpleLockUnlock(interruptLock);
+		if (client) {
+			// The event's count is 8 bytes into its payload (RgfxVblank).
+			UInt64 count = size >= 16 ? *reinterpret_cast<const volatile UInt64 *>(payload + 8) : 0;
+			hook(client, count, mach_absolute_time());
+			client->release();
+		}
 		break;
+	}
 	default:
 		return;
 	}
@@ -577,6 +588,12 @@ bool ReimsGraphics::start(IOService *provider)
 	}
 	IOLog("ReimsGraphics: display %u, %u modes, region 0x%llx bytes\n", displayId, count, regionSize);
 
+	// The display pipe's index, which the wrangler and IOPresentment read off the framebuffer
+	// before it is published: our one display is pipe 0 of the accelerator (RgfxAccelerator sets
+	// IOAccelTypes once it has started).
+	setProperty("IOAccelIndex", 0ull, 32);
+	setProperty("IOAccelRevision", 2ull, 32);
+
 	if (super::start(provider))
 		return true;
 fail:
@@ -635,6 +652,7 @@ void ReimsGraphics::free()
 		IOLockFree(stateLock);
 	submitLock = interruptLock = nullptr;
 	stateLock = nullptr;
+	OSSafeReleaseNULL(pipeVblankClient);
 	super::free();
 }
 
@@ -990,4 +1008,29 @@ IOReturn ReimsGraphics::setInterruptState(void *interruptRef, UInt32 state)
 	IOSimpleLockUnlock(interruptLock);
 	kickWorkLoop();
 	return kIOReturnSuccess;
+}
+
+// MARK: - The display pipe
+
+IOReturn ReimsGraphics::presentSurface(UInt32 surfaceId, UInt32 transactionId)
+{
+	RgfxPresentSurface p = {};
+	p.display = displayId;
+	p.iosurface_id = surfaceId;
+	p.transaction_id = transactionId;
+	return command(RGFX_CMD_PRESENT_SURFACE, &p, sizeof(p));
+}
+
+void ReimsGraphics::setPipeVblank(OSObject *client, PipeVblankHook hook)
+{
+	if (client)
+		client->retain();
+	IOSimpleLockLock(interruptLock);
+	OSObject *old = pipeVblankClient;
+	pipeVblankClient = client;
+	pipeVblankHook = client ? hook : nullptr;
+	IOSimpleLockUnlock(interruptLock);
+	if (old)
+		old->release();
+	kickWorkLoop();
 }
