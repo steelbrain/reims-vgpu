@@ -26,17 +26,18 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use reims_graphics::wire::{
-    RGFX_CMD_BUFFER_CREATE, RGFX_CMD_DEPTH_STENCIL_CREATE, RGFX_CMD_EVENT_CREATE,
-    RGFX_CMD_FENCE_CREATE, RGFX_CMD_HEAP_CREATE, RGFX_CMD_LIBRARY_CREATE, RGFX_CMD_OBJECT_DESTROY,
-    RGFX_CMD_QUEUE_CREATE, RGFX_CMD_SAMPLER_CREATE, RGFX_CMD_SHARED_EVENT_CREATE,
-    RGFX_CMD_TEXTURE_CREATE, RGFX_CMD_TEXTURE_FROM_BUFFER, RGFX_LIBRARY_BYTES_OFFSET,
-    RgfxBufferCreate, RgfxDepthStencilCreate, RgfxHeapCreate, RgfxLibraryCreate, RgfxMsgHeader,
-    RgfxObjectCreate, RgfxObjectDestroy, RgfxQueueCreate, RgfxSamplerCreate, RgfxSharedEventCreate,
-    RgfxStencilDescriptor, RgfxTextureCreate, RgfxTextureDescriptor, RgfxTextureFromBuffer,
+    RGFX_CMD_BUFFER_AT_OFFSET, RGFX_CMD_BUFFER_CREATE, RGFX_CMD_DEPTH_STENCIL_CREATE,
+    RGFX_CMD_EVENT_CREATE, RGFX_CMD_FENCE_CREATE, RGFX_CMD_HEAP_CREATE, RGFX_CMD_LIBRARY_CREATE,
+    RGFX_CMD_OBJECT_DESTROY, RGFX_CMD_QUEUE_CREATE, RGFX_CMD_SAMPLER_CREATE,
+    RGFX_CMD_SHARED_EVENT_CREATE, RGFX_CMD_TEXTURE_CREATE, RGFX_CMD_TEXTURE_FROM_BUFFER,
+    RGFX_LIBRARY_BYTES_OFFSET, RgfxBufferAtOffset, RgfxBufferCreate, RgfxDepthStencilCreate,
+    RgfxHeapCreate, RgfxLibraryCreate, RgfxMsgHeader, RgfxObjectCreate, RgfxObjectDestroy,
+    RgfxQueueCreate, RgfxSamplerCreate, RgfxSharedEventCreate, RgfxStencilDescriptor,
+    RgfxTextureCreate, RgfxTextureDescriptor, RgfxTextureFromBuffer,
 };
 use reims_vgpu_core::platform::Platform;
 use reims_vgpu_core::platform::device::GpuDevice;
-use reims_vgpu_core::platform::resource::Buffer;
+use reims_vgpu_core::platform::resource::{Buffer, Heap};
 use reims_vgpu_core::platform::types::Swizzle;
 use reims_vgpu_core::platform::values::{
     BufferDesc, DepthStencilDesc, HeapDesc, OptionSet, SamplerDesc, StencilDesc, TextureDesc,
@@ -270,20 +271,43 @@ impl<P: Platform> GraphicsDecoder<P> {
                 let Some(m) = read::<RgfxTextureCreate>(message) else {
                     return Ok(Err(DecodeError::Malformed));
                 };
-                // Heap-placed textures land with the heap decode; this slice
-                // makes device-placed textures (`heap_obj_id` 0). The guest
-                // picks the resource id, pinned as the texture's resource index
-                // so its argument buffers name the same texture the host made.
-                if m.heap_obj_id != 0 {
-                    return Ok(Err(DecodeError::Refused));
-                }
+                // The guest picks the resource id, pinned as the texture's
+                // resource index so its argument buffers name the same texture
+                // the host made. `texture_descriptor` forwards the raw pixel
+                // format, so a format Metal refuses aborts here; the guest bundle
+                // only ever sends one it read from a real descriptor.
                 let desc = texture_desc(&m.desc, m.resource_id);
-                // `texture_descriptor` forwards the raw pixel format, so a format
-                // Metal refuses aborts here; the guest bundle only ever sends one
-                // it read from a real descriptor.
                 let descriptor = self.platform.texture_descriptor(&desc);
-                match device.new_texture(OnFault::Return, &descriptor)? {
+                let made = if m.heap_obj_id != 0 {
+                    // Heap-placed at `heap_offset` in the named heap; a heap the
+                    // host does not hold is a guest protocol error.
+                    let Some(ObjHandle::Heap(heap)) = self.objects.get(&m.heap_obj_id) else {
+                        return Ok(Err(DecodeError::BadReference));
+                    };
+                    heap.new_texture(&descriptor, m.heap_offset)?
+                } else {
+                    // Device-placed at the guest-picked GPU address.
+                    device.new_texture(OnFault::Return, &descriptor)?
+                };
+                match made {
                     Some(texture) => self.insert(m.obj_id, ObjHandle::Texture(texture)),
+                    None => Ok(Err(DecodeError::Refused)),
+                }
+            }
+            RGFX_CMD_BUFFER_AT_OFFSET => {
+                let Some(m) = read::<RgfxBufferAtOffset>(message) else {
+                    return Ok(Err(DecodeError::Malformed));
+                };
+                // A buffer at an offset in an existing heap; a heap the host does
+                // not hold is a guest protocol error.
+                let made = {
+                    let Some(ObjHandle::Heap(heap)) = self.objects.get(&m.heap_obj_id) else {
+                        return Ok(Err(DecodeError::BadReference));
+                    };
+                    heap.new_buffer_of_length(m.length, m.options.into(), m.offset)?
+                };
+                match made {
+                    Some(buffer) => self.insert(m.obj_id, ObjHandle::Buffer(buffer)),
                     None => Ok(Err(DecodeError::Refused)),
                 }
             }
@@ -588,7 +612,52 @@ mod tests {
         };
         assert_eq!(dec.decode(&device, heap.as_bytes()).unwrap(), Ok(()));
 
-        assert_eq!(dec.object_count(), 11);
+        // A heap-placed texture at an offset in the heap just made.
+        let heap_tex = RgfxTextureCreate {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_TEXTURE_CREATE,
+                size: size_of::<RgfxTextureCreate>() as u32,
+                seqno: 0,
+            },
+            obj_id: 22,
+            gpu_address: 0,
+            resource_id: 0x44,
+            heap_obj_id: 21,
+            heap_offset: 0,
+            desc: RgfxTextureDescriptor {
+                pixel_format: 80,
+                texture_type: 2,
+                width: 256,
+                height: 256,
+                depth: 1,
+                mipmap_level_count: 1,
+                array_length: 1,
+                sample_count: 1,
+                usage: 1,
+                options: 0,
+                swizzle: 0,
+                reserved_2c: 0,
+            },
+        };
+        assert_eq!(dec.decode(&device, heap_tex.as_bytes()).unwrap(), Ok(()));
+
+        // A buffer at an offset in the same heap.
+        let heap_buf = RgfxBufferAtOffset {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_BUFFER_AT_OFFSET,
+                size: size_of::<RgfxBufferAtOffset>() as u32,
+                seqno: 0,
+            },
+            obj_id: 23,
+            heap_obj_id: 21,
+            offset: 0x1_0000,
+            length: 4096,
+            options: 0,
+            reserved_34: 0,
+        };
+        assert_eq!(dec.decode(&device, heap_buf.as_bytes()).unwrap(), Ok(()));
+
+        assert_eq!(dec.object_count(), 13);
         let log = p.call_log();
         assert_eq!(log.calls_to("newEvent").len(), 1);
         assert_eq!(log.calls_to("newFence").len(), 1);
@@ -605,6 +674,8 @@ mod tests {
             1
         );
         assert_eq!(log.calls_to("newHeapWithDescriptor:").len(), 1);
+        assert_eq!(log.calls_to("newTextureWithDescriptor:offset:").len(), 1);
+        assert_eq!(log.calls_to("newBufferWithLength:options:offset:").len(), 1);
 
         // Destroying the event drops its handle; the others stay.
         let destroy = RgfxObjectDestroy {
@@ -616,7 +687,7 @@ mod tests {
             obj_id: 10,
         };
         assert_eq!(dec.decode(&device, destroy.as_bytes()).unwrap(), Ok(()));
-        assert_eq!(dec.object_count(), 10);
+        assert_eq!(dec.object_count(), 12);
         // Destroying an id the host never made is not an error.
         assert_eq!(dec.decode(&device, destroy.as_bytes()).unwrap(), Ok(()));
 
