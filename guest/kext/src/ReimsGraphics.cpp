@@ -9,6 +9,8 @@
 #include <kern/clock.h>
 #include <libkern/libkern.h>
 
+#include "RgfxTrace.hpp"
+
 #define super IOFramebuffer
 OSDefineMetaClassAndStructors(ReimsGraphics, IOFramebuffer);
 
@@ -1917,6 +1919,27 @@ IOReturn ReimsGraphics::newUserClient(task_t owningTask, void *securityID, UInt3
 	IOReturn r = super::newUserClient(owningTask, securityID, type, clientH);
 	FBTRACE(32, "newUserClient type %u -> 0x%x", type, r);
 	return r;
+}
+
+OSObject *ReimsGraphics::copyProperty(const OSSymbol *aKey) const
+{
+	OSObject *o = super::copyProperty(aKey);
+	rgfxTracePropertyRead("fb", aKey ? aKey->getCStringNoCopy() : nullptr, o != nullptr);
+	return o;
+}
+
+OSObject *ReimsGraphics::copyProperty(const OSString *aKey) const
+{
+	OSObject *o = super::copyProperty(aKey);
+	rgfxTracePropertyRead("fb", aKey ? aKey->getCStringNoCopy() : nullptr, o != nullptr);
+	return o;
+}
+
+OSObject *ReimsGraphics::copyProperty(const char *aKey) const
+{
+	OSObject *o = super::copyProperty(aKey);
+	rgfxTracePropertyRead("fb", aKey, o != nullptr);
+	return o;
 }
 
 IOReturn ReimsGraphics::requestProbe(IOOptionBits options)

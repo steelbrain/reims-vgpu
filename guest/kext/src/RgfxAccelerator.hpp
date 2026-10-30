@@ -202,6 +202,14 @@ public:
 	void unwatchClient(RgfxAcceleratorUserClient *client);
 	void queueInterrupt();
 
+#if RGFX_FB_TRACE
+	// A trace build logs the properties processes read of the accelerator.
+	using IOAccelerator::copyProperty;
+	OSObject *copyProperty(const OSSymbol *aKey) const override;
+	OSObject *copyProperty(const OSString *aKey) const override;
+	OSObject *copyProperty(const char *aKey) const override;
+#endif
+
 private:
 	IOReturn newDisplayPipe(task_t owningTask, void *securityID, UInt32 type,
 	                        OSDictionary *properties, IOUserClient **handler);

@@ -11,6 +11,8 @@
 
 #include <IOKit/IOLib.h>
 
+#include "RgfxTrace.hpp"
+
 #define super IOAccelerator
 OSDefineMetaClassAndStructors(RgfxAccelerator, IOAccelerator);
 
@@ -129,8 +131,9 @@ IOReturn RgfxAccelerator::newUserClient(task_t owningTask, void *securityID, UIn
 	// (diagnostic) accept ANY type so the base proceeds and reveals its subsequent
 	// clientMemoryForType / externalMethod handshake, instead of rejecting non-zero
 	// types up front. Only Metal's device-open path reaches this.
-	IOLog("RGFX: newUserClient type=%u task=%p (expected our type=%u)\n", type, owningTask,
-	      kRgfxAccelUserClientType);
+	RgfxCaller caller;
+	IOLog("RGFX: newUserClient type=%u from %s[%d] (expected our type=%u)\n", type, caller.name,
+	      caller.pid, kRgfxAccelUserClientType);
 	if (type == kRgfxDisplayPipeUserClientType)
 		return newDisplayPipe(owningTask, securityID, type, properties, handler);
 
@@ -220,3 +223,28 @@ void RgfxAccelerator::ringDoorbell(UInt32 ringId)
 	writeRegister(RGFX_REG_DOORBELL, ringId);
 	IOSimpleLockUnlockEnableInterrupt(doorbellLock, s);
 }
+
+#if RGFX_FB_TRACE
+// MARK: - Trace: the properties processes read
+
+OSObject *RgfxAccelerator::copyProperty(const OSSymbol *aKey) const
+{
+	OSObject *o = super::copyProperty(aKey);
+	rgfxTracePropertyRead("accel", aKey ? aKey->getCStringNoCopy() : nullptr, o != nullptr);
+	return o;
+}
+
+OSObject *RgfxAccelerator::copyProperty(const OSString *aKey) const
+{
+	OSObject *o = super::copyProperty(aKey);
+	rgfxTracePropertyRead("accel", aKey ? aKey->getCStringNoCopy() : nullptr, o != nullptr);
+	return o;
+}
+
+OSObject *RgfxAccelerator::copyProperty(const char *aKey) const
+{
+	OSObject *o = super::copyProperty(aKey);
+	rgfxTracePropertyRead("accel", aKey, o != nullptr);
+	return o;
+}
+#endif

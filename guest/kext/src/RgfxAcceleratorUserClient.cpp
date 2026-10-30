@@ -8,6 +8,8 @@
 #include <IOKit/IOLib.h>
 #include <IOKit/IOMemoryDescriptor.h>
 
+#include "RgfxTrace.hpp"
+
 #define super IOUserClient
 OSDefineMetaClassAndStructors(RgfxAcceleratorUserClient, IOUserClient);
 
@@ -81,7 +83,9 @@ IOReturn RgfxAcceleratorUserClient::clientMemoryForType(UInt32 type, IOOptionBit
                                                         IOMemoryDescriptor **memory)
 {
 	// RGFX DIAG (Wall-2 trace; remove before merge): which memory type the base maps.
-	IOLog("RGFX: clientMemoryForType type=%u (ours=%u)\n", type, kRgfxAccelMemoryRegion);
+	RgfxCaller caller;
+	IOLog("RGFX: clientMemoryForType type=%u on user client type %u from %s[%d] (ours=%u)\n", type,
+	      ucType, caller.name, caller.pid, kRgfxAccelMemoryRegion);
 	if (type != kRgfxAccelMemoryRegion)
 		return kIOReturnUnsupported;
 	if (!owner)
@@ -148,6 +152,28 @@ IOReturn RgfxAcceleratorUserClient::externalMethod(uint32_t selector,
 	static const IOExternalMethodDispatch methods[kRgfxAccelMethodCount] = {
 		{ &RgfxAcceleratorUserClient::doorbellMethod, 1, 0, 0, 0 },
 	};
+
+#if RGFX_FB_TRACE
+	// A trace build logs the first calls of each (user-client type, selector): their shape,
+	// their first scalars and their caller.
+	{
+		static char site;
+		if (arguments && rgfxFirstCalls(&site, (static_cast<UInt64>(ucType) << 32) | selector, 6)) {
+			RgfxCaller caller;
+			UInt64 in[5] = {};
+			for (UInt32 i = 0; i < arguments->scalarInputCount && i < 5; i++)
+				in[i] = arguments->scalarInput[i];
+			IOLog("RGFX uc type %u sel 0x%x from %s[%d]: scalars %u/%u struct %u/%u%s%s, in "
+			      "0x%llx 0x%llx 0x%llx 0x%llx 0x%llx\n",
+			      ucType, selector, caller.name, caller.pid, arguments->scalarInputCount,
+			      arguments->scalarOutputCount, arguments->structureInputSize,
+			      arguments->structureOutputSize,
+			      arguments->structureInputDescriptor ? " inDesc" : "",
+			      arguments->structureOutputDescriptor ? " outDesc" : "", in[0], in[1], in[2],
+			      in[3], in[4]);
+		}
+	}
+#endif
 
 	// Our own protocol: the process's context (its ids, blocks and queues), on our own user
 	// client alone.

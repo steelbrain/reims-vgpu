@@ -118,6 +118,11 @@ public:
 	                            IOOptionBits options) override;
 	IOReturn connectFlags(IOIndex connectIndex, IODisplayModeID displayMode,
 	                      IOOptionBits *flags) override;
+	// And the properties processes read of it.
+	using IOFramebuffer::copyProperty;
+	OSObject *copyProperty(const OSSymbol *aKey) const override;
+	OSObject *copyProperty(const OSString *aKey) const override;
+	OSObject *copyProperty(const char *aKey) const override;
 #endif
 
 	// The display pipe (RgfxDisplayPipeUserClient, on the accelerator) presents through the
