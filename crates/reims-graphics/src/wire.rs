@@ -778,6 +778,107 @@ pub struct RgfxTextureFromBuffer {
     pub desc: RgfxTextureDescriptor,
 }
 
+/// `SAMPLER_CREATE`: a sampler as `MTLSamplerDescriptor` gives it. Each enum is
+/// its Metal raw value; `lod_min_clamp_bits`/`lod_max_clamp_bits` are the `f32`
+/// clamps' bits (so the wire stays all-integer and comparable); `flags` packs
+/// the booleans.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxSamplerCreate {
+    /// [`RGFX_CMD_SAMPLER_CREATE`].
+    pub header: RgfxMsgHeader,
+    /// The new sampler's guest-picked id.
+    pub obj_id: u64,
+    /// `MTLSamplerMinMagFilter` for minification.
+    pub min_filter: u32,
+    /// `MTLSamplerMinMagFilter` for magnification.
+    pub mag_filter: u32,
+    /// `MTLSamplerMipFilter`.
+    pub mip_filter: u32,
+    /// `MTLSamplerAddressMode` for s.
+    pub s_address_mode: u32,
+    /// `MTLSamplerAddressMode` for t.
+    pub t_address_mode: u32,
+    /// `MTLSamplerAddressMode` for r.
+    pub r_address_mode: u32,
+    /// `MTLSamplerBorderColor`.
+    pub border_color: u32,
+    /// `MTLCompareFunction` for the sampler's compare.
+    pub compare_function: u32,
+    /// The maximum anisotropy.
+    pub max_anisotropy: u32,
+    /// The minimum LOD clamp, as `f32` bits.
+    pub lod_min_clamp_bits: u32,
+    /// The maximum LOD clamp, as `f32` bits.
+    pub lod_max_clamp_bits: u32,
+    /// Bit 0: normalized coordinates. Bit 1: LOD average. Bit 2: usable from an
+    /// argument buffer.
+    pub flags: u32,
+}
+
+/// One face's stencil state, as `MTLStencilDescriptor` gives it.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxStencilDescriptor {
+    /// `MTLCompareFunction` for the stencil test.
+    pub stencil_compare: u32,
+    /// `MTLStencilOperation` when the stencil test fails.
+    pub stencil_fail_op: u32,
+    /// `MTLStencilOperation` when the depth test fails.
+    pub depth_fail_op: u32,
+    /// `MTLStencilOperation` when both tests pass.
+    pub pass_op: u32,
+    /// The bits the stencil test reads.
+    pub read_mask: u32,
+    /// The bits a stencil write may change.
+    pub write_mask: u32,
+}
+
+/// `DEPTH_STENCIL_CREATE`: a depth/stencil state as `MTLDepthStencilDescriptor`
+/// gives it.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxDepthStencilCreate {
+    /// [`RGFX_CMD_DEPTH_STENCIL_CREATE`].
+    pub header: RgfxMsgHeader,
+    /// The new state's guest-picked id.
+    pub obj_id: u64,
+    /// `MTLCompareFunction` for the depth test.
+    pub depth_compare: u32,
+    /// Whether a depth write is kept: 0 discards it.
+    pub depth_write_enabled: u32,
+    /// The front faces' stencil state.
+    pub front: RgfxStencilDescriptor,
+    /// The back faces' stencil state.
+    pub back: RgfxStencilDescriptor,
+}
+
+/// `LIBRARY_CREATE`: a library from `byte_length` bytes of `.metallib` or AIR
+/// that follow this header at [`RGFX_LIBRARY_BYTES_OFFSET`], forwarded to the
+/// host unchanged. The message's `size` is `RGFX_LIBRARY_BYTES_OFFSET +
+/// byte_length` rounded up to a multiple of 8.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxLibraryCreate {
+    /// [`RGFX_CMD_LIBRARY_CREATE`].
+    pub header: RgfxMsgHeader,
+    /// The new library's guest-picked id.
+    pub obj_id: u64,
+    /// The length of the `.metallib`/AIR bytes that follow.
+    pub byte_length: u64,
+}
+
+/// Where a `LIBRARY_CREATE` message's bytes start: right after its header.
+pub const RGFX_LIBRARY_BYTES_OFFSET: u32 = 32;
+
 // The stage-3 messages' layout.
 const _: () = {
     use core::mem::size_of;
@@ -795,6 +896,11 @@ const _: () = {
     assert!(size_of::<RgfxTextureDescriptor>() == 48);
     assert!(size_of::<RgfxTextureCreate>() == 104);
     assert!(size_of::<RgfxTextureFromBuffer>() == 104);
+    assert!(size_of::<RgfxSamplerCreate>() == 72);
+    assert!(size_of::<RgfxStencilDescriptor>() == 24);
+    assert!(size_of::<RgfxDepthStencilCreate>() == 80);
+    assert!(size_of::<RgfxLibraryCreate>() == 32);
+    assert!(RGFX_LIBRARY_BYTES_OFFSET as usize == size_of::<RgfxLibraryCreate>());
     // Each exact size above is a multiple of 8, as a ring message must be.
     // The stage-3 opcodes do not collide with the stage-2 ones or each other.
     assert!(RGFX_CMD_QUEUE_CREATE > RGFX_EVT_VBLANK);
@@ -886,6 +992,47 @@ mod tests {
         assert_eq!(
             RgfxTextureCreate::read_from_bytes(texture.as_bytes()).unwrap(),
             texture
+        );
+
+        let depth = RgfxDepthStencilCreate {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_DEPTH_STENCIL_CREATE,
+                size: size_of::<RgfxDepthStencilCreate>() as u32,
+                seqno: 4,
+            },
+            obj_id: 8,
+            depth_compare: 1,
+            depth_write_enabled: 1,
+            front: RgfxStencilDescriptor {
+                read_mask: 0xff,
+                write_mask: 0xff,
+                ..RgfxStencilDescriptor::default()
+            },
+            back: RgfxStencilDescriptor::default(),
+        };
+        assert_eq!(
+            RgfxDepthStencilCreate::read_from_bytes(depth.as_bytes()).unwrap(),
+            depth
+        );
+
+        // A library message's bytes follow its header; the header's size covers
+        // both, rounded up to a multiple of 8.
+        let lib = RgfxLibraryCreate {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_LIBRARY_CREATE,
+                size: RGFX_LIBRARY_BYTES_OFFSET + 8,
+                seqno: 5,
+            },
+            obj_id: 12,
+            byte_length: 6,
+        };
+        assert_eq!(
+            RgfxLibraryCreate::read_from_bytes(lib.as_bytes()).unwrap(),
+            lib
+        );
+        assert_eq!(
+            RGFX_LIBRARY_BYTES_OFFSET as usize,
+            size_of::<RgfxLibraryCreate>()
         );
     }
 }

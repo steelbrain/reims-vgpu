@@ -267,6 +267,9 @@
 // Where a `DISPLAYS` message's first display record starts: right after `count`.
 #define RGFX_DISPLAYS_ENTRIES_OFFSET 20
 
+// Where a `LIBRARY_CREATE` message's bytes start: right after its header.
+#define RGFX_LIBRARY_BYTES_OFFSET 32
+
 // A ring's header, at the start of the ring: each field in a 64-byte line of its own, so the
 // producer's and the consumer's writes never share a cache line.
 typedef struct {
@@ -678,5 +681,87 @@ typedef struct {
   // The texture's shape.
   RgfxTextureDescriptor desc;
 } RgfxTextureFromBuffer;
+
+// `SAMPLER_CREATE`: a sampler as `MTLSamplerDescriptor` gives it. Each enum is
+// its Metal raw value; `lod_min_clamp_bits`/`lod_max_clamp_bits` are the `f32`
+// clamps' bits (so the wire stays all-integer and comparable); `flags` packs
+// the booleans.
+typedef struct {
+  // [`RGFX_CMD_SAMPLER_CREATE`].
+  RgfxMsgHeader header;
+  // The new sampler's guest-picked id.
+  uint64_t obj_id;
+  // `MTLSamplerMinMagFilter` for minification.
+  uint32_t min_filter;
+  // `MTLSamplerMinMagFilter` for magnification.
+  uint32_t mag_filter;
+  // `MTLSamplerMipFilter`.
+  uint32_t mip_filter;
+  // `MTLSamplerAddressMode` for s.
+  uint32_t s_address_mode;
+  // `MTLSamplerAddressMode` for t.
+  uint32_t t_address_mode;
+  // `MTLSamplerAddressMode` for r.
+  uint32_t r_address_mode;
+  // `MTLSamplerBorderColor`.
+  uint32_t border_color;
+  // `MTLCompareFunction` for the sampler's compare.
+  uint32_t compare_function;
+  // The maximum anisotropy.
+  uint32_t max_anisotropy;
+  // The minimum LOD clamp, as `f32` bits.
+  uint32_t lod_min_clamp_bits;
+  // The maximum LOD clamp, as `f32` bits.
+  uint32_t lod_max_clamp_bits;
+  // Bit 0: normalized coordinates. Bit 1: LOD average. Bit 2: usable from an
+  // argument buffer.
+  uint32_t flags;
+} RgfxSamplerCreate;
+
+// One face's stencil state, as `MTLStencilDescriptor` gives it.
+typedef struct {
+  // `MTLCompareFunction` for the stencil test.
+  uint32_t stencil_compare;
+  // `MTLStencilOperation` when the stencil test fails.
+  uint32_t stencil_fail_op;
+  // `MTLStencilOperation` when the depth test fails.
+  uint32_t depth_fail_op;
+  // `MTLStencilOperation` when both tests pass.
+  uint32_t pass_op;
+  // The bits the stencil test reads.
+  uint32_t read_mask;
+  // The bits a stencil write may change.
+  uint32_t write_mask;
+} RgfxStencilDescriptor;
+
+// `DEPTH_STENCIL_CREATE`: a depth/stencil state as `MTLDepthStencilDescriptor`
+// gives it.
+typedef struct {
+  // [`RGFX_CMD_DEPTH_STENCIL_CREATE`].
+  RgfxMsgHeader header;
+  // The new state's guest-picked id.
+  uint64_t obj_id;
+  // `MTLCompareFunction` for the depth test.
+  uint32_t depth_compare;
+  // Whether a depth write is kept: 0 discards it.
+  uint32_t depth_write_enabled;
+  // The front faces' stencil state.
+  RgfxStencilDescriptor front;
+  // The back faces' stencil state.
+  RgfxStencilDescriptor back;
+} RgfxDepthStencilCreate;
+
+// `LIBRARY_CREATE`: a library from `byte_length` bytes of `.metallib` or AIR
+// that follow this header at [`RGFX_LIBRARY_BYTES_OFFSET`], forwarded to the
+// host unchanged. The message's `size` is `RGFX_LIBRARY_BYTES_OFFSET +
+// byte_length` rounded up to a multiple of 8.
+typedef struct {
+  // [`RGFX_CMD_LIBRARY_CREATE`].
+  RgfxMsgHeader header;
+  // The new library's guest-picked id.
+  uint64_t obj_id;
+  // The length of the `.metallib`/AIR bytes that follow.
+  uint64_t byte_length;
+} RgfxLibraryCreate;
 
 #endif  /* REIMS_GRAPHICS_WIRE_H */

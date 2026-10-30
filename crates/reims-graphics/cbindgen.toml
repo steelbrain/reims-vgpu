@@ -56,6 +56,10 @@ include = [
     "RgfxTextureDescriptor",
     "RgfxTextureCreate",
     "RgfxTextureFromBuffer",
+    "RgfxSamplerCreate",
+    "RgfxStencilDescriptor",
+    "RgfxDepthStencilCreate",
+    "RgfxLibraryCreate",
 ]
 
 [struct]
