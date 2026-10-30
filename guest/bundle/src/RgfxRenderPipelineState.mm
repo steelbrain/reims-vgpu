@@ -29,19 +29,25 @@ namespace {
 constexpr NSUInteger kMaxVertexBuffers = 31;
 constexpr NSUInteger kMaxVertexAttributes = 31;
 
-/// Fills `fr` from an id<MTLFunction> that must be an RgfxFunction (what the bundle
+/// Fills `fr` from an id<MTLFunction>, which must be an RgfxFunction (what the bundle
 /// vends). A nil function leaves `fr` naming no function (library 0, null name).
-void fillFunctionRef(RgfxFunctionRef &fr, id<MTLFunction> fn)
+/// Answers false for a function another device's library made: it names no library
+/// the host holds, so the create is refused rather than sent.
+bool fillFunctionRef(RgfxFunctionRef &fr, id<MTLFunction> fn)
 {
 	fr = RgfxFunctionRef{};
 	if (fn == nil) {
-		return;
+		return true;
+	}
+	if (![(id)fn isKindOfClass:[RgfxFunction class]]) {
+		return false;
 	}
 	RgfxFunction *rf = (RgfxFunction *)fn;
 	fr.library = rf.rgfxLibraryObjId;
 	fr.entry_point = [rf rgfxEntryPointUTF8];
 	fr.constants = [rf rgfxConstants];
 	fr.constant_count = [rf rgfxConstantCount];
+	return true;
 }
 
 } // namespace
@@ -67,8 +73,19 @@ void fillFunctionRef(RgfxFunctionRef &fr, id<MTLFunction> fn)
 	}
 
 	RgfxRenderPipelineParams p = {};
-	fillFunctionRef(p.vertex, descriptor.vertexFunction);
-	fillFunctionRef(p.fragment, descriptor.fragmentFunction);
+	if (!fillFunctionRef(p.vertex, descriptor.vertexFunction) ||
+	    !fillFunctionRef(p.fragment, descriptor.fragmentFunction)) {
+		id<MTLFunction> foreign = descriptor.vertexFunction;
+		if ([(id)foreign isKindOfClass:[RgfxFunction class]])
+			foreign = descriptor.fragmentFunction;
+		NSString *msg = [NSString
+		    stringWithFormat:@"render pipeline: function %@ (%@) is not from a library of this device",
+		                     foreign.name, NSStringFromClass([(id)foreign class])];
+		NSLog(@"RGFX: %@", msg);
+		if (error)
+			*error = RgfxMakeError(RgfxMetalErrorInvalidDescriptor, msg);
+		return nil;
+	}
 
 	std::string label;
 	if (descriptor.label != nil && descriptor.label.UTF8String != nullptr) {

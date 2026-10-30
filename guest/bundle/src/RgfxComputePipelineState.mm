@@ -24,6 +24,12 @@ bool fillComputeParams(RgfxComputePipelineParams &p, id<MTLFunction> fn, uint32_
 	if (fn == nil) {
 		return false;
 	}
+	if (![(id)fn isKindOfClass:[RgfxFunction class]]) {
+		// Another device's library made it: it names no library the host holds.
+		NSLog(@"RGFX: compute pipeline: function %@ (%@) is not from a library of this device",
+		      fn.name, NSStringFromClass([(id)fn class]));
+		return false;
+	}
 	RgfxFunction *rf = (RgfxFunction *)fn;
 	p = RgfxComputePipelineParams{};
 	nameStore = [rf rgfxEntryPointUTF8] ? [rf rgfxEntryPointUTF8] : "";
@@ -112,7 +118,7 @@ bool fillComputeParams(RgfxComputePipelineParams &p, id<MTLFunction> fn, uint32_
 	if (!fillComputeParams(p, function, flags, maxTotalThreads, nameStore)) {
 		if (error)
 			*error = RgfxMakeError(RgfxMetalErrorInvalidDescriptor,
-			                       @"compute pipeline: no compute function");
+			                       @"compute pipeline: no compute function of this device");
 		return nil;
 	}
 	RgfxCreated created = serializer->createComputePipeline(p);

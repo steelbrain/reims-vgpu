@@ -66,6 +66,10 @@ NS_ASSUME_NONNULL_BEGIN
 - (nullable const RgfxFunctionConstant *)rgfxConstants;
 - (uint32_t)rgfxConstantCount;
 
+/// Sets the stage `functionType` answers: the library reads it from the .metallib's
+/// function list. A function made without it answers the placeholder stage.
+- (void)rgfxSetFunctionType:(MTLFunctionType)type;
+
 @end
 
 NS_ASSUME_NONNULL_END

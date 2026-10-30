@@ -13,9 +13,79 @@
 
 #include "RgfxSerializer.hpp"
 
+#include <fcntl.h>
+#include <stdio.h>
+#include <unistd.h>
+
 @implementation RgfxMetalDevice (Pipelines)
 
 // --- libraries ---------------------------------------------------------------
+
+namespace {
+
+// RGFX DIAG (WindowServer bring-up; remove before merge): one line per library
+// create to /tmp/rgfx-diag.log, so a guest without logd shows which entry point a
+// client loads its shaders through and whether the create posted.
+void rgfxLibraryDiag(const char *how, NSString *origin, NSUInteger length, BOOL posted)
+{
+	char line[600];
+	int n = snprintf(line, sizeof(line), "RGFX: library %s %s bytes=%lu posted=%d pid=%d\n", how,
+	                 origin.UTF8String ? origin.UTF8String : "-", (unsigned long)length,
+	                 posted ? 1 : 0, getpid());
+	if (n <= 0)
+		return;
+	int fd = open("/tmp/rgfx-diag.log", O_WRONLY | O_CREAT | O_APPEND, 0666);
+	if (fd < 0)
+		return;
+	(void)!write(fd, line, static_cast<size_t>(n < (int)sizeof(line) ? n : (int)sizeof(line)));
+	close(fd);
+}
+
+// How long a library create waits for room on the device ring before it reports the
+// ring full: the host drains the ring as it runs, so a full ring is transient.
+constexpr useconds_t kLibraryRetrySleepUs = 1000;
+constexpr int kLibraryRetries = 2000; // about two seconds
+
+} // namespace
+
+// Every library-from-bytes entry point funnels through here: posts the bytes as one
+// LIBRARY_CREATE, waiting for room while the ring is momentarily full. A library
+// larger than the ring cannot be posted in one message and is refused.
+- (nullable id<MTLLibrary>)rgfxLibraryWithBytes:(const void *)bytes
+                                         length:(NSUInteger)length
+                                            how:(const char *)how
+                                         origin:(NSString *)origin
+                                          error:(__autoreleasing NSError **)error
+{
+	RgfxSerializer *ser = [self serializer];
+	if (ser == nullptr) {
+		rgfxLibraryDiag(how, origin, length, NO);
+		if (error)
+			*error = RgfxMakeError(RgfxMetalErrorNoRoute, @"library: no serialiser route");
+		return nil;
+	}
+	if (RGFX_LIBRARY_BYTES_OFFSET + static_cast<uint64_t>(length) + 8 > RGFX_CONTROL_RING_DATA_SIZE) {
+		rgfxLibraryDiag(how, origin, length, NO);
+		NSLog(@"RGFX: library %@ of %lu bytes does not fit one device-ring message", origin,
+		      (unsigned long)length);
+		if (error)
+			*error = RgfxMakeError(RgfxMetalErrorUnsupported,
+			                       [NSString stringWithFormat:@"library %@: %lu bytes do not fit "
+			                                                  @"one device-ring message",
+			                                                  origin, (unsigned long)length]);
+		return nil;
+	}
+	id<MTLLibrary> lib = nil;
+	for (int i = 0; i < kLibraryRetries && lib == nil; i++) {
+		lib = [RgfxLibrary libraryWithData:bytes length:length device:self serializer:ser];
+		if (lib == nil)
+			usleep(kLibraryRetrySleepUs);
+	}
+	rgfxLibraryDiag(how, origin, length, lib != nil);
+	if (lib == nil && error)
+		*error = RgfxMakeError(RgfxMetalErrorRingFull, @"library: the device ring stayed full");
+	return lib;
+}
 
 - (id<MTLLibrary>)newLibraryWithData:(dispatch_data_t)data
                                error:(__autoreleasing NSError **)error
@@ -30,53 +100,64 @@
 	const void *bytes = nullptr;
 	size_t size = 0;
 	dispatch_data_t map = dispatch_data_create_map(data, &bytes, &size);
-	id<MTLLibrary> lib = [RgfxLibrary libraryWithData:bytes
-	                                           length:size
-	                                           device:self
-	                                       serializer:[self serializer]];
+	id<MTLLibrary> lib = [self rgfxLibraryWithBytes:bytes
+	                                         length:size
+	                                            how:"data"
+	                                         origin:@"(data)"
+	                                          error:error];
 	(void)map; // released by ARC; `bytes` stayed valid for the create above
-	if (lib == nil && error)
-		*error = RgfxMakeError([self serializer] ? RgfxMetalErrorRingFull : RgfxMetalErrorNoRoute,
-		                       @"newLibraryWithData: create failed");
 	return lib;
 }
 
 - (id<MTLLibrary>)newLibraryWithURL:(NSURL *)url error:(__autoreleasing NSError **)error
 {
 	NSError *readError = nil;
-	NSData *data = [NSData dataWithContentsOfURL:url options:0 error:&readError];
+	NSData *data = url ? [NSData dataWithContentsOfURL:url options:NSDataReadingMappedIfSafe
+	                                             error:&readError]
+	                   : nil;
 	if (data == nil) {
+		rgfxLibraryDiag("url-unreadable", url.path, 0, NO);
 		if (error)
 			*error = readError ?: RgfxMakeError(RgfxMetalErrorInvalidDescriptor,
 			                                    @"newLibraryWithURL: could not read URL");
 		return nil;
 	}
-	id<MTLLibrary> lib = [RgfxLibrary libraryWithData:data.bytes
-	                                           length:data.length
-	                                           device:self
-	                                       serializer:[self serializer]];
-	if (lib == nil && error)
-		*error = RgfxMakeError([self serializer] ? RgfxMetalErrorRingFull : RgfxMetalErrorNoRoute,
-		                       @"newLibraryWithURL: create failed");
-	return lib;
+	return [self rgfxLibraryWithBytes:data.bytes
+	                           length:data.length
+	                              how:"url"
+	                           origin:url.path
+	                            error:error];
 }
 
-- (id<MTLLibrary>)newDefaultLibrary
+- (id<MTLLibrary>)newLibraryWithFile:(NSString *)filepath error:(__autoreleasing NSError **)error
 {
-	// DOCUMENTED STUB. There is no default library baked into the bundle; the guest
-	// provides libraries by data/URL. nil is the documented answer, as Metal allows
-	// when a process has no default.metallib.
-	return nil;
+	if (filepath == nil) {
+		if (error)
+			*error = RgfxMakeError(RgfxMetalErrorInvalidDescriptor, @"newLibraryWithFile: nil path");
+		return nil;
+	}
+	return [self newLibraryWithURL:[NSURL fileURLWithPath:filepath] error:error];
 }
 
 - (id<MTLLibrary>)newDefaultLibraryWithBundle:(NSBundle *)bundle
                                         error:(__autoreleasing NSError **)error
 {
-	(void)bundle;
-	if (error)
-		*error = RgfxMakeError(RgfxMetalErrorUnsupported,
-		                       @"newDefaultLibraryWithBundle: no default library in the bundle");
-	return nil;
+	// A bundle's default library is its default.metallib resource, as Metal finds it.
+	NSURL *url = [bundle URLForResource:@"default" withExtension:@"metallib"];
+	if (url == nil) {
+		rgfxLibraryDiag("default-missing", bundle.bundlePath, 0, NO);
+		if (error)
+			*error = RgfxMakeError(RgfxMetalErrorInvalidDescriptor,
+			                       [NSString stringWithFormat:@"no default.metallib in %@",
+			                                                  bundle.bundlePath]);
+		return nil;
+	}
+	return [self newLibraryWithURL:url error:error];
+}
+
+- (id<MTLLibrary>)newDefaultLibrary
+{
+	return [self newDefaultLibraryWithBundle:[NSBundle mainBundle] error:nil];
 }
 
 - (id<MTLLibrary>)newLibraryWithSource:(NSString *)source
