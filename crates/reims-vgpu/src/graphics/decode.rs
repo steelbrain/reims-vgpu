@@ -23,19 +23,21 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use reims_graphics::wire::{
     RGFX_CMD_BUFFER_CREATE, RGFX_CMD_DEPTH_STENCIL_CREATE, RGFX_CMD_EVENT_CREATE,
     RGFX_CMD_FENCE_CREATE, RGFX_CMD_LIBRARY_CREATE, RGFX_CMD_OBJECT_DESTROY, RGFX_CMD_QUEUE_CREATE,
-    RGFX_CMD_SAMPLER_CREATE, RGFX_CMD_SHARED_EVENT_CREATE, RGFX_LIBRARY_BYTES_OFFSET,
-    RgfxBufferCreate, RgfxDepthStencilCreate, RgfxLibraryCreate, RgfxMsgHeader, RgfxObjectCreate,
-    RgfxObjectDestroy, RgfxQueueCreate, RgfxSamplerCreate, RgfxSharedEventCreate,
-    RgfxStencilDescriptor,
+    RGFX_CMD_SAMPLER_CREATE, RGFX_CMD_SHARED_EVENT_CREATE, RGFX_CMD_TEXTURE_CREATE,
+    RGFX_LIBRARY_BYTES_OFFSET, RgfxBufferCreate, RgfxDepthStencilCreate, RgfxLibraryCreate,
+    RgfxMsgHeader, RgfxObjectCreate, RgfxObjectDestroy, RgfxQueueCreate, RgfxSamplerCreate,
+    RgfxSharedEventCreate, RgfxStencilDescriptor, RgfxTextureCreate, RgfxTextureDescriptor,
 };
 use reims_vgpu_core::platform::Platform;
 use reims_vgpu_core::platform::device::GpuDevice;
+use reims_vgpu_core::platform::types::Swizzle;
 use reims_vgpu_core::platform::values::{
-    BufferDesc, DepthStencilDesc, OptionSet, SamplerDesc, StencilDesc,
+    BufferDesc, DepthStencilDesc, OptionSet, SamplerDesc, StencilDesc, TextureDesc,
 };
 use reims_vgpu_core::raise::{OnFault, RaiseResult};
 use zerocopy::FromBytes;
@@ -52,6 +54,7 @@ enum ObjHandle<P: Platform> {
     Sampler(P::SamplerState),
     DepthStencil(P::DepthStencilState),
     Buffer(P::Buffer),
+    Texture(P::Texture),
 }
 
 /// Why a message was not carried out.
@@ -68,21 +71,19 @@ pub enum DecodeError {
 /// The stage-3 decoder for one device: the `obj_id` → handle table and the
 /// dispatch from a wire message to a `Platform` call.
 pub struct GraphicsDecoder<P: Platform> {
+    /// The platform whose device the decoder drives, held for the descriptor
+    /// builders ([`Platform::texture_descriptor`]) some per-device creates need.
+    platform: Arc<P>,
     objects: HashMap<u64, ObjHandle<P>>,
 }
 
-impl<P: Platform> Default for GraphicsDecoder<P> {
-    fn default() -> Self {
+impl<P: Platform> GraphicsDecoder<P> {
+    /// A new decoder for `platform`, with no objects.
+    pub fn new(platform: Arc<P>) -> Self {
         GraphicsDecoder {
+            platform,
             objects: HashMap::new(),
         }
-    }
-}
-
-impl<P: Platform> GraphicsDecoder<P> {
-    /// A new decoder with no objects.
-    pub fn new() -> Self {
-        Self::default()
     }
 
     /// The objects the table holds.
@@ -241,6 +242,27 @@ impl<P: Platform> GraphicsDecoder<P> {
                     None => Ok(Err(DecodeError::Refused)),
                 }
             }
+            RGFX_CMD_TEXTURE_CREATE => {
+                let Some(m) = read::<RgfxTextureCreate>(message) else {
+                    return Ok(Err(DecodeError::Malformed));
+                };
+                // Heap-placed textures land with the heap decode; this slice
+                // makes device-placed textures (`heap_obj_id` 0). The guest
+                // picks the resource id, pinned as the texture's resource index
+                // so its argument buffers name the same texture the host made.
+                if m.heap_obj_id != 0 {
+                    return Ok(Err(DecodeError::Refused));
+                }
+                let desc = texture_desc(&m.desc, m.resource_id);
+                // `texture_descriptor` forwards the raw pixel format, so a format
+                // Metal refuses aborts here; the guest bundle only ever sends one
+                // it read from a real descriptor.
+                let descriptor = self.platform.texture_descriptor(&desc);
+                match device.new_texture(OnFault::Return, &descriptor)? {
+                    Some(texture) => self.insert(m.obj_id, ObjHandle::Texture(texture)),
+                    None => Ok(Err(DecodeError::Refused)),
+                }
+            }
             _ => Ok(Err(DecodeError::UnknownCommand)),
         }
     }
@@ -260,6 +282,37 @@ impl<P: Platform> GraphicsDecoder<P> {
 /// short.
 fn read<T: FromBytes>(message: &[u8]) -> Option<T> {
     T::read_from_prefix(message).ok().map(|(t, _)| t)
+}
+
+/// The core texture descriptor values from a wire texture descriptor, with the
+/// guest-picked resource id pinned as the texture's resource index (the SPI the
+/// guest's argument buffers name it by). A 0 `resource_id` leaves the id to the
+/// platform, and a 0 swizzle leaves Metal's identity swizzle.
+fn texture_desc(d: &RgfxTextureDescriptor, resource_id: u64) -> TextureDesc {
+    TextureDesc {
+        texture_type: d.texture_type.into(),
+        pixel_format: d.pixel_format.into(),
+        width: d.width.into(),
+        height: d.height.into(),
+        depth: d.depth.into(),
+        mipmap_level_count: d.mipmap_level_count.into(),
+        sample_count: d.sample_count.into(),
+        array_length: d.array_length.into(),
+        usage: d.usage.into(),
+        resource_options: Some(d.options.into()),
+        // Four `MTLTextureSwizzle` channels packed one byte each, red lowest.
+        swizzle: (d.swizzle != 0).then(|| {
+            let [red, green, blue, alpha] = d.swizzle.to_le_bytes();
+            Swizzle {
+                red,
+                green,
+                blue,
+                alpha,
+            }
+        }),
+        resource_index: (resource_id != 0).then_some((resource_id, true)),
+        ..TextureDesc::default()
+    }
 }
 
 /// The core stencil descriptor for one face from its wire record.
@@ -290,7 +343,7 @@ mod tests {
     fn creates_and_destroys_the_state_objects() {
         let p = Arc::new(FakePlatform::new());
         let device = p.device();
-        let mut dec = GraphicsDecoder::<FakePlatform>::new();
+        let mut dec = GraphicsDecoder::<FakePlatform>::new(Arc::clone(&p));
 
         let obj = |ty: u32, obj_id: u64| RgfxObjectCreate {
             header: RgfxMsgHeader {
@@ -403,7 +456,37 @@ mod tests {
         };
         assert_eq!(dec.decode(&device, buffer.as_bytes()).unwrap(), Ok(()));
 
-        assert_eq!(dec.object_count(), 8);
+        // A device-placed render-target texture of a non-default shape, with its
+        // resource id pinned and the identity swizzle.
+        let texture = RgfxTextureCreate {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_TEXTURE_CREATE,
+                size: size_of::<RgfxTextureCreate>() as u32,
+                seqno: 0,
+            },
+            obj_id: 18,
+            gpu_address: 0x5_0000,
+            resource_id: 0x42,
+            heap_obj_id: 0,
+            heap_offset: 0,
+            desc: RgfxTextureDescriptor {
+                pixel_format: 80, // BGRA8Unorm
+                texture_type: 2,  // 2D
+                width: 1920,
+                height: 1200,
+                depth: 1,
+                mipmap_level_count: 1,
+                array_length: 1,
+                sample_count: 1,
+                usage: 4, // RenderTarget
+                options: 0,
+                swizzle: 0x0403_0201, // identity (red lowest)
+                reserved_2c: 0,
+            },
+        };
+        assert_eq!(dec.decode(&device, texture.as_bytes()).unwrap(), Ok(()));
+
+        assert_eq!(dec.object_count(), 9);
         let log = p.call_log();
         assert_eq!(log.calls_to("newEvent").len(), 1);
         assert_eq!(log.calls_to("newFence").len(), 1);
@@ -413,6 +496,7 @@ mod tests {
         assert_eq!(log.calls_to("newSamplerStateWithDescriptor:").len(), 1);
         assert_eq!(log.calls_to("newDepthStencilStateWithDescriptor:").len(), 1);
         assert_eq!(log.calls_to("newBufferWithDescriptor:").len(), 1);
+        assert_eq!(log.calls_to("newTextureWithDescriptor:").len(), 1);
 
         // Destroying the event drops its handle; the others stay.
         let destroy = RgfxObjectDestroy {
@@ -424,7 +508,7 @@ mod tests {
             obj_id: 10,
         };
         assert_eq!(dec.decode(&device, destroy.as_bytes()).unwrap(), Ok(()));
-        assert_eq!(dec.object_count(), 7);
+        assert_eq!(dec.object_count(), 8);
         // Destroying an id the host never made is not an error.
         assert_eq!(dec.decode(&device, destroy.as_bytes()).unwrap(), Ok(()));
 
