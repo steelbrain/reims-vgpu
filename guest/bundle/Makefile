@@ -59,6 +59,16 @@ OBJCXXFLAGS = -fobjc-arc \
 	-Wno-incomplete-implementation -Wno-unguarded-availability-new \
 	-Wno-deprecated-declarations -Wno-objc-protocol-method-implementation
 FRAMEWORKS  = -framework Metal -framework Foundation
+# The device shell subclasses IOGPUMetalDevice, whose ObjC class symbol
+# (_OBJC_CLASS_$_IOGPUMetalDevice) is a hard link-time dependency. It lives in
+# the private IOGPU framework, which the SDK ships a .tbd stub for. We link it
+# TWO-LEVEL (not dynamic_lookup) so the bundle records an LC_LOAD_DYLIB for
+# IOGPU and dyld auto-loads it at the bundle's load in the guest, resolving the
+# superclass — exactly as Apple's AppleParavirtGPUMetalIOGPUFamily.bundle does.
+# A flat-namespace dynamic_lookup of this symbol does NOT resolve when Metal
+# dlopens the plugin (Metal's process is two-level; IOGPU's symbols aren't in
+# the flat namespace), so the class never realises and MTLCopyAllDevices=0.
+PRIVFW      = -F $(SDK)/System/Library/PrivateFrameworks -framework IOGPU
 
 HEADERS      = $(wildcard src/*.hpp) $(wildcard src/*.h)
 TESTHEADERS  = $(wildcard tests/*.hpp)
@@ -126,15 +136,17 @@ test: $(SER_TESTBIN) $(SHELL_TESTBIN)
 	$(SHELL_TESTBIN)
 
 # --- the loadable bundle (x86_64, device shell included) ---------------------
-# Private base/SPI symbols resolve at load in the guest, so -undefined
-# dynamic_lookup; the bundle is built to prove it compiles + links, not to run.
+# The IOGPUMetalDevice superclass is linked two-level against IOGPU (PRIVFW), so
+# dyld auto-loads IOGPU and resolves the device shell's base class when Metal
+# dlopens the plugin in the guest. The remaining private Metal SPI (instance
+# methods, resolved via the base at runtime) stays -undefined dynamic_lookup.
 
 bundle: $(BUNDLEBIN)
 
 $(BUNDLEBIN): $(CORE_OBJ_ARCH) $(SHELL_OBJ_ARCH) Makefile
 	@mkdir -p $(@D)
 	$(CXX) -arch $(ARCH) $(CXXFLAGS) $(OBJCXXFLAGS) \
-		-bundle -undefined dynamic_lookup $(FRAMEWORKS) \
+		-bundle -undefined dynamic_lookup $(FRAMEWORKS) $(PRIVFW) \
 		$(CORE_OBJ_ARCH) $(SHELL_OBJ_ARCH) -o $@
 
 clean:
