@@ -4,16 +4,144 @@
 //! protocol"). The command-buffer walk ([`super::cmdbuf`]) routes every
 //! compute-group op (`tag >> 12 == `[`RGFX_OP_GROUP_COMPUTE`]) here.
 //!
-//! This is a stub: it handles no tag yet (returns `Ok(false)` for every one, so
-//! the walk faults an unrecognised compute op). The compute ops land here, one
-//! arm each, matching [`super::render`]'s pattern.
+//! Each arm reads its op's body with zerocopy, resolves its object references
+//! through the [object-resolution API](super) (`require_*`/`get_*`), and sends the
+//! matching [`ComputeCmd`] with [`ComputeEncoder::encode`]. A body too short for its
+//! op faults the exec ([`super::op_fault`]); a bad reference faults through the
+//! resolution API. The array-tailed ops ([`reims_graphics::ops::compute`], "Array-tailed
+//! ops") read a fixed head, then its `length`/`count` element records right after it.
+//!
+//! `endEncoding` has no arm here: the walk's `ENCODER_END` framing op ends the open
+//! compute encoder ([`super::cmdbuf`]).
 //!
 //! [`RGFX_OP_GROUP_COMPUTE`]: reims_graphics::ops::RGFX_OP_GROUP_COMPUTE
 
+use reims_graphics::ops::compute::{
+    RGFX_OP_COMPUTE_COMPRESSED_TEXTURE_REINTERPRETATION_FLUSH,
+    RGFX_OP_COMPUTE_DISPATCH_THREADGROUPS, RGFX_OP_COMPUTE_DISPATCH_THREADGROUPS_INDIRECT,
+    RGFX_OP_COMPUTE_DISPATCH_THREADS, RGFX_OP_COMPUTE_DISPATCH_THREADS_INDIRECT,
+    RGFX_OP_COMPUTE_ENCODE_START_DO_WHILE, RGFX_OP_COMPUTE_ENCODE_START_ELSE,
+    RGFX_OP_COMPUTE_ENCODE_START_IF, RGFX_OP_COMPUTE_ENCODE_START_WHILE,
+    RGFX_OP_COMPUTE_EXECUTE_COMMANDS_IN_BUFFER, RGFX_OP_COMPUTE_EXECUTE_COMMANDS_INDIRECT,
+    RGFX_OP_COMPUTE_MEMORY_BARRIER_RESOURCES, RGFX_OP_COMPUTE_MEMORY_BARRIER_SCOPE,
+    RGFX_OP_COMPUTE_SET_BUFFER_OFFSET, RGFX_OP_COMPUTE_SET_BUFFER_OFFSET_ATTRIBUTE_STRIDE,
+    RGFX_OP_COMPUTE_SET_BUFFERS, RGFX_OP_COMPUTE_SET_BUFFERS_ATTRIBUTE_STRIDES,
+    RGFX_OP_COMPUTE_SET_COMPUTE_PIPELINE_STATE, RGFX_OP_COMPUTE_SET_IMAGEBLOCK_WIDTH,
+    RGFX_OP_COMPUTE_SET_SAMPLER_STATES, RGFX_OP_COMPUTE_SET_SAMPLER_STATES_LOD_CLAMPS,
+    RGFX_OP_COMPUTE_SET_STAGE_IN_REGION, RGFX_OP_COMPUTE_SET_STAGE_IN_REGION_INDIRECT,
+    RGFX_OP_COMPUTE_SET_TEXTURE, RGFX_OP_COMPUTE_SET_TEXTURES,
+    RGFX_OP_COMPUTE_SET_THREADGROUP_MEMORY_LENGTH, RGFX_OP_COMPUTE_UPDATE_FENCE,
+    RGFX_OP_COMPUTE_USE_HEAPS, RGFX_OP_COMPUTE_USE_RESOURCES, RGFX_OP_COMPUTE_WAIT_FOR_FENCE,
+    RGFX_RESOURCE_KIND_BUFFER, RGFX_RESOURCE_KIND_ICB, RGFX_RESOURCE_KIND_NONE,
+    RGFX_RESOURCE_KIND_TEXTURE, RgfxComputeBufferBinding, RgfxComputeBufferStrideBinding,
+    RgfxComputeHeapBinding, RgfxComputeResourceRef, RgfxComputeSamplerBinding,
+    RgfxComputeSamplerLodBinding, RgfxComputeTextureBinding, RgfxOpDispatchThreadgroups,
+    RgfxOpDispatchThreadgroupsIndirect, RgfxOpDispatchThreads, RgfxOpDispatchThreadsIndirect,
+    RgfxOpEncodeStartIf, RgfxOpEncodeStartWhile, RgfxOpExecuteCommandsInBuffer,
+    RgfxOpExecuteCommandsIndirect, RgfxOpMemoryBarrierResources, RgfxOpMemoryBarrierScope,
+    RgfxOpSetBufferOffset, RgfxOpSetBufferOffsetAttributeStride, RgfxOpSetBuffers,
+    RgfxOpSetBuffersAttributeStrides, RgfxOpSetComputePipelineState, RgfxOpSetImageblockWidth,
+    RgfxOpSetSamplerStates, RgfxOpSetSamplerStatesLodClamps, RgfxOpSetStageInRegion,
+    RgfxOpSetStageInRegionIndirect, RgfxOpSetTexture, RgfxOpSetTextures,
+    RgfxOpSetThreadgroupMemoryLength, RgfxOpUpdateFence, RgfxOpUseHeaps, RgfxOpUseResources,
+    RgfxOpWaitForFence,
+};
 use reims_vgpu_core::platform::Platform;
+use reims_vgpu_core::platform::blit::ResourceRef;
+use reims_vgpu_core::platform::compute::{ComputeCmd, ComputeEncoder};
+use reims_vgpu_core::platform::types::{MtlOrigin, MtlRegion, MtlSize, NsRange};
 use reims_vgpu_core::raise::{OnFault, RaiseResult};
+use zerocopy::{FromBytes, Immutable};
 
-use super::GraphicsDecoder;
+use super::{GraphicsDecoder, op_fault};
+
+/// Reads op body `T` from the start of `payload`, or an exec fault when it is too
+/// short.
+fn body<T: FromBytes>(tag: u16, payload: &[u8]) -> RaiseResult<T> {
+    match T::read_from_prefix(payload) {
+        Ok((t, _)) => Ok(t),
+        Err(_) => Err(op_fault(format_args!(
+            "compute op {tag:#06x}: body too short"
+        ))),
+    }
+}
+
+/// Reads the `count` element records of `E` that follow a head of `head_len` bytes
+/// in `payload`, or an exec fault when the body is too short for them.
+fn tail<E: FromBytes + Immutable>(
+    tag: u16,
+    payload: &[u8],
+    head_len: usize,
+    count: usize,
+) -> RaiseResult<Vec<E>> {
+    let stride = size_of::<E>();
+    let short = || {
+        op_fault(format_args!(
+            "compute op {tag:#06x}: body too short for its records"
+        ))
+    };
+    let span = count.checked_mul(stride).ok_or_else(short)?;
+    let end = head_len.checked_add(span).ok_or_else(short)?;
+    let records = payload.get(head_len..end).ok_or_else(short)?;
+    let mut out = Vec::with_capacity(count);
+    for chunk in records.chunks_exact(stride) {
+        out.push(E::read_from_bytes(chunk).map_err(|_| short())?);
+    }
+    Ok(out)
+}
+
+/// A resource reference held by value while its [`ResourceRef`] borrows it for the
+/// encode: `useResources:` and `memoryBarrierWithResources:` take a mixed array of
+/// buffers, textures and indirect command buffers.
+enum OwnedResource<P: Platform> {
+    Buffer(P::Buffer),
+    Texture(P::Texture),
+    Icb(P::Icb),
+}
+
+impl<P: Platform> OwnedResource<P> {
+    /// A borrowed reference to this resource.
+    fn as_ref(&self) -> ResourceRef<'_, P> {
+        match self {
+            OwnedResource::Buffer(b) => ResourceRef::Buffer(b),
+            OwnedResource::Texture(t) => ResourceRef::Texture(t),
+            OwnedResource::Icb(i) => ResourceRef::Icb(i),
+        }
+    }
+}
+
+/// Resolves one wire resource record: a nil kind is `None`, each other kind
+/// resolves `obj_id` through its resolver (a miss or wrong kind faults), and an
+/// unknown kind faults the exec.
+fn resolve_resource<P: Platform>(
+    objs: &GraphicsDecoder<P>,
+    rec: &RgfxComputeResourceRef,
+) -> RaiseResult<Option<OwnedResource<P>>> {
+    match rec.kind {
+        RGFX_RESOURCE_KIND_NONE => Ok(None),
+        RGFX_RESOURCE_KIND_BUFFER => Ok(Some(OwnedResource::Buffer(
+            objs.require_buffer(rec.obj_id)?,
+        ))),
+        RGFX_RESOURCE_KIND_TEXTURE => Ok(Some(OwnedResource::Texture(
+            objs.require_texture(rec.obj_id)?,
+        ))),
+        RGFX_RESOURCE_KIND_ICB => Ok(Some(OwnedResource::Icb(
+            objs.require_indirect_command_buffer(rec.obj_id)?,
+        ))),
+        other => Err(op_fault(format_args!(
+            "compute op: unknown resource kind {other}"
+        ))),
+    }
+}
+
+/// Resolves a wire resource array into owned handles the caller borrows for the
+/// encode.
+fn resolve_resources<P: Platform>(
+    objs: &GraphicsDecoder<P>,
+    recs: &[RgfxComputeResourceRef],
+) -> RaiseResult<Vec<Option<OwnedResource<P>>>> {
+    recs.iter().map(|r| resolve_resource(objs, r)).collect()
+}
 
 /// Decodes one compute-encoder op: `tag` its op, `payload` its body (the bytes
 /// after the [`RgfxOpHeader`](reims_graphics::ops::RgfxOpHeader)). `objs` resolves
@@ -27,7 +155,880 @@ pub(crate) fn decode_op<P: Platform>(
     enc: &P::ComputeEncoder,
     on: OnFault,
 ) -> RaiseResult<bool> {
-    // No compute op is decoded yet; the walk faults every compute-group op.
-    let _ = (tag, payload, objs, enc, on);
-    Ok(false)
+    match tag {
+        RGFX_OP_COMPUTE_SET_COMPUTE_PIPELINE_STATE => {
+            let m: RgfxOpSetComputePipelineState = body(tag, payload)?;
+            let state = objs.get_compute_pipeline(m.pipeline_obj_id)?;
+            enc.encode(
+                on,
+                ComputeCmd::SetComputePipelineState {
+                    state: state.as_ref(),
+                },
+            )?;
+        }
+        RGFX_OP_COMPUTE_SET_BUFFER_OFFSET => {
+            let m: RgfxOpSetBufferOffset = body(tag, payload)?;
+            enc.encode(
+                on,
+                ComputeCmd::SetBufferOffset {
+                    offset: m.offset,
+                    index: m.index,
+                },
+            )?;
+        }
+        RGFX_OP_COMPUTE_SET_BUFFER_OFFSET_ATTRIBUTE_STRIDE => {
+            let m: RgfxOpSetBufferOffsetAttributeStride = body(tag, payload)?;
+            enc.encode(
+                on,
+                ComputeCmd::SetBufferOffsetAttributeStride {
+                    offset: m.offset,
+                    stride: m.stride,
+                    index: m.index,
+                },
+            )?;
+        }
+        RGFX_OP_COMPUTE_SET_BUFFERS => {
+            let m: RgfxOpSetBuffers = body(tag, payload)?;
+            let recs: Vec<RgfxComputeBufferBinding> = tail(
+                tag,
+                payload,
+                size_of::<RgfxOpSetBuffers>(),
+                m.length as usize,
+            )?;
+            let owned: Vec<Option<P::Buffer>> = recs
+                .iter()
+                .map(|r| objs.get_buffer(r.buffer_obj_id))
+                .collect::<RaiseResult<_>>()?;
+            let buffers: Vec<Option<&P::Buffer>> = owned.iter().map(Option::as_ref).collect();
+            let offsets: Vec<u64> = recs.iter().map(|r| r.offset).collect();
+            enc.encode(
+                on,
+                ComputeCmd::SetBuffers {
+                    buffers: &buffers,
+                    offsets: &offsets,
+                    range: NsRange::new(m.location, m.length),
+                },
+            )?;
+        }
+        RGFX_OP_COMPUTE_SET_BUFFERS_ATTRIBUTE_STRIDES => {
+            let m: RgfxOpSetBuffersAttributeStrides = body(tag, payload)?;
+            let recs: Vec<RgfxComputeBufferStrideBinding> = tail(
+                tag,
+                payload,
+                size_of::<RgfxOpSetBuffersAttributeStrides>(),
+                m.length as usize,
+            )?;
+            let owned: Vec<Option<P::Buffer>> = recs
+                .iter()
+                .map(|r| objs.get_buffer(r.buffer_obj_id))
+                .collect::<RaiseResult<_>>()?;
+            let buffers: Vec<Option<&P::Buffer>> = owned.iter().map(Option::as_ref).collect();
+            let offsets: Vec<u64> = recs.iter().map(|r| r.offset).collect();
+            let strides: Vec<u64> = recs.iter().map(|r| r.stride).collect();
+            enc.encode(
+                on,
+                ComputeCmd::SetBuffersAttributeStrides {
+                    buffers: &buffers,
+                    offsets: &offsets,
+                    strides: &strides,
+                    range: NsRange::new(m.location, m.length),
+                },
+            )?;
+        }
+        RGFX_OP_COMPUTE_SET_TEXTURE => {
+            let m: RgfxOpSetTexture = body(tag, payload)?;
+            let texture = objs.get_texture(m.texture_obj_id)?;
+            enc.encode(
+                on,
+                ComputeCmd::SetTexture {
+                    texture: texture.as_ref(),
+                    index: m.index,
+                },
+            )?;
+        }
+        RGFX_OP_COMPUTE_SET_TEXTURES => {
+            let m: RgfxOpSetTextures = body(tag, payload)?;
+            let recs: Vec<RgfxComputeTextureBinding> = tail(
+                tag,
+                payload,
+                size_of::<RgfxOpSetTextures>(),
+                m.length as usize,
+            )?;
+            let owned: Vec<Option<P::Texture>> = recs
+                .iter()
+                .map(|r| objs.get_texture(r.texture_obj_id))
+                .collect::<RaiseResult<_>>()?;
+            let textures: Vec<Option<&P::Texture>> = owned.iter().map(Option::as_ref).collect();
+            enc.encode(
+                on,
+                ComputeCmd::SetTextures {
+                    textures: &textures,
+                    range: NsRange::new(m.location, m.length),
+                },
+            )?;
+        }
+        RGFX_OP_COMPUTE_SET_SAMPLER_STATES => {
+            let m: RgfxOpSetSamplerStates = body(tag, payload)?;
+            let recs: Vec<RgfxComputeSamplerBinding> = tail(
+                tag,
+                payload,
+                size_of::<RgfxOpSetSamplerStates>(),
+                m.length as usize,
+            )?;
+            let owned: Vec<Option<P::SamplerState>> = recs
+                .iter()
+                .map(|r| objs.get_sampler(r.sampler_obj_id))
+                .collect::<RaiseResult<_>>()?;
+            let samplers: Vec<Option<&P::SamplerState>> =
+                owned.iter().map(Option::as_ref).collect();
+            enc.encode(
+                on,
+                ComputeCmd::SetSamplerStates {
+                    samplers: &samplers,
+                    range: NsRange::new(m.location, m.length),
+                },
+            )?;
+        }
+        RGFX_OP_COMPUTE_SET_SAMPLER_STATES_LOD_CLAMPS => {
+            let m: RgfxOpSetSamplerStatesLodClamps = body(tag, payload)?;
+            let recs: Vec<RgfxComputeSamplerLodBinding> = tail(
+                tag,
+                payload,
+                size_of::<RgfxOpSetSamplerStatesLodClamps>(),
+                m.length as usize,
+            )?;
+            let owned: Vec<Option<P::SamplerState>> = recs
+                .iter()
+                .map(|r| objs.get_sampler(r.sampler_obj_id))
+                .collect::<RaiseResult<_>>()?;
+            let samplers: Vec<Option<&P::SamplerState>> =
+                owned.iter().map(Option::as_ref).collect();
+            let lod_min: Vec<f32> = recs
+                .iter()
+                .map(|r| f32::from_bits(r.lod_min_clamp_bits))
+                .collect();
+            let lod_max: Vec<f32> = recs
+                .iter()
+                .map(|r| f32::from_bits(r.lod_max_clamp_bits))
+                .collect();
+            enc.encode(
+                on,
+                ComputeCmd::SetSamplerStatesLodClamps {
+                    samplers: &samplers,
+                    lod_min_clamps: &lod_min,
+                    lod_max_clamps: &lod_max,
+                    range: NsRange::new(m.location, m.length),
+                },
+            )?;
+        }
+        RGFX_OP_COMPUTE_SET_THREADGROUP_MEMORY_LENGTH => {
+            let m: RgfxOpSetThreadgroupMemoryLength = body(tag, payload)?;
+            enc.encode(
+                on,
+                ComputeCmd::SetThreadgroupMemoryLength {
+                    length: m.length,
+                    index: m.index,
+                },
+            )?;
+        }
+        RGFX_OP_COMPUTE_SET_STAGE_IN_REGION => {
+            let m: RgfxOpSetStageInRegion = body(tag, payload)?;
+            enc.encode(
+                on,
+                ComputeCmd::SetStageInRegion {
+                    region: MtlRegion::new(
+                        MtlOrigin::new(m.origin_x, m.origin_y, m.origin_z),
+                        MtlSize::new(m.width, m.height, m.depth),
+                    ),
+                },
+            )?;
+        }
+        RGFX_OP_COMPUTE_SET_STAGE_IN_REGION_INDIRECT => {
+            let m: RgfxOpSetStageInRegionIndirect = body(tag, payload)?;
+            // The indirect buffer must name an object (nil faults the stream).
+            let indirect_buffer = objs.require_buffer(m.indirect_buffer_obj_id)?;
+            enc.encode(
+                on,
+                ComputeCmd::SetStageInRegionIndirect {
+                    indirect_buffer: &indirect_buffer,
+                    indirect_buffer_offset: m.indirect_buffer_offset,
+                },
+            )?;
+        }
+        RGFX_OP_COMPUTE_SET_IMAGEBLOCK_WIDTH => {
+            let m: RgfxOpSetImageblockWidth = body(tag, payload)?;
+            enc.encode(
+                on,
+                ComputeCmd::SetImageblockWidth {
+                    width: m.width,
+                    height: m.height,
+                },
+            )?;
+        }
+        RGFX_OP_COMPUTE_DISPATCH_THREADGROUPS => {
+            let m: RgfxOpDispatchThreadgroups = body(tag, payload)?;
+            enc.encode(
+                on,
+                ComputeCmd::DispatchThreadgroups {
+                    threadgroups_per_grid: MtlSize::new(
+                        m.threadgroups_width,
+                        m.threadgroups_height,
+                        m.threadgroups_depth,
+                    ),
+                    threads_per_threadgroup: MtlSize::new(
+                        m.threads_width,
+                        m.threads_height,
+                        m.threads_depth,
+                    ),
+                },
+            )?;
+        }
+        RGFX_OP_COMPUTE_DISPATCH_THREADGROUPS_INDIRECT => {
+            let m: RgfxOpDispatchThreadgroupsIndirect = body(tag, payload)?;
+            let indirect_buffer = objs.get_buffer(m.indirect_buffer_obj_id)?;
+            enc.encode(
+                on,
+                ComputeCmd::DispatchThreadgroupsIndirect {
+                    indirect_buffer: indirect_buffer.as_ref(),
+                    indirect_buffer_offset: m.indirect_buffer_offset,
+                    threads_per_threadgroup: MtlSize::new(
+                        m.threads_width,
+                        m.threads_height,
+                        m.threads_depth,
+                    ),
+                },
+            )?;
+        }
+        RGFX_OP_COMPUTE_DISPATCH_THREADS => {
+            let m: RgfxOpDispatchThreads = body(tag, payload)?;
+            enc.encode(
+                on,
+                ComputeCmd::DispatchThreads {
+                    threads_per_grid: MtlSize::new(m.grid_width, m.grid_height, m.grid_depth),
+                    threads_per_threadgroup: MtlSize::new(
+                        m.threads_width,
+                        m.threads_height,
+                        m.threads_depth,
+                    ),
+                },
+            )?;
+        }
+        RGFX_OP_COMPUTE_DISPATCH_THREADS_INDIRECT => {
+            let m: RgfxOpDispatchThreadsIndirect = body(tag, payload)?;
+            let indirect_buffer = objs.get_buffer(m.indirect_buffer_obj_id)?;
+            enc.encode(
+                on,
+                ComputeCmd::DispatchThreadsIndirect {
+                    indirect_buffer: indirect_buffer.as_ref(),
+                    indirect_buffer_offset: m.indirect_buffer_offset,
+                },
+            )?;
+        }
+        RGFX_OP_COMPUTE_USE_RESOURCES => {
+            let m: RgfxOpUseResources = body(tag, payload)?;
+            let recs: Vec<RgfxComputeResourceRef> = tail(
+                tag,
+                payload,
+                size_of::<RgfxOpUseResources>(),
+                m.count as usize,
+            )?;
+            let owned = resolve_resources(objs, &recs)?;
+            let resources: Vec<Option<ResourceRef<'_, P>>> = owned
+                .iter()
+                .map(|o| o.as_ref().map(OwnedResource::as_ref))
+                .collect();
+            enc.encode(
+                on,
+                ComputeCmd::UseResources {
+                    resources: &resources,
+                    usage: m.usage,
+                },
+            )?;
+        }
+        RGFX_OP_COMPUTE_USE_HEAPS => {
+            let m: RgfxOpUseHeaps = body(tag, payload)?;
+            let recs: Vec<RgfxComputeHeapBinding> =
+                tail(tag, payload, size_of::<RgfxOpUseHeaps>(), m.count as usize)?;
+            let owned: Vec<Option<P::Heap>> = recs
+                .iter()
+                .map(|r| objs.get_heap(r.heap_obj_id))
+                .collect::<RaiseResult<_>>()?;
+            let heaps: Vec<Option<&P::Heap>> = owned.iter().map(Option::as_ref).collect();
+            enc.encode(on, ComputeCmd::UseHeaps { heaps: &heaps })?;
+        }
+        RGFX_OP_COMPUTE_MEMORY_BARRIER_RESOURCES => {
+            let m: RgfxOpMemoryBarrierResources = body(tag, payload)?;
+            let recs: Vec<RgfxComputeResourceRef> = tail(
+                tag,
+                payload,
+                size_of::<RgfxOpMemoryBarrierResources>(),
+                m.count as usize,
+            )?;
+            let owned = resolve_resources(objs, &recs)?;
+            let resources: Vec<Option<ResourceRef<'_, P>>> = owned
+                .iter()
+                .map(|o| o.as_ref().map(OwnedResource::as_ref))
+                .collect();
+            enc.encode(
+                on,
+                ComputeCmd::MemoryBarrierWithResources {
+                    resources: &resources,
+                },
+            )?;
+        }
+        RGFX_OP_COMPUTE_MEMORY_BARRIER_SCOPE => {
+            let m: RgfxOpMemoryBarrierScope = body(tag, payload)?;
+            enc.encode(on, ComputeCmd::MemoryBarrierWithScope { scope: m.scope })?;
+        }
+        RGFX_OP_COMPUTE_UPDATE_FENCE => {
+            let m: RgfxOpUpdateFence = body(tag, payload)?;
+            // The fence must name an object (nil faults the stream).
+            let fence = objs.require_fence(m.fence_obj_id)?;
+            enc.encode(on, ComputeCmd::UpdateFence { fence: &fence })?;
+        }
+        RGFX_OP_COMPUTE_WAIT_FOR_FENCE => {
+            let m: RgfxOpWaitForFence = body(tag, payload)?;
+            // The fence must name an object (nil faults the stream).
+            let fence = objs.require_fence(m.fence_obj_id)?;
+            enc.encode(on, ComputeCmd::WaitForFence { fence: &fence })?;
+        }
+        RGFX_OP_COMPUTE_EXECUTE_COMMANDS_INDIRECT => {
+            let m: RgfxOpExecuteCommandsIndirect = body(tag, payload)?;
+            // Both the ICB and the range buffer must name an object.
+            let icb = objs.require_indirect_command_buffer(m.indirect_commandbuffer_obj_id)?;
+            let range_buffer = objs.require_buffer(m.indirect_range_buffer_obj_id)?;
+            enc.encode(
+                on,
+                ComputeCmd::ExecuteCommandsIndirect {
+                    indirect_commandbuffer: &icb,
+                    indirect_range_buffer: &range_buffer,
+                    indirect_buffer_offset: m.indirect_buffer_offset,
+                },
+            )?;
+        }
+        RGFX_OP_COMPUTE_EXECUTE_COMMANDS_IN_BUFFER => {
+            let m: RgfxOpExecuteCommandsInBuffer = body(tag, payload)?;
+            // The ICB must name an object.
+            let icb = objs.require_indirect_command_buffer(m.indirect_command_buffer_obj_id)?;
+            enc.encode(
+                on,
+                ComputeCmd::ExecuteCommandsInBuffer {
+                    indirect_command_buffer: &icb,
+                    execution_range: NsRange::new(m.location, m.length),
+                },
+            )?;
+        }
+        RGFX_OP_COMPUTE_ENCODE_START_IF => {
+            let m: RgfxOpEncodeStartIf = body(tag, payload)?;
+            let buffer = objs.get_buffer(m.buffer_obj_id)?;
+            enc.encode(
+                on,
+                ComputeCmd::EncodeStartIf {
+                    buffer: buffer.as_ref(),
+                    offset: m.offset,
+                    comparison: m.comparison,
+                    reference_value: m.reference_value,
+                },
+            )?;
+        }
+        RGFX_OP_COMPUTE_ENCODE_START_WHILE => {
+            let m: RgfxOpEncodeStartWhile = body(tag, payload)?;
+            let buffer = objs.get_buffer(m.buffer_obj_id)?;
+            enc.encode(
+                on,
+                ComputeCmd::EncodeStartWhile {
+                    buffer: buffer.as_ref(),
+                    offset: m.offset,
+                    comparison: m.comparison,
+                    reference_value: m.reference_value,
+                },
+            )?;
+        }
+        RGFX_OP_COMPUTE_ENCODE_START_ELSE => {
+            enc.encode(on, ComputeCmd::EncodeStartElse)?;
+        }
+        RGFX_OP_COMPUTE_ENCODE_START_DO_WHILE => {
+            enc.encode(on, ComputeCmd::EncodeStartDoWhile)?;
+        }
+        RGFX_OP_COMPUTE_COMPRESSED_TEXTURE_REINTERPRETATION_FLUSH => {
+            enc.encode(on, ComputeCmd::CompressedTextureReinterpretationFlush)?;
+        }
+        _ => return Ok(false),
+    }
+    Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use reims_graphics::wire::{
+        RGFX_CMD_BUFFER_CREATE, RGFX_CMD_FENCE_CREATE, RGFX_CMD_QUEUE_CREATE,
+        RGFX_CMD_TEXTURE_CREATE, RgfxBufferCreate, RgfxMsgHeader, RgfxObjectCreate,
+        RgfxQueueCreate, RgfxTextureCreate, RgfxTextureDescriptor,
+    };
+    use reims_vgpu_core::platform::Handle;
+    use reims_vgpu_core::platform::command::{CommandBuffer, CommandQueue};
+    use reims_vgpu_core::platform::device::GpuDevice;
+    use reims_vgpu_core::platform::values::ComputePassDesc;
+    use reims_vgpu_core::raise::OnFault;
+    use reims_vgpu_core::testkit::FakePlatform;
+    use reims_vgpu_core::testkit::calllog::Arg;
+    use zerocopy::IntoBytes;
+
+    use super::*;
+
+    /// A decoder with a queue (1), two buffers (2, 3), a texture (4) and a fence (5)
+    /// created, plus an open compute encoder on a fresh command buffer.
+    fn setup() -> (
+        Arc<FakePlatform>,
+        GraphicsDecoder<FakePlatform>,
+        <FakePlatform as Platform>::ComputeEncoder,
+    ) {
+        let p = Arc::new(FakePlatform::new());
+        let device = p.device();
+        let mut dec = GraphicsDecoder::<FakePlatform>::new(Arc::clone(&p));
+
+        let queue = RgfxQueueCreate {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_QUEUE_CREATE,
+                size: size_of::<RgfxQueueCreate>() as u32,
+                seqno: 0,
+            },
+            obj_id: 1,
+            ..RgfxQueueCreate::default()
+        };
+        assert_eq!(dec.decode(&device, queue.as_bytes()).unwrap(), Ok(()));
+
+        for id in [2, 3] {
+            let b = RgfxBufferCreate {
+                header: RgfxMsgHeader {
+                    r#type: RGFX_CMD_BUFFER_CREATE,
+                    size: size_of::<RgfxBufferCreate>() as u32,
+                    seqno: 0,
+                },
+                obj_id: id,
+                length: 65536,
+                ..RgfxBufferCreate::default()
+            };
+            assert_eq!(dec.decode(&device, b.as_bytes()).unwrap(), Ok(()));
+        }
+
+        let t = RgfxTextureCreate {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_TEXTURE_CREATE,
+                size: size_of::<RgfxTextureCreate>() as u32,
+                seqno: 0,
+            },
+            obj_id: 4,
+            desc: RgfxTextureDescriptor {
+                pixel_format: 80,
+                texture_type: 2,
+                width: 64,
+                height: 64,
+                depth: 1,
+                mipmap_level_count: 1,
+                array_length: 1,
+                sample_count: 1,
+                usage: 5,
+                ..RgfxTextureDescriptor::default()
+            },
+            ..RgfxTextureCreate::default()
+        };
+        assert_eq!(dec.decode(&device, t.as_bytes()).unwrap(), Ok(()));
+
+        let fence = RgfxObjectCreate {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_FENCE_CREATE,
+                size: size_of::<RgfxObjectCreate>() as u32,
+                seqno: 0,
+            },
+            obj_id: 5,
+        };
+        assert_eq!(dec.decode(&device, fence.as_bytes()).unwrap(), Ok(()));
+
+        // An open compute encoder on a fresh command buffer from the queue.
+        let queue_handle = p.device().new_command_queue().unwrap();
+        let cb = queue_handle
+            .command_buffer(OnFault::Return)
+            .unwrap()
+            .unwrap();
+        let enc = cb
+            .compute_encoder_for_pass(&ComputePassDesc::default())
+            .unwrap()
+            .unwrap();
+        (p, dec, enc)
+    }
+
+    /// The fake `ObjId` of the object the decoder holds under guest `obj_id`
+    /// `id`, as a non-nil object argument.
+    fn buffer_arg(dec: &GraphicsDecoder<FakePlatform>, id: u64) -> Arg {
+        Arg::Obj(Some(dec.require_buffer(id).unwrap().id()))
+    }
+
+    /// One op body of bytes to the decoder, asserting it was handled.
+    fn drive(
+        dec: &GraphicsDecoder<FakePlatform>,
+        enc: &<FakePlatform as Platform>::ComputeEncoder,
+        tag: u16,
+        body: &[u8],
+    ) {
+        assert!(decode_op(tag, body, dec, enc, OnFault::Return).unwrap());
+    }
+
+    /// Each scalar compute op drives its selector with its arguments.
+    #[test]
+    fn scalar_ops_drive_the_encoder() {
+        let (p, dec, enc) = setup();
+        let mark = p.call_log().mark();
+
+        drive(
+            &dec,
+            &enc,
+            RGFX_OP_COMPUTE_SET_BUFFER_OFFSET,
+            RgfxOpSetBufferOffset {
+                offset: 128,
+                index: 2,
+            }
+            .as_bytes(),
+        );
+        drive(
+            &dec,
+            &enc,
+            RGFX_OP_COMPUTE_DISPATCH_THREADGROUPS,
+            RgfxOpDispatchThreadgroups {
+                threadgroups_width: 16,
+                threadgroups_height: 8,
+                threadgroups_depth: 1,
+                threads_width: 32,
+                threads_height: 1,
+                threads_depth: 1,
+            }
+            .as_bytes(),
+        );
+        drive(
+            &dec,
+            &enc,
+            RGFX_OP_COMPUTE_SET_STAGE_IN_REGION,
+            RgfxOpSetStageInRegion {
+                origin_x: 0,
+                origin_y: 0,
+                origin_z: 0,
+                width: 64,
+                height: 64,
+                depth: 1,
+            }
+            .as_bytes(),
+        );
+        drive(
+            &dec,
+            &enc,
+            RGFX_OP_COMPUTE_MEMORY_BARRIER_SCOPE,
+            RgfxOpMemoryBarrierScope { scope: 3 }.as_bytes(),
+        );
+        drive(&dec, &enc, RGFX_OP_COMPUTE_ENCODE_START_ELSE, &[]);
+
+        let sels: Vec<&str> = p.call_log().sels_since(mark);
+        assert_eq!(
+            sels,
+            vec![
+                "setBufferOffset:atIndex:",
+                "dispatchThreadgroups:threadsPerThreadgroup:",
+                "setStageInRegion:",
+                "memoryBarrierWithScope:",
+                "encodeStartElse",
+            ]
+        );
+
+        // The dispatch sent the two sizes as its arguments.
+        let dispatch = p
+            .call_log()
+            .calls_to("dispatchThreadgroups:threadsPerThreadgroup:");
+        assert_eq!(dispatch.len(), 1);
+        assert_eq!(
+            dispatch[0].args,
+            vec![
+                Arg::val(&MtlSize::new(16, 8, 1)),
+                Arg::val(&MtlSize::new(32, 1, 1)),
+            ]
+        );
+    }
+
+    /// A compute op resolves its object references and sends the handle.
+    #[test]
+    fn set_texture_resolves_its_reference() {
+        let (p, dec, enc) = setup();
+        let mark = p.call_log().mark();
+        drive(
+            &dec,
+            &enc,
+            RGFX_OP_COMPUTE_SET_TEXTURE,
+            RgfxOpSetTexture {
+                texture_obj_id: 4,
+                index: 1,
+            }
+            .as_bytes(),
+        );
+        let calls = p.call_log().calls_to("setTexture:atIndex:");
+        assert_eq!(calls.len(), 1);
+        let want = Arg::Obj(Some(dec.require_texture(4).unwrap().id()));
+        assert_eq!(calls[0].args, vec![want, Arg::U64(1)]);
+        let _ = mark;
+    }
+
+    /// An update/wait fence op resolves its required reference.
+    #[test]
+    fn fence_ops_resolve_their_reference() {
+        let (p, dec, enc) = setup();
+        drive(
+            &dec,
+            &enc,
+            RGFX_OP_COMPUTE_UPDATE_FENCE,
+            RgfxOpUpdateFence { fence_obj_id: 5 }.as_bytes(),
+        );
+        let want = Arg::Obj(Some(dec.require_fence(5).unwrap().id()));
+        assert_eq!(p.call_log().calls_to("updateFence:")[0].args, vec![want]);
+    }
+
+    /// An array-tailed `setBuffers:` reads its head and element records, resolves
+    /// each buffer (a nil entry kept), and sends the arrays and range.
+    #[test]
+    fn set_buffers_decodes_its_tail() {
+        let (p, dec, enc) = setup();
+        let mut msg = RgfxOpSetBuffers {
+            location: 3,
+            length: 3,
+        }
+        .as_bytes()
+        .to_vec();
+        for (buffer_obj_id, offset) in [(2u64, 0u64), (0, 0), (3, 512)] {
+            msg.extend_from_slice(
+                RgfxComputeBufferBinding {
+                    buffer_obj_id,
+                    offset,
+                }
+                .as_bytes(),
+            );
+        }
+        drive(&dec, &enc, RGFX_OP_COMPUTE_SET_BUFFERS, &msg);
+
+        let calls = p.call_log().calls_to("setBuffers:offsets:withRange:");
+        assert_eq!(calls.len(), 1);
+        let b2 = dec.require_buffer(2).unwrap().id();
+        let b3 = dec.require_buffer(3).unwrap().id();
+        assert_eq!(
+            calls[0].args,
+            vec![
+                Arg::Objs(vec![Some(b2), None, Some(b3)]),
+                Arg::U64s(vec![0, 0, 512]),
+                Arg::val(&NsRange::new(3, 3)),
+            ]
+        );
+    }
+
+    /// `setSamplerStates:lodMinClamps:lodMaxClamps:withRange:` carries the LOD clamps
+    /// as f32 from their bits.
+    #[test]
+    fn sampler_lod_clamps_decode() {
+        let (p, dec, enc) = setup();
+        let mut msg = RgfxOpSetSamplerStatesLodClamps {
+            location: 0,
+            length: 1,
+        }
+        .as_bytes()
+        .to_vec();
+        msg.extend_from_slice(
+            RgfxComputeSamplerLodBinding {
+                sampler_obj_id: 0, // nil sampler
+                lod_min_clamp_bits: 0.5f32.to_bits(),
+                lod_max_clamp_bits: 7.0f32.to_bits(),
+            }
+            .as_bytes(),
+        );
+        drive(
+            &dec,
+            &enc,
+            RGFX_OP_COMPUTE_SET_SAMPLER_STATES_LOD_CLAMPS,
+            &msg,
+        );
+        let calls = p
+            .call_log()
+            .calls_to("setSamplerStates:lodMinClamps:lodMaxClamps:withRange:");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].args,
+            vec![
+                Arg::Objs(vec![None]),
+                Arg::F32s(vec![0.5]),
+                Arg::F32s(vec![7.0]),
+                Arg::val(&NsRange::new(0, 1)),
+            ]
+        );
+    }
+
+    /// A mixed `useResources:count:usage:` resolves a buffer and a texture by their
+    /// wire kind, keeps a nil entry, and sends the usage.
+    #[test]
+    fn use_resources_decodes_mixed_kinds() {
+        let (p, dec, enc) = setup();
+        let mut msg = RgfxOpUseResources { count: 3, usage: 1 }
+            .as_bytes()
+            .to_vec();
+        for (kind, obj_id) in [
+            (RGFX_RESOURCE_KIND_BUFFER, 2u64),
+            (RGFX_RESOURCE_KIND_NONE, 0),
+            (RGFX_RESOURCE_KIND_TEXTURE, 4),
+        ] {
+            msg.extend_from_slice(
+                RgfxComputeResourceRef {
+                    kind,
+                    reserved_04: 0,
+                    obj_id,
+                }
+                .as_bytes(),
+            );
+        }
+        drive(&dec, &enc, RGFX_OP_COMPUTE_USE_RESOURCES, &msg);
+        let calls = p.call_log().calls_to("useResources:count:usage:");
+        assert_eq!(calls.len(), 1);
+        let b2 = dec.require_buffer(2).unwrap().id();
+        let t4 = dec.require_texture(4).unwrap().id();
+        assert_eq!(
+            calls[0].args,
+            vec![Arg::Objs(vec![Some(b2), None, Some(t4)]), Arg::U64(1),]
+        );
+    }
+
+    /// A body too short for its op faults the exec.
+    #[test]
+    fn a_short_body_faults() {
+        let (_p, dec, enc) = setup();
+        let r = decode_op(
+            RGFX_OP_COMPUTE_SET_BUFFER_OFFSET,
+            &[0u8; 4],
+            &dec,
+            &enc,
+            OnFault::Return,
+        );
+        assert!(r.is_err());
+    }
+
+    /// An array-tailed op whose records run past the body faults the exec.
+    #[test]
+    fn a_short_tail_faults() {
+        let (_p, dec, enc) = setup();
+        // Claims three bindings but carries none.
+        let msg = RgfxOpSetBuffers {
+            location: 0,
+            length: 3,
+        }
+        .as_bytes()
+        .to_vec();
+        let r = decode_op(
+            RGFX_OP_COMPUTE_SET_BUFFERS,
+            &msg,
+            &dec,
+            &enc,
+            OnFault::Return,
+        );
+        assert!(r.is_err());
+    }
+
+    /// A required reference the host does not hold faults the exec; a nil required
+    /// reference faults too.
+    #[test]
+    fn a_bad_reference_raises() {
+        let (_p, dec, enc) = setup();
+        // A fence the host never made.
+        let r = decode_op(
+            RGFX_OP_COMPUTE_UPDATE_FENCE,
+            RgfxOpUpdateFence { fence_obj_id: 999 }.as_bytes(),
+            &dec,
+            &enc,
+            OnFault::Return,
+        );
+        assert!(r.is_err());
+        // A nil required indirect buffer for the stage-in region.
+        let r = decode_op(
+            RGFX_OP_COMPUTE_SET_STAGE_IN_REGION_INDIRECT,
+            RgfxOpSetStageInRegionIndirect {
+                indirect_buffer_obj_id: 0,
+                indirect_buffer_offset: 0,
+            }
+            .as_bytes(),
+            &dec,
+            &enc,
+            OnFault::Return,
+        );
+        assert!(r.is_err());
+    }
+
+    /// An unknown resource kind faults the exec.
+    #[test]
+    fn an_unknown_resource_kind_faults() {
+        let (_p, dec, enc) = setup();
+        let mut msg = RgfxOpUseResources { count: 1, usage: 0 }
+            .as_bytes()
+            .to_vec();
+        msg.extend_from_slice(
+            RgfxComputeResourceRef {
+                kind: 99,
+                reserved_04: 0,
+                obj_id: 2,
+            }
+            .as_bytes(),
+        );
+        let r = decode_op(
+            RGFX_OP_COMPUTE_USE_RESOURCES,
+            &msg,
+            &dec,
+            &enc,
+            OnFault::Return,
+        );
+        assert!(r.is_err());
+    }
+
+    /// An unknown compute tag is not handled (the walk then faults).
+    #[test]
+    fn an_unknown_tag_is_unhandled() {
+        let (_p, dec, enc) = setup();
+        assert!(!decode_op(0x2fff, &[0u8; 8], &dec, &enc, OnFault::Return).unwrap());
+    }
+
+    /// Every array-tailed op decodes an empty tail (count 0) without a record.
+    #[test]
+    fn empty_tails_decode() {
+        let (p, dec, enc) = setup();
+        let mark = p.call_log().mark();
+        drive(
+            &dec,
+            &enc,
+            RGFX_OP_COMPUTE_USE_HEAPS,
+            RgfxOpUseHeaps { count: 0 }.as_bytes(),
+        );
+        drive(
+            &dec,
+            &enc,
+            RGFX_OP_COMPUTE_MEMORY_BARRIER_RESOURCES,
+            RgfxOpMemoryBarrierResources { count: 0 }.as_bytes(),
+        );
+        drive(
+            &dec,
+            &enc,
+            RGFX_OP_COMPUTE_SET_TEXTURES,
+            RgfxOpSetTextures {
+                location: 0,
+                length: 0,
+            }
+            .as_bytes(),
+        );
+        assert_eq!(
+            p.call_log().sels_since(mark),
+            vec![
+                "useHeaps:count:",
+                "memoryBarrierWithResources:count:",
+                "setTextures:withRange:",
+            ]
+        );
+    }
 }
