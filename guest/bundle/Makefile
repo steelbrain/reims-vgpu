@@ -41,7 +41,7 @@ CXXFLAGS = -isysroot $(SDK) -std=c++17 -Os \
 	-Wall -Wextra -Werror -Wno-unused-parameter \
 	-I src -I $(WIRE)
 
-# ObjC++ (.mm) also needs ARC and four warning suppressions: our classes conform to
+# ObjC++ (.mm) also needs ARC and five warning suppressions: our classes conform to
 # the full Metal protocols (MTLDevice/MTLBuffer/…) but deliberately implement only
 # the selectors a slice owns — the Apple-private base supplies the device's protocol
 # properties/methods at load, and the later slices fill the wrappers — so the
@@ -49,11 +49,15 @@ CXXFLAGS = -isysroot $(SDK) -std=c++17 -Os \
 # not errors. (unguarded-availability-new: we target the running OS's SPI;
 # deprecated-declarations: the device protocol has members Apple deprecated on
 # macOS 27 — location/peer*/locationNumber/didModifyRange — that we still implement
-# for MTLDevice/MTLBuffer conformance and older guests.)
+# for MTLDevice/MTLBuffer conformance and older guests; objc-protocol-method-
+# implementation: the category split (RgfxMetalDevice+Sync and the later slices)
+# implements MTLDevice protocol methods in a category whose primary class declares
+# the conformance, which clang flags though the primary class implements none of
+# them — expected by design, one category per slice.)
 OBJCXXFLAGS = -fobjc-arc \
 	-Wno-objc-protocol-property-synthesis -Wno-protocol \
 	-Wno-incomplete-implementation -Wno-unguarded-availability-new \
-	-Wno-deprecated-declarations
+	-Wno-deprecated-declarations -Wno-objc-protocol-method-implementation
 FRAMEWORKS  = -framework Metal -framework Foundation
 
 HEADERS      = $(wildcard src/*.hpp) $(wildcard src/*.h)
@@ -64,9 +68,12 @@ CORE_SRCS = src/RgfxObjectModel.cpp src/RgfxCaps.cpp src/RgfxRingWriter.cpp \
 	src/RgfxSerializer.cpp src/RgfxEncoder.cpp src/RgfxWireLayout.cpp
 
 # The whole Metal shell (ObjC++): wrappers + the device. Goes in the bundle.
-SHELL_SRCS = src/RgfxResource.mm src/RgfxBuffer.mm src/RgfxMetalDevice.mm
+SHELL_SRCS = src/RgfxResource.mm src/RgfxBuffer.mm \
+	src/RgfxEvent.mm src/RgfxFence.mm src/RgfxSharedEvent.mm \
+	src/RgfxMetalDevice.mm src/RgfxMetalDevice+Sync.mm
 # The NSObject-based wrappers alone (no Apple-private base): goes in the unit test.
-WRAP_SRCS  = src/RgfxResource.mm src/RgfxBuffer.mm
+WRAP_SRCS  = src/RgfxResource.mm src/RgfxBuffer.mm \
+	src/RgfxEvent.mm src/RgfxFence.mm src/RgfxSharedEvent.mm
 
 # Objects are kept per-arch (so the x86_64 and native builds never clobber) and
 # split core/ (C++) vs shell/ (ObjC++) so each compile rule has a unique target

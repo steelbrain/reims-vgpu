@@ -1,0 +1,53 @@
+/*
+ * RgfxSharedEvent: the reims-graphics bundle's MTLSharedEvent wrapper (sync slice).
+ * A shared event is a CPU/GPU-shared counter: encoders signal and wait on it on the
+ * GPU timeline, and the CPU reads/sets its `signaledValue` and registers listeners
+ * that fire when it reaches a value. Like RgfxEvent it carries its `rgfxObjId` (the
+ * encoders slice names it on the wire) plus the base `label`.
+ *
+ * Created by `+sharedEventWithInitialValue:device:serializer:`, which routes an
+ * RGFX_CMD_SHARED_EVENT_CREATE (carrying the initial value) through the serialiser
+ * and wraps the result. The device category `newSharedEvent` (RgfxMetalDevice+Sync)
+ * forwards to it with an initial value of 0.
+ *
+ * THE VALUE LIVES HOST-SIDE. The authoritative counter is on the host, raised by
+ * GPU signal ops and reported back by RGFX_EVT_EVENT_SIGNALLED. Until the region/
+ * reply-ring transport lands, this wrapper keeps a LOCAL MIRROR of the value so the
+ * `signaledValue` getter/setter and the listener API have defined behaviour; the
+ * host->guest value sync (reading EVENT_SIGNALLED, firing listeners) is a later
+ * transport piece. The CPU-set path has no wire op of its own (see the setter), so
+ * a set updates only the mirror for now.
+ *
+ * Our own ObjC++: it conforms to the real MTLSharedEvent protocol but subclasses
+ * only NSObject (via RgfxResource), so it instantiates and is unit-tested on the
+ * Mac.
+ */
+
+#ifndef RGFX_SHARED_EVENT_H_
+#define RGFX_SHARED_EVENT_H_
+
+#import <Metal/Metal.h>
+
+#import "RgfxResource.h"
+
+#ifdef __cplusplus
+class RgfxSerializer;
+#endif
+
+NS_ASSUME_NONNULL_BEGIN
+
+@interface RgfxSharedEvent : RgfxResource <MTLSharedEvent>
+
+/// Creates a shared event starting at `initialValue`, serialising an
+/// RGFX_CMD_SHARED_EVENT_CREATE through `serializer` (which picks the objId) and
+/// seeding the local value mirror. `device` is the owning shell (nil in a unit
+/// test). Returns nil if `serializer` is null (a shared event must have a route).
++ (nullable instancetype)sharedEventWithInitialValue:(uint64_t)initialValue
+                                             device:(nullable id<MTLDevice>)device
+                                         serializer:(nullable RgfxSerializer *)serializer;
+
+@end
+
+NS_ASSUME_NONNULL_END
+
+#endif // RGFX_SHARED_EVENT_H_

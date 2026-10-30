@@ -24,7 +24,10 @@
 #include <cstring>
 
 #import "RgfxBuffer.h"
+#import "RgfxEvent.h"
+#import "RgfxFence.h"
 #import "RgfxResource.h"
+#import "RgfxSharedEvent.h"
 
 #include "RgfxObjectModel.hpp"
 #include "RgfxRingWriter.hpp"
@@ -156,6 +159,95 @@ void test_wrapper_guards_and_base()
 	CHECK([buf conformsToProtocol:@protocol(MTLBuffer)]);
 }
 
+// --- sync slice (slice 4): event / fence / shared-event wrappers -------------
+
+// An event wrapper's create routes one RGFX_CMD_EVENT_CREATE (an RgfxObjectCreate
+// carrying its objId), and the wrapper carries that id, its device and route.
+void test_event_routing()
+{
+	Fixture fx;
+
+	RgfxEvent *ev = [RgfxEvent eventWithDevice:nil serializer:&fx.ser];
+	CHECK(ev != nil);
+	CHECK(ev.rgfxObjId == 1); // first object on this device
+	CHECK(ev.device == nil);
+	CHECK([ev serializer] == &fx.ser);
+	CHECK([ev isKindOfClass:[RgfxResource class]]);
+	CHECK([ev conformsToProtocol:@protocol(MTLEvent)]);
+
+	auto msg = expectMessage<RgfxObjectCreate>(fx.ring, RGFX_CMD_EVENT_CREATE);
+	CHECK(msg.header.seqno == 1);
+	CHECK(msg.obj_id == ev.rgfxObjId);
+
+	// Nothing else reached the ring.
+	RgfxMsgHeader extra = {};
+	std::vector<uint8_t> extraBytes;
+	CHECK(!fx.ring.next(&extra, &extraBytes));
+
+	// A null route declines the create (an event must reach the host).
+	CHECK([RgfxEvent eventWithDevice:nil serializer:nullptr] == nil);
+}
+
+// A fence wrapper's create routes one RGFX_CMD_FENCE_CREATE, same shape as an
+// event.
+void test_fence_routing()
+{
+	Fixture fx;
+
+	RgfxFence *fence = [RgfxFence fenceWithDevice:nil serializer:&fx.ser];
+	CHECK(fence != nil);
+	CHECK(fence.rgfxObjId == 1);
+	CHECK([fence conformsToProtocol:@protocol(MTLFence)]);
+
+	auto msg = expectMessage<RgfxObjectCreate>(fx.ring, RGFX_CMD_FENCE_CREATE);
+	CHECK(msg.header.seqno == 1);
+	CHECK(msg.obj_id == fence.rgfxObjId);
+
+	CHECK([RgfxFence fenceWithDevice:nil serializer:nullptr] == nil);
+}
+
+// A shared-event wrapper's create routes one RGFX_CMD_SHARED_EVENT_CREATE carrying
+// the initial value, and the wrapper's signaledValue mirror starts there.
+void test_shared_event_routing()
+{
+	Fixture fx;
+
+	const uint64_t initial = 0x1234;
+	RgfxSharedEvent *ev = [RgfxSharedEvent sharedEventWithInitialValue:initial
+	                                                           device:nil
+	                                                       serializer:&fx.ser];
+	CHECK(ev != nil);
+	CHECK(ev.rgfxObjId == 1);
+	CHECK([ev conformsToProtocol:@protocol(MTLSharedEvent)]);
+
+	auto msg = expectMessage<RgfxSharedEventCreate>(fx.ring, RGFX_CMD_SHARED_EVENT_CREATE);
+	CHECK(msg.header.seqno == 1);
+	CHECK(msg.obj_id == ev.rgfxObjId);
+	CHECK(msg.initial_value == initial);
+
+	// The local value mirror starts at the initial value, and a CPU-side set
+	// updates the mirror (no wire op for a set in this slice).
+	CHECK(ev.signaledValue == initial);
+	ev.signaledValue = initial + 7;
+	CHECK(ev.signaledValue == initial + 7);
+
+	// The set posts nothing on the ring (documented follow-up, no wire op yet), and
+	// the listener/handle stubs are safe no-ops.
+	RgfxMsgHeader extra = {};
+	std::vector<uint8_t> extraBytes;
+	CHECK(!fx.ring.next(&extra, &extraBytes));
+	CHECK([ev newSharedEventHandle] == nil);
+	MTLSharedEventListener *listener = [[MTLSharedEventListener alloc] init];
+	[ev notifyListener:listener
+	           atValue:initial + 7
+	             block:^(id<MTLSharedEvent> e, uint64_t v) {
+		             (void)e;
+		             (void)v;
+	             }]; // stub: must not fault
+
+	CHECK([RgfxSharedEvent sharedEventWithInitialValue:0 device:nil serializer:nullptr] == nil);
+}
+
 } // namespace
 
 int main()
@@ -164,6 +256,9 @@ int main()
 		test_buffer_routing();
 		test_second_buffer_is_monotonic();
 		test_wrapper_guards_and_base();
+		test_event_routing();
+		test_fence_routing();
+		test_shared_event_routing();
 	}
 	std::printf("shell_tests: OK (%d checks)\n", g_checks);
 	return 0;
