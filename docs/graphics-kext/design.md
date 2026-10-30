@@ -157,14 +157,14 @@ Stages:
     matches any display-class device. WindowServer composites in software
     with no Metal device: x86-64 macOS 26.5.2, 26.6.1 and 26.7.1 reach the
     desktop that way ("Software compositor activated"; measured).
-13. **Loading: Apple's documented route.** The kext has our own bundle ID and
-    links no private KPI. It is installed in `/Library/Extensions`, and the
-    OS links it into the Auxiliary Kernel Collection against the Boot and
-    System collections, where IOGraphicsFamily and IOGPUFamily live.
-    OpenCore can't carry it, since OpenCore links injected kexts only
-    against the Boot collection. The stage 3 Metal bundle goes in
-    `/Library/GPUBundles`, installed with the kext through its
-    `GPUCompanionBundles` key. Nothing of the guest OS is patched or hooked.
+13. **Loading: through OpenCore.** The OpenCore image reims-util makes
+    injects the kext, as it injects the x86-64 port's GPU and display kexts.
+    Libraries outside the Boot kernel collection (IOGraphicsFamily,
+    IOGPUFamily) are reached through the same loader bridge those kexts use.
+    So no install, approval or signing happens in the guest. Iterating means
+    replacing the kext in the OpenCore image and booting, with nothing
+    rebuilt inside the guest. Apple's paravirt kext is never blocked or
+    changed: it doesn't match our device.
 14. **IOSurfaces follow the discrete model.** IOSurface.kext allocates
     surfaces in guest RAM, CAMetalLayer drawables and window backing stores
     included. The accelerator gets a per-surface device cache with a sync
@@ -178,6 +178,11 @@ Stages:
     metal2vulkan's host-page rules: in place where only sampled, otherwise a
     shadow copy that is announced. Stage 2 needs none of this, since its
     compositor is software.
+
+15. **The stage 3 stack is IOGPUFamily.** x86-64 macOS 26 carries IOGPUFamily
+    and IOGPU.framework, and the x86-64 port runs Metal compositing on them:
+    WindowServer composites with Metal through an IOSurface display pipe on
+    IOGPU that the driver provides. Our accelerator does the same.
 
 ## What metal2vulkan adds in stage 3
 
@@ -286,22 +291,10 @@ BAR2, and the kext takes the display over when it starts.
 
 ## Open
 
-- **Signing (owner call).** Apple's route needs Developer ID signing with
-  the kext-enabled certificate, notarization, and the user's approval once
-  per VM. A from-scratch kext with our own ID can be signed, which the
-  Apple-code port could not. The alternative is guests whose SIP skips the
-  kext signature check, which Apple calls permissive security. Development
-  is not blocked: a development guest uses the SIP setting Apple documents
-  for kext development, as the port's development builds do.
-- **Stage 3 desktop compositing.** The Metal compositor needs a display
-  pipe that only IOAcceleratorFamily2 provides, and IOAcceleratorFamily2
-  cannot start beside IOGPUFamily in one kernel (measured by the port).
-  CoreDisplay also wants an AppleGraphicsDeviceControl node. The fallback is
-  a headless accelerator: apps get Metal, and the desktop stays on the
-  software compositor (measured by the port).
-- **Stage 3 bundle loading:** whether WindowServer, sandboxed apps and
-  `MTLCompilerService` load a signed third-party bundle at stock settings
-  (library validation).
+- **Stage 3 bundle placement:** how our user-space Metal bundle reaches the
+  guest's `/Library/GPUBundles`, which OpenCore can't write, and whether
+  WindowServer, sandboxed apps and `MTLCompilerService` load it (library
+  validation).
 - **IOSurface details:** whether the device-cache sync runs on every CPU
   access path and on unlock (window buffers wrapped no-copy are written
   without a lock); whether IOGPU accepts a device cache that holds a host
