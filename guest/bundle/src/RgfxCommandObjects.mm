@@ -192,6 +192,9 @@ uint32_t fillRenderPass(MTLRenderPassDescriptor *d, RgfxRenderPassDesc *desc,
 	NSUInteger _maxCount;
 	NSString *_queueLabel;
 	RgfxReplyReader *_ownedReader; // owned (adoptReplyReader:): the per-queue completion reader
+	dispatch_queue_t _submissionQueue; // kept for -submissionQueue (setSubmissionQueue: SPI)
+	dispatch_queue_t _completionQueue; // kept for -completionQueue (setCompletionQueue: SPI)
+	NSUInteger _gpuPriority;           // kept for -GPUPriority (setGPUPriority: SPI)
 }
 
 + (instancetype)queueWithSubmitRing:(RgfxRingWriter *)submitRing
@@ -275,6 +278,42 @@ uint32_t fillRenderPass(MTLRenderPassDescriptor *d, RgfxRenderPassDesc *desc,
 - (void)dealloc
 {
 	delete _ownedReader;
+}
+
+// --- dispatch queues and priority (MTLCommandQueue SPI WindowServer sets) -----------
+// WindowServer hands its queues the dispatch queues Metal is to run submission and
+// completion work on, and a GPU priority. Our queue submits on the caller's thread and
+// completes on its reply reader's, and the host schedules every queue alike, so each is
+// kept and answered back, and changes nothing the queue does.
+
+- (void)setSubmissionQueue:(dispatch_queue_t)queue
+{
+	_submissionQueue = queue;
+}
+
+- (dispatch_queue_t)submissionQueue
+{
+	return _submissionQueue;
+}
+
+- (void)setCompletionQueue:(dispatch_queue_t)queue
+{
+	_completionQueue = queue;
+}
+
+- (dispatch_queue_t)completionQueue
+{
+	return _completionQueue;
+}
+
+- (void)setGPUPriority:(NSUInteger)priority
+{
+	_gpuPriority = priority;
+}
+
+- (NSUInteger)GPUPriority
+{
+	return _gpuPriority;
 }
 
 @end
