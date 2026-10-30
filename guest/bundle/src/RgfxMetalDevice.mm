@@ -61,6 +61,7 @@ enum {
 	kRgfxAccelMethodFree = 0x102,
 	kRgfxAccelMethodQueueCreate = 0x103,
 	kRgfxAccelMethodSubmit = 0x105,
+	kRgfxAccelMethodResourceIds = 0x106,
 };
 
 namespace {
@@ -113,6 +114,16 @@ bool rgfxKextAlloc(void *context, uint64_t size, uint64_t align, uint64_t *offse
 	uint32_t outCount = 1;
 	return IOConnectCallScalarMethod(conn, kRgfxAccelMethodAlloc, in, 2, offset, &outCount) ==
 	       KERN_SUCCESS;
+}
+
+// The kext's chunks of texture resource ids, as RgfxIdSpace's chunk source; `context` is the
+// user client's connect. False once every chunk of the guest's pool is held.
+bool rgfxKextResourceIds(void *context, uint64_t *first_id)
+{
+	io_connect_t conn = static_cast<io_connect_t>(reinterpret_cast<uintptr_t>(context));
+	uint32_t outCount = 1;
+	return IOConnectCallScalarMethod(conn, kRgfxAccelMethodResourceIds, nullptr, 0, first_id,
+	                                 &outCount) == KERN_SUCCESS;
 }
 
 void rgfxKextRelease(void *context, uint64_t offset)
@@ -254,10 +265,10 @@ constexpr long kGpuFamilyMinus1009 = -1009;
 	if (!_caps.load(info))
 		rgfxDiag("RGFX: caps blob invalid (version/zero); using defaults\n");
 
-	// The process's context: its id, address and resource-id ranges, and its blocks, from the
-	// kext, so no two processes' rings, blocks or numbers meet.
-	uint64_t ctx[4] = {};
-	uint32_t ctxCount = 4;
+	// The process's context: its id and address ranges, its blocks and its chunks of texture
+	// resource ids, from the kext, so no two processes' rings, blocks or numbers meet.
+	uint64_t ctx[3] = {};
+	uint32_t ctxCount = 3;
 	kr = IOConnectCallScalarMethod(_conn, kRgfxAccelMethodOpenContext, nullptr, 0, ctx, &ctxCount);
 	if (kr != KERN_SUCCESS) {
 		rgfxDiag("RGFX: OPEN_CONTEXT failed kr=0x%x; transport stubbed\n", kr);
@@ -265,8 +276,9 @@ constexpr long kGpuFamilyMinus1009 = -1009;
 		_conn = IO_OBJECT_NULL;
 		return self;
 	}
-	_ids.setBases(ctx[1], ctx[2], ctx[3]);
+	_ids.setBases(ctx[1], ctx[2]);
 	void *connContext = reinterpret_cast<void *>(static_cast<uintptr_t>(_conn));
+	_ids.setResourceIdSource(&rgfxKextResourceIds, connContext);
 	_region = new RgfxRegion(base, mapSize);
 	_region->setBlockSource(&rgfxKextAlloc, &rgfxKextRelease, connContext);
 
@@ -278,9 +290,8 @@ constexpr long kGpuFamilyMinus1009 = -1009;
 	_controlRing = std::make_unique<RgfxRingWriter>(&rgfxKextSubmit, &_link, kLifecycleMessageMax);
 	_serializer = new RgfxSerializer(*_controlRing, _ids);
 	_serializer->setQueueOpener(&rgfxKextQueueOpener, connContext);
-	rgfxDiag("RGFX: context %llu: ids 0x%llx, va 0x%llx, resource ids %llu\n",
-	         (unsigned long long)ctx[0], (unsigned long long)ctx[1], (unsigned long long)ctx[2],
-	         (unsigned long long)ctx[3]);
+	rgfxDiag("RGFX: context %llu: ids 0x%llx, va 0x%llx\n", (unsigned long long)ctx[0],
+	         (unsigned long long)ctx[1], (unsigned long long)ctx[2]);
 	rgfxDiag("RGFX: transport up: region=%llu bytes, caps=%s\n", (unsigned long long)mapSize,
 	         _caps.valid() ? "valid" : "default");
 	return self;

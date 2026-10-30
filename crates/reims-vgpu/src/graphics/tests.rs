@@ -278,6 +278,92 @@ fn an_object_create_reaches_the_decoder() {
     assert!(grew, "the create never reached the decoder");
 }
 
+/// A `RESOURCE_ID_CHUNK` giving `context` chunk `chunk` of the texture resource ids.
+fn resource_id_chunk(context: u32, chunk: u32) -> Vec<u8> {
+    RgfxResourceIdChunk {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_RESOURCE_ID_CHUNK,
+            size: 0,
+            seqno: 0,
+        },
+        context,
+        chunk,
+    }
+    .as_bytes()
+    .to_vec()
+}
+
+/// A `TEXTURE_CREATE` of a 64 x 64 BGRA8 texture `obj_id` at resource id `resource_id`.
+fn texture_create(obj_id: u64, resource_id: u64) -> Vec<u8> {
+    RgfxTextureCreate {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_TEXTURE_CREATE,
+            size: 0,
+            seqno: 0,
+        },
+        obj_id,
+        resource_id,
+        desc: RgfxTextureDescriptor {
+            pixel_format: 80,
+            texture_type: 2,
+            width: 64,
+            height: 64,
+            depth: 1,
+            mipmap_level_count: 1,
+            array_length: 1,
+            sample_count: 1,
+            usage: 5,
+            ..RgfxTextureDescriptor::default()
+        },
+        ..RgfxTextureCreate::default()
+    }
+    .as_bytes()
+    .to_vec()
+}
+
+/// The kext's `RESOURCE_ID_CHUNK` on ring 0 lets its context make textures at the chunk's ids;
+/// a texture at an id the context holds no chunk of, the limit's among them, is refused and the
+/// device goes on; at the context's close the chunk goes with it, so the next context's texture
+/// at its ids is refused until the kext gives it the chunk.
+#[test]
+fn a_texture_create_needs_its_context_s_chunk_of_resource_ids() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, _platform) = headless_on(&raised);
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    // Ring 0 is carried out in order, so once the close of a context that holds nothing is
+    // answered, everything sent before it is.
+    let carried_out = |guest: &mut Guest| {
+        assert_eq!(answered(&device, guest, context_close(99)), RGFX_STATUS_OK);
+        device.decoder_object_count()
+    };
+    let first = 1 + 7 * RGFX_RESOURCE_ID_CHUNK;
+    guest.send(&device, resource_id_chunk(3, 7));
+    guest.send(&device, texture_create(obj(3, 1), first));
+    guest.send(
+        &device,
+        texture_create(obj(3, 2), first + RGFX_RESOURCE_ID_CHUNK),
+    );
+    guest.send(&device, texture_create(obj(3, 3), RGFX_RESOURCE_ID_LIMIT));
+    guest.send(&device, texture_create(obj(3, 4), 0));
+    guest.send(&device, event_create(obj(3, 5)));
+    assert_eq!(
+        carried_out(&mut guest),
+        2,
+        "the texture in the chunk, and the event"
+    );
+    assert_eq!(
+        answered(&device, &mut guest, context_close(3)),
+        RGFX_STATUS_OK
+    );
+    assert_eq!(device.decoder_object_count(), 0);
+    guest.send(&device, texture_create(obj(4, 1), first));
+    assert_eq!(carried_out(&mut guest), 0, "the closed context's chunk");
+    guest.send(&device, resource_id_chunk(4, 7));
+    guest.send(&device, texture_create(obj(4, 1), first));
+    assert_eq!(carried_out(&mut guest), 1, "the chunk given again");
+}
+
 /// A command buffer on a queue is decoded and committed once ring 0 has carried out what was
 /// published on it before; completing it on the GPU posts a `CB_COMPLETE` onto the queue's
 /// completion ring, raising the queue's vector (0 here) when the guest armed it; the context's

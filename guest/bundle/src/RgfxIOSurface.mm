@@ -282,6 +282,9 @@ RgfxTextureDescriptor wireDescriptor(MTLTextureDescriptor *d)
 	RgfxCreated created = serializer->createTextureFromIOSurface(
 	    [(RgfxResource *)shadow->buffer rgfxObjId], 0, shadow->pitch, shadow->surfaceId,
 	    shadow->plane, hostDesc);
+	if (created.resource_id == 0) {
+		return nil; // no resource id left: no texture, as Metal answers one it cannot make
+	}
 	RgfxIOSurfaceTexture *t = [[RgfxIOSurfaceTexture alloc] initWithObjId:created.obj_id
 	                                                           gpuAddress:0
 	                                                           resourceId:created.resource_id

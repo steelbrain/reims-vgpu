@@ -431,6 +431,8 @@ mod tests {
             assert_eq!(dec.decode(&device, b.as_bytes()).unwrap(), Ok(()));
         }
 
+        // The textures' resource ids are their object ids, in chunk 0.
+        dec.hold_resource_ids(0, 0);
         for id in [4, 5] {
             let t = RgfxTextureCreate {
                 header: RgfxMsgHeader {
@@ -451,6 +453,7 @@ mod tests {
                     usage: 5,
                     ..RgfxTextureDescriptor::default()
                 },
+                resource_id: id,
                 ..RgfxTextureCreate::default()
             };
             assert_eq!(dec.decode(&device, t.as_bytes()).unwrap(), Ok(()));

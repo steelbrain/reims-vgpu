@@ -10,12 +10,15 @@
  * create needs no round trip. Host device addresses never reach the guest.
  *
  * RgfxIdSpace hands out those three number lines for one device (one guest
- * process = one context, Decided 7). The lines are monotonic and never reuse a
- * value while the device lives: host handles are refcounted, and reuse would
- * alias a live handle. The precise per-context partitioning of the address and
- * id spaces, and sub-allocation of GPU addresses inside host memory blocks,
- * land with the region/block work; this hands out a flat, aligned bump range
- * that the host pins as given.
+ * process = one context, Decided 7). Object ids and GPU addresses are
+ * monotonic and never reuse a value while the device lives: host handles are
+ * refcounted, and reuse would alias a live handle; they start at the context's
+ * bases, which the accelerator kext hands out. Texture resource ids are shared
+ * by every process on the host's one device, whose ids end below
+ * RGFX_RESOURCE_ID_LIMIT, so they come in chunks of RGFX_RESOURCE_ID_CHUNK the
+ * kext hands out on demand from one pool for the guest, and an id goes back to
+ * the process's chunks when its texture goes: Metal gives a texture's id back
+ * as the texture goes too.
  *
  * This is our own code: it knows nothing of Apple's Metal SPI. The Metal device
  * shell (built later) allocates an ObjId per object it creates and stores it on
@@ -27,6 +30,10 @@
 
 #include <atomic>
 #include <cstdint>
+#include <mutex>
+#include <vector>
+
+#include "reims_graphics_wire.h"
 
 /// A guest-picked object id, unique per device. 0 names no object.
 typedef uint64_t RgfxObjId;
@@ -40,24 +47,41 @@ static const RgfxObjId RGFX_OBJ_NONE = 0;
 /// thread (Metal creates objects on the app's threads).
 class RgfxIdSpace {
 public:
-	/// A space whose GPU addresses start at `address_base`. Object ids and
-	/// resource ids start at 1 (0 is [`RGFX_OBJ_NONE`]).
+	/// A source of chunks of texture resource ids: it hands `*first_id`, the
+	/// first id of a chunk of RGFX_RESOURCE_ID_CHUNK the process holds from now
+	/// on (the accelerator kext's), or answers false where none is left. Called
+	/// with `context`.
+	typedef bool (*ResourceIdChunkFn)(void *context, uint64_t *first_id);
+
+	/// A space whose GPU addresses start at `address_base`. Object ids start at
+	/// 1 (0 is [`RGFX_OBJ_NONE`]). Until a chunk source is set, resource ids come
+	/// from every chunk of the pool in order, as for the device's one process.
 	explicit RgfxIdSpace(uint64_t address_base = kDefaultAddressBase);
 
 	/// The next object id, never 0 and never reused.
 	RgfxObjId allocObjId();
 
-	/// The next texture resource id, never 0 and never reused.
+	/// A free texture resource id of the process's chunks: the lowest free one of
+	/// the first chunk taken that has one, else the first of a new chunk from the
+	/// source. 0 where the source has none left: the caller makes no texture.
 	uint64_t allocResourceId();
+
+	/// Gives texture resource id `id` back to the process's chunks, once its
+	/// texture is gone. 0, and an id of no chunk the process holds, are ignored.
+	void freeResourceId(uint64_t id);
+
+	/// Where new chunks of texture resource ids come from from now on.
+	void setResourceIdSource(ResourceIdChunkFn source, void *context);
 
 	/// A GPU address range of `size` bytes aligned up to `align` (a power of
 	/// two, at least 1). The guest owns the range; the host pins it.
 	uint64_t allocAddress(uint64_t size, uint64_t align);
 
-	/// Moves the three lines to the process's context's ranges, which the accelerator
-	/// kext hands out (its object-id base, GPU-address base and resource-id base), so no
-	/// two processes' numbers meet on the host. Called once, before any number is minted.
-	void setBases(uint64_t obj_id_base, uint64_t address_base, uint64_t resource_id_base);
+	/// Moves the object ids and GPU addresses to the process's context's ranges,
+	/// which the accelerator kext hands out (its object-id base and GPU-address
+	/// base), so no two processes' numbers meet on the host. Called once, before
+	/// any number is minted.
+	void setBases(uint64_t obj_id_base, uint64_t address_base);
 
 	/// Where this space's GPU addresses begin by default: above the low 4 GiB,
 	/// clear of any identity-mapped low range and of zero.
@@ -65,8 +89,19 @@ public:
 
 private:
 	std::atomic<uint64_t> m_nextObjId;
-	std::atomic<uint64_t> m_nextResourceId;
 	std::atomic<uint64_t> m_nextAddress;
+
+	// The texture resource ids, under m_idsLock: the chunks the process holds,
+	// by index (chunk k holds ids 1 + k * 64 to 64 + k * 64), in the order taken,
+	// and each chunk's free ids, bit i for its id 1 + k * 64 + i.
+	std::mutex m_idsLock;
+	std::vector<uint32_t> m_chunks;
+	uint64_t m_freeIds[RGFX_RESOURCE_ID_CHUNKS] = {};
+	bool m_heldChunks[RGFX_RESOURCE_ID_CHUNKS] = {};
+	ResourceIdChunkFn m_chunkSource = nullptr;
+	void *m_chunkSourceContext = nullptr;
+	// With no source: the next chunk of the pool.
+	uint32_t m_nextLocalChunk = 0;
 };
 
 #endif // RGFX_OBJECT_MODEL_HPP_

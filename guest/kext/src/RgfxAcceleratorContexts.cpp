@@ -5,9 +5,14 @@
  *   - A context number, handed out once from 1: the process's object ids are
  *     c << RGFX_CONTEXT_OBJ_ID_SHIFT and up, so no two processes' ids meet in the host's one
  *     handle table, and the host drops the process's at CONTEXT_CLOSE.
- *   - A slot of RGFX_CONTEXT_SLOTS, held until the close: the process's GPU addresses and
- *     texture resource ids come from the slot's range. Slots are handed out round-robin, so a
- *     slot freed by one process is the last one the next process takes.
+ *   - A slot of RGFX_CONTEXT_SLOTS, held until the close: the process's GPU addresses come from
+ *     the slot's range. Slots are handed out round-robin, so a slot freed by one process is the
+ *     last one the next process takes.
+ *   - Chunks of the texture resource ids, on demand, from one pool for the guest: every
+ *     process's textures share the host device's one space of ids, which ends below
+ *     RGFX_RESOURCE_ID_LIMIT, so ids are not split by slot. Each chunk is posted to the device
+ *     (RESOURCE_ID_CHUNK) before the process learns of it, and the client's are freed at its
+ *     close, after its CONTEXT_CLOSE is answered.
  *   - Region blocks past RGFX_CONTEXT_ALLOCATIONS_OFFSET (rings, Shared buffers and heaps,
  *     surfaces), from a first-fit allocator over a table sorted by offset, each owned by the
  *     client that asked; the client's are freed at its close.
@@ -56,8 +61,11 @@ struct ContextState {
 	UInt32 blockCount;
 	UInt64 blocksStart;
 	UInt64 blocksEnd;
+	// Under contextLock: the client holding each chunk of the texture resource ids, null where
+	// none does.
+	const void *idChunkOwners[RGFX_RESOURCE_ID_CHUNKS];
 };
-ContextState state = {nullptr, 0, 0, 1, nullptr, 0, 0, 0};
+ContextState state = {nullptr, 0, 0, 1, nullptr, 0, 0, 0, {}};
 IOLock *&contextLock = state.contextLock;
 UInt32 &slotsHeld = state.slotsHeld;
 UInt32 &nextSlot = state.nextSlot;
@@ -66,6 +74,7 @@ RgfxBlock *&blocks = state.blocks;
 UInt32 &blockCount = state.blockCount;
 UInt64 &blocksStart = state.blocksStart;
 UInt64 &blocksEnd = state.blocksEnd;
+const void *(&idChunkOwners)[RGFX_RESOURCE_ID_CHUNKS] = state.idChunkOwners;
 } // namespace
 
 bool RgfxAccelerator::startContexts()
@@ -148,6 +157,57 @@ void RgfxAccelerator::closeContext(UInt32 context, UInt32 slot)
 		IOLockUnlock(contextLock);
 	}
 	IOLog("RgfxAccelerator: context %u closed (slot %u)\n", context, slot);
+}
+
+// MARK: - Resource ids
+
+IOReturn RgfxAccelerator::takeIdChunk(const void *owner, UInt32 context, UInt64 *firstId)
+{
+	if (!contextLock)
+		return kIOReturnNotReady;
+	IOLockLock(contextLock);
+	UInt32 chunk = 0;
+	while (chunk < RGFX_RESOURCE_ID_CHUNKS && idChunkOwners[chunk])
+		chunk++;
+	if (chunk == RGFX_RESOURCE_ID_CHUNKS) {
+		IOLockUnlock(contextLock);
+		IOLog("RgfxAccelerator: context %u: every resource-id chunk is held\n", context);
+		return kIOReturnNoResources;
+	}
+	idChunkOwners[chunk] = owner;
+	IOLockUnlock(contextLock);
+	// The device learns of the chunk before the process does, so the grant is on the control
+	// ring before any create that names one of its ids.
+	RgfxResourceIdChunk grant = {};
+	grant.context = context;
+	grant.chunk = chunk;
+	IOReturn r = postLifecycle(RGFX_CMD_RESOURCE_ID_CHUNK, &grant, sizeof(grant), 0, nullptr, 0,
+	                           nullptr, nullptr, 0);
+	if (r != kIOReturnSuccess) {
+		IOLockLock(contextLock);
+		idChunkOwners[chunk] = nullptr;
+		IOLockUnlock(contextLock);
+		return r;
+	}
+	*firstId = 1 + static_cast<UInt64>(chunk) * RGFX_RESOURCE_ID_CHUNK;
+	return kIOReturnSuccess;
+}
+
+void RgfxAccelerator::freeIdChunks(const void *owner)
+{
+	if (!contextLock)
+		return;
+	IOLockLock(contextLock);
+	UInt32 freed = 0;
+	for (UInt32 i = 0; i < RGFX_RESOURCE_ID_CHUNKS; i++) {
+		if (idChunkOwners[i] == owner) {
+			idChunkOwners[i] = nullptr;
+			freed++;
+		}
+	}
+	IOLockUnlock(contextLock);
+	if (freed)
+		IOLog("RgfxAccelerator: %u resource-id chunks freed\n", freed);
 }
 
 // MARK: - Blocks

@@ -323,6 +323,67 @@ void test_texture_routing()
 	CHECK(msg.desc.options == (uint32_t)desc.resourceOptions);
 }
 
+// One chunk of texture resource ids (ids 1 + 4 * 64 to 64 + 4 * 64), as the kext would hand
+// it, and none after it.
+bool oneChunk(void *context, uint64_t *first_id)
+{
+	int *calls = static_cast<int *>(context);
+	if ((*calls)++ != 0)
+		return false;
+	*first_id = 1 + 4 * RGFX_RESOURCE_ID_CHUNK;
+	return true;
+}
+
+// A texture's resource id comes from the process's chunks and goes back as the texture goes,
+// for the next texture; with every id held and no chunk left, newTexture answers nil and posts
+// nothing.
+void test_texture_resource_ids()
+{
+	Fixture fx;
+	int calls = 0;
+	fx.ids.setResourceIdSource(&oneChunk, &calls);
+	MTLTextureDescriptor *desc =
+	    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+	                                                       width:16
+	                                                      height:16
+	                                                   mipmapped:NO];
+	const uint64_t first = 1 + 4 * RGFX_RESOURCE_ID_CHUNK;
+	NSMutableArray<RgfxTexture *> *held = [NSMutableArray array];
+	for (uint64_t i = 0; i < RGFX_RESOURCE_ID_CHUNK; i++) {
+		RgfxTexture *tex = [RgfxTexture textureWithDescriptor:desc
+		                                                 heap:RGFX_OBJ_NONE
+		                                           heapOffset:0
+		                                               device:nil
+		                                           serializer:&fx.ser];
+		CHECK(tex != nil && [tex gpuResourceID]._impl == first + i);
+		auto msg = expectMessage<RgfxTextureCreate>(fx.ring, RGFX_CMD_TEXTURE_CREATE);
+		CHECK(msg.resource_id == first + i);
+		[held addObject:tex];
+	}
+	CHECK(calls == 1);
+	RgfxTexture *none = [RgfxTexture textureWithDescriptor:desc
+	                                                  heap:RGFX_OBJ_NONE
+	                                            heapOffset:0
+	                                                device:nil
+	                                            serializer:&fx.ser];
+	CHECK(none == nil);
+	RgfxMsgHeader h = {};
+	std::vector<uint8_t> bytes;
+	CHECK(!fx.ring.next(&h, &bytes));
+	// The texture holding id first + 10 goes; the next texture takes its id.
+	@autoreleasepool {
+		[held removeObjectAtIndex:10];
+	}
+	RgfxTexture *again = [RgfxTexture textureWithDescriptor:desc
+	                                                   heap:RGFX_OBJ_NONE
+	                                             heapOffset:0
+	                                                 device:nil
+	                                             serializer:&fx.ser];
+	CHECK(again != nil && [again gpuResourceID]._impl == first + 10);
+	auto msg = expectMessage<RgfxTextureCreate>(fx.ring, RGFX_CMD_TEXTURE_CREATE);
+	CHECK(msg.resource_id == first + 10 && msg.obj_id == again.rgfxObjId);
+}
+
 // A sampler wrapper's create routes an RGFX_CMD_SAMPLER_CREATE, mapping every
 // descriptor field (the LOD clamps as f32 bits, the booleans packed into flags).
 void test_sampler_routing()
@@ -1488,6 +1549,7 @@ int main()
 		test_fence_routing();
 		test_shared_event_routing();
 		test_texture_routing();
+		test_texture_resource_ids();
 		test_sampler_routing();
 		test_depth_stencil_routing();
 		test_heap_routing_and_suballoc();

@@ -148,12 +148,19 @@ RgfxCreated RgfxSerializer::createBufferAtOffset(RgfxObjId heap, uint64_t offset
 	return out;
 }
 
+void RgfxSerializer::releaseResourceId(uint64_t resource_id)
+{
+	m_ids.freeResourceId(resource_id);
+}
+
 RgfxCreated RgfxSerializer::createTexture(const RgfxTextureDescriptor &desc, RgfxObjId heap,
                                           uint64_t heap_offset, uint64_t align)
 {
 	RgfxCreated out = {};
-	out.obj_id = m_ids.allocObjId();
 	out.resource_id = m_ids.allocResourceId();
+	if (out.resource_id == 0)
+		return out;
+	out.obj_id = m_ids.allocObjId();
 
 	RgfxTextureCreate msg = {};
 	msg.obj_id = out.obj_id;
@@ -176,8 +183,10 @@ RgfxCreated RgfxSerializer::createTextureFromBuffer(RgfxObjId buffer, uint64_t o
                                                     const RgfxTextureDescriptor &desc)
 {
 	RgfxCreated out = {};
-	out.obj_id = m_ids.allocObjId();
 	out.resource_id = m_ids.allocResourceId();
+	if (out.resource_id == 0)
+		return out;
+	out.obj_id = m_ids.allocObjId();
 
 	RgfxTextureFromBuffer msg = {};
 	msg.obj_id = out.obj_id;
@@ -197,8 +206,10 @@ RgfxCreated RgfxSerializer::createTextureFromIOSurface(RgfxObjId buffer, uint64_
                                                        const RgfxTextureDescriptor &desc)
 {
 	RgfxCreated out = {};
-	out.obj_id = m_ids.allocObjId();
 	out.resource_id = m_ids.allocResourceId();
+	if (out.resource_id == 0)
+		return out;
+	out.obj_id = m_ids.allocObjId();
 
 	RgfxTextureFromIOSurface msg = {};
 	msg.obj_id = out.obj_id;

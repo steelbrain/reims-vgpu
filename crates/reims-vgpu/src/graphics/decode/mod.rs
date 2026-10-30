@@ -45,9 +45,10 @@ use reims_graphics::wire::{
     RGFX_CMD_COMPUTE_PIPELINE_CREATE, RGFX_CMD_DEPTH_STENCIL_CREATE, RGFX_CMD_EVENT_CREATE,
     RGFX_CMD_FENCE_CREATE, RGFX_CMD_HEAP_CREATE, RGFX_CMD_HEAP_OVER_HOST_MEMORY,
     RGFX_CMD_LIBRARY_CREATE, RGFX_CMD_LIBRARY_FROM_REGION, RGFX_CMD_OBJECT_DESTROY,
-    RGFX_CMD_QUEUE_CREATE, RGFX_CMD_RENDER_PIPELINE_CREATE, RGFX_CMD_SAMPLER_CREATE,
-    RGFX_CMD_SHARED_EVENT_CREATE, RGFX_CMD_TEXTURE_CREATE, RGFX_CMD_TEXTURE_FROM_BUFFER,
-    RGFX_CMD_TEXTURE_FROM_IOSURFACE,
+    RGFX_CMD_QUEUE_CREATE, RGFX_CMD_RENDER_PIPELINE_CREATE, RGFX_CMD_RESOURCE_ID_CHUNK,
+    RGFX_CMD_SAMPLER_CREATE, RGFX_CMD_SHARED_EVENT_CREATE, RGFX_CMD_TEXTURE_CREATE,
+    RGFX_CMD_TEXTURE_FROM_BUFFER, RGFX_CMD_TEXTURE_FROM_IOSURFACE, RGFX_RESOURCE_ID_CHUNK,
+    RGFX_RESOURCE_ID_CHUNKS, RGFX_RESOURCE_ID_LIMIT,
     RGFX_EVT_PIPELINE_REFLECTION, RGFX_PIPELINE_KIND_COMPUTE,
     RGFX_PIPELINE_KIND_RENDER, RGFX_PIPELINE_OK, RGFX_PIPELINE_REFLECT_SUPPORT_ICB,
     RGFX_PIPELINE_REFLECT_THREADGROUP_MATCHES_TILE, RGFX_PIPELINE_REFUSED, RgfxBufferAtOffset,
@@ -56,8 +57,8 @@ use reims_graphics::wire::{
     RgfxBufferOverHostMemory, RgfxDepthStencilCreate, RgfxHeapCreate, RgfxHeapOverHostMemory,
     RgfxMsgHeader, RgfxObjectCreate,
     RgfxObjectDestroy, RgfxPipelineReflection, RgfxQueueCreate, RgfxRenderPipelineCreate,
-    RgfxSamplerCreate, RgfxSharedEventCreate, RgfxStencilDescriptor, RgfxTextureCreate,
-    RgfxTextureDescriptor, RgfxTextureFromBuffer, RgfxTextureFromIOSurface,
+    RgfxResourceIdChunk, RgfxSamplerCreate, RgfxSharedEventCreate, RgfxStencilDescriptor,
+    RgfxTextureCreate, RgfxTextureDescriptor, RgfxTextureFromBuffer, RgfxTextureFromIOSurface,
 };
 use reims_vgpu_core::host::HostPtr;
 use reims_vgpu_core::platform::device::GpuDevice;
@@ -134,6 +135,11 @@ pub enum DecodeError {
     Refused,
     /// The message named an object the host does not hold, or of the wrong kind.
     BadReference,
+    /// A texture create's resource id lies in no chunk its context holds
+    /// (`RESOURCE_ID_CHUNK`): 0, at or past [`RGFX_RESOURCE_ID_LIMIT`], or another
+    /// context's. The platform is not called, so no id the host's Metal ends the
+    /// process for reaches it.
+    BadResourceId,
 }
 
 /// The stage-3 decoder for one device: the `obj_id` → handle table and the
@@ -156,6 +162,11 @@ pub struct GraphicsDecoder<P: Platform> {
     library_cache: LibraryCache<P>,
     /// The key of each id the cache's entries are named by.
     cached_libraries: HashMap<u64, LibraryKey>,
+    /// The context holding each chunk of the texture resource ids, by chunk, as
+    /// `RESOURCE_ID_CHUNK` gave it, until its `CONTEXT_CLOSE`: every process's
+    /// textures share the one device's ids, so a texture create's id must lie in
+    /// a chunk of its own context ([`Self::holds_resource_id`]).
+    id_chunks: Box<[Option<u32>]>,
     /// Where a command buffer's completion record goes once its work finishes;
     /// `None` builds and drops it (the ring loop sets a sink later).
     completion_sink: Option<CompletionSink>,
@@ -180,6 +191,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             making_libraries: HashMap::new(),
             library_cache: LibraryCache::new(RELEASED_BUDGET),
             cached_libraries: HashMap::new(),
+            id_chunks: vec![None; RGFX_RESOURCE_ID_CHUNKS as usize].into_boxed_slice(),
             completion_sink: None,
             reflection_sink: None,
             region,
@@ -228,8 +240,14 @@ impl<P: Platform> GraphicsDecoder<P> {
 
     /// Drops every object of context `context`: those whose id lies in its range,
     /// `context << RGFX_CONTEXT_OBJ_ID_SHIFT` and up, below the next context's (its process closed
-    /// the device or died). How many were dropped.
+    /// the device or died), and its chunks of the texture resource ids. How many objects were
+    /// dropped.
     pub(crate) fn drop_context(&mut self, context: u32) -> usize {
+        for holder in self.id_chunks.iter_mut() {
+            if *holder == Some(context) {
+                *holder = None;
+            }
+        }
         let ours = |id: &u64| (id >> RGFX_CONTEXT_OBJ_ID_SHIFT) == u64::from(context);
         let before = self.objects.len();
         self.objects.retain(|id, _| !ours(id));
@@ -243,6 +261,27 @@ impl<P: Platform> GraphicsDecoder<P> {
             self.forget_library(id);
         }
         before - self.objects.len()
+    }
+
+    /// Whether texture resource id `id` lies in a chunk that the context of object
+    /// `obj_id` holds: never 0, and always below [`RGFX_RESOURCE_ID_LIMIT`].
+    fn holds_resource_id(&self, obj_id: u64, id: u64) -> bool {
+        if id == 0 || id >= RGFX_RESOURCE_ID_LIMIT {
+            return false;
+        }
+        let context = obj_id >> RGFX_CONTEXT_OBJ_ID_SHIFT;
+        self.id_chunks
+            .get(((id - 1) / RGFX_RESOURCE_ID_CHUNK) as usize)
+            .copied()
+            .flatten()
+            .is_some_and(|holder| u64::from(holder) == context)
+    }
+
+    /// Gives context `context` chunk `chunk` of the texture resource ids, as a
+    /// `RESOURCE_ID_CHUNK` does.
+    #[cfg(test)]
+    pub(crate) fn hold_resource_ids(&mut self, context: u32, chunk: u32) {
+        self.id_chunks[chunk as usize] = Some(context);
     }
 
     /// Carries out one wire message against `device`: a create inserts the new
@@ -268,6 +307,18 @@ impl<P: Platform> GraphicsDecoder<P> {
                 if matches!(self.objects.remove(&m.obj_id), Some(ObjHandle::Texture(_))) {
                     self.surfaces.retain(|_, texture| *texture != m.obj_id);
                 }
+                Ok(Ok(()))
+            }
+            RGFX_CMD_RESOURCE_ID_CHUNK => {
+                let Some(m) = read::<RgfxResourceIdChunk>(message) else {
+                    return Ok(Err(DecodeError::Malformed));
+                };
+                // The kext's grant: the context holds the chunk until its close. A
+                // chunk past the pool is not one.
+                let Some(holder) = self.id_chunks.get_mut(m.chunk as usize) else {
+                    return Ok(Err(DecodeError::BadResourceId));
+                };
+                *holder = Some(m.context);
                 Ok(Ok(()))
             }
             RGFX_CMD_EVENT_CREATE => {
@@ -471,6 +522,9 @@ impl<P: Platform> GraphicsDecoder<P> {
                 let Some(m) = read::<RgfxTextureCreate>(message) else {
                     return Ok(Err(DecodeError::Malformed));
                 };
+                if !self.holds_resource_id(m.obj_id, m.resource_id) {
+                    return Ok(Err(DecodeError::BadResourceId));
+                }
                 // The guest picks the resource id, pinned as the texture's
                 // resource index so its argument buffers name the same texture
                 // the host made. `texture_descriptor` forwards the raw pixel
@@ -515,6 +569,9 @@ impl<P: Platform> GraphicsDecoder<P> {
                 let Some(m) = read::<RgfxTextureFromBuffer>(message) else {
                     return Ok(Err(DecodeError::Malformed));
                 };
+                if !self.holds_resource_id(m.obj_id, m.resource_id) {
+                    return Ok(Err(DecodeError::BadResourceId));
+                }
                 let desc = texture_desc(&m.desc, m.resource_id);
                 let descriptor = self.platform.texture_descriptor(&desc);
                 // The texture reads the guest's named buffer; a buffer the host
@@ -534,6 +591,9 @@ impl<P: Platform> GraphicsDecoder<P> {
                 let Some(m) = read::<RgfxTextureFromIOSurface>(message) else {
                     return Ok(Err(DecodeError::Malformed));
                 };
+                if !self.holds_resource_id(m.obj_id, m.resource_id) {
+                    return Ok(Err(DecodeError::BadResourceId));
+                }
                 // Placed as TEXTURE_FROM_BUFFER places a texture, over the buffer
                 // the guest keeps its copy of the plane in; a buffer the host does
                 // not hold is a guest protocol error.
@@ -1057,8 +1117,8 @@ fn read<T: FromBytes>(message: &[u8]) -> Option<T> {
 
 /// The core texture descriptor values from a wire texture descriptor, with the
 /// guest-picked resource id pinned as the texture's resource index (the SPI the
-/// guest's argument buffers name it by). A 0 `resource_id` leaves the id to the
-/// platform, and a 0 swizzle leaves Metal's identity swizzle.
+/// guest's argument buffers name it by), which the caller checked lies in its
+/// context's chunks. A 0 swizzle leaves Metal's identity swizzle.
 fn texture_desc(d: &RgfxTextureDescriptor, resource_id: u64) -> TextureDesc {
     TextureDesc {
         texture_type: d.texture_type.into(),
@@ -1081,7 +1141,7 @@ fn texture_desc(d: &RgfxTextureDescriptor, resource_id: u64) -> TextureDesc {
                 alpha,
             }
         }),
-        resource_index: (resource_id != 0).then_some((resource_id, true)),
+        resource_index: Some((resource_id, true)),
         ..TextureDesc::default()
     }
 }
@@ -1297,6 +1357,18 @@ mod tests {
             ..RgfxBufferCreate::default()
         };
         assert_eq!(dec.decode(&device, buffer.as_bytes()).unwrap(), Ok(()));
+
+        // The kext gives this context (0) the chunk of resource ids 65 to 128.
+        let grant = RgfxResourceIdChunk {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_RESOURCE_ID_CHUNK,
+                size: size_of::<RgfxResourceIdChunk>() as u32,
+                seqno: 0,
+            },
+            context: 0,
+            chunk: 1,
+        };
+        assert_eq!(dec.decode(&device, grant.as_bytes()).unwrap(), Ok(()));
 
         // A device-placed render-target texture of a non-default shape, with its
         // resource id pinned and the identity swizzle.
@@ -1549,6 +1621,174 @@ mod tests {
             Err(DecodeError::BadReference)
         );
         assert!(dec.surface_texture(0x77).is_none());
+    }
+
+    /// A texture create is carried out only where its resource id lies in a chunk its own
+    /// context holds (`RESOURCE_ID_CHUNK`, until the context's close). An id of 0, one at or
+    /// past the limit, one in no context's chunk and one in another context's are refused
+    /// before any platform call, so none reaches the platform's own limit, and the decoder goes
+    /// on.
+    #[test]
+    fn refuses_texture_ids_outside_the_context_chunks() {
+        let p = Arc::new(FakePlatform::new());
+        let device = p.device();
+        let mut dec = GraphicsDecoder::<FakePlatform>::new(
+            Arc::clone(&p),
+            Arc::new(Region::new(0x10000).unwrap()),
+        );
+        let obj = |context: u64, n: u64| (context << RGFX_CONTEXT_OBJ_ID_SHIFT) | n;
+        let grant = |context: u32, chunk: u32| RgfxResourceIdChunk {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_RESOURCE_ID_CHUNK,
+                size: size_of::<RgfxResourceIdChunk>() as u32,
+                seqno: 0,
+            },
+            context,
+            chunk,
+        };
+        let desc = RgfxTextureDescriptor {
+            pixel_format: 80,
+            texture_type: 2,
+            width: 64,
+            height: 64,
+            depth: 1,
+            mipmap_level_count: 1,
+            array_length: 1,
+            sample_count: 1,
+            usage: 5,
+            ..RgfxTextureDescriptor::default()
+        };
+        let texture = |obj_id: u64, resource_id: u64| RgfxTextureCreate {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_TEXTURE_CREATE,
+                size: size_of::<RgfxTextureCreate>() as u32,
+                seqno: 0,
+            },
+            obj_id,
+            resource_id,
+            desc,
+            ..RgfxTextureCreate::default()
+        };
+        let made = |dec: &mut GraphicsDecoder<FakePlatform>, obj_id: u64, resource_id: u64| {
+            dec.decode(&device, texture(obj_id, resource_id).as_bytes())
+                .unwrap()
+        };
+
+        // Context 1 holds chunk 0 (ids 1 to 64), and context 2 the last chunk (ids 16257 to
+        // 16320). A chunk past the pool is no chunk.
+        assert_eq!(dec.decode(&device, grant(1, 0).as_bytes()).unwrap(), Ok(()));
+        assert_eq!(
+            dec.decode(&device, grant(2, RGFX_RESOURCE_ID_CHUNKS - 1).as_bytes())
+                .unwrap(),
+            Ok(())
+        );
+        assert_eq!(
+            dec.decode(&device, grant(1, RGFX_RESOURCE_ID_CHUNKS).as_bytes())
+                .unwrap(),
+            Err(DecodeError::BadResourceId)
+        );
+
+        // Each context's ids, at both ends of its chunk.
+        assert_eq!(made(&mut dec, obj(1, 1), 1), Ok(()));
+        assert_eq!(made(&mut dec, obj(1, 2), 64), Ok(()));
+        assert_eq!(made(&mut dec, obj(2, 1), 16257), Ok(()));
+        assert_eq!(made(&mut dec, obj(2, 2), 16320), Ok(()));
+
+        // 0; the next chunk's first id, which no context holds; another context's ids; the ids
+        // past the last chunk, below the limit; the limit; and far past it.
+        for (obj_id, id) in [
+            (obj(1, 3), 0),
+            (obj(1, 4), 65),
+            (obj(1, 5), 16257),
+            (obj(2, 3), 1),
+            (obj(2, 4), 16321),
+            (obj(2, 5), RGFX_RESOURCE_ID_LIMIT),
+            (obj(2, 6), 1 << 20),
+            (obj(1, 6), u64::MAX),
+        ] {
+            assert_eq!(
+                made(&mut dec, obj_id, id),
+                Err(DecodeError::BadResourceId),
+                "id {id}"
+            );
+        }
+
+        // A texture over a buffer and one over an IOSurface are checked the same way, and a
+        // refused surface texture leaves the surface unnamed.
+        let buffer = RgfxBufferCreate {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_BUFFER_CREATE,
+                size: size_of::<RgfxBufferCreate>() as u32,
+                seqno: 0,
+            },
+            obj_id: obj(1, 10),
+            length: 65536,
+            ..RgfxBufferCreate::default()
+        };
+        assert_eq!(dec.decode(&device, buffer.as_bytes()).unwrap(), Ok(()));
+        let from_buffer = |obj_id: u64, resource_id: u64| RgfxTextureFromBuffer {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_TEXTURE_FROM_BUFFER,
+                size: size_of::<RgfxTextureFromBuffer>() as u32,
+                seqno: 0,
+            },
+            obj_id,
+            resource_id,
+            buffer_obj_id: obj(1, 10),
+            offset: 0,
+            bytes_per_row: 64 * 4,
+            desc,
+        };
+        assert_eq!(
+            dec.decode(&device, from_buffer(obj(1, 11), 70).as_bytes())
+                .unwrap(),
+            Err(DecodeError::BadResourceId)
+        );
+        assert_eq!(
+            dec.decode(&device, from_buffer(obj(1, 11), 3).as_bytes())
+                .unwrap(),
+            Ok(())
+        );
+        let from_surface = RgfxTextureFromIOSurface {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_TEXTURE_FROM_IOSURFACE,
+                size: size_of::<RgfxTextureFromIOSurface>() as u32,
+                seqno: 0,
+            },
+            obj_id: obj(1, 12),
+            resource_id: 16300,
+            buffer_obj_id: obj(1, 10),
+            offset: 0,
+            bytes_per_row: 64 * 4,
+            iosurface_id: 0x55,
+            plane: 0,
+            desc,
+        };
+        assert_eq!(
+            dec.decode(&device, from_surface.as_bytes()).unwrap(),
+            Err(DecodeError::BadResourceId)
+        );
+        assert!(dec.surface_texture(0x55).is_none());
+
+        // Only the textures in their contexts' chunks reached the platform.
+        let log = p.call_log();
+        assert_eq!(log.calls_to("newTextureWithDescriptor:").len(), 4);
+        assert_eq!(
+            log.calls_to("newTextureWithDescriptor:offset:bytesPerRow:")
+                .len(),
+            1
+        );
+
+        // Context 1's chunk goes at its close: its ids are refused to the next context until
+        // the kext gives it the chunk. Context 2's stays.
+        dec.drop_context(1);
+        assert_eq!(
+            made(&mut dec, obj(3, 1), 5),
+            Err(DecodeError::BadResourceId)
+        );
+        assert_eq!(dec.decode(&device, grant(3, 0).as_bytes()).unwrap(), Ok(()));
+        assert_eq!(made(&mut dec, obj(3, 1), 5), Ok(()));
+        assert_eq!(made(&mut dec, obj(2, 7), 16319), Ok(()));
     }
 
     /// A render and a compute pipeline create each resolve their functions from a

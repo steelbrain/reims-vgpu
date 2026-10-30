@@ -206,6 +206,7 @@ include = [
     "RgfxRenderPassStencilAttachment",
     "RgfxRenderPipelineCreate",
     "RgfxResourceBinding",
+    "RgfxResourceIdChunk",
     "RgfxRingHeader",
     "RgfxSamplerBinding",
     "RgfxSamplerCreate",

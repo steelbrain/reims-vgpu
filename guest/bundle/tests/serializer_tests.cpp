@@ -45,6 +45,141 @@ void test_id_space()
 	CHECK(b >= a + 100); // disjoint ranges, b after a
 }
 
+// A chunk source standing in for the kext: it hands each first id of `firsts` in turn, then
+// answers none left, and counts its calls (the user-client calls a create would make).
+struct FakeChunks {
+	std::vector<uint64_t> firsts;
+	size_t next = 0;
+	int calls = 0;
+};
+
+bool fakeChunk(void *context, uint64_t *first_id)
+{
+	FakeChunks *f = static_cast<FakeChunks *>(context);
+	f->calls++;
+	if (f->next == f->firsts.size())
+		return false;
+	*first_id = f->firsts[f->next++];
+	return true;
+}
+
+void test_resource_id_chunks()
+{
+	const uint64_t chunk = RGFX_RESOURCE_ID_CHUNK;
+
+	// With no source, the ids are the whole pool's, in order, to its last whole chunk below
+	// the limit; then none, until one is given back.
+	{
+		RgfxIdSpace ids;
+		const uint64_t last = RGFX_RESOURCE_ID_CHUNKS * chunk;
+		CHECK(last < RGFX_RESOURCE_ID_LIMIT);
+		for (uint64_t id = 1; id <= last; id++)
+			CHECK(ids.allocResourceId() == id);
+		CHECK(ids.allocResourceId() == 0);
+		ids.freeResourceId(100);
+		CHECK(ids.allocResourceId() == 100);
+		CHECK(ids.allocResourceId() == 0);
+	}
+
+	// From the kext's chunks: 7 (ids 449 to 512), then 3 (ids 193 to 256), then none.
+	FakeChunks f;
+	f.firsts = {1 + 7 * chunk, 1 + 3 * chunk};
+	RgfxIdSpace ids;
+	ids.setResourceIdSource(&fakeChunk, &f);
+
+	// Take: the first id takes a chunk; its other 63 take no other.
+	CHECK(ids.allocResourceId() == 449);
+	CHECK(f.calls == 1);
+	for (uint64_t id = 450; id <= 512; id++)
+		CHECK(ids.allocResourceId() == id);
+	CHECK(f.calls == 1);
+
+	// Free and reuse: the lowest id given back comes first, and no chunk is taken.
+	ids.freeResourceId(460);
+	ids.freeResourceId(455);
+	CHECK(ids.allocResourceId() == 455);
+	CHECK(ids.allocResourceId() == 460);
+	CHECK(f.calls == 1);
+
+	// Refill: with the chunk full, the next id is a new chunk's first.
+	CHECK(ids.allocResourceId() == 193);
+	CHECK(f.calls == 2);
+	// The chunks are tried in the order taken, so an id given back to the first comes before
+	// the second's next.
+	ids.freeResourceId(500);
+	CHECK(ids.allocResourceId() == 500);
+	CHECK(ids.allocResourceId() == 194);
+
+	// 0, an id of a chunk the process does not hold, and ids past the pool are ignored.
+	ids.freeResourceId(0);
+	ids.freeResourceId(1);
+	ids.freeResourceId(RGFX_RESOURCE_ID_LIMIT - 1);
+	ids.freeResourceId(RGFX_RESOURCE_ID_LIMIT);
+	ids.freeResourceId(~0ull);
+
+	// Exhaustion: once both chunks are full and the source has none, no id, each time asked.
+	for (uint64_t id = 195; id <= 256; id++)
+		CHECK(ids.allocResourceId() == id);
+	CHECK(ids.allocResourceId() == 0);
+	CHECK(f.calls == 3);
+	CHECK(ids.allocResourceId() == 0);
+	CHECK(f.calls == 4);
+	// An id given back is taken again with no call.
+	ids.freeResourceId(200);
+	CHECK(ids.allocResourceId() == 200);
+	CHECK(f.calls == 4);
+
+	// A chunk that is not one of the pool's (not a chunk's first id, past the pool, 0), or
+	// one held already, gives no id.
+	FakeChunks bad;
+	bad.firsts = {2, 1 + RGFX_RESOURCE_ID_CHUNKS * chunk, 0, 1 + 5 * chunk, 1 + 5 * chunk};
+	RgfxIdSpace badIds;
+	badIds.setResourceIdSource(&fakeChunk, &bad);
+	CHECK(badIds.allocResourceId() == 0);
+	CHECK(badIds.allocResourceId() == 0);
+	CHECK(badIds.allocResourceId() == 0);
+	CHECK(badIds.allocResourceId() == 1 + 5 * chunk);
+	for (uint64_t i = 1; i < chunk; i++)
+		CHECK(badIds.allocResourceId() == 1 + 5 * chunk + i);
+	CHECK(badIds.allocResourceId() == 0);
+
+	// A texture create with no id left posts nothing and answers no object; one given back
+	// lets the next create go out with it.
+	TestRing ring(0x8000);
+	RgfxRingWriter writer(ring.base(), ring.dataSize, RGFX_CONTROL_RING_ID, TestRing::doorbell,
+	                      nullptr);
+	FakeChunks one;
+	one.firsts = {1 + 9 * chunk};
+	RgfxIdSpace serIds;
+	serIds.setResourceIdSource(&fakeChunk, &one);
+	RgfxSerializer ser(writer, serIds);
+	RgfxTextureDescriptor desc = {};
+	desc.pixel_format = 80;
+	desc.texture_type = 2;
+	desc.width = desc.height = desc.depth = 1;
+	desc.mipmap_level_count = desc.array_length = desc.sample_count = 1;
+	for (uint64_t i = 0; i < chunk; i++) {
+		RgfxCreated t = ser.createTexture(desc);
+		CHECK(t.posted && t.resource_id == 1 + 9 * chunk + i);
+		auto tm = expectMessage<RgfxTextureCreate>(ring, RGFX_CMD_TEXTURE_CREATE);
+		CHECK(tm.resource_id == t.resource_id);
+	}
+	RgfxCreated none = ser.createTexture(desc);
+	CHECK(!none.posted && none.obj_id == 0 && none.resource_id == 0 && none.gpu_address == 0);
+	RgfxCreated noneFromBuffer = ser.createTextureFromBuffer(1, 0, 4, desc);
+	CHECK(!noneFromBuffer.posted && noneFromBuffer.resource_id == 0);
+	RgfxCreated noneFromSurface = ser.createTextureFromIOSurface(1, 0, 4, 0x55, 0, desc);
+	CHECK(!noneFromSurface.posted && noneFromSurface.resource_id == 0);
+	RgfxMsgHeader h = {};
+	std::vector<uint8_t> bytes;
+	CHECK(!ring.next(&h, &bytes));
+	ser.releaseResourceId(1 + 9 * chunk + 3);
+	RgfxCreated again = ser.createTexture(desc);
+	CHECK(again.posted && again.resource_id == 1 + 9 * chunk + 3);
+	auto am = expectMessage<RgfxTextureCreate>(ring, RGFX_CMD_TEXTURE_CREATE);
+	CHECK(am.resource_id == again.resource_id && am.obj_id == again.obj_id);
+}
+
 void test_caps()
 {
 	RgfxCaps caps;
@@ -858,6 +993,7 @@ void test_keyed_library_messages()
 int main()
 {
 	test_id_space();
+	test_resource_id_chunks();
 	test_caps();
 	test_lifecycle_messages();
 	test_library_message();

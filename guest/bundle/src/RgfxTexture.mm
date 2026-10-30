@@ -51,6 +51,9 @@ RgfxTextureDescriptor rgfxTextureDescriptorFromMTL(MTLTextureDescriptor *d)
 	}
 	RgfxTextureDescriptor desc = rgfxTextureDescriptorFromMTL(descriptor);
 	RgfxCreated created = serializer->createTexture(desc, heap, heapOffset);
+	if (created.resource_id == 0) {
+		return nil; // no resource id left: no texture, as Metal answers one it cannot make
+	}
 	return [[RgfxTexture alloc] initWithObjId:created.obj_id
 	                              gpuAddress:created.gpu_address
 	                              resourceId:created.resource_id
@@ -73,6 +76,14 @@ RgfxTextureDescriptor rgfxTextureDescriptorFromMTL(MTLTextureDescriptor *d)
 		_resourceId = resourceId;
 	}
 	return self;
+}
+
+- (void)dealloc
+{
+	// The id goes back to the process's chunks, for its next texture.
+	if (_serializer != nullptr) {
+		_serializer->releaseResourceId(_resourceId);
+	}
 }
 
 // --- MTLTexture shape (from the stored descriptor) ---------------------------

@@ -97,17 +97,25 @@ pub const RGFX_CONTEXT_ALLOCATIONS_OFFSET: u64 = RGFX_ALLOCATIONS_OFFSET + RGFX_
 /// `c << RGFX_CONTEXT_OBJ_ID_SHIFT` and up, below the next context's: the guest bundle picks them
 /// there, and `CONTEXT_CLOSE` drops the context's.
 pub const RGFX_CONTEXT_OBJ_ID_SHIFT: u32 = 40;
-/// How many processes hold the device at once: each holds one slot of the GPU address and texture
-/// resource-id spaces, which the kext hands out with its context.
+/// How many processes hold the device at once: each holds one slot of the GPU address space,
+/// which the kext hands out with its context.
 pub const RGFX_CONTEXT_SLOTS: u32 = 32;
 /// Where slot 0's GPU addresses start; slot `s`'s start [`RGFX_CONTEXT_VA_SPAN`] bytes a slot
 /// later.
 pub const RGFX_CONTEXT_VA_BASE: u64 = 0x1_0000_0000;
 /// The GPU addresses each slot picks from.
 pub const RGFX_CONTEXT_VA_SPAN: u64 = 0x10_0000_0000;
-/// The texture resource ids each slot picks from: slot `s`'s are `1 + s * RGFX_CONTEXT_RESOURCE_IDS`
-/// and up.
-pub const RGFX_CONTEXT_RESOURCE_IDS: u64 = 2048;
+/// The first texture resource id the host refuses: every process's textures share the host
+/// device's one space of ids, and Metal ends the process for a texture placed at 16381 or more
+/// (measured on an M4 and an M3 Max; metal2vulkan refuses it, as it imitates that).
+pub const RGFX_RESOURCE_ID_LIMIT: u64 = 16381;
+/// The texture resource ids in one chunk. The kext hands the processes their ids in chunks, from
+/// one pool for the guest ([`RGFX_RESOURCE_ID_CHUNKS`]): chunk `k` holds ids `1 + k * 64` to
+/// `64 + k * 64`, so a chunk's free ids fit in one 64-bit mask in the bundle.
+pub const RGFX_RESOURCE_ID_CHUNK: u64 = 64;
+/// How many chunks of texture resource ids the pool holds: every whole chunk below
+/// [`RGFX_RESOURCE_ID_LIMIT`].
+pub const RGFX_RESOURCE_ID_CHUNKS: u32 = 255;
 /// The control submission ring's id, which the guest writes to `DOORBELL`.
 pub const RGFX_CONTROL_RING_ID: u32 = 0;
 /// The control completion ring's MSI-X vector.
@@ -278,6 +286,12 @@ pub const RGFX_CMD_LIBRARY_LOOKUP: u32 = 0x213;
 /// [`RGFX_EVT_COMPLETE`]; the kext destroyed its queues before it, and frees its blocks once it is
 /// answered.
 pub const RGFX_CMD_CONTEXT_CLOSE: u32 = 0x2f0;
+/// `RESOURCE_ID_CHUNK` ([`RgfxResourceIdChunk`]), on ring 0 from the accelerator kext: the kext
+/// gave context `context` chunk `chunk` of the texture resource ids ([`RGFX_RESOURCE_ID_CHUNK`]),
+/// which it holds until its `CONTEXT_CLOSE`. Posted before the process learns of the chunk, so it
+/// comes before every create naming one of its ids. Not answered. A texture create whose id lies
+/// in no chunk of its context is refused.
+pub const RGFX_CMD_RESOURCE_ID_CHUNK: u32 = 0x2f1;
 
 /// Command `COMMAND_BUFFER` (a per-queue submission ring): one command buffer,
 /// its `obj_id` followed by the encoder-op byte stream. Struct and op stream in
@@ -558,6 +572,15 @@ const _: () = {
     assert!(RGFX_ALLOCATIONS_OFFSET.is_multiple_of(0x1000));
     assert!(RGFX_CONTEXT_ALLOCATIONS_OFFSET.is_multiple_of(0x1000));
     assert!(size_of::<RgfxContextClose>() == 24);
+    assert!(size_of::<RgfxResourceIdChunk>() == 24);
+    // Every chunk's ids lie below the limit (the last chunk's last id is CHUNKS * CHUNK), and
+    // no whole chunk more fits there.
+    assert!(RGFX_RESOURCE_ID_CHUNKS as u64 * RGFX_RESOURCE_ID_CHUNK < RGFX_RESOURCE_ID_LIMIT);
+    assert!(
+        1 + (RGFX_RESOURCE_ID_CHUNKS as u64 + 1) * RGFX_RESOURCE_ID_CHUNK > RGFX_RESOURCE_ID_LIMIT
+    );
+    // The bundle keeps a chunk's free ids in one 64-bit mask.
+    assert!(RGFX_RESOURCE_ID_CHUNK == 64);
     // Every slot's GPU addresses lie below the Metal address space's end, 2^47.
     assert!(RGFX_CONTEXT_VA_BASE + RGFX_CONTEXT_SLOTS as u64 * RGFX_CONTEXT_VA_SPAN <= 1u64 << 47);
 };
@@ -647,6 +670,21 @@ pub struct RgfxContextClose {
     pub context: u32,
     /// Zero.
     pub reserved_14: u32,
+}
+
+/// `RESOURCE_ID_CHUNK`: context `context` holds chunk `chunk` of the texture resource ids.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxResourceIdChunk {
+    /// [`RGFX_CMD_RESOURCE_ID_CHUNK`].
+    pub header: RgfxMsgHeader,
+    /// The context.
+    pub context: u32,
+    /// The chunk, below [`RGFX_RESOURCE_ID_CHUNKS`]: ids `1 + chunk * RGFX_RESOURCE_ID_CHUNK` and
+    /// up.
+    pub chunk: u32,
 }
 
 /// `HEAP_CREATE`: a device heap of `size_bytes` at the guest-picked

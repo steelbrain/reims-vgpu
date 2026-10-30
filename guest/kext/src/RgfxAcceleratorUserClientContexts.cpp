@@ -1,9 +1,9 @@
 /*
  * RgfxAcceleratorUserClient's context selectors (RgfxAccelerator.hpp names them): the Metal
- * process's context, its region blocks and its command queues, all released when the client
- * closes or its process dies (releaseContext): its queues are closed, then its context (the
- * device drops its objects), then its blocks are freed, so no block is handed out again while the
- * device still reads a ring in it.
+ * process's context, its region blocks, its chunks of texture resource ids and its command
+ * queues, all released when the client closes or its process dies (releaseContext): its queues
+ * are closed, then its context (the device drops its objects), then its chunks and blocks are
+ * freed, so no block or id is handed out again while the device still holds what used it.
  *
  * Our own code; it names only SDK-public IOKit calls.
  */
@@ -31,7 +31,7 @@ IOReturn RgfxAcceleratorUserClient::contextMethod(uint32_t selector,
 	uint64_t *out = a->scalarOutput;
 	switch (selector) {
 	case kRgfxAccelMethodOpenContext: {
-		if (a->scalarOutputCount != 4)
+		if (a->scalarOutputCount != 3)
 			return kIOReturnBadArgument;
 		IOLockLock(queueLock);
 		if (!hasContext) {
@@ -45,9 +45,21 @@ IOReturn RgfxAcceleratorUserClient::contextMethod(uint32_t selector,
 		out[0] = context;
 		out[1] = static_cast<uint64_t>(context) << RGFX_CONTEXT_OBJ_ID_SHIFT;
 		out[2] = RGFX_CONTEXT_VA_BASE + static_cast<uint64_t>(slot) * RGFX_CONTEXT_VA_SPAN;
-		out[3] = 1 + static_cast<uint64_t>(slot) * RGFX_CONTEXT_RESOURCE_IDS;
 		IOLockUnlock(queueLock);
 		return kIOReturnSuccess;
+	}
+	case kRgfxAccelMethodResourceIds: {
+		if (a->scalarOutputCount != 1)
+			return kIOReturnBadArgument;
+		// Under the queue lock, so a chunk is never taken for a context releaseContext has
+		// closed: no grant follows its CONTEXT_CLOSE, and no chunk outlives its freeIdChunks.
+		IOLockLock(queueLock);
+		UInt64 first = 0;
+		IOReturn r = hasContext ? owner->takeIdChunk(this, context, &first)
+		                        : kIOReturnBadArgument;
+		IOLockUnlock(queueLock);
+		out[0] = first;
+		return r;
 	}
 	case kRgfxAccelMethodAlloc: {
 		if (a->scalarInputCount != 2 || a->scalarOutputCount != 1 || !hasContext)
@@ -201,6 +213,7 @@ void RgfxAcceleratorUserClient::releaseContext()
 		accel->closeQueue(queues[i]);
 	queueCount = 0;
 	accel->closeContext(context, slot);
+	accel->freeIdChunks(this);
 	accel->freeBlocks(this);
 	hasContext = false;
 	IOLockUnlock(queueLock);

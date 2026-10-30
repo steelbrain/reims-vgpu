@@ -49,7 +49,7 @@ NS_ASSUME_NONNULL_BEGIN
 /// A texture of shape `descriptor` over plane `plane` of `surface`, in this process's
 /// copy of the plane, which is made in `region` on first use and synced from the
 /// surface's pages. Nil when the surface has no such plane, its plane has no CPU
-/// mapping, or the region has no room.
+/// mapping, the region has no room, or no texture resource id is left.
 + (nullable instancetype)textureWithDescriptor:(MTLTextureDescriptor *)descriptor
                                      iosurface:(IOSurfaceRef)surface
                                          plane:(NSUInteger)plane

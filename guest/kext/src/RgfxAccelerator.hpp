@@ -80,8 +80,7 @@ enum {
 // 0) only, numbered clear of the selectors Apple's IOGPU base drives on its type-0 client.
 enum {
 	// Opens the client's context. No input; out: the context number c, the object-id base
-	// (c << RGFX_CONTEXT_OBJ_ID_SHIFT), the GPU-address base and the texture resource-id
-	// base of the context's slot.
+	// (c << RGFX_CONTEXT_OBJ_ID_SHIFT) and the GPU-address base of the context's slot.
 	kRgfxAccelMethodOpenContext = 0x100,
 	// A region block: in size, align (a power of two); out: its region offset.
 	kRgfxAccelMethodAlloc = 0x101,
@@ -100,6 +99,11 @@ enum {
 	// ReimsGraphics::kLifecycleMessageMax bytes; out: the seqno, and for a pipeline create, its
 	// reflection (RgfxPipelineReflection) as struct out, once the device has answered.
 	kRgfxAccelMethodSubmit = 0x105,
+	// Gives the client's context a chunk of RGFX_RESOURCE_ID_CHUNK texture resource ids, from
+	// the guest's one pool of RGFX_RESOURCE_ID_CHUNKS: no input; out: the chunk's first id.
+	// kIOReturnNoResources once every chunk is held. The device has the grant
+	// (RESOURCE_ID_CHUNK) before it returns; the context holds the chunk until its close.
+	kRgfxAccelMethodResourceIds = 0x106,
 };
 
 // A block the accelerator handed out of the region, and its owner.
@@ -139,9 +143,14 @@ public:
 	ReimsGraphics *copyFramebuffer();
 
 	// The processes' contexts (RgfxAcceleratorContexts.cpp). A context number is handed out once
-	// (from 1); a slot of the GPU-address and resource-id spaces is held until the close.
+	// (from 1); a slot of the GPU-address space is held until the close.
 	IOReturn openContext(UInt32 *context, UInt32 *slot);
 	void closeContext(UInt32 context, UInt32 slot);
+	// Chunks of the texture resource ids, each owned by `owner` for context `context` and posted
+	// to the device (RESOURCE_ID_CHUNK) before takeIdChunk returns its first id; the owner's are
+	// freed after its context's close is answered.
+	IOReturn takeIdChunk(const void *owner, UInt32 context, UInt64 *firstId);
+	void freeIdChunks(const void *owner);
 	// Blocks of the region past RGFX_CONTEXT_ALLOCATIONS_OFFSET, each owned by `owner`.
 	IOReturn allocBlock(const void *owner, UInt64 size, UInt64 align, UInt64 *offset);
 	IOReturn freeBlock(const void *owner, UInt64 offset);

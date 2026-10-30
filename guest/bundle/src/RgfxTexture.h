@@ -38,10 +38,12 @@ NS_ASSUME_NONNULL_BEGIN
 
 /// Creates a texture of shape `descriptor`. When `heap` is RGFX_OBJ_NONE the
 /// texture is device-placed (a GPU address is picked); otherwise it lies at
-/// `heapOffset` in the heap `heap`. A resource id is picked either way. Serialises
-/// an `RGFX_CMD_TEXTURE_CREATE` through `serializer`; `device` is the owning shell
-/// (nil in a unit test). Returns nil if `serializer` is null or `descriptor` is
-/// nil.
+/// `heapOffset` in the heap `heap`. A resource id is picked either way, and given
+/// back as the texture goes. Serialises an `RGFX_CMD_TEXTURE_CREATE` through
+/// `serializer`; `device` is the owning shell (nil in a unit test). Returns nil if
+/// `serializer` is null or `descriptor` is nil, or where no resource id is left
+/// (every chunk of the guest's pool is held), as Metal answers a texture it cannot
+/// make.
 + (nullable instancetype)textureWithDescriptor:(MTLTextureDescriptor *)descriptor
                                           heap:(RgfxObjId)heap
                                     heapOffset:(uint64_t)heapOffset
@@ -51,7 +53,8 @@ NS_ASSUME_NONNULL_BEGIN
 #ifdef __cplusplus
 /// Designated initialiser: wraps an already-created host texture. `objId`,
 /// `gpuAddress` (0 when heap-placed) and `resourceId` are the guest-picked values
-/// the create returned; `desc` is the mapped shape the getters answer from.
+/// the create returned; `desc` is the mapped shape the getters answer from. The
+/// texture gives `resourceId` back to `serializer` as it goes.
 - (instancetype)initWithObjId:(uint64_t)objId
                    gpuAddress:(uint64_t)gpuAddress
                    resourceId:(uint64_t)resourceId

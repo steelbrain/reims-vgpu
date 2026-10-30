@@ -697,8 +697,8 @@
 // there, and `CONTEXT_CLOSE` drops the context's.
 #define RGFX_CONTEXT_OBJ_ID_SHIFT 40
 
-// How many processes hold the device at once: each holds one slot of the GPU address and texture
-// resource-id spaces, which the kext hands out with its context.
+// How many processes hold the device at once: each holds one slot of the GPU address space,
+// which the kext hands out with its context.
 #define RGFX_CONTEXT_SLOTS 32
 
 // Where slot 0's GPU addresses start; slot `s`'s start [`RGFX_CONTEXT_VA_SPAN`] bytes a slot
@@ -708,9 +708,19 @@
 // The GPU addresses each slot picks from.
 #define RGFX_CONTEXT_VA_SPAN 68719476736
 
-// The texture resource ids each slot picks from: slot `s`'s are `1 + s * RGFX_CONTEXT_RESOURCE_IDS`
-// and up.
-#define RGFX_CONTEXT_RESOURCE_IDS 2048
+// The first texture resource id the host refuses: every process's textures share the host
+// device's one space of ids, and Metal ends the process for a texture placed at 16381 or more
+// (measured on an M4 and an M3 Max; metal2vulkan refuses it, as it imitates that).
+#define RGFX_RESOURCE_ID_LIMIT 16381
+
+// The texture resource ids in one chunk. The kext hands the processes their ids in chunks, from
+// one pool for the guest ([`RGFX_RESOURCE_ID_CHUNKS`]): chunk `k` holds ids `1 + k * 64` to
+// `64 + k * 64`, so a chunk's free ids fit in one 64-bit mask in the bundle.
+#define RGFX_RESOURCE_ID_CHUNK 64
+
+// How many chunks of texture resource ids the pool holds: every whole chunk below
+// [`RGFX_RESOURCE_ID_LIMIT`].
+#define RGFX_RESOURCE_ID_CHUNKS 255
 
 // The control submission ring's id, which the guest writes to `DOORBELL`.
 #define RGFX_CONTROL_RING_ID 0
@@ -884,6 +894,13 @@
 // [`RGFX_EVT_COMPLETE`]; the kext destroyed its queues before it, and frees its blocks once it is
 // answered.
 #define RGFX_CMD_CONTEXT_CLOSE 752
+
+// `RESOURCE_ID_CHUNK` ([`RgfxResourceIdChunk`]), on ring 0 from the accelerator kext: the kext
+// gave context `context` chunk `chunk` of the texture resource ids ([`RGFX_RESOURCE_ID_CHUNK`]),
+// which it holds until its `CONTEXT_CLOSE`. Posted before the process learns of the chunk, so it
+// comes before every create naming one of its ids. Not answered. A texture create whose id lies
+// in no chunk of its context is refused.
+#define RGFX_CMD_RESOURCE_ID_CHUNK 753
 
 // Command `COMMAND_BUFFER` (a per-queue submission ring): one command buffer,
 // its `obj_id` followed by the encoder-op byte stream. Struct and op stream in
@@ -3362,6 +3379,17 @@ typedef struct {
   // Pads to a multiple of 8; 0.
   uint32_t reserved_0c;
 } RgfxResourceBinding;
+
+// `RESOURCE_ID_CHUNK`: context `context` holds chunk `chunk` of the texture resource ids.
+typedef struct {
+  // [`RGFX_CMD_RESOURCE_ID_CHUNK`].
+  RgfxMsgHeader header;
+  // The context.
+  uint32_t context;
+  // The chunk, below [`RGFX_RESOURCE_ID_CHUNKS`]: ids `1 + chunk * RGFX_RESOURCE_ID_CHUNK` and
+  // up.
+  uint32_t chunk;
+} RgfxResourceIdChunk;
 
 // A ring's header, at the start of the ring: each field in a 64-byte line of its own, so the
 // producer's and the consumer's writes never share a cache line.

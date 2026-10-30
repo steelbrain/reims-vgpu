@@ -264,17 +264,37 @@ Metal.
 **Contexts.** Each process that opens the accelerator's user client gets a
 context from the kext: a number `c`, handed out once from 1 (its object ids are
 `c << 40` and up), and one of 32 slots, held until its close, for its GPU
-addresses (`0x1_0000_0000 + s << 36`) and texture resource ids
-(`1 + s * 2048`). The kext hands out its region blocks (first fit, page
-granular). The process hands each create and destroy of its objects (ids in its
-range) to the kext by a user-client call; the kext posts it on the control ring
-and, for a pipeline create, hands the reflection back once the host answers
-it. A queue's `QUEUE_CREATE` goes the same way, its rings checked to lie in the
-process's blocks, and is answered once the host has the rings. At the
-process's close or death the kext destroys its queues, then closes its context
-(`CONTEXT_CLOSE`: the host drops its objects, then answers), then frees its
-blocks. A command buffer is decoded once the host has carried out every
-control-ring message published before its queue's thread took it.
+addresses (`0x1_0000_0000 + s << 36`). The kext hands out its region blocks
+(first fit, page granular). The process hands each create and destroy of its
+objects (ids in its range) to the kext by a user-client call; the kext posts it
+on the control ring and, for a pipeline create, hands the reflection back once
+the host answers it. A queue's `QUEUE_CREATE` goes the same way, its rings
+checked to lie in the process's blocks, and is answered once the host has the
+rings. At the process's close or death the kext destroys its queues, then
+closes its context (`CONTEXT_CLOSE`: the host drops its objects, then
+answers), then frees its chunks of resource ids and its blocks. A command
+buffer is decoded once the host has carried out every control-ring message
+published before its queue's thread took it.
+
+**Texture resource ids.** Every process's textures share the host's one
+device, whose texture ids end below 16381: Metal ends the process for a texture
+placed at 16381 or more (measured on an M4 and an M3 Max), and metal2vulkan
+imitates that. So ids are not split by slot. The kext keeps one pool for the
+guest, 255 chunks of 64 ids (chunk `k` holds `1 + 64k` to `64 + 64k`, all below
+16321), and hands a process a chunk when it asks (user-client selector 0x106),
+posting the grant (`RESOURCE_ID_CHUNK`: context, chunk) on the control ring
+before it returns, so the host has it before any create naming its ids. The
+bundle keeps each chunk's free ids in one 64-bit mask, takes the lowest free id
+of the first chunk taken that has one, asks for a chunk only when all of its are
+in use, and gives an id back as its texture goes. A process keeps its chunks
+until its close. With every chunk held, a texture create answers nil, as Metal
+answers a texture it cannot make. The host carries out a texture create only
+where its id lies in a chunk of its own context (by the object id's context);
+any other id, 0 and the limit's included, is refused before any platform call,
+as a refused create is: unanswered, and a command buffer naming the texture
+fails. Sampler states and pipeline states take no guest-picked ids (the host
+numbers them), and the bundle makes no indirect command buffers, so textures
+are the only kind with chunks.
 
 **Rings.** A 256-byte header, then a byte ring whose size is a power of two
 (64 KiB minus the header for the control rings). Each header field sits in its

@@ -97,6 +97,8 @@ struct RgfxComputePipelineParams {
 /// is false when the ring had no room — the caller retries the create. `status` is
 /// the device's COMPLETE status for a create the device answers through the ring's
 /// forward (a library's), kRgfxNoAnswer where none came back; 0 for the others.
+/// A texture create with no resource id left (RgfxIdSpace::allocResourceId) posts
+/// nothing and answers every field 0: the caller makes no texture.
 struct RgfxCreated {
 	RgfxObjId obj_id;
 	uint64_t gpu_address;
@@ -155,6 +157,9 @@ public:
 	                                 uint32_t options);
 
 	// --- textures -------------------------------------------------------------
+
+	/// Gives a texture's resource id back as the texture goes (RgfxIdSpace::freeResourceId).
+	void releaseResourceId(uint64_t resource_id);
 
 	/// A texture of shape `desc`. When `heap` is RGFX_OBJ_NONE the texture is
 	/// device-placed at a picked GPU address; otherwise it lies at `heap_offset`

@@ -55,6 +55,11 @@ CHECK(offsetof(RgfxLibraryFromRegion, key) == 0x50);
 CHECK(sizeof(RgfxLibraryLookup) == 64);
 CHECK(offsetof(RgfxLibraryLookup, key) == 0x20);
 CHECK(RGFX_CMD_LIBRARY_LOOKUP == 0x213);
+CHECK(sizeof(RgfxResourceIdChunk) == 24);
+CHECK(RGFX_CMD_RESOURCE_ID_CHUNK == 0x2f1);
+CHECK(RGFX_RESOURCE_ID_LIMIT == 16381);
+CHECK(RGFX_RESOURCE_ID_CHUNK == 64);
+CHECK(RGFX_RESOURCE_ID_CHUNKS == 255);
 CHECK(RGFX_CONTROL_RING_ID == 0);
 CHECK(RGFX_CONTROL_VECTOR == 0);
 int main(void) { return 0; }
