@@ -10,6 +10,9 @@
 
 #import "RgfxMetalDevice.h"
 
+#import "RgfxBuffer.h"
+#import "RgfxTexture.h"
+
 // RGFX DIAG (Wall-2 trace; remove before merge): the guest's logd is broken, so
 // write diagnostics to a file any process (platform or not) can read.
 #include <fcntl.h>
@@ -22,6 +25,7 @@
 #include <objc/runtime.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -69,6 +73,7 @@ enum {
 	kRgfxAccelMethodSubmit = 0x105,
 	kRgfxAccelMethodResourceIds = 0x106,
 	kRgfxAccelMethodWaitCompletions = 0x107,
+	kRgfxAccelMethodSurfaceScanout = 0x108,
 };
 
 namespace {
@@ -394,6 +399,64 @@ void rgfxDeviceDoorbell(void *context, uint32_t ring_id)
 - (RgfxRegion *)region
 {
 	return _region;
+}
+
+// A texture over a legacy IOAccel surface, which is how WindowServer's CoreDisplay reaches the
+// surface a display is drawn into. The kext answers where the surface's memory lies, the
+// framebuffer's scanout in the region, and lets this process name it; the texture lies over a
+// Shared buffer over that span, so what the GPU draws there is what the display shows. Nil for
+// a surface that is not the scanout, as the base answers for every surface.
+- (id<MTLTexture>)newTextureWithSurface:(NSUInteger)surfaceId buffer:(NSUInteger)buffer
+{
+	if (_conn == IO_OBJECT_NULL || _region == nullptr || [self serializer] == nullptr) {
+		return nil;
+	}
+	uint64_t in[2] = {surfaceId, buffer};
+	uint64_t out[5] = {};
+	uint32_t outCount = 5;
+	kern_return_t kr =
+	    IOConnectCallScalarMethod(_conn, kRgfxAccelMethodSurfaceScanout, in, 2, out, &outCount);
+	static std::atomic<int> logged{0};
+	if (logged.fetch_add(1) < 8) {
+		NSLog(@"RGFX: newTextureWithSurface:0x%lx buffer:%lu -> 0x%x: offset 0x%llx, %llu bytes, "
+		      @"%llux%llu, %llu bytes a row",
+		      static_cast<unsigned long>(surfaceId), static_cast<unsigned long>(buffer), kr,
+		      out[0], out[1], out[2], out[3], out[4]);
+	}
+	if (kr != KERN_SUCCESS || outCount != 5) {
+		return nil;
+	}
+	uint64_t offset = out[0], length = out[1], width = out[2], height = out[3];
+	uint64_t rowBytes = out[4];
+	if (offset > _region->size() || length > _region->size() - offset ||
+	    rowBytes * height > length) {
+		return nil;
+	}
+	RgfxBuffer *span =
+	    [RgfxBuffer bufferOverHostMemoryWithContents:const_cast<uint8_t *>(_region->base() + offset)
+	                                    regionOffset:offset
+	                                          length:static_cast<NSUInteger>(length)
+	                                         options:MTLResourceStorageModeShared
+	                                     deallocator:nil
+	                                          device:self
+	                                      serializer:[self serializer]];
+	if (span == nil) {
+		return nil;
+	}
+	// The scanout's pixels: BGRA8.
+	MTLTextureDescriptor *d =
+	    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+	                                                       width:static_cast<NSUInteger>(width)
+	                                                      height:static_cast<NSUInteger>(height)
+	                                                   mipmapped:NO];
+	d.storageMode = MTLStorageModeShared;
+	d.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | MTLTextureUsageRenderTarget;
+	return [RgfxTexture textureWithDescriptor:d
+	                                   buffer:span
+	                                   offset:0
+	                              bytesPerRow:rowBytes
+	                                   device:self
+	                               serializer:[self serializer]];
 }
 
 - (RgfxReplyReader *)replyReader

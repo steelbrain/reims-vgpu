@@ -51,6 +51,17 @@ NS_ASSUME_NONNULL_BEGIN
                                         device:(nullable id<MTLDevice>)device
                                     serializer:(nullable RgfxSerializer *)serializer;
 
+/// Creates a texture of shape `descriptor` over `buffer` from `offset`, each row `bytesPerRow`
+/// apart, serialising an `RGFX_CMD_TEXTURE_FROM_BUFFER`; the texture keeps `buffer`, which its
+/// `buffer`, `bufferOffset` and `bufferBytesPerRow` answer. Nil where textureWithDescriptor:
+/// answers nil.
++ (nullable instancetype)textureWithDescriptor:(MTLTextureDescriptor *)descriptor
+                                        buffer:(RgfxResource<MTLBuffer> *)buffer
+                                        offset:(uint64_t)offset
+                                   bytesPerRow:(uint64_t)bytesPerRow
+                                        device:(nullable id<MTLDevice>)device
+                                    serializer:(nullable RgfxSerializer *)serializer;
+
 #ifdef __cplusplus
 /// Creates a Managed texture of shape `descriptor` whose CPU copy is a block of `region`, in the
 /// layout RgfxManagedLayout.hpp gives, which the guest maps: `replaceRegion:` writes it and tells

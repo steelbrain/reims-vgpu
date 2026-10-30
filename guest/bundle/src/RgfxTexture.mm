@@ -51,6 +51,10 @@ RgfxTextureDescriptor rgfxTextureDescriptorFromMTL(MTLTextureDescriptor *d)
 	RgfxBuffer *_managedCpu;
 	uint8_t *_managedBytes;
 	std::unique_ptr<RgfxManagedLayout> _managedLayout;
+	// The buffer a texture made over one lies in (kept), its offset and bytes per row.
+	id<MTLBuffer> _buffer;
+	uint64_t _bufferOffset;
+	uint64_t _bufferBytesPerRow;
 }
 
 + (instancetype)managedTextureWithDescriptor:(MTLTextureDescriptor *)descriptor
@@ -106,6 +110,51 @@ RgfxTextureDescriptor rgfxTextureDescriptorFromMTL(MTLTextureDescriptor *d)
 		t->_managedLayout = std::move(layout);
 	}
 	return t;
+}
+
++ (instancetype)textureWithDescriptor:(MTLTextureDescriptor *)descriptor
+                               buffer:(RgfxResource<MTLBuffer> *)buffer
+                               offset:(uint64_t)offset
+                          bytesPerRow:(uint64_t)bytesPerRow
+                               device:(id<MTLDevice>)device
+                           serializer:(RgfxSerializer *)serializer
+{
+	if (serializer == nullptr || descriptor == nil || buffer == nil) {
+		return nil;
+	}
+	RgfxTextureDescriptor desc = rgfxTextureDescriptorFromMTL(descriptor);
+	RgfxCreated created =
+	    serializer->createTextureFromBuffer([buffer rgfxObjId], offset, bytesPerRow, desc);
+	if (created.resource_id == 0) {
+		return nil;
+	}
+	RgfxTexture *t = [[RgfxTexture alloc] initWithObjId:created.obj_id
+	                                         gpuAddress:0
+	                                         resourceId:created.resource_id
+	                                         descriptor:desc
+	                                             device:device
+	                                         serializer:serializer];
+	if (t != nil) {
+		t->_buffer = buffer;
+		t->_bufferOffset = offset;
+		t->_bufferBytesPerRow = bytesPerRow;
+	}
+	return t;
+}
+
+- (id<MTLBuffer>)buffer
+{
+	return _buffer;
+}
+
+- (NSUInteger)bufferOffset
+{
+	return static_cast<NSUInteger>(_bufferOffset);
+}
+
+- (NSUInteger)bufferBytesPerRow
+{
+	return static_cast<NSUInteger>(_bufferBytesPerRow);
 }
 
 + (instancetype)textureWithDescriptor:(MTLTextureDescriptor *)descriptor
@@ -250,10 +299,9 @@ RgfxTextureDescriptor rgfxTextureDescriptorFromMTL(MTLTextureDescriptor *d)
 	                                          MTLResourceHazardTrackingModeShift);
 }
 
-// --- views / backings (none in this slice) -----------------------------------
-// A plain device- or heap-placed texture has no parent, backing buffer or
-// IOSurface; those paths (texture views, buffer-backed textures, IOSurface
-// import) are later resource/transport pieces.
+// --- views / backings ---------------------------------------------------------
+// A plain device- or heap-placed texture has no parent or IOSurface; one made over a
+// buffer answers its buffer (above). Texture views are a later piece.
 
 // --- CPU access ----------------------------------------------------------------
 //
@@ -418,11 +466,6 @@ RgfxTextureDescriptor rgfxTextureDescriptorFromMTL(MTLTextureDescriptor *d)
 }
 
 - (id<MTLTexture>)parentTexture
-{
-	return nil;
-}
-
-- (id<MTLBuffer>)buffer
 {
 	return nil;
 }
