@@ -5,17 +5,35 @@
 //                       many were made, and their lowest and highest gpuResourceID, which must be
 //                       distinct, non-zero and below 16381 (the host device's limit)
 // Prints "TEX OK" when every check passes, else "TEX FAIL: why" and exits 1. A completion 20 s
-// late prints HANG and exits 3.
+// late prints HANG and exits 3. The copy waits with waitUntilCompleted, as the bundle runs a
+// command buffer's completion when a waiter takes it from the completion ring.
 // Build: xcrun clang -arch x86_64 -fobjc-arc -framework Metal -framework Foundation
 //        tex_probe.m -o tex_probe
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
 static const unsigned long kLimit = 16381;
+
+static atomic_int g_copied;
+
+// Ends the process with HANG if the copy has not completed 20 s after it starts.
+static void *watchdog(void *arg)
+{
+	(void)arg;
+	sleep(20);
+	if (!atomic_load(&g_copied)) {
+		printf("HANG: the copy's command buffer never completed\n");
+		fflush(stdout);
+		_exit(3);
+	}
+	return NULL;
+}
 
 static int fail(const char *why)
 {
@@ -69,17 +87,12 @@ static int copy_through_texture(id<MTLDevice> device, id<MTLCommandQueue> queue)
 	      destinationBytesPerRow:row
 	    destinationBytesPerImage:size];
 	[blit endEncoding];
-	dispatch_semaphore_t done = dispatch_semaphore_create(0);
-	[cb addCompletedHandler:^(id<MTLCommandBuffer> b) {
-	  (void)b;
-	  dispatch_semaphore_signal(done);
-	}];
+	pthread_t dog;
+	pthread_create(&dog, NULL, watchdog, NULL);
+	pthread_detach(dog);
 	[cb commit];
-	if (dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, 20 * NSEC_PER_SEC)) != 0) {
-		printf("HANG: the copy's command buffer never completed\n");
-		fflush(stdout);
-		_exit(3);
-	}
+	[cb waitUntilCompleted];
+	atomic_store(&g_copied, 1);
 	printf("status=%ld (4=completed,5=error)\n", (long)cb.status);
 	if (cb.status != MTLCommandBufferStatusCompleted)
 		return fail(cb.error ? [[cb.error description] UTF8String] : "not completed");
