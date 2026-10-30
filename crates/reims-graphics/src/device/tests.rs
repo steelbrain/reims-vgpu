@@ -671,6 +671,94 @@ impl Host for QueueTestHost {
     }
 }
 
+/// A command buffer the guest publishes on a queue's submission ring before the host has taken
+/// the queue's `QUEUE_CREATE` (the create rides another ring), with no doorbell since the ring's
+/// `consumer_idle` was still the 0 the guest zeroed it to, is still taken and completed: the
+/// create keeps the guest's producer count
+#[test]
+fn a_command_buffer_published_before_its_queue_create_completes() {
+    use crate::ops::{RGFX_COMMAND_BUFFER_OPS_OFFSET, RgfxCommandBuffer};
+
+    let vectors = Arc::new(Mutex::new(Vec::<u32>::new()));
+    let queue_messages = Arc::new(AtomicU32::new(0));
+    let region = Arc::new(Region::new(REGION_SIZE as usize).unwrap());
+    let device = Device::new(
+        region,
+        Box::new(QueueTestHost {
+            vectors: Arc::clone(&vectors),
+            queue_messages: Arc::clone(&queue_messages),
+        }),
+        Box::new(crate::display::FixedScreen(Mode {
+            width: 1920,
+            height: 1080,
+            refresh_mhz: NEVER_MHZ,
+        })),
+    )
+    .unwrap();
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let region = &device.shared.region;
+
+    // The guest's first command buffer, published on the queue's zeroed submission ring with no
+    // doorbell.
+    const SUBMIT_OFF: u64 = RGFX_ALLOCATIONS_OFFSET;
+    const COMPLETE_OFF: u64 = RGFX_ALLOCATIONS_OFFSET + 0x10_0000;
+    const RING_DATA: u32 = 0x1_0000;
+    let cb = RgfxCommandBuffer {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_COMMAND_BUFFER,
+            size: RGFX_COMMAND_BUFFER_OPS_OFFSET,
+            seqno: 1,
+        },
+        queue_obj_id: 1,
+        cb_obj_id: 100,
+        op_bytes: 0,
+    };
+    let bytes = cb.as_bytes();
+    region.write(SUBMIT_OFF + 256, bytes);
+    region
+        .atomic_u64(SUBMIT_OFF)
+        .store(bytes.len() as u64, Ordering::SeqCst);
+
+    // Then the host takes the queue's create.
+    let qc = RgfxQueueCreate {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_QUEUE_CREATE,
+            size: size_of::<RgfxQueueCreate>() as u32,
+            seqno: 1,
+        },
+        obj_id: 1,
+        submit_offset: SUBMIT_OFF,
+        complete_offset: COMPLETE_OFF,
+        submit_data_size: RING_DATA,
+        complete_data_size: RING_DATA,
+        priority: 2,
+        vector: 3,
+    };
+    let qc_bytes = qc.as_bytes();
+    region.write(RGFX_CONTROL_SUBMIT_OFFSET + 256, qc_bytes);
+    region
+        .atomic_u64(RGFX_CONTROL_SUBMIT_OFFSET)
+        .store(qc_bytes.len() as u64, Ordering::SeqCst);
+    device.mmio_write(RGFX_REG_DOORBELL.into(), RGFX_CONTROL_RING_ID);
+
+    // The command buffer completes on the queue's completion ring.
+    let mut done = None;
+    for _ in 0..2000 {
+        if region.atomic_u64(COMPLETE_OFF).load(Ordering::SeqCst) != 0 {
+            let header = region.read(COMPLETE_OFF + 256, 8).unwrap();
+            let size = u32::from_le_bytes(header[4..8].try_into().unwrap()) as usize;
+            let msg = region.read(COMPLETE_OFF + 256, size).unwrap();
+            done = Some(RgfxCbComplete::read_from_bytes(&msg).unwrap());
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let done = done.expect("the command buffer published before its queue's create completed");
+    assert_eq!(done.header.r#type, RGFX_EVT_CB_COMPLETE);
+    assert_eq!(done.cb_obj_id, 100);
+    assert_eq!(queue_messages.load(Ordering::SeqCst), 1);
+}
+
 /// A `QUEUE_CREATE` with valid ring parameters makes a command queue's own submission and
 /// completion rings and a service thread; a `COMMAND_BUFFER` published on the queue's submission
 /// ring reaches [`Host::queue_message`], whose completion lands on the queue's own completion ring

@@ -801,12 +801,14 @@ impl Shared {
             );
             return;
         };
-        // Initialize the ring headers the guest allocated: the submission ring idle (so the guest
-        // rings the doorbell for its first message), the completion ring with nothing published.
-        let mut consumer = Consumer::new(submit_at);
-        consumer.reset(&self.region);
-        let mut producer = Producer::new(complete_at);
-        producer.reset(&self.region);
+        // Take the ring headers as the guest left them: it zeroes both before the create, and may
+        // publish its first command buffer on the submission ring before the host gets here (the
+        // create rides the device ring, the buffer the queue's own). A reset here would clear
+        // that producer count and lose the buffer, and the guest, seeing `consumer_idle` 0, rang
+        // no doorbell for it. The service thread takes what is published before it first sleeps,
+        // and sets `consumer_idle` itself when it does.
+        let consumer = Consumer::new(submit_at);
+        let producer = Producer::new(complete_at);
         let queue = Arc::new(QueueShared {
             obj_id: q.obj_id,
             ring_id: q.submit_offset,
