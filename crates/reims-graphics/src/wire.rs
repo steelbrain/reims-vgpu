@@ -937,6 +937,282 @@ pub struct RgfxDeviceInfo {
     pub name: [u8; RGFX_DEVICE_NAME_LEN],
 }
 
+// ---------------------------------------------------------------------------
+// Stage 3: render and compute pipeline creates and their reflection reply
+// (RGFX_CMD_RENDER_PIPELINE_CREATE 0x20d, RGFX_CMD_COMPUTE_PIPELINE_CREATE
+// 0x20e, RGFX_EVT_PIPELINE_REFLECTION 0x402). A pipeline names its functions by
+// library `obj_id` + entry-point name bytes + function-constant values; the
+// create blocks on the host's reflection reply, matched to the create by its
+// `seqno`. Each create carries the whole descriptor the guest read from the
+// Metal pipeline descriptor, so the wire is the stable guest ABI; which parts
+// the host applies today is bounded by the host platform's pipeline creators
+// (see the host decoder and docs).
+// ---------------------------------------------------------------------------
+
+/// A pipeline reflection reply's status: the pipeline was created.
+pub const RGFX_PIPELINE_OK: u32 = 0;
+/// A pipeline reflection reply's status: the host made no pipeline (a nil or
+/// invalid function, or Metal refused the descriptor); no handle was stored.
+pub const RGFX_PIPELINE_REFUSED: u32 = 1;
+
+/// A pipeline reflection reply's kind: a render pipeline.
+pub const RGFX_PIPELINE_KIND_RENDER: u32 = 0;
+/// A pipeline reflection reply's kind: a compute pipeline.
+pub const RGFX_PIPELINE_KIND_COMPUTE: u32 = 1;
+
+/// [`RgfxPipelineReflection`] `flags`: the state supports indirect command
+/// buffers (`supportIndirectCommandBuffers`).
+pub const RGFX_PIPELINE_REFLECT_SUPPORT_ICB: u32 = 1 << 0;
+/// [`RgfxPipelineReflection`] `flags`: a render pipeline's threadgroup size
+/// matches its tile size (`threadgroupSizeMatchesTileSize`).
+pub const RGFX_PIPELINE_REFLECT_THREADGROUP_MATCHES_TILE: u32 = 1 << 1;
+
+/// [`RgfxRenderPipelineCreate`] `flags`: `alphaToCoverageEnabled`.
+pub const RGFX_RENDER_PIPELINE_ALPHA_TO_COVERAGE: u32 = 1 << 0;
+/// [`RgfxRenderPipelineCreate`] `flags`: `alphaToOneEnabled`.
+pub const RGFX_RENDER_PIPELINE_ALPHA_TO_ONE: u32 = 1 << 1;
+/// [`RgfxRenderPipelineCreate`] `flags`: `rasterizationEnabled` (set when the
+/// pipeline rasterizes; a vertex-only pipeline clears it).
+pub const RGFX_RENDER_PIPELINE_RASTERIZATION_ENABLED: u32 = 1 << 2;
+
+/// [`RgfxComputePipelineCreate`] `flags`:
+/// `threadGroupSizeIsMultipleOfThreadExecutionWidth`.
+pub const RGFX_COMPUTE_PIPELINE_TG_MULTIPLE_OF_EXEC_WIDTH: u32 = 1 << 0;
+/// [`RgfxComputePipelineCreate`] `flags`: `supportIndirectCommandBuffers`.
+pub const RGFX_COMPUTE_PIPELINE_SUPPORT_ICB: u32 = 1 << 1;
+
+/// One function-constant value a pipeline specialises its function with
+/// (`MTLFunctionConstantValues`, by index). `value` holds the constant's raw
+/// bits; a scalar or small vector up to eight bytes fits inline (a larger value
+/// is a gap the host would flag rather than guess). The constant is keyed by
+/// `index`; name-keyed constants are resolved to an index by the guest before it
+/// serialises.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxFunctionConstant {
+    /// The constant's index (`constantValues.setConstantValue:type:atIndex:`).
+    pub index: u32,
+    /// `MTLDataType` of the constant's value.
+    pub data_type: u32,
+    /// The constant's value, its raw little-endian bits, zero-extended.
+    pub value: u64,
+}
+
+/// One colour attachment of a render pipeline
+/// (`MTLRenderPipelineColorAttachmentDescriptor`). Each enum is its Metal raw
+/// value (`MTLPixelFormat`, `MTLBlendFactor`, `MTLBlendOperation`,
+/// `MTLColorWriteMask`).
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxColorAttachmentDesc {
+    /// `MTLPixelFormat`; 0 (`Invalid`) for an unused attachment.
+    pub pixel_format: u32,
+    /// Whether blending is enabled: 0 off.
+    pub blending_enabled: u32,
+    /// `MTLBlendFactor` for the source RGB.
+    pub source_rgb_blend_factor: u32,
+    /// `MTLBlendFactor` for the destination RGB.
+    pub destination_rgb_blend_factor: u32,
+    /// `MTLBlendOperation` for RGB.
+    pub rgb_blend_operation: u32,
+    /// `MTLBlendFactor` for the source alpha.
+    pub source_alpha_blend_factor: u32,
+    /// `MTLBlendFactor` for the destination alpha.
+    pub destination_alpha_blend_factor: u32,
+    /// `MTLBlendOperation` for alpha.
+    pub alpha_blend_operation: u32,
+    /// `MTLColorWriteMask`.
+    pub write_mask: u32,
+    /// Pads to a multiple of 8; 0.
+    pub reserved_24: u32,
+}
+
+/// One vertex buffer layout of a render pipeline's vertex descriptor
+/// (`MTLVertexBufferLayoutDescriptor`), at `buffer_index`.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxVertexBufferLayout {
+    /// The vertex buffer index this layout describes.
+    pub buffer_index: u32,
+    /// Bytes from one element to the next.
+    pub stride: u32,
+    /// `MTLVertexStepFunction`.
+    pub step_function: u32,
+    /// The step rate.
+    pub step_rate: u32,
+}
+
+/// One vertex attribute of a render pipeline's vertex descriptor
+/// (`MTLVertexAttributeDescriptor`), at `attribute_index`.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxVertexAttribute {
+    /// The attribute index this record describes.
+    pub attribute_index: u32,
+    /// `MTLVertexFormat`.
+    pub format: u32,
+    /// The attribute's byte offset in its vertex buffer.
+    pub offset: u32,
+    /// The vertex buffer the attribute reads.
+    pub buffer_index: u32,
+}
+
+/// `RENDER_PIPELINE_CREATE`: a render pipeline from a descriptor, answered by
+/// [`RgfxPipelineReflection`] on the queue's completion ring with this create's
+/// `seqno`.
+///
+/// The vertex and fragment functions are each named by a library `obj_id` and an
+/// entry-point name in the message tail (`*_name_offset`/`*_name_len`, byte
+/// offsets from the message start), optionally specialised by a run of
+/// [`RgfxFunctionConstant`] in the tail (`*_constants_offset`/`*_constant_count`).
+/// The vertex descriptor's layouts and attributes are runs of
+/// [`RgfxVertexBufferLayout`] and [`RgfxVertexAttribute`] in the tail. The colour
+/// attachments are inline, `color_attachment_count` of
+/// [`RgfxColorAttachmentDesc`] in use. The optional pipeline `label` is tail
+/// bytes (`label_len` 0 for none). The whole message's `size` is the fixed head
+/// plus the tail, rounded up to a multiple of 8.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxRenderPipelineCreate {
+    /// [`RGFX_CMD_RENDER_PIPELINE_CREATE`].
+    pub header: RgfxMsgHeader,
+    /// The new pipeline's guest-picked id.
+    pub obj_id: u64,
+    /// The library the vertex function comes from.
+    pub vertex_library_obj_id: u64,
+    /// The library the fragment function comes from.
+    pub fragment_library_obj_id: u64,
+    /// The vertex entry-point name's byte offset from the message start.
+    pub vertex_name_offset: u32,
+    /// The vertex entry-point name's length in bytes.
+    pub vertex_name_len: u32,
+    /// The fragment entry-point name's byte offset from the message start.
+    pub fragment_name_offset: u32,
+    /// The fragment entry-point name's length in bytes.
+    pub fragment_name_len: u32,
+    /// The pipeline label's byte offset from the message start (0-length: none).
+    pub label_offset: u32,
+    /// The pipeline label's length in bytes; 0 for no label.
+    pub label_len: u32,
+    /// The vertex function constants' byte offset from the message start.
+    pub vertex_constants_offset: u32,
+    /// The number of [`RgfxFunctionConstant`] for the vertex function.
+    pub vertex_constant_count: u32,
+    /// The fragment function constants' byte offset from the message start.
+    pub fragment_constants_offset: u32,
+    /// The number of [`RgfxFunctionConstant`] for the fragment function.
+    pub fragment_constant_count: u32,
+    /// The vertex buffer layouts' byte offset from the message start.
+    pub vertex_layouts_offset: u32,
+    /// The number of [`RgfxVertexBufferLayout`] in the vertex descriptor.
+    pub vertex_layout_count: u32,
+    /// The vertex attributes' byte offset from the message start.
+    pub vertex_attributes_offset: u32,
+    /// The number of [`RgfxVertexAttribute`] in the vertex descriptor.
+    pub vertex_attribute_count: u32,
+    /// `rasterSampleCount` (the raster/colour sample count).
+    pub raster_sample_count: u32,
+    /// The colour attachments in use, up to 8 (the length of `colors`).
+    pub color_attachment_count: u32,
+    /// `depthAttachmentPixelFormat` (`MTLPixelFormat`; 0 for none).
+    pub depth_pixel_format: u32,
+    /// `stencilAttachmentPixelFormat` (`MTLPixelFormat`; 0 for none).
+    pub stencil_pixel_format: u32,
+    /// The `RGFX_RENDER_PIPELINE_*` boolean flags.
+    pub flags: u32,
+    /// `inputPrimitiveTopology` (`MTLPrimitiveTopologyClass`).
+    pub input_primitive_topology: u32,
+    /// `maxVertexAmplificationCount`.
+    pub max_vertex_amplification_count: u32,
+    /// Pads `colors` to an 8-aligned offset; 0.
+    pub reserved_7c: u32,
+    /// The eight colour attachments; `color_attachment_count` are in use, the
+    /// rest zeroed.
+    pub colors: [RgfxColorAttachmentDesc; 8],
+}
+
+/// `COMPUTE_PIPELINE_CREATE`: a compute pipeline from a function, answered by
+/// [`RgfxPipelineReflection`] with this create's `seqno`. The compute function is
+/// named by `function_library_obj_id` and an entry-point name in the tail
+/// (`name_offset`/`name_len`, byte offsets from the message start), optionally
+/// specialised by `constant_count` [`RgfxFunctionConstant`] in the tail. The
+/// message's `size` is the fixed head plus the tail, rounded up to a multiple of
+/// 8.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxComputePipelineCreate {
+    /// [`RGFX_CMD_COMPUTE_PIPELINE_CREATE`].
+    pub header: RgfxMsgHeader,
+    /// The new pipeline's guest-picked id.
+    pub obj_id: u64,
+    /// The library the compute function comes from.
+    pub function_library_obj_id: u64,
+    /// The compute entry-point name's byte offset from the message start.
+    pub name_offset: u32,
+    /// The compute entry-point name's length in bytes.
+    pub name_len: u32,
+    /// The function constants' byte offset from the message start.
+    pub constants_offset: u32,
+    /// The number of [`RgfxFunctionConstant`] for the function.
+    pub constant_count: u32,
+    /// The `RGFX_COMPUTE_PIPELINE_*` boolean flags.
+    pub flags: u32,
+    /// `maxTotalThreadsPerThreadgroup` the guest set, or 0 to leave Metal's.
+    pub max_total_threads_per_threadgroup: u32,
+    /// `maxCallStackDepth`.
+    pub max_call_stack_depth: u32,
+    /// Pads to a multiple of 8; 0.
+    pub reserved_3c: u32,
+}
+
+/// `PIPELINE_REFLECTION`: a pipeline create's answer, with the pipeline state's
+/// own queries (the host platform exposes no per-argument binding reflection, so
+/// the argument tables Metal's `MTLRenderPipelineReflection` would carry are not
+/// here — a platform gap recorded with the host decoder). On a refusal `status`
+/// is [`RGFX_PIPELINE_REFUSED`] and the metrics are 0.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxPipelineReflection {
+    /// [`RGFX_EVT_PIPELINE_REFLECTION`], with the create's `seqno`.
+    pub header: RgfxMsgHeader,
+    /// The pipeline the create named.
+    pub obj_id: u64,
+    /// `gpuResourceID` (`MTLResourceID._impl`).
+    pub gpu_resource_id: u64,
+    /// `uniqueIdentifier`, as the guest reads it (the state's identity).
+    pub unique_identifier: u64,
+    /// `maxTotalThreadsPerThreadgroup`.
+    pub max_total_threads_per_threadgroup: u64,
+    /// `staticThreadgroupMemoryLength` (compute; 0 for render).
+    pub static_threadgroup_memory_length: u64,
+    /// `threadExecutionWidth` (compute; 0 for render).
+    pub thread_execution_width: u32,
+    /// `imageblockSampleLength` (render; 0 for compute).
+    pub imageblock_sample_length: u32,
+    /// `resourceIndex` (the state's argument-buffer index).
+    pub resource_index: u32,
+    /// An `RGFX_PIPELINE_*` status.
+    pub status: u32,
+    /// An `RGFX_PIPELINE_KIND_*`.
+    pub kind: u32,
+    /// The `RGFX_PIPELINE_REFLECT_*` flags.
+    pub flags: u32,
+}
+
 // The stage-3 messages' layout.
 const _: () = {
     use core::mem::size_of;
@@ -960,6 +1236,15 @@ const _: () = {
     assert!(size_of::<RgfxLibraryCreate>() == 32);
     assert!(RGFX_LIBRARY_BYTES_OFFSET as usize == size_of::<RgfxLibraryCreate>());
     assert!(size_of::<RgfxDeviceInfo>() == 376);
+    // Pipeline creates and reflection.
+    assert!(size_of::<RgfxFunctionConstant>() == 16);
+    assert!(size_of::<RgfxColorAttachmentDesc>() == 40);
+    assert!(size_of::<RgfxVertexBufferLayout>() == 16);
+    assert!(size_of::<RgfxVertexAttribute>() == 16);
+    assert!(size_of::<RgfxRenderPipelineCreate>() == 448);
+    assert!(core::mem::offset_of!(RgfxRenderPipelineCreate, colors) == 128);
+    assert!(size_of::<RgfxComputePipelineCreate>() == 64);
+    assert!(size_of::<RgfxPipelineReflection>() == 80);
     // Each exact size above is a multiple of 8, as a ring message must be.
     // The stage-3 opcodes do not collide with the stage-2 ones or each other.
     assert!(RGFX_CMD_QUEUE_CREATE > RGFX_EVT_VBLANK);
@@ -1118,5 +1403,116 @@ mod tests {
             info
         );
         assert_eq!(&info.name[..info.name_len as usize], name);
+    }
+
+    /// The pipeline create heads and the reflection reply round-trip; a render
+    /// create's fixed head reads back with its colour attachments and its tail
+    /// names lie where the head's offsets say.
+    #[test]
+    fn pipeline_messages_round_trip() {
+        // A render create: one colour attachment, a vertex and a fragment name in
+        // the tail right after the fixed head.
+        let head = size_of::<RgfxRenderPipelineCreate>() as u32;
+        let (vname, fname) = (b"vmain".as_slice(), b"frag_main".as_slice());
+        let mut colors = [RgfxColorAttachmentDesc::default(); 8];
+        colors[0] = RgfxColorAttachmentDesc {
+            pixel_format: 80, // BGRA8Unorm
+            blending_enabled: 1,
+            source_rgb_blend_factor: 1,      // One
+            destination_rgb_blend_factor: 5, // OneMinusSourceAlpha
+            rgb_blend_operation: 0,          // Add
+            source_alpha_blend_factor: 1,
+            destination_alpha_blend_factor: 5,
+            alpha_blend_operation: 0,
+            write_mask: 0xf,
+            reserved_24: 0,
+        };
+        let mut render = RgfxRenderPipelineCreate {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_RENDER_PIPELINE_CREATE,
+                size: 0,
+                seqno: 9,
+            },
+            obj_id: 0x30,
+            vertex_library_obj_id: 0x10,
+            fragment_library_obj_id: 0x10,
+            vertex_name_offset: head,
+            vertex_name_len: vname.len() as u32,
+            fragment_name_offset: head + vname.len() as u32,
+            fragment_name_len: fname.len() as u32,
+            raster_sample_count: 1,
+            color_attachment_count: 1,
+            depth_pixel_format: 252, // Depth32Float
+            flags: RGFX_RENDER_PIPELINE_RASTERIZATION_ENABLED,
+            colors,
+            ..RgfxRenderPipelineCreate::default()
+        };
+        let total = ((head as usize + vname.len() + fname.len()) + 7) & !7;
+        render.header.size = total as u32;
+        let mut msg = render.as_bytes().to_vec();
+        msg.extend_from_slice(vname);
+        msg.extend_from_slice(fname);
+        msg.resize(total, 0);
+
+        let (back, _) = RgfxRenderPipelineCreate::read_from_prefix(&msg).unwrap();
+        assert_eq!(back, render);
+        assert_eq!(back.colors[0].pixel_format, 80);
+        assert_eq!(back.colors[0].destination_rgb_blend_factor, 5);
+        let vs = back.vertex_name_offset as usize;
+        assert_eq!(&msg[vs..vs + back.vertex_name_len as usize], vname);
+        let fs = back.fragment_name_offset as usize;
+        assert_eq!(&msg[fs..fs + back.fragment_name_len as usize], fname);
+
+        // A compute create head.
+        let compute = RgfxComputePipelineCreate {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_COMPUTE_PIPELINE_CREATE,
+                size: size_of::<RgfxComputePipelineCreate>() as u32,
+                seqno: 10,
+            },
+            obj_id: 0x31,
+            function_library_obj_id: 0x10,
+            name_offset: size_of::<RgfxComputePipelineCreate>() as u32,
+            name_len: 4,
+            flags: RGFX_COMPUTE_PIPELINE_SUPPORT_ICB,
+            max_total_threads_per_threadgroup: 256,
+            ..RgfxComputePipelineCreate::default()
+        };
+        assert_eq!(
+            RgfxComputePipelineCreate::read_from_bytes(compute.as_bytes()).unwrap(),
+            compute
+        );
+
+        // A function constant and the reflection reply.
+        let k = RgfxFunctionConstant {
+            index: 3,
+            data_type: 30, // Bool
+            value: 1,
+        };
+        assert_eq!(
+            RgfxFunctionConstant::read_from_bytes(k.as_bytes()).unwrap(),
+            k
+        );
+        let reflection = RgfxPipelineReflection {
+            header: RgfxMsgHeader {
+                r#type: RGFX_EVT_PIPELINE_REFLECTION,
+                size: size_of::<RgfxPipelineReflection>() as u32,
+                seqno: 9,
+            },
+            obj_id: 0x30,
+            gpu_resource_id: 0xabc,
+            unique_identifier: 0xdef,
+            max_total_threads_per_threadgroup: 1024,
+            imageblock_sample_length: 4,
+            resource_index: 7,
+            status: RGFX_PIPELINE_OK,
+            kind: RGFX_PIPELINE_KIND_RENDER,
+            flags: RGFX_PIPELINE_REFLECT_SUPPORT_ICB,
+            ..RgfxPipelineReflection::default()
+        };
+        assert_eq!(
+            RgfxPipelineReflection::read_from_bytes(reflection.as_bytes()).unwrap(),
+            reflection
+        );
     }
 }

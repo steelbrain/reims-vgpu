@@ -350,6 +350,120 @@ void test_library_message()
 	CHECK(!big.posted);
 }
 
+void test_pipeline_messages()
+{
+	TestRing ring(0x8000);
+	RgfxRingWriter writer(ring.base(), ring.dataSize, RGFX_CONTROL_RING_ID, nullptr, nullptr);
+	RgfxIdSpace ids;
+	RgfxSerializer ser(writer, ids);
+
+	// A render pipeline: two function names, a label, one colour attachment with
+	// source-over blend, and a one-entry vertex descriptor, all in the tail.
+	RgfxRenderPipelineParams rp = {};
+	rp.vertex.library = 10;
+	rp.vertex.entry_point = "vmain";
+	rp.fragment.library = 10;
+	rp.fragment.entry_point = "frag_main";
+	rp.label = "pipe";
+	rp.raster_sample_count = 1;
+	rp.color_attachment_count = 1;
+	rp.colors[0].pixel_format = 80; // BGRA8Unorm
+	rp.colors[0].blending_enabled = 1;
+	rp.colors[0].source_rgb_blend_factor = 1;      // One
+	rp.colors[0].destination_rgb_blend_factor = 5; // OneMinusSourceAlpha
+	rp.colors[0].write_mask = 0xf;
+	rp.depth_pixel_format = 252; // Depth32Float
+	RgfxVertexBufferLayout layout = {};
+	layout.buffer_index = 0;
+	layout.stride = 32;
+	layout.step_function = 1;
+	rp.vertex_layouts = &layout;
+	rp.vertex_layout_count = 1;
+	RgfxVertexAttribute attr = {};
+	attr.format = 29; // Float4
+	rp.vertex_attributes = &attr;
+	rp.vertex_attribute_count = 1;
+	rp.flags = RGFX_RENDER_PIPELINE_RASTERIZATION_ENABLED;
+
+	RgfxCreated r = ser.createRenderPipeline(rp);
+	CHECK(r.posted);
+
+	RgfxMsgHeader h = {};
+	std::vector<uint8_t> bytes;
+	CHECK(ring.next(&h, &bytes));
+	CHECK(h.type == RGFX_CMD_RENDER_PIPELINE_CREATE);
+	CHECK(h.size == bytes.size());
+	CHECK(h.size % 8 == 0);
+	RgfxRenderPipelineCreate rc;
+	std::memcpy(&rc, bytes.data(), sizeof(rc));
+	CHECK(rc.obj_id == r.obj_id);
+	CHECK(rc.vertex_library_obj_id == 10 && rc.fragment_library_obj_id == 10);
+	CHECK(rc.color_attachment_count == 1 && rc.colors[0].pixel_format == 80);
+	CHECK(rc.colors[0].destination_rgb_blend_factor == 5);
+	CHECK(rc.depth_pixel_format == 252);
+	CHECK(rc.vertex_layout_count == 1 && rc.vertex_attribute_count == 1);
+	CHECK(rc.vertex_name_len == 5);
+	CHECK(std::memcmp(bytes.data() + rc.vertex_name_offset, "vmain", 5) == 0);
+	CHECK(rc.fragment_name_len == 9);
+	CHECK(std::memcmp(bytes.data() + rc.fragment_name_offset, "frag_main", 9) == 0);
+	CHECK(rc.label_len == 4);
+	CHECK(std::memcmp(bytes.data() + rc.label_offset, "pipe", 4) == 0);
+	RgfxVertexBufferLayout gotLayout;
+	std::memcpy(&gotLayout, bytes.data() + rc.vertex_layouts_offset, sizeof(gotLayout));
+	CHECK(gotLayout.stride == 32 && gotLayout.step_function == 1);
+	RgfxVertexAttribute gotAttr;
+	std::memcpy(&gotAttr, bytes.data() + rc.vertex_attributes_offset, sizeof(gotAttr));
+	CHECK(gotAttr.format == 29);
+
+	// A compute pipeline specialised by one function constant.
+	RgfxFunctionConstant k = {};
+	k.index = 2;
+	k.data_type = 30; // Bool
+	k.value = 1;
+	RgfxComputePipelineParams cp = {};
+	cp.function.library = 10;
+	cp.function.entry_point = "cmain";
+	cp.function.constants = &k;
+	cp.function.constant_count = 1;
+	cp.max_total_threads_per_threadgroup = 256;
+	cp.flags = RGFX_COMPUTE_PIPELINE_SUPPORT_ICB;
+
+	RgfxCreated c = ser.createComputePipeline(cp);
+	CHECK(c.posted);
+	CHECK(ring.next(&h, &bytes));
+	CHECK(h.type == RGFX_CMD_COMPUTE_PIPELINE_CREATE);
+	CHECK(h.size == bytes.size());
+	RgfxComputePipelineCreate cc;
+	std::memcpy(&cc, bytes.data(), sizeof(cc));
+	CHECK(cc.obj_id == c.obj_id && cc.function_library_obj_id == 10);
+	CHECK(cc.name_len == 5);
+	CHECK(std::memcmp(bytes.data() + cc.name_offset, "cmain", 5) == 0);
+	CHECK(cc.constant_count == 1);
+	RgfxFunctionConstant gotK;
+	std::memcpy(&gotK, bytes.data() + cc.constants_offset, sizeof(gotK));
+	CHECK(gotK.index == 2 && gotK.data_type == 30 && gotK.value == 1);
+	CHECK(cc.max_total_threads_per_threadgroup == 256);
+
+	// The host's reflection reply, matched to the create by its seqno: built as
+	// the host would and read back, asserting the reply layout the guest reads.
+	RgfxPipelineReflection refl = {};
+	refl.header.type = RGFX_EVT_PIPELINE_REFLECTION;
+	refl.header.size = sizeof(refl);
+	refl.header.seqno = c.seqno;
+	refl.obj_id = c.obj_id;
+	refl.status = RGFX_PIPELINE_OK;
+	refl.kind = RGFX_PIPELINE_KIND_COMPUTE;
+	refl.max_total_threads_per_threadgroup = 1024;
+	refl.thread_execution_width = 32;
+	std::vector<uint8_t> wire(sizeof(refl), 0);
+	std::memcpy(wire.data(), &refl, sizeof(refl));
+	RgfxPipelineReflection back;
+	std::memcpy(&back, wire.data(), sizeof(back));
+	CHECK(back.header.seqno == c.seqno && back.obj_id == c.obj_id);
+	CHECK(back.status == RGFX_PIPELINE_OK && back.kind == RGFX_PIPELINE_KIND_COMPUTE);
+	CHECK(back.thread_execution_width == 32);
+}
+
 void test_ring_wrap_and_no_room()
 {
 	// A small ring so a message must pad to the end and wrap.
@@ -398,6 +512,7 @@ int main()
 	test_caps();
 	test_lifecycle_messages();
 	test_library_message();
+	test_pipeline_messages();
 	test_ring_wrap_and_no_room();
 	std::printf("serializer_tests: OK (%d checks)\n", g_checks);
 	return 0;

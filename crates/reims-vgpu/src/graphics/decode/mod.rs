@@ -37,19 +37,25 @@ use std::sync::Arc;
 
 use reims_graphics::wire::{
     RGFX_CMD_BUFFER_AT_OFFSET, RGFX_CMD_BUFFER_CREATE, RGFX_CMD_COMMAND_BUFFER,
-    RGFX_CMD_DEPTH_STENCIL_CREATE, RGFX_CMD_EVENT_CREATE, RGFX_CMD_FENCE_CREATE,
-    RGFX_CMD_HEAP_CREATE, RGFX_CMD_LIBRARY_CREATE, RGFX_CMD_OBJECT_DESTROY, RGFX_CMD_QUEUE_CREATE,
-    RGFX_CMD_SAMPLER_CREATE, RGFX_CMD_SHARED_EVENT_CREATE, RGFX_CMD_TEXTURE_CREATE,
-    RGFX_CMD_TEXTURE_FROM_BUFFER, RGFX_LIBRARY_BYTES_OFFSET, RgfxBufferAtOffset, RgfxBufferCreate,
-    RgfxCbComplete, RgfxDepthStencilCreate, RgfxHeapCreate, RgfxLibraryCreate, RgfxMsgHeader,
-    RgfxObjectCreate, RgfxObjectDestroy, RgfxQueueCreate, RgfxSamplerCreate, RgfxSharedEventCreate,
-    RgfxStencilDescriptor, RgfxTextureCreate, RgfxTextureDescriptor, RgfxTextureFromBuffer,
+    RGFX_CMD_COMPUTE_PIPELINE_CREATE, RGFX_CMD_DEPTH_STENCIL_CREATE, RGFX_CMD_EVENT_CREATE,
+    RGFX_CMD_FENCE_CREATE, RGFX_CMD_HEAP_CREATE, RGFX_CMD_LIBRARY_CREATE, RGFX_CMD_OBJECT_DESTROY,
+    RGFX_CMD_QUEUE_CREATE, RGFX_CMD_RENDER_PIPELINE_CREATE, RGFX_CMD_SAMPLER_CREATE,
+    RGFX_CMD_SHARED_EVENT_CREATE, RGFX_CMD_TEXTURE_CREATE, RGFX_CMD_TEXTURE_FROM_BUFFER,
+    RGFX_EVT_PIPELINE_REFLECTION, RGFX_LIBRARY_BYTES_OFFSET, RGFX_PIPELINE_KIND_COMPUTE,
+    RGFX_PIPELINE_KIND_RENDER, RGFX_PIPELINE_OK, RGFX_PIPELINE_REFLECT_SUPPORT_ICB,
+    RGFX_PIPELINE_REFLECT_THREADGROUP_MATCHES_TILE, RGFX_PIPELINE_REFUSED, RgfxBufferAtOffset,
+    RgfxBufferCreate, RgfxCbComplete, RgfxColorAttachmentDesc, RgfxComputePipelineCreate,
+    RgfxDepthStencilCreate, RgfxHeapCreate, RgfxLibraryCreate, RgfxMsgHeader, RgfxObjectCreate,
+    RgfxObjectDestroy, RgfxPipelineReflection, RgfxQueueCreate, RgfxRenderPipelineCreate,
+    RgfxSamplerCreate, RgfxSharedEventCreate, RgfxStencilDescriptor, RgfxTextureCreate,
+    RgfxTextureDescriptor, RgfxTextureFromBuffer,
 };
 use reims_vgpu_core::platform::device::GpuDevice;
-use reims_vgpu_core::platform::resource::{Buffer, Heap};
+use reims_vgpu_core::platform::resource::{Buffer, ComputePipeline, Heap, Library, RenderPipeline};
 use reims_vgpu_core::platform::types::Swizzle;
 use reims_vgpu_core::platform::values::{
-    BufferDesc, DepthStencilDesc, HeapDesc, OptionSet, SamplerDesc, StencilDesc, TextureDesc,
+    BufferDesc, DepthStencilDesc, HeapDesc, OptionSet, RenderPipelineDesc, SamplerDesc,
+    StencilDesc, TextureDesc,
 };
 use reims_vgpu_core::platform::{Handle, Platform};
 use reims_vgpu_core::raise::{OnFault, Raise, RaiseResult};
@@ -65,6 +71,12 @@ mod render;
 /// one that writes the record to the queue's completion ring; until it is set, a
 /// completion is built and dropped.
 pub(crate) type CompletionSink = Arc<dyn Fn(RgfxCbComplete) + Send + Sync>;
+
+/// A sink the decoder calls with a pipeline create's reflection reply once the
+/// pipeline is made (or refused). The ring loop sets one that writes the reply to
+/// the queue's completion ring, keyed to the create by its `seqno`; until it is
+/// set, the reply is built and dropped.
+pub(crate) type ReflectionSink = Arc<dyn Fn(RgfxPipelineReflection) + Send + Sync>;
 
 /// A host handle for one guest object, by kind. Later increments read these to
 /// bind resources into command buffers; this slice only inserts them on a create
@@ -108,6 +120,9 @@ pub struct GraphicsDecoder<P: Platform> {
     /// Where a command buffer's completion record goes once its work finishes;
     /// `None` builds and drops it (the ring loop sets a sink later).
     completion_sink: Option<CompletionSink>,
+    /// Where a pipeline create's reflection reply goes; `None` builds and drops
+    /// it (the ring loop sets a sink later).
+    reflection_sink: Option<ReflectionSink>,
 }
 
 impl<P: Platform> GraphicsDecoder<P> {
@@ -117,6 +132,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             platform,
             objects: HashMap::new(),
             completion_sink: None,
+            reflection_sink: None,
         }
     }
 
@@ -125,6 +141,12 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// ring).
     pub(crate) fn set_completion_sink(&mut self, sink: CompletionSink) {
         self.completion_sink = Some(sink);
+    }
+
+    /// Sets the sink the decoder hands each pipeline create's reflection reply to
+    /// (the ring loop's, writing the queue's completion ring).
+    pub(crate) fn set_reflection_sink(&mut self, sink: ReflectionSink) {
+        self.reflection_sink = Some(sink);
     }
 
     /// The objects the table holds.
@@ -365,6 +387,8 @@ impl<P: Platform> GraphicsDecoder<P> {
                     None => Ok(Err(DecodeError::Refused)),
                 }
             }
+            RGFX_CMD_RENDER_PIPELINE_CREATE => self.decode_render_pipeline(device, message),
+            RGFX_CMD_COMPUTE_PIPELINE_CREATE => self.decode_compute_pipeline(device, message),
             RGFX_CMD_COMMAND_BUFFER => self.decode_command_buffer(message),
             _ => Ok(Err(DecodeError::UnknownCommand)),
         }
@@ -378,6 +402,245 @@ impl<P: Platform> GraphicsDecoder<P> {
     ) -> RaiseResult<Result<(), DecodeError>> {
         self.objects.insert(obj_id, handle);
         Ok(Ok(()))
+    }
+
+    /// `RENDER_PIPELINE_CREATE`: resolve the vertex and fragment functions from
+    /// their libraries, build the platform's render pipeline descriptor, make the
+    /// pipeline, store it and emit its reflection reply.
+    ///
+    /// The host drives [`GpuDevice::new_render_pipeline_state`], the platform's
+    /// descriptor-value creator. That value carries the vertex and fragment
+    /// functions, colour attachment 0's pixel format and the one source-over
+    /// blend it can express, and a label; the rest of the wire descriptor (colour
+    /// attachments 1..8, arbitrary blend state, depth/stencil formats, the raster
+    /// sample count, the vertex descriptor and the pipeline flags, and the
+    /// functions' constant specialisation) has no place in that value and is not
+    /// applied here. The full path is Metal's serialized-descriptor deserializer,
+    /// which is the Apple lane's; carrying the whole descriptor on the wire keeps
+    /// the guest ABI stable for when the platform value grows.
+    fn decode_render_pipeline(
+        &mut self,
+        device: &P::Device,
+        message: &[u8],
+    ) -> RaiseResult<Result<(), DecodeError>> {
+        let Some(m) = read::<RgfxRenderPipelineCreate>(message) else {
+            return Ok(Err(DecodeError::Malformed));
+        };
+        // Resolve both function libraries (which may be the same). A reference
+        // that names no library is a guest protocol error, as the other
+        // control-ring creates treat one.
+        let vertex_lib = match self.objects.get(&m.vertex_library_obj_id) {
+            Some(ObjHandle::Library(l)) => l.clone_ref(),
+            _ => return Ok(Err(DecodeError::BadReference)),
+        };
+        let fragment_lib = match self.objects.get(&m.fragment_library_obj_id) {
+            Some(ObjHandle::Library(l)) => l.clone_ref(),
+            _ => return Ok(Err(DecodeError::BadReference)),
+        };
+        // The entry-point names and the optional label live in the message tail;
+        // a span the message does not cover, or non-UTF-8, is malformed.
+        let (Some(vertex_name), Some(fragment_name)) = (
+            str_tail(message, m.vertex_name_offset, m.vertex_name_len),
+            str_tail(message, m.fragment_name_offset, m.fragment_name_len),
+        ) else {
+            return Ok(Err(DecodeError::Malformed));
+        };
+        let label = if m.label_len == 0 {
+            None
+        } else {
+            match str_tail(message, m.label_offset, m.label_len) {
+                Some(s) => Some(s),
+                None => return Ok(Err(DecodeError::Malformed)),
+            }
+        };
+        // Resolve the functions. A nil function (the library has no such entry
+        // point) refuses the pipeline. Function-constant specialisation on the
+        // wire is not applied: `Library::new_function` takes only a name.
+        let Some(vertex) = vertex_lib.new_function(OnFault::Return, vertex_name)? else {
+            return self.emit_pipeline_refused(m.header.seqno, m.obj_id, RGFX_PIPELINE_KIND_RENDER);
+        };
+        let Some(fragment) = fragment_lib.new_function(OnFault::Return, fragment_name)? else {
+            return self.emit_pipeline_refused(m.header.seqno, m.obj_id, RGFX_PIPELINE_KIND_RENDER);
+        };
+        let desc = RenderPipelineDesc::<P> {
+            label,
+            vertex: &vertex,
+            fragment: &fragment,
+            color0_pixel_format: m.colors[0].pixel_format.into(),
+            blend_over: is_source_over(&m.colors[0]),
+            resource_index: None,
+        };
+        // `new_render_pipeline_state` returns a plain `Result` (no path reaches it
+        // under a handler in the Apple lane); a nil state or an `NSError` refuses.
+        match device.new_render_pipeline_state(&desc) {
+            Ok(Some(pipeline)) => {
+                let reflection = render_reflection::<P>(&pipeline, m.header.seqno, m.obj_id);
+                if let Some(sink) = self.reflection_sink.clone() {
+                    sink(reflection);
+                }
+                self.insert(m.obj_id, ObjHandle::RenderPipeline(pipeline))
+            }
+            Ok(None) | Err(_) => {
+                self.emit_pipeline_refused(m.header.seqno, m.obj_id, RGFX_PIPELINE_KIND_RENDER)
+            }
+        }
+    }
+
+    /// `COMPUTE_PIPELINE_CREATE`: resolve the compute function from its library,
+    /// make the pipeline through [`GpuDevice::new_compute_pipeline_state_for_function`],
+    /// store it and emit its reflection reply. As the render form, the wire
+    /// carries the whole descriptor but the function-from-a-name creator applies
+    /// only the function; the flags, limits and constant specialisation are not
+    /// applied here (the serialized-descriptor path is the Apple lane's).
+    fn decode_compute_pipeline(
+        &mut self,
+        device: &P::Device,
+        message: &[u8],
+    ) -> RaiseResult<Result<(), DecodeError>> {
+        let Some(m) = read::<RgfxComputePipelineCreate>(message) else {
+            return Ok(Err(DecodeError::Malformed));
+        };
+        let function_lib = match self.objects.get(&m.function_library_obj_id) {
+            Some(ObjHandle::Library(l)) => l.clone_ref(),
+            _ => return Ok(Err(DecodeError::BadReference)),
+        };
+        let Some(name) = str_tail(message, m.name_offset, m.name_len) else {
+            return Ok(Err(DecodeError::Malformed));
+        };
+        let Some(function) = function_lib.new_function(OnFault::Return, name)? else {
+            return self.emit_pipeline_refused(
+                m.header.seqno,
+                m.obj_id,
+                RGFX_PIPELINE_KIND_COMPUTE,
+            );
+        };
+        match device.new_compute_pipeline_state_for_function(Some(&function)) {
+            Ok(Some(pipeline)) => {
+                let reflection = compute_reflection::<P>(&pipeline, m.header.seqno, m.obj_id);
+                if let Some(sink) = self.reflection_sink.clone() {
+                    sink(reflection);
+                }
+                self.insert(m.obj_id, ObjHandle::ComputePipeline(pipeline))
+            }
+            Ok(None) | Err(_) => {
+                self.emit_pipeline_refused(m.header.seqno, m.obj_id, RGFX_PIPELINE_KIND_COMPUTE)
+            }
+        }
+    }
+
+    /// Emits a refused reflection reply for a pipeline the host could not make
+    /// (a nil function, or the platform refusing the descriptor) and reports the
+    /// create as [`DecodeError::Refused`], so a guest blocked on the reply unblocks.
+    fn emit_pipeline_refused(
+        &self,
+        seqno: u64,
+        obj_id: u64,
+        kind: u32,
+    ) -> RaiseResult<Result<(), DecodeError>> {
+        if let Some(sink) = self.reflection_sink.clone() {
+            sink(RgfxPipelineReflection {
+                header: reflection_header(seqno),
+                obj_id,
+                status: RGFX_PIPELINE_REFUSED,
+                kind,
+                ..RgfxPipelineReflection::default()
+            });
+        }
+        Ok(Err(DecodeError::Refused))
+    }
+}
+
+/// A `PIPELINE_REFLECTION` message header for a create at `seqno`.
+fn reflection_header(seqno: u64) -> RgfxMsgHeader {
+    RgfxMsgHeader {
+        r#type: RGFX_EVT_PIPELINE_REFLECTION,
+        size: size_of::<RgfxPipelineReflection>() as u32,
+        seqno,
+    }
+}
+
+/// A UTF-8 string at `[offset, offset + len)` of `message`, or `None` when the
+/// span lies outside the message or is not UTF-8.
+fn str_tail(message: &[u8], offset: u32, len: u32) -> Option<&str> {
+    let start = offset as usize;
+    let end = start.checked_add(len as usize)?;
+    std::str::from_utf8(message.get(start..end)?).ok()
+}
+
+/// Whether a colour attachment's blend state is the premultiplied source-over
+/// blend the platform's [`RenderPipelineDesc`] value can express: blending on,
+/// both source factors `One`, both destination factors `OneMinusSourceAlpha`,
+/// both operations `Add`. Any other blend state cannot travel through that value
+/// and is dropped (the render decoder's note).
+fn is_source_over(c: &RgfxColorAttachmentDesc) -> bool {
+    /// `MTLBlendFactorOne`.
+    const ONE: u32 = 1;
+    /// `MTLBlendFactorOneMinusSourceAlpha`.
+    const ONE_MINUS_SRC_ALPHA: u32 = 5;
+    /// `MTLBlendOperationAdd`.
+    const ADD: u32 = 0;
+    c.blending_enabled != 0
+        && c.source_rgb_blend_factor == ONE
+        && c.source_alpha_blend_factor == ONE
+        && c.destination_rgb_blend_factor == ONE_MINUS_SRC_ALPHA
+        && c.destination_alpha_blend_factor == ONE_MINUS_SRC_ALPHA
+        && c.rgb_blend_operation == ADD
+        && c.alpha_blend_operation == ADD
+}
+
+/// The reflection reply for a made render pipeline: the state's own queries (the
+/// platform exposes no per-argument binding reflection).
+fn render_reflection<P: Platform>(
+    pipeline: &P::RenderPipeline,
+    seqno: u64,
+    obj_id: u64,
+) -> RgfxPipelineReflection {
+    let mut flags = 0;
+    if pipeline.support_indirect_command_buffers() {
+        flags |= RGFX_PIPELINE_REFLECT_SUPPORT_ICB;
+    }
+    if pipeline.threadgroup_size_matches_tile_size() {
+        flags |= RGFX_PIPELINE_REFLECT_THREADGROUP_MATCHES_TILE;
+    }
+    RgfxPipelineReflection {
+        header: reflection_header(seqno),
+        obj_id,
+        gpu_resource_id: pipeline.gpu_resource_id(),
+        unique_identifier: pipeline.guest_unique_identifier(),
+        max_total_threads_per_threadgroup: pipeline.max_total_threads_per_threadgroup(),
+        static_threadgroup_memory_length: 0,
+        thread_execution_width: 0,
+        imageblock_sample_length: pipeline.imageblock_sample_length() as u32,
+        resource_index: pipeline.resource_index() as u32,
+        status: RGFX_PIPELINE_OK,
+        kind: RGFX_PIPELINE_KIND_RENDER,
+        flags,
+    }
+}
+
+/// The reflection reply for a made compute pipeline: the state's own queries.
+fn compute_reflection<P: Platform>(
+    pipeline: &P::ComputePipeline,
+    seqno: u64,
+    obj_id: u64,
+) -> RgfxPipelineReflection {
+    let mut flags = 0;
+    if pipeline.support_indirect_command_buffers() {
+        flags |= RGFX_PIPELINE_REFLECT_SUPPORT_ICB;
+    }
+    RgfxPipelineReflection {
+        header: reflection_header(seqno),
+        obj_id,
+        gpu_resource_id: pipeline.gpu_resource_id(),
+        unique_identifier: pipeline.guest_unique_identifier(),
+        max_total_threads_per_threadgroup: pipeline.max_total_threads_per_threadgroup(),
+        static_threadgroup_memory_length: pipeline.static_threadgroup_memory_length(),
+        thread_execution_width: pipeline.thread_execution_width() as u32,
+        imageblock_sample_length: 0,
+        resource_index: pipeline.resource_index() as u32,
+        status: RGFX_PIPELINE_OK,
+        kind: RGFX_PIPELINE_KIND_COMPUTE,
+        flags,
     }
 }
 
@@ -442,6 +705,7 @@ resolvers! {
     (require_fence, get_fence, Fence, Fence, "fence"),
     (require_event, get_event, Event, Event, "event"),
     (require_heap, get_heap, Heap, Heap, "heap"),
+    (require_library, get_library, Library, Library, "library"),
     (require_indirect_command_buffer, get_indirect_command_buffer, Icb, Icb, "indirect command buffer"),
 }
 
@@ -805,5 +1069,161 @@ mod tests {
             dec.decode(&device, &[0u8; 4]).unwrap(),
             Err(DecodeError::Malformed)
         );
+    }
+
+    /// A render and a compute pipeline create each resolve their functions from a
+    /// library, call the right platform creator, store the handle and emit a
+    /// reflection reply keyed to the create's seqno; a pipeline that names a
+    /// non-library is a bad reference and makes nothing.
+    #[test]
+    fn render_and_compute_pipeline_creates() {
+        use reims_vgpu_core::sync::Mutex;
+
+        let p = Arc::new(FakePlatform::new());
+        let device = p.device();
+        let mut dec = GraphicsDecoder::<FakePlatform>::new(Arc::clone(&p));
+
+        let replies = Arc::new(Mutex::new(Vec::<RgfxPipelineReflection>::new()));
+        let sink_replies = Arc::clone(&replies);
+        dec.set_reflection_sink(Arc::new(move |r| sink_replies.lock().push(r)));
+
+        // A library the pipelines draw their functions from.
+        let air = [1u8, 2, 3, 4];
+        let mut lib_msg = RgfxLibraryCreate {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_LIBRARY_CREATE,
+                size: (RGFX_LIBRARY_BYTES_OFFSET as usize + air.len()).next_multiple_of(8) as u32,
+                seqno: 0,
+            },
+            obj_id: 1,
+            byte_length: air.len() as u64,
+        }
+        .as_bytes()
+        .to_vec();
+        lib_msg.extend_from_slice(&air);
+        assert_eq!(dec.decode(&device, &lib_msg).unwrap(), Ok(()));
+
+        // A render pipeline: vertex and fragment names in the tail, colour
+        // attachment 0 BGRA8Unorm with source-over blend.
+        let render_msg = |obj_id: u64, seqno: u64, vlib: u64, flib: u64| {
+            let head = size_of::<RgfxRenderPipelineCreate>() as u32;
+            let (vn, fnm) = (b"vmain".as_slice(), b"fmain".as_slice());
+            let mut colors = [RgfxColorAttachmentDesc::default(); 8];
+            colors[0] = RgfxColorAttachmentDesc {
+                pixel_format: 80,
+                blending_enabled: 1,
+                source_rgb_blend_factor: 1,
+                destination_rgb_blend_factor: 5,
+                rgb_blend_operation: 0,
+                source_alpha_blend_factor: 1,
+                destination_alpha_blend_factor: 5,
+                alpha_blend_operation: 0,
+                write_mask: 0xf,
+                reserved_24: 0,
+            };
+            let total = (head as usize + vn.len() + fnm.len()).next_multiple_of(8);
+            let m = RgfxRenderPipelineCreate {
+                header: RgfxMsgHeader {
+                    r#type: RGFX_CMD_RENDER_PIPELINE_CREATE,
+                    size: total as u32,
+                    seqno,
+                },
+                obj_id,
+                vertex_library_obj_id: vlib,
+                fragment_library_obj_id: flib,
+                vertex_name_offset: head,
+                vertex_name_len: vn.len() as u32,
+                fragment_name_offset: head + vn.len() as u32,
+                fragment_name_len: fnm.len() as u32,
+                raster_sample_count: 1,
+                color_attachment_count: 1,
+                colors,
+                ..RgfxRenderPipelineCreate::default()
+            };
+            let mut bytes = m.as_bytes().to_vec();
+            bytes.extend_from_slice(vn);
+            bytes.extend_from_slice(fnm);
+            bytes.resize(total, 0);
+            bytes
+        };
+
+        let m = p.call_log().mark();
+        assert_eq!(
+            dec.decode(&device, &render_msg(100, 7, 1, 1)).unwrap(),
+            Ok(())
+        );
+        assert_eq!(
+            p.call_log()
+                .sels_since(m)
+                .iter()
+                .filter(|s| **s == "newRenderPipelineStateWithDescriptor:error:")
+                .count(),
+            1
+        );
+        {
+            let r = replies.lock();
+            assert_eq!(r.len(), 1);
+            assert_eq!(r[0].header.seqno, 7);
+            assert_eq!(r[0].obj_id, 100);
+            assert_eq!(r[0].status, RGFX_PIPELINE_OK);
+            assert_eq!(r[0].kind, RGFX_PIPELINE_KIND_RENDER);
+            assert_eq!(r[0].max_total_threads_per_threadgroup, 1024);
+        }
+
+        // A compute pipeline from a function in the same library.
+        let compute_msg = |obj_id: u64, seqno: u64, lib: u64| {
+            let head = size_of::<RgfxComputePipelineCreate>() as u32;
+            let name = b"cmain".as_slice();
+            let total = (head as usize + name.len()).next_multiple_of(8);
+            let m = RgfxComputePipelineCreate {
+                header: RgfxMsgHeader {
+                    r#type: RGFX_CMD_COMPUTE_PIPELINE_CREATE,
+                    size: total as u32,
+                    seqno,
+                },
+                obj_id,
+                function_library_obj_id: lib,
+                name_offset: head,
+                name_len: name.len() as u32,
+                ..RgfxComputePipelineCreate::default()
+            };
+            let mut bytes = m.as_bytes().to_vec();
+            bytes.extend_from_slice(name);
+            bytes.resize(total, 0);
+            bytes
+        };
+
+        let m = p.call_log().mark();
+        assert_eq!(
+            dec.decode(&device, &compute_msg(101, 8, 1)).unwrap(),
+            Ok(())
+        );
+        assert_eq!(
+            p.call_log()
+                .sels_since(m)
+                .iter()
+                .filter(|s| **s == "newComputePipelineStateWithFunction:error:")
+                .count(),
+            1
+        );
+        {
+            let r = replies.lock();
+            assert_eq!(r.len(), 2);
+            assert_eq!(r[1].obj_id, 101);
+            assert_eq!(r[1].kind, RGFX_PIPELINE_KIND_COMPUTE);
+            assert_eq!(r[1].thread_execution_width, 32);
+        }
+
+        // Both pipelines are held alongside the library.
+        assert_eq!(dec.object_count(), 3);
+
+        // A render create that names a non-library is a bad reference; no reply,
+        // no handle.
+        assert_eq!(
+            dec.decode(&device, &render_msg(102, 9, 999, 999)).unwrap(),
+            Err(DecodeError::BadReference)
+        );
+        assert_eq!(dec.object_count(), 3);
+        assert_eq!(replies.lock().len(), 2);
     }
 }

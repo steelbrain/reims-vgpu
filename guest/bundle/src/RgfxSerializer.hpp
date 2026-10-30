@@ -49,6 +49,48 @@ struct RgfxSamplerParams {
 	uint32_t flags; // bit 0 normalized coords, bit 1 LOD average, bit 2 argument-buffer usable
 };
 
+/// A function reference a pipeline draws from: the library it lives in, its
+/// entry-point name, and the function constants that specialise it (`constants`
+/// may be null when `constant_count` is 0). The name is a NUL-terminated C
+/// string; the serialiser copies `strlen(entry_point)` bytes to the wire.
+struct RgfxFunctionRef {
+	RgfxObjId library;
+	const char *entry_point;
+	const RgfxFunctionConstant *constants;
+	uint32_t constant_count;
+};
+
+/// A render pipeline's descriptor, as MTLRenderPipelineDescriptor gives it, in
+/// plain fields the serialiser packs into RgfxRenderPipelineCreate. `colors[0..
+/// color_attachment_count)` are in use; the vertex descriptor's `layouts` and
+/// `attributes` may be null when their counts are 0; `label` may be null.
+struct RgfxRenderPipelineParams {
+	RgfxFunctionRef vertex;
+	RgfxFunctionRef fragment;
+	const char *label;
+	uint32_t raster_sample_count;
+	uint32_t color_attachment_count; // <= 8
+	RgfxColorAttachmentDesc colors[8];
+	uint32_t depth_pixel_format;
+	uint32_t stencil_pixel_format;
+	const RgfxVertexBufferLayout *vertex_layouts;
+	uint32_t vertex_layout_count;
+	const RgfxVertexAttribute *vertex_attributes;
+	uint32_t vertex_attribute_count;
+	uint32_t flags; // RGFX_RENDER_PIPELINE_*
+	uint32_t input_primitive_topology;
+	uint32_t max_vertex_amplification_count;
+};
+
+/// A compute pipeline's descriptor in plain fields the serialiser packs into
+/// RgfxComputePipelineCreate.
+struct RgfxComputePipelineParams {
+	RgfxFunctionRef function;
+	uint32_t flags; // RGFX_COMPUTE_PIPELINE_*
+	uint32_t max_total_threads_per_threadgroup; // 0 leaves Metal's
+	uint32_t max_call_stack_depth;
+};
+
 /// What a create did. `obj_id`, `gpu_address` and `resource_id` are the values
 /// the guest picked (valid whether or not the message reached the ring, so a
 /// caller that retries keeps the same handle); `gpu_address`/`resource_id` are 0
@@ -133,6 +175,20 @@ public:
 	/// forwarded unchanged. `posted` is false when the message (its header plus
 	/// the bytes, rounded to a multiple of 8) does not fit the ring.
 	RgfxCreated createLibrary(const void *bytes, uint64_t byte_length);
+
+	// --- pipelines ------------------------------------------------------------
+
+	/// A render pipeline from `params`. The functions, label and vertex
+	/// descriptor are packed into the message tail; the colour attachments are
+	/// inline. The create is answered by the host with an RgfxPipelineReflection
+	/// carrying the returned `seqno`, read off the queue's completion ring (the
+	/// reply-ring reader is a later transport piece; `RgfxCreated::seqno` is the
+	/// key the reply is matched by). `posted` is false when the message does not
+	/// fit the ring.
+	RgfxCreated createRenderPipeline(const RgfxRenderPipelineParams &params);
+
+	/// A compute pipeline from `params`, answered as createRenderPipeline is.
+	RgfxCreated createComputePipeline(const RgfxComputePipelineParams &params);
 
 	// --- sync objects ---------------------------------------------------------
 

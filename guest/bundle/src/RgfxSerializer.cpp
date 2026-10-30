@@ -249,6 +249,125 @@ RgfxCreated RgfxSerializer::createLibrary(const void *bytes, uint64_t byte_lengt
 	return out;
 }
 
+RgfxCreated RgfxSerializer::createRenderPipeline(const RgfxRenderPipelineParams &p)
+{
+	RgfxCreated out = {};
+	out.obj_id = m_ids.allocObjId();
+
+	// The functions, label and vertex descriptor go in the message tail, each
+	// addressed by a byte offset from the message start (the fixed head's size
+	// plus the segment's position in the tail).
+	const uint32_t head = sizeof(RgfxRenderPipelineCreate);
+	std::vector<uint8_t> tail;
+	auto append = [&](const void *data, size_t n) -> uint32_t {
+		uint32_t off = static_cast<uint32_t>(head + tail.size());
+		if (n) {
+			const uint8_t *b = static_cast<const uint8_t *>(data);
+			tail.insert(tail.end(), b, b + n);
+		}
+		return off;
+	};
+	auto nameLen = [](const char *s) -> uint32_t {
+		return s ? static_cast<uint32_t>(std::strlen(s)) : 0;
+	};
+
+	RgfxRenderPipelineCreate msg = {};
+	msg.obj_id = out.obj_id;
+	msg.vertex_library_obj_id = p.vertex.library;
+	msg.fragment_library_obj_id = p.fragment.library;
+
+	uint32_t vlen = nameLen(p.vertex.entry_point);
+	msg.vertex_name_offset = append(p.vertex.entry_point, vlen);
+	msg.vertex_name_len = vlen;
+	uint32_t flen = nameLen(p.fragment.entry_point);
+	msg.fragment_name_offset = append(p.fragment.entry_point, flen);
+	msg.fragment_name_len = flen;
+	uint32_t llen = nameLen(p.label);
+	msg.label_offset = append(p.label, llen);
+	msg.label_len = llen;
+	msg.vertex_constants_offset =
+	    append(p.vertex.constants, p.vertex.constant_count * sizeof(RgfxFunctionConstant));
+	msg.vertex_constant_count = p.vertex.constant_count;
+	msg.fragment_constants_offset =
+	    append(p.fragment.constants, p.fragment.constant_count * sizeof(RgfxFunctionConstant));
+	msg.fragment_constant_count = p.fragment.constant_count;
+	msg.vertex_layouts_offset =
+	    append(p.vertex_layouts, p.vertex_layout_count * sizeof(RgfxVertexBufferLayout));
+	msg.vertex_layout_count = p.vertex_layout_count;
+	msg.vertex_attributes_offset =
+	    append(p.vertex_attributes, p.vertex_attribute_count * sizeof(RgfxVertexAttribute));
+	msg.vertex_attribute_count = p.vertex_attribute_count;
+
+	msg.raster_sample_count = p.raster_sample_count;
+	uint32_t ncolor = p.color_attachment_count > 8 ? 8 : p.color_attachment_count;
+	msg.color_attachment_count = ncolor;
+	for (uint32_t i = 0; i < ncolor; i++)
+		msg.colors[i] = p.colors[i];
+	msg.depth_pixel_format = p.depth_pixel_format;
+	msg.stencil_pixel_format = p.stencil_pixel_format;
+	msg.flags = p.flags;
+	msg.input_primitive_topology = p.input_primitive_topology;
+	msg.max_vertex_amplification_count = p.max_vertex_amplification_count;
+
+	uint64_t total = roundUp8(head + tail.size());
+	if (total > m_control.dataSize() || total > UINT32_MAX) {
+		out.posted = false;
+		return out;
+	}
+	std::vector<uint8_t> buf(static_cast<size_t>(total), 0);
+	std::memcpy(buf.data(), &msg, sizeof(msg));
+	if (!tail.empty())
+		std::memcpy(buf.data() + head, tail.data(), tail.size());
+	out.posted = m_control.tryPost(RGFX_CMD_RENDER_PIPELINE_CREATE, buf.data(),
+	                               static_cast<uint32_t>(total), &out.seqno);
+	return out;
+}
+
+RgfxCreated RgfxSerializer::createComputePipeline(const RgfxComputePipelineParams &p)
+{
+	RgfxCreated out = {};
+	out.obj_id = m_ids.allocObjId();
+
+	const uint32_t head = sizeof(RgfxComputePipelineCreate);
+	std::vector<uint8_t> tail;
+	auto append = [&](const void *data, size_t n) -> uint32_t {
+		uint32_t off = static_cast<uint32_t>(head + tail.size());
+		if (n) {
+			const uint8_t *b = static_cast<const uint8_t *>(data);
+			tail.insert(tail.end(), b, b + n);
+		}
+		return off;
+	};
+
+	RgfxComputePipelineCreate msg = {};
+	msg.obj_id = out.obj_id;
+	msg.function_library_obj_id = p.function.library;
+	uint32_t nlen = p.function.entry_point
+	                    ? static_cast<uint32_t>(std::strlen(p.function.entry_point))
+	                    : 0;
+	msg.name_offset = append(p.function.entry_point, nlen);
+	msg.name_len = nlen;
+	msg.constants_offset =
+	    append(p.function.constants, p.function.constant_count * sizeof(RgfxFunctionConstant));
+	msg.constant_count = p.function.constant_count;
+	msg.flags = p.flags;
+	msg.max_total_threads_per_threadgroup = p.max_total_threads_per_threadgroup;
+	msg.max_call_stack_depth = p.max_call_stack_depth;
+
+	uint64_t total = roundUp8(head + tail.size());
+	if (total > m_control.dataSize() || total > UINT32_MAX) {
+		out.posted = false;
+		return out;
+	}
+	std::vector<uint8_t> buf(static_cast<size_t>(total), 0);
+	std::memcpy(buf.data(), &msg, sizeof(msg));
+	if (!tail.empty())
+		std::memcpy(buf.data() + head, tail.data(), tail.size());
+	out.posted = m_control.tryPost(RGFX_CMD_COMPUTE_PIPELINE_CREATE, buf.data(),
+	                               static_cast<uint32_t>(total), &out.seqno);
+	return out;
+}
+
 RgfxCreated RgfxSerializer::createEvent()
 {
 	RgfxCreated out = {};
