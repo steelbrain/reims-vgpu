@@ -158,6 +158,112 @@
 // The displays the device has: display 0.
 #define RGFX_DISPLAY_COUNT 1
 
+// Device-level object lifecycle (ring 0). Creates with a guest-picked id or
+// address are fire-and-forget; pipeline creates are answered with reflection.
+// Command `QUEUE_CREATE` ([`RgfxQueueCreate`]): make a submission+completion
+// ring pair for a command queue; answered by [`RGFX_EVT_COMPLETE`].
+#define RGFX_CMD_QUEUE_CREATE 512
+
+// Command `OBJECT_DESTROY` ([`RgfxObjectDestroy`]): drop the host handle for an
+// `obj_id` of any kind (the handle table knows the kind). Not answered.
+#define RGFX_CMD_OBJECT_DESTROY 513
+
+// Command `HEAP_CREATE` ([`RgfxHeapCreate`]): a device heap at a guest address.
+#define RGFX_CMD_HEAP_CREATE 514
+
+// Command `HEAP_OVER_HOST_MEMORY` ([`RgfxHeapOverHostMemory`]): a Shared heap
+// over a block of the region.
+#define RGFX_CMD_HEAP_OVER_HOST_MEMORY 515
+
+// Command `BUFFER_CREATE` ([`RgfxBufferCreate`]): a device buffer at a guest
+// address.
+#define RGFX_CMD_BUFFER_CREATE 516
+
+// Command `BUFFER_OVER_HOST_MEMORY` ([`RgfxBufferOverHostMemory`]): a Shared
+// buffer over a block of the region.
+#define RGFX_CMD_BUFFER_OVER_HOST_MEMORY 517
+
+// Command `BUFFER_AT_OFFSET` ([`RgfxBufferAtOffset`]): a buffer at an offset in
+// a heap.
+#define RGFX_CMD_BUFFER_AT_OFFSET 518
+
+// Command `TEXTURE_CREATE`: a texture from a descriptor. Struct in a later
+// increment (carries the texture descriptor schema).
+#define RGFX_CMD_TEXTURE_CREATE 519
+
+// Command `TEXTURE_FROM_BUFFER`: a texture over a buffer. Struct later.
+#define RGFX_CMD_TEXTURE_FROM_BUFFER 520
+
+// Command `TEXTURE_FROM_IOSURFACE`: a texture over an IOSurface plane. Struct
+// later.
+#define RGFX_CMD_TEXTURE_FROM_IOSURFACE 521
+
+// Command `SAMPLER_CREATE`: a sampler from a descriptor. Struct later.
+#define RGFX_CMD_SAMPLER_CREATE 522
+
+// Command `DEPTH_STENCIL_CREATE`: a depth/stencil state from a descriptor.
+// Struct later.
+#define RGFX_CMD_DEPTH_STENCIL_CREATE 523
+
+// Command `LIBRARY_CREATE`: a library from `.metallib`/AIR bytes, forwarded
+// unchanged. Struct later (a header followed by the bytes).
+#define RGFX_CMD_LIBRARY_CREATE 524
+
+// Command `RENDER_PIPELINE_CREATE`: a render pipeline from a descriptor;
+// answered by [`RGFX_EVT_PIPELINE_REFLECTION`]. Struct later.
+#define RGFX_CMD_RENDER_PIPELINE_CREATE 525
+
+// Command `COMPUTE_PIPELINE_CREATE`: a compute pipeline; answered by
+// [`RGFX_EVT_PIPELINE_REFLECTION`]. Struct later.
+#define RGFX_CMD_COMPUTE_PIPELINE_CREATE 526
+
+// Command `EVENT_CREATE` ([`RgfxObjectCreate`]): a Metal event.
+#define RGFX_CMD_EVENT_CREATE 527
+
+// Command `SHARED_EVENT_CREATE` ([`RgfxSharedEventCreate`]): a shared event
+// with an initial value.
+#define RGFX_CMD_SHARED_EVENT_CREATE 528
+
+// Command `FENCE_CREATE` ([`RgfxObjectCreate`]): a Metal fence.
+#define RGFX_CMD_FENCE_CREATE 529
+
+// Command `COMMAND_BUFFER` (a per-queue submission ring): one command buffer,
+// its `obj_id` followed by the encoder-op byte stream. Struct and op stream in
+// a later increment.
+#define RGFX_CMD_COMMAND_BUFFER 768
+
+// Event `CB_COMPLETE` ([`RgfxCbComplete`], a per-queue completion ring): a
+// command buffer finished, with its status and GPU times.
+#define RGFX_EVT_CB_COMPLETE 1024
+
+// Event `EVENT_SIGNALLED` ([`RgfxEventSignalled`]): a shared event reached a
+// value.
+#define RGFX_EVT_EVENT_SIGNALLED 1025
+
+// Event `PIPELINE_REFLECTION`: a pipeline create's answer, with the reflection
+// the guest needs. Struct in a later increment.
+#define RGFX_EVT_PIPELINE_REFLECTION 1026
+
+// A command buffer's status in [`RgfxCbComplete`]: finished with no error.
+#define RGFX_CB_OK 0
+
+// A command buffer's status: a GPU page fault (IOGPU page fault).
+#define RGFX_CB_PAGE_FAULT 1
+
+// A command buffer's status: the GPU hung and the work timed out.
+#define RGFX_CB_TIMEOUT 2
+
+// A command buffer's status: an internal error (a GPU recovery made this work
+// an innocent victim).
+#define RGFX_CB_INTERNAL 3
+
+// A command buffer's status: the queue's submissions are ignored after a second
+// fault (access revoked).
+#define RGFX_CB_ACCESS_REVOKED 4
+
+// A command buffer's status: a resource the work named was invalid.
+#define RGFX_CB_INVALID_RESOURCE 5
+
 // Where a `DISPLAYS` message's first display record starts: right after `count`.
 #define RGFX_DISPLAYS_ENTRIES_OFFSET 20
 
@@ -331,5 +437,175 @@ typedef struct {
   // The host's monotonic clock at the refresh, in nanoseconds.
   uint64_t host_time_ns;
 } RgfxVblank;
+
+// `OBJECT_DESTROY`: drop the host handle for `obj_id`. The handle table knows
+// the kind, so one message destroys an object of any kind.
+typedef struct {
+  // [`RGFX_CMD_OBJECT_DESTROY`].
+  RgfxMsgHeader header;
+  // The object to drop.
+  uint64_t obj_id;
+} RgfxObjectDestroy;
+
+// `EVENT_CREATE` and `FENCE_CREATE`: a sync object with no payload but its id.
+typedef struct {
+  // [`RGFX_CMD_EVENT_CREATE`] or [`RGFX_CMD_FENCE_CREATE`].
+  RgfxMsgHeader header;
+  // The new object's guest-picked id.
+  uint64_t obj_id;
+} RgfxObjectCreate;
+
+// `SHARED_EVENT_CREATE`: a shared event starting at `initial_value`.
+typedef struct {
+  // [`RGFX_CMD_SHARED_EVENT_CREATE`].
+  RgfxMsgHeader header;
+  // The new event's guest-picked id.
+  uint64_t obj_id;
+  // The event's value when it is made.
+  uint64_t initial_value;
+} RgfxSharedEventCreate;
+
+// `QUEUE_CREATE`: a command queue and its submission+completion ring pair, each
+// a [`RgfxRingHeader`] followed by a byte ring of the given data size (a power
+// of two) at the given region offset. The completion ring raises `vector`.
+typedef struct {
+  // [`RGFX_CMD_QUEUE_CREATE`].
+  RgfxMsgHeader header;
+  // The new queue's guest-picked id.
+  uint64_t obj_id;
+  // Where the submission ring (guest to host) starts in the region.
+  uint64_t submit_offset;
+  // Where the completion ring (host to guest) starts in the region.
+  uint64_t complete_offset;
+  // The submission ring's byte-ring size, after its header: a power of two.
+  uint32_t submit_data_size;
+  // The completion ring's byte-ring size, after its header: a power of two.
+  uint32_t complete_data_size;
+  // The queue's priority; the host gives its VkQueue a matching priority so
+  // WindowServer's queue runs high. 0 is normal, higher is higher.
+  uint32_t priority;
+  // The MSI-X vector the completion ring raises.
+  uint32_t vector;
+} RgfxQueueCreate;
+
+// `HEAP_CREATE`: a device heap of `size_bytes` at the guest-picked
+// `gpu_address`. `options` carries the heap's storage and cache modes and type.
+typedef struct {
+  // [`RGFX_CMD_HEAP_CREATE`].
+  RgfxMsgHeader header;
+  // The new heap's guest-picked id.
+  uint64_t obj_id;
+  // The heap's guest-picked GPU address.
+  uint64_t gpu_address;
+  // The heap's size in bytes.
+  uint64_t size_bytes;
+  // The heap's storage/cache modes and type.
+  uint32_t options;
+  // Pads to a multiple of 8; 0.
+  uint32_t reserved_2c;
+} RgfxHeapCreate;
+
+// `HEAP_OVER_HOST_MEMORY`: a Shared heap of `size_bytes` over the block at
+// `region_offset` in the region, at the guest-picked `gpu_address`.
+typedef struct {
+  // [`RGFX_CMD_HEAP_OVER_HOST_MEMORY`].
+  RgfxMsgHeader header;
+  // The new heap's guest-picked id.
+  uint64_t obj_id;
+  // The heap's guest-picked GPU address.
+  uint64_t gpu_address;
+  // Where the heap's block starts in the region.
+  uint64_t region_offset;
+  // The heap's size in bytes.
+  uint64_t size_bytes;
+  // The heap's storage/cache modes and type.
+  uint32_t options;
+  // Pads to a multiple of 8; 0.
+  uint32_t reserved_34;
+} RgfxHeapOverHostMemory;
+
+// `BUFFER_CREATE`: a device buffer of `length` bytes at the guest-picked
+// `gpu_address`. `options` carries `MTLResourceOptions`.
+typedef struct {
+  // [`RGFX_CMD_BUFFER_CREATE`].
+  RgfxMsgHeader header;
+  // The new buffer's guest-picked id.
+  uint64_t obj_id;
+  // The buffer's guest-picked GPU address.
+  uint64_t gpu_address;
+  // The buffer's length in bytes.
+  uint64_t length;
+  // `MTLResourceOptions`: storage mode, cache mode, hazard tracking.
+  uint32_t options;
+  // Pads to a multiple of 8; 0.
+  uint32_t reserved_2c;
+} RgfxBufferCreate;
+
+// `BUFFER_OVER_HOST_MEMORY`: a Shared buffer of `length` bytes over the block at
+// `region_offset` in the region, at the guest-picked `gpu_address`.
+typedef struct {
+  // [`RGFX_CMD_BUFFER_OVER_HOST_MEMORY`].
+  RgfxMsgHeader header;
+  // The new buffer's guest-picked id.
+  uint64_t obj_id;
+  // The buffer's guest-picked GPU address.
+  uint64_t gpu_address;
+  // Where the buffer's block starts in the region.
+  uint64_t region_offset;
+  // The buffer's length in bytes.
+  uint64_t length;
+  // `MTLResourceOptions`: storage mode, cache mode, hazard tracking.
+  uint32_t options;
+  // Pads to a multiple of 8; 0.
+  uint32_t reserved_34;
+} RgfxBufferOverHostMemory;
+
+// `BUFFER_AT_OFFSET`: a buffer of `length` bytes at `offset` in the heap
+// `heap_obj_id`.
+typedef struct {
+  // [`RGFX_CMD_BUFFER_AT_OFFSET`].
+  RgfxMsgHeader header;
+  // The new buffer's guest-picked id.
+  uint64_t obj_id;
+  // The heap the buffer lies in.
+  uint64_t heap_obj_id;
+  // The buffer's offset in the heap.
+  uint64_t offset;
+  // The buffer's length in bytes.
+  uint64_t length;
+  // `MTLResourceOptions`: storage mode, cache mode, hazard tracking.
+  uint32_t options;
+  // Pads to a multiple of 8; 0.
+  uint32_t reserved_34;
+} RgfxBufferAtOffset;
+
+// `CB_COMPLETE`: a command buffer finished. `status` is an `RGFX_CB_*`, and
+// `error_code` carries the raw IOGPU code for diagnostics (0 when `status` is
+// [`RGFX_CB_OK`]).
+typedef struct {
+  // [`RGFX_EVT_CB_COMPLETE`], with the command buffer's submission `seqno`.
+  RgfxMsgHeader header;
+  // The command buffer that finished.
+  uint64_t cb_obj_id;
+  // The host's monotonic clock when the GPU started the work, in nanoseconds;
+  // 0 when unknown (e.g. a recovery victim).
+  uint64_t gpu_start_ns;
+  // The host's monotonic clock when the GPU finished the work, in nanoseconds.
+  uint64_t gpu_end_ns;
+  // An `RGFX_CB_*`.
+  uint32_t status;
+  // The raw IOGPU code behind `status`, for diagnostics; 0 on success.
+  uint32_t error_code;
+} RgfxCbComplete;
+
+// `EVENT_SIGNALLED`: the shared event `obj_id` reached `value`.
+typedef struct {
+  // [`RGFX_EVT_EVENT_SIGNALLED`], `seqno` 0.
+  RgfxMsgHeader header;
+  // The shared event that fired.
+  uint64_t obj_id;
+  // The value it reached.
+  uint64_t value;
+} RgfxEventSignalled;
 
 #endif  /* REIMS_GRAPHICS_WIRE_H */

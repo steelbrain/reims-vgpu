@@ -42,6 +42,17 @@ include = [
     "RgfxModeEntry",
     "RgfxDisplayChanged",
     "RgfxVblank",
+    "RgfxObjectDestroy",
+    "RgfxObjectCreate",
+    "RgfxSharedEventCreate",
+    "RgfxQueueCreate",
+    "RgfxHeapCreate",
+    "RgfxHeapOverHostMemory",
+    "RgfxBufferCreate",
+    "RgfxBufferOverHostMemory",
+    "RgfxBufferAtOffset",
+    "RgfxCbComplete",
+    "RgfxEventSignalled",
 ]
 
 [struct]

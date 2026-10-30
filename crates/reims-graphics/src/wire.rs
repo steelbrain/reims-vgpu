@@ -158,6 +158,98 @@ pub const RGFX_CURSOR_MAX_SIZE: u32 = 256;
 /// The displays the device has: display 0.
 pub const RGFX_DISPLAY_COUNT: u32 = 1;
 
+// ---------------------------------------------------------------------------
+// Stage 3: the Metal-call stream (docs/graphics-kext/design.md, "Stage 3 wire
+// protocol"). The guest's Metal GPU bundle serialises every Metal call into
+// these messages; the host decodes them onto the library's `Platform`. Every
+// guest object has a 64-bit `obj_id` the guest picks, unique per device; the
+// host keeps an `obj_id` -> handle table. The guest also picks each resource's
+// GPU address and the host pins it. The transport (rings, header, doorbell and
+// interrupt handshake, `RgfxMsgHeader`) is the stage-2 one, unchanged.
+// ---------------------------------------------------------------------------
+
+/// Device-level object lifecycle (ring 0). Creates with a guest-picked id or
+/// address are fire-and-forget; pipeline creates are answered with reflection.
+/// Command `QUEUE_CREATE` ([`RgfxQueueCreate`]): make a submission+completion
+/// ring pair for a command queue; answered by [`RGFX_EVT_COMPLETE`].
+pub const RGFX_CMD_QUEUE_CREATE: u32 = 0x200;
+/// Command `OBJECT_DESTROY` ([`RgfxObjectDestroy`]): drop the host handle for an
+/// `obj_id` of any kind (the handle table knows the kind). Not answered.
+pub const RGFX_CMD_OBJECT_DESTROY: u32 = 0x201;
+/// Command `HEAP_CREATE` ([`RgfxHeapCreate`]): a device heap at a guest address.
+pub const RGFX_CMD_HEAP_CREATE: u32 = 0x202;
+/// Command `HEAP_OVER_HOST_MEMORY` ([`RgfxHeapOverHostMemory`]): a Shared heap
+/// over a block of the region.
+pub const RGFX_CMD_HEAP_OVER_HOST_MEMORY: u32 = 0x203;
+/// Command `BUFFER_CREATE` ([`RgfxBufferCreate`]): a device buffer at a guest
+/// address.
+pub const RGFX_CMD_BUFFER_CREATE: u32 = 0x204;
+/// Command `BUFFER_OVER_HOST_MEMORY` ([`RgfxBufferOverHostMemory`]): a Shared
+/// buffer over a block of the region.
+pub const RGFX_CMD_BUFFER_OVER_HOST_MEMORY: u32 = 0x205;
+/// Command `BUFFER_AT_OFFSET` ([`RgfxBufferAtOffset`]): a buffer at an offset in
+/// a heap.
+pub const RGFX_CMD_BUFFER_AT_OFFSET: u32 = 0x206;
+/// Command `TEXTURE_CREATE`: a texture from a descriptor. Struct in a later
+/// increment (carries the texture descriptor schema).
+pub const RGFX_CMD_TEXTURE_CREATE: u32 = 0x207;
+/// Command `TEXTURE_FROM_BUFFER`: a texture over a buffer. Struct later.
+pub const RGFX_CMD_TEXTURE_FROM_BUFFER: u32 = 0x208;
+/// Command `TEXTURE_FROM_IOSURFACE`: a texture over an IOSurface plane. Struct
+/// later.
+pub const RGFX_CMD_TEXTURE_FROM_IOSURFACE: u32 = 0x209;
+/// Command `SAMPLER_CREATE`: a sampler from a descriptor. Struct later.
+pub const RGFX_CMD_SAMPLER_CREATE: u32 = 0x20a;
+/// Command `DEPTH_STENCIL_CREATE`: a depth/stencil state from a descriptor.
+/// Struct later.
+pub const RGFX_CMD_DEPTH_STENCIL_CREATE: u32 = 0x20b;
+/// Command `LIBRARY_CREATE`: a library from `.metallib`/AIR bytes, forwarded
+/// unchanged. Struct later (a header followed by the bytes).
+pub const RGFX_CMD_LIBRARY_CREATE: u32 = 0x20c;
+/// Command `RENDER_PIPELINE_CREATE`: a render pipeline from a descriptor;
+/// answered by [`RGFX_EVT_PIPELINE_REFLECTION`]. Struct later.
+pub const RGFX_CMD_RENDER_PIPELINE_CREATE: u32 = 0x20d;
+/// Command `COMPUTE_PIPELINE_CREATE`: a compute pipeline; answered by
+/// [`RGFX_EVT_PIPELINE_REFLECTION`]. Struct later.
+pub const RGFX_CMD_COMPUTE_PIPELINE_CREATE: u32 = 0x20e;
+/// Command `EVENT_CREATE` ([`RgfxObjectCreate`]): a Metal event.
+pub const RGFX_CMD_EVENT_CREATE: u32 = 0x20f;
+/// Command `SHARED_EVENT_CREATE` ([`RgfxSharedEventCreate`]): a shared event
+/// with an initial value.
+pub const RGFX_CMD_SHARED_EVENT_CREATE: u32 = 0x210;
+/// Command `FENCE_CREATE` ([`RgfxObjectCreate`]): a Metal fence.
+pub const RGFX_CMD_FENCE_CREATE: u32 = 0x211;
+
+/// Command `COMMAND_BUFFER` (a per-queue submission ring): one command buffer,
+/// its `obj_id` followed by the encoder-op byte stream. Struct and op stream in
+/// a later increment.
+pub const RGFX_CMD_COMMAND_BUFFER: u32 = 0x300;
+
+/// Event `CB_COMPLETE` ([`RgfxCbComplete`], a per-queue completion ring): a
+/// command buffer finished, with its status and GPU times.
+pub const RGFX_EVT_CB_COMPLETE: u32 = 0x400;
+/// Event `EVENT_SIGNALLED` ([`RgfxEventSignalled`]): a shared event reached a
+/// value.
+pub const RGFX_EVT_EVENT_SIGNALLED: u32 = 0x401;
+/// Event `PIPELINE_REFLECTION`: a pipeline create's answer, with the reflection
+/// the guest needs. Struct in a later increment.
+pub const RGFX_EVT_PIPELINE_REFLECTION: u32 = 0x402;
+
+/// A command buffer's status in [`RgfxCbComplete`]: finished with no error.
+pub const RGFX_CB_OK: u32 = 0;
+/// A command buffer's status: a GPU page fault (IOGPU page fault).
+pub const RGFX_CB_PAGE_FAULT: u32 = 1;
+/// A command buffer's status: the GPU hung and the work timed out.
+pub const RGFX_CB_TIMEOUT: u32 = 2;
+/// A command buffer's status: an internal error (a GPU recovery made this work
+/// an innocent victim).
+pub const RGFX_CB_INTERNAL: u32 = 3;
+/// A command buffer's status: the queue's submissions are ignored after a second
+/// fault (access revoked).
+pub const RGFX_CB_ACCESS_REVOKED: u32 = 4;
+/// A command buffer's status: a resource the work named was invalid.
+pub const RGFX_CB_INVALID_RESOURCE: u32 = 5;
+
 /// Every message's header.
 #[repr(C)]
 #[derive(
@@ -381,3 +473,306 @@ const _: () = {
     );
     assert!(RGFX_CONTROL_COMPLETE_OFFSET + RGFX_CONTROL_RING_SPAN <= RGFX_ALLOCATIONS_OFFSET);
 };
+
+// ---------------------------------------------------------------------------
+// Stage 3 messages (first increment): the stable, descriptor-free object
+// lifecycle and completion records. The descriptor-carrying creates (textures,
+// pipelines, samplers, depth/stencil, library bytes) and the command-buffer
+// encoder-op stream follow in later increments.
+// ---------------------------------------------------------------------------
+
+/// `OBJECT_DESTROY`: drop the host handle for `obj_id`. The handle table knows
+/// the kind, so one message destroys an object of any kind.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxObjectDestroy {
+    /// [`RGFX_CMD_OBJECT_DESTROY`].
+    pub header: RgfxMsgHeader,
+    /// The object to drop.
+    pub obj_id: u64,
+}
+
+/// `EVENT_CREATE` and `FENCE_CREATE`: a sync object with no payload but its id.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxObjectCreate {
+    /// [`RGFX_CMD_EVENT_CREATE`] or [`RGFX_CMD_FENCE_CREATE`].
+    pub header: RgfxMsgHeader,
+    /// The new object's guest-picked id.
+    pub obj_id: u64,
+}
+
+/// `SHARED_EVENT_CREATE`: a shared event starting at `initial_value`.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxSharedEventCreate {
+    /// [`RGFX_CMD_SHARED_EVENT_CREATE`].
+    pub header: RgfxMsgHeader,
+    /// The new event's guest-picked id.
+    pub obj_id: u64,
+    /// The event's value when it is made.
+    pub initial_value: u64,
+}
+
+/// `QUEUE_CREATE`: a command queue and its submission+completion ring pair, each
+/// a [`RgfxRingHeader`] followed by a byte ring of the given data size (a power
+/// of two) at the given region offset. The completion ring raises `vector`.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxQueueCreate {
+    /// [`RGFX_CMD_QUEUE_CREATE`].
+    pub header: RgfxMsgHeader,
+    /// The new queue's guest-picked id.
+    pub obj_id: u64,
+    /// Where the submission ring (guest to host) starts in the region.
+    pub submit_offset: u64,
+    /// Where the completion ring (host to guest) starts in the region.
+    pub complete_offset: u64,
+    /// The submission ring's byte-ring size, after its header: a power of two.
+    pub submit_data_size: u32,
+    /// The completion ring's byte-ring size, after its header: a power of two.
+    pub complete_data_size: u32,
+    /// The queue's priority; the host gives its VkQueue a matching priority so
+    /// WindowServer's queue runs high. 0 is normal, higher is higher.
+    pub priority: u32,
+    /// The MSI-X vector the completion ring raises.
+    pub vector: u32,
+}
+
+/// `HEAP_CREATE`: a device heap of `size_bytes` at the guest-picked
+/// `gpu_address`. `options` carries the heap's storage and cache modes and type.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxHeapCreate {
+    /// [`RGFX_CMD_HEAP_CREATE`].
+    pub header: RgfxMsgHeader,
+    /// The new heap's guest-picked id.
+    pub obj_id: u64,
+    /// The heap's guest-picked GPU address.
+    pub gpu_address: u64,
+    /// The heap's size in bytes.
+    pub size_bytes: u64,
+    /// The heap's storage/cache modes and type.
+    pub options: u32,
+    /// Pads to a multiple of 8; 0.
+    pub reserved_2c: u32,
+}
+
+/// `HEAP_OVER_HOST_MEMORY`: a Shared heap of `size_bytes` over the block at
+/// `region_offset` in the region, at the guest-picked `gpu_address`.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxHeapOverHostMemory {
+    /// [`RGFX_CMD_HEAP_OVER_HOST_MEMORY`].
+    pub header: RgfxMsgHeader,
+    /// The new heap's guest-picked id.
+    pub obj_id: u64,
+    /// The heap's guest-picked GPU address.
+    pub gpu_address: u64,
+    /// Where the heap's block starts in the region.
+    pub region_offset: u64,
+    /// The heap's size in bytes.
+    pub size_bytes: u64,
+    /// The heap's storage/cache modes and type.
+    pub options: u32,
+    /// Pads to a multiple of 8; 0.
+    pub reserved_34: u32,
+}
+
+/// `BUFFER_CREATE`: a device buffer of `length` bytes at the guest-picked
+/// `gpu_address`. `options` carries `MTLResourceOptions`.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxBufferCreate {
+    /// [`RGFX_CMD_BUFFER_CREATE`].
+    pub header: RgfxMsgHeader,
+    /// The new buffer's guest-picked id.
+    pub obj_id: u64,
+    /// The buffer's guest-picked GPU address.
+    pub gpu_address: u64,
+    /// The buffer's length in bytes.
+    pub length: u64,
+    /// `MTLResourceOptions`: storage mode, cache mode, hazard tracking.
+    pub options: u32,
+    /// Pads to a multiple of 8; 0.
+    pub reserved_2c: u32,
+}
+
+/// `BUFFER_OVER_HOST_MEMORY`: a Shared buffer of `length` bytes over the block at
+/// `region_offset` in the region, at the guest-picked `gpu_address`.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxBufferOverHostMemory {
+    /// [`RGFX_CMD_BUFFER_OVER_HOST_MEMORY`].
+    pub header: RgfxMsgHeader,
+    /// The new buffer's guest-picked id.
+    pub obj_id: u64,
+    /// The buffer's guest-picked GPU address.
+    pub gpu_address: u64,
+    /// Where the buffer's block starts in the region.
+    pub region_offset: u64,
+    /// The buffer's length in bytes.
+    pub length: u64,
+    /// `MTLResourceOptions`: storage mode, cache mode, hazard tracking.
+    pub options: u32,
+    /// Pads to a multiple of 8; 0.
+    pub reserved_34: u32,
+}
+
+/// `BUFFER_AT_OFFSET`: a buffer of `length` bytes at `offset` in the heap
+/// `heap_obj_id`.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxBufferAtOffset {
+    /// [`RGFX_CMD_BUFFER_AT_OFFSET`].
+    pub header: RgfxMsgHeader,
+    /// The new buffer's guest-picked id.
+    pub obj_id: u64,
+    /// The heap the buffer lies in.
+    pub heap_obj_id: u64,
+    /// The buffer's offset in the heap.
+    pub offset: u64,
+    /// The buffer's length in bytes.
+    pub length: u64,
+    /// `MTLResourceOptions`: storage mode, cache mode, hazard tracking.
+    pub options: u32,
+    /// Pads to a multiple of 8; 0.
+    pub reserved_34: u32,
+}
+
+/// `CB_COMPLETE`: a command buffer finished. `status` is an `RGFX_CB_*`, and
+/// `error_code` carries the raw IOGPU code for diagnostics (0 when `status` is
+/// [`RGFX_CB_OK`]).
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxCbComplete {
+    /// [`RGFX_EVT_CB_COMPLETE`], with the command buffer's submission `seqno`.
+    pub header: RgfxMsgHeader,
+    /// The command buffer that finished.
+    pub cb_obj_id: u64,
+    /// The host's monotonic clock when the GPU started the work, in nanoseconds;
+    /// 0 when unknown (e.g. a recovery victim).
+    pub gpu_start_ns: u64,
+    /// The host's monotonic clock when the GPU finished the work, in nanoseconds.
+    pub gpu_end_ns: u64,
+    /// An `RGFX_CB_*`.
+    pub status: u32,
+    /// The raw IOGPU code behind `status`, for diagnostics; 0 on success.
+    pub error_code: u32,
+}
+
+/// `EVENT_SIGNALLED`: the shared event `obj_id` reached `value`.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxEventSignalled {
+    /// [`RGFX_EVT_EVENT_SIGNALLED`], `seqno` 0.
+    pub header: RgfxMsgHeader,
+    /// The shared event that fired.
+    pub obj_id: u64,
+    /// The value it reached.
+    pub value: u64,
+}
+
+// The stage-3 messages' layout.
+const _: () = {
+    use core::mem::size_of;
+    assert!(size_of::<RgfxObjectDestroy>() == 24);
+    assert!(size_of::<RgfxObjectCreate>() == 24);
+    assert!(size_of::<RgfxSharedEventCreate>() == 32);
+    assert!(size_of::<RgfxQueueCreate>() == 56);
+    assert!(size_of::<RgfxHeapCreate>() == 48);
+    assert!(size_of::<RgfxHeapOverHostMemory>() == 56);
+    assert!(size_of::<RgfxBufferCreate>() == 48);
+    assert!(size_of::<RgfxBufferOverHostMemory>() == 56);
+    assert!(size_of::<RgfxBufferAtOffset>() == 56);
+    assert!(size_of::<RgfxCbComplete>() == 48);
+    assert!(size_of::<RgfxEventSignalled>() == 32);
+    // Each exact size above is a multiple of 8, as a ring message must be.
+    // The stage-3 opcodes do not collide with the stage-2 ones or each other.
+    assert!(RGFX_CMD_QUEUE_CREATE > RGFX_EVT_VBLANK);
+    assert!(RGFX_CMD_COMMAND_BUFFER > RGFX_CMD_FENCE_CREATE);
+    assert!(RGFX_EVT_CB_COMPLETE > RGFX_CMD_COMMAND_BUFFER);
+};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zerocopy::{FromBytes, IntoBytes};
+
+    /// A message written to bytes and read back is the same, and its header's
+    /// `size` matches the struct, as the ring writer fills it in.
+    #[test]
+    fn stage3_messages_round_trip() {
+        let destroy = RgfxObjectDestroy {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_OBJECT_DESTROY,
+                size: size_of::<RgfxObjectDestroy>() as u32,
+                seqno: 7,
+            },
+            obj_id: 0xdead_beef,
+        };
+        let bytes = destroy.as_bytes();
+        assert_eq!(bytes.len(), 24);
+        assert_eq!(RgfxObjectDestroy::read_from_bytes(bytes).unwrap(), destroy);
+
+        let queue = RgfxQueueCreate {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_QUEUE_CREATE,
+                size: size_of::<RgfxQueueCreate>() as u32,
+                seqno: 1,
+            },
+            obj_id: 1,
+            submit_offset: RGFX_ALLOCATIONS_OFFSET,
+            complete_offset: RGFX_ALLOCATIONS_OFFSET + 0x1_0000,
+            submit_data_size: 0x1_0000,
+            complete_data_size: 0x1_0000,
+            priority: 2,
+            vector: 1,
+        };
+        assert!(queue.submit_data_size.is_power_of_two());
+        assert_eq!(
+            RgfxQueueCreate::read_from_bytes(queue.as_bytes()).unwrap(),
+            queue
+        );
+
+        let done = RgfxCbComplete {
+            header: RgfxMsgHeader {
+                r#type: RGFX_EVT_CB_COMPLETE,
+                size: size_of::<RgfxCbComplete>() as u32,
+                seqno: 42,
+            },
+            cb_obj_id: 99,
+            gpu_start_ns: 1_000,
+            gpu_end_ns: 2_000,
+            status: RGFX_CB_OK,
+            error_code: 0,
+        };
+        assert_eq!(done.header.size as usize, size_of::<RgfxCbComplete>());
+        assert_eq!(
+            RgfxCbComplete::read_from_bytes(done.as_bytes()).unwrap(),
+            done
+        );
+    }
+}
