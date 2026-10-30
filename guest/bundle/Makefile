@@ -58,7 +58,7 @@ OBJCXXFLAGS = -fobjc-arc \
 	-Wno-objc-protocol-property-synthesis -Wno-protocol \
 	-Wno-incomplete-implementation -Wno-unguarded-availability-new \
 	-Wno-deprecated-declarations -Wno-objc-protocol-method-implementation
-FRAMEWORKS  = -framework Metal -framework Foundation
+FRAMEWORKS  = -framework Metal -framework Foundation -framework IOKit
 # The device shell subclasses IOGPUMetalDevice, whose ObjC class symbol
 # (_OBJC_CLASS_$_IOGPUMetalDevice) is a hard link-time dependency. It lives in
 # the private IOGPU framework, which the SDK ships a .tbd stub for. We link it

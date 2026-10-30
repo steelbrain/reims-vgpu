@@ -17,6 +17,9 @@
 #include <stdio.h>
 #include <unistd.h>
 
+#include <IOKit/IOKitLib.h>
+
+#include <cstring>
 #include <memory>
 #include <vector>
 
@@ -45,6 +48,15 @@ void rgfxDiag(const char *fmt, ...)
 #include "RgfxReplyReader.hpp"
 #include "RgfxRingWriter.hpp"
 #include "RgfxSerializer.hpp"
+
+// The accelerator's user-client ABI, mirroring guest/kext/src/RgfxAccelerator.hpp (that
+// header is kernel-only and not included here, so the values are duplicated and kept in sync
+// by hand): the only user-client type, the BAR-2 region memory id, and the doorbell selector.
+enum {
+	kRgfxAccelUserClientType = 0,
+	kRgfxAccelMemoryRegion = 0,
+	kRgfxAccelMethodDoorbell = 0,
+};
 
 // The device's doorbell trampoline the queue submission rings ring: it forwards the
 // ring id to the device, which (once BAR 0's registers are mapped) writes it to the
@@ -84,6 +96,10 @@ constexpr long kGpuFamilyMinus1009 = -1009;
 	RgfxReplyReader *_replyReader; // control-completion-ring reader; null until the handshake
 	std::vector<std::unique_ptr<RgfxRingWriter>> _queueRings; // owned queue submit-ring writers
 	uint32_t _nextRingId;        // the next queue ring's doorbell id (0 is the control ring)
+	io_connect_t _conn;          // our accelerator user client (BAR-2 region map + doorbell)
+	std::unique_ptr<RgfxRingWriter> _controlRing; // control submission ring (ring id 0)
+	mach_vm_address_t _mapBase;  // mapped device-region base (0 until the handshake maps it)
+	mach_vm_size_t _mapSize;     // mapped device-region size
 }
 
 // RGFX DIAG (Wall-2 trace; remove before merge): fires when the bundle is loaded
@@ -119,17 +135,57 @@ constexpr long kGpuFamilyMinus1009 = -1009;
 		return nil; // Apple's base declined (or the port is not ours)
 	}
 	_acceleratorPort = port;
+	_conn = IO_OBJECT_NULL;
 	_serializer = nullptr;
 	_region = nullptr;
 	_replyReader = nullptr;
+	_mapBase = 0;
+	_mapSize = 0;
 	_nextRingId = 1;
-	// Wire handshake stub: when the device-region/ring transport lands, this maps
-	// the device region off `port`, reads the RgfxDeviceInfo caps blob into
-	// `_caps` (RgfxCaps::load), stands up the control ring + RgfxSerializer and the
-	// completion-ring RgfxReplyReader, and builds the RgfxRegion over the region's
-	// base and size. Until then `_caps` stays invalid and the getters below answer
-	// from their documented defaults, and `_serializer`/`_region`/`_replyReader` are
-	// null (the resource and command-queue slices fall back while they are).
+
+	// Wire transport handshake: open our own user client on the accelerator and map the
+	// device region (BAR 2) into this task. Read the caps blob the host wrote, build the
+	// region allocator, and stand up the control submission ring (RgfxSerializer) + control
+	// completion ring (RgfxReplyReader). With these non-null the resource / command-queue /
+	// command-buffer categories route over our wire instead of falling back to the
+	// IOGPUMetalDevice base (Apple's IOGPU kernel ABI). Any failure leaves the transport
+	// stubbed (the getters answer from defaults) rather than crashing.
+	kern_return_t kr = IOServiceOpen(port, mach_task_self(), kRgfxAccelUserClientType, &_conn);
+	if (kr != KERN_SUCCESS) {
+		rgfxDiag("RGFX: IOServiceOpen(type=%u) failed kr=0x%x; transport stubbed\n",
+		         kRgfxAccelUserClientType, kr);
+		return self;
+	}
+	mach_vm_address_t addr = 0;
+	mach_vm_size_t mapSize = 0;
+	kr = IOConnectMapMemory(_conn, kRgfxAccelMemoryRegion, mach_task_self(), &addr, &mapSize,
+	                        kIOMapAnywhere);
+	if (kr != KERN_SUCCESS || addr == 0 || mapSize < RGFX_ALLOCATIONS_OFFSET) {
+		rgfxDiag("RGFX: IOConnectMapMemory failed kr=0x%x size=%llu; transport stubbed\n", kr,
+		         (unsigned long long)mapSize);
+		IOServiceClose(_conn);
+		_conn = IO_OBJECT_NULL;
+		return self;
+	}
+	_mapBase = addr;
+	_mapSize = mapSize;
+	volatile uint8_t *base = reinterpret_cast<volatile uint8_t *>(addr);
+
+	// The caps blob the host wrote at RGFX_DEVICE_INFO_OFFSET (read once at init).
+	RgfxDeviceInfo info;
+	memcpy(&info, const_cast<const uint8_t *>(base) + RGFX_DEVICE_INFO_OFFSET, sizeof(info));
+	if (!_caps.load(info))
+		rgfxDiag("RGFX: caps blob invalid (version/zero); using defaults\n");
+
+	_region = new RgfxRegion(base, mapSize);
+	_controlRing = std::make_unique<RgfxRingWriter>(base + RGFX_CONTROL_SUBMIT_OFFSET,
+	                                                RGFX_CONTROL_RING_DATA_SIZE, RGFX_CONTROL_RING_ID,
+	                                                &rgfxDeviceDoorbell, (__bridge void *)self);
+	_serializer = new RgfxSerializer(*_controlRing, _ids);
+	_replyReader = new RgfxReplyReader(base + RGFX_CONTROL_COMPLETE_OFFSET,
+	                                   RGFX_CONTROL_RING_DATA_SIZE);
+	rgfxDiag("RGFX: transport up: region=%llu bytes, caps=%s\n", (unsigned long long)mapSize,
+	         _caps.valid() ? "valid" : "default");
 	return self;
 }
 
@@ -196,9 +252,12 @@ constexpr long kGpuFamilyMinus1009 = -1009;
 
 - (void)rgfxRingDoorbell:(uint32_t)ringId
 {
-	// Stub until BAR 0's registers are mapped (the wire handshake): then this writes
-	// `ringId` to RGFX_REG_DOORBELL to wake the host's consumer of that ring.
-	(void)ringId;
+	// Ring the ring's doorbell through our accelerator user client: the kext writes `ringId`
+	// to RGFX_REG_DOORBELL in BAR 0, waking the host's consumer of that ring.
+	if (_conn == IO_OBJECT_NULL)
+		return;
+	uint64_t scalar = ringId;
+	IOConnectCallScalarMethod(_conn, kRgfxAccelMethodDoorbell, &scalar, 1, nullptr, nullptr);
 }
 
 // --- identity ----------------------------------------------------------------
