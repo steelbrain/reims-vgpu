@@ -1,0 +1,3 @@
+# The bundle build output (serialiser objects, the unit-test binaries and the
+# loadable bundle); never committed.
+/build/
