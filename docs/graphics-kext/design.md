@@ -224,9 +224,27 @@ sit in BAR0 from 0x800.
 | 0x018 | `REGION_SIZE_HI` | RO | BAR2's size, high 32 bits |
 | 0x020 | `DOORBELL` | WO | writing a ring's id wakes its consumer (an `ioeventfd`) |
 
-**BAR2: the region.** A 64-bit prefetchable BAR over host memory (256 MiB),
+**BAR2: the region.** A 64-bit prefetchable BAR over host memory (1 GiB),
 mapped write-back by the guest. The device places the control rings at fixed
-offsets; the guest places everything else.
+offsets; the guest places everything else. Its pages are committed on the host
+as they are first touched, and the host imports for the GPU only what it reads:
+the scanout's pages, and each block a `*_OVER_HOST_MEMORY` names.
+
+1 GiB is the largest size an x86-64 macOS guest takes (measured on macOS 26,
+q35, OVMF):
+- macOS's PCI configurator lays the bus out again at boot. It places every
+  64-bit prefetchable BAR below 4 GiB, never in the host bridge's 64-bit window,
+  and it misreads a 4 GiB BAR as an I/O BAR.
+- Below 4 GiB the window ends at 0xE000_0000, so a 2 GiB BAR cannot fit.
+- A 1 GiB BAR needs the window to start at or below 0x4000_0000. q35 keeps
+  2 GiB of the guest's RAM below 4 GiB when the guest has more than that, and
+  then the BAR gets no address: the kext finds no BAR2 and IONDRVFramebuffer
+  keeps the display.
+
+So the host starts QEMU with `-machine q35,...,max-ram-below-4g=1G` wherever
+the device is present. QEMU then keeps 1 GiB of RAM below 4 GiB and puts the
+rest above, which leaves the guest's memory size unchanged, and the BAR lands
+at 0x4000_0000. The device stays on `pcie.0`: a root port does not help.
 
 | offset | size | what |
 |---|---|---|
@@ -311,8 +329,10 @@ stage 2.
 refresh rate (the guest runs at the host screen's rate). The host presents the
 scanout buffer to the display's window at the host's refresh rate, only when
 the guest wrote it, which it learns from KVM's dirty log over the scanout range
-(QEMU's VGA devices do the same). The GPU reads the buffer in place: it is
-imported once, so no copy is made on the way to the window. While vblank is
+(QEMU's VGA devices do the same). The GPU reads the buffer in place: the host
+pages under the scanout are imported at its first draw, and again only when
+the guest moves the scanout or changes its size, so no copy is made on the way
+to the window, and no other page of the region is pinned for it. While vblank is
 enabled, the host sends `VBLANK` at each refresh of the window's screen.
 
 **Boot display.** The device's option ROM gives firmware a GOP framebuffer in
