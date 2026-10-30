@@ -5,6 +5,8 @@
 //! - [`wire`] is the format the guest and the host share: the registers, the region's layout,
 //!   the rings and the control commands and events. cbindgen writes it into
 //!   `include/reims_graphics_wire.h`, which the guest's kext and option ROM include.
+//! - [`ops`] is the command-buffer op stream in that format: the `COMMAND_BUFFER` message and the
+//!   encoder ops (begin/end, and the render, compute and blit groups) the guest serialises.
 //! - [`Device`] is the host side, as the host's process runs it: the region (BAR 2), the
 //!   registers (BAR 0), the control ring's thread and the display's refresh thread, over the
 //!   host's callbacks ([`Host`]) and what shows the display ([`Screen`]). `reims-vgpu` shows it
@@ -15,6 +17,7 @@
 mod control;
 pub mod device;
 pub mod display;
+pub mod ops;
 pub mod region;
 mod ring;
 mod wake;

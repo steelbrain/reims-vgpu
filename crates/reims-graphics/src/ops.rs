@@ -1,0 +1,399 @@
+//! The command-buffer op stream, as the guest and the host share it: the
+//! [`RgfxCommandBuffer`] message that heads an
+//! [`RGFX_CMD_COMMAND_BUFFER`](crate::wire::RGFX_CMD_COMMAND_BUFFER) and
+//! the byte stream of encoder ops that follows it (docs/graphics-kext/design.md,
+//! "Stage 3 wire protocol: the Metal-call stream"). The guest's Metal GPU bundle
+//! serialises each `MTLCommandBuffer` into one of these; the host walks the op
+//! stream and drives the library's `Platform`.
+//!
+//! **An op.** Every op starts with an [`RgfxOpHeader`] — its `tag`, `flags` and
+//! `len` — followed by the op's body. `len` is the whole op's byte count, header
+//! included, a multiple of 8, so the walker steps `len` bytes to the next op. The
+//! op's body struct (the `RgfxOp*` records in [`render`], and later [`compute`]
+//! and [`blit`]) is the bytes **after** the header, not the whole op: unlike a
+//! ring message, whose struct is the whole message, an op's fields are the body
+//! alone and the walker has already read the header. A body with no fields (an
+//! `ENCODER_END`) is a bare header.
+//!
+//! **Tag ranges.** An op's `tag` names both its group and its op. The group is
+//! `tag >> 12` ([`op_group`]):
+//!
+//! | group | `tag >> 12` | tags | module |
+//! |---|---|---|---|
+//! | framing / command buffer | 0 | `0x00xx` | this module |
+//! | render encoder | 1 | `0x1xxx` | [`render`] |
+//! | compute encoder | 2 | `0x2xxx` | [`compute`] |
+//! | blit encoder | 3 | `0x3xxx` | [`blit`] |
+//!
+//! The host dispatches by group: framing ops (encoder begin/end) it handles
+//! itself, and each encoder group's ops it hands to that group's decoder.
+//!
+//! **Object references.** Every reference is a `u64` `obj_id` the guest picked,
+//! and `0` is nil. A reference that may be nil is resolved as an `Option`; a
+//! reference that must name an object faults the stream where it is `0` or names
+//! no object.
+//!
+//! Every value is little-endian, as [`crate::wire`]'s are, and the structs follow
+//! its layout rules (a `u64` never at an offset that is not a multiple of 8, a
+//! `size_of` a multiple of 8). cbindgen writes them into
+//! `include/reims_graphics_wire.h`.
+
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
+
+use crate::wire::RgfxMsgHeader;
+
+pub mod blit;
+pub mod compute;
+pub mod render;
+
+/// The group of ops a `tag` belongs to: `tag >> 12`.
+pub const fn op_group(tag: u16) -> u16 {
+    tag >> 12
+}
+
+/// The framing / command-buffer group (`tag >> 12`): encoder begin and end.
+pub const RGFX_OP_GROUP_FRAMING: u16 = 0x0;
+/// The render-encoder group (`tag >> 12`): [`render`].
+pub const RGFX_OP_GROUP_RENDER: u16 = 0x1;
+/// The compute-encoder group (`tag >> 12`): [`compute`].
+pub const RGFX_OP_GROUP_COMPUTE: u16 = 0x2;
+/// The blit-encoder group (`tag >> 12`): [`blit`].
+pub const RGFX_OP_GROUP_BLIT: u16 = 0x3;
+
+/// Op `ENCODER_BEGIN_RENDER`: open a render encoder for the pass the op's body
+/// describes (an [`RgfxRenderPassDesc`] then its `color_count`
+/// [`RgfxRenderPassColorAttachment`] records). Holds the encoder until
+/// [`RGFX_OP_ENCODER_END`].
+pub const RGFX_OP_ENCODER_BEGIN_RENDER: u16 = 0x0001;
+/// Op `ENCODER_BEGIN_COMPUTE`: open a compute encoder for the pass the op's body
+/// ([`RgfxComputePassDesc`]) describes.
+pub const RGFX_OP_ENCODER_BEGIN_COMPUTE: u16 = 0x0002;
+/// Op `ENCODER_BEGIN_BLIT`: open a blit encoder (no body).
+pub const RGFX_OP_ENCODER_BEGIN_BLIT: u16 = 0x0003;
+/// Op `ENCODER_END`: end the open encoder (`endEncoding`) and drop it (no body).
+pub const RGFX_OP_ENCODER_END: u16 = 0x0004;
+
+/// Every op's header: its tag, its flags and its total byte count.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxOpHeader {
+    /// The op's tag: its group ([`op_group`]) and its op within the group.
+    pub tag: u16,
+    /// Per-op flags; 0 where an op defines none.
+    pub flags: u16,
+    /// The op's bytes, this header included: a multiple of 8.
+    pub len: u32,
+}
+
+/// Where an op's body starts in the op: right after its header.
+pub const RGFX_OP_BODY_OFFSET: u32 = 8;
+
+/// `COMMAND_BUFFER` ([`RGFX_CMD_COMMAND_BUFFER`](crate::wire::RGFX_CMD_COMMAND_BUFFER)):
+/// one command buffer on a queue's submission ring. The op stream (`op_bytes`
+/// bytes) follows this message at [`RGFX_COMMAND_BUFFER_OPS_OFFSET`]; the host
+/// opens a command buffer on the queue `queue_obj_id`, walks the ops, commits,
+/// and answers an [`RgfxCbComplete`](crate::wire::RgfxCbComplete) carrying
+/// `cb_obj_id` when the work finishes.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxCommandBuffer {
+    /// [`RGFX_CMD_COMMAND_BUFFER`](crate::wire::RGFX_CMD_COMMAND_BUFFER).
+    pub header: RgfxMsgHeader,
+    /// The command queue this buffer belongs to.
+    pub queue_obj_id: u64,
+    /// The command buffer's guest-picked id, which its completion names.
+    pub cb_obj_id: u64,
+    /// The bytes of op stream that follow this message.
+    pub op_bytes: u64,
+}
+
+/// Where a `COMMAND_BUFFER` message's op stream starts: right after its header.
+pub const RGFX_COMMAND_BUFFER_OPS_OFFSET: u32 = 40;
+
+// ---------------------------------------------------------------------------
+// The render-pass descriptor wire schema, carried by an `ENCODER_BEGIN_RENDER`
+// op: a fixed [`RgfxRenderPassDesc`] (the pass's own properties and the depth and
+// stencil attachments) then `color_count` [`RgfxRenderPassColorAttachment`]
+// records. An attachment whose `texture_obj_id` is 0 is absent (nil), and sets
+// nothing; a non-zero `resolve_texture_obj_id` adds the resolve. Clear values
+// travel as the bits of their `f64`/`u32`, so the schema stays all-integer and
+// comparable, as the sampler's LOD clamps do in `wire`.
+// ---------------------------------------------------------------------------
+
+/// A pass's `render_target_array_length` is set (else Metal's default stands).
+pub const RGFX_PASS_FLAG_RT_ARRAY_LENGTH: u32 = 1 << 0;
+/// A pass's `render_target_width` and `render_target_height` are set.
+pub const RGFX_PASS_FLAG_RT_SIZE: u32 = 1 << 1;
+/// A pass's `default_raster_sample_count` is set.
+pub const RGFX_PASS_FLAG_DEFAULT_RASTER_SAMPLE_COUNT: u32 = 1 << 2;
+
+/// One colour attachment of a render pass (`colorAttachments[i]`). Absent (sets
+/// nothing) when `texture_obj_id` is 0.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxRenderPassColorAttachment {
+    /// The attachment's texture, or 0 for an absent attachment.
+    pub texture_obj_id: u64,
+    /// The resolve texture, or 0 for none.
+    pub resolve_texture_obj_id: u64,
+    /// `MTLClearColor` as the bits of its four `f64` (red, green, blue, alpha).
+    pub clear_color_bits: [u64; 4],
+    /// `MTLLoadAction`.
+    pub load_action: u32,
+    /// `MTLStoreAction`.
+    pub store_action: u32,
+    /// `MTLStoreActionOptions`.
+    pub store_action_options: u32,
+    /// The mip level.
+    pub level: u32,
+    /// The slice.
+    pub slice: u32,
+    /// The depth plane.
+    pub depth_plane: u32,
+    /// The resolve texture's mip level.
+    pub resolve_level: u32,
+    /// The resolve texture's slice.
+    pub resolve_slice: u32,
+    /// The resolve texture's depth plane.
+    pub resolve_depth_plane: u32,
+    /// Pads to a multiple of 8; 0.
+    pub reserved_54: u32,
+}
+
+/// A render pass's depth attachment (`depthAttachment`). Absent when
+/// `texture_obj_id` is 0.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxRenderPassDepthAttachment {
+    /// The attachment's texture, or 0 for none.
+    pub texture_obj_id: u64,
+    /// The resolve texture, or 0 for none.
+    pub resolve_texture_obj_id: u64,
+    /// The clear depth as the bits of its `f64`.
+    pub clear_depth_bits: u64,
+    /// `MTLLoadAction`.
+    pub load_action: u32,
+    /// `MTLStoreAction`.
+    pub store_action: u32,
+    /// `MTLStoreActionOptions`.
+    pub store_action_options: u32,
+    /// The mip level.
+    pub level: u32,
+    /// The slice.
+    pub slice: u32,
+    /// The depth plane.
+    pub depth_plane: u32,
+    /// The resolve texture's mip level.
+    pub resolve_level: u32,
+    /// The resolve texture's slice.
+    pub resolve_slice: u32,
+    /// The resolve texture's depth plane.
+    pub resolve_depth_plane: u32,
+    /// `MTLMultisampleDepthResolveFilter`.
+    pub depth_resolve_filter: u32,
+}
+
+/// A render pass's stencil attachment (`stencilAttachment`). Absent when
+/// `texture_obj_id` is 0.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxRenderPassStencilAttachment {
+    /// The attachment's texture, or 0 for none.
+    pub texture_obj_id: u64,
+    /// The resolve texture, or 0 for none.
+    pub resolve_texture_obj_id: u64,
+    /// `MTLLoadAction`.
+    pub load_action: u32,
+    /// `MTLStoreAction`.
+    pub store_action: u32,
+    /// `MTLStoreActionOptions`.
+    pub store_action_options: u32,
+    /// The mip level.
+    pub level: u32,
+    /// The slice.
+    pub slice: u32,
+    /// The depth plane.
+    pub depth_plane: u32,
+    /// The resolve texture's mip level.
+    pub resolve_level: u32,
+    /// The resolve texture's slice.
+    pub resolve_slice: u32,
+    /// The resolve texture's depth plane.
+    pub resolve_depth_plane: u32,
+    /// `MTLMultisampleStencilResolveFilter`.
+    pub stencil_resolve_filter: u32,
+    /// The clear stencil value.
+    pub clear_stencil: u32,
+    /// Pads to a multiple of 8; 0.
+    pub reserved_3c: u32,
+}
+
+/// The fixed head of an `ENCODER_BEGIN_RENDER` op's body: the pass's own
+/// properties and its depth and stencil attachments. `color_count`
+/// [`RgfxRenderPassColorAttachment`] records follow it, at
+/// [`RGFX_RENDER_PASS_COLOR_OFFSET`]. `flags` is an `RGFX_PASS_FLAG_*` set that
+/// says which of the optional pass properties are set.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxRenderPassDesc {
+    /// The colour attachment records that follow this struct.
+    pub color_count: u32,
+    /// An `RGFX_PASS_FLAG_*` set: which optional pass properties are set.
+    pub flags: u32,
+    /// `renderTargetArrayLength`, when [`RGFX_PASS_FLAG_RT_ARRAY_LENGTH`] is set.
+    pub render_target_array_length: u32,
+    /// `renderTargetWidth`, when [`RGFX_PASS_FLAG_RT_SIZE`] is set.
+    pub render_target_width: u32,
+    /// `renderTargetHeight`, when [`RGFX_PASS_FLAG_RT_SIZE`] is set.
+    pub render_target_height: u32,
+    /// `defaultRasterSampleCount`, when [`RGFX_PASS_FLAG_DEFAULT_RASTER_SAMPLE_COUNT`] is set.
+    pub default_raster_sample_count: u32,
+    /// The depth attachment (absent when its `texture_obj_id` is 0).
+    pub depth: RgfxRenderPassDepthAttachment,
+    /// The stencil attachment (absent when its `texture_obj_id` is 0).
+    pub stencil: RgfxRenderPassStencilAttachment,
+}
+
+/// Where the colour attachment array starts in an `ENCODER_BEGIN_RENDER` op's
+/// body: right after the fixed [`RgfxRenderPassDesc`].
+pub const RGFX_RENDER_PASS_COLOR_OFFSET: u32 = 152;
+
+/// The body of an `ENCODER_BEGIN_COMPUTE` op: the compute pass's properties.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxComputePassDesc {
+    /// `MTLDispatchType`, when [`RGFX_COMPUTE_PASS_FLAG_DISPATCH_TYPE`] is set.
+    pub dispatch_type: u32,
+    /// An `RGFX_COMPUTE_PASS_FLAG_*` set.
+    pub flags: u32,
+}
+
+/// A compute pass's `dispatch_type` is set (else Metal's default stands).
+pub const RGFX_COMPUTE_PASS_FLAG_DISPATCH_TYPE: u32 = 1 << 0;
+
+// The op-stream layout.
+const _: () = {
+    use core::mem::size_of;
+    assert!(size_of::<RgfxOpHeader>() == 8);
+    assert!(RGFX_OP_BODY_OFFSET as usize == size_of::<RgfxOpHeader>());
+    assert!(size_of::<RgfxCommandBuffer>() == 40);
+    assert!(RGFX_COMMAND_BUFFER_OPS_OFFSET as usize == size_of::<RgfxCommandBuffer>());
+    assert!(size_of::<RgfxRenderPassColorAttachment>() == 88);
+    assert!(size_of::<RgfxRenderPassDepthAttachment>() == 64);
+    assert!(size_of::<RgfxRenderPassStencilAttachment>() == 64);
+    assert!(size_of::<RgfxRenderPassDesc>() == 152);
+    assert!(RGFX_RENDER_PASS_COLOR_OFFSET as usize == size_of::<RgfxRenderPassDesc>());
+    assert!(size_of::<RgfxComputePassDesc>() == 8);
+    // Each group's tag range maps to its own `op_group`.
+    assert!(op_group(RGFX_OP_ENCODER_BEGIN_RENDER) == RGFX_OP_GROUP_FRAMING);
+    assert!(op_group(RGFX_OP_ENCODER_END) == RGFX_OP_GROUP_FRAMING);
+    assert!(op_group(render::RGFX_OP_RENDER_DRAW_PRIMITIVES) == RGFX_OP_GROUP_RENDER);
+};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zerocopy::{FromBytes, IntoBytes};
+
+    /// The op header and the command-buffer message round-trip, and the group of
+    /// each framing tag is the framing group.
+    #[test]
+    fn framing_round_trips() {
+        let op = RgfxOpHeader {
+            tag: RGFX_OP_ENCODER_BEGIN_RENDER,
+            flags: 0,
+            len: 8 + size_of::<RgfxRenderPassDesc>() as u32,
+        };
+        assert_eq!(op.as_bytes().len(), 8);
+        assert_eq!(RgfxOpHeader::read_from_bytes(op.as_bytes()).unwrap(), op);
+
+        let cb = RgfxCommandBuffer {
+            header: RgfxMsgHeader {
+                r#type: crate::wire::RGFX_CMD_COMMAND_BUFFER,
+                size: 48,
+                seqno: 9,
+            },
+            queue_obj_id: 3,
+            cb_obj_id: 77,
+            op_bytes: 8,
+        };
+        assert_eq!(cb.as_bytes().len(), 40);
+        assert_eq!(
+            RgfxCommandBuffer::read_from_bytes(cb.as_bytes()).unwrap(),
+            cb
+        );
+
+        for tag in [
+            RGFX_OP_ENCODER_BEGIN_RENDER,
+            RGFX_OP_ENCODER_BEGIN_COMPUTE,
+            RGFX_OP_ENCODER_BEGIN_BLIT,
+            RGFX_OP_ENCODER_END,
+        ] {
+            assert_eq!(op_group(tag), RGFX_OP_GROUP_FRAMING);
+        }
+    }
+
+    /// The render-pass schema round-trips, clear values travelling as bits.
+    #[test]
+    fn render_pass_schema_round_trips() {
+        let desc = RgfxRenderPassDesc {
+            color_count: 1,
+            flags: RGFX_PASS_FLAG_RT_SIZE,
+            render_target_width: 1920,
+            render_target_height: 1080,
+            depth: RgfxRenderPassDepthAttachment {
+                texture_obj_id: 5,
+                clear_depth_bits: 1.0f64.to_bits(),
+                load_action: 2,
+                store_action: 1,
+                ..RgfxRenderPassDepthAttachment::default()
+            },
+            ..RgfxRenderPassDesc::default()
+        };
+        assert_eq!(
+            RgfxRenderPassDesc::read_from_bytes(desc.as_bytes()).unwrap(),
+            desc
+        );
+        assert_eq!(f64::from_bits(desc.depth.clear_depth_bits), 1.0);
+
+        let color = RgfxRenderPassColorAttachment {
+            texture_obj_id: 7,
+            clear_color_bits: [
+                0.0f64.to_bits(),
+                0.25f64.to_bits(),
+                0.5f64.to_bits(),
+                1.0f64.to_bits(),
+            ],
+            load_action: 2,
+            store_action: 1,
+            ..RgfxRenderPassColorAttachment::default()
+        };
+        assert_eq!(
+            RgfxRenderPassColorAttachment::read_from_bytes(color.as_bytes()).unwrap(),
+            color
+        );
+
+        let pass = RgfxComputePassDesc {
+            dispatch_type: 1,
+            flags: RGFX_COMPUTE_PASS_FLAG_DISPATCH_TYPE,
+        };
+        assert_eq!(
+            RgfxComputePassDesc::read_from_bytes(pass.as_bytes()).unwrap(),
+            pass
+        );
+    }
+}

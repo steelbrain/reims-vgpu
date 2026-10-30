@@ -61,6 +61,21 @@ include = [
     "RgfxDepthStencilCreate",
     "RgfxLibraryCreate",
     "RgfxDeviceInfo",
+    "RgfxOpHeader",
+    "RgfxCommandBuffer",
+    "RgfxRenderPassColorAttachment",
+    "RgfxRenderPassDepthAttachment",
+    "RgfxRenderPassStencilAttachment",
+    "RgfxRenderPassDesc",
+    "RgfxComputePassDesc",
+    "RgfxOpSetRenderPipelineState",
+    "RgfxOpSetVertexBuffer",
+    "RgfxOpSetFragmentBuffer",
+    "RgfxOpSetFragmentTexture",
+    "RgfxOpSetViewport",
+    "RgfxOpSetScissorRect",
+    "RgfxOpDrawPrimitives",
+    "RgfxOpDrawIndexedPrimitives",
 ]
 
 [struct]
