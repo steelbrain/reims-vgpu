@@ -81,13 +81,26 @@ pub const RGFX_CONTROL_SUBMIT_OFFSET: u64 = 0x0_0000;
 pub const RGFX_CONTROL_COMPLETE_OFFSET: u64 = 0x1_0000;
 /// The room each control ring has in the region, its header included.
 pub const RGFX_CONTROL_RING_SPAN: u64 = 0x1_0000;
+/// Where the device submission ring is in the region: ring id [`RGFX_DEVICE_RING_ID`], guest
+/// (the Metal bundle) to host. It carries the object lifecycle (queue, heap, buffer, texture,
+/// sampler, pipeline and sync-object creates and destroys) the bundle drives, so the control
+/// ring stays the framebuffer kext's alone: each ring keeps a single producer and consumer.
+pub const RGFX_DEVICE_SUBMIT_OFFSET: u64 = 0x2_0000;
+/// Where the device completion ring is in the region: host to guest (the Metal bundle), MSI-X
+/// vector [`RGFX_DEVICE_VECTOR`]. It carries the stage-3 replies (pipeline reflection and the
+/// command answers the bundle awaits).
+pub const RGFX_DEVICE_COMPLETE_OFFSET: u64 = 0x3_0000;
 /// Where the guest's allocations start in the region (the scanout buffers and the cursor
 /// image): everything from here to the region's end is the guest's to place.
-pub const RGFX_ALLOCATIONS_OFFSET: u64 = 0x2_0000;
+pub const RGFX_ALLOCATIONS_OFFSET: u64 = 0x4_0000;
 /// The control submission ring's id, which the guest writes to `DOORBELL`.
 pub const RGFX_CONTROL_RING_ID: u32 = 0;
 /// The control completion ring's MSI-X vector.
 pub const RGFX_CONTROL_VECTOR: u32 = 0;
+/// The device submission ring's id, which the guest bundle writes to `DOORBELL`.
+pub const RGFX_DEVICE_RING_ID: u32 = 1;
+/// The device completion ring's MSI-X vector.
+pub const RGFX_DEVICE_VECTOR: u32 = 1;
 
 /// The size of a ring's header ([`RgfxRingHeader`]); its byte ring follows it.
 pub const RGFX_RING_HEADER_SIZE: u32 = 256;
@@ -480,7 +493,9 @@ const _: () = {
     assert!(
         RGFX_RING_HEADER_SIZE as u64 + RGFX_CONTROL_RING_DATA_SIZE as u64 <= RGFX_CONTROL_RING_SPAN
     );
-    assert!(RGFX_CONTROL_COMPLETE_OFFSET + RGFX_CONTROL_RING_SPAN <= RGFX_ALLOCATIONS_OFFSET);
+    assert!(RGFX_CONTROL_COMPLETE_OFFSET + RGFX_CONTROL_RING_SPAN <= RGFX_DEVICE_SUBMIT_OFFSET);
+    assert!(RGFX_DEVICE_SUBMIT_OFFSET + RGFX_CONTROL_RING_SPAN <= RGFX_DEVICE_COMPLETE_OFFSET);
+    assert!(RGFX_DEVICE_COMPLETE_OFFSET + RGFX_CONTROL_RING_SPAN <= RGFX_ALLOCATIONS_OFFSET);
 };
 
 // ---------------------------------------------------------------------------

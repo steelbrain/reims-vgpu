@@ -8,12 +8,14 @@
  *   - resource blocks for Shared / no-copy buffers and Shared heaps (placed for
  *     createBufferOverHostMemory / createHeapOverHostMemory).
  *
- * THE RESERVED HEAD. The region's first RGFX_ALLOCATIONS_OFFSET (0x20000) bytes are
+ * THE RESERVED HEAD. The region's first RGFX_ALLOCATIONS_OFFSET (0x40000) bytes are
  * the host's: the control submission ring at RGFX_CONTROL_SUBMIT_OFFSET, the control
- * completion ring at RGFX_CONTROL_COMPLETE_OFFSET, and the device-info caps page at
- * RGFX_DEVICE_INFO_OFFSET in that completion ring's tail. (The MSI-X table lives in
- * BAR 0, not here.) The allocator never hands out an offset below that floor, so it
- * never collides with the control rings or the caps page the host owns.
+ * completion ring at RGFX_CONTROL_COMPLETE_OFFSET, the device submission and completion
+ * rings (the bundle's own) at RGFX_DEVICE_SUBMIT_OFFSET and RGFX_DEVICE_COMPLETE_OFFSET,
+ * and the device-info caps page at RGFX_DEVICE_INFO_OFFSET in the control completion
+ * ring's tail. (The MSI-X table lives in BAR 0, not here.) The allocator never hands out
+ * an offset below that floor, so it never collides with the rings or the caps page the
+ * host owns.
  *
  * THE POLICY. Deterministic bump allocation: a monotonic cursor that starts at the
  * floor and only moves up, each allocation rounded up to its alignment. Nothing is

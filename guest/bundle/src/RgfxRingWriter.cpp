@@ -78,14 +78,10 @@ RgfxRingWriter::RgfxRingWriter(volatile uint8_t *ring_base, uint32_t data_size, 
       m_mask(data_size - 1), m_ringId(ring_id), m_doorbell(doorbell),
       m_doorbellContext(doorbell_context), m_produced(0), m_nextSeqno(1)
 {
-	// Join the ring at its current producer count, as the framebuffer kext does
-	// (ReimsGraphics.cpp reads the header's producer at start). A freshly allocated ring
-	// (per-queue, zeroed by the region allocator) reads 0; the control ring, already driven
-	// by the framebuffer, continues from where it stands, so the room check (producer -
-	// consumer) is right rather than underflowing from a 0 start and refusing every post.
-	// NOTE: the control ring is shared with the framebuffer kext; a single owner / separate
-	// accelerator ring is the robust fix (concurrent producers still race) — interim here.
-	m_produced = load64(m_header + kProducer);
+	// The bundle's rings (the device ring and the per-queue rings) are its own: fresh, and the
+	// host resets each at device init and at reset, so the writer starts from 0. (The interim
+	// "join at the current producer" was for sharing the framebuffer kext's control ring; the
+	// device ring replaced that, so each ring has a single producer and starts clean.)
 }
 
 bool RgfxRingWriter::tryPost(uint32_t type, const void *message, uint32_t size, uint64_t *out_seqno)

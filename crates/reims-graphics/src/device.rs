@@ -7,7 +7,13 @@
 //! the guest's `STATUS`, it takes every message the guest has published, answers each on the
 //! completion ring, then sleeps with the ring's `consumer_idle` handshake (`ring`). While the
 //! completion ring has no room, it waits for the guest to take more, polling, and takes no
-//! command meanwhile. `reims-vgpu.graphics-refresh` runs at the display's refresh rate
+//! command meanwhile. The framebuffer kext is its sole producer (the display commands).
+//! `reims-vgpu.graphics-device` takes the device submission ring the same way, its sole producer
+//! the Metal bundle: it hands every message (the object lifecycle — queue, heap, buffer, texture,
+//! sampler, pipeline and sync-object creates and destroys) to the host's stage-3 decoder, and any
+//! reply the host owes it posts on the device completion ring. The two rings each keep a single
+//! producer and a single consumer, so their `consumer_idle` handshakes never race.
+//! `reims-vgpu.graphics-refresh` runs at the display's refresh rate
 //! ([`Screen::mode`]): at each refresh it asks the host whether the guest wrote the scanout
 //! ([`Host::scanout_written`]) and has the screen show it where it did, sends `VBLANK` while the
 //! guest has it on (dropping one the completion ring has no room for), and sends
@@ -84,6 +90,17 @@ const COMPLETE: RingAt = RingAt {
     header: RGFX_CONTROL_COMPLETE_OFFSET,
     data_size: RGFX_CONTROL_RING_DATA_SIZE as u64,
 };
+/// The device submission ring: the Metal bundle's own, parallel to the control ring, so each ring
+/// keeps a single producer and consumer (`wire`'s layout). It carries the object lifecycle.
+const DEVICE_SUBMIT: RingAt = RingAt {
+    header: RGFX_DEVICE_SUBMIT_OFFSET,
+    data_size: RGFX_CONTROL_RING_DATA_SIZE as u64,
+};
+/// The device completion ring: the bundle's own, for the stage-3 replies the host owes it.
+const DEVICE_COMPLETE: RingAt = RingAt {
+    header: RGFX_DEVICE_COMPLETE_OFFSET,
+    data_size: RGFX_CONTROL_RING_DATA_SIZE as u64,
+};
 
 /// What the device asks of the host that runs it (QEMU, through the C API's callbacks). Each is
 /// called on one of the device's threads, never inside a call of the host's into the device, and
@@ -97,13 +114,12 @@ pub trait Host: Send + Sync + 'static {
     /// cleared. On the refresh thread.
     fn scanout_written(&self, offset: u64, length: u64) -> bool;
 
-    /// Hands a stage-3 control message — one whose type is not a stage-2 display command (the
-    /// object-lifecycle creates and destroy, the pipeline creates, and `COMMAND_BUFFER`) — to the
-    /// host's decoder. The control thread calls this with the message's whole bytes, in the order
-    /// the guest published them. Any reply the host owes (a pipeline reflection, a command
-    /// buffer's completion) it posts onto the control completion ring itself, through
-    /// [`Device::completion_poster`]; this returns nothing. The default does nothing, for a host
-    /// with no stage-3 decoder.
+    /// Hands a stage-3 message — the object-lifecycle creates and destroy, the pipeline creates,
+    /// and any `COMMAND_BUFFER` not on a per-queue ring — to the host's decoder. The device thread
+    /// calls this with the message's whole bytes, in the order the guest published them on the
+    /// device ring. Any reply the host owes (a pipeline reflection, a command buffer's completion)
+    /// it posts onto the device completion ring itself, through [`Device::completion_poster`]; this
+    /// returns nothing. The default does nothing, for a host with no stage-3 decoder.
     fn stage3_message(&self, message: &[u8]) {
         let _ = message;
     }
@@ -157,6 +173,13 @@ pub(crate) struct Shared {
     pub(crate) display: Mutex<DisplayState>,
     /// The control completion ring.
     completion: Mutex<Producer>,
+    /// The device service thread's own wake.
+    device_wake: Wake,
+    /// The device submission ring (the Metal bundle's own), held while the device thread takes a
+    /// message. Its sole producer is the bundle and its sole consumer the device thread.
+    device_submit: Mutex<Submit>,
+    /// The device completion ring (the bundle's own): the stage-3 replies the host posts it.
+    device_completion: Mutex<Producer>,
     /// The command queues' own rings and service threads, by queue id and by ring id.
     queues: Mutex<Queues>,
     /// A weak handle to this shared state, set at the device's make: a queue's service thread and
@@ -245,6 +268,10 @@ impl Device {
         consumer.reset(&region);
         let mut producer = Producer::new(COMPLETE);
         producer.reset(&region);
+        let mut device_consumer = Consumer::new(DEVICE_SUBMIT);
+        device_consumer.reset(&region);
+        let mut device_producer = Producer::new(DEVICE_COMPLETE);
+        device_producer.reset(&region);
         let shared = Arc::new(Shared {
             host,
             screen,
@@ -260,6 +287,12 @@ impl Device {
             }),
             display: Mutex::new(DisplayState::default()),
             completion: Mutex::new(producer),
+            device_wake: Wake::new()?,
+            device_submit: Mutex::new(Submit {
+                consumer: device_consumer,
+                broken: false,
+            }),
+            device_completion: Mutex::new(device_producer),
             queues: Mutex::new(Queues::default()),
             weak_self: OnceLock::new(),
         });
@@ -270,6 +303,14 @@ impl Device {
             .name("reims-vgpu.graphics-control".to_owned())
             .spawn(move || control.control_thread())
             .ok()?;
+        let device = Arc::clone(&shared);
+        let started = std::thread::Builder::new()
+            .name("reims-vgpu.graphics-device".to_owned())
+            .spawn(move || device.device_service());
+        if started.is_err() {
+            shared.end();
+            return None;
+        }
         let refresh = Arc::clone(&shared);
         let started = std::thread::Builder::new()
             .name("reims-vgpu.graphics-refresh".to_owned())
@@ -321,6 +362,7 @@ impl Device {
                     .status
                     .store(RGFX_STATUS_DRIVER_READY, Ordering::Release);
                 self.shared.wake.wake();
+                self.shared.device_wake.wake();
             }
             RGFX_REG_DOORBELL => self.shared.ring_doorbell(u64::from(value)),
             _ => {}
@@ -346,10 +388,12 @@ impl Device {
         self.shared.reset();
     }
 
-    /// A handle onto the control completion ring that posts host-to-guest events from any thread:
-    /// the stage-3 decoder's command-buffer completions, which the GPU raises on a thread of its
-    /// own, and its pipeline-reflection replies. The handle holds no strong reference to the
-    /// device, so it never keeps it alive; a post after the device has ended is dropped.
+    /// A handle onto the device completion ring that posts host-to-guest stage-3 replies from any
+    /// thread: the stage-3 decoder's command-buffer completions (for buffers not on a per-queue
+    /// ring), which the GPU raises on a thread of its own, and its pipeline-reflection replies. It
+    /// posts onto the bundle's own completion ring, not the control one, so the display events and
+    /// the stage-3 replies never share a ring. The handle holds no strong reference to the device,
+    /// so it never keeps it alive; a post after the device has ended is dropped.
     pub fn completion_poster(&self) -> ControlCompletionPoster {
         ControlCompletionPoster {
             shared: Arc::downgrade(&self.shared),
@@ -357,11 +401,12 @@ impl Device {
     }
 }
 
-/// A handle that posts events onto the control completion ring from any thread ([`Device`]'s
-/// module doc and [`Device::completion_poster`]): it writes the message and raises the control
-/// vector where the guest armed the ring, through the same [`Producer`] and interrupt path the
-/// control thread uses. It holds a weak reference to the device, so it does not keep it alive; a
-/// post after the device has ended, or dropped while it is reset, is dropped.
+/// A handle that posts stage-3 replies onto the device completion ring from any thread ([`Device`]'s
+/// module doc and [`Device::completion_poster`]): it writes the message and raises the device
+/// vector where the guest armed the ring, through that ring's [`Producer`] and interrupt path. It
+/// holds a weak reference to the device, so it does not keep it alive; a post after the device has
+/// ended, or dropped while it is reset, is dropped. (Its name is kept for the C API; it drives the
+/// device ring, not the control one.)
 #[derive(Clone)]
 pub struct ControlCompletionPoster {
     /// The device's shared state, weakly, so the handle outlives nothing.
@@ -369,15 +414,15 @@ pub struct ControlCompletionPoster {
 }
 
 impl ControlCompletionPoster {
-    /// Posts `message` (a whole event, its `size` set and a multiple of 8) onto the control
+    /// Posts `message` (a whole event, its `size` set and a multiple of 8) onto the device
     /// completion ring, waiting for room while the device lives and is not reset, and raising the
-    /// control vector where the guest armed the ring. Does nothing where the device has ended.
+    /// device vector where the guest armed the ring. Does nothing where the device has ended.
     pub fn post(&self, message: &[u8]) {
         let Some(shared) = self.shared.upgrade() else {
             return;
         };
         let epoch = shared.epoch.load(Ordering::Acquire);
-        shared.post_waiting(message, epoch);
+        shared.device_post_waiting(message, epoch);
     }
 }
 
@@ -433,6 +478,7 @@ impl Shared {
     fn end(&self) {
         self.ending.store(true, Ordering::Release);
         self.wake.wake();
+        self.device_wake.wake();
         for queue in self.queues.lock().by_obj.values() {
             queue.end();
         }
@@ -453,10 +499,17 @@ impl Shared {
         let mut submit = self.submit.lock();
         let mut display = self.display.lock();
         let mut completion = self.completion.lock();
+        let mut device_submit = self.device_submit.lock();
+        let mut device_completion = self.device_completion.lock();
         submit.consumer.reset(&self.region);
         submit.broken = false;
         completion.reset(&self.region);
+        device_submit.consumer.reset(&self.region);
+        device_submit.broken = false;
+        device_completion.reset(&self.region);
         *display = DisplayState::default();
+        drop(device_completion);
+        drop(device_submit);
         drop(completion);
         drop(display);
         drop(submit);
@@ -566,12 +619,110 @@ impl Shared {
         Post::Done
     }
 
+    /// Posts `message` onto the device completion ring, waiting for room while the device is not
+    /// reset or ended.
+    fn device_post_waiting(&self, message: &[u8], epoch: u64) {
+        while self.device_post(message, epoch) == Post::NoRoom {
+            if self.ending() {
+                return;
+            }
+            std::thread::sleep(ROOM_POLL);
+        }
+    }
+
+    /// Posts `message` into the device completion ring, for work begun at reset count `epoch`, and
+    /// raises the device ring's interrupt where the guest armed it, with no lock held.
+    fn device_post(&self, message: &[u8], epoch: u64) -> Post {
+        let raise = {
+            let mut completion = self.device_completion.lock();
+            if self.epoch.load(Ordering::Acquire) != epoch || !self.started() {
+                return Post::Dropped;
+            }
+            match completion.post(&self.region, message) {
+                Posted::Yes { raise } => raise,
+                Posted::NoRoom => return Post::NoRoom,
+                Posted::Broken(broken) => {
+                    log::warn!(
+                        target: "reims_graphics",
+                        "the device completion ring is broken ({broken}): an event is dropped"
+                    );
+                    return Post::Dropped;
+                }
+            }
+        };
+        if raise {
+            self.host.raise_interrupt(RGFX_DEVICE_VECTOR);
+        }
+        Post::Done
+    }
+
+    /// The device service thread (the module doc): it takes the device submission ring with the
+    /// control thread's `consumer_idle` handshake, hands every message to the host's stage-3
+    /// decoder, and sleeps on the device wake, woken by the device doorbell, the guest's start or
+    /// the device's end.
+    fn device_service(&self) {
+        while !self.ending() {
+            self.take_device_messages();
+            let idle = {
+                let submit = self.device_submit.lock();
+                if !self.started() || submit.broken {
+                    false
+                } else if submit.consumer.sleep_or_pending(&self.region) {
+                    continue;
+                } else {
+                    true
+                }
+            };
+            if self.ending() {
+                break;
+            }
+            self.device_wake.sleep(None);
+            if idle {
+                self.device_submit.lock().consumer.awake(&self.region);
+            }
+        }
+    }
+
+    /// Takes and hands to the host every message the bundle has published on the device submission
+    /// ring, while the device is started and the ring is not broken. Each message is a stage-3
+    /// message: it is taken with the ring held and handed to [`control::device_message`] (so a
+    /// queue create or destroy drives the per-queue rings too) with nothing held; any reply the
+    /// host owes it posts on the device completion ring itself, so nothing is posted here.
+    fn take_device_messages(&self) {
+        loop {
+            let message = {
+                let mut submit = self.device_submit.lock();
+                if !self.started() || submit.broken || self.ending() {
+                    return;
+                }
+                match submit.consumer.next(&self.region) {
+                    Ok(Some(message)) => message,
+                    Ok(None) => return,
+                    Err(broken) => {
+                        log::error!(
+                            target: "reims_graphics",
+                            "the device submission ring is broken ({broken}): it takes nothing \
+                             more until the device is reset"
+                        );
+                        submit.broken = true;
+                        return;
+                    }
+                }
+            };
+            control::device_message(self, &message);
+        }
+    }
+
     /// A doorbell write of ring id `ring_id`: wakes the control thread (ring id 0) or the service
     /// thread of the queue whose submission ring is at that region offset; an unknown id is
     /// ignored.
     fn ring_doorbell(&self, ring_id: u64) {
         if ring_id == u64::from(RGFX_CONTROL_RING_ID) {
             self.wake.wake();
+            return;
+        }
+        if ring_id == u64::from(RGFX_DEVICE_RING_ID) {
+            self.device_wake.wake();
             return;
         }
         if let Some(queue) = self.queues.lock().by_ring.get(&ring_id) {
@@ -770,15 +921,20 @@ impl Shared {
                 }
             };
             // Order this command buffer after the resource creates the guest posted before it.
-            // Creates ride the control ring, whose sole consumer is the control thread; command
+            // Creates ride the device ring, whose sole consumer is the device thread; command
             // buffers ride per-queue rings (this thread). A create a buffer uses is posted before
-            // it in guest order, so it is within the control ring's producer at the moment this
-            // thread takes the buffer. Wait for the control thread to consume up to there, so the
+            // it in guest order, so it is within the device ring's producer at the moment this
+            // thread takes the buffer. Wait for the device thread to consume up to there, so the
             // resource is registered before the buffer's ops name it. This thread only reads the
-            // control ring's counts; it never consumes it, so the control ring keeps one consumer
+            // device ring's counts; it never consumes it, so the device ring keeps one consumer
             // and its `consumer_idle` handshake is untouched (draining it here would break both).
-            let created_through = { self.submit.lock().consumer.published_count(&self.region) };
-            while self.submit.lock().consumer.consumed() < created_through {
+            let created_through = {
+                self.device_submit
+                    .lock()
+                    .consumer
+                    .published_count(&self.region)
+            };
+            while self.device_submit.lock().consumer.consumed() < created_through {
                 if self.ending() || queue.ended() {
                     return;
                 }

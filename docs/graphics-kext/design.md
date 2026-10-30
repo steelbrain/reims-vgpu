@@ -225,15 +225,22 @@ sit in BAR0 from 0x800.
 | 0x020 | `DOORBELL` | WO | writing a ring's id wakes its consumer (an `ioeventfd`) |
 
 **BAR2: the region.** A 64-bit prefetchable BAR over host memory, mapped
-write-back by the guest. The device places the control rings at fixed
-offsets, and the guest allocates everything from 0x20000 up (stage 2: the
+write-back by the guest. The device places the control and device rings at
+fixed offsets, and the guest allocates everything from 0x40000 up (stage 2: the
 scanout buffers and the cursor image).
 
 | offset | size | what |
 |---|---|---|
-| 0x00000 | 64 KiB | control submission ring, id 0 (guest to host) |
-| 0x10000 | 64 KiB | control completion ring (host to guest), MSI-X vector 0 |
-| 0x20000 | rest | the guest's allocations |
+| 0x00000 | 64 KiB | control submission ring, id 0 (framebuffer kext to host) |
+| 0x10000 | 64 KiB | control completion ring (host to kext), MSI-X vector 0 |
+| 0x20000 | 64 KiB | device submission ring, id 1 (Metal bundle to host) |
+| 0x30000 | 64 KiB | device completion ring (host to bundle), MSI-X vector 1 |
+| 0x40000 | rest | the guest's allocations |
+
+The two ring pairs keep each ring a single producer and a single consumer: the
+framebuffer kext drives the control ring (the display commands), the Metal
+bundle drives the device ring (the object lifecycle), and neither shares a ring
+with the other.
 
 **Rings.** A 256-byte header, then a byte ring whose size is a power of two
 (64 KiB minus the header for the control rings). Each header field sits in its
@@ -319,15 +326,18 @@ picks buffer/texture/heap GPU addresses and resource IDs, and the host pins
 them — the host never hands a host device address to the guest (m2v's rule). A
 destroy carries the `ObjId` alone; the host drops its handle.
 
-**Rings.** Ring 0 stays the control ring: the stage-2 display commands, plus
-the device-level object lifecycle below. A `QUEUE_CREATE` on ring 0 makes a
-submission+completion ring pair at a guest-given region offset with its own
-MSI-X vector (one submission + one completion ring per `MTLCommandQueue`,
-created on demand); `QUEUE_DESTROY` frees it. A create carries a priority, and
-the host gives that ring's VkQueue a matching priority, so WindowServer's queue
-runs high.
+**Rings.** Ring 0 stays the control ring: the framebuffer kext's stage-2
+display commands alone. The Metal bundle drives its own ring pair, the device
+ring (id 1, submission at 0x20000, completion at 0x30000, MSI-X vector 1),
+which carries the device-level object lifecycle below. Each ring keeps a single
+producer and a single consumer, so their `consumer_idle` handshakes never race.
+A `QUEUE_CREATE` on the device ring makes a submission+completion ring pair at a
+guest-given region offset with its own MSI-X vector (one submission + one
+completion ring per `MTLCommandQueue`, created on demand); `QUEUE_DESTROY` frees
+it. A create carries a priority, and the host gives that ring's VkQueue a
+matching priority, so WindowServer's queue runs high.
 
-**Object lifecycle** (ring 0, request/reply). Each `*_CREATE` carries our
+**Object lifecycle** (the device ring, request/reply). Each `*_CREATE` carries our
 schema for the Metal descriptor (plain little-endian fields, decoded straight
 into the `Platform` descriptor struct — core keeps descriptors as public-field
 structs), the guest-picked `ObjId`, and, where it applies, the address, id or

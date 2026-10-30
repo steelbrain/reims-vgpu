@@ -93,10 +93,10 @@ constexpr long kGpuFamilyMinus1009 = -1009;
 	RgfxSerializer *_serializer; // the create route; null until the ring transport lands
 	mach_port_t _acceleratorPort;
 	RgfxRegion *_region;         // BAR-region allocator; null until the handshake maps it
-	RgfxReplyReader *_replyReader; // control-completion-ring reader; null until the handshake
+	RgfxReplyReader *_replyReader; // device-completion-ring reader; null until the handshake
 	std::vector<std::unique_ptr<RgfxRingWriter>> _queueRings; // owned queue submit-ring writers
 	io_connect_t _conn;          // our accelerator user client (BAR-2 region map + doorbell)
-	std::unique_ptr<RgfxRingWriter> _controlRing; // control submission ring (ring id 0)
+	std::unique_ptr<RgfxRingWriter> _controlRing; // device submission ring (ring id RGFX_DEVICE_RING_ID)
 	mach_vm_address_t _mapBase;  // mapped device-region base (0 until the handshake maps it)
 	mach_vm_size_t _mapSize;     // mapped device-region size
 }
@@ -143,7 +143,7 @@ constexpr long kGpuFamilyMinus1009 = -1009;
 
 	// Wire transport handshake: open our own user client on the accelerator and map the
 	// device region (BAR 2) into this task. Read the caps blob the host wrote, build the
-	// region allocator, and stand up the control submission ring (RgfxSerializer) + control
+	// region allocator, and stand up the device submission ring (RgfxSerializer) + device
 	// completion ring (RgfxReplyReader). With these non-null the resource / command-queue /
 	// command-buffer categories route over our wire instead of falling back to the
 	// IOGPUMetalDevice base (Apple's IOGPU kernel ABI). Any failure leaves the transport
@@ -176,11 +176,13 @@ constexpr long kGpuFamilyMinus1009 = -1009;
 		rgfxDiag("RGFX: caps blob invalid (version/zero); using defaults\n");
 
 	_region = new RgfxRegion(base, mapSize);
-	_controlRing = std::make_unique<RgfxRingWriter>(base + RGFX_CONTROL_SUBMIT_OFFSET,
-	                                                RGFX_CONTROL_RING_DATA_SIZE, RGFX_CONTROL_RING_ID,
+	// The bundle drives its own ring pair (the device ring, id RGFX_DEVICE_RING_ID), parallel to
+	// the framebuffer kext's control ring, so each ring keeps a single producer and consumer.
+	_controlRing = std::make_unique<RgfxRingWriter>(base + RGFX_DEVICE_SUBMIT_OFFSET,
+	                                                RGFX_CONTROL_RING_DATA_SIZE, RGFX_DEVICE_RING_ID,
 	                                                &rgfxDeviceDoorbell, (__bridge void *)self);
 	_serializer = new RgfxSerializer(*_controlRing, _ids);
-	_replyReader = new RgfxReplyReader(base + RGFX_CONTROL_COMPLETE_OFFSET,
+	_replyReader = new RgfxReplyReader(base + RGFX_DEVICE_COMPLETE_OFFSET,
 	                                   RGFX_CONTROL_RING_DATA_SIZE);
 	rgfxDiag("RGFX: transport up: region=%llu bytes, caps=%s\n", (unsigned long long)mapSize,
 	         _caps.valid() ? "valid" : "default");

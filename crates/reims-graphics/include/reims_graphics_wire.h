@@ -675,15 +675,32 @@
 // The room each control ring has in the region, its header included.
 #define RGFX_CONTROL_RING_SPAN 65536
 
+// Where the device submission ring is in the region: ring id [`RGFX_DEVICE_RING_ID`], guest
+// (the Metal bundle) to host. It carries the object lifecycle (queue, heap, buffer, texture,
+// sampler, pipeline and sync-object creates and destroys) the bundle drives, so the control
+// ring stays the framebuffer kext's alone: each ring keeps a single producer and consumer.
+#define RGFX_DEVICE_SUBMIT_OFFSET 131072
+
+// Where the device completion ring is in the region: host to guest (the Metal bundle), MSI-X
+// vector [`RGFX_DEVICE_VECTOR`]. It carries the stage-3 replies (pipeline reflection and the
+// command answers the bundle awaits).
+#define RGFX_DEVICE_COMPLETE_OFFSET 196608
+
 // Where the guest's allocations start in the region (the scanout buffers and the cursor
 // image): everything from here to the region's end is the guest's to place.
-#define RGFX_ALLOCATIONS_OFFSET 131072
+#define RGFX_ALLOCATIONS_OFFSET 262144
 
 // The control submission ring's id, which the guest writes to `DOORBELL`.
 #define RGFX_CONTROL_RING_ID 0
 
 // The control completion ring's MSI-X vector.
 #define RGFX_CONTROL_VECTOR 0
+
+// The device submission ring's id, which the guest bundle writes to `DOORBELL`.
+#define RGFX_DEVICE_RING_ID 1
+
+// The device completion ring's MSI-X vector.
+#define RGFX_DEVICE_VECTOR 1
 
 // The size of a ring's header ([`RgfxRingHeader`]); its byte ring follows it.
 #define RGFX_RING_HEADER_SIZE 256

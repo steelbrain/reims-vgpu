@@ -54,8 +54,8 @@ pub const RVG_GRAPHICS_REG_DOORBELL: u32 = 0x020;
 pub const RVG_GRAPHICS_DOORBELL_CONTROL: u32 = 0;
 
 /// Where the guest's allocations start in the region, the scanout among them: below it are the
-/// control rings, which the host's dirty log need not cover.
-pub const RVG_GRAPHICS_ALLOCATIONS_OFFSET: u64 = 0x2_0000;
+/// control and device rings, which the host's dirty log need not cover.
+pub const RVG_GRAPHICS_ALLOCATIONS_OFFSET: u64 = 0x4_0000;
 
 const _: () = {
     use reims_graphics::wire;
