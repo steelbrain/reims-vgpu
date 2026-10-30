@@ -134,11 +134,18 @@ pub trait Host: Send + Sync + 'static {
     }
 
     /// Shows the IOSurface of global ID `iosurface_id` on display 0 in place of the scanout
-    /// (`PRESENT_SURFACE`; 0 shows the scanout again), on the control thread. True where the host
-    /// shows it; false, with nothing changed, where it holds no texture over that surface. The
-    /// default shows nothing and refuses every surface but 0, for a host with no stage-3 decoder.
-    fn present_surface(&self, iosurface_id: u32) -> bool {
-        iosurface_id == 0
+    /// (`PRESENT_SURFACE`; 0 shows the scanout again), on the control thread, and gives `answer`
+    /// once the display shows it: [`RGFX_STATUS_OK`], or [`RGFX_STATUS_INVALID_ARGUMENT`], with
+    /// nothing changed, where the host holds no texture over that surface. The guest's display
+    /// pipe completes its transaction on that answer, so it is given when the surface is shown,
+    /// not before. The default shows nothing and answers at once, refusing every surface but 0,
+    /// for a host with no stage-3 decoder.
+    fn present_surface(&self, iosurface_id: u32, answer: PresentAnswer) {
+        answer.answer(if iosurface_id == 0 {
+            RGFX_STATUS_OK
+        } else {
+            RGFX_STATUS_INVALID_ARGUMENT
+        });
     }
 }
 
@@ -435,6 +442,35 @@ impl ControlCompletionPoster {
         };
         let epoch = shared.epoch.load(Ordering::Acquire);
         shared.device_post_waiting(message, epoch);
+    }
+}
+
+/// The `COMPLETE` a `PRESENT_SURFACE` owes, which the host gives from any thread once the display
+/// shows the surface ([`Host::present_surface`]). It holds a weak reference to the device; an
+/// answer after the device has ended, or for a command taken before a reset, is dropped.
+pub struct PresentAnswer {
+    /// The device's shared state, weakly.
+    shared: Weak<Shared>,
+    /// The command's `seqno`.
+    seqno: u64,
+    /// The reset count the command was taken at.
+    epoch: u64,
+}
+
+impl std::fmt::Debug for PresentAnswer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PresentAnswer")
+            .field("seqno", &self.seqno)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PresentAnswer {
+    /// Posts the `COMPLETE` with `status` onto the control completion ring, waiting for room.
+    pub fn answer(self, status: u32) {
+        if let Some(shared) = self.shared.upgrade() {
+            shared.post_waiting(&crate::control::complete(self.seqno, status), self.epoch);
+        }
     }
 }
 
@@ -872,6 +908,15 @@ impl Shared {
         if let Some(queue) = queues.by_obj.remove(&obj_id) {
             queues.by_ring.remove(&queue.ring_id);
             queue.end();
+        }
+    }
+
+    /// The answer `PRESENT_SURFACE` command `seqno` owes ([`PresentAnswer`]).
+    pub(crate) fn present_answer(&self, seqno: u64) -> PresentAnswer {
+        PresentAnswer {
+            shared: self.weak_self.get().cloned().unwrap_or_else(Weak::new),
+            seqno,
+            epoch: self.epoch.load(Ordering::Acquire),
         }
     }
 

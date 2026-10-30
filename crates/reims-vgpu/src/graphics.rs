@@ -30,12 +30,12 @@ use std::sync::{Arc, OnceLock};
 use reims_graphics::ops::RgfxCommandBuffer;
 use reims_graphics::region::Region;
 use reims_graphics::wire::{
-    RGFX_CMD_COMMAND_BUFFER, RGFX_DEVICE_INFO_OFFSET, RgfxCbComplete, RgfxMsgHeader,
-    RgfxPipelineReflection,
+    RGFX_CMD_COMMAND_BUFFER, RGFX_DEVICE_INFO_OFFSET, RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK,
+    RgfxCbComplete, RgfxMsgHeader, RgfxPipelineReflection,
 };
 use reims_graphics::{
-    ControlCompletionPoster, CursorImage, FixedScreen, Host, Mode, QueueCompletionPoster, Scanout,
-    Screen,
+    ControlCompletionPoster, CursorImage, FixedScreen, Host, Mode, PresentAnswer,
+    QueueCompletionPoster, Scanout, Screen,
 };
 use reims_vgpu_core::platform::device::GpuDevice;
 use reims_vgpu_core::platform::Platform;
@@ -260,8 +260,10 @@ struct GraphicsControl<P: ApiPlatform> {
 }
 
 /// The IOSurface the display pipe shows in place of the scanout (`PRESENT_SURFACE`): the texture
-/// the decoder made over it, which the window's sink copies into each drawable (`sink`), and
-/// what asks the window for a frame when it changes or a command buffer completes.
+/// the decoder made over it, which the window's sink draws into the next drawable (`sink`), and
+/// the presents' answers, given once that draw is encoded. The window draws a present when it is
+/// made, never on its own: each present is the guest's own, and none is batched or repeated by
+/// the GPU's work.
 pub(crate) struct Presented<P: Platform> {
     /// The texture shown; `None` shows the scanout.
     pub(crate) texture: Mutex<Option<P::Texture>>,
@@ -269,11 +271,12 @@ pub(crate) struct Presented<P: Platform> {
     surface_id: AtomicU32,
     /// The window, once it has opened.
     window: OnceLock<Arc<Window>>,
-    /// A surface of a format the sink cannot copy was logged.
+    /// A surface of a format the sink cannot draw was logged.
     refused: AtomicBool,
-    /// A command buffer completed since the refresh last asked: the GPU may have written the
-    /// scanout, which the host's dirty log never sees.
-    gpu_wrote: AtomicBool,
+    /// The presents' answers owed until the window draws the surface.
+    pending: Mutex<Vec<PresentAnswer>>,
+    /// The last (surface, drawable) pixel formats logged.
+    formats: Mutex<Option<(u64, u64)>>,
 }
 
 impl<P: Platform> Default for Presented<P> {
@@ -283,14 +286,16 @@ impl<P: Platform> Default for Presented<P> {
             surface_id: AtomicU32::new(0),
             window: OnceLock::new(),
             refused: AtomicBool::new(false),
-            gpu_wrote: AtomicBool::new(false),
+            formats: Mutex::new(None),
+            pending: Mutex::new(Vec::new()),
         }
     }
 }
 
 impl<P: Platform> Presented<P> {
-    /// Shows `texture` (the surface `id`'s), or the scanout for `None`, and asks for a frame.
-    fn show(&self, id: u32, texture: Option<P::Texture>) {
+    /// Shows `texture` (the surface `id`'s), or the scanout for `None`, and asks the window for a
+    /// frame; `answer` is given once the window has drawn it, or at once without a window.
+    fn show(&self, id: u32, texture: Option<P::Texture>, answer: PresentAnswer) {
         let previous = self.surface_id.swap(id, Ordering::AcqRel);
         if previous != id {
             log::info!(
@@ -299,38 +304,46 @@ impl<P: Platform> Presented<P> {
             );
         }
         *self.texture.lock() = texture;
-        self.frame();
-    }
-
-    /// A command buffer completed: the GPU may have written what the window shows.
-    fn completed(&self) {
-        self.gpu_wrote.store(true, Ordering::Release);
-        if self.texture.lock().is_some() {
-            self.frame();
+        match self.window.get() {
+            Some(window) => {
+                self.pending.lock().push(answer);
+                window.new_frame();
+            }
+            None => answer.answer(RGFX_STATUS_OK),
         }
     }
 
-    /// Whether a command buffer completed since the last ask.
-    fn take_gpu_wrote(&self) -> bool {
-        self.gpu_wrote.swap(false, Ordering::AcqRel)
-    }
-
-    /// Asks the window for a frame.
-    fn frame(&self) {
-        if let Some(window) = self.window.get() {
-            window.new_frame();
+    /// The window's draw that shows the latest present is encoded: every present made before it
+    /// is shown, and is answered.
+    pub(crate) fn drawn(&self) {
+        let answers = std::mem::take(&mut *self.pending.lock());
+        for answer in answers {
+            answer.answer(RGFX_STATUS_OK);
         }
     }
 
-    /// The sink cannot copy a surface of pixel format `surface` into a drawable of `drawable`:
+    /// The sink draws a surface of pixel format `surface` into a drawable of `drawable`: logged
+    /// when the pair changes.
+    pub(crate) fn seen_format(&self, surface: u64, drawable: u64) {
+        let mut formats = self.formats.lock();
+        if *formats != Some((surface, drawable)) {
+            *formats = Some((surface, drawable));
+            log::info!(
+                target: "reims_vgpu::graphics",
+                "the presented IOSurface's texture has pixel format {surface}, the window's \
+                 drawable {drawable}"
+            );
+        }
+    }
+
+    /// The sink cannot draw a surface of pixel format `surface` into a drawable of `drawable`:
     /// logged once.
     pub(crate) fn refuse_format(&self, surface: u64, drawable: u64) {
         if !self.refused.swap(true, Ordering::AcqRel) {
             log::warn!(
                 target: "reims_vgpu::graphics",
-                "the presented IOSurface's texture (pixel format {surface}) cannot be copied into \
-                 the window's drawable (pixel format {drawable}; BGRA8 only): the scanout shows \
-                 instead"
+                "the presented IOSurface's texture (pixel format {surface}) cannot be drawn into \
+                 the window's drawable (pixel format {drawable}): the scanout shows instead"
             );
         }
     }
@@ -342,10 +355,8 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     /// pipeline create's [`RgfxPipelineReflection`].
     fn set_sinks(&self, poster: &ControlCompletionPoster) {
         let completion = poster.clone();
-        let presented = Arc::clone(&self.presented);
         let sink: CompletionSink = Arc::new(move |record: RgfxCbComplete| {
             completion.post(record.as_bytes());
-            presented.completed();
         });
         let _ = self.control_completion.set(Arc::clone(&sink));
         let mut decoder = self.decoder.lock();
@@ -403,10 +414,8 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     fn handle_queue(&self, poster: &QueueCompletionPoster, message: &[u8]) {
         entry::run(|_| {
             let queue_poster = poster.clone();
-            let presented = Arc::clone(&self.presented);
             let sink: CompletionSink = Arc::new(move |record: RgfxCbComplete| {
                 queue_poster.post(record.as_bytes());
-                presented.completed();
             });
             let outcome = {
                 let mut decoder = self.decoder.lock();
@@ -433,20 +442,17 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         });
     }
 
-    /// Shows the IOSurface `iosurface_id` (0: the scanout): false, with nothing changed, where the
-    /// decoder holds no texture over it.
-    fn present_surface(&self, iosurface_id: u32) -> bool {
+    /// Shows the IOSurface `iosurface_id` (0: the scanout), answering once the window shows it;
+    /// answered invalid at once, with nothing changed, where the decoder holds no texture over it.
+    fn present_surface(&self, iosurface_id: u32, answer: PresentAnswer) {
         if iosurface_id == 0 {
-            self.presented.show(0, None);
-            return true;
+            self.presented.show(0, None, answer);
+            return;
         }
         let texture = self.decoder.lock().surface_texture(iosurface_id);
         match texture {
-            Some(texture) => {
-                self.presented.show(iosurface_id, Some(texture));
-                true
-            }
-            None => false,
+            Some(texture) => self.presented.show(iosurface_id, Some(texture), answer),
+            None => answer.answer(RGFX_STATUS_INVALID_ARGUMENT),
         }
     }
 
@@ -500,20 +506,15 @@ impl<P: ApiPlatform> Host for CallbackHost<P> {
         }
     }
 
-    /// The host's dirty log, or a command buffer's completion since the last ask: the GPU's
-    /// writes to the scanout never reach the dirty log.
     fn scanout_written(&self, offset: u64, length: u64) -> bool {
-        let gpu = self.control.presented.take_gpu_wrote();
-        let cpu = self
-            .callbacks
+        self.callbacks
             .scanout_written
             .as_ref()
-            .is_none_or(|f| f(offset, length));
-        gpu || cpu
+            .is_none_or(|f| f(offset, length))
     }
 
-    fn present_surface(&self, iosurface_id: u32) -> bool {
-        self.control.present_surface(iosurface_id)
+    fn present_surface(&self, iosurface_id: u32, answer: PresentAnswer) {
+        self.control.present_surface(iosurface_id, answer);
     }
 
     fn stage3_message(&self, message: &[u8]) {
@@ -588,8 +589,9 @@ impl WindowScreen {
         let shown = Arc::new(Shown::default());
         if let Some(sink) = scanout_sink(platform, region, &shown, presented) {
             window.attach(sink);
+            // Presents wait for the window's draw only where it has a sink to draw them.
+            let _ = presented.window.set(Arc::clone(&window));
         }
-        let _ = presented.window.set(Arc::clone(&window));
         let screen = WindowScreen {
             window: Arc::clone(&window),
             shown,

@@ -68,9 +68,13 @@ impl Host for TestHost {
         self.asked.lock().push((offset, length));
         self.written.load(Ordering::SeqCst)
     }
-    fn present_surface(&self, iosurface_id: u32) -> bool {
+    fn present_surface(&self, iosurface_id: u32, answer: PresentAnswer) {
         self.presented.lock().push(iosurface_id);
-        iosurface_id == 0 || iosurface_id == HELD_SURFACE
+        answer.answer(if iosurface_id == 0 || iosurface_id == HELD_SURFACE {
+            RGFX_STATUS_OK
+        } else {
+            RGFX_STATUS_INVALID_ARGUMENT
+        });
     }
 }
 

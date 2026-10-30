@@ -36,10 +36,14 @@ pub(crate) fn answer(shared: &Shared, message: &Message) -> Option<Vec<u8>> {
         RGFX_CMD_SET_VBLANK => read(message).map_or(RGFX_STATUS_INVALID_ARGUMENT, |command| {
             set_vblank(shared, &command)
         }),
-        RGFX_CMD_PRESENT_SURFACE => read(message)
-            .map_or(RGFX_STATUS_INVALID_ARGUMENT, |command| {
-                present_surface(shared, &command)
-            }),
+        RGFX_CMD_PRESENT_SURFACE => match read::<RgfxPresentSurface>(message) {
+            Some(command) if command.display == 0 => {
+                present_surface(shared, &command, seqno);
+                return None;
+            }
+            Some(_) => RGFX_STATUS_NO_DISPLAY,
+            None => RGFX_STATUS_INVALID_ARGUMENT,
+        },
         // Stage 3 (every type at or above `QUEUE_CREATE`): the bundle rides the device ring now,
         // but a stage-3 message that reaches the control ring is still handled, on the device ring's
         // terms. Its replies — a pipeline reflection, a command buffer's completion — come back on
@@ -203,22 +207,18 @@ fn set_cursor(shared: &Shared, command: &RgfxSetCursor) -> u32 {
     RGFX_STATUS_OK
 }
 
-/// `PRESENT_SURFACE`: display 0 only, and a surface the host holds a texture over.
-fn present_surface(shared: &Shared, command: &RgfxPresentSurface) -> u32 {
-    if command.display != 0 {
-        return RGFX_STATUS_NO_DISPLAY;
-    }
-    if shared.host.present_surface(command.iosurface_id) {
-        RGFX_STATUS_OK
-    } else {
-        log::debug!(
-            target: "reims_graphics",
-            "PRESENT_SURFACE of transaction {}: no texture over IOSurface {}",
-            command.transaction_id,
-            command.iosurface_id
-        );
-        RGFX_STATUS_INVALID_ARGUMENT
-    }
+/// `PRESENT_SURFACE` on display 0: the host answers once it shows the surface, or refuses it
+/// (`Host::present_surface`).
+fn present_surface(shared: &Shared, command: &RgfxPresentSurface, seqno: u64) {
+    log::trace!(
+        target: "reims_graphics",
+        "PRESENT_SURFACE of transaction {}: IOSurface {}",
+        command.transaction_id,
+        command.iosurface_id
+    );
+    shared
+        .host
+        .present_surface(command.iosurface_id, shared.present_answer(seqno));
 }
 
 /// `SET_VBLANK`.

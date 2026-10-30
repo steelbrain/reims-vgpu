@@ -11,9 +11,11 @@
 //! cannot scale, and the guest's next mode makes the sizes equal again.
 //!
 //! **A presented surface.** While the display pipe shows an IOSurface (`PRESENT_SURFACE`), the
-//! draw copies the texture the decoder made over it into the drawable instead, texture to
-//! texture on the GPU, where the two have one pixel format (BGRA8, with or without sRGB); a
-//! surface of another format is not shown, and the scanout shows meanwhile (logged once).
+//! draw puts the texture the decoder made over it into the drawable instead, on the GPU: a copy,
+//! texture to texture, where the two have one pixel format (BGRA8, with or without sRGB), and
+//! otherwise a draw of the display's present shaders (core's [`DisplayPipelineCache`]), which
+//! sample the surface in its own format (WindowServer's display surfaces are 10-bit,
+//! `BGR10A2Unorm`) and write the drawable's. The first surface of each format is logged.
 //!
 //! **The import.** The buffer covers the whole region, so its deallocator, which holds the
 //! region, is what keeps the region mapped while a command buffer still reads it: Metal (or the
@@ -35,6 +37,10 @@ use reims_vgpu_core::platform::values::ColorAttachmentSet;
 use reims_vgpu_core::platform::{Handle, HostRange, Platform};
 use reims_vgpu_core::raise::OnFault;
 use reims_vgpu_window::PixelRect;
+
+use reims_vgpu_core::display::pipeline::{DisplayPipelineCache, PipelineKey};
+use reims_vgpu_core::platform::resource::Buffer as _;
+use reims_vgpu_core::platform::types::MtlViewport;
 
 use super::{Presented, Shown};
 use crate::display::no_catch;
@@ -61,7 +67,29 @@ pub(crate) struct ScanoutDraw<P: Platform> {
     shown: Arc<Shown>,
     /// The surface the display pipe shows, if any, in place of the scanout.
     presented: Arc<Presented<P>>,
+    /// The present shaders' pipelines and the strip's two buffers, made at the first surface
+    /// whose format a copy cannot carry; `None` inside where the platform refused them.
+    converter: std::sync::OnceLock<Option<Converter<P>>>,
 }
+
+/// What draws a presented surface of another format into the drawable: core's display pipelines
+/// and the full-viewport strip they draw (positions at vertex buffer 0, texture coordinates at 1).
+struct Converter<P: Platform> {
+    /// The display's present pipelines, by the drawable's format.
+    pipelines: DisplayPipelineCache<P>,
+    /// The strip's positions, float4 × 4.
+    positions: P::Buffer,
+    /// Its texture coordinates, float2 × 4, the surface's top row at the top.
+    coordinates: P::Buffer,
+}
+
+/// The strip's positions and texture coordinates, as core's display draws them.
+const STRIP_POSITIONS: [f32; 16] = [
+    -1.0, -1.0, 0.0, 1.0, -1.0, 1.0, 0.0, 1.0, 1.0, -1.0, 0.0, 1.0, 1.0, 1.0, 0.0, 1.0,
+];
+const STRIP_COORDINATES: [f32; 8] = [0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0];
+/// `MTLPrimitiveTypeTriangleStrip`.
+const TRIANGLE_STRIP: u64 = 4;
 
 /// `MTLPixelFormatBGRA8Unorm` and its sRGB form, which copy into each other.
 const BGRA8_FORMATS: [u64; 2] = [80, 81];
@@ -101,6 +129,7 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
             buffer,
             shown: Arc::clone(shown),
             presented: Arc::clone(presented),
+            converter: std::sync::OnceLock::new(),
         })
     }
 
@@ -120,13 +149,22 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
     ) -> Option<P::CommandBuffer> {
         let surface = self.presented.texture.lock().as_ref().map(Handle::clone_ref);
         if let Some(surface) = surface {
-            if BGRA8_FORMATS.contains(&surface.pixel_format())
-                && BGRA8_FORMATS.contains(&texture.pixel_format())
-            {
-                return self.encode_surface(&surface, texture, region);
+            let (from, to) = (surface.pixel_format(), texture.pixel_format());
+            self.presented.seen_format(from, to);
+            let drawn = if BGRA8_FORMATS.contains(&from) && BGRA8_FORMATS.contains(&to) {
+                self.encode_surface(&surface, texture, region)
+            } else {
+                self.encode_converted(&surface, texture, region)
+            };
+            if drawn.is_some() {
+                // The caller commits and presents it next: the presents made so far are shown.
+                self.presented.drawn();
+                return drawn;
             }
-            self.presented
-                .refuse_format(surface.pixel_format(), texture.pixel_format());
+            // Not drawn: the scanout shows, and the presents are answered so the guest's
+            // compositor does not wait on a window that cannot show them.
+            self.presented.refuse_format(from, to);
+            self.presented.drawn();
         }
         let scanout = (*self.shown.scanout.lock())?;
         let command_buffer = no_catch(self.queue.command_buffer(OnFault::Die))?;
@@ -206,6 +244,116 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
             ));
             no_catch(blit.encode(OnFault::Die, BlitCmd::EndEncoding));
         }
+        Some(command_buffer)
+    }
+
+    /// The converter, made at its first use; `None` where the platform refuses its library, a
+    /// pipeline or a buffer.
+    fn converter(&self) -> Option<&Converter<P>> {
+        self.converter
+            .get_or_init(|| {
+                let pipelines = DisplayPipelineCache::new(self.device.clone_ref())?;
+                let buffer = |floats: &[f32]| -> Option<P::Buffer> {
+                    let bytes: Vec<u8> = floats.iter().flat_map(|f| f.to_le_bytes()).collect();
+                    let length = u64::try_from(bytes.len()).ok()?;
+                    let buffer =
+                        no_catch(self.device.new_buffer_of_length(OnFault::Die, length, 0))?;
+                    let contents: *mut u8 = buffer.contents().as_ptr();
+                    if contents.is_null() {
+                        return None;
+                    }
+                    // SAFETY: the buffer is `length` bytes of shared memory, its contents mapped
+                    // while it lives, and nothing else writes it yet.
+                    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), contents, bytes.len()) };
+                    Some(buffer)
+                };
+                Some(Converter {
+                    positions: buffer(&STRIP_POSITIONS)?,
+                    coordinates: buffer(&STRIP_COORDINATES)?,
+                    pipelines,
+                })
+            })
+            .as_ref()
+    }
+
+    /// A command buffer of the sink's queue with the presented `surface` drawn into `texture` at
+    /// `region` by the display's present shaders, which convert its format to the drawable's,
+    /// after a clear of the drawable to black; not committed. `None`, with nothing committed,
+    /// where the converter or a pipeline for the drawable's format is refused.
+    fn encode_converted(
+        &self,
+        surface: &P::Texture,
+        texture: &P::Texture,
+        region: PixelRect,
+    ) -> Option<P::CommandBuffer> {
+        let converter = self.converter()?;
+        let pipeline = converter.pipelines.pipeline_for(PipelineKey {
+            format: texture.pixel_format(),
+            gamma: false,
+        })?;
+        let command_buffer = no_catch(self.queue.command_buffer(OnFault::Die))?;
+        let pass = self.platform.render_pass_descriptor();
+        no_catch(pass.set_color_attachment(
+            OnFault::Die,
+            0,
+            &ColorAttachmentSet {
+                texture: Some(Some(texture)),
+                load_action: Some(LOAD_ACTION_CLEAR),
+                store_action: Some(STORE_ACTION_STORE),
+                clear_color: Some(ClearColor {
+                    red: 0.0,
+                    green: 0.0,
+                    blue: 0.0,
+                    alpha: 1.0,
+                }),
+                ..ColorAttachmentSet::default()
+            },
+        ));
+        let encoder = no_catch(command_buffer.render_encoder(OnFault::Die, &pass))?;
+        let (texture_width, texture_height) = (texture.width(), texture.height());
+        let x = region.x.min(texture_width);
+        let y = region.y.min(texture_height);
+        let width = region.width.min(texture_width - x);
+        let height = region.height.min(texture_height - y);
+        #[expect(clippy::as_conversions, reason = "pixel counts far below 2^52")]
+        let viewport = MtlViewport {
+            origin_x: x as f64,
+            origin_y: y as f64,
+            width: width as f64,
+            height: height as f64,
+            znear: 0.0,
+            zfar: 1.0,
+        };
+        if width > 0 && height > 0 {
+            for cmd in [
+                RenderCmd::SetRenderPipelineState {
+                    pipeline_state: Some(&pipeline),
+                },
+                RenderCmd::SetViewport { viewport },
+                RenderCmd::SetVertexBuffer {
+                    buffer: Some(&converter.positions),
+                    offset: 0,
+                    index: 0,
+                },
+                RenderCmd::SetVertexBuffer {
+                    buffer: Some(&converter.coordinates),
+                    offset: 0,
+                    index: 1,
+                },
+                RenderCmd::SetFragmentTexture {
+                    texture: Some(surface),
+                    index: 0,
+                },
+                RenderCmd::DrawPrimitives {
+                    primitive_type: TRIANGLE_STRIP,
+                    vertex_start: 0,
+                    vertex_count: 4,
+                },
+            ] {
+                no_catch(encoder.encode(OnFault::Die, cmd));
+            }
+        }
+        no_catch(encoder.encode(OnFault::Die, RenderCmd::EndEncoding));
         Some(command_buffer)
     }
 

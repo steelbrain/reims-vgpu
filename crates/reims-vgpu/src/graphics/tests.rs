@@ -585,29 +585,35 @@ fn the_cursor_shows_with_an_image_while_the_guest_shows_it() {
     window.close();
 }
 
-/// The display pipe's present: a surface the decoder holds no texture over is refused with
-/// nothing shown, 0 shows the scanout; a command buffer's completion counts as a write of the
-/// scanout once, at the next refresh's ask, whatever the host's dirty log says
+/// The display pipe's present: a surface the decoder holds no texture over is answered invalid
+/// with nothing shown, and 0 (the scanout) is answered at once on a device with no window
 #[test]
-fn a_present_needs_the_surface_s_texture_and_completions_mark_the_scanout() {
+fn a_present_needs_the_surface_s_texture() {
     let raised = Arc::new(AtomicU32::new(0));
     let device = headless(&raised);
-    let control = Arc::clone(&device.control);
-    assert!(!control.present_surface(0x77), "no texture over the surface");
-    assert!(control.presented.texture.lock().is_none());
-    assert_eq!(control.presented.surface_id.load(Ordering::SeqCst), 0);
-    assert!(control.present_surface(0), "0 shows the scanout");
-
-    let never = GraphicsCallbacks {
-        raise_interrupt: None,
-        scanout_written: Some(Arc::new(|_, _| false)),
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    let present = |id: u32| {
+        RgfxPresentSurface {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_PRESENT_SURFACE,
+                size: 32,
+                seqno: 0,
+            },
+            display: 0,
+            iosurface_id: id,
+            transaction_id: 1,
+            reserved_1c: 0,
+        }
+        .as_bytes()
+        .to_vec()
     };
-    let host = CallbackHost {
-        callbacks: never,
-        control: Arc::clone(&control),
-    };
-    assert!(!host.scanout_written(0, 4096));
-    control.presented.completed();
-    assert!(host.scanout_written(0, 4096), "the GPU may have written it");
-    assert!(!host.scanout_written(0, 4096), "once per completion");
+    for (id, status) in [(0x77, RGFX_STATUS_INVALID_ARGUMENT), (0, RGFX_STATUS_OK)] {
+        guest.send(&device, present(id));
+        let bytes = guest.event().expect("a COMPLETE");
+        let done = RgfxComplete::read_from_bytes(&bytes).unwrap();
+        assert_eq!(done.header.r#type, RGFX_EVT_COMPLETE);
+        assert_eq!(done.status, status, "IOSurface {id}");
+        assert!(device.control.presented.texture.lock().is_none());
+    }
 }
