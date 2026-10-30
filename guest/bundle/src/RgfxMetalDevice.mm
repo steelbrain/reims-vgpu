@@ -58,7 +58,7 @@ void rgfxDiag(const char *fmt, ...)
 // header is kernel-only and not included here, so the values are duplicated and kept in sync
 // by hand): the only user-client type, the BAR-2 region memory id, and the doorbell selector.
 enum {
-	kRgfxAccelUserClientType = 0,
+	kRgfxAccelUserClientType = 0x52474658, // 'RGFX', clear of the IOAccel surface type 0
 	kRgfxAccelMemoryRegion = 0,
 	kRgfxAccelMethodDoorbell = 0,
 	kRgfxAccelMethodOpenContext = 0x100,

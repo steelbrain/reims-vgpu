@@ -55,7 +55,9 @@ OBJECTS = $(BUILD)/obj/ReimsGraphics.o \
 	$(BUILD)/obj/RgfxDisplayPipeUserClient.o \
 	$(BUILD)/obj/kmod_info.o \
 	$(BUILD)/obj/RgfxAcceleratorContexts.o \
-	$(BUILD)/obj/RgfxAcceleratorUserClientContexts.o
+	$(BUILD)/obj/RgfxAcceleratorUserClientContexts.o \
+	$(BUILD)/obj/RgfxAcceleratorSurfaces.o \
+	$(BUILD)/obj/RgfxSurfaceUserClient.o
 
 all: $(BINARY)
 

@@ -394,6 +394,12 @@ bool RgfxAccelerator::pinRange(const void *owner, UInt64 offset, UInt64 length, 
 	IOLockLock(contextLock);
 	bool pinned = rgfxBlockPin(blockTable, owner, offset, length, pin);
 	IOLockUnlock(contextLock);
+	// Or a scanout span a surface of its process is drawn into (RgfxAcceleratorSurfaces.cpp):
+	// no block holds it and nothing frees it, so its pin names no block (serial 0).
+	if (!pinned && grantedRange(owner, offset, length)) {
+		*pin = {offset, 0};
+		pinned = true;
+	}
 	return pinned;
 }
 

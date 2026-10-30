@@ -133,6 +133,10 @@ public:
 	// for every COMPLETE (the pipe picks its own seqnos), and, while setPipeVblankEnabled is on,
 	// `vblank(client, count, time)` for each VBLANK, `time` the guest's mach_absolute_time at the
 	// event. nullptr clears them.
+	// The scanout as it is now (setScanout): its shape, bytes per row and offset in the region.
+	// False before a mode is set.
+	bool currentScanout(UInt32 *width, UInt32 *height, UInt32 *rowBytes, UInt64 *offset);
+
 	typedef void (*PipeVblankHook)(OSObject *client, UInt64 count, UInt64 time);
 	typedef void (*PipePresentHook)(OSObject *client, UInt64 seqno, UInt32 status);
 	IOReturn postPresent(UInt32 surfaceId, UInt32 transactionId, UInt64 *seqno);

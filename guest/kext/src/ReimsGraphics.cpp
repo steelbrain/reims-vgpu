@@ -731,6 +731,24 @@ IOReturn ReimsGraphics::setScanout(const Mode &mode)
 	return kIOReturnSuccess;
 }
 
+bool ReimsGraphics::currentScanout(UInt32 *width, UInt32 *height, UInt32 *rowBytes,
+                                   UInt64 *offset)
+{
+	if (!stateLock)
+		return false;
+	IOLockLock(stateLock);
+	bool have = haveCurrent;
+	Mode m = current;
+	IOLockUnlock(stateLock);
+	if (!have)
+		return false;
+	*width = m.width;
+	*height = m.height;
+	*rowBytes = strideFor(m.width);
+	*offset = RGFX_ALLOCATIONS_OFFSET;
+	return true;
+}
+
 // MARK: - IOService
 
 bool ReimsGraphics::start(IOService *provider)

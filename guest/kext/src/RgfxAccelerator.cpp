@@ -8,6 +8,7 @@
 #include "ReimsGraphics.hpp"
 #include "RgfxAcceleratorUserClient.hpp"
 #include "RgfxDisplayPipeUserClient.hpp"
+#include "RgfxSurfaceUserClient.hpp"
 
 #include <IOKit/IOLib.h>
 
@@ -126,13 +127,15 @@ void RgfxAccelerator::free()
 IOReturn RgfxAccelerator::newUserClient(task_t owningTask, void *securityID, UInt32 type,
                                         OSDictionary *properties, IOUserClient **handler)
 {
-	// The types callers open, measured: ours (0), the display pipe (4), and the one the
-	// IOGPUMetalDevice base builds its device over (5). Any other is refused, logged once per
-	// type.
+	// The types callers open, measured: IOAccel surfaces (0), the display pipe (4), the one the
+	// IOGPUMetalDevice base builds its device over (5), and ours. Any other is refused, logged
+	// once per type.
 	RgfxCaller caller;
 	IOLog("RGFX: newUserClient type=%u from %s[%d]\n", type, caller.name, caller.pid);
 	if (type == kRgfxDisplayPipeUserClientType)
 		return newDisplayPipe(owningTask, securityID, type, properties, handler);
+	if (type == kRgfxSurfaceUserClientType)
+		return newSurface(owningTask, securityID, type, properties, handler);
 	if (type != kRgfxAccelUserClientType && type != kRgfxIOGPUDeviceUserClientType) {
 		static char site;
 		if (rgfxFirstCalls(&site, type, 1))
@@ -166,6 +169,30 @@ IOReturn RgfxAccelerator::newDisplayPipe(task_t owningTask, void *securityID, UI
                                          OSDictionary *properties, IOUserClient **handler)
 {
 	RgfxDisplayPipeUserClient *client = OSTypeAlloc(RgfxDisplayPipeUserClient);
+	if (!client)
+		return kIOReturnNoMemory;
+	if (!client->initWithTask(owningTask, securityID, type, properties)) {
+		client->release();
+		return kIOReturnBadArgument;
+	}
+	if (!client->attach(this)) {
+		client->release();
+		return kIOReturnInternalError;
+	}
+	if (!client->start(this)) {
+		client->detach(this);
+		client->release();
+		return kIOReturnInternalError;
+	}
+	*handler = client;
+	return kIOReturnSuccess;
+}
+
+// An IOAccel surface (RgfxSurfaceUserClient).
+IOReturn RgfxAccelerator::newSurface(task_t owningTask, void *securityID, UInt32 type,
+                                     OSDictionary *properties, IOUserClient **handler)
+{
+	RgfxSurfaceUserClient *client = OSTypeAlloc(RgfxSurfaceUserClient);
 	if (!client)
 		return kIOReturnNoMemory;
 	if (!client->initWithTask(owningTask, securityID, type, properties)) {

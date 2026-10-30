@@ -1,0 +1,207 @@
+/*
+ * RgfxAccelerator's IOAccel surfaces: the surface clients (RgfxSurfaceUserClient) that have an
+ * id, by id, and the scanout spans our own user clients may name because a surface of their
+ * process is drawn into the scanout.
+ *
+ * WindowServer draws a display into the IOAccel surface on its framebuffer; with the Metal
+ * compositor, through a texture the bundle makes over that surface's memory, asked for by the
+ * surface's id (-newTextureWithSurface:buffer:). For a surface over the scanout, that memory is
+ * the scanout's span of the region, outside every process's blocks, so the process's lifecycle
+ * messages could not name it: grantSurfaceScanout lets the client of a process that holds the
+ * surface name the span (grantedRange, which pinRange asks), until the client's context is
+ * released or the surface goes.
+ *
+ * Our own code; it names only SDK-public IOKit calls.
+ */
+
+#include "RgfxAccelerator.hpp"
+#include "RgfxSurfaceUserClient.hpp"
+#include "ReimsGraphics.hpp"
+
+#include <IOKit/IOLib.h>
+
+namespace {
+// The most surfaces with an id at once, and the most scanout grants.
+constexpr UInt32 kMaxSurfaces = 256;
+constexpr UInt32 kMaxGrants = 8;
+
+struct Grant {
+	const void *client;
+	UInt32 surfaceId;
+	UInt64 offset;
+	UInt64 length;
+};
+
+// Under lock: the surfaces (each retained) and their ids, and the grants. One initialised
+// object, made at the first surface's id.
+struct SurfaceState {
+	IOLock *lock;
+	UInt32 count;
+	RgfxSurfaceUserClient *surfaces[kMaxSurfaces];
+	UInt32 ids[kMaxSurfaces];
+	Grant grants[kMaxGrants];
+};
+SurfaceState surfaceState = {nullptr, 0, {}, {}, {}};
+
+IOLock *surfaceLock()
+{
+	IOLock *lock = __atomic_load_n(&surfaceState.lock, __ATOMIC_ACQUIRE);
+	if (lock)
+		return lock;
+	IOLock *made = IOLockAlloc();
+	if (!made)
+		return nullptr;
+	IOLock *expected = nullptr;
+	if (__atomic_compare_exchange_n(&surfaceState.lock, &expected, made, false,
+	                                __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+		return made;
+	IOLockFree(made);
+	return expected;
+}
+
+// Drops the grants made for surface `id`. Under the lock.
+void dropGrantsOf(UInt32 id)
+{
+	for (UInt32 i = 0; i < kMaxGrants; i++) {
+		if (surfaceState.grants[i].client && surfaceState.grants[i].surfaceId == id)
+			surfaceState.grants[i] = {};
+	}
+}
+} // namespace
+
+IOReturn RgfxAccelerator::registerSurface(RgfxSurfaceUserClient *surface, UInt32 surfaceId)
+{
+	IOLock *lock = surfaceLock();
+	if (!lock)
+		return kIOReturnNoMemory;
+	IOLockLock(lock);
+	UInt32 mine = kMaxSurfaces;
+	for (UInt32 i = 0; i < surfaceState.count; i++) {
+		if (surfaceState.surfaces[i] == surface) {
+			mine = i;
+		} else if (surfaceState.ids[i] == surfaceId) {
+			IOLockUnlock(lock);
+			return kIOReturnExclusiveAccess;
+		}
+	}
+	if (mine != kMaxSurfaces) {
+		if (surfaceState.ids[mine] != surfaceId)
+			dropGrantsOf(surfaceState.ids[mine]);
+		surfaceState.ids[mine] = surfaceId;
+		IOLockUnlock(lock);
+		return kIOReturnSuccess;
+	}
+	if (surfaceState.count == kMaxSurfaces) {
+		IOLockUnlock(lock);
+		return kIOReturnNoResources;
+	}
+	surface->retain();
+	surfaceState.surfaces[surfaceState.count] = surface;
+	surfaceState.ids[surfaceState.count] = surfaceId;
+	surfaceState.count++;
+	IOLockUnlock(lock);
+	return kIOReturnSuccess;
+}
+
+void RgfxAccelerator::unregisterSurface(RgfxSurfaceUserClient *surface)
+{
+	IOLock *lock = __atomic_load_n(&surfaceState.lock, __ATOMIC_ACQUIRE);
+	if (!lock)
+		return;
+	RgfxSurfaceUserClient *gone = nullptr;
+	IOLockLock(lock);
+	for (UInt32 i = 0; i < surfaceState.count; i++) {
+		if (surfaceState.surfaces[i] != surface)
+			continue;
+		dropGrantsOf(surfaceState.ids[i]);
+		gone = surface;
+		surfaceState.count--;
+		surfaceState.surfaces[i] = surfaceState.surfaces[surfaceState.count];
+		surfaceState.ids[i] = surfaceState.ids[surfaceState.count];
+		break;
+	}
+	IOLockUnlock(lock);
+	OSSafeReleaseNULL(gone);
+}
+
+bool RgfxAccelerator::currentScanout(Scanout *scanout)
+{
+	ReimsGraphics *fb = copyFramebuffer();
+	if (!fb)
+		return false;
+	bool ok = fb->currentScanout(&scanout->width, &scanout->height, &scanout->rowBytes,
+	                             &scanout->offset);
+	fb->release();
+	if (!ok)
+		return false;
+	scanout->length = round_page_64(static_cast<UInt64>(scanout->rowBytes) * scanout->height);
+	return true;
+}
+
+IOReturn RgfxAccelerator::grantSurfaceScanout(const void *client, task_t task, UInt32 surfaceId,
+                                              Scanout *scanout)
+{
+	if (!currentScanout(scanout))
+		return kIOReturnNotReady;
+	IOLock *lock = __atomic_load_n(&surfaceState.lock, __ATOMIC_ACQUIRE);
+	if (!lock)
+		return kIOReturnNotFound;
+	IOLockLock(lock);
+	RgfxSurfaceUserClient *surface = nullptr;
+	for (UInt32 i = 0; i < surfaceState.count; i++) {
+		if (surfaceState.ids[i] == surfaceId)
+			surface = surfaceState.surfaces[i];
+	}
+	IOReturn r = kIOReturnSuccess;
+	if (!surface || surface->owningTask() != task)
+		r = kIOReturnNotFound;
+	else if (!surface->isScanout(scanout->width, scanout->height))
+		r = kIOReturnUnsupported;
+	if (r == kIOReturnSuccess) {
+		// The client's grant, made again for this surface and the scanout as it is now.
+		UInt32 slot = kMaxGrants;
+		for (UInt32 i = 0; i < kMaxGrants; i++) {
+			if (surfaceState.grants[i].client == client) {
+				slot = i;
+				break;
+			}
+			if (!surfaceState.grants[i].client && slot == kMaxGrants)
+				slot = i;
+		}
+		if (slot == kMaxGrants)
+			r = kIOReturnNoResources;
+		else
+			surfaceState.grants[slot] = {client, surfaceId, scanout->offset, scanout->length};
+	}
+	IOLockUnlock(lock);
+	return r;
+}
+
+void RgfxAccelerator::revokeGrants(const void *client)
+{
+	IOLock *lock = __atomic_load_n(&surfaceState.lock, __ATOMIC_ACQUIRE);
+	if (!lock)
+		return;
+	IOLockLock(lock);
+	for (UInt32 i = 0; i < kMaxGrants; i++) {
+		if (surfaceState.grants[i].client == client)
+			surfaceState.grants[i] = {};
+	}
+	IOLockUnlock(lock);
+}
+
+bool RgfxAccelerator::grantedRange(const void *client, UInt64 offset, UInt64 length)
+{
+	IOLock *lock = __atomic_load_n(&surfaceState.lock, __ATOMIC_ACQUIRE);
+	if (!lock)
+		return false;
+	bool granted = false;
+	IOLockLock(lock);
+	for (UInt32 i = 0; i < kMaxGrants && !granted; i++) {
+		const Grant &g = surfaceState.grants[i];
+		granted = g.client == client && offset >= g.offset && offset - g.offset <= g.length &&
+		          length <= g.length - (offset - g.offset);
+	}
+	IOLockUnlock(lock);
+	return granted;
+}

@@ -147,6 +147,23 @@ IOReturn RgfxAcceleratorUserClient::contextMethod(uint32_t selector,
 		return submitMethod(a);
 	case kRgfxAccelMethodWaitCompletions:
 		return waitCompletionsMethod(a);
+	case kRgfxAccelMethodSurfaceScanout: {
+		if (a->scalarInputCount != 2 || a->scalarOutputCount != 5 || !hasContext)
+			return kIOReturnBadArgument;
+		// The surface's one buffer.
+		if (in[0] == 0 || in[0] > UINT32_MAX || in[1] != 0)
+			return kIOReturnBadArgument;
+		RgfxAccelerator::Scanout scanout = {};
+		IOReturn r = owner->grantSurfaceScanout(this, task, static_cast<UInt32>(in[0]), &scanout);
+		if (r != kIOReturnSuccess)
+			return r;
+		a->scalarOutput[0] = scanout.offset;
+		a->scalarOutput[1] = scanout.length;
+		a->scalarOutput[2] = scanout.width;
+		a->scalarOutput[3] = scanout.height;
+		a->scalarOutput[4] = scanout.rowBytes;
+		return kIOReturnSuccess;
+	}
 	default:
 		return kIOReturnUnsupported;
 	}
@@ -312,6 +329,7 @@ void RgfxAcceleratorUserClient::releaseContext()
 		accel->freeBlocks(this);
 	else
 		accel->keepBlocks(this);
+	accel->revokeGrants(this);
 	hasContext = false;
 	IOLockUnlock(queueLock);
 }

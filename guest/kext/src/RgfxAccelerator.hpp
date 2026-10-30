@@ -60,8 +60,11 @@
 // region with IOConnectMapMemory(kRgfxAccelMemoryRegion), and rings a ring's doorbell
 // with IOConnectCallScalarMethod(kRgfxAccelMethodDoorbell, {ringId}).
 
-// Our own user-client type.
-static const UInt32 kRgfxAccelUserClientType = 0;
+// Our own user-client type: a private one ('RGFX'), clear of the public IOAccel surface type 0
+// (kRgfxSurfaceUserClientType) and of the types Apple's frameworks open.
+static const UInt32 kRgfxAccelUserClientType = 0x52474658;
+// The IOAccel surface client, the public kIOAccelSurfaceClientType (RgfxSurfaceUserClient).
+static const UInt32 kRgfxSurfaceUserClientType = 0;
 // The type Apple's IOGPUMetalDevice base opens to build its device
 // (RgfxAcceleratorUserClient::deviceMethod).
 static const UInt32 kRgfxIOGPUDeviceUserClientType = 5;
@@ -119,9 +122,16 @@ enum {
 	// has not taken (the device's interrupt, RgfxAccelerator::queueInterrupt). kIOReturnAborted
 	// when the thread is interrupted, kIOReturnNotOpen once the client's context is released.
 	kRgfxAccelMethodWaitCompletions = 0x107,
+	// The scanout an IOAccel surface of the client's process is drawn into, for a texture over
+	// it: in the surface's id and its buffer (0, the one buffer); out its region offset, its
+	// bytes, its width, height and bytes per row (BGRA8 pixels). The surface must be the
+	// framebuffer's whole scanout (RgfxSurfaceUserClient::isScanout); from then on the client's
+	// lifecycle messages may name the span, until its context is released or the surface goes.
+	kRgfxAccelMethodSurfaceScanout = 0x108,
 };
 
 class RgfxAcceleratorUserClient;
+class RgfxSurfaceUserClient;
 class ReimsGraphics;
 
 // A command queue's completion ring the accelerator watches for its client
@@ -205,6 +215,28 @@ public:
 	void unwatchClient(RgfxAcceleratorUserClient *client);
 	void queueInterrupt();
 
+	// The IOAccel surfaces (RgfxAcceleratorSurfaces.cpp). registerSurface names `surface`'s id
+	// (kIOReturnExclusiveAccess where another surface holds it); unregisterSurface drops it and
+	// the grants made for it.
+	IOReturn registerSurface(RgfxSurfaceUserClient *surface, UInt32 surfaceId);
+	void unregisterSurface(RgfxSurfaceUserClient *surface);
+	// The framebuffer's scanout as it is now: its place and bytes in the region, its shape.
+	struct Scanout {
+		UInt64 offset;
+		UInt64 length;
+		UInt32 width;
+		UInt32 height;
+		UInt32 rowBytes;
+	};
+	bool currentScanout(Scanout *scanout);
+	// For our user client `client` in `task`: the scanout surface `surfaceId` of that task is
+	// drawn into, whose span `client` may name from then on (grantedRange) until revokeGrants
+	// or the surface goes.
+	IOReturn grantSurfaceScanout(const void *client, task_t task, UInt32 surfaceId,
+	                             Scanout *scanout);
+	void revokeGrants(const void *client);
+	bool grantedRange(const void *client, UInt64 offset, UInt64 length);
+
 #if RGFX_FB_TRACE
 	// A trace build logs the properties processes read of the accelerator.
 	using IOAccelerator::copyProperty;
@@ -216,6 +248,8 @@ public:
 private:
 	IOReturn newDisplayPipe(task_t owningTask, void *securityID, UInt32 type,
 	                        OSDictionary *properties, IOUserClient **handler);
+	IOReturn newSurface(task_t owningTask, void *securityID, UInt32 type,
+	                    OSDictionary *properties, IOUserClient **handler);
 	UInt32 readRegister(UInt32 offset) const;
 	void writeRegister(UInt32 offset, UInt32 value);
 	void teardown();
