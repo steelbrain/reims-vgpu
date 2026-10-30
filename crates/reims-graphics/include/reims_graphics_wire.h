@@ -805,8 +805,9 @@
 // Command `TEXTURE_FROM_BUFFER`: a texture over a buffer. Struct later.
 #define RGFX_CMD_TEXTURE_FROM_BUFFER 520
 
-// Command `TEXTURE_FROM_IOSURFACE`: a texture over an IOSurface plane. Struct
-// later.
+// Command `TEXTURE_FROM_IOSURFACE` ([`RgfxTextureFromIOSurface`]): a texture
+// over a guest process's copy of an IOSurface plane, named by the surface's
+// global id.
 #define RGFX_CMD_TEXTURE_FROM_IOSURFACE 521
 
 // Command `SAMPLER_CREATE`: a sampler from a descriptor. Struct later.
@@ -3454,6 +3455,35 @@ typedef struct {
   // The texture's shape.
   RgfxTextureDescriptor desc;
 } RgfxTextureFromBuffer;
+
+// `TEXTURE_FROM_IOSURFACE`: a texture of shape `desc` over plane `plane` of
+// the IOSurface `iosurface_id` (its global `IOSurfaceID`). The texture lies
+// over the guest process's copy of that plane, the buffer `buffer_obj_id` from
+// `offset`, each row `bytes_per_row` apart, as `TEXTURE_FROM_BUFFER` places
+// one. The guest syncs that copy with the surface's own pages: from the pages
+// when the CPU wrote the surface since, before a commit, and back to them when
+// a command buffer that wrote the texture completes. The host names the
+// texture by the surface's id, so a present of the surface finds it.
+typedef struct {
+  // [`RGFX_CMD_TEXTURE_FROM_IOSURFACE`].
+  RgfxMsgHeader header;
+  // The new texture's guest-picked id.
+  uint64_t obj_id;
+  // The new texture's guest-picked resource id.
+  uint64_t resource_id;
+  // The buffer over the guest's copy of the plane, which the texture reads.
+  uint64_t buffer_obj_id;
+  // The texture's first byte in the buffer.
+  uint64_t offset;
+  // Bytes from one row's start to the next's in the buffer.
+  uint64_t bytes_per_row;
+  // The surface's global `IOSurfaceID`.
+  uint32_t iosurface_id;
+  // The surface's plane the texture shows (0 for a surface of one plane).
+  uint32_t plane;
+  // The texture's shape.
+  RgfxTextureDescriptor desc;
+} RgfxTextureFromIOSurface;
 
 // `VBLANK`: the display's host screen refreshed.
 typedef struct {

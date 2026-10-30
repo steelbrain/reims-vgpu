@@ -181,6 +181,29 @@ RgfxCreated RgfxSerializer::createTextureFromBuffer(RgfxObjId buffer, uint64_t o
 	return out;
 }
 
+RgfxCreated RgfxSerializer::createTextureFromIOSurface(RgfxObjId buffer, uint64_t offset,
+                                                       uint64_t bytes_per_row,
+                                                       uint32_t iosurface_id, uint32_t plane,
+                                                       const RgfxTextureDescriptor &desc)
+{
+	RgfxCreated out = {};
+	out.obj_id = m_ids.allocObjId();
+	out.resource_id = m_ids.allocResourceId();
+
+	RgfxTextureFromIOSurface msg = {};
+	msg.obj_id = out.obj_id;
+	msg.resource_id = out.resource_id;
+	msg.buffer_obj_id = buffer;
+	msg.offset = offset;
+	msg.bytes_per_row = bytes_per_row;
+	msg.iosurface_id = iosurface_id;
+	msg.plane = plane;
+	msg.desc = desc;
+	out.posted =
+	    m_control.tryPost(RGFX_CMD_TEXTURE_FROM_IOSURFACE, &msg, sizeof(msg), &out.seqno);
+	return out;
+}
+
 RgfxCreated RgfxSerializer::createSampler(const RgfxSamplerParams &params)
 {
 	RgfxCreated out = {};

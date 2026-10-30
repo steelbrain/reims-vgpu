@@ -38,6 +38,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 #include "RgfxObjectModel.hpp"
@@ -372,6 +373,15 @@ public:
 	/// The op-stream bytes appended so far (the message size less the header).
 	uint64_t opBytes() const;
 
+	// --- IOSurface copies this command buffer writes -------------------------
+
+	/// Records that the command buffer writes the IOSurface copy `shadow` (opaque
+	/// here: the Metal shell's RgfxSurfaceShadow), which its completion writes back
+	/// to the surface's pages. Held until taken.
+	void noteSurfaceWrite(std::shared_ptr<void> shadow) { m_surfaceWrites.push_back(std::move(shadow)); }
+	/// The copies recorded so far, which the caller now holds.
+	std::vector<std::shared_ptr<void>> takeSurfaceWrites() { return std::move(m_surfaceWrites); }
+
 private:
 	// Appends an op with no body (header only, len 8).
 	void appendOp(uint16_t tag);
@@ -387,6 +397,7 @@ private:
 	RgfxRingWriter &m_ring;
 	RgfxCommandBuffer m_head;
 	std::vector<uint8_t> m_buf;
+	std::vector<std::shared_ptr<void>> m_surfaceWrites;
 };
 
 #endif // RGFX_ENCODER_HPP_

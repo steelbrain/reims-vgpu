@@ -9,6 +9,7 @@
 #import "RgfxBuffer.h"
 #import "RgfxDepthStencilState.h"
 #import "RgfxHeap.h"
+#import "RgfxIOSurface.h"
 #import "RgfxSampler.h"
 #import "RgfxTexture.h"
 
@@ -149,13 +150,14 @@ bool rgfxIsSharedStorage(MTLResourceOptions options)
                                  iosurface:(IOSurfaceRef)iosurface
                                      plane:(NSUInteger)plane
 {
-	// Texture-over-IOSurface import (TEXTURE_FROM_IOSURFACE) has no wire struct
-	// yet and needs the IOSurface shared into the device region: a later transport
-	// piece. Documented nil stub until then.
-	(void)descriptor;
-	(void)iosurface;
-	(void)plane;
-	return nil;
+	// Over this process's copy of the plane in the device region, synced with the
+	// surface's pages (RgfxIOSurface.h).
+	return [RgfxIOSurfaceTexture textureWithDescriptor:descriptor
+	                                         iosurface:iosurface
+	                                             plane:plane
+	                                            region:[self region]
+	                                            device:self
+	                                        serializer:[self serializer]];
 }
 
 // --- samplers ----------------------------------------------------------------

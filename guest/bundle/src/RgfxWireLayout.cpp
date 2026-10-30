@@ -34,6 +34,7 @@ static_assert(sizeof(RgfxEventSignalled) == 32, "RgfxEventSignalled");
 static_assert(sizeof(RgfxTextureDescriptor) == 48, "RgfxTextureDescriptor");
 static_assert(sizeof(RgfxTextureCreate) == 104, "RgfxTextureCreate");
 static_assert(sizeof(RgfxTextureFromBuffer) == 104, "RgfxTextureFromBuffer");
+static_assert(sizeof(RgfxTextureFromIOSurface) == 112, "RgfxTextureFromIOSurface");
 static_assert(sizeof(RgfxSamplerCreate) == 72, "RgfxSamplerCreate");
 static_assert(sizeof(RgfxStencilDescriptor) == 24, "RgfxStencilDescriptor");
 static_assert(sizeof(RgfxDepthStencilCreate) == 80, "RgfxDepthStencilCreate");

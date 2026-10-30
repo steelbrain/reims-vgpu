@@ -47,6 +47,7 @@ use reims_graphics::wire::{
     RGFX_CMD_LIBRARY_CREATE, RGFX_CMD_OBJECT_DESTROY,
     RGFX_CMD_QUEUE_CREATE, RGFX_CMD_RENDER_PIPELINE_CREATE, RGFX_CMD_SAMPLER_CREATE,
     RGFX_CMD_SHARED_EVENT_CREATE, RGFX_CMD_TEXTURE_CREATE, RGFX_CMD_TEXTURE_FROM_BUFFER,
+    RGFX_CMD_TEXTURE_FROM_IOSURFACE,
     RGFX_EVT_PIPELINE_REFLECTION, RGFX_LIBRARY_BYTES_OFFSET, RGFX_PIPELINE_KIND_COMPUTE,
     RGFX_PIPELINE_KIND_RENDER, RGFX_PIPELINE_OK, RGFX_PIPELINE_REFLECT_SUPPORT_ICB,
     RGFX_PIPELINE_REFLECT_THREADGROUP_MATCHES_TILE, RGFX_PIPELINE_REFUSED, RgfxBufferAtOffset,
@@ -55,7 +56,7 @@ use reims_graphics::wire::{
     RgfxLibraryCreate, RgfxMsgHeader, RgfxObjectCreate,
     RgfxObjectDestroy, RgfxPipelineReflection, RgfxQueueCreate, RgfxRenderPipelineCreate,
     RgfxSamplerCreate, RgfxSharedEventCreate, RgfxStencilDescriptor, RgfxTextureCreate,
-    RgfxTextureDescriptor, RgfxTextureFromBuffer,
+    RgfxTextureDescriptor, RgfxTextureFromBuffer, RgfxTextureFromIOSurface,
 };
 use reims_vgpu_core::host::HostPtr;
 use reims_vgpu_core::platform::device::GpuDevice;
@@ -129,6 +130,10 @@ pub struct GraphicsDecoder<P: Platform> {
     /// builders ([`Platform::texture_descriptor`]) some per-device creates need.
     platform: Arc<P>,
     objects: HashMap<u64, ObjHandle<P>>,
+    /// The texture over each IOSurface's plane 0, by the surface's global id:
+    /// the latest `TEXTURE_FROM_IOSURFACE` naming the surface, until that
+    /// texture's destroy. A present names its surface by that id.
+    surfaces: HashMap<u32, u64>,
     /// Where a command buffer's completion record goes once its work finishes;
     /// `None` builds and drops it (the ring loop sets a sink later).
     completion_sink: Option<CompletionSink>,
@@ -148,6 +153,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         GraphicsDecoder {
             platform,
             objects: HashMap::new(),
+            surfaces: HashMap::new(),
             completion_sink: None,
             reflection_sink: None,
             region,
@@ -172,6 +178,29 @@ impl<P: Platform> GraphicsDecoder<P> {
         self.objects.len()
     }
 
+    /// The texture over plane 0 of the IOSurface whose global id is
+    /// `iosurface_id`: the latest one a guest process made with
+    /// `TEXTURE_FROM_IOSURFACE` and has not destroyed. Its pixels are what that
+    /// process's command buffers wrote, as of their completion.
+    #[allow(dead_code)] // the present path reads it
+    pub(crate) fn surface_texture(&self, iosurface_id: u32) -> Option<P::Texture> {
+        match self.objects.get(self.surfaces.get(&iosurface_id)?) {
+            Some(ObjHandle::Texture(texture)) => Some(texture.clone_ref()),
+            _ => None,
+        }
+    }
+
+    /// Forgets the surface names of textures the table no longer holds: a caller
+    /// that drops objects other than by `OBJECT_DESTROY` (a context's whole id
+    /// range at its close) calls it, so a later object that takes a dropped id is
+    /// never taken for the surface's texture.
+    #[allow(dead_code)] // a context's close calls it
+    pub(crate) fn forget_dropped_surfaces(&mut self) {
+        let objects = &self.objects;
+        self.surfaces
+            .retain(|_, texture| matches!(objects.get(texture), Some(ObjHandle::Texture(_))));
+    }
+
     /// Carries out one wire message against `device`: a create inserts the new
     /// handle (keyed by the guest-picked `obj_id`), a destroy drops it. The
     /// inner `Result` says whether the message was carried out; a platform raise
@@ -191,7 +220,9 @@ impl<P: Platform> GraphicsDecoder<P> {
                 };
                 // A missing id is not an error: the guest may destroy an object
                 // the host never made (a create that the platform refused).
-                self.objects.remove(&m.obj_id);
+                if matches!(self.objects.remove(&m.obj_id), Some(ObjHandle::Texture(_))) {
+                    self.surfaces.retain(|_, texture| *texture != m.obj_id);
+                }
                 Ok(Ok(()))
             }
             RGFX_CMD_EVENT_CREATE => {
@@ -469,6 +500,31 @@ impl<P: Platform> GraphicsDecoder<P> {
                 };
                 match made {
                     Some(texture) => self.insert(m.obj_id, ObjHandle::Texture(texture)),
+                    None => Ok(Err(DecodeError::Refused)),
+                }
+            }
+            RGFX_CMD_TEXTURE_FROM_IOSURFACE => {
+                let Some(m) = read::<RgfxTextureFromIOSurface>(message) else {
+                    return Ok(Err(DecodeError::Malformed));
+                };
+                // Placed as TEXTURE_FROM_BUFFER places a texture, over the buffer
+                // the guest keeps its copy of the plane in; a buffer the host does
+                // not hold is a guest protocol error.
+                let desc = texture_desc(&m.desc, m.resource_id);
+                let descriptor = self.platform.texture_descriptor(&desc);
+                let made = {
+                    let Some(ObjHandle::Buffer(buffer)) = self.objects.get(&m.buffer_obj_id) else {
+                        return Ok(Err(DecodeError::BadReference));
+                    };
+                    buffer.new_texture(OnFault::Return, &descriptor, m.offset, m.bytes_per_row)?
+                };
+                match made {
+                    Some(texture) => {
+                        if m.plane == 0 {
+                            self.surfaces.insert(m.iosurface_id, m.obj_id);
+                        }
+                        self.insert(m.obj_id, ObjHandle::Texture(texture))
+                    }
                     None => Ok(Err(DecodeError::Refused)),
                 }
             }
@@ -1157,6 +1213,75 @@ mod tests {
             dec.decode(&device, &[0u8; 4]).unwrap(),
             Err(DecodeError::Malformed)
         );
+
+        // A texture over IOSurface 0x77's plane 0, in the guest's copy of it in
+        // the buffer above: the host names it by the surface's id until its
+        // destroy. A later plane-1 texture of the surface leaves the name alone.
+        let tex_from_surface = RgfxTextureFromIOSurface {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_TEXTURE_FROM_IOSURFACE,
+                size: size_of::<RgfxTextureFromIOSurface>() as u32,
+                seqno: 0,
+            },
+            obj_id: 30,
+            resource_id: 0x45,
+            buffer_obj_id: 17,
+            offset: 0,
+            bytes_per_row: 64 * 4,
+            iosurface_id: 0x77,
+            plane: 0,
+            desc: RgfxTextureDescriptor {
+                width: 64,
+                height: 64,
+                usage: 5, // ShaderRead | RenderTarget
+                ..tex_from_buf.desc
+            },
+        };
+        assert!(dec.surface_texture(0x77).is_none());
+        assert_eq!(
+            dec.decode(&device, tex_from_surface.as_bytes()).unwrap(),
+            Ok(())
+        );
+        assert!(dec.surface_texture(0x77).is_some());
+        let plane1 = RgfxTextureFromIOSurface {
+            obj_id: 31,
+            plane: 1,
+            ..tex_from_surface
+        };
+        assert_eq!(dec.decode(&device, plane1.as_bytes()).unwrap(), Ok(()));
+        let destroy_plane1 = RgfxObjectDestroy {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_OBJECT_DESTROY,
+                size: size_of::<RgfxObjectDestroy>() as u32,
+                seqno: 0,
+            },
+            obj_id: 31,
+        };
+        assert_eq!(
+            dec.decode(&device, destroy_plane1.as_bytes()).unwrap(),
+            Ok(())
+        );
+        assert!(dec.surface_texture(0x77).is_some());
+        let destroy_surface = RgfxObjectDestroy {
+            obj_id: 30,
+            ..destroy_plane1
+        };
+        assert_eq!(
+            dec.decode(&device, destroy_surface.as_bytes()).unwrap(),
+            Ok(())
+        );
+        assert!(dec.surface_texture(0x77).is_none());
+        // Over a buffer the host never made: a bad reference, and no name.
+        let bad_surface = RgfxTextureFromIOSurface {
+            obj_id: 32,
+            buffer_obj_id: 999,
+            ..tex_from_surface
+        };
+        assert_eq!(
+            dec.decode(&device, bad_surface.as_bytes()).unwrap(),
+            Err(DecodeError::BadReference)
+        );
+        assert!(dec.surface_texture(0x77).is_none());
     }
 
     /// A render and a compute pipeline create each resolve their functions from a

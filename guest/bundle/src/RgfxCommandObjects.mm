@@ -28,6 +28,7 @@
  */
 
 #import "RgfxCommandObjects.h"
+#import "RgfxIOSurface.h"
 
 #include <cstring>
 #include <vector>
@@ -96,6 +97,20 @@ void fillColor(RgfxRenderPassColorAttachment *c, MTLRenderPassColorAttachmentDes
 /// Translates an MTLRenderPassDescriptor into the wire pass descriptor and its colour
 /// attachments, returning the colour count (highest set attachment index + 1, so
 /// gaps stay as absent attachments). `colors` is filled with `count` records.
+/// Records on `enc` every IOSurface texture the pass `d` writes: its attachments and
+/// their resolve targets.
+void noteRenderPassWrites(RgfxEncoder *enc, MTLRenderPassDescriptor *d)
+{
+	for (uint32_t i = 0; i < 8; i++) {
+		rgfxIOSurfaceNoteWrite(enc, d.colorAttachments[i].texture);
+		rgfxIOSurfaceNoteWrite(enc, d.colorAttachments[i].resolveTexture);
+	}
+	rgfxIOSurfaceNoteWrite(enc, d.depthAttachment.texture);
+	rgfxIOSurfaceNoteWrite(enc, d.depthAttachment.resolveTexture);
+	rgfxIOSurfaceNoteWrite(enc, d.stencilAttachment.texture);
+	rgfxIOSurfaceNoteWrite(enc, d.stencilAttachment.resolveTexture);
+}
+
 uint32_t fillRenderPass(MTLRenderPassDescriptor *d, RgfxRenderPassDesc *desc,
                         std::vector<RgfxRenderPassColorAttachment> *colors)
 {
@@ -290,6 +305,9 @@ uint32_t fillRenderPass(MTLRenderPassDescriptor *d, RgfxRenderPassDesc *desc,
 	// queue at commit. Null when the queue has no reader (a unit test driving the
 	// queue without one), in which case the buffer holds its seqno as before.
 	RgfxReplyReader *_reader;
+	// The IOSurface copies this buffer writes, written back to their surfaces' pages
+	// when it completes (RgfxIOSurface.h).
+	std::vector<std::shared_ptr<void>> _surfaceWrites;
 }
 
 + (instancetype)commandBufferForQueue:(RgfxCommandQueue *)queue
@@ -326,6 +344,7 @@ uint32_t fillRenderPass(MTLRenderPassDescriptor *d, RgfxRenderPassDesc *desc,
 	RgfxRenderPassDesc desc = {};
 	std::vector<RgfxRenderPassColorAttachment> colors;
 	uint32_t count = fillRenderPass(renderPassDescriptor, &desc, &colors);
+	noteRenderPassWrites(_encoder, renderPassDescriptor);
 	_encoder->beginRenderPass(desc, colors.empty() ? nullptr : colors.data(), count);
 	return [[RgfxRenderCommandEncoder alloc] initWithEncoder:_encoder
 	                                                 emitEnd:YES
@@ -366,6 +385,7 @@ uint32_t fillRenderPass(MTLRenderPassDescriptor *d, RgfxRenderPassDesc *desc,
 	RgfxRenderPassDesc desc = {};
 	std::vector<RgfxRenderPassColorAttachment> colors;
 	uint32_t count = fillRenderPass(renderPassDescriptor, &desc, &colors);
+	noteRenderPassWrites(_encoder, renderPassDescriptor);
 	_encoder->beginRenderPass(desc, colors.empty() ? nullptr : colors.data(), count);
 	return [[RgfxParallelRenderCommandEncoder alloc] initWithEncoder:_encoder device:self.device];
 }
@@ -387,6 +407,11 @@ uint32_t fillRenderPass(MTLRenderPassDescriptor *d, RgfxRenderPassDesc *desc,
 		return; // commit is once
 	}
 	_committed = YES;
+	// The IOSurface copies the CPU changed since they last synced take the surfaces'
+	// pages before the GPU reads them; the copies this buffer writes go back at its
+	// completion.
+	rgfxIOSurfaceSyncBeforeCommit();
+	_surfaceWrites = _encoder->takeSurfaceWrites();
 	// Serialise the command-buffer header + op stream and post it on the queue's
 	// submission ring; `_seqno` is the submission the host's RgfxCbComplete carries.
 	_encoder->finish(&_seqno);
@@ -413,6 +438,9 @@ uint32_t fillRenderPass(MTLRenderPassDescriptor *d, RgfxRenderPassDesc *desc,
 // so the scheduled handlers fire here too (a completed buffer was scheduled).
 - (void)rgfxDeliverCompletion:(const RgfxCbComplete *)msg
 {
+	// The surfaces this buffer wrote hold its results before anyone sees it complete.
+	rgfxIOSurfaceWriteBack(_surfaceWrites);
+	_surfaceWrites.clear();
 	if (msg->status == RGFX_CB_OK) {
 		_status = MTLCommandBufferStatusCompleted;
 	} else {
@@ -1346,12 +1374,14 @@ uint32_t fillRenderPass(MTLRenderPassDescriptor *d, RgfxRenderPassDesc *desc,
 }
 - (void)setTexture:(id<MTLTexture>)texture atIndex:(NSUInteger)index
 {
+	rgfxIOSurfaceNoteShaderWrite(_enc, texture);
 	_enc->computeSetTexture(rgfxId(texture), index);
 }
 - (void)setTextures:(const id<MTLTexture> __nullable [__nonnull])textures withRange:(NSRange)range
 {
 	std::vector<RgfxComputeTextureBinding> t(range.length);
 	for (NSUInteger i = 0; i < range.length; i++) {
+		rgfxIOSurfaceNoteShaderWrite(_enc, textures[i]);
 		t[i].texture_obj_id = rgfxId(textures[i]);
 	}
 	_enc->computeSetTextures(range.location, t.empty() ? nullptr : t.data(),
@@ -1576,6 +1606,7 @@ uint32_t fillRenderPass(MTLRenderPassDescriptor *d, RgfxRenderPassDesc *desc,
       destinationLevel:(NSUInteger)destinationLevel
      destinationOrigin:(MTLOrigin)destinationOrigin
 {
+	rgfxIOSurfaceNoteWrite(_enc, destinationTexture);
 	_enc->blitCopyBufferToTexture(rgfxId(sourceBuffer), rgfxId(destinationTexture), sourceOffset,
 	                              sourceBytesPerRow, sourceBytesPerImage, sourceSize.width,
 	                              sourceSize.height, sourceSize.depth, destinationSlice,
@@ -1593,6 +1624,7 @@ uint32_t fillRenderPass(MTLRenderPassDescriptor *d, RgfxRenderPassDesc *desc,
      destinationOrigin:(MTLOrigin)destinationOrigin
                options:(MTLBlitOption)options
 {
+	rgfxIOSurfaceNoteWrite(_enc, destinationTexture);
 	_enc->blitCopyBufferToTextureOptions(rgfxId(sourceBuffer), rgfxId(destinationTexture),
 	                                     sourceOffset, sourceBytesPerRow, sourceBytesPerImage,
 	                                     sourceSize.width, sourceSize.height, sourceSize.depth,
@@ -1643,6 +1675,7 @@ destinationBytesPerImage:(NSUInteger)destinationBytesPerImage
        destinationLevel:(NSUInteger)destinationLevel
       destinationOrigin:(MTLOrigin)destinationOrigin
 {
+	rgfxIOSurfaceNoteWrite(_enc, destinationTexture);
 	_enc->blitCopyTextureRegion(rgfxId(sourceTexture), rgfxId(destinationTexture), sourceSlice,
 	                            sourceLevel, sourceOrigin.x, sourceOrigin.y, sourceOrigin.z,
 	                            sourceSize.width, sourceSize.height, sourceSize.depth,
@@ -1658,12 +1691,14 @@ destinationBytesPerImage:(NSUInteger)destinationBytesPerImage
              sliceCount:(NSUInteger)sliceCount
              levelCount:(NSUInteger)levelCount
 {
+	rgfxIOSurfaceNoteWrite(_enc, destinationTexture);
 	_enc->blitCopyTextureSlices(rgfxId(sourceTexture), rgfxId(destinationTexture), sourceSlice,
 	                            sourceLevel, destinationSlice, destinationLevel, sliceCount,
 	                            levelCount);
 }
 - (void)generateMipmapsForTexture:(id<MTLTexture>)texture
 {
+	rgfxIOSurfaceNoteWrite(_enc, texture);
 	_enc->blitGenerateMipmaps(rgfxId(texture));
 }
 - (void)fillBuffer:(id<MTLBuffer>)buffer range:(NSRange)range value:(uint8_t)value
