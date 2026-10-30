@@ -19,10 +19,13 @@
  * Every other selector is refused as unsupported and logged.
  *
  * A submitted transaction's plane 0, where it is an IOSurface, goes to the host on the control
- * ring as PRESENT_SURFACE through the framebuffer (ReimsGraphics owns that ring), and the
- * transaction completes when the host has answered: its completion notification goes out and
- * a waiter returns. VBL notifications follow the device's VBLANK events while one is
- * registered.
+ * ring as PRESENT_SURFACE through the framebuffer (ReimsGraphics owns that ring), and submit
+ * returns at once. The transaction completes when the host answers that PRESENT_SURFACE, which
+ * it does once the display shows the surface: its completion notification goes out and a waiter
+ * returns. An answer completes every transaction submitted before it, oldest first. At most two
+ * are outstanding; a third submit waits up to five seconds for room, then fails unsent. A
+ * transaction with no IOSurface on plane 0 keeps the surface shown and completes at once. VBL
+ * notifications follow the device's VBLANK events while one is registered.
  *
  * Our own code; it names only SDK-public IOKit classes.
  */
@@ -57,6 +60,13 @@ public:
 private:
 	// The registrations a client keeps (selector 3's kinds).
 	enum { kKindVbl = 0, kKindTransaction = 1, kKinds = 2 };
+	// The transactions submitted to the host and not yet answered, oldest first.
+	enum { kMaxOutstanding = 2 };
+	struct Outstanding {
+		UInt64 seqno;
+		UInt32 id;
+		UInt64 cookie;
+	};
 
 	static IOReturn sAssociate(OSObject *target, void *reference, IOExternalMethodArguments *a);
 	static IOReturn sModeScaler(OSObject *target, void *reference, IOExternalMethodArguments *a);
@@ -67,10 +77,13 @@ private:
 	static IOReturn sSubmit(OSObject *target, void *reference, IOExternalMethodArguments *a);
 	static IOReturn sWait(OSObject *target, void *reference, IOExternalMethodArguments *a);
 
-	// The framebuffer's VBLANK hook (ReimsGraphics::setPipeVblank), on its work loop.
+	// The framebuffer's hooks (ReimsGraphics::setPipe), on its work loop.
 	static void vblankHook(OSObject *client, UInt64 count, UInt64 time);
+	static void presentHook(OSObject *client, UInt64 seqno, UInt32 status);
+	void presented(UInt64 seqno, UInt32 status);
+	void completeLocked(UInt32 transactionId, UInt64 cookie, UInt64 time);
 	void sendVbl(UInt64 count, UInt64 time);
-	void sendCompletion(UInt32 transactionId, UInt64 cookie, UInt64 time);
+
 	void releaseRegistrations();
 
 	task_t task;
@@ -88,6 +101,8 @@ private:
 	UInt32 completed;
 	UInt64 lastVblTime;
 	UInt32 logged;
+	Outstanding outstanding[kMaxOutstanding];
+	UInt32 outstandingCount;
 };
 
 #endif // RGFX_DISPLAY_PIPE_USER_CLIENT_HPP_

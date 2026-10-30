@@ -77,14 +77,18 @@ public:
 	IOReturn setInterruptState(void *interruptRef, UInt32 state) override;
 
 	// The display pipe (RgfxDisplayPipeUserClient, on the accelerator) presents through the
-	// framebuffer, which owns the control ring. presentSurface shows the IOSurface of global ID
-	// `surfaceId` on the display (0 goes back to the scanout) and waits for the host's answer:
-	// thread context only. setPipeVblank gives the pipe the display's VBLANK events: while
-	// `client` is set, the device sends them and each calls `hook(client, count, time)` on the
-	// work loop, `time` the guest's mach_absolute_time at the event; nullptr stops them.
+	// framebuffer, which owns the control ring. postPresent puts PRESENT_SURFACE for the
+	// IOSurface of global ID `surfaceId` on the ring without waiting (thread context only); the
+	// host answers it once the display shows the surface. setPipe names the pipe's client
+	// (retained) and its hooks, both called on the work loop: `present(client, seqno, status)`
+	// for every COMPLETE (the pipe picks its own seqnos), and, while setPipeVblankEnabled is on,
+	// `vblank(client, count, time)` for each VBLANK, `time` the guest's mach_absolute_time at the
+	// event. nullptr clears them.
 	typedef void (*PipeVblankHook)(OSObject *client, UInt64 count, UInt64 time);
-	IOReturn presentSurface(UInt32 surfaceId, UInt32 transactionId);
-	void setPipeVblank(OSObject *client, PipeVblankHook hook);
+	typedef void (*PipePresentHook)(OSObject *client, UInt64 seqno, UInt32 status);
+	IOReturn postPresent(UInt32 surfaceId, UInt32 transactionId, UInt64 *seqno);
+	void setPipe(OSObject *client, PipeVblankHook vblank, PipePresentHook present);
+	void setPipeVblankEnabled(bool enabled);
 
 private:
 	// The display's modes. IDs stay with a mode (its size and rate) for the
@@ -191,9 +195,11 @@ private:
 	Interrupt vblank;
 	Interrupt connect;
 	bool vblankWanted;
-	// The display pipe's VBLANK client (retained) and its hook.
-	OSObject *pipeVblankClient;
+	// The display pipe's client (retained), its hooks, and whether it wants VBLANK.
+	OSObject *pipeClient;
 	PipeVblankHook pipeVblankHook;
+	PipePresentHook pipePresentHook;
+	bool pipeVblankEnabled;
 
 	// The work loop's alone: what SET_VBLANK last asked, and a display
 	// refresh after DISPLAY_CHANGED, waiting to be sent or answered.

@@ -10,6 +10,7 @@
 
 #include <IOKit/IOLib.h>
 #include <IOKit/IOMemoryDescriptor.h>
+#include <kern/clock.h>
 #include <libkern/c++/OSSerialize.h>
 
 #define super IOUserClient
@@ -104,6 +105,7 @@ bool RgfxDisplayPipeUserClient::initWithTask(task_t owningTask, void *securityID
 	completed = 0;
 	lastVblTime = 0;
 	logged = 0;
+	outstandingCount = 0;
 	return lock != nullptr;
 }
 
@@ -142,7 +144,7 @@ void RgfxDisplayPipeUserClient::free()
 void RgfxDisplayPipeUserClient::releaseRegistrations()
 {
 	if (framebuffer)
-		framebuffer->setPipeVblank(nullptr, nullptr);
+		framebuffer->setPipe(nullptr, nullptr, nullptr);
 	if (!lock)
 		return;
 	IOLockLock(lock);
@@ -221,6 +223,7 @@ IOReturn RgfxDisplayPipeUserClient::sAssociate(OSObject *target, void *,
 	OSSafeReleaseNULL(self->framebuffer);
 	self->framebuffer = fb;
 	self->associated = true;
+	fb->setPipe(self, &RgfxDisplayPipeUserClient::vblankHook, &RgfxDisplayPipeUserClient::presentHook);
 	a->scalarOutput[0] = kAcceleratorId;
 	IOLog("RGFX pipe: associated index %d with accelerator %llu\n", static_cast<int>(index),
 	      kAcceleratorId);
@@ -313,7 +316,7 @@ IOReturn RgfxDisplayPipeUserClient::sRequestNotify(OSObject *target, void *,
 	// A VBL registration turns the device's VBLANK events on first, so a failed enable leaves
 	// no reference behind.
 	if (kind == kKindVbl)
-		self->framebuffer->setPipeVblank(self, &RgfxDisplayPipeUserClient::vblankHook);
+		self->framebuffer->setPipeVblankEnabled(true);
 	IOLockLock(self->lock);
 	if (self->registered[kind]) {
 		IOLockUnlock(self->lock);
@@ -367,18 +370,42 @@ IOReturn RgfxDisplayPipeUserClient::sSubmit(OSObject *target, void *, IOExternal
 		      "ids %u %u cookie %llx\n",
 		      id, self->begun, rd64(t, 0), rd32(t, kTxnOptions), planeType, surface,
 		      rd32(t, kTxnPlane0 + kPlaneSurface + 4), cookie);
-	if (planeType == kPlaneIOSurface && surface != 0) {
-		IOReturn r = self->framebuffer->presentSurface(surface, id);
-		if (r != kIOReturnSuccess && log)
-			IOLog("RGFX pipe: transaction %u: the host did not show IOSurface %u: 0x%x\n", id,
-			      surface, r);
-	}
 	IOLockLock(self->lock);
-	self->completed = id;
 	if (self->begun == id)
 		self->begun = 0;
+	// Room for one more outstanding transaction, waiting up to five seconds.
+	uint64_t deadline = 0;
+	clock_interval_to_deadline(5000, kMillisecondScale, &deadline);
+	while (self->outstandingCount >= kMaxOutstanding) {
+		if (IOLockSleepDeadline(self->lock, &self->completed, deadline, THREAD_UNINT) == THREAD_TIMED_OUT &&
+		    self->outstandingCount >= kMaxOutstanding) {
+			IOLockUnlock(self->lock);
+			IOLog("RGFX pipe: transaction %u: no room in 5 s, not sent\n", id);
+			return kIOReturnTimeout;
+		}
+	}
+	if (planeType != kPlaneIOSurface || surface == 0) {
+		// Nothing for the host to show: the display keeps its surface, and the transaction is
+		// done with the last one before it (at once where none is outstanding).
+		if (self->outstandingCount == 0)
+			self->completeLocked(id, cookie, mach_absolute_time());
+		else
+			self->outstanding[self->outstandingCount++] = {
+				self->outstanding[self->outstandingCount - 1].seqno, id, cookie};
+		IOLockUnlock(self->lock);
+		return kIOReturnSuccess;
+	}
+	// Posted and recorded under the lock, so the host's answer, which the work loop hands to
+	// presented() under the same lock, finds it recorded.
+	UInt64 seqno = 0;
+	IOReturn r = self->framebuffer->postPresent(surface, id, &seqno);
+	if (r != kIOReturnSuccess) {
+		IOLockUnlock(self->lock);
+		IOLog("RGFX pipe: transaction %u: PRESENT_SURFACE not sent: 0x%x\n", id, r);
+		return r;
+	}
+	self->outstanding[self->outstandingCount++] = {seqno, id, cookie};
 	IOLockUnlock(self->lock);
-	self->sendCompletion(id, cookie, mach_absolute_time());
 	return kIOReturnSuccess;
 }
 
@@ -392,28 +419,80 @@ IOReturn RgfxDisplayPipeUserClient::sWait(OSObject *target, void *, IOExternalMe
 	if (!w)
 		return kIOReturnBadArgument;
 	UInt32 id = rd32(w, 0);
+	UInt32 ms = rd32(w, 8);
+	uint64_t deadline = 0;
+	clock_interval_to_deadline(ms, kMillisecondScale, &deadline);
+	IOReturn r = kIOReturnSuccess;
 	IOLockLock(self->lock);
-	// Transactions complete inside their submit, so a submitted one is already done.
-	bool done = id != 0 && id <= self->completed;
-	bool pending = id != 0 && id == self->begun;
+	if (id == 0 || id > self->nextTransaction) {
+		r = kIOReturnBadArgument;
+	} else if (id == self->begun) {
+		r = kIOReturnNotReady; // begun, never submitted
+	} else {
+		while (id > self->completed) {
+			if (IOLockSleepDeadline(self->lock, &self->completed, deadline, THREAD_UNINT) == THREAD_TIMED_OUT &&
+			    id > self->completed) {
+				r = kIOReturnTimeout;
+				break;
+			}
+		}
+	}
 	IOLockUnlock(self->lock);
-	if (done)
-		return kIOReturnSuccess;
-	return pending ? kIOReturnNotReady : kIOReturnBadArgument;
+	return r;
 }
 
 // MARK: - Notifications
 
-void RgfxDisplayPipeUserClient::sendCompletion(UInt32 transactionId, UInt64 cookie, UInt64 time)
+// Completes transaction `transactionId`: its completion notification, and waiters woken. Called
+// with the lock held.
+void RgfxDisplayPipeUserClient::completeLocked(UInt32 transactionId, UInt64 cookie, UInt64 time)
 {
-	io_user_reference_t words[kCompletionWords] = {};
-	words[0] = cookie;
-	words[1] = static_cast<io_user_reference_t>(transactionId) << 32;
-	words[3] = time;
-	words[8] = 1;
-	IOLockLock(lock);
-	if (registered[kKindTransaction])
+	if (transactionId > completed)
+		completed = transactionId;
+	if (registered[kKindTransaction]) {
+		io_user_reference_t words[kCompletionWords] = {};
+		words[0] = cookie;
+		words[1] = static_cast<io_user_reference_t>(transactionId) << 32;
+		words[3] = time;
+		words[8] = 1;
 		sendAsyncResult64(references[kKindTransaction], kIOReturnSuccess, words, kCompletionWords);
+	}
+	IOLockWakeup(lock, &completed, false);
+}
+
+void RgfxDisplayPipeUserClient::presentHook(OSObject *client, UInt64 seqno, UInt32 status)
+{
+	RgfxDisplayPipeUserClient *self = OSDynamicCast(RgfxDisplayPipeUserClient, client);
+	if (self)
+		self->presented(seqno, status);
+}
+
+// The host answered a COMPLETE: where it is one of our PRESENT_SURFACEs, the display shows that
+// transaction's surface, so it and every transaction before it are done, oldest first.
+void RgfxDisplayPipeUserClient::presented(UInt64 seqno, UInt32 status)
+{
+	IOLockLock(lock);
+	UInt32 match = kMaxOutstanding;
+	for (UInt32 i = 0; i < outstandingCount; i++) {
+		if (outstanding[i].seqno == seqno)
+			match = i;
+	}
+	if (match == kMaxOutstanding) {
+		IOLockUnlock(lock);
+		return;
+	}
+	if (status != 0 && logged < kLogFirst) {
+		logged++;
+		IOLog("RGFX pipe: transaction %u: the host did not show its IOSurface (status %u)\n",
+		      outstanding[match].id, status);
+	}
+	UInt64 now = mach_absolute_time();
+	for (UInt32 i = 0; i <= match; i++)
+		completeLocked(outstanding[i].id, outstanding[i].cookie, now);
+	UInt32 left = outstandingCount - (match + 1);
+	for (UInt32 i = 0; i < left; i++)
+		outstanding[i] = outstanding[match + 1 + i];
+	outstandingCount = left;
 	IOLockUnlock(lock);
 }
 
