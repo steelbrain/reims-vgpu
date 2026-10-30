@@ -1,0 +1,292 @@
+/*
+ * RgfxSerializer: building each object-lifecycle wire message and posting it on
+ * the control ring (RgfxSerializer.hpp).
+ */
+
+#include "RgfxSerializer.hpp"
+
+#include <cstring>
+#include <vector>
+
+namespace {
+
+/// The f32 bits of `value`, as the wire stores a float field.
+uint32_t floatBits(float value)
+{
+	uint32_t bits;
+	std::memcpy(&bits, &value, sizeof(bits));
+	return bits;
+}
+
+/// `n` rounded up to a multiple of 8, as every ring message's size is.
+uint64_t roundUp8(uint64_t n)
+{
+	return (n + 7) & ~static_cast<uint64_t>(7);
+}
+
+} // namespace
+
+RgfxSerializer::RgfxSerializer(RgfxRingWriter &control, RgfxIdSpace &ids)
+    : m_control(control), m_ids(ids)
+{
+}
+
+RgfxCreated RgfxSerializer::createQueue(uint64_t submit_offset, uint64_t complete_offset,
+                                        uint32_t submit_data_size, uint32_t complete_data_size,
+                                        uint32_t priority, uint32_t vector)
+{
+	RgfxCreated out = {};
+	out.obj_id = m_ids.allocObjId();
+
+	RgfxQueueCreate msg = {};
+	msg.obj_id = out.obj_id;
+	msg.submit_offset = submit_offset;
+	msg.complete_offset = complete_offset;
+	msg.submit_data_size = submit_data_size;
+	msg.complete_data_size = complete_data_size;
+	msg.priority = priority;
+	msg.vector = vector;
+	out.posted = m_control.tryPost(RGFX_CMD_QUEUE_CREATE, &msg, sizeof(msg), &out.seqno);
+	return out;
+}
+
+RgfxCreated RgfxSerializer::createHeap(uint64_t size_bytes, uint32_t options, int32_t heap_type,
+                                       uint64_t align)
+{
+	RgfxCreated out = {};
+	out.obj_id = m_ids.allocObjId();
+	out.gpu_address = m_ids.allocAddress(size_bytes, align);
+
+	RgfxHeapCreate msg = {};
+	msg.obj_id = out.obj_id;
+	msg.gpu_address = out.gpu_address;
+	msg.size_bytes = size_bytes;
+	msg.options = options;
+	msg.heap_type = heap_type;
+	out.posted = m_control.tryPost(RGFX_CMD_HEAP_CREATE, &msg, sizeof(msg), &out.seqno);
+	return out;
+}
+
+RgfxCreated RgfxSerializer::createHeapOverHostMemory(uint64_t size_bytes, uint32_t options,
+                                                     int32_t heap_type, uint64_t region_offset,
+                                                     uint64_t align)
+{
+	RgfxCreated out = {};
+	out.obj_id = m_ids.allocObjId();
+	out.gpu_address = m_ids.allocAddress(size_bytes, align);
+
+	RgfxHeapOverHostMemory msg = {};
+	msg.obj_id = out.obj_id;
+	msg.gpu_address = out.gpu_address;
+	msg.region_offset = region_offset;
+	msg.size_bytes = size_bytes;
+	msg.options = options;
+	msg.heap_type = heap_type;
+	out.posted =
+	    m_control.tryPost(RGFX_CMD_HEAP_OVER_HOST_MEMORY, &msg, sizeof(msg), &out.seqno);
+	return out;
+}
+
+RgfxCreated RgfxSerializer::createBuffer(uint64_t length, uint32_t options, uint64_t align)
+{
+	RgfxCreated out = {};
+	out.obj_id = m_ids.allocObjId();
+	out.gpu_address = m_ids.allocAddress(length, align);
+
+	RgfxBufferCreate msg = {};
+	msg.obj_id = out.obj_id;
+	msg.gpu_address = out.gpu_address;
+	msg.length = length;
+	msg.options = options;
+	out.posted = m_control.tryPost(RGFX_CMD_BUFFER_CREATE, &msg, sizeof(msg), &out.seqno);
+	return out;
+}
+
+RgfxCreated RgfxSerializer::createBufferOverHostMemory(uint64_t length, uint32_t options,
+                                                       uint64_t region_offset, uint64_t align)
+{
+	RgfxCreated out = {};
+	out.obj_id = m_ids.allocObjId();
+	out.gpu_address = m_ids.allocAddress(length, align);
+
+	RgfxBufferOverHostMemory msg = {};
+	msg.obj_id = out.obj_id;
+	msg.gpu_address = out.gpu_address;
+	msg.region_offset = region_offset;
+	msg.length = length;
+	msg.options = options;
+	out.posted =
+	    m_control.tryPost(RGFX_CMD_BUFFER_OVER_HOST_MEMORY, &msg, sizeof(msg), &out.seqno);
+	return out;
+}
+
+RgfxCreated RgfxSerializer::createBufferAtOffset(RgfxObjId heap, uint64_t offset, uint64_t length,
+                                                 uint32_t options)
+{
+	RgfxCreated out = {};
+	out.obj_id = m_ids.allocObjId();
+	// A heap-placed buffer's address is the heap's plus the offset; the host
+	// derives it from the heap it pinned, so none is sent.
+
+	RgfxBufferAtOffset msg = {};
+	msg.obj_id = out.obj_id;
+	msg.heap_obj_id = heap;
+	msg.offset = offset;
+	msg.length = length;
+	msg.options = options;
+	out.posted = m_control.tryPost(RGFX_CMD_BUFFER_AT_OFFSET, &msg, sizeof(msg), &out.seqno);
+	return out;
+}
+
+RgfxCreated RgfxSerializer::createTexture(const RgfxTextureDescriptor &desc, RgfxObjId heap,
+                                          uint64_t heap_offset, uint64_t align)
+{
+	RgfxCreated out = {};
+	out.obj_id = m_ids.allocObjId();
+	out.resource_id = m_ids.allocResourceId();
+
+	RgfxTextureCreate msg = {};
+	msg.obj_id = out.obj_id;
+	msg.resource_id = out.resource_id;
+	msg.desc = desc;
+	if (heap == RGFX_OBJ_NONE) {
+		// Device-placed: pick a GPU address; heap_obj_id stays 0.
+		out.gpu_address = m_ids.allocAddress(1, align);
+		msg.gpu_address = out.gpu_address;
+	} else {
+		msg.heap_obj_id = heap;
+		msg.heap_offset = heap_offset;
+	}
+	out.posted = m_control.tryPost(RGFX_CMD_TEXTURE_CREATE, &msg, sizeof(msg), &out.seqno);
+	return out;
+}
+
+RgfxCreated RgfxSerializer::createTextureFromBuffer(RgfxObjId buffer, uint64_t offset,
+                                                    uint64_t bytes_per_row,
+                                                    const RgfxTextureDescriptor &desc)
+{
+	RgfxCreated out = {};
+	out.obj_id = m_ids.allocObjId();
+	out.resource_id = m_ids.allocResourceId();
+
+	RgfxTextureFromBuffer msg = {};
+	msg.obj_id = out.obj_id;
+	msg.resource_id = out.resource_id;
+	msg.buffer_obj_id = buffer;
+	msg.offset = offset;
+	msg.bytes_per_row = bytes_per_row;
+	msg.desc = desc;
+	out.posted =
+	    m_control.tryPost(RGFX_CMD_TEXTURE_FROM_BUFFER, &msg, sizeof(msg), &out.seqno);
+	return out;
+}
+
+RgfxCreated RgfxSerializer::createSampler(const RgfxSamplerParams &params)
+{
+	RgfxCreated out = {};
+	out.obj_id = m_ids.allocObjId();
+
+	RgfxSamplerCreate msg = {};
+	msg.obj_id = out.obj_id;
+	msg.min_filter = params.min_filter;
+	msg.mag_filter = params.mag_filter;
+	msg.mip_filter = params.mip_filter;
+	msg.s_address_mode = params.s_address_mode;
+	msg.t_address_mode = params.t_address_mode;
+	msg.r_address_mode = params.r_address_mode;
+	msg.border_color = params.border_color;
+	msg.compare_function = params.compare_function;
+	msg.max_anisotropy = params.max_anisotropy;
+	msg.lod_min_clamp_bits = floatBits(params.lod_min_clamp);
+	msg.lod_max_clamp_bits = floatBits(params.lod_max_clamp);
+	msg.flags = params.flags;
+	out.posted = m_control.tryPost(RGFX_CMD_SAMPLER_CREATE, &msg, sizeof(msg), &out.seqno);
+	return out;
+}
+
+RgfxCreated RgfxSerializer::createDepthStencil(uint32_t depth_compare, bool depth_write_enabled,
+                                               const RgfxStencilDescriptor &front,
+                                               const RgfxStencilDescriptor &back)
+{
+	RgfxCreated out = {};
+	out.obj_id = m_ids.allocObjId();
+
+	RgfxDepthStencilCreate msg = {};
+	msg.obj_id = out.obj_id;
+	msg.depth_compare = depth_compare;
+	msg.depth_write_enabled = depth_write_enabled ? 1u : 0u;
+	msg.front = front;
+	msg.back = back;
+	out.posted =
+	    m_control.tryPost(RGFX_CMD_DEPTH_STENCIL_CREATE, &msg, sizeof(msg), &out.seqno);
+	return out;
+}
+
+RgfxCreated RgfxSerializer::createLibrary(const void *bytes, uint64_t byte_length)
+{
+	RgfxCreated out = {};
+	out.obj_id = m_ids.allocObjId();
+
+	// The message is the header struct, then the bytes, rounded up to a multiple
+	// of 8. A library larger than the ring cannot be posted in one message; the
+	// caller retries or (a later transport piece) places large AIR in a region
+	// block.
+	uint64_t total = roundUp8(RGFX_LIBRARY_BYTES_OFFSET + byte_length);
+	if (total > m_control.dataSize() || total > UINT32_MAX) {
+		out.posted = false;
+		return out;
+	}
+	std::vector<uint8_t> buf(static_cast<size_t>(total), 0);
+	RgfxLibraryCreate head = {};
+	head.obj_id = out.obj_id;
+	head.byte_length = byte_length;
+	std::memcpy(buf.data(), &head, sizeof(head));
+	if (byte_length)
+		std::memcpy(buf.data() + RGFX_LIBRARY_BYTES_OFFSET, bytes,
+		            static_cast<size_t>(byte_length));
+	out.posted = m_control.tryPost(RGFX_CMD_LIBRARY_CREATE, buf.data(),
+	                               static_cast<uint32_t>(total), &out.seqno);
+	return out;
+}
+
+RgfxCreated RgfxSerializer::createEvent()
+{
+	RgfxCreated out = {};
+	out.obj_id = m_ids.allocObjId();
+
+	RgfxObjectCreate msg = {};
+	msg.obj_id = out.obj_id;
+	out.posted = m_control.tryPost(RGFX_CMD_EVENT_CREATE, &msg, sizeof(msg), &out.seqno);
+	return out;
+}
+
+RgfxCreated RgfxSerializer::createFence()
+{
+	RgfxCreated out = {};
+	out.obj_id = m_ids.allocObjId();
+
+	RgfxObjectCreate msg = {};
+	msg.obj_id = out.obj_id;
+	out.posted = m_control.tryPost(RGFX_CMD_FENCE_CREATE, &msg, sizeof(msg), &out.seqno);
+	return out;
+}
+
+RgfxCreated RgfxSerializer::createSharedEvent(uint64_t initial_value)
+{
+	RgfxCreated out = {};
+	out.obj_id = m_ids.allocObjId();
+
+	RgfxSharedEventCreate msg = {};
+	msg.obj_id = out.obj_id;
+	msg.initial_value = initial_value;
+	out.posted =
+	    m_control.tryPost(RGFX_CMD_SHARED_EVENT_CREATE, &msg, sizeof(msg), &out.seqno);
+	return out;
+}
+
+bool RgfxSerializer::destroy(RgfxObjId obj_id)
+{
+	RgfxObjectDestroy msg = {};
+	msg.obj_id = obj_id;
+	return m_control.tryPost(RGFX_CMD_OBJECT_DESTROY, &msg, sizeof(msg), nullptr);
+}

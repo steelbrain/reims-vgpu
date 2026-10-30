@@ -1,0 +1,404 @@
+/*
+ * serializer_tests: the reims-graphics guest serialiser's self-contained check,
+ * run on the Mac (guest/bundle/Makefile `test`). It builds a plain-buffer region,
+ * a ring writer over it, and a serialiser, posts every message the slice covers,
+ * and reads each back with a minimal host-side consumer (the mirror of
+ * crates/reims-graphics/src/ring.rs), asserting the type, size and fields on the
+ * wire. No Metal, no device: this validates the serialiser's bytes alone.
+ *
+ * Exits 0 and prints a one-line summary when every check passes; aborts on the
+ * first failure.
+ */
+
+#include <atomic>
+#include <cassert>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <vector>
+
+#include "RgfxCaps.hpp"
+#include "RgfxObjectModel.hpp"
+#include "RgfxRingWriter.hpp"
+#include "RgfxSerializer.hpp"
+#include "reims_graphics_wire.h"
+
+namespace {
+
+int g_checks = 0;
+
+#define CHECK(cond)                                                                                \
+	do {                                                                                           \
+		g_checks++;                                                                                \
+		if (!(cond)) {                                                                             \
+			std::fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond);                  \
+			std::abort();                                                                          \
+		}                                                                                          \
+	} while (0)
+
+// A ring's region: its 256-byte header then a power-of-two byte ring, in a plain
+// buffer, with a doorbell counter. Mirrors a BAR-mapped ring for the test.
+struct TestRing {
+	std::vector<uint8_t> mem;
+	uint32_t dataSize;
+	uint64_t consumed = 0; // the host's count
+	static std::atomic<int> doorbells;
+
+	explicit TestRing(uint32_t data_size)
+	    : mem(RGFX_RING_HEADER_SIZE + data_size, 0), dataSize(data_size)
+	{
+	}
+
+	volatile uint8_t *base() { return mem.data(); }
+	volatile uint8_t *data() { return mem.data() + RGFX_RING_HEADER_SIZE; }
+
+	uint64_t producer()
+	{
+		uint64_t v;
+		std::memcpy(&v, mem.data() + __builtin_offsetof(RgfxRingHeader, producer), 8);
+		return v;
+	}
+	void setConsumer(uint64_t v)
+	{
+		std::memcpy(mem.data() + __builtin_offsetof(RgfxRingHeader, consumer), &v, 8);
+	}
+	void setConsumerIdle(uint32_t v)
+	{
+		std::memcpy(mem.data() + __builtin_offsetof(RgfxRingHeader, consumer_idle), &v, 4);
+	}
+
+	static void doorbell(void *, uint32_t) { doorbells.fetch_add(1); }
+
+	// The next message from the host's count, pads skipped; false when none more.
+	bool next(RgfxMsgHeader *header, std::vector<uint8_t> *bytes)
+	{
+		for (;;) {
+			if (consumed >= producer())
+				return false;
+			uint32_t off = static_cast<uint32_t>(consumed) & (dataSize - 1);
+			RgfxMsgHeader h;
+			std::memcpy(&h, const_cast<uint8_t *>(data()) + off, sizeof(h));
+			if (h.type == RGFX_MSG_PAD) {
+				consumed += h.size;
+				continue;
+			}
+			*header = h;
+			bytes->resize(h.size);
+			std::memcpy(bytes->data(), const_cast<uint8_t *>(data()) + off, h.size);
+			consumed += h.size;
+			setConsumer(consumed);
+			return true;
+		}
+	}
+};
+
+std::atomic<int> TestRing::doorbells{0};
+
+// Reads a message back into a wire struct T and returns it, checking the type
+// and that the on-wire size equals sizeof(T).
+template <typename T> T expectMessage(TestRing &ring, uint32_t type)
+{
+	RgfxMsgHeader h = {};
+	std::vector<uint8_t> bytes;
+	CHECK(ring.next(&h, &bytes));
+	CHECK(h.type == type);
+	CHECK(h.size == sizeof(T));
+	CHECK(bytes.size() == sizeof(T));
+	T msg;
+	std::memcpy(&msg, bytes.data(), sizeof(T));
+	return msg;
+}
+
+void test_id_space()
+{
+	RgfxIdSpace ids;
+	CHECK(ids.allocObjId() == 1);
+	CHECK(ids.allocObjId() == 2);
+	CHECK(ids.allocResourceId() == 1);
+	CHECK(ids.allocResourceId() == 2);
+
+	uint64_t a = ids.allocAddress(100, 256);
+	uint64_t b = ids.allocAddress(1, 4096);
+	CHECK(a >= RgfxIdSpace::kDefaultAddressBase);
+	CHECK((a % 256) == 0);
+	CHECK((b % 4096) == 0);
+	CHECK(b >= a + 100); // disjoint ranges, b after a
+}
+
+void test_caps()
+{
+	RgfxCaps caps;
+	// A bad version is refused and leaves the caps invalid.
+	RgfxDeviceInfo bad = {};
+	bad.version = RGFX_DEVICE_INFO_VERSION + 1;
+	CHECK(!caps.load(bad));
+	CHECK(!caps.valid());
+
+	RgfxDeviceInfo info = {};
+	info.version = RGFX_DEVICE_INFO_VERSION;
+	info.registry_id = 0xabcd;
+	info.gpu_core_count = 16;
+	info.max_threads_per_threadgroup[0] = 1024;
+	info.max_threads_per_threadgroup[1] = 512;
+	info.max_threads_per_threadgroup[2] = 64;
+	info.max_vertex_amplification_count = 2;
+	info.families[kRgfxFamilyApple5] = 1;
+	info.families[kRgfxFamilyMinus1009] = 1; // last by position
+	info.sample_counts[0] = 1;               // count 1
+	info.sample_counts[2] = 1;               // count 4
+	info.primitive_types[3] = 1;
+	info.write_rounding_modes[1] = 1; // mode 2
+	info.limits[kRgfxLimitDeviceLinearTextureAlignmentBytes] = 64;
+	info.limits[kRgfxLimitMaxViewportCount] = 16; // last by position
+	info.flags[kRgfxFlagAreRasterOrderGroupsSupported] = 1; // first by position
+	info.flags[kRgfxFlagSupportsTileShaders] = 1;           // last by position
+	const char *nm = "Test GPU";
+	info.name_len = static_cast<uint32_t>(std::strlen(nm));
+	std::memcpy(info.name, nm, info.name_len);
+
+	CHECK(caps.load(info));
+	CHECK(caps.valid());
+	CHECK(caps.registryId() == 0xabcd);
+	CHECK(caps.gpuCoreCount() == 16);
+	CHECK(caps.maxThreadsPerThreadgroup(0) == 1024);
+	CHECK(caps.maxThreadsPerThreadgroup(2) == 64);
+	CHECK(caps.maxVertexAmplificationCount() == 2);
+	CHECK(caps.supportsFamily(kRgfxFamilyApple5));
+	CHECK(caps.supportsFamily(kRgfxFamilyMinus1009));
+	CHECK(!caps.supportsFamily(kRgfxFamilyApple6));
+	CHECK(caps.supportsSampleCount(1));
+	CHECK(caps.supportsSampleCount(4));
+	CHECK(!caps.supportsSampleCount(2));
+	CHECK(!caps.supportsSampleCount(8));
+	CHECK(!caps.supportsSampleCount(3)); // not a power the blob holds
+	CHECK(caps.supportsPrimitiveType(3));
+	CHECK(!caps.supportsPrimitiveType(0));
+	CHECK(caps.supportsWriteRoundingMode(2));
+	CHECK(!caps.supportsWriteRoundingMode(1));
+	CHECK(caps.limit(kRgfxLimitDeviceLinearTextureAlignmentBytes) == 64);
+	CHECK(caps.limit(kRgfxLimitMaxViewportCount) == 16);
+	CHECK(caps.flag(kRgfxFlagAreRasterOrderGroupsSupported));
+	CHECK(caps.flag(kRgfxFlagSupportsTileShaders));
+	CHECK(!caps.flag(kRgfxFlagSupportsImageBlocks));
+	CHECK(std::strcmp(caps.name(), "Test GPU") == 0);
+}
+
+void test_lifecycle_messages()
+{
+	TestRing ring(0x8000);
+	ring.setConsumerIdle(1); // the host is idle, so each post rings the doorbell
+	int before = TestRing::doorbells.load();
+	RgfxRingWriter writer(ring.base(), ring.dataSize, RGFX_CONTROL_RING_ID, TestRing::doorbell,
+	                      nullptr);
+	RgfxIdSpace ids;
+	RgfxSerializer ser(writer, ids);
+
+	// Queue.
+	RgfxCreated q = ser.createQueue(0x20000, 0x30000, 0x1000, 0x1000, 2, 1);
+	CHECK(q.posted);
+	CHECK(q.obj_id == 1);
+	CHECK(q.seqno == 1); // the first message on the ring
+	auto qm = expectMessage<RgfxQueueCreate>(ring, RGFX_CMD_QUEUE_CREATE);
+	CHECK(qm.header.seqno == 1);
+	CHECK(qm.obj_id == 1);
+	CHECK(qm.submit_offset == 0x20000 && qm.complete_offset == 0x30000);
+	CHECK(qm.submit_data_size == 0x1000 && qm.complete_data_size == 0x1000);
+	CHECK(qm.priority == 2 && qm.vector == 1);
+
+	// Heap (device) and heap over host memory.
+	RgfxCreated h = ser.createHeap(0x10000, 0, 1 /*Placement*/, 4096);
+	CHECK(h.posted && (h.gpu_address % 4096) == 0);
+	auto hm = expectMessage<RgfxHeapCreate>(ring, RGFX_CMD_HEAP_CREATE);
+	CHECK(hm.obj_id == h.obj_id && hm.gpu_address == h.gpu_address);
+	CHECK(hm.size_bytes == 0x10000 && hm.heap_type == 1);
+
+	RgfxCreated hh = ser.createHeapOverHostMemory(0x2000, 0, 0, 0x40000);
+	CHECK(hh.posted);
+	auto hhm = expectMessage<RgfxHeapOverHostMemory>(ring, RGFX_CMD_HEAP_OVER_HOST_MEMORY);
+	CHECK(hhm.obj_id == hh.obj_id && hhm.region_offset == 0x40000 && hhm.size_bytes == 0x2000);
+
+	// Buffers: device, over host memory, at offset in a heap.
+	RgfxCreated b = ser.createBuffer(0x1000, 0);
+	CHECK(b.posted && b.gpu_address != 0);
+	auto bm = expectMessage<RgfxBufferCreate>(ring, RGFX_CMD_BUFFER_CREATE);
+	CHECK(bm.obj_id == b.obj_id && bm.gpu_address == b.gpu_address && bm.length == 0x1000);
+	CHECK(bm.reserved_2c == 0);
+
+	RgfxCreated bh = ser.createBufferOverHostMemory(0x800, 0, 0x50000);
+	CHECK(bh.posted);
+	auto bhm = expectMessage<RgfxBufferOverHostMemory>(ring, RGFX_CMD_BUFFER_OVER_HOST_MEMORY);
+	CHECK(bhm.obj_id == bh.obj_id && bhm.region_offset == 0x50000 && bhm.length == 0x800);
+
+	RgfxCreated bo = ser.createBufferAtOffset(h.obj_id, 0x100, 0x200, 0);
+	CHECK(bo.posted && bo.gpu_address == 0); // derived host-side from the heap
+	auto bom = expectMessage<RgfxBufferAtOffset>(ring, RGFX_CMD_BUFFER_AT_OFFSET);
+	CHECK(bom.obj_id == bo.obj_id && bom.heap_obj_id == h.obj_id);
+	CHECK(bom.offset == 0x100 && bom.length == 0x200);
+
+	// Textures: device-placed and heap-placed and from a buffer.
+	RgfxTextureDescriptor desc = {};
+	desc.pixel_format = 80; // MTLPixelFormatBGRA8Unorm
+	desc.texture_type = 2;  // MTLTextureType2D
+	desc.width = 1920;
+	desc.height = 1080;
+	desc.depth = 1;
+	desc.mipmap_level_count = 1;
+	desc.array_length = 1;
+	desc.sample_count = 1;
+	desc.usage = 4; // MTLTextureUsageRenderTarget
+
+	RgfxCreated t = ser.createTexture(desc);
+	CHECK(t.posted && t.resource_id != 0 && t.gpu_address != 0);
+	auto tm = expectMessage<RgfxTextureCreate>(ring, RGFX_CMD_TEXTURE_CREATE);
+	CHECK(tm.obj_id == t.obj_id && tm.resource_id == t.resource_id);
+	CHECK(tm.gpu_address == t.gpu_address && tm.heap_obj_id == 0);
+	CHECK(tm.desc.width == 1920 && tm.desc.height == 1080 && tm.desc.pixel_format == 80);
+
+	RgfxCreated th = ser.createTexture(desc, h.obj_id, 0x400);
+	CHECK(th.posted && th.gpu_address == 0); // heap-placed: no device address
+	auto thm = expectMessage<RgfxTextureCreate>(ring, RGFX_CMD_TEXTURE_CREATE);
+	CHECK(thm.heap_obj_id == h.obj_id && thm.heap_offset == 0x400);
+
+	RgfxCreated tb = ser.createTextureFromBuffer(b.obj_id, 0x10, 7680, desc);
+	CHECK(tb.posted);
+	auto tbm = expectMessage<RgfxTextureFromBuffer>(ring, RGFX_CMD_TEXTURE_FROM_BUFFER);
+	CHECK(tbm.buffer_obj_id == b.obj_id && tbm.offset == 0x10 && tbm.bytes_per_row == 7680);
+	CHECK(tbm.resource_id == tb.resource_id && tbm.desc.width == 1920);
+
+	// Sampler: the float clamps are stored as bits.
+	RgfxSamplerParams sp = {};
+	sp.min_filter = 1;
+	sp.mag_filter = 1;
+	sp.mip_filter = 1;
+	sp.max_anisotropy = 4;
+	sp.lod_min_clamp = 0.0f;
+	sp.lod_max_clamp = 7.5f;
+	sp.flags = 0x1;
+	RgfxCreated s = ser.createSampler(sp);
+	CHECK(s.posted);
+	auto sm = expectMessage<RgfxSamplerCreate>(ring, RGFX_CMD_SAMPLER_CREATE);
+	CHECK(sm.obj_id == s.obj_id && sm.max_anisotropy == 4 && sm.flags == 0x1);
+	float lodMax;
+	std::memcpy(&lodMax, &sm.lod_max_clamp_bits, 4);
+	CHECK(lodMax == 7.5f);
+
+	// Depth/stencil.
+	RgfxStencilDescriptor front = {};
+	front.stencil_compare = 7;
+	front.read_mask = 0xff;
+	front.write_mask = 0xff;
+	RgfxStencilDescriptor back = {};
+	RgfxCreated ds = ser.createDepthStencil(4 /*compare*/, true, front, back);
+	CHECK(ds.posted);
+	auto dsm = expectMessage<RgfxDepthStencilCreate>(ring, RGFX_CMD_DEPTH_STENCIL_CREATE);
+	CHECK(dsm.obj_id == ds.obj_id && dsm.depth_compare == 4 && dsm.depth_write_enabled == 1);
+	CHECK(dsm.front.stencil_compare == 7 && dsm.front.read_mask == 0xff);
+
+	// Sync objects.
+	RgfxCreated ev = ser.createEvent();
+	CHECK(ev.posted);
+	auto evm = expectMessage<RgfxObjectCreate>(ring, RGFX_CMD_EVENT_CREATE);
+	CHECK(evm.obj_id == ev.obj_id);
+
+	RgfxCreated fe = ser.createFence();
+	CHECK(fe.posted);
+	auto fem = expectMessage<RgfxObjectCreate>(ring, RGFX_CMD_FENCE_CREATE);
+	CHECK(fem.obj_id == fe.obj_id);
+
+	RgfxCreated se = ser.createSharedEvent(42);
+	CHECK(se.posted);
+	auto sem = expectMessage<RgfxSharedEventCreate>(ring, RGFX_CMD_SHARED_EVENT_CREATE);
+	CHECK(sem.obj_id == se.obj_id && sem.initial_value == 42);
+
+	// Destroy carries the id alone.
+	CHECK(ser.destroy(b.obj_id));
+	auto dm = expectMessage<RgfxObjectDestroy>(ring, RGFX_CMD_OBJECT_DESTROY);
+	CHECK(dm.obj_id == b.obj_id);
+
+	// The ring is now drained and every post rang the idle host's doorbell.
+	RgfxMsgHeader spare = {};
+	std::vector<uint8_t> none;
+	CHECK(!ring.next(&spare, &none));
+	CHECK(TestRing::doorbells.load() > before);
+}
+
+void test_library_message()
+{
+	TestRing ring(0x8000);
+	RgfxRingWriter writer(ring.base(), ring.dataSize, RGFX_CONTROL_RING_ID, nullptr, nullptr);
+	RgfxIdSpace ids;
+	RgfxSerializer ser(writer, ids);
+
+	const uint8_t air[6] = { 1, 2, 3, 4, 5, 6 };
+	RgfxCreated lib = ser.createLibrary(air, sizeof(air));
+	CHECK(lib.posted);
+
+	RgfxMsgHeader h = {};
+	std::vector<uint8_t> bytes;
+	CHECK(ring.next(&h, &bytes));
+	CHECK(h.type == RGFX_CMD_LIBRARY_CREATE);
+	// header struct (32) + 6 bytes, rounded up to a multiple of 8 = 40.
+	CHECK(h.size == 40);
+	RgfxLibraryCreate head;
+	std::memcpy(&head, bytes.data(), sizeof(head));
+	CHECK(head.obj_id == lib.obj_id && head.byte_length == 6);
+	CHECK(std::memcmp(bytes.data() + RGFX_LIBRARY_BYTES_OFFSET, air, sizeof(air)) == 0);
+
+	// A library larger than the ring cannot be posted in one message.
+	std::vector<uint8_t> huge(ring.dataSize, 0xcc);
+	RgfxCreated big = ser.createLibrary(huge.data(), huge.size());
+	CHECK(!big.posted);
+}
+
+void test_ring_wrap_and_no_room()
+{
+	// A small ring so a message must pad to the end and wrap.
+	const uint32_t kData = 256;
+	TestRing ring(kData);
+	RgfxRingWriter writer(ring.base(), kData, RGFX_CONTROL_RING_ID, nullptr, nullptr);
+	RgfxIdSpace ids;
+	RgfxSerializer ser(writer, ids);
+
+	// Each OBJECT_DESTROY is 24 bytes. Post and drain to push the producer near
+	// the ring's end, then post one that must pad over the tail.
+	for (int i = 0; i < 10; i++) {
+		CHECK(ser.destroy(100 + i));
+		auto m = expectMessage<RgfxObjectDestroy>(ring, RGFX_CMD_OBJECT_DESTROY);
+		CHECK(m.obj_id == static_cast<uint64_t>(100 + i));
+	}
+	// 10 * 24 = 240; 16 bytes to the end. The next 24-byte message pads and wraps.
+	CHECK(ser.destroy(999));
+	auto wrapped = expectMessage<RgfxObjectDestroy>(ring, RGFX_CMD_OBJECT_DESTROY);
+	CHECK(wrapped.obj_id == 999);
+
+	// Fill the ring without draining until a post finds no room.
+	TestRing full(kData);
+	RgfxRingWriter fw(full.base(), kData, RGFX_CONTROL_RING_ID, nullptr, nullptr);
+	RgfxIdSpace fids;
+	RgfxSerializer fser(fw, fids);
+	int posted = 0;
+	bool hitNoRoom = false;
+	for (int i = 0; i < 100; i++) {
+		if (fser.destroy(i)) {
+			posted++;
+		} else {
+			hitNoRoom = true;
+			break;
+		}
+	}
+	CHECK(hitNoRoom);
+	CHECK(posted == static_cast<int>(kData / sizeof(RgfxObjectDestroy))); // 256/24 = 10
+}
+
+} // namespace
+
+int main()
+{
+	test_id_space();
+	test_caps();
+	test_lifecycle_messages();
+	test_library_message();
+	test_ring_wrap_and_no_room();
+	std::printf("serializer_tests: OK (%d checks)\n", g_checks);
+	return 0;
+}
