@@ -26,7 +26,7 @@ use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSArray;
 use objc2_metal::{
     MTLArgumentDescriptor, MTLArgumentEncoder, MTLArrayType, MTLBindingAccess, MTLDataType,
-    MTLDevice, MTLFunction, MTLResourceOptions, MTLStructType, MTLTextureType,
+    MTLDevice, MTLFunction, MTLPointerType, MTLResourceOptions, MTLStructType, MTLTextureType,
 };
 use reims_vgpu_core::num::{ToU64, ToUsize};
 use reims_vgpu_core::platform::types::{ArgumentKind, ArgumentLayout, ArgumentMember};
@@ -34,6 +34,7 @@ use reims_vgpu_core::platform::values::ArgumentDesc;
 use reims_vgpu_core::raise::RaiseResult;
 
 use crate::msg::{self, Policy};
+use crate::spi::methods::FunctionSpi;
 
 /// Bytes of every argument that is no constant: an address or a resource ID.
 const WORD: u64 = 8;
@@ -50,17 +51,29 @@ pub(crate) fn of_descriptors(
     let descriptors: Vec<Retained<MTLArgumentDescriptor>> = arguments
         .iter()
         .map(|a| {
-            let d = MTLArgumentDescriptor::new();
-            d.setDataType(MTLDataType(a.data_type.to_usize()));
-            d.setIndex(a.index.to_usize());
-            d.setArrayLength(a.array_length.to_usize());
-            d.setAccess(MTLBindingAccess(a.access.to_usize()));
-            d.setTextureType(MTLTextureType(a.texture_type.to_usize()));
-            d.setConstantBlockAlignment(a.constant_block_alignment.to_usize());
+            let d = msg::get("new", MTLArgumentDescriptor::new);
+            msg::get("setDataType:", || {
+                d.setDataType(MTLDataType(a.data_type.to_usize()))
+            });
+            msg::get("setIndex:", || d.setIndex(a.index.to_usize()));
+            msg::get("setArrayLength:", || {
+                d.setArrayLength(a.array_length.to_usize())
+            });
+            msg::get("setAccess:", || {
+                d.setAccess(MTLBindingAccess(a.access.to_usize()))
+            });
+            msg::get("setTextureType:", || {
+                d.setTextureType(MTLTextureType(a.texture_type.to_usize()))
+            });
+            msg::get("setConstantBlockAlignment:", || {
+                d.setConstantBlockAlignment(a.constant_block_alignment.to_usize())
+            });
             d
         })
         .collect();
-    let array = NSArray::from_retained_slice(&descriptors);
+    let array = msg::value("arrayWithObjects:count:", || {
+        NSArray::from_retained_slice(&descriptors)
+    });
     let Some(encoder) = msg::send("newArgumentEncoderWithArguments:", Policy::Caught, || {
         device.newArgumentEncoderWithArguments(&array)
     })?
@@ -95,8 +108,8 @@ pub(crate) fn of_descriptors(
         });
     }
     Ok(Some(ArgumentLayout {
-        encoded_length: encoder.encodedLength().to_u64(),
-        alignment: encoder.alignment().to_u64(),
+        encoded_length: msg::get("encodedLength", || encoder.encodedLength()).to_u64(),
+        alignment: msg::get("alignment", || encoder.alignment()).to_u64(),
         members,
     }))
 }
@@ -113,26 +126,18 @@ pub(crate) fn of_function(
     buffer_index: u64,
 ) -> RaiseResult<Option<ArgumentLayout>> {
     let mut reflection = None;
-    let encoder: Option<Retained<ProtocolObject<dyn MTLArgumentEncoder>>> = msg::send(
+    let encoder = msg::send(
         "newArgumentEncoderWithBufferIndex:reflection:",
         Policy::Caught,
         || {
-            // SAFETY: a plain send of the documented selector; the reflection out-parameter is
-            // an autoreleased object or nil, and a nil encoder is answered as `None`.
-            unsafe {
-                objc2::msg_send![
-                    function,
-                    newArgumentEncoderWithBufferIndex: buffer_index.to_usize(),
-                    reflection: &mut reflection
-                ]
-            }
+            function
+                .newArgumentEncoderWithBufferIndex_reflection_or_nil(buffer_index, &mut reflection)
         },
     )?;
     let (Some(encoder), Some(reflection)) = (encoder, reflection) else {
         return Ok(None);
     };
-    let reflection: Retained<objc2_metal::MTLArgument> = reflection;
-    let Some(st) = reflection.bufferStructType() else {
+    let Some(st) = msg::get("bufferStructType", || reflection.bufferStructType()) else {
         return Ok(None);
     };
     of_struct(&encoder, &st, 0)
@@ -148,8 +153,8 @@ fn of_struct(
         return Ok(None);
     };
     Ok(Some(ArgumentLayout {
-        encoded_length: encoder.encodedLength().to_u64(),
-        alignment: encoder.alignment().to_u64(),
+        encoded_length: msg::get("encodedLength", || encoder.encodedLength()).to_u64(),
+        alignment: msg::get("alignment", || encoder.alignment()).to_u64(),
         members,
     }))
 }
@@ -166,14 +171,14 @@ fn members(
         return Ok(None);
     }
     let mut out = Vec::new();
-    for m in st.members() {
-        let Ok(id) = u32::try_from(m.argumentIndex()) else {
+    for m in msg::get("members", || st.members().to_vec()) {
+        let Ok(id) = u32::try_from(msg::get("argumentIndex", || m.argumentIndex())) else {
             return Ok(None);
         };
-        let offset = m.offset().to_u64();
-        let data_type = m.dataType();
+        let offset = msg::get("offset", || m.offset()).to_u64();
+        let data_type = msg::get("dataType", || m.dataType());
         let member = if data_type == MTLDataType::Array {
-            let Some(at) = m.arrayType() else {
+            let Some(at) = msg::get("arrayType", || m.arrayType()) else {
                 return Ok(None);
             };
             let Some(member) = array_member(encoder, &at, id, offset, depth)? else {
@@ -181,7 +186,7 @@ fn members(
             };
             member
         } else if data_type == MTLDataType::Struct {
-            let Some(inner) = m.structType() else {
+            let Some(inner) = msg::get("structType", || m.structType()) else {
                 return Ok(None);
             };
             let Some(layout) = struct_element(&inner, 0, depth)? else {
@@ -199,13 +204,9 @@ fn members(
                 layout: Some(Box::new(layout)),
             }
         } else if data_type == MTLDataType::Pointer {
-            let nested = match (encoder, m.pointerType()) {
-                (Some(encoder), Some(pt)) if pt.elementIsArgumentBuffer() => {
-                    match pt.elementStructType() {
-                        Some(inner) => nested(encoder, id, &inner, depth)?,
-                        None => None,
-                    }
-                }
+            let pointer = msg::get("pointerType", || m.pointerType());
+            let nested = match (encoder, pointer) {
+                (Some(encoder), Some(pt)) => nested_of_pointer(encoder, id, &pt, depth)?,
                 _ => None,
             };
             ArgumentMember {
@@ -246,15 +247,15 @@ fn array_member(
     depth: u32,
 ) -> RaiseResult<Option<ArgumentMember>> {
     let (Ok(count), Ok(ids)) = (
-        u32::try_from(at.arrayLength()),
-        u32::try_from(at.argumentIndexStride()),
+        u32::try_from(msg::get("arrayLength", || at.arrayLength())),
+        u32::try_from(msg::get("argumentIndexStride", || at.argumentIndexStride())),
     ) else {
         return Ok(None);
     };
-    let stride = at.stride().to_u64();
-    let element = at.elementType();
+    let stride = msg::get("stride", || at.stride()).to_u64();
+    let element = msg::get("elementType", || at.elementType());
     let (kind, size, layout) = if element == MTLDataType::Struct {
-        let Some(inner) = at.elementStructType() else {
+        let Some(inner) = msg::get("elementStructType", || at.elementStructType()) else {
             return Ok(None);
         };
         let Some(layout) = struct_element(&inner, stride, depth)? else {
@@ -262,13 +263,9 @@ fn array_member(
         };
         (ArgumentKind::Struct, stride, Some(Box::new(layout)))
     } else if element == MTLDataType::Pointer {
-        let nested = match (encoder, at.elementPointerType()) {
-            (Some(encoder), Some(pt)) if pt.elementIsArgumentBuffer() => {
-                match pt.elementStructType() {
-                    Some(inner) => nested(encoder, id, &inner, depth)?,
-                    None => None,
-                }
-            }
+        let pointer = msg::get("elementPointerType", || at.elementPointerType());
+        let nested = match (encoder, pointer) {
+            (Some(encoder), Some(pt)) => nested_of_pointer(encoder, id, &pt, depth)?,
             _ => None,
         };
         (ArgumentKind::Buffer, WORD, nested.map(Box::new))
@@ -323,6 +320,23 @@ fn struct_element(
     }))
 }
 
+/// The layout of the argument buffer the pointer `pt` at argument index `id` of `encoder` points
+/// to; `None` where it points to no argument buffer, or to one of no reflected struct.
+fn nested_of_pointer(
+    encoder: &ProtocolObject<dyn MTLArgumentEncoder>,
+    id: u32,
+    pt: &MTLPointerType,
+    depth: u32,
+) -> RaiseResult<Option<ArgumentLayout>> {
+    if !msg::get("elementIsArgumentBuffer", || pt.elementIsArgumentBuffer()) {
+        return Ok(None);
+    }
+    match msg::get("elementStructType", || pt.elementStructType()) {
+        Some(inner) => nested(encoder, id, &inner, depth),
+        None => Ok(None),
+    }
+}
+
 /// The layout of the argument buffer the pointer at argument index `id` of `encoder` points to,
 /// whose arguments `st` reflects.
 fn nested(
@@ -370,7 +384,7 @@ impl Offsets {
         device: &ProtocolObject<dyn MTLDevice>,
         encoder: &ProtocolObject<dyn MTLArgumentEncoder>,
     ) -> RaiseResult<Option<Offsets>> {
-        let length = encoder.encodedLength().max(WORD.to_usize());
+        let length = msg::get("encodedLength", || encoder.encodedLength()).max(WORD.to_usize());
         let Some(buffer) = msg::send("newBufferWithLength:options:", Policy::Caught, || {
             device.newBufferWithLength_options(length, MTLResourceOptions::StorageModeShared)
         })?
@@ -382,7 +396,8 @@ impl Offsets {
             // `constantDataAtIndex:` sent over it (it lives in `Offsets`).
             unsafe { encoder.setArgumentBuffer_offset(Some(&buffer), 0) }
         })?;
-        let base = objc2_metal::MTLBuffer::contents(&*buffer).as_ptr() as usize;
+        let base =
+            msg::get("contents", || objc2_metal::MTLBuffer::contents(&*buffer)).as_ptr() as usize;
         Ok(Some(Offsets { buffer, base }))
     }
 

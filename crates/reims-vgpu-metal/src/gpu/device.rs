@@ -1130,12 +1130,7 @@ fn read_identity_caps(device: &MetalDevice) -> IdentityCaps {
     let placement_sparse = msg::get("respondsToSelector:", || {
         d.respondsToSelector(sel!(supportsPlacementSparse))
     })
-    .then(|| {
-        // SAFETY: the device responds to the getter, whose answer is a `BOOL`.
-        msg::get("supportsPlacementSparse", || unsafe {
-            objc2::msg_send![d, supportsPlacementSparse]
-        })
-    });
+    .then(|| msg::get("supportsPlacementSparse", || d.supportsPlacementSparse()));
     IdentityCaps {
         families: SDK_FAMILIES.map(|family| {
             // `NSInteger` is `i64` on arm64: lossless.
