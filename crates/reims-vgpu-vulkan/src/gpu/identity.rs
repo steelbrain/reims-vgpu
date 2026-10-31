@@ -240,10 +240,9 @@ mod tests {
     fn a_family_claims_the_families_it_contains() {
         let mut families = [false; 20];
         families[at(1009)] = true;
-        let closed = closed(families);
         let claimed: Vec<i64> = SDK_FAMILIES
             .iter()
-            .zip(closed)
+            .zip(closed(families))
             .filter_map(|(&f, yes)| yes.then_some(f))
             .collect();
         assert_eq!(
