@@ -37,11 +37,12 @@ use reims_vgpu_core::platform::caps::{
 };
 use reims_vgpu_core::platform::device::{FunctionResolver, GpuDevice, NoCopyDeallocator};
 use reims_vgpu_core::platform::types::{
-    MtlSize, NsErrorText, PixelFormatInfo, ResourceAddressRange, SizeAndAlign, TextureLevelInfo,
-    TextureLevelQuery,
+    ArgumentLayout, MtlSize, NsErrorText, PixelFormatInfo, ResourceAddressRange, SizeAndAlign,
+    TextureLevelInfo, TextureLevelQuery,
 };
 use reims_vgpu_core::platform::values::{
-    BufferDesc, DepthStencilDesc, HeapDesc, HeapMade, IcbDesc, RenderPipelineDesc, SamplerDesc,
+    ArgumentDesc, BufferDesc, DepthStencilDesc, HeapDesc, HeapMade, IcbDesc, RenderPipelineDesc,
+    SamplerDesc,
 };
 use reims_vgpu_core::raise::death::DeathKind;
 use reims_vgpu_core::raise::{Kept, keep_forever};
@@ -291,6 +292,20 @@ impl GpuDevice<MetalPlatform> for MetalDevice {
         msg::get("allowLibrariesFromOtherPlatforms", || {
             d.allowLibrariesFromOtherPlatforms()
         });
+    }
+
+    /// Read off the encoder Metal makes ([`super::argument`]).
+    fn argument_layout(&self, arguments: &[ArgumentDesc]) -> RaiseResult<Option<ArgumentLayout>> {
+        super::argument::of_descriptors(self.get(), arguments)
+    }
+
+    /// Read off the encoder Metal makes, and its reflection ([`super::argument`]).
+    fn function_argument_layout(
+        &self,
+        function: &MetalFunction,
+        buffer_index: u64,
+    ) -> RaiseResult<Option<ArgumentLayout>> {
+        super::argument::of_function(function, buffer_index)
     }
 
     fn heap_texture_size_and_align(

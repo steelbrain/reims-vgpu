@@ -79,7 +79,7 @@ const CI_KERNEL: [&str; 6] = ["metal", "-fcikernel", "-x", "metal", "-c", "-"];
 const CI_KERNEL_LIBRARY: [&str; 2] = ["metallib", "-cikernel"];
 
 /// The tests' metallibs of one source each, `src/gpu/<name>.metal`.
-const TEST_LIBRARIES: [&str; 19] = [
+const TEST_LIBRARIES: [&str; 20] = [
     "predication",
     "no_draw",
     "icb_encode",
@@ -99,6 +99,7 @@ const TEST_LIBRARIES: [&str; 19] = [
     "spin",
     "rgbx",
     "tile_edges",
+    "argument_probe",
 ];
 
 /// The files [`imports`] makes.

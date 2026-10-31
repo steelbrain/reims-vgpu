@@ -33,12 +33,12 @@ use reims_vgpu_core::platform::caps::{DeviceCaps, IdentityCaps};
 use reims_vgpu_core::platform::device::{FunctionResolver, GpuDevice, NoCopyDeallocator};
 use reims_vgpu_core::platform::os::vm::HostVm;
 use reims_vgpu_core::platform::types::{
-    NsErrorText, PixelFormatInfo, ResourceAddressRange, SizeAndAlign, TextureLevelInfo,
-    TextureLevelQuery,
+    ArgumentKind, ArgumentLayout, ArgumentMember, NsErrorText, PixelFormatInfo,
+    ResourceAddressRange, SizeAndAlign, TextureLevelInfo, TextureLevelQuery,
 };
 use reims_vgpu_core::platform::values::{
-    BufferDeallocator, BufferDesc, DepthStencilDesc, HeapDesc, HeapMade, IcbDesc, OptionSet,
-    RenderPipelineDesc, SamplerDesc,
+    ArgumentDesc, BufferDeallocator, BufferDesc, DepthStencilDesc, HeapDesc, HeapMade, IcbDesc,
+    OptionSet, RenderPipelineDesc, SamplerDesc,
 };
 use reims_vgpu_core::platform::{Handle, HostRange};
 use reims_vgpu_core::raise::{Kept, OnFault, RaiseResult, keep_forever};
@@ -71,6 +71,48 @@ use crate::gpu::serialized;
 use crate::gpu::timing;
 use crate::os::{OsSurface, OsVm};
 use crate::platform::{Obj, VulkanPlatform};
+
+/// Core's layout of the runtime's `layout`, nested layouts with it.
+fn layout_of(layout: &metal2vulkan::bind::ArgumentBufferLayout) -> ArgumentLayout {
+    ArgumentLayout {
+        encoded_length: layout.encoded_length,
+        alignment: layout.alignment,
+        members: layout
+            .members
+            .iter()
+            .map(|m| ArgumentMember {
+                id: m.id,
+                count: m.count,
+                ids_per_element: m.ids_per_element,
+                offset: m.offset,
+                stride: m.stride,
+                size: m.size,
+                kind: argument_kind(m.ty),
+                layout: m.layout.as_deref().map(|l| Box::new(layout_of(l))),
+            })
+            .collect(),
+    }
+}
+
+/// Core's kind of the runtime's argument type.
+fn argument_kind(ty: metal2vulkan::bind::ArgumentType) -> ArgumentKind {
+    use metal2vulkan::bind::ArgumentType as T;
+    match ty {
+        T::Buffer => ArgumentKind::Buffer,
+        T::Texture => ArgumentKind::Texture,
+        T::Sampler => ArgumentKind::Sampler,
+        T::Constant => ArgumentKind::Constant,
+        T::IndirectCommandBuffer => ArgumentKind::IndirectCommandBuffer,
+        T::ComputePipelineState => ArgumentKind::ComputePipelineState,
+        T::RenderPipelineState => ArgumentKind::RenderPipelineState,
+        T::VisibleFunctionTable => ArgumentKind::VisibleFunctionTable,
+        T::IntersectionFunctionTable => ArgumentKind::IntersectionFunctionTable,
+        T::AccelerationStructure => ArgumentKind::AccelerationStructure,
+        T::DepthStencilState => ArgumentKind::DepthStencilState,
+        T::Struct => ArgumentKind::Struct,
+        _ => ArgumentKind::Constant,
+    }
+}
 
 /// `newTextureWithDescriptor:iosurface:plane:`'s debug line ([the module docs](self)): the
 /// selector; the descriptor's pixel format, raw and by Metal's name; the plane asked for; the
@@ -734,6 +776,68 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
     /// built for (`newLibraryWithData:error:` checks no platform).
     fn allow_foreign_libraries(&self) {
         plain(|| ());
+    }
+
+    /// The runtime's encoder's layout (`ArgumentEncoder::layout`), Metal's rules for descriptors
+    /// as the runtime measured them. A descriptor of a data type, access or texture type the
+    /// runtime has no enumerator of answers nil, as one of a type no argument has; what the
+    /// runtime refuses as Metal raises (no arguments, a misplaced constant block alignment) is the
+    /// caller's to catch.
+    fn argument_layout(&self, arguments: &[ArgumentDesc]) -> RaiseResult<Option<ArgumentLayout>> {
+        let sel = "newArgumentEncoderWithArguments:";
+        let mut descriptors = Vec::with_capacity(arguments.len());
+        for a in arguments {
+            let (
+                Some(data_type),
+                Some(access),
+                Some(texture_type),
+                Ok(index),
+                Ok(array_length),
+                Ok(alignment),
+            ) = (
+                u32::try_from(a.data_type)
+                    .ok()
+                    .and_then(|raw| metal2vulkan::metal::DataType::try_from(raw).ok()),
+                u32::try_from(a.access)
+                    .ok()
+                    .and_then(|raw| metal2vulkan::metal::BindingAccess::try_from(raw).ok()),
+                crate::gpu::runtime_texture_type(a.texture_type),
+                u32::try_from(a.index),
+                u32::try_from(a.array_length),
+                u32::try_from(a.constant_block_alignment),
+            )
+            else {
+                return Ok(None);
+            };
+            let mut d = metal2vulkan::bind::ArgumentDescriptor::new(data_type, index);
+            d.array_length = array_length;
+            d.access = access;
+            d.texture_type = texture_type;
+            d.constant_block_alignment = alignment;
+            descriptors.push(d);
+        }
+        let encoder = create(sel, Policy::Caught, Nil::Never, || {
+            self.raw.new_argument_encoder_with_arguments(&descriptors)
+        })?;
+        Ok(encoder.map(|e| layout_of(e.layout())))
+    }
+
+    /// The runtime's encoder of the function's argument buffer, laid out as its AIR lays it out,
+    /// nested argument buffers with it. No argument buffer at the index is the caller's to catch,
+    /// as Metal raises.
+    fn function_argument_layout(
+        &self,
+        function: &VulkanFunction,
+        buffer_index: u64,
+    ) -> RaiseResult<Option<ArgumentLayout>> {
+        let sel = "newArgumentEncoderWithBufferIndex:";
+        let Ok(index) = u32::try_from(buffer_index) else {
+            return Ok(None);
+        };
+        let encoder = create(sel, Policy::Caught, Nil::Never, || {
+            function.new_argument_encoder_with_buffer_index(index)
+        })?;
+        Ok(encoder.map(|e| layout_of(e.layout())))
     }
 
     /// The runtime's answer, Metal's but for a depth or stencil texture with
@@ -1902,6 +2006,75 @@ pub(crate) mod tests {
     /// The system default device (MoltenVK on the suite's host).
     pub(crate) fn dev() -> VulkanDevice {
         DEVICE.clone_ref()
+    }
+
+    /// Descriptors and a function's argument buffer are laid out as the Metal platform's own
+    /// encoder lays them out (`reims-vgpu-metal`'s `gpu::argument` tests, measured on the M3 Max,
+    /// with the same descriptors and the same probe kernel): the runtime's layout, Metal's
+    /// rules, reaches the guest unchanged
+    #[test]
+    fn argument_layouts_are_metals() {
+        use reims_vgpu_core::platform::resource::Library as _;
+        use reims_vgpu_core::platform::types::ArgumentKind as K;
+        let d = dev();
+        let arg = |data_type: u64, index: u64, array_length: u64| ArgumentDesc {
+            data_type,
+            index,
+            array_length,
+            texture_type: 2,
+            ..ArgumentDesc::default()
+        };
+        let layout = d
+            .argument_layout(&[arg(58, 0, 0), arg(60, 1, 4), arg(6, 5, 0), arg(3, 6, 0)])
+            .unwrap()
+            .unwrap();
+        let got: Vec<_> = layout
+            .members
+            .iter()
+            .map(|m| (m.id, m.count, m.offset, m.stride, m.size, m.kind))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (0, 1, 0, 8, 8, K::Texture),
+                (1, 4, 8, 8, 8, K::Buffer),
+                (5, 1, 48, 16, 16, K::Constant),
+                (6, 1, 64, 4, 4, K::Constant),
+            ]
+        );
+        assert_eq!((layout.encoded_length, layout.alignment), (80, 16));
+
+        const PROBE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/argument_probe.metallib"));
+        let library = d.new_library(PROBE).unwrap().unwrap().unwrap();
+        let function = library
+            .new_function(OnFault::Die, "reims_vgpu_argument_probe")
+            .unwrap()
+            .unwrap();
+        let layout = d.function_argument_layout(&function, 0).unwrap().unwrap();
+        let got: Vec<_> = layout
+            .members
+            .iter()
+            .map(|m| (m.id, m.offset, m.kind, m.layout.is_some()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (0, 0, K::Texture, false),
+                (1, 8, K::Buffer, true),
+                (2, 16, K::Sampler, false),
+                (3, 32, K::Constant, false),
+                (4, 48, K::Buffer, false),
+            ]
+        );
+        assert_eq!((layout.encoded_length, layout.alignment), (64, 16));
+        let inner = layout.members[1].layout.as_ref().unwrap();
+        let got: Vec<_> = inner
+            .members
+            .iter()
+            .map(|m| (m.id, m.offset, m.kind))
+            .collect();
+        assert_eq!(got, [(0, 0, K::Texture), (1, 8, K::Sampler)]);
+        assert_eq!(inner.encoded_length, 16);
     }
 
     /// The crate's directory, which cargo and nextest give a test process: read at run time, so

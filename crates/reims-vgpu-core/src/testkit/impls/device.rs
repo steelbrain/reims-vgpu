@@ -23,11 +23,12 @@ use crate::platform::caps::{
 };
 use crate::platform::device::*;
 use crate::platform::types::{
-    MtlSize, NsErrorText, PixelFormatInfo, SizeAndAlign, TextureLevelInfo, TextureLevelQuery,
+    ArgumentKind, ArgumentLayout, ArgumentMember, MtlSize, NsErrorText, PixelFormatInfo,
+    SizeAndAlign, TextureLevelInfo, TextureLevelQuery,
 };
 use crate::platform::values::{
-    BufferDesc, DepthStencilDesc, HeapDesc, HeapMade, IcbDesc, OptionSet, RenderPipelineDesc,
-    SamplerDesc,
+    ArgumentDesc, BufferDesc, DepthStencilDesc, HeapDesc, HeapMade, IcbDesc, OptionSet,
+    RenderPipelineDesc, SamplerDesc,
 };
 use crate::platform::{Handle, HostRange, Platform};
 use crate::raise::{OnFault, RaiseResult};
@@ -52,6 +53,36 @@ impl Default for DeviceModel {
 impl GpuDevice<FakePlatform> for Fk<kind::Device> {
     fn allow_foreign_libraries(&self) {
         fatal(self.act(Policy::Fatal, "allowLibrariesFromOtherPlatforms", vec![]));
+    }
+
+    /// The fake's layout: each argument's elements in turn, 8 bytes each, in the order given;
+    /// `None` for no arguments.
+    fn argument_layout(&self, arguments: &[ArgumentDesc]) -> RaiseResult<Option<ArgumentLayout>> {
+        let shown: Vec<(u64, u64, u64)> = arguments
+            .iter()
+            .map(|a| (a.data_type, a.index, a.array_length))
+            .collect();
+        self.thr(
+            Policy::Caught,
+            "newArgumentEncoderWithArguments:",
+            vec![Arg::val(&shown)],
+            || fake_argument_layout(arguments),
+        )
+    }
+
+    /// The fake's layout of buffer index 0 of any function: a texture at index 0, then a
+    /// pointer at index 1 to an argument buffer of one sampler; `None` at every other index.
+    fn function_argument_layout(
+        &self,
+        function: &<FakePlatform as Platform>::Function,
+        buffer_index: u64,
+    ) -> RaiseResult<Option<ArgumentLayout>> {
+        self.thr(
+            Policy::Caught,
+            "newArgumentEncoderWithBufferIndex:",
+            vec![Arg::obj(function), Arg::val(&buffer_index)],
+            || (buffer_index == 0).then(fake_function_layout),
+        )
     }
 
     fn heap_texture_size_and_align(
@@ -900,5 +931,91 @@ pub fn fake_identity_caps() -> IdentityCaps {
             supports_primitive_motion_blur: Some(true),
             supports_placement_sparse: Some(true),
         },
+    }
+}
+
+/// [`GpuDevice::argument_layout`]'s fake answer (its doc).
+fn fake_argument_layout(arguments: &[ArgumentDesc]) -> Option<ArgumentLayout> {
+    if arguments.is_empty() {
+        return None;
+    }
+    let mut members = Vec::with_capacity(arguments.len());
+    let mut offset = 0u64;
+    for a in arguments {
+        let count = a.array_length.max(1);
+        members.push(ArgumentMember {
+            id: u32::try_from(a.index).ok()?,
+            count: u32::try_from(count).ok()?,
+            ids_per_element: 1,
+            offset,
+            stride: 8,
+            size: 8,
+            kind: fake_kind(a.data_type),
+            layout: None,
+        });
+        offset = offset.checked_add(count.checked_mul(8)?)?;
+    }
+    Some(ArgumentLayout {
+        encoded_length: offset,
+        alignment: 8,
+        members,
+    })
+}
+
+/// The kind of `MTLDataType` `data_type`: Pointer, Texture, Sampler, the two pipeline states and
+/// the indirect command buffer by their raw values, the rest constants.
+fn fake_kind(data_type: u64) -> ArgumentKind {
+    match data_type {
+        60 => ArgumentKind::Buffer,
+        58 => ArgumentKind::Texture,
+        59 => ArgumentKind::Sampler,
+        78 => ArgumentKind::RenderPipelineState,
+        79 => ArgumentKind::ComputePipelineState,
+        80 => ArgumentKind::IndirectCommandBuffer,
+        _ => ArgumentKind::Constant,
+    }
+}
+
+/// [`GpuDevice::function_argument_layout`]'s fake answer at buffer index 0.
+fn fake_function_layout() -> ArgumentLayout {
+    let nested = ArgumentLayout {
+        encoded_length: 8,
+        alignment: 8,
+        members: vec![ArgumentMember {
+            id: 0,
+            count: 1,
+            ids_per_element: 1,
+            offset: 0,
+            stride: 8,
+            size: 8,
+            kind: ArgumentKind::Sampler,
+            layout: None,
+        }],
+    };
+    ArgumentLayout {
+        encoded_length: 16,
+        alignment: 8,
+        members: vec![
+            ArgumentMember {
+                id: 0,
+                count: 1,
+                ids_per_element: 1,
+                offset: 0,
+                stride: 8,
+                size: 8,
+                kind: ArgumentKind::Texture,
+                layout: None,
+            },
+            ArgumentMember {
+                id: 1,
+                count: 1,
+                ids_per_element: 1,
+                offset: 8,
+                stride: 8,
+                size: 8,
+                kind: ArgumentKind::Buffer,
+                layout: Some(Box::new(nested)),
+            },
+        ],
     }
 }

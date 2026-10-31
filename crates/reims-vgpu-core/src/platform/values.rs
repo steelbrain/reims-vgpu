@@ -31,6 +31,24 @@ pub enum OptionSet {
     HazardTrackingMode(u64),
 }
 
+/// One `MTLArgumentDescriptor` of `newArgumentEncoderWithArguments:`, as a value: each field is
+/// its Metal raw value, sent with its setter in field order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct ArgumentDesc {
+    /// `setDataType:` (`MTLDataType`).
+    pub data_type: u64,
+    /// `setIndex:`.
+    pub index: u64,
+    /// `setArrayLength:`.
+    pub array_length: u64,
+    /// `setAccess:` (`MTLBindingAccess`).
+    pub access: u64,
+    /// `setTextureType:` (`MTLTextureType`).
+    pub texture_type: u64,
+    /// `setConstantBlockAlignment:`.
+    pub constant_block_alignment: u64,
+}
+
 /// The block Metal calls once, with the contents and the length, when a buffer made from a
 /// [`BufferDesc`] is released.
 pub type BufferDeallocator = Box<dyn FnOnce(HostPtr, u64) + Send>;

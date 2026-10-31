@@ -92,6 +92,73 @@ pub struct SizeAndAlign {
     pub align: u64,
 }
 
+/// What one argument of an argument buffer holds ([`ArgumentMember::kind`]): every kind but
+/// [`Constant`](Self::Constant) and [`Struct`](Self::Struct) is an 8-byte word, little endian, a
+/// buffer's GPU address plus its offset or another object's `gpuResourceID`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ArgumentKind {
+    /// A buffer's address (`setBuffer:offset:atIndex:`); a pointer to a nested argument buffer
+    /// where the member has a layout.
+    Buffer,
+    /// A texture's resource ID.
+    Texture,
+    /// A sampler state's resource ID.
+    Sampler,
+    /// Plain bytes (`constantDataAtIndex:`).
+    Constant,
+    /// An indirect command buffer's resource ID.
+    IndirectCommandBuffer,
+    /// A compute pipeline state's resource ID.
+    ComputePipelineState,
+    /// A render pipeline state's resource ID.
+    RenderPipelineState,
+    /// A visible function table's resource ID.
+    VisibleFunctionTable,
+    /// An intersection function table's resource ID.
+    IntersectionFunctionTable,
+    /// An acceleration structure's resource ID.
+    AccelerationStructure,
+    /// A depth/stencil state.
+    DepthStencilState,
+    /// A struct of arguments, laid out as its member's layout says.
+    Struct,
+}
+
+/// One member of an [`ArgumentLayout`]: an argument, or an array of them.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ArgumentMember {
+    /// The argument index (`[[id(n)]]`) of element 0.
+    pub id: u32,
+    /// Elements: 1 for a single argument.
+    pub count: u32,
+    /// Argument indices each element takes: 1, or a struct's span.
+    pub ids_per_element: u32,
+    /// Byte offset of element 0 in the argument buffer.
+    pub offset: u64,
+    /// Bytes from one element to the next.
+    pub stride: u64,
+    /// Bytes of one element.
+    pub size: u64,
+    /// What the member holds.
+    pub kind: ArgumentKind,
+    /// For a [`ArgumentKind::Buffer`] that points to an argument buffer, that buffer's layout
+    /// (`newArgumentEncoderForBufferAtIndex:`); for a [`ArgumentKind::Struct`], one element's,
+    /// at indices and offsets from the element's. `None` otherwise.
+    pub layout: Option<Box<ArgumentLayout>>,
+}
+
+/// The layout of one argument buffer, as an `MTLArgumentEncoder` writes it: its length, its
+/// alignment, and where each argument index lands.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+pub struct ArgumentLayout {
+    /// `encodedLength`.
+    pub encoded_length: u64,
+    /// `alignment`.
+    pub alignment: u64,
+    /// The members, in layout order. An index two members hold lands in the later one.
+    pub members: Vec<ArgumentMember>,
+}
+
 /// `MTLClearColor` (`{?=dddd}`).
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 #[repr(C)]

@@ -31,7 +31,7 @@ use std::sync::{Arc, OnceLock};
 use reims_graphics::ops::RgfxCommandBuffer;
 use reims_graphics::region::Region;
 use reims_graphics::wire::{
-    RGFX_CMD_COMMAND_BUFFER, RGFX_CMD_COMPUTE_PIPELINE_CREATE,
+    RGFX_CMD_ARGUMENT_LAYOUT, RGFX_CMD_COMMAND_BUFFER, RGFX_CMD_COMPUTE_PIPELINE_CREATE,
     RGFX_CMD_HEAP_TEXTURE_SIZE_AND_ALIGN, RGFX_CMD_LIBRARY_CREATE, RGFX_CMD_LIBRARY_FROM_REGION,
     RGFX_CMD_LIBRARY_LOOKUP, RGFX_CMD_OBJECT_DESTROY, RGFX_CMD_RENDER_PIPELINE_CREATE,
     RGFX_CONTEXT_OBJ_ID_SHIFT, RGFX_DEVICE_INFO_OFFSET, RGFX_STATUS_INVALID_ARGUMENT,
@@ -438,6 +438,10 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                 self.heap_texture_size(poster, message);
                 return;
             }
+            RGFX_CMD_ARGUMENT_LAYOUT => {
+                self.argument_layout(poster, message);
+                return;
+            }
             RGFX_CMD_COMMAND_BUFFER => self.pending.wait_for_command_buffer(message),
             _ => {}
         }
@@ -584,6 +588,29 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         });
         if let Some(answer) = answer {
             poster.post(answer.as_bytes());
+        }
+    }
+
+    /// An argument buffer's layout from ring 0, answered at once: written into the sender's
+    /// block, then its `COMPLETE` (`GraphicsDecoder::argument_layout`). The platform's encoder
+    /// is made in the refusal scope, so one Metal raises at is refused, as a create is.
+    fn argument_layout(&self, poster: &CompletionPoster, message: &[u8]) {
+        let (ty, seqno, obj_id) = message_identity(message);
+        let answer = entry::run(|_| {
+            let mut decoder = self.decoder.lock();
+            decoder.set_context(Some(sender_context(poster, message)));
+            refusing(|| decoder.argument_layout(&self.device, message))
+        });
+        let (seqno, status) = answer.unwrap_or((Some(seqno), RGFX_STATUS_REFUSED));
+        if status != RGFX_STATUS_OK {
+            log::warn!(
+                target: "reims_vgpu::graphics",
+                "an argument layout (type {ty:#x}, object {obj_id:#x}) was answered status \
+                 {status}"
+            );
+        }
+        if let Some(seqno) = seqno {
+            poster.post(complete(seqno, status).as_bytes());
         }
     }
 

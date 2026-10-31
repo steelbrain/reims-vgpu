@@ -797,6 +797,11 @@
 // could not build); nothing was made.
 #define RGFX_STATUS_REFUSED 5
 
+// `COMPLETE`'s status: the answer does not fit the block the guest gave for it, whose first
+// bytes now say how many it needs ([`RgfxArgumentLayoutReply::needed`]); nothing else was
+// written.
+#define RGFX_STATUS_TOO_SMALL 6
+
 // Scanout pixels: 32-bit BGRA8, `kIO32BGRAPixelFormat`, the one format there is.
 #define RGFX_SCANOUT_BYTES_PER_PIXEL 4
 
@@ -915,6 +920,13 @@
 // a texture of a shape takes in a heap (`heapTextureSizeAndAlignWithDescriptor:`), as the host's
 // device answers it; answered by [`RGFX_EVT_SIZE_AND_ALIGN`]. Makes nothing.
 #define RGFX_CMD_HEAP_TEXTURE_SIZE_AND_ALIGN 536
+
+// Command `ARGUMENT_LAYOUT` ([`RgfxArgumentLayoutQuery`]): the layout of an argument buffer
+// (`MTLArgumentEncoder`'s), from argument descriptors (`newArgumentEncoderWithArguments:`) or
+// from a function's buffer argument (`newArgumentEncoderWithBufferIndex:`), written into a block
+// of the sender's as [`RgfxArgumentLayoutReply`] says, then answered by [`RGFX_EVT_COMPLETE`].
+// Nothing is made: the guest's encoder writes the arguments where the layout puts them.
+#define RGFX_CMD_ARGUMENT_LAYOUT 537
 
 // `CONTEXT_CLOSE` ([`RgfxContextClose`]), on ring 0 from the accelerator kext: the process that
 // held context `context` closed the device or died. The host ends the context's command queues
@@ -1035,6 +1047,55 @@
 // [`RGFX_TEXTURE_VIEW_SUBRANGE`].
 #define RGFX_TEXTURE_VIEW_SWIZZLE 2
 
+// [`RgfxArgumentLayoutQuery::source`]: the layout of `count` [`RgfxArgumentDescriptor`]s
+// (`newArgumentEncoderWithArguments:`).
+#define RGFX_ARGUMENT_SOURCE_DESCRIPTORS 0
+
+// [`RgfxArgumentLayoutQuery::source`]: the layout of the argument buffer a library's function
+// takes at `buffer_index` (`newArgumentEncoderWithBufferIndex:`).
+#define RGFX_ARGUMENT_SOURCE_FUNCTION 1
+
+// [`RgfxArgumentMemberRecord::kind`]: a buffer's address, which may point to a nested argument
+// buffer ([`RgfxArgumentMemberRecord::layout`]).
+#define RGFX_ARGUMENT_BUFFER 0
+
+// [`RgfxArgumentMemberRecord::kind`]: a texture's resource id.
+#define RGFX_ARGUMENT_TEXTURE 1
+
+// [`RgfxArgumentMemberRecord::kind`]: a sampler state's resource id.
+#define RGFX_ARGUMENT_SAMPLER 2
+
+// [`RgfxArgumentMemberRecord::kind`]: plain bytes (`constantDataAtIndex:`).
+#define RGFX_ARGUMENT_CONSTANT 3
+
+// [`RgfxArgumentMemberRecord::kind`]: an indirect command buffer's resource id.
+#define RGFX_ARGUMENT_INDIRECT_COMMAND_BUFFER 4
+
+// [`RgfxArgumentMemberRecord::kind`]: a compute pipeline state's resource id.
+#define RGFX_ARGUMENT_COMPUTE_PIPELINE 5
+
+// [`RgfxArgumentMemberRecord::kind`]: a render pipeline state's resource id.
+#define RGFX_ARGUMENT_RENDER_PIPELINE 6
+
+// [`RgfxArgumentMemberRecord::kind`]: a visible function table's resource id.
+#define RGFX_ARGUMENT_VISIBLE_FUNCTION_TABLE 7
+
+// [`RgfxArgumentMemberRecord::kind`]: an intersection function table's resource id.
+#define RGFX_ARGUMENT_INTERSECTION_FUNCTION_TABLE 8
+
+// [`RgfxArgumentMemberRecord::kind`]: an acceleration structure's resource id.
+#define RGFX_ARGUMENT_ACCELERATION_STRUCTURE 9
+
+// [`RgfxArgumentMemberRecord::kind`]: a depth/stencil state.
+#define RGFX_ARGUMENT_DEPTH_STENCIL 10
+
+// [`RgfxArgumentMemberRecord::kind`]: a struct whose members are arguments, laid out as
+// [`RgfxArgumentMemberRecord::layout`] says, from the element's offset and argument index.
+#define RGFX_ARGUMENT_STRUCT 11
+
+// [`RgfxArgumentMemberRecord::layout`]: no layout.
+#define RGFX_ARGUMENT_NO_LAYOUT 4294967295
+
 // Where a `LIBRARY_CREATE` message's bytes start: right after its header.
 #define RGFX_LIBRARY_BYTES_OFFSET 72
 
@@ -1113,6 +1174,132 @@
 
 // The bytes of [`RgfxFunctionConstant::value`]: the widest constant's, a `long4` or `ulong4`.
 #define RGFX_FUNCTION_CONSTANT_VALUE_BYTES 32
+
+// One `MTLArgumentDescriptor` of an [`RgfxArgumentLayoutQuery`]; each enum is its Metal raw
+// value.
+typedef struct {
+  // `dataType` (`MTLDataType`).
+  uint32_t data_type;
+  // `index`.
+  uint32_t index;
+  // `arrayLength`.
+  uint32_t array_length;
+  // `access` (`MTLBindingAccess`).
+  uint32_t access;
+  // `textureType` (`MTLTextureType`).
+  uint32_t texture_type;
+  // `constantBlockAlignment`.
+  uint32_t constant_block_alignment;
+} RgfxArgumentDescriptor;
+
+// Every message's header.
+typedef struct {
+  // The message's type: an `RGFX_CMD_*`, an `RGFX_EVT_*` or [`RGFX_MSG_PAD`].
+  uint32_t type;
+  // The message's bytes, this header included: a multiple of 8.
+  uint32_t size;
+  // A command's number, from 1 up on each ring, which the guest picks; an answer carries its
+  // command's, and an event that answers nothing carries 0.
+  uint64_t seqno;
+} RgfxMsgHeader;
+
+// `ARGUMENT_LAYOUT`: the layout of one argument buffer, from the source `source` names, written
+// into the `reply_length` bytes at `reply_offset` of a block of the sender's. `obj_id` is an id
+// of the sender's context naming the query; nothing is made under it.
+// - [`RGFX_ARGUMENT_SOURCE_DESCRIPTORS`]: `count` [`RgfxArgumentDescriptor`]s at
+//   `descriptors_offset`, in the order the guest gave them.
+// - [`RGFX_ARGUMENT_SOURCE_FUNCTION`]: function `name_offset`/`name_len` of library
+//   `library_obj_id`, specialised by the `constant_count` [`RgfxFunctionConstant`]s at
+//   `constants_offset` where there are any, and the argument buffer it takes at
+//   `buffer_index`.
+//
+// Offsets are bytes from the message start; the message's `size` is the head plus the tail,
+// rounded up to a multiple of 8. Answered by [`RGFX_EVT_COMPLETE`]: [`RGFX_STATUS_OK`] with the
+// layout written; [`RGFX_STATUS_TOO_SMALL`] with only the bytes needed written; and
+// [`RGFX_STATUS_REFUSED`] where the platform makes no encoder of the source (a function with no
+// argument buffer at the index, descriptors Metal refuses), with nothing written.
+typedef struct {
+  // [`RGFX_CMD_ARGUMENT_LAYOUT`].
+  RgfxMsgHeader header;
+  // An id of the sender's context, naming the query.
+  uint64_t obj_id;
+  // The answer's block: its offset in the region.
+  uint64_t reply_offset;
+  // The answer's block: its length.
+  uint64_t reply_length;
+  // The function's library, for [`RGFX_ARGUMENT_SOURCE_FUNCTION`]; 0 otherwise.
+  uint64_t library_obj_id;
+  // The `RGFX_ARGUMENT_SOURCE_*` the layout comes from.
+  uint32_t source;
+  // The [`RgfxArgumentDescriptor`]s, for [`RGFX_ARGUMENT_SOURCE_DESCRIPTORS`].
+  uint32_t count;
+  // The descriptors' byte offset from the message start.
+  uint32_t descriptors_offset;
+  // The function's buffer index, for [`RGFX_ARGUMENT_SOURCE_FUNCTION`].
+  uint32_t buffer_index;
+  // The function name's byte offset from the message start.
+  uint32_t name_offset;
+  // The function name's length in bytes.
+  uint32_t name_len;
+  // The function constants' byte offset from the message start.
+  uint32_t constants_offset;
+  // The number of [`RgfxFunctionConstant`]s.
+  uint32_t constant_count;
+} RgfxArgumentLayoutQuery;
+
+// One layout of an [`RgfxArgumentLayoutReply`]: the argument buffer's, a nested argument
+// buffer's, or one element's of a struct member.
+typedef struct {
+  // `encodedLength`: the bytes one argument buffer of the layout takes; a struct element's
+  // size.
+  uint64_t encoded_length;
+  // `alignment`; 1 for a struct element's.
+  uint64_t alignment;
+  // Its first member's index among the reply's members.
+  uint32_t first_member;
+  // Its members, in layout order.
+  uint32_t member_count;
+} RgfxArgumentLayoutRecord;
+
+// An [`RgfxArgumentLayoutQuery`]'s answer, at the start of the guest's block: `layout_count`
+// [`RgfxArgumentLayoutRecord`]s follow it, the first the argument buffer's own, then
+// `member_count` [`RgfxArgumentMemberRecord`]s, which the layouts index.
+typedef struct {
+  // The bytes the whole answer takes; the only field written with
+  // [`RGFX_STATUS_TOO_SMALL`].
+  uint64_t needed;
+  // The layouts.
+  uint32_t layout_count;
+  // The members of every layout.
+  uint32_t member_count;
+} RgfxArgumentLayoutReply;
+
+// One member of a layout: an argument, or an array of them. Argument index `i` lands in the
+// last member of the layout whose indices hold it: element `(i - id) / ids_per_element`, at
+// `offset` plus `stride` times the element; a struct element's members hold
+// `(i - id) % ids_per_element` from that offset on.
+typedef struct {
+  // The argument index (`[[id(n)]]`) of element 0.
+  uint32_t id;
+  // Elements: 1 for a single argument.
+  uint32_t count;
+  // Argument indices each element takes: 1, or a struct's span.
+  uint32_t ids_per_element;
+  // The `RGFX_ARGUMENT_*` kind.
+  uint32_t kind;
+  // Byte offset of element 0.
+  uint64_t offset;
+  // Bytes from one element to the next.
+  uint64_t stride;
+  // Bytes of one element.
+  uint64_t size;
+  // The layout of a nested argument buffer a [`RGFX_ARGUMENT_BUFFER`] points to, or of one
+  // element of a [`RGFX_ARGUMENT_STRUCT`], by its index among the reply's layouts;
+  // [`RGFX_ARGUMENT_NO_LAYOUT`] otherwise.
+  uint32_t layout;
+  // Pads to a multiple of 8; 0.
+  uint32_t reserved_2c;
+} RgfxArgumentMemberRecord;
 
 // `copyFromBuffer:sourceOffset:toBuffer:destinationOffset:size:`. Either
 // buffer may be nil (`0`).
@@ -1564,17 +1751,6 @@ typedef struct {
   // The fence (must not be nil).
   uint64_t fence_obj_id;
 } RgfxBlitOpWaitForFence;
-
-// Every message's header.
-typedef struct {
-  // The message's type: an `RGFX_CMD_*`, an `RGFX_EVT_*` or [`RGFX_MSG_PAD`].
-  uint32_t type;
-  // The message's bytes, this header included: a multiple of 8.
-  uint32_t size;
-  // A command's number, from 1 up on each ring, which the guest picks; an answer carries its
-  // command's, and an event that answers nothing carries 0.
-  uint64_t seqno;
-} RgfxMsgHeader;
 
 // `BLOCK_GRANT`: the kext gave context `context` the region block of `size` bytes at `offset`.
 // `BLOCK_SHARE` and `BLOCK_UNSHARE` have its layout: context `context` holds, or no longer

@@ -47,6 +47,13 @@ int main()
 	CHECK(s[1].offset == 0x9fff000 && s[1].length == 8);
 	CHECK(spansOf(RGFX_CMD_LIBRARY_FROM_REGION, chunk, 72, s) == -1);
 
+	RgfxArgumentLayoutQuery layout = {};
+	layout.reply_offset = 0xb000000;
+	layout.reply_length = 0x4000;
+	CHECK(spansOf(RGFX_CMD_ARGUMENT_LAYOUT, layout, sizeof(layout), s) == 1);
+	CHECK(s[0].offset == 0xb000000 && s[0].length == 0x4000);
+	CHECK(spansOf(RGFX_CMD_ARGUMENT_LAYOUT, layout, 40, s) == -1);
+
 	// Messages that name no span of the region, whatever their size.
 	RgfxObjectCreate event = {};
 	CHECK(spansOf(RGFX_CMD_EVENT_CREATE, event, sizeof(event), s) == 0);

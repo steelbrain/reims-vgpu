@@ -8,6 +8,7 @@
 //! (`BlitCmd`, `ComputeCmd`, `RenderCmd`, `IcbRenderCmd`, `IcbComputeCmd`) are each one
 //! exhaustive `match` in their trait's `encode`, one call per variant.
 
+mod argument;
 pub mod command;
 pub mod desc;
 pub mod device;

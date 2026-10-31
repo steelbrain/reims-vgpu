@@ -81,6 +81,7 @@ use zerocopy::FromBytes;
 /// block holds it whole ([`RGFX_CMD_HEAP_OVER_HOST_MEMORY`]).
 const HEAP_PAGE: u64 = 0x4000;
 
+mod argument;
 mod blit;
 mod cmdbuf;
 mod compute;

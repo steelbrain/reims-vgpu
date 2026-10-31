@@ -69,6 +69,18 @@ CHECK(offsetof(RgfxTextureView, swizzle) == 0x44);
 CHECK(RGFX_CMD_TEXTURE_VIEW == 0x217);
 CHECK(RGFX_TEXTURE_VIEW_SUBRANGE == 1);
 CHECK(RGFX_TEXTURE_VIEW_SWIZZLE == 2);
+CHECK(sizeof(RgfxArgumentLayoutQuery) == 80);
+CHECK(offsetof(RgfxArgumentLayoutQuery, reply_offset) == 0x18);
+CHECK(offsetof(RgfxArgumentLayoutQuery, source) == 0x30);
+CHECK(offsetof(RgfxArgumentLayoutQuery, constant_count) == 0x4c);
+CHECK(sizeof(RgfxArgumentDescriptor) == 24);
+CHECK(sizeof(RgfxArgumentLayoutReply) == 16);
+CHECK(sizeof(RgfxArgumentLayoutRecord) == 24);
+CHECK(sizeof(RgfxArgumentMemberRecord) == 48);
+CHECK(offsetof(RgfxArgumentMemberRecord, layout) == 0x28);
+CHECK(RGFX_CMD_ARGUMENT_LAYOUT == 0x219);
+CHECK(RGFX_STATUS_TOO_SMALL == 6);
+CHECK(RGFX_ARGUMENT_STRUCT == 11);
 CHECK(RGFX_CONTROL_RING_ID == 0);
 CHECK(RGFX_CONTROL_VECTOR == 0);
 int main(void) { return 0; }

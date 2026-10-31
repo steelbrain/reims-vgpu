@@ -1175,6 +1175,77 @@ fn a_heap_texture_size_query_is_answered_on_ring_0() {
     assert_eq!(device.decoder_object_count(), 0);
 }
 
+/// An argument layout query on ring 0 writes the platform's layout into the sender's block and is
+/// answered by a `COMPLETE` at its seqno, making no object; one whose block is another process's
+/// is refused, with nothing written
+#[test]
+fn an_argument_layout_query_is_answered_on_ring_0() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, _platform) = headless_on(&raised);
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    const BLOCK: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x10_0000;
+    const SIZE: u64 = 0x1000;
+    guest.send(&device, block_grant(1, BLOCK, SIZE));
+    let descriptors = [
+        RgfxArgumentDescriptor {
+            data_type: 58, // MTLDataTypeTexture
+            index: 0,
+            texture_type: 2,
+            ..RgfxArgumentDescriptor::default()
+        },
+        RgfxArgumentDescriptor {
+            data_type: 60, // MTLDataTypePointer
+            index: 1,
+            array_length: 4,
+            ..RgfxArgumentDescriptor::default()
+        },
+    ];
+    let query = |obj_id: u64| {
+        let head = RgfxArgumentLayoutQuery {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_ARGUMENT_LAYOUT,
+                size: 0,
+                seqno: 0,
+            },
+            obj_id,
+            reply_offset: BLOCK,
+            reply_length: SIZE,
+            source: RGFX_ARGUMENT_SOURCE_DESCRIPTORS,
+            count: 2,
+            descriptors_offset: size_of::<RgfxArgumentLayoutQuery>() as u32,
+            ..RgfxArgumentLayoutQuery::default()
+        };
+        let mut bytes = head.as_bytes().to_vec();
+        bytes.extend_from_slice(descriptors.as_bytes());
+        bytes
+    };
+    // Process 2 names process 1's block: refused, and the block keeps its bytes.
+    guest.send(&device, query(obj(2, 1)));
+    let seqno = guest.seqno;
+    assert_ne!(answer_of(&mut guest, seqno), RGFX_STATUS_OK);
+    // SAFETY: as `Guest`'s helpers; the block lies in the region.
+    assert_eq!(unsafe { guest.load_u64(BLOCK as usize) }, 0);
+    guest.send(&device, query(obj(1, 1)));
+    let seqno = guest.seqno;
+    assert_eq!(answer_of(&mut guest, seqno), RGFX_STATUS_OK);
+    // SAFETY: as above.
+    let head = unsafe { guest.read(BLOCK as usize, size_of::<RgfxArgumentLayoutReply>()) };
+    let head = RgfxArgumentLayoutReply::read_from_bytes(&head).unwrap();
+    assert_eq!((head.layout_count, head.member_count), (1, 2));
+    // SAFETY: as above.
+    let layout = unsafe {
+        guest.read(
+            BLOCK as usize + size_of::<RgfxArgumentLayoutReply>(),
+            size_of::<RgfxArgumentLayoutRecord>(),
+        )
+    };
+    let layout = RgfxArgumentLayoutRecord::read_from_bytes(&layout).unwrap();
+    // The fake's layout: 8 bytes an element, in order.
+    assert_eq!((layout.encoded_length, layout.member_count), (40, 2));
+    assert_eq!(device.decoder_object_count(), 0);
+}
+
 /// The calls the platform had to make a library from bytes.
 fn library_makes(platform: &FakePlatform) -> usize {
     platform

@@ -29,6 +29,11 @@ item_types = ["constants", "structs"]
 exclude = ["REGION_SIZE", "RgfxOpSetDepthCleared", "RgfxOpSetStencilCleared"]
 # The records, which no function names, listed so that cbindgen writes them.
 include = [
+    "RgfxArgumentDescriptor",
+    "RgfxArgumentLayoutQuery",
+    "RgfxArgumentLayoutRecord",
+    "RgfxArgumentLayoutReply",
+    "RgfxArgumentMemberRecord",
     "RgfxBlitOpCopyBufferToBuffer",
     "RgfxBlitOpCopyBufferToTexture",
     "RgfxBlitOpCopyBufferToTextureOptions",

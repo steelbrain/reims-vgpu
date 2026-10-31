@@ -18,10 +18,11 @@ use std::sync::Arc;
 use super::caps::{DeviceCaps, IdentityCaps};
 use super::host_range::HostRange;
 use super::types::{
-    NsErrorText, PixelFormatInfo, SizeAndAlign, TextureLevelInfo, TextureLevelQuery,
+    ArgumentLayout, NsErrorText, PixelFormatInfo, SizeAndAlign, TextureLevelInfo, TextureLevelQuery,
 };
 use super::values::{
-    BufferDesc, DepthStencilDesc, HeapDesc, HeapMade, IcbDesc, RenderPipelineDesc, SamplerDesc,
+    ArgumentDesc, BufferDesc, DepthStencilDesc, HeapDesc, HeapMade, IcbDesc, RenderPipelineDesc,
+    SamplerDesc,
 };
 use super::{Handle, Platform};
 use crate::raise::{OnFault, RaiseResult};
@@ -46,6 +47,20 @@ pub trait GpuDevice<P: Platform>: Handle {
     /// Side effect only; sent once per device, where no handler is live: a raise inside it dies
     /// at the send.
     fn allow_foreign_libraries(&self);
+    /// sel: newArgumentEncoderWithArguments: — the layout of the encoder Metal makes of
+    /// `arguments`, in their order: its `encodedLength`, its `alignment` and where each argument
+    /// lands. Nothing is kept. `None` where Metal makes no encoder (nil, or a raise a handler
+    /// catches: no arguments, a data type no argument has).
+    fn argument_layout(&self, arguments: &[ArgumentDesc]) -> RaiseResult<Option<ArgumentLayout>>;
+    /// sel: -[MTLFunction newArgumentEncoderWithBufferIndex:] — the layout of the encoder Metal
+    /// makes of the argument buffer `function` takes at `buffer_index`, its nested argument
+    /// buffers' layouts with it (`newArgumentEncoderForBufferAtIndex:`). Nothing is kept. `None`
+    /// where Metal makes none (no argument buffer at the index).
+    fn function_argument_layout(
+        &self,
+        function: &P::Function,
+        buffer_index: u64,
+    ) -> RaiseResult<Option<ArgumentLayout>>;
     /// sel: heapTextureSizeAndAlignWithDescriptor:
     /// The result reaches the guest (opcode 64, info 451/469).
     fn heap_texture_size_and_align(&self, desc: &P::TextureDescriptor)
