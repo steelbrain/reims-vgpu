@@ -60,19 +60,24 @@ use reims_graphics::wire::{
     RgfxStencilDescriptor, RgfxTextureCreate, RgfxTextureDescriptor, RgfxTextureFromBuffer,
     RgfxTextureFromIOSurface,
 };
+use reims_vgpu_core::host::HostPtr;
 use reims_vgpu_core::platform::device::GpuDevice;
 use reims_vgpu_core::platform::resource::{
     Buffer, ComputePipeline, FunctionConstant, Heap, Library, RenderPipeline,
 };
-use reims_vgpu_core::platform::types::{ResourceAddressRange, Swizzle};
+use reims_vgpu_core::platform::types::Swizzle;
 use reims_vgpu_core::platform::values::{
     BufferDesc, DepthStencilDesc, HeapDesc, OptionSet, RenderPipelineDesc, SamplerDesc,
     StencilDesc, TextureDesc,
 };
-use reims_vgpu_core::platform::{Handle, Platform};
+use reims_vgpu_core::platform::{Handle, HostRange, Platform};
 use reims_vgpu_core::raise::{OnFault, Raise, RaiseResult, refusals};
 use reims_vgpu_core::sync::Mutex;
 use zerocopy::FromBytes;
+
+/// Metal's page on Apple silicon, to which a Shared heap's memory is rounded up: the guest's
+/// block holds it whole ([`RGFX_CMD_HEAP_OVER_HOST_MEMORY`]).
+const HEAP_PAGE: u64 = 0x4000;
 
 mod blit;
 mod cmdbuf;
@@ -549,8 +554,16 @@ impl<P: Platform> GraphicsDecoder<P> {
                 if storage_mode(m.options.into()) == STORAGE_MODE_MANAGED {
                     return self.managed_buffer(device, &m);
                 }
-                let made =
-                    self.buffer_over_block(device, m.region_offset, m.length, m.options.into())?;
+                // At the guest's address, which its pointers to the buffer hold, as a
+                // BUFFER_CREATE's is.
+                let pin = (m.gpu_address != 0).then_some(m.gpu_address);
+                let made = self.buffer_over_block(
+                    device,
+                    m.region_offset,
+                    m.length,
+                    m.options.into(),
+                    pin,
+                )?;
                 match made {
                     Some(buffer) => self.insert_over(
                         m.obj_id,
@@ -596,35 +609,39 @@ impl<P: Platform> GraphicsDecoder<P> {
                 let Some(m) = read::<RgfxHeapOverHostMemory>(message) else {
                     return Ok(Err(DecodeError::Malformed));
                 };
-                // A Shared heap placed over the guest's own memory in the device's
-                // region, `size_bytes` at `region_offset`: its address range is the
-                // host VA of that block, as the detached-heap path builds a heap
-                // over host pages. A span in no block of the sender's is a guest
-                // protocol error. The region stays mapped while the decoder holds it, and the
-                // heap (in the object table) drops before the region (field order).
-                if !self.in_own_block(m.region_offset, m.size_bytes) {
+                // A Shared heap over the guest's own memory in the device's region, in place:
+                // its memory is the `size_bytes` at `region_offset`, rounded up to Metal's 16 KiB
+                // page, so a resource the guest places in it lies in the guest's bytes at its
+                // offset, which the CPU and the GPU share, as Metal's heap does. A span in no
+                // block of the sender's is a guest protocol error. The region stays mapped while
+                // the decoder holds it, and the heap (in the object table) drops before the
+                // region (field order).
+                let Some(length) = m.size_bytes.checked_next_multiple_of(HEAP_PAGE) else {
+                    return Ok(Err(DecodeError::BadReference));
+                };
+                if !self.in_own_block(m.region_offset, length) {
                     return Ok(Err(DecodeError::BadReference));
                 }
-                // SAFETY: the block lies inside the region (checked above), one
-                // allocation, so the offset is in bounds.
-                let address = unsafe { self.region.base().add(m.region_offset as usize) } as u64;
-                let range = ResourceAddressRange {
-                    address,
-                    length: m.size_bytes,
+                // SAFETY: the block lies inside the region (checked above), which stays mapped
+                // while the decoder, and so the heap, lives.
+                let bytes = unsafe {
+                    HostRange::new(
+                        HostPtr::from_ptr(self.region.base().add(m.region_offset as usize)),
+                        length,
+                    )
                 };
-                let ranges = self.platform.new_address_range_array(&[range])?;
                 let desc = HeapDesc {
                     size: m.size_bytes,
                     heap_type: m.heap_type as i64,
                     options: vec![OptionSet::ResourceOptions(m.options.into())],
-                    address_ranges: Some(&ranges),
+                    address_ranges: None,
                     pinned_gpu_address: (m.gpu_address != 0).then_some(m.gpu_address),
                 };
-                match device.new_heap(&desc)?.heap {
+                match device.new_heap_over_host_memory(bytes, &desc)?.heap {
                     Some(heap) => self.insert_over(
                         m.obj_id,
                         ObjHandle::Heap(heap),
-                        Some((m.region_offset, m.size_bytes)),
+                        Some((m.region_offset, length)),
                     ),
                     None => {
                         heap_refused(
@@ -1629,6 +1646,81 @@ mod tests {
         dec.set_context(Some(1));
         assert!(dec.require_buffer(one | 3).is_ok());
         assert_eq!(dec.object_count(), 2);
+    }
+
+    /// A Shared heap over host memory is made over its block in place, the guest's size rounded
+    /// up to Metal's 16 KiB page, at the guest's address; one whose rounded size runs past its
+    /// block is a bad reference. A buffer over host memory lies over its bytes at the guest's
+    /// address, as a BUFFER_CREATE's does.
+    #[test]
+    fn host_memory_heaps_and_buffers_lie_in_place_at_the_guest_address() {
+        let p = Arc::new(FakePlatform::new());
+        let device = p.device();
+        let blocks = RGFX_CONTEXT_ALLOCATIONS_OFFSET;
+        let size = blocks + 0x10_0000 + RGFX_CURSOR_SPAN;
+        let region = Arc::new(reims_graphics::region::Region::new(size as usize).unwrap());
+        let mut dec = GraphicsDecoder::<FakePlatform>::new(Arc::clone(&p), Arc::clone(&region));
+        region.grant(1, blocks, 0x2_0000);
+        dec.set_context(Some(1));
+        let one = 1u64 << RGFX_CONTEXT_OBJ_ID_SHIFT;
+        let heap = |obj_id: u64, region_offset: u64, size_bytes: u64| RgfxHeapOverHostMemory {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_HEAP_OVER_HOST_MEMORY,
+                size: size_of::<RgfxHeapOverHostMemory>() as u32,
+                seqno: 0,
+            },
+            obj_id,
+            gpu_address: 0x2_0000_8000,
+            region_offset,
+            size_bytes,
+            ..RgfxHeapOverHostMemory::default()
+        };
+        let mark = p.call_log().mark();
+        assert_eq!(
+            dec.decode(&device, heap(one | 1, blocks, 0x1_0001).as_bytes())
+                .unwrap(),
+            Ok(())
+        );
+        let calls = p.call_log().since(mark);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].sel, "newHeapWithDescriptor:");
+        assert_eq!(
+            calls[0].args[..2],
+            [
+                Arg::Ptr(region.base() as usize + blocks as usize),
+                Arg::U64(0x1_4000)
+            ]
+        );
+        assert_eq!(
+            dec.require_heap(one | 1).unwrap().gpu_address(),
+            0x2_0000_8000
+        );
+        // 0x4001 bytes at 0x1c000 into the block take 0x8000, past its end.
+        assert_eq!(
+            dec.decode(&device, heap(one | 2, blocks + 0x1_c000, 0x4001).as_bytes())
+                .unwrap(),
+            Err(DecodeError::BadReference)
+        );
+        let buffer = RgfxBufferOverHostMemory {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_BUFFER_OVER_HOST_MEMORY,
+                size: size_of::<RgfxBufferOverHostMemory>() as u32,
+                seqno: 0,
+            },
+            obj_id: one | 3,
+            gpu_address: 0x3_0000_0000,
+            region_offset: blocks + 0x1_8000,
+            length: 0x100,
+            options: 0,
+            reserved_34: 0,
+        };
+        assert_eq!(dec.decode(&device, buffer.as_bytes()).unwrap(), Ok(()));
+        let made = dec.require_buffer(one | 3).unwrap();
+        assert_eq!(made.gpu_address(), 0x3_0000_0000);
+        assert_eq!(
+            made.contents().addr(),
+            region.base() as usize + (blocks + 0x1_8000) as usize
+        );
     }
 
     /// A create of each state object calls the platform and holds its handle;

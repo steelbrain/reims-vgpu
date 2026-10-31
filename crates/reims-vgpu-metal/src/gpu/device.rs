@@ -37,7 +37,8 @@ use reims_vgpu_core::platform::caps::{
 };
 use reims_vgpu_core::platform::device::{FunctionResolver, GpuDevice, NoCopyDeallocator};
 use reims_vgpu_core::platform::types::{
-    MtlSize, NsErrorText, PixelFormatInfo, SizeAndAlign, TextureLevelInfo, TextureLevelQuery,
+    MtlSize, NsErrorText, PixelFormatInfo, ResourceAddressRange, SizeAndAlign, TextureLevelInfo,
+    TextureLevelQuery,
 };
 use reims_vgpu_core::platform::values::{
     BufferDesc, DepthStencilDesc, HeapDesc, HeapMade, IcbDesc, RenderPipelineDesc, SamplerDesc,
@@ -720,6 +721,26 @@ impl GpuDevice<MetalPlatform> for MetalDevice {
         })
     }
 
+    /// A heap over one address range, `bytes`, which Metal makes over the range's pages in place.
+    fn new_heap_over_host_memory(
+        &self,
+        bytes: HostRange<'_>,
+        desc: &HeapDesc<'_, MetalPlatform>,
+    ) -> RaiseResult<HeapMade<MetalPlatform>> {
+        let range = ResourceAddressRange {
+            address: bytes.ptr().addr().to_u64(),
+            length: bytes.len(),
+        };
+        let ranges = crate::platform::address_range_array(&[range])?;
+        self.new_heap(&HeapDesc {
+            size: desc.size,
+            heap_type: desc.heap_type,
+            options: desc.options.clone(),
+            address_ranges: Some(&ranges),
+            pinned_gpu_address: desc.pinned_gpu_address,
+        })
+    }
+
     fn new_sampler_state(&self, desc: &SamplerDesc) -> RaiseResult<Option<MetalSamplerState>> {
         let d = crate::platform::class_new(objc2_metal::MTLSamplerDescriptor::new);
         desc::apply_sampler(desc, &d);
@@ -1398,6 +1419,75 @@ pub(crate) mod tests {
         drop(b);
         // SAFETY: the buffer is gone; allocated above with `layout`.
         unsafe { std::alloc::dealloc(mem, layout) };
+    }
+
+    /// A heap over host memory is Metal's over the one address range in place: a buffer placed at
+    /// an offset is the bytes there, at the heap's address plus the offset, and the CPU's writes
+    /// and the GPU's fill of the buffer land in them
+    #[test]
+    fn a_heap_over_host_memory_lies_in_its_bytes() {
+        use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder};
+        use reims_vgpu_core::platform::command::{CommandBuffer, CommandQueue};
+        use reims_vgpu_core::platform::resource::{Buffer, Heap};
+        use reims_vgpu_core::platform::types::NsRange;
+        use reims_vgpu_core::platform::values::OptionSet;
+        let d = dev();
+        let layout = std::alloc::Layout::from_size_align(0x2_0000, 0x4000).unwrap();
+        // SAFETY: a non-zero layout; the memory is kept for the process.
+        let mem = unsafe { std::alloc::alloc_zeroed(layout) };
+        let at = |offset: usize| {
+            // SAFETY: inside the allocation.
+            unsafe { mem.add(offset) }
+        };
+        // SAFETY: the memory is kept for the process.
+        let bytes = unsafe { HostRange::new(HostPtr::from_ptr(mem), 0x1_4000) };
+        let desc = HeapDesc {
+            size: 0x1_0001,
+            heap_type: 1,
+            options: vec![OptionSet::StorageMode(0)],
+            address_ranges: None,
+            pinned_gpu_address: None,
+        };
+        let heap = d
+            .new_heap_over_host_memory(bytes, &desc)
+            .unwrap()
+            .heap
+            .unwrap();
+        let buffer = heap
+            .new_buffer_of_length(0x1000, 0, 0x4000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(buffer.contents().addr(), at(0x4000).addr());
+        assert_eq!(buffer.gpu_address(), heap.gpu_address() + 0x4000);
+        // SAFETY: the buffer's bytes are the allocation's, which nothing else touches.
+        unsafe { at(0x4000).write_bytes(0xa1, 0x800) };
+        let queue = d.new_command_queue().unwrap();
+        let cb = queue.command_buffer(OnFault::Return).unwrap().unwrap();
+        let e = cb.blit_encoder(OnFault::Return).unwrap().unwrap();
+        for command in [
+            BlitCmd::FillBuffer {
+                buffer: &buffer,
+                range: NsRange::new(0x800, 0x800),
+                value: 0x5c,
+            },
+            BlitCmd::EndEncoding,
+        ] {
+            e.encode(OnFault::Return, command).unwrap();
+        }
+        cb.commit(OnFault::Return).unwrap();
+        cb.wait_until_completed(OnFault::Return).unwrap();
+        assert_eq!(cb.status().0, 4, "completed");
+        // SAFETY: as above, the command buffer done.
+        unsafe {
+            assert_eq!(at(0x47ff).read(), 0xa1, "the CPU's bytes stay");
+            assert_eq!(
+                at(0x4800).read(),
+                0x5c,
+                "the GPU's fill lands in the heap's bytes"
+            );
+            assert_eq!(at(0x4fff).read(), 0x5c);
+            assert_eq!(at(0x5000).read(), 0, "past the buffer");
+        }
     }
 
     /// Metal runs a no-copy buffer's deallocator on the thread that lets the buffer go, which

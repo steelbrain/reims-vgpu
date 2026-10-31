@@ -1754,6 +1754,91 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         })
     }
 
+    /// A heap whose memory is `bytes`, imported in place as a no-copy buffer's is
+    /// ([`no_copy_release`]), at the address Metal's space gives it or the value's pin: its
+    /// resources lie in `bytes` from their offsets, so the guest's writes there and the GPU's are
+    /// each other's, and it never detaches ([`Backing::fixed`]). Nil for a size of 0, for bytes
+    /// short of the size rounded up to the runtime's granule, and as [`Self::new_heap`] answers
+    /// for its address; storage other than `Shared` dies, as there. A type the runtime lacks
+    /// dies at `setType:`.
+    fn new_heap_over_host_memory(
+        &self,
+        bytes: HostRange<'_>,
+        desc: &HeapDesc<'_, VulkanPlatform>,
+    ) -> RaiseResult<HeapMade<VulkanPlatform>> {
+        let sel = "newHeapWithDescriptor:";
+        let heap_type = u64::try_from(desc.heap_type)
+            .ok()
+            .and_then(|raw| rt::HeapType::from_raw(raw).ok())
+            .unwrap_or_else(|| {
+                unrepresentable("setType:", &format!("heap type {}", desc.heap_type))
+            });
+        let held = descriptor_options(HEAP_DESCRIPTOR_OPTIONS, &desc.options);
+        let options = crate::gpu::resource_options(sel, held);
+        let covered = desc.size.checked_next_multiple_of(backing::HEAP_GRANULE);
+        if desc.size == 0 || covered.is_none_or(|need| bytes.len() < need) {
+            return Ok(HeapMade {
+                heap: None,
+                descriptor_resource_options: held,
+            });
+        }
+        let (placement, mut placing) =
+            metal_space::placing(desc.size, metal_space::Bytes::Heap, desc.pinned_gpu_address);
+        let token = placing.token();
+        let nil = placed_nil(&placing, Nil::Heap);
+        let descriptor =
+            rt::HeapDescriptor::new(heap_type, desc.size, options).with_placement(placement);
+        let start = pointer(sel, bytes.ptr());
+        // The bytes, or a writable twin of them where the runtime cannot import them as mapped,
+        // and what keeps them mapped until the runtime freed its import.
+        let (imported, _, keep, kept) =
+            no_copy_release(start, bytes.len(), None, backing::ImportSite::Heap);
+        let heap = create(sel, Policy::Dies, nil, || {
+            // SAFETY: `HostRange::new`'s contract keeps the bytes mapped for the heap's life, and
+            // an unmap of core's through the platform's VM waits for the keep-alive; they cover
+            // the heap's size rounded up to the runtime's granule (checked above) and start on a
+            // page, the runtime's import unit on this host.
+            let made = unsafe {
+                let memory = crate::os::host_memory(imported, bytes.logged());
+                match token {
+                    Some(token) => self.raw.new_heap_with_bytes_no_copy_and_range_token(
+                        memory,
+                        &descriptor,
+                        None,
+                        Some(keep),
+                        token,
+                    ),
+                    None => {
+                        self.raw
+                            .new_heap_with_bytes_no_copy(memory, &descriptor, None, Some(keep))
+                    }
+                }
+            };
+            match made {
+                Err(rt::Error::Invalid(rt::Invalid {
+                    problem: rt::Problem::StorageMode,
+                    ..
+                })) => metal_aborts(sel, &format!("a heap of resource options {held:#x}")),
+                made => made,
+            }
+        })?;
+        Ok(HeapMade {
+            heap: heap.map(|raw| {
+                let backing = Backing::fixed();
+                backing.imported(kept);
+                Obj::new(HeapObject {
+                    raw,
+                    device: self.clone_ref(),
+                    descriptor_size: desc.size,
+                    backing,
+                    placed: Mutex::default(),
+                    space: placing.made(),
+                })
+            }),
+            descriptor_resource_options: held,
+        })
+    }
+
     /// One object for equal requests while it lives, placed at the value's resource index
     /// ([`super::states`]).
     fn new_sampler_state(&self, desc: &SamplerDesc) -> RaiseResult<Option<VulkanSamplerState>> {
@@ -1854,6 +1939,88 @@ pub(crate) mod tests {
             raw,
             caps: OnceLock::new(),
         })
+    }
+
+    /// A Shared heap over host memory lies in it, in place: a buffer placed at an offset is the
+    /// bytes there, at the heap's pin plus the offset, and the CPU's writes through either and
+    /// the GPU's fill of the buffer land in them. Bytes short of the heap's size rounded up to
+    /// the runtime's granule make none.
+    #[test]
+    fn a_heap_over_host_memory_lies_in_its_bytes() {
+        use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder};
+        use reims_vgpu_core::platform::command::{CommandBuffer, CommandQueue};
+        use reims_vgpu_core::platform::resource::{Buffer, Heap};
+        use reims_vgpu_core::platform::types::NsRange;
+        use reims_vgpu_core::platform::values::{HeapDesc, OptionSet};
+        let d = dev();
+        // Private anonymous memory, as the graphics device's region is, kept for the process.
+        let layout = std::alloc::Layout::from_size_align(0x2_0000, 0x4000).unwrap();
+        // SAFETY: a layout of non-zero size.
+        let mem = unsafe { std::alloc::alloc_zeroed(layout) };
+        assert!(!mem.is_null());
+        let at = |offset: usize| {
+            // SAFETY: inside the allocation, which the process keeps.
+            unsafe { mem.add(offset) }
+        };
+        let over = |length: u64| {
+            // SAFETY: the allocation stays for the process.
+            unsafe { HostRange::new(HostPtr::from_ptr(mem), length) }
+        };
+        let pin = metal_space::END / 4;
+        let desc = HeapDesc {
+            size: 0x1_0001,
+            heap_type: 1,
+            options: vec![OptionSet::StorageMode(0)],
+            address_ranges: None,
+            pinned_gpu_address: Some(pin),
+        };
+        let short = d.new_heap_over_host_memory(over(0x1_0000), &desc).unwrap();
+        assert!(short.heap.is_none(), "short of the granule");
+        let heap = d
+            .new_heap_over_host_memory(over(0x1_4000), &desc)
+            .unwrap()
+            .heap
+            .unwrap();
+        assert_eq!(heap.gpu_address(), pin);
+        let buffer = heap
+            .new_buffer_of_length(0x1000, 0, 0x4000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(buffer.contents().addr(), at(0x4000).addr());
+        assert_eq!(buffer.gpu_address(), pin + 0x4000);
+        // SAFETY: the buffer's bytes are the allocation's, which nothing else touches.
+        unsafe {
+            at(0x4000).write_bytes(0xa1, 0x800);
+            assert_eq!(buffer.contents().as_ptr::<u8>().read(), 0xa1);
+        }
+        let queue = d.new_command_queue().unwrap();
+        let cb = queue.command_buffer(OnFault::Return).unwrap().unwrap();
+        let e = cb.blit_encoder(OnFault::Return).unwrap().unwrap();
+        for command in [
+            BlitCmd::FillBuffer {
+                buffer: &buffer,
+                range: NsRange::new(0x800, 0x800),
+                value: 0x5c,
+            },
+            BlitCmd::EndEncoding,
+        ] {
+            e.encode(OnFault::Return, command).unwrap();
+        }
+        cb.commit(OnFault::Return).unwrap();
+        cb.wait_until_completed(OnFault::Return).unwrap();
+        assert_eq!(cb.status().0, 4, "completed");
+        // SAFETY: as above, the command buffer done.
+        unsafe {
+            assert_eq!(at(0x4000).read(), 0xa1, "the CPU's bytes stay");
+            assert_eq!(at(0x47ff).read(), 0xa1);
+            assert_eq!(
+                at(0x4800).read(),
+                0x5c,
+                "the GPU's fill lands in the heap's bytes"
+            );
+            assert_eq!(at(0x4fff).read(), 0x5c);
+            assert_eq!(at(0x5000).read(), 0, "past the buffer");
+        }
     }
 
     /// A sparse heap takes its range where the model of Metal's space places it: unpinned or at a

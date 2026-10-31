@@ -601,6 +601,40 @@ impl GpuDevice<FakePlatform> for Fk<kind::Device> {
         })
     }
 
+    /// A heap of the value over `bytes`, logged with the bytes' pointer and length first; it
+    /// owns no memory of its own.
+    fn new_heap_over_host_memory(
+        &self,
+        bytes: HostRange<'_>,
+        desc: &HeapDesc<'_, FakePlatform>,
+    ) -> RaiseResult<HeapMade<FakePlatform>> {
+        let opts = fold_options(&desc.options);
+        let (size, pinned) = (desc.size, desc.pinned_gpu_address);
+        let heap = self.make(
+            Policy::Caught,
+            "newHeapWithDescriptor:",
+            vec![
+                Arg::Ptr(bytes.ptr().addr()),
+                Arg::U64(bytes.len()),
+                Arg::val(desc),
+            ],
+            |w| {
+                Some(w.new_obj::<kind::Heap>(Model::Heap(HeapModel {
+                    size,
+                    options: opts,
+                    gpu_address: pinned.unwrap_or_else(|| w.alloc_gpu_va(size)),
+                    mem: None,
+                    ranges: None,
+                    common: common(w, None),
+                })))
+            },
+        )?;
+        Ok(HeapMade {
+            heap,
+            descriptor_resource_options: opts,
+        })
+    }
+
     /// The value's resource index is the state's forced index.
     fn new_sampler_state(
         &self,

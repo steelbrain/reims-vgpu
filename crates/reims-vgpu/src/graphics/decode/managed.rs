@@ -102,14 +102,15 @@ impl<P: Platform> GraphicsDecoder<P> {
     }
 
     /// A `Shared` buffer over the `length` bytes at region offset `at`, which the caller checked
-    /// lie in a block of the sender's, of `options`; it keeps the region mapped until the
-    /// platform frees it.
+    /// lie in a block of the sender's, of `options`, at the guest's `pin` where it has one (a
+    /// BUFFER_CREATE's alike); it keeps the region mapped until the platform frees it.
     pub(super) fn buffer_over_block(
         &self,
         device: &P::Device,
         at: u64,
         length: u64,
         options: u64,
+        pin: Option<u64>,
     ) -> RaiseResult<Option<P::Buffer>> {
         let keep = std::sync::Arc::clone(&self.region);
         // SAFETY: the span lies inside the region (the caller checked), which stays mapped until
@@ -120,12 +121,14 @@ impl<P: Platform> GraphicsDecoder<P> {
                 length,
             )
         };
-        device.new_buffer_over_host_memory(
-            OnFault::Return,
-            bytes,
-            options,
-            Some(Box::new(move || drop(keep))),
-        )
+        device.new_buffer(BufferDesc {
+            length,
+            options: vec![OptionSet::ResourceOptions(options)],
+            pinned_gpu_address: pin,
+            contents: Some(bytes),
+            no_copy: true,
+            deallocator: Some(Box::new(move |_, _| drop(keep))),
+        })
     }
 
     /// `BUFFER_OVER_HOST_MEMORY` of a `Managed` buffer, whose block the caller checked is the
@@ -139,8 +142,9 @@ impl<P: Platform> GraphicsDecoder<P> {
     ) -> RaiseResult<Result<(), DecodeError>> {
         let options = u64::from(m.options);
         let span = Some((m.region_offset, m.length));
+        let pin = (m.gpu_address != 0).then_some(m.gpu_address);
         let (buffer, cpu) = if self.unified_memory {
-            match self.buffer_over_block(device, m.region_offset, m.length, options)? {
+            match self.buffer_over_block(device, m.region_offset, m.length, options, pin)? {
                 Some(buffer) => (buffer, None),
                 None => return Ok(Err(DecodeError::Refused)),
             }
@@ -148,7 +152,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             let desc = BufferDesc {
                 length: m.length,
                 options: vec![OptionSet::ResourceOptions(options)],
-                pinned_gpu_address: (m.gpu_address != 0).then_some(m.gpu_address),
+                pinned_gpu_address: pin,
                 contents: None,
                 no_copy: false,
                 deallocator: None,
@@ -157,7 +161,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                 return Ok(Err(DecodeError::Refused));
             };
             let Some(cpu) =
-                self.buffer_over_block(device, m.region_offset, m.length, shared(options))?
+                self.buffer_over_block(device, m.region_offset, m.length, shared(options), None)?
             else {
                 return Ok(Err(DecodeError::Refused));
             };
@@ -632,6 +636,22 @@ mod tests {
         }
     }
 
+    /// The descriptor of a no-copy buffer over the `length` bytes at region offset `at` of
+    /// `options`, pinned at `pin` or not, as the platform's call log holds it.
+    fn over_block(r: &Rig, at: u64, length: u64, options: u64, pin: Option<u64>) -> Arg {
+        // SAFETY: the region is the rig's, mapped while it lives; the range is only formatted.
+        let bytes =
+            unsafe { HostRange::new(HostPtr::from_ptr(r.region.base().add(at as usize)), length) };
+        Arg::val(&BufferDesc {
+            length,
+            options: vec![OptionSet::ResourceOptions(options)],
+            pinned_gpu_address: pin,
+            contents: Some(bytes),
+            no_copy: true,
+            deallocator: Some(Box::new(|_, _| {})),
+        })
+    }
+
     /// On a GPU that does not share the CPU's memory a `Managed` buffer is two copies: the
     /// platform's own `Managed` buffer at the guest's address, filled from the block at its
     /// create, and the block. A range message copies exactly its range from the block and tells
@@ -651,16 +671,12 @@ mod tests {
             sels,
             [
                 "newBufferWithDescriptor:",
-                "newBufferWithBytesNoCopy:length:options:deallocator:",
+                "newBufferWithDescriptor:",
                 "didModifyRange:"
             ]
         );
-        // The CPU copy's buffer is Shared, over the block.
-        assert_eq!(
-            calls[1].args[0],
-            Arg::Ptr(r.region.base() as usize + at as usize)
-        );
-        assert_eq!(calls[1].args[2], Arg::U64(0));
+        // The CPU copy's buffer is Shared, over the block, at an address of the platform's.
+        assert_eq!(calls[1].args[0], over_block(&r, at, 0x100, 0, None));
         assert_eq!(calls[2].args[0], Arg::val(&NsRange::new(0, 0x100)));
         let buffer = r.dec.require_buffer(10).unwrap();
         assert_eq!(buffer.gpu_address(), 0x1_0000_0000 + 10 * 0x10_0000);
@@ -735,12 +751,14 @@ mod tests {
         assert_eq!(r.buffer(10, at, 0x100, MANAGED), Ok(()));
         let calls = r.p.call_log().since(mark);
         assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].sel, "newBufferWithDescriptor:");
+        let pin = 0x1_0000_0000 + 10 * 0x10_0000;
         assert_eq!(
-            calls[0].sel,
-            "newBufferWithBytesNoCopy:length:options:deallocator:"
+            calls[0].args[0],
+            over_block(&r, at, 0x100, MANAGED.into(), Some(pin))
         );
-        assert_eq!(calls[0].args[2], Arg::U64(MANAGED.into()));
         let buffer = r.dec.require_buffer(10).unwrap();
+        assert_eq!(buffer.gpu_address(), pin);
         assert_eq!(
             buffer.contents().addr(),
             r.region.base() as usize + at as usize

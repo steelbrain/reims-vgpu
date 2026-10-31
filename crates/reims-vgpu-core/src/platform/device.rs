@@ -216,6 +216,19 @@ pub trait GpuDevice<P: Platform>: Handle {
     /// sel: newHeapWithDescriptor: — from a heap descriptor made from `desc`, and that
     /// descriptor's `resourceOptions` read after the creation.
     fn new_heap(&self, desc: &HeapDesc<'_, P>) -> RaiseResult<HeapMade<P>>;
+    /// sel: newHeapWithDescriptor: over `bytes` in place — a Shared heap of `desc`, whose
+    /// `address_ranges` the platform ignores, with `bytes` as its memory, zero-copy, as Metal
+    /// makes one over one address range (`setAddressRanges:` SPI): a resource placed at an offset
+    /// lies in `bytes` from that offset, and the CPU's and the GPU's writes there are each
+    /// other's. Unlike a heap over address ranges it never detaches. `bytes` starts on a page and
+    /// covers the heap's size rounded up to Metal's 16 KiB page, and its constructor's contract
+    /// keeps it mapped for as long as the heap lives. Nil where the platform makes no heap over
+    /// it, as for `new_heap`.
+    fn new_heap_over_host_memory(
+        &self,
+        bytes: HostRange<'_>,
+        desc: &HeapDesc<'_, P>,
+    ) -> RaiseResult<HeapMade<P>>;
     /// sel: newSamplerStateWithDescriptor: — from a sampler descriptor made from `desc`.
     fn new_sampler_state(&self, desc: &SamplerDesc) -> RaiseResult<Option<P::SamplerState>>;
     /// sel: newDepthStencilStateWithDescriptor: — from a depth-stencil descriptor made from
