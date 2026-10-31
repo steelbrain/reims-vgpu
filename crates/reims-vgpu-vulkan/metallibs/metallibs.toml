@@ -22,3 +22,4 @@
 "tile_edges.metallib" = "14b96e4a82ab3f9c26611a5da9276c32afb1545bd8494133a9efef9acc57d856"
 "rounding_safe.metallib" = "9b8720555eefdfa339a8033f57c8dde9bca4f7d5ca2167d02b3c21067a6d350d"
 "scaler.metallib" = "4250e79e58ba2a1a74cf007d7e0904fbae669fc11543b8d5f5bcf87ccd277e9e"
+"ci_kernel.metallib" = "d50192b91cff2f1163026c3dfcaf3e2d0a06216da5261480815baf39e60a819e"

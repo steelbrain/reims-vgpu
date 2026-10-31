@@ -30,7 +30,9 @@
 //! `$OUT_DIR/spin.metallib`, the tests' kernels that read, sample and write textures of Apple's
 //! RGBX formats, `src/gpu/rgbx.metal`, into `$OUT_DIR/rgbx.metallib`, the tests' tile functions
 //! that read and write a colour attachment's imageblock cells, `src/gpu/tile_edges.metal`, into
-//! `$OUT_DIR/tile_edges.metallib`, and those that import a symbol from a dynamic library,
+//! `$OUT_DIR/tile_edges.metallib`, the tests' Core Image kernel, `src/gpu/ci_kernel.metal`,
+//! compiled as Core Image compiles one (`-fcikernel`, then `metallib -cikernel`) into
+//! `$OUT_DIR/ci_kernel.metallib`, and those that import a symbol from a dynamic library,
 //! `src/gpu/refused_import.metal`, linked into three metallibs ([`imports`]): the runtime makes
 //! libraries of metallibs, not of source. The two commands compile with the language Metal 4.0
 //! and fast math, which are what Metal's own `newLibraryWithSource:options:error:` compiles the
@@ -67,6 +69,14 @@ const DYNAMIC: [&str; 4] = ["metal", "-std=metal4.0", "-dynamiclib", "-install_n
 
 /// The commands that link a source against a dynamic library, before the search path and name.
 const LINK: [&str; 2] = ["metal", "-std=metal4.0"];
+
+/// The commands that compile a Core Image kernel library of one source, as Core Image's own,
+/// read from standard input: of a file, `-fcikernel` writes the file's absolute path into the
+/// metallib, and of standard input no path (measured with Apple metal 32023.922).
+const CI_KERNEL: [&str; 6] = ["metal", "-fcikernel", "-x", "metal", "-c", "-"];
+
+/// The commands that make the metallib of a Core Image kernel.
+const CI_KERNEL_LIBRARY: [&str; 2] = ["metallib", "-cikernel"];
 
 /// The tests' metallibs of one source each, `src/gpu/<name>.metal`.
 const TEST_LIBRARIES: [&str; 19] = [
@@ -142,6 +152,12 @@ fn steps(manifest: &Path) -> Vec<Step> {
         manifest.join("../reims-vgpu-metal/src/gpu/scaler.metal"),
         &COMPILE_SAFE,
     ));
+    steps.push(Step {
+        files: vec!["ci_kernel.metallib".to_owned()],
+        commands: format!("{} | {}", CI_KERNEL.join(" "), CI_KERNEL_LIBRARY.join(" ")),
+        sources: vec![gpu.join("ci_kernel.metal")],
+        portable: true,
+    });
     steps.push(Step {
         files: IMPORT_FILES.map(str::to_owned).to_vec(),
         commands: format!("{} | {} -L -l", DYNAMIC.join(" "), LINK.join(" ")),
@@ -237,6 +253,11 @@ fn compile(manifest: &Path, out: &Path) -> Result<(), String> {
     let (air, metallib) = (out.join("scaler.air"), out.join("scaler.metallib"));
     xcrun(&COMPILE_SAFE, &source, &air)?;
     xcrun(&["metallib"], &air, &metallib)?;
+    // The tests' Core Image kernel library.
+    let source = manifest.join("src/gpu/ci_kernel.metal");
+    let (air, metallib) = (out.join("ci_kernel.air"), out.join("ci_kernel.metallib"));
+    xcrun_stdin(&CI_KERNEL, &source, &air)?;
+    xcrun(&CI_KERNEL_LIBRARY, &air, &metallib)?;
     imports(&manifest.join("src/gpu"), out)
 }
 
@@ -385,6 +406,26 @@ const NEEDS: &str = "on a Mac the shaders need Xcode's Metal toolchain (`xcodebu
 /// The build script's environment variable `name`.
 fn var(name: &str) -> Result<String, String> {
     std::env::var(name).map_err(|e| format!("{name}: {e}"))
+}
+
+/// Runs `xcrun -sdk macosx <tool...> -o <output>` with `input` its standard input, failing on a
+/// non-zero exit.
+fn xcrun_stdin(tool: &[&str], input: &Path, output: &Path) -> Result<(), String> {
+    let stdin = std::fs::File::open(input).map_err(|e| format!("{}: {e}", input.display()))?;
+    let mut cmd = Command::new("xcrun");
+    cmd.args(["-sdk", "macosx"])
+        .args(tool)
+        .arg("-o")
+        .arg(output)
+        .stdin(stdin);
+    let status = cmd
+        .status()
+        .map_err(|e| format!("{cmd:?}: {e} ({NEEDS})"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("{cmd:?}: {status} ({NEEDS})"))
+    }
 }
 
 /// Runs `xcrun -sdk macosx <tool...> <input> -o <output>`, failing on a non-zero exit.
