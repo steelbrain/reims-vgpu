@@ -318,8 +318,8 @@ void RgfxAccelerator::freeIdChunks(const void *owner)
 
 // MARK: - Blocks
 
-IOReturn RgfxAccelerator::allocBlock(const void *owner, UInt32 context, UInt64 size, UInt64 align,
-                                    UInt64 *offset)
+IOReturn RgfxAccelerator::allocBlock(RgfxAcceleratorUserClient *owner, UInt32 context,
+                                    UInt64 size, UInt64 align, UInt64 *offset)
 {
 	if (!contextLock)
 		return kIOReturnBadArgument;
@@ -329,20 +329,27 @@ IOReturn RgfxAccelerator::allocBlock(const void *owner, UInt32 context, UInt64 s
 	IOLockUnlock(contextLock);
 	switch (r) {
 	case kRgfxBlockOk: {
-		// The device learns of the block before the process does, so the grant is on the
-		// control ring before any message naming it, on that ring or a queue's; the block is
-		// pinned until then, so no free's release overtakes it.
-		RgfxBlockGrant grant = {};
-		grant.context = context;
-		grant.offset = pin.offset;
-		grant.size = rgfxBlockAlignUp(size, kRgfxBlockPage); // the block's, as allocated
-		IOReturn posted = postLifecycle(RGFX_CMD_BLOCK_GRANT, &grant, sizeof(grant), 0, nullptr, 0,
-		                                nullptr, nullptr, 0);
+		const UInt64 bytes = rgfxBlockAlignUp(size, kRgfxBlockPage); // the block's, as allocated
+		// The block is in the process's window, and the device learns of it, before the
+		// process does: the grant is on the control ring before any message naming it, on that
+		// ring or a queue's. The block is pinned until then, so no free overtakes either.
+		IOReturn posted = owner->mapSpan(pin.offset, bytes);
+		if (posted == kIOReturnSuccess) {
+			RgfxBlockGrant grant = {};
+			grant.context = context;
+			grant.offset = pin.offset;
+			grant.size = bytes;
+			posted = postLifecycle(RGFX_CMD_BLOCK_GRANT, &grant, sizeof(grant), 0, nullptr, 0,
+			                       nullptr, nullptr, 0);
+		}
 		IOLockLock(contextLock);
-		if (posted == kIOReturnSuccess)
+		if (posted == kIOReturnSuccess) {
 			rgfxBlockUnpin(blockTable, pin);
-		else
+		} else {
+			// Out of the window again before the block goes back.
+			owner->unmapSpan(pin.offset, bytes);
 			rgfxBlockDrop(blockTable, pin);
+		}
 		IOLockUnlock(contextLock);
 		return posted;
 	}
@@ -355,12 +362,19 @@ IOReturn RgfxAccelerator::allocBlock(const void *owner, UInt32 context, UInt64 s
 	}
 }
 
-IOReturn RgfxAccelerator::freeBlock(const void *owner, UInt64 offset)
+IOReturn RgfxAccelerator::freeBlock(RgfxAcceleratorUserClient *owner, UInt64 offset)
 {
 	if (!contextLock)
 		return kIOReturnNotReady;
 	IOLockLock(contextLock);
-	RgfxBlockResult r = rgfxBlockFree(blockTable, owner, offset);
+	// Out of the process's window before the block is freed, under the lock, so no other free
+	// of it and no new grant of its span comes between.
+	UInt64 size = 0;
+	RgfxBlockResult r = rgfxBlockFreeable(blockTable, owner, offset, &size);
+	if (r == kRgfxBlockOk) {
+		owner->unmapSpan(offset, size);
+		r = rgfxBlockFree(blockTable, owner, offset);
+	}
 	IOLockUnlock(contextLock);
 	if (r == kRgfxBlockBusy)
 		return kIOReturnBusy;
@@ -512,9 +526,9 @@ bool letGoBlock(RgfxSurfaceEntry &e, UInt32 context, bool keep)
 }
 } // namespace
 
-IOReturn RgfxAccelerator::acquireSurfaceBlock(const void *client, UInt32 context, task_t task,
-                                             UInt64 address, UInt64 length, UInt64 size,
-                                             SurfaceBlock *block)
+IOReturn RgfxAccelerator::acquireSurfaceBlock(RgfxAcceleratorUserClient *client, UInt32 context,
+                                             task_t task, UInt64 address, UInt64 length,
+                                             UInt64 size, SurfaceBlock *block)
 {
 	if (!contextLock)
 		return kIOReturnNotReady;
@@ -540,14 +554,29 @@ IOReturn RgfxAccelerator::acquireSurfaceBlock(const void *client, UInt32 context
 	int32_t at = table.entries ? rgfxSurfaceFind(table, runs, count, length, size, &sizeDiffers)
 	                           : -1;
 	if (at >= 0) {
-		// Another process's plane: this client holds its block too.
+		// Another process's plane: this client holds its block too, in its window from its
+		// first hold, mapped under the lock so no let-go of the hold comes between.
 		RgfxSurfaceEntry &e = table.entries[at];
 		RgfxSurfaceHoldResult held = rgfxSurfaceHold(e, client, context, pages);
 		*block = {e.offset, e.size, e.serial, false};
+		IOReturn mapped = kIOReturnSuccess;
+		if (held == kRgfxSurfaceHoldNew) {
+			mapped = client->mapSpan(e.offset, e.size);
+			if (mapped != kIOReturnSuccess) {
+				// No hold the device was not told of, nor one not in the window.
+				void *mine = nullptr;
+				UInt32 c = 0;
+				rgfxSurfaceLetGo(e, client, true, &mine, &c);
+				client->unmapSpan(e.offset, e.size);
+				held = kRgfxSurfaceHoldFull;
+			}
+		}
 		IOLockUnlock(contextLock);
 		freeRuns(runs, count);
 		if (held != kRgfxSurfaceHoldNew) {
 			unwire(pages);
+			if (mapped != kIOReturnSuccess)
+				return mapped;
 			return held == kRgfxSurfaceHoldAgain ? kIOReturnSuccess : kIOReturnNoResources;
 		}
 		RgfxBlockGrant share = {};
@@ -563,9 +592,12 @@ IOReturn RgfxAccelerator::acquireSurfaceBlock(const void *client, UInt32 context
 			IOLockLock(contextLock);
 			bool release = false;
 			int32_t again = rgfxSurfaceAt(table, block->offset);
-			if (again >= 0 &&
-			    rgfxSurfaceLetGo(table.entries[again], client, true, &mine, &c) ==
-			        kRgfxSurfaceLetGoLast)
+			RgfxSurfaceLetGo gone = again >= 0 ? rgfxSurfaceLetGo(table.entries[again], client,
+			                                                      true, &mine, &c)
+			                                   : kRgfxSurfaceLetGoNotHeld;
+			if (gone != kRgfxSurfaceLetGoNotHeld)
+				client->unmapSpan(block->offset, block->size);
+			if (gone == kRgfxSurfaceLetGoLast)
 				release = letGoBlock(table.entries[again], c, false);
 			IOLockUnlock(contextLock);
 			unwire(mine);
@@ -598,6 +630,18 @@ IOReturn RgfxAccelerator::acquireSurfaceBlock(const void *client, UInt32 context
 	e.runCount = count;
 	rgfxSurfaceHold(e, client, context, pages);
 	*block = {offset, size, pin.serial, true};
+	// In the client's window, under the lock, so no let-go of the hold comes between. A block
+	// that is not goes back as if never made: the device was not told of it.
+	IOReturn mapped = client->mapSpan(offset, size);
+	if (mapped != kIOReturnSuccess) {
+		client->unmapSpan(offset, size);
+		rgfxBlockDrop(blockTable, pin);
+		rgfxSurfaceClear(e);
+		IOLockUnlock(contextLock);
+		freeRuns(runs, count);
+		unwire(pages);
+		return mapped;
+	}
 	IOLockUnlock(contextLock);
 	// The device learns of the block before any process does; it is pinned until then, so no
 	// release overtakes the share.
@@ -613,7 +657,10 @@ IOReturn RgfxAccelerator::acquireSurfaceBlock(const void *client, UInt32 context
 	rgfxBlockUnpin(blockTable, pin);
 	if (posted != kIOReturnSuccess) {
 		UInt32 c = 0;
-		if (rgfxSurfaceLetGo(e, client, true, &mine, &c) == kRgfxSurfaceLetGoLast)
+		RgfxSurfaceLetGo gone = rgfxSurfaceLetGo(e, client, true, &mine, &c);
+		if (gone != kRgfxSurfaceLetGoNotHeld)
+			client->unmapSpan(offset, size);
+		if (gone == kRgfxSurfaceLetGoLast)
 			release = letGoBlock(e, c, false);
 	}
 	IOLockUnlock(contextLock);
@@ -623,7 +670,7 @@ IOReturn RgfxAccelerator::acquireSurfaceBlock(const void *client, UInt32 context
 	return posted;
 }
 
-IOReturn RgfxAccelerator::releaseSurfaceBlock(const void *client, UInt64 offset)
+IOReturn RgfxAccelerator::releaseSurfaceBlock(RgfxAcceleratorUserClient *client, UInt64 offset)
 {
 	if (!contextLock)
 		return kIOReturnNotReady;
@@ -636,6 +683,9 @@ IOReturn RgfxAccelerator::releaseSurfaceBlock(const void *client, UInt64 offset)
 	                               : rgfxSurfaceLetGo(table.entries[at], client, false, &pages,
 	                                                  &context);
 	UInt64 size = at < 0 ? 0 : table.entries[at].size;
+	// Out of the client's window once its hold ends, before the block can be anyone else's.
+	if (gone == kRgfxSurfaceLetGoHold || gone == kRgfxSurfaceLetGoLast)
+		client->unmapSpan(offset, size);
 	bool release = false;
 	if (gone == kRgfxSurfaceLetGoLast)
 		release = letGoBlock(table.entries[at], context, false);

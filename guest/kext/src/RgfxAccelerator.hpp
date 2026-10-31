@@ -14,9 +14,9 @@
  * keys live in src/Info.plist's accelerator personality (stage3-apple-metal-iface.md
  * section 1). This service then exposes, over OUR protocol (not Apple's IOGPU
  * user-client ABI), the two things the bundle's transport needs:
- *   - the device BAR-2 region, mapped into the Metal client's task, so the bundle's
- *     RgfxRegion / RgfxRingWriter write into real device memory (clientMemoryForType
- *     on RgfxAcceleratorUserClient), and
+ *   - the process's part of the device's BAR-2 region, mapped into the Metal client's
+ *     task in its window (RgfxAcceleratorUserClient.hpp), so the bundle's RgfxRegion /
+ *     RgfxRingWriter write into real device memory, and
  *   - the doorbell: a write of a ring id to RGFX_REG_DOORBELL in BAR 0, to wake the
  *     host's consumer of a queue's submission ring (ringDoorbell, reached from the
  *     user client's external method).
@@ -54,11 +54,11 @@
 #include "RgfxBlockTable.hpp"
 #include "reims_graphics_wire.h"
 
-// OUR user-client protocol (not Apple's IOGPU ABI). The bundle's wire handshake
-// (a boot-gated stub in RgfxMetalDevice today) opens the accelerator with
-// IOServiceOpen(acceleratorPort, task, kRgfxAccelUserClientType, &connect), maps the
-// region with IOConnectMapMemory(kRgfxAccelMemoryRegion), and rings a ring's doorbell
-// with IOConnectCallScalarMethod(kRgfxAccelMethodDoorbell, {ringId}).
+// OUR user-client protocol (not Apple's IOGPU ABI). The bundle's wire handshake opens the
+// accelerator with IOServiceOpen(acceleratorPort, task, kRgfxAccelUserClientType, &connect),
+// reads the device info (kRgfxAccelMethodDeviceInfo), opens its context and window
+// (kRgfxAccelMethodOpenContext), and rings a ring's doorbell with
+// IOConnectCallScalarMethod(kRgfxAccelMethodDoorbell, {ringId}).
 
 // Our own user-client type: a private one ('RGFX'), clear of the public IOAccel surface type 0
 // (kRgfxSurfaceUserClientType) and of the types Apple's frameworks open.
@@ -69,8 +69,9 @@ static const UInt32 kRgfxSurfaceUserClientType = 0;
 // (RgfxAcceleratorUserClient::deviceMethod).
 static const UInt32 kRgfxIOGPUDeviceUserClientType = 5;
 
-// clientMemoryForType ids: the whole BAR-2 device region (control rings, caps page
-// and the allocations past RGFX_ALLOCATIONS_OFFSET), mapped into the client task.
+// clientMemoryForType ids: the whole BAR-2 device region, which is refused
+// (kIOReturnUnsupported): the region holds every process's blocks, the rings and the device
+// page, and a process maps only its own part of it, in its window.
 enum {
 	kRgfxAccelMemoryRegion = 0,
 };
@@ -86,8 +87,11 @@ enum {
 // The process's device context (RgfxAcceleratorContexts.cpp), on our own user client (type
 // 0) only, numbered clear of the selectors Apple's IOGPU base drives on its type-0 client.
 enum {
-	// Opens the client's context. No input; out: the context number c, the object-id base
-	// (c << RGFX_CONTEXT_OBJ_ID_SHIFT) and the GPU-address base of the context's slot.
+	// Opens the client's context and its window. No input; out: the context number c, the
+	// object-id base (c << RGFX_CONTEXT_OBJ_ID_SHIFT), the GPU-address base of the context's
+	// slot, and the window's base in the process and its size (the region's): region offset o
+	// of what the client is given lies at the base plus o, and nothing else of the region is
+	// mapped there (RgfxAcceleratorUserClient.hpp).
 	kRgfxAccelMethodOpenContext = 0x100,
 	// A region block: in size, align (a power of two); out: its region offset.
 	kRgfxAccelMethodAlloc = 0x101,
@@ -140,6 +144,10 @@ enum {
 	// Lets go of one ask of the shared block at the region offset scalarInput[0]; the block goes
 	// once no process holds it, through its BLOCK_RELEASE.
 	kRgfxAccelMethodSurfaceBlockRelease = 0x10a,
+	// The device info the host wrote at RGFX_DEVICE_INFO_OFFSET (RgfxDeviceInfo): no input;
+	// struct out, exactly sizeof(RgfxDeviceInfo) bytes. Its page holds the control completion
+	// ring's tail, so no process maps it; the kext reads it for the process.
+	kRgfxAccelMethodDeviceInfo = 0x10b,
 };
 
 class RgfxAcceleratorUserClient;
@@ -200,9 +208,11 @@ public:
 	// is kIOReturnBusy while a create naming it is in flight (pinRange). freeBlocks frees the
 	// owner's blocks after its close is answered; keepBlocks keeps them from use for good after
 	// a close that was not.
-	IOReturn allocBlock(const void *owner, UInt32 context, UInt64 size, UInt64 align,
-	                    UInt64 *offset);
-	IOReturn freeBlock(const void *owner, UInt64 offset);
+	// allocBlock maps the block into the client's window before it returns; freeBlock takes it
+	// back from the window before the block is freed.
+	IOReturn allocBlock(RgfxAcceleratorUserClient *owner, UInt32 context, UInt64 size,
+	                    UInt64 align, UInt64 *offset);
+	IOReturn freeBlock(RgfxAcceleratorUserClient *owner, UInt64 offset);
 	void freeBlocks(const void *owner);
 	void keepBlocks(const void *owner);
 	// Pins the owner's live block that holds the `length` bytes at `offset`, for a create that
@@ -213,16 +223,19 @@ public:
 	// of context `context` in `task`: the block of the plane of `length` bytes at `address` in
 	// the task, of `size` bytes (kRgfxAccelMethodSurfaceBlock), and letting go of one ask of
 	// it. dropSurfaceBlocks lets go of every one of the client's after its close, the device
-	// answered (`closed`) or not; pinRange pins a span of one the client holds.
+	// answered (`closed`) or not; pinRange pins a span of one the client holds. Each holder has
+	// the block mapped in its window from its first ask until its hold ends, which takes it
+	// back before the block can go to anyone else.
 	struct SurfaceBlock {
 		UInt64 offset;
 		UInt64 size;
 		UInt64 serial;
 		bool fresh;
 	};
-	IOReturn acquireSurfaceBlock(const void *client, UInt32 context, task_t task, UInt64 address,
-	                             UInt64 length, UInt64 size, SurfaceBlock *block);
-	IOReturn releaseSurfaceBlock(const void *client, UInt64 offset);
+	IOReturn acquireSurfaceBlock(RgfxAcceleratorUserClient *client, UInt32 context, task_t task,
+	                             UInt64 address, UInt64 length, UInt64 size,
+	                             SurfaceBlock *block);
+	IOReturn releaseSurfaceBlock(RgfxAcceleratorUserClient *client, UInt64 offset);
 	void dropSurfaceBlocks(const void *client, bool closed);
 	// The processes' object lifecycle, on the framebuffer's control ring
 	// (ReimsGraphics::postLifecycle). openQueue's QUEUE_CREATE is answered once the device has
@@ -259,8 +272,9 @@ public:
 	// For our user client `client` in `task`, of context `context`: the scanout surface
 	// `surfaceId` of that task is drawn into, whose span `client` may name from then on
 	// (grantedRange) until revokeGrants or the surface goes. The device is told the span is
-	// `context`'s (BLOCK_GRANT) before this returns.
-	IOReturn grantSurfaceScanout(const void *client, UInt32 context, task_t task,
+	// `context`'s (BLOCK_GRANT) before this returns, and the span is mapped in the client's
+	// window while the grant lasts.
+	IOReturn grantSurfaceScanout(RgfxAcceleratorUserClient *client, UInt32 context, task_t task,
 	                             UInt32 surfaceId, Scanout *scanout);
 	void revokeGrants(const void *client);
 	bool grantedRange(const void *client, UInt64 offset, UInt64 length);

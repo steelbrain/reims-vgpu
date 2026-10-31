@@ -223,6 +223,20 @@ inline void rgfxBlockDrop(RgfxBlockTable &t, const RgfxBlockPin &pin)
 		rgfxBlockRemove(t, static_cast<uint32_t>(at));
 }
 
+// Whether `owner` may free its block at `offset` now, as rgfxBlockFree would answer, with the
+// block's bytes in `*size` where it may: the caller takes the block from the owner's sight first.
+inline RgfxBlockResult rgfxBlockFreeable(const RgfxBlockTable &t, const void *owner,
+                                         uint64_t offset, uint64_t *size)
+{
+	int64_t at = rgfxBlockIndex(t, offset);
+	if (at < 0 || t.blocks[at].owner != owner || t.blocks[at].state != kRgfxBlockLive)
+		return kRgfxBlockBadArgument;
+	if (t.blocks[at].pins)
+		return kRgfxBlockBusy;
+	*size = t.blocks[at].size;
+	return kRgfxBlockOk;
+}
+
 // `owner` frees its live block at `offset`: it is freed, for its release to be posted. Busy while
 // a create naming it is in flight.
 inline RgfxBlockResult rgfxBlockFree(RgfxBlockTable &t, const void *owner, uint64_t offset)

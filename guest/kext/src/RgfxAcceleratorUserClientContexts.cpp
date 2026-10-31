@@ -32,11 +32,17 @@ IOReturn RgfxAcceleratorUserClient::contextMethod(uint32_t selector,
 	uint64_t *out = a->scalarOutput;
 	switch (selector) {
 	case kRgfxAccelMethodOpenContext: {
-		if (a->scalarOutputCount != 3)
+		if (a->scalarOutputCount != 5)
 			return kIOReturnBadArgument;
 		IOLockLock(queueLock);
 		if (!hasContext) {
-			IOReturn r = owner->openContext(&context, &slot);
+			// The window first: a context with no window is never opened.
+			IOReturn r = openWindow();
+			if (r == kIOReturnSuccess) {
+				r = owner->openContext(&context, &slot);
+				if (r != kIOReturnSuccess)
+					closeWindow();
+			}
 			if (r != kIOReturnSuccess) {
 				IOLockUnlock(queueLock);
 				return r;
@@ -46,9 +52,15 @@ IOReturn RgfxAcceleratorUserClient::contextMethod(uint32_t selector,
 		out[0] = context;
 		out[1] = static_cast<uint64_t>(context) << RGFX_CONTEXT_OBJ_ID_SHIFT;
 		out[2] = RGFX_CONTEXT_VA_BASE + static_cast<uint64_t>(slot) * RGFX_CONTEXT_VA_SPAN;
+		IOLockLock(windowLock);
+		out[3] = windowBase;
+		out[4] = windowSize;
+		IOLockUnlock(windowLock);
 		IOLockUnlock(queueLock);
 		return kIOReturnSuccess;
 	}
+	case kRgfxAccelMethodDeviceInfo:
+		return deviceInfoMethod(a);
 	case kRgfxAccelMethodResourceIds: {
 		if (a->scalarOutputCount != 1)
 			return kIOReturnBadArgument;
@@ -334,6 +346,9 @@ void RgfxAcceleratorUserClient::releaseContext()
 	IOLockWakeup(completionLock, &completionCount, false);
 	IOLockUnlock(completionLock);
 	IOLockLock(queueLock);
+	// The process reaches nothing of the region from here on: its window goes before anything
+	// it held is freed, and given to another process.
+	closeWindow();
 	RgfxAccelerator *accel = owner;
 	// Under the queue lock, which a QUEUE_CREATE watches its ring under, so none is left.
 	if (accel)
@@ -357,4 +372,41 @@ void RgfxAcceleratorUserClient::releaseContext()
 	accel->revokeGrants(this);
 	hasContext = false;
 	IOLockUnlock(queueLock);
+}
+
+// kRgfxAccelMethodDeviceInfo (RgfxAccelerator.hpp): the device info the host wrote, read from
+// the region for the process, which maps no page of it.
+IOReturn RgfxAcceleratorUserClient::deviceInfoMethod(IOExternalMethodArguments *a)
+{
+	if (a->scalarInputCount != 0 || a->scalarOutputCount != 0 || a->structureInputSize != 0 ||
+	    a->structureOutputSize != sizeof(RgfxDeviceInfo))
+		return kIOReturnBadArgument;
+	IODeviceMemory *region = owner->copyRegion();
+	if (!region)
+		return kIOReturnNotReady;
+	RgfxDeviceInfo *info = static_cast<RgfxDeviceInfo *>(IOMalloc(sizeof(RgfxDeviceInfo)));
+	IOReturn r = kIOReturnNoMemory;
+	if (info) {
+		r = region->readBytes(RGFX_DEVICE_INFO_OFFSET, info, sizeof(RgfxDeviceInfo)) ==
+		            sizeof(RgfxDeviceInfo)
+		        ? kIOReturnSuccess
+		        : kIOReturnIOError;
+		if (r == kIOReturnSuccess) {
+			if (a->structureOutput)
+				memcpy(a->structureOutput, info, sizeof(RgfxDeviceInfo));
+			else if (IOMemoryDescriptor *desc = a->structureOutputDescriptor) {
+				r = desc->prepare(kIODirectionIn);
+				if (r == kIOReturnSuccess) {
+					if (desc->writeBytes(0, info, sizeof(RgfxDeviceInfo)) !=
+					    sizeof(RgfxDeviceInfo))
+						r = kIOReturnBadArgument;
+					desc->complete(kIODirectionIn);
+				}
+			} else
+				r = kIOReturnBadArgument;
+		}
+		IOFree(info, sizeof(RgfxDeviceInfo));
+	}
+	region->release();
+	return r;
 }

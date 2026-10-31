@@ -31,7 +31,13 @@ bool RgfxAcceleratorUserClient::initWithTask(task_t owningTask, void *securityID
 	completionLock = IOLockAlloc();
 	completionCount = 0;
 	completionsClosed = false;
-	return queueLock != nullptr && completionLock != nullptr;
+	windowLock = IOLockAlloc();
+	windowMemory = nullptr;
+	windowMap = nullptr;
+	windowBase = 0;
+	windowSize = 0;
+	grants = grantNs = revokes = revokeNs = 0;
+	return queueLock != nullptr && completionLock != nullptr && windowLock != nullptr;
 }
 
 bool RgfxAcceleratorUserClient::start(IOService *provider)
@@ -57,6 +63,10 @@ void RgfxAcceleratorUserClient::free()
 	if (completionLock)
 		IOLockFree(completionLock);
 	completionLock = nullptr;
+	closeWindow();
+	if (windowLock)
+		IOLockFree(windowLock);
+	windowLock = nullptr;
 	super::free();
 }
 
@@ -77,30 +87,21 @@ IOReturn RgfxAcceleratorUserClient::clientClose()
 	return kIOReturnSuccess;
 }
 
-// MARK: - The region mapping
+// MARK: - No region mapping
 
 IOReturn RgfxAcceleratorUserClient::clientMemoryForType(UInt32 type, IOOptionBits *options,
                                                         IOMemoryDescriptor **memory)
 {
-	// RGFX DIAG (Wall-2 trace; remove before merge): which memory type the base maps.
-	RgfxCaller caller;
-	IOLog("RGFX: clientMemoryForType type=%u on user client type %u from %s[%d] (ours=%u)\n", type,
-	      ucType, caller.name, caller.pid, kRgfxAccelMemoryRegion);
-	if (type != kRgfxAccelMemoryRegion)
-		return kIOReturnUnsupported;
-	if (!owner)
-		return kIOReturnNotReady;
-
-	IODeviceMemory *region = owner->copyRegion();
-	if (!region)
-		return kIOReturnNoMemory;
-
-	// The region is host memory behind a prefetchable BAR; map it write-back, as the
-	// framebuffer maps it in the kernel, so the bundle's ring and resource writes are
-	// cached. IOUserClient releases this reference when the last map is destroyed.
-	*options |= kIOMapCopybackCache;
-	*memory = region;
-	return kIOReturnSuccess;
+	// The region holds every process's blocks, the rings and the device page: none of it is
+	// mapped whole. The process's part of it is in its window (openWindow), and the device info
+	// comes from kRgfxAccelMethodDeviceInfo. Logged once per (user-client type, memory type).
+	static char site;
+	if (rgfxFirstCalls(&site, (static_cast<UInt64>(ucType) << 32) | type, 1)) {
+		RgfxCaller caller;
+		IOLog("RGFX: user client type %u: memory type %u from %s[%d] is not mapped\n", ucType,
+		      type, caller.name, caller.pid);
+	}
+	return kIOReturnUnsupported;
 }
 
 // MARK: - External methods (the doorbell)
@@ -198,7 +199,7 @@ IOReturn RgfxAcceleratorUserClient::externalMethod(uint32_t selector,
 	// Our own protocol: the process's context (its ids, blocks and queues), on our own user
 	// client alone.
 	if (ucType == kRgfxAccelUserClientType && arguments && selector >= kRgfxAccelMethodOpenContext &&
-	    selector <= kRgfxAccelMethodSurfaceBlockRelease)
+	    selector <= kRgfxAccelMethodDeviceInfo)
 		return contextMethod(selector, arguments);
 
 	// Our own protocol: the doorbell. ONLY on our own user client (type 0). Apple's IOGPU

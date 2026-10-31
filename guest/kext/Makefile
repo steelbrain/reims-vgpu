@@ -57,7 +57,8 @@ OBJECTS = $(BUILD)/obj/ReimsGraphics.o \
 	$(BUILD)/obj/RgfxAcceleratorContexts.o \
 	$(BUILD)/obj/RgfxAcceleratorUserClientContexts.o \
 	$(BUILD)/obj/RgfxAcceleratorSurfaces.o \
-	$(BUILD)/obj/RgfxSurfaceUserClient.o
+	$(BUILD)/obj/RgfxSurfaceUserClient.o \
+	$(BUILD)/obj/RgfxAcceleratorUserClientWindow.o
 
 all: $(BINARY)
 
@@ -88,7 +89,8 @@ check: $(BINARY) $(BUILD)/obj/layout.o
 
 # The native tests: header-only rules of the kext's, built for this Mac.
 TESTS = $(BUILD)/tests/spans_test $(BUILD)/tests/blocks_test $(BUILD)/tests/surface_blocks_test \
-	$(BUILD)/tests/surface_test
+	$(BUILD)/tests/surface_test \
+	$(BUILD)/tests/window_test
 
 $(BUILD)/tests/%: tests/%.cpp $(HEADERS) ../../crates/reims-graphics/include/reims_graphics_wire.h Makefile
 	@mkdir -p $(@D)

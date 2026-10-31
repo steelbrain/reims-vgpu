@@ -1,8 +1,10 @@
 /*
  * RgfxRegion: the guest bundle's allocator over the reims-graphics device's BAR 2
- * region (the committed region layout in reims_graphics_wire.h). The device maps
- * the region write-back and hands this allocator its base and size; this hands out
- * aligned blocks past the host-reserved head of the region:
+ * region (the committed region layout in reims_graphics_wire.h), as the process sees it in
+ * its window: region offset o at the window's base plus o. The kext maps in only what is the
+ * process's (its blocks, the shared blocks of the surface planes it holds, the scanout it is
+ * granted), write-back, each before the process learns of it; the rest of the window, the
+ * reserved head with it, reads zeros. This hands out aligned blocks past the head:
  *   - per-queue submission + completion ring pairs (a ring header then a power-of-
  *     two byte ring, placed for RgfxSerializer::createQueue), and
  *   - resource blocks for Shared / no-copy buffers and Shared heaps (placed for
@@ -25,7 +27,7 @@
  * blocks default to a page so a block can later back a mapping.
  *
  * Our own code; depends only on the committed wire header. In a unit test the region
- * is a plain buffer; in the bundle it is the BAR-mapped region.
+ * is a plain buffer; in the bundle it is the context's window.
  */
 
 #ifndef RGFX_REGION_HPP_

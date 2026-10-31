@@ -1,20 +1,19 @@
 /*
  * RgfxAcceleratorUserClient: the connection the guest Metal bundle opens to the
- * RgfxAccelerator over OUR protocol (RgfxAccelerator.hpp names the ids and selectors).
- * It does exactly two things, and no more:
- *   - clientMemoryForType(kRgfxAccelMemoryRegion): hands back the device's BAR-2
- *     region so the client's IOConnectMapMemory maps it into the Metal process; the
- *     bundle's RgfxRegion / RgfxRingWriter then write rings and resources into real
- *     device memory, and read the caps page the host wrote in the region's reserved
- *     head.
+ * RgfxAccelerator over OUR protocol (RgfxAccelerator.hpp names the ids and selectors): the
+ * doorbell, the process's context and its window.
+ *   - The window (RgfxAcceleratorUserClientWindow.cpp): the range of the process where its part
+ *     of the region lies, each byte at the window's base plus its region offset. The kext maps
+ *     in only what is the client's: its blocks, the shared blocks of the surface planes it
+ *     holds and the scanout it is granted, and nothing of the rings, the device page or another
+ *     process's. The bundle's RgfxRegion and RgfxRingWriter write rings and resources there,
+ *     in place in the device's memory. The device info comes from a selector.
  *   - externalMethod(kRgfxAccelMethodDoorbell): writes a ring id to RGFX_REG_DOORBELL
  *     so the host's consumer of that queue's submission ring wakes.
  *
  * This is deliberately NOT Apple's IOGPU submission / allocation user-client ABI. That
  * ABI (its types and selectors) is Apple-private and boot-gated — see the base-class
- * note in RgfxAccelerator.hpp — so it is neither modelled nor invented here. Our
- * transport is region-in-place plus a doorbell, which is all the bundle's committed
- * RgfxRingWriter / RgfxReplyReader need.
+ * note in RgfxAccelerator.hpp — so it is neither modelled nor invented here.
  *
  * Our own code; it names only SDK-public IOKit classes.
  */
@@ -25,6 +24,8 @@
 #include <IOKit/IOUserClient.h>
 
 #include "RgfxAccelerator.hpp"
+
+class IOBufferMemoryDescriptor;
 
 class RgfxAcceleratorUserClient : public IOUserClient {
 	OSDeclareDefaultStructors(RgfxAcceleratorUserClient);
@@ -44,9 +45,19 @@ public:
 	// client's held but its own.
 	void wakeCompletions();
 
-	// Map the device region (kRgfxAccelMemoryRegion) into the client task.
+	// Maps nothing: the region reaches the process only through the window.
 	IOReturn clientMemoryForType(UInt32 type, IOOptionBits *options,
 	                             IOMemoryDescriptor **memory) override;
+
+	// The window (RgfxAcceleratorUserClientWindow.cpp): maps the region's `length` bytes at
+	// `offset` in at the window's base plus `offset`, a span of the client's own
+	// (RgfxWindowSpans.hpp), before the process learns of it; unmapSpan maps the window's own
+	// bytes back over the span, read-only, before the span can be anyone else's. Any thread; the
+	// window's lock alone, which a caller may take under the accelerator's context or surface
+	// lock. mapSpan fails, the op it serves with it, where the window is closed or the span is not
+	// one; an unmapSpan that cannot map the window back closes the window.
+	IOReturn mapSpan(UInt64 offset, UInt64 length);
+	void unmapSpan(UInt64 offset, UInt64 length);
 
 	// Dispatch our selectors (the doorbell).
 	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *arguments,
@@ -69,6 +80,11 @@ private:
 	IOReturn submitMethod(IOExternalMethodArguments *arguments);
 	IOReturn waitCompletionsMethod(IOExternalMethodArguments *arguments);
 	void releaseContext();
+	// Makes the window at the context's open; closeWindow lets it go, every span in it with it,
+	// at the release, before the context's blocks go.
+	IOReturn openWindow();
+	void closeWindow();
+	IOReturn deviceInfoMethod(IOExternalMethodArguments *arguments);
 
 	static const UInt32 kMaxQueues = 256;
 	bool hasContext;
@@ -83,6 +99,19 @@ private:
 	IOLock *completionLock;
 	UInt64 completionCount;
 	bool completionsClosed;
+
+	// Under windowLock: the window's memory and its mapping in the task, its base there and its
+	// size, null and 0 while closed; how many spans were mapped in and taken back, and the time
+	// it took, logged at the close.
+	IOLock *windowLock;
+	IOBufferMemoryDescriptor *windowMemory;
+	IOMemoryMap *windowMap;
+	UInt64 windowBase;
+	UInt64 windowSize;
+	UInt64 grants;
+	UInt64 grantNs;
+	UInt64 revokes;
+	UInt64 revokeNs;
 
 	task_t task;
 	RgfxAccelerator *owner;

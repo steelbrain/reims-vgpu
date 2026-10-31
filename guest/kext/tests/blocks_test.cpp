@@ -88,9 +88,20 @@ int main()
 		check(!rgfxBlockPin(x.t, a, at + 0x1000, 0x1001, &pin), "nor a span past its end");
 		check(rgfxBlockPin(x.t, a, at + 0x1000, 0x1000, &pin) && pin.offset == at,
 		      "its owner pins a span in it");
+		uint64_t size = 0;
+		check(rgfxBlockFreeable(x.t, a, at, &size) == kRgfxBlockBusy && size == 0,
+		      "pinned, it may not be freed");
 		check(rgfxBlockFree(x.t, a, at) == kRgfxBlockBusy, "pinned, it is busy");
 		rgfxBlockUnpin(x.t, pin);
+		check(rgfxBlockFreeable(x.t, b, at, &size) == kRgfxBlockBadArgument,
+		      "another client may not free it");
+		check(rgfxBlockFreeable(x.t, a, at + 0x1000, &size) == kRgfxBlockBadArgument,
+		      "nor its owner a span in it");
+		check(rgfxBlockFreeable(x.t, a, at, &size) == kRgfxBlockOk && size == 0x2000,
+		      "unpinned, its owner may free its bytes");
 		check(rgfxBlockFree(x.t, a, at) == kRgfxBlockOk, "unpinned, it is freed");
+		check(rgfxBlockFreeable(x.t, a, at, &size) == kRgfxBlockBadArgument,
+		      "freed, it may not be freed again");
 		RgfxBlock release;
 		check(rgfxBlockNextRelease(x.t, &release), "its release");
 		rgfxBlockReleased(x.t, at, release.serial, true);

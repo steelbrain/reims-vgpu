@@ -60,10 +60,9 @@ void rgfxDiag(const char *fmt, ...)
 
 // The accelerator's user-client ABI, mirroring guest/kext/src/RgfxAccelerator.hpp (that
 // header is kernel-only and not included here, so the values are duplicated and kept in sync
-// by hand): the only user-client type, the BAR-2 region memory id, and the doorbell selector.
+// by hand): the only user-client type, and the selectors.
 enum {
 	kRgfxAccelUserClientType = 0x52474658, // 'RGFX', clear of the IOAccel surface type 0
-	kRgfxAccelMemoryRegion = 0,
 	kRgfxAccelMethodDoorbell = 0,
 	kRgfxAccelMethodOpenContext = 0x100,
 	kRgfxAccelMethodAlloc = 0x101,
@@ -76,6 +75,7 @@ enum {
 	kRgfxAccelMethodSurfaceScanout = 0x108,
 	kRgfxAccelMethodSurfaceBlock = 0x109,
 	kRgfxAccelMethodSurfaceBlockRelease = 0x10a,
+	kRgfxAccelMethodDeviceInfo = 0x10b,
 };
 
 namespace {
@@ -277,8 +277,8 @@ void rgfxDeviceDoorbell(void *context, uint32_t ring_id)
 	std::mutex _queueRingsLock;  // queues are made and end on any thread
 	io_connect_t _conn;          // our accelerator user client (BAR-2 region map + doorbell)
 	std::unique_ptr<RgfxRingWriter> _controlRing; // the lifecycle, forwarded to the kext
-	mach_vm_address_t _mapBase;  // mapped device-region base (0 until the handshake maps it)
-	mach_vm_size_t _mapSize;     // mapped device-region size
+	mach_vm_address_t _mapBase;  // the window's base in this process (0 until the context opens)
+	mach_vm_size_t _mapSize;     // the window's size, the region's
 }
 
 // RGFX DIAG (Wall-2 trace; remove before merge): fires when the bundle is loaded
@@ -321,51 +321,49 @@ void rgfxDeviceDoorbell(void *context, uint32_t ring_id)
 	_mapBase = 0;
 	_mapSize = 0;
 
-	// Wire transport handshake: open our own user client on the accelerator and map the
-	// device region (BAR 2) into this task. Read the caps blob the host wrote, build the
-	// region allocator, and stand up the device submission ring (RgfxSerializer) + device
-	// completion ring (RgfxReplyReader). With these non-null the resource / command-queue /
-	// command-buffer categories route over our wire instead of falling back to the
-	// IOGPUMetalDevice base (Apple's IOGPU kernel ABI). Any failure leaves the transport
-	// stubbed (the getters answer from defaults) rather than crashing.
+	// Wire transport handshake: open our own user client on the accelerator, read the caps blob
+	// the host wrote, open the process's context, whose window is where its part of the device
+	// region (BAR 2) lies in this task, and build the region allocator over the window and the
+	// device submission ring (RgfxSerializer) + device completion ring (RgfxReplyReader). With
+	// these non-null the resource / command-queue / command-buffer categories route over our
+	// wire instead of falling back to the IOGPUMetalDevice base (Apple's IOGPU kernel ABI). Any
+	// failure leaves the transport stubbed (the getters answer from defaults) rather than
+	// crashing.
 	kern_return_t kr = IOServiceOpen(port, mach_task_self(), kRgfxAccelUserClientType, &_conn);
 	if (kr != KERN_SUCCESS) {
 		rgfxDiag("RGFX: IOServiceOpen(type=%u) failed kr=0x%x; transport stubbed\n",
 		         kRgfxAccelUserClientType, kr);
 		return self;
 	}
-	mach_vm_address_t addr = 0;
-	mach_vm_size_t mapSize = 0;
-	kr = IOConnectMapMemory(_conn, kRgfxAccelMemoryRegion, mach_task_self(), &addr, &mapSize,
-	                        kIOMapAnywhere);
-	if (kr != KERN_SUCCESS || addr == 0 || mapSize < RGFX_ALLOCATIONS_OFFSET) {
-		rgfxDiag("RGFX: IOConnectMapMemory failed kr=0x%x size=%llu; transport stubbed\n", kr,
-		         (unsigned long long)mapSize);
+
+	// The caps blob the host wrote (read once at init), which the kext reads for us: its page
+	// is no process's to map.
+	RgfxDeviceInfo info = {};
+	size_t infoSize = sizeof(info);
+	kr = IOConnectCallStructMethod(_conn, kRgfxAccelMethodDeviceInfo, nullptr, 0, &info,
+	                               &infoSize);
+	if (kr != KERN_SUCCESS || infoSize != sizeof(info) || !_caps.load(info))
+		rgfxDiag("RGFX: caps blob not read (kr=0x%x) or invalid; using defaults\n", kr);
+
+	// The process's context: its id and address ranges, its window, its blocks and its chunks
+	// of texture resource ids, from the kext, so no two processes' rings, blocks or numbers
+	// meet, and this one maps nothing of the region but its own.
+	uint64_t ctx[5] = {};
+	uint32_t ctxCount = 5;
+	kr = IOConnectCallScalarMethod(_conn, kRgfxAccelMethodOpenContext, nullptr, 0, ctx, &ctxCount);
+	if (kr != KERN_SUCCESS || ctxCount != 5 || ctx[3] == 0 || ctx[4] < RGFX_ALLOCATIONS_OFFSET) {
+		rgfxDiag("RGFX: OPEN_CONTEXT failed kr=0x%x (window 0x%llx, %llu bytes); transport "
+		         "stubbed\n",
+		         kr, (unsigned long long)ctx[3], (unsigned long long)ctx[4]);
 		IOServiceClose(_conn);
 		_conn = IO_OBJECT_NULL;
 		return self;
 	}
+	const mach_vm_address_t addr = ctx[3];
+	const mach_vm_size_t mapSize = ctx[4];
 	_mapBase = addr;
 	_mapSize = mapSize;
 	volatile uint8_t *base = reinterpret_cast<volatile uint8_t *>(addr);
-
-	// The caps blob the host wrote at RGFX_DEVICE_INFO_OFFSET (read once at init).
-	RgfxDeviceInfo info;
-	memcpy(&info, const_cast<const uint8_t *>(base) + RGFX_DEVICE_INFO_OFFSET, sizeof(info));
-	if (!_caps.load(info))
-		rgfxDiag("RGFX: caps blob invalid (version/zero); using defaults\n");
-
-	// The process's context: its id and address ranges, its blocks and its chunks of texture
-	// resource ids, from the kext, so no two processes' rings, blocks or numbers meet.
-	uint64_t ctx[3] = {};
-	uint32_t ctxCount = 3;
-	kr = IOConnectCallScalarMethod(_conn, kRgfxAccelMethodOpenContext, nullptr, 0, ctx, &ctxCount);
-	if (kr != KERN_SUCCESS) {
-		rgfxDiag("RGFX: OPEN_CONTEXT failed kr=0x%x; transport stubbed\n", kr);
-		IOServiceClose(_conn);
-		_conn = IO_OBJECT_NULL;
-		return self;
-	}
 	_ids.setBases(ctx[1], ctx[2]);
 	void *connContext = reinterpret_cast<void *>(static_cast<uintptr_t>(_conn));
 	_ids.setResourceIdSource(&rgfxKextResourceIds, connContext);

@@ -14,12 +14,15 @@
  *
  * The device keeps that grant until the context's close, or until another context is granted
  * the span: nothing frees the scanout or gives it to a process as a block, so the grant lets the
- * context draw into the display and reach nothing else.
+ * context draw into the display and reach nothing else. The span is in the client's window while
+ * the kext's grant lasts: mapped in at the grant, under the lock, and taken back where the grant
+ * goes or moves (the surface goes, or a mode change moves the scanout).
  *
  * Our own code; it names only SDK-public IOKit calls.
  */
 
 #include "RgfxAccelerator.hpp"
+#include "RgfxAcceleratorUserClient.hpp"
 #include "RgfxSurfaceUserClient.hpp"
 #include "ReimsGraphics.hpp"
 
@@ -31,7 +34,7 @@ constexpr UInt32 kMaxSurfaces = 256;
 constexpr UInt32 kMaxGrants = 8;
 
 struct Grant {
-	const void *client;
+	RgfxAcceleratorUserClient *client;
 	UInt32 surfaceId;
 	UInt64 offset;
 	UInt64 length;
@@ -64,12 +67,20 @@ IOLock *surfaceLock()
 	return expected;
 }
 
+// Drops grant `g`, its span out of its client's window first. Under the lock, which the client's
+// release takes before its window goes.
+void dropGrant(Grant &g)
+{
+	g.client->unmapSpan(g.offset, g.length);
+	g = {};
+}
+
 // Drops the grants made for surface `id`. Under the lock.
 void dropGrantsOf(UInt32 id)
 {
 	for (UInt32 i = 0; i < kMaxGrants; i++) {
 		if (surfaceState.grants[i].client && surfaceState.grants[i].surfaceId == id)
-			surfaceState.grants[i] = {};
+			dropGrant(surfaceState.grants[i]);
 	}
 }
 } // namespace
@@ -143,8 +154,8 @@ bool RgfxAccelerator::currentScanout(Scanout *scanout)
 	return true;
 }
 
-IOReturn RgfxAccelerator::grantSurfaceScanout(const void *client, UInt32 context, task_t task,
-                                              UInt32 surfaceId, Scanout *scanout)
+IOReturn RgfxAccelerator::grantSurfaceScanout(RgfxAcceleratorUserClient *client, UInt32 context,
+                                              task_t task, UInt32 surfaceId, Scanout *scanout)
 {
 	if (!currentScanout(scanout))
 		return kIOReturnNotReady;
@@ -173,10 +184,22 @@ IOReturn RgfxAccelerator::grantSurfaceScanout(const void *client, UInt32 context
 			if (!surfaceState.grants[i].client && slot == kMaxGrants)
 				slot = i;
 		}
-		if (slot == kMaxGrants)
+		if (slot == kMaxGrants) {
 			r = kIOReturnNoResources;
-		else
-			surfaceState.grants[slot] = {client, surfaceId, scanout->offset, scanout->length};
+		} else {
+			// In the client's window as the scanout is now; where it moved, the old span is
+			// taken back.
+			Grant &g = surfaceState.grants[slot];
+			if (g.client && (g.offset != scanout->offset || g.length != scanout->length))
+				dropGrant(g);
+			r = client->mapSpan(scanout->offset, scanout->length);
+			if (r == kIOReturnSuccess)
+				g = {client, surfaceId, scanout->offset, scanout->length};
+			else if (g.client)
+				dropGrant(g);
+			else
+				client->unmapSpan(scanout->offset, scanout->length);
+		}
 	}
 	IOLockUnlock(lock);
 	if (r != kIOReturnSuccess)
@@ -202,7 +225,7 @@ void RgfxAccelerator::revokeGrants(const void *client)
 	IOLockLock(lock);
 	for (UInt32 i = 0; i < kMaxGrants; i++) {
 		if (surfaceState.grants[i].client == client)
-			surfaceState.grants[i] = {};
+			dropGrant(surfaceState.grants[i]);
 	}
 	IOLockUnlock(lock);
 }
