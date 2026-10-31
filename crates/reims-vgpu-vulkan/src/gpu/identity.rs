@@ -213,6 +213,31 @@ fn device_local_bytes(device: &rt::Device) -> u64 {
         .fold(0u64, |sum, heap| sum.saturating_add(heap.size))
 }
 
+/// `architecture.name` of a device of PCI vendor `vendor` and device `device` whose driver
+/// keys its compiled pipelines by `pipeline_cache`: `vulkan_VVVV_DDDD_` and the key in hex.
+///
+/// The name keys the guest's binary archives, so it stays the same for one GPU and driver from
+/// boot to boot, and differs where compiled pipelines differ: between GPUs, and between drivers
+/// or driver builds, which Vulkan's `pipelineCacheUUID` tells apart (a pipeline cache of another
+/// UUID is one the driver does not take). The name claims no Apple GPU (Metal's are
+/// `applegpu_gNN`); the device's families say what it supports.
+fn architecture_name(vendor: u32, device: u32, pipeline_cache: [u8; vk::UUID_SIZE]) -> String {
+    let key: String = pipeline_cache.iter().map(|b| format!("{b:02x}")).collect();
+    format!("vulkan_{vendor:04x}_{device:04x}_{key}")
+}
+
+/// `VkPhysicalDeviceProperties::pipelineCacheUUID` of `device`.
+fn pipeline_cache_uuid(device: &rt::Device) -> [u8; vk::UUID_SIZE] {
+    // SAFETY: the instance and physical device are the runtime's, read only, while `device`
+    // lives.
+    unsafe {
+        let raw = device.raw();
+        raw.instance
+            .get_physical_device_properties(raw.physical_device)
+            .pipeline_cache_uuid
+    }
+}
+
 /// Every identity answer of `device`, whose `DeviceCaps` are `caps`, read once.
 pub fn read(device: &rt::Device, caps: &DeviceCaps) -> IdentityCaps {
     let props = device.properties();
@@ -232,7 +257,11 @@ pub fn read(device: &rt::Device, caps: &DeviceCaps) -> IdentityCaps {
         families: families.map(Some),
         feature_sets: FEATURE_SETS.map(|set| Some(feature_set(set, &families))),
         counter_sampling: [None; 5],
-        architecture_name: None,
+        architecture_name: Some(architecture_name(
+            props.vendor_id,
+            props.device_id,
+            pipeline_cache_uuid(device),
+        )),
         formats: SDK_PIXEL_FORMATS
             .iter()
             .map(|&format| format_answers(device, format))
@@ -296,6 +325,24 @@ mod tests {
             ]
         );
         assert_eq!(closed([false; 20]), [false; 20]);
+    }
+
+    /// The architecture's name is the GPU's vendor and device and its driver's pipeline-cache
+    /// key, in hex, under a prefix no Apple GPU's name has
+    #[test]
+    fn the_architecture_names_the_gpu_and_its_compiled_pipelines() {
+        let mut key = [0u8; vk::UUID_SIZE];
+        key[0] = 0xab;
+        key[15] = 0x01;
+        let name = architecture_name(0x10de, 0x2c58, key);
+        assert_eq!(name, "vulkan_10de_2c58_ab000000000000000000000000000001");
+        assert!(name.len() < 64);
+        key[15] = 0x02;
+        assert_ne!(architecture_name(0x10de, 0x2c58, key), name);
+        assert_ne!(
+            architecture_name(0x1002, 0x2c58, [0; vk::UUID_SIZE]),
+            architecture_name(0x10de, 0x2c58, [0; vk::UUID_SIZE])
+        );
     }
 
     /// The feature sets of the M3 Max's families are the M3 Max's (measured, macOS 27.2): every
