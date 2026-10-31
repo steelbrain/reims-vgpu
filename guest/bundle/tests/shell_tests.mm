@@ -737,6 +737,51 @@ void test_library_and_function_routing()
 	std::vector<uint8_t> extraBytes;
 	CHECK(!fx.ring.next(&extra, &extraBytes)); // newFunctionWithName: posts nothing
 
+	// No function table: a stand-in hash, the same for the same function, another for
+	// another name.
+	id<MTLFunction> other = [lib newFunctionWithName:@"fmain"];
+	CHECK(std::memcmp([rf bitCodeHash]->bytes, [(RgfxFunction *)[lib newFunctionWithName:@"vmain"]
+	                                               bitCodeHash]->bytes, 32) == 0);
+	CHECK(std::memcmp([rf bitCodeHash]->bytes, [(RgfxFunction *)other bitCodeHash]->bytes, 32) != 0);
+
+	// A .metallib's function list: its entry's stage from TYPE and its hash from HASH.
+	std::vector<uint8_t> metallib(0x30, 0);
+	std::memcpy(metallib.data(), "MTLB", 4);
+	metallib[0x18] = 0x30; // the function list's offset
+	auto put32 = [&](uint32_t v) {
+		for (int i = 0; i < 4; i++)
+			metallib.push_back(static_cast<uint8_t>(v >> (8 * i)));
+	};
+	auto tag = [&](const char *name, const uint8_t *data, uint16_t size) {
+		metallib.insert(metallib.end(), name, name + 4);
+		metallib.push_back(static_cast<uint8_t>(size));
+		metallib.push_back(static_cast<uint8_t>(size >> 8));
+		metallib.insert(metallib.end(), data, data + size);
+	};
+	uint8_t hash[32];
+	for (int i = 0; i < 32; i++)
+		hash[i] = static_cast<uint8_t>(0xa0 + i);
+	const uint8_t stage = 2; // a kernel
+	put32(1);
+	put32(4 + (6 + 6) + (6 + 1) + (6 + 32) + 4);
+	tag("NAME", reinterpret_cast<const uint8_t *>("kmain"), 6);
+	tag("TYPE", &stage, 1);
+	tag("HASH", hash, 32);
+	metallib.insert(metallib.end(), {'E', 'N', 'D', 'T'});
+	RgfxLibrary *tabled = [RgfxLibrary libraryWithData:metallib.data()
+	                                            length:metallib.size()
+	                                               key:nullptr
+	                                            device:nil
+	                                        serializer:&fx.ser
+	                                            status:&libStatus];
+	CHECK(tabled != nil);
+	RgfxFunction *k = (RgfxFunction *)[tabled newFunctionWithName:@"kmain"];
+	CHECK(k != nil && k.functionType == MTLFunctionTypeKernel);
+	CHECK(std::memcmp([k bitCodeHash]->bytes, hash, 32) == 0);
+	CHECK([tabled newFunctionWithName:@"vmain"] == nil);
+	while (fx.ring.next(&extra, &extraBytes)) {
+	}
+
 	// A library with no route cannot be created.
 	RgfxLibrary *none = [RgfxLibrary libraryWithData:libBytes
 	                                         length:sizeof(libBytes)

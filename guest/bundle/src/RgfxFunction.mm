@@ -4,6 +4,9 @@
 
 #import "RgfxFunction.h"
 
+#include <CommonCrypto/CommonDigest.h>
+
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -14,6 +17,8 @@
 	std::vector<RgfxFunctionConstant> _constants; // specialisation constants, owned
 	MTLFunctionType _type;                        // the stage, from the library's table
 	BOOL _haveType;
+	RgfxBitCodeHash _hash;                        // the bitcode hash, from the library's table
+	BOOL _haveHash;
 }
 
 + (instancetype)functionWithLibrary:(RgfxResource *)library
@@ -79,6 +84,32 @@
 {
 	_type = type;
 	_haveType = YES;
+}
+
+- (void)rgfxSetBitCodeHash:(const uint8_t *)hash
+{
+	std::memcpy(_hash.bytes, hash, sizeof(_hash.bytes));
+	_haveHash = YES;
+}
+
+// The entry's HASH tag. A function whose library gave none (one with no function table) has no
+// bitcode of its own here, so it answers a stand-in no other function shares, as callers key
+// their pipelines by it: the SHA-256 of "rgfx-function-v1", its library's id and its name.
+- (const RgfxBitCodeHash *)bitCodeHash
+{
+	@synchronized(self) {
+		if (!_haveHash) {
+			static const char kPrefix[] = "rgfx-function-v1";
+			CC_SHA256_CTX ctx;
+			CC_SHA256_Init(&ctx);
+			CC_SHA256_Update(&ctx, kPrefix, sizeof(kPrefix) - 1);
+			CC_SHA256_Update(&ctx, &_libraryObjId, sizeof(_libraryObjId));
+			CC_SHA256_Update(&ctx, _name.data(), static_cast<CC_LONG>(_name.size()));
+			CC_SHA256_Final(_hash.bytes, &ctx);
+			_haveHash = YES;
+		}
+	}
+	return &_hash;
 }
 
 // --- MTLFunction -------------------------------------------------------------

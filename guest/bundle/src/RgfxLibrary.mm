@@ -22,10 +22,13 @@
 
 namespace {
 
-// One entry of a .metallib's function list: the entry point and its stage.
+// One entry of a .metallib's function list: the entry point, its stage, and its HASH tag (the
+// SHA-256 of its bitcode) when the entry has one.
 struct MetallibFunction {
 	std::string name;
 	MTLFunctionType type;
+	bool hasHash;
+	uint8_t hash[32];
 };
 
 uint16_t rd16(const uint8_t *p)
@@ -87,7 +90,7 @@ bool readMetallibFunctions(const uint8_t *p, size_t n, std::vector<MetallibFunct
 			return false;
 		const uint64_t end = q + group;
 		uint64_t t = q + 4;
-		MetallibFunction f{ std::string(), MTLFunctionTypeVisible };
+		MetallibFunction f{ std::string(), MTLFunctionTypeVisible, false, {} };
 		while (end - t >= 4) {
 			if (std::memcmp(p + t, "ENDT", 4) == 0)
 				break;
@@ -101,6 +104,10 @@ bool readMetallibFunctions(const uint8_t *p, size_t n, std::vector<MetallibFunct
 				f.name.assign(reinterpret_cast<const char *>(data), strnlen(reinterpret_cast<const char *>(data), size));
 			else if (std::memcmp(p + t, "TYPE", 4) == 0 && size >= 1)
 				f.type = metallibStage(data[0]);
+			else if (std::memcmp(p + t, "HASH", 4) == 0 && size == sizeof(f.hash)) {
+				std::memcpy(f.hash, data, sizeof(f.hash));
+				f.hasHash = true;
+			}
 			t += 6 + static_cast<uint64_t>(size);
 		}
 		if (!f.name.empty())
@@ -423,8 +430,11 @@ static bool rgfxMade(uint32_t status)
 	                                               count:static_cast<uint32_t>(constants.size())
 	                                              device:self.device
 	                                          serializer:[self serializer]];
-	if (entry != nullptr)
+	if (entry != nullptr) {
 		[fn rgfxSetFunctionType:entry->type];
+		if (entry->hasHash)
+			[fn rgfxSetBitCodeHash:entry->hash];
+	}
 	return fn;
 }
 

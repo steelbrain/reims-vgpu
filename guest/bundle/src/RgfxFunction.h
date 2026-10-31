@@ -72,6 +72,19 @@ NS_ASSUME_NONNULL_BEGIN
 /// function list. A function made without it answers the placeholder stage.
 - (void)rgfxSetFunctionType:(MTLFunctionType)type;
 
+/// The 32 bytes of a function's bitcode hash (bitCodeHash), as the runtime's SPI types it.
+typedef struct {
+	uint8_t bytes[32];
+} RgfxBitCodeHash;
+
+/// Sets the hash bitCodeHash answers: the library reads the 32 bytes from the entry's HASH tag
+/// in the .metallib's function list.
+- (void)rgfxSetBitCodeHash:(const uint8_t *)hash;
+
+/// The function SPI RenderBox reads as it keys its pipelines: the SHA-256 of the function's
+/// bitcode, valid for the function's life (measured type: r^{?=[32C]}16@0:8).
+- (const RgfxBitCodeHash *)bitCodeHash;
+
 @end
 
 NS_ASSUME_NONNULL_END
