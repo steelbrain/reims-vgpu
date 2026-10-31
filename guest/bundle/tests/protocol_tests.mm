@@ -19,7 +19,11 @@
 
 #import "RgfxBuffer.h"
 #import "RgfxCommandObjects.h"
+#import "RgfxComputePipelineState.h"
+#import "RgfxDepthStencilState.h"
 #import "RgfxHeap.h"
+#import "RgfxLibrary.h"
+#import "RgfxRenderPipelineState.h"
 #import "RgfxResource.h"
 #import "RgfxTexture.h"
 #import "RgfxUnsupported.h"
@@ -729,6 +733,116 @@ void test_heap_members()
 	CHECK(RgfxUnsupportedWasLogged([RgfxHeap class], @selector(newBufferWithLength:options:)));
 }
 
+
+// --- pipeline states ---------------------------------------------------------------
+
+// What the create asked answers as asked; a pipeline a device makes has no reflection object
+// and no validation; a vertex/fragment pipeline answers 0 for the mesh, object and tile
+// stages; the host's memory and imageblock answers are not on the wire (0, logged); function
+// handles, binary functions and function tables are nil (with an NSError where there is an
+// error out), logged.
+void test_pipeline_state_members()
+{
+	TestRing control(0x8000);
+	control.setConsumerIdle(1);
+	RgfxRingWriter writer(control.base(), control.dataSize, RGFX_CONTROL_RING_ID,
+	                      TestRing::doorbell, nullptr);
+	RgfxIdSpace ids;
+	RgfxSerializer ser(writer, ids);
+	const uint8_t libBytes[] = {9, 9, 9};
+	uint32_t libStatus = 0;
+	RgfxLibrary *lib = [RgfxLibrary libraryWithData:libBytes
+	                                        length:sizeof(libBytes)
+	                                           key:nullptr
+	                                        device:nil
+	                                    serializer:&ser
+	                                        status:&libStatus];
+	id<MTLFunction> kfn = [lib newFunctionWithName:@"kmain"];
+	id<MTLFunction> vfn = [lib newFunctionWithName:@"vmain"];
+	id<MTLFunction> ffn = [lib newFunctionWithName:@"fmain"];
+
+	// --- compute ---
+	MTLComputePipelineDescriptor *cd = [[MTLComputePipelineDescriptor alloc] init];
+	cd.computeFunction = kfn;
+	cd.supportIndirectCommandBuffers = YES;
+	cd.requiredThreadsPerThreadgroup = MTLSizeMake(8, 4, 1);
+	NSError *err = nil;
+	RgfxComputePipelineState *cs =
+	    [RgfxComputePipelineState computePipelineStateWithDescriptor:cd
+	                                                         device:nil
+	                                                     serializer:&ser
+	                                                          error:&err];
+	CHECK(cs != nil);
+	CHECK(cs.supportIndirectCommandBuffers == YES);
+	MTLSize req = cs.requiredThreadsPerThreadgroup;
+	CHECK(req.width == 8 && req.height == 4 && req.depth == 1);
+	CHECK(cs.forwardProgressUsage == MTLForwardProgressUsageAutomatic);
+	CHECK(cs.shaderValidation == MTLShaderValidationDisabled);
+	CHECK(cs.reflection == nil);
+	CHECK(cs.allocatedSize == 0);
+	CHECK([cs imageblockMemoryLengthForDimensions:MTLSizeMake(8, 8, 1)] == 0);
+	CHECK(RgfxUnsupportedWasLogged([RgfxComputePipelineState class], @selector(allocatedSize)));
+	CHECK([cs functionHandleWithFunction:kfn] == nil);
+	CHECK([cs functionHandleWithName:@"kmain"] == nil);
+	CHECK([cs newVisibleFunctionTableWithDescriptor:[MTLVisibleFunctionTableDescriptor
+	                                                    visibleFunctionTableDescriptor]] == nil);
+	CHECK([cs newIntersectionFunctionTableWithDescriptor:
+	              [MTLIntersectionFunctionTableDescriptor intersectionFunctionTableDescriptor]] ==
+	      nil);
+	err = nil;
+	CHECK([cs newComputePipelineStateWithAdditionalBinaryFunctions:@[ kfn ] error:&err] == nil);
+	CHECK(err != nil && err.code == RgfxMetalErrorUnsupported);
+	// A function-only pipeline answers Metal's defaults.
+	RgfxComputePipelineState *plain =
+	    [RgfxComputePipelineState computePipelineStateWithFunction:kfn
+	                                                       device:nil
+	                                                   serializer:&ser
+	                                                        error:nullptr];
+	CHECK(plain.supportIndirectCommandBuffers == NO);
+	MTLSize none = plain.requiredThreadsPerThreadgroup;
+	CHECK(none.width == 0 && none.height == 0 && none.depth == 0);
+
+	// --- render ---
+	MTLRenderPipelineDescriptor *rd = [[MTLRenderPipelineDescriptor alloc] init];
+	rd.vertexFunction = vfn;
+	rd.fragmentFunction = ffn;
+	rd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+	rd.supportIndirectCommandBuffers = YES;
+	RgfxRenderPipelineState *rs =
+	    [RgfxRenderPipelineState renderPipelineStateWithDescriptor:rd
+	                                                       device:nil
+	                                                   serializer:&ser
+	                                                        error:nullptr];
+	CHECK(rs != nil);
+	CHECK(rs.supportIndirectCommandBuffers == YES);
+	CHECK(rs.shaderValidation == MTLShaderValidationDisabled);
+	CHECK(rs.reflection == nil);
+	CHECK(rs.maxTotalThreadsPerObjectThreadgroup == 0 && rs.maxTotalThreadsPerMeshThreadgroup == 0);
+	CHECK(rs.objectThreadExecutionWidth == 0 && rs.meshThreadExecutionWidth == 0);
+	CHECK(rs.maxTotalThreadgroupsPerMeshGrid == 0);
+	CHECK(rs.requiredThreadsPerTileThreadgroup.width == 0);
+	CHECK(rs.requiredThreadsPerObjectThreadgroup.width == 0);
+	CHECK(rs.requiredThreadsPerMeshThreadgroup.width == 0);
+	CHECK(rs.allocatedSize == 0);
+	CHECK([rs functionHandleWithFunction:vfn stage:MTLRenderStageVertex] == nil);
+	CHECK([rs newRenderPipelineDescriptorForSpecialization] == nil);
+	err = nil;
+	CHECK([rs newRenderPipelineStateWithAdditionalBinaryFunctions:
+	              [[MTLRenderPipelineFunctionsDescriptor alloc] init]
+	                                                        error:&err] == nil);
+	CHECK(err != nil && err.code == RgfxMetalErrorUnsupported);
+	CHECK(RgfxUnsupportedWasLogged([RgfxRenderPipelineState class],
+	                               @selector(newRenderPipelineDescriptorForSpecialization)));
+
+	// --- depth/stencil ---
+	RgfxDepthStencilState *ds =
+	    [RgfxDepthStencilState depthStencilStateWithDescriptor:[[MTLDepthStencilDescriptor alloc] init]
+	                                                    device:nil
+	                                                serializer:&ser];
+	CHECK(ds.gpuResourceID._impl == 0);
+	CHECK(RgfxUnsupportedWasLogged([RgfxDepthStencilState class], @selector(gpuResourceID)));
+}
+
 } // namespace
 
 void rgfxProtocolTests()
@@ -744,4 +858,5 @@ void rgfxProtocolTests()
 	test_texture_members();
 	test_buffer_members();
 	test_heap_members();
+	test_pipeline_state_members();
 }

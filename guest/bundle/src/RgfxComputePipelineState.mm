@@ -9,6 +9,7 @@
 
 #import "RgfxFunction.h"
 #import "RgfxMetalError.h"
+#import "RgfxUnsupported.h"
 
 #include "RgfxReplyReader.hpp"
 #include "RgfxSerializer.hpp"
@@ -57,10 +58,18 @@ bool fillComputeParams(RgfxComputePipelineParams &p, id<MTLFunction> fn, uint32_
 // Defined in the main implementation; declared here so the lambda in
 // rgfxRegisterWithReplyReader: sees its signature.
 - (void)rgfxFillReflection:(const RgfxPipelineReflection *)r;
+// Keeps what the descriptor asked that the pipeline answers (rgfx*Desc ivars).
+- (void)rgfxTakeDescriptor:(MTLComputePipelineDescriptor *)descriptor flags:(uint32_t)flags;
 @end
 
 @implementation RgfxComputePipelineState {
 	uint64_t _seqno;
+	// What the create asked that the pipeline answers: its RGFX_COMPUTE_PIPELINE_* flags, the
+	// required threadgroup size and the forward-progress use (Metal's defaults for a pipeline
+	// made from a function alone).
+	uint32_t _createFlags;
+	MTLSize _requiredThreadsPerThreadgroup;
+	NSInteger _forwardProgressUsage;
 	// The host's reflection, filled once RGFX_EVT_PIPELINE_REFLECTION for `_seqno`
 	// arrives; until then `_haveReflection` is NO and the getters answer placeholders.
 	RgfxPipelineReflection _reflection;
@@ -98,13 +107,26 @@ bool fillComputeParams(RgfxComputePipelineParams &p, id<MTLFunction> fn, uint32_
 		flags |= RGFX_COMPUTE_PIPELINE_TG_MULTIPLE_OF_EXEC_WIDTH;
 	if (descriptor.supportIndirectCommandBuffers)
 		flags |= RGFX_COMPUTE_PIPELINE_SUPPORT_ICB;
-	return [self createWithFunction:descriptor.computeFunction
-	                          flags:flags
-	                maxTotalThreads:static_cast<uint32_t>(descriptor.maxTotalThreadsPerThreadgroup)
-	                          label:descriptor.label
-	                         device:device
-	                     serializer:serializer
-	                          error:error];
+	RgfxComputePipelineState *state =
+	    [self createWithFunction:descriptor.computeFunction
+	                       flags:flags
+	             maxTotalThreads:static_cast<uint32_t>(descriptor.maxTotalThreadsPerThreadgroup)
+	                       label:descriptor.label
+	                      device:device
+	                  serializer:serializer
+	                       error:error];
+	[state rgfxTakeDescriptor:descriptor flags:flags];
+	return state;
+}
+
+- (void)rgfxTakeDescriptor:(MTLComputePipelineDescriptor *)descriptor flags:(uint32_t)flags
+{
+	_createFlags = flags;
+	// Both are newer than some guests' Metal (macOS 26 and 27): absent, Metal's defaults stand.
+	if ([descriptor respondsToSelector:@selector(requiredThreadsPerThreadgroup)])
+		_requiredThreadsPerThreadgroup = descriptor.requiredThreadsPerThreadgroup;
+	if ([descriptor respondsToSelector:@selector(forwardProgressUsage)])
+		_forwardProgressUsage = static_cast<NSInteger>(descriptor.forwardProgressUsage);
 }
 
 + (instancetype)createWithFunction:(id<MTLFunction>)function
@@ -228,6 +250,110 @@ bool fillComputeParams(RgfxComputePipelineParams &p, id<MTLFunction> fn, uint32_
 		return (MTLResourceID){ _reflection.gpu_resource_id };
 	}
 	return (MTLResourceID){0}; // 0 until the reflection reply carries the real id
+}
+
+// --- what the create asked ----------------------------------------------------------
+
+- (BOOL)supportIndirectCommandBuffers
+{
+	if (_haveReflection)
+		return (_reflection.flags & RGFX_PIPELINE_REFLECT_SUPPORT_ICB) != 0;
+	return (_createFlags & RGFX_COMPUTE_PIPELINE_SUPPORT_ICB) != 0;
+}
+
+- (MTLSize)requiredThreadsPerThreadgroup
+{
+	return _requiredThreadsPerThreadgroup;
+}
+
+- (MTLForwardProgressUsage)forwardProgressUsage
+{
+	return static_cast<MTLForwardProgressUsage>(_forwardProgressUsage);
+}
+
+// The device validates no shader, so no pipeline of it runs with validation.
+- (MTLShaderValidation)shaderValidation
+{
+	return MTLShaderValidationDisabled;
+}
+
+// Metal's answer for every pipeline a device (not a Metal 4 compiler) makes.
+- (MTLComputePipelineReflection *)reflection
+{
+	return nil;
+}
+
+// --- not on the wire ------------------------------------------------------------------
+// The host answers no pipeline's memory, imageblock or persistent-threadgroup queries yet
+// (RgfxPipelineReflection carries none): 0, logged.
+
+- (NSUInteger)allocatedSize
+{
+	RGFX_UNSUPPORTED("a pipeline's allocated size (not in the host's reflection)");
+	return 0;
+}
+
+- (NSUInteger)imageblockMemoryLengthForDimensions:(MTLSize)imageblockDimensions
+{
+	RGFX_UNSUPPORTED("imageblock memory queries (not in the host's reflection)");
+	return 0;
+}
+
+- (NSUInteger)recommendedPersistentThreadgroupsPerGridForThreadsPerThreadgroup:
+    (MTLSize)threadsPerThreadgroup
+{
+	RGFX_UNSUPPORTED("persistent threadgroup queries (not in the host's reflection)");
+	return 0;
+}
+
+// --- unsupported: function pointers, binary functions and function tables ---------------
+
+- (id<MTLFunctionHandle>)functionHandleWithFunction:(id<MTLFunction>)function
+{
+	RGFX_UNSUPPORTED("function pointers");
+	return nil;
+}
+
+- (id<MTLFunctionHandle>)functionHandleWithName:(NSString *)name
+{
+	RGFX_UNSUPPORTED("function pointers");
+	return nil;
+}
+
+- (id<MTLFunctionHandle>)functionHandleWithBinaryFunction:(id<MTL4BinaryFunction>)function
+{
+	RGFX_UNSUPPORTED("function pointers");
+	return nil;
+}
+
+- (id<MTLComputePipelineState>)
+    newComputePipelineStateWithAdditionalBinaryFunctions:(NSArray<id<MTLFunction>> *)functions
+                                                   error:(__autoreleasing NSError **)error
+{
+	RGFX_UNSUPPORTED_ERROR(error, "binary functions");
+	return nil;
+}
+
+- (id<MTLComputePipelineState>)
+    newComputePipelineStateWithBinaryFunctions:(NSArray<id<MTL4BinaryFunction>> *)additionalBinaryFunctions
+                                         error:(NSError **)error
+{
+	RGFX_UNSUPPORTED_ERROR(error, "binary functions");
+	return nil;
+}
+
+- (id<MTLVisibleFunctionTable>)newVisibleFunctionTableWithDescriptor:
+    (MTLVisibleFunctionTableDescriptor *)descriptor
+{
+	RGFX_UNSUPPORTED("function pointers");
+	return nil;
+}
+
+- (id<MTLIntersectionFunctionTable>)newIntersectionFunctionTableWithDescriptor:
+    (MTLIntersectionFunctionTableDescriptor *)descriptor
+{
+	RGFX_UNSUPPORTED("ray tracing");
+	return nil;
 }
 
 @end

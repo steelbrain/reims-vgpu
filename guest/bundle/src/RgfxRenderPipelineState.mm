@@ -4,6 +4,7 @@
  */
 
 #import "RgfxRenderPipelineState.h"
+#import "RgfxUnsupported.h"
 
 #include <vector>
 
@@ -54,6 +55,8 @@ bool fillFunctionRef(RgfxFunctionRef &fr, id<MTLFunction> fn)
 
 @implementation RgfxRenderPipelineState {
 	uint64_t _seqno;
+	// What the descriptor asked that the pipeline answers.
+	BOOL _supportIndirectCommandBuffers;
 	// The host's reflection, filled once RGFX_EVT_PIPELINE_REFLECTION for `_seqno`
 	// arrives through the reply reader; until then `_haveReflection` is NO and the
 	// getters answer documented placeholders.
@@ -195,11 +198,14 @@ bool fillFunctionRef(RgfxFunctionRef &fr, id<MTLFunction> fn)
 	}
 	if (error)
 		*error = nil;
-	return [[RgfxRenderPipelineState alloc] initWithObjId:created.obj_id
-	                                                seqno:created.seqno
-	                                                label:descriptor.label
-	                                               device:device
-	                                           serializer:serializer];
+	RgfxRenderPipelineState *state = [[RgfxRenderPipelineState alloc] initWithObjId:created.obj_id
+	                                                                          seqno:created.seqno
+	                                                                          label:descriptor.label
+	                                                                         device:device
+	                                                                     serializer:serializer];
+	if (state != nil)
+		state->_supportIndirectCommandBuffers = descriptor.supportIndirectCommandBuffers;
+	return state;
 }
 
 - (instancetype)initWithObjId:(uint64_t)objId
@@ -285,6 +291,149 @@ bool fillFunctionRef(RgfxFunctionRef &fr, id<MTLFunction> fn)
 		return (MTLResourceID){ _reflection.gpu_resource_id };
 	}
 	return (MTLResourceID){0}; // 0 until the reflection reply carries the real id
+}
+
+// --- what the create asked ----------------------------------------------------------
+
+- (BOOL)supportIndirectCommandBuffers
+{
+	if (_haveReflection)
+		return (_reflection.flags & RGFX_PIPELINE_REFLECT_SUPPORT_ICB) != 0;
+	return _supportIndirectCommandBuffers;
+}
+
+// The device validates no shader, so no pipeline of it runs with validation.
+- (MTLShaderValidation)shaderValidation
+{
+	return MTLShaderValidationDisabled;
+}
+
+// Metal's answer for every pipeline a device (not a Metal 4 compiler) makes.
+- (MTLRenderPipelineReflection *)reflection
+{
+	return nil;
+}
+
+// --- the mesh, object and tile stages a vertex/fragment pipeline has none of ------------
+// The device makes no mesh or tile pipeline (newRenderPipelineStateWithMeshDescriptor: and
+// ...TileDescriptor: answer nil), and Metal answers 0 for a pipeline without the stage.
+
+- (NSUInteger)maxTotalThreadsPerObjectThreadgroup
+{
+	return 0;
+}
+
+- (NSUInteger)maxTotalThreadsPerMeshThreadgroup
+{
+	return 0;
+}
+
+- (NSUInteger)objectThreadExecutionWidth
+{
+	return 0;
+}
+
+- (NSUInteger)meshThreadExecutionWidth
+{
+	return 0;
+}
+
+- (NSUInteger)maxTotalThreadgroupsPerMeshGrid
+{
+	return 0;
+}
+
+- (MTLSize)requiredThreadsPerTileThreadgroup
+{
+	return MTLSizeMake(0, 0, 0);
+}
+
+- (MTLSize)requiredThreadsPerObjectThreadgroup
+{
+	return MTLSizeMake(0, 0, 0);
+}
+
+- (MTLSize)requiredThreadsPerMeshThreadgroup
+{
+	return MTLSizeMake(0, 0, 0);
+}
+
+// --- not on the wire ------------------------------------------------------------------
+// The host answers no pipeline's memory or imageblock queries yet (RgfxPipelineReflection
+// carries none): 0, logged.
+
+- (NSUInteger)allocatedSize
+{
+	RGFX_UNSUPPORTED("a pipeline's allocated size (not in the host's reflection)");
+	return 0;
+}
+
+- (NSUInteger)imageblockMemoryLengthForDimensions:(MTLSize)imageblockDimensions
+{
+	RGFX_UNSUPPORTED("imageblock memory queries (not in the host's reflection)");
+	return 0;
+}
+
+// --- unsupported: function pointers, binary functions, function tables, Metal 4 ----------
+
+- (id<MTLFunctionHandle>)functionHandleWithFunction:(id<MTLFunction>)function
+                                              stage:(MTLRenderStages)stage
+{
+	RGFX_UNSUPPORTED("function pointers");
+	return nil;
+}
+
+- (id<MTLFunctionHandle>)functionHandleWithName:(NSString *)name stage:(MTLRenderStages)stage
+{
+	RGFX_UNSUPPORTED("function pointers");
+	return nil;
+}
+
+- (id<MTLFunctionHandle>)functionHandleWithBinaryFunction:(id<MTL4BinaryFunction>)function
+                                                    stage:(MTLRenderStages)stage
+{
+	RGFX_UNSUPPORTED("function pointers");
+	return nil;
+}
+
+- (id<MTLRenderPipelineState>)
+    newRenderPipelineStateWithAdditionalBinaryFunctions:
+        (MTLRenderPipelineFunctionsDescriptor *)additionalBinaryFunctions
+                                                  error:(__autoreleasing NSError **)error
+{
+	RGFX_UNSUPPORTED_ERROR(error, "binary functions");
+	return nil;
+}
+
+- (id<MTLRenderPipelineState>)
+    newRenderPipelineStateWithBinaryFunctions:
+        (MTL4RenderPipelineBinaryFunctionsDescriptor *)binaryFunctionsDescriptor
+                                        error:(NSError **)error
+{
+	RGFX_UNSUPPORTED_ERROR(error, "binary functions");
+	return nil;
+}
+
+- (MTL4PipelineDescriptor *)newRenderPipelineDescriptorForSpecialization
+{
+	RGFX_UNSUPPORTED("Metal 4 pipeline specialization");
+	return nil;
+}
+
+- (id<MTLVisibleFunctionTable>)newVisibleFunctionTableWithDescriptor:
+                                   (MTLVisibleFunctionTableDescriptor *)descriptor
+                                                               stage:(MTLRenderStages)stage
+{
+	RGFX_UNSUPPORTED("function pointers");
+	return nil;
+}
+
+- (id<MTLIntersectionFunctionTable>)
+    newIntersectionFunctionTableWithDescriptor:(MTLIntersectionFunctionTableDescriptor *)descriptor
+                                         stage:(MTLRenderStages)stage
+{
+	RGFX_UNSUPPORTED("ray tracing");
+	return nil;
 }
 
 @end

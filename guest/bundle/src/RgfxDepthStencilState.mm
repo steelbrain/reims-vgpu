@@ -4,6 +4,7 @@
  */
 
 #import "RgfxDepthStencilState.h"
+#import "RgfxUnsupported.h"
 
 #include "RgfxSerializer.hpp" // RgfxSerializer, RgfxStencilDescriptor (wire)
 
@@ -54,6 +55,16 @@ RgfxStencilDescriptor rgfxStencilFromMTL(MTLStencilDescriptor *s)
 	return [[RgfxDepthStencilState alloc] initWithObjId:created.obj_id
 	                                             device:device
 	                                         serializer:serializer];
+}
+
+// The state's id in an argument buffer or an indirect command buffer: the depth/stencil create
+// carries no resource id on the wire, and the device supports neither use. 0, logged.
+- (MTLResourceID)gpuResourceID
+{
+	RGFX_UNSUPPORTED("depth/stencil resource ids (none on the wire)");
+	MTLResourceID rid;
+	rid._impl = 0;
+	return rid;
 }
 
 @end
