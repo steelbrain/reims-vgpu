@@ -2,7 +2,8 @@
 // answers can be compared line by line with a host's (the same source builds for both).
 //   metal_enum          every device of MTLCopyAllDevices, then the system default's name
 // Each line is `key=value`. A selector the device does not respond to prints `n/r`, and is
-// not sent; one that raises prints `threw` and the exception's name. Families and feature sets are asked by raw value, so the build does not depend on
+// not sent; one that raises prints `threw` and the exception's name. Families and feature sets
+// are asked by raw value, so the build does not depend on
 // which ones the SDK names.
 // Build: xcrun clang -arch x86_64 -mmacosx-version-min=26.0 -fobjc-arc -framework Metal \
 //        -framework Foundation metal_enum.m -o metal_enum
@@ -140,6 +141,33 @@ static void dump(id<MTLDevice> d)
 		char label[16];
 		snprintf(label, sizeof(label), "%lld", n);
 		query(d, "supportsVertexAmplificationCount:", label, n);
+	}
+	// Per-format answers of two uncompressed formats (BGRA8Unorm, RGBA32Float), which Metal
+	// answers on every device; it asserts on a compressed one, so none is asked.
+	static const unsigned long formats[] = {80, 125};
+	for (size_t i = 0; i < 2; i++) {
+		MTLPixelFormat f = (MTLPixelFormat)formats[i];
+		if ([(id)d respondsToSelector:@selector(minimumTextureBufferAlignmentForPixelFormat:)])
+			printf("  minimumTextureBufferAlignmentForPixelFormat:(%lu)=%lu\n", formats[i],
+			       (unsigned long)[d minimumTextureBufferAlignmentForPixelFormat:f]);
+		else
+			printf("  minimumTextureBufferAlignmentForPixelFormat:(%lu)=n/r\n", formats[i]);
+		SEL tile = @selector(sparseTileSizeWithTextureType:pixelFormat:sampleCount:sparsePageSize:);
+		if (![(id)d respondsToSelector:tile]) {
+			printf("  sparseTileSize(%lu)=n/r\n", formats[i]);
+			continue;
+		}
+		for (unsigned long n = 1; n <= 4; n *= 2) {
+			for (long page = 101; page <= 103; page++) {
+				MTLSize z = [d sparseTileSizeWithTextureType:MTLTextureType2D
+				                                 pixelFormat:f
+				                                 sampleCount:n
+				                              sparsePageSize:(MTLSparsePageSize)page];
+				printf("  sparseTileSize(%lu,%lu samples,page %ld)=%lux%lux%lu\n", formats[i], n,
+				       page, (unsigned long)z.width, (unsigned long)z.height,
+				       (unsigned long)z.depth);
+			}
+		}
 	}
 	if ([(id)d respondsToSelector:@selector(supportsCounterSampling:)]) {
 		static const char *const points[] = {"atStage", "atDraw", "atDispatch", "atTile",
