@@ -6,7 +6,10 @@
 #include "ReimsGraphics.hpp"
 
 #include <IOKit/IOLib.h>
+#include <IOKit/IOUserClient.h>
 #include <kern/clock.h>
+#include <kern/task.h>
+#include <kern/task_ref.h>
 #include <libkern/libkern.h>
 
 #include "RgfxTrace.hpp"
@@ -703,10 +706,11 @@ UInt32 ReimsGraphics::strideFor(UInt32 width)
 	return (width * 4 + kStrideAlign - 1) & ~(kStrideAlign - 1);
 }
 
-// The scanout buffer's room: from the guest's allocations up to the cursor.
+// The scanout buffer's room: RGFX_SCANOUT_SPAN at the guest's allocations, before the
+// accelerator's blocks (RgfxScanoutOwner.hpp), so no mode reaches a process's memory.
 UInt64 ReimsGraphics::scanoutLimit() const
 {
-	return regionSize - RGFX_ALLOCATIONS_OFFSET - kCursorSlot;
+	return rgfxScanoutRoom(regionSize, kCursorSlot);
 }
 
 IOReturn ReimsGraphics::setScanout(const Mode &mode)
@@ -732,6 +736,17 @@ IOReturn ReimsGraphics::setScanout(const Mode &mode)
 	return kIOReturnSuccess;
 }
 
+bool ReimsGraphics::ownsScanout(task_t task)
+{
+	if (!task || !stateLock)
+		return false;
+	IOLockLock(stateLock);
+	const IOUserClient *client = static_cast<const IOUserClient *>(scanoutOwner.client);
+	bool owns = scanoutOwner.owns(task, client && !client->isInactive());
+	IOLockUnlock(stateLock);
+	return owns;
+}
+
 bool ReimsGraphics::currentScanout(UInt32 *width, UInt32 *height, UInt32 *rowBytes,
                                    UInt64 *offset)
 {
@@ -751,6 +766,47 @@ bool ReimsGraphics::currentScanout(UInt32 *width, UInt32 *height, UInt32 *rowByt
 }
 
 // MARK: - IOService
+
+// IOFramebuffer makes the connection; a server connection's task is the scanout's owner from
+// then on, in place of the one before it, and while the open is in flight
+// (RgfxScanoutOwner.hpp).
+IOReturn ReimsGraphics::newUserClient(task_t owningTask, void *securityID, UInt32 type,
+                                      IOUserClient **clientH)
+{
+	if (type != kIOFBServerConnectType || !stateLock) {
+		IOReturn r = super::newUserClient(owningTask, securityID, type, clientH);
+		FBTRACE(32, "newUserClient type %u -> 0x%x", type, r);
+		return r;
+	}
+	IOLockLock(stateLock);
+	const IOUserClient *held = static_cast<const IOUserClient *>(scanoutOwner.client);
+	bool marked = scanoutOwner.beginOpen(owningTask, held && !held->isInactive());
+	IOLockUnlock(stateLock);
+	IOReturn r = super::newUserClient(owningTask, securityID, type, clientH);
+	FBTRACE(32, "newUserClient type %u -> 0x%x", type, r);
+	IOUserClient *made = r == kIOReturnSuccess && clientH ? *clientH : nullptr;
+	if (made) {
+		task_reference(owningTask);
+		made->retain();
+	}
+	const void *oldTask = nullptr, *oldClient = nullptr;
+	IOLockLock(stateLock);
+	scanoutOwner.endOpen(owningTask, made, marked, &oldTask, &oldClient);
+	IOLockUnlock(stateLock);
+	if (oldTask)
+		task_deallocate(static_cast<task_t>(const_cast<void *>(oldTask)));
+	if (oldClient)
+		static_cast<const IOUserClient *>(oldClient)->release();
+	RgfxCaller caller;
+	if (made)
+		IOLog("ReimsGraphics: the scanout's owner is %s[%d], which holds the server connection\n",
+		      caller.name, caller.pid);
+	else
+		IOLog("ReimsGraphics: %s[%d]'s server connection was not made (0x%x): the scanout's "
+		      "owner stays\n",
+		      caller.name, caller.pid, r);
+	return r;
+}
 
 bool ReimsGraphics::start(IOService *provider)
 {
@@ -985,6 +1041,12 @@ void ReimsGraphics::free()
 		IOLockFree(stateLock);
 	submitLock = interruptLock = nullptr;
 	stateLock = nullptr;
+	const void *oldTask = nullptr, *oldClient = nullptr;
+	scanoutOwner.clear(&oldTask, &oldClient);
+	if (oldTask)
+		task_deallocate(static_cast<task_t>(const_cast<void *>(oldTask)));
+	if (oldClient)
+		static_cast<const IOUserClient *>(oldClient)->release();
 	OSSafeReleaseNULL(pipeClient);
 	OSSafeReleaseNULL(queueTarget);
 	super::free();
@@ -1019,9 +1081,24 @@ IODeviceMemory *ReimsGraphics::getApertureRange(IOPixelAperture aperture)
 	return IODeviceMemory::withSubRange(region, RGFX_ALLOCATIONS_OFFSET, length);
 }
 
+// The scanout's room. IOFramebuffer asks for it in its own setup, where it reads the room's size
+// and the aperture's offset in it, and maps it into the task that asks for it on a user client
+// (its server connection, and its shared one for any task of the console's user), calling this
+// on that task's thread (IOGraphics' open source, clientMemoryForType). So the room goes to the
+// kernel and to the scanout's owner alone, and any other task gets none (RgfxScanoutOwner.hpp).
 IODeviceMemory *ReimsGraphics::getVRAMRange()
 {
 	if (!region)
+		return nullptr;
+	task_t task = current_task();
+	bool owner = task != kernel_task && ownsScanout(task);
+	bool given = rgfxMayMapVram(task, kernel_task, owner);
+	static char site;
+	RgfxCaller caller;
+	if (caller.pid != 0 && rgfxFirstCalls(&site, static_cast<UInt64>(caller.pid), 4))
+		IOLog("ReimsGraphics: the VRAM range %s %s[%d]\n",
+		      given ? "goes to the scanout's owner" : "is refused to", caller.name, caller.pid);
+	if (!given)
 		return nullptr;
 	return IODeviceMemory::withSubRange(region, RGFX_ALLOCATIONS_OFFSET, scanoutLimit());
 }
@@ -1929,14 +2006,6 @@ IOReturn ReimsGraphics::powerStateDidChangeTo(IOPMPowerFlags flags, unsigned lon
 	IOReturn r = super::powerStateDidChangeTo(flags, state, device);
 	FBTRACE(16, "powerStateDidChangeTo flags 0x%lx state %lu -> 0x%x",
 	        static_cast<unsigned long>(flags), state, r);
-	return r;
-}
-
-IOReturn ReimsGraphics::newUserClient(task_t owningTask, void *securityID, UInt32 type,
-                                      IOUserClient **clientH)
-{
-	IOReturn r = super::newUserClient(owningTask, securityID, type, clientH);
-	FBTRACE(32, "newUserClient type %u -> 0x%x", type, r);
 	return r;
 }
 

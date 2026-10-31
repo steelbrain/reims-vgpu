@@ -9,7 +9,13 @@
 //       4. an IOSurface plane's shared block holds what one holder wrote for another holder,
 //          and reads zeros for a process that does not hold the surface, which gets a block of
 //          its own for pages of its own; once this process lets go, it reads zeros here.
+//       5. the display's pixels are the scanout's owner's alone (the WindowServer that holds the
+//          framebuffer's server connection): another process's lock of a surface over the
+//          scanout is refused and maps nothing, the scanout's grant to its context is refused
+//          and its window reads zeros there, where a write faults, and the framebuffer's VRAM
+//          range does not map on the framebuffer's shared connection.
 //     Prints "WINDOW OK" when every step holds, else "WINDOW FAIL: why".
+//   window_probe scanout   step 5 alone, in a process of its own.
 //   window_probe bench [N]  N (2000 by default) allocs and frees of a 64 KiB block, one after
 //     the other: the microseconds a pair takes from this process, the kext's window work
 //     included (which the kext logs at the close).
@@ -18,6 +24,8 @@
 //        -framework Foundation window_probe.m -o window_probe
 #import <Foundation/Foundation.h>
 #import <IOKit/IOKitLib.h>
+#import <IOKit/graphics/IOAccelSurfaceConnect.h>
+#import <IOKit/graphics/IOGraphicsTypes.h>
 #import <IOSurface/IOSurface.h>
 #include <mach/mach_time.h>
 #include <setjmp.h>
@@ -39,14 +47,21 @@ enum {
 	kOpenContext = 0x100,
 	kAlloc = 0x101,
 	kFree = 0x102,
+	kSurfaceScanout = 0x108,
 	kSurfaceBlock = 0x109,
 	kSurfaceBlockRelease = 0x10a,
 	kDeviceInfo = 0x10b,
 };
 static const uint64_t kHead = 0x400000;       // RGFX_ALLOCATIONS_OFFSET
 static const uint64_t kDeviceInfoAt = 0x18100; // RGFX_DEVICE_INFO_OFFSET
+#define RGFX_PROBE_SCANOUT_SPAN 0x8000000ull     // RGFX_SCANOUT_SPAN
 static const size_t kDeviceInfoSize = 11640;   // sizeof(RgfxDeviceInfo)
 static const uint64_t kBlock = 0x10000;
+// The accelerator's IOAccel surface client (kIOAccelSurfaceClientType), and IOGraphics' memory
+// type for a framebuffer's VRAM range on its user clients (kIOFBVRAMMemory, in IOGraphics' open
+// source, IOGraphicsTypesPrivate.h).
+static const uint32_t kSurfaceClientType = 0;
+static const uint32_t kFramebufferVram = 110;
 
 struct Conn {
 	io_connect_t conn;
@@ -217,6 +232,158 @@ static int peerOther(uint64_t offset, uint64_t length)
 	return bad == 0 && asked == 0 && at != offset && fresh ? 0 : 1;
 }
 
+// A surface of the accelerator's, with no backing, on framebuffer 0: `sid`, BGRA.
+static io_connect_t openSurface(uint32_t sid)
+{
+	io_service_t svc =
+	    IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("RgfxAccelerator"));
+	if (!svc)
+		return IO_OBJECT_NULL;
+	io_connect_t s = IO_OBJECT_NULL;
+	kern_return_t kr = IOServiceOpen(svc, mach_task_self(), kSurfaceClientType, &s);
+	IOObjectRelease(svc);
+	if (kr != KERN_SUCCESS)
+		return IO_OBJECT_NULL;
+	uint64_t idMode[2] = {sid, kIOAccelSurfaceModeColorDepthBGRA32};
+	if (IOConnectCallScalarMethod(s, kIOAccelSurfaceSetIDMode, idMode, 2, NULL, NULL) !=
+	    KERN_SUCCESS) {
+		IOServiceClose(s);
+		return IO_OBJECT_NULL;
+	}
+	return s;
+}
+
+// Shapes surface `s` to `w` x `h` at the display's origin and write-locks it: the lock's answer,
+// its information in `*info`. The lock is let go at once.
+static kern_return_t lockShape(io_connect_t s, int w, int h, IOAccelSurfaceInformation *info)
+{
+	IOAccelDeviceRegion region = {};
+	region.num_rects = 0;
+	region.bounds = (IOAccelBounds){0, 0, (SInt16)w, (SInt16)h};
+	uint64_t shape[2] = {0, 0}; // options, framebuffer 0
+	kern_return_t kr = IOConnectCallMethod(s, kIOAccelSurfaceSetShape, shape, 2, &region,
+	                                       sizeof(region), NULL, NULL, NULL, NULL);
+	if (kr != KERN_SUCCESS)
+		return kr;
+	memset(info, 0, sizeof(*info));
+	size_t infoSize = sizeof(*info);
+	uint64_t options = 0;
+	kr = IOConnectCallMethod(s, kIOAccelSurfaceWriteLockOptions, &options, 1, NULL, 0, NULL, NULL,
+	                         info, &infoSize);
+	if (kr == KERN_SUCCESS)
+		IOConnectCallScalarMethod(s, kIOAccelSurfaceWriteUnlockOptions, &options, 1, NULL, NULL);
+	return kr;
+}
+
+// The largest `n` in [1, limit] for which `fits(n)` holds, `fits` holding up to it and not past.
+static int largest(io_connect_t s, int limit, int width)
+{
+	int lo = 1, hi = limit;
+	while (lo < hi) {
+		int mid = lo + (hi - lo + 1) / 2;
+		IOAccelSurfaceInformation info;
+		kern_return_t kr = width ? lockShape(s, mid, 1, &info) : lockShape(s, 1, mid, &info);
+		if (kr == KERN_SUCCESS)
+			lo = mid;
+		else
+			hi = mid - 1;
+	}
+	return lo;
+}
+
+// peer-scanout: this process does not hold the framebuffer's server connection, so it reaches
+// none of the display's pixels: its lock of a surface over the scanout is refused, its context
+// is not granted the scanout and its window reads zeros there, and the framebuffer's VRAM range
+// does not map for it on the shared connection.
+static int peerScanout(void)
+{
+	struct Conn c;
+	if (openConn(&c) != 0 || !c.base) {
+		printf("  scanout: no context\n");
+		return 1;
+	}
+	uint32_t sid = 0x52000000u | ((uint32_t)getpid() & 0xffffffu);
+	io_connect_t s = openSurface(sid);
+	if (s == IO_OBJECT_NULL) {
+		printf("  scanout: no surface\n");
+		return 1;
+	}
+	int failed = 0;
+	// a. The lock of a corner of the display.
+	IOAccelSurfaceInformation info;
+	kern_return_t locked = lockShape(s, 16, 16, &info);
+	printf("  scanout: a lock of 16x16 at 0,0: 0x%x, address 0x%llx\n", locked,
+	       (unsigned long long)info.address[0]);
+	int w = 16, h = 16;
+	if (locked == KERN_SUCCESS) {
+		// The display's pixels reach this process: how much of them, and the display's shape
+		// for the grant below.
+		volatile const uint8_t *px = (volatile const uint8_t *)(uintptr_t)info.address[0];
+		printf("  scanout: the lock maps the display here (%zu nonzero bytes in its first row)\n",
+		       px ? notAll(px, 64, 0) : 0);
+		w = largest(s, 16384, 1);
+		h = largest(s, 16384, 0);
+		printf("  scanout: the display is %dx%d\n", w, h);
+		failed = 1;
+	}
+	// b. The scanout's grant to this process's context, for the surface shaped as the whole
+	// display (as far as this process could tell its shape).
+	lockShape(s, w, h, &info);
+	uint64_t in[2] = {sid, 0};
+	uint64_t out[5] = {};
+	uint32_t n = 5;
+	kern_return_t granted = IOConnectCallScalarMethod(c.conn, kSurfaceScanout, in, 2, out, &n);
+	uint64_t at = granted == KERN_SUCCESS ? out[0] : kHead;
+	uint64_t length = granted == KERN_SUCCESS && out[1] ? out[1] : 0x10000;
+	if (at >= c.size || length > c.size - at)
+		at = kHead, length = 0x10000;
+	size_t bad = notAll(c.base + at, length, 0);
+	int faulted = writeFaults(c.base + at);
+	printf("  scanout: the grant 0x%x (span 0x%llx, 0x%llx bytes); the window reads %zu nonzero "
+	       "bytes there, a write %s\n",
+	       granted, (unsigned long long)at, (unsigned long long)length, bad,
+	       faulted ? "faults" : "lands");
+	if (granted == KERN_SUCCESS || bad != 0 || !faulted)
+		failed = 1;
+	IOServiceClose(s);
+	// c. The framebuffer's VRAM range, on its shared connection, which IOGraphics opens for any
+	// task while WindowServer holds the server connection.
+	io_service_t fb =
+	    IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("ReimsGraphics"));
+	io_connect_t shared = IO_OBJECT_NULL;
+	kern_return_t opened =
+	    fb ? IOServiceOpen(fb, mach_task_self(), kIOFBSharedConnectType, &shared) : KERN_FAILURE;
+	if (fb)
+		IOObjectRelease(fb);
+	mach_vm_address_t addr = 0;
+	mach_vm_size_t size = 0;
+	kern_return_t vram = opened == KERN_SUCCESS
+	                         ? IOConnectMapMemory64(shared, kFramebufferVram, mach_task_self(),
+	                                                &addr, &size, kIOMapAnywhere)
+	                         : KERN_FAILURE;
+	if (vram == KERN_SUCCESS) {
+		// What the range reaches: the scanout at its start, and past it the accelerator's
+		// blocks, every process's.
+		size_t onScreen = notAll((volatile const uint8_t *)(uintptr_t)addr, 0x100000, 0);
+		size_t past = size > RGFX_PROBE_SCANOUT_SPAN
+		                  ? notAll((volatile const uint8_t *)(uintptr_t)addr +
+		                               RGFX_PROBE_SCANOUT_SPAN,
+		                           size - RGFX_PROBE_SCANOUT_SPAN, 0)
+		                  : 0;
+		printf("  scanout: the VRAM range maps here: 0x%llx bytes, %zu nonzero bytes in its "
+		       "first MiB, %zu past the scanout's span\n",
+		       (unsigned long long)size, onScreen, past);
+		failed = 1;
+	} else {
+		printf("  scanout: the shared connection 0x%x, its VRAM range 0x%x (not mapped)\n",
+		       opened, vram);
+	}
+	if (shared != IO_OBJECT_NULL)
+		IOServiceClose(shared);
+	IOServiceClose(c.conn);
+	return failed;
+}
+
 static int check(const char *self)
 {
 	struct Conn c;
@@ -319,6 +486,13 @@ static int check(const char *self)
 	}
 	CFRelease(s);
 	IOServiceClose(c.conn);
+	// 5. The display's pixels are not this process's to reach, nor another's.
+	char *scanout[] = {(char *)self, "peer-scanout", NULL};
+	if (spawnWait(scanout) != 0) {
+		printf("WINDOW FAIL: 5\n");
+		return 1;
+	}
+	printf("5 the scanout reaches no process but its owner\n");
 	printf("WINDOW OK\n");
 	return 0;
 }
@@ -368,6 +542,14 @@ int main(int argc, char **argv)
 			                  (uint8_t)strtoul(argv[4], NULL, 0));
 		if (argc >= 4 && strcmp(argv[1], "peer-other") == 0)
 			return peerOther(strtoull(argv[2], NULL, 0), strtoull(argv[3], NULL, 0));
+		if (argc >= 2 && strcmp(argv[1], "peer-scanout") == 0)
+			return peerScanout();
+		if (argc >= 2 && strcmp(argv[1], "scanout") == 0) {
+			char *scanout[] = {argv[0], "peer-scanout", NULL};
+			int r = spawnWait(scanout);
+			printf(r == 0 ? "SCANOUT OK\n" : "SCANOUT FAIL\n");
+			return r != 0;
+		}
 		if (argc >= 2 && strcmp(argv[1], "bench") == 0)
 			return bench(argc >= 3 ? strtol(argv[2], NULL, 0) : 2000);
 		return check(argv[0]);

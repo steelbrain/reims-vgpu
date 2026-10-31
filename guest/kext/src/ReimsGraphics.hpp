@@ -32,6 +32,7 @@
 #include <IOKit/graphics/IOFramebuffer.h>
 #include <IOKit/pci/IOPCIDevice.h>
 
+#include "RgfxScanoutOwner.hpp"
 #include "reims_graphics_wire.h"
 
 class ReimsGraphics : public IOFramebuffer {
@@ -94,6 +95,11 @@ public:
 	IOReturn unregisterInterrupt(void *interruptRef) override;
 	IOReturn setInterruptState(void *interruptRef, UInt32 state) override;
 
+	// IOService: the user clients IOFramebuffer makes. The task a server connection
+	// (kIOFBServerConnectType) is made for owns the scanout from then on (ownsScanout).
+	IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type,
+	                       IOUserClient **clientH) override;
+
 #if RGFX_FB_TRACE
 	// A trace build (make TRACE=1) logs what IOFramebuffer and its clients call on the
 	// driver, forwarding each of these to IOFramebuffer.
@@ -109,8 +115,6 @@ public:
 	                                IOService *device) override;
 	IOReturn powerStateDidChangeTo(IOPMPowerFlags flags, unsigned long state,
 	                               IOService *device) override;
-	IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type,
-	                       IOUserClient **clientH) override;
 	IOReturn requestProbe(IOOptionBits options) override;
 	IOReturn message(UInt32 type, IOService *provider, void *argument = 0) override;
 	IOReturn setupForCurrentConfig() override;
@@ -137,6 +141,9 @@ public:
 	// The scanout as it is now (setScanout): its shape, bytes per row and offset in the region.
 	// False before a mode is set.
 	bool currentScanout(UInt32 *width, UInt32 *height, UInt32 *rowBytes, UInt64 *offset);
+	// Whether `task` owns the scanout: it holds the framebuffer's server connection, or its open
+	// of one is in flight (RgfxScanoutOwner.hpp). Only the owner reaches the display's pixels.
+	bool ownsScanout(task_t task);
 
 	typedef void (*PipeVblankHook)(OSObject *client, UInt64 count, UInt64 time);
 	typedef void (*PipePresentHook)(OSObject *client, UInt64 seqno, UInt32 status);
@@ -315,8 +322,9 @@ private:
 	UInt64 consumed;
 
 	// Under stateLock: answers, the lifecycle's waiters, the display and its modes, the mode
-	// set.
+	// set, and the scanout's owner (its task referenced, its connection retained).
 	IOLock *stateLock;
+	RgfxScanoutOwner scanoutOwner;
 	Answer answers[kAnswers];
 	UInt32 nextAnswer;
 	LifecycleWaiter lifecycleWaiters[kLifecycleWaiters];

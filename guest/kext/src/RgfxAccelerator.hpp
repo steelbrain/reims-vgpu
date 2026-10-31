@@ -269,11 +269,14 @@ public:
 		UInt32 rowBytes;
 	};
 	bool currentScanout(Scanout *scanout);
+	// Whether `task` owns the framebuffer's scanout (ReimsGraphics::ownsScanout): only the owner
+	// locks a surface over it or is granted it.
+	bool ownsScanout(task_t task);
 	// For our user client `client` in `task`, of context `context`: the scanout surface
 	// `surfaceId` of that task is drawn into, whose span `client` may name from then on
 	// (grantedRange) until revokeGrants or the surface goes. The device is told the span is
 	// `context`'s (BLOCK_GRANT) before this returns, and the span is mapped in the client's
-	// window while the grant lasts.
+	// window while the grant lasts. kIOReturnNotPermitted where `task` does not own the scanout.
 	IOReturn grantSurfaceScanout(RgfxAcceleratorUserClient *client, UInt32 context, task_t task,
 	                             UInt32 surfaceId, Scanout *scanout);
 	void revokeGrants(const void *client);

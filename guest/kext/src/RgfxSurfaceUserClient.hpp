@@ -27,6 +27,9 @@
  *     answers the shape's first pixel in it, and what is drawn there is what the display
  *     shows, so a flush has nothing to copy;
  *   - else none, and a lock fails with kIOReturnNoMemory.
+ * The scanout is its owner's alone, the task that holds the framebuffer's server connection
+ * (RgfxScanoutOwner.hpp): a lock of a surface with no backing by any other task fails with
+ * kIOReturnNotPermitted, and maps nothing.
  *
  * Our own code; it names only SDK-public IOKit classes and the SDK's IOAccel headers.
  */

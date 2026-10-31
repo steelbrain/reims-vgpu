@@ -18,6 +18,9 @@
  * the kext's grant lasts: mapped in at the grant, under the lock, and taken back where the grant
  * goes or moves (the surface goes, or a mode change moves the scanout).
  *
+ * Only the scanout's owner, the task that holds the framebuffer's server connection, is granted
+ * it (RgfxScanoutOwner.hpp); any other task's ask is refused, whatever surface it made.
+ *
  * Our own code; it names only SDK-public IOKit calls.
  */
 
@@ -25,6 +28,7 @@
 #include "RgfxAcceleratorUserClient.hpp"
 #include "RgfxSurfaceUserClient.hpp"
 #include "ReimsGraphics.hpp"
+#include "RgfxTrace.hpp"
 
 #include <IOKit/IOLib.h>
 
@@ -140,6 +144,16 @@ void RgfxAccelerator::unregisterSurface(RgfxSurfaceUserClient *surface)
 	OSSafeReleaseNULL(gone);
 }
 
+bool RgfxAccelerator::ownsScanout(task_t task)
+{
+	ReimsGraphics *fb = copyFramebuffer();
+	if (!fb)
+		return false;
+	bool owns = fb->ownsScanout(task);
+	fb->release();
+	return owns;
+}
+
 bool RgfxAccelerator::currentScanout(Scanout *scanout)
 {
 	ReimsGraphics *fb = copyFramebuffer();
@@ -157,6 +171,15 @@ bool RgfxAccelerator::currentScanout(Scanout *scanout)
 IOReturn RgfxAccelerator::grantSurfaceScanout(RgfxAcceleratorUserClient *client, UInt32 context,
                                               task_t task, UInt32 surfaceId, Scanout *scanout)
 {
+	// The display's pixels are its owner's alone (RgfxScanoutOwner.hpp).
+	if (!ownsScanout(task)) {
+		static char site;
+		RgfxCaller caller;
+		if (rgfxFirstCalls(&site, static_cast<UInt64>(caller.pid), 2))
+			IOLog("RGFX surface: the scanout is refused to %s[%d], which does not own it\n",
+			      caller.name, caller.pid);
+		return kIOReturnNotPermitted;
+	}
 	if (!currentScanout(scanout))
 		return kIOReturnNotReady;
 	IOLock *lock = __atomic_load_n(&surfaceState.lock, __ATOMIC_ACQUIRE);
