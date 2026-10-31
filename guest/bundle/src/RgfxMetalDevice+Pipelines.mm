@@ -5,11 +5,11 @@
 
 #import "RgfxMetalDevice+Pipelines.h"
 
-#import "RgfxArgumentEncoder.h"
 #import "RgfxComputePipelineState.h"
 #import "RgfxLibrary.h"
 #import "RgfxMetalError.h"
 #import "RgfxRenderPipelineState.h"
+#import "RgfxUnsupported.h"
 
 #include "RgfxLibraryKey.hpp"
 #include "RgfxRegion.hpp"
@@ -422,12 +422,14 @@ static State rgfxUnlessRefused(State state, NSError *__autoreleasing *error)
 
 // --- argument encoders -------------------------------------------------------
 
+// No argument-buffer layout on the wire (the host's layout answer: protocol-gaps-wire.md), so no
+// encoder: nil, which apps and Metal's own frameworks check, rather than an encoder whose
+// encodedLength and writes would give the GPU a buffer that holds nothing.
 - (id<MTLArgumentEncoder>)
     newArgumentEncoderWithArguments:(NSArray<MTLArgumentDescriptor *> *)arguments
 {
-	return [RgfxArgumentEncoder argumentEncoderWithArguments:arguments
-	                                                 device:self
-	                                             serializer:[self serializer]];
+	RGFX_UNSUPPORTED("argument encoders (no argument-buffer layout on the wire)");
+	return nil;
 }
 
 @end
