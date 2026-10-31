@@ -143,6 +143,31 @@ pub const FEATURE_SETS: [u64; 29] = [
     10005, 30000, 30001, 30002, 30003, 30004, 30005,
 ];
 
+/// The family of [`SDK_FAMILIES`] an `MTLFeatureSet` of [`FEATURE_SETS`] goes with: a device answers
+/// the set where it answers the family, as Metal answers on the M3 Max (macOS 27, measured). The iOS
+/// sets go with the Apple family of their number, macOS' 1_v1 to v4 with Mac1 and 2_v1 with Mac2;
+/// `None` for the sets no family brings (macOS_ReadWriteTextureTier2 and the tvOS sets), which the
+/// M3 Max answers no.
+pub const fn feature_set_family(set: u64) -> Option<i64> {
+    match set {
+        // iOS_GPUFamily1_v1 to v5.
+        0 | 2 | 5 | 8 | 12 => Some(1001),
+        // iOS_GPUFamily2_v1 to v5.
+        1 | 3 | 6 | 9 | 13 => Some(1002),
+        // iOS_GPUFamily3_v1 to v4.
+        4 | 7 | 10 | 14 => Some(1003),
+        // iOS_GPUFamily4_v1 and v2.
+        11 | 15 => Some(1004),
+        // iOS_GPUFamily5_v1.
+        16 => Some(1005),
+        // macOS_GPUFamily1_v1 to v4.
+        10000 | 10001 | 10003 | 10004 => Some(2001),
+        // macOS_GPUFamily2_v1.
+        10005 => Some(2002),
+        _ => None,
+    }
+}
+
 /// The `MTLCounterSamplingPoint`s [`IdentityCaps`] answers `supportsCounterSampling:` of, in order:
 /// at stage, draw, dispatch, tile and blit boundaries.
 pub const COUNTER_SAMPLING_POINTS: [u64; 5] = [0, 1, 2, 3, 4];

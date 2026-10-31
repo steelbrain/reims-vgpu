@@ -40,7 +40,7 @@ use metal2vulkan_runtime as rt;
 use reims_vgpu_core::platform::caps::{
     DeviceCaps, FEATURE_SETS, FormatAnswers, IdentityCaps, IdentityFlags, IdentitySizes,
     LARGEST_COUNT_ASKED, SDK_FAMILIES, SDK_PIXEL_FORMATS, SPARSE_PAGE_SIZES, SPARSE_SAMPLE_COUNTS,
-    TEXTURE_BUFFER_FORMATS,
+    TEXTURE_BUFFER_FORMATS, feature_set_family,
 };
 
 use crate::gpu::runtime_pixel_format;
@@ -133,27 +133,9 @@ fn families(device: &rt::Device, caps: &DeviceCaps) -> [bool; 20] {
 
 /// `supportsFeatureSet:` of `set` on a device of `families`, as Metal answers on the M3 Max (the
 /// module docs): the iOS feature sets of each Apple family, macOS' two families, and none of the
-/// others.
+/// others ([`feature_set_family`]).
 fn feature_set(set: u64, families: &[bool; 20]) -> bool {
-    let has = |family: i64| families[at(family)];
-    match set {
-        // iOS_GPUFamily1_v1 to v5.
-        0 | 2 | 5 | 8 | 12 => has(1001),
-        // iOS_GPUFamily2_v1 to v5.
-        1 | 3 | 6 | 9 | 13 => has(1002),
-        // iOS_GPUFamily3_v1 to v4.
-        4 | 7 | 10 | 14 => has(1003),
-        // iOS_GPUFamily4_v1 and v2.
-        11 | 15 => has(1004),
-        // iOS_GPUFamily5_v1.
-        16 => has(1005),
-        // macOS_GPUFamily1_v1 to v4.
-        10000 | 10001 | 10003 | 10004 => has(2001),
-        // macOS_GPUFamily2_v1.
-        10005 => has(2002),
-        // macOS_ReadWriteTextureTier2 and the tvOS feature sets.
-        _ => false,
-    }
+    feature_set_family(set).is_some_and(|family| families[at(family)])
 }
 
 /// The largest count in `1..=LARGEST_COUNT_ASKED` `accepts` takes, counting up from 1 until it
