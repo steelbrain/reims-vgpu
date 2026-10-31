@@ -18,6 +18,7 @@
 #include <cstring>
 #include <vector>
 
+#include "RgfxBinaryArchiveFile.hpp"
 #include "RgfxCaps.hpp"
 #include "RgfxEncoder.hpp"
 #include "RgfxLibraryKey.hpp"
@@ -1237,12 +1238,66 @@ void test_keyed_library_messages()
 	CHECK(std::memcmp(chunk.key, key, 32) == 0);
 }
 
+// The archive file: its sections round-trip, whatever does not parse whole is no archive, and a
+// Metal archive is told by its fat header, every slice inside the file.
+void test_archive_file()
+{
+	RgfxArchiveKey k1(kRgfxArchiveCompute), k2(kRgfxArchiveCompute), k3(kRgfxArchiveVertex);
+	k1.text("a");
+	k2.text("b");
+	k3.text("a");
+	RgfxArchiveEntry a = k1.finish(), b = k2.finish(), v = k3.finish();
+	CHECK(!(a == b));
+	CHECK(!(a == v)); // the kind is part of the key
+	RgfxArchiveKey k4(kRgfxArchiveCompute);
+	k4.text("a");
+	CHECK(k4.finish() == a);
+	// A field's length goes in with it: "ab" then "" is not "a" then "b".
+	RgfxArchiveKey s1(kRgfxArchiveCompute), s2(kRgfxArchiveCompute);
+	s1.text("ab");
+	s1.text("");
+	s2.text("a");
+	s2.text("b");
+	CHECK(!(s1.finish() == s2.finish()));
+
+	std::vector<RgfxArchiveSection> in(2);
+	in[0].architecture = "vulkan_10de_2c58_00";
+	in[0].entries = {a, v};
+	in[1].architecture = "applegpu_g15s";
+	in[1].entries = {b};
+	std::vector<uint8_t> file = rgfxWriteArchiveFile(in);
+	std::vector<RgfxArchiveSection> out;
+	CHECK(rgfxReadArchiveFile(file.data(), file.size(), out) == RgfxArchiveFileKind::Ours);
+	CHECK(out.size() == 2);
+	CHECK(out[0].architecture == in[0].architecture && out[0].entries == in[0].entries);
+	CHECK(out[1].architecture == in[1].architecture && out[1].entries == in[1].entries);
+	CHECK(file.size() == 8 + 4 + (4 + 19 + 4 + 2 * 33) + (4 + 13 + 4 + 33));
+
+	for (size_t cut = 0; cut < file.size(); cut++)
+		CHECK(rgfxReadArchiveFile(file.data(), cut, out) == RgfxArchiveFileKind::Invalid);
+	std::vector<uint8_t> longer = file;
+	longer.push_back(0);
+	CHECK(rgfxReadArchiveFile(longer.data(), longer.size(), out) == RgfxArchiveFileKind::Invalid);
+	CHECK(out.empty());
+	std::vector<uint8_t> none = rgfxWriteArchiveFile({});
+	CHECK(rgfxReadArchiveFile(none.data(), none.size(), out) == RgfxArchiveFileKind::Ours);
+	CHECK(out.empty());
+
+	// One slice of 4 bytes at 28: a Metal archive; its slice past the end: no archive.
+	const uint8_t fat[] = {0xcb, 0xfe, 0xba, 0xbe, 0, 0, 0, 1, 1, 0, 0, 0x17, 0, 0, 0, 0xd,
+	                       0,    0,    0,    28,   0, 0, 0, 4, 0, 0, 0, 0,    1, 2, 3, 4};
+	CHECK(rgfxReadArchiveFile(fat, sizeof(fat), out) == RgfxArchiveFileKind::Metal);
+	CHECK(rgfxReadArchiveFile(fat, sizeof(fat) - 1, out) == RgfxArchiveFileKind::Invalid);
+	CHECK(rgfxReadArchiveFile(fat, 8, out) == RgfxArchiveFileKind::Invalid);
+}
+
 int main()
 {
 	test_id_space();
 	test_address_picks();
 	test_resource_id_chunks();
 	test_caps();
+	test_archive_file();
 	test_lifecycle_messages();
 	test_creates_with_no_address_post_nothing();
 	test_library_message();

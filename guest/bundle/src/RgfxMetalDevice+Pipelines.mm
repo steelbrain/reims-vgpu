@@ -5,6 +5,7 @@
 
 #import "RgfxMetalDevice+Pipelines.h"
 
+#import "RgfxBinaryArchive.h"
 #import "RgfxComputePipelineState.h"
 #import "RgfxLibrary.h"
 #import "RgfxMetalError.h"
@@ -264,8 +265,19 @@ static State rgfxUnlessRefused(State state, NSError *__autoreleasing *error)
 // entry point funnels through here.
 - (nullable id<MTLRenderPipelineState>)
     rgfxRenderPipelineForDescriptor:(MTLRenderPipelineDescriptor *)descriptor
+                            options:(MTLPipelineOption)options
                               error:(__autoreleasing NSError **)error
 {
+	// MTLPipelineOptionFailOnBinaryArchiveMiss answers Metal's miss where the descriptor's
+	// archives lack one of its functions' compiles; without it a miss compiles as Metal's does.
+	if ((options & MTLPipelineOptionFailOnBinaryArchiveMiss) != 0) {
+		NSError *miss = [RgfxBinaryArchive rgfxMissOfRenderPipeline:descriptor];
+		if (miss != nil) {
+			if (error)
+				*error = miss;
+			return nil;
+		}
+	}
 	RgfxRenderPipelineState *state =
 	    [RgfxRenderPipelineState renderPipelineStateWithDescriptor:descriptor
 	                                                        device:self
@@ -279,7 +291,7 @@ static State rgfxUnlessRefused(State state, NSError *__autoreleasing *error)
     newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)descriptor
                                    error:(__autoreleasing NSError **)error
 {
-	return [self rgfxRenderPipelineForDescriptor:descriptor error:error];
+	return [self rgfxRenderPipelineForDescriptor:descriptor options:MTLPipelineOptionNone error:error];
 }
 
 - (id<MTLRenderPipelineState>)
@@ -288,12 +300,11 @@ static State rgfxUnlessRefused(State state, NSError *__autoreleasing *error)
                               reflection:(MTLAutoreleasedRenderPipelineReflection *)reflection
                                    error:(__autoreleasing NSError **)error
 {
-	(void)options;
 	// The reflection is answered by the host over the completion ring (reader is a
 	// later transport piece), so there is none to hand back synchronously.
 	if (reflection)
 		*reflection = nil;
-	return [self rgfxRenderPipelineForDescriptor:descriptor error:error];
+	return [self rgfxRenderPipelineForDescriptor:descriptor options:options error:error];
 }
 
 - (void)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)descriptor
@@ -313,10 +324,10 @@ static State rgfxUnlessRefused(State state, NSError *__autoreleasing *error)
                                (MTLNewRenderPipelineStateWithReflectionCompletionHandler)
                                    completionHandler
 {
-	(void)options;
 	NSError *err = nil;
-	id<MTLRenderPipelineState> state = [self newRenderPipelineStateWithDescriptor:descriptor
-	                                                                       error:&err];
+	id<MTLRenderPipelineState> state = [self rgfxRenderPipelineForDescriptor:descriptor
+	                                                                 options:options
+	                                                                   error:&err];
 	if (completionHandler)
 		completionHandler(state, nil, err); // reflection: see the error: variant above
 }
@@ -340,8 +351,19 @@ static State rgfxUnlessRefused(State state, NSError *__autoreleasing *error)
 
 - (nullable id<MTLComputePipelineState>)
     rgfxComputePipelineForDescriptor:(MTLComputePipelineDescriptor *)descriptor
+                             options:(MTLPipelineOption)options
                                error:(__autoreleasing NSError **)error
 {
+	// As a render pipeline's (above). A pipeline of a function alone names no archive, so it
+	// compiles whatever its options, as Metal's does.
+	if ((options & MTLPipelineOptionFailOnBinaryArchiveMiss) != 0) {
+		NSError *miss = [RgfxBinaryArchive rgfxMissOfComputePipeline:descriptor];
+		if (miss != nil) {
+			if (error)
+				*error = miss;
+			return nil;
+		}
+	}
 	RgfxComputePipelineState *state =
 	    [RgfxComputePipelineState computePipelineStateWithDescriptor:descriptor
 	                                                          device:self
@@ -400,10 +422,9 @@ static State rgfxUnlessRefused(State state, NSError *__autoreleasing *error)
                                reflection:(MTLAutoreleasedComputePipelineReflection *)reflection
                                     error:(__autoreleasing NSError **)error
 {
-	(void)options;
 	if (reflection)
 		*reflection = nil;
-	return [self rgfxComputePipelineForDescriptor:descriptor error:error];
+	return [self rgfxComputePipelineForDescriptor:descriptor options:options error:error];
 }
 
 - (void)newComputePipelineStateWithDescriptor:(MTLComputePipelineDescriptor *)descriptor
@@ -412,12 +433,24 @@ static State rgfxUnlessRefused(State state, NSError *__autoreleasing *error)
                                 (MTLNewComputePipelineStateWithReflectionCompletionHandler)
                                     completionHandler
 {
-	(void)options;
 	NSError *err = nil;
 	id<MTLComputePipelineState> state = [self rgfxComputePipelineForDescriptor:descriptor
+	                                                                  options:options
 	                                                                    error:&err];
 	if (completionHandler)
 		completionHandler(state, nil, err);
+}
+
+// --- binary archives ---------------------------------------------------------
+
+// The device's archives are its own, keyed by its architecture's name (RgfxBinaryArchive.h).
+- (id<MTLBinaryArchive>)newBinaryArchiveWithDescriptor:(MTLBinaryArchiveDescriptor *)descriptor
+                                                 error:(__autoreleasing NSError **)error
+{
+	return [RgfxBinaryArchive archiveWithDescriptor:descriptor
+	                                         device:self
+	                                   architecture:[self architecture].name ?: @""
+	                                          error:error];
 }
 
 // --- argument encoders -------------------------------------------------------

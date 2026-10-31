@@ -145,14 +145,6 @@ constexpr const char *kIO = "Metal IO command queues";
 		completionHandler(nil, nil, error);
 }
 
-- (id<MTLBinaryArchive>)newBinaryArchiveWithDescriptor:(MTLBinaryArchiveDescriptor *)descriptor
-                                                 error:(NSError **)error
-{
-	RGFX_UNSUPPORTED_ERROR_IN(error, "binary archives (none on the wire)", MTLBinaryArchiveDomain,
-	                          MTLBinaryArchiveErrorInternalError);
-	return nil;
-}
-
 // --- resources the device does not make -----------------------------------------------
 
 - (id<MTLBuffer>)newBufferWithLength:(NSUInteger)length

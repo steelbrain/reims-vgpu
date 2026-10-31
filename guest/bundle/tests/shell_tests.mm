@@ -4185,6 +4185,7 @@ void test_reply_reader_close()
 }
 
 void rgfxProtocolTests();
+void rgfxArchiveTests();
 
 int main()
 {
@@ -4247,6 +4248,7 @@ int main()
 		test_shared_heap_buffers_alias_its_bytes();
 		test_managed_texture_copy_block_after_destroys();
 		rgfxProtocolTests(); // tests/protocol_tests.mm
+		rgfxArchiveTests();  // tests/archive_tests.mm
 	}
 	std::printf("shell_tests: OK (%d checks)\n", g_checks);
 	return 0;

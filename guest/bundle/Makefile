@@ -82,7 +82,8 @@ TESTHEADERS  = $(wildcard tests/*.hpp)
 CORE_SRCS = src/RgfxObjectModel.cpp src/RgfxCaps.cpp src/RgfxRingWriter.cpp \
 	src/RgfxSerializer.cpp src/RgfxEncoder.cpp src/RgfxWireLayout.cpp \
 	src/RgfxRegion.cpp src/RgfxReplyReader.cpp src/RgfxLibraryKey.cpp \
-	src/RgfxCompletionThread.cpp src/RgfxRetirement.cpp src/RgfxFunctionConstants.cpp
+	src/RgfxCompletionThread.cpp src/RgfxRetirement.cpp src/RgfxFunctionConstants.cpp \
+	src/RgfxBinaryArchiveFile.cpp
 
 # The whole Metal shell (ObjC++): wrappers + the device. Goes in the bundle. Globbed
 # so each later slice's wrappers + category are picked up with no Makefile edit.
@@ -136,7 +137,7 @@ $(SER_TESTBIN): $(CORE_OBJ_ARCH) tests/serializer_tests.cpp $(HEADERS) $(TESTHEA
 # --- the Metal-shell wrapper/routing check (native arch) ---------------------
 # The NSObject wrappers + serialiser core + the routing test; no device shell.
 
-SHELL_TESTSRCS = tests/shell_tests.mm tests/protocol_tests.mm
+SHELL_TESTSRCS = tests/shell_tests.mm tests/protocol_tests.mm tests/archive_tests.mm
 
 $(SHELL_TESTBIN): $(CORE_OBJ_NAT) $(WRAP_OBJ_NAT) $(SHELL_TESTSRCS) $(HEADERS) $(TESTHEADERS) Makefile
 	@mkdir -p $(@D)
