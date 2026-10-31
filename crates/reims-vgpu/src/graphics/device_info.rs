@@ -91,7 +91,9 @@ fn format_answers(answers: &FormatAnswers) -> RgfxFormatAnswers {
 /// | `supportsCounterSampling:` | no, at every point | counter sample buffers |
 /// | `supportsRasterizationRateMapWithLayerCount:` | no, of every count | rasterization rate maps |
 /// | `maximumConcurrentCompilationTaskCount` | the device's compile threads, which run its pipeline compiles | nothing: the device's own answer |
-/// | `hasUnifiedMemory` | yes, an interim answer | Managed resources' two copies (docs/graphics-kext/design.md, Decided 4). The platform's answer is the host GPU's (no on a discrete one); the bundle keeps a Managed buffer's bytes in guest memory alone, so an app told no, which picks Managed storage, would draw what the GPU never saw. Yes also matches the Apple family the device claims |
+///
+/// `hasUnifiedMemory` is the platform's: the decoder keeps `Managed` resources in one copy or two
+/// by the same answer (docs/graphics-kext/design.md, Decided 4).
 fn lane(mut identity: IdentityCaps, compile_threads: u64) -> IdentityCaps {
     let metal4 = SDK_FAMILIES
         .iter()
@@ -112,7 +114,6 @@ fn lane(mut identity: IdentityCaps, compile_threads: u64) -> IdentityCaps {
     ] {
         *no = Some(false);
     }
-    f.has_unified_memory = Some(true);
     identity.counter_sampling = [Some(false); 5];
     identity.sizes.largest_rasterization_rate_map_layer_count = Some(0);
     identity.sizes.maximum_concurrent_compilation_task_count = Some(compile_threads);
@@ -387,9 +388,9 @@ mod tests {
         }
     }
 
-    /// The identity is the platform's, a name longer than v1's 32 bytes whole, but where the
-    /// lane's table says otherwise: what the wire does not carry answers no, and the memory is
-    /// unified for now whatever the platform answers
+    /// The identity is the platform's, a name longer than v1's 32 bytes whole and the memory as
+    /// the platform shares it, but where the lane's table says otherwise: what the wire does
+    /// not carry answers no
     #[test]
     fn the_identity_is_the_platforms_but_the_lanes_table() {
         let p = Arc::new(FakePlatform::new());
@@ -408,7 +409,7 @@ mod tests {
             b"fake_gpu"
         );
         // is_low_power, then is_headless, is_removable, has_unified_memory.
-        assert_eq!(info.identity_flags[..4], [1, 0, 0, 1]);
+        assert_eq!(info.identity_flags[..4], [1, 0, 0, 0]);
         // supports_bc_texture_compression is the platform's yes; raytracing (13) the lane's no.
         assert_eq!(info.identity_flags[7], 1);
         assert_eq!(info.identity_flags[13], 0);

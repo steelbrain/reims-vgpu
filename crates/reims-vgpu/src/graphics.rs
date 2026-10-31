@@ -149,16 +149,15 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             // before it makes any queue. A host with no GPU device cannot run the lane.
             let gpu_device = platform.metal_device(None).ok_or(Error::HostResources)?;
             let pool = CompilePool::new();
-            let info = device_info(
-                &gpu_device.caps(),
-                gpu_device.identity_caps(),
-                pool.threads().to_u64(),
-            );
+            let identity = gpu_device.identity_caps();
+            // `Managed` resources are one copy where the platform answers that the GPU shares the
+            // CPU's memory, else two, which hold Metal's contract on any GPU: the guest's device
+            // answers `hasUnifiedMemory` alike, from the blob.
+            let unified_memory = identity.flags.has_unified_memory.unwrap_or(false);
+            let info = device_info(&gpu_device.caps(), identity, pool.threads().to_u64());
             region.write(RGFX_DEVICE_INFO_OFFSET, info.as_bytes());
             let mut decoder = GraphicsDecoder::new(Arc::clone(&platform), Arc::clone(&region));
-            // `Managed` resources are two copies, which hold Metal's contract on any GPU, until
-            // the device's identity answers carry the platform's `hasUnifiedMemory`.
-            decoder.set_unified_memory(false);
+            decoder.set_unified_memory(unified_memory);
             let control = Arc::new(GraphicsControl {
                 decoder: Mutex::new(decoder),
                 device: gpu_device,
