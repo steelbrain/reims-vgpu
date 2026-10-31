@@ -814,7 +814,7 @@ fn linked_functions(
     }
     let array = |fs: &[MetalFunction]| {
         let fs: Vec<&ProtocolObject<dyn MTLFunction>> = fs.iter().map(|f| f.get()).collect();
-        NSArray::from_slice(&fs)
+        msg::value("arrayWithObjects:count:", || NSArray::from_slice(&fs))
     };
     let o = msg::get("linkedFunctions", MTLLinkedFunctions::linkedFunctions);
     if !l.functions.is_empty() {
@@ -837,7 +837,9 @@ fn linked_functions(
         let keys: Vec<&NSString> = names.iter().map(|n| &**n).collect();
         let values: Vec<&NSArray<ProtocolObject<dyn MTLFunction>>> =
             lists.iter().map(|a| &**a).collect();
-        let groups = NSDictionary::from_slices(&keys, &values);
+        let groups = msg::value("dictionaryWithObjects:forKeys:count:", || {
+            NSDictionary::from_slices(&keys, &values)
+        });
         msg::get("setGroups:", || o.setGroups(Some(&groups)));
     }
     if !l.private_functions.is_empty() {

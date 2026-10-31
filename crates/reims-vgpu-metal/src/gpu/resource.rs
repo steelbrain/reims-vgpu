@@ -655,17 +655,17 @@ impl reims_vgpu_core::platform::resource::Library<MetalPlatform> for MetalLibrar
 fn constant_values(
     constants: &[reims_vgpu_core::platform::resource::FunctionConstant],
 ) -> Option<objc2::rc::Retained<MTLFunctionConstantValues>> {
-    let values = MTLFunctionConstantValues::new();
+    let values = msg::get("new", MTLFunctionConstantValues::new);
     for c in constants {
         let bytes = c.bytes()?;
         // SAFETY: `bytes` holds as many bytes as `data_type` names; Metal copies them.
-        unsafe {
+        msg::get("setConstantValue:type:atIndex:", || unsafe {
             values.setConstantValue_type_atIndex(
                 NonNull::new(bytes.as_ptr().cast_mut().cast()).unwrap_or(NonNull::dangling()),
                 MTLDataType(c.data_type.to_usize()),
                 c.index.to_usize(),
             );
-        }
+        });
     }
     Some(values)
 }
