@@ -3,6 +3,7 @@
  */
 
 #import "RgfxBuffer.h"
+#import "RgfxUnsupported.h"
 
 #include <cstdlib>
 
@@ -205,6 +206,45 @@
 		return;
 	}
 	_serializer->bufferDidModifyRange([self rgfxObjId], range.location, range.length);
+}
+
+// --- what a buffer that is not sparse or remote answers ------------------------------
+
+- (MTLBufferSparseTier)sparseBufferTier
+{
+	return MTLBufferSparseTierNone; // the device makes no placement-sparse buffer
+}
+
+- (id<MTLBuffer>)remoteStorageBuffer
+{
+	return nil; // not a remote view (the device makes none)
+}
+
+// Debug markers name ranges for capture tools only: no capture tool sees this device's work,
+// so they change nothing, as Metal's do with no capture under way.
+- (void)addDebugMarker:(NSString *)marker range:(NSRange)range
+{
+}
+
+- (void)removeAllDebugMarkers
+{
+}
+
+// --- unsupported --------------------------------------------------------------------
+
+// One device: no other device to view the buffer from.
+- (id<MTLBuffer>)newRemoteBufferViewForDevice:(id<MTLDevice>)device
+{
+	RGFX_UNSUPPORTED("remote buffer views");
+	return nil;
+}
+
+- (id<MTLTensor>)newTensorWithDescriptor:(MTLTensorDescriptor *)descriptor
+                                  offset:(NSUInteger)offset
+                                   error:(__autoreleasing NSError **)error
+{
+	RGFX_UNSUPPORTED_ERROR(error, "tensors");
+	return nil;
 }
 
 @end

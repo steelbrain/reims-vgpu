@@ -6,6 +6,7 @@
 
 #import "RgfxBuffer.h"
 #import "RgfxTexture.h"
+#import "RgfxUnsupported.h"
 
 #include "RgfxSerializer.hpp" // RgfxSerializer
 
@@ -204,14 +205,51 @@
 
 - (id<MTLBuffer>)newBufferWithLength:(NSUInteger)length options:(MTLResourceOptions)options
 {
-	(void)length;
-	(void)options;
+	RGFX_UNSUPPORTED("automatic heap placement (no host size and alignment on the wire)");
 	return nil;
 }
 
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)descriptor
 {
-	(void)descriptor;
+	RGFX_UNSUPPORTED("automatic heap placement (no host size and alignment on the wire)");
+	return nil;
+}
+
+// --- MTLAllocation -------------------------------------------------------------------
+
+// The bytes the heap takes: its size, all of it reserved at its create.
+- (NSUInteger)allocatedSize
+{
+	return static_cast<NSUInteger>(_size);
+}
+
+// --- unsupported: the device makes no acceleration structure ------------------------
+
+- (id<MTLAccelerationStructure>)newAccelerationStructureWithSize:(NSUInteger)size
+{
+	RGFX_UNSUPPORTED("ray tracing");
+	return nil;
+}
+
+- (id<MTLAccelerationStructure>)newAccelerationStructureWithDescriptor:
+    (MTLAccelerationStructureDescriptor *)descriptor
+{
+	RGFX_UNSUPPORTED("ray tracing");
+	return nil;
+}
+
+- (id<MTLAccelerationStructure>)newAccelerationStructureWithSize:(NSUInteger)size
+                                                          offset:(NSUInteger)offset
+{
+	RGFX_UNSUPPORTED("ray tracing");
+	return nil;
+}
+
+- (id<MTLAccelerationStructure>)newAccelerationStructureWithDescriptor:
+                                    (MTLAccelerationStructureDescriptor *)descriptor
+                                                                offset:(NSUInteger)offset
+{
+	RGFX_UNSUPPORTED("ray tracing");
 	return nil;
 }
 

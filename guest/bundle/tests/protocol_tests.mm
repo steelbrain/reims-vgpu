@@ -19,6 +19,7 @@
 
 #import "RgfxBuffer.h"
 #import "RgfxCommandObjects.h"
+#import "RgfxHeap.h"
 #import "RgfxResource.h"
 #import "RgfxTexture.h"
 #import "RgfxUnsupported.h"
@@ -663,6 +664,71 @@ void test_texture_members()
 	CHECK(RgfxUnsupportedWasLogged(c, @selector(newSharedTextureHandle)));
 }
 
+
+// --- buffers and heaps ------------------------------------------------------------
+
+// A buffer that is not sparse or remote answers as Metal's; debug markers change nothing on
+// the wire; a remote view or a tensor over it is nil (with an NSError where the member has an
+// error out), logged.
+void test_buffer_members()
+{
+	TestRing control(0x8000);
+	control.setConsumerIdle(1);
+	RgfxRingWriter writer(control.base(), control.dataSize, RGFX_CONTROL_RING_ID,
+	                      TestRing::doorbell, nullptr);
+	RgfxIdSpace ids;
+	RgfxSerializer ser(writer, ids);
+	RgfxBuffer *b = [RgfxBuffer bufferWithLength:256
+	                                     options:MTLResourceStorageModeShared
+	                                      device:nil
+	                                  serializer:&ser];
+	(void)expectMessage<RgfxBufferCreate>(control, RGFX_CMD_BUFFER_CREATE);
+	CHECK(b.sparseBufferTier == MTLBufferSparseTierNone);
+	[b addDebugMarker:@"marker" range:NSMakeRange(0, 16)];
+	[b removeAllDebugMarkers];
+	RgfxMsgHeader h = {};
+	std::vector<uint8_t> bytes;
+	CHECK(!control.next(&h, &bytes));
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+	CHECK(b.remoteStorageBuffer == nil);
+	CHECK([b newRemoteBufferViewForDevice:(id<MTLDevice>)b] == nil);
+#pragma clang diagnostic pop
+	NSError *error = nil;
+	MTLTensorDescriptor *td = [[MTLTensorDescriptor alloc] init];
+	CHECK([b newTensorWithDescriptor:td offset:0 error:&error] == nil);
+	CHECK(error != nil && [error.domain isEqualToString:RgfxMetalErrorDomain] &&
+	      error.code == RgfxMetalErrorUnsupported);
+	CHECK([b newTensorWithDescriptor:td offset:0 error:nullptr] == nil); // no error out: fine
+	CHECK(RgfxUnsupportedWasLogged([RgfxBuffer class], @selector(newTensorWithDescriptor:offset:error:)));
+}
+
+// A heap's allocated size is its size; acceleration structures and the automatic placements
+// (no host size and alignment on the wire) are nil, logged.
+void test_heap_members()
+{
+	TestRing control(0x8000);
+	control.setConsumerIdle(1);
+	RgfxRingWriter writer(control.base(), control.dataSize, RGFX_CONTROL_RING_ID,
+	                      TestRing::doorbell, nullptr);
+	RgfxIdSpace ids;
+	RgfxSerializer ser(writer, ids);
+	MTLHeapDescriptor *hd = [[MTLHeapDescriptor alloc] init];
+	hd.size = 0x100000;
+	hd.type = MTLHeapTypePlacement;
+	RgfxHeap *heap = [RgfxHeap heapWithDescriptor:hd device:nil serializer:&ser];
+	CHECK(heap != nil);
+	CHECK(heap.allocatedSize == 0x100000);
+	CHECK([heap newAccelerationStructureWithSize:4096] == nil);
+	CHECK([heap newAccelerationStructureWithSize:4096 offset:0] == nil);
+	MTLAccelerationStructureDescriptor *ad = [[MTLAccelerationStructureDescriptor alloc] init];
+	CHECK([heap newAccelerationStructureWithDescriptor:ad] == nil);
+	CHECK([heap newAccelerationStructureWithDescriptor:ad offset:0] == nil);
+	CHECK([heap newBufferWithLength:64 options:0] == nil);
+	CHECK(RgfxUnsupportedWasLogged([RgfxHeap class], @selector(newAccelerationStructureWithSize:)));
+	CHECK(RgfxUnsupportedWasLogged([RgfxHeap class], @selector(newBufferWithLength:options:)));
+}
+
 } // namespace
 
 void rgfxProtocolTests()
@@ -676,4 +742,6 @@ void rgfxProtocolTests()
 	test_encoders_unsupported();
 	test_command_buffer_and_queue_members();
 	test_texture_members();
+	test_buffer_members();
+	test_heap_members();
 }
