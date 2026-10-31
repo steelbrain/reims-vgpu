@@ -21,7 +21,7 @@ use reims_graphics::wire::{
 };
 use reims_vgpu_core::platform::caps::{
     COUNTER_SAMPLING_POINTS, DeviceCaps, FAMILIES, FEATURE_SETS, FormatAnswers, IdentityCaps,
-    SDK_FAMILIES, SDK_PIXEL_FORMATS, SPARSE_PAGE_SIZES, SPARSE_SAMPLE_COUNTS,
+    SDK_FAMILIES, SDK_PIXEL_FORMATS, SPARSE_PAGE_SIZES, SPARSE_SAMPLE_COUNTS, feature_set_family,
 };
 use reims_vgpu_core::raise::RaiseResult;
 
@@ -75,6 +75,159 @@ fn format_answers(answers: &FormatAnswers) -> RgfxFormatAnswers {
     out
 }
 
+/// The index of `family` in [`SDK_FAMILIES`].
+fn at(family: i64) -> usize {
+    SDK_FAMILIES
+        .iter()
+        .position(|&f| f == family)
+        .unwrap_or_else(|| unreachable!("{family} is an SDK family"))
+}
+
+/// A feature that the rows of Apple's Metal Feature Set Tables require of an Apple GPU family,
+/// which the lane's wire, decoder and bundle do not carry yet. The bundle answers each one's
+/// members as Metal answers a device without the feature, and marks them `RGFX_UNSUPPORTED`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Piece {
+    /// `MTLArgumentEncoder`, from the device, a function and an encoder (argument buffers tier 1).
+    ArgumentEncoders,
+    /// Placement in an `Automatic` heap, and `heapTextureSizeAndAlignWithDescriptor:` (resource
+    /// heaps).
+    AutomaticHeaps,
+    /// A pass's sample positions and `setDepthStoreActionOptions:` (programmable sample
+    /// positions).
+    SamplePositions,
+    /// `MTLIOCommandQueue` and its file handles (fast resource loading).
+    IoCommandQueues,
+    /// Texture views, the stencil texture views among them.
+    TextureViews,
+    /// Indirect command buffers, render and compute, and their executions.
+    IndirectCommandBuffers,
+    /// Memory barriers in a compute indirect command buffer.
+    ComputeIndirectBarriers,
+    /// `MTLBinaryArchive`.
+    BinaryArchives,
+    /// Tile pipelines and a pass's tile size (tile shaders).
+    TilePipelines,
+    /// `imageblockMemoryLengthForDimensions:` (imageblocks).
+    Imageblocks,
+    /// A tile dispatch of a nonsquare tile.
+    NonsquareTileDispatch,
+    /// Sparse textures, and the resource state encoder that maps them.
+    SparseTextures,
+    /// `MTLResidencySet`.
+    ResidencySets,
+    /// `MTLLogState` (shader logging).
+    ShaderLogging,
+    /// Shader validation chosen per pipeline.
+    ShaderValidation,
+    /// Acceleration structures and intersection functions (ray tracing).
+    RayTracing,
+    /// Visible function tables and function handles (function pointers).
+    FunctionPointers,
+    /// `MTLDynamicLibrary`.
+    DynamicLibraries,
+    /// Rasterization rate maps (variable rasterization rate).
+    RasterizationRateMaps,
+    /// Mesh pipelines and their draws (mesh shading).
+    MeshShading,
+    /// `setColorAttachmentMap:`.
+    ColorAttachmentMapping,
+    /// `MTLTextureViewPool`.
+    TextureViewPools,
+    /// The Metal 4 programming model.
+    Metal4,
+    /// Placement sparse buffers and textures.
+    PlacementSparse,
+    /// Mesh draws in an indirect command buffer.
+    IndirectMeshDraws,
+    /// Memory barriers in a render indirect command buffer.
+    RenderIndirectBarriers,
+    /// `setDepthTestMinBound:maxBound:` (depth bounds testing).
+    DepthBounds,
+}
+
+/// The pieces each Apple family's rows add to the family before it, Apple1 to Apple11, read from
+/// the 2026-10-23 edition of Apple's Metal Feature Set Tables. Its first Apple column is Apple2:
+/// Apple1, which left the tables with the A7, answers as Apple2, as Metal answers on an M3 Max and
+/// as metal2vulkan's family audit reads it, so Apple1 takes Apple2's pieces. Apple11 has no column
+/// in any edition, and adds none.
+const APPLE_PIECES: [(i64, &[Piece]); 11] = {
+    use Piece as P;
+    [
+        (
+            1001,
+            &[
+                P::ArgumentEncoders,
+                P::AutomaticHeaps,
+                P::SamplePositions,
+                P::IoCommandQueues,
+                P::TextureViews,
+            ],
+        ),
+        (1002, &[]),
+        (
+            1003,
+            &[
+                P::IndirectCommandBuffers,
+                P::ComputeIndirectBarriers,
+                P::BinaryArchives,
+            ],
+        ),
+        (1004, &[P::TilePipelines, P::Imageblocks]),
+        (1005, &[P::NonsquareTileDispatch]),
+        (
+            1006,
+            &[
+                P::SparseTextures,
+                P::ResidencySets,
+                P::ShaderLogging,
+                P::ShaderValidation,
+                P::RayTracing,
+                P::FunctionPointers,
+                P::DynamicLibraries,
+                P::RasterizationRateMaps,
+            ],
+        ),
+        (
+            1007,
+            &[
+                P::MeshShading,
+                P::ColorAttachmentMapping,
+                P::TextureViewPools,
+                P::Metal4,
+            ],
+        ),
+        (1008, &[P::PlacementSparse]),
+        (1009, &[P::IndirectMeshDraws, P::RenderIndirectBarriers]),
+        (1010, &[P::DepthBounds]),
+        (1011, &[]),
+    ]
+};
+
+/// The pieces the lane carries: none yet. A piece joins this list when its wire messages, its
+/// decoding and its bundle members land, and the Apple families it holds back rise with it.
+const WIRED: &[Piece] = &[];
+
+/// `identity` with each Apple family answered yes only where the platform answers yes and `wired`
+/// holds every piece of its rows and of each Apple family's before it ([`APPLE_PIECES`]), and each
+/// iOS feature set of a family so lowered answered no with it.
+fn cap_apple_families(identity: &mut IdentityCaps, wired: &[Piece]) {
+    let mut carried = true;
+    let mut lowered = [false; SDK_FAMILIES.len()];
+    for (family, pieces) in APPLE_PIECES {
+        carried &= pieces.iter().all(|piece| wired.contains(piece));
+        if !carried {
+            identity.families[at(family)] = Some(false);
+            lowered[at(family)] = true;
+        }
+    }
+    for (answer, &set) in identity.feature_sets.iter_mut().zip(&FEATURE_SETS) {
+        if feature_set_family(set).is_some_and(|family| lowered[at(family)]) {
+            *answer = Some(false);
+        }
+    }
+}
+
 /// The guest's device's answers where they are not the platform's: what the lane does not
 /// carry yet. The guest's `MTLDevice` is the lane's own, which can do only what the wire, the
 /// bundle and the decoder carry, so it answers no to a feature they lack whatever the host GPU
@@ -83,6 +236,8 @@ fn format_answers(answers: &FormatAnswers) -> RgfxFormatAnswers {
 ///
 /// | answer | the lane's | waits on |
 /// |---|---|---|
+/// | `supportsFamily:` of Apple1 to Apple11, and `supportsFeatureSet:` of the iOS sets that go with them | the platform's, but no from the first Apple family whose rows need a piece the lane lacks; it carries none yet, so no Apple family | each family's pieces in [`APPLE_PIECES`], from argument encoders, automatic heaps, sample positions, IO command queues and texture views (Apple1 and Apple2) on |
+/// | `supportsFamily:` of Mac1, Mac2, Common1 to Common3 and Metal3 | the platform's, for now | their rows need some of the same pieces: argument encoders (Mac1, Mac2 and Metal3), and automatic heaps, texture views, sample positions and IO command queues (every one of them) |
 /// | `supportsFamily:` of Metal4 | no | the `MTL4` API: its command queues and buffers, argument tables, compiler and allocators |
 /// | `supportsRaytracing`, `supportsRaytracingFromRender`, `supportsPrimitiveMotionBlur` | no | acceleration structures, their builds, and intersection function tables |
 /// | `supportsFunctionPointers`, `supportsFunctionPointersFromRender` | no | visible function tables and function handles |
@@ -95,12 +250,8 @@ fn format_answers(answers: &FormatAnswers) -> RgfxFormatAnswers {
 /// `hasUnifiedMemory` is the platform's: the decoder keeps `Managed` resources in one copy or two
 /// by the same answer (docs/graphics-kext/design.md, Decided 4).
 fn lane(mut identity: IdentityCaps, compile_threads: u64) -> IdentityCaps {
-    let metal4 = SDK_FAMILIES
-        .iter()
-        .position(|&f| f == MTL_GPU_FAMILY_METAL4);
-    if let Some(i) = metal4 {
-        identity.families[i] = Some(false);
-    }
+    cap_apple_families(&mut identity, WIRED);
+    identity.families[at(MTL_GPU_FAMILY_METAL4)] = Some(false);
     let f = &mut identity.flags;
     for no in [
         &mut f.supports_raytracing,
@@ -352,8 +503,9 @@ mod tests {
     }
 
     /// Every family of the SDK and -1009 is answered, each the platform's (the fake answers as
-    /// an M3 Max: Apple1 to Apple9, Mac1 and Mac2, the Common families and Metal3), but Metal4,
-    /// which the lane cannot carry; a value that names no family is listed nowhere
+    /// an M3 Max: Apple1 to Apple9, Mac1 and Mac2, the Common families and Metal3), but the
+    /// Apple families, which need pieces the lane lacks, and Metal4; a value that names no family
+    /// is listed nowhere
     #[test]
     fn every_family_is_the_platforms_or_the_lanes() {
         let p = Arc::new(FakePlatform::new());
@@ -361,31 +513,90 @@ mod tests {
         caps.families[6] = Ok(false);
         let info = device_info(&caps, p.device().identity_caps(), 4);
         assert_eq!(info.family_count, 21);
-        for yes in [
-            1001, 1002, 1003, 1004, 1005, 1006, 1007, 1008, 1009, 2001, 2002, 3001, 3002, 3003,
-            5001,
-        ] {
+        for yes in [2001, 2002, 3001, 3002, 3003, 5001] {
             assert_eq!(family(&info, yes), Some(1), "family {yes}");
         }
-        for no in [1010, 1011, 4001, 4002, 5002, -1009] {
+        for no in [
+            1001, 1002, 1003, 1004, 1005, 1006, 1007, 1008, 1009, 1010, 1011, 4001, 4002, 5002,
+            -1009,
+        ] {
             assert_eq!(family(&info, no), Some(0), "family {no}");
         }
         assert_eq!(family(&info, 7), None);
     }
 
-    /// Every feature set is answered as the platform answers it: the fake's (an M3 Max's) every
-    /// iOS one and macOS' but 10002, no tvOS one
+    /// Every feature set is answered as the platform answers it, the fake's (an M3 Max's) every
+    /// iOS one and macOS' but 10002 and no tvOS one, but the iOS sets, whose Apple families the
+    /// lane answers no
     #[test]
-    fn every_feature_set_is_the_platforms() {
+    fn every_feature_set_is_the_platforms_or_its_familys() {
         let p = Arc::new(FakePlatform::new());
         let info = device_info(&p.device().caps(), p.device().identity_caps(), 4);
         assert_eq!(info.feature_set_count as usize, FEATURE_SETS.len());
-        for set in (0..=16).chain([10000, 10001, 10003, 10004, 10005]) {
+        for set in [10000, 10001, 10003, 10004, 10005] {
             assert_eq!(feature_set(&info, set), Some(1), "feature set {set}");
         }
-        for set in [10002, 30000, 30005] {
+        for set in (0..=16).chain([10002, 30000, 30005]) {
             assert_eq!(feature_set(&info, set), Some(0), "feature set {set}");
         }
+    }
+
+    /// An Apple family keeps the platform's yes only while the lane carries every piece of its
+    /// rows and the rows before it: with every piece the fake's Apple1 to Apple9 and their iOS
+    /// sets stand; without imageblocks, an Apple4 piece, Apple4 and later answer no and so do
+    /// iOS_GPUFamily4 and 5, while Apple1 to Apple3, their sets and Mac1 stand; without argument
+    /// encoders no Apple family does
+    #[test]
+    fn an_apple_family_drops_where_the_lane_lacks_a_piece() {
+        let p = Arc::new(FakePlatform::new());
+        let platform = p.device().identity_caps();
+        let every: Vec<Piece> = APPLE_PIECES
+            .iter()
+            .flat_map(|(_, pieces)| pieces.iter().copied())
+            .collect();
+        let without = |missing: Piece| -> IdentityCaps {
+            let wired: Vec<Piece> = every.iter().copied().filter(|&p| p != missing).collect();
+            let mut identity = platform.clone();
+            cap_apple_families(&mut identity, &wired);
+            identity
+        };
+        let answer = |identity: &IdentityCaps, family: i64| identity.families[at(family)];
+        let set = |identity: &IdentityCaps, set: u64| {
+            identity.feature_sets[FEATURE_SETS.iter().position(|&s| s == set).unwrap()]
+        };
+
+        let mut whole = platform.clone();
+        cap_apple_families(&mut whole, &every);
+        assert_eq!(whole.families, platform.families);
+        assert_eq!(whole.feature_sets, platform.feature_sets);
+
+        let no_imageblocks = without(Piece::Imageblocks);
+        for family in [1001, 1002, 1003, 2001, 2002, 5001] {
+            assert_eq!(
+                answer(&no_imageblocks, family),
+                Some(true),
+                "family {family}"
+            );
+        }
+        for family in [1004, 1005, 1006, 1007, 1008, 1009] {
+            assert_eq!(
+                answer(&no_imageblocks, family),
+                Some(false),
+                "family {family}"
+            );
+        }
+        // iOS_GPUFamily3_v4 (14) stands; iOS_GPUFamily4_v1 (11) and 5_v1 (16) fall.
+        assert_eq!(set(&no_imageblocks, 14), Some(true));
+        assert_eq!(set(&no_imageblocks, 11), Some(false));
+        assert_eq!(set(&no_imageblocks, 16), Some(false));
+        assert_eq!(set(&no_imageblocks, 10000), Some(true));
+
+        let no_encoders = without(Piece::ArgumentEncoders);
+        for family in 1001..=1011 {
+            assert_eq!(answer(&no_encoders, family), Some(false), "family {family}");
+        }
+        assert_eq!(answer(&no_encoders, 2002), Some(true));
+        assert_eq!(set(&no_encoders, 0), Some(false));
     }
 
     /// The identity is the platform's, a name longer than v1's 32 bytes whole and the memory as
