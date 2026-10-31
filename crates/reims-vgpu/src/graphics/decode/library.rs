@@ -445,6 +445,10 @@ impl<P: Platform> GraphicsDecoder<P> {
             let seqno = read::<RgfxMsgHeader>(message).map(|h| h.seqno);
             return (seqno, RGFX_STATUS_INVALID_ARGUMENT);
         };
+        // A failed context's later work is refused ([`super::FailedContexts`]).
+        if self.context_failed() {
+            return (Some(m.header.seqno), RGFX_STATUS_REFUSED);
+        }
         let Some(library) = self.library_cache.take(&m.key, m.slice_size) else {
             return (Some(m.header.seqno), RGFX_STATUS_NOT_FOUND);
         };
@@ -495,6 +499,11 @@ impl<P: Platform> GraphicsDecoder<P> {
             }
             _ => return refused(DecodeError::Malformed, None),
         };
+        // A failed context's later work is refused ([`super::FailedContexts`]): its chunks are
+        // taken and acked as any, so its process goes on, and the library they make is refused.
+        if self.context_failed() {
+            return refused(DecodeError::ContextFailed, Some(seqno));
+        }
         let slot = LibrarySlot::new();
         self.making_libraries.insert(obj_id, Arc::clone(&slot));
         LibraryStart::Make(LibraryJob {

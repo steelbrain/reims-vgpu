@@ -56,8 +56,12 @@ pub type MetalCommandBuffer = Obj<ProtocolObject<dyn MTLCommandBuffer>>;
 
 impl reims_vgpu_core::platform::command::CommandBuffer<MetalPlatform> for MetalCommandBuffer {
     /// The block reads the buffer's `status` and `error` when Metal calls it, on Metal's completion
-    /// thread, and runs `block` once with them; `block` is dropped there, when it returns.
+    /// thread, and runs `block` once with them; `block` is dropped there, when it returns. Added
+    /// inside a refusal scope (the graphics lane's), the read and `block` run in one there too
+    /// (`run_completed`): a death in the read fails the command buffer to `block`, and the process
+    /// goes on.
     fn add_completed_handler(&self, on: OnFault, block: CompletedHandler) -> RaiseResult<()> {
+        let carried = reims_vgpu_core::raise::refusals::carry();
         let once = Mutex::new(Some(block));
         let handler = RcBlock::new(move |cb: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
             // A foreign callout: marked ours, so a panic here aborts before it unwinds into Metal.
@@ -67,7 +71,12 @@ impl reims_vgpu_core::platform::command::CommandBuffer<MetalPlatform> for MetalC
                 return;
             };
             // SAFETY: Metal passes the live command buffer the handler was added to.
-            block(completed_info(unsafe { cb.as_ref() }));
+            let cb = unsafe { cb.as_ref() };
+            reims_vgpu_core::platform::command::run_completed(
+                carried,
+                || completed_info(cb),
+                block,
+            );
         });
         let handler = RcBlock::as_ptr(&handler);
         // SAFETY: a live block; Metal copies it.

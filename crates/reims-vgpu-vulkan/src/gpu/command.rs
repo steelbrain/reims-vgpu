@@ -197,12 +197,13 @@ use metal2vulkan::metal::DispatchType;
 use metal2vulkan_runtime as rt;
 use reims_vgpu_core::platform::Handle;
 use reims_vgpu_core::platform::command::{
-    CommandBuffer, CommandQueue, CompletedHandler, CompletedInfo,
+    CommandBuffer, CommandQueue, CompletedHandler, CompletedInfo, run_completed,
 };
 use reims_vgpu_core::platform::event::EventRef;
 use reims_vgpu_core::platform::types::{CommandBufferStatus, NsErrorText};
 use reims_vgpu_core::platform::values::ComputePassDesc;
 use reims_vgpu_core::raise::death::{DeathId, DeathKind, fatal_with_detail};
+use reims_vgpu_core::raise::refusals::{self, Carried};
 use reims_vgpu_core::raise::{OnFault, RaiseResult};
 use reims_vgpu_core::rt::BlockEnv;
 use reims_vgpu_core::sync::Mutex;
@@ -515,6 +516,7 @@ impl CommandBufferObject {
         let ending = Ending {
             progress: Some(Arc::clone(&progress)),
             task: TaskLife::current(),
+            carried: refusals::carry(),
             #[cfg(test)]
             slot: reims_vgpu_core::testkit::capture::current_slot(),
         };
@@ -663,6 +665,10 @@ struct Ending {
     /// The isolated task whose code made the progress, if one's did: the command buffer is the
     /// task's, and its death in the handler is the task's code ([`as_task`]).
     task: Option<Arc<TaskLife>>,
+    /// The refusal scope of the op whose command made the progress (the graphics lane's), which
+    /// the death in the handler refuses instead of ending the process; none outside every scope.
+    /// The command buffer's own completed handlers then see its refused step as their failure.
+    carried: Carried,
     /// The test's death slot, which a death in the handler lands in.
     #[cfg(test)]
     slot: Option<Arc<reims_vgpu_core::testkit::capture::DeathSlot>>,
@@ -687,17 +693,23 @@ impl Ending {
 
     /// Ends the progress at `stage`, after `refused`'s death at the selector of its first
     /// execution of an indirect command buffer where a host step refused the command buffer and
-    /// its commands execute one. The death is the task's code, so none comes once the task ended.
+    /// its commands execute one. The death is the task's code, so none comes once the task ended;
+    /// in the scope the progress carried, it is refused there, logged, and the progress ends.
     fn end(&mut self, stage: Stage, refused: Option<impl Fn(&'static str)>) {
         let Some(progress) = self.progress.take() else {
             return;
         };
         let task = self.task.take();
+        let carried = self.carried;
         let end = || {
             if let Some(refused) = refused
                 && let Some(sel) = progress.first_execution()
+                && let Err(refusal) = carried.run(|| as_task(task.as_ref(), || refused(sel)))
             {
-                as_task(task.as_ref(), || refused(sel));
+                log::warn!(
+                    target: "reims_vgpu::refused",
+                    "a refused command buffer's execution of an indirect command buffer: {refusal}"
+                );
             }
             progress.end(stage);
         };
@@ -1182,7 +1194,9 @@ fn failure_error(cb: &rt::CommandBuffer) -> Option<NsErrorText> {
 /// death in [`Ending`] is: once the task ended, core's handlers of it run none
 /// (`TaskLife::carry`), so none reads the failure, and nothing dies; `block` is called all the
 /// same, with the failure as its code says ([`command_buffer_error`]), and decides itself
-/// whether it runs.
+/// whether it runs. Added inside a refusal scope (the graphics lane's), the read and `block` run
+/// in one on the runtime's thread too ([`run_completed`]): the read's death fails the command
+/// buffer to `block` ([`CompletedInfo::refused`]) and the process goes on.
 fn completed_handler(
     block: CompletedHandler,
     task: Option<Arc<TaskLife>>,
@@ -1190,18 +1204,25 @@ fn completed_handler(
 ) -> rt::Handler {
     #[cfg(test)]
     let slot = reims_vgpu_core::testkit::capture::current_slot();
+    let carried = refusals::carry();
     Box::new(move |cb: &rt::CommandBuffer| {
         // A callout on the runtime's thread: marked ours, so a panic here aborts.
         let _env = BlockEnv::foreign();
         let run = || {
-            as_task(task.as_ref(), || read(cb));
-            let error = cb
-                .error()
-                .map(|e| command_buffer_error(e, cb.error_description()));
-            block(CompletedInfo {
-                status: CommandBufferStatus(cb.status().raw()),
-                error,
-            });
+            run_completed(
+                carried,
+                || {
+                    as_task(task.as_ref(), || read(cb));
+                    let error = cb
+                        .error()
+                        .map(|e| command_buffer_error(e, cb.error_description()));
+                    CompletedInfo {
+                        status: CommandBufferStatus(cb.status().raw()),
+                        error,
+                    }
+                },
+                block,
+            );
         };
         #[cfg(test)]
         reims_vgpu_core::testkit::capture::with_slot(slot, run);
@@ -2053,6 +2074,7 @@ mod tests {
             let ending = Ending {
                 progress: Some(Arc::clone(&progress)),
                 task,
+                carried: refusals::carry(),
                 slot: None,
             };
             (progress, ending)
@@ -2070,6 +2092,54 @@ mod tests {
         assert!(life.exit());
         e.end(Stage::Failed, Some(refused));
         assert_eq!(progress.stage(), Stage::Failed);
+        // Made by an op of the graphics lane's, in its refusal scope: the death is refused on the
+        // handler's thread, and the progress ends all the same.
+        let (progress, mut e) = refusals::refusing(|| ending(None)).unwrap();
+        std::thread::Builder::new()
+            .name("the runtime's progress".into())
+            .spawn(move || e.end(Stage::Failed, Some(refused)))
+            .unwrap()
+            .join()
+            .unwrap();
+        assert_eq!(progress.stage(), Stage::Failed);
+    }
+
+    /// Core's completed handler added inside a refusal scope (the graphics lane's) reads a failure
+    /// that dies in that scope on the runtime's thread: the handler is handed the command buffer
+    /// failed by the refusal, and the process goes on. Added outside every scope (the paravirt
+    /// device's), the same read dies, as before
+    #[test]
+    fn a_completed_handlers_read_in_a_scope_fails_its_command_buffer() {
+        let q = dev().new_command_queue().unwrap();
+        let cb = buffer(&q);
+        cb.commit(OnFault::Return).unwrap();
+        cb.wait_until_completed(OnFault::Return).unwrap();
+        let handler = |seen: mpsc::Sender<CompletedInfo>| {
+            let block: CompletedHandler = Box::new(move |info| seen.send(info).unwrap());
+            completed_handler(block, None, |_| {
+                unrepresentable("commit", "a failure none of Metal's");
+            })
+        };
+        let (tx, rx) = mpsc::channel();
+        let h = refusals::refusing(|| handler(tx)).unwrap();
+        let raw = cb.raw.clone();
+        std::thread::Builder::new()
+            .name("the runtime's completion".into())
+            .spawn(move || h(&raw))
+            .unwrap()
+            .join()
+            .unwrap();
+        let info = rx.recv().unwrap();
+        assert!(info.is_refused(), "{info:?}");
+        assert_eq!(info.status, CommandBufferStatus::ERROR);
+        let description = info.error.unwrap().description;
+        assert!(description.contains("commit"), "{description}");
+        // Outside every scope the read dies, and the handler is not run.
+        let (tx, rx) = mpsc::channel();
+        let h = handler(tx);
+        let site = catch_death(|| h(&cb.raw)).unwrap_err();
+        assert_eq!((site.kind, site.file), (DeathKind::Abort, "commit"));
+        assert!(rx.try_recv().is_err());
     }
 
     /// Core's completed handler reads a failure that dies as the code of the isolated task that

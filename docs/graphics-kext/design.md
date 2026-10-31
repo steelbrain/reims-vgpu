@@ -492,8 +492,20 @@ death at a platform call, where the platform refuses a create or an encode and
 the paravirt device ends the process, unwinds to the op's scope instead, and the
 op is refused there, logged once at WARN with the platform's reason. A command
 buffer refused mid-stream has its open encoder ended and is never committed.
-What dies off the op's thread (the runtime's scheduler thread, a completion
-handler, the window's draw) still ends the process. This
+Work an op registers to run on another thread takes the op's scope with it
+(`refusals::carry`): a command buffer's completed handler runs the platform's
+read of the buffer, and itself, in the scope of the decode that added it. A
+death in that read (a failure no Metal answer matches, which the Vulkan
+platform reads on the runtime's thread) fails the command buffer, whose
+`CB_COMPLETE` is an internal error, and fails its context: the host refuses
+the context's later command buffers, creates and library lookups at once,
+carries out its destroys, and forgets the failure at its close. A release the
+platform dies at (at a destroy, a context's close, or the display's swap of
+the texture it shows) is refused alone, and the destroy or the close is
+carried out whole. What dies elsewhere off the op's thread still ends the
+process: a notice the runtime's scheduler thread announces at a host step,
+which names no command buffer, a release on the runtime's thread as a command
+buffer completes, and the window's draw. This
 is the lane's own rule: the paravirt device's rule of ending the process at the
 op (AGENTS.md, the contract) is Apple's framework's behaviour, which that
 device keeps.
@@ -546,6 +558,21 @@ reaches nothing of the region from then on. A placed mapping is IOKit's
 overwrite mapping, which IOKit never takes down itself (read from the public
 xnu source, `IOMemoryDescriptor::doUnmap`), so only another mapping over it
 takes a span back; vm_protect is not a KPI a third-party kext may link.
+
+**The scanout is its owner's.** The scanout holds the display's pixels, so
+only the process that drives the display reaches it: the task that holds the
+framebuffer's server connection (`kIOFBServerConnectType`), WindowServer. The
+kext grants the scanout (selector 0x108), locks an IOSurface with no backing
+of its own over it, and gives out the framebuffer's VRAM range (which
+IOFramebuffer maps on its server connection, and on its shared connection into
+any process of the console's user) to that task and the kernel alone. Any
+other process gets `kIOReturnNotPermitted`, or no memory for the VRAM range,
+and nothing is mapped. The server connection is the test because IOFramebuffer
+opens it for one task at a time, and the task that holds it maps the scanout
+through it already (the system aperture), so the rule gives no process what
+IOFramebuffer does not. An open in flight counts too, since IOFramebuffer sets
+the display up inside it. A new connection's task replaces the last one, and
+what the last one mapped stays in it until its surface goes or it locks again.
 
 Command buffers do not pass through the kext, so the host checks each
 object a message names: it must be

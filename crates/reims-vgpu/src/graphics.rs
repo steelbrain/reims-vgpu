@@ -322,7 +322,17 @@ impl<P: Platform> Presented<P> {
                 "the display shows IOSurface {id} (was {previous}; 0 is the scanout)"
             );
         }
-        *self.texture.lock() = texture;
+        // The texture shown before may be the last hold of a closed context's: let go of in a
+        // refusal scope, so a release the platform dies at is refused, logged, and the present
+        // goes on.
+        let shown = std::mem::replace(&mut *self.texture.lock(), texture);
+        if let Err(refusal) = reims_vgpu_core::raise::refusals::refusing(move || drop(shown)) {
+            log::warn!(
+                target: "reims_vgpu::graphics",
+                "the texture of IOSurface {previous} was let go of, and its release was refused: \
+                 {refusal}"
+            );
+        }
         match self.window.get() {
             Some(window) => {
                 self.answers.shown(answer);

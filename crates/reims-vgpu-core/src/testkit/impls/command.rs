@@ -5,7 +5,7 @@
 //! and `device` are free and read the model.
 
 use super::super::calllog::Arg;
-use super::super::objects::{CommandBufferModel, Fk, Model, kind};
+use super::super::objects::{CommandBufferModel, Fk, Model, completion_read, kind};
 use super::super::platform::FakePlatform;
 use super::fatal;
 use crate::platform::command::*;
@@ -32,12 +32,21 @@ impl CommandQueue<FakePlatform> for Fk<kind::CommandQueue> {
 }
 
 impl CommandBuffer<FakePlatform> for Fk<kind::CommandBuffer> {
+    /// As Metal's platforms do: the read of the buffer and `block` run in the refusal scope the
+    /// handler was added in, where it was added in one (`run_completed`), so a read that dies
+    /// ([`World::complete_dying_read`]) hands `block` the buffer refused there.
+    ///
+    /// [`World::complete_dying_read`]: super::super::objects::World::complete_dying_read
     fn add_completed_handler(&self, on: OnFault, block: CompletedHandler) -> RaiseResult<()> {
         self.act(
             Policy::On(on),
             "addCompletedHandler:",
             vec![Arg::Block(true)],
         )?;
+        let carried = crate::raise::refusals::carry();
+        let block: CompletedHandler = Box::new(move |info| {
+            run_completed(carried, || completion_read(info), block);
+        });
         if let Model::CommandBuffer(m) = &mut self.state().model {
             m.handlers.push(block);
         }

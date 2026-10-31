@@ -11,7 +11,15 @@
 //! **Unwinding.** The thread unwinds from the death to the scope, and the `Drop`s between them
 //! run: a handle dropped there is released. A death while the thread is already unwinding is not
 //! trapped and ends the process. So does a death on a thread that runs no scope (a platform's own
-//! threads, a completion handler).
+//! threads), but where the scope was carried there.
+//!
+//! **Carried scopes.** Work an op registers to run later on another thread (a command buffer's
+//! completed handler, which the platform runs on its own thread after it reads the buffer's
+//! failure) takes the scope with it: [`carry`] at the registration notes whether the op runs in a
+//! scope, and [`Carried::run`] runs the work in one there too. So a death in the work, the
+//! platform's read of a failure no Metal answer matches among them, refuses that work and the
+//! process goes on. Work registered outside every scope, all of the paravirt device's, runs as it
+//! always did.
 
 #![expect(
     clippy::disallowed_methods,
@@ -84,6 +92,31 @@ pub fn refusing<T>(f: impl FnOnce() -> T) -> Result<T, Refusal> {
 /// Whether this thread is inside a refusal scope.
 pub fn is_refusing() -> bool {
     DEPTH.with(Cell::get) > 0
+}
+
+/// Whether work registered now runs in a refusal scope where it runs later ([`carry`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub struct Carried(bool);
+
+/// The scope of the op registering work now, for the thread that runs the work later (module
+/// doc, "Carried scopes"): a scope where this thread is inside one, none otherwise.
+pub fn carry() -> Carried {
+    Carried(is_refusing())
+}
+
+impl Carried {
+    /// Whether the work runs in a scope.
+    pub fn refuses(self) -> bool {
+        self.0
+    }
+
+    /// Runs `f`: in a refusal scope where the registration was in one ([`refusing`]), so a death
+    /// in it is its `Err`; else plainly, so a death in it ends the process, as outside every
+    /// scope.
+    pub fn run<T>(self, f: impl FnOnce() -> T) -> Result<T, Refusal> {
+        if self.0 { refusing(f) } else { Ok(f()) }
+    }
 }
 
 /// `raise::death`'s hook: inside a scope, the death unwinds to it as a [`Refusal`]. Returns where
@@ -173,6 +206,34 @@ mod tests {
             5
         });
         assert_eq!(outer, Ok(5));
+    }
+
+    /// Work registered inside a scope runs in one on the thread that runs it, and its death is
+    /// its refusal there; work registered outside every scope runs plainly, and its death is a
+    /// death
+    #[test]
+    fn a_carried_scope_refuses_on_the_thread_that_runs_it() {
+        let carried = refusing(carry).unwrap();
+        assert!(carried.refuses());
+        let refused = std::thread::spawn(move || {
+            let r = carried.run(|| -> u32 { Raise::platform("addCompletedHandler:").fatal() });
+            (r, is_refusing())
+        })
+        .join()
+        .unwrap();
+        let refusal = refused.0.unwrap_err();
+        assert!(
+            refusal.to_string().contains("addCompletedHandler:"),
+            "{refusal}"
+        );
+        assert!(!refused.1);
+        assert_eq!(carried.run(|| 3), Ok(3));
+
+        let plain = carry();
+        assert!(!plain.refuses());
+        assert_eq!(plain.run(|| 4), Ok(4));
+        let d = catch_death(|| plain.run(|| crate::fatal!(SITE)));
+        assert_eq!(d.map(|_| ()), Err(SITE));
     }
 
     /// An unwind that is not a death passes the scope by

@@ -2644,3 +2644,146 @@ fn a_present_shows_the_latest_texture_over_its_surface() {
     assert_eq!(answer_of(&mut guest, seqno), RGFX_STATUS_INVALID_ARGUMENT);
     assert_eq!(shown_width(&device), Some(64));
 }
+
+/// The platform dying at its read of a finished command buffer on its own thread (a failure it has
+/// no answer of Metal's for), which ends the process on the paravirt device, fails that command
+/// buffer and its context: the buffer's completion is an internal error, the context's later
+/// command buffers and creates are refused at once, its destroys are carried out, another
+/// context's work goes on, and once the context closes its number is fresh for the next process
+#[test]
+fn a_completion_the_platform_refuses_fails_its_context() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform) = headless_on(&raised);
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    const SUBMIT_3: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET;
+    const COMPLETE_3: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x2_0000;
+    const SUBMIT_4: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x4_0000;
+    const COMPLETE_4: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x6_0000;
+    const SUBMIT_NEXT: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x8_0000;
+    const COMPLETE_NEXT: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0xa_0000;
+    const RING_DATA: u32 = 0x1_0000;
+    for (context, submit, complete) in [(3, SUBMIT_3, COMPLETE_3), (4, SUBMIT_4, COMPLETE_4)] {
+        assert_eq!(
+            answered(
+                &device,
+                &mut guest,
+                queue_create(context, 1, submit, complete, RING_DATA, 0)
+            ),
+            RGFX_STATUS_OK
+        );
+    }
+    let mut ring3 = QueueRing::new(&device, SUBMIT_3, COMPLETE_3, u64::from(RING_DATA));
+    let mut ring4 = QueueRing::new(&device, SUBMIT_4, COMPLETE_4, u64::from(RING_DATA));
+    guest.send(&device, event_create(obj(3, 5)));
+    ring3.send(&device, command_buffer(obj(3, 1), 100));
+    let cb = committed(&platform, 1)[0];
+    assert!(platform.world().complete_dying_read(
+        cb,
+        "a failure none of Metal's",
+        CompleteOn::Thread
+    ));
+    let failed = ring3.event().expect("the failed buffer's completion");
+    let failed = RgfxCbComplete::read_from_bytes(&failed).unwrap();
+    assert_eq!((failed.cb_obj_id, failed.status), (100, RGFX_CB_INTERNAL));
+
+    // The context's later command buffer is refused at once, unrun, and so is its create.
+    ring3.send(&device, command_buffer(obj(3, 1), 101));
+    let refused = ring3.event().expect("the refused buffer's completion");
+    let refused = RgfxCbComplete::read_from_bytes(&refused).unwrap();
+    assert_eq!((refused.cb_obj_id, refused.status), (101, RGFX_CB_INTERNAL));
+    assert!(platform.world().committed().is_empty(), "the buffer ran");
+    guest.send(&device, event_create(obj(3, 6)));
+    assert_eq!(
+        answered(&device, &mut guest, context_close(99)),
+        RGFX_STATUS_OK
+    );
+    assert_eq!(
+        device.decoder_object_count(),
+        3,
+        "the two queues and context 3's first event"
+    );
+
+    // Another context's work goes on.
+    ring4.send(&device, command_buffer(obj(4, 1), 200));
+    assert!(complete_until_event(&platform, &ring4), "no completion");
+    let done = RgfxCbComplete::read_from_bytes(&ring4.event().unwrap()).unwrap();
+    assert_eq!((done.cb_obj_id, done.status), (200, RGFX_CB_OK));
+
+    // The failed context's destroys are carried out.
+    guest.send(&device, object_destroy(obj(3, 5)));
+    assert_eq!(
+        answered(&device, &mut guest, context_close(99)),
+        RGFX_STATUS_OK
+    );
+    assert_eq!(device.decoder_object_count(), 2, "the event destroyed");
+
+    // Closed, the context's number is fresh: the next process given it runs its work.
+    assert_eq!(
+        answered(&device, &mut guest, context_close(3)),
+        RGFX_STATUS_OK
+    );
+    assert_eq!(
+        answered(
+            &device,
+            &mut guest,
+            queue_create(3, 2, SUBMIT_NEXT, COMPLETE_NEXT, RING_DATA, 0)
+        ),
+        RGFX_STATUS_OK
+    );
+    let mut next = QueueRing::new(&device, SUBMIT_NEXT, COMPLETE_NEXT, u64::from(RING_DATA));
+    next.send(&device, command_buffer(obj(3, 2), 300));
+    assert!(complete_until_event(&platform, &next), "no completion");
+    let done = RgfxCbComplete::read_from_bytes(&next.event().unwrap()).unwrap();
+    assert_eq!((done.cb_obj_id, done.status), (300, RGFX_CB_OK));
+}
+
+/// The platform dying as it lets go of an object, at the object's destroy or at its context's
+/// close, refuses that release alone: the destroy and the close are carried out whole, the close
+/// is answered, and the device goes on
+#[test]
+fn a_release_the_platform_dies_at_is_refused() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform) = headless_on(&raised);
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    let world = platform.world();
+    let before = world.live("MTLEvent");
+    for n in 1..=3 {
+        guest.send(&device, event_create(obj(3, n)));
+    }
+    assert_eq!(
+        answered(&device, &mut guest, context_close(99)),
+        RGFX_STATUS_OK
+    );
+    let events: Vec<ObjId> = (world.live("MTLEvent").into_iter())
+        .filter(|id| !before.contains(id))
+        .collect();
+    assert_eq!(events.len(), 3);
+    assert_eq!(device.decoder_object_count(), 3);
+
+    // At a destroy.
+    world.die_at_release(events[0]);
+    guest.send(&device, object_destroy(obj(3, 1)));
+    assert_eq!(
+        answered(&device, &mut guest, context_close(99)),
+        RGFX_STATUS_OK
+    );
+    assert_eq!(device.decoder_object_count(), 2, "the destroy carried out");
+
+    // At the close: the context's other objects go all the same.
+    world.die_at_release(events[1]);
+    assert_eq!(
+        answered(&device, &mut guest, context_close(3)),
+        RGFX_STATUS_OK
+    );
+    assert_eq!(device.decoder_object_count(), 0, "the close carried out");
+
+    // The device goes on.
+    guest.send(&device, event_create(obj(3, 4)));
+    assert_eq!(
+        answered(&device, &mut guest, context_close(99)),
+        RGFX_STATUS_OK
+    );
+    assert_eq!(device.decoder_object_count(), 1);
+}

@@ -105,9 +105,23 @@ impl<P: Platform> GraphicsDecoder<P> {
         let cb_obj_id = m.cb_obj_id;
         let seqno = m.header.seqno;
         let sink = self.completion_sink.clone();
+        let (failed, context) = (Arc::clone(&self.failed), self.context);
         cb.add_completed_handler(
             ON,
             Box::new(move |info: CompletedInfo| {
+                // The platform refused the buffer's completion on its own thread (a death in its
+                // read, in the scope this decode carried there): the buffer fails, and so does its
+                // context, whose later work is refused until its close.
+                if info.is_refused()
+                    && let Some(context) = context
+                    && failed.fail(context)
+                {
+                    log::warn!(
+                        target: "reims_vgpu::graphics",
+                        "context {context}'s command buffer {cb_obj_id:#x} (seqno {seqno}) failed \
+                         off its op's thread: the context's later work is refused until its close"
+                    );
+                }
                 let record = cb_complete(cb_obj_id, seqno, 0, 0, info.error.as_ref());
                 if let Some(sink) = &sink {
                     sink(record);

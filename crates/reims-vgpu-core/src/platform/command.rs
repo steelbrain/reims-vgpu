@@ -17,7 +17,66 @@ pub struct CompletedInfo {
     pub error: Option<NsErrorText>,
 }
 
+/// The domain of the error a command buffer completes with where the platform's read of it, as
+/// its completed handler ran, died in the refusal scope the handler's registration carried
+/// ([`crate::raise::refusals::carry`]): the platform failed it there, where outside every scope
+/// the death ends the process. Not Metal's: only the graphics lane's handlers see it.
+pub const REFUSED_DOMAIN: &str = "reims-vgpu.refused";
+
+/// `MTLCommandBufferErrorInternal`, the code of a refused command buffer's error.
+const ERROR_INTERNAL: i64 = 1;
+
+impl CompletedInfo {
+    /// What a completed handler learns of a command buffer whose read the platform refused
+    /// ([`REFUSED_DOMAIN`]): status `Error`, and an internal error naming the refusal.
+    pub fn refused(refusal: &crate::raise::refusals::Refusal) -> CompletedInfo {
+        CompletedInfo {
+            status: CommandBufferStatus::ERROR,
+            error: Some(NsErrorText {
+                domain: REFUSED_DOMAIN.to_owned(),
+                code: ERROR_INTERNAL,
+                description: refusal.to_string(),
+            }),
+        }
+    }
+
+    /// Whether the platform refused the command buffer's read ([`CompletedInfo::refused`]).
+    pub fn is_refused(&self) -> bool {
+        self.error
+            .as_ref()
+            .is_some_and(|e| e.domain == REFUSED_DOMAIN)
+    }
+}
+
+/// Runs completed handler `block` with what `read` finds of its command buffer, in the scope
+/// `carried` names, the one the handler's registration carried ([`crate::raise::refusals::carry`]):
+/// a death in `read` hands `block` [`CompletedInfo::refused`] instead, and a death in `block` ends
+/// only `block`, each logged. Outside every scope `read` and `block` run plainly, one after the
+/// other, as they always did.
+pub fn run_completed(
+    carried: crate::raise::refusals::Carried,
+    read: impl FnOnce() -> CompletedInfo,
+    block: CompletedHandler,
+) {
+    let info = carried.run(read).unwrap_or_else(|refusal| {
+        log::warn!(
+            target: "reims_vgpu::refused",
+            "a command buffer's completion was refused, and the command buffer failed: {refusal}"
+        );
+        CompletedInfo::refused(&refusal)
+    });
+    if let Err(refusal) = carried.run(|| block(info)) {
+        log::warn!(
+            target: "reims_vgpu::refused",
+            "a command buffer's completed handler was refused: {refusal}"
+        );
+    }
+}
+
 /// A completed handler (`addCompletedHandler:`'s block). Runs once, on a Metal thread (4.2 item 6).
+/// Where it is added inside a refusal scope, the platform runs its read of the buffer and the
+/// handler in that scope ([`crate::raise::refusals::Carried`]): a death in the read hands the
+/// handler [`CompletedInfo::refused`], and a death in the handler ends only the handler.
 pub type CompletedHandler = Box<dyn FnOnce(CompletedInfo) + Send>;
 
 /// `id<MTLCommandQueue>`: the device's `reims-vgpu.blit-up`, `reims-vgpu.blit-down` and

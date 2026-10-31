@@ -358,6 +358,10 @@ pub struct CommandBufferModel {
     pub signal_on_complete: Vec<(AnyHandle, u64)>,
     /// `encodeSignalEventScheduled:value:`s, applied at commit.
     pub signal_on_schedule: Vec<(AnyHandle, u64)>,
+    /// The detail of the death the platform's read of the buffer dies with as each completed
+    /// handler runs ([`World::complete_dying_read`]); `None` for a read that finds what the model
+    /// holds.
+    pub read_dies: Option<String>,
 }
 
 impl std::fmt::Debug for CommandBufferModel {
@@ -704,12 +708,19 @@ impl<K: Kind> Handle for Fk<K> {
 }
 
 impl<K: Kind> Drop for Fk<K> {
+    /// A release: logged where `K` logs its retains, and the death [`World::die_at_release`] set
+    /// for the object, where the thread is not unwinding already.
     fn drop(&mut self) {
         if K::LOG_RETAIN {
             self.obj()
                 .world
                 .log
                 .push(self.id(), K::CLASS, "CFRelease", vec![]);
+        }
+        if !std::thread::panicking() && self.obj().world.take_release_death(self.id()) {
+            crate::raise::Raise::platform("release")
+                .with_detail("the platform died letting go of the object")
+                .fatal();
         }
     }
 }
@@ -887,6 +898,8 @@ pub struct World {
     library_functions: Mutex<Vec<String>>,
     /// What [`World::on_new`] runs on the next object of a kind, in the order added.
     on_new: Mutex<Vec<(TypeId, Box<dyn Any + Send>)>>,
+    /// The objects whose next release dies ([`World::die_at_release`]).
+    release_dies: Mutex<Vec<ObjId>>,
 }
 
 /// A test's model setters for the next object of kind `K` ([`World::on_new`]).
@@ -918,6 +931,7 @@ impl World {
             auto_complete: Mutex::new(None),
             library_functions: Mutex::new(Vec::new()),
             on_new: Mutex::new(Vec::new()),
+            release_dies: Mutex::new(Vec::new()),
         })
     }
 
@@ -974,6 +988,26 @@ impl World {
     pub fn on_new<K: Kind>(&self, set: impl FnOnce(&Fk<K>) + Send + 'static) {
         let set: OnNew<K> = Box::new(set);
         self.on_new.lock().push((TypeId::of::<K>(), Box::new(set)));
+    }
+
+    /// Makes the next release of a handle of object `id` die at `release`, as a platform that
+    /// dies letting go of an object does (the Vulkan platform's release of a no-copy buffer whose
+    /// deallocator the runtime delays): in a refusal scope it is refused, outside every scope it
+    /// ends the process.
+    pub fn die_at_release(&self, id: ObjId) {
+        self.release_dies.lock().push(id);
+    }
+
+    /// Whether this release of object `id` dies ([`World::die_at_release`]): once.
+    fn take_release_death(&self, id: ObjId) -> bool {
+        let mut dies = self.release_dies.lock();
+        match dies.iter().position(|d| *d == id) {
+            Some(i) => {
+                dies.remove(i);
+                true
+            }
+            None => false,
+        }
     }
 
     /// A live object by identity (a retained, erased handle).
@@ -1127,6 +1161,23 @@ impl World {
         true
     }
 
+    /// Completes the committed command buffer `id` with status Error, as [`World::complete`]
+    /// does, where the platform's read of it, as each completed handler runs, dies with `detail`
+    /// (a failure the platform has no answer of Metal's for, which the Vulkan platform dies at on
+    /// the runtime's thread): a handler added in a refusal scope (the graphics lane's) is handed
+    /// the buffer refused ([`CompletedInfo::refused`]), and one added outside every scope dies
+    /// with it. `false` if no such live buffer.
+    pub fn complete_dying_read(&self, id: ObjId, detail: &str, on: CompleteOn) -> bool {
+        let Some(h) = self.find(id) else {
+            return false;
+        };
+        if let Model::CommandBuffer(m) = &mut h.obj().state.lock().model {
+            m.read_dies = Some(detail.to_owned());
+        }
+        complete_obj(h.obj(), CommandBufferStatus::ERROR, None, on);
+        true
+    }
+
     /// Completes every committed buffer successfully, in commit order.
     pub fn complete_all(&self, on: CompleteOn) -> usize {
         let ids = self.committed();
@@ -1192,6 +1243,37 @@ pub fn wait_event(ev: &Arc<FakeObj>, v: u64, ms: u64) -> bool {
     }
 }
 
+thread_local! {
+    /// The detail of the death the platform's read of the command buffer whose completed handlers
+    /// this thread runs dies with ([`World::complete_dying_read`]).
+    static READ_DIES: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Runs `f`, the completed handlers of a command buffer whose read dies with `detail` where it is
+/// `Some` ([`completion_read`]).
+fn with_read_death<R>(detail: Option<String>, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<String>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            READ_DIES.with(|d| *d.borrow_mut() = self.0.take());
+        }
+    }
+    let _restore = Restore(READ_DIES.with(|d| d.replace(detail)));
+    f()
+}
+
+/// The platform's read of a command buffer as its completed handler runs: `info`, what the model
+/// holds, or the death [`World::complete_dying_read`] set for it, at `commit`, the selector the
+/// Vulkan platform dies at for a failure it reads there.
+pub(crate) fn completion_read(info: CompletedInfo) -> CompletedInfo {
+    if let Some(detail) = READ_DIES.with(|d| d.borrow().clone()) {
+        crate::raise::Raise::platform("commit")
+            .with_detail(detail)
+            .fatal();
+    }
+    info
+}
+
 /// [`World::complete`]'s body.
 pub fn complete_obj(
     cb: &Arc<FakeObj>,
@@ -1199,7 +1281,7 @@ pub fn complete_obj(
     error: Option<NsErrorText>,
     on: CompleteOn,
 ) {
-    let (handlers, signals) = {
+    let (handlers, signals, read_dies) = {
         let mut s = cb.state.lock();
         let Model::CommandBuffer(m) = &mut s.model else {
             return;
@@ -1209,6 +1291,7 @@ pub fn complete_obj(
         (
             std::mem::take(&mut m.handlers),
             std::mem::take(&mut m.signal_on_complete),
+            m.read_dies.take(),
         )
     };
     for (ev, v) in &signals {
@@ -1219,9 +1302,11 @@ pub fn complete_obj(
     let info = CompletedInfo { status, error };
     let run = move || {
         super::calllog::as_completion_thread(|| {
-            for h in handlers {
-                h(info.clone());
-            }
+            with_read_death(read_dies, || {
+                for h in handlers {
+                    h(info.clone());
+                }
+            })
         })
     };
     match on {

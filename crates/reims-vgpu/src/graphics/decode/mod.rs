@@ -35,7 +35,7 @@
 //! resolvers are for ops the first op slice does not emit yet, and so are not
 //! reached, but they are kept whole (project rule "Unread is not dead").
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use reims_graphics::region::Region;
@@ -140,6 +140,33 @@ impl Drop for Drain {
     }
 }
 
+/// The contexts whose work failed off its op's thread: a command buffer's completion the
+/// platform refused on its own thread ([`CompletedInfo::refused`]), where the paravirt device ends
+/// the process. The decoder refuses each one's later work, its command buffers and creates, until
+/// its close: only its destroys are carried out (docs/graphics-kext/design.md, "Guest input the
+/// host refuses"). Shared with the command buffers' completed handlers, which mark a context.
+///
+/// [`CompletedInfo::refused`]: reims_vgpu_core::platform::command::CompletedInfo::refused
+#[derive(Default)]
+pub(crate) struct FailedContexts(Mutex<HashSet<u32>>);
+
+impl FailedContexts {
+    /// Marks `context` failed; true where it was not yet.
+    pub(crate) fn fail(&self, context: u32) -> bool {
+        self.0.lock().insert(context)
+    }
+
+    /// Whether `context` failed.
+    pub(crate) fn has(&self, context: u32) -> bool {
+        self.0.lock().contains(&context)
+    }
+
+    /// Forgets `context`, at its close.
+    fn forget(&self, context: u32) {
+        self.0.lock().remove(&context);
+    }
+}
+
 /// A host handle for one guest object, by kind. Later increments read these to
 /// bind resources into command buffers; this slice only inserts them on a create
 /// and drops them on a destroy.
@@ -179,6 +206,9 @@ pub enum DecodeError {
     /// context's. The platform is not called, so no id the host's Metal ends the
     /// process for reaches it.
     BadResourceId,
+    /// The message's context failed off its op's thread ([`FailedContexts`]): its later work is
+    /// refused.
+    ContextFailed,
 }
 
 /// The stage-3 decoder for one device: the `obj_id` → handle table and the
@@ -228,6 +258,8 @@ pub struct GraphicsDecoder<P: Platform> {
     /// Each context's command buffers in flight since its last drain began
     /// ([`Self::drain_context`]).
     drains: HashMap<u32, Arc<Drain>>,
+    /// The contexts whose work failed off its op's thread, whose later work is refused.
+    failed: Arc<FailedContexts>,
     /// The CPU copy of each `Managed` buffer and texture ([`managed`]).
     managed: HashMap<u64, ManagedCopy<P>>,
     /// Whether a `Managed` resource is one copy, over its block ([`Self::set_unified_memory`]).
@@ -257,6 +289,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             context: None,
             spans: HashMap::new(),
             drains: HashMap::new(),
+            failed: Arc::default(),
             managed: HashMap::new(),
             unified_memory: false,
             region,
@@ -281,6 +314,12 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// destroys, which the kext checked is the sender's; on a queue's ring, the queue's.
     pub(crate) fn set_context(&mut self, context: Option<u32>) {
         self.context = context;
+    }
+
+    /// Whether the current context's work failed off its op's thread ([`FailedContexts`]), so
+    /// its later work is refused.
+    pub(super) fn context_failed(&self) -> bool {
+        self.context.is_some_and(|context| self.failed.has(context))
     }
 
     /// Whether `obj_id` is the current context's to name (any where none is set).
@@ -389,18 +428,30 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// Drops every object of context `context`: those whose id lies in its range,
     /// `context << RGFX_CONTEXT_OBJ_ID_SHIFT` and up, below the next context's (its process closed
     /// the device or died), and its chunks of the texture resource ids. How many objects were
-    /// dropped.
+    /// dropped. Each object is let go of in a refusal scope of its own ([`drop_refused`]), so a
+    /// release the platform dies at is refused, logged, and the close goes on; the context's
+    /// failure ([`FailedContexts`]) is forgotten with it.
     pub(crate) fn drop_context(&mut self, context: u32) -> usize {
         for holder in self.id_chunks.iter_mut() {
             if *holder == Some(context) {
                 *holder = None;
             }
         }
+        self.failed.forget(context);
         let ours = |id: &u64| (id >> RGFX_CONTEXT_OBJ_ID_SHIFT) == u64::from(context);
-        let before = self.objects.len();
-        self.objects.retain(|id, _| !ours(id));
+        let objects: Vec<u64> = self.objects.keys().copied().filter(ours).collect();
+        for &id in &objects {
+            if let Some(handle) = self.objects.remove(&id) {
+                drop_refused(id, handle);
+            }
+        }
         self.spans.retain(|id, _| !ours(id));
-        self.managed.retain(|id, _| !ours(id));
+        let managed: Vec<u64> = self.managed.keys().copied().filter(ours).collect();
+        for id in managed {
+            if let Some(copy) = self.managed.remove(&id) {
+                drop_refused(id, copy);
+            }
+        }
         let libraries: Vec<u64> = (self.making_libraries.keys())
             .chain(self.library_chunks.keys())
             .chain(self.cached_libraries.keys())
@@ -408,9 +459,11 @@ impl<P: Platform> GraphicsDecoder<P> {
             .filter(ours)
             .collect();
         for id in libraries {
-            self.forget_library(id);
+            if let Err(refusal) = refusals::refusing(|| self.forget_library(id)) {
+                refused_release(id, &refusal);
+            }
         }
-        before - self.objects.len()
+        objects.len()
     }
 
     /// Whether texture resource id `id` lies in a chunk that the context of object
@@ -567,18 +620,32 @@ impl<P: Platform> GraphicsDecoder<P> {
         let Some(header) = read::<RgfxMsgHeader>(message) else {
             return Ok(Err(DecodeError::Malformed));
         };
+        // A failed context's later work is refused: only its destroys are carried out.
+        if header.r#type != RGFX_CMD_OBJECT_DESTROY && self.context_failed() {
+            return Ok(Err(DecodeError::ContextFailed));
+        }
         match header.r#type {
             RGFX_CMD_OBJECT_DESTROY => {
                 let Some(m) = read::<RgfxObjectDestroy>(message) else {
                     return Ok(Err(DecodeError::Malformed));
                 };
                 // A missing id is not an error: the guest may destroy an object
-                // the host never made (a create that the platform refused).
-                self.forget_library(m.obj_id);
+                // the host never made (a create that the platform refused). Each release is
+                // refused alone where the platform dies at it, so the destroy is carried out
+                // whole ([`drop_refused`]).
+                if let Err(refusal) = refusals::refusing(|| self.forget_library(m.obj_id)) {
+                    refused_release(m.obj_id, &refusal);
+                }
                 self.spans.remove(&m.obj_id);
-                self.managed.remove(&m.obj_id);
-                if matches!(self.objects.remove(&m.obj_id), Some(ObjHandle::Texture(_))) {
-                    self.forget_surface_texture(m.obj_id);
+                if let Some(copy) = self.managed.remove(&m.obj_id) {
+                    drop_refused(m.obj_id, copy);
+                }
+                if let Some(handle) = self.objects.remove(&m.obj_id) {
+                    let texture = matches!(handle, ObjHandle::Texture(_));
+                    drop_refused(m.obj_id, handle);
+                    if texture {
+                        self.forget_surface_texture(m.obj_id);
+                    }
                 }
                 Ok(Ok(()))
             }
@@ -1054,6 +1121,9 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// linked functions. Each function is specialised by the index-keyed constants the wire
     /// carries for it, and each linked function made with the options the guest made it with.
     pub(crate) fn prepare_pipeline(&self, message: &[u8]) -> Result<PipelineJob<P>, DecodeError> {
+        if self.context_failed() {
+            return Err(DecodeError::ContextFailed);
+        }
         let library = |obj_id: u64| self.library_ref(obj_id);
         let header = read::<RgfxMsgHeader>(message).ok_or(DecodeError::Malformed)?;
         if header.r#type == RGFX_CMD_COMPUTE_PIPELINE_CREATE {
@@ -1896,6 +1966,24 @@ fn bad_reference() -> Raise {
 /// [`bad_reference`], it faults the exec rather than reporting a [`DecodeError`].
 pub(crate) fn op_fault(detail: impl std::fmt::Display) -> Raise {
     Raise::foreign("rgfx.decode.op").with_detail(detail)
+}
+
+/// Lets go of `value`, what the decoder held for object `id`, in a refusal scope
+/// ([`refusals::refusing`]): a death in its release, which ends the process outside every scope,
+/// is refused there and logged ([`refused_release`]), and the caller goes on. Where the platform
+/// died partway, what it had not let go of yet stays held.
+pub(crate) fn drop_refused<T>(id: u64, value: T) {
+    if let Err(refusal) = refusals::refusing(move || drop(value)) {
+        refused_release(id, &refusal);
+    }
+}
+
+/// Logs the refused release of object `id` ([`drop_refused`]).
+fn refused_release(id: u64, refusal: &refusals::Refusal) {
+    log::warn!(
+        target: "reims_vgpu::graphics",
+        "object {id:#x} was let go of, and its release was refused: {refusal}"
+    );
 }
 
 /// `op`, one guest op of the lane's, inside the refusal scope ([`refusals::refusing`]): a death
