@@ -10,6 +10,7 @@
  * first failure.
  */
 
+#include <algorithm>
 #include <atomic>
 #include <cassert>
 #include <cstdint>
@@ -43,9 +44,95 @@ void test_id_space()
 	uint64_t a = ids.allocAddress(100, 256);
 	uint64_t b = ids.allocAddress(1, 4096);
 	CHECK(a >= RgfxIdSpace::kDefaultAddressBase);
-	CHECK((a % 256) == 0);
-	CHECK((b % 4096) == 0);
-	CHECK(b >= a + 100); // disjoint ranges, b after a
+	CHECK((a % RgfxIdSpace::kAddressGranule) == 0);
+	CHECK((b % RgfxIdSpace::kAddressGranule) == 0);
+	CHECK(b >= a + RgfxIdSpace::addressSpan(100)); // a's span, its guard page included
+}
+
+// GPU addresses hold Metal's span of a pin: each starts a 32 KiB granule, holds the pages its
+// bytes touch and one guard page, rounded up to a granule, and no two live spans meet, so the
+// host pins every one. A span given back is picked again once the picks have gone round the
+// context's range, joined with the free spans beside it.
+void test_address_picks()
+{
+	const uint64_t page = RgfxIdSpace::kAddressPage, granule = RgfxIdSpace::kAddressGranule;
+	CHECK(RgfxIdSpace::addressSpan(0) == 2 * page);
+	CHECK(RgfxIdSpace::addressSpan(1) == 2 * page);
+	CHECK(RgfxIdSpace::addressSpan(page) == 2 * page);
+	CHECK(RgfxIdSpace::addressSpan(page + 1) == 4 * page);
+	CHECK(RgfxIdSpace::addressSpan(3 * page) == 4 * page);
+	CHECK(RgfxIdSpace::addressSpan(64 * page) == 66 * page);
+	CHECK(RgfxIdSpace::addressSpan(65 * page) == 66 * page);
+
+	// A context's range, as the kext hands it (slot 3), its picks granule-aligned and their
+	// spans apart, whatever their sizes: one of a heap's 1 MiB, then a buffer's 16 KiB.
+	RgfxIdSpace ids;
+	const uint64_t base = RGFX_CONTEXT_VA_BASE + 3 * RGFX_CONTEXT_VA_SPAN;
+	ids.setBases(uint64_t{4} << RGFX_CONTEXT_OBJ_ID_SHIFT, base);
+	uint64_t prev = 0, prevSize = 0;
+	const uint64_t sizes[] = {1u << 20, 0x4000, 256, 1, 0x4001, 4u << 20, 0x8000};
+	for (uint64_t size : sizes) {
+		uint64_t at = ids.allocAddress(size, 256);
+		CHECK(at >= base && at % granule == 0);
+		if (prev != 0)
+			CHECK(at >= prev + RgfxIdSpace::addressSpan(prevSize));
+		prev = at;
+		prevSize = size;
+	}
+	// A larger alignment is honoured.
+	CHECK(ids.allocAddress(1, 0x10'0000) % 0x10'0000 == 0);
+
+	// Next fit: a span given back is not picked again at once.
+	uint64_t a = ids.allocAddress(1, 1);
+	ids.freeAddress(a);
+	uint64_t b = ids.allocAddress(1, 1);
+	CHECK(b > a);
+	ids.freeAddress(0);       // no pick: ignored
+	ids.freeAddress(a);       // given back already: ignored
+	ids.freeAddress(b + 256); // no pick starts there: ignored
+
+	// Round the range: 1 GiB picks till none is left, then two side by side given back, which
+	// a pick of both their spans takes, at the first's address.
+	RgfxIdSpace full;
+	full.setBases(uint64_t{5} << RGFX_CONTEXT_OBJ_ID_SHIFT, base);
+	const uint64_t gib = uint64_t{1} << 30;
+	std::vector<uint64_t> picks;
+	for (;;) {
+		uint64_t at = full.allocAddress(gib, 1);
+		if (at == 0)
+			break;
+		picks.push_back(at);
+	}
+	CHECK(picks.size() == RGFX_CONTEXT_VA_SPAN / RgfxIdSpace::addressSpan(gib));
+	CHECK(picks.back() + RgfxIdSpace::addressSpan(gib) <= base + RGFX_CONTEXT_VA_SPAN);
+	full.freeAddress(picks[10]);
+	full.freeAddress(picks[11]);
+	uint64_t both = full.allocAddress(2 * RgfxIdSpace::addressSpan(gib) - 2 * page, 1);
+	CHECK(both == picks[10]);
+	CHECK(full.allocAddress(gib, 1) == 0); // no other 1 GiB span is free
+	full.freeAddress(picks[3]);
+	CHECK(full.allocAddress(gib, 1) == picks[3]);
+
+	// Picks from several threads at once never share a span.
+	RgfxIdSpace shared;
+	std::vector<uint64_t> got[4];
+	std::vector<std::thread> threads;
+	for (auto &g : got)
+		threads.emplace_back([&shared, &g] {
+			for (int i = 0; i < 500; i++) {
+				uint64_t at = shared.allocAddress(0x1000, 1);
+				g.push_back(at);
+				if (i % 3 == 0)
+					shared.freeAddress(at);
+			}
+		});
+	for (auto &t : threads)
+		t.join();
+	std::vector<uint64_t> all;
+	for (auto &g : got)
+		all.insert(all.end(), g.begin(), g.end());
+	std::sort(all.begin(), all.end());
+	CHECK(std::adjacent_find(all.begin(), all.end()) == all.end());
 }
 
 // A chunk source standing in for the kext: it hands each first id of `firsts` in turn, then
@@ -1101,6 +1188,7 @@ void test_keyed_library_messages()
 int main()
 {
 	test_id_space();
+	test_address_picks();
 	test_resource_id_chunks();
 	test_caps();
 	test_lifecycle_messages();

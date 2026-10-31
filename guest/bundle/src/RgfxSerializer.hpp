@@ -176,6 +176,10 @@ public:
 	/// Gives a texture's resource id back as the texture goes (RgfxIdSpace::freeResourceId).
 	void releaseResourceId(uint64_t resource_id);
 
+	/// Gives the GPU address a create picked back, once the object's destroy is posted
+	/// (RgfxIdSpace::freeAddress).
+	void releaseAddress(uint64_t gpu_address);
+
 	/// A texture of shape `desc`. When `heap` is RGFX_OBJ_NONE the texture is
 	/// device-placed at a picked GPU address; otherwise it lies at `heap_offset`
 	/// in `heap`. A resource id is picked either way.

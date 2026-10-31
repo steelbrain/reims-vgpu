@@ -5,8 +5,19 @@
 
 #include "RgfxObjectModel.hpp"
 
-RgfxIdSpace::RgfxIdSpace(uint64_t address_base) : m_nextObjId(1), m_nextAddress(address_base)
+#include <algorithm>
+#include <iterator>
+
+namespace {
+uint64_t alignUp(uint64_t value, uint64_t align)
 {
+	return (value + (align - 1)) & ~(align - 1);
+}
+} // namespace
+
+RgfxIdSpace::RgfxIdSpace(uint64_t address_base) : m_nextObjId(1)
+{
+	resetAddresses(address_base);
 }
 
 RgfxObjId RgfxIdSpace::allocObjId()
@@ -68,26 +79,93 @@ void RgfxIdSpace::setResourceIdSource(ResourceIdChunkFn source, void *context)
 	m_chunkSourceContext = context;
 }
 
+uint64_t RgfxIdSpace::addressSpan(uint64_t size)
+{
+	const uint64_t pages = (std::max<uint64_t>(size, 1) + kAddressPage - 1) / kAddressPage;
+	return alignUp((pages + 1) * kAddressPage, kAddressGranule);
+}
+
+void RgfxIdSpace::resetAddresses(uint64_t base)
+{
+	m_freeRanges.clear();
+	m_livePicks.clear();
+	const uint64_t start = alignUp(base, kAddressGranule);
+	const uint64_t end = base + RGFX_CONTEXT_VA_SPAN;
+	if (start < end)
+		m_freeRanges[start] = end - start;
+	m_addressCursor = start;
+}
+
 uint64_t RgfxIdSpace::allocAddress(uint64_t size, uint64_t align)
 {
-	if (align < 1)
-		align = 1;
-	const uint64_t mask = align - 1;
-	// A compare-and-swap loop so the aligned base and the bump stay consistent
-	// across concurrent callers; each caller gets a disjoint range.
-	uint64_t cur = m_nextAddress.load(std::memory_order_relaxed);
-	for (;;) {
-		uint64_t base = (cur + mask) & ~mask;
-		uint64_t next = base + size;
-		if (m_nextAddress.compare_exchange_weak(
-		        cur, next, std::memory_order_relaxed, std::memory_order_relaxed))
-			return base;
+	align = std::max(align, kAddressGranule);
+	const uint64_t span = addressSpan(size);
+	std::lock_guard<std::mutex> hold(m_addressLock);
+	// Where `span` bytes from `from` on fit the free range at `at` of `length` bytes.
+	auto fit = [&](uint64_t at, uint64_t length, uint64_t from, uint64_t *start) {
+		const uint64_t s = alignUp(std::max(at, from), align);
+		if (s < at || s - at >= length || length - (s - at) < span)
+			return false;
+		*start = s;
+		return true;
+	};
+	// Next fit: the free range the cursor lies in, from the cursor, and those after it; then
+	// round from the range's first.
+	auto it = m_freeRanges.upper_bound(m_addressCursor);
+	if (it != m_freeRanges.begin()) {
+		auto before = std::prev(it);
+		if (before->first + before->second > m_addressCursor)
+			it = before;
 	}
+	for (int pass = 0; pass < 2; pass++) {
+		for (; it != m_freeRanges.end(); ++it) {
+			uint64_t start = 0;
+			if (!fit(it->first, it->second, pass == 0 ? m_addressCursor : 0, &start))
+				continue;
+			const uint64_t at = it->first, end = it->first + it->second;
+			m_freeRanges.erase(it);
+			if (start > at)
+				m_freeRanges[at] = start - at;
+			if (start + span < end)
+				m_freeRanges[start + span] = end - (start + span);
+			m_livePicks[start] = span;
+			m_addressCursor = start + span;
+			return start;
+		}
+		it = m_freeRanges.begin();
+	}
+	return 0;
+}
+
+void RgfxIdSpace::freeAddress(uint64_t address)
+{
+	std::lock_guard<std::mutex> hold(m_addressLock);
+	auto live = m_livePicks.find(address);
+	if (live == m_livePicks.end())
+		return;
+	uint64_t start = live->first, length = live->second;
+	m_livePicks.erase(live);
+	// Joined with the free ranges either side of it.
+	auto after = m_freeRanges.lower_bound(start);
+	if (after != m_freeRanges.begin()) {
+		auto before = std::prev(after);
+		if (before->first + before->second == start) {
+			start = before->first;
+			length += before->second;
+			m_freeRanges.erase(before);
+		}
+	}
+	if (after != m_freeRanges.end() && after->first == start + length) {
+		length += after->second;
+		m_freeRanges.erase(after);
+	}
+	m_freeRanges[start] = length;
 }
 
 void RgfxIdSpace::setBases(uint64_t obj_id_base, uint64_t address_base)
 {
 	// 0 names no object, so a context's first id is its base + 1.
 	m_nextObjId.store(obj_id_base + 1, std::memory_order_relaxed);
-	m_nextAddress.store(address_base, std::memory_order_relaxed);
+	std::lock_guard<std::mutex> hold(m_addressLock);
+	resetAddresses(address_base);
 }

@@ -168,6 +168,11 @@ void RgfxSerializer::releaseResourceId(uint64_t resource_id)
 	m_ids.freeResourceId(resource_id);
 }
 
+void RgfxSerializer::releaseAddress(uint64_t gpu_address)
+{
+	m_ids.freeAddress(gpu_address);
+}
+
 RgfxCreated RgfxSerializer::createTexture(const RgfxTextureDescriptor &desc, RgfxObjId heap,
                                           uint64_t heap_offset, uint64_t align)
 {

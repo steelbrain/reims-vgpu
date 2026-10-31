@@ -37,6 +37,7 @@
 #import "RgfxFunction.h"
 #import "RgfxLibrary.h"
 #import "RgfxRenderPipelineState.h"
+#include <set>
 #include <vector>
 #import "RgfxCommandObjects.h"
 #import "RgfxIOSurface.h"
@@ -2504,6 +2505,64 @@ bool retirementIdle()
 	return RgfxRetirement::process().waiting() == 0 && RgfxRetirement::process().live() == 0;
 }
 
+// A heap's GPU address goes back once its destroy is retired: churned 1 GiB heaps, each made
+// while the one before it lives, take spans that never meet a live one and are picked again
+// once the picks have gone round the context's 64 GiB, so the churn never runs out. One a
+// command buffer in flight holds back keeps its span till the buffer completes.
+void test_addresses_reused_after_destroy()
+{
+	CHECK(retirementIdle());
+	Fixture fx;
+	MTLHeapDescriptor *d = [MTLHeapDescriptor new];
+	d.size = uint64_t{1} << 30;
+	d.type = MTLHeapTypePlacement;
+	const uint64_t span = RgfxIdSpace::addressSpan(d.size);
+	auto heapAddress = [&] {
+		return expectMessage<RgfxHeapCreate>(fx.ring, RGFX_CMD_HEAP_CREATE).gpu_address;
+	};
+	std::set<uint64_t> seen;
+	RgfxHeap *held = nil;
+	uint64_t heldAt = 0;
+	bool reused = false;
+	for (int i = 0; i < 200; i++) {
+		@autoreleasepool {
+			RgfxHeap *heap = [RgfxHeap heapWithDescriptor:d device:nil serializer:&fx.ser];
+			uint64_t at = heapAddress();
+			CHECK(heap != nil && at != 0 && at % RgfxIdSpace::kAddressGranule == 0);
+			CHECK(at + span <= heldAt || heldAt + span <= at); // apart from the live one's span
+			reused |= !seen.insert(at).second;
+			held = heap; // the one before goes
+			heldAt = at;
+			drainRing(fx.ring);
+		}
+	}
+	CHECK(reused && seen.size() < 200 && held != nil);
+	@autoreleasepool {
+		held = nil;
+	}
+	drainRing(fx.ring);
+
+	// A destroy held back by a command buffer in flight keeps its span till the buffer ends:
+	// with every other span taken, only its own is picked once the buffer is done.
+	uint64_t ticket = 0, keptAt = 0;
+	@autoreleasepool {
+		RgfxHeap *kept = [RgfxHeap heapWithDescriptor:d device:nil serializer:&fx.ser];
+		keptAt = heapAddress();
+		CHECK(kept != nil);
+		ticket = RgfxRetirement::process().begin();
+		kept = nil;
+	}
+	CHECK(ringEmpty(fx.ring)); // its destroy waits
+	int taken = 0;
+	for (uint64_t at; (at = fx.ids.allocAddress(d.size, 1)) != 0; taken++)
+		CHECK(at != keptAt);
+	CHECK(taken > 0);
+	RgfxRetirement::process().end(ticket);
+	CHECK(nextDestroyed(fx.ring) != 0 && ringEmpty(fx.ring));
+	CHECK(fx.ids.allocAddress(d.size, 1) == keptAt);
+	CHECK(retirementIdle());
+}
+
 // Each host object the bundle makes is destroyed as the app lets it go, at once with no
 // command buffer in flight: samplers, depth-stencil states, events, fences, shared events,
 // buffers, heaps, libraries, and render and compute pipelines.
@@ -3023,6 +3082,7 @@ int main()
 		test_objects_outlive_an_uncommitted_buffer();
 		test_retirement_keeps_order_while_running();
 		test_reply_reader_close();
+		test_addresses_reused_after_destroy();
 	}
 	std::printf("shell_tests: OK (%d checks)\n", g_checks);
 	return 0;

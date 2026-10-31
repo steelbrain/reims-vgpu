@@ -149,7 +149,13 @@ RgfxTextureDescriptor rgfxTextureDescriptorFromMTL(MTLTextureDescriptor *d)
 	// with the id later is created on ring 0 after this one's destroy.
 	RgfxSerializer *serializer = _serializer;
 	uint64_t resourceId = _resourceId;
-	[self rgfxRetireThen:[serializer, resourceId] { serializer->releaseResourceId(resourceId); }];
+	uint64_t address = _gpuAddress; // a device-placed texture's, picked by its create
+	[self rgfxRetireThen:[serializer, resourceId, address] {
+		if (serializer == nullptr)
+			return;
+		serializer->releaseResourceId(resourceId);
+		serializer->releaseAddress(address);
+	}];
 }
 
 // --- MTLTexture shape (from the stored descriptor) ---------------------------

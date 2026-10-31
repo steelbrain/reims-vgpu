@@ -14,6 +14,7 @@
 	MTLResourceOptions _options;
 	MTLHeapType _type;
 	void (^_deallocator)(void); // gives a Shared heap's region block back
+	uint64_t _gpuAddress;       // the GPU address its create picked, given back after its destroy
 }
 
 // The host drops the heap once every command buffer in flight now has completed, and only
@@ -22,9 +23,13 @@
 - (void)dealloc
 {
 	void (^deallocator)(void) = _deallocator;
-	[self rgfxRetireThen:[deallocator] {
+	RgfxSerializer *serializer = _serializer;
+	uint64_t address = _gpuAddress;
+	[self rgfxRetireThen:[deallocator, serializer, address] {
 		if (deallocator != nil)
 			deallocator();
+		if (serializer != nullptr)
+			serializer->releaseAddress(address);
 	}];
 }
 
@@ -46,6 +51,7 @@
 		heap->_size = static_cast<uint64_t>(descriptor.size);
 		heap->_options = descriptor.resourceOptions;
 		heap->_type = descriptor.type;
+		heap->_gpuAddress = created.gpu_address;
 	}
 	return heap;
 }
@@ -70,6 +76,7 @@
 		heap->_size = static_cast<uint64_t>(descriptor.size);
 		heap->_options = descriptor.resourceOptions;
 		heap->_type = descriptor.type;
+		heap->_gpuAddress = created.gpu_address;
 		heap->_deallocator = [deallocator copy];
 	}
 	return heap;

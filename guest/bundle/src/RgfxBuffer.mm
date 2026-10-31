@@ -22,6 +22,9 @@
 	// instead (no-copy's deallocator), when set.
 	BOOL _ownsContents;
 	void (^_hostDeallocator)(void);
+	// YES where the buffer's create picked its GPU address (a device buffer, or one over host
+	// memory), which goes back after its destroy; NO for one placed in a heap.
+	BOOL _ownsAddress;
 }
 
 + (instancetype)bufferWithLength:(NSUInteger)length
@@ -33,12 +36,17 @@
 		return nil; // a buffer must have a route to the host
 	}
 	RgfxCreated created = serializer->createBuffer(length, static_cast<uint32_t>(options));
-	return [[RgfxBuffer alloc] initWithObjId:created.obj_id
-	                              gpuAddress:created.gpu_address
-	                                  length:length
-	                                 options:options
-	                                  device:device
-	                              serializer:serializer];
+	RgfxBuffer *buffer = [[RgfxBuffer alloc] initWithObjId:created.obj_id
+	                                            gpuAddress:created.gpu_address
+	                                                length:length
+	                                               options:options
+	                                                device:device
+	                                            serializer:serializer];
+	// One whose contents could not be made keeps its address from use: its destroy may wait
+	// behind command buffers in flight, and nothing here follows it.
+	if (buffer != nil)
+		buffer->_ownsAddress = YES;
+	return buffer;
 }
 
 + (instancetype)bufferOverHostMemoryWithContents:(void *)contents
@@ -54,14 +62,17 @@
 	}
 	RgfxCreated created = serializer->createBufferOverHostMemory(
 	    length, static_cast<uint32_t>(options), regionOffset);
-	return [[RgfxBuffer alloc] initWithObjId:created.obj_id
-	                              gpuAddress:created.gpu_address
-	                                  length:length
-	                                 options:options
-	                                contents:contents
-	                             deallocator:deallocator
-	                                  device:device
-	                              serializer:serializer];
+	RgfxBuffer *buffer = [[RgfxBuffer alloc] initWithObjId:created.obj_id
+	                                            gpuAddress:created.gpu_address
+	                                                length:length
+	                                               options:options
+	                                              contents:contents
+	                                           deallocator:deallocator
+	                                                device:device
+	                                            serializer:serializer];
+	if (buffer != nil)
+		buffer->_ownsAddress = YES;
+	return buffer;
 }
 
 - (instancetype)initWithObjId:(uint64_t)objId
@@ -119,9 +130,13 @@
 	if (_ownsContents)
 		std::free(_contents);
 	void (^deallocator)(void) = _hostDeallocator;
-	[self rgfxRetireThen:[deallocator] {
+	RgfxSerializer *serializer = _serializer;
+	uint64_t address = _ownsAddress ? _gpuAddress : 0;
+	[self rgfxRetireThen:[deallocator, serializer, address] {
 		if (deallocator != nil)
 			deallocator();
+		if (serializer != nullptr && address != 0)
+			serializer->releaseAddress(address);
 	}];
 }
 

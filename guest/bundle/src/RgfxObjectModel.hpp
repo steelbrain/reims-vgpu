@@ -10,10 +10,14 @@
  * create needs no round trip. Host device addresses never reach the guest.
  *
  * RgfxIdSpace hands out those three number lines for one device (one guest
- * process = one context, Decided 7). Object ids and GPU addresses are
- * monotonic and never reuse a value while the device lives: host handles are
- * refcounted, and reuse would alias a live handle; they start at the context's
- * bases, which the accelerator kext hands out. Texture resource ids are shared
+ * process = one context, Decided 7). Object ids are monotonic and never reuse a
+ * value while the device lives: host handles are refcounted, and reuse would
+ * alias a live handle. GPU addresses lie in the context's range and follow
+ * Metal's rules for a pinned address (allocAddress), since the host pins them;
+ * a range comes back once its object's destroy has gone to the host, and is
+ * picked again only once the picks have gone round the whole range (next fit),
+ * so the host has long let the old pin go. Both start at the context's bases,
+ * which the accelerator kext hands out. Texture resource ids are shared
  * by every process on the host's one device, whose ids end below
  * RGFX_RESOURCE_ID_LIMIT, so they come in chunks of RGFX_RESOURCE_ID_CHUNK the
  * kext hands out on demand from one pool for the guest, and an id goes back to
@@ -30,6 +34,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <map>
 #include <mutex>
 #include <vector>
 
@@ -73,9 +78,29 @@ public:
 	/// Where new chunks of texture resource ids come from from now on.
 	void setResourceIdSource(ResourceIdChunkFn source, void *context);
 
-	/// A GPU address range of `size` bytes aligned up to `align` (a power of
-	/// two, at least 1). The guest owns the range; the host pins it.
+	/// The GPU address of an object of `size` bytes the host pins there, aligned up
+	/// to `align` (a power of two, at least 1) and to a kAddressGranule. Each pick
+	/// holds Metal's span of a pin (addressSpan): the pages its bytes touch and one
+	/// guard page after them, rounded up to a granule, so no two live picks' spans
+	/// meet and each starts a granule, as the host's pins must (measured on an M3
+	/// Max and an M4; metal2vulkan's runtime holds pins the same). Picks go forward
+	/// through the context's range and wrap round to the ranges given back behind
+	/// them. 0 where no free range is left.
 	uint64_t allocAddress(uint64_t size, uint64_t align);
+
+	/// Gives the range allocAddress picked at `address` back, once its object's
+	/// destroy has gone to the host. An address no live pick starts at, 0 included,
+	/// is ignored.
+	void freeAddress(uint64_t address);
+
+	/// The bytes a pick of `size` bytes holds from its first byte, a granule's start:
+	/// the pages it touches and one guard page, rounded up to a granule (1 page and
+	/// the guard for 1 byte: 32 KiB; 64 pages: 66 pages).
+	static uint64_t addressSpan(uint64_t size);
+
+	/// Metal's page on Apple silicon, and the granule a pin's first page starts.
+	static const uint64_t kAddressPage = 0x4000;
+	static const uint64_t kAddressGranule = 0x8000;
 
 	/// Moves the object ids and GPU addresses to the process's context's ranges,
 	/// which the accelerator kext hands out (its object-id base and GPU-address
@@ -88,8 +113,18 @@ public:
 	static const uint64_t kDefaultAddressBase = 0x1'0000'0000ull;
 
 private:
+	/// The context's address range from `base`, every byte free. Caller holds m_addressLock
+	/// (or is the constructor).
+	void resetAddresses(uint64_t base);
+
 	std::atomic<uint64_t> m_nextObjId;
-	std::atomic<uint64_t> m_nextAddress;
+
+	// The GPU addresses, under m_addressLock: the free ranges by start (coalesced), the live
+	// picks' spans by start, and where the next pick looks first.
+	std::mutex m_addressLock;
+	std::map<uint64_t, uint64_t> m_freeRanges;
+	std::map<uint64_t, uint64_t> m_livePicks;
+	uint64_t m_addressCursor = 0;
 
 	// The texture resource ids, under m_idsLock: the chunks the process holds,
 	// by index (chunk k holds ids 1 + k * 64 to 64 + k * 64), in the order taken,
