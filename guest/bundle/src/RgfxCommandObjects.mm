@@ -101,7 +101,8 @@ std::atomic<uint64_t> g_bytesDropped{0};
 
 /// Puts an encoder's inline bytes (set*Bytes:length:atIndex:) in its command buffer's upload
 /// chunks (RgfxUploads.h), answering the buffer and offset they lie at to bind; false, said in
-/// the log, where no chunk could be had (the region has no room), and the binding is not made.
+/// the log, where no chunk could be had (the region has no room): the binding is not made, and
+/// the command buffer fails with MTLCommandBufferErrorOutOfMemory when it completes.
 bool rgfxPutBytes(RgfxUploadArena *uploads, const void *bytes, NSUInteger length,
                   id<MTLBuffer> __strong *buffer, uint64_t *offset)
 {
@@ -111,7 +112,7 @@ bool rgfxPutBytes(RgfxUploadArena *uploads, const void *bytes, NSUInteger length
 	uint64_t n = 0;
 	if (logEventOp(g_bytesDropped, &n)) {
 		NSLog(@"RGFX: %lu inline bytes have no upload chunk (no region room): their binding is "
-		      @"not made (so far: %llu)",
+		      @"not made, and the command buffer fails (so far: %llu)",
 		      (unsigned long)length, (unsigned long long)(n + 1));
 	}
 	return false;
@@ -893,7 +894,9 @@ uint32_t fillRenderPass(MTLRenderPassDescriptor *d, RgfxRenderPassDesc *desc,
 	// The surfaces this buffer wrote hold its results before anyone sees it complete.
 	rgfxIOSurfaceWriteBack(_surfaceWrites);
 	_surfaceWrites.clear();
-	// The host is done with the inline bytes: their chunks go back to the queue's pool.
+	// The host is done with the inline bytes: their chunks go back to the queue's pool. A
+	// buffer some of whose inline bytes found no chunk ran without those bindings, so it fails.
+	const bool uploadsFailed = _uploads != nullptr && _uploads->failed();
 	if (_uploads != nullptr) {
 		_uploads->giveBack();
 	}
@@ -906,7 +909,16 @@ uint32_t fillRenderPass(MTLRenderPassDescriptor *d, RgfxRenderPassDesc *desc,
 	// does not wait for its own.
 	[self rgfxGiveSlotBack];
 	[self rgfxNoteGPUTimes:msg];
-	if (msg->status == RGFX_CB_OK) {
+	if (msg->status == RGFX_CB_OK && uploadsFailed) {
+		_cbError = [NSError
+		    errorWithDomain:MTLCommandBufferErrorDomain
+		               code:MTLCommandBufferErrorOutOfMemory
+		           userInfo:@{
+			           NSLocalizedDescriptionKey :
+			               @"inline bytes (set*Bytes:) found no room in the device's memory"
+		           }];
+		_status.store(MTLCommandBufferStatusError);
+	} else if (msg->status == RGFX_CB_OK) {
 		_status.store(MTLCommandBufferStatusCompleted);
 	} else {
 		// The host preserved the raw MTLCommandBufferError code behind the status; it

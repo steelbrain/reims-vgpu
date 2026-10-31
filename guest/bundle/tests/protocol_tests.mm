@@ -18,16 +18,16 @@
 #include <utility>
 #include <vector>
 
-#import "RgfxBuffer.h"
 #import "RgfxArgumentEncoder.h"
+#import "RgfxBuffer.h"
 #import "RgfxCommandObjects.h"
 #import "RgfxComputePipelineState.h"
 #import "RgfxDepthStencilState.h"
 #import "RgfxHeap.h"
 #import "RgfxLibrary.h"
 #import "RgfxRenderPipelineState.h"
-#import "RgfxSharedEvent.h"
 #import "RgfxResource.h"
+#import "RgfxSharedEvent.h"
 #import "RgfxTexture.h"
 #import "RgfxUnsupported.h"
 
@@ -132,8 +132,9 @@ struct QueueFixture {
 		return ops;
 	}
 
-	// The host completes the command buffer committed with `seqno`.
-	void complete(id<MTLCommandBuffer> cb, uint64_t seqno)
+	// The host completes the command buffer committed with `seqno`, which then has `status`.
+	void complete(id<MTLCommandBuffer> cb, uint64_t seqno,
+	              MTLCommandBufferStatus status = MTLCommandBufferStatusCompleted)
 	{
 		RgfxCbComplete done = {};
 		done.header.type = RGFX_EVT_CB_COMPLETE;
@@ -143,7 +144,7 @@ struct QueueFixture {
 		done.status = RGFX_CB_OK;
 		CHECK(completion.postFromHost(&done, sizeof(done)));
 		[cb waitUntilCompleted];
-		CHECK(cb.status == MTLCommandBufferStatusCompleted);
+		CHECK(cb.status == status);
 	}
 
 	// The region bytes at `offset` in the chunk buffer created at `regionOffset`.
@@ -318,7 +319,8 @@ void test_inline_bytes()
 	fx.complete(cb3, seqno3);
 }
 
-// Without a region the bytes have nowhere to go: no binding is made (and it is logged).
+// Without a region the bytes have nowhere to go: no binding is made (and it is logged), and the
+// command buffer fails with MTLCommandBufferErrorOutOfMemory.
 void test_inline_bytes_without_region()
 {
 	QueueFixture fx;
@@ -338,7 +340,10 @@ void test_inline_bytes_without_region()
 	uint64_t seqno = 0;
 	std::vector<Op> ops = fx.nextOps(&seqno);
 	CHECK(findOp(ops, RGFX_OP_RENDER_SET_VERTEX_BUFFER) == nullptr);
-	fx.complete(cb, seqno);
+	// It ran without the binding, so it fails as Metal's does when memory runs out.
+	fx.complete(cb, seqno, MTLCommandBufferStatusError);
+	CHECK(cb.error != nil && [cb.error.domain isEqualToString:MTLCommandBufferErrorDomain] &&
+	      cb.error.code == MTLCommandBufferErrorOutOfMemory);
 }
 
 // The render barriers: the scope barrier as given; a resource barrier as the scope of the

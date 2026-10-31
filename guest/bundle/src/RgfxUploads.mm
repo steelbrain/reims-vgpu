@@ -101,6 +101,7 @@ bool RgfxUploadArena::put(const void *bytes, uint64_t length, id<MTLBuffer> __st
                           uint64_t *offset)
 {
 	if (m_pool == nullptr) {
+		m_failed.store(true, std::memory_order_release);
 		return false;
 	}
 	std::lock_guard<std::mutex> hold(m_lock);
@@ -108,6 +109,7 @@ bool RgfxUploadArena::put(const void *bytes, uint64_t length, id<MTLBuffer> __st
 	if (m_chunks.empty() || at + length > m_chunks.back().size) {
 		RgfxUploadChunk chunk = {};
 		if (!m_pool->take(length == 0 ? 1 : length, &chunk)) {
+			m_failed.store(true, std::memory_order_release);
 			return false;
 		}
 		m_chunks.push_back(chunk);

@@ -25,6 +25,7 @@
 
 #import <Metal/Metal.h>
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -80,6 +81,10 @@ public:
 	/// Gives every chunk taken back to the pool: the host is done reading them.
 	void giveBack();
 
+	/// Whether a put() found no chunk: the command buffer's inline bytes are not all bound, so
+	/// it fails (MTLCommandBufferErrorOutOfMemory, as Metal's does when memory runs out).
+	bool failed() const { return m_failed.load(std::memory_order_acquire); }
+
 	/// The offset alignment of each call's bytes in a chunk.
 	static const uint64_t kUploadAlign = 256;
 	/// A chunk's size.
@@ -90,6 +95,7 @@ private:
 	std::mutex m_lock;
 	std::vector<RgfxUploadChunk> m_chunks; // taken; the last is the one being filled
 	uint64_t m_cursor = 0;                 // the next free byte of the last chunk
+	std::atomic<bool> m_failed{false};     // a put() found no chunk
 };
 
 #endif // RGFX_UPLOADS_H_
