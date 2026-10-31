@@ -35,9 +35,9 @@ use reims_graphics::wire::{
     RGFX_CMD_HEAP_TEXTURE_SIZE_AND_ALIGN, RGFX_CMD_LIBRARY_CREATE, RGFX_CMD_LIBRARY_FROM_REGION,
     RGFX_CMD_LIBRARY_LOOKUP, RGFX_CMD_OBJECT_DESTROY, RGFX_CMD_RENDER_PIPELINE_CREATE,
     RGFX_CMD_SAMPLER_CREATE, RGFX_CONTEXT_OBJ_ID_SHIFT, RGFX_DEVICE_INFO_OFFSET,
-    RGFX_EVT_SAMPLER_STATE, RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK, RGFX_STATUS_REFUSED,
-    RgfxBlockRelease, RgfxCbComplete, RgfxLibraryLookup, RgfxMsgHeader, RgfxPipelineReflection,
-    RgfxSamplerState,
+    RGFX_EVT_SAMPLER_STATE, RGFX_RESOURCE_ID_CHUNK, RGFX_RESOURCE_ID_CHUNKS,
+    RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK, RGFX_STATUS_REFUSED, RgfxBlockRelease,
+    RgfxCbComplete, RgfxLibraryLookup, RgfxMsgHeader, RgfxPipelineReflection, RgfxSamplerState,
 };
 use reims_graphics::{
     CompleteAnswer, CompletionPoster, CursorImage, FixedScreen, Host, Mode, PresentAnswer, Scanout,
@@ -47,6 +47,8 @@ use reims_vgpu_core::num::ToU64;
 use reims_vgpu_core::platform::Platform;
 use reims_vgpu_core::platform::command::CommandBuffer as _;
 use reims_vgpu_core::platform::device::GpuDevice;
+use reims_vgpu_core::platform::resource::Texture;
+use reims_vgpu_core::platform::values::TextureDesc;
 use reims_vgpu_core::raise::OnFault;
 use reims_vgpu_core::sync::Mutex;
 use reims_vgpu_window::{FrameSink, Window, WindowConfig};
@@ -154,6 +156,8 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             // The device the decoder drives, and its caps blob, which the guest bundle reads
             // before it makes any queue. A host with no GPU device cannot run the lane.
             let gpu_device = platform.metal_device(None).ok_or(Error::HostResources)?;
+            // Before anything else makes a queue or a texture on it.
+            reserve_guest_texture_ids(platform.as_ref(), &gpu_device);
             let pool = CompilePool::new();
             let identity = gpu_device.identity_caps();
             // `Managed` resources are one copy where the platform answers that the GPU shares the
@@ -925,6 +929,63 @@ impl WindowScreen {
             }),
         };
         (WindowLink::new(window), screen)
+    }
+}
+
+/// The texture resource ids the kext hands the guest's processes in chunks: 1 to
+/// `RGFX_RESOURCE_ID_CHUNKS * RGFX_RESOURCE_ID_CHUNK` (docs/graphics-kext/design.md, "Texture
+/// resource ids").
+fn guest_texture_ids() -> std::ops::RangeInclusive<u64> {
+    1..=u64::from(RGFX_RESOURCE_ID_CHUNKS) * RGFX_RESOURCE_ID_CHUNK
+}
+
+/// How many plain textures the reservation's check makes: Metal's texture pool's first range,
+/// which it hands out a second time where a reservation follows the device's first queue.
+const RESERVATION_CHECKS: usize = 16;
+
+/// Keeps the guest's texture resource ids ([`guest_texture_ids`]) from every texture the process
+/// numbers itself on `device`: the window's drawables and cursor, and any other the host makes.
+/// The guest places each of its textures at its own id, and Metal hands out a placed id again to
+/// plain allocation, so without the reservation two textures share it; a texture placed past
+/// the ids the device's table has grown to corrupts Metal's heap. The reservation grows the table
+/// to hold them. Measured on an M3 Max, macOS 27; metal2vulkan imitates both.
+///
+/// Metal takes a texture reservation only before the device's first texture (it ignores a later
+/// one, logging so), and one after the device's first command queue keeps the pool's first range
+/// beside the ids it leaves, which it hands out twice. So this is the first call on the device,
+/// and a few plain textures check it took: one inside the guest's ids is logged as an error.
+fn reserve_guest_texture_ids<P: Platform>(platform: &P, device: &P::Device) {
+    let ids: Vec<u64> = guest_texture_ids().collect();
+    if let Err(raise) = refusing(|| device.reserve_resource_indices(0, &ids)) {
+        log::error!(
+            "the guest's texture resource ids are not reserved ({raise}): its textures may \
+             share ids with the host's"
+        );
+        return;
+    }
+    let descriptor = platform.texture_descriptor(&TextureDesc {
+        pixel_format: 80,
+        width: 1,
+        height: 1,
+        usage: 1,
+        resource_options: Some(0x20),
+        ..TextureDesc::default()
+    });
+    let made: Vec<P::Texture> = (0..RESERVATION_CHECKS)
+        .filter_map(|_| refusing(|| device.new_texture(OnFault::Return, &descriptor)).ok()?)
+        .collect();
+    if let Some(id) = made
+        .iter()
+        .map(Texture::gpu_resource_id)
+        .find(|id| guest_texture_ids().contains(id))
+    {
+        log::error!(
+            "a texture of the host's took resource id {id}, one of the guest's ({} to {}): \
+             something made a texture or a command queue on the device before the guest's ids \
+             were reserved, and the guest's textures may share ids with the host's",
+            guest_texture_ids().start(),
+            guest_texture_ids().end()
+        );
     }
 }
 

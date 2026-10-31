@@ -128,7 +128,7 @@ pub mod kind {
 
 /// A resource-index space: the reservation type the platform is given. Textures, samplers and
 /// ICBs are the product's reservation types 0, 1 and 5; the other spaces are the fake's own.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Space(pub u64);
 
 impl Space {
@@ -830,7 +830,8 @@ impl<K: Kind> Fk<K> {
 #[derive(Debug, Default)]
 struct Indices {
     used: Vec<(Space, u64)>,
-    reserved: Vec<(Space, u64)>,
+    // A set: a reservation may hold thousands (the graphics device's texture ids).
+    reserved: std::collections::HashSet<(Space, u64)>,
 }
 
 /// A resource index held by a live object; freed when the object dies.
@@ -1018,11 +1019,8 @@ impl World {
             Some(i) => i,
             None => {
                 let mut i = 1u64;
-                while g
-                    .used
-                    .iter()
-                    .chain(g.reserved.iter())
-                    .any(|&(s, x)| s == space && x == i)
+                while g.reserved.contains(&(space, i))
+                    || g.used.iter().any(|&(s, x)| s == space && x == i)
                 {
                     i = i.wrapping_add(1);
                 }
@@ -1042,7 +1040,7 @@ impl World {
     pub fn reserve_indices(&self, space: Space, indices: &[u64]) {
         let mut g = self.indices.lock();
         for &i in indices {
-            g.reserved.push((space, i));
+            g.reserved.insert((space, i));
         }
     }
 

@@ -341,8 +341,26 @@ imitates that. So ids are not split by slot. The kext keeps one pool for the
 guest, 255 chunks of 64 ids (chunk `k` holds `1 + 64k` to `64 + 64k`, all below
 16321), and hands a process a chunk when it asks (user-client selector 0x106),
 posting the grant (`RESOURCE_ID_CHUNK`: context, chunk) on the control ring
-before it returns, so the host has it before any create naming its ids. The
-bundle keeps each chunk's free ids in one 64-bit mask, takes the lowest free id
+before it returns, so the host has it before any create naming its ids.
+The host reserves the pool's ids on its device as it makes the graphics device,
+its first call on the device (`reserve_guest_texture_ids`,
+`crates/reims-vgpu/src/graphics.rs`). Metal hands the id of a texture placed at
+one out again to plain allocation, so without it the guest's textures would share
+ids with the host's own (the window's drawables, the cursor), and a texture placed
+past the table a fresh device has corrupts Metal's heap (placements from 10000 up
+crashed some runs). The reservation keeps the ids from plain allocation and grows
+the table to hold them (measured on an M3 Max, macOS 27; metal2vulkan imitates
+both). Metal takes one only before the device's first texture, and once the device
+has a queue it hands the pool's first range out twice, so the host checks it with
+a few plain textures and logs an error where one takes a guest id. Were the
+paravirt lane's device in the same process, on the same GPU, the graphics lane's
+reservation would win: it is made as the device is, before any guest runs, while
+the paravirt lane reserves its placed objects as each task starts
+(`crates/reims-vgpu-core/src/resources/manager/reserve.rs`), and Metal takes only
+a type's first reservation. That would not make the two safe together: both lanes'
+guests place textures in the device's one table, at ids each picks alone. So a
+process runs one lane's device on a GPU, and today a VM has one lane or the other.
+The bundle keeps each chunk's free ids in one 64-bit mask, takes the lowest free id
 of the first chunk taken that has one, asks for a chunk only when all of its are
 in use, and gives an id back as its texture goes, after the texture's destroy
 (below), so a later create with the id follows the destroy on ring 0.

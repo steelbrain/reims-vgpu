@@ -114,6 +114,93 @@ fn headless_on(raised: &Arc<AtomicU32>) -> (GraphicsDevice<FakePlatform>, Arc<Fa
     (device, platform)
 }
 
+/// The device's first call reserves the guest's texture resource ids, every id of the kext's
+/// chunks, before any queue or texture on it; the plain textures that check it take ids past them
+#[test]
+fn the_device_reserves_the_guest_s_texture_ids_first() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (_device, platform) = headless_on(&raised);
+    let calls = platform.call_log().calls();
+    let reserve = "reserveResourceIndicesForResourceType:indices:indexCount:";
+    let first = calls
+        .iter()
+        .position(|c| c.sel == reserve)
+        .expect("a reservation");
+    let ids: Vec<u64> = (1..=u64::from(RGFX_RESOURCE_ID_CHUNKS) * RGFX_RESOURCE_ID_CHUNK).collect();
+    assert_eq!(ids.len(), 16320);
+    assert_eq!(calls[first].args, vec![Arg::U64(0), Arg::U64s(ids)]);
+    assert!(
+        calls[..first]
+            .iter()
+            .all(|c| !c.sel.starts_with("newCommandQueue") && !c.sel.starts_with("newTexture")),
+        "{:?}",
+        calls[..first].iter().map(|c| c.sel).collect::<Vec<_>>()
+    );
+    let checks = calls
+        .iter()
+        .filter(|c| c.sel == "newTextureWithDescriptor:")
+        .count();
+    assert_eq!(checks, RESERVATION_CHECKS);
+}
+
+/// On Metal, a texture the guest places at one of its ids and the plain textures the host makes
+/// never share an id, and one placed at the guest's last id, past the table a fresh device has,
+/// is made and lives (Metal's heap is not corrupted). Each test runs in a process of its own, so
+/// the device's ids start fresh
+#[cfg(target_os = "macos")]
+#[test]
+fn on_metal_guest_texture_ids_are_kept_from_the_host_s() {
+    use reims_vgpu_core::platform::resource::Texture as _;
+    use reims_vgpu_core::platform::values::TextureDesc;
+    let platform = reims_vgpu_metal::MetalPlatform::process();
+    let config = GraphicsConfig {
+        callbacks: GraphicsCallbacks {
+            raise_interrupt: None,
+            scanout_written: None,
+        },
+        window: None,
+    };
+    let _device = GraphicsDevice::with_platform(Arc::clone(&platform), config).unwrap();
+    let gpu = platform.metal_device(None).unwrap();
+    let desc = |resource_index| TextureDesc {
+        pixel_format: 80,
+        width: 4,
+        height: 4,
+        usage: 1,
+        resource_options: Some(0x20),
+        resource_index,
+        ..TextureDesc::default()
+    };
+    let last = u64::from(RGFX_RESOURCE_ID_CHUNKS) * RGFX_RESOURCE_ID_CHUNK;
+    let mut placed = Vec::new();
+    for id in [1, 2, 65, last / 2, last - 1, last] {
+        let d = platform.texture_descriptor(&desc(Some((id, true))));
+        let t = gpu.new_texture(OnFault::Return, &d).unwrap().unwrap();
+        assert_eq!(t.gpu_resource_id(), id);
+        placed.push(t);
+    }
+    let plain_desc = platform.texture_descriptor(&desc(None));
+    let plain: Vec<_> = (0..256)
+        .map(|_| {
+            gpu.new_texture(OnFault::Return, &plain_desc)
+                .unwrap()
+                .unwrap()
+        })
+        .collect();
+    let inside: Vec<u64> = plain
+        .iter()
+        .map(|t| t.gpu_resource_id())
+        .filter(|id| (1..=last).contains(id))
+        .collect();
+    assert!(
+        inside.is_empty(),
+        "plain textures took the guest's ids {inside:?}"
+    );
+    for (t, id) in placed.iter().zip([1, 2, 65, last / 2, last - 1, last]) {
+        assert_eq!(t.gpu_resource_id(), id);
+    }
+}
+
 /// The control ring's data-ring size.
 const RING_DATA: u64 = RGFX_CONTROL_RING_DATA_SIZE as u64;
 
