@@ -17,6 +17,7 @@
 
 @interface RgfxSharedEvent ()
 - (void)rgfxEventSignalled:(const RgfxEventSignalled *)msg;
+- (void)rgfxSetMirror:(uint64_t)value;
 @end
 
 @implementation RgfxSharedEvent {
@@ -29,6 +30,8 @@
 	// remove on dealloc.
 	RgfxReplyReader *_reader;
 	uint64_t _eventToken;
+	// Signalled each time the mirror moves, for waitUntilSignaledValue:timeoutMS:.
+	NSCondition *_valueChanged;
 }
 
 + (instancetype)sharedEventWithInitialValue:(uint64_t)initialValue
@@ -45,6 +48,7 @@
 	if (ev != nil) {
 		ev->_signaledValue = initialValue;
 		ev->_pending = [NSMutableArray array];
+		ev->_valueChanged = [[NSCondition alloc] init];
 	}
 	return ev;
 }
@@ -78,7 +82,7 @@
 // pending notifyListener block whose value has been reached, in registration order.
 - (void)rgfxEventSignalled:(const RgfxEventSignalled *)msg
 {
-	_signaledValue = msg->value;
+	[self rgfxSetMirror:msg->value];
 	NSMutableArray<RgfxSharedEventPending *> *fired = [NSMutableArray array];
 	for (RgfxSharedEventPending *p in _pending) {
 		if (msg->value >= p.value) {
@@ -108,7 +112,44 @@
 	// call. FOLLOW-UP: when the host grows a shared-event SET op (and/or the reply
 	// ring reports the host's value back), route the set through the serialiser and
 	// reconcile the mirror. For now this updates only the local mirror.
-	_signaledValue = signaledValue;
+	[self rgfxSetMirror:signaledValue];
+}
+
+// Moves the mirror and wakes every waitUntilSignaledValue:timeoutMS:.
+- (void)rgfxSetMirror:(uint64_t)value
+{
+	[_valueChanged lock];
+	_signaledValue = value;
+	[_valueChanged broadcast];
+	[_valueChanged unlock];
+}
+
+// Blocks until the mirror reaches `value` (YES) or `milliseconds` pass (NO), as Metal's does.
+// The mirror moves on the host's EVENT_SIGNALLED and on the CPU's set; where no thread drives
+// the reader the event is registered with (a unit test), the wait takes it meanwhile.
+- (BOOL)waitUntilSignaledValue:(uint64_t)value timeoutMS:(uint64_t)milliseconds
+{
+	NSDate *deadline =
+	    [NSDate dateWithTimeIntervalSinceNow:static_cast<double>(milliseconds) / 1000.0];
+	for (;;) {
+		[_valueChanged lock];
+		BOOL reached = _signaledValue >= value;
+		BOOL pumps = _reader != nullptr && !_reader->driven();
+		if (!reached && !pumps) {
+			[_valueChanged waitUntilDate:deadline];
+		}
+		reached = _signaledValue >= value;
+		[_valueChanged unlock];
+		if (reached) {
+			return YES;
+		}
+		if ([deadline timeIntervalSinceNow] <= 0) {
+			return NO;
+		}
+		if (pumps && _reader->pump() == 0) {
+			[NSThread sleepForTimeInterval:0.001];
+		}
+	}
 }
 
 - (void)notifyListener:(MTLSharedEventListener *)listener

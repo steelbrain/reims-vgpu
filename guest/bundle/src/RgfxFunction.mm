@@ -3,6 +3,7 @@
  */
 
 #import "RgfxFunction.h"
+#import "RgfxUnsupported.h"
 
 #import "RgfxMetalError.h"
 
@@ -194,8 +195,9 @@
 
 - (id<MTLArgumentEncoder>)newArgumentEncoderWithBufferIndex:(NSUInteger)bufferIndex
 {
-	(void)bufferIndex;
-	return nil; // needs the function's argument reflection, which the shell does not read
+	// Needs the function's argument reflection, which no host reply carries.
+	RGFX_UNSUPPORTED("argument encoders (no argument reflection on the wire)");
+	return nil;
 }
 
 - (id<MTLArgumentEncoder>)newArgumentEncoderWithBufferIndex:(NSUInteger)bufferIndex

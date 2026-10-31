@@ -5,6 +5,7 @@
  */
 
 #import "RgfxLibrary.h"
+#import "RgfxUnsupported.h"
 
 #import <objc/message.h>
 
@@ -591,6 +592,35 @@ static NSError *rgfxFunctionNotFound(NSString *name)
 - (NSString *)installName
 {
 	return nil; // an executable library has no install name
+}
+
+// --- unsupported ----------------------------------------------------------------------
+
+// Intersection functions are ray tracing's, which the device does not support: nil and
+// Metal's own unsupported error.
+- (id<MTLFunction>)newIntersectionFunctionWithDescriptor:(MTLIntersectionFunctionDescriptor *)descriptor
+                                                   error:(__autoreleasing NSError **)error
+{
+	RGFX_UNSUPPORTED_ERROR_IN(error, "ray tracing", MTLLibraryErrorDomain,
+	                          MTLLibraryErrorUnsupported);
+	return nil;
+}
+
+- (void)newIntersectionFunctionWithDescriptor:(MTLIntersectionFunctionDescriptor *)descriptor
+                            completionHandler:(void (^)(id<MTLFunction> _Nullable,
+                                                        NSError *_Nullable))completionHandler
+{
+	NSError *err = nil;
+	id<MTLFunction> fn = [self newIntersectionFunctionWithDescriptor:descriptor error:&err];
+	if (completionHandler)
+		completionHandler(fn, err);
+}
+
+// A function's reflection needs the host's per-argument bindings, which no reply carries.
+- (MTLFunctionReflection *)reflectionForFunctionWithName:(NSString *)functionName
+{
+	RGFX_UNSUPPORTED("function reflection (the host sends no argument bindings)");
+	return nil;
 }
 
 @end

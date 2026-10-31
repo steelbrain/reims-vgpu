@@ -4,6 +4,7 @@
  */
 
 #import "RgfxArgumentEncoder.h"
+#import "RgfxUnsupported.h"
 
 @interface RgfxArgumentEncoder ()
 - (instancetype)initWithArguments:(NSArray<MTLArgumentDescriptor *> *)arguments
@@ -42,61 +43,176 @@
 	return _argumentCount;
 }
 
-// --- MTLArgumentEncoder (DOCUMENTED STUB) ------------------------------------
-// encodedLength/alignment need the platform's argument-buffer layout rules, which
-// are not in this slice's wire; these return documented placeholders rather than
-// fabricate a layout. The setters are no-ops until the argument-buffer transport
-// lands. Callers that write argument buffers do not reach this path yet.
+// --- MTLArgumentEncoder: unsupported ----------------------------------------------
+// encodedLength and the layout need the host platform's argument-buffer layout rules, and the
+// writes need the host's view of the addresses and resource ids they encode: neither is on the
+// wire. So the encoder lays out nothing: encodedLength is 0, the setters write nothing, and
+// each member logs its first use (RgfxUnsupported.h). A nil or empty argument asks for nothing.
 
 - (NSUInteger)encodedLength
 {
-	return 0; // placeholder until the argument-buffer layout transport lands
+	RGFX_UNSUPPORTED("argument encoders (no argument-buffer layout on the wire)");
+	return 0;
 }
 
 - (NSUInteger)alignment
 {
-	return 256; // a safe argument-buffer alignment floor; the real value is the
-	            // platform's, carried later
+	return 256; // a safe argument-buffer alignment floor; the layout itself is not carried
 }
 
 - (void)setArgumentBuffer:(id<MTLBuffer>)argumentBuffer offset:(NSUInteger)offset
 {
-	(void)argumentBuffer;
-	(void)offset;
+	if (argumentBuffer != nil)
+		RGFX_UNSUPPORTED("argument encoders (no argument-buffer layout on the wire)");
 }
 
 - (void)setArgumentBuffer:(id<MTLBuffer>)argumentBuffer
               startOffset:(NSUInteger)startOffset
              arrayElement:(NSUInteger)arrayElement
 {
-	(void)argumentBuffer;
-	(void)startOffset;
-	(void)arrayElement;
+	if (argumentBuffer != nil)
+		RGFX_UNSUPPORTED("argument encoders (no argument-buffer layout on the wire)");
 }
 
 - (void)setBuffer:(id<MTLBuffer>)buffer offset:(NSUInteger)offset atIndex:(NSUInteger)index
 {
-	(void)buffer;
-	(void)offset;
-	(void)index;
+	if (buffer != nil)
+		RGFX_UNSUPPORTED("argument encoders (no argument-buffer layout on the wire)");
+}
+
+- (void)setBuffers:(const id<MTLBuffer> __nullable[__nonnull])buffers
+           offsets:(const NSUInteger[__nonnull])offsets
+         withRange:(NSRange)range
+{
+	if (range.length != 0)
+		RGFX_UNSUPPORTED("argument encoders (no argument-buffer layout on the wire)");
 }
 
 - (void)setTexture:(id<MTLTexture>)texture atIndex:(NSUInteger)index
 {
-	(void)texture;
-	(void)index;
+	if (texture != nil)
+		RGFX_UNSUPPORTED("argument encoders (no argument-buffer layout on the wire)");
+}
+
+- (void)setTextures:(const id<MTLTexture> __nullable[__nonnull])textures withRange:(NSRange)range
+{
+	if (range.length != 0)
+		RGFX_UNSUPPORTED("argument encoders (no argument-buffer layout on the wire)");
 }
 
 - (void)setSamplerState:(id<MTLSamplerState>)sampler atIndex:(NSUInteger)index
 {
-	(void)sampler;
-	(void)index;
+	if (sampler != nil)
+		RGFX_UNSUPPORTED("argument encoders (no argument-buffer layout on the wire)");
+}
+
+- (void)setSamplerStates:(const id<MTLSamplerState> __nullable[__nonnull])samplers
+               withRange:(NSRange)range
+{
+	if (range.length != 0)
+		RGFX_UNSUPPORTED("argument encoders (no argument-buffer layout on the wire)");
+}
+
+- (void)setRenderPipelineState:(id<MTLRenderPipelineState>)pipeline atIndex:(NSUInteger)index
+{
+	if (pipeline != nil)
+		RGFX_UNSUPPORTED("argument encoders (no argument-buffer layout on the wire)");
+}
+
+- (void)setRenderPipelineStates:(const id<MTLRenderPipelineState> __nullable[__nonnull])pipelines
+                      withRange:(NSRange)range
+{
+	if (range.length != 0)
+		RGFX_UNSUPPORTED("argument encoders (no argument-buffer layout on the wire)");
+}
+
+- (void)setComputePipelineState:(id<MTLComputePipelineState>)pipeline atIndex:(NSUInteger)index
+{
+	if (pipeline != nil)
+		RGFX_UNSUPPORTED("argument encoders (no argument-buffer layout on the wire)");
+}
+
+- (void)setComputePipelineStates:(const id<MTLComputePipelineState> __nullable[__nonnull])pipelines
+                       withRange:(NSRange)range
+{
+	if (range.length != 0)
+		RGFX_UNSUPPORTED("argument encoders (no argument-buffer layout on the wire)");
+}
+
+- (void)setDepthStencilState:(id<MTLDepthStencilState>)depthStencilState atIndex:(NSUInteger)index
+{
+	if (depthStencilState != nil)
+		RGFX_UNSUPPORTED("argument encoders (no argument-buffer layout on the wire)");
+}
+
+- (void)setDepthStencilStates:(const id<MTLDepthStencilState> __nullable[__nonnull])depthStencilStates
+                    withRange:(NSRange)range
+{
+	if (range.length != 0)
+		RGFX_UNSUPPORTED("argument encoders (no argument-buffer layout on the wire)");
+}
+
+// The device makes no indirect command buffer, acceleration structure or function table.
+- (void)setIndirectCommandBuffer:(id<MTLIndirectCommandBuffer>)indirectCommandBuffer
+                         atIndex:(NSUInteger)index
+{
+	if (indirectCommandBuffer != nil)
+		RGFX_UNSUPPORTED("indirect command buffers");
+}
+
+- (void)setIndirectCommandBuffers:(const id<MTLIndirectCommandBuffer> __nullable[__nonnull])buffers
+                        withRange:(NSRange)range
+{
+	if (range.length != 0)
+		RGFX_UNSUPPORTED("indirect command buffers");
+}
+
+- (void)setAccelerationStructure:(id<MTLAccelerationStructure>)accelerationStructure
+                         atIndex:(NSUInteger)index
+{
+	if (accelerationStructure != nil)
+		RGFX_UNSUPPORTED("ray tracing");
+}
+
+- (void)setIntersectionFunctionTable:(id<MTLIntersectionFunctionTable>)intersectionFunctionTable
+                             atIndex:(NSUInteger)index
+{
+	if (intersectionFunctionTable != nil)
+		RGFX_UNSUPPORTED("ray tracing");
+}
+
+- (void)setIntersectionFunctionTables:
+            (const id<MTLIntersectionFunctionTable> __nullable[__nonnull])intersectionFunctionTables
+                            withRange:(NSRange)range
+{
+	if (range.length != 0)
+		RGFX_UNSUPPORTED("ray tracing");
+}
+
+- (void)setVisibleFunctionTable:(id<MTLVisibleFunctionTable>)visibleFunctionTable
+                        atIndex:(NSUInteger)index
+{
+	if (visibleFunctionTable != nil)
+		RGFX_UNSUPPORTED("function pointers");
+}
+
+- (void)setVisibleFunctionTables:(const id<MTLVisibleFunctionTable> __nullable[__nonnull])visibleFunctionTables
+                       withRange:(NSRange)range
+{
+	if (range.length != 0)
+		RGFX_UNSUPPORTED("function pointers");
 }
 
 - (void *)constantDataAtIndex:(NSUInteger)index
 {
-	(void)index;
-	return nullptr; // no argument-buffer backing in the stub
+	RGFX_UNSUPPORTED("argument encoders (no argument-buffer layout on the wire)");
+	return nullptr; // no argument buffer is laid out
+}
+
+- (id<MTLArgumentEncoder>)newArgumentEncoderForBufferAtIndex:(NSUInteger)index
+{
+	RGFX_UNSUPPORTED("argument encoders (no argument-buffer layout on the wire)");
+	return nil;
 }
 
 @end

@@ -14,16 +14,19 @@
 
 #include <cstdint>
 #include <cstring>
+#include <thread>
 #include <utility>
 #include <vector>
 
 #import "RgfxBuffer.h"
+#import "RgfxArgumentEncoder.h"
 #import "RgfxCommandObjects.h"
 #import "RgfxComputePipelineState.h"
 #import "RgfxDepthStencilState.h"
 #import "RgfxHeap.h"
 #import "RgfxLibrary.h"
 #import "RgfxRenderPipelineState.h"
+#import "RgfxSharedEvent.h"
 #import "RgfxResource.h"
 #import "RgfxTexture.h"
 #import "RgfxUnsupported.h"
@@ -843,6 +846,112 @@ void test_pipeline_state_members()
 	CHECK(RgfxUnsupportedWasLogged([RgfxDepthStencilState class], @selector(gpuResourceID)));
 }
 
+
+// --- libraries, argument encoders and shared events -----------------------------------
+
+// An intersection function is nil with Metal's own unsupported library error, through both
+// forms; a function's reflection is nil, logged.
+void test_library_members()
+{
+	TestRing control(0x8000);
+	control.setConsumerIdle(1);
+	RgfxRingWriter writer(control.base(), control.dataSize, RGFX_CONTROL_RING_ID,
+	                      TestRing::doorbell, nullptr);
+	RgfxIdSpace ids;
+	RgfxSerializer ser(writer, ids);
+	@autoreleasepool {
+		const uint8_t libBytes[] = {1, 2, 3};
+		uint32_t libStatus = 0;
+		RgfxLibrary *lib = [RgfxLibrary libraryWithData:libBytes
+		                                        length:sizeof(libBytes)
+		                                           key:nullptr
+		                                        device:nil
+		                                    serializer:&ser
+		                                        status:&libStatus];
+		MTLIntersectionFunctionDescriptor *d = [[MTLIntersectionFunctionDescriptor alloc] init];
+		d.name = @"hit";
+		NSError *err = nil;
+		CHECK([lib newIntersectionFunctionWithDescriptor:d error:&err] == nil);
+		CHECK(err != nil && [err.domain isEqualToString:MTLLibraryErrorDomain] &&
+		      err.code == MTLLibraryErrorUnsupported);
+		__block BOOL called = NO;
+		__block NSError *handlerErr = nil;
+		[lib newIntersectionFunctionWithDescriptor:d
+		                         completionHandler:^(id<MTLFunction> fn, NSError *e) {
+			                         called = fn == nil;
+			                         handlerErr = e;
+		                         }];
+		CHECK(called && handlerErr.code == MTLLibraryErrorUnsupported);
+		CHECK([lib reflectionForFunctionWithName:@"vmain"] == nil);
+		CHECK(RgfxUnsupportedWasLogged([RgfxLibrary class],
+		                               @selector(reflectionForFunctionWithName:)));
+	} // @autoreleasepool: the library drains while ser lives
+}
+
+// An argument encoder lays out nothing (its encoded length is 0) and writes nothing; each
+// member that is asked something logs it, a nil argument does not.
+void test_argument_encoder_members()
+{
+	MTLArgumentDescriptor *a = [MTLArgumentDescriptor argumentDescriptor];
+	a.dataType = MTLDataTypePointer;
+	a.index = 0;
+	RgfxArgumentEncoder *enc = [RgfxArgumentEncoder argumentEncoderWithArguments:@[ a ]
+	                                                                      device:nil
+	                                                                  serializer:nullptr];
+	Class c = [RgfxArgumentEncoder class];
+	[enc setBuffer:nil offset:0 atIndex:0];
+	CHECK(!RgfxUnsupportedWasLogged(c, @selector(setBuffer:offset:atIndex:)));
+	CHECK(enc.encodedLength == 0);
+	CHECK(RgfxUnsupportedWasLogged(c, @selector(encodedLength)));
+	id<MTLTexture> none[1] = {nil};
+	[enc setTextures:none withRange:NSMakeRange(0, 1)];
+	CHECK(RgfxUnsupportedWasLogged(c, @selector(setTextures:withRange:)));
+	CHECK([enc newArgumentEncoderForBufferAtIndex:0] == nil);
+	CHECK([enc constantDataAtIndex:0] == nullptr);
+	[enc setIndirectCommandBuffer:nil atIndex:0];
+	CHECK(!RgfxUnsupportedWasLogged(c, @selector(setIndirectCommandBuffer:atIndex:)));
+}
+
+// waitUntilSignaledValue:timeoutMS: answers YES at once for a value reached, NO once the
+// timeout passes, and YES when the value is reached meanwhile: by the CPU's set on another
+// thread, or by the host's EVENT_SIGNALLED, which the wait takes off a reader no thread drives.
+void test_shared_event_wait()
+{
+	TestRing control(0x8000);
+	control.setConsumerIdle(1);
+	RgfxRingWriter writer(control.base(), control.dataSize, RGFX_CONTROL_RING_ID,
+	                      TestRing::doorbell, nullptr);
+	RgfxIdSpace ids;
+	RgfxSerializer ser(writer, ids);
+	TestRing completion(0x8000);
+	RgfxReplyReader reader(completion.base(), completion.dataSize);
+	@autoreleasepool {
+		RgfxSharedEvent *ev = [RgfxSharedEvent sharedEventWithInitialValue:5
+		                                                             device:nil
+		                                                         serializer:&ser];
+		CHECK([ev waitUntilSignaledValue:5 timeoutMS:0] == YES);
+		CHECK([ev waitUntilSignaledValue:6 timeoutMS:20] == NO);
+
+		std::thread setter([ev] {
+			std::this_thread::sleep_for(std::chrono::milliseconds(20));
+			ev.signaledValue = 9;
+		});
+		CHECK([ev waitUntilSignaledValue:9 timeoutMS:5000] == YES);
+		setter.join();
+
+		[ev rgfxRegisterWithReplyReader:&reader];
+		RgfxEventSignalled sig = {};
+		sig.header.type = RGFX_EVT_EVENT_SIGNALLED;
+		sig.header.size = sizeof(sig);
+		sig.obj_id = ev.rgfxObjId;
+		sig.value = 12;
+		CHECK(completion.postFromHost(&sig, sizeof(sig)));
+		CHECK([ev waitUntilSignaledValue:12 timeoutMS:5000] == YES);
+		CHECK(ev.signaledValue == 12);
+		CHECK([ev waitUntilSignaledValue:13 timeoutMS:10] == NO);
+	} // @autoreleasepool: ev drains while ser and reader live
+}
+
 } // namespace
 
 void rgfxProtocolTests()
@@ -859,4 +968,7 @@ void rgfxProtocolTests()
 	test_buffer_members();
 	test_heap_members();
 	test_pipeline_state_members();
+	test_library_members();
+	test_argument_encoder_members();
+	test_shared_event_wait();
 }
