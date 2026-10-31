@@ -21,13 +21,15 @@
 //   tex_probe kinds N   N rounds, each of one object of every kind made and let go while the
 //                       round's command buffer is in flight: a new queue, a 4 MiB Shared buffer
 //                       (a region block), a 1 MiB Shared heap with a buffer and a texture placed
-//                       in it, a 64 x 64 IOSurface texture (its copy is a region block), a
-//                       Private texture, a sampler, a depth-stencil state, an event, a fence
-//                       and a shared event. The buffer fills the 4 MiB buffer and copies a
-//                       pattern through the Private texture into it, waiting on the fence it
-//                       updates; each must complete with those bytes in the Shared buffer, so
-//                       N past 256 needs each queue to end, and N past 256 needs the blocks
-//                       back (the region is 1 GiB)
+//                       in it, a 256 MiB Private heap with a texture placed in it, a Private
+//                       buffer of a page and a byte, a 64 x 64 IOSurface texture (its copy is a
+//                       region block), a Private texture, a sampler, a depth-stencil state, an
+//                       event, a fence and a shared event. The buffer fills the 4 MiB buffer and copies a
+//                       pattern through the Private texture into it, the copy out waiting on
+//                       the fence the copy in updates; each must complete with those bytes in
+//                       the Shared buffer, so N past 256 needs each queue to end, and N past
+//                       256 needs the blocks back (the region is 1 GiB), and N past 250 needs
+//                       the Private heaps' GPU addresses back (64 GiB a process)
 // Prints "TEX OK" when every check passes, else "TEX FAIL: why" and exits 1. A completion 20 s
 // late prints HANG and exits 3. The copy waits with waitUntilCompleted, or with its completed
 // handler alone (`handler`).
@@ -346,11 +348,22 @@ static int kinds(id<MTLDevice> device, long n)
 			MTLHeapDescriptor *hd = [MTLHeapDescriptor new];
 			hd.size = 1u << 20;
 			hd.storageMode = MTLStorageModeShared;
+			hd.type = MTLHeapTypePlacement; // resources at offsets the probe names
 			id<MTLHeap> heap = [device newHeapWithDescriptor:hd];
 			id<MTLBuffer> placed = [heap newBufferWithLength:4096
 			                                         options:MTLResourceStorageModeShared
 			                                          offset:0];
 			id<MTLTexture> placedTex = [heap newTextureWithDescriptor:sd offset:0x10000];
+			// A 256 MiB Private heap a round: 1000 rounds go round the process's 64 GiB of GPU
+			// addresses four times, so its picks must come back as the heaps go.
+			MTLHeapDescriptor *pd = [MTLHeapDescriptor new];
+			pd.size = 256u << 20;
+			pd.storageMode = MTLStorageModePrivate;
+			pd.type = MTLHeapTypePlacement;
+			id<MTLHeap> privateHeap = [device newHeapWithDescriptor:pd];
+			id<MTLTexture> privateTex = [privateHeap newTextureWithDescriptor:d offset:0];
+			id<MTLBuffer> deviceBuffer = [device newBufferWithLength:0x4001
+			                                                  options:MTLResourceStorageModePrivate];
 			IOSurfaceRef surface = IOSurfaceCreate((__bridge CFDictionaryRef)props);
 			id<MTLTexture> surfaceTex =
 			    surface ? [device newTextureWithDescriptor:sd iosurface:surface plane:0] : nil;
@@ -364,11 +377,14 @@ static int kinds(id<MTLDevice> device, long n)
 			id<MTLFence> fence = [device newFence];
 			id<MTLSharedEvent> sharedEvent = [device newSharedEvent];
 			if (queue == nil || shared == nil || heap == nil || placed == nil || placedTex == nil ||
+			    privateHeap == nil || privateTex == nil || deviceBuffer == nil ||
 			    surfaceTex == nil || tex == nil || sampler == nil || depth == nil || event == nil ||
 			    fence == nil || sharedEvent == nil) {
-				printf("round %ld: queue=%d shared=%d heap=%d placed=%d placedTex=%d surfaceTex=%d "
+				printf("round %ld: queue=%d shared=%d heap=%d placed=%d placedTex=%d "
+				       "privateHeap=%d privateTex=%d deviceBuffer=%d surfaceTex=%d "
 				       "tex=%d sampler=%d depth=%d event=%d fence=%d sharedEvent=%d\n",
 				       i, queue != nil, shared != nil, heap != nil, placed != nil, placedTex != nil,
+				       privateHeap != nil, privateTex != nil, deviceBuffer != nil,
 				       surfaceTex != nil, tex != nil, sampler != nil, depth != nil, event != nil,
 				       fence != nil, sharedEvent != nil);
 				missing++;
@@ -378,6 +394,16 @@ static int kinds(id<MTLDevice> device, long n)
 			id<MTLCommandBuffer> cb = [queue commandBuffer];
 			id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
 			[blit fillBuffer:shared range:NSMakeRange(0, big) value:fill];
+			[blit fillBuffer:deviceBuffer range:NSMakeRange(0, 0x4001) value:fill];
+			[blit copyFromBuffer:src
+			           sourceOffset:0
+			      sourceBytesPerRow:row
+			    sourceBytesPerImage:size
+			             sourceSize:MTLSizeMake(side, side, 1)
+			              toTexture:privateTex
+			       destinationSlice:0
+			       destinationLevel:0
+			      destinationOrigin:MTLOriginMake(0, 0, 0)];
 			[blit copyFromBuffer:src
 			           sourceOffset:0
 			      sourceBytesPerRow:row
@@ -412,15 +438,17 @@ static int kinds(id<MTLDevice> device, long n)
 		atomic_store(&w->done, 1);
 		if (missing)
 			break;
-		const uint8_t *b = (const uint8_t *)[out contents];
-		long wrong = 0;
-		for (NSUInteger k = 0; k < big; k++)
-			wrong += b[k] != (k < size ? pattern : fill);
-		if (status != MTLCommandBufferStatusCompleted)
-			failed++;
-		else if (wrong)
-			bad++;
-		out = nil;
+		@autoreleasepool {
+			const uint8_t *b = (const uint8_t *)[out contents];
+			long wrong = 0;
+			for (NSUInteger k = 0; k < big; k++)
+				wrong += b[k] != (k < size ? pattern : fill);
+			if (status != MTLCommandBufferStatusCompleted)
+				failed++;
+			else if (wrong)
+				bad++;
+			out = nil; // its block goes back for the next round
+		}
 	}
 	printf("kinds: %ld rounds in %.0f ms (%.1f GiB of 4 MiB Shared buffers), failed=%ld, wrong=%ld, "
 	       "missing=%ld\n",
