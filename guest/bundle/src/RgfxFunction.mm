@@ -26,6 +26,8 @@
 	RgfxBitCodeHash _hash;                        // the bitcode hash, from the library's table
 	BOOL _haveHash;
 	MTLFunctionOptions _options;                  // the descriptor's, where made from one
+	std::string _specializedName;                 // the descriptor's, where it gave one
+	BOOL _haveSpecializedName;
 }
 
 + (instancetype)functionWithLibrary:(RgfxResource *)library
@@ -147,6 +149,8 @@
 
 - (NSString *)name
 {
+	if (_haveSpecializedName)
+		return [NSString stringWithUTF8String:_specializedName.c_str()];
 	return [NSString stringWithUTF8String:_name.c_str()];
 }
 
@@ -201,6 +205,17 @@
 	_options = options;
 }
 
+- (void)rgfxSetSpecializedName:(NSString *)specializedName
+{
+	_specializedName = specializedName.UTF8String ? specializedName.UTF8String : "";
+	_haveSpecializedName = YES;
+}
+
+- (const char *)rgfxSpecializedNameUTF8
+{
+	return _haveSpecializedName ? _specializedName.c_str() : nullptr;
+}
+
 // The host lays out the argument buffer the function takes at `bufferIndex` from the library's
 // function (ARGUMENT_LAYOUT, RgfxArgumentEncoder.h); nil where it takes none there.
 - (id<MTLArgumentEncoder>)newArgumentEncoderWithBufferIndex:(NSUInteger)bufferIndex
@@ -247,6 +262,7 @@ id<MTLFunction> RgfxCollectLinkedFunctions(MTLLinkedFunctions *linked, RgfxLinke
 			r.list = list;
 			r.options = static_cast<uint32_t>(rf.options);
 			r.group = group;
+			r.specialized_name = [rf rgfxSpecializedNameUTF8];
 			out.refs.push_back(r);
 		}
 		return nil;

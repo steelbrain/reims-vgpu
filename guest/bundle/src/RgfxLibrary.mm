@@ -560,13 +560,15 @@ static NSError *rgfxFunctionNotFound(NSString *name)
 - (id<MTLFunction>)newFunctionWithDescriptor:(MTLFunctionDescriptor *)descriptor
                                        error:(__autoreleasing NSError **)error
 {
-	// `specializedName` changes only the host's compile, not which entry point is named; the
-	// name and constants are what the wire carries, and the options travel with the
-	// function to the pipelines that link it.
+	// The entry point and constants are what the wire names the function by; the options
+	// and the specialized name travel with it to the pipelines that link it, and the
+	// specialized name is the one it answers.
 	id<MTLFunction> fn = [self newFunctionWithName:descriptor.name
 	                                constantValues:descriptor.constantValues
 	                                         error:error];
 	[(RgfxFunction *)fn rgfxSetOptions:descriptor.options];
+	if (descriptor.specializedName.length != 0)
+		[(RgfxFunction *)fn rgfxSetSpecializedName:descriptor.specializedName];
 	return fn;
 }
 

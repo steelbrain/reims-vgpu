@@ -60,13 +60,15 @@ struct RgfxFunctionRef {
 };
 
 /// One function a pipeline stage links (MTLLinkedFunctions): the function, the list
-/// it is in (an RGFX_LINKED_*), the MTLFunctionOptions it was made with, and for
-/// RGFX_LINKED_GROUP the group's name (null otherwise).
+/// it is in (an RGFX_LINKED_*), the MTLFunctionOptions it was made with, for
+/// RGFX_LINKED_GROUP the group's name (null otherwise), and the specializedName it was
+/// made with (null for none).
 struct RgfxLinkedFunctionRef {
 	RgfxFunctionRef function;
 	uint32_t list;
 	uint32_t options;
 	const char *group;
+	const char *specialized_name;
 };
 
 /// A render pipeline's descriptor, as MTLRenderPipelineDescriptor gives it, in

@@ -2730,8 +2730,10 @@ typedef struct {
 // One function a pipeline stage links (`MTLLinkedFunctions`), named as a stage's
 // function is: a library `obj_id`, an entry-point name in the message tail and a run
 // of [`RgfxFunctionConstant`] in the tail, with the `MTLFunctionOptions` the guest
-// made it with. A stage's linked functions are a run of these in the tail, each
-// list's in its order; a group's functions carry the group's name.
+// made it with and, where it gave one, the descriptor's `specializedName`, the name
+// the function answers and a pipeline's visible-function references resolve against.
+// A stage's linked functions are a run of these in the tail, each list's in its
+// order; a group's functions carry the group's name.
 typedef struct {
   // The library the function comes from.
   uint64_t library_obj_id;
@@ -2754,6 +2756,10 @@ typedef struct {
   uint32_t group_offset;
   // For [`RGFX_LINKED_GROUP`], the group name's length in bytes; 0 otherwise.
   uint32_t group_len;
+  // The `specializedName`'s byte offset from the message start; 0 for none.
+  uint32_t specialized_name_offset;
+  // The `specializedName`'s length in bytes; 0 for none.
+  uint32_t specialized_name_len;
 } RgfxLinkedFunction;
 
 // `MANAGED_TEXTURE_CREATE`: a `Managed` texture of shape `desc` at the guest-picked

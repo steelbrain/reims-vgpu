@@ -1929,8 +1929,10 @@ pub const RGFX_LINKED_GROUP: u32 = 3;
 /// One function a pipeline stage links (`MTLLinkedFunctions`), named as a stage's
 /// function is: a library `obj_id`, an entry-point name in the message tail and a run
 /// of [`RgfxFunctionConstant`] in the tail, with the `MTLFunctionOptions` the guest
-/// made it with. A stage's linked functions are a run of these in the tail, each
-/// list's in its order; a group's functions carry the group's name.
+/// made it with and, where it gave one, the descriptor's `specializedName`, the name
+/// the function answers and a pipeline's visible-function references resolve against.
+/// A stage's linked functions are a run of these in the tail, each list's in its
+/// order; a group's functions carry the group's name.
 #[repr(C)]
 #[derive(
     Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
@@ -1957,6 +1959,10 @@ pub struct RgfxLinkedFunction {
     pub group_offset: u32,
     /// For [`RGFX_LINKED_GROUP`], the group name's length in bytes; 0 otherwise.
     pub group_len: u32,
+    /// The `specializedName`'s byte offset from the message start; 0 for none.
+    pub specialized_name_offset: u32,
+    /// The `specializedName`'s length in bytes; 0 for none.
+    pub specialized_name_len: u32,
 }
 
 /// `RENDER_PIPELINE_CREATE`: a render pipeline from a descriptor, answered by
@@ -2189,7 +2195,7 @@ const _: () = {
     assert!(size_of::<RgfxColorAttachmentDesc>() == 40);
     assert!(size_of::<RgfxVertexBufferLayout>() == 16);
     assert!(size_of::<RgfxVertexAttribute>() == 16);
-    assert!(size_of::<RgfxLinkedFunction>() == 40);
+    assert!(size_of::<RgfxLinkedFunction>() == 48);
     assert!(size_of::<RgfxRenderPipelineCreate>() == 464);
     assert!(core::mem::offset_of!(RgfxRenderPipelineCreate, colors) == 128);
     assert!(size_of::<RgfxComputePipelineCreate>() == 96);

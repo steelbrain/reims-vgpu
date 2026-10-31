@@ -1311,7 +1311,7 @@ mod tests {
         let named =
             |l: &VulkanLibrary, name: &str| l.new_function(OnFault::Return, name).unwrap().unwrap();
         let binary = callee
-            .new_function_with_options(OnFault::Return, "linked_add_one", &[], 1)
+            .new_function_with_options(OnFault::Return, "linked_add_one", &[], 1, None)
             .unwrap()
             .unwrap();
         [
@@ -1383,6 +1383,28 @@ mod tests {
             let shown = format!("{refused:?}");
             assert!(!matches!(made(refused), Ok(Ok(Some(_)))), "{shown}");
         }
+    }
+
+    /// The runtime's function descriptor has no specialized name, so a function asked for with
+    /// one is nil, and the same function without one is made
+    #[test]
+    fn a_function_with_a_specialized_name_is_refused() {
+        use crate::gpu::resource::VulkanLibrary;
+        let callee: VulkanLibrary = dev()
+            .new_library(include_bytes!(concat!(
+                env!("OUT_DIR"),
+                "/linked_callee.metallib"
+            )))
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let with = |specialized| {
+            callee
+                .new_function_with_options(OnFault::Return, "linked_add_one", &[], 0, specialized)
+                .unwrap()
+        };
+        assert!(with(Some("custom_fn")).is_none());
+        assert!(with(None).is_some());
     }
 
     /// A vertex function that calls a visible function its library does not define is made with

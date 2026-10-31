@@ -1001,12 +1001,19 @@ void test_compute_pipeline_routing()
 
 	// The stage-input descriptor's layouts and attributes in use, its index type and buffer,
 	// the call stack depth, and the linked functions in their lists, a function made by
-	// descriptor with its options.
+	// descriptor with its options, and one with a specialized name, which it answers, under
+	// its entry point.
 	MTLFunctionDescriptor *fd = [MTLFunctionDescriptor functionDescriptor];
 	fd.name = @"bin";
 	fd.options = MTLFunctionOptionCompileToBinary;
 	id<MTLFunction> binary = [lib newFunctionWithDescriptor:fd error:nil];
 	CHECK(binary.options == MTLFunctionOptionCompileToBinary);
+	CHECK([binary.name isEqualToString:@"bin"]);
+	MTLFunctionDescriptor *pd = [MTLFunctionDescriptor functionDescriptor];
+	pd.name = @"fp";
+	pd.specializedName = @"custom_fn";
+	id<MTLFunction> specialized = [lib newFunctionWithDescriptor:pd error:nil];
+	CHECK([specialized.name isEqualToString:@"custom_fn"]);
 	MTLComputePipelineDescriptor *whole = [[MTLComputePipelineDescriptor alloc] init];
 	whole.computeFunction = kfn;
 	whole.maxCallStackDepth = 3;
@@ -1025,7 +1032,7 @@ void test_compute_pipeline_routing()
 		@"zeta" : @[ [lib newFunctionWithName:@"gz"] ],
 		@"alpha" : @[ [lib newFunctionWithName:@"ga"], [lib newFunctionWithName:@"gb"] ],
 	};
-	linked.privateFunctions = @[ [lib newFunctionWithName:@"fp"] ];
+	linked.privateFunctions = @[ specialized ];
 	whole.linkedFunctions = linked;
 	RgfxComputePipelineState *cs4 =
 	    [RgfxComputePipelineState computePipelineStateWithDescriptor:whole
@@ -1055,14 +1062,15 @@ void test_compute_pipeline_routing()
 		uint32_t list;
 		uint32_t options;
 		const char *group;
+		const char *specialized;
 	};
 	const Want want[6] = {
-		{"fa", RGFX_LINKED_FUNCTIONS, 0, ""},
-		{"bin", RGFX_LINKED_BINARY_FUNCTIONS, MTLFunctionOptionCompileToBinary, ""},
-		{"ga", RGFX_LINKED_GROUP, 0, "alpha"},
-		{"gb", RGFX_LINKED_GROUP, 0, "alpha"},
-		{"gz", RGFX_LINKED_GROUP, 0, "zeta"},
-		{"fp", RGFX_LINKED_PRIVATE_FUNCTIONS, 0, ""},
+		{"fa", RGFX_LINKED_FUNCTIONS, 0, "", ""},
+		{"bin", RGFX_LINKED_BINARY_FUNCTIONS, MTLFunctionOptionCompileToBinary, "", ""},
+		{"ga", RGFX_LINKED_GROUP, 0, "alpha", ""},
+		{"gb", RGFX_LINKED_GROUP, 0, "alpha", ""},
+		{"gz", RGFX_LINKED_GROUP, 0, "zeta", ""},
+		{"fp", RGFX_LINKED_PRIVATE_FUNCTIONS, 0, "", "custom_fn"},
 	};
 	for (uint32_t i = 0; i < 6; i++) {
 		RgfxLinkedFunction r;
@@ -1074,6 +1082,10 @@ void test_compute_pipeline_routing()
 		CHECK(r.options == want[i].options);
 		CHECK(r.group_len == std::strlen(want[i].group));
 		CHECK(std::memcmp(bytes4.data() + r.group_offset, want[i].group, r.group_len) == 0);
+		CHECK(r.specialized_name_len == std::strlen(want[i].specialized));
+		CHECK((r.specialized_name_offset == 0) == (r.specialized_name_len == 0));
+		CHECK(std::memcmp(bytes4.data() + r.specialized_name_offset, want[i].specialized,
+		                  r.specialized_name_len) == 0);
 	}
 
 	// A linked function another device's library made is refused before anything is sent:

@@ -2089,15 +2089,25 @@ impl Library<VulkanPlatform> for VulkanLibrary {
     /// The runtime's `newFunctionWithDescriptor:error:`: the descriptor's constant values nil
     /// where there are none, and each constant by its index where there are. A constant the
     /// runtime cannot carry answers nil, as a refused specialisation; options the runtime does
-    /// not know die, as its other creators' unknown raw values do.
+    /// not know die, as its other creators' unknown raw values do. The runtime's descriptor has
+    /// no specialized name, so a function made with one answers nil, logged: a pipeline linking
+    /// it under its own name would not resolve the references Metal resolves to it.
     fn new_function_with_options(
         &self,
         _on: OnFault,
         function_name: &str,
         constants: &[reims_vgpu_core::platform::resource::FunctionConstant],
         options: u64,
+        specialized_name: Option<&str>,
     ) -> RaiseResult<Option<VulkanFunction>> {
         let sel = "newFunctionWithDescriptor:error:";
+        if let Some(specialized) = specialized_name {
+            log::warn!(
+                "function {function_name:?}: the runtime makes no function of the specialized \
+                 name {specialized:?}"
+            );
+            return Ok(None);
+        }
         let mut descriptor = rt::FunctionDescriptor::new(function_name);
         if !constants.is_empty() {
             let Some(values) = constant_values(function_name, constants) else {

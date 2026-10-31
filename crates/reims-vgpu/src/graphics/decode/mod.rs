@@ -1117,6 +1117,15 @@ impl<P: Platform> GraphicsDecoder<P> {
                     constants: constants_tail(message, r.constants_offset, r.constant_count)
                         .ok_or(DecodeError::Malformed)?,
                     options: r.options.into(),
+                    specialized_name: if r.specialized_name_len == 0 {
+                        None
+                    } else {
+                        Some(
+                            str_tail(message, r.specialized_name_offset, r.specialized_name_len)
+                                .ok_or(DecodeError::Malformed)?
+                                .to_owned(),
+                        )
+                    },
                     list,
                 })
             })
@@ -1184,6 +1193,8 @@ struct LinkedRef<P: Platform> {
     constants: Vec<FunctionConstant>,
     /// The `MTLFunctionOptions` the guest made it with.
     options: u64,
+    /// The descriptor's `specializedName`, where the guest gave one.
+    specialized_name: Option<String>,
     list: LinkedList,
 }
 
@@ -1454,7 +1465,13 @@ impl<P: Platform> PipelineJob<P> {
     pub(crate) fn functions(&self) -> PipelineFunctions {
         let linked = |stage: &'static str, refs: &[LinkedRef<P>]| {
             refs.iter()
-                .map(move |r| (stage, r.name.clone(), r.constants.clone()))
+                .map(move |r| {
+                    let name = match &r.specialized_name {
+                        Some(specialized) => format!("{} as {specialized:?}", r.name),
+                        None => r.name.clone(),
+                    };
+                    (stage, name, r.constants.clone())
+                })
                 .collect::<Vec<_>>()
         };
         let mut out = Vec::new();
@@ -1695,10 +1712,16 @@ fn linked_functions<P: Platform>(
                 r.name
             )));
         };
-        let function = if r.options == 0 {
+        let function = if r.options == 0 && r.specialized_name.is_none() {
             specialised::<P>(&library, &r.name, &r.constants)?
         } else {
-            library.new_function_with_options(OnFault::Return, &r.name, &r.constants, r.options)?
+            library.new_function_with_options(
+                OnFault::Return,
+                &r.name,
+                &r.constants,
+                r.options,
+                r.specialized_name.as_deref(),
+            )?
         };
         let Some(function) = function else {
             return Ok(Err(format!(
@@ -3460,20 +3483,22 @@ mod tests {
     }
 
     /// Appends to `bytes` the linked functions `specs` name, each of library `library`: its name,
-    /// list, `MTLFunctionOptions`, group name (empty for none) and constants, then their records,
-    /// and answers the records' offset and count; the message's size is set again, a multiple of
-    /// 8.
+    /// list, `MTLFunctionOptions`, group name (empty for none), constants and specialized name
+    /// (empty for none), then their records, and answers the records' offset and count; the
+    /// message's size is set again, a multiple of 8.
     fn append_linked(
         bytes: &mut Vec<u8>,
         library: u64,
-        specs: &[(&str, u32, u32, &str, &[RgfxFunctionConstant])],
+        specs: &[(&str, u32, u32, &str, &[RgfxFunctionConstant], &str)],
     ) -> (u32, u32) {
         let mut records = Vec::new();
-        for &(name, list, options, group, constants) in specs {
+        for &(name, list, options, group, constants, specialized) in specs {
             let name_offset = bytes.len() as u32;
             bytes.extend_from_slice(name.as_bytes());
             let group_offset = bytes.len() as u32;
             bytes.extend_from_slice(group.as_bytes());
+            let specialized_offset = bytes.len() as u32;
+            bytes.extend_from_slice(specialized.as_bytes());
             let constants_offset = bytes.len() as u32;
             bytes.extend_from_slice(constants.as_bytes());
             records.push(RgfxLinkedFunction {
@@ -3486,6 +3511,12 @@ mod tests {
                 options,
                 group_offset: if group.is_empty() { 0 } else { group_offset },
                 group_len: group.len() as u32,
+                specialized_name_offset: if specialized.is_empty() {
+                    0
+                } else {
+                    specialized_offset
+                },
+                specialized_name_len: specialized.len() as u32,
             });
         }
         bytes.resize(bytes.len().next_multiple_of(8), 0);
@@ -3559,11 +3590,11 @@ mod tests {
             &mut bytes,
             1,
             &[
-                ("fa", RGFX_LINKED_FUNCTIONS, 0, "", &[]),
-                ("fb", RGFX_LINKED_BINARY_FUNCTIONS, 1, "", &[]),
-                ("ga", RGFX_LINKED_GROUP, 0, "g", &[]),
-                ("gb", RGFX_LINKED_GROUP, 0, "g", &[]),
-                ("fp", RGFX_LINKED_PRIVATE_FUNCTIONS, 0, "", &[constant]),
+                ("fa", RGFX_LINKED_FUNCTIONS, 0, "", &[], ""),
+                ("fb", RGFX_LINKED_BINARY_FUNCTIONS, 1, "", &[], ""),
+                ("ga", RGFX_LINKED_GROUP, 0, "g", &[], ""),
+                ("gb", RGFX_LINKED_GROUP, 0, "g", &[], ""),
+                ("fp", RGFX_LINKED_PRIVATE_FUNCTIONS, 0, "", &[constant], ""),
             ],
         );
         let layouts_at = bytes.len() as u32;
@@ -3665,11 +3696,15 @@ mod tests {
         let (p, mut dec, replies) = pipeline_decoder();
         let device = p.device();
         let mut bytes = whole_render_create(100, true);
-        let vertex = append_linked(&mut bytes, 1, &[("va", RGFX_LINKED_FUNCTIONS, 0, "", &[])]);
+        let vertex = append_linked(
+            &mut bytes,
+            1,
+            &[("va", RGFX_LINKED_FUNCTIONS, 0, "", &[], "")],
+        );
         let fragment = append_linked(
             &mut bytes,
             1,
-            &[("fa", RGFX_LINKED_PRIVATE_FUNCTIONS, 0, "", &[])],
+            &[("fa", RGFX_LINKED_PRIVATE_FUNCTIONS, 0, "", &[], "")],
         );
         edit_head(&mut bytes, |m: &mut RgfxRenderPipelineCreate| {
             (m.vertex_linked_offset, m.vertex_linked_count) = vertex;
@@ -3706,7 +3741,7 @@ mod tests {
         let device = p.device();
         let with = |obj_id, library, list| {
             let mut bytes = compute_create(obj_id);
-            let linked = append_linked(&mut bytes, library, &[("fa", list, 1, "", &[])]);
+            let linked = append_linked(&mut bytes, library, &[("fa", list, 1, "", &[], "")]);
             edit_head(&mut bytes, |m: &mut RgfxComputePipelineCreate| {
                 (m.linked_offset, m.linked_count) = linked;
             });
@@ -3753,6 +3788,50 @@ mod tests {
             ]
         );
         assert_eq!(dec.object_count(), 1, "only the library");
+    }
+
+    /// A linked function the guest gave a specialized name is made by descriptor with that name,
+    /// though its options are 0, and one with neither by name alone
+    #[test]
+    fn a_linked_function_s_specialized_name_reaches_the_platform() {
+        let (p, mut dec, replies) = pipeline_decoder();
+        let device = p.device();
+        let mut bytes = compute_create(100);
+        let linked = append_linked(
+            &mut bytes,
+            1,
+            &[
+                ("fp", RGFX_LINKED_PRIVATE_FUNCTIONS, 0, "", &[], "custom_fn"),
+                ("fa", RGFX_LINKED_FUNCTIONS, 0, "", &[], ""),
+            ],
+        );
+        edit_head(&mut bytes, |m: &mut RgfxComputePipelineCreate| {
+            (m.linked_offset, m.linked_count) = linked;
+        });
+        let mark = p.call_log().mark();
+        assert_eq!(dec.decode(&device, &bytes).unwrap(), Ok(()));
+        assert_eq!(replies.lock()[0].status, RGFX_PIPELINE_OK);
+        let made: Vec<_> = p
+            .call_log()
+            .since(mark)
+            .into_iter()
+            .filter(|c| c.sel.starts_with("newFunction"))
+            .map(|c| (c.sel, c.args))
+            .collect();
+        assert_eq!(
+            made[1..],
+            [
+                (
+                    "newFunctionWithDescriptor:error:",
+                    vec![
+                        Arg::Str("fp".to_owned()),
+                        Arg::U64(0),
+                        Arg::Str("custom_fn".to_owned())
+                    ]
+                ),
+                ("newFunctionWithName:", vec![Arg::Str("fa".to_owned())]),
+            ]
+        );
     }
 
     /// A render and a compute pipeline create each resolve their functions from a

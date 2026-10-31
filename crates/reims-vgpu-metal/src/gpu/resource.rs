@@ -611,15 +611,16 @@ impl reims_vgpu_core::platform::resource::Library<MetalPlatform> for MetalLibrar
         .map(created)
     }
 
-    /// Metal's `newFunctionWithDescriptor:error:` over a descriptor of the name, the options and,
-    /// where there are any, the constants, each set by its index. A constant of a type no function
-    /// constant takes, or an `NSError`, answers nil.
+    /// Metal's `newFunctionWithDescriptor:error:` over a descriptor of the name, the options, the
+    /// specialized name where given and, where there are any, the constants, each set by its
+    /// index. A constant of a type no function constant takes, or an `NSError`, answers nil.
     fn new_function_with_options(
         &self,
         _on: OnFault,
         function_name: &str,
         constants: &[reims_vgpu_core::platform::resource::FunctionConstant],
         options: u64,
+        specialized_name: Option<&str>,
     ) -> RaiseResult<Option<<MetalPlatform as Platform>::Function>> {
         let (l, name) = (self.get(), msg::new_string(function_name));
         let d = msg::get(
@@ -636,6 +637,12 @@ impl reims_vgpu_core::platform::resource::Library<MetalPlatform> for MetalLibrar
         msg::get("setOptions:", || {
             d.setOptions(MTLFunctionOptions(options.to_usize()))
         });
+        if let Some(specialized) = specialized_name {
+            let specialized = msg::new_string(specialized);
+            msg::get("setSpecializedName:", || {
+                d.setSpecializedName(Some(&specialized))
+            });
+        }
         msg::send("newFunctionWithDescriptor:error:", Policy::Caught, || {
             l.newFunctionWithDescriptor_error(&d).ok()
         })
@@ -1597,16 +1604,70 @@ mod tests {
         let k = kit();
         let lib = library(&k.device);
         let f = lib
-            .new_function_with_options(OnFault::Return, "k", &[], 1)
+            .new_function_with_options(OnFault::Return, "k", &[], 1, None)
             .unwrap()
             .unwrap();
         assert_eq!(f.get().options(), MTLFunctionOptions::CompileToBinary);
         assert_eq!(f.get().name().to_string(), "k");
         assert!(
-            lib.new_function_with_options(OnFault::Return, "nope", &[], 1)
+            lib.new_function_with_options(OnFault::Return, "nope", &[], 1, None)
                 .unwrap()
                 .is_none()
         );
+    }
+
+    /// A function made with a specialized name answers that name, and a kernel that calls a
+    /// visible function of that name links it as a private function; the same function made
+    /// under its own name leaves the call unresolved, and the pipeline refused
+    #[test]
+    fn a_specialized_name_resolves_a_kernel_s_call() {
+        use objc2_foundation::NSString;
+        use reims_vgpu_core::platform::device::GpuDevice as _;
+        use reims_vgpu_core::platform::values::{FullComputePipelineDesc, LinkedFunctionsDesc};
+        let k = kit();
+        let source = |src: &str| -> MetalLibrary {
+            Obj::from_retained(
+                k.device
+                    .get()
+                    .newLibraryWithSource_options_error(&NSString::from_str(src), None)
+                    .unwrap(),
+            )
+        };
+        let caller = source(
+            "[[visible]] int custom_fn(int x);\n\
+             kernel void caller(device int *o [[buffer(0)]]) { o[0] = custom_fn(o[0]); }",
+        );
+        let callee = source("[[visible]] int impl_fn(int x) { return x + 1; }");
+        let kernel = function(&caller, "caller");
+        let pipeline = |linked: MetalFunction| {
+            k.device
+                .new_compute_pipeline_state_full(&FullComputePipelineDesc {
+                    label: None,
+                    function: &kernel,
+                    threadgroup_size_is_multiple_of_execution_width: false,
+                    max_total_threads_per_threadgroup: 0,
+                    max_call_stack_depth: 1,
+                    support_indirect_command_buffers: false,
+                    stage_input: None,
+                    linked: LinkedFunctionsDesc {
+                        private_functions: vec![linked],
+                        ..LinkedFunctionsDesc::default()
+                    },
+                })
+        };
+        let specialized = callee
+            .new_function_with_options(OnFault::Return, "impl_fn", &[], 0, Some("custom_fn"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(specialized.get().name().to_string(), "custom_fn");
+        assert!(matches!(pipeline(specialized), Ok(Some(_))));
+        let plain = callee
+            .new_function_with_options(OnFault::Return, "impl_fn", &[], 0, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(plain.get().name().to_string(), "impl_fn");
+        let refused = pipeline(plain);
+        assert!(matches!(refused, Err(_)), "{refused:?}");
     }
 
     /// The pipeline getters agree with objc2-metal's

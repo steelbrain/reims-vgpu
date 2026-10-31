@@ -555,8 +555,8 @@ namespace {
 
 /// Appends `count` linked functions to a pipeline create's tail through `append`
 /// (which answers the byte offset from the message start of what it appended): each
-/// one's name, constants and group name, then their RgfxLinkedFunction records, whose
-/// offset it answers.
+/// one's name, constants, group name and specialized name, then their
+/// RgfxLinkedFunction records, whose offset it answers.
 template <typename Append>
 uint32_t appendLinkedFunctions(Append &append, const RgfxLinkedFunctionRef *refs, uint32_t count)
 {
@@ -578,6 +578,11 @@ uint32_t appendLinkedFunctions(Append &append, const RgfxLinkedFunctionRef *refs
 			const uint32_t glen = static_cast<uint32_t>(std::strlen(r.group));
 			m.group_offset = append(r.group, glen);
 			m.group_len = glen;
+		}
+		if (r.specialized_name != nullptr) {
+			const uint32_t slen = static_cast<uint32_t>(std::strlen(r.specialized_name));
+			m.specialized_name_offset = append(r.specialized_name, slen);
+			m.specialized_name_len = slen;
 		}
 	}
 	return append(records.data(), count * sizeof(RgfxLinkedFunction));

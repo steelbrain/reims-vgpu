@@ -80,6 +80,15 @@ NS_ASSUME_NONNULL_BEGIN
 /// from (`newFunctionWithDescriptor:`). A function made by name answers none.
 - (void)rgfxSetOptions:(MTLFunctionOptions)options;
 
+/// Sets the descriptor's `specializedName` (`newFunctionWithDescriptor:`): the name `name`
+/// answers, and the one a pipeline that links the function resolves references to it by
+/// (measured on an M3 Max, macOS 27.0.1). The entry point stays the one it was made from.
+- (void)rgfxSetSpecializedName:(NSString *)specializedName;
+
+/// The specialized name as a NUL-terminated C string valid for the function's lifetime;
+/// null where the function was made with none.
+- (nullable const char *)rgfxSpecializedNameUTF8;
+
 /// The 32 bytes of a function's bitcode hash (bitCodeHash), as the runtime's SPI types it.
 typedef struct {
 	uint8_t bytes[32];

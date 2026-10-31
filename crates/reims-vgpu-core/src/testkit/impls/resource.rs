@@ -708,9 +708,14 @@ impl Library<FakePlatform> for Fk<kind::Library> {
         function_name: &str,
         constants: &[crate::platform::resource::FunctionConstant],
         options: u64,
+        specialized_name: Option<&str>,
     ) -> RaiseResult<Option<<FakePlatform as Platform>::Function>> {
-        let name = function_name.to_owned();
-        let mut args = vec![Arg::Str(function_name.to_owned()), Arg::U64(options)];
+        let name = specialized_name.unwrap_or(function_name).to_owned();
+        let mut args = vec![
+            Arg::Str(function_name.to_owned()),
+            Arg::U64(options),
+            Arg::Str(specialized_name.unwrap_or_default().to_owned()),
+        ];
         for c in constants {
             args.push(Arg::U64(u64::from(c.index)));
             args.push(Arg::U64(u64::from(c.data_type)));
