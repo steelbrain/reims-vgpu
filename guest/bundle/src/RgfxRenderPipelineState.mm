@@ -79,6 +79,16 @@ bool fillFunctionRef(RgfxFunctionRef &fr, id<MTLFunction> fn)
 		return nil;
 	}
 
+	NSError *unspecialised =
+	    [RgfxFunction rgfxUnspecialisedError:descriptor.vertexFunction role:@"vertexFunction"]
+	        ?: [RgfxFunction rgfxUnspecialisedError:descriptor.fragmentFunction
+	                                           role:@"fragmentFunction"];
+	if (unspecialised != nil) {
+		if (error)
+			*error = unspecialised;
+		return nil;
+	}
+
 	RgfxRenderPipelineParams p = {};
 	if (!fillFunctionRef(p.vertex, descriptor.vertexFunction) ||
 	    !fillFunctionRef(p.fragment, descriptor.fragmentFunction)) {

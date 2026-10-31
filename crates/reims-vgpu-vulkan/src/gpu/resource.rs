@@ -2055,8 +2055,8 @@ impl Library<VulkanPlatform> for VulkanLibrary {
     }
 
     /// The runtime's `newFunctionWithName:constantValues:error:`: each constant by its index.
-    /// A constant whose type the runtime does not know, or wider than its eight inline bytes,
-    /// answers nil, as a refused specialisation.
+    /// A constant whose type the runtime does not know, or no function constant takes, answers
+    /// nil, as a refused specialisation.
     fn new_function_with_constants(
         &self,
         _on: OnFault,
@@ -2079,7 +2079,7 @@ impl Library<VulkanPlatform> for VulkanLibrary {
             };
             values = values.with_index(
                 c.index,
-                metal2vulkan::library::FunctionConstantValue::new(ty, bytes),
+                metal2vulkan::library::FunctionConstantValue::new(ty, bytes.to_vec()),
             );
         }
         crate::gpu::timing::creation(

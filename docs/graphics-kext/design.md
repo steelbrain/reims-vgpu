@@ -139,6 +139,16 @@ Stages:
    descriptor and function constants. The host takes no keys or reflection
    from the guest, and answers once translation finishes, without waiting
    for the driver's compile.
+   - The bundle resolves a function's constant values as Metal does, against
+     the constants the library's own bytes declare (each function's `CNST`
+     table): a value set at a constant's index (by index or by range) wins,
+     else the one set under its name; values for constants the function does
+     not declare are ignored; a value of another type than its constant's
+     fails the function with Metal's error; a required constant with no value
+     reads 0, and an optional one stays undefined. Each pipeline create
+     carries one record per constant given a value, by index, with up to 32
+     bytes (a `long4`). A function made with no values builds no pipeline:
+     Metal asserts there, and the bundle refuses it.
 9. **Synchronization.** The bundle sends Metal's own semantics exactly:
    tracking modes, resource usage, `useResource`/`useHeap`, memory barriers,
    fences and events. The host derives the Vulkan barriers. Shared-event

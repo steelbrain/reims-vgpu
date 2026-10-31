@@ -4,6 +4,8 @@
 
 #import "RgfxFunction.h"
 
+#import "RgfxMetalError.h"
+
 #include <CommonCrypto/CommonDigest.h>
 
 #include <cstring>
@@ -12,6 +14,7 @@
 
 @implementation RgfxFunction {
 	RgfxResource *_library; // kept alive: a pipeline made from the function names it
+	NSDictionary<NSString *, MTLFunctionConstant *> *_unspecialised; // declared, with no values
 	uint64_t _libraryObjId;
 	std::string _name;                          // the entry point, owned
 	std::vector<RgfxFunctionConstant> _constants; // specialisation constants, owned
@@ -112,6 +115,30 @@
 	return &_hash;
 }
 
+- (void)rgfxSetUnspecialisedConstants:(NSDictionary<NSString *, MTLFunctionConstant *> *)declared
+{
+	_unspecialised = declared.count ? [declared copy] : nil;
+}
+
+- (BOOL)rgfxUnspecialised
+{
+	return _unspecialised != nil;
+}
+
++ (NSError *)rgfxUnspecialisedError:(id<MTLFunction>)function role:(NSString *)role
+{
+	if (![(id)function isKindOfClass:[RgfxFunction class]] ||
+	    ![(RgfxFunction *)function rgfxUnspecialised])
+		return nil;
+	// Metal asserts here (measured: macOS 27 Metal, compute and render, with or without its
+	// validation layer); the lane ends no process on its input, so the pipeline is refused.
+	NSString *what = [NSString
+	    stringWithFormat:@"%@ %@ cannot be used to build a pipeline state. Use "
+	                     @"newFunctionWithName:constantValues:... to get the specialized function",
+	                     role, function.name];
+	return RgfxMakeError(RgfxMetalErrorInvalidDescriptor, what);
+}
+
 // --- MTLFunction -------------------------------------------------------------
 
 - (NSString *)name
@@ -135,9 +162,9 @@
 
 - (NSDictionary<NSString *, MTLFunctionConstant *> *)functionConstantsDictionary
 {
-	// The function's constant table lives in the AIR the host compiles; the shell
-	// does not read it, so it reports none.
-	return @{};
+	// The constants the library's table declares, for a function made with no values; none
+	// for one specialised by values, as Metal answers (measured: macOS 27 Metal).
+	return _unspecialised ?: @{};
 }
 
 - (NSArray<MTLVertexAttribute *> *)vertexAttributes

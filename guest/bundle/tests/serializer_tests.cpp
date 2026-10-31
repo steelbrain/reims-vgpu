@@ -622,8 +622,9 @@ void test_pipeline_messages()
 	// A compute pipeline specialised by one function constant.
 	RgfxFunctionConstant k = {};
 	k.index = 2;
-	k.data_type = 30; // Bool
-	k.value = 1;
+	k.data_type = 84; // Long4, the widest
+	for (size_t i = 0; i < sizeof(k.value); i++)
+		k.value[i] = static_cast<uint8_t>(i + 1);
 	RgfxComputePipelineParams cp = {};
 	cp.function.library = 10;
 	cp.function.entry_point = "cmain";
@@ -645,7 +646,8 @@ void test_pipeline_messages()
 	CHECK(cc.constant_count == 1);
 	RgfxFunctionConstant gotK;
 	std::memcpy(&gotK, bytes.data() + cc.constants_offset, sizeof(gotK));
-	CHECK(gotK.index == 2 && gotK.data_type == 30 && gotK.value == 1);
+	CHECK(gotK.index == 2 && gotK.data_type == 84);
+	CHECK(std::memcmp(gotK.value, k.value, sizeof(k.value)) == 0);
 	CHECK(cc.max_total_threads_per_threadgroup == 256);
 
 	// The host's reflection reply, matched to the create by its seqno: built as

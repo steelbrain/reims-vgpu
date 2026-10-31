@@ -1512,23 +1512,27 @@ pub const RGFX_COMPUTE_PIPELINE_TG_MULTIPLE_OF_EXEC_WIDTH: u32 = 1 << 0;
 /// [`RgfxComputePipelineCreate`] `flags`: `supportIndirectCommandBuffers`.
 pub const RGFX_COMPUTE_PIPELINE_SUPPORT_ICB: u32 = 1 << 1;
 
-/// One function-constant value a pipeline specialises its function with
-/// (`MTLFunctionConstantValues`, by index). `value` holds the constant's raw
-/// bits; a scalar or small vector up to eight bytes fits inline (a larger value
-/// is a gap the host would flag rather than guess). The constant is keyed by
-/// `index`; name-keyed constants are resolved to an index by the guest before it
-/// serialises.
+/// The bytes of [`RgfxFunctionConstant::value`]: the widest constant's, a `long4` or `ulong4`.
+pub const RGFX_FUNCTION_CONSTANT_VALUE_BYTES: usize = 32;
+
+/// One function-constant value a pipeline specialises its function with, by the
+/// constant's index. The guest resolves every value its process set on the
+/// `MTLFunctionConstantValues` (by index, by range or by name) against the
+/// function's own constants, as Metal does, and sends one record for each of the
+/// function's constants it gives a value: the function's constants it declares
+/// and nothing else.
 #[repr(C)]
 #[derive(
     Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
 )]
 pub struct RgfxFunctionConstant {
-    /// The constant's index (`constantValues.setConstantValue:type:atIndex:`).
+    /// The constant's index (`[[function_constant(index)]]`).
     pub index: u32,
-    /// `MTLDataType` of the constant's value.
+    /// `MTLDataType` of the constant's value, which is the constant's own type.
     pub data_type: u32,
-    /// The constant's value, its raw little-endian bits, zero-extended.
-    pub value: u64,
+    /// The value's bytes, packed as the type's lanes are (a `float3` is 12 bytes), from the
+    /// first; the rest are zero.
+    pub value: [u8; RGFX_FUNCTION_CONSTANT_VALUE_BYTES],
 }
 
 /// One colour attachment of a render pipeline
@@ -1788,7 +1792,7 @@ const _: () = {
         RGFX_DEVICE_INFO_OFFSET + size_of::<RgfxDeviceInfo>() as u64 <= RGFX_ALLOCATIONS_OFFSET
     );
     // Pipeline creates and reflection.
-    assert!(size_of::<RgfxFunctionConstant>() == 16);
+    assert!(size_of::<RgfxFunctionConstant>() == 40);
     assert!(size_of::<RgfxColorAttachmentDesc>() == 40);
     assert!(size_of::<RgfxVertexBufferLayout>() == 16);
     assert!(size_of::<RgfxVertexAttribute>() == 16);
@@ -2045,8 +2049,8 @@ mod tests {
         // A function constant and the reflection reply.
         let k = RgfxFunctionConstant {
             index: 3,
-            data_type: 30, // Bool
-            value: 1,
+            data_type: 84, // Long4
+            value: core::array::from_fn(|i| i as u8 + 1),
         };
         assert_eq!(
             RgfxFunctionConstant::read_from_bytes(k.as_bytes()).unwrap(),

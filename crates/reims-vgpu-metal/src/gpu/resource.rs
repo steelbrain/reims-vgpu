@@ -589,7 +589,7 @@ impl reims_vgpu_core::platform::resource::Library<MetalPlatform> for MetalLibrar
     }
 
     /// Metal's `newFunctionWithName:constantValues:error:`, each constant set by its index. A
-    /// constant wider than its eight inline bytes, or an `NSError`, answers nil.
+    /// constant of a type no function constant takes, or an `NSError`, answers nil.
     fn new_function_with_constants(
         &self,
         _on: OnFault,

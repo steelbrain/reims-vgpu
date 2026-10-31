@@ -292,31 +292,42 @@ pub struct FunctionConstant {
     pub index: u32,
     /// `MTLDataType` of the value.
     pub data_type: u32,
-    /// The value's raw little-endian bits, zero-extended to eight bytes.
-    pub value: u64,
+    /// The value's bytes, packed as its type's lanes are, from the first; the rest are zero.
+    pub value: [u8; FunctionConstant::MAX_BYTES],
 }
 
 impl FunctionConstant {
-    /// The value's bytes, as many as `data_type` holds: `None` for a type wider than eight
-    /// bytes, or not a scalar or small vector of one.
-    pub fn bytes(&self) -> Option<Vec<u8>> {
-        // `MTLDataType` raw values (Metal's MTLDataType.h).
-        let len = match self.data_type {
-            // Bool, Char, UChar
-            53 | 45 | 49 => 1,
-            // Bool2, Char2, UChar2, Short, UShort, Half
-            54 | 46 | 50 | 37 | 41 | 16 => 2,
-            // Bool3, Char3, UChar3
-            55 | 47 | 51 => 3,
-            // Bool4, Char4, UChar4, Short2, UShort2, Half2, Int, UInt, Float
-            56 | 48 | 52 | 38 | 42 | 17 | 29 | 33 | 3 => 4,
-            // Short3, UShort3, Half3
-            39 | 43 | 18 => 6,
-            // Short4, UShort4, Half4, Int2, UInt2, Float2, Long, ULong
-            40 | 44 | 19 | 30 | 34 | 4 | 81 | 85 => 8,
+    /// The widest value's bytes: a `long4`'s or `ulong4`'s.
+    pub const MAX_BYTES: usize = 32;
+
+    /// The packed size of a function constant of `MTLDataType` `data_type` (a `float3` is 12
+    /// bytes): `None` for a type no function constant takes, which is a scalar or vector of
+    /// `bool`, `char`, `uchar`, `short`, `ushort`, `int`, `uint`, `long`, `ulong`, `half` or
+    /// `float` (Metal's compiler refuses the rest, `bfloat` among them).
+    pub fn size_of(data_type: u32) -> Option<usize> {
+        // `MTLDataType` raw values (Metal's MTLDataType.h): each family's scalar, then its two-,
+        // three- and four-lane vectors, numbered in a row.
+        let (lane, lanes) = match data_type {
+            3..=6 => (4, data_type - 2),    // Float
+            16..=19 => (2, data_type - 15), // Half
+            29..=32 => (4, data_type - 28), // Int
+            33..=36 => (4, data_type - 32), // UInt
+            37..=40 => (2, data_type - 36), // Short
+            41..=44 => (2, data_type - 40), // UShort
+            45..=48 => (1, data_type - 44), // Char
+            49..=52 => (1, data_type - 48), // UChar
+            53..=56 => (1, data_type - 52), // Bool
+            81..=84 => (8, data_type - 80), // Long
+            85..=88 => (8, data_type - 84), // ULong
             _ => return None,
         };
-        self.value.to_le_bytes().get(..len).map(<[u8]>::to_vec)
+        Some(lane * lanes as usize)
+    }
+
+    /// The value's bytes, as many as `data_type` packs: `None` for a type no function constant
+    /// takes ([`Self::size_of`]).
+    pub fn bytes(&self) -> Option<&[u8]> {
+        Self::size_of(self.data_type).and_then(|n| self.value.get(..n))
     }
 }
 
@@ -337,4 +348,46 @@ pub trait Library<P: Platform>: Handle {
         function_name: &str,
         constants: &[FunctionConstant],
     ) -> RaiseResult<Option<P::Function>>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FunctionConstant;
+
+    /// A function constant's packed size follows its type's lanes, a `long4` the widest, and a
+    /// type no function constant takes has none (the sizes Apple's compiler gives the `CNST` table
+    /// of a library of such constants)
+    #[test]
+    fn a_function_constant_packs_its_lanes() {
+        let sizes = [
+            (53, 1),  // Bool
+            (55, 3),  // Bool3
+            (16, 2),  // Half
+            (18, 6),  // Half3
+            (3, 4),   // Float
+            (5, 12),  // Float3
+            (6, 16),  // Float4
+            (32, 16), // Int4
+            (85, 8),  // ULong
+            (84, 32), // Long4
+        ];
+        for (data_type, size) in sizes {
+            assert_eq!(
+                FunctionConstant::size_of(data_type),
+                Some(size),
+                "{data_type}"
+            );
+        }
+        for data_type in [0, 1, 7, 57, 60, 121] {
+            assert_eq!(FunctionConstant::size_of(data_type), None, "{data_type}");
+        }
+        let mut c = FunctionConstant {
+            index: 1,
+            data_type: 5,
+            value: [7; FunctionConstant::MAX_BYTES],
+        };
+        assert_eq!(c.bytes(), Some(&[7u8; 12][..]));
+        c.data_type = 121; // BFloat
+        assert_eq!(c.bytes(), None);
+    }
 }

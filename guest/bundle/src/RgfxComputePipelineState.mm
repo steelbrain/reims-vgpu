@@ -120,6 +120,11 @@ bool fillComputeParams(RgfxComputePipelineParams &p, id<MTLFunction> fn, uint32_
 			*error = RgfxMakeError(RgfxMetalErrorNoRoute, @"compute pipeline: no serialiser route");
 		return nil;
 	}
+	if (NSError *unspecialised = [RgfxFunction rgfxUnspecialisedError:function role:@"function"]) {
+		if (error)
+			*error = unspecialised;
+		return nil;
+	}
 	RgfxComputePipelineParams p = {};
 	std::string nameStore;
 	if (!fillComputeParams(p, function, flags, maxTotalThreads, nameStore)) {

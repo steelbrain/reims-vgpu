@@ -692,7 +692,7 @@ impl Library<FakePlatform> for Fk<kind::Library> {
         for c in constants {
             args.push(Arg::U64(u64::from(c.index)));
             args.push(Arg::U64(u64::from(c.data_type)));
-            args.push(Arg::U64(c.value));
+            args.push(Arg::Bytes(c.value.to_vec()));
         }
         self.make(
             Policy::On(on),

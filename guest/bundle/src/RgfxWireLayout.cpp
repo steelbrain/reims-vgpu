@@ -50,7 +50,7 @@ static_assert(__builtin_offsetof(RgfxDeviceInfo, family_answers) == 944,
 static_assert(__builtin_offsetof(RgfxDeviceInfo, name) == 1080, "RgfxDeviceInfo name");
 
 // Stage-3 pipeline creates and reflection.
-static_assert(sizeof(RgfxFunctionConstant) == 16, "RgfxFunctionConstant");
+static_assert(sizeof(RgfxFunctionConstant) == 40, "RgfxFunctionConstant");
 static_assert(sizeof(RgfxColorAttachmentDesc) == 40, "RgfxColorAttachmentDesc");
 static_assert(sizeof(RgfxVertexBufferLayout) == 16, "RgfxVertexBufferLayout");
 static_assert(sizeof(RgfxVertexAttribute) == 16, "RgfxVertexAttribute");

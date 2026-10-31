@@ -1,7 +1,7 @@
 /*
  * RgfxLibrary: see RgfxLibrary.h. Our own ObjC++; no Apple private SPI except the
- * read-only accessors of MTLFunctionConstantValues' indexed constants, called only
- * when the object answers them.
+ * read-only accessors of MTLFunctionConstantValues' indexed and named constants,
+ * called only when the object answers them.
  */
 
 #import "RgfxLibrary.h"
@@ -12,23 +12,30 @@
 #import "RgfxMetalError.h"
 
 #include <cstring>
+#include <map>
 #include <mutex>
 #include <unistd.h>
 #include <string>
 #include <vector>
 
+#include "RgfxFunctionConstants.hpp"
 #include "RgfxRegion.hpp"
 #include "RgfxSerializer.hpp"
 
 namespace {
 
-// One entry of a .metallib's function list: the entry point, its stage, and its HASH tag (the
-// SHA-256 of its bitcode) when the entry has one.
+// One entry of a .metallib's function list: the entry point, its stage, its HASH tag (the
+// SHA-256 of its bitcode) when the entry has one, and the constants its public metadata declares
+// (`haveConstants` where that table was read).
 struct MetallibFunction {
 	std::string name;
 	MTLFunctionType type;
-	bool hasHash;
-	uint8_t hash[32];
+	bool hasHash = false;
+	uint8_t hash[32] = {};
+	uint64_t publicOffset = 0; // into the public metadata section (OFFT's first field)
+	bool haveOffsets = false;
+	std::vector<RgfxConstantDecl> constants;
+	bool haveConstants = false;
 };
 
 uint16_t rd16(const uint8_t *p)
@@ -70,7 +77,8 @@ MTLFunctionType metallibStage(uint8_t t)
 
 // Reads a .metallib's function list: the header's function-list offset (at 0x18),
 // a u32 count, then per function a u32 group size (counting itself) and its tags,
-// each a 4-byte name, a u16 size and the data, up to `ENDT`. Answers false, leaving
+// each a 4-byte name, a u16 size and the data, up to `ENDT`; then each function's
+// constants, from the public metadata its OFFT tag places. Answers false, leaving
 // `out` empty, when the bytes are not a .metallib or the list runs past them.
 bool readMetallibFunctions(const uint8_t *p, size_t n, std::vector<MetallibFunction> &out)
 {
@@ -90,7 +98,8 @@ bool readMetallibFunctions(const uint8_t *p, size_t n, std::vector<MetallibFunct
 			return false;
 		const uint64_t end = q + group;
 		uint64_t t = q + 4;
-		MetallibFunction f{ std::string(), MTLFunctionTypeVisible, false, {} };
+		MetallibFunction f;
+		f.type = MTLFunctionTypeVisible;
 		while (end - t >= 4) {
 			if (std::memcmp(p + t, "ENDT", 4) == 0)
 				break;
@@ -107,98 +116,20 @@ bool readMetallibFunctions(const uint8_t *p, size_t n, std::vector<MetallibFunct
 			else if (std::memcmp(p + t, "HASH", 4) == 0 && size == sizeof(f.hash)) {
 				std::memcpy(f.hash, data, sizeof(f.hash));
 				f.hasHash = true;
+			} else if (std::memcmp(p + t, "OFFT", 4) == 0 && size >= 8) {
+				f.publicOffset = rd64(data);
+				f.haveOffsets = true;
 			}
 			t += 6 + static_cast<uint64_t>(size);
 		}
-		if (!f.name.empty())
+		if (!f.name.empty()) {
+			if (f.haveOffsets)
+				f.haveConstants = rgfxReadConstantTable(p, n, f.publicOffset, f.constants);
 			out.push_back(std::move(f));
+		}
 		q = end;
 	}
 	return true;
-}
-
-// The byte size of a constant of `type` that fits the wire's inline value (at most
-// eight bytes); 0 for a type the wire cannot carry inline.
-uint32_t inlineConstantSize(MTLDataType type)
-{
-	switch (type) {
-	case MTLDataTypeBool:
-	case MTLDataTypeChar:
-	case MTLDataTypeUChar:
-		return 1;
-	case MTLDataTypeBool2:
-	case MTLDataTypeChar2:
-	case MTLDataTypeUChar2:
-	case MTLDataTypeShort:
-	case MTLDataTypeUShort:
-	case MTLDataTypeHalf:
-		return 2;
-	case MTLDataTypeBool3:
-	case MTLDataTypeChar3:
-	case MTLDataTypeUChar3:
-		return 3;
-	case MTLDataTypeBool4:
-	case MTLDataTypeChar4:
-	case MTLDataTypeUChar4:
-	case MTLDataTypeShort2:
-	case MTLDataTypeUShort2:
-	case MTLDataTypeHalf2:
-	case MTLDataTypeInt:
-	case MTLDataTypeUInt:
-	case MTLDataTypeFloat:
-		return 4;
-	case MTLDataTypeShort3:
-	case MTLDataTypeUShort3:
-	case MTLDataTypeHalf3:
-		return 6;
-	case MTLDataTypeShort4:
-	case MTLDataTypeUShort4:
-	case MTLDataTypeHalf4:
-	case MTLDataTypeInt2:
-	case MTLDataTypeUInt2:
-	case MTLDataTypeFloat2:
-	case MTLDataTypeLong:
-	case MTLDataTypeULong:
-		return 8;
-	default:
-		return 0;
-	}
-}
-
-// The index-keyed constants set on `values`, read through the object's own
-// `newIndexedConstantArray` (each element answering `index`, `dataType` and `data`).
-// Constants set by name, and values wider than the wire's inline eight bytes, are
-// not carried. measured: macOS 27 Metal
-// (MTLFunctionConstantValuesInternal, MTLIndexedConstantValue).
-std::vector<RgfxFunctionConstant> indexedConstants(MTLFunctionConstantValues *values)
-{
-	std::vector<RgfxFunctionConstant> out;
-	if (values == nil)
-		return out;
-	SEL indexedSel = sel_registerName("newIndexedConstantArray");
-	if (![values respondsToSelector:indexedSel])
-		return out;
-	NSArray *indexed = ((NSArray * (*)(id, SEL)) objc_msgSend)(values, indexedSel);
-	SEL indexSel = sel_registerName("index");
-	SEL typeSel = sel_registerName("dataType");
-	SEL dataSel = sel_registerName("data");
-	for (id c in indexed) {
-		if (![c respondsToSelector:indexSel] || ![c respondsToSelector:typeSel] ||
-		    ![c respondsToSelector:dataSel])
-			continue;
-		NSUInteger index = ((NSUInteger(*)(id, SEL))objc_msgSend)(c, indexSel);
-		MTLDataType type = static_cast<MTLDataType>(((NSUInteger(*)(id, SEL))objc_msgSend)(c, typeSel));
-		const void *data = ((const void *(*)(id, SEL))objc_msgSend)(c, dataSel);
-		uint32_t size = inlineConstantSize(type);
-		if (size == 0 || data == nullptr)
-			continue;
-		RgfxFunctionConstant k = {};
-		k.index = static_cast<uint32_t>(index);
-		k.data_type = static_cast<uint32_t>(type);
-		std::memcpy(&k.value, data, size);
-		out.push_back(k);
-	}
-	return out;
 }
 
 // The process's staging window for streamed libraries: two blocks of the device
@@ -293,7 +224,108 @@ bool streamLibrary(RgfxRegion &region, RgfxSerializer &ser, const uint8_t *bytes
 	return true;
 }
 
+// An `NSArray` a `new`-family SPI hands back, retained.
+using NewArrayFn = NSArray *__attribute__((ns_returns_retained)) (*)(id, SEL);
+
+// The values set on `values`, by index (by index or by range, one per index, the last set) and by
+// name, read through the object's own `newIndexedConstantArray` and `newNamedConstantArray` (each
+// element answering `index` or `name`, `dataType` and `data`), each value's bytes as many as its
+// type packs. measured: macOS 27 Metal (MTLFunctionConstantValuesInternal, MTLIndexedConstantValue,
+// MTLNamedConstantValue; a range is one indexed value per index). nil sets none.
+void readConstantValues(MTLFunctionConstantValues *values, std::map<uint32_t, RgfxConstantValue> &byIndex,
+                    std::map<std::string, RgfxConstantValue> &byName)
+{
+	byIndex.clear();
+	byName.clear();
+	if (values == nil)
+		return;
+	SEL typeSel = sel_registerName("dataType");
+	SEL dataSel = sel_registerName("data");
+	SEL indexSel = sel_registerName("index");
+	auto value = [&](id c, RgfxConstantValue *out) {
+		if (![c respondsToSelector:typeSel] || ![c respondsToSelector:dataSel])
+			return false;
+		out->type = static_cast<uint32_t>(((NSUInteger(*)(id, SEL))objc_msgSend)(c, typeSel));
+		const void *data = ((const void *(*)(id, SEL))objc_msgSend)(c, dataSel);
+		const uint32_t size = rgfxConstantSize(out->type);
+		if (data != nullptr && size != 0) {
+			const uint8_t *b = static_cast<const uint8_t *>(data);
+			out->bytes.assign(b, b + size);
+		}
+		return true;
+	};
+	SEL indexedSel = sel_registerName("newIndexedConstantArray");
+	if ([values respondsToSelector:indexedSel]) {
+		NSArray *indexed = ((NewArrayFn)objc_msgSend)(values, indexedSel);
+		for (id c in indexed) {
+			RgfxConstantValue v;
+			if ([c respondsToSelector:indexSel] && value(c, &v)) {
+				NSUInteger index = ((NSUInteger(*)(id, SEL))objc_msgSend)(c, indexSel);
+				byIndex[static_cast<uint32_t>(index)] = std::move(v);
+			}
+		}
+	}
+	SEL namedSel = sel_registerName("newNamedConstantArray");
+	if ([values respondsToSelector:namedSel]) {
+		NSArray *named = ((NewArrayFn)objc_msgSend)(values, namedSel);
+		for (id c in named) {
+			RgfxConstantValue v;
+			if ([c respondsToSelector:@selector(name)] && value(c, &v)) {
+				NSString *name = [c name];
+				if (name.UTF8String != nullptr)
+					byName[name.UTF8String] = std::move(v);
+			}
+		}
+	}
+}
+
 } // namespace
+
+// One constant a function declares, as `functionConstantsDictionary` answers it.
+@interface RgfxDeclaredConstant : MTLFunctionConstant
+- (instancetype)initWithDecl:(const RgfxConstantDecl &)decl;
+@end
+
+@implementation RgfxDeclaredConstant {
+	NSString *_name;
+	MTLDataType _type;
+	NSUInteger _index;
+	BOOL _required;
+}
+
+- (instancetype)initWithDecl:(const RgfxConstantDecl &)decl
+{
+	self = [super init];
+	if (self) {
+		_name = [NSString stringWithUTF8String:decl.name.c_str()] ?: @"";
+		_type = static_cast<MTLDataType>(decl.type);
+		_index = decl.index;
+		_required = decl.required ? YES : NO;
+	}
+	return self;
+}
+
+- (NSString *)name
+{
+	return _name;
+}
+
+- (MTLDataType)type
+{
+	return _type;
+}
+
+- (NSUInteger)index
+{
+	return _index;
+}
+
+- (BOOL)required
+{
+	return _required;
+}
+
+@end
 
 @implementation RgfxLibrary {
 	std::vector<MetallibFunction> _functions; // the .metallib's function list
@@ -438,28 +470,80 @@ static bool rgfxMade(uint32_t status)
 	return fn;
 }
 
+// The NSError Metal answers for a name the library does not hold.
+static NSError *rgfxFunctionNotFound(NSString *name)
+{
+	NSString *what = [NSString stringWithFormat:@"Function %@ was not found in the library", name];
+	return [NSError errorWithDomain:MTLLibraryErrorDomain
+	                           code:MTLLibraryErrorFunctionNotFound
+	                       userInfo:@{NSLocalizedDescriptionKey : what}];
+}
+
 // --- MTLLibrary --------------------------------------------------------------
 
 - (id<MTLFunction>)newFunctionWithName:(NSString *)functionName
 {
-	return [self rgfxFunctionNamed:functionName constants:{}];
+	RgfxFunction *fn = (RgfxFunction *)[self rgfxFunctionNamed:functionName constants:{}];
+	const MetallibFunction *entry = fn ? [self rgfxEntryNamed:functionName] : nullptr;
+	if (entry != nullptr && entry->haveConstants && !entry->constants.empty()) {
+		NSMutableDictionary<NSString *, MTLFunctionConstant *> *declared =
+		    [NSMutableDictionary dictionaryWithCapacity:entry->constants.size()];
+		for (const RgfxConstantDecl &d : entry->constants) {
+			RgfxDeclaredConstant *c = [[RgfxDeclaredConstant alloc] initWithDecl:d];
+			declared[c.name] = c;
+		}
+		[fn rgfxSetUnspecialisedConstants:declared];
+	}
+	return fn;
 }
 
 - (id<MTLFunction>)newFunctionWithName:(NSString *)name
                         constantValues:(MTLFunctionConstantValues *)constantValues
                                  error:(__autoreleasing NSError **)error
 {
-	// Index-keyed constants are carried on the pipeline create's wire. A constant set
-	// by name needs the function's constant table to find its index, which the shell
-	// does not read; such constants are not carried (the host then compiles the
-	// function unspecialised for them).
-	std::vector<RgfxFunctionConstant> constants = indexedConstants(constantValues);
-	id<MTLFunction> fn = [self rgfxFunctionNamed:name constants:constants];
 	if (error)
-		*error = fn ? nil
-		            : RgfxMakeError(RgfxMetalErrorInvalidDescriptor,
-		                            [NSString stringWithFormat:@"no function named %@ in the library", name]);
-	return fn;
+		*error = nil;
+	const MetallibFunction *entry = _haveFunctionTable ? [self rgfxEntryNamed:name] : nullptr;
+	if (name == nil || (_haveFunctionTable && entry == nullptr)) {
+		if (error)
+			*error = rgfxFunctionNotFound(name);
+		return nil;
+	}
+	std::map<uint32_t, RgfxConstantValue> byIndex;
+	std::map<std::string, RgfxConstantValue> byName;
+	readConstantValues(constantValues, byIndex, byName);
+	std::vector<RgfxFunctionConstant> constants;
+	if (entry != nullptr && entry->haveConstants) {
+		// The values resolved against the function's own constants, as Metal resolves them.
+		RgfxConstantMismatch mismatch;
+		if (!rgfxResolveConstants(entry->constants, byIndex, byName, constants, &mismatch)) {
+			const RgfxConstantDecl &d = entry->constants[mismatch.decl];
+			NSString *what = [NSString
+			    stringWithFormat:@"Function %@: constant %s (%u) is of type %s but value found has type %s",
+			                     name, d.name.c_str(), d.index, rgfxDataTypeName(d.type).c_str(),
+			                     rgfxDataTypeName(mismatch.valueType).c_str()];
+			if (error)
+				*error = [NSError errorWithDomain:MTLLibraryErrorDomain
+				                             code:MTLLibraryErrorCompileFailure
+				                         userInfo:@{NSLocalizedDescriptionKey : what}];
+			return nil;
+		}
+	} else {
+		// No table to resolve against (bytes that are no .metallib, or an entry whose
+		// metadata did not read): the values set by index, as set; the host checks them
+		// against the function. Values set by name need the table, and are not carried.
+		for (const auto &[index, v] : byIndex) {
+			if (v.bytes.empty())
+				continue;
+			RgfxFunctionConstant k = {};
+			k.index = index;
+			k.data_type = v.type;
+			std::memcpy(k.value, v.bytes.data(),
+			            v.bytes.size() < sizeof(k.value) ? v.bytes.size() : sizeof(k.value));
+			constants.push_back(k);
+		}
+	}
+	return [self rgfxFunctionNamed:name constants:constants];
 }
 
 - (void)newFunctionWithName:(NSString *)name

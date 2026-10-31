@@ -55,6 +55,7 @@
 #include <thread>
 
 #include "RgfxCompletionThread.hpp"
+#include "RgfxFunctionConstants.hpp"
 #include "RgfxManagedLayout.hpp"
 #include "RgfxObjectModel.hpp"
 #include "RgfxRetirement.hpp"
@@ -974,6 +975,265 @@ void test_compute_pipeline_routing()
 	                                                        error:&err3];
 	CHECK(noFn == nil);
 	CHECK(err3 != nil);
+}
+
+// One function of a test .metallib: its entry point, its stage (the TYPE tag's byte: 0
+// vertex, 1 fragment, 2 kernel) and the constants its public metadata declares.
+struct TestFunction {
+	const char *name;
+	uint8_t stage;
+	std::vector<RgfxConstantDecl> constants;
+};
+
+void put16(std::vector<uint8_t> &v, uint16_t x) { v.insert(v.end(), (uint8_t *)&x, (uint8_t *)&x + 2); }
+void put32(std::vector<uint8_t> &v, uint32_t x) { v.insert(v.end(), (uint8_t *)&x, (uint8_t *)&x + 4); }
+void put64(std::vector<uint8_t> &v, uint64_t x) { v.insert(v.end(), (uint8_t *)&x, (uint8_t *)&x + 8); }
+
+// A tag: its four-character name, a u16 size and the data.
+void putTag(std::vector<uint8_t> &v, const char *name, const std::vector<uint8_t> &data)
+{
+	v.insert(v.end(), name, name + 4);
+	put16(v, static_cast<uint16_t>(data.size()));
+	v.insert(v.end(), data.begin(), data.end());
+}
+
+// A .metallib of `functions` in the layout Apple's compiler writes (measured: macOS 27's
+// `metal`): the header's function list offset and size at 0x18, its public metadata's at 0x28;
+// per function a group of tags (NAME, TYPE, OFFT, whose first field places the function's
+// entry in the public metadata), and per function a public entry (its size, then a CNST tag
+// where it declares constants: a u16 count, then each name, MTLDataType byte, u16 index and
+// required byte). No bitcode: the shell never reads it.
+std::vector<uint8_t> metallibOf(const std::vector<TestFunction> &functions)
+{
+	std::vector<uint8_t> list, pub;
+	put32(list, static_cast<uint32_t>(functions.size()));
+	for (const TestFunction &f : functions) {
+		std::vector<uint8_t> entry;
+		put32(entry, 0);
+		if (!f.constants.empty()) {
+			std::vector<uint8_t> cnst;
+			put16(cnst, static_cast<uint16_t>(f.constants.size()));
+			for (const RgfxConstantDecl &d : f.constants) {
+				cnst.insert(cnst.end(), d.name.begin(), d.name.end());
+				cnst.push_back(0);
+				cnst.push_back(static_cast<uint8_t>(d.type));
+				put16(cnst, static_cast<uint16_t>(d.index));
+				cnst.push_back(d.required ? 1 : 0);
+			}
+			putTag(entry, "CNST", cnst);
+		}
+		entry.insert(entry.end(), { 'E', 'N', 'D', 'T' });
+		uint32_t entrySize = static_cast<uint32_t>(entry.size());
+		std::memcpy(entry.data(), &entrySize, 4);
+		std::vector<uint8_t> group, offt;
+		put32(group, 0);
+		std::vector<uint8_t> name(f.name, f.name + std::strlen(f.name) + 1);
+		putTag(group, "NAME", name);
+		putTag(group, "TYPE", { f.stage });
+		put64(offt, pub.size());
+		put64(offt, 0);
+		put64(offt, 0);
+		putTag(group, "OFFT", offt);
+		group.insert(group.end(), { 'E', 'N', 'D', 'T' });
+		uint32_t groupSize = static_cast<uint32_t>(group.size());
+		std::memcpy(group.data(), &groupSize, 4);
+		list.insert(list.end(), group.begin(), group.end());
+		pub.insert(pub.end(), entry.begin(), entry.end());
+	}
+	std::vector<uint8_t> out(0x58, 0);
+	std::memcpy(out.data(), "MTLB", 4);
+	uint64_t fields[4] = { 0x58, list.size(), 0x58 + list.size(), pub.size() };
+	std::memcpy(out.data() + 0x18, fields, sizeof(fields));
+	out.insert(out.end(), list.begin(), list.end());
+	out.insert(out.end(), pub.begin(), pub.end());
+	return out;
+}
+
+// The constant `function` carries at `index`, or null.
+const RgfxFunctionConstant *constantAt(id<MTLFunction> function, uint32_t index)
+{
+	RgfxFunction *rf = (RgfxFunction *)function;
+	for (uint32_t i = 0; i < [rf rgfxConstantCount]; i++) {
+		if ([rf rgfxConstants][i].index == index)
+			return &[rf rgfxConstants][i];
+	}
+	return nullptr;
+}
+
+// A library's functions are specialised as Metal specialises them: a value set by name or by
+// range reaches its constant's index, an indexed value wins over a named one, values for
+// constants the function does not declare are ignored, a required constant left unset reads 0
+// and an optional one is not defined, and a value of another type than its constant's fails the
+// function with Metal's error. A function made with no values answers its constants and builds
+// no pipeline. (Metal's answers measured on macOS 27.0.1, M3 Max.)
+void test_function_constants_resolve_as_metal()
+{
+	Fixture fx;
+	const std::vector<uint8_t> bytes = metallibOf({
+	    { "frg",
+	      1,
+	      { { "useRed", 53, 0, true }, { "mode", 29, 7, true }, { "opt", 53, 9, false },
+	        { "tint", 6, 11, true } } },
+	    { "knl", 2, { { "scale", 3, 3, true }, { "mode", 29, 7, true } } },
+	    { "plain", 1, {} },
+	});
+	uint32_t status = 0;
+	RgfxLibrary *lib = [RgfxLibrary libraryWithData:bytes.data()
+	                                        length:bytes.size()
+	                                           key:nullptr
+	                                        device:nil
+	                                    serializer:&fx.ser
+	                                        status:&status];
+	CHECK(lib != nil);
+	(void)nextMessage(fx.ring, RGFX_CMD_LIBRARY_CREATE);
+	static const bool yes = true;
+	static const int32_t one = 1, two = 2, three = 3;
+	static const float four[4] = { 1, 2, 3, 4 }, five = 5, nine = 9;
+
+	// By name: each value reaches its constant's index, with its bytes; `opt` is not defined.
+	MTLFunctionConstantValues *named = [MTLFunctionConstantValues new];
+	[named setConstantValue:&yes type:MTLDataTypeBool withName:@"useRed"];
+	[named setConstantValue:&two type:MTLDataTypeInt withName:@"mode"];
+	[named setConstantValue:four type:MTLDataTypeFloat4 withName:@"tint"];
+	NSError *err = nil;
+	id<MTLFunction> frg = [lib newFunctionWithName:@"frg" constantValues:named error:&err];
+	CHECK(frg != nil && err == nil);
+	CHECK([(RgfxFunction *)frg rgfxConstantCount] == 3);
+	const RgfxFunctionConstant *k = constantAt(frg, 0);
+	CHECK(k != nullptr && k->data_type == 53 && k->value[0] == 1);
+	k = constantAt(frg, 7);
+	CHECK(k != nullptr && k->data_type == 29 && std::memcmp(k->value, &two, 4) == 0);
+	k = constantAt(frg, 11);
+	CHECK(k != nullptr && k->data_type == 6 && std::memcmp(k->value, four, 16) == 0);
+	CHECK(constantAt(frg, 9) == nullptr);
+	CHECK(frg.functionConstantsDictionary.count == 0); // specialised: none, as Metal answers
+	CHECK(![(RgfxFunction *)frg rgfxUnspecialised]);
+
+	// A required constant left unset reads 0; the optional one stays undefined.
+	MTLFunctionConstantValues *some = [MTLFunctionConstantValues new];
+	[some setConstantValue:&two type:MTLDataTypeInt atIndex:7];
+	id<MTLFunction> partial = [lib newFunctionWithName:@"frg" constantValues:some error:&err];
+	CHECK(partial != nil && err == nil);
+	CHECK([(RgfxFunction *)partial rgfxConstantCount] == 3);
+	static const uint8_t zeros[RGFX_FUNCTION_CONSTANT_VALUE_BYTES] = {};
+	k = constantAt(partial, 0);
+	CHECK(k != nullptr && k->data_type == 53 && std::memcmp(k->value, zeros, sizeof(zeros)) == 0);
+	k = constantAt(partial, 11);
+	CHECK(k != nullptr && k->data_type == 6 && std::memcmp(k->value, zeros, sizeof(zeros)) == 0);
+	CHECK(constantAt(partial, 9) == nullptr);
+	// nil values specialise with none set.
+	MTLFunctionConstantValues *nilValues = nil; // through a variable: the parameter is nonnull
+	id<MTLFunction> none = [lib newFunctionWithName:@"frg" constantValues:nilValues error:&err];
+	CHECK(none != nil && err == nil && [(RgfxFunction *)none rgfxConstantCount] == 3);
+
+	// By range, an index over a name (whose type is then not checked), and values for
+	// constants the function does not declare, ignored.
+	MTLFunctionConstantValues *mixed = [MTLFunctionConstantValues new];
+	[mixed setConstantValues:&five type:MTLDataTypeFloat withRange:NSMakeRange(3, 1)];
+	[mixed setConstantValue:&nine type:MTLDataTypeFloat withName:@"mode"];
+	[mixed setConstantValue:&one type:MTLDataTypeInt atIndex:7];
+	[mixed setConstantValue:&three type:MTLDataTypeInt withName:@"nosuch"];
+	[mixed setConstantValue:four type:MTLDataTypeBool4 atIndex:30];
+	id<MTLFunction> knl = [lib newFunctionWithName:@"knl" constantValues:mixed error:&err];
+	CHECK(knl != nil && err == nil);
+	CHECK([(RgfxFunction *)knl rgfxConstantCount] == 2);
+	k = constantAt(knl, 3);
+	CHECK(k != nullptr && k->data_type == 3 && std::memcmp(k->value, &five, 4) == 0);
+	k = constantAt(knl, 7);
+	CHECK(k != nullptr && k->data_type == 29 && std::memcmp(k->value, &one, 4) == 0);
+
+	// A value of another type than its constant's: nil, and Metal's error.
+	MTLFunctionConstantValues *wrong = [MTLFunctionConstantValues new];
+	[wrong setConstantValue:&five type:MTLDataTypeFloat atIndex:0];
+	CHECK([lib newFunctionWithName:@"frg" constantValues:wrong error:&err] == nil);
+	CHECK(err != nil && [err.domain isEqualToString:MTLLibraryErrorDomain] &&
+	      err.code == MTLLibraryErrorCompileFailure);
+	CHECK([err.localizedDescription
+	    isEqualToString:@"Function frg: constant useRed (0) is of type MTLDataTypeBool but value "
+	                    @"found has type MTLDataTypeFloat"]);
+	MTLFunctionConstantValues *wrongName = [MTLFunctionConstantValues new];
+	[wrongName setConstantValue:&two type:MTLDataTypeUInt withName:@"mode"];
+	err = nil;
+	CHECK([lib newFunctionWithName:@"knl" constantValues:wrongName error:&err] == nil);
+	CHECK([err.localizedDescription
+	    isEqualToString:@"Function knl: constant mode (7) is of type MTLDataTypeInt but value "
+	                    @"found has type MTLDataTypeUInt"]);
+	static const float span[5] = { 1, 2, 3, 4, 5 };
+	MTLFunctionConstantValues *wideRange = [MTLFunctionConstantValues new];
+	[wideRange setConstantValues:span type:MTLDataTypeFloat withRange:NSMakeRange(3, 5)];
+	err = nil;
+	CHECK([lib newFunctionWithName:@"knl" constantValues:wideRange error:&err] == nil);
+	CHECK(err.code == MTLLibraryErrorCompileFailure);
+	// The completion-handler and descriptor forms answer alike.
+	__block NSError *handed = nil;
+	__block id<MTLFunction> handedFn = nil;
+	[lib newFunctionWithName:@"frg"
+	          constantValues:wrong
+	       completionHandler:^(id<MTLFunction> f, NSError *e) {
+		       handedFn = f;
+		       handed = e;
+	       }];
+	CHECK(handedFn == nil && handed.code == MTLLibraryErrorCompileFailure);
+	MTLFunctionDescriptor *fd = [MTLFunctionDescriptor functionDescriptor];
+	fd.name = @"frg";
+	fd.constantValues = named;
+	id<MTLFunction> described = [lib newFunctionWithDescriptor:fd error:&err];
+	CHECK(described != nil && [(RgfxFunction *)described rgfxConstantCount] == 3);
+	CHECK(constantAt(described, 7) != nullptr);
+	fd.constantValues = nil;
+	described = [lib newFunctionWithDescriptor:fd error:&err];
+	CHECK(described != nil && ![(RgfxFunction *)described rgfxUnspecialised]);
+
+	// A name the library does not hold: Metal's error.
+	err = nil;
+	CHECK([lib newFunctionWithName:@"nosuch" constantValues:named error:&err] == nil);
+	CHECK([err.domain isEqualToString:MTLLibraryErrorDomain] &&
+	      err.code == MTLLibraryErrorFunctionNotFound);
+	CHECK([err.localizedDescription isEqualToString:@"Function nosuch was not found in the library"]);
+
+	// Made with no values: the function answers its constants, and builds no pipeline.
+	id<MTLFunction> unspecialised = [lib newFunctionWithName:@"frg"];
+	CHECK([(RgfxFunction *)unspecialised rgfxUnspecialised]);
+	NSDictionary<NSString *, MTLFunctionConstant *> *table = unspecialised.functionConstantsDictionary;
+	CHECK(table.count == 4);
+	CHECK(table[@"opt"].index == 9 && table[@"opt"].type == MTLDataTypeBool && !table[@"opt"].required);
+	CHECK(table[@"tint"].index == 11 && table[@"tint"].type == MTLDataTypeFloat4 && table[@"tint"].required);
+	id<MTLFunction> plain = [lib newFunctionWithName:@"plain"];
+	CHECK(![(RgfxFunction *)plain rgfxUnspecialised] && plain.functionConstantsDictionary.count == 0);
+	MTLRenderPipelineDescriptor *rd = [[MTLRenderPipelineDescriptor alloc] init];
+	rd.vertexFunction = knl;
+	rd.fragmentFunction = unspecialised;
+	rd.colorAttachments[0].pixelFormat = MTLPixelFormatR16Float;
+	err = nil;
+	CHECK([RgfxRenderPipelineState renderPipelineStateWithDescriptor:rd
+	                                                          device:nil
+	                                                      serializer:&fx.ser
+	                                                           error:&err] == nil);
+	CHECK([err.localizedDescription hasPrefix:@"fragmentFunction frg cannot be used to build a pipeline state."]);
+	err = nil;
+	CHECK([RgfxComputePipelineState computePipelineStateWithFunction:[lib newFunctionWithName:@"knl"]
+	                                                          device:nil
+	                                                      serializer:&fx.ser
+	                                                           error:&err] == nil);
+	CHECK([err.localizedDescription hasPrefix:@"function knl cannot be used to build a pipeline state."]);
+	RgfxMsgHeader h = {};
+	std::vector<uint8_t> posted;
+	CHECK(!fx.ring.next(&h, &posted)); // neither refusal posted a create
+
+	// A specialised pipeline carries its functions' records in its create's tail.
+	rd.fragmentFunction = frg;
+	RgfxRenderPipelineState *ps = [RgfxRenderPipelineState renderPipelineStateWithDescriptor:rd
+	                                                                                  device:nil
+	                                                                              serializer:&fx.ser
+	                                                                                   error:&err];
+	CHECK(ps != nil);
+	auto create = nextMessage(fx.ring, RGFX_CMD_RENDER_PIPELINE_CREATE);
+	RgfxRenderPipelineCreate head;
+	std::memcpy(&head, create.data(), sizeof(head));
+	CHECK(head.vertex_constant_count == 2 && head.fragment_constant_count == 3);
+	RgfxFunctionConstant tint;
+	std::memcpy(&tint, create.data() + head.fragment_constants_offset + 2 * sizeof(tint), sizeof(tint));
+	CHECK(tint.index == 11 && tint.data_type == 6 && std::memcmp(tint.value, four, 16) == 0);
 }
 
 // The argument encoder is a documented stub: it holds its argument count, carries no
@@ -3289,6 +3549,7 @@ int main()
 		test_library_and_function_routing();
 		test_render_pipeline_routing();
 		test_compute_pipeline_routing();
+		test_function_constants_resolve_as_metal();
 		test_argument_encoder_stub();
 		test_command_graph();
 		test_parallel_render_encoder();

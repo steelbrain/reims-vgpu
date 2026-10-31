@@ -85,6 +85,21 @@ typedef struct {
 /// bitcode, valid for the function's life (measured type: r^{?=[32C]}16@0:8).
 - (const RgfxBitCodeHash *)bitCodeHash;
 
+/// Marks the function as made with no constant values (`-newFunctionWithName:`) from an entry
+/// that declares the constants `declared` (by name, non-empty). Metal answers them from
+/// `functionConstantsDictionary` and builds no pipeline of such a function (measured: its
+/// pipeline creators assert); a function specialised by values answers none.
+- (void)rgfxSetUnspecialisedConstants:(NSDictionary<NSString *, MTLFunctionConstant *> *)declared;
+
+/// Whether the function declares constants and was made with no values for them: a pipeline of
+/// it is refused.
+- (BOOL)rgfxUnspecialised;
+
+/// The refusal of a pipeline of `function` in the descriptor's `role` ("vertexFunction",
+/// "fragmentFunction", "function"), where it is an unspecialised RgfxFunction: Metal's own
+/// words at its assertion, as an NSError; nil for any other function.
++ (nullable NSError *)rgfxUnspecialisedError:(nullable id<MTLFunction>)function role:(NSString *)role;
+
 @end
 
 NS_ASSUME_NONNULL_END

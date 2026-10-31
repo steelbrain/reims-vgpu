@@ -1070,6 +1070,9 @@
 // [`RgfxComputePipelineCreate`] `flags`: `supportIndirectCommandBuffers`.
 #define RGFX_COMPUTE_PIPELINE_SUPPORT_ICB (1 << 1)
 
+// The bytes of [`RgfxFunctionConstant::value`]: the widest constant's, a `long4` or `ulong4`.
+#define RGFX_FUNCTION_CONSTANT_VALUE_BYTES 32
+
 // `copyFromBuffer:sourceOffset:toBuffer:destinationOffset:size:`. Either
 // buffer may be nil (`0`).
 typedef struct {
@@ -2265,19 +2268,20 @@ typedef struct {
   uint64_t value;
 } RgfxEventSignalled;
 
-// One function-constant value a pipeline specialises its function with
-// (`MTLFunctionConstantValues`, by index). `value` holds the constant's raw
-// bits; a scalar or small vector up to eight bytes fits inline (a larger value
-// is a gap the host would flag rather than guess). The constant is keyed by
-// `index`; name-keyed constants are resolved to an index by the guest before it
-// serialises.
+// One function-constant value a pipeline specialises its function with, by the
+// constant's index. The guest resolves every value its process set on the
+// `MTLFunctionConstantValues` (by index, by range or by name) against the
+// function's own constants, as Metal does, and sends one record for each of the
+// function's constants it gives a value: the function's constants it declares
+// and nothing else.
 typedef struct {
-  // The constant's index (`constantValues.setConstantValue:type:atIndex:`).
+  // The constant's index (`[[function_constant(index)]]`).
   uint32_t index;
-  // `MTLDataType` of the constant's value.
+  // `MTLDataType` of the constant's value, which is the constant's own type.
   uint32_t data_type;
-  // The constant's value, its raw little-endian bits, zero-extended.
-  uint64_t value;
+  // The value's bytes, packed as the type's lanes are (a `float3` is 12 bytes), from the
+  // first; the rest are zero.
+  uint8_t value[RGFX_FUNCTION_CONSTANT_VALUE_BYTES];
 } RgfxFunctionConstant;
 
 // `GET_DISPLAYS`: no payload.
