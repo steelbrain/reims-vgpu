@@ -218,6 +218,17 @@ void test_caps()
 	info.identity_flags[kRgfxIdentityIsLowPower] = 1;              // first by position
 	info.identity_flags[kRgfxIdentitySupportsPlacementSparse] = 1; // last by position
 	info.counter_sampling[0] = 1; // at stage boundaries
+	info.format_count = 1;
+	info.formats[0].format = 80; // BGRA8Unorm
+	info.formats[0].texture_buffer_alignment = 16;
+	info.formats[0].sparse_tiles[0][0] = 64; // 1 sample, 16 KiB pages
+	info.formats[0].sparse_tiles[0][1] = 64;
+	info.formats[0].sparse_tiles[0][2] = 1;
+	info.formats[0].sparse_tiles[8][0] = 128; // 4 samples, 256 KiB pages
+	info.formats[0].sparse_tiles[8][1] = 128;
+	info.formats[0].sparse_tiles[8][2] = 1;
+	info.formats[1].format = 70; // past format_count: not read
+	info.formats[1].texture_buffer_alignment = 16;
 	const char *arch = "test_arch";
 	info.architecture_name_len = static_cast<uint32_t>(std::strlen(arch));
 	std::memcpy(info.architecture_name, arch, info.architecture_name_len);
@@ -259,6 +270,16 @@ void test_caps()
 	CHECK(!caps.supportsCounterSampling(1));
 	CHECK(!caps.supportsCounterSampling(5));
 	CHECK(std::strcmp(caps.architectureName(), "test_arch") == 0);
+	CHECK(caps.textureBufferAlignment(80) == 16);
+	CHECK(caps.textureBufferAlignment(70) == 0); // listed past the count
+	CHECK(caps.textureBufferAlignment(130) == 0); // not listed
+	uint64_t tile[3];
+	CHECK(caps.sparseTile(80, 1, 101, tile) && tile[0] == 64 && tile[1] == 64 && tile[2] == 1);
+	CHECK(caps.sparseTile(80, 4, 103, tile) && tile[0] == 128 && tile[2] == 1);
+	CHECK(!caps.sparseTile(80, 2, 102, tile) && tile[0] == 0); // a zero tile is no answer
+	CHECK(!caps.sparseTile(80, 8, 101, tile));                  // no such sample count
+	CHECK(!caps.sparseTile(80, 1, 104, tile));                  // no such page
+	CHECK(!caps.sparseTile(130, 1, 101, tile));                 // not listed
 	CHECK(caps.supportsSampleCount(1));
 	CHECK(caps.supportsSampleCount(4));
 	CHECK(!caps.supportsSampleCount(2));

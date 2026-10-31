@@ -18,7 +18,9 @@ use super::rate_map::RateMapModel;
 use super::resource::PipelineModel;
 use super::{Backing, ResolveIds, common, new_buffer, new_state, new_texture};
 use crate::num;
-use crate::platform::caps::{self, DeviceCaps, IdentityCaps, IdentityFlags, IdentitySizes};
+use crate::platform::caps::{
+    self, DeviceCaps, FormatAnswers, IdentityCaps, IdentityFlags, IdentitySizes,
+};
 use crate::platform::device::*;
 use crate::platform::types::{
     MtlSize, NsErrorText, PixelFormatInfo, SizeAndAlign, TextureLevelInfo, TextureLevelQuery,
@@ -805,6 +807,27 @@ pub fn fake_identity_caps() -> IdentityCaps {
         feature_sets,
         counter_sampling: caps::COUNTER_SAMPLING_POINTS.map(|p| Some(p == 0)),
         architecture_name: Some(String::from("fake_gpu")),
+        // 16 for each texture-buffer format; a 4-byte texel's tiles for every format.
+        formats: caps::SDK_PIXEL_FORMATS
+            .iter()
+            .map(|&format| FormatAnswers {
+                format,
+                texture_buffer_alignment: caps::TEXTURE_BUFFER_FORMATS
+                    .contains(&format)
+                    .then_some(16),
+                sparse_tiles: Some([
+                    [64, 64, 1],
+                    [128, 128, 1],
+                    [256, 256, 1],
+                    [64, 32, 1],
+                    [128, 64, 1],
+                    [256, 128, 1],
+                    [32, 32, 1],
+                    [64, 64, 1],
+                    [128, 128, 1],
+                ]),
+            })
+            .collect(),
         sizes: IdentitySizes {
             recommended_max_working_set_size: Some(0xcf5c_2c000),
             location: Some(0),

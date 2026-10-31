@@ -150,6 +150,14 @@ public:
 	/// `supportsCounterSampling:` of the raw `MTLCounterSamplingPoint` `point` (0..4; any
 	/// other is no).
 	bool supportsCounterSampling(uint64_t point) const;
+	/// `minimumTextureBufferAlignmentForPixelFormat:` of the raw `MTLPixelFormat` `format`; 0
+	/// where the blob has no answer (a format Metal asserts on, among them).
+	uint64_t textureBufferAlignment(uint64_t format) const;
+	/// `sparseTileSizeWithTextureType:pixelFormat:sampleCount:sparsePageSize:` of `format` at
+	/// `samples` (1, 2 or 4) in pages of the raw `MTLSparsePageSize` `page` (101, 102 or 103),
+	/// the same for every texture type, into `out` (width, height, depth); false, with `out`
+	/// all 0, where the blob has no answer.
+	bool sparseTile(uint64_t format, uint64_t samples, int64_t page, uint64_t out[3]) const;
 	/// One of the 15 integer identity answers.
 	uint64_t size(RgfxSize which) const;
 	/// One of the 19 BOOL identity answers.

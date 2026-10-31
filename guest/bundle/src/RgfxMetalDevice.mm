@@ -568,6 +568,35 @@ void rgfxDeviceDoorbell(void *context, uint32_t ring_id)
 	return _caps.size(kRgfxSizeSparseTileSizeInBytes);
 }
 
+- (NSUInteger)minimumTextureBufferAlignmentForPixelFormat:(MTLPixelFormat)format
+{
+	return _caps.textureBufferAlignment(static_cast<uint64_t>(format));
+}
+
+- (MTLSize)sparseTileSizeWithTextureType:(MTLTextureType)textureType
+                             pixelFormat:(MTLPixelFormat)pixelFormat
+                             sampleCount:(NSUInteger)sampleCount
+                          sparsePageSize:(MTLSparsePageSize)sparsePageSize
+{
+	// The host answers one tile for every texture type, as Metal does.
+	(void)textureType;
+	uint64_t tile[3];
+	_caps.sparseTile(static_cast<uint64_t>(pixelFormat), sampleCount,
+	                 static_cast<int64_t>(sparsePageSize), tile);
+	return MTLSizeMake(tile[0], tile[1], tile[2]);
+}
+
+- (MTLSize)sparseTileSizeWithTextureType:(MTLTextureType)textureType
+                             pixelFormat:(MTLPixelFormat)pixelFormat
+                             sampleCount:(NSUInteger)sampleCount
+{
+	// Pages of 16 KiB, as Metal's query without a page size.
+	return [self sparseTileSizeWithTextureType:textureType
+	                               pixelFormat:pixelFormat
+	                               sampleCount:sampleCount
+	                            sparsePageSize:MTLSparsePageSize16];
+}
+
 // --- feature flags (RgfxCaps) ------------------------------------------------
 
 - (BOOL)areProgrammableSamplePositionsSupported

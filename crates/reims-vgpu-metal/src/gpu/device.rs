@@ -30,9 +30,10 @@ use objc2_metal::{MTLDevice, MTLGPUFamily, MTLPixelFormat, MTLResourceOptions};
 use reims_vgpu_core::num::{ToU64, ToUsize};
 use reims_vgpu_core::platform::HostRange;
 use reims_vgpu_core::platform::caps::{
-    COUNTER_SAMPLING_POINTS, DeviceCaps, FAMILIES, FEATURE_SETS, Flags, HEAP_QUERY_OPTIONS,
-    IdentityCaps, IdentityFlags, IdentitySizes, LARGEST_COUNT_ASKED, LINEAR_ALIGNMENT_FORMAT,
-    Limits, SAMPLE_COUNTS, SDK_FAMILIES, WRITE_ROUNDING_MODES,
+    COUNTER_SAMPLING_POINTS, DeviceCaps, FAMILIES, FEATURE_SETS, Flags, FormatAnswers,
+    HEAP_QUERY_OPTIONS, IdentityCaps, IdentityFlags, IdentitySizes, LARGEST_COUNT_ASKED,
+    LINEAR_ALIGNMENT_FORMAT, Limits, SAMPLE_COUNTS, SDK_FAMILIES, SDK_PIXEL_FORMATS,
+    SPARSE_PAGE_SIZES, SPARSE_SAMPLE_COUNTS, TEXTURE_BUFFER_FORMATS, WRITE_ROUNDING_MODES,
 };
 use reims_vgpu_core::platform::device::{FunctionResolver, GpuDevice, NoCopyDeallocator};
 use reims_vgpu_core::platform::types::{
@@ -1006,6 +1007,46 @@ fn largest(accepts: impl Fn(u64) -> bool) -> u64 {
         .unwrap_or(0)
 }
 
+/// The answers of `format` [`FormatAnswers`] holds: its texture buffers' alignment where Metal
+/// answers it ([`TEXTURE_BUFFER_FORMATS`]; it asserts on every other format), and its 2D sparse
+/// tiles.
+fn format_answers(d: &ProtocolObject<dyn MTLDevice>, format: u64) -> FormatAnswers {
+    let pf = MTLPixelFormat(format.to_usize());
+    let texture_buffer_alignment = TEXTURE_BUFFER_FORMATS.contains(&format).then(|| {
+        msg::get("minimumTextureBufferAlignmentForPixelFormat:", || {
+            d.minimumTextureBufferAlignmentForPixelFormat(pf)
+        })
+        .to_u64()
+    });
+    let mut tiles = [[0; 3]; 9];
+    let pairs = SPARSE_SAMPLE_COUNTS
+        .iter()
+        .flat_map(|&samples| SPARSE_PAGE_SIZES.iter().map(move |&page| (samples, page)));
+    for (tile, (samples, page)) in tiles.iter_mut().zip(pairs) {
+        // `NSInteger` is `i64` on arm64: lossless.
+        let page = objc2_metal::MTLSparsePageSize(page as isize);
+        let samples = samples.to_usize();
+        // SAFETY: any format, count and page; Metal answers a tile for each of the SDK's.
+        let size = msg::get(
+            "sparseTileSizeWithTextureType:pixelFormat:sampleCount:sparsePageSize:",
+            || unsafe {
+                d.sparseTileSizeWithTextureType_pixelFormat_sampleCount_sparsePageSize(
+                    objc2_metal::MTLTextureType::Type2D,
+                    pf,
+                    samples,
+                    page,
+                )
+            },
+        );
+        *tile = [size.width, size.height, size.depth].map(ToU64::to_u64);
+    }
+    FormatAnswers {
+        format,
+        texture_buffer_alignment,
+        sparse_tiles: Some(tiles),
+    }
+}
+
 /// Every identity and capability answer of `device` [`IdentityCaps`] holds, each Metal's getter
 /// or query, sent once. Metal answers each of them, so none is `None`.
 #[allow(deprecated)] // `supportsFeatureSet:`, `location` and the peer getters, deprecated in the SDK
@@ -1048,6 +1089,10 @@ fn read_identity_caps(device: &MetalDevice) -> IdentityCaps {
             }))
         }),
         architecture_name: Some(msg::string_text(&architecture_name)),
+        formats: SDK_PIXEL_FORMATS
+            .iter()
+            .map(|&format| format_answers(d, format))
+            .collect(),
         sizes: IdentitySizes {
             recommended_max_working_set_size: Some(get!(recommendedMaxWorkingSetSize)),
             location: Some(get!(location).0.to_u64()),
@@ -1612,6 +1657,13 @@ pub(crate) mod tests {
             identity.architecture_name,
             Some(d.get().architecture().name().to_string())
         );
+        // BGRA8Unorm (80): 16-byte texture buffers, and a 4-byte texel's 64x64 tile in 16 KiB.
+        let bgra8 = identity.formats.iter().find(|f| f.format == 80).unwrap();
+        assert_eq!(bgra8.texture_buffer_alignment, Some(16));
+        assert_eq!(bgra8.sparse_tiles.unwrap()[0], [64, 64, 1]);
+        // BC1_RGBA (130), which Metal asserts on, is not asked.
+        let bc1 = identity.formats.iter().find(|f| f.format == 130).unwrap();
+        assert_eq!(bc1.texture_buffer_alignment, None);
     }
 
     /// Garbage is the NSError; a compiled metallib (the suite's one-kernel fixture) is a library

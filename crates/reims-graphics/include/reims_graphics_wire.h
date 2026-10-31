@@ -1022,6 +1022,13 @@
 // The counter sampling points [`RgfxDeviceInfo::counter_sampling`] answers.
 #define RGFX_DEVICE_INFO_COUNTER_POINTS 5
 
+// The most pixel formats [`RgfxDeviceInfo::formats`] answers.
+#define RGFX_DEVICE_INFO_FORMATS 160
+
+// The sparse tiles [`RgfxFormatAnswers::sparse_tiles`] holds: sample counts 1, 2 and 4, each
+// at pages of 16, 64 and 256 KiB.
+#define RGFX_DEVICE_INFO_SPARSE_TILES 9
+
 // A pipeline reflection reply's status: the pipeline was created.
 #define RGFX_PIPELINE_OK 0
 
@@ -2114,6 +2121,21 @@ typedef struct {
   RgfxStencilDescriptor back;
 } RgfxDepthStencilCreate;
 
+// One pixel format's answers in [`RgfxDeviceInfo`].
+typedef struct {
+  // The raw `MTLPixelFormat`.
+  uint32_t format;
+  // `minimumTextureBufferAlignmentForPixelFormat:`; 0 for a format the host has no answer
+  // of (one Metal asserts on, among them).
+  uint32_t texture_buffer_alignment;
+  // `sparseTileSizeWithTextureType:pixelFormat:sampleCount:sparsePageSize:`, the same for
+  // every texture type: width, height and depth, at sample counts 1, 2 and 4 (major) and
+  // pages of 16, 64 and 256 KiB; all 0 where the host has no answer.
+  uint16_t sparse_tiles[RGFX_DEVICE_INFO_SPARSE_TILES][3];
+  // Zero.
+  uint8_t reserved_3e[2];
+} RgfxFormatAnswers;
+
 // The device-info caps blob the host writes once at device init, read by the
 // guest bundle before it makes any queue. It holds every answer of the guest's
 // `MTLDevice` that does not change while the device lives: the host device's
@@ -2135,8 +2157,8 @@ typedef struct {
   uint32_t family_count;
   // The entries of `feature_set_values` and `feature_set_answers` in use.
   uint32_t feature_set_count;
-  // Zero.
-  uint32_t reserved_14;
+  // The entries of `formats` in use.
+  uint32_t format_count;
   // `registryID`.
   uint64_t registry_id;
   // `gpuCoreCount`, or 0 when the device does not answer it.
@@ -2192,6 +2214,9 @@ typedef struct {
   // The device's `architecture.name`, UTF-8, `architecture_name_len` bytes
   // used, the rest 0.
   uint8_t architecture_name[RGFX_DEVICE_ARCHITECTURE_NAME_LEN];
+  // Each pixel format's answers, `format_count` in use; a format the blob does
+  // not list has none.
+  RgfxFormatAnswers formats[RGFX_DEVICE_INFO_FORMATS];
 } RgfxDeviceInfo;
 
 // `DISPLAY_CHANGED`: what the display offers has changed; the guest asks `GET_DISPLAYS` again.

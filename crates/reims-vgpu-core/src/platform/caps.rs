@@ -152,6 +152,52 @@ pub const COUNTER_SAMPLING_POINTS: [u64; 5] = [0, 1, 2, 3, 4];
 /// [`IdentitySizes`] is the largest count up to it the query takes.
 pub const LARGEST_COUNT_ASKED: u64 = 16;
 
+/// Every `MTLPixelFormat` of the macOS 27 SDK but Invalid, in its order. [`IdentityCaps`] answers
+/// `sparseTileSizeWithTextureType:pixelFormat:sampleCount:sparsePageSize:` of each.
+pub const SDK_PIXEL_FORMATS: [u64; 151] = [
+    1, 10, 11, 12, 13, 14, 20, 22, 23, 24, 25, 30, 31, 32, 33, 34, 40, 41, 42, 43, 45, 46, 47, 48,
+    53, 54, 55, 60, 62, 63, 64, 65, 70, 71, 72, 73, 74, 80, 81, 90, 91, 92, 93, 94, 95, 96, 97, 98,
+    99, 103, 104, 105, 110, 112, 113, 114, 115, 120, 121, 122, 123, 124, 125, 130, 131, 132, 133,
+    134, 135, 140, 141, 142, 143, 150, 151, 152, 153, 160, 161, 162, 163, 164, 165, 166, 167, 170,
+    172, 174, 176, 178, 179, 180, 181, 182, 183, 186, 187, 188, 189, 190, 192, 193, 194, 195, 196,
+    197, 198, 199, 200, 204, 205, 206, 207, 208, 210, 211, 212, 213, 214, 215, 216, 217, 218, 222,
+    223, 224, 225, 226, 228, 229, 230, 231, 232, 233, 234, 235, 236, 240, 241, 250, 252, 253, 255,
+    260, 261, 262, 263, 552, 553, 554, 555,
+];
+
+/// The formats of [`SDK_PIXEL_FORMATS`] Metal answers `minimumTextureBufferAlignmentForPixelFormat:`
+/// of, as it does `minimumLinearTextureAlignmentForPixelFormat:`: the uncompressed colour
+/// formats that are neither packed nor YUV (measured on an Apple M3 Max, macOS 27.2: 16 for each,
+/// and a failed assertion, which ends the process, for every other format of the SDK, so no
+/// other is asked).
+pub const TEXTURE_BUFFER_FORMATS: [u64; 56] = [
+    1, 10, 11, 12, 13, 14, 20, 22, 23, 24, 25, 30, 31, 32, 33, 34, 40, 41, 42, 43, 53, 54, 55, 60,
+    62, 63, 64, 65, 70, 71, 72, 73, 74, 80, 81, 90, 91, 92, 93, 94, 103, 104, 105, 110, 112, 113,
+    114, 115, 123, 124, 125, 263, 552, 553, 554, 555,
+];
+
+/// The sample counts [`FormatAnswers::sparse_tiles`] answers, in order.
+pub const SPARSE_SAMPLE_COUNTS: [u64; 3] = [1, 2, 4];
+
+/// The `MTLSparsePageSize`s [`FormatAnswers::sparse_tiles`] answers, in order: 16, 64 and 256
+/// KiB. The query without a page size answers the first's.
+pub const SPARSE_PAGE_SIZES: [i64; 3] = [101, 102, 103];
+
+/// One pixel format's answers in [`IdentityCaps`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FormatAnswers {
+    /// The raw `MTLPixelFormat`.
+    pub format: u64,
+    /// `minimumTextureBufferAlignmentForPixelFormat:`; `None` for a format Metal does not answer
+    /// (it asserts) or where the platform has no answer.
+    pub texture_buffer_alignment: Option<u64>,
+    /// `sparseTileSizeWithTextureType:pixelFormat:sampleCount:sparsePageSize:` of a 2D texture,
+    /// width, height and depth, at each of [`SPARSE_SAMPLE_COUNTS`] (major) and each of
+    /// [`SPARSE_PAGE_SIZES`]: the same for every texture type (measured on the M3 Max); `None`
+    /// where the platform has no answer.
+    pub sparse_tiles: Option<[[u64; 3]; 9]>,
+}
+
 caps_struct! {
     /// The device's identity and size answers [`IdentityCaps`] holds, one field per selector:
     /// `None` where the platform has no answer of its own.
@@ -218,6 +264,8 @@ pub struct IdentityCaps {
     pub counter_sampling: [Option<bool>; 5],
     /// `architecture.name`.
     pub architecture_name: Option<String>,
+    /// The answers of each of [`SDK_PIXEL_FORMATS`], in its order.
+    pub formats: Vec<FormatAnswers>,
     /// The integer answers.
     pub sizes: IdentitySizes,
     /// The `BOOL` answers.

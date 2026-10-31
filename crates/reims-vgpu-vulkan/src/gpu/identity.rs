@@ -4,8 +4,11 @@
 //! Each answer comes from one of these sources, and is `None` where none gives it:
 //! - **the runtime's answer**: `name`'s companions in `DeviceProperties` (`hasUnifiedMemory`,
 //!   `maxBufferLength`, the argument-buffer and read-write texture tiers,
-//!   `supports32BitFloatFiltering`), `sparseTileSizeInBytes`, `supportsFamily:`,
-//!   `supportsVertexAmplificationCount:` and `supportsRasterizationRateMapWithLayerCount:`;
+//!   `supports32BitFloatFiltering`), `sparseTileSizeInBytes`, each format's sparse tiles,
+//!   `supportsFamily:`, `supportsVertexAmplificationCount:` and
+//!   `supportsRasterizationRateMapWithLayerCount:`, and, for
+//!   `minimumTextureBufferAlignmentForPixelFormat:`, its
+//!   `minimumLinearTextureAlignmentForPixelFormat:`, which Metal answers alike (measured);
 //! - **the runtime's audit of a feature row** of Apple's tables, in the Apple9 column, which lists
 //!   every row read here, as [`crate::gpu::caps`]' SIMD flags are read ([`ROWS`]): a getter is yes
 //!   where the row its feature is is exact on the device;
@@ -32,11 +35,15 @@
 //! set the heaps' sum), and a query of the runtime's to come.
 
 use ash::vk;
+use metal2vulkan::metal::TextureType;
 use metal2vulkan_runtime as rt;
 use reims_vgpu_core::platform::caps::{
-    DeviceCaps, FEATURE_SETS, IdentityCaps, IdentityFlags, IdentitySizes, LARGEST_COUNT_ASKED,
-    SDK_FAMILIES,
+    DeviceCaps, FEATURE_SETS, FormatAnswers, IdentityCaps, IdentityFlags, IdentitySizes,
+    LARGEST_COUNT_ASKED, SDK_FAMILIES, SDK_PIXEL_FORMATS, SPARSE_PAGE_SIZES, SPARSE_SAMPLE_COUNTS,
+    TEXTURE_BUFFER_FORMATS,
 };
+
+use crate::gpu::runtime_pixel_format;
 
 /// The feature rows of Apple's tables the getters are read from, each with its getter's field
 /// in [`IdentityFlags`], in the order `flags` reads them.
@@ -158,6 +165,56 @@ fn largest(accepts: impl Fn(u64) -> Result<bool, rt::RuntimeGap>) -> u64 {
         .unwrap_or(0)
 }
 
+/// The runtime's page of Metal's raw `MTLSparsePageSize` `page`.
+fn sparse_page(page: i64) -> Option<rt::SparsePageSize> {
+    [
+        rt::SparsePageSize::Size16,
+        rt::SparsePageSize::Size64,
+        rt::SparsePageSize::Size256,
+    ]
+    .into_iter()
+    .zip(SPARSE_PAGE_SIZES)
+    .find_map(|(p, raw)| (raw == page).then_some(p))
+}
+
+/// The answers of `format` [`FormatAnswers`] holds: the runtime's sparse tiles, and, of a format
+/// Metal answers it of ([`TEXTURE_BUFFER_FORMATS`]), the alignment of its texture buffers: the
+/// runtime's `minimumLinearTextureAlignmentForPixelFormat:`, which Metal answers alike for
+/// every format of the SDK (measured, an M3 Max under macOS 27.2). `None` for a format the
+/// runtime has no enumerator of.
+fn format_answers(device: &rt::Device, format: u64) -> FormatAnswers {
+    let Some(pf) = runtime_pixel_format(format) else {
+        return FormatAnswers {
+            format,
+            ..FormatAnswers::default()
+        };
+    };
+    let texture_buffer_alignment = TEXTURE_BUFFER_FORMATS
+        .contains(&format)
+        .then(|| {
+            device
+                .properties()
+                .minimum_linear_texture_alignment_for_pixel_format(pf)
+                .ok()
+        })
+        .flatten();
+    let mut tiles = [[0; 3]; 9];
+    let pairs = SPARSE_SAMPLE_COUNTS
+        .iter()
+        .flat_map(|&samples| SPARSE_PAGE_SIZES.iter().map(move |&page| (samples, page)));
+    for (tile, (samples, page)) in tiles.iter_mut().zip(pairs) {
+        if let Some(page) = sparse_page(page) {
+            let size = device.sparse_tile_size_for_page(TextureType::Type2D, pf, samples, page);
+            *tile = [size.width, size.height, size.depth];
+        }
+    }
+    FormatAnswers {
+        format,
+        texture_buffer_alignment,
+        sparse_tiles: Some(tiles),
+    }
+}
+
 /// The sum of `device`'s device-local memory heaps.
 fn device_local_bytes(device: &rt::Device) -> u64 {
     // SAFETY: the instance and physical device are the runtime's, read only, while `device`
@@ -194,6 +251,10 @@ pub fn read(device: &rt::Device, caps: &DeviceCaps) -> IdentityCaps {
         feature_sets: FEATURE_SETS.map(|set| Some(feature_set(set, &families))),
         counter_sampling: [None; 5],
         architecture_name: None,
+        formats: SDK_PIXEL_FORMATS
+            .iter()
+            .map(|&format| format_answers(device, format))
+            .collect(),
         sizes: IdentitySizes {
             recommended_max_working_set_size: Some(device_local_bytes(device)),
             max_buffer_length: Some(props.max_buffer_length),
@@ -305,5 +366,12 @@ mod tests {
                 .is_some_and(|bytes| bytes > 0)
         );
         assert_eq!(identity.flags.is_low_power, None);
+        // BGRA8Unorm (80): 16-byte texture buffers, and a 4-byte texel's 64x64 tile in 16 KiB,
+        // as Metal answers on the M3 Max; a format Metal asserts on (BC1_RGBA, 130) has none.
+        let bgra8 = identity.formats.iter().find(|f| f.format == 80).unwrap();
+        assert_eq!(bgra8.texture_buffer_alignment, Some(16));
+        assert_eq!(bgra8.sparse_tiles.unwrap()[0], [64, 64, 1]);
+        let bc1 = identity.formats.iter().find(|f| f.format == 130).unwrap();
+        assert_eq!(bc1.texture_buffer_alignment, None);
     }
 }

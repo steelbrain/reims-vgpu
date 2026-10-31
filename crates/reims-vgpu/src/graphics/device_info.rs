@@ -15,11 +15,13 @@
 
 use reims_graphics::wire::{
     RGFX_DEVICE_ARCHITECTURE_NAME_LEN, RGFX_DEVICE_INFO_COUNTER_POINTS, RGFX_DEVICE_INFO_FAMILIES,
-    RGFX_DEVICE_INFO_FEATURE_SETS, RGFX_DEVICE_INFO_IDENTITY_FLAGS, RGFX_DEVICE_INFO_SIZES,
-    RGFX_DEVICE_INFO_VERSION, RGFX_DEVICE_NAME_LEN, RgfxDeviceInfo,
+    RGFX_DEVICE_INFO_FEATURE_SETS, RGFX_DEVICE_INFO_FORMATS, RGFX_DEVICE_INFO_IDENTITY_FLAGS,
+    RGFX_DEVICE_INFO_SIZES, RGFX_DEVICE_INFO_SPARSE_TILES, RGFX_DEVICE_INFO_VERSION,
+    RGFX_DEVICE_NAME_LEN, RgfxDeviceInfo, RgfxFormatAnswers,
 };
 use reims_vgpu_core::platform::caps::{
-    COUNTER_SAMPLING_POINTS, DeviceCaps, FAMILIES, FEATURE_SETS, IdentityCaps, SDK_FAMILIES,
+    COUNTER_SAMPLING_POINTS, DeviceCaps, FAMILIES, FEATURE_SETS, FormatAnswers, IdentityCaps,
+    SDK_FAMILIES, SDK_PIXEL_FORMATS, SPARSE_PAGE_SIZES, SPARSE_SAMPLE_COUNTS,
 };
 use reims_vgpu_core::raise::RaiseResult;
 
@@ -46,6 +48,31 @@ fn put_text(out: &mut [u8], text: &str) -> u32 {
     out[..len].copy_from_slice(&text.as_bytes()[..len]);
     // At most 256 bytes: lossless.
     len as u32
+}
+
+/// `answers` as the blob holds them; a value the blob's field cannot hold (no such answer is
+/// known) is 0, no answer.
+fn format_answers(answers: &FormatAnswers) -> RgfxFormatAnswers {
+    let mut out = RgfxFormatAnswers {
+        format: u32::try_from(answers.format).unwrap_or(0),
+        texture_buffer_alignment: answers
+            .texture_buffer_alignment
+            .and_then(|a| u32::try_from(a).ok())
+            .unwrap_or(0),
+        ..RgfxFormatAnswers::default()
+    };
+    if let Some(tiles) = answers.sparse_tiles {
+        for (out, tile) in out.sparse_tiles.iter_mut().zip(tiles) {
+            if let (Ok(w), Ok(h), Ok(d)) = (
+                u16::try_from(tile[0]),
+                u16::try_from(tile[1]),
+                u16::try_from(tile[2]),
+            ) {
+                *out = [w, h, d];
+            }
+        }
+    }
+    out
 }
 
 /// The guest's device's answers where they are not the platform's: what the lane does not
@@ -251,6 +278,12 @@ pub fn device_info(
     ];
     info.identity_flags = identity_flags.map(known);
     info.counter_sampling = identity.counter_sampling.map(known);
+    let mut format_count = 0;
+    for (out, answers) in info.formats.iter_mut().zip(&identity.formats) {
+        *out = format_answers(answers);
+        format_count += 1;
+    }
+    info.format_count = format_count;
     info
 }
 
@@ -260,6 +293,9 @@ const _: () = assert!(FEATURE_SETS.len() <= RGFX_DEVICE_INFO_FEATURE_SETS);
 const _: () = assert!(COUNTER_SAMPLING_POINTS.len() == RGFX_DEVICE_INFO_COUNTER_POINTS);
 const _: () = assert!(RGFX_DEVICE_NAME_LEN <= 256 && RGFX_DEVICE_ARCHITECTURE_NAME_LEN <= 256);
 const _: () = assert!(FAMILIES[6] == -1009);
+const _: () = assert!(SDK_PIXEL_FORMATS.len() <= RGFX_DEVICE_INFO_FORMATS);
+const _: () =
+    assert!(SPARSE_SAMPLE_COUNTS.len() * SPARSE_PAGE_SIZES.len() == RGFX_DEVICE_INFO_SPARSE_TILES);
 
 #[cfg(test)]
 mod tests {
@@ -388,6 +424,14 @@ mod tests {
         assert_eq!(info.sizes[12], 4);
         assert_eq!(info.sizes[13], 8);
         assert_eq!(info.sizes[14], 0);
+        // Every SDK format, each the platform's: BGRA8Unorm (80) 16-byte texture buffers and
+        // 64x64 tiles; BC1_RGBA (130) no texture buffers.
+        assert_eq!(info.format_count as usize, SDK_PIXEL_FORMATS.len());
+        let at = |f: u32| info.formats.iter().find(|a| a.format == f).unwrap();
+        assert_eq!(at(80).texture_buffer_alignment, 16);
+        assert_eq!(at(80).sparse_tiles[0], [64, 64, 1]);
+        assert_eq!(at(80).sparse_tiles[8], [128, 128, 1]);
+        assert_eq!(at(130).texture_buffer_alignment, 0);
     }
 
     /// A present no reads 0, a present yes reads 1, and a platform gap (an `Err` or `None`)

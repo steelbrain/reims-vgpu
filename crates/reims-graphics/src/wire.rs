@@ -1347,6 +1347,32 @@ pub const RGFX_DEVICE_INFO_IDENTITY_FLAGS: usize = 19;
 /// The counter sampling points [`RgfxDeviceInfo::counter_sampling`] answers.
 pub const RGFX_DEVICE_INFO_COUNTER_POINTS: usize = 5;
 
+/// The most pixel formats [`RgfxDeviceInfo::formats`] answers.
+pub const RGFX_DEVICE_INFO_FORMATS: usize = 160;
+
+/// The sparse tiles [`RgfxFormatAnswers::sparse_tiles`] holds: sample counts 1, 2 and 4, each
+/// at pages of 16, 64 and 256 KiB.
+pub const RGFX_DEVICE_INFO_SPARSE_TILES: usize = 9;
+
+/// One pixel format's answers in [`RgfxDeviceInfo`].
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxFormatAnswers {
+    /// The raw `MTLPixelFormat`.
+    pub format: u32,
+    /// `minimumTextureBufferAlignmentForPixelFormat:`; 0 for a format the host has no answer
+    /// of (one Metal asserts on, among them).
+    pub texture_buffer_alignment: u32,
+    /// `sparseTileSizeWithTextureType:pixelFormat:sampleCount:sparsePageSize:`, the same for
+    /// every texture type: width, height and depth, at sample counts 1, 2 and 4 (major) and
+    /// pages of 16, 64 and 256 KiB; all 0 where the host has no answer.
+    pub sparse_tiles: [[u16; 3]; RGFX_DEVICE_INFO_SPARSE_TILES],
+    /// Zero.
+    pub reserved_3e: [u8; 2],
+}
+
 /// The device-info caps blob the host writes once at device init, read by the
 /// guest bundle before it makes any queue. It holds every answer of the guest's
 /// `MTLDevice` that does not change while the device lives: the host device's
@@ -1370,8 +1396,8 @@ pub struct RgfxDeviceInfo {
     pub family_count: u32,
     /// The entries of `feature_set_values` and `feature_set_answers` in use.
     pub feature_set_count: u32,
-    /// Zero.
-    pub reserved_14: u32,
+    /// The entries of `formats` in use.
+    pub format_count: u32,
     /// `registryID`.
     pub registry_id: u64,
     /// `gpuCoreCount`, or 0 when the device does not answer it.
@@ -1427,6 +1453,9 @@ pub struct RgfxDeviceInfo {
     /// The device's `architecture.name`, UTF-8, `architecture_name_len` bytes
     /// used, the rest 0.
     pub architecture_name: [u8; RGFX_DEVICE_ARCHITECTURE_NAME_LEN],
+    /// Each pixel format's answers, `format_count` in use; a format the blob does
+    /// not list has none.
+    pub formats: [RgfxFormatAnswers; RGFX_DEVICE_INFO_FORMATS],
 }
 
 impl Default for RgfxDeviceInfo {
@@ -1740,7 +1769,9 @@ const _: () = {
     assert!(size_of::<RgfxManagedTextureCreate>() == 112);
     assert!(size_of::<RgfxTextureReplaceRegion>() == 56);
     assert!(RGFX_LIBRARY_BYTES_OFFSET as usize == size_of::<RgfxLibraryCreate>());
-    assert!(size_of::<RgfxDeviceInfo>() == 1400);
+    assert!(size_of::<RgfxFormatAnswers>() == 64);
+    assert!(size_of::<RgfxDeviceInfo>() == 1400 + 64 * RGFX_DEVICE_INFO_FORMATS);
+    assert!(core::mem::offset_of!(RgfxDeviceInfo, formats) == 1400);
     assert!(core::mem::offset_of!(RgfxDeviceInfo, family_answers) == 944);
     assert!(core::mem::offset_of!(RgfxDeviceInfo, name) == 1080);
     // The device-info blob sits past the completion ring and before the allocations.
@@ -1919,7 +1950,10 @@ mod tests {
         let name = b"NVIDIA GeForce RTX 5080 Laptop GPU";
         info.name[..name.len()].copy_from_slice(name);
         info.name_len = name.len() as u32;
-        assert_eq!(info.as_bytes().len(), 1400);
+        info.format_count = 1;
+        info.formats[0].format = 80;
+        info.formats[0].sparse_tiles[0] = [64, 64, 1];
+        assert_eq!(info.as_bytes().len(), 1400 + 64 * RGFX_DEVICE_INFO_FORMATS);
         assert_eq!(
             RgfxDeviceInfo::read_from_bytes(info.as_bytes()).unwrap(),
             info
