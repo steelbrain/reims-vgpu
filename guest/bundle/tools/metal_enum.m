@@ -2,7 +2,7 @@
 // answers can be compared line by line with a host's (the same source builds for both).
 //   metal_enum          every device of MTLCopyAllDevices, then the system default's name
 // Each line is `key=value`. A selector the device does not respond to prints `n/r`, and is
-// not sent. Families and feature sets are asked by raw value, so the build does not depend on
+// not sent; one that raises prints `threw` and the exception's name. Families and feature sets are asked by raw value, so the build does not depend on
 // which ones the SDK names.
 // Build: xcrun clang -arch x86_64 -mmacosx-version-min=26.0 -fobjc-arc -framework Metal \
 //        -framework Foundation metal_enum.m -o metal_enum
@@ -22,8 +22,12 @@ static void scalar(id<MTLDevice> d, const char *sel_name)
 		printf("  %s=n/r\n", sel_name);
 		return;
 	}
-	unsigned long long v = ((unsigned long long (*)(id, SEL))objc_msgSend)((id)d, sel);
-	printf("  %s=%llu (0x%llx)\n", sel_name, v, v);
+	@try {
+		unsigned long long v = ((unsigned long long (*)(id, SEL))objc_msgSend)((id)d, sel);
+		printf("  %s=%llu (0x%llx)\n", sel_name, v, v);
+	} @catch (NSException *e) {
+		printf("  %s=threw %s\n", sel_name, e.name.UTF8String);
+	}
 }
 
 // A BOOL getter, printed 0 or 1.
@@ -34,8 +38,12 @@ static void flag(id<MTLDevice> d, const char *sel_name)
 		printf("  %s=n/r\n", sel_name);
 		return;
 	}
-	BOOL v = ((BOOL (*)(id, SEL))objc_msgSend)((id)d, sel);
-	printf("  %s=%d\n", sel_name, (int)v);
+	@try {
+		BOOL v = ((BOOL (*)(id, SEL))objc_msgSend)((id)d, sel);
+		printf("  %s=%d\n", sel_name, (int)v);
+	} @catch (NSException *e) {
+		printf("  %s=threw %s\n", sel_name, e.name.UTF8String);
+	}
 }
 
 // A one-argument BOOL query of an integer argument.
@@ -46,8 +54,12 @@ static void query(id<MTLDevice> d, const char *sel_name, const char *label, long
 		printf("  %s(%s)=n/r\n", sel_name, label);
 		return;
 	}
-	BOOL v = ((BOOL (*)(id, SEL, long long))objc_msgSend)((id)d, sel, arg);
-	printf("  %s(%s)=%d\n", sel_name, label, (int)v);
+	@try {
+		BOOL v = ((BOOL (*)(id, SEL, long long))objc_msgSend)((id)d, sel, arg);
+		printf("  %s(%s)=%d\n", sel_name, label, (int)v);
+	} @catch (NSException *e) {
+		printf("  %s(%s)=threw %s\n", sel_name, label, e.name.UTF8String);
+	}
 }
 
 static void dump(id<MTLDevice> d)
