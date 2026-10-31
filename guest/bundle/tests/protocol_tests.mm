@@ -611,6 +611,58 @@ void test_command_buffer_and_queue_members()
 	fx.complete(cb, seqno);
 }
 
+
+// --- textures ---------------------------------------------------------------------
+
+// The descriptor's members the wire does not carry answer as made; a texture that is not a
+// view, sparse, shared or remote answers as Metal's such texture does; views, remote views and
+// shared handles are nil, logged.
+void test_texture_members()
+{
+	TestRing control(0x8000);
+	control.setConsumerIdle(1);
+	RgfxRingWriter writer(control.base(), control.dataSize, RGFX_CONTROL_RING_ID,
+	                      TestRing::doorbell, nullptr);
+	RgfxIdSpace ids;
+	RgfxSerializer ser(writer, ids);
+
+	MTLTextureDescriptor *d =
+	    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+	                                                       width:32
+	                                                      height:32
+	                                                   mipmapped:NO];
+	d.allowGPUOptimizedContents = NO;
+	d.compressionType = MTLTextureCompressionTypeLossy;
+	RgfxTexture *t = [RgfxTexture textureWithDescriptor:d
+	                                               heap:RGFX_OBJ_NONE
+	                                         heapOffset:0
+	                                             device:nil
+	                                         serializer:&ser];
+	CHECK(t != nil);
+	CHECK(t.allowGPUOptimizedContents == NO);
+	CHECK(t.compressionType == MTLTextureCompressionTypeLossy);
+
+	// Metal's defaults where no descriptor was taken.
+	RgfxTexture *plain = shapeTexture(d, 0x70);
+	CHECK(plain.allowGPUOptimizedContents == YES);
+	CHECK(plain.compressionType == MTLTextureCompressionTypeLossless);
+
+	CHECK(t.iosurfacePlane == 0);
+	CHECK(t.isShareable == NO);
+	CHECK(t.sparseTextureTier == MTLTextureSparseTierNone);
+	CHECK(t.isSparse == NO && t.firstMipmapInTail == 0 && t.tailSizeInBytes == 0);
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+	CHECK(t.rootResource == nil); // no parent, no buffer
+	CHECK(t.remoteStorageTexture == nil);
+	CHECK([t newRemoteTextureViewForDevice:(id<MTLDevice>)t] == nil);
+#pragma clang diagnostic pop
+
+	Class c = [RgfxTexture class];
+	CHECK([t newSharedTextureHandle] == nil);
+	CHECK(RgfxUnsupportedWasLogged(c, @selector(newSharedTextureHandle)));
+}
+
 } // namespace
 
 void rgfxProtocolTests()
@@ -623,4 +675,5 @@ void rgfxProtocolTests()
 	test_render_tile_size();
 	test_encoders_unsupported();
 	test_command_buffer_and_queue_members();
+	test_texture_members();
 }

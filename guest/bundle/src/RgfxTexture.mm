@@ -5,6 +5,7 @@
 #import "RgfxTexture.h"
 
 #import "RgfxBuffer.h"
+#import "RgfxUnsupported.h"
 
 #include <cstring>
 #include <memory>
@@ -403,6 +404,10 @@ enum RgfxViewRefusal { kNoFormat, kFormatClass, kLevels, kSlices, kTypeFamily, k
 	RgfxTexture *_parent;
 	NSUInteger _parentLevel;
 	NSUInteger _parentSlice;
+	// The descriptor's members the wire's texture descriptor does not carry, answered as made
+	// (rgfxTakeDescriptor:): Metal's defaults until then.
+	BOOL _allowGPUOptimizedContents;
+	MTLTextureCompressionType _compressionType;
 }
 
 + (instancetype)managedTextureWithDescriptor:(MTLTextureDescriptor *)descriptor
@@ -456,6 +461,7 @@ enum RgfxViewRefusal { kNoFormat, kFormatClass, kLevels, kSlices, kTypeFamily, k
 		t->_managedCpu = cpu;
 		t->_managedBytes = bytes;
 		t->_managedLayout = std::move(layout);
+		[t rgfxTakeDescriptor:descriptor];
 	}
 	return t;
 }
@@ -486,6 +492,7 @@ enum RgfxViewRefusal { kNoFormat, kFormatClass, kLevels, kSlices, kTypeFamily, k
 		t->_buffer = buffer;
 		t->_bufferOffset = offset;
 		t->_bufferBytesPerRow = bytesPerRow;
+		[t rgfxTakeDescriptor:descriptor];
 	}
 	return t;
 }
@@ -549,12 +556,14 @@ enum RgfxViewRefusal { kNoFormat, kFormatClass, kLevels, kSlices, kTypeFamily, k
 	if (created.resource_id == 0) {
 		return nil; // no resource id left: no texture, as Metal answers one it cannot make
 	}
-	return [[RgfxTexture alloc] initWithObjId:created.obj_id
-	                              gpuAddress:created.gpu_address
-	                              resourceId:created.resource_id
-	                              descriptor:desc
-	                                  device:device
-	                              serializer:serializer];
+	RgfxTexture *t = [[RgfxTexture alloc] initWithObjId:created.obj_id
+	                                        gpuAddress:created.gpu_address
+	                                        resourceId:created.resource_id
+	                                        descriptor:desc
+	                                            device:device
+	                                        serializer:serializer];
+	[t rgfxTakeDescriptor:descriptor];
+	return t;
 }
 
 - (instancetype)initWithObjId:(uint64_t)objId
@@ -569,8 +578,19 @@ enum RgfxViewRefusal { kNoFormat, kFormatClass, kLevels, kSlices, kTypeFamily, k
 		_desc = desc;
 		_gpuAddress = gpuAddress;
 		_resourceId = resourceId;
+		_allowGPUOptimizedContents = YES;
+		_compressionType = MTLTextureCompressionTypeLossless;
 	}
 	return self;
+}
+
+- (void)rgfxTakeDescriptor:(MTLTextureDescriptor *)descriptor
+{
+	if (descriptor == nil) {
+		return;
+	}
+	_allowGPUOptimizedContents = descriptor.allowGPUOptimizedContents;
+	_compressionType = descriptor.compressionType;
 }
 
 - (void)dealloc
@@ -796,6 +816,9 @@ enum RgfxViewRefusal { kNoFormat, kFormatClass, kLevels, kSlices, kTypeFamily, k
 		view->_parent = self;
 		view->_parentLevel = static_cast<NSUInteger>(base);
 		view->_parentSlice = subrange ? slices.location : 0;
+		// The view's storage is its texture's, and so are its layout's choices.
+		view->_allowGPUOptimizedContents = _allowGPUOptimizedContents;
+		view->_compressionType = _compressionType;
 	}
 	return view;
 }
@@ -1278,6 +1301,73 @@ enum RgfxViewRefusal { kNoFormat, kFormatClass, kLevels, kSlices, kTypeFamily, k
 	if (toBytes) {
 		copyRows(caller, bytesPerRow, imageBytes, staged, shape.rowBytes, stageImage);
 	}
+}
+
+// --- the descriptor's members the wire does not carry -------------------------------
+
+- (BOOL)allowGPUOptimizedContents
+{
+	return _allowGPUOptimizedContents;
+}
+
+- (MTLTextureCompressionType)compressionType
+{
+	return _compressionType;
+}
+
+// --- what a texture that is not sparse, shared or remote answers ----------------------
+// The device makes none of those (their members below answer nil), so these are exact.
+
+// The deprecated owner of the texture's storage: its parent texture, else its buffer.
+- (id<MTLResource>)rootResource
+{
+	id<MTLTexture> parent = self.parentTexture;
+	return parent != nil ? (id<MTLResource>)parent : (id<MTLResource>)self.buffer;
+}
+
+- (BOOL)isShareable
+{
+	return NO;
+}
+
+- (MTLTextureSparseTier)sparseTextureTier
+{
+	return MTLTextureSparseTierNone;
+}
+
+- (BOOL)isSparse
+{
+	return NO;
+}
+
+- (NSUInteger)firstMipmapInTail
+{
+	return 0;
+}
+
+- (NSUInteger)tailSizeInBytes
+{
+	return 0;
+}
+
+- (id<MTLTexture>)remoteStorageTexture
+{
+	return nil;
+}
+
+// --- unsupported --------------------------------------------------------------------
+
+// One device: no other device to view the texture from.
+- (id<MTLTexture>)newRemoteTextureViewForDevice:(id<MTLDevice>)device
+{
+	RGFX_UNSUPPORTED("remote texture views");
+	return nil;
+}
+
+- (MTLSharedTextureHandle *)newSharedTextureHandle
+{
+	RGFX_UNSUPPORTED("shared texture handles");
+	return nil;
 }
 
 @end

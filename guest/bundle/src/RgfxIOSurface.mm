@@ -439,6 +439,7 @@ RgfxTextureDescriptor wireDescriptor(MTLTextureDescriptor *d)
 	                                                           serializer:serializer];
 	if (t != nil) {
 		t->_shadow = std::move(shadow);
+		[t rgfxTakeDescriptor:descriptor];
 	}
 	return t;
 }

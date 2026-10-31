@@ -93,6 +93,11 @@ NS_ASSUME_NONNULL_BEGIN
                        device:(nullable id<MTLDevice>)device
                    serializer:(nullable RgfxSerializer *)serializer NS_UNAVAILABLE;
 
+/// Keeps the members of `descriptor` that the wire's texture descriptor does not carry
+/// (allowGPUOptimizedContents, compressionType), which the texture answers. Each
+/// factory calls it on the texture it made; until then the texture answers Metal's defaults.
+- (void)rgfxTakeDescriptor:(nullable MTLTextureDescriptor *)descriptor;
+
 @end
 
 NS_ASSUME_NONNULL_END
