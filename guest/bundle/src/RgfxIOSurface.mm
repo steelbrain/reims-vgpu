@@ -7,9 +7,15 @@
 #import "RgfxBuffer.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
+#include <fcntl.h>
 #include <map>
 #include <mutex>
+#include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
+#include <unistd.h>
 #include <utility>
 
 #include "RgfxEncoder.hpp"
@@ -74,6 +80,72 @@ uint8_t *planeBase(IOSurfaceRef s, size_t plane)
 	return static_cast<uint8_t *>(p);
 }
 
+/// The process's copies between surfaces' pages and the GPU's view of them, by direction: a
+/// diagnostic, a line in kCopyLog at most every kCopyReportNs while copies run.
+struct CopyCount {
+	std::atomic<uint64_t> count{0};
+	std::atomic<uint64_t> bytes{0};
+	std::atomic<uint64_t> ns{0};
+};
+
+CopyCount gUploads;    // pages -> the GPU's view
+CopyCount gWriteBacks; // the GPU's view -> pages
+
+const uint64_t kCopyReportNs = 10ull * 1000 * 1000 * 1000;
+const char *const kCopyLog = "/tmp/rgfx-surface-copies.log";
+
+uint64_t nowNs()
+{
+	return clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+}
+
+/// Logs the copies since the last report, once kCopyReportNs has passed since it.
+void reportCopies(uint64_t now)
+{
+	static std::mutex lock;
+	static uint64_t last = 0, upCount = 0, upBytes = 0, upNs = 0, wbCount = 0, wbBytes = 0,
+	                wbNs = 0;
+	std::unique_lock<std::mutex> g(lock, std::try_to_lock);
+	if (!g.owns_lock()) {
+		return;
+	}
+	if (last == 0) {
+		last = now;
+		return;
+	}
+	if (now - last < kCopyReportNs) {
+		return;
+	}
+	uint64_t uc = gUploads.count, ub = gUploads.bytes, un = gUploads.ns;
+	uint64_t wc = gWriteBacks.count, wb = gWriteBacks.bytes, wn = gWriteBacks.ns;
+	char line[256];
+	int n = snprintf(line, sizeof(line),
+	                 "RGFX: surface copies, pid %d %s, %.1f s: %llu uploads %.1f MiB %.2f ms, "
+	                 "%llu write-backs %.1f MiB %.2f ms\n",
+	                 getpid(), getprogname(), (now - last) / 1e9, uc - upCount,
+	                 (ub - upBytes) / 1048576.0, (un - upNs) / 1e6, wc - wbCount,
+	                 (wb - wbBytes) / 1048576.0, (wn - wbNs) / 1e6);
+	int fd = open(kCopyLog, O_WRONLY | O_CREAT | O_APPEND, 0666);
+	if (fd >= 0 && n > 0) {
+		(void)write(fd, line, std::min(static_cast<size_t>(n), sizeof(line) - 1));
+	}
+	if (fd >= 0) {
+		close(fd);
+	}
+	last = now;
+	upCount = uc, upBytes = ub, upNs = un, wbCount = wc, wbBytes = wb, wbNs = wn;
+}
+
+/// Counts a copy of `bytes` that started at `start`.
+void countCopy(CopyCount &c, uint64_t bytes, uint64_t start)
+{
+	uint64_t now = nowNs();
+	c.count.fetch_add(1, std::memory_order_relaxed);
+	c.bytes.fetch_add(bytes, std::memory_order_relaxed);
+	c.ns.fetch_add(now - start, std::memory_order_relaxed);
+	reportCopies(now);
+}
+
 } // namespace
 
 /// This process's copy of one surface plane, in a block of the device region.
@@ -97,6 +169,7 @@ struct RgfxSurfaceShadow {
 	void upload()
 	{
 		uint32_t s = 0;
+		uint64_t start = nowNs();
 		if (IOSurfaceLock(surface, kIOSurfaceLockReadOnly, &s) != kIOReturnSuccess) {
 			return;
 		}
@@ -106,6 +179,7 @@ struct RgfxSurfaceShadow {
 		}
 		IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, &s);
 		seed = s;
+		countCopy(gUploads, shape.rowBytes * shape.rows, start);
 	}
 
 	/// Copy -> pages, under a write lock; records the seed the unlock leaves, so the
@@ -113,6 +187,7 @@ struct RgfxSurfaceShadow {
 	void writeBack()
 	{
 		uint32_t s = 0;
+		uint64_t start = nowNs();
 		if (IOSurfaceLock(surface, 0, &s) != kIOReturnSuccess) {
 			return;
 		}
@@ -122,6 +197,7 @@ struct RgfxSurfaceShadow {
 		}
 		IOSurfaceUnlock(surface, 0, &s);
 		seed = s;
+		countCopy(gWriteBacks, shape.rowBytes * shape.rows, start);
 	}
 
 	/// Uploads when the surface's seed moved since the copy last matched it.
