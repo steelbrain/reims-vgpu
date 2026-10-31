@@ -1017,6 +1017,80 @@ void test_library_members()
 	} // @autoreleasepool: the library drains while ser lives
 }
 
+// A fake device's sampler creates: each answered SAMPLER_STATE with `status` and the next id from
+// `id` on, the creates it was asked kept.
+struct SamplerAsker {
+	uint64_t id = 1;
+	uint32_t status = RGFX_STATUS_OK;
+	bool answers = true;
+	std::vector<RgfxSamplerCreate> asked;
+
+	static bool ask(void *context, const void *message, uint32_t size, void *reply,
+	                uint32_t capacity, uint32_t *reply_size)
+	{
+		SamplerAsker *self = static_cast<SamplerAsker *>(context);
+		RgfxSamplerCreate m = {};
+		CHECK(size == sizeof(m));
+		std::memcpy(&m, message, sizeof(m));
+		self->asked.push_back(m);
+		if (!self->answers)
+			return false;
+		RgfxSamplerState answer = {};
+		answer.header = {RGFX_EVT_SAMPLER_STATE, sizeof(answer), 11};
+		answer.status = self->status;
+		answer.gpu_resource_id = self->status == RGFX_STATUS_OK ? self->id++ : 0;
+		CHECK(capacity >= sizeof(answer));
+		std::memcpy(reply, &answer, sizeof(answer));
+		*reply_size = sizeof(answer);
+		return true;
+	}
+};
+
+// A sampler takes the resource id its create was answered with, and is nil where the device
+// refused it or no answer came back; with no asker its create goes on the ring unanswered.
+void test_sampler_resource_ids()
+{
+	TestRing control(0x8000);
+	control.setConsumerIdle(1);
+	RgfxRingWriter writer(control.base(), control.dataSize, RGFX_CONTROL_RING_ID,
+	                      TestRing::doorbell, nullptr);
+	RgfxIdSpace ids;
+	RgfxSerializer ser(writer, ids);
+	SamplerAsker asker;
+	asker.id = 7;
+	ser.setAsker(&SamplerAsker::ask, &asker);
+	MTLSamplerDescriptor *d = [[MTLSamplerDescriptor alloc] init];
+	d.minFilter = MTLSamplerMinMagFilterLinear;
+	d.supportArgumentBuffers = YES;
+	d.lodMaxClamp = 4.0f;
+	RgfxSampler *a = [RgfxSampler samplerWithDescriptor:d device:nil serializer:&ser];
+	RgfxSampler *b = [RgfxSampler samplerWithDescriptor:d device:nil serializer:&ser];
+	CHECK(a != nil && b != nil);
+	CHECK(a.gpuResourceID._impl == 7 && b.gpuResourceID._impl == 8);
+	CHECK(asker.asked.size() == 2);
+	const RgfxSamplerCreate &m = asker.asked[0];
+	CHECK(m.header.type == RGFX_CMD_SAMPLER_CREATE && m.header.size == sizeof(m));
+	CHECK(m.obj_id == a.rgfxObjId && asker.asked[1].obj_id == b.rgfxObjId);
+	CHECK(m.min_filter == MTLSamplerMinMagFilterLinear && (m.flags & 0x4) != 0);
+	float lod = 0;
+	std::memcpy(&lod, &m.lod_max_clamp_bits, sizeof(lod));
+	CHECK(lod == 4.0f);
+	RgfxMsgHeader h = {};
+	std::vector<uint8_t> bytes;
+	CHECK(!control.next(&h, &bytes)); // asked, not posted
+
+	asker.status = RGFX_STATUS_REFUSED;
+	CHECK([RgfxSampler samplerWithDescriptor:d device:nil serializer:&ser] == nil);
+	asker.answers = false;
+	CHECK([RgfxSampler samplerWithDescriptor:d device:nil serializer:&ser] == nil);
+	CHECK(asker.asked.size() == 4);
+
+	ser.setAsker(nullptr, nullptr);
+	RgfxSampler *plain = [RgfxSampler samplerWithDescriptor:d device:nil serializer:&ser];
+	CHECK(plain != nil && plain.gpuResourceID._impl == 0);
+	(void)expectMessage<RgfxSamplerCreate>(control, RGFX_CMD_SAMPLER_CREATE);
+}
+
 // The word at `offset` of `buffer`'s contents.
 uint64_t wordAt(id<MTLBuffer> buffer, uint64_t offset)
 {
@@ -1112,17 +1186,22 @@ void test_argument_encoder_members()
 	[inner setTexture:named atIndex:0];
 	CHECK(wordAt(args, 16) == 0x1234);
 
-	// A sampler's resource id is not on the wire: its word is 0, and it logs that.
+	// A sampler's word is the resource id the host answered its create with.
 	[enc setArgumentBuffer:args offset:0];
+	SamplerAsker samplers;
+	samplers.id = 0x2a;
+	ser.setAsker(&SamplerAsker::ask, &samplers);
 	RgfxSampler *smp = [RgfxSampler samplerWithDescriptor:[[MTLSamplerDescriptor alloc] init]
 	                                               device:nil
 	                                           serializer:&ser];
-	CHECK(smp != nil);
+	ser.setAsker(nullptr, nullptr);
+	CHECK(smp != nil && smp.gpuResourceID._impl == 0x2a);
+	std::memset(args.contents, 0x5c, 24);
 	[enc setSamplerState:nil atIndex:2];
-	CHECK(!RgfxUnsupportedWasLogged(c, @selector(setSamplerState:atIndex:)));
-	[enc setSamplerState:smp atIndex:2];
 	CHECK(wordAt(args, 16) == 0);
-	CHECK(RgfxUnsupportedWasLogged(c, @selector(setSamplerState:atIndex:)));
+	[enc setSamplerState:smp atIndex:2];
+	CHECK(wordAt(args, 16) == 0x2a);
+	CHECK(!RgfxUnsupportedWasLogged(c, @selector(setSamplerState:atIndex:)));
 	// A depth/stencil state has no resource id: its argument keeps its bytes.
 	RgfxDepthStencilState *ds =
 	    [RgfxDepthStencilState depthStencilStateWithDescriptor:[[MTLDepthStencilDescriptor alloc] init]
@@ -1436,6 +1515,7 @@ void rgfxProtocolTests()
 	test_library_members();
 	test_argument_encoder_members();
 	test_argument_encoder_query();
+	test_sampler_resource_ids();
 	test_shared_event_wait();
 	test_heap_sizes();
 	test_queue_barriers();

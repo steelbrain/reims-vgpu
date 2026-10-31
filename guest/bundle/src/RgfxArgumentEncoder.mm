@@ -255,10 +255,7 @@ uint64_t resourceId(MTLResourceID id)
 
 - (void)setSamplerState:(id<MTLSamplerState>)sampler atIndex:(NSUInteger)index
 {
-	const uint64_t word = sampler != nil ? resourceId(sampler.gpuResourceID) : 0;
-	if (sampler != nil && word == 0)
-		RGFX_UNSUPPORTED("argument-buffer samplers (no sampler resource id on the wire)");
-	[self rgfxWord:word atIndex:index cmd:_cmd];
+	[self rgfxWord:sampler != nil ? resourceId(sampler.gpuResourceID) : 0 atIndex:index cmd:_cmd];
 }
 
 - (void)setSamplerStates:(const id<MTLSamplerState> __nullable[__nonnull])samplers

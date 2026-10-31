@@ -9,8 +9,13 @@
  *
  * MTLSamplerState exposes only `label`, `device` and `gpuResourceID`; the sampler's
  * state lives on the wire, not in gettable protocol properties, so the wrapper
- * holds only its objId. The sampler create carries no resource id yet, so
- * `gpuResourceID` answers 0 (a follow-up: argument-buffer samplers need one).
+ * holds its objId and its resource id. The host's device numbers its samplers
+ * itself, in one space with its own and its pipelines', and answers one sampler
+ * for equal descriptors (measured: M3 Max, macOS 27, as metal2vulkan's do), so
+ * the guest picks none: the create waits for the host's answer (SAMPLER_STATE),
+ * whose id `gpuResourceID` answers and an argument buffer holds. A sampler the
+ * host refuses, or whose create is not answered, is nil, as Metal answers one it
+ * cannot make.
  *
  * Our own ObjC++: conforms to MTLSamplerState but subclasses only NSObject (via
  * RgfxResource), so it instantiates and is unit-tested on the Mac.

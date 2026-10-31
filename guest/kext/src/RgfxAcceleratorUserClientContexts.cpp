@@ -270,14 +270,16 @@ IOReturn RgfxAcceleratorUserClient::submitMethod(IOExternalMethodArguments *a)
 			r = kIOReturnBadArgument;
 	}
 	// The answers the client waits for: a pipeline create's reflection, a heap texture size
-	// query's SIZE_AND_ALIGN, and the COMPLETE of a library create or lookup (a library's last
-	// region chunk is its create) or of an argument layout, whose layout the device writes into
-	// the client's block before it.
+	// query's SIZE_AND_ALIGN, a sampler create's SAMPLER_STATE (its resource id), and the
+	// COMPLETE of a library create or lookup (a library's last region chunk is its create) or of
+	// an argument layout, whose layout the device writes into the client's block before it.
 	UInt32 replyType = 0;
 	if (type == RGFX_CMD_RENDER_PIPELINE_CREATE || type == RGFX_CMD_COMPUTE_PIPELINE_CREATE)
 		replyType = RGFX_EVT_PIPELINE_REFLECTION;
 	else if (type == RGFX_CMD_HEAP_TEXTURE_SIZE_AND_ALIGN)
 		replyType = RGFX_EVT_SIZE_AND_ALIGN;
+	else if (type == RGFX_CMD_SAMPLER_CREATE)
+		replyType = RGFX_EVT_SAMPLER_STATE;
 	else if (type == RGFX_CMD_LIBRARY_CREATE || type == RGFX_CMD_LIBRARY_LOOKUP ||
 	         type == RGFX_CMD_ARGUMENT_LAYOUT ||
 	         (type == RGFX_CMD_LIBRARY_FROM_REGION && lastLibraryChunk(message, size)))

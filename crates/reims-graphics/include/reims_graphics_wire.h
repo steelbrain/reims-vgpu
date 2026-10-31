@@ -854,7 +854,8 @@
 // global id.
 #define RGFX_CMD_TEXTURE_FROM_IOSURFACE 521
 
-// Command `SAMPLER_CREATE`: a sampler from a descriptor. Struct later.
+// Command `SAMPLER_CREATE` ([`RgfxSamplerCreate`]): a sampler from a descriptor, answered by
+// [`RGFX_EVT_SAMPLER_STATE`] with the `gpuResourceID` the host's device numbers it by.
 #define RGFX_CMD_SAMPLER_CREATE 522
 
 // Command `DEPTH_STENCIL_CREATE`: a depth/stencil state from a descriptor.
@@ -1005,6 +1006,10 @@
 // Event `SIZE_AND_ALIGN` ([`RgfxSizeAndAlign`], on the control completion ring): a
 // `HEAP_TEXTURE_SIZE_AND_ALIGN`'s answer.
 #define RGFX_EVT_SIZE_AND_ALIGN 1027
+
+// Event `SAMPLER_STATE` ([`RgfxSamplerState`], on the control completion ring): a
+// `SAMPLER_CREATE`'s answer.
+#define RGFX_EVT_SAMPLER_STATE 1028
 
 // A command buffer's status in [`RgfxCbComplete`]: finished with no error.
 #define RGFX_CB_OK 0
@@ -3942,6 +3947,22 @@ typedef struct {
   // argument buffer.
   uint32_t flags;
 } RgfxSamplerCreate;
+
+// `SAMPLER_STATE`: a `SAMPLER_CREATE`'s answer. `status` is [`RGFX_STATUS_OK`] with the sampler's
+// `gpu_resource_id`, or [`RGFX_STATUS_REFUSED`] (the device made none) or
+// [`RGFX_STATUS_INVALID_ARGUMENT`] (the create was short), with 0. The host's device numbers its
+// samplers itself, every process's and its own in one space, and answers one sampler, and one
+// id, for equal descriptors, so the guest takes the id from here rather than picking one.
+typedef struct {
+  // [`RGFX_EVT_SAMPLER_STATE`], with the create's `seqno`.
+  RgfxMsgHeader header;
+  // An `RGFX_STATUS_*`.
+  uint32_t status;
+  // Pads to a multiple of 8; 0.
+  uint32_t reserved_14;
+  // `MTLSamplerState.gpuResourceID`: what an argument buffer holds of the sampler.
+  uint64_t gpu_resource_id;
+} RgfxSamplerState;
 
 // One element of a sampler-with-LOD-clamps array
 // ([`RgfxOpSetVertexSamplerStatesLodClamps`] and the like): a sampler (0 = nil) and

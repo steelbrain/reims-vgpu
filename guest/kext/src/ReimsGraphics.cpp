@@ -462,6 +462,7 @@ void ReimsGraphics::handleEvent(UInt32 type, UInt64 seqno, const volatile UInt8 
 		return;
 	case RGFX_EVT_PIPELINE_REFLECTION:
 	case RGFX_EVT_SIZE_AND_ALIGN:
+	case RGFX_EVT_SAMPLER_STATE:
 		answerLifecycle(type, seqno, payload, size);
 		return;
 	case RGFX_EVT_VBLANK: {

@@ -20,7 +20,7 @@
  * queues' own, so the accelerator posts the Metal processes' object lifecycle
  * on it too (postLifecycle), under the same lock; the work loop hands each of
  * those its answer (a COMPLETE, a pipeline's reflection, a heap texture
- * size) by seqno.
+ * size, a sampler's resource id) by seqno.
  */
 
 #ifndef REIMS_GRAPHICS_HPP_

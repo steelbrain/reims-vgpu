@@ -254,7 +254,8 @@ pub const RGFX_CMD_TEXTURE_FROM_BUFFER: u32 = 0x208;
 /// over a guest process's copy of an IOSurface plane, named by the surface's
 /// global id.
 pub const RGFX_CMD_TEXTURE_FROM_IOSURFACE: u32 = 0x209;
-/// Command `SAMPLER_CREATE`: a sampler from a descriptor. Struct later.
+/// Command `SAMPLER_CREATE` ([`RgfxSamplerCreate`]): a sampler from a descriptor, answered by
+/// [`RGFX_EVT_SAMPLER_STATE`] with the `gpuResourceID` the host's device numbers it by.
 pub const RGFX_CMD_SAMPLER_CREATE: u32 = 0x20a;
 /// Command `DEPTH_STENCIL_CREATE`: a depth/stencil state from a descriptor.
 /// Struct later.
@@ -382,6 +383,9 @@ pub const RGFX_EVT_PIPELINE_REFLECTION: u32 = 0x402;
 /// Event `SIZE_AND_ALIGN` ([`RgfxSizeAndAlign`], on the control completion ring): a
 /// `HEAP_TEXTURE_SIZE_AND_ALIGN`'s answer.
 pub const RGFX_EVT_SIZE_AND_ALIGN: u32 = 0x403;
+/// Event `SAMPLER_STATE` ([`RgfxSamplerState`], on the control completion ring): a
+/// `SAMPLER_CREATE`'s answer.
+pub const RGFX_EVT_SAMPLER_STATE: u32 = 0x404;
 
 /// A command buffer's status in [`RgfxCbComplete`]: finished with no error.
 pub const RGFX_CB_OK: u32 = 0;
@@ -1041,6 +1045,26 @@ pub struct RgfxSizeAndAlign {
     pub size: u64,
     /// `MTLSizeAndAlign.align`.
     pub align: u64,
+}
+
+/// `SAMPLER_STATE`: a `SAMPLER_CREATE`'s answer. `status` is [`RGFX_STATUS_OK`] with the sampler's
+/// `gpu_resource_id`, or [`RGFX_STATUS_REFUSED`] (the device made none) or
+/// [`RGFX_STATUS_INVALID_ARGUMENT`] (the create was short), with 0. The host's device numbers its
+/// samplers itself, every process's and its own in one space, and answers one sampler, and one
+/// id, for equal descriptors, so the guest takes the id from here rather than picking one.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxSamplerState {
+    /// [`RGFX_EVT_SAMPLER_STATE`], with the create's `seqno`.
+    pub header: RgfxMsgHeader,
+    /// An `RGFX_STATUS_*`.
+    pub status: u32,
+    /// Pads to a multiple of 8; 0.
+    pub reserved_14: u32,
+    /// `MTLSamplerState.gpuResourceID`: what an argument buffer holds of the sampler.
+    pub gpu_resource_id: u64,
 }
 
 /// `BUFFER_DID_MODIFY_RANGE`: the guest wrote `length` bytes at `location` of `Managed` buffer
@@ -2068,6 +2092,7 @@ const _: () = {
     assert!(size_of::<RgfxTextureView>() == 72);
     assert!(size_of::<RgfxHeapTextureSizeAndAlign>() == 72);
     assert!(size_of::<RgfxSizeAndAlign>() == 40);
+    assert!(size_of::<RgfxSamplerState>() == 32);
     assert!(RGFX_LIBRARY_BYTES_OFFSET as usize == size_of::<RgfxLibraryCreate>());
     assert!(size_of::<RgfxFormatAnswers>() == 64);
     assert!(size_of::<RgfxDeviceInfo>() == 1400 + 64 * RGFX_DEVICE_INFO_FORMATS);

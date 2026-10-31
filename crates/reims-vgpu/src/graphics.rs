@@ -34,9 +34,10 @@ use reims_graphics::wire::{
     RGFX_CMD_ARGUMENT_LAYOUT, RGFX_CMD_COMMAND_BUFFER, RGFX_CMD_COMPUTE_PIPELINE_CREATE,
     RGFX_CMD_HEAP_TEXTURE_SIZE_AND_ALIGN, RGFX_CMD_LIBRARY_CREATE, RGFX_CMD_LIBRARY_FROM_REGION,
     RGFX_CMD_LIBRARY_LOOKUP, RGFX_CMD_OBJECT_DESTROY, RGFX_CMD_RENDER_PIPELINE_CREATE,
-    RGFX_CONTEXT_OBJ_ID_SHIFT, RGFX_DEVICE_INFO_OFFSET, RGFX_STATUS_INVALID_ARGUMENT,
-    RGFX_STATUS_OK, RGFX_STATUS_REFUSED, RgfxBlockRelease, RgfxCbComplete, RgfxLibraryLookup,
-    RgfxMsgHeader, RgfxPipelineReflection,
+    RGFX_CMD_SAMPLER_CREATE, RGFX_CONTEXT_OBJ_ID_SHIFT, RGFX_DEVICE_INFO_OFFSET,
+    RGFX_EVT_SAMPLER_STATE, RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK, RGFX_STATUS_REFUSED,
+    RgfxBlockRelease, RgfxCbComplete, RgfxLibraryLookup, RgfxMsgHeader, RgfxPipelineReflection,
+    RgfxSamplerState,
 };
 use reims_graphics::{
     CompleteAnswer, CompletionPoster, CursorImage, FixedScreen, Host, Mode, PresentAnswer, Scanout,
@@ -442,6 +443,10 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                 self.argument_layout(poster, message);
                 return;
             }
+            RGFX_CMD_SAMPLER_CREATE => {
+                self.create_sampler(poster, message);
+                return;
+            }
             RGFX_CMD_COMMAND_BUFFER => self.pending.wait_for_command_buffer(message),
             _ => {}
         }
@@ -589,6 +594,50 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         if let Some(answer) = answer {
             poster.post(answer.as_bytes());
         }
+    }
+
+    /// A sampler create from ring 0, answered at once through `poster` with the sampler's
+    /// `gpuResourceID` (`SAMPLER_STATE`), which the guest's sampler answers and its argument
+    /// buffers hold: the id the platform numbers it by, in the one space the host's own samplers
+    /// and its pipelines' take theirs from, so none is held twice. A create the platform raises
+    /// at is answered refused, as one it refuses.
+    fn create_sampler(&self, poster: &CompletionPoster, message: &[u8]) {
+        let (ty, seqno, obj_id) = message_identity(message);
+        let answer = entry::run(|_| {
+            let mut decoder = self.decoder.lock();
+            decoder.set_context(Some(sender_context(poster, message)));
+            refusing(|| decoder.sampler_state(&self.device, message))
+        });
+        let answer = answer.unwrap_or_else(|raise| {
+            log::warn!(
+                target: "reims_vgpu::graphics",
+                "a sampler create (type {ty:#x}, seqno {seqno}, object {obj_id:#x}) faulted: \
+                 {raise}"
+            );
+            RgfxMsgHeader::read_from_prefix(message)
+                .ok()
+                .map(|(header, _)| RgfxSamplerState {
+                    header: RgfxMsgHeader {
+                        r#type: RGFX_EVT_SAMPLER_STATE,
+                        size: size_of::<RgfxSamplerState>() as u32,
+                        seqno: header.seqno,
+                    },
+                    status: RGFX_STATUS_REFUSED,
+                    ..RgfxSamplerState::default()
+                })
+        });
+        let Some(answer) = answer else {
+            return;
+        };
+        if answer.status != RGFX_STATUS_OK {
+            log::warn!(
+                target: "reims_vgpu::graphics",
+                "a sampler create (type {ty:#x}, seqno {seqno}, object {obj_id:#x}) was answered \
+                 status {}",
+                answer.status
+            );
+        }
+        poster.post(answer.as_bytes());
     }
 
     /// An argument buffer's layout from ring 0, answered at once: written into the sender's

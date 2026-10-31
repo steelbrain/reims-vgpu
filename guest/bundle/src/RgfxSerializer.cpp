@@ -447,7 +447,19 @@ RgfxCreated RgfxSerializer::createSampler(const RgfxSamplerParams &params)
 	msg.lod_min_clamp_bits = floatBits(params.lod_min_clamp);
 	msg.lod_max_clamp_bits = floatBits(params.lod_max_clamp);
 	msg.flags = params.flags;
-	out.posted = m_control.tryPost(RGFX_CMD_SAMPLER_CREATE, &msg, sizeof(msg), &out.seqno);
+	if (m_ask == nullptr) {
+		out.posted = m_control.tryPost(RGFX_CMD_SAMPLER_CREATE, &msg, sizeof(msg), &out.seqno);
+		return out;
+	}
+	msg.header.type = RGFX_CMD_SAMPLER_CREATE;
+	msg.header.size = sizeof(msg);
+	RgfxSamplerState answer = {};
+	uint32_t length = 0;
+	out.posted = m_ask(m_askContext, &msg, sizeof(msg), &answer, sizeof(answer), &length) &&
+	             length >= sizeof(answer) && answer.header.type == RGFX_EVT_SAMPLER_STATE;
+	out.status = out.posted ? answer.status : kRgfxNoAnswer;
+	out.seqno = out.posted ? answer.header.seqno : 0;
+	out.resource_id = out.posted && answer.status == RGFX_STATUS_OK ? answer.gpu_resource_id : 0;
 	return out;
 }
 

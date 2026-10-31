@@ -32,7 +32,9 @@ RgfxSamplerParams rgfxSamplerParamsFromMTL(MTLSamplerDescriptor *d)
 
 } // namespace
 
-@implementation RgfxSampler
+@implementation RgfxSampler {
+	uint64_t _resourceId; // the host's answer; 0 where none came (a create on a test's ring)
+}
 
 // The host drops the sampler once every command buffer in flight now has completed, as one may
 // still name it.
@@ -50,17 +52,28 @@ RgfxSamplerParams rgfxSamplerParamsFromMTL(MTLSamplerDescriptor *d)
 	}
 	RgfxSamplerParams params = rgfxSamplerParamsFromMTL(descriptor);
 	RgfxCreated created = serializer->createSampler(params);
-	return [[RgfxSampler alloc] initWithObjId:created.obj_id device:device serializer:serializer];
+	// A create the host refused, or one not answered (kRgfxNoAnswer), made no sampler: nil, as
+	// Metal answers a sampler it cannot make. One the kext timed out on is followed by its
+	// destroy there, so nothing is left to let go.
+	if (created.status != RGFX_STATUS_OK) {
+		NSLog(@"RGFX: newSamplerStateWithDescriptor: no sampler (status 0x%x)", created.status);
+		return nil;
+	}
+	RgfxSampler *sampler = [[RgfxSampler alloc] initWithObjId:created.obj_id
+	                                                    device:device
+	                                                serializer:serializer];
+	if (sampler)
+		sampler->_resourceId = created.resource_id;
+	return sampler;
 }
 
 // --- MTLSamplerState ---------------------------------------------------------
 
+// The id the host's device numbered the sampler by (RgfxSampler.h).
 - (MTLResourceID)gpuResourceID
 {
-	// The sampler create carries no resource id yet; a sampler used from an
-	// argument buffer needs one (a wire follow-up). Answer 0 until then.
 	MTLResourceID rid;
-	rid._impl = 0;
+	rid._impl = _resourceId;
 	return rid;
 }
 

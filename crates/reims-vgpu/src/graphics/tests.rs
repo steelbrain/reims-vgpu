@@ -1175,6 +1175,43 @@ fn a_heap_texture_size_query_is_answered_on_ring_0() {
     assert_eq!(device.decoder_object_count(), 0);
 }
 
+/// A sampler create on ring 0 is answered on the control completion ring, at its seqno, with
+/// the sampler's `gpuResourceID`: the platform's, which a command buffer naming the sampler finds
+#[test]
+fn a_sampler_create_is_answered_on_ring_0() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform) = headless_on(&raised);
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    let create = RgfxSamplerCreate {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_SAMPLER_CREATE,
+            size: 0,
+            seqno: 0,
+        },
+        obj_id: obj(1, 4),
+        max_anisotropy: 1,
+        flags: 0b101,
+        lod_max_clamp_bits: f32::MAX.to_bits(),
+        ..RgfxSamplerCreate::default()
+    };
+    guest.send(&device, create.as_bytes().to_vec());
+    let bytes = guest.event().expect("a SAMPLER_STATE");
+    let answer = RgfxSamplerState::read_from_bytes(&bytes).unwrap();
+    assert_eq!(answer.header.r#type, RGFX_EVT_SAMPLER_STATE);
+    assert_eq!(answer.header.seqno, guest.seqno);
+    assert_eq!(answer.status, RGFX_STATUS_OK);
+    assert_ne!(answer.gpu_resource_id, 0);
+    assert_eq!(
+        platform
+            .call_log()
+            .calls_to("newSamplerStateWithDescriptor:")
+            .len(),
+        1
+    );
+    assert_eq!(device.decoder_object_count(), 1);
+}
+
 /// An argument layout query on ring 0 writes the platform's layout into the sender's block and is
 /// answered by a `COMPLETE` at its seqno, making no object; one whose block is another process's
 /// is refused, with nothing written

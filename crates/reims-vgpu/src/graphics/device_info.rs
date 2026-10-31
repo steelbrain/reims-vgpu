@@ -205,12 +205,14 @@ const APPLE_PIECES: [(i64, &[Piece]); 11] = {
     ]
 };
 
-/// The pieces the lane carries: texture views (`TEXTURE_VIEW`), placement in an Automatic heap
-/// with the heap texture size (`HEAP_TEXTURE_SIZE_AND_ALIGN`), and binary archives, which the
+/// The pieces the lane carries: argument encoders (the host's layout, `ARGUMENT_LAYOUT`, and the
+/// sampler ids `SAMPLER_STATE` answers), texture views (`TEXTURE_VIEW`), placement in an Automatic
+/// heap with the heap texture size (`HEAP_TEXTURE_SIZE_AND_ALIGN`), and binary archives, which the
 /// bundle keeps in the guest (`RgfxBinaryArchive`: no compiled code crosses, so no wire message).
 /// A piece joins this list when its wire messages, its decoding and its bundle members land, and
 /// the Apple families it holds back rise with it.
 const WIRED: &[Piece] = &[
+    Piece::ArgumentEncoders,
     Piece::AutomaticHeaps,
     Piece::TextureViews,
     Piece::BinaryArchives,
@@ -601,8 +603,9 @@ mod tests {
         assert_eq!(set(&no_imageblocks, 16), Some(false));
         assert_eq!(set(&no_imageblocks, 10000), Some(true));
 
-        // The lane's own pieces: texture views and Automatic heaps, but not Apple2's others, so
-        // no Apple family stands, and none would without either of them.
+        // The lane's own pieces: argument encoders, texture views and Automatic heaps, but not
+        // Apple2's others, so no Apple family stands, and none would without any one of them.
+        assert!(WIRED.contains(&Piece::ArgumentEncoders));
         assert!(WIRED.contains(&Piece::TextureViews));
         assert!(WIRED.contains(&Piece::AutomaticHeaps));
         let mut lane = platform.clone();
@@ -619,6 +622,16 @@ mod tests {
             );
         }
         assert_eq!(answer(&lane, 2002), Some(true));
+        // With the rest of Apple2's pieces carried too, Apple1 and Apple2 stand.
+        let to_apple2: Vec<Piece> = WIRED
+            .iter()
+            .copied()
+            .chain([Piece::SamplePositions, Piece::IoCommandQueues])
+            .collect();
+        let mut apple2_lane = platform.clone();
+        cap_apple_families(&mut apple2_lane, &to_apple2);
+        assert_eq!(answer(&apple2_lane, 1002), Some(true));
+        assert_eq!(answer(&apple2_lane, 1003), Some(false));
 
         let no_encoders = without(Piece::ArgumentEncoders);
         for family in 1001..=1011 {

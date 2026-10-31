@@ -221,6 +221,7 @@ include = [
     "RgfxRingHeader",
     "RgfxSamplerBinding",
     "RgfxSamplerCreate",
+    "RgfxSamplerState",
     "RgfxSamplerLodBinding",
     "RgfxScissorRectElem",
     "RgfxSetCursor",

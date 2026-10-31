@@ -16,10 +16,10 @@
  * writes its words in turn. A setter with no argument buffer set writes nothing, and logs it
  * (plain Metal's process ends there). constantDataAtIndex: answers the place itself.
  *
- * What the device makes no object of (indirect command buffers, acceleration structures,
- * function tables) only nil reaches, which writes 0. A depth/stencil state has no resource id on
- * the wire, so its arguments keep the bytes the buffer holds, and a sampler's resource id is not
- * on the wire yet (RgfxSampler.h): both log their first use (RgfxUnsupported.h).
+ * A sampler's word is the resource id the host's device numbered it by (RgfxSampler.h). What the
+ * device makes no object of (indirect command buffers, acceleration structures, function tables)
+ * only nil reaches, which writes 0. A depth/stencil state has no resource id on the wire, so its
+ * arguments keep the bytes the buffer holds, and log their first use (RgfxUnsupported.h).
  *
  * Our own ObjC++: it conforms to MTLArgumentEncoder but subclasses only NSObject (via
  * RgfxResource), so it instantiates and is unit-tested on the Mac.

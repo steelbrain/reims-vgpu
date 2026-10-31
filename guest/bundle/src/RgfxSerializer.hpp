@@ -256,7 +256,10 @@ public:
 
 	// --- state objects --------------------------------------------------------
 
-	/// A sampler state.
+	/// A sampler state. With an asker set, the device answers the create (SAMPLER_STATE):
+	/// `status` is its status, and `resource_id` the sampler's gpuResourceID, the id the host's
+	/// device numbers it by; `posted` is false where no answer came back. Without one the create
+	/// goes on the ring unanswered, with no resource id.
 	RgfxCreated createSampler(const RgfxSamplerParams &params);
 
 	/// A depth/stencil state.

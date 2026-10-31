@@ -49,23 +49,23 @@ use reims_graphics::wire::{
     RGFX_CMD_SAMPLER_CREATE, RGFX_CMD_SHARED_EVENT_CREATE, RGFX_CMD_TEXTURE_CREATE,
     RGFX_CMD_TEXTURE_FROM_BUFFER, RGFX_CMD_TEXTURE_FROM_IOSURFACE, RGFX_CMD_TEXTURE_REPLACE_REGION,
     RGFX_CMD_TEXTURE_VIEW, RGFX_CONTEXT_ALLOCATIONS_OFFSET, RGFX_CONTEXT_OBJ_ID_SHIFT,
-    RGFX_CURSOR_SPAN, RGFX_EVT_PIPELINE_REFLECTION, RGFX_EVT_SIZE_AND_ALIGN,
-    RGFX_PIPELINE_KIND_COMPUTE, RGFX_PIPELINE_KIND_RENDER, RGFX_PIPELINE_OK,
-    RGFX_PIPELINE_REFLECT_SUPPORT_ICB, RGFX_PIPELINE_REFLECT_THREADGROUP_MATCHES_TILE,
-    RGFX_PIPELINE_REFUSED, RGFX_RESOURCE_ID_CHUNK, RGFX_RESOURCE_ID_CHUNKS, RGFX_RESOURCE_ID_LIMIT,
-    RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK, RGFX_STATUS_REFUSED, RgfxBufferAtOffset,
-    RgfxBufferCreate, RgfxBufferOverHostMemory, RgfxCbComplete, RgfxColorAttachmentDesc,
-    RgfxComputePipelineCreate, RgfxDepthStencilCreate, RgfxFunctionConstant, RgfxHeapCreate,
-    RgfxHeapOverHostMemory, RgfxHeapTextureSizeAndAlign, RgfxMsgHeader, RgfxObjectCreate,
-    RgfxObjectDestroy, RgfxPipelineReflection, RgfxQueueCreate, RgfxRenderPipelineCreate,
-    RgfxResourceIdChunk, RgfxSamplerCreate, RgfxSharedEventCreate, RgfxSizeAndAlign,
-    RgfxStencilDescriptor, RgfxTextureCreate, RgfxTextureDescriptor, RgfxTextureFromBuffer,
-    RgfxTextureFromIOSurface,
+    RGFX_CURSOR_SPAN, RGFX_EVT_PIPELINE_REFLECTION, RGFX_EVT_SAMPLER_STATE,
+    RGFX_EVT_SIZE_AND_ALIGN, RGFX_PIPELINE_KIND_COMPUTE, RGFX_PIPELINE_KIND_RENDER,
+    RGFX_PIPELINE_OK, RGFX_PIPELINE_REFLECT_SUPPORT_ICB,
+    RGFX_PIPELINE_REFLECT_THREADGROUP_MATCHES_TILE, RGFX_PIPELINE_REFUSED, RGFX_RESOURCE_ID_CHUNK,
+    RGFX_RESOURCE_ID_CHUNKS, RGFX_RESOURCE_ID_LIMIT, RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK,
+    RGFX_STATUS_REFUSED, RgfxBufferAtOffset, RgfxBufferCreate, RgfxBufferOverHostMemory,
+    RgfxCbComplete, RgfxColorAttachmentDesc, RgfxComputePipelineCreate, RgfxDepthStencilCreate,
+    RgfxFunctionConstant, RgfxHeapCreate, RgfxHeapOverHostMemory, RgfxHeapTextureSizeAndAlign,
+    RgfxMsgHeader, RgfxObjectCreate, RgfxObjectDestroy, RgfxPipelineReflection, RgfxQueueCreate,
+    RgfxRenderPipelineCreate, RgfxResourceIdChunk, RgfxSamplerCreate, RgfxSamplerState,
+    RgfxSharedEventCreate, RgfxSizeAndAlign, RgfxStencilDescriptor, RgfxTextureCreate,
+    RgfxTextureDescriptor, RgfxTextureFromBuffer, RgfxTextureFromIOSurface,
 };
 use reims_vgpu_core::host::HostPtr;
 use reims_vgpu_core::platform::device::GpuDevice;
 use reims_vgpu_core::platform::resource::{
-    Buffer, ComputePipeline, FunctionConstant, Heap, Library, RenderPipeline,
+    Buffer, ComputePipeline, FunctionConstant, Heap, Library, RenderPipeline, SamplerState,
 };
 use reims_vgpu_core::platform::types::Swizzle;
 use reims_vgpu_core::platform::values::{
@@ -391,6 +391,76 @@ impl<P: Platform> GraphicsDecoder<P> {
         self.id_chunks[chunk as usize] = Some(context);
     }
 
+    /// A `SAMPLER_CREATE`'s answer (`SAMPLER_STATE`): the sampler made under the message's id,
+    /// with its `gpuResourceID`, the id the platform numbers it by, which the guest's sampler
+    /// answers and its argument buffers hold; [`RGFX_STATUS_REFUSED`] with 0 where the platform
+    /// makes none, and [`RGFX_STATUS_INVALID_ARGUMENT`] for a short create. `None` for a message
+    /// too short to carry its seqno, which no one can be answered by.
+    pub(crate) fn sampler_state(
+        &mut self,
+        device: &P::Device,
+        message: &[u8],
+    ) -> RaiseResult<Option<RgfxSamplerState>> {
+        let Some(header) = read::<RgfxMsgHeader>(message) else {
+            return Ok(None);
+        };
+        let answer = |status, gpu_resource_id| RgfxSamplerState {
+            header: RgfxMsgHeader {
+                r#type: RGFX_EVT_SAMPLER_STATE,
+                size: size_of::<RgfxSamplerState>() as u32,
+                seqno: header.seqno,
+            },
+            status,
+            reserved_14: 0,
+            gpu_resource_id,
+        };
+        Ok(Some(match self.make_sampler(device, message)? {
+            Ok(id) => answer(RGFX_STATUS_OK, id),
+            Err(DecodeError::Malformed) => answer(RGFX_STATUS_INVALID_ARGUMENT, 0),
+            Err(_) => answer(RGFX_STATUS_REFUSED, 0),
+        }))
+    }
+
+    /// The sampler of a `SAMPLER_CREATE`, stored under its id: its `gpuResourceID`.
+    fn make_sampler(
+        &mut self,
+        device: &P::Device,
+        message: &[u8],
+    ) -> RaiseResult<Result<u64, DecodeError>> {
+        let Some(m) = read::<RgfxSamplerCreate>(message) else {
+            return Ok(Err(DecodeError::Malformed));
+        };
+        // Our wire sends the whole descriptor, so every field is set;
+        // the LOD clamps travel as `f32` bits, and `flags` packs the
+        // booleans. `reduction_mode` is not on the wire yet (the Metal
+        // default stands).
+        let desc = SamplerDesc {
+            min_filter: Some(m.min_filter.into()),
+            mag_filter: Some(m.mag_filter.into()),
+            mip_filter: Some(m.mip_filter.into()),
+            s_address_mode: Some(m.s_address_mode.into()),
+            t_address_mode: Some(m.t_address_mode.into()),
+            r_address_mode: Some(m.r_address_mode.into()),
+            border_color: Some(m.border_color.into()),
+            compare_function: Some(m.compare_function.into()),
+            max_anisotropy: Some(m.max_anisotropy.into()),
+            lod_min_clamp: Some(f32::from_bits(m.lod_min_clamp_bits)),
+            lod_max_clamp: Some(f32::from_bits(m.lod_max_clamp_bits)),
+            normalized_coordinates: Some((m.flags & 1) != 0),
+            lod_average: Some((m.flags & 2) != 0),
+            support_argument_buffers: Some((m.flags & 4) != 0),
+            reduction_mode: None,
+            resource_index: None,
+        };
+        let Some(sampler) = device.new_sampler_state(&desc)? else {
+            return Ok(Err(DecodeError::Refused));
+        };
+        let id = sampler.gpu_resource_id();
+        Ok(self
+            .insert(m.obj_id, ObjHandle::Sampler(sampler))?
+            .map(|()| id))
+    }
+
     /// A `HEAP_TEXTURE_SIZE_AND_ALIGN`'s answer: `device`'s size and alignment for a texture of
     /// the message's shape (`heapTextureSizeAndAlignWithDescriptor:`), or, where the platform
     /// raises or refuses the shape, [`RGFX_STATUS_REFUSED`] with both 0, which the guest answers
@@ -526,37 +596,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             RGFX_CMD_LIBRARY_CREATE | RGFX_CMD_LIBRARY_FROM_REGION => {
                 self.decode_library(device, message)
             }
-            RGFX_CMD_SAMPLER_CREATE => {
-                let Some(m) = read::<RgfxSamplerCreate>(message) else {
-                    return Ok(Err(DecodeError::Malformed));
-                };
-                // Our wire sends the whole descriptor, so every field is set;
-                // the LOD clamps travel as `f32` bits, and `flags` packs the
-                // booleans. `reduction_mode` is not on the wire yet (the Metal
-                // default stands).
-                let desc = SamplerDesc {
-                    min_filter: Some(m.min_filter.into()),
-                    mag_filter: Some(m.mag_filter.into()),
-                    mip_filter: Some(m.mip_filter.into()),
-                    s_address_mode: Some(m.s_address_mode.into()),
-                    t_address_mode: Some(m.t_address_mode.into()),
-                    r_address_mode: Some(m.r_address_mode.into()),
-                    border_color: Some(m.border_color.into()),
-                    compare_function: Some(m.compare_function.into()),
-                    max_anisotropy: Some(m.max_anisotropy.into()),
-                    lod_min_clamp: Some(f32::from_bits(m.lod_min_clamp_bits)),
-                    lod_max_clamp: Some(f32::from_bits(m.lod_max_clamp_bits)),
-                    normalized_coordinates: Some((m.flags & 1) != 0),
-                    lod_average: Some((m.flags & 2) != 0),
-                    support_argument_buffers: Some((m.flags & 4) != 0),
-                    reduction_mode: None,
-                    resource_index: None,
-                };
-                match device.new_sampler_state(&desc)? {
-                    Some(sampler) => self.insert(m.obj_id, ObjHandle::Sampler(sampler)),
-                    None => Ok(Err(DecodeError::Refused)),
-                }
-            }
+            RGFX_CMD_SAMPLER_CREATE => Ok(self.make_sampler(device, message)?.map(|_| ())),
             RGFX_CMD_DEPTH_STENCIL_CREATE => {
                 let Some(m) = read::<RgfxDepthStencilCreate>(message) else {
                     return Ok(Err(DecodeError::Malformed));
@@ -1848,6 +1888,68 @@ mod tests {
         assert_eq!(made_type(heap(one | 2, 1).as_bytes(), &mut dec), "1");
         assert_eq!(made_type(over(one | 3, 0).as_bytes(), &mut dec), "1");
         assert_eq!(made_type(over(one | 4, 1).as_bytes(), &mut dec), "1");
+    }
+
+    /// A sampler create is answered with the sampler's `gpuResourceID`, the id the platform
+    /// numbers it by, at the create's seqno, and the sampler is stored under its id; a create the
+    /// platform makes nothing of is refused with 0 and stores nothing, and a short one is an
+    /// invalid argument.
+    #[test]
+    fn a_sampler_create_answers_the_platforms_id() {
+        let p = Arc::new(FakePlatform::new());
+        let device = p.device();
+        let region = Arc::new(reims_graphics::region::Region::new(0x1_0000).unwrap());
+        let mut dec = GraphicsDecoder::<FakePlatform>::new(Arc::clone(&p), Arc::clone(&region));
+        let create = |obj_id, seqno| RgfxSamplerCreate {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_SAMPLER_CREATE,
+                size: size_of::<RgfxSamplerCreate>() as u32,
+                seqno,
+            },
+            obj_id,
+            max_anisotropy: 1,
+            flags: 0b101,
+            lod_max_clamp_bits: f32::MAX.to_bits(),
+            ..RgfxSamplerCreate::default()
+        };
+        let first = dec
+            .sampler_state(&device, create(21, 4).as_bytes())
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.header.r#type, RGFX_EVT_SAMPLER_STATE);
+        assert_eq!(first.header.size as usize, size_of::<RgfxSamplerState>());
+        assert_eq!((first.header.seqno, first.status), (4, RGFX_STATUS_OK));
+        assert_ne!(first.gpu_resource_id, 0);
+        assert!(dec.named(21).is_some());
+        let second = dec
+            .sampler_state(&device, create(22, 5).as_bytes())
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.status, RGFX_STATUS_OK);
+        assert_ne!(second.gpu_resource_id, first.gpu_resource_id);
+
+        p.script().push("newSamplerStateWithDescriptor:", Step::Nil);
+        let refused = dec
+            .sampler_state(&device, create(23, 6).as_bytes())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (
+                refused.header.seqno,
+                refused.status,
+                refused.gpu_resource_id
+            ),
+            (6, RGFX_STATUS_REFUSED, 0)
+        );
+        assert!(dec.named(23).is_none());
+        let short = create(24, 7);
+        let short = &short.as_bytes()[..size_of::<RgfxMsgHeader>() + 8];
+        let invalid = dec.sampler_state(&device, short).unwrap().unwrap();
+        assert_eq!(
+            (invalid.header.seqno, invalid.status),
+            (7, RGFX_STATUS_INVALID_ARGUMENT)
+        );
+        assert!(dec.sampler_state(&device, &[0u8; 8]).unwrap().is_none());
     }
 
     /// A heap texture size query is answered at its seqno with the device's size and alignment
