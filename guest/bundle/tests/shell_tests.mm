@@ -3624,6 +3624,7 @@ void test_texture_views()
 	id<MTLTexture> asWords = [over newTextureViewWithPixelFormat:MTLPixelFormatR32Uint];
 	CHECK(asWords.buffer == buf && asWords.bufferOffset == 16 && asWords.bufferBytesPerRow == 32);
 	CHECK(asWords.allocatedSize == over.allocatedSize);
+	CHECK(over.allocatedSize == buf.allocatedSize); // the buffer's, as Metal answers
 	const uint32_t words[2] = {0x11223344, 0x55667788};
 	[asWords replaceRegion:MTLRegionMake2D(1, 2, 2, 1) mipmapLevel:0 withBytes:words bytesPerRow:8];
 	CHECK(std::memcmp(&memory[16 + 32 * 2 + 4], words, 8) == 0);
