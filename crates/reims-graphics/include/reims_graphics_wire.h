@@ -1101,6 +1101,13 @@
 // [`RgfxArgumentMemberRecord::layout`]: no layout.
 #define RGFX_ARGUMENT_NO_LAYOUT 4294967295
 
+// [`RgfxTextureFromIOSurface::writers_offset`] of a copy with no
+// [`RgfxSurfaceWriters`].
+#define RGFX_SURFACE_NO_WRITERS UINT64_MAX
+
+// The slots of [`RgfxSurfaceWriters`].
+#define RGFX_SURFACE_WRITER_SLOTS 4
+
 // Where a `LIBRARY_CREATE` message's bytes start: right after its header.
 #define RGFX_LIBRARY_BYTES_OFFSET 72
 
@@ -4220,6 +4227,10 @@ typedef struct {
 // when the CPU wrote the surface since, before a commit, and back to them when
 // a command buffer that wrote the texture completes. The host names the
 // texture by the surface's id, so a present of the surface finds it.
+//
+// `writers_offset` is where in the buffer the copy's [`RgfxSurfaceWriters`]
+// lie ([`RGFX_SURFACE_NO_WRITERS`] for none): the command buffers committed
+// that write the copy, which a present of the surface waits for.
 typedef struct {
   // [`RGFX_CMD_TEXTURE_FROM_IOSURFACE`].
   RgfxMsgHeader header;
@@ -4239,7 +4250,37 @@ typedef struct {
   uint32_t plane;
   // The texture's shape.
   RgfxTextureDescriptor desc;
+  // The copy's [`RgfxSurfaceWriters`], bytes into the buffer;
+  // [`RGFX_SURFACE_NO_WRITERS`] for none.
+  uint64_t writers_offset;
 } RgfxTextureFromIOSurface;
+
+// One command queue's latest command buffer that writes a surface plane's
+// copy: the queue's id and the buffer's `seqno` on the queue's submission ring.
+// A slot no queue holds has `queue_obj_id` 0.
+typedef struct {
+  // The queue's id; 0 for a free slot.
+  uint64_t queue_obj_id;
+  // The latest `COMMAND_BUFFER` on the queue's ring that writes the copy.
+  uint64_t seqno;
+} RgfxSurfaceWriter;
+
+// The command buffers committed that write a surface plane's copy, one slot
+// per queue, kept by the guest processes that hold the copy, in the copy's
+// block ([`RgfxTextureFromIOSurface::writers_offset`]). Each committing process
+// raises its queue's `seqno` once the buffer is on the queue's ring, before its
+// commit returns, so a present the process (or one it hands the surface to)
+// makes after that finds it; a present of the surface waits for each named
+// buffer's completion before the display reads the copy.
+//
+// The guest writes a slot's `seqno` with 0 before it gives the slot to another
+// queue and the new seqno after, so a reader that reads `queue_obj_id`, then
+// `seqno`, then `queue_obj_id` again, and finds the two ids alike, reads a
+// queue's own seqno (or 0).
+typedef struct {
+  // The slots.
+  RgfxSurfaceWriter writers[RGFX_SURFACE_WRITER_SLOTS];
+} RgfxSurfaceWriters;
 
 // `TEXTURE_REPLACE_REGION`: the guest wrote the texels of `size` at `origin` of `level` and
 // `slice` of `Managed` texture `obj_id`'s CPU copy, at their places in its layout

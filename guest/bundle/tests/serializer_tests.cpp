@@ -263,7 +263,7 @@ void test_resource_id_chunks()
 	CHECK(!none.posted && none.obj_id == 0 && none.resource_id == 0 && none.gpu_address == 0);
 	RgfxCreated noneFromBuffer = ser.createTextureFromBuffer(1, 0, 4, desc);
 	CHECK(!noneFromBuffer.posted && noneFromBuffer.resource_id == 0);
-	RgfxCreated noneFromSurface = ser.createTextureFromIOSurface(1, 0, 4, 0x55, 0, desc);
+	RgfxCreated noneFromSurface = ser.createTextureFromIOSurface(1, 0, 4, 0x55, 0, desc, 0);
 	CHECK(!noneFromSurface.posted && noneFromSurface.resource_id == 0);
 	RgfxTextureView noView = {};
 	noView.parent_obj_id = 1;

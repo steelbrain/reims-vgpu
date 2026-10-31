@@ -59,14 +59,14 @@ use reims_graphics::wire::{
     RGFX_RENDER_PIPELINE_ALPHA_TO_ONE, RGFX_RENDER_PIPELINE_RASTERIZATION_ENABLED,
     RGFX_RENDER_PIPELINE_SUPPORT_ICB, RGFX_RESOURCE_ID_CHUNK, RGFX_RESOURCE_ID_CHUNKS,
     RGFX_RESOURCE_ID_LIMIT, RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK, RGFX_STATUS_REFUSED,
-    RgfxBufferAtOffset, RgfxBufferCreate, RgfxBufferOverHostMemory, RgfxCbComplete,
-    RgfxColorAttachmentDesc, RgfxComputePipelineCreate, RgfxDepthStencilCreate,
+    RGFX_SURFACE_NO_WRITERS, RgfxBufferAtOffset, RgfxBufferCreate, RgfxBufferOverHostMemory,
+    RgfxCbComplete, RgfxColorAttachmentDesc, RgfxComputePipelineCreate, RgfxDepthStencilCreate,
     RgfxFunctionConstant, RgfxHeapCreate, RgfxHeapOverHostMemory, RgfxHeapTextureSizeAndAlign,
     RgfxLinkedFunction, RgfxMsgHeader, RgfxObjectCreate, RgfxObjectDestroy, RgfxPipelineReflection,
     RgfxQueueCreate, RgfxRenderPipelineCreate, RgfxResourceIdChunk, RgfxSamplerCreate,
     RgfxSamplerState, RgfxSharedEventCreate, RgfxSizeAndAlign, RgfxStencilDescriptor,
-    RgfxTextureCreate, RgfxTextureDescriptor, RgfxTextureFromBuffer, RgfxTextureFromIOSurface,
-    RgfxVertexAttribute, RgfxVertexBufferLayout,
+    RgfxSurfaceWriter, RgfxSurfaceWriters, RgfxTextureCreate, RgfxTextureDescriptor,
+    RgfxTextureFromBuffer, RgfxTextureFromIOSurface, RgfxVertexAttribute, RgfxVertexBufferLayout,
 };
 use reims_vgpu_core::host::HostPtr;
 use reims_vgpu_core::platform::device::GpuDevice;
@@ -194,6 +194,9 @@ pub struct GraphicsDecoder<P: Platform> {
     /// process's, or an older one's) to name the surface. A present names its
     /// surface by that id and shows the latest.
     surfaces: HashMap<u32, Vec<u64>>,
+    /// Where in the region each of those textures' copy keeps its
+    /// [`RgfxSurfaceWriters`], by the texture's id, where its message gave one.
+    surface_writers: HashMap<u64, u64>,
     /// The bytes of each library whose `LIBRARY_FROM_REGION` chunks have not yet
     /// reached its length, by the library's id.
     library_chunks: HashMap<u64, Vec<u8>>,
@@ -243,6 +246,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             platform,
             objects: HashMap::new(),
             surfaces: HashMap::new(),
+            surface_writers: HashMap::new(),
             library_chunks: HashMap::new(),
             making_libraries: HashMap::new(),
             library_cache: LibraryCache::new(RELEASED_BUDGET),
@@ -317,17 +321,46 @@ impl<P: Platform> GraphicsDecoder<P> {
         self.objects.len()
     }
 
-    /// The texture over plane 0 of the IOSurface whose global id is
-    /// `iosurface_id`: the latest one a guest process made with
-    /// `TEXTURE_FROM_IOSURFACE` and has not destroyed. Its pixels are what that
-    /// process's command buffers wrote, as of their completion. The caller holds
-    /// its own reference: a destroy of the texture after this leaves it drawable.
-    #[allow(dead_code)] // the present path reads it
+    /// The texture a present of IOSurface `iosurface_id` shows ([`Self::surface_present`]).
+    #[cfg(test)]
     pub(crate) fn surface_texture(&self, iosurface_id: u32) -> Option<P::Texture> {
-        match self.objects.get(self.surfaces.get(&iosurface_id)?.last()?) {
-            Some(ObjHandle::Texture(texture)) => Some(texture.clone_ref()),
-            _ => None,
-        }
+        self.surface_present(iosurface_id)
+            .map(|(texture, _)| texture)
+    }
+
+    /// What a present of IOSurface `iosurface_id` shows: the latest texture a guest process made
+    /// over its plane 0 with `TEXTURE_FROM_IOSURFACE` and has not destroyed, and the command
+    /// buffers committed that write that texture's copy, which the present waits for: the slots
+    /// of its [`RgfxSurfaceWriters`] that name a queue the decoder holds (a slot naming another,
+    /// or none, has nothing to wait for). The caller holds its own reference to the texture: a
+    /// destroy of it after this leaves it drawable.
+    pub(crate) fn surface_present(
+        &self,
+        iosurface_id: u32,
+    ) -> Option<(P::Texture, Vec<RgfxSurfaceWriter>)> {
+        let obj_id = *self.surfaces.get(&iosurface_id)?.last()?;
+        let Some(ObjHandle::Texture(texture)) = self.objects.get(&obj_id) else {
+            return None;
+        };
+        let writers = self
+            .surface_writers
+            .get(&obj_id)
+            .and_then(|&at| self.region.surface_writers(at))
+            .map(|record| {
+                record
+                    .writers
+                    .into_iter()
+                    .filter(|w| {
+                        w.seqno != 0
+                            && matches!(
+                                self.objects.get(&w.queue_obj_id),
+                                Some(ObjHandle::CommandQueue(_))
+                            )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Some((texture.clone_ref(), writers))
     }
 
     /// Forgets texture `obj_id` as a name of the surfaces it lies over.
@@ -336,6 +369,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             textures.retain(|t| *t != obj_id);
             !textures.is_empty()
         });
+        self.surface_writers.remove(&obj_id);
     }
 
     /// Forgets the surface names of textures the table no longer holds: a caller
@@ -344,6 +378,8 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// never taken for the surface's texture.
     pub(crate) fn forget_dropped_surfaces(&mut self) {
         let objects = &self.objects;
+        self.surface_writers
+            .retain(|t, _| matches!(objects.get(t), Some(ObjHandle::Texture(_))));
         self.surfaces.retain(|_, textures| {
             textures.retain(|t| matches!(objects.get(t), Some(ObjHandle::Texture(_))));
             !textures.is_empty()
@@ -839,13 +875,33 @@ impl<P: Platform> GraphicsDecoder<P> {
                 // not hold is a guest protocol error.
                 let desc = texture_desc(&m.desc, m.resource_id);
                 let descriptor = self.platform.texture_descriptor(&desc);
+                if !matches!(self.named(m.buffer_obj_id), Some(ObjHandle::Buffer(_))) {
+                    return Ok(Err(DecodeError::BadReference));
+                }
+                let span = self.span_of(m.buffer_obj_id);
+                // The copy's writers lie wholly inside the buffer, in the region.
+                let writers = if m.writers_offset == RGFX_SURFACE_NO_WRITERS {
+                    None
+                } else {
+                    let record = size_of::<RgfxSurfaceWriters>() as u64;
+                    match span {
+                        Some((at, length))
+                            if m.writers_offset.is_multiple_of(8)
+                                && m.writers_offset
+                                    .checked_add(record)
+                                    .is_some_and(|end| end <= length) =>
+                        {
+                            Some(at + m.writers_offset)
+                        }
+                        _ => return Ok(Err(DecodeError::Malformed)),
+                    }
+                };
                 let made = {
                     let Some(ObjHandle::Buffer(buffer)) = self.named(m.buffer_obj_id) else {
                         return Ok(Err(DecodeError::BadReference));
                     };
                     buffer.new_texture(OnFault::Return, &descriptor, m.offset, m.bytes_per_row)?
                 };
-                let span = self.span_of(m.buffer_obj_id);
                 match made {
                     Some(texture) => {
                         // An id made again names only its new texture's surface.
@@ -855,6 +911,9 @@ impl<P: Platform> GraphicsDecoder<P> {
                                 .entry(m.iosurface_id)
                                 .or_default()
                                 .push(m.obj_id);
+                            if let Some(at) = writers {
+                                self.surface_writers.insert(m.obj_id, at);
+                            }
                         }
                         self.insert_over(m.obj_id, ObjHandle::Texture(texture), span)
                     }
@@ -2804,6 +2863,7 @@ mod tests {
                 usage: 5, // ShaderRead | RenderTarget
                 ..tex_from_buf.desc
             },
+            writers_offset: RGFX_SURFACE_NO_WRITERS,
         };
         assert!(dec.surface_texture(0x77).is_none());
         assert_eq!(
@@ -3040,6 +3100,7 @@ mod tests {
             iosurface_id: 0x55,
             plane: 0,
             desc,
+            writers_offset: RGFX_SURFACE_NO_WRITERS,
         };
         assert_eq!(
             dec.decode(&device, from_surface.as_bytes()).unwrap(),

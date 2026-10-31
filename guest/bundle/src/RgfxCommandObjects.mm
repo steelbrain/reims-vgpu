@@ -966,6 +966,9 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 	_surfaceWrites = _encoder->takeSurfaceWrites();
 	// So do the copies of app memory it uses, which take the bytes the CPU wrote since.
 	_shadowWrites = rgfxShadowsSyncIn(_encoder->takeShadowUses());
+	// The copies it writes, named among their writers once it is posted: its completion may
+	// clear _surfaceWrites by then.
+	std::vector<std::shared_ptr<void>> written = _surfaceWrites;
 	// Committed before the host can see it, so a completion never finds an older status.
 	_status.store(MTLCommandBufferStatusCommitted);
 
@@ -1018,6 +1021,9 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 			                                  expect);
 		}
 	}
+	// A present of a surface it writes, made after this commit, waits for it on the host.
+	if (posted && !written.empty())
+		rgfxIOSurfaceNoteCommitted(written, queue, queue.rgfxObjId, _seqno);
 	// The CPU's part ends here, posted or not; the completion may already have come.
 	CFTimeInterval unset = 0;
 	_kernelEnd.compare_exchange_strong(unset, rgfxHostTime());

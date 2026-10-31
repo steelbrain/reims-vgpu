@@ -4522,6 +4522,143 @@ void test_iosurface_shared_block()
 		CFRelease(s);
 }
 
+// A surface copy's writers (RgfxIOSurface.h): a block made for this process starts with none
+// whatever it held, and its texture names them to the host; each commit of a buffer that draws
+// the copy names its queue and seqno there, in the queue's own slot, raised; another queue takes
+// an empty slot, never one another process holds, or one of ours whose queue is gone; with none
+// left, nothing is named; and the slots of ours go empty as the copy goes.
+void test_iosurface_writers()
+{
+	CHECK(retirementIdle());
+	// Never freed, as Fixture's: the queues and their buffers may go after the test.
+	TestRing &control = *new TestRing(0x8000);
+	control.setConsumerIdle(1);
+	RgfxRingWriter &controlWriter = *new RgfxRingWriter(
+	    control.base(), control.dataSize, RGFX_CONTROL_RING_ID, TestRing::doorbell, nullptr);
+	RgfxIdSpace &ids = *new RgfxIdSpace();
+	int &calls = *new int(0);
+	ids.setResourceIdSource(&oneChunk, &calls);
+	RgfxSerializer &ser = *new RgfxSerializer(controlWriter, ids);
+	TestRing &submit = *new TestRing(0x8000);
+	submit.setConsumerIdle(1);
+	RgfxRingWriter &submitWriter =
+	    *new RgfxRingWriter(submit.base(), submit.dataSize, 1, TestRing::doorbell, nullptr);
+	std::vector<uint8_t> &mem = *new std::vector<uint8_t>(RGFX_ALLOCATIONS_OFFSET + 0x100000, 0);
+	RgfxRegion &region = *new RgfxRegion(mem.data(), mem.size());
+	struct Source {
+		uint64_t offset = RGFX_ALLOCATIONS_OFFSET + 0x40000;
+		static bool acquire(void *c, const void *, uint64_t, uint64_t, uint64_t *offset,
+		                    uint64_t *serial, bool *fresh)
+		{
+			*offset = static_cast<Source *>(c)->offset;
+			*serial = 7;
+			*fresh = true;
+			return true;
+		}
+		static void release(void *, uint64_t) {}
+	} &src = *new Source();
+	region.setSurfaceSource(&Source::acquire, &Source::release, &src);
+	auto queueMade = [&]() {
+		drainRing(control); // a queue let go before has its destroys there
+		RgfxCommandQueue *q = [RgfxCommandQueue queueWithSubmitRing:&submitWriter
+		                                              submitOffset:0
+		                                            completeOffset:0
+		                                          completeDataSize:0
+		                                                       ids:&ids
+		                                                  maxCount:0
+		                                                    device:nil
+		                                                serializer:&ser];
+		CHECK(q != nil);
+		(void)expectQueueCreate(control);
+		return q;
+	};
+	// 16 x 16 BGRA: rows 256 bytes apart, the header at 4096, the writers after it.
+	const uint64_t kWriters = 4096 + 16;
+	auto *writers = reinterpret_cast<RgfxSurfaceWriters *>(mem.data() + src.offset + kWriters);
+	// The block held an older one's writers.
+	for (auto &w : writers->writers)
+		w = {0x5000000000 + 9, 77};
+	NSDictionary *props = @{
+		(id)kIOSurfaceWidth : @16,
+		(id)kIOSurfaceHeight : @16,
+		(id)kIOSurfaceBytesPerElement : @4,
+		(id)kIOSurfacePixelFormat : @(static_cast<uint32_t>('BGRA')),
+	};
+	IOSurfaceRef surface = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+	CHECK(surface != nullptr);
+	// A buffer drawing the texture, committed on `q`: the seqno it was posted at.
+	auto draw = [&](RgfxCommandQueue *q, id<MTLTexture> t) {
+		id<MTLCommandBuffer> cb = [q commandBuffer];
+		MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+		rp.colorAttachments[0].texture = t;
+		rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+		rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+		[[cb renderCommandEncoderWithDescriptor:rp] endEncoding];
+		[cb commit];
+		RgfxMsgHeader h = {};
+		std::vector<uint8_t> bytes;
+		CHECK(submit.next(&h, &bytes) && h.type == RGFX_CMD_COMMAND_BUFFER);
+		return h.seqno;
+	};
+	auto slot = [&](int i) {
+		return std::make_pair(writers->writers[i].queue_obj_id, writers->writers[i].seqno);
+	};
+	using Slot = std::pair<uint64_t, uint64_t>;
+	const Slot kEmpty = {0, 0}, kOther = {0x6000000000 + 3, 12};
+	RgfxCommandQueue *first = queueMade();
+	@autoreleasepool {
+		MTLTextureDescriptor *td =
+		    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+		                                                       width:16
+		                                                      height:16
+		                                                   mipmapped:NO];
+		td.usage = MTLTextureUsageRenderTarget;
+		RgfxIOSurfaceTexture *t = [RgfxIOSurfaceTexture textureWithDescriptor:td
+		                                                            iosurface:surface
+		                                                                plane:0
+		                                                               region:&region
+		                                                               device:nil
+		                                                           serializer:&ser];
+		CHECK(t != nil);
+		(void)expectMessage<RgfxBufferOverHostMemory>(control, RGFX_CMD_BUFFER_OVER_HOST_MEMORY);
+		auto made = expectMessage<RgfxTextureFromIOSurface>(control,
+		                                                    RGFX_CMD_TEXTURE_FROM_IOSURFACE);
+		CHECK(made.writers_offset == kWriters && made.iosurface_id == IOSurfaceGetID(surface));
+		for (int i = 0; i < RGFX_SURFACE_WRITER_SLOTS; i++)
+			CHECK(slot(i) == kEmpty);
+
+		// The first queue's buffers: its slot, raised.
+		uint64_t a = draw(first, t);
+		CHECK(slot(0) == Slot(first.rgfxObjId, a));
+		uint64_t b = draw(first, t);
+		CHECK(b > a && slot(0) == Slot(first.rgfxObjId, b));
+		// Another process holds slot 1: a second queue takes slot 2.
+		writers->writers[1] = {kOther.first, kOther.second};
+		@autoreleasepool {
+			RgfxCommandQueue *second = queueMade();
+			uint64_t c = draw(second, t);
+			CHECK(slot(1) == kOther && slot(2) == Slot(second.rgfxObjId, c));
+			second = nil;
+		}
+		// Once the second queue is gone, a third takes its slot again.
+		RgfxCommandQueue *third = queueMade();
+		uint64_t d = draw(third, t);
+		CHECK(slot(2) == Slot(third.rgfxObjId, d) && slot(3) == kEmpty);
+		// Another process takes the last; a fourth queue finds none, and names nothing.
+		writers->writers[3] = {kOther.first + 1, kOther.second};
+		RgfxCommandQueue *fourth = queueMade();
+		(void)draw(fourth, t);
+		CHECK(slot(0) == Slot(first.rgfxObjId, b) && slot(1) == kOther &&
+		      slot(2) == Slot(third.rgfxObjId, d) && slot(3) == Slot(kOther.first + 1, 12));
+		drainRing(control);
+	}
+	// The copy goes: our slots empty, the other process's kept.
+	CHECK(slot(0) == kEmpty && slot(1) == kOther && slot(2) == kEmpty &&
+	      slot(3) == Slot(kOther.first + 1, 12));
+	drainRing(control);
+	CFRelease(surface);
+}
+
 // A queue's command buffers keep it alive; once they are gone it ends on the device, its
 // completion ring read no more, and only then does what it holds go back.
 void test_queue_ends_after_its_buffers()
@@ -4739,6 +4876,7 @@ int main()
 		test_region_memory_given_back_after_destroy();
 		test_iosurface_copy_block_after_destroys();
 		test_iosurface_shared_block();
+		test_iosurface_writers();
 		test_queue_ends_after_its_buffers();
 		test_serializer_destroys_queues();
 		test_objects_outlive_an_uncommitted_buffer();

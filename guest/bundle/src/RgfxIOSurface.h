@@ -23,6 +23,18 @@
  *     render attachment, a blit's destination or a compute texture with ShaderWrite usage.
  * The seed after a write-back is the header's, so no holder reads that write back.
  *
+ * After the header lie the copy's writers (RgfxSurfaceWriters, reims_graphics_wire.h), which the
+ * texture's create names to the host: a present of the surface shows the copy once the command
+ * buffers they name have finished. A commit of a buffer that writes the copy names its queue and
+ * the buffer's seqno there before the commit returns, so a present the process makes after it
+ * waits for it on the host. Each process writes only the slots naming its own queues: it raises
+ * its queue's seqno in the slot it holds, takes again one naming a queue of its own that is gone
+ * (whose buffers have all finished), or takes an empty one (queue 0); it empties its slots as
+ * its copy goes, when the buffers that wrote it have finished. A slot given to another queue has
+ * its seqno emptied first, then its queue written, then the seqno, so the host, which reads the
+ * queue, the seqno and the queue again, never pairs one queue with another's seqno. A block made
+ * again has its writers emptied by the process that made it, before its texture is created.
+ *
  * IOSurface's use count is left as it is: Metal neither raises it nor reads it for GPU work
  * over a surface (measured, an M3 Max under macOS 27: IOSurfaceGetUseCount stays 0 and
  * IOSurfaceIsInUse false while a command buffer that renders into a surface, or blits from it,
@@ -80,6 +92,12 @@ void rgfxIOSurfaceNoteWrite(RgfxEncoder *_Nullable enc, id _Nullable texture);
 /// As rgfxIOSurfaceNoteWrite, for a texture a shader may write: only when its usage
 /// has ShaderWrite.
 void rgfxIOSurfaceNoteShaderWrite(RgfxEncoder *_Nullable enc, id _Nullable texture);
+
+/// After a command buffer is posted at seqno `seqno` on queue `queue` (whose id is
+/// `queueObjId`): names it among the writers of each copy in `writes` (taken from its encoder),
+/// once each, so a present of the surface after this waits for it.
+void rgfxIOSurfaceNoteCommitted(const std::vector<std::shared_ptr<void>> &writes, id _Nonnull queue,
+                                uint64_t queueObjId, uint64_t seqno);
 
 /// At a command buffer's completion: writes each block in `writes` (taken from its
 /// encoder) back to its surface's pages, once each.

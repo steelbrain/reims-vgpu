@@ -158,6 +158,9 @@ struct RgfxSurfaceHeader {
 	uint32_t reserved;
 };
 
+static_assert(sizeof(RgfxSurfaceHeader) % alignof(RgfxSurfaceWriters) == 0,
+              "the writers follow the header, aligned");
+
 /// The GPU's view of one surface plane, in a block of the device region: the plane's shared
 /// block, which every process holding the surface draws and samples (the kext's,
 /// RgfxRegion::acquireSurface), or this process's own block where the kext gives none.
@@ -175,8 +178,77 @@ struct RgfxSurfaceShadow {
 	uint64_t serial = 0;        // the shared block's
 	RgfxSurfaceHeader *header = nullptr; // the shared block's, past the plane's rows
 	uint32_t seed = 0;          // this process's own block: the seed when it last matched
+	RgfxSurfaceWriters *writers = nullptr; // past the header: the buffers a present waits for
+	uint64_t writersAt = 0;                 // their offset in the block
+	std::mutex writersLock;                 // one change of this process's slots at a time
+	// By slot: the queue this process named there (0: none), and that queue while it lives.
+	uint64_t slotQueue[RGFX_SURFACE_WRITER_SLOTS] = {};
+	__weak id slotOwner[RGFX_SURFACE_WRITER_SLOTS];
 
 	~RgfxSurfaceShadow();
+
+	/// Names the buffer at `seqno` on `queue` (id `queueId`) among the copy's writers.
+	void noteWriter(id queue, uint64_t queueId, uint64_t seqno)
+	{
+		std::lock_guard<std::mutex> g(writersLock);
+		for (uint32_t i = 0; i < RGFX_SURFACE_WRITER_SLOTS; i++) {
+			if (slotQueue[i] == queueId) {
+				// Only this process writes the slot: its seqno only rises.
+				uint64_t *s = &writers->writers[i].seqno;
+				if (__atomic_load_n(s, __ATOMIC_RELAXED) < seqno)
+					__atomic_store_n(s, seqno, __ATOMIC_RELEASE);
+				return;
+			}
+		}
+		for (uint32_t i = 0; i < RGFX_SURFACE_WRITER_SLOTS; i++) {
+			if (slotQueue[i] != 0 && slotOwner[i] == nil) {
+				// A queue of ours that is gone, its buffers all finished: the slot is ours to give.
+				give(i, queue, queueId, seqno);
+				return;
+			}
+		}
+		for (uint32_t i = 0; i < RGFX_SURFACE_WRITER_SLOTS; i++) {
+			uint64_t empty = 0;
+			if (slotQueue[i] == 0 &&
+			    __atomic_compare_exchange_n(&writers->writers[i].queue_obj_id, &empty, queueId,
+			                                false, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+				__atomic_store_n(&writers->writers[i].seqno, seqno, __ATOMIC_RELEASE);
+				slotQueue[i] = queueId;
+				slotOwner[i] = queue;
+				return;
+			}
+		}
+		static std::atomic<bool> logged{false};
+		if (!logged.exchange(true)) {
+			NSLog(@"RGFX: IOSurface %u: no writer slot left for queue 0x%llx: a present of the "
+			      @"surface may show it before the queue's command buffers finish",
+			      surfaceId, (unsigned long long)queueId);
+		}
+	}
+
+	/// Gives slot `i`, ours, to `queue`: its seqno emptied, then the queue, then the seqno.
+	void give(uint32_t i, id queue, uint64_t queueId, uint64_t seqno)
+	{
+		__atomic_store_n(&writers->writers[i].seqno, 0, __ATOMIC_RELEASE);
+		__atomic_store_n(&writers->writers[i].queue_obj_id, queueId, __ATOMIC_RELEASE);
+		__atomic_store_n(&writers->writers[i].seqno, seqno, __ATOMIC_RELEASE);
+		slotQueue[i] = queueId;
+		slotOwner[i] = queue;
+	}
+
+	/// Empties this process's slots: the seqno, then the queue.
+	void emptyWriters()
+	{
+		std::lock_guard<std::mutex> g(writersLock);
+		for (uint32_t i = 0; i < RGFX_SURFACE_WRITER_SLOTS; i++) {
+			if (slotQueue[i] == 0)
+				continue;
+			__atomic_store_n(&writers->writers[i].seqno, 0, __ATOMIC_RELEASE);
+			__atomic_store_n(&writers->writers[i].queue_obj_id, 0, __ATOMIC_RELEASE);
+			slotQueue[i] = 0;
+			slotOwner[i] = nil;
+		}
+	}
 
 	uint8_t *copy() const { return const_cast<uint8_t *>(block.ptr); }
 
@@ -282,6 +354,9 @@ Registry &registry()
 
 RgfxSurfaceShadow::~RgfxSurfaceShadow()
 {
+	// The buffers that wrote the copy hold it until they finish, so none is left to wait for.
+	if (writers != nullptr)
+		emptyWriters();
 	// The buffer gives the block back once the host has dropped it (its deallocator); one
 	// never made leaves the block to give back here.
 	if (buffer != nil)
@@ -326,10 +401,11 @@ std::shared_ptr<RgfxSurfaceShadow> shadowFor(IOSurfaceRef surface, uint32_t plan
 		shadow->shape = shape;
 		shadow->pitch = alignUp(shape.rowBytes, kShadowRowAlign);
 		// Every holder lays the block out alike, from the plane's shape alone: the rows, then
-		// the header.
+		// the header, then the writers.
 		uint64_t headerAt = alignUp(shadow->pitch * shape.rows, alignof(RgfxSurfaceHeader));
+		uint64_t writersAt = headerAt + sizeof(RgfxSurfaceHeader);
 		uint64_t size =
-		    alignUp(headerAt + sizeof(RgfxSurfaceHeader), RgfxRegion::kDefaultBlockAlign);
+		    alignUp(writersAt + sizeof(RgfxSurfaceWriters), RgfxRegion::kDefaultBlockAlign);
 		RgfxRegion::SurfaceBlock sharedBlock =
 		    region->acquireSurface(planeBase(surface, plane), shape.rowBytes * shape.rows, size);
 		shadow->region = region;
@@ -344,6 +420,12 @@ std::shared_ptr<RgfxSurfaceShadow> shadowFor(IOSurfaceRef surface, uint32_t plan
 		if (!shadow->block.ok) {
 			return nullptr;
 		}
+		// A block made for this ask holds an older one's bytes: its writers start empty, before
+		// any holder's texture names them.
+		shadow->writersAt = writersAt;
+		shadow->writers = reinterpret_cast<RgfxSurfaceWriters *>(shadow->copy() + writersAt);
+		if (!shadow->shared || sharedBlock.fresh)
+			std::memset(static_cast<void *>(shadow->writers), 0, sizeof(RgfxSurfaceWriters));
 		r.shadows[{surfaceId, plane}] = shadow;
 	}
 	uint64_t offset = shadow->block.offset;
@@ -427,7 +509,7 @@ RgfxTextureDescriptor wireDescriptor(MTLTextureDescriptor *d)
 	                   static_cast<uint32_t>(MTLResourceStorageModeShared);
 	RgfxCreated created = serializer->createTextureFromIOSurface(
 	    [(RgfxResource *)shadow->buffer rgfxObjId], 0, shadow->pitch, shadow->surfaceId,
-	    shadow->plane, hostDesc);
+	    shadow->plane, hostDesc, shadow->writersAt);
 	if (created.resource_id == 0) {
 		return nil; // no resource id left: no texture, as Metal answers one it cannot make
 	}
@@ -584,6 +666,20 @@ void rgfxIOSurfaceNoteShaderWrite(RgfxEncoder *enc, id texture)
 	if ([texture isKindOfClass:[RgfxTexture class]] &&
 	    ([(id<MTLTexture>)texture usage] & MTLTextureUsageShaderWrite) != 0) {
 		rgfxIOSurfaceNoteWrite(enc, texture);
+	}
+}
+
+void rgfxIOSurfaceNoteCommitted(const std::vector<std::shared_ptr<void>> &writes, id queue,
+                                uint64_t queueObjId, uint64_t seqno)
+{
+	std::vector<RgfxSurfaceShadow *> done;
+	for (const auto &w : writes) {
+		auto *s = static_cast<RgfxSurfaceShadow *>(w.get());
+		if (std::find(done.begin(), done.end(), s) != done.end()) {
+			continue;
+		}
+		done.push_back(s);
+		s->noteWriter(queue, queueObjId, seqno);
 	}
 }
 

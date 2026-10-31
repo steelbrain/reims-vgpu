@@ -2339,3 +2339,221 @@ fn an_encode_the_platform_refuses_fails_its_command_buffer() {
     assert_eq!(done.cb_obj_id, 101);
     assert_eq!(done.status, RGFX_CB_OK);
 }
+
+/// A `TEXTURE_FROM_IOSURFACE`: a BGRA8 texture `width` pixels square at resource id
+/// `resource_id`, over the start of `buffer`, naming plane 0 of IOSurface `iosurface`, its copy's
+/// writers `writers_offset` bytes into the buffer.
+fn texture_from_iosurface(
+    obj_id: u64,
+    resource_id: u64,
+    buffer: u64,
+    iosurface: u32,
+    width: u32,
+    writers_offset: u64,
+) -> Vec<u8> {
+    let (create, _) = RgfxTextureCreate::read_from_prefix(&texture_create(0, 0)).unwrap();
+    RgfxTextureFromIOSurface {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_TEXTURE_FROM_IOSURFACE,
+            size: 0,
+            seqno: 0,
+        },
+        obj_id,
+        resource_id,
+        buffer_obj_id: buffer,
+        offset: 0,
+        bytes_per_row: u64::from(width) * 4,
+        iosurface_id: iosurface,
+        plane: 0,
+        desc: RgfxTextureDescriptor {
+            width,
+            height: width,
+            ..create.desc
+        },
+        writers_offset,
+    }
+    .as_bytes()
+    .to_vec()
+}
+
+/// A display pipe's `PRESENT_SURFACE` of IOSurface `id` (0: the scanout), as the kext posts it.
+fn present_surface(id: u32) -> Vec<u8> {
+    RgfxPresentSurface {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_PRESENT_SURFACE,
+            size: 0,
+            seqno: 0,
+        },
+        display: 0,
+        iosurface_id: id,
+        transaction_id: 1,
+        reserved_1c: 0,
+    }
+    .as_bytes()
+    .to_vec()
+}
+
+/// [`command_buffer`] at `seqno` on its queue's ring, as the guest's ring writer numbers it.
+fn command_buffer_at(queue_obj_id: u64, cb_obj_id: u64, seqno: u64) -> Vec<u8> {
+    let mut message = command_buffer(queue_obj_id, cb_obj_id);
+    message[8..16].copy_from_slice(&seqno.to_le_bytes());
+    message
+}
+
+/// A surface copy's writers, as the guest's processes keep them: `writers` in the first slots.
+fn write_writers(device: &GraphicsDevice<FakePlatform>, at: u64, writers: &[(u64, u64)]) {
+    let mut record = RgfxSurfaceWriters::default();
+    for (slot, &(queue_obj_id, seqno)) in record.writers.iter_mut().zip(writers) {
+        *slot = RgfxSurfaceWriter {
+            queue_obj_id,
+            seqno,
+        };
+    }
+    // SAFETY: the record lies in the device's region, mapped while the device lives, in a block
+    // the test granted; the host only reads it.
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            record.as_bytes().as_ptr(),
+            device.region_base().add(at as usize),
+            size_of::<RgfxSurfaceWriters>(),
+        );
+    }
+}
+
+/// Waits about 2 s for `n` presents to wait for their writers.
+fn presents_waiting(device: &GraphicsDevice<FakePlatform>, n: usize) {
+    for _ in 0..2000 {
+        if device.control.presents.waiting() == n {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    panic!("{n} presents were not waiting");
+}
+
+/// The width of the texture the display shows; `None` for the scanout.
+fn shown_width(device: &GraphicsDevice<FakePlatform>) -> Option<u64> {
+    use reims_vgpu_core::platform::resource::Texture as _;
+    device
+        .control
+        .presented
+        .texture
+        .lock()
+        .as_ref()
+        .map(|t| t.width())
+}
+
+/// Context 1 with a queue (its rings at `SUBMIT` and `COMPLETE`), resource-id chunk 0, and a
+/// buffer over the block at `BLOCK` that a texture over IOSurface 0x77 lies over, its copy's
+/// writers at `WRITERS` in the block: the guest's ring 0 and the queue's rings.
+const SUBMIT: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET;
+const COMPLETE: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x2_0000;
+const BLOCK: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x10_0000;
+const WRITERS: u64 = 0x8000;
+
+fn surface_and_queue(device: &GraphicsDevice<FakePlatform>) -> (Guest, QueueRing) {
+    const RING_DATA: u32 = 0x1_0000;
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(device);
+    assert_eq!(
+        answered(
+            device,
+            &mut guest,
+            queue_create(1, 1, SUBMIT, COMPLETE, RING_DATA, 0)
+        ),
+        RGFX_STATUS_OK
+    );
+    guest.send(device, block_grant(1, BLOCK, 0x1_0000));
+    guest.send(device, resource_id_chunk(1, 0));
+    guest.send(device, buffer_over_host_memory(obj(1, 2), BLOCK, 0x1_0000));
+    guest.send(
+        device,
+        texture_from_iosurface(obj(1, 3), 1, obj(1, 2), 0x77, 64, WRITERS),
+    );
+    let ring = QueueRing::new(device, SUBMIT, COMPLETE, u64::from(RING_DATA));
+    (guest, ring)
+}
+
+/// A present of a surface is shown only once the command buffer committed before it that writes
+/// the surface's copy has finished, however late the host takes that buffer: a buffer before it
+/// on the queue finishing shows nothing, and the present is answered once it is shown
+#[test]
+fn a_present_waits_for_the_command_buffer_that_wrote_its_surface() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform) = headless_on(&raised);
+    let (mut guest, mut ring) = surface_and_queue(&device);
+    // The guest committed buffer 5 on the queue, which draws the surface, then presented it; the
+    // host has taken neither buffer 4 nor 5 yet.
+    write_writers(&device, BLOCK + WRITERS, &[(obj(1, 1), 5)]);
+    guest.send(&device, present_surface(0x77));
+    presents_waiting(&device, 1);
+    assert!(quiet(&guest), "answered before it was shown");
+    assert_eq!(shown_width(&device), None);
+
+    // Buffer 4 runs and finishes: the present still waits.
+    ring.send(&device, command_buffer_at(obj(1, 1), 100, 4));
+    assert!(complete_until_event(&platform, &ring));
+    ring.event().expect("buffer 4's CB_COMPLETE");
+    presents_waiting(&device, 1);
+    assert_eq!(shown_width(&device), None);
+
+    // Buffer 5 finishes: the surface shows, and the present is answered.
+    ring.send(&device, command_buffer_at(obj(1, 1), 101, 5));
+    assert!(complete_until_event(&platform, &ring));
+    let seqno = guest.seqno;
+    assert_eq!(answer_of(&mut guest, seqno), RGFX_STATUS_OK);
+    assert_eq!(shown_width(&device), Some(64));
+    presents_waiting(&device, 0);
+}
+
+/// Presents are shown in the order made: one with nothing to wait for, made after one that waits,
+/// waits behind it; a present waiting for a queue that is destroyed is shown, as nothing of that
+/// queue will finish; and a writer naming no queue the host holds holds nothing
+#[test]
+fn presents_keep_their_order_and_a_gone_queue_holds_none() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, _platform) = headless_on(&raised);
+    let (mut guest, _ring) = surface_and_queue(&device);
+    write_writers(&device, BLOCK + WRITERS, &[(obj(1, 1), 9), (obj(1, 7), 3)]);
+    guest.send(&device, present_surface(0x77));
+    presents_waiting(&device, 1);
+    // The scanout, presented next, waits behind it.
+    guest.send(&device, present_surface(0));
+    presents_waiting(&device, 2);
+    assert!(quiet(&guest));
+
+    guest.send(&device, object_destroy(obj(1, 1)));
+    let first = guest.seqno - 2;
+    assert_eq!(answer_of(&mut guest, first), RGFX_STATUS_OK);
+    assert_eq!(answer_of(&mut guest, first + 1), RGFX_STATUS_OK);
+    presents_waiting(&device, 0);
+    assert_eq!(shown_width(&device), None, "the scanout, presented last");
+}
+
+/// A present shows the latest texture a process made over its surface, and an earlier one once
+/// the latest is destroyed; a surface with no texture is answered invalid at once
+#[test]
+fn a_present_shows_the_latest_texture_over_its_surface() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, _platform) = headless_on(&raised);
+    let (mut guest, _ring) = surface_and_queue(&device);
+    guest.send(
+        &device,
+        texture_from_iosurface(obj(1, 4), 2, obj(1, 2), 0x77, 32, RGFX_SURFACE_NO_WRITERS),
+    );
+    guest.send(&device, present_surface(0x77));
+    let seqno = guest.seqno;
+    assert_eq!(answer_of(&mut guest, seqno), RGFX_STATUS_OK);
+    assert_eq!(shown_width(&device), Some(32));
+
+    guest.send(&device, object_destroy(obj(1, 4)));
+    guest.send(&device, present_surface(0x77));
+    let seqno = guest.seqno;
+    assert_eq!(answer_of(&mut guest, seqno), RGFX_STATUS_OK);
+    assert_eq!(shown_width(&device), Some(64));
+
+    guest.send(&device, present_surface(0x78));
+    let seqno = guest.seqno;
+    assert_eq!(answer_of(&mut guest, seqno), RGFX_STATUS_INVALID_ARGUMENT);
+    assert_eq!(shown_width(&device), Some(64));
+}

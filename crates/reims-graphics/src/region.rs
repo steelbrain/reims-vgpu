@@ -23,9 +23,11 @@
 //! `BLOCK_UNSHARE` or its close, and by none after the block's `BLOCK_RELEASE`.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU32, AtomicU64};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use parking_lot::Mutex;
+
+use crate::wire::{RgfxSurfaceWriter, RgfxSurfaceWriters};
 
 /// The region's memory.
 pub struct Region {
@@ -264,6 +266,32 @@ impl Region {
         // SAFETY: as in `atomic_u64`.
         unsafe { AtomicU32::from_ptr(self.base.add(offset as usize).cast()) }
     }
+
+    /// The [`RgfxSurfaceWriters`] the guest keeps at `offset`, each slot read as the guest's
+    /// writes allow (the record's doc): its queue, its seqno, then its queue again, a slot whose
+    /// queue changed meanwhile reading as free. `None` where the record is not 8-aligned and
+    /// wholly inside the region.
+    pub fn surface_writers(&self, offset: u64) -> Option<RgfxSurfaceWriters> {
+        let slot = size_of::<RgfxSurfaceWriter>() as u64;
+        if !offset.is_multiple_of(8)
+            || !self.contains(offset, size_of::<RgfxSurfaceWriters>() as u64)
+        {
+            return None;
+        }
+        let mut record = RgfxSurfaceWriters::default();
+        for (i, writer) in record.writers.iter_mut().enumerate() {
+            let at = offset + i as u64 * slot;
+            let queue = self.atomic_u64(at).load(Ordering::Acquire);
+            let seqno = self.atomic_u64(at + 8).load(Ordering::Acquire);
+            if queue != 0 && self.atomic_u64(at).load(Ordering::Acquire) == queue {
+                *writer = RgfxSurfaceWriter {
+                    queue_obj_id: queue,
+                    seqno,
+                };
+            }
+        }
+        Some(record)
+    }
 }
 
 impl Drop for Region {
@@ -289,6 +317,39 @@ mod tests {
         assert!(region.read(64 * 1024 - 2, 3).is_none());
         assert!(region.read(u64::MAX, 1).is_none());
         assert!(Region::new(0).is_none());
+    }
+
+    /// A surface plane's writers read slot by slot, a free slot (queue 0) as free, and nothing
+    /// for a record misaligned or past the region's end
+    #[test]
+    fn a_surface_s_writers_are_read_slot_by_slot() {
+        let region = Region::new(64 * 1024).unwrap();
+        let at = 0x1000;
+        let mut record = RgfxSurfaceWriters::default();
+        record.writers[0] = RgfxSurfaceWriter {
+            queue_obj_id: 0x3_0000_0001,
+            seqno: 7,
+        };
+        record.writers[2] = RgfxSurfaceWriter {
+            queue_obj_id: 0x4_0000_0002,
+            seqno: 9,
+        };
+        // A free slot's stale seqno reads as free.
+        record.writers[3].seqno = 5;
+        assert!(region.write(at, zerocopy::IntoBytes::as_bytes(&record)));
+        let read = region.surface_writers(at).unwrap();
+        let expected = RgfxSurfaceWriters {
+            writers: [
+                record.writers[0],
+                RgfxSurfaceWriter::default(),
+                record.writers[2],
+                RgfxSurfaceWriter::default(),
+            ],
+        };
+        assert_eq!(read, expected);
+        assert!(region.surface_writers(at + 4).is_none());
+        assert!(region.surface_writers(64 * 1024 - 32).is_none());
+        assert!(region.surface_writers(u64::MAX - 7).is_none());
     }
 
     /// A shared block is held by each context it is shared with until that context lets it go

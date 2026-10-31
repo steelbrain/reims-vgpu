@@ -1424,6 +1424,10 @@ pub struct RgfxTextureFromBuffer {
 /// when the CPU wrote the surface since, before a commit, and back to them when
 /// a command buffer that wrote the texture completes. The host names the
 /// texture by the surface's id, so a present of the surface finds it.
+///
+/// `writers_offset` is where in the buffer the copy's [`RgfxSurfaceWriters`]
+/// lie ([`RGFX_SURFACE_NO_WRITERS`] for none): the command buffers committed
+/// that write the copy, which a present of the surface waits for.
 #[repr(C)]
 #[derive(
     Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
@@ -1447,6 +1451,51 @@ pub struct RgfxTextureFromIOSurface {
     pub plane: u32,
     /// The texture's shape.
     pub desc: RgfxTextureDescriptor,
+    /// The copy's [`RgfxSurfaceWriters`], bytes into the buffer;
+    /// [`RGFX_SURFACE_NO_WRITERS`] for none.
+    pub writers_offset: u64,
+}
+
+/// [`RgfxTextureFromIOSurface::writers_offset`] of a copy with no
+/// [`RgfxSurfaceWriters`].
+pub const RGFX_SURFACE_NO_WRITERS: u64 = u64::MAX;
+
+/// The slots of [`RgfxSurfaceWriters`].
+pub const RGFX_SURFACE_WRITER_SLOTS: usize = 4;
+
+/// One command queue's latest command buffer that writes a surface plane's
+/// copy: the queue's id and the buffer's `seqno` on the queue's submission ring.
+/// A slot no queue holds has `queue_obj_id` 0.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxSurfaceWriter {
+    /// The queue's id; 0 for a free slot.
+    pub queue_obj_id: u64,
+    /// The latest `COMMAND_BUFFER` on the queue's ring that writes the copy.
+    pub seqno: u64,
+}
+
+/// The command buffers committed that write a surface plane's copy, one slot
+/// per queue, kept by the guest processes that hold the copy, in the copy's
+/// block ([`RgfxTextureFromIOSurface::writers_offset`]). Each committing process
+/// raises its queue's `seqno` once the buffer is on the queue's ring, before its
+/// commit returns, so a present the process (or one it hands the surface to)
+/// makes after that finds it; a present of the surface waits for each named
+/// buffer's completion before the display reads the copy.
+///
+/// The guest writes a slot's `seqno` with 0 before it gives the slot to another
+/// queue and the new seqno after, so a reader that reads `queue_obj_id`, then
+/// `seqno`, then `queue_obj_id` again, and finds the two ids alike, reads a
+/// queue's own seqno (or 0).
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxSurfaceWriters {
+    /// The slots.
+    pub writers: [RgfxSurfaceWriter; RGFX_SURFACE_WRITER_SLOTS],
 }
 
 /// `SAMPLER_CREATE`: a sampler as `MTLSamplerDescriptor` gives it. Each enum is
@@ -2160,7 +2209,8 @@ const _: () = {
     assert!(size_of::<RgfxTextureDescriptor>() == 48);
     assert!(size_of::<RgfxTextureCreate>() == 104);
     assert!(size_of::<RgfxTextureFromBuffer>() == 104);
-    assert!(size_of::<RgfxTextureFromIOSurface>() == 112);
+    assert!(size_of::<RgfxTextureFromIOSurface>() == 120);
+    assert!(size_of::<RgfxSurfaceWriters>() == 64);
     assert!(size_of::<RgfxSamplerCreate>() == 72);
     assert!(size_of::<RgfxStencilDescriptor>() == 24);
     assert!(size_of::<RgfxDepthStencilCreate>() == 80);

@@ -60,6 +60,7 @@ use crate::graphics::decode::{
     PipelineJob, ReflectionSink, compile_refusing, complete, make_library, refused_reply, refusing,
 };
 use crate::graphics::device_info::device_info;
+use crate::graphics::present::PresentQueue;
 use crate::platform::ApiPlatform;
 use crate::window::WindowLink;
 
@@ -69,6 +70,7 @@ mod decode;
 mod device_info;
 #[cfg(target_os = "macos")]
 mod metal;
+mod present;
 mod sink;
 #[cfg(feature = "vulkan")]
 mod vulkan;
@@ -159,10 +161,12 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             region.write(RGFX_DEVICE_INFO_OFFSET, info.as_bytes());
             let mut decoder = GraphicsDecoder::new(Arc::clone(&platform), Arc::clone(&region));
             decoder.set_unified_memory(unified_memory);
+            let presented = Arc::new(Presented::default());
             let control = Arc::new(GraphicsControl {
                 decoder: Mutex::new(decoder),
                 device: gpu_device,
-                presented: Arc::new(Presented::default()),
+                presents: Arc::new(PresentQueue::new(Arc::clone(&presented))),
+                presented,
                 pool,
                 pending: Pending::default(),
             });
@@ -258,6 +262,8 @@ struct GraphicsControl<P: ApiPlatform> {
     device: P::Device,
     /// The surface the display pipe shows, shared with the window's sink.
     presented: Arc<Presented<P>>,
+    /// The presents waiting for the command buffers that write their surfaces.
+    presents: Arc<PresentQueue<P>>,
     /// The threads ring 0's pipeline and library creates compile on (`compile`, `make`).
     pool: CompilePool,
     /// The pipelines being compiled, which a command buffer naming one waits for.
@@ -366,6 +372,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                 let dropped = decoder.drop_context(context);
                 decoder.forget_dropped_surfaces();
                 self.pending.cancel_context(context);
+                self.presents.context_gone(context);
                 let drain = decoder.drain_context(
                     context,
                     true,
@@ -451,8 +458,14 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         }
         entry::run(|_| {
             let queue_poster = poster.clone();
+            let presents = Arc::clone(&self.presents);
+            let queue = poster.queue_obj_id();
             let sink: CompletionSink = Arc::new(move |record: RgfxCbComplete| {
                 queue_poster.post(record.as_bytes());
+                // A present waiting for the buffer is shown once its completion is posted.
+                if let Some(queue) = queue {
+                    presents.finished(queue, record.header.seqno);
+                }
             });
             let reflection_poster = poster.clone();
             let reflection: ReflectionSink = Arc::new(move |record: RgfxPipelineReflection| {
@@ -466,6 +479,8 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                 if r#type == RGFX_CMD_OBJECT_DESTROY {
                     let (_, _, obj_id) = message_identity(message);
                     self.pending.cancel(obj_id);
+                    // A queue's destroy: nothing more of it finishes for a present to wait for.
+                    self.presents.queue_gone(obj_id);
                 }
                 if foreign_queue(poster, message) {
                     Ok(Err(DecodeError::BadReference))
@@ -714,16 +729,21 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         });
     }
 
-    /// Shows the IOSurface `iosurface_id` (0: the scanout), answering once the window shows it;
-    /// answered invalid at once, with nothing changed, where the decoder holds no texture over it.
+    /// Shows the IOSurface `iosurface_id` (0: the scanout) once the command buffers committed that
+    /// write its copy have finished, after the presents before it ([`PresentQueue`]), answering
+    /// once the window shows it; answered invalid at once, with nothing changed, where the decoder
+    /// holds no texture over it.
     fn present_surface(&self, iosurface_id: u32, answer: PresentAnswer) {
         if iosurface_id == 0 {
-            self.presented.show(0, None, answer);
+            self.presents.present(0, None, answer, Vec::new());
             return;
         }
-        let texture = self.decoder.lock().surface_texture(iosurface_id);
-        match texture {
-            Some(texture) => self.presented.show(iosurface_id, Some(texture), answer),
+        let found = self.decoder.lock().surface_present(iosurface_id);
+        match found {
+            Some((texture, writers)) => {
+                self.presents
+                    .present(iosurface_id, Some(texture), answer, writers);
+            }
             None => answer.answer(RGFX_STATUS_INVALID_ARGUMENT),
         }
     }
@@ -741,6 +761,9 @@ impl<P: ApiPlatform> GraphicsControl<P> {
             return;
         };
         poster.post(cb_failed(cb.cb_obj_id, header.seqno).as_bytes());
+        if let Some(queue) = poster.queue_obj_id() {
+            self.presents.finished(queue, header.seqno);
+        }
     }
 }
 

@@ -406,7 +406,8 @@ RgfxCreated RgfxSerializer::createTextureView(const RgfxTextureView &view)
 RgfxCreated RgfxSerializer::createTextureFromIOSurface(RgfxObjId buffer, uint64_t offset,
                                                        uint64_t bytes_per_row,
                                                        uint32_t iosurface_id, uint32_t plane,
-                                                       const RgfxTextureDescriptor &desc)
+                                                       const RgfxTextureDescriptor &desc,
+                                                       uint64_t writers_offset)
 {
 	RgfxCreated out = {};
 	out.resource_id = m_ids.allocResourceId();
@@ -423,6 +424,7 @@ RgfxCreated RgfxSerializer::createTextureFromIOSurface(RgfxObjId buffer, uint64_
 	msg.iosurface_id = iosurface_id;
 	msg.plane = plane;
 	msg.desc = desc;
+	msg.writers_offset = writers_offset;
 	out.posted =
 	    m_control.tryPost(RGFX_CMD_TEXTURE_FROM_IOSURFACE, &msg, sizeof(msg), &out.seqno);
 	return out;

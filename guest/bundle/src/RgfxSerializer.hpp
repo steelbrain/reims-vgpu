@@ -276,10 +276,13 @@ public:
 
 	/// A texture of shape `desc` over plane `plane` of the IOSurface `iosurface_id`,
 	/// lying over the buffer `buffer` (this process's copy of the plane) from
-	/// `offset`, each row `bytes_per_row` apart. A resource id is picked.
+	/// `offset`, each row `bytes_per_row` apart, the copy's writers (RgfxSurfaceWriters)
+	/// `writers_offset` bytes into the buffer (RGFX_SURFACE_NO_WRITERS for none). A resource
+	/// id is picked.
 	RgfxCreated createTextureFromIOSurface(RgfxObjId buffer, uint64_t offset,
 	                                       uint64_t bytes_per_row, uint32_t iosurface_id,
-	                                       uint32_t plane, const RgfxTextureDescriptor &desc);
+	                                       uint32_t plane, const RgfxTextureDescriptor &desc,
+	                                       uint64_t writers_offset);
 
 	// --- state objects --------------------------------------------------------
 
