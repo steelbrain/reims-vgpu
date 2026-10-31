@@ -3266,6 +3266,7 @@ void test_heap_outlives_its_resources()
 	@autoreleasepool {
 		MTLHeapDescriptor *d = [MTLHeapDescriptor new];
 		d.size = 0x100000;
+		d.type = MTLHeapTypePlacement; // only a Placement heap places at an offset
 		heap = [RgfxHeap heapWithDescriptor:d device:nil serializer:&fx.ser];
 		buf = [heap newBufferWithLength:256 options:0 offset:0];
 		MTLTextureDescriptor *td =
