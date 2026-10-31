@@ -510,6 +510,10 @@ impl<P: Platform> GraphicsDecoder<P> {
             reserved_14: 0,
             gpu_resource_id,
         };
+        // A failed context's later work is refused ([`FailedContexts`]).
+        if self.context_failed() {
+            return Ok(Some(answer(RGFX_STATUS_REFUSED, 0)));
+        }
         Ok(Some(match self.make_sampler(device, message)? {
             Ok(id) => answer(RGFX_STATUS_OK, id),
             Err(DecodeError::Malformed) => answer(RGFX_STATUS_INVALID_ARGUMENT, 0),

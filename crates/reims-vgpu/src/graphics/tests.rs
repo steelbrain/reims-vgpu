@@ -2648,8 +2648,9 @@ fn a_present_shows_the_latest_texture_over_its_surface() {
 /// The platform dying at its read of a finished command buffer on its own thread (a failure it has
 /// no answer of Metal's for), which ends the process on the paravirt device, fails that command
 /// buffer and its context: the buffer's completion is an internal error, the context's later
-/// command buffers and creates are refused at once, its destroys are carried out, another
-/// context's work goes on, and once the context closes its number is fresh for the next process
+/// command buffers and creates (its sampler creates among them) are refused at once, its
+/// destroys are carried out, another context's work goes on, and once the context closes its
+/// number is fresh for the next process
 #[test]
 fn a_completion_the_platform_refuses_fails_its_context() {
     let raised = Arc::new(AtomicU32::new(0));
@@ -2694,6 +2695,31 @@ fn a_completion_the_platform_refuses_fails_its_context() {
     assert_eq!((refused.cb_obj_id, refused.status), (101, RGFX_CB_INTERNAL));
     assert!(platform.world().committed().is_empty(), "the buffer ran");
     guest.send(&device, event_create(obj(3, 6)));
+    let sampler = RgfxSamplerCreate {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_SAMPLER_CREATE,
+            size: 0,
+            seqno: 0,
+        },
+        obj_id: obj(3, 7),
+        max_anisotropy: 1,
+        lod_max_clamp_bits: f32::MAX.to_bits(),
+        ..RgfxSamplerCreate::default()
+    };
+    guest.send(&device, sampler.as_bytes().to_vec());
+    let answer = guest.event().expect("the sampler create's SAMPLER_STATE");
+    let answer = RgfxSamplerState::read_from_bytes(&answer).unwrap();
+    assert_eq!(
+        (answer.header.seqno, answer.status, answer.gpu_resource_id),
+        (guest.seqno, RGFX_STATUS_REFUSED, 0)
+    );
+    assert_eq!(
+        platform
+            .call_log()
+            .calls_to("newSamplerStateWithDescriptor:")
+            .len(),
+        0
+    );
     assert_eq!(
         answered(&device, &mut guest, context_close(99)),
         RGFX_STATUS_OK
