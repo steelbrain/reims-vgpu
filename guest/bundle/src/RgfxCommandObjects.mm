@@ -14,21 +14,26 @@
  * selector (setVertexBuffer:offset:atIndex:) forwards a one-element array at the given
  * index, exactly as the host reads it.
  *
- * NOT MAPPED HERE (no RgfxEncoder op yet — follow-ups, no wire invented): the
- * argument/visible-function-table, acceleration-structure, mesh/object (mesh-shader),
- * and *Bytes inline-constant setters; the render SPI-only ops that have no public
- * selector (provoking-vertex, alpha-test ref, line width, point size, viewport-
- * transform, primitive-restart, depth/stencil "cleared", resolve textures, tile-
- * dispatch in-region, memory barrier with scope/stages, vertex-amplification mode);
- * the compute indirect-command-encoding ops (encodeStartIf/While/Else/DoWhile,
- * compressed-texture flush) and computeDispatchThreadsIndirect; the blit fill-texture,
- * fill-buffer-pattern4 and invalidate-compressed ops; setDepthStoreActionOptions:
- * (no op); and copyFromTexture:toTexture: (needs the textures' slice/level counts,
- * which the texture wrappers do not expose in this slice).
+ * INLINE BYTES. The set*Bytes:length:atIndex: setters have no op of their own: the bytes go
+ * to an upload chunk of the command buffer's in the device region (RgfxUploads.h), bound as a
+ * buffer at their offset there.
+ *
+ * NOT MAPPED HERE (no RgfxEncoder op yet — follow-ups, no wire invented): the render SPI-only
+ * ops that have no public selector (provoking-vertex, alpha-test ref, line width, point size,
+ * viewport-transform, primitive-restart, depth/stencil "cleared", resolve textures,
+ * tile-dispatch in-region, vertex-amplification mode); the compute indirect-command-encoding
+ * ops (encodeStartIf/While/Else/DoWhile, compressed-texture flush) and
+ * computeDispatchThreadsIndirect; the blit fill-texture, fill-buffer-pattern4 and
+ * invalidate-compressed ops. The public members of features the device does not support
+ * (function tables, acceleration structures, mesh and object stages, counters, tensors,
+ * queue-stage barriers, depth bounds, colour attachment maps, depth store-action options) do
+ * nothing on the wire and are logged (RgfxUnsupported.h).
  */
 
 #import "RgfxCommandObjects.h"
 #import "RgfxIOSurface.h"
+#import "RgfxUnsupported.h"
+#import "RgfxUploads.h"
 
 #include <algorithm>
 #include <atomic>
@@ -92,6 +97,25 @@ bool logEventOp(std::atomic<uint64_t> &count, uint64_t *n)
 
 std::atomic<uint64_t> g_eventWaits{0};
 std::atomic<uint64_t> g_eventSignals{0};
+std::atomic<uint64_t> g_bytesDropped{0};
+
+/// Puts an encoder's inline bytes (set*Bytes:length:atIndex:) in its command buffer's upload
+/// chunks (RgfxUploads.h), answering the buffer and offset they lie at to bind; false, said in
+/// the log, where no chunk could be had (the region has no room), and the binding is not made.
+bool rgfxPutBytes(RgfxUploadArena *uploads, const void *bytes, NSUInteger length,
+                  id<MTLBuffer> __strong *buffer, uint64_t *offset)
+{
+	if (uploads != nullptr && uploads->put(bytes, length, buffer, offset)) {
+		return true;
+	}
+	uint64_t n = 0;
+	if (logEventOp(g_bytesDropped, &n)) {
+		NSLog(@"RGFX: %lu inline bytes have no upload chunk (no region room): their binding is "
+		      @"not made (so far: %llu)",
+		      (unsigned long)length, (unsigned long long)(n + 1));
+	}
+	return false;
+}
 
 /// The host handle naming `obj` (0 = nil). Every Metal object the guest sees is one
 /// of our RgfxResource wrappers.
@@ -113,6 +137,29 @@ uint32_t rgfxResourceKind(id<MTLResource> res)
 	if ([res conformsToProtocol:@protocol(MTLIndirectCommandBuffer)])
 		return RGFX_RESOURCE_KIND_ICB;
 	return RGFX_RESOURCE_KIND_NONE;
+}
+
+/// The level of `t` whose size is `other`'s first level's, in `*level`; false where none is.
+bool rgfxLevelMatching(id<MTLTexture> t, id<MTLTexture> other, NSUInteger *level)
+{
+	for (NSUInteger m = 0; m < t.mipmapLevelCount; m++) {
+		if (std::max<NSUInteger>(1, t.width >> m) == other.width &&
+		    std::max<NSUInteger>(1, t.height >> m) == other.height &&
+		    std::max<NSUInteger>(1, t.depth >> m) == other.depth) {
+			*level = m;
+			return true;
+		}
+	}
+	return false;
+}
+
+/// The slices a blit's whole-surface copy counts in `t`: its array length, six faces a cube.
+NSUInteger rgfxSurfaceSlices(id<MTLTexture> t)
+{
+	NSUInteger slices = t.arrayLength != 0 ? t.arrayLength : 1;
+	if (t.textureType == MTLTextureTypeCube || t.textureType == MTLTextureTypeCubeArray)
+		slices *= 6;
+	return slices;
 }
 
 /// The f64 bits of `v`, as a clear-colour/viewport field travels on the wire.
@@ -243,6 +290,10 @@ uint32_t fillRenderPass(MTLRenderPassDescriptor *d, RgfxRenderPassDesc *desc,
 - (void)rgfxHoldSlot:(dispatch_semaphore_t)slots;
 @end
 
+@interface RgfxCommandQueue ()
+- (std::shared_ptr<RgfxUploadPool>)rgfxUploadPool;
+@end
+
 @implementation RgfxCommandQueue {
 	RgfxRingWriter *_submitRing;   // borrowed: the queue's submission ring
 	RgfxIdSpace *_ids;             // borrowed: the device id space, for cb ids
@@ -259,6 +310,9 @@ uint32_t fillRenderPass(MTLRenderPassDescriptor *d, RgfxRenderPassDesc *desc,
 	unsigned short _gpuPriorityOffset; // and the offsets and background priority with it
 	NSUInteger _backgroundGpuPriority;
 	unsigned short _backgroundGpuPriorityOffset;
+	// The chunks its command buffers' inline bytes go to (RgfxUploads.h), made with the first
+	// command buffer, over the queue's region.
+	std::shared_ptr<RgfxUploadPool> _uploadPool;
 }
 
 + (instancetype)queueWithSubmitRing:(RgfxRingWriter *)submitRing
@@ -363,6 +417,18 @@ uint32_t fillRenderPass(MTLRenderPassDescriptor *d, RgfxRenderPassDesc *desc,
 	if (descriptor != nil)
 		[cb rgfxSetErrorOptions:descriptor.errorOptions];
 	return cb;
+}
+
+// The queue's upload pool, made over its region on first use.
+- (std::shared_ptr<RgfxUploadPool>)rgfxUploadPool
+{
+	@synchronized(self) {
+		if (_uploadPool == nullptr) {
+			_uploadPool = std::make_shared<RgfxUploadPool>(self.region, [self serializer],
+			                                               self.device);
+		}
+		return _uploadPool;
+	}
 }
 
 - (RgfxCmdBuffer *)rgfxCommandBufferRetained:(BOOL)retained
@@ -490,6 +556,23 @@ uint32_t fillRenderPass(MTLRenderPassDescriptor *d, RgfxRenderPassDesc *desc,
 - (void)rgfxDeliverCompletion:(const RgfxCbComplete *)msg;
 @end
 
+// The encoders' inline bytes go to their command buffer's upload arena, handed over as the
+// command buffer vends them.
+@interface RgfxRenderCommandEncoder ()
+- (void)rgfxSetUploads:(std::shared_ptr<RgfxUploadArena>)uploads;
+// The tile size its pass descriptor asked for (0: the device's choice).
+- (void)rgfxSetTileWidth:(NSUInteger)width height:(NSUInteger)height;
+@end
+@interface RgfxComputeCommandEncoder ()
+- (void)rgfxSetUploads:(std::shared_ptr<RgfxUploadArena>)uploads;
+// The dispatch type its pass was opened with.
+- (void)rgfxSetDispatchType:(MTLDispatchType)dispatchType;
+@end
+@interface RgfxParallelRenderCommandEncoder ()
+- (void)rgfxSetUploads:(std::shared_ptr<RgfxUploadArena>)uploads;
+- (void)rgfxSetTileWidth:(NSUInteger)width height:(NSUInteger)height;
+@end
+
 @implementation RgfxCmdBuffer {
 	RgfxCommandQueue *_queue; // kept alive, as Metal's command buffers keep their queue
 	RgfxEncoder *_encoder; // owned: built incrementally, posted on commit
@@ -538,6 +621,9 @@ uint32_t fillRenderPass(MTLRenderPassDescriptor *d, RgfxRenderPassDesc *desc,
 	// The IOSurface copies this buffer writes, written back to their surfaces' pages
 	// when it completes (RgfxIOSurface.h).
 	std::vector<std::shared_ptr<void>> _surfaceWrites;
+	// Where its encoders' inline bytes go: chunks of the queue's upload pool, given back once
+	// the host has completed the buffer (RgfxUploads.h). The encoders share it.
+	std::shared_ptr<RgfxUploadArena> _uploads;
 }
 
 + (instancetype)commandBufferForQueue:(RgfxCommandQueue *)queue
@@ -561,6 +647,7 @@ uint32_t fillRenderPass(MTLRenderPassDescriptor *d, RgfxRenderPassDesc *desc,
 		// may be let go before its commit.
 		if (queue.replyReader != nullptr)
 			cb->_ticket.store(RgfxRetirement::process().begin());
+		cb->_uploads = std::make_shared<RgfxUploadArena>([queue rgfxUploadPool]);
 	}
 	return cb;
 }
@@ -601,22 +688,39 @@ uint32_t fillRenderPass(MTLRenderPassDescriptor *d, RgfxRenderPassDesc *desc,
 	uint32_t count = fillRenderPass(renderPassDescriptor, &desc, &colors);
 	noteRenderPassWrites(_encoder, renderPassDescriptor);
 	_encoder->beginRenderPass(desc, colors.empty() ? nullptr : colors.data(), count);
-	return [[RgfxRenderCommandEncoder alloc] initWithEncoder:_encoder
-	                                                 emitEnd:YES
-	                                                  device:self.device];
+	RgfxRenderCommandEncoder *enc = [[RgfxRenderCommandEncoder alloc] initWithEncoder:_encoder
+	                                                                          emitEnd:YES
+	                                                                           device:self.device];
+	[enc rgfxSetUploads:_uploads];
+	[enc rgfxSetTileWidth:renderPassDescriptor.tileWidth height:renderPassDescriptor.tileHeight];
+	return enc;
 }
 
 - (nullable id<MTLComputeCommandEncoder>)computeCommandEncoder
 {
 	_encoder->beginComputePass();
-	return [[RgfxComputeCommandEncoder alloc] initWithEncoder:_encoder device:self.device];
+	RgfxComputeCommandEncoder *enc = [[RgfxComputeCommandEncoder alloc] initWithEncoder:_encoder
+	                                                                             device:self.device];
+	[enc rgfxSetUploads:_uploads];
+	return enc;
 }
 
 - (nullable id<MTLComputeCommandEncoder>)computeCommandEncoderWithDescriptor:
     (MTLComputePassDescriptor *)computePassDescriptor
 {
-	_encoder->beginComputePass(static_cast<uint32_t>(computePassDescriptor.dispatchType));
-	return [[RgfxComputeCommandEncoder alloc] initWithEncoder:_encoder device:self.device];
+	return [self computeCommandEncoderWithDispatchType:computePassDescriptor.dispatchType];
+}
+
+// The pass carries the dispatch type, which the encoder answers (dispatchType).
+- (nullable id<MTLComputeCommandEncoder>)computeCommandEncoderWithDispatchType:
+    (MTLDispatchType)dispatchType
+{
+	_encoder->beginComputePass(static_cast<uint32_t>(dispatchType));
+	RgfxComputeCommandEncoder *enc = [[RgfxComputeCommandEncoder alloc] initWithEncoder:_encoder
+	                                                                             device:self.device];
+	[enc rgfxSetUploads:_uploads];
+	[enc rgfxSetDispatchType:dispatchType];
+	return enc;
 }
 
 - (nullable id<MTLBlitCommandEncoder>)blitCommandEncoder
@@ -642,7 +746,11 @@ uint32_t fillRenderPass(MTLRenderPassDescriptor *d, RgfxRenderPassDesc *desc,
 	uint32_t count = fillRenderPass(renderPassDescriptor, &desc, &colors);
 	noteRenderPassWrites(_encoder, renderPassDescriptor);
 	_encoder->beginRenderPass(desc, colors.empty() ? nullptr : colors.data(), count);
-	return [[RgfxParallelRenderCommandEncoder alloc] initWithEncoder:_encoder device:self.device];
+	RgfxParallelRenderCommandEncoder *enc =
+	    [[RgfxParallelRenderCommandEncoder alloc] initWithEncoder:_encoder device:self.device];
+	[enc rgfxSetUploads:_uploads];
+	[enc rgfxSetTileWidth:renderPassDescriptor.tileWidth height:renderPassDescriptor.tileHeight];
+	return enc;
 }
 
 // --- submission --------------------------------------------------------------
@@ -754,6 +862,10 @@ uint32_t fillRenderPass(MTLRenderPassDescriptor *d, RgfxRenderPassDesc *desc,
 	// The surfaces this buffer wrote hold its results before anyone sees it complete.
 	rgfxIOSurfaceWriteBack(_surfaceWrites);
 	_surfaceWrites.clear();
+	// The host is done with the inline bytes: their chunks go back to the queue's pool.
+	if (_uploads != nullptr) {
+		_uploads->giveBack();
+	}
 	// The host read the message out of its block before it ran the buffer.
 	if (_bodyRegion != nullptr) {
 		_bodyRegion->release(_bodyOffset);
@@ -1015,6 +1127,19 @@ uint32_t fillRenderPass(MTLRenderPassDescriptor *d, RgfxRenderPassDesc *desc,
 	BOOL _emitEnd;
 	__weak id<MTLDevice> _device;
 	NSString *_encLabel;
+	std::shared_ptr<RgfxUploadArena> _uploads; // the command buffer's, for inline bytes
+	NSUInteger _tileWidth, _tileHeight;          // the pass descriptor's tile size
+}
+
+- (void)rgfxSetUploads:(std::shared_ptr<RgfxUploadArena>)uploads
+{
+	_uploads = std::move(uploads);
+}
+
+- (void)rgfxSetTileWidth:(NSUInteger)width height:(NSUInteger)height
+{
+	_tileWidth = width;
+	_tileHeight = height;
 }
 
 - (instancetype)initWithEncoder:(RgfxEncoder *)enc
@@ -1701,6 +1826,366 @@ uint32_t fillRenderPass(MTLRenderPassDescriptor *d, RgfxRenderPassDesc *desc,
 	                                    indirectBufferOffset);
 }
 
+// --- inline bytes ------------------------------------------------------------
+// The wire carries no inline constant data: the bytes go to an upload chunk of the command
+// buffer's (RgfxUploads.h), which is bound as a buffer at their offset there.
+
+- (void)setVertexBytes:(const void *)bytes length:(NSUInteger)length atIndex:(NSUInteger)index
+{
+	id<MTLBuffer> buffer = nil;
+	uint64_t offset = 0;
+	if (rgfxPutBytes(_uploads.get(), bytes, length, &buffer, &offset))
+		[self setVertexBuffer:buffer offset:offset atIndex:index];
+}
+- (void)setVertexBytes:(const void *)bytes
+                length:(NSUInteger)length
+       attributeStride:(NSUInteger)stride
+               atIndex:(NSUInteger)index
+{
+	id<MTLBuffer> buffer = nil;
+	uint64_t offset = 0;
+	if (rgfxPutBytes(_uploads.get(), bytes, length, &buffer, &offset))
+		[self setVertexBuffer:buffer offset:offset attributeStride:stride atIndex:index];
+}
+- (void)setFragmentBytes:(const void *)bytes length:(NSUInteger)length atIndex:(NSUInteger)index
+{
+	id<MTLBuffer> buffer = nil;
+	uint64_t offset = 0;
+	if (rgfxPutBytes(_uploads.get(), bytes, length, &buffer, &offset))
+		[self setFragmentBuffer:buffer offset:offset atIndex:index];
+}
+- (void)setTileBytes:(const void *)bytes length:(NSUInteger)length atIndex:(NSUInteger)index
+{
+	id<MTLBuffer> buffer = nil;
+	uint64_t offset = 0;
+	if (rgfxPutBytes(_uploads.get(), bytes, length, &buffer, &offset))
+		[self setTileBuffer:buffer offset:offset atIndex:index];
+}
+
+// --- barriers ------------------------------------------------------------------
+
+- (void)memoryBarrierWithScope:(MTLBarrierScope)scope
+                   afterStages:(MTLRenderStages)after
+                  beforeStages:(MTLRenderStages)before
+{
+	_enc->renderMemoryBarrierWithScope(static_cast<uint64_t>(scope), static_cast<uint64_t>(after),
+	                                   static_cast<uint64_t>(before));
+}
+
+// The wire's render barrier names scopes, not resources: the barrier covers the scope of every
+// kind among `resources` (buffers; textures, which also covers them as render targets), a
+// superset of the resources, so everything that waited on them still waits.
+- (void)memoryBarrierWithResources:(const id<MTLResource> __nonnull[__nonnull])resources
+                             count:(NSUInteger)count
+                       afterStages:(MTLRenderStages)after
+                      beforeStages:(MTLRenderStages)before
+{
+	MTLBarrierScope scope = 0;
+	for (NSUInteger i = 0; i < count; i++) {
+		if ([resources[i] conformsToProtocol:@protocol(MTLTexture)])
+			scope |= MTLBarrierScopeTextures | MTLBarrierScopeRenderTargets;
+		else
+			scope |= MTLBarrierScopeBuffers;
+	}
+	if (scope != 0)
+		[self memoryBarrierWithScope:scope afterStages:after beforeStages:before];
+}
+
+// What the deprecated texture barrier is: the render targets' writes before later fragment reads.
+- (void)textureBarrier
+{
+	[self memoryBarrierWithScope:MTLBarrierScopeRenderTargets
+	                 afterStages:MTLRenderStageFragment
+	                beforeStages:MTLRenderStageFragment];
+}
+
+// --- the pass's tile size --------------------------------------------------------
+// The pass descriptor's, where it named one; where it left the choice to the device, which
+// size the host GPU picks is not on the wire: answered 0 and logged.
+
+- (NSUInteger)tileWidth
+{
+	if (_tileWidth == 0)
+		RGFX_UNSUPPORTED("the device's own tile size (no host query on the wire)");
+	return _tileWidth;
+}
+- (NSUInteger)tileHeight
+{
+	if (_tileHeight == 0)
+		RGFX_UNSUPPORTED("the device's own tile size (no host query on the wire)");
+	return _tileHeight;
+}
+
+// --- unsupported: the device answers NO for these features -----------------------
+// A nil or default argument asks for nothing, so it is exact; any other is logged and dropped.
+
+- (void)setDepthStoreActionOptions:(MTLStoreActionOptions)storeActionOptions
+{
+	if (storeActionOptions != MTLStoreActionOptionNone)
+		RGFX_UNSUPPORTED("depth store action options (no op on the wire)");
+}
+- (void)setDepthTestMinBound:(float)minBound maxBound:(float)maxBound
+{
+	if (minBound != 0.0f || maxBound != 1.0f)
+		RGFX_UNSUPPORTED("depth bounds testing (no op on the wire)");
+}
+- (void)setColorAttachmentMap:(nullable MTLLogicalToPhysicalColorAttachmentMap *)mapping
+{
+	if (mapping != nil)
+		RGFX_UNSUPPORTED("color attachment mapping (no op on the wire)");
+}
+- (void)barrierAfterQueueStages:(MTLStages)afterQueueStages beforeStages:(MTLStages)beforeStages
+{
+	RGFX_UNSUPPORTED("queue-stage barriers (no op on the wire)");
+}
+- (void)sampleCountersInBuffer:(id<MTLCounterSampleBuffer>)sampleBuffer
+                 atSampleIndex:(NSUInteger)sampleIndex
+                   withBarrier:(BOOL)barrier
+{
+	RGFX_UNSUPPORTED("counter sampling");
+}
+
+// Mesh shading: no mesh pipeline can be made (newRenderPipelineStateWithMeshDescriptor:), so
+// these draw nothing.
+- (void)drawMeshThreadgroups:(MTLSize)threadgroupsPerGrid
+    threadsPerObjectThreadgroup:(MTLSize)threadsPerObjectThreadgroup
+      threadsPerMeshThreadgroup:(MTLSize)threadsPerMeshThreadgroup
+{
+	RGFX_UNSUPPORTED("mesh shading");
+}
+- (void)drawMeshThreads:(MTLSize)threadsPerGrid
+    threadsPerObjectThreadgroup:(MTLSize)threadsPerObjectThreadgroup
+      threadsPerMeshThreadgroup:(MTLSize)threadsPerMeshThreadgroup
+{
+	RGFX_UNSUPPORTED("mesh shading");
+}
+- (void)drawMeshThreadgroupsWithIndirectBuffer:(id<MTLBuffer>)indirectBuffer
+                          indirectBufferOffset:(NSUInteger)indirectBufferOffset
+                   threadsPerObjectThreadgroup:(MTLSize)threadsPerObjectThreadgroup
+                     threadsPerMeshThreadgroup:(MTLSize)threadsPerMeshThreadgroup
+{
+	RGFX_UNSUPPORTED("mesh shading");
+}
+
+- (void)setObjectBuffer:(nullable id<MTLBuffer>)buffer offset:(NSUInteger)offset atIndex:(NSUInteger)index
+{
+	if (buffer != nil)
+		RGFX_UNSUPPORTED("mesh shading");
+}
+- (void)setObjectBufferOffset:(NSUInteger)offset atIndex:(NSUInteger)index
+{
+	RGFX_UNSUPPORTED("mesh shading");
+}
+- (void)setObjectBuffers:(const id<MTLBuffer> __nullable[__nonnull])buffers
+                offsets:(const NSUInteger[__nonnull])offsets
+              withRange:(NSRange)range
+{
+	if (range.length != 0)
+		RGFX_UNSUPPORTED("mesh shading");
+}
+- (void)setObjectBytes:(const void *)bytes length:(NSUInteger)length atIndex:(NSUInteger)index
+{
+	RGFX_UNSUPPORTED("mesh shading");
+}
+- (void)setObjectSamplerState:(nullable id<MTLSamplerState>)sampler atIndex:(NSUInteger)index
+{
+	if (sampler != nil)
+		RGFX_UNSUPPORTED("mesh shading");
+}
+- (void)setObjectSamplerState:(nullable id<MTLSamplerState>)sampler
+                  lodMinClamp:(float)lodMinClamp
+                  lodMaxClamp:(float)lodMaxClamp
+                      atIndex:(NSUInteger)index
+{
+	if (sampler != nil)
+		RGFX_UNSUPPORTED("mesh shading");
+}
+- (void)setObjectSamplerStates:(const id<MTLSamplerState> __nullable[__nonnull])samplers
+                  lodMinClamps:(const float[__nonnull])lodMinClamps
+                  lodMaxClamps:(const float[__nonnull])lodMaxClamps
+                     withRange:(NSRange)range
+{
+	if (range.length != 0)
+		RGFX_UNSUPPORTED("mesh shading");
+}
+- (void)setObjectSamplerStates:(const id<MTLSamplerState> __nullable[__nonnull])samplers
+                     withRange:(NSRange)range
+{
+	if (range.length != 0)
+		RGFX_UNSUPPORTED("mesh shading");
+}
+- (void)setObjectTexture:(nullable id<MTLTexture>)texture atIndex:(NSUInteger)index
+{
+	if (texture != nil)
+		RGFX_UNSUPPORTED("mesh shading");
+}
+- (void)setObjectTextures:(const id<MTLTexture> __nullable[__nonnull])textures withRange:(NSRange)range
+{
+	if (range.length != 0)
+		RGFX_UNSUPPORTED("mesh shading");
+}
+- (void)setMeshBuffer:(nullable id<MTLBuffer>)buffer offset:(NSUInteger)offset atIndex:(NSUInteger)index
+{
+	if (buffer != nil)
+		RGFX_UNSUPPORTED("mesh shading");
+}
+- (void)setMeshBufferOffset:(NSUInteger)offset atIndex:(NSUInteger)index
+{
+	RGFX_UNSUPPORTED("mesh shading");
+}
+- (void)setMeshBuffers:(const id<MTLBuffer> __nullable[__nonnull])buffers
+                offsets:(const NSUInteger[__nonnull])offsets
+              withRange:(NSRange)range
+{
+	if (range.length != 0)
+		RGFX_UNSUPPORTED("mesh shading");
+}
+- (void)setMeshBytes:(const void *)bytes length:(NSUInteger)length atIndex:(NSUInteger)index
+{
+	RGFX_UNSUPPORTED("mesh shading");
+}
+- (void)setMeshSamplerState:(nullable id<MTLSamplerState>)sampler atIndex:(NSUInteger)index
+{
+	if (sampler != nil)
+		RGFX_UNSUPPORTED("mesh shading");
+}
+- (void)setMeshSamplerState:(nullable id<MTLSamplerState>)sampler
+                  lodMinClamp:(float)lodMinClamp
+                  lodMaxClamp:(float)lodMaxClamp
+                      atIndex:(NSUInteger)index
+{
+	if (sampler != nil)
+		RGFX_UNSUPPORTED("mesh shading");
+}
+- (void)setMeshSamplerStates:(const id<MTLSamplerState> __nullable[__nonnull])samplers
+                  lodMinClamps:(const float[__nonnull])lodMinClamps
+                  lodMaxClamps:(const float[__nonnull])lodMaxClamps
+                     withRange:(NSRange)range
+{
+	if (range.length != 0)
+		RGFX_UNSUPPORTED("mesh shading");
+}
+- (void)setMeshSamplerStates:(const id<MTLSamplerState> __nullable[__nonnull])samplers
+                     withRange:(NSRange)range
+{
+	if (range.length != 0)
+		RGFX_UNSUPPORTED("mesh shading");
+}
+- (void)setMeshTexture:(nullable id<MTLTexture>)texture atIndex:(NSUInteger)index
+{
+	if (texture != nil)
+		RGFX_UNSUPPORTED("mesh shading");
+}
+- (void)setMeshTextures:(const id<MTLTexture> __nullable[__nonnull])textures withRange:(NSRange)range
+{
+	if (range.length != 0)
+		RGFX_UNSUPPORTED("mesh shading");
+}
+
+- (void)setObjectThreadgroupMemoryLength:(NSUInteger)length atIndex:(NSUInteger)index
+{
+	RGFX_UNSUPPORTED("mesh shading");
+}
+
+// Ray tracing and function tables: the device makes no acceleration structure, intersection
+// or visible function table, so only nil reaches these.
+- (void)setVertexAccelerationStructure:(nullable id<MTLAccelerationStructure>)accelerationStructure
+                       atBufferIndex:(NSUInteger)bufferIndex
+{
+	if (accelerationStructure != nil)
+		RGFX_UNSUPPORTED("ray tracing");
+}
+- (void)setVertexIntersectionFunctionTable:
+            (nullable id<MTLIntersectionFunctionTable>)intersectionFunctionTable
+                           atBufferIndex:(NSUInteger)bufferIndex
+{
+	if (intersectionFunctionTable != nil)
+		RGFX_UNSUPPORTED("ray tracing");
+}
+- (void)setVertexIntersectionFunctionTables:
+            (const id<MTLIntersectionFunctionTable> __nullable[__nonnull])intersectionFunctionTables
+                          withBufferRange:(NSRange)range
+{
+	if (range.length != 0)
+		RGFX_UNSUPPORTED("ray tracing");
+}
+- (void)setVertexVisibleFunctionTable:(nullable id<MTLVisibleFunctionTable>)functionTable
+                      atBufferIndex:(NSUInteger)bufferIndex
+{
+	if (functionTable != nil)
+		RGFX_UNSUPPORTED("function pointers");
+}
+- (void)setVertexVisibleFunctionTables:(const id<MTLVisibleFunctionTable> __nullable[__nonnull])functionTables
+                     withBufferRange:(NSRange)range
+{
+	if (range.length != 0)
+		RGFX_UNSUPPORTED("function pointers");
+}
+- (void)setFragmentAccelerationStructure:(nullable id<MTLAccelerationStructure>)accelerationStructure
+                       atBufferIndex:(NSUInteger)bufferIndex
+{
+	if (accelerationStructure != nil)
+		RGFX_UNSUPPORTED("ray tracing");
+}
+- (void)setFragmentIntersectionFunctionTable:
+            (nullable id<MTLIntersectionFunctionTable>)intersectionFunctionTable
+                           atBufferIndex:(NSUInteger)bufferIndex
+{
+	if (intersectionFunctionTable != nil)
+		RGFX_UNSUPPORTED("ray tracing");
+}
+- (void)setFragmentIntersectionFunctionTables:
+            (const id<MTLIntersectionFunctionTable> __nullable[__nonnull])intersectionFunctionTables
+                          withBufferRange:(NSRange)range
+{
+	if (range.length != 0)
+		RGFX_UNSUPPORTED("ray tracing");
+}
+- (void)setFragmentVisibleFunctionTable:(nullable id<MTLVisibleFunctionTable>)functionTable
+                      atBufferIndex:(NSUInteger)bufferIndex
+{
+	if (functionTable != nil)
+		RGFX_UNSUPPORTED("function pointers");
+}
+- (void)setFragmentVisibleFunctionTables:(const id<MTLVisibleFunctionTable> __nullable[__nonnull])functionTables
+                     withBufferRange:(NSRange)range
+{
+	if (range.length != 0)
+		RGFX_UNSUPPORTED("function pointers");
+}
+- (void)setTileAccelerationStructure:(nullable id<MTLAccelerationStructure>)accelerationStructure
+                       atBufferIndex:(NSUInteger)bufferIndex
+{
+	if (accelerationStructure != nil)
+		RGFX_UNSUPPORTED("ray tracing");
+}
+- (void)setTileIntersectionFunctionTable:
+            (nullable id<MTLIntersectionFunctionTable>)intersectionFunctionTable
+                           atBufferIndex:(NSUInteger)bufferIndex
+{
+	if (intersectionFunctionTable != nil)
+		RGFX_UNSUPPORTED("ray tracing");
+}
+- (void)setTileIntersectionFunctionTables:
+            (const id<MTLIntersectionFunctionTable> __nullable[__nonnull])intersectionFunctionTables
+                          withBufferRange:(NSRange)range
+{
+	if (range.length != 0)
+		RGFX_UNSUPPORTED("ray tracing");
+}
+- (void)setTileVisibleFunctionTable:(nullable id<MTLVisibleFunctionTable>)functionTable
+                      atBufferIndex:(NSUInteger)bufferIndex
+{
+	if (functionTable != nil)
+		RGFX_UNSUPPORTED("function pointers");
+}
+- (void)setTileVisibleFunctionTables:(const id<MTLVisibleFunctionTable> __nullable[__nonnull])functionTables
+                     withBufferRange:(NSRange)range
+{
+	if (range.length != 0)
+		RGFX_UNSUPPORTED("function pointers");
+}
+
 @end
 
 // =============================================================================
@@ -1711,6 +2196,23 @@ uint32_t fillRenderPass(MTLRenderPassDescriptor *d, RgfxRenderPassDesc *desc,
 	RgfxEncoder *_enc;
 	__weak id<MTLDevice> _device;
 	NSString *_encLabel;
+	std::shared_ptr<RgfxUploadArena> _uploads; // the command buffer's, for inline bytes
+	MTLDispatchType _dispatchType;              // the pass's; Serial, Metal's default, unless set
+}
+
+- (void)rgfxSetUploads:(std::shared_ptr<RgfxUploadArena>)uploads
+{
+	_uploads = std::move(uploads);
+}
+
+- (void)rgfxSetDispatchType:(MTLDispatchType)dispatchType
+{
+	_dispatchType = dispatchType;
+}
+
+- (MTLDispatchType)dispatchType
+{
+	return _dispatchType;
 }
 
 - (instancetype)initWithEncoder:(RgfxEncoder *)enc device:(id<MTLDevice>)device
@@ -1974,6 +2476,72 @@ uint32_t fillRenderPass(MTLRenderPassDescriptor *d, RgfxRenderPassDesc *desc,
 	                                     indirectBufferOffset);
 }
 
+// --- inline bytes ------------------------------------------------------------
+// As the render encoder's: an upload chunk of the command buffer's, bound at its offset.
+
+- (void)setBytes:(const void *)bytes length:(NSUInteger)length atIndex:(NSUInteger)index
+{
+	id<MTLBuffer> buffer = nil;
+	uint64_t offset = 0;
+	if (rgfxPutBytes(_uploads.get(), bytes, length, &buffer, &offset))
+		[self setBuffer:buffer offset:offset atIndex:index];
+}
+- (void)setBytes:(const void *)bytes
+             length:(NSUInteger)length
+    attributeStride:(NSUInteger)stride
+            atIndex:(NSUInteger)index
+{
+	id<MTLBuffer> buffer = nil;
+	uint64_t offset = 0;
+	if (rgfxPutBytes(_uploads.get(), bytes, length, &buffer, &offset))
+		[self setBuffer:buffer offset:offset attributeStride:stride atIndex:index];
+}
+
+// --- unsupported: the device answers NO for these features -----------------------
+// The device makes no acceleration structure or function table, so only nil reaches these.
+
+- (void)setAccelerationStructure:(nullable id<MTLAccelerationStructure>)accelerationStructure
+                   atBufferIndex:(NSUInteger)bufferIndex
+{
+	if (accelerationStructure != nil)
+		RGFX_UNSUPPORTED("ray tracing");
+}
+- (void)setIntersectionFunctionTable:(nullable id<MTLIntersectionFunctionTable>)intersectionFunctionTable
+                       atBufferIndex:(NSUInteger)bufferIndex
+{
+	if (intersectionFunctionTable != nil)
+		RGFX_UNSUPPORTED("ray tracing");
+}
+- (void)setIntersectionFunctionTables:
+            (const id<MTLIntersectionFunctionTable> __nullable[__nonnull])intersectionFunctionTables
+                      withBufferRange:(NSRange)range
+{
+	if (range.length != 0)
+		RGFX_UNSUPPORTED("ray tracing");
+}
+- (void)setVisibleFunctionTable:(nullable id<MTLVisibleFunctionTable>)visibleFunctionTable
+                  atBufferIndex:(NSUInteger)bufferIndex
+{
+	if (visibleFunctionTable != nil)
+		RGFX_UNSUPPORTED("function pointers");
+}
+- (void)setVisibleFunctionTables:(const id<MTLVisibleFunctionTable> __nullable[__nonnull])visibleFunctionTables
+                 withBufferRange:(NSRange)range
+{
+	if (range.length != 0)
+		RGFX_UNSUPPORTED("function pointers");
+}
+- (void)sampleCountersInBuffer:(id<MTLCounterSampleBuffer>)sampleBuffer
+                 atSampleIndex:(NSUInteger)sampleIndex
+                   withBarrier:(BOOL)barrier
+{
+	RGFX_UNSUPPORTED("counter sampling");
+}
+- (void)barrierAfterQueueStages:(MTLStages)afterQueueStages beforeStages:(MTLStages)beforeStages
+{
+	RGFX_UNSUPPORTED("queue-stage barriers (no op on the wire)");
+}
+
 @end
 
 // =============================================================================
@@ -2133,6 +2701,28 @@ destinationBytesPerImage:(NSUInteger)destinationBytesPerImage
 	                            sourceLevel, destinationSlice, destinationLevel, sliceCount,
 	                            levelCount);
 }
+// As many whole surfaces as both textures have, as Metal computes them: the level of one
+// texture whose size is the other's first level's lines the two up; then the levels both have
+// from there, and the slices both have (a cube's six faces each).
+- (void)copyFromTexture:(id<MTLTexture>)sourceTexture toTexture:(id<MTLTexture>)destinationTexture
+{
+	NSUInteger sourceLevel = 0, destinationLevel = 0;
+	if (!rgfxLevelMatching(sourceTexture, destinationTexture, &sourceLevel)) {
+		if (!rgfxLevelMatching(destinationTexture, sourceTexture, &destinationLevel))
+			return; // no level of one is the other's size: Metal's validation refuses the copy
+	}
+	NSUInteger levels = std::min(sourceTexture.mipmapLevelCount - sourceLevel,
+	                             destinationTexture.mipmapLevelCount - destinationLevel);
+	NSUInteger slices = std::min(rgfxSurfaceSlices(sourceTexture), rgfxSurfaceSlices(destinationTexture));
+	[self copyFromTexture:sourceTexture
+	          sourceSlice:0
+	          sourceLevel:sourceLevel
+	            toTexture:destinationTexture
+	     destinationSlice:0
+	     destinationLevel:destinationLevel
+	           sliceCount:slices
+	           levelCount:levels];
+}
 - (void)generateMipmapsForTexture:(id<MTLTexture>)texture
 {
 	rgfxIOSurfaceNoteWrite(_enc, texture);
@@ -2197,6 +2787,47 @@ destinationBytesPerImage:(NSUInteger)destinationBytesPerImage
 	_enc->blitSynchronizeTexture(rgfxId(texture), slice, level);
 }
 
+// --- unsupported: the device answers NO for these features -----------------------
+
+- (void)resolveCounters:(id<MTLCounterSampleBuffer>)sampleBuffer
+                inRange:(NSRange)range
+      destinationBuffer:(id<MTLBuffer>)destinationBuffer
+      destinationOffset:(NSUInteger)destinationOffset
+{
+	RGFX_UNSUPPORTED("counter sampling");
+}
+- (void)sampleCountersInBuffer:(id<MTLCounterSampleBuffer>)sampleBuffer
+                 atSampleIndex:(NSUInteger)sampleIndex
+                   withBarrier:(BOOL)barrier
+{
+	RGFX_UNSUPPORTED("counter sampling");
+}
+// The device makes no tensor (newTensorWithDescriptor:error:), so these copy nothing.
+- (void)copyFromTensor:(id<MTLTensor>)sourceTensor
+              sourceOrigin:(MTLTensorExtents *)sourceOrigin
+          sourceDimensions:(MTLTensorExtents *)sourceDimensions
+                  toTensor:(id<MTLTensor>)destinationTensor
+         destinationOrigin:(MTLTensorExtents *)destinationOrigin
+     destinationDimensions:(MTLTensorExtents *)destinationDimensions
+{
+	RGFX_UNSUPPORTED("tensors");
+}
+- (void)copyFromTensor:(id<MTLTensor>)sourceTensor
+              sourceOrigin:(MTLTensorExtents *)sourceOrigin
+          sourceDimensions:(MTLTensorExtents *)sourceDimensions
+               sourcePlane:(MTLTensorPlaneType)sourcePlane
+                  toTensor:(id<MTLTensor>)destinationTensor
+         destinationOrigin:(MTLTensorExtents *)destinationOrigin
+     destinationDimensions:(MTLTensorExtents *)destinationDimensions
+          destinationPlane:(MTLTensorPlaneType)destinationPlane
+{
+	RGFX_UNSUPPORTED("tensors");
+}
+- (void)barrierAfterQueueStages:(MTLStages)afterQueueStages beforeStages:(MTLStages)beforeStages
+{
+	RGFX_UNSUPPORTED("queue-stage barriers (no op on the wire)");
+}
+
 @end
 
 // =============================================================================
@@ -2208,6 +2839,19 @@ destinationBytesPerImage:(NSUInteger)destinationBytesPerImage
 	__weak id<MTLDevice> _device;
 	NSString *_encLabel;
 	BOOL _ended;
+	std::shared_ptr<RgfxUploadArena> _uploads; // the command buffer's, for its sub-encoders
+	NSUInteger _tileWidth, _tileHeight;
+}
+
+- (void)rgfxSetUploads:(std::shared_ptr<RgfxUploadArena>)uploads
+{
+	_uploads = std::move(uploads);
+}
+
+- (void)rgfxSetTileWidth:(NSUInteger)width height:(NSUInteger)height
+{
+	_tileWidth = width;
+	_tileHeight = height;
 }
 
 - (instancetype)initWithEncoder:(RgfxEncoder *)enc device:(id<MTLDevice>)device
@@ -2249,7 +2893,12 @@ destinationBytesPerImage:(NSUInteger)destinationBytesPerImage
 	// Sub-encoders of a parallel pass share the one open render pass; they forward
 	// ops to the same RgfxEncoder and do NOT write their own begin/end framing. This
 	// encoder writes the single RGFX_OP_ENCODER_END on its own endEncoding.
-	return [[RgfxRenderCommandEncoder alloc] initWithEncoder:_enc emitEnd:NO device:_device];
+	RgfxRenderCommandEncoder *sub = [[RgfxRenderCommandEncoder alloc] initWithEncoder:_enc
+	                                                                          emitEnd:NO
+	                                                                           device:_device];
+	[sub rgfxSetUploads:_uploads];
+	[sub rgfxSetTileWidth:_tileWidth height:_tileHeight];
+	return sub;
 }
 
 - (void)endEncoding
@@ -2281,6 +2930,15 @@ destinationBytesPerImage:(NSUInteger)destinationBytesPerImage
 - (void)setStencilStoreActionOptions:(MTLStoreActionOptions)storeActionOptions
 {
 	_enc->renderSetStencilStoreActionOptions(static_cast<uint64_t>(storeActionOptions));
+}
+- (void)setDepthStoreActionOptions:(MTLStoreActionOptions)storeActionOptions
+{
+	if (storeActionOptions != MTLStoreActionOptionNone)
+		RGFX_UNSUPPORTED("depth store action options (no op on the wire)");
+}
+- (void)barrierAfterQueueStages:(MTLStages)afterQueueStages beforeStages:(MTLStages)beforeStages
+{
+	RGFX_UNSUPPORTED("queue-stage barriers (no op on the wire)");
 }
 
 @end

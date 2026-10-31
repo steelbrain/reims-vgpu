@@ -4111,6 +4111,8 @@ void test_reply_reader_close()
 	CHECK(ring.consumerCount() == 0);
 }
 
+void rgfxProtocolTests();
+
 int main()
 {
 	@autoreleasepool {
@@ -4170,6 +4172,7 @@ int main()
 		test_heaps_with_no_bytes_or_address_are_nil();
 		test_queue_ring_carries_only_command_buffers();
 		test_managed_texture_copy_block_after_destroys();
+		rgfxProtocolTests(); // tests/protocol_tests.mm
 	}
 	std::printf("shell_tests: OK (%d checks)\n", g_checks);
 	return 0;
