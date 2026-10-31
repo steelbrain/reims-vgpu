@@ -658,6 +658,18 @@ void test_heap_routing_and_suballoc()
 	// The offset-less (Automatic-placement) variants are nil stubs this slice.
 	CHECK([heap newBufferWithLength:0x100 options:MTLResourceStorageModePrivate] == nil);
 	CHECK([heap newTextureWithDescriptor:td] == nil);
+
+	// Of an Automatic heap, a placement at an offset is nil, and nothing is posted.
+	hd.type = MTLHeapTypeAutomatic;
+	RgfxHeap *automatic = [RgfxHeap heapWithDescriptor:hd device:nil serializer:&fx.ser];
+	(void)expectMessage<RgfxHeapCreate>(fx.ring, RGFX_CMD_HEAP_CREATE);
+	CHECK([automatic newTextureWithDescriptor:td offset:0x4000] == nil);
+	CHECK([automatic newBufferWithLength:0x400
+	                             options:MTLResourceStorageModePrivate
+	                              offset:0x2000] == nil);
+	RgfxMsgHeader h = {};
+	std::vector<uint8_t> posted;
+	CHECK(!fx.ring.next(&h, &posted));
 	}
 }
 

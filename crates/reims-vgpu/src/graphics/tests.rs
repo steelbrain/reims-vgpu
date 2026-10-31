@@ -1922,8 +1922,62 @@ fn a_compile_the_platform_refuses_is_a_refused_reflection() {
     assert_eq!(device.decoder_object_count(), 3);
 }
 
-/// The platform ending the process at a texture's or a buffer's create refuses the create: nothing
-/// is made, the device goes on, and the next creates are made
+/// The platform ending the process at a library's make (the Vulkan runtime refusing a library
+/// kind it makes none of yet, a Core Image kernel library) refuses the create in this lane: its
+/// `COMPLETE` is refused, a pipeline of it is refused, and the next library is made
+#[test]
+fn a_library_the_platform_refuses_is_a_refused_create() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform) = headless_on(&raised);
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    platform
+        .faults()
+        .at("MTLDevice", "newLibraryWithData:error:", 0, Fault::Crash);
+    assert_eq!(
+        answered(&device, &mut guest, library_create(obj(1, 10))),
+        RGFX_STATUS_REFUSED
+    );
+    guest.send(&device, compute_pipeline_create(obj(1, 11), obj(1, 10)));
+    expect_reflection(&mut guest, obj(1, 11), RGFX_PIPELINE_REFUSED);
+    assert_eq!(device.decoder_object_count(), 0, "nothing made");
+    // The device goes on: the same create is made.
+    make_library(&device, &mut guest, obj(1, 20));
+    guest.send(&device, compute_pipeline_create(obj(1, 21), obj(1, 20)));
+    expect_reflection(&mut guest, obj(1, 21), RGFX_PIPELINE_OK);
+    assert_eq!(device.decoder_object_count(), 2);
+}
+
+/// A `HEAP_CREATE` of an Automatic heap `obj_id` of 1 MiB.
+fn heap_create(obj_id: u64) -> Vec<u8> {
+    RgfxHeapCreate {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_HEAP_CREATE,
+            size: 0,
+            seqno: 0,
+        },
+        obj_id,
+        gpu_address: 0x6_0000,
+        size_bytes: 1 << 20,
+        options: 0,
+        heap_type: 0,
+    }
+    .as_bytes()
+    .to_vec()
+}
+
+/// A `TEXTURE_CREATE` of texture `obj_id` at `offset` in heap `heap`, at `resource_id`.
+fn heap_texture_create(obj_id: u64, resource_id: u64, heap: u64, offset: u64) -> Vec<u8> {
+    let mut m = RgfxTextureCreate::read_from_bytes(&texture_create(obj_id, resource_id)).unwrap();
+    m.heap_obj_id = heap;
+    m.heap_offset = offset;
+    m.as_bytes().to_vec()
+}
+
+/// The platform ending the process at a texture's or a buffer's create, or at a texture's
+/// placement in a heap (the Vulkan runtime refusing a placement at an offset in an Automatic
+/// heap, which Metal's validation fails), refuses the create: nothing is made, the device goes
+/// on, and the next creates are made
 #[test]
 fn a_create_the_platform_refuses_makes_nothing() {
     let raised = Arc::new(AtomicU32::new(0));
@@ -1932,26 +1986,36 @@ fn a_create_the_platform_refuses_makes_nothing() {
     let mut guest = Guest::new(&device);
     let first = 1 + 7 * RGFX_RESOURCE_ID_CHUNK;
     guest.send(&device, resource_id_chunk(3, 7));
+    guest.send(&device, heap_create(obj(3, 9)));
     let faults = platform.faults();
     faults.at("MTLDevice", "newTextureWithDescriptor:", 0, Fault::Crash);
     faults.at("MTLDevice", "newBufferWithDescriptor:", 0, Fault::Crash);
+    faults.at("MTLHeap", "newTextureWithDescriptor:offset:", 0, Fault::Crash);
     guest.send(&device, texture_create(obj(3, 1), first));
     guest.send(&device, buffer_create(obj(3, 2)));
+    guest.send(
+        &device,
+        heap_texture_create(obj(3, 5), first + 2, obj(3, 9), 0x1000),
+    );
     assert_eq!(
         answered(&device, &mut guest, context_close(99)),
         RGFX_STATUS_OK
     );
-    assert_eq!(device.decoder_object_count(), 0, "both creates refused");
+    assert_eq!(device.decoder_object_count(), 1, "the three creates refused");
     guest.send(&device, texture_create(obj(3, 3), first + 1));
     guest.send(&device, buffer_create(obj(3, 4)));
+    guest.send(
+        &device,
+        heap_texture_create(obj(3, 6), first + 3, obj(3, 9), 0x1000),
+    );
     assert_eq!(
         answered(&device, &mut guest, context_close(99)),
         RGFX_STATUS_OK
     );
     assert_eq!(
         device.decoder_object_count(),
-        2,
-        "the next texture and buffer"
+        4,
+        "the heap, and the next texture, buffer and placed texture"
     );
 }
 

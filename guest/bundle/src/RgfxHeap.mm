@@ -143,13 +143,15 @@
 }
 
 // --- sub-allocation (Placement: the guest names the offset) -------------------
+// Only a Placement heap places at an offset: of a heap of another type, Metal's validation
+// fails the call, and these answer nil, as the host refuses such a placement.
 
 - (id<MTLBuffer>)newBufferWithLength:(NSUInteger)length
                              options:(MTLResourceOptions)options
                               offset:(NSUInteger)offset
 {
 	RgfxSerializer *ser = [self serializer];
-	if (ser == nullptr) {
+	if (ser == nullptr || _type != MTLHeapTypePlacement) {
 		return nil;
 	}
 	RgfxCreated created = ser->createBufferAtOffset([self rgfxObjId], offset, length,
@@ -170,6 +172,9 @@
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)descriptor
                                     offset:(NSUInteger)offset
 {
+	if (_type != MTLHeapTypePlacement) {
+		return nil;
+	}
 	RgfxTexture *texture = [RgfxTexture textureWithDescriptor:descriptor
 	                                                     heap:[self rgfxObjId]
 	                                               heapOffset:offset
