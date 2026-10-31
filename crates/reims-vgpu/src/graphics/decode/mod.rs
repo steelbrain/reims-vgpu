@@ -49,14 +49,16 @@ use reims_graphics::wire::{
     RGFX_CMD_SAMPLER_CREATE, RGFX_CMD_SHARED_EVENT_CREATE, RGFX_CMD_TEXTURE_CREATE,
     RGFX_CMD_TEXTURE_FROM_BUFFER, RGFX_CMD_TEXTURE_FROM_IOSURFACE, RGFX_CMD_TEXTURE_REPLACE_REGION,
     RGFX_CMD_TEXTURE_VIEW, RGFX_CONTEXT_ALLOCATIONS_OFFSET, RGFX_CONTEXT_OBJ_ID_SHIFT,
-    RGFX_CURSOR_SPAN, RGFX_EVT_PIPELINE_REFLECTION, RGFX_PIPELINE_KIND_COMPUTE,
-    RGFX_PIPELINE_KIND_RENDER, RGFX_PIPELINE_OK, RGFX_PIPELINE_REFLECT_SUPPORT_ICB,
-    RGFX_PIPELINE_REFLECT_THREADGROUP_MATCHES_TILE, RGFX_PIPELINE_REFUSED, RGFX_RESOURCE_ID_CHUNK,
-    RGFX_RESOURCE_ID_CHUNKS, RGFX_RESOURCE_ID_LIMIT, RgfxBufferAtOffset, RgfxBufferCreate,
-    RgfxBufferOverHostMemory, RgfxCbComplete, RgfxColorAttachmentDesc, RgfxComputePipelineCreate,
-    RgfxDepthStencilCreate, RgfxFunctionConstant, RgfxHeapCreate, RgfxHeapOverHostMemory,
-    RgfxMsgHeader, RgfxObjectCreate, RgfxObjectDestroy, RgfxPipelineReflection, RgfxQueueCreate,
-    RgfxRenderPipelineCreate, RgfxResourceIdChunk, RgfxSamplerCreate, RgfxSharedEventCreate,
+    RGFX_CURSOR_SPAN, RGFX_EVT_PIPELINE_REFLECTION, RGFX_EVT_SIZE_AND_ALIGN,
+    RGFX_PIPELINE_KIND_COMPUTE, RGFX_PIPELINE_KIND_RENDER, RGFX_PIPELINE_OK,
+    RGFX_PIPELINE_REFLECT_SUPPORT_ICB, RGFX_PIPELINE_REFLECT_THREADGROUP_MATCHES_TILE,
+    RGFX_PIPELINE_REFUSED, RGFX_RESOURCE_ID_CHUNK, RGFX_RESOURCE_ID_CHUNKS, RGFX_RESOURCE_ID_LIMIT,
+    RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK, RGFX_STATUS_REFUSED, RgfxBufferAtOffset,
+    RgfxBufferCreate, RgfxBufferOverHostMemory, RgfxCbComplete, RgfxColorAttachmentDesc,
+    RgfxComputePipelineCreate, RgfxDepthStencilCreate, RgfxFunctionConstant, RgfxHeapCreate,
+    RgfxHeapOverHostMemory, RgfxHeapTextureSizeAndAlign, RgfxMsgHeader, RgfxObjectCreate,
+    RgfxObjectDestroy, RgfxPipelineReflection, RgfxQueueCreate, RgfxRenderPipelineCreate,
+    RgfxResourceIdChunk, RgfxSamplerCreate, RgfxSharedEventCreate, RgfxSizeAndAlign,
     RgfxStencilDescriptor, RgfxTextureCreate, RgfxTextureDescriptor, RgfxTextureFromBuffer,
     RgfxTextureFromIOSurface,
 };
@@ -388,6 +390,57 @@ impl<P: Platform> GraphicsDecoder<P> {
         self.id_chunks[chunk as usize] = Some(context);
     }
 
+    /// A `HEAP_TEXTURE_SIZE_AND_ALIGN`'s answer: `device`'s size and alignment for a texture of
+    /// the message's shape (`heapTextureSizeAndAlignWithDescriptor:`), or, where the platform
+    /// raises or refuses the shape, [`RGFX_STATUS_REFUSED`] with both 0, which the guest answers
+    /// by a bound of its own. `None` for a message too short to carry its seqno, which no one can
+    /// be answered by; a shorter body is answered [`RGFX_STATUS_INVALID_ARGUMENT`].
+    pub(crate) fn heap_texture_size_and_align(
+        &self,
+        device: &P::Device,
+        message: &[u8],
+    ) -> Option<RgfxSizeAndAlign> {
+        let header = read::<RgfxMsgHeader>(message)?;
+        let answer = |status, size, align| RgfxSizeAndAlign {
+            header: RgfxMsgHeader {
+                r#type: RGFX_EVT_SIZE_AND_ALIGN,
+                size: size_of::<RgfxSizeAndAlign>() as u32,
+                seqno: header.seqno,
+            },
+            status,
+            reserved_14: 0,
+            size,
+            align,
+        };
+        let Some(m) = read::<RgfxHeapTextureSizeAndAlign>(message) else {
+            return Some(answer(RGFX_STATUS_INVALID_ARGUMENT, 0, 0));
+        };
+        // The shape alone: a texture's resource index is no part of its size.
+        let desc = TextureDesc {
+            resource_index: None,
+            ..texture_desc(&m.desc, 0)
+        };
+        let asked = refusing(|| {
+            let descriptor = self.platform.texture_descriptor(&desc);
+            device.heap_texture_size_and_align(&descriptor)
+        });
+        Some(match asked {
+            Ok(sa) => answer(RGFX_STATUS_OK, sa.size, sa.align),
+            Err(raise) => {
+                log::warn!(
+                    target: "reims_vgpu::graphics",
+                    "heap texture size of format {}, type {}, {}x{}x{} not answered: {raise}",
+                    m.desc.pixel_format,
+                    m.desc.texture_type,
+                    m.desc.width,
+                    m.desc.height,
+                    m.desc.depth
+                );
+                answer(RGFX_STATUS_REFUSED, 0, 0)
+            }
+        })
+    }
+
     /// Carries out one wire message against `device`: a create inserts the new
     /// handle (keyed by the guest-picked `obj_id`), a destroy drops it. The
     /// inner `Result` says whether the message was carried out; a platform raise
@@ -582,11 +635,10 @@ impl<P: Platform> GraphicsDecoder<P> {
                     return Ok(Err(DecodeError::Malformed));
                 };
                 // A device-placed heap at a guest-picked GPU address (0 lets the
-                // host choose). `heap_type` widens to the `MTLHeapType`. Heaps
-                // over host memory land with that region's decode.
+                // host choose). Heaps over host memory land with that region's decode.
                 let desc = HeapDesc {
                     size: m.size_bytes,
-                    heap_type: m.heap_type as i64,
+                    heap_type: host_heap_type(m.heap_type),
                     options: vec![OptionSet::ResourceOptions(m.options.into())],
                     address_ranges: None,
                     pinned_gpu_address: (m.gpu_address != 0).then_some(m.gpu_address),
@@ -632,7 +684,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                 };
                 let desc = HeapDesc {
                     size: m.size_bytes,
-                    heap_type: m.heap_type as i64,
+                    heap_type: host_heap_type(m.heap_type),
                     options: vec![OptionSet::ResourceOptions(m.options.into())],
                     address_ranges: None,
                     pinned_gpu_address: (m.gpu_address != 0).then_some(m.gpu_address),
@@ -1393,6 +1445,24 @@ fn heap_refused(obj_id: u64, size: u64, heap_type: i32, options: u32, gpu_addres
     );
 }
 
+/// The `MTLHeapType` the host makes a guest heap of `heap_type` with: an `Automatic` heap (0) is
+/// a `Placement` heap (1), whose resources the guest places itself, at the offsets its own
+/// allocator picks, as Metal's `Automatic` heap would (`guest/bundle/src/RgfxHeapRanges.hpp`);
+/// any other type is its own. Metal makes both types of a heap at one hazard tracking mode, the
+/// options', and answers `Default` as `Untracked` for each (measured: M3 Max, macOS 27), so the
+/// heap tracks as the guest's would.
+fn host_heap_type(heap_type: i32) -> i64 {
+    match heap_type {
+        HEAP_TYPE_AUTOMATIC => HEAP_TYPE_PLACEMENT,
+        other => other.into(),
+    }
+}
+
+/// `MTLHeapTypeAutomatic`, as `HEAP_CREATE` carries it.
+const HEAP_TYPE_AUTOMATIC: i32 = 0;
+/// `MTLHeapTypePlacement`.
+const HEAP_TYPE_PLACEMENT: i64 = 1;
+
 /// Reads a message struct from the start of `message`, or `None` if it is too
 /// short.
 fn read<T: FromBytes>(message: &[u8]) -> Option<T> {
@@ -1447,9 +1517,10 @@ mod tests {
     use std::sync::Arc;
 
     use reims_graphics::wire::{
-        RGFX_LIBRARY_BYTES_OFFSET, RgfxLibraryCreate, RgfxLibraryFromRegion,
+        RGFX_CMD_HEAP_TEXTURE_SIZE_AND_ALIGN, RGFX_LIBRARY_BYTES_OFFSET, RgfxLibraryCreate,
+        RgfxLibraryFromRegion,
     };
-    use reims_vgpu_core::testkit::{Arg, FakePlatform};
+    use reims_vgpu_core::testkit::{Arg, FakePlatform, Step};
     use zerocopy::IntoBytes;
 
     use super::*;
@@ -1720,6 +1791,146 @@ mod tests {
         assert_eq!(
             made.contents().addr(),
             region.base() as usize + (blocks + 0x1_8000) as usize
+        );
+    }
+
+    /// An Automatic heap is made a Placement heap, the guest placing its resources itself; a
+    /// Placement heap and a Shared heap over host memory keep their type, an Automatic one of
+    /// those is a Placement heap too.
+    #[test]
+    fn automatic_heaps_are_made_placement_heaps() {
+        let p = Arc::new(FakePlatform::new());
+        let device = p.device();
+        let blocks = RGFX_CONTEXT_ALLOCATIONS_OFFSET;
+        let size = blocks + 0x10_0000 + RGFX_CURSOR_SPAN;
+        let region = Arc::new(reims_graphics::region::Region::new(size as usize).unwrap());
+        let mut dec = GraphicsDecoder::<FakePlatform>::new(Arc::clone(&p), Arc::clone(&region));
+        region.grant(1, blocks, 0x2_0000);
+        dec.set_context(Some(1));
+        let one = 1u64 << RGFX_CONTEXT_OBJ_ID_SHIFT;
+        let heap = |obj_id: u64, heap_type: i32| RgfxHeapCreate {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_HEAP_CREATE,
+                size: size_of::<RgfxHeapCreate>() as u32,
+                seqno: 0,
+            },
+            obj_id,
+            gpu_address: 0x2_0000_0000 + (obj_id & 0xff) * 0x10_0000,
+            size_bytes: 0x1_0000,
+            options: 0,
+            heap_type,
+        };
+        let over = |obj_id: u64, heap_type: i32| RgfxHeapOverHostMemory {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_HEAP_OVER_HOST_MEMORY,
+                size: size_of::<RgfxHeapOverHostMemory>() as u32,
+                seqno: 0,
+            },
+            obj_id,
+            gpu_address: 0x3_0000_0000 + (obj_id & 0xff) * 0x10_0000,
+            region_offset: blocks + (obj_id & 0xff) * 0x1_0000 - 0x3_0000,
+            size_bytes: 0x1_0000,
+            heap_type,
+            ..RgfxHeapOverHostMemory::default()
+        };
+        let made_type = |message: &[u8], dec: &mut GraphicsDecoder<FakePlatform>| {
+            let mark = p.call_log().mark();
+            assert_eq!(dec.decode(&device, message).unwrap(), Ok(()));
+            let calls = p.call_log().since(mark);
+            let Some(Arg::Val(desc)) = calls[0].args.last() else {
+                panic!("no descriptor: {calls:?}");
+            };
+            let at = desc.find("heap_type: ").unwrap() + "heap_type: ".len();
+            desc[at..].split(',').next().unwrap().to_owned()
+        };
+        assert_eq!(made_type(heap(one | 1, 0).as_bytes(), &mut dec), "1");
+        assert_eq!(made_type(heap(one | 2, 1).as_bytes(), &mut dec), "1");
+        assert_eq!(made_type(over(one | 3, 0).as_bytes(), &mut dec), "1");
+        assert_eq!(made_type(over(one | 4, 1).as_bytes(), &mut dec), "1");
+    }
+
+    /// A heap texture size query is answered at its seqno with the device's size and alignment
+    /// for the shape, and makes nothing; one the device raises at is refused with both 0, and a
+    /// query too short for its shape is an invalid argument.
+    #[test]
+    fn heap_texture_sizes_are_the_devices() {
+        let p = Arc::new(FakePlatform::new());
+        let device = p.device();
+        let region = Arc::new(reims_graphics::region::Region::new(0x1_0000).unwrap());
+        let dec = GraphicsDecoder::<FakePlatform>::new(Arc::clone(&p), Arc::clone(&region));
+        let query = RgfxHeapTextureSizeAndAlign {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_HEAP_TEXTURE_SIZE_AND_ALIGN,
+                size: size_of::<RgfxHeapTextureSizeAndAlign>() as u32,
+                seqno: 7,
+            },
+            obj_id: (1u64 << RGFX_CONTEXT_OBJ_ID_SHIFT) | 5,
+            desc: RgfxTextureDescriptor {
+                pixel_format: 80,
+                texture_type: 2,
+                width: 100,
+                height: 100,
+                depth: 1,
+                mipmap_level_count: 1,
+                array_length: 1,
+                sample_count: 1,
+                ..RgfxTextureDescriptor::default()
+            },
+        };
+        let mark = p.call_log().mark();
+        let answer = dec
+            .heap_texture_size_and_align(&device, query.as_bytes())
+            .unwrap();
+        // The fake's size: 4 bytes a texel, at its 16 KiB alignment.
+        assert_eq!(
+            answer,
+            RgfxSizeAndAlign {
+                header: RgfxMsgHeader {
+                    r#type: RGFX_EVT_SIZE_AND_ALIGN,
+                    size: size_of::<RgfxSizeAndAlign>() as u32,
+                    seqno: 7,
+                },
+                status: RGFX_STATUS_OK,
+                reserved_14: 0,
+                size: 0xc000,
+                align: 0x4000,
+            }
+        );
+        let calls = p.call_log().since(mark);
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.sel == "heapTextureSizeAndAlignWithDescriptor:"),
+            "{calls:?}"
+        );
+        assert!(dec.named(query.obj_id).is_none());
+
+        p.script().push(
+            "heapTextureSizeAndAlignWithDescriptor:",
+            Step::raise("NSInvalidArgumentException", "x"),
+        );
+        let refused = dec
+            .heap_texture_size_and_align(&device, query.as_bytes())
+            .unwrap();
+        assert_eq!(
+            (
+                refused.header.seqno,
+                refused.status,
+                refused.size,
+                refused.align
+            ),
+            (7, RGFX_STATUS_REFUSED, 0, 0)
+        );
+
+        let short = &query.as_bytes()[..size_of::<RgfxMsgHeader>() + 8];
+        let invalid = dec.heap_texture_size_and_align(&device, short).unwrap();
+        assert_eq!(
+            (invalid.header.seqno, invalid.status),
+            (7, RGFX_STATUS_INVALID_ARGUMENT)
+        );
+        assert!(
+            dec.heap_texture_size_and_align(&device, &query.as_bytes()[..8])
+                .is_none()
         );
     }
 

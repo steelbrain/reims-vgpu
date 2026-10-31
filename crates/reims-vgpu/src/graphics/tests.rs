@@ -1128,6 +1128,53 @@ fn a_destroy_of_a_pending_pipeline_cancels_it() {
     assert_eq!(device.decoder_object_count(), 1);
 }
 
+/// A heap texture size query on ring 0 is answered on the control completion ring, at its seqno,
+/// with the platform's size and alignment for the shape, and makes no object
+#[test]
+fn a_heap_texture_size_query_is_answered_on_ring_0() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform) = headless_on(&raised);
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    let query = RgfxHeapTextureSizeAndAlign {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_HEAP_TEXTURE_SIZE_AND_ALIGN,
+            size: 0,
+            seqno: 0,
+        },
+        obj_id: obj(1, 3),
+        desc: RgfxTextureDescriptor {
+            pixel_format: 80,
+            texture_type: 2,
+            width: 256,
+            height: 128,
+            depth: 1,
+            mipmap_level_count: 1,
+            array_length: 1,
+            sample_count: 1,
+            ..RgfxTextureDescriptor::default()
+        },
+    };
+    guest.send(&device, query.as_bytes().to_vec());
+    let bytes = guest.event().expect("a SIZE_AND_ALIGN");
+    let answer = RgfxSizeAndAlign::read_from_bytes(&bytes).unwrap();
+    assert_eq!(answer.header.r#type, RGFX_EVT_SIZE_AND_ALIGN);
+    assert_eq!(answer.header.seqno, guest.seqno);
+    // The fake's size: 4 bytes a texel, at its 16 KiB alignment.
+    assert_eq!(
+        (answer.status, answer.size, answer.align),
+        (RGFX_STATUS_OK, 0x2_0000, 0x4000)
+    );
+    assert_eq!(
+        platform
+            .call_log()
+            .calls_to("heapTextureSizeAndAlignWithDescriptor:")
+            .len(),
+        1
+    );
+    assert_eq!(device.decoder_object_count(), 0);
+}
+
 /// The calls the platform had to make a library from bytes.
 fn library_makes(platform: &FakePlatform) -> usize {
     platform

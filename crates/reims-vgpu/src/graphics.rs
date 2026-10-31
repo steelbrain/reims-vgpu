@@ -31,11 +31,12 @@ use std::sync::{Arc, OnceLock};
 use reims_graphics::ops::RgfxCommandBuffer;
 use reims_graphics::region::Region;
 use reims_graphics::wire::{
-    RGFX_CMD_COMMAND_BUFFER, RGFX_CMD_COMPUTE_PIPELINE_CREATE, RGFX_CMD_LIBRARY_CREATE,
-    RGFX_CMD_LIBRARY_FROM_REGION, RGFX_CMD_LIBRARY_LOOKUP, RGFX_CMD_OBJECT_DESTROY,
-    RGFX_CMD_RENDER_PIPELINE_CREATE, RGFX_CONTEXT_OBJ_ID_SHIFT, RGFX_DEVICE_INFO_OFFSET,
-    RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK, RGFX_STATUS_REFUSED, RgfxBlockRelease,
-    RgfxCbComplete, RgfxLibraryLookup, RgfxMsgHeader, RgfxPipelineReflection,
+    RGFX_CMD_COMMAND_BUFFER, RGFX_CMD_COMPUTE_PIPELINE_CREATE,
+    RGFX_CMD_HEAP_TEXTURE_SIZE_AND_ALIGN, RGFX_CMD_LIBRARY_CREATE, RGFX_CMD_LIBRARY_FROM_REGION,
+    RGFX_CMD_LIBRARY_LOOKUP, RGFX_CMD_OBJECT_DESTROY, RGFX_CMD_RENDER_PIPELINE_CREATE,
+    RGFX_CONTEXT_OBJ_ID_SHIFT, RGFX_DEVICE_INFO_OFFSET, RGFX_STATUS_INVALID_ARGUMENT,
+    RGFX_STATUS_OK, RGFX_STATUS_REFUSED, RgfxBlockRelease, RgfxCbComplete, RgfxLibraryLookup,
+    RgfxMsgHeader, RgfxPipelineReflection,
 };
 use reims_graphics::{
     CompleteAnswer, CompletionPoster, CursorImage, FixedScreen, Host, Mode, PresentAnswer, Scanout,
@@ -433,6 +434,10 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                 self.lookup_library(poster, message);
                 return;
             }
+            RGFX_CMD_HEAP_TEXTURE_SIZE_AND_ALIGN => {
+                self.heap_texture_size(poster, message);
+                return;
+            }
             RGFX_CMD_COMMAND_BUFFER => self.pending.wait_for_command_buffer(message),
             _ => {}
         }
@@ -566,6 +571,19 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         );
         if let Some(seqno) = seqno {
             poster.post(complete(seqno, status).as_bytes());
+        }
+    }
+
+    /// A heap texture size query from ring 0, answered at once through `poster`: the device's
+    /// size and alignment, or a refusal, which the guest answers by a bound of its own.
+    fn heap_texture_size(&self, poster: &CompletionPoster, message: &[u8]) {
+        let answer = entry::run(|_| {
+            self.decoder
+                .lock()
+                .heap_texture_size_and_align(&self.device, message)
+        });
+        if let Some(answer) = answer {
+            poster.post(answer.as_bytes());
         }
     }
 

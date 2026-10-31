@@ -911,6 +911,11 @@
 // view the platform refuses, as Metal refuses it, makes nothing.
 #define RGFX_CMD_TEXTURE_VIEW 535
 
+// Command `HEAP_TEXTURE_SIZE_AND_ALIGN` ([`RgfxHeapTextureSizeAndAlign`]): the size and alignment
+// a texture of a shape takes in a heap (`heapTextureSizeAndAlignWithDescriptor:`), as the host's
+// device answers it; answered by [`RGFX_EVT_SIZE_AND_ALIGN`]. Makes nothing.
+#define RGFX_CMD_HEAP_TEXTURE_SIZE_AND_ALIGN 536
+
 // `CONTEXT_CLOSE` ([`RgfxContextClose`]), on ring 0 from the accelerator kext: the process that
 // held context `context` closed the device or died. The host ends the context's command queues
 // and drops every object whose id lies in its range ([`RGFX_CONTEXT_OBJ_ID_SHIFT`]), then answers
@@ -984,6 +989,10 @@
 // Event `PIPELINE_REFLECTION`: a pipeline create's answer, with the reflection
 // the guest needs. Struct in a later increment.
 #define RGFX_EVT_PIPELINE_REFLECTION 1026
+
+// Event `SIZE_AND_ALIGN` ([`RgfxSizeAndAlign`], on the control completion ring): a
+// `HEAP_TEXTURE_SIZE_AND_ALIGN`'s answer.
+#define RGFX_EVT_SIZE_AND_ALIGN 1027
 
 // A command buffer's status in [`RgfxCbComplete`]: finished with no error.
 #define RGFX_CB_OK 0
@@ -2368,6 +2377,48 @@ typedef struct {
   int32_t heap_type;
 } RgfxHeapOverHostMemory;
 
+// A texture's shape, as `MTLTextureDescriptor` gives it. Each enum is its Metal
+// raw value (`MTLPixelFormat`, `MTLTextureType`, `MTLTextureUsage`,
+// `MTLResourceOptions`); `swizzle` packs the four `MTLTextureSwizzle` channels,
+// one byte each, red in the low byte.
+typedef struct {
+  // `MTLPixelFormat`.
+  uint32_t pixel_format;
+  // `MTLTextureType`.
+  uint32_t texture_type;
+  // Pixels a row.
+  uint32_t width;
+  // Rows.
+  uint32_t height;
+  // Slices, for a 3D texture; 1 otherwise.
+  uint32_t depth;
+  // Mip levels.
+  uint32_t mipmap_level_count;
+  // Array elements, for an array texture; 1 otherwise.
+  uint32_t array_length;
+  // Samples a pixel, for a multisample texture; 1 otherwise.
+  uint32_t sample_count;
+  // `MTLTextureUsage`.
+  uint32_t usage;
+  // `MTLResourceOptions`: the storage, cache and hazard-tracking modes.
+  uint32_t options;
+  // The four `MTLTextureSwizzle` channels, one byte each, red lowest.
+  uint32_t swizzle;
+  // Pads to a multiple of 8; 0.
+  uint32_t reserved_2c;
+} RgfxTextureDescriptor;
+
+// `HEAP_TEXTURE_SIZE_AND_ALIGN`: the size and alignment a texture of shape `desc` takes in a heap.
+typedef struct {
+  // [`RGFX_CMD_HEAP_TEXTURE_SIZE_AND_ALIGN`].
+  RgfxMsgHeader header;
+  // A new id of the sender's context, which names no object: the query makes none, and the id
+  // tells whose it is.
+  uint64_t obj_id;
+  // The texture's shape, as `TEXTURE_CREATE` carries it; its `swizzle` is not read.
+  RgfxTextureDescriptor desc;
+} RgfxHeapTextureSizeAndAlign;
+
 // `LIBRARY_CREATE`: a library from `byte_length` bytes of `.metallib` or AIR
 // that follow this header at [`RGFX_LIBRARY_BYTES_OFFSET`], forwarded to the
 // host unchanged. The message's `size` is `RGFX_LIBRARY_BYTES_OFFSET +
@@ -2458,37 +2509,6 @@ typedef struct {
   // The bytes' content key.
   uint8_t key[32];
 } RgfxLibraryLookup;
-
-// A texture's shape, as `MTLTextureDescriptor` gives it. Each enum is its Metal
-// raw value (`MTLPixelFormat`, `MTLTextureType`, `MTLTextureUsage`,
-// `MTLResourceOptions`); `swizzle` packs the four `MTLTextureSwizzle` channels,
-// one byte each, red in the low byte.
-typedef struct {
-  // `MTLPixelFormat`.
-  uint32_t pixel_format;
-  // `MTLTextureType`.
-  uint32_t texture_type;
-  // Pixels a row.
-  uint32_t width;
-  // Rows.
-  uint32_t height;
-  // Slices, for a 3D texture; 1 otherwise.
-  uint32_t depth;
-  // Mip levels.
-  uint32_t mipmap_level_count;
-  // Array elements, for an array texture; 1 otherwise.
-  uint32_t array_length;
-  // Samples a pixel, for a multisample texture; 1 otherwise.
-  uint32_t sample_count;
-  // `MTLTextureUsage`.
-  uint32_t usage;
-  // `MTLResourceOptions`: the storage, cache and hazard-tracking modes.
-  uint32_t options;
-  // The four `MTLTextureSwizzle` channels, one byte each, red lowest.
-  uint32_t swizzle;
-  // Pads to a multiple of 8; 0.
-  uint32_t reserved_2c;
-} RgfxTextureDescriptor;
 
 // `MANAGED_TEXTURE_CREATE`: a `Managed` texture of shape `desc` at the guest-picked
 // `gpu_address`, with the guest-picked `resource_id`, whose CPU copy is the Shared buffer
@@ -3850,6 +3870,22 @@ typedef struct {
   // The event's value when it is made.
   uint64_t initial_value;
 } RgfxSharedEventCreate;
+
+// `SIZE_AND_ALIGN`: a `HEAP_TEXTURE_SIZE_AND_ALIGN`'s answer. `status` is [`RGFX_STATUS_OK`]
+// with the device's `size` and `align` (a size of 0 for a shape no texture has, as Metal answers
+// it), or [`RGFX_STATUS_REFUSED`], with both 0, where the device gave no answer.
+typedef struct {
+  // [`RGFX_EVT_SIZE_AND_ALIGN`], with the query's `seqno`.
+  RgfxMsgHeader header;
+  // An `RGFX_STATUS_*`.
+  uint32_t status;
+  // Pads to a multiple of 8; 0.
+  uint32_t reserved_14;
+  // `MTLSizeAndAlign.size`.
+  uint64_t size;
+  // `MTLSizeAndAlign.align`.
+  uint64_t align;
+} RgfxSizeAndAlign;
 
 // One element of a texture-binding array ([`RgfxOpSetVertexTextures`] and the like):
 // a texture (0 = nil).

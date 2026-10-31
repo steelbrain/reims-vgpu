@@ -298,6 +298,10 @@ pub const RGFX_CMD_TEXTURE_REPLACE_REGION: u32 = 0x216;
 /// slices and swizzle (`newTextureViewWithPixelFormat:` and its longer forms). Not answered; a
 /// view the platform refuses, as Metal refuses it, makes nothing.
 pub const RGFX_CMD_TEXTURE_VIEW: u32 = 0x217;
+/// Command `HEAP_TEXTURE_SIZE_AND_ALIGN` ([`RgfxHeapTextureSizeAndAlign`]): the size and alignment
+/// a texture of a shape takes in a heap (`heapTextureSizeAndAlignWithDescriptor:`), as the host's
+/// device answers it; answered by [`RGFX_EVT_SIZE_AND_ALIGN`]. Makes nothing.
+pub const RGFX_CMD_HEAP_TEXTURE_SIZE_AND_ALIGN: u32 = 0x218;
 
 /// `CONTEXT_CLOSE` ([`RgfxContextClose`]), on ring 0 from the accelerator kext: the process that
 /// held context `context` closed the device or died. The host ends the context's command queues
@@ -365,6 +369,9 @@ pub const RGFX_EVT_EVENT_SIGNALLED: u32 = 0x401;
 /// Event `PIPELINE_REFLECTION`: a pipeline create's answer, with the reflection
 /// the guest needs. Struct in a later increment.
 pub const RGFX_EVT_PIPELINE_REFLECTION: u32 = 0x402;
+/// Event `SIZE_AND_ALIGN` ([`RgfxSizeAndAlign`], on the control completion ring): a
+/// `HEAP_TEXTURE_SIZE_AND_ALIGN`'s answer.
+pub const RGFX_EVT_SIZE_AND_ALIGN: u32 = 0x403;
 
 /// A command buffer's status in [`RgfxCbComplete`]: finished with no error.
 pub const RGFX_CB_OK: u32 = 0;
@@ -989,6 +996,41 @@ pub struct RgfxTextureDescriptor {
     pub swizzle: u32,
     /// Pads to a multiple of 8; 0.
     pub reserved_2c: u32,
+}
+
+/// `HEAP_TEXTURE_SIZE_AND_ALIGN`: the size and alignment a texture of shape `desc` takes in a heap.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxHeapTextureSizeAndAlign {
+    /// [`RGFX_CMD_HEAP_TEXTURE_SIZE_AND_ALIGN`].
+    pub header: RgfxMsgHeader,
+    /// A new id of the sender's context, which names no object: the query makes none, and the id
+    /// tells whose it is.
+    pub obj_id: u64,
+    /// The texture's shape, as `TEXTURE_CREATE` carries it; its `swizzle` is not read.
+    pub desc: RgfxTextureDescriptor,
+}
+
+/// `SIZE_AND_ALIGN`: a `HEAP_TEXTURE_SIZE_AND_ALIGN`'s answer. `status` is [`RGFX_STATUS_OK`]
+/// with the device's `size` and `align` (a size of 0 for a shape no texture has, as Metal answers
+/// it), or [`RGFX_STATUS_REFUSED`], with both 0, where the device gave no answer.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxSizeAndAlign {
+    /// [`RGFX_EVT_SIZE_AND_ALIGN`], with the query's `seqno`.
+    pub header: RgfxMsgHeader,
+    /// An `RGFX_STATUS_*`.
+    pub status: u32,
+    /// Pads to a multiple of 8; 0.
+    pub reserved_14: u32,
+    /// `MTLSizeAndAlign.size`.
+    pub size: u64,
+    /// `MTLSizeAndAlign.align`.
+    pub align: u64,
 }
 
 /// `BUFFER_DID_MODIFY_RANGE`: the guest wrote `length` bytes at `location` of `Managed` buffer
@@ -1843,6 +1885,8 @@ const _: () = {
     assert!(size_of::<RgfxManagedTextureCreate>() == 112);
     assert!(size_of::<RgfxTextureReplaceRegion>() == 56);
     assert!(size_of::<RgfxTextureView>() == 72);
+    assert!(size_of::<RgfxHeapTextureSizeAndAlign>() == 72);
+    assert!(size_of::<RgfxSizeAndAlign>() == 40);
     assert!(RGFX_LIBRARY_BYTES_OFFSET as usize == size_of::<RgfxLibraryCreate>());
     assert!(size_of::<RgfxFormatAnswers>() == 64);
     assert!(size_of::<RgfxDeviceInfo>() == 1400 + 64 * RGFX_DEVICE_INFO_FORMATS);
