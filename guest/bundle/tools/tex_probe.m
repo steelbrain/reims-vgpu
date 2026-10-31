@@ -361,7 +361,10 @@ static int kinds(id<MTLDevice> device, long n)
 			id<MTLBuffer> placed = [heap newBufferWithLength:4096
 			                                         options:MTLResourceStorageModeShared
 			                                          offset:0];
-			id<MTLTexture> placedTex = [heap newTextureWithDescriptor:sd offset:0x10000];
+			// A texture placed in a heap takes the heap's storage mode, as Metal requires.
+			MTLTextureDescriptor *placedDesc = [sd copy];
+			placedDesc.storageMode = MTLStorageModeShared;
+			id<MTLTexture> placedTex = [heap newTextureWithDescriptor:placedDesc offset:0x10000];
 			// A 256 MiB Private heap a round: 1000 rounds go round the process's 64 GiB of GPU
 			// addresses four times, so its picks must come back as the heaps go.
 			MTLHeapDescriptor *pd = [MTLHeapDescriptor new];
