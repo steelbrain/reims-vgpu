@@ -3,6 +3,7 @@
  */
 
 #import "RgfxBuffer.h"
+#import "RgfxTexture.h"
 #import "RgfxUnsupported.h"
 
 #include <cstdlib>
@@ -209,6 +210,20 @@
 }
 
 // --- what a buffer that is not sparse or remote answers ------------------------------
+
+// A texture over the buffer's bytes from `offset`, rows `bytesPerRow` apart
+// (TEXTURE_FROM_BUFFER); it keeps the buffer, which its `buffer` answers.
+- (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)descriptor
+                                    offset:(NSUInteger)offset
+                               bytesPerRow:(NSUInteger)bytesPerRow
+{
+	return [RgfxTexture textureWithDescriptor:descriptor
+	                                   buffer:self
+	                                   offset:offset
+	                              bytesPerRow:bytesPerRow
+	                                   device:self.device
+	                               serializer:[self serializer]];
+}
 
 - (MTLBufferSparseTier)sparseBufferTier
 {

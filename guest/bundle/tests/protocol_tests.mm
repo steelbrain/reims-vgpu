@@ -714,6 +714,22 @@ void test_buffer_members()
 	      error.code == RgfxMetalErrorUnsupported);
 	CHECK([b newTensorWithDescriptor:td offset:0 error:nullptr] == nil); // no error out: fine
 	CHECK(RgfxUnsupportedWasLogged([RgfxBuffer class], @selector(newTensorWithDescriptor:offset:error:)));
+
+	// A texture over the buffer: a TEXTURE_FROM_BUFFER naming it, with the offset and the rows;
+	// the texture keeps the buffer and answers where it lies.
+	MTLTextureDescriptor *d =
+	    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+	                                                       width:4
+	                                                      height:2
+	                                                   mipmapped:NO];
+	d.storageMode = MTLStorageModeShared;
+	id<MTLTexture> t = [b newTextureWithDescriptor:d offset:64 bytesPerRow:64];
+	CHECK(t != nil);
+	RgfxTextureFromBuffer m =
+	    expectMessage<RgfxTextureFromBuffer>(control, RGFX_CMD_TEXTURE_FROM_BUFFER);
+	CHECK(m.buffer_obj_id == b.rgfxObjId && m.offset == 64 && m.bytes_per_row == 64);
+	CHECK(m.desc.width == 4 && m.desc.height == 2);
+	CHECK(t.buffer == b && t.bufferOffset == 64 && t.bufferBytesPerRow == 64);
 }
 
 // A heap's allocated size is its size; acceleration structures and the automatic placements
