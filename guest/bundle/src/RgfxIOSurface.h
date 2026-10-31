@@ -66,7 +66,7 @@ NS_ASSUME_NONNULL_END
 void rgfxIOSurfaceSyncBeforeCommit(void);
 
 /// Records on `enc` that its command buffer writes `texture`, when `texture` is one
-/// over an IOSurface (otherwise nothing).
+/// over an IOSurface or a view of one, through any views (otherwise nothing).
 void rgfxIOSurfaceNoteWrite(RgfxEncoder *_Nullable enc, id _Nullable texture);
 
 /// As rgfxIOSurfaceNoteWrite, for a texture a shader may write: only when its usage

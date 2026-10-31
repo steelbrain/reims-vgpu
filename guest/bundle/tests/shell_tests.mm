@@ -3415,6 +3415,280 @@ void test_heap_outlives_its_resources()
 	CHECK(nextDestroyed(fx.ring) == heapId && ringEmpty(fx.ring));
 }
 
+// A texture's views (RGFX_CMD_TEXTURE_VIEW): each form posts its view of the texture with the
+// fields it names, and the view answers its own shape and its texture's memory, as Metal's do
+// (measured on the M3 Max under macOS 27.0.1). A view Metal makes none of, or asserts at,
+// answers nil and posts nothing.
+void test_texture_views()
+{
+	CHECK(retirementIdle());
+	Fixture fx;
+	@autoreleasepool {
+	// A Private 2D array of four slices and seven levels, of usage 0x17.
+	MTLTextureDescriptor *desc =
+	    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+	                                                       width:64
+	                                                      height:32
+	                                                   mipmapped:YES];
+	desc.textureType = MTLTextureType2DArray;
+	desc.arrayLength = 4;
+	desc.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite |
+	             MTLTextureUsageRenderTarget | MTLTextureUsagePixelFormatView;
+	desc.storageMode = MTLStorageModePrivate;
+	RgfxTexture *tex = [RgfxTexture textureWithDescriptor:desc
+	                                                 heap:RGFX_OBJ_NONE
+	                                           heapOffset:0
+	                                               device:nil
+	                                           serializer:&fx.ser];
+	CHECK(tex != nil && tex.mipmapLevelCount == 7);
+	drainRing(fx.ring);
+
+	// In a format alone: the whole texture in its type.
+	id<MTLTexture> srgb = [tex newTextureViewWithPixelFormat:MTLPixelFormatRGBA8Unorm_sRGB];
+	CHECK(srgb != nil && srgb.parentTexture == tex);
+	CHECK(srgb.pixelFormat == MTLPixelFormatRGBA8Unorm_sRGB);
+	CHECK(srgb.textureType == MTLTextureType2DArray && srgb.width == 64 && srgb.height == 32);
+	CHECK(srgb.mipmapLevelCount == 7 && srgb.arrayLength == 4 && srgb.usage == 0x17);
+	CHECK(srgb.parentRelativeLevel == 0 && srgb.parentRelativeSlice == 0);
+	CHECK(srgb.storageMode == MTLStorageModePrivate);
+	CHECK(srgb.gpuResourceID._impl != 0 && srgb.gpuResourceID._impl != tex.gpuResourceID._impl);
+	auto m = expectMessage<RgfxTextureView>(fx.ring, RGFX_CMD_TEXTURE_VIEW);
+	CHECK(m.obj_id == ((RgfxResource *)srgb).rgfxObjId && m.parent_obj_id == tex.rgfxObjId);
+	CHECK(m.resource_id == srgb.gpuResourceID._impl && m.pixel_format == 71 && m.flags == 0);
+	CHECK(m.texture_type == 0 && m.level_count == 0 && m.slice_count == 0 && m.swizzle == 0);
+
+	// Of a type, levels and slices: the texture's size at the view's first level.
+	id<MTLTexture> face = [tex newTextureViewWithPixelFormat:MTLPixelFormatRGBA8Unorm
+	                                             textureType:MTLTextureType2D
+	                                                  levels:NSMakeRange(1, 2)
+	                                                  slices:NSMakeRange(2, 1)];
+	CHECK(face != nil && face.textureType == MTLTextureType2D);
+	CHECK(face.width == 32 && face.height == 16 && face.mipmapLevelCount == 2);
+	CHECK(face.arrayLength == 1 && face.parentRelativeLevel == 1 && face.parentRelativeSlice == 2);
+	m = expectMessage<RgfxTextureView>(fx.ring, RGFX_CMD_TEXTURE_VIEW);
+	CHECK(m.flags == RGFX_TEXTURE_VIEW_SUBRANGE && m.texture_type == MTLTextureType2D);
+	CHECK(m.level_start == 1 && m.level_count == 2 && m.slice_start == 2 && m.slice_count == 1);
+	CHECK(m.swizzle == 0);
+
+	// Of a swizzle other than the default: it keeps only ShaderRead and PixelFormatView of the
+	// usage; of the default swizzle, all of it.
+	MTLTextureSwizzleChannels rrr1 = MTLTextureSwizzleChannelsMake(
+	    MTLTextureSwizzleRed, MTLTextureSwizzleRed, MTLTextureSwizzleRed, MTLTextureSwizzleOne);
+	id<MTLTexture> red = [tex newTextureViewWithPixelFormat:MTLPixelFormatRGBA8Unorm
+	                                            textureType:MTLTextureType2DArray
+	                                                 levels:NSMakeRange(0, 7)
+	                                                 slices:NSMakeRange(1, 3)
+	                                                swizzle:rrr1];
+	CHECK(red != nil && red.usage == 0x11 && red.arrayLength == 3);
+	CHECK(red.swizzle.red == MTLTextureSwizzleRed && red.swizzle.alpha == MTLTextureSwizzleOne);
+	m = expectMessage<RgfxTextureView>(fx.ring, RGFX_CMD_TEXTURE_VIEW);
+	CHECK(m.flags == (RGFX_TEXTURE_VIEW_SUBRANGE | RGFX_TEXTURE_VIEW_SWIZZLE));
+	CHECK(m.swizzle == 0x01020202 && m.slice_start == 1 && m.slice_count == 3);
+	id<MTLTexture> plain = [tex newTextureViewWithPixelFormat:MTLPixelFormatRGBA8Unorm
+	                                              textureType:MTLTextureType2D
+	                                                   levels:NSMakeRange(0, 1)
+	                                                   slices:NSMakeRange(0, 1)
+	                                                  swizzle:MTLTextureSwizzleChannelsDefault];
+	CHECK(plain != nil && plain.usage == 0x17);
+	m = expectMessage<RgfxTextureView>(fx.ring, RGFX_CMD_TEXTURE_VIEW);
+	CHECK(m.swizzle == 0x05040302);
+
+	// By a descriptor: made as the longest form.
+	MTLTextureViewDescriptor *vd = [MTLTextureViewDescriptor new];
+	vd.pixelFormat = MTLPixelFormatRGBA8Unorm;
+	vd.textureType = MTLTextureType2D;
+	vd.levelRange = NSMakeRange(3, 1);
+	vd.sliceRange = NSMakeRange(3, 1);
+	id<MTLTexture> byDesc = [tex newTextureViewWithDescriptor:vd];
+	CHECK(byDesc != nil && byDesc.width == 8 && byDesc.parentRelativeSlice == 3);
+	m = expectMessage<RgfxTextureView>(fx.ring, RGFX_CMD_TEXTURE_VIEW);
+	CHECK(m.flags == (RGFX_TEXTURE_VIEW_SUBRANGE | RGFX_TEXTURE_VIEW_SWIZZLE));
+	CHECK(m.level_start == 3 && m.slice_start == 3 && m.swizzle == 0x05040302);
+	CHECK(byDesc.minLOD == 0.0f);
+	if ([vd respondsToSelector:@selector(minLOD)]) {
+		vd.minLOD = 1.5f; // a lowest level of detail the device carries not
+		CHECK([tex newTextureViewWithDescriptor:vd] == nil && ringEmpty(fx.ring));
+	}
+
+	// A view of a view: of it, at levels and slices relative to it.
+	id<MTLTexture> inner = [red newTextureViewWithPixelFormat:MTLPixelFormatRGBA8Unorm
+	                                              textureType:MTLTextureType2D
+	                                                   levels:NSMakeRange(1, 1)
+	                                                   slices:NSMakeRange(1, 1)];
+	CHECK(inner.parentTexture == red && inner.parentRelativeLevel == 1);
+	CHECK(inner.parentRelativeSlice == 1 && inner.width == 32);
+	// It keeps the swizzle of the view it is made of, as it names none.
+	CHECK(inner.swizzle.alpha == MTLTextureSwizzleOne);
+	m = expectMessage<RgfxTextureView>(fx.ring, RGFX_CMD_TEXTURE_VIEW);
+	CHECK(m.parent_obj_id == ((RgfxResource *)red).rgfxObjId);
+
+	// Views Metal makes none of, or asserts at: nil, and nothing posted.
+	CHECK([tex newTextureViewWithPixelFormat:MTLPixelFormatInvalid] == nil);
+	CHECK([tex newTextureViewWithPixelFormat:MTLPixelFormatRG8Unorm] == nil);
+	CHECK([tex newTextureViewWithPixelFormat:MTLPixelFormatBC1_RGBA] == nil);
+	CHECK([tex newTextureViewWithPixelFormat:MTLPixelFormatRGBA8Unorm
+	                             textureType:MTLTextureType2D
+	                                  levels:NSMakeRange(6, 3)
+	                                  slices:NSMakeRange(0, 1)] == nil);
+	CHECK([tex newTextureViewWithPixelFormat:MTLPixelFormatRGBA8Unorm
+	                             textureType:MTLTextureType2D
+	                                  levels:NSMakeRange(0, 0)
+	                                  slices:NSMakeRange(0, 1)] == nil);
+	CHECK([tex newTextureViewWithPixelFormat:MTLPixelFormatRGBA8Unorm
+	                             textureType:MTLTextureType2DArray
+	                                  levels:NSMakeRange(0, 1)
+	                                  slices:NSMakeRange(3, 2)] == nil);
+	CHECK([tex newTextureViewWithPixelFormat:MTLPixelFormatRGBA8Unorm
+	                             textureType:MTLTextureType2D
+	                                  levels:NSMakeRange(0, 1)
+	                                  slices:NSMakeRange(0, 2)] == nil);
+	CHECK([tex newTextureViewWithPixelFormat:MTLPixelFormatRGBA8Unorm
+	                             textureType:MTLTextureType3D
+	                                  levels:NSMakeRange(0, 1)
+	                                  slices:NSMakeRange(0, 1)] == nil);
+	CHECK([tex newTextureViewWithPixelFormat:MTLPixelFormatRGBA8Unorm
+	                             textureType:MTLTextureTypeCube
+	                                  levels:NSMakeRange(0, 1)
+	                                  slices:NSMakeRange(0, 5)] == nil);
+	CHECK(ringEmpty(fx.ring));
+	// A format the bundle cannot size is the host's to refuse: posted.
+	CHECK([tex newTextureViewWithPixelFormat:MTLPixelFormatR32Float] != nil);
+	CHECK([tex newTextureViewWithPixelFormat:MTLPixelFormatDepth32Float] != nil);
+	drainRing(fx.ring);
+
+	// Cube and 3D views.
+	MTLTextureDescriptor *cd =
+	    [MTLTextureDescriptor textureCubeDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+	                                                         size:16
+	                                                    mipmapped:YES];
+	RgfxTexture *cube = [RgfxTexture textureWithDescriptor:cd
+	                                                  heap:RGFX_OBJ_NONE
+	                                            heapOffset:0
+	                                                device:nil
+	                                            serializer:&fx.ser];
+	id<MTLTexture> faces = [cube newTextureViewWithPixelFormat:MTLPixelFormatRGBA8Unorm
+	                                               textureType:MTLTextureType2DArray
+	                                                    levels:NSMakeRange(0, 2)
+	                                                    slices:NSMakeRange(0, 6)];
+	CHECK(faces != nil && faces.arrayLength == 6 && faces.mipmapLevelCount == 2);
+	id<MTLTexture> face3 = [cube newTextureViewWithPixelFormat:MTLPixelFormatRGBA8Unorm
+	                                               textureType:MTLTextureType2D
+	                                                    levels:NSMakeRange(1, 1)
+	                                                    slices:NSMakeRange(3, 1)];
+	CHECK(face3 != nil && face3.width == 8 && face3.parentRelativeSlice == 3);
+	MTLTextureDescriptor *dd = [MTLTextureDescriptor new];
+	dd.textureType = MTLTextureType3D;
+	dd.pixelFormat = MTLPixelFormatRGBA8Unorm;
+	dd.width = 16;
+	dd.height = 8;
+	dd.depth = 4;
+	dd.mipmapLevelCount = 3;
+	RgfxTexture *vol = [RgfxTexture textureWithDescriptor:dd
+	                                                 heap:RGFX_OBJ_NONE
+	                                           heapOffset:0
+	                                               device:nil
+	                                           serializer:&fx.ser];
+	id<MTLTexture> level1 = [vol newTextureViewWithPixelFormat:MTLPixelFormatRGBA8Unorm
+	                                               textureType:MTLTextureType3D
+	                                                    levels:NSMakeRange(1, 2)
+	                                                    slices:NSMakeRange(0, 1)];
+	CHECK(level1 != nil && level1.width == 8 && level1.height == 4 && level1.depth == 2);
+	CHECK([vol newTextureViewWithPixelFormat:MTLPixelFormatRGBA8Unorm
+	                             textureType:MTLTextureType2D
+	                                  levels:NSMakeRange(0, 1)
+	                                  slices:NSMakeRange(0, 1)] == nil);
+	drainRing(fx.ring);
+
+	// A view of a texture over a buffer: the buffer's, and its CPU copies are the texture's.
+	std::vector<uint8_t> memory(16 + 32 * 3, 0xee);
+	RgfxBuffer *buf = [RgfxBuffer bufferOverHostMemoryWithContents:memory.data()
+	                                                  regionOffset:0x10000
+	                                                        length:memory.size()
+	                                                       options:MTLResourceStorageModeShared
+	                                                   deallocator:nil
+	                                                        device:nil
+	                                                    serializer:&fx.ser];
+	MTLTextureDescriptor *bd =
+	    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+	                                                       width:4
+	                                                      height:3
+	                                                   mipmapped:NO];
+	bd.storageMode = MTLStorageModeShared;
+	RgfxTexture *over = [RgfxTexture textureWithDescriptor:bd
+	                                                buffer:buf
+	                                                offset:16
+	                                           bytesPerRow:32
+	                                                device:nil
+	                                            serializer:&fx.ser];
+	id<MTLTexture> asWords = [over newTextureViewWithPixelFormat:MTLPixelFormatR32Uint];
+	CHECK(asWords.buffer == buf && asWords.bufferOffset == 16 && asWords.bufferBytesPerRow == 32);
+	CHECK(asWords.allocatedSize == over.allocatedSize);
+	const uint32_t words[2] = {0x11223344, 0x55667788};
+	[asWords replaceRegion:MTLRegionMake2D(1, 2, 2, 1) mipmapLevel:0 withBytes:words bytesPerRow:8];
+	CHECK(std::memcmp(&memory[16 + 32 * 2 + 4], words, 8) == 0);
+	uint32_t back[2] = {};
+	[asWords getBytes:back bytesPerRow:8 fromRegion:MTLRegionMake2D(1, 2, 2, 1) mipmapLevel:0];
+	CHECK(back[0] == words[0] && back[1] == words[1]);
+	// A level the view lacks: nothing copied.
+	[asWords replaceRegion:MTLRegionMake2D(0, 0, 1, 1) mipmapLevel:1 withBytes:words bytesPerRow:4];
+	CHECK(memory[16] == 0xee);
+	drainRing(fx.ring);
+
+	// A view of a heap texture: the heap's, at the texture's offset, aliased as the texture
+	// is; making the view aliasable changes nothing, and its purgeable state stays NonVolatile.
+	MTLHeapDescriptor *hd = [MTLHeapDescriptor new];
+	hd.size = 0x100000;
+	hd.type = MTLHeapTypePlacement;
+	RgfxHeap *heap = [RgfxHeap heapWithDescriptor:hd device:nil serializer:&fx.ser];
+	id<MTLTexture> placed = [heap newTextureWithDescriptor:bd offset:0x10000];
+	id<MTLTexture> placedView = [placed newTextureViewWithPixelFormat:MTLPixelFormatBGRA8Unorm_sRGB];
+	CHECK(placedView.heap == heap && placedView.heapOffset == 0x10000);
+	const BOOL aliasable = placed.isAliasable;
+	[placedView makeAliasable];
+	CHECK(placed.isAliasable == aliasable && placedView.isAliasable == aliasable);
+	[placed makeAliasable];
+	CHECK(placed.isAliasable && placedView.isAliasable);
+	CHECK([placedView setPurgeableState:MTLPurgeableStateVolatile] == MTLPurgeableStateNonVolatile);
+	CHECK([placed setPurgeableState:MTLPurgeableStateKeepCurrent] == MTLPurgeableStateNonVolatile);
+	drainRing(fx.ring);
+	}
+}
+
+// A view keeps its texture: the texture's destroy is posted only after the view's.
+void test_view_keeps_its_texture()
+{
+	CHECK(retirementIdle());
+	Fixture fx;
+	RgfxTexture *tex = nil;
+	id<MTLTexture> view = nil;
+	@autoreleasepool {
+		MTLTextureDescriptor *d =
+		    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+		                                                       width:8
+		                                                      height:8
+		                                                   mipmapped:NO];
+		tex = [RgfxTexture textureWithDescriptor:d
+		                                    heap:RGFX_OBJ_NONE
+		                              heapOffset:0
+		                                  device:nil
+		                              serializer:&fx.ser];
+		view = [tex newTextureViewWithPixelFormat:MTLPixelFormatBGRA8Unorm_sRGB];
+		CHECK(view != nil);
+		drainRing(fx.ring);
+	}
+	uint64_t texId = tex.rgfxObjId;
+	uint64_t viewId = ((RgfxResource *)view).rgfxObjId;
+	@autoreleasepool {
+		tex = nil;
+	}
+	CHECK(ringEmpty(fx.ring)); // the view keeps it
+	@autoreleasepool {
+		view = nil;
+	}
+	CHECK(nextDestroyed(fx.ring) == viewId);
+	CHECK(nextDestroyed(fx.ring) == texId && ringEmpty(fx.ring));
+}
+
 // The region memory under a buffer or heap over host memory goes back only once the host has
 // dropped the object, and only once every command buffer in flight at its release completed.
 void test_region_memory_given_back_after_destroy()
@@ -3703,6 +3977,8 @@ int main()
 		test_shared_event_routing();
 		test_texture_routing();
 		test_texture_cpu_copies();
+		test_texture_views();
+		test_view_keeps_its_texture();
 		test_texture_resource_ids();
 		test_sampler_routing();
 		test_depth_stencil_routing();

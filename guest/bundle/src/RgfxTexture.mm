@@ -263,6 +263,126 @@ id<MTLCommandQueue> rgfxCopyQueue(id<MTLDevice> device)
 	}
 }
 
+// --- views ---------------------------------------------------------------------
+
+// MTLTextureSwizzleChannelsDefault, one byte a channel, red lowest.
+constexpr uint32_t kRgfxDefaultSwizzle = 0x05040302;
+
+// The usage a view of a swizzle other than the default keeps of its texture's: ShaderRead,
+// PixelFormatView and the two bits Metal sets of its own, 0x4000 and 0x10000 (measured on the
+// M3 Max under macOS 27.0.1: a texture of usage 0x17 answers a swizzled view of 0x11, and of a
+// default swizzle one of 0x17).
+constexpr uint64_t kRgfxSwizzledViewUsage =
+    MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView | 0x4000 | 0x10000;
+
+uint32_t rgfxPackSwizzle(MTLTextureSwizzleChannels sw)
+{
+	return static_cast<uint32_t>(sw.red) | (static_cast<uint32_t>(sw.green) << 8) |
+	       (static_cast<uint32_t>(sw.blue) << 16) | (static_cast<uint32_t>(sw.alpha) << 24);
+}
+
+// The slices of a texture of `type` with `arrayLength` elements: an array's elements, six
+// faces each for a cube; one for any other type.
+uint64_t rgfxSlicesOf(MTLTextureType type, uint64_t arrayLength)
+{
+	switch (type) {
+	case MTLTextureType1DArray:
+	case MTLTextureType2DArray:
+	case MTLTextureType2DMultisampleArray:
+		return arrayLength;
+	case MTLTextureTypeCube:
+		return 6;
+	case MTLTextureTypeCubeArray:
+		return 6 * arrayLength;
+	default:
+		return 1;
+	}
+}
+
+// The array length a view of `type` over `slices` slices answers.
+uint64_t rgfxArrayLengthOf(MTLTextureType type, uint64_t slices)
+{
+	switch (type) {
+	case MTLTextureType1DArray:
+	case MTLTextureType2DArray:
+	case MTLTextureType2DMultisampleArray:
+		return slices;
+	case MTLTextureTypeCubeArray:
+		return slices / 6;
+	default:
+		return 1;
+	}
+}
+
+// The family of texture types a view may change among, as Metal's do: the 1D types; the 2D, 2D
+// array and cube types; the multisample types; 3D; texture buffers (measured on the M3 Max
+// under macOS 27.0.1: a 3D view of a 2D array fails Metal's assertion, a 2D and a 2D array view
+// of a cube do not). 0 for a value that is no type.
+int rgfxViewFamily(MTLTextureType type)
+{
+	switch (type) {
+	case MTLTextureType1D:
+	case MTLTextureType1DArray:
+		return 1;
+	case MTLTextureType2D:
+	case MTLTextureType2DArray:
+	case MTLTextureTypeCube:
+	case MTLTextureTypeCubeArray:
+		return 2;
+	case MTLTextureType2DMultisample:
+	case MTLTextureType2DMultisampleArray:
+		return 3;
+	case MTLTextureType3D:
+		return 4;
+	case MTLTextureTypeTextureBuffer:
+		return 5;
+	default:
+		return 0;
+	}
+}
+
+// Whether a view of `type` may take `count` slices, as Metal's assertion asks (measured on the
+// M3 Max under macOS 27.0.1: a 2D view of two slices and a cube view of five fail it): one for a
+// type with no slices of its own, a multiple of six for a cube, at least one for an array.
+bool rgfxViewTakesSlices(MTLTextureType type, uint64_t count)
+{
+	switch (type) {
+	case MTLTextureType1DArray:
+	case MTLTextureType2DArray:
+	case MTLTextureType2DMultisampleArray:
+		return count > 0;
+	case MTLTextureTypeCube:
+	case MTLTextureTypeCubeArray:
+		return count > 0 && count % 6 == 0;
+	default:
+		return count == 1;
+	}
+}
+
+// Whether Metal may make a view in `to` of a texture in `from`, as far as the formats' blocks
+// tell (RgfxManagedLayout.hpp): not where the blocks differ in bytes or in size, or where one
+// is block-compressed and the other is not (measured on the M3 Max under macOS 27.0.1:
+// RGBA16Float in RGBA8Unorm, BC1 in RG32Uint and ASTC 4x4 in RGBA32Uint fail Metal's
+// assertion; RGBA8Unorm in R32Float, RG16Unorm in RGBA8Unorm and RGB10A2Unorm in R32Uint make
+// a view). Every other pair, a format with no block there (depth, stencil, PVRTC) or a 4:2:2
+// one among them, is the host's to refuse.
+bool rgfxViewFormatsMayMatch(MTLPixelFormat from, MTLPixelFormat to)
+{
+	RgfxFormatBlock a = {}, b = {};
+	auto subsampled = [](MTLPixelFormat f) {
+		return f == MTLPixelFormatGBGR422 || f == MTLPixelFormatBGRG422;
+	};
+	if (subsampled(from) || subsampled(to) || !rgfxPixelFormatBlock(from, &a) ||
+	    !rgfxPixelFormatBlock(to, &b)) {
+		return true;
+	}
+	return a.bytes == b.bytes && a.width == b.width && a.height == b.height &&
+	       a.linear == b.linear;
+}
+
+// Why the bundle answers a view nil without asking the host, each logged once.
+enum RgfxViewRefusal { kNoFormat, kFormatClass, kLevels, kSlices, kTypeFamily, kSliceCount, kViews };
+
 } // namespace
 
 @implementation RgfxTexture {
@@ -278,6 +398,11 @@ id<MTLCommandQueue> rgfxCopyQueue(id<MTLDevice> device)
 	id<MTLBuffer> _buffer;
 	uint64_t _bufferOffset;
 	uint64_t _bufferBytesPerRow;
+	// A view's texture (kept), and the level and slice of it the view starts at; nil and 0 for
+	// a texture that is no view.
+	RgfxTexture *_parent;
+	NSUInteger _parentLevel;
+	NSUInteger _parentSlice;
 }
 
 + (instancetype)managedTextureWithDescriptor:(MTLTextureDescriptor *)descriptor
@@ -367,13 +492,16 @@ id<MTLCommandQueue> rgfxCopyQueue(id<MTLDevice> device)
 
 - (id<MTLBuffer>)buffer
 {
-	return _buffer;
+	return _parent != nil ? _parent.buffer : _buffer;
 }
 
 // The bytes the texture takes: its rows in its buffer, for one made over a buffer; else every
 // level of every slice and sample, in its format's blocks (0 for a format not sized here).
 - (NSUInteger)allocatedSize
 {
+	if (_parent != nil) {
+		return _parent.allocatedSize; // a view takes its texture's memory
+	}
 	if (_buffer != nil) {
 		return static_cast<NSUInteger>(_bufferBytesPerRow * _desc.height);
 	}
@@ -396,12 +524,13 @@ id<MTLCommandQueue> rgfxCopyQueue(id<MTLDevice> device)
 
 - (NSUInteger)bufferOffset
 {
-	return static_cast<NSUInteger>(_bufferOffset);
+	return _parent != nil ? _parent.bufferOffset : static_cast<NSUInteger>(_bufferOffset);
 }
 
 - (NSUInteger)bufferBytesPerRow
 {
-	return static_cast<NSUInteger>(_bufferBytesPerRow);
+	return _parent != nil ? _parent.bufferBytesPerRow
+	                      : static_cast<NSUInteger>(_bufferBytesPerRow);
 }
 
 + (instancetype)textureWithDescriptor:(MTLTextureDescriptor *)descriptor
@@ -451,9 +580,12 @@ id<MTLCommandQueue> rgfxCopyQueue(id<MTLDevice> device)
 	RgfxSerializer *serializer = _serializer;
 	uint64_t resourceId = _resourceId;
 	uint64_t address = _gpuAddress; // a device-placed texture's, picked by its create
+	// A view keeps its texture until then too, so the host drops the view first.
 	id<MTLBuffer> buffer = _buffer;
-	[self rgfxRetireThen:[serializer, resourceId, address, buffer]() mutable {
+	RgfxTexture *parent = _parent;
+	[self rgfxRetireThen:[serializer, resourceId, address, buffer, parent]() mutable {
 		buffer = nil;
+		parent = nil;
 		if (serializer == nullptr)
 			return;
 		serializer->releaseResourceId(resourceId);
@@ -549,9 +681,241 @@ id<MTLCommandQueue> rgfxCopyQueue(id<MTLDevice> device)
 	                                          MTLResourceHazardTrackingModeShift);
 }
 
-// --- views / backings ---------------------------------------------------------
-// A plain device- or heap-placed texture has no parent or IOSurface; one made over a
-// buffer answers its buffer (above). Texture views are a later piece.
+// --- views ---------------------------------------------------------------------
+// A view is a texture of its own id and resource id over its texture's texels
+// (RGFX_CMD_TEXTURE_VIEW), which it keeps. It answers its own format, type, levels, slices
+// and swizzle, and its texture's memory: the texture's buffer, IOSurface, heap, offset,
+// aliasing and size, as Metal's views do (measured on the M3 Max under macOS 27.0.1). Its
+// CPU copies are its texture's, at the view's levels and slices of it.
+//
+// Metal ends the process at a view it does not make (a failed assertion: levels or slices
+// outside the texture, a type of another family, a format of another class), and answers nil
+// for one in no format. The bundle answers nil, sending nothing, for each of these it can tell
+// from the texture (rgfxView...), and the host refuses any other its platform does not make.
+
+- (nullable id<MTLTexture>)rgfxViewInFormat:(MTLPixelFormat)format
+                                       type:(MTLTextureType)type
+                                     levels:(NSRange)levels
+                                     slices:(NSRange)slices
+                                    swizzle:(MTLTextureSwizzleChannels)swizzle
+                                      flags:(uint32_t)flags
+{
+	if (_serializer == nullptr) {
+		return nil;
+	}
+	const bool subrange = (flags & RGFX_TEXTURE_VIEW_SUBRANGE) != 0;
+	const bool swizzled = (flags & RGFX_TEXTURE_VIEW_SWIZZLE) != 0;
+	const MTLTextureType parentType = self.textureType;
+	const uint64_t parentLevels = self.mipmapLevelCount;
+	const uint64_t parentSlices = rgfxSlicesOf(parentType, self.arrayLength);
+	RgfxViewRefusal refusal = kViews;
+	if (format == MTLPixelFormatInvalid) {
+		refusal = kNoFormat;
+	} else if (!rgfxViewFormatsMayMatch(self.pixelFormat, format)) {
+		refusal = kFormatClass;
+	} else if (subrange && (levels.length == 0 || levels.location >= parentLevels ||
+	                        levels.length > parentLevels - levels.location)) {
+		refusal = kLevels;
+	} else if (subrange && (slices.length == 0 || slices.location >= parentSlices ||
+	                        slices.length > parentSlices - slices.location)) {
+		refusal = kSlices;
+	} else if (subrange &&
+	           (rgfxViewFamily(type) == 0 || rgfxViewFamily(type) != rgfxViewFamily(parentType))) {
+		refusal = kTypeFamily;
+	} else if (subrange && !rgfxViewTakesSlices(type, slices.length)) {
+		refusal = kSliceCount;
+	}
+	if (refusal != kViews) {
+		static std::atomic<bool> logged[kViews];
+		static NSString *const what[kViews] = {
+		    @"in no pixel format", @"in a pixel format of another class",
+		    @"of levels outside it", @"of slices outside it", @"of a type of another family",
+		    @"of a slice count its type does not take"};
+		if (!logged[refusal].exchange(true)) {
+			NSLog(@"RGFX: a view of texture 0x%llx (format %lu, type %lu) %@ (format %lu, type "
+			      @"%lu): answered nil",
+			      (unsigned long long)[self rgfxObjId], (unsigned long)self.pixelFormat,
+			      (unsigned long)parentType, what[refusal], (unsigned long)format,
+			      (unsigned long)type);
+		}
+		return nil;
+	}
+
+	// The view's shape: its texture's, from the view's first level, of the view's type, levels
+	// and slices where it names them, and of its swizzle where it names one.
+	const uint64_t base = subrange ? levels.location : 0;
+	RgfxTextureDescriptor desc = {};
+	desc.pixel_format = static_cast<uint32_t>(format);
+	desc.texture_type = static_cast<uint32_t>(subrange ? type : parentType);
+	desc.width = static_cast<uint32_t>(std::max<uint64_t>(1, self.width >> base));
+	desc.height = static_cast<uint32_t>(std::max<uint64_t>(1, self.height >> base));
+	desc.depth = static_cast<uint32_t>(std::max<uint64_t>(1, self.depth >> base));
+	desc.mipmap_level_count = static_cast<uint32_t>(subrange ? levels.length : parentLevels);
+	desc.array_length =
+	    static_cast<uint32_t>(subrange ? rgfxArrayLengthOf(type, slices.length) : self.arrayLength);
+	desc.sample_count = static_cast<uint32_t>(self.sampleCount);
+	uint64_t usage = self.usage;
+	uint32_t packed = rgfxPackSwizzle(self.swizzle);
+	if (swizzled) {
+		packed = rgfxPackSwizzle(swizzle);
+		if (packed != kRgfxDefaultSwizzle) {
+			usage &= kRgfxSwizzledViewUsage;
+		}
+	}
+	desc.usage = static_cast<uint32_t>(usage);
+	desc.options = static_cast<uint32_t>(self.resourceOptions);
+	desc.swizzle = packed;
+
+	RgfxTextureView msg = {};
+	msg.parent_obj_id = [self rgfxObjId];
+	msg.pixel_format = static_cast<uint32_t>(format);
+	msg.flags = flags;
+	if (subrange) {
+		msg.texture_type = static_cast<uint32_t>(type);
+		msg.level_start = static_cast<uint32_t>(levels.location);
+		msg.level_count = static_cast<uint32_t>(levels.length);
+		msg.slice_start = static_cast<uint32_t>(slices.location);
+		msg.slice_count = static_cast<uint32_t>(slices.length);
+	}
+	if (swizzled) {
+		msg.swizzle = packed;
+	}
+	RgfxCreated created = _serializer->createTextureView(msg);
+	if (created.resource_id == 0) {
+		return nil; // no resource id left, as for any texture
+	}
+	RgfxTexture *view = [[RgfxTexture alloc] initWithObjId:created.obj_id
+	                                            gpuAddress:0
+	                                            resourceId:created.resource_id
+	                                            descriptor:desc
+	                                                device:self.device
+	                                            serializer:_serializer];
+	if (view != nil) {
+		view->_parent = self;
+		view->_parentLevel = static_cast<NSUInteger>(base);
+		view->_parentSlice = subrange ? slices.location : 0;
+	}
+	return view;
+}
+
+- (id<MTLTexture>)newTextureViewWithPixelFormat:(MTLPixelFormat)pixelFormat
+{
+	return [self rgfxViewInFormat:pixelFormat
+	                         type:self.textureType
+	                       levels:NSMakeRange(0, 0)
+	                       slices:NSMakeRange(0, 0)
+	                      swizzle:MTLTextureSwizzleChannelsDefault
+	                        flags:0];
+}
+
+- (id<MTLTexture>)newTextureViewWithPixelFormat:(MTLPixelFormat)pixelFormat
+                                    textureType:(MTLTextureType)textureType
+                                         levels:(NSRange)levelRange
+                                         slices:(NSRange)sliceRange
+{
+	return [self rgfxViewInFormat:pixelFormat
+	                         type:textureType
+	                       levels:levelRange
+	                       slices:sliceRange
+	                      swizzle:MTLTextureSwizzleChannelsDefault
+	                        flags:RGFX_TEXTURE_VIEW_SUBRANGE];
+}
+
+- (id<MTLTexture>)newTextureViewWithPixelFormat:(MTLPixelFormat)pixelFormat
+                                    textureType:(MTLTextureType)textureType
+                                         levels:(NSRange)levelRange
+                                         slices:(NSRange)sliceRange
+                                        swizzle:(MTLTextureSwizzleChannels)swizzle
+{
+	return [self rgfxViewInFormat:pixelFormat
+	                         type:textureType
+	                       levels:levelRange
+	                       slices:sliceRange
+	                      swizzle:swizzle
+	                        flags:RGFX_TEXTURE_VIEW_SUBRANGE | RGFX_TEXTURE_VIEW_SWIZZLE];
+}
+
+// The descriptor names every field of the longest form, so it is made as that form. The wire
+// carries no lowest level of detail, which macOS 27's descriptors add (minLOD): a view of
+// another than the default 0 is answered nil, logged once, rather than made without it.
+- (id<MTLTexture>)newTextureViewWithDescriptor:(MTLTextureViewDescriptor *)descriptor
+{
+	if (descriptor == nil) {
+		return nil;
+	}
+	if ([descriptor respondsToSelector:@selector(minLOD)] && descriptor.minLOD != 0.0f) {
+		static std::atomic<bool> logged{false};
+		if (!logged.exchange(true)) {
+			NSLog(@"RGFX: a view of texture 0x%llx with a lowest level of detail of %f: answered "
+			      @"nil (the device carries none)",
+			      (unsigned long long)[self rgfxObjId], descriptor.minLOD);
+		}
+		return nil;
+	}
+	return [self rgfxViewInFormat:descriptor.pixelFormat
+	                         type:descriptor.textureType
+	                       levels:descriptor.levelRange
+	                       slices:descriptor.sliceRange
+	                      swizzle:descriptor.swizzle
+	                        flags:RGFX_TEXTURE_VIEW_SUBRANGE | RGFX_TEXTURE_VIEW_SWIZZLE];
+}
+
+// Every texture, a view among them, keeps the default lowest level of detail
+// (newTextureViewWithDescriptor:).
+- (float)minLOD
+{
+	return 0.0f;
+}
+
+- (NSUInteger)parentRelativeLevel
+{
+	return _parentLevel;
+}
+
+- (NSUInteger)parentRelativeSlice
+{
+	return _parentSlice;
+}
+
+// A view's memory is its texture's: the heap it lies in, at its offset, aliased with it. Making
+// a view aliasable changes nothing, and its purgeable state stays NonVolatile and leaves its
+// texture's as it was (measured on the M3 Max under macOS 27.0.1).
+- (id<MTLHeap>)heap
+{
+	return _parent != nil ? _parent.heap : [super heap];
+}
+
+- (NSUInteger)heapOffset
+{
+	return _parent != nil ? _parent.heapOffset : [super heapOffset];
+}
+
+- (BOOL)isAliasable
+{
+	return _parent != nil ? _parent.isAliasable : [super isAliasable];
+}
+
+- (void)makeAliasable
+{
+	if (_parent == nil) {
+		[super makeAliasable];
+	}
+}
+
+- (MTLPurgeableState)setPurgeableState:(MTLPurgeableState)state
+{
+	if (_parent != nil) {
+		return MTLPurgeableStateNonVolatile;
+	}
+	return [super setPurgeableState:state];
+}
+
+// Whether `level` and `slice` are the view's, for a CPU copy through it.
+- (BOOL)rgfxViewHoldsLevel:(NSUInteger)level slice:(NSUInteger)slice
+{
+	return level < _desc.mipmap_level_count &&
+	       slice < rgfxSlicesOf(static_cast<MTLTextureType>(_desc.texture_type), _desc.array_length);
+}
 
 // --- CPU access ----------------------------------------------------------------
 //
@@ -661,6 +1025,20 @@ id<MTLCommandQueue> rgfxCopyQueue(id<MTLDevice> device)
           bytesPerRow:(NSUInteger)bytesPerRow
         bytesPerImage:(NSUInteger)bytesPerImage
 {
+	if (_parent != nil) {
+		if (![self rgfxViewHoldsLevel:level slice:slice]) {
+			static std::atomic<bool> logged{false};
+			rgfxNoteCopyRefused(logged, @"replaceRegion: of a level or slice the view lacks", self);
+			return;
+		}
+		[_parent replaceRegion:region
+		           mipmapLevel:level + _parentLevel
+		                 slice:slice + _parentSlice
+		             withBytes:pixelBytes
+		           bytesPerRow:bytesPerRow
+		         bytesPerImage:bytesPerImage];
+		return;
+	}
 	if ([self rgfxManagedReplaceRegion:region
 	                             level:level
 	                             slice:slice
@@ -708,6 +1086,20 @@ id<MTLCommandQueue> rgfxCopyQueue(id<MTLDevice> device)
       mipmapLevel:(NSUInteger)level
             slice:(NSUInteger)slice
 {
+	if (_parent != nil) {
+		if (![self rgfxViewHoldsLevel:level slice:slice]) {
+			static std::atomic<bool> logged{false};
+			rgfxNoteCopyRefused(logged, @"getBytes: of a level or slice the view lacks", self);
+			return;
+		}
+		[_parent getBytes:pixelBytes
+		      bytesPerRow:bytesPerRow
+		    bytesPerImage:bytesPerImage
+		       fromRegion:region
+		      mipmapLevel:level + _parentLevel
+		            slice:slice + _parentSlice];
+		return;
+	}
 	if ([self rgfxManagedGetBytes:pixelBytes
 	                  bytesPerRow:bytesPerRow
 	                bytesPerImage:bytesPerImage
@@ -750,12 +1142,17 @@ id<MTLCommandQueue> rgfxCopyQueue(id<MTLDevice> device)
 
 - (id<MTLTexture>)parentTexture
 {
-	return nil;
+	return _parent;
 }
 
 - (IOSurfaceRef)iosurface
 {
-	return nullptr;
+	return _parent != nil ? _parent.iosurface : nullptr;
+}
+
+- (NSUInteger)iosurfacePlane
+{
+	return _parent != nil ? _parent.iosurfacePlane : 0;
 }
 
 - (BOOL)isFramebufferOnly

@@ -203,6 +203,10 @@ public:
 	bool textureReplaceRegion(RgfxObjId texture, uint32_t level, uint32_t slice,
 	                          const uint32_t origin[3], const uint32_t size[3]);
 
+	/// A view of a texture (RGFX_CMD_TEXTURE_VIEW): `view`'s parent, format, flags, type, levels,
+	/// slices and swizzle, with its id and resource id picked; `view`'s own are not read.
+	RgfxCreated createTextureView(const RgfxTextureView &view);
+
 	/// A texture of shape `desc` over the buffer `buffer` from `offset`, each row
 	/// `bytes_per_row` apart. A resource id is picked.
 	RgfxCreated createTextureFromBuffer(RgfxObjId buffer, uint64_t offset, uint64_t bytes_per_row,

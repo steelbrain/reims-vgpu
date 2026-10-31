@@ -425,14 +425,19 @@ void rgfxIOSurfaceSyncBeforeCommit(void)
 
 void rgfxIOSurfaceNoteWrite(RgfxEncoder *enc, id texture)
 {
-	if (enc != nullptr && [texture isKindOfClass:[RgfxIOSurfaceTexture class]]) {
-		enc->noteSurfaceWrite([(RgfxIOSurfaceTexture *)texture rgfxShadow]);
+	// A view writes the texels of the texture it views, through every view between.
+	id root = texture;
+	while ([root isKindOfClass:[RgfxTexture class]] && [(RgfxTexture *)root parentTexture] != nil) {
+		root = [(RgfxTexture *)root parentTexture];
+	}
+	if (enc != nullptr && [root isKindOfClass:[RgfxIOSurfaceTexture class]]) {
+		enc->noteSurfaceWrite([(RgfxIOSurfaceTexture *)root rgfxShadow]);
 	}
 }
 
 void rgfxIOSurfaceNoteShaderWrite(RgfxEncoder *enc, id texture)
 {
-	if ([texture isKindOfClass:[RgfxIOSurfaceTexture class]] &&
+	if ([texture isKindOfClass:[RgfxTexture class]] &&
 	    ([(id<MTLTexture>)texture usage] & MTLTextureUsageShaderWrite) != 0) {
 		rgfxIOSurfaceNoteWrite(enc, texture);
 	}

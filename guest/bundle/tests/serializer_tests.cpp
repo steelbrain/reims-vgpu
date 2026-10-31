@@ -260,6 +260,10 @@ void test_resource_id_chunks()
 	CHECK(!noneFromBuffer.posted && noneFromBuffer.resource_id == 0);
 	RgfxCreated noneFromSurface = ser.createTextureFromIOSurface(1, 0, 4, 0x55, 0, desc);
 	CHECK(!noneFromSurface.posted && noneFromSurface.resource_id == 0);
+	RgfxTextureView noView = {};
+	noView.parent_obj_id = 1;
+	RgfxCreated noneView = ser.createTextureView(noView);
+	CHECK(!noneView.posted && noneView.resource_id == 0 && noneView.obj_id == 0);
 	RgfxMsgHeader h = {};
 	std::vector<uint8_t> bytes;
 	CHECK(!ring.next(&h, &bytes));
@@ -491,6 +495,26 @@ void test_lifecycle_messages()
 	auto tbm = expectMessage<RgfxTextureFromBuffer>(ring, RGFX_CMD_TEXTURE_FROM_BUFFER);
 	CHECK(tbm.buffer_obj_id == b.obj_id && tbm.offset == 0x10 && tbm.bytes_per_row == 7680);
 	CHECK(tbm.resource_id == tb.resource_id && tbm.desc.width == 1920);
+
+	// A view: the parent and shape as given, the ids picked.
+	RgfxTextureView v = {};
+	v.obj_id = 0x77;      // not read
+	v.resource_id = 0x77; // not read
+	v.parent_obj_id = tb.obj_id;
+	v.pixel_format = 81;
+	v.flags = RGFX_TEXTURE_VIEW_SUBRANGE | RGFX_TEXTURE_VIEW_SWIZZLE;
+	v.texture_type = 2;
+	v.level_count = 1;
+	v.slice_start = 0;
+	v.slice_count = 1;
+	v.swizzle = 0x05020202;
+	RgfxCreated tv = ser.createTextureView(v);
+	CHECK(tv.posted && tv.resource_id != 0 && tv.resource_id != tb.resource_id);
+	auto tvm = expectMessage<RgfxTextureView>(ring, RGFX_CMD_TEXTURE_VIEW);
+	CHECK(tvm.obj_id == tv.obj_id && tvm.resource_id == tv.resource_id);
+	CHECK(tvm.parent_obj_id == tb.obj_id && tvm.pixel_format == 81 && tvm.flags == 3);
+	CHECK(tvm.texture_type == 2 && tvm.level_count == 1 && tvm.slice_count == 1);
+	CHECK(tvm.swizzle == 0x05020202);
 
 	// Sampler: the float clamps are stored as bits.
 	RgfxSamplerParams sp = {};

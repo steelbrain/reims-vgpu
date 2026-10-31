@@ -13,7 +13,9 @@
  * are thin forwarders to this factory.
  *
  * The getters answer from the stored shape (the `RgfxTextureDescriptor` the create
- * carried) and the picked resource id. Our own ObjC++: it conforms to the real
+ * carried) and the picked resource id. A view (`newTextureViewWithPixelFormat:` and its
+ * longer forms, RGFX_CMD_TEXTURE_VIEW) is an RgfxTexture of its own shape and resource id
+ * that keeps its texture and answers its memory (RgfxTexture.mm, "views"). Our own ObjC++: it conforms to the real
  * `MTLTexture` protocol but subclasses only NSObject (via RgfxResource), so it
  * instantiates and is unit-tested on the Mac.
  */
