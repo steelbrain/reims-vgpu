@@ -167,13 +167,14 @@ Stages:
      Metal does: the tables' first Apple column is Apple2. Today the lane
      carries no Apple family: Apple2's rows need argument encoders, placement
      in `Automatic` heaps with the heap texture size, programmable sample
-     positions, Metal IO queues and texture views. Each family's pieces are
+     positions and Metal IO queues, and texture views, which it carries.
+     Each family's pieces are
      listed in `device_info.rs` (`APPLE_PIECES`), and the claim rises as each
      piece lands.
    - Mac1, Mac2, Common1 to Common3 and Metal3 keep the platform's answer for
      now, though their rows need some of the same pieces: argument encoders
-     for Mac1, Mac2 and Metal3, and the heaps, texture views, sample
-     positions and IO queues for each of them.
+     for Mac1, Mac2 and Metal3, and the heaps, sample positions and IO
+     queues for each of them.
    - Where the lane's own device can do less than the host GPU, it answers
      no (Metal4, ray tracing, function pointers, dynamic libraries and the
      rest). One table in `crates/reims-vgpu/src/graphics/device_info.rs`

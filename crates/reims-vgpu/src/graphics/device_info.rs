@@ -83,9 +83,10 @@ fn at(family: i64) -> usize {
         .unwrap_or_else(|| unreachable!("{family} is an SDK family"))
 }
 
-/// A feature that the rows of Apple's Metal Feature Set Tables require of an Apple GPU family,
-/// which the lane's wire, decoder and bundle do not carry yet. The bundle answers each one's
-/// members as Metal answers a device without the feature, and marks them `RGFX_UNSUPPORTED`.
+/// A feature that the rows of Apple's Metal Feature Set Tables require of an Apple GPU family.
+/// [`WIRED`] lists those the lane's wire, decoder and bundle carry; the bundle answers each other
+/// one's members as Metal answers a device without the feature, and marks them
+/// `RGFX_UNSUPPORTED`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Piece {
     /// `MTLArgumentEncoder`, from the device, a function and an encoder (argument buffers tier 1).
@@ -204,9 +205,10 @@ const APPLE_PIECES: [(i64, &[Piece]); 11] = {
     ]
 };
 
-/// The pieces the lane carries: none yet. A piece joins this list when its wire messages, its
-/// decoding and its bundle members land, and the Apple families it holds back rise with it.
-const WIRED: &[Piece] = &[];
+/// The pieces the lane carries: texture views (`TEXTURE_VIEW`). A piece joins this list when its
+/// wire messages, its decoding and its bundle members land, and the Apple families it holds back
+/// rise with it.
+const WIRED: &[Piece] = &[Piece::TextureViews];
 
 /// `identity` with each Apple family answered yes only where the platform answers yes and `wired`
 /// holds every piece of its rows and of each Apple family's before it ([`APPLE_PIECES`]), and each
@@ -236,8 +238,8 @@ fn cap_apple_families(identity: &mut IdentityCaps, wired: &[Piece]) {
 ///
 /// | answer | the lane's | waits on |
 /// |---|---|---|
-/// | `supportsFamily:` of Apple1 to Apple11, and `supportsFeatureSet:` of the iOS sets that go with them | the platform's, but no from the first Apple family whose rows need a piece the lane lacks; it carries none yet, so no Apple family | each family's pieces in [`APPLE_PIECES`], from argument encoders, automatic heaps, sample positions, IO command queues and texture views (Apple1 and Apple2) on |
-/// | `supportsFamily:` of Mac1, Mac2, Common1 to Common3 and Metal3 | the platform's, for now | their rows need some of the same pieces: argument encoders (Mac1, Mac2 and Metal3), and automatic heaps, texture views, sample positions and IO command queues (every one of them) |
+/// | `supportsFamily:` of Apple1 to Apple11, and `supportsFeatureSet:` of the iOS sets that go with them | the platform's, but no from the first Apple family whose rows need a piece the lane lacks; of Apple2's it carries texture views alone, so no Apple family | each family's pieces in [`APPLE_PIECES`] the lane lacks, from argument encoders, automatic heaps, sample positions and IO command queues (Apple1 and Apple2) on |
+/// | `supportsFamily:` of Mac1, Mac2, Common1 to Common3 and Metal3 | the platform's, for now | their rows need some of the same pieces: argument encoders (Mac1, Mac2 and Metal3), and automatic heaps, sample positions and IO command queues (every one of them) |
 /// | `supportsFamily:` of Metal4 | no | the `MTL4` API: its command queues and buffers, argument tables, compiler and allocators |
 /// | `supportsRaytracing`, `supportsRaytracingFromRender`, `supportsPrimitiveMotionBlur` | no | acceleration structures, their builds, and intersection function tables |
 /// | `supportsFunctionPointers`, `supportsFunctionPointersFromRender` | no | visible function tables and function handles |
@@ -545,7 +547,7 @@ mod tests {
     /// rows and the rows before it: with every piece the fake's Apple1 to Apple9 and their iOS
     /// sets stand; without imageblocks, an Apple4 piece, Apple4 and later answer no and so do
     /// iOS_GPUFamily4 and 5, while Apple1 to Apple3, their sets and Mac1 stand; without argument
-    /// encoders no Apple family does
+    /// encoders, or texture views, no Apple family does, nor with the lane's pieces alone
     #[test]
     fn an_apple_family_drops_where_the_lane_lacks_a_piece() {
         let p = Arc::new(FakePlatform::new());
@@ -590,6 +592,18 @@ mod tests {
         assert_eq!(set(&no_imageblocks, 11), Some(false));
         assert_eq!(set(&no_imageblocks, 16), Some(false));
         assert_eq!(set(&no_imageblocks, 10000), Some(true));
+
+        // The lane's own pieces: texture views, but none of Apple2's others, so no Apple family
+        // stands, and none would without texture views either.
+        assert!(WIRED.contains(&Piece::TextureViews));
+        let mut lane = platform.clone();
+        cap_apple_families(&mut lane, WIRED);
+        let no_views = without(Piece::TextureViews);
+        for family in 1001..=1011 {
+            assert_eq!(answer(&lane, family), Some(false), "family {family}");
+            assert_eq!(answer(&no_views, family), Some(false), "family {family}");
+        }
+        assert_eq!(answer(&lane, 2002), Some(true));
 
         let no_encoders = without(Piece::ArgumentEncoders);
         for family in 1001..=1011 {
