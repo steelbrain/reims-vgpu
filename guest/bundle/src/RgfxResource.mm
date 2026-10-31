@@ -114,9 +114,11 @@
 	return _heapOffset;
 }
 
-// Only a resource made in a heap can be made aliasable, as in Metal. The guest places every
-// heap resource itself (a Placement heap), so aliasing changes nothing on the device: the flag
-// is only answered.
+// Only a resource made in a heap can be made aliasable, as in Metal, and one of a Placement
+// heap is aliasable from its making (measured on the M3 Max under macOS 27.0.1: YES for a
+// buffer of a Placement heap, NO for one of an Automatic heap until made so). The guest places
+// every heap resource itself, so aliasing changes nothing on the device: the flag is only
+// answered.
 - (void)makeAliasable
 {
 	if (_heap != nil) {
@@ -126,7 +128,7 @@
 
 - (BOOL)isAliasable
 {
-	return _aliasable.load();
+	return _aliasable.load() || (_heap != nil && _heap.type == MTLHeapTypePlacement);
 }
 
 // The task the resource's memory is accounted to. The device accounts memory to no task, so

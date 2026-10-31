@@ -647,13 +647,14 @@ void test_heap_routing_and_suballoc()
 	CHECK(tm.heap_obj_id == heap.rgfxObjId && tm.heap_offset == 0x4000);
 	CHECK(tm.gpu_address == 0); // heap-placed: no device address
 	CHECK(tm.desc.pixel_format == MTLPixelFormatRGBA8Unorm);
-	// Each answers its heap and offset, and can be made aliasable.
+	// Each answers its heap and offset, and is aliasable, as a Placement heap's resources are
+	// from their making.
 	CHECK(hb.heap == heap && hb.heapOffset == 0x2000);
 	CHECK(ht.heap == heap && ht.heapOffset == 0x4000);
 	CHECK(hb.storageMode == MTLStorageModePrivate);
-	CHECK(!ht.isAliasable);
+	CHECK(ht.isAliasable && hb.isAliasable);
 	[ht makeAliasable];
-	CHECK(ht.isAliasable && !hb.isAliasable);
+	CHECK(ht.isAliasable);
 
 	// The offset-less (Automatic-placement) variants are nil stubs this slice.
 	CHECK([heap newBufferWithLength:0x100 options:MTLResourceStorageModePrivate] == nil);
@@ -3643,11 +3644,7 @@ void test_texture_views()
 	id<MTLTexture> placed = [heap newTextureWithDescriptor:bd offset:0x10000];
 	id<MTLTexture> placedView = [placed newTextureViewWithPixelFormat:MTLPixelFormatBGRA8Unorm_sRGB];
 	CHECK(placedView.heap == heap && placedView.heapOffset == 0x10000);
-	const BOOL aliasable = placed.isAliasable;
-	[placedView makeAliasable];
-	CHECK(placed.isAliasable == aliasable && placedView.isAliasable == aliasable);
-	[placed makeAliasable];
-	CHECK(placed.isAliasable && placedView.isAliasable);
+	CHECK(placed.isAliasable && placedView.isAliasable); // a Placement heap's
 	CHECK([placedView setPurgeableState:MTLPurgeableStateVolatile] == MTLPurgeableStateNonVolatile);
 	CHECK([placed setPurgeableState:MTLPurgeableStateKeepCurrent] == MTLPurgeableStateNonVolatile);
 	drainRing(fx.ring);
