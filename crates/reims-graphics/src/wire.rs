@@ -279,6 +279,20 @@ pub const RGFX_CMD_LIBRARY_FROM_REGION: u32 = 0x212;
 /// Command `LIBRARY_LOOKUP` ([`RgfxLibraryLookup`]): a library by its content key, from the
 /// libraries the device made for any process of the guest; answered by [`RGFX_EVT_COMPLETE`].
 pub const RGFX_CMD_LIBRARY_LOOKUP: u32 = 0x213;
+/// Command `BUFFER_DID_MODIFY_RANGE` ([`RgfxBufferDidModifyRange`]): the guest wrote `length`
+/// bytes at `location` of a `Managed` buffer's CPU copy (`didModifyRange:`). Every command buffer
+/// of the context committed after it, on any queue, sees them: ring 0 is carried out before any
+/// later command buffer. Not answered; a range past the buffer, or a buffer not `Managed`, is
+/// refused.
+pub const RGFX_CMD_BUFFER_DID_MODIFY_RANGE: u32 = 0x214;
+/// Command `MANAGED_TEXTURE_CREATE` ([`RgfxManagedTextureCreate`]): a `Managed` texture, whose
+/// CPU copy is a Shared buffer of the sender's over its own region block, in the linear layout
+/// [`RgfxManagedTextureCreate`] describes. Not answered.
+pub const RGFX_CMD_MANAGED_TEXTURE_CREATE: u32 = 0x215;
+/// Command `TEXTURE_REPLACE_REGION` ([`RgfxTextureReplaceRegion`]): the guest wrote a region of
+/// a level and slice of a `Managed` texture's CPU copy (`replaceRegion:`). Every command buffer of
+/// the context committed after it, on any queue, sees them. Not answered.
+pub const RGFX_CMD_TEXTURE_REPLACE_REGION: u32 = 0x216;
 
 /// `CONTEXT_CLOSE` ([`RgfxContextClose`]), on ring 0 from the accelerator kext: the process that
 /// held context `context` closed the device or died. The host ends the context's command queues
@@ -953,6 +967,90 @@ pub struct RgfxTextureDescriptor {
     pub reserved_2c: u32,
 }
 
+/// `BUFFER_DID_MODIFY_RANGE`: the guest wrote `length` bytes at `location` of `Managed` buffer
+/// `obj_id`'s CPU copy, the region block its `BUFFER_OVER_HOST_MEMORY` named.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxBufferDidModifyRange {
+    /// [`RGFX_CMD_BUFFER_DID_MODIFY_RANGE`].
+    pub header: RgfxMsgHeader,
+    /// The buffer.
+    pub obj_id: u64,
+    /// Where the bytes start in the buffer.
+    pub location: u64,
+    /// How many.
+    pub length: u64,
+}
+
+/// The rows of a level of a `Managed` texture's CPU copy start at multiples of this, in bytes
+/// ([`RgfxManagedTextureCreate`]).
+pub const RGFX_MANAGED_ROW_ALIGN: u64 = 256;
+
+/// [`RgfxManagedTextureCreate::flags`]: the pixel format is one a texture over a buffer can
+/// have (uncompressed, one texel a block, neither depth nor stencil).
+pub const RGFX_MANAGED_TEXTURE_LINEAR: u32 = 1;
+
+/// `MANAGED_TEXTURE_CREATE`: a `Managed` texture of shape `desc` at the guest-picked
+/// `gpu_address`, with the guest-picked `resource_id`, whose CPU copy is the Shared buffer
+/// `cpu_buffer_obj_id` over a block of the sender's.
+///
+/// The CPU copy holds every level in order; each level its slices in order (`array_length`, six
+/// faces a cube); each slice its images (the level's depth, for a 3D texture; else one); each
+/// image its rows of texel blocks. A level of `w` by `h` texels (the texture's halved `level`
+/// times, at least 1) has rows of `ceil(w / block_width) * bytes_per_block` bytes rounded up to
+/// [`RGFX_MANAGED_ROW_ALIGN`], and `ceil(h / block_height)` of them an image. The guest and the
+/// host each compute it from these fields alone (`reims_graphics::managed`).
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxManagedTextureCreate {
+    /// [`RGFX_CMD_MANAGED_TEXTURE_CREATE`].
+    pub header: RgfxMsgHeader,
+    /// The new texture's guest-picked id.
+    pub obj_id: u64,
+    /// The texture's guest-picked GPU address.
+    pub gpu_address: u64,
+    /// The texture's guest-picked resource id.
+    pub resource_id: u64,
+    /// The Shared buffer over the block that holds the texture's CPU copy.
+    pub cpu_buffer_obj_id: u64,
+    /// The bytes of one block of texels of the pixel format.
+    pub bytes_per_block: u32,
+    /// A block's width in texels: 1 for an uncompressed format.
+    pub block_width: u32,
+    /// A block's height in texels.
+    pub block_height: u32,
+    /// [`RGFX_MANAGED_TEXTURE_LINEAR`], or 0.
+    pub flags: u32,
+    /// The texture's shape.
+    pub desc: RgfxTextureDescriptor,
+}
+
+/// `TEXTURE_REPLACE_REGION`: the guest wrote the texels of `size` at `origin` of `level` and
+/// `slice` of `Managed` texture `obj_id`'s CPU copy, at their places in its layout
+/// ([`RgfxManagedTextureCreate`]).
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxTextureReplaceRegion {
+    /// [`RGFX_CMD_TEXTURE_REPLACE_REGION`].
+    pub header: RgfxMsgHeader,
+    /// The texture.
+    pub obj_id: u64,
+    /// The mip level.
+    pub level: u32,
+    /// The slice: the array element, times six plus the face for a cube.
+    pub slice: u32,
+    /// The region's origin, x, y and z, in texels.
+    pub origin: [u32; 3],
+    /// The region's width, height and depth, in texels.
+    pub size: [u32; 3],
+}
+
 /// `TEXTURE_CREATE`: a texture of shape `desc` at the guest-picked `gpu_address`
 /// (device-placed, `heap_obj_id` 0) or at `heap_offset` in `heap_obj_id`, with
 /// the guest-picked `resource_id`.
@@ -1581,6 +1679,9 @@ const _: () = {
     assert!(size_of::<RgfxLibraryCreate>() == 72);
     assert!(size_of::<RgfxLibraryFromRegion>() == 112);
     assert!(size_of::<RgfxLibraryLookup>() == 64);
+    assert!(size_of::<RgfxBufferDidModifyRange>() == 40);
+    assert!(size_of::<RgfxManagedTextureCreate>() == 112);
+    assert!(size_of::<RgfxTextureReplaceRegion>() == 56);
     assert!(RGFX_LIBRARY_BYTES_OFFSET as usize == size_of::<RgfxLibraryCreate>());
     assert!(size_of::<RgfxDeviceInfo>() == 376);
     // The device-info blob sits past the completion ring and before the allocations.

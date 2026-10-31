@@ -429,6 +429,14 @@ pub(crate) fn decode_op<P: Platform>(
         }
         RGFX_OP_BLIT_SYNCHRONIZE_RESOURCE => {
             let m: RgfxBlitOpSynchronizeResource = body(tag, payload)?;
+            // A `Managed` buffer or texture of two copies: its GPU copy to its CPU copy, here.
+            if matches!(
+                m.resource_kind,
+                RGFX_BLIT_RESOURCE_BUFFER | RGFX_BLIT_RESOURCE_TEXTURE
+            ) && objs.synchronize_managed(m.resource_obj_id, None, enc, on)?
+            {
+                return Ok(true);
+            }
             // The resource is any `id<MTLResource>`: `resource_kind` picks the
             // resolver. A nil kind (or a 0 id) is a nil resource; an unknown kind
             // faults. The resolved handle is held for the encode.
@@ -472,6 +480,10 @@ pub(crate) fn decode_op<P: Platform>(
         }
         RGFX_OP_BLIT_SYNCHRONIZE_TEXTURE => {
             let m: RgfxBlitOpSynchronizeTexture = body(tag, payload)?;
+            let which = Some((m.slice, m.level));
+            if objs.synchronize_managed(m.texture_obj_id, which, enc, on)? {
+                return Ok(true);
+            }
             let texture = objs.require_texture(m.texture_obj_id)?;
             enc.encode(
                 on,

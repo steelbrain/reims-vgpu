@@ -6,8 +6,8 @@ use reims_graphics::wire::*;
 use reims_vgpu_core::platform::ObjId;
 use reims_vgpu_core::platform::device::GpuDevice;
 use reims_vgpu_core::platform::types::CommandBufferStatus;
-use reims_vgpu_core::testkit::FakePlatform;
 use reims_vgpu_core::testkit::objects::CompleteOn;
+use reims_vgpu_core::testkit::{Arg, FakePlatform};
 use zerocopy::{FromBytes, IntoBytes};
 
 use super::*;
@@ -1659,6 +1659,62 @@ fn a_block_is_released_only_once_nothing_lies_in_it() {
     guest.send(&device, object_destroy(obj(1, 2)));
     let status = answered(&device, &mut guest, block_release(1, BLOCK, SIZE));
     assert_eq!(status, RGFX_STATUS_OK);
+}
+
+/// A `Managed` buffer's range on ring 0 reaches the platform before a command buffer its process
+/// commits after it on a queue's own ring: the range's `didModifyRange:` comes before the
+/// buffer's commit
+#[test]
+fn a_managed_range_is_carried_out_before_a_later_command_buffer() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform) = headless_on(&raised);
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    const SUBMIT: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET;
+    const COMPLETE: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x2_0000;
+    const BLOCK: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x10_0000;
+    const RING_DATA: u32 = 0x1_0000;
+    let mut guest = Guest::new(&device);
+    assert_eq!(
+        answered(
+            &device,
+            &mut guest,
+            queue_create(1, 1, SUBMIT, COMPLETE, RING_DATA, 0)
+        ),
+        RGFX_STATUS_OK
+    );
+    guest.send(&device, block_grant(1, BLOCK, 0x1_0000));
+    let mut managed = buffer_over_host_memory(obj(1, 2), BLOCK, 0x1000);
+    let options = std::mem::offset_of!(RgfxBufferOverHostMemory, options);
+    managed[options..options + 4].copy_from_slice(&(1u32 << 4).to_le_bytes());
+    guest.send(&device, managed);
+    let range = RgfxBufferDidModifyRange {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_BUFFER_DID_MODIFY_RANGE,
+            size: 0,
+            seqno: 0,
+        },
+        obj_id: obj(1, 2),
+        location: 0x40,
+        length: 0x10,
+    };
+    guest.send(&device, range.as_bytes().to_vec());
+    let mut ring = QueueRing::new(&device, SUBMIT, COMPLETE, u64::from(RING_DATA));
+    ring.send(&device, command_buffer(obj(1, 1), 100));
+    committed(&platform, 1);
+    let calls = platform.call_log().calls();
+    let at = |sel: &str, arg: Option<Arg>| {
+        calls
+            .iter()
+            .position(|c| c.sel == sel && arg.as_ref().is_none_or(|a| c.args.first() == Some(a)))
+            .unwrap_or_else(|| panic!("no {sel}"))
+    };
+    let modified = at(
+        "didModifyRange:",
+        Some(Arg::val(&reims_vgpu_core::platform::types::NsRange::new(
+            0x40, 0x10,
+        ))),
+    );
+    assert!(modified < at("commit", None));
 }
 
 /// A library from region chunks is checked against its own process's blocks, whichever process

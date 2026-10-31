@@ -4,6 +4,13 @@
 
 #import "RgfxTexture.h"
 
+#import "RgfxBuffer.h"
+
+#include <cstring>
+#include <memory>
+
+#include "RgfxManagedLayout.hpp"
+#include "RgfxRegion.hpp"
 #include "RgfxRetirement.hpp"
 #include "RgfxSerializer.hpp" // RgfxSerializer, RgfxTextureDescriptor (wire)
 
@@ -39,6 +46,62 @@ RgfxTextureDescriptor rgfxTextureDescriptorFromMTL(MTLTextureDescriptor *d)
 	RgfxTextureDescriptor _desc; // the mapped shape the getters answer from
 	uint64_t _gpuAddress;        // the picked GPU address (0 when heap-placed)
 	uint64_t _resourceId;        // the picked texture resource id
+	// A Managed texture's CPU copy: the Shared buffer over its block, the block's bytes, and
+	// their layout. Nil and null for any other texture.
+	RgfxBuffer *_managedCpu;
+	uint8_t *_managedBytes;
+	std::unique_ptr<RgfxManagedLayout> _managedLayout;
+}
+
++ (instancetype)managedTextureWithDescriptor:(MTLTextureDescriptor *)descriptor
+                                      region:(RgfxRegion *)region
+                                      device:(id<MTLDevice>)device
+                                  serializer:(RgfxSerializer *)serializer
+{
+	if (descriptor == nil || region == nullptr || serializer == nullptr) {
+		return nil;
+	}
+	RgfxTextureDescriptor desc = rgfxTextureDescriptorFromMTL(descriptor);
+	RgfxFormatBlock block = {};
+	auto layout = std::make_unique<RgfxManagedLayout>();
+	if (!rgfxPixelFormatBlock(desc.pixel_format, &block) || !layout->init(desc, block)) {
+		return nil;
+	}
+	RgfxRegion::Block copy = region->allocate(layout->size());
+	if (!copy.ok) {
+		return nil;
+	}
+	// A new Managed texture reads zero, as Metal's do.
+	uint8_t *bytes = const_cast<uint8_t *>(copy.ptr);
+	std::memset(bytes, 0, layout->size());
+	RgfxBuffer *cpu = [RgfxBuffer bufferOverHostMemoryWithContents:bytes
+	                                                  regionOffset:copy.offset
+	                                                        length:layout->size()
+	                                                       options:MTLResourceStorageModeShared
+	                                                   deallocator:nil
+	                                                        device:device
+	                                                    serializer:serializer];
+	if (cpu == nil) {
+		return nil;
+	}
+	RgfxCreated created = serializer->createManagedTexture(
+	    desc, [cpu rgfxObjId], block.bytes, block.width, block.height,
+	    block.linear ? RGFX_MANAGED_TEXTURE_LINEAR : 0);
+	if (created.resource_id == 0) {
+		return nil;
+	}
+	RgfxTexture *t = [[RgfxTexture alloc] initWithObjId:created.obj_id
+	                                         gpuAddress:created.gpu_address
+	                                         resourceId:created.resource_id
+	                                         descriptor:desc
+	                                             device:device
+	                                         serializer:serializer];
+	if (t != nil) {
+		t->_managedCpu = cpu;
+		t->_managedBytes = bytes;
+		t->_managedLayout = std::move(layout);
+	}
+	return t;
 }
 
 + (instancetype)textureWithDescriptor:(MTLTextureDescriptor *)descriptor
@@ -187,6 +250,168 @@ RgfxTextureDescriptor rgfxTextureDescriptorFromMTL(MTLTextureDescriptor *d)
 // A plain device- or heap-placed texture has no parent, backing buffer or
 // IOSurface; those paths (texture views, buffer-backed textures, IOSurface
 // import) are later resource/transport pieces.
+
+// --- CPU access ----------------------------------------------------------------
+//
+// Each form dispatches on the texture's storage: a Managed texture with a CPU copy reads and
+// writes the copy (rgfxManaged...), with no round trip.
+
+/// The bytes of the texels of `region` of `level` and `slice` in the CPU copy, copied to or from
+/// `pixels` (each row `bytesPerRow`, each image `bytesPerImage` apart), as `toCopy` says. False
+/// for a texture with no CPU copy; a region the layout does not hold copies nothing.
+- (BOOL)rgfxManagedCopy:(MTLRegion)region
+                  level:(NSUInteger)level
+                  slice:(NSUInteger)slice
+                 pixels:(uint8_t *)pixels
+            bytesPerRow:(NSUInteger)bytesPerRow
+          bytesPerImage:(NSUInteger)bytesPerImage
+                 toCopy:(BOOL)toCopy
+                 offset:(uint64_t *)offset
+{
+	if (_managedLayout == nullptr) {
+		return NO;
+	}
+	const RgfxManagedLayout &layout = *_managedLayout;
+	const uint64_t origin[3] = {region.origin.x, region.origin.y, region.origin.z};
+	const uint64_t size[3] = {region.size.width, region.size.height, region.size.depth};
+	*offset = UINT64_MAX;
+	uint64_t at = 0;
+	if (pixels == nullptr || level > UINT32_MAX ||
+	    !layout.region(static_cast<uint32_t>(level), slice, origin, size, &at)) {
+		return YES;
+	}
+	const RgfxManagedLevel &lv = layout.level(static_cast<uint32_t>(level));
+	const uint64_t rowBytes = layout.rowBytes(size[0]);
+	const uint64_t rows = layout.rows(size[1]);
+	for (uint64_t z = 0; z < size[2]; z++) {
+		for (uint64_t r = 0; r < rows; r++) {
+			uint8_t *copy = _managedBytes + at + z * lv.bytesPerImage + r * lv.bytesPerRow;
+			uint8_t *app = pixels + z * bytesPerImage + r * bytesPerRow;
+			if (toCopy) {
+				std::memcpy(copy, app, rowBytes);
+			} else {
+				std::memcpy(app, copy, rowBytes);
+			}
+		}
+	}
+	*offset = at;
+	return YES;
+}
+
+/// replaceRegion: of a Managed texture: the CPU copy written, and the host told the region. False
+/// for a texture with no CPU copy.
+- (BOOL)rgfxManagedReplaceRegion:(MTLRegion)region
+                           level:(NSUInteger)level
+                           slice:(NSUInteger)slice
+                           bytes:(const void *)bytes
+                     bytesPerRow:(NSUInteger)bytesPerRow
+                   bytesPerImage:(NSUInteger)bytesPerImage
+{
+	uint64_t at = 0;
+	if (![self rgfxManagedCopy:region
+	                     level:level
+	                     slice:slice
+	                    pixels:static_cast<uint8_t *>(const_cast<void *>(bytes))
+	               bytesPerRow:bytesPerRow
+	             bytesPerImage:bytesPerImage
+	                    toCopy:YES
+	                    offset:&at]) {
+		return NO;
+	}
+	if (at != UINT64_MAX && _serializer != nullptr) {
+		const uint32_t origin[3] = {static_cast<uint32_t>(region.origin.x),
+		                            static_cast<uint32_t>(region.origin.y),
+		                            static_cast<uint32_t>(region.origin.z)};
+		const uint32_t size[3] = {static_cast<uint32_t>(region.size.width),
+		                          static_cast<uint32_t>(region.size.height),
+		                          static_cast<uint32_t>(region.size.depth)};
+		_serializer->textureReplaceRegion([self rgfxObjId], static_cast<uint32_t>(level),
+		                                  static_cast<uint32_t>(slice), origin, size);
+	}
+	return YES;
+}
+
+/// getBytes: of a Managed texture: the CPU copy read, as the GPU left it at the last
+/// synchronize the process waited for. False for a texture with no CPU copy.
+- (BOOL)rgfxManagedGetBytes:(void *)bytes
+                bytesPerRow:(NSUInteger)bytesPerRow
+              bytesPerImage:(NSUInteger)bytesPerImage
+                 fromRegion:(MTLRegion)region
+                      level:(NSUInteger)level
+                      slice:(NSUInteger)slice
+{
+	uint64_t at = 0;
+	return [self rgfxManagedCopy:region
+	                       level:level
+	                       slice:slice
+	                      pixels:static_cast<uint8_t *>(bytes)
+	                 bytesPerRow:bytesPerRow
+	               bytesPerImage:bytesPerImage
+	                      toCopy:NO
+	                      offset:&at];
+}
+
+- (void)replaceRegion:(MTLRegion)region
+          mipmapLevel:(NSUInteger)level
+                slice:(NSUInteger)slice
+            withBytes:(const void *)pixelBytes
+          bytesPerRow:(NSUInteger)bytesPerRow
+        bytesPerImage:(NSUInteger)bytesPerImage
+{
+	if ([self rgfxManagedReplaceRegion:region
+	                             level:level
+	                             slice:slice
+	                             bytes:pixelBytes
+	                       bytesPerRow:bytesPerRow
+	                     bytesPerImage:bytesPerImage]) {
+		return;
+	}
+	// Other storage modes: not handled here.
+}
+
+- (void)replaceRegion:(MTLRegion)region
+          mipmapLevel:(NSUInteger)level
+            withBytes:(const void *)pixelBytes
+          bytesPerRow:(NSUInteger)bytesPerRow
+{
+	[self replaceRegion:region
+	        mipmapLevel:level
+	              slice:0
+	          withBytes:pixelBytes
+	        bytesPerRow:bytesPerRow
+	      bytesPerImage:0];
+}
+
+- (void)getBytes:(void *)pixelBytes
+      bytesPerRow:(NSUInteger)bytesPerRow
+    bytesPerImage:(NSUInteger)bytesPerImage
+       fromRegion:(MTLRegion)region
+      mipmapLevel:(NSUInteger)level
+            slice:(NSUInteger)slice
+{
+	if ([self rgfxManagedGetBytes:pixelBytes
+	                  bytesPerRow:bytesPerRow
+	                bytesPerImage:bytesPerImage
+	                   fromRegion:region
+	                        level:level
+	                        slice:slice]) {
+		return;
+	}
+	// Other storage modes: not handled here.
+}
+
+- (void)getBytes:(void *)pixelBytes
+     bytesPerRow:(NSUInteger)bytesPerRow
+      fromRegion:(MTLRegion)region
+     mipmapLevel:(NSUInteger)level
+{
+	[self getBytes:pixelBytes
+	      bytesPerRow:bytesPerRow
+	    bytesPerImage:0
+	       fromRegion:region
+	      mipmapLevel:level
+	            slice:0];
+}
 
 - (id<MTLTexture>)parentTexture
 {

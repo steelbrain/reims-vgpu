@@ -40,13 +40,14 @@ use std::sync::Arc;
 
 use reims_graphics::region::Region;
 use reims_graphics::wire::{
-    RGFX_CMD_BUFFER_AT_OFFSET, RGFX_CMD_BUFFER_CREATE, RGFX_CMD_BUFFER_OVER_HOST_MEMORY,
-    RGFX_CMD_COMMAND_BUFFER, RGFX_CMD_COMPUTE_PIPELINE_CREATE, RGFX_CMD_DEPTH_STENCIL_CREATE,
-    RGFX_CMD_EVENT_CREATE, RGFX_CMD_FENCE_CREATE, RGFX_CMD_HEAP_CREATE,
-    RGFX_CMD_HEAP_OVER_HOST_MEMORY, RGFX_CMD_LIBRARY_CREATE, RGFX_CMD_LIBRARY_FROM_REGION,
-    RGFX_CMD_OBJECT_DESTROY, RGFX_CMD_QUEUE_CREATE, RGFX_CMD_RENDER_PIPELINE_CREATE,
-    RGFX_CMD_RESOURCE_ID_CHUNK, RGFX_CMD_SAMPLER_CREATE, RGFX_CMD_SHARED_EVENT_CREATE,
-    RGFX_CMD_TEXTURE_CREATE, RGFX_CMD_TEXTURE_FROM_BUFFER, RGFX_CMD_TEXTURE_FROM_IOSURFACE,
+    RGFX_CMD_BUFFER_AT_OFFSET, RGFX_CMD_BUFFER_CREATE, RGFX_CMD_BUFFER_DID_MODIFY_RANGE,
+    RGFX_CMD_BUFFER_OVER_HOST_MEMORY, RGFX_CMD_COMMAND_BUFFER, RGFX_CMD_COMPUTE_PIPELINE_CREATE,
+    RGFX_CMD_DEPTH_STENCIL_CREATE, RGFX_CMD_EVENT_CREATE, RGFX_CMD_FENCE_CREATE,
+    RGFX_CMD_HEAP_CREATE, RGFX_CMD_HEAP_OVER_HOST_MEMORY, RGFX_CMD_LIBRARY_CREATE,
+    RGFX_CMD_LIBRARY_FROM_REGION, RGFX_CMD_MANAGED_TEXTURE_CREATE, RGFX_CMD_OBJECT_DESTROY,
+    RGFX_CMD_QUEUE_CREATE, RGFX_CMD_RENDER_PIPELINE_CREATE, RGFX_CMD_RESOURCE_ID_CHUNK,
+    RGFX_CMD_SAMPLER_CREATE, RGFX_CMD_SHARED_EVENT_CREATE, RGFX_CMD_TEXTURE_CREATE,
+    RGFX_CMD_TEXTURE_FROM_BUFFER, RGFX_CMD_TEXTURE_FROM_IOSURFACE, RGFX_CMD_TEXTURE_REPLACE_REGION,
     RGFX_CONTEXT_ALLOCATIONS_OFFSET, RGFX_CONTEXT_OBJ_ID_SHIFT, RGFX_CURSOR_SPAN,
     RGFX_EVT_PIPELINE_REFLECTION, RGFX_PIPELINE_KIND_COMPUTE, RGFX_PIPELINE_KIND_RENDER,
     RGFX_PIPELINE_OK, RGFX_PIPELINE_REFLECT_SUPPORT_ICB,
@@ -59,7 +60,6 @@ use reims_graphics::wire::{
     RgfxStencilDescriptor, RgfxTextureCreate, RgfxTextureDescriptor, RgfxTextureFromBuffer,
     RgfxTextureFromIOSurface,
 };
-use reims_vgpu_core::host::HostPtr;
 use reims_vgpu_core::platform::device::GpuDevice;
 use reims_vgpu_core::platform::resource::{
     Buffer, ComputePipeline, FunctionConstant, Heap, Library, RenderPipeline,
@@ -69,7 +69,7 @@ use reims_vgpu_core::platform::values::{
     BufferDesc, DepthStencilDesc, HeapDesc, OptionSet, RenderPipelineDesc, SamplerDesc,
     StencilDesc, TextureDesc,
 };
-use reims_vgpu_core::platform::{Handle, HostRange, Platform};
+use reims_vgpu_core::platform::{Handle, Platform};
 use reims_vgpu_core::raise::{OnFault, Raise, RaiseResult};
 use reims_vgpu_core::sync::Mutex;
 use zerocopy::FromBytes;
@@ -78,6 +78,7 @@ mod blit;
 mod cmdbuf;
 mod compute;
 mod library;
+mod managed;
 mod render;
 
 #[cfg(test)]
@@ -88,6 +89,7 @@ use library::{LibraryCache, LibraryKey, LibraryRef, LibrarySlot};
 pub(crate) use library::{
     LibraryJob, LibraryStart, MadeLibrary, RELEASED_BUDGET, complete, make_library,
 };
+use managed::{ManagedCopy, STORAGE_MODE_MANAGED, storage_mode};
 
 /// A sink the decoder calls with each command buffer's completion record once its
 /// work finishes (the handler the stream's close registers). The ring loop sets
@@ -207,6 +209,10 @@ pub struct GraphicsDecoder<P: Platform> {
     /// Each context's command buffers in flight since its last drain began
     /// ([`Self::drain_context`]).
     drains: HashMap<u32, Arc<Drain>>,
+    /// The CPU copy of each `Managed` buffer and texture ([`managed`]).
+    managed: HashMap<u64, ManagedCopy<P>>,
+    /// Whether a `Managed` resource is one copy, over its block ([`Self::set_unified_memory`]).
+    unified_memory: bool,
     /// The device's BAR 2 region: the host memory the over-host-memory buffers
     /// and heaps are placed over. Held so it stays mapped while the decoder's
     /// objects live; declared last so the object table drops before it (a buffer
@@ -231,6 +237,8 @@ impl<P: Platform> GraphicsDecoder<P> {
             context: None,
             spans: HashMap::new(),
             drains: HashMap::new(),
+            managed: HashMap::new(),
+            unified_memory: false,
             region,
         }
     }
@@ -340,6 +348,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         let before = self.objects.len();
         self.objects.retain(|id, _| !ours(id));
         self.spans.retain(|id, _| !ours(id));
+        self.managed.retain(|id, _| !ours(id));
         let libraries: Vec<u64> = (self.making_libraries.keys())
             .chain(self.library_chunks.keys())
             .chain(self.cached_libraries.keys())
@@ -394,6 +403,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                 // the host never made (a create that the platform refused).
                 self.forget_library(m.obj_id);
                 self.spans.remove(&m.obj_id);
+                self.managed.remove(&m.obj_id);
                 if matches!(self.objects.remove(&m.obj_id), Some(ObjHandle::Texture(_))) {
                     self.forget_surface_texture(m.obj_id);
                 }
@@ -534,22 +544,12 @@ impl<P: Platform> GraphicsDecoder<P> {
                 if !self.in_own_block(m.region_offset, m.length) {
                     return Ok(Err(DecodeError::BadReference));
                 }
-                let keep = Arc::clone(&self.region);
-                // SAFETY: the block lies inside the region (checked above), which
-                // stays mapped until its last reference goes; the deallocator holds
-                // one until Metal frees the buffer.
-                let bytes = unsafe {
-                    HostRange::new(
-                        HostPtr::from_ptr(self.region.base().add(m.region_offset as usize)),
-                        m.length,
-                    )
-                };
-                let made = device.new_buffer_over_host_memory(
-                    OnFault::Return,
-                    bytes,
-                    m.options as u64,
-                    Some(Box::new(move || drop(keep))),
-                )?;
+                // A `Managed` one's block is its CPU copy ([`managed`]).
+                if storage_mode(m.options.into()) == STORAGE_MODE_MANAGED {
+                    return self.managed_buffer(device, &m);
+                }
+                let made =
+                    self.buffer_over_block(device, m.region_offset, m.length, m.options.into())?;
                 match made {
                     Some(buffer) => self.insert_over(
                         m.obj_id,
@@ -559,6 +559,9 @@ impl<P: Platform> GraphicsDecoder<P> {
                     None => Ok(Err(DecodeError::Refused)),
                 }
             }
+            RGFX_CMD_BUFFER_DID_MODIFY_RANGE => self.did_modify_range(message),
+            RGFX_CMD_MANAGED_TEXTURE_CREATE => self.managed_texture(device, message),
+            RGFX_CMD_TEXTURE_REPLACE_REGION => self.replace_region(message),
             RGFX_CMD_HEAP_CREATE => {
                 let Some(m) = read::<RgfxHeapCreate>(message) else {
                     return Ok(Err(DecodeError::Malformed));
@@ -762,6 +765,7 @@ impl<P: Platform> GraphicsDecoder<P> {
     fn store(&mut self, obj_id: u64, handle: ObjHandle<P>) {
         self.forget_library(obj_id);
         self.spans.remove(&obj_id);
+        self.managed.remove(&obj_id);
         self.objects.insert(obj_id, handle);
     }
 

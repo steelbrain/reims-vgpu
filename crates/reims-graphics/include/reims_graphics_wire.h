@@ -888,6 +888,23 @@
 // libraries the device made for any process of the guest; answered by [`RGFX_EVT_COMPLETE`].
 #define RGFX_CMD_LIBRARY_LOOKUP 531
 
+// Command `BUFFER_DID_MODIFY_RANGE` ([`RgfxBufferDidModifyRange`]): the guest wrote `length`
+// bytes at `location` of a `Managed` buffer's CPU copy (`didModifyRange:`). Every command buffer
+// of the context committed after it, on any queue, sees them: ring 0 is carried out before any
+// later command buffer. Not answered; a range past the buffer, or a buffer not `Managed`, is
+// refused.
+#define RGFX_CMD_BUFFER_DID_MODIFY_RANGE 532
+
+// Command `MANAGED_TEXTURE_CREATE` ([`RgfxManagedTextureCreate`]): a `Managed` texture, whose
+// CPU copy is a Shared buffer of the sender's over its own region block, in the linear layout
+// [`RgfxManagedTextureCreate`] describes. Not answered.
+#define RGFX_CMD_MANAGED_TEXTURE_CREATE 533
+
+// Command `TEXTURE_REPLACE_REGION` ([`RgfxTextureReplaceRegion`]): the guest wrote a region of
+// a level and slice of a `Managed` texture's CPU copy (`replaceRegion:`). Every command buffer of
+// the context committed after it, on any queue, sees them. Not answered.
+#define RGFX_CMD_TEXTURE_REPLACE_REGION 534
+
 // `CONTEXT_CLOSE` ([`RgfxContextClose`]), on ring 0 from the accelerator kext: the process that
 // held context `context` closed the device or died. The host ends the context's command queues
 // and drops every object whose id lies in its range ([`RGFX_CONTEXT_OBJ_ID_SHIFT`]), then answers
@@ -965,6 +982,14 @@
 
 // Where a `DISPLAYS` message's first display record starts: right after `count`.
 #define RGFX_DISPLAYS_ENTRIES_OFFSET 20
+
+// The rows of a level of a `Managed` texture's CPU copy start at multiples of this, in bytes
+// ([`RgfxManagedTextureCreate`]).
+#define RGFX_MANAGED_ROW_ALIGN 256
+
+// [`RgfxManagedTextureCreate::flags`]: the pixel format is one a texture over a buffer can
+// have (uncompressed, one texel a block, neither depth nor stencil).
+#define RGFX_MANAGED_TEXTURE_LINEAR 1
 
 // Where a `LIBRARY_CREATE` message's bytes start: right after its header.
 #define RGFX_LIBRARY_BYTES_OFFSET 72
@@ -1525,6 +1550,19 @@ typedef struct {
   // Pads to a multiple of 8; 0.
   uint32_t reserved_34;
 } RgfxBufferAtOffset;
+
+// `BUFFER_DID_MODIFY_RANGE`: the guest wrote `length` bytes at `location` of `Managed` buffer
+// `obj_id`'s CPU copy, the region block its `BUFFER_OVER_HOST_MEMORY` named.
+typedef struct {
+  // [`RGFX_CMD_BUFFER_DID_MODIFY_RANGE`].
+  RgfxMsgHeader header;
+  // The buffer.
+  uint64_t obj_id;
+  // Where the bytes start in the buffer.
+  uint64_t location;
+  // How many.
+  uint64_t length;
+} RgfxBufferDidModifyRange;
 
 // One element of a buffer-binding array ([`RgfxOpSetVertexBuffers`] and the like):
 // a buffer (0 = nil) and its offset.
@@ -2302,6 +2340,70 @@ typedef struct {
   // The bytes' content key.
   uint8_t key[32];
 } RgfxLibraryLookup;
+
+// A texture's shape, as `MTLTextureDescriptor` gives it. Each enum is its Metal
+// raw value (`MTLPixelFormat`, `MTLTextureType`, `MTLTextureUsage`,
+// `MTLResourceOptions`); `swizzle` packs the four `MTLTextureSwizzle` channels,
+// one byte each, red in the low byte.
+typedef struct {
+  // `MTLPixelFormat`.
+  uint32_t pixel_format;
+  // `MTLTextureType`.
+  uint32_t texture_type;
+  // Pixels a row.
+  uint32_t width;
+  // Rows.
+  uint32_t height;
+  // Slices, for a 3D texture; 1 otherwise.
+  uint32_t depth;
+  // Mip levels.
+  uint32_t mipmap_level_count;
+  // Array elements, for an array texture; 1 otherwise.
+  uint32_t array_length;
+  // Samples a pixel, for a multisample texture; 1 otherwise.
+  uint32_t sample_count;
+  // `MTLTextureUsage`.
+  uint32_t usage;
+  // `MTLResourceOptions`: the storage, cache and hazard-tracking modes.
+  uint32_t options;
+  // The four `MTLTextureSwizzle` channels, one byte each, red lowest.
+  uint32_t swizzle;
+  // Pads to a multiple of 8; 0.
+  uint32_t reserved_2c;
+} RgfxTextureDescriptor;
+
+// `MANAGED_TEXTURE_CREATE`: a `Managed` texture of shape `desc` at the guest-picked
+// `gpu_address`, with the guest-picked `resource_id`, whose CPU copy is the Shared buffer
+// `cpu_buffer_obj_id` over a block of the sender's.
+//
+// The CPU copy holds every level in order; each level its slices in order (`array_length`, six
+// faces a cube); each slice its images (the level's depth, for a 3D texture; else one); each
+// image its rows of texel blocks. A level of `w` by `h` texels (the texture's halved `level`
+// times, at least 1) has rows of `ceil(w / block_width) * bytes_per_block` bytes rounded up to
+// [`RGFX_MANAGED_ROW_ALIGN`], and `ceil(h / block_height)` of them an image. The guest and the
+// host each compute it from these fields alone (`reims_graphics::managed`).
+typedef struct {
+  // [`RGFX_CMD_MANAGED_TEXTURE_CREATE`].
+  RgfxMsgHeader header;
+  // The new texture's guest-picked id.
+  uint64_t obj_id;
+  // The texture's guest-picked GPU address.
+  uint64_t gpu_address;
+  // The texture's guest-picked resource id.
+  uint64_t resource_id;
+  // The Shared buffer over the block that holds the texture's CPU copy.
+  uint64_t cpu_buffer_obj_id;
+  // The bytes of one block of texels of the pixel format.
+  uint32_t bytes_per_block;
+  // A block's width in texels: 1 for an uncompressed format.
+  uint32_t block_width;
+  // A block's height in texels.
+  uint32_t block_height;
+  // [`RGFX_MANAGED_TEXTURE_LINEAR`], or 0.
+  uint32_t flags;
+  // The texture's shape.
+  RgfxTextureDescriptor desc;
+} RgfxManagedTextureCreate;
 
 // One mode of a display in a `DISPLAYS` message.
 typedef struct {
@@ -3638,37 +3740,6 @@ typedef struct {
   uint64_t texture_obj_id;
 } RgfxTextureBinding;
 
-// A texture's shape, as `MTLTextureDescriptor` gives it. Each enum is its Metal
-// raw value (`MTLPixelFormat`, `MTLTextureType`, `MTLTextureUsage`,
-// `MTLResourceOptions`); `swizzle` packs the four `MTLTextureSwizzle` channels,
-// one byte each, red in the low byte.
-typedef struct {
-  // `MTLPixelFormat`.
-  uint32_t pixel_format;
-  // `MTLTextureType`.
-  uint32_t texture_type;
-  // Pixels a row.
-  uint32_t width;
-  // Rows.
-  uint32_t height;
-  // Slices, for a 3D texture; 1 otherwise.
-  uint32_t depth;
-  // Mip levels.
-  uint32_t mipmap_level_count;
-  // Array elements, for an array texture; 1 otherwise.
-  uint32_t array_length;
-  // Samples a pixel, for a multisample texture; 1 otherwise.
-  uint32_t sample_count;
-  // `MTLTextureUsage`.
-  uint32_t usage;
-  // `MTLResourceOptions`: the storage, cache and hazard-tracking modes.
-  uint32_t options;
-  // The four `MTLTextureSwizzle` channels, one byte each, red lowest.
-  uint32_t swizzle;
-  // Pads to a multiple of 8; 0.
-  uint32_t reserved_2c;
-} RgfxTextureDescriptor;
-
 // `TEXTURE_CREATE`: a texture of shape `desc` at the guest-picked `gpu_address`
 // (device-placed, `heap_obj_id` 0) or at `heap_offset` in `heap_obj_id`, with
 // the guest-picked `resource_id`.
@@ -3737,6 +3808,24 @@ typedef struct {
   // The texture's shape.
   RgfxTextureDescriptor desc;
 } RgfxTextureFromIOSurface;
+
+// `TEXTURE_REPLACE_REGION`: the guest wrote the texels of `size` at `origin` of `level` and
+// `slice` of `Managed` texture `obj_id`'s CPU copy, at their places in its layout
+// ([`RgfxManagedTextureCreate`]).
+typedef struct {
+  // [`RGFX_CMD_TEXTURE_REPLACE_REGION`].
+  RgfxMsgHeader header;
+  // The texture.
+  uint64_t obj_id;
+  // The mip level.
+  uint32_t level;
+  // The slice: the array element, times six plus the face for a cube.
+  uint32_t slice;
+  // The region's origin, x, y and z, in texels.
+  uint32_t origin[3];
+  // The region's width, height and depth, in texels.
+  uint32_t size[3];
+} RgfxTextureReplaceRegion;
 
 // `VBLANK`: the display's host screen refreshed.
 typedef struct {

@@ -468,16 +468,47 @@ memory) — m2v's "take state answers from the created pipeline".
 
 | group | messages | `Platform` call |
 |---|---|---|
-| memory | `HEAP_OVER_HOST_MEMORY`, `HEAP_CREATE`, `BUFFER_CREATE`, `BUFFER_OVER_HOST_MEMORY`, `BUFFER_AT_OFFSET`, `TEXTURE_CREATE`, `TEXTURE_FROM_BUFFER`, `TEXTURE_FROM_IOSURFACE`, `*_DESTROY` | `new_heap_over_host_memory`, `new_heap`, `new_buffer`, `Heap::new_buffer_at_offset`, `new_texture`, `Buffer::new_texture`, drop |
+| memory | `HEAP_OVER_HOST_MEMORY`, `HEAP_CREATE`, `BUFFER_CREATE`, `BUFFER_OVER_HOST_MEMORY`, `BUFFER_AT_OFFSET`, `TEXTURE_CREATE`, `TEXTURE_FROM_BUFFER`, `TEXTURE_FROM_IOSURFACE`, `MANAGED_TEXTURE_CREATE`, `*_DESTROY` | `new_heap_over_host_memory`, `new_heap`, `new_buffer`, `Heap::new_buffer_at_offset`, `new_texture`, `Buffer::new_texture`, drop |
+| Managed ranges | `BUFFER_DID_MODIFY_RANGE`, `TEXTURE_REPLACE_REGION` | `Buffer::did_modify_range`, `Texture::replace_region` |
 | state | `SAMPLER_CREATE`, `DEPTH_STENCIL_CREATE`, `*_DESTROY` | `new_sampler_state`, `new_depth_stencil_state` |
 | shaders | `LIBRARY_LOOKUP` (the content key of the `.metallib`'s AIR slice: a hit binds the library the device made for any process, and no bytes cross), `LIBRARY_CREATE` and `LIBRARY_FROM_REGION` (the slice's bytes forwarded unchanged on a miss, answered once made), `RENDER_PIPELINE_CREATE`, `COMPUTE_PIPELINE_CREATE`, `*_DESTROY` | the device's library cache, `new_library_with_data`, `new_render_pipeline_state`, `new_compute_pipeline_state` |
 | sync | `EVENT_CREATE`, `SHARED_EVENT_CREATE`, `FENCE_CREATE`, `*_DESTROY` | `new_event`, `new_shared_event`, `new_fence` |
 | queue | `QUEUE_CREATE` (priority, region offset, vector), `QUEUE_DESTROY` | `new_command_queue` |
 
 `*_OVER_HOST_MEMORY` map guest region blocks (Shared) and the host builds a
-placement heap/buffer over them. Managed is backed as Shared tonight (one
-coherent copy, allowed by Metal's contract), behind one function so the
-two-copy VRAM form drops in when m2v ships it.
+placement heap/buffer over them.
+
+**Managed storage** (Decided 4). A Managed buffer's or texture's CPU copy is a
+region block of its process's, which the guest maps, and the host decides the
+form from the platform's answer of whether the GPU shares the CPU's memory:
+- **Shared memory:** one copy. The buffer is a no-copy buffer over its block,
+  and a one-level 2D texture of a linear format a texture over its block's
+  Shared buffer; the range messages are checked and do nothing more.
+- **Otherwise:** two copies. The object the command buffers name is the
+  platform's own Managed buffer (at the guest's address) or texture, and the
+  block sits beside it as a Shared buffer.
+  - `BUFFER_DID_MODIFY_RANGE` copies the named range from the block to the
+    platform buffer's host copy, and the platform's `didModifyRange:` copies it
+    to the GPU's before any command of its next submission.
+  - `TEXTURE_REPLACE_REGION` is the platform's `replaceRegion:` from the block,
+    done before the call returns.
+  - Ring 0 is carried out before any later command buffer of the process, on
+    any queue, so a range is ordered before every command buffer committed after
+    it, as Metal promises.
+  - A blit encoder's `synchronizeResource:` and `synchronizeTexture:` become
+    copies of the GPU's copy into the block at that point of the encoder.
+- A buffer comes from `BUFFER_OVER_HOST_MEMORY` with Managed options; a texture
+  from `MANAGED_TEXTURE_CREATE`, which names the block's Shared buffer and the
+  texel block of its format (bytes, width, height). Both sides compute the
+  copy's linear layout from it (`crates/reims-graphics/src/managed.rs`,
+  `guest/bundle/src/RgfxManagedLayout.hpp`): levels in order, then slices,
+  images and rows of blocks, each row rounded up to 256 bytes.
+- In the guest, `replaceRegion:` and `getBytes:` are memcpys of the block, and
+  `replaceRegion:` posts its region; neither waits for the host. A format the
+  layout has no block for (depth, stencil, PVRTC, three-component) keeps no CPU
+  copy.
+- Until the device's identity answers carry `hasUnifiedMemory`, the host takes
+  the two copies on every GPU, which hold Metal's contract on any of them.
 
 **Command buffers** (per-queue submission ring). A `COMMAND_BUFFER` message is
 one command buffer: its `ObjId`, then a byte stream of encoder ops. The decoder

@@ -27,14 +27,24 @@ bool rgfxIsSharedStorage(MTLResourceOptions options)
 	return ((options & MTLResourceStorageModeMask) >> MTLResourceStorageModeShift) ==
 	       MTLStorageModeShared;
 }
+
+/// Whether `options` names Managed storage, whose CPU copy is a region block the host copies
+/// to and from the GPU's (RgfxTexture's managedTextureWithDescriptor, RgfxBuffer's
+/// didModifyRange:).
+bool rgfxIsManagedStorage(MTLResourceOptions options)
+{
+	return ((options & MTLResourceStorageModeMask) >> MTLResourceStorageModeShift) ==
+	       MTLStorageModeManaged;
+}
 } // namespace
 
 @implementation RgfxMetalDevice (Resources)
 
 // --- buffers -----------------------------------------------------------------
 
-// A Shared buffer backed by a region block (the host sees it in place), or nil when
-// the region had no room. `initialBytes` (may be null) seeds the block.
+// A Shared or Managed buffer backed by a region block (the host sees a Shared one in place,
+// and a Managed one's CPU copy there), or nil when the region had no room. `initialBytes`
+// (may be null) seeds the block.
 - (nullable id<MTLBuffer>)rgfxSharedBufferOfLength:(NSUInteger)length
                                           options:(MTLResourceOptions)options
                                       initialBytes:(nullable const void *)initialBytes
@@ -67,15 +77,22 @@ bool rgfxIsSharedStorage(MTLResourceOptions options)
 
 - (id<MTLBuffer>)newBufferWithLength:(NSUInteger)length options:(MTLResourceOptions)options
 {
-	// A Shared buffer lives in the device region so the host sees it in place; any other
-	// storage mode is a device buffer (createBuffer) with its own backing.
-	if (rgfxIsSharedStorage(options) && [self region] != nullptr) {
+	// A Shared buffer lives in the device region so the host sees it in place, and a Managed
+	// one's CPU copy does, which the host copies to the GPU's; any other storage mode is a
+	// device buffer (createBuffer) with its own backing.
+	if ((rgfxIsSharedStorage(options) || rgfxIsManagedStorage(options)) &&
+	    [self region] != nullptr) {
 		id<MTLBuffer> shared = [self rgfxSharedBufferOfLength:length
 		                                             options:options
 		                                        initialBytes:nullptr];
 		if (shared != nil) {
 			return shared;
 		}
+	}
+	// A Managed buffer without a block would be bytes the GPU never sees: none, as Metal
+	// answers a buffer it has no memory for.
+	if (rgfxIsManagedStorage(options)) {
+		return nil;
 	}
 	return [RgfxBuffer bufferWithLength:length
 	                           options:options
@@ -87,13 +104,17 @@ bool rgfxIsSharedStorage(MTLResourceOptions options)
                              length:(NSUInteger)length
                             options:(MTLResourceOptions)options
 {
-	if (rgfxIsSharedStorage(options) && [self region] != nullptr) {
+	if ((rgfxIsSharedStorage(options) || rgfxIsManagedStorage(options)) &&
+	    [self region] != nullptr) {
 		id<MTLBuffer> shared = [self rgfxSharedBufferOfLength:length
 		                                             options:options
 		                                        initialBytes:pointer];
 		if (shared != nil) {
 			return shared;
 		}
+	}
+	if (rgfxIsManagedStorage(options)) {
+		return nil;
 	}
 	RgfxBuffer *buf = [RgfxBuffer bufferWithLength:length
 	                                       options:options
@@ -139,6 +160,18 @@ bool rgfxIsSharedStorage(MTLResourceOptions options)
 
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)descriptor
 {
+	// A Managed texture's CPU copy is a region block; one of a format or shape no CPU copy
+	// holds is made without one.
+	if (descriptor != nil && descriptor.storageMode == MTLStorageModeManaged &&
+	    [self region] != nullptr && [self serializer] != nullptr) {
+		RgfxTexture *managed = [RgfxTexture managedTextureWithDescriptor:descriptor
+		                                                          region:[self region]
+		                                                          device:self
+		                                                      serializer:[self serializer]];
+		if (managed != nil) {
+			return managed;
+		}
+	}
 	return [RgfxTexture textureWithDescriptor:descriptor
 	                                     heap:RGFX_OBJ_NONE
 	                               heapOffset:0

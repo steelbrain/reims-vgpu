@@ -17,6 +17,7 @@
 mod control;
 pub mod device;
 pub mod display;
+pub mod managed;
 pub mod ops;
 pub mod region;
 mod ring;

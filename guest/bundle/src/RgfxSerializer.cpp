@@ -178,6 +178,58 @@ RgfxCreated RgfxSerializer::createTexture(const RgfxTextureDescriptor &desc, Rgf
 	return out;
 }
 
+bool RgfxSerializer::bufferDidModifyRange(RgfxObjId buffer, uint64_t location, uint64_t length)
+{
+	RgfxBufferDidModifyRange msg = {};
+	msg.obj_id = buffer;
+	msg.location = location;
+	msg.length = length;
+	uint64_t seqno = 0;
+	return m_control.tryPost(RGFX_CMD_BUFFER_DID_MODIFY_RANGE, &msg, sizeof(msg), &seqno);
+}
+
+RgfxCreated RgfxSerializer::createManagedTexture(const RgfxTextureDescriptor &desc,
+                                                 RgfxObjId cpu_buffer, uint32_t bytes_per_block,
+                                                 uint32_t block_width, uint32_t block_height,
+                                                 uint32_t flags, uint64_t align)
+{
+	RgfxCreated out = {};
+	out.resource_id = m_ids.allocResourceId();
+	if (out.resource_id == 0)
+		return out;
+	out.obj_id = m_ids.allocObjId();
+	out.gpu_address = m_ids.allocAddress(1, align);
+
+	RgfxManagedTextureCreate msg = {};
+	msg.obj_id = out.obj_id;
+	msg.gpu_address = out.gpu_address;
+	msg.resource_id = out.resource_id;
+	msg.cpu_buffer_obj_id = cpu_buffer;
+	msg.bytes_per_block = bytes_per_block;
+	msg.block_width = block_width;
+	msg.block_height = block_height;
+	msg.flags = flags;
+	msg.desc = desc;
+	out.posted =
+	    m_control.tryPost(RGFX_CMD_MANAGED_TEXTURE_CREATE, &msg, sizeof(msg), &out.seqno);
+	return out;
+}
+
+bool RgfxSerializer::textureReplaceRegion(RgfxObjId texture, uint32_t level, uint32_t slice,
+                                          const uint32_t origin[3], const uint32_t size[3])
+{
+	RgfxTextureReplaceRegion msg = {};
+	msg.obj_id = texture;
+	msg.level = level;
+	msg.slice = slice;
+	for (int i = 0; i < 3; i++) {
+		msg.origin[i] = origin[i];
+		msg.size[i] = size[i];
+	}
+	uint64_t seqno = 0;
+	return m_control.tryPost(RGFX_CMD_TEXTURE_REPLACE_REGION, &msg, sizeof(msg), &seqno);
+}
+
 RgfxCreated RgfxSerializer::createTextureFromBuffer(RgfxObjId buffer, uint64_t offset,
                                                     uint64_t bytes_per_row,
                                                     const RgfxTextureDescriptor &desc)

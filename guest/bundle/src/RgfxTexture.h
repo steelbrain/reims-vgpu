@@ -29,6 +29,7 @@
 #include "reims_graphics_wire.h" // RgfxTextureDescriptor (a typedef, not a tag)
 
 #ifdef __cplusplus
+class RgfxRegion;
 class RgfxSerializer;
 #endif
 
@@ -51,6 +52,18 @@ NS_ASSUME_NONNULL_BEGIN
                                     serializer:(nullable RgfxSerializer *)serializer;
 
 #ifdef __cplusplus
+/// Creates a Managed texture of shape `descriptor` whose CPU copy is a block of `region`, in the
+/// layout RgfxManagedLayout.hpp gives, which the guest maps: `replaceRegion:` writes it and tells
+/// the host the region (RGFX_CMD_TEXTURE_REPLACE_REGION), `getBytes:` reads it, and a blit
+/// encoder's synchronize has the host copy the GPU's copy into it (docs/graphics-kext/design.md,
+/// Decided 4). Serialises the block's Shared buffer and an RGFX_CMD_MANAGED_TEXTURE_CREATE. Nil
+/// for a pixel format or shape no CPU copy holds, or where the region has no room or no resource
+/// id is left: the caller makes the texture without a CPU copy then.
++ (nullable instancetype)managedTextureWithDescriptor:(MTLTextureDescriptor *)descriptor
+                                               region:(RgfxRegion *)region
+                                               device:(nullable id<MTLDevice>)device
+                                           serializer:(RgfxSerializer *)serializer;
+
 /// Designated initialiser: wraps an already-created host texture. `objId`,
 /// `gpuAddress` (0 when heap-placed) and `resourceId` are the guest-picked values
 /// the create returned; `desc` is the mapped shape the getters answer from. The

@@ -49,6 +49,7 @@
 #include <thread>
 
 #include "RgfxCompletionThread.hpp"
+#include "RgfxManagedLayout.hpp"
 #include "RgfxObjectModel.hpp"
 #include "RgfxRetirement.hpp"
 #include "RgfxRegion.hpp"
@@ -2260,6 +2261,203 @@ void test_uncompleted_buffer_releases()
 
 } // namespace
 
+// The layout of a Managed texture's CPU copy, for the cases crates/reims-graphics/src/managed.rs
+// holds too: a 2D RGBA8 texture with three levels, a BC1 one whose sides are no multiple of its
+// blocks, a cube array, and a 3D one; and the blocks of a few formats.
+void test_managed_layout()
+{
+	auto desc = [](uint32_t type, uint32_t w, uint32_t h, uint32_t d, uint32_t levels,
+	               uint32_t array) {
+		RgfxTextureDescriptor t = {};
+		t.pixel_format = 70;
+		t.texture_type = type;
+		t.width = w;
+		t.height = h;
+		t.depth = d;
+		t.mipmap_level_count = levels;
+		t.array_length = array;
+		t.sample_count = 1;
+		return t;
+	};
+	auto level = [](const RgfxManagedLayout &l, uint32_t i, uint64_t offset, uint64_t row,
+	                uint64_t image, uint64_t slice) {
+		const RgfxManagedLevel &lv = l.level(i);
+		return lv.offset == offset && lv.bytesPerRow == row && lv.bytesPerImage == image &&
+		       lv.bytesPerSlice == slice;
+	};
+	RgfxFormatBlock rgba = {}, bc1 = {}, astc = {}, none = {};
+	CHECK(rgfxPixelFormatBlock(MTLPixelFormatRGBA8Unorm, &rgba) && rgba.bytes == 4 &&
+	      rgba.width == 1 && rgba.linear);
+	CHECK(rgfxPixelFormatBlock(MTLPixelFormatBC1_RGBA, &bc1) && bc1.bytes == 8 &&
+	      bc1.width == 4 && bc1.height == 4 && !bc1.linear);
+	CHECK(rgfxPixelFormatBlock(MTLPixelFormatASTC_10x8_LDR, &astc) && astc.bytes == 16 &&
+	      astc.width == 10 && astc.height == 8);
+	CHECK(!rgfxPixelFormatBlock(MTLPixelFormatDepth32Float, &none));
+	CHECK(!rgfxPixelFormatBlock(191, &none));
+
+	RgfxManagedLayout l;
+	CHECK(l.init(desc(2, 100, 60, 1, 3, 1), rgba));
+	CHECK(level(l, 0, 0, 512, 30720, 30720) && level(l, 1, 30720, 256, 7680, 7680) &&
+	      level(l, 2, 38400, 256, 3840, 3840));
+	CHECK(l.size() == 42240 && l.slices() == 1);
+	CHECK(l.init(desc(2, 30, 30, 1, 2, 1), bc1));
+	CHECK(level(l, 0, 0, 256, 2048, 2048) && level(l, 1, 2048, 256, 1024, 1024));
+	uint64_t at = 0;
+	const uint64_t bcOrigin[3] = {4, 8, 0}, bcSize[3] = {26, 22, 1}, offBlock[3] = {2, 0, 0};
+	CHECK(l.region(0, 0, bcOrigin, bcSize, &at) && at == 512 + 8);
+	CHECK(!l.region(0, 0, offBlock, bcSize, &at));
+	CHECK(l.init(desc(6, 16, 16, 1, 2, 2), rgba));
+	CHECK(l.slices() == 12 && level(l, 0, 0, 256, 4096, 4096) &&
+	      level(l, 1, 49152, 256, 2048, 2048) && l.size() == 49152 + 12 * 2048);
+	const uint64_t o[3] = {2, 1, 0}, sz[3] = {4, 3, 1};
+	CHECK(l.region(1, 3, o, sz, &at) && at == 49152 + 3 * 2048 + 256 + 8);
+	CHECK(!l.region(1, 12, o, sz, &at) && !l.region(2, 0, o, sz, &at));
+	CHECK(l.init(desc(7, 8, 8, 4, 2, 1), rgba));
+	CHECK(level(l, 0, 0, 256, 2048, 8192) && level(l, 1, 8192, 256, 1024, 2048));
+	CHECK(l.init(desc(2, 8, 8, 4, 1, 1), rgba) && l.size() == 2048);
+	CHECK(!l.init(desc(2, 8, 8, 1, 5, 1), rgba)); // more levels than 8 halves to
+	CHECK(!l.init(desc(2, 0, 8, 1, 1, 1), rgba));
+}
+
+// A Managed buffer's contents are a region block: didModifyRange: tells the host the range
+// (BUFFER_DID_MODIFY_RANGE) and a Shared buffer's posts nothing.
+void test_managed_buffer_range()
+{
+	Fixture fx;
+	std::vector<uint8_t> mem(0x800000, 0);
+	RgfxRegion region(mem.data(), mem.size());
+	RgfxRegion::Block block = region.allocate(0x1000);
+	CHECK(block.ok);
+	const MTLResourceOptions managed = MTLResourceStorageModeManaged;
+	RgfxBuffer *buf = [RgfxBuffer
+	    bufferOverHostMemoryWithContents:const_cast<uint8_t *>(block.ptr)
+	                        regionOffset:block.offset
+	                              length:0x1000
+	                             options:managed
+	                         deallocator:nil
+	                              device:nil
+	                          serializer:&fx.ser];
+	CHECK(buf != nil && [buf contents] == block.ptr);
+	auto create =
+	    expectMessage<RgfxBufferOverHostMemory>(fx.ring, RGFX_CMD_BUFFER_OVER_HOST_MEMORY);
+	CHECK(create.options == static_cast<uint32_t>(managed));
+	CHECK(create.region_offset == block.offset);
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+	[buf didModifyRange:NSMakeRange(0x40, 0x20)];
+	[buf didModifyRange:NSMakeRange(0x40, 0)];
+#pragma clang diagnostic pop
+	auto range =
+	    expectMessage<RgfxBufferDidModifyRange>(fx.ring, RGFX_CMD_BUFFER_DID_MODIFY_RANGE);
+	CHECK(range.obj_id == buf.rgfxObjId && range.location == 0x40 && range.length == 0x20);
+	RgfxMsgHeader extra = {};
+	std::vector<uint8_t> extraBytes;
+	CHECK(!fx.ring.next(&extra, &extraBytes)); // an empty range posts nothing
+
+	RgfxBuffer *shared = [RgfxBuffer
+	    bufferOverHostMemoryWithContents:const_cast<uint8_t *>(block.ptr)
+	                        regionOffset:block.offset
+	                              length:0x1000
+	                             options:MTLResourceStorageModeShared
+	                         deallocator:nil
+	                              device:nil
+	                          serializer:&fx.ser];
+	expectMessage<RgfxBufferOverHostMemory>(fx.ring, RGFX_CMD_BUFFER_OVER_HOST_MEMORY);
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+	[shared didModifyRange:NSMakeRange(0, 0x10)];
+#pragma clang diagnostic pop
+	CHECK(!fx.ring.next(&extra, &extraBytes));
+}
+
+// A Managed texture's CPU copy is a block of the region, made over a Shared buffer and named by
+// its MANAGED_TEXTURE_CREATE: replaceRegion: writes it at the layout's rows and posts the region
+// (TEXTURE_REPLACE_REGION); getBytes: reads it back with no message; a region past the level
+// writes nothing and posts nothing. A format no CPU copy holds makes no Managed texture.
+void test_managed_texture_cpu_copy()
+{
+	Fixture fx;
+	std::vector<uint8_t> mem(0x800000, 0xff); // pre-dirtied, as BAR memory
+	RgfxRegion region(mem.data(), mem.size());
+	@autoreleasepool {
+		MTLTextureDescriptor *desc =
+		    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+		                                                       width:100
+		                                                      height:60
+		                                                   mipmapped:YES];
+		desc.mipmapLevelCount = 3;
+		desc.storageMode = MTLStorageModeManaged;
+		RgfxTexture *tex = [RgfxTexture managedTextureWithDescriptor:desc
+		                                                      region:&region
+		                                                      device:nil
+		                                                  serializer:&fx.ser];
+		CHECK(tex != nil);
+		CHECK([tex storageMode] == MTLStorageModeManaged);
+		auto cpu =
+		    expectMessage<RgfxBufferOverHostMemory>(fx.ring, RGFX_CMD_BUFFER_OVER_HOST_MEMORY);
+		CHECK(cpu.length == 42240 && cpu.options == MTLResourceStorageModeShared);
+		auto create = expectMessage<RgfxManagedTextureCreate>(fx.ring,
+		                                                      RGFX_CMD_MANAGED_TEXTURE_CREATE);
+		CHECK(create.obj_id == tex.rgfxObjId && create.cpu_buffer_obj_id == cpu.obj_id);
+		CHECK(create.resource_id == [tex gpuResourceID]._impl && create.gpu_address != 0);
+		CHECK(create.bytes_per_block == 4 && create.block_width == 1 &&
+		      create.block_height == 1 && create.flags == RGFX_MANAGED_TEXTURE_LINEAR);
+		CHECK(create.desc.mipmap_level_count == 3 &&
+		      create.desc.options == static_cast<uint32_t>(desc.resourceOptions));
+		uint8_t *copy = mem.data() + cpu.region_offset;
+		CHECK(copy[0] == 0 && copy[42239] == 0); // a new Managed texture reads zero
+
+		// Level 1, a 4x3 region at (2, 1): its rows at the layout's 256-byte pitch.
+		uint8_t pixels[3][16];
+		for (int r = 0; r < 3; r++)
+			for (int i = 0; i < 16; i++)
+				pixels[r][i] = static_cast<uint8_t>(r * 16 + i + 1);
+		[tex replaceRegion:MTLRegionMake2D(2, 1, 4, 3)
+		       mipmapLevel:1
+		         withBytes:pixels
+		       bytesPerRow:16];
+		for (int r = 0; r < 3; r++)
+			CHECK(std::memcmp(copy + 30720 + (1 + r) * 256 + 8, pixels[r], 16) == 0);
+		CHECK(copy[30720 + 256 + 7] == 0 && copy[30720 + 256 + 24] == 0);
+		auto replaced = expectMessage<RgfxTextureReplaceRegion>(fx.ring,
+		                                                        RGFX_CMD_TEXTURE_REPLACE_REGION);
+		CHECK(replaced.obj_id == tex.rgfxObjId && replaced.level == 1 && replaced.slice == 0);
+		CHECK(replaced.origin[0] == 2 && replaced.origin[1] == 1 && replaced.origin[2] == 0);
+		CHECK(replaced.size[0] == 4 && replaced.size[1] == 3 && replaced.size[2] == 1);
+
+		// getBytes: reads the copy, here as the GPU's synchronize would have left it.
+		copy[30720 + 2 * 256 + 16] = 0xab;
+		uint8_t back[2][8] = {};
+		[tex getBytes:back bytesPerRow:8 fromRegion:MTLRegionMake2D(3, 1, 2, 2) mipmapLevel:1];
+		CHECK(back[0][0] == pixels[0][4] && back[1][0] == pixels[1][4] && back[1][4] == 0xab);
+		RgfxMsgHeader extra = {};
+		std::vector<uint8_t> extraBytes;
+		CHECK(!fx.ring.next(&extra, &extraBytes)); // getBytes: posts nothing
+
+		// A region past the level writes nothing and posts nothing.
+		const uint8_t before = copy[30720 + 49 * 4];
+		[tex replaceRegion:MTLRegionMake2D(49, 0, 2, 1)
+		       mipmapLevel:1
+		         withBytes:pixels
+		       bytesPerRow:16];
+		CHECK(copy[30720 + 49 * 4] == before);
+		CHECK(!fx.ring.next(&extra, &extraBytes));
+
+		// A depth texture keeps no CPU copy.
+		MTLTextureDescriptor *depth =
+		    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float
+		                                                       width:64
+		                                                      height:64
+		                                                   mipmapped:NO];
+		depth.storageMode = MTLStorageModeManaged;
+		CHECK([RgfxTexture managedTextureWithDescriptor:depth
+		                                         region:&region
+		                                         device:nil
+		                                     serializer:&fx.ser] == nil);
+		CHECK(!fx.ring.next(&extra, &extraBytes));
+	}
+}
+
 int main()
 {
 	@autoreleasepool {
@@ -2297,6 +2495,9 @@ int main()
 		test_command_buffer_back_pressure();
 		test_retirement();
 		test_texture_destroy_waits_for_buffers();
+		test_managed_layout();
+		test_managed_buffer_range();
+		test_managed_texture_cpu_copy();
 	}
 	std::printf("shell_tests: OK (%d checks)\n", g_checks);
 	return 0;

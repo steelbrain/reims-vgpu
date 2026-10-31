@@ -143,13 +143,17 @@
 
 - (void)didModifyRange:(NSRange)range
 {
-	// Managed-buffer flush: push the CPU-written bytes in `range` to the GPU. A
-	// Shared buffer over coherent region memory (what slice 0 uses) needs no
-	// flush — the host already sees the bytes — so this is a no-op here. The sync
-	// slice wires it to a host-visible flush op if/when a Managed buffer over
-	// non-coherent memory lands, routing through the serialiser like every other
-	// mutating call.
-	(void)range;
+	// A Managed buffer's contents are its CPU copy, a region block: the host copies the range
+	// to the GPU's copy before any command buffer committed after this, on any queue
+	// (RGFX_CMD_BUFFER_DID_MODIFY_RANGE). A Shared or Private buffer has nothing to tell, as
+	// Metal does nothing for one.
+	const MTLStorageMode storage = static_cast<MTLStorageMode>(
+	    (_options & MTLResourceStorageModeMask) >> MTLResourceStorageModeShift);
+	if (storage != MTLStorageModeManaged || _ownsContents || _serializer == nullptr ||
+	    range.length == 0) {
+		return;
+	}
+	_serializer->bufferDidModifyRange([self rgfxObjId], range.location, range.length);
 }
 
 @end

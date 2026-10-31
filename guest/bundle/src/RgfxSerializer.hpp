@@ -156,6 +156,11 @@ public:
 	RgfxCreated createBufferAtOffset(RgfxObjId heap, uint64_t offset, uint64_t length,
 	                                 uint32_t options);
 
+	/// The process wrote `length` bytes at `location` of Managed buffer `buffer`'s CPU copy
+	/// (`didModifyRange:`): every command buffer committed after it sees them. False where the
+	/// message was not posted.
+	bool bufferDidModifyRange(RgfxObjId buffer, uint64_t location, uint64_t length);
+
 	// --- textures -------------------------------------------------------------
 
 	/// Gives a texture's resource id back as the texture goes (RgfxIdSpace::freeResourceId).
@@ -166,6 +171,21 @@ public:
 	/// in `heap`. A resource id is picked either way.
 	RgfxCreated createTexture(const RgfxTextureDescriptor &desc, RgfxObjId heap = RGFX_OBJ_NONE,
 	                          uint64_t heap_offset = 0, uint64_t align = kDefaultAddressAlign);
+
+	/// A Managed texture of shape `desc` at a picked GPU address, whose CPU copy is the Shared
+	/// buffer `cpu_buffer` over a block, of blocks `bytes_per_block` bytes and `block_width` by
+	/// `block_height` texels (RgfxManagedLayout.hpp), `flags` RGFX_MANAGED_TEXTURE_LINEAR or 0. A
+	/// resource id is picked.
+	RgfxCreated createManagedTexture(const RgfxTextureDescriptor &desc, RgfxObjId cpu_buffer,
+	                                 uint32_t bytes_per_block, uint32_t block_width,
+	                                 uint32_t block_height, uint32_t flags,
+	                                 uint64_t align = kDefaultAddressAlign);
+
+	/// The process wrote the texels of `size` at `origin` of `level` and `slice` of Managed
+	/// texture `texture`'s CPU copy (`replaceRegion:`): every command buffer committed after it
+	/// sees them. False where the message was not posted.
+	bool textureReplaceRegion(RgfxObjId texture, uint32_t level, uint32_t slice,
+	                          const uint32_t origin[3], const uint32_t size[3]);
 
 	/// A texture of shape `desc` over the buffer `buffer` from `offset`, each row
 	/// `bytes_per_row` apart. A resource id is picked.

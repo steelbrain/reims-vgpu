@@ -151,11 +151,12 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                 RGFX_DEVICE_INFO_OFFSET,
                 device_info(&gpu_device.caps()).as_bytes(),
             );
+            let mut decoder = GraphicsDecoder::new(Arc::clone(&platform), Arc::clone(&region));
+            // `Managed` resources are two copies, which hold Metal's contract on any GPU, until
+            // the device's identity answers carry the platform's `hasUnifiedMemory`.
+            decoder.set_unified_memory(false);
             let control = Arc::new(GraphicsControl {
-                decoder: Mutex::new(GraphicsDecoder::new(
-                    Arc::clone(&platform),
-                    Arc::clone(&region),
-                )),
+                decoder: Mutex::new(decoder),
                 device: gpu_device,
                 presented: Arc::new(Presented::default()),
                 pool: CompilePool::new(),
