@@ -30,8 +30,10 @@
 #import "RgfxCommandObjects.h"
 #import "RgfxIOSurface.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstring>
+#include <mach/mach_time.h>
 #include <vector>
 
 #include "RgfxCompletionThread.hpp"
@@ -43,6 +45,35 @@
 #include "RgfxRingWriter.hpp"
 #include "RgfxSerializer.hpp"
 #include "reims_graphics_wire.h"
+
+namespace {
+
+// The guest's host time in seconds, the clock CACurrentMediaTime reads (mach_absolute_time).
+CFTimeInterval rgfxHostTime()
+{
+	static mach_timebase_info_data_t timebase = [] {
+		mach_timebase_info_data_t t = {};
+		mach_timebase_info(&t);
+		return t;
+	}();
+	return static_cast<CFTimeInterval>(mach_absolute_time()) * timebase.numer / timebase.denom /
+	       1e9;
+}
+
+} // namespace
+
+// The logs of a command buffer: none, as the device runs no shader that logs.
+@interface RgfxLogContainer : NSObject <MTLLogContainer>
+@end
+
+@implementation RgfxLogContainer
+- (NSUInteger)countByEnumeratingWithState:(NSFastEnumerationState *)state
+                                  objects:(id __unsafe_unretained _Nullable[_Nonnull])buffer
+                                    count:(NSUInteger)len
+{
+	return 0;
+}
+@end
 
 namespace {
 
@@ -326,9 +357,12 @@ uint32_t fillRenderPass(MTLRenderPassDescriptor *d, RgfxRenderPassDesc *desc,
 
 - (nullable id<MTLCommandBuffer>)commandBufferWithDescriptor:(MTLCommandBufferDescriptor *)descriptor
 {
-	BOOL retained = descriptor == nil ||
-	                descriptor.retainedReferences; // MTLCommandBufferErrorOption is diagnostics
-	return [self rgfxCommandBufferRetained:retained];
+	BOOL retained = descriptor == nil || descriptor.retainedReferences;
+	RgfxCmdBuffer *cb = [self rgfxCommandBufferRetained:retained];
+	// The error options are diagnostics: kept for the buffer to answer, they change nothing.
+	if (descriptor != nil)
+		[cb rgfxSetErrorOptions:descriptor.errorOptions];
+	return cb;
 }
 
 - (RgfxCmdBuffer *)rgfxCommandBufferRetained:(BOOL)retained
@@ -468,6 +502,15 @@ uint32_t fillRenderPass(MTLRenderPassDescriptor *d, RgfxRenderPassDesc *desc,
 	NSString *_cbLabel;
 	// What the client asked of the buffer's content protection (setProtectionOptions:).
 	uint64_t _protectionOptions;
+	// The error options its descriptor asked for (commandBufferWithDescriptor:).
+	MTLCommandBufferErrorOption _errorOptions;
+	// Its times, in the guest's host time (rgfxHostTime), 0 until known: the CPU's
+	// scheduling from commit until the buffer is posted to the device, and the GPU's run
+	// (rgfxDeliverCompletion:). Each is written once, before the status that makes it known.
+	std::atomic<CFTimeInterval> _kernelStart;
+	std::atomic<CFTimeInterval> _kernelEnd;
+	std::atomic<CFTimeInterval> _gpuStart;
+	std::atomic<CFTimeInterval> _gpuEnd;
 	NSError *_cbError;
 	NSMutableArray *_completedHandlers;
 	NSMutableArray *_scheduledHandlers;
@@ -618,6 +661,7 @@ uint32_t fillRenderPass(MTLRenderPassDescriptor *d, RgfxRenderPassDesc *desc,
 		return; // commit is once
 	}
 	_committed = YES;
+	_kernelStart.store(rgfxHostTime());
 	// The IOSurface copies the CPU changed since they last synced take the surfaces'
 	// pages before the GPU reads them; the copies this buffer writes go back at its
 	// completion.
@@ -675,6 +719,9 @@ uint32_t fillRenderPass(MTLRenderPassDescriptor *d, RgfxRenderPassDesc *desc,
 			                                  expect);
 		}
 	}
+	// The CPU's part ends here, posted or not; the completion may already have come.
+	CFTimeInterval unset = 0;
+	_kernelEnd.compare_exchange_strong(unset, rgfxHostTime());
 	if (!posted) {
 		// No block for it: the buffer fails as Metal's does when memory runs out, and its
 		// handlers run off the committing thread.
@@ -715,6 +762,7 @@ uint32_t fillRenderPass(MTLRenderPassDescriptor *d, RgfxRenderPassDesc *desc,
 	// The queue's slot goes back before the handlers run, so one that makes the next buffer
 	// does not wait for its own.
 	[self rgfxGiveSlotBack];
+	[self rgfxNoteGPUTimes:msg];
 	if (msg->status == RGFX_CB_OK) {
 		_status.store(MTLCommandBufferStatusCompleted);
 	} else {
@@ -740,6 +788,25 @@ uint32_t fillRenderPass(MTLRenderPassDescriptor *d, RgfxRenderPassDesc *desc,
 	// may still name them.
 	if (uint64_t ticket = _ticket.exchange(0))
 		RgfxRetirement::process().end(ticket);
+}
+
+// The GPU's times, in the guest's host time. The device's clock is the host's, not the
+// guest's, so the guest's own time anchors them: the run ends when the completion is
+// delivered (later than the GPU finished by the delivery's latency), and starts the run's
+// length as the device measured it (gpu_end_ns - gpu_start_ns) before that, never before the
+// CPU posted the buffer. With no length known (a failed buffer), the run starts as it ends.
+- (void)rgfxNoteGPUTimes:(const RgfxCbComplete *)msg
+{
+	CFTimeInterval end = rgfxHostTime();
+	CFTimeInterval unset = 0;
+	_kernelEnd.compare_exchange_strong(unset, end);
+	CFTimeInterval start = end;
+	if (msg->gpu_start_ns != 0 && msg->gpu_end_ns >= msg->gpu_start_ns) {
+		start = end - static_cast<CFTimeInterval>(msg->gpu_end_ns - msg->gpu_start_ns) / 1e9;
+		start = std::max(start, _kernelEnd.load());
+	}
+	_gpuStart.store(start);
+	_gpuEnd.store(end);
 }
 
 - (BOOL)rgfxFinished
@@ -870,6 +937,35 @@ uint32_t fillRenderPass(MTLRenderPassDescriptor *d, RgfxRenderPassDesc *desc,
 - (NSError *)error
 {
 	return _cbError;
+}
+- (MTLCommandBufferErrorOption)errorOptions
+{
+	return _errorOptions;
+}
+- (void)rgfxSetErrorOptions:(MTLCommandBufferErrorOption)options
+{
+	_errorOptions = options;
+}
+- (id<MTLLogContainer>)logs
+{
+	return [[RgfxLogContainer alloc] init];
+}
+// The times (rgfxNoteGPUTimes:), 0 until the buffer has them.
+- (CFTimeInterval)kernelStartTime
+{
+	return _kernelStart.load();
+}
+- (CFTimeInterval)kernelEndTime
+{
+	return _kernelEnd.load();
+}
+- (CFTimeInterval)GPUStartTime
+{
+	return _gpuStart.load();
+}
+- (CFTimeInterval)GPUEndTime
+{
+	return _gpuEnd.load();
 }
 - (NSString *)label
 {

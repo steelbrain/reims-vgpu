@@ -1413,8 +1413,13 @@ void test_reply_reader_completion()
 		fired++;
 		handlerGot = done;
 	}];
+	// No time is known before the commit, and the GPU's none before the completion.
+	CHECK(cb.kernelStartTime == 0 && cb.kernelEndTime == 0);
+	CHECK(cb.GPUStartTime == 0 && cb.GPUEndTime == 0);
 	[cb commit];
 	CHECK(cb.status == MTLCommandBufferStatusCommitted);
+	CHECK(cb.kernelStartTime > 0 && cb.kernelEndTime >= cb.kernelStartTime);
+	CHECK(cb.GPUStartTime == 0 && cb.GPUEndTime == 0);
 
 	// Read the submission seqno the host's completion must carry.
 	RgfxMsgHeader submitHdr = {};
@@ -1434,12 +1439,19 @@ void test_reply_reader_completion()
 	done.header.seqno = seqno;
 	done.cb_obj_id = cbObjId;
 	done.status = RGFX_CB_OK;
+	// A 2 ms run on the device's clock.
+	done.gpu_start_ns = 5'000'000'000;
+	done.gpu_end_ns = 5'002'000'000;
 	CHECK(completion.postFromHost(&done, sizeof(done)));
 	CHECK(reader.pump() == 1);
 	CHECK(fired == 1);
 	CHECK(handlerGot == cb);
 	CHECK(cb.status == MTLCommandBufferStatusCompleted);
 	CHECK(cb.error == nil);
+	// The run ends at the delivery, in the guest's time, and lasts what the device measured,
+	// starting no earlier than the CPU posted the buffer.
+	CHECK(cb.GPUEndTime >= cb.GPUStartTime && cb.GPUStartTime >= cb.kernelEndTime);
+	CHECK(cb.GPUEndTime - cb.GPUStartTime <= 0.002 + 1e-9);
 	CHECK(!reader.awaitingCompletion(seqno)); // the one-shot was removed
 
 	// --- an error completion on a second buffer, waited on ---
@@ -1463,6 +1475,21 @@ void test_reply_reader_completion()
 	CHECK(cb2.status == MTLCommandBufferStatusError);
 	CHECK(cb2.error != nil);
 	CHECK(cb2.error.code == 2);
+	// No run length known: the run starts as it ends.
+	CHECK(cb2.GPUEndTime > 0 && cb2.GPUStartTime == cb2.GPUEndTime);
+
+	// A descriptor's error options are kept for the buffer to answer, and no buffer has logs.
+	MTLCommandBufferDescriptor *desc = [[MTLCommandBufferDescriptor alloc] init];
+	desc.errorOptions = MTLCommandBufferErrorOptionEncoderExecutionStatus;
+	id<MTLCommandBuffer> cb3 = [queue commandBufferWithDescriptor:desc];
+	CHECK(cb3.errorOptions == MTLCommandBufferErrorOptionEncoderExecutionStatus);
+	CHECK(cb.errorOptions == MTLCommandBufferErrorOptionNone);
+	NSUInteger logs = 0;
+	for (id log in cb3.logs) {
+		(void)log;
+		logs++;
+	}
+	CHECK(logs == 0);
 }
 
 // A host pipeline reflection the reader dispatches fills the pipeline-state wrapper, so

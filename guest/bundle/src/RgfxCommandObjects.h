@@ -159,6 +159,9 @@ NS_ASSUME_NONNULL_BEGIN
                        device:(nullable id<MTLDevice>)device
                    serializer:(nullable RgfxSerializer *)serializer NS_UNAVAILABLE;
 
+/// The error options the buffer's descriptor asked for (errorOptions answers them).
+- (void)rgfxSetErrorOptions:(MTLCommandBufferErrorOption)options;
+
 @end
 
 // --- the encoders ------------------------------------------------------------
