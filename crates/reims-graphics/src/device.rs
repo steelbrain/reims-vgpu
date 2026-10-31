@@ -17,8 +17,10 @@
 //! `reims-vgpu.graphics-refresh` runs at the display's refresh rate
 //! ([`Screen::mode`]): at each refresh it asks the host whether the guest wrote the scanout
 //! ([`Host::scanout_written`]) and has the screen show it where it did, sends `VBLANK` while the
-//! guest has it on (dropping one the completion ring has no room for), and sends
-//! `DISPLAY_CHANGED` once the display's mode is not the one the guest was last told.
+//! guest has it on (dropping one the completion ring has no room for), sends
+//! `DISPLAY_CHANGED` once the display's mode is not the one the guest was last told, and then
+//! tells the host of the refresh ([`Host::refreshed`]), which answers there the presents the
+//! display first shows at it.
 //!
 //! **Per-queue rings.** A `QUEUE_CREATE` on ring 0, where its ring parameters are valid, makes the
 //! queue's own submission+completion ring pair at the guest-given region offsets and starts a
@@ -161,6 +163,12 @@ pub trait Host: Send + Sync + 'static {
     fn stage3_message(&self, completion: &CompletionPoster, message: &[u8]) {
         let _ = (completion, message);
     }
+
+    /// A refresh of display 0, on the refresh thread, after its `VBLANK` (while the guest has
+    /// them on): the vblank at which the presents the window has shown since the last one are
+    /// first on the display, which the host answers here ([`Host::present_surface`]). The default
+    /// does nothing.
+    fn refreshed(&self) {}
 
     /// Shows the IOSurface of global ID `iosurface_id` on display 0 in place of the scanout
     /// (`PRESENT_SURFACE`; 0 shows the scanout again), on the control thread, and gives `answer`
@@ -1234,6 +1242,7 @@ impl Shared {
                 self.display.lock().changed = false;
             }
         }
+        self.host.refreshed();
     }
 }
 

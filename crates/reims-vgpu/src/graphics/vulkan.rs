@@ -97,12 +97,14 @@ impl Presenter for ScanoutPresenter {
             let Some(texture) = self.swapchain.texture(frame) else {
                 return Drawn::Nothing;
             };
-            let Some(command_buffer) = self.draw.encode(texture, region) else {
+            let Some((command_buffer, presents)) = self.draw.encode(texture, region) else {
                 return Drawn::Nothing;
             };
+            // A draw dropped here answers its presents at the next refresh.
             if !self.swapchain.encode_ready(frame, &command_buffer) {
                 return Drawn::Nothing;
             }
+            presents.after(&command_buffer);
             no_catch(command_buffer.commit(OnFault::Die));
             self.swapchain.present(frame, command_buffer);
             Drawn::Presented

@@ -54,6 +54,7 @@ struct TestHost {
     written: Arc<AtomicBool>,
     asked: Arc<Mutex<Vec<(u64, u64)>>>,
     presented: Arc<Mutex<Vec<u32>>>,
+    refreshes: Arc<AtomicU32>,
 }
 
 /// The one IOSurface the test host holds a texture over.
@@ -67,6 +68,9 @@ impl Host for TestHost {
     fn scanout_written(&self, offset: u64, length: u64) -> bool {
         self.asked.lock().push((offset, length));
         self.written.load(Ordering::SeqCst)
+    }
+    fn refreshed(&self) {
+        self.refreshes.fetch_add(1, Ordering::SeqCst);
     }
     fn present_surface(&self, iosurface_id: u32, answer: PresentAnswer) {
         self.presented.lock().push(iosurface_id);
@@ -87,6 +91,8 @@ struct Rig {
     written: Arc<AtomicBool>,
     asked: Arc<Mutex<Vec<(u64, u64)>>>,
     presented: Arc<Mutex<Vec<u32>>>,
+    /// The refreshes the host was told of.
+    refreshes: Arc<AtomicU32>,
     /// The guest's count of the submission ring.
     produced: u64,
     /// The guest's count of the completion ring.
@@ -106,17 +112,20 @@ impl Rig {
         let written = Arc::new(AtomicBool::new(false));
         let asked = Arc::new(Mutex::new(Vec::new()));
         let presented = Arc::new(Mutex::new(Vec::new()));
+        let refreshes = Arc::new(AtomicU32::new(0));
         let host = TestHost {
             interrupts: Arc::clone(&interrupts),
             written: Arc::clone(&written),
             asked: Arc::clone(&asked),
             presented: Arc::clone(&presented),
+            refreshes: Arc::clone(&refreshes),
         };
         let mut rig = Rig::with_host(Box::new(host));
         rig.interrupts = interrupts;
         rig.written = written;
         rig.asked = asked;
         rig.presented = presented;
+        rig.refreshes = refreshes;
         rig
     }
 
@@ -146,6 +155,7 @@ impl Rig {
             written,
             asked,
             presented,
+            refreshes: Arc::new(AtomicU32::new(0)),
             produced: 0,
             consumed: 0,
             seqno: 0,
@@ -524,7 +534,8 @@ fn unknown_and_short_commands_are_answered() {
 }
 
 /// A refresh shows the scanout where the host's log says the guest wrote it, asking for the
-/// scanout's range; `VBLANK` carries the refresh count while it is on
+/// scanout's range; `VBLANK` carries the refresh count while it is on; the host is told of each
+/// refresh
 #[test]
 fn a_refresh_presents_written_pixels_and_sends_vblank() {
     let mut rig = Rig::new();
@@ -536,6 +547,7 @@ fn a_refresh_presents_written_pixels_and_sends_vblank() {
     rig.refresh();
     assert_eq!(rig.told(), []);
     assert_eq!(*rig.asked.lock(), [(alloc, 128 * 3 + 64)]);
+    assert_eq!(rig.refreshes.load(Ordering::SeqCst), 1);
     rig.written.store(true, Ordering::SeqCst);
     rig.refresh();
     assert_eq!(rig.told(), [Told::Present]);
@@ -553,6 +565,7 @@ fn a_refresh_presents_written_pixels_and_sends_vblank() {
     rig.complete();
     rig.refresh();
     assert!(rig.event().is_none());
+    assert_eq!(rig.refreshes.load(Ordering::SeqCst), 4);
 }
 
 /// Once the guest has been told the display's mode, a change of the screen's mode is told

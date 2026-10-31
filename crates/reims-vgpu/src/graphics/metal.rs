@@ -57,13 +57,14 @@ impl FrameSink for MetalScanoutSink {
             let texture: <MetalPlatform as Platform>::Texture =
                 Obj::from_retained(msg::get("texture", || drawable.texture()));
             self.draw.drawn((texture.width(), texture.height()));
-            let Some(command_buffer) = self.draw.encode(&texture, region) else {
+            let Some((command_buffer, presents)) = self.draw.encode(&texture, region) else {
                 return false;
             };
             let drawable: &ProtocolObject<dyn MTLDrawable> = ProtocolObject::from_ref(drawable);
             msg::get("presentDrawable:", || {
                 command_buffer.get().presentDrawable(drawable);
             });
+            presents.after(&command_buffer);
             no_catch(command_buffer.commit(OnFault::Die));
             true
         })

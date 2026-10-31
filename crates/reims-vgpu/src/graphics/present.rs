@@ -16,12 +16,26 @@
 //! present never overtakes one made before it. A failed buffer finishes as a completed one does
 //! (its `CB_COMPLETE` carries the failure). A queue's destroy, or its context's close, drops what
 //! the presents wait for of it: no buffer of it will finish.
+//!
+//! [`PresentAnswers`]: when a shown present is answered. The guest's display pipe completes a
+//! transaction on its answer, and holds at most two unanswered (the kext's `RgfxDisplayPipe`),
+//! so the answer says the frame is on the display, as a display's flip completes at the vblank
+//! that latches it: it is given at the first refresh of the device's display (the refresh thread,
+//! [`reims_graphics::Host::refreshed`], after that refresh's `VBLANK`) once the window's draw of
+//! it has finished on the host's GPU, the copy out of the surface done, so the guest may draw
+//! into the surface again. A draw the window drops before its commit, or one that shows the
+//! scanout in place of a surface it cannot draw, answers its presents at the next refresh too.
+//! A present the window has not drawn by the second refresh after it was shown (the window is
+//! hidden, or takes no drawable) is answered there: the device's display shows it whether or not
+//! the host's window does, and the guest's compositor must not wait on the window. A guest that
+//! presents once a vblank so never meets its limit of two: a frame drawn as it is made is
+//! answered at the next vblank, and one the window does not draw at the second.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use reims_graphics::PresentAnswer;
-use reims_graphics::wire::{RGFX_CONTEXT_OBJ_ID_SHIFT, RgfxSurfaceWriter};
+use reims_graphics::wire::{RGFX_CONTEXT_OBJ_ID_SHIFT, RGFX_STATUS_OK, RgfxSurfaceWriter};
 use reims_vgpu_core::platform::Platform;
 use reims_vgpu_core::sync::Mutex;
 
@@ -139,5 +153,211 @@ impl<P: Platform> PresentQueue<P> {
     #[cfg(test)]
     pub(crate) fn waiting(&self) -> usize {
         self.state.lock().waiting.len()
+    }
+}
+
+/// A present's answer, given once with [`RGFX_STATUS_OK`].
+pub(crate) trait Answer: Send {
+    /// Gives the answer.
+    fn answer_ok(self);
+}
+
+impl Answer for PresentAnswer {
+    fn answer_ok(self) {
+        self.answer(RGFX_STATUS_OK);
+    }
+}
+
+/// When shown presents are answered (the module doc).
+pub(crate) struct PresentAnswers<A> {
+    state: Mutex<AnswersState<A>>,
+}
+
+/// [`PresentAnswers`]' state.
+struct AnswersState<A> {
+    /// The device's refreshes so far.
+    refreshes: u64,
+    /// The presents shown that the window has not drawn, each with the refresh count at its show.
+    undrawn: Vec<(A, u64)>,
+    /// The presents whose draw has finished, or will not come: answered at the next refresh.
+    due: Vec<A>,
+}
+
+impl<A> Default for PresentAnswers<A> {
+    fn default() -> Self {
+        PresentAnswers {
+            state: Mutex::new(AnswersState {
+                refreshes: 0,
+                undrawn: Vec::new(),
+                due: Vec::new(),
+            }),
+        }
+    }
+}
+
+impl<A: Answer> PresentAnswers<A> {
+    /// A present is shown; the window will draw it.
+    pub(crate) fn shown(&self, answer: A) {
+        let mut state = self.state.lock();
+        let at = state.refreshes;
+        state.undrawn.push((answer, at));
+    }
+
+    /// The window draws the latest present: the answers of every present shown so far, which
+    /// the draw hands back to [`Self::done`] once it has finished or will not.
+    pub(crate) fn drawn(&self) -> Vec<A> {
+        let mut state = self.state.lock();
+        state.undrawn.drain(..).map(|(answer, _)| answer).collect()
+    }
+
+    /// A draw of `answers`' presents has finished on the GPU, or will not come: they are
+    /// answered at the next refresh.
+    pub(crate) fn done(&self, answers: Vec<A>) {
+        if !answers.is_empty() {
+            self.state.lock().due.extend(answers);
+        }
+    }
+
+    /// A refresh of the device's display: the presents whose draw has finished are answered, and
+    /// those not drawn by the second refresh after their show.
+    pub(crate) fn refreshed(&self) {
+        let answers: Vec<A> = {
+            let mut state = self.state.lock();
+            state.refreshes += 1;
+            let now = state.refreshes;
+            let mut answers = std::mem::take(&mut state.due);
+            let (late, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut state.undrawn)
+                .into_iter()
+                .partition(|&(_, at)| at + 2 <= now);
+            state.undrawn = waiting;
+            answers.extend(late.into_iter().map(|(answer, _)| answer));
+            answers
+        };
+        for answer in answers {
+            answer.answer_ok();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use reims_vgpu_core::sync::Mutex;
+
+    use super::{Answer, PresentAnswers};
+
+    /// An answer that records the refresh it was given at.
+    struct Recorded {
+        frame: usize,
+        log: Arc<Mutex<Vec<(usize, u64)>>>,
+        refresh: Arc<Mutex<u64>>,
+    }
+
+    impl Answer for Recorded {
+        fn answer_ok(self) {
+            let at = *self.refresh.lock();
+            self.log.lock().push((self.frame, at));
+        }
+    }
+
+    /// How the window treats each frame in [`guest_at_the_limit`].
+    #[derive(Clone, Copy)]
+    enum Window {
+        /// Draws it as it is shown, the draw finishing before the next refresh.
+        Draws,
+        /// Draws it as it is shown, the draw finishing only after the next refresh.
+        DrawsLate,
+        /// Draws nothing (hidden).
+        Hidden,
+    }
+
+    /// A guest that presents once each refresh, after it, with at most two presents unanswered
+    /// (the kext's display pipe), over `refreshes` refreshes: the refreshes at which it would have
+    /// had to wait, and each frame's answer as (frame, refresh it was shown after, refresh it
+    /// was answered at).
+    fn guest_at_the_limit(window: Window, refreshes: u64) -> (Vec<u64>, Vec<(usize, u64, u64)>) {
+        let answers = PresentAnswers::<Recorded>::default();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let refresh = Arc::new(Mutex::new(0u64));
+        let mut shown_at = Vec::new();
+        let mut waited = Vec::new();
+        let mut late = Vec::new();
+        for r in 1..=refreshes {
+            *refresh.lock() = r;
+            answers.refreshed();
+            // The draw of the frame before finishes only now, just after this refresh.
+            answers.done(std::mem::take(&mut late));
+            let unanswered = shown_at.len() - log.lock().len();
+            if unanswered >= 2 {
+                waited.push(r);
+                continue;
+            }
+            let frame = shown_at.len();
+            shown_at.push(r);
+            answers.shown(Recorded {
+                frame,
+                log: Arc::clone(&log),
+                refresh: Arc::clone(&refresh),
+            });
+            match window {
+                Window::Draws => {
+                    let drawn = answers.drawn();
+                    answers.done(drawn);
+                }
+                Window::DrawsLate => late = answers.drawn(),
+                Window::Hidden => {}
+            }
+        }
+        let answered = log
+            .lock()
+            .iter()
+            .map(|&(frame, at)| (frame, shown_at[frame], at))
+            .collect();
+        (waited, answered)
+    }
+
+    /// A guest presenting once a vblank never waits on its limit of two: a frame the window draws
+    /// as it is shown is answered at the next refresh, one whose draw finishes a refresh late at
+    /// the one after, and one a hidden window never draws at the second
+    #[test]
+    fn a_present_is_answered_at_the_vblank_it_is_first_shown() {
+        for (window, delay) in [
+            (Window::Draws, 1u64),
+            (Window::DrawsLate, 2),
+            (Window::Hidden, 2),
+        ] {
+            let (waited, answered) = guest_at_the_limit(window, 12);
+            assert!(waited.is_empty(), "the guest waited on its limit at {waited:?}");
+            assert_eq!(answered.len() as u64, 12 - delay, "a frame went unanswered");
+            for (frame, shown, at) in answered {
+                assert_eq!(at, shown + delay, "frame {frame}'s answer");
+            }
+        }
+    }
+
+    /// A present is never answered before the window's draw of it has finished, while the
+    /// window draws: a draw still running at the second refresh holds its answers
+    #[test]
+    fn a_drawn_present_waits_for_its_draw() {
+        let answers = PresentAnswers::<Recorded>::default();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let refresh = Arc::new(Mutex::new(0u64));
+        answers.shown(Recorded {
+            frame: 0,
+            log: Arc::clone(&log),
+            refresh: Arc::clone(&refresh),
+        });
+        let drawing = answers.drawn();
+        for r in 1..=3 {
+            *refresh.lock() = r;
+            answers.refreshed();
+        }
+        assert!(log.lock().is_empty());
+        answers.done(drawing);
+        assert!(log.lock().is_empty(), "answered before the refresh");
+        *refresh.lock() = 4;
+        answers.refreshed();
+        assert_eq!(*log.lock(), [(0, 4)]);
     }
 }

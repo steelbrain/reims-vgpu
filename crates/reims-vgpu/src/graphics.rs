@@ -45,12 +45,15 @@ use reims_graphics::{
 };
 use reims_vgpu_core::num::ToU64;
 use reims_vgpu_core::platform::Platform;
+use reims_vgpu_core::platform::command::CommandBuffer as _;
 use reims_vgpu_core::platform::device::GpuDevice;
+use reims_vgpu_core::raise::OnFault;
 use reims_vgpu_core::sync::Mutex;
 use reims_vgpu_window::{FrameSink, Window, WindowConfig};
 use zerocopy::{FromBytes, IntoBytes};
 
 use crate::DefaultPlatform;
+use crate::display::no_catch;
 use crate::entry;
 use crate::error::Error;
 use crate::graphics::compile::{CompilePool, Pending};
@@ -60,7 +63,7 @@ use crate::graphics::decode::{
     PipelineJob, ReflectionSink, compile_refusing, complete, make_library, refused_reply, refusing,
 };
 use crate::graphics::device_info::device_info;
-use crate::graphics::present::PresentQueue;
+use crate::graphics::present::{PresentAnswers, PresentQueue};
 use crate::platform::ApiPlatform;
 use crate::window::WindowLink;
 
@@ -272,9 +275,9 @@ struct GraphicsControl<P: ApiPlatform> {
 
 /// The IOSurface the display pipe shows in place of the scanout (`PRESENT_SURFACE`): the texture
 /// the decoder made over it, which the window's sink draws into the next drawable (`sink`), and
-/// the presents' answers, given once that draw is encoded. The window draws a present when it is
-/// made, never on its own: each present is the guest's own, and none is batched or repeated by
-/// the GPU's work.
+/// the presents' answers, given at the first refresh of the device's display after that draw has
+/// finished ([`PresentAnswers`]). The window draws a present when it is made, never on its own:
+/// each present is the guest's own, and none is batched or repeated by the GPU's work.
 pub(crate) struct Presented<P: Platform> {
     /// The texture shown; `None` shows the scanout.
     pub(crate) texture: Mutex<Option<P::Texture>>,
@@ -284,8 +287,8 @@ pub(crate) struct Presented<P: Platform> {
     window: OnceLock<Arc<Window>>,
     /// A surface of a format the sink cannot draw was logged.
     refused: AtomicBool,
-    /// The presents' answers owed until the window draws the surface.
-    pending: Mutex<Vec<PresentAnswer>>,
+    /// The presents' answers, owed until the device's display shows them.
+    answers: PresentAnswers<PresentAnswer>,
     /// The last (surface, drawable) pixel formats logged.
     formats: Mutex<Option<(u64, u64)>>,
 }
@@ -298,14 +301,15 @@ impl<P: Platform> Default for Presented<P> {
             window: OnceLock::new(),
             refused: AtomicBool::new(false),
             formats: Mutex::new(None),
-            pending: Mutex::new(Vec::new()),
+            answers: PresentAnswers::default(),
         }
     }
 }
 
 impl<P: Platform> Presented<P> {
     /// Shows `texture` (the surface `id`'s), or the scanout for `None`, and asks the window for a
-    /// frame; `answer` is given once the window has drawn it, or at once without a window.
+    /// frame; `answer` is given at the vblank the display first shows it ([`PresentAnswers`]), or
+    /// at once without a window.
     fn show(&self, id: u32, texture: Option<P::Texture>, answer: PresentAnswer) {
         let previous = self.surface_id.swap(id, Ordering::AcqRel);
         if previous != id {
@@ -317,20 +321,25 @@ impl<P: Platform> Presented<P> {
         *self.texture.lock() = texture;
         match self.window.get() {
             Some(window) => {
-                self.pending.lock().push(answer);
+                self.answers.shown(answer);
                 window.new_frame();
             }
             None => answer.answer(RGFX_STATUS_OK),
         }
     }
 
-    /// The window's draw that shows the latest present is encoded: every present made before it
-    /// is shown, and is answered.
-    pub(crate) fn drawn(&self) {
-        let answers = std::mem::take(&mut *self.pending.lock());
-        for answer in answers {
-            answer.answer(RGFX_STATUS_OK);
+    /// The window draws the latest present: the presents shown so far, answered once the draw has
+    /// finished, or once it is dropped undone ([`DrawnPresents`]).
+    pub(crate) fn drawn(self: &Arc<Self>) -> DrawnPresents<P> {
+        DrawnPresents {
+            presented: Arc::clone(self),
+            answers: self.answers.drawn(),
         }
+    }
+
+    /// A refresh of the device's display: the presents it now shows are answered.
+    fn refreshed(&self) {
+        self.answers.refreshed();
     }
 
     /// The sink draws a surface of pixel format `surface` into a drawable of `drawable`: logged
@@ -357,6 +366,38 @@ impl<P: Platform> Presented<P> {
                  the window's drawable (pixel format {drawable}): the scanout shows instead"
             );
         }
+    }
+}
+
+/// The presents a window's draw shows: answered at the refresh after the draw has finished on the
+/// GPU ([`DrawnPresents::after`]), or after the draw is dropped before its commit.
+pub(crate) struct DrawnPresents<P: Platform> {
+    /// Where they are answered.
+    presented: Arc<Presented<P>>,
+    /// Their answers.
+    answers: Vec<PresentAnswer>,
+}
+
+impl<P: Platform> DrawnPresents<P> {
+    /// The presents are answered after `command_buffer`, the draw, has finished: its completed
+    /// handler holds them. Called before its commit; where the handler is refused, or the buffer
+    /// is never committed, they are answered as if it had finished.
+    pub(crate) fn after(self, command_buffer: &P::CommandBuffer) {
+        if self.answers.is_empty() {
+            return;
+        }
+        let _ = no_catch(command_buffer.add_completed_handler(
+            OnFault::Die,
+            Box::new(move |_| drop(self)),
+        ));
+    }
+}
+
+impl<P: Platform> Drop for DrawnPresents<P> {
+    fn drop(&mut self) {
+        self.presented
+            .answers
+            .done(std::mem::take(&mut self.answers));
     }
 }
 
@@ -791,6 +832,10 @@ impl<P: ApiPlatform> Host for CallbackHost<P> {
 
     fn present_surface(&self, iosurface_id: u32, answer: PresentAnswer) {
         self.control.present_surface(iosurface_id, answer);
+    }
+
+    fn refreshed(&self) {
+        self.control.presented.refreshed();
     }
 
     fn context_closed(&self, context: u32, answer: CompleteAnswer) {

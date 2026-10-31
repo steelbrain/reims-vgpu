@@ -49,7 +49,7 @@ use reims_vgpu_core::display::pipeline::{DisplayPipelineCache, PipelineKey};
 use reims_vgpu_core::platform::resource::Buffer as _;
 use reims_vgpu_core::platform::types::MtlViewport;
 
-use super::{Presented, Shown};
+use super::{DrawnPresents, Presented, Shown};
 use crate::display::no_catch;
 use crate::platform::ApiPlatform;
 
@@ -214,13 +214,18 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
     }
 
     /// A command buffer of the sink's queue with the scanout blitted into `texture` at `region`
-    /// (the module doc), not committed; `None`, with nothing encoded, where the guest has no
-    /// scanout or the queue gives no command buffer.
+    /// (the module doc), not committed, and the presents it shows, which the caller hands it
+    /// before its commit ([`DrawnPresents::after`]); `None`, with nothing encoded, where the
+    /// guest has no scanout or the queue gives no command buffer. The presents the draw shows are
+    /// those made so far, whatever it draws: where it shows the scanout in place of a surface it
+    /// cannot draw, or nothing, they are answered at the next refresh, so the guest's compositor
+    /// does not wait on a window that cannot show them.
     pub(crate) fn encode(
         &self,
         texture: &P::Texture,
         region: PixelRect,
-    ) -> Option<P::CommandBuffer> {
+    ) -> Option<(P::CommandBuffer, DrawnPresents<P>)> {
+        let presents = self.presented.drawn();
         let surface = self
             .presented
             .texture
@@ -235,16 +240,18 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
             } else {
                 self.encode_converted(&surface, texture, region)
             };
-            if drawn.is_some() {
-                // The caller commits and presents it next: the presents made so far are shown.
-                self.presented.drawn();
-                return drawn;
+            if let Some(drawn) = drawn {
+                return Some((drawn, presents));
             }
-            // Not drawn: the scanout shows, and the presents are answered so the guest's
-            // compositor does not wait on a window that cannot show them.
             self.presented.refuse_format(from, to);
-            self.presented.drawn();
         }
+        let command_buffer = self.encode_scanout(texture, region)?;
+        Some((command_buffer, presents))
+    }
+
+    /// A command buffer of the sink's queue with the scanout blitted into `texture` at `region`,
+    /// not committed; `None` where the guest has no scanout or the queue gives no command buffer.
+    fn encode_scanout(&self, texture: &P::Texture, region: PixelRect) -> Option<P::CommandBuffer> {
         let scanout = (*self.shown.scanout.lock())?;
         let (buffer, source_offset) = self.scanout_buffer(&scanout)?;
         let command_buffer = no_catch(self.queue.command_buffer(OnFault::Die))?;
