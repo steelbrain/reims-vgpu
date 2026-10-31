@@ -466,7 +466,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                     let (ty, seqno, obj_id) = message_identity(message);
                     log::warn!(
                         target: "reims_vgpu::graphics",
-                        "a queue message (type {ty:#x}, seqno {seqno}, object {obj_id:#x}) was not \
+                        "a message (type {ty:#x}, seqno {seqno}, object {obj_id:#x}) was not \
                          carried out: {e:?}"
                     );
                     self.fail_queue_command_buffer(poster, message);

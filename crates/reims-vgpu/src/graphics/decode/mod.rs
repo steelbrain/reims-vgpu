@@ -578,7 +578,16 @@ impl<P: Platform> GraphicsDecoder<P> {
                 };
                 match device.new_heap(&desc)?.heap {
                     Some(heap) => self.insert(m.obj_id, ObjHandle::Heap(heap)),
-                    None => Ok(Err(DecodeError::Refused)),
+                    None => {
+                        heap_refused(
+                            m.obj_id,
+                            m.size_bytes,
+                            m.heap_type,
+                            m.options,
+                            m.gpu_address,
+                        );
+                        Ok(Err(DecodeError::Refused))
+                    }
                 }
             }
             RGFX_CMD_HEAP_OVER_HOST_MEMORY => {
@@ -615,7 +624,16 @@ impl<P: Platform> GraphicsDecoder<P> {
                         ObjHandle::Heap(heap),
                         Some((m.region_offset, m.size_bytes)),
                     ),
-                    None => Ok(Err(DecodeError::Refused)),
+                    None => {
+                        heap_refused(
+                            m.obj_id,
+                            m.size_bytes,
+                            m.heap_type,
+                            m.options,
+                            m.gpu_address,
+                        );
+                        Ok(Err(DecodeError::Refused))
+                    }
                 }
             }
             RGFX_CMD_TEXTURE_CREATE => {
@@ -1343,6 +1361,17 @@ resolvers! {
     (require_heap, get_heap, Heap, Heap, "heap"),
     (require_library, get_library, Library, Library, "library"),
     (require_indirect_command_buffer, get_indirect_command_buffer, Icb, Icb, "indirect command buffer"),
+}
+
+/// The line of a heap create the platform answered nil for (a size of 0, memory the device
+/// cannot allocate, or an address its space cannot honour), which names what the guest asked
+/// for, as the refusal's own line names only its message.
+fn heap_refused(obj_id: u64, size: u64, heap_type: i32, options: u32, gpu_address: u64) {
+    log::warn!(
+        target: "reims_vgpu::graphics",
+        "heap {obj_id:#x} not made: the platform answered nil for {size:#x} bytes of type \
+         {heap_type}, options {options:#x}, at GPU address {gpu_address:#x}"
+    );
 }
 
 /// Reads a message struct from the start of `message`, or `None` if it is too
