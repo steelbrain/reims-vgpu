@@ -319,7 +319,10 @@ pub const RGFX_CMD_BLOCK_RELEASE: u32 = 0x2f2;
 /// `context` the region block of `size` bytes at `offset`. Posted before the process learns of the
 /// block, so it comes before every message naming it. Not answered. A span a message names, on
 /// ring 0 or on a queue's ring, must lie in one block its context holds: from its grant until its
-/// `BLOCK_RELEASE` or the context's `CONTEXT_CLOSE`.
+/// `BLOCK_RELEASE` or the context's `CONTEXT_CLOSE`. A block lies in the processes' blocks
+/// ([`RGFX_CONTEXT_ALLOCATIONS_OFFSET`] up to the cursor's span), or in the scanout's span, which
+/// the kext grants to a context whose process draws the display into it; a grant of a span that
+/// overlaps another context's block takes it from that context.
 pub const RGFX_CMD_BLOCK_GRANT: u32 = 0x2f3;
 
 /// Command `COMMAND_BUFFER` (a per-queue submission ring): one command buffer,

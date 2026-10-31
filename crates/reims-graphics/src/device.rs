@@ -730,15 +730,21 @@ impl Shared {
     }
 
     /// `BLOCK_GRANT`: the region keeps the block as its context's, where it lies in the
-    /// processes' part of the region (past the device info and the scanout, before the cursor).
+    /// processes' part of the region (past the device info and the scanout, before the cursor),
+    /// or in the scanout's span, which the kext grants to the context that draws the display into
+    /// it.
     pub(crate) fn grant_block(&self, grant: &RgfxBlockGrant) {
         let end = self.region.size().saturating_sub(RGFX_CURSOR_SPAN);
-        if grant.offset < RGFX_CONTEXT_ALLOCATIONS_OFFSET
-            || grant.offset.checked_add(grant.size).is_none_or(|e| e > end)
+        let grant_end = grant.offset.checked_add(grant.size);
+        let within =
+            |from: u64, to: u64| grant.offset >= from && grant_end.is_some_and(|e| e <= to);
+        if !within(RGFX_CONTEXT_ALLOCATIONS_OFFSET, end)
+            && !within(RGFX_ALLOCATIONS_OFFSET, RGFX_CONTEXT_ALLOCATIONS_OFFSET)
         {
             log::warn!(
                 target: "reims_graphics",
-                "a BLOCK_GRANT of {:#x} bytes at {:#x} lies outside the processes' blocks: ignored",
+                "a BLOCK_GRANT of {:#x} bytes at {:#x} lies outside the processes' blocks and the \
+                 scanout: ignored",
                 grant.size, grant.offset
             );
             return;

@@ -1120,6 +1120,54 @@ fn a_command_buffer_in_region_is_taken_from_its_block() {
     );
 }
 
+/// A `BLOCK_GRANT` is kept where it lies in the processes' blocks, or in the scanout's span (the
+/// kext grants it to the context that draws the display into it), and ignored where it reaches
+/// the device info before the scanout, crosses from the scanout into the blocks, or reaches the
+/// cursor's span. A grant of a span another context holds takes it from that context.
+#[test]
+fn a_block_grant_is_kept_in_the_blocks_or_the_scanout() {
+    let mut rig = Rig::new();
+    rig.start();
+    const SCANOUT: u64 = RGFX_ALLOCATIONS_OFFSET;
+    const BLOCK: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x20_0000;
+    let cursor = REGION_SIZE - RGFX_CURSOR_SPAN;
+    let grants = [
+        (5, SCANOUT, 0x87_0000),
+        (6, BLOCK, 0x1_0000),
+        (7, SCANOUT - 0x1000, 0x2000),
+        (8, RGFX_CONTEXT_ALLOCATIONS_OFFSET - 0x1000, 0x2000),
+        (9, cursor - 0x1000, 0x2000),
+    ];
+    for (context, offset, size) in grants {
+        rig.send(block_message(RGFX_CMD_BLOCK_GRANT, context, offset, size));
+    }
+    // A grant is not answered: the close after them is, once the ring has taken them.
+    let seqno = rig.send(context_close(99));
+    assert_eq!(rig.complete(), (seqno, RGFX_STATUS_OK));
+
+    let region = rig.region();
+    assert!(region.held_by(5, SCANOUT, 0x87_0000));
+    assert!(region.held_by(5, SCANOUT + 0x1000, 0x8000));
+    assert!(!region.held_by(6, SCANOUT, 0x1000));
+    assert!(region.held_by(6, BLOCK, 0x1_0000));
+    assert!(!region.held_by(7, SCANOUT - 0x1000, 0x1000));
+    assert!(!region.held_by(8, RGFX_CONTEXT_ALLOCATIONS_OFFSET - 0x1000, 0x1000));
+    assert!(!region.held_by(8, RGFX_CONTEXT_ALLOCATIONS_OFFSET, 0x1000));
+    assert!(!region.held_by(9, cursor - 0x1000, 0x1000));
+
+    // A new process drawing the display: the scanout is its context's, no longer the old one's.
+    rig.send(block_message(RGFX_CMD_BLOCK_GRANT, 10, SCANOUT, 0x87_0000));
+    let seqno = rig.send(context_close(99));
+    assert_eq!(rig.complete(), (seqno, RGFX_STATUS_OK));
+    assert!(rig.region().held_by(10, SCANOUT, 0x87_0000));
+    assert!(!rig.region().held_by(5, SCANOUT, 0x1000));
+
+    // Its context's close ends its grant.
+    let seqno = rig.send(context_close(10));
+    assert_eq!(rig.complete(), (seqno, RGFX_STATUS_OK));
+    assert!(!rig.region().held_by(10, SCANOUT, 0x1000));
+}
+
 /// A `BLOCK_GRANT` or `BLOCK_RELEASE` (their layouts are one) of `type` for `context`'s block of
 /// `size` bytes at `offset`.
 fn block_message(r#type: u32, context: u32, offset: u64, size: u64) -> Vec<u8> {
