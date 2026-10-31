@@ -306,22 +306,22 @@ impl FunctionConstant {
     /// `float` (Metal's compiler refuses the rest, `bfloat` among them).
     pub fn size_of(data_type: u32) -> Option<usize> {
         // `MTLDataType` raw values (Metal's MTLDataType.h): each family's scalar, then its two-,
-        // three- and four-lane vectors, numbered in a row.
-        let (lane, lanes) = match data_type {
-            3..=6 => (4, data_type - 2),    // Float
-            16..=19 => (2, data_type - 15), // Half
-            29..=32 => (4, data_type - 28), // Int
-            33..=36 => (4, data_type - 32), // UInt
-            37..=40 => (2, data_type - 36), // Short
-            41..=44 => (2, data_type - 40), // UShort
-            45..=48 => (1, data_type - 44), // Char
-            49..=52 => (1, data_type - 48), // UChar
-            53..=56 => (1, data_type - 52), // Bool
-            81..=84 => (8, data_type - 80), // Long
-            85..=88 => (8, data_type - 84), // ULong
+        // three- and four-lane vectors, numbered in a row. The lane's size, and the scalar's value.
+        let (lane, scalar): (usize, u32) = match data_type {
+            3..=6 => (4, 3),    // Float
+            16..=19 => (2, 16), // Half
+            29..=32 => (4, 29), // Int
+            33..=36 => (4, 33), // UInt
+            37..=40 => (2, 37), // Short
+            41..=44 => (2, 41), // UShort
+            45..=48 => (1, 45), // Char
+            49..=52 => (1, 49), // UChar
+            53..=56 => (1, 53), // Bool
+            81..=84 => (8, 81), // Long
+            85..=88 => (8, 85), // ULong
             _ => return None,
         };
-        Some(lane * lanes as usize)
+        Some(lane * usize::try_from(data_type - scalar + 1).ok()?)
     }
 
     /// The value's bytes, as many as `data_type` packs: `None` for a type no function constant
