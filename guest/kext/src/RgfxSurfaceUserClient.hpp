@@ -15,13 +15,17 @@
  *   0, 3 ReadLockOptions, WriteLockOptions(options)
  *        -> IOAccelSurfaceInformation                         scalar 1, struct out
  *   1, 4 ReadUnlockOptions, WriteUnlockOptions(options)       scalar 1
+ *   0xa  Flush, of a surface with no backing                  scalar 2
  * Every other method, and any other shape, is refused as unsupported, logged once per method.
  *
  * A surface's memory is:
  *   - the backing the client gave (SetShapeBackingAndLength with a backing), its own memory;
- *   - else, for a surface on framebuffer 0 whose shape is the display's whole current mode,
- *     the framebuffer's scanout in the device region, mapped into the client's task at its
- *     first lock: what is drawn there is what the display shows;
+ *   - else, for a surface on framebuffer 0 whose shape lies inside the display's current
+ *     mode, the framebuffer's scanout under that shape (RgfxSurfacePlace.hpp): WindowServer
+ *     reshapes its display's surface to each update's dirty rectangle. The whole scanout is
+ *     mapped into the client's task at its first lock, and kept until a mode moves it; a lock
+ *     answers the shape's first pixel in it, and what is drawn there is what the display
+ *     shows, so a flush has nothing to copy;
  *   - else none, and a lock fails with kIOReturnNoMemory.
  *
  * Our own code; it names only SDK-public IOKit classes and the SDK's IOAccel headers.
@@ -54,6 +58,8 @@ public:
 
 	// The task that opened the surface.
 	task_t owningTask() const { return task; }
+	// Whether the client gave the surface memory of its own (SetShapeBackingAndLength).
+	bool hasBacking();
 	// Whether the surface's memory is the framebuffer's scanout of `width` x `height`: on
 	// framebuffer 0, no backing of the client's, its shape the whole `width` x `height`.
 	bool isScanout(UInt32 width, UInt32 height);
@@ -67,7 +73,8 @@ private:
 	task_t task;
 	RgfxAccelerator *owner;
 	// Under stateLock: the surface's id and mode (SetIDMode), its shape (the region's bounds and
-	// framebuffer index), the backing the client gave, and the scanout's mapping in the task.
+	// framebuffer index), the backing the client gave, and the scanout's mapping in the task with
+	// the span and rows it maps.
 	IOLock *stateLock;
 	bool haveId;
 	UInt32 surfaceId;
@@ -79,6 +86,8 @@ private:
 	UInt32 backingRowBytes;
 	UInt64 backingLength;
 	IOMemoryMap *scanoutMap;
+	UInt64 scanoutOffset;
+	UInt64 scanoutLength;
 	UInt32 scanoutRowBytes;
 };
 

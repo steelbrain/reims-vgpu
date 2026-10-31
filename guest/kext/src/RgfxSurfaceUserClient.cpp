@@ -6,6 +6,7 @@
 #include "RgfxSurfaceUserClient.hpp"
 
 #include "RgfxAccelerator.hpp"
+#include "RgfxSurfacePlace.hpp"
 #include "RgfxTrace.hpp"
 
 #include <IOKit/IOLib.h>
@@ -63,6 +64,8 @@ bool RgfxSurfaceUserClient::initWithTask(task_t owningTask, void *securityID, UI
 	backingRowBytes = 0;
 	backingLength = 0;
 	scanoutMap = nullptr;
+	scanoutOffset = 0;
+	scanoutLength = 0;
 	scanoutRowBytes = 0;
 	stateLock = IOLockAlloc();
 	return stateLock != nullptr;
@@ -151,6 +154,13 @@ IOReturn RgfxSurfaceUserClient::externalMethod(uint32_t selector,
 			    a->structureOutputSize == sizeof(IOAccelSurfaceInformation))
 				return lock(a);
 			break;
+		case kIOAccelSurfaceFlush:
+			// The pixels of a surface with no backing are the display's already: nothing to
+			// copy. A backing surface's flush is not supported.
+			if (a->scalarInputCount == 2 && a->scalarOutputCount == 0 &&
+			    a->structureOutputSize == 0 && !hasBacking())
+				return kIOReturnSuccess;
+			break;
 		case kIOAccelSurfaceReadUnlockOptions:
 		case kIOAccelSurfaceWriteUnlockOptions:
 			// The memory is the client's or the scanout, both coherent with the CPU: nothing
@@ -218,12 +228,17 @@ IOReturn RgfxSurfaceUserClient::setShape(IOExternalMethodArguments *a, bool with
 		backingRowBytes = rowBytes;
 		backingLength = length;
 	}
-	// A new shape may not be the scanout's: the next lock maps it again if it is.
-	IOMemoryMap *old = scanoutMap;
-	scanoutMap = nullptr;
+	// The scanout's mapping stays: it maps the whole scanout, under any shape.
 	IOLockUnlock(stateLock);
-	OSSafeReleaseNULL(old);
 	return kIOReturnSuccess;
+}
+
+bool RgfxSurfaceUserClient::hasBacking()
+{
+	IOLockLock(stateLock);
+	bool has = backing != 0;
+	IOLockUnlock(stateLock);
+	return has;
 }
 
 bool RgfxSurfaceUserClient::isScanout(UInt32 width, UInt32 height)
@@ -258,21 +273,27 @@ IOReturn RgfxSurfaceUserClient::lock(IOExternalMethodArguments *a)
 		IOLockUnlock(stateLock);
 		return writeLockInfo(a, info);
 	}
-	bool onScanout = haveScanout && framebufferIndex == 0 && bounds.x == 0 && bounds.y == 0 &&
-	                 info.width == scanout.width && info.height == scanout.height;
-	IOMemoryMap *map = scanoutMap;
+	// The scanout's pixels under the shape (RgfxSurfacePlace.hpp).
+	uint64_t at = 0;
+	bool onScanout = haveScanout && framebufferIndex == 0 &&
+	                 rgfxSurfaceInScanout(bounds.x, bounds.y, bounds.w, bounds.h, scanout.width,
+	                                      scanout.height, scanout.rowBytes, &at);
+	bool current = scanoutMap && scanoutOffset == scanout.offset &&
+	               scanoutLength == scanout.length && scanoutRowBytes == scanout.rowBytes;
 	IOLockUnlock(stateLock);
 	if (!onScanout) {
 		static char site;
 		if (rgfxFirstCalls(&site, 0, 1))
-			IOLog("RGFX surface: a lock of %ux%u on framebuffer %u has no memory (scanout "
-			      "%ux%u)\n",
-			      info.width, info.height, framebufferIndex, scanout.width, scanout.height);
+			IOLog("RGFX surface: a lock of %ux%u at %d,%d on framebuffer %u has no memory "
+			      "(scanout %ux%u)\n",
+			      info.width, info.height, bounds.x, bounds.y, framebufferIndex, scanout.width,
+			      scanout.height);
 		return kIOReturnNoMemory;
 	}
-	if (!map) {
-		// The scanout, mapped into the client's task as the bundle and the framebuffer map the
-		// region: write-back.
+	if (!current) {
+		// The scanout as it is now, mapped into the client's task as the bundle and the
+		// framebuffer map the region: write-back. Kept across shapes, and made again when a
+		// mode moves the scanout.
 		IODeviceMemory *region = owner->copyRegion();
 		IODeviceMemory *span =
 		    region ? IODeviceMemory::withSubRange(region, scanout.offset, scanout.length)
@@ -286,17 +307,16 @@ IOReturn RgfxSurfaceUserClient::lock(IOExternalMethodArguments *a)
 		if (!made)
 			return kIOReturnNoMemory;
 		IOLockLock(stateLock);
-		if (scanoutMap) {
-			IOLockUnlock(stateLock);
-			made->release();
-		} else {
-			scanoutMap = made;
-			scanoutRowBytes = scanout.rowBytes;
-			IOLockUnlock(stateLock);
-		}
+		IOMemoryMap *old = scanoutMap;
+		scanoutMap = made;
+		scanoutOffset = scanout.offset;
+		scanoutLength = scanout.length;
+		scanoutRowBytes = scanout.rowBytes;
+		IOLockUnlock(stateLock);
+		OSSafeReleaseNULL(old);
 	}
 	IOLockLock(stateLock);
-	info.address[0] = scanoutMap ? scanoutMap->getAddress() : 0;
+	info.address[0] = scanoutMap ? scanoutMap->getAddress() + at : 0;
 	info.rowBytes = scanoutRowBytes;
 	IOLockUnlock(stateLock);
 	if (!info.address[0])
