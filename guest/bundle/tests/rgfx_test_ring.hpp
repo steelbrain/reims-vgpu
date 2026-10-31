@@ -160,4 +160,14 @@ template <typename T> T expectMessage(TestRing &ring, uint32_t type)
 	return msg;
 }
 
+/// A queue's QUEUE_CREATE, then the FENCE_CREATEs of its barrier fences, which it makes with
+/// itself (RgfxCommandObjects.mm, QUEUE BARRIERS).
+inline RgfxQueueCreate expectQueueCreate(TestRing &ring)
+{
+	RgfxQueueCreate q = expectMessage<RgfxQueueCreate>(ring, RGFX_CMD_QUEUE_CREATE);
+	for (int i = 0; i < 8; i++)
+		(void)expectMessage<RgfxObjectCreate>(ring, RGFX_CMD_FENCE_CREATE);
+	return q;
+}
+
 #endif // RGFX_TEST_RING_HPP_

@@ -1361,15 +1361,16 @@ void test_command_graph()
 	CHECK(queue != nil);
 	CHECK(queue.rgfxObjId == 1);
 	CHECK([queue conformsToProtocol:@protocol(MTLCommandQueue)]);
-	auto qc = expectMessage<RgfxQueueCreate>(control, RGFX_CMD_QUEUE_CREATE);
+	auto qc = expectQueueCreate(control);
 	CHECK(qc.obj_id == 1);
 	CHECK(qc.submit_data_size == submit.dataSize);
 
-	// A command buffer: next objId (2), bound to the queue, not yet enqueued.
+	// A command buffer: the next objId after the queue's eight barrier fences (10), bound to
+	// the queue, not yet enqueued.
 	id<MTLCommandBuffer> cb = [queue commandBuffer];
 	CHECK(cb != nil);
 	CHECK([cb conformsToProtocol:@protocol(MTLCommandBuffer)]);
-	CHECK(((RgfxResource *)cb).rgfxObjId == 2);
+	CHECK(((RgfxResource *)cb).rgfxObjId == 10);
 	CHECK(cb.commandQueue == queue);
 	CHECK(cb.retainedReferences == YES);
 	CHECK(cb.status == MTLCommandBufferStatusNotEnqueued);
@@ -1448,7 +1449,7 @@ void test_command_graph()
 	RgfxCommandBuffer cbh = {};
 	std::memcpy(&cbh, bytes.data(), sizeof(cbh));
 	CHECK(cbh.queue_obj_id == 1);
-	CHECK(cbh.cb_obj_id == 2);
+	CHECK(cbh.cb_obj_id == 10);
 	CHECK(cbh.op_bytes == bytes.size() - RGFX_COMMAND_BUFFER_OPS_OFFSET);
 
 	// The exact op sequence the three encoders produced.
@@ -1465,6 +1466,7 @@ void test_command_graph()
 		RGFX_OP_RENDER_USE_RESOURCES,
 		RGFX_OP_RENDER_DRAW_PRIMITIVES,
 		RGFX_OP_RENDER_DRAW_INDEXED_PRIMITIVES_INSTANCES,
+		RGFX_OP_RENDER_UPDATE_FENCE, // the queue barrier fence (QUEUE BARRIERS)
 		RGFX_OP_ENCODER_END,
 		RGFX_OP_ENCODER_BEGIN_COMPUTE,
 		RGFX_OP_COMPUTE_SET_COMPUTE_PIPELINE_STATE,
@@ -1473,6 +1475,7 @@ void test_command_graph()
 		RGFX_OP_COMPUTE_DISPATCH_THREADGROUPS,
 		RGFX_OP_COMPUTE_MEMORY_BARRIER_SCOPE,
 		RGFX_OP_COMPUTE_UPDATE_FENCE,
+		RGFX_OP_COMPUTE_UPDATE_FENCE, // the queue barrier fence
 		RGFX_OP_ENCODER_END,
 		RGFX_OP_ENCODER_BEGIN_BLIT,
 		RGFX_OP_BLIT_COPY_BUFFER_TO_BUFFER,
@@ -1480,6 +1483,7 @@ void test_command_graph()
 		RGFX_OP_BLIT_GENERATE_MIPMAPS,
 		RGFX_OP_BLIT_SYNCHRONIZE_TEXTURE,
 		RGFX_OP_BLIT_WAIT_FOR_FENCE,
+		RGFX_OP_BLIT_UPDATE_FENCE, // the queue barrier fence
 		RGFX_OP_ENCODER_END,
 	};
 	const size_t want_n = sizeof(want) / sizeof(want[0]);
@@ -1585,9 +1589,10 @@ void test_command_graph()
 			CHECK(b.threadgroups_width == 16 && b.threadgroups_height == 8);
 			CHECK(b.threads_width == 32);
 		} else if (tag == RGFX_OP_COMPUTE_UPDATE_FENCE) {
+			// The app's fence, then the queue's barrier fence at the encoder's end.
 			RgfxComputeOpUpdateFence b;
 			std::memcpy(&b, body, sizeof(b));
-			CHECK(b.fence_obj_id == 30);
+			CHECK(b.fence_obj_id == 30 || (i + 1 < want_n && want[i + 1] == RGFX_OP_ENCODER_END));
 		} else if (tag == RGFX_OP_BLIT_COPY_BUFFER_TO_BUFFER) {
 			RgfxBlitOpCopyBufferToBuffer b;
 			std::memcpy(&b, body, sizeof(b));
@@ -1644,7 +1649,7 @@ void test_parallel_render_encoder()
 	                                                      maxCount:0
 	                                                        device:nil
 	                                                    serializer:&ser];
-	(void)expectMessage<RgfxQueueCreate>(control, RGFX_CMD_QUEUE_CREATE);
+	(void)expectQueueCreate(control);
 	id<MTLCommandBuffer> cb = [queue commandBuffer];
 
 	MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
@@ -1670,6 +1675,7 @@ void test_parallel_render_encoder()
 	const uint16_t want[] = {
 		RGFX_OP_ENCODER_BEGIN_RENDER,     RGFX_OP_RENDER_SET_RENDER_PIPELINE_STATE,
 		RGFX_OP_RENDER_DRAW_PRIMITIVES,   RGFX_OP_RENDER_DRAW_PRIMITIVES,
+		RGFX_OP_RENDER_UPDATE_FENCE, // the pass's queue barrier fence (QUEUE BARRIERS)
 		RGFX_OP_ENCODER_END,
 	};
 	const size_t want_n = sizeof(want) / sizeof(want[0]);
@@ -1820,7 +1826,7 @@ void test_queue_carries_allocated_offsets()
 	                                                        device:nil
 	                                                    serializer:&ser];
 	CHECK(queue != nil);
-	RgfxQueueCreate qc = expectMessage<RgfxQueueCreate>(control, RGFX_CMD_QUEUE_CREATE);
+	RgfxQueueCreate qc = expectQueueCreate(control);
 	CHECK(qc.submit_offset == rings.submit_offset);
 	CHECK(qc.complete_offset == rings.complete_offset);
 	CHECK(qc.submit_data_size == rings.submit_data_size);
@@ -1855,7 +1861,7 @@ void test_reply_reader_completion()
 	                                                        device:nil
 	                                                    serializer:&ser];
 	queue.replyReader = &reader;
-	(void)expectMessage<RgfxQueueCreate>(control, RGFX_CMD_QUEUE_CREATE);
+	(void)expectQueueCreate(control);
 
 	// --- a clean completion ---
 	__block int fired = 0;
@@ -2679,7 +2685,7 @@ void test_texture_destroy_waits_for_buffers()
 	CHECK(RgfxRetirement::process().waiting() == 0 && RgfxRetirement::process().live() == 0);
 	@autoreleasepool {
 	QueueFixture f;
-	(void)expectMessage<RgfxQueueCreate>(f.control, RGFX_CMD_QUEUE_CREATE);
+	(void)expectQueueCreate(f.control);
 	int calls = 0;
 	f.ids.setResourceIdSource(&oneChunk, &calls);
 	MTLTextureDescriptor *desc =
@@ -3958,7 +3964,7 @@ void test_queue_ends_after_its_buffers()
 			made = new QueueFixture();
 		}
 		QueueFixture &f = *made;
-		(void)expectMessage<RgfxQueueCreate>(f.control, RGFX_CMD_QUEUE_CREATE);
+		(void)expectQueueCreate(f.control);
 		uint64_t queueId = f.queue.rgfxObjId;
 		std::shared_ptr<RgfxReplyReader> reader = [f.queue sharedReplyReader];
 		int released = 0;

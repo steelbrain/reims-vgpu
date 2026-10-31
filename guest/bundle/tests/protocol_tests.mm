@@ -104,7 +104,7 @@ struct QueueFixture {
 		CHECK(queue != nil);
 		queue.replyReader = &reader;
 		queue.region = &region;
-		(void)expectMessage<RgfxQueueCreate>(control, RGFX_CMD_QUEUE_CREATE);
+		(void)expectQueueCreate(control);
 	}
 
 	// The ops of the next command buffer on the submission ring, and its seqno.
@@ -552,12 +552,10 @@ void test_encoders_unsupported()
 	    threadsPerObjectThreadgroup:MTLSizeMake(1, 1, 1)
 	      threadsPerMeshThreadgroup:MTLSizeMake(1, 1, 1)];
 	[renc setMeshBytes:&r length:sizeof(r) atIndex:0];
-	[renc barrierAfterQueueStages:MTLStageVertex beforeStages:MTLStageFragment];
 	CHECK(RgfxUnsupportedWasLogged(r, @selector(setDepthTestMinBound:maxBound:)));
 	CHECK(RgfxUnsupportedWasLogged(
 	    r, @selector(drawMeshThreads:threadsPerObjectThreadgroup:threadsPerMeshThreadgroup:)));
 	CHECK(RgfxUnsupportedWasLogged(r, @selector(setMeshBytes:length:atIndex:)));
-	CHECK(RgfxUnsupportedWasLogged(r, @selector(barrierAfterQueueStages:beforeStages:)));
 	[renc endEncoding];
 	id<MTLComputeCommandEncoder> cenc = [cb computeCommandEncoder];
 	[cenc setAccelerationStructure:nil atBufferIndex:1];
@@ -565,24 +563,124 @@ void test_encoders_unsupported()
 	[cenc setVisibleFunctionTables:noTables withBufferRange:NSMakeRange(0, 0)];
 	CHECK(!RgfxUnsupportedWasLogged([RgfxComputeCommandEncoder class],
 	                                @selector(setAccelerationStructure:atBufferIndex:)));
-	[cenc barrierAfterQueueStages:MTLStageDispatch beforeStages:MTLStageDispatch];
-	CHECK(RgfxUnsupportedWasLogged([RgfxComputeCommandEncoder class],
-	                               @selector(barrierAfterQueueStages:beforeStages:)));
+	[cenc endEncoding];
+	[cb commit];
+	uint64_t seqno = 0;
+	std::vector<Op> ops = fx.nextOps(&seqno);
+	// Only the framing and the queue barrier fences (test_queue_barriers) reached the wire.
+	for (const Op &op : ops) {
+		CHECK(op.tag == RGFX_OP_ENCODER_BEGIN_RENDER || op.tag == RGFX_OP_ENCODER_BEGIN_COMPUTE ||
+		      op.tag == RGFX_OP_RENDER_UPDATE_FENCE || op.tag == RGFX_OP_COMPUTE_UPDATE_FENCE ||
+		      op.tag == RGFX_OP_ENCODER_END);
+	}
+	fx.complete(cb, seqno);
+}
+
+// --- queue barriers -----------------------------------------------------------------
+
+// The fence id of fence op `op` (every fence op's body starts with it).
+uint64_t fenceOf(const Op &op)
+{
+	uint64_t id = 0;
+	std::memcpy(&id, op.body.data(), sizeof(id));
+	return id;
+}
+
+// The fence ops of `ops` between the nth (0-based) encoder begin and its end, as (tag, fence).
+std::vector<std::pair<uint16_t, uint64_t>> encoderFences(const std::vector<Op> &ops, int nth)
+{
+	std::vector<std::pair<uint16_t, uint64_t>> out;
+	int begins = -1;
+	bool in = false;
+	for (const Op &op : ops) {
+		if (op.tag == RGFX_OP_ENCODER_BEGIN_RENDER || op.tag == RGFX_OP_ENCODER_BEGIN_COMPUTE ||
+		    op.tag == RGFX_OP_ENCODER_BEGIN_BLIT) {
+			in = ++begins == nth;
+		} else if (op.tag == RGFX_OP_ENCODER_END) {
+			in = false;
+		} else if (in && (op.tag == RGFX_OP_RENDER_UPDATE_FENCE ||
+		                  op.tag == RGFX_OP_RENDER_WAIT_FOR_FENCE ||
+		                  op.tag == RGFX_OP_COMPUTE_UPDATE_FENCE ||
+		                  op.tag == RGFX_OP_COMPUTE_WAIT_FOR_FENCE ||
+		                  op.tag == RGFX_OP_BLIT_UPDATE_FENCE ||
+		                  op.tag == RGFX_OP_BLIT_WAIT_FOR_FENCE)) {
+			out.push_back({op.tag, fenceOf(op)});
+		}
+	}
+	return out;
+}
+
+// barrierAfterQueueStages:beforeStages: waits for every encoder made before it on the queue:
+// each encoder updates one of the queue's eight barrier fences at its end, and first waits
+// for the encoder that last updated it; a barrier waits for the seven others an earlier encoder
+// updated, once, in render, compute, blit and parallel passes, across command buffers.
+void test_queue_barriers()
+{
+	QueueFixture fx;
+	RgfxTexture *target = shapeTexture(
+	    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+	                                                       width:8
+	                                                      height:8
+	                                                   mipmapped:NO],
+	    0x42);
+	// Encoders 0..2: render, compute, then a blit whose barrier waits for 0 and 1.
+	id<MTLCommandBuffer> cb = [fx.queue commandBuffer];
+	id<MTLRenderCommandEncoder> renc = [cb renderCommandEncoderWithDescriptor:onePass(target)];
+	[renc endEncoding];
+	id<MTLComputeCommandEncoder> cenc = [cb computeCommandEncoder];
 	[cenc endEncoding];
 	id<MTLBlitCommandEncoder> benc = [cb blitCommandEncoder];
-	[benc barrierAfterQueueStages:MTLStageBlit beforeStages:MTLStageBlit];
-	CHECK(RgfxUnsupportedWasLogged([RgfxBlitCommandEncoder class],
-	                               @selector(barrierAfterQueueStages:beforeStages:)));
+	[benc barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll];
+	[benc barrierAfterQueueStages:MTLStageBlit beforeStages:MTLStageBlit]; // nothing more
 	[benc endEncoding];
 	[cb commit];
 	uint64_t seqno = 0;
 	std::vector<Op> ops = fx.nextOps(&seqno);
-	// Only the framing and nothing else reached the wire.
-	for (const Op &op : ops) {
-		CHECK(op.tag == RGFX_OP_ENCODER_BEGIN_RENDER || op.tag == RGFX_OP_ENCODER_BEGIN_COMPUTE ||
-		      op.tag == RGFX_OP_ENCODER_BEGIN_BLIT || op.tag == RGFX_OP_ENCODER_END);
-	}
+	auto e0 = encoderFences(ops, 0), e1 = encoderFences(ops, 1), e2 = encoderFences(ops, 2);
+	CHECK(e0.size() == 1 && e0[0].first == RGFX_OP_RENDER_UPDATE_FENCE);
+	CHECK(e1.size() == 1 && e1[0].first == RGFX_OP_COMPUTE_UPDATE_FENCE);
+	const uint64_t f0 = e0[0].second, f1 = e1[0].second;
+	CHECK(f0 != 0 && f1 != 0 && f0 != f1);
+	CHECK(e2.size() == 3);
+	CHECK(e2[0].first == RGFX_OP_BLIT_WAIT_FOR_FENCE && e2[0].second == f0);
+	CHECK(e2[1].first == RGFX_OP_BLIT_WAIT_FOR_FENCE && e2[1].second == f1);
+	CHECK(e2[2].first == RGFX_OP_BLIT_UPDATE_FENCE && e2[2].second != f0 && e2[2].second != f1);
+	const uint64_t f2 = e2[2].second;
+	// A render pass's fences cover all its stages.
+	RgfxOpUpdateFence ru = {};
+	std::memcpy(&ru, findOp(ops, RGFX_OP_RENDER_UPDATE_FENCE)->body.data(), sizeof(ru));
+	CHECK(ru.stages == (MTLRenderStageVertex | MTLRenderStageFragment));
 	fx.complete(cb, seqno);
+
+	// Encoders 3..7 in a second buffer take the other five fences; 8 takes encoder 0's again,
+	// so it waits for 0 first, and its barrier waits for the other seven (1..7). A parallel
+	// pass waits and updates as one encoder, and its sub-encoder's barrier waits as it would.
+	id<MTLCommandBuffer> cb2 = [fx.queue commandBuffer];
+	for (int i = 3; i < 8; i++) {
+		[[cb2 blitCommandEncoder] endEncoding];
+	}
+	id<MTLParallelRenderCommandEncoder> par =
+	    [cb2 parallelRenderCommandEncoderWithDescriptor:onePass(target)];
+	id<MTLRenderCommandEncoder> sub = [par renderCommandEncoder];
+	[sub barrierAfterQueueStages:MTLStageFragment beforeStages:MTLStageVertex];
+	[sub endEncoding];
+	[par endEncoding];
+	[cb2 commit];
+	ops = fx.nextOps(&seqno);
+	std::vector<uint64_t> fences = {f0, f1, f2};
+	for (int i = 0; i < 5; i++) {
+		auto e = encoderFences(ops, i);
+		CHECK(e.size() == 1 && e[0].first == RGFX_OP_BLIT_UPDATE_FENCE);
+		fences.push_back(e[0].second);
+	}
+	auto e8 = encoderFences(ops, 5);
+	CHECK(e8.size() == 9);
+	CHECK(e8[0].first == RGFX_OP_RENDER_WAIT_FOR_FENCE && e8[0].second == f0); // its own, first
+	for (int t = 1; t < 8; t++) {
+		CHECK(e8[t].first == RGFX_OP_RENDER_WAIT_FOR_FENCE && e8[t].second == fences[t]);
+	}
+	CHECK(e8[8].first == RGFX_OP_RENDER_UPDATE_FENCE && e8[8].second == f0);
+	fx.complete(cb2, seqno);
 }
 
 
@@ -1051,4 +1149,5 @@ void rgfxProtocolTests()
 	test_argument_encoder_members();
 	test_shared_event_wait();
 	test_heap_sizes();
+	test_queue_barriers();
 }

@@ -18,6 +18,15 @@
  * to an upload chunk of the command buffer's in the device region (RgfxUploads.h), bound as a
  * buffer at their offset there.
  *
+ * QUEUE BARRIERS. barrierAfterQueueStages:beforeStages: has no op of its own either: it waits
+ * for every encoder made before it on the queue, through the queue's eight barrier fences
+ * (RgfxBarrierSlot). Every encoder takes the next fence in turn, waits at its start for the
+ * encoder that last took it, and updates it at its end, so the fence each encoder updated last
+ * is done only once every earlier encoder of that fence is. A barrier then waits for the other
+ * seven, which covers every encoder before it: over-synchronising, as the barrier may (all
+ * stages, all resources). The order is the order the encoders were made in, which is the
+ * queue's where its command buffers are committed in the order they were encoded.
+ *
  * NOT MAPPED HERE (no RgfxEncoder op yet — follow-ups, no wire invented): the render SPI-only
  * ops that have no public selector (provoking-vertex, alpha-test ref, line width, point size,
  * viewport-transform, primitive-restart, depth/stencil "cleared", resolve textures,
@@ -26,11 +35,12 @@
  * computeDispatchThreadsIndirect; the blit fill-texture, fill-buffer-pattern4 and
  * invalidate-compressed ops. The public members of features the device does not support
  * (function tables, acceleration structures, mesh and object stages, counters, tensors,
- * queue-stage barriers, depth bounds, colour attachment maps, depth store-action options) do
- * nothing on the wire and are logged (RgfxUnsupported.h).
+ * depth bounds, colour attachment maps, depth store-action options) do nothing on the wire
+ * and are logged (RgfxUnsupported.h).
  */
 
 #import "RgfxCommandObjects.h"
+#import "RgfxFence.h"
 #import "RgfxIOSurface.h"
 #import "RgfxUnsupported.h"
 #import "RgfxUploads.h"
@@ -291,8 +301,22 @@ uint32_t fillRenderPass(MTLRenderPassDescriptor *d, RgfxRenderPassDesc *desc,
 - (void)rgfxHoldSlot:(dispatch_semaphore_t)slots;
 @end
 
+/// How many barrier fences a queue has (QUEUE BARRIERS, above).
+constexpr uint32_t kRgfxBarrierFences = 8;
+
+/// An encoder's place among its queue's barrier fences: the fences, the one it takes, and how
+/// many of them encoders before it took. All fences 0 where the queue has none (no route).
+struct RgfxBarrierSlot {
+	RgfxObjId fences[kRgfxBarrierFences] = {};
+	uint32_t slot = 0;    // the fence the encoder updates at its end
+	uint32_t earlier = 0; // the fences earlier encoders took: 0..earlier-1, all once past eight
+	bool waitOwn = false; // an earlier encoder took the encoder's fence: wait for it first
+};
+
 @interface RgfxCommandQueue ()
 - (std::shared_ptr<RgfxUploadPool>)rgfxUploadPool;
+/// The next encoder's barrier fence, of the fences the queue made with itself.
+- (RgfxBarrierSlot)rgfxTakeBarrierSlot;
 @end
 
 @implementation RgfxCommandQueue {
@@ -314,6 +338,9 @@ uint32_t fillRenderPass(MTLRenderPassDescriptor *d, RgfxRenderPassDesc *desc,
 	// The chunks its command buffers' inline bytes go to (RgfxUploads.h), made with the first
 	// command buffer, over the queue's region.
 	std::shared_ptr<RgfxUploadPool> _uploadPool;
+	// The barrier fences (QUEUE BARRIERS), made with the queue, and the encoders made.
+	NSArray<RgfxFence *> *_barrierFences;
+	uint64_t _encodersMade;
 }
 
 + (instancetype)queueWithSubmitRing:(RgfxRingWriter *)submitRing
@@ -343,6 +370,15 @@ uint32_t fillRenderPass(MTLRenderPassDescriptor *d, RgfxRenderPassDesc *desc,
 		q->_ids = ids;
 		q->_maxCount = maxCount != 0 ? maxCount : 64;
 		q->_slots = dispatch_semaphore_create(static_cast<long>(q->_maxCount));
+		// Its barrier fences (QUEUE BARRIERS), made with it, so every encoder takes one.
+		NSMutableArray<RgfxFence *> *fences = [NSMutableArray array];
+		for (uint32_t i = 0; i < kRgfxBarrierFences; i++) {
+			RgfxFence *f = [RgfxFence fenceWithDevice:device serializer:serializer];
+			if (f == nil)
+				break;
+			[fences addObject:f];
+		}
+		q->_barrierFences = fences.count == kRgfxBarrierFences ? fences : @[];
 	}
 	return q;
 }
@@ -430,6 +466,22 @@ uint32_t fillRenderPass(MTLRenderPassDescriptor *d, RgfxRenderPassDesc *desc,
 		}
 		return _uploadPool;
 	}
+}
+
+- (RgfxBarrierSlot)rgfxTakeBarrierSlot
+{
+	RgfxBarrierSlot b;
+	@synchronized(self) {
+		if (_barrierFences.count != kRgfxBarrierFences)
+			return b;
+		for (uint32_t i = 0; i < kRgfxBarrierFences; i++)
+			b.fences[i] = [_barrierFences[i] rgfxObjId];
+		const uint64_t n = _encodersMade++;
+		b.slot = static_cast<uint32_t>(n % kRgfxBarrierFences);
+		b.earlier = static_cast<uint32_t>(n < kRgfxBarrierFences ? n : kRgfxBarrierFences);
+		b.waitOwn = n >= kRgfxBarrierFences;
+	}
+	return b;
 }
 
 - (RgfxCmdBuffer *)rgfxCommandBufferRetained:(BOOL)retained
@@ -594,16 +646,43 @@ uint32_t fillRenderPass(MTLRenderPassDescriptor *d, RgfxRenderPassDesc *desc,
 - (void)rgfxSetUploads:(std::shared_ptr<RgfxUploadArena>)uploads;
 // The tile size its pass descriptor asked for (0: the device's choice).
 - (void)rgfxSetTileWidth:(NSUInteger)width height:(NSUInteger)height;
+// Its barrier fence (QUEUE BARRIERS): `begin` for an encoder of its own pass, which waits for
+// its fence's last encoder now and updates the fence at its end; not for a parallel pass's
+// sub-encoder, whose pass does both.
+- (void)rgfxSetBarrierSlot:(const RgfxBarrierSlot &)slot begin:(BOOL)begin;
 @end
 @interface RgfxComputeCommandEncoder ()
 - (void)rgfxSetUploads:(std::shared_ptr<RgfxUploadArena>)uploads;
 // The dispatch type its pass was opened with.
 - (void)rgfxSetDispatchType:(MTLDispatchType)dispatchType;
+- (void)rgfxSetBarrierSlot:(const RgfxBarrierSlot &)slot;
+@end
+@interface RgfxBlitCommandEncoder ()
+- (void)rgfxSetBarrierSlot:(const RgfxBarrierSlot &)slot;
 @end
 @interface RgfxParallelRenderCommandEncoder ()
 - (void)rgfxSetUploads:(std::shared_ptr<RgfxUploadArena>)uploads;
 - (void)rgfxSetTileWidth:(NSUInteger)width height:(NSUInteger)height;
+- (void)rgfxSetBarrierSlot:(const RgfxBarrierSlot &)slot;
 @end
+
+namespace {
+
+// The render stages a queue barrier's fences wait before and update after: every stage the
+// device's pipelines have.
+constexpr uint64_t kRgfxBarrierRenderStages = MTLRenderStageVertex | MTLRenderStageFragment;
+
+// The fences a barrier in the encoder of `b` waits for: every one but its own that an earlier
+// encoder took, calling `wait` with each.
+template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &b, Wait wait)
+{
+	for (uint32_t t = 0; t < b.earlier; t++) {
+		if (t != b.slot && b.fences[t] != 0)
+			wait(b.fences[t]);
+	}
+}
+
+} // namespace
 
 @implementation RgfxCmdBuffer {
 	RgfxCommandQueue *_queue; // kept alive, as Metal's command buffers keep their queue
@@ -725,6 +804,7 @@ uint32_t fillRenderPass(MTLRenderPassDescriptor *d, RgfxRenderPassDesc *desc,
 	                                                                           device:self.device];
 	[enc rgfxSetUploads:_uploads];
 	[enc rgfxSetTileWidth:renderPassDescriptor.tileWidth height:renderPassDescriptor.tileHeight];
+	[enc rgfxSetBarrierSlot:[_queue rgfxTakeBarrierSlot] begin:YES];
 	return enc;
 }
 
@@ -734,6 +814,7 @@ uint32_t fillRenderPass(MTLRenderPassDescriptor *d, RgfxRenderPassDesc *desc,
 	RgfxComputeCommandEncoder *enc = [[RgfxComputeCommandEncoder alloc] initWithEncoder:_encoder
 	                                                                             device:self.device];
 	[enc rgfxSetUploads:_uploads];
+	[enc rgfxSetBarrierSlot:[_queue rgfxTakeBarrierSlot]];
 	return enc;
 }
 
@@ -752,13 +833,17 @@ uint32_t fillRenderPass(MTLRenderPassDescriptor *d, RgfxRenderPassDesc *desc,
 	                                                                             device:self.device];
 	[enc rgfxSetUploads:_uploads];
 	[enc rgfxSetDispatchType:dispatchType];
+	[enc rgfxSetBarrierSlot:[_queue rgfxTakeBarrierSlot]];
 	return enc;
 }
 
 - (nullable id<MTLBlitCommandEncoder>)blitCommandEncoder
 {
 	_encoder->beginBlitPass();
-	return [[RgfxBlitCommandEncoder alloc] initWithEncoder:_encoder device:self.device];
+	RgfxBlitCommandEncoder *enc = [[RgfxBlitCommandEncoder alloc] initWithEncoder:_encoder
+	                                                                       device:self.device];
+	[enc rgfxSetBarrierSlot:[_queue rgfxTakeBarrierSlot]];
+	return enc;
 }
 
 - (nullable id<MTLBlitCommandEncoder>)blitCommandEncoderWithDescriptor:
@@ -766,8 +851,7 @@ uint32_t fillRenderPass(MTLRenderPassDescriptor *d, RgfxRenderPassDesc *desc,
 {
 	// The blit pass descriptor carries only sample-buffer attachments (diagnostics);
 	// the op stream's blit pass has no body.
-	_encoder->beginBlitPass();
-	return [[RgfxBlitCommandEncoder alloc] initWithEncoder:_encoder device:self.device];
+	return [self blitCommandEncoder];
 }
 
 - (nullable id<MTLParallelRenderCommandEncoder>)parallelRenderCommandEncoderWithDescriptor:
@@ -782,6 +866,7 @@ uint32_t fillRenderPass(MTLRenderPassDescriptor *d, RgfxRenderPassDesc *desc,
 	    [[RgfxParallelRenderCommandEncoder alloc] initWithEncoder:_encoder device:self.device];
 	[enc rgfxSetUploads:_uploads];
 	[enc rgfxSetTileWidth:renderPassDescriptor.tileWidth height:renderPassDescriptor.tileHeight];
+	[enc rgfxSetBarrierSlot:[_queue rgfxTakeBarrierSlot]];
 	return enc;
 }
 
@@ -1210,6 +1295,8 @@ uint32_t fillRenderPass(MTLRenderPassDescriptor *d, RgfxRenderPassDesc *desc,
 	NSString *_encLabel;
 	std::shared_ptr<RgfxUploadArena> _uploads; // the command buffer's, for inline bytes
 	NSUInteger _tileWidth, _tileHeight;          // the pass descriptor's tile size
+	RgfxBarrierSlot _barrier;                    // its queue barrier fence (QUEUE BARRIERS)
+	BOOL _barrierWaited;                         // a barrier has waited for the earlier encoders
 }
 
 - (void)rgfxSetUploads:(std::shared_ptr<RgfxUploadArena>)uploads
@@ -1221,6 +1308,13 @@ uint32_t fillRenderPass(MTLRenderPassDescriptor *d, RgfxRenderPassDesc *desc,
 {
 	_tileWidth = width;
 	_tileHeight = height;
+}
+
+- (void)rgfxSetBarrierSlot:(const RgfxBarrierSlot &)slot begin:(BOOL)begin
+{
+	_barrier = slot;
+	if (begin && slot.waitOwn && slot.fences[slot.slot] != 0)
+		_enc->renderWaitForFence(slot.fences[slot.slot], kRgfxBarrierRenderStages);
 }
 
 - (instancetype)initWithEncoder:(RgfxEncoder *)enc
@@ -1263,6 +1357,8 @@ uint32_t fillRenderPass(MTLRenderPassDescriptor *d, RgfxRenderPassDesc *desc,
 - (void)endEncoding
 {
 	if (_emitEnd) {
+		if (_barrier.fences[_barrier.slot] != 0)
+			_enc->renderUpdateFence(_barrier.fences[_barrier.slot], kRgfxBarrierRenderStages);
 		_enc->endEncoder();
 	}
 }
@@ -2015,9 +2111,16 @@ uint32_t fillRenderPass(MTLRenderPassDescriptor *d, RgfxRenderPassDesc *desc,
 	if (mapping != nil)
 		RGFX_UNSUPPORTED("color attachment mapping (no op on the wire)");
 }
+// Waits for every encoder made before this one on the queue (QUEUE BARRIERS), whatever the
+// stages: once is enough, as no earlier encoder is added after.
 - (void)barrierAfterQueueStages:(MTLStages)afterQueueStages beforeStages:(MTLStages)beforeStages
 {
-	RGFX_UNSUPPORTED("queue-stage barriers (no op on the wire)");
+	if (_barrierWaited)
+		return;
+	_barrierWaited = YES;
+	rgfxWaitForEarlierEncoders(_barrier, [&](RgfxObjId fence) {
+		_enc->renderWaitForFence(fence, kRgfxBarrierRenderStages);
+	});
 }
 - (void)sampleCountersInBuffer:(id<MTLCounterSampleBuffer>)sampleBuffer
                  atSampleIndex:(NSUInteger)sampleIndex
@@ -2279,6 +2382,15 @@ uint32_t fillRenderPass(MTLRenderPassDescriptor *d, RgfxRenderPassDesc *desc,
 	NSString *_encLabel;
 	std::shared_ptr<RgfxUploadArena> _uploads; // the command buffer's, for inline bytes
 	MTLDispatchType _dispatchType;              // the pass's; Serial, Metal's default, unless set
+	RgfxBarrierSlot _barrier;                   // its queue barrier fence (QUEUE BARRIERS)
+	BOOL _barrierWaited;
+}
+
+- (void)rgfxSetBarrierSlot:(const RgfxBarrierSlot &)slot
+{
+	_barrier = slot;
+	if (slot.waitOwn && slot.fences[slot.slot] != 0)
+		_enc->computeWaitForFence(slot.fences[slot.slot]);
 }
 
 - (void)rgfxSetUploads:(std::shared_ptr<RgfxUploadArena>)uploads
@@ -2331,6 +2443,8 @@ uint32_t fillRenderPass(MTLRenderPassDescriptor *d, RgfxRenderPassDesc *desc,
 }
 - (void)endEncoding
 {
+	if (_barrier.fences[_barrier.slot] != 0)
+		_enc->computeUpdateFence(_barrier.fences[_barrier.slot]);
 	_enc->endEncoder();
 }
 
@@ -2618,9 +2732,13 @@ uint32_t fillRenderPass(MTLRenderPassDescriptor *d, RgfxRenderPassDesc *desc,
 {
 	RGFX_UNSUPPORTED("counter sampling");
 }
+// Waits for every encoder made before this one on the queue (QUEUE BARRIERS).
 - (void)barrierAfterQueueStages:(MTLStages)afterQueueStages beforeStages:(MTLStages)beforeStages
 {
-	RGFX_UNSUPPORTED("queue-stage barriers (no op on the wire)");
+	if (_barrierWaited)
+		return;
+	_barrierWaited = YES;
+	rgfxWaitForEarlierEncoders(_barrier, [&](RgfxObjId fence) { _enc->computeWaitForFence(fence); });
 }
 
 @end
@@ -2633,6 +2751,15 @@ uint32_t fillRenderPass(MTLRenderPassDescriptor *d, RgfxRenderPassDesc *desc,
 	RgfxEncoder *_enc;
 	__weak id<MTLDevice> _device;
 	NSString *_encLabel;
+	RgfxBarrierSlot _barrier; // its queue barrier fence (QUEUE BARRIERS)
+	BOOL _barrierWaited;
+}
+
+- (void)rgfxSetBarrierSlot:(const RgfxBarrierSlot &)slot
+{
+	_barrier = slot;
+	if (slot.waitOwn && slot.fences[slot.slot] != 0)
+		_enc->blitWaitForFence(slot.fences[slot.slot]);
 }
 
 - (instancetype)initWithEncoder:(RgfxEncoder *)enc device:(id<MTLDevice>)device
@@ -2670,6 +2797,8 @@ uint32_t fillRenderPass(MTLRenderPassDescriptor *d, RgfxRenderPassDesc *desc,
 }
 - (void)endEncoding
 {
+	if (_barrier.fences[_barrier.slot] != 0)
+		_enc->blitUpdateFence(_barrier.fences[_barrier.slot]);
 	_enc->endEncoder();
 }
 
@@ -2904,9 +3033,13 @@ destinationBytesPerImage:(NSUInteger)destinationBytesPerImage
 {
 	RGFX_UNSUPPORTED("tensors");
 }
+// Waits for every encoder made before this one on the queue (QUEUE BARRIERS).
 - (void)barrierAfterQueueStages:(MTLStages)afterQueueStages beforeStages:(MTLStages)beforeStages
 {
-	RGFX_UNSUPPORTED("queue-stage barriers (no op on the wire)");
+	if (_barrierWaited)
+		return;
+	_barrierWaited = YES;
+	rgfxWaitForEarlierEncoders(_barrier, [&](RgfxObjId fence) { _enc->blitWaitForFence(fence); });
 }
 
 @end
@@ -2922,6 +3055,15 @@ destinationBytesPerImage:(NSUInteger)destinationBytesPerImage
 	BOOL _ended;
 	std::shared_ptr<RgfxUploadArena> _uploads; // the command buffer's, for its sub-encoders
 	NSUInteger _tileWidth, _tileHeight;
+	RgfxBarrierSlot _barrier; // the pass's queue barrier fence (QUEUE BARRIERS)
+	BOOL _barrierWaited;
+}
+
+- (void)rgfxSetBarrierSlot:(const RgfxBarrierSlot &)slot
+{
+	_barrier = slot;
+	if (slot.waitOwn && slot.fences[slot.slot] != 0)
+		_enc->renderWaitForFence(slot.fences[slot.slot], kRgfxBarrierRenderStages);
 }
 
 - (void)rgfxSetUploads:(std::shared_ptr<RgfxUploadArena>)uploads
@@ -2979,6 +3121,7 @@ destinationBytesPerImage:(NSUInteger)destinationBytesPerImage
 	                                                                           device:_device];
 	[sub rgfxSetUploads:_uploads];
 	[sub rgfxSetTileWidth:_tileWidth height:_tileHeight];
+	[sub rgfxSetBarrierSlot:_barrier begin:NO];
 	return sub;
 }
 
@@ -2986,6 +3129,8 @@ destinationBytesPerImage:(NSUInteger)destinationBytesPerImage
 {
 	if (!_ended) {
 		_ended = YES;
+		if (_barrier.fences[_barrier.slot] != 0)
+			_enc->renderUpdateFence(_barrier.fences[_barrier.slot], kRgfxBarrierRenderStages);
 		_enc->endEncoder();
 	}
 }
@@ -3017,9 +3162,15 @@ destinationBytesPerImage:(NSUInteger)destinationBytesPerImage
 	if (storeActionOptions != MTLStoreActionOptionNone)
 		RGFX_UNSUPPORTED("depth store action options (no op on the wire)");
 }
+// Waits for every encoder made before this pass on the queue (QUEUE BARRIERS).
 - (void)barrierAfterQueueStages:(MTLStages)afterQueueStages beforeStages:(MTLStages)beforeStages
 {
-	RGFX_UNSUPPORTED("queue-stage barriers (no op on the wire)");
+	if (_barrierWaited)
+		return;
+	_barrierWaited = YES;
+	rgfxWaitForEarlierEncoders(_barrier, [&](RgfxObjId fence) {
+		_enc->renderWaitForFence(fence, kRgfxBarrierRenderStages);
+	});
 }
 
 @end
