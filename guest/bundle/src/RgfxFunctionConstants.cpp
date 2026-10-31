@@ -120,20 +120,24 @@ bool rgfxReadConstantTable(const uint8_t *bytes, size_t length, uint64_t offset,
 	if (section > length || sectionSize > length - section || offset > sectionSize ||
 	    sectionSize - offset < 4)
 		return false;
-	// The entry: a u32 size counting itself, then its tags (a 4-byte name, a u16 size and the
-	// data) up to `ENDT`.
+	// The entry: a u32 size, then its tags (a 4-byte name, a u16 size and the data) up to
+	// `ENDT`. The size counts its own 4 bytes in a metallib built for macOS 27, and not in one
+	// built for macOS 26 (measured: Apple metal 32023.922, -mmacosx-version-min 27.2 and 26.0,
+	// the same functions), so the tags are read up to the 4 bytes past it.
 	const uint8_t *entry = bytes + section + offset;
+	const uint64_t room = sectionSize - offset;
 	const uint32_t size = rd32(entry);
-	if (size < 4 || size > sectionSize - offset)
+	if (size < 4 || size > room)
 		return false;
+	const size_t end = static_cast<size_t>(size + 4 <= room ? size + 4 : size);
 	size_t at = 4;
-	while (size - at >= 4) {
+	while (end - at >= 4) {
 		if (std::memcmp(entry + at, "ENDT", 4) == 0)
 			return true;
-		if (size - at < 6)
+		if (end - at < 6)
 			break;
 		const uint16_t tagSize = rd16(entry + at + 4);
-		if (tagSize > size - at - 6)
+		if (tagSize > end - at - 6)
 			break;
 		if (std::memcmp(entry + at, "CNST", 4) == 0 && !readCnst(entry + at + 6, tagSize, out))
 			break;

@@ -1002,8 +1002,10 @@ void putTag(std::vector<uint8_t> &v, const char *name, const std::vector<uint8_t
 // per function a group of tags (NAME, TYPE, OFFT, whose first field places the function's
 // entry in the public metadata), and per function a public entry (its size, then a CNST tag
 // where it declares constants: a u16 count, then each name, MTLDataType byte, u16 index and
-// required byte). No bitcode: the shell never reads it.
-std::vector<uint8_t> metallibOf(const std::vector<TestFunction> &functions)
+// required byte), whose size counts itself where `sizeCountsItself` (macOS 27's) and not
+// otherwise (macOS 26's). No bitcode: the shell never reads it.
+std::vector<uint8_t> metallibOf(const std::vector<TestFunction> &functions,
+                                bool sizeCountsItself = true)
 {
 	std::vector<uint8_t> list, pub;
 	put32(list, static_cast<uint32_t>(functions.size()));
@@ -1023,7 +1025,7 @@ std::vector<uint8_t> metallibOf(const std::vector<TestFunction> &functions)
 			putTag(entry, "CNST", cnst);
 		}
 		entry.insert(entry.end(), { 'E', 'N', 'D', 'T' });
-		uint32_t entrySize = static_cast<uint32_t>(entry.size());
+		uint32_t entrySize = static_cast<uint32_t>(entry.size() - (sizeCountsItself ? 0 : 4));
 		std::memcpy(entry.data(), &entrySize, 4);
 		std::vector<uint8_t> group, offt;
 		put32(group, 0);
@@ -1234,6 +1236,35 @@ void test_function_constants_resolve_as_metal()
 	RgfxFunctionConstant tint;
 	std::memcpy(&tint, create.data() + head.fragment_constants_offset + 2 * sizeof(tint), sizeof(tint));
 	CHECK(tint.index == 11 && tint.data_type == 6 && std::memcmp(tint.value, four, 16) == 0);
+
+	// A metallib built for macOS 26, whose entries' sizes do not count themselves: its constants
+	// are read alike, by name and against their types.
+	const std::vector<uint8_t> older = metallibOf(
+	    {
+	        { "knl", 2, { { "scale", 3, 3, true }, { "mode", 29, 7, true } } },
+	        { "plain", 1, {} },
+	    },
+	    false);
+	RgfxLibrary *lib26 = [RgfxLibrary libraryWithData:older.data()
+	                                           length:older.size()
+	                                              key:nullptr
+	                                           device:nil
+	                                       serializer:&fx.ser
+	                                           status:&status];
+	CHECK(lib26 != nil);
+	(void)nextMessage(fx.ring, RGFX_CMD_LIBRARY_CREATE);
+	MTLFunctionConstantValues *byName = [MTLFunctionConstantValues new];
+	[byName setConstantValue:&five type:MTLDataTypeFloat withName:@"scale"];
+	err = nil;
+	id<MTLFunction> knl26 = [lib26 newFunctionWithName:@"knl" constantValues:byName error:&err];
+	CHECK(knl26 != nil && [(RgfxFunction *)knl26 rgfxConstantCount] == 2);
+	CHECK(constantAt(knl26, 3) != nullptr && std::memcmp(constantAt(knl26, 3)->value, &five, 4) == 0);
+	CHECK(constantAt(knl26, 7) != nullptr && constantAt(knl26, 7)->value[0] == 0);
+	[byName setConstantValue:&yes type:MTLDataTypeBool withName:@"mode"];
+	err = nil;
+	CHECK([lib26 newFunctionWithName:@"knl" constantValues:byName error:&err] == nil);
+	CHECK(err.code == MTLLibraryErrorCompileFailure);
+	CHECK([lib26 newFunctionWithName:@"plain"].functionConstantsDictionary.count == 0);
 }
 
 // The argument encoder is a documented stub: it holds its argument count, carries no
