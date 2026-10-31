@@ -31,7 +31,7 @@
 //! `supportsCounterSampling:` and `recommendedMaxWorkingSetSize`: each is `None` here (the working
 //! set the heaps' sum), and a query of the runtime's to come.
 
-use metal2vulkan::vk;
+use ash::vk;
 use metal2vulkan_runtime as rt;
 use reims_vgpu_core::platform::caps::{
     DeviceCaps, FEATURE_SETS, IdentityCaps, IdentityFlags, IdentitySizes, LARGEST_COUNT_ASKED,
