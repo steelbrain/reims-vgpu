@@ -42,23 +42,27 @@ CXXFLAGS = -isysroot $(SDK) -std=c++17 -Os \
 	-Wall -Wextra -Werror -Wno-unused-parameter \
 	-I src -I $(WIRE)
 
-# ObjC++ (.mm) also needs ARC and five warning suppressions: our classes conform to
-# the full Metal protocols (MTLDevice/MTLBuffer/…) but deliberately implement only
-# the selectors a slice owns — the Apple-private base supplies the device's protocol
-# properties/methods at load, and the later slices fill the wrappers — so the
-# protocol-completeness and protocol-property-synthesis diagnostics are expected and
-# not errors. (unguarded-availability-new: we target the running OS's SPI;
-# deprecated-declarations: the device protocol has members Apple deprecated on
-# macOS 27 — location/peer*/locationNumber/didModifyRange — that we still implement
-# for MTLDevice/MTLBuffer conformance and older guests; objc-protocol-method-
-# implementation: the category split (RgfxMetalDevice+Sync and the later slices)
-# implements MTLDevice protocol methods in a category whose primary class declares
-# the conformance, which clang flags though the primary class implements none of
-# them — expected by design, one category per slice.)
-OBJCXXFLAGS = -fobjc-arc \
-	-Wno-objc-protocol-property-synthesis -Wno-protocol \
-	-Wno-incomplete-implementation -Wno-unguarded-availability-new \
-	-Wno-deprecated-declarations -Wno-objc-protocol-method-implementation
+# ObjC++ (.mm) also needs ARC and three warning suppressions (unguarded-availability-new:
+# we target the running OS's SPI; deprecated-declarations: the device protocol has members
+# Apple deprecated on macOS 27 — location/peer*/locationNumber/didModifyRange — that we still
+# implement for MTLDevice/MTLBuffer conformance and older guests; objc-protocol-method-
+# implementation: the device's category split implements MTLDevice protocol methods in
+# categories whose primary class declares the conformance).
+OBJCXXFLAGS = -fobjc-arc -Wno-unguarded-availability-new -Wno-deprecated-declarations \
+	-Wno-objc-protocol-method-implementation
+# The protocol-completeness diagnostics: a Metal protocol member a wrapper class leaves out is
+# a warning, never an error, so what is left shows on every build of the file. A member the
+# device does not support is not left out: it is marked RGFX_UNSUPPORTED (src/RgfxUnsupported.h),
+# and the bundle's build prints how many there are. The device's own files (RgfxMetalDevice*.mm)
+# keep them quiet: its members live in its categories and in the IOGPU base, which these
+# diagnostics do not see, so they would list every member. tools/protocol_audit.m checks
+# the device at run time instead, through the base.
+PROTOCOL_WARN  = -Wprotocol -Wincomplete-implementation -Wobjc-protocol-property-synthesis \
+	-Wno-error=protocol -Wno-error=incomplete-implementation \
+	-Wno-error=objc-protocol-property-synthesis
+PROTOCOL_QUIET = -Wno-protocol -Wno-incomplete-implementation \
+	-Wno-objc-protocol-property-synthesis
+PROTOCOL_FLAGS = $(PROTOCOL_WARN)
 FRAMEWORKS  = -framework Metal -framework Foundation -framework IOKit -framework IOSurface
 # The device shell subclasses IOGPUMetalDevice, whose ObjC class symbol
 # (_OBJC_CLASS_$_IOGPUMetalDevice) is a hard link-time dependency. It lives in
@@ -109,7 +113,7 @@ $(BUILD)/obj/$(ARCH)/core/%.o: src/%.cpp $(HEADERS) $(WIRE)/reims_graphics_wire.
 
 $(BUILD)/obj/$(ARCH)/shell/%.o: src/%.mm $(HEADERS) $(WIRE)/reims_graphics_wire.h Makefile
 	@mkdir -p $(@D)
-	$(CXX) -arch $(ARCH) $(CXXFLAGS) $(OBJCXXFLAGS) -c $< -o $@
+	$(CXX) -arch $(ARCH) $(CXXFLAGS) $(OBJCXXFLAGS) $(PROTOCOL_FLAGS) -c $< -o $@
 
 $(BUILD)/obj/$(NATIVE)/core/%.o: src/%.cpp $(HEADERS) $(WIRE)/reims_graphics_wire.h Makefile
 	@mkdir -p $(@D)
@@ -117,7 +121,11 @@ $(BUILD)/obj/$(NATIVE)/core/%.o: src/%.cpp $(HEADERS) $(WIRE)/reims_graphics_wir
 
 $(BUILD)/obj/$(NATIVE)/shell/%.o: src/%.mm $(HEADERS) $(WIRE)/reims_graphics_wire.h Makefile
 	@mkdir -p $(@D)
-	$(CXX) -arch $(NATIVE) $(CXXFLAGS) $(OBJCXXFLAGS) -c $< -o $@
+	$(CXX) -arch $(NATIVE) $(CXXFLAGS) $(OBJCXXFLAGS) $(PROTOCOL_FLAGS) -c $< -o $@
+
+# The device's files keep the protocol diagnostics quiet (above).
+$(patsubst src/%.mm,$(BUILD)/obj/$(ARCH)/shell/%.o,$(wildcard src/RgfxMetalDevice*.mm)): \
+	PROTOCOL_FLAGS = $(PROTOCOL_QUIET)
 
 # --- the serialiser check (x86_64, Rosetta) ----------------------------------
 
@@ -132,7 +140,7 @@ SHELL_TESTSRCS = tests/shell_tests.mm tests/protocol_tests.mm
 
 $(SHELL_TESTBIN): $(CORE_OBJ_NAT) $(WRAP_OBJ_NAT) $(SHELL_TESTSRCS) $(HEADERS) $(TESTHEADERS) Makefile
 	@mkdir -p $(@D)
-	$(CXX) -arch $(NATIVE) $(CXXFLAGS) $(OBJCXXFLAGS) -I tests \
+	$(CXX) -arch $(NATIVE) $(CXXFLAGS) $(OBJCXXFLAGS) $(PROTOCOL_QUIET) -I tests \
 		$(CORE_OBJ_NAT) $(WRAP_OBJ_NAT) $(SHELL_TESTSRCS) $(FRAMEWORKS) -o $@
 
 test: $(SER_TESTBIN) $(SHELL_TESTBIN)
@@ -152,6 +160,8 @@ $(BUNDLEBIN): $(CORE_OBJ_ARCH) $(SHELL_OBJ_ARCH) Makefile
 	$(CXX) -arch $(ARCH) $(CXXFLAGS) $(OBJCXXFLAGS) \
 		-bundle -undefined dynamic_lookup $(FRAMEWORKS) $(PRIVFW) \
 		$(CORE_OBJ_ARCH) $(SHELL_OBJ_ARCH) -o $@
+	@echo "$(notdir $@): $$(cat src/*.mm | grep -o 'RGFX_UNSUPPORTED[A-Z_]*(' | wc -l | tr -d ' ')" \
+	      "members marked RGFX_UNSUPPORTED (src/RgfxUnsupported.h)"
 
 clean:
 	rm -rf $(BUILD)
