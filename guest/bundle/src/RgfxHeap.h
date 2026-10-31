@@ -46,10 +46,12 @@ NS_ASSUME_NONNULL_BEGIN
 
 /// Creates a Shared heap over a block of the device region at `regionOffset`,
 /// serialising an `RGFX_CMD_HEAP_OVER_HOST_MEMORY` through `serializer` (which picks the
-/// objId and GPU address). The host sees the heap's memory in place. Returns nil if
+/// objId and GPU address). The host sees the heap's memory in place. `deallocator` (may
+/// be nil) gives the block back once the host has dropped the heap. Returns nil if
 /// `serializer` is null or `descriptor` is nil.
 + (nullable instancetype)heapOverHostMemoryWithDescriptor:(MTLHeapDescriptor *)descriptor
                                              regionOffset:(uint64_t)regionOffset
+                                              deallocator:(nullable void (^)(void))deallocator
                                                    device:(nullable id<MTLDevice>)device
                                                serializer:(nullable RgfxSerializer *)serializer;
 

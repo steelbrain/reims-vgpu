@@ -39,9 +39,13 @@
 #import "RgfxRenderPipelineState.h"
 #include <vector>
 #import "RgfxCommandObjects.h"
+#import "RgfxIOSurface.h"
+
+#include <IOSurface/IOSurface.h>
 
 #include <pthread.h>
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <mutex>
@@ -73,16 +77,19 @@ namespace {
 // A ring + id space + serialiser over a plain-buffer region, the fixture every
 // wrapper routing test stands up. Mirrors how a device category would reach its
 // serialiser, minus the device (nil here, as a wrapper allows).
+// The transport is never freed: an object a test lets go may dealloc after the test (its
+// autorelease pool drains later, or a retirement waits) and post its destroy here.
 struct Fixture {
-	TestRing ring;
-	RgfxRingWriter writer;
-	RgfxIdSpace ids;
-	RgfxSerializer ser;
+	TestRing &ring;
+	RgfxRingWriter &writer;
+	RgfxIdSpace &ids;
+	RgfxSerializer &ser;
 
 	Fixture()
-	    : ring(0x8000), writer(ring.base(), ring.dataSize, RGFX_CONTROL_RING_ID, TestRing::doorbell,
-	                           nullptr),
-	      ids(), ser(writer, ids)
+	    : ring(*new TestRing(0x8000)),
+	      writer(*new RgfxRingWriter(ring.base(), ring.dataSize, RGFX_CONTROL_RING_ID,
+	                                 TestRing::doorbell, nullptr)),
+	      ids(*new RgfxIdSpace()), ser(*new RgfxSerializer(writer, ids))
 	{
 		ring.setConsumerIdle(1); // host idle, so each post rings the doorbell
 	}
@@ -875,12 +882,13 @@ void test_command_graph()
 {
 	// Control ring for the serialiser (QUEUE_CREATE), and a separate submission ring
 	// the queue's command buffers post on (COMMAND_BUFFER).
-	TestRing control(0x8000);
+	// Never freed, as Fixture's: the queue and its buffers may go after the test.
+	TestRing &control = *new TestRing(0x8000);
 	control.setConsumerIdle(1);
-	RgfxRingWriter controlWriter(control.base(), control.dataSize, RGFX_CONTROL_RING_ID,
-	                             TestRing::doorbell, nullptr);
-	RgfxIdSpace ids;
-	RgfxSerializer ser(controlWriter, ids);
+	RgfxRingWriter &controlWriter = *new RgfxRingWriter(
+	    control.base(), control.dataSize, RGFX_CONTROL_RING_ID, TestRing::doorbell, nullptr);
+	RgfxIdSpace &ids = *new RgfxIdSpace();
+	RgfxSerializer &ser = *new RgfxSerializer(controlWriter, ids);
 
 	TestRing submit(0x8000);
 	submit.setConsumerIdle(1);
@@ -1163,12 +1171,13 @@ void test_command_graph()
 // single ENCODER_END.
 void test_parallel_render_encoder()
 {
-	TestRing control(0x8000);
+	// Never freed, as Fixture's: the queue and its buffers may go after the test.
+	TestRing &control = *new TestRing(0x8000);
 	control.setConsumerIdle(1);
-	RgfxRingWriter controlWriter(control.base(), control.dataSize, RGFX_CONTROL_RING_ID,
-	                             TestRing::doorbell, nullptr);
-	RgfxIdSpace ids;
-	RgfxSerializer ser(controlWriter, ids);
+	RgfxRingWriter &controlWriter = *new RgfxRingWriter(
+	    control.base(), control.dataSize, RGFX_CONTROL_RING_ID, TestRing::doorbell, nullptr);
+	RgfxIdSpace &ids = *new RgfxIdSpace();
+	RgfxSerializer &ser = *new RgfxSerializer(controlWriter, ids);
 	TestRing submit(0x8000);
 	submit.setConsumerIdle(1);
 	RgfxRingWriter submitWriter(submit.base(), submit.dataSize, 1, TestRing::doorbell, nullptr);
@@ -1233,12 +1242,13 @@ void test_parallel_render_encoder()
 // A queue must have a route, an id space and a ring.
 void test_queue_guards()
 {
-	TestRing control(0x8000);
+	// Never freed, as Fixture's: the queue and its buffers may go after the test.
+	TestRing &control = *new TestRing(0x8000);
 	control.setConsumerIdle(1);
-	RgfxRingWriter controlWriter(control.base(), control.dataSize, RGFX_CONTROL_RING_ID,
-	                             TestRing::doorbell, nullptr);
-	RgfxIdSpace ids;
-	RgfxSerializer ser(controlWriter, ids);
+	RgfxRingWriter &controlWriter = *new RgfxRingWriter(
+	    control.base(), control.dataSize, RGFX_CONTROL_RING_ID, TestRing::doorbell, nullptr);
+	RgfxIdSpace &ids = *new RgfxIdSpace();
+	RgfxSerializer &ser = *new RgfxSerializer(controlWriter, ids);
 	TestRing submit(0x8000);
 	RgfxRingWriter submitWriter(submit.base(), submit.dataSize, 1, TestRing::doorbell, nullptr);
 
@@ -1330,12 +1340,13 @@ void test_region_allocator()
 // with its region; here the factory is driven directly with a fixture region).
 void test_queue_carries_allocated_offsets()
 {
-	TestRing control(0x8000);
+	// Never freed, as Fixture's: the queue and its buffers may go after the test.
+	TestRing &control = *new TestRing(0x8000);
 	control.setConsumerIdle(1);
-	RgfxRingWriter controlWriter(control.base(), control.dataSize, RGFX_CONTROL_RING_ID,
-	                             TestRing::doorbell, nullptr);
-	RgfxIdSpace ids;
-	RgfxSerializer ser(controlWriter, ids);
+	RgfxRingWriter &controlWriter = *new RgfxRingWriter(
+	    control.base(), control.dataSize, RGFX_CONTROL_RING_ID, TestRing::doorbell, nullptr);
+	RgfxIdSpace &ids = *new RgfxIdSpace();
+	RgfxSerializer &ser = *new RgfxSerializer(controlWriter, ids);
 
 	std::vector<uint8_t> mem(0x800000, 0);
 	RgfxRegion region(mem.data(), mem.size());
@@ -1367,12 +1378,13 @@ void test_queue_carries_allocated_offsets()
 // fires with the buffer, its status flips, and an error completion carries the error.
 void test_reply_reader_completion()
 {
-	TestRing control(0x8000);
+	// Never freed, as Fixture's: the queue and its buffers may go after the test.
+	TestRing &control = *new TestRing(0x8000);
 	control.setConsumerIdle(1);
-	RgfxRingWriter controlWriter(control.base(), control.dataSize, RGFX_CONTROL_RING_ID,
-	                             TestRing::doorbell, nullptr);
-	RgfxIdSpace ids;
-	RgfxSerializer ser(controlWriter, ids);
+	RgfxRingWriter &controlWriter = *new RgfxRingWriter(
+	    control.base(), control.dataSize, RGFX_CONTROL_RING_ID, TestRing::doorbell, nullptr);
+	RgfxIdSpace &ids = *new RgfxIdSpace();
+	RgfxSerializer &ser = *new RgfxSerializer(controlWriter, ids);
 	TestRing submit(0x8000);
 	submit.setConsumerIdle(1);
 	RgfxRingWriter submitWriter(submit.base(), submit.dataSize, 1, TestRing::doorbell, nullptr);
@@ -1674,22 +1686,26 @@ template <typename F> bool eventually(F pred)
 
 // A queue over its own submission and completion rings, as the device makes one, with an
 // owned reader the completion thread can drive.
+// The rings and the serialiser are never freed, as Fixture's: the queue lives on while a
+// command buffer the test let go holds it.
 struct QueueFixture {
-	TestRing control{0x8000};
-	RgfxRingWriter controlWriter{control.base(), control.dataSize, RGFX_CONTROL_RING_ID,
-	                             TestRing::doorbell, nullptr};
-	RgfxIdSpace ids;
-	RgfxSerializer ser{controlWriter, ids};
-	TestRing submit;
-	RgfxRingWriter submitWriter;
-	TestRing completion{0x8000};
+	TestRing &control = *new TestRing(0x8000);
+	RgfxRingWriter &controlWriter = *new RgfxRingWriter(
+	    control.base(), control.dataSize, RGFX_CONTROL_RING_ID, TestRing::doorbell, nullptr);
+	RgfxIdSpace &ids = *new RgfxIdSpace();
+	RgfxSerializer &ser = *new RgfxSerializer(controlWriter, ids);
+	TestRing &submit;
+	RgfxRingWriter &submitWriter;
+	TestRing &completion = *new TestRing(0x8000);
 	RgfxCommandQueue *queue = nil;
 
 	// A queue whose submission ring has `submitData` bytes, made with `maxCount`, its doorbell
 	// `doorbell` (with `doorbellContext`).
 	explicit QueueFixture(uint32_t submitData = 0x8000, NSUInteger maxCount = 0,
 	                      RgfxDoorbell doorbell = TestRing::doorbell, void *doorbellContext = nullptr)
-	    : submit(submitData), submitWriter(submit.base(), submit.dataSize, 1, doorbell, doorbellContext)
+	    : submit(*new TestRing(submitData)),
+	      submitWriter(*new RgfxRingWriter(submit.base(), submit.dataSize, 1, doorbell,
+	                                       doorbellContext))
 	{
 		control.setConsumerIdle(1);
 		submit.setConsumerIdle(1);
@@ -2461,6 +2477,502 @@ void test_managed_texture_cpu_copy()
 	}
 }
 
+// --- host objects go as the app lets them go ----------------------------------------------
+
+// The obj_id of the OBJECT_DESTROY next on `ring`.
+uint64_t nextDestroyed(TestRing &ring)
+{
+	return expectMessage<RgfxObjectDestroy>(ring, RGFX_CMD_OBJECT_DESTROY).obj_id;
+}
+
+bool ringEmpty(TestRing &ring)
+{
+	RgfxMsgHeader h = {};
+	std::vector<uint8_t> bytes;
+	return !ring.next(&h, &bytes);
+}
+
+// Reads every message waiting on `ring` (the creates a test does not check).
+void drainRing(TestRing &ring)
+{
+	while (!ringEmpty(ring)) {
+	}
+}
+
+bool retirementIdle()
+{
+	return RgfxRetirement::process().waiting() == 0 && RgfxRetirement::process().live() == 0;
+}
+
+// Each host object the bundle makes is destroyed as the app lets it go, at once with no
+// command buffer in flight: samplers, depth-stencil states, events, fences, shared events,
+// buffers, heaps, libraries, and render and compute pipelines.
+void test_objects_destroyed_as_let_go()
+{
+	CHECK(retirementIdle());
+	Fixture fx;
+	auto made = [&](id object) {
+		CHECK(object != nil);
+		uint64_t objId = ((RgfxResource *)object).rgfxObjId;
+		CHECK(objId != 0);
+		drainRing(fx.ring);
+		return objId;
+	};
+	uint64_t objId = 0;
+	@autoreleasepool {
+		objId = made([RgfxSampler samplerWithDescriptor:[MTLSamplerDescriptor new]
+		                                         device:nil
+		                                     serializer:&fx.ser]);
+	}
+	CHECK(nextDestroyed(fx.ring) == objId && ringEmpty(fx.ring));
+	@autoreleasepool {
+		objId = made([RgfxDepthStencilState
+		    depthStencilStateWithDescriptor:[MTLDepthStencilDescriptor new]
+		                             device:nil
+		                         serializer:&fx.ser]);
+	}
+	CHECK(nextDestroyed(fx.ring) == objId && ringEmpty(fx.ring));
+	@autoreleasepool {
+		objId = made([RgfxEvent eventWithDevice:nil serializer:&fx.ser]);
+	}
+	CHECK(nextDestroyed(fx.ring) == objId && ringEmpty(fx.ring));
+	@autoreleasepool {
+		objId = made([RgfxFence fenceWithDevice:nil serializer:&fx.ser]);
+	}
+	CHECK(nextDestroyed(fx.ring) == objId && ringEmpty(fx.ring));
+	@autoreleasepool {
+		objId = made([RgfxSharedEvent sharedEventWithInitialValue:3 device:nil serializer:&fx.ser]);
+	}
+	CHECK(nextDestroyed(fx.ring) == objId && ringEmpty(fx.ring));
+	@autoreleasepool {
+		objId = made([RgfxBuffer bufferWithLength:256 options:0 device:nil serializer:&fx.ser]);
+	}
+	CHECK(nextDestroyed(fx.ring) == objId && ringEmpty(fx.ring));
+	@autoreleasepool {
+		MTLHeapDescriptor *d = [MTLHeapDescriptor new];
+		d.size = 0x10000;
+		objId = made([RgfxHeap heapWithDescriptor:d device:nil serializer:&fx.ser]);
+	}
+	CHECK(nextDestroyed(fx.ring) == objId && ringEmpty(fx.ring));
+
+	const uint8_t libBytes[] = {1, 2, 3, 4};
+	uint32_t status = 0;
+	uint64_t libId = 0;
+	@autoreleasepool {
+		libId = made([RgfxLibrary libraryWithData:libBytes
+		                                   length:sizeof(libBytes)
+		                                      key:nullptr
+		                                   device:nil
+		                               serializer:&fx.ser
+		                                   status:&status]);
+	}
+	CHECK(nextDestroyed(fx.ring) == libId && ringEmpty(fx.ring));
+
+	RgfxLibrary *lib = nil;
+	@autoreleasepool {
+		lib = [RgfxLibrary libraryWithData:libBytes
+		                            length:sizeof(libBytes)
+		                               key:nullptr
+		                            device:nil
+		                        serializer:&fx.ser
+		                            status:&status];
+		drainRing(fx.ring);
+	}
+	@autoreleasepool {
+		MTLRenderPipelineDescriptor *desc = [MTLRenderPipelineDescriptor new];
+		desc.vertexFunction = [lib newFunctionWithName:@"vmain"];
+		desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+		NSError *err = nil;
+		objId = made([RgfxRenderPipelineState renderPipelineStateWithDescriptor:desc
+		                                                                 device:nil
+		                                                             serializer:&fx.ser
+		                                                                  error:&err]);
+	}
+	CHECK(nextDestroyed(fx.ring) == objId && ringEmpty(fx.ring));
+	@autoreleasepool {
+		NSError *err = nil;
+		objId = made([RgfxComputePipelineState
+		    computePipelineStateWithFunction:[lib newFunctionWithName:@"kmain"]
+		                              device:nil
+		                          serializer:&fx.ser
+		                               error:&err]);
+	}
+	CHECK(nextDestroyed(fx.ring) == objId && ringEmpty(fx.ring));
+	libId = lib.rgfxObjId;
+	@autoreleasepool {
+		lib = nil;
+	}
+	CHECK(nextDestroyed(fx.ring) == libId && ringEmpty(fx.ring)); // with its last function
+	CHECK(retirementIdle());
+}
+
+// A function keeps its library on the host, so a pipeline made from it after the app let the
+// library go still names a library the host holds; the pipeline needs the library no more.
+void test_function_keeps_its_library()
+{
+	CHECK(retirementIdle());
+	Fixture fx;
+	const uint8_t libBytes[] = {5, 6, 7};
+	uint32_t status = 0;
+	uint64_t libId = 0;
+	id<MTLFunction> fn = nil;
+	@autoreleasepool {
+		RgfxLibrary *lib = [RgfxLibrary libraryWithData:libBytes
+		                                        length:sizeof(libBytes)
+		                                           key:nullptr
+		                                        device:nil
+		                                    serializer:&fx.ser
+		                                        status:&status];
+		libId = lib.rgfxObjId;
+		fn = [lib newFunctionWithName:@"kmain"];
+		drainRing(fx.ring);
+	}
+	CHECK(ringEmpty(fx.ring)); // the function keeps it
+	RgfxComputePipelineState *ps = nil;
+	@autoreleasepool {
+		NSError *err = nil;
+		ps = [RgfxComputePipelineState computePipelineStateWithFunction:fn
+		                                                         device:nil
+		                                                     serializer:&fx.ser
+		                                                          error:&err];
+		CHECK(ps != nil);
+		auto bytes = nextMessage(fx.ring, RGFX_CMD_COMPUTE_PIPELINE_CREATE);
+		RgfxComputePipelineCreate create;
+		std::memcpy(&create, bytes.data(), sizeof(create));
+		CHECK(create.function_library_obj_id == libId);
+	}
+	@autoreleasepool {
+		fn = nil;
+	}
+	CHECK(nextDestroyed(fx.ring) == libId && ringEmpty(fx.ring)); // with its last function
+	uint64_t pipeId = ps.rgfxObjId;
+	@autoreleasepool {
+		ps = nil;
+	}
+	CHECK(nextDestroyed(fx.ring) == pipeId && ringEmpty(fx.ring));
+}
+
+// A buffer or texture placed in a heap keeps the heap (its `heap`): the heap goes from the
+// host only after the last of them.
+void test_heap_outlives_its_resources()
+{
+	CHECK(retirementIdle());
+	Fixture fx;
+	int calls = 0;
+	fx.ids.setResourceIdSource(&oneChunk, &calls);
+	RgfxHeap *heap = nil;
+	id<MTLBuffer> buf = nil;
+	id<MTLTexture> tex = nil;
+	@autoreleasepool {
+		MTLHeapDescriptor *d = [MTLHeapDescriptor new];
+		d.size = 0x100000;
+		heap = [RgfxHeap heapWithDescriptor:d device:nil serializer:&fx.ser];
+		buf = [heap newBufferWithLength:256 options:0 offset:0];
+		MTLTextureDescriptor *td =
+		    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+		                                                       width:8
+		                                                      height:8
+		                                                   mipmapped:NO];
+		tex = [heap newTextureWithDescriptor:td offset:0x10000];
+		CHECK(buf != nil && tex != nil);
+		drainRing(fx.ring);
+	}
+	uint64_t heapId = heap.rgfxObjId;
+	uint64_t bufId = ((RgfxResource *)buf).rgfxObjId;
+	uint64_t texId = ((RgfxResource *)tex).rgfxObjId;
+	@autoreleasepool {
+		CHECK(buf.heap == heap && tex.heap == heap);
+		heap = nil;
+	}
+	CHECK(ringEmpty(fx.ring)); // its resources keep it
+	@autoreleasepool {
+		buf = nil;
+	}
+	CHECK(nextDestroyed(fx.ring) == bufId && ringEmpty(fx.ring));
+	@autoreleasepool {
+		tex = nil;
+	}
+	CHECK(nextDestroyed(fx.ring) == texId);
+	CHECK(nextDestroyed(fx.ring) == heapId && ringEmpty(fx.ring));
+}
+
+// The region memory under a buffer or heap over host memory goes back only once the host has
+// dropped the object, and only once every command buffer in flight at its release completed.
+void test_region_memory_given_back_after_destroy()
+{
+	CHECK(retirementIdle());
+	Fixture fx;
+	TestRing *ring = &fx.ring;
+	__block int released = 0;
+	__block bool destroyedFirst = false;
+	void (^deallocator)(void) = ^{
+		RgfxMsgHeader h = {};
+		std::vector<uint8_t> bytes;
+		destroyedFirst = ring->next(&h, &bytes) && h.type == RGFX_CMD_OBJECT_DESTROY;
+		released++;
+	};
+	static uint8_t page[0x1000];
+	uint64_t ticket = RgfxRetirement::process().begin(); // a command buffer in flight
+	@autoreleasepool {
+		RgfxBuffer *b = [RgfxBuffer bufferOverHostMemoryWithContents:page
+		                                                regionOffset:RGFX_CONTEXT_ALLOCATIONS_OFFSET
+		                                                      length:sizeof(page)
+		                                                     options:MTLResourceStorageModeShared
+		                                                 deallocator:deallocator
+		                                                      device:nil
+		                                                  serializer:&fx.ser];
+		CHECK(b != nil);
+		MTLHeapDescriptor *d = [MTLHeapDescriptor new];
+		d.size = 0x10000;
+		d.storageMode = MTLStorageModeShared;
+		RgfxHeap *h = [RgfxHeap heapOverHostMemoryWithDescriptor:d
+		                                            regionOffset:RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x1000
+		                                             deallocator:deallocator
+		                                                  device:nil
+		                                              serializer:&fx.ser];
+		CHECK(h != nil);
+		drainRing(fx.ring);
+	}
+	CHECK(released == 0 && ringEmpty(fx.ring)); // the buffer in flight may name them
+	RgfxRetirement::process().end(ticket);
+	CHECK(released == 2 && destroyedFirst);
+	CHECK(ringEmpty(fx.ring));
+}
+
+// An IOSurface texture's copy goes as the texture goes: the texture, then the copy's buffer,
+// from the host, and only then the copy's block back to the region.
+void test_iosurface_copy_block_after_destroys()
+{
+	CHECK(retirementIdle());
+	Fixture fx;
+	int calls = 0;
+	fx.ids.setResourceIdSource(&oneChunk, &calls);
+	std::vector<uint8_t> mem(RGFX_ALLOCATIONS_OFFSET + 0x100000, 0);
+	RgfxRegion region(mem.data(), mem.size());
+	struct Log {
+		BlockLog blocks;
+		TestRing *ring;
+		std::vector<uint64_t> seenAtRelease; // the objects destroyed on the ring by each release
+		static bool alloc(void *c, uint64_t size, uint64_t align, uint64_t *offset)
+		{
+			return BlockLog::alloc(&static_cast<Log *>(c)->blocks, size, align, offset);
+		}
+		static void release(void *c, uint64_t offset)
+		{
+			Log *log = static_cast<Log *>(c);
+			BlockLog::release(&log->blocks, offset);
+			RgfxMsgHeader h = {};
+			std::vector<uint8_t> bytes;
+			while (log->ring->next(&h, &bytes)) {
+				RgfxObjectDestroy d = {};
+				if (h.type == RGFX_CMD_OBJECT_DESTROY && bytes.size() >= sizeof(d)) {
+					std::memcpy(&d, bytes.data(), sizeof(d));
+					log->seenAtRelease.push_back(d.obj_id);
+				}
+			}
+		}
+	} log;
+	log.ring = &fx.ring;
+	region.setBlockSource(&Log::alloc, &Log::release, &log);
+	NSDictionary *props = @{
+		(id)kIOSurfaceWidth : @16,
+		(id)kIOSurfaceHeight : @16,
+		(id)kIOSurfaceBytesPerElement : @4,
+		(id)kIOSurfacePixelFormat : @(static_cast<uint32_t>('BGRA')),
+	};
+	IOSurfaceRef surface = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+	CHECK(surface != nullptr);
+	uint64_t texId = 0, bufId = 0;
+	@autoreleasepool {
+		MTLTextureDescriptor *td =
+		    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+		                                                       width:16
+		                                                      height:16
+		                                                   mipmapped:NO];
+		RgfxIOSurfaceTexture *t = [RgfxIOSurfaceTexture textureWithDescriptor:td
+		                                                            iosurface:surface
+		                                                                plane:0
+		                                                               region:&region
+		                                                               device:nil
+		                                                           serializer:&fx.ser];
+		CHECK(t != nil);
+		texId = t.rgfxObjId;
+		bufId = expectMessage<RgfxBufferOverHostMemory>(fx.ring, RGFX_CMD_BUFFER_OVER_HOST_MEMORY)
+		            .obj_id;
+		drainRing(fx.ring);
+		CHECK(log.blocks.allocated.size() == 1);
+	}
+	CHECK(log.blocks.released == log.blocks.allocated);
+	CHECK(log.seenAtRelease == std::vector<uint64_t>({texId, bufId}));
+	CHECK(ringEmpty(fx.ring));
+	CFRelease(surface);
+}
+
+// A queue's command buffers keep it alive; once they are gone it ends on the device, its
+// completion ring read no more, and only then does what it holds go back.
+void test_queue_ends_after_its_buffers()
+{
+	CHECK(retirementIdle());
+	@autoreleasepool {
+		// Made in a pool of its own, so no autorelease keeps the queue past the test's let-go.
+		QueueFixture *made = nullptr;
+		@autoreleasepool {
+			made = new QueueFixture();
+		}
+		QueueFixture &f = *made;
+		(void)expectMessage<RgfxQueueCreate>(f.control, RGFX_CMD_QUEUE_CREATE);
+		uint64_t queueId = f.queue.rgfxObjId;
+		std::shared_ptr<RgfxReplyReader> reader = [f.queue sharedReplyReader];
+		int released = 0;
+		bool endedFirst = false;
+		TestRing *control = &f.control;
+		[f.queue rgfxSetRelease:[&released, &endedFirst, control] {
+			RgfxMsgHeader h = {};
+			std::vector<uint8_t> bytes;
+			endedFirst = control->next(&h, &bytes) && h.type == RGFX_CMD_OBJECT_DESTROY;
+			released++;
+		}];
+		id<MTLCommandBuffer> cb = nil;
+		@autoreleasepool {
+			cb = [f.queue commandBuffer];
+			[cb commit];
+			f.queue = nil;
+		}
+		@autoreleasepool {
+			CHECK(cb.commandQueue != nil); // the buffer keeps it
+		}
+		CHECK(ringEmpty(f.control) && released == 0);
+		RgfxCbComplete done = cbComplete(f.nextSeqno(), ((RgfxResource *)cb).rgfxObjId);
+		CHECK(f.completion.postFromHost(&done, sizeof(done)));
+		[cb waitUntilCompleted];
+		CHECK(ringEmpty(f.control) && released == 0);
+		@autoreleasepool {
+			cb = nil;
+		}
+		CHECK(released == 1 && endedFirst);
+		CHECK(queueId != 0);
+		// Its completion ring is read no more.
+		uint64_t consumer = f.completion.consumerCount();
+		RgfxCbComplete late = cbComplete(99, 1);
+		CHECK(f.completion.postFromHost(&late, sizeof(late)));
+		CHECK(reader->pump() == 0 && !reader->armAndCheck());
+		CHECK(f.completion.consumerCount() == consumer);
+	}
+	CHECK(retirementIdle());
+}
+
+// Where a closer is set the queue ends through it (the kext's QUEUE_DESTROY) and nothing is
+// posted on the ring; without one, an OBJECT_DESTROY ends it.
+void test_serializer_destroys_queues()
+{
+	struct Closed {
+		std::vector<uint64_t> ids;
+		static void close(void *c, RgfxObjId objId) { static_cast<Closed *>(c)->ids.push_back(objId); }
+	} closed;
+	Fixture fx;
+	fx.ser.destroyQueue(7);
+	CHECK(nextDestroyed(fx.ring) == 7 && ringEmpty(fx.ring));
+	fx.ser.setQueueCloser(&Closed::close, &closed);
+	fx.ser.destroyQueue(8);
+	CHECK(closed.ids == std::vector<uint64_t>({8}) && ringEmpty(fx.ring));
+}
+
+// An object let go after a command buffer was made, before its commit, stays on the host
+// until the buffer completes, as it may encode it meanwhile; one never committed holds
+// nothing back once it goes.
+void test_objects_outlive_an_uncommitted_buffer()
+{
+	CHECK(retirementIdle());
+	@autoreleasepool {
+		QueueFixture f;
+		drainRing(f.control);
+		id<MTLCommandBuffer> cb = [f.queue commandBuffer];
+		uint64_t samplerId = 0;
+		@autoreleasepool {
+			RgfxSampler *s = [RgfxSampler samplerWithDescriptor:[MTLSamplerDescriptor new]
+			                                             device:nil
+			                                         serializer:&f.ser];
+			samplerId = s.rgfxObjId;
+			drainRing(f.control);
+		}
+		CHECK(ringEmpty(f.control));
+		[cb commit];
+		RgfxCbComplete done = cbComplete(f.nextSeqno(), ((RgfxResource *)cb).rgfxObjId);
+		CHECK(f.completion.postFromHost(&done, sizeof(done)));
+		[cb waitUntilCompleted];
+		CHECK(nextDestroyed(f.control) == samplerId && ringEmpty(f.control));
+
+		uint64_t other = 0;
+		@autoreleasepool {
+			id<MTLCommandBuffer> idle = [f.queue commandBuffer];
+			@autoreleasepool {
+				RgfxSampler *s = [RgfxSampler samplerWithDescriptor:[MTLSamplerDescriptor new]
+				                                             device:nil
+				                                         serializer:&f.ser];
+				other = s.rgfxObjId;
+				drainRing(f.control);
+			}
+			CHECK(ringEmpty(f.control));
+			(void)idle;
+		}
+		CHECK(nextDestroyed(f.control) == other && ringEmpty(f.control));
+	}
+	CHECK(retirementIdle());
+}
+
+// While one thread runs the releases due, a release retired meanwhile waits behind them,
+// though no ticket is live, and runs on that thread after them; a release that retires
+// another runs it after itself.
+void test_retirement_keeps_order_while_running()
+{
+	RgfxRetirement r;
+	std::vector<int> ran;
+	std::atomic<bool> running{false}, go{false};
+	uint64_t t = r.begin();
+	r.retire([&] {
+		running = true;
+		while (!go)
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+		ran.push_back(1);
+	});
+	std::thread::id ranOn;
+	std::thread a([&] { r.end(t); });
+	std::thread::id aId = a.get_id();
+	CHECK(eventually([&] { return running.load(); }));
+	r.retire([&] {
+		ran.push_back(2);
+		ranOn = std::this_thread::get_id();
+	});
+	CHECK(r.waiting() == 1 && r.live() == 0);
+	go = true;
+	a.join();
+	CHECK(ran == std::vector<int>({1, 2}));
+	CHECK(ranOn == aId);
+	r.retire([&] {
+		r.retire([&] { ran.push_back(4); });
+		ran.push_back(3);
+	});
+	CHECK(ran == std::vector<int>({1, 2, 3, 4}));
+	CHECK(r.waiting() == 0);
+}
+
+// A closed reader takes nothing more off its ring: no handler runs, the consumer stays, and
+// the ring is not armed.
+void test_reply_reader_close()
+{
+	TestRing ring(0x1000);
+	RgfxReplyReader reader(ring.base(), ring.dataSize);
+	int fired = 0;
+	reader.expectCompletion(7, [&](const RgfxCbComplete &) { fired++; });
+	reader.close();
+	RgfxCbComplete done = cbComplete(7, 1);
+	CHECK(ring.postFromHost(&done, sizeof(done)));
+	CHECK(reader.pump() == 0 && fired == 0);
+	CHECK(!reader.armAndCheck());
+	CHECK(ringArmed(ring) == 0);
+	CHECK(ring.consumerCount() == 0);
+}
+
 int main()
 {
 	@autoreleasepool {
@@ -2501,6 +3013,16 @@ int main()
 		test_managed_layout();
 		test_managed_buffer_range();
 		test_managed_texture_cpu_copy();
+		test_objects_destroyed_as_let_go();
+		test_function_keeps_its_library();
+		test_heap_outlives_its_resources();
+		test_region_memory_given_back_after_destroy();
+		test_iosurface_copy_block_after_destroys();
+		test_queue_ends_after_its_buffers();
+		test_serializer_destroys_queues();
+		test_objects_outlive_an_uncommitted_buffer();
+		test_retirement_keeps_order_while_running();
+		test_reply_reader_close();
 	}
 	std::printf("shell_tests: OK (%d checks)\n", g_checks);
 	return 0;

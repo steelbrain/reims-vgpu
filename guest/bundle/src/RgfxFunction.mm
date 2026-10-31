@@ -8,6 +8,7 @@
 #include <vector>
 
 @implementation RgfxFunction {
+	RgfxResource *_library; // kept alive: a pipeline made from the function names it
 	uint64_t _libraryObjId;
 	std::string _name;                          // the entry point, owned
 	std::vector<RgfxFunctionConstant> _constants; // specialisation constants, owned
@@ -15,14 +16,14 @@
 	BOOL _haveType;
 }
 
-+ (instancetype)functionWithLibrary:(uint64_t)libraryObjId
++ (instancetype)functionWithLibrary:(RgfxResource *)library
                                name:(NSString *)name
                           constants:(const RgfxFunctionConstant *)constants
                               count:(uint32_t)count
                              device:(id<MTLDevice>)device
                          serializer:(RgfxSerializer *)serializer
 {
-	return [[RgfxFunction alloc] initWithLibrary:libraryObjId
+	return [[RgfxFunction alloc] initWithLibrary:library
 	                                        name:name
 	                                   constants:constants
 	                                       count:count
@@ -30,7 +31,7 @@
 	                                  serializer:serializer];
 }
 
-- (instancetype)initWithLibrary:(uint64_t)libraryObjId
+- (instancetype)initWithLibrary:(RgfxResource *)library
                            name:(NSString *)name
                       constants:(const RgfxFunctionConstant *)constants
                           count:(uint32_t)count
@@ -44,7 +45,8 @@
 	// and entry point. RGFX_OBJ_NONE (0) is the base objId ("0 names no object").
 	self = [super initWithObjId:RGFX_OBJ_NONE device:device serializer:serializer];
 	if (self) {
-		_libraryObjId = libraryObjId;
+		_library = library;
+		_libraryObjId = library != nil ? library.rgfxObjId : RGFX_OBJ_NONE;
 		_name = name.UTF8String ? name.UTF8String : "";
 		if (count && constants) {
 			_constants.assign(constants, constants + count);

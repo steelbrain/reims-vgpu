@@ -18,12 +18,23 @@
 //   tex_probe big N     one command buffer of N fills, each 4 bytes of a Shared buffer with its
 //                       own value, far larger than its queue's ring for large N, waited for by its
 //                       handler alone: every word must hold its fill
+//   tex_probe kinds N   N rounds, each of one object of every kind made and let go while the
+//                       round's command buffer is in flight: a new queue, a 4 MiB Shared buffer
+//                       (a region block), a 1 MiB Shared heap with a buffer and a texture placed
+//                       in it, a 64 x 64 IOSurface texture (its copy is a region block), a
+//                       Private texture, a sampler, a depth-stencil state, an event, a fence
+//                       and a shared event. The buffer fills the 4 MiB buffer and copies a
+//                       pattern through the Private texture into it, waiting on the fence it
+//                       updates; each must complete with those bytes in the Shared buffer, so
+//                       N past 256 needs each queue to end, and N past 256 needs the blocks
+//                       back (the region is 1 GiB)
 // Prints "TEX OK" when every check passes, else "TEX FAIL: why" and exits 1. A completion 20 s
 // late prints HANG and exits 3. The copy waits with waitUntilCompleted, or with its completed
 // handler alone (`handler`).
 // Build: xcrun clang -arch x86_64 -fobjc-arc -framework Metal -framework Foundation
-//        tex_probe.m -o tex_probe
+//        -framework IOSurface tex_probe.m -o tex_probe
 #import <Foundation/Foundation.h>
+#import <IOSurface/IOSurface.h>
 #import <Metal/Metal.h>
 #include <pthread.h>
 #include <sys/resource.h>
@@ -293,6 +304,136 @@ static int churn(id<MTLDevice> device, id<MTLCommandQueue> queue, long n)
 	return 0;
 }
 
+// `n` rounds of one object of every kind, each let go while the round's command buffer runs.
+static int kinds(id<MTLDevice> device, long n)
+{
+	const NSUInteger side = 64, row = side * 4, size = row * side, big = 4u << 20;
+	id<MTLBuffer> src = [device newBufferWithLength:size options:MTLResourceStorageModeShared];
+	if (src == nil)
+		return fail("no Shared buffer");
+	MTLTextureDescriptor *d =
+	    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+	                                                       width:side
+	                                                      height:side
+	                                                   mipmapped:NO];
+	d.storageMode = MTLStorageModePrivate;
+	d.usage = MTLTextureUsageShaderRead;
+	MTLTextureDescriptor *sd =
+	    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+	                                                       width:side
+	                                                      height:side
+	                                                   mipmapped:NO];
+	sd.usage = MTLTextureUsageShaderRead;
+	NSDictionary *props = @{
+		(id)kIOSurfaceWidth : @(side),
+		(id)kIOSurfaceHeight : @(side),
+		(id)kIOSurfaceBytesPerElement : @4,
+		(id)kIOSurfacePixelFormat : @((uint32_t)'BGRA'),
+	};
+	double start = now_ms();
+	long failed = 0, bad = 0, missing = 0;
+	for (long i = 0; i < n; i++) {
+		struct watch *w = watch_start("a kinds command buffer");
+		uint8_t fill = (uint8_t)(i * 7 + 3), pattern = (uint8_t)(i * 13 + 5);
+		memset([src contents], pattern, size);
+		dispatch_semaphore_t done = dispatch_semaphore_create(0);
+		__block MTLCommandBufferStatus status = MTLCommandBufferStatusNotEnqueued;
+		id<MTLBuffer> out = nil; // checked once the round's objects are gone
+		@autoreleasepool {
+			id<MTLCommandQueue> queue = [device newCommandQueue];
+			id<MTLBuffer> shared = [device newBufferWithLength:big
+			                                          options:MTLResourceStorageModeShared];
+			MTLHeapDescriptor *hd = [MTLHeapDescriptor new];
+			hd.size = 1u << 20;
+			hd.storageMode = MTLStorageModeShared;
+			id<MTLHeap> heap = [device newHeapWithDescriptor:hd];
+			id<MTLBuffer> placed = [heap newBufferWithLength:4096
+			                                         options:MTLResourceStorageModeShared
+			                                          offset:0];
+			id<MTLTexture> placedTex = [heap newTextureWithDescriptor:sd offset:0x10000];
+			IOSurfaceRef surface = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+			id<MTLTexture> surfaceTex =
+			    surface ? [device newTextureWithDescriptor:sd iosurface:surface plane:0] : nil;
+			if (surface)
+				CFRelease(surface);
+			id<MTLTexture> tex = [device newTextureWithDescriptor:d];
+			id<MTLSamplerState> sampler = [device newSamplerStateWithDescriptor:[MTLSamplerDescriptor new]];
+			id<MTLDepthStencilState> depth =
+			    [device newDepthStencilStateWithDescriptor:[MTLDepthStencilDescriptor new]];
+			id<MTLEvent> event = [device newEvent];
+			id<MTLFence> fence = [device newFence];
+			id<MTLSharedEvent> sharedEvent = [device newSharedEvent];
+			if (queue == nil || shared == nil || heap == nil || placed == nil || placedTex == nil ||
+			    surfaceTex == nil || tex == nil || sampler == nil || depth == nil || event == nil ||
+			    fence == nil || sharedEvent == nil) {
+				printf("round %ld: queue=%d shared=%d heap=%d placed=%d placedTex=%d surfaceTex=%d "
+				       "tex=%d sampler=%d depth=%d event=%d fence=%d sharedEvent=%d\n",
+				       i, queue != nil, shared != nil, heap != nil, placed != nil, placedTex != nil,
+				       surfaceTex != nil, tex != nil, sampler != nil, depth != nil, event != nil,
+				       fence != nil, sharedEvent != nil);
+				missing++;
+				atomic_store(&w->done, 1);
+				break;
+			}
+			id<MTLCommandBuffer> cb = [queue commandBuffer];
+			id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+			[blit fillBuffer:shared range:NSMakeRange(0, big) value:fill];
+			[blit copyFromBuffer:src
+			           sourceOffset:0
+			      sourceBytesPerRow:row
+			    sourceBytesPerImage:size
+			             sourceSize:MTLSizeMake(side, side, 1)
+			              toTexture:tex
+			       destinationSlice:0
+			       destinationLevel:0
+			      destinationOrigin:MTLOriginMake(0, 0, 0)];
+			[blit updateFence:fence];
+			[blit endEncoding];
+			blit = [cb blitCommandEncoder];
+			[blit waitForFence:fence];
+			[blit copyFromTexture:tex
+			                 sourceSlice:0
+			                 sourceLevel:0
+			                sourceOrigin:MTLOriginMake(0, 0, 0)
+			                  sourceSize:MTLSizeMake(side, side, 1)
+			                    toBuffer:shared
+			           destinationOffset:0
+			      destinationBytesPerRow:row
+			    destinationBytesPerImage:size];
+			[blit endEncoding];
+			[cb addCompletedHandler:^(id<MTLCommandBuffer> b) {
+				status = b.status;
+				dispatch_semaphore_signal(done);
+			}];
+			[cb commit];
+			out = shared; // kept to check its bytes; every other object goes now
+		}
+		dispatch_semaphore_wait(done, DISPATCH_TIME_FOREVER);
+		atomic_store(&w->done, 1);
+		if (missing)
+			break;
+		const uint8_t *b = (const uint8_t *)[out contents];
+		long wrong = 0;
+		for (NSUInteger k = 0; k < big; k++)
+			wrong += b[k] != (k < size ? pattern : fill);
+		if (status != MTLCommandBufferStatusCompleted)
+			failed++;
+		else if (wrong)
+			bad++;
+		out = nil;
+	}
+	printf("kinds: %ld rounds in %.0f ms (%.1f GiB of 4 MiB Shared buffers), failed=%ld, wrong=%ld, "
+	       "missing=%ld\n",
+	       n, now_ms() - start, (double)n * big / (1u << 30), failed, bad, missing);
+	if (missing)
+		return fail("an object could not be made: a queue or a block never came back");
+	if (failed)
+		return fail("a command buffer failed: an object went before it ran");
+	if (bad)
+		return fail("a Shared buffer came back wrong");
+	return 0;
+}
+
 // One command buffer of `n` 4-byte fills, each of its own value, waited for by its handler.
 static int one_big_buffer(id<MTLDevice> device, id<MTLCommandQueue> queue, long n)
 {
@@ -336,11 +477,13 @@ int main(int argc, char **argv)
 		int handler = argc >= 2 && strcmp(argv[1], "handler") == 0;
 		int big = argc >= 2 && strcmp(argv[1], "big") == 0;
 		int churning = argc >= 2 && strcmp(argv[1], "churn") == 0;
+		int everyKind = argc >= 2 && strcmp(argv[1], "kinds") == 0;
 		if (argc < 2 ||
 		    (strcmp(argv[1], "copy") != 0 && strcmp(argv[1], "hold") != 0 && !handler && !big &&
-		     !churning) ||
+		     !churning && !everyKind) ||
 		    (strcmp(argv[1], "copy") != 0 && argc < 3)) {
-			fprintf(stderr, "usage: tex_probe copy | hold N | handler N | big N | churn N\n");
+			fprintf(stderr,
+			        "usage: tex_probe copy | hold N | handler N | big N | churn N | kinds N\n");
 			return 2;
 		}
 		id<MTLDevice> device = MTLCreateSystemDefaultDevice();
@@ -389,9 +532,11 @@ int main(int argc, char **argv)
 			if ((long)held.count < n && held.count > 0)
 				[held removeLastObject];
 		}
-		if (big || churning) {
+		if (big || churning || everyKind) {
 			long n = strtol(argv[2], NULL, 10);
-			int r = big ? one_big_buffer(device, queue, n) : churn(device, queue, n);
+			int r = big        ? one_big_buffer(device, queue, n)
+			        : churning ? churn(device, queue, n)
+			                   : kinds(device, n);
 			if (r != 0)
 				return r;
 			printf("TEX OK\n");

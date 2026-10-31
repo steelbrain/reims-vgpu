@@ -13,6 +13,19 @@
 	uint64_t _size;
 	MTLResourceOptions _options;
 	MTLHeapType _type;
+	void (^_deallocator)(void); // gives a Shared heap's region block back
+}
+
+// The host drops the heap once every command buffer in flight now has completed, and only
+// then is a Shared heap's block given back. The resources placed in the heap keep it alive
+// (RgfxResource's `heap`), so they went first.
+- (void)dealloc
+{
+	void (^deallocator)(void) = _deallocator;
+	[self rgfxRetireThen:[deallocator] {
+		if (deallocator != nil)
+			deallocator();
+	}];
 }
 
 + (instancetype)heapWithDescriptor:(MTLHeapDescriptor *)descriptor
@@ -39,6 +52,7 @@
 
 + (instancetype)heapOverHostMemoryWithDescriptor:(MTLHeapDescriptor *)descriptor
                                     regionOffset:(uint64_t)regionOffset
+                                     deallocator:(void (^)(void))deallocator
                                           device:(id<MTLDevice>)device
                                       serializer:(RgfxSerializer *)serializer
 {
@@ -56,6 +70,7 @@
 		heap->_size = static_cast<uint64_t>(descriptor.size);
 		heap->_options = descriptor.resourceOptions;
 		heap->_type = descriptor.type;
+		heap->_deallocator = [deallocator copy];
 	}
 	return heap;
 }
@@ -132,23 +147,28 @@
 	}
 	RgfxCreated created = ser->createBufferAtOffset([self rgfxObjId], offset, length,
 	                                                static_cast<uint32_t>(options));
-	// A heap-placed buffer's address is derived host-side from the heap (0 here).
-	return [[RgfxBuffer alloc] initWithObjId:created.obj_id
-	                              gpuAddress:created.gpu_address
-	                                  length:length
-	                                 options:options
-	                                  device:self.device
-	                              serializer:ser];
+	// A heap-placed buffer's address is derived host-side from the heap (0 here). It keeps
+	// the heap alive.
+	RgfxBuffer *buffer = [[RgfxBuffer alloc] initWithObjId:created.obj_id
+	                                            gpuAddress:created.gpu_address
+	                                                length:length
+	                                               options:options
+	                                                device:self.device
+	                                            serializer:ser];
+	[buffer rgfxSetHeap:self];
+	return buffer;
 }
 
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)descriptor
                                     offset:(NSUInteger)offset
 {
-	return [RgfxTexture textureWithDescriptor:descriptor
-	                                     heap:[self rgfxObjId]
-	                               heapOffset:offset
-	                                   device:self.device
-	                               serializer:[self serializer]];
+	RgfxTexture *texture = [RgfxTexture textureWithDescriptor:descriptor
+	                                                     heap:[self rgfxObjId]
+	                                               heapOffset:offset
+	                                                   device:self.device
+	                                               serializer:[self serializer]];
+	[texture rgfxSetHeap:self]; // the texture keeps the heap alive
+	return texture;
 }
 
 // --- sub-allocation (Automatic: Metal picks the offset) ----------------------

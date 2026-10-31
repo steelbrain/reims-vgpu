@@ -28,20 +28,22 @@ NS_ASSUME_NONNULL_BEGIN
 
 @interface RgfxFunction : RgfxResource <MTLFunction>
 
-/// A function reference naming `name` in the library `libraryObjId`, specialised
-/// by `count` function constants at `constants` (may be null when `count` is 0;
-/// the constants are copied). `device`/`serializer` are the owning library's
-/// (both may be nil in a unit test). Returns nil if `name` is nil.
-+ (nullable instancetype)functionWithLibrary:(uint64_t)libraryObjId
+/// A function reference naming `name` in `library`, specialised by `count` function
+/// constants at `constants` (may be null when `count` is 0; the constants are copied).
+/// The function keeps `library` alive, so the host still holds it when a pipeline is
+/// made from the function, as Metal's functions outlive their library. `device`/
+/// `serializer` are the owning library's (both may be nil in a unit test). Returns nil
+/// if `name` is nil.
++ (nullable instancetype)functionWithLibrary:(nullable RgfxResource *)library
                                         name:(NSString *)name
                                    constants:(nullable const RgfxFunctionConstant *)constants
                                        count:(uint32_t)count
                                       device:(nullable id<MTLDevice>)device
                                   serializer:(nullable RgfxSerializer *)serializer;
 
-/// Designated initialiser. Holds the library objId, the entry-point name (copied)
-/// and a copy of the `count` function constants at `constants`.
-- (nullable instancetype)initWithLibrary:(uint64_t)libraryObjId
+/// Designated initialiser. Holds `library` (and its objId), the entry-point name
+/// (copied) and a copy of the `count` function constants at `constants`.
+- (nullable instancetype)initWithLibrary:(nullable RgfxResource *)library
                                     name:(NSString *)name
                                constants:(nullable const RgfxFunctionConstant *)constants
                                    count:(uint32_t)count

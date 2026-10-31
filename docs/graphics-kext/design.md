@@ -295,11 +295,8 @@ posting the grant (`RESOURCE_ID_CHUNK`: context, chunk) on the control ring
 before it returns, so the host has it before any create naming its ids. The
 bundle keeps each chunk's free ids in one 64-bit mask, takes the lowest free id
 of the first chunk taken that has one, asks for a chunk only when all of its are
-in use, and gives an id back as its texture goes. A texture goes from the host
-too: its dealloc posts its `OBJECT_DESTROY` once every command buffer the
-process had in flight then has completed. Those ride their queues' own rings and
-may name it, and Metal keeps an in-flight buffer's resources alive. Only then is
-its id given back, so a later create with the id follows the destroy on ring 0.
+in use, and gives an id back as its texture goes, after the texture's destroy
+(below), so a later create with the id follows the destroy on ring 0.
 The host names an IOSurface by every live texture over its plane 0, and shows
 the latest. A present holds its own reference to the texture it shows, so a
 destroy after the present leaves the window's frame drawable. A process keeps its chunks
@@ -311,6 +308,26 @@ as a refused create is: unanswered, and a command buffer naming the texture
 fails. Sampler states and pipeline states take no guest-picked ids (the host
 numbers them), and the bundle makes no indirect command buffers, so textures
 are the only kind with chunks.
+
+**Objects go with their wrappers.** Every host object the bundle makes goes
+from the host as the app lets its wrapper go. A buffer, heap, texture, sampler,
+depth-stencil state, render or compute pipeline, library, event, fence or shared
+event posts its `OBJECT_DESTROY` from its dealloc. A queue ends through the kext
+(user-client selector 0x104), which stops watching its completion ring and
+posts the destroy. Each release waits until every command buffer of the process
+made before it has completed, or gone uncommitted. Command buffers ride their
+queues' own rings and may name the object, and Metal keeps what a buffer
+encodes alive from the encode on, so a buffer holds releases back from its
+making, not its commit. The releases run in the order the app let the objects
+go. What an object lay over goes back only after its destroy: a Shared buffer's
+or heap's region block, an IOSurface copy's block, a queue's ring blocks (its
+completion ring read no more first), and a texture's resource id. The block's
+`BLOCK_RELEASE` then finds nothing of the object on the host. A resource placed
+in a heap keeps the heap alive (its `heap`), a command buffer keeps its queue,
+and a function keeps its library. So a pipeline made from a function whose
+library the app let go names a library the host still holds. The host makes the
+pipeline from the library before the library's destroy, and the pipeline needs
+it no more.
 
 **Rings.** A 256-byte header, then a byte ring whose size is a power of two
 (64 KiB minus the header for the control rings). Each header field sits in its

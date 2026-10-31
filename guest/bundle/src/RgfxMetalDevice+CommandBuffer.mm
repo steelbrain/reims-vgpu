@@ -52,9 +52,14 @@ constexpr uint32_t kQueueCompleteDataSize = 32768;
 	if (!rings.ok) {
 		return nil; // the region had no room for the ring pair
 	}
+	auto releaseRings = [region, rings] {
+		region->release(rings.submit_offset);
+		region->release(rings.complete_offset);
+	};
 	RgfxRingWriter *submit = [self addQueueSubmitRingAtOffset:rings.submit_offset
 	                                                dataSize:kQueueSubmitDataSize];
 	if (submit == nullptr) {
+		releaseRings();
 		return nil;
 	}
 	RgfxCommandQueue *queue =
@@ -67,8 +72,18 @@ constexpr uint32_t kQueueCompleteDataSize = 32768;
 	                                   device:self
 	                               serializer:ser];
 	if (queue == nil) {
+		[self dropQueueSubmitRing:submit];
+		releaseRings();
 		return nil;
 	}
+	// At the queue's end, once the device has ended it, the writer over its submission ring
+	// goes, then its rings' blocks.
+	__weak RgfxMetalDevice *weakSelf = self;
+	[queue rgfxSetRelease:[weakSelf, submit, releaseRings] {
+		RgfxMetalDevice *device = weakSelf;
+		[device dropQueueSubmitRing:submit];
+		releaseRings();
+	}];
 	// The host's ring loop posts this queue's command-buffer completions on the queue's
 	// own completion ring (device.rs: QueueCompletionPoster on the guest-given
 	// complete_offset), raising the queue's vector. So the queue reads THAT ring, not the

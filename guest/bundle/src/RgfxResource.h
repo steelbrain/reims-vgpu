@@ -34,10 +34,13 @@
 #include "RgfxObjectModel.hpp" // RgfxObjId
 
 #ifdef __cplusplus
+#include <functional>
+
 class RgfxSerializer;
 #endif
 
 @protocol MTLDevice;
+@protocol MTLHeap;
 
 NS_ASSUME_NONNULL_BEGIN
 
@@ -70,6 +73,21 @@ NS_ASSUME_NONNULL_BEGIN
 
 /// The borrowed serialiser (null when the wrapper was made without one).
 - (nullable RgfxSerializer *)serializer;
+
+/// The heap the resource lies in (MTLResource's `heap`), nil for one that lies in none. The
+/// resource keeps it alive, as Metal's heap-placed resources do.
+@property(nonatomic, readonly, nullable) id<MTLHeap> heap;
+
+/// Places the resource in `heap` (the heap's sub-allocation sets it).
+- (void)rgfxSetHeap:(nullable id<MTLHeap>)heap;
+
+#ifdef __cplusplus
+/// For a wrapper's dealloc: drops the object's host handle (OBJECT_DESTROY) once every command
+/// buffer in flight now has completed (RgfxRetirement), as one may still name it, then runs
+/// `after` (when set), which gives back what the host object lay over: its region block, its
+/// resource id. Without a serialiser there is no host object, and `after` runs at once.
+- (void)rgfxRetireThen:(std::function<void()>)after;
+#endif
 
 @end
 

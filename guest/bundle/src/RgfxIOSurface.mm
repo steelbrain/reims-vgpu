@@ -164,10 +164,12 @@ Registry &registry()
 
 RgfxSurfaceShadow::~RgfxSurfaceShadow()
 {
-	buffer = nil; // the host drops the buffer before the block is reused
-	if (block.ok && region != nullptr) {
+	// The buffer gives the block back once the host has dropped it (its deallocator); one
+	// never made leaves the block to give back here.
+	if (buffer != nil)
+		buffer = nil;
+	else if (block.ok && region != nullptr)
 		region->release(block.offset);
-	}
 	if (surface != nullptr) {
 		CFRelease(surface);
 	}
@@ -211,11 +213,12 @@ std::shared_ptr<RgfxSurfaceShadow> shadowFor(IOSurfaceRef surface, uint32_t plan
 		}
 		r.shadows[{surfaceId, plane}] = shadow;
 	}
+	uint64_t offset = shadow->block.offset;
 	shadow->buffer = [RgfxBuffer bufferOverHostMemoryWithContents:shadow->copy()
-	                                                regionOffset:shadow->block.offset
+	                                                regionOffset:offset
 	                                                      length:shadow->block.size
 	                                                     options:MTLResourceStorageModeShared
-	                                                 deallocator:nil
+	                                                 deallocator:^{ region->release(offset); }
 	                                                      device:device
 	                                                  serializer:serializer];
 	if (shadow->buffer == nil) {

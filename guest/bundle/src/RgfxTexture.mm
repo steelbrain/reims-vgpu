@@ -148,14 +148,8 @@ RgfxTextureDescriptor rgfxTextureDescriptorFromMTL(MTLTextureDescriptor *d)
 	// may still name it), then its id goes back to the process's chunks, so a texture made
 	// with the id later is created on ring 0 after this one's destroy.
 	RgfxSerializer *serializer = _serializer;
-	if (serializer != nullptr) {
-		uint64_t objId = [self rgfxObjId];
-		uint64_t resourceId = _resourceId;
-		RgfxRetirement::process().retire([serializer, objId, resourceId] {
-			serializer->destroy(objId);
-			serializer->releaseResourceId(resourceId);
-		});
-	}
+	uint64_t resourceId = _resourceId;
+	[self rgfxRetireThen:[serializer, resourceId] { serializer->releaseResourceId(resourceId); }];
 }
 
 // --- MTLTexture shape (from the stored descriptor) ---------------------------

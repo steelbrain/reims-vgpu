@@ -293,6 +293,14 @@ bool streamLibrary(RgfxRegion &region, RgfxSerializer &ser, const uint8_t *bytes
 	BOOL _haveFunctionTable;                  // the bytes were a readable .metallib
 }
 
+// The host drops the library's id once every command buffer in flight now has completed. Its
+// functions keep it alive (RgfxFunction), and a pipeline made from them needs it no more: the
+// host made it from the library before the destroy.
+- (void)dealloc
+{
+	[self rgfxRetireThen:nullptr];
+}
+
 // Whether a create's answer is the device's library: it made it (RGFX_STATUS_OK), or the
 // route hands no answer back (a ring the process writes itself).
 static bool rgfxMade(uint32_t status)
@@ -409,7 +417,7 @@ static bool rgfxMade(uint32_t status)
 		if (entry == nullptr)
 			return nil;
 	}
-	RgfxFunction *fn = [RgfxFunction functionWithLibrary:self.rgfxObjId
+	RgfxFunction *fn = [RgfxFunction functionWithLibrary:self
 	                                                name:name
 	                                           constants:constants.empty() ? nullptr : constants.data()
 	                                               count:static_cast<uint32_t>(constants.size())

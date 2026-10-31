@@ -8,6 +8,13 @@
 
 @implementation RgfxEvent
 
+// The host drops the event once every command buffer in flight now has completed, as one may
+// still name it.
+- (void)dealloc
+{
+	[self rgfxRetireThen:nullptr];
+}
+
 + (instancetype)eventWithDevice:(id<MTLDevice>)device serializer:(RgfxSerializer *)serializer
 {
 	if (serializer == nullptr) {

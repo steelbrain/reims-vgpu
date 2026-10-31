@@ -34,6 +34,13 @@ RgfxSamplerParams rgfxSamplerParamsFromMTL(MTLSamplerDescriptor *d)
 
 @implementation RgfxSampler
 
+// The host drops the sampler once every command buffer in flight now has completed, as one may
+// still name it.
+- (void)dealloc
+{
+	[self rgfxRetireThen:nullptr];
+}
+
 + (instancetype)samplerWithDescriptor:(MTLSamplerDescriptor *)descriptor
                                device:(id<MTLDevice>)device
                            serializer:(RgfxSerializer *)serializer

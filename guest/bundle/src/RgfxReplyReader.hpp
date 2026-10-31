@@ -107,6 +107,11 @@ public:
 	/// not taken: true means pump again before sleeping. False for a ringless reader.
 	bool armAndCheck();
 
+	/// Stops reading the ring for good: pump() and armAndCheck() touch it no more, so its
+	/// block can go back to the region (the queue's end) though the completion thread still
+	/// holds the reader.
+	void close();
+
 	/// Whether the completion thread drives this reader (it is then the only consumer).
 	void setDriven(bool driven) { m_driven.store(driven, std::memory_order_release); }
 	bool driven() const { return m_driven.load(std::memory_order_acquire); }
@@ -129,6 +134,7 @@ private:
 
 	std::mutex m_lock;
 	uint64_t m_consumed; // the guest's count: what it has taken
+	bool m_closed = false; // close(): the ring is not read again
 	std::atomic<bool> m_driven{false};
 
 	std::unordered_map<uint64_t, CompletionHandler> m_completions;

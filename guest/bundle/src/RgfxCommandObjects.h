@@ -48,6 +48,7 @@
 #import "RgfxResource.h"
 
 #ifdef __cplusplus
+#include <functional>
 #include <memory>
 
 class RgfxSerializer;
@@ -122,6 +123,13 @@ NS_ASSUME_NONNULL_BEGIN
 /// command buffer committed on the queue holds it until its completion. Empty for a
 /// borrowed reader (the `replyReader` a unit test sets).
 - (std::shared_ptr<RgfxReplyReader>)sharedReplyReader;
+
+/// What the queue's end gives back once the device has ended the queue (its rings' blocks,
+/// the writer over its submission ring). The queue ends once every command buffer in flight
+/// at its release has completed: its own keep it alive until then, as Metal's do. The device
+/// stops reading its completion ring, then the serialiser ends it (destroyQueue), then this
+/// runs.
+- (void)rgfxSetRelease:(std::function<void()>)release;
 #endif
 
 @end

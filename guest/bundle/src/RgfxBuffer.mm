@@ -112,11 +112,17 @@
 
 - (void)dealloc
 {
-	if (_ownsContents) {
+	// The device buffer's own pages are the guest's alone. The host drops the buffer once
+	// every command buffer in flight now has completed, and only then is the memory under a
+	// region-backed one given back (its block, or the no-copy caller's pages), so nothing
+	// reuses it while the host may still read it.
+	if (_ownsContents)
 		std::free(_contents);
-	} else if (_hostDeallocator != nil) {
-		_hostDeallocator();
-	}
+	void (^deallocator)(void) = _hostDeallocator;
+	[self rgfxRetireThen:[deallocator] {
+		if (deallocator != nil)
+			deallocator();
+	}];
 }
 
 // --- MTLBuffer ---------------------------------------------------------------

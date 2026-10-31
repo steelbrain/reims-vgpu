@@ -65,14 +65,18 @@ bool rgfxIsManagedStorage(MTLResourceOptions options)
 			std::memset(contents, 0, length);
 		}
 	}
-	// The region owns the block (no free list yet, a follow-up), so no deallocator.
-	return [RgfxBuffer bufferOverHostMemoryWithContents:contents
-	                                      regionOffset:block.offset
-	                                            length:length
-	                                           options:options
-	                                       deallocator:nil
-	                                            device:self
-	                                        serializer:[self serializer]];
+	// The block goes back to the region once the host has dropped the buffer.
+	uint64_t offset = block.offset;
+	id<MTLBuffer> buffer = [RgfxBuffer bufferOverHostMemoryWithContents:contents
+	                                                      regionOffset:offset
+	                                                            length:length
+	                                                           options:options
+	                                                       deallocator:^{ region->release(offset); }
+	                                                            device:self
+	                                                        serializer:[self serializer]];
+	if (buffer == nil)
+		region->release(offset); // no buffer lies over the block
+	return buffer;
 }
 
 - (id<MTLBuffer>)newBufferWithLength:(NSUInteger)length options:(MTLResourceOptions)options
@@ -224,13 +228,17 @@ bool rgfxIsManagedStorage(MTLResourceOptions options)
 		    region->allocate(descriptor.size == 0 ? 1 : static_cast<uint64_t>(descriptor.size));
 		if (block.ok) {
 			std::memset(const_cast<uint8_t *>(block.ptr), 0, block.size);
+			// The block goes back to the region once the host has dropped the heap.
+			uint64_t offset = block.offset;
 			id<MTLHeap> shared = [RgfxHeap heapOverHostMemoryWithDescriptor:descriptor
-			                                                  regionOffset:block.offset
+			                                                  regionOffset:offset
+			                                                   deallocator:^{ region->release(offset); }
 			                                                        device:self
 			                                                    serializer:[self serializer]];
 			if (shared != nil) {
 				return shared;
 			}
+			region->release(offset); // no heap lies over the block
 		}
 	}
 	return [RgfxHeap heapWithDescriptor:descriptor

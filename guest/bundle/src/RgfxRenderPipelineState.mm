@@ -61,6 +61,13 @@ bool fillFunctionRef(RgfxFunctionRef &fr, id<MTLFunction> fn)
 	BOOL _haveReflection;
 }
 
+// The host drops the pipeline once every command buffer in flight now has completed, as one may
+// still name it.
+- (void)dealloc
+{
+	[self rgfxRetireThen:nullptr];
+}
+
 + (instancetype)renderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)descriptor
                                            device:(id<MTLDevice>)device
                                        serializer:(RgfxSerializer *)serializer

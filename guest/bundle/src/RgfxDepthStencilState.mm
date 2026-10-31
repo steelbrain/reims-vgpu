@@ -32,6 +32,13 @@ RgfxStencilDescriptor rgfxStencilFromMTL(MTLStencilDescriptor *s)
 
 @implementation RgfxDepthStencilState
 
+// The host drops the state once every command buffer in flight now has completed, as one may
+// still name it.
+- (void)dealloc
+{
+	[self rgfxRetireThen:nullptr];
+}
+
 + (instancetype)depthStencilStateWithDescriptor:(MTLDepthStencilDescriptor *)descriptor
                                          device:(id<MTLDevice>)device
                                      serializer:(RgfxSerializer *)serializer

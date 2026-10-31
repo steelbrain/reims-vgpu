@@ -60,6 +60,21 @@ void RgfxSerializer::setQueueOpener(QueueOpenFn open, void *context)
 	m_queueOpenContext = context;
 }
 
+void RgfxSerializer::setQueueCloser(QueueCloseFn close, void *context)
+{
+	m_queueClose = close;
+	m_queueCloseContext = context;
+}
+
+void RgfxSerializer::destroyQueue(RgfxObjId obj_id)
+{
+	if (m_queueClose != nullptr) {
+		m_queueClose(m_queueCloseContext, obj_id);
+		return;
+	}
+	destroy(obj_id);
+}
+
 RgfxCreated RgfxSerializer::createHeap(uint64_t size_bytes, uint32_t options, int32_t heap_type,
                                        uint64_t align)
 {

@@ -2,15 +2,16 @@
  * RgfxRetirement: holds back an object's release on the host until every command buffer the
  * process had in flight when the guest let the object go has completed.
  *
- * A texture's OBJECT_DESTROY rides ring 0 through the kext, while a command buffer rides its
+ * An object's OBJECT_DESTROY rides ring 0 through the kext, while a command buffer rides its
  * queue's own ring, and the host decodes a buffer once ring 0's messages published before it took
- * the buffer are carried out. A destroy posted while a buffer that names the texture still waits
+ * the buffer are carried out. A destroy posted while a buffer that names the object still waits
  * on its ring would reach the host first, and the buffer would name an object the host has
- * dropped. Metal keeps an in-flight buffer's resources alive (retained references), so the
- * release waits for the buffers: each committed buffer that will complete holds a ticket from
- * begin() to end(), and retire() runs its release once every ticket issued before it has ended,
- * at once where none is live. Releases run in the order retired, on the thread that ends the last
- * ticket they wait for (the completion thread) or the caller's.
+ * dropped. Metal keeps what a buffer encodes alive from the encode to its completion (retained
+ * references), so the release waits for the buffers: each buffer that will complete holds a
+ * ticket from its making (begin()) to its completion or dealloc (end()), and retire() runs its
+ * release once every ticket issued before it has ended, at once where none is live. Releases run in the order retired, on the thread that ends the last
+ * ticket they wait for (the completion thread) or the caller's; one retired while earlier ones
+ * run waits for them, though no ticket is live.
  *
  * Our own C++; tested off the guest.
  */
@@ -46,11 +47,17 @@ public:
 	size_t live();
 
 private:
+	/// Runs the releases due, on this thread, until none is: those retire() queued behind
+	/// them meanwhile included, so none overtakes another.
+	void drain(std::unique_lock<std::mutex> &held);
+
 	std::mutex m_lock;
 	uint64_t m_next = 1;
 	std::set<uint64_t> m_live;
 	// In retire() order, so in the order of the last ticket each waits for.
 	std::deque<std::pair<uint64_t, std::function<void()>>> m_waiting;
+	// A thread runs releases (drain): a release retired meanwhile queues behind them.
+	bool m_draining = false;
 };
 
 #endif // RGFX_RETIREMENT_HPP_

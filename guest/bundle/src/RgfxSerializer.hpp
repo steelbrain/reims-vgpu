@@ -129,6 +129,16 @@ public:
 	typedef bool (*QueueOpenFn)(void *context, const RgfxQueueCreate &queue);
 	void setQueueOpener(QueueOpenFn open, void *context);
 
+	/// Where queues close: `close` hands the device the end of the queue `obj_id` (the
+	/// accelerator kext's QUEUE_DESTROY, which stops watching its completion ring and posts its
+	/// destroy). With one set, destroyQueue() posts nothing on the ring. Called with `context`.
+	typedef void (*QueueCloseFn)(void *context, RgfxObjId obj_id);
+	void setQueueCloser(QueueCloseFn close, void *context);
+
+	/// Ends the queue `obj_id` on the device: through the closer where one is set, else an
+	/// OBJECT_DESTROY on the ring. The device takes neither of its rings after it.
+	void destroyQueue(RgfxObjId obj_id);
+
 	// --- heaps ----------------------------------------------------------------
 
 	/// A device heap of `size_bytes`. `options` is MTLResourceOptions, `heap_type`
@@ -280,6 +290,8 @@ private:
 	RgfxIdSpace &m_ids;
 	QueueOpenFn m_queueOpen = nullptr;
 	void *m_queueOpenContext = nullptr;
+	QueueCloseFn m_queueClose = nullptr;
+	void *m_queueCloseContext = nullptr;
 };
 
 #endif // RGFX_SERIALIZER_HPP_

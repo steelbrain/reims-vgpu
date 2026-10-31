@@ -21,8 +21,10 @@
 #include <objc/message.h>
 #include <objc/runtime.h>
 
+#include <algorithm>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <vector>
 
 namespace {
@@ -63,6 +65,7 @@ enum {
 	kRgfxAccelMethodAlloc = 0x101,
 	kRgfxAccelMethodFree = 0x102,
 	kRgfxAccelMethodQueueCreate = 0x103,
+	kRgfxAccelMethodQueueDestroy = 0x104,
 	kRgfxAccelMethodSubmit = 0x105,
 	kRgfxAccelMethodResourceIds = 0x106,
 	kRgfxAccelMethodWaitCompletions = 0x107,
@@ -154,6 +157,15 @@ void rgfxKextRelease(void *context, uint64_t offset)
 	IOConnectCallScalarMethod(conn, kRgfxAccelMethodFree, &offset, 1, nullptr, nullptr);
 }
 
+// The serializer's queue closer: the kext stops watching the queue's completion ring and posts
+// its destroy on the control ring, behind the process's messages before it.
+void rgfxKextQueueCloser(void *context, RgfxObjId objId)
+{
+	io_connect_t conn = static_cast<io_connect_t>(reinterpret_cast<uintptr_t>(context));
+	uint64_t in = objId;
+	IOConnectCallScalarMethod(conn, kRgfxAccelMethodQueueDestroy, &in, 1, nullptr, nullptr);
+}
+
 // The serializer's queue opener: the kext posts the queue's create on the control ring and
 // returns once the device has its rings.
 bool rgfxKextQueueOpener(void *context, const RgfxQueueCreate &q)
@@ -223,6 +235,7 @@ void rgfxDeviceDoorbell(void *context, uint32_t ring_id)
 	std::unique_ptr<RgfxCompletionThread> _completions; // the queues' completions; null until then
 	RgfxKextLink _link;          // the lifecycle's route to the kext
 	std::vector<std::unique_ptr<RgfxRingWriter>> _queueRings; // owned queue submit-ring writers
+	std::mutex _queueRingsLock;  // queues are made and end on any thread
 	io_connect_t _conn;          // our accelerator user client (BAR-2 region map + doorbell)
 	std::unique_ptr<RgfxRingWriter> _controlRing; // the lifecycle, forwarded to the kext
 	mach_vm_address_t _mapBase;  // mapped device-region base (0 until the handshake maps it)
@@ -328,6 +341,7 @@ void rgfxDeviceDoorbell(void *context, uint32_t ring_id)
 	_controlRing = std::make_unique<RgfxRingWriter>(&rgfxKextSubmit, &_link, kLifecycleMessageMax);
 	_serializer = new RgfxSerializer(*_controlRing, _ids);
 	_serializer->setQueueOpener(&rgfxKextQueueOpener, connContext);
+	_serializer->setQueueCloser(&rgfxKextQueueCloser, connContext);
 	// The queues' completions, taken as the kext wakes the thread for them.
 	_completions = std::make_unique<RgfxCompletionThread>(&rgfxKextWaitCompletions, connContext);
 	if (!_completions->start()) {
@@ -405,8 +419,23 @@ void rgfxDeviceDoorbell(void *context, uint32_t ring_id)
 	auto writer = std::make_unique<RgfxRingWriter>(_region->base() + regionOffset, dataSize, ringId,
 	                                               &rgfxDeviceDoorbell, (__bridge void *)self);
 	RgfxRingWriter *raw = writer.get();
+	std::lock_guard<std::mutex> hold(_queueRingsLock);
 	_queueRings.push_back(std::move(writer));
 	return raw;
+}
+
+- (void)dropQueueSubmitRing:(RgfxRingWriter *)ring
+{
+	std::unique_ptr<RgfxRingWriter> dropped;
+	{
+		std::lock_guard<std::mutex> hold(_queueRingsLock);
+		auto it = std::find_if(_queueRings.begin(), _queueRings.end(),
+		                       [ring](const std::unique_ptr<RgfxRingWriter> &w) { return w.get() == ring; });
+		if (it == _queueRings.end())
+			return;
+		dropped = std::move(*it);
+		_queueRings.erase(it);
+	}
 }
 
 - (void)rgfxRingDoorbell:(uint32_t)ringId

@@ -117,6 +117,9 @@ bool RgfxReplyReader::armAndCheck()
 {
 	if (m_header == nullptr)
 		return false;
+	std::lock_guard<std::mutex> guard(m_lock);
+	if (m_closed)
+		return false;
 	// The host's post publishes `producer`, fences, then reads and clears `armed`; this
 	// sets `armed`, fences, then reads `producer`. One of the two sees the other's write:
 	// either the host raises the vector, or this sees the record and pumps again.
@@ -124,8 +127,13 @@ bool RgfxReplyReader::armAndCheck()
 	                 __ATOMIC_SEQ_CST);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	uint64_t producer = load64(m_header + kProducer);
-	std::lock_guard<std::mutex> guard(m_lock);
 	return producer != m_consumed;
+}
+
+void RgfxReplyReader::close()
+{
+	std::lock_guard<std::mutex> guard(m_lock);
+	m_closed = true;
 }
 
 bool RgfxReplyReader::awaitingCompletion(uint64_t seqno)
@@ -150,6 +158,8 @@ uint32_t RgfxReplyReader::pump()
 		return 0;
 	{
 		std::lock_guard<std::mutex> guard(m_lock);
+		if (m_closed)
+			return 0;
 		uint64_t producer = load64(m_header + kProducer);
 		while (m_consumed != producer) {
 			uint32_t offset = static_cast<uint32_t>(m_consumed) & m_mask;

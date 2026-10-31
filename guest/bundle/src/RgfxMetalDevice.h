@@ -98,10 +98,14 @@ NS_ASSUME_NONNULL_BEGIN
 - (nullable RgfxCompletionThread *)completionThread;
 
 /// Places a queue submission ring at `regionOffset` in the device region with a byte
-/// ring of `dataSize` bytes, owns the RgfxRingWriter over it for the device's life, and
-/// returns it (null when there is no region). The command-queue slice calls this.
+/// ring of `dataSize` bytes, owns the RgfxRingWriter over it until the queue's end
+/// (dropQueueSubmitRing:), and returns it (null when there is no region). The
+/// command-queue slice calls this.
 - (nullable RgfxRingWriter *)addQueueSubmitRingAtOffset:(uint64_t)regionOffset
                                               dataSize:(uint32_t)dataSize;
+
+/// Frees the writer addQueueSubmitRingAtOffset: returned, at its queue's end.
+- (void)dropQueueSubmitRing:(RgfxRingWriter *)ring;
 
 @end
 

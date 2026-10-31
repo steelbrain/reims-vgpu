@@ -221,6 +221,7 @@ uint32_t fillRenderPass(MTLRenderPassDescriptor *d, RgfxRenderPassDesc *desc,
 	dispatch_semaphore_t _slots;
 	NSString *_queueLabel;
 	std::shared_ptr<RgfxReplyReader> _ownedReader; // adoptReplyReader:'s per-queue completion reader
+	std::function<void()> _release;                // rgfxSetRelease:'s, run at the queue's end
 	dispatch_queue_t _submissionQueue; // kept for -submissionQueue (setSubmissionQueue: SPI)
 	dispatch_queue_t _completionQueue; // kept for -completionQueue (setCompletionQueue: SPI)
 	NSUInteger _gpuPriority;           // kept for -GPUPriority (setGPUPriority: SPI)
@@ -255,6 +256,30 @@ uint32_t fillRenderPass(MTLRenderPassDescriptor *d, RgfxRenderPassDesc *desc,
 		q->_slots = dispatch_semaphore_create(static_cast<long>(q->_maxCount));
 	}
 	return q;
+}
+
+// The device ends the queue once every command buffer in flight now has completed (its own
+// all have: each keeps the queue alive), and only then do its rings go back: the completion
+// ring is read no more first, as the completion thread may still hold its reader.
+- (void)dealloc
+{
+	RgfxSerializer *serializer = _serializer;
+	uint64_t objId = _objId;
+	std::shared_ptr<RgfxReplyReader> reader = _ownedReader;
+	std::function<void()> release = std::move(_release);
+	RgfxRetirement::process().retire([serializer, objId, reader, release] {
+		if (reader != nullptr)
+			reader->close();
+		if (serializer != nullptr)
+			serializer->destroyQueue(objId);
+		if (release)
+			release();
+	});
+}
+
+- (void)rgfxSetRelease:(std::function<void()>)release
+{
+	_release = std::move(release);
 }
 
 - (NSUInteger)maxCommandBufferCount
@@ -395,7 +420,7 @@ uint32_t fillRenderPass(MTLRenderPassDescriptor *d, RgfxRenderPassDesc *desc,
 @end
 
 @implementation RgfxCmdBuffer {
-	__weak RgfxCommandQueue *_queue;
+	RgfxCommandQueue *_queue; // kept alive, as Metal's command buffers keep their queue
 	RgfxEncoder *_encoder; // owned: built incrementally, posted on commit
 	BOOL _retained;
 	BOOL _committed;
@@ -424,8 +449,9 @@ uint32_t fillRenderPass(MTLRenderPassDescriptor *d, RgfxRenderPassDesc *desc,
 	// A buffer too large for its ring: the region block its message lies in until it completes.
 	RgfxRegion *_bodyRegion;
 	uint64_t _bodyOffset;
-	// The process's retirement ticket a buffer that will complete holds from its commit to its
-	// completion (RgfxRetirement), 0 for none: objects let go meanwhile stay on the host.
+	// The process's retirement ticket a buffer that will complete holds from its making to its
+	// completion (RgfxRetirement), 0 for none: objects let go meanwhile stay on the host, as
+	// Metal's buffer keeps what it encodes from the encode on.
 	std::atomic<uint64_t> _ticket;
 	// The IOSurface copies this buffer writes, written back to their surfaces' pages
 	// when it completes (RgfxIOSurface.h).
@@ -449,6 +475,10 @@ uint32_t fillRenderPass(MTLRenderPassDescriptor *d, RgfxRenderPassDesc *desc,
 		cb->_completedHandlers = [NSMutableArray array];
 		cb->_scheduledHandlers = [NSMutableArray array];
 		cb->_encoder = new RgfxEncoder(*ring, queue.rgfxObjId, cbObjId);
+		// One that will complete holds back the releases from now on: an object it encodes
+		// may be let go before its commit.
+		if (queue.replyReader != nullptr)
+			cb->_ticket.store(RgfxRetirement::process().begin());
 	}
 	return cb;
 }
@@ -569,8 +599,10 @@ uint32_t fillRenderPass(MTLRenderPassDescriptor *d, RgfxRenderPassDesc *desc,
 	std::function<void(uint64_t)> expect;
 	std::function<void()> whileWaiting;
 	if (_reader != nullptr) {
-		// Before the host can see it: an object let go from now on outlives it on the host.
-		_ticket.store(RgfxRetirement::process().begin());
+		// Before the host can see it: an object let go from now on outlives it on the host
+		// (the ticket taken as the buffer was made, or one taken here).
+		if (_ticket.load() == 0)
+			_ticket.store(RgfxRetirement::process().begin());
 		_readerHold = [queue sharedReplyReader];
 		_done = dispatch_group_create();
 		dispatch_group_enter(_done);
