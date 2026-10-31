@@ -229,11 +229,12 @@ public:
 		UInt32 rowBytes;
 	};
 	bool currentScanout(Scanout *scanout);
-	// For our user client `client` in `task`: the scanout surface `surfaceId` of that task is
-	// drawn into, whose span `client` may name from then on (grantedRange) until revokeGrants
-	// or the surface goes.
-	IOReturn grantSurfaceScanout(const void *client, task_t task, UInt32 surfaceId,
-	                             Scanout *scanout);
+	// For our user client `client` in `task`, of context `context`: the scanout surface
+	// `surfaceId` of that task is drawn into, whose span `client` may name from then on
+	// (grantedRange) until revokeGrants or the surface goes. The device is told the span is
+	// `context`'s (BLOCK_GRANT) before this returns.
+	IOReturn grantSurfaceScanout(const void *client, UInt32 context, task_t task,
+	                             UInt32 surfaceId, Scanout *scanout);
 	void revokeGrants(const void *client);
 	bool grantedRange(const void *client, UInt64 offset, UInt64 length);
 

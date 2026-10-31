@@ -154,7 +154,8 @@ IOReturn RgfxAcceleratorUserClient::contextMethod(uint32_t selector,
 		if (in[0] == 0 || in[0] > UINT32_MAX || in[1] != 0)
 			return kIOReturnBadArgument;
 		RgfxAccelerator::Scanout scanout = {};
-		IOReturn r = owner->grantSurfaceScanout(this, task, static_cast<UInt32>(in[0]), &scanout);
+		IOReturn r = owner->grantSurfaceScanout(this, context, task, static_cast<UInt32>(in[0]),
+		                                        &scanout);
 		if (r != kIOReturnSuccess)
 			return r;
 		a->scalarOutput[0] = scanout.offset;

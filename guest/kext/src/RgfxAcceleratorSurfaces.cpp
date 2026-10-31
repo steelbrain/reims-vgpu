@@ -6,10 +6,15 @@
  * WindowServer draws a display into the IOAccel surface on its framebuffer; with the Metal
  * compositor, through a texture the bundle makes over that surface's memory, asked for by the
  * surface's id (-newTextureWithSurface:buffer:). For a surface over the scanout, that memory is
- * the scanout's span of the region, outside every process's blocks, so the process's lifecycle
- * messages could not name it: grantSurfaceScanout lets the client of a process that holds the
- * surface name the span (grantedRange, which pinRange asks), until the client's context is
- * released or the surface goes.
+ * the scanout's span of the region, outside every process's blocks, so the process's messages
+ * could not name it: grantSurfaceScanout lets the client of a process that holds the surface name
+ * the span (grantedRange, which pinRange asks), until the client's context is released or the
+ * surface goes, and tells the device the span is the client's context's (BLOCK_GRANT), as the
+ * device checks the spans of the messages on the queues' rings, which bypass the kext.
+ *
+ * The device keeps that grant until the context's close, or until another context is granted
+ * the span: nothing frees the scanout or gives it to a process as a block, so the grant lets the
+ * context draw into the display and reach nothing else.
  *
  * Our own code; it names only SDK-public IOKit calls.
  */
@@ -138,8 +143,8 @@ bool RgfxAccelerator::currentScanout(Scanout *scanout)
 	return true;
 }
 
-IOReturn RgfxAccelerator::grantSurfaceScanout(const void *client, task_t task, UInt32 surfaceId,
-                                              Scanout *scanout)
+IOReturn RgfxAccelerator::grantSurfaceScanout(const void *client, UInt32 context, task_t task,
+                                              UInt32 surfaceId, Scanout *scanout)
 {
 	if (!currentScanout(scanout))
 		return kIOReturnNotReady;
@@ -174,6 +179,18 @@ IOReturn RgfxAccelerator::grantSurfaceScanout(const void *client, task_t task, U
 			surfaceState.grants[slot] = {client, surfaceId, scanout->offset, scanout->length};
 	}
 	IOLockUnlock(lock);
+	if (r != kIOReturnSuccess)
+		return r;
+	// Told at each grant, not only a new one: another context of the process may have been
+	// granted the span since, and the device keeps one holder.
+	RgfxBlockGrant grant = {};
+	grant.context = context;
+	grant.offset = scanout->offset;
+	grant.size = scanout->length;
+	r = postLifecycle(RGFX_CMD_BLOCK_GRANT, &grant, sizeof(grant), 0, nullptr, 0, nullptr,
+	                  nullptr, 0);
+	if (r != kIOReturnSuccess)
+		revokeGrants(client);
 	return r;
 }
 
