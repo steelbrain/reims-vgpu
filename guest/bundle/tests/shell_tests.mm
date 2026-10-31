@@ -3046,6 +3046,90 @@ void test_managed_texture_copy_block_after_destroys()
 	CHECK(ringEmpty(fx.ring));
 }
 
+// A queue's ring carries only its command buffers: every create and destroy of the objects they
+// use rides the control ring (ring 0), which the kext checks, and nothing else rides the queue's,
+// whose host side refuses any other type. Objects of every kind are made, used by a command
+// buffer committed on the queue, and let go.
+void test_queue_ring_carries_only_command_buffers()
+{
+	CHECK(retirementIdle());
+	QueueFixture f;
+	int calls = 0;
+	f.ids.setResourceIdSource(&oneChunk, &calls);
+	id<MTLCommandBuffer> cb = nil;
+	@autoreleasepool {
+		MTLHeapDescriptor *hd = [MTLHeapDescriptor new];
+		hd.size = 0x10000;
+		hd.type = MTLHeapTypePlacement;
+		RgfxHeap *heap = [RgfxHeap heapWithDescriptor:hd device:nil serializer:&f.ser];
+		id<MTLBuffer> placed = [heap newBufferWithLength:0x100
+		                                         options:MTLResourceStorageModePrivate
+		                                          offset:0];
+		RgfxBuffer *buffer = [RgfxBuffer bufferWithLength:0x1000
+		                                          options:MTLResourceStorageModePrivate
+		                                           device:nil
+		                                       serializer:&f.ser];
+		MTLTextureDescriptor *td =
+		    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+		                                                       width:8
+		                                                      height:8
+		                                                   mipmapped:NO];
+		RgfxTexture *texture = [RgfxTexture textureWithDescriptor:td
+		                                                     heap:RGFX_OBJ_NONE
+		                                               heapOffset:0
+		                                                   device:nil
+		                                               serializer:&f.ser];
+		id<MTLSamplerState> sampler =
+		    [RgfxSampler samplerWithDescriptor:[MTLSamplerDescriptor new] device:nil serializer:&f.ser];
+		id<MTLDepthStencilState> depth =
+		    [RgfxDepthStencilState depthStencilStateWithDescriptor:[MTLDepthStencilDescriptor new]
+		                                                    device:nil
+		                                                serializer:&f.ser];
+		id<MTLEvent> event = [RgfxEvent eventWithDevice:nil serializer:&f.ser];
+		id<MTLFence> fence = [RgfxFence fenceWithDevice:nil serializer:&f.ser];
+		CHECK(heap != nil && placed != nil && buffer != nil && texture != nil && sampler != nil &&
+		      depth != nil && event != nil && fence != nil);
+		cb = [f.queue commandBuffer];
+		id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+		[blit fillBuffer:buffer range:NSMakeRange(0, 0x100) value:7];
+		[blit copyFromBuffer:buffer sourceOffset:0 toBuffer:placed destinationOffset:0 size:0x100];
+		[blit updateFence:fence];
+		[blit endEncoding];
+		[cb encodeSignalEvent:event value:1];
+		[cb commit];
+	}
+	const std::set<uint32_t> queueTypes = {RGFX_CMD_COMMAND_BUFFER,
+	                                       RGFX_CMD_COMMAND_BUFFER_IN_REGION};
+	RgfxMsgHeader h = {};
+	std::vector<uint8_t> bytes;
+	int buffers = 0;
+	uint64_t seqno = 0;
+	while (f.submit.next(&h, &bytes)) {
+		CHECK(queueTypes.count(h.type) == 1);
+		seqno = h.seqno;
+		buffers++;
+	}
+	CHECK(buffers == 1);
+	// The buffer completes, so the destroys of what it used, held back for it, go too.
+	RgfxCbComplete done = cbComplete(seqno, ((RgfxResource *)cb).rgfxObjId);
+	CHECK(f.completion.postFromHost(&done, sizeof(done)));
+	[cb waitUntilCompleted];
+	@autoreleasepool {
+		cb = nil;
+	}
+	CHECK(retirementIdle());
+	std::set<uint32_t> lifecycle;
+	while (f.control.next(&h, &bytes)) {
+		CHECK(queueTypes.count(h.type) == 0);
+		lifecycle.insert(h.type);
+	}
+	for (uint32_t type : {RGFX_CMD_HEAP_CREATE, RGFX_CMD_BUFFER_AT_OFFSET, RGFX_CMD_BUFFER_CREATE,
+	                      RGFX_CMD_TEXTURE_CREATE, RGFX_CMD_SAMPLER_CREATE,
+	                      RGFX_CMD_DEPTH_STENCIL_CREATE, RGFX_CMD_EVENT_CREATE,
+	                      RGFX_CMD_FENCE_CREATE, RGFX_CMD_OBJECT_DESTROY})
+		CHECK(lifecycle.count(type) == 1);
+}
+
 // A heap of no bytes is nil, as Metal answers one, and so is a heap or device buffer for which
 // the context's range has no GPU address left: neither posts anything, so the host is never
 // asked for an object the app does not hold.
@@ -3662,6 +3746,7 @@ int main()
 		test_reply_reader_close();
 		test_addresses_reused_after_destroy();
 		test_heaps_with_no_bytes_or_address_are_nil();
+		test_queue_ring_carries_only_command_buffers();
 		test_managed_texture_copy_block_after_destroys();
 	}
 	std::printf("shell_tests: OK (%d checks)\n", g_checks);
