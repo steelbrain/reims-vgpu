@@ -175,6 +175,20 @@ Stages:
      now, though their rows need some of the same pieces: argument encoders
      for Mac1, Mac2 and Metal3, and the heaps, sample positions and IO
      queues for each of them.
+   - `architecture.name` is the host platform's: Metal's own on a Mac, and
+     on the Vulkan platform `vulkan_` with the GPU's PCI vendor and device
+     IDs and its driver's `pipelineCacheUUID`. The name keys binary archives,
+     so it stays one GPU's from boot to boot and changes where compiled
+     pipelines would (another GPU, driver or driver build). It names no Apple
+     GPU.
+   - Binary archives are the bundle's own (`RgfxBinaryArchive`): no compiled
+     code crosses the wire, so an archive keeps the keys Metal looks each
+     function's compile up by, per architecture, and writes them to a file of
+     its own format. Its answers and errors are Metal's, measured on the M3
+     Max (guest/bundle/tools/archive_probe.m), including the miss of
+     `MTLPipelineOptionFailOnBinaryArchiveMiss`. Apple frameworks that load
+     one at start (IconRendering, RenderBox) get a working archive, not the
+     base class's, which needs a target architecture the device has none of.
    - Where the lane's own device can do less than the host GPU, it answers
      no (Metal4, ray tracing, function pointers, dynamic libraries and the
      rest). One table in `crates/reims-vgpu/src/graphics/device_info.rs`

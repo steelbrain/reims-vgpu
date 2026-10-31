@@ -205,10 +205,11 @@ const APPLE_PIECES: [(i64, &[Piece]); 11] = {
     ]
 };
 
-/// The pieces the lane carries: texture views (`TEXTURE_VIEW`). A piece joins this list when its
-/// wire messages, its decoding and its bundle members land, and the Apple families it holds back
-/// rise with it.
-const WIRED: &[Piece] = &[Piece::TextureViews];
+/// The pieces the lane carries: texture views (`TEXTURE_VIEW`), and binary archives, which the
+/// bundle keeps in the guest (`RgfxBinaryArchive`: no compiled code crosses, so no wire message).
+/// A piece joins this list when its wire messages, its decoding and its bundle members land, and
+/// the Apple families it holds back rise with it.
+const WIRED: &[Piece] = &[Piece::TextureViews, Piece::BinaryArchives];
 
 /// `identity` with each Apple family answered yes only where the platform answers yes and `wired`
 /// holds every piece of its rows and of each Apple family's before it ([`APPLE_PIECES`]), and each
@@ -547,7 +548,8 @@ mod tests {
     /// rows and the rows before it: with every piece the fake's Apple1 to Apple9 and their iOS
     /// sets stand; without imageblocks, an Apple4 piece, Apple4 and later answer no and so do
     /// iOS_GPUFamily4 and 5, while Apple1 to Apple3, their sets and Mac1 stand; without argument
-    /// encoders, or texture views, no Apple family does, nor with the lane's pieces alone
+    /// encoders, or texture views, no Apple family does, nor with the lane's pieces alone; with
+    /// Apple1 to Apple3's pieces Apple3 stands, and without binary archives it does not
     #[test]
     fn an_apple_family_drops_where_the_lane_lacks_a_piece() {
         let p = Arc::new(FakePlatform::new());
@@ -611,6 +613,28 @@ mod tests {
         }
         assert_eq!(answer(&no_encoders, 2002), Some(true));
         assert_eq!(set(&no_encoders, 0), Some(false));
+
+        // Binary archives are the lane's too, so once the rest of Apple1 to Apple3's pieces are
+        // carried, Apple3 stands and Apple4 does not; without binary archives Apple3 falls back
+        // to Apple2.
+        assert!(WIRED.contains(&Piece::BinaryArchives));
+        let to_apple3: Vec<Piece> = APPLE_PIECES[..3]
+            .iter()
+            .flat_map(|(_, pieces)| pieces.iter().copied())
+            .collect();
+        let mut apple3 = platform.clone();
+        cap_apple_families(&mut apple3, &to_apple3);
+        assert_eq!(answer(&apple3, 1003), Some(true));
+        assert_eq!(answer(&apple3, 1004), Some(false));
+        let no_archives: Vec<Piece> = to_apple3
+            .iter()
+            .copied()
+            .filter(|&p| p != Piece::BinaryArchives)
+            .collect();
+        let mut apple2 = platform.clone();
+        cap_apple_families(&mut apple2, &no_archives);
+        assert_eq!(answer(&apple2, 1002), Some(true));
+        assert_eq!(answer(&apple2, 1003), Some(false));
     }
 
     /// The identity is the platform's, a name longer than v1's 32 bytes whole and the memory as
