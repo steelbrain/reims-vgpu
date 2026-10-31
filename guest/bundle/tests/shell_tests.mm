@@ -41,6 +41,7 @@
 #include <vector>
 #import "RgfxCommandObjects.h"
 #import "RgfxIOSurface.h"
+#import "RgfxMetalPrivate.h"
 
 #include <IOSurface/IOSurface.h>
 
@@ -382,6 +383,8 @@ void test_texture_cpu_copies()
 	[buf makeAliasable];
 	CHECK(!buf.isAliasable);
 	CHECK([buf setOwnerWithIdentity:0] == KERN_SUCCESS);
+	// No resource is protected: the device protects no content.
+	CHECK([buf protectionOptions] == 0 && [tex protectionOptions] == 0);
 	}
 }
 
@@ -1629,6 +1632,11 @@ void test_reply_reader_completion()
 	desc.errorOptions = MTLCommandBufferErrorOptionEncoderExecutionStatus;
 	id<MTLCommandBuffer> cb3 = [queue commandBufferWithDescriptor:desc];
 	CHECK(cb3.errorOptions == MTLCommandBufferErrorOptionEncoderExecutionStatus);
+	// The content protection asked of a buffer is answered as set.
+	id<MTLCommandBufferSPI> spi = (id<MTLCommandBufferSPI>)cb3;
+	CHECK([spi protectionOptions] == 0);
+	[spi setProtectionOptions:0x5];
+	CHECK([spi protectionOptions] == 0x5);
 	CHECK(cb.errorOptions == MTLCommandBufferErrorOptionNone);
 	NSUInteger logs = 0;
 	for (id log in cb3.logs) {

@@ -95,6 +95,13 @@
 	return _responsibleProcess;
 }
 
+// The resource SPI WindowServer reads as it composites into a texture: the content protection
+// the resource was made with. The device protects no content and no call sets it, so none.
+- (uint64_t)protectionOptions
+{
+	return 0;
+}
+
 - (void)rgfxSetHeapOffset:(NSUInteger)offset
 {
 	_heapOffset = offset;

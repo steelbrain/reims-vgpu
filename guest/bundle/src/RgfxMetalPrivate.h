@@ -84,8 +84,9 @@
 // buffer wrapper will conform to (the command-buffer/encoders slice), with the selectors it
 // overrides.
 @protocol MTLCommandBufferSPI <MTLCommandBuffer>
-// measured: macOS 26 Metal.framework, optional, `v24@0:8Q16`.
+// measured: macOS 26 Metal.framework, optional, `v24@0:8Q16` and `Q16@0:8`.
 - (void)setProtectionOptions:(uint64_t)options;
+- (uint64_t)protectionOptions;
 // measured: macOS 26 Metal.framework, optional, `c16@0:8`.
 - (BOOL)commitAndWaitUntilSubmitted;
 @end
@@ -96,6 +97,8 @@
 // measured: required, `v20@0:8i16` and `i16@0:8`.
 - (void)setResponsibleProcess:(int)pid;
 - (int)responsibleProcess;
+// measured: required, `Q16@0:8` (MTLHeapSPI has it too, optional); no setter is declared.
+- (uint64_t)protectionOptions;
 @end
 
 #endif // RGFX_METAL_PRIVATE_H_

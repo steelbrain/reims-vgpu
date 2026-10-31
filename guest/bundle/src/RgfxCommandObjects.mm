@@ -976,6 +976,12 @@ uint32_t fillRenderPass(MTLRenderPassDescriptor *d, RgfxRenderPassDesc *desc,
 	_cbLabel = [label copy];
 }
 
+// What the client asked of the buffer's content protection, as set.
+- (uint64_t)protectionOptions
+{
+	return _protectionOptions;
+}
+
 // The command-buffer SPI WindowServer's CoreDisplay calls before it fills a display surface.
 // The device protects no content, so the options are kept and change nothing; options asking
 // for protection are logged once.

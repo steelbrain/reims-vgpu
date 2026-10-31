@@ -101,6 +101,9 @@ NS_ASSUME_NONNULL_BEGIN
 - (MTLPurgeableState)setPurgeableState:(MTLPurgeableState)state;
 - (kern_return_t)setOwnerWithIdentity:(task_id_token_t)identity;
 
+/// The resource SPI's content protection (RgfxMetalPrivate.h): none.
+- (uint64_t)protectionOptions;
+
 @end
 
 NS_ASSUME_NONNULL_END
