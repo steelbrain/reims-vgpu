@@ -3,6 +3,8 @@
  */
 
 #import "RgfxFunction.h"
+
+#import "RgfxArgumentEncoder.h"
 #import "RgfxUnsupported.h"
 
 #import "RgfxMetalError.h"
@@ -193,18 +195,29 @@
 	return MTLFunctionOptionNone;
 }
 
+// The host lays out the argument buffer the function takes at `bufferIndex` from the library's
+// function (ARGUMENT_LAYOUT, RgfxArgumentEncoder.h); nil where it takes none there.
 - (id<MTLArgumentEncoder>)newArgumentEncoderWithBufferIndex:(NSUInteger)bufferIndex
 {
-	// Needs the function's argument reflection, which no host reply carries.
-	RGFX_UNSUPPORTED("argument encoders (no argument reflection on the wire)");
-	return nil;
+	id<MTLDevice> device = self.device;
+	RgfxRegion *region = [device conformsToProtocol:@protocol(RgfxRegionHolder)]
+	                         ? [(id<RgfxRegionHolder>)device region]
+	                         : nullptr;
+	return [RgfxArgumentEncoder encoderOfFunction:self
+	                                  bufferIndex:bufferIndex
+	                                       region:region
+	                                       device:device
+	                                   serializer:[self serializer]];
 }
 
+// The argument's reflection is not on the wire: the encoder comes back without it.
 - (id<MTLArgumentEncoder>)newArgumentEncoderWithBufferIndex:(NSUInteger)bufferIndex
                                                  reflection:(MTLAutoreleasedArgument *)reflection
 {
-	if (reflection)
+	if (reflection) {
 		*reflection = nil;
+		RGFX_UNSUPPORTED("an argument buffer's reflection (no argument reflection on the wire)");
+	}
 	return [self newArgumentEncoderWithBufferIndex:bufferIndex];
 }
 

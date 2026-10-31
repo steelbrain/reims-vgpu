@@ -14,6 +14,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <string>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -23,10 +24,12 @@
 #import "RgfxCommandObjects.h"
 #import "RgfxComputePipelineState.h"
 #import "RgfxDepthStencilState.h"
+#import "RgfxFunction.h"
 #import "RgfxHeap.h"
 #import "RgfxLibrary.h"
 #import "RgfxRenderPipelineState.h"
 #import "RgfxResource.h"
+#import "RgfxSampler.h"
 #import "RgfxSharedEvent.h"
 #import "RgfxTexture.h"
 #import "RgfxUnsupported.h"
@@ -38,6 +41,7 @@
 #include "RgfxRingWriter.hpp"
 #include "RgfxSerializer.hpp"
 #include "RgfxUploads.h"
+#include "rgfx_argument_reply.hpp"
 #include "reims_graphics_wire.h"
 #include "rgfx_test_ring.hpp" // CHECK, g_checks, TestRing, expectMessage
 
@@ -1013,28 +1017,307 @@ void test_library_members()
 	} // @autoreleasepool: the library drains while ser lives
 }
 
-// An argument encoder lays out nothing (its encoded length is 0) and writes nothing; each
-// member that is asked something logs it, a nil argument does not.
+// The word at `offset` of `buffer`'s contents.
+uint64_t wordAt(id<MTLBuffer> buffer, uint64_t offset)
+{
+	uint64_t v = 0;
+	std::memcpy(&v, static_cast<uint8_t *>(buffer.contents) + offset, sizeof(v));
+	return v;
+}
+
+// An argument encoder writes each argument's word where its layout puts the index, in the
+// argument buffer at the offset it was set to: a buffer's GPU address plus the offset, a
+// texture's or pipeline's resource id, 0 for nil, at the arguments' offset 0 for an index no
+// argument has, each word of a range in turn; nothing past the buffer's end, nor with no
+// argument buffer set. A depth/stencil state and a sampler with no resource id log that the
+// wire carries none; what the device makes no object of takes only nil, which writes 0.
 void test_argument_encoder_members()
 {
-	MTLArgumentDescriptor *a = [MTLArgumentDescriptor argumentDescriptor];
-	a.dataType = MTLDataTypePointer;
-	a.index = 0;
-	RgfxArgumentEncoder *enc = [RgfxArgumentEncoder argumentEncoderWithArguments:@[ a ]
-	                                                                      device:nil
-	                                                                  serializer:nullptr];
+	TestRing control(0x8000);
+	control.setConsumerIdle(1);
+	RgfxRingWriter writer(control.base(), control.dataSize, RGFX_CONTROL_RING_ID,
+	                      TestRing::doorbell, nullptr);
+	RgfxIdSpace ids;
+	RgfxSerializer ser(writer, ids);
 	Class c = [RgfxArgumentEncoder class];
-	[enc setBuffer:nil offset:0 atIndex:0];
-	CHECK(!RgfxUnsupportedWasLogged(c, @selector(setBuffer:offset:atIndex:)));
-	CHECK(enc.encodedLength == 0);
-	CHECK(RgfxUnsupportedWasLogged(c, @selector(encodedLength)));
-	id<MTLTexture> none[1] = {nil};
-	[enc setTextures:none withRange:NSMakeRange(0, 1)];
-	CHECK(RgfxUnsupportedWasLogged(c, @selector(setTextures:withRange:)));
+	auto probe = probeReply().bytes();
+	RgfxArgumentEncoder *enc =
+	    [[RgfxArgumentEncoder alloc] initWithLayout:RgfxArgLayout::parse(probe.data(), probe.size())
+	                                         device:nil
+	                                     serializer:&ser];
+	CHECK(enc.rgfxObjId == 0 && enc.encodedLength == 64 && enc.alignment == 16);
+	RgfxMsgHeader h = {};
+	std::vector<uint8_t> bytes;
+	CHECK(!control.next(&h, &bytes)); // an encoder makes nothing on the device
+
+	// No argument buffer: nothing to write into.
+	[enc setBuffer:nil offset:0 atIndex:4];
+	CHECK([enc constantDataAtIndex:3] == nullptr);
+
+	RgfxBuffer *args = [[RgfxBuffer alloc] initWithObjId:0x50
+	                                          gpuAddress:0x1000000
+	                                              length:256
+	                                             options:MTLResourceStorageModeShared
+	                                              device:nil
+	                                          serializer:nullptr];
+	RgfxBuffer *data = [[RgfxBuffer alloc] initWithObjId:0x51
+	                                          gpuAddress:0x2000000
+	                                              length:64
+	                                             options:MTLResourceStorageModeShared
+	                                              device:nil
+	                                          serializer:nullptr];
+	std::memset(args.contents, 0xaa, 256);
+	[enc setArgumentBuffer:args offset:64];
+	[enc setBuffer:data offset:16 atIndex:4];
+	CHECK(wordAt(args, 64 + 48) == 0x2000010);
+	RgfxTextureDescriptor tw = {};
+	tw.pixel_format = 70;
+	tw.texture_type = 2;
+	tw.width = tw.height = 4;
+	tw.depth = tw.mipmap_level_count = tw.array_length = tw.sample_count = 1;
+	RgfxTexture *named = [[RgfxTexture alloc] initWithObjId:0x61
+	                                             gpuAddress:0
+	                                             resourceId:0x1234
+	                                             descriptor:tw
+	                                                 device:nil
+	                                             serializer:nullptr];
+	[enc setTexture:named atIndex:0];
+	CHECK(wordAt(args, 64) == 0x1234);
+	[enc setTexture:nil atIndex:0];
+	CHECK(wordAt(args, 64) == 0);
+	CHECK(static_cast<uint8_t *>([enc constantDataAtIndex:3]) ==
+	      static_cast<uint8_t *>(args.contents) + 64 + 32);
+	// An index no argument has lands at the arguments' offset 0, as Metal's encoder writes it.
+	[enc setBuffer:data offset:0 atIndex:9];
+	CHECK(wordAt(args, 64) == 0x2000000);
+	CHECK(static_cast<uint8_t *>([enc constantDataAtIndex:9]) ==
+	      static_cast<uint8_t *>(args.contents) + 64);
+	CHECK(wordAt(args, 56) == 0xaaaaaaaaaaaaaaaaull); // nothing before the arguments
+
+	// The third element of an array of argument buffers; nothing past the buffer's end.
+	[enc setArgumentBuffer:args startOffset:0 arrayElement:2];
+	[enc setBuffer:data offset:8 atIndex:4];
+	CHECK(wordAt(args, 128 + 48) == 0x2000008);
+	[enc setArgumentBuffer:args offset:240];
+	[enc setBuffer:data offset:0 atIndex:4];
+	CHECK(wordAt(args, 240) == 0xaaaaaaaaaaaaaaaaull);
+
+	// A nested argument buffer's encoder, from the layout; none where the index holds none.
+	id<MTLArgumentEncoder> inner = [enc newArgumentEncoderForBufferAtIndex:1];
+	CHECK(inner != nil && inner.encodedLength == 16 && inner.alignment == 8);
+	CHECK([enc newArgumentEncoderForBufferAtIndex:4] == nil);
 	CHECK([enc newArgumentEncoderForBufferAtIndex:0] == nil);
-	CHECK([enc constantDataAtIndex:0] == nullptr);
+	CHECK([enc newArgumentEncoderForBufferAtIndex:7] == nil);
+	[inner setArgumentBuffer:args offset:16];
+	[inner setTexture:named atIndex:0];
+	CHECK(wordAt(args, 16) == 0x1234);
+
+	// A sampler's resource id is not on the wire: its word is 0, and it logs that.
+	[enc setArgumentBuffer:args offset:0];
+	RgfxSampler *smp = [RgfxSampler samplerWithDescriptor:[[MTLSamplerDescriptor alloc] init]
+	                                               device:nil
+	                                           serializer:&ser];
+	CHECK(smp != nil);
+	[enc setSamplerState:nil atIndex:2];
+	CHECK(!RgfxUnsupportedWasLogged(c, @selector(setSamplerState:atIndex:)));
+	[enc setSamplerState:smp atIndex:2];
+	CHECK(wordAt(args, 16) == 0);
+	CHECK(RgfxUnsupportedWasLogged(c, @selector(setSamplerState:atIndex:)));
+	// A depth/stencil state has no resource id: its argument keeps its bytes.
+	RgfxDepthStencilState *ds =
+	    [RgfxDepthStencilState depthStencilStateWithDescriptor:[[MTLDepthStencilDescriptor alloc] init]
+	                                                    device:nil
+	                                                serializer:&ser];
+	std::memset(args.contents, 0x5c, 8);
+	[enc setDepthStencilState:ds atIndex:0];
+	CHECK(wordAt(args, 0) == 0x5c5c5c5c5c5c5c5cull);
+	CHECK(RgfxUnsupportedWasLogged(c, @selector(setDepthStencilState:atIndex:)));
+	// What the device makes no object of: nil writes 0, unlogged.
 	[enc setIndirectCommandBuffer:nil atIndex:0];
+	CHECK(wordAt(args, 0) == 0);
 	CHECK(!RgfxUnsupportedWasLogged(c, @selector(setIndirectCommandBuffer:atIndex:)));
+	std::memset(args.contents, 0x5c, 8);
+	[enc setAccelerationStructure:nil atIndex:0];
+	[enc setVisibleFunctionTable:nil atIndex:0];
+	CHECK(wordAt(args, 0) == 0);
+
+	// A range writes each word in turn: the descriptors' layout of a texture, four pointers,
+	// a float4 and a float (measured: M3 Max, macOS 27).
+	ArgReply arr;
+	arr.layout(80, 16)
+	    .member(0, RGFX_ARGUMENT_TEXTURE, 0, 8)
+	    .member(1, RGFX_ARGUMENT_BUFFER, 8, 8, 4, 8)
+	    .member(5, RGFX_ARGUMENT_CONSTANT, 48, 16)
+	    .member(6, RGFX_ARGUMENT_CONSTANT, 64, 4);
+	auto ab = arr.bytes();
+	RgfxArgumentEncoder *ranged =
+	    [[RgfxArgumentEncoder alloc] initWithLayout:RgfxArgLayout::parse(ab.data(), ab.size())
+	                                         device:nil
+	                                     serializer:nullptr];
+	CHECK(ranged.encodedLength == 80);
+	[ranged setArgumentBuffer:args offset:0];
+	id<MTLBuffer> four[4] = {data, nil, data, data};
+	NSUInteger offsets[4] = {0, 8, 16, 24};
+	[ranged setBuffers:four offsets:offsets withRange:NSMakeRange(1, 4)];
+	CHECK(wordAt(args, 8) == 0x2000000 && wordAt(args, 16) == 0);
+	CHECK(wordAt(args, 24) == 0x2000010 && wordAt(args, 32) == 0x2000018);
+	id<MTLTexture> textures[2] = {named, nil};
+	std::memset(args.contents, 0xaa, 16);
+	[ranged setTextures:textures withRange:NSMakeRange(0, 2)];
+	CHECK(wordAt(args, 0) == 0x1234 && wordAt(args, 8) == 0);
+}
+
+// A fake device's argument layouts, written into the region's block the query names: the
+// whole layout where it fits, else the bytes it needs and TOO_SMALL; `status` where it is set.
+struct RegionAsker {
+	uint8_t *region = nullptr;
+	std::vector<uint8_t> reply;
+	std::vector<RgfxArgumentLayoutQuery> asked;
+	std::vector<std::string> names;
+	uint32_t status = RGFX_STATUS_OK;
+
+	static bool ask(void *context, const void *message, uint32_t size, void *answer,
+	                uint32_t capacity, uint32_t *answer_size)
+	{
+		RegionAsker *self = static_cast<RegionAsker *>(context);
+		RgfxArgumentLayoutQuery q = {};
+		CHECK(size >= sizeof(q));
+		std::memcpy(&q, message, sizeof(q));
+		CHECK(q.header.type == RGFX_CMD_ARGUMENT_LAYOUT);
+		self->asked.push_back(q);
+		self->names.emplace_back(static_cast<const char *>(message) + q.name_offset, q.name_len);
+		RgfxComplete c = {};
+		c.header = {RGFX_EVT_COMPLETE, sizeof(c), 7};
+		c.status = self->status;
+		if (c.status == RGFX_STATUS_OK && self->reply.size() > q.reply_length) {
+			const uint64_t needed = self->reply.size();
+			std::memcpy(self->region + q.reply_offset, &needed, sizeof(needed));
+			c.status = RGFX_STATUS_TOO_SMALL;
+		} else if (c.status == RGFX_STATUS_OK) {
+			std::memcpy(self->region + q.reply_offset, self->reply.data(), self->reply.size());
+		}
+		CHECK(capacity >= sizeof(c));
+		std::memcpy(answer, &c, sizeof(c));
+		*answer_size = sizeof(c);
+		return true;
+	}
+};
+
+// The region's blocks, counted: a bump of whole pages past the reserved head.
+struct CountedBlocks {
+	uint64_t next = RGFX_ALLOCATIONS_OFFSET;
+	int live = 0;
+
+	static bool alloc(void *context, uint64_t size, uint64_t align, uint64_t *offset)
+	{
+		CountedBlocks *self = static_cast<CountedBlocks *>(context);
+		self->next = (self->next + align - 1) & ~(align - 1);
+		*offset = self->next;
+		self->next += (size + 4095) & ~uint64_t(4095);
+		self->live++;
+		return true;
+	}
+	static void release(void *context, uint64_t)
+	{
+		static_cast<CountedBlocks *>(context)->live--;
+	}
+};
+
+// The device's and a function's encoders take their layout from the host's answer, asked into
+// a block of the region that goes back once the answer is read, and again, once, into a block
+// of the size the host says it needs; nil where the host refuses, or there is no region.
+void test_argument_encoder_query()
+{
+	TestRing control(0x8000);
+	control.setConsumerIdle(1);
+	RgfxRingWriter writer(control.base(), control.dataSize, RGFX_CONTROL_RING_ID,
+	                      TestRing::doorbell, nullptr);
+	RgfxIdSpace ids;
+	RgfxSerializer ser(writer, ids);
+	std::vector<uint8_t> mem(RGFX_ALLOCATIONS_OFFSET + (8u << 20), 0);
+	RgfxRegion region(mem.data(), mem.size());
+	CountedBlocks blocks;
+	region.setBlockSource(&CountedBlocks::alloc, &CountedBlocks::release, &blocks);
+	RegionAsker asker;
+	asker.region = mem.data();
+	asker.reply = probeReply().bytes();
+	ser.setAsker(&RegionAsker::ask, &asker);
+
+	MTLArgumentDescriptor *t = [MTLArgumentDescriptor argumentDescriptor];
+	t.dataType = MTLDataTypeTexture;
+	t.index = 0;
+	t.textureType = MTLTextureType2D;
+	t.access = MTLBindingAccessReadOnly;
+	MTLArgumentDescriptor *p = [MTLArgumentDescriptor argumentDescriptor];
+	p.dataType = MTLDataTypePointer;
+	p.index = 1;
+	p.arrayLength = 4;
+	RgfxArgumentEncoder *enc = [RgfxArgumentEncoder encoderOfArguments:@[ t, p ]
+	                                                            region:&region
+	                                                            device:nil
+	                                                        serializer:&ser];
+	CHECK(enc != nil && enc.encodedLength == 64 && enc.alignment == 16);
+	CHECK(asker.asked.size() == 1 && blocks.live == 0);
+	const RgfxArgumentLayoutQuery &q = asker.asked[0];
+	CHECK(q.source == RGFX_ARGUMENT_SOURCE_DESCRIPTORS && q.count == 2 && q.reply_length == 4096);
+	CHECK(q.reply_offset >= RGFX_ALLOCATIONS_OFFSET);
+
+	// A layout past the first block: asked again into one of the size the host needs.
+	ArgReply big;
+	big.layout(8 * 100, 8);
+	for (uint32_t i = 0; i < 100; i++)
+		big.member(i, RGFX_ARGUMENT_BUFFER, 8 * i, 8);
+	asker.reply = big.bytes();
+	CHECK(asker.reply.size() > 4096);
+	enc = [RgfxArgumentEncoder encoderOfArguments:@[ p ] region:&region device:nil serializer:&ser];
+	CHECK(enc != nil && enc.encodedLength == 800 && enc.rgfxLayout->members.size() == 100);
+	CHECK(asker.asked.size() == 3 && asker.asked[2].reply_length >= asker.reply.size());
+	CHECK(blocks.live == 0);
+
+	// A function's buffer argument, under its library, name and constants.
+	RgfxResource *lib = [[RgfxResource alloc] initWithObjId:0x70 device:nil serializer:&ser];
+	RgfxFunctionConstant fc = {};
+	fc.index = 1;
+	fc.data_type = 53; // MTLDataTypeBool
+	fc.value[0] = 1;
+	RgfxFunction *fn = [RgfxFunction functionWithLibrary:lib
+	                                                name:@"argument_probe"
+	                                           constants:&fc
+	                                               count:1
+	                                              device:nil
+	                                          serializer:&ser];
+	asker.reply = probeReply().bytes();
+	enc = [RgfxArgumentEncoder encoderOfFunction:fn
+	                                 bufferIndex:2
+	                                      region:&region
+	                                      device:nil
+	                                  serializer:&ser];
+	CHECK(enc != nil && enc.encodedLength == 64);
+	const RgfxArgumentLayoutQuery &fq = asker.asked.back();
+	CHECK(fq.source == RGFX_ARGUMENT_SOURCE_FUNCTION && fq.library_obj_id == 0x70);
+	CHECK(fq.buffer_index == 2 && fq.constant_count == 1);
+	CHECK(asker.names.back() == "argument_probe");
+
+	// Refused, or no region: no encoder, and no block kept.
+	asker.status = RGFX_STATUS_REFUSED;
+	CHECK([RgfxArgumentEncoder encoderOfArguments:@[ t ] region:&region device:nil
+	                                   serializer:&ser] == nil);
+	CHECK([RgfxArgumentEncoder encoderOfFunction:fn
+	                                 bufferIndex:0
+	                                      region:&region
+	                                      device:nil
+	                                  serializer:&ser] == nil);
+	CHECK(blocks.live == 0);
+	const size_t asked = asker.asked.size();
+	CHECK([RgfxArgumentEncoder encoderOfArguments:@[ t ] region:nullptr device:nil
+	                                   serializer:&ser] == nil);
+	// A function with no device to hold a region makes none, nor answers a reflection.
+	MTLAutoreleasedArgument reflection = (MTLArgument *)@"unset";
+	CHECK([fn newArgumentEncoderWithBufferIndex:0 reflection:&reflection] == nil);
+	CHECK(reflection == nil && asker.asked.size() == asked);
+	RgfxMsgHeader h = {};
+	std::vector<uint8_t> bytes;
+	CHECK(!control.next(&h, &bytes)); // queries go through the asker, never the ring
 }
 
 // waitUntilSignaledValue:timeoutMS: answers YES at once for a value reached, NO once the
@@ -1152,6 +1435,7 @@ void rgfxProtocolTests()
 	test_pipeline_state_members();
 	test_library_members();
 	test_argument_encoder_members();
+	test_argument_encoder_query();
 	test_shared_event_wait();
 	test_heap_sizes();
 	test_queue_barriers();

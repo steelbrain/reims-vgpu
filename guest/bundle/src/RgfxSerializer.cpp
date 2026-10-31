@@ -93,6 +93,82 @@ bool RgfxSerializer::heapTextureSizeAndAlign(const RgfxTextureDescriptor &desc, 
 	return true;
 }
 
+// One ARGUMENT_LAYOUT through `ask`: the head, then its tail (the descriptors, or the name and
+// the constants), its offsets set as `fill` appends them. Answers the COMPLETE's status, or
+// kRgfxNoAnswer.
+template <typename Fill>
+static uint32_t askArgumentLayout(RgfxSerializer::AskFn ask, void *askContext, RgfxIdSpace &ids,
+                                  uint32_t max_size, uint32_t source, uint64_t reply_offset,
+                                  uint64_t reply_length, Fill fill)
+{
+	if (ask == nullptr)
+		return kRgfxNoAnswer;
+	const uint32_t head = sizeof(RgfxArgumentLayoutQuery);
+	std::vector<uint8_t> tail;
+	auto append = [&](const void *data, size_t n) -> uint32_t {
+		uint32_t off = static_cast<uint32_t>(head + tail.size());
+		if (n) {
+			const uint8_t *b = static_cast<const uint8_t *>(data);
+			tail.insert(tail.end(), b, b + n);
+		}
+		return off;
+	};
+	RgfxArgumentLayoutQuery msg = {};
+	msg.obj_id = ids.allocObjId();
+	msg.reply_offset = reply_offset;
+	msg.reply_length = reply_length;
+	msg.source = source;
+	fill(msg, append);
+	const uint64_t total = (uint64_t(head) + tail.size() + 7) & ~uint64_t(7);
+	if (total > max_size)
+		return kRgfxNoAnswer;
+	msg.header.type = RGFX_CMD_ARGUMENT_LAYOUT;
+	msg.header.size = static_cast<uint32_t>(total);
+	std::vector<uint8_t> buf(static_cast<size_t>(total), 0);
+	std::memcpy(buf.data(), &msg, sizeof(msg));
+	if (!tail.empty())
+		std::memcpy(buf.data() + head, tail.data(), tail.size());
+	RgfxComplete answer = {};
+	uint32_t length = 0;
+	if (!ask(askContext, buf.data(), static_cast<uint32_t>(total), &answer, sizeof(answer),
+	         &length) ||
+	    length < sizeof(answer) || answer.header.type != RGFX_EVT_COMPLETE)
+		return kRgfxNoAnswer;
+	return answer.status;
+}
+
+uint32_t RgfxSerializer::argumentLayoutOfDescriptors(const RgfxArgumentDescriptor *descriptors,
+                                                     uint32_t count, uint64_t reply_offset,
+                                                     uint64_t reply_length)
+{
+	return askArgumentLayout(
+	    m_ask, m_askContext, m_ids, m_control.dataSize(), RGFX_ARGUMENT_SOURCE_DESCRIPTORS,
+	    reply_offset, reply_length, [&](RgfxArgumentLayoutQuery &msg, auto &append) {
+		    msg.count = count;
+		    msg.descriptors_offset = append(descriptors, size_t(count) * sizeof(*descriptors));
+	    });
+}
+
+uint32_t RgfxSerializer::argumentLayoutOfFunction(RgfxObjId library, const char *entry_point,
+                                                  const RgfxFunctionConstant *constants,
+                                                  uint32_t constant_count, uint32_t buffer_index,
+                                                  uint64_t reply_offset, uint64_t reply_length)
+{
+	return askArgumentLayout(
+	    m_ask, m_askContext, m_ids, m_control.dataSize(), RGFX_ARGUMENT_SOURCE_FUNCTION,
+	    reply_offset, reply_length, [&](RgfxArgumentLayoutQuery &msg, auto &append) {
+		    const uint32_t len =
+		        entry_point ? static_cast<uint32_t>(std::strlen(entry_point)) : 0;
+		    msg.library_obj_id = library;
+		    msg.buffer_index = buffer_index;
+		    msg.name_offset = append(entry_point, len);
+		    msg.name_len = len;
+		    msg.constants_offset =
+		        append(constants, size_t(constant_count) * sizeof(RgfxFunctionConstant));
+		    msg.constant_count = constant_count;
+	    });
+}
+
 void RgfxSerializer::destroyQueue(RgfxObjId obj_id)
 {
 	if (m_queueClose != nullptr) {

@@ -1285,22 +1285,6 @@ void test_function_constants_resolve_as_metal()
 	CHECK([lib26 newFunctionWithName:@"plain"].functionConstantsDictionary.count == 0);
 }
 
-// The argument encoder is a documented stub: it holds its argument count, carries no
-// host handle, and answers placeholder layout queries without posting anything.
-void test_argument_encoder_stub()
-{
-	RgfxArgumentEncoder *enc = [RgfxArgumentEncoder argumentEncoderWithArguments:@[]
-	                                                                     device:nil
-	                                                                 serializer:nullptr];
-	CHECK(enc != nil);
-	CHECK(enc.rgfxObjId == 0); // no host handle in this slice
-	CHECK(enc.rgfxArgumentCount == 0);
-	CHECK([enc encodedLength] == 0);
-	CHECK([enc conformsToProtocol:@protocol(MTLArgumentEncoder)]);
-}
-
-
-
 static TestHandle *handle(uint64_t objId)
 {
 	return [[TestHandle alloc] initWithObjId:objId device:nil serializer:nullptr];
@@ -4593,7 +4577,6 @@ int main()
 		test_render_pipeline_routing();
 		test_compute_pipeline_routing();
 		test_function_constants_resolve_as_metal();
-		test_argument_encoder_stub();
 		test_command_graph();
 		test_parallel_render_encoder();
 		test_queue_guards();

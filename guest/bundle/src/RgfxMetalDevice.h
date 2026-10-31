@@ -46,6 +46,7 @@
 #ifndef RGFX_METAL_DEVICE_H_
 #define RGFX_METAL_DEVICE_H_
 
+#import "RgfxArgumentEncoder.h" // RgfxRegionHolder
 #import "RgfxMetalPrivate.h"
 
 #include "RgfxCaps.hpp"
@@ -61,7 +62,7 @@ class RgfxCompletionThread;
 
 NS_ASSUME_NONNULL_BEGIN
 
-@interface RgfxMetalDevice : IOGPUMetalDevice <MTLDevice, MTLDeviceSPI>
+@interface RgfxMetalDevice : IOGPUMetalDevice <MTLDevice, MTLDeviceSPI, RgfxRegionHolder>
 
 /// Metal's entry point: `[super initWithAcceleratorPort:]` identifies the GPU, then
 /// (stub, until the region/ring transport lands) we would map the device region,

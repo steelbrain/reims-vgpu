@@ -158,6 +158,22 @@ public:
 	bool heapTextureSizeAndAlign(const RgfxTextureDescriptor &desc, uint64_t *size,
 	                             uint64_t *align);
 
+	/// ARGUMENT_LAYOUT of `count` argument descriptors, in their order, under a new id that
+	/// names nothing: the device writes the layout into the `reply_length` bytes at
+	/// `reply_offset`, a block of the caller's, and answers its COMPLETE. Answers its status
+	/// (RGFX_STATUS_OK; RGFX_STATUS_TOO_SMALL, with the bytes needed written; a refusal), or
+	/// kRgfxNoAnswer where no answer came back.
+	uint32_t argumentLayoutOfDescriptors(const RgfxArgumentDescriptor *descriptors, uint32_t count,
+	                                     uint64_t reply_offset, uint64_t reply_length);
+
+	/// ARGUMENT_LAYOUT of the argument buffer function `entry_point` of library `library`
+	/// takes at `buffer_index`, specialised by `constant_count` constants where there are any;
+	/// answered as argumentLayoutOfDescriptors.
+	uint32_t argumentLayoutOfFunction(RgfxObjId library, const char *entry_point,
+	                                  const RgfxFunctionConstant *constants,
+	                                  uint32_t constant_count, uint32_t buffer_index,
+	                                  uint64_t reply_offset, uint64_t reply_length);
+
 	// --- heaps ----------------------------------------------------------------
 
 	/// A device heap of `size_bytes`. `options` is MTLResourceOptions, `heap_type`

@@ -18,6 +18,7 @@
 #include <cstring>
 #include <vector>
 
+#include "RgfxArgumentLayout.hpp"
 #include "RgfxBinaryArchiveFile.hpp"
 #include "RgfxCaps.hpp"
 #include "RgfxEncoder.hpp"
@@ -32,6 +33,7 @@
 #include "RgfxRingWriter.hpp"
 #include "RgfxSerializer.hpp"
 #include "reims_graphics_wire.h"
+#include "rgfx_argument_reply.hpp"
 #include "rgfx_test_ring.hpp" // CHECK, g_checks, TestRing, expectMessage
 
 namespace {
@@ -1494,6 +1496,182 @@ void test_memory_shadow()
 	CHECK(rgfxShadowsSyncIn({}).empty());
 }
 
+// What a fake device answers an argument layout query, and what it was asked.
+struct LayoutAsker {
+	std::vector<uint8_t> asked;
+	uint32_t status = RGFX_STATUS_OK;
+	uint32_t answerType = RGFX_EVT_COMPLETE;
+	bool answers = true;
+	int calls = 0;
+
+	static bool ask(void *context, const void *message, uint32_t size, void *reply,
+	                uint32_t capacity, uint32_t *reply_size)
+	{
+		LayoutAsker *self = static_cast<LayoutAsker *>(context);
+		self->calls++;
+		const uint8_t *b = static_cast<const uint8_t *>(message);
+		self->asked.assign(b, b + size);
+		if (!self->answers)
+			return false;
+		RgfxComplete answer = {};
+		answer.header = {self->answerType, sizeof(answer), 5};
+		answer.status = self->status;
+		CHECK(capacity >= sizeof(answer));
+		std::memcpy(reply, &answer, sizeof(answer));
+		*reply_size = sizeof(answer);
+		return true;
+	}
+
+	RgfxArgumentLayoutQuery query() const
+	{
+		RgfxArgumentLayoutQuery q = {};
+		CHECK(asked.size() >= sizeof(q));
+		std::memcpy(&q, asked.data(), sizeof(q));
+		return q;
+	}
+};
+
+// An argument layout query asks the device under a new id of the context, with the
+// descriptors, or the function's name and constants, after its head, and the reply block it
+// names; it posts nothing on the ring, and answers the COMPLETE's status, or no answer where no
+// asker is set, nothing came back, or the answer is not a COMPLETE.
+void test_argument_layout_queries()
+{
+	TestRing ring(0x4000);
+	ring.setConsumerIdle(1);
+	RgfxRingWriter writer(ring.base(), ring.dataSize, RGFX_CONTROL_RING_ID, TestRing::doorbell,
+	                      nullptr);
+	RgfxIdSpace ids;
+	ids.setBases(3ull << RGFX_CONTEXT_OBJ_ID_SHIFT, RgfxIdSpace::kDefaultAddressBase);
+	RgfxSerializer ser(writer, ids);
+	RgfxArgumentDescriptor d[2] = {};
+	d[0].data_type = 58; // MTLDataTypeTexture
+	d[0].index = 0;
+	d[0].texture_type = 2;
+	d[1].data_type = 60; // MTLDataTypePointer
+	d[1].index = 1;
+	d[1].array_length = 4;
+	CHECK(ser.argumentLayoutOfDescriptors(d, 2, 0x10000, 4096) == kRgfxNoAnswer);
+
+	LayoutAsker asker;
+	ser.setAsker(&LayoutAsker::ask, &asker);
+	CHECK(ser.argumentLayoutOfDescriptors(d, 2, 0x10000, 4096) == RGFX_STATUS_OK);
+	RgfxArgumentLayoutQuery q = asker.query();
+	CHECK(q.header.type == RGFX_CMD_ARGUMENT_LAYOUT);
+	CHECK(q.header.size == asker.asked.size() && q.header.size % 8 == 0);
+	CHECK(q.header.size == sizeof(q) + sizeof(d));
+	CHECK(q.obj_id >> RGFX_CONTEXT_OBJ_ID_SHIFT == 3);
+	CHECK(q.source == RGFX_ARGUMENT_SOURCE_DESCRIPTORS && q.count == 2);
+	CHECK(q.reply_offset == 0x10000 && q.reply_length == 4096);
+	CHECK(q.descriptors_offset == sizeof(q));
+	CHECK(std::memcmp(asker.asked.data() + q.descriptors_offset, d, sizeof(d)) == 0);
+	const uint64_t first = q.obj_id;
+	RgfxMsgHeader h = {};
+	std::vector<uint8_t> bytes;
+	CHECK(!ring.next(&h, &bytes));
+
+	RgfxFunctionConstant c = {};
+	c.index = 2;
+	c.data_type = 53; // MTLDataTypeBool
+	c.value[0] = 1;
+	asker.status = RGFX_STATUS_TOO_SMALL;
+	CHECK(ser.argumentLayoutOfFunction(0x77, "kern", &c, 1, 3, 0x20000, 8192) ==
+	      RGFX_STATUS_TOO_SMALL);
+	q = asker.query();
+	CHECK(q.obj_id != first && q.source == RGFX_ARGUMENT_SOURCE_FUNCTION);
+	CHECK(q.library_obj_id == 0x77 && q.buffer_index == 3);
+	CHECK(q.reply_offset == 0x20000 && q.reply_length == 8192);
+	CHECK(q.name_offset == sizeof(q) && q.name_len == 4);
+	CHECK(std::memcmp(asker.asked.data() + q.name_offset, "kern", 4) == 0);
+	CHECK(q.constants_offset == sizeof(q) + 4 && q.constant_count == 1);
+	CHECK(std::memcmp(asker.asked.data() + q.constants_offset, &c, sizeof(c)) == 0);
+	CHECK(q.header.size == ((sizeof(q) + 4 + sizeof(c) + 7) & ~size_t(7)));
+
+	asker.status = RGFX_STATUS_REFUSED;
+	CHECK(ser.argumentLayoutOfDescriptors(d, 2, 0x10000, 4096) == RGFX_STATUS_REFUSED);
+	asker.answerType = RGFX_EVT_SIZE_AND_ALIGN;
+	CHECK(ser.argumentLayoutOfDescriptors(d, 2, 0x10000, 4096) == kRgfxNoAnswer);
+	asker.answers = false;
+	CHECK(ser.argumentLayoutOfDescriptors(d, 2, 0x10000, 4096) == kRgfxNoAnswer);
+	// Larger than the control ring takes: not asked.
+	std::vector<RgfxArgumentDescriptor> many(ring.dataSize / sizeof(RgfxArgumentDescriptor));
+	const int calls = asker.calls;
+	CHECK(ser.argumentLayoutOfDescriptors(many.data(), static_cast<uint32_t>(many.size()), 0x10000,
+	                                      4096) == kRgfxNoAnswer);
+	CHECK(asker.calls == calls);
+}
+
+// A layout answer parses into its tree, and an index lands where Metal's encoder puts it: in
+// the last member whose indices hold it, at its element's offset, inside a struct element as
+// that element's layout says, with a nested argument buffer's layout; nowhere for an index no
+// member holds. An answer that is not whole parses to nothing.
+void test_argument_layout_parse()
+{
+	auto probe = probeReply().bytes();
+	auto layout = RgfxArgLayout::parse(probe.data(), probe.size());
+	CHECK(layout != nullptr);
+	CHECK(layout->encodedLength == 64 && layout->alignment == 16);
+	CHECK(layout->members.size() == 5 && layout->idSpan() == 5);
+	RgfxArgPlace at = {};
+	CHECK(layout->place(0, &at) && at.kind == RGFX_ARGUMENT_TEXTURE && at.offset == 0);
+	CHECK(layout->place(1, &at) && at.kind == RGFX_ARGUMENT_BUFFER && at.offset == 8);
+	CHECK(at.nested && at.nested->encodedLength == 16 && at.nested->members.size() == 2);
+	RgfxArgPlace inner = {};
+	CHECK(at.nested->place(1, &inner) && inner.kind == RGFX_ARGUMENT_SAMPLER && inner.offset == 8);
+	CHECK(layout->place(3, &at) && at.kind == RGFX_ARGUMENT_CONSTANT && at.offset == 32 &&
+	      at.size == 16);
+	CHECK(layout->place(4, &at) && at.offset == 48 && !at.nested);
+	CHECK(!layout->place(5, &at));
+
+	// An array, a later member that claims one of its indices, and an array of structs.
+	ArgReply r;
+	r.layout(256, 16)
+	    .member(0, RGFX_ARGUMENT_BUFFER, 0, 8, 4, 8)
+	    .member(2, RGFX_ARGUMENT_TEXTURE, 40, 8)
+	    .member(10, RGFX_ARGUMENT_STRUCT, 64, 32, 2, 32, 3, 1);
+	r.layout(32, 16)
+	    .member(0, RGFX_ARGUMENT_BUFFER, 0, 8)
+	    .member(1, RGFX_ARGUMENT_CONSTANT, 16, 16)
+	    .member(2, RGFX_ARGUMENT_TEXTURE, 8, 8);
+	auto b = r.bytes();
+	layout = RgfxArgLayout::parse(b.data(), b.size());
+	CHECK(layout != nullptr && layout->idSpan() == 16);
+	CHECK(layout->place(1, &at) && at.kind == RGFX_ARGUMENT_BUFFER && at.offset == 8);
+	CHECK(layout->place(2, &at) && at.kind == RGFX_ARGUMENT_TEXTURE && at.offset == 40);
+	CHECK(layout->place(3, &at) && at.kind == RGFX_ARGUMENT_BUFFER && at.offset == 24);
+	CHECK(!layout->place(4, &at));
+	CHECK(layout->place(10, &at) && at.kind == RGFX_ARGUMENT_BUFFER && at.offset == 64);
+	CHECK(layout->place(12, &at) && at.kind == RGFX_ARGUMENT_TEXTURE && at.offset == 72);
+	CHECK(layout->place(14, &at) && at.kind == RGFX_ARGUMENT_CONSTANT && at.offset == 112);
+	CHECK(!layout->place(16, &at));
+
+	// Not whole: no layouts, a run past the members, a layout index past the layouts, a layout
+	// that holds itself, a reply shorter than its records or than it says it needs.
+	CHECK(RgfxArgLayout::parse(nullptr, 0) == nullptr);
+	ArgReply none;
+	none.layouts.clear();
+	auto nb = none.bytes();
+	CHECK(RgfxArgLayout::parse(nb.data(), nb.size()) == nullptr);
+	ArgReply run = probeReply();
+	run.layouts[1].member_count = 3;
+	auto rb = run.bytes();
+	CHECK(RgfxArgLayout::parse(rb.data(), rb.size()) == nullptr);
+	ArgReply past = probeReply();
+	past.members[1].layout = 2;
+	auto pb = past.bytes();
+	CHECK(RgfxArgLayout::parse(pb.data(), pb.size()) == nullptr);
+	ArgReply self = probeReply();
+	self.members[1].layout = 0;
+	auto sb = self.bytes();
+	CHECK(RgfxArgLayout::parse(sb.data(), sb.size()) == nullptr);
+	CHECK(RgfxArgLayout::parse(probe.data(), probe.size() - 1) == nullptr);
+	RgfxArgumentLayoutReply head = {};
+	std::memcpy(&head, probe.data(), sizeof(head));
+	head.needed = probe.size() + 8;
+	std::memcpy(probe.data(), &head, sizeof(head));
+	CHECK(RgfxArgLayout::parse(probe.data(), probe.size()) == nullptr);
+}
+
 int main()
 {
 	test_id_space();
@@ -1514,6 +1692,8 @@ int main()
 	test_heap_ranges();
 	test_heap_texture_size_query();
 	test_memory_shadow();
+	test_argument_layout_queries();
+	test_argument_layout_parse();
 	std::printf("serializer_tests: OK (%d checks)\n", g_checks);
 	return 0;
 }
