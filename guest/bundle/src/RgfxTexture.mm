@@ -14,7 +14,11 @@
 #include "RgfxRetirement.hpp"
 #include "RgfxSerializer.hpp" // RgfxSerializer, RgfxTextureDescriptor (wire)
 
+#import <objc/runtime.h>
+
 #include <algorithm>
+#include <atomic>
+#include <cstring>
 
 namespace {
 
@@ -206,6 +210,56 @@ RgfxBlockShape rgfxBlockShapeOf(MTLPixelFormat f)
 		return {16, 12, 12};
 	default:
 		return {0, 1, 1};
+	}
+}
+
+// A CPU copy's shape: the region's rows of blocks, each row's bytes, and its images (depth).
+struct RgfxCopyShape {
+	uint64_t rowBytes, rows, images;
+};
+
+// The shape of a CPU copy of `region` of a texture in `format`; false where the format is not
+// sized here or the region is empty.
+bool rgfxCopyShapeOf(MTLPixelFormat format, MTLRegion region, RgfxCopyShape *out)
+{
+	RgfxBlockShape b = rgfxBlockShapeOf(format);
+	if (b.bytes == 0 || region.size.width == 0 || region.size.height == 0 ||
+	    region.size.depth == 0) {
+		return false;
+	}
+	out->rowBytes = (region.size.width + b.width - 1) / b.width * b.bytes;
+	out->rows = (region.size.height + b.height - 1) / b.height;
+	out->images = region.size.depth;
+	return true;
+}
+
+// Logs, once per kind, a CPU copy the texture does not make.
+void rgfxNoteCopyRefused(std::atomic<bool> &logged, NSString *what, RgfxTexture *t)
+{
+	if (!logged.exchange(true)) {
+		NSLog(@"RGFX: texture 0x%llx (format %lu, storage mode %lu): %@; nothing is copied",
+		      (unsigned long long)[t rgfxObjId], (unsigned long)t.pixelFormat,
+		      (unsigned long)t.storageMode, what);
+	}
+}
+
+// The device's queue for the CPU's copies into and out of its textures, made at the first one
+// and kept with the device.
+id<MTLCommandQueue> rgfxCopyQueue(id<MTLDevice> device)
+{
+	static char key;
+	if (device == nil) {
+		return nil;
+	}
+	@synchronized(device) {
+		id<MTLCommandQueue> queue = objc_getAssociatedObject(device, &key);
+		if (queue == nil) {
+			queue = [device newCommandQueue];
+			if (queue != nil) {
+				objc_setAssociatedObject(device, &key, queue, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+			}
+		}
+		return queue;
 	}
 }
 
@@ -502,7 +556,8 @@ RgfxBlockShape rgfxBlockShapeOf(MTLPixelFormat f)
 // --- CPU access ----------------------------------------------------------------
 //
 // Each form dispatches on the texture's storage: a Managed texture with a CPU copy reads and
-// writes the copy (rgfxManaged...), with no round trip.
+// writes the copy (rgfxManaged...), with no round trip; any other is copied on the device
+// (rgfxCopyRegion:, below), or refused where the CPU cannot reach it.
 
 /// The bytes of the texels of `region` of `level` and `slice` in the CPU copy, copied to or from
 /// `pixels` (each row `bytesPerRow`, each image `bytesPerImage` apart), as `toCopy` says. False
@@ -614,7 +669,23 @@ RgfxBlockShape rgfxBlockShapeOf(MTLPixelFormat f)
 	                     bytesPerImage:bytesPerImage]) {
 		return;
 	}
-	// Other storage modes: not handled here.
+	switch (self.storageMode) {
+	case MTLStorageModePrivate:
+	case MTLStorageModeMemoryless: {
+		static std::atomic<bool> logged{false};
+		rgfxNoteCopyRefused(logged, @"replaceRegion: of a texture the CPU cannot reach", self);
+		return;
+	}
+	default:
+		[self rgfxCopyRegion:region
+		         mipmapLevel:level
+		               slice:slice
+		               bytes:const_cast<void *>(pixelBytes)
+		         bytesPerRow:bytesPerRow
+		       bytesPerImage:bytesPerImage
+		             toBytes:NO];
+		return;
+	}
 }
 
 - (void)replaceRegion:(MTLRegion)region
@@ -645,7 +716,23 @@ RgfxBlockShape rgfxBlockShapeOf(MTLPixelFormat f)
 	                        slice:slice]) {
 		return;
 	}
-	// Other storage modes: not handled here.
+	switch (self.storageMode) {
+	case MTLStorageModePrivate:
+	case MTLStorageModeMemoryless: {
+		static std::atomic<bool> logged{false};
+		rgfxNoteCopyRefused(logged, @"getBytes: of a texture the CPU cannot reach", self);
+		return;
+	}
+	default:
+		[self rgfxCopyRegion:region
+		         mipmapLevel:level
+		               slice:slice
+		               bytes:pixelBytes
+		         bytesPerRow:bytesPerRow
+		       bytesPerImage:bytesPerImage
+		             toBytes:YES];
+		return;
+	}
 }
 
 - (void)getBytes:(void *)pixelBytes
@@ -674,6 +761,124 @@ RgfxBlockShape rgfxBlockShapeOf(MTLPixelFormat f)
 - (BOOL)isFramebufferOnly
 {
 	return NO;
+}
+
+// --- the CPU's copies of a texture with no CPU copy of its own ----------------------
+// Private and Memoryless textures give the CPU no access. One made over a buffer is copied in
+// the buffer's bytes, where its rows lie; any other (a Shared texture, or a Managed one with no
+// CPU copy) is copied through a staging buffer of the region's rows, by a blit the call waits
+// for, so the GPU's later work sees what was written and the bytes read are the GPU's.
+
+// Copies `region` of `level` and `slice` between the texture and the caller's `bytes`, rows
+// `bytesPerRow` apart and images `bytesPerImage` apart: out of the texture into `bytes` when
+// `toBytes`, else into the texture.
+- (void)rgfxCopyRegion:(MTLRegion)region
+           mipmapLevel:(NSUInteger)level
+                 slice:(NSUInteger)slice
+                 bytes:(void *)bytes
+           bytesPerRow:(NSUInteger)bytesPerRow
+         bytesPerImage:(NSUInteger)bytesPerImage
+               toBytes:(BOOL)toBytes
+{
+	RgfxCopyShape shape = {};
+	if (bytes == nullptr || !rgfxCopyShapeOf(self.pixelFormat, region, &shape)) {
+		static std::atomic<bool> logged{false};
+		rgfxNoteCopyRefused(logged, @"a CPU copy of an empty region or an unsized format",
+		                    self);
+		return;
+	}
+	uint64_t width = std::max<uint64_t>(1, _desc.width >> level);
+	uint64_t height = std::max<uint64_t>(1, _desc.height >> level);
+	uint64_t depth = std::max<uint64_t>(1, _desc.depth >> level);
+	uint64_t imageBytes = shape.images > 1 ? bytesPerImage : bytesPerRow * shape.rows;
+	if (level >= std::max<uint32_t>(1, _desc.mipmap_level_count) ||
+	    region.origin.x + region.size.width > width ||
+	    region.origin.y + region.size.height > height ||
+	    region.origin.z + region.size.depth > depth || bytesPerRow < shape.rowBytes ||
+	    (shape.images > 1 && imageBytes < bytesPerRow * shape.rows)) {
+		static std::atomic<bool> logged{false};
+		rgfxNoteCopyRefused(logged, @"a CPU copy past the texture or with rows too short", self);
+		return;
+	}
+	auto copyRows = [&](uint8_t *dst, uint64_t dstRow, uint64_t dstImage, const uint8_t *src,
+	                    uint64_t srcRow, uint64_t srcImage) {
+		for (uint64_t z = 0; z < shape.images; z++) {
+			for (uint64_t r = 0; r < shape.rows; r++) {
+				std::memcpy(dst + z * dstImage + r * dstRow, src + z * srcImage + r * srcRow,
+				            shape.rowBytes);
+			}
+		}
+	};
+	uint8_t *caller = static_cast<uint8_t *>(bytes);
+
+	if (_buffer != nil) {
+		// Its one level and slice lie in the buffer, rows _bufferBytesPerRow apart.
+		uint8_t *contents = static_cast<uint8_t *>([_buffer contents]);
+		RgfxBlockShape b = rgfxBlockShapeOf(self.pixelFormat);
+		if (contents == nullptr || level != 0 || slice != 0 || shape.images != 1) {
+			static std::atomic<bool> logged{false};
+			rgfxNoteCopyRefused(logged, @"a CPU copy of a texture over a buffer it cannot reach",
+			                    self);
+			return;
+		}
+		uint8_t *at = contents + _bufferOffset + region.origin.y / b.height * _bufferBytesPerRow +
+		              region.origin.x / b.width * b.bytes;
+		if (toBytes) {
+			copyRows(caller, bytesPerRow, imageBytes, at, _bufferBytesPerRow, 0);
+		} else {
+			copyRows(at, _bufferBytesPerRow, 0, caller, bytesPerRow, imageBytes);
+		}
+		return;
+	}
+
+	// Through a staging buffer of the region's rows, packed.
+	id<MTLDevice> device = self.device;
+	id<MTLCommandQueue> queue = rgfxCopyQueue(device);
+	uint64_t stageImage = shape.rowBytes * shape.rows;
+	id<MTLBuffer> stage = [device newBufferWithLength:stageImage * shape.images
+	                                          options:MTLResourceStorageModeShared];
+	uint8_t *staged = static_cast<uint8_t *>([stage contents]);
+	id<MTLCommandBuffer> cb = [queue commandBuffer];
+	id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+	if (staged == nullptr || blit == nil) {
+		static std::atomic<bool> logged{false};
+		rgfxNoteCopyRefused(logged, @"no staging buffer or command buffer for a CPU copy", self);
+		[blit endEncoding];
+		return;
+	}
+	if (toBytes) {
+		[blit copyFromTexture:self
+		                 sourceSlice:slice
+		                 sourceLevel:level
+		                sourceOrigin:region.origin
+		                  sourceSize:region.size
+		                    toBuffer:stage
+		           destinationOffset:0
+		      destinationBytesPerRow:shape.rowBytes
+		    destinationBytesPerImage:stageImage];
+	} else {
+		copyRows(staged, shape.rowBytes, stageImage, caller, bytesPerRow, imageBytes);
+		[blit copyFromBuffer:stage
+		           sourceOffset:0
+		      sourceBytesPerRow:shape.rowBytes
+		    sourceBytesPerImage:stageImage
+		             sourceSize:region.size
+		              toTexture:self
+		       destinationSlice:slice
+		       destinationLevel:level
+		      destinationOrigin:region.origin];
+	}
+	[blit endEncoding];
+	[cb commit];
+	[cb waitUntilCompleted];
+	if (cb.status != MTLCommandBufferStatusCompleted) {
+		static std::atomic<bool> logged{false};
+		rgfxNoteCopyRefused(logged, @"the device failed a CPU copy's blit", self);
+		return;
+	}
+	if (toBytes) {
+		copyRows(caller, bytesPerRow, imageBytes, staged, shape.rowBytes, stageImage);
+	}
 }
 
 @end

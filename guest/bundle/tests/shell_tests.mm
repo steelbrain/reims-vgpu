@@ -291,6 +291,81 @@ void test_shared_event_routing()
 }
 
 
+// The CPU's copies of a texture: one over a buffer writes and reads the region's rows in the
+// buffer's bytes, at the texture's rows; a Private texture's are refused with nothing posted,
+// as is a device texture's copy with no device to blit on.
+void test_texture_cpu_copies()
+{
+	Fixture fx;
+	@autoreleasepool {
+	// A 4 x 3 BGRA8 texture over a buffer, its rows 32 bytes apart from offset 16.
+	std::vector<uint8_t> memory(16 + 32 * 3, 0xee);
+	RgfxBuffer *buf = [RgfxBuffer bufferOverHostMemoryWithContents:memory.data()
+	                                                  regionOffset:0x10000
+	                                                        length:memory.size()
+	                                                       options:MTLResourceStorageModeShared
+	                                                   deallocator:nil
+	                                                        device:nil
+	                                                    serializer:&fx.ser];
+	MTLTextureDescriptor *desc =
+	    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+	                                                       width:4
+	                                                      height:3
+	                                                   mipmapped:NO];
+	desc.storageMode = MTLStorageModeShared;
+	RgfxTexture *tex = [RgfxTexture textureWithDescriptor:desc
+	                                               buffer:buf
+	                                               offset:16
+	                                          bytesPerRow:32
+	                                               device:nil
+	                                           serializer:&fx.ser];
+	CHECK(tex != nil);
+	RgfxMsgHeader h = {};
+	std::vector<uint8_t> bytes;
+	while (fx.ring.next(&h, &bytes)) {
+	}
+
+	// Two pixels of each of two rows, from (1, 1), the caller's rows 12 bytes apart.
+	uint8_t in[24];
+	for (int i = 0; i < 24; i++)
+		in[i] = static_cast<uint8_t>(i);
+	[tex replaceRegion:MTLRegionMake2D(1, 1, 2, 2) mipmapLevel:0 withBytes:in bytesPerRow:12];
+	CHECK(std::memcmp(&memory[16 + 32 * 1 + 4], &in[0], 8) == 0);
+	CHECK(std::memcmp(&memory[16 + 32 * 2 + 4], &in[12], 8) == 0);
+	CHECK(memory[16 + 32 * 1] == 0xee && memory[16 + 32 * 1 + 12] == 0xee); // around it
+	CHECK(memory[16 + 32 * 0 + 4] == 0xee);
+	uint8_t out[16] = {};
+	[tex getBytes:out bytesPerRow:8 fromRegion:MTLRegionMake2D(1, 1, 2, 2) mipmapLevel:0];
+	CHECK(std::memcmp(&out[0], &in[0], 8) == 0 && std::memcmp(&out[8], &in[12], 8) == 0);
+	// Past the texture, or rows shorter than the region's: nothing is copied.
+	[tex replaceRegion:MTLRegionMake2D(3, 0, 2, 1) mipmapLevel:0 withBytes:in bytesPerRow:8];
+	[tex replaceRegion:MTLRegionMake2D(0, 0, 2, 1) mipmapLevel:0 withBytes:in bytesPerRow:4];
+	CHECK(memory[16] == 0xee && memory[16 + 12] == 0xee);
+
+	// A Private texture: refused, nothing posted. A Shared device texture with no device:
+	// no queue to blit on, nothing posted.
+	desc.storageMode = MTLStorageModePrivate;
+	RgfxTexture *priv = [RgfxTexture textureWithDescriptor:desc
+	                                                  heap:RGFX_OBJ_NONE
+	                                            heapOffset:0
+	                                                device:nil
+	                                            serializer:&fx.ser];
+	desc.storageMode = MTLStorageModeShared;
+	RgfxTexture *shared = [RgfxTexture textureWithDescriptor:desc
+	                                                    heap:RGFX_OBJ_NONE
+	                                              heapOffset:0
+	                                                  device:nil
+	                                              serializer:&fx.ser];
+	CHECK(priv != nil && shared != nil);
+	while (fx.ring.next(&h, &bytes)) {
+	}
+	[priv replaceRegion:MTLRegionMake2D(0, 0, 2, 2) mipmapLevel:0 withBytes:in bytesPerRow:12];
+	[priv getBytes:out bytesPerRow:8 fromRegion:MTLRegionMake2D(0, 0, 2, 2) mipmapLevel:0];
+	[shared replaceRegion:MTLRegionMake2D(0, 0, 2, 2) mipmapLevel:0 withBytes:in bytesPerRow:12];
+	CHECK(!fx.ring.next(&h, &bytes));
+	}
+}
+
 // A texture wrapper's create routes an RGFX_CMD_TEXTURE_CREATE onto the ring
 // (device-placed: a GPU address and a resource id are picked, heap_obj_id 0), and
 // its getters answer the mapped descriptor. The RgfxBuffer routing pattern, for
@@ -3126,6 +3201,7 @@ int main()
 		test_fence_routing();
 		test_shared_event_routing();
 		test_texture_routing();
+		test_texture_cpu_copies();
 		test_texture_resource_ids();
 		test_sampler_routing();
 		test_depth_stencil_routing();
