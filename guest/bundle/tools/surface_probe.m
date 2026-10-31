@@ -2,7 +2,8 @@
 //   surface_probe check [W H]        correctness across processes, three ways:
 //       1. this process writes the surface on the CPU (a lock), the other samples it on the GPU;
 //       2. the other renders into it on the GPU, this process reads it on the CPU (a lock);
-//       3. this process renders into it on the GPU, the other samples it on the GPU.
+//       3. this process renders into it on the GPU, the other samples it on the GPU;
+//       4. both let their textures go and make them again, then 1 and 3 again.
 //     Prints "SURFACE OK" when every pixel of every step matches, else "SURFACE FAIL: why".
 //   surface_probe bench [W H SECONDS]  the desktop's hot path: each frame this process renders
 //     the surface (a clear) and the other samples it (a blit into a Shared buffer), one after
@@ -42,7 +43,7 @@ struct Mailbox {
 	double ms; // the peer's command buffer, commit to completion
 };
 
-enum { kOpSample = 1, kOpRender = 2, kOpQuit = 3 };
+enum { kOpSample = 1, kOpRender = 2, kOpQuit = 3, kOpRemake = 4 };
 
 static int W = 1920, H = 1080;
 static id<MTLDevice> gDevice;
@@ -71,6 +72,25 @@ static id<MTLDevice> ourDevice(void)
 			return d;
 	}
 	return nil;
+}
+
+// Lets the texture over the surface go, waits for the bundle to let its block go, and makes it
+// again.
+static int remake(IOSurfaceRef s)
+{
+	@autoreleasepool {
+		gTexture = nil;
+	}
+	usleep(300 * 1000);
+	MTLTextureDescriptor *td =
+	    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+	                                                       width:W
+	                                                      height:H
+	                                                   mipmapped:NO];
+	td.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
+	td.storageMode = MTLStorageModeManaged;
+	gTexture = [gDevice newTextureWithDescriptor:td iosurface:s plane:0];
+	return gTexture == nil;
 }
 
 static int setUp(IOSurfaceRef s)
@@ -217,6 +237,9 @@ static int peer(IOSurfaceID sid, const char *path)
 			mb->ms = render(mb->arg);
 			mb->result = mb->ms < 0;
 			break;
+		case kOpRemake:
+			mb->result = remake(s);
+			break;
 		case kOpQuit:
 			atomic_store(&mb->ack, req);
 			return 0;
@@ -324,6 +347,24 @@ int main(int argc, char **argv)
 				rc = 1;
 			} else if (rc == 0) {
 				printf("3 GPU render here, GPU sample in the peer: every pixel\n");
+			}
+			// 4. Both let their textures go, so the plane's block goes, and make them again.
+			if (rc == 0 && (ask(mb, kOpRemake, 0, false) != 0 || remake(s) != 0)) {
+				printf("SURFACE FAIL: 4 a texture was not made again\n");
+				rc = 1;
+			} else if (rc == 0 && (cpuWrite(s, 0x22334455), 0) == 0 &&
+			           (bad = ask(mb, kOpSample, 0x22334455, true)) != 0) {
+				printf("SURFACE FAIL: 4 the peer's GPU saw %u pixels not the CPU's\n", bad);
+				rc = 1;
+			} else if (rc == 0 && render(0x44) < 0) {
+				printf("SURFACE FAIL: 4 the render failed\n");
+				rc = 1;
+			} else if (rc == 0 && (bad = ask(mb, kOpSample, redPixel(0x44), true)) != 0) {
+				printf("SURFACE FAIL: 4 the peer's GPU saw %u pixels not the render\n", bad);
+				rc = 1;
+			} else if (rc == 0) {
+				printf("4 textures made again: CPU write and GPU render here, GPU sample in the "
+				       "peer: every pixel\n");
 			}
 			if (rc == 0)
 				printf("SURFACE OK\n");
