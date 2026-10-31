@@ -139,14 +139,17 @@ use metal2vulkan::bind::SamplerDescriptor;
 use metal2vulkan::metal::PrimitiveTopologyClass;
 use metal2vulkan::metal::state::{DepthStencilDescriptor, StencilDescriptor};
 use metal2vulkan::pipeline::{
-    ColorAttachmentDescriptor, ComputePipelineDescriptor, RenderPipelineDescriptor, StageSource,
-    TileRenderPipelineDescriptor,
+    ColorAttachmentDescriptor, ComputePipelineDescriptor, RenderPipelineDescriptor,
+    StageInputAttributeDescriptor, StageInputDescriptor, StageInputLayoutDescriptor, StageSource,
+    TileRenderPipelineDescriptor, VertexAttributeDescriptor, VertexBufferLayoutDescriptor,
+    VertexDescriptor,
 };
 use metal2vulkan_runtime as rt;
 use reims_vgpu_core::platform::resource::RenderPipeline as _;
 use reims_vgpu_core::platform::types::NsErrorText;
 use reims_vgpu_core::platform::values::{
-    DepthStencilDesc, RenderPipelineDesc, SamplerDesc, StencilDesc,
+    ColorAttachmentDesc, DepthStencilDesc, FullComputePipelineDesc, FullRenderPipelineDesc,
+    RenderPipelineDesc, SamplerDesc, StageInputDesc, StencilDesc, VertexDesc,
 };
 use reims_vgpu_core::raise::RaiseResult;
 use reims_vgpu_core::sync::Mutex;
@@ -504,6 +507,201 @@ pub(crate) fn new_render_pipeline_state(
     )
 }
 
+/// `newRenderPipelineStateWithDescriptor:error:` of the whole value `desc`, the graphics lane's:
+/// every field the value carries is the runtime descriptor's own. A raw value the runtime has no
+/// enumerator of dies at the send ([`metal_value`]); so does the compile's refusal where Metal
+/// answers no `NSError` ([`made`]). The lane calls it inside its refusal scope.
+pub(crate) fn new_render_pipeline_state_full(
+    device: &VulkanDevice,
+    desc: &FullRenderPipelineDesc<'_, VulkanPlatform>,
+) -> Result<Option<VulkanRenderPipeline>, NsErrorText> {
+    let sel = "newRenderPipelineStateWithDescriptor:error:";
+    let mut d =
+        RenderPipelineDescriptor::new(StageSource::Function(desc.vertex.function_descriptor()));
+    d.fragment = desc
+        .fragment
+        .map(|f| StageSource::Function(f.function_descriptor()));
+    d.vertex_descriptor = desc
+        .vertex_descriptor
+        .as_ref()
+        .map(|v| vertex_descriptor(sel, v));
+    for (index, c) in &desc.colors {
+        let slot = usize::try_from(*index)
+            .ok()
+            .and_then(|i| d.color_attachments.get_mut(i))
+            .unwrap_or_else(|| unrepresentable(sel, &format!("colour attachment {index}")));
+        *slot = full_color_attachment(sel, c);
+    }
+    d.depth_format = optional_format(sel, desc.depth_pixel_format);
+    d.stencil_format = optional_format(sel, desc.stencil_pixel_format);
+    d.raster_sample_count = count(sel, "raster sample count", desc.raster_sample_count);
+    d.alpha_to_coverage = desc.alpha_to_coverage;
+    d.alpha_to_one = desc.alpha_to_one;
+    d.rasterization_enabled = desc.rasterization_enabled;
+    d.input_primitive_topology = metal_value(
+        sel,
+        "primitive topology class",
+        desc.input_primitive_topology,
+    );
+    d.max_vertex_amplification_count = count(
+        sel,
+        "maximum vertex amplification count",
+        desc.max_vertex_amplification_count,
+    );
+    d.support_indirect_command_buffers = desc.support_indirect_command_buffers;
+    let mut options = rt::PipelineOptions::default();
+    options.label = desc.label.map(str::to_owned);
+    timing::creation(
+        sel,
+        timing::RENDER_LATER,
+        || {
+            let state = plain_at(sel, || device.raw.new_render_pipeline_state(&d, &options));
+            let class = d.input_primitive_topology;
+            match made(
+                sel,
+                (class, RenderDescriptor::Render(Box::new(d.clone()))),
+                state,
+            ) {
+                Ok(answer) => answer,
+                Err(raise) => raise.fatal(),
+            }
+        },
+        || timing::render_stages(&d),
+        |made| timing::answer(made, |s| timing::state(s.unique_identifier())),
+    )
+}
+
+/// The runtime's colour attachment of a whole value's: none for `MTLPixelFormatInvalid`.
+fn full_color_attachment(
+    sel: &'static str,
+    c: &ColorAttachmentDesc,
+) -> Option<ColorAttachmentDescriptor> {
+    let mut a = color_attachment(c.pixel_format)?;
+    a.blending_enabled = c.blending_enabled;
+    a.source_rgb_blend_factor = metal_value(sel, "blend factor", c.source_rgb_blend_factor);
+    a.destination_rgb_blend_factor =
+        metal_value(sel, "blend factor", c.destination_rgb_blend_factor);
+    a.rgb_blend_operation = metal_value(sel, "blend operation", c.rgb_blend_operation);
+    a.source_alpha_blend_factor = metal_value(sel, "blend factor", c.source_alpha_blend_factor);
+    a.destination_alpha_blend_factor =
+        metal_value(sel, "blend factor", c.destination_alpha_blend_factor);
+    a.alpha_blend_operation = metal_value(sel, "blend operation", c.alpha_blend_operation);
+    a.write_mask = metal_value(sel, "colour write mask", c.write_mask);
+    Some(a)
+}
+
+/// A depth or stencil attachment's format: none for `MTLPixelFormatInvalid`.
+fn optional_format(sel: &'static str, raw: u64) -> Option<metal2vulkan::metal::PixelFormat> {
+    (raw != 0).then(|| crate::gpu::pixel_format(sel, raw))
+}
+
+/// A count the runtime holds as a `u32`.
+fn count(sel: &'static str, what: &str, raw: u64) -> u32 {
+    u32::try_from(raw).unwrap_or_else(|_| unrepresentable(sel, &format!("{what} {raw}")))
+}
+
+/// `MTLBufferLayoutStrideDynamic`, a layout's stride the runtime holds as `None`.
+const DYNAMIC_STRIDE: u64 = u32::MAX as u64;
+
+/// A layout's stride: `None` for `MTLBufferLayoutStrideDynamic`.
+fn layout_stride(sel: &'static str, raw: u64) -> Option<u32> {
+    (raw != DYNAMIC_STRIDE).then(|| count(sel, "buffer layout stride", raw))
+}
+
+/// The runtime's vertex descriptor of a whole value's: each layout and attribute at its index,
+/// and a layout, as Metal's array holds one, for each buffer an attribute reads that the value
+/// sets none of.
+fn vertex_descriptor(sel: &'static str, v: &VertexDesc) -> VertexDescriptor {
+    let mut out = VertexDescriptor::new();
+    for l in &v.layouts {
+        let mut layout = VertexBufferLayoutDescriptor::new(layout_stride(sel, l.stride));
+        layout.step_function = metal_value(sel, "vertex step function", l.step_function);
+        layout.step_rate = count(sel, "vertex step rate", l.step_rate);
+        out.layouts
+            .insert(count(sel, "vertex buffer index", l.buffer_index), layout);
+    }
+    for a in &v.attributes {
+        let attribute = VertexAttributeDescriptor::new(
+            metal_value(sel, "vertex format", a.format),
+            count(sel, "vertex attribute offset", a.offset),
+            count(sel, "vertex buffer index", a.buffer_index),
+        );
+        out.attributes.insert(
+            count(sel, "vertex attribute index", a.attribute_index),
+            attribute,
+        );
+    }
+    for buffer in out.attributes.values().map(|a| a.buffer_index) {
+        out.layouts
+            .entry(buffer)
+            .or_insert_with(|| VertexBufferLayoutDescriptor::new(Some(0)));
+    }
+    out
+}
+
+/// The runtime's stage-input descriptor of a whole value's, as [`vertex_descriptor`] makes a
+/// vertex descriptor's, with its index type and index buffer.
+pub(crate) fn stage_input_descriptor(
+    sel: &'static str,
+    s: &StageInputDesc,
+) -> StageInputDescriptor {
+    let mut out = StageInputDescriptor::new();
+    for l in &s.layouts {
+        let mut layout = StageInputLayoutDescriptor::new(layout_stride(sel, l.stride));
+        layout.step_function = metal_value(sel, "step function", l.step_function);
+        layout.step_rate = count(sel, "step rate", l.step_rate);
+        out.layouts.insert(
+            count(sel, "stage-input buffer index", l.buffer_index),
+            layout,
+        );
+    }
+    for a in &s.attributes {
+        let attribute = StageInputAttributeDescriptor::new(
+            metal_value(sel, "attribute format", a.format),
+            count(sel, "stage-input attribute offset", a.offset),
+            count(sel, "stage-input buffer index", a.buffer_index),
+        );
+        out.attributes.insert(
+            count(sel, "stage-input attribute index", a.attribute_index),
+            attribute,
+        );
+    }
+    for buffer in out.attributes.values().map(|a| a.buffer_index) {
+        out.layouts
+            .entry(buffer)
+            .or_insert_with(|| StageInputLayoutDescriptor::new(Some(0)));
+    }
+    out.index_type = metal_value(sel, "index type", s.index_type);
+    out.index_buffer_index = count(sel, "index buffer index", s.index_buffer_index);
+    out
+}
+
+/// The runtime's compute descriptor of a whole value's, the graphics lane's.
+pub(crate) fn full_compute_descriptor(
+    sel: &'static str,
+    desc: &FullComputePipelineDesc<'_, VulkanPlatform>,
+) -> ComputePipelineDescriptor {
+    let mut d =
+        ComputePipelineDescriptor::new(StageSource::Function(desc.function.function_descriptor()));
+    d.threadgroup_size_is_multiple_of_execution_width =
+        desc.threadgroup_size_is_multiple_of_execution_width;
+    d.max_total_threads_per_threadgroup =
+        (desc.max_total_threads_per_threadgroup != 0).then(|| {
+            count(
+                sel,
+                "maximum threads per threadgroup",
+                desc.max_total_threads_per_threadgroup,
+            )
+        });
+    d.max_call_stack_depth = count(sel, "maximum call stack depth", desc.max_call_stack_depth);
+    d.support_indirect_command_buffers = desc.support_indirect_command_buffers;
+    d.stage_input = desc
+        .stage_input
+        .as_ref()
+        .map(|s| stage_input_descriptor(sel, s));
+    d
+}
+
 /// The runtime's options of Metal's raw `MTLPipelineOption`, the state placed at `placement` and
 /// labelled `label`.
 fn pipeline_options(
@@ -846,6 +1044,224 @@ mod tests {
              unset, lod min unset max unset average unset, max anisotropy unset, compare function \
              unset, reduction mode unset, supportArgumentBuffers unset, resource index unset"
         );
+    }
+
+    /// The suite's vertex function fed through a vertex descriptor (attribute 0 a `float2`,
+    /// attribute 1 a normalized `uchar4`, buffer 0) and the fragment function that returns the
+    /// colour it outputs.
+    fn vertex_descriptor_functions() -> (VulkanFunction, VulkanFunction) {
+        use crate::gpu::serialized::tests::fixture_function;
+        (
+            fixture_function(include_bytes!(
+                "../../../../tests/suite/fixtures/shaders/render_vdesc.metallib"
+            )),
+            fixture_function(include_bytes!(
+                "../../../../tests/suite/fixtures/shaders/render_color.metallib"
+            )),
+        )
+    }
+
+    /// The whole render value of `vertex` and `fragment`: colour 0 BGRA8Unorm, no vertex
+    /// descriptor, Metal's defaults elsewhere.
+    fn full_render<'a>(
+        vertex: &'a VulkanFunction,
+        fragment: Option<&'a VulkanFunction>,
+    ) -> FullRenderPipelineDesc<'a, VulkanPlatform> {
+        FullRenderPipelineDesc {
+            label: Some("whole"),
+            vertex,
+            fragment,
+            vertex_descriptor: None,
+            colors: vec![(
+                0,
+                ColorAttachmentDesc {
+                    pixel_format: 80,
+                    ..ColorAttachmentDesc::default()
+                },
+            )],
+            depth_pixel_format: 0,
+            stencil_pixel_format: 0,
+            raster_sample_count: 1,
+            alpha_to_coverage: false,
+            alpha_to_one: false,
+            rasterization_enabled: true,
+            input_primitive_topology: 0,
+            max_vertex_amplification_count: 1,
+            support_indirect_command_buffers: false,
+        }
+    }
+
+    /// A vertex function that reads `[[stage_in]]` attributes makes a pipeline with the vertex
+    /// descriptor the whole value carries, and with none is the compile's `NSError` for the
+    /// attribute it lacks
+    #[test]
+    fn a_whole_render_value_carries_its_vertex_descriptor() {
+        use reims_vgpu_core::platform::values::{AttributeDesc, BufferLayoutDesc};
+        let (v, f) = vertex_descriptor_functions();
+        let d = dev();
+        let mut desc = full_render(&v, Some(&f));
+        let e = d.new_render_pipeline_state_full(&desc).unwrap_err();
+        assert!(
+            e.description.contains("VertexAttribute { attribute: 0 }"),
+            "{e:?}"
+        );
+        desc.vertex_descriptor = Some(VertexDesc {
+            layouts: vec![BufferLayoutDesc {
+                buffer_index: 0,
+                stride: 12,
+                step_function: 1,
+                step_rate: 1,
+            }],
+            attributes: vec![
+                AttributeDesc {
+                    attribute_index: 0,
+                    format: 29,
+                    offset: 0,
+                    buffer_index: 0,
+                },
+                AttributeDesc {
+                    attribute_index: 1,
+                    format: 9,
+                    offset: 8,
+                    buffer_index: 0,
+                },
+            ],
+        });
+        let made = d.new_render_pipeline_state_full(&desc).unwrap().unwrap();
+        assert_ne!(made.unique_identifier(), 0);
+    }
+
+    /// The runtime's descriptor of a whole render value holds every field it carries, each raw
+    /// value the runtime's own: the colour attachments with their blend state and write masks,
+    /// the depth and stencil formats, the sample count, the flags, the topology and the
+    /// amplification count; a raw value the runtime has no enumerator of dies at the send
+    #[test]
+    fn a_whole_render_value_is_the_runtime_s_descriptor() {
+        use metal2vulkan::metal::{
+            BlendFactor, BlendOperation, ColorWriteMask, PrimitiveTopologyClass,
+        };
+        let (v, f) = vertex_descriptor_functions();
+        let sel = "newRenderPipelineStateWithDescriptor:error:";
+        let c = ColorAttachmentDesc {
+            pixel_format: 115,
+            blending_enabled: true,
+            source_rgb_blend_factor: 4,
+            destination_rgb_blend_factor: 5,
+            rgb_blend_operation: 1,
+            source_alpha_blend_factor: 2,
+            destination_alpha_blend_factor: 7,
+            alpha_blend_operation: 3,
+            write_mask: 0x9,
+        };
+        let a = full_color_attachment(sel, &c).unwrap();
+        assert_eq!(a.pixel_format, PixelFormat::RGBA16Float);
+        assert!(a.blending_enabled);
+        assert_eq!(
+            (
+                a.source_rgb_blend_factor,
+                a.destination_rgb_blend_factor,
+                a.source_alpha_blend_factor,
+                a.destination_alpha_blend_factor
+            ),
+            (
+                BlendFactor::try_from(4).unwrap(),
+                BlendFactor::try_from(5).unwrap(),
+                BlendFactor::try_from(2).unwrap(),
+                BlendFactor::try_from(7).unwrap()
+            )
+        );
+        assert_eq!(
+            (a.rgb_blend_operation, a.alpha_blend_operation),
+            (
+                BlendOperation::try_from(1).unwrap(),
+                BlendOperation::try_from(3).unwrap()
+            )
+        );
+        assert_eq!(a.write_mask, ColorWriteMask::try_from(9).unwrap());
+        assert_eq!(
+            full_color_attachment(sel, &ColorAttachmentDesc::default()),
+            None,
+            "no format, no attachment"
+        );
+        let site = catch_death(|| {
+            full_color_attachment(
+                sel,
+                &ColorAttachmentDesc {
+                    source_rgb_blend_factor: 99,
+                    ..c
+                },
+            )
+        })
+        .unwrap_err();
+        assert_eq!(site.file, sel);
+        assert_eq!(optional_format(sel, 0), None);
+        assert_eq!(optional_format(sel, 252), Some(PixelFormat::Depth32Float));
+        let mut desc = full_render(&v, Some(&f));
+        desc.input_primitive_topology = 99;
+        let site = catch_death(|| d_new(&desc)).unwrap_err();
+        assert_eq!(site.file, sel, "no topology class 99");
+        assert_eq!(
+            metal_value::<PrimitiveTopologyClass>(sel, "primitive topology class", 3),
+            PrimitiveTopologyClass::Triangle
+        );
+    }
+
+    /// [`GpuDevice::new_render_pipeline_state_full`] on the default device.
+    fn d_new(
+        desc: &FullRenderPipelineDesc<'_, VulkanPlatform>,
+    ) -> Result<Option<VulkanRenderPipeline>, NsErrorText> {
+        dev().new_render_pipeline_state_full(desc)
+    }
+
+    /// A kernel that reads `[[stage_in]]` attributes makes a compute pipeline with the
+    /// stage-input descriptor the whole value carries, and dies at the send with none; the
+    /// value's other fields are the runtime descriptor's own
+    #[test]
+    fn a_whole_compute_value_carries_its_stage_input() {
+        use crate::gpu::serialized::tests::{STAGEIN, fixture_function};
+        use reims_vgpu_core::platform::resource::ComputePipeline as _;
+        use reims_vgpu_core::platform::values::{AttributeDesc, BufferLayoutDesc};
+        let f = fixture_function(STAGEIN);
+        let sel = "newComputePipelineStateWithDescriptor:options:reflection:error:";
+        let mut desc = FullComputePipelineDesc {
+            label: Some("stage in"),
+            function: &f,
+            threadgroup_size_is_multiple_of_execution_width: true,
+            max_total_threads_per_threadgroup: 128,
+            max_call_stack_depth: 3,
+            support_indirect_command_buffers: false,
+            stage_input: None,
+        };
+        let site = catch_death(|| dev().new_compute_pipeline_state_full(&desc)).unwrap_err();
+        assert_eq!(site.file, sel);
+        desc.stage_input = Some(StageInputDesc {
+            layouts: vec![BufferLayoutDesc {
+                buffer_index: 1,
+                stride: 4,
+                step_function: 5,
+                step_rate: 1,
+            }],
+            attributes: vec![AttributeDesc {
+                attribute_index: 0,
+                format: 36,
+                offset: 0,
+                buffer_index: 1,
+            }],
+            index_type: 1,
+            index_buffer_index: 0,
+        });
+        let d = full_compute_descriptor(sel, &desc);
+        assert!(d.threadgroup_size_is_multiple_of_execution_width);
+        assert_eq!(d.max_total_threads_per_threadgroup, Some(128));
+        assert_eq!(d.max_call_stack_depth, 3);
+        let s = d.stage_input.as_ref().unwrap();
+        assert_eq!(s.layouts[&1].stride, Some(4));
+        assert_eq!(s.attributes[&0].buffer_index, 1);
+        let made = dev()
+            .new_compute_pipeline_state_full(&desc)
+            .unwrap()
+            .unwrap();
+        assert_eq!(made.max_total_threads_per_threadgroup(), 128);
     }
 
     /// The display's vertex and plain fragment functions, from the platform's shader library.

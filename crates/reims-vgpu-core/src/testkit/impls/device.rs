@@ -27,8 +27,8 @@ use crate::platform::types::{
     SizeAndAlign, TextureLevelInfo, TextureLevelQuery,
 };
 use crate::platform::values::{
-    ArgumentDesc, BufferDesc, DepthStencilDesc, HeapDesc, HeapMade, IcbDesc, OptionSet,
-    RenderPipelineDesc, SamplerDesc,
+    ArgumentDesc, BufferDesc, DepthStencilDesc, FullComputePipelineDesc, FullRenderPipelineDesc,
+    HeapDesc, HeapMade, IcbDesc, OptionSet, RenderPipelineDesc, SamplerDesc,
 };
 use crate::platform::{Handle, HostRange, Platform};
 use crate::raise::{OnFault, RaiseResult};
@@ -739,6 +739,44 @@ impl GpuDevice<FakePlatform> for Fk<kind::Device> {
                     w,
                     Space::RENDER_PIPELINE,
                     forced,
+                ))
+            },
+        ))
+    }
+
+    /// The whole value is the call's one argument.
+    fn new_render_pipeline_state_full(
+        &self,
+        desc: &FullRenderPipelineDesc<'_, FakePlatform>,
+    ) -> Result<Option<<FakePlatform as Platform>::RenderPipeline>, NsErrorText> {
+        fatal(self.make_or_error(
+            Policy::Fatal,
+            "newRenderPipelineStateWithDescriptor:error:",
+            vec![Arg::val(desc)],
+            |w| {
+                Some(new_pipeline::<kind::RenderPipeline>(
+                    w,
+                    Space::RENDER_PIPELINE,
+                    None,
+                ))
+            },
+        ))
+    }
+
+    /// The whole value is the call's first argument, then the options (0).
+    fn new_compute_pipeline_state_full(
+        &self,
+        desc: &FullComputePipelineDesc<'_, FakePlatform>,
+    ) -> Result<Option<<FakePlatform as Platform>::ComputePipeline>, NsErrorText> {
+        fatal(self.make_or_error(
+            Policy::Fatal,
+            "newComputePipelineStateWithDescriptor:options:reflection:error:",
+            vec![Arg::val(desc), Arg::U64(0)],
+            |w| {
+                Some(new_pipeline::<kind::ComputePipeline>(
+                    w,
+                    Space::COMPUTE_PIPELINE,
+                    None,
                 ))
             },
         ))

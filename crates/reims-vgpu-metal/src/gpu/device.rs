@@ -41,8 +41,8 @@ use reims_vgpu_core::platform::types::{
     TextureLevelInfo, TextureLevelQuery,
 };
 use reims_vgpu_core::platform::values::{
-    ArgumentDesc, BufferDesc, DepthStencilDesc, HeapDesc, HeapMade, IcbDesc, RenderPipelineDesc,
-    SamplerDesc,
+    ArgumentDesc, BufferDesc, DepthStencilDesc, FullComputePipelineDesc, FullRenderPipelineDesc,
+    HeapDesc, HeapMade, IcbDesc, RenderPipelineDesc, SamplerDesc,
 };
 use reims_vgpu_core::raise::death::DeathKind;
 use reims_vgpu_core::raise::{Kept, keep_forever};
@@ -790,6 +790,36 @@ impl GpuDevice<MetalPlatform> for MetalDevice {
         let d = crate::platform::class_new(objc2_metal::MTLRenderPipelineDescriptor::new);
         desc::apply_render_pipeline(desc, &d);
         render_pipeline_state_with_descriptor(self, &d)
+    }
+
+    fn new_render_pipeline_state_full(
+        &self,
+        desc: &FullRenderPipelineDesc<'_, MetalPlatform>,
+    ) -> Result<Option<MetalRenderPipeline>, NsErrorText> {
+        let d = crate::platform::class_new(objc2_metal::MTLRenderPipelineDescriptor::new);
+        desc::apply_full_render_pipeline(desc, &d);
+        render_pipeline_state_with_descriptor(self, &d)
+    }
+
+    fn new_compute_pipeline_state_full(
+        &self,
+        desc: &FullComputePipelineDesc<'_, MetalPlatform>,
+    ) -> Result<Option<MetalComputePipeline>, NsErrorText> {
+        let d = crate::platform::class_new(objc2_metal::MTLComputePipelineDescriptor::new);
+        desc::apply_full_compute_pipeline(desc, &d);
+        let (device, descriptor) = (self.get(), d.get());
+        // SAFETY: `create_or_die`'s out-parameter.
+        create_or_die(
+            "newComputePipelineStateWithDescriptor:options:reflection:error:",
+            |error| unsafe {
+                DeviceSpi::newComputePipelineStateWithDescriptor_options_reflection_error(
+                    device,
+                    Some(descriptor),
+                    0,
+                    error,
+                )
+            },
+        )
     }
 }
 

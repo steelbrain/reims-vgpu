@@ -262,6 +262,193 @@ impl<P: Platform> fmt::Debug for RenderPipelineDesc<'_, P> {
     }
 }
 
+/// One colour attachment of a [`FullRenderPipelineDesc`]
+/// (`MTLRenderPipelineColorAttachmentDescriptor`), each enum its Metal raw value: `MTLPixelFormat`,
+/// `MTLBlendFactor`, `MTLBlendOperation` and `MTLColorWriteMask`. [`Default`] is Metal's
+/// attachment: no format, blending off, `one` over `zero` by `add`, every channel written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[allow(missing_docs)] // each field is its setter's argument, named after it
+pub struct ColorAttachmentDesc {
+    pub pixel_format: u64,
+    pub blending_enabled: bool,
+    pub source_rgb_blend_factor: u64,
+    pub destination_rgb_blend_factor: u64,
+    pub rgb_blend_operation: u64,
+    pub source_alpha_blend_factor: u64,
+    pub destination_alpha_blend_factor: u64,
+    pub alpha_blend_operation: u64,
+    pub write_mask: u64,
+}
+
+impl Default for ColorAttachmentDesc {
+    fn default() -> Self {
+        ColorAttachmentDesc {
+            pixel_format: 0,
+            blending_enabled: false,
+            source_rgb_blend_factor: 1,
+            destination_rgb_blend_factor: 0,
+            rgb_blend_operation: 0,
+            source_alpha_blend_factor: 1,
+            destination_alpha_blend_factor: 0,
+            alpha_blend_operation: 0,
+            write_mask: 0xf,
+        }
+    }
+}
+
+/// One buffer layout of a vertex descriptor (`MTLVertexBufferLayoutDescriptor`) or a stage-input
+/// descriptor (`MTLBufferLayoutDescriptor`), at index `buffer_index` of its array: the stride
+/// (`MTLBufferLayoutStrideDynamic` as Metal's raw value), the step function (`MTLVertexStepFunction`
+/// or `MTLStepFunction`) and the step rate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[allow(missing_docs)] // each field is its setter's argument, named after it
+pub struct BufferLayoutDesc {
+    pub buffer_index: u64,
+    pub stride: u64,
+    pub step_function: u64,
+    pub step_rate: u64,
+}
+
+/// One attribute of a vertex descriptor (`MTLVertexAttributeDescriptor`) or a stage-input
+/// descriptor (`MTLAttributeDescriptor`), at index `attribute_index` of its array: the format
+/// (`MTLVertexFormat` or `MTLAttributeFormat`), the byte offset and the buffer it reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[allow(missing_docs)] // each field is its setter's argument, named after it
+pub struct AttributeDesc {
+    pub attribute_index: u64,
+    pub format: u64,
+    pub offset: u64,
+    pub buffer_index: u64,
+}
+
+/// `MTLVertexDescriptor`: the layouts and attributes set, the rest as Metal makes them.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+pub struct VertexDesc {
+    /// The layouts set, each at its index.
+    pub layouts: Vec<BufferLayoutDesc>,
+    /// The attributes set, each at its index.
+    pub attributes: Vec<AttributeDesc>,
+}
+
+/// `MTLStageInputOutputDescriptor`: the layouts and attributes set, and the index buffer's type
+/// (`MTLIndexType`) and index.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+#[allow(missing_docs)] // each field is its setter's argument, named after it
+pub struct StageInputDesc {
+    pub layouts: Vec<BufferLayoutDesc>,
+    pub attributes: Vec<AttributeDesc>,
+    pub index_type: u64,
+    pub index_buffer_index: u64,
+}
+
+/// A whole `MTLRenderPipelineDescriptor`, as a value: what the graphics lane carries of a guest's
+/// descriptor. The display's own pipelines take [`RenderPipelineDesc`]. Each enum is its Metal raw
+/// value. Order: label, the vertex and fragment functions, the vertex descriptor, the colour
+/// attachments at their indices, the depth and stencil formats, the raster sample count,
+/// alpha-to-coverage, alpha-to-one, rasterization, the input primitive topology, the maximum
+/// vertex amplification count, then indirect command buffer support.
+pub struct FullRenderPipelineDesc<'a, P: Platform> {
+    /// `setLabel:`, when set.
+    pub label: Option<&'a str>,
+    /// `setVertexFunction:`.
+    pub vertex: &'a P::Function,
+    /// `setFragmentFunction:`; `None` leaves it nil (a pipeline that does not rasterize).
+    pub fragment: Option<&'a P::Function>,
+    /// `setVertexDescriptor:`; `None` leaves it nil.
+    pub vertex_descriptor: Option<VertexDesc>,
+    /// The colour attachments set, each at its index (0 to 7).
+    pub colors: Vec<(u64, ColorAttachmentDesc)>,
+    /// `setDepthAttachmentPixelFormat:` (`MTLPixelFormat`; 0 for none).
+    pub depth_pixel_format: u64,
+    /// `setStencilAttachmentPixelFormat:` (`MTLPixelFormat`; 0 for none).
+    pub stencil_pixel_format: u64,
+    /// `setRasterSampleCount:`.
+    pub raster_sample_count: u64,
+    /// `setAlphaToCoverageEnabled:`.
+    pub alpha_to_coverage: bool,
+    /// `setAlphaToOneEnabled:`.
+    pub alpha_to_one: bool,
+    /// `setRasterizationEnabled:`.
+    pub rasterization_enabled: bool,
+    /// `setInputPrimitiveTopology:` (`MTLPrimitiveTopologyClass`).
+    pub input_primitive_topology: u64,
+    /// `setMaxVertexAmplificationCount:`.
+    pub max_vertex_amplification_count: u64,
+    /// `setSupportIndirectCommandBuffers:`.
+    pub support_indirect_command_buffers: bool,
+}
+
+impl<P: Platform> fmt::Debug for FullRenderPipelineDesc<'_, P> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FullRenderPipelineDesc")
+            .field("label", &self.label)
+            .field("vertex", &self.vertex.id())
+            .field("fragment", &self.fragment.map(|f| f.id()))
+            .field("vertex_descriptor", &self.vertex_descriptor)
+            .field("colors", &self.colors)
+            .field("depth_pixel_format", &self.depth_pixel_format)
+            .field("stencil_pixel_format", &self.stencil_pixel_format)
+            .field("raster_sample_count", &self.raster_sample_count)
+            .field("alpha_to_coverage", &self.alpha_to_coverage)
+            .field("alpha_to_one", &self.alpha_to_one)
+            .field("rasterization_enabled", &self.rasterization_enabled)
+            .field("input_primitive_topology", &self.input_primitive_topology)
+            .field(
+                "max_vertex_amplification_count",
+                &self.max_vertex_amplification_count,
+            )
+            .field(
+                "support_indirect_command_buffers",
+                &self.support_indirect_command_buffers,
+            )
+            .finish()
+    }
+}
+
+/// A whole `MTLComputePipelineDescriptor`, as a value: what the graphics lane carries of a guest's
+/// descriptor. Order: label, the compute function, whether the threadgroup size is a multiple of
+/// the execution width, the maximum threads per threadgroup where set, the maximum call stack
+/// depth, indirect command buffer support, then the stage-input descriptor where set.
+pub struct FullComputePipelineDesc<'a, P: Platform> {
+    /// `setLabel:`, when set.
+    pub label: Option<&'a str>,
+    /// `setComputeFunction:`.
+    pub function: &'a P::Function,
+    /// `setThreadGroupSizeIsMultipleOfThreadExecutionWidth:`.
+    pub threadgroup_size_is_multiple_of_execution_width: bool,
+    /// `setMaxTotalThreadsPerThreadgroup:`, when set (0 leaves Metal's).
+    pub max_total_threads_per_threadgroup: u64,
+    /// `setMaxCallStackDepth:`.
+    pub max_call_stack_depth: u64,
+    /// `setSupportIndirectCommandBuffers:`.
+    pub support_indirect_command_buffers: bool,
+    /// `setStageInputDescriptor:`, when set.
+    pub stage_input: Option<StageInputDesc>,
+}
+
+impl<P: Platform> fmt::Debug for FullComputePipelineDesc<'_, P> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FullComputePipelineDesc")
+            .field("label", &self.label)
+            .field("function", &self.function.id())
+            .field(
+                "threadgroup_size_is_multiple_of_execution_width",
+                &self.threadgroup_size_is_multiple_of_execution_width,
+            )
+            .field(
+                "max_total_threads_per_threadgroup",
+                &self.max_total_threads_per_threadgroup,
+            )
+            .field("max_call_stack_depth", &self.max_call_stack_depth)
+            .field(
+                "support_indirect_command_buffers",
+                &self.support_indirect_command_buffers,
+            )
+            .field("stage_input", &self.stage_input)
+            .finish()
+    }
+}
+
 /// `MTLTextureDescriptor`, as a value, from which the platform makes the descriptor.
 ///
 /// The first nine fields are always sent; [`Default`] gives Metal's own defaults for them. The

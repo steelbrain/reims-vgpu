@@ -37,8 +37,9 @@ use reims_vgpu_core::platform::types::{
     ResourceAddressRange, SizeAndAlign, TextureLevelInfo, TextureLevelQuery,
 };
 use reims_vgpu_core::platform::values::{
-    ArgumentDesc, BufferDeallocator, BufferDesc, DepthStencilDesc, HeapDesc, HeapMade, IcbDesc,
-    OptionSet, RenderPipelineDesc, SamplerDesc,
+    ArgumentDesc, BufferDeallocator, BufferDesc, DepthStencilDesc, FullComputePipelineDesc,
+    FullRenderPipelineDesc, HeapDesc, HeapMade, IcbDesc, OptionSet, RenderPipelineDesc,
+    SamplerDesc,
 };
 use reims_vgpu_core::platform::{Handle, HostRange};
 use reims_vgpu_core::raise::{Kept, OnFault, RaiseResult, keep_forever};
@@ -1972,6 +1973,36 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         desc: &RenderPipelineDesc<'_, VulkanPlatform>,
     ) -> Result<Option<VulkanRenderPipeline>, NsErrorText> {
         super::states::new_render_pipeline_state(self, desc)
+    }
+
+    /// The graphics lane's whole descriptor ([`super::states::new_render_pipeline_state_full`]).
+    fn new_render_pipeline_state_full(
+        &self,
+        desc: &FullRenderPipelineDesc<'_, VulkanPlatform>,
+    ) -> Result<Option<VulkanRenderPipeline>, NsErrorText> {
+        super::states::new_render_pipeline_state_full(self, desc)
+    }
+
+    /// The graphics lane's whole descriptor: the compile's refusal of a function or descriptor it
+    /// finds wrong is the `NSError`, every other refusal dies at the send ([`compile_error`]).
+    fn new_compute_pipeline_state_full(
+        &self,
+        desc: &FullComputePipelineDesc<'_, VulkanPlatform>,
+    ) -> Result<Option<VulkanComputePipeline>, NsErrorText> {
+        let sel = "newComputePipelineStateWithDescriptor:options:reflection:error:";
+        let d = super::states::full_compute_descriptor(sel, desc);
+        let mut options = rt::PipelineOptions::default();
+        options.label = desc.label.map(str::to_owned);
+        timing::creation(
+            sel,
+            timing::DISPATCH_LATER,
+            || match plain_at(sel, || self.raw.new_compute_pipeline_state(&d, &options)) {
+                Ok(state) => Ok(Some(Obj::new(ComputePipelineObject::of(state, d.clone())))),
+                Err(e) => Err(compile_error(sel, e, Some(&d))),
+            },
+            || format!("kernel {}", timing::stage(&d.kernel)),
+            |made| timing::answer(made, |s| timing::state(s.unique_identifier)),
+        )
     }
 }
 

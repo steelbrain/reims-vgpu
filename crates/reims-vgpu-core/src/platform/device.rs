@@ -21,8 +21,8 @@ use super::types::{
     ArgumentLayout, NsErrorText, PixelFormatInfo, SizeAndAlign, TextureLevelInfo, TextureLevelQuery,
 };
 use super::values::{
-    ArgumentDesc, BufferDesc, DepthStencilDesc, HeapDesc, HeapMade, IcbDesc, RenderPipelineDesc,
-    SamplerDesc,
+    ArgumentDesc, BufferDesc, DepthStencilDesc, FullComputePipelineDesc, FullRenderPipelineDesc,
+    HeapDesc, HeapMade, IcbDesc, RenderPipelineDesc, SamplerDesc,
 };
 use super::{Handle, Platform};
 use crate::raise::{OnFault, RaiseResult};
@@ -267,4 +267,19 @@ pub trait GpuDevice<P: Platform>: Handle {
         &self,
         desc: &RenderPipelineDesc<'_, P>,
     ) -> Result<Option<P::RenderPipeline>, NsErrorText>;
+    /// sel: newRenderPipelineStateWithDescriptor:error: — from a render pipeline descriptor made
+    /// from the whole value `desc`, the graphics lane's. A raise inside it, and a refusal Metal
+    /// answers with no `NSError`, die at the send: the lane calls it inside its refusal scope.
+    fn new_render_pipeline_state_full(
+        &self,
+        desc: &FullRenderPipelineDesc<'_, P>,
+    ) -> Result<Option<P::RenderPipeline>, NsErrorText>;
+    /// sel: newComputePipelineStateWithDescriptor:options:reflection:error: — from a compute
+    /// pipeline descriptor made from the whole value `desc`, the graphics lane's, with no options
+    /// and a nil reflection. A raise inside it, and a refusal Metal answers with no `NSError`, die
+    /// at the send: the lane calls it inside its refusal scope.
+    fn new_compute_pipeline_state_full(
+        &self,
+        desc: &FullComputePipelineDesc<'_, P>,
+    ) -> Result<Option<P::ComputePipeline>, NsErrorText>;
 }
