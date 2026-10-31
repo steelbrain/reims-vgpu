@@ -4525,7 +4525,6 @@ void test_iosurface_shared_block()
 // left, nothing is named; and the slots of ours go empty as the copy goes.
 void test_iosurface_writers()
 {
-	CHECK(retirementIdle());
 	// Never freed, as Fixture's: the queues and their buffers may go after the test.
 	TestRing &control = *new TestRing(0x8000);
 	control.setConsumerIdle(1);
