@@ -99,8 +99,8 @@ public:
 	static uint64_t addressSpan(uint64_t size);
 
 	/// Metal's page on Apple silicon, and the granule a pin's first page starts.
-	static const uint64_t kAddressPage = 0x4000;
-	static const uint64_t kAddressGranule = 0x8000;
+	static constexpr uint64_t kAddressPage = 0x4000;
+	static constexpr uint64_t kAddressGranule = 0x8000;
 
 	/// Moves the object ids and GPU addresses to the process's context's ranges,
 	/// which the accelerator kext hands out (its object-id base and GPU-address
@@ -110,7 +110,7 @@ public:
 
 	/// Where this space's GPU addresses begin by default: above the low 4 GiB,
 	/// clear of any identity-mapped low range and of zero.
-	static const uint64_t kDefaultAddressBase = 0x1'0000'0000ull;
+	static constexpr uint64_t kDefaultAddressBase = 0x1'0000'0000ull;
 
 private:
 	/// The context's address range from `base`, every byte free. Caller holds m_addressLock

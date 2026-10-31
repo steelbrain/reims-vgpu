@@ -293,7 +293,7 @@ public:
 	/// The default alignment for a picked GPU address when the caller names none.
 	/// The caller passes a caps-derived alignment where Metal demands one; this
 	/// is a safe floor for the first slice.
-	static const uint64_t kDefaultAddressAlign = 256;
+	static constexpr uint64_t kDefaultAddressAlign = 256;
 
 private:
 	RgfxRingWriter &m_control;
