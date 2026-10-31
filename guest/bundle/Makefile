@@ -163,7 +163,29 @@ $(BUNDLEBIN): $(CORE_OBJ_ARCH) $(SHELL_OBJ_ARCH) Makefile
 	@echo "$(notdir $@): $$(cat src/*.mm | grep -o 'RGFX_UNSUPPORTED[A-Z_]*(' | wc -l | tr -d ' ')" \
 	      "members marked RGFX_UNSUPPORTED (src/RgfxUnsupported.h)"
 
+# --- the installable bundle: the directory Metal loads from /Library/GPUBundles -----
+# Contents/Info.plist and Contents/MacOS/reims-graphics, ad-hoc signed: WindowServer is a
+# platform process, whose Library Validation refuses an unsigned bundle (dlopen error 71),
+# whatever amfi_get_out_of_my_way says; an ad-hoc signature it takes. The tarball is the same
+# directory, as the guest install takes it.
+
+PACKAGE    = $(BUILD)/package/reims-graphics.bundle
+PACKAGETGZ = $(BUILD)/reims-graphics.bundle.tgz
+
+package: $(PACKAGETGZ)
+
+$(PACKAGETGZ): $(BUNDLEBIN) Info.plist Makefile
+	rm -rf $(PACKAGE)
+	@mkdir -p $(PACKAGE)/Contents/MacOS
+	plutil -lint Info.plist > /dev/null
+	cp Info.plist $(PACKAGE)/Contents/Info.plist
+	cp $(BUNDLEBIN) $(PACKAGE)/Contents/MacOS/reims-graphics
+	codesign --force --sign - $(PACKAGE)
+	codesign -v --strict $(PACKAGE)
+	COPYFILE_DISABLE=1 tar -C $(dir $(PACKAGE)) -czf $@ reims-graphics.bundle
+	@echo "$(notdir $@): $(PACKAGE), ad-hoc signed"
+
 clean:
 	rm -rf $(BUILD)
 
-.PHONY: all test bundle clean
+.PHONY: all test bundle package clean
