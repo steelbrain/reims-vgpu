@@ -328,7 +328,10 @@ mod tests {
             (Window::Hidden, 2),
         ] {
             let (waited, answered) = guest_at_the_limit(window, 12);
-            assert!(waited.is_empty(), "the guest waited on its limit at {waited:?}");
+            assert!(
+                waited.is_empty(),
+                "the guest waited on its limit at {waited:?}"
+            );
             assert_eq!(answered.len() as u64, 12 - delay, "a frame went unanswered");
             for (frame, shown, at) in answered {
                 assert_eq!(at, shown + delay, "frame {frame}'s answer");
