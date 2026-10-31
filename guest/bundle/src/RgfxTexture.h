@@ -35,6 +35,12 @@ class RgfxRegion;
 class RgfxSerializer;
 #endif
 
+#ifdef __cplusplus
+/// The wire's RgfxTextureDescriptor of `d`: each Metal enum its raw value, the four swizzle
+/// channels one byte each, red lowest (RgfxTexture.mm).
+RgfxTextureDescriptor rgfxTextureDescriptorFromMTL(MTLTextureDescriptor *_Nonnull d);
+#endif
+
 NS_ASSUME_NONNULL_BEGIN
 
 @interface RgfxTexture : RgfxResource <MTLTexture>

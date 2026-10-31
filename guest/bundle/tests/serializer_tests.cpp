@@ -21,6 +21,7 @@
 #include "RgfxBinaryArchiveFile.hpp"
 #include "RgfxCaps.hpp"
 #include "RgfxEncoder.hpp"
+#include "RgfxHeapRanges.hpp"
 #include "RgfxLibraryKey.hpp"
 #include "RgfxObjectModel.hpp"
 #include <chrono>
@@ -1291,6 +1292,136 @@ void test_archive_file()
 	CHECK(rgfxReadArchiveFile(fat, 8, out) == RgfxArchiveFileKind::Invalid);
 }
 
+// An Automatic heap's placements, in the order Metal's took them (measured: M3 Max, macOS 27,
+// a Private heap of 1000000 bytes, 1015808 once rounded): each at the lowest offset at its
+// alignment where all its bytes are free, the sizes summed as used, the free bytes joined as
+// they come back, and the longest free run from an aligned offset as the most available.
+void test_heap_ranges()
+{
+	RgfxHeapRanges r(1015808);
+	uint64_t at = 1;
+	CHECK(r.used() == 0 && r.maxAvailable(0) == 1015808 && r.maxAvailable(65536) == 1015808);
+	uint64_t b1 = 0, b2 = 0, b3 = 0, t1 = 0;
+	CHECK(r.take(100, 256, &b1) && b1 == 0);
+	CHECK(r.used() == 100 && r.maxAvailable(1) == 1015708 && r.maxAvailable(256) == 1015552);
+	CHECK(r.maxAvailable(4096) == 1011712 && r.maxAvailable(65536) == 950272);
+	CHECK(r.take(100, 256, &b2) && b2 == 256);
+	CHECK(r.take(70000, 256, &b3) && b3 == 512);
+	CHECK(r.used() == 70200 && r.maxAvailable(1) == 945296 && r.maxAvailable(256) == 945152);
+	CHECK(r.maxAvailable(4096) == 942080 && r.maxAvailable(65536) == 884736);
+	CHECK(r.take(264192, 128, &t1) && t1 == 70528);
+	CHECK(r.used() == 334392 && r.maxAvailable(1) == 681088 && r.maxAvailable(256) == 680960);
+	r.give(b1, 100);
+	CHECK(r.used() == 334292 && r.maxAvailable(1) == 681088);
+	uint64_t b4 = 0, b5 = 0, b7 = 0;
+	CHECK(r.take(50, 256, &b4) && b4 == 0);
+	r.give(b2, 100); // made aliasable
+	CHECK(r.take(60, 256, &b5) && b5 == 256);
+	CHECK(r.used() == 334302 && r.maxAvailable(256) == 680960);
+	CHECK(!r.take(680961, 256, &at) && at == 1);
+	CHECK(r.take(680960, 256, &b7) && b7 == 334848);
+	CHECK(r.used() == 1015262 && r.maxAvailable(1) == 206 && r.maxAvailable(256) == 0);
+	CHECK(!r.take(16, 256, &at));
+	// First fit, not best fit: with holes of 5000 and 1000 bytes in that order, 800 bytes go in
+	// the first (Metal's order of a 5000, 256, 1000 and 256-byte buffer, the first and third
+	// freed).
+	RgfxHeapRanges f(1 << 20);
+	uint64_t a = 0, b = 0, c = 0, d = 0, e = 0, g = 0, h = 0, i = 0;
+	CHECK(f.take(5000, 256, &a) && f.take(256, 256, &b) && f.take(1000, 256, &c) &&
+	      f.take(256, 256, &d));
+	CHECK(a == 0 && b == 5120 && c == 5376 && d == 6400);
+	f.give(a, 5000);
+	f.give(c, 1000);
+	CHECK(f.take(800, 256, &e) && e == 0);
+	CHECK(f.take(3000, 256, &g) && g == 1024);
+	CHECK(f.take(3000, 256, &h) && h == 6656);
+	uint64_t k = 0;
+	CHECK(f.take(100, 256, &k) && k == 4096);
+	// B, E and F back: [0, 4096) and [4196, 6400) are free, neither holds 5500.
+	f.give(b, 256);
+	f.give(e, 800);
+	f.give(g, 3000);
+	CHECK(f.take(5500, 256, &i) && i == 9728);
+	CHECK(f.maxAvailable(1) == (1 << 20) - 15228 && f.take(16, 256, &at) && at == 0);
+	// Nothing for a size of 0, nor at an alignment that is not a power of two.
+	CHECK(!f.take(0, 256, &at) && !f.take(16, 3, &at) && f.maxAvailable(3) == 0);
+	RgfxHeapRanges none(0);
+	CHECK(!none.take(1, 1, &at) && none.maxAvailable(1) == 0);
+}
+
+// What a fake device answers a heap texture size query, and what it was asked.
+struct SizeAsker {
+	RgfxHeapTextureSizeAndAlign asked = {};
+	uint32_t status = RGFX_STATUS_OK;
+	bool answers = true;
+	int calls = 0;
+
+	static bool ask(void *context, const void *message, uint32_t size, void *reply,
+	                uint32_t capacity, uint32_t *reply_size)
+	{
+		SizeAsker *self = static_cast<SizeAsker *>(context);
+		self->calls++;
+		CHECK(size == sizeof(RgfxHeapTextureSizeAndAlign));
+		std::memcpy(&self->asked, message, sizeof(self->asked));
+		if (!self->answers)
+			return false;
+		RgfxSizeAndAlign answer = {};
+		answer.header = {RGFX_EVT_SIZE_AND_ALIGN, sizeof(answer), 9};
+		answer.status = self->status;
+		answer.size = self->status == RGFX_STATUS_OK ? 264192 : 0;
+		answer.align = self->status == RGFX_STATUS_OK ? 128 : 0;
+		CHECK(capacity >= sizeof(answer));
+		std::memcpy(reply, &answer, sizeof(answer));
+		*reply_size = sizeof(answer);
+		return true;
+	}
+};
+
+// A heap texture size query asks the device with the texture's shape under a new id of the
+// context and posts nothing on the ring; it answers the device's size and alignment, and
+// nothing where no asker is set, nothing came back, or the device refused the shape.
+void test_heap_texture_size_query()
+{
+	TestRing ring(0x4000);
+	ring.setConsumerIdle(1);
+	RgfxRingWriter writer(ring.base(), ring.dataSize, RGFX_CONTROL_RING_ID, TestRing::doorbell,
+	                      nullptr);
+	RgfxIdSpace ids;
+	ids.setBases(2ull << RGFX_CONTEXT_OBJ_ID_SHIFT, RgfxIdSpace::kDefaultAddressBase);
+	RgfxSerializer ser(writer, ids);
+	RgfxTextureDescriptor desc = {};
+	desc.pixel_format = 70;
+	desc.texture_type = 2;
+	desc.width = 256;
+	desc.height = 256;
+	desc.depth = 1;
+	desc.mipmap_level_count = 1;
+	desc.array_length = 1;
+	desc.sample_count = 1;
+	uint64_t size = 1, align = 1;
+	CHECK(!ser.heapTextureSizeAndAlign(desc, &size, &align) && size == 1 && align == 1);
+
+	SizeAsker asker;
+	ser.setAsker(&SizeAsker::ask, &asker);
+	CHECK(ser.heapTextureSizeAndAlign(desc, &size, &align));
+	CHECK(size == 264192 && align == 128 && asker.calls == 1);
+	CHECK(asker.asked.header.type == RGFX_CMD_HEAP_TEXTURE_SIZE_AND_ALIGN);
+	CHECK(asker.asked.header.size == sizeof(RgfxHeapTextureSizeAndAlign));
+	CHECK(asker.asked.obj_id >> RGFX_CONTEXT_OBJ_ID_SHIFT == 2);
+	CHECK(std::memcmp(&asker.asked.desc, &desc, sizeof(desc)) == 0);
+	const uint64_t first = asker.asked.obj_id;
+	RgfxMsgHeader h = {};
+	std::vector<uint8_t> bytes;
+	CHECK(!ring.next(&h, &bytes));
+
+	asker.status = RGFX_STATUS_REFUSED;
+	size = align = 1;
+	CHECK(!ser.heapTextureSizeAndAlign(desc, &size, &align) && size == 1 && align == 1);
+	CHECK(asker.asked.obj_id != first);
+	asker.answers = false;
+	CHECK(!ser.heapTextureSizeAndAlign(desc, &size, &align) && asker.calls == 3);
+}
+
 int main()
 {
 	test_id_space();
@@ -1308,6 +1439,8 @@ int main()
 	test_forwarded_lifecycle();
 	test_library_key();
 	test_keyed_library_messages();
+	test_heap_ranges();
+	test_heap_texture_size_query();
 	std::printf("serializer_tests: OK (%d checks)\n", g_checks);
 	return 0;
 }

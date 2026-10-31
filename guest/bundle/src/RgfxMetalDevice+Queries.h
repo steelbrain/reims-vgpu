@@ -1,11 +1,12 @@
 /*
- * RgfxMetalDevice (Queries): the MTLDevice queries the device answers itself, without the
- * host: the heap placement sizes (RgfxHeapSizes.hpp), the timestamps and the sizes of what
- * the device does not make.
+ * RgfxMetalDevice (Queries): the MTLDevice queries the device answers itself, or with one
+ * question to the host: the heap placement sizes (RgfxHeapSizes.hpp), the timestamps and the
+ * sizes of what the device does not make.
  *
  * - heapBufferSizeAndAlignWithLength:options: answers the length at the host's alignment, as
- *   Metal does; heapTextureSizeAndAlignWithDescriptor: answers a bound of Metal's size until
- *   the wire carries the host's answer.
+ *   Metal does; heapTextureSizeAndAlignWithDescriptor: answers the host device's size and
+ *   alignment (HEAP_TEXTURE_SIZE_AND_ALIGN), and a bound of Metal's where the host gave none
+ *   (rgfxHeapTextureSizeAndAlign, RgfxHeap.h).
  * - sampleTimestamps:gpuTimestamp: answers the CPU's mach_absolute_time() for both: the device
  *   makes no counter sample buffer or counter heap, so nothing else stamps the GPU's domain,
  *   and queryTimestampFrequency answers that domain's ticks a second.

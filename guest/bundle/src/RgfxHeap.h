@@ -14,13 +14,21 @@
  * each wrapped as an RgfxBuffer / RgfxTexture whose `heap` is this one. A placed
  * buffer's GPU address is the heap's plus its offset, and a Shared heap's placed
  * buffer's contents are the heap's bytes there, so placed resources alias the
- * heap's memory as Metal's do. The
- * offset-less variants (an Automatic heap, where Metal picks the placement) need
- * the host's per-resource size and alignment, which arrives with the region/block
- * transport; until then they are documented nil stubs.
+ * heap's memory as Metal's do.
  *
- * The getters answer from the stored descriptor (size, type, storage/cache/hazard
- * modes). Our own ObjC++: conforms to MTLHeap but subclasses only NSObject (via
+ * An Automatic heap places what `newBufferWithLength:options:` and
+ * `newTextureWithDescriptor:` make itself, as Metal's does (RgfxHeapRanges.hpp): a
+ * buffer takes its length at the device's heap buffer alignment, a texture the size
+ * and alignment the host's device gives it (HEAP_TEXTURE_SIZE_AND_ALIGN), and each
+ * goes in at the offset picked, as in a Placement heap, which the host makes the heap.
+ * Its `heapOffset` answers 0, as Metal's does. Its bytes go back to the heap when it
+ * is made aliasable or freed. `usedSize` and `maxAvailableSizeWithAlignment:` answer
+ * from those placements, and a Placement heap answers 0 for both, as Metal's does.
+ *
+ * The getters answer from the stored descriptor (type, storage/cache/hazard modes),
+ * and the size is the descriptor's rounded up to Metal's 16 KiB page, as Metal's is
+ * (measured: M3 Max, macOS 27: a heap of 100 bytes is 16384, of 1000000 1015808, of
+ * either type). Our own ObjC++: conforms to MTLHeap but subclasses only NSObject (via
  * RgfxResource), so it instantiates and is unit-tested on the Mac.
  */
 
@@ -61,7 +69,21 @@ NS_ASSUME_NONNULL_BEGIN
                                                    device:(nullable id<MTLDevice>)device
                                                serializer:(nullable RgfxSerializer *)serializer;
 
+/// Gives back the `size` bytes at `offset` that one of the heap's Automatic placements held
+/// (RgfxResource's rgfxHoldHeapRange:size:). Thread-safe.
+- (void)rgfxGiveRangeAt:(uint64_t)offset size:(uint64_t)size;
+
 @end
+
+#ifdef __cplusplus
+/// heapTextureSizeAndAlignWithDescriptor:'s answer for `descriptor`: the host device's, through
+/// `serializer` (HEAP_TEXTURE_SIZE_AND_ALIGN), else, where none came back, the bound of Metal's
+/// that RgfxHeapSizes.hpp computes, logged the first time `cls` is asked `cmd`. 0 bytes for a
+/// nil descriptor.
+MTLSizeAndAlign rgfxHeapTextureSizeAndAlign(RgfxSerializer *_Nullable serializer,
+                                            MTLTextureDescriptor *_Nullable descriptor, Class cls,
+                                            SEL cmd);
+#endif
 
 NS_ASSUME_NONNULL_END
 

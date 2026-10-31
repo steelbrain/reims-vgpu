@@ -120,6 +120,22 @@ bool rgfxKextSubmit(void *context, const void *message, uint32_t size, uint64_t 
 	return true;
 }
 
+// The serializer's queries: the kext posts the message on the control ring, stamping its seqno,
+// and hands back the device's answer, whole. `context` is the user client's connect.
+bool rgfxKextAsk(void *context, const void *message, uint32_t size, void *reply,
+                 uint32_t capacity, uint32_t *reply_size)
+{
+	io_connect_t conn = static_cast<io_connect_t>(reinterpret_cast<uintptr_t>(context));
+	uint64_t seqno = 0;
+	uint32_t outCount = 1;
+	size_t replySize = capacity;
+	if (IOConnectCallMethod(conn, kRgfxAccelMethodSubmit, nullptr, 0, message, size, &seqno,
+	                        &outCount, reply, &replySize) != KERN_SUCCESS)
+		return false;
+	*reply_size = static_cast<uint32_t>(replySize);
+	return true;
+}
+
 // The kext's blocks, as RgfxRegion's block source; `context` is the user client's connect.
 bool rgfxKextAlloc(void *context, uint64_t size, uint64_t align, uint64_t *offset)
 {
@@ -380,6 +396,7 @@ void rgfxDeviceDoorbell(void *context, uint32_t ring_id)
 	_serializer = new RgfxSerializer(*_controlRing, _ids);
 	_serializer->setQueueOpener(&rgfxKextQueueOpener, connContext);
 	_serializer->setQueueCloser(&rgfxKextQueueCloser, connContext);
+	_serializer->setAsker(&rgfxKextAsk, connContext);
 	// The queues' completions, taken as the kext wakes the thread for them.
 	_completions = std::make_unique<RgfxCompletionThread>(&rgfxKextWaitCompletions, connContext);
 	if (!_completions->start()) {

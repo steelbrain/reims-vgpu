@@ -7,6 +7,8 @@
 
 #import <Metal/Metal.h>
 
+#import "RgfxHeap.h"
+
 #include <atomic>
 #include <unistd.h>
 
@@ -24,6 +26,11 @@
 	// aliasable (makeAliasable).
 	NSUInteger _heapOffset;
 	std::atomic<bool> _aliasable;
+	// The bytes of its Automatic heap the resource lies in (rgfxHoldHeapRange:size:), and
+	// whether it holds them still.
+	uint64_t _rangeOffset;
+	uint64_t _rangeSize;
+	std::atomic<bool> _rangeHeld;
 }
 
 - (instancetype)initWithObjId:(uint64_t)objId
@@ -68,18 +75,37 @@
 
 - (void)rgfxRetireThen:(std::function<void()>)after
 {
+	// The bytes of its heap the resource still holds go back last, once its destroy has gone,
+	// so a resource placed there later is made after it.
+	RgfxHeap *rangeHeap = _rangeHeld.exchange(false) ? static_cast<RgfxHeap *>(_heap) : nil;
+	const uint64_t rangeOffset = _rangeOffset, rangeSize = _rangeSize;
 	RgfxSerializer *serializer = _serializer;
 	if (serializer == nullptr) {
 		if (after)
 			after(); // no host object to wait for
+		[rangeHeap rgfxGiveRangeAt:rangeOffset size:rangeSize];
 		return;
 	}
 	uint64_t objId = _objId;
-	RgfxRetirement::process().retire([serializer, objId, after = std::move(after)] {
-		serializer->destroy(objId);
-		if (after)
-			after();
-	});
+	RgfxRetirement::process().retire(
+	    [serializer, objId, after = std::move(after), rangeHeap, rangeOffset, rangeSize] {
+		    serializer->destroy(objId);
+		    if (after)
+			    after();
+		    [rangeHeap rgfxGiveRangeAt:rangeOffset size:rangeSize];
+	    });
+}
+
+- (void)rgfxHoldHeapRange:(uint64_t)offset size:(uint64_t)size
+{
+	_rangeOffset = offset;
+	_rangeSize = size;
+	_rangeHeld.store(true);
+}
+
+- (uint64_t)rgfxHeapRangeSize
+{
+	return _rangeSize;
 }
 
 // The resource SPI WindowServer calls as it prepares a window's surface for its compositor:
@@ -117,12 +143,17 @@
 // Only a resource made in a heap can be made aliasable, as in Metal, and one of a Placement
 // heap is aliasable from its making (measured on the M3 Max under macOS 27.0.1: YES for a
 // buffer of a Placement heap, NO for one of an Automatic heap until made so). The guest places
-// every heap resource itself, so aliasing changes nothing on the device: the flag is only
-// answered.
+// every heap resource itself, so aliasing changes nothing on the device. A resource of an
+// Automatic heap gives its bytes back to the heap then, which places what it makes next there,
+// as Metal's does (measured on the M3 Max under macOS 27: usedSize drops by its size at once,
+// and not again when it is freed).
 - (void)makeAliasable
 {
 	if (_heap != nil) {
 		_aliasable.store(true);
+		if (_rangeHeld.exchange(false)) {
+			[static_cast<RgfxHeap *>(_heap) rgfxGiveRangeAt:_rangeOffset size:_rangeSize];
+		}
 	}
 }
 

@@ -139,6 +139,25 @@ public:
 	/// OBJECT_DESTROY on the ring. The device takes neither of its rings after it.
 	void destroyQueue(RgfxObjId obj_id);
 
+	/// Where the device's answers to queries come from: `ask` hands the device one whole
+	/// message (its header's `type` and `size` stamped) on the control ring and waits for its
+	/// answer, which it copies to `reply` (at most `capacity` bytes, its length in
+	/// `*reply_size`): in the bundle, the accelerator kext's submit, which stamps the seqno.
+	/// False where nothing came back. Called with `context`. With none set, a query has no
+	/// answer.
+	typedef bool (*AskFn)(void *context, const void *message, uint32_t size, void *reply,
+	                      uint32_t capacity, uint32_t *reply_size);
+	void setAsker(AskFn ask, void *context);
+
+	// --- queries --------------------------------------------------------------
+
+	/// The size and alignment the host's device gives a texture of shape `desc` in a heap
+	/// (HEAP_TEXTURE_SIZE_AND_ALIGN, under a new id that names nothing): true with them in
+	/// `*size` and `*align` where the device answered, false where no answer came back or the
+	/// device refused the shape.
+	bool heapTextureSizeAndAlign(const RgfxTextureDescriptor &desc, uint64_t *size,
+	                             uint64_t *align);
+
 	// --- heaps ----------------------------------------------------------------
 
 	/// A device heap of `size_bytes`. `options` is MTLResourceOptions, `heap_type`
@@ -302,6 +321,8 @@ private:
 	void *m_queueOpenContext = nullptr;
 	QueueCloseFn m_queueClose = nullptr;
 	void *m_queueCloseContext = nullptr;
+	AskFn m_ask = nullptr;
+	void *m_askContext = nullptr;
 };
 
 #endif // RGFX_SERIALIZER_HPP_

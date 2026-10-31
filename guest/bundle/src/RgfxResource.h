@@ -85,11 +85,21 @@ NS_ASSUME_NONNULL_BEGIN
 /// Records the resource's offset in its heap (MTLResource's `heapOffset` answers it).
 - (void)rgfxSetHeapOffset:(NSUInteger)offset;
 
+/// Holds the `size` bytes at `offset` of its Automatic heap (`heap`, an RgfxHeap) that the heap
+/// placed it at. They go back to the heap once, when the resource is made aliasable or else once
+/// its host object is dropped (rgfxRetireThen:), as Metal's go when its resource is made
+/// aliasable or freed.
+- (void)rgfxHoldHeapRange:(uint64_t)offset size:(uint64_t)size;
+
+/// The bytes rgfxHoldHeapRange: held, given back or not; 0 for a resource it never held.
+@property(nonatomic, readonly) uint64_t rgfxHeapRangeSize;
+
 #ifdef __cplusplus
 /// For a wrapper's dealloc: drops the object's host handle (OBJECT_DESTROY) once every command
 /// buffer in flight now has completed (RgfxRetirement), as one may still name it, then runs
 /// `after` (when set), which gives back what the host object lay over: its region block, its
-/// resource id. Without a serialiser there is no host object, and `after` runs at once.
+/// resource id; then the bytes of its Automatic heap it still holds go back. Without a
+/// serialiser there is no host object, and these run at once.
 - (void)rgfxRetireThen:(std::function<void()>)after;
 #endif
 

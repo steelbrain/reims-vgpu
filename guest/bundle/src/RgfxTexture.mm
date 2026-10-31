@@ -21,8 +21,6 @@
 #include <atomic>
 #include <cstring>
 
-namespace {
-
 /// Maps an MTLTextureDescriptor into the wire's RgfxTextureDescriptor. Each Metal
 /// enum is carried as its raw value (the wire's convention); the four swizzle
 /// channels are packed one byte each, red lowest, as RgfxTextureDescriptor.swizzle
@@ -47,6 +45,7 @@ RgfxTextureDescriptor rgfxTextureDescriptorFromMTL(MTLTextureDescriptor *d)
 	return out;
 }
 
+namespace {
 
 // A block of a pixel format: its bytes and its width and height in pixels (1 x 1 where the
 // format is not block-compressed). 0 bytes for a format this does not size.
@@ -504,8 +503,10 @@ enum RgfxViewRefusal { kNoFormat, kFormatClass, kLevels, kSlices, kTypeFamily, k
 
 // The bytes the texture takes: its buffer's, for one made over a buffer (measured on the M3 Max
 // under macOS 27.0.1: a texture of four rows over buffers of 5000, 65536 and 200000 bytes
-// answers 5000, 65536 and 212992, each buffer's allocatedSize); else every level of every
-// slice and sample, in its format's blocks (0 for a format not sized here).
+// answers 5000, 65536 and 212992, each buffer's allocatedSize); the size its Automatic heap
+// placed it by, for one made there (measured on the M3 Max under macOS 27: a texture's
+// heapTextureSizeAndAlignWithDescriptor: size); else every level of every slice and sample, in
+// its format's blocks (0 for a format not sized here).
 - (NSUInteger)allocatedSize
 {
 	if (_parent != nil) {
@@ -513,6 +514,9 @@ enum RgfxViewRefusal { kNoFormat, kFormatClass, kLevels, kSlices, kTypeFamily, k
 	}
 	if (_buffer != nil) {
 		return _buffer.allocatedSize;
+	}
+	if (self.rgfxHeapRangeSize != 0) {
+		return static_cast<NSUInteger>(self.rgfxHeapRangeSize); // its Automatic heap's size of it
 	}
 	RgfxBlockShape b = rgfxBlockShapeOf(static_cast<MTLPixelFormat>(_desc.pixel_format));
 	uint64_t slices = _desc.array_length ? _desc.array_length : 1;

@@ -830,8 +830,8 @@ void test_buffer_members()
 	CHECK(t.buffer == b && t.bufferOffset == 64 && t.bufferBytesPerRow == 64);
 }
 
-// A heap's allocated size is its size; acceleration structures and the automatic placements
-// (no host size and alignment on the wire) are nil, logged.
+// A heap's allocated size is its size; acceleration structures are nil, logged; a Placement
+// heap makes nothing at an offset it picks (only an Automatic heap does), and logs no buffer.
 void test_heap_members()
 {
 	TestRing control(0x8000);
@@ -853,7 +853,12 @@ void test_heap_members()
 	CHECK([heap newAccelerationStructureWithDescriptor:ad offset:0] == nil);
 	CHECK([heap newBufferWithLength:64 options:0] == nil);
 	CHECK(RgfxUnsupportedWasLogged([RgfxHeap class], @selector(newAccelerationStructureWithSize:)));
-	CHECK(RgfxUnsupportedWasLogged([RgfxHeap class], @selector(newBufferWithLength:options:)));
+	CHECK([heap newTextureWithDescriptor:[MTLTextureDescriptor
+	                                         texture2DDescriptorWithPixelFormat:MTLPixelFormatR8Unorm
+	                                                                      width:4
+	                                                                     height:4
+	                                                                  mipmapped:NO]] == nil);
+	CHECK(!RgfxUnsupportedWasLogged([RgfxHeap class], @selector(newBufferWithLength:options:)));
 }
 
 

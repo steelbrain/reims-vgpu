@@ -66,6 +66,33 @@ void RgfxSerializer::setQueueCloser(QueueCloseFn close, void *context)
 	m_queueCloseContext = context;
 }
 
+void RgfxSerializer::setAsker(AskFn ask, void *context)
+{
+	m_ask = ask;
+	m_askContext = context;
+}
+
+bool RgfxSerializer::heapTextureSizeAndAlign(const RgfxTextureDescriptor &desc, uint64_t *size,
+                                             uint64_t *align)
+{
+	if (m_ask == nullptr)
+		return false;
+	RgfxHeapTextureSizeAndAlign msg = {};
+	msg.header.type = RGFX_CMD_HEAP_TEXTURE_SIZE_AND_ALIGN;
+	msg.header.size = sizeof(msg);
+	msg.obj_id = m_ids.allocObjId();
+	msg.desc = desc;
+	RgfxSizeAndAlign answer = {};
+	uint32_t length = 0;
+	if (!m_ask(m_askContext, &msg, sizeof(msg), &answer, sizeof(answer), &length) ||
+	    length < sizeof(answer) || answer.header.type != RGFX_EVT_SIZE_AND_ALIGN ||
+	    answer.status != RGFX_STATUS_OK)
+		return false;
+	*size = answer.size;
+	*align = answer.align;
+	return true;
+}
+
 void RgfxSerializer::destroyQueue(RgfxObjId obj_id)
 {
 	if (m_queueClose != nullptr) {

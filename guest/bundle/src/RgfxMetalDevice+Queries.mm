@@ -8,6 +8,8 @@
 
 #include <mach/mach_time.h>
 
+#import "RgfxHeap.h"
+
 #include "RgfxCaps.hpp"
 #include "RgfxHeapSizes.hpp"
 
@@ -30,14 +32,7 @@
 
 - (MTLSizeAndAlign)heapTextureSizeAndAlignWithDescriptor:(MTLTextureDescriptor *)desc
 {
-	// A bound, not the host's answer: no query on the wire carries it yet.
-	RGFX_UNSUPPORTED("the host's heap texture sizes (no query on the wire): a bound is answered");
-	RgfxHeapSizeAlign sa = {};
-	rgfxHeapTextureBound(static_cast<uint32_t>(desc.pixelFormat),
-	                     static_cast<uint32_t>(desc.textureType), desc.width, desc.height,
-	                     desc.depth, static_cast<uint32_t>(desc.mipmapLevelCount),
-	                     desc.arrayLength, desc.sampleCount, &sa);
-	return {static_cast<NSUInteger>(sa.size), static_cast<NSUInteger>(sa.align)};
+	return rgfxHeapTextureSizeAndAlign([self serializer], desc, [self class], _cmd);
 }
 
 // No acceleration structures, tensors or counter heaps: Metal's sizes of what a device makes

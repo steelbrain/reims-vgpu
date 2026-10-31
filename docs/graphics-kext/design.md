@@ -588,6 +588,7 @@ memory) — m2v's "take state answers from the created pipeline".
 |---|---|---|
 | memory | `HEAP_OVER_HOST_MEMORY`, `HEAP_CREATE`, `BUFFER_CREATE`, `BUFFER_OVER_HOST_MEMORY`, `BUFFER_AT_OFFSET`, `TEXTURE_CREATE`, `TEXTURE_FROM_BUFFER`, `TEXTURE_FROM_IOSURFACE`, `MANAGED_TEXTURE_CREATE`, `*_DESTROY` | `new_heap_over_host_memory`, `new_heap`, `new_buffer`, `Heap::new_buffer_at_offset`, `new_texture`, `Buffer::new_texture`, drop |
 | Managed ranges | `BUFFER_DID_MODIFY_RANGE`, `TEXTURE_REPLACE_REGION` | `Buffer::did_modify_range`, `Texture::replace_region` |
+| heap sizes | `HEAP_TEXTURE_SIZE_AND_ALIGN` (answered `SIZE_AND_ALIGN` on the control completion ring; makes nothing) | `heap_texture_size_and_align` |
 | state | `SAMPLER_CREATE`, `DEPTH_STENCIL_CREATE`, `*_DESTROY` | `new_sampler_state`, `new_depth_stencil_state` |
 | shaders | `LIBRARY_LOOKUP` (the content key of the `.metallib`'s AIR slice: a hit binds the library the device made for any process, and no bytes cross), `LIBRARY_CREATE` and `LIBRARY_FROM_REGION` (the slice's bytes forwarded unchanged on a miss, answered once made), `RENDER_PIPELINE_CREATE`, `COMPUTE_PIPELINE_CREATE`, `*_DESTROY` | the device's library cache, `new_library_with_data`, `new_render_pipeline_state`, `new_compute_pipeline_state` |
 | sync | `EVENT_CREATE`, `SHARED_EVENT_CREATE`, `FENCE_CREATE`, `*_DESTROY` | `new_event`, `new_shared_event`, `new_fence` |
@@ -595,6 +596,13 @@ memory) — m2v's "take state answers from the created pipeline".
 
 `*_OVER_HOST_MEMORY` map guest region blocks (Shared) and the host builds a
 placement heap/buffer over them.
+
+The host makes an `Automatic` heap a `Placement` heap: the guest places what
+the heap makes itself, as Metal's Automatic heap places it (lowest free offset
+at the resource's alignment; `guest/bundle/src/RgfxHeapRanges.hpp`), a buffer
+at its length and a texture at the size `HEAP_TEXTURE_SIZE_AND_ALIGN` answers,
+and sends each as a placement at that offset. The heap's `usedSize` and
+`maxAvailableSizeWithAlignment:` answer from those placements.
 
 **Managed storage** (Decided 4). A Managed buffer's or texture's CPU copy is a
 region block of its process's, which the guest maps, and the host decides the

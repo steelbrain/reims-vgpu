@@ -205,11 +205,16 @@ const APPLE_PIECES: [(i64, &[Piece]); 11] = {
     ]
 };
 
-/// The pieces the lane carries: texture views (`TEXTURE_VIEW`), and binary archives, which the
+/// The pieces the lane carries: texture views (`TEXTURE_VIEW`), placement in an Automatic heap
+/// with the heap texture size (`HEAP_TEXTURE_SIZE_AND_ALIGN`), and binary archives, which the
 /// bundle keeps in the guest (`RgfxBinaryArchive`: no compiled code crosses, so no wire message).
 /// A piece joins this list when its wire messages, its decoding and its bundle members land, and
 /// the Apple families it holds back rise with it.
-const WIRED: &[Piece] = &[Piece::TextureViews, Piece::BinaryArchives];
+const WIRED: &[Piece] = &[
+    Piece::AutomaticHeaps,
+    Piece::TextureViews,
+    Piece::BinaryArchives,
+];
 
 /// `identity` with each Apple family answered yes only where the platform answers yes and `wired`
 /// holds every piece of its rows and of each Apple family's before it ([`APPLE_PIECES`]), and each
@@ -548,8 +553,9 @@ mod tests {
     /// rows and the rows before it: with every piece the fake's Apple1 to Apple9 and their iOS
     /// sets stand; without imageblocks, an Apple4 piece, Apple4 and later answer no and so do
     /// iOS_GPUFamily4 and 5, while Apple1 to Apple3, their sets and Mac1 stand; without argument
-    /// encoders, or texture views, no Apple family does, nor with the lane's pieces alone; with
-    /// Apple1 to Apple3's pieces Apple3 stands, and without binary archives it does not
+    /// encoders, texture views or Automatic heaps, no Apple family does, nor with the lane's
+    /// pieces alone; with Apple1 to Apple3's pieces Apple3 stands, and without binary archives it
+    /// does not
     #[test]
     fn an_apple_family_drops_where_the_lane_lacks_a_piece() {
         let p = Arc::new(FakePlatform::new());
@@ -595,15 +601,22 @@ mod tests {
         assert_eq!(set(&no_imageblocks, 16), Some(false));
         assert_eq!(set(&no_imageblocks, 10000), Some(true));
 
-        // The lane's own pieces: texture views, but none of Apple2's others, so no Apple family
-        // stands, and none would without texture views either.
+        // The lane's own pieces: texture views and Automatic heaps, but not Apple2's others, so
+        // no Apple family stands, and none would without either of them.
         assert!(WIRED.contains(&Piece::TextureViews));
+        assert!(WIRED.contains(&Piece::AutomaticHeaps));
         let mut lane = platform.clone();
         cap_apple_families(&mut lane, WIRED);
         let no_views = without(Piece::TextureViews);
+        let no_automatic_heaps = without(Piece::AutomaticHeaps);
         for family in 1001..=1011 {
             assert_eq!(answer(&lane, family), Some(false), "family {family}");
             assert_eq!(answer(&no_views, family), Some(false), "family {family}");
+            assert_eq!(
+                answer(&no_automatic_heaps, family),
+                Some(false),
+                "family {family}"
+            );
         }
         assert_eq!(answer(&lane, 2002), Some(true));
 

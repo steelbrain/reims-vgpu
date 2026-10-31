@@ -42,6 +42,9 @@
 #import "RgfxCommandObjects.h"
 #import "RgfxIOSurface.h"
 #import "RgfxMetalPrivate.h"
+#import "RgfxUnsupported.h"
+
+#include "RgfxHeapSizes.hpp"
 
 #include <IOSurface/IOSurface.h>
 
@@ -3253,6 +3256,173 @@ void test_shared_heap_buffers_alias_its_bytes()
 	CHECK(retirementIdle());
 }
 
+// What a fake device answers a heap texture size query: 264192 bytes at 128, as Metal answers a
+// 256 x 256 RGBA8Unorm texture (M3 Max, macOS 27).
+bool askTextureSize(void *, const void *, uint32_t, void *reply, uint32_t capacity,
+                    uint32_t *reply_size)
+{
+	RgfxSizeAndAlign answer = {};
+	answer.header = {RGFX_EVT_SIZE_AND_ALIGN, sizeof(answer), 1};
+	answer.status = RGFX_STATUS_OK;
+	answer.size = 264192;
+	answer.align = 128;
+	CHECK(capacity >= sizeof(answer));
+	std::memcpy(reply, &answer, sizeof(answer));
+	*reply_size = sizeof(answer);
+	return true;
+}
+
+// An Automatic heap places what it makes as Metal's does, in the sequence measured on the M3
+// Max under macOS 27 (RgfxHeapRanges.hpp): its size rounded up to the 16 KiB page, buffers at
+// their length and textures at the device's size, each at the lowest free offset at its
+// alignment, routed as a placement at that offset, and answering heapOffset 0; usedSize and
+// maxAvailableSizeWithAlignment: follow, a resource gives its bytes back when freed or made
+// aliasable (once), and one no free run holds is nil and posts nothing. A Placement heap
+// answers 0 for both and places nothing itself.
+void test_automatic_heap_places_as_metal()
+{
+	CHECK(retirementIdle());
+	Fixture fx;
+	fx.ser.setAsker(&askTextureSize, nullptr);
+	MTLHeapDescriptor *d = [MTLHeapDescriptor new];
+	d.size = 1000000;
+	d.storageMode = MTLStorageModePrivate;
+	d.type = MTLHeapTypeAutomatic;
+	const MTLResourceOptions o = MTLResourceStorageModePrivate;
+	@autoreleasepool {
+		RgfxHeap *heap = [RgfxHeap heapWithDescriptor:d device:nil serializer:&fx.ser];
+		CHECK(heap != nil);
+		const RgfxHeapCreate made = expectMessage<RgfxHeapCreate>(fx.ring, RGFX_CMD_HEAP_CREATE);
+		CHECK(made.heap_type == MTLHeapTypeAutomatic && made.size_bytes == 1000000);
+		CHECK(heap.size == 1015808 && heap.currentAllocatedSize == 1015808);
+		CHECK(heap.usedSize == 0 && [heap maxAvailableSizeWithAlignment:65536] == 1015808);
+		auto placed = [&](uint64_t offset, uint64_t length) {
+			auto m = expectMessage<RgfxBufferAtOffset>(fx.ring, RGFX_CMD_BUFFER_AT_OFFSET);
+			CHECK(m.heap_obj_id == heap.rgfxObjId && m.offset == offset && m.length == length);
+		};
+		id<MTLBuffer> b1 = [heap newBufferWithLength:100 options:o];
+		placed(0, 100);
+		CHECK(b1 != nil && b1.heap == heap && b1.heapOffset == 0 && b1.gpuAddress == made.gpu_address);
+		CHECK(heap.usedSize == 100 && [heap maxAvailableSizeWithAlignment:256] == 1015552);
+		id<MTLBuffer> b2 = [heap newBufferWithLength:100 options:o];
+		placed(256, 100);
+		id<MTLBuffer> b3 = [heap newBufferWithLength:70000 options:o];
+		placed(512, 70000);
+		CHECK(b3.gpuAddress == made.gpu_address + 512 && b3.heapOffset == 0);
+		CHECK(heap.usedSize == 70200 && [heap maxAvailableSizeWithAlignment:1] == 945296);
+		CHECK([heap maxAvailableSizeWithAlignment:4096] == 942080);
+		CHECK([heap maxAvailableSizeWithAlignment:65536] == 884736);
+		MTLTextureDescriptor *td =
+		    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+		                                                       width:256
+		                                                      height:256
+		                                                   mipmapped:NO];
+		td.storageMode = MTLStorageModePrivate;
+		id<MTLTexture> t1 = [heap newTextureWithDescriptor:td];
+		auto tex = expectMessage<RgfxTextureCreate>(fx.ring, RGFX_CMD_TEXTURE_CREATE);
+		CHECK(t1 != nil && t1.heap == heap && t1.heapOffset == 0 && t1.allocatedSize == 264192);
+		CHECK(tex.heap_obj_id == heap.rgfxObjId && tex.heap_offset == 70528);
+		CHECK(heap.usedSize == 334392 && [heap maxAvailableSizeWithAlignment:256] == 680960);
+		CHECK(!RgfxUnsupportedWasLogged([RgfxHeap class], @selector(newTextureWithDescriptor:)));
+
+		b1 = nil; // no command buffer in flight: its bytes go back at once
+		CHECK(expectMessage<RgfxObjectDestroy>(fx.ring, RGFX_CMD_OBJECT_DESTROY).obj_id != 0);
+		CHECK(heap.usedSize == 334292);
+		id<MTLBuffer> b4 = [heap newBufferWithLength:50 options:o];
+		placed(0, 50);
+		CHECK(!b2.isAliasable);
+		[b2 makeAliasable];
+		CHECK(b2.isAliasable && heap.usedSize == 334242);
+		[b2 makeAliasable];
+		CHECK(heap.usedSize == 334242);
+		id<MTLBuffer> b5 = [heap newBufferWithLength:60 options:o];
+		placed(256, 60);
+		b2 = nil; // made aliasable, so its bytes went back already
+		drainRing(fx.ring);
+		CHECK(heap.usedSize == 334302);
+		const NSUInteger most = [heap maxAvailableSizeWithAlignment:256];
+		CHECK(most == 680960);
+		CHECK([heap newBufferWithLength:most + 1 options:o] == nil && ringEmpty(fx.ring));
+		id<MTLBuffer> b7 = [heap newBufferWithLength:most options:o];
+		placed(334848, most);
+		CHECK(heap.usedSize == 1015262 && [heap maxAvailableSizeWithAlignment:1] == 206);
+		CHECK([heap newBufferWithLength:16 options:o] == nil);
+		CHECK([heap newTextureWithDescriptor:td] == nil);
+		CHECK([heap newBufferWithLength:0 options:o] == nil && ringEmpty(fx.ring));
+		CHECK([heap maxAvailableSizeWithAlignment:3] == 0);
+		(void)b3, (void)b4, (void)b5, (void)b7, (void)t1;
+	}
+	drainRing(fx.ring);
+	CHECK(retirementIdle());
+
+	// With no answer from the device, a texture takes the bound of Metal's size, logged.
+	@autoreleasepool {
+		Fixture bare;
+		RgfxHeap *heap = [RgfxHeap heapWithDescriptor:d device:nil serializer:&bare.ser];
+		MTLTextureDescriptor *td =
+		    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+		                                                       width:256
+		                                                      height:256
+		                                                   mipmapped:NO];
+		RgfxHeapSizeAlign bound = {};
+		CHECK(rgfxHeapTextureBound(MTLPixelFormatRGBA8Unorm, MTLTextureType2D, 256, 256, 1, 1, 1,
+		                           1, &bound));
+		id<MTLTexture> t = [heap newTextureWithDescriptor:td];
+		CHECK(t != nil && t.allocatedSize == bound.size && heap.usedSize == bound.size);
+		CHECK(RgfxUnsupportedWasLogged([RgfxHeap class], @selector(newTextureWithDescriptor:)));
+		drainRing(bare.ring);
+	}
+	CHECK(retirementIdle());
+
+	// A Placement heap places nothing itself, and answers 0 used and 0 available.
+	@autoreleasepool {
+		Fixture px;
+		MTLHeapDescriptor *pd = [MTLHeapDescriptor new];
+		pd.size = 20000;
+		pd.type = MTLHeapTypePlacement;
+		RgfxHeap *heap = [RgfxHeap heapWithDescriptor:pd device:nil serializer:&px.ser];
+		CHECK(heap.size == 32768 && heap.currentAllocatedSize == 32768);
+		id<MTLBuffer> b = [heap newBufferWithLength:4096 options:0 offset:0];
+		CHECK(b != nil && heap.usedSize == 0 && [heap maxAvailableSizeWithAlignment:256] == 0);
+		CHECK([heap newBufferWithLength:64 options:0] == nil);
+		drainRing(px.ring);
+	}
+	CHECK(retirementIdle());
+}
+
+// An Automatic Shared heap's buffers are its bytes at the offsets it picks.
+void test_automatic_shared_heap_buffers_are_its_bytes()
+{
+	CHECK(retirementIdle());
+	Fixture fx;
+	static uint8_t bytes[0x8000];
+	MTLHeapDescriptor *d = [MTLHeapDescriptor new];
+	d.size = sizeof(bytes);
+	d.storageMode = MTLStorageModeShared;
+	d.type = MTLHeapTypeAutomatic;
+	@autoreleasepool {
+		RgfxHeap *heap = [RgfxHeap heapOverHostMemoryWithDescriptor:d
+		                                              regionOffset:RGFX_CONTEXT_ALLOCATIONS_OFFSET
+		                                                  contents:bytes
+		                                               deallocator:nil
+		                                                    device:nil
+		                                                serializer:&fx.ser];
+		const uint64_t at =
+		    expectMessage<RgfxHeapOverHostMemory>(fx.ring, RGFX_CMD_HEAP_OVER_HOST_MEMORY)
+		        .gpu_address;
+		id<MTLBuffer> a = [heap newBufferWithLength:300 options:MTLResourceStorageModeShared];
+		id<MTLBuffer> b = [heap newBufferWithLength:300 options:MTLResourceStorageModeShared];
+		CHECK(a != nil && b != nil);
+		CHECK([a contents] == bytes && [b contents] == bytes + 512);
+		CHECK(a.gpuAddress == at && b.gpuAddress == at + 512);
+		CHECK([heap newBufferWithLength:sizeof(bytes) options:MTLResourceStorageModeShared] ==
+		      nil);
+		drainRing(fx.ring);
+	}
+	drainRing(fx.ring);
+	CHECK(retirementIdle());
+}
+
 // A heap's GPU address goes back once its destroy is retired: churned 1 GiB heaps, each made
 // while the one before it lives, take spans that never meet a live one and are picked again
 // once the picks have gone round the context's 64 GiB, so the churn never runs out. One a
@@ -4262,6 +4432,8 @@ int main()
 		test_heaps_with_no_bytes_or_address_are_nil();
 		test_queue_ring_carries_only_command_buffers();
 		test_shared_heap_buffers_alias_its_bytes();
+		test_automatic_heap_places_as_metal();
+		test_automatic_shared_heap_buffers_are_its_bytes();
 		test_managed_texture_copy_block_after_destroys();
 		rgfxProtocolTests(); // tests/protocol_tests.mm
 		rgfxArchiveTests();  // tests/archive_tests.mm
