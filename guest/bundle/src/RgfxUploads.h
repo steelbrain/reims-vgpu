@@ -66,6 +66,45 @@ private:
 	uint64_t m_made = 0;
 };
 
+/// A block a command buffer too large for its queue's ring puts its message in.
+struct RgfxBodyBlock {
+	uint64_t offset;
+	volatile uint8_t *ptr;
+	uint64_t size;
+};
+
+/// A queue's blocks for the messages of its command buffers too large for its ring: one taken
+/// at the commit, given back at the completion (the host read the message out of it before it
+/// ran the buffer), and reused by the next such buffer, so the block stays the process's, and
+/// in its window, with no kext call per buffer. A block is a power of two of at least
+/// kGranule bytes; the pool keeps kKeep free ones and gives the rest back to the region, and
+/// gives back all it holds when it goes. Locked: commits and completions come on any thread.
+class RgfxBodyPool {
+public:
+	static constexpr uint64_t kGranule = 64 * 1024;
+	static constexpr size_t kKeep = 8;
+
+	/// A pool over `region` (borrowed; it outlives the pool, as the upload pool's does).
+	explicit RgfxBodyPool(RgfxRegion *region);
+	~RgfxBodyPool();
+	RgfxBodyPool(const RgfxBodyPool &) = delete;
+	RgfxBodyPool &operator=(const RgfxBodyPool &) = delete;
+
+	/// A free block of at least `size` bytes, made where none of its size is free. False where
+	/// the region has no room.
+	bool take(uint64_t size, RgfxBodyBlock *block);
+	/// Takes back a block a command buffer is done with.
+	void giveBack(const RgfxBodyBlock &block);
+	/// How many blocks the pool has made (diagnostics and tests).
+	uint64_t made() const;
+
+private:
+	RgfxRegion *m_region;
+	mutable std::mutex m_lock;
+	std::vector<RgfxBodyBlock> m_free;
+	uint64_t m_made = 0;
+};
+
 class RgfxUploadArena {
 public:
 	explicit RgfxUploadArena(std::shared_ptr<RgfxUploadPool> pool);

@@ -88,6 +88,73 @@ uint64_t RgfxUploadPool::made() const
 	return m_made;
 }
 
+RgfxBodyPool::RgfxBodyPool(RgfxRegion *region) : m_region(region)
+{
+}
+
+RgfxBodyPool::~RgfxBodyPool()
+{
+	if (m_region != nullptr) {
+		for (const RgfxBodyBlock &b : m_free) {
+			m_region->release(b.offset);
+		}
+	}
+}
+
+bool RgfxBodyPool::take(uint64_t size, RgfxBodyBlock *block)
+{
+	uint64_t bytes = kGranule;
+	while (bytes < size && bytes <= (UINT64_MAX >> 1)) {
+		bytes <<= 1;
+	}
+	if (bytes < size) {
+		return false;
+	}
+	{
+		std::lock_guard<std::mutex> hold(m_lock);
+		for (size_t i = 0; i < m_free.size(); i++) {
+			if (m_free[i].size == bytes) {
+				*block = m_free[i];
+				m_free.erase(m_free.begin() + static_cast<std::ptrdiff_t>(i));
+				return true;
+			}
+		}
+	}
+	if (m_region == nullptr) {
+		return false;
+	}
+	RgfxRegion::Block made = m_region->allocate(bytes);
+	if (!made.ok) {
+		return false;
+	}
+	{
+		std::lock_guard<std::mutex> hold(m_lock);
+		m_made++;
+	}
+	*block = {made.offset, made.ptr, bytes};
+	return true;
+}
+
+void RgfxBodyPool::giveBack(const RgfxBodyBlock &block)
+{
+	{
+		std::lock_guard<std::mutex> hold(m_lock);
+		if (m_free.size() < kKeep) {
+			m_free.push_back(block);
+			return;
+		}
+	}
+	if (m_region != nullptr) {
+		m_region->release(block.offset);
+	}
+}
+
+uint64_t RgfxBodyPool::made() const
+{
+	std::lock_guard<std::mutex> hold(m_lock);
+	return m_made;
+}
+
 RgfxUploadArena::RgfxUploadArena(std::shared_ptr<RgfxUploadPool> pool) : m_pool(std::move(pool))
 {
 }

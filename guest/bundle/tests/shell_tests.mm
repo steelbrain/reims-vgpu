@@ -2505,14 +2505,30 @@ void test_command_buffer_out_of_line()
 	            sizeof(first));
 	CHECK(first.tag == RGFX_OP_ENCODER_BEGIN_BLIT);
 
-	// Its completion carries the reference's seqno; the block goes back then.
+	// Its completion carries the reference's seqno; the block goes back to the queue's pool
+	// then, still the process's, and the next buffer too large for the ring takes it again.
 	CHECK(blocks.released.empty());
 	RgfxCbComplete done = cbComplete(h.seqno, ((RgfxResource *)cb).rgfxObjId);
 	CHECK(f.completion.postFromHost(&done, sizeof(done)));
 	[cb waitUntilCompleted];
 	CHECK(fired == 1);
 	CHECK(cb.status == MTLCommandBufferStatusCompleted);
-	CHECK(blocks.released.size() == 1 && blocks.released[0] == ref.region_offset);
+	CHECK(blocks.released.empty());
+	id<MTLCommandBuffer> next = [f.queue commandBuffer];
+	id<MTLBlitCommandEncoder> nextBlit = [next blitCommandEncoder];
+	for (int i = 0; i < 200; i++)
+		[nextBlit fillBuffer:handle(40) range:NSMakeRange(4 * i, 4) value:(uint8_t)i];
+	[nextBlit endEncoding];
+	[next commit];
+	CHECK(f.submit.next(&h, &bytes));
+	CHECK(h.type == RGFX_CMD_COMMAND_BUFFER_IN_REGION);
+	RgfxCommandBufferInRegion nextRef = {};
+	std::memcpy(&nextRef, bytes.data(), sizeof(nextRef));
+	CHECK(nextRef.region_offset == ref.region_offset && blocks.allocated.size() == 1);
+	RgfxCbComplete nextDone = cbComplete(h.seqno, ((RgfxResource *)next).rgfxObjId);
+	CHECK(f.completion.postFromHost(&nextDone, sizeof(nextDone)));
+	[next waitUntilCompleted];
+	CHECK(next.status == MTLCommandBufferStatusCompleted && blocks.released.empty());
 
 	// With no region, a buffer too large for the ring fails as out of memory, off the
 	// committing thread, and never reaches the ring.

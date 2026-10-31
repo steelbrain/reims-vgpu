@@ -315,6 +315,7 @@ struct RgfxBarrierSlot {
 
 @interface RgfxCommandQueue ()
 - (std::shared_ptr<RgfxUploadPool>)rgfxUploadPool;
+- (std::shared_ptr<RgfxBodyPool>)rgfxBodyPool;
 /// The next encoder's barrier fence, of the fences the queue made with itself.
 - (RgfxBarrierSlot)rgfxTakeBarrierSlot;
 @end
@@ -338,6 +339,9 @@ struct RgfxBarrierSlot {
 	// The chunks its command buffers' inline bytes go to (RgfxUploads.h), made with the first
 	// command buffer, over the queue's region.
 	std::shared_ptr<RgfxUploadPool> _uploadPool;
+	// The blocks of its command buffers too large for its ring (RgfxUploads.h), made with the
+	// first such buffer, over the queue's region.
+	std::shared_ptr<RgfxBodyPool> _bodyPool;
 	// The barrier fences (QUEUE BARRIERS), made with the queue, and the encoders made.
 	NSArray<RgfxFence *> *_barrierFences;
 	uint64_t _encodersMade;
@@ -454,6 +458,17 @@ struct RgfxBarrierSlot {
 	if (descriptor != nil)
 		[cb rgfxSetErrorOptions:descriptor.errorOptions];
 	return cb;
+}
+
+// The queue's pool of message blocks, made over its region on first use.
+- (std::shared_ptr<RgfxBodyPool>)rgfxBodyPool
+{
+	@synchronized(self) {
+		if (_bodyPool == nullptr && self.region != nullptr) {
+			_bodyPool = std::make_shared<RgfxBodyPool>(self.region);
+		}
+		return _bodyPool;
+	}
 }
 
 // The queue's upload pool, made over its region on first use.
@@ -722,9 +737,10 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 	// The queue's slot this buffer holds (rgfxHoldSlot:), and whether it still does.
 	dispatch_semaphore_t _slots;
 	std::atomic<bool> _slotHeld;
-	// A buffer too large for its ring: the region block its message lies in until it completes.
-	RgfxRegion *_bodyRegion;
-	uint64_t _bodyOffset;
+	// A buffer too large for its ring: the block of its queue's pool its message lies in until
+	// it completes.
+	std::shared_ptr<RgfxBodyPool> _bodyPool;
+	RgfxBodyBlock _body;
 	// The process's retirement ticket a buffer that will complete holds from its making to its
 	// completion (RgfxRetirement), 0 for none: objects let go meanwhile stay on the host, as
 	// Metal's buffer keeps what it encodes from the encode on.
@@ -935,11 +951,11 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 	bool posted = false;
 	if (_encoder->fitsRing()) {
 		posted = _encoder->finish(&_seqno, whileWaiting, expect);
-	} else if (RgfxRegion *region = queue.region) {
-		RgfxRegion::Block block = region->allocate(_encoder->messageSize());
-		if (block.ok) {
-			_bodyRegion = region;
-			_bodyOffset = block.offset;
+	} else if (std::shared_ptr<RgfxBodyPool> pool = [queue rgfxBodyPool]) {
+		RgfxBodyBlock block = {};
+		if (pool->take(_encoder->messageSize(), &block)) {
+			_bodyPool = pool;
+			_body = block;
 			posted = _encoder->finishInRegion(block.ptr, block.offset, &_seqno, whileWaiting,
 			                                  expect);
 		}
@@ -986,9 +1002,9 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 		_uploads->giveBack();
 	}
 	// The host read the message out of its block before it ran the buffer.
-	if (_bodyRegion != nullptr) {
-		_bodyRegion->release(_bodyOffset);
-		_bodyRegion = nullptr;
+	if (_bodyPool != nullptr) {
+		_bodyPool->giveBack(_body);
+		_bodyPool = nullptr;
 	}
 	// The queue's slot goes back before the handlers run, so one that makes the next buffer
 	// does not wait for its own.
