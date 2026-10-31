@@ -146,6 +146,14 @@ Stages:
    trip.
 10. **Device answers.** One versioned blob at device open holds every answer,
    taken from the host GPU, and the bundle caches it.
+   - The device shows the host GPU's real name, and claims the Apple GPU
+     families the host platform claims, with every family and feature set
+     those contain, as an Apple-silicon Mac of that generation answers. It
+     invents no family of its own (owner, 2026-10-31).
+   - Where the lane's own device can do less than the host GPU, it answers
+     no (Metal4, ray tracing, function pointers, dynamic libraries and the
+     rest). One table in `crates/reims-vgpu/src/graphics/device_info.rs`
+     lists each such answer with what it waits on.
 11. **Stage 2 lays the final transport.** The rings, doorbells, interrupts,
     contexts and the display path are the final ones from stage 2 on, and
     stage 3 adds commands to them. The stage 2 display scans out host memory
@@ -678,5 +686,4 @@ builds a pipe), and refuses the rest.
   (probe on the Apple lane: KVM's dirty bits per mapped surface).
 - **The PCI vendor:device ID** the device ships with (owner call).
 - **Owner calls**, each with a recommendation once the evidence is in:
-  - the GPU name and families an x86-64 guest sees;
   - whether host device addresses are ever exposed.
