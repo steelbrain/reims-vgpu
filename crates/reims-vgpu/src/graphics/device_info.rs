@@ -63,8 +63,9 @@ fn put_text(out: &mut [u8], text: &str) -> u32 {
 /// | `supportsPlacementSparse` | no | placement sparse buffers and textures |
 /// | `supportsCounterSampling:` | no, at every point | counter sample buffers |
 /// | `supportsRasterizationRateMapWithLayerCount:` | no, of every count | rasterization rate maps |
+/// | `maximumConcurrentCompilationTaskCount` | the device's compile threads, which run its pipeline compiles | nothing: the device's own answer |
 /// | `hasUnifiedMemory` | yes, an interim answer | Managed resources' two copies (docs/graphics-kext/design.md, Decided 4). The platform's answer is the host GPU's (no on a discrete one); the bundle keeps a Managed buffer's bytes in guest memory alone, so an app told no, which picks Managed storage, would draw what the GPU never saw. Yes also matches the Apple family the device claims |
-fn lane(mut identity: IdentityCaps) -> IdentityCaps {
+fn lane(mut identity: IdentityCaps, compile_threads: u64) -> IdentityCaps {
     let metal4 = SDK_FAMILIES
         .iter()
         .position(|&f| f == MTL_GPU_FAMILY_METAL4);
@@ -87,13 +88,19 @@ fn lane(mut identity: IdentityCaps) -> IdentityCaps {
     f.has_unified_memory = Some(true);
     identity.counter_sampling = [Some(false); 5];
     identity.sizes.largest_rasterization_rate_map_layer_count = Some(0);
+    identity.sizes.maximum_concurrent_compilation_task_count = Some(compile_threads);
     identity
 }
 
-/// The device-info caps blob for `caps` and `identity`: every value the guest bundle reads once
-/// at init, the host device's answers but where the lane's own differ ([`lane`]).
-pub fn device_info(caps: &DeviceCaps, identity: IdentityCaps) -> RgfxDeviceInfo {
-    let identity = lane(identity);
+/// The device-info caps blob for `caps` and `identity`, of a device that runs `compile_threads`
+/// pipeline compiles at once: every value the guest bundle reads once at init, the host device's
+/// answers but where the lane's own differ ([`lane`]).
+pub fn device_info(
+    caps: &DeviceCaps,
+    identity: IdentityCaps,
+    compile_threads: u64,
+) -> RgfxDeviceInfo {
+    let identity = lane(identity, compile_threads);
     let mut info = RgfxDeviceInfo {
         version: RGFX_DEVICE_INFO_VERSION,
         registry_id: caps.registry_id,
@@ -289,7 +296,7 @@ mod tests {
     fn mirrors_the_device_caps() {
         let p = Arc::new(FakePlatform::new());
         let caps = p.device().caps();
-        let info = device_info(&caps, p.device().identity_caps());
+        let info = device_info(&caps, p.device().identity_caps(), 4);
 
         assert_eq!(info.version, RGFX_DEVICE_INFO_VERSION);
         assert_eq!(info.registry_id, caps.registry_id);
@@ -315,7 +322,7 @@ mod tests {
         let p = Arc::new(FakePlatform::new());
         let mut caps = (*p.device().caps()).clone();
         caps.families[6] = Ok(false);
-        let info = device_info(&caps, p.device().identity_caps());
+        let info = device_info(&caps, p.device().identity_caps(), 4);
         assert_eq!(info.family_count, 21);
         for yes in [
             1001, 1002, 1003, 1004, 1005, 1006, 1007, 1008, 1009, 2001, 2002, 3001, 3002, 3003,
@@ -334,7 +341,7 @@ mod tests {
     #[test]
     fn every_feature_set_is_the_platforms() {
         let p = Arc::new(FakePlatform::new());
-        let info = device_info(&p.device().caps(), p.device().identity_caps());
+        let info = device_info(&p.device().caps(), p.device().identity_caps(), 4);
         assert_eq!(info.feature_set_count as usize, FEATURE_SETS.len());
         for set in (0..=16).chain([10000, 10001, 10003, 10004, 10005]) {
             assert_eq!(feature_set(&info, set), Some(1), "feature set {set}");
@@ -355,7 +362,7 @@ mod tests {
         let mut identity = p.device().identity_caps();
         identity.flags.has_unified_memory = Some(false);
         identity.flags.is_low_power = Some(true);
-        let info = device_info(&caps, identity.clone());
+        let info = device_info(&caps, identity.clone(), 4);
         assert_eq!(
             &info.name[..info.name_len as usize],
             b"NVIDIA GeForce RTX 5080 Laptop GPU"
@@ -377,6 +384,8 @@ mod tests {
             identity.sizes.recommended_max_working_set_size.unwrap()
         );
         assert_eq!(info.sizes[7], identity.sizes.max_buffer_length.unwrap());
+        // maximum_concurrent_compilation_task_count is the device's compile threads.
+        assert_eq!(info.sizes[12], 4);
         assert_eq!(info.sizes[13], 8);
         assert_eq!(info.sizes[14], 0);
     }
@@ -389,14 +398,14 @@ mod tests {
         let mut caps = (*p.device().caps()).clone();
         let mut identity = p.device().identity_caps();
         // The fake answers sample count 8 (index 3) with a present no.
-        assert_eq!(device_info(&caps, identity.clone()).sample_counts[3], 0);
+        assert_eq!(device_info(&caps, identity.clone(), 4).sample_counts[3], 0);
         // A family the platform could not answer at all (a gap) also reads 0.
         caps.families[6] = Err(Raise::foreign("device_info_test_gap"));
         identity.families[8] = None;
         identity.feature_sets[0] = None;
         identity.flags.is_low_power = None;
         identity.sizes.location = None;
-        let info = device_info(&caps, identity.clone());
+        let info = device_info(&caps, identity.clone(), 4);
         assert_eq!(family(&info, -1009), Some(0));
         assert_eq!(family(&info, 1009), Some(0));
         assert_eq!(feature_set(&info, 0), Some(0));
@@ -405,12 +414,12 @@ mod tests {
         // A present yes still reads 1.
         caps.families[6] = Ok(true);
         assert_eq!(
-            family(&device_info(&caps, identity.clone()), -1009),
+            family(&device_info(&caps, identity.clone(), 4), -1009),
             Some(1)
         );
         // 255 ASCII bytes and a two-byte character: the character does not fit, and is left out.
         caps.name = Some(format!("{}\u{e9}", "a".repeat(255)));
-        let info = device_info(&caps, identity);
+        let info = device_info(&caps, identity, 4);
         assert_eq!(info.name_len, 255);
     }
 }

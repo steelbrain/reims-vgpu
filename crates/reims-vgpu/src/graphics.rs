@@ -41,6 +41,7 @@ use reims_graphics::{
     CompleteAnswer, CompletionPoster, CursorImage, FixedScreen, Host, Mode, PresentAnswer, Scanout,
     Screen,
 };
+use reims_vgpu_core::num::ToU64;
 use reims_vgpu_core::platform::Platform;
 use reims_vgpu_core::platform::device::GpuDevice;
 use reims_vgpu_core::sync::Mutex;
@@ -147,10 +148,13 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             // The device the decoder drives, and its caps blob, which the guest bundle reads
             // before it makes any queue. A host with no GPU device cannot run the lane.
             let gpu_device = platform.metal_device(None).ok_or(Error::HostResources)?;
-            region.write(
-                RGFX_DEVICE_INFO_OFFSET,
-                device_info(&gpu_device.caps(), gpu_device.identity_caps()).as_bytes(),
+            let pool = CompilePool::new();
+            let info = device_info(
+                &gpu_device.caps(),
+                gpu_device.identity_caps(),
+                pool.threads().to_u64(),
             );
+            region.write(RGFX_DEVICE_INFO_OFFSET, info.as_bytes());
             let mut decoder = GraphicsDecoder::new(Arc::clone(&platform), Arc::clone(&region));
             // `Managed` resources are two copies, which hold Metal's contract on any GPU, until
             // the device's identity answers carry the platform's `hasUnifiedMemory`.
@@ -159,7 +163,7 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                 decoder: Mutex::new(decoder),
                 device: gpu_device,
                 presented: Arc::new(Presented::default()),
-                pool: CompilePool::new(),
+                pool,
                 pending: Pending::default(),
             });
             let host = Box::new(CallbackHost {

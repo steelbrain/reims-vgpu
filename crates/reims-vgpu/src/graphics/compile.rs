@@ -42,6 +42,8 @@ pub(crate) type CompileJob = Box<dyn FnOnce() + Send>;
 pub(crate) struct CompilePool {
     /// The threads' queue; `None` where no thread could be started.
     sender: Mutex<Option<Sender<CompileJob>>>,
+    /// The threads that started.
+    threads: usize,
     /// Holds the threads before each compile while shut (tests only).
     #[cfg(test)]
     gate: Arc<Gate>,
@@ -85,9 +87,16 @@ impl CompilePool {
         }
         CompilePool {
             sender: Mutex::new((started > 0).then_some(sender)),
+            threads: started,
             #[cfg(test)]
             gate,
         }
+    }
+
+    /// The compiles the pool runs at once: its threads, or 1 where none started and each
+    /// compile runs where it is handed over.
+    pub(crate) fn threads(&self) -> usize {
+        self.threads.max(1)
     }
 
     /// Hands `job` to the threads, or gives it back where the pool has none.
