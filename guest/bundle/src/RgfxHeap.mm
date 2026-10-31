@@ -16,6 +16,7 @@
 	MTLHeapType _type;
 	void (^_deallocator)(void); // gives a Shared heap's region block back
 	uint64_t _gpuAddress;       // the GPU address its create picked, given back after its destroy
+	uint8_t *_contents;         // a Shared heap's bytes, its region block's; null for any other
 }
 
 // The host drops the heap once every command buffer in flight now has completed, and only
@@ -65,6 +66,7 @@
 
 + (instancetype)heapOverHostMemoryWithDescriptor:(MTLHeapDescriptor *)descriptor
                                     regionOffset:(uint64_t)regionOffset
+                                        contents:(void *)contents
                                      deallocator:(void (^)(void))deallocator
                                           device:(id<MTLDevice>)device
                                       serializer:(RgfxSerializer *)serializer
@@ -90,6 +92,7 @@
 		heap->_options = descriptor.resourceOptions;
 		heap->_type = descriptor.type;
 		heap->_gpuAddress = created.gpu_address;
+		heap->_contents = static_cast<uint8_t *>(contents);
 		heap->_deallocator = [deallocator copy];
 	}
 	return heap;
@@ -167,16 +170,32 @@
 	if (ser == nullptr || _type != MTLHeapTypePlacement) {
 		return nil;
 	}
+	// A Shared heap's buffer is its bytes at the offset, which must lie in the heap.
+	if (_contents != nullptr && (offset > _size || length > _size - offset)) {
+		return nil;
+	}
 	RgfxCreated created = ser->createBufferAtOffset([self rgfxObjId], offset, length,
 	                                                static_cast<uint32_t>(options));
-	// A heap-placed buffer's address is derived host-side from the heap (0 here). It keeps
-	// the heap alive.
-	RgfxBuffer *buffer = [[RgfxBuffer alloc] initWithObjId:created.obj_id
-	                                            gpuAddress:created.gpu_address
-	                                                length:length
-	                                               options:options
-	                                                device:self.device
-	                                            serializer:ser];
+	// At the heap's address plus the offset, where the host places it in the heap it pinned.
+	// A Shared heap's buffer is the heap's bytes there, which the host's is too; it keeps the
+	// heap, and so the bytes, alive.
+	const uint64_t address = _gpuAddress + offset;
+	RgfxBuffer *buffer =
+	    _contents != nullptr
+	        ? [[RgfxBuffer alloc] initWithObjId:created.obj_id
+	                                 gpuAddress:address
+	                                     length:length
+	                                    options:options
+	                                   contents:_contents + offset
+	                                deallocator:nil
+	                                     device:self.device
+	                                 serializer:ser]
+	        : [[RgfxBuffer alloc] initWithObjId:created.obj_id
+	                                 gpuAddress:address
+	                                     length:length
+	                                    options:options
+	                                     device:self.device
+	                                 serializer:ser];
 	[buffer rgfxSetHeap:self];
 	[buffer rgfxSetHeapOffset:offset];
 	return buffer;

@@ -224,14 +224,18 @@ bool rgfxIsManagedStorage(MTLResourceOptions options)
 	RgfxRegion *region = [self region];
 	if (descriptor != nil && rgfxIsSharedStorage(descriptor.resourceOptions) &&
 	    region != nullptr) {
-		RgfxRegion::Block block =
-		    region->allocate(descriptor.size == 0 ? 1 : static_cast<uint64_t>(descriptor.size));
+		// The heap's memory is the block, on the host too, whole pages of Metal's 16 KiB.
+		const uint64_t page = 0x4000;
+		const uint64_t size = descriptor.size == 0 ? 1 : static_cast<uint64_t>(descriptor.size);
+		RgfxRegion::Block block = region->allocate((size + page - 1) & ~(page - 1), page);
 		if (block.ok) {
-			std::memset(const_cast<uint8_t *>(block.ptr), 0, block.size);
+			uint8_t *bytes = const_cast<uint8_t *>(block.ptr);
+			std::memset(bytes, 0, block.size);
 			// The block goes back to the region once the host has dropped the heap.
 			uint64_t offset = block.offset;
 			id<MTLHeap> shared = [RgfxHeap heapOverHostMemoryWithDescriptor:descriptor
 			                                                  regionOffset:offset
+			                                                      contents:bytes
 			                                                   deallocator:^{ region->release(offset); }
 			                                                        device:self
 			                                                    serializer:[self serializer]];

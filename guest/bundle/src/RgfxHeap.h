@@ -11,7 +11,10 @@
  * The heap sub-allocates its own resources: a Placement heap's
  * `newBufferWithLength:options:offset:` routes an `RGFX_CMD_BUFFER_AT_OFFSET` and
  * `newTextureWithDescriptor:offset:` an `RGFX_CMD_TEXTURE_CREATE` into this heap,
- * each wrapped as an RgfxBuffer / RgfxTexture whose `heap` is this one. The
+ * each wrapped as an RgfxBuffer / RgfxTexture whose `heap` is this one. A placed
+ * buffer's GPU address is the heap's plus its offset, and a Shared heap's placed
+ * buffer's contents are the heap's bytes there, so placed resources alias the
+ * heap's memory as Metal's do. The
  * offset-less variants (an Automatic heap, where Metal picks the placement) need
  * the host's per-resource size and alignment, which arrives with the region/block
  * transport; until then they are documented nil stubs.
@@ -44,13 +47,16 @@ NS_ASSUME_NONNULL_BEGIN
                                      device:(nullable id<MTLDevice>)device
                                  serializer:(nullable RgfxSerializer *)serializer;
 
-/// Creates a Shared heap over a block of the device region at `regionOffset`,
-/// serialising an `RGFX_CMD_HEAP_OVER_HOST_MEMORY` through `serializer` (which picks the
-/// objId and GPU address). The host sees the heap's memory in place. `deallocator` (may
-/// be nil) gives the block back once the host has dropped the heap. Returns nil if
-/// `serializer` is null or `descriptor` is nil.
+/// Creates a Shared heap over a block of the device region at `regionOffset`, whose bytes
+/// are at `contents` here, serialising an `RGFX_CMD_HEAP_OVER_HOST_MEMORY` through
+/// `serializer` (which picks the objId and GPU address). The heap's memory is the block, in
+/// place on the host too, so a buffer placed in it is the block's bytes at its offset, as
+/// Metal's is. The block holds the heap's size rounded up to Metal's 16 KiB page.
+/// `deallocator` (may be nil) gives the block back once the host has dropped the heap.
+/// Returns nil if `serializer` is null or `descriptor` is nil.
 + (nullable instancetype)heapOverHostMemoryWithDescriptor:(MTLHeapDescriptor *)descriptor
                                              regionOffset:(uint64_t)regionOffset
+                                                 contents:(nullable void *)contents
                                               deallocator:(nullable void (^)(void))deallocator
                                                    device:(nullable id<MTLDevice>)device
                                                serializer:(nullable RgfxSerializer *)serializer;

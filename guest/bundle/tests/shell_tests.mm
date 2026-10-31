@@ -3152,6 +3152,7 @@ void test_heaps_with_no_bytes_or_address_are_nil()
 		d.storageMode = MTLStorageModeShared;
 		CHECK([RgfxHeap heapOverHostMemoryWithDescriptor:d
 		                                    regionOffset:RGFX_CONTEXT_ALLOCATIONS_OFFSET
+		                                        contents:nullptr
 		                                     deallocator:nil
 		                                          device:nil
 		                                      serializer:&fx.ser] == nil);
@@ -3166,6 +3167,71 @@ void test_heaps_with_no_bytes_or_address_are_nil()
 		d.size = 0x10000;
 		CHECK([RgfxHeap heapWithDescriptor:d device:nil serializer:&fx.ser] != nil);
 		CHECK(expectMessage<RgfxHeapCreate>(fx.ring, RGFX_CMD_HEAP_CREATE).size_bytes == 0x10000);
+	}
+	drainRing(fx.ring);
+	CHECK(retirementIdle());
+}
+
+// A Shared heap's placed buffers alias its bytes, as Metal's do: a buffer is the heap's bytes at
+// its offset, two at one offset are the same bytes, and each is at the heap's GPU address plus
+// its offset; one that runs past the heap is nil, and posts nothing. A Private heap's placed
+// buffer is at its address plus the offset too.
+void test_shared_heap_buffers_alias_its_bytes()
+{
+	CHECK(retirementIdle());
+	Fixture fx;
+	static uint8_t bytes[0x10000];
+	MTLHeapDescriptor *d = [MTLHeapDescriptor new];
+	d.size = sizeof(bytes);
+	d.storageMode = MTLStorageModeShared;
+	d.type = MTLHeapTypePlacement;
+	@autoreleasepool {
+		RgfxHeap *heap = [RgfxHeap heapOverHostMemoryWithDescriptor:d
+		                                              regionOffset:RGFX_CONTEXT_ALLOCATIONS_OFFSET
+		                                                  contents:bytes
+		                                               deallocator:nil
+		                                                    device:nil
+		                                                serializer:&fx.ser];
+		CHECK(heap != nil);
+		const uint64_t at =
+		    expectMessage<RgfxHeapOverHostMemory>(fx.ring, RGFX_CMD_HEAP_OVER_HOST_MEMORY)
+		        .gpu_address;
+		CHECK(at != 0);
+		id<MTLBuffer> a = [heap newBufferWithLength:0x1000
+		                                    options:MTLResourceStorageModeShared
+		                                     offset:0x2000];
+		id<MTLBuffer> b = [heap newBufferWithLength:0x800
+		                                    options:MTLResourceStorageModeShared
+		                                     offset:0x2000];
+		CHECK(a != nil && b != nil);
+		auto placed = expectMessage<RgfxBufferAtOffset>(fx.ring, RGFX_CMD_BUFFER_AT_OFFSET);
+		CHECK(placed.heap_obj_id == heap.rgfxObjId && placed.offset == 0x2000 &&
+		      placed.length == 0x1000);
+		drainRing(fx.ring);
+		CHECK([a contents] == bytes + 0x2000 && [b contents] == [a contents]);
+		CHECK(a.gpuAddress == at + 0x2000 && b.gpuAddress == at + 0x2000);
+		static_cast<uint8_t *>([a contents])[5] = 0xc3;
+		CHECK(static_cast<uint8_t *>([b contents])[5] == 0xc3 && bytes[0x2005] == 0xc3);
+		CHECK([heap newBufferWithLength:0x2000
+		                        options:MTLResourceStorageModeShared
+		                         offset:sizeof(bytes) - 0x1000] == nil);
+		CHECK([heap newBufferWithLength:1
+		                        options:MTLResourceStorageModeShared
+		                         offset:sizeof(bytes) + 1] == nil);
+		CHECK(ringEmpty(fx.ring));
+
+		MTLHeapDescriptor *pd = [MTLHeapDescriptor new];
+		pd.size = 0x10000;
+		pd.storageMode = MTLStorageModePrivate;
+		pd.type = MTLHeapTypePlacement;
+		RgfxHeap *priv = [RgfxHeap heapWithDescriptor:pd device:nil serializer:&fx.ser];
+		const uint64_t privAt =
+		    expectMessage<RgfxHeapCreate>(fx.ring, RGFX_CMD_HEAP_CREATE).gpu_address;
+		id<MTLBuffer> c = [priv newBufferWithLength:0x100
+		                                    options:MTLResourceStorageModePrivate
+		                                     offset:0x4000];
+		CHECK(c != nil && c.gpuAddress == privAt + 0x4000);
+		drainRing(fx.ring);
 	}
 	drainRing(fx.ring);
 	CHECK(retirementIdle());
@@ -3724,6 +3790,7 @@ void test_region_memory_given_back_after_destroy()
 		d.storageMode = MTLStorageModeShared;
 		RgfxHeap *h = [RgfxHeap heapOverHostMemoryWithDescriptor:d
 		                                            regionOffset:RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x1000
+		                                                contents:nullptr
 		                                             deallocator:deallocator
 		                                                  device:nil
 		                                              serializer:&fx.ser];
@@ -4177,6 +4244,7 @@ int main()
 		test_addresses_reused_after_destroy();
 		test_heaps_with_no_bytes_or_address_are_nil();
 		test_queue_ring_carries_only_command_buffers();
+		test_shared_heap_buffers_alias_its_bytes();
 		test_managed_texture_copy_block_after_destroys();
 		rgfxProtocolTests(); // tests/protocol_tests.mm
 	}
