@@ -89,7 +89,7 @@ check: $(BINARY) $(BUILD)/obj/layout.o
 
 # The native tests: header-only rules of the kext's, built for this Mac.
 TESTS = $(BUILD)/tests/spans_test $(BUILD)/tests/blocks_test $(BUILD)/tests/surface_blocks_test \
-	$(BUILD)/tests/surface_test \
+	$(BUILD)/tests/surface_test $(BUILD)/tests/pipe_clients_test \
 	$(BUILD)/tests/window_test $(BUILD)/tests/scanout_owner_test
 
 $(BUILD)/tests/%: tests/%.cpp $(HEADERS) ../../crates/reims-graphics/include/reims_graphics_wire.h Makefile

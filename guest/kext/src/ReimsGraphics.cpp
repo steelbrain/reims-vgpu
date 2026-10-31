@@ -364,7 +364,7 @@ void ReimsGraphics::service()
 	}
 
 	IOSimpleLockLock(interruptLock);
-	bool want = vblankWanted || (pipeClient && pipeVblankEnabled);
+	bool want = vblankWanted || pipes.anyVblank();
 	IOSimpleLockUnlock(interruptLock);
 	if (want != vblankSent) {
 		RgfxSetVblank v = {};
@@ -432,16 +432,18 @@ void ReimsGraphics::handleEvent(UInt32 type, UInt64 seqno, const volatile UInt8 
 			return;
 		UInt32 status = size >= sizeof(uint32_t) ? field32(payload, 0) : kStatusUnreadable;
 		answer(seqno, status);
+		// Every pipe client: the one whose transaction this answers takes it.
+		OSObject *clients[kMaxPipeClients];
 		IOSimpleLockLock(interruptLock);
-		OSObject *client = pipeClient;
+		UInt32 n = pipes.all(clients);
 		PipePresentHook hook = pipePresentHook;
-		if (client)
-			client->retain();
+		for (UInt32 i = 0; i < n; i++)
+			clients[i]->retain();
 		IOSimpleLockUnlock(interruptLock);
-		if (client) {
+		for (UInt32 i = 0; i < n; i++) {
 			if (hook)
-				hook(client, seqno, status);
-			client->release();
+				hook(clients[i], seqno, status);
+			clients[i]->release();
 		}
 		return;
 	}
@@ -466,19 +468,21 @@ void ReimsGraphics::handleEvent(UInt32 type, UInt64 seqno, const volatile UInt8 
 		answerLifecycle(type, seqno, payload, size);
 		return;
 	case RGFX_EVT_VBLANK: {
+		OSObject *clients[kMaxPipeClients];
 		IOSimpleLockLock(interruptLock);
 		fire = vblank;
-		OSObject *client = pipeVblankEnabled ? pipeClient : nullptr;
+		UInt32 n = pipes.wantingVblank(clients);
 		PipeVblankHook hook = pipeVblankHook;
-		if (client)
-			client->retain();
+		for (UInt32 i = 0; i < n; i++)
+			clients[i]->retain();
 		IOSimpleLockUnlock(interruptLock);
-		if (client) {
-			// The event's count is 8 bytes into its payload (RgfxVblank).
-			UInt64 count = size >= 16 ? *reinterpret_cast<const volatile UInt64 *>(payload + 8) : 0;
+		// The event's count is 8 bytes into its payload (RgfxVblank).
+		UInt64 count = size >= 16 ? *reinterpret_cast<const volatile UInt64 *>(payload + 8) : 0;
+		UInt64 now = mach_absolute_time();
+		for (UInt32 i = 0; i < n; i++) {
 			if (hook)
-				hook(client, count, mach_absolute_time());
-			client->release();
+				hook(clients[i], count, now);
+			clients[i]->release();
 		}
 		break;
 	}
@@ -1048,7 +1052,13 @@ void ReimsGraphics::free()
 		task_deallocate(static_cast<task_t>(const_cast<void *>(oldTask)));
 	if (oldClient)
 		static_cast<const IOUserClient *>(oldClient)->release();
-	OSSafeReleaseNULL(pipeClient);
+	OSObject *clients[kMaxPipeClients];
+	UInt32 held = pipes.all(clients);
+	for (UInt32 i = 0; i < held; i++) {
+		bool showScanout = false;
+		pipes.remove(clients[i], &showScanout);
+		clients[i]->release();
+	}
 	OSSafeReleaseNULL(queueTarget);
 	super::free();
 }
@@ -1918,23 +1928,53 @@ IOReturn ReimsGraphics::postPresent(UInt32 surfaceId, UInt32 transactionId, UInt
 	p.display = displayId;
 	p.iosurface_id = surfaceId;
 	p.transaction_id = transactionId;
-	return post(RGFX_CMD_PRESENT_SURFACE, &p, sizeof(p), seqno);
+	IOReturn r = post(RGFX_CMD_PRESENT_SURFACE, &p, sizeof(p), seqno);
+	if (r == kIOReturnSuccess) {
+		IOSimpleLockLock(interruptLock);
+		pipes.shows(surfaceId);
+		IOSimpleLockUnlock(interruptLock);
+	}
+	return r;
 }
 
-void ReimsGraphics::setPipe(OSObject *client, PipeVblankHook vblankHook, PipePresentHook presentHook)
+bool ReimsGraphics::addPipe(OSObject *client, PipeVblankHook vblankHook, PipePresentHook presentHook)
 {
-	if (client)
-		client->retain();
-	IOSimpleLockLock(interruptLock);
-	OSObject *old = pipeClient;
-	pipeClient = client;
-	pipeVblankHook = client ? vblankHook : nullptr;
-	pipePresentHook = client ? presentHook : nullptr;
 	if (!client)
-		pipeVblankEnabled = false;
+		return false;
+	// Retained before it is published; let go again where it was held already or has no room.
+	client->retain();
+	IOSimpleLockLock(interruptLock);
+	bool already = pipes.holds(client);
+	bool held = already || pipes.add(client);
+	if (held) {
+		pipeVblankHook = vblankHook;
+		pipePresentHook = presentHook;
+	}
 	IOSimpleLockUnlock(interruptLock);
-	if (old)
-		old->release();
+	if (already || !held)
+		client->release();
+	return held;
+}
+
+void ReimsGraphics::removePipe(OSObject *client)
+{
+	bool showScanout = false;
+	IOSimpleLockLock(interruptLock);
+	bool held = pipes.remove(client, &showScanout);
+	IOSimpleLockUnlock(interruptLock);
+	if (!held)
+		return;
+	client->release();
+	if (showScanout) {
+		// The last client went with a surface shown: the scanout again, so whatever draws into
+		// it next is seen. Its answer goes to no client.
+		RgfxPresentSurface p = {};
+		p.display = displayId;
+		IOReturn r = post(RGFX_CMD_PRESENT_SURFACE, &p, sizeof(p), nullptr);
+		if (r != kIOReturnSuccess)
+			IOLog("ReimsGraphics: the last display pipe client went; PRESENT_SURFACE 0 not sent: "
+			      "0x%x\n", r);
+	}
 	kickWorkLoop();
 }
 
@@ -1953,10 +1993,10 @@ void ReimsGraphics::setQueueInterrupt(OSObject *target, QueueInterruptHook hook)
 		old->release();
 }
 
-void ReimsGraphics::setPipeVblankEnabled(bool enabled)
+void ReimsGraphics::setPipeVblankEnabled(OSObject *client, bool enabled)
 {
 	IOSimpleLockLock(interruptLock);
-	pipeVblankEnabled = enabled;
+	pipes.setVblank(client, enabled);
 	IOSimpleLockUnlock(interruptLock);
 	kickWorkLoop();
 }

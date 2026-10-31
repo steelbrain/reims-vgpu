@@ -77,7 +77,7 @@ private:
 	static IOReturn sSubmit(OSObject *target, void *reference, IOExternalMethodArguments *a);
 	static IOReturn sWait(OSObject *target, void *reference, IOExternalMethodArguments *a);
 
-	// The framebuffer's hooks (ReimsGraphics::setPipe), on its work loop.
+	// The framebuffer's hooks (ReimsGraphics::addPipe), on its work loop.
 	static void vblankHook(OSObject *client, UInt64 count, UInt64 time);
 	static void presentHook(OSObject *client, UInt64 seqno, UInt32 status);
 	void presented(UInt64 seqno, UInt32 status);

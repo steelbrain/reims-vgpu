@@ -32,6 +32,7 @@
 #include <IOKit/graphics/IOFramebuffer.h>
 #include <IOKit/pci/IOPCIDevice.h>
 
+#include "RgfxPipeClients.hpp"
 #include "RgfxScanoutOwner.hpp"
 #include "reims_graphics_wire.h"
 
@@ -133,11 +134,13 @@ public:
 	// The display pipe (RgfxDisplayPipeUserClient, on the accelerator) presents through the
 	// framebuffer, which owns the control ring. postPresent puts PRESENT_SURFACE for the
 	// IOSurface of global ID `surfaceId` on the ring without waiting (thread context only); the
-	// host answers it once the display shows the surface. setPipe names the pipe's client
-	// (retained) and its hooks, both called on the work loop: `present(client, seqno, status)`
-	// for every COMPLETE (the pipe picks its own seqnos), and, while setPipeVblankEnabled is on,
-	// `vblank(client, count, time)` for each VBLANK, `time` the guest's mach_absolute_time at the
-	// event. nullptr clears them.
+	// host answers it once the display shows the surface. addPipe adds an associated pipe client
+	// (retained; RgfxPipeClients.hpp: IOPresentment associates several), and the hooks, both
+	// called on the work loop for each client: `present(client, seqno, status)` for every
+	// COMPLETE (each pipe client picks its own seqnos), and, while the client's
+	// setPipeVblankEnabled is on, `vblank(client, count, time)` for each VBLANK, `time` the
+	// guest's mach_absolute_time at the event. removePipe lets one go; the last one's going
+	// shows the scanout again where the pipe showed a surface (thread context only).
 	// The scanout as it is now (setScanout): its shape, bytes per row and offset in the region.
 	// False before a mode is set.
 	bool currentScanout(UInt32 *width, UInt32 *height, UInt32 *rowBytes, UInt64 *offset);
@@ -148,8 +151,9 @@ public:
 	typedef void (*PipeVblankHook)(OSObject *client, UInt64 count, UInt64 time);
 	typedef void (*PipePresentHook)(OSObject *client, UInt64 seqno, UInt32 status);
 	IOReturn postPresent(UInt32 surfaceId, UInt32 transactionId, UInt64 *seqno);
-	void setPipe(OSObject *client, PipeVblankHook vblank, PipePresentHook present);
-	void setPipeVblankEnabled(bool enabled);
+	bool addPipe(OSObject *client, PipeVblankHook vblank, PipePresentHook present);
+	void removePipe(OSObject *client);
+	void setPipeVblankEnabled(OSObject *client, bool enabled);
 
 	// The device's one MSI-X vector also carries the command queues' completion interrupts
 	// (each QUEUE_CREATE names it). setQueueInterrupt names the accelerator (retained) and its
@@ -186,6 +190,8 @@ private:
 		UInt32 refreshMhz;
 	};
 	static constexpr UInt32 kMaxModes = 64;
+	// The most display pipe clients served at once (RgfxPipeClients.hpp).
+	static constexpr UInt32 kMaxPipeClients = 8;
 
 	// A mode's timing: the active size with reduced blanking (VESA CVT's second reduced
 	// blanking: a fixed 80-pixel horizontal blank and at least 460 us of vertical blank),
@@ -348,11 +354,11 @@ private:
 	Interrupt vblank;
 	Interrupt connect;
 	bool vblankWanted;
-	// The display pipe's client (retained), its hooks, and whether it wants VBLANK.
-	OSObject *pipeClient;
+	// The display pipe's clients (each retained), which want VBLANK, and the surface shown; the
+	// hooks every client takes.
+	RgfxPipeClients<OSObject *, kMaxPipeClients> pipes;
 	PipeVblankHook pipeVblankHook;
 	PipePresentHook pipePresentHook;
-	bool pipeVblankEnabled;
 	// The accelerator (retained) and its queue-interrupt hook.
 	OSObject *queueTarget;
 	QueueInterruptHook queueHook;

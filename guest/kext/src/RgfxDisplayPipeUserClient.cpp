@@ -144,7 +144,7 @@ void RgfxDisplayPipeUserClient::free()
 void RgfxDisplayPipeUserClient::releaseRegistrations()
 {
 	if (framebuffer)
-		framebuffer->setPipe(nullptr, nullptr, nullptr);
+		framebuffer->removePipe(this);
 	if (!lock)
 		return;
 	IOLockLock(lock);
@@ -223,7 +223,12 @@ IOReturn RgfxDisplayPipeUserClient::sAssociate(OSObject *target, void *,
 	OSSafeReleaseNULL(self->framebuffer);
 	self->framebuffer = fb;
 	self->associated = true;
-	fb->setPipe(self, &RgfxDisplayPipeUserClient::vblankHook, &RgfxDisplayPipeUserClient::presentHook);
+	if (!fb->addPipe(self, &RgfxDisplayPipeUserClient::vblankHook,
+	                 &RgfxDisplayPipeUserClient::presentHook)) {
+		self->associated = false;
+		IOLog("RGFX pipe: associate: the framebuffer serves no more pipe clients\n");
+		return kIOReturnNoResources;
+	}
 	a->scalarOutput[0] = kAcceleratorId;
 	IOLog("RGFX pipe: associated index %d with accelerator %llu\n", static_cast<int>(index),
 	      kAcceleratorId);
@@ -316,7 +321,7 @@ IOReturn RgfxDisplayPipeUserClient::sRequestNotify(OSObject *target, void *,
 	// A VBL registration turns the device's VBLANK events on first, so a failed enable leaves
 	// no reference behind.
 	if (kind == kKindVbl)
-		self->framebuffer->setPipeVblankEnabled(true);
+		self->framebuffer->setPipeVblankEnabled(self, true);
 	IOLockLock(self->lock);
 	if (self->registered[kind]) {
 		IOLockUnlock(self->lock);
