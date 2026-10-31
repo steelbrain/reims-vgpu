@@ -269,11 +269,14 @@ IOReturn RgfxAcceleratorUserClient::submitMethod(IOExternalMethodArguments *a)
 		else
 			r = kIOReturnBadArgument;
 	}
-	// The answers the client waits for: a pipeline create's reflection, and a library create's
-	// or lookup's COMPLETE (a library's last region chunk is its create).
+	// The answers the client waits for: a pipeline create's reflection, a heap texture size
+	// query's SIZE_AND_ALIGN, and a library create's or lookup's COMPLETE (a library's last
+	// region chunk is its create).
 	UInt32 replyType = 0;
 	if (type == RGFX_CMD_RENDER_PIPELINE_CREATE || type == RGFX_CMD_COMPUTE_PIPELINE_CREATE)
 		replyType = RGFX_EVT_PIPELINE_REFLECTION;
+	else if (type == RGFX_CMD_HEAP_TEXTURE_SIZE_AND_ALIGN)
+		replyType = RGFX_EVT_SIZE_AND_ALIGN;
 	else if (type == RGFX_CMD_LIBRARY_CREATE || type == RGFX_CMD_LIBRARY_LOOKUP ||
 	         (type == RGFX_CMD_LIBRARY_FROM_REGION && lastLibraryChunk(message, size)))
 		replyType = RGFX_EVT_COMPLETE;
@@ -284,10 +287,11 @@ IOReturn RgfxAcceleratorUserClient::submitMethod(IOExternalMethodArguments *a)
 		r = owner->postLifecycle(type, message, static_cast<UInt32>(size), replyType, reply,
 		                         sizeof(reply), &replyLength, &seqno, kReflectionMs);
 	IOFree(message, size);
-	if (r == kIOReturnTimeout) {
+	if (r == kIOReturnTimeout && type != RGFX_CMD_HEAP_TEXTURE_SIZE_AND_ALIGN) {
 		// Posted, but not answered in time: the client takes the create as failed, and may make
 		// it again under a new id. Destroy this one, so the device keeps nothing of it: the
 		// destroy follows the create on the ring, and cancels it where it is still being made.
+		// A size query makes nothing, so nothing follows it.
 		RgfxObjectDestroy destroy = {};
 		destroy.header.type = RGFX_CMD_OBJECT_DESTROY;
 		destroy.obj_id = objId;

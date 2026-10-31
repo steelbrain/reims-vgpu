@@ -19,7 +19,8 @@
  * The control ring is the guest's one ring to the device besides the command
  * queues' own, so the accelerator posts the Metal processes' object lifecycle
  * on it too (postLifecycle), under the same lock; the work loop hands each of
- * those its answer (a COMPLETE, a pipeline's reflection) by seqno.
+ * those its answer (a COMPLETE, a pipeline's reflection, a heap texture
+ * size) by seqno.
  */
 
 #ifndef REIMS_GRAPHICS_HPP_
