@@ -42,6 +42,7 @@
 #include <memory>
 #include <vector>
 
+#include "RgfxMemoryShadow.hpp"
 #include "RgfxObjectModel.hpp"
 #include "RgfxRingWriter.hpp"
 #include "reims_graphics_wire.h"
@@ -402,6 +403,19 @@ public:
 	void noteSurfaceWrite(std::shared_ptr<void> shadow) { m_surfaceWrites.push_back(std::move(shadow)); }
 	/// The copies recorded so far, which the caller now holds.
 	std::vector<std::shared_ptr<void>> takeSurfaceWrites() { return std::move(m_surfaceWrites); }
+	/// Records that the command buffer uses the copy of app memory `shadow` (a no-copy
+	/// buffer's; RgfxMemoryShadow.hpp), which its commit syncs in, and, where `writes`, its
+	/// completion writes back. Held until taken.
+	void noteShadowUse(const std::shared_ptr<RgfxMemoryShadow> &shadow, bool writes)
+	{
+		if (!m_shadowUses.empty() && m_shadowUses.back().shadow == shadow) {
+			m_shadowUses.back().writes = m_shadowUses.back().writes || writes;
+			return;
+		}
+		m_shadowUses.push_back({shadow, writes});
+	}
+	/// The uses recorded so far, which the caller now holds.
+	std::vector<RgfxShadowUse> takeShadowUses() { return std::move(m_shadowUses); }
 
 private:
 	// Appends an op with no body (header only, len 8).
@@ -419,6 +433,7 @@ private:
 	RgfxCommandBuffer m_head;
 	std::vector<uint8_t> m_buf;
 	std::vector<std::shared_ptr<void>> m_surfaceWrites;
+	std::vector<RgfxShadowUse> m_shadowUses;
 };
 
 #endif // RGFX_ENCODER_HPP_

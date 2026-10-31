@@ -6,9 +6,54 @@
 #import "RgfxTexture.h"
 #import "RgfxUnsupported.h"
 
-#include <cstdlib>
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
 
+#include <cstdlib>
+#include <cstring>
+
+#include "RgfxMemoryShadow.hpp"
+#include "RgfxRegion.hpp"
 #include "RgfxSerializer.hpp"
+
+namespace {
+/// Whether this process maps every byte of [p, p + length) readable, and in `*writable` whether
+/// it maps them all writable too.
+bool rgfxMappedReadable(const void *p, size_t length, bool *writable)
+{
+	*writable = true;
+	mach_vm_address_t at = reinterpret_cast<uintptr_t>(p);
+	const mach_vm_address_t end = at + length;
+	if (end < at)
+		return false;
+	while (at < end) {
+		mach_vm_address_t base = at;
+		mach_vm_size_t size = 0;
+		vm_region_basic_info_data_64_t info = {};
+		mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+		mach_port_t object = MACH_PORT_NULL;
+		kern_return_t kr = mach_vm_region(mach_task_self(), &base, &size, VM_REGION_BASIC_INFO_64,
+		                                  reinterpret_cast<vm_region_info_t>(&info), &count,
+		                                  &object);
+		if (object != MACH_PORT_NULL)
+			mach_port_deallocate(mach_task_self(), object);
+		// The region found is the one holding `at`, or the next one past a hole.
+		if (kr != KERN_SUCCESS || base > at || (info.protection & VM_PROT_READ) == 0)
+			return false;
+		if ((info.protection & VM_PROT_WRITE) == 0)
+			*writable = false;
+		at = base + size;
+	}
+	return true;
+}
+
+/// Whether `options` names Shared or Managed storage, the modes Metal makes a no-copy buffer in.
+bool rgfxNoCopyStorage(MTLResourceOptions options)
+{
+	const NSUInteger mode = (options & MTLResourceStorageModeMask) >> MTLResourceStorageModeShift;
+	return mode == MTLStorageModeShared || mode == MTLStorageModeManaged;
+}
+} // namespace
 
 @implementation RgfxBuffer {
 	uint64_t _gpuAddress;
@@ -27,6 +72,9 @@
 	// YES where the buffer's create picked its GPU address (a device buffer, or one over host
 	// memory), which goes back after its destroy; NO for one placed in a heap.
 	BOOL _ownsAddress;
+	// A no-copy buffer over app memory outside the region: the block it lies over, the GPU's
+	// copy of `_contents` (RgfxMemoryShadow.hpp).
+	std::shared_ptr<RgfxMemoryShadow> _shadow;
 }
 
 + (instancetype)bufferWithLength:(NSUInteger)length
@@ -81,6 +129,77 @@
 	if (buffer != nil)
 		buffer->_ownsAddress = YES;
 	return buffer;
+}
+
++ (instancetype)bufferWithBytesNoCopy:(void *)pointer
+                               length:(NSUInteger)length
+                              options:(MTLResourceOptions)options
+                          deallocator:(void (^)(void *, NSUInteger))deallocator
+                               region:(RgfxRegion *)region
+                               device:(id<MTLDevice>)device
+                           serializer:(RgfxSerializer *)serializer
+{
+	if (length == 0 || !rgfxNoCopyStorage(options) || region == nullptr || serializer == nullptr)
+		return nil;
+	void (^appDeallocator)(void *, NSUInteger) = [deallocator copy];
+	// Bytes already in a block of the process's: the host sees them in place.
+	if (pointer != nullptr && region->contains(pointer, length)) {
+		void (^done)(void) = nil;
+		if (appDeallocator != nil)
+			done = ^{ appDeallocator(pointer, length); };
+		return [RgfxBuffer bufferOverHostMemoryWithContents:pointer
+		                                      regionOffset:region->offsetOf(pointer)
+		                                            length:length
+		                                           options:options
+		                                       deallocator:done
+		                                            device:device
+		                                        serializer:serializer];
+	}
+	bool writable = true;
+	if (pointer != nullptr && !rgfxMappedReadable(pointer, length, &writable))
+		return nil;
+	RgfxRegion::Block block = region->allocate(length);
+	if (!block.ok)
+		return nil;
+	uint8_t *bytes = const_cast<uint8_t *>(block.ptr);
+	std::shared_ptr<RgfxMemoryShadow> shadow;
+	void *contents = pointer;
+	if (pointer != nullptr) {
+		shadow = std::make_shared<RgfxMemoryShadow>(pointer, bytes, length, writable);
+		if (!shadow->ok()) {
+			region->release(block.offset);
+			return nil;
+		}
+	} else {
+		// No memory of the caller's: the block is the buffer's contents, as Metal's buffer
+		// has memory of its own.
+		std::memset(bytes, 0, length);
+		contents = bytes;
+	}
+	// The block goes back once the host has dropped the buffer, then the caller's memory.
+	const uint64_t offset = block.offset;
+	RgfxBuffer *buffer = [RgfxBuffer bufferOverHostMemoryWithContents:contents
+	                                                     regionOffset:offset
+	                                                           length:length
+	                                                          options:options
+	                                                      deallocator:^{
+		                                                      region->release(offset);
+		                                                      if (appDeallocator != nil)
+			                                                      appDeallocator(pointer, length);
+	                                                      }
+	                                                           device:device
+	                                                       serializer:serializer];
+	if (buffer == nil) {
+		region->release(offset); // no buffer lies over the block
+		return nil;
+	}
+	buffer->_shadow = std::move(shadow);
+	return buffer;
+}
+
+- (std::shared_ptr<RgfxMemoryShadow>)rgfxShadow
+{
+	return _shadow;
 }
 
 - (instancetype)initWithObjId:(uint64_t)objId
@@ -206,6 +325,9 @@
 	    range.length == 0) {
 		return;
 	}
+	// A no-copy buffer's CPU copy is the app's memory: the block takes its bytes first.
+	if (_shadow != nullptr)
+		_shadow->syncIn();
 	_serializer->bufferDidModifyRange([self rgfxObjId], range.location, range.length);
 }
 
@@ -263,3 +385,13 @@
 }
 
 @end
+
+std::shared_ptr<RgfxMemoryShadow> rgfxShadowOf(id resource)
+{
+	// A texture's bytes are its buffer's, through every view between (RgfxTexture's -buffer).
+	if ([resource isKindOfClass:[RgfxTexture class]])
+		resource = [(RgfxTexture *)resource buffer];
+	if ([resource isKindOfClass:[RgfxBuffer class]])
+		return [(RgfxBuffer *)resource rgfxShadow];
+	return nullptr;
+}

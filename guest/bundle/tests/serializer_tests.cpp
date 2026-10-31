@@ -23,6 +23,7 @@
 #include "RgfxEncoder.hpp"
 #include "RgfxHeapRanges.hpp"
 #include "RgfxLibraryKey.hpp"
+#include "RgfxMemoryShadow.hpp"
 #include "RgfxObjectModel.hpp"
 #include <chrono>
 #include <thread>
@@ -1422,6 +1423,77 @@ void test_heap_texture_size_query()
 	CHECK(!ser.heapTextureSizeAndAlign(desc, &size, &align) && asker.calls == 3);
 }
 
+// A no-copy buffer's block and the app's memory (RgfxMemoryShadow): the block starts as the
+// memory; each sync moves the bytes one side changed since the two last agreed, byte by byte,
+// so a CPU write and a GPU write beside it in one word both stand; memory mapped read-only is
+// never written; the encoder's notes sync each shadow once and keep the ones written.
+void test_memory_shadow()
+{
+	CHECK(!RgfxMemoryShadow::anyLive());
+	const size_t n = 0x3003; // a tail past the last whole word and chunk
+	std::vector<uint8_t> app(n), block(n, 0xee);
+	for (size_t i = 0; i < n; i++)
+		app[i] = static_cast<uint8_t>(i * 7);
+	{
+		auto s = std::make_shared<RgfxMemoryShadow>(app.data(), block.data(), n, true);
+		CHECK(s->ok() && s->length() == n && s->writable() && RgfxMemoryShadow::anyLive());
+		CHECK(block == app);
+
+		// The CPU writes; the GPU writes elsewhere, before the commit's sync.
+		app[0x10] = 0xa1;
+		std::memset(&app[0x1000], 0xa2, 8); // a whole word
+		app[0x3002] = 0xa3;                 // the tail
+		block[0x2000] = 0xb1;               // a GPU write not yet written back
+		block[0x400] = 0xb2;
+		app[0x401] = 0xa4; // beside it, in the same word
+		s->syncIn();
+		CHECK(block[0x10] == 0xa1 && block[0x1000] == 0xa2 && block[0x1007] == 0xa2);
+		CHECK(block[0x3002] == 0xa3 && block[0x401] == 0xa4);
+		CHECK(block[0x2000] == 0xb1 && block[0x400] == 0xb2); // the GPU's stay
+		CHECK(app[0x2000] == static_cast<uint8_t>(0x2000 * 7));
+
+		// The completion writes the GPU's back, and keeps a CPU write made meanwhile.
+		app[0x402] = 0xa5;
+		s->writeBack();
+		CHECK(app[0x2000] == 0xb1 && app[0x400] == 0xb2 && app[0x401] == 0xa4);
+		CHECK(app[0x402] == 0xa5 && block[0x402] == static_cast<uint8_t>(0x402 * 7));
+		s->syncIn();
+		CHECK(block == app);
+		s->writeBack();
+		CHECK(block == app);
+	}
+	CHECK(!RgfxMemoryShadow::anyLive());
+
+	// Read-only memory: synced in, never written.
+	std::vector<uint8_t> ro(64, 3), roBlock(64, 0);
+	auto r = std::make_shared<RgfxMemoryShadow>(ro.data(), roBlock.data(), ro.size(), false);
+	CHECK(!r->writable() && roBlock == ro);
+	roBlock[5] = 9;
+	r->writeBack();
+	CHECK(ro[5] == 3);
+
+	// The notes: each shadow synced once, the ones any use writes kept.
+	std::vector<uint8_t> a2(16, 1), b2(16, 2), aBlock(16), bBlock(16);
+	auto a = std::make_shared<RgfxMemoryShadow>(a2.data(), aBlock.data(), 16, true);
+	auto b = std::make_shared<RgfxMemoryShadow>(b2.data(), bBlock.data(), 16, true);
+	TestRing ring(0x1000);
+	RgfxRingWriter writer(ring.base(), ring.dataSize, 1, TestRing::doorbell, nullptr);
+	RgfxEncoder enc(writer, 1, 2);
+	enc.noteShadowUse(a, false);
+	enc.noteShadowUse(a, false); // the same as the last: one note
+	enc.noteShadowUse(b, false);
+	enc.noteShadowUse(a, true);
+	enc.noteShadowUse(r, false);
+	std::vector<RgfxShadowUse> uses = enc.takeShadowUses();
+	CHECK(uses.size() == 4 && enc.takeShadowUses().empty());
+	a2[0] = 5;
+	b2[0] = 6;
+	std::vector<std::shared_ptr<RgfxMemoryShadow>> written = rgfxShadowsSyncIn(uses);
+	CHECK(aBlock[0] == 5 && bBlock[0] == 6);
+	CHECK(written.size() == 1 && written[0] == a);
+	CHECK(rgfxShadowsSyncIn({}).empty());
+}
+
 int main()
 {
 	test_id_space();
@@ -1441,6 +1513,7 @@ int main()
 	test_keyed_library_messages();
 	test_heap_ranges();
 	test_heap_texture_size_query();
+	test_memory_shadow();
 	std::printf("serializer_tests: OK (%d checks)\n", g_checks);
 	return 0;
 }

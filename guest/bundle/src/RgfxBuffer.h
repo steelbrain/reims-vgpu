@@ -23,6 +23,10 @@
 #import "RgfxResource.h"
 
 #ifdef __cplusplus
+#include <memory>
+
+class RgfxMemoryShadow;
+class RgfxRegion;
 class RgfxSerializer;
 #endif
 
@@ -53,6 +57,32 @@ NS_ASSUME_NONNULL_BEGIN
                                               deallocator:(nullable void (^)(void))deallocator
                                                    device:(nullable id<MTLDevice>)device
                                                serializer:(nullable RgfxSerializer *)serializer;
+
+#ifdef __cplusplus
+/// The buffer `newBufferWithBytesNoCopy:length:options:deallocator:` makes over the caller's
+/// `length` bytes at `pointer`, whose `contents` is `pointer`, with `deallocator` (may be nil)
+/// called with them once the buffer is gone from the host. Bytes in `region` (a block of the
+/// process's) the host sees in place; any others get a block of their own, the GPU's copy,
+/// synced with them at the command buffers that use the buffer (RgfxMemoryShadow.hpp). A null
+/// `pointer` is a buffer with contents of its own, zeroed, whose deallocator gets null.
+///
+/// What Metal makes, as measured (M3 Max, macOS 27, 16 KiB and, under Rosetta, 4 KiB pages):
+/// any pointer and length, at any alignment, over memory the process maps readable: malloc'd,
+/// vm_allocate'd, read-only, or a shared or private file mapping, and two buffers over the same
+/// or overlapping bytes. Nil for a length of 0 and for a range not wholly mapped; Private
+/// storage fails an assertion, where this answers nil. Nil also where `region` has no room.
++ (nullable instancetype)bufferWithBytesNoCopy:(nullable void *)pointer
+                                        length:(NSUInteger)length
+                                       options:(MTLResourceOptions)options
+                                   deallocator:(nullable void (^)(void *_Nullable, NSUInteger))deallocator
+                                        region:(nullable RgfxRegion *)region
+                                        device:(nullable id<MTLDevice>)device
+                                    serializer:(nullable RgfxSerializer *)serializer;
+
+/// The GPU's copy of app memory the buffer lies over (a no-copy buffer's outside the device
+/// region), null for any other.
+- (std::shared_ptr<RgfxMemoryShadow>)rgfxShadow;
+#endif
 
 /// Designated initialiser: wraps an already-created host buffer. `objId` and
 /// `gpuAddress` are the guest-picked values the create returned; `length` and
@@ -85,5 +115,11 @@ NS_ASSUME_NONNULL_BEGIN
 @end
 
 NS_ASSUME_NONNULL_END
+
+#ifdef __cplusplus
+/// The copy of app memory `resource` reaches: a no-copy buffer's, or that of the buffer under
+/// a texture, through its views; null for any other (or nil).
+std::shared_ptr<RgfxMemoryShadow> rgfxShadowOf(id _Nullable resource);
+#endif
 
 #endif // RGFX_BUFFER_H_

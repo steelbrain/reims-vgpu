@@ -604,6 +604,21 @@ at its length and a texture at the size `HEAP_TEXTURE_SIZE_AND_ALIGN` answers,
 and sends each as a placement at that offset. The heap's `usedSize` and
 `maxAvailableSizeWithAlignment:` answer from those placements.
 
+**No-copy buffers.** `newBufferWithBytesNoCopy:` over bytes in a block of the
+process's lies over them in place (`BUFFER_OVER_HOST_MEMORY` at their offset).
+Metal makes one over any range the process maps readable, at any alignment:
+malloc'd, `vm_allocate`d, read-only, or a file mapping (measured on an M3 Max,
+16 KiB and 4 KiB pages). Over such memory the buffer lies over a block of its
+own, and `contents` stays the app's pointer, since the host never reaches guest
+RAM (Decided 5). The block syncs with the memory as the IOSurface copies do
+(Decided 14): from the memory before the commit of each command buffer that uses
+the buffer, and back to it as one that may write it completes, before its
+completion is reported. Each side's bytes that moved since the two last agreed go
+to the other, byte by byte, so CPU and GPU writes beside each other both stand
+(`guest/bundle/src/RgfxMemoryShadow.hpp`). A GPU write shows in the memory at
+its command buffer's completion, not as it runs, and memory mapped read-only is
+never written back.
+
 **Managed storage** (Decided 4). A Managed buffer's or texture's CPU copy is a
 region block of its process's, which the guest maps, and the host decides the
 form from the platform's answer of whether the GPU shares the CPU's memory:

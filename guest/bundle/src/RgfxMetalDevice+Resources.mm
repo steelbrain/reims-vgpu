@@ -135,29 +135,15 @@ bool rgfxIsManagedStorage(MTLResourceOptions options)
                                   options:(MTLResourceOptions)options
                               deallocator:(void (^)(void *, NSUInteger))deallocator
 {
-	// No-copy wraps the caller's pages as the buffer's backing, which the host sees in
-	// place only when those pages already lie in the device region (a buffer the caller
-	// allocated from our region). Then we wrap them via createBufferOverHostMemory at
-	// their offset and call the caller's deallocator when the buffer dies. Pages outside
-	// the region cannot be aliased into the host's view without a copy, which would break
-	// the caller's aliasing contract, so those still return nil (a documented limitation).
-	RgfxRegion *region = [self region];
-	if (region == nullptr || pointer == nullptr || !region->contains(pointer, length)) {
-		(void)deallocator;
-		return nil;
-	}
-	uint64_t offset = region->offsetOf(pointer);
-	void (^wrapped)(void) = nil;
-	if (deallocator != nil) {
-		wrapped = ^{ deallocator(pointer, length); };
-	}
-	return [RgfxBuffer bufferOverHostMemoryWithContents:pointer
-	                                      regionOffset:offset
-	                                            length:length
-	                                           options:options
-	                                       deallocator:wrapped
-	                                            device:self
-	                                        serializer:[self serializer]];
+	// Over the caller's bytes in place where they lie in a block of ours, else over a block of
+	// their own synced with them (RgfxBuffer.h).
+	return [RgfxBuffer bufferWithBytesNoCopy:pointer
+	                                  length:length
+	                                 options:options
+	                             deallocator:deallocator
+	                                  region:[self region]
+	                                  device:self
+	                              serializer:[self serializer]];
 }
 
 // --- textures ----------------------------------------------------------------

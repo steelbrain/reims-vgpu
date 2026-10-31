@@ -48,6 +48,7 @@
 
 #include <IOSurface/IOSurface.h>
 
+#include <mach/mach.h>
 #include <pthread.h>
 
 #include <atomic>
@@ -60,6 +61,7 @@
 #include "RgfxCompletionThread.hpp"
 #include "RgfxFunctionConstants.hpp"
 #include "RgfxManagedLayout.hpp"
+#include "RgfxMemoryShadow.hpp"
 #include "RgfxObjectModel.hpp"
 #include "RgfxRetirement.hpp"
 #include "RgfxRegion.hpp"
@@ -3014,6 +3016,202 @@ bool retirementIdle()
 {
 	return RgfxRetirement::process().waiting() == 0 && RgfxRetirement::process().live() == 0;
 }
+// newBufferWithBytesNoCopy: over app memory outside the region (RgfxBuffer.h): `contents` is the
+// app's pointer and the buffer lies over a block of its own, seeded from the memory. A command
+// buffer that uses it takes the CPU's writes into the block at its commit, and one that may write
+// it gives the GPU's back at its completion, keeping the CPU's beside them; one that only reads
+// it gives nothing back, nor does memory mapped read-only. A texture over it (CA's shape: offset
+// 0x100, 1920-byte rows) writes through it. The deallocator gets the pointer and length once the
+// host has dropped the buffer. Metal's refusals are nil: a length of 0, Private storage, a range
+// not wholly mapped. A null pointer is contents of the buffer's own; bytes in the region are
+// used in place.
+void test_no_copy_buffers()
+{
+	CHECK(retirementIdle());
+	@autoreleasepool {
+	QueueFixture f;
+	(void)expectQueueCreate(f.control);
+	std::vector<uint8_t> mem(RGFX_ALLOCATIONS_OFFSET + 0x200000, 0xff);
+	RgfxRegion region(mem.data(), mem.size());
+	const MTLResourceOptions shared = MTLResourceStorageModeShared;
+	vm_address_t app = 0;
+	CHECK(vm_allocate(mach_task_self(), &app, 0x40000, VM_FLAGS_ANYWHERE) == KERN_SUCCESS);
+	uint8_t *p = reinterpret_cast<uint8_t *>(app);
+	std::memset(p, 0x11, 0x40000);
+	// What the deallocator got, which a block writes and a lambda reads.
+	struct Freed {
+		std::atomic<int> count{0};
+		void *at = nullptr;
+		NSUInteger length = 0;
+	} freedState;
+	Freed *freedLog = &freedState;
+	auto completeOn = [&](id<MTLCommandBuffer> cb) {
+		RgfxCbComplete done = cbComplete(f.nextSeqno(), ((RgfxResource *)cb).rgfxObjId);
+		CHECK(f.completion.postFromHost(&done, sizeof(done)));
+		[cb waitUntilCompleted];
+		CHECK(cb.status == MTLCommandBufferStatusCompleted);
+	};
+	uint8_t *block = nullptr;
+	@autoreleasepool {
+		RgfxBuffer *b = [RgfxBuffer bufferWithBytesNoCopy:p
+		                                           length:0x14000
+		                                          options:shared
+		                                      deallocator:^(void *q, NSUInteger l) {
+			                                      freedLog->at = q;
+			                                      freedLog->length = l;
+			                                      freedLog->count++;
+		                                      }
+		                                           region:&region
+		                                           device:nil
+		                                       serializer:&f.ser];
+		CHECK(b != nil && [b contents] == p && b.length == 0x14000 && [b rgfxShadow] != nullptr);
+		auto create =
+		    expectMessage<RgfxBufferOverHostMemory>(f.control, RGFX_CMD_BUFFER_OVER_HOST_MEMORY);
+		CHECK(create.obj_id == b.rgfxObjId && create.length == 0x14000);
+		CHECK(create.region_offset >= region.floor());
+		block = mem.data() + create.region_offset;
+		CHECK(std::memcmp(block, p, 0x14000) == 0);
+
+		// A writing command buffer: the CPU's bytes go in at the commit.
+		p[0x10] = 0xa1;
+		p[0x13fff] = 0xa2;
+		id<MTLCommandBuffer> cb = [f.queue commandBuffer];
+		id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+		[blit fillBuffer:b range:NSMakeRange(0x8000, 0x100) value:0x77];
+		[blit endEncoding];
+		[cb commit];
+		CHECK(block[0x10] == 0xa1 && block[0x13fff] == 0xa2);
+		// The host fills; the CPU writes beside it meanwhile.
+		std::memset(block + 0x8000, 0x77, 0x100);
+		p[0x8100] = 0xa3;
+		CHECK(p[0x8000] == 0x11);
+		completeOn(cb);
+		CHECK(p[0x8000] == 0x77 && p[0x80ff] == 0x77 && p[0x8100] == 0xa3 && p[0x10] == 0xa1);
+
+		// One that only reads it gives nothing back.
+		RgfxRegion::Block other = region.allocate(0x1000);
+		RgfxBuffer *dst = [RgfxBuffer bufferOverHostMemoryWithContents:const_cast<uint8_t *>(other.ptr)
+		                                                  regionOffset:other.offset
+		                                                        length:0x1000
+		                                                       options:shared
+		                                                   deallocator:nil
+		                                                        device:nil
+		                                                    serializer:&f.ser];
+		id<MTLCommandBuffer> reads = [f.queue commandBuffer];
+		blit = [reads blitCommandEncoder];
+		[blit copyFromBuffer:b sourceOffset:0 toBuffer:dst destinationOffset:0 size:0x100];
+		[blit endEncoding];
+		[reads commit];
+		block[0x9000] = 0xb1; // not this buffer's to give back
+		completeOn(reads);
+		CHECK(p[0x9000] == 0x11);
+		block[0x9000] = 0x11;
+
+		// A texture over it, CA's shape, as a blit's destination.
+		MTLTextureDescriptor *td =
+		    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+		                                                       width:468
+		                                                      height:36
+		                                                   mipmapped:NO];
+		td.storageMode = MTLStorageModeShared;
+		id<MTLTexture> tex = [b newTextureWithDescriptor:td offset:0x100 bytesPerRow:1920];
+		CHECK(tex != nil && tex.buffer == b);
+		id<MTLCommandBuffer> draws = [f.queue commandBuffer];
+		blit = [draws blitCommandEncoder];
+		[blit copyFromBuffer:dst
+		           sourceOffset:0
+		      sourceBytesPerRow:1920
+		    sourceBytesPerImage:1920
+		             sourceSize:MTLSizeMake(4, 1, 1)
+		              toTexture:tex
+		       destinationSlice:0
+		       destinationLevel:0
+		      destinationOrigin:MTLOriginMake(0, 0, 0)];
+		[blit endEncoding];
+		[draws commit];
+		block[0x100] = 0xc1;
+		completeOn(draws);
+		CHECK(p[0x100] == 0xc1);
+		tex = nil;
+		dst = nil;
+		CHECK(freedState.count == 0);
+	}
+	CHECK(eventually([&] { return freedState.count == 1; }));
+	CHECK(freedState.at == p && freedState.length == 0x14000);
+
+	drainRing(f.control);
+
+	// Metal's refusals.
+	auto noCopy = [&](void *ptr, NSUInteger length, MTLResourceOptions options) {
+		return [RgfxBuffer bufferWithBytesNoCopy:ptr
+		                                  length:length
+		                                 options:options
+		                             deallocator:nil
+		                                  region:&region
+		                                  device:nil
+		                              serializer:&f.ser];
+	};
+	CHECK(noCopy(p, 0, shared) == nil);
+	CHECK(noCopy(p, 0x1000, MTLResourceStorageModePrivate) == nil);
+	vm_address_t holed = 0;
+	CHECK(vm_allocate(mach_task_self(), &holed, 0x10000, VM_FLAGS_ANYWHERE) == KERN_SUCCESS);
+	CHECK(vm_deallocate(mach_task_self(), holed + 0x8000, 0x8000) == KERN_SUCCESS);
+	CHECK(noCopy(reinterpret_cast<void *>(holed + 0x10), 0x8000, shared) == nil);
+	@autoreleasepool {
+		// Any alignment, Managed too: its didModifyRange: takes the CPU's bytes first.
+		RgfxBuffer *odd = noCopy(reinterpret_cast<void *>(holed + 0x13), 0x100,
+		                         MTLResourceStorageModeManaged);
+		CHECK(odd != nil && [odd contents] == reinterpret_cast<void *>(holed + 0x13));
+		auto c = expectMessage<RgfxBufferOverHostMemory>(f.control, RGFX_CMD_BUFFER_OVER_HOST_MEMORY);
+		reinterpret_cast<uint8_t *>(holed)[0x14] = 0xd1;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+		[odd didModifyRange:NSMakeRange(1, 1)];
+#pragma clang diagnostic pop
+		CHECK(mem[c.region_offset + 1] == 0xd1);
+		auto range =
+		    expectMessage<RgfxBufferDidModifyRange>(f.control, RGFX_CMD_BUFFER_DID_MODIFY_RANGE);
+		CHECK(range.obj_id == odd.rgfxObjId && range.location == 1 && range.length == 1);
+
+		// Read-only memory: made, never written back.
+		CHECK(vm_protect(mach_task_self(), holed, 0x4000, false, VM_PROT_READ) == KERN_SUCCESS);
+		RgfxBuffer *ro = noCopy(reinterpret_cast<void *>(holed), 0x4000, shared);
+		CHECK(ro != nil && [ro rgfxShadow] != nullptr && ![ro rgfxShadow]->writable());
+
+		// A null pointer: zeroed contents of its own, in the region, with no shadow. The
+		// deallocator gets null.
+		std::atomic<void *> nullFreedState{reinterpret_cast<void *>(1)};
+		std::atomic<void *> *nullFreed = &nullFreedState;
+		@autoreleasepool {
+			RgfxBuffer *own = [RgfxBuffer bufferWithBytesNoCopy:nullptr
+			                                             length:0x2000
+			                                            options:shared
+			                                        deallocator:^(void *q, NSUInteger) {
+				                                        nullFreed->store(q);
+			                                        }
+			                                             region:&region
+			                                             device:nil
+			                                         serializer:&f.ser];
+			CHECK(own != nil && [own rgfxShadow] == nullptr &&
+			      region.contains([own contents], 0x2000));
+			CHECK(static_cast<uint8_t *>([own contents])[0x1fff] == 0);
+		}
+		CHECK(eventually([&] { return nullFreedState.load() == nullptr; }));
+
+		// Bytes already in the region: in place.
+		RgfxRegion::Block inRegion = region.allocate(0x1000);
+		RgfxBuffer *placed = noCopy(const_cast<uint8_t *>(inRegion.ptr), 0x1000, shared);
+		CHECK(placed != nil && [placed rgfxShadow] == nullptr);
+		drainRing(f.control);
+		(void)ro;
+	}
+	drainRing(f.control);
+	vm_deallocate(mach_task_self(), holed, 0x8000);
+	vm_deallocate(mach_task_self(), app, 0x40000);
+	}
+	CHECK(!RgfxMemoryShadow::anyLive());
+}
+
 
 // A Managed texture's CPU copy goes with it: the texture's destroy, then its copy's buffer's,
 // then the copy's block goes back.
@@ -4435,6 +4633,7 @@ int main()
 		test_automatic_heap_places_as_metal();
 		test_automatic_shared_heap_buffers_are_its_bytes();
 		test_managed_texture_copy_block_after_destroys();
+		test_no_copy_buffers();
 		rgfxProtocolTests(); // tests/protocol_tests.mm
 		rgfxArchiveTests();  // tests/archive_tests.mm
 	}

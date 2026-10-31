@@ -40,6 +40,7 @@
  */
 
 #import "RgfxCommandObjects.h"
+#import "RgfxBuffer.h"
 #import "RgfxFence.h"
 #import "RgfxIOSurface.h"
 #import "RgfxUnsupported.h"
@@ -53,6 +54,7 @@
 
 #include "RgfxCompletionThread.hpp"
 #include "RgfxEncoder.hpp"
+#include "RgfxMemoryShadow.hpp"
 #include "RgfxObjectModel.hpp"
 #include "RgfxRegion.hpp"
 #include "RgfxReplyReader.hpp"
@@ -138,6 +140,53 @@ uint64_t rgfxId(id obj)
 	return 0;
 }
 
+/// Records on `enc` that its command buffer uses the copy of app memory `obj` reaches, if any
+/// (rgfxShadowOf: a no-copy buffer's, or a texture's over one), which its commit syncs in and,
+/// where it `writes`, its completion writes back.
+void rgfxNoteShadowUse(RgfxEncoder *enc, id obj, bool writes)
+{
+	if (enc == nullptr || obj == nil || !RgfxMemoryShadow::anyLive())
+		return;
+	if (std::shared_ptr<RgfxMemoryShadow> shadow = rgfxShadowOf(obj))
+		enc->noteShadowUse(shadow, writes);
+}
+
+/// rgfxId of a resource the command buffer only reads (a blit's source, an index or indirect
+/// buffer).
+uint64_t rgfxReads(RgfxEncoder *enc, id obj)
+{
+	rgfxNoteShadowUse(enc, obj, false);
+	return rgfxId(obj);
+}
+
+/// rgfxId of a resource the command buffer writes (a blit's destination, a fill, a synchronize,
+/// a render attachment).
+uint64_t rgfxWrites(RgfxEncoder *enc, id obj)
+{
+	rgfxNoteShadowUse(enc, obj, true);
+	return rgfxId(obj);
+}
+
+/// rgfxId of a resource bound to a shader, which may write a buffer, and a texture whose usage
+/// has ShaderWrite.
+uint64_t rgfxBinds(RgfxEncoder *enc, id obj)
+{
+	if (enc != nullptr && obj != nil && RgfxMemoryShadow::anyLive()) {
+		const bool writes = ![obj conformsToProtocol:@protocol(MTLTexture)] ||
+		                    ([(id<MTLTexture>)obj usage] & MTLTextureUsageShaderWrite) != 0;
+		rgfxNoteShadowUse(enc, obj, writes);
+	}
+	return rgfxId(obj);
+}
+
+/// rgfxId of a resource used with `usage` (useResource:usage:), which writes it where the usage
+/// has Write.
+uint64_t rgfxUses(RgfxEncoder *enc, id obj, MTLResourceUsage usage)
+{
+	rgfxNoteShadowUse(enc, obj, (usage & MTLResourceUsageWrite) != 0);
+	return rgfxId(obj);
+}
+
 /// The RGFX_RESOURCE_KIND_* of a Metal resource, for the resource-reference ops.
 uint32_t rgfxResourceKind(id<MTLResource> res)
 {
@@ -206,18 +255,22 @@ void fillColor(RgfxRenderPassColorAttachment *c, MTLRenderPassColorAttachmentDes
 /// Translates an MTLRenderPassDescriptor into the wire pass descriptor and its colour
 /// attachments, returning the colour count (highest set attachment index + 1, so
 /// gaps stay as absent attachments). `colors` is filled with `count` records.
-/// Records on `enc` every IOSurface texture the pass `d` writes: its attachments and
-/// their resolve targets.
+/// Records on `enc` every texture the pass `d` writes over an IOSurface or over app memory
+/// (a no-copy buffer's): its attachments and their resolve targets.
 void noteRenderPassWrites(RgfxEncoder *enc, MTLRenderPassDescriptor *d)
 {
+	auto note = [enc](id<MTLTexture> t) {
+		rgfxIOSurfaceNoteWrite(enc, t);
+		rgfxNoteShadowUse(enc, t, true);
+	};
 	for (uint32_t i = 0; i < 8; i++) {
-		rgfxIOSurfaceNoteWrite(enc, d.colorAttachments[i].texture);
-		rgfxIOSurfaceNoteWrite(enc, d.colorAttachments[i].resolveTexture);
+		note(d.colorAttachments[i].texture);
+		note(d.colorAttachments[i].resolveTexture);
 	}
-	rgfxIOSurfaceNoteWrite(enc, d.depthAttachment.texture);
-	rgfxIOSurfaceNoteWrite(enc, d.depthAttachment.resolveTexture);
-	rgfxIOSurfaceNoteWrite(enc, d.stencilAttachment.texture);
-	rgfxIOSurfaceNoteWrite(enc, d.stencilAttachment.resolveTexture);
+	note(d.depthAttachment.texture);
+	note(d.depthAttachment.resolveTexture);
+	note(d.stencilAttachment.texture);
+	note(d.stencilAttachment.resolveTexture);
 }
 
 uint32_t fillRenderPass(MTLRenderPassDescriptor *d, RgfxRenderPassDesc *desc,
@@ -748,6 +801,9 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 	// The IOSurface copies this buffer writes, written back to their surfaces' pages
 	// when it completes (RgfxIOSurface.h).
 	std::vector<std::shared_ptr<void>> _surfaceWrites;
+	// The copies of app memory (no-copy buffers') this buffer may write, written back to the
+	// memory when it completes (RgfxMemoryShadow.hpp).
+	std::vector<std::shared_ptr<RgfxMemoryShadow>> _shadowWrites;
 	// Where its encoders' inline bytes go: chunks of the queue's upload pool, given back once
 	// the host has completed the buffer (RgfxUploads.h). The encoders share it.
 	std::shared_ptr<RgfxUploadArena> _uploads;
@@ -908,6 +964,8 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 	// completion.
 	rgfxIOSurfaceSyncBeforeCommit();
 	_surfaceWrites = _encoder->takeSurfaceWrites();
+	// So do the copies of app memory it uses, which take the bytes the CPU wrote since.
+	_shadowWrites = rgfxShadowsSyncIn(_encoder->takeShadowUses());
 	// Committed before the host can see it, so a completion never finds an older status.
 	_status.store(MTLCommandBufferStatusCommitted);
 
@@ -995,6 +1053,10 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 	// The surfaces this buffer wrote hold its results before anyone sees it complete.
 	rgfxIOSurfaceWriteBack(_surfaceWrites);
 	_surfaceWrites.clear();
+	// So does the app memory it may have written under no-copy buffers.
+	for (const std::shared_ptr<RgfxMemoryShadow> &shadow : _shadowWrites)
+		shadow->writeBack();
+	_shadowWrites.clear();
 	// The host is done with the inline bytes: their chunks go back to the queue's pool. A
 	// buffer some of whose inline bytes found no chunk ran without those bindings, so it fails.
 	const bool uploadsFailed = _uploads != nullptr && _uploads->failed();
@@ -1501,7 +1563,7 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 
 - (void)setVertexBuffer:(id<MTLBuffer>)buffer offset:(NSUInteger)offset atIndex:(NSUInteger)index
 {
-	_enc->renderSetVertexBuffer(rgfxId(buffer), offset, index);
+	_enc->renderSetVertexBuffer(rgfxBinds(_enc, buffer), offset, index);
 }
 - (void)setVertexBufferOffset:(NSUInteger)offset atIndex:(NSUInteger)index
 {
@@ -1513,7 +1575,7 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 {
 	std::vector<RgfxBufferBinding> b(range.length);
 	for (NSUInteger i = 0; i < range.length; i++) {
-		b[i].buffer_obj_id = rgfxId(buffers[i]);
+		b[i].buffer_obj_id = rgfxBinds(_enc, buffers[i]);
 		b[i].offset = offsets[i];
 	}
 	_enc->renderSetVertexBuffers(range.location, b.empty() ? nullptr : b.data(),
@@ -1525,7 +1587,7 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
                 atIndex:(NSUInteger)index
 {
 	RgfxBufferStrideBinding e = {};
-	e.buffer_obj_id = rgfxId(buffer);
+	e.buffer_obj_id = rgfxBinds(_enc, buffer);
 	e.offset = offset;
 	e.stride = stride;
 	_enc->renderSetVertexBuffersAttributeStrides(index, &e, 1);
@@ -1537,7 +1599,7 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 {
 	std::vector<RgfxBufferStrideBinding> b(range.length);
 	for (NSUInteger i = 0; i < range.length; i++) {
-		b[i].buffer_obj_id = rgfxId(buffers[i]);
+		b[i].buffer_obj_id = rgfxBinds(_enc, buffers[i]);
 		b[i].offset = offsets[i];
 		b[i].stride = strides[i];
 	}
@@ -1553,14 +1615,14 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 - (void)setVertexTexture:(id<MTLTexture>)texture atIndex:(NSUInteger)index
 {
 	RgfxTextureBinding e = {};
-	e.texture_obj_id = rgfxId(texture);
+	e.texture_obj_id = rgfxBinds(_enc, texture);
 	_enc->renderSetVertexTextures(index, &e, 1);
 }
 - (void)setVertexTextures:(const id<MTLTexture> __nullable [__nonnull])textures withRange:(NSRange)range
 {
 	std::vector<RgfxTextureBinding> t(range.length);
 	for (NSUInteger i = 0; i < range.length; i++) {
-		t[i].texture_obj_id = rgfxId(textures[i]);
+		t[i].texture_obj_id = rgfxBinds(_enc, textures[i]);
 	}
 	_enc->renderSetVertexTextures(range.location, t.empty() ? nullptr : t.data(),
 	                              static_cast<uint32_t>(range.length));
@@ -1611,7 +1673,7 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 
 - (void)setFragmentBuffer:(id<MTLBuffer>)buffer offset:(NSUInteger)offset atIndex:(NSUInteger)index
 {
-	_enc->renderSetFragmentBuffer(rgfxId(buffer), offset, index);
+	_enc->renderSetFragmentBuffer(rgfxBinds(_enc, buffer), offset, index);
 }
 - (void)setFragmentBufferOffset:(NSUInteger)offset atIndex:(NSUInteger)index
 {
@@ -1623,7 +1685,7 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 {
 	std::vector<RgfxBufferBinding> b(range.length);
 	for (NSUInteger i = 0; i < range.length; i++) {
-		b[i].buffer_obj_id = rgfxId(buffers[i]);
+		b[i].buffer_obj_id = rgfxBinds(_enc, buffers[i]);
 		b[i].offset = offsets[i];
 	}
 	_enc->renderSetFragmentBuffers(range.location, b.empty() ? nullptr : b.data(),
@@ -1631,13 +1693,13 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 }
 - (void)setFragmentTexture:(id<MTLTexture>)texture atIndex:(NSUInteger)index
 {
-	_enc->renderSetFragmentTexture(rgfxId(texture), index);
+	_enc->renderSetFragmentTexture(rgfxBinds(_enc, texture), index);
 }
 - (void)setFragmentTextures:(const id<MTLTexture> __nullable [__nonnull])textures withRange:(NSRange)range
 {
 	std::vector<RgfxTextureBinding> t(range.length);
 	for (NSUInteger i = 0; i < range.length; i++) {
-		t[i].texture_obj_id = rgfxId(textures[i]);
+		t[i].texture_obj_id = rgfxBinds(_enc, textures[i]);
 	}
 	_enc->renderSetFragmentTextures(range.location, t.empty() ? nullptr : t.data(),
 	                                static_cast<uint32_t>(range.length));
@@ -1689,7 +1751,7 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 - (void)setTileBuffer:(id<MTLBuffer>)buffer offset:(NSUInteger)offset atIndex:(NSUInteger)index
 {
 	RgfxBufferBinding e = {};
-	e.buffer_obj_id = rgfxId(buffer);
+	e.buffer_obj_id = rgfxBinds(_enc, buffer);
 	e.offset = offset;
 	_enc->renderSetTileBuffers(index, &e, 1);
 }
@@ -1703,7 +1765,7 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 {
 	std::vector<RgfxBufferBinding> b(range.length);
 	for (NSUInteger i = 0; i < range.length; i++) {
-		b[i].buffer_obj_id = rgfxId(buffers[i]);
+		b[i].buffer_obj_id = rgfxBinds(_enc, buffers[i]);
 		b[i].offset = offsets[i];
 	}
 	_enc->renderSetTileBuffers(range.location, b.empty() ? nullptr : b.data(),
@@ -1712,14 +1774,14 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 - (void)setTileTexture:(id<MTLTexture>)texture atIndex:(NSUInteger)index
 {
 	RgfxTextureBinding e = {};
-	e.texture_obj_id = rgfxId(texture);
+	e.texture_obj_id = rgfxBinds(_enc, texture);
 	_enc->renderSetTileTextures(index, &e, 1);
 }
 - (void)setTileTextures:(const id<MTLTexture> __nullable [__nonnull])textures withRange:(NSRange)range
 {
 	std::vector<RgfxTextureBinding> t(range.length);
 	for (NSUInteger i = 0; i < range.length; i++) {
-		t[i].texture_obj_id = rgfxId(textures[i]);
+		t[i].texture_obj_id = rgfxBinds(_enc, textures[i]);
 	}
 	_enc->renderSetTileTextures(range.location, t.empty() ? nullptr : t.data(),
 	                            static_cast<uint32_t>(range.length));
@@ -1782,7 +1844,7 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
                              offset:(NSUInteger)offset
                      instanceStride:(NSUInteger)instanceStride
 {
-	_enc->renderSetTessellationFactorBuffer(rgfxId(buffer), offset, instanceStride);
+	_enc->renderSetTessellationFactorBuffer(rgfxReads(_enc, buffer), offset, instanceStride);
 }
 - (void)setTessellationFactorScale:(float)scale
 {
@@ -1819,7 +1881,7 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
   indirectBufferOffset:(NSUInteger)indirectBufferOffset
 {
 	_enc->renderDrawPrimitivesIndirect(static_cast<uint64_t>(primitiveType),
-	                                   rgfxId(indirectBuffer), indirectBufferOffset);
+	                                   rgfxReads(_enc, indirectBuffer), indirectBufferOffset);
 }
 - (void)drawIndexedPrimitives:(MTLPrimitiveType)primitiveType
                    indexCount:(NSUInteger)indexCount
@@ -1828,7 +1890,7 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
             indexBufferOffset:(NSUInteger)indexBufferOffset
 {
 	_enc->renderDrawIndexedPrimitives(static_cast<uint64_t>(primitiveType), indexCount,
-	                                  static_cast<uint64_t>(indexType), rgfxId(indexBuffer),
+	                                  static_cast<uint64_t>(indexType), rgfxReads(_enc, indexBuffer),
 	                                  indexBufferOffset);
 }
 - (void)drawIndexedPrimitives:(MTLPrimitiveType)primitiveType
@@ -1839,7 +1901,7 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
                 instanceCount:(NSUInteger)instanceCount
 {
 	_enc->renderDrawIndexedPrimitivesInstances(static_cast<uint64_t>(primitiveType), indexCount,
-	                                           static_cast<uint64_t>(indexType), rgfxId(indexBuffer),
+	                                           static_cast<uint64_t>(indexType), rgfxReads(_enc, indexBuffer),
 	                                           indexBufferOffset, instanceCount);
 }
 - (void)drawIndexedPrimitives:(MTLPrimitiveType)primitiveType
@@ -1852,7 +1914,7 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
                  baseInstance:(NSUInteger)baseInstance
 {
 	_enc->renderDrawIndexedPrimitivesBase(static_cast<uint64_t>(primitiveType), indexCount,
-	                                      static_cast<uint64_t>(indexType), rgfxId(indexBuffer),
+	                                      static_cast<uint64_t>(indexType), rgfxReads(_enc, indexBuffer),
 	                                      indexBufferOffset, instanceCount,
 	                                      static_cast<int64_t>(baseVertex), baseInstance);
 }
@@ -1864,8 +1926,8 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
          indirectBufferOffset:(NSUInteger)indirectBufferOffset
 {
 	_enc->renderDrawIndexedPrimitivesIndirect(static_cast<uint64_t>(primitiveType),
-	                                          static_cast<uint64_t>(indexType), rgfxId(indexBuffer),
-	                                          indexBufferOffset, rgfxId(indirectBuffer),
+	                                          static_cast<uint64_t>(indexType), rgfxReads(_enc, indexBuffer),
+	                                          indexBufferOffset, rgfxReads(_enc, indirectBuffer),
 	                                          indirectBufferOffset);
 }
 
@@ -1880,7 +1942,7 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
               baseInstance:(NSUInteger)baseInstance
 {
 	_enc->renderDrawPatches(numberOfPatchControlPoints, patchStart, patchCount,
-	                        rgfxId(patchIndexBuffer), patchIndexBufferOffset, instanceCount,
+	                        rgfxReads(_enc, patchIndexBuffer), patchIndexBufferOffset, instanceCount,
 	                        baseInstance);
 }
 - (void)drawPatches:(NSUInteger)numberOfPatchControlPoints
@@ -1889,8 +1951,8 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
             indirectBuffer:(id<MTLBuffer>)indirectBuffer
       indirectBufferOffset:(NSUInteger)indirectBufferOffset
 {
-	_enc->renderDrawPatchesIndirect(numberOfPatchControlPoints, rgfxId(patchIndexBuffer),
-	                                patchIndexBufferOffset, rgfxId(indirectBuffer),
+	_enc->renderDrawPatchesIndirect(numberOfPatchControlPoints, rgfxReads(_enc, patchIndexBuffer),
+	                                patchIndexBufferOffset, rgfxReads(_enc, indirectBuffer),
 	                                indirectBufferOffset);
 }
 - (void)drawIndexedPatches:(NSUInteger)numberOfPatchControlPoints
@@ -1904,8 +1966,8 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
                    baseInstance:(NSUInteger)baseInstance
 {
 	_enc->renderDrawIndexedPatches(numberOfPatchControlPoints, patchStart, patchCount,
-	                               rgfxId(patchIndexBuffer), patchIndexBufferOffset,
-	                               rgfxId(controlPointIndexBuffer),
+	                               rgfxReads(_enc, patchIndexBuffer), patchIndexBufferOffset,
+	                               rgfxReads(_enc, controlPointIndexBuffer),
 	                               controlPointIndexBufferOffset, instanceCount, baseInstance);
 }
 - (void)drawIndexedPatches:(NSUInteger)numberOfPatchControlPoints
@@ -1916,9 +1978,9 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
                  indirectBuffer:(id<MTLBuffer>)indirectBuffer
            indirectBufferOffset:(NSUInteger)indirectBufferOffset
 {
-	_enc->renderDrawIndexedPatchesIndirect(numberOfPatchControlPoints, rgfxId(patchIndexBuffer),
-	                                       patchIndexBufferOffset, rgfxId(controlPointIndexBuffer),
-	                                       controlPointIndexBufferOffset, rgfxId(indirectBuffer),
+	_enc->renderDrawIndexedPatchesIndirect(numberOfPatchControlPoints, rgfxReads(_enc, patchIndexBuffer),
+	                                       patchIndexBufferOffset, rgfxReads(_enc, controlPointIndexBuffer),
+	                                       controlPointIndexBufferOffset, rgfxReads(_enc, indirectBuffer),
 	                                       indirectBufferOffset);
 }
 
@@ -1935,7 +1997,7 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 - (void)useResource:(id<MTLResource>)resource usage:(MTLResourceUsage)usage
 {
 	RgfxResourceBinding e = {};
-	e.obj_id = rgfxId(resource);
+	e.obj_id = rgfxUses(_enc, resource, usage);
 	e.kind = rgfxResourceKind(resource);
 	_enc->renderUseResources(&e, 1, static_cast<uint64_t>(usage));
 }
@@ -1945,7 +2007,7 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 {
 	std::vector<RgfxResourceBinding> r(count);
 	for (NSUInteger i = 0; i < count; i++) {
-		r[i].obj_id = rgfxId(resources[i]);
+		r[i].obj_id = rgfxUses(_enc, resources[i], usage);
 		r[i].kind = rgfxResourceKind(resources[i]);
 	}
 	_enc->renderUseResources(r.empty() ? nullptr : r.data(), static_cast<uint32_t>(count),
@@ -1956,7 +2018,7 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
              stages:(MTLRenderStages)stages
 {
 	RgfxResourceBinding e = {};
-	e.obj_id = rgfxId(resource);
+	e.obj_id = rgfxUses(_enc, resource, usage);
 	e.kind = rgfxResourceKind(resource);
 	_enc->renderUseResourcesStages(&e, 1, static_cast<uint64_t>(usage),
 	                               static_cast<uint64_t>(stages));
@@ -1968,7 +2030,7 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 {
 	std::vector<RgfxResourceBinding> r(count);
 	for (NSUInteger i = 0; i < count; i++) {
-		r[i].obj_id = rgfxId(resources[i]);
+		r[i].obj_id = rgfxUses(_enc, resources[i], usage);
 		r[i].kind = rgfxResourceKind(resources[i]);
 	}
 	_enc->renderUseResourcesStages(r.empty() ? nullptr : r.data(), static_cast<uint32_t>(count),
@@ -2015,7 +2077,7 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
                  indirectBuffer:(id<MTLBuffer>)indirectRangeBuffer
            indirectBufferOffset:(NSUInteger)indirectBufferOffset
 {
-	_enc->renderExecuteCommandsIndirect(rgfxId(indirectCommandbuffer), rgfxId(indirectRangeBuffer),
+	_enc->renderExecuteCommandsIndirect(rgfxId(indirectCommandbuffer), rgfxReads(_enc, indirectRangeBuffer),
 	                                    indirectBufferOffset);
 }
 
@@ -2471,7 +2533,7 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 - (void)setBuffer:(id<MTLBuffer>)buffer offset:(NSUInteger)offset atIndex:(NSUInteger)index
 {
 	RgfxComputeBufferBinding e = {};
-	e.buffer_obj_id = rgfxId(buffer);
+	e.buffer_obj_id = rgfxBinds(_enc, buffer);
 	e.offset = offset;
 	_enc->computeSetBuffers(index, &e, 1);
 }
@@ -2485,7 +2547,7 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 {
 	std::vector<RgfxComputeBufferBinding> b(range.length);
 	for (NSUInteger i = 0; i < range.length; i++) {
-		b[i].buffer_obj_id = rgfxId(buffers[i]);
+		b[i].buffer_obj_id = rgfxBinds(_enc, buffers[i]);
 		b[i].offset = offsets[i];
 	}
 	_enc->computeSetBuffers(range.location, b.empty() ? nullptr : b.data(),
@@ -2497,7 +2559,7 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
          atIndex:(NSUInteger)index
 {
 	RgfxComputeBufferStrideBinding e = {};
-	e.buffer_obj_id = rgfxId(buffer);
+	e.buffer_obj_id = rgfxBinds(_enc, buffer);
 	e.offset = offset;
 	e.stride = stride;
 	_enc->computeSetBuffersAttributeStrides(index, &e, 1);
@@ -2509,7 +2571,7 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 {
 	std::vector<RgfxComputeBufferStrideBinding> b(range.length);
 	for (NSUInteger i = 0; i < range.length; i++) {
-		b[i].buffer_obj_id = rgfxId(buffers[i]);
+		b[i].buffer_obj_id = rgfxBinds(_enc, buffers[i]);
 		b[i].offset = offsets[i];
 		b[i].stride = strides[i];
 	}
@@ -2525,14 +2587,14 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 - (void)setTexture:(id<MTLTexture>)texture atIndex:(NSUInteger)index
 {
 	rgfxIOSurfaceNoteShaderWrite(_enc, texture);
-	_enc->computeSetTexture(rgfxId(texture), index);
+	_enc->computeSetTexture(rgfxBinds(_enc, texture), index);
 }
 - (void)setTextures:(const id<MTLTexture> __nullable [__nonnull])textures withRange:(NSRange)range
 {
 	std::vector<RgfxComputeTextureBinding> t(range.length);
 	for (NSUInteger i = 0; i < range.length; i++) {
 		rgfxIOSurfaceNoteShaderWrite(_enc, textures[i]);
-		t[i].texture_obj_id = rgfxId(textures[i]);
+		t[i].texture_obj_id = rgfxBinds(_enc, textures[i]);
 	}
 	_enc->computeSetTextures(range.location, t.empty() ? nullptr : t.data(),
 	                         static_cast<uint32_t>(range.length));
@@ -2593,7 +2655,7 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 - (void)setStageInRegionWithIndirectBuffer:(id<MTLBuffer>)indirectBuffer
                       indirectBufferOffset:(NSUInteger)indirectBufferOffset
 {
-	_enc->computeSetStageInRegionIndirect(rgfxId(indirectBuffer), indirectBufferOffset);
+	_enc->computeSetStageInRegionIndirect(rgfxReads(_enc, indirectBuffer), indirectBufferOffset);
 }
 - (void)dispatchThreadgroups:(MTLSize)threadgroupsPerGrid
        threadsPerThreadgroup:(MTLSize)threadsPerThreadgroup
@@ -2606,7 +2668,7 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
                           indirectBufferOffset:(NSUInteger)indirectBufferOffset
                          threadsPerThreadgroup:(MTLSize)threadsPerThreadgroup
 {
-	_enc->computeDispatchThreadgroupsIndirect(rgfxId(indirectBuffer), indirectBufferOffset,
+	_enc->computeDispatchThreadgroupsIndirect(rgfxReads(_enc, indirectBuffer), indirectBufferOffset,
 	                                          threadsPerThreadgroup.width,
 	                                          threadsPerThreadgroup.height,
 	                                          threadsPerThreadgroup.depth);
@@ -2628,7 +2690,7 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 - (void)useResource:(id<MTLResource>)resource usage:(MTLResourceUsage)usage
 {
 	RgfxComputeResourceRef e = {};
-	e.obj_id = rgfxId(resource);
+	e.obj_id = rgfxUses(_enc, resource, usage);
 	e.kind = rgfxResourceKind(resource);
 	_enc->computeUseResources(&e, 1, static_cast<uint64_t>(usage));
 }
@@ -2638,7 +2700,7 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 {
 	std::vector<RgfxComputeResourceRef> r(count);
 	for (NSUInteger i = 0; i < count; i++) {
-		r[i].obj_id = rgfxId(resources[i]);
+		r[i].obj_id = rgfxUses(_enc, resources[i], usage);
 		r[i].kind = rgfxResourceKind(resources[i]);
 	}
 	_enc->computeUseResources(r.empty() ? nullptr : r.data(), static_cast<uint32_t>(count),
@@ -2683,7 +2745,7 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
                  indirectBuffer:(id<MTLBuffer>)indirectRangeBuffer
            indirectBufferOffset:(NSUInteger)indirectBufferOffset
 {
-	_enc->computeExecuteCommandsIndirect(rgfxId(indirectCommandbuffer), rgfxId(indirectRangeBuffer),
+	_enc->computeExecuteCommandsIndirect(rgfxId(indirectCommandbuffer), rgfxReads(_enc, indirectRangeBuffer),
 	                                     indirectBufferOffset);
 }
 
@@ -2824,7 +2886,7 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
      destinationOffset:(NSUInteger)destinationOffset
                   size:(NSUInteger)size
 {
-	_enc->blitCopyBufferToBuffer(rgfxId(sourceBuffer), rgfxId(destinationBuffer), sourceOffset,
+	_enc->blitCopyBufferToBuffer(rgfxReads(_enc, sourceBuffer), rgfxWrites(_enc, destinationBuffer), sourceOffset,
 	                             destinationOffset, size);
 }
 - (void)copyFromBuffer:(id<MTLBuffer>)sourceBuffer
@@ -2838,7 +2900,7 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
      destinationOrigin:(MTLOrigin)destinationOrigin
 {
 	rgfxIOSurfaceNoteWrite(_enc, destinationTexture);
-	_enc->blitCopyBufferToTexture(rgfxId(sourceBuffer), rgfxId(destinationTexture), sourceOffset,
+	_enc->blitCopyBufferToTexture(rgfxReads(_enc, sourceBuffer), rgfxWrites(_enc, destinationTexture), sourceOffset,
 	                              sourceBytesPerRow, sourceBytesPerImage, sourceSize.width,
 	                              sourceSize.height, sourceSize.depth, destinationSlice,
 	                              destinationLevel, destinationOrigin.x, destinationOrigin.y,
@@ -2856,7 +2918,7 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
                options:(MTLBlitOption)options
 {
 	rgfxIOSurfaceNoteWrite(_enc, destinationTexture);
-	_enc->blitCopyBufferToTextureOptions(rgfxId(sourceBuffer), rgfxId(destinationTexture),
+	_enc->blitCopyBufferToTextureOptions(rgfxReads(_enc, sourceBuffer), rgfxWrites(_enc, destinationTexture),
 	                                     sourceOffset, sourceBytesPerRow, sourceBytesPerImage,
 	                                     sourceSize.width, sourceSize.height, sourceSize.depth,
 	                                     destinationSlice, destinationLevel, destinationOrigin.x,
@@ -2873,7 +2935,7 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
  destinationBytesPerRow:(NSUInteger)destinationBytesPerRow
 destinationBytesPerImage:(NSUInteger)destinationBytesPerImage
 {
-	_enc->blitCopyTextureToBuffer(rgfxId(sourceTexture), rgfxId(destinationBuffer), sourceSlice,
+	_enc->blitCopyTextureToBuffer(rgfxReads(_enc, sourceTexture), rgfxWrites(_enc, destinationBuffer), sourceSlice,
 	                              sourceLevel, sourceOrigin.x, sourceOrigin.y, sourceOrigin.z,
 	                              sourceSize.width, sourceSize.height, sourceSize.depth,
 	                              destinationOffset, destinationBytesPerRow,
@@ -2890,7 +2952,7 @@ destinationBytesPerImage:(NSUInteger)destinationBytesPerImage
 destinationBytesPerImage:(NSUInteger)destinationBytesPerImage
                 options:(MTLBlitOption)options
 {
-	_enc->blitCopyTextureToBufferOptions(rgfxId(sourceTexture), rgfxId(destinationBuffer),
+	_enc->blitCopyTextureToBufferOptions(rgfxReads(_enc, sourceTexture), rgfxWrites(_enc, destinationBuffer),
 	                                     sourceSlice, sourceLevel, sourceOrigin.x, sourceOrigin.y,
 	                                     sourceOrigin.z, sourceSize.width, sourceSize.height,
 	                                     sourceSize.depth, destinationOffset, destinationBytesPerRow,
@@ -2907,7 +2969,7 @@ destinationBytesPerImage:(NSUInteger)destinationBytesPerImage
       destinationOrigin:(MTLOrigin)destinationOrigin
 {
 	rgfxIOSurfaceNoteWrite(_enc, destinationTexture);
-	_enc->blitCopyTextureRegion(rgfxId(sourceTexture), rgfxId(destinationTexture), sourceSlice,
+	_enc->blitCopyTextureRegion(rgfxReads(_enc, sourceTexture), rgfxWrites(_enc, destinationTexture), sourceSlice,
 	                            sourceLevel, sourceOrigin.x, sourceOrigin.y, sourceOrigin.z,
 	                            sourceSize.width, sourceSize.height, sourceSize.depth,
 	                            destinationSlice, destinationLevel, destinationOrigin.x,
@@ -2923,7 +2985,7 @@ destinationBytesPerImage:(NSUInteger)destinationBytesPerImage
              levelCount:(NSUInteger)levelCount
 {
 	rgfxIOSurfaceNoteWrite(_enc, destinationTexture);
-	_enc->blitCopyTextureSlices(rgfxId(sourceTexture), rgfxId(destinationTexture), sourceSlice,
+	_enc->blitCopyTextureSlices(rgfxReads(_enc, sourceTexture), rgfxWrites(_enc, destinationTexture), sourceSlice,
 	                            sourceLevel, destinationSlice, destinationLevel, sliceCount,
 	                            levelCount);
 }
@@ -2952,11 +3014,11 @@ destinationBytesPerImage:(NSUInteger)destinationBytesPerImage
 - (void)generateMipmapsForTexture:(id<MTLTexture>)texture
 {
 	rgfxIOSurfaceNoteWrite(_enc, texture);
-	_enc->blitGenerateMipmaps(rgfxId(texture));
+	_enc->blitGenerateMipmaps(rgfxWrites(_enc, texture));
 }
 - (void)fillBuffer:(id<MTLBuffer>)buffer range:(NSRange)range value:(uint8_t)value
 {
-	_enc->blitFillBuffer(rgfxId(buffer), range.location, range.length, value);
+	_enc->blitFillBuffer(rgfxWrites(_enc, buffer), range.location, range.length, value);
 }
 - (void)updateFence:(id<MTLFence>)fence
 {
@@ -3006,11 +3068,11 @@ destinationBytesPerImage:(NSUInteger)destinationBytesPerImage
 }
 - (void)synchronizeResource:(id<MTLResource>)resource
 {
-	_enc->blitSynchronizeResource(rgfxId(resource), rgfxResourceKind(resource));
+	_enc->blitSynchronizeResource(rgfxWrites(_enc, resource), rgfxResourceKind(resource));
 }
 - (void)synchronizeTexture:(id<MTLTexture>)texture slice:(NSUInteger)slice level:(NSUInteger)level
 {
-	_enc->blitSynchronizeTexture(rgfxId(texture), slice, level);
+	_enc->blitSynchronizeTexture(rgfxWrites(_enc, texture), slice, level);
 }
 
 // --- unsupported: the device answers NO for these features -----------------------
