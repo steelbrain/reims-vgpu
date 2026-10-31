@@ -74,14 +74,18 @@ RgfxTextureDescriptor rgfxTextureDescriptorFromMTL(MTLTextureDescriptor *d)
 	// A new Managed texture reads zero, as Metal's do.
 	uint8_t *bytes = const_cast<uint8_t *>(copy.ptr);
 	std::memset(bytes, 0, layout->size());
+	// The block goes back once the host has dropped the copy's buffer, which goes after the
+	// texture that holds it (its destroy first).
+	const uint64_t offset = copy.offset;
 	RgfxBuffer *cpu = [RgfxBuffer bufferOverHostMemoryWithContents:bytes
-	                                                  regionOffset:copy.offset
+	                                                  regionOffset:offset
 	                                                        length:layout->size()
 	                                                       options:MTLResourceStorageModeShared
-	                                                   deallocator:nil
+	                                                   deallocator:^{ region->release(offset); }
 	                                                        device:device
 	                                                    serializer:serializer];
 	if (cpu == nil) {
+		region->release(offset); // no buffer lies over the block
 		return nil;
 	}
 	RgfxCreated created = serializer->createManagedTexture(

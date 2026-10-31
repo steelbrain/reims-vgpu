@@ -2505,6 +2505,63 @@ bool retirementIdle()
 	return RgfxRetirement::process().waiting() == 0 && RgfxRetirement::process().live() == 0;
 }
 
+// A Managed texture's CPU copy goes with it: the texture's destroy, then its copy's buffer's,
+// then the copy's block goes back.
+void test_managed_texture_copy_block_after_destroys()
+{
+	CHECK(retirementIdle());
+	Fixture fx;
+	std::vector<uint8_t> mem(RGFX_ALLOCATIONS_OFFSET + 0x100000, 0);
+	RgfxRegion region(mem.data(), mem.size());
+	struct Log {
+		BlockLog blocks;
+		TestRing *ring;
+		std::vector<uint64_t> seenAtRelease; // the objects destroyed on the ring by each release
+		static bool alloc(void *c, uint64_t size, uint64_t align, uint64_t *offset)
+		{
+			return BlockLog::alloc(&static_cast<Log *>(c)->blocks, size, align, offset);
+		}
+		static void release(void *c, uint64_t offset)
+		{
+			Log *log = static_cast<Log *>(c);
+			BlockLog::release(&log->blocks, offset);
+			RgfxMsgHeader h = {};
+			std::vector<uint8_t> bytes;
+			while (log->ring->next(&h, &bytes)) {
+				RgfxObjectDestroy d = {};
+				if (h.type == RGFX_CMD_OBJECT_DESTROY && bytes.size() >= sizeof(d)) {
+					std::memcpy(&d, bytes.data(), sizeof(d));
+					log->seenAtRelease.push_back(d.obj_id);
+				}
+			}
+		}
+	} log;
+	log.ring = &fx.ring;
+	region.setBlockSource(&Log::alloc, &Log::release, &log);
+	uint64_t texId = 0, bufId = 0;
+	@autoreleasepool {
+		MTLTextureDescriptor *td =
+		    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+		                                                       width:64
+		                                                      height:64
+		                                                   mipmapped:NO];
+		td.storageMode = MTLStorageModeManaged;
+		RgfxTexture *t = [RgfxTexture managedTextureWithDescriptor:td
+		                                                    region:&region
+		                                                    device:nil
+		                                                serializer:&fx.ser];
+		CHECK(t != nil);
+		texId = t.rgfxObjId;
+		bufId = expectMessage<RgfxBufferOverHostMemory>(fx.ring, RGFX_CMD_BUFFER_OVER_HOST_MEMORY)
+		            .obj_id;
+		drainRing(fx.ring);
+		CHECK(log.blocks.allocated.size() == 1 && log.blocks.released.empty());
+	}
+	CHECK(log.blocks.released == log.blocks.allocated);
+	CHECK(log.seenAtRelease == std::vector<uint64_t>({texId, bufId}));
+	CHECK(ringEmpty(fx.ring));
+}
+
 // A heap's GPU address goes back once its destroy is retired: churned 1 GiB heaps, each made
 // while the one before it lives, take spans that never meet a live one and are picked again
 // once the picks have gone round the context's 64 GiB, so the churn never runs out. One a
@@ -3083,6 +3140,7 @@ int main()
 		test_retirement_keeps_order_while_running();
 		test_reply_reader_close();
 		test_addresses_reused_after_destroy();
+		test_managed_texture_copy_block_after_destroys();
 	}
 	std::printf("shell_tests: OK (%d checks)\n", g_checks);
 	return 0;
