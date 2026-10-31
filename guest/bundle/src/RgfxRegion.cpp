@@ -33,6 +33,41 @@ void RgfxRegion::setBlockSource(AllocFn alloc, ReleaseFn release, void *context)
 	m_sourceContext = context;
 }
 
+void RgfxRegion::setSurfaceSource(SurfaceAcquireFn acquire, ReleaseFn release, void *context)
+{
+	std::lock_guard<std::mutex> guard(m_lock);
+	m_surfaceAcquire = acquire;
+	m_surfaceRelease = release;
+	m_surfaceContext = context;
+}
+
+RgfxRegion::SurfaceBlock RgfxRegion::acquireSurface(const void *plane, uint64_t length,
+                                                    uint64_t size)
+{
+	SurfaceBlock out = {};
+	uint64_t offset = 0, serial = 0;
+	bool fresh = false;
+	if (m_surfaceAcquire == nullptr ||
+	    !m_surfaceAcquire(m_surfaceContext, plane, length, size, &offset, &serial, &fresh)) {
+		return out; // block.ok == false
+	}
+	if (offset < m_floor || offset > m_size || size > m_size - offset) {
+		releaseSurface(offset);
+		return out;
+	}
+	out.block = {offset, m_base + offset, size, true};
+	out.serial = serial;
+	out.fresh = fresh;
+	return out;
+}
+
+void RgfxRegion::releaseSurface(uint64_t offset)
+{
+	if (m_surfaceRelease != nullptr) {
+		m_surfaceRelease(m_surfaceContext, offset);
+	}
+}
+
 void RgfxRegion::release(uint64_t offset)
 {
 	if (m_release != nullptr) {

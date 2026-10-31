@@ -74,6 +74,8 @@ enum {
 	kRgfxAccelMethodResourceIds = 0x106,
 	kRgfxAccelMethodWaitCompletions = 0x107,
 	kRgfxAccelMethodSurfaceScanout = 0x108,
+	kRgfxAccelMethodSurfaceBlock = 0x109,
+	kRgfxAccelMethodSurfaceBlockRelease = 0x10a,
 };
 
 namespace {
@@ -160,6 +162,38 @@ void rgfxKextRelease(void *context, uint64_t offset)
 {
 	io_connect_t conn = static_cast<io_connect_t>(reinterpret_cast<uintptr_t>(context));
 	IOConnectCallScalarMethod(conn, kRgfxAccelMethodFree, &offset, 1, nullptr, nullptr);
+}
+
+// The kext's shared blocks of surface planes, as RgfxRegion's surface source: the block every
+// process that holds the plane's surface gets, found by the pages it maps at `plane`.
+bool rgfxKextSurfaceBlock(void *context, const void *plane, uint64_t length, uint64_t size,
+                          uint64_t *offset, uint64_t *serial, bool *fresh)
+{
+	io_connect_t conn = static_cast<io_connect_t>(reinterpret_cast<uintptr_t>(context));
+	uint64_t in[3] = {reinterpret_cast<uintptr_t>(plane), length, size};
+	uint64_t out[4] = {};
+	uint32_t outCount = 4;
+	if (IOConnectCallScalarMethod(conn, kRgfxAccelMethodSurfaceBlock, in, 3, out, &outCount) !=
+	        KERN_SUCCESS ||
+	    outCount != 4) {
+		return false;
+	}
+	if (out[1] != size) {
+		IOConnectCallScalarMethod(conn, kRgfxAccelMethodSurfaceBlockRelease, &out[0], 1, nullptr,
+		                          nullptr);
+		return false;
+	}
+	*offset = out[0];
+	*serial = out[2];
+	*fresh = out[3] != 0;
+	return true;
+}
+
+void rgfxKextSurfaceRelease(void *context, uint64_t offset)
+{
+	io_connect_t conn = static_cast<io_connect_t>(reinterpret_cast<uintptr_t>(context));
+	IOConnectCallScalarMethod(conn, kRgfxAccelMethodSurfaceBlockRelease, &offset, 1, nullptr,
+	                          nullptr);
 }
 
 // The serializer's queue closer: the kext stops watching the queue's completion ring and posts
@@ -337,6 +371,7 @@ void rgfxDeviceDoorbell(void *context, uint32_t ring_id)
 	_ids.setResourceIdSource(&rgfxKextResourceIds, connContext);
 	_region = new RgfxRegion(base, mapSize);
 	_region->setBlockSource(&rgfxKextAlloc, &rgfxKextRelease, connContext);
+	_region->setSurfaceSource(&rgfxKextSurfaceBlock, &rgfxKextSurfaceRelease, connContext);
 
 	// The object lifecycle goes to the kext, which posts it on the control ring and hands back
 	// the replies (a pipeline's reflection).

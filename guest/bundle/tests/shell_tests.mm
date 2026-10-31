@@ -3799,6 +3799,153 @@ void test_iosurface_copy_block_after_destroys()
 	CFRelease(surface);
 }
 
+// A surface plane's GPU view is the plane's shared block where the kext gives one: synced from
+// the pages only where no holder has synced it since their last CPU write (its header names the
+// block and the seed), let go through the surface source as the texture goes; and the process's
+// own block where the kext gives none.
+void test_iosurface_shared_block()
+{
+	CHECK(retirementIdle());
+	Fixture fx;
+	int calls = 0;
+	fx.ids.setResourceIdSource(&oneChunk, &calls);
+	std::vector<uint8_t> mem(RGFX_ALLOCATIONS_OFFSET + 0x100000, 0);
+	RgfxRegion region(mem.data(), mem.size());
+	BlockLog blocks;
+	region.setBlockSource(&BlockLog::alloc, &BlockLog::release, &blocks);
+	struct Source {
+		uint64_t offset = RGFX_ALLOCATIONS_OFFSET + 0x40000;
+		uint64_t serial = 0;
+		bool fresh = true;
+		bool give = true;
+		const void *plane = nullptr;
+		uint64_t length = 0, size = 0;
+		int acquired = 0;
+		std::vector<uint64_t> released;
+		static bool acquire(void *c, const void *plane, uint64_t length, uint64_t size,
+		                    uint64_t *offset, uint64_t *serial, bool *fresh)
+		{
+			Source *src = static_cast<Source *>(c);
+			src->plane = plane;
+			src->length = length;
+			src->size = size;
+			src->acquired++;
+			*offset = src->offset;
+			*serial = src->serial;
+			*fresh = src->fresh;
+			return src->give;
+		}
+		static void release(void *c, uint64_t offset)
+		{
+			static_cast<Source *>(c)->released.push_back(offset);
+		}
+	} src;
+	region.setSurfaceSource(&Source::acquire, &Source::release, &src);
+	// 16 x 16 BGRA: rows 256 bytes apart in the block, its header at 4096, the block 8192 bytes.
+	const uint64_t kPitch = 256, kHeader = 4096;
+	auto fill = [](IOSurfaceRef s, uint32_t v) {
+		IOSurfaceLock(s, 0, nullptr);
+		auto *base = static_cast<uint8_t *>(IOSurfaceGetBaseAddress(s));
+		for (int y = 0; y < 16; y++)
+			for (int x = 0; x < 16; x++)
+				reinterpret_cast<uint32_t *>(base + y * IOSurfaceGetBytesPerRow(s))[x] = v;
+		IOSurfaceUnlock(s, 0, nullptr);
+	};
+	auto made = [&](uint32_t v) {
+		NSDictionary *props = @{
+			(id)kIOSurfaceWidth : @16,
+			(id)kIOSurfaceHeight : @16,
+			(id)kIOSurfaceBytesPerElement : @4,
+			(id)kIOSurfacePixelFormat : @(static_cast<uint32_t>('BGRA')),
+		};
+		IOSurfaceRef s = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+		fill(s, v);
+		return s;
+	};
+	uint8_t *block = mem.data() + src.offset;
+	auto blockIs = [&](uint32_t v) {
+		for (int y = 0; y < 16; y++)
+			for (int x = 0; x < 16; x++)
+				if (reinterpret_cast<uint32_t *>(block + y * kPitch)[x] != v)
+					return false;
+		return true;
+	};
+	auto header = [&]() { return reinterpret_cast<uint64_t *>(block + kHeader); };
+	auto headerSeed = [&]() { return *reinterpret_cast<uint32_t *>(block + kHeader + 8); };
+	auto texture = [&](IOSurfaceRef s) {
+		MTLTextureDescriptor *td =
+		    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+		                                                       width:16
+		                                                      height:16
+		                                                   mipmapped:NO];
+		return [RgfxIOSurfaceTexture textureWithDescriptor:td
+		                                        iosurface:s
+		                                            plane:0
+		                                           region:&region
+		                                           device:nil
+		                                       serializer:&fx.ser];
+	};
+
+	// The first holder: a fresh block, synced from the pages, its header its own.
+	src.serial = 41;
+	IOSurfaceRef first = made(0x11223344);
+	@autoreleasepool {
+		RgfxIOSurfaceTexture *t = texture(first);
+		CHECK(t != nil && src.acquired == 1 && blocks.allocated.empty());
+		CHECK(src.plane == IOSurfaceGetBaseAddress(first) &&
+		      src.length == IOSurfaceGetBytesPerRow(first) * 16 && src.size == 8192);
+		auto create =
+		    expectMessage<RgfxBufferOverHostMemory>(fx.ring, RGFX_CMD_BUFFER_OVER_HOST_MEMORY);
+		CHECK(create.region_offset == src.offset && create.length == 8192);
+		CHECK(blockIs(0x11223344));
+		CHECK(*header() == 41 && headerSeed() == IOSurfaceGetSeed(first));
+		drainRing(fx.ring);
+	}
+	CHECK(src.released == std::vector<uint64_t>({src.offset}));
+
+	// Another process synced it with the pages already: no copy, until a CPU writes them.
+	src.serial = 42;
+	src.fresh = false;
+	src.released.clear();
+	IOSurfaceRef second = made(0x55555555);
+	std::memset(block, 0xaa, kHeader);
+	*header() = 42;
+	*reinterpret_cast<uint32_t *>(block + kHeader + 8) = IOSurfaceGetSeed(second);
+	@autoreleasepool {
+		RgfxIOSurfaceTexture *t = texture(second);
+		CHECK(t != nil && blockIs(0xaaaaaaaa));
+		rgfxIOSurfaceSyncBeforeCommit();
+		CHECK(blockIs(0xaaaaaaaa));
+		fill(second, 0x66666666);
+		rgfxIOSurfaceSyncBeforeCommit();
+		CHECK(blockIs(0x66666666) && headerSeed() == IOSurfaceGetSeed(second));
+		drainRing(fx.ring);
+	}
+	CHECK(src.released.size() == 1);
+
+	// A block made again holds an older block's header: synced from the pages.
+	src.serial = 43;
+	IOSurfaceRef third = made(0x77777777);
+	@autoreleasepool {
+		RgfxIOSurfaceTexture *t = texture(third);
+		CHECK(t != nil && blockIs(0x77777777) && *header() == 43);
+		drainRing(fx.ring);
+	}
+
+	// No shared block: the process's own.
+	src.give = false;
+	IOSurfaceRef fourth = made(0x12121212);
+	@autoreleasepool {
+		RgfxIOSurfaceTexture *t = texture(fourth);
+		CHECK(t != nil && blocks.allocated.size() == 1);
+		drainRing(fx.ring);
+	}
+	CHECK(blocks.released == blocks.allocated && src.released.size() == 2);
+	drainRing(fx.ring); // the textures' and buffers' destroys
+	for (IOSurfaceRef s : {first, second, third, fourth})
+		CFRelease(s);
+}
+
 // A queue's command buffers keep it alive; once they are gone it ends on the device, its
 // completion ring read no more, and only then does what it holds go back.
 void test_queue_ends_after_its_buffers()
@@ -4013,6 +4160,7 @@ int main()
 		test_heap_outlives_its_resources();
 		test_region_memory_given_back_after_destroy();
 		test_iosurface_copy_block_after_destroys();
+		test_iosurface_shared_block();
 		test_queue_ends_after_its_buffers();
 		test_serializer_destroys_queues();
 		test_objects_outlive_an_uncommitted_buffer();

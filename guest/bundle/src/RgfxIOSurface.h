@@ -1,28 +1,36 @@
 /*
  * RgfxIOSurface: textures over IOSurfaces (`newTextureWithDescriptor:iosurface:plane:`).
  *
- * IOSurface.kext allocates a surface in guest RAM, which the host cannot reach, and
- * processes share a surface by its global IOSurfaceID (WindowServer and its clients
- * alias the same window and drawable surfaces). So a surface's own pages stay the one
- * copy every process and the CPU agree on, and each process that makes a texture over
- * a surface's plane keeps a copy of that plane in host memory the GPU reaches: a
- * block of the device region, one per (IOSurfaceID, plane) in the process, rows
- * kShadowRowAlign apart, with a Shared buffer over it and the texture over that buffer
- * (TEXTURE_FROM_IOSURFACE, which also names the texture by the surface's id on the
- * host, for presents).
+ * IOSurface.kext allocates a surface in guest RAM, which the host GPU does not use in place
+ * (docs/graphics-kext/design.md, Decided 5 and 14), and processes share a surface by its global
+ * IOSurfaceID (WindowServer and its clients alias the same window and drawable surfaces). So a
+ * surface's own pages stay its CPU copy, which every process and the CPU agree on, and its GPU
+ * view is one block of the device region per plane: the plane's shared block, the one every
+ * process that holds the surface gets from the accelerator kext (RgfxRegion::acquireSurface),
+ * found by the plane's pages the process maps. Each process makes a Shared buffer over the
+ * block and its texture over that buffer (TEXTURE_FROM_IOSURFACE, which also names the texture
+ * by the surface's id on the host, for presents). What one process's GPU draws there, another's
+ * samples there, with no copy. Where the kext gives no shared block, the process keeps a block
+ * of its own for the plane, as before.
  *
- * The copy syncs with the pages at two points:
- *   - before a commit, from the pages, for every copy whose surface's seed moved since
- *     the copy last synced (a CPU wrote it under a lock, or another process wrote its
- *     GPU results back);
- *   - when a command buffer that writes the copy completes, before it reports
- *     completion, back to the pages. A write is a render attachment, a blit's
- *     destination or a compute texture with ShaderWrite usage.
- * The seed after our own write-back is recorded, so a write-back is never read back.
+ * The block's rows are kShadowRowAlign apart, and a header past them (RgfxSurfaceHeader) holds
+ * the surface's seed when the block last matched the pages, which every holder reads and
+ * writes. The block syncs with the pages at two points:
+ *   - before a commit, from the pages, where the surface's seed is not the header's: a CPU
+ *     wrote the surface under a lock since any holder synced it;
+ *   - when a command buffer that writes the block completes, before it reports completion,
+ *     back to the pages, so a CPU lock in any process reads the GPU's results. A write is a
+ *     render attachment, a blit's destination or a compute texture with ShaderWrite usage.
+ * The seed after a write-back is the header's, so no holder reads that write back.
  *
- * Left for later: zero copies (the host reaching the surface's pages, or one host
- * texture per IOSurfaceID that every process shares); CPU writes made without a lock;
- * a texture's own CPU reads and writes cover one-element-per-pixel formats only.
+ * IOSurface's use count is left as it is: Metal neither raises it nor reads it for GPU work
+ * over a surface (measured, an M3 Max under macOS 27: IOSurfaceGetUseCount stays 0 and
+ * IOSurfaceIsInUse false while a command buffer that renders into a surface, or blits from it,
+ * is held in flight, and after it completes).
+ *
+ * Left for later: syncing the pages at the CPU's lock instead of at every GPU write's
+ * completion (IOSurface's device caches); CPU writes made without a lock; a texture's own CPU
+ * reads and writes cover one-element-per-pixel formats only.
  *
  * Our own ObjC++.
  */
@@ -46,10 +54,10 @@ NS_ASSUME_NONNULL_BEGIN
 
 @interface RgfxIOSurfaceTexture : RgfxTexture
 
-/// A texture of shape `descriptor` over plane `plane` of `surface`, in this process's
-/// copy of the plane, which is made in `region` on first use and synced from the
-/// surface's pages. Nil when the surface has no such plane, its plane has no CPU
-/// mapping, the region has no room, or no texture resource id is left.
+/// A texture of shape `descriptor` over plane `plane` of `surface`, over the plane's GPU
+/// view: its shared block, or a block of this process's own in `region`, taken on first use
+/// and synced from the surface's pages. Nil when the surface has no such plane, its plane has
+/// no CPU mapping, the region has no room, or no texture resource id is left.
 + (nullable instancetype)textureWithDescriptor:(MTLTextureDescriptor *)descriptor
                                      iosurface:(IOSurfaceRef)surface
                                          plane:(NSUInteger)plane
@@ -61,8 +69,8 @@ NS_ASSUME_NONNULL_BEGIN
 
 NS_ASSUME_NONNULL_END
 
-/// Before a commit: syncs every copy in this process whose surface's seed moved from
-/// the surface's pages.
+/// Before a commit: syncs every plane's block this process uses from the surface's pages,
+/// where the surface's seed moved since any holder synced it.
 void rgfxIOSurfaceSyncBeforeCommit(void);
 
 /// Records on `enc` that its command buffer writes `texture`, when `texture` is one
@@ -73,7 +81,7 @@ void rgfxIOSurfaceNoteWrite(RgfxEncoder *_Nullable enc, id _Nullable texture);
 /// has ShaderWrite.
 void rgfxIOSurfaceNoteShaderWrite(RgfxEncoder *_Nullable enc, id _Nullable texture);
 
-/// At a command buffer's completion: writes each copy in `writes` (taken from its
+/// At a command buffer's completion: writes each block in `writes` (taken from its
 /// encoder) back to its surface's pages, once each.
 void rgfxIOSurfaceWriteBack(const std::vector<std::shared_ptr<void>> &writes);
 

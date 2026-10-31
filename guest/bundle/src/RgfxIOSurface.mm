@@ -148,7 +148,19 @@ void countCopy(CopyCount &c, uint64_t bytes, uint64_t start)
 
 } // namespace
 
-/// This process's copy of one surface plane, in a block of the device region.
+/// What every process holding a plane's shared block agrees on, in the block past the plane's
+/// rows (RgfxSurfaceShadow::header): the surface's seed when the block last matched the
+/// surface's pages, valid where `serial` is the block's own (a block made again holds an older
+/// one's bytes until its first holder writes it).
+struct RgfxSurfaceHeader {
+	uint64_t serial;
+	uint32_t seed;
+	uint32_t reserved;
+};
+
+/// The GPU's view of one surface plane, in a block of the device region: the plane's shared
+/// block, which every process holding the surface draws and samples (the kext's,
+/// RgfxRegion::acquireSurface), or this process's own block where the kext gives none.
 struct RgfxSurfaceShadow {
 	IOSurfaceRef surface = nullptr; // retained
 	uint32_t surfaceId = 0;
@@ -158,12 +170,40 @@ struct RgfxSurfaceShadow {
 	RgfxRegion::Block block = {};
 	RgfxRegion *region = nullptr; // where the block goes back at the copy's end
 	id<MTLBuffer> buffer = nil; // the Shared buffer over the block
-	std::mutex lock;            // one sync at a time
-	uint32_t seed = 0;          // the surface's seed when the copy last matched it
+	std::mutex lock;            // one sync at a time in this process
+	bool shared = false;        // the plane's shared block, else this process's own
+	uint64_t serial = 0;        // the shared block's
+	RgfxSurfaceHeader *header = nullptr; // the shared block's, past the plane's rows
+	uint32_t seed = 0;          // this process's own block: the seed when it last matched
 
 	~RgfxSurfaceShadow();
 
 	uint8_t *copy() const { return const_cast<uint8_t *>(block.ptr); }
+
+	/// The surface's seed when the block last matched its pages; false where it never has.
+	bool syncedSeed(uint32_t *out) const
+	{
+		if (!shared) {
+			*out = seed;
+			return true;
+		}
+		if (__atomic_load_n(&header->serial, __ATOMIC_ACQUIRE) != serial) {
+			return false;
+		}
+		*out = __atomic_load_n(&header->seed, __ATOMIC_ACQUIRE);
+		return true;
+	}
+
+	/// The block matches the surface's pages as of seed `s`.
+	void setSynced(uint32_t s)
+	{
+		if (!shared) {
+			seed = s;
+			return;
+		}
+		__atomic_store_n(&header->seed, s, __ATOMIC_RELEASE);
+		__atomic_store_n(&header->serial, serial, __ATOMIC_RELEASE);
+	}
 
 	/// Pages -> copy, under a read lock; records the seed. Caller holds `lock`.
 	void upload()
@@ -178,7 +218,7 @@ struct RgfxSurfaceShadow {
 			copyRows(copy(), pitch, src, shape.rowBytes);
 		}
 		IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, &s);
-		seed = s;
+		setSynced(s);
 		countCopy(gUploads, shape.rowBytes * shape.rows, start);
 	}
 
@@ -196,15 +236,17 @@ struct RgfxSurfaceShadow {
 			copyRows(dst, shape.rowBytes, copy(), pitch);
 		}
 		IOSurfaceUnlock(surface, 0, &s);
-		seed = s;
+		setSynced(s);
 		countCopy(gWriteBacks, shape.rowBytes * shape.rows, start);
 	}
 
-	/// Uploads when the surface's seed moved since the copy last matched it.
+	/// Uploads when the surface's seed moved since the block last matched it, in any process
+	/// that holds the block: a CPU wrote the surface under a lock.
 	void uploadIfChanged()
 	{
 		std::lock_guard<std::mutex> g(lock);
-		if (IOSurfaceGetSeed(surface) != seed) {
+		uint32_t synced = 0;
+		if (!syncedSeed(&synced) || IOSurfaceGetSeed(surface) != synced) {
 			upload();
 		}
 	}
@@ -244,6 +286,8 @@ RgfxSurfaceShadow::~RgfxSurfaceShadow()
 	// never made leaves the block to give back here.
 	if (buffer != nil)
 		buffer = nil;
+	else if (block.ok && region != nullptr && shared)
+		region->releaseSurface(block.offset);
 	else if (block.ok && region != nullptr)
 		region->release(block.offset);
 	if (surface != nullptr) {
@@ -281,26 +325,49 @@ std::shared_ptr<RgfxSurfaceShadow> shadowFor(IOSurfaceRef surface, uint32_t plan
 		shadow->plane = plane;
 		shadow->shape = shape;
 		shadow->pitch = alignUp(shape.rowBytes, kShadowRowAlign);
-		uint64_t size = alignUp(shadow->pitch * shape.rows, RgfxRegion::kDefaultBlockAlign);
-		shadow->block = region->allocate(size);
+		// Every holder lays the block out alike, from the plane's shape alone: the rows, then
+		// the header.
+		uint64_t headerAt = alignUp(shadow->pitch * shape.rows, alignof(RgfxSurfaceHeader));
+		uint64_t size =
+		    alignUp(headerAt + sizeof(RgfxSurfaceHeader), RgfxRegion::kDefaultBlockAlign);
+		RgfxRegion::SurfaceBlock sharedBlock =
+		    region->acquireSurface(planeBase(surface, plane), shape.rowBytes * shape.rows, size);
 		shadow->region = region;
+		if (sharedBlock.block.ok) {
+			shadow->block = sharedBlock.block;
+			shadow->shared = true;
+			shadow->serial = sharedBlock.serial;
+			shadow->header = reinterpret_cast<RgfxSurfaceHeader *>(shadow->copy() + headerAt);
+		} else {
+			shadow->block = region->allocate(size);
+		}
 		if (!shadow->block.ok) {
 			return nullptr;
 		}
 		r.shadows[{surfaceId, plane}] = shadow;
 	}
 	uint64_t offset = shadow->block.offset;
+	bool shared = shadow->shared;
 	shadow->buffer = [RgfxBuffer bufferOverHostMemoryWithContents:shadow->copy()
 	                                                regionOffset:offset
 	                                                      length:shadow->block.size
 	                                                     options:MTLResourceStorageModeShared
-	                                                 deallocator:^{ region->release(offset); }
+	                                                 deallocator:^{
+		                                                 if (shared)
+			                                                 region->releaseSurface(offset);
+		                                                 else
+			                                                 region->release(offset);
+	                                                 }
 	                                                      device:device
 	                                                  serializer:serializer];
 	if (shadow->buffer == nil) {
 		return nullptr;
 	}
-	{
+	// This process's own block takes the pages now; a shared one where no holder has synced
+	// it with them since their last CPU write.
+	if (shared) {
+		shadow->uploadIfChanged();
+	} else {
 		std::lock_guard<std::mutex> g(shadow->lock);
 		shadow->upload();
 	}

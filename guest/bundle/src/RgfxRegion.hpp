@@ -92,6 +92,31 @@ public:
 	typedef void (*ReleaseFn)(void *context, uint64_t offset);
 	void setBlockSource(AllocFn alloc, ReleaseFn release, void *context);
 
+	/// The shared block of an IOSurface plane (acquireSurface): the block, its serial (unique to
+	/// the block's allocation) and whether this ask made it, so its bytes are not yet the
+	/// plane's.
+	struct SurfaceBlock {
+		Block block;
+		uint64_t serial;
+		bool fresh;
+	};
+
+	/// Where surface planes' shared blocks come from: `acquire` answers the block of `size`
+	/// bytes of the plane of `length` bytes this process maps at `plane` (false where it gives
+	/// none), `release` lets go of one. Both are called with `context`, from any thread.
+	typedef bool (*SurfaceAcquireFn)(void *context, const void *plane, uint64_t length,
+	                                 uint64_t size, uint64_t *offset, uint64_t *serial,
+	                                 bool *fresh);
+	void setSurfaceSource(SurfaceAcquireFn acquire, ReleaseFn release, void *context);
+
+	/// The shared block of `size` bytes for the plane of `length` bytes at `plane`, the one every
+	/// process that holds its surface gets (the kext's, RgfxSurfaceBlocks.hpp). `block.ok` is
+	/// false without a surface source, or where it gives none.
+	SurfaceBlock acquireSurface(const void *plane, uint64_t length, uint64_t size);
+
+	/// Lets go of one acquireSurface of the block at `offset`.
+	void releaseSurface(uint64_t offset);
+
 	/// A submission + completion ring pair (see RingPair). Each data size must be a
 	/// power of two; `complete_data_size` may be 0 (no completion ring placed).
 	RingPair allocateRingPair(uint32_t submit_data_size, uint32_t complete_data_size);
@@ -124,6 +149,9 @@ private:
 	AllocFn m_alloc = nullptr;     // the block source, where set (the kext)
 	ReleaseFn m_release = nullptr;
 	void *m_sourceContext = nullptr;
+	SurfaceAcquireFn m_surfaceAcquire = nullptr; // the surface source, where set (the kext)
+	ReleaseFn m_surfaceRelease = nullptr;
+	void *m_surfaceContext = nullptr;
 
 	std::mutex m_lock;
 };
