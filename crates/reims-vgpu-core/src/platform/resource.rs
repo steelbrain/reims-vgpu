@@ -348,6 +348,18 @@ pub trait Library<P: Platform>: Handle {
         function_name: &str,
         constants: &[FunctionConstant],
     ) -> RaiseResult<Option<P::Function>>;
+    /// sel: newFunctionWithDescriptor:error:
+    /// The function named `function_name` made with `options` (`MTLFunctionOptions`, as
+    /// `MTLFunctionDescriptor.options`), specialised by `constants`, each keyed by its index;
+    /// with none the descriptor's `constantValues` is nil. Nil for a name the library does not
+    /// hold, or a function the platform refuses. Reached with no handler.
+    fn new_function_with_options(
+        &self,
+        on: OnFault,
+        function_name: &str,
+        constants: &[FunctionConstant],
+        options: u64,
+    ) -> RaiseResult<Option<P::Function>>;
 }
 
 #[cfg(test)]

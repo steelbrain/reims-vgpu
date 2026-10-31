@@ -701,6 +701,28 @@ impl Library<FakePlatform> for Fk<kind::Library> {
             |w| Some(w.new_obj::<kind::Function>(Model::Names(vec![name]))),
         )
     }
+
+    fn new_function_with_options(
+        &self,
+        on: OnFault,
+        function_name: &str,
+        constants: &[crate::platform::resource::FunctionConstant],
+        options: u64,
+    ) -> RaiseResult<Option<<FakePlatform as Platform>::Function>> {
+        let name = function_name.to_owned();
+        let mut args = vec![Arg::Str(function_name.to_owned()), Arg::U64(options)];
+        for c in constants {
+            args.push(Arg::U64(u64::from(c.index)));
+            args.push(Arg::U64(u64::from(c.data_type)));
+            args.push(Arg::Bytes(c.value.to_vec()));
+        }
+        self.make(
+            Policy::On(on),
+            "newFunctionWithDescriptor:error:",
+            args,
+            |w| Some(w.new_obj::<kind::Function>(Model::Names(vec![name]))),
+        )
+    }
 }
 
 impl Fk<kind::Texture> {

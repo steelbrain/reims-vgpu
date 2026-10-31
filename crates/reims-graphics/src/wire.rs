@@ -1916,6 +1916,49 @@ pub struct RgfxVertexAttribute {
     pub buffer_index: u32,
 }
 
+/// [`RgfxLinkedFunction`] `list`: `MTLLinkedFunctions.functions`.
+pub const RGFX_LINKED_FUNCTIONS: u32 = 0;
+/// [`RgfxLinkedFunction`] `list`: `MTLLinkedFunctions.privateFunctions`.
+pub const RGFX_LINKED_PRIVATE_FUNCTIONS: u32 = 1;
+/// [`RgfxLinkedFunction`] `list`: `MTLLinkedFunctions.binaryFunctions`.
+pub const RGFX_LINKED_BINARY_FUNCTIONS: u32 = 2;
+/// [`RgfxLinkedFunction`] `list`: one of `MTLLinkedFunctions.groups`, the group its
+/// `group_*` name.
+pub const RGFX_LINKED_GROUP: u32 = 3;
+
+/// One function a pipeline stage links (`MTLLinkedFunctions`), named as a stage's
+/// function is: a library `obj_id`, an entry-point name in the message tail and a run
+/// of [`RgfxFunctionConstant`] in the tail, with the `MTLFunctionOptions` the guest
+/// made it with. A stage's linked functions are a run of these in the tail, each
+/// list's in its order; a group's functions carry the group's name.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxLinkedFunction {
+    /// The library the function comes from.
+    pub library_obj_id: u64,
+    /// The entry-point name's byte offset from the message start.
+    pub name_offset: u32,
+    /// The entry-point name's length in bytes.
+    pub name_len: u32,
+    /// The function constants' byte offset from the message start.
+    pub constants_offset: u32,
+    /// The number of [`RgfxFunctionConstant`] for the function; 0 for a function made
+    /// with none.
+    pub constant_count: u32,
+    /// The list the function is in: an `RGFX_LINKED_*`.
+    pub list: u32,
+    /// The `MTLFunctionOptions` the function was made with
+    /// (`newFunctionWithDescriptor:`); 0 for the other forms.
+    pub options: u32,
+    /// For [`RGFX_LINKED_GROUP`], the group name's byte offset from the message
+    /// start; 0 otherwise.
+    pub group_offset: u32,
+    /// For [`RGFX_LINKED_GROUP`], the group name's length in bytes; 0 otherwise.
+    pub group_len: u32,
+}
+
 /// `RENDER_PIPELINE_CREATE`: a render pipeline from a descriptor, answered by
 /// [`RgfxPipelineReflection`] on the queue's completion ring with this create's
 /// `seqno`.
@@ -1927,7 +1970,9 @@ pub struct RgfxVertexAttribute {
 /// The vertex descriptor's layouts and attributes are runs of
 /// [`RgfxVertexBufferLayout`] and [`RgfxVertexAttribute`] in the tail. The colour
 /// attachments are inline, `color_attachment_count` of
-/// [`RgfxColorAttachmentDesc`] in use. The optional pipeline `label` is tail
+/// [`RgfxColorAttachmentDesc`] in use. The vertex and fragment stages' linked
+/// functions (`vertexLinkedFunctions`, `fragmentLinkedFunctions`) are runs of
+/// [`RgfxLinkedFunction`] in the tail. The optional pipeline `label` is tail
 /// bytes (`label_len` 0 for none). The whole message's `size` is the fixed head
 /// plus the tail, rounded up to a multiple of 8.
 #[repr(C)]
@@ -1990,6 +2035,14 @@ pub struct RgfxRenderPipelineCreate {
     /// The eight colour attachments; `color_attachment_count` are in use, the
     /// rest zeroed.
     pub colors: [RgfxColorAttachmentDesc; 8],
+    /// The vertex stage's linked functions' byte offset from the message start.
+    pub vertex_linked_offset: u32,
+    /// The number of [`RgfxLinkedFunction`] the vertex stage links.
+    pub vertex_linked_count: u32,
+    /// The fragment stage's linked functions' byte offset from the message start.
+    pub fragment_linked_offset: u32,
+    /// The number of [`RgfxLinkedFunction`] the fragment stage links.
+    pub fragment_linked_count: u32,
 }
 
 /// `COMPUTE_PIPELINE_CREATE`: a compute pipeline from a function, answered by
@@ -1997,8 +2050,12 @@ pub struct RgfxRenderPipelineCreate {
 /// named by `function_library_obj_id` and an entry-point name in the tail
 /// (`name_offset`/`name_len`, byte offsets from the message start), optionally
 /// specialised by `constant_count` [`RgfxFunctionConstant`] in the tail. The
-/// message's `size` is the fixed head plus the tail, rounded up to a multiple of
-/// 8.
+/// stage-input descriptor's (`stageInputDescriptor`) layouts and attributes are
+/// runs of [`RgfxVertexBufferLayout`] and [`RgfxVertexAttribute`] in the tail,
+/// their `step_function` an `MTLStepFunction` and their `format` an
+/// `MTLAttributeFormat`; the kernel's linked functions (`linkedFunctions`) are a
+/// run of [`RgfxLinkedFunction`]. The message's `size` is the fixed head plus the
+/// tail, rounded up to a multiple of 8.
 #[repr(C)]
 #[derive(
     Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
@@ -2024,8 +2081,24 @@ pub struct RgfxComputePipelineCreate {
     pub max_total_threads_per_threadgroup: u32,
     /// `maxCallStackDepth`.
     pub max_call_stack_depth: u32,
+    /// The stage-input layouts' byte offset from the message start.
+    pub stage_input_layouts_offset: u32,
+    /// The number of stage-input layouts ([`RgfxVertexBufferLayout`]).
+    pub stage_input_layout_count: u32,
+    /// The stage-input attributes' byte offset from the message start.
+    pub stage_input_attributes_offset: u32,
+    /// The number of stage-input attributes ([`RgfxVertexAttribute`]).
+    pub stage_input_attribute_count: u32,
+    /// The stage-input descriptor's `indexType` (`MTLIndexType`).
+    pub stage_input_index_type: u32,
+    /// The stage-input descriptor's `indexBufferIndex`.
+    pub stage_input_index_buffer_index: u32,
+    /// The kernel's linked functions' byte offset from the message start.
+    pub linked_offset: u32,
+    /// The number of [`RgfxLinkedFunction`] the kernel links.
+    pub linked_count: u32,
     /// Pads to a multiple of 8; 0.
-    pub reserved_3c: u32,
+    pub reserved_5c: u32,
 }
 
 /// `PIPELINE_REFLECTION`: a pipeline create's answer, with the pipeline state's
@@ -2116,9 +2189,10 @@ const _: () = {
     assert!(size_of::<RgfxColorAttachmentDesc>() == 40);
     assert!(size_of::<RgfxVertexBufferLayout>() == 16);
     assert!(size_of::<RgfxVertexAttribute>() == 16);
-    assert!(size_of::<RgfxRenderPipelineCreate>() == 448);
+    assert!(size_of::<RgfxLinkedFunction>() == 40);
+    assert!(size_of::<RgfxRenderPipelineCreate>() == 464);
     assert!(core::mem::offset_of!(RgfxRenderPipelineCreate, colors) == 128);
-    assert!(size_of::<RgfxComputePipelineCreate>() == 64);
+    assert!(size_of::<RgfxComputePipelineCreate>() == 96);
     assert!(size_of::<RgfxPipelineReflection>() == 80);
     // Each exact size above is a multiple of 8, as a ring message must be.
     // The stage-3 opcodes do not collide with the stage-2 ones or each other.

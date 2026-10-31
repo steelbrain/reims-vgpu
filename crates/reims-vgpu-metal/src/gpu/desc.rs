@@ -27,6 +27,9 @@
 use std::ffi::c_void;
 
 use block2::RcBlock;
+use objc2::rc::Retained;
+use objc2::runtime::ProtocolObject;
+use objc2_foundation::{NSArray, NSDictionary, NSString};
 use objc2_metal::*;
 use reims_vgpu_core::host::HostPtr;
 use reims_vgpu_core::num::{ToU64, ToUsize};
@@ -34,13 +37,15 @@ use reims_vgpu_core::platform::types::MtlSamplePosition;
 use reims_vgpu_core::platform::values::{
     AttachmentState, BufferDeallocator, BufferDesc, ColorAttachmentDesc, ColorAttachmentSet,
     ComputePassDesc, DepthAttachmentSet, DepthStencilDesc, FullComputePipelineDesc,
-    FullRenderPipelineDesc, HeapDesc, IcbDesc, OptionSet, PassSet, RenderPipelineDesc, SamplerDesc,
-    StageInputDesc, StencilAttachmentSet, StencilDesc, TextureDesc, VertexDesc,
+    FullRenderPipelineDesc, HeapDesc, IcbDesc, LinkedFunctionsDesc, OptionSet, PassSet,
+    RenderPipelineDesc, SamplerDesc, StageInputDesc, StencilAttachmentSet, StencilDesc,
+    TextureDesc, VertexDesc,
 };
 use reims_vgpu_core::raise::{OnFault, RaiseResult};
 use reims_vgpu_core::sync::Mutex;
 
 use crate::gpu::array;
+use crate::gpu::resource::MetalFunction;
 use crate::msg::encode::ToMtl;
 use crate::msg::{self, Policy};
 use crate::platform::{MetalPlatform, Obj};
@@ -786,6 +791,62 @@ pub fn apply_full_render_pipeline(
     msg::get("setSupportIndirectCommandBuffers:", || {
         o.setSupportIndirectCommandBuffers(desc.support_indirect_command_buffers);
     });
+    if let Some(linked) = linked_functions(&desc.vertex_linked) {
+        msg::get("setVertexLinkedFunctions:", || {
+            o.setVertexLinkedFunctions(Some(&linked))
+        });
+    }
+    if let Some(linked) = linked_functions(&desc.fragment_linked) {
+        msg::get("setFragmentLinkedFunctions:", || {
+            o.setFragmentLinkedFunctions(Some(&linked))
+        });
+    }
+}
+
+/// `l` as Metal's `MTLLinkedFunctions`, each list set where it holds a function, in the
+/// properties' order (functions, binary functions, groups, private functions); `None` where it
+/// links nothing, which leaves the stage's as Metal's descriptor has them.
+fn linked_functions(
+    l: &LinkedFunctionsDesc<MetalPlatform>,
+) -> Option<Retained<MTLLinkedFunctions>> {
+    if l.is_empty() {
+        return None;
+    }
+    let array = |fs: &[MetalFunction]| {
+        let fs: Vec<&ProtocolObject<dyn MTLFunction>> = fs.iter().map(|f| f.get()).collect();
+        NSArray::from_slice(&fs)
+    };
+    let o = msg::get("linkedFunctions", MTLLinkedFunctions::linkedFunctions);
+    if !l.functions.is_empty() {
+        let functions = array(&l.functions);
+        msg::get("setFunctions:", || o.setFunctions(Some(&functions)));
+    }
+    if !l.binary_functions.is_empty() {
+        let functions = array(&l.binary_functions);
+        msg::get("setBinaryFunctions:", || {
+            o.setBinaryFunctions(Some(&functions))
+        });
+    }
+    if !l.groups.is_empty() {
+        let names: Vec<Retained<NSString>> = l
+            .groups
+            .iter()
+            .map(|(name, _)| msg::new_string(name))
+            .collect();
+        let lists: Vec<_> = l.groups.iter().map(|(_, fs)| array(fs)).collect();
+        let keys: Vec<&NSString> = names.iter().map(|n| &**n).collect();
+        let values: Vec<&NSArray<ProtocolObject<dyn MTLFunction>>> =
+            lists.iter().map(|a| &**a).collect();
+        let groups = NSDictionary::from_slices(&keys, &values);
+        msg::get("setGroups:", || o.setGroups(Some(&groups)));
+    }
+    if !l.private_functions.is_empty() {
+        let functions = array(&l.private_functions);
+        msg::get("setPrivateFunctions:", || {
+            o.setPrivateFunctions(Some(&functions))
+        });
+    }
+    Some(o)
 }
 
 /// One colour attachment's every property, in `MTLRenderPipelineColorAttachmentDescriptor`'s
@@ -923,6 +984,11 @@ pub fn apply_full_compute_pipeline(
         apply_stage_input(s, sd.get());
         msg::get("setStageInputDescriptor:", || {
             o.setStageInputDescriptor(Some(sd.get()))
+        });
+    }
+    if let Some(linked) = linked_functions(&desc.linked) {
+        msg::get("setLinkedFunctions:", || {
+            o.setLinkedFunctions(Some(&linked))
         });
     }
 }
@@ -1280,7 +1346,7 @@ mod tests {
     use reims_vgpu_core::platform::device::GpuDevice as _;
     use reims_vgpu_core::platform::resource::Buffer as _;
     use reims_vgpu_core::platform::types::{ClearColor, Swizzle};
-    use reims_vgpu_core::platform::{HostRange, Platform as _};
+    use reims_vgpu_core::platform::{Handle as _, HostRange, Platform as _};
     use reims_vgpu_core::sync::Mutex;
 
     use super::*;
@@ -1605,8 +1671,9 @@ mod tests {
 
     /// The whole render value reaches the descriptor: every colour attachment it sets with its
     /// blend state and write mask, the vertex descriptor's layouts and attributes, the depth and
-    /// stencil formats, the sample count, the flags, the topology and the amplification count;
-    /// with no fragment function the descriptor's is nil
+    /// stencil formats, the sample count, the flags, the topology, the amplification count and
+    /// each stage's linked functions in their lists; with no fragment function the descriptor's
+    /// is nil
     #[test]
     fn a_whole_render_value_reaches_the_descriptor() {
         use reims_vgpu_core::platform::values::{AttributeDesc, BufferLayoutDesc};
@@ -1653,11 +1720,34 @@ mod tests {
                 input_primitive_topology: 3,
                 max_vertex_amplification_count: 2,
                 support_indirect_command_buffers: true,
+                vertex_linked: LinkedFunctionsDesc {
+                    functions: vec![k.function.clone_ref()],
+                    groups: vec![(
+                        "g".to_owned(),
+                        vec![k.function.clone_ref(), k.function.clone_ref()],
+                    )],
+                    ..LinkedFunctionsDesc::default()
+                },
+                fragment_linked: LinkedFunctionsDesc {
+                    private_functions: vec![k.function.clone_ref()],
+                    ..LinkedFunctionsDesc::default()
+                },
             },
             &x,
         );
         let o = x.get();
         assert!(o.fragmentFunction().is_none());
+        let (v, f) = (o.vertexLinkedFunctions(), o.fragmentLinkedFunctions());
+        let count = |a: Option<Retained<NSArray<ProtocolObject<dyn MTLFunction>>>>| {
+            a.map_or(0, |a| a.count())
+        };
+        assert_eq!(count(v.functions()), 1);
+        assert_eq!(count(v.privateFunctions()), 0);
+        let groups = v.groups().unwrap();
+        assert_eq!(groups.count(), 1);
+        assert_eq!(count(groups.objectForKey(&NSString::from_str("g"))), 2);
+        assert_eq!(count(f.privateFunctions()), 1);
+        assert_eq!(count(f.functions()), 0);
         // SAFETY: index 2 of the colour attachments.
         let c = unsafe { o.colorAttachments().objectAtIndexedSubscript(2) };
         assert_eq!(c.pixelFormat(), MTLPixelFormat(115));
@@ -1696,8 +1786,9 @@ mod tests {
     }
 
     /// The whole compute value reaches the descriptor: the threadgroup-size multiple, the maximum
-    /// threads per threadgroup, the maximum call stack depth, indirect command buffer support and
-    /// the stage-input descriptor's layouts, attributes, index type and index buffer
+    /// threads per threadgroup, the maximum call stack depth, indirect command buffer support, the
+    /// stage-input descriptor's layouts, attributes, index type and index buffer, and the linked
+    /// functions in their lists
     #[test]
     fn a_whole_compute_value_reaches_the_descriptor() {
         use reims_vgpu_core::platform::values::{AttributeDesc, BufferLayoutDesc};
@@ -1728,6 +1819,10 @@ mod tests {
                     index_type: 1,
                     index_buffer_index: 2,
                 }),
+                linked: LinkedFunctionsDesc {
+                    binary_functions: vec![k.function.clone_ref()],
+                    ..LinkedFunctionsDesc::default()
+                },
             },
             &x,
         );
@@ -1756,6 +1851,9 @@ mod tests {
             (sd.indexType(), sd.indexBufferIndex()),
             (MTLIndexType(1), 2)
         );
+        let linked = o.linkedFunctions().unwrap();
+        assert_eq!(linked.binaryFunctions().map(|a| a.count()), Some(1));
+        assert!(linked.functions().is_none_or(|a| a.count() == 0));
     }
 
     /// setContents: and setDeallocator: (SPI) on the private buffer descriptor: the buffer Metal

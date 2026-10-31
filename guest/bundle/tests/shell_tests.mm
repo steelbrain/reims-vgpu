@@ -36,6 +36,7 @@
 #import "RgfxComputePipelineState.h"
 #import "RgfxFunction.h"
 #import "RgfxLibrary.h"
+#import "RgfxMetalError.h"
 #import "RgfxRenderPipelineState.h"
 #include <set>
 #include <vector>
@@ -846,6 +847,8 @@ void test_render_pipeline_routing()
 	desc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
 	desc.alphaToCoverageEnabled = YES;
 	desc.supportIndirectCommandBuffers = YES;
+	desc.vertexLinkedFunctions.functions = @[ [lib newFunctionWithName:@"vlink"] ];
+	desc.fragmentLinkedFunctions.privateFunctions = @[ [lib newFunctionWithName:@"flink"] ];
 
 	MTLVertexDescriptor *vd = [MTLVertexDescriptor vertexDescriptor];
 	vd.layouts[0].stride = 32;
@@ -885,6 +888,16 @@ void test_render_pipeline_routing()
 	CHECK((head.flags & RGFX_RENDER_PIPELINE_ALPHA_TO_COVERAGE) != 0);
 	CHECK((head.flags & RGFX_RENDER_PIPELINE_RASTERIZATION_ENABLED) != 0); // default on
 	CHECK((head.flags & RGFX_RENDER_PIPELINE_SUPPORT_ICB) != 0);
+	// Each stage's linked functions, in their lists.
+	CHECK(head.vertex_linked_count == 1 && head.fragment_linked_count == 1);
+	RgfxLinkedFunction vlink, flink;
+	std::memcpy(&vlink, bytes.data() + head.vertex_linked_offset, sizeof(vlink));
+	std::memcpy(&flink, bytes.data() + head.fragment_linked_offset, sizeof(flink));
+	CHECK(vlink.list == RGFX_LINKED_FUNCTIONS && vlink.name_len == 5);
+	CHECK(std::memcmp(bytes.data() + vlink.name_offset, "vlink", 5) == 0);
+	CHECK(flink.list == RGFX_LINKED_PRIVATE_FUNCTIONS && flink.name_len == 5);
+	CHECK(std::memcmp(bytes.data() + flink.name_offset, "flink", 5) == 0);
+	CHECK(vlink.library_obj_id == lib.rgfxObjId && flink.library_obj_id == lib.rgfxObjId);
 
 	// The functions, label and vertex descriptor are in the tail at their offsets.
 	CHECK(head.vertex_name_len == 5);
@@ -960,6 +973,9 @@ void test_compute_pipeline_routing()
 	CHECK(head.name_len == 5);
 	CHECK(std::memcmp(bytes.data() + head.name_offset, "kmain", 5) == 0);
 	CHECK(head.flags == 0);
+	CHECK(head.max_call_stack_depth == 1); // Metal's default
+	CHECK(head.stage_input_layout_count == 0 && head.stage_input_attribute_count == 0);
+	CHECK(head.linked_count == 0);
 
 	CHECK([cs threadExecutionWidth] == 32);           // documented placeholder
 	CHECK([cs maxTotalThreadsPerThreadgroup] == 1024); // documented placeholder
@@ -982,6 +998,111 @@ void test_compute_pipeline_routing()
 	std::memcpy(&head2, bytes2.data(), sizeof(head2));
 	CHECK((head2.flags & RGFX_COMPUTE_PIPELINE_TG_MULTIPLE_OF_EXEC_WIDTH) != 0);
 	CHECK(head2.max_total_threads_per_threadgroup == 256);
+
+	// The stage-input descriptor's layouts and attributes in use, its index type and buffer,
+	// the call stack depth, and the linked functions in their lists, a function made by
+	// descriptor with its options.
+	MTLFunctionDescriptor *fd = [MTLFunctionDescriptor functionDescriptor];
+	fd.name = @"bin";
+	fd.options = MTLFunctionOptionCompileToBinary;
+	id<MTLFunction> binary = [lib newFunctionWithDescriptor:fd error:nil];
+	CHECK(binary.options == MTLFunctionOptionCompileToBinary);
+	MTLComputePipelineDescriptor *whole = [[MTLComputePipelineDescriptor alloc] init];
+	whole.computeFunction = kfn;
+	whole.maxCallStackDepth = 3;
+	MTLStageInputOutputDescriptor *sd = [MTLStageInputOutputDescriptor stageInputOutputDescriptor];
+	sd.layouts[2].stride = 8;
+	sd.layouts[2].stepFunction = MTLStepFunctionThreadPositionInGridX;
+	sd.attributes[1].format = MTLAttributeFormatFloat2;
+	sd.attributes[1].bufferIndex = 2;
+	sd.indexType = MTLIndexTypeUInt32;
+	sd.indexBufferIndex = 5;
+	whole.stageInputDescriptor = sd;
+	MTLLinkedFunctions *linked = [MTLLinkedFunctions linkedFunctions];
+	linked.functions = @[ [lib newFunctionWithName:@"fa"] ];
+	linked.binaryFunctions = @[ binary ];
+	linked.groups = @{
+		@"zeta" : @[ [lib newFunctionWithName:@"gz"] ],
+		@"alpha" : @[ [lib newFunctionWithName:@"ga"], [lib newFunctionWithName:@"gb"] ],
+	};
+	linked.privateFunctions = @[ [lib newFunctionWithName:@"fp"] ];
+	whole.linkedFunctions = linked;
+	RgfxComputePipelineState *cs4 =
+	    [RgfxComputePipelineState computePipelineStateWithDescriptor:whole
+	                                                          device:nil
+	                                                      serializer:&fx.ser
+	                                                           error:nil];
+	CHECK(cs4 != nil);
+	auto bytes4 = nextMessage(fx.ring, RGFX_CMD_COMPUTE_PIPELINE_CREATE);
+	RgfxComputePipelineCreate head4;
+	std::memcpy(&head4, bytes4.data(), sizeof(head4));
+	CHECK(head4.max_call_stack_depth == 3);
+	CHECK(head4.stage_input_layout_count == 1);
+	RgfxVertexBufferLayout sl;
+	std::memcpy(&sl, bytes4.data() + head4.stage_input_layouts_offset, sizeof(sl));
+	CHECK(sl.buffer_index == 2 && sl.stride == 8);
+	CHECK(sl.step_function == static_cast<uint32_t>(MTLStepFunctionThreadPositionInGridX));
+	CHECK(head4.stage_input_attribute_count == 1);
+	RgfxVertexAttribute sa;
+	std::memcpy(&sa, bytes4.data() + head4.stage_input_attributes_offset, sizeof(sa));
+	CHECK(sa.attribute_index == 1 && sa.buffer_index == 2);
+	CHECK(sa.format == static_cast<uint32_t>(MTLAttributeFormatFloat2));
+	CHECK(head4.stage_input_index_type == static_cast<uint32_t>(MTLIndexTypeUInt32));
+	CHECK(head4.stage_input_index_buffer_index == 5);
+	CHECK(head4.linked_count == 6);
+	struct Want {
+		const char *name;
+		uint32_t list;
+		uint32_t options;
+		const char *group;
+	};
+	const Want want[6] = {
+		{"fa", RGFX_LINKED_FUNCTIONS, 0, ""},
+		{"bin", RGFX_LINKED_BINARY_FUNCTIONS, MTLFunctionOptionCompileToBinary, ""},
+		{"ga", RGFX_LINKED_GROUP, 0, "alpha"},
+		{"gb", RGFX_LINKED_GROUP, 0, "alpha"},
+		{"gz", RGFX_LINKED_GROUP, 0, "zeta"},
+		{"fp", RGFX_LINKED_PRIVATE_FUNCTIONS, 0, ""},
+	};
+	for (uint32_t i = 0; i < 6; i++) {
+		RgfxLinkedFunction r;
+		std::memcpy(&r, bytes4.data() + head4.linked_offset + i * sizeof(r), sizeof(r));
+		CHECK(r.library_obj_id == lib.rgfxObjId);
+		CHECK(r.name_len == std::strlen(want[i].name));
+		CHECK(std::memcmp(bytes4.data() + r.name_offset, want[i].name, r.name_len) == 0);
+		CHECK(r.list == want[i].list);
+		CHECK(r.options == want[i].options);
+		CHECK(r.group_len == std::strlen(want[i].group));
+		CHECK(std::memcmp(bytes4.data() + r.group_offset, want[i].group, r.group_len) == 0);
+	}
+
+	// A linked function another device's library made is refused before anything is sent:
+	// the next create is the one the ring holds next.
+	id<MTLDevice> metal = MTLCreateSystemDefaultDevice();
+	id<MTLLibrary> real =
+	    [metal newLibraryWithSource:@"[[visible]] int f(int x) { return x + 1; }" options:nil error:nil];
+	id<MTLFunction> foreign = [real newFunctionWithName:@"f"];
+	CHECK(foreign != nil);
+	MTLLinkedFunctions *other = [MTLLinkedFunctions linkedFunctions];
+	other.privateFunctions = @[ foreign ];
+	whole.linkedFunctions = other;
+	NSError *foreignErr = nil;
+	CHECK([RgfxComputePipelineState computePipelineStateWithDescriptor:whole
+	                                                            device:nil
+	                                                        serializer:&fx.ser
+	                                                             error:&foreignErr] == nil);
+	CHECK(foreignErr.code == RgfxMetalErrorInvalidDescriptor);
+	whole.linkedFunctions = nil;
+	RgfxComputePipelineState *after =
+	    [RgfxComputePipelineState computePipelineStateWithDescriptor:whole
+	                                                          device:nil
+	                                                      serializer:&fx.ser
+	                                                           error:nil];
+	auto bytes5 = nextMessage(fx.ring, RGFX_CMD_COMPUTE_PIPELINE_CREATE);
+	RgfxComputePipelineCreate head5;
+	std::memcpy(&head5, bytes5.data(), sizeof(head5));
+	CHECK(head5.obj_id == after.rgfxObjId);
+	CHECK(head5.linked_count == 0);
 
 	// A compute create with no function is a refusal with an error. (The nil goes
 	// through a variable so the nonnull parameter's literal-nil diagnostic does not

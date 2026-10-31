@@ -1183,6 +1183,19 @@
 // The bytes of [`RgfxFunctionConstant::value`]: the widest constant's, a `long4` or `ulong4`.
 #define RGFX_FUNCTION_CONSTANT_VALUE_BYTES 32
 
+// [`RgfxLinkedFunction`] `list`: `MTLLinkedFunctions.functions`.
+#define RGFX_LINKED_FUNCTIONS 0
+
+// [`RgfxLinkedFunction`] `list`: `MTLLinkedFunctions.privateFunctions`.
+#define RGFX_LINKED_PRIVATE_FUNCTIONS 1
+
+// [`RgfxLinkedFunction`] `list`: `MTLLinkedFunctions.binaryFunctions`.
+#define RGFX_LINKED_BINARY_FUNCTIONS 2
+
+// [`RgfxLinkedFunction`] `list`: one of `MTLLinkedFunctions.groups`, the group its
+// `group_*` name.
+#define RGFX_LINKED_GROUP 3
+
 // One `MTLArgumentDescriptor` of an [`RgfxArgumentLayoutQuery`]; each enum is its Metal raw
 // value.
 typedef struct {
@@ -2258,8 +2271,12 @@ typedef struct {
 // named by `function_library_obj_id` and an entry-point name in the tail
 // (`name_offset`/`name_len`, byte offsets from the message start), optionally
 // specialised by `constant_count` [`RgfxFunctionConstant`] in the tail. The
-// message's `size` is the fixed head plus the tail, rounded up to a multiple of
-// 8.
+// stage-input descriptor's (`stageInputDescriptor`) layouts and attributes are
+// runs of [`RgfxVertexBufferLayout`] and [`RgfxVertexAttribute`] in the tail,
+// their `step_function` an `MTLStepFunction` and their `format` an
+// `MTLAttributeFormat`; the kernel's linked functions (`linkedFunctions`) are a
+// run of [`RgfxLinkedFunction`]. The message's `size` is the fixed head plus the
+// tail, rounded up to a multiple of 8.
 typedef struct {
   // [`RGFX_CMD_COMPUTE_PIPELINE_CREATE`].
   RgfxMsgHeader header;
@@ -2281,8 +2298,24 @@ typedef struct {
   uint32_t max_total_threads_per_threadgroup;
   // `maxCallStackDepth`.
   uint32_t max_call_stack_depth;
+  // The stage-input layouts' byte offset from the message start.
+  uint32_t stage_input_layouts_offset;
+  // The number of stage-input layouts ([`RgfxVertexBufferLayout`]).
+  uint32_t stage_input_layout_count;
+  // The stage-input attributes' byte offset from the message start.
+  uint32_t stage_input_attributes_offset;
+  // The number of stage-input attributes ([`RgfxVertexAttribute`]).
+  uint32_t stage_input_attribute_count;
+  // The stage-input descriptor's `indexType` (`MTLIndexType`).
+  uint32_t stage_input_index_type;
+  // The stage-input descriptor's `indexBufferIndex`.
+  uint32_t stage_input_index_buffer_index;
+  // The kernel's linked functions' byte offset from the message start.
+  uint32_t linked_offset;
+  // The number of [`RgfxLinkedFunction`] the kernel links.
+  uint32_t linked_count;
   // Pads to a multiple of 8; 0.
-  uint32_t reserved_3c;
+  uint32_t reserved_5c;
 } RgfxComputePipelineCreate;
 
 // One resource reference of `useResources:count:usage:` or
@@ -2693,6 +2726,35 @@ typedef struct {
   // The bytes' content key.
   uint8_t key[32];
 } RgfxLibraryLookup;
+
+// One function a pipeline stage links (`MTLLinkedFunctions`), named as a stage's
+// function is: a library `obj_id`, an entry-point name in the message tail and a run
+// of [`RgfxFunctionConstant`] in the tail, with the `MTLFunctionOptions` the guest
+// made it with. A stage's linked functions are a run of these in the tail, each
+// list's in its order; a group's functions carry the group's name.
+typedef struct {
+  // The library the function comes from.
+  uint64_t library_obj_id;
+  // The entry-point name's byte offset from the message start.
+  uint32_t name_offset;
+  // The entry-point name's length in bytes.
+  uint32_t name_len;
+  // The function constants' byte offset from the message start.
+  uint32_t constants_offset;
+  // The number of [`RgfxFunctionConstant`] for the function; 0 for a function made
+  // with none.
+  uint32_t constant_count;
+  // The list the function is in: an `RGFX_LINKED_*`.
+  uint32_t list;
+  // The `MTLFunctionOptions` the function was made with
+  // (`newFunctionWithDescriptor:`); 0 for the other forms.
+  uint32_t options;
+  // For [`RGFX_LINKED_GROUP`], the group name's byte offset from the message
+  // start; 0 otherwise.
+  uint32_t group_offset;
+  // For [`RGFX_LINKED_GROUP`], the group name's length in bytes; 0 otherwise.
+  uint32_t group_len;
+} RgfxLinkedFunction;
 
 // `MANAGED_TEXTURE_CREATE`: a `Managed` texture of shape `desc` at the guest-picked
 // `gpu_address`, with the guest-picked `resource_id`, whose CPU copy is the Shared buffer
@@ -3801,7 +3863,9 @@ typedef struct {
 // The vertex descriptor's layouts and attributes are runs of
 // [`RgfxVertexBufferLayout`] and [`RgfxVertexAttribute`] in the tail. The colour
 // attachments are inline, `color_attachment_count` of
-// [`RgfxColorAttachmentDesc`] in use. The optional pipeline `label` is tail
+// [`RgfxColorAttachmentDesc`] in use. The vertex and fragment stages' linked
+// functions (`vertexLinkedFunctions`, `fragmentLinkedFunctions`) are runs of
+// [`RgfxLinkedFunction`] in the tail. The optional pipeline `label` is tail
 // bytes (`label_len` 0 for none). The whole message's `size` is the fixed head
 // plus the tail, rounded up to a multiple of 8.
 typedef struct {
@@ -3860,6 +3924,14 @@ typedef struct {
   // The eight colour attachments; `color_attachment_count` are in use, the
   // rest zeroed.
   RgfxColorAttachmentDesc colors[8];
+  // The vertex stage's linked functions' byte offset from the message start.
+  uint32_t vertex_linked_offset;
+  // The number of [`RgfxLinkedFunction`] the vertex stage links.
+  uint32_t vertex_linked_count;
+  // The fragment stage's linked functions' byte offset from the message start.
+  uint32_t fragment_linked_offset;
+  // The number of [`RgfxLinkedFunction`] the fragment stage links.
+  uint32_t fragment_linked_count;
 } RgfxRenderPipelineCreate;
 
 // One element of a resource array ([`RgfxOpUseResources`] and the like): a resource

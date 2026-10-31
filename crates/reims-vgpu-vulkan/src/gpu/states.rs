@@ -139,17 +139,17 @@ use metal2vulkan::bind::SamplerDescriptor;
 use metal2vulkan::metal::PrimitiveTopologyClass;
 use metal2vulkan::metal::state::{DepthStencilDescriptor, StencilDescriptor};
 use metal2vulkan::pipeline::{
-    ColorAttachmentDescriptor, ComputePipelineDescriptor, RenderPipelineDescriptor,
-    StageInputAttributeDescriptor, StageInputDescriptor, StageInputLayoutDescriptor, StageSource,
-    TileRenderPipelineDescriptor, VertexAttributeDescriptor, VertexBufferLayoutDescriptor,
-    VertexDescriptor,
+    ColorAttachmentDescriptor, ComputePipelineDescriptor, LinkedFunctions,
+    RenderPipelineDescriptor, StageInputAttributeDescriptor, StageInputDescriptor,
+    StageInputLayoutDescriptor, StageSource, TileRenderPipelineDescriptor,
+    VertexAttributeDescriptor, VertexBufferLayoutDescriptor, VertexDescriptor,
 };
 use metal2vulkan_runtime as rt;
 use reims_vgpu_core::platform::resource::RenderPipeline as _;
 use reims_vgpu_core::platform::types::NsErrorText;
 use reims_vgpu_core::platform::values::{
     ColorAttachmentDesc, DepthStencilDesc, FullComputePipelineDesc, FullRenderPipelineDesc,
-    RenderPipelineDesc, SamplerDesc, StageInputDesc, StencilDesc, VertexDesc,
+    LinkedFunctionsDesc, RenderPipelineDesc, SamplerDesc, StageInputDesc, StencilDesc, VertexDesc,
 };
 use reims_vgpu_core::raise::RaiseResult;
 use reims_vgpu_core::sync::Mutex;
@@ -161,8 +161,8 @@ use crate::gpu::desc::{VulkanRenderPipelineDescriptor, VulkanTileRenderPipelineD
 use crate::gpu::device::{VulkanDevice, nil_pipeline_descriptor};
 use crate::gpu::metal_value;
 use crate::gpu::resource::{
-    RenderDescriptor, RenderPipelineObject, VulkanDepthStencilState, VulkanRenderPipeline,
-    VulkanSamplerState, render_pipeline_of, sampler_state,
+    RenderDescriptor, RenderPipelineObject, VulkanDepthStencilState, VulkanFunction,
+    VulkanRenderPipeline, VulkanSamplerState, render_pipeline_of, sampler_state,
 };
 use crate::gpu::serialized;
 use crate::gpu::timing;
@@ -516,11 +516,17 @@ pub(crate) fn new_render_pipeline_state_full(
     desc: &FullRenderPipelineDesc<'_, VulkanPlatform>,
 ) -> Result<Option<VulkanRenderPipeline>, NsErrorText> {
     let sel = "newRenderPipelineStateWithDescriptor:error:";
-    let mut d =
-        RenderPipelineDescriptor::new(StageSource::Function(desc.vertex.function_descriptor()));
-    d.fragment = desc
-        .fragment
-        .map(|f| StageSource::Function(f.function_descriptor()));
+    let mut d = RenderPipelineDescriptor::new(StageSource::Function(
+        desc.vertex
+            .function_descriptor()
+            .with_linked(linked_functions(&desc.vertex_linked)),
+    ));
+    d.fragment = desc.fragment.map(|f| {
+        StageSource::Function(
+            f.function_descriptor()
+                .with_linked(linked_functions(&desc.fragment_linked)),
+        )
+    });
     d.vertex_descriptor = desc
         .vertex_descriptor
         .as_ref()
@@ -571,6 +577,22 @@ pub(crate) fn new_render_pipeline_state_full(
     )
 }
 
+/// The runtime's linked functions of a whole value's: each function as a stage links it, with its
+/// constant values, and precompiled where it was made compiled to a binary.
+fn linked_functions(l: &LinkedFunctionsDesc<VulkanPlatform>) -> LinkedFunctions {
+    let list = |fs: &[VulkanFunction]| fs.iter().map(|f| f.linked_function()).collect();
+    let mut out = LinkedFunctions::new();
+    out.functions = list(&l.functions);
+    out.binary_functions = list(&l.binary_functions);
+    out.groups = l
+        .groups
+        .iter()
+        .map(|(name, fs)| (name.clone(), list(fs)))
+        .collect();
+    out.private_functions = list(&l.private_functions);
+    out
+}
+
 /// The runtime's colour attachment of a whole value's: none for `MTLPixelFormatInvalid`.
 fn full_color_attachment(
     sel: &'static str,
@@ -600,8 +622,9 @@ fn count(sel: &'static str, what: &str, raw: u64) -> u32 {
     u32::try_from(raw).unwrap_or_else(|_| unrepresentable(sel, &format!("{what} {raw}")))
 }
 
-/// `MTLBufferLayoutStrideDynamic`, a layout's stride the runtime holds as `None`.
-const DYNAMIC_STRIDE: u64 = u32::MAX as u64;
+/// `MTLBufferLayoutStrideDynamic` (`NSUIntegerMax`), a layout's stride the runtime holds as
+/// `None`.
+const DYNAMIC_STRIDE: u64 = u64::MAX;
 
 /// A layout's stride: `None` for `MTLBufferLayoutStrideDynamic`.
 fn layout_stride(sel: &'static str, raw: u64) -> Option<u32> {
@@ -681,8 +704,11 @@ pub(crate) fn full_compute_descriptor(
     sel: &'static str,
     desc: &FullComputePipelineDesc<'_, VulkanPlatform>,
 ) -> ComputePipelineDescriptor {
-    let mut d =
-        ComputePipelineDescriptor::new(StageSource::Function(desc.function.function_descriptor()));
+    let mut d = ComputePipelineDescriptor::new(StageSource::Function(
+        desc.function
+            .function_descriptor()
+            .with_linked(linked_functions(&desc.linked)),
+    ));
     d.threadgroup_size_is_multiple_of_execution_width =
         desc.threadgroup_size_is_multiple_of_execution_width;
     d.max_total_threads_per_threadgroup =
@@ -1088,6 +1114,8 @@ mod tests {
             input_primitive_topology: 0,
             max_vertex_amplification_count: 1,
             support_indirect_command_buffers: false,
+            vertex_linked: LinkedFunctionsDesc::default(),
+            fragment_linked: LinkedFunctionsDesc::default(),
         }
     }
 
@@ -1231,6 +1259,7 @@ mod tests {
             max_call_stack_depth: 3,
             support_indirect_command_buffers: false,
             stage_input: None,
+            linked: LinkedFunctionsDesc::default(),
         };
         let site = catch_death(|| dev().new_compute_pipeline_state_full(&desc)).unwrap_err();
         assert_eq!(site.file, sel);
@@ -1262,6 +1291,119 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(made.max_total_threads_per_threadgroup(), 128);
+    }
+
+    /// `linked_caller.metal`'s kernel, vertex and fragment functions, and `linked_callee.metal`'s
+    /// `linked_add_one`, which they call, made by name and, with `COMPILE_TO_BINARY`, by
+    /// descriptor.
+    fn linked_functions_of_fixtures() -> [VulkanFunction; 5] {
+        use crate::gpu::resource::VulkanLibrary;
+        let d = dev();
+        let library = |bytes: &[u8]| d.new_library(bytes).unwrap().unwrap().unwrap();
+        let caller = library(include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/linked_caller.metallib"
+        )));
+        let callee = library(include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/linked_callee.metallib"
+        )));
+        let named =
+            |l: &VulkanLibrary, name: &str| l.new_function(OnFault::Return, name).unwrap().unwrap();
+        let binary = callee
+            .new_function_with_options(OnFault::Return, "linked_add_one", &[], 1)
+            .unwrap()
+            .unwrap();
+        [
+            named(&caller, "linked_kernel"),
+            named(&caller, "linked_vertex"),
+            named(&caller, "linked_fragment"),
+            named(&callee, "linked_add_one"),
+            binary,
+        ]
+    }
+
+    /// A kernel that calls a visible function its library does not define is made with the
+    /// function linked by any of the lists the value carries (functions, private functions, a
+    /// group, or binary functions of one made compiled to a binary), and the runtime refuses it
+    /// with none, and a binary function not made compiled to a binary
+    #[test]
+    fn a_whole_compute_value_carries_its_linked_functions() {
+        let [kernel, _, _, add_one, binary] = linked_functions_of_fixtures();
+        let sel = "newComputePipelineStateWithDescriptor:options:reflection:error:";
+        let desc = |linked| FullComputePipelineDesc {
+            label: None,
+            function: &kernel,
+            threadgroup_size_is_multiple_of_execution_width: false,
+            max_total_threads_per_threadgroup: 0,
+            max_call_stack_depth: 1,
+            support_indirect_command_buffers: false,
+            stage_input: None,
+            linked,
+        };
+        let one = |f: &VulkanFunction| vec![f.clone_ref()];
+        let linked = |functions, binary_functions, groups, private_functions| LinkedFunctionsDesc {
+            functions,
+            binary_functions,
+            groups,
+            private_functions,
+        };
+        let made = |l: LinkedFunctionsDesc<VulkanPlatform>| {
+            catch_death(|| dev().new_compute_pipeline_state_full(&desc(l)))
+        };
+        for l in [
+            linked(one(&add_one), vec![], vec![], vec![]),
+            linked(vec![], vec![], vec![], one(&add_one)),
+            linked(vec![], one(&binary), vec![], vec![]),
+            linked(
+                vec![],
+                vec![],
+                vec![("g".to_owned(), one(&add_one))],
+                one(&add_one),
+            ),
+        ] {
+            let shown = format!("{l:?}");
+            let state = made(l);
+            assert!(matches!(state, Ok(Ok(Some(_)))), "{shown}: {state:?}");
+        }
+        let d = full_compute_descriptor(
+            sel,
+            &desc(linked(one(&add_one), one(&binary), vec![], vec![])),
+        );
+        let StageSource::Function(f) = &d.kernel else {
+            panic!("{:?}", d.kernel);
+        };
+        assert_eq!(f.linked.functions.len(), 1);
+        assert!(!f.linked.functions[0].precompiled);
+        assert!(f.linked.binary_functions[0].precompiled);
+        for refused in [
+            LinkedFunctionsDesc::default(),
+            linked(vec![], one(&add_one), vec![], vec![]),
+        ] {
+            let shown = format!("{refused:?}");
+            assert!(!matches!(made(refused), Ok(Ok(Some(_)))), "{shown}");
+        }
+    }
+
+    /// A vertex function that calls a visible function its library does not define is made with
+    /// the function linked to the vertex stage, and not with it linked to the fragment stage
+    #[test]
+    fn a_whole_render_value_carries_its_stages_linked_functions() {
+        let [_, vertex, fragment, add_one, _] = linked_functions_of_fixtures();
+        let made = |vertex_linked, fragment_linked| {
+            let mut desc = full_render(&vertex, Some(&fragment));
+            desc.vertex_linked = vertex_linked;
+            desc.fragment_linked = fragment_linked;
+            catch_death(|| dev().new_render_pipeline_state_full(&desc))
+        };
+        let functions = |f: &VulkanFunction| LinkedFunctionsDesc {
+            functions: vec![f.clone_ref()],
+            ..LinkedFunctionsDesc::default()
+        };
+        let state = made(functions(&add_one), LinkedFunctionsDesc::default());
+        assert!(matches!(state, Ok(Ok(Some(_)))), "{state:?}");
+        let state = made(LinkedFunctionsDesc::default(), functions(&add_one));
+        assert!(!matches!(state, Ok(Ok(Some(_)))), "{state:?}");
     }
 
     /// The display's vertex and plain fragment functions, from the platform's shader library.

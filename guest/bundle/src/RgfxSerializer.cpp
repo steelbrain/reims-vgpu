@@ -551,6 +551,40 @@ bool RgfxSerializer::postLibraryChunk(RgfxObjId obj_id, uint64_t region_offset, 
 	return m_control.tryPost(RGFX_CMD_LIBRARY_FROM_REGION, &m, sizeof(m), nullptr, out_status);
 }
 
+namespace {
+
+/// Appends `count` linked functions to a pipeline create's tail through `append`
+/// (which answers the byte offset from the message start of what it appended): each
+/// one's name, constants and group name, then their RgfxLinkedFunction records, whose
+/// offset it answers.
+template <typename Append>
+uint32_t appendLinkedFunctions(Append &append, const RgfxLinkedFunctionRef *refs, uint32_t count)
+{
+	std::vector<RgfxLinkedFunction> records(count);
+	for (uint32_t i = 0; i < count; i++) {
+		const RgfxLinkedFunctionRef &r = refs[i];
+		RgfxLinkedFunction &m = records[i];
+		m.library_obj_id = r.function.library;
+		const uint32_t len =
+		    r.function.entry_point ? static_cast<uint32_t>(std::strlen(r.function.entry_point)) : 0;
+		m.name_offset = append(r.function.entry_point, len);
+		m.name_len = len;
+		m.constants_offset =
+		    append(r.function.constants, r.function.constant_count * sizeof(RgfxFunctionConstant));
+		m.constant_count = r.function.constant_count;
+		m.list = r.list;
+		m.options = r.options;
+		if (r.list == RGFX_LINKED_GROUP && r.group != nullptr) {
+			const uint32_t glen = static_cast<uint32_t>(std::strlen(r.group));
+			m.group_offset = append(r.group, glen);
+			m.group_len = glen;
+		}
+	}
+	return append(records.data(), count * sizeof(RgfxLinkedFunction));
+}
+
+} // namespace
+
 RgfxCreated RgfxSerializer::createRenderPipeline(const RgfxRenderPipelineParams &p)
 {
 	RgfxCreated out = {};
@@ -599,6 +633,11 @@ RgfxCreated RgfxSerializer::createRenderPipeline(const RgfxRenderPipelineParams 
 	msg.vertex_attributes_offset =
 	    append(p.vertex_attributes, p.vertex_attribute_count * sizeof(RgfxVertexAttribute));
 	msg.vertex_attribute_count = p.vertex_attribute_count;
+	msg.vertex_linked_offset = appendLinkedFunctions(append, p.vertex_linked, p.vertex_linked_count);
+	msg.vertex_linked_count = p.vertex_linked_count;
+	msg.fragment_linked_offset =
+	    appendLinkedFunctions(append, p.fragment_linked, p.fragment_linked_count);
+	msg.fragment_linked_count = p.fragment_linked_count;
 
 	msg.raster_sample_count = p.raster_sample_count;
 	uint32_t ncolor = p.color_attachment_count > 8 ? 8 : p.color_attachment_count;
@@ -655,6 +694,16 @@ RgfxCreated RgfxSerializer::createComputePipeline(const RgfxComputePipelineParam
 	msg.flags = p.flags;
 	msg.max_total_threads_per_threadgroup = p.max_total_threads_per_threadgroup;
 	msg.max_call_stack_depth = p.max_call_stack_depth;
+	msg.stage_input_layouts_offset = append(
+	    p.stage_input_layouts, p.stage_input_layout_count * sizeof(RgfxVertexBufferLayout));
+	msg.stage_input_layout_count = p.stage_input_layout_count;
+	msg.stage_input_attributes_offset = append(
+	    p.stage_input_attributes, p.stage_input_attribute_count * sizeof(RgfxVertexAttribute));
+	msg.stage_input_attribute_count = p.stage_input_attribute_count;
+	msg.stage_input_index_type = p.stage_input_index_type;
+	msg.stage_input_index_buffer_index = p.stage_input_index_buffer_index;
+	msg.linked_offset = appendLinkedFunctions(append, p.linked, p.linked_count);
+	msg.linked_count = p.linked_count;
 
 	uint64_t total = roundUp8(head + tail.size());
 	if (total > m_control.dataSize() || total > UINT32_MAX) {

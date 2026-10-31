@@ -2064,24 +2064,9 @@ impl Library<VulkanPlatform> for VulkanLibrary {
         constants: &[reims_vgpu_core::platform::resource::FunctionConstant],
     ) -> RaiseResult<Option<VulkanFunction>> {
         let sel = "newFunctionWithName:constantValues:error:";
-        let mut values = metal2vulkan::library::FunctionConstantValues::defaults();
-        for c in constants {
-            let (Ok(ty), Some(bytes)) = (
-                metal2vulkan::metal::DataType::try_from(c.data_type),
-                c.bytes(),
-            ) else {
-                log::warn!(
-                    "function {function_name:?}: constant {} of MTLDataType {} cannot be carried",
-                    c.index,
-                    c.data_type
-                );
-                return Ok(None);
-            };
-            values = values.with_index(
-                c.index,
-                metal2vulkan::library::FunctionConstantValue::new(ty, bytes.to_vec()),
-            );
-        }
+        let Some(values) = constant_values(function_name, constants) else {
+            return Ok(None);
+        };
         crate::gpu::timing::creation(
             sel,
             "",
@@ -2100,6 +2085,76 @@ impl Library<VulkanPlatform> for VulkanLibrary {
         )
         .map(|made| made.map(Obj::new))
     }
+
+    /// The runtime's `newFunctionWithDescriptor:error:`: the descriptor's constant values nil
+    /// where there are none, and each constant by its index where there are. A constant the
+    /// runtime cannot carry answers nil, as a refused specialisation; options the runtime does
+    /// not know die, as its other creators' unknown raw values do.
+    fn new_function_with_options(
+        &self,
+        _on: OnFault,
+        function_name: &str,
+        constants: &[reims_vgpu_core::platform::resource::FunctionConstant],
+        options: u64,
+    ) -> RaiseResult<Option<VulkanFunction>> {
+        let sel = "newFunctionWithDescriptor:error:";
+        let mut descriptor = rt::FunctionDescriptor::new(function_name);
+        if !constants.is_empty() {
+            let Some(values) = constant_values(function_name, constants) else {
+                return Ok(None);
+            };
+            descriptor.constant_values = Some(values);
+        }
+        descriptor.options = gpu::metal_value(sel, "function options", options);
+        crate::gpu::timing::creation(
+            sel,
+            "",
+            || {
+                create(sel, Policy::Dies, Nil::MissingFunction, || {
+                    self.raw.new_function_with_descriptor(&descriptor)
+                })
+            },
+            || {
+                format!(
+                    "{function_name:?} with {} constants, options {options:#x}",
+                    constants.len()
+                )
+            },
+            |made| match made {
+                Ok(Some(_)) => "found".to_owned(),
+                Ok(None) => "nil".to_owned(),
+                Err(_) => "raised".to_owned(),
+            },
+        )
+        .map(|made| made.map(Obj::new))
+    }
+}
+
+/// The runtime's constant values of `constants`, each by its index: `None`, logged, where one is
+/// of a type the runtime does not know or no function constant takes.
+fn constant_values(
+    function_name: &str,
+    constants: &[reims_vgpu_core::platform::resource::FunctionConstant],
+) -> Option<metal2vulkan::library::FunctionConstantValues> {
+    let mut values = metal2vulkan::library::FunctionConstantValues::defaults();
+    for c in constants {
+        let (Ok(ty), Some(bytes)) = (
+            metal2vulkan::metal::DataType::try_from(c.data_type),
+            c.bytes(),
+        ) else {
+            log::warn!(
+                "function {function_name:?}: constant {} of MTLDataType {} cannot be carried",
+                c.index,
+                c.data_type
+            );
+            return None;
+        };
+        values = values.with_index(
+            c.index,
+            metal2vulkan::library::FunctionConstantValue::new(ty, bytes.to_vec()),
+        );
+    }
+    Some(values)
 }
 
 #[cfg(test)]

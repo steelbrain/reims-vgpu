@@ -56,9 +56,8 @@ use crate::error::Error;
 use crate::graphics::compile::{CompilePool, Pending};
 use crate::graphics::completion::cb_failed;
 use crate::graphics::decode::{
-    CompiledPipeline, CompletionSink, DecodeError, GraphicsDecoder, LibraryJob, LibraryStart,
-    MadeLibrary, PipelineJob, ReflectionSink, compile_pipeline, complete, make_library,
-    refused_reply, refusing,
+    CompletionSink, DecodeError, GraphicsDecoder, LibraryJob, LibraryStart, MadeLibrary,
+    PipelineJob, ReflectionSink, compile_refusing, complete, make_library, refused_reply, refusing,
 };
 use crate::graphics::device_info::device_info;
 use crate::platform::ApiPlatform;
@@ -540,11 +539,8 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     /// wait for it go on, and posts its reply (its reflection, or a refusal) through `poster`.
     fn compile(&self, job: PipelineJob<P>, poster: &CompletionPoster) {
         entry::run(|_| {
-            let (obj_id, seqno, kind) = (job.obj_id, job.seqno, job.kind());
-            let compiled = match refusing(|| compile_pipeline::<P>(&self.device, job)) {
-                Ok(compiled) => compiled,
-                Err(raise) => CompiledPipeline::refused(obj_id, seqno, kind, raise.to_string()),
-            };
+            let (obj_id, seqno) = (job.obj_id, job.seqno);
+            let compiled = compile_refusing::<P>(&self.device, job);
             if let Some(reason) = compiled.refusal() {
                 log::warn!(
                     target: "reims_vgpu::graphics",

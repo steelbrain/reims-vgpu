@@ -51,20 +51,22 @@ use reims_graphics::wire::{
     RGFX_CMD_TEXTURE_VIEW, RGFX_COMPUTE_PIPELINE_SUPPORT_ICB,
     RGFX_COMPUTE_PIPELINE_TG_MULTIPLE_OF_EXEC_WIDTH, RGFX_CONTEXT_ALLOCATIONS_OFFSET,
     RGFX_CONTEXT_OBJ_ID_SHIFT, RGFX_CURSOR_SPAN, RGFX_EVT_PIPELINE_REFLECTION,
-    RGFX_EVT_SAMPLER_STATE, RGFX_EVT_SIZE_AND_ALIGN, RGFX_PIPELINE_KIND_COMPUTE,
-    RGFX_PIPELINE_KIND_RENDER, RGFX_PIPELINE_OK, RGFX_PIPELINE_REFLECT_SUPPORT_ICB,
-    RGFX_PIPELINE_REFLECT_THREADGROUP_MATCHES_TILE, RGFX_PIPELINE_REFUSED,
-    RGFX_RENDER_PIPELINE_ALPHA_TO_COVERAGE, RGFX_RENDER_PIPELINE_ALPHA_TO_ONE,
-    RGFX_RENDER_PIPELINE_RASTERIZATION_ENABLED, RGFX_RENDER_PIPELINE_SUPPORT_ICB,
-    RGFX_RESOURCE_ID_CHUNK, RGFX_RESOURCE_ID_CHUNKS, RGFX_RESOURCE_ID_LIMIT,
-    RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK, RGFX_STATUS_REFUSED, RgfxBufferAtOffset,
-    RgfxBufferCreate, RgfxBufferOverHostMemory, RgfxCbComplete, RgfxColorAttachmentDesc,
-    RgfxComputePipelineCreate, RgfxDepthStencilCreate, RgfxFunctionConstant, RgfxHeapCreate,
-    RgfxHeapOverHostMemory, RgfxHeapTextureSizeAndAlign, RgfxMsgHeader, RgfxObjectCreate,
-    RgfxObjectDestroy, RgfxPipelineReflection, RgfxQueueCreate, RgfxRenderPipelineCreate,
-    RgfxResourceIdChunk, RgfxSamplerCreate, RgfxSamplerState, RgfxSharedEventCreate,
-    RgfxSizeAndAlign, RgfxStencilDescriptor, RgfxTextureCreate, RgfxTextureDescriptor,
-    RgfxTextureFromBuffer, RgfxTextureFromIOSurface, RgfxVertexAttribute, RgfxVertexBufferLayout,
+    RGFX_EVT_SAMPLER_STATE, RGFX_EVT_SIZE_AND_ALIGN, RGFX_LINKED_BINARY_FUNCTIONS,
+    RGFX_LINKED_FUNCTIONS, RGFX_LINKED_GROUP, RGFX_LINKED_PRIVATE_FUNCTIONS,
+    RGFX_PIPELINE_KIND_COMPUTE, RGFX_PIPELINE_KIND_RENDER, RGFX_PIPELINE_OK,
+    RGFX_PIPELINE_REFLECT_SUPPORT_ICB, RGFX_PIPELINE_REFLECT_THREADGROUP_MATCHES_TILE,
+    RGFX_PIPELINE_REFUSED, RGFX_RENDER_PIPELINE_ALPHA_TO_COVERAGE,
+    RGFX_RENDER_PIPELINE_ALPHA_TO_ONE, RGFX_RENDER_PIPELINE_RASTERIZATION_ENABLED,
+    RGFX_RENDER_PIPELINE_SUPPORT_ICB, RGFX_RESOURCE_ID_CHUNK, RGFX_RESOURCE_ID_CHUNKS,
+    RGFX_RESOURCE_ID_LIMIT, RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK, RGFX_STATUS_REFUSED,
+    RgfxBufferAtOffset, RgfxBufferCreate, RgfxBufferOverHostMemory, RgfxCbComplete,
+    RgfxColorAttachmentDesc, RgfxComputePipelineCreate, RgfxDepthStencilCreate,
+    RgfxFunctionConstant, RgfxHeapCreate, RgfxHeapOverHostMemory, RgfxHeapTextureSizeAndAlign,
+    RgfxLinkedFunction, RgfxMsgHeader, RgfxObjectCreate, RgfxObjectDestroy, RgfxPipelineReflection,
+    RgfxQueueCreate, RgfxRenderPipelineCreate, RgfxResourceIdChunk, RgfxSamplerCreate,
+    RgfxSamplerState, RgfxSharedEventCreate, RgfxSizeAndAlign, RgfxStencilDescriptor,
+    RgfxTextureCreate, RgfxTextureDescriptor, RgfxTextureFromBuffer, RgfxTextureFromIOSurface,
+    RgfxVertexAttribute, RgfxVertexBufferLayout,
 };
 use reims_vgpu_core::host::HostPtr;
 use reims_vgpu_core::platform::device::GpuDevice;
@@ -74,8 +76,8 @@ use reims_vgpu_core::platform::resource::{
 use reims_vgpu_core::platform::types::Swizzle;
 use reims_vgpu_core::platform::values::{
     AttributeDesc, BufferDesc, BufferLayoutDesc, ColorAttachmentDesc, DepthStencilDesc,
-    FullComputePipelineDesc, FullRenderPipelineDesc, HeapDesc, OptionSet, SamplerDesc, StencilDesc,
-    TextureDesc, VertexDesc,
+    FullComputePipelineDesc, FullRenderPipelineDesc, HeapDesc, LinkedFunctionsDesc, OptionSet,
+    SamplerDesc, StageInputDesc, StencilDesc, TextureDesc, VertexDesc,
 };
 use reims_vgpu_core::platform::{Handle, HostRange, Platform};
 use reims_vgpu_core::raise::{OnFault, Raise, RaiseResult, refusals};
@@ -960,11 +962,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                 return Ok(Err(e));
             }
         };
-        let (obj_id, seqno, kind) = (job.obj_id, job.seqno, job.kind());
-        let compiled = match refusing(|| compile_pipeline::<P>(device, job)) {
-            Ok(compiled) => compiled,
-            Err(raise) => CompiledPipeline::refused(obj_id, seqno, kind, raise.to_string()),
-        };
+        let compiled = compile_refusing::<P>(device, job);
         let refused = compiled.is_refused();
         if let Some(sink) = self.reflection_sink.clone() {
             sink(compiled.reflection);
@@ -982,18 +980,20 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// compile needs nothing of the decoder's. A library reference that names no library is a
     /// guest protocol error, as the other creates treat one ([`DecodeError::BadReference`]); a
     /// span the message does not cover, a name that is not UTF-8, more than eight colour
-    /// attachments, or a vertex buffer or attribute index past Metal's last (30), is
-    /// [`DecodeError::Malformed`]. Neither is answered. A render create naming library 0 and no
-    /// name for its fragment function has none (a pipeline that does not rasterize).
+    /// attachments, a vertex or stage-input buffer or attribute index past Metal's last (30), or a
+    /// linked function in no list Metal has, is [`DecodeError::Malformed`]. Neither is answered. A
+    /// render create naming library 0 and no name for its fragment function has none (a pipeline
+    /// that does not rasterize).
     ///
     /// Every field the wire carries reaches the platform's creator: the render form's functions,
     /// vertex descriptor, colour attachments (format, blending, factors, operations, write mask),
     /// depth and stencil formats, raster sample count, alpha-to-coverage and alpha-to-one,
-    /// rasterization, input primitive topology, maximum vertex amplification count and indirect
-    /// command buffer support, and its label; the compute form's function, threadgroup-size
-    /// multiple, maximum threads per threadgroup, maximum call stack depth and indirect command
-    /// buffer support. Each function is specialised by the index-keyed constants the wire carries
-    /// for it.
+    /// rasterization, input primitive topology, maximum vertex amplification count, indirect
+    /// command buffer support, the vertex and fragment stages' linked functions, and its label;
+    /// the compute form's function, threadgroup-size multiple, maximum threads per threadgroup,
+    /// maximum call stack depth, indirect command buffer support, stage-input descriptor and
+    /// linked functions. Each function is specialised by the index-keyed constants the wire
+    /// carries for it, and each linked function made with the options the guest made it with.
     pub(crate) fn prepare_pipeline(&self, message: &[u8]) -> Result<PipelineJob<P>, DecodeError> {
         let library = |obj_id: u64| self.library_ref(obj_id);
         let header = read::<RgfxMsgHeader>(message).ok_or(DecodeError::Malformed)?;
@@ -1004,6 +1004,8 @@ impl<P: Platform> GraphicsDecoder<P> {
                 str_tail(message, m.name_offset, m.name_len).ok_or(DecodeError::Malformed)?;
             let constants = constants_tail(message, m.constants_offset, m.constant_count)
                 .ok_or(DecodeError::Malformed)?;
+            let linked = self.linked_tail(message, m.linked_offset, m.linked_count)?;
+            let stage_input = stage_input(message, &m)?;
             return Ok(PipelineJob {
                 obj_id: m.obj_id,
                 seqno: m.header.seqno,
@@ -1011,6 +1013,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                     library,
                     name: name.to_owned(),
                     constants,
+                    linked,
                     fields: ComputeFields {
                         threadgroup_size_is_multiple_of_execution_width: m.flags
                             & RGFX_COMPUTE_PIPELINE_TG_MULTIPLE_OF_EXEC_WIDTH
@@ -1022,6 +1025,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                         support_indirect_command_buffers: m.flags
                             & RGFX_COMPUTE_PIPELINE_SUPPORT_ICB
                             != 0,
+                        stage_input,
                     },
                 },
             });
@@ -1059,6 +1063,10 @@ impl<P: Platform> GraphicsDecoder<P> {
                     .to_owned(),
             )
         };
+        let vertex_linked =
+            self.linked_tail(message, m.vertex_linked_offset, m.vertex_linked_count)?;
+        let fragment_linked =
+            self.linked_tail(message, m.fragment_linked_offset, m.fragment_linked_count)?;
         Ok(PipelineJob {
             obj_id: m.obj_id,
             seqno: m.header.seqno,
@@ -1068,9 +1076,51 @@ impl<P: Platform> GraphicsDecoder<P> {
                 vertex_constants,
                 fragment,
                 label,
+                vertex_linked,
+                fragment_linked,
                 fields: render_fields(message, &m)?,
             },
         })
+    }
+
+    /// The `count` linked functions at byte `offset` of `message`: each one's library resolved
+    /// from the table, its name, constants and options, and its list. A library that names none is
+    /// [`DecodeError::BadReference`]; a span the message does not cover, a name that is not UTF-8,
+    /// or a list Metal has none of is [`DecodeError::Malformed`].
+    fn linked_tail(
+        &self,
+        message: &[u8],
+        offset: u32,
+        count: u32,
+    ) -> Result<Vec<LinkedRef<P>>, DecodeError> {
+        let records = records_tail::<RgfxLinkedFunction>(message, offset, count)
+            .ok_or(DecodeError::Malformed)?;
+        records
+            .iter()
+            .map(|r| {
+                let list = match r.list {
+                    RGFX_LINKED_FUNCTIONS => LinkedList::Functions,
+                    RGFX_LINKED_BINARY_FUNCTIONS => LinkedList::Binary,
+                    RGFX_LINKED_PRIVATE_FUNCTIONS => LinkedList::Private,
+                    RGFX_LINKED_GROUP => LinkedList::Group(
+                        str_tail(message, r.group_offset, r.group_len)
+                            .ok_or(DecodeError::Malformed)?
+                            .to_owned(),
+                    ),
+                    _ => return Err(DecodeError::Malformed),
+                };
+                Ok(LinkedRef {
+                    library: self.library_ref(r.library_obj_id)?,
+                    name: str_tail(message, r.name_offset, r.name_len)
+                        .ok_or(DecodeError::Malformed)?
+                        .to_owned(),
+                    constants: constants_tail(message, r.constants_offset, r.constant_count)
+                        .ok_or(DecodeError::Malformed)?,
+                    options: r.options.into(),
+                    list,
+                })
+            })
+            .collect()
     }
 
     /// The last step of a pipeline create: stores the compiled pipeline under its id (a refused
@@ -1113,14 +1163,38 @@ enum PipelineShape<P: Platform> {
         /// The fragment function's library, name and constants; `None` for none.
         fragment: Option<(LibraryRef<P>, String, Vec<FunctionConstant>)>,
         label: Option<String>,
+        vertex_linked: Vec<LinkedRef<P>>,
+        fragment_linked: Vec<LinkedRef<P>>,
         fields: RenderFields,
     },
     Compute {
         library: LibraryRef<P>,
         name: String,
         constants: Vec<FunctionConstant>,
+        linked: Vec<LinkedRef<P>>,
         fields: ComputeFields,
     },
+}
+
+/// A linked function a pipeline create names, prepared: its library, name, constants and
+/// options, and the list of `MTLLinkedFunctions` it is in.
+struct LinkedRef<P: Platform> {
+    library: LibraryRef<P>,
+    name: String,
+    constants: Vec<FunctionConstant>,
+    /// The `MTLFunctionOptions` the guest made it with.
+    options: u64,
+    list: LinkedList,
+}
+
+/// The list of `MTLLinkedFunctions` a linked function is in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LinkedList {
+    Functions,
+    Binary,
+    /// The call-site group of this name.
+    Group(String),
+    Private,
 }
 
 /// A render pipeline create's descriptor past its functions and label, owned: the fields of
@@ -1140,14 +1214,15 @@ struct RenderFields {
     support_indirect_command_buffers: bool,
 }
 
-/// A compute pipeline create's descriptor past its function: the fields of
-/// [`FullComputePipelineDesc`] the compile hands the platform with it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// A compute pipeline create's descriptor past its function and linked functions: the fields of
+/// [`FullComputePipelineDesc`] the compile hands the platform with them.
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ComputeFields {
     threadgroup_size_is_multiple_of_execution_width: bool,
     max_total_threads_per_threadgroup: u64,
     max_call_stack_depth: u64,
     support_indirect_command_buffers: bool,
+    stage_input: Option<StageInputDesc>,
 }
 
 /// The highest vertex buffer and attribute index Metal's arrays hold: a larger one raises there.
@@ -1169,44 +1244,14 @@ fn render_fields(
         .zip(0u64..)
         .map(|(c, index)| (index, color_attachment(c)))
         .collect();
-    let layouts = records_tail::<RgfxVertexBufferLayout>(
+    let (layouts, attributes) = layout_runs(
         message,
-        m.vertex_layouts_offset,
-        m.vertex_layout_count,
-    )
-    .ok_or(DecodeError::Malformed)?;
-    let attributes = records_tail::<RgfxVertexAttribute>(
-        message,
-        m.vertex_attributes_offset,
-        m.vertex_attribute_count,
-    )
-    .ok_or(DecodeError::Malformed)?;
-    let past_last = layouts.iter().any(|l| l.buffer_index > LAST_VERTEX_INDEX)
-        || attributes
-            .iter()
-            .any(|a| a.attribute_index > LAST_VERTEX_INDEX || a.buffer_index > LAST_VERTEX_INDEX);
-    if past_last {
-        return Err(DecodeError::Malformed);
-    }
-    let vertex_descriptor = (!layouts.is_empty() || !attributes.is_empty()).then(|| VertexDesc {
-        layouts: layouts
-            .iter()
-            .map(|l| BufferLayoutDesc {
-                buffer_index: l.buffer_index.into(),
-                stride: l.stride.into(),
-                step_function: l.step_function.into(),
-                step_rate: l.step_rate.into(),
-            })
-            .collect(),
-        attributes: attributes
-            .iter()
-            .map(|a| AttributeDesc {
-                attribute_index: a.attribute_index.into(),
-                format: a.format.into(),
-                offset: a.offset.into(),
-                buffer_index: a.buffer_index.into(),
-            })
-            .collect(),
+        (m.vertex_layouts_offset, m.vertex_layout_count),
+        (m.vertex_attributes_offset, m.vertex_attribute_count),
+    )?;
+    let vertex_descriptor = (!layouts.is_empty() || !attributes.is_empty()).then_some(VertexDesc {
+        layouts,
+        attributes,
     });
     Ok(RenderFields {
         vertex_descriptor,
@@ -1221,6 +1266,81 @@ fn render_fields(
         max_vertex_amplification_count: m.max_vertex_amplification_count.into(),
         support_indirect_command_buffers: m.flags & RGFX_RENDER_PIPELINE_SUPPORT_ICB != 0,
     })
+}
+
+/// The wire's stride for `MTLBufferLayoutStrideDynamic`, which the guest's 32 bits hold as their
+/// highest value.
+const WIRE_DYNAMIC_STRIDE: u32 = u32::MAX;
+
+/// The layouts and attributes of a vertex or stage-input descriptor: the runs of
+/// [`RgfxVertexBufferLayout`] and [`RgfxVertexAttribute`] at the `(offset, count)` spans of
+/// `message`, each stride as Metal's (`MTLBufferLayoutStrideDynamic` its `NSUIntegerMax`). A run
+/// the message does not hold, or a buffer or attribute index past Metal's last, is
+/// [`DecodeError::Malformed`].
+fn layout_runs(
+    message: &[u8],
+    (layouts_offset, layout_count): (u32, u32),
+    (attributes_offset, attribute_count): (u32, u32),
+) -> Result<(Vec<BufferLayoutDesc>, Vec<AttributeDesc>), DecodeError> {
+    let layouts = records_tail::<RgfxVertexBufferLayout>(message, layouts_offset, layout_count)
+        .ok_or(DecodeError::Malformed)?;
+    let attributes =
+        records_tail::<RgfxVertexAttribute>(message, attributes_offset, attribute_count)
+            .ok_or(DecodeError::Malformed)?;
+    let past_last = layouts.iter().any(|l| l.buffer_index > LAST_VERTEX_INDEX)
+        || attributes
+            .iter()
+            .any(|a| a.attribute_index > LAST_VERTEX_INDEX || a.buffer_index > LAST_VERTEX_INDEX);
+    if past_last {
+        return Err(DecodeError::Malformed);
+    }
+    let layouts = layouts
+        .iter()
+        .map(|l| BufferLayoutDesc {
+            buffer_index: l.buffer_index.into(),
+            stride: if l.stride == WIRE_DYNAMIC_STRIDE {
+                u64::MAX
+            } else {
+                l.stride.into()
+            },
+            step_function: l.step_function.into(),
+            step_rate: l.step_rate.into(),
+        })
+        .collect();
+    let attributes = attributes
+        .iter()
+        .map(|a| AttributeDesc {
+            attribute_index: a.attribute_index.into(),
+            format: a.format.into(),
+            offset: a.offset.into(),
+            buffer_index: a.buffer_index.into(),
+        })
+        .collect();
+    Ok((layouts, attributes))
+}
+
+/// A compute create's stage-input descriptor: none where it carries neither layouts nor
+/// attributes.
+fn stage_input(
+    message: &[u8],
+    m: &RgfxComputePipelineCreate,
+) -> Result<Option<StageInputDesc>, DecodeError> {
+    let (layouts, attributes) = layout_runs(
+        message,
+        (m.stage_input_layouts_offset, m.stage_input_layout_count),
+        (
+            m.stage_input_attributes_offset,
+            m.stage_input_attribute_count,
+        ),
+    )?;
+    Ok(
+        (!layouts.is_empty() || !attributes.is_empty()).then(|| StageInputDesc {
+            layouts,
+            attributes,
+            index_type: m.stage_input_index_type.into(),
+            index_buffer_index: m.stage_input_index_buffer_index.into(),
+        }),
+    )
 }
 
 /// A colour attachment of the wire as the platform's value: each field its own.
@@ -1284,6 +1404,90 @@ impl<P: Platform> CompiledPipeline<P> {
     }
 }
 
+/// [`compile_pipeline`] in the lane's refusal scope ([`refusing`]): a platform refusing the
+/// compile refuses the create, and a refusal's reason names the pipeline's functions and the
+/// constants each was specialised with, for the host's log.
+pub(crate) fn compile_refusing<P: Platform>(
+    device: &P::Device,
+    job: PipelineJob<P>,
+) -> CompiledPipeline<P> {
+    let (obj_id, seqno, kind) = (job.obj_id, job.seqno, job.kind());
+    let functions = job.functions();
+    let mut compiled = match refusing(|| compile_pipeline::<P>(device, job)) {
+        Ok(compiled) => compiled,
+        Err(raise) => CompiledPipeline::refused(obj_id, seqno, kind, raise.to_string()),
+    };
+    if let Some(reason) = compiled.refusal.as_mut() {
+        reason.push_str(&format!("; its functions: {functions}"));
+    }
+    compiled
+}
+
+/// A pipeline create's functions, for the host's log: each stage's function name and the
+/// constants it is specialised with, then each linked function's.
+pub(crate) struct PipelineFunctions(Vec<(&'static str, String, Vec<FunctionConstant>)>);
+
+impl std::fmt::Display for PipelineFunctions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (i, (stage, name, constants)) in self.0.iter().enumerate() {
+            if i > 0 {
+                f.write_str(", ")?;
+            }
+            write!(f, "{stage} {name:?} [")?;
+            for (j, c) in constants.iter().enumerate() {
+                if j > 0 {
+                    f.write_str(" ")?;
+                }
+                write!(f, "{}:{}=", c.index, c.data_type)?;
+                for b in c.bytes().unwrap_or(&c.value) {
+                    write!(f, "{b:02x}")?;
+                }
+            }
+            f.write_str("]")?;
+        }
+        Ok(())
+    }
+}
+
+impl<P: Platform> PipelineJob<P> {
+    /// The create's functions and their constants ([`PipelineFunctions`]).
+    pub(crate) fn functions(&self) -> PipelineFunctions {
+        let linked = |stage: &'static str, refs: &[LinkedRef<P>]| {
+            refs.iter()
+                .map(move |r| (stage, r.name.clone(), r.constants.clone()))
+                .collect::<Vec<_>>()
+        };
+        let mut out = Vec::new();
+        match &self.shape {
+            PipelineShape::Render {
+                vertex_name,
+                vertex_constants,
+                fragment,
+                vertex_linked,
+                fragment_linked,
+                ..
+            } => {
+                out.push(("vertex", vertex_name.clone(), vertex_constants.clone()));
+                if let Some((_, name, constants)) = fragment {
+                    out.push(("fragment", name.clone(), constants.clone()));
+                }
+                out.extend(linked("vertex-linked", vertex_linked));
+                out.extend(linked("fragment-linked", fragment_linked));
+            }
+            PipelineShape::Compute {
+                name,
+                constants,
+                linked: refs,
+                ..
+            } => {
+                out.push(("kernel", name.clone(), constants.clone()));
+                out.extend(linked("linked", refs));
+            }
+        }
+        PipelineFunctions(out)
+    }
+}
+
 /// The middle step of a pipeline create, with no lock held: the functions specialised by their
 /// constants and the pipeline made on `device`. A nil function (the library has no such entry
 /// point, or refuses the specialisation) refuses the pipeline, as a nil state or an `NSError`
@@ -1306,6 +1510,8 @@ pub(crate) fn compile_pipeline<P: Platform>(
             vertex_constants,
             fragment,
             label,
+            vertex_linked,
+            fragment_linked,
             fields,
         } => {
             // A library being made is waited for here; one the platform refused refuses the
@@ -1329,6 +1535,14 @@ pub(crate) fn compile_pipeline<P: Platform>(
                     Some(function)
                 }
             };
+            let vertex_linked = match linked_functions::<P>(vertex_linked)? {
+                Ok(linked) => linked,
+                Err(reason) => return Ok(refused(reason)),
+            };
+            let fragment_linked = match linked_functions::<P>(fragment_linked)? {
+                Ok(linked) => linked,
+                Err(reason) => return Ok(refused(reason)),
+            };
             let desc = FullRenderPipelineDesc::<P> {
                 label: label.as_deref(),
                 vertex: &vertex,
@@ -1344,6 +1558,8 @@ pub(crate) fn compile_pipeline<P: Platform>(
                 input_primitive_topology: fields.input_primitive_topology,
                 max_vertex_amplification_count: fields.max_vertex_amplification_count,
                 support_indirect_command_buffers: fields.support_indirect_command_buffers,
+                vertex_linked,
+                fragment_linked,
             };
             // A nil state or an `NSError` refuses; a refusal Metal answers with none dies at the
             // send, inside the caller's refusal scope.
@@ -1360,6 +1576,7 @@ pub(crate) fn compile_pipeline<P: Platform>(
             library,
             name,
             constants,
+            linked,
             fields,
         } => {
             let Some(library) = library.resolve() else {
@@ -1367,6 +1584,10 @@ pub(crate) fn compile_pipeline<P: Platform>(
             };
             let Some(function) = specialised::<P>(&library, &name, &constants)? else {
                 return Ok(refused(no_function(&name)));
+            };
+            let linked = match linked_functions::<P>(linked)? {
+                Ok(linked) => linked,
+                Err(reason) => return Ok(refused(reason)),
             };
             let desc = FullComputePipelineDesc::<P> {
                 label: None,
@@ -1376,7 +1597,8 @@ pub(crate) fn compile_pipeline<P: Platform>(
                 max_total_threads_per_threadgroup: fields.max_total_threads_per_threadgroup,
                 max_call_stack_depth: fields.max_call_stack_depth,
                 support_indirect_command_buffers: fields.support_indirect_command_buffers,
-                stage_input: None,
+                stage_input: fields.stage_input,
+                linked,
             };
             Ok(match device.new_compute_pipeline_state_full(&desc) {
                 Ok(Some(pipeline)) => {
@@ -1457,6 +1679,44 @@ fn specialised<P: Platform>(
     } else {
         library.new_function_with_constants(OnFault::Return, name, constants)
     }
+}
+
+/// The linked functions `refs` name, made: each from its library, specialised by its constants,
+/// with its options where it was made with any, in its list. A library the platform refused, or
+/// a function the library makes none of, is the refusal's reason.
+fn linked_functions<P: Platform>(
+    refs: Vec<LinkedRef<P>>,
+) -> RaiseResult<Result<LinkedFunctionsDesc<P>, String>> {
+    let mut out = LinkedFunctionsDesc::<P>::default();
+    for r in refs {
+        let Some(library) = r.library.resolve() else {
+            return Ok(Err(format!(
+                "linked function {:?}'s library was refused",
+                r.name
+            )));
+        };
+        let function = if r.options == 0 {
+            specialised::<P>(&library, &r.name, &r.constants)?
+        } else {
+            library.new_function_with_options(OnFault::Return, &r.name, &r.constants, r.options)?
+        };
+        let Some(function) = function else {
+            return Ok(Err(format!(
+                "the library made no linked function {:?} of its constants and options",
+                r.name
+            )));
+        };
+        match r.list {
+            LinkedList::Functions => out.functions.push(function),
+            LinkedList::Binary => out.binary_functions.push(function),
+            LinkedList::Private => out.private_functions.push(function),
+            LinkedList::Group(name) => match out.groups.iter_mut().find(|(n, _)| *n == name) {
+                Some((_, group)) => group.push(function),
+                None => out.groups.push((name, vec![function])),
+            },
+        }
+    }
+    Ok(Ok(out))
 }
 
 /// `count` wire records of `T` at `offset` from the message start: `None` where the message does
@@ -3197,6 +3457,302 @@ mod tests {
                     max_total_threads_per_threadgroup: 256, max_call_stack_depth: 7, \
                     support_indirect_command_buffers: true, stage_input: None";
         assert!(logged.contains(part), "{logged}");
+    }
+
+    /// Appends to `bytes` the linked functions `specs` name, each of library `library`: its name,
+    /// list, `MTLFunctionOptions`, group name (empty for none) and constants, then their records,
+    /// and answers the records' offset and count; the message's size is set again, a multiple of
+    /// 8.
+    fn append_linked(
+        bytes: &mut Vec<u8>,
+        library: u64,
+        specs: &[(&str, u32, u32, &str, &[RgfxFunctionConstant])],
+    ) -> (u32, u32) {
+        let mut records = Vec::new();
+        for &(name, list, options, group, constants) in specs {
+            let name_offset = bytes.len() as u32;
+            bytes.extend_from_slice(name.as_bytes());
+            let group_offset = bytes.len() as u32;
+            bytes.extend_from_slice(group.as_bytes());
+            let constants_offset = bytes.len() as u32;
+            bytes.extend_from_slice(constants.as_bytes());
+            records.push(RgfxLinkedFunction {
+                library_obj_id: library,
+                name_offset,
+                name_len: name.len() as u32,
+                constants_offset,
+                constant_count: constants.len() as u32,
+                list,
+                options,
+                group_offset: if group.is_empty() { 0 } else { group_offset },
+                group_len: group.len() as u32,
+            });
+        }
+        bytes.resize(bytes.len().next_multiple_of(8), 0);
+        let at = bytes.len() as u32;
+        bytes.extend_from_slice(records.as_bytes());
+        let size = bytes.len() as u32;
+        bytes[4..8].copy_from_slice(&size.to_le_bytes());
+        (at, specs.len() as u32)
+    }
+
+    /// `message` with its fixed head of `T` edited by `f`.
+    fn edit_head<T: FromBytes + IntoBytes + KnownLayout + Immutable>(
+        message: &mut [u8],
+        f: impl FnOnce(&mut T),
+    ) {
+        let (mut m, _) = T::read_from_prefix(message).unwrap();
+        f(&mut m);
+        message[..size_of::<T>()].copy_from_slice(m.as_bytes());
+    }
+
+    /// A compute create of library 1's `cmain`, with no field past its function set.
+    fn compute_create(obj_id: u64) -> Vec<u8> {
+        let head = size_of::<RgfxComputePipelineCreate>() as u32;
+        let name = b"cmain".as_slice();
+        let total = (head as usize + name.len()).next_multiple_of(8);
+        let m = RgfxComputePipelineCreate {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_COMPUTE_PIPELINE_CREATE,
+                size: total as u32,
+                seqno: 4,
+            },
+            obj_id,
+            function_library_obj_id: 1,
+            name_offset: head,
+            name_len: name.len() as u32,
+            max_call_stack_depth: 1,
+            ..RgfxComputePipelineCreate::default()
+        };
+        let mut bytes = m.as_bytes().to_vec();
+        bytes.extend_from_slice(name);
+        bytes.resize(total, 0);
+        bytes
+    }
+
+    /// The `ObjId` numbers in `text` after `from`, in order.
+    fn ids_after(text: &str, from: &str) -> Vec<u64> {
+        let rest = &text[text
+            .find(from)
+            .unwrap_or_else(|| panic!("{text}\nlacks {from}"))..];
+        rest.split("ObjId(")
+            .skip(1)
+            .map(|p| p[..p.find(')').unwrap()].parse().unwrap())
+            .collect()
+    }
+
+    /// A compute create's linked functions reach the platform's creator in their lists, each
+    /// made from its library with its constants, and with its options where it has any (a binary
+    /// function compiled to a binary); its stage-input descriptor reaches it too, a dynamic
+    /// stride as Metal's `MTLBufferLayoutStrideDynamic`
+    #[test]
+    fn a_compute_create_carries_its_linked_functions_and_stage_input() {
+        let (p, mut dec, replies) = pipeline_decoder();
+        let device = p.device();
+        let mut bytes = compute_create(100);
+        let constant = RgfxFunctionConstant {
+            index: 2,
+            data_type: 29,
+            value: [7; 32],
+        };
+        let (linked_offset, linked_count) = append_linked(
+            &mut bytes,
+            1,
+            &[
+                ("fa", RGFX_LINKED_FUNCTIONS, 0, "", &[]),
+                ("fb", RGFX_LINKED_BINARY_FUNCTIONS, 1, "", &[]),
+                ("ga", RGFX_LINKED_GROUP, 0, "g", &[]),
+                ("gb", RGFX_LINKED_GROUP, 0, "g", &[]),
+                ("fp", RGFX_LINKED_PRIVATE_FUNCTIONS, 0, "", &[constant]),
+            ],
+        );
+        let layouts_at = bytes.len() as u32;
+        bytes.extend_from_slice(
+            RgfxVertexBufferLayout {
+                buffer_index: 1,
+                stride: u32::MAX,
+                step_function: 5,
+                step_rate: 1,
+            }
+            .as_bytes(),
+        );
+        let attributes_at = bytes.len() as u32;
+        bytes.extend_from_slice(
+            RgfxVertexAttribute {
+                attribute_index: 0,
+                format: 36,
+                offset: 0,
+                buffer_index: 1,
+            }
+            .as_bytes(),
+        );
+        let size = bytes.len() as u32;
+        edit_head(&mut bytes, |m: &mut RgfxComputePipelineCreate| {
+            m.header.size = size;
+            m.linked_offset = linked_offset;
+            m.linked_count = linked_count;
+            m.stage_input_layouts_offset = layouts_at;
+            m.stage_input_layout_count = 1;
+            m.stage_input_attributes_offset = attributes_at;
+            m.stage_input_attribute_count = 1;
+            m.stage_input_index_type = 1;
+            m.stage_input_index_buffer_index = 2;
+        });
+        let mark = p.call_log().mark();
+        assert_eq!(dec.decode(&device, &bytes).unwrap(), Ok(()));
+        assert_eq!(replies.lock()[0].status, RGFX_PIPELINE_OK);
+        // Each function made in the wire's order, the binary one with its options.
+        let made: Vec<_> = p
+            .call_log()
+            .since(mark)
+            .into_iter()
+            .filter(|c| c.sel.starts_with("newFunction"))
+            .map(|c| (c.sel, c.args.clone()))
+            .collect();
+        let sels: Vec<_> = made.iter().map(|(sel, _)| *sel).collect();
+        assert_eq!(
+            sels,
+            [
+                "newFunctionWithName:",
+                "newFunctionWithName:",
+                "newFunctionWithDescriptor:error:",
+                "newFunctionWithName:",
+                "newFunctionWithName:",
+                "newFunctionWithName:constantValues:error:",
+            ]
+        );
+        assert_eq!(made[2].1[..2], [Arg::Str("fb".to_owned()), Arg::U64(1)]);
+        assert_eq!(
+            made[5].1[..3],
+            [Arg::Str("fp".to_owned()), Arg::U64(2), Arg::U64(29)]
+        );
+        let calls = p
+            .call_log()
+            .calls_to("newComputePipelineStateWithDescriptor:options:reflection:error:");
+        let Arg::Val(logged) = &calls[0].args[0] else {
+            panic!("{:?}", calls[0].args);
+        };
+        // The kernel, then fa, fb, ga, gb and fp, each in its own list.
+        let [kernel] = ids_after(logged, "function: ")[..1] else {
+            unreachable!()
+        };
+        let lists = [
+            "functions: [",
+            "binary_functions: [",
+            "groups: [(\"g\", [",
+            "private_functions: [",
+        ];
+        let firsts: Vec<_> = lists.iter().map(|l| ids_after(logged, l)[0]).collect();
+        assert!(kernel < firsts[0], "{logged}");
+        assert!(firsts.windows(2).all(|w| w[0] < w[1]), "{logged}");
+        assert!(logged.contains("groups: [(\"g\", [ObjId("), "{logged}");
+        assert_eq!(
+            ids_after(logged, "groups: [").len(),
+            3,
+            "two in g, then fp: {logged}"
+        );
+        let stage = "stage_input: Some(StageInputDesc { layouts: [BufferLayoutDesc { buffer_index: \
+                     1, stride: 18446744073709551615, step_function: 5, step_rate: 1 }], \
+                     attributes: [AttributeDesc { attribute_index: 0, format: 36, offset: 0, \
+                     buffer_index: 1 }], index_type: 1, index_buffer_index: 2 })";
+        assert!(logged.contains(stage), "{logged}");
+    }
+
+    /// A render create's vertex and fragment linked functions reach the platform's creator, each
+    /// stage's its own
+    #[test]
+    fn a_render_create_carries_its_stages_linked_functions() {
+        let (p, mut dec, replies) = pipeline_decoder();
+        let device = p.device();
+        let mut bytes = whole_render_create(100, true);
+        let vertex = append_linked(&mut bytes, 1, &[("va", RGFX_LINKED_FUNCTIONS, 0, "", &[])]);
+        let fragment = append_linked(
+            &mut bytes,
+            1,
+            &[("fa", RGFX_LINKED_PRIVATE_FUNCTIONS, 0, "", &[])],
+        );
+        edit_head(&mut bytes, |m: &mut RgfxRenderPipelineCreate| {
+            (m.vertex_linked_offset, m.vertex_linked_count) = vertex;
+            (m.fragment_linked_offset, m.fragment_linked_count) = fragment;
+        });
+        assert_eq!(dec.decode(&device, &bytes).unwrap(), Ok(()));
+        assert_eq!(replies.lock()[0].status, RGFX_PIPELINE_OK);
+        let calls = p
+            .call_log()
+            .calls_to("newRenderPipelineStateWithDescriptor:error:");
+        let Arg::Val(logged) = &calls[0].args[0] else {
+            panic!("{:?}", calls[0].args);
+        };
+        let vertex_part =
+            &logged[logged.find("vertex_linked").unwrap()..logged.find("fragment_linked").unwrap()];
+        assert_eq!(ids_after(vertex_part, "functions: [").len(), 1, "{logged}");
+        assert!(vertex_part.contains("private_functions: []"), "{logged}");
+        let fragment_part = &logged[logged.find("fragment_linked").unwrap()..];
+        assert!(
+            fragment_part.contains(
+                "functions: [], binary_functions: [], groups: [], private_functions: [ObjId("
+            ),
+            "{logged}"
+        );
+    }
+
+    /// A linked function naming no library is a bad reference and one in no list Metal has is
+    /// malformed, neither reaching the platform; a linked function the platform ends the process
+    /// at refuses the create
+    #[test]
+    fn a_create_s_bad_linked_function_makes_nothing() {
+        use reims_vgpu_core::testkit::faults::Fault;
+        let (p, mut dec, replies) = pipeline_decoder();
+        let device = p.device();
+        let with = |obj_id, library, list| {
+            let mut bytes = compute_create(obj_id);
+            let linked = append_linked(&mut bytes, library, &[("fa", list, 1, "", &[])]);
+            edit_head(&mut bytes, |m: &mut RgfxComputePipelineCreate| {
+                (m.linked_offset, m.linked_count) = linked;
+            });
+            bytes
+        };
+        let mark = p.call_log().mark();
+        assert_eq!(
+            dec.decode(&device, &with(100, 77, RGFX_LINKED_FUNCTIONS))
+                .unwrap(),
+            Err(DecodeError::BadReference)
+        );
+        assert_eq!(
+            dec.decode(&device, &with(101, 1, 9)).unwrap(),
+            Err(DecodeError::Malformed)
+        );
+        assert!(
+            !p.call_log()
+                .sels_since(mark)
+                .iter()
+                .any(|s| s.starts_with("newComputePipelineState"))
+        );
+        p.faults().at(
+            "MTLLibrary",
+            "newFunctionWithDescriptor:error:",
+            0,
+            Fault::Crash,
+        );
+        assert_eq!(
+            dec.decode(&device, &with(102, 1, RGFX_LINKED_BINARY_FUNCTIONS))
+                .unwrap(),
+            Err(DecodeError::Refused)
+        );
+        let statuses: Vec<_> = replies
+            .lock()
+            .iter()
+            .map(|r| (r.obj_id, r.status))
+            .collect();
+        assert_eq!(
+            statuses,
+            [
+                (100, RGFX_PIPELINE_REFUSED),
+                (101, RGFX_PIPELINE_REFUSED),
+                (102, RGFX_PIPELINE_REFUSED)
+            ]
+        );
+        assert_eq!(dec.object_count(), 1, "only the library");
     }
 
     /// A render and a compute pipeline create each resolve their functions from a

@@ -59,10 +59,21 @@ struct RgfxFunctionRef {
 	uint32_t constant_count;
 };
 
+/// One function a pipeline stage links (MTLLinkedFunctions): the function, the list
+/// it is in (an RGFX_LINKED_*), the MTLFunctionOptions it was made with, and for
+/// RGFX_LINKED_GROUP the group's name (null otherwise).
+struct RgfxLinkedFunctionRef {
+	RgfxFunctionRef function;
+	uint32_t list;
+	uint32_t options;
+	const char *group;
+};
+
 /// A render pipeline's descriptor, as MTLRenderPipelineDescriptor gives it, in
 /// plain fields the serialiser packs into RgfxRenderPipelineCreate. `colors[0..
 /// color_attachment_count)` are in use; the vertex descriptor's `layouts` and
-/// `attributes` may be null when their counts are 0; `label` may be null.
+/// `attributes`, and each stage's linked functions, may be null when their counts
+/// are 0; `label` may be null.
 struct RgfxRenderPipelineParams {
 	RgfxFunctionRef vertex;
 	RgfxFunctionRef fragment;
@@ -79,15 +90,29 @@ struct RgfxRenderPipelineParams {
 	uint32_t flags; // RGFX_RENDER_PIPELINE_*
 	uint32_t input_primitive_topology;
 	uint32_t max_vertex_amplification_count;
+	const RgfxLinkedFunctionRef *vertex_linked;
+	uint32_t vertex_linked_count;
+	const RgfxLinkedFunctionRef *fragment_linked;
+	uint32_t fragment_linked_count;
 };
 
 /// A compute pipeline's descriptor in plain fields the serialiser packs into
-/// RgfxComputePipelineCreate.
+/// RgfxComputePipelineCreate. The stage-input descriptor's `layouts` and
+/// `attributes` (their step functions MTLStepFunction, their formats
+/// MTLAttributeFormat) and the linked functions may be null when their counts are 0.
 struct RgfxComputePipelineParams {
 	RgfxFunctionRef function;
 	uint32_t flags; // RGFX_COMPUTE_PIPELINE_*
 	uint32_t max_total_threads_per_threadgroup; // 0 leaves Metal's
 	uint32_t max_call_stack_depth;
+	const RgfxVertexBufferLayout *stage_input_layouts;
+	uint32_t stage_input_layout_count;
+	const RgfxVertexAttribute *stage_input_attributes;
+	uint32_t stage_input_attribute_count;
+	uint32_t stage_input_index_type;
+	uint32_t stage_input_index_buffer_index;
+	const RgfxLinkedFunctionRef *linked;
+	uint32_t linked_count;
 };
 
 /// What a create did. `obj_id`, `gpu_address` and `resource_id` are the values

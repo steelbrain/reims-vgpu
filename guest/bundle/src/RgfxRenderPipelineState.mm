@@ -107,6 +107,27 @@ bool fillFunctionRef(RgfxFunctionRef &fr, id<MTLFunction> fn)
 		return nil;
 	}
 
+	// Each stage's linked functions; one another device's library made names no library the
+	// host holds, so the create is refused rather than sent.
+	RgfxLinkedFunctionList vertexLinked, fragmentLinked;
+	id<MTLFunction> foreignLinked =
+	    RgfxCollectLinkedFunctions(descriptor.vertexLinkedFunctions, vertexLinked);
+	if (foreignLinked == nil)
+		foreignLinked = RgfxCollectLinkedFunctions(descriptor.fragmentLinkedFunctions, fragmentLinked);
+	if (foreignLinked != nil) {
+		NSString *msg = [NSString
+		    stringWithFormat:@"render pipeline: linked function %@ (%@) is not from a library of this device",
+		                     foreignLinked.name, NSStringFromClass([(id)foreignLinked class])];
+		NSLog(@"RGFX: %@", msg);
+		if (error)
+			*error = RgfxMakeError(RgfxMetalErrorInvalidDescriptor, msg);
+		return nil;
+	}
+	p.vertex_linked = vertexLinked.refs.empty() ? nullptr : vertexLinked.refs.data();
+	p.vertex_linked_count = static_cast<uint32_t>(vertexLinked.refs.size());
+	p.fragment_linked = fragmentLinked.refs.empty() ? nullptr : fragmentLinked.refs.data();
+	p.fragment_linked_count = static_cast<uint32_t>(fragmentLinked.refs.size());
+
 	std::string label;
 	if (descriptor.label != nil && descriptor.label.UTF8String != nullptr) {
 		label = descriptor.label.UTF8String;

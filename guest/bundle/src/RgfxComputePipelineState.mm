@@ -6,6 +6,7 @@
 #import "RgfxComputePipelineState.h"
 
 #include <string>
+#include <vector>
 
 #import "RgfxFunction.h"
 #import "RgfxMetalError.h"
@@ -16,47 +17,57 @@
 
 namespace {
 
-/// Builds an RgfxComputePipelineParams from the compute function and the descriptor
-/// knobs. `fn` must be an RgfxFunction (what the bundle vends); nil is a refusal the
-/// caller reports. `label` out-param keeps the entry-point C string alive.
-bool fillComputeParams(RgfxComputePipelineParams &p, id<MTLFunction> fn, uint32_t flags,
-                       uint32_t maxTotalThreads, std::string &nameStore)
+// The stage-input descriptor's layout/attribute arrays expose no count, so the mapping scans
+// the indices MTLStageInputOutputDescriptor addresses (0..30) and keeps the entries in use: a
+// layout whose stride is non-zero, an attribute whose format is not MTLAttributeFormatInvalid.
+constexpr NSUInteger kMaxStageInputBuffers = 31;
+constexpr NSUInteger kMaxStageInputAttributes = 31;
+
+/// The in-use layouts and attributes of `sd` (nil: none).
+void readStageInput(MTLStageInputOutputDescriptor *sd, std::vector<RgfxVertexBufferLayout> &layouts,
+                    std::vector<RgfxVertexAttribute> &attributes)
 {
-	if (fn == nil) {
-		return false;
+	if (sd == nil)
+		return;
+	for (NSUInteger i = 0; i < kMaxStageInputBuffers; i++) {
+		MTLBufferLayoutDescriptor *l = sd.layouts[i];
+		if (l.stride == 0)
+			continue;
+		RgfxVertexBufferLayout rl = {};
+		rl.buffer_index = static_cast<uint32_t>(i);
+		rl.stride = static_cast<uint32_t>(l.stride);
+		rl.step_function = static_cast<uint32_t>(l.stepFunction);
+		rl.step_rate = static_cast<uint32_t>(l.stepRate);
+		layouts.push_back(rl);
 	}
-	if (![(id)fn isKindOfClass:[RgfxFunction class]]) {
-		// Another device's library made it: it names no library the host holds.
-		NSLog(@"RGFX: compute pipeline: function %@ (%@) is not from a library of this device",
-		      fn.name, NSStringFromClass([(id)fn class]));
-		return false;
+	for (NSUInteger i = 0; i < kMaxStageInputAttributes; i++) {
+		MTLAttributeDescriptor *a = sd.attributes[i];
+		if (a.format == MTLAttributeFormatInvalid)
+			continue;
+		RgfxVertexAttribute ra = {};
+		ra.attribute_index = static_cast<uint32_t>(i);
+		ra.format = static_cast<uint32_t>(a.format);
+		ra.offset = static_cast<uint32_t>(a.offset);
+		ra.buffer_index = static_cast<uint32_t>(a.bufferIndex);
+		attributes.push_back(ra);
 	}
-	RgfxFunction *rf = (RgfxFunction *)fn;
-	p = RgfxComputePipelineParams{};
-	nameStore = [rf rgfxEntryPointUTF8] ? [rf rgfxEntryPointUTF8] : "";
-	p.function.library = rf.rgfxLibraryObjId;
-	p.function.entry_point = nameStore.c_str();
-	p.function.constants = [rf rgfxConstants];
-	p.function.constant_count = [rf rgfxConstantCount];
-	p.flags = flags;
-	p.max_total_threads_per_threadgroup = maxTotalThreads;
-	p.max_call_stack_depth = 0;
-	return true;
+}
+
+/// The refusal of a pipeline that names `fn`, a function another device's library made: it
+/// names no library the host holds.
+NSError *foreignFunctionError(NSString *what, id<MTLFunction> fn)
+{
+	NSString *msg = [NSString stringWithFormat:@"compute pipeline: %@ %@ (%@) is not from a library of this device",
+	                                           what, fn.name, NSStringFromClass([(id)fn class])];
+	NSLog(@"RGFX: %@", msg);
+	return RgfxMakeError(RgfxMetalErrorInvalidDescriptor, msg);
 }
 
 } // namespace
 
-// The private create both public factories funnel through.
-@interface RgfxComputePipelineState ()
-+ (nullable instancetype)createWithFunction:(id<MTLFunction>)function
-                                      flags:(uint32_t)flags
-                            maxTotalThreads:(uint32_t)maxTotalThreads
-                                      label:(nullable NSString *)label
-                                     device:(nullable id<MTLDevice>)device
-                                 serializer:(nullable RgfxSerializer *)serializer
-                                      error:(__autoreleasing NSError *_Nullable *_Nullable)error;
 // Defined in the main implementation; declared here so the lambda in
 // rgfxRegisterWithReplyReader: sees its signature.
+@interface RgfxComputePipelineState ()
 - (void)rgfxFillReflection:(const RgfxPipelineReflection *)r;
 // Keeps what the descriptor asked that the pipeline answers (rgfx*Desc ivars).
 - (void)rgfxTakeDescriptor:(MTLComputePipelineDescriptor *)descriptor flags:(uint32_t)flags;
@@ -83,18 +94,28 @@ bool fillComputeParams(RgfxComputePipelineParams &p, id<MTLFunction> fn, uint32_
 	[self rgfxRetireThen:nullptr];
 }
 
+// A pipeline of the function alone is one of a descriptor of it, every other field Metal's
+// default. Metal's descriptor takes no nil function, so a nil one is refused here.
 + (instancetype)computePipelineStateWithFunction:(id<MTLFunction>)function
                                           device:(id<MTLDevice>)device
                                       serializer:(RgfxSerializer *)serializer
                                            error:(__autoreleasing NSError **)error
 {
-	return [self createWithFunction:function
-	                          flags:0
-	                maxTotalThreads:0
-	                          label:nil
-	                         device:device
-	                     serializer:serializer
-	                          error:error];
+	if (function == nil) {
+		if (error)
+			*error = RgfxMakeError(serializer == nullptr ? RgfxMetalErrorNoRoute
+			                                             : RgfxMetalErrorInvalidDescriptor,
+			                       serializer == nullptr
+			                           ? @"compute pipeline: no serialiser route"
+			                           : @"compute pipeline: no compute function of this device");
+		return nil;
+	}
+	MTLComputePipelineDescriptor *descriptor = [[MTLComputePipelineDescriptor alloc] init];
+	descriptor.computeFunction = function;
+	return [self computePipelineStateWithDescriptor:descriptor
+	                                         device:device
+	                                     serializer:serializer
+	                                          error:error];
 }
 
 + (instancetype)computePipelineStateWithDescriptor:(MTLComputePipelineDescriptor *)descriptor
@@ -102,20 +123,80 @@ bool fillComputeParams(RgfxComputePipelineParams &p, id<MTLFunction> fn, uint32_
                                         serializer:(RgfxSerializer *)serializer
                                              error:(__autoreleasing NSError **)error
 {
-	uint32_t flags = 0;
+	if (serializer == nullptr) {
+		if (error)
+			*error = RgfxMakeError(RgfxMetalErrorNoRoute, @"compute pipeline: no serialiser route");
+		return nil;
+	}
+	id<MTLFunction> function = descriptor.computeFunction;
+	if (NSError *unspecialised = [RgfxFunction rgfxUnspecialisedError:function role:@"function"]) {
+		if (error)
+			*error = unspecialised;
+		return nil;
+	}
+	if (function == nil) {
+		if (error)
+			*error = RgfxMakeError(RgfxMetalErrorInvalidDescriptor,
+			                       @"compute pipeline: no compute function of this device");
+		return nil;
+	}
+	if (![(id)function isKindOfClass:[RgfxFunction class]]) {
+		if (error)
+			*error = foreignFunctionError(@"function", function);
+		return nil;
+	}
+	RgfxLinkedFunctionList linked;
+	if (id<MTLFunction> foreign = RgfxCollectLinkedFunctions(descriptor.linkedFunctions, linked)) {
+		if (error)
+			*error = foreignFunctionError(@"linked function", foreign);
+		return nil;
+	}
+
+	RgfxFunction *rf = (RgfxFunction *)function;
+	RgfxComputePipelineParams p = {};
+	p.function.library = rf.rgfxLibraryObjId;
+	p.function.entry_point = [rf rgfxEntryPointUTF8] ? [rf rgfxEntryPointUTF8] : "";
+	p.function.constants = [rf rgfxConstants];
+	p.function.constant_count = [rf rgfxConstantCount];
 	if (descriptor.threadGroupSizeIsMultipleOfThreadExecutionWidth)
-		flags |= RGFX_COMPUTE_PIPELINE_TG_MULTIPLE_OF_EXEC_WIDTH;
+		p.flags |= RGFX_COMPUTE_PIPELINE_TG_MULTIPLE_OF_EXEC_WIDTH;
 	if (descriptor.supportIndirectCommandBuffers)
-		flags |= RGFX_COMPUTE_PIPELINE_SUPPORT_ICB;
+		p.flags |= RGFX_COMPUTE_PIPELINE_SUPPORT_ICB;
+	p.max_total_threads_per_threadgroup =
+	    static_cast<uint32_t>(descriptor.maxTotalThreadsPerThreadgroup);
+	p.max_call_stack_depth = static_cast<uint32_t>(descriptor.maxCallStackDepth);
+
+	std::vector<RgfxVertexBufferLayout> layouts;
+	std::vector<RgfxVertexAttribute> attributes;
+	MTLStageInputOutputDescriptor *stageInput = descriptor.stageInputDescriptor;
+	readStageInput(stageInput, layouts, attributes);
+	p.stage_input_layouts = layouts.empty() ? nullptr : layouts.data();
+	p.stage_input_layout_count = static_cast<uint32_t>(layouts.size());
+	p.stage_input_attributes = attributes.empty() ? nullptr : attributes.data();
+	p.stage_input_attribute_count = static_cast<uint32_t>(attributes.size());
+	if (stageInput != nil) {
+		p.stage_input_index_type = static_cast<uint32_t>(stageInput.indexType);
+		p.stage_input_index_buffer_index = static_cast<uint32_t>(stageInput.indexBufferIndex);
+	}
+	p.linked = linked.refs.empty() ? nullptr : linked.refs.data();
+	p.linked_count = static_cast<uint32_t>(linked.refs.size());
+
+	RgfxCreated created = serializer->createComputePipeline(p);
+	if (!created.posted) {
+		if (error)
+			*error = RgfxMakeError(RgfxMetalErrorRingFull,
+			                       @"compute pipeline: create did not fit the ring");
+		return nil;
+	}
+	if (error)
+		*error = nil;
 	RgfxComputePipelineState *state =
-	    [self createWithFunction:descriptor.computeFunction
-	                       flags:flags
-	             maxTotalThreads:static_cast<uint32_t>(descriptor.maxTotalThreadsPerThreadgroup)
-	                       label:descriptor.label
-	                      device:device
-	                  serializer:serializer
-	                       error:error];
-	[state rgfxTakeDescriptor:descriptor flags:flags];
+	    [[RgfxComputePipelineState alloc] initWithObjId:created.obj_id
+	                                              seqno:created.seqno
+	                                              label:descriptor.label
+	                                             device:device
+	                                         serializer:serializer];
+	[state rgfxTakeDescriptor:descriptor flags:p.flags];
 	return state;
 }
 
@@ -127,48 +208,6 @@ bool fillComputeParams(RgfxComputePipelineParams &p, id<MTLFunction> fn, uint32_
 		_requiredThreadsPerThreadgroup = descriptor.requiredThreadsPerThreadgroup;
 	if ([descriptor respondsToSelector:@selector(forwardProgressUsage)])
 		_forwardProgressUsage = static_cast<NSInteger>(descriptor.forwardProgressUsage);
-}
-
-+ (instancetype)createWithFunction:(id<MTLFunction>)function
-                             flags:(uint32_t)flags
-                   maxTotalThreads:(uint32_t)maxTotalThreads
-                             label:(NSString *)label
-                            device:(id<MTLDevice>)device
-                        serializer:(RgfxSerializer *)serializer
-                             error:(__autoreleasing NSError **)error
-{
-	if (serializer == nullptr) {
-		if (error)
-			*error = RgfxMakeError(RgfxMetalErrorNoRoute, @"compute pipeline: no serialiser route");
-		return nil;
-	}
-	if (NSError *unspecialised = [RgfxFunction rgfxUnspecialisedError:function role:@"function"]) {
-		if (error)
-			*error = unspecialised;
-		return nil;
-	}
-	RgfxComputePipelineParams p = {};
-	std::string nameStore;
-	if (!fillComputeParams(p, function, flags, maxTotalThreads, nameStore)) {
-		if (error)
-			*error = RgfxMakeError(RgfxMetalErrorInvalidDescriptor,
-			                       @"compute pipeline: no compute function of this device");
-		return nil;
-	}
-	RgfxCreated created = serializer->createComputePipeline(p);
-	if (!created.posted) {
-		if (error)
-			*error = RgfxMakeError(RgfxMetalErrorRingFull,
-			                       @"compute pipeline: create did not fit the ring");
-		return nil;
-	}
-	if (error)
-		*error = nil;
-	return [[RgfxComputePipelineState alloc] initWithObjId:created.obj_id
-	                                                 seqno:created.seqno
-	                                                 label:label
-	                                                device:device
-	                                            serializer:serializer];
 }
 
 - (instancetype)initWithObjId:(uint64_t)objId

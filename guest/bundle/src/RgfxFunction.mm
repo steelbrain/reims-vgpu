@@ -25,6 +25,7 @@
 	BOOL _haveType;
 	RgfxBitCodeHash _hash;                        // the bitcode hash, from the library's table
 	BOOL _haveHash;
+	MTLFunctionOptions _options;                  // the descriptor's, where made from one
 }
 
 + (instancetype)functionWithLibrary:(RgfxResource *)library
@@ -192,7 +193,12 @@
 
 - (MTLFunctionOptions)options
 {
-	return MTLFunctionOptionNone;
+	return _options;
+}
+
+- (void)rgfxSetOptions:(MTLFunctionOptions)options
+{
+	_options = options;
 }
 
 // The host lays out the argument buffer the function takes at `bufferIndex` from the library's
@@ -222,3 +228,38 @@
 }
 
 @end
+
+id<MTLFunction> RgfxCollectLinkedFunctions(MTLLinkedFunctions *linked, RgfxLinkedFunctionList &out)
+{
+	if (linked == nil)
+		return nil;
+	auto add = [&](NSArray<id<MTLFunction>> *functions, uint32_t list,
+	               const char *group) -> id<MTLFunction> {
+		for (id<MTLFunction> fn in functions) {
+			if (![(id)fn isKindOfClass:[RgfxFunction class]])
+				return fn;
+			RgfxFunction *rf = (RgfxFunction *)fn;
+			RgfxLinkedFunctionRef r = {};
+			r.function.library = rf.rgfxLibraryObjId;
+			r.function.entry_point = [rf rgfxEntryPointUTF8];
+			r.function.constants = [rf rgfxConstants];
+			r.function.constant_count = [rf rgfxConstantCount];
+			r.list = list;
+			r.options = static_cast<uint32_t>(rf.options);
+			r.group = group;
+			out.refs.push_back(r);
+		}
+		return nil;
+	};
+	if (id<MTLFunction> foreign = add(linked.functions, RGFX_LINKED_FUNCTIONS, nullptr))
+		return foreign;
+	if (id<MTLFunction> foreign = add(linked.binaryFunctions, RGFX_LINKED_BINARY_FUNCTIONS, nullptr))
+		return foreign;
+	NSDictionary<NSString *, NSArray<id<MTLFunction>> *> *groups = linked.groups;
+	for (NSString *name in [groups.allKeys sortedArrayUsingSelector:@selector(compare:)]) {
+		out.groups.emplace_back(name.UTF8String != nullptr ? name.UTF8String : "");
+		if (id<MTLFunction> foreign = add(groups[name], RGFX_LINKED_GROUP, out.groups.back().c_str()))
+			return foreign;
+	}
+	return add(linked.privateFunctions, RGFX_LINKED_PRIVATE_FUNCTIONS, nullptr);
+}

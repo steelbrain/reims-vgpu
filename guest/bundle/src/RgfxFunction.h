@@ -21,7 +21,11 @@
 #include "reims_graphics_wire.h" // RgfxFunctionConstant
 
 #ifdef __cplusplus
-class RgfxSerializer;
+#include <deque>
+#include <string>
+#include <vector>
+
+#include "RgfxSerializer.hpp" // RgfxLinkedFunctionRef
 #endif
 
 NS_ASSUME_NONNULL_BEGIN
@@ -72,6 +76,10 @@ NS_ASSUME_NONNULL_BEGIN
 /// function list. A function made without it answers the placeholder stage.
 - (void)rgfxSetFunctionType:(MTLFunctionType)type;
 
+/// Sets the options `options` answers: those of the descriptor the function was made
+/// from (`newFunctionWithDescriptor:`). A function made by name answers none.
+- (void)rgfxSetOptions:(MTLFunctionOptions)options;
+
 /// The 32 bytes of a function's bitcode hash (bitCodeHash), as the runtime's SPI types it.
 typedef struct {
 	uint8_t bytes[32];
@@ -101,6 +109,23 @@ typedef struct {
 + (nullable NSError *)rgfxUnspecialisedError:(nullable id<MTLFunction>)function role:(NSString *)role;
 
 @end
+
+#ifdef __cplusplus
+/// The functions a pipeline stage links, as its create sends them: their references,
+/// and the group names those of a group point into.
+struct RgfxLinkedFunctionList {
+	std::vector<RgfxLinkedFunctionRef> refs;
+	std::deque<std::string> groups;
+};
+
+/// Appends `linked`'s functions to `out` in the wire's order: its functions, its
+/// binary functions, each group's in the order of their names, then its private
+/// functions, each with the options it was made with. Answers the first that is not
+/// an RgfxFunction (another device's library made it, so it names no library the host
+/// holds), leaving `out` partly filled; nil when every one is, or `linked` is nil.
+id<MTLFunction> _Nullable RgfxCollectLinkedFunctions(MTLLinkedFunctions *_Nullable linked,
+                                                     RgfxLinkedFunctionList &out);
+#endif
 
 NS_ASSUME_NONNULL_END
 

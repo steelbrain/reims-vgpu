@@ -54,10 +54,11 @@ static_assert(sizeof(RgfxFunctionConstant) == 40, "RgfxFunctionConstant");
 static_assert(sizeof(RgfxColorAttachmentDesc) == 40, "RgfxColorAttachmentDesc");
 static_assert(sizeof(RgfxVertexBufferLayout) == 16, "RgfxVertexBufferLayout");
 static_assert(sizeof(RgfxVertexAttribute) == 16, "RgfxVertexAttribute");
-static_assert(sizeof(RgfxRenderPipelineCreate) == 448, "RgfxRenderPipelineCreate");
+static_assert(sizeof(RgfxLinkedFunction) == 40, "RgfxLinkedFunction");
+static_assert(sizeof(RgfxRenderPipelineCreate) == 464, "RgfxRenderPipelineCreate");
 static_assert(__builtin_offsetof(RgfxRenderPipelineCreate, colors) == 128,
               "RgfxRenderPipelineCreate colors");
-static_assert(sizeof(RgfxComputePipelineCreate) == 64, "RgfxComputePipelineCreate");
+static_assert(sizeof(RgfxComputePipelineCreate) == 96, "RgfxComputePipelineCreate");
 static_assert(sizeof(RgfxPipelineReflection) == 80, "RgfxPipelineReflection");
 static_assert(sizeof(RgfxRenderPipelineCreate) % 8 == 0, "RgfxRenderPipelineCreate aligned");
 static_assert(sizeof(RgfxComputePipelineCreate) % 8 == 0, "RgfxComputePipelineCreate aligned");

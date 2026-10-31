@@ -341,12 +341,65 @@ pub struct StageInputDesc {
     pub index_buffer_index: u64,
 }
 
+/// `MTLLinkedFunctions`, as a value: the functions a pipeline stage links, each made as the guest
+/// made it. Order: functions, binary functions, groups, then private functions. [`Default`] links
+/// none, which leaves the stage's linked functions as Metal's descriptor has them.
+pub struct LinkedFunctionsDesc<P: Platform> {
+    /// `setFunctions:`.
+    pub functions: Vec<P::Function>,
+    /// `setBinaryFunctions:`.
+    pub binary_functions: Vec<P::Function>,
+    /// `setGroups:`: each call-site group's name and its functions, in name order.
+    pub groups: Vec<(String, Vec<P::Function>)>,
+    /// `setPrivateFunctions:`.
+    pub private_functions: Vec<P::Function>,
+}
+
+impl<P: Platform> LinkedFunctionsDesc<P> {
+    /// Whether no function is linked.
+    pub fn is_empty(&self) -> bool {
+        self.functions.is_empty()
+            && self.binary_functions.is_empty()
+            && self.groups.is_empty()
+            && self.private_functions.is_empty()
+    }
+}
+
+impl<P: Platform> Default for LinkedFunctionsDesc<P> {
+    fn default() -> Self {
+        LinkedFunctionsDesc {
+            functions: Vec::new(),
+            binary_functions: Vec::new(),
+            groups: Vec::new(),
+            private_functions: Vec::new(),
+        }
+    }
+}
+
+impl<P: Platform> fmt::Debug for LinkedFunctionsDesc<P> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let ids = |fs: &[P::Function]| fs.iter().map(Handle::id).collect::<Vec<_>>();
+        let groups: Vec<_> = self
+            .groups
+            .iter()
+            .map(|(name, fs)| (name.as_str(), ids(fs)))
+            .collect();
+        f.debug_struct("LinkedFunctionsDesc")
+            .field("functions", &ids(&self.functions))
+            .field("binary_functions", &ids(&self.binary_functions))
+            .field("groups", &groups)
+            .field("private_functions", &ids(&self.private_functions))
+            .finish()
+    }
+}
+
 /// A whole `MTLRenderPipelineDescriptor`, as a value: what the graphics lane carries of a guest's
 /// descriptor. The display's own pipelines take [`RenderPipelineDesc`]. Each enum is its Metal raw
 /// value. Order: label, the vertex and fragment functions, the vertex descriptor, the colour
 /// attachments at their indices, the depth and stencil formats, the raster sample count,
 /// alpha-to-coverage, alpha-to-one, rasterization, the input primitive topology, the maximum
-/// vertex amplification count, then indirect command buffer support.
+/// vertex amplification count, indirect command buffer support, then the vertex and fragment
+/// stages' linked functions where they link any.
 pub struct FullRenderPipelineDesc<'a, P: Platform> {
     /// `setLabel:`, when set.
     pub label: Option<&'a str>,
@@ -376,6 +429,10 @@ pub struct FullRenderPipelineDesc<'a, P: Platform> {
     pub max_vertex_amplification_count: u64,
     /// `setSupportIndirectCommandBuffers:`.
     pub support_indirect_command_buffers: bool,
+    /// `setVertexLinkedFunctions:`, where the stage links any.
+    pub vertex_linked: LinkedFunctionsDesc<P>,
+    /// `setFragmentLinkedFunctions:`, where the stage links any.
+    pub fragment_linked: LinkedFunctionsDesc<P>,
 }
 
 impl<P: Platform> fmt::Debug for FullRenderPipelineDesc<'_, P> {
@@ -401,6 +458,8 @@ impl<P: Platform> fmt::Debug for FullRenderPipelineDesc<'_, P> {
                 "support_indirect_command_buffers",
                 &self.support_indirect_command_buffers,
             )
+            .field("vertex_linked", &self.vertex_linked)
+            .field("fragment_linked", &self.fragment_linked)
             .finish()
     }
 }
@@ -408,7 +467,8 @@ impl<P: Platform> fmt::Debug for FullRenderPipelineDesc<'_, P> {
 /// A whole `MTLComputePipelineDescriptor`, as a value: what the graphics lane carries of a guest's
 /// descriptor. Order: label, the compute function, whether the threadgroup size is a multiple of
 /// the execution width, the maximum threads per threadgroup where set, the maximum call stack
-/// depth, indirect command buffer support, then the stage-input descriptor where set.
+/// depth, indirect command buffer support, the stage-input descriptor where set, then the linked
+/// functions where it links any.
 pub struct FullComputePipelineDesc<'a, P: Platform> {
     /// `setLabel:`, when set.
     pub label: Option<&'a str>,
@@ -424,6 +484,8 @@ pub struct FullComputePipelineDesc<'a, P: Platform> {
     pub support_indirect_command_buffers: bool,
     /// `setStageInputDescriptor:`, when set.
     pub stage_input: Option<StageInputDesc>,
+    /// `setLinkedFunctions:`, where the kernel links any.
+    pub linked: LinkedFunctionsDesc<P>,
 }
 
 impl<P: Platform> fmt::Debug for FullComputePipelineDesc<'_, P> {
@@ -445,6 +507,7 @@ impl<P: Platform> fmt::Debug for FullComputePipelineDesc<'_, P> {
                 &self.support_indirect_command_buffers,
             )
             .field("stage_input", &self.stage_input)
+            .field("linked", &self.linked)
             .finish()
     }
 }

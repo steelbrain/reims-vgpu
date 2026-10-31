@@ -597,20 +597,9 @@ impl reims_vgpu_core::platform::resource::Library<MetalPlatform> for MetalLibrar
         constants: &[reims_vgpu_core::platform::resource::FunctionConstant],
     ) -> RaiseResult<Option<<MetalPlatform as Platform>::Function>> {
         let (l, name) = (self.get(), msg::new_string(function_name));
-        let values = MTLFunctionConstantValues::new();
-        for c in constants {
-            let Some(bytes) = c.bytes() else {
-                return Ok(None);
-            };
-            // SAFETY: `bytes` holds as many bytes as `data_type` names; Metal copies them.
-            unsafe {
-                values.setConstantValue_type_atIndex(
-                    NonNull::new(bytes.as_ptr().cast_mut().cast()).unwrap_or(NonNull::dangling()),
-                    MTLDataType(c.data_type.to_usize()),
-                    c.index.to_usize(),
-                );
-            }
-        }
+        let Some(values) = constant_values(constants) else {
+            return Ok(None);
+        };
         msg::send(
             "newFunctionWithName:constantValues:error:",
             Policy::Caught,
@@ -621,6 +610,57 @@ impl reims_vgpu_core::platform::resource::Library<MetalPlatform> for MetalLibrar
         )
         .map(created)
     }
+
+    /// Metal's `newFunctionWithDescriptor:error:` over a descriptor of the name, the options and,
+    /// where there are any, the constants, each set by its index. A constant of a type no function
+    /// constant takes, or an `NSError`, answers nil.
+    fn new_function_with_options(
+        &self,
+        _on: OnFault,
+        function_name: &str,
+        constants: &[reims_vgpu_core::platform::resource::FunctionConstant],
+        options: u64,
+    ) -> RaiseResult<Option<<MetalPlatform as Platform>::Function>> {
+        let (l, name) = (self.get(), msg::new_string(function_name));
+        let d = msg::get(
+            "functionDescriptor",
+            MTLFunctionDescriptor::functionDescriptor,
+        );
+        msg::get("setName:", || d.setName(Some(&name)));
+        if !constants.is_empty() {
+            let Some(values) = constant_values(constants) else {
+                return Ok(None);
+            };
+            msg::get("setConstantValues:", || d.setConstantValues(Some(&values)));
+        }
+        msg::get("setOptions:", || {
+            d.setOptions(MTLFunctionOptions(options.to_usize()))
+        });
+        msg::send("newFunctionWithDescriptor:error:", Policy::Caught, || {
+            l.newFunctionWithDescriptor_error(&d).ok()
+        })
+        .map(created)
+    }
+}
+
+/// `MTLFunctionConstantValues` of `constants`, each set by its index: `None` where one is of a
+/// type no function constant takes.
+fn constant_values(
+    constants: &[reims_vgpu_core::platform::resource::FunctionConstant],
+) -> Option<objc2::rc::Retained<MTLFunctionConstantValues>> {
+    let values = MTLFunctionConstantValues::new();
+    for c in constants {
+        let bytes = c.bytes()?;
+        // SAFETY: `bytes` holds as many bytes as `data_type` names; Metal copies them.
+        unsafe {
+            values.setConstantValue_type_atIndex(
+                NonNull::new(bytes.as_ptr().cast_mut().cast()).unwrap_or(NonNull::dangling()),
+                MTLDataType(c.data_type.to_usize()),
+                c.index.to_usize(),
+            );
+        }
+    }
+    Some(values)
 }
 
 /// `id<MTLFunction>`.
@@ -1548,6 +1588,25 @@ mod tests {
         }
         assert!(lib.new_function(OnFault::Return, "nope").unwrap().is_none());
         assert!(lib.new_function(OnFault::Return, "k").unwrap().is_some());
+    }
+
+    /// A function made with options is Metal's function of the descriptor's name and options,
+    /// and a name the library does not hold is nil
+    #[test]
+    fn a_function_made_with_options_answers_them() {
+        let k = kit();
+        let lib = library(&k.device);
+        let f = lib
+            .new_function_with_options(OnFault::Return, "k", &[], 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(f.get().options(), MTLFunctionOptions::CompileToBinary);
+        assert_eq!(f.get().name().to_string(), "k");
+        assert!(
+            lib.new_function_with_options(OnFault::Return, "nope", &[], 1)
+                .unwrap()
+                .is_none()
+        );
     }
 
     /// The pipeline getters agree with objc2-metal's
