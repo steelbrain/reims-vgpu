@@ -30,6 +30,14 @@
 //                       the Shared buffer, so N past 256 needs each queue to end, and N past
 //                       256 needs the blocks back (the region is 1 GiB), and N past 250 needs
 //                       the Private heaps' GPU addresses back (64 GiB a process)
+//   tex_probe sharedheap N  N rounds of a 1 MiB Shared Placement heap with buffers placed in
+//                       it: A of 64 KiB at 0, B of 64 KiB at 64 KiB and C of 4 KiB at 0, over
+//                       A's first bytes. Each placed buffer must be the heap's bytes at its
+//                       offset (C's contents A's, B's 64 KiB past them) at the heap's GPU address
+//                       plus the offset; the CPU writes a pattern through A, which C reads, and
+//                       one command buffer copies A to B and fills C's second half: B must hold
+//                       the CPU's pattern and A the GPU's fill, each seen through the other's
+//                       contents, as Metal's placed resources alias their heap's memory
 // Prints "TEX OK" when every check passes, else "TEX FAIL: why" and exits 1. A completion 20 s
 // late prints HANG and exits 3. The copy waits with waitUntilCompleted, or with its completed
 // handler alone (`handler`).
@@ -499,6 +507,71 @@ static int one_big_buffer(id<MTLDevice> device, id<MTLCommandQueue> queue, long 
 	return 0;
 }
 
+// `n` rounds of a Shared heap whose placed buffers alias its bytes, the CPU's and the GPU's
+// writes each seen through the other buffers over them.
+static int shared_heap(id<MTLDevice> device, id<MTLCommandQueue> queue, long n)
+{
+	const NSUInteger half = 0x10000, small = 0x1000;
+	const MTLResourceOptions shared = MTLResourceStorageModeShared;
+	double start = now_ms();
+	for (long i = 0; i < n; i++) {
+		@autoreleasepool {
+			MTLHeapDescriptor *hd = [MTLHeapDescriptor new];
+			hd.size = 1u << 20;
+			hd.storageMode = MTLStorageModeShared;
+			hd.type = MTLHeapTypePlacement;
+			id<MTLHeap> heap = [device newHeapWithDescriptor:hd];
+			id<MTLBuffer> a = [heap newBufferWithLength:half options:shared offset:0];
+			id<MTLBuffer> b = [heap newBufferWithLength:half options:shared offset:half];
+			id<MTLBuffer> c = [heap newBufferWithLength:small options:shared offset:0];
+			if (heap == nil || a == nil || b == nil || c == nil) {
+				printf("round %ld: heap=%d a=%d b=%d c=%d\n", i, heap != nil, a != nil, b != nil,
+				       c != nil);
+				return fail("no Shared heap or placed buffer");
+			}
+			uint8_t *pa = (uint8_t *)[a contents], *pb = (uint8_t *)[b contents];
+			uint8_t *pc = (uint8_t *)[c contents];
+			if (pa == NULL || pc != pa || pb != pa + half) {
+				printf("round %ld: contents a=%p b=%p c=%p\n", i, pa, pb, pc);
+				return fail("placed buffers are not the heap's bytes at their offsets");
+			}
+			if (b.gpuAddress != a.gpuAddress + half || c.gpuAddress != a.gpuAddress ||
+			    a.gpuAddress == 0) {
+				printf("round %ld: gpuAddress a=0x%llx b=0x%llx c=0x%llx\n", i, a.gpuAddress,
+				       b.gpuAddress, c.gpuAddress);
+				return fail("placed buffers are not at the heap's address plus their offsets");
+			}
+			const uint8_t pattern = (uint8_t)(i * 13 + 5), fill = (uint8_t)(i * 7 + 3);
+			memset(pa, pattern, half);
+			if (pc[small - 1] != pattern)
+				return fail("the CPU's write through one placed buffer is not another's");
+			struct watch *w = watch_start("a shared heap command buffer");
+			id<MTLCommandBuffer> cb = [queue commandBuffer];
+			id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+			[blit copyFromBuffer:a sourceOffset:0 toBuffer:b destinationOffset:0 size:half];
+			[blit fillBuffer:c range:NSMakeRange(small / 2, small / 2) value:fill];
+			[blit endEncoding];
+			[cb commit];
+			[cb waitUntilCompleted];
+			atomic_store(&w->done, 1);
+			if (cb.status != MTLCommandBufferStatusCompleted)
+				return fail("a shared heap command buffer failed");
+			long wrong = 0;
+			for (NSUInteger k = 0; k < half; k++)
+				wrong += pb[k] != pattern;
+			for (NSUInteger k = 0; k < small; k++)
+				wrong += pa[k] != (k < small / 2 ? pattern : fill);
+			if (wrong) {
+				printf("round %ld: %ld wrong bytes (b[0]=0x%02x a[0x800]=0x%02x)\n", i, wrong,
+				       pb[0], pa[small / 2]);
+				return fail("the GPU's reads and writes of the heap's bytes are not the CPU's");
+			}
+		}
+	}
+	printf("sharedheap: %ld rounds in %.0f ms\n", n, now_ms() - start);
+	return 0;
+}
+
 int main(int argc, char **argv)
 {
 	@autoreleasepool {
@@ -506,12 +579,14 @@ int main(int argc, char **argv)
 		int big = argc >= 2 && strcmp(argv[1], "big") == 0;
 		int churning = argc >= 2 && strcmp(argv[1], "churn") == 0;
 		int everyKind = argc >= 2 && strcmp(argv[1], "kinds") == 0;
+		int sharedHeap = argc >= 2 && strcmp(argv[1], "sharedheap") == 0;
 		if (argc < 2 ||
 		    (strcmp(argv[1], "copy") != 0 && strcmp(argv[1], "hold") != 0 && !handler && !big &&
-		     !churning && !everyKind) ||
+		     !churning && !everyKind && !sharedHeap) ||
 		    (strcmp(argv[1], "copy") != 0 && argc < 3)) {
 			fprintf(stderr,
-			        "usage: tex_probe copy | hold N | handler N | big N | churn N | kinds N\n");
+			        "usage: tex_probe copy | hold N | handler N | big N | churn N | kinds N | "
+			        "sharedheap N\n");
 			return 2;
 		}
 		id<MTLDevice> device = MTLCreateSystemDefaultDevice();
@@ -560,11 +635,12 @@ int main(int argc, char **argv)
 			if ((long)held.count < n && held.count > 0)
 				[held removeLastObject];
 		}
-		if (big || churning || everyKind) {
+		if (big || churning || everyKind || sharedHeap) {
 			long n = strtol(argv[2], NULL, 10);
-			int r = big        ? one_big_buffer(device, queue, n)
-			        : churning ? churn(device, queue, n)
-			                   : kinds(device, n);
+			int r = big          ? one_big_buffer(device, queue, n)
+			        : churning   ? churn(device, queue, n)
+			        : sharedHeap ? shared_heap(device, queue, n)
+			                     : kinds(device, n);
 			if (r != 0)
 				return r;
 			printf("TEX OK\n");
