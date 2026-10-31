@@ -79,8 +79,11 @@ RgfxCreated RgfxSerializer::createHeap(uint64_t size_bytes, uint32_t options, in
                                        uint64_t align)
 {
 	RgfxCreated out = {};
-	out.obj_id = m_ids.allocObjId();
+	// No address left for it: no object, as Metal answers one it cannot place.
 	out.gpu_address = m_ids.allocAddress(size_bytes, align);
+	if (out.gpu_address == 0)
+		return out;
+	out.obj_id = m_ids.allocObjId();
 
 	RgfxHeapCreate msg = {};
 	msg.obj_id = out.obj_id;
@@ -97,8 +100,11 @@ RgfxCreated RgfxSerializer::createHeapOverHostMemory(uint64_t size_bytes, uint32
                                                      uint64_t align)
 {
 	RgfxCreated out = {};
-	out.obj_id = m_ids.allocObjId();
+	// No address left for it: no object, as Metal answers one it cannot place.
 	out.gpu_address = m_ids.allocAddress(size_bytes, align);
+	if (out.gpu_address == 0)
+		return out;
+	out.obj_id = m_ids.allocObjId();
 
 	RgfxHeapOverHostMemory msg = {};
 	msg.obj_id = out.obj_id;
@@ -115,8 +121,11 @@ RgfxCreated RgfxSerializer::createHeapOverHostMemory(uint64_t size_bytes, uint32
 RgfxCreated RgfxSerializer::createBuffer(uint64_t length, uint32_t options, uint64_t align)
 {
 	RgfxCreated out = {};
-	out.obj_id = m_ids.allocObjId();
+	// No address left for it: no object, as Metal answers one it cannot place.
 	out.gpu_address = m_ids.allocAddress(length, align);
+	if (out.gpu_address == 0)
+		return out;
+	out.obj_id = m_ids.allocObjId();
 
 	RgfxBufferCreate msg = {};
 	msg.obj_id = out.obj_id;
@@ -131,8 +140,11 @@ RgfxCreated RgfxSerializer::createBufferOverHostMemory(uint64_t length, uint32_t
                                                        uint64_t region_offset, uint64_t align)
 {
 	RgfxCreated out = {};
-	out.obj_id = m_ids.allocObjId();
+	// No address left for it: no object, as Metal answers one it cannot place.
 	out.gpu_address = m_ids.allocAddress(length, align);
+	if (out.gpu_address == 0)
+		return out;
+	out.obj_id = m_ids.allocObjId();
 
 	RgfxBufferOverHostMemory msg = {};
 	msg.obj_id = out.obj_id;

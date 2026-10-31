@@ -142,7 +142,9 @@ public:
 	// --- heaps ----------------------------------------------------------------
 
 	/// A device heap of `size_bytes`. `options` is MTLResourceOptions, `heap_type`
-	/// MTLHeapType. A GPU address of `size_bytes` aligned to `align` is picked.
+	/// MTLHeapType. A GPU address of `size_bytes` aligned to `align` is picked. This and the
+	/// three creates after it post nothing, and answer an obj_id and a gpu_address of 0, where
+	/// the context's range has no room left for the address.
 	RgfxCreated createHeap(uint64_t size_bytes, uint32_t options, int32_t heap_type,
 	                       uint64_t align = kDefaultAddressAlign);
 

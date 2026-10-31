@@ -36,6 +36,9 @@
 		return nil; // a buffer must have a route to the host
 	}
 	RgfxCreated created = serializer->createBuffer(length, static_cast<uint32_t>(options));
+	if (created.obj_id == 0) {
+		return nil; // no GPU address left for it
+	}
 	RgfxBuffer *buffer = [[RgfxBuffer alloc] initWithObjId:created.obj_id
 	                                            gpuAddress:created.gpu_address
 	                                                length:length
@@ -62,6 +65,9 @@
 	}
 	RgfxCreated created = serializer->createBufferOverHostMemory(
 	    length, static_cast<uint32_t>(options), regionOffset);
+	if (created.obj_id == 0) {
+		return nil; // no GPU address left for it
+	}
 	RgfxBuffer *buffer = [[RgfxBuffer alloc] initWithObjId:created.obj_id
 	                                            gpuAddress:created.gpu_address
 	                                                length:length

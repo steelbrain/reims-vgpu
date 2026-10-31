@@ -40,10 +40,16 @@
 	if (serializer == nullptr || descriptor == nil) {
 		return nil; // a heap must have a route and a shape
 	}
+	if (descriptor.size == 0) {
+		return nil; // as Metal answers a heap of no bytes
+	}
 	RgfxCreated created =
 	    serializer->createHeap(static_cast<uint64_t>(descriptor.size),
 	                           static_cast<uint32_t>(descriptor.resourceOptions),
 	                           static_cast<int32_t>(descriptor.type));
+	if (created.obj_id == 0) {
+		return nil; // no GPU address left for it
+	}
 	RgfxHeap *heap = [[RgfxHeap alloc] initWithObjId:created.obj_id
 	                                          device:device
 	                                      serializer:serializer];
@@ -65,10 +71,16 @@
 	if (serializer == nullptr || descriptor == nil) {
 		return nil; // a heap must have a route and a shape
 	}
+	if (descriptor.size == 0) {
+		return nil; // as Metal answers a heap of no bytes
+	}
 	RgfxCreated created = serializer->createHeapOverHostMemory(
 	    static_cast<uint64_t>(descriptor.size),
 	    static_cast<uint32_t>(descriptor.resourceOptions),
 	    static_cast<int32_t>(descriptor.type), regionOffset);
+	if (created.obj_id == 0) {
+		return nil; // no GPU address left for it
+	}
 	RgfxHeap *heap = [[RgfxHeap alloc] initWithObjId:created.obj_id
 	                                          device:device
 	                                      serializer:serializer];

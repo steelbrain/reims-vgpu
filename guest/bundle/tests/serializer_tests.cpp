@@ -384,6 +384,32 @@ void test_caps()
 	CHECK(std::strcmp(caps.name(), "NVIDIA GeForce RTX 5080 Laptop GPU") == 0);
 }
 
+// A heap or buffer whose GPU address finds no room in the context's range is no object: the
+// create posts nothing and answers ids of 0, so the caller answers nil, as Metal does for one it
+// cannot place; a smaller one that fits is made after it.
+void test_creates_with_no_address_post_nothing()
+{
+	TestRing ring(0x8000);
+	ring.setConsumerIdle(1);
+	RgfxRingWriter writer(ring.base(), ring.dataSize, RGFX_CONTROL_RING_ID, TestRing::doorbell,
+	                      nullptr);
+	RgfxIdSpace ids;
+	RgfxSerializer ser(writer, ids);
+	const uint64_t past = RGFX_CONTEXT_VA_SPAN; // its span, with the guard page, passes the range
+	RgfxCreated h = ser.createHeap(past, 0, 1);
+	RgfxCreated hh = ser.createHeapOverHostMemory(past, 0, 1, 0x40000);
+	RgfxCreated b = ser.createBuffer(past, 0);
+	RgfxCreated bh = ser.createBufferOverHostMemory(past, 0, 0x50000);
+	for (const RgfxCreated &c : {h, hh, b, bh})
+		CHECK(!c.posted && c.obj_id == 0 && c.gpu_address == 0);
+	RgfxMsgHeader header = {};
+	std::vector<uint8_t> bytes;
+	CHECK(!ring.next(&header, &bytes));
+	RgfxCreated fits = ser.createHeap(0x10000, 0, 1);
+	CHECK(fits.posted && fits.obj_id == 1 && fits.gpu_address != 0);
+	CHECK(expectMessage<RgfxHeapCreate>(ring, RGFX_CMD_HEAP_CREATE).obj_id == 1);
+}
+
 void test_lifecycle_messages()
 {
 	TestRing ring(0x8000);
@@ -1194,6 +1220,7 @@ int main()
 	test_resource_id_chunks();
 	test_caps();
 	test_lifecycle_messages();
+	test_creates_with_no_address_post_nothing();
 	test_library_message();
 	test_pipeline_messages();
 	test_ring_wrap_and_no_room();

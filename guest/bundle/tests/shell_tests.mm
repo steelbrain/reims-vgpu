@@ -3046,6 +3046,40 @@ void test_managed_texture_copy_block_after_destroys()
 	CHECK(ringEmpty(fx.ring));
 }
 
+// A heap of no bytes is nil, as Metal answers one, and so is a heap or device buffer for which
+// the context's range has no GPU address left: neither posts anything, so the host is never
+// asked for an object the app does not hold.
+void test_heaps_with_no_bytes_or_address_are_nil()
+{
+	CHECK(retirementIdle());
+	Fixture fx;
+	@autoreleasepool {
+		MTLHeapDescriptor *d = [MTLHeapDescriptor new];
+		d.size = 0;
+		d.type = MTLHeapTypePlacement;
+		CHECK([RgfxHeap heapWithDescriptor:d device:nil serializer:&fx.ser] == nil);
+		d.storageMode = MTLStorageModeShared;
+		CHECK([RgfxHeap heapOverHostMemoryWithDescriptor:d
+		                                    regionOffset:RGFX_CONTEXT_ALLOCATIONS_OFFSET
+		                                     deallocator:nil
+		                                          device:nil
+		                                      serializer:&fx.ser] == nil);
+		d.size = RGFX_CONTEXT_VA_SPAN;
+		d.storageMode = MTLStorageModePrivate;
+		CHECK([RgfxHeap heapWithDescriptor:d device:nil serializer:&fx.ser] == nil);
+		CHECK([RgfxBuffer bufferWithLength:RGFX_CONTEXT_VA_SPAN
+		                           options:MTLResourceStorageModePrivate
+		                            device:nil
+		                        serializer:&fx.ser] == nil);
+		CHECK(ringEmpty(fx.ring));
+		d.size = 0x10000;
+		CHECK([RgfxHeap heapWithDescriptor:d device:nil serializer:&fx.ser] != nil);
+		CHECK(expectMessage<RgfxHeapCreate>(fx.ring, RGFX_CMD_HEAP_CREATE).size_bytes == 0x10000);
+	}
+	drainRing(fx.ring);
+	CHECK(retirementIdle());
+}
+
 // A heap's GPU address goes back once its destroy is retired: churned 1 GiB heaps, each made
 // while the one before it lives, take spans that never meet a live one and are picked again
 // once the picks have gone round the context's 64 GiB, so the churn never runs out. One a
@@ -3627,6 +3661,7 @@ int main()
 		test_retirement_keeps_order_while_running();
 		test_reply_reader_close();
 		test_addresses_reused_after_destroy();
+		test_heaps_with_no_bytes_or_address_are_nil();
 		test_managed_texture_copy_block_after_destroys();
 	}
 	std::printf("shell_tests: OK (%d checks)\n", g_checks);
