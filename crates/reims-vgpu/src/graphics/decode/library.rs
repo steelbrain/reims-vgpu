@@ -360,17 +360,25 @@ pub(crate) struct MadeLibrary<P: Platform> {
     /// The key the host vouches for, and the bytes' length, where it is the guest's.
     key: Option<(LibraryKey, u64)>,
     slot: Arc<LibrarySlot<P>>,
+    /// Why the platform made no library, for the host's log; `None` where it made one.
+    refusal: Option<String>,
 }
 
 impl<P: Platform> MadeLibrary<P> {
-    /// A make that raised: no library.
-    pub(crate) fn refused(job: LibraryJob<P>) -> Self {
+    /// A make that raised or was refused, for `reason`: no library.
+    pub(crate) fn refused(job: LibraryJob<P>, reason: impl Into<String>) -> Self {
         MadeLibrary {
             obj_id: job.obj_id,
             library: None,
             key: None,
             slot: job.slot,
+            refusal: Some(reason.into()),
         }
+    }
+
+    /// Why the platform made no library; `None` where it made one.
+    pub(crate) fn refusal(&self) -> Option<&str> {
+        self.refusal.as_deref()
     }
 }
 
@@ -386,12 +394,20 @@ pub(crate) fn make_library<P: Platform>(
         (host == guest).then_some((host, job.bytes.len() as u64))
     });
     // A nil library and a build failure both mean no usable library.
-    let library = device.new_library(&job.bytes)?.ok().flatten();
+    let (library, refusal) = match device.new_library(&job.bytes)? {
+        Ok(Some(library)) => (Some(library), None),
+        Ok(None) => (None, Some("the platform answered nil".to_owned())),
+        Err(e) => (
+            None,
+            Some(format!("the platform answered an error: {}", e.description)),
+        ),
+    };
     Ok(MadeLibrary {
         obj_id: job.obj_id,
         library,
         key,
         slot: Arc::clone(&job.slot),
+        refusal,
     })
 }
 
@@ -580,10 +596,10 @@ impl<P: Platform> GraphicsDecoder<P> {
             LibraryStart::Chunk => return Ok(Ok(())),
             LibraryStart::Refused { error, .. } => return Ok(Err(error)),
         };
-        let made = match make_library::<P>(device, &job) {
+        let made = match super::refusing(|| make_library::<P>(device, &job)) {
             Ok(made) => made,
             Err(raise) => {
-                self.finish_library(MadeLibrary::refused(job));
+                self.finish_library(MadeLibrary::refused(job, raise.to_string()));
                 return Err(raise);
             }
         };

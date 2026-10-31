@@ -6,6 +6,7 @@ use reims_graphics::wire::*;
 use reims_vgpu_core::platform::ObjId;
 use reims_vgpu_core::platform::device::GpuDevice;
 use reims_vgpu_core::platform::types::CommandBufferStatus;
+use reims_vgpu_core::testkit::faults::Fault;
 use reims_vgpu_core::testkit::objects::CompleteOn;
 use reims_vgpu_core::testkit::{Arg, FakePlatform};
 use zerocopy::{FromBytes, IntoBytes};
@@ -1853,4 +1854,144 @@ fn a_queue_s_rings_keep_their_block() {
     guest.send(&device, object_destroy(obj(1, 1)));
     let status = answered(&device, &mut guest, block_release(1, SUBMIT, 0x4_0000));
     assert_eq!(status, RGFX_STATUS_OK);
+}
+
+/// A `BUFFER_CREATE` of a 4 KiB Private buffer `obj_id` the host places.
+fn buffer_create(obj_id: u64) -> Vec<u8> {
+    RgfxBufferCreate {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_BUFFER_CREATE,
+            size: 0,
+            seqno: 0,
+        },
+        obj_id,
+        length: 0x1000,
+        options: 0x20,
+        ..RgfxBufferCreate::default()
+    }
+    .as_bytes()
+    .to_vec()
+}
+
+/// The reflection the next event of ring 0 is: of pipeline `obj_id`, `status`.
+fn expect_reflection(guest: &mut Guest, obj_id: u64, status: u32) {
+    let bytes = next_event(guest, RGFX_EVT_PIPELINE_REFLECTION);
+    let reflection = RgfxPipelineReflection::read_from_bytes(&bytes).unwrap();
+    assert_eq!(reflection.header.seqno, guest.seqno);
+    assert_eq!(reflection.obj_id, obj_id);
+    assert_eq!(reflection.status, status);
+}
+
+/// The platform ending the process at a pipeline's compile or at its function's specialisation
+/// (the Vulkan runtime refusing the compile, which ends the process on the paravirt device)
+/// refuses the create in this lane: the reflection is refused, nothing is stored, and the device
+/// goes on, the next creates made
+#[test]
+fn a_compile_the_platform_refuses_is_a_refused_reflection() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform) = headless_on(&raised);
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    make_library(&device, &mut guest, obj(1, 10));
+    let faults = platform.faults();
+    faults.at(
+        "MTLDevice",
+        "newRenderPipelineStateWithDescriptor:error:",
+        0,
+        Fault::Crash,
+    );
+    guest.send(&device, render_pipeline_create(obj(1, 11), obj(1, 10)));
+    expect_reflection(&mut guest, obj(1, 11), RGFX_PIPELINE_REFUSED);
+    faults.at(
+        "MTLDevice",
+        "newComputePipelineStateWithFunction:error:",
+        0,
+        Fault::Crash,
+    );
+    guest.send(&device, compute_pipeline_create(obj(1, 12), obj(1, 10)));
+    expect_reflection(&mut guest, obj(1, 12), RGFX_PIPELINE_REFUSED);
+    faults.at("MTLLibrary", "newFunctionWithName:", 0, Fault::Crash);
+    guest.send(&device, compute_pipeline_create(obj(1, 13), obj(1, 10)));
+    expect_reflection(&mut guest, obj(1, 13), RGFX_PIPELINE_REFUSED);
+    assert_eq!(device.decoder_object_count(), 1, "only the library");
+    // The device goes on: the same creates are made.
+    guest.send(&device, render_pipeline_create(obj(1, 21), obj(1, 10)));
+    expect_reflection(&mut guest, obj(1, 21), RGFX_PIPELINE_OK);
+    guest.send(&device, compute_pipeline_create(obj(1, 22), obj(1, 10)));
+    expect_reflection(&mut guest, obj(1, 22), RGFX_PIPELINE_OK);
+    assert_eq!(device.decoder_object_count(), 3);
+}
+
+/// The platform ending the process at a texture's or a buffer's create refuses the create: nothing
+/// is made, the device goes on, and the next creates are made
+#[test]
+fn a_create_the_platform_refuses_makes_nothing() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform) = headless_on(&raised);
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    let first = 1 + 7 * RGFX_RESOURCE_ID_CHUNK;
+    guest.send(&device, resource_id_chunk(3, 7));
+    let faults = platform.faults();
+    faults.at("MTLDevice", "newTextureWithDescriptor:", 0, Fault::Crash);
+    faults.at("MTLDevice", "newBufferWithDescriptor:", 0, Fault::Crash);
+    guest.send(&device, texture_create(obj(3, 1), first));
+    guest.send(&device, buffer_create(obj(3, 2)));
+    assert_eq!(
+        answered(&device, &mut guest, context_close(99)),
+        RGFX_STATUS_OK
+    );
+    assert_eq!(device.decoder_object_count(), 0, "both creates refused");
+    guest.send(&device, texture_create(obj(3, 3), first + 1));
+    guest.send(&device, buffer_create(obj(3, 4)));
+    assert_eq!(
+        answered(&device, &mut guest, context_close(99)),
+        RGFX_STATUS_OK
+    );
+    assert_eq!(
+        device.decoder_object_count(),
+        2,
+        "the next texture and buffer"
+    );
+}
+
+/// The platform ending the process at an encode in a command buffer fails that command buffer:
+/// its completion carries an error, and the queue's next command buffer runs and completes
+#[test]
+fn an_encode_the_platform_refuses_fails_its_command_buffer() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform) = headless_on(&raised);
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    const SUBMIT_OFF: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET;
+    const COMPLETE_OFF: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x2_0000;
+    const RING_DATA: u32 = 0x1_0000;
+    assert_eq!(
+        answered(
+            &device,
+            &mut guest,
+            queue_create(3, 1, SUBMIT_OFF, COMPLETE_OFF, RING_DATA, 0)
+        ),
+        RGFX_STATUS_OK
+    );
+    make_library(&device, &mut guest, obj(3, 10));
+    guest.send(&device, compute_pipeline_create(obj(3, 11), obj(3, 10)));
+    expect_reflection(&mut guest, obj(3, 11), RGFX_PIPELINE_OK);
+    platform.faults().at(
+        "MTLComputeCommandEncoder",
+        "setComputePipelineState:",
+        0,
+        Fault::Crash,
+    );
+    let mut ring = QueueRing::new(&device, SUBMIT_OFF, COMPLETE_OFF, u64::from(RING_DATA));
+    ring.send(&device, compute_command_buffer(obj(3, 1), 100, obj(3, 11)));
+    assert!(complete_until_event(&platform, &ring), "no completion");
+    let failed = RgfxCbComplete::read_from_bytes(&ring.event().unwrap()).unwrap();
+    assert_eq!(failed.cb_obj_id, 100);
+    assert_ne!(failed.status, RGFX_CB_OK);
+    ring.send(&device, compute_command_buffer(obj(3, 1), 101, obj(3, 11)));
+    assert!(complete_until_event(&platform, &ring), "no completion");
+    let done = RgfxCbComplete::read_from_bytes(&ring.event().unwrap()).unwrap();
+    assert_eq!(done.cb_obj_id, 101);
+    assert_eq!(done.status, RGFX_CB_OK);
 }

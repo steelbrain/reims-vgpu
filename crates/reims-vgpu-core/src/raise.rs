@@ -4,12 +4,13 @@
 //! raise ([`on_fault`]): `Err` where a handler is always live ([`raise!`](crate::raise!)`(id)`), a
 //! death where none ever is ([`Raise::fatal`]), before any `Drop` runs, so lock guards stay held
 //! and nothing more is sent or written, and its caller's [`OnFault`] where both are reached
-//! ([`raise!`](crate::raise!)`(on => id)`). Deaths are [`death`], and values kept for good
-//! [`kept`].
+//! ([`raise!`](crate::raise!)`(on => id)`). Deaths are [`death`], values kept for good
+//! [`kept`], and the scope where a death refuses its op instead [`refusals`].
 
 pub mod death;
 pub mod kept;
 pub mod on_fault;
+pub mod refusals;
 
 use std::fmt;
 use std::panic::Location;

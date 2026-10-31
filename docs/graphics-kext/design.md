@@ -417,7 +417,14 @@ pipeline's reflection, a library create or lookup, a queue's create, a
 context's close) is answered at that op: a refused `PIPELINE_REFLECTION`, or a
 `COMPLETE` with the refusal's status, so no guest thread waits out the kext's
 timeout. A refused command buffer completes with an error status. Nothing in
-this lane ends the offending context or its process on malformed input. This
+this lane ends the offending context or its process on malformed input. The
+host runs each op in a refusal scope (`reims_vgpu_core::raise::refusals`): a
+death at a platform call, where the platform refuses a create or an encode and
+the paravirt device ends the process, unwinds to the op's scope instead, and the
+op is refused there, logged once at WARN with the platform's reason. A command
+buffer refused mid-stream has its open encoder ended and is never committed.
+What dies off the op's thread (the runtime's scheduler thread, a completion
+handler, the window's draw) still ends the process. This
 is the lane's own rule: the paravirt device's rule of ending the process at the
 op (AGENTS.md, the contract) is Apple's framework's behaviour, which that
 device keeps.

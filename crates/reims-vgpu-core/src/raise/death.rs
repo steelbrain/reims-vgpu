@@ -3,6 +3,9 @@
 //! `reims-vgpu: fatal: <what died>`, then `abort()`. Nothing unwinds and no `Drop` runs, so the
 //! process ends at the guest op that caused it and nothing after it reaches the host or the
 //! guest. Where the process dies is the contract; the message and the signal are diagnostics.
+//! The two exceptions unwind instead: a death in an isolated task's own code ends the task
+//! (`tasks::isolation::life`), and one inside a refusal scope refuses the op it met
+//! ([`crate::raise::refusals`]), which only the graphics lane opens.
 //!
 //! [`DeathId`] names what died: an area's reason (its `Display` a dotted id), a raise nothing may
 //! catch, a platform call, or a host call that raised. [`DeathSite`] and [`DeathKind`] are the
@@ -249,6 +252,8 @@ pub fn fatal_with_detail(id: impl Into<DeathId>, detail: &str) -> ! {
 pub(crate) fn die(id: DeathId, detail: Option<&str>) -> ! {
     // A death in an isolated task's own code ends that task, not the process.
     crate::tasks::isolation::life::trap(id, detail);
+    // A death inside a refusal scope (the graphics lane's ops) refuses the op instead.
+    crate::raise::refusals::trap(id, detail);
     #[cfg(any(test, feature = "testkit"))]
     if crate::testkit::capture::capture_enabled() {
         crate::testkit::capture::capture(id.site())

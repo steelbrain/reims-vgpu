@@ -1,0 +1,186 @@
+//! The refusal scope, [`refusing`]: where a death on this thread refuses the op that met it, and
+//! the process goes on.
+//!
+//! The reims-graphics lane's host side runs each guest op inside a scope
+//! (docs/graphics-kext/design.md, "Guest input the host refuses"). There, a death that would end
+//! the process, a platform refusing a create or an encode among them, unwinds to the innermost
+//! scope instead, which answers [`Refusal`]. The lane then refuses the op to the guest. The
+//! paravirt device never opens a scope, so its deaths stay where its contract puts them: outside
+//! a scope [`trap`] returns at once, and the death writes its line and ends the process.
+//!
+//! **Unwinding.** The thread unwinds from the death to the scope, and the `Drop`s between them
+//! run: a handle dropped there is released. A death while the thread is already unwinding is not
+//! trapped and ends the process. So does a death on a thread that runs no scope (a platform's own
+//! threads, a completion handler).
+
+#![expect(
+    clippy::disallowed_methods,
+    reason = "the refusal scope: a death in the graphics lane's op unwinds to its scope (6.4)"
+)]
+
+use std::cell::Cell;
+use std::fmt;
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
+
+use crate::raise::death::DeathId;
+
+thread_local! {
+    /// How many scopes this thread is inside.
+    static DEPTH: Cell<u32> = const { Cell::new(0) };
+}
+
+/// A death a scope caught: what died, and the detail its line would have carried.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refusal {
+    /// What died.
+    pub id: DeathId,
+    /// What the death said after its id: the platform's refusal, for a platform call.
+    pub detail: Option<String>,
+}
+
+impl fmt::Display for Refusal {
+    /// The death's line without its prefix: `<id>` and `: <detail>` where there is one.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.id)?;
+        if let Some(detail) = &self.detail {
+            write!(f, ": {detail}")?;
+        }
+        Ok(())
+    }
+}
+
+/// Leaves the scope as the thread leaves `refusing`, whether `f` returned or unwound.
+struct Depth;
+
+impl Depth {
+    fn enter() -> Depth {
+        DEPTH.with(|d| d.set(d.get().saturating_add(1)));
+        Depth
+    }
+}
+
+impl Drop for Depth {
+    fn drop(&mut self) {
+        DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    }
+}
+
+/// Runs `f` in a refusal scope: `Ok` with what `f` returns, or `Err` with the [`Refusal`] of a
+/// death on this thread inside it, which ended `f` there (module doc). Any other unwind goes on
+/// past the scope.
+pub fn refusing<T>(f: impl FnOnce() -> T) -> Result<T, Refusal> {
+    let depth = Depth::enter();
+    let r = catch_unwind(AssertUnwindSafe(f));
+    drop(depth);
+    match r {
+        Ok(v) => Ok(v),
+        Err(payload) => match payload.downcast::<Refusal>() {
+            Ok(refusal) => Err(*refusal),
+            Err(other) => resume_unwind(other),
+        },
+    }
+}
+
+/// Whether this thread is inside a refusal scope.
+pub fn is_refusing() -> bool {
+    DEPTH.with(Cell::get) > 0
+}
+
+/// `raise::death`'s hook: inside a scope, the death unwinds to it as a [`Refusal`]. Returns where
+/// the thread is in no scope, or is unwinding already: the process then ends as it always did.
+pub(crate) fn trap(id: DeathId, detail: Option<&str>) {
+    if !is_refusing() || std::thread::panicking() {
+        return;
+    }
+    resume_unwind(Box::new(Refusal {
+        id,
+        detail: detail.map(str::to_owned),
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::raise::death::{DeathKind, DeathSite, fatal_with_detail};
+    use crate::raise::{Raise, RaiseResult};
+    use crate::testkit::capture::catch_death;
+
+    const SITE: DeathSite = DeathSite {
+        kind: DeathKind::Abort,
+        file: "refusals.test",
+        line: 0,
+    };
+
+    /// A platform call's death inside a scope refuses: `refusing` answers what died and its
+    /// detail, the `Drop`s between them run, and the thread leaves the scope
+    #[test]
+    fn a_death_in_a_scope_is_its_refusal() {
+        struct Dropped<'a>(&'a Cell<bool>);
+        impl Drop for Dropped<'_> {
+            fn drop(&mut self) {
+                self.0.set(true);
+            }
+        }
+        let dropped = Cell::new(false);
+        let r: Result<(), Refusal> = refusing(|| {
+            let _held = Dropped(&dropped);
+            assert!(is_refusing());
+            fatal_with_detail(
+                DeathId::Platform {
+                    kind: DeathKind::Abort,
+                    call: "newRenderPipelineStateWithDescriptor:error:",
+                },
+                "the runtime refused it",
+            )
+        });
+        let refusal = r.unwrap_err();
+        assert_eq!(
+            refusal.id,
+            DeathId::Platform {
+                kind: DeathKind::Abort,
+                call: "newRenderPipelineStateWithDescriptor:error:",
+            }
+        );
+        assert_eq!(
+            refusal.to_string(),
+            "platform call newRenderPipelineStateWithDescriptor:error:: the runtime refused it"
+        );
+        assert!(dropped.get());
+        assert!(!is_refusing());
+    }
+
+    /// Outside every scope a death is a death, as before any scope existed; a scope's work that
+    /// returns is its value
+    #[test]
+    fn outside_a_scope_a_death_is_a_death() {
+        assert_eq!(refusing(|| 7), Ok(7));
+        assert!(!is_refusing());
+        let d = catch_death(|| crate::fatal!(SITE));
+        assert_eq!(d, Err(SITE));
+        let d = catch_death(|| -> RaiseResult<()> { Raise::platform("commit").fatal() });
+        assert_eq!(d.map_err(|s| s.kind), Err(DeathKind::UncaughtObjc));
+    }
+
+    /// An uncaught raise inside a scope refuses too, and the innermost scope takes the death
+    #[test]
+    fn the_innermost_scope_takes_the_death() {
+        let outer = refusing(|| {
+            let inner: Result<(), Refusal> =
+                refusing(|| Raise::platform("setRenderPipelineState:").fatal());
+            let refusal = inner.unwrap_err();
+            assert!(refusal.to_string().contains("setRenderPipelineState:"));
+            assert!(is_refusing());
+            5
+        });
+        assert_eq!(outer, Ok(5));
+    }
+
+    /// An unwind that is not a death passes the scope by
+    #[test]
+    fn another_unwind_passes_the_scope() {
+        let r = catch_unwind(|| refusing(|| resume_unwind(Box::new(41u32))));
+        let payload = r.unwrap_err();
+        assert_eq!(payload.downcast_ref::<u32>(), Some(&41));
+        assert!(!is_refusing());
+    }
+}

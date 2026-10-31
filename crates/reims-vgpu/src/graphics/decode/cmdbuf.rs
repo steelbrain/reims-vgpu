@@ -47,7 +47,7 @@ use zerocopy::FromBytes;
 
 use super::super::completion::cb_complete;
 use super::{
-    DecodeError, Drain, GraphicsDecoder, ObjHandle, blit, compute, op_fault, read, render,
+    DecodeError, Drain, GraphicsDecoder, ObjHandle, blit, compute, op_fault, read, refusing, render,
 };
 
 /// The op stream runs under a live raise handler (the ring loop's), so an encode's
@@ -122,13 +122,26 @@ impl<P: Platform> GraphicsDecoder<P> {
 
     /// Walks the op stream `ops` on the command buffer `cb`. `Ok(Err(..))` for a
     /// structural malformation, `Ok(Ok(()))` when the whole stream was carried out;
-    /// a fault propagates as `Err`.
-    fn walk_ops(
+    /// a fault propagates as `Err`, and so does an op the platform refuses, which
+    /// the lane's refusal scope takes ([`refusing`]). A walk that stops with an
+    /// encoder open ends it before the command buffer goes, uncommitted, as Metal
+    /// asserts on an encoder released without its end.
+    fn walk_ops(&self, ops: &[u8], cb: &P::CommandBuffer) -> RaiseResult<Result<(), DecodeError>> {
+        let mut encoder: Option<OpenEncoder<P>> = None;
+        let walked = refusing(|| self.walk(ops, cb, &mut encoder));
+        if let Some(open) = encoder.take() {
+            end_abandoned(open);
+        }
+        walked
+    }
+
+    /// [`Self::walk_ops`]'s walk, `encoder` the one it holds open.
+    fn walk(
         &self,
         mut ops: &[u8],
         cb: &P::CommandBuffer,
+        encoder: &mut Option<OpenEncoder<P>>,
     ) -> RaiseResult<Result<(), DecodeError>> {
-        let mut encoder: Option<OpenEncoder<P>> = None;
         while !ops.is_empty() {
             let Some(h) = read::<RgfxOpHeader>(ops) else {
                 return Ok(Err(DecodeError::Malformed));
@@ -139,7 +152,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             }
             let body = &ops[RGFX_OP_BODY_OFFSET as usize..len];
             match op_group(h.tag) {
-                RGFX_OP_GROUP_FRAMING => self.framing_op(h.tag, body, cb, &mut encoder)?,
+                RGFX_OP_GROUP_FRAMING => self.framing_op(h.tag, body, cb, encoder)?,
                 RGFX_OP_GROUP_RENDER => {
                     let Some(OpenEncoder::Render(enc)) = encoder.as_ref() else {
                         return Err(no_encoder(h.tag, "render"));
@@ -321,6 +334,16 @@ impl<P: Platform> GraphicsDecoder<P> {
 
         Ok(pass)
     }
+}
+
+/// Ends `open`, an encoder a walk left open as it stopped, in a refusal scope of its own: its
+/// command buffer is never committed, and what the end answers is not the guest's.
+fn end_abandoned<P: Platform>(open: OpenEncoder<P>) {
+    let _ = refusing(|| match open {
+        OpenEncoder::Render(enc) => enc.encode(ON, RenderCmd::EndEncoding),
+        OpenEncoder::Compute(enc) => enc.encode(ON, ComputeCmd::EndEncoding),
+        OpenEncoder::Blit(enc) => enc.encode(ON, BlitCmd::EndEncoding),
+    });
 }
 
 /// A fault: an encoder op whose group has no open encoder.

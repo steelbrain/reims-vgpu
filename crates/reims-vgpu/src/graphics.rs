@@ -56,7 +56,7 @@ use crate::graphics::completion::cb_failed;
 use crate::graphics::decode::{
     CompiledPipeline, CompletionSink, DecodeError, GraphicsDecoder, LibraryJob, LibraryStart,
     MadeLibrary, PipelineJob, ReflectionSink, compile_pipeline, complete, make_library,
-    refused_reply,
+    refused_reply, refusing,
 };
 use crate::graphics::device_info::device_info;
 use crate::platform::ApiPlatform;
@@ -457,7 +457,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                 if foreign_queue(poster, message) {
                     Ok(Err(DecodeError::BadReference))
                 } else {
-                    decoder.decode(&self.device, message)
+                    refusing(|| decoder.decode(&self.device, message))
                 }
             };
             match outcome {
@@ -472,9 +472,11 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                     self.fail_queue_command_buffer(poster, message);
                 }
                 Err(raise) => {
+                    let (ty, seqno, obj_id) = message_identity(message);
                     log::warn!(
                         target: "reims_vgpu::graphics",
-                        "a queue command buffer faulted: {raise}"
+                        "a message (type {ty:#x}, seqno {seqno}, object {obj_id:#x}) faulted: \
+                         {raise}"
                     );
                     self.fail_queue_command_buffer(poster, message);
                 }
@@ -525,20 +527,14 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     fn compile(&self, job: PipelineJob<P>, poster: &CompletionPoster) {
         entry::run(|_| {
             let (obj_id, seqno, kind) = (job.obj_id, job.seqno, job.kind());
-            let compiled = match compile_pipeline::<P>(&self.device, job) {
+            let compiled = match refusing(|| compile_pipeline::<P>(&self.device, job)) {
                 Ok(compiled) => compiled,
-                Err(raise) => {
-                    log::warn!(
-                        target: "reims_vgpu::graphics",
-                        "a pipeline create (seqno {seqno}, object {obj_id:#x}) faulted: {raise}"
-                    );
-                    CompiledPipeline::refused(obj_id, seqno, kind)
-                }
+                Err(raise) => CompiledPipeline::refused(obj_id, seqno, kind, raise.to_string()),
             };
-            if compiled.is_refused() {
+            if let Some(reason) = compiled.refusal() {
                 log::warn!(
                     target: "reims_vgpu::graphics",
-                    "a pipeline create (seqno {seqno}, object {obj_id:#x}) was refused"
+                    "a pipeline create (seqno {seqno}, object {obj_id:#x}) was refused: {reason}"
                 );
             }
             let reflection = compiled.reflection;
@@ -611,21 +607,17 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     fn make(&self, job: LibraryJob<P>, poster: &CompletionPoster) {
         entry::run(|_| {
             let (obj_id, seqno) = (job.obj_id, job.seqno);
-            let made = match make_library::<P>(&self.device, &job) {
+            let made = match refusing(|| make_library::<P>(&self.device, &job)) {
                 Ok(made) => made,
-                Err(raise) => {
-                    log::warn!(
-                        target: "reims_vgpu::graphics",
-                        "a library create (seqno {seqno}, object {obj_id:#x}) faulted: {raise}"
-                    );
-                    MadeLibrary::refused(job)
-                }
+                Err(raise) => MadeLibrary::refused(job, raise.to_string()),
             };
+            let reason = made.refusal().map(str::to_owned);
             let status = self.decoder.lock().finish_library(made);
             if status != RGFX_STATUS_OK {
+                let reason = reason.as_deref().unwrap_or("it was cancelled");
                 log::warn!(
                     target: "reims_vgpu::graphics",
-                    "a library create (seqno {seqno}, object {obj_id:#x}) was refused"
+                    "a library create (seqno {seqno}, object {obj_id:#x}) was refused: {reason}"
                 );
             }
             poster.post(complete(seqno, status).as_bytes());

@@ -70,7 +70,7 @@ use reims_vgpu_core::platform::values::{
     StencilDesc, TextureDesc,
 };
 use reims_vgpu_core::platform::{Handle, Platform};
-use reims_vgpu_core::raise::{OnFault, Raise, RaiseResult};
+use reims_vgpu_core::raise::{OnFault, Raise, RaiseResult, refusals};
 use reims_vgpu_core::sync::Mutex;
 use zerocopy::FromBytes;
 
@@ -825,7 +825,11 @@ impl<P: Platform> GraphicsDecoder<P> {
                 return Ok(Err(e));
             }
         };
-        let compiled = compile_pipeline::<P>(device, job)?;
+        let (obj_id, seqno, kind) = (job.obj_id, job.seqno, job.kind());
+        let compiled = match refusing(|| compile_pipeline::<P>(device, job)) {
+            Ok(compiled) => compiled,
+            Err(raise) => CompiledPipeline::refused(obj_id, seqno, kind, raise.to_string()),
+        };
         let refused = compiled.is_refused();
         if let Some(sink) = self.reflection_sink.clone() {
             sink(compiled.reflection);
@@ -980,16 +984,29 @@ pub(crate) struct CompiledPipeline<P: Platform> {
     handle: Option<ObjHandle<P>>,
     /// The reply: the pipeline's reflection, or a refusal.
     pub(crate) reflection: RgfxPipelineReflection,
+    /// Why it was refused, for the host's log; `None` for a made pipeline.
+    refusal: Option<String>,
 }
 
 impl<P: Platform> CompiledPipeline<P> {
     /// A refused create of `kind` (a nil function, the platform refusing the descriptor, or a
-    /// raise in the compile).
-    pub(crate) fn refused(obj_id: u64, seqno: u64, kind: u32) -> Self {
+    /// raise or a refusal in the compile), refused for `reason`.
+    pub(crate) fn refused(obj_id: u64, seqno: u64, kind: u32, reason: impl Into<String>) -> Self {
         CompiledPipeline {
             obj_id,
             handle: None,
             reflection: refused_reflection(obj_id, seqno, kind),
+            refusal: Some(reason.into()),
+        }
+    }
+
+    /// A made pipeline and its reflection.
+    fn made(obj_id: u64, handle: ObjHandle<P>, reflection: RgfxPipelineReflection) -> Self {
+        CompiledPipeline {
+            obj_id,
+            handle: Some(handle),
+            reflection,
+            refusal: None,
         }
     }
 
@@ -997,19 +1014,28 @@ impl<P: Platform> CompiledPipeline<P> {
     pub(crate) fn is_refused(&self) -> bool {
         self.handle.is_none()
     }
+
+    /// Why the platform made no pipeline; `None` for a made one.
+    pub(crate) fn refusal(&self) -> Option<&str> {
+        self.refusal.as_deref()
+    }
 }
 
 /// The middle step of a pipeline create, with no lock held: the functions specialised by their
 /// constants and the pipeline made on `device`. A nil function (the library has no such entry
 /// point, or refuses the specialisation) refuses the pipeline, as a nil state or an `NSError`
-/// from the creator does; a platform raise propagates.
+/// from the creator does; a platform raise propagates. The caller runs it in the lane's refusal
+/// scope ([`refusing`]), where a platform refusing the compile refuses the create too.
 pub(crate) fn compile_pipeline<P: Platform>(
     device: &P::Device,
     job: PipelineJob<P>,
 ) -> RaiseResult<CompiledPipeline<P>> {
     let kind = job.kind();
     let (obj_id, seqno) = (job.obj_id, job.seqno);
-    let refused = || CompiledPipeline::refused(obj_id, seqno, kind);
+    let refused = |reason: String| CompiledPipeline::refused(obj_id, seqno, kind, reason);
+    let no_library = |stage: &str| format!("its {stage} function's library was refused");
+    let no_function =
+        |name: &str| format!("the library made no function {name:?} of its constants");
     match job.shape {
         PipelineShape::Render {
             vertex_library,
@@ -1024,19 +1050,20 @@ pub(crate) fn compile_pipeline<P: Platform>(
         } => {
             // A library being made is waited for here; one the platform refused refuses the
             // pipeline.
-            let (Some(vertex_library), Some(fragment_library)) =
-                (vertex_library.resolve(), fragment_library.resolve())
-            else {
-                return Ok(refused());
+            let Some(vertex_library) = vertex_library.resolve() else {
+                return Ok(refused(no_library("vertex")));
+            };
+            let Some(fragment_library) = fragment_library.resolve() else {
+                return Ok(refused(no_library("fragment")));
             };
             let Some(vertex) = specialised::<P>(&vertex_library, &vertex_name, &vertex_constants)?
             else {
-                return Ok(refused());
+                return Ok(refused(no_function(&vertex_name)));
             };
             let Some(fragment) =
                 specialised::<P>(&fragment_library, &fragment_name, &fragment_constants)?
             else {
-                return Ok(refused());
+                return Ok(refused(no_function(&fragment_name)));
             };
             let desc = RenderPipelineDesc::<P> {
                 label: label.as_deref(),
@@ -1049,12 +1076,12 @@ pub(crate) fn compile_pipeline<P: Platform>(
             // `new_render_pipeline_state` returns a plain `Result` (no path reaches it under a
             // handler in the Apple lane); a nil state or an `NSError` refuses.
             Ok(match device.new_render_pipeline_state(&desc) {
-                Ok(Some(pipeline)) => CompiledPipeline {
-                    obj_id,
-                    reflection: render_reflection::<P>(&pipeline, seqno, obj_id),
-                    handle: Some(ObjHandle::RenderPipeline(pipeline)),
-                },
-                Ok(None) | Err(_) => refused(),
+                Ok(Some(pipeline)) => {
+                    let reflection = render_reflection::<P>(&pipeline, seqno, obj_id);
+                    CompiledPipeline::made(obj_id, ObjHandle::RenderPipeline(pipeline), reflection)
+                }
+                Ok(None) => refused("the platform answered nil".to_owned()),
+                Err(e) => refused(format!("the platform answered an error: {}", e.description)),
             })
         }
         PipelineShape::Compute {
@@ -1063,19 +1090,23 @@ pub(crate) fn compile_pipeline<P: Platform>(
             constants,
         } => {
             let Some(library) = library.resolve() else {
-                return Ok(refused());
+                return Ok(refused(no_library("kernel")));
             };
             let Some(function) = specialised::<P>(&library, &name, &constants)? else {
-                return Ok(refused());
+                return Ok(refused(no_function(&name)));
             };
             Ok(
                 match device.new_compute_pipeline_state_for_function(Some(&function)) {
-                    Ok(Some(pipeline)) => CompiledPipeline {
-                        obj_id,
-                        reflection: compute_reflection::<P>(&pipeline, seqno, obj_id),
-                        handle: Some(ObjHandle::ComputePipeline(pipeline)),
-                    },
-                    Ok(None) | Err(_) => refused(),
+                    Ok(Some(pipeline)) => {
+                        let reflection = compute_reflection::<P>(&pipeline, seqno, obj_id);
+                        CompiledPipeline::made(
+                            obj_id,
+                            ObjHandle::ComputePipeline(pipeline),
+                            reflection,
+                        )
+                    }
+                    Ok(None) => refused("the platform answered nil".to_owned()),
+                    Err(e) => refused(format!("the platform answered an error: {}", e.description)),
                 },
             )
         }
@@ -1250,6 +1281,18 @@ fn bad_reference() -> Raise {
 /// [`bad_reference`], it faults the exec rather than reporting a [`DecodeError`].
 pub(crate) fn op_fault(detail: impl std::fmt::Display) -> Raise {
     Raise::foreign("rgfx.decode.op").with_detail(detail)
+}
+
+/// `op`, one guest op of the lane's, inside the refusal scope ([`refusals::refusing`]): a death
+/// on this thread inside it, a platform refusing a create or an encode among them, which ends
+/// the process at its call on the paravirt device, refuses the op instead, as a raise the
+/// caller's handler takes. So the op is refused to the guest at its op (a refused reflection, a
+/// `COMPLETE` with its status, a failed command buffer) and the process goes on
+/// (docs/graphics-kext/design.md, "Guest input the host refuses").
+pub(crate) fn refusing<T>(op: impl FnOnce() -> RaiseResult<T>) -> RaiseResult<T> {
+    refusals::refusing(op).unwrap_or_else(|refusal| {
+        Err(Raise::foreign("rgfx.platform.refused").with_detail(format!("refused: {refusal}")))
+    })
 }
 
 /// The object-resolution API: the contract the encoder-op decoders

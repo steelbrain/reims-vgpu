@@ -11,7 +11,7 @@ disallowed-methods = [
     { path = "std::thread::spawn", reason = "core's threads come from the platform's Threads: rt::thread::spawn_named (7.1)" },
     { path = "std::time::Instant::now", reason = "use Clock (7.5)" },
     { path = "std::time::SystemTime::now", reason = "use Clock (7.5)" },
-    { path = "std::panic::catch_unwind", reason = "allowed only in the testkit (capture, death, launcher), an isolated task's trap (tasks::isolation::life) (6.5), the pipeline resolver's callback inside Metal (spi::classes, 6.3) and the C API's catch on Linux (ffi::catch, 6.7)" },
+    { path = "std::panic::catch_unwind", reason = "allowed only in the testkit (capture, death, launcher), an isolated task's trap (tasks::isolation::life) (6.5), the graphics lane's refusal scope (raise::refusals), the pipeline resolver's callback inside Metal (spi::classes, 6.3) and the C API's catch on Linux (ffi::catch, 6.7)" },
 ]
 
 # Tests may unwrap, index and panic: a failure is the assertion (architecture 17.4).
