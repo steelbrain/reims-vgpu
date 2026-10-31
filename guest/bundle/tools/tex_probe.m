@@ -38,6 +38,16 @@
 //                       one command buffer copies A to B and fills C's second half: B must hold
 //                       the CPU's pattern and A the GPU's fill, each seen through the other's
 //                       contents, as Metal's placed resources alias their heap's memory
+//   tex_probe autoheap N  N rounds of a 1000000-byte Automatic heap, Private, then Shared, placed in
+//                       as Metal places (M3 Max, macOS 27): its size the 16 KiB pages that hold
+//                       it; buffers of 100, 100 and 70000 bytes at its first byte, 256 and 512
+//                       bytes past it (their gpuAddress), heapOffset 0, then a 256 x 256 RGBA8
+//                       texture of the device's heapTextureSizeAndAlignWithDescriptor: size,
+//                       usedSize their sizes; one command buffer fills each buffer with its own
+//                       byte and copies a pattern through the texture, and every byte must come
+//                       back; the first buffer let go and the second made aliasable give their
+//                       bytes back (usedSize, within a second of the command buffer's end), and a
+//                       buffer of 50 bytes goes at the first byte
 // Prints "TEX OK" when every check passes, else "TEX FAIL: why" and exits 1. A completion 20 s
 // late prints HANG and exits 3. The copy waits with waitUntilCompleted, or with its completed
 // handler alone (`handler`).
@@ -575,6 +585,156 @@ static int shared_heap(id<MTLDevice> device, id<MTLCommandQueue> queue, long n)
 	return 0;
 }
 
+// One round of `autoheap` in a heap of `mode`.
+static int auto_heap_round(id<MTLDevice> device, id<MTLCommandQueue> queue, MTLStorageMode mode,
+                           long i)
+{
+	const MTLResourceOptions o = (MTLResourceOptions)mode << MTLResourceStorageModeShift;
+	const MTLResourceOptions shared = MTLResourceStorageModeShared;
+	MTLHeapDescriptor *hd = [MTLHeapDescriptor new];
+	hd.size = 1000000;
+	hd.storageMode = mode;
+	hd.type = MTLHeapTypeAutomatic;
+	id<MTLHeap> heap = [device newHeapWithDescriptor:hd];
+	if (heap == nil)
+		return fail("no Automatic heap");
+	if (heap.size != 1015808 || heap.currentAllocatedSize != 1015808 || heap.usedSize != 0 ||
+	    [heap maxAvailableSizeWithAlignment:256] != 1015808) {
+		printf("round %ld: size %lu allocated %lu used %lu available %lu\n", i,
+		       (unsigned long)heap.size, (unsigned long)heap.currentAllocatedSize,
+		       (unsigned long)heap.usedSize,
+		       (unsigned long)[heap maxAvailableSizeWithAlignment:256]);
+		return fail("a fresh Automatic heap's sizes are not Metal's");
+	}
+	id<MTLBuffer> b1 = [heap newBufferWithLength:100 options:o];
+	id<MTLBuffer> b2 = [heap newBufferWithLength:100 options:o];
+	id<MTLBuffer> b3 = [heap newBufferWithLength:70000 options:o];
+	if (b1 == nil || b2 == nil || b3 == nil)
+		return fail("no buffer of an Automatic heap");
+	const uint64_t base = b1.gpuAddress;
+	if (b2.gpuAddress != base + 256 || b3.gpuAddress != base + 512 || b1.heapOffset != 0 ||
+	    b3.heapOffset != 0 || b3.heap != heap) {
+		printf("round %ld: at +0x%llx +0x%llx, heapOffset %lu\n", i, b2.gpuAddress - base,
+		       b3.gpuAddress - base, (unsigned long)b3.heapOffset);
+		return fail("an Automatic heap's buffers are not where Metal places them");
+	}
+	// In a pool of its own: Metal's contents keeps its buffer in the pool (measured: M3 Max,
+	// macOS 27), which would hold the first buffer's bytes past its letting go below.
+	ptrdiff_t apart = 512;
+	@autoreleasepool {
+		if (mode == MTLStorageModeShared)
+			apart = (uint8_t *)[b3 contents] - (uint8_t *)[b1 contents];
+	}
+	if (apart != 512)
+		return fail("an Automatic Shared heap's buffers are not its bytes at their offsets");
+	if (heap.usedSize != 70200 || [heap maxAvailableSizeWithAlignment:256] != 945152 ||
+	    [heap maxAvailableSizeWithAlignment:65536] != 884736) {
+		printf("round %ld: used %lu available %lu / %lu\n", i, (unsigned long)heap.usedSize,
+		       (unsigned long)[heap maxAvailableSizeWithAlignment:256],
+		       (unsigned long)[heap maxAvailableSizeWithAlignment:65536]);
+		return fail("an Automatic heap's used and available bytes are not Metal's");
+	}
+	MTLTextureDescriptor *td =
+	    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+	                                                       width:256
+	                                                      height:256
+	                                                   mipmapped:NO];
+	td.storageMode = mode;
+	td.usage = MTLTextureUsageShaderRead;
+	const MTLSizeAndAlign sa = [device heapTextureSizeAndAlignWithDescriptor:td];
+	id<MTLTexture> t = [heap newTextureWithDescriptor:td];
+	if (i == 0)
+		printf("autoheap: a 256 x 256 RGBA8 texture takes %lu bytes at %lu\n",
+		       (unsigned long)sa.size, (unsigned long)sa.align);
+	if (t == nil || sa.size < 256 * 256 * 4 || t.allocatedSize != sa.size ||
+	    heap.usedSize != 70200 + sa.size || t.heapOffset != 0) {
+		printf("round %ld: texture %d, size %lu, allocated %lu, used %lu\n", i, t != nil,
+		       (unsigned long)sa.size, (unsigned long)t.allocatedSize,
+		       (unsigned long)heap.usedSize);
+		return fail("an Automatic heap's texture does not take its size");
+	}
+	const NSUInteger row = 256 * 4, bytes = row * 256;
+	id<MTLBuffer> pattern = [device newBufferWithLength:bytes options:shared];
+	id<MTLBuffer> back = [device newBufferWithLength:bytes + 70200 options:shared];
+	uint8_t *pp = (uint8_t *)[pattern contents], *pb = (uint8_t *)[back contents];
+	for (NSUInteger k = 0; k < bytes; k++)
+		pp[k] = (uint8_t)(k * 31 + i);
+	const uint8_t f1 = (uint8_t)(i + 1), f2 = (uint8_t)(i + 2), f3 = (uint8_t)(i + 3);
+	struct watch *w = watch_start("an automatic heap command buffer");
+	id<MTLCommandBuffer> cb = [queue commandBuffer];
+	id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+	[blit fillBuffer:b1 range:NSMakeRange(0, 100) value:f1];
+	[blit fillBuffer:b2 range:NSMakeRange(0, 100) value:f2];
+	[blit fillBuffer:b3 range:NSMakeRange(0, 70000) value:f3];
+	[blit copyFromBuffer:pattern
+	           sourceOffset:0
+	      sourceBytesPerRow:row
+	    sourceBytesPerImage:bytes
+	             sourceSize:MTLSizeMake(256, 256, 1)
+	              toTexture:t
+	       destinationSlice:0
+	       destinationLevel:0
+	      destinationOrigin:MTLOriginMake(0, 0, 0)];
+	[blit copyFromTexture:t
+	                 sourceSlice:0
+	                 sourceLevel:0
+	                sourceOrigin:MTLOriginMake(0, 0, 0)
+	                  sourceSize:MTLSizeMake(256, 256, 1)
+	                    toBuffer:back
+	           destinationOffset:0
+	      destinationBytesPerRow:row
+	    destinationBytesPerImage:bytes];
+	[blit copyFromBuffer:b1 sourceOffset:0 toBuffer:back destinationOffset:bytes size:100];
+	[blit copyFromBuffer:b2 sourceOffset:0 toBuffer:back destinationOffset:bytes + 100 size:100];
+	[blit copyFromBuffer:b3 sourceOffset:0 toBuffer:back destinationOffset:bytes + 200 size:70000];
+	[blit endEncoding];
+	[cb commit];
+	[cb waitUntilCompleted];
+	atomic_store(&w->done, 1);
+	if (cb.status != MTLCommandBufferStatusCompleted)
+		return fail("an automatic heap command buffer failed");
+	long wrong = 0;
+	for (NSUInteger k = 0; k < bytes; k++)
+		wrong += pb[k] != pp[k];
+	for (NSUInteger k = 0; k < 70200; k++)
+		wrong += pb[bytes + k] != (k < 100 ? f1 : k < 200 ? f2 : f3);
+	if (wrong) {
+		printf("round %ld: %ld wrong bytes\n", i, wrong);
+		return fail("an Automatic heap's resources do not keep their own bytes");
+	}
+	cb = nil;
+	b1 = nil;
+	[b2 makeAliasable];
+	// The command buffer lets its resources go as it completes, which may come just after the
+	// wait returns (Metal's does so on its completion thread): give it a second.
+	for (int tries = 0; tries < 100 && heap.usedSize != 70000 + sa.size; tries++)
+		usleep(10000);
+	if (heap.usedSize != 70000 + sa.size || !b2.isAliasable) {
+		printf("round %ld: used %lu\n", i, (unsigned long)heap.usedSize);
+		return fail("a buffer let go or made aliasable keeps its bytes of its heap");
+	}
+	id<MTLBuffer> b4 = [heap newBufferWithLength:50 options:o];
+	if (b4 == nil || b4.gpuAddress != base)
+		return fail("a buffer after the first is let go is not at the heap's first byte");
+	return 0;
+}
+
+static int auto_heap(id<MTLDevice> device, id<MTLCommandQueue> queue, long n)
+{
+	double start = now_ms();
+	for (long i = 0; i < n; i++) {
+		@autoreleasepool {
+			int r = auto_heap_round(device, queue, i % 2 ? MTLStorageModeShared
+			                                             : MTLStorageModePrivate,
+			                        i);
+			if (r != 0)
+				return r;
+		}
+	}
+	printf("autoheap: %ld rounds in %.0f ms\n", n, now_ms() - start);
+	return 0;
+}
+
 int main(int argc, char **argv)
 {
 	@autoreleasepool {
@@ -583,13 +743,14 @@ int main(int argc, char **argv)
 		int churning = argc >= 2 && strcmp(argv[1], "churn") == 0;
 		int everyKind = argc >= 2 && strcmp(argv[1], "kinds") == 0;
 		int sharedHeap = argc >= 2 && strcmp(argv[1], "sharedheap") == 0;
+		int autoHeap = argc >= 2 && strcmp(argv[1], "autoheap") == 0;
 		if (argc < 2 ||
 		    (strcmp(argv[1], "copy") != 0 && strcmp(argv[1], "hold") != 0 && !handler && !big &&
-		     !churning && !everyKind && !sharedHeap) ||
+		     !churning && !everyKind && !sharedHeap && !autoHeap) ||
 		    (strcmp(argv[1], "copy") != 0 && argc < 3)) {
 			fprintf(stderr,
 			        "usage: tex_probe copy | hold N | handler N | big N | churn N | kinds N | "
-			        "sharedheap N\n");
+			        "sharedheap N | autoheap N\n");
 			return 2;
 		}
 		id<MTLDevice> device = MTLCreateSystemDefaultDevice();
@@ -638,11 +799,12 @@ int main(int argc, char **argv)
 			if ((long)held.count < n && held.count > 0)
 				[held removeLastObject];
 		}
-		if (big || churning || everyKind || sharedHeap) {
+		if (big || churning || everyKind || sharedHeap || autoHeap) {
 			long n = strtol(argv[2], NULL, 10);
 			int r = big          ? one_big_buffer(device, queue, n)
 			        : churning   ? churn(device, queue, n)
 			        : sharedHeap ? shared_heap(device, queue, n)
+			        : autoHeap   ? auto_heap(device, queue, n)
 			                     : kinds(device, n);
 			if (r != 0)
 				return r;
