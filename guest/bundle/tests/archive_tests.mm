@@ -143,10 +143,14 @@ void test_archive_making()
 	    e, MTLBinaryArchiveErrorInvalidFile,
 	    [NSString stringWithFormat:@"The file %@ has an invalid format.", dir.absoluteString]));
 
-	// Nothing added: Metal writes nothing.
+	// Nothing added: Metal writes nothing, but answers a URL it cannot write to first.
 	CHECK(![a serializeToURL:at(@"empty-archive.bin") error:&e]);
 	CHECK(isArchiveError(e, MTLBinaryArchiveErrorCompilationFailure, @"Nothing to serialize"));
 	CHECK(![[NSFileManager defaultManager] fileExistsAtPath:at(@"empty-archive.bin").path]);
+	CHECK(![a serializeToURL:at(@"no/such/dir/a.bin") error:&e]);
+	CHECK(isArchiveError(e, MTLBinaryArchiveErrorInvalidFile, @"Invalid URL"));
+	CHECK(![a serializeToURL:[NSURL URLWithString:@"https://example.invalid/a.bin"] error:&e]);
+	CHECK(isArchiveError(e, MTLBinaryArchiveErrorInvalidFile, @"Invalid URL"));
 }
 
 // Adding: what Metal asserts on is refused with its words; a fragment function may be absent.

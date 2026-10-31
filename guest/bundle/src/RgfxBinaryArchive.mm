@@ -212,8 +212,9 @@ NSString *hex(const RgfxArchiveEntry &e)
 
 NSError *miss(id<MTLFunction> fn, const char *pipeline, const RgfxArchiveEntry &e)
 {
+	// Metal's words, then its expected key, here the device's own, on lines of their own.
 	NSString *what = [NSString stringWithFormat:@"Unable to find function \"%@\" (%s pipeline) in "
-	                                            @"binary archives. \n Expected key: %@ \n",
+	                                            @"binary archives. \n Expected key: \n %@ \n ",
 	                                            fn.name, pipeline, hex(e)];
 	return [NSError errorWithDomain:RgfxBinaryArchiveMissDomain
 	                           code:3
@@ -437,6 +438,17 @@ NSError *miss(id<MTLFunction> fn, const char *pipeline, const RgfxArchiveEntry &
 
 - (BOOL)serializeToURL:(NSURL *)url error:(__autoreleasing NSError **)error
 {
+	// Metal answers a URL it cannot write to before it looks at what there is to write
+	// (measured: an empty archive to a missing directory answers Invalid URL).
+	BOOL directory = NO;
+	NSString *parent = url.URLByDeletingLastPathComponent.path;
+	if (url == nil || !url.isFileURL || parent == nil ||
+	    ![[NSFileManager defaultManager] fileExistsAtPath:parent isDirectory:&directory] ||
+	    !directory) {
+		if (error)
+			*error = invalidURL();
+		return NO;
+	}
 	std::vector<uint8_t> bytes;
 	{
 		std::lock_guard<std::mutex> hold(_lock);
@@ -453,7 +465,7 @@ NSError *miss(id<MTLFunction> fn, const char *pipeline, const RgfxArchiveEntry &
 		bytes = rgfxWriteArchiveFile(kept);
 	}
 	NSData *data = [NSData dataWithBytes:bytes.data() length:bytes.size()];
-	if (url == nil || !url.isFileURL || ![data writeToURL:url atomically:YES]) {
+	if (![data writeToURL:url atomically:YES]) {
 		if (error)
 			*error = invalidURL();
 		return NO;
