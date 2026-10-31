@@ -30,6 +30,7 @@
 #define RGFX_RESOURCE_H_
 
 #import <Foundation/Foundation.h>
+#import <Metal/Metal.h>
 
 #include "RgfxObjectModel.hpp" // RgfxObjId
 
@@ -81,6 +82,9 @@ NS_ASSUME_NONNULL_BEGIN
 /// Places the resource in `heap` (the heap's sub-allocation sets it).
 - (void)rgfxSetHeap:(nullable id<MTLHeap>)heap;
 
+/// Records the resource's offset in its heap (MTLResource's `heapOffset` answers it).
+- (void)rgfxSetHeapOffset:(NSUInteger)offset;
+
 #ifdef __cplusplus
 /// For a wrapper's dealloc: drops the object's host handle (OBJECT_DESTROY) once every command
 /// buffer in flight now has completed (RgfxRetirement), as one may still name it, then runs
@@ -88,6 +92,14 @@ NS_ASSUME_NONNULL_BEGIN
 /// resource id. Without a serialiser there is no host object, and `after` runs at once.
 - (void)rgfxRetireThen:(std::function<void()>)after;
 #endif
+
+/// The MTLResource members every wrapper shares (RgfxResource.mm), declared so a subclass's
+/// protocol conformance sees them.
+@property(nonatomic, readonly) NSUInteger heapOffset;
+- (void)makeAliasable;
+- (BOOL)isAliasable;
+- (MTLPurgeableState)setPurgeableState:(MTLPurgeableState)state;
+- (kern_return_t)setOwnerWithIdentity:(task_id_token_t)identity;
 
 @end
 

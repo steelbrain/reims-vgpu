@@ -163,6 +163,7 @@
 	                                                device:self.device
 	                                            serializer:ser];
 	[buffer rgfxSetHeap:self];
+	[buffer rgfxSetHeapOffset:offset];
 	return buffer;
 }
 
@@ -175,6 +176,7 @@
 	                                                   device:self.device
 	                                               serializer:[self serializer]];
 	[texture rgfxSetHeap:self]; // the texture keeps the heap alive
+	[texture rgfxSetHeapOffset:offset];
 	return texture;
 }
 

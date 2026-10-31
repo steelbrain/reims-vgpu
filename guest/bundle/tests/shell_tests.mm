@@ -372,6 +372,16 @@ void test_texture_cpu_copies()
 	CHECK([tex setPurgeableState:MTLPurgeableStateEmpty] == MTLPurgeableStateNonVolatile);
 	CHECK([tex setPurgeableState:MTLPurgeableStateNonVolatile] == MTLPurgeableStateEmpty);
 	CHECK(!fx.ring.next(&h, &bytes));
+
+	// A buffer's resource options decode as a texture's; a resource made in no heap answers
+	// none, and cannot be made aliasable.
+	CHECK(buf.storageMode == MTLStorageModeShared && tex.storageMode == MTLStorageModeShared);
+	CHECK(buf.cpuCacheMode == MTLCPUCacheModeDefaultCache);
+	CHECK(buf.hazardTrackingMode == MTLHazardTrackingModeDefault);
+	CHECK(buf.heap == nil && buf.heapOffset == 0 && tex.heap == nil);
+	[buf makeAliasable];
+	CHECK(!buf.isAliasable);
+	CHECK([buf setOwnerWithIdentity:0] == KERN_SUCCESS);
 	}
 }
 
@@ -633,6 +643,13 @@ void test_heap_routing_and_suballoc()
 	CHECK(tm.heap_obj_id == heap.rgfxObjId && tm.heap_offset == 0x4000);
 	CHECK(tm.gpu_address == 0); // heap-placed: no device address
 	CHECK(tm.desc.pixel_format == MTLPixelFormatRGBA8Unorm);
+	// Each answers its heap and offset, and can be made aliasable.
+	CHECK(hb.heap == heap && hb.heapOffset == 0x2000);
+	CHECK(ht.heap == heap && ht.heapOffset == 0x4000);
+	CHECK(hb.storageMode == MTLStorageModePrivate);
+	CHECK(!ht.isAliasable);
+	[ht makeAliasable];
+	CHECK(ht.isAliasable && !hb.isAliasable);
 
 	// The offset-less (Automatic-placement) variants are nil stubs this slice.
 	CHECK([heap newBufferWithLength:0x100 options:MTLResourceStorageModePrivate] == nil);
