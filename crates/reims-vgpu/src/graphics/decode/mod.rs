@@ -3482,15 +3482,21 @@ mod tests {
         assert!(logged.contains(part), "{logged}");
     }
 
-    /// Appends to `bytes` the linked functions `specs` name, each of library `library`: its name,
-    /// list, `MTLFunctionOptions`, group name (empty for none), constants and specialized name
-    /// (empty for none), then their records, and answers the records' offset and count; the
-    /// message's size is set again, a multiple of 8.
-    fn append_linked(
-        bytes: &mut Vec<u8>,
-        library: u64,
-        specs: &[(&str, u32, u32, &str, &[RgfxFunctionConstant], &str)],
-    ) -> (u32, u32) {
+    /// A linked function [`append_linked`] appends: its name, list, `MTLFunctionOptions`, group
+    /// name (empty for none), constants and specialized name (empty for none).
+    type LinkedSpec<'a> = (
+        &'a str,
+        u32,
+        u32,
+        &'a str,
+        &'a [RgfxFunctionConstant],
+        &'a str,
+    );
+
+    /// Appends to `bytes` the linked functions `specs` name ([`LinkedSpec`]), each of library
+    /// `library`, then their records, and answers the records' offset and count; the message's
+    /// size is set again, a multiple of 8.
+    fn append_linked(bytes: &mut Vec<u8>, library: u64, specs: &[LinkedSpec<'_>]) -> (u32, u32) {
         let mut records = Vec::new();
         for &(name, list, options, group, constants, specialized) in specs {
             let name_offset = bytes.len() as u32;

@@ -1667,7 +1667,7 @@ mod tests {
             .unwrap();
         assert_eq!(plain.get().name().to_string(), "impl_fn");
         let refused = pipeline(plain);
-        assert!(matches!(refused, Err(_)), "{refused:?}");
+        assert!(refused.is_err(), "{refused:?}");
     }
 
     /// The pipeline getters agree with objc2-metal's
