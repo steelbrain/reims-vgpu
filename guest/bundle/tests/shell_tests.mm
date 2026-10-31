@@ -1272,6 +1272,130 @@ const RgfxFunctionConstant *constantAt(id<MTLFunction> function, uint32_t index)
 	return nullptr;
 }
 
+// A Core Image kernel library's extern functions come from its shadow, Metal's own library over
+// the same bytes: their names, each a function of functionType 4 that holds Metal's own, and nil
+// for a name the shadow does not hold; functionNames leaves them out, as Metal's does. Core
+// Image's link hands Metal each function's shadow, and makes the library Metal's link answers
+// ours from the bytes Metal answers for it, keeping Metal's as its shadow.
+void test_core_image_extern_functions()
+{
+	Fixture fx;
+	const char *path = getenv("RGFX_CI_KERNEL");
+	CHECK(path != nullptr);
+	if (path == nullptr)
+		return;
+	NSData *bytes = [NSData dataWithContentsOfFile:@(path)];
+	CHECK(bytes.length > 0);
+	id<MTLDevice> metal = MTLCreateSystemDefaultDevice();
+	auto make = [&](NSData *from) {
+		uint32_t status = 0;
+		return [RgfxLibrary libraryWithData:from.bytes
+		                             length:from.length
+		                                key:nullptr
+		                             device:nil
+		                         serializer:&fx.ser
+		                             status:&status];
+	};
+	RgfxLibrary *lib = make(bytes);
+	CHECK(lib != nil);
+
+	// With no source kept, no shadow and no extern functions.
+	CHECK([lib rgfxShadow] == nil);
+	CHECK([lib externFunctionNames].count == 0);
+	CHECK([lib newExternFunctionWithName:@"swap_red_blue"] == nil);
+
+	// The shadow is made once, on first use, from the source.
+	dispatch_data_t source = dispatch_data_create(bytes.bytes, bytes.length, nil, ^{
+		(void)bytes;
+	});
+	__block int made = 0;
+	[lib rgfxSetSource:source
+	       shadowMaker:^id<MTLLibrary>(dispatch_data_t d) {
+		       made++;
+		       return [metal newLibraryWithData:d error:nil];
+	       }];
+	id<MTLLibrary> shadow = [lib rgfxShadow];
+	CHECK(shadow != nil && [lib rgfxShadow] == shadow && made == 1);
+	id<RgfxMetalLibraryInternals> internals = (id<RgfxMetalLibraryInternals>)shadow;
+	NSArray<NSString *> *names = [internals externFunctionNames];
+	CHECK(names.count == 2);
+	CHECK([[lib externFunctionNames] isEqualToArray:names]);
+	CHECK([shadow functionNames].count == 0 && [lib functionNames].count == 0);
+
+	RgfxFunction *swap = (RgfxFunction *)[lib newExternFunctionWithName:@"swap_red_blue"];
+	CHECK([swap isKindOfClass:[RgfxFunction class]]);
+	CHECK(swap.functionType == kRgfxFunctionTypeExtern);
+	CHECK([swap.name isEqualToString:@"swap_red_blue"]);
+	CHECK([swap rgfxShadow].functionType == kRgfxFunctionTypeExtern);
+	CHECK([[swap rgfxShadow].name isEqualToString:@"swap_red_blue"]);
+	CHECK([lib newExternFunctionWithName:@"nope"] == nil);
+	// A kernel by name is of functionType 4 too, as Metal's.
+	id<MTLFunction> byName = [lib newFunctionWithName:@"scale_red_green"];
+	CHECK(byName.functionType == kRgfxFunctionTypeExtern);
+	CHECK([shadow newFunctionWithName:@"scale_red_green"].functionType == kRgfxFunctionTypeExtern);
+
+	// The link's functions: ours as their shadows (one made by name given one of its library's
+	// shadow), Metal's own as they are.
+	id<MTLFunction> genuine = [internals newExternFunctionWithName:@"scale_red_green"];
+	NSError *err = nil;
+	NSArray<id<MTLFunction>> *shadows = RgfxShadowFunctions(@[ swap, byName, genuine ], &err);
+	CHECK(shadows.count == 3 && err == nil);
+	CHECK(shadows[0] == [swap rgfxShadow] && shadows[2] == genuine);
+	CHECK(shadows[1] == [(RgfxFunction *)byName rgfxShadow] &&
+	      ![(id)shadows[1] isKindOfClass:[RgfxFunction class]]);
+	// A function whose library keeps no source has no shadow, and the link is refused.
+	RgfxLibrary *bare = make(bytes);
+	CHECK(RgfxShadowFunctions(@[ [bare newFunctionWithName:@"swap_red_blue"] ], &err) == nil);
+	CHECK(err.code == RgfxMetalErrorInvalidDescriptor);
+
+	// Metal's link answers its own library: made ours from its bytes, Metal's kept as the shadow.
+	__block NSArray<id<MTLFunction>> *linkedFrom = nil;
+	__block dispatch_data_t madeFrom = nil;
+	RgfxLibraryMaker maker = ^id<MTLLibrary>(dispatch_data_t data, NSError **e) {
+		madeFrom = data;
+		const void *p = nullptr;
+		size_t n = 0;
+		dispatch_data_t map = dispatch_data_create_map(data, &p, &n);
+		(void)map;
+		return make([NSData dataWithBytes:p length:n]);
+	};
+	err = nil;
+	id<MTLLibrary> ours = RgfxLinkImageFilterFunctions(
+	    @[ swap ],
+	    ^id<MTLLibrary>(NSArray<id<MTLFunction>> *given, NSError **e) {
+		    linkedFrom = given;
+		    return shadow;
+	    },
+	    maker, &err);
+	CHECK(linkedFrom.count == 1 && linkedFrom[0] == [swap rgfxShadow]);
+	CHECK([(id)ours isKindOfClass:[RgfxLibrary class]] && ours != lib);
+	CHECK([(RgfxLibrary *)ours rgfxShadow] == shadow);
+	NSData *contents = [internals libraryDataContents];
+	CHECK(contents.length > 0 && madeFrom != nil &&
+	      dispatch_data_get_size(madeFrom) == contents.length);
+	CHECK([[(RgfxLibrary *)ours externFunctionNames] isEqualToArray:names]);
+	// A library the link answers that is ours already is answered as it is, and a refused link
+	// answers nil with its error.
+	madeFrom = nil;
+	CHECK(RgfxLinkImageFilterFunctions(
+	          @[ swap ], ^id<MTLLibrary>(NSArray<id<MTLFunction>> *given, NSError **e) { return lib; },
+	          maker, &err) == lib);
+	CHECK(madeFrom == nil);
+	err = nil;
+	CHECK(RgfxLinkImageFilterFunctions(
+	          @[ swap ],
+	          ^id<MTLLibrary>(NSArray<id<MTLFunction>> *given, NSError **e) {
+		          *e = RgfxMakeError(RgfxMetalErrorRefused, @"refused");
+		          return nil;
+	          },
+	          maker, &err) == nil);
+	CHECK(err.code == RgfxMetalErrorRefused);
+	std::vector<uint8_t> drain;
+	RgfxMsgHeader h;
+	while (fx.ring.next(&h, &drain)) {
+	}
+}
+
 // A library's functions are specialised as Metal specialises them: a value set by name or by
 // range reaches its constant's index, an indexed value wins over a named one, values for
 // constants the function does not declare are ignored, a required constant left unset reads 0
@@ -4864,6 +4988,7 @@ int main()
 		test_render_pipeline_routing();
 		test_compute_pipeline_routing();
 		test_function_constants_resolve_as_metal();
+		test_core_image_extern_functions();
 		test_command_graph();
 		test_parallel_render_encoder();
 		test_queue_guards();

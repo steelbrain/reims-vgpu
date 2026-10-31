@@ -1,7 +1,8 @@
 /*
  * RgfxLibrary: see RgfxLibrary.h. Our own ObjC++; no Apple private SPI except the
  * read-only accessors of MTLFunctionConstantValues' indexed and named constants,
- * called only when the object answers them.
+ * called only when the object answers them, and the extern-function members of
+ * Metal's own library (RgfxMetalPrivate.h), called on the shadow.
  */
 
 #import "RgfxLibrary.h"
@@ -11,6 +12,7 @@
 
 #import "RgfxFunction.h"
 #import "RgfxMetalError.h"
+#import "RgfxMetalPrivate.h"
 
 #include <cstring>
 #include <map>
@@ -61,7 +63,9 @@ uint64_t rd64(const uint8_t *p)
 }
 
 // A .metallib's TYPE tag byte, as MTLFunctionType. measured: macOS 27 Metal, on
-// CoreDisplay's default.metallib (0 vertex, 1 fragment, 2 kernel).
+// CoreDisplay's default.metallib (0 vertex, 1 fragment, 2 kernel), and on a Core Image
+// kernel library on macOS 27 and 26.6.1 (5, its kernels: functionType 4, which
+// `functionNames` leaves out).
 MTLFunctionType metallibStage(uint8_t t)
 {
 	switch (t) {
@@ -71,6 +75,8 @@ MTLFunctionType metallibStage(uint8_t t)
 		return MTLFunctionTypeFragment;
 	case 2:
 		return MTLFunctionTypeKernel;
+	case 5:
+		return kRgfxFunctionTypeExtern;
 	default:
 		return MTLFunctionTypeVisible;
 	}
@@ -331,6 +337,11 @@ void readConstantValues(MTLFunctionConstantValues *values, std::map<uint32_t, Rg
 @implementation RgfxLibrary {
 	std::vector<MetallibFunction> _functions; // the .metallib's function list
 	BOOL _haveFunctionTable;                  // the bytes were a readable .metallib
+	std::mutex _shadowLock;                   // guards the three below
+	dispatch_data_t _source;                  // the bytes, kept for the shadow
+	RgfxShadowMaker _shadowMaker;
+	id<MTLLibrary> _shadow;                   // Metal's own over _source, made on first use
+	BOOL _shadowTried;
 }
 
 // The host drops the library's id as the app lets it go. Its functions keep it alive (RgfxFunction), and a pipeline made from them needs it no more: the
@@ -582,12 +593,70 @@ static NSError *rgfxFunctionNotFound(NSString *name)
 
 - (NSArray<NSString *> *)functionNames
 {
-	// The .metallib's function list; empty for raw AIR, whose functions callers
-	// name directly by string.
+	// The .metallib's function list but its extern functions, as Metal lists it; empty for raw
+	// AIR, whose functions callers name directly by string.
 	NSMutableArray<NSString *> *names = [NSMutableArray arrayWithCapacity:_functions.size()];
-	for (const MetallibFunction &f : _functions)
-		[names addObject:[NSString stringWithUTF8String:f.name.c_str()]];
+	for (const MetallibFunction &f : _functions) {
+		if (f.type != kRgfxFunctionTypeExtern)
+			[names addObject:[NSString stringWithUTF8String:f.name.c_str()]];
+	}
 	return names;
+}
+
+// --- Core Image's extern functions, through the shadow -------------------------
+
+- (void)rgfxSetSource:(dispatch_data_t)source shadowMaker:(RgfxShadowMaker)maker
+{
+	std::lock_guard<std::mutex> hold(_shadowLock);
+	_source = source;
+	_shadowMaker = maker;
+}
+
+- (void)rgfxAdoptShadow:(id<MTLLibrary>)shadow
+{
+	std::lock_guard<std::mutex> hold(_shadowLock);
+	_shadow = shadow;
+	_shadowTried = YES;
+}
+
+- (id<MTLLibrary>)rgfxShadow
+{
+	std::lock_guard<std::mutex> hold(_shadowLock);
+	if (!_shadowTried && _source != nil && _shadowMaker != nil) {
+		_shadowTried = YES;
+		_shadow = _shadowMaker(_source);
+	}
+	return _shadow;
+}
+
+- (NSArray<NSString *> *)externFunctionNames
+{
+	id<MTLLibrary> shadow = [self rgfxShadow];
+	if (![shadow respondsToSelector:@selector(externFunctionNames)])
+		return @[];
+	return [(id<RgfxMetalLibraryInternals>)shadow externFunctionNames] ?: @[];
+}
+
+- (id<MTLFunction>)newExternFunctionWithName:(NSString *)name
+{
+	id<MTLLibrary> shadow = [self rgfxShadow];
+	if (name == nil || ![shadow respondsToSelector:@selector(newExternFunctionWithName:)])
+		return nil;
+	id<MTLFunction> genuine = [(id<RgfxMetalLibraryInternals>)shadow newExternFunctionWithName:name];
+	if (genuine == nil)
+		return nil;
+	RgfxFunction *fn = [RgfxFunction functionWithLibrary:self
+	                                                name:name
+	                                           constants:nullptr
+	                                               count:0
+	                                              device:self.device
+	                                          serializer:[self serializer]];
+	[fn rgfxSetFunctionType:genuine.functionType];
+	const MetallibFunction *entry = [self rgfxEntryNamed:name];
+	if (entry != nullptr && entry->hasHash)
+		[fn rgfxSetBitCodeHash:entry->hash];
+	[fn rgfxSetShadow:genuine];
+	return fn;
 }
 
 - (MTLLibraryType)type
@@ -630,3 +699,64 @@ static NSError *rgfxFunctionNotFound(NSString *name)
 }
 
 @end
+
+NSArray<id<MTLFunction>> *RgfxShadowFunctions(NSArray<id<MTLFunction>> *functions, NSError **error)
+{
+	NSMutableArray<id<MTLFunction>> *shadows = [NSMutableArray arrayWithCapacity:functions.count];
+	for (id<MTLFunction> fn in functions) {
+		if (![(id)fn isKindOfClass:[RgfxFunction class]]) {
+			[shadows addObject:fn];
+			continue;
+		}
+		RgfxFunction *rf = (RgfxFunction *)fn;
+		id<MTLFunction> shadow = [rf rgfxShadow];
+		RgfxResource *library = [rf rgfxLibrary];
+		if (shadow == nil && [library isKindOfClass:[RgfxLibrary class]] && [rf rgfxConstantCount] == 0) {
+			RgfxLibrary *lib = (RgfxLibrary *)library;
+			NSString *entry = [NSString stringWithUTF8String:[rf rgfxEntryPointUTF8]];
+			id<MTLLibrary> metal = [lib rgfxShadow];
+			if ([metal respondsToSelector:@selector(newExternFunctionWithName:)])
+				shadow = [(id<RgfxMetalLibraryInternals>)metal newExternFunctionWithName:entry];
+			if (shadow != nil)
+				[rf rgfxSetShadow:shadow];
+		}
+		if (shadow == nil) {
+			if (error)
+				*error = RgfxMakeError(RgfxMetalErrorInvalidDescriptor,
+				                       [NSString stringWithFormat:@"image filter link: function %@ has no "
+				                                                  @"function of Metal's own library",
+				                                                  rf.name]);
+			return nil;
+		}
+		[shadows addObject:shadow];
+	}
+	return shadows;
+}
+
+id<MTLLibrary> RgfxLinkImageFilterFunctions(NSArray<id<MTLFunction>> *functions, RgfxLinkBlock link,
+                                            RgfxLibraryMaker makeLibrary, NSError **error)
+{
+	NSArray<id<MTLFunction>> *shadows = RgfxShadowFunctions(functions, error);
+	if (shadows == nil)
+		return nil;
+	id<MTLLibrary> linked = link(shadows, error);
+	if (linked == nil || [(id)linked isKindOfClass:[RgfxLibrary class]])
+		return linked;
+	NSData *bytes = [linked respondsToSelector:@selector(libraryDataContents)]
+	                    ? [(id<RgfxMetalLibraryInternals>)linked libraryDataContents]
+	                    : nil;
+	if (bytes.length == 0) {
+		if (error)
+			*error = RgfxMakeError(RgfxMetalErrorRefused,
+			                       @"image filter link: Metal's linked library answered no bytes");
+		return nil;
+	}
+	dispatch_data_t data = dispatch_data_create(bytes.bytes, bytes.length, nil, ^{
+		(void)bytes;
+	});
+	id<MTLLibrary> lib = makeLibrary(data, error);
+	if ([(id)lib isKindOfClass:[RgfxLibrary class]])
+		[(RgfxLibrary *)lib rgfxAdoptShadow:linked];
+	return lib;
+}
+

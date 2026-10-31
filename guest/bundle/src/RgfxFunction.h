@@ -98,6 +98,17 @@ typedef struct {
 /// in the .metallib's function list.
 - (void)rgfxSetBitCodeHash:(const uint8_t *)hash;
 
+/// Sets the function Metal's own library made of the same entry point (`shadow`, an extern
+/// function of the library's shadow, RgfxLibrary): what Metal's Core Image link reads in this
+/// function's place, since it reads Metal's internal objects no RgfxFunction holds.
+- (void)rgfxSetShadow:(id<MTLFunction>)shadow;
+
+/// The shadow `rgfxSetShadow:` set; nil for none.
+- (nullable id<MTLFunction>)rgfxShadow;
+
+/// The library the function was made from; nil where it was made without one.
+- (nullable RgfxResource *)rgfxLibrary;
+
 /// The function SPI RenderBox reads as it keys its pipelines: the SHA-256 of the function's
 /// bitcode, valid for the function's life (measured type: r^{?=[32C]}16@0:8).
 - (const RgfxBitCodeHash *)bitCodeHash;

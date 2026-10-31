@@ -786,6 +786,21 @@ How a Metal bundle plugs into macOS, in Apple's own terms (notes:
   takes the AIR slice, asks the host for it by its content key
   (`LIBRARY_LOOKUP`), and forwards the slice's bytes over the wire only where
   the host holds none (`LIBRARY_CREATE`), which the host compiles.
+- **Core Image's link.** Core Image makes its kernel libraries (file type 1,
+  whose kernels are extern functions of `functionType` 4, left out of
+  `functionNames`) through `newLibraryWith*`, takes each kernel and its own
+  helpers with the private `newExternFunctionWithName:`, and links them on the
+  CPU in Metal's base device class (`newLibraryWithImageFilterFunctionsSPI:…`,
+  which calls `newLibraryWithCIFilters:…` on the device). The link reads
+  Metal-internal library data from each function, which no function of ours
+  holds. So each library of ours keeps the bytes it was made from and makes, on
+  first use, a shadow: Metal's own library over them (the base class's
+  `newLibraryWithData:`), whose extern functions ours hold. The device's link
+  overrides hand Metal the shadows, and make the library Metal links (the bytes
+  it answers as `libraryDataContents`: one kernel, `ciKernelMain`) the device's
+  own through `newLibraryWithData:`, so the kernel's pipeline is made on the
+  host like any other (measured: macOS 27, and 26.6.1 in the guest;
+  `tools/ci_probe.m` renders through it).
 - **Kernel family — the fork.** The prior art builds its accelerator on the
   older `IOAcceleratorFamily2`, but our guest already runs the **ported
   IOGPUFamily stack**, and IOAccel2 cannot start in a kernel where IOGPU runs.

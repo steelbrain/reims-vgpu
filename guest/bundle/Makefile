@@ -144,9 +144,20 @@ $(SHELL_TESTBIN): $(CORE_OBJ_NAT) $(WRAP_OBJ_NAT) $(SHELL_TESTSRCS) $(HEADERS) $
 	$(CXX) -arch $(NATIVE) $(CXXFLAGS) $(OBJCXXFLAGS) $(PROTOCOL_QUIET) -I tests \
 		$(CORE_OBJ_NAT) $(WRAP_OBJ_NAT) $(SHELL_TESTSRCS) $(FRAMEWORKS) -o $@
 
-test: $(SER_TESTBIN) $(SHELL_TESTBIN)
+# A Core Image kernel library, compiled from tests/ci_kernel.metal for the shell tests' extern
+# functions; built here, never committed. Built for macOS 14 and Metal 3.1: a guest's Metal on
+# macOS 26 refuses the macOS 27 SDK's default language version and deployment target.
+CI_KERNEL = $(BUILD)/ci_kernel.metallib
+
+$(CI_KERNEL): tests/ci_kernel.metal Makefile
+	@mkdir -p $(@D)
+	xcrun -sdk macosx metal -c -fcikernel -std=metal3.1 -mmacosx-version-min=14.0 \
+		tests/ci_kernel.metal -o $(BUILD)/ci_kernel.air
+	xcrun -sdk macosx metallib -cikernel $(BUILD)/ci_kernel.air -o $@
+
+test: $(SER_TESTBIN) $(SHELL_TESTBIN) $(CI_KERNEL)
 	arch -$(ARCH) $(SER_TESTBIN)
-	$(SHELL_TESTBIN)
+	RGFX_CI_KERNEL=$(CI_KERNEL) $(SHELL_TESTBIN)
 
 # --- the loadable bundle (x86_64, device shell included) ---------------------
 # The IOGPUMetalDevice superclass is linked two-level against IOGPU (PRIVFW), so

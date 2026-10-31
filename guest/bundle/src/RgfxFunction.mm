@@ -28,6 +28,7 @@
 	MTLFunctionOptions _options;                  // the descriptor's, where made from one
 	std::string _specializedName;                 // the descriptor's, where it gave one
 	BOOL _haveSpecializedName;
+	id<MTLFunction> _shadow;                      // Metal's own, for Core Image's link
 }
 
 + (instancetype)functionWithLibrary:(RgfxResource *)library
@@ -214,6 +215,21 @@
 - (const char *)rgfxSpecializedNameUTF8
 {
 	return _haveSpecializedName ? _specializedName.c_str() : nullptr;
+}
+
+- (void)rgfxSetShadow:(id<MTLFunction>)shadow
+{
+	_shadow = shadow;
+}
+
+- (id<MTLFunction>)rgfxShadow
+{
+	return _shadow;
+}
+
+- (RgfxResource *)rgfxLibrary
+{
+	return _library;
 }
 
 // The host lays out the argument buffer the function takes at `bufferIndex` from the library's

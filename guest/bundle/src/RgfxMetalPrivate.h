@@ -51,6 +51,35 @@
 - (nullable instancetype)initWithAcceleratorPort:(mach_port_t)port;
 @end
 
+// measured: macOS 27 and 26.6.1 (the x86-64 guest, on our device) Metal.framework — the base
+// device class's own selectors the Core Image link route calls on `super`, implemented only by
+// _MTLDevice. `-newLibraryWithData:error:` (`@32@0:8@16^@24`) makes Metal's own library over
+// the bytes. The two links (`@40@0:8@16r^{?=BQ^{?}}24^@32`) link Core Image's extern functions on
+// the CPU into a library of one kernel; their second argument is Core Image's, passed through
+// unread, so it is declared opaque.
+NS_ASSUME_NONNULL_BEGIN
+@interface IOGPUMetalDevice (RgfxImageFilterLink)
+- (nullable id<MTLLibrary>)newLibraryWithData:(dispatch_data_t)data
+                                        error:(NSError *_Nullable *_Nullable)error;
+- (nullable id<MTLLibrary>)newLibraryWithImageFilterFunctionsSPI:(NSArray<id<MTLFunction>> *)functions
+                                         imageFilterFunctionInfo:(const void *)info
+                                                           error:(NSError *_Nullable *_Nullable)error;
+- (nullable id<MTLLibrary>)newLibraryWithCIFilters:(NSArray<id<MTLFunction>> *)functions
+                           imageFilterFunctionInfo:(const void *)info
+                                             error:(NSError *_Nullable *_Nullable)error;
+@end
+
+// measured: macOS 27 and 26.6.1 Metal.framework — the private selectors of Metal's own library
+// (_MTLLibrary) the link route reads: its extern functions' names (`@16@0:8`), one of them by
+// name (`@24@0:8@16`, nil for a name it does not hold), and the bytes it was made from or linked
+// into (`libraryDataContents`, `@16@0:8`, an NSData of a .metallib).
+@protocol RgfxMetalLibraryInternals
+- (NSArray<NSString *> *)externFunctionNames;
+- (nullable id<MTLFunction>)newExternFunctionWithName:(NSString *)name;
+- (nullable NSData *)libraryDataContents;
+@end
+NS_ASSUME_NONNULL_END
+
 // measured: macOS 27 Metal.framework — the private device SPI our MTLDevice must
 // conform to. Metal's CoreImage/GL/OpenCL/WindowServer layers call ~439 selectors
 // on it; this forward-declaration lists ONLY the ones a slice overrides, answered

@@ -170,8 +170,83 @@ void selectAirSlice(const void *&bytes, NSUInteger &length)
 	size_t size = 0;
 	dispatch_data_t map = dispatch_data_create_map(data, &bytes, &size);
 	id<MTLLibrary> lib = [self rgfxLibraryWithBytes:bytes length:size error:error];
-	(void)map; // released by ARC; `bytes` stayed valid for the create above
+	[self rgfxKeepSource:map ofLibrary:lib];
 	return lib;
+}
+
+// Keeps `source` with `lib` for its shadow (RgfxLibrary): Metal's own library over the same
+// bytes, made by the base device class, whose extern functions Core Image's link reads.
+- (void)rgfxKeepSource:(dispatch_data_t)source ofLibrary:(id<MTLLibrary>)lib
+{
+	if (![(id)lib isKindOfClass:[RgfxLibrary class]])
+		return;
+	__weak RgfxMetalDevice *weakSelf = self;
+	[(RgfxLibrary *)lib rgfxSetSource:source
+	                      shadowMaker:^id<MTLLibrary>(dispatch_data_t bytes) {
+		                      return [weakSelf rgfxMetalLibraryWithData:bytes];
+	                      }];
+}
+
+// Metal's own library over `data` (measured: macOS 27 and 26.6.1, the base device class's
+// newLibraryWithData:error: makes it on our device: an _MTLLibrary answering a Core Image kernel
+// library's extern functions); nil where Metal refuses the bytes.
+- (id<MTLLibrary>)rgfxMetalLibraryWithData:(dispatch_data_t)data
+{
+	NSError *error = nil;
+	id<MTLLibrary> lib = [super newLibraryWithData:data error:&error];
+	if (lib == nil)
+		NSLog(@"RGFX: Metal's own library over %zu bytes: %@", dispatch_data_get_size(data),
+		      error.localizedDescription);
+	return lib;
+}
+
+// Core Image's links (measured: macOS 27 and 26.6.1, the base device class's own, which link
+// Core Image's extern functions on the CPU): Metal's own link over each function's shadow, its
+// library made ours (RgfxLinkImageFilterFunctions). Metal's first link calls the second on
+// `self`, which makes the library ours there.
+- (id<MTLLibrary>)newLibraryWithImageFilterFunctionsSPI:(NSArray<id<MTLFunction>> *)functions
+                                imageFilterFunctionInfo:(const void *)info
+                                                  error:(__autoreleasing NSError **)error
+{
+	return RgfxLinkImageFilterFunctions(
+	    functions,
+	    ^id<MTLLibrary>(NSArray<id<MTLFunction>> *shadows, NSError *__autoreleasing *e) {
+		    return [self rgfxMetalLinkImageFilterFunctions:shadows info:info error:e];
+	    },
+	    ^id<MTLLibrary>(dispatch_data_t data, NSError *__autoreleasing *e) {
+		    return [self newLibraryWithData:data error:e];
+	    },
+	    error);
+}
+
+- (id<MTLLibrary>)newLibraryWithCIFilters:(NSArray<id<MTLFunction>> *)functions
+                  imageFilterFunctionInfo:(const void *)info
+                                    error:(__autoreleasing NSError **)error
+{
+	return RgfxLinkImageFilterFunctions(
+	    functions,
+	    ^id<MTLLibrary>(NSArray<id<MTLFunction>> *shadows, NSError *__autoreleasing *e) {
+		    return [self rgfxMetalLinkCIFilters:shadows info:info error:e];
+	    },
+	    ^id<MTLLibrary>(dispatch_data_t data, NSError *__autoreleasing *e) {
+		    return [self newLibraryWithData:data error:e];
+	    },
+	    error);
+}
+
+// The base class's links, which a block cannot reach through `super`.
+- (id<MTLLibrary>)rgfxMetalLinkImageFilterFunctions:(NSArray<id<MTLFunction>> *)shadows
+                                               info:(const void *)info
+                                              error:(__autoreleasing NSError **)error
+{
+	return [super newLibraryWithImageFilterFunctionsSPI:shadows imageFilterFunctionInfo:info error:error];
+}
+
+- (id<MTLLibrary>)rgfxMetalLinkCIFilters:(NSArray<id<MTLFunction>> *)shadows
+                                    info:(const void *)info
+                                   error:(__autoreleasing NSError **)error
+{
+	return [super newLibraryWithCIFilters:shadows imageFilterFunctionInfo:info error:error];
 }
 
 - (id<MTLLibrary>)newLibraryWithURL:(NSURL *)url error:(__autoreleasing NSError **)error
@@ -186,7 +261,12 @@ void selectAirSlice(const void *&bytes, NSUInteger &length)
 			                                    @"newLibraryWithURL: could not read URL");
 		return nil;
 	}
-	return [self rgfxLibraryWithBytes:data.bytes length:data.length error:error];
+	id<MTLLibrary> lib = [self rgfxLibraryWithBytes:data.bytes length:data.length error:error];
+	dispatch_data_t source = dispatch_data_create(data.bytes, data.length, nil, ^{
+		(void)data;
+	});
+	[self rgfxKeepSource:source ofLibrary:lib];
+	return lib;
 }
 
 - (id<MTLLibrary>)newLibraryWithFile:(NSString *)filepath error:(__autoreleasing NSError **)error
