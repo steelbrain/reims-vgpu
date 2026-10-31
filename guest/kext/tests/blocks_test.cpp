@@ -166,6 +166,32 @@ int main()
 		check(rgfxBlockAlloc(x.t, a, 1, 0x1000, 0x1000, &at) == kRgfxBlockTableFull,
 		      "a full table");
 	}
+	{
+		// A shared block: pinned whoever owns it, released naming its last holder's context,
+		// and kept for good where that holder's close was not answered.
+		Table x;
+		uint64_t at = 0;
+		check(rgfxBlockAlloc(x.t, a, 1, 0x2000, 0x1000, &at) == kRgfxBlockOk, "a block");
+		RgfxBlockPin pin;
+		check(rgfxBlockPinAny(x.t, at + 0x1000, 0x1000, &pin) && pin.offset == at,
+		      "any client's span in it pins it");
+		check(!rgfxBlockPinAny(x.t, at + 0x1000, 0x1001, &pin), "a span past it does not");
+		check(rgfxBlockFree(x.t, a, at) == kRgfxBlockBusy, "pinned, it is not freed");
+		rgfxBlockUnpin(x.t, pin);
+		rgfxBlockSetContext(x.t, at, 9);
+		check(rgfxBlockFree(x.t, a, at) == kRgfxBlockOk, "unpinned, it is");
+		check(!rgfxBlockPinAny(x.t, at, 0x10, &pin), "a freed block is not pinned");
+		RgfxBlock release;
+		check(rgfxBlockNextRelease(x.t, &release) && release.context == 9,
+		      "its release names the context set");
+		uint64_t kept = 0;
+		check(rgfxBlockAlloc(x.t, b, 2, 0x1000, 0x1000, &kept) == kRgfxBlockOk, "another");
+		rgfxBlockKeepAt(x.t, kept);
+		check(rgfxBlockFree(x.t, b, kept) == kRgfxBlockBadArgument &&
+		          !rgfxBlockPinAny(x.t, kept, 0x10, &pin),
+		      "a kept block is no one's");
+		check(!rgfxBlockNextRelease(x.t, &release), "nor released");
+	}
 	std::printf("blocks_test: OK (%d checks)\n", checks);
 	return 0;
 }

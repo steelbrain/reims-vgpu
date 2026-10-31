@@ -167,6 +167,47 @@ inline bool rgfxBlockPin(RgfxBlockTable &t, const void *owner, uint64_t offset, 
 }
 
 // Gives back a pin; nothing where its block has gone since.
+// Pins the live block that holds the `length` bytes at `offset`, whoever owns it: for a span the
+// caller has found the client may name another way (a shared block it holds,
+// RgfxSurfaceBlocks.hpp).
+inline bool rgfxBlockPinAny(RgfxBlockTable &t, uint64_t offset, uint64_t length,
+                            RgfxBlockPin *pin)
+{
+	for (uint32_t i = 0; i < t.count; i++) {
+		RgfxBlock &b = t.blocks[i];
+		if (b.offset > offset)
+			return false;
+		if (offset - b.offset <= b.size && length <= b.size - (offset - b.offset)) {
+			if (b.state != kRgfxBlockLive)
+				return false;
+			b.pins++;
+			*pin = {b.offset, b.serial};
+			return true;
+		}
+	}
+	return false;
+}
+
+// The context the BLOCK_RELEASE of the block at `offset` names: a shared block's last holder's.
+inline void rgfxBlockSetContext(RgfxBlockTable &t, uint64_t offset, uint32_t context)
+{
+	int64_t at = rgfxBlockIndex(t, offset);
+	if (at >= 0)
+		t.blocks[at].context = context;
+}
+
+// Keeps the block at `offset` from use for good: no client owns it, and the device may still use
+// it (a shared block whose last holder's close was not answered).
+inline void rgfxBlockKeepAt(RgfxBlockTable &t, uint64_t offset)
+{
+	int64_t at = rgfxBlockIndex(t, offset);
+	if (at < 0)
+		return;
+	t.blocks[at].owner = rgfxBlockNoOwner();
+	if (t.blocks[at].state != kRgfxBlockReleasing)
+		t.blocks[at].state = kRgfxBlockKept;
+}
+
 inline void rgfxBlockUnpin(RgfxBlockTable &t, const RgfxBlockPin &pin)
 {
 	int64_t at = rgfxBlockIndex(t, pin.offset);

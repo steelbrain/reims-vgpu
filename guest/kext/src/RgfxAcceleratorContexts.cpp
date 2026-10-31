@@ -19,6 +19,11 @@
  *     answers its BLOCK_RELEASE OK, which a thread call of the kext's own posts, so a free
  *     returns at once; the client's are freed after its close is answered, and kept from use
  *     for good where it is not.
+ *   - The shared blocks of IOSurface planes (RgfxSurfaceBlocks.hpp): one block per plane for
+ *     every process that holds the surface, found by the plane's physical pages, which the kext
+ *     wires in each asking process's task while it holds the block. The device learns of each
+ *     holder (BLOCK_SHARE) before the process learns of the block, and of each but the last
+ *     letting go (BLOCK_UNSHARE); the last frees the block as a client's free does.
  *   - The completion rings of the clients' queues, watched: the device raises its one vector
  *     for a queue's completion as for the control ring's, and the framebuffer's work loop then
  *     calls queueInterrupt, which wakes the client of each ring whose producer moved and
@@ -34,8 +39,10 @@
 #include "RgfxAccelerator.hpp"
 #include "RgfxAcceleratorUserClient.hpp"
 #include "ReimsGraphics.hpp"
+#include "RgfxSurfaceBlocks.hpp"
 
 #include <IOKit/IOLib.h>
+#include <IOKit/IOMemoryDescriptor.h>
 #include <kern/thread_call.h>
 #include <libkern/libkern.h>
 
@@ -104,6 +111,8 @@ IOLock *&watchLock = state.watchLock;
 RgfxWatchedRing *&watched = state.watched;
 UInt32 &watchedCount = state.watchedCount;
 bool &hooked = state.hooked;
+// Under contextLock: the shared blocks of surface planes, made at the first ask.
+RgfxSurfaceTable surfaceTable = {nullptr, 0};
 
 UInt64 loadHeader64(const volatile UInt8 *header, UInt32 field)
 {
@@ -393,6 +402,10 @@ bool RgfxAccelerator::pinRange(const void *owner, UInt64 offset, UInt64 length, 
 		return false;
 	IOLockLock(contextLock);
 	bool pinned = rgfxBlockPin(blockTable, owner, offset, length, pin);
+	// Or a shared block of a surface plane the owner holds.
+	RgfxSurfaceTable &table = surfaceTable;
+	if (!pinned && table.entries && rgfxSurfaceHeldBy(table, owner, offset, length))
+		pinned = rgfxBlockPinAny(blockTable, offset, length, pin);
 	IOLockUnlock(contextLock);
 	// Or a scanout span a surface of its process is drawn into (RgfxAcceleratorSurfaces.cpp):
 	// no block holds it and nothing frees it, so its pin names no block (serial 0).
@@ -410,6 +423,266 @@ void RgfxAccelerator::unpinBlock(const RgfxBlockPin &pin)
 	IOLockLock(contextLock);
 	rgfxBlockUnpin(blockTable, pin);
 	IOLockUnlock(contextLock);
+}
+
+// MARK: - Shared blocks of surface planes
+
+namespace {
+// The most planes with a shared block at once, and the most bytes of one plane.
+constexpr UInt32 kMaxSurfaceBlocks = 512;
+constexpr UInt64 kMaxPlaneBytes = 256ull << 20;
+
+// The plane of `length` bytes at `address` in `task`, wired: its descriptor, prepared, and its
+// pages' runs (`*runs`, IOMalloc'd, `*count` of them, the caller's to free with freeRuns), or
+// null where the range is not mapped there or its runs do not fit.
+IOMemoryDescriptor *wirePlane(task_t task, UInt64 address, UInt64 length, RgfxPageRun **runs,
+                              UInt32 *count)
+{
+	IOMemoryDescriptor *md =
+	    IOMemoryDescriptor::withAddressRange(address, length, kIODirectionOutIn, task);
+	if (!md)
+		return nullptr;
+	if (md->prepare(kIODirectionOutIn) != kIOReturnSuccess) {
+		md->release();
+		return nullptr;
+	}
+	// One run a page at most.
+	UInt32 capacity = static_cast<UInt32>(((address & (kPage - 1)) + length + kPage - 1) / kPage);
+	RgfxPageRun *all = static_cast<RgfxPageRun *>(IOMalloc(sizeof(RgfxPageRun) * capacity));
+	UInt32 n = 0;
+	bool fits = all != nullptr;
+	for (UInt64 at = 0; fits && at < length;) {
+		IOByteCount segment = 0;
+		addr64_t phys = md->getPhysicalSegment(at, &segment, kIOMemoryMapperNone);
+		if (!phys || !segment) {
+			fits = false;
+			break;
+		}
+		if (segment > length - at)
+			segment = length - at;
+		fits = rgfxSurfaceAppendRun(all, &n, capacity, phys, segment);
+		at += segment;
+	}
+	RgfxPageRun *kept = fits && n ? static_cast<RgfxPageRun *>(IOMalloc(sizeof(RgfxPageRun) * n))
+	                              : nullptr;
+	if (kept)
+		bcopy(all, kept, sizeof(RgfxPageRun) * n);
+	if (all)
+		IOFree(all, sizeof(RgfxPageRun) * capacity);
+	if (!kept) {
+		md->complete(kIODirectionOutIn);
+		md->release();
+		return nullptr;
+	}
+	*runs = kept;
+	*count = n;
+	return md;
+}
+
+void freeRuns(RgfxPageRun *runs, UInt32 count)
+{
+	if (runs)
+		IOFree(runs, sizeof(RgfxPageRun) * count);
+}
+
+void unwire(void *pages)
+{
+	if (IOMemoryDescriptor *md = static_cast<IOMemoryDescriptor *>(pages)) {
+		md->complete(kIODirectionOutIn);
+		md->release();
+	}
+}
+
+// The last holder of entry `e` let it go: its block is freed (its BLOCK_RELEASE names
+// `context`), or kept for good where the device may still use it (`keep`, a close not answered,
+// or a create naming it in flight), and the entry goes. Under contextLock; whether a release is
+// to be posted.
+bool letGoBlock(RgfxSurfaceEntry &e, UInt32 context, bool keep)
+{
+	bool release = false;
+	if (!keep) {
+		rgfxBlockSetContext(blockTable, e.offset, context);
+		release = rgfxBlockFree(blockTable, &e, e.offset) == kRgfxBlockOk;
+	}
+	if (!release)
+		rgfxBlockKeepAt(blockTable, e.offset);
+	freeRuns(e.runs, e.runCount);
+	rgfxSurfaceClear(e);
+	return release;
+}
+} // namespace
+
+IOReturn RgfxAccelerator::acquireSurfaceBlock(const void *client, UInt32 context, task_t task,
+                                             UInt64 address, UInt64 length, UInt64 size,
+                                             SurfaceBlock *block)
+{
+	if (!contextLock)
+		return kIOReturnNotReady;
+	if (!length || length > kMaxPlaneBytes || !size || size % kPage || size < length ||
+	    size > 2 * kMaxPlaneBytes)
+		return kIOReturnBadArgument;
+	RgfxPageRun *runs = nullptr;
+	UInt32 count = 0;
+	IOMemoryDescriptor *pages = wirePlane(task, address, length, &runs, &count);
+	if (!pages)
+		return kIOReturnBadArgument;
+	RgfxSurfaceTable &table = surfaceTable;
+	IOLockLock(contextLock);
+	if (!table.entries) {
+		auto *made = static_cast<RgfxSurfaceEntry *>(
+		    IOMalloc(sizeof(RgfxSurfaceEntry) * kMaxSurfaceBlocks));
+		if (made) {
+			bzero(made, sizeof(RgfxSurfaceEntry) * kMaxSurfaceBlocks);
+			table = {made, kMaxSurfaceBlocks};
+		}
+	}
+	bool sizeDiffers = false;
+	int32_t at = table.entries ? rgfxSurfaceFind(table, runs, count, length, size, &sizeDiffers)
+	                           : -1;
+	if (at >= 0) {
+		// Another process's plane: this client holds its block too.
+		RgfxSurfaceEntry &e = table.entries[at];
+		RgfxSurfaceHoldResult held = rgfxSurfaceHold(e, client, context, pages);
+		*block = {e.offset, e.size, e.serial, false};
+		IOLockUnlock(contextLock);
+		freeRuns(runs, count);
+		if (held != kRgfxSurfaceHoldNew) {
+			unwire(pages);
+			return held == kRgfxSurfaceHoldAgain ? kIOReturnSuccess : kIOReturnNoResources;
+		}
+		RgfxBlockGrant share = {};
+		share.context = context;
+		share.offset = block->offset;
+		share.size = block->size;
+		IOReturn posted = postLifecycle(RGFX_CMD_BLOCK_SHARE, &share, sizeof(share), 0, nullptr,
+		                                0, nullptr, nullptr, 0);
+		if (posted != kIOReturnSuccess) {
+			// No hold the device was not told of: let it go again.
+			void *mine = nullptr;
+			UInt32 c = 0;
+			IOLockLock(contextLock);
+			bool release = false;
+			int32_t again = rgfxSurfaceAt(table, block->offset);
+			if (again >= 0 &&
+			    rgfxSurfaceLetGo(table.entries[again], client, true, &mine, &c) ==
+			        kRgfxSurfaceLetGoLast)
+				release = letGoBlock(table.entries[again], c, false);
+			IOLockUnlock(contextLock);
+			unwire(mine);
+			if (release)
+				thread_call_enter(releaseCall);
+		}
+		return posted;
+	}
+	int32_t slot = !sizeDiffers && table.entries ? rgfxSurfaceFreeEntry(table) : -1;
+	RgfxBlockPin pin = {};
+	UInt64 offset = 0;
+	RgfxBlockResult made = slot < 0 ? kRgfxBlockTableFull
+	                                : rgfxBlockAlloc(blockTable, &table.entries[slot], context,
+	                                                 size, kPage, &offset, &pin);
+	if (made != kRgfxBlockOk) {
+		IOLockUnlock(contextLock);
+		freeRuns(runs, count);
+		unwire(pages);
+		if (sizeDiffers)
+			return kIOReturnBadArgument;
+		return made == kRgfxBlockNoSpace ? kIOReturnNoSpace : kIOReturnNoResources;
+	}
+	RgfxSurfaceEntry &e = table.entries[slot];
+	e.used = true;
+	e.offset = offset;
+	e.size = size;
+	e.serial = pin.serial;
+	e.length = length;
+	e.runs = runs;
+	e.runCount = count;
+	rgfxSurfaceHold(e, client, context, pages);
+	*block = {offset, size, pin.serial, true};
+	IOLockUnlock(contextLock);
+	// The device learns of the block before any process does; it is pinned until then, so no
+	// release overtakes the share.
+	RgfxBlockGrant share = {};
+	share.context = context;
+	share.offset = offset;
+	share.size = size;
+	IOReturn posted = postLifecycle(RGFX_CMD_BLOCK_SHARE, &share, sizeof(share), 0, nullptr, 0,
+	                                nullptr, nullptr, 0);
+	void *mine = nullptr;
+	bool release = false;
+	IOLockLock(contextLock);
+	rgfxBlockUnpin(blockTable, pin);
+	if (posted != kIOReturnSuccess) {
+		UInt32 c = 0;
+		if (rgfxSurfaceLetGo(e, client, true, &mine, &c) == kRgfxSurfaceLetGoLast)
+			release = letGoBlock(e, c, false);
+	}
+	IOLockUnlock(contextLock);
+	unwire(mine);
+	if (release)
+		thread_call_enter(releaseCall);
+	return posted;
+}
+
+IOReturn RgfxAccelerator::releaseSurfaceBlock(const void *client, UInt64 offset)
+{
+	if (!contextLock)
+		return kIOReturnNotReady;
+	RgfxSurfaceTable &table = surfaceTable;
+	IOLockLock(contextLock);
+	int32_t at = table.entries ? rgfxSurfaceAt(table, offset) : -1;
+	void *pages = nullptr;
+	UInt32 context = 0;
+	RgfxSurfaceLetGo gone = at < 0 ? kRgfxSurfaceLetGoNotHeld
+	                               : rgfxSurfaceLetGo(table.entries[at], client, false, &pages,
+	                                                  &context);
+	UInt64 size = at < 0 ? 0 : table.entries[at].size;
+	bool release = false;
+	if (gone == kRgfxSurfaceLetGoLast)
+		release = letGoBlock(table.entries[at], context, false);
+	IOLockUnlock(contextLock);
+	if (gone == kRgfxSurfaceLetGoHold) {
+		// The other holders keep it; the device no longer lets this context name it.
+		RgfxBlockGrant unshare = {};
+		unshare.context = context;
+		unshare.offset = offset;
+		unshare.size = size;
+		postLifecycle(RGFX_CMD_BLOCK_UNSHARE, &unshare, sizeof(unshare), 0, nullptr, 0, nullptr,
+		              nullptr, 0);
+	}
+	unwire(pages);
+	if (release)
+		thread_call_enter(releaseCall);
+	return gone == kRgfxSurfaceLetGoNotHeld ? kIOReturnBadArgument : kIOReturnSuccess;
+}
+
+void RgfxAccelerator::dropSurfaceBlocks(const void *client, bool closed)
+{
+	if (!contextLock)
+		return;
+	RgfxSurfaceTable &table = surfaceTable;
+	bool release = false;
+	UInt32 dropped = 0;
+	for (UInt32 i = 0; i < table.capacity; i++) {
+		void *pages = nullptr;
+		UInt32 context = 0;
+		IOLockLock(contextLock);
+		RgfxSurfaceLetGo gone =
+		    table.entries[i].used
+		        ? rgfxSurfaceLetGo(table.entries[i], client, true, &pages, &context)
+		        : kRgfxSurfaceLetGoNotHeld;
+		// The device ended the context's holds at its close; the last holder's block goes as
+		// its blocks go, or is kept where the close was not answered.
+		if (gone == kRgfxSurfaceLetGoLast)
+			release |= letGoBlock(table.entries[i], context, !closed);
+		IOLockUnlock(contextLock);
+		if (gone != kRgfxSurfaceLetGoNotHeld)
+			dropped++;
+		unwire(pages);
+	}
+	if (release)
+		thread_call_enter(releaseCall);
+	if (dropped)
+		IOLog("RgfxAccelerator: %u shared surface blocks let go at a close\n", dropped);
 }
 
 // MARK: - The queues' completion rings

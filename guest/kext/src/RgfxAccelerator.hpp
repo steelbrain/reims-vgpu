@@ -128,6 +128,18 @@ enum {
 	// framebuffer's whole scanout (RgfxSurfaceUserClient::isScanout); from then on the client's
 	// lifecycle messages may name the span, until its context is released or the surface goes.
 	kRgfxAccelMethodSurfaceScanout = 0x108,
+	// The shared block of an IOSurface plane the client's process holds (RgfxSurfaceBlocks.hpp):
+	// in the plane's CPU address in the process, its bytes there, and the block's size (whole
+	// pages, at least those bytes); out the block's region offset, its size, its serial (unique
+	// to the block) and 1 where this ask made it (its bytes are not yet the plane's), else 0.
+	// Every process that holds the surface gets the same block for the plane, and its lifecycle
+	// messages may name it from then on, until it lets go of its last ask. The device has the
+	// hold (BLOCK_SHARE) before this returns. kIOReturnBadArgument where the range is not mapped
+	// in the process, or the plane's block has another size.
+	kRgfxAccelMethodSurfaceBlock = 0x109,
+	// Lets go of one ask of the shared block at the region offset scalarInput[0]; the block goes
+	// once no process holds it, through its BLOCK_RELEASE.
+	kRgfxAccelMethodSurfaceBlockRelease = 0x10a,
 };
 
 class RgfxAcceleratorUserClient;
@@ -197,6 +209,21 @@ public:
 	// names them, until unpinBlock: false where no block of the owner's does.
 	bool pinRange(const void *owner, UInt64 offset, UInt64 length, RgfxBlockPin *pin);
 	void unpinBlock(const RgfxBlockPin &pin);
+	// The shared blocks of IOSurface planes (RgfxSurfaceBlocks.hpp), for our user client `client`
+	// of context `context` in `task`: the block of the plane of `length` bytes at `address` in
+	// the task, of `size` bytes (kRgfxAccelMethodSurfaceBlock), and letting go of one ask of
+	// it. dropSurfaceBlocks lets go of every one of the client's after its close, the device
+	// answered (`closed`) or not; pinRange pins a span of one the client holds.
+	struct SurfaceBlock {
+		UInt64 offset;
+		UInt64 size;
+		UInt64 serial;
+		bool fresh;
+	};
+	IOReturn acquireSurfaceBlock(const void *client, UInt32 context, task_t task, UInt64 address,
+	                             UInt64 length, UInt64 size, SurfaceBlock *block);
+	IOReturn releaseSurfaceBlock(const void *client, UInt64 offset);
+	void dropSurfaceBlocks(const void *client, bool closed);
 	// The processes' object lifecycle, on the framebuffer's control ring
 	// (ReimsGraphics::postLifecycle). openQueue's QUEUE_CREATE is answered once the device has
 	// the queue's rings; closeContext's CONTEXT_CLOSE once the device has dropped the context's

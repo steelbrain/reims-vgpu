@@ -165,6 +165,29 @@ IOReturn RgfxAcceleratorUserClient::contextMethod(uint32_t selector,
 		a->scalarOutput[4] = scanout.rowBytes;
 		return kIOReturnSuccess;
 	}
+	case kRgfxAccelMethodSurfaceBlock: {
+		if (a->scalarInputCount != 3 || a->scalarOutputCount != 4)
+			return kIOReturnBadArgument;
+		// Under the queue lock, so no hold is made for a context releaseContext has closed:
+		// every hold of the client's goes in its dropSurfaceBlocks.
+		IOLockLock(queueLock);
+		RgfxAccelerator::SurfaceBlock block = {};
+		IOReturn r = hasContext ? owner->acquireSurfaceBlock(this, context, task, in[0], in[1],
+		                                                     in[2], &block)
+		                        : kIOReturnBadArgument;
+		IOLockUnlock(queueLock);
+		if (r != kIOReturnSuccess)
+			return r;
+		out[0] = block.offset;
+		out[1] = block.size;
+		out[2] = block.serial;
+		out[3] = block.fresh ? 1 : 0;
+		return kIOReturnSuccess;
+	}
+	case kRgfxAccelMethodSurfaceBlockRelease:
+		if (a->scalarInputCount != 1)
+			return kIOReturnBadArgument;
+		return owner->releaseSurfaceBlock(this, in[0]);
 	default:
 		return kIOReturnUnsupported;
 	}
@@ -330,6 +353,7 @@ void RgfxAcceleratorUserClient::releaseContext()
 		accel->freeBlocks(this);
 	else
 		accel->keepBlocks(this);
+	accel->dropSurfaceBlocks(this, closed);
 	accel->revokeGrants(this);
 	hasContext = false;
 	IOLockUnlock(queueLock);
