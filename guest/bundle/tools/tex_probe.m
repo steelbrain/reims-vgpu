@@ -48,6 +48,16 @@
 //                       back; the first buffer let go and the second made aliasable give their
 //                       bytes back (usedSize, within a second of the command buffer's end), and a
 //                       buffer of 50 bytes goes at the first byte
+//   tex_probe nocopy N  N rounds of newBufferWithBytesNoCopy: over the app's own memory, CA's two
+//                       shapes and one Metal takes too: a page-based 0x14000-byte image, a
+//                       0x11000-byte one under a 468 x 36 BGRA8 texture at offset 0x100 with
+//                       1920-byte rows, and 4000 malloc'd bytes 3 past a 16-byte boundary. Each
+//                       buffer's contents must be the app's pointer; one command buffer copies
+//                       the first and the texture out, the CPU's bytes, and fills part of the
+//                       first and all of the third, which the app's memory must hold once it
+//                       completes, with every other byte as the CPU left it; a second copies the
+//                       first out again after the CPU rewrites it. The deallocators run once the
+//                       buffers go, and a length of 0 or a range not wholly mapped makes none
 // Prints "TEX OK" when every check passes, else "TEX FAIL: why" and exits 1. A completion 20 s
 // late prints HANG and exits 3. The copy waits with waitUntilCompleted, or with its completed
 // handler alone (`handler`).
@@ -56,6 +66,7 @@
 #import <Foundation/Foundation.h>
 #import <IOSurface/IOSurface.h>
 #import <Metal/Metal.h>
+#include <mach/mach.h>
 #include <pthread.h>
 #include <sys/resource.h>
 #include <stdatomic.h>
@@ -735,6 +746,159 @@ static int auto_heap(id<MTLDevice> device, id<MTLCommandQueue> queue, long n)
 	return 0;
 }
 
+// Waits for `cb` under a watchdog named `what`.
+static void wait_watched(id<MTLCommandBuffer> cb, const char *what)
+{
+	struct watch *w = watch_start(what);
+	[cb waitUntilCompleted];
+	atomic_store(&w->done, 1);
+}
+
+static int no_copy_round(id<MTLDevice> device, id<MTLCommandQueue> queue, long i)
+{
+	const NSUInteger len1 = 0x14000, len2 = 0x11000, len3 = 4000, rows = 36, bpr = 1920;
+	vm_address_t a1 = 0, a2 = 0;
+	if (vm_allocate(mach_task_self(), &a1, len1, VM_FLAGS_ANYWHERE) != KERN_SUCCESS ||
+	    vm_allocate(mach_task_self(), &a2, len2, VM_FLAGS_ANYWHERE) != KERN_SUCCESS)
+		return fail("no app memory");
+	uint8_t *p1 = (uint8_t *)a1, *p2 = (uint8_t *)a2;
+	uint8_t *q = malloc(len3 + 64);
+	uint8_t *p3 = (uint8_t *)(((uintptr_t)q + 15) & ~(uintptr_t)15) + 3;
+	for (NSUInteger k = 0; k < len1; k++)
+		p1[k] = (uint8_t)(k * 13 + i);
+	for (NSUInteger k = 0; k < len2; k++)
+		p2[k] = (uint8_t)(k * 7 + i);
+	memset(q, 0x33, len3 + 64);
+	__block atomic_int freed;
+	atomic_init(&freed, 0);
+	@autoreleasepool {
+		id<MTLBuffer> b1 = [device newBufferWithBytesNoCopy:p1
+		                                             length:len1
+		                                            options:MTLResourceStorageModeShared
+		                                        deallocator:^(void *m, NSUInteger l) {
+			                                        vm_deallocate(mach_task_self(), (vm_address_t)m, l);
+			                                        atomic_fetch_add(&freed, 1);
+		                                        }];
+		id<MTLBuffer> b2 = [device newBufferWithBytesNoCopy:p2
+		                                             length:len2
+		                                            options:MTLResourceStorageModeShared
+		                                        deallocator:^(void *m, NSUInteger l) {
+			                                        vm_deallocate(mach_task_self(), (vm_address_t)m, l);
+			                                        atomic_fetch_add(&freed, 1);
+		                                        }];
+		id<MTLBuffer> b3 = [device newBufferWithBytesNoCopy:p3
+		                                             length:len3
+		                                            options:MTLResourceStorageModeShared
+		                                        deallocator:^(void *m, NSUInteger l) {
+			                                        atomic_fetch_add(&freed, 1);
+		                                        }];
+		if (b1 == nil || b2 == nil || b3 == nil)
+			return fail("nil buffer from memory");
+		if (b1.contents != p1 || b2.contents != p2 || b3.contents != p3 || b1.length != len1)
+			return fail("a no-copy buffer's contents are not the app's bytes");
+		MTLTextureDescriptor *td =
+		    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+		                                                       width:468
+		                                                      height:rows
+		                                                   mipmapped:NO];
+		td.storageMode = MTLStorageModeShared;
+		td.usage = MTLTextureUsageShaderRead;
+		id<MTLTexture> t2 = [b2 newTextureWithDescriptor:td offset:0x100 bytesPerRow:bpr];
+		if (t2 == nil)
+			return fail("no texture over a no-copy buffer");
+		id<MTLBuffer> out1 = [device newBufferWithLength:len1 options:MTLResourceStorageModeShared];
+		id<MTLBuffer> out2 = [device newBufferWithLength:468 * 4 * rows
+		                                         options:MTLResourceStorageModeShared];
+		id<MTLCommandBuffer> cb = [queue commandBuffer];
+		id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+		[blit copyFromBuffer:b1 sourceOffset:0 toBuffer:out1 destinationOffset:0 size:len1];
+		[blit copyFromTexture:t2
+		                 sourceSlice:0
+		                 sourceLevel:0
+		                sourceOrigin:MTLOriginMake(0, 0, 0)
+		                  sourceSize:MTLSizeMake(468, rows, 1)
+		                    toBuffer:out2
+		           destinationOffset:0
+		      destinationBytesPerRow:468 * 4
+		    destinationBytesPerImage:468 * 4 * rows];
+		[blit fillBuffer:b1 range:NSMakeRange(0x8000, 0x100) value:0xee];
+		[blit fillBuffer:b3 range:NSMakeRange(0, len3) value:0x5a];
+		[blit endEncoding];
+		[cb commit];
+		wait_watched(cb, "the no-copy copies");
+		if (cb.status != MTLCommandBufferStatusCompleted)
+			return fail("the no-copy command buffer failed");
+		const uint8_t *o1 = out1.contents, *o2 = out2.contents;
+		long wrong = 0;
+		for (NSUInteger k = 0; k < len1; k++)
+			wrong += o1[k] != (uint8_t)(k * 13 + i);
+		for (NSUInteger y = 0; y < rows; y++)
+			for (NSUInteger x = 0; x < 468 * 4; x++)
+				wrong += o2[y * 468 * 4 + x] != (uint8_t)((0x100 + y * bpr + x) * 7 + i);
+		if (wrong) {
+			printf("round %ld: %ld wrong bytes read\n", i, wrong);
+			return fail("the GPU does not read the app's bytes under a no-copy buffer");
+		}
+		for (NSUInteger k = 0; k < len1; k++)
+			wrong += p1[k] != (k >= 0x8000 && k < 0x8100 ? 0xee : (uint8_t)(k * 13 + i));
+		for (NSUInteger k = 0; k < len3 + 64; k++) {
+			const uint8_t *at = q + k;
+			wrong += *at != (at >= p3 && at < p3 + len3 ? 0x5a : 0x33);
+		}
+		if (wrong) {
+			printf("round %ld: %ld wrong bytes written\n", i, wrong);
+			return fail("the app's memory does not hold the GPU's writes alone");
+		}
+		for (NSUInteger k = 0; k < len1; k++)
+			p1[k] = (uint8_t)(k * 5 + i + 1);
+		cb = [queue commandBuffer];
+		blit = [cb blitCommandEncoder];
+		[blit copyFromBuffer:b1 sourceOffset:0 toBuffer:out1 destinationOffset:0 size:len1];
+		[blit endEncoding];
+		[cb commit];
+		wait_watched(cb, "the second no-copy copy");
+		for (NSUInteger k = 0; k < len1; k++)
+			wrong += o1[k] != (uint8_t)(k * 5 + i + 1);
+		if (wrong)
+			return fail("a second commit does not take the CPU's new bytes");
+		if (atomic_load(&freed) != 0)
+			return fail("a deallocator ran while its buffer lived");
+		cb = nil;
+	}
+	for (int tries = 0; tries < 100 && atomic_load(&freed) != 3; tries++)
+		usleep(10000);
+	if (atomic_load(&freed) != 3) {
+		printf("round %ld: %d deallocators ran\n", i, atomic_load(&freed));
+		return fail("a no-copy buffer's deallocator never ran");
+	}
+	free(q);
+	vm_address_t holed = 0;
+	vm_allocate(mach_task_self(), &holed, 0x8000, VM_FLAGS_ANYWHERE);
+	vm_deallocate(mach_task_self(), holed + 0x4000, 0x4000);
+	@autoreleasepool {
+		if ([device newBufferWithBytesNoCopy:(void *)holed length:0x8000 options:0 deallocator:nil] !=
+		        nil ||
+		    [device newBufferWithBytesNoCopy:(void *)holed length:0 options:0 deallocator:nil] != nil)
+			return fail("a no-copy buffer of no bytes or of unmapped ones");
+	}
+	vm_deallocate(mach_task_self(), holed, 0x4000);
+	return 0;
+}
+
+static int no_copy(id<MTLDevice> device, id<MTLCommandQueue> queue, long n)
+{
+	double start = now_ms();
+	for (long i = 0; i < n; i++) {
+		@autoreleasepool {
+			int r = no_copy_round(device, queue, i);
+			if (r != 0)
+				return r;
+		}
+	}
+	printf("nocopy: %ld rounds in %.0f ms\n", n, now_ms() - start);
+	return 0;
+}
+
 int main(int argc, char **argv)
 {
 	@autoreleasepool {
@@ -744,13 +908,14 @@ int main(int argc, char **argv)
 		int everyKind = argc >= 2 && strcmp(argv[1], "kinds") == 0;
 		int sharedHeap = argc >= 2 && strcmp(argv[1], "sharedheap") == 0;
 		int autoHeap = argc >= 2 && strcmp(argv[1], "autoheap") == 0;
+		int noCopy = argc >= 2 && strcmp(argv[1], "nocopy") == 0;
 		if (argc < 2 ||
 		    (strcmp(argv[1], "copy") != 0 && strcmp(argv[1], "hold") != 0 && !handler && !big &&
-		     !churning && !everyKind && !sharedHeap && !autoHeap) ||
+		     !churning && !everyKind && !sharedHeap && !autoHeap && !noCopy) ||
 		    (strcmp(argv[1], "copy") != 0 && argc < 3)) {
 			fprintf(stderr,
 			        "usage: tex_probe copy | hold N | handler N | big N | churn N | kinds N | "
-			        "sharedheap N | autoheap N\n");
+			        "sharedheap N | autoheap N | nocopy N\n");
 			return 2;
 		}
 		id<MTLDevice> device = MTLCreateSystemDefaultDevice();
@@ -799,12 +964,13 @@ int main(int argc, char **argv)
 			if ((long)held.count < n && held.count > 0)
 				[held removeLastObject];
 		}
-		if (big || churning || everyKind || sharedHeap || autoHeap) {
+		if (big || churning || everyKind || sharedHeap || autoHeap || noCopy) {
 			long n = strtol(argv[2], NULL, 10);
 			int r = big          ? one_big_buffer(device, queue, n)
 			        : churning   ? churn(device, queue, n)
 			        : sharedHeap ? shared_heap(device, queue, n)
 			        : autoHeap   ? auto_heap(device, queue, n)
+			        : noCopy     ? no_copy(device, queue, n)
 			                     : kinds(device, n);
 			if (r != 0)
 				return r;
