@@ -238,7 +238,7 @@ static int check(const char *self)
 	size_t infoSize = kDeviceInfoSize;
 	kern_return_t infoKr =
 	    IOConnectCallStructMethod(c.conn, kDeviceInfo, NULL, 0, info, &infoSize);
-	size_t infoBytes = kDeviceInfoSize - notAll(info, kDeviceInfoSize, 0);
+	size_t infoBytes = notAll(info, kDeviceInfoSize, 0);
 	size_t headBytes = notAll(c.base, kHead, 0);
 	size_t infoHere = notAll(c.base + (kDeviceInfoAt & ~0xfffull), 0x2000, 0);
 	printf("1 window 0x%llx, 0x%llx bytes; the region's map 0x%x; device info 0x%x, %zu bytes, "
@@ -333,15 +333,26 @@ static int bench(long n)
 	mach_timebase_info_data_t tb;
 	mach_timebase_info(&tb);
 	long failed = 0;
+	uint64_t inAlloc = 0, inFree = 0;
 	uint64_t start = mach_absolute_time();
 	for (long i = 0; i < n; i++) {
 		uint64_t off = 0;
-		if (alloc(&c, kBlock, &off) != 0 || freeBlock(&c, off) != KERN_SUCCESS)
+		uint64_t t0 = mach_absolute_time();
+		int a = alloc(&c, kBlock, &off);
+		uint64_t t1 = mach_absolute_time();
+		kern_return_t f = a == 0 ? freeBlock(&c, off) : KERN_FAILURE;
+		uint64_t t2 = mach_absolute_time();
+		inAlloc += t1 - t0;
+		inFree += t2 - t1;
+		if (a != 0 || f != KERN_SUCCESS)
 			failed++;
 	}
 	double us = (double)(mach_absolute_time() - start) * tb.numer / tb.denom / 1000.0;
-	printf("bench: %ld allocs and frees of 64 KiB in %.0f us, %.2f us a pair (%s), failed=%ld\n",
-	       n, us, us / (double)n, c.base ? "with a window" : "no window", failed);
+	double allocUs = (double)inAlloc * tb.numer / tb.denom / 1000.0 / (double)n;
+	double freeUs = (double)inFree * tb.numer / tb.denom / 1000.0 / (double)n;
+	printf("bench: %ld allocs and frees of 64 KiB in %.0f us, %.2f us a pair (an alloc %.2f, a "
+	       "free %.2f; %s), failed=%ld\n",
+	       n, us, us / (double)n, allocUs, freeUs, c.base ? "with a window" : "no window", failed);
 	IOServiceClose(c.conn);
 	return failed != 0;
 }

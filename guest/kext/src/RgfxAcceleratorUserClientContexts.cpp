@@ -378,35 +378,42 @@ void RgfxAcceleratorUserClient::releaseContext()
 // the region for the process, which maps no page of it.
 IOReturn RgfxAcceleratorUserClient::deviceInfoMethod(IOExternalMethodArguments *a)
 {
+	// Larger than a message's inline bytes, it comes out through a descriptor, which IOKit
+	// sizes apart from the inline output.
+	const UInt64 outSize = a->structureOutputDescriptor ? a->structureOutputDescriptorSize
+	                                                    : a->structureOutputSize;
 	if (a->scalarInputCount != 0 || a->scalarOutputCount != 0 || a->structureInputSize != 0 ||
-	    a->structureOutputSize != sizeof(RgfxDeviceInfo))
+	    outSize != sizeof(RgfxDeviceInfo))
 		return kIOReturnBadArgument;
 	IODeviceMemory *region = owner->copyRegion();
 	if (!region)
 		return kIOReturnNotReady;
-	RgfxDeviceInfo *info = static_cast<RgfxDeviceInfo *>(IOMalloc(sizeof(RgfxDeviceInfo)));
-	IOReturn r = kIOReturnNoMemory;
-	if (info) {
-		r = region->readBytes(RGFX_DEVICE_INFO_OFFSET, info, sizeof(RgfxDeviceInfo)) ==
-		            sizeof(RgfxDeviceInfo)
-		        ? kIOReturnSuccess
-		        : kIOReturnIOError;
-		if (r == kIOReturnSuccess) {
-			if (a->structureOutput)
-				memcpy(a->structureOutput, info, sizeof(RgfxDeviceInfo));
-			else if (IOMemoryDescriptor *desc = a->structureOutputDescriptor) {
-				r = desc->prepare(kIODirectionIn);
-				if (r == kIOReturnSuccess) {
-					if (desc->writeBytes(0, info, sizeof(RgfxDeviceInfo)) !=
-					    sizeof(RgfxDeviceInfo))
-						r = kIOReturnBadArgument;
-					desc->complete(kIODirectionIn);
-				}
-			} else
-				r = kIOReturnBadArgument;
-		}
-		IOFree(info, sizeof(RgfxDeviceInfo));
-	}
+	// Its pages, mapped into the kernel write-back as the framebuffer maps the rings: the
+	// region is BAR memory, which a physical copy does not read.
+	const UInt64 page = RGFX_DEVICE_INFO_OFFSET & ~0xfffull;
+	const UInt64 length =
+	    ((RGFX_DEVICE_INFO_OFFSET + sizeof(RgfxDeviceInfo) + 0xfffull) & ~0xfffull) - page;
+	IOMemoryMap *map = region->createMappingInTask(
+	    kernel_task, 0, kIOMapAnywhere | kIOMapCopybackCache | kIOMapReadOnly, page, length);
 	region->release();
+	if (!map)
+		return kIOReturnNoResources;
+	const void *info =
+	    reinterpret_cast<const UInt8 *>(map->getVirtualAddress()) + (RGFX_DEVICE_INFO_OFFSET - page);
+	// The descriptor where there is one: the inline buffer is there too, but holds less.
+	IOReturn r = kIOReturnSuccess;
+	if (IOMemoryDescriptor *desc = a->structureOutputDescriptor) {
+		r = desc->prepare(kIODirectionIn);
+		if (r == kIOReturnSuccess) {
+			if (desc->writeBytes(0, info, sizeof(RgfxDeviceInfo)) != sizeof(RgfxDeviceInfo))
+				r = kIOReturnBadArgument;
+			desc->complete(kIODirectionIn);
+		}
+	} else if (a->structureOutput && a->structureOutputSize == sizeof(RgfxDeviceInfo)) {
+		memcpy(a->structureOutput, info, sizeof(RgfxDeviceInfo));
+	} else {
+		r = kIOReturnBadArgument;
+	}
+	map->release();
 	return r;
 }
