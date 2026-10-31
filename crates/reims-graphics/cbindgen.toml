@@ -229,6 +229,7 @@ include = [
     "RgfxTextureFromBuffer",
     "RgfxTextureFromIOSurface",
     "RgfxTextureReplaceRegion",
+    "RgfxTextureView",
     "RgfxVblank",
     "RgfxVertexAttribute",
     "RgfxVertexBufferLayout",

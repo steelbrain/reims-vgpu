@@ -293,6 +293,11 @@ pub const RGFX_CMD_MANAGED_TEXTURE_CREATE: u32 = 0x215;
 /// a level and slice of a `Managed` texture's CPU copy (`replaceRegion:`). Every command buffer of
 /// the context committed after it, on any queue, sees them. Not answered.
 pub const RGFX_CMD_TEXTURE_REPLACE_REGION: u32 = 0x216;
+/// Command `TEXTURE_VIEW` ([`RgfxTextureView`]): a view of a texture the guest made, over the
+/// same texels in another pixel format, and, where the guest named them, another type, levels,
+/// slices and swizzle (`newTextureViewWithPixelFormat:` and its longer forms). Not answered; a
+/// view the platform refuses, as Metal refuses it, makes nothing.
+pub const RGFX_CMD_TEXTURE_VIEW: u32 = 0x217;
 
 /// `CONTEXT_CLOSE` ([`RgfxContextClose`]), on ring 0 from the accelerator kext: the process that
 /// held context `context` closed the device or died. The host ends the context's command queues
@@ -1054,6 +1059,52 @@ pub struct RgfxTextureReplaceRegion {
     pub size: [u32; 3],
 }
 
+/// [`RgfxTextureView::flags`]: the view names its type, levels and slices
+/// (`newTextureViewWithPixelFormat:textureType:levels:slices:`). Without it the view is of the
+/// whole texture in its own type (`newTextureViewWithPixelFormat:`).
+pub const RGFX_TEXTURE_VIEW_SUBRANGE: u32 = 1;
+/// [`RgfxTextureView::flags`]: the view names its swizzle as well
+/// (`newTextureViewWithPixelFormat:textureType:levels:slices:swizzle:`); only with
+/// [`RGFX_TEXTURE_VIEW_SUBRANGE`].
+pub const RGFX_TEXTURE_VIEW_SWIZZLE: u32 = 2;
+
+/// `TEXTURE_VIEW`: view `obj_id`, with the guest-picked `resource_id`, of texture
+/// `parent_obj_id` (any texture the guest made, a view among them), made by the selector the
+/// `RGFX_TEXTURE_VIEW_*` flags name.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxTextureView {
+    /// [`RGFX_CMD_TEXTURE_VIEW`].
+    pub header: RgfxMsgHeader,
+    /// The view's guest-picked id.
+    pub obj_id: u64,
+    /// The texture it views.
+    pub parent_obj_id: u64,
+    /// The view's guest-picked resource id.
+    pub resource_id: u64,
+    /// `MTLPixelFormat`.
+    pub pixel_format: u32,
+    /// The `RGFX_TEXTURE_VIEW_*` flags.
+    pub flags: u32,
+    /// `MTLTextureType`, with [`RGFX_TEXTURE_VIEW_SUBRANGE`]; 0 without it.
+    pub texture_type: u32,
+    /// The first of the parent's mip levels the view takes, with
+    /// [`RGFX_TEXTURE_VIEW_SUBRANGE`]; 0 without it.
+    pub level_start: u32,
+    /// How many levels, with [`RGFX_TEXTURE_VIEW_SUBRANGE`]; 0 without it.
+    pub level_count: u32,
+    /// The first of the parent's slices the view takes (an array element, times six plus the
+    /// face for a cube), with [`RGFX_TEXTURE_VIEW_SUBRANGE`]; 0 without it.
+    pub slice_start: u32,
+    /// How many slices, with [`RGFX_TEXTURE_VIEW_SUBRANGE`]; 0 without it.
+    pub slice_count: u32,
+    /// The four `MTLTextureSwizzle` channels, one byte each, red lowest, with
+    /// [`RGFX_TEXTURE_VIEW_SWIZZLE`]; 0 without it.
+    pub swizzle: u32,
+}
+
 /// `TEXTURE_CREATE`: a texture of shape `desc` at the guest-picked `gpu_address`
 /// (device-placed, `heap_obj_id` 0) or at `heap_offset` in `heap_obj_id`, with
 /// the guest-picked `resource_id`.
@@ -1775,6 +1826,7 @@ const _: () = {
     assert!(size_of::<RgfxBufferDidModifyRange>() == 40);
     assert!(size_of::<RgfxManagedTextureCreate>() == 112);
     assert!(size_of::<RgfxTextureReplaceRegion>() == 56);
+    assert!(size_of::<RgfxTextureView>() == 72);
     assert!(RGFX_LIBRARY_BYTES_OFFSET as usize == size_of::<RgfxLibraryCreate>());
     assert!(size_of::<RgfxFormatAnswers>() == 64);
     assert!(size_of::<RgfxDeviceInfo>() == 1400 + 64 * RGFX_DEVICE_INFO_FORMATS);

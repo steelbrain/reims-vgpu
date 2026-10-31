@@ -905,6 +905,12 @@
 // the context committed after it, on any queue, sees them. Not answered.
 #define RGFX_CMD_TEXTURE_REPLACE_REGION 534
 
+// Command `TEXTURE_VIEW` ([`RgfxTextureView`]): a view of a texture the guest made, over the
+// same texels in another pixel format, and, where the guest named them, another type, levels,
+// slices and swizzle (`newTextureViewWithPixelFormat:` and its longer forms). Not answered; a
+// view the platform refuses, as Metal refuses it, makes nothing.
+#define RGFX_CMD_TEXTURE_VIEW 535
+
 // `CONTEXT_CLOSE` ([`RgfxContextClose`]), on ring 0 from the accelerator kext: the process that
 // held context `context` closed the device or died. The host ends the context's command queues
 // and drops every object whose id lies in its range ([`RGFX_CONTEXT_OBJ_ID_SHIFT`]), then answers
@@ -993,6 +999,16 @@
 // [`RgfxManagedTextureCreate::flags`]: the pixel format is one a texture over a buffer can
 // have (uncompressed, one texel a block, neither depth nor stencil).
 #define RGFX_MANAGED_TEXTURE_LINEAR 1
+
+// [`RgfxTextureView::flags`]: the view names its type, levels and slices
+// (`newTextureViewWithPixelFormat:textureType:levels:slices:`). Without it the view is of the
+// whole texture in its own type (`newTextureViewWithPixelFormat:`).
+#define RGFX_TEXTURE_VIEW_SUBRANGE 1
+
+// [`RgfxTextureView::flags`]: the view names its swizzle as well
+// (`newTextureViewWithPixelFormat:textureType:levels:slices:swizzle:`); only with
+// [`RGFX_TEXTURE_VIEW_SUBRANGE`].
+#define RGFX_TEXTURE_VIEW_SWIZZLE 2
 
 // Where a `LIBRARY_CREATE` message's bytes start: right after its header.
 #define RGFX_LIBRARY_BYTES_OFFSET 72
@@ -3910,6 +3926,39 @@ typedef struct {
   // The region's width, height and depth, in texels.
   uint32_t size[3];
 } RgfxTextureReplaceRegion;
+
+// `TEXTURE_VIEW`: view `obj_id`, with the guest-picked `resource_id`, of texture
+// `parent_obj_id` (any texture the guest made, a view among them), made by the selector the
+// `RGFX_TEXTURE_VIEW_*` flags name.
+typedef struct {
+  // [`RGFX_CMD_TEXTURE_VIEW`].
+  RgfxMsgHeader header;
+  // The view's guest-picked id.
+  uint64_t obj_id;
+  // The texture it views.
+  uint64_t parent_obj_id;
+  // The view's guest-picked resource id.
+  uint64_t resource_id;
+  // `MTLPixelFormat`.
+  uint32_t pixel_format;
+  // The `RGFX_TEXTURE_VIEW_*` flags.
+  uint32_t flags;
+  // `MTLTextureType`, with [`RGFX_TEXTURE_VIEW_SUBRANGE`]; 0 without it.
+  uint32_t texture_type;
+  // The first of the parent's mip levels the view takes, with
+  // [`RGFX_TEXTURE_VIEW_SUBRANGE`]; 0 without it.
+  uint32_t level_start;
+  // How many levels, with [`RGFX_TEXTURE_VIEW_SUBRANGE`]; 0 without it.
+  uint32_t level_count;
+  // The first of the parent's slices the view takes (an array element, times six plus the
+  // face for a cube), with [`RGFX_TEXTURE_VIEW_SUBRANGE`]; 0 without it.
+  uint32_t slice_start;
+  // How many slices, with [`RGFX_TEXTURE_VIEW_SUBRANGE`]; 0 without it.
+  uint32_t slice_count;
+  // The four `MTLTextureSwizzle` channels, one byte each, red lowest, with
+  // [`RGFX_TEXTURE_VIEW_SWIZZLE`]; 0 without it.
+  uint32_t swizzle;
+} RgfxTextureView;
 
 // `VBLANK`: the display's host screen refreshed.
 typedef struct {

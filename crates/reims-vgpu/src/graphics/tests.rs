@@ -2028,6 +2028,80 @@ fn a_create_the_platform_refuses_makes_nothing() {
     );
 }
 
+/// A `TEXTURE_VIEW` in `pixel_format` of levels `levels` and slices `slices` of texture `parent`,
+/// as view `obj_id` at resource id `resource_id`.
+fn texture_view(
+    obj_id: u64,
+    parent: u64,
+    resource_id: u64,
+    pixel_format: u32,
+    levels: (u32, u32),
+    slices: (u32, u32),
+) -> Vec<u8> {
+    RgfxTextureView {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_TEXTURE_VIEW,
+            size: 0,
+            seqno: 0,
+        },
+        obj_id,
+        parent_obj_id: parent,
+        resource_id,
+        pixel_format,
+        flags: RGFX_TEXTURE_VIEW_SUBRANGE,
+        texture_type: 2,
+        level_start: levels.0,
+        level_count: levels.1,
+        slice_start: slices.0,
+        slice_count: slices.1,
+        swizzle: 0,
+    }
+    .as_bytes()
+    .to_vec()
+}
+
+/// The platform ending the process at a view, as it does at one Metal makes not (levels outside
+/// the texture, a format of another class), refuses the view: nothing is made, the device goes
+/// on, and the next view of the texture is made
+#[test]
+fn a_view_the_platform_refuses_makes_nothing() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform) = headless_on(&raised);
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    let first = 1 + 7 * RGFX_RESOURCE_ID_CHUNK;
+    guest.send(&device, resource_id_chunk(3, 7));
+    guest.send(&device, texture_create(obj(3, 1), first));
+    platform.faults().at(
+        "MTLTexture",
+        "newTextureViewWithPixelFormat:textureType:levels:slices:resourceIndex:",
+        0,
+        Fault::Crash,
+    );
+    guest.send(
+        &device,
+        texture_view(obj(3, 2), obj(3, 1), first + 1, 80, (3, 1), (0, 1)),
+    );
+    assert_eq!(
+        answered(&device, &mut guest, context_close(99)),
+        RGFX_STATUS_OK
+    );
+    assert_eq!(device.decoder_object_count(), 1, "the view refused");
+    guest.send(
+        &device,
+        texture_view(obj(3, 3), obj(3, 1), first + 2, 81, (0, 1), (0, 1)),
+    );
+    assert_eq!(
+        answered(&device, &mut guest, context_close(99)),
+        RGFX_STATUS_OK
+    );
+    assert_eq!(
+        device.decoder_object_count(),
+        2,
+        "the texture and its next view"
+    );
+}
+
 /// The platform ending the process at an encode in a command buffer fails that command buffer:
 /// its completion carries an error, and the queue's next command buffer runs and completes
 #[test]

@@ -48,9 +48,9 @@ use reims_graphics::wire::{
     RGFX_CMD_QUEUE_CREATE, RGFX_CMD_RENDER_PIPELINE_CREATE, RGFX_CMD_RESOURCE_ID_CHUNK,
     RGFX_CMD_SAMPLER_CREATE, RGFX_CMD_SHARED_EVENT_CREATE, RGFX_CMD_TEXTURE_CREATE,
     RGFX_CMD_TEXTURE_FROM_BUFFER, RGFX_CMD_TEXTURE_FROM_IOSURFACE, RGFX_CMD_TEXTURE_REPLACE_REGION,
-    RGFX_CONTEXT_ALLOCATIONS_OFFSET, RGFX_CONTEXT_OBJ_ID_SHIFT, RGFX_CURSOR_SPAN,
-    RGFX_EVT_PIPELINE_REFLECTION, RGFX_PIPELINE_KIND_COMPUTE, RGFX_PIPELINE_KIND_RENDER,
-    RGFX_PIPELINE_OK, RGFX_PIPELINE_REFLECT_SUPPORT_ICB,
+    RGFX_CMD_TEXTURE_VIEW, RGFX_CONTEXT_ALLOCATIONS_OFFSET, RGFX_CONTEXT_OBJ_ID_SHIFT,
+    RGFX_CURSOR_SPAN, RGFX_EVT_PIPELINE_REFLECTION, RGFX_PIPELINE_KIND_COMPUTE,
+    RGFX_PIPELINE_KIND_RENDER, RGFX_PIPELINE_OK, RGFX_PIPELINE_REFLECT_SUPPORT_ICB,
     RGFX_PIPELINE_REFLECT_THREADGROUP_MATCHES_TILE, RGFX_PIPELINE_REFUSED, RGFX_RESOURCE_ID_CHUNK,
     RGFX_RESOURCE_ID_CHUNKS, RGFX_RESOURCE_ID_LIMIT, RgfxBufferAtOffset, RgfxBufferCreate,
     RgfxBufferOverHostMemory, RgfxCbComplete, RgfxColorAttachmentDesc, RgfxComputePipelineCreate,
@@ -80,6 +80,7 @@ mod compute;
 mod library;
 mod managed;
 mod render;
+mod view;
 
 #[cfg(test)]
 pub(crate) use library::tests::{metallib as test_metallib, sha as test_sha};
@@ -562,6 +563,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             RGFX_CMD_BUFFER_DID_MODIFY_RANGE => self.did_modify_range(message),
             RGFX_CMD_MANAGED_TEXTURE_CREATE => self.managed_texture(device, message),
             RGFX_CMD_TEXTURE_REPLACE_REGION => self.replace_region(message),
+            RGFX_CMD_TEXTURE_VIEW => self.texture_view(message),
             RGFX_CMD_HEAP_CREATE => {
                 let Some(m) = read::<RgfxHeapCreate>(message) else {
                     return Ok(Err(DecodeError::Malformed));
