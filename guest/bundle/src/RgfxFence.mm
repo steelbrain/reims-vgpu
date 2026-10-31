@@ -8,8 +8,8 @@
 
 @implementation RgfxFence
 
-// The host drops the fence once every command buffer in flight now has completed, as one may
-// still name it.
+// The host drops the fence as the app lets it go, after any command buffer that names it (each
+// keeps it while it runs).
 - (void)dealloc
 {
 	[self rgfxRetireThen:nullptr];

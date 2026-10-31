@@ -60,8 +60,8 @@ MTLSizeAndAlign rgfxHeapTextureSizeAndAlign(RgfxSerializer *serializer,
 	std::mutex _rangesLock;
 }
 
-// The host drops the heap once every command buffer in flight now has completed, and only
-// then is a Shared heap's block given back. The resources placed in the heap keep it alive
+// The host drops the heap as the app lets it go, after any command buffer that names it (each
+// keeps it while it runs), and only then is a Shared heap's block given back. The resources placed in the heap keep it alive
 // (RgfxResource's `heap`), so they went first.
 - (void)dealloc
 {

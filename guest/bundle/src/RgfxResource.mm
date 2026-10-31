@@ -12,7 +12,6 @@
 #include <atomic>
 #include <unistd.h>
 
-#include "RgfxRetirement.hpp"
 #include "RgfxSerializer.hpp"
 
 @implementation RgfxResource {
@@ -86,14 +85,10 @@
 		[rangeHeap rgfxGiveRangeAt:rangeOffset size:rangeSize];
 		return;
 	}
-	uint64_t objId = _objId;
-	RgfxRetirement::process().retire(
-	    [serializer, objId, after = std::move(after), rangeHeap, rangeOffset, rangeSize] {
-		    serializer->destroy(objId);
-		    if (after)
-			    after();
-		    [rangeHeap rgfxGiveRangeAt:rangeOffset size:rangeSize];
-	    });
+	serializer->destroy(_objId);
+	if (after)
+		after();
+	[rangeHeap rgfxGiveRangeAt:rangeOffset size:rangeSize];
 }
 
 - (void)rgfxHoldHeapRange:(uint64_t)offset size:(uint64_t)size

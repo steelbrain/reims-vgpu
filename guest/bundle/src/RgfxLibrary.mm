@@ -333,8 +333,7 @@ void readConstantValues(MTLFunctionConstantValues *values, std::map<uint32_t, Rg
 	BOOL _haveFunctionTable;                  // the bytes were a readable .metallib
 }
 
-// The host drops the library's id once every command buffer in flight now has completed. Its
-// functions keep it alive (RgfxFunction), and a pipeline made from them needs it no more: the
+// The host drops the library's id as the app lets it go. Its functions keep it alive (RgfxFunction), and a pipeline made from them needs it no more: the
 // host made it from the library before the destroy.
 - (void)dealloc
 {

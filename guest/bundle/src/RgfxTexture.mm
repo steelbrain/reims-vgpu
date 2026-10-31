@@ -12,7 +12,6 @@
 
 #include "RgfxManagedLayout.hpp"
 #include "RgfxRegion.hpp"
-#include "RgfxRetirement.hpp"
 #include "RgfxSerializer.hpp" // RgfxSerializer, RgfxTextureDescriptor (wire)
 
 #import <objc/runtime.h>
@@ -599,9 +598,9 @@ enum RgfxViewRefusal { kNoFormat, kFormatClass, kLevels, kSlices, kTypeFamily, k
 
 - (void)dealloc
 {
-	// The host drops the texture once every command buffer in flight now has completed (one
-	// may still name it), then its id goes back to the process's chunks, so a texture made
-	// with the id later is created on ring 0 after this one's destroy.
+	// The host drops the texture as the app lets it go, after any command buffer that names it
+	// (each keeps it while it runs), then its id goes back to the process's chunks, so a
+	// texture made with the id later is created on ring 0 after this one's destroy.
 	// A texture over a buffer keeps the buffer until then: the host's texture lies in it.
 	RgfxSerializer *serializer = _serializer;
 	uint64_t resourceId = _resourceId;

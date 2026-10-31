@@ -381,12 +381,14 @@ from the host as the app lets its wrapper go. A buffer, heap, texture, sampler,
 depth-stencil state, render or compute pipeline, library, event, fence or shared
 event posts its `OBJECT_DESTROY` from its dealloc. A queue ends through the kext
 (user-client selector 0x104), which stops watching its completion ring and
-posts the destroy. Each release waits until every command buffer of the process
-made before it has completed, or gone uncommitted. Command buffers ride their
-queues' own rings and may name the object, and Metal keeps what a buffer
-encodes alive from the encode on, so a buffer holds releases back from its
-making, not its commit. The releases run in the order the app let the objects
-go. What an object lay over goes back only after its destroy: a Shared buffer's
+posts the destroy. Command buffers ride their queues' own rings, so a destroy
+must not reach the host before a buffer that names the object. A command buffer
+keeps every object its encoders name, from the encode until its completion
+handlers have run, or until it goes uncommitted, as Metal's with retained
+references keeps what it encodes. One made with unretained references keeps them
+too, though it answers `retainedReferences` NO, since the host must not drop an
+object before a buffer that names it runs. A buffer whose completion never comes
+holds back only what it names. Objects are released in the order they go. What an object lay over goes back only after its destroy: a Shared buffer's
 or heap's region block, an IOSurface plane's block, a queue's ring blocks (its
 completion ring read no more first), and a texture's resource id. The block's
 `BLOCK_RELEASE` then finds nothing of the object on the host. A resource placed

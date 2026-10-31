@@ -82,7 +82,7 @@ TESTHEADERS  = $(wildcard tests/*.hpp)
 CORE_SRCS = src/RgfxObjectModel.cpp src/RgfxCaps.cpp src/RgfxRingWriter.cpp \
 	src/RgfxSerializer.cpp src/RgfxEncoder.cpp src/RgfxWireLayout.cpp \
 	src/RgfxRegion.cpp src/RgfxReplyReader.cpp src/RgfxLibraryKey.cpp \
-	src/RgfxCompletionThread.cpp src/RgfxRetirement.cpp src/RgfxFunctionConstants.cpp \
+	src/RgfxCompletionThread.cpp src/RgfxFunctionConstants.cpp \
 	src/RgfxBinaryArchiveFile.cpp
 
 # The whole Metal shell (ObjC++): wrappers + the device. Goes in the bundle. Globbed

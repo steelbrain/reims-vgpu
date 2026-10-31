@@ -95,11 +95,11 @@ NS_ASSUME_NONNULL_BEGIN
 @property(nonatomic, readonly) uint64_t rgfxHeapRangeSize;
 
 #ifdef __cplusplus
-/// For a wrapper's dealloc: drops the object's host handle (OBJECT_DESTROY) once every command
-/// buffer in flight now has completed (RgfxRetirement), as one may still name it, then runs
-/// `after` (when set), which gives back what the host object lay over: its region block, its
-/// resource id; then the bytes of its Automatic heap it still holds go back. Without a
-/// serialiser there is no host object, and these run at once.
+/// For a wrapper's dealloc: drops the object's host handle (OBJECT_DESTROY), then runs `after`
+/// (when set), which gives back what the host object lay over: its region block, its resource
+/// id; then the bytes of its Automatic heap it still holds go back. A command buffer that names
+/// the object keeps its wrapper until it completes, so no buffer in flight names a dropped
+/// object. Without a serialiser there is no host object.
 - (void)rgfxRetireThen:(std::function<void()>)after;
 #endif
 

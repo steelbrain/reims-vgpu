@@ -36,8 +36,8 @@ RgfxSamplerParams rgfxSamplerParamsFromMTL(MTLSamplerDescriptor *d)
 	uint64_t _resourceId; // the host's answer; 0 where none came (a create on a test's ring)
 }
 
-// The host drops the sampler once every command buffer in flight now has completed, as one may
-// still name it.
+// The host drops the sampler as the app lets it go, after any command buffer that names it (each
+// keeps it while it runs).
 - (void)dealloc
 {
 	[self rgfxRetireThen:nullptr];

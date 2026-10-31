@@ -58,8 +58,8 @@
 	if (_reader != nullptr && _eventToken != 0) {
 		_reader->removeEventListener(_eventToken);
 	}
-	// The host drops the event once every command buffer in flight now has completed, as one
-	// may still signal or wait on it.
+	// The host drops the event as the app lets it go, after any command buffer that names it
+	// (each keeps it while it runs).
 	[self rgfxRetireThen:nullptr];
 }
 

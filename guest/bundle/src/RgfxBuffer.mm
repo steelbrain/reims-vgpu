@@ -250,10 +250,10 @@ bool rgfxNoCopyStorage(MTLResourceOptions options)
 
 - (void)dealloc
 {
-	// The device buffer's own pages are the guest's alone. The host drops the buffer once
-	// every command buffer in flight now has completed, and only then is the memory under a
-	// region-backed one given back (its block, or the no-copy caller's pages), so nothing
-	// reuses it while the host may still read it.
+	// The device buffer's own pages are the guest's alone. The host drops the buffer as the app
+	// lets it go, after any command buffer that names it (each keeps it while it runs), and only
+	// then is the memory under a region-backed one given back (its block, or the no-copy
+	// caller's pages), so nothing reuses it while the host may still read it.
 	if (_ownsContents)
 		std::free(_contents);
 	void (^deallocator)(void) = _hostDeallocator;

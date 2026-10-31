@@ -403,6 +403,23 @@ public:
 	void noteSurfaceWrite(std::shared_ptr<void> shadow) { m_surfaceWrites.push_back(std::move(shadow)); }
 	/// The copies recorded so far, which the caller now holds.
 	std::vector<std::shared_ptr<void>> takeSurfaceWrites() { return std::move(m_surfaceWrites); }
+	/// Where the command buffer keeps the objects its encoders name, as Metal's command buffer
+	/// with retained references keeps what it encodes: `keep(context, object)` for each one
+	/// (once for a run of the same object), from the encode until the buffer completes or goes.
+	/// None set: nothing is kept.
+	void setKeeper(void (*keep)(void *context, const void *object), void *context)
+	{
+		m_keep = keep;
+		m_keepContext = context;
+	}
+	/// Keeps `object` where the command buffer keeps what it encodes (setKeeper).
+	void keep(const void *object)
+	{
+		if (m_keep == nullptr || object == nullptr || object == m_lastKept)
+			return;
+		m_lastKept = object; // kept, so no other object takes its address meanwhile
+		m_keep(m_keepContext, object);
+	}
 	/// Records that the command buffer uses the copy of app memory `shadow` (a no-copy
 	/// buffer's; RgfxMemoryShadow.hpp), which its commit syncs in, and, where `writes`, its
 	/// completion writes back. Held until taken.
@@ -434,6 +451,9 @@ private:
 	std::vector<uint8_t> m_buf;
 	std::vector<std::shared_ptr<void>> m_surfaceWrites;
 	std::vector<RgfxShadowUse> m_shadowUses;
+	void (*m_keep)(void *, const void *) = nullptr;
+	void *m_keepContext = nullptr;
+	const void *m_lastKept = nullptr;
 };
 
 #endif // RGFX_ENCODER_HPP_

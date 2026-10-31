@@ -58,7 +58,6 @@
 #include "RgfxObjectModel.hpp"
 #include "RgfxRegion.hpp"
 #include "RgfxReplyReader.hpp"
-#include "RgfxRetirement.hpp"
 #include "RgfxRingWriter.hpp"
 #include "RgfxSerializer.hpp"
 #include "reims_graphics_wire.h"
@@ -151,12 +150,28 @@ void rgfxNoteShadowUse(RgfxEncoder *enc, id obj, bool writes)
 		enc->noteShadowUse(shadow, writes);
 }
 
+/// The keeper of a command buffer with retained references (RgfxEncoder::setKeeper): `context`
+/// is the buffer's list of what it keeps.
+void rgfxKeep(void *context, const void *object)
+{
+	static_cast<std::vector<id> *>(context)->push_back((__bridge id)object);
+}
+
+/// rgfxId of an object an encoder of the command buffer names, which the buffer keeps where it
+/// keeps what it encodes (RgfxEncoder::setKeeper).
+uint64_t rgfxNamed(RgfxEncoder *enc, id obj)
+{
+	if (enc != nullptr)
+		enc->keep((__bridge const void *)obj);
+	return rgfxId(obj);
+}
+
 /// rgfxId of a resource the command buffer only reads (a blit's source, an index or indirect
 /// buffer).
 uint64_t rgfxReads(RgfxEncoder *enc, id obj)
 {
 	rgfxNoteShadowUse(enc, obj, false);
-	return rgfxId(obj);
+	return rgfxNamed(enc, obj);
 }
 
 /// rgfxId of a resource the command buffer writes (a blit's destination, a fill, a synchronize,
@@ -164,7 +179,7 @@ uint64_t rgfxReads(RgfxEncoder *enc, id obj)
 uint64_t rgfxWrites(RgfxEncoder *enc, id obj)
 {
 	rgfxNoteShadowUse(enc, obj, true);
-	return rgfxId(obj);
+	return rgfxNamed(enc, obj);
 }
 
 /// rgfxId of a resource bound to a shader, which may write a buffer, and a texture whose usage
@@ -176,7 +191,7 @@ uint64_t rgfxBinds(RgfxEncoder *enc, id obj)
 		                    ([(id<MTLTexture>)obj usage] & MTLTextureUsageShaderWrite) != 0;
 		rgfxNoteShadowUse(enc, obj, writes);
 	}
-	return rgfxId(obj);
+	return rgfxNamed(enc, obj);
 }
 
 /// rgfxId of a resource used with `usage` (useResource:usage:), which writes it where the usage
@@ -184,7 +199,7 @@ uint64_t rgfxBinds(RgfxEncoder *enc, id obj)
 uint64_t rgfxUses(RgfxEncoder *enc, id obj, MTLResourceUsage usage)
 {
 	rgfxNoteShadowUse(enc, obj, (usage & MTLResourceUsageWrite) != 0);
-	return rgfxId(obj);
+	return rgfxNamed(enc, obj);
 }
 
 /// The RGFX_RESOURCE_KIND_* of a Metal resource, for the resource-reference ops.
@@ -255,13 +270,14 @@ void fillColor(RgfxRenderPassColorAttachment *c, MTLRenderPassColorAttachmentDes
 /// Translates an MTLRenderPassDescriptor into the wire pass descriptor and its colour
 /// attachments, returning the colour count (highest set attachment index + 1, so
 /// gaps stay as absent attachments). `colors` is filled with `count` records.
-/// Records on `enc` every texture the pass `d` writes over an IOSurface or over app memory
-/// (a no-copy buffer's): its attachments and their resolve targets.
+/// Records on `enc` the textures the pass `d` writes, its attachments and their resolve
+/// targets: those over an IOSurface or over app memory (a no-copy buffer's), and every one as
+/// the command buffer's to keep.
 void noteRenderPassWrites(RgfxEncoder *enc, MTLRenderPassDescriptor *d)
 {
 	auto note = [enc](id<MTLTexture> t) {
 		rgfxIOSurfaceNoteWrite(enc, t);
-		rgfxNoteShadowUse(enc, t, true);
+		(void)rgfxWrites(enc, t);
 	};
 	for (uint32_t i = 0; i < 8; i++) {
 		note(d.colorAttachments[i].texture);
@@ -440,23 +456,17 @@ struct RgfxBarrierSlot {
 	return q;
 }
 
-// The device ends the queue once every command buffer in flight now has completed (its own
-// all have: each keeps the queue alive), and only then do its rings go back: the completion
-// ring is read no more first, as the completion thread may still hold its reader.
+// The device ends the queue as it goes, once its command buffers have (each keeps the queue
+// alive), and only then do its rings go back: the completion ring is read no more first, as the
+// completion thread may still hold its reader.
 - (void)dealloc
 {
-	RgfxSerializer *serializer = _serializer;
-	uint64_t objId = _objId;
-	std::shared_ptr<RgfxReplyReader> reader = _ownedReader;
-	std::function<void()> release = std::move(_release);
-	RgfxRetirement::process().retire([serializer, objId, reader, release] {
-		if (reader != nullptr)
-			reader->close();
-		if (serializer != nullptr)
-			serializer->destroyQueue(objId);
-		if (release)
-			release();
-	});
+	if (_ownedReader != nullptr)
+		_ownedReader->close();
+	if (_serializer != nullptr)
+		_serializer->destroyQueue(_objId);
+	if (_release)
+		_release();
 }
 
 - (void)rgfxSetRelease:(std::function<void()>)release
@@ -794,10 +804,10 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 	// it completes.
 	std::shared_ptr<RgfxBodyPool> _bodyPool;
 	RgfxBodyBlock _body;
-	// The process's retirement ticket a buffer that will complete holds from its making to its
-	// completion (RgfxRetirement), 0 for none: objects let go meanwhile stay on the host, as
-	// Metal's buffer keeps what it encodes from the encode on.
-	std::atomic<uint64_t> _ticket;
+	// What its encoders named, kept from the encode until it completes or goes, so nothing it
+	// names leaves the host before it runs, as Metal's buffer with retained references keeps what
+	// it encodes.
+	std::vector<id> _kept;
 	// The IOSurface copies this buffer writes, written back to their surfaces' pages
 	// when it completes (RgfxIOSurface.h).
 	std::vector<std::shared_ptr<void>> _surfaceWrites;
@@ -826,10 +836,9 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 		cb->_completedHandlers = [NSMutableArray array];
 		cb->_scheduledHandlers = [NSMutableArray array];
 		cb->_encoder = new RgfxEncoder(*ring, queue.rgfxObjId, cbObjId);
-		// One that will complete holds back the releases from now on: an object it encodes
-		// may be let go before its commit.
-		if (queue.replyReader != nullptr)
-			cb->_ticket.store(RgfxRetirement::process().begin());
+		// One with unretained references keeps them too, though it answers retainedReferences
+		// NO: the host must not drop an object before a buffer that names it has run.
+		cb->_encoder->setKeeper(&rgfxKeep, &cb->_kept);
 		cb->_uploads = std::make_shared<RgfxUploadArena>([queue rgfxUploadPool]);
 	}
 	return cb;
@@ -841,11 +850,9 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 	// (its reader went first) is left here.
 	if (_done != nil && !_left.exchange(true))
 		dispatch_group_leave(_done);
-	// A buffer never committed, or whose completion never came, gives its slot back, and its
-	// ticket.
+	// A buffer never committed, or whose completion never came, gives its slot back, and lets
+	// what it kept go with it.
 	[self rgfxGiveSlotBack];
-	if (uint64_t ticket = _ticket.exchange(0))
-		RgfxRetirement::process().end(ticket);
 	delete _encoder;
 }
 
@@ -984,10 +991,6 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 	std::function<void(uint64_t)> expect;
 	std::function<void()> whileWaiting;
 	if (_reader != nullptr) {
-		// Before the host can see it: an object let go from now on outlives it on the host
-		// (the ticket taken as the buffer was made, or one taken here).
-		if (_ticket.load() == 0)
-			_ticket.store(RgfxRetirement::process().begin());
 		_readerHold = [queue sharedReplyReader];
 		_done = dispatch_group_create();
 		dispatch_group_enter(_done);
@@ -1105,13 +1108,12 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 		block(self);
 	}
 	[_completedHandlers removeAllObjects];
+	// What it kept goes after its handlers, which may still name it, and before its waiters
+	// wake, as Metal's buffer lets its retained references go.
+	_kept.clear();
 	t_delivering--;
 	if (_done != nil && !_left.exchange(true))
 		dispatch_group_leave(_done);
-	// The objects let go while it ran may go from the host now, after its handlers, which
-	// may still name them.
-	if (uint64_t ticket = _ticket.exchange(0))
-		RgfxRetirement::process().end(ticket);
 }
 
 // The GPU's times, in the guest's host time. The device's clock is the host's, not the
@@ -1451,11 +1453,11 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 
 - (void)setRenderPipelineState:(id<MTLRenderPipelineState>)pipelineState
 {
-	_enc->renderSetRenderPipelineState(rgfxId(pipelineState));
+	_enc->renderSetRenderPipelineState(rgfxNamed(_enc, pipelineState));
 }
 - (void)setDepthStencilState:(id<MTLDepthStencilState>)depthStencilState
 {
-	_enc->renderSetDepthStencilState(rgfxId(depthStencilState));
+	_enc->renderSetDepthStencilState(rgfxNamed(_enc, depthStencilState));
 }
 - (void)setViewport:(MTLViewport)viewport
 {
@@ -1636,7 +1638,7 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 - (void)setVertexSamplerState:(id<MTLSamplerState>)sampler atIndex:(NSUInteger)index
 {
 	RgfxSamplerBinding e = {};
-	e.sampler_obj_id = rgfxId(sampler);
+	e.sampler_obj_id = rgfxNamed(_enc, sampler);
 	_enc->renderSetVertexSamplerStates(index, &e, 1);
 }
 - (void)setVertexSamplerStates:(const id<MTLSamplerState> __nullable [__nonnull])samplers
@@ -1644,7 +1646,7 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 {
 	std::vector<RgfxSamplerBinding> s(range.length);
 	for (NSUInteger i = 0; i < range.length; i++) {
-		s[i].sampler_obj_id = rgfxId(samplers[i]);
+		s[i].sampler_obj_id = rgfxNamed(_enc, samplers[i]);
 	}
 	_enc->renderSetVertexSamplerStates(range.location, s.empty() ? nullptr : s.data(),
 	                                   static_cast<uint32_t>(range.length));
@@ -1655,7 +1657,7 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
                       atIndex:(NSUInteger)index
 {
 	RgfxSamplerLodBinding e = {};
-	e.sampler_obj_id = rgfxId(sampler);
+	e.sampler_obj_id = rgfxNamed(_enc, sampler);
 	std::memcpy(&e.lod_min_clamp_bits, &lodMinClamp, 4);
 	std::memcpy(&e.lod_max_clamp_bits, &lodMaxClamp, 4);
 	_enc->renderSetVertexSamplerStatesLodClamps(index, &e, 1);
@@ -1667,7 +1669,7 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 {
 	std::vector<RgfxSamplerLodBinding> s(range.length);
 	for (NSUInteger i = 0; i < range.length; i++) {
-		s[i].sampler_obj_id = rgfxId(samplers[i]);
+		s[i].sampler_obj_id = rgfxNamed(_enc, samplers[i]);
 		std::memcpy(&s[i].lod_min_clamp_bits, &lodMinClamps[i], 4);
 		std::memcpy(&s[i].lod_max_clamp_bits, &lodMaxClamps[i], 4);
 	}
@@ -1713,7 +1715,7 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 - (void)setFragmentSamplerState:(id<MTLSamplerState>)sampler atIndex:(NSUInteger)index
 {
 	RgfxSamplerBinding e = {};
-	e.sampler_obj_id = rgfxId(sampler);
+	e.sampler_obj_id = rgfxNamed(_enc, sampler);
 	_enc->renderSetFragmentSamplerStates(index, &e, 1);
 }
 - (void)setFragmentSamplerStates:(const id<MTLSamplerState> __nullable [__nonnull])samplers
@@ -1721,7 +1723,7 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 {
 	std::vector<RgfxSamplerBinding> s(range.length);
 	for (NSUInteger i = 0; i < range.length; i++) {
-		s[i].sampler_obj_id = rgfxId(samplers[i]);
+		s[i].sampler_obj_id = rgfxNamed(_enc, samplers[i]);
 	}
 	_enc->renderSetFragmentSamplerStates(range.location, s.empty() ? nullptr : s.data(),
 	                                     static_cast<uint32_t>(range.length));
@@ -1732,7 +1734,7 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
                         atIndex:(NSUInteger)index
 {
 	RgfxSamplerLodBinding e = {};
-	e.sampler_obj_id = rgfxId(sampler);
+	e.sampler_obj_id = rgfxNamed(_enc, sampler);
 	std::memcpy(&e.lod_min_clamp_bits, &lodMinClamp, 4);
 	std::memcpy(&e.lod_max_clamp_bits, &lodMaxClamp, 4);
 	_enc->renderSetFragmentSamplerStatesLodClamps(index, &e, 1);
@@ -1744,7 +1746,7 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 {
 	std::vector<RgfxSamplerLodBinding> s(range.length);
 	for (NSUInteger i = 0; i < range.length; i++) {
-		s[i].sampler_obj_id = rgfxId(samplers[i]);
+		s[i].sampler_obj_id = rgfxNamed(_enc, samplers[i]);
 		std::memcpy(&s[i].lod_min_clamp_bits, &lodMinClamps[i], 4);
 		std::memcpy(&s[i].lod_max_clamp_bits, &lodMaxClamps[i], 4);
 	}
@@ -1795,14 +1797,14 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 - (void)setTileSamplerState:(id<MTLSamplerState>)sampler atIndex:(NSUInteger)index
 {
 	RgfxSamplerBinding e = {};
-	e.sampler_obj_id = rgfxId(sampler);
+	e.sampler_obj_id = rgfxNamed(_enc, sampler);
 	_enc->renderSetTileSamplerStates(index, &e, 1);
 }
 - (void)setTileSamplerStates:(const id<MTLSamplerState> __nullable [__nonnull])samplers withRange:(NSRange)range
 {
 	std::vector<RgfxSamplerBinding> s(range.length);
 	for (NSUInteger i = 0; i < range.length; i++) {
-		s[i].sampler_obj_id = rgfxId(samplers[i]);
+		s[i].sampler_obj_id = rgfxNamed(_enc, samplers[i]);
 	}
 	_enc->renderSetTileSamplerStates(range.location, s.empty() ? nullptr : s.data(),
 	                                 static_cast<uint32_t>(range.length));
@@ -1813,7 +1815,7 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
                     atIndex:(NSUInteger)index
 {
 	RgfxSamplerLodBinding e = {};
-	e.sampler_obj_id = rgfxId(sampler);
+	e.sampler_obj_id = rgfxNamed(_enc, sampler);
 	std::memcpy(&e.lod_min_clamp_bits, &lodMinClamp, 4);
 	std::memcpy(&e.lod_max_clamp_bits, &lodMaxClamp, 4);
 	_enc->renderSetTileSamplerStatesLodClamps(index, &e, 1);
@@ -1825,7 +1827,7 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 {
 	std::vector<RgfxSamplerLodBinding> s(range.length);
 	for (NSUInteger i = 0; i < range.length; i++) {
-		s[i].sampler_obj_id = rgfxId(samplers[i]);
+		s[i].sampler_obj_id = rgfxNamed(_enc, samplers[i]);
 		std::memcpy(&s[i].lod_min_clamp_bits, &lodMinClamps[i], 4);
 		std::memcpy(&s[i].lod_max_clamp_bits, &lodMaxClamps[i], 4);
 	}
@@ -1994,11 +1996,11 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 
 - (void)updateFence:(id<MTLFence>)fence afterStages:(MTLRenderStages)stages
 {
-	_enc->renderUpdateFence(rgfxId(fence), static_cast<uint64_t>(stages));
+	_enc->renderUpdateFence(rgfxNamed(_enc, fence), static_cast<uint64_t>(stages));
 }
 - (void)waitForFence:(id<MTLFence>)fence beforeStages:(MTLRenderStages)stages
 {
-	_enc->renderWaitForFence(rgfxId(fence), static_cast<uint64_t>(stages));
+	_enc->renderWaitForFence(rgfxNamed(_enc, fence), static_cast<uint64_t>(stages));
 }
 - (void)useResource:(id<MTLResource>)resource usage:(MTLResourceUsage)usage
 {
@@ -2045,21 +2047,21 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 - (void)useHeap:(id<MTLHeap>)heap
 {
 	RgfxHeapBinding e = {};
-	e.heap_obj_id = rgfxId(heap);
+	e.heap_obj_id = rgfxNamed(_enc, heap);
 	_enc->renderUseHeaps(&e, 1);
 }
 - (void)useHeaps:(const id<MTLHeap> __nonnull[__nonnull])heaps count:(NSUInteger)count
 {
 	std::vector<RgfxHeapBinding> h(count);
 	for (NSUInteger i = 0; i < count; i++) {
-		h[i].heap_obj_id = rgfxId(heaps[i]);
+		h[i].heap_obj_id = rgfxNamed(_enc, heaps[i]);
 	}
 	_enc->renderUseHeaps(h.empty() ? nullptr : h.data(), static_cast<uint32_t>(count));
 }
 - (void)useHeap:(id<MTLHeap>)heap stages:(MTLRenderStages)stages
 {
 	RgfxHeapBinding e = {};
-	e.heap_obj_id = rgfxId(heap);
+	e.heap_obj_id = rgfxNamed(_enc, heap);
 	_enc->renderUseHeapsStages(&e, 1, static_cast<uint64_t>(stages));
 }
 - (void)useHeaps:(const id<MTLHeap> __nonnull[__nonnull])heaps
@@ -2068,7 +2070,7 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 {
 	std::vector<RgfxHeapBinding> h(count);
 	for (NSUInteger i = 0; i < count; i++) {
-		h[i].heap_obj_id = rgfxId(heaps[i]);
+		h[i].heap_obj_id = rgfxNamed(_enc, heaps[i]);
 	}
 	_enc->renderUseHeapsStages(h.empty() ? nullptr : h.data(), static_cast<uint32_t>(count),
 	                           static_cast<uint64_t>(stages));
@@ -2076,14 +2078,14 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 - (void)executeCommandsInBuffer:(id<MTLIndirectCommandBuffer>)indirectCommandBuffer
                       withRange:(NSRange)executionRange
 {
-	_enc->renderExecuteCommandsInBuffer(rgfxId(indirectCommandBuffer), executionRange.location,
+	_enc->renderExecuteCommandsInBuffer(rgfxNamed(_enc, indirectCommandBuffer), executionRange.location,
 	                                    executionRange.length);
 }
 - (void)executeCommandsInBuffer:(id<MTLIndirectCommandBuffer>)indirectCommandbuffer
                  indirectBuffer:(id<MTLBuffer>)indirectRangeBuffer
            indirectBufferOffset:(NSUInteger)indirectBufferOffset
 {
-	_enc->renderExecuteCommandsIndirect(rgfxId(indirectCommandbuffer), rgfxReads(_enc, indirectRangeBuffer),
+	_enc->renderExecuteCommandsIndirect(rgfxNamed(_enc, indirectCommandbuffer), rgfxReads(_enc, indirectRangeBuffer),
 	                                    indirectBufferOffset);
 }
 
@@ -2534,7 +2536,7 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 
 - (void)setComputePipelineState:(id<MTLComputePipelineState>)state
 {
-	_enc->computeSetComputePipelineState(rgfxId(state));
+	_enc->computeSetComputePipelineState(rgfxNamed(_enc, state));
 }
 - (void)setBuffer:(id<MTLBuffer>)buffer offset:(NSUInteger)offset atIndex:(NSUInteger)index
 {
@@ -2608,14 +2610,14 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 - (void)setSamplerState:(id<MTLSamplerState>)sampler atIndex:(NSUInteger)index
 {
 	RgfxComputeSamplerBinding e = {};
-	e.sampler_obj_id = rgfxId(sampler);
+	e.sampler_obj_id = rgfxNamed(_enc, sampler);
 	_enc->computeSetSamplerStates(index, &e, 1);
 }
 - (void)setSamplerStates:(const id<MTLSamplerState> __nullable [__nonnull])samplers withRange:(NSRange)range
 {
 	std::vector<RgfxComputeSamplerBinding> s(range.length);
 	for (NSUInteger i = 0; i < range.length; i++) {
-		s[i].sampler_obj_id = rgfxId(samplers[i]);
+		s[i].sampler_obj_id = rgfxNamed(_enc, samplers[i]);
 	}
 	_enc->computeSetSamplerStates(range.location, s.empty() ? nullptr : s.data(),
 	                              static_cast<uint32_t>(range.length));
@@ -2626,7 +2628,7 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
                 atIndex:(NSUInteger)index
 {
 	RgfxComputeSamplerLodBinding e = {};
-	e.sampler_obj_id = rgfxId(sampler);
+	e.sampler_obj_id = rgfxNamed(_enc, sampler);
 	std::memcpy(&e.lod_min_clamp_bits, &lodMinClamp, 4);
 	std::memcpy(&e.lod_max_clamp_bits, &lodMaxClamp, 4);
 	_enc->computeSetSamplerStatesLodClamps(index, &e, 1);
@@ -2638,7 +2640,7 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 {
 	std::vector<RgfxComputeSamplerLodBinding> s(range.length);
 	for (NSUInteger i = 0; i < range.length; i++) {
-		s[i].sampler_obj_id = rgfxId(samplers[i]);
+		s[i].sampler_obj_id = rgfxNamed(_enc, samplers[i]);
 		std::memcpy(&s[i].lod_min_clamp_bits, &lodMinClamps[i], 4);
 		std::memcpy(&s[i].lod_max_clamp_bits, &lodMaxClamps[i], 4);
 	}
@@ -2687,11 +2689,11 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 }
 - (void)updateFence:(id<MTLFence>)fence
 {
-	_enc->computeUpdateFence(rgfxId(fence));
+	_enc->computeUpdateFence(rgfxNamed(_enc, fence));
 }
 - (void)waitForFence:(id<MTLFence>)fence
 {
-	_enc->computeWaitForFence(rgfxId(fence));
+	_enc->computeWaitForFence(rgfxNamed(_enc, fence));
 }
 - (void)useResource:(id<MTLResource>)resource usage:(MTLResourceUsage)usage
 {
@@ -2715,14 +2717,14 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 - (void)useHeap:(id<MTLHeap>)heap
 {
 	RgfxComputeHeapBinding e = {};
-	e.heap_obj_id = rgfxId(heap);
+	e.heap_obj_id = rgfxNamed(_enc, heap);
 	_enc->computeUseHeaps(&e, 1);
 }
 - (void)useHeaps:(const id<MTLHeap> __nonnull[__nonnull])heaps count:(NSUInteger)count
 {
 	std::vector<RgfxComputeHeapBinding> h(count);
 	for (NSUInteger i = 0; i < count; i++) {
-		h[i].heap_obj_id = rgfxId(heaps[i]);
+		h[i].heap_obj_id = rgfxNamed(_enc, heaps[i]);
 	}
 	_enc->computeUseHeaps(h.empty() ? nullptr : h.data(), static_cast<uint32_t>(count));
 }
@@ -2735,7 +2737,7 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 {
 	std::vector<RgfxComputeResourceRef> r(count);
 	for (NSUInteger i = 0; i < count; i++) {
-		r[i].obj_id = rgfxId(resources[i]);
+		r[i].obj_id = rgfxNamed(_enc, resources[i]);
 		r[i].kind = rgfxResourceKind(resources[i]);
 	}
 	_enc->computeMemoryBarrierResources(r.empty() ? nullptr : r.data(),
@@ -2744,14 +2746,14 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 - (void)executeCommandsInBuffer:(id<MTLIndirectCommandBuffer>)indirectCommandBuffer
                       withRange:(NSRange)executionRange
 {
-	_enc->computeExecuteCommandsInBuffer(rgfxId(indirectCommandBuffer), executionRange.location,
+	_enc->computeExecuteCommandsInBuffer(rgfxNamed(_enc, indirectCommandBuffer), executionRange.location,
 	                                     executionRange.length);
 }
 - (void)executeCommandsInBuffer:(id<MTLIndirectCommandBuffer>)indirectCommandbuffer
                  indirectBuffer:(id<MTLBuffer>)indirectRangeBuffer
            indirectBufferOffset:(NSUInteger)indirectBufferOffset
 {
-	_enc->computeExecuteCommandsIndirect(rgfxId(indirectCommandbuffer), rgfxReads(_enc, indirectRangeBuffer),
+	_enc->computeExecuteCommandsIndirect(rgfxNamed(_enc, indirectCommandbuffer), rgfxReads(_enc, indirectRangeBuffer),
 	                                     indirectBufferOffset);
 }
 
@@ -3028,48 +3030,48 @@ destinationBytesPerImage:(NSUInteger)destinationBytesPerImage
 }
 - (void)updateFence:(id<MTLFence>)fence
 {
-	_enc->blitUpdateFence(rgfxId(fence));
+	_enc->blitUpdateFence(rgfxNamed(_enc, fence));
 }
 - (void)waitForFence:(id<MTLFence>)fence
 {
-	_enc->blitWaitForFence(rgfxId(fence));
+	_enc->blitWaitForFence(rgfxNamed(_enc, fence));
 }
 - (void)optimizeContentsForGPUAccess:(id<MTLTexture>)texture
 {
-	_enc->blitOptimizeForGpu(rgfxId(texture));
+	_enc->blitOptimizeForGpu(rgfxNamed(_enc, texture));
 }
 - (void)optimizeContentsForGPUAccess:(id<MTLTexture>)texture
                                slice:(NSUInteger)slice
                                level:(NSUInteger)level
 {
-	_enc->blitOptimizeForGpuSlice(rgfxId(texture), slice, level);
+	_enc->blitOptimizeForGpuSlice(rgfxNamed(_enc, texture), slice, level);
 }
 - (void)optimizeContentsForCPUAccess:(id<MTLTexture>)texture
 {
-	_enc->blitOptimizeForCpu(rgfxId(texture));
+	_enc->blitOptimizeForCpu(rgfxNamed(_enc, texture));
 }
 - (void)optimizeContentsForCPUAccess:(id<MTLTexture>)texture
                                slice:(NSUInteger)slice
                                level:(NSUInteger)level
 {
-	_enc->blitOptimizeForCpuSlice(rgfxId(texture), slice, level);
+	_enc->blitOptimizeForCpuSlice(rgfxNamed(_enc, texture), slice, level);
 }
 - (void)resetCommandsInBuffer:(id<MTLIndirectCommandBuffer>)buffer withRange:(NSRange)range
 {
-	_enc->blitResetCommandsInBuffer(rgfxId(buffer), range.location, range.length);
+	_enc->blitResetCommandsInBuffer(rgfxNamed(_enc, buffer), range.location, range.length);
 }
 - (void)copyIndirectCommandBuffer:(id<MTLIndirectCommandBuffer>)source
                       sourceRange:(NSRange)sourceRange
                       destination:(id<MTLIndirectCommandBuffer>)destination
                  destinationIndex:(NSUInteger)destinationIndex
 {
-	_enc->blitCopyIndirectCommandBuffer(rgfxId(source), rgfxId(destination), sourceRange.location,
+	_enc->blitCopyIndirectCommandBuffer(rgfxNamed(_enc, source), rgfxNamed(_enc, destination), sourceRange.location,
 	                                    sourceRange.length, destinationIndex);
 }
 - (void)optimizeIndirectCommandBuffer:(id<MTLIndirectCommandBuffer>)indirectCommandBuffer
                             withRange:(NSRange)range
 {
-	_enc->blitOptimizeIndirectCommandBuffer(rgfxId(indirectCommandBuffer), range.location,
+	_enc->blitOptimizeIndirectCommandBuffer(rgfxNamed(_enc, indirectCommandBuffer), range.location,
 	                                        range.length);
 }
 - (void)synchronizeResource:(id<MTLResource>)resource

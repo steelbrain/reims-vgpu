@@ -64,7 +64,6 @@
 #include "RgfxManagedLayout.hpp"
 #include "RgfxMemoryShadow.hpp"
 #include "RgfxObjectModel.hpp"
-#include "RgfxRetirement.hpp"
 #include "RgfxRegion.hpp"
 #include "RgfxReplyReader.hpp"
 #include "RgfxRingWriter.hpp"
@@ -81,6 +80,11 @@
 
 @implementation TestHandle
 @end
+// The control ring's helpers (below), which the tests in the namespace use too.
+uint64_t nextDestroyed(TestRing &ring);
+bool ringEmpty(TestRing &ring);
+void drainRing(TestRing &ring);
+
 namespace {
 
 // A ring + id space + serialiser over a plain-buffer region, the fixture every
@@ -2576,12 +2580,14 @@ struct BlockLog {
 
 void test_command_buffer_out_of_line()
 {
-	@autoreleasepool {
-	QueueFixture f(0x1000); // up to 2 KiB on the ring
+	// Outside the pool: the queue's pool of blocks goes back into the region as the queue goes,
+	// which the pool's drain may do.
 	std::vector<uint8_t> mem(RGFX_ALLOCATIONS_OFFSET + 0x100000, 0);
 	RgfxRegion region(mem.data(), mem.size());
 	BlockLog blocks;
 	region.setBlockSource(&BlockLog::alloc, &BlockLog::release, &blocks);
+	@autoreleasepool {
+	QueueFixture f(0x1000); // up to 2 KiB on the ring
 	f.queue.region = &region;
 
 	// A small buffer still rides the ring.
@@ -2793,36 +2799,13 @@ void test_command_buffer_back_pressure()
 	}
 }
 
-// A release waits for every command buffer begun before it, and runs at once with none in
-// flight; one begun after it does not hold it; releases run in the order retired.
-void test_retirement()
-{
-	RgfxRetirement r;
-	std::vector<int> ran;
-	r.retire([&] { ran.push_back(0); });
-	CHECK(ran == std::vector<int>({0}));
-	uint64_t a = r.begin();
-	uint64_t b = r.begin();
-	r.retire([&] { ran.push_back(1); });
-	uint64_t c = r.begin(); // after the release: does not hold it
-	r.retire([&] { ran.push_back(2); });
-	CHECK(r.waiting() == 2);
-	r.end(b);
-	CHECK(ran.size() == 1);
-	r.end(a);
-	CHECK(ran == std::vector<int>({0, 1})); // 2 waits for c
-	r.end(c);
-	CHECK(ran == std::vector<int>({0, 1, 2}));
-	CHECK(r.waiting() == 0);
-}
-
-// A texture let go while a command buffer is in flight stays on the host until the buffer
-// completes: its OBJECT_DESTROY comes after the buffer's handlers, and its resource id goes
-// to the next texture only after that.
+// A texture a command buffer names stays on the host while the buffer is in flight, though the
+// app let it go, as Metal's buffer keeps what it encodes: its OBJECT_DESTROY comes after the
+// buffer's handlers and before its waiter wakes, and its resource id goes to the next texture only
+// after that. A texture the buffer never names goes at once meanwhile. A buffer made with
+// unretained references keeps what it names too, though it answers retainedReferences NO.
 void test_texture_destroy_waits_for_buffers()
 {
-	// Nothing left in flight by earlier tests.
-	CHECK(RgfxRetirement::process().waiting() == 0 && RgfxRetirement::process().live() == 0);
 	@autoreleasepool {
 	QueueFixture f;
 	(void)expectQueueCreate(f.control);
@@ -2833,18 +2816,23 @@ void test_texture_destroy_waits_for_buffers()
 	                                                       width:8
 	                                                      height:8
 	                                                   mipmapped:NO];
+	auto texture = [&] {
+		RgfxTexture *t = [RgfxTexture textureWithDescriptor:desc
+		                                               heap:RGFX_OBJ_NONE
+		                                         heapOffset:0
+		                                             device:nil
+		                                         serializer:&f.ser];
+		CHECK(t != nil);
+		(void)expectMessage<RgfxTextureCreate>(f.control, RGFX_CMD_TEXTURE_CREATE);
+		return t;
+	};
 	uint64_t texObjId = 0, texResourceId = 0;
 	id<MTLCommandBuffer> cb = [f.queue commandBuffer];
+	CHECK(cb.retainedReferences);
 	@autoreleasepool {
-		RgfxTexture *tex = [RgfxTexture textureWithDescriptor:desc
-		                                                 heap:RGFX_OBJ_NONE
-		                                           heapOffset:0
-		                                               device:nil
-		                                           serializer:&f.ser];
-		CHECK(tex != nil);
+		RgfxTexture *tex = texture();
 		texObjId = tex.rgfxObjId;
 		texResourceId = [tex gpuResourceID]._impl;
-		(void)expectMessage<RgfxTextureCreate>(f.control, RGFX_CMD_TEXTURE_CREATE);
 		id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
 		[blit generateMipmapsForTexture:tex];
 		[blit endEncoding];
@@ -2853,18 +2841,15 @@ void test_texture_destroy_waits_for_buffers()
 	RgfxMsgHeader h = {};
 	std::vector<uint8_t> bytes;
 	CHECK(!f.control.next(&h, &bytes)); // no destroy yet
-	CHECK(RgfxRetirement::process().waiting() == 1);
-	// A texture made meanwhile gets another id: the first's is still the host's.
+	// A texture made meanwhile gets another id: the first's is still the host's. It goes at once.
+	uint64_t otherObjId = 0;
 	@autoreleasepool {
-		RgfxTexture *other = [RgfxTexture textureWithDescriptor:desc
-		                                                   heap:RGFX_OBJ_NONE
-		                                             heapOffset:0
-		                                                 device:nil
-		                                             serializer:&f.ser];
-		CHECK(other != nil && [other gpuResourceID]._impl != texResourceId);
-		(void)expectMessage<RgfxTextureCreate>(f.control, RGFX_CMD_TEXTURE_CREATE);
+		RgfxTexture *other = texture();
+		otherObjId = other.rgfxObjId;
+		CHECK([other gpuResourceID]._impl != texResourceId);
 	}
-	CHECK(RgfxRetirement::process().waiting() == 2);
+	CHECK(expectMessage<RgfxObjectDestroy>(f.control, RGFX_CMD_OBJECT_DESTROY).obj_id ==
+	      otherObjId);
 
 	__block bool destroyedBeforeHandler = true;
 	TestRing *control = &f.control;
@@ -2878,32 +2863,64 @@ void test_texture_destroy_waits_for_buffers()
 	CHECK(f.completion.postFromHost(&done, sizeof(done)));
 	[cb waitUntilCompleted];
 	CHECK(!destroyedBeforeHandler);
-	auto gone = expectMessage<RgfxObjectDestroy>(f.control, RGFX_CMD_OBJECT_DESTROY);
-	CHECK(gone.obj_id == texObjId);
-	(void)expectMessage<RgfxObjectDestroy>(f.control, RGFX_CMD_OBJECT_DESTROY); // `other`'s
-	CHECK(RgfxRetirement::process().waiting() == 0);
+	CHECK(expectMessage<RgfxObjectDestroy>(f.control, RGFX_CMD_OBJECT_DESTROY).obj_id == texObjId);
+	CHECK(ringEmpty(f.control));
+
+	// Unretained references: kept all the same.
+	id<MTLCommandBuffer> unretained = [f.queue commandBufferWithUnretainedReferences];
+	CHECK(!unretained.retainedReferences);
+	@autoreleasepool {
+		RgfxTexture *tex = texture();
+		texObjId = tex.rgfxObjId;
+		id<MTLBlitCommandEncoder> blit = [unretained blitCommandEncoder];
+		[blit generateMipmapsForTexture:tex];
+		[blit endEncoding];
+		[unretained commit];
+	}
+	CHECK(ringEmpty(f.control));
+	done = cbComplete(f.nextSeqno(), ((RgfxResource *)unretained).rgfxObjId);
+	CHECK(f.completion.postFromHost(&done, sizeof(done)));
+	[unretained waitUntilCompleted];
+	CHECK(expectMessage<RgfxObjectDestroy>(f.control, RGFX_CMD_OBJECT_DESTROY).obj_id == texObjId);
 	}
 }
 
-// A buffer whose completion never comes, released with its queue and reader, ends
-// nothing (its completion group is left at dealloc).
+// A buffer whose completion never comes holds back only what it names: a buffer it fills stays
+// on the host until the command buffer goes, with its queue's reader, while one it never names
+// goes at once. Its completion group is left at its dealloc.
 void test_uncompleted_buffer_releases()
 {
 	@autoreleasepool {
 		QueueFixture f;
+		(void)expectQueueCreate(f.control);
+		uint64_t namedId = 0, otherId = 0;
 		{
 			RgfxReplyReader reader(f.completion.base(), f.completion.dataSize);
 			f.queue.replyReader = &reader;
 			@autoreleasepool {
+				RgfxBuffer *named = [RgfxBuffer bufferWithLength:64
+				                                         options:MTLResourceStorageModePrivate
+				                                          device:nil
+				                                      serializer:&f.ser];
+				RgfxBuffer *other = [RgfxBuffer bufferWithLength:64
+				                                         options:MTLResourceStorageModePrivate
+				                                          device:nil
+				                                      serializer:&f.ser];
+				namedId = named.rgfxObjId;
+				otherId = other.rgfxObjId;
+				drainRing(f.control);
 				id<MTLCommandBuffer> cb = [f.queue commandBuffer];
+				id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+				[blit fillBuffer:named range:NSMakeRange(0, 64) value:1];
+				[blit endEncoding];
 				[cb commit];
 				(void)f.nextSeqno();
 				CHECK(cb.status == MTLCommandBufferStatusCommitted);
 			}
-			CHECK(RgfxRetirement::process().live() == 1);
+			CHECK(nextDestroyed(f.control) == otherId && ringEmpty(f.control));
 			f.queue.replyReader = nullptr;
 		} // the reader goes, and with it its handler, the buffer's last hold
-		CHECK(RgfxRetirement::process().live() == 0); // its ticket ended at its dealloc
+		CHECK(nextDestroyed(f.control) == namedId && ringEmpty(f.control));
 	}
 }
 
@@ -3131,10 +3148,6 @@ void drainRing(TestRing &ring)
 	}
 }
 
-bool retirementIdle()
-{
-	return RgfxRetirement::process().waiting() == 0 && RgfxRetirement::process().live() == 0;
-}
 // newBufferWithBytesNoCopy: over app memory outside the region (RgfxBuffer.h): `contents` is the
 // app's pointer and the buffer lies over a block of its own, seeded from the memory. A command
 // buffer that uses it takes the CPU's writes into the block at its commit, and one that may write
@@ -3146,7 +3159,6 @@ bool retirementIdle()
 // used in place.
 void test_no_copy_buffers()
 {
-	CHECK(retirementIdle());
 	@autoreleasepool {
 	QueueFixture f;
 	(void)expectQueueCreate(f.control);
@@ -3336,7 +3348,6 @@ void test_no_copy_buffers()
 // then the copy's block goes back.
 void test_managed_texture_copy_block_after_destroys()
 {
-	CHECK(retirementIdle());
 	Fixture fx;
 	std::vector<uint8_t> mem(RGFX_ALLOCATIONS_OFFSET + 0x100000, 0);
 	RgfxRegion region(mem.data(), mem.size());
@@ -3395,7 +3406,6 @@ void test_managed_texture_copy_block_after_destroys()
 // buffer committed on the queue, and let go.
 void test_queue_ring_carries_only_command_buffers()
 {
-	CHECK(retirementIdle());
 	QueueFixture f;
 	int calls = 0;
 	f.ids.setResourceIdSource(&oneChunk, &calls);
@@ -3460,7 +3470,6 @@ void test_queue_ring_carries_only_command_buffers()
 	@autoreleasepool {
 		cb = nil;
 	}
-	CHECK(retirementIdle());
 	std::set<uint32_t> lifecycle;
 	while (f.control.next(&h, &bytes)) {
 		CHECK(queueTypes.count(h.type) == 0);
@@ -3478,7 +3487,6 @@ void test_queue_ring_carries_only_command_buffers()
 // asked for an object the app does not hold.
 void test_heaps_with_no_bytes_or_address_are_nil()
 {
-	CHECK(retirementIdle());
 	Fixture fx;
 	@autoreleasepool {
 		MTLHeapDescriptor *d = [MTLHeapDescriptor new];
@@ -3505,7 +3513,6 @@ void test_heaps_with_no_bytes_or_address_are_nil()
 		CHECK(expectMessage<RgfxHeapCreate>(fx.ring, RGFX_CMD_HEAP_CREATE).size_bytes == 0x10000);
 	}
 	drainRing(fx.ring);
-	CHECK(retirementIdle());
 }
 
 // A Shared heap's placed buffers alias its bytes, as Metal's do: a buffer is the heap's bytes at
@@ -3514,7 +3521,6 @@ void test_heaps_with_no_bytes_or_address_are_nil()
 // buffer is at its address plus the offset too.
 void test_shared_heap_buffers_alias_its_bytes()
 {
-	CHECK(retirementIdle());
 	Fixture fx;
 	static uint8_t bytes[0x10000];
 	MTLHeapDescriptor *d = [MTLHeapDescriptor new];
@@ -3570,7 +3576,6 @@ void test_shared_heap_buffers_alias_its_bytes()
 		drainRing(fx.ring);
 	}
 	drainRing(fx.ring);
-	CHECK(retirementIdle());
 }
 
 // What a fake device answers a heap texture size query: 264192 bytes at 128, as Metal answers a
@@ -3598,7 +3603,6 @@ bool askTextureSize(void *, const void *, uint32_t, void *reply, uint32_t capaci
 // answers 0 for both and places nothing itself.
 void test_automatic_heap_places_as_metal()
 {
-	CHECK(retirementIdle());
 	Fixture fx;
 	fx.ser.setAsker(&askTextureSize, nullptr);
 	MTLHeapDescriptor *d = [MTLHeapDescriptor new];
@@ -3670,7 +3674,6 @@ void test_automatic_heap_places_as_metal()
 		(void)b3, (void)b4, (void)b5, (void)b7, (void)t1;
 	}
 	drainRing(fx.ring);
-	CHECK(retirementIdle());
 
 	// With no answer from the device, a texture takes the bound of Metal's size, logged.
 	@autoreleasepool {
@@ -3689,7 +3692,6 @@ void test_automatic_heap_places_as_metal()
 		CHECK(RgfxUnsupportedWasLogged([RgfxHeap class], @selector(newTextureWithDescriptor:)));
 		drainRing(bare.ring);
 	}
-	CHECK(retirementIdle());
 
 	// A Placement heap places nothing itself, and answers 0 used and 0 available.
 	@autoreleasepool {
@@ -3704,13 +3706,11 @@ void test_automatic_heap_places_as_metal()
 		CHECK([heap newBufferWithLength:64 options:0] == nil);
 		drainRing(px.ring);
 	}
-	CHECK(retirementIdle());
 }
 
 // An Automatic Shared heap's buffers are its bytes at the offsets it picks.
 void test_automatic_shared_heap_buffers_are_its_bytes()
 {
-	CHECK(retirementIdle());
 	Fixture fx;
 	static uint8_t bytes[0x8000];
 	MTLHeapDescriptor *d = [MTLHeapDescriptor new];
@@ -3737,7 +3737,6 @@ void test_automatic_shared_heap_buffers_are_its_bytes()
 		drainRing(fx.ring);
 	}
 	drainRing(fx.ring);
-	CHECK(retirementIdle());
 }
 
 // A heap's GPU address goes back once its destroy is retired: churned 1 GiB heaps, each made
@@ -3746,7 +3745,6 @@ void test_automatic_shared_heap_buffers_are_its_bytes()
 // command buffer in flight holds back keeps its span till the buffer completes.
 void test_addresses_reused_after_destroy()
 {
-	CHECK(retirementIdle());
 	Fixture fx;
 	MTLHeapDescriptor *d = [MTLHeapDescriptor new];
 	d.size = uint64_t{1} << 30;
@@ -3777,14 +3775,16 @@ void test_addresses_reused_after_destroy()
 	}
 	drainRing(fx.ring);
 
-	// A destroy held back by a command buffer in flight keeps its span till the buffer ends:
-	// with every other span taken, only its own is picked once the buffer is done.
-	uint64_t ticket = 0, keptAt = 0;
+	// A heap a command buffer in flight keeps (its retained references), though the app let it
+	// go, keeps its span till the buffer lets it go: with every other span taken, only its own is
+	// picked once it has.
+	uint64_t keptAt = 0;
+	NSMutableArray *inFlight = [NSMutableArray array]; // what the command buffer keeps
 	@autoreleasepool {
 		RgfxHeap *kept = [RgfxHeap heapWithDescriptor:d device:nil serializer:&fx.ser];
 		keptAt = heapAddress();
 		CHECK(kept != nil);
-		ticket = RgfxRetirement::process().begin();
+		[inFlight addObject:kept];
 		kept = nil;
 	}
 	CHECK(ringEmpty(fx.ring)); // its destroy waits
@@ -3792,10 +3792,11 @@ void test_addresses_reused_after_destroy()
 	for (uint64_t at; (at = fx.ids.allocAddress(d.size, 1)) != 0; taken++)
 		CHECK(at != keptAt);
 	CHECK(taken > 0);
-	RgfxRetirement::process().end(ticket);
+	@autoreleasepool {
+		[inFlight removeAllObjects];
+	}
 	CHECK(nextDestroyed(fx.ring) != 0 && ringEmpty(fx.ring));
 	CHECK(fx.ids.allocAddress(d.size, 1) == keptAt);
-	CHECK(retirementIdle());
 }
 
 // Each host object the bundle makes is destroyed as the app lets it go, at once with no
@@ -3803,7 +3804,6 @@ void test_addresses_reused_after_destroy()
 // buffers, heaps, libraries, and render and compute pipelines.
 void test_objects_destroyed_as_let_go()
 {
-	CHECK(retirementIdle());
 	Fixture fx;
 	auto made = [&](id object) {
 		CHECK(object != nil);
@@ -3897,14 +3897,12 @@ void test_objects_destroyed_as_let_go()
 		lib = nil;
 	}
 	CHECK(nextDestroyed(fx.ring) == libId && ringEmpty(fx.ring)); // with its last function
-	CHECK(retirementIdle());
 }
 
 // A function keeps its library on the host, so a pipeline made from it after the app let the
 // library go still names a library the host holds; the pipeline needs the library no more.
 void test_function_keeps_its_library()
 {
-	CHECK(retirementIdle());
 	Fixture fx;
 	const uint8_t libBytes[] = {5, 6, 7};
 	uint32_t status = 0;
@@ -3950,7 +3948,6 @@ void test_function_keeps_its_library()
 // host only after the last of them.
 void test_heap_outlives_its_resources()
 {
-	CHECK(retirementIdle());
 	Fixture fx;
 	int calls = 0;
 	fx.ids.setResourceIdSource(&oneChunk, &calls);
@@ -3997,7 +3994,6 @@ void test_heap_outlives_its_resources()
 // answers nil and posts nothing.
 void test_texture_views()
 {
-	CHECK(retirementIdle());
 	Fixture fx;
 	@autoreleasepool {
 	// A Private 2D array of four slices and seven levels, of usage 0x17.
@@ -4230,7 +4226,6 @@ void test_texture_views()
 // A view keeps its texture: the texture's destroy is posted only after the view's.
 void test_view_keeps_its_texture()
 {
-	CHECK(retirementIdle());
 	Fixture fx;
 	RgfxTexture *tex = nil;
 	id<MTLTexture> view = nil;
@@ -4263,10 +4258,9 @@ void test_view_keeps_its_texture()
 }
 
 // The region memory under a buffer or heap over host memory goes back only once the host has
-// dropped the object, and only once every command buffer in flight at its release completed.
+// dropped the object, after any command buffer in flight that keeps it has let it go.
 void test_region_memory_given_back_after_destroy()
 {
-	CHECK(retirementIdle());
 	Fixture fx;
 	TestRing *ring = &fx.ring;
 	__block int released = 0;
@@ -4278,7 +4272,7 @@ void test_region_memory_given_back_after_destroy()
 		released++;
 	};
 	static uint8_t page[0x1000];
-	uint64_t ticket = RgfxRetirement::process().begin(); // a command buffer in flight
+	NSMutableArray *inFlight = [NSMutableArray array]; // what a command buffer in flight keeps
 	@autoreleasepool {
 		RgfxBuffer *b = [RgfxBuffer bufferOverHostMemoryWithContents:page
 		                                                regionOffset:RGFX_CONTEXT_ALLOCATIONS_OFFSET
@@ -4298,10 +4292,14 @@ void test_region_memory_given_back_after_destroy()
 		                                                  device:nil
 		                                              serializer:&fx.ser];
 		CHECK(h != nil);
+		[inFlight addObject:b];
+		[inFlight addObject:h];
 		drainRing(fx.ring);
 	}
-	CHECK(released == 0 && ringEmpty(fx.ring)); // the buffer in flight may name them
-	RgfxRetirement::process().end(ticket);
+	CHECK(released == 0 && ringEmpty(fx.ring)); // the buffer in flight keeps them
+	@autoreleasepool {
+		[inFlight removeAllObjects];
+	}
 	CHECK(released == 2 && destroyedFirst);
 	CHECK(ringEmpty(fx.ring));
 }
@@ -4310,7 +4308,6 @@ void test_region_memory_given_back_after_destroy()
 // from the host, and only then the copy's block back to the region.
 void test_iosurface_copy_block_after_destroys()
 {
-	CHECK(retirementIdle());
 	Fixture fx;
 	int calls = 0;
 	fx.ids.setResourceIdSource(&oneChunk, &calls);
@@ -4381,7 +4378,6 @@ void test_iosurface_copy_block_after_destroys()
 // own block where the kext gives none.
 void test_iosurface_shared_block()
 {
-	CHECK(retirementIdle());
 	Fixture fx;
 	int calls = 0;
 	fx.ids.setResourceIdSource(&oneChunk, &calls);
@@ -4663,7 +4659,6 @@ void test_iosurface_writers()
 // completion ring read no more, and only then does what it holds go back.
 void test_queue_ends_after_its_buffers()
 {
-	CHECK(retirementIdle());
 	@autoreleasepool {
 		// Made in a pool of its own, so no autorelease keeps the queue past the test's let-go.
 		QueueFixture *made = nullptr;
@@ -4709,7 +4704,6 @@ void test_queue_ends_after_its_buffers()
 		CHECK(reader->pump() == 0 && !reader->armAndCheck());
 		CHECK(f.completion.consumerCount() == consumer);
 	}
-	CHECK(retirementIdle());
 }
 
 // Where a closer is set the queue ends through it (the kext's QUEUE_DESTROY) and nothing is
@@ -4728,26 +4722,36 @@ void test_serializer_destroys_queues()
 	CHECK(closed.ids == std::vector<uint64_t>({8}) && ringEmpty(fx.ring));
 }
 
-// An object let go after a command buffer was made, before its commit, stays on the host
-// until the buffer completes, as it may encode it meanwhile; one never committed holds
-// nothing back once it goes.
+// An object a command buffer encodes stays on the host though the app let it go: until the
+// buffer completes, where it is committed, and until it goes, where it never is. One it never
+// encodes goes at once, whether made before the buffer or after.
 void test_objects_outlive_an_uncommitted_buffer()
 {
-	CHECK(retirementIdle());
 	@autoreleasepool {
 		QueueFixture f;
 		drainRing(f.control);
-		id<MTLCommandBuffer> cb = [f.queue commandBuffer];
-		uint64_t samplerId = 0;
-		@autoreleasepool {
+		auto sampler = [&](uint64_t *objId) {
 			RgfxSampler *s = [RgfxSampler samplerWithDescriptor:[MTLSamplerDescriptor new]
 			                                             device:nil
 			                                         serializer:&f.ser];
-			samplerId = s.rgfxObjId;
+			*objId = s.rgfxObjId;
 			drainRing(f.control);
+			return s;
+		};
+		auto encode = [](id<MTLCommandBuffer> cb, id<MTLSamplerState> s) {
+			id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+			[enc setSamplerState:s atIndex:0];
+			[enc endEncoding];
+		};
+		id<MTLCommandBuffer> cb = [f.queue commandBuffer];
+		uint64_t samplerId = 0, unnamed = 0;
+		@autoreleasepool {
+			encode(cb, sampler(&samplerId));
+			(void)sampler(&unnamed);
 		}
-		CHECK(ringEmpty(f.control));
+		CHECK(nextDestroyed(f.control) == unnamed && ringEmpty(f.control));
 		[cb commit];
+		CHECK(ringEmpty(f.control));
 		RgfxCbComplete done = cbComplete(f.nextSeqno(), ((RgfxResource *)cb).rgfxObjId);
 		CHECK(f.completion.postFromHost(&done, sizeof(done)));
 		[cb waitUntilCompleted];
@@ -4757,54 +4761,12 @@ void test_objects_outlive_an_uncommitted_buffer()
 		@autoreleasepool {
 			id<MTLCommandBuffer> idle = [f.queue commandBuffer];
 			@autoreleasepool {
-				RgfxSampler *s = [RgfxSampler samplerWithDescriptor:[MTLSamplerDescriptor new]
-				                                             device:nil
-				                                         serializer:&f.ser];
-				other = s.rgfxObjId;
-				drainRing(f.control);
+				encode(idle, sampler(&other));
 			}
-			CHECK(ringEmpty(f.control));
-			(void)idle;
+			CHECK(ringEmpty(f.control)); // the buffer that encodes it keeps it
 		}
 		CHECK(nextDestroyed(f.control) == other && ringEmpty(f.control));
 	}
-	CHECK(retirementIdle());
-}
-
-// While one thread runs the releases due, a release retired meanwhile waits behind them,
-// though no ticket is live, and runs on that thread after them; a release that retires
-// another runs it after itself.
-void test_retirement_keeps_order_while_running()
-{
-	RgfxRetirement r;
-	std::vector<int> ran;
-	std::atomic<bool> running{false}, go{false};
-	uint64_t t = r.begin();
-	r.retire([&] {
-		running = true;
-		while (!go)
-			std::this_thread::sleep_for(std::chrono::milliseconds(1));
-		ran.push_back(1);
-	});
-	std::thread::id ranOn;
-	std::thread a([&] { r.end(t); });
-	std::thread::id aId = a.get_id();
-	CHECK(eventually([&] { return running.load(); }));
-	r.retire([&] {
-		ran.push_back(2);
-		ranOn = std::this_thread::get_id();
-	});
-	CHECK(r.waiting() == 1 && r.live() == 0);
-	go = true;
-	a.join();
-	CHECK(ran == std::vector<int>({1, 2}));
-	CHECK(ranOn == aId);
-	r.retire([&] {
-		r.retire([&] { ran.push_back(4); });
-		ran.push_back(3);
-	});
-	CHECK(ran == std::vector<int>({1, 2, 3, 4}));
-	CHECK(r.waiting() == 0);
 }
 
 // A closed reader takes nothing more off its ring: no handler runs, the consumer stays, and
@@ -4865,7 +4827,6 @@ int main()
 		test_command_buffer_out_of_line();
 		test_completion_expected_before_publish();
 		test_command_buffer_back_pressure();
-		test_retirement();
 		test_texture_destroy_waits_for_buffers();
 		test_managed_layout();
 		test_managed_buffer_range();
@@ -4880,7 +4841,6 @@ int main()
 		test_queue_ends_after_its_buffers();
 		test_serializer_destroys_queues();
 		test_objects_outlive_an_uncommitted_buffer();
-		test_retirement_keeps_order_while_running();
 		test_reply_reader_close();
 		test_addresses_reused_after_destroy();
 		test_heaps_with_no_bytes_or_address_are_nil();
