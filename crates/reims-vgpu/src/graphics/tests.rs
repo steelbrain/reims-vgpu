@@ -1990,7 +1990,12 @@ fn a_create_the_platform_refuses_makes_nothing() {
     let faults = platform.faults();
     faults.at("MTLDevice", "newTextureWithDescriptor:", 0, Fault::Crash);
     faults.at("MTLDevice", "newBufferWithDescriptor:", 0, Fault::Crash);
-    faults.at("MTLHeap", "newTextureWithDescriptor:offset:", 0, Fault::Crash);
+    faults.at(
+        "MTLHeap",
+        "newTextureWithDescriptor:offset:",
+        0,
+        Fault::Crash,
+    );
     guest.send(&device, texture_create(obj(3, 1), first));
     guest.send(&device, buffer_create(obj(3, 2)));
     guest.send(
@@ -2001,7 +2006,11 @@ fn a_create_the_platform_refuses_makes_nothing() {
         answered(&device, &mut guest, context_close(99)),
         RGFX_STATUS_OK
     );
-    assert_eq!(device.decoder_object_count(), 1, "the three creates refused");
+    assert_eq!(
+        device.decoder_object_count(),
+        1,
+        "the three creates refused"
+    );
     guest.send(&device, texture_create(obj(3, 3), first + 1));
     guest.send(&device, buffer_create(obj(3, 4)));
     guest.send(
