@@ -386,9 +386,7 @@ impl<P: Platform> DrawnPresents<P> {
         if self.answers.is_empty() {
             return;
         }
-        let _ = no_catch(
-            command_buffer.add_completed_handler(OnFault::Die, Box::new(move |_| drop(self))),
-        );
+        no_catch(command_buffer.add_completed_handler(OnFault::Die, Box::new(move |_| drop(self))));
     }
 }
 

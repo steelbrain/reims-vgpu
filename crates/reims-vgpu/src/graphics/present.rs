@@ -134,17 +134,21 @@ impl<P: Platform> PresentQueue<P> {
 
     /// Shows the presents at the front whose writers have finished, oldest first.
     fn show_ready(&self, state: &mut State<P>) {
-        while let Some(front) = state.waiting.front() {
-            let ready = front.writers.iter().all(|w| {
-                state
-                    .finished
-                    .get(&w.queue_obj_id)
-                    .is_some_and(|&done| done >= w.seqno)
+        loop {
+            let ready = state.waiting.front().is_some_and(|front| {
+                front.writers.iter().all(|w| {
+                    state
+                        .finished
+                        .get(&w.queue_obj_id)
+                        .is_some_and(|&done| done >= w.seqno)
+                })
             });
             if !ready {
                 return;
             }
-            let shown = state.waiting.pop_front().expect("the front present");
+            let Some(shown) = state.waiting.pop_front() else {
+                return;
+            };
             self.presented.show(shown.id, shown.texture, shown.answer);
         }
     }
