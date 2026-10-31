@@ -474,6 +474,37 @@ uint32_t fillRenderPass(MTLRenderPassDescriptor *d, RgfxRenderPassDesc *desc,
 	return _ownedReader;
 }
 
+// A capture tool's frame boundary: no capture tool sees this device's work, so nothing
+// marks one, as Metal's does with no capture under way.
+- (void)insertDebugCaptureBoundary
+{
+}
+
+// --- unsupported: the device makes no residency set (newResidencySetWithDescriptor:error:) ---
+
+- (void)addResidencySet:(id<MTLResidencySet>)residencySet
+{
+	if (residencySet != nil)
+		RGFX_UNSUPPORTED("residency sets");
+}
+- (void)addResidencySets:(const id<MTLResidencySet> _Nonnull[_Nonnull])residencySets
+                   count:(NSUInteger)count
+{
+	if (count != 0)
+		RGFX_UNSUPPORTED("residency sets");
+}
+- (void)removeResidencySet:(id<MTLResidencySet>)residencySet
+{
+	if (residencySet != nil)
+		RGFX_UNSUPPORTED("residency sets");
+}
+- (void)removeResidencySets:(const id<MTLResidencySet> _Nonnull[_Nonnull])residencySets
+                      count:(NSUInteger)count
+{
+	if (count != 0)
+		RGFX_UNSUPPORTED("residency sets");
+}
+
 // --- dispatch queues and priority (MTLCommandQueue SPI WindowServer sets) -----------
 // WindowServer hands its queues the dispatch queues Metal is to run submission and
 // completion work on, and a GPU priority. Our queue submits on the caller's thread and
@@ -1114,6 +1145,44 @@ uint32_t fillRenderPass(MTLRenderPassDescriptor *d, RgfxRenderPassDesc *desc,
 }
 - (void)popDebugGroup
 {
+}
+
+// --- unsupported: the device answers NO for these features -----------------------
+// No encoder of these kinds can be made: nil, as Metal answers a device without them.
+
+- (nullable id<MTLAccelerationStructureCommandEncoder>)accelerationStructureCommandEncoder
+{
+	RGFX_UNSUPPORTED("ray tracing");
+	return nil;
+}
+- (id<MTLAccelerationStructureCommandEncoder>)accelerationStructureCommandEncoderWithDescriptor:
+    (MTLAccelerationStructurePassDescriptor *)descriptor
+{
+	RGFX_UNSUPPORTED("ray tracing");
+	return nil;
+}
+- (nullable id<MTLResourceStateCommandEncoder>)resourceStateCommandEncoder
+{
+	RGFX_UNSUPPORTED("sparse textures");
+	return nil;
+}
+- (nullable id<MTLResourceStateCommandEncoder>)resourceStateCommandEncoderWithDescriptor:
+    (MTLResourceStatePassDescriptor *)resourceStatePassDescriptor
+{
+	RGFX_UNSUPPORTED("sparse textures");
+	return nil;
+}
+// The device makes no residency set (newResidencySetWithDescriptor:error:).
+- (void)useResidencySet:(id<MTLResidencySet>)residencySet
+{
+	if (residencySet != nil)
+		RGFX_UNSUPPORTED("residency sets");
+}
+- (void)useResidencySets:(const id<MTLResidencySet> _Nonnull[_Nonnull])residencySets
+                   count:(NSUInteger)count
+{
+	if (count != 0)
+		RGFX_UNSUPPORTED("residency sets");
 }
 
 @end

@@ -571,6 +571,46 @@ void test_encoders_unsupported()
 	fx.complete(cb, seqno);
 }
 
+
+// --- the command buffer and the queue ---------------------------------------------
+
+// The encoders of features the device does not support are nil, logged; residency sets
+// (which the device does not make) change nothing; a capture boundary marks nothing.
+void test_command_buffer_and_queue_members()
+{
+	QueueFixture fx;
+	id<MTLCommandBuffer> cb = [fx.queue commandBuffer];
+	CHECK([cb accelerationStructureCommandEncoder] == nil);
+	CHECK([cb accelerationStructureCommandEncoderWithDescriptor:
+	              [MTLAccelerationStructurePassDescriptor accelerationStructurePassDescriptor]] ==
+	      nil);
+	CHECK([cb resourceStateCommandEncoder] == nil);
+	CHECK([cb resourceStateCommandEncoderWithDescriptor:
+	              [MTLResourceStatePassDescriptor resourceStatePassDescriptor]] == nil);
+	CHECK(RgfxUnsupportedWasLogged([RgfxCmdBuffer class],
+	                               @selector(accelerationStructureCommandEncoder)));
+	CHECK(RgfxUnsupportedWasLogged([RgfxCmdBuffer class], @selector(resourceStateCommandEncoder)));
+	id<MTLResidencySet> noSets[1] = {nil};
+	[cb useResidencySets:noSets count:0];
+	CHECK(!RgfxUnsupportedWasLogged([RgfxCmdBuffer class], @selector(useResidencySets:count:)));
+	[fx.queue addResidencySets:noSets count:0];
+	[fx.queue removeResidencySets:noSets count:0];
+	CHECK(!RgfxUnsupportedWasLogged([RgfxCommandQueue class], @selector(addResidencySets:count:)));
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+	[fx.queue insertDebugCaptureBoundary];
+#pragma clang diagnostic pop
+	// None of it reached a ring.
+	RgfxMsgHeader h = {};
+	std::vector<uint8_t> bytes;
+	CHECK(!fx.control.next(&h, &bytes));
+	[cb commit];
+	uint64_t seqno = 0;
+	std::vector<Op> ops = fx.nextOps(&seqno);
+	CHECK(ops.empty());
+	fx.complete(cb, seqno);
+}
+
 } // namespace
 
 void rgfxProtocolTests()
@@ -582,4 +622,5 @@ void rgfxProtocolTests()
 	test_blit_copy_texture_to_texture();
 	test_render_tile_size();
 	test_encoders_unsupported();
+	test_command_buffer_and_queue_members();
 }
