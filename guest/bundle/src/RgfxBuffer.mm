@@ -141,15 +141,33 @@
 	return _options;
 }
 
+// The modes `resourceOptions` holds: an app reads `storageMode` to tell a Managed buffer, whose
+// writes it names with didModifyRange:.
+- (MTLStorageMode)storageMode
+{
+	return static_cast<MTLStorageMode>((_options & MTLResourceStorageModeMask) >>
+	                                   MTLResourceStorageModeShift);
+}
+
+- (MTLCPUCacheMode)cpuCacheMode
+{
+	return static_cast<MTLCPUCacheMode>((_options & MTLResourceCPUCacheModeMask) >>
+	                                    MTLResourceCPUCacheModeShift);
+}
+
+- (MTLHazardTrackingMode)hazardTrackingMode
+{
+	return static_cast<MTLHazardTrackingMode>((_options & MTLResourceHazardTrackingModeMask) >>
+	                                          MTLResourceHazardTrackingModeShift);
+}
+
 - (void)didModifyRange:(NSRange)range
 {
 	// A Managed buffer's contents are its CPU copy, a region block: the host copies the range
 	// to the GPU's copy before any command buffer committed after this, on any queue
 	// (RGFX_CMD_BUFFER_DID_MODIFY_RANGE). A Shared or Private buffer has nothing to tell, as
 	// Metal does nothing for one.
-	const MTLStorageMode storage = static_cast<MTLStorageMode>(
-	    (_options & MTLResourceStorageModeMask) >> MTLResourceStorageModeShift);
-	if (storage != MTLStorageModeManaged || _ownsContents || _serializer == nullptr ||
+	if ([self storageMode] != MTLStorageModeManaged || _ownsContents || _serializer == nullptr ||
 	    range.length == 0) {
 		return;
 	}

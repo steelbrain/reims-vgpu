@@ -2338,6 +2338,9 @@ void test_managed_buffer_range()
 	                              device:nil
 	                          serializer:&fx.ser];
 	CHECK(buf != nil && [buf contents] == block.ptr);
+	CHECK([buf storageMode] == MTLStorageModeManaged &&
+	      [buf cpuCacheMode] == MTLCPUCacheModeDefaultCache &&
+	      [buf hazardTrackingMode] == MTLHazardTrackingModeDefault);
 	auto create =
 	    expectMessage<RgfxBufferOverHostMemory>(fx.ring, RGFX_CMD_BUFFER_OVER_HOST_MEMORY);
 	CHECK(create.options == static_cast<uint32_t>(managed));
