@@ -329,6 +329,20 @@ pub const RGFX_CMD_BLOCK_RELEASE: u32 = 0x2f2;
 /// the kext grants to a context whose process draws the display into it; a grant of a span that
 /// overlaps another context's block takes it from that context.
 pub const RGFX_CMD_BLOCK_GRANT: u32 = 0x2f3;
+/// `BLOCK_SHARE` ([`RgfxBlockGrant`]), on ring 0 from the accelerator kext: context `context`
+/// holds the shared region block of `size` bytes at `offset` too, beside the contexts that hold
+/// it already: the one block of an IOSurface's plane every process that holds the surface draws
+/// and samples (`guest/bundle/src/RgfxIOSurface.h`). Posted before the process learns of the
+/// block. Not answered. A span a message names may lie in it from then until the context's
+/// `BLOCK_UNSHARE` or `CONTEXT_CLOSE`. A share of a span that meets a block other than a shared
+/// one of the same offset and size takes the span from its holders, as a grant does.
+pub const RGFX_CMD_BLOCK_SHARE: u32 = 0x2f4;
+/// `BLOCK_UNSHARE` ([`RgfxBlockGrant`]), on ring 0 from the accelerator kext: context `context`
+/// no longer holds the shared block of `size` bytes at `offset`, which other contexts still hold.
+/// Posted after every message the process posted before it let the block go. Not answered. The
+/// block's last holder lets it go with a `BLOCK_RELEASE`, which ends every hold of it, and is
+/// refused while an object of any context lies in the block.
+pub const RGFX_CMD_BLOCK_UNSHARE: u32 = 0x2f5;
 
 /// Command `COMMAND_BUFFER` (a per-queue submission ring): one command buffer,
 /// its `obj_id` followed by the encoder-op byte stream. Struct and op stream in
@@ -771,6 +785,8 @@ pub struct RgfxBlockRelease {
 }
 
 /// `BLOCK_GRANT`: the kext gave context `context` the region block of `size` bytes at `offset`.
+/// `BLOCK_SHARE` and `BLOCK_UNSHARE` have its layout: context `context` holds, or no longer
+/// holds, the shared block of `size` bytes at `offset`.
 #[repr(C)]
 #[derive(
     Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,

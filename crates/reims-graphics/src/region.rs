@@ -18,7 +18,9 @@
 //! the host of each (`BLOCK_GRANT`) before the process learns of it. The region keeps which
 //! context holds each block until the block's `BLOCK_RELEASE` or the context's `CONTEXT_CLOSE`,
 //! so a span a message names is checked against the sender's own blocks ([`Region::held_by`]),
-//! on the queues' rings, which bypass the kext, as on ring 0.
+//! on the queues' rings, which bypass the kext, as on ring 0. A shared block (`BLOCK_SHARE`, an
+//! IOSurface plane's) is held by every context the kext shared it with, each until its
+//! `BLOCK_UNSHARE` or its close, and by none after the block's `BLOCK_RELEASE`.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU32, AtomicU64};
@@ -31,8 +33,18 @@ pub struct Region {
     base: *mut u8,
     /// Its length in bytes.
     len: usize,
-    /// The blocks the processes hold, by offset: each one's size and its holder's context.
-    blocks: Mutex<BTreeMap<u64, (u64, u32)>>,
+    /// The blocks the processes hold, by offset.
+    blocks: Mutex<BTreeMap<u64, Held>>,
+}
+
+/// A block's size and who holds it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Held {
+    size: u64,
+    /// Its holders' contexts: one for a granted block, any number for a shared one.
+    holders: Vec<u32>,
+    /// Whether it is a shared block (`BLOCK_SHARE`), which more contexts may join.
+    shared: bool,
 }
 
 // SAFETY: the region is plain memory the struct owns, reached only through the methods below,
@@ -83,21 +95,74 @@ impl Region {
     /// was held there.
     pub fn grant(&self, context: u32, offset: u64, size: u64) {
         let mut blocks = self.blocks.lock();
-        let end = offset.saturating_add(size);
-        blocks.retain(|&at, &mut (held, _)| at.saturating_add(held) <= offset || end <= at);
-        blocks.insert(offset, (size, context));
+        Self::clear(&mut blocks, offset, size);
+        blocks.insert(
+            offset,
+            Held {
+                size,
+                holders: vec![context],
+                shared: false,
+            },
+        );
     }
 
-    /// The block at `offset` is no longer its holder's to name (`BLOCK_RELEASE`).
+    /// Context `context` holds the shared block of `size` bytes at `offset` too (`BLOCK_SHARE`),
+    /// beside its holders; a span that meets any other block takes it from its holders, as a
+    /// grant does.
+    pub fn share(&self, context: u32, offset: u64, size: u64) {
+        let mut blocks = self.blocks.lock();
+        if let Some(held) = blocks.get_mut(&offset) {
+            if held.shared && held.size == size {
+                if !held.holders.contains(&context) {
+                    held.holders.push(context);
+                }
+                return;
+            }
+        }
+        Self::clear(&mut blocks, offset, size);
+        blocks.insert(
+            offset,
+            Held {
+                size,
+                holders: vec![context],
+                shared: true,
+            },
+        );
+    }
+
+    /// Context `context` no longer holds the shared block of `size` bytes at `offset`
+    /// (`BLOCK_UNSHARE`); its other holders keep it. Nothing where no such block is shared.
+    pub fn unshare(&self, context: u32, offset: u64, size: u64) {
+        let mut blocks = self.blocks.lock();
+        if let Some(held) = blocks.get_mut(&offset) {
+            if held.shared && held.size == size {
+                held.holders.retain(|&c| c != context);
+                if held.holders.is_empty() {
+                    blocks.remove(&offset);
+                }
+            }
+        }
+    }
+
+    /// Drops every block that meets the `size` bytes at `offset`.
+    fn clear(blocks: &mut BTreeMap<u64, Held>, offset: u64, size: u64) {
+        let end = offset.saturating_add(size);
+        blocks.retain(|&at, held| at.saturating_add(held.size) <= offset || end <= at);
+    }
+
+    /// The block at `offset` is no longer anyone's to name (`BLOCK_RELEASE`): its holder's, or
+    /// every holder's of a shared one.
     pub fn revoke(&self, offset: u64) {
         self.blocks.lock().remove(&offset);
     }
 
-    /// No block is context `context`'s any more (`CONTEXT_CLOSE`).
+    /// No block is context `context`'s any more (`CONTEXT_CLOSE`): a block only it holds goes,
+    /// and a shared block's other holders keep it.
     pub fn revoke_context(&self, context: u32) {
-        self.blocks
-            .lock()
-            .retain(|_, &mut (_, holder)| holder != context);
+        self.blocks.lock().retain(|_, held| {
+            held.holders.retain(|&c| c != context);
+            !held.holders.is_empty()
+        });
     }
 
     /// Whether the `len` bytes at `offset` lie in one block context `context` holds.
@@ -115,15 +180,15 @@ impl Region {
         self.read(offset, len)
     }
 
-    fn in_held(blocks: &BTreeMap<u64, (u64, u32)>, context: u32, offset: u64, len: u64) -> bool {
+    fn in_held(blocks: &BTreeMap<u64, Held>, context: u32, offset: u64, len: u64) -> bool {
         blocks
             .range(..=offset)
             .next_back()
-            .is_some_and(|(&at, &(size, holder))| {
-                holder == context
+            .is_some_and(|(&at, held)| {
+                held.holders.contains(&context)
                     && offset
                         .checked_add(len)
-                        .is_some_and(|end| end <= at.saturating_add(size))
+                        .is_some_and(|end| end <= at.saturating_add(held.size))
             })
     }
 
@@ -222,6 +287,54 @@ mod tests {
         assert!(region.read(64 * 1024 - 2, 3).is_none());
         assert!(region.read(u64::MAX, 1).is_none());
         assert!(Region::new(0).is_none());
+    }
+
+    /// A shared block is held by each context it is shared with until that context lets it go
+    /// or closes, and by none after its release; a grant over it takes it from them all.
+    #[test]
+    fn a_shared_block_is_each_holder_s_until_it_lets_it_go() {
+        let region = Region::new(1 << 20).unwrap();
+        region.share(1, 0x1_0000, 0x2000);
+        region.share(2, 0x1_0000, 0x2000);
+        region.share(2, 0x1_0000, 0x2000);
+        assert!(region.held_by(1, 0x1_0000, 0x2000));
+        assert!(region.held_by(2, 0x1_1000, 0x1000));
+        assert!(!region.held_by(3, 0x1_0000, 0x10));
+        assert!(!region.held_by(2, 0x1_1000, 0x1001));
+        // One holder lets it go; the other keeps it.
+        region.unshare(1, 0x1_0000, 0x2000);
+        assert!(!region.held_by(1, 0x1_0000, 0x10));
+        assert!(region.held_by(2, 0x1_0000, 0x10));
+        // An unshare of another size, or of a granted block, changes nothing.
+        region.grant(4, 0x4_0000, 0x1000);
+        region.unshare(4, 0x4_0000, 0x1000);
+        region.unshare(2, 0x1_0000, 0x1000);
+        assert!(region.held_by(4, 0x4_0000, 0x1000));
+        assert!(region.held_by(2, 0x1_0000, 0x10));
+        // A context's close ends its holds; the block goes with its last holder.
+        region.share(3, 0x1_0000, 0x2000);
+        region.revoke_context(2);
+        assert!(!region.held_by(2, 0x1_0000, 0x10));
+        assert!(region.held_by(3, 0x1_0000, 0x10));
+        // Its release ends every hold.
+        region.share(5, 0x1_0000, 0x2000);
+        region.revoke(0x1_0000);
+        assert!(!region.held_by(3, 0x1_0000, 0x10));
+        assert!(!region.held_by(5, 0x1_0000, 0x10));
+        // A share over a granted block, or a grant over a shared one, takes the span.
+        region.share(6, 0x4_0000, 0x1000);
+        assert!(!region.held_by(4, 0x4_0000, 0x10));
+        assert!(region.held_by(6, 0x4_0000, 0x10));
+        region.share(7, 0x4_0000, 0x1000);
+        region.grant(8, 0x4_0000, 0x2000);
+        assert!(!region.held_by(6, 0x4_0000, 0x10));
+        assert!(!region.held_by(7, 0x4_0000, 0x10));
+        assert!(region.held_by(8, 0x4_1000, 0x1000));
+        // A share of another size at a shared block's offset starts the block anew.
+        region.share(1, 0x8_0000, 0x1000);
+        region.share(2, 0x8_0000, 0x2000);
+        assert!(!region.held_by(1, 0x8_0000, 0x10));
+        assert!(region.held_by(2, 0x8_1000, 0x1000));
     }
 
     /// The process's peak resident size in bytes: `ru_maxrss` is in bytes on macOS and in KiB

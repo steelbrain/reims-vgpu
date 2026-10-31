@@ -63,8 +63,9 @@ pub(crate) fn is_lifecycle(message: &Message) -> bool {
 /// service, which drops its handle; a `CONTEXT_CLOSE` ends the context's queues and has the host
 /// drop its objects, and the host answers it once the context's command buffers have finished; a
 /// `BLOCK_RELEASE` is refused where a live queue's ring lies in the block, and else the host answers
-/// it; a `BLOCK_GRANT` is kept with the region (`Region::grant`). Every other message goes to the
-/// host's decoder.
+/// it; a `BLOCK_GRANT` is kept with the region (`Region::grant`), and so are a `BLOCK_SHARE` and a
+/// `BLOCK_UNSHARE` (`Region::share`, `Region::unshare`). Every other message goes to the host's
+/// decoder.
 pub(crate) fn lifecycle(shared: &Shared, message: &Message) -> Option<Vec<u8>> {
     let seqno = message.header.seqno;
     match message.header.r#type {
@@ -95,6 +96,12 @@ pub(crate) fn lifecycle(shared: &Shared, message: &Message) -> Option<Vec<u8>> {
         RGFX_CMD_BLOCK_GRANT => {
             if let Some(grant) = read::<RgfxBlockGrant>(message) {
                 shared.grant_block(&grant);
+            }
+            None
+        }
+        RGFX_CMD_BLOCK_SHARE | RGFX_CMD_BLOCK_UNSHARE => {
+            if let Some(share) = read::<RgfxBlockGrant>(message) {
+                shared.share_block(&share, message.header.r#type == RGFX_CMD_BLOCK_SHARE);
             }
             None
         }

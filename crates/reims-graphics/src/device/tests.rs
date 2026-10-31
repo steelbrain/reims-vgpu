@@ -1168,8 +1168,39 @@ fn a_block_grant_is_kept_in_the_blocks_or_the_scanout() {
     assert!(!rig.region().held_by(10, SCANOUT, 0x1000));
 }
 
-/// A `BLOCK_GRANT` or `BLOCK_RELEASE` (their layouts are one) of `type` for `context`'s block of
-/// `size` bytes at `offset`.
+/// A `BLOCK_SHARE` makes each context it names a holder of the shared block, in the processes'
+/// blocks only; a `BLOCK_UNSHARE` ends one context's hold and leaves the others', and the block's
+/// `BLOCK_RELEASE` ends every hold.
+#[test]
+fn a_shared_block_is_held_by_each_context_it_is_shared_with() {
+    let mut rig = Rig::new();
+    rig.start();
+    const BLOCK: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x40_0000;
+    const SCANOUT: u64 = RGFX_ALLOCATIONS_OFFSET;
+    for context in [5, 6] {
+        rig.send(block_message(RGFX_CMD_BLOCK_SHARE, context, BLOCK, 0x2_0000));
+    }
+    rig.send(block_message(RGFX_CMD_BLOCK_SHARE, 7, SCANOUT, 0x1000));
+    let seqno = rig.send(context_close(99));
+    assert_eq!(rig.complete(), (seqno, RGFX_STATUS_OK));
+    let region = rig.region();
+    assert!(region.held_by(5, BLOCK, 0x2_0000));
+    assert!(region.held_by(6, BLOCK + 0x1_0000, 0x1_0000));
+    assert!(!region.held_by(7, SCANOUT, 0x1000));
+
+    rig.send(block_message(RGFX_CMD_BLOCK_UNSHARE, 5, BLOCK, 0x2_0000));
+    let seqno = rig.send(context_close(99));
+    assert_eq!(rig.complete(), (seqno, RGFX_STATUS_OK));
+    assert!(!rig.region().held_by(5, BLOCK, 0x1000));
+    assert!(rig.region().held_by(6, BLOCK, 0x1000));
+
+    let seqno = rig.send(block_message(RGFX_CMD_BLOCK_RELEASE, 6, BLOCK, 0x2_0000));
+    assert_eq!(rig.complete(), (seqno, RGFX_STATUS_OK));
+    assert!(!rig.region().held_by(6, BLOCK, 0x1000));
+}
+
+/// A `BLOCK_GRANT`, `BLOCK_SHARE`, `BLOCK_UNSHARE` or `BLOCK_RELEASE` (their layouts are one) of
+/// `type` for `context`'s block of `size` bytes at `offset`.
 fn block_message(r#type: u32, context: u32, offset: u64, size: u64) -> Vec<u8> {
     RgfxBlockGrant {
         header: RgfxMsgHeader {

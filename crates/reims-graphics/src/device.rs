@@ -752,6 +752,28 @@ impl Shared {
         self.region.grant(grant.context, grant.offset, grant.size);
     }
 
+    /// `BLOCK_SHARE` and `BLOCK_UNSHARE`: the region keeps, or ends, the context's hold of the
+    /// shared block, where it lies in the processes' part of the region.
+    pub(crate) fn share_block(&self, share: &RgfxBlockGrant, holds: bool) {
+        let end = self.region.size().saturating_sub(RGFX_CURSOR_SPAN);
+        if share.offset < RGFX_CONTEXT_ALLOCATIONS_OFFSET
+            || share.offset.checked_add(share.size).is_none_or(|e| e > end)
+        {
+            log::warn!(
+                target: "reims_graphics",
+                "a {} of {:#x} bytes at {:#x} lies outside the processes' blocks: ignored",
+                if holds { "BLOCK_SHARE" } else { "BLOCK_UNSHARE" },
+                share.size, share.offset
+            );
+            return;
+        }
+        if holds {
+            self.region.share(share.context, share.offset, share.size);
+        } else {
+            self.region.unshare(share.context, share.offset, share.size);
+        }
+    }
+
     /// Whether a live queue's submission or completion ring lies in the `size` bytes at `offset`
     /// (a `BLOCK_RELEASE` of a block that holds one is refused).
     pub(crate) fn rings_in(&self, offset: u64, size: u64) -> bool {
