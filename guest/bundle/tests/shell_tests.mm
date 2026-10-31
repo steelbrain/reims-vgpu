@@ -845,6 +845,7 @@ void test_render_pipeline_routing()
 	desc.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
 	desc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
 	desc.alphaToCoverageEnabled = YES;
+	desc.supportIndirectCommandBuffers = YES;
 
 	MTLVertexDescriptor *vd = [MTLVertexDescriptor vertexDescriptor];
 	vd.layouts[0].stride = 32;
@@ -883,6 +884,7 @@ void test_render_pipeline_routing()
 	CHECK(head.depth_pixel_format == static_cast<uint32_t>(MTLPixelFormatDepth32Float));
 	CHECK((head.flags & RGFX_RENDER_PIPELINE_ALPHA_TO_COVERAGE) != 0);
 	CHECK((head.flags & RGFX_RENDER_PIPELINE_RASTERIZATION_ENABLED) != 0); // default on
+	CHECK((head.flags & RGFX_RENDER_PIPELINE_SUPPORT_ICB) != 0);
 
 	// The functions, label and vertex descriptor are in the tail at their offsets.
 	CHECK(head.vertex_name_len == 5);

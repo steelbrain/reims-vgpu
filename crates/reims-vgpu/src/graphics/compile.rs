@@ -118,6 +118,13 @@ impl CompilePool {
     pub(crate) fn release(&self) {
         self.gate.set(true);
     }
+
+    /// Lets the threads go: every compile from then on runs where it is handed over, as with a
+    /// pool no thread started for (tests only).
+    #[cfg(test)]
+    pub(crate) fn stop(&self) {
+        *self.sender.lock() = None;
+    }
 }
 
 /// The next compile from the shared queue; `None` once the pool is gone.

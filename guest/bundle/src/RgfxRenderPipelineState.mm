@@ -149,6 +149,8 @@ bool fillFunctionRef(RgfxFunctionRef &fr, id<MTLFunction> fn)
 		flags |= RGFX_RENDER_PIPELINE_ALPHA_TO_ONE;
 	if (descriptor.isRasterizationEnabled)
 		flags |= RGFX_RENDER_PIPELINE_RASTERIZATION_ENABLED;
+	if (descriptor.supportIndirectCommandBuffers)
+		flags |= RGFX_RENDER_PIPELINE_SUPPORT_ICB;
 	p.flags = flags;
 	p.input_primitive_topology = static_cast<uint32_t>(descriptor.inputPrimitiveTopology);
 	p.max_vertex_amplification_count =

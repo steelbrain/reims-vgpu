@@ -1170,6 +1170,9 @@
 // pipeline rasterizes; a vertex-only pipeline clears it).
 #define RGFX_RENDER_PIPELINE_RASTERIZATION_ENABLED (1 << 2)
 
+// [`RgfxRenderPipelineCreate`] `flags`: `supportIndirectCommandBuffers`.
+#define RGFX_RENDER_PIPELINE_SUPPORT_ICB (1 << 3)
+
 // [`RgfxComputePipelineCreate`] `flags`:
 // `threadGroupSizeIsMultipleOfThreadExecutionWidth`.
 #define RGFX_COMPUTE_PIPELINE_TG_MULTIPLE_OF_EXEC_WIDTH (1 << 0)

@@ -1819,6 +1819,8 @@ pub const RGFX_RENDER_PIPELINE_ALPHA_TO_ONE: u32 = 1 << 1;
 /// [`RgfxRenderPipelineCreate`] `flags`: `rasterizationEnabled` (set when the
 /// pipeline rasterizes; a vertex-only pipeline clears it).
 pub const RGFX_RENDER_PIPELINE_RASTERIZATION_ENABLED: u32 = 1 << 2;
+/// [`RgfxRenderPipelineCreate`] `flags`: `supportIndirectCommandBuffers`.
+pub const RGFX_RENDER_PIPELINE_SUPPORT_ICB: u32 = 1 << 3;
 
 /// [`RgfxComputePipelineCreate`] `flags`:
 /// `threadGroupSizeIsMultipleOfThreadExecutionWidth`.

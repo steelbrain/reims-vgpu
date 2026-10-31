@@ -48,19 +48,23 @@ use reims_graphics::wire::{
     RGFX_CMD_QUEUE_CREATE, RGFX_CMD_RENDER_PIPELINE_CREATE, RGFX_CMD_RESOURCE_ID_CHUNK,
     RGFX_CMD_SAMPLER_CREATE, RGFX_CMD_SHARED_EVENT_CREATE, RGFX_CMD_TEXTURE_CREATE,
     RGFX_CMD_TEXTURE_FROM_BUFFER, RGFX_CMD_TEXTURE_FROM_IOSURFACE, RGFX_CMD_TEXTURE_REPLACE_REGION,
-    RGFX_CMD_TEXTURE_VIEW, RGFX_CONTEXT_ALLOCATIONS_OFFSET, RGFX_CONTEXT_OBJ_ID_SHIFT,
-    RGFX_CURSOR_SPAN, RGFX_EVT_PIPELINE_REFLECTION, RGFX_EVT_SAMPLER_STATE,
-    RGFX_EVT_SIZE_AND_ALIGN, RGFX_PIPELINE_KIND_COMPUTE, RGFX_PIPELINE_KIND_RENDER,
-    RGFX_PIPELINE_OK, RGFX_PIPELINE_REFLECT_SUPPORT_ICB,
-    RGFX_PIPELINE_REFLECT_THREADGROUP_MATCHES_TILE, RGFX_PIPELINE_REFUSED, RGFX_RESOURCE_ID_CHUNK,
-    RGFX_RESOURCE_ID_CHUNKS, RGFX_RESOURCE_ID_LIMIT, RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK,
-    RGFX_STATUS_REFUSED, RgfxBufferAtOffset, RgfxBufferCreate, RgfxBufferOverHostMemory,
-    RgfxCbComplete, RgfxColorAttachmentDesc, RgfxComputePipelineCreate, RgfxDepthStencilCreate,
-    RgfxFunctionConstant, RgfxHeapCreate, RgfxHeapOverHostMemory, RgfxHeapTextureSizeAndAlign,
-    RgfxMsgHeader, RgfxObjectCreate, RgfxObjectDestroy, RgfxPipelineReflection, RgfxQueueCreate,
-    RgfxRenderPipelineCreate, RgfxResourceIdChunk, RgfxSamplerCreate, RgfxSamplerState,
-    RgfxSharedEventCreate, RgfxSizeAndAlign, RgfxStencilDescriptor, RgfxTextureCreate,
-    RgfxTextureDescriptor, RgfxTextureFromBuffer, RgfxTextureFromIOSurface,
+    RGFX_CMD_TEXTURE_VIEW, RGFX_COMPUTE_PIPELINE_SUPPORT_ICB,
+    RGFX_COMPUTE_PIPELINE_TG_MULTIPLE_OF_EXEC_WIDTH, RGFX_CONTEXT_ALLOCATIONS_OFFSET,
+    RGFX_CONTEXT_OBJ_ID_SHIFT, RGFX_CURSOR_SPAN, RGFX_EVT_PIPELINE_REFLECTION,
+    RGFX_EVT_SAMPLER_STATE, RGFX_EVT_SIZE_AND_ALIGN, RGFX_PIPELINE_KIND_COMPUTE,
+    RGFX_PIPELINE_KIND_RENDER, RGFX_PIPELINE_OK, RGFX_PIPELINE_REFLECT_SUPPORT_ICB,
+    RGFX_PIPELINE_REFLECT_THREADGROUP_MATCHES_TILE, RGFX_PIPELINE_REFUSED,
+    RGFX_RENDER_PIPELINE_ALPHA_TO_COVERAGE, RGFX_RENDER_PIPELINE_ALPHA_TO_ONE,
+    RGFX_RENDER_PIPELINE_RASTERIZATION_ENABLED, RGFX_RENDER_PIPELINE_SUPPORT_ICB,
+    RGFX_RESOURCE_ID_CHUNK, RGFX_RESOURCE_ID_CHUNKS, RGFX_RESOURCE_ID_LIMIT,
+    RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK, RGFX_STATUS_REFUSED, RgfxBufferAtOffset,
+    RgfxBufferCreate, RgfxBufferOverHostMemory, RgfxCbComplete, RgfxColorAttachmentDesc,
+    RgfxComputePipelineCreate, RgfxDepthStencilCreate, RgfxFunctionConstant, RgfxHeapCreate,
+    RgfxHeapOverHostMemory, RgfxHeapTextureSizeAndAlign, RgfxMsgHeader, RgfxObjectCreate,
+    RgfxObjectDestroy, RgfxPipelineReflection, RgfxQueueCreate, RgfxRenderPipelineCreate,
+    RgfxResourceIdChunk, RgfxSamplerCreate, RgfxSamplerState, RgfxSharedEventCreate,
+    RgfxSizeAndAlign, RgfxStencilDescriptor, RgfxTextureCreate, RgfxTextureDescriptor,
+    RgfxTextureFromBuffer, RgfxTextureFromIOSurface, RgfxVertexAttribute, RgfxVertexBufferLayout,
 };
 use reims_vgpu_core::host::HostPtr;
 use reims_vgpu_core::platform::device::GpuDevice;
@@ -69,13 +73,14 @@ use reims_vgpu_core::platform::resource::{
 };
 use reims_vgpu_core::platform::types::Swizzle;
 use reims_vgpu_core::platform::values::{
-    BufferDesc, DepthStencilDesc, HeapDesc, OptionSet, RenderPipelineDesc, SamplerDesc,
-    StencilDesc, TextureDesc,
+    AttributeDesc, BufferDesc, BufferLayoutDesc, ColorAttachmentDesc, DepthStencilDesc,
+    FullComputePipelineDesc, FullRenderPipelineDesc, HeapDesc, OptionSet, SamplerDesc, StencilDesc,
+    TextureDesc, VertexDesc,
 };
 use reims_vgpu_core::platform::{Handle, HostRange, Platform};
 use reims_vgpu_core::raise::{OnFault, Raise, RaiseResult, refusals};
 use reims_vgpu_core::sync::Mutex;
-use zerocopy::FromBytes;
+use zerocopy::{FromBytes, Immutable, KnownLayout};
 
 /// Metal's page on Apple silicon, to which a Shared heap's memory is rounded up: the guest's
 /// block holds it whole ([`RGFX_CMD_HEAP_OVER_HOST_MEMORY`]).
@@ -973,21 +978,22 @@ impl<P: Platform> GraphicsDecoder<P> {
     }
 
     /// The first step of a pipeline create, with the table at hand: its libraries resolved from
-    /// the table, its entry points, constants and descriptor fields read from the message, so the
+    /// the table, its entry points, constants and whole descriptor read from the message, so the
     /// compile needs nothing of the decoder's. A library reference that names no library is a
     /// guest protocol error, as the other creates treat one ([`DecodeError::BadReference`]); a
-    /// span the message does not cover, or a name that is not UTF-8, is
-    /// [`DecodeError::Malformed`]. Neither is answered.
+    /// span the message does not cover, a name that is not UTF-8, more than eight colour
+    /// attachments, or a vertex buffer or attribute index past Metal's last (30), is
+    /// [`DecodeError::Malformed`]. Neither is answered. A render create naming library 0 and no
+    /// name for its fragment function has none (a pipeline that does not rasterize).
     ///
-    /// The render form carries the vertex and fragment functions, colour attachment 0's pixel
-    /// format and the one source-over blend [`RenderPipelineDesc`] can express, and a label; the
-    /// rest of the wire descriptor (colour attachments 1..8, arbitrary blend state,
-    /// depth/stencil formats, the raster sample count, the vertex descriptor and the pipeline
-    /// flags) has no place in that value and is not applied. The compute form applies only the
-    /// function; its flags and limits are not applied. Each function is specialised by the
-    /// index-keyed constants the wire carries for it. The full path is Metal's
-    /// serialized-descriptor deserializer, which is the Apple lane's; carrying the whole
-    /// descriptor on the wire keeps the guest ABI stable for when the platform value grows.
+    /// Every field the wire carries reaches the platform's creator: the render form's functions,
+    /// vertex descriptor, colour attachments (format, blending, factors, operations, write mask),
+    /// depth and stencil formats, raster sample count, alpha-to-coverage and alpha-to-one,
+    /// rasterization, input primitive topology, maximum vertex amplification count and indirect
+    /// command buffer support, and its label; the compute form's function, threadgroup-size
+    /// multiple, maximum threads per threadgroup, maximum call stack depth and indirect command
+    /// buffer support. Each function is specialised by the index-keyed constants the wire carries
+    /// for it.
     pub(crate) fn prepare_pipeline(&self, message: &[u8]) -> Result<PipelineJob<P>, DecodeError> {
         let library = |obj_id: u64| self.library_ref(obj_id);
         let header = read::<RgfxMsgHeader>(message).ok_or(DecodeError::Malformed)?;
@@ -1005,18 +1011,44 @@ impl<P: Platform> GraphicsDecoder<P> {
                     library,
                     name: name.to_owned(),
                     constants,
+                    fields: ComputeFields {
+                        threadgroup_size_is_multiple_of_execution_width: m.flags
+                            & RGFX_COMPUTE_PIPELINE_TG_MULTIPLE_OF_EXEC_WIDTH
+                            != 0,
+                        max_total_threads_per_threadgroup: m
+                            .max_total_threads_per_threadgroup
+                            .into(),
+                        max_call_stack_depth: m.max_call_stack_depth.into(),
+                        support_indirect_command_buffers: m.flags
+                            & RGFX_COMPUTE_PIPELINE_SUPPORT_ICB
+                            != 0,
+                    },
                 },
             });
         }
         let m = read::<RgfxRenderPipelineCreate>(message).ok_or(DecodeError::Malformed)?;
-        // Both function libraries (which may be the same).
         let vertex_library = library(m.vertex_library_obj_id)?;
-        let fragment_library = library(m.fragment_library_obj_id)?;
-        let (Some(vertex_name), Some(fragment_name)) = (
-            str_tail(message, m.vertex_name_offset, m.vertex_name_len),
-            str_tail(message, m.fragment_name_offset, m.fragment_name_len),
-        ) else {
-            return Err(DecodeError::Malformed);
+        let vertex_name = str_tail(message, m.vertex_name_offset, m.vertex_name_len)
+            .ok_or(DecodeError::Malformed)?;
+        let vertex_constants =
+            constants_tail(message, m.vertex_constants_offset, m.vertex_constant_count)
+                .ok_or(DecodeError::Malformed)?;
+        let fragment = if m.fragment_library_obj_id == 0 && m.fragment_name_len == 0 {
+            None
+        } else {
+            let name = str_tail(message, m.fragment_name_offset, m.fragment_name_len)
+                .ok_or(DecodeError::Malformed)?;
+            let constants = constants_tail(
+                message,
+                m.fragment_constants_offset,
+                m.fragment_constant_count,
+            )
+            .ok_or(DecodeError::Malformed)?;
+            Some((
+                library(m.fragment_library_obj_id)?,
+                name.to_owned(),
+                constants,
+            ))
         };
         let label = if m.label_len == 0 {
             None
@@ -1027,16 +1059,6 @@ impl<P: Platform> GraphicsDecoder<P> {
                     .to_owned(),
             )
         };
-        let (Some(vertex_constants), Some(fragment_constants)) = (
-            constants_tail(message, m.vertex_constants_offset, m.vertex_constant_count),
-            constants_tail(
-                message,
-                m.fragment_constants_offset,
-                m.fragment_constant_count,
-            ),
-        ) else {
-            return Err(DecodeError::Malformed);
-        };
         Ok(PipelineJob {
             obj_id: m.obj_id,
             seqno: m.header.seqno,
@@ -1044,12 +1066,9 @@ impl<P: Platform> GraphicsDecoder<P> {
                 vertex_library,
                 vertex_name: vertex_name.to_owned(),
                 vertex_constants,
-                fragment_library,
-                fragment_name: fragment_name.to_owned(),
-                fragment_constants,
+                fragment,
                 label,
-                color0_pixel_format: m.colors[0].pixel_format.into(),
-                blend_over: is_source_over(&m.colors[0]),
+                fields: render_fields(message, &m)?,
             },
         })
     }
@@ -1091,18 +1110,132 @@ enum PipelineShape<P: Platform> {
         vertex_library: LibraryRef<P>,
         vertex_name: String,
         vertex_constants: Vec<FunctionConstant>,
-        fragment_library: LibraryRef<P>,
-        fragment_name: String,
-        fragment_constants: Vec<FunctionConstant>,
+        /// The fragment function's library, name and constants; `None` for none.
+        fragment: Option<(LibraryRef<P>, String, Vec<FunctionConstant>)>,
         label: Option<String>,
-        color0_pixel_format: u64,
-        blend_over: bool,
+        fields: RenderFields,
     },
     Compute {
         library: LibraryRef<P>,
         name: String,
         constants: Vec<FunctionConstant>,
+        fields: ComputeFields,
     },
+}
+
+/// A render pipeline create's descriptor past its functions and label, owned: the fields of
+/// [`FullRenderPipelineDesc`] the compile hands the platform with them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RenderFields {
+    vertex_descriptor: Option<VertexDesc>,
+    colors: Vec<(u64, ColorAttachmentDesc)>,
+    depth_pixel_format: u64,
+    stencil_pixel_format: u64,
+    raster_sample_count: u64,
+    alpha_to_coverage: bool,
+    alpha_to_one: bool,
+    rasterization_enabled: bool,
+    input_primitive_topology: u64,
+    max_vertex_amplification_count: u64,
+    support_indirect_command_buffers: bool,
+}
+
+/// A compute pipeline create's descriptor past its function: the fields of
+/// [`FullComputePipelineDesc`] the compile hands the platform with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ComputeFields {
+    threadgroup_size_is_multiple_of_execution_width: bool,
+    max_total_threads_per_threadgroup: u64,
+    max_call_stack_depth: u64,
+    support_indirect_command_buffers: bool,
+}
+
+/// The highest vertex buffer and attribute index Metal's arrays hold: a larger one raises there.
+const LAST_VERTEX_INDEX: u32 = 30;
+
+/// A render create's descriptor fields ([`RenderFields`]): the colour attachments in use, the
+/// vertex descriptor's runs from the tail (none where it carries neither layouts nor
+/// attributes), and the rest from the head.
+fn render_fields(
+    message: &[u8],
+    m: &RgfxRenderPipelineCreate,
+) -> Result<RenderFields, DecodeError> {
+    let in_use = usize::try_from(m.color_attachment_count)
+        .ok()
+        .filter(|&n| n <= m.colors.len())
+        .ok_or(DecodeError::Malformed)?;
+    let colors = m.colors[..in_use]
+        .iter()
+        .zip(0u64..)
+        .map(|(c, index)| (index, color_attachment(c)))
+        .collect();
+    let layouts = records_tail::<RgfxVertexBufferLayout>(
+        message,
+        m.vertex_layouts_offset,
+        m.vertex_layout_count,
+    )
+    .ok_or(DecodeError::Malformed)?;
+    let attributes = records_tail::<RgfxVertexAttribute>(
+        message,
+        m.vertex_attributes_offset,
+        m.vertex_attribute_count,
+    )
+    .ok_or(DecodeError::Malformed)?;
+    let past_last = layouts.iter().any(|l| l.buffer_index > LAST_VERTEX_INDEX)
+        || attributes
+            .iter()
+            .any(|a| a.attribute_index > LAST_VERTEX_INDEX || a.buffer_index > LAST_VERTEX_INDEX);
+    if past_last {
+        return Err(DecodeError::Malformed);
+    }
+    let vertex_descriptor = (!layouts.is_empty() || !attributes.is_empty()).then(|| VertexDesc {
+        layouts: layouts
+            .iter()
+            .map(|l| BufferLayoutDesc {
+                buffer_index: l.buffer_index.into(),
+                stride: l.stride.into(),
+                step_function: l.step_function.into(),
+                step_rate: l.step_rate.into(),
+            })
+            .collect(),
+        attributes: attributes
+            .iter()
+            .map(|a| AttributeDesc {
+                attribute_index: a.attribute_index.into(),
+                format: a.format.into(),
+                offset: a.offset.into(),
+                buffer_index: a.buffer_index.into(),
+            })
+            .collect(),
+    });
+    Ok(RenderFields {
+        vertex_descriptor,
+        colors,
+        depth_pixel_format: m.depth_pixel_format.into(),
+        stencil_pixel_format: m.stencil_pixel_format.into(),
+        raster_sample_count: m.raster_sample_count.into(),
+        alpha_to_coverage: m.flags & RGFX_RENDER_PIPELINE_ALPHA_TO_COVERAGE != 0,
+        alpha_to_one: m.flags & RGFX_RENDER_PIPELINE_ALPHA_TO_ONE != 0,
+        rasterization_enabled: m.flags & RGFX_RENDER_PIPELINE_RASTERIZATION_ENABLED != 0,
+        input_primitive_topology: m.input_primitive_topology.into(),
+        max_vertex_amplification_count: m.max_vertex_amplification_count.into(),
+        support_indirect_command_buffers: m.flags & RGFX_RENDER_PIPELINE_SUPPORT_ICB != 0,
+    })
+}
+
+/// A colour attachment of the wire as the platform's value: each field its own.
+fn color_attachment(c: &RgfxColorAttachmentDesc) -> ColorAttachmentDesc {
+    ColorAttachmentDesc {
+        pixel_format: c.pixel_format.into(),
+        blending_enabled: c.blending_enabled != 0,
+        source_rgb_blend_factor: c.source_rgb_blend_factor.into(),
+        destination_rgb_blend_factor: c.destination_rgb_blend_factor.into(),
+        rgb_blend_operation: c.rgb_blend_operation.into(),
+        source_alpha_blend_factor: c.source_alpha_blend_factor.into(),
+        destination_alpha_blend_factor: c.destination_alpha_blend_factor.into(),
+        alpha_blend_operation: c.alpha_blend_operation.into(),
+        write_mask: c.write_mask.into(),
+    }
 }
 
 /// A compiled pipeline create: the pipeline (none where it was refused) and the reflection reply
@@ -1171,41 +1304,50 @@ pub(crate) fn compile_pipeline<P: Platform>(
             vertex_library,
             vertex_name,
             vertex_constants,
-            fragment_library,
-            fragment_name,
-            fragment_constants,
+            fragment,
             label,
-            color0_pixel_format,
-            blend_over,
+            fields,
         } => {
             // A library being made is waited for here; one the platform refused refuses the
             // pipeline.
             let Some(vertex_library) = vertex_library.resolve() else {
                 return Ok(refused(no_library("vertex")));
             };
-            let Some(fragment_library) = fragment_library.resolve() else {
-                return Ok(refused(no_library("fragment")));
-            };
             let Some(vertex) = specialised::<P>(&vertex_library, &vertex_name, &vertex_constants)?
             else {
                 return Ok(refused(no_function(&vertex_name)));
             };
-            let Some(fragment) =
-                specialised::<P>(&fragment_library, &fragment_name, &fragment_constants)?
-            else {
-                return Ok(refused(no_function(&fragment_name)));
+            let fragment = match fragment {
+                None => None,
+                Some((library, name, constants)) => {
+                    let Some(library) = library.resolve() else {
+                        return Ok(refused(no_library("fragment")));
+                    };
+                    let Some(function) = specialised::<P>(&library, &name, &constants)? else {
+                        return Ok(refused(no_function(&name)));
+                    };
+                    Some(function)
+                }
             };
-            let desc = RenderPipelineDesc::<P> {
+            let desc = FullRenderPipelineDesc::<P> {
                 label: label.as_deref(),
                 vertex: &vertex,
-                fragment: &fragment,
-                color0_pixel_format,
-                blend_over,
-                resource_index: None,
+                fragment: fragment.as_ref(),
+                vertex_descriptor: fields.vertex_descriptor,
+                colors: fields.colors,
+                depth_pixel_format: fields.depth_pixel_format,
+                stencil_pixel_format: fields.stencil_pixel_format,
+                raster_sample_count: fields.raster_sample_count,
+                alpha_to_coverage: fields.alpha_to_coverage,
+                alpha_to_one: fields.alpha_to_one,
+                rasterization_enabled: fields.rasterization_enabled,
+                input_primitive_topology: fields.input_primitive_topology,
+                max_vertex_amplification_count: fields.max_vertex_amplification_count,
+                support_indirect_command_buffers: fields.support_indirect_command_buffers,
             };
-            // `new_render_pipeline_state` returns a plain `Result` (no path reaches it under a
-            // handler in the Apple lane); a nil state or an `NSError` refuses.
-            Ok(match device.new_render_pipeline_state(&desc) {
+            // A nil state or an `NSError` refuses; a refusal Metal answers with none dies at the
+            // send, inside the caller's refusal scope.
+            Ok(match device.new_render_pipeline_state_full(&desc) {
                 Ok(Some(pipeline)) => {
                     let reflection = render_reflection::<P>(&pipeline, seqno, obj_id);
                     CompiledPipeline::made(obj_id, ObjHandle::RenderPipeline(pipeline), reflection)
@@ -1218,6 +1360,7 @@ pub(crate) fn compile_pipeline<P: Platform>(
             library,
             name,
             constants,
+            fields,
         } => {
             let Some(library) = library.resolve() else {
                 return Ok(refused(no_library("kernel")));
@@ -1225,20 +1368,24 @@ pub(crate) fn compile_pipeline<P: Platform>(
             let Some(function) = specialised::<P>(&library, &name, &constants)? else {
                 return Ok(refused(no_function(&name)));
             };
-            Ok(
-                match device.new_compute_pipeline_state_for_function(Some(&function)) {
-                    Ok(Some(pipeline)) => {
-                        let reflection = compute_reflection::<P>(&pipeline, seqno, obj_id);
-                        CompiledPipeline::made(
-                            obj_id,
-                            ObjHandle::ComputePipeline(pipeline),
-                            reflection,
-                        )
-                    }
-                    Ok(None) => refused("the platform answered nil".to_owned()),
-                    Err(e) => refused(format!("the platform answered an error: {}", e.description)),
-                },
-            )
+            let desc = FullComputePipelineDesc::<P> {
+                label: None,
+                function: &function,
+                threadgroup_size_is_multiple_of_execution_width: fields
+                    .threadgroup_size_is_multiple_of_execution_width,
+                max_total_threads_per_threadgroup: fields.max_total_threads_per_threadgroup,
+                max_call_stack_depth: fields.max_call_stack_depth,
+                support_indirect_command_buffers: fields.support_indirect_command_buffers,
+                stage_input: None,
+            };
+            Ok(match device.new_compute_pipeline_state_full(&desc) {
+                Ok(Some(pipeline)) => {
+                    let reflection = compute_reflection::<P>(&pipeline, seqno, obj_id);
+                    CompiledPipeline::made(obj_id, ObjHandle::ComputePipeline(pipeline), reflection)
+                }
+                Ok(None) => refused("the platform answered nil".to_owned()),
+                Err(e) => refused(format!("the platform answered an error: {}", e.description)),
+            })
         }
     }
 }
@@ -1312,31 +1459,27 @@ fn specialised<P: Platform>(
     }
 }
 
+/// `count` wire records of `T` at `offset` from the message start: `None` where the message does
+/// not hold them all.
+fn records_tail<T: FromBytes + KnownLayout + Immutable>(
+    message: &[u8],
+    offset: u32,
+    count: u32,
+) -> Option<Vec<T>> {
+    let size = size_of::<T>();
+    let start = offset as usize;
+    let end = start.checked_add((count as usize).checked_mul(size)?)?;
+    message
+        .get(start..end)?
+        .chunks_exact(size)
+        .map(|b| T::read_from_bytes(b).ok())
+        .collect()
+}
+
 fn str_tail(message: &[u8], offset: u32, len: u32) -> Option<&str> {
     let start = offset as usize;
     let end = start.checked_add(len as usize)?;
     std::str::from_utf8(message.get(start..end)?).ok()
-}
-
-/// Whether a colour attachment's blend state is the premultiplied source-over
-/// blend the platform's [`RenderPipelineDesc`] value can express: blending on,
-/// both source factors `One`, both destination factors `OneMinusSourceAlpha`,
-/// both operations `Add`. Any other blend state cannot travel through that value
-/// and is dropped (the render decoder's note).
-fn is_source_over(c: &RgfxColorAttachmentDesc) -> bool {
-    /// `MTLBlendFactorOne`.
-    const ONE: u32 = 1;
-    /// `MTLBlendFactorOneMinusSourceAlpha`.
-    const ONE_MINUS_SRC_ALPHA: u32 = 5;
-    /// `MTLBlendOperationAdd`.
-    const ADD: u32 = 0;
-    c.blending_enabled != 0
-        && c.source_rgb_blend_factor == ONE
-        && c.source_alpha_blend_factor == ONE
-        && c.destination_rgb_blend_factor == ONE_MINUS_SRC_ALPHA
-        && c.destination_alpha_blend_factor == ONE_MINUS_SRC_ALPHA
-        && c.rgb_blend_operation == ADD
-        && c.alpha_blend_operation == ADD
 }
 
 /// The reflection reply for a made render pipeline: the state's own queries (the
@@ -2642,6 +2785,420 @@ mod tests {
         assert_eq!(made(&mut dec, obj(2, 7), 16319), Ok(()));
     }
 
+    /// A decoder of a fake platform, its reflection replies, and library 1 made.
+    fn pipeline_decoder() -> (
+        Arc<FakePlatform>,
+        GraphicsDecoder<FakePlatform>,
+        Arc<reims_vgpu_core::sync::Mutex<Vec<RgfxPipelineReflection>>>,
+    ) {
+        let p = Arc::new(FakePlatform::new());
+        let device = p.device();
+        let mut dec = GraphicsDecoder::<FakePlatform>::new(
+            Arc::clone(&p),
+            Arc::new(reims_graphics::region::Region::new(0x10000).unwrap()),
+        );
+        let replies = Arc::new(reims_vgpu_core::sync::Mutex::new(Vec::new()));
+        let sink_replies = Arc::clone(&replies);
+        dec.set_reflection_sink(Arc::new(move |r| sink_replies.lock().push(r)));
+        let air = [1u8, 2, 3, 4];
+        let mut lib_msg = RgfxLibraryCreate {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_LIBRARY_CREATE,
+                size: (RGFX_LIBRARY_BYTES_OFFSET as usize + air.len()).next_multiple_of(8) as u32,
+                seqno: 0,
+            },
+            obj_id: 1,
+            byte_length: air.len() as u64,
+            ..RgfxLibraryCreate::default()
+        }
+        .as_bytes()
+        .to_vec();
+        lib_msg.extend_from_slice(&air);
+        assert_eq!(dec.decode(&device, &lib_msg).unwrap(), Ok(()));
+        (p, dec, replies)
+    }
+
+    /// The colour attachments [`whole_render_create`] sets: 0 BGRA8Unorm, blending off, writing
+    /// red and alpha; 1 RGBA16Float, every factor and operation its own; 2 R32Float, unused
+    /// blending.
+    fn whole_render_colors() -> [RgfxColorAttachmentDesc; 3] {
+        [
+            RgfxColorAttachmentDesc {
+                pixel_format: 80,
+                write_mask: 0x9,
+                ..RgfxColorAttachmentDesc::default()
+            },
+            RgfxColorAttachmentDesc {
+                pixel_format: 115,
+                blending_enabled: 1,
+                source_rgb_blend_factor: 4,
+                destination_rgb_blend_factor: 5,
+                rgb_blend_operation: 1,
+                source_alpha_blend_factor: 2,
+                destination_alpha_blend_factor: 7,
+                alpha_blend_operation: 3,
+                write_mask: 0xf,
+                reserved_24: 0,
+            },
+            RgfxColorAttachmentDesc {
+                pixel_format: 55,
+                write_mask: 0x8,
+                ..RgfxColorAttachmentDesc::default()
+            },
+        ]
+    }
+
+    /// A `RENDER_PIPELINE_CREATE` of pipeline `obj_id` from library 1's `vmain` and, with
+    /// `fragment`, its `fmain`, carrying a descriptor that sets every field to a value of its own:
+    /// three colour attachments, a vertex descriptor of two layouts and three attributes, depth
+    /// Depth32Float, stencil Stencil8, 4 samples, every flag, topology triangle, amplification 2.
+    fn whole_render_create(obj_id: u64, fragment: bool) -> Vec<u8> {
+        let head = size_of::<RgfxRenderPipelineCreate>();
+        let layouts = [
+            RgfxVertexBufferLayout {
+                buffer_index: 0,
+                stride: 12,
+                step_function: 1,
+                step_rate: 1,
+            },
+            RgfxVertexBufferLayout {
+                buffer_index: 3,
+                stride: 16,
+                step_function: 2,
+                step_rate: 4,
+            },
+        ];
+        let attributes = [
+            RgfxVertexAttribute {
+                attribute_index: 0,
+                format: 29,
+                offset: 0,
+                buffer_index: 0,
+            },
+            RgfxVertexAttribute {
+                attribute_index: 1,
+                format: 9,
+                offset: 8,
+                buffer_index: 0,
+            },
+            RgfxVertexAttribute {
+                attribute_index: 5,
+                format: 31,
+                offset: 4,
+                buffer_index: 3,
+            },
+        ];
+        let (vn, fnm) = (b"vmain".as_slice(), b"fmain".as_slice());
+        let layouts_at = head;
+        let attributes_at = layouts_at + size_of_val(&layouts);
+        let vn_at = attributes_at + size_of_val(&attributes);
+        let fn_at = vn_at + vn.len();
+        let total = (fn_at + fnm.len()).next_multiple_of(8);
+        let mut colors = [RgfxColorAttachmentDesc::default(); 8];
+        colors[..3].copy_from_slice(&whole_render_colors());
+        let m = RgfxRenderPipelineCreate {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_RENDER_PIPELINE_CREATE,
+                size: total as u32,
+                seqno: 9,
+            },
+            obj_id,
+            vertex_library_obj_id: 1,
+            fragment_library_obj_id: if fragment { 1 } else { 0 },
+            vertex_name_offset: vn_at as u32,
+            vertex_name_len: vn.len() as u32,
+            fragment_name_offset: if fragment { fn_at as u32 } else { 0 },
+            fragment_name_len: if fragment { fnm.len() as u32 } else { 0 },
+            vertex_layouts_offset: layouts_at as u32,
+            vertex_layout_count: 2,
+            vertex_attributes_offset: attributes_at as u32,
+            vertex_attribute_count: 3,
+            raster_sample_count: 4,
+            color_attachment_count: 3,
+            depth_pixel_format: 252,
+            stencil_pixel_format: 253,
+            flags: RGFX_RENDER_PIPELINE_ALPHA_TO_COVERAGE
+                | RGFX_RENDER_PIPELINE_ALPHA_TO_ONE
+                | RGFX_RENDER_PIPELINE_RASTERIZATION_ENABLED
+                | RGFX_RENDER_PIPELINE_SUPPORT_ICB,
+            input_primitive_topology: 3,
+            max_vertex_amplification_count: 2,
+            colors,
+            ..RgfxRenderPipelineCreate::default()
+        };
+        let mut bytes = m.as_bytes().to_vec();
+        bytes.extend_from_slice(layouts.as_bytes());
+        bytes.extend_from_slice(attributes.as_bytes());
+        bytes.extend_from_slice(vn);
+        bytes.extend_from_slice(fnm);
+        bytes.resize(total, 0);
+        bytes
+    }
+
+    /// What [`whole_render_create`] carries, as the platform's value takes it.
+    fn whole_render_fields() -> RenderFields {
+        let layout = |buffer_index, stride, step_function, step_rate| BufferLayoutDesc {
+            buffer_index,
+            stride,
+            step_function,
+            step_rate,
+        };
+        let attribute = |attribute_index, format, offset, buffer_index| AttributeDesc {
+            attribute_index,
+            format,
+            offset,
+            buffer_index,
+        };
+        RenderFields {
+            vertex_descriptor: Some(VertexDesc {
+                layouts: vec![layout(0, 12, 1, 1), layout(3, 16, 2, 4)],
+                attributes: vec![
+                    attribute(0, 29, 0, 0),
+                    attribute(1, 9, 8, 0),
+                    attribute(5, 31, 4, 3),
+                ],
+            }),
+            colors: vec![
+                (
+                    0,
+                    ColorAttachmentDesc {
+                        pixel_format: 80,
+                        blending_enabled: false,
+                        source_rgb_blend_factor: 0,
+                        destination_rgb_blend_factor: 0,
+                        rgb_blend_operation: 0,
+                        source_alpha_blend_factor: 0,
+                        destination_alpha_blend_factor: 0,
+                        alpha_blend_operation: 0,
+                        write_mask: 0x9,
+                    },
+                ),
+                (
+                    1,
+                    ColorAttachmentDesc {
+                        pixel_format: 115,
+                        blending_enabled: true,
+                        source_rgb_blend_factor: 4,
+                        destination_rgb_blend_factor: 5,
+                        rgb_blend_operation: 1,
+                        source_alpha_blend_factor: 2,
+                        destination_alpha_blend_factor: 7,
+                        alpha_blend_operation: 3,
+                        write_mask: 0xf,
+                    },
+                ),
+                (
+                    2,
+                    ColorAttachmentDesc {
+                        pixel_format: 55,
+                        blending_enabled: false,
+                        source_rgb_blend_factor: 0,
+                        destination_rgb_blend_factor: 0,
+                        rgb_blend_operation: 0,
+                        source_alpha_blend_factor: 0,
+                        destination_alpha_blend_factor: 0,
+                        alpha_blend_operation: 0,
+                        write_mask: 0x8,
+                    },
+                ),
+            ],
+            depth_pixel_format: 252,
+            stencil_pixel_format: 253,
+            raster_sample_count: 4,
+            alpha_to_coverage: true,
+            alpha_to_one: true,
+            rasterization_enabled: true,
+            input_primitive_topology: 3,
+            max_vertex_amplification_count: 2,
+            support_indirect_command_buffers: true,
+        }
+    }
+
+    /// Every field of a render create reaches the platform's creator, read from the wire as the
+    /// value holds it: the colour attachments in use with their blend state and write masks, the
+    /// vertex descriptor's layouts and attributes, the depth and stencil formats, the sample
+    /// count, the four flags, the topology and the amplification count; a create naming library
+    /// 0 and no name for its fragment function has none
+    #[test]
+    fn a_render_create_carries_its_whole_descriptor() {
+        let message = whole_render_create(100, true);
+        let (m, _) = RgfxRenderPipelineCreate::read_from_prefix(&message).unwrap();
+        assert_eq!(render_fields(&message, &m), Ok(whole_render_fields()));
+        let (p, mut dec, replies) = pipeline_decoder();
+        let device = p.device();
+        assert_eq!(dec.decode(&device, &message).unwrap(), Ok(()));
+        assert_eq!(replies.lock()[0].status, RGFX_PIPELINE_OK);
+        let calls = p
+            .call_log()
+            .calls_to("newRenderPipelineStateWithDescriptor:error:");
+        let Arg::Val(logged) = &calls[0].args[0] else {
+            panic!("{:?}", calls[0].args);
+        };
+        let fields = whole_render_fields();
+        for part in [
+            format!("vertex_descriptor: {:?}", fields.vertex_descriptor),
+            format!("colors: {:?}", fields.colors),
+            "depth_pixel_format: 252, stencil_pixel_format: 253, raster_sample_count: 4, \
+             alpha_to_coverage: true, alpha_to_one: true, rasterization_enabled: true, \
+             input_primitive_topology: 3, max_vertex_amplification_count: 2, \
+             support_indirect_command_buffers: true"
+                .to_owned(),
+        ] {
+            assert!(logged.contains(&part), "{logged}\nlacks {part}");
+        }
+        assert!(logged.contains("fragment: Some("), "{logged}");
+        // No fragment function: none reaches the creator, and the pipeline is made.
+        assert_eq!(
+            dec.decode(&device, &whole_render_create(101, false))
+                .unwrap(),
+            Ok(())
+        );
+        assert_eq!(replies.lock()[1].status, RGFX_PIPELINE_OK);
+        let calls = p
+            .call_log()
+            .calls_to("newRenderPipelineStateWithDescriptor:error:");
+        let Arg::Val(logged) = &calls[1].args[0] else {
+            panic!("{:?}", calls[1].args);
+        };
+        assert!(logged.contains("fragment: None"), "{logged}");
+    }
+
+    /// A pipeline create the decoder carries out at once (not on the device's compile pool) that
+    /// the platform ends the process at is refused there: the create answers
+    /// [`DecodeError::Refused`] with a refused reply, nothing is stored, and the next is made
+    #[test]
+    fn a_compile_the_platform_refuses_in_the_decoder_is_a_refused_reply() {
+        use reims_vgpu_core::testkit::faults::Fault;
+        let (p, mut dec, replies) = pipeline_decoder();
+        let device = p.device();
+        let faults = p.faults();
+        faults.at(
+            "MTLDevice",
+            "newRenderPipelineStateWithDescriptor:error:",
+            0,
+            Fault::Crash,
+        );
+        assert_eq!(
+            dec.decode(&device, &whole_render_create(100, true))
+                .unwrap(),
+            Err(DecodeError::Refused)
+        );
+        faults.at("MTLLibrary", "newFunctionWithName:", 0, Fault::Crash);
+        assert_eq!(
+            dec.decode(&device, &whole_render_create(101, false))
+                .unwrap(),
+            Err(DecodeError::Refused)
+        );
+        assert_eq!(dec.object_count(), 1, "only the library");
+        assert_eq!(
+            dec.decode(&device, &whole_render_create(102, true))
+                .unwrap(),
+            Ok(())
+        );
+        let statuses: Vec<_> = replies
+            .lock()
+            .iter()
+            .map(|r| (r.obj_id, r.status))
+            .collect();
+        assert_eq!(
+            statuses,
+            [
+                (100, RGFX_PIPELINE_REFUSED),
+                (101, RGFX_PIPELINE_REFUSED),
+                (102, RGFX_PIPELINE_OK)
+            ]
+        );
+    }
+
+    /// A render create with more than eight colour attachments, or a vertex buffer or attribute
+    /// index past 30, is malformed: no platform call, and a refused reply
+    #[test]
+    fn a_render_create_past_metal_s_arrays_is_malformed() {
+        let (p, mut dec, replies) = pipeline_decoder();
+        let device = p.device();
+        let whole = whole_render_create(100, true);
+        let edit = |f: &dyn Fn(&mut RgfxRenderPipelineCreate)| {
+            let (mut m, _) = RgfxRenderPipelineCreate::read_from_prefix(&whole).unwrap();
+            f(&mut m);
+            let mut bytes = whole.clone();
+            bytes[..size_of::<RgfxRenderPipelineCreate>()].copy_from_slice(m.as_bytes());
+            bytes
+        };
+        let layouts_at = size_of::<RgfxRenderPipelineCreate>();
+        let mut past_buffer = whole.clone();
+        past_buffer[layouts_at..layouts_at + 4].copy_from_slice(&31u32.to_ne_bytes());
+        let attributes_at = layouts_at + 2 * size_of::<RgfxVertexBufferLayout>();
+        let mut past_attribute = whole.clone();
+        past_attribute[attributes_at..attributes_at + 4].copy_from_slice(&31u32.to_ne_bytes());
+        let m = p.call_log().mark();
+        for bad in [
+            edit(&|m| m.color_attachment_count = 9),
+            edit(&|m| m.vertex_attribute_count = 99),
+            past_buffer,
+            past_attribute,
+        ] {
+            assert_eq!(
+                dec.decode(&device, &bad).unwrap(),
+                Err(DecodeError::Malformed)
+            );
+        }
+        assert!(
+            !p.call_log()
+                .sels_since(m)
+                .contains(&"newRenderPipelineStateWithDescriptor:error:")
+        );
+        assert!(
+            replies
+                .lock()
+                .iter()
+                .all(|r| r.status == RGFX_PIPELINE_REFUSED)
+        );
+        assert_eq!(replies.lock().len(), 4);
+    }
+
+    /// Every field of a compute create reaches the platform's creator: the threadgroup-size
+    /// multiple, the maximum threads per threadgroup, the maximum call stack depth and indirect
+    /// command buffer support
+    #[test]
+    fn a_compute_create_carries_its_whole_descriptor() {
+        let (p, mut dec, replies) = pipeline_decoder();
+        let device = p.device();
+        let head = size_of::<RgfxComputePipelineCreate>() as u32;
+        let name = b"cmain".as_slice();
+        let total = (head as usize + name.len()).next_multiple_of(8);
+        let m = RgfxComputePipelineCreate {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_COMPUTE_PIPELINE_CREATE,
+                size: total as u32,
+                seqno: 3,
+            },
+            obj_id: 100,
+            function_library_obj_id: 1,
+            name_offset: head,
+            name_len: name.len() as u32,
+            flags: RGFX_COMPUTE_PIPELINE_TG_MULTIPLE_OF_EXEC_WIDTH
+                | RGFX_COMPUTE_PIPELINE_SUPPORT_ICB,
+            max_total_threads_per_threadgroup: 256,
+            max_call_stack_depth: 7,
+            ..RgfxComputePipelineCreate::default()
+        };
+        let mut bytes = m.as_bytes().to_vec();
+        bytes.extend_from_slice(name);
+        bytes.resize(total, 0);
+        assert_eq!(dec.decode(&device, &bytes).unwrap(), Ok(()));
+        assert_eq!(replies.lock()[0].status, RGFX_PIPELINE_OK);
+        let calls = p
+            .call_log()
+            .calls_to("newComputePipelineStateWithDescriptor:options:reflection:error:");
+        let Arg::Val(logged) = &calls[0].args[0] else {
+            panic!("{:?}", calls[0].args);
+        };
+        let part = "threadgroup_size_is_multiple_of_execution_width: true, \
+                    max_total_threads_per_threadgroup: 256, max_call_stack_depth: 7, \
+                    support_indirect_command_buffers: true, stage_input: None";
+        assert!(logged.contains(part), "{logged}");
+    }
+
     /// A render and a compute pipeline create each resolve their functions from a
     /// library, call the right platform creator, store the handle and emit a
     /// reflection reply keyed to the create's seqno; a pipeline that names a
@@ -2777,7 +3334,7 @@ mod tests {
             p.call_log()
                 .sels_since(m)
                 .iter()
-                .filter(|s| **s == "newComputePipelineStateWithFunction:error:")
+                .filter(|s| **s == "newComputePipelineStateWithDescriptor:options:reflection:error:")
                 .count(),
             1
         );

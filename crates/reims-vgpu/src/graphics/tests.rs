@@ -2059,7 +2059,7 @@ fn a_compile_the_platform_refuses_is_a_refused_reflection() {
     expect_reflection(&mut guest, obj(1, 11), RGFX_PIPELINE_REFUSED);
     faults.at(
         "MTLDevice",
-        "newComputePipelineStateWithFunction:error:",
+        "newComputePipelineStateWithDescriptor:options:reflection:error:",
         0,
         Fault::Crash,
     );
@@ -2075,6 +2075,48 @@ fn a_compile_the_platform_refuses_is_a_refused_reflection() {
     guest.send(&device, compute_pipeline_create(obj(1, 22), obj(1, 10)));
     expect_reflection(&mut guest, obj(1, 22), RGFX_PIPELINE_OK);
     assert_eq!(device.decoder_object_count(), 3);
+}
+
+/// With no compile thread, a create's compile runs on the control thread, where the platform
+/// ending the process refuses it as on the pool: the reflection or the `COMPLETE` is refused, and
+/// the next creates are made
+#[test]
+fn a_create_compiled_on_the_control_thread_the_platform_refuses_is_refused() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform) = headless_on(&raised);
+    device.control.pool.stop();
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    make_library(&device, &mut guest, obj(1, 10));
+    let faults = platform.faults();
+    faults.at(
+        "MTLDevice",
+        "newRenderPipelineStateWithDescriptor:error:",
+        0,
+        Fault::Crash,
+    );
+    guest.send(&device, render_pipeline_create(obj(1, 11), obj(1, 10)));
+    expect_reflection(&mut guest, obj(1, 11), RGFX_PIPELINE_REFUSED);
+    faults.at(
+        "MTLDevice",
+        "newComputePipelineStateWithDescriptor:options:reflection:error:",
+        0,
+        Fault::Crash,
+    );
+    guest.send(&device, compute_pipeline_create(obj(1, 12), obj(1, 10)));
+    expect_reflection(&mut guest, obj(1, 12), RGFX_PIPELINE_REFUSED);
+    faults.at("MTLDevice", "newLibraryWithData:error:", 0, Fault::Crash);
+    assert_eq!(
+        answered(&device, &mut guest, library_create(obj(1, 13))),
+        RGFX_STATUS_REFUSED
+    );
+    assert_eq!(device.decoder_object_count(), 1, "only the first library");
+    guest.send(&device, render_pipeline_create(obj(1, 21), obj(1, 10)));
+    expect_reflection(&mut guest, obj(1, 21), RGFX_PIPELINE_OK);
+    guest.send(&device, compute_pipeline_create(obj(1, 22), obj(1, 10)));
+    expect_reflection(&mut guest, obj(1, 22), RGFX_PIPELINE_OK);
+    make_library(&device, &mut guest, obj(1, 23));
+    assert_eq!(device.decoder_object_count(), 4);
 }
 
 /// The platform ending the process at a library's make (the Vulkan runtime refusing a library
