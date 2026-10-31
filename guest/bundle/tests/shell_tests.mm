@@ -363,6 +363,15 @@ void test_texture_cpu_copies()
 	[priv getBytes:out bytesPerRow:8 fromRegion:MTLRegionMake2D(0, 0, 2, 2) mipmapLevel:0];
 	[shared replaceRegion:MTLRegionMake2D(0, 0, 2, 2) mipmapLevel:0 withBytes:in bytesPerRow:12];
 	CHECK(!fx.ring.next(&h, &bytes));
+
+	// A resource's purgeable state is kept as told, the previous one answered, and nothing
+	// is posted: the device purges nothing.
+	CHECK([buf setPurgeableState:MTLPurgeableStateKeepCurrent] == MTLPurgeableStateNonVolatile);
+	CHECK([buf setPurgeableState:MTLPurgeableStateVolatile] == MTLPurgeableStateNonVolatile);
+	CHECK([buf setPurgeableState:MTLPurgeableStateKeepCurrent] == MTLPurgeableStateVolatile);
+	CHECK([tex setPurgeableState:MTLPurgeableStateEmpty] == MTLPurgeableStateNonVolatile);
+	CHECK([tex setPurgeableState:MTLPurgeableStateNonVolatile] == MTLPurgeableStateEmpty);
+	CHECK(!fx.ring.next(&h, &bytes));
 	}
 }
 

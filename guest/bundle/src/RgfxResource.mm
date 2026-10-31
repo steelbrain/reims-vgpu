@@ -7,6 +7,7 @@
 
 #import <Metal/Metal.h>
 
+#include <atomic>
 #include <unistd.h>
 
 #include "RgfxRetirement.hpp"
@@ -17,6 +18,8 @@
 	id<MTLHeap> _heap; // the heap the resource lies in, kept alive
 	// The process the resource is used for (setResponsibleProcess:): this one until told.
 	int _responsibleProcess;
+	// The purgeable state the client set (setPurgeableState:), NonVolatile until set.
+	std::atomic<MTLPurgeableState> _purgeableState;
 }
 
 - (instancetype)initWithObjId:(uint64_t)objId
@@ -29,6 +32,7 @@
 		_device = device;
 		_serializer = serializer;
 		_responsibleProcess = getpid();
+		_purgeableState.store(MTLPurgeableStateNonVolatile);
 	}
 	return self;
 }
@@ -85,6 +89,17 @@
 - (int)responsibleProcess
 {
 	return _responsibleProcess;
+}
+
+// The state is kept as told and the previous one answered (KeepCurrent only answers it). The
+// device never purges a resource, so a Volatile one keeps its contents and stays Volatile, and
+// an Empty one keeps them too, which no client may read.
+- (MTLPurgeableState)setPurgeableState:(MTLPurgeableState)state
+{
+	if (state == MTLPurgeableStateKeepCurrent) {
+		return _purgeableState.load();
+	}
+	return _purgeableState.exchange(state);
 }
 
 @end
