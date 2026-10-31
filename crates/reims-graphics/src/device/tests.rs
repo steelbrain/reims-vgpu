@@ -1178,7 +1178,12 @@ fn a_shared_block_is_held_by_each_context_it_is_shared_with() {
     const BLOCK: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x40_0000;
     const SCANOUT: u64 = RGFX_ALLOCATIONS_OFFSET;
     for context in [5, 6] {
-        rig.send(block_message(RGFX_CMD_BLOCK_SHARE, context, BLOCK, 0x2_0000));
+        rig.send(block_message(
+            RGFX_CMD_BLOCK_SHARE,
+            context,
+            BLOCK,
+            0x2_0000,
+        ));
     }
     rig.send(block_message(RGFX_CMD_BLOCK_SHARE, 7, SCANOUT, 0x1000));
     let seqno = rig.send(context_close(99));

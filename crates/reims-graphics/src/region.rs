@@ -111,13 +111,14 @@ impl Region {
     /// grant does.
     pub fn share(&self, context: u32, offset: u64, size: u64) {
         let mut blocks = self.blocks.lock();
-        if let Some(held) = blocks.get_mut(&offset) {
-            if held.shared && held.size == size {
-                if !held.holders.contains(&context) {
-                    held.holders.push(context);
-                }
-                return;
+        if let Some(held) = blocks.get_mut(&offset)
+            && held.shared
+            && held.size == size
+        {
+            if !held.holders.contains(&context) {
+                held.holders.push(context);
             }
+            return;
         }
         Self::clear(&mut blocks, offset, size);
         blocks.insert(
@@ -134,12 +135,13 @@ impl Region {
     /// (`BLOCK_UNSHARE`); its other holders keep it. Nothing where no such block is shared.
     pub fn unshare(&self, context: u32, offset: u64, size: u64) {
         let mut blocks = self.blocks.lock();
-        if let Some(held) = blocks.get_mut(&offset) {
-            if held.shared && held.size == size {
-                held.holders.retain(|&c| c != context);
-                if held.holders.is_empty() {
-                    blocks.remove(&offset);
-                }
+        if let Some(held) = blocks.get_mut(&offset)
+            && held.shared
+            && held.size == size
+        {
+            held.holders.retain(|&c| c != context);
+            if held.holders.is_empty() {
+                blocks.remove(&offset);
             }
         }
     }
