@@ -202,13 +202,13 @@ void selectAirSlice(const void *&bytes, NSUInteger &length)
 
 // Core Image's links (measured: macOS 27 and 26.6.1, the base device class's own, which link
 // Core Image's extern functions on the CPU): Metal's own link over each function's shadow, its
-// library made ours (RgfxLinkImageFilterFunctions). Metal's first link calls the second on
-// `self`, which makes the library ours there.
+// library made ours (RgfxLinkOverShadows). Metal's first link calls the second on `self`, which
+// makes the library ours there.
 - (id<MTLLibrary>)newLibraryWithImageFilterFunctionsSPI:(NSArray<id<MTLFunction>> *)functions
                                 imageFilterFunctionInfo:(const void *)info
                                                   error:(__autoreleasing NSError **)error
 {
-	return RgfxLinkImageFilterFunctions(
+	return RgfxLinkOverShadows(
 	    functions,
 	    ^id<MTLLibrary>(NSArray<id<MTLFunction>> *shadows, NSError *__autoreleasing *e) {
 		    return [self rgfxMetalLinkImageFilterFunctions:shadows info:info error:e];
@@ -223,7 +223,7 @@ void selectAirSlice(const void *&bytes, NSUInteger &length)
                   imageFilterFunctionInfo:(const void *)info
                                     error:(__autoreleasing NSError **)error
 {
-	return RgfxLinkImageFilterFunctions(
+	return RgfxLinkOverShadows(
 	    functions,
 	    ^id<MTLLibrary>(NSArray<id<MTLFunction>> *shadows, NSError *__autoreleasing *e) {
 		    return [self rgfxMetalLinkCIFilters:shadows info:info error:e];
@@ -232,6 +232,33 @@ void selectAirSlice(const void *&bytes, NSUInteger &length)
 		    return [self newLibraryWithData:data error:e];
 	    },
 	    error);
+}
+
+// A stitched library (measured: the base device class's own on macOS 27 and 26.6.1, which on
+// macOS 27 stitches on the CPU, reading each function's name and bitcode hash): Metal's own over
+// the functions' shadows, made ours (RgfxStitchOverShadows), so its functions are named on the
+// host like any library's.
+- (id<MTLLibrary>)newLibraryWithStitchedDescriptor:(MTLStitchedLibraryDescriptor *)descriptor
+                                             error:(__autoreleasing NSError **)error
+{
+	return RgfxStitchOverShadows(
+	    descriptor,
+	    ^id<MTLLibrary>(MTLStitchedLibraryDescriptor *shadowed, NSError *__autoreleasing *e) {
+		    return [self rgfxMetalStitch:shadowed error:e];
+	    },
+	    ^id<MTLLibrary>(dispatch_data_t data, NSError *__autoreleasing *e) {
+		    return [self newLibraryWithData:data error:e];
+	    },
+	    error);
+}
+
+- (void)newLibraryWithStitchedDescriptor:(MTLStitchedLibraryDescriptor *)descriptor
+                       completionHandler:(MTLNewLibraryCompletionHandler)completionHandler
+{
+	NSError *error = nil;
+	id<MTLLibrary> lib = [self newLibraryWithStitchedDescriptor:descriptor error:&error];
+	if (completionHandler)
+		completionHandler(lib, error);
 }
 
 // The base class's links, which a block cannot reach through `super`.
@@ -247,6 +274,12 @@ void selectAirSlice(const void *&bytes, NSUInteger &length)
                                    error:(__autoreleasing NSError **)error
 {
 	return [super newLibraryWithCIFilters:shadows imageFilterFunctionInfo:info error:error];
+}
+
+- (id<MTLLibrary>)rgfxMetalStitch:(MTLStitchedLibraryDescriptor *)descriptor
+                            error:(__autoreleasing NSError **)error
+{
+	return [super newLibraryWithStitchedDescriptor:descriptor error:error];
 }
 
 - (id<MTLLibrary>)newLibraryWithURL:(NSURL *)url error:(__autoreleasing NSError **)error

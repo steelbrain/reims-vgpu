@@ -712,19 +712,18 @@ NSArray<id<MTLFunction>> *RgfxShadowFunctions(NSArray<id<MTLFunction>> *function
 		id<MTLFunction> shadow = [rf rgfxShadow];
 		RgfxResource *library = [rf rgfxLibrary];
 		if (shadow == nil && [library isKindOfClass:[RgfxLibrary class]] && [rf rgfxConstantCount] == 0) {
-			RgfxLibrary *lib = (RgfxLibrary *)library;
+			// Metal's newFunctionWithName: answers a Core Image kernel library's extern functions
+			// too, of functionType 4 (measured: macOS 27).
 			NSString *entry = [NSString stringWithUTF8String:[rf rgfxEntryPointUTF8]];
-			id<MTLLibrary> metal = [lib rgfxShadow];
-			if ([metal respondsToSelector:@selector(newExternFunctionWithName:)])
-				shadow = [(id<RgfxMetalLibraryInternals>)metal newExternFunctionWithName:entry];
+			shadow = [[(RgfxLibrary *)library rgfxShadow] newFunctionWithName:entry];
 			if (shadow != nil)
 				[rf rgfxSetShadow:shadow];
 		}
 		if (shadow == nil) {
 			if (error)
 				*error = RgfxMakeError(RgfxMetalErrorInvalidDescriptor,
-				                       [NSString stringWithFormat:@"image filter link: function %@ has no "
-				                                                  @"function of Metal's own library",
+				                       [NSString stringWithFormat:@"link: function %@ has no function of "
+				                                                  @"Metal's own library",
 				                                                  rf.name]);
 			return nil;
 		}
@@ -733,8 +732,8 @@ NSArray<id<MTLFunction>> *RgfxShadowFunctions(NSArray<id<MTLFunction>> *function
 	return shadows;
 }
 
-id<MTLLibrary> RgfxLinkImageFilterFunctions(NSArray<id<MTLFunction>> *functions, RgfxLinkBlock link,
-                                            RgfxLibraryMaker makeLibrary, NSError **error)
+id<MTLLibrary> RgfxLinkOverShadows(NSArray<id<MTLFunction>> *functions, RgfxLinkBlock link,
+                                   RgfxLibraryMaker makeLibrary, NSError **error)
 {
 	NSArray<id<MTLFunction>> *shadows = RgfxShadowFunctions(functions, error);
 	if (shadows == nil)
@@ -747,8 +746,7 @@ id<MTLLibrary> RgfxLinkImageFilterFunctions(NSArray<id<MTLFunction>> *functions,
 	                    : nil;
 	if (bytes.length == 0) {
 		if (error)
-			*error = RgfxMakeError(RgfxMetalErrorRefused,
-			                       @"image filter link: Metal's linked library answered no bytes");
+			*error = RgfxMakeError(RgfxMetalErrorRefused, @"link: Metal's linked library answered no bytes");
 		return nil;
 	}
 	dispatch_data_t data = dispatch_data_create(bytes.bytes, bytes.length, nil, ^{
@@ -760,3 +758,16 @@ id<MTLLibrary> RgfxLinkImageFilterFunctions(NSArray<id<MTLFunction>> *functions,
 	return lib;
 }
 
+id<MTLLibrary> RgfxStitchOverShadows(MTLStitchedLibraryDescriptor *descriptor, RgfxStitchBlock stitch,
+                                     RgfxLibraryMaker makeLibrary, NSError **error)
+{
+	MTLStitchedLibraryDescriptor *copy = [descriptor copy];
+	copy.binaryArchives = @[];
+	return RgfxLinkOverShadows(
+	    descriptor.functions,
+	    ^id<MTLLibrary>(NSArray<id<MTLFunction>> *shadows, NSError *__autoreleasing *e) {
+		    copy.functions = shadows;
+		    return stitch(copy, e);
+	    },
+	    makeLibrary, error);
+}

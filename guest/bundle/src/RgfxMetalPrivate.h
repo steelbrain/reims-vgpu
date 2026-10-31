@@ -67,6 +67,10 @@ NS_ASSUME_NONNULL_BEGIN
 - (nullable id<MTLLibrary>)newLibraryWithCIFilters:(NSArray<id<MTLFunction>> *)functions
                            imageFilterFunctionInfo:(const void *)info
                                              error:(NSError *_Nullable *_Nullable)error;
+// measured: macOS 27 and 26.6.1, `@32@0:8@16^@24`, implemented only by _MTLDevice; on macOS 27 it
+// stitches on the CPU, reading each function's name and bitcode hash.
+- (nullable id<MTLLibrary>)newLibraryWithStitchedDescriptor:(MTLStitchedLibraryDescriptor *)descriptor
+                                                      error:(NSError *_Nullable *_Nullable)error;
 @end
 
 // measured: macOS 27 and 26.6.1 Metal.framework — the private selectors of Metal's own library

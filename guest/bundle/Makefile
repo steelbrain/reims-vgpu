@@ -155,9 +155,18 @@ $(CI_KERNEL): tests/ci_kernel.metal Makefile
 		tests/ci_kernel.metal -o $(BUILD)/ci_kernel.air
 	xcrun -sdk macosx metallib -cikernel $(BUILD)/ci_kernel.air -o $@
 
-test: $(SER_TESTBIN) $(SHELL_TESTBIN) $(CI_KERNEL)
+# The stitchable functions of tests/stitchable.metal, for the shell tests' stitched library.
+STITCHABLE = $(BUILD)/stitchable.metallib
+
+$(STITCHABLE): tests/stitchable.metal Makefile
+	@mkdir -p $(@D)
+	xcrun -sdk macosx metal -c -std=metal3.1 -mmacosx-version-min=14.0 tests/stitchable.metal \
+		-o $(BUILD)/stitchable.air
+	xcrun -sdk macosx metallib $(BUILD)/stitchable.air -o $@
+
+test: $(SER_TESTBIN) $(SHELL_TESTBIN) $(CI_KERNEL) $(STITCHABLE)
 	arch -$(ARCH) $(SER_TESTBIN)
-	RGFX_CI_KERNEL=$(CI_KERNEL) $(SHELL_TESTBIN)
+	RGFX_CI_KERNEL=$(CI_KERNEL) RGFX_STITCHABLE=$(STITCHABLE) $(SHELL_TESTBIN)
 
 # --- the loadable bundle (x86_64, device shell included) ---------------------
 # The IOGPUMetalDevice superclass is linked two-level against IOGPU (PRIVFW), so

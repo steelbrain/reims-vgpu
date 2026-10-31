@@ -58,24 +58,6 @@ constexpr const char *kIO = "Metal IO command queues";
 	return nil;
 }
 
-- (id<MTLLibrary>)newLibraryWithStitchedDescriptor:(MTLStitchedLibraryDescriptor *)descriptor
-                                             error:(NSError **)error
-{
-	RGFX_UNSUPPORTED_ERROR_IN(error, "stitched libraries", MTLLibraryErrorDomain,
-	                          MTLLibraryErrorUnsupported);
-	return nil;
-}
-
-- (void)newLibraryWithStitchedDescriptor:(MTLStitchedLibraryDescriptor *)descriptor
-                       completionHandler:(MTLNewLibraryCompletionHandler)completionHandler
-{
-	NSError *error = nil;
-	RGFX_UNSUPPORTED_ERROR_IN(&error, "stitched libraries", MTLLibraryErrorDomain,
-	                          MTLLibraryErrorUnsupported);
-	if (completionHandler)
-		completionHandler(nil, error);
-}
-
 // --- argument encoders and indirect command buffers -----------------------------------
 
 // No argument-buffer layout on the wire: no encoder, which apps and Metal's own frameworks check,

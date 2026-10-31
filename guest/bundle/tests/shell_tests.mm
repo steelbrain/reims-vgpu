@@ -1272,6 +1272,90 @@ const RgfxFunctionConstant *constantAt(id<MTLFunction> function, uint32_t index)
 	return nullptr;
 }
 
+// A stitched library is Metal's own, stitched over the shadows of our functions and of no binary
+// archive, and made ours from the bytes Metal answers for it: its functions are the graphs'.
+void test_stitched_library_over_shadows()
+{
+	Fixture fx;
+	const char *path = getenv("RGFX_STITCHABLE");
+	CHECK(path != nullptr);
+	if (path == nullptr)
+		return;
+	NSData *bytes = [NSData dataWithContentsOfFile:@(path)];
+	id<MTLDevice> metal = MTLCreateSystemDefaultDevice();
+	auto make = [&](const void *p, size_t n) {
+		uint32_t status = 0;
+		return [RgfxLibrary libraryWithData:p
+		                             length:n
+		                                key:nullptr
+		                             device:nil
+		                         serializer:&fx.ser
+		                             status:&status];
+	};
+	RgfxLibrary *lib = make(bytes.bytes, bytes.length);
+	[lib rgfxSetSource:dispatch_data_create(bytes.bytes, bytes.length, nil, ^{
+		     (void)bytes;
+	     })
+	       shadowMaker:^id<MTLLibrary>(dispatch_data_t d) {
+		       return [metal newLibraryWithData:d error:nil];
+	       }];
+	id<MTLFunction> add = [lib newFunctionWithName:@"stitch_add"];
+	id<MTLFunction> mul = [lib newFunctionWithName:@"stitch_mul"];
+	CHECK([(id)add isKindOfClass:[RgfxFunction class]] && [(RgfxFunction *)add rgfxShadow] == nil);
+
+	MTLFunctionStitchingInputNode *a = [[MTLFunctionStitchingInputNode alloc] initWithArgumentIndex:0];
+	MTLFunctionStitchingInputNode *b = [[MTLFunctionStitchingInputNode alloc] initWithArgumentIndex:1];
+	MTLFunctionStitchingInputNode *c = [[MTLFunctionStitchingInputNode alloc] initWithArgumentIndex:2];
+	MTLFunctionStitchingFunctionNode *sum =
+	    [[MTLFunctionStitchingFunctionNode alloc] initWithName:@"stitch_add"
+	                                                 arguments:@[ a, b ]
+	                                       controlDependencies:@[]];
+	MTLFunctionStitchingFunctionNode *product =
+	    [[MTLFunctionStitchingFunctionNode alloc] initWithName:@"stitch_mul"
+	                                                 arguments:@[ sum, c ]
+	                                       controlDependencies:@[]];
+	MTLStitchedLibraryDescriptor *d = [[MTLStitchedLibraryDescriptor alloc] init];
+	d.functionGraphs = @[ [[MTLFunctionStitchingGraph alloc] initWithFunctionName:@"fused"
+	                                                                        nodes:@[ sum ]
+	                                                                   outputNode:product
+	                                                                   attributes:@[]] ];
+	d.functions = @[ add, mul ];
+	d.binaryArchives = @[ [metal newBinaryArchiveWithDescriptor:[MTLBinaryArchiveDescriptor new] error:nil] ];
+
+	__block MTLStitchedLibraryDescriptor *given = nil;
+	__block id<MTLLibrary> stitched = nil;
+	NSError *err = nil;
+	id<MTLLibrary> ours = RgfxStitchOverShadows(
+	    d,
+	    ^id<MTLLibrary>(MTLStitchedLibraryDescriptor *shadowed, NSError **e) {
+		    given = shadowed;
+		    stitched = [metal newLibraryWithStitchedDescriptor:shadowed error:e];
+		    return stitched;
+	    },
+	    ^id<MTLLibrary>(dispatch_data_t data, NSError **e) {
+		    const void *p = nullptr;
+		    size_t n = 0;
+		    dispatch_data_t map = dispatch_data_create_map(data, &p, &n);
+		    (void)map;
+		    return make(p, n);
+	    },
+	    &err);
+	CHECK(err == nil && stitched != nil);
+	CHECK(given != d && given.binaryArchives.count == 0 && d.binaryArchives.count == 1);
+	CHECK(given.functions.count == 2 && given.functions[0] == [(RgfxFunction *)add rgfxShadow] &&
+	      given.functions[1] == [(RgfxFunction *)mul rgfxShadow]);
+	CHECK(![(id)given.functions[0] isKindOfClass:[RgfxFunction class]]);
+	CHECK(d.functions[0] == add); // the caller's descriptor is unchanged
+	CHECK([(id)ours isKindOfClass:[RgfxLibrary class]]);
+	CHECK([[ours functionNames] isEqualToArray:@[ @"fused" ]]);
+	CHECK([(RgfxLibrary *)ours rgfxShadow] == stitched);
+	CHECK([ours newFunctionWithName:@"fused"].functionType == MTLFunctionTypeVisible);
+	std::vector<uint8_t> drain;
+	RgfxMsgHeader h;
+	while (fx.ring.next(&h, &drain)) {
+	}
+}
+
 // A Core Image kernel library's extern functions come from its shadow, Metal's own library over
 // the same bytes: their names, each a function of functionType 4 that holds Metal's own, and nil
 // for a name the shadow does not hold; functionNames leaves them out, as Metal's does. Core
@@ -1360,7 +1444,7 @@ void test_core_image_extern_functions()
 		return make([NSData dataWithBytes:p length:n]);
 	};
 	err = nil;
-	id<MTLLibrary> ours = RgfxLinkImageFilterFunctions(
+	id<MTLLibrary> ours = RgfxLinkOverShadows(
 	    @[ swap ],
 	    ^id<MTLLibrary>(NSArray<id<MTLFunction>> *given, NSError **e) {
 		    linkedFrom = given;
@@ -1377,12 +1461,12 @@ void test_core_image_extern_functions()
 	// A library the link answers that is ours already is answered as it is, and a refused link
 	// answers nil with its error.
 	madeFrom = nil;
-	CHECK(RgfxLinkImageFilterFunctions(
+	CHECK(RgfxLinkOverShadows(
 	          @[ swap ], ^id<MTLLibrary>(NSArray<id<MTLFunction>> *given, NSError **e) { return lib; },
 	          maker, &err) == lib);
 	CHECK(madeFrom == nil);
 	err = nil;
-	CHECK(RgfxLinkImageFilterFunctions(
+	CHECK(RgfxLinkOverShadows(
 	          @[ swap ],
 	          ^id<MTLLibrary>(NSArray<id<MTLFunction>> *given, NSError **e) {
 		          *e = RgfxMakeError(RgfxMetalErrorRefused, @"refused");
@@ -4989,6 +5073,7 @@ int main()
 		test_compute_pipeline_routing();
 		test_function_constants_resolve_as_metal();
 		test_core_image_extern_functions();
+		test_stitched_library_over_shadows();
 		test_command_graph();
 		test_parallel_render_encoder();
 		test_queue_guards();

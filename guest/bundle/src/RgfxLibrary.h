@@ -95,26 +95,37 @@ static const MTLFunctionType kRgfxFunctionTypeExtern = (MTLFunctionType)4;
 
 @end
 
-/// Each of `functions` as Metal's own Core Image link takes it: an RgfxFunction as its shadow
-/// (an extern function of its library's shadow, of its entry point, where it has none yet), any
-/// other function as it is. nil, with `*error`, where an RgfxFunction has no shadow: its library
-/// keeps no source, Metal refused it, or it holds no function of that name.
+/// Each of `functions` as Metal's own links take it (Core Image's link and stitching): an
+/// RgfxFunction as its shadow (its library's shadow's function of its entry point, where it has
+/// none yet), any other function as it is. nil, with `*error`, where an RgfxFunction has no shadow:
+/// it is specialised by constants, its library keeps no source, Metal refused it, or it holds no
+/// function of that name.
 NSArray<id<MTLFunction>> *_Nullable RgfxShadowFunctions(NSArray<id<MTLFunction>> *functions,
                                                         NSError *__autoreleasing _Nullable *_Nullable error);
 
-/// Core Image's link of `functions` (measured: macOS 27 and 26.6.1, Metal's base device class
-/// links them on the CPU, reading Metal-internal library data no RgfxFunction holds): `link`,
-/// Metal's own, given each function's shadow, and the library it answers made one of ours by
-/// `makeLibrary` over the bytes Metal answers for it (`libraryDataContents`, a .metallib of the
-/// one kernel), which keeps Metal's library as its shadow. A library `link` answers that is
-/// already ours (Metal's link reached ours again, which made it) is answered as it is.
+/// A link Metal's base device class runs on the CPU over Metal's own functions, reading
+/// Metal-internal library data no RgfxFunction holds (measured: macOS 27, and 26.6.1 in the guest,
+/// for Core Image's link; stitching reads each function's bitcode hash): `link`, given each of
+/// `functions`' shadow, and the library it answers made one of ours by `makeLibrary` over the
+/// bytes Metal answers for it (`libraryDataContents`, a .metallib), which keeps Metal's library as
+/// its shadow. A library `link` answers that is already ours (Metal's link reached one of ours
+/// again, which made it) is answered as it is.
 typedef id<MTLLibrary> _Nullable (^RgfxLinkBlock)(NSArray<id<MTLFunction>> *shadows,
                                                   NSError *__autoreleasing _Nullable *_Nullable error);
 typedef id<MTLLibrary> _Nullable (^RgfxLibraryMaker)(dispatch_data_t data,
                                                      NSError *__autoreleasing _Nullable *_Nullable error);
-id<MTLLibrary> _Nullable RgfxLinkImageFilterFunctions(NSArray<id<MTLFunction>> *functions,
-                                                      RgfxLinkBlock link, RgfxLibraryMaker makeLibrary,
-                                                      NSError *__autoreleasing _Nullable *_Nullable error);
+id<MTLLibrary> _Nullable RgfxLinkOverShadows(NSArray<id<MTLFunction>> *functions, RgfxLinkBlock link,
+                                             RgfxLibraryMaker makeLibrary,
+                                             NSError *__autoreleasing _Nullable *_Nullable error);
+
+/// A stitched library (`newLibraryWithStitchedDescriptor:`), by `stitch`, Metal's own, over a copy
+/// of `descriptor` whose functions are their shadows and which names no binary archive (Metal
+/// would read ours as its own), made ours as `RgfxLinkOverShadows` makes it.
+typedef id<MTLLibrary> _Nullable (^RgfxStitchBlock)(MTLStitchedLibraryDescriptor *descriptor,
+                                                    NSError *__autoreleasing _Nullable *_Nullable error);
+id<MTLLibrary> _Nullable RgfxStitchOverShadows(MTLStitchedLibraryDescriptor *descriptor, RgfxStitchBlock stitch,
+                                               RgfxLibraryMaker makeLibrary,
+                                               NSError *__autoreleasing _Nullable *_Nullable error);
 
 NS_ASSUME_NONNULL_END
 
