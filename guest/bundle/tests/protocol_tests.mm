@@ -31,6 +31,7 @@
 #import "RgfxTexture.h"
 #import "RgfxUnsupported.h"
 
+#include "RgfxHeapSizes.hpp"
 #include "RgfxObjectModel.hpp"
 #include "RgfxRegion.hpp"
 #include "RgfxReplyReader.hpp"
@@ -957,6 +958,63 @@ void test_shared_event_wait()
 	} // @autoreleasepool: ev drains while ser and reader live
 }
 
+// --- heap placement sizes ------------------------------------------------------------
+
+// A heap buffer is its length at the host's alignment (Metal's 256 where the host gave none).
+// A heap texture's bound holds Metal's answer for shapes of each kind (Metal's sizes measured on
+// an M3 Max, macOS 27), at Metal's coarsest alignment; a descriptor of no texture answers 0.
+void test_heap_sizes()
+{
+	RgfxHeapSizeAlign b = rgfxHeapBufferSizeAndAlign(100001, 256);
+	CHECK(b.size == 100001 && b.align == 256);
+	b = rgfxHeapBufferSizeAndAlign(7, 0);
+	CHECK(b.size == 7 && b.align == kRgfxHeapBufferAlign);
+	b = rgfxHeapBufferSizeAndAlign(0, 4096);
+	CHECK(b.size == 0 && b.align == 4096);
+
+	struct Shape {
+		uint32_t format, type;
+		uint64_t w, h, d;
+		uint32_t levels;
+		uint64_t array, samples, metal; // Metal's size
+	};
+	const Shape shapes[] = {
+	    {10, 2, 1, 1, 1, 1, 1, 1, 128},                 // R8Unorm 1x1
+	    {10, 2, 100, 37, 1, 7, 1, 1, 11776},            // R8Unorm, mipmapped
+	    {10, 2, 1920, 1080, 1, 11, 1, 1, 3457408},      // the bound's closest (1.06x)
+	    {70, 2, 1920, 1080, 1, 1, 1, 1, 8486912},       // RGBA8Unorm
+	    {70, 4, 1920, 1080, 1, 1, 1, 4, 33947648},      // RGBA8Unorm, 4 samples
+	    {252, 4, 1920, 1080, 1, 1, 1, 4, 33947648},     // Depth32Float, 4 samples
+	    {130, 2, 1920, 1080, 1, 1, 1, 1, 1179648},      // BC1_RGBA
+	    {115, 3, 333, 777, 1, 10, 3, 1, 10469376},      // RGBA16Float array
+	    {70, 5, 64, 64, 1, 7, 1, 1, 198912},            // RGBA8Unorm cube
+	    {10, 7, 256, 256, 256, 9, 1, 1, 25919488},      // R8Unorm 3D, mipmapped
+	    {125, 1, 16384, 1, 1, 1, 9, 1, 2359296},        // RGBA32Float 1D array
+	    {70, 2, 16384, 16384, 1, 15, 1, 1, 1442841088}, // RGBA8Unorm 16K, mipmapped
+	};
+	for (const Shape &t : shapes) {
+		RgfxHeapSizeAlign sa = {};
+		CHECK(rgfxHeapTextureBound(t.format, t.type, t.w, t.h, t.d, t.levels, t.array, t.samples,
+		                           &sa));
+		CHECK(sa.size >= t.metal && sa.align == kRgfxHeapTextureGranule);
+		CHECK(sa.size % sa.align == 0);
+	}
+	// A large texture's bound stays near Metal's size.
+	RgfxHeapSizeAlign big = {};
+	CHECK(rgfxHeapTextureBound(70, 2, 1920, 1080, 1, 1, 1, 1, &big));
+	CHECK(big.size < 8486912ull * 5 / 4);
+
+	RgfxHeapSizeAlign none = {};
+	CHECK(!rgfxHeapTextureBound(70, 2, 0, 16, 1, 1, 1, 1, &none));
+	CHECK(none.size == 0);
+	CHECK(!rgfxHeapTextureBound(70, 2, 16, 16, 1, 0, 1, 1, &none));
+	CHECK(!rgfxHeapTextureBound(125, 3, 1ull << 40, 1ull << 40, 1, 1, 1ull << 20, 1, &none));
+	CHECK(none.size == 0);
+	// A format the CPU copies hold no block of still has one: depth, stencil, PVRTC, any other.
+	CHECK(rgfxHeapFormatBlock(260).bytes == 8 && rgfxHeapFormatBlock(253).bytes == 1);
+	CHECK(rgfxHeapFormatBlock(160).width == 8 && rgfxHeapFormatBlock(0xffff).bytes == 16);
+}
+
 } // namespace
 
 void rgfxProtocolTests()
@@ -976,4 +1034,5 @@ void rgfxProtocolTests()
 	test_library_members();
 	test_argument_encoder_members();
 	test_shared_event_wait();
+	test_heap_sizes();
 }

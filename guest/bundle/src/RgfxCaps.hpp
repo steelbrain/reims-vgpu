@@ -181,6 +181,9 @@ public:
 	uint64_t maxThreadsPerThreadgroup(uint32_t dim) const;
 	/// `maxVertexAmplificationCount`.
 	uint64_t maxVertexAmplificationCount() const { return m_info.max_vertex_amplification_count; }
+	/// The alignment of `heapBufferSizeAndAlignWithLength:options:`(`vm_page_size`, Private),
+	/// or 0 where the host had no answer.
+	uint64_t heapBufferPageAlign() const { return m_info.heap_buffer_page_private[1]; }
 	/// The device name, NUL-terminated (a display string, never read back).
 	const char *name() const { return m_name; }
 	/// The device's `architecture.name`, NUL-terminated; empty where the host has none.

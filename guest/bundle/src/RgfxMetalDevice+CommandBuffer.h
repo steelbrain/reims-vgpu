@@ -25,6 +25,7 @@ NS_ASSUME_NONNULL_BEGIN
 @interface RgfxMetalDevice (CommandBuffer)
 
 - (nullable id<MTLCommandQueue>)newCommandQueue;
+- (nullable id<MTLCommandQueue>)newCommandQueueWithDescriptor:(MTLCommandQueueDescriptor *)descriptor;
 - (nullable id<MTLCommandQueue>)newCommandQueueWithMaxCommandBufferCount:
     (NSUInteger)maxCommandBufferCount;
 
