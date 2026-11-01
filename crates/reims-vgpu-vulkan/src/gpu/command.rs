@@ -626,8 +626,13 @@ impl Progress {
 
     /// The command buffer ends at `stage`: its changes run if it completed, its failures' if it
     /// failed, what it held goes, then the stage is set. It runs on the runtime's thread, or
-    /// where the command buffer goes, and sends nothing, so it checks no task's end.
-    fn end(&self, stage: Stage) {
+    /// where the command buffer goes, and sends nothing, so it checks no task's end. Each change
+    /// runs, and each object held is let go of, in the scope `carried` names, the one the
+    /// command that made the progress carried (the graphics lane's): a death in one is refused
+    /// there and logged, and the rest run and go, and the stage is set, all the same. Outside
+    /// every scope each runs and goes as it always did, in the same order, and a death in one
+    /// ends the process.
+    fn end(&self, stage: Stage, carried: Carried) {
         let (changes, failures, held, executions) = {
             let mut state = self.state.lock();
             (
@@ -651,8 +656,27 @@ impl Progress {
                 Vec::new()
             }
         };
-        ran.into_iter().for_each(|change| change());
-        drop((held, executions));
+        let refused = |what: &str, refusal: refusals::Refusal| {
+            log::warn!(
+                target: "reims_vgpu::refused",
+                "a command buffer's {what} as it ended was refused: {refusal}"
+            );
+        };
+        for change in ran {
+            if let Err(refusal) = carried.run(change) {
+                refused("change", refusal);
+            }
+        }
+        for object in held {
+            if let Err(refusal) = carried.run(move || drop(object)) {
+                refused("release of what its commands used", refusal);
+            }
+        }
+        for execution in executions {
+            if let Err(refusal) = carried.run(move || drop(execution)) {
+                refused("release of an indirect command buffer it executed", refusal);
+            }
+        }
         self.state.lock().stage = stage;
     }
 }
@@ -711,7 +735,7 @@ impl Ending {
                     "a refused command buffer's execution of an indirect command buffer: {refusal}"
                 );
             }
-            progress.end(stage);
+            progress.end(stage, carried);
         };
         #[cfg(test)]
         reims_vgpu_core::testkit::capture::with_slot(self.slot.take(), end);
@@ -769,7 +793,7 @@ fn of_records(e: &rt::Error) -> bool {
 impl Drop for Ending {
     fn drop(&mut self) {
         if let Some(progress) = self.progress.take() {
-            progress.end(Stage::Dropped);
+            progress.end(Stage::Dropped, self.carried);
         }
     }
 }
@@ -2102,6 +2126,60 @@ mod tests {
             .join()
             .unwrap();
         assert_eq!(progress.stage(), Stage::Failed);
+    }
+
+    /// A command buffer's progress ends on the runtime's thread in the scope its command carried
+    /// (the graphics lane's): a change that dies at the completion and an object whose release
+    /// dies are refused there, the other changes run, the other objects go, and the stage is
+    /// set. Outside every scope (the paravirt device's), the same release dies, as before
+    #[test]
+    fn a_progress_ends_in_the_scope_its_command_carried() {
+        /// An object whose release dies, as the platform's release of what a command used can.
+        struct DiesAtRelease;
+        impl Drop for DiesAtRelease {
+            fn drop(&mut self) {
+                unrepresentable("release", "a release none of Metal's");
+            }
+        }
+        let ending = |progress: &Arc<Progress>| Ending {
+            progress: Some(Arc::clone(progress)),
+            task: None,
+            carried: refusals::carry(),
+            slot: None,
+        };
+        let (ran, gone) = (Arc::new(AtomicUsize::new(0)), Arc::new(()));
+        let progress = Arc::new(Progress::default());
+        progress.at_completion(|| unrepresentable("commit", "a change none of Metal's"));
+        let after = Arc::clone(&ran);
+        progress.at_completion(move || {
+            after.fetch_add(1, Ordering::SeqCst);
+        });
+        progress.hold(DiesAtRelease);
+        progress.hold(Arc::clone(&gone));
+        let mut e = refusals::refusing(|| ending(&progress)).unwrap();
+        std::thread::Builder::new()
+            .name("the runtime's progress".into())
+            .spawn(move || e.end(Stage::Completed, None::<fn(&'static str)>))
+            .unwrap()
+            .join()
+            .unwrap();
+        assert_eq!(progress.stage(), Stage::Completed);
+        assert_eq!(
+            ran.load(Ordering::SeqCst),
+            1,
+            "the change after the refused one"
+        );
+        assert_eq!(
+            Arc::strong_count(&gone),
+            1,
+            "the object held after the refused one"
+        );
+        // Outside every scope the release dies.
+        let progress = Arc::new(Progress::default());
+        progress.hold(DiesAtRelease);
+        let mut e = ending(&progress);
+        let site = catch_death(|| e.end(Stage::Completed, None::<fn(&'static str)>)).unwrap_err();
+        assert_eq!((site.kind, site.file), (DeathKind::Abort, "release"));
     }
 
     /// Core's completed handler added inside a refusal scope (the graphics lane's) reads a failure

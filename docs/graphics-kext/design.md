@@ -503,10 +503,12 @@ among them), library lookups and heap-size and argument-layout queries at
 once, carries out its destroys, and forgets the failure at its close. A release the
 platform dies at (at a destroy, a context's close, or the display's swap of
 the texture it shows) is refused alone, and the destroy or the close is
-carried out whole. What dies elsewhere off the op's thread still ends the
-process: a notice the runtime's scheduler thread announces at a host step,
-which names no command buffer, a release on the runtime's thread as a command
-buffer completes, and the window's draw. This
+carried out whole. So is each of the Vulkan platform's releases of what a
+command buffer's commands used, and each change it makes, as the command
+buffer ends on the runtime's thread. What dies elsewhere off the op's thread
+still ends the process: a notice the runtime's scheduler thread announces at
+a host step, which names no command buffer, the runtime's own releases after
+the platform's handlers ran, and the window's draw. This
 is the lane's own rule: the paravirt device's rule of ending the process at the
 op (AGENTS.md, the contract) is Apple's framework's behaviour, which that
 device keeps.
