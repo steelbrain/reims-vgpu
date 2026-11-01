@@ -717,16 +717,9 @@ NSArray<id<MTLFunction>> *RgfxShadowFunctions(NSArray<id<MTLFunction>> *function
 			continue;
 		}
 		RgfxFunction *rf = (RgfxFunction *)fn;
-		id<MTLFunction> shadow = [rf rgfxShadow];
-		RgfxResource *library = [rf rgfxLibrary];
-		if (shadow == nil && [library isKindOfClass:[RgfxLibrary class]] && [rf rgfxConstantCount] == 0) {
-			// Metal's newFunctionWithName: answers a Core Image kernel library's extern functions
-			// too, of functionType 4 (measured: macOS 27).
-			NSString *entry = [NSString stringWithUTF8String:[rf rgfxEntryPointUTF8]];
-			shadow = [[(RgfxLibrary *)library rgfxShadow] newFunctionWithName:entry];
-			if (shadow != nil)
-				[rf rgfxSetShadow:shadow];
-		}
+		// Metal's newFunctionWithName: answers a Core Image kernel library's extern functions too,
+		// of functionType 4 (measured: macOS 27).
+		id<MTLFunction> shadow = [rf rgfxShadowOrMake];
 		if (shadow == nil) {
 			if (error)
 				*error = RgfxMakeError(RgfxMetalErrorInvalidDescriptor,

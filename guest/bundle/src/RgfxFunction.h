@@ -110,6 +110,11 @@ typedef struct {
 /// The shadow `rgfxSetShadow:` set; nil for none.
 - (nullable id<MTLFunction>)rgfxShadow;
 
+/// The shadow, made where there is none of the library's shadow by entry point, for a function made
+/// with no constant values (its own, as Metal's library answers newFunctionWithName:, measured:
+/// macOS 27); nil where it was made with values or its library has no shadow.
+- (nullable id<MTLFunction>)rgfxShadowOrMake;
+
 /// The library the function was made from; nil where it was made without one.
 - (nullable RgfxResource *)rgfxLibrary;
 

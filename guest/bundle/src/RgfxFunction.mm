@@ -5,14 +5,17 @@
 #import "RgfxFunction.h"
 
 #import "RgfxArgumentEncoder.h"
+#import "RgfxLibrary.h"
 #import "RgfxUnsupported.h"
 
 #import "RgfxMetalError.h"
 
+#import <objc/message.h>
 #import <objc/runtime.h>
 
 #include <CommonCrypto/CommonDigest.h>
 
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <set>
@@ -229,6 +232,12 @@ void logAnsweredByShadow(Class cls, SEL cmd)
 	_options = options;
 }
 
+// Metal's function keeps what it is given, and answers it from options (measured: macOS 27).
+- (void)setOptions:(MTLFunctionOptions)options
+{
+	_options = options;
+}
+
 - (void)rgfxSetSpecializedName:(NSString *)specializedName
 {
 	_specializedName = specializedName.UTF8String ? specializedName.UTF8String : "";
@@ -250,6 +259,82 @@ void logAnsweredByShadow(Class cls, SEL cmd)
 {
 	std::lock_guard<std::mutex> hold(_shadowLock);
 	return _shadow;
+}
+
+- (id<MTLFunction>)rgfxShadowOrMake
+{
+	std::lock_guard<std::mutex> hold(_shadowLock);
+	if (_shadow == nil && _constants.empty() && [_library isKindOfClass:[RgfxLibrary class]]) {
+		NSString *entry = [NSString stringWithUTF8String:_name.c_str()];
+		_shadow = [[(RgfxLibrary *)_library rgfxShadow] newFunctionWithName:entry];
+	}
+	return _shadow;
+}
+
+// The shadow's answer to `cmd`, Metal's own function's of the same entry point, logged once per
+// class as forwarded selectors are; nil, logged, where there is none to ask.
+- (id)rgfxShadowAnswer:(SEL)cmd
+{
+	id<MTLFunction> shadow = [self rgfxShadowOrMake];
+	if (![shadow respondsToSelector:cmd]) {
+		RgfxLogUnsupported([self class], cmd,
+		                   "no function of Metal's own answers it (one made with constant values, "
+		                   "or of a library Metal's own does not hold)");
+		return nil;
+	}
+	logAnsweredByShadow([self class], cmd);
+	return ((id (*)(id, SEL))objc_msgSend)(shadow, cmd);
+}
+
+// --- MTLFunctionSPI, as Metal's own function answers it -----------------------------------
+// Core Image and MPS read these. Metal's answers depend on the function (measured: macOS 27):
+// nil arguments, imported libraries and return type for a plain library function, the bindings
+// and the type of a stitchable one, the declared constants of one made with no values for them,
+// and the function's AIR as its bitcode data. The shadow, Metal's own function of the same entry
+// point, answers them here.
+
+- (NSArray *)arguments
+{
+	return [self rgfxShadowAnswer:_cmd];
+}
+
+- (NSArray *)importedLibraries
+{
+	return [self rgfxShadowAnswer:_cmd];
+}
+
+- (id)returnType
+{
+	return [self rgfxShadowAnswer:_cmd];
+}
+
+- (id)bitcodeData
+{
+	return [self rgfxShadowAnswer:_cmd];
+}
+
+// Metal answers nil for a function specialised by values (measured), which has no shadow.
+- (NSArray *)functionConstants
+{
+	if (!_constants.empty())
+		return nil;
+	return [self rgfxShadowAnswer:_cmd];
+}
+
+// Metal answers nil for every function, one made of a descriptor with plugin data too (measured):
+// its setPluginData: ends the process.
+- (id)pluginData
+{
+	return nil;
+}
+
+// Metal's function aborts here, for any argument, nil too (measured: macOS 27), and so does ours.
+- (void)setPluginData:(id)pluginData
+{
+	(void)pluginData;
+	NSLog(@"RGFX: -[%s setPluginData:] ends the process, as Metal's function does",
+	      class_getName([self class]));
+	abort();
 }
 
 // What this class does not implement goes to the shadow, Metal's own function of the same entry

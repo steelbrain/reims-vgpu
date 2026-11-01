@@ -1367,6 +1367,84 @@ void test_stitched_library_over_shadows()
 	}
 }
 
+// A function answers Metal's private members from its shadow, Metal's own function of the same
+// entry point, made of its library's on first use: a stitchable function's bindings and return
+// type, a kernel's nils, and each one's AIR. One made with constant values has no shadow: it
+// answers nil for its constants, as Metal's, and nil, logged, for the rest. Its options are what
+// it was last given, and its plugin data nil.
+void test_function_members_from_shadow()
+{
+	Fixture fx;
+	const char *path = getenv("RGFX_STITCHABLE");
+	CHECK(path != nullptr);
+	if (path == nullptr)
+		return;
+	NSData *bytes = [NSData dataWithContentsOfFile:@(path)];
+	id<MTLDevice> metal = MTLCreateSystemDefaultDevice();
+	uint32_t status = 0;
+	RgfxLibrary *lib = [RgfxLibrary libraryWithData:bytes.bytes
+	                                        length:bytes.length
+	                                           key:nullptr
+	                                        device:nil
+	                                    serializer:&fx.ser
+	                                        status:&status];
+	dispatch_data_t source = dispatch_data_create(bytes.bytes, bytes.length, nil, ^{
+		(void)bytes;
+	});
+	[lib rgfxSetSource:source
+	       shadowMaker:^id<MTLLibrary>(dispatch_data_t d) {
+		       return [metal newLibraryWithData:d error:nil];
+	       }];
+	id<MTLLibrary> genuine = [metal newLibraryWithData:source error:nil];
+	auto ask = [](id object, NSString *member) {
+		return ((id (*)(id, SEL))objc_msgSend)(object, NSSelectorFromString(member));
+	};
+	for (NSString *name in @[ @"stitch_add", @"stitch_caller" ]) {
+		RgfxFunction *fn = (RgfxFunction *)[lib newFunctionWithName:name];
+		id<MTLFunction> theirs = [genuine newFunctionWithName:name];
+		CHECK(fn != nil && theirs != nil && [fn rgfxShadow] == nil);
+		NSArray *arguments = ask(fn, @"arguments"), *metals = ask(theirs, @"arguments");
+		CHECK((arguments == nil) == (metals == nil) && arguments.count == metals.count);
+		for (NSUInteger i = 0; i < arguments.count && i < metals.count; i++)
+			CHECK([[arguments[i] name] isEqualToString:[metals[i] name]]);
+		id type = ask(fn, @"returnType"), metalType = ask(theirs, @"returnType");
+		CHECK((type == nil) == (metalType == nil));
+		CHECK(type == nil || [type dataType] == [metalType dataType]);
+		CHECK(ask(fn, @"importedLibraries") == nil && ask(theirs, @"importedLibraries") == nil);
+		CHECK(ask(fn, @"functionConstants") == nil && ask(theirs, @"functionConstants") == nil);
+		id air = ask(fn, @"bitcodeData"), metalAir = ask(theirs, @"bitcodeData");
+		CHECK(air != nil && dispatch_data_get_size((dispatch_data_t)air) ==
+		                        dispatch_data_get_size((dispatch_data_t)metalAir));
+		CHECK([fn rgfxShadow] != nil && ![(id)[fn rgfxShadow] isKindOfClass:[RgfxFunction class]]);
+		CHECK(ask(fn, @"pluginData") == nil);
+	}
+	CHECK(((NSArray *)ask([lib newFunctionWithName:@"stitch_add"], @"arguments")).count == 2);
+	CHECK(ask([lib newFunctionWithName:@"stitch_add"], @"returnType") != nil);
+	CHECK(ask([lib newFunctionWithName:@"stitch_caller"], @"returnType") == nil);
+
+	RgfxFunctionConstant c = {};
+	c.data_type = static_cast<uint32_t>(MTLDataTypeFloat);
+	RgfxFunction *valued = [RgfxFunction functionWithLibrary:lib
+	                                                    name:@"stitch_caller"
+	                                               constants:&c
+	                                                   count:1
+	                                                  device:nil
+	                                              serializer:&fx.ser];
+	CHECK(ask(valued, @"functionConstants") == nil && ask(valued, @"bitcodeData") == nil);
+	CHECK([valued rgfxShadowOrMake] == nil);
+	CHECK(RgfxUnsupportedWasLogged([RgfxFunction class], NSSelectorFromString(@"bitcodeData")));
+
+	SEL setOptions = NSSelectorFromString(@"setOptions:");
+	CHECK(valued.options == MTLFunctionOptionNone && [valued respondsToSelector:setOptions]);
+	((void (*)(id, SEL, MTLFunctionOptions))objc_msgSend)(valued, setOptions,
+	                                                      MTLFunctionOptionCompileToBinary);
+	CHECK(valued.options == MTLFunctionOptionCompileToBinary);
+	std::vector<uint8_t> drain;
+	RgfxMsgHeader h;
+	while (fx.ring.next(&h, &drain)) {
+	}
+}
+
 // A Core Image kernel library's extern functions come from its shadow, Metal's own library over
 // the same bytes: their names, each a function of functionType 4 that holds Metal's own, and nil
 // for a name the shadow does not hold; functionNames leaves them out, as Metal's does. Core
@@ -1424,14 +1502,18 @@ void test_core_image_extern_functions()
 	CHECK([swap rgfxShadow].functionType == kRgfxFunctionTypeExtern);
 	CHECK([[swap rgfxShadow].name isEqualToString:@"swap_red_blue"]);
 	CHECK([lib newExternFunctionWithName:@"nope"] == nil);
-	// What the function does not implement, its shadow answers (Core Image reflects a kernel's
-	// return type so); one with no shadow answers only its own.
+	// Its shadow answers what Core Image reflects of the kernel (its return type); a function by
+	// name answers it from a shadow made of its library's on first use.
 	SEL returnType = NSSelectorFromString(@"returnType");
 	CHECK([[swap rgfxShadow] respondsToSelector:returnType] && [swap respondsToSelector:returnType]);
 	id answered = ((id (*)(id, SEL))objc_msgSend)(swap, returnType);
 	id metals = ((id (*)(id, SEL))objc_msgSend)([swap rgfxShadow], returnType);
 	CHECK(answered != nil && [[answered description] isEqualToString:[metals description]]);
-	CHECK(![[lib newFunctionWithName:@"swap_red_blue"] respondsToSelector:returnType]);
+	RgfxFunction *swapByName = (RgfxFunction *)[lib newFunctionWithName:@"swap_red_blue"];
+	CHECK([swapByName rgfxShadow] == nil);
+	id swapType = ((id (*)(id, SEL))objc_msgSend)(swapByName, returnType);
+	CHECK([swapByName rgfxShadow] != nil &&
+	      [[swapType description] isEqualToString:[metals description]]);
 	// A kernel by name is of functionType 4 too, as Metal's.
 	id<MTLFunction> byName = [lib newFunctionWithName:@"scale_red_green"];
 	CHECK(byName.functionType == kRgfxFunctionTypeExtern);
@@ -1450,6 +1532,10 @@ void test_core_image_extern_functions()
 	RgfxLibrary *bare = make(bytes);
 	CHECK(RgfxShadowFunctions(@[ [bare newFunctionWithName:@"swap_red_blue"] ], &err) == nil);
 	CHECK(err.code == RgfxMetalErrorInvalidDescriptor);
+	// Nor any answer of Metal's own: nil, logged.
+	CHECK(((id (*)(id, SEL))objc_msgSend)([bare newFunctionWithName:@"swap_red_blue"], returnType) ==
+	      nil);
+	CHECK(RgfxUnsupportedWasLogged([RgfxFunction class], returnType));
 
 	// Metal's link answers its own library: made ours from its bytes, Metal's kept as the shadow.
 	__block NSArray<id<MTLFunction>> *linkedFrom = nil;
@@ -5093,6 +5179,7 @@ int main()
 		test_function_constants_resolve_as_metal();
 		test_core_image_extern_functions();
 		test_stitched_library_over_shadows();
+		test_function_members_from_shadow();
 		test_command_graph();
 		test_parallel_render_encoder();
 		test_queue_guards();
