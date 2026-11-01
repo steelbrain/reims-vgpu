@@ -1488,15 +1488,16 @@ fn states_whose_arguments_reflection_is_refused_are_decided_by_their_roles() {
     }
 }
 
+/// A pipeline creator's answer in [`linked_answers`]: made, or the `NSError`'s code, or where the
+/// creator dies.
+type LinkedAnswer = Result<Result<(), i64>, reims_vgpu_core::raise::death::DeathSite>;
+
 /// What the compute and render creators answer for `linked_caller.metal`'s functions with
 /// `linked_callee.metal`'s `linked_add_one`, which they call, linked by each list a value
-/// carries, each case named: made, or the `NSError`'s code, or where the creator dies.
+/// carries, each case named.
 fn linked_answers<P: reims_vgpu_core::platform::Platform>(
     d: &P::Device,
-) -> Vec<(
-    &'static str,
-    Result<Result<(), i64>, reims_vgpu_core::raise::death::DeathSite>,
-)> {
+) -> Vec<(&'static str, LinkedAnswer)> {
     let library = |bytes| d.new_library(bytes).unwrap().unwrap().unwrap();
     let (caller, callee) = (library(LINKED_CALLER), library(LINKED_CALLEE));
     let named = |l: &P::Library, name| l.new_function(OnFault::Return, name).unwrap().unwrap();
