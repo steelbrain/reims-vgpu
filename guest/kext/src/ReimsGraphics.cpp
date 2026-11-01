@@ -941,6 +941,13 @@ bool ReimsGraphics::start(IOService *provider)
 		}
 	}
 
+	// The class name user space reads for the framebuffer: IOObjectCopyClass and IOObjectGetClass
+	// answer this property where the service carries it. CoreDisplay takes the display's GPU
+	// vendor from that name, searching it for the vendor names it knows, and keeps WindowServer's
+	// accelerated, transactional display model (kIOWindowServerActiveAttribute) off for a name in
+	// which it finds none, as it does for "ReimsGraphics".
+	setProperty("IOClassNameOverride", "ReimsGraphicsAMD");
+
 	if (super::start(provider))
 		return true;
 fail:
