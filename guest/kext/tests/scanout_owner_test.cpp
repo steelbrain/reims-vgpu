@@ -1,7 +1,7 @@
 // The native test of RgfxScanoutOwner.hpp: only the task that holds the framebuffer's server
 // connection (or whose open of one is in flight) owns the scanout, a new connection's task
 // replaces the old one and takes every other task's hold of the scanout back, a closed connection
-// owns nothing, the VRAM range goes to the kernel and the owner alone, and the scanout's room
+// owns nothing, the VRAM range goes to the owner on its connection alone, and the scanout's room
 // never reaches the accelerator's blocks.
 #include "RgfxScanoutOwner.hpp"
 
@@ -97,10 +97,21 @@ int main()
 	check(rgfxKeepsScanout(ws2, ws2), "the new owner's hold stays");
 	check(!rgfxKeepsScanout(nullptr, ws2), "a hold of no task goes");
 
-	// The VRAM range: the kernel and the owner.
-	check(rgfxMayMapVram(k, k, false), "the kernel maps the VRAM range");
-	check(rgfxMayMapVram(ws, k, true), "the owner does");
+	// The VRAM range: the owner on the connection it holds, and no one else: not the kernel, not
+	// a task whose open is in flight.
+	check(!rgfxMayMapVram(k, k, false) && !rgfxMayMapVram(k, k, true),
+	      "the kernel does not map the VRAM range");
+	check(rgfxMayMapVram(ws, k, true), "the owner on its connection does");
 	check(!rgfxMayMapVram(other, k, false), "no other task does");
+	check(!rgfxMayMapVram(nullptr, k, true), "a null task does not");
+	RgfxScanoutOwner held;
+	marked = held.beginOpen(ws, false);
+	check(held.owns(ws, false) && !held.holdsConnection(ws, false),
+	      "an open in flight owns the scanout but holds no connection");
+	held.endOpen(ws, &connection, marked, &oldTask, &oldClient);
+	check(held.holdsConnection(ws, true), "the made connection is held");
+	check(!held.holdsConnection(ws, false), "a closed one is not");
+	check(!held.holdsConnection(other, true), "nor is another task's");
 
 	// The scanout's room: the span, inside the region, never past the accelerator's blocks.
 	const uint64_t cursor = 256 * 256 * 4;

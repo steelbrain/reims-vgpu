@@ -19,13 +19,15 @@
 //     into the context's window;
 //   - the framebuffer's VRAM range (getVRAMRange), which IOFramebuffer maps into the task that
 //     asks for it on its server connection, and on its shared connection (kIOFBSharedConnectType)
-//     into any task of the console's user.
+//     into any task of the console's user: only the task that holds the server connection gets
+//     it, once the connection is made (rgfxMayMapVram).
 // A task the rule refuses gets an error at that op (kIOReturnNotPermitted, or no memory for the
 // VRAM range); nothing is mapped and nothing panics.
 //
 // While a server connection's open is in flight, its task owns the scanout too: IOFramebuffer
-// sets the display up inside the open (its open()), asking for the VRAM range there, before
-// the connection exists. An open while a connection is held fails, so it marks nothing.
+// sets the display up inside the open (its open()), before the connection exists. The VRAM range
+// it asks for there is refused (rgfxMayMapVram). An open while a connection is held fails, so it
+// marks nothing.
 //
 // One task owns the scanout at a time: a new server connection's task replaces the one before
 // it, and every other task's hold of the scanout is taken back then (rgfxKeepsScanout): each
@@ -66,7 +68,14 @@ struct RgfxScanoutOwner {
 	// Whether `who` owns the scanout, `active` whether the recorded connection is still open.
 	bool owns(const void *who, bool active) const
 	{
-		return who && (who == opening || (who == task && client && active));
+		return who && (who == opening || holdsConnection(who, active));
+	}
+
+	// Whether `who` holds the server connection, made and still open (`active`): an owner whose
+	// open is no longer in flight.
+	bool holdsConnection(const void *who, bool active) const
+	{
+		return who && who == task && client && active;
 	}
 
 	// A server connection's open by `who` begins, `active` whether the recorded one is still
@@ -114,11 +123,13 @@ inline bool rgfxKeepsScanout(const void *holder, const void *owner)
 	return holder && holder == owner;
 }
 
-// Whether `who` may be given the framebuffer's VRAM range: the kernel (IOFramebuffer's own setup
-// and power work) and the scanout's owner.
-inline bool rgfxMayMapVram(const void *who, const void *kernel, bool owner)
+// Whether `who` may be given the framebuffer's VRAM range: the scanout's owner on the server
+// connection it holds (`connected`, RgfxScanoutOwner::holdsConnection), which maps it through that
+// connection. IOFramebuffer's own setup asks too, in the kernel and inside the connection's open,
+// and gets none: it publishes the range's size (kIOFBMemorySizeKey) from that answer alone.
+inline bool rgfxMayMapVram(const void *who, const void *kernel, bool connected)
 {
-	return who == kernel || owner;
+	return who && who != kernel && connected;
 }
 
 #endif // RGFX_SCANOUT_OWNER_HPP_

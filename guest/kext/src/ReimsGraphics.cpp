@@ -1092,18 +1092,28 @@ IODeviceMemory *ReimsGraphics::getApertureRange(IOPixelAperture aperture)
 	return IODeviceMemory::withSubRange(region, RGFX_ALLOCATIONS_OFFSET, length);
 }
 
-// The scanout's room. IOFramebuffer asks for it in its own setup, where it reads the room's size
-// and the aperture's offset in it, and maps it into the task that asks for it on a user client
-// (its server connection, and its shared one for any task of the console's user), calling this
-// on that task's thread (IOGraphics' open source, clientMemoryForType). So the room goes to the
-// kernel and to the scanout's owner alone, and any other task gets none (RgfxScanoutOwner.hpp).
+// The scanout's room. IOFramebuffer maps it into the task that asks for it on a user client (its
+// server connection, and its shared one for any task of the console's user), calling this on that
+// task's thread (IOGraphics' open source, clientMemoryForType). It asks in its own setup too (in
+// the kernel, and inside the server connection's open), where it reads the room's size into
+// kIOFBMemorySizeKey and the aperture's offset in it. So the room goes to the scanout's owner on
+// the connection it holds alone, and IOFramebuffer's setup in the kernel or in the open and every
+// other task get none (RgfxScanoutOwner.hpp): the framebuffer publishes no memory size, unless the
+// owner sets a new mode, whose setup runs on the owner's thread. The aperture (getApertureRange),
+// which the kernel maps for the console, is another range, and stays.
 IODeviceMemory *ReimsGraphics::getVRAMRange()
 {
 	if (!region)
 		return nullptr;
 	task_t task = current_task();
-	bool owner = task != kernel_task && ownsScanout(task);
-	bool given = rgfxMayMapVram(task, kernel_task, owner);
+	bool connected = false;
+	if (task != kernel_task && stateLock) {
+		IOLockLock(stateLock);
+		const IOUserClient *client = static_cast<const IOUserClient *>(scanoutOwner.client);
+		connected = scanoutOwner.holdsConnection(task, client && !client->isInactive());
+		IOLockUnlock(stateLock);
+	}
+	bool given = rgfxMayMapVram(task, kernel_task, connected);
 	static char site;
 	RgfxCaller caller;
 	if (caller.pid != 0 && rgfxFirstCalls(&site, static_cast<UInt64>(caller.pid), 4))
