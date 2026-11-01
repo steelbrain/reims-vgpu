@@ -24,9 +24,10 @@
 //!   more with constexpr samplers, whose order Metal itself does not decide, and a function a
 //!   table can hold whose samplers the runtime cannot read, among them. One linked function
 //!   alone, of `functions` or `privateFunctions`, called or not, is numbered as Metal numbers it.
-//!   No guest form here links a function. This platform's libraries, functions and states hold the
-//!   runtime's exactly as long as the guest's handles to them live, so its sampler IDs are Metal's
-//!   (`tests::sampler_ids_follow_pipeline_holders_as_metals`).
+//!   The paravirtualized device's guest forms link none; the graphics wire's pipelines link the
+//!   functions the guest lists (`reims-vgpu`'s decoder). This platform's libraries, functions and
+//!   states hold the runtime's exactly as long as the guest's handles to them live, so its sampler
+//!   IDs are Metal's (`tests::sampler_ids_follow_pipeline_holders_as_metals`).
 //! - **A pipeline's refusals** that Metal answers with an `NSError` are one here
 //!   ([`pipeline_error`]): what the compile finds wrong with the functions or the descriptor, a
 //!   vertex function writing a point size under a line or triangle topology, a function Metal's
@@ -591,7 +592,8 @@ pub(crate) fn new_render_pipeline_state_full(
 }
 
 /// The runtime's linked functions of a whole value's: each function as a stage links it, with its
-/// constant values, and precompiled where it was made compiled to a binary.
+/// constant values, under its specialized name where it was made with one, and precompiled where
+/// it was made compiled to a binary.
 fn linked_functions(l: &LinkedFunctionsDesc<VulkanPlatform>) -> LinkedFunctions {
     let list = |fs: &[VulkanFunction]| fs.iter().map(|f| f.linked_function()).collect();
     let mut out = LinkedFunctions::new();
@@ -1418,26 +1420,185 @@ mod tests {
     pub(super) const LINKED_CALLEE: &[u8] =
         include_bytes!(concat!(env!("OUT_DIR"), "/linked_callee.metallib"));
 
-    /// The runtime's function descriptor has no specialized name, so a function asked for with
-    /// one is nil, and the same function without one is made
-    #[test]
-    fn a_function_with_a_specialized_name_is_refused() {
-        use crate::gpu::resource::VulkanLibrary;
-        let callee: VulkanLibrary = dev()
-            .new_library(include_bytes!(concat!(
-                env!("OUT_DIR"),
-                "/linked_callee.metallib"
-            )))
+    /// The float constant of `index` whose value is `v`.
+    fn float_constant(index: u32, v: f32) -> reims_vgpu_core::platform::resource::FunctionConstant {
+        let mut value = [0; reims_vgpu_core::platform::resource::FunctionConstant::MAX_BYTES];
+        value[..4].copy_from_slice(&v.to_le_bytes());
+        reims_vgpu_core::platform::resource::FunctionConstant {
+            index,
+            data_type: 3,
+            value,
+        }
+    }
+
+    /// `linked_callee.metal`'s `linked_gradient` of `callee` with `linked_gradient_scale` 0.5,
+    /// made by descriptor under `specialized` where given: the function RenderBox links under
+    /// `custom_fn`. `None` where the library makes none.
+    pub(super) fn gradient<P: reims_vgpu_core::platform::Platform>(
+        callee: &P::Library,
+        specialized: Option<&str>,
+    ) -> Option<P::Function> {
+        callee
+            .new_function_with_options(
+                OnFault::Return,
+                "linked_gradient",
+                &[float_constant(1, 0.5)],
+                0,
+                specialized,
+            )
             .unwrap()
+    }
+
+    /// What `linked_caller.metal`'s `linked_effect_fragment` of `caller`, with
+    /// `linked_effect_alpha` 0.75 and `linked` linked to its stage (RenderBox's custom effect),
+    /// writes for each pixel of a 4x4 target on `p`'s device `d`, by its bits: `None` where the
+    /// pipeline is refused.
+    pub(super) fn custom_effect<P: reims_vgpu_core::platform::Platform>(
+        p: &P,
+        d: &P::Device,
+        caller: &P::Library,
+        linked: &P::Function,
+    ) -> Option<Vec<[u32; 4]>> {
+        use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
+        use reims_vgpu_core::platform::descriptor::RenderPassDescriptor as _;
+        use reims_vgpu_core::platform::render::{RenderCmd, RenderEncoder as _};
+        use reims_vgpu_core::platform::resource::Buffer as _;
+        use reims_vgpu_core::platform::types::NsRange;
+        use reims_vgpu_core::platform::values::{ColorAttachmentSet, TextureDesc};
+        let _pool = reims_vgpu_core::rt::Pool::here();
+        let vertex = caller
+            .new_function(OnFault::Die, "linked_effect_vertex")
             .unwrap()
             .unwrap();
-        let with = |specialized| {
-            callee
-                .new_function_with_options(OnFault::Return, "linked_add_one", &[], 0, specialized)
-                .unwrap()
+        let fragment = caller
+            .new_function_with_options(
+                OnFault::Return,
+                "linked_effect_fragment",
+                &[float_constant(0, 0.75)],
+                0,
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        let state = d
+            .new_render_pipeline_state_full(&FullRenderPipelineDesc {
+                label: Some("custom effect"),
+                vertex: &vertex,
+                fragment: Some(&fragment),
+                vertex_descriptor: None,
+                colors: vec![(
+                    0,
+                    ColorAttachmentDesc {
+                        pixel_format: 80,
+                        ..ColorAttachmentDesc::default()
+                    },
+                )],
+                depth_pixel_format: 0,
+                stencil_pixel_format: 0,
+                raster_sample_count: 1,
+                alpha_to_coverage: false,
+                alpha_to_one: false,
+                rasterization_enabled: true,
+                input_primitive_topology: 0,
+                max_vertex_amplification_count: 1,
+                support_indirect_command_buffers: false,
+                vertex_linked: LinkedFunctionsDesc::default(),
+                fragment_linked: LinkedFunctionsDesc {
+                    functions: vec![linked.clone_ref()],
+                    ..LinkedFunctionsDesc::default()
+                },
+            })
+            .ok()??;
+        let out = d
+            .new_buffer_of_length(OnFault::Die, 16 * 16, 0)
+            .unwrap()
+            .unwrap();
+        let target = d
+            .new_texture(
+                OnFault::Die,
+                &p.texture_descriptor(&TextureDesc {
+                    texture_type: 2,
+                    pixel_format: 80,
+                    width: 4,
+                    height: 4,
+                    usage: 4,
+                    resource_options: Some(0x20),
+                    ..TextureDesc::default()
+                }),
+            )
+            .unwrap()
+            .unwrap();
+        let pass = p.render_pass_descriptor();
+        let attachment = ColorAttachmentSet {
+            texture: Some(Some(&target)),
+            ..ColorAttachmentSet::default()
         };
-        assert!(with(Some("custom_fn")).is_none());
-        assert!(with(None).is_some());
+        pass.set_color_attachment(OnFault::Die, 0, &attachment)
+            .unwrap();
+        let q = d.new_command_queue().unwrap();
+        let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
+        let e = cb.render_encoder(OnFault::Die, &pass).unwrap().unwrap();
+        let buffers = [Some(&out)];
+        for cmd in [
+            RenderCmd::SetRenderPipelineState {
+                pipeline_state: Some(&state),
+            },
+            RenderCmd::SetFragmentBuffers {
+                buffers: &buffers,
+                offsets: &[0],
+                range: NsRange::new(0, 1),
+            },
+            RenderCmd::DrawPrimitives {
+                primitive_type: 3,
+                vertex_start: 0,
+                vertex_count: 3,
+            },
+            RenderCmd::EndEncoding,
+        ] {
+            e.encode(OnFault::Die, cmd).unwrap();
+        }
+        cb.commit(OnFault::Die).unwrap();
+        cb.wait_until_completed(OnFault::Die).unwrap();
+        assert!(cb.error().is_none(), "{:?}", cb.error());
+        // SAFETY: a Shared buffer of 16 float4s, read after the command buffer completed.
+        let floats = unsafe { std::slice::from_raw_parts(out.contents().as_ptr::<f32>(), 64) };
+        Some(
+            floats
+                .chunks(4)
+                .map(|c| [0, 1, 2, 3].map(|i| c[i].to_bits()))
+                .collect(),
+        )
+    }
+
+    /// RenderBox's custom effect: a function made with a specialized name answers it as its
+    /// name, and a fragment function that calls a visible function of that name links it, its
+    /// own constants and the linked function's each read; each pixel reads the linked
+    /// `linked_gradient` at its centre with `linked_gradient_scale` 0.5, and alpha
+    /// `linked_effect_alpha` 0.75. The same function made under its own name, or under another,
+    /// leaves the call unresolved, and the pipeline refused
+    #[test]
+    fn a_function_with_a_specialized_name_links_under_it() {
+        use crate::gpu::resource::VulkanLibrary;
+        let (p, d) = (crate::platform::tests::platform(), dev());
+        let library = |bytes| -> VulkanLibrary { d.new_library(bytes).unwrap().unwrap().unwrap() };
+        let (caller, callee) = (library(LINKED_CALLER), library(LINKED_CALLEE));
+        let custom = gradient::<VulkanPlatform>(&callee, Some("custom_fn")).unwrap();
+        assert_eq!(custom.name(), "custom_fn");
+        let drawn = custom_effect(&p, &d, &caller, &custom).expect("the pipeline was refused");
+        let want: Vec<[u32; 4]> = (0u8..16)
+            .map(|i| {
+                let (x, y) = (f32::from(i % 4) + 0.5, f32::from(i / 4) + 0.5);
+                [x * 0.5, y * 0.25, 0.5, 0.75].map(f32::to_bits)
+            })
+            .collect();
+        assert_eq!(drawn, want);
+        for specialized in [None, Some("other_fn")] {
+            let linked = gradient::<VulkanPlatform>(&callee, specialized).unwrap();
+            let name = specialized.unwrap_or("linked_gradient");
+            assert_eq!(linked.name(), name);
+            let refused = catch_death(|| custom_effect(&p, &d, &caller, &linked));
+            assert!(matches!(refused, Ok(None)), "{name}: {refused:?}");
+        }
     }
 
     /// A vertex function that calls a visible function its library does not define is made with

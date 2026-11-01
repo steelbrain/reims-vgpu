@@ -4338,11 +4338,23 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn on_metal_a_linked_function_s_specialized_name_resolves_its_call() {
-        use crate::platform::ApiPlatform as _;
-        use reims_vgpu_metal::MetalPlatform;
-        let platform = MetalPlatform::process();
+        a_linked_function_s_specialized_name_resolves_its_call::<reims_vgpu_metal::MetalPlatform>();
+    }
+
+    /// [`on_metal_a_linked_function_s_specialized_name_resolves_its_call`] on the Vulkan
+    /// platform, whose answers are Metal's
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn on_vulkan_a_linked_function_s_specialized_name_resolves_its_call() {
+        a_linked_function_s_specialized_name_resolves_its_call::<reims_vgpu_vulkan::VulkanPlatform>(
+        );
+    }
+
+    /// The cases of [`on_metal_a_linked_function_s_specialized_name_resolves_its_call`] on `P`.
+    fn a_linked_function_s_specialized_name_resolves_its_call<P: crate::platform::ApiPlatform>() {
+        let platform = P::process();
         let device = platform.metal_device(None).unwrap();
-        let mut dec = GraphicsDecoder::<MetalPlatform>::new(
+        let mut dec = GraphicsDecoder::<P>::new(
             Arc::clone(&platform),
             Arc::new(reims_graphics::region::Region::new(0x10000).unwrap()),
         );

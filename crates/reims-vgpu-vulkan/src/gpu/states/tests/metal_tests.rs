@@ -1488,6 +1488,38 @@ fn states_whose_arguments_reflection_is_refused_are_decided_by_their_roles() {
     }
 }
 
+/// RenderBox's custom effect is Metal's: the fragment function that calls `custom_fn` links the
+/// function made under that specialized name and reads, at every pixel, the bits Metal's reads;
+/// with the function made under its own name or another, the pipeline is refused on both. (What
+/// each function answers as its name is Metal's too: the Metal platform's
+/// `a_specialized_name_resolves_a_kernel_s_call`.)
+#[test]
+fn a_function_linked_under_a_specialized_name_is_metals() {
+    use reims_vgpu_metal::MetalPlatform;
+    let Some(md) = MetalPlatform::system_default_device() else {
+        return;
+    };
+    let mp = MetalPlatform::new(Box::new(crate::gpu::device::tests::metal_tests::NoLauncher));
+    let (p, d) = (crate::platform::tests::platform(), dev());
+    let library = |bytes| d.new_library(bytes).unwrap().unwrap().unwrap();
+    let (caller, callee) = (library(LINKED_CALLER), library(LINKED_CALLEE));
+    let metal_library = |bytes| md.new_library(bytes).unwrap().unwrap().unwrap();
+    let (metal_caller, metal_callee) = (metal_library(LINKED_CALLER), metal_library(LINKED_CALLEE));
+    for specialized in [Some("custom_fn"), None, Some("other_fn")] {
+        let ours = gradient::<VulkanPlatform>(&callee, specialized).unwrap();
+        let metals = gradient::<MetalPlatform>(&metal_callee, specialized).unwrap();
+        assert_eq!(ours.name(), specialized.unwrap_or("linked_gradient"));
+        let want = custom_effect(&mp, &md, &metal_caller, &metals);
+        assert_eq!(
+            want.is_some(),
+            specialized == Some("custom_fn"),
+            "{specialized:?}"
+        );
+        let drawn = catch_death(|| custom_effect(&p, &d, &caller, &ours));
+        assert_eq!(drawn, Ok(want), "{specialized:?}");
+    }
+}
+
 /// A pipeline creator's answer in [`linked_answers`]: made, or the `NSError`'s code, or where the
 /// creator dies.
 type LinkedAnswer = Result<Result<(), i64>, reims_vgpu_core::raise::death::DeathSite>;
