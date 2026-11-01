@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <cstring>
 
+#include "RgfxManagedLayout.hpp"
 #include "RgfxMemoryShadow.hpp"
 #include "RgfxRegion.hpp"
 #include "RgfxSerializer.hpp"
@@ -423,6 +424,73 @@ RGFX_RESOURCE_SPI
 	                              bytesPerRow:bytesPerRow
 	                                   device:self.device
 	                               serializer:[self serializer]];
+}
+
+// A texture over the buffer's bytes from `offset`, rows `bytesPerRow` apart, as
+// newTextureWithDescriptor:offset:bytesPerRow: makes one (TEXTURE_FROM_BUFFER), with the buffer's
+// storage. WindowServer's MetalTiledBacking makes one for each tile of a window's backing: on the
+// x86-64 guest (macOS 26) the display's backing is a Shared buffer of 3840 x 2400 BGRA8 pixels
+// (36864000 bytes), and the tile a 2D BGRA8Unorm descriptor of 1024 x 1024, usage ShaderRead |
+// RenderTarget, storage Managed, at offset 0 with the backing's pitch, 15360 bytes a row.
+//
+// Measured on the M3 Max under macOS 27.0.1: the buffer of Metal's validation layer
+// (MTLDebugBuffer) answers the selector, checks the call and passes it to the driver's buffer,
+// which on the M3 (AGXG15XFamilyBuffer, of every storage mode) does not answer it, so the M3 makes
+// no such texture. The validation asserts that the descriptor's storage is Managed, that the
+// buffer's is Shared, and that offset + bytesPerRow x (height - 1) + the row's bytes fit in the
+// buffer (a 1024 x 1024 RGBA32Float tile at a pitch of 61440 needs 62869504 bytes); any offset
+// and pitch past that pass (an offset of 4, a pitch of 4100). WindowServer's arguments pass. Not
+// measured: what the driver of a GPU with Managed storage answers, as no such GPU is on hand, nor
+// how Metal refuses what its validation asserts at: the bundle answers nil, logged once for each
+// rule, as it does for the linear form's.
+- (id<MTLTexture>)newTiledTextureWithDescriptor:(MTLTextureDescriptor *)descriptor
+                                         offset:(NSUInteger)offset
+                                    bytesPerRow:(NSUInteger)bytesPerRow
+{
+	if (descriptor == nil) {
+		return nil;
+	}
+	if (descriptor.storageMode != MTLStorageModeManaged) {
+		static std::atomic<bool> logged{false};
+		if (!logged.exchange(true)) {
+			NSLog(@"RGFX: a tiled texture over buffer 0x%llx with descriptor storage %lu, not "
+			      @"Managed, which Metal's validation asserts at: answered nil",
+			      (unsigned long long)[self rgfxObjId], (unsigned long)descriptor.storageMode);
+		}
+		return nil;
+	}
+	if ([self storageMode] != MTLStorageModeShared) {
+		static std::atomic<bool> logged{false};
+		if (!logged.exchange(true)) {
+			NSLog(@"RGFX: a tiled texture over buffer 0x%llx of storage %lu, not Shared, which "
+			      @"Metal's validation asserts at: answered nil",
+			      (unsigned long long)[self rgfxObjId], (unsigned long)[self storageMode]);
+		}
+		return nil;
+	}
+	RgfxFormatBlock block = {};
+	if (rgfxPixelFormatBlock(static_cast<uint32_t>(descriptor.pixelFormat), &block) &&
+	    block.linear && descriptor.height > 0) {
+		const unsigned __int128 needs =
+		    static_cast<unsigned __int128>(offset) +
+		    static_cast<unsigned __int128>(bytesPerRow) * (descriptor.height - 1) +
+		    static_cast<unsigned __int128>(descriptor.width) * block.bytes;
+		if (needs > [self length]) {
+			static std::atomic<bool> logged{false};
+			if (!logged.exchange(true)) {
+				NSLog(@"RGFX: a tiled texture past buffer 0x%llx's %lu bytes (offset %lu, "
+				      @"%lu bytes a row, %lu x %lu), which Metal's validation asserts at: "
+				      @"answered nil",
+				      (unsigned long long)[self rgfxObjId], (unsigned long)[self length],
+				      (unsigned long)offset, (unsigned long)bytesPerRow,
+				      (unsigned long)descriptor.width, (unsigned long)descriptor.height);
+			}
+			return nil;
+		}
+	}
+	MTLTextureDescriptor *shared = [descriptor copy];
+	shared.storageMode = [self storageMode];
+	return [self newTextureWithDescriptor:shared offset:offset bytesPerRow:bytesPerRow];
 }
 
 // A texture over the buffer's bytes as Metal's linear form makes one, which the host's platform

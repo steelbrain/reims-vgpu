@@ -527,6 +527,114 @@ void test_texture_cpu_copies()
 	}
 }
 
+// A tiled texture (newTiledTextureWithDescriptor:offset:bytesPerRow:, RgfxBuffer.mm), as
+// WindowServer's MetalTiledBacking makes one: a tile of a Shared backing buffer at the backing's
+// pitch, from a Managed descriptor. It is a texture over the buffer's bytes with the buffer's
+// storage (TEXTURE_FROM_BUFFER), whose CPU copies read and write the tile's bytes in the
+// buffer. What Metal's validation asserts at answers nil and posts nothing.
+void test_tiled_texture_over_backing()
+{
+	Fixture fx;
+	@autoreleasepool {
+	// A backing of 8 x 6 BGRA8 pixels, 32 bytes a row, and a 3 x 2 tile of it at (2, 3).
+	const NSUInteger pitch = 32, tileOffset = 3 * pitch + 2 * 4;
+	std::vector<uint8_t> memory(pitch * 6, 0xee);
+	RgfxBuffer *buf = [RgfxBuffer bufferOverHostMemoryWithContents:memory.data()
+	                                                  regionOffset:0x10000
+	                                                        length:memory.size()
+	                                                       options:MTLResourceStorageModeShared
+	                                                   deallocator:nil
+	                                                        device:nil
+	                                                    serializer:&fx.ser];
+	CHECK(buf != nil);
+	RgfxMsgHeader h = {};
+	std::vector<uint8_t> bytes;
+	while (fx.ring.next(&h, &bytes)) {
+	}
+	MTLTextureDescriptor *desc =
+	    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+	                                                       width:3
+	                                                      height:2
+	                                                   mipmapped:NO];
+	desc.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+	desc.storageMode = MTLStorageModeManaged;
+#pragma clang diagnostic pop
+	id<RgfxMetalBufferInternals> tiled = (id<RgfxMetalBufferInternals>)buf;
+	id<MTLTexture> tex = [tiled newTiledTextureWithDescriptor:desc
+	                                                    offset:tileOffset
+	                                               bytesPerRow:pitch];
+	CHECK(tex != nil && tex.buffer == buf && tex.bufferOffset == tileOffset &&
+	      tex.bufferBytesPerRow == pitch);
+	CHECK(tex.storageMode == MTLStorageModeShared && tex.width == 3 && tex.height == 2);
+	auto made = expectMessage<RgfxTextureFromBuffer>(fx.ring, RGFX_CMD_TEXTURE_FROM_BUFFER);
+	CHECK(made.buffer_obj_id == buf.rgfxObjId && made.offset == tileOffset &&
+	      made.bytes_per_row == pitch);
+	CHECK(made.desc.width == 3 && made.desc.height == 2 &&
+	      made.desc.pixel_format == MTLPixelFormatBGRA8Unorm &&
+	      (made.desc.options & MTLResourceStorageModeMask) == MTLResourceStorageModeShared);
+	CHECK(ringEmpty(fx.ring));
+
+	// The CPU's bytes in the backing are the tile's texels, and the tile's writes land there.
+	for (NSUInteger i = 0; i < memory.size(); i++)
+		memory[i] = static_cast<uint8_t>(i);
+	uint8_t out[3 * 4 * 2] = {};
+	[tex getBytes:out bytesPerRow:12 fromRegion:MTLRegionMake2D(0, 0, 3, 2) mipmapLevel:0];
+	CHECK(std::memcmp(&out[0], &memory[tileOffset], 12) == 0);
+	CHECK(std::memcmp(&out[12], &memory[tileOffset + pitch], 12) == 0);
+	uint8_t in[8] = {0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7};
+	[tex replaceRegion:MTLRegionMake2D(1, 1, 2, 1) mipmapLevel:0 withBytes:in bytesPerRow:8];
+	CHECK(std::memcmp(&memory[tileOffset + pitch + 4], in, 8) == 0);
+	CHECK(memory[tileOffset + pitch] == static_cast<uint8_t>(tileOffset + pitch)); // beside it
+	CHECK(memory[tileOffset + pitch + 12] == static_cast<uint8_t>(tileOffset + pitch + 12));
+
+	// Metal's validation's rules: a descriptor other than Managed, and a tile past the
+	// buffer's bytes (offset + pitch x (height - 1) + the row's bytes), answer nil.
+	desc.storageMode = MTLStorageModeShared;
+	CHECK([tiled newTiledTextureWithDescriptor:desc offset:tileOffset bytesPerRow:pitch] == nil);
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+	desc.storageMode = MTLStorageModeManaged;
+#pragma clang diagnostic pop
+	const NSUInteger last = memory.size() - (pitch + 3 * 4); // the last offset that fits
+	id<MTLTexture> atLast = [tiled newTiledTextureWithDescriptor:desc
+	                                                       offset:last
+	                                                  bytesPerRow:pitch];
+	CHECK(atLast != nil);
+	CHECK(expectMessage<RgfxTextureFromBuffer>(fx.ring, RGFX_CMD_TEXTURE_FROM_BUFFER).offset ==
+	      last);
+	CHECK([tiled newTiledTextureWithDescriptor:desc offset:last + 4 bytesPerRow:pitch] == nil);
+	// Any offset and pitch inside the buffer: no alignment is asked.
+	id<MTLTexture> odd = [tiled newTiledTextureWithDescriptor:desc offset:4 bytesPerRow:pitch + 4];
+	CHECK(odd != nil);
+	CHECK(expectMessage<RgfxTextureFromBuffer>(fx.ring, RGFX_CMD_TEXTURE_FROM_BUFFER)
+	          .bytes_per_row == pitch + 4);
+	while (fx.ring.next(&h, &bytes)) {
+	}
+
+	// A buffer other than Shared answers nil.
+	std::vector<uint8_t> other(pitch * 6, 0);
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+	RgfxBuffer *managed = [RgfxBuffer bufferOverHostMemoryWithContents:other.data()
+	                                                      regionOffset:0x20000
+	                                                            length:other.size()
+	                                                           options:MTLResourceStorageModeManaged
+	                                                       deallocator:nil
+	                                                            device:nil
+	                                                        serializer:&fx.ser];
+#pragma clang diagnostic pop
+	CHECK(managed != nil);
+	while (fx.ring.next(&h, &bytes)) {
+	}
+	CHECK([(id<RgfxMetalBufferInternals>)managed newTiledTextureWithDescriptor:desc
+	                                                                    offset:0
+	                                                               bytesPerRow:pitch] == nil);
+	CHECK(ringEmpty(fx.ring));
+	}
+}
+
 // A texture wrapper's create routes an RGFX_CMD_TEXTURE_CREATE onto the ring
 // (device-placed: a GPU address and a resource id are picked, heap_obj_id 0), and
 // its getters answer the mapped descriptor. The RgfxBuffer routing pattern, for
@@ -5751,6 +5859,7 @@ int main()
 		test_shared_event_routing();
 		test_texture_routing();
 		test_texture_cpu_copies();
+		test_tiled_texture_over_backing();
 		test_texture_views();
 		test_view_keeps_its_texture();
 		test_texture_resource_ids();

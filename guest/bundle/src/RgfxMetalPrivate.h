@@ -203,6 +203,11 @@ NS_ASSUME_NONNULL_BEGIN
                                                   offset:(NSUInteger)offset
                                              bytesPerRow:(NSUInteger)bytesPerRow
                                            bytesPerImage:(NSUInteger)bytesPerImage;
+// `@40@0:8@16Q24Q32` (Metal's validation layer's MTLDebugBuffer): a texture over a Shared
+// buffer's bytes from a Managed descriptor, rows `bytesPerRow` apart (RgfxBuffer.mm).
+- (nullable id<MTLTexture>)newTiledTextureWithDescriptor:(MTLTextureDescriptor *)descriptor
+                                                 offset:(NSUInteger)offset
+                                            bytesPerRow:(NSUInteger)bytesPerRow;
 @end
 
 @protocol RgfxMetalTextureInternals <RgfxMetalResourceInternals>
