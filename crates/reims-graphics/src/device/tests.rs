@@ -1022,6 +1022,30 @@ fn a_command_buffer_published_before_its_queue_create_completes() {
     );
 }
 
+/// A `QUEUE_CREATE` of a context the host refuses (its work failed off its op's thread) is
+/// refused and makes no rings; another context's is made
+#[test]
+fn a_refused_context_s_queue_create_makes_no_rings() {
+    struct Refusing;
+    impl Host for Refusing {
+        fn raise_interrupt(&self, _vector: u32) {}
+        fn scanout_written(&self, _offset: u64, _length: u64) -> bool {
+            false
+        }
+        fn context_refused(&self, context: u32) -> bool {
+            context == 7
+        }
+    }
+    let mut rig = Rig::with_host(Box::new(Refusing));
+    rig.start();
+    let seqno = rig.send(queue_create((7 << RGFX_CONTEXT_OBJ_ID_SHIFT) | 1));
+    assert_eq!(rig.complete(), (seqno, RGFX_STATUS_REFUSED));
+    assert_eq!(rig.device.queue_count(), 0);
+    let seqno = rig.send(queue_create((8 << RGFX_CONTEXT_OBJ_ID_SHIFT) | 1));
+    assert_eq!(rig.complete(), (seqno, RGFX_STATUS_OK));
+    assert_eq!(rig.device.queue_count(), 1);
+}
+
 /// A `QUEUE_CREATE` on ring 0 with valid ring parameters makes a command queue's own submission and
 /// completion rings and a service thread before it is answered, and the host is handed the
 /// queue's `QUEUE_CREATE` first; a `COMMAND_BUFFER` published on the queue's submission ring

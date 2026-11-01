@@ -498,8 +498,9 @@ read of the buffer, and itself, in the scope of the decode that added it. A
 death in that read (a failure no Metal answer matches, which the Vulkan
 platform reads on the runtime's thread) fails the command buffer, whose
 `CB_COMPLETE` is an internal error, and fails its context: the host refuses
-the context's later command buffers, creates and library lookups at once,
-carries out its destroys, and forgets the failure at its close. A release the
+the context's later command buffers, creates (its queues' and samplers'
+among them), library lookups and heap-size and argument-layout queries at
+once, carries out its destroys, and forgets the failure at its close. A release the
 platform dies at (at a destroy, a context's close, or the display's swap of
 the texture it shows) is refused alone, and the destroy or the close is
 carried out whole. What dies elsewhere off the op's thread still ends the

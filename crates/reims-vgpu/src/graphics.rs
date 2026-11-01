@@ -61,8 +61,9 @@ use crate::error::Error;
 use crate::graphics::compile::{CompilePool, Pending};
 use crate::graphics::completion::cb_failed;
 use crate::graphics::decode::{
-    CompletionSink, DecodeError, GraphicsDecoder, LibraryJob, LibraryStart, MadeLibrary,
-    PipelineJob, ReflectionSink, compile_refusing, complete, make_library, refused_reply, refusing,
+    CompletionSink, DecodeError, FailedContexts, GraphicsDecoder, LibraryJob, LibraryStart,
+    MadeLibrary, PipelineJob, ReflectionSink, compile_refusing, complete, make_library,
+    refused_reply, refusing,
 };
 use crate::graphics::device_info::device_info;
 use crate::graphics::present::{PresentAnswers, PresentQueue};
@@ -170,6 +171,7 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             decoder.set_unified_memory(unified_memory);
             let presented = Arc::new(Presented::default());
             let control = Arc::new(GraphicsControl {
+                failed: decoder.failed_contexts(),
                 decoder: Mutex::new(decoder),
                 device: gpu_device,
                 presents: Arc::new(PresentQueue::new(Arc::clone(&presented))),
@@ -275,6 +277,9 @@ struct GraphicsControl<P: ApiPlatform> {
     pool: CompilePool,
     /// The pipelines being compiled, which a command buffer naming one waits for.
     pending: Pending,
+    /// The decoder's failed contexts, which the device asks of at a `QUEUE_CREATE`
+    /// (`Host::context_refused`) with no lock of the decoder's taken.
+    failed: Arc<FailedContexts>,
 }
 
 /// The IOSurface the display pipe shows in place of the scanout (`PRESENT_SURFACE`): the texture
@@ -650,9 +655,9 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     /// size and alignment, or a refusal, which the guest answers by a bound of its own.
     fn heap_texture_size(&self, poster: &CompletionPoster, message: &[u8]) {
         let answer = entry::run(|_| {
-            self.decoder
-                .lock()
-                .heap_texture_size_and_align(&self.device, message)
+            let mut decoder = self.decoder.lock();
+            decoder.set_context(Some(sender_context(poster, message)));
+            decoder.heap_texture_size_and_align(&self.device, message)
         });
         if let Some(answer) = answer {
             poster.post(answer.as_bytes());
@@ -851,6 +856,10 @@ impl<P: ApiPlatform> Host for CallbackHost<P> {
 
     fn context_closed(&self, context: u32, answer: CompleteAnswer) {
         self.control.close_context(context, answer);
+    }
+
+    fn context_refused(&self, context: u32) -> bool {
+        self.control.failed.has(context)
     }
 
     fn block_released(&self, release: &RgfxBlockRelease, answer: CompleteAnswer) {

@@ -2813,3 +2813,150 @@ fn a_release_the_platform_dies_at_is_refused() {
     );
     assert_eq!(device.decoder_object_count(), 1);
 }
+
+/// Fails context `context` as the platform does off its op's thread: makes its queue 1 over
+/// `submit` and `complete`, runs command buffer 100 on it, and completes the buffer with a read
+/// that dies ([`World::complete_dying_read`]), taking its failed completion.
+///
+/// [`World::complete_dying_read`]: reims_vgpu_core::testkit::objects::World::complete_dying_read
+fn fail_context(
+    device: &GraphicsDevice<FakePlatform>,
+    platform: &FakePlatform,
+    guest: &mut Guest,
+    context: u32,
+    (submit, complete): (u64, u64),
+) {
+    const RING_DATA: u32 = 0x1_0000;
+    assert_eq!(
+        answered(
+            device,
+            guest,
+            queue_create(context, 1, submit, complete, RING_DATA, 0)
+        ),
+        RGFX_STATUS_OK
+    );
+    let mut ring = QueueRing::new(device, submit, complete, u64::from(RING_DATA));
+    ring.send(device, command_buffer(obj(context, 1), 100));
+    let cb = committed(platform, 1)[0];
+    assert!(platform.world().complete_dying_read(
+        cb,
+        "a failure none of Metal's",
+        CompleteOn::Thread
+    ));
+    let failed = ring.event().expect("the failed buffer's completion");
+    let failed = RgfxCbComplete::read_from_bytes(&failed).unwrap();
+    assert_eq!((failed.cb_obj_id, failed.status), (100, RGFX_CB_INTERNAL));
+}
+
+/// A failed context's queue creates and queries are refused as its other work is: a
+/// `QUEUE_CREATE` makes no rings, and a heap texture size query and an argument layout query are
+/// answered refused, the platform not asked and nothing written; another context's are answered
+#[test]
+fn a_failed_context_s_queues_and_queries_are_refused() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform) = headless_on(&raised);
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    const SUBMIT: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET;
+    const COMPLETE: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x2_0000;
+    const NEXT_SUBMIT: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x4_0000;
+    const NEXT_COMPLETE: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x6_0000;
+    const BLOCK: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x10_0000;
+    const OTHER_BLOCK: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x20_0000;
+    const SIZE: u64 = 0x1000;
+    fail_context(&device, &platform, &mut guest, 3, (SUBMIT, COMPLETE));
+
+    // The queue create.
+    assert_eq!(
+        answered(
+            &device,
+            &mut guest,
+            queue_create(3, 2, NEXT_SUBMIT, NEXT_COMPLETE, 0x1_0000, 0)
+        ),
+        RGFX_STATUS_REFUSED
+    );
+    assert_eq!(
+        device.graphics_queue_count(),
+        1,
+        "the refused queue's rings"
+    );
+
+    // The heap texture size query.
+    let size = |obj_id: u64| {
+        RgfxHeapTextureSizeAndAlign {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_HEAP_TEXTURE_SIZE_AND_ALIGN,
+                size: 0,
+                seqno: 0,
+            },
+            obj_id,
+            desc: RgfxTextureDescriptor {
+                pixel_format: 80,
+                texture_type: 2,
+                width: 256,
+                height: 128,
+                depth: 1,
+                mipmap_level_count: 1,
+                array_length: 1,
+                sample_count: 1,
+                ..RgfxTextureDescriptor::default()
+            },
+        }
+        .as_bytes()
+        .to_vec()
+    };
+    let sizes = || {
+        platform
+            .call_log()
+            .calls_to("heapTextureSizeAndAlignWithDescriptor:")
+            .len()
+    };
+    guest.send(&device, size(obj(3, 8)));
+    let answer = RgfxSizeAndAlign::read_from_bytes(&guest.event().unwrap()).unwrap();
+    assert_eq!(
+        (answer.status, answer.size, answer.align),
+        (RGFX_STATUS_REFUSED, 0, 0)
+    );
+    assert_eq!(sizes(), 0);
+    guest.send(&device, size(obj(4, 8)));
+    let answer = RgfxSizeAndAlign::read_from_bytes(&guest.event().unwrap()).unwrap();
+    assert_eq!(answer.status, RGFX_STATUS_OK);
+    assert_eq!(sizes(), 1);
+
+    // The argument layout query.
+    guest.send(&device, block_grant(3, BLOCK, SIZE));
+    guest.send(&device, block_grant(4, OTHER_BLOCK, SIZE));
+    let descriptor = RgfxArgumentDescriptor {
+        data_type: 60, // MTLDataTypePointer
+        index: 0,
+        ..RgfxArgumentDescriptor::default()
+    };
+    let layout = |obj_id: u64, reply_offset: u64| {
+        let mut bytes = RgfxArgumentLayoutQuery {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_ARGUMENT_LAYOUT,
+                size: 0,
+                seqno: 0,
+            },
+            obj_id,
+            reply_offset,
+            reply_length: SIZE,
+            source: RGFX_ARGUMENT_SOURCE_DESCRIPTORS,
+            count: 1,
+            descriptors_offset: size_of::<RgfxArgumentLayoutQuery>() as u32,
+            ..RgfxArgumentLayoutQuery::default()
+        }
+        .as_bytes()
+        .to_vec();
+        bytes.extend_from_slice(descriptor.as_bytes());
+        bytes
+    };
+    guest.send(&device, layout(obj(3, 9), BLOCK));
+    let seqno = guest.seqno;
+    assert_eq!(answer_of(&mut guest, seqno), RGFX_STATUS_REFUSED);
+    // SAFETY: as `Guest`'s helpers; the block lies in the region.
+    assert_eq!(unsafe { guest.load_u64(BLOCK as usize) }, 0, "written");
+    guest.send(&device, layout(obj(4, 9), OTHER_BLOCK));
+    let seqno = guest.seqno;
+    assert_eq!(answer_of(&mut guest, seqno), RGFX_STATUS_OK);
+}

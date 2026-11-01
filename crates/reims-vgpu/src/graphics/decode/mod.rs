@@ -316,6 +316,11 @@ impl<P: Platform> GraphicsDecoder<P> {
         self.context = context;
     }
 
+    /// The contexts whose work failed off its op's thread, shared ([`FailedContexts`]).
+    pub(crate) fn failed_contexts(&self) -> Arc<FailedContexts> {
+        Arc::clone(&self.failed)
+    }
+
     /// Whether the current context's work failed off its op's thread ([`FailedContexts`]), so
     /// its later work is refused.
     pub(super) fn context_failed(&self) -> bool {
@@ -586,6 +591,10 @@ impl<P: Platform> GraphicsDecoder<P> {
         let Some(m) = read::<RgfxHeapTextureSizeAndAlign>(message) else {
             return Some(answer(RGFX_STATUS_INVALID_ARGUMENT, 0, 0));
         };
+        // A failed context's later work is refused ([`FailedContexts`]).
+        if self.context_failed() {
+            return Some(answer(RGFX_STATUS_REFUSED, 0, 0));
+        }
         // The shape alone: a texture's resource index is no part of its size.
         let desc = TextureDesc {
             resource_index: None,
