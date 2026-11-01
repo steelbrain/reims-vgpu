@@ -12,8 +12,8 @@
  * - Unrecognised selectors: every class of the bundle logs a selector it does not answer, once per
  *   class and selector ("RGFX: unrecognized: -[RgfxComputeCommandEncoder sel]"), and then raises
  *   as NSObject does (RGFX_LOG_UNRECOGNIZED), so one boot shows every miss, not only the first
- *   that ends the process. The device answers what it does not implement with zero instead, and
- *   logs it the same way.
+ *   that ends the process. The device does too: a selector neither it nor Metal's base classes
+ *   answer raises, as Metal's own device does.
  *
  * Our own ObjC++; no Apple private SPI.
  */

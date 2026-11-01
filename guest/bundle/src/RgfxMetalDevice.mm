@@ -302,6 +302,8 @@ RGFX_LOG_UNRECOGNIZED
 	std::atomic<bool> _metalAssertions; // setMetalAssertionsEnabled:'s, read back
 }
 
+RGFX_LOG_UNRECOGNIZED
+
 // RGFX DIAG (Wall-2 trace; remove before merge): fires when the bundle is loaded
 // and this class is realized in the ObjC runtime. If this logs but no init below
 // does, Metal loaded the bundle but did not instantiate us by initWithAcceleratorPort
@@ -413,26 +415,6 @@ RGFX_LOG_UNRECOGNIZED
 	rgfxDiag("RGFX: transport up: region=%llu bytes, caps=%s\n", (unsigned long long)mapSize,
 	         _caps.valid() ? "valid" : "default");
 	return self;
-}
-
-// RGFX DIAG (remove before merge): -[_MTLDevice initLimits] and other Metal bring-up code send
-// MTLDeviceSPI selectors straight to us without -respondsToSelector:; any that neither our shell
-// nor the IOGPUMetalDevice base implements hit -doesNotRecognizeSelector: and throw an
-// unhandled ObjC exception (crash). Every unimplemented selector is forwarded here and answered
-// with a zero scalar, so bring-up keeps going.
-- (NSMethodSignature *)methodSignatureForSelector:(SEL)aSelector
-{
-	NSMethodSignature *sig = [super methodSignatureForSelector:aSelector];
-	if (sig)
-		return sig;
-	return [NSMethodSignature signatureWithObjCTypes:"Q@:"]; // assume an 8-byte scalar return
-}
-
-- (void)forwardInvocation:(NSInvocation *)anInvocation
-{
-	RgfxLogUnrecognized([self class], anInvocation.selector);
-	unsigned long long zero = 0;
-	[anInvocation setReturnValue:&zero];
 }
 
 // --- accessors the category slices route through -----------------------------
