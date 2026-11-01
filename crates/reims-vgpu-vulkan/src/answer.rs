@@ -1878,7 +1878,8 @@ fn degraded(call: &'static str, notice: &rt::DegradeNotice) -> ! {
 
 /// The runtime's refusal `e` of `sel`, decided: what Metal's validation stops (`Invalid`) by the
 /// call's label, anything else, and anything at a call labelled `Dies`, a death here
-/// ([`refused`]).
+/// ([`refused`]). A pipeline state of an unspecialized function (`UnspecializedFunction`) dies
+/// whatever the label, as plain Metal aborts at each pipeline creator for one.
 pub fn decide<T>(sel: &'static str, policy: Policy, e: Error) -> RaiseResult<T> {
     decide_describing(sel, policy, e, None)
 }
@@ -1894,6 +1895,9 @@ pub fn decide_describing<T>(
 ) -> RaiseResult<T> {
     let line = refusal_describing(&e, descriptor);
     match e {
+        Error::Invalid(ref i) if matches!(i.problem, rt::Problem::UnspecializedFunction { .. }) => {
+            dies(sel, &line)
+        }
         Error::Invalid(_) if policy != Policy::Dies => {
             policy.on().throw(Raise::platform(sel).with_detail(line))
         }

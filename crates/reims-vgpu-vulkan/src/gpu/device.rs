@@ -2023,7 +2023,7 @@ pub(crate) mod tests {
 
     use reims_vgpu_core::platform::Handle;
     use reims_vgpu_core::platform::device::GpuDevice;
-    use reims_vgpu_core::raise::death::{DeathId, DeathKind};
+    use reims_vgpu_core::raise::death::DeathKind;
     use reims_vgpu_core::testkit::capture::catch_death;
 
     use super::*;
@@ -2935,28 +2935,13 @@ pub(crate) mod tests {
         drop((own, held));
     }
 
-    /// A Core Image kernel library (`ci_kernel.metallib`, its header's file type 1) is one the
-    /// runtime makes no library of yet: a death at the send, which a refusal scope, the graphics
-    /// lane's, takes as its refusal, naming the runtime's reason, and the process goes on
+    /// A Core Image kernel library (`ci_kernel.metallib`, its header's file type 1) is made, as
+    /// Metal makes it, and the device goes on to make others
     #[test]
-    fn a_core_image_kernel_library_dies_at_its_send() {
-        use reims_vgpu_core::raise::refusals::refusing;
+    fn a_core_image_kernel_library_is_made() {
         const CI_KERNEL: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ci_kernel.metallib"));
         assert_eq!(CI_KERNEL[10], 1, "the header's file type");
-        let sel = "newLibraryWithData:error:";
-        let site = catch_death(|| dev().new_library(CI_KERNEL)).unwrap_err();
-        assert_eq!((site.kind, site.file), (DeathKind::Abort, sel));
-        let refusal = refusing(|| dev().new_library(CI_KERNEL)).unwrap_err();
-        assert_eq!(
-            refusal.id,
-            DeathId::Platform {
-                kind: DeathKind::Abort,
-                call: sel
-            }
-        );
-        let detail = refusal.detail.unwrap_or_default();
-        assert!(detail.contains("LibraryKind(1)"), "{detail}");
-        // The device goes on.
+        assert!(dev().new_library(CI_KERNEL).unwrap().unwrap().is_some());
         assert!(
             dev()
                 .new_library(include_bytes!(
