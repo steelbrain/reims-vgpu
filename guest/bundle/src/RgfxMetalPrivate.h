@@ -175,9 +175,19 @@ NS_ASSUME_NONNULL_BEGIN
                                            bytesPerImage:(NSUInteger)bytesPerImage;
 @end
 
-@protocol RgfxMetalTextureInternals
+@protocol RgfxMetalTextureInternals <RgfxMetalResourceInternals>
+// `Q16@0:8`: the GPU address of the texture's memory.
+- (uint64_t)gpuAddress;
 // `B16@0:8`: whether the GPU keeps the texture's contents losslessly compressed.
 - (BOOL)isCompressed;
+// `B16@0:8`: whether the texture is a drawable's.
+- (BOOL)isDrawable;
+// `Q16@0:8`: the rotation the texture's contents are shown at.
+- (NSUInteger)rotation;
+// `Q16@0:8`: the texture's number among the process's textures.
+- (uint64_t)uniqueIdentifier;
+// `v16@0:8`: the CPU wrote the texture's memory.
+- (void)didModifyData;
 @end
 
 @protocol RgfxMetalHeapInternals

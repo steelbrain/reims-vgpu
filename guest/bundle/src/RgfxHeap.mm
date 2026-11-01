@@ -225,6 +225,11 @@ MTLSizeAndAlign rgfxHeapTextureSizeAndAlign(RgfxSerializer *serializer,
 	return static_cast<NSUInteger>(_ranges->used());
 }
 
+- (void *)rgfxContents
+{
+	return _contents;
+}
+
 - (NSUInteger)currentAllocatedSize
 {
 	return static_cast<NSUInteger>(_size);

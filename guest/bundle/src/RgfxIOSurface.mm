@@ -536,6 +536,20 @@ RgfxTextureDescriptor wireDescriptor(MTLTextureDescriptor *d)
 	return _shadow->surface;
 }
 
+// The texture lies at the start of its copy's buffer, in the buffer's allocation, so the textures
+// over one plane share both, as Metal's over one surface do (measured on the M3 Max under macOS
+// 27: one allocationID and one gpuAddress for two textures and a view over a surface, of any
+// storage mode).
+- (uint64_t)gpuAddress
+{
+	return _shadow->buffer.gpuAddress;
+}
+
+- (uint64_t)rgfxAllocationId
+{
+	return static_cast<RgfxResource *>(_shadow->buffer).rgfxAllocationId;
+}
+
 - (NSUInteger)iosurfacePlane
 {
 	return _shadow->plane;

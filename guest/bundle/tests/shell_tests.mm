@@ -503,12 +503,13 @@ void test_texture_cpu_copies()
 	CHECK(!fx.ring.next(&h, &bytes));
 
 	// A resource's purgeable state is kept as told, the previous one answered, and nothing
-	// is posted: the device purges nothing.
+	// is posted: the device purges nothing. A texture over a buffer stays NonVolatile, as
+	// Metal's (resource_tests.mm).
 	CHECK([buf setPurgeableState:MTLPurgeableStateKeepCurrent] == MTLPurgeableStateNonVolatile);
 	CHECK([buf setPurgeableState:MTLPurgeableStateVolatile] == MTLPurgeableStateNonVolatile);
 	CHECK([buf setPurgeableState:MTLPurgeableStateKeepCurrent] == MTLPurgeableStateVolatile);
 	CHECK([tex setPurgeableState:MTLPurgeableStateEmpty] == MTLPurgeableStateNonVolatile);
-	CHECK([tex setPurgeableState:MTLPurgeableStateNonVolatile] == MTLPurgeableStateEmpty);
+	CHECK([tex setPurgeableState:MTLPurgeableStateNonVolatile] == MTLPurgeableStateNonVolatile);
 	CHECK(!fx.ring.next(&h, &bytes));
 
 	// A buffer's resource options decode as a texture's; a resource made in no heap answers
@@ -558,7 +559,8 @@ void test_texture_routing()
 	CHECK([tex mipmapLevelCount] == 1 && [tex arrayLength] == 1 && [tex sampleCount] == 1);
 	CHECK([tex usage] == (MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead));
 	CHECK([tex storageMode] == MTLStorageModePrivate);
-	CHECK([tex resourceOptions] == desc.resourceOptions);
+	// Its Default hazard tracking mode answered resolved, as Metal's (resource_tests.mm).
+	CHECK([tex resourceOptions] == (desc.resourceOptions | MTLResourceHazardTrackingModeTracked));
 	MTLTextureSwizzleChannels sw = [tex swizzle]; // the descriptor's default swizzle
 	CHECK(sw.red == MTLTextureSwizzleRed && sw.green == MTLTextureSwizzleGreen);
 	CHECK(sw.blue == MTLTextureSwizzleBlue && sw.alpha == MTLTextureSwizzleAlpha);

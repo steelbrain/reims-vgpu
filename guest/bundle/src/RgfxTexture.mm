@@ -5,6 +5,7 @@
 #import "RgfxTexture.h"
 
 #import "RgfxBuffer.h"
+#import "RgfxHeap.h"
 #import "RgfxMetalPrivate.h"
 #import "RgfxUnsupported.h"
 
@@ -419,7 +420,14 @@ enum RgfxViewRefusal { kNoFormat, kFormatClass, kLevels, kSlices, kTypeFamily, k
 	// (rgfxTakeDescriptor:): Metal's defaults until then.
 	BOOL _allowGPUOptimizedContents;
 	MTLTextureCompressionType _compressionType;
+	uint64_t _number; // uniqueIdentifier
 }
+
+namespace {
+// The last uniqueIdentifier a texture took: every texture, a view among them, takes the next as
+// it is made.
+std::atomic<uint64_t> g_lastTextureNumber{0};
+} // namespace
 
 + (instancetype)managedTextureWithDescriptor:(MTLTextureDescriptor *)descriptor
                                       region:(RgfxRegion *)region
@@ -636,6 +644,7 @@ enum RgfxViewRefusal { kNoFormat, kFormatClass, kLevels, kSlices, kTypeFamily, k
 		_resourceId = resourceId;
 		_allowGPUOptimizedContents = YES;
 		_compressionType = MTLTextureCompressionTypeLossless;
+		_number = g_lastTextureNumber.fetch_add(1) + 1;
 	}
 	return self;
 }
@@ -736,9 +745,37 @@ enum RgfxViewRefusal { kNoFormat, kFormatClass, kLevels, kSlices, kTypeFamily, k
 
 // --- MTLResource (decoded from the descriptor's resource options) -------------
 
+// The texture's options as Metal answers them (measured on the M3 Max under macOS 27): those its
+// descriptor asked, a Default hazard tracking mode resolved to Tracked (0x220 for Private, 0x210
+// for Managed); a heap's texture answers the heap's (0x120 in a Private heap), one over a buffer
+// the buffer's, whatever its descriptor asked, and a view its texture's.
 - (MTLResourceOptions)resourceOptions
 {
-	return static_cast<MTLResourceOptions>(_desc.options);
+	if (_parent != nil) {
+		return _parent.resourceOptions;
+	}
+	if (_buffer != nil) {
+		return _buffer.resourceOptions;
+	}
+	id<MTLHeap> heap = [super heap];
+	return heap != nil ? heap.resourceOptions
+	                   : RgfxResolveHazardTracking(static_cast<MTLResourceOptions>(_desc.options),
+	                                               MTLResourceHazardTrackingModeTracked);
+}
+
+// The options it was made with: its descriptor's as asked (0x20 for Private, 0x100 for Shared
+// Untracked); its heap's for a heap's texture, as resourceOptions; its buffer's for one over a
+// buffer, and its texture's for a view.
+- (MTLResourceOptions)unfilteredResourceOptions
+{
+	if (_parent != nil) {
+		return [_parent unfilteredResourceOptions];
+	}
+	if (_buffer != nil) {
+		return [(id<RgfxMetalBufferInternals>)_buffer unfilteredResourceOptions];
+	}
+	id<MTLHeap> heap = [super heap];
+	return heap != nil ? heap.resourceOptions : static_cast<MTLResourceOptions>(_desc.options);
 }
 
 - (MTLStorageMode)storageMode
@@ -755,7 +792,8 @@ enum RgfxViewRefusal { kNoFormat, kFormatClass, kLevels, kSlices, kTypeFamily, k
 
 - (MTLHazardTrackingMode)hazardTrackingMode
 {
-	return static_cast<MTLHazardTrackingMode>((_desc.options & MTLResourceHazardTrackingModeMask) >>
+	return static_cast<MTLHazardTrackingMode>((self.resourceOptions &
+	                                           MTLResourceHazardTrackingModeMask) >>
 	                                          MTLResourceHazardTrackingModeShift);
 }
 
@@ -960,20 +998,32 @@ enum RgfxViewRefusal { kNoFormat, kFormatClass, kLevels, kSlices, kTypeFamily, k
 
 // A view's memory is its texture's: the heap it lies in, at its offset, aliased with it. Making
 // a view aliasable changes nothing, and its purgeable state stays NonVolatile and leaves its
-// texture's as it was (measured on the M3 Max under macOS 27.0.1).
+// texture's as it was (measured on the M3 Max under macOS 27.0.1). A texture over a buffer lies
+// in the buffer's memory alike: the buffer's heap at the buffer's offset, aliasable as the buffer
+// is, and its purgeable state stays NonVolatile, whatever the buffer's (measured on the M3 Max
+// under macOS 27).
 - (id<MTLHeap>)heap
 {
-	return _parent != nil ? _parent.heap : [super heap];
+	if (_parent != nil) {
+		return _parent.heap;
+	}
+	return _buffer != nil ? _buffer.heap : [super heap];
 }
 
 - (NSUInteger)heapOffset
 {
-	return _parent != nil ? _parent.heapOffset : [super heapOffset];
+	if (_parent != nil) {
+		return _parent.heapOffset;
+	}
+	return _buffer != nil ? _buffer.heapOffset : [super heapOffset];
 }
 
 - (BOOL)isAliasable
 {
-	return _parent != nil ? _parent.isAliasable : [super isAliasable];
+	if (_parent != nil) {
+		return _parent.isAliasable;
+	}
+	return _buffer != nil ? _buffer.isAliasable : [super isAliasable];
 }
 
 - (void)makeAliasable
@@ -985,10 +1035,30 @@ enum RgfxViewRefusal { kNoFormat, kFormatClass, kLevels, kSlices, kTypeFamily, k
 
 - (MTLPurgeableState)setPurgeableState:(MTLPurgeableState)state
 {
-	if (_parent != nil) {
+	if (_parent != nil || _buffer != nil) {
 		return MTLPurgeableStateNonVolatile;
 	}
 	return [super setPurgeableState:state];
+}
+
+// The allocation a view lies in is its texture's, and one over a buffer the buffer's (measured on
+// the M3 Max under macOS 27), and so are the bytes it meets another resource over.
+- (uint64_t)rgfxAllocationId
+{
+	if (_parent != nil) {
+		return _parent.rgfxAllocationId;
+	}
+	return _buffer != nil ? static_cast<RgfxResource *>(_buffer).rgfxAllocationId
+	                      : [super rgfxAllocationId];
+}
+
+- (id<MTLHeap>)rgfxSpanOffset:(uint64_t *)offset size:(uint64_t *)size
+{
+	if (_parent != nil) {
+		return [_parent rgfxSpanOffset:offset size:size];
+	}
+	return _buffer != nil ? [static_cast<RgfxResource *>(_buffer) rgfxSpanOffset:offset size:size]
+	                      : [super rgfxSpanOffset:offset size:size];
 }
 
 // Whether `level` and `slice` are the view's, for a CPU copy through it.
@@ -1372,6 +1442,97 @@ enum RgfxViewRefusal { kNoFormat, kFormatClass, kLevels, kSlices, kTypeFamily, k
 }
 
 // --- what Metal's texture answers past its protocol (RgfxMetalPrivate.h) ----------------
+// Each as Metal's (measured on the M3 Max under macOS 27), for a texture of every kind the
+// device makes.
+
+// The GPU address of the texture's memory, nonzero for every kind: its texture's for a view, at
+// any level and slice, its buffer's plus its offset for one over a buffer, its heap's plus its
+// offset there for one in a heap (RgfxIOSurfaceTexture answers its own). Else it is the address
+// its create reserved, which no other resource takes, where Metal's is that of the texture's
+// memory: the host does not place a device-placed texture's memory at it.
+- (uint64_t)gpuAddress
+{
+	if (_parent != nil) {
+		return [_parent gpuAddress];
+	}
+	if (_buffer != nil) {
+		return _buffer.gpuAddress + _bufferOffset;
+	}
+	id<MTLHeap> heap = [super heap];
+	if (heap != nil) {
+		return [(id<RgfxMetalHeapInternals>)heap gpuAddress] + self.rgfxHeapPlacement;
+	}
+	return _gpuAddress;
+}
+
+// The size of the allocation the texture lies in: its texture's for a view, its buffer's for one
+// over a buffer (the heap's, for a buffer in a heap), its heap's for one in a heap, else its own
+// allocatedSize.
+- (uint64_t)resourceSize
+{
+	if (_parent != nil) {
+		return [_parent resourceSize];
+	}
+	if (_buffer != nil) {
+		return [(id<RgfxMetalBufferInternals>)_buffer resourceSize];
+	}
+	id<MTLHeap> heap = [super heap];
+	return heap != nil ? heap.size : self.allocatedSize;
+}
+
+RGFX_RESOURCE_SPI
+
+// The CPU's address of the texture's memory: its texture's for a view, its buffer's plus its
+// offset for one over a buffer (the offset itself, over a Private buffer), its heap's plus its
+// offset there for a heap's texture (the offset itself, in a Private heap), else NULL, as Metal's
+// answers for a Private or IOSurface texture. Metal's Shared and Managed textures in no heap have
+// a CPU address, laid out as its GPU lays them out; the device lays out no such texture's memory
+// where the CPU reaches it, so NULL.
+- (void *)virtualAddress
+{
+	if (_parent != nil) {
+		return [_parent virtualAddress];
+	}
+	uintptr_t base = 0, offset = 0;
+	if (_buffer != nil) {
+		base = reinterpret_cast<uintptr_t>([(id<RgfxMetalBufferInternals>)_buffer virtualAddress]);
+		offset = static_cast<uintptr_t>(_bufferOffset);
+	} else if (id<MTLHeap> heap = [super heap]) {
+		if ([heap isKindOfClass:[RgfxHeap class]]) {
+			base = reinterpret_cast<uintptr_t>(static_cast<RgfxHeap *>(heap).rgfxContents);
+		}
+		offset = static_cast<uintptr_t>(self.rgfxHeapPlacement);
+	} else {
+		return nullptr;
+	}
+	return reinterpret_cast<void *>(base + offset);
+}
+
+// The texture's number in the process: 1, 2, ... in the order textures are made, views among them,
+// as Metal's.
+- (uint64_t)uniqueIdentifier
+{
+	return _number;
+}
+
+// The device's textures are no drawable's, and are shown unrotated: Metal answers NO and 0 for
+// every texture an app makes (private, shared, IOSurface and views).
+- (BOOL)isDrawable
+{
+	return NO;
+}
+
+- (NSUInteger)rotation
+{
+	return 0;
+}
+
+// The CPU wrote the texture's memory: nothing to do. A texture over an IOSurface takes the
+// surface's bytes at a commit once a CPU has written them under a lock (RgfxIOSurface.h), one over
+// a buffer is the buffer's bytes, and no other texture's memory is the CPU's to write.
+- (void)didModifyData
+{
+}
 
 // Whether the GPU keeps the texture's contents losslessly compressed, by the rule Metal's follows
 // (measured on the M3 Max under macOS 27): NO for one over a buffer or an IOSurface, a Memoryless

@@ -533,6 +533,243 @@ void test_texture_compression()
 	drainRing(fx.ring);
 }
 
+// What a texture answers past MTLTexture, for each kind the device makes: its options resolved and
+// as asked, its GPU and CPU addresses, the allocation it lies in and that allocation's size, its
+// number among the process's textures, and the rest of the resource SPI. A view answers its
+// texture's, a texture over a buffer the buffer's, a heap's texture the heap's, and textures over
+// one IOSurface plane share an allocation and an address.
+void test_texture_answers()
+{
+	Fixture fx;
+	std::vector<uint8_t> mem(RGFX_ALLOCATIONS_OFFSET + 0x400000, 0);
+	RgfxRegion region(mem.data(), mem.size());
+	std::vector<uint8_t> heapBytes(0x100000);
+	@autoreleasepool {
+		const MTLTextureUsage read = MTLTextureUsageShaderRead;
+		auto device = [&](MTLTextureDescriptor *d) {
+			return [RgfxTexture textureWithDescriptor:d
+			                                     heap:RGFX_OBJ_NONE
+			                               heapOffset:0
+			                                   device:nil
+			                               serializer:&fx.ser];
+		};
+		drainRing(fx.ring);
+		RgfxTexture *priv = device(texture2D(MTLPixelFormatBGRA8Unorm, 64, 64, read));
+		auto made = expectMessage<RgfxTextureCreate>(fx.ring, RGFX_CMD_TEXTURE_CREATE);
+		CHECK(priv != nil && made.gpu_address != 0);
+		CHECK([internals(priv) gpuAddress] == made.gpu_address);
+		CHECK(priv.resourceOptions == 0x220 && [internals(priv) unfilteredResourceOptions] == 0x20);
+		CHECK(priv.hazardTrackingMode == MTLHazardTrackingModeTracked);
+		CHECK(priv.storageMode == MTLStorageModePrivate);
+		CHECK([internals(priv) resourceSize] == priv.allocatedSize && priv.allocatedSize == 0x4000);
+		CHECK([internals(priv) virtualAddress] == nullptr);
+		CHECK(![internals(priv) isDrawable] && [internals(priv) rotation] == 0);
+		[internals(priv) didModifyData];
+		CHECK([internals(priv) isComplete] && [internals(priv) isWriteComplete]);
+		[internals(priv) waitUntilComplete];
+		CHECK(![internals(priv) isPurgeable]);
+		[priv setPurgeableState:MTLPurgeableStateVolatile];
+		CHECK([internals(priv) isPurgeable]);
+		[priv setPurgeableState:MTLPurgeableStateNonVolatile];
+		CHECK(![internals(priv) isPurgeable]);
+		CHECK(![internals(priv) doesAliasResource:priv] && ![internals(priv) doesAliasResource:nil]);
+		CHECK(ringEmpty(fx.ring)); // the members post nothing
+
+		// Options as asked, resolved; a texture of each kind takes the next number.
+		MTLTextureDescriptor *sd = texture2D(MTLPixelFormatBGRA8Unorm, 64, 64, read);
+		sd.storageMode = MTLStorageModeShared;
+		RgfxTexture *shared = device(sd);
+		CHECK(shared.resourceOptions == 0x200 && [internals(shared) unfilteredResourceOptions] == 0);
+		CHECK([internals(shared) virtualAddress] == nullptr);
+		sd.hazardTrackingMode = MTLHazardTrackingModeUntracked;
+		RgfxTexture *untracked = device(sd);
+		CHECK(untracked.resourceOptions == 0x100 &&
+		      [internals(untracked) unfilteredResourceOptions] == 0x100);
+		CHECK(untracked.hazardTrackingMode == MTLHazardTrackingModeUntracked);
+		MTLTextureDescriptor *md = texture2D(MTLPixelFormatBGRA8Unorm, 64, 64, read);
+		md.storageMode = MTLStorageModeManaged;
+		RgfxTexture *managed = [RgfxTexture managedTextureWithDescriptor:md
+		                                                          region:&region
+		                                                          device:nil
+		                                                      serializer:&fx.ser];
+		CHECK(managed != nil && managed.resourceOptions == 0x210);
+		CHECK([internals(managed) unfilteredResourceOptions] == 0x10);
+		CHECK([internals(managed) gpuAddress] != 0 &&
+		      [internals(managed) gpuAddress] != [internals(priv) gpuAddress]);
+		const uint64_t first = [internals(priv) uniqueIdentifier];
+		CHECK(first != 0 && [internals(shared) uniqueIdentifier] == first + 1);
+		CHECK([internals(untracked) uniqueIdentifier] == first + 2);
+		CHECK([internals(managed) uniqueIdentifier] == first + 3);
+		const uint64_t a0 = [internals(priv) allocationID], a1 = [internals(shared) allocationID];
+		CHECK(a0 != 0 && a1 != 0 && a0 != a1);
+
+		// A view, at any level and slice, answers its texture's, under a number of its own, and
+		// keeps a purgeable state of its own.
+		id<MTLTexture> view = [priv newTextureViewWithPixelFormat:MTLPixelFormatBGRA8Unorm_sRGB];
+		CHECK(view != nil && [internals(view) uniqueIdentifier] == first + 4);
+		CHECK([internals(view) gpuAddress] == [internals(priv) gpuAddress]);
+		CHECK([internals(view) allocationID] == a0);
+		CHECK([internals(view) resourceSize] == [internals(priv) resourceSize]);
+		CHECK(view.resourceOptions == 0x220 && [internals(view) unfilteredResourceOptions] == 0x20);
+		CHECK([internals(view) virtualAddress] == nullptr && ![internals(view) isDrawable]);
+		[priv setPurgeableState:MTLPurgeableStateVolatile];
+		CHECK([internals(priv) isPurgeable] && ![internals(view) isPurgeable]);
+		[priv setPurgeableState:MTLPurgeableStateNonVolatile];
+		MTLTextureDescriptor *ad = texture2D(MTLPixelFormatRGBA8Unorm, 64, 64, read);
+		ad.textureType = MTLTextureType2DArray;
+		ad.arrayLength = 4;
+		ad.mipmapLevelCount = 3;
+		RgfxTexture *array = device(ad);
+		id<MTLTexture> deep = [array newTextureViewWithPixelFormat:MTLPixelFormatRGBA8Unorm
+		                                               textureType:MTLTextureType2DArray
+		                                                    levels:NSMakeRange(1, 2)
+		                                                    slices:NSMakeRange(1, 2)];
+		CHECK(deep != nil && [internals(deep) gpuAddress] == [internals(array) gpuAddress]);
+		CHECK([internals(deep) allocationID] == [internals(array) allocationID]);
+
+		// A heap's texture lies at the heap's address and CPU address plus its offset, in the
+		// heap's allocation, of the heap's size and options, and aliases what meets its bytes.
+		drainRing(fx.ring);
+		RgfxHeap *heap = [RgfxHeap heapWithDescriptor:heapDescriptor(MTLStorageModePrivate,
+		                                                             MTLHeapTypePlacement)
+		                                       device:nil
+		                                   serializer:&fx.ser];
+		auto heapMade = expectMessage<RgfxHeapCreate>(fx.ring, RGFX_CMD_HEAP_CREATE);
+		id<MTLTexture> placed =
+		    [heap newTextureWithDescriptor:texture2D(MTLPixelFormatBGRA8Unorm, 64, 64, read)
+		                            offset:0x10000];
+		id<MTLBuffer> over = [heap newBufferWithLength:0x1000
+		                                       options:MTLResourceStorageModePrivate
+		                                        offset:0x10000];
+		id<MTLBuffer> apart = [heap newBufferWithLength:0x1000
+		                                        options:MTLResourceStorageModePrivate
+		                                         offset:0];
+		CHECK(placed != nil && [internals(placed) gpuAddress] == heapMade.gpu_address + 0x10000);
+		CHECK([internals(placed) virtualAddress] == reinterpret_cast<void *>(0x10000));
+		CHECK([internals(placed) allocationID] == [internals(over) allocationID]);
+		CHECK([internals(placed) resourceSize] == heap.size);
+		CHECK(placed.resourceOptions == 0x120 && [internals(placed) unfilteredResourceOptions] == 0x120);
+		CHECK([internals(placed) doesAliasResource:over] && [internals(over) doesAliasResource:placed]);
+		CHECK([internals(placed) doesAliasResource:placed]);
+		CHECK(![internals(placed) doesAliasResource:apart]);
+		__unsafe_unretained id<MTLResource> both[] = {over, apart};
+		CHECK([internals(placed) doesAliasAnyResources:both count:2]);
+		CHECK(![internals(placed) doesAliasAllResources:both count:2]);
+		id<MTLTexture> placedView = [placed newTextureViewWithPixelFormat:MTLPixelFormatBGRA8Unorm_sRGB];
+		CHECK([internals(placedView) doesAliasResource:over] &&
+		      [internals(placedView) doesAliasResource:placed]);
+		CHECK([internals(placedView) gpuAddress] == [internals(placed) gpuAddress]);
+
+		// A Shared heap's texture lies at the heap's bytes plus its offset.
+		RgfxHeap *sharedHeap = [RgfxHeap
+		    heapOverHostMemoryWithDescriptor:heapDescriptor(MTLStorageModeShared,
+		                                                    MTLHeapTypePlacement)
+		                        regionOffset:0
+		                            contents:heapBytes.data()
+		                         deallocator:nil
+		                              device:nil
+		                          serializer:&fx.ser];
+		MTLTextureDescriptor *shd = texture2D(MTLPixelFormatRGBA8Unorm, 64, 64, read);
+		shd.storageMode = MTLStorageModeShared;
+		id<MTLTexture> inShared = [sharedHeap newTextureWithDescriptor:shd offset:0x10000];
+		CHECK(inShared != nil &&
+		      [internals(inShared) virtualAddress] == heapBytes.data() + 0x10000);
+		CHECK(inShared.resourceOptions == 0x100 &&
+		      [internals(inShared) unfilteredResourceOptions] == 0x100);
+
+		// A texture over a buffer lies in the buffer's memory: its address plus the offset, its
+		// allocation, its options and its heap, and stays NonVolatile.
+		RgfxBuffer *buffer = [RgfxBuffer bufferWithLength:0x10000
+		                                          options:0
+		                                           device:nil
+		                                       serializer:&fx.ser];
+		MTLTextureDescriptor *ld = texture2D(MTLPixelFormatBGRA8Unorm, 64, 64, read);
+		ld.storageMode = MTLStorageModeShared;
+		id<MTLTexture> linear = [buffer newTextureWithDescriptor:ld offset:0x1000 bytesPerRow:256];
+		CHECK(linear != nil && [internals(linear) gpuAddress] == buffer.gpuAddress + 0x1000);
+		CHECK([internals(linear) virtualAddress] ==
+		      static_cast<uint8_t *>(buffer.contents) + 0x1000);
+		CHECK([internals(linear) allocationID] == [internals(buffer) allocationID]);
+		CHECK([internals(linear) resourceSize] == 0x10000);
+		CHECK(linear.resourceOptions == 0x200 && [internals(linear) unfilteredResourceOptions] == 0);
+		CHECK(linear.heap == nil && ![internals(linear) doesAliasResource:buffer]);
+		[buffer setPurgeableState:MTLPurgeableStateVolatile];
+		CHECK(![internals(linear) isPurgeable]);
+		CHECK([linear setPurgeableState:MTLPurgeableStateVolatile] == MTLPurgeableStateNonVolatile);
+		CHECK(![internals(linear) isPurgeable]);
+		RgfxBuffer *privBuffer = [RgfxBuffer bufferWithLength:0x10000
+		                                              options:MTLResourceStorageModePrivate
+		                                               device:nil
+		                                           serializer:&fx.ser];
+		ld.storageMode = MTLStorageModePrivate;
+		id<MTLTexture> privLinear = [privBuffer newTextureWithDescriptor:ld
+		                                                          offset:0x1000
+		                                                     bytesPerRow:256];
+		CHECK(privLinear != nil &&
+		      [internals(privLinear) virtualAddress] == reinterpret_cast<void *>(0x1000));
+		CHECK(privLinear.resourceOptions == 0x220 &&
+		      [internals(privLinear) unfilteredResourceOptions] == 0x20);
+		id<MTLBuffer> heapBuffer = [sharedHeap newBufferWithLength:0x1000 options:0 offset:0x4000];
+		ld.storageMode = MTLStorageModeShared;
+		id<MTLTexture> heapLinear = [heapBuffer newTextureWithDescriptor:ld
+		                                                          offset:0
+		                                                     bytesPerRow:256];
+		CHECK(heapLinear != nil && heapLinear.heap == sharedHeap);
+		CHECK(heapLinear.heapOffset == heapBuffer.heapOffset);
+		CHECK([internals(heapLinear) allocationID] == [internals(heapBuffer) allocationID]);
+		CHECK([internals(heapLinear) resourceSize] == sharedHeap.size);
+		CHECK([internals(heapLinear) virtualAddress] == heapBuffer.contents);
+		CHECK([internals(heapLinear) doesAliasResource:heapBuffer] &&
+		      [internals(heapBuffer) doesAliasResource:heapLinear]);
+		id<MTLTexture> linearView = [linear newTextureViewWithPixelFormat:MTLPixelFormatBGRA8Unorm_sRGB];
+		CHECK(linearView != nil && [internals(linearView) gpuAddress] == [internals(linear) gpuAddress]);
+		CHECK([internals(linearView) virtualAddress] == [internals(linear) virtualAddress]);
+
+		// Textures over one IOSurface plane, and a view of one, share an allocation and an address,
+		// with no CPU address, and alias nothing.
+		NSDictionary *props = @{
+			(id)kIOSurfaceWidth : @64,
+			(id)kIOSurfaceHeight : @64,
+			(id)kIOSurfaceBytesPerElement : @4,
+			(id)kIOSurfacePixelFormat : @(static_cast<uint32_t>('BGRA')),
+		};
+		IOSurfaceRef surface = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+		CHECK(surface != nullptr);
+		ld.storageMode = MTLStorageModeShared;
+		auto overSurface = [&](MTLTextureDescriptor *d) {
+			return [RgfxIOSurfaceTexture textureWithDescriptor:d
+			                                         iosurface:surface
+			                                             plane:0
+			                                            region:&region
+			                                            device:nil
+			                                        serializer:&fx.ser];
+		};
+		RgfxIOSurfaceTexture *sa = overSurface(ld);
+		ld.storageMode = MTLStorageModePrivate;
+		RgfxIOSurfaceTexture *sb = overSurface(ld);
+		CHECK(sa != nil && sb != nil && [internals(sa) gpuAddress] != 0);
+		CHECK([internals(sa) gpuAddress] == [internals(sb) gpuAddress]);
+		CHECK([internals(sa) allocationID] == [internals(sb) allocationID]);
+		CHECK([internals(sa) allocationID] != a0);
+		CHECK([internals(sb) uniqueIdentifier] == [internals(sa) uniqueIdentifier] + 1);
+		CHECK(sa.resourceOptions == 0x200 && [internals(sa) unfilteredResourceOptions] == 0);
+		CHECK(sb.resourceOptions == 0x220 && [internals(sb) unfilteredResourceOptions] == 0x20);
+		CHECK([internals(sa) virtualAddress] == nullptr);
+		CHECK([internals(sa) resourceSize] == sa.allocatedSize);
+		CHECK(![internals(sa) doesAliasResource:sb] && ![internals(sa) doesAliasResource:sa]);
+		id<MTLTexture> surfaceView = [sa newTextureViewWithPixelFormat:MTLPixelFormatBGRA8Unorm_sRGB];
+		CHECK(surfaceView != nil && [internals(surfaceView) gpuAddress] == [internals(sa) gpuAddress]);
+		CHECK([internals(surfaceView) allocationID] == [internals(sa) allocationID]);
+		CHECK(![internals(surfaceView) isDrawable] && [internals(surfaceView) rotation] == 0);
+		sa = nil;
+		sb = nil;
+		surfaceView = nil;
+		CFRelease(surface);
+		(void)apart;
+	}
+	drainRing(fx.ring);
+}
+
 } // namespace
 
 void rgfxResourceTests()
@@ -543,4 +780,5 @@ void rgfxResourceTests()
 	test_heap_buffers_answer_their_heap();
 	test_buffer_linear_textures();
 	test_texture_compression();
+	test_texture_answers();
 }

@@ -69,6 +69,10 @@ NS_ASSUME_NONNULL_BEGIN
                                                    device:(nullable id<MTLDevice>)device
                                                serializer:(nullable RgfxSerializer *)serializer;
 
+/// A Shared heap's bytes here (heapOverHostMemoryWithDescriptor:'s `contents`), where its
+/// resources lie at their offsets; NULL for a heap of any other storage mode.
+@property(nonatomic, readonly, nullable) void *rgfxContents;
+
 /// Gives back the `size` bytes at `offset` that one of the heap's Automatic placements held
 /// (RgfxResource's rgfxHoldHeapRange:size:). Thread-safe.
 - (void)rgfxGiveRangeAt:(uint64_t)offset size:(uint64_t)size;
