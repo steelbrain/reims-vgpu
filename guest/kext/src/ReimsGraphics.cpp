@@ -940,7 +940,6 @@ bool ReimsGraphics::start(IOService *provider)
 			data->release();
 		}
 	}
-	setProperty("IOAccelRevision", 2ull, 32);
 
 	if (super::start(provider))
 		return true;
