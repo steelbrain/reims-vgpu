@@ -30,9 +30,9 @@
 //! - **A pipeline's refusals** that Metal answers with an `NSError` are one here
 //!   ([`pipeline_error`]): what the compile finds wrong with the functions or the descriptor, a
 //!   vertex function writing a point size under a line or triangle topology, a function Metal's
-//!   compiler itself refuses on this device, an import no dynamic library supplies, and a state
-//!   that supports indirect command buffers whose functions use a direct texture or sampler
-//!   argument. The rest die at the selector: an ID past Metal's limit, which ends Metal's process,
+//!   compiler itself refuses on this device, an import no dynamic library supplies, a call through
+//!   a visible-function reference no linked function resolves, and a state that supports indirect
+//!   command buffers whose functions use a direct texture or sampler argument. The rest die at the selector: an ID past Metal's limit, which ends Metal's process,
 //!   a gap of the runtime (an unspecialized function constant among them, which Metal aborts for;
 //!   and a function's SIMD-group operations in a stage the runtime does not take them in, a vertex
 //!   function's on MoltenVK, which Metal makes and for which device info's key 33 answers no,
@@ -48,7 +48,13 @@
 //!   and for a fragment function's read of a program-scope `thread_index_in_quadgroup` (a read of
 //!   `thread_index_in_simdgroup` or `threads_per_simdgroup` there is made); and of code 2
 //!   ("Undefined symbols:") for a function whose import the library at its install name lacks, or
-//!   whose install name names no file. The functions that draw without a setter, and those whose
+//!   whose install name names no file. The compute and render creators answer nil and an
+//!   `NSError` of code 3 for a stage whose call through a visible-function reference no function
+//!   its descriptor links under that name resolves ("unresolved visible function reference:
+//!   linked_add_one", "Reason: visible function not loaded", macOS 27.0.1, plain and under
+//!   `MTL_DEBUG_LAYER`): none linked, one linked to the other stage, one in a group alone, or one
+//!   in `binaryFunctions` not made compiled to a binary, or made so, with no list but
+//!   `binaryFunctions` holding it. The functions that draw without a setter, and those whose
 //!   library exports the import, are made. The runtime refuses a fragment function's read of a
 //!   program-scope `thread_index_in_simdgroup` as a gap of its own (`Lowering(StageIo)`), which
 //!   dies where Metal makes the pipeline. The compute and render creators answer nil and an
@@ -401,7 +407,10 @@ pub(crate) fn new_depth_stencil_state(
 ///   function writes no second output ("Fragment shader does not write to render target
 ///   color(0), index(1) that is required for blending"), and a `half4` output into an
 ///   `RGBA8Uint` attachment (`encode_render`'s
-///   `second_source_blends_without_a_second_output_are_refused_as_metals`).
+///   `second_source_blends_without_a_second_output_are_refused_as_metals`); and a call through a
+///   visible-function reference no function the stage links resolves (`NeedsInput` of
+///   `LinkedFunction`), measured ("unresolved visible function reference":
+///   `tests::metal_tests::unresolved_visible_calls_are_metals`).
 /// - Code 2 ([`UNDEFINED_SYMBOLS`]): a function whose import no linked dynamic library exports,
 ///   or whose install name loaded no library (`NeedsInput` of `DynamicSymbol` or
 ///   `DynamicLibrary`).
@@ -427,6 +436,9 @@ pub(crate) fn pipeline_error(e: &rt::Error) -> Option<NsErrorText> {
         {
             METAL_REFUSES
         }
+        rt::Error::Compile(Compile::NeedsInput(RuntimeInput::LinkedFunction { .. })) => {
+            METAL_REFUSES
+        }
         rt::Error::Compile(Compile::NeedsInput(
             RuntimeInput::DynamicSymbol { .. } | RuntimeInput::DynamicLibrary { .. },
         )) => UNDEFINED_SYMBOLS,
@@ -442,8 +454,9 @@ pub(crate) fn pipeline_error(e: &rt::Error) -> Option<NsErrorText> {
 /// The `NSError` code of Metal's pipeline creators for a function its compiler refuses on the
 /// device ("Encountered unlowered function call to air.set_cull_mode_render_command", to
 /// `air.get_thread_index_in_quadgroup.i32`), at the compute, render and tile creators (measured:
-/// the module docs), and of the render creator for a colour attachment the fragment function's
-/// outputs do not fit ([`pipeline_error`]).
+/// the module docs), of the render creator for a colour attachment the fragment function's
+/// outputs do not fit, and of the compute and render creators for a call through a
+/// visible-function reference nothing linked resolves ([`pipeline_error`]).
 const METAL_REFUSES: i64 = 3;
 
 /// The `NSError` code of Metal's pipeline creators for a function whose import no library it
@@ -1325,8 +1338,11 @@ mod tests {
 
     /// A kernel that calls a visible function its library does not define is made with the
     /// function linked by any of the lists the value carries (functions, private functions, a
-    /// group, or binary functions of one made compiled to a binary), and the runtime refuses it
-    /// with none, and a binary function not made compiled to a binary
+    /// group with it in private functions, or binary functions of one made compiled to a binary),
+    /// and is refused with Metal's code with none and with a group alone
+    /// (`metal_tests::unresolved_visible_calls_are_metals`), and not made with a binary function
+    /// not made compiled to a binary, which the runtime refuses as Metal's validation does
+    /// (`BinaryFunctions(NotPrecompiled)`: the creator raises)
     #[test]
     fn a_whole_compute_value_carries_its_linked_functions() {
         let [kernel, _, _, add_one, binary] = linked_functions_of_fixtures();
@@ -1376,14 +1392,31 @@ mod tests {
         assert_eq!(f.linked.functions.len(), 1);
         assert!(!f.linked.functions[0].precompiled);
         assert!(f.linked.binary_functions[0].precompiled);
+        let unbinary = made(linked(vec![], one(&add_one), vec![], vec![]));
+        assert!(!matches!(unbinary, Ok(Ok(Some(_)))), "{unbinary:?}");
         for refused in [
             LinkedFunctionsDesc::default(),
-            linked(vec![], one(&add_one), vec![], vec![]),
+            linked(
+                vec![],
+                vec![],
+                vec![("g".to_owned(), one(&add_one))],
+                vec![],
+            ),
         ] {
             let shown = format!("{refused:?}");
-            assert!(!matches!(made(refused), Ok(Ok(Some(_)))), "{shown}");
+            let state = made(refused);
+            assert!(
+                matches!(&state, Ok(Err(e)) if e.code == METAL_REFUSES),
+                "{shown}: {state:?}"
+            );
         }
     }
+
+    /// `linked_caller.metal`'s and `linked_callee.metal`'s metallibs, compiled by build.rs.
+    pub(super) const LINKED_CALLER: &[u8] =
+        include_bytes!(concat!(env!("OUT_DIR"), "/linked_caller.metallib"));
+    pub(super) const LINKED_CALLEE: &[u8] =
+        include_bytes!(concat!(env!("OUT_DIR"), "/linked_callee.metallib"));
 
     /// The runtime's function descriptor has no specialized name, so a function asked for with
     /// one is nil, and the same function without one is made
@@ -1408,7 +1441,8 @@ mod tests {
     }
 
     /// A vertex function that calls a visible function its library does not define is made with
-    /// the function linked to the vertex stage, and not with it linked to the fragment stage
+    /// the function linked to the vertex stage, and refused with Metal's code with it linked to
+    /// the fragment stage
     #[test]
     fn a_whole_render_value_carries_its_stages_linked_functions() {
         let [_, vertex, fragment, add_one, _] = linked_functions_of_fixtures();
@@ -1425,7 +1459,10 @@ mod tests {
         let state = made(functions(&add_one), LinkedFunctionsDesc::default());
         assert!(matches!(state, Ok(Ok(Some(_)))), "{state:?}");
         let state = made(LinkedFunctionsDesc::default(), functions(&add_one));
-        assert!(!matches!(state, Ok(Ok(Some(_)))), "{state:?}");
+        assert!(
+            matches!(&state, Ok(Err(e)) if e.code == METAL_REFUSES),
+            "{state:?}"
+        );
     }
 
     /// The display's vertex and plain fragment functions, from the platform's shader library.

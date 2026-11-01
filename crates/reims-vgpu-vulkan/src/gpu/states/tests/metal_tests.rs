@@ -1487,3 +1487,155 @@ fn states_whose_arguments_reflection_is_refused_are_decided_by_their_roles() {
         assert!(matches!(made, Ok(Ok(Some(_)))), "{indirect}: {made:?}");
     }
 }
+
+/// What the compute and render creators answer for `linked_caller.metal`'s functions with
+/// `linked_callee.metal`'s `linked_add_one`, which they call, linked by each list a value
+/// carries, each case named: made, or the `NSError`'s code, or where the creator dies.
+fn linked_answers<P: reims_vgpu_core::platform::Platform>(
+    d: &P::Device,
+) -> Vec<(
+    &'static str,
+    Result<Result<(), i64>, reims_vgpu_core::raise::death::DeathSite>,
+)> {
+    let library = |bytes| d.new_library(bytes).unwrap().unwrap().unwrap();
+    let (caller, callee) = (library(LINKED_CALLER), library(LINKED_CALLEE));
+    let named = |l: &P::Library, name| l.new_function(OnFault::Return, name).unwrap().unwrap();
+    let (kernel, vertex, fragment) = (
+        named(&caller, "linked_kernel"),
+        named(&caller, "linked_vertex"),
+        named(&caller, "linked_fragment"),
+    );
+    let add_one = named(&callee, "linked_add_one");
+    let binary = callee
+        .new_function_with_options(OnFault::Return, "linked_add_one", &[], 1, None)
+        .unwrap()
+        .unwrap();
+    let one = |f: &P::Function| vec![f.clone_ref()];
+    let group = || vec![("g".to_owned(), one(&add_one))];
+    let answer = |made: Result<
+        Result<Option<()>, NsErrorText>,
+        reims_vgpu_core::raise::death::DeathSite,
+    >| {
+        made.map(|made| match made {
+            Ok(state) => {
+                assert!(state.is_some());
+                Ok(())
+            }
+            Err(e) => Err(e.code),
+        })
+    };
+    let compute = |functions, binary_functions, groups, private_functions| {
+        answer(catch_death(|| {
+            d.new_compute_pipeline_state_full(&FullComputePipelineDesc {
+                label: None,
+                function: &kernel,
+                threadgroup_size_is_multiple_of_execution_width: false,
+                max_total_threads_per_threadgroup: 0,
+                max_call_stack_depth: 1,
+                support_indirect_command_buffers: false,
+                stage_input: None,
+                linked: LinkedFunctionsDesc {
+                    functions,
+                    binary_functions,
+                    groups,
+                    private_functions,
+                },
+            })
+            .map(|state| state.map(drop))
+        }))
+    };
+    let render = |vertex_linked, fragment_linked| {
+        answer(catch_death(|| {
+            d.new_render_pipeline_state_full(&FullRenderPipelineDesc {
+                label: None,
+                vertex: &vertex,
+                fragment: Some(&fragment),
+                vertex_descriptor: None,
+                colors: vec![(
+                    0,
+                    ColorAttachmentDesc {
+                        pixel_format: 80,
+                        ..ColorAttachmentDesc::default()
+                    },
+                )],
+                depth_pixel_format: 0,
+                stencil_pixel_format: 0,
+                raster_sample_count: 1,
+                alpha_to_coverage: false,
+                alpha_to_one: false,
+                rasterization_enabled: true,
+                input_primitive_topology: 0,
+                max_vertex_amplification_count: 1,
+                support_indirect_command_buffers: false,
+                vertex_linked,
+                fragment_linked,
+            })
+            .map(|state| state.map(drop))
+        }))
+    };
+    let functions = |f: &P::Function| LinkedFunctionsDesc {
+        functions: one(f),
+        ..LinkedFunctionsDesc::default()
+    };
+    vec![
+        ("none", compute(vec![], vec![], vec![], vec![])),
+        ("functions", compute(one(&add_one), vec![], vec![], vec![])),
+        ("private", compute(vec![], vec![], vec![], one(&add_one))),
+        ("group", compute(vec![], vec![], group(), vec![])),
+        (
+            "group, private",
+            compute(vec![], vec![], group(), one(&add_one)),
+        ),
+        (
+            "binary alone",
+            compute(vec![], one(&binary), vec![], vec![]),
+        ),
+        (
+            "render none",
+            render(
+                LinkedFunctionsDesc::default(),
+                LinkedFunctionsDesc::default(),
+            ),
+        ),
+        (
+            "render vertex",
+            render(functions(&add_one), LinkedFunctionsDesc::default()),
+        ),
+        (
+            "render fragment",
+            render(LinkedFunctionsDesc::default(), functions(&add_one)),
+        ),
+    ]
+}
+
+/// A call through a visible-function reference that nothing the stage links resolves is
+/// refused with Metal's `NSError` code (3, "unresolved visible function reference"), at the
+/// compute and the render creators, and made where Metal makes it: by every list but a group
+/// alone, or a binary function made compiled to a binary with no other list holding it. That
+/// last the runtime makes, where Metal answers code 3: the runtime's to decide (its link resolves
+/// a direct call by a binary function, Metal's does not). Two lists that name one function the
+/// runtime refuses as Metal's validation does (`DuplicateLinkedFunction`, and `NotPrecompiled` for
+/// a binary function not made compiled to a binary), and the creator raises: plain Metal makes
+/// the state with `functions` holding the function and `binaryFunctions` holding it made
+/// compiled to a binary, and answers code 3 with `binaryFunctions` alone holding it not so made
+/// (`a_whole_compute_value_carries_its_linked_functions`).
+#[test]
+fn unresolved_visible_calls_are_metals() {
+    use reims_vgpu_metal::MetalPlatform;
+    let Some(md) = MetalPlatform::system_default_device() else {
+        return;
+    };
+    let metals = linked_answers::<MetalPlatform>(&md);
+    let ours = linked_answers::<VulkanPlatform>(&dev());
+    for ((case, ours), (_, metals)) in ours.into_iter().zip(metals) {
+        if case == "binary alone" {
+            assert_eq!(
+                (ours, metals),
+                (Ok(Ok(())), Ok(Err(METAL_REFUSES))),
+                "{case}"
+            );
+        } else {
+            assert_eq!(ours, metals, "{case}");
+        }
+    }
+}
