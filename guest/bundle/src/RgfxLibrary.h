@@ -53,6 +53,17 @@ static const MTLFunctionType kRgfxFunctionTypeExtern = (MTLFunctionType)4;
 - (NSArray<NSString *> *)externFunctionNames;
 - (nullable id<MTLFunction>)newExternFunctionWithName:(NSString *)name;
 
+/// Marks the library as made from a URL (newLibraryWithURL:, and the calls that make theirs so),
+/// which Metal does not serialize.
+- (void)rgfxSetMadeFromURL;
+
+/// The private MTLLibrary members MPS and Core Image call, as Metal answers them (measured: macOS
+/// 27): nil for the bitcode of a library made from bytes, and its shadow's for one Metal's link or
+/// stitching made; and the library written to `url` by its shadow, or Metal's refusal of one made
+/// from a URL.
+- (nullable id)bitcodeData;
+- (BOOL)serializeToURL:(NSURL *)url error:(NSError *_Nullable __autoreleasing *_Nullable)error;
+
 /// Creates a library from `length` bytes of .metallib/AIR at `bytes`, serialising
 /// an RGFX_CMD_LIBRARY_CREATE (the bytes forwarded unchanged, with their content
 /// key where `key`, 32 bytes, is not null; the serialiser picks the objId).

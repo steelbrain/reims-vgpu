@@ -1445,6 +1445,87 @@ void test_function_members_from_shadow()
 	}
 }
 
+// A library made from bytes answers nil for its bitcode, as Metal's, and is written by its shadow
+// as the bytes it was made from, with Foundation's error for a URL it cannot write; one made from
+// a URL is refused with Metal's error, and one with no shadow is refused, logged. (Metal's answers
+// measured on macOS 27, M3 Max.)
+void test_library_members_as_metal()
+{
+	Fixture fx;
+	const char *path = getenv("RGFX_STITCHABLE");
+	CHECK(path != nullptr);
+	if (path == nullptr)
+		return;
+	NSData *bytes = [NSData dataWithContentsOfFile:@(path)];
+	id<MTLDevice> metal = MTLCreateSystemDefaultDevice();
+	auto make = [&]() {
+		uint32_t status = 0;
+		RgfxLibrary *lib = [RgfxLibrary libraryWithData:bytes.bytes
+		                                        length:bytes.length
+		                                           key:nullptr
+		                                        device:nil
+		                                    serializer:&fx.ser
+		                                        status:&status];
+		[lib rgfxSetSource:dispatch_data_create(bytes.bytes, bytes.length, nil, ^{
+			     (void)bytes;
+		     })
+		       shadowMaker:^id<MTLLibrary>(dispatch_data_t d) {
+			       return [metal newLibraryWithData:d error:nil];
+		       }];
+		return lib;
+	};
+	NSString *dir = [NSTemporaryDirectory()
+	    stringByAppendingPathComponent:[NSString stringWithFormat:@"rgfx-library-tests-%d", getpid()]];
+	[[NSFileManager defaultManager] createDirectoryAtPath:dir
+	                          withIntermediateDirectories:YES
+	                                           attributes:nil
+	                                                error:nil];
+	NSURL *out = [NSURL fileURLWithPath:[dir stringByAppendingPathComponent:@"out.metallib"]];
+
+	RgfxLibrary *lib = make();
+	CHECK([lib bitcodeData] == nil);
+	NSError *err = nil;
+	CHECK([lib serializeToURL:out error:&err] && err == nil);
+	CHECK([[NSData dataWithContentsOfURL:out] isEqualToData:bytes]);
+	CHECK([lib bitcodeData] == nil); // its shadow's, now made, is nil too
+	CHECK([lib serializeToURL:out error:&err]); // over the file it wrote
+	NSURL *missing = [NSURL fileURLWithPath:[dir stringByAppendingPathComponent:@"no/out.metallib"]];
+	CHECK(![lib serializeToURL:missing error:&err]);
+	CHECK([err.domain isEqualToString:NSCocoaErrorDomain] && err.code == NSFileNoSuchFileError);
+	err = nil;
+	CHECK(![lib serializeToURL:[NSURL URLWithString:@"https://example.invalid/out.metallib"]
+	                     error:&err]);
+	CHECK([err.domain isEqualToString:NSCocoaErrorDomain] &&
+	      err.code == NSFileWriteUnsupportedSchemeError);
+
+	RgfxLibrary *fromURL = make();
+	[fromURL rgfxSetMadeFromURL];
+	err = nil;
+	CHECK(![fromURL serializeToURL:out error:&err]);
+	CHECK([err.domain isEqualToString:MTLLibraryErrorDomain] && err.code == MTLLibraryErrorUnsupported &&
+	      [err.localizedDescription isEqualToString:@"MTLLibrary is not formatted as a MetalLib file."]);
+	CHECK([fromURL bitcodeData] == nil);
+
+	std::vector<uint8_t> drain;
+	RgfxMsgHeader h;
+	while (fx.ring.next(&h, &drain)) {
+	}
+	uint32_t status = 0;
+	RgfxLibrary *bare = [RgfxLibrary libraryWithData:bytes.bytes
+	                                         length:bytes.length
+	                                            key:nullptr
+	                                         device:nil
+	                                     serializer:&fx.ser
+	                                         status:&status];
+	CHECK(bare != nil);
+	err = nil;
+	CHECK(![bare serializeToURL:out error:&err] && [err.domain isEqualToString:MTLLibraryErrorDomain]);
+	CHECK(RgfxUnsupportedWasLogged([RgfxLibrary class], @selector(serializeToURL:error:)));
+	[[NSFileManager defaultManager] removeItemAtPath:dir error:nil];
+	while (fx.ring.next(&h, &drain)) {
+	}
+}
+
 // A Core Image kernel library's extern functions come from its shadow, Metal's own library over
 // the same bytes: their names, each a function of functionType 4 that holds Metal's own, and nil
 // for a name the shadow does not hold; functionNames leaves them out, as Metal's does. Core
@@ -1563,6 +1644,9 @@ void test_core_image_extern_functions()
 	CHECK(contents.length > 0 && madeFrom != nil &&
 	      dispatch_data_get_size(madeFrom) == contents.length);
 	CHECK([[(RgfxLibrary *)ours externFunctionNames] isEqualToArray:names]);
+	id ourBitcode = [(RgfxLibrary *)ours bitcodeData];
+	id metalBitcode = ((id (*)(id, SEL))objc_msgSend)(shadow, @selector(bitcodeData));
+	CHECK((ourBitcode == nil) == (metalBitcode == nil));
 	// A library the link answers that is ours already is answered as it is, and a refused link
 	// answers nil with its error.
 	madeFrom = nil;
@@ -5180,6 +5264,7 @@ int main()
 		test_core_image_extern_functions();
 		test_stitched_library_over_shadows();
 		test_function_members_from_shadow();
+		test_library_members_as_metal();
 		test_command_graph();
 		test_parallel_render_encoder();
 		test_queue_guards();

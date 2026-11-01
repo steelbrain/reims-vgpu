@@ -299,6 +299,8 @@ void selectAirSlice(const void *&bytes, NSUInteger &length)
 		(void)data;
 	});
 	[self rgfxKeepSource:source ofLibrary:lib];
+	if ([(id)lib isKindOfClass:[RgfxLibrary class]])
+		[(RgfxLibrary *)lib rgfxSetMadeFromURL];
 	return lib;
 }
 

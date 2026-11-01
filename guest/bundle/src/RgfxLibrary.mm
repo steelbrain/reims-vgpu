@@ -345,6 +345,7 @@ RGFX_LOG_UNRECOGNIZED
 	RgfxShadowMaker _shadowMaker;
 	id<MTLLibrary> _shadow;                   // Metal's own over _source, made on first use
 	BOOL _shadowTried;
+	BOOL _madeFromURL; // newLibraryWithURL:'s, which Metal does not serialize
 }
 
 // The host drops the library's id as the app lets it go. Its functions keep it alive (RgfxFunction), and a pipeline made from them needs it no more: the
@@ -660,6 +661,54 @@ static NSError *rgfxFunctionNotFound(NSString *name)
 		[fn rgfxSetBitCodeHash:entry->hash];
 	[fn rgfxSetShadow:genuine];
 	return fn;
+}
+
+- (void)rgfxSetMadeFromURL
+{
+	std::lock_guard<std::mutex> hold(_shadowLock);
+	_madeFromURL = YES;
+}
+
+// Metal answers nil for a library made from bytes, of data or of a URL (measured: macOS 27), as
+// every library of the device is, and so does the shadow of one; a library Metal's link or
+// stitching made answers its shadow's, Metal's own library.
+- (id)bitcodeData
+{
+	id<MTLLibrary> shadow = nil;
+	{
+		std::lock_guard<std::mutex> hold(_shadowLock);
+		shadow = _shadow;
+	}
+	return [shadow respondsToSelector:_cmd] ? ((id (*)(id, SEL))objc_msgSend)(shadow, _cmd) : nil;
+}
+
+// Metal writes a library made from data to `url` as the bytes it was made from, answering
+// Foundation's error for a URL it cannot write, and refuses one made from a URL (measured: macOS
+// 27): the shadow, Metal's own library over the same bytes, writes it, and a library made from a
+// URL is refused with Metal's error.
+- (BOOL)serializeToURL:(NSURL *)url error:(__autoreleasing NSError **)error
+{
+	BOOL fromURL = NO;
+	{
+		std::lock_guard<std::mutex> hold(_shadowLock);
+		fromURL = _madeFromURL;
+	}
+	if (fromURL) {
+		if (error)
+			*error = [NSError
+			    errorWithDomain:MTLLibraryErrorDomain
+			               code:MTLLibraryErrorUnsupported
+			           userInfo:@{NSLocalizedDescriptionKey : @"MTLLibrary is not formatted as a MetalLib file."}];
+		return NO;
+	}
+	id<MTLLibrary> shadow = [self rgfxShadow];
+	if (![shadow respondsToSelector:_cmd]) {
+		RGFX_UNSUPPORTED_ERROR_IN(error, "serializing a library Metal's own does not hold",
+		                          MTLLibraryErrorDomain, MTLLibraryErrorUnsupported);
+		return NO;
+	}
+	return ((BOOL (*)(id, SEL, NSURL *, NSError *__autoreleasing *))objc_msgSend)(shadow, _cmd, url,
+	                                                                              error);
 }
 
 - (MTLLibraryType)type
