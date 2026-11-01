@@ -36,9 +36,10 @@ NS_ASSUME_NONNULL_BEGIN
 
 /// Creates a device buffer of `length` bytes with `options`, serialising an
 /// `RGFX_CMD_BUFFER_CREATE` through `serializer` (which picks the objId and GPU
-/// address). `device` is the owning shell (nil in a unit test). Returns nil if
-/// `serializer` is null (a buffer must have a route) or the backing cannot be
-/// allocated.
+/// address). `device` is the owning shell (nil in a unit test). A Shared or Managed
+/// one has contents of its own, zeroed; a Private one has none (`contents` answers
+/// NULL). Returns nil if `serializer` is null (a buffer must have a route) or the
+/// backing cannot be allocated.
 + (nullable instancetype)bufferWithLength:(NSUInteger)length
                                   options:(MTLResourceOptions)options
                                    device:(nullable id<MTLDevice>)device
@@ -87,7 +88,7 @@ NS_ASSUME_NONNULL_BEGIN
 /// Designated initialiser: wraps an already-created host buffer. `objId` and
 /// `gpuAddress` are the guest-picked values the create returned; `length` and
 /// `options` are the buffer's. Allocates the CPU-visible backing `contents` vends,
-/// which this owns and frees.
+/// which this owns and frees, for a Shared or Managed buffer; a Private one has none.
 - (nullable instancetype)initWithObjId:(uint64_t)objId
                             gpuAddress:(uint64_t)gpuAddress
                                 length:(NSUInteger)length

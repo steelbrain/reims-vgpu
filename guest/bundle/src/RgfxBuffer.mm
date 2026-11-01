@@ -47,8 +47,9 @@ bool rgfxMappedReadable(const void *p, size_t length, bool *writable)
 	return true;
 }
 
-/// Whether `options` names Shared or Managed storage, the modes Metal makes a no-copy buffer in.
-bool rgfxNoCopyStorage(MTLResourceOptions options)
+/// Whether `options` names Shared or Managed storage: the modes whose buffer has contents the CPU
+/// reaches, and the ones Metal makes a no-copy buffer in.
+bool rgfxCpuStorage(MTLResourceOptions options)
 {
 	const NSUInteger mode = (options & MTLResourceStorageModeMask) >> MTLResourceStorageModeShift;
 	return mode == MTLStorageModeShared || mode == MTLStorageModeManaged;
@@ -59,8 +60,9 @@ bool rgfxNoCopyStorage(MTLResourceOptions options)
 	uint64_t _gpuAddress;
 	NSUInteger _length;
 	MTLResourceOptions _options;
-	// The buffer's CPU-visible backing `contents` vends. For a device buffer
-	// (createBuffer) this is a plain page-aligned allocation the wrapper owns; for a
+	// The buffer's CPU-visible backing `contents` vends. For a Shared or Managed device buffer
+	// (createBuffer) this is a plain page-aligned allocation the wrapper owns, and a Private
+	// one has none; for a
 	// region-backed buffer (createBufferOverHostMemory) it is a pointer into the device
 	// region (or the caller's no-copy pages), which the wrapper does NOT own.
 	void *_contents;
@@ -139,7 +141,7 @@ bool rgfxNoCopyStorage(MTLResourceOptions options)
                                device:(id<MTLDevice>)device
                            serializer:(RgfxSerializer *)serializer
 {
-	if (length == 0 || !rgfxNoCopyStorage(options) || region == nullptr || serializer == nullptr)
+	if (length == 0 || !rgfxCpuStorage(options) || region == nullptr || serializer == nullptr)
 		return nil;
 	void (^appDeallocator)(void *, NSUInteger) = [deallocator copy];
 	// Bytes already in a block of the process's: the host sees them in place.
@@ -216,7 +218,9 @@ bool rgfxNoCopyStorage(MTLResourceOptions options)
 		_options = options;
 		_contents = nullptr;
 		_ownsContents = YES;
-		if (length > 0) {
+		// A Private buffer's bytes are the GPU's alone: `contents` answers NULL, as Metal
+		// documents for the mode, and nothing of the guest's memory stands for them.
+		if (length > 0 && rgfxCpuStorage(options)) {
 			// Page-aligned so it matches a region mapping's alignment.
 			if (posix_memalign(&_contents, 0x1000, length) != 0 || _contents == nullptr) {
 				return nil;

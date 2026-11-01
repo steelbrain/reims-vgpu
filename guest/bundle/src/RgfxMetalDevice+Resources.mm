@@ -83,7 +83,7 @@ bool rgfxIsManagedStorage(MTLResourceOptions options)
 {
 	// A Shared buffer lives in the device region so the host sees it in place, and a Managed
 	// one's CPU copy does, which the host copies to the GPU's; any other storage mode is a
-	// device buffer (createBuffer) with its own backing.
+	// device buffer (createBuffer), whose bytes are the GPU's alone (`contents` answers NULL).
 	if ((rgfxIsSharedStorage(options) || rgfxIsManagedStorage(options)) &&
 	    [self region] != nullptr) {
 		id<MTLBuffer> shared = [self rgfxSharedBufferOfLength:length
@@ -117,14 +117,16 @@ bool rgfxIsManagedStorage(MTLResourceOptions options)
 			return shared;
 		}
 	}
-	if (rgfxIsManagedStorage(options)) {
+	// A Managed buffer without a block, and one of a mode whose contents the CPU never reaches
+	// (Private): none, as Metal's validation refuses bytes for a Private buffer.
+	if (!rgfxIsSharedStorage(options)) {
 		return nil;
 	}
 	RgfxBuffer *buf = [RgfxBuffer bufferWithLength:length
 	                                       options:options
 	                                        device:self
 	                                    serializer:[self serializer]];
-	if (buf && pointer && length > 0) {
+	if (buf && pointer && length > 0 && [buf contents] != nullptr) {
 		std::memcpy([buf contents], pointer, length);
 	}
 	return buf;

@@ -165,6 +165,58 @@ void test_buffer_routing()
 	CHECK(!fx.ring.next(&extra, &extraBytes)); // nothing more on the ring
 }
 
+// The bytes this process has resident or compressed, as its footprint counts them.
+uint64_t physFootprint()
+{
+	task_vm_info_data_t info = {};
+	mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+	if (task_info(mach_task_self(), TASK_VM_INFO, reinterpret_cast<task_info_t>(&info), &count) !=
+	    KERN_SUCCESS)
+		return 0;
+	return info.phys_footprint;
+}
+
+// A Private buffer's bytes are the GPU's alone: its create routes as any other's, and no guest
+// memory stands for them, whatever its length (`contents` answers NULL, as Metal documents for
+// the mode). A Managed one made without a region still has zeroed contents of its own.
+void test_private_buffer_has_no_contents()
+{
+	Fixture fx;
+	// Drained while fx lives: a buffer's dealloc posts its destroy through fx.
+	@autoreleasepool {
+		const NSUInteger length = 0x4000000; // 64 MiB, which a zeroed backing would make resident
+		const uint64_t before = physFootprint();
+		RgfxBuffer *priv = [RgfxBuffer bufferWithLength:length
+		                                        options:MTLResourceStorageModePrivate
+		                                         device:nil
+		                                     serializer:&fx.ser];
+		CHECK(priv != nil);
+		CHECK([priv contents] == nullptr);
+		CHECK(physFootprint() < before + 0x800000);
+		CHECK([priv length] == length && [priv storageMode] == MTLStorageModePrivate);
+		auto msg = expectMessage<RgfxBufferCreate>(fx.ring, RGFX_CMD_BUFFER_CREATE);
+		CHECK(msg.obj_id == priv.rgfxObjId && msg.gpu_address == [priv gpuAddress]);
+		CHECK(msg.length == length);
+		CHECK(msg.options == static_cast<uint32_t>(MTLResourceStorageModePrivate));
+		// didModifyRange: on it posts nothing and touches nothing.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+		[priv didModifyRange:NSMakeRange(0, 0x1000)];
+#pragma clang diagnostic pop
+
+		RgfxBuffer *managed = [RgfxBuffer bufferWithLength:0x1000
+		                                           options:MTLResourceStorageModeManaged
+		                                            device:nil
+		                                        serializer:&fx.ser];
+		CHECK(managed != nil && [managed contents] != nullptr);
+		CHECK(static_cast<uint8_t *>([managed contents])[0xfff] == 0);
+		(void)expectMessage<RgfxBufferCreate>(fx.ring, RGFX_CMD_BUFFER_CREATE);
+		RgfxMsgHeader extra = {};
+		std::vector<uint8_t> extraBytes;
+		CHECK(!fx.ring.next(&extra, &extraBytes)); // nothing more on the ring
+	}
+}
+
 // The id space is monotonic across wrappers: a second buffer gets the next objId
 // and a disjoint, higher GPU address, and its own BUFFER_CREATE.
 void test_second_buffer_is_monotonic()
@@ -662,6 +714,7 @@ void test_heap_routing_and_suballoc()
 	CHECK(hb.heap == heap && hb.heapOffset == 0x2000);
 	CHECK(ht.heap == heap && ht.heapOffset == 0x4000);
 	CHECK(hb.storageMode == MTLStorageModePrivate);
+	CHECK([hb contents] == nullptr); // a Private heap's buffer: the GPU's bytes alone
 	CHECK(ht.isAliasable && hb.isAliasable);
 	[ht makeAliasable];
 	CHECK(ht.isAliasable);
@@ -4792,6 +4845,7 @@ int main()
 {
 	@autoreleasepool {
 		test_buffer_routing();
+		test_private_buffer_has_no_contents();
 		test_second_buffer_is_monotonic();
 		test_wrapper_guards_and_base();
 		test_event_routing();
