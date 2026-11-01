@@ -113,6 +113,25 @@ pub fn default_gpu_core_count() -> Option<u64> {
     *COUNT.get_or_init(|| count)
 }
 
+/// `featureProfile`, `halfFPConfig`, `singleFPConfig` and `doubleFPConfig` of the system default
+/// `MTLDevice`, asked of Metal once: the answers of the GPU's own driver for the device
+/// [`default_registry_id`] names, which no Vulkan query reports. `None` for each where Metal has
+/// no device, or its device does not respond to it.
+pub fn default_driver_sizes() -> [Option<u64>; 4] {
+    static SIZES: std::sync::OnceLock<[Option<u64>; 4]> = std::sync::OnceLock::new();
+    *SIZES.get_or_init(|| {
+        MetalPlatform::system_default_device().map_or([None; 4], |d| {
+            let z = d.identity_caps().sizes;
+            [
+                z.feature_profile,
+                z.half_fp_config,
+                z.single_fp_config,
+                z.double_fp_config,
+            ]
+        })
+    })
+}
+
 /// What a device holds of the guest's RAM while it lives: nothing, as Mach makes a view of any
 /// memory by remapping its addresses (`mach_vm_remap`), with no file behind it.
 #[derive(Debug)]

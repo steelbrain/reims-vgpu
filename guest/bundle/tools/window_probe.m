@@ -60,7 +60,7 @@ enum {
 static const uint64_t kHead = 0x400000;       // RGFX_ALLOCATIONS_OFFSET
 static const uint64_t kDeviceInfoAt = 0x18100; // RGFX_DEVICE_INFO_OFFSET
 #define RGFX_PROBE_SCANOUT_SPAN 0x8000000ull     // RGFX_SCANOUT_SPAN
-static const size_t kDeviceInfoSize = 11640;   // sizeof(RgfxDeviceInfo)
+static const size_t kDeviceInfoSize = 11672;   // sizeof(RgfxDeviceInfo)
 static const uint64_t kBlock = 0x10000;
 // The accelerator's IOAccel surface client (kIOAccelSurfaceClientType), and IOGraphics' memory
 // type for a framebuffer's VRAM range on its user clients (kIOFBVRAMMemory, in IOGraphics' open

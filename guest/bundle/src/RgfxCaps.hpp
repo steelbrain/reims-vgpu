@@ -86,7 +86,7 @@ enum RgfxFlag {
 	kRgfxFlagCount
 };
 
-/// The 15 integer identity answers, in the host `IdentitySizes` field order.
+/// The 19 integer identity answers, in the host `IdentitySizes` field order.
 enum RgfxSize {
 	kRgfxSizeRecommendedMaxWorkingSetSize = 0,
 	kRgfxSizeLocation,
@@ -103,6 +103,10 @@ enum RgfxSize {
 	kRgfxSizeMaximumConcurrentCompilationTaskCount,
 	kRgfxSizeLargestVertexAmplificationCount,
 	kRgfxSizeLargestRasterizationRateMapLayerCount,
+	kRgfxSizeFeatureProfile,
+	kRgfxSizeHalfFpConfig,
+	kRgfxSizeSingleFpConfig,
+	kRgfxSizeDoubleFpConfig,
 	kRgfxSizeCount
 };
 

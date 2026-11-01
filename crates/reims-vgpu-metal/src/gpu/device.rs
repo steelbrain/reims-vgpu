@@ -23,7 +23,7 @@ use std::sync::{Arc, LazyLock};
 use block2::{Block, RcBlock};
 use dispatch2::{DispatchData, DispatchRetained, dispatch_block_t};
 use objc2::rc::Retained;
-use objc2::runtime::{AnyObject, NSObjectProtocol, ProtocolObject};
+use objc2::runtime::{AnyObject, NSObjectProtocol, ProtocolObject, Sel};
 use objc2::{AnyThread as _, Message, sel};
 use objc2_foundation::{NSData, NSError};
 use objc2_metal::{MTLDevice, MTLGPUFamily, MTLPixelFormat, MTLResourceOptions};
@@ -931,6 +931,17 @@ fn gpu_core_count(d: &ProtocolObject<dyn MTLDevice>) -> Option<u64> {
     Some(u64::from(n))
 }
 
+/// An `MTLDeviceSPI` getter answering `Q@:`, sent as `get` where the device responds to `sel`;
+/// `None` where it does not, and then only `respondsToSelector:` is called.
+fn spi_size(
+    d: &ProtocolObject<dyn MTLDevice>,
+    sel: Sel,
+    name: &'static str,
+    get: impl FnOnce() -> u64,
+) -> Option<u64> {
+    msg::get("respondsToSelector:", || d.respondsToSelector(sel)).then(|| msg::get(name, get))
+}
+
 /// `heapBufferSizeAndAlignWithLength:options:`.
 fn heap_buffer_size_and_align(
     d: &ProtocolObject<dyn MTLDevice>,
@@ -1114,7 +1125,8 @@ fn format_answers(d: &ProtocolObject<dyn MTLDevice>, format: u64) -> FormatAnswe
 }
 
 /// Every identity and capability answer of `device` [`IdentityCaps`] holds, each Metal's getter
-/// or query, sent once. Metal answers each of them, so none is `None`.
+/// or query, sent once. Metal answers each of them, so none is `None`, but for the
+/// `MTLDeviceSPI` getters a device may not respond to.
 #[allow(deprecated)] // `supportsFeatureSet:`, `location` and the peer getters, deprecated in the SDK
 fn read_identity_caps(device: &MetalDevice) -> IdentityCaps {
     let d = device.get();
@@ -1183,6 +1195,16 @@ fn read_identity_caps(device: &MetalDevice) -> IdentityCaps {
                     d.supportsRasterizationRateMapWithLayerCount(count)
                 })
             })),
+            feature_profile: spi_size(d, sel!(featureProfile), "featureProfile", || {
+                d.featureProfile()
+            }),
+            half_fp_config: spi_size(d, sel!(halfFPConfig), "halfFPConfig", || d.halfFPConfig()),
+            single_fp_config: spi_size(d, sel!(singleFPConfig), "singleFPConfig", || {
+                d.singleFPConfig()
+            }),
+            double_fp_config: spi_size(d, sel!(doubleFPConfig), "doubleFPConfig", || {
+                d.doubleFPConfig()
+            }),
         },
         flags: IdentityFlags {
             is_low_power: Some(get!(isLowPower)),
@@ -1794,6 +1816,18 @@ pub(crate) mod tests {
         // BC1_RGBA (130), which Metal asserts on, is not asked.
         let bc1 = identity.formats.iter().find(|f| f.format == 130).unwrap();
         assert_eq!(bc1.texture_buffer_alignment, None);
+        // The driver's feature profile and FP configs, as the device answers them.
+        assert_eq!(
+            identity.sizes.feature_profile,
+            Some(d.get().featureProfile())
+        );
+        assert!(identity.sizes.feature_profile.is_some_and(|p| p >= 8));
+        assert_eq!(identity.sizes.half_fp_config, Some(d.get().halfFPConfig()));
+        assert_eq!(
+            identity.sizes.single_fp_config,
+            Some(d.get().singleFPConfig())
+        );
+        assert_eq!(identity.sizes.double_fp_config, Some(0));
     }
 
     /// Garbage is the NSError; a compiled metallib (the suite's one-kernel fixture) is a library

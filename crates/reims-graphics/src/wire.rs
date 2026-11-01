@@ -1709,7 +1709,7 @@ pub struct RgfxLibraryLookup {
 }
 
 /// The version of the [`RgfxDeviceInfo`] layout the host writes.
-pub const RGFX_DEVICE_INFO_VERSION: u32 = 2;
+pub const RGFX_DEVICE_INFO_VERSION: u32 = 3;
 
 /// The most bytes of a device name [`RgfxDeviceInfo`] carries: Vulkan's
 /// `VK_MAX_PHYSICAL_DEVICE_NAME_SIZE`, so no host GPU's name is cut short.
@@ -1725,7 +1725,7 @@ pub const RGFX_DEVICE_INFO_FAMILIES: usize = 32;
 pub const RGFX_DEVICE_INFO_FEATURE_SETS: usize = 32;
 
 /// The integer identity answers [`RgfxDeviceInfo::sizes`] holds.
-pub const RGFX_DEVICE_INFO_SIZES: usize = 15;
+pub const RGFX_DEVICE_INFO_SIZES: usize = 19;
 
 /// The `BOOL` identity answers [`RgfxDeviceInfo::identity_flags`] holds.
 pub const RGFX_DEVICE_INFO_IDENTITY_FLAGS: usize = 19;
@@ -1802,8 +1802,8 @@ pub struct RgfxDeviceInfo {
     /// last); the host fills them in that order.
     pub limits: [u64; 27],
     /// The integer identity answers, in the host `IdentitySizes` field order
-    /// (`recommended_max_working_set_size` first,
-    /// `largest_rasterization_rate_map_layer_count` last); 0 on a gap.
+    /// (`recommended_max_working_set_size` first, `double_fp_config` last); 0
+    /// on a gap.
     pub sizes: [u64; RGFX_DEVICE_INFO_SIZES],
     /// The raw `MTLGPUFamily` values `family_answers` answers, by position.
     pub family_values: [i64; RGFX_DEVICE_INFO_FAMILIES],
@@ -1833,7 +1833,7 @@ pub struct RgfxDeviceInfo {
     /// boundaries by position; a gap reads 0.
     pub counter_sampling: [u8; RGFX_DEVICE_INFO_COUNTER_POINTS],
     /// Zero.
-    pub reserved_431: [u8; 7],
+    pub reserved_451: [u8; 7],
     /// The device `name`, UTF-8, `name_len` bytes used, the rest 0.
     pub name: [u8; RGFX_DEVICE_NAME_LEN],
     /// The device's `architecture.name`, UTF-8, `architecture_name_len` bytes
@@ -2247,10 +2247,10 @@ const _: () = {
     assert!(size_of::<RgfxSamplerState>() == 32);
     assert!(RGFX_LIBRARY_BYTES_OFFSET as usize == size_of::<RgfxLibraryCreate>());
     assert!(size_of::<RgfxFormatAnswers>() == 64);
-    assert!(size_of::<RgfxDeviceInfo>() == 1400 + 64 * RGFX_DEVICE_INFO_FORMATS);
-    assert!(core::mem::offset_of!(RgfxDeviceInfo, formats) == 1400);
-    assert!(core::mem::offset_of!(RgfxDeviceInfo, family_answers) == 944);
-    assert!(core::mem::offset_of!(RgfxDeviceInfo, name) == 1080);
+    assert!(size_of::<RgfxDeviceInfo>() == 1432 + 64 * RGFX_DEVICE_INFO_FORMATS);
+    assert!(core::mem::offset_of!(RgfxDeviceInfo, formats) == 1432);
+    assert!(core::mem::offset_of!(RgfxDeviceInfo, family_answers) == 976);
+    assert!(core::mem::offset_of!(RgfxDeviceInfo, name) == 1112);
     // The device-info blob sits past the completion ring and before the allocations.
     assert!(
         RGFX_DEVICE_INFO_OFFSET
@@ -2431,7 +2431,7 @@ mod tests {
         info.format_count = 1;
         info.formats[0].format = 80;
         info.formats[0].sparse_tiles[0] = [64, 64, 1];
-        assert_eq!(info.as_bytes().len(), 1400 + 64 * RGFX_DEVICE_INFO_FORMATS);
+        assert_eq!(info.as_bytes().len(), 1432 + 64 * RGFX_DEVICE_INFO_FORMATS);
         assert_eq!(
             RgfxDeviceInfo::read_from_bytes(info.as_bytes()).unwrap(),
             info

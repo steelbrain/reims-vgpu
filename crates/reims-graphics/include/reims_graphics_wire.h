@@ -1140,7 +1140,7 @@
 #define RGFX_LIBRARY_FLAG_KEYED 1
 
 // The version of the [`RgfxDeviceInfo`] layout the host writes.
-#define RGFX_DEVICE_INFO_VERSION 2
+#define RGFX_DEVICE_INFO_VERSION 3
 
 // The most bytes of a device name [`RgfxDeviceInfo`] carries: Vulkan's
 // `VK_MAX_PHYSICAL_DEVICE_NAME_SIZE`, so no host GPU's name is cut short.
@@ -1156,7 +1156,7 @@
 #define RGFX_DEVICE_INFO_FEATURE_SETS 32
 
 // The integer identity answers [`RgfxDeviceInfo::sizes`] holds.
-#define RGFX_DEVICE_INFO_SIZES 15
+#define RGFX_DEVICE_INFO_SIZES 19
 
 // The `BOOL` identity answers [`RgfxDeviceInfo::identity_flags`] holds.
 #define RGFX_DEVICE_INFO_IDENTITY_FLAGS 19
@@ -2475,8 +2475,8 @@ typedef struct {
   // last); the host fills them in that order.
   uint64_t limits[27];
   // The integer identity answers, in the host `IdentitySizes` field order
-  // (`recommended_max_working_set_size` first,
-  // `largest_rasterization_rate_map_layer_count` last); 0 on a gap.
+  // (`recommended_max_working_set_size` first, `double_fp_config` last); 0
+  // on a gap.
   uint64_t sizes[RGFX_DEVICE_INFO_SIZES];
   // The raw `MTLGPUFamily` values `family_answers` answers, by position.
   int64_t family_values[RGFX_DEVICE_INFO_FAMILIES];
@@ -2506,7 +2506,7 @@ typedef struct {
   // boundaries by position; a gap reads 0.
   uint8_t counter_sampling[RGFX_DEVICE_INFO_COUNTER_POINTS];
   // Zero.
-  uint8_t reserved_431[7];
+  uint8_t reserved_451[7];
   // The device `name`, UTF-8, `name_len` bytes used, the rest 0.
   uint8_t name[RGFX_DEVICE_NAME_LEN];
   // The device's `architecture.name`, UTF-8, `architecture_name_len` bytes

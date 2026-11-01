@@ -135,3 +135,9 @@ pub fn default_registry_id() -> Option<u64> {
 pub fn default_gpu_core_count() -> Option<u64> {
     None
 }
+
+/// The feature profile and FP configs Metal answers for the device [`default_registry_id`]
+/// names: none, as there is no Metal here to ask.
+pub fn default_driver_sizes() -> [Option<u64>; 4] {
+    [None; 4]
+}

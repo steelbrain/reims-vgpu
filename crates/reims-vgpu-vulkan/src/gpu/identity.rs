@@ -238,9 +238,39 @@ fn pipeline_cache_uuid(device: &rt::Device) -> [u8; vk::UUID_SIZE] {
     }
 }
 
+/// `featureProfile`, `halfFPConfig`, `singleFPConfig` and `doubleFPConfig` measured on the M3 Max
+/// (macOS 27), the one device they are measured on.
+const M3_MAX_DRIVER_SIZES: [u64; 4] = [10, 0xe, 0x54, 0];
+
+/// `featureProfile`, `halfFPConfig`, `singleFPConfig` and `doubleFPConfig` (private; SkyLight asks
+/// them) of the device this platform answers registry ID `registry_id` for:
+/// - on macOS, for the device this platform answers Metal's registry ID for, Metal's own answers
+///   for that GPU ([`crate::os::default_driver_sizes`]);
+/// - else the M3 Max's ([`M3_MAX_DRIVER_SIZES`]). No Vulkan query reports them, and what Metal
+///   answers for a family other than the M3 Max's is not measured, so every other device answers
+///   the one measured device's values (a gap, in the graphics lane's selector sweep).
+fn driver_sizes(registry_id: u64) -> [Option<u64>; 4] {
+    let metals = if crate::os::default_registry_id() == Some(registry_id) {
+        crate::os::default_driver_sizes()
+    } else {
+        [None; 4]
+    };
+    let mut sizes = [None; 4];
+    for ((size, metal), m3) in sizes.iter_mut().zip(metals).zip(M3_MAX_DRIVER_SIZES) {
+        *size = Some(metal.unwrap_or(m3));
+    }
+    sizes
+}
+
 /// Every identity answer of `device`, whose `DeviceCaps` are `caps`, read once.
 pub fn read(device: &rt::Device, caps: &DeviceCaps) -> IdentityCaps {
     let props = device.properties();
+    let [
+        feature_profile,
+        half_fp_config,
+        single_fp_config,
+        double_fp_config,
+    ] = driver_sizes(caps.registry_id);
     let families = families(device, caps);
     let [
         lod,
@@ -278,6 +308,10 @@ pub fn read(device: &rt::Device, caps: &DeviceCaps) -> IdentityCaps {
             largest_rasterization_rate_map_layer_count: Some(largest(|count| {
                 props.supports_rasterization_rate_map_with_layer_count(count)
             })),
+            feature_profile,
+            half_fp_config,
+            single_fp_config,
+            double_fp_config,
             ..IdentitySizes::default()
         },
         flags: IdentityFlags {
@@ -304,6 +338,21 @@ mod tests {
 
     use super::*;
     use crate::gpu::device::tests::dev;
+
+    /// A device no Metal device stands for answers the M3 Max's feature profile and FP configs;
+    /// the one Metal's registry ID names, Metal's own (on macOS)
+    #[test]
+    fn driver_sizes_are_metals_or_the_m3_maxs() {
+        let elsewhere = crate::os::default_registry_id().map_or(1, |id| id ^ 1);
+        assert_eq!(driver_sizes(elsewhere), M3_MAX_DRIVER_SIZES.map(Some));
+        if let Some(id) = crate::os::default_registry_id() {
+            let metals = crate::os::default_driver_sizes();
+            let answered = driver_sizes(id);
+            for ((answer, metal), m3) in answered.iter().zip(metals).zip(M3_MAX_DRIVER_SIZES) {
+                assert_eq!(*answer, Some(metal.unwrap_or(m3)));
+            }
+        }
+    }
 
     /// A claimed family claims every family Metal documents it contains, and nothing more: Apple9
     /// claims Apple1 to Apple8, the Common families, Mac1, Mac2 and Metal3, but not Apple10,

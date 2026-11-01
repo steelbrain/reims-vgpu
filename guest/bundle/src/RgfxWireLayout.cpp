@@ -46,11 +46,11 @@ static_assert(RGFX_LIBRARY_BYTES_OFFSET == sizeof(RgfxLibraryCreate), "library b
 static_assert(sizeof(RgfxLibraryFromRegion) == 112, "RgfxLibraryFromRegion");
 static_assert(sizeof(RgfxLibraryLookup) == 64, "RgfxLibraryLookup");
 static_assert(sizeof(RgfxFormatAnswers) == 64, "RgfxFormatAnswers");
-static_assert(sizeof(RgfxDeviceInfo) == 1400 + 64 * RGFX_DEVICE_INFO_FORMATS, "RgfxDeviceInfo");
-static_assert(__builtin_offsetof(RgfxDeviceInfo, formats) == 1400, "RgfxDeviceInfo formats");
-static_assert(__builtin_offsetof(RgfxDeviceInfo, family_answers) == 944,
+static_assert(sizeof(RgfxDeviceInfo) == 1432 + 64 * RGFX_DEVICE_INFO_FORMATS, "RgfxDeviceInfo");
+static_assert(__builtin_offsetof(RgfxDeviceInfo, formats) == 1432, "RgfxDeviceInfo formats");
+static_assert(__builtin_offsetof(RgfxDeviceInfo, family_answers) == 976,
               "RgfxDeviceInfo family_answers");
-static_assert(__builtin_offsetof(RgfxDeviceInfo, name) == 1080, "RgfxDeviceInfo name");
+static_assert(__builtin_offsetof(RgfxDeviceInfo, name) == 1112, "RgfxDeviceInfo name");
 
 // Stage-3 pipeline creates and reflection.
 static_assert(sizeof(RgfxFunctionConstant) == 40, "RgfxFunctionConstant");

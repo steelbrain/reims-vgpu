@@ -902,6 +902,36 @@ RGFX_LOG_UNRECOGNIZED
 // SkyLight, Core Image and MPS send these; each answers what Metal's device answers, measured
 // on the M3 Max (macOS 27), unless it says otherwise.
 
+// The host's answers, from the device info: its Metal device's own, or, where no Metal device
+// stands for its GPU, the M3 Max's (the Vulkan platform's), and 0 for a Metal device that does
+// not respond to one. Measured on the M3 Max (macOS 27): feature profile 10, FP configs 0xe
+// (half), 0x54 (single) and 0 (double), 40 cores.
+- (NSUInteger)featureProfile
+{
+	return _caps.size(kRgfxSizeFeatureProfile);
+}
+
+- (NSUInteger)halfFPConfig
+{
+	return _caps.size(kRgfxSizeHalfFpConfig);
+}
+
+- (NSUInteger)singleFPConfig
+{
+	return _caps.size(kRgfxSizeSingleFpConfig);
+}
+
+- (NSUInteger)doubleFPConfig
+{
+	return _caps.size(kRgfxSizeDoubleFpConfig);
+}
+
+// `unsigned int`, as Metal's (`I16@0:8`).
+- (unsigned int)gpuCoreCount
+{
+	return static_cast<unsigned int>(_caps.gpuCoreCount());
+}
+
 // As supportsTextureSampleCount: (the same for each count from 1 to 16).
 - (BOOL)supportsSampleCount:(NSUInteger)sampleCount
 {

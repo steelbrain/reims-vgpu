@@ -947,6 +947,10 @@ pub fn fake_identity_caps() -> IdentityCaps {
             maximum_concurrent_compilation_task_count: Some(16),
             largest_vertex_amplification_count: Some(8),
             largest_rasterization_rate_map_layer_count: Some(2),
+            feature_profile: Some(10),
+            half_fp_config: Some(0xe),
+            single_fp_config: Some(0x54),
+            double_fp_config: Some(0),
         },
         flags: IdentityFlags {
             is_low_power: Some(false),

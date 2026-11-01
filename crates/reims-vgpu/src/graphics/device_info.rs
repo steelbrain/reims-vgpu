@@ -362,6 +362,10 @@ pub fn device_info(
         z.maximum_concurrent_compilation_task_count,
         z.largest_vertex_amplification_count,
         z.largest_rasterization_rate_map_layer_count,
+        z.feature_profile,
+        z.half_fp_config,
+        z.single_fp_config,
+        z.double_fp_config,
     ];
     info.sizes = sizes.map(|size| size.unwrap_or(0));
 
@@ -702,7 +706,8 @@ mod tests {
         assert_eq!(info.identity_flags[13], 0);
         assert_eq!(info.identity_flags[18], 0);
         assert_eq!(info.counter_sampling, [0; 5]);
-        // recommended_max_working_set_size first, the rate maps' layers last (the lane's 0).
+        // recommended_max_working_set_size first, the rate maps' layers at 14 (the lane's 0), the
+        // driver's feature profile and FP configs last, the platform's.
         assert_eq!(
             info.sizes[0],
             identity.sizes.recommended_max_working_set_size.unwrap()
@@ -712,6 +717,7 @@ mod tests {
         assert_eq!(info.sizes[12], 4);
         assert_eq!(info.sizes[13], 8);
         assert_eq!(info.sizes[14], 0);
+        assert_eq!(info.sizes[15..], [10, 0xe, 0x54, 0]);
         // Every SDK format, each the platform's: BGRA8Unorm (80) 16-byte texture buffers and
         // 64x64 tiles; BC1_RGBA (130) no texture buffers.
         assert_eq!(info.format_count as usize, SDK_PIXEL_FORMATS.len());

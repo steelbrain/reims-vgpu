@@ -71,9 +71,18 @@ pub unsafe trait DeviceSpi: Message {
     fn deviceLinearTextureAlignmentBytes(&self) -> u64 {
         unsafe { msg_send![self, deviceLinearTextureAlignmentBytes] }
     }
+    fn doubleFPConfig(&self) -> u64 {
+        unsafe { msg_send![self, doubleFPConfig] }
+    }
+    fn featureProfile(&self) -> u64 {
+        unsafe { msg_send![self, featureProfile] }
+    }
     /// `unsigned int`, as the runtime answers (`I@:`).
     fn gpuCoreCount(&self) -> u32 {
         unsafe { msg_send![self, gpuCoreCount] }
+    }
+    fn halfFPConfig(&self) -> u64 {
+        unsafe { msg_send![self, halfFPConfig] }
     }
     fn iosurfaceReadOnlyTextureAlignmentBytes(&self) -> u64 {
         unsafe { msg_send![self, iosurfaceReadOnlyTextureAlignmentBytes] }
@@ -161,6 +170,9 @@ pub unsafe trait DeviceSpi: Message {
     }
     fn maxViewportCount(&self) -> u64 {
         unsafe { msg_send![self, maxViewportCount] }
+    }
+    fn singleFPConfig(&self) -> u64 {
+        unsafe { msg_send![self, singleFPConfig] }
     }
     fn supportsBufferWithAddressRanges(&self) -> bool {
         unsafe { msg_send![self, supportsBufferWithAddressRanges] }

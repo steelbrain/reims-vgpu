@@ -225,7 +225,9 @@ pub struct FormatAnswers {
 
 caps_struct! {
     /// The device's identity and size answers [`IdentityCaps`] holds, one field per selector:
-    /// `None` where the platform has no answer of its own.
+    /// `None` where the platform has no answer of its own. The last four are `MTLDeviceSPI`'s
+    /// `featureProfile`, `halfFPConfig`, `singleFPConfig` and `doubleFPConfig`, which SkyLight
+    /// asks (measured on the M3 Max, macOS 27: 10, 0xe, 0x54 and 0).
     IdentitySizes: Option<u64>;
     recommended_max_working_set_size,
     location,
@@ -242,6 +244,10 @@ caps_struct! {
     maximum_concurrent_compilation_task_count,
     largest_vertex_amplification_count,
     largest_rasterization_rate_map_layer_count,
+    feature_profile,
+    half_fp_config,
+    single_fp_config,
+    double_fp_config,
 }
 
 caps_struct! {

@@ -347,7 +347,10 @@ MTLRasterizationRateLayerDescriptor initWithSampleCount: @@:{?=QQQ}
 MTLResourceAddressRangeArray initWithRanges:count: @@:^{MTLAddressRange=QQ}Q
 MTLDevice allowLibrariesFromOtherPlatforms v@:
 MTLDevice deviceLinearTextureAlignmentBytes Q@:
+MTLDevice doubleFPConfig Q@:
+MTLDevice featureProfile Q@:
 MTLDevice gpuCoreCount I@:
+MTLDevice halfFPConfig Q@:
 MTLDevice iosurfaceReadOnlyTextureAlignmentBytes Q@:
 MTLDevice iosurfaceTextureAlignmentBytes Q@:
 MTLDevice isFramebufferReadSupported B@:
@@ -395,6 +398,7 @@ MTLDevice newSharedTextureWithHandle:withResourceIndex: @@:@Q
 MTLDevice newTextureWithDescriptor:iosurface:plane: @@:@^{__IOSurface=}Q
 MTLDevice newTileRenderPipelineDescriptorWithSerializedData:deserializationContext: @@:@@
 MTLDevice reserveResourceIndicesForResourceType:indices:indexCount: v@:Q^QQ
+MTLDevice singleFPConfig Q@:
 MTLDevice supportsBufferWithAddressRanges B@:
 MTLDevice supportsBufferWithIOSurface B@:
 MTLDevice supportsCommandBufferJump B@:
@@ -685,7 +689,7 @@ fn every_spi_declaration_matches_the_runtime() {
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
-    assert_eq!(rows.len(), 254);
+    assert_eq!(rows.len(), 258);
 }
 
 /// The render-encoder SPI the host's AGX render encoder does not implement stays unimplemented
