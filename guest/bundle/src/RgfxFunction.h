@@ -100,7 +100,11 @@ typedef struct {
 
 /// Sets the function Metal's own library made of the same entry point (`shadow`, an extern
 /// function of the library's shadow, RgfxLibrary): what Metal's Core Image link reads in this
-/// function's place, since it reads Metal's internal objects no RgfxFunction holds.
+/// function's place, since it reads Metal's internal objects no RgfxFunction holds. A function
+/// with a shadow hands each message it does not implement to the shadow, which answers it as
+/// Metal's own function of the same entry point: Core Image reflects its kernels through Metal's
+/// private getters (measured: macOS 26.6.1, `-returnType`). Each selector so handed is logged
+/// once per class ("RGFX: answered by Metal's own function: -[RgfxFunction returnType]").
 - (void)rgfxSetShadow:(id<MTLFunction>)shadow;
 
 /// The shadow `rgfxSetShadow:` set; nil for none.

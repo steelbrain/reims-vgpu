@@ -19,6 +19,7 @@
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#import <objc/message.h>
 
 #include <cstdint>
 #include <cstring>
@@ -1413,6 +1414,14 @@ void test_core_image_extern_functions()
 	CHECK([swap rgfxShadow].functionType == kRgfxFunctionTypeExtern);
 	CHECK([[swap rgfxShadow].name isEqualToString:@"swap_red_blue"]);
 	CHECK([lib newExternFunctionWithName:@"nope"] == nil);
+	// What the function does not implement, its shadow answers (Core Image reflects a kernel's
+	// return type so); one with no shadow answers only its own.
+	SEL returnType = NSSelectorFromString(@"returnType");
+	CHECK([[swap rgfxShadow] respondsToSelector:returnType] && [swap respondsToSelector:returnType]);
+	id answered = ((id (*)(id, SEL))objc_msgSend)(swap, returnType);
+	id metals = ((id (*)(id, SEL))objc_msgSend)([swap rgfxShadow], returnType);
+	CHECK(answered != nil && [[answered description] isEqualToString:[metals description]]);
+	CHECK(![[lib newFunctionWithName:@"swap_red_blue"] respondsToSelector:returnType]);
 	// A kernel by name is of functionType 4 too, as Metal's.
 	id<MTLFunction> byName = [lib newFunctionWithName:@"scale_red_green"];
 	CHECK(byName.functionType == kRgfxFunctionTypeExtern);

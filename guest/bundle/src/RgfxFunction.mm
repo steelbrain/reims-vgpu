@@ -9,11 +9,33 @@
 
 #import "RgfxMetalError.h"
 
+#import <objc/runtime.h>
+
 #include <CommonCrypto/CommonDigest.h>
 
 #include <cstring>
+#include <mutex>
+#include <set>
 #include <string>
+#include <utility>
 #include <vector>
+
+namespace {
+
+// Logs, the first time `cls` hands `cmd` to a shadow, that Metal's own function answered it.
+void logAnsweredByShadow(Class cls, SEL cmd)
+{
+	static std::mutex lock;
+	static std::set<std::pair<Class, SEL>> logged;
+	{
+		std::lock_guard<std::mutex> hold(lock);
+		if (!logged.insert({cls, cmd}).second)
+			return;
+	}
+	NSLog(@"RGFX: answered by Metal's own function: -[%s %s]", class_getName(cls), sel_getName(cmd));
+}
+
+} // namespace
 
 @implementation RgfxFunction {
 	RgfxResource *_library; // kept alive: a pipeline made from the function names it
@@ -29,6 +51,7 @@
 	std::string _specializedName;                 // the descriptor's, where it gave one
 	BOOL _haveSpecializedName;
 	id<MTLFunction> _shadow;                      // Metal's own, for Core Image's link
+	std::mutex _shadowLock;                       // guards _shadow, set once in use
 }
 
 + (instancetype)functionWithLibrary:(RgfxResource *)library
@@ -219,12 +242,34 @@
 
 - (void)rgfxSetShadow:(id<MTLFunction>)shadow
 {
+	std::lock_guard<std::mutex> hold(_shadowLock);
 	_shadow = shadow;
 }
 
 - (id<MTLFunction>)rgfxShadow
 {
+	std::lock_guard<std::mutex> hold(_shadowLock);
 	return _shadow;
+}
+
+// What this class does not implement goes to the shadow, Metal's own function of the same entry
+// point, where it answers it (rgfxSetShadow:); nothing else answers in its place.
+- (id)forwardingTargetForSelector:(SEL)aSelector
+{
+	id<MTLFunction> shadow = [self rgfxShadow];
+	if (shadow != nil && [shadow respondsToSelector:aSelector]) {
+		logAnsweredByShadow([self class], aSelector);
+		return shadow;
+	}
+	return [super forwardingTargetForSelector:aSelector];
+}
+
+- (BOOL)respondsToSelector:(SEL)aSelector
+{
+	if ([super respondsToSelector:aSelector])
+		return YES;
+	id<MTLFunction> shadow = [self rgfxShadow];
+	return shadow != nil && [shadow respondsToSelector:aSelector];
 }
 
 - (RgfxResource *)rgfxLibrary
