@@ -3,6 +3,7 @@
  */
 
 #import "RgfxSharedEvent.h"
+#import "RgfxInterop.h"
 
 #include "RgfxReplyReader.hpp"
 #include "RgfxSerializer.hpp"
@@ -13,6 +14,7 @@
 @property(nonatomic, copy) MTLSharedEventNotificationBlock block;
 @end
 @implementation RgfxSharedEventPending
+RGFX_LOG_UNRECOGNIZED
 @end
 
 @interface RgfxSharedEvent ()
@@ -32,6 +34,7 @@
 	uint64_t _eventToken;
 	// Signalled each time the mirror moves, for waitUntilSignaledValue:timeoutMS:.
 	NSCondition *_valueChanged;
+	uint64_t _traceId; // globalTraceObjectID
 }
 
 + (instancetype)sharedEventWithInitialValue:(uint64_t)initialValue
@@ -46,6 +49,7 @@
 	                                                     device:device
 	                                                 serializer:serializer];
 	if (ev != nil) {
+		ev->_traceId = RgfxNextTraceObjectId();
 		ev->_signaledValue = initialValue;
 		ev->_pending = [NSMutableArray array];
 		ev->_valueChanged = [[NSCondition alloc] init];
@@ -96,6 +100,12 @@
 }
 
 // --- MTLSharedEvent ----------------------------------------------------------
+
+// Its trace id (RgfxInterop.h), taken as it was made.
+- (uint64_t)globalTraceObjectID
+{
+	return _traceId;
+}
 
 - (uint64_t)signaledValue
 {

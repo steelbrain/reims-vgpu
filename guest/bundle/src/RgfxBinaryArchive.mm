@@ -24,6 +24,7 @@
 #include <vector>
 
 #import "RgfxFunction.h"
+#import "RgfxInterop.h"
 #import "RgfxLibrary.h"
 #import "RgfxMetalError.h"
 #import "RgfxUnsupported.h"
@@ -237,6 +238,8 @@ NSError *miss(id<MTLFunction> fn, const char *pipeline, const RgfxArchiveEntry &
 }
 
 @synthesize label = _label;
+
+RGFX_LOG_UNRECOGNIZED
 
 + (instancetype)archiveWithDescriptor:(MTLBinaryArchiveDescriptor *)descriptor
                                device:(id<MTLDevice>)device

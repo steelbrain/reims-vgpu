@@ -11,6 +11,7 @@
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#import <objc/message.h>
 
 #include <cstdint>
 #include <cstring>
@@ -24,8 +25,11 @@
 #import "RgfxCommandObjects.h"
 #import "RgfxComputePipelineState.h"
 #import "RgfxDepthStencilState.h"
+#import "RgfxEvent.h"
+#import "RgfxFence.h"
 #import "RgfxFunction.h"
 #import "RgfxHeap.h"
+#import "RgfxInterop.h"
 #import "RgfxLibrary.h"
 #import "RgfxRenderPipelineState.h"
 #import "RgfxResource.h"
@@ -516,6 +520,114 @@ void test_render_tile_size()
 	CHECK(chosen.tileWidth == 0);
 	CHECK(RgfxUnsupportedWasLogged([RgfxRenderCommandEncoder class], @selector(tileWidth)));
 	[chosen endEncoding];
+	[cb commit];
+	uint64_t seqno = 0;
+	(void)fx.nextOps(&seqno);
+	fx.complete(cb, seqno);
+}
+
+// --- trace ids, encoders' command buffers, unrecognised selectors ----------------------
+
+// The trace ids Metal answers (RgfxInterop.h): on queues, command buffers, every encoder (a
+// parallel pass's sub-encoders too), heaps and shared events; each taken as the object is made,
+// so in creation order, and the same each time it is asked. Each encoder answers the command
+// buffer that made it.
+void test_trace_ids()
+{
+	QueueFixture fx;
+	RgfxTexture *target = shapeTexture(
+	    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+	                                                       width:64
+	                                                      height:64
+	                                                   mipmapped:NO],
+	    0x42);
+	auto trace = [](id object) {
+		return ((uint64_t(*)(id, SEL))objc_msgSend)(object, @selector(globalTraceObjectID));
+	};
+	std::vector<uint64_t> made;
+	made.push_back(trace(fx.queue));
+	id<MTLCommandBuffer> cb = [fx.queue commandBuffer];
+	made.push_back(trace(cb));
+	id<MTLRenderCommandEncoder> renc = [cb renderCommandEncoderWithDescriptor:onePass(target)];
+	made.push_back(trace(renc));
+	CHECK([(id)renc commandBuffer] == cb);
+	[renc endEncoding];
+	id<MTLComputeCommandEncoder> cenc = [cb computeCommandEncoder];
+	made.push_back(trace(cenc));
+	CHECK([(id)cenc commandBuffer] == cb);
+	[cenc endEncoding];
+	id<MTLComputeCommandEncoder> conc =
+	    [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
+	made.push_back(trace(conc));
+	CHECK([(id)conc commandBuffer] == cb);
+	[conc endEncoding];
+	id<MTLBlitCommandEncoder> benc = [cb blitCommandEncoder];
+	made.push_back(trace(benc));
+	CHECK([(id)benc commandBuffer] == cb);
+	[benc endEncoding];
+	id<MTLParallelRenderCommandEncoder> par =
+	    [cb parallelRenderCommandEncoderWithDescriptor:onePass(target)];
+	made.push_back(trace(par));
+	CHECK([(id)par commandBuffer] == cb);
+	id<MTLRenderCommandEncoder> sub = [par renderCommandEncoder];
+	made.push_back(trace(sub));
+	CHECK([(id)sub commandBuffer] == cb);
+	[sub endEncoding];
+	[par endEncoding];
+	MTLHeapDescriptor *hd = [[MTLHeapDescriptor alloc] init];
+	hd.size = 0x10000;
+	RgfxHeap *heap = [RgfxHeap heapWithDescriptor:hd device:nil serializer:&fx.ser];
+	CHECK(heap != nil);
+	made.push_back(trace(heap));
+	RgfxSharedEvent *ev = [RgfxSharedEvent sharedEventWithInitialValue:0
+	                                                             device:nil
+	                                                         serializer:&fx.ser];
+	CHECK(ev != nil);
+	made.push_back(trace(ev));
+	// Unique, in creation order, and stable.
+	for (size_t i = 0; i < made.size(); i++)
+		CHECK(made[i] != 0 && (i == 0 || made[i] > made[i - 1]));
+	CHECK(trace(fx.queue) == made[0] && trace(cb) == made[1] && trace(sub) == made[7]);
+	CHECK(trace(ev) == made.back());
+	// The kinds Metal gives no trace id answer none.
+	for (Class kind : {[RgfxBuffer class], [RgfxTexture class], [RgfxSampler class],
+	                   [RgfxFence class], [RgfxEvent class], [RgfxLibrary class],
+	                   [RgfxFunction class], [RgfxRenderPipelineState class],
+	                   [RgfxComputePipelineState class], [RgfxDepthStencilState class],
+	                   [RgfxArgumentEncoder class]})
+		CHECK(![kind instancesRespondToSelector:@selector(globalTraceObjectID)]);
+	[cb commit];
+	uint64_t seqno = 0;
+	(void)fx.nextOps(&seqno);
+	fx.complete(cb, seqno);
+}
+
+// A selector a class does not answer is logged with the class, once, and then raises as
+// NSObject does.
+void test_unrecognized_selectors_logged()
+{
+	QueueFixture fx;
+	id<MTLCommandBuffer> cb = [fx.queue commandBuffer];
+	id<MTLComputeCommandEncoder> cenc = [cb computeCommandEncoder];
+	SEL missing = NSSelectorFromString(@"rgfxNoSuchMember");
+	auto send = [missing](id object) {
+		BOOL raised = NO;
+		@try {
+			((void (*)(id, SEL))objc_msgSend)(object, missing);
+		} @catch (NSException *e) {
+			raised = [e.name isEqualToString:NSInvalidArgumentException];
+		}
+		return raised;
+	};
+	CHECK(!RgfxUnrecognizedWasLogged([RgfxComputeCommandEncoder class], missing));
+	CHECK(send(cenc));
+	CHECK(RgfxUnrecognizedWasLogged([RgfxComputeCommandEncoder class], missing));
+	CHECK(send(cenc)); // still raises, logged once
+	// A subclass of the resource root logs its own class.
+	CHECK(send(cb));
+	CHECK(RgfxUnrecognizedWasLogged([RgfxCmdBuffer class], missing));
+	CHECK(!RgfxUnrecognizedWasLogged([RgfxResource class], missing));
+	[cenc endEncoding];
 	[cb commit];
 	uint64_t seqno = 0;
 	(void)fx.nextOps(&seqno);
@@ -1618,6 +1730,8 @@ void rgfxProtocolTests()
 	test_compute_dispatch_type();
 	test_blit_copy_texture_to_texture();
 	test_render_tile_size();
+	test_trace_ids();
+	test_unrecognized_selectors_logged();
 	test_sample_positions();
 	test_encoders_unsupported();
 	test_command_buffer_and_queue_members();

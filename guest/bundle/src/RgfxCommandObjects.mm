@@ -43,6 +43,7 @@
 #import "RgfxBuffer.h"
 #import "RgfxFence.h"
 #import "RgfxIOSurface.h"
+#import "RgfxInterop.h"
 #import "RgfxUnsupported.h"
 #import "RgfxUploads.h"
 
@@ -83,6 +84,8 @@ CFTimeInterval rgfxHostTime()
 @end
 
 @implementation RgfxLogContainer
+RGFX_LOG_UNRECOGNIZED
+
 - (NSUInteger)countByEnumeratingWithState:(NSFastEnumerationState *)state
                                   objects:(id __unsafe_unretained _Nullable[_Nonnull])buffer
                                     count:(NSUInteger)len
@@ -452,6 +455,7 @@ struct RgfxBarrierSlot {
 	// The barrier fences (QUEUE BARRIERS), made with the queue, and the encoders made.
 	NSArray<RgfxFence *> *_barrierFences;
 	uint64_t _encodersMade;
+	uint64_t _traceId; // globalTraceObjectID
 }
 
 + (instancetype)queueWithSubmitRing:(RgfxRingWriter *)submitRing
@@ -477,6 +481,7 @@ struct RgfxBarrierSlot {
 	                                                       device:device
 	                                                   serializer:serializer];
 	if (q != nil) {
+		q->_traceId = RgfxNextTraceObjectId();
 		q->_submitRing = submitRing;
 		q->_ids = ids;
 		q->_maxCount = maxCount != 0 ? maxCount : 64;
@@ -622,6 +627,12 @@ struct RgfxBarrierSlot {
 	return cb;
 }
 
+// Its trace id (RgfxInterop.h), taken as it was made.
+- (uint64_t)globalTraceObjectID
+{
+	return _traceId;
+}
+
 - (NSString *)label
 {
 	return _queueLabel;
@@ -759,6 +770,8 @@ struct RgfxBarrierSlot {
 // The encoders' inline bytes go to their command buffer's upload arena, handed over as the
 // command buffer vends them.
 @interface RgfxRenderCommandEncoder ()
+// The command buffer that made it (commandBuffer).
+- (void)rgfxSetCommandBuffer:(id<MTLCommandBuffer>)commandBuffer;
 - (void)rgfxSetUploads:(std::shared_ptr<RgfxUploadArena>)uploads;
 // The tile size its pass descriptor asked for (0: the device's choice).
 - (void)rgfxSetTileWidth:(NSUInteger)width height:(NSUInteger)height;
@@ -768,15 +781,21 @@ struct RgfxBarrierSlot {
 - (void)rgfxSetBarrierSlot:(const RgfxBarrierSlot &)slot begin:(BOOL)begin;
 @end
 @interface RgfxComputeCommandEncoder ()
+// The command buffer that made it (commandBuffer).
+- (void)rgfxSetCommandBuffer:(id<MTLCommandBuffer>)commandBuffer;
 - (void)rgfxSetUploads:(std::shared_ptr<RgfxUploadArena>)uploads;
 // The dispatch type its pass was opened with.
 - (void)rgfxSetDispatchType:(MTLDispatchType)dispatchType;
 - (void)rgfxSetBarrierSlot:(const RgfxBarrierSlot &)slot;
 @end
 @interface RgfxBlitCommandEncoder ()
+// The command buffer that made it (commandBuffer).
+- (void)rgfxSetCommandBuffer:(id<MTLCommandBuffer>)commandBuffer;
 - (void)rgfxSetBarrierSlot:(const RgfxBarrierSlot &)slot;
 @end
 @interface RgfxParallelRenderCommandEncoder ()
+// The command buffer that made it (commandBuffer).
+- (void)rgfxSetCommandBuffer:(id<MTLCommandBuffer>)commandBuffer;
 - (void)rgfxSetUploads:(std::shared_ptr<RgfxUploadArena>)uploads;
 - (void)rgfxSetTileWidth:(NSUInteger)width height:(NSUInteger)height;
 - (void)rgfxSetBarrierSlot:(const RgfxBarrierSlot &)slot;
@@ -855,6 +874,7 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 	// Where its encoders' inline bytes go: chunks of the queue's upload pool, given back once
 	// the host has completed the buffer (RgfxUploads.h). The encoders share it.
 	std::shared_ptr<RgfxUploadArena> _uploads;
+	uint64_t _traceId; // globalTraceObjectID
 }
 
 + (instancetype)commandBufferForQueue:(RgfxCommandQueue *)queue
@@ -868,6 +888,7 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 	                                                          device:device
 	                                                      serializer:serializer];
 	if (cb != nil) {
+		cb->_traceId = RgfxNextTraceObjectId();
 		cb->_queue = queue;
 		cb->_retained = retained;
 		cb->_status.store(MTLCommandBufferStatusNotEnqueued);
@@ -924,6 +945,7 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 	RgfxRenderCommandEncoder *enc = [[RgfxRenderCommandEncoder alloc] initWithEncoder:_encoder
 	                                                                          emitEnd:YES
 	                                                                           device:self.device];
+	[enc rgfxSetCommandBuffer:self];
 	[enc rgfxSetUploads:_uploads];
 	[enc rgfxSetTileWidth:renderPassDescriptor.tileWidth height:renderPassDescriptor.tileHeight];
 	[enc rgfxSetBarrierSlot:[_queue rgfxTakeBarrierSlot] begin:YES];
@@ -935,6 +957,7 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 	_encoder->beginComputePass();
 	RgfxComputeCommandEncoder *enc = [[RgfxComputeCommandEncoder alloc] initWithEncoder:_encoder
 	                                                                             device:self.device];
+	[enc rgfxSetCommandBuffer:self];
 	[enc rgfxSetUploads:_uploads];
 	[enc rgfxSetBarrierSlot:[_queue rgfxTakeBarrierSlot]];
 	return enc;
@@ -953,6 +976,7 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 	_encoder->beginComputePass(static_cast<uint32_t>(dispatchType));
 	RgfxComputeCommandEncoder *enc = [[RgfxComputeCommandEncoder alloc] initWithEncoder:_encoder
 	                                                                             device:self.device];
+	[enc rgfxSetCommandBuffer:self];
 	[enc rgfxSetUploads:_uploads];
 	[enc rgfxSetDispatchType:dispatchType];
 	[enc rgfxSetBarrierSlot:[_queue rgfxTakeBarrierSlot]];
@@ -964,6 +988,7 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 	_encoder->beginBlitPass();
 	RgfxBlitCommandEncoder *enc = [[RgfxBlitCommandEncoder alloc] initWithEncoder:_encoder
 	                                                                       device:self.device];
+	[enc rgfxSetCommandBuffer:self];
 	[enc rgfxSetBarrierSlot:[_queue rgfxTakeBarrierSlot]];
 	return enc;
 }
@@ -991,6 +1016,7 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 	                          programmed ? &positions : nullptr);
 	RgfxParallelRenderCommandEncoder *enc =
 	    [[RgfxParallelRenderCommandEncoder alloc] initWithEncoder:_encoder device:self.device];
+	[enc rgfxSetCommandBuffer:self];
 	[enc rgfxSetUploads:_uploads];
 	[enc rgfxSetTileWidth:renderPassDescriptor.tileWidth height:renderPassDescriptor.tileHeight];
 	[enc rgfxSetBarrierSlot:[_queue rgfxTakeBarrierSlot]];
@@ -1341,6 +1367,12 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 {
 	return _gpuEnd.load();
 }
+// Its trace id (RgfxInterop.h), taken as it was made.
+- (uint64_t)globalTraceObjectID
+{
+	return _traceId;
+}
+
 - (NSString *)label
 {
 	return _cbLabel;
@@ -1426,6 +1458,8 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 	RgfxEncoder *_enc; // borrowed: the command buffer's encoder
 	BOOL _emitEnd;
 	__weak id<MTLDevice> _device;
+	__weak id<MTLCommandBuffer> _commandBuffer;
+	uint64_t _traceId;
 	NSString *_encLabel;
 	std::shared_ptr<RgfxUploadArena> _uploads; // the command buffer's, for inline bytes
 	NSUInteger _tileWidth, _tileHeight;          // the pass descriptor's tile size
@@ -1460,9 +1494,31 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 		_enc = enc;
 		_emitEnd = emitEnd;
 		_device = device;
+		_traceId = RgfxNextTraceObjectId();
 	}
 	return self;
 }
+
+- (void)rgfxSetCommandBuffer:(id<MTLCommandBuffer>)commandBuffer
+{
+	_commandBuffer = commandBuffer;
+}
+
+// The command buffer that made the encoder, as Metal's encoders answer it (SPI, sent by MPS and
+// SkyLight). A parallel pass's sub-encoder answers its pass's buffer: Metal's answers a buffer of
+// its own on the same queue (measured on the M3 Max), which the bundle does not make.
+- (id<MTLCommandBuffer>)commandBuffer
+{
+	return _commandBuffer;
+}
+
+// The encoder's trace id (RgfxInterop.h).
+- (uint64_t)globalTraceObjectID
+{
+	return _traceId;
+}
+
+RGFX_LOG_UNRECOGNIZED
 
 - (id<MTLDevice>)device
 {
@@ -2512,6 +2568,8 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 @implementation RgfxComputeCommandEncoder {
 	RgfxEncoder *_enc;
 	__weak id<MTLDevice> _device;
+	__weak id<MTLCommandBuffer> _commandBuffer;
+	uint64_t _traceId;
 	NSString *_encLabel;
 	std::shared_ptr<RgfxUploadArena> _uploads; // the command buffer's, for inline bytes
 	MTLDispatchType _dispatchType;              // the pass's; Serial, Metal's default, unless set
@@ -2547,9 +2605,31 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 	if (self) {
 		_enc = enc;
 		_device = device;
+		_traceId = RgfxNextTraceObjectId();
 	}
 	return self;
 }
+
+- (void)rgfxSetCommandBuffer:(id<MTLCommandBuffer>)commandBuffer
+{
+	_commandBuffer = commandBuffer;
+}
+
+// The command buffer that made the encoder, as Metal's encoders answer it (SPI, sent by MPS and
+// SkyLight). A parallel pass's sub-encoder answers its pass's buffer: Metal's answers a buffer of
+// its own on the same queue (measured on the M3 Max), which the bundle does not make.
+- (id<MTLCommandBuffer>)commandBuffer
+{
+	return _commandBuffer;
+}
+
+// The encoder's trace id (RgfxInterop.h).
+- (uint64_t)globalTraceObjectID
+{
+	return _traceId;
+}
+
+RGFX_LOG_UNRECOGNIZED
 
 - (id<MTLDevice>)device
 {
@@ -2883,6 +2963,8 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 @implementation RgfxBlitCommandEncoder {
 	RgfxEncoder *_enc;
 	__weak id<MTLDevice> _device;
+	__weak id<MTLCommandBuffer> _commandBuffer;
+	uint64_t _traceId;
 	NSString *_encLabel;
 	RgfxBarrierSlot _barrier; // its queue barrier fence (QUEUE BARRIERS)
 	BOOL _barrierWaited;
@@ -2901,9 +2983,31 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 	if (self) {
 		_enc = enc;
 		_device = device;
+		_traceId = RgfxNextTraceObjectId();
 	}
 	return self;
 }
+
+- (void)rgfxSetCommandBuffer:(id<MTLCommandBuffer>)commandBuffer
+{
+	_commandBuffer = commandBuffer;
+}
+
+// The command buffer that made the encoder, as Metal's encoders answer it (SPI, sent by MPS and
+// SkyLight). A parallel pass's sub-encoder answers its pass's buffer: Metal's answers a buffer of
+// its own on the same queue (measured on the M3 Max), which the bundle does not make.
+- (id<MTLCommandBuffer>)commandBuffer
+{
+	return _commandBuffer;
+}
+
+// The encoder's trace id (RgfxInterop.h).
+- (uint64_t)globalTraceObjectID
+{
+	return _traceId;
+}
+
+RGFX_LOG_UNRECOGNIZED
 
 - (id<MTLDevice>)device
 {
@@ -3184,6 +3288,8 @@ destinationBytesPerImage:(NSUInteger)destinationBytesPerImage
 @implementation RgfxParallelRenderCommandEncoder {
 	RgfxEncoder *_enc;
 	__weak id<MTLDevice> _device;
+	__weak id<MTLCommandBuffer> _commandBuffer;
+	uint64_t _traceId;
 	NSString *_encLabel;
 	BOOL _ended;
 	std::shared_ptr<RgfxUploadArena> _uploads; // the command buffer's, for its sub-encoders
@@ -3216,9 +3322,31 @@ destinationBytesPerImage:(NSUInteger)destinationBytesPerImage
 	if (self) {
 		_enc = enc;
 		_device = device;
+		_traceId = RgfxNextTraceObjectId();
 	}
 	return self;
 }
+
+- (void)rgfxSetCommandBuffer:(id<MTLCommandBuffer>)commandBuffer
+{
+	_commandBuffer = commandBuffer;
+}
+
+// The command buffer that made the encoder, as Metal's encoders answer it (SPI, sent by MPS and
+// SkyLight). A parallel pass's sub-encoder answers its pass's buffer: Metal's answers a buffer of
+// its own on the same queue (measured on the M3 Max), which the bundle does not make.
+- (id<MTLCommandBuffer>)commandBuffer
+{
+	return _commandBuffer;
+}
+
+// The encoder's trace id (RgfxInterop.h).
+- (uint64_t)globalTraceObjectID
+{
+	return _traceId;
+}
+
+RGFX_LOG_UNRECOGNIZED
 
 - (id<MTLDevice>)device
 {
@@ -3252,6 +3380,7 @@ destinationBytesPerImage:(NSUInteger)destinationBytesPerImage
 	RgfxRenderCommandEncoder *sub = [[RgfxRenderCommandEncoder alloc] initWithEncoder:_enc
 	                                                                          emitEnd:NO
 	                                                                           device:_device];
+	[sub rgfxSetCommandBuffer:_commandBuffer];
 	[sub rgfxSetUploads:_uploads];
 	[sub rgfxSetTileWidth:_tileWidth height:_tileHeight];
 	[sub rgfxSetBarrierSlot:_barrier begin:NO];

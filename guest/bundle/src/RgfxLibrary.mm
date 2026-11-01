@@ -11,6 +11,7 @@
 #import <objc/message.h>
 
 #import "RgfxFunction.h"
+#import "RgfxInterop.h"
 #import "RgfxMetalError.h"
 #import "RgfxMetalPrivate.h"
 
@@ -299,6 +300,8 @@ void readConstantValues(MTLFunctionConstantValues *values, std::map<uint32_t, Rg
 	NSUInteger _index;
 	BOOL _required;
 }
+
+RGFX_LOG_UNRECOGNIZED
 
 - (instancetype)initWithDecl:(const RgfxConstantDecl &)decl
 {

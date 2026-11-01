@@ -8,6 +8,7 @@
 #import <Metal/Metal.h>
 
 #import "RgfxHeap.h"
+#import "RgfxInterop.h"
 
 #include <atomic>
 #include <unistd.h>
@@ -46,6 +47,8 @@
 	}
 	return self;
 }
+
+RGFX_LOG_UNRECOGNIZED
 
 - (uint64_t)rgfxObjId
 {

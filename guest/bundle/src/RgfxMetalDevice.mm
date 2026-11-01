@@ -11,6 +11,7 @@
 #import "RgfxMetalDevice.h"
 
 #import "RgfxBuffer.h"
+#import "RgfxInterop.h"
 #import "RgfxTexture.h"
 
 // RGFX DIAG (Wall-2 trace; remove before merge): the guest's logd is broken, so
@@ -260,6 +261,8 @@ void rgfxDeviceDoorbell(void *context, uint32_t ring_id)
 	NSString *_rgfxName;
 }
 
+RGFX_LOG_UNRECOGNIZED
+
 - (instancetype)initWithArchitectureName:(NSString *)name
 {
 	self = [super init];
@@ -425,6 +428,7 @@ void rgfxDeviceDoorbell(void *context, uint32_t ring_id)
 
 - (void)forwardInvocation:(NSInvocation *)anInvocation
 {
+	RgfxLogUnrecognized([self class], anInvocation.selector);
 	unsigned long long zero = 0;
 	[anInvocation setReturnValue:&zero];
 }

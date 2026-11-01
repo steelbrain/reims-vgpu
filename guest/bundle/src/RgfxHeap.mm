@@ -5,6 +5,7 @@
 #import "RgfxHeap.h"
 
 #import "RgfxBuffer.h"
+#import "RgfxInterop.h"
 #import "RgfxTexture.h"
 #import "RgfxUnsupported.h"
 
@@ -58,6 +59,13 @@ MTLSizeAndAlign rgfxHeapTextureSizeAndAlign(RgfxSerializer *serializer,
 	// An Automatic heap's placements, under _rangesLock; null for a heap of another type.
 	std::unique_ptr<RgfxHeapRanges> _ranges;
 	std::mutex _rangesLock;
+	uint64_t _traceId; // globalTraceObjectID
+}
+
+// Its trace id (RgfxInterop.h), taken as it was made.
+- (uint64_t)globalTraceObjectID
+{
+	return _traceId;
 }
 
 // The host drops the heap as the app lets it go, after any command buffer that names it (each
@@ -96,6 +104,8 @@ MTLSizeAndAlign rgfxHeapTextureSizeAndAlign(RgfxSerializer *serializer,
 	RgfxHeap *heap = [[RgfxHeap alloc] initWithObjId:created.obj_id
 	                                          device:device
 	                                      serializer:serializer];
+	if (heap)
+		heap->_traceId = RgfxNextTraceObjectId();
 	[heap rgfxTakeDescriptor:descriptor gpuAddress:created.gpu_address];
 	return heap;
 }
@@ -124,6 +134,7 @@ MTLSizeAndAlign rgfxHeapTextureSizeAndAlign(RgfxSerializer *serializer,
 	                                          device:device
 	                                      serializer:serializer];
 	if (heap) {
+		heap->_traceId = RgfxNextTraceObjectId();
 		[heap rgfxTakeDescriptor:descriptor gpuAddress:created.gpu_address];
 		heap->_contents = static_cast<uint8_t *>(contents);
 		heap->_deallocator = [deallocator copy];
