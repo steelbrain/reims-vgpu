@@ -5,7 +5,20 @@
 //! ring (the display's commands, other processes' creates), and is compiled on one of the pool's
 //! threads, `reims-vgpu.graphics-compile-*`; its reply goes on ring 0's completion ring when the
 //! compile ends, keyed to the create by its seqno. Its process waits for that reply, as Metal's
-//! synchronous creators wait for their compile; nothing else does.
+//! synchronous creators wait for their compile; nothing else does. A library create is made there
+//! too.
+//!
+//! **Turns.** Metal compiles each process's pipelines in that process, so one process's burst of
+//! creates delays no other's. The pool's threads serve the processes (contexts) in turns: the
+//! next compile is of the context that owns the scanout where it has one waiting (the context of
+//! the surface the display last presented, WindowServer's), else of the context with the fewest
+//! compiles running, the one longest without a turn among equals; each context's own compiles go
+//! in the order it handed them over. So a context's single create waits for at most the first
+//! running compile to end, whatever another context has queued, and the scanout owner's waits
+//! behind no other context's. Library makes go before every pipeline compile: a pipeline that
+//! names a library another context is still making waits for it on its thread, and that library
+//! has then always been taken by a thread already. Each compile's wait and run time is logged at
+//! debug (`reims_vgpu::graphics::compile`).
 //!
 //! **Order.** From its dispatch until it is stored, the pipeline is pending. A command buffer
 //! that names a pending pipeline (`SET_RENDER_PIPELINE_STATE`, `SET_COMPUTE_PIPELINE_STATE`: the
@@ -15,9 +28,9 @@
 //! taken before the pending set's wherever both are held, and a waiter holds only the pending
 //! set's.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::time::Duration;
 
 use reims_graphics::ops::compute::{
     RGFX_OP_COMPUTE_SET_COMPUTE_PIPELINE_STATE, RgfxComputeOpSetComputePipelineState,
@@ -29,19 +42,162 @@ use reims_graphics::ops::{
     RGFX_COMMAND_BUFFER_OPS_OFFSET, RGFX_OP_BODY_OFFSET, RgfxCommandBuffer, RgfxOpHeader,
 };
 use reims_graphics::wire::RGFX_CONTEXT_OBJ_ID_SHIFT;
+use reims_vgpu_core::platform::os::clock::MonoTime;
 use reims_vgpu_core::sync::{Condvar, Mutex};
 use zerocopy::FromBytes;
 
 /// The most compile threads a device runs.
 const MAX_THREADS: usize = 4;
 
+/// The target of each compile's line.
+const LOG_TARGET: &str = "reims_vgpu::graphics::compile";
+
 /// A compile, run on one of the pool's threads.
 pub(crate) type CompileJob = Box<dyn FnOnce() + Send>;
 
-/// The device's compile threads, fed in the order compiles are handed over.
+/// The platform's monotonic clock, which times each compile's wait and run.
+pub(crate) type Now = Box<dyn Fn() -> MonoTime + Send + Sync>;
+
+/// What a compile makes: a library, or a pipeline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CompileKind {
+    /// A `LIBRARY_CREATE` or a library's last `LIBRARY_FROM_REGION` chunk.
+    Library,
+    /// A `RENDER_PIPELINE_CREATE` or a `COMPUTE_PIPELINE_CREATE`.
+    Pipeline,
+}
+
+/// A compile's object: its kind, its id, and the context that created it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CompileOf {
+    /// A library or a pipeline.
+    pub(crate) kind: CompileKind,
+    /// The object's guest-picked id, its context in its top bits.
+    pub(crate) obj_id: u64,
+}
+
+impl CompileOf {
+    /// A compile of `kind` for object `obj_id`.
+    pub(crate) fn new(kind: CompileKind, obj_id: u64) -> CompileOf {
+        CompileOf { kind, obj_id }
+    }
+
+    /// The context that created the object.
+    fn context(self) -> u32 {
+        (self.obj_id >> RGFX_CONTEXT_OBJ_ID_SHIFT) as u32
+    }
+}
+
+/// A compile waiting for a thread.
+struct Queued {
+    of: CompileOf,
+    job: CompileJob,
+    /// When it was handed over, and how many compiles were waiting then.
+    handed: MonoTime,
+    ahead: usize,
+}
+
+/// A context's waiting compiles, each kind in the order handed over.
+#[derive(Default)]
+struct ContextQueue {
+    libraries: VecDeque<Queued>,
+    pipelines: VecDeque<Queued>,
+}
+
+impl ContextQueue {
+    fn of(&mut self, kind: CompileKind) -> &mut VecDeque<Queued> {
+        match kind {
+            CompileKind::Library => &mut self.libraries,
+            CompileKind::Pipeline => &mut self.pipelines,
+        }
+    }
+
+    fn holds(&self, kind: CompileKind) -> bool {
+        match kind {
+            CompileKind::Library => !self.libraries.is_empty(),
+            CompileKind::Pipeline => !self.pipelines.is_empty(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.libraries.is_empty() && self.pipelines.is_empty()
+    }
+}
+
+/// What the pool's threads share.
+#[derive(Default)]
+struct PoolState {
+    /// Each context's waiting compiles.
+    queues: HashMap<u32, ContextQueue>,
+    /// The contexts with compiles waiting, in the order they take turns: a context goes to the
+    /// back as a compile of it is taken.
+    turns: VecDeque<u32>,
+    /// The compiles each context has running.
+    running: HashMap<u32, usize>,
+    /// The context that owns the scanout, whose compiles go first.
+    favoured: Option<u32>,
+    /// The pool is gone (or stopped): the threads end once nothing waits.
+    closed: bool,
+}
+
+impl PoolState {
+    /// The compiles waiting.
+    fn waiting(&self) -> usize {
+        self.queues
+            .values()
+            .map(|q| q.libraries.len() + q.pipelines.len())
+            .sum()
+    }
+
+    /// Takes the next compile (the module doc, "Turns"), and counts it running.
+    fn take(&mut self) -> Option<Queued> {
+        let kind = if self.queues.values().any(|q| q.holds(CompileKind::Library)) {
+            CompileKind::Library
+        } else {
+            CompileKind::Pipeline
+        };
+        let holds = |c: &u32| self.queues.get(c).is_some_and(|q| q.holds(kind));
+        let context = self.favoured.filter(holds).or_else(|| {
+            self.turns
+                .iter()
+                .copied()
+                .filter(holds)
+                .min_by_key(|c| self.running.get(c).copied().unwrap_or(0))
+        })?;
+        let queue = self.queues.get_mut(&context)?;
+        let queued = queue.of(kind).pop_front()?;
+        let emptied = queue.is_empty();
+        self.turns.retain(|&c| c != context);
+        if emptied {
+            self.queues.remove(&context);
+        } else {
+            self.turns.push_back(context);
+        }
+        *self.running.entry(context).or_default() += 1;
+        Some(queued)
+    }
+
+    /// A compile of `context` ended.
+    fn ended(&mut self, context: u32) {
+        if let Some(n) = self.running.get_mut(&context) {
+            *n -= 1;
+            if *n == 0 {
+                self.running.remove(&context);
+            }
+        }
+    }
+}
+
+/// The pool's state, the condition its threads wait on for a compile, and its clock.
+struct Shared {
+    state: Mutex<PoolState>,
+    waiting: Condvar,
+    now: Now,
+}
+
+/// The device's compile threads, which serve the contexts in turns (the module doc, "Turns").
 pub(crate) struct CompilePool {
-    /// The threads' queue; `None` where no thread could be started.
-    sender: Mutex<Option<Sender<CompileJob>>>,
+    shared: Arc<Shared>,
     /// The threads that started.
     threads: usize,
     /// Holds the threads before each compile while shut (tests only).
@@ -52,27 +208,35 @@ pub(crate) struct CompilePool {
 impl CompilePool {
     /// A pool of one thread per core the host offers, two at the least and [`MAX_THREADS`] at
     /// the most. A thread the host refuses is not started; with none, compiles run where they
-    /// are handed over.
-    pub(crate) fn new() -> CompilePool {
+    /// are handed over. `now` reads the platform's monotonic clock.
+    pub(crate) fn new(now: Now) -> CompilePool {
         let threads = std::thread::available_parallelism()
             .map_or(2, |n| n.get())
             .clamp(2, MAX_THREADS);
-        let (sender, receiver) = mpsc::channel::<CompileJob>();
-        let receiver = Arc::new(Mutex::new(receiver));
+        CompilePool::with_threads(threads, now)
+    }
+
+    /// A pool of `threads` threads, those the host starts.
+    fn with_threads(threads: usize, now: Now) -> CompilePool {
+        let shared = Arc::new(Shared {
+            state: Mutex::new(PoolState::default()),
+            waiting: Condvar::new(),
+            now,
+        });
         #[cfg(test)]
         let gate = Arc::new(Gate::default());
         let mut started = 0;
         for i in 0..threads {
-            let receiver = Arc::clone(&receiver);
+            let shared = Arc::clone(&shared);
             #[cfg(test)]
             let gate = Arc::clone(&gate);
             let spawned = std::thread::Builder::new()
                 .name(format!("reims-vgpu.graphics-compile-{i}"))
                 .spawn(move || {
-                    while let Some(job) = next_job(&receiver) {
+                    while let Some(queued) = next_compile(&shared) {
                         #[cfg(test)]
                         gate.pass();
-                        job();
+                        run(&shared, queued);
                     }
                 });
             if spawned.is_ok() {
@@ -84,9 +248,10 @@ impl CompilePool {
                 target: "reims_vgpu::graphics",
                 "no compile thread could be started: pipelines compile on the control thread"
             );
+            shared.state.lock().closed = true;
         }
         CompilePool {
-            sender: Mutex::new((started > 0).then_some(sender)),
+            shared,
             threads: started,
             #[cfg(test)]
             gate,
@@ -99,12 +264,56 @@ impl CompilePool {
         self.threads.max(1)
     }
 
-    /// Hands `job` to the threads, or gives it back where the pool has none.
-    pub(crate) fn submit(&self, job: CompileJob) -> Result<(), CompileJob> {
-        match &*self.sender.lock() {
-            Some(sender) => sender.send(job).map_err(|e| e.0),
-            None => Err(job),
+    /// Hands `job`, the compile of `of`, to the threads, or gives it back where the pool has
+    /// none.
+    pub(crate) fn submit(&self, of: CompileOf, job: CompileJob) -> Result<(), CompileJob> {
+        let mut state = self.shared.state.lock();
+        if state.closed {
+            return Err(job);
         }
+        let context = of.context();
+        let ahead = state.waiting();
+        let handed = (self.shared.now)();
+        let queue = state.queues.entry(context).or_default();
+        let joins = queue.is_empty();
+        queue.of(of.kind).push_back(Queued {
+            of,
+            job,
+            handed,
+            ahead,
+        });
+        if joins {
+            state.turns.push_back(context);
+        }
+        drop(state);
+        self.shared.waiting.notify_one();
+        Ok(())
+    }
+
+    /// Context `context` owns the scanout: its compiles go first. A change is logged.
+    pub(crate) fn favour(&self, context: u32) {
+        let mut state = self.shared.state.lock();
+        if state.favoured != Some(context) {
+            state.favoured = Some(context);
+            log::debug!(
+                target: LOG_TARGET,
+                "context {context} owns the scanout: its compiles go first"
+            );
+        }
+    }
+
+    /// Context `context` closed: it owns the scanout no longer.
+    pub(crate) fn context_closed(&self, context: u32) {
+        let mut state = self.shared.state.lock();
+        if state.favoured == Some(context) {
+            state.favoured = None;
+        }
+    }
+
+    /// The context whose compiles go first (tests only).
+    #[cfg(test)]
+    pub(crate) fn favoured(&self) -> Option<u32> {
+        self.shared.state.lock().favoured
     }
 
     /// Shuts the gate: the threads hold before their next compile (tests only).
@@ -123,13 +332,63 @@ impl CompilePool {
     /// pool no thread started for (tests only).
     #[cfg(test)]
     pub(crate) fn stop(&self) {
-        *self.sender.lock() = None;
+        self.close();
+    }
+
+    /// Ends the threads once nothing waits; later compiles run where they are handed over.
+    fn close(&self) {
+        self.shared.state.lock().closed = true;
+        self.shared.waiting.notify_all();
     }
 }
 
-/// The next compile from the shared queue; `None` once the pool is gone.
-fn next_job(receiver: &Mutex<Receiver<CompileJob>>) -> Option<CompileJob> {
-    receiver.lock().recv().ok()
+impl Drop for CompilePool {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+/// The next compile for a thread, waiting for one; `None` once the pool is closed and nothing
+/// waits.
+fn next_compile(shared: &Shared) -> Option<Queued> {
+    let mut state = shared.state.lock();
+    loop {
+        if let Some(queued) = state.take() {
+            return Some(queued);
+        }
+        if state.closed {
+            return None;
+        }
+        shared.waiting.wait(&mut state);
+    }
+}
+
+/// Runs a compile the pool took, and logs its wait and its run time.
+fn run(shared: &Shared, queued: Queued) {
+    let Queued {
+        of,
+        job,
+        handed,
+        ahead,
+    } = queued;
+    let started = (shared.now)();
+    job();
+    let ended = (shared.now)();
+    let ms = |d: Duration| d.as_secs_f64() * 1e3;
+    log::debug!(
+        target: LOG_TARGET,
+        "context {}'s {} {:#x}: waited {:.1} ms, {ahead} compiles waiting when handed over; \
+         compiled in {:.1} ms",
+        of.context(),
+        match of.kind {
+            CompileKind::Library => "library",
+            CompileKind::Pipeline => "pipeline",
+        },
+        of.obj_id,
+        ms(started.saturating_duration_since(handed)),
+        ms(ended.saturating_duration_since(started)),
+    );
+    shared.state.lock().ended(of.context());
 }
 
 /// A gate the tests shut to hold every compile.
@@ -252,4 +511,229 @@ pub(crate) fn named_pipelines(message: &[u8]) -> Vec<u64> {
         at += len;
     }
     named
+}
+
+#[cfg(test)]
+#[allow(clippy::disallowed_methods)] // test scaffolding: real-time waits for the pool's threads
+mod tests {
+    use std::sync::LazyLock;
+    use std::sync::mpsc;
+    use std::time::Instant;
+
+    use super::*;
+
+    /// A pool of `threads` threads on the host's monotonic time.
+    fn pool(threads: usize) -> CompilePool {
+        CompilePool::with_threads(threads, Box::new(|| MonoTime::from_nanos(since_start())))
+    }
+
+    /// Nanoseconds since the tests' first reading.
+    fn since_start() -> u64 {
+        static START: LazyLock<Instant> = LazyLock::new(Instant::now);
+        u64::try_from(START.elapsed().as_nanos()).unwrap_or(u64::MAX)
+    }
+
+    /// The object `n` of context `context`.
+    fn obj(context: u32, n: u64) -> u64 {
+        (u64::from(context) << RGFX_CONTEXT_OBJ_ID_SHIFT) | n
+    }
+
+    /// The order compiles start in, by name.
+    type Starts = Arc<Mutex<Vec<String>>>;
+
+    /// A compile of `kind` for context `context` that notes its start under `name`, then runs
+    /// for `takes`.
+    fn compile(
+        pool: &CompilePool,
+        starts: &Starts,
+        kind: CompileKind,
+        context: u32,
+        name: &str,
+        takes: Duration,
+    ) {
+        let (starts, name) = (Arc::clone(starts), name.to_owned());
+        let of = CompileOf::new(kind, obj(context, 1));
+        let job: CompileJob = Box::new(move || {
+            starts.lock().push(name);
+            std::thread::sleep(takes);
+        });
+        assert!(pool.submit(of, job).is_ok());
+    }
+
+    /// Waits until `n` compiles have started.
+    fn started(starts: &Starts, n: usize) -> Vec<String> {
+        for _ in 0..5000 {
+            let now = starts.lock().clone();
+            if now.len() >= n {
+                return now;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        panic!("{n} compiles did not start");
+    }
+
+    /// One context's backlog holds no other context's create: with four threads busy on context
+    /// 1's twenty compiles, context 2's single create starts as the first of them ends and so
+    /// finishes one compile time after that, where in the order compiles were handed over it
+    /// would wait for five
+    #[test]
+    fn a_context_s_create_waits_behind_no_other_context_s_backlog() {
+        const TAKES: Duration = Duration::from_millis(100);
+        let pool = pool(4);
+        let starts = Starts::default();
+        pool.hold();
+        for i in 0..20 {
+            compile(
+                &pool,
+                &starts,
+                CompileKind::Pipeline,
+                1,
+                &format!("1.{i}"),
+                TAKES,
+            );
+        }
+        let (finished, finish) = mpsc::channel::<Instant>();
+        let create: CompileJob = {
+            let starts = Arc::clone(&starts);
+            Box::new(move || {
+                starts.lock().push("2".to_owned());
+                std::thread::sleep(TAKES);
+                let _ = finished.send(Instant::now());
+            })
+        };
+        assert!(
+            pool.submit(CompileOf::new(CompileKind::Pipeline, obj(2, 1)), create)
+                .is_ok()
+        );
+        let released = Instant::now();
+        pool.release();
+        let done = finish
+            .recv_timeout(Duration::from_secs(10))
+            .expect("context 2's create never ran");
+        let order = starts.lock().clone();
+        let at = order.iter().position(|n| n == "2");
+        assert!(
+            at.is_some_and(|at| at <= 4),
+            "context 2's create started late: {order:?}"
+        );
+        // Handed over last, it would finish after six compile times; it waits for one.
+        let took = done.saturating_duration_since(released);
+        assert!(
+            took < 3 * TAKES,
+            "context 2's create finished {took:?} after the release, more than a compile's wait"
+        );
+    }
+
+    /// The scanout owner's compile goes before every other context's waiting, and so before one
+    /// handed over earlier by a context with as few running
+    #[test]
+    fn the_scanout_owner_s_compile_goes_first() {
+        let pool = pool(1);
+        let starts = Starts::default();
+        pool.favour(3);
+        assert_eq!(pool.favoured(), Some(3));
+        let (unblock, blocked) = mpsc::channel::<()>();
+        let blocker: CompileJob = Box::new(move || {
+            let _ = blocked.recv();
+        });
+        assert!(
+            pool.submit(CompileOf::new(CompileKind::Pipeline, obj(9, 1)), blocker)
+                .is_ok()
+        );
+        // The one thread holds the blocker; then three contexts' compiles wait.
+        std::thread::sleep(Duration::from_millis(20));
+        for i in 0..3 {
+            compile(
+                &pool,
+                &starts,
+                CompileKind::Pipeline,
+                1,
+                &format!("1.{i}"),
+                Duration::ZERO,
+            );
+        }
+        compile(
+            &pool,
+            &starts,
+            CompileKind::Pipeline,
+            2,
+            "2",
+            Duration::ZERO,
+        );
+        compile(
+            &pool,
+            &starts,
+            CompileKind::Pipeline,
+            3,
+            "3",
+            Duration::ZERO,
+        );
+        unblock.send(()).unwrap();
+        let order = started(&starts, 5);
+        assert_eq!(order[0], "3", "{order:?}");
+        // Then the contexts in turns: 1 and 2 had none running, 1 handed over first.
+        assert_eq!(order[1..], ["1.0", "2", "1.1", "1.2"], "{order:?}");
+        pool.context_closed(3);
+        assert_eq!(pool.favoured(), None);
+    }
+
+    /// A library make goes before every pipeline compile, whatever its context, so a pipeline
+    /// that waits on its thread for another context's library never waits for one no thread has
+    /// taken
+    #[test]
+    fn a_library_make_goes_before_pipeline_compiles() {
+        let pool = pool(1);
+        let starts = Starts::default();
+        pool.favour(1);
+        let (unblock, blocked) = mpsc::channel::<()>();
+        let blocker: CompileJob = Box::new(move || {
+            let _ = blocked.recv();
+        });
+        assert!(
+            pool.submit(CompileOf::new(CompileKind::Pipeline, obj(9, 1)), blocker)
+                .is_ok()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+        compile(
+            &pool,
+            &starts,
+            CompileKind::Pipeline,
+            1,
+            "pipeline 1",
+            Duration::ZERO,
+        );
+        compile(
+            &pool,
+            &starts,
+            CompileKind::Pipeline,
+            2,
+            "pipeline 2",
+            Duration::ZERO,
+        );
+        compile(
+            &pool,
+            &starts,
+            CompileKind::Library,
+            2,
+            "library 2",
+            Duration::ZERO,
+        );
+        unblock.send(()).unwrap();
+        assert_eq!(
+            started(&starts, 3),
+            ["library 2", "pipeline 1", "pipeline 2"]
+        );
+    }
+
+    /// A stopped pool hands each compile back, to run where it was handed over
+    #[test]
+    fn a_stopped_pool_hands_compiles_back() {
+        let pool = pool(2);
+        pool.stop();
+        let job: CompileJob = Box::new(|| {});
+        assert!(
+            pool.submit(CompileOf::new(CompileKind::Library, obj(1, 1)), job)
+                .is_err()
+        );
+    }
 }

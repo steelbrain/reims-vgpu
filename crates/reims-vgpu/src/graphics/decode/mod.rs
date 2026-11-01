@@ -393,19 +393,19 @@ impl<P: Platform> GraphicsDecoder<P> {
     #[cfg(test)]
     pub(crate) fn surface_texture(&self, iosurface_id: u32) -> Option<P::Texture> {
         self.surface_present(iosurface_id)
-            .map(|(texture, _)| texture)
+            .map(|(texture, _, _)| texture)
     }
 
     /// What a present of IOSurface `iosurface_id` shows: the latest texture a guest process made
     /// over its plane 0 with `TEXTURE_FROM_IOSURFACE` and has not destroyed, and the command
     /// buffers committed that write that texture's copy, which the present waits for: the slots
     /// of its [`RgfxSurfaceWriters`] that name a queue the decoder holds (a slot naming another,
-    /// or none, has nothing to wait for). The caller holds its own reference to the texture: a
-    /// destroy of it after this leaves it drawable.
+    /// or none, has nothing to wait for); and the context that made the texture. The caller holds
+    /// its own reference to the texture: a destroy of it after this leaves it drawable.
     pub(crate) fn surface_present(
         &self,
         iosurface_id: u32,
-    ) -> Option<(P::Texture, Vec<RgfxSurfaceWriter>)> {
+    ) -> Option<(P::Texture, Vec<RgfxSurfaceWriter>, u32)> {
         let obj_id = *self.surfaces.get(&iosurface_id)?.last()?;
         let Some(ObjHandle::Texture(texture)) = self.objects.get(&obj_id) else {
             return None;
@@ -428,7 +428,8 @@ impl<P: Platform> GraphicsDecoder<P> {
                     .collect()
             })
             .unwrap_or_default();
-        Some((texture.clone_ref(), writers))
+        let owner = (obj_id >> RGFX_CONTEXT_OBJ_ID_SHIFT) as u32;
+        Some((texture.clone_ref(), writers, owner))
     }
 
     /// Forgets texture `obj_id` as a name of the surfaces it lies over.

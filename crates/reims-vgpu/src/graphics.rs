@@ -48,6 +48,7 @@ use reims_vgpu_core::num::ToU64;
 use reims_vgpu_core::platform::Platform;
 use reims_vgpu_core::platform::command::CommandBuffer as _;
 use reims_vgpu_core::platform::device::GpuDevice;
+use reims_vgpu_core::platform::os::clock::Clock as _;
 use reims_vgpu_core::platform::resource::Texture;
 use reims_vgpu_core::platform::values::TextureDesc;
 use reims_vgpu_core::raise::OnFault;
@@ -59,7 +60,7 @@ use crate::DefaultPlatform;
 use crate::display::no_catch;
 use crate::entry;
 use crate::error::Error;
-use crate::graphics::compile::{CompilePool, Pending};
+use crate::graphics::compile::{CompileKind, CompileOf, CompilePool, Pending};
 use crate::graphics::completion::cb_failed;
 use crate::graphics::decode::{
     CompletionSink, DecodeError, FailedContexts, GraphicsDecoder, LibraryJob, LibraryStart,
@@ -160,7 +161,8 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             let gpu_device = platform.metal_device(None).ok_or(Error::HostResources)?;
             // Before anything else makes a queue or a texture on it.
             reserve_guest_texture_ids(platform.as_ref(), &gpu_device);
-            let pool = CompilePool::new();
+            let clock = Arc::clone(&platform);
+            let pool = CompilePool::new(Box::new(move || clock.clock().now_mono()));
             let identity = gpu_device.identity_caps();
             // `Managed` resources are one copy where the platform answers that the GPU shares the
             // CPU's memory, else two, which hold Metal's contract on any GPU: the guest's device
@@ -430,6 +432,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                 let dropped = decoder.drop_context(context);
                 decoder.forget_dropped_surfaces();
                 self.pending.cancel_context(context);
+                self.pool.context_closed(context);
                 self.presents.context_gone(context);
                 let drain = decoder.drain_context(
                     context,
@@ -622,9 +625,13 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                 return;
             }
         };
+        let of = CompileOf::new(CompileKind::Pipeline, job.obj_id);
         let me = Arc::clone(self);
         let poster = poster.clone();
-        if let Err(compile) = self.pool.submit(Box::new(move || me.compile(job, &poster))) {
+        if let Err(compile) = self
+            .pool
+            .submit(of, Box::new(move || me.compile(job, &poster)))
+        {
             compile();
         }
     }
@@ -780,9 +787,13 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                 return;
             }
         };
+        let of = CompileOf::new(CompileKind::Library, job.obj_id);
         let me = Arc::clone(self);
         let poster = poster.clone();
-        if let Err(make) = self.pool.submit(Box::new(move || me.make(job, &poster))) {
+        if let Err(make) = self
+            .pool
+            .submit(of, Box::new(move || me.make(job, &poster)))
+        {
             make();
         }
     }
@@ -820,7 +831,10 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         }
         let found = self.decoder.lock().surface_present(iosurface_id);
         match found {
-            Some((texture, writers)) => {
+            Some((texture, writers, owner)) => {
+                // The process that made the texture over the surface the display shows owns the
+                // scanout (WindowServer): its compiles go first.
+                self.pool.favour(owner);
                 self.presents
                     .present(iosurface_id, Some(texture), answer, writers);
             }

@@ -2793,17 +2793,21 @@ fn surface_and_queue(device: &GraphicsDevice<FakePlatform>) -> (Guest, QueueRing
 
 /// A present of a surface is shown only once the command buffer committed before it that writes
 /// the surface's copy has finished, however late the host takes that buffer: a buffer before it
-/// on the queue finishing shows nothing, and the present is answered once it is shown
+/// on the queue finishing shows nothing, and the present is answered once it is shown. The process
+/// that made the surface's texture owns the scanout from the present on: its compiles go first,
+/// until its close
 #[test]
 fn a_present_waits_for_the_command_buffer_that_wrote_its_surface() {
     let raised = Arc::new(AtomicU32::new(0));
     let (device, platform) = headless_on(&raised);
     let (mut guest, mut ring) = surface_and_queue(&device);
+    assert_eq!(device.control.pool.favoured(), None);
     // The guest committed buffer 5 on the queue, which draws the surface, then presented it; the
     // host has taken neither buffer 4 nor 5 yet.
     write_writers(&device, BLOCK + WRITERS, &[(obj(1, 1), 5)]);
     guest.send(&device, present_surface(0x77));
     presents_waiting(&device, 1);
+    assert_eq!(device.control.pool.favoured(), Some(1));
     assert!(quiet(&guest), "answered before it was shown");
     assert_eq!(shown_width(&device), None);
 
@@ -2821,6 +2825,11 @@ fn a_present_waits_for_the_command_buffer_that_wrote_its_surface() {
     assert_eq!(answer_of(&mut guest, seqno), RGFX_STATUS_OK);
     assert_eq!(shown_width(&device), Some(64));
     presents_waiting(&device, 0);
+    assert_eq!(
+        answered(&device, &mut guest, context_close(1)),
+        RGFX_STATUS_OK
+    );
+    assert_eq!(device.control.pool.favoured(), None);
 }
 
 /// Presents are shown in the order made: one with nothing to wait for, made after one that waits,
