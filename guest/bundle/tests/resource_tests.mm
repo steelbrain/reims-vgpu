@@ -14,12 +14,17 @@
 #include <cstdint>
 #include <vector>
 
+#include <IOSurface/IOSurface.h>
+
 #import "RgfxBuffer.h"
 #import "RgfxHeap.h"
+#import "RgfxIOSurface.h"
 #import "RgfxMetalPrivate.h"
+#import "RgfxTexture.h"
 #import "RgfxUnsupported.h"
 
 #include "RgfxObjectModel.hpp"
+#include "RgfxRegion.hpp"
 #include "RgfxRingWriter.hpp"
 #include "RgfxSerializer.hpp"
 #include "reims_graphics_wire.h"
@@ -349,6 +354,159 @@ void test_buffer_linear_textures()
 	drainRing(fx.ring);
 }
 
+// A texture's members past MTLTexture.
+id<RgfxMetalTextureInternals> internals(id<MTLTexture> texture)
+{
+	return (id<RgfxMetalTextureInternals>)texture;
+}
+
+MTLTextureDescriptor *texture2D(MTLPixelFormat format, NSUInteger width, NSUInteger height,
+                                MTLTextureUsage usage)
+{
+	MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format
+	                                                                             width:width
+	                                                                            height:height
+	                                                                         mipmapped:NO];
+	d.usage = usage;
+	d.storageMode = MTLStorageModePrivate;
+	return d;
+}
+
+// isCompressed follows Metal's rule, case by case as measured: the usage, the size, the format,
+// the storage, GPU-optimized contents, and the memory a texture lies in; a view answers its
+// texture's.
+void test_texture_compression()
+{
+	Fixture fx;
+	std::vector<uint8_t> mem(RGFX_ALLOCATIONS_OFFSET + 0x400000, 0);
+	RgfxRegion region(mem.data(), mem.size());
+	@autoreleasepool {
+		auto compressed = [&](MTLTextureDescriptor *d) {
+			RgfxTexture *t = [RgfxTexture textureWithDescriptor:d
+			                                               heap:RGFX_OBJ_NONE
+			                                         heapOffset:0
+			                                             device:nil
+			                                         serializer:&fx.ser];
+			CHECK(t != nil);
+			return [internals(t) isCompressed];
+		};
+		const MTLTextureUsage read = MTLTextureUsageShaderRead;
+		const MTLTextureUsage target = MTLTextureUsageRenderTarget;
+		const struct {
+			MTLPixelFormat format;
+			NSUInteger width, height;
+			MTLTextureUsage usage;
+			BOOL answer;
+		} cases[] = {
+		    {MTLPixelFormatBGRA8Unorm, 16, 16, read, YES},
+		    {MTLPixelFormatBGRA8Unorm, 15, 16, read, NO},
+		    {MTLPixelFormatBGRA8Unorm, 16, 15, read, NO},
+		    {MTLPixelFormatBGRA8Unorm, 64, 64, target, YES},
+		    {MTLPixelFormatBGRA8Unorm, 64, 64, target | read, YES},
+		    {MTLPixelFormatBGRA8Unorm, 64, 64, read | MTLTextureUsageShaderWrite, NO},
+		    {MTLPixelFormatBGRA8Unorm, 64, 64, read | MTLTextureUsagePixelFormatView, NO},
+		    {MTLPixelFormatR32Uint, 64, 64, read | MTLTextureUsageShaderAtomic, NO},
+		    {MTLPixelFormatBGRA8Unorm, 64, 64, MTLTextureUsageUnknown, NO},
+		    {MTLPixelFormatBC1_RGBA, 64, 64, read, NO},
+		    {MTLPixelFormatASTC_4x4_LDR, 64, 64, read, NO},
+		    {MTLPixelFormatETC2_RGB8, 64, 64, read, NO},
+		    {MTLPixelFormatEAC_R11Unorm, 64, 64, read, NO},
+		    {MTLPixelFormatPVRTC_RGBA_4BPP, 64, 64, read, NO},
+		    {MTLPixelFormatGBGR422, 64, 64, read, NO},
+		    {MTLPixelFormatBGRG422, 64, 64, read, NO},
+		    {MTLPixelFormatDepth32Float, 64, 64, target, YES},
+		    {MTLPixelFormatStencil8, 64, 64, target, YES},
+		    {MTLPixelFormatDepth32Float_Stencil8, 64, 64, target, YES},
+		    {MTLPixelFormatBGR10_XR, 64, 64, read, YES},
+		    {MTLPixelFormatRGB9E5Float, 64, 64, read, YES},
+		    {MTLPixelFormatR8Unorm, 64, 64, read, YES},
+		    {MTLPixelFormatA8Unorm, 64, 64, read, YES},
+		    {MTLPixelFormatRGBA32Float, 64, 64, read, YES},
+		};
+		for (const auto &c : cases) {
+			CHECK(compressed(texture2D(c.format, c.width, c.height, c.usage)) == c.answer);
+		}
+
+		MTLTextureDescriptor *d = texture2D(MTLPixelFormatBGRA8Unorm, 64, 64, read);
+		d.compressionType = MTLTextureCompressionTypeLossy;
+		CHECK(compressed(d));
+		d.compressionType = MTLTextureCompressionTypeLossless;
+		d.allowGPUOptimizedContents = NO;
+		CHECK(!compressed(d));
+		d.allowGPUOptimizedContents = YES;
+		for (MTLStorageMode storage : {MTLStorageModeShared, MTLStorageModeManaged}) {
+			d.storageMode = storage;
+			CHECK(compressed(d));
+		}
+		d.storageMode = MTLStorageModeMemoryless;
+		d.usage = target;
+		CHECK(!compressed(d));
+		d.storageMode = MTLStorageModePrivate;
+		d.usage = read;
+		d.textureType = MTLTextureType3D;
+		d.width = d.height = 16;
+		d.depth = 4;
+		CHECK(compressed(d));
+		d.width = d.height = 8;
+		d.depth = 64;
+		CHECK(!compressed(d));
+		d.textureType = MTLTextureType1D;
+		d.width = 64;
+		d.height = d.depth = 1;
+		CHECK(!compressed(d));
+		d.textureType = MTLTextureType2DMultisample;
+		d.width = d.height = 64;
+		d.sampleCount = 4;
+		d.usage = target;
+		CHECK(compressed(d));
+		d = texture2D(MTLPixelFormatBGRA8Unorm, 64, 64, read);
+		d.mipmapLevelCount = 7;
+		CHECK(compressed(d));
+		d.mipmapLevelCount = 1;
+		d.textureType = MTLTextureTypeCube;
+		CHECK(compressed(d));
+
+		// A heap's texture follows the rule; a view answers its texture's, a texture over a buffer
+		// or an IOSurface NO.
+		RgfxHeap *heap = [RgfxHeap heapWithDescriptor:heapDescriptor(MTLStorageModePrivate,
+		                                                             MTLHeapTypePlacement)
+		                                       device:nil
+		                                   serializer:&fx.ser];
+		id<MTLTexture> placed = [heap newTextureWithDescriptor:texture2D(MTLPixelFormatBGRA8Unorm,
+		                                                                 64, 64, read)
+		                                                offset:0];
+		CHECK([internals(placed) isCompressed]);
+		id<MTLTexture> view = [placed newTextureViewWithPixelFormat:MTLPixelFormatBGRA8Unorm_sRGB];
+		CHECK(view != nil && [internals(view) isCompressed]);
+		RgfxBuffer *buffer = [RgfxBuffer bufferWithLength:0x10000
+		                                          options:0
+		                                           device:nil
+		                                       serializer:&fx.ser];
+		MTLTextureDescriptor *ld = texture2D(MTLPixelFormatBGRA8Unorm, 64, 64, read);
+		ld.storageMode = MTLStorageModeShared;
+		id<MTLTexture> linear = [buffer newTextureWithDescriptor:ld offset:0 bytesPerRow:256];
+		CHECK(linear != nil && ![internals(linear) isCompressed]);
+		NSDictionary *props = @{
+			(id)kIOSurfaceWidth : @64,
+			(id)kIOSurfaceHeight : @64,
+			(id)kIOSurfaceBytesPerElement : @4,
+			(id)kIOSurfacePixelFormat : @(static_cast<uint32_t>('BGRA')),
+		};
+		IOSurfaceRef surface = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+		CHECK(surface != nullptr);
+		RgfxIOSurfaceTexture *over = [RgfxIOSurfaceTexture textureWithDescriptor:ld
+		                                                               iosurface:surface
+		                                                                   plane:0
+		                                                                  region:&region
+		                                                                  device:nil
+		                                                              serializer:&fx.ser];
+		CHECK(over != nil && ![internals(over) isCompressed]);
+		over = nil;
+		CFRelease(surface);
+	}
+	drainRing(fx.ring);
+}
+
 } // namespace
 
 void rgfxResourceTests()
@@ -358,4 +516,5 @@ void rgfxResourceTests()
 	test_buffer_answers();
 	test_heap_buffers_answer_their_heap();
 	test_buffer_linear_textures();
+	test_texture_compression();
 }

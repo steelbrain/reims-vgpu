@@ -175,6 +175,11 @@ NS_ASSUME_NONNULL_BEGIN
                                            bytesPerImage:(NSUInteger)bytesPerImage;
 @end
 
+@protocol RgfxMetalTextureInternals
+// `B16@0:8`: whether the GPU keeps the texture's contents losslessly compressed.
+- (BOOL)isCompressed;
+@end
+
 @protocol RgfxMetalHeapInternals
 // `Q16@0:8`: the heap's base address, where a resource at offset 0 lies.
 - (uint64_t)gpuAddress;

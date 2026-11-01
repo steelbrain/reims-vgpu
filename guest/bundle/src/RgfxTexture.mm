@@ -5,6 +5,7 @@
 #import "RgfxTexture.h"
 
 #import "RgfxBuffer.h"
+#import "RgfxMetalPrivate.h"
 #import "RgfxUnsupported.h"
 
 #include <cstring>
@@ -212,6 +213,15 @@ RgfxBlockShape rgfxBlockShapeOf(MTLPixelFormat f)
 	}
 }
 
+// Whether `f`'s texels are stored in blocks of more than one (BC, ETC, EAC, ASTC, PVRTC) or
+// share their chroma between two (the 4:2:2 formats).
+bool rgfxIsBlockOrSubsampled(MTLPixelFormat f)
+{
+	const RgfxBlockShape b = rgfxBlockShapeOf(f);
+	return b.width > 1 || b.height > 1 ||
+	       (f >= MTLPixelFormatPVRTC_RGB_2BPP && f <= MTLPixelFormatPVRTC_RGBA_4BPP_sRGB);
+}
+
 // A CPU copy's shape: the region's rows of blocks, each row's bytes, and its images (depth).
 struct RgfxCopyShape {
 	uint64_t rowBytes, rows, images;
@@ -383,6 +393,9 @@ bool rgfxViewFormatsMayMatch(MTLPixelFormat from, MTLPixelFormat to)
 enum RgfxViewRefusal { kNoFormat, kFormatClass, kLevels, kSlices, kTypeFamily, kSliceCount, kViews };
 
 } // namespace
+
+@interface RgfxTexture () <RgfxMetalTextureInternals>
+@end
 
 @implementation RgfxTexture {
 	RgfxTextureDescriptor _desc; // the mapped shape the getters answer from
@@ -1316,6 +1329,36 @@ enum RgfxViewRefusal { kNoFormat, kFormatClass, kLevels, kSlices, kTypeFamily, k
 - (MTLTextureCompressionType)compressionType
 {
 	return _compressionType;
+}
+
+// --- what Metal's texture answers past its protocol (RgfxMetalPrivate.h) ----------------
+
+// Whether the GPU keeps the texture's contents losslessly compressed, by the rule Metal's follows
+// (measured on the M3 Max under macOS 27): NO for one over a buffer or an IOSurface, a Memoryless
+// one, one that does not allow GPU-optimized contents, one of no usage or of any of ShaderWrite,
+// PixelFormatView and ShaderAtomic, one under 16 texels wide or high (1D textures and texture
+// buffers among them), and one of a block-compressed (BC, ETC, EAC, ASTC, PVRTC) or 4:2:2 format;
+// YES for any other, of any storage mode, sample count, level count or type, depth, stencil and
+// heap textures among them, and lossy ones. A view answers its texture's.
+- (BOOL)isCompressed
+{
+	if (_parent != nil) {
+		return [_parent isCompressed];
+	}
+	if (_buffer != nil || self.iosurface != nullptr ||
+	    self.storageMode == MTLStorageModeMemoryless || !_allowGPUOptimizedContents) {
+		return NO;
+	}
+	const MTLTextureUsage usage = self.usage;
+	const MTLTextureUsage uncompressed =
+	    MTLTextureUsageShaderWrite | MTLTextureUsagePixelFormatView | MTLTextureUsageShaderAtomic;
+	if (usage == MTLTextureUsageUnknown || (usage & uncompressed) != 0) {
+		return NO;
+	}
+	if (_desc.width < 16 || _desc.height < 16) {
+		return NO;
+	}
+	return !rgfxIsBlockOrSubsampled(self.pixelFormat);
 }
 
 // --- what a texture that is not sparse, shared or remote answers ----------------------
