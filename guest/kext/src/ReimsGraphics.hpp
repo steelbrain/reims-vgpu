@@ -329,6 +329,10 @@ private:
 	RgfxModeConfig modeConfig;
 	UInt32 reportedCount;
 
+	// kIOWindowServerActiveAttribute's value as WindowServer last set it: 0
+	// (kIOWSAA_Unaccelerated) before any set. IOFramebuffer gets and sets it under its gate.
+	UInt32 windowServerActive;
+
 	// Under interruptLock: IOFramebuffer's registrations, whether it wants
 	// VBLANK events, and a display change waiting for its connect interrupt.
 	IOSimpleLock *interruptLock;

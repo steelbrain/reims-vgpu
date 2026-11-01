@@ -1350,6 +1350,14 @@ IOReturn ReimsGraphics::getAttribute(IOSelect attribute, uintptr_t *value)
 		traceAttribute("getAttribute", -1, attribute, 1, kIOReturnSuccess);
 		return kIOReturnSuccess;
 	}
+	if (attribute == kIOWindowServerActiveAttribute) {
+		// WindowServer's access to the display, as it last set it (setAttribute).
+		if (!value)
+			return kIOReturnBadArgument;
+		*value = windowServerActive;
+		traceAttribute("getAttribute", -1, attribute, *value, kIOReturnSuccess);
+		return kIOReturnSuccess;
+	}
 	IOReturn r = super::getAttribute(attribute, value);
 	traceAttribute("getAttribute", -1, attribute, value ? *value : 0, r);
 	return r;
@@ -1361,6 +1369,15 @@ IOReturn ReimsGraphics::setAttribute(IOSelect attribute, uintptr_t value)
 		IOReturn r = setPower(static_cast<UInt32>(value));
 		traceAttribute("setAttribute", -1, attribute, value, r);
 		return r;
+	}
+	if (attribute == kIOWindowServerActiveAttribute) {
+		// WindowServer's access to the display (a kIOWSAA_ state: CPU only, GPU only, or moving
+		// between them, with or without the transactional bit, which the display pipe's
+		// transactions follow): recorded, for getAttribute. The display shows the scanout, or
+		// the surface the display pipe last presented, in every state.
+		windowServerActive = static_cast<UInt32>(value);
+		traceAttribute("setAttribute", -1, attribute, value, kIOReturnSuccess);
+		return kIOReturnSuccess;
 	}
 	IOReturn r = super::setAttribute(attribute, value);
 	traceAttribute("setAttribute", -1, attribute, value, r);
