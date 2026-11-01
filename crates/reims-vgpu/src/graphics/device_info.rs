@@ -251,8 +251,8 @@ fn cap_apple_families(identity: &mut IdentityCaps, wired: &[Piece]) {
 ///
 /// | answer | the lane's | waits on |
 /// |---|---|---|
-/// | `supportsFamily:` of Apple1 to Apple11, and `supportsFeatureSet:` of the iOS sets that go with them | the platform's, but no from the first Apple family whose rows need a piece the lane lacks; of Apple2's it carries texture views alone, so no Apple family | each family's pieces in [`APPLE_PIECES`] the lane lacks, from argument encoders, automatic heaps, sample positions and IO command queues (Apple1 and Apple2) on |
-/// | `supportsFamily:` of Mac1, Mac2, Common1 to Common3 and Metal3 | the platform's, for now | their rows need some of the same pieces: argument encoders (Mac1, Mac2 and Metal3), and automatic heaps, sample positions and IO command queues (every one of them) |
+/// | `supportsFamily:` of Apple1 to Apple11, and `supportsFeatureSet:` of the iOS sets that go with them | the platform's, but no from the first Apple family whose rows need a piece the lane lacks: the platform's of Apple1 and Apple2, every piece of which it carries, and no from Apple3 on | each family's pieces in [`APPLE_PIECES`] the lane lacks, from Apple3's indirect command buffers and compute indirect barriers on |
+/// | `supportsFamily:` of Mac1, Mac2, Common1 to Common3 and Metal3 | the platform's | nothing [`APPLE_PIECES`] lists: it lists the Apple families' pieces alone, and the pieces of Apple1 and Apple2 these rows were held to (argument encoders, automatic heaps, sample positions and IO command queues) the lane carries |
 /// | `supportsFamily:` of Metal4 | no | the `MTL4` API: its command queues and buffers, argument tables, compiler and allocators |
 /// | `supportsRaytracing`, `supportsRaytracingFromRender`, `supportsPrimitiveMotionBlur` | no | acceleration structures, their builds, and intersection function tables |
 /// | `supportsFunctionPointers`, `supportsFunctionPointersFromRender` | no | visible function tables and function handles |

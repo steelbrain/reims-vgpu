@@ -756,8 +756,9 @@ pub struct RgfxQueueCreate {
     pub submit_data_size: u32,
     /// The completion ring's byte-ring size, after its header: a power of two.
     pub complete_data_size: u32,
-    /// The queue's priority; the host gives its VkQueue a matching priority so
-    /// WindowServer's queue runs high. 0 is normal, higher is higher.
+    /// The queue's priority, 0 normal and higher higher. The bundle sends 0 for
+    /// every queue (a `setGPUPriority:` stays in the guest), and the host reads
+    /// none: each queue is the platform's plain `newCommandQueue`.
     pub priority: u32,
     /// The MSI-X vector the completion ring raises.
     pub vector: u32,

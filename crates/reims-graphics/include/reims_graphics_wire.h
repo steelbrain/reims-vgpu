@@ -3788,8 +3788,9 @@ typedef struct {
   uint32_t submit_data_size;
   // The completion ring's byte-ring size, after its header: a power of two.
   uint32_t complete_data_size;
-  // The queue's priority; the host gives its VkQueue a matching priority so
-  // WindowServer's queue runs high. 0 is normal, higher is higher.
+  // The queue's priority, 0 normal and higher higher. The bundle sends 0 for
+  // every queue (a `setGPUPriority:` stays in the guest), and the host reads
+  // none: each queue is the platform's plain `newCommandQueue`.
   uint32_t priority;
   // The MSI-X vector the completion ring raises.
   uint32_t vector;

@@ -641,8 +641,8 @@ accelerator kext posts there for each process. Every other ring is one
 `MTLCommandQueue`'s ring pair (one submission and one completion ring per
 queue, created on demand), which the bundle places in its kext-given blocks and
 creates through the accelerator kext. Each ring keeps a single producer and a
-single consumer, so their `consumer_idle` handshakes never race. A create carries a priority, and the host gives that ring's VkQueue a
-matching priority, so WindowServer's queue runs high.
+single consumer, so their `consumer_idle` handshakes never race. A create carries a priority, which the bundle sends as 0 for every
+queue and the host does not read: each queue is the platform's plain `newCommandQueue`.
 
 **Object lifecycle** (ring 0, through the accelerator kext, request/reply). Each `*_CREATE` carries our
 schema for the Metal descriptor (plain little-endian fields, decoded straight
