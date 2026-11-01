@@ -9,7 +9,10 @@
  *   - RGFX_EVT_PIPELINE_REFLECTION (RgfxPipelineReflection) -> the pipeline-state
  *     wrapper whose create seqno it carries: the wrapper's reflection fills;
  *   - RGFX_EVT_EVENT_SIGNALLED (RgfxEventSignalled) -> the shared-event wrapper named
- *     by its obj_id: its value mirror updates and its listeners fire.
+ *     by its obj_id: its value mirror updates and its listeners fire. The host posts it
+ *     on the completion ring of the queue whose command buffer signalled the event, ahead
+ *     of that buffer's CB_COMPLETE; a queue's reader hands it to the device's
+ *     (setEventsTo), where the process's shared events listen.
  * Every other message type (the control-command answers RGFX_EVT_COMPLETE / DISPLAYS /
  * VBLANK, which the control path owns) is skipped. The three reply structs' byte
  * layout is the committed wire header's; the host builders this mirrors are
@@ -92,6 +95,14 @@ public:
 	/// is not registered is ignored.
 	void removeEventListener(uint64_t token);
 
+	/// Hands every RGFX_EVT_EVENT_SIGNALLED this reader reads to `events` (signalled)
+	/// instead of this reader's own listeners: a queue's reader, to the device's.
+	/// `events` outlives this reader, as the process's device does its queues.
+	void setEventsTo(RgfxReplyReader *events);
+
+	/// Fires this reader's listeners for `msg`'s shared event, in registration order.
+	void signalled(const RgfxEventSignalled &msg);
+
 	/// Reads every message the host has published and not yet consumed, dispatches
 	/// each to its handler, and publishes the consumer count so the host sees the
 	/// room freed. Returns how many messages it dispatched (pads and unmatched or
@@ -127,6 +138,9 @@ private:
 		EventHandler handler;
 	};
 
+	/// The handlers listening for `obj_id`, in registration order. Called with the lock held.
+	std::vector<EventHandler> listenersOf(uint64_t obj_id);
+
 	volatile uint8_t *m_header;
 	volatile uint8_t *m_data;
 	uint32_t m_dataSize;
@@ -142,6 +156,8 @@ private:
 	std::unordered_map<uint64_t, RgfxPipelineReflection> m_earlyReflections;
 	std::unordered_map<uint64_t, EventListener> m_eventListeners;
 	uint64_t m_nextToken;
+	RgfxReplyReader *m_eventsTo = nullptr; // setEventsTo: borrowed
+
 };
 
 #endif // RGFX_REPLY_READER_HPP_

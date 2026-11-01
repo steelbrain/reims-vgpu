@@ -8,23 +8,26 @@
 #include "RgfxReplyReader.hpp"
 #include "RgfxSerializer.hpp"
 
-// One pending notifyListener registration: the value at which the block fires.
+// One pending notifyListener registration: the value at which the block fires, on the
+// listener's queue.
 @interface RgfxSharedEventPending : NSObject
 @property(nonatomic) uint64_t value;
 @property(nonatomic, copy) MTLSharedEventNotificationBlock block;
+@property(nonatomic, strong) dispatch_queue_t queue;
 @end
 @implementation RgfxSharedEventPending
 RGFX_LOG_UNRECOGNIZED
 @end
 
 @interface RgfxSharedEvent ()
-- (void)rgfxEventSignalled:(const RgfxEventSignalled *)msg;
-- (void)rgfxSetMirror:(uint64_t)value;
+- (void)rgfxRaiseTo:(uint64_t)value;
 @end
 
 @implementation RgfxSharedEvent {
-	// Local mirror of the host-side counter. Seeded from the create's initial value
-	// and updated from RGFX_EVT_EVENT_SIGNALLED once registered with the reply reader.
+	// The value as this process knows it: the create's initial value, raised by the CPU's sets
+	// and by the host's RGFX_EVT_EVENT_SIGNALLED once registered with the reply reader. It only
+	// rises, as Metal's does (measured on the M3 Max: a set or a GPU signal to a lower value
+	// leaves it). Guarded by `_valueChanged`, with `_pending`.
 	uint64_t _signaledValue;
 	// Pending notifyListener registrations, fired when the value reaches theirs.
 	NSMutableArray<RgfxSharedEventPending *> *_pending;
@@ -32,7 +35,7 @@ RGFX_LOG_UNRECOGNIZED
 	// remove on dealloc.
 	RgfxReplyReader *_reader;
 	uint64_t _eventToken;
-	// Signalled each time the mirror moves, for waitUntilSignaledValue:timeoutMS:.
+	// Signalled each time the value moves, for waitUntilSignaledValue:timeoutMS:.
 	NSCondition *_valueChanged;
 	uint64_t _traceId; // globalTraceObjectID
 }
@@ -77,25 +80,34 @@ RGFX_LOG_UNRECOGNIZED
 	_eventToken = reader->addEventListener([self rgfxObjId], [weakSelf](const RgfxEventSignalled &m) {
 		RgfxSharedEvent *strongSelf = weakSelf;
 		if (strongSelf != nil) {
-			[strongSelf rgfxEventSignalled:&m];
+			[strongSelf rgfxRaiseTo:m.value];
 		}
 	});
 }
 
-// The host signalled this event to `msg->value`: update the mirror and fire every
-// pending notifyListener block whose value has been reached, in registration order.
-- (void)rgfxEventSignalled:(const RgfxEventSignalled *)msg
+// The value reached `value` (a command buffer's signal the host posted, or the CPU's set): it
+// rises to it where it is higher, and each pending notifyListener block whose value it reached
+// fires on its listener's queue, in registration order, with the value it was registered at, as
+// Metal's do (measured).
+- (void)rgfxRaiseTo:(uint64_t)value
 {
-	[self rgfxSetMirror:msg->value];
 	NSMutableArray<RgfxSharedEventPending *> *fired = [NSMutableArray array];
-	for (RgfxSharedEventPending *p in _pending) {
-		if (msg->value >= p.value) {
-			[fired addObject:p];
-		}
-	}
+	[_valueChanged lock];
+	if (value > _signaledValue)
+		_signaledValue = value;
+	const uint64_t now = _signaledValue;
+	NSMutableArray<RgfxSharedEventPending *> *left = [NSMutableArray array];
+	for (RgfxSharedEventPending *p in _pending)
+		[(now >= p.value ? fired : left) addObject:p];
+	_pending = left;
+	[_valueChanged broadcast];
+	[_valueChanged unlock];
 	for (RgfxSharedEventPending *p in fired) {
-		[_pending removeObjectIdenticalTo:p];
-		p.block(self, msg->value);
+		MTLSharedEventNotificationBlock block = p.block;
+		const uint64_t at = p.value;
+		dispatch_async(p.queue, ^{
+			block(self, at);
+		});
 	}
 }
 
@@ -109,34 +121,23 @@ RGFX_LOG_UNRECOGNIZED
 
 - (uint64_t)signaledValue
 {
-	// The host holds the authoritative counter; this returns the local mirror, which
-	// the reply reader updates from RGFX_EVT_EVENT_SIGNALLED once registered.
-	return _signaledValue;
+	[_valueChanged lock];
+	const uint64_t value = _signaledValue;
+	[_valueChanged unlock];
+	return value;
 }
 
 - (void)setSignaledValue:(uint64_t)signaledValue
 {
-	// A CPU-side set of the counter has no wire op of its own in this slice: the
-	// lifecycle serialiser carries SHARED_EVENT_CREATE only, and the GPU-timeline
-	// signal is an encoder op (the command-buffer/encoders slice), not a device
-	// call. FOLLOW-UP: when the host grows a shared-event SET op (and/or the reply
-	// ring reports the host's value back), route the set through the serialiser and
-	// reconcile the mirror. For now this updates only the local mirror.
-	[self rgfxSetMirror:signaledValue];
+	// To the host first, whose GPU waits it may release, then here.
+	if (_serializer != nullptr)
+		_serializer->setSharedEventValue([self rgfxObjId], signaledValue);
+	[self rgfxRaiseTo:signaledValue];
 }
 
-// Moves the mirror and wakes every waitUntilSignaledValue:timeoutMS:.
-- (void)rgfxSetMirror:(uint64_t)value
-{
-	[_valueChanged lock];
-	_signaledValue = value;
-	[_valueChanged broadcast];
-	[_valueChanged unlock];
-}
-
-// Blocks until the mirror reaches `value` (YES) or `milliseconds` pass (NO), as Metal's does.
-// The mirror moves on the host's EVENT_SIGNALLED and on the CPU's set; where no thread drives
-// the reader the event is registered with (a unit test), the wait takes it meanwhile.
+// Blocks until the value reaches `value` (YES) or `milliseconds` pass (NO), as Metal's does. The
+// value moves on the host's EVENT_SIGNALLED and on the CPU's set; where no thread drives the
+// reader the event is registered with (a unit test), the wait takes it meanwhile.
 - (BOOL)waitUntilSignaledValue:(uint64_t)value timeoutMS:(uint64_t)milliseconds
 {
 	NSDate *deadline =
@@ -166,23 +167,30 @@ RGFX_LOG_UNRECOGNIZED
                atValue:(uint64_t)value
                  block:(MTLSharedEventNotificationBlock)block
 {
-	// A CPU completion callback fires when the event's value reaches `value`. If the
-	// mirror has already reached it, fire now; otherwise keep the (value, block) until
-	// an RGFX_EVT_EVENT_SIGNALLED through the reply reader reaches it (rgfxEventSignalled:).
-	// `listener` names the dispatch queue Metal would fire the block on; we fire
-	// synchronously (a documented simplification until the listener's queue is wired).
-	(void)listener;
+	// `block` runs on the listener's queue once the value reaches `value`, with `value`: at
+	// once where it already has, else when a signal or a set reaches it (rgfxRaiseTo:).
 	if (block == nil) {
 		return;
 	}
-	if (_signaledValue >= value) {
-		block(self, _signaledValue);
-		return;
+	dispatch_queue_t queue = listener.dispatchQueue;
+	if (queue == nil)
+		queue = dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0);
+	MTLSharedEventNotificationBlock copied = [block copy];
+	[_valueChanged lock];
+	const BOOL reached = _signaledValue >= value;
+	if (!reached) {
+		RgfxSharedEventPending *p = [[RgfxSharedEventPending alloc] init];
+		p.value = value;
+		p.block = copied;
+		p.queue = queue;
+		[_pending addObject:p];
 	}
-	RgfxSharedEventPending *p = [[RgfxSharedEventPending alloc] init];
-	p.value = value;
-	p.block = block;
-	[_pending addObject:p];
+	[_valueChanged unlock];
+	if (reached) {
+		dispatch_async(queue, ^{
+			copied(self, value);
+		});
+	}
 }
 
 - (MTLSharedEventHandle *)newSharedEventHandle

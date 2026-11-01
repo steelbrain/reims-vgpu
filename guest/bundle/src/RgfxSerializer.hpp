@@ -350,6 +350,9 @@ public:
 	RgfxCreated createFence();
 	/// A shared event starting at `initial_value`.
 	RgfxCreated createSharedEvent(uint64_t initial_value);
+	/// The CPU set shared event `event` to `value` (`setSignaledValue:`); the host's only rises.
+	/// False where the message was not posted.
+	bool setSharedEventValue(RgfxObjId event, uint64_t value);
 
 	// --- destroy --------------------------------------------------------------
 

@@ -15,7 +15,8 @@
 
 #include <stdint.h>
 
-// The framing / command-buffer group (`tag >> 12`): encoder begin and end.
+// The framing / command-buffer group (`tag >> 12`): encoder begin and end, and the command
+// buffer's own event signals and waits.
 #define RGFX_OP_GROUP_FRAMING 0
 
 // The render-encoder group (`tag >> 12`): [`render`].
@@ -42,6 +43,15 @@
 
 // Op `ENCODER_END`: end the open encoder (`endEncoding`) and drop it (no body).
 #define RGFX_OP_ENCODER_END 4
+
+// Op `SIGNAL_EVENT` ([`RgfxOpEvent`]): `encodeSignalEvent:value:`, between encoders. The event is
+// an `id<MTLEvent>` or an `id<MTLSharedEvent>`; a shared one's signal is posted to the guest as
+// [`RgfxEventSignalled`](crate::wire::RgfxEventSignalled) once the buffer finishes.
+#define RGFX_OP_SIGNAL_EVENT 5
+
+// Op `WAIT_EVENT` ([`RgfxOpEvent`]): `encodeWaitForEvent:value:`, between encoders: the work
+// after it waits until the event reaches `value`.
+#define RGFX_OP_WAIT_EVENT 6
 
 // Where an op's body starts in the op: right after its header.
 #define RGFX_OP_BODY_OFFSET 8
@@ -939,6 +949,10 @@
 // of the sender's as [`RgfxArgumentLayoutReply`] says, then answered by [`RGFX_EVT_COMPLETE`].
 // Nothing is made: the guest's encoder writes the arguments where the layout puts them.
 #define RGFX_CMD_ARGUMENT_LAYOUT 537
+
+// Command `SHARED_EVENT_SET_VALUE` ([`RgfxSharedEventSetValue`]): the CPU sets a shared event's
+// value (`setSignaledValue:`), which only rises, as Metal's does. Not answered.
+#define RGFX_CMD_SHARED_EVENT_SET_VALUE 538
 
 // `CONTEXT_CLOSE` ([`RgfxContextClose`]), on ring 0 from the accelerator kext: the process that
 // held context `context` closed the device or died. The host ends the context's command queues
@@ -2536,13 +2550,15 @@ typedef struct {
   uint32_t count;
 } RgfxDisplays;
 
-// `EVENT_SIGNALLED`: the shared event `obj_id` reached `value`.
+// `EVENT_SIGNALLED`, on the completion ring of the queue whose command buffer signalled it, ahead
+// of that buffer's [`RgfxCbComplete`]: the shared event `obj_id` was signalled to `value`
+// (`encodeSignalEvent:value:`) by the buffer, now finished.
 typedef struct {
   // [`RGFX_EVT_EVENT_SIGNALLED`], `seqno` 0.
   RgfxMsgHeader header;
   // The shared event that fired.
   uint64_t obj_id;
-  // The value it reached.
+  // The value the buffer signalled it to.
   uint64_t value;
 } RgfxEventSignalled;
 
@@ -3108,6 +3124,14 @@ typedef struct {
   // The instances to draw.
   uint64_t instance_count;
 } RgfxOpDrawPrimitivesInstances;
+
+// The body of [`RGFX_OP_SIGNAL_EVENT`] and [`RGFX_OP_WAIT_EVENT`].
+typedef struct {
+  // The event (`EVENT_CREATE`'s or `SHARED_EVENT_CREATE`'s object).
+  uint64_t event_obj_id;
+  // The value signalled, or waited for.
+  uint64_t value;
+} RgfxOpEvent;
 
 // `executeCommandsInBuffer:withRange:`. The indirect command buffer must name an
 // object.
@@ -4185,6 +4209,16 @@ typedef struct {
   // The event's value when it is made.
   uint64_t initial_value;
 } RgfxSharedEventCreate;
+
+// `SHARED_EVENT_SET_VALUE`: the shared event `obj_id` set to `value` from the CPU.
+typedef struct {
+  // [`RGFX_CMD_SHARED_EVENT_SET_VALUE`].
+  RgfxMsgHeader header;
+  // The shared event.
+  uint64_t obj_id;
+  // The value `setSignaledValue:` was given.
+  uint64_t value;
+} RgfxSharedEventSetValue;
 
 // `SIZE_AND_ALIGN`: a `HEAP_TEXTURE_SIZE_AND_ALIGN`'s answer. `status` is [`RGFX_STATUS_OK`]
 // with the device's `size` and `align` (a size of 0 for a shape no texture has, as Metal answers

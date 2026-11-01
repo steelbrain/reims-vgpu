@@ -58,6 +58,15 @@
 //                       completes, with every other byte as the CPU left it; a second copies the
 //                       first out again after the CPU rewrites it. The deallocators run once the
 //                       buffers go, and a length of 0 or a range not wholly mapped makes none
+//   tex_probe events N  N rounds of command buffers ordered by events across two queues, as
+//                       Metal's are (M3 Max, macOS 27): a buffer on the second queue waits for a
+//                       new shared event to reach 1, then copies a buffer the first queue's next
+//                       buffer fills and then signals 1, committed after it, and must copy the
+//                       fill; the value is 1 once the signalling buffer's waitUntilCompleted
+//                       returns. A listener at 2 runs on its own queue, with 2, once a buffer
+//                       signals 2. A buffer waiting for 3 is not completed 2 ms after its
+//                       commit, and runs once the CPU sets 3; a set to 1 leaves the value at 3.
+//                       A plain MTLEvent orders a copy across the queues as the shared one does
 // Prints "TEX OK" when every check passes, else "TEX FAIL: why" and exits 1. A completion 20 s
 // late prints HANG and exits 3. The copy waits with waitUntilCompleted, or with its completed
 // handler alone (`handler`).
@@ -899,6 +908,141 @@ static int no_copy(id<MTLDevice> device, id<MTLCommandQueue> queue, long n)
 	return 0;
 }
 
+// One round of `events`: see the header.
+static int events_round(id<MTLDevice> device, id<MTLCommandQueue> first, id<MTLCommandQueue> second,
+                        dispatch_queue_t listenerQueue, long i)
+{
+	const NSUInteger len = 4096;
+	const uint8_t fill = (uint8_t)(0x10 + (i % 200));
+	id<MTLBuffer> src = [device newBufferWithLength:len options:MTLResourceStorageModeShared];
+	id<MTLBuffer> dst = [device newBufferWithLength:len options:MTLResourceStorageModeShared];
+	id<MTLBuffer> late = [device newBufferWithLength:len options:MTLResourceStorageModeShared];
+	id<MTLSharedEvent> e = [device newSharedEvent];
+	id<MTLEvent> plain = [device newEvent];
+	if (src == nil || dst == nil || late == nil || e == nil || plain == nil)
+		return fail("events: no buffers or events");
+	memset(src.contents, 0, len);
+	memset(dst.contents, 0xee, len);
+	memset(late.contents, 0, len);
+
+	// The second queue's copy waits for the first queue's fill, committed after it.
+	struct watch *w = watch_start("events: the copy that waits for a shared event");
+	id<MTLCommandBuffer> copy = [second commandBuffer];
+	[copy encodeWaitForEvent:e value:1];
+	id<MTLBlitCommandEncoder> b = [copy blitCommandEncoder];
+	[b copyFromBuffer:src sourceOffset:0 toBuffer:dst destinationOffset:0 size:len];
+	[b endEncoding];
+	[copy commit];
+	usleep(1000);
+	id<MTLCommandBuffer> fillCb = [first commandBuffer];
+	b = [fillCb blitCommandEncoder];
+	[b fillBuffer:src range:NSMakeRange(0, len) value:fill];
+	[b endEncoding];
+	[fillCb encodeSignalEvent:e value:1];
+	[fillCb commit];
+	[fillCb waitUntilCompleted];
+	if (e.signaledValue != 1) {
+		printf("events: value %llu once the signalling buffer completed\n", e.signaledValue);
+		return fail("events: a shared event's signal is not seen by its buffer's completion");
+	}
+	[copy waitUntilCompleted];
+	atomic_store(&w->done, 1);
+	for (NSUInteger k = 0; k < len; k++) {
+		if (((uint8_t *)dst.contents)[k] != fill) {
+			printf("events: byte %lu is %#x, not %#x\n", (unsigned long)k,
+			       ((uint8_t *)dst.contents)[k], fill);
+			return fail("events: a copy ran before the signal it waited for");
+		}
+	}
+
+	// A listener at 2, on its own queue, with 2.
+	MTLSharedEventListener *listener =
+	    [[MTLSharedEventListener alloc] initWithDispatchQueue:listenerQueue];
+	dispatch_semaphore_t heard = dispatch_semaphore_create(0);
+	__block uint64_t heardValue = 0;
+	__block int onQueue = 0;
+	static char key;
+	[e notifyListener:listener
+	          atValue:2
+	            block:^(id<MTLSharedEvent> ev, uint64_t v) {
+		            (void)ev;
+		            heardValue = v;
+		            onQueue = dispatch_get_specific(&key) == &key;
+		            dispatch_semaphore_signal(heard);
+	            }];
+	dispatch_queue_set_specific(listenerQueue, &key, &key, NULL);
+	id<MTLCommandBuffer> two = [first commandBuffer];
+	[two encodeSignalEvent:e value:2];
+	[two commit];
+	if (dispatch_semaphore_wait(heard, dispatch_time(DISPATCH_TIME_NOW, 20 * NSEC_PER_SEC)) != 0)
+		return fail("events: a listener never ran");
+	if (heardValue != 2 || !onQueue) {
+		printf("events: listener value %llu, on its queue %d\n", heardValue, onQueue);
+		return fail("events: a listener ran with another value or off its queue");
+	}
+
+	// A buffer waiting for 3 runs once the CPU sets 3.
+	w = watch_start("events: the buffer the CPU's set releases");
+	id<MTLCommandBuffer> held = [second commandBuffer];
+	[held encodeWaitForEvent:e value:3];
+	b = [held blitCommandEncoder];
+	[b fillBuffer:late range:NSMakeRange(0, len) value:0x5a];
+	[b endEncoding];
+	[held commit];
+	usleep(2000);
+	if (held.status >= MTLCommandBufferStatusCompleted)
+		return fail("events: a buffer ran before the value it waited for");
+	e.signaledValue = 3;
+	[held waitUntilCompleted];
+	atomic_store(&w->done, 1);
+	if (((uint8_t *)late.contents)[0] != 0x5a || ((uint8_t *)late.contents)[len - 1] != 0x5a)
+		return fail("events: the released buffer did not run");
+	e.signaledValue = 1;
+	if (e.signaledValue != 3)
+		return fail("events: a set to a lower value moved the value");
+
+	// A plain event orders a copy across the queues too.
+	memset(dst.contents, 0xee, len);
+	w = watch_start("events: the copy that waits for a plain event");
+	copy = [second commandBuffer];
+	[copy encodeWaitForEvent:plain value:1];
+	b = [copy blitCommandEncoder];
+	[b copyFromBuffer:src sourceOffset:0 toBuffer:dst destinationOffset:0 size:len];
+	[b endEncoding];
+	[copy commit];
+	usleep(1000);
+	fillCb = [first commandBuffer];
+	b = [fillCb blitCommandEncoder];
+	[b fillBuffer:src range:NSMakeRange(0, len) value:(uint8_t)(fill + 1)];
+	[b endEncoding];
+	[fillCb encodeSignalEvent:plain value:1];
+	[fillCb commit];
+	[copy waitUntilCompleted];
+	atomic_store(&w->done, 1);
+	if (((uint8_t *)dst.contents)[0] != (uint8_t)(fill + 1) ||
+	    ((uint8_t *)dst.contents)[len - 1] != (uint8_t)(fill + 1))
+		return fail("events: a copy ran before the plain event it waited for");
+	return 0;
+}
+
+static int events(id<MTLDevice> device, id<MTLCommandQueue> queue, long n)
+{
+	id<MTLCommandQueue> second = [device newCommandQueue];
+	if (second == nil)
+		return fail("events: no second queue");
+	dispatch_queue_t listenerQueue = dispatch_queue_create("tex_probe.listener", DISPATCH_QUEUE_SERIAL);
+	double start = now_ms();
+	for (long i = 0; i < n; i++) {
+		@autoreleasepool {
+			int r = events_round(device, queue, second, listenerQueue, i);
+			if (r != 0)
+				return r;
+		}
+	}
+	printf("events: %ld rounds in %.0f ms\n", n, now_ms() - start);
+	return 0;
+}
+
 int main(int argc, char **argv)
 {
 	@autoreleasepool {
@@ -909,13 +1053,14 @@ int main(int argc, char **argv)
 		int sharedHeap = argc >= 2 && strcmp(argv[1], "sharedheap") == 0;
 		int autoHeap = argc >= 2 && strcmp(argv[1], "autoheap") == 0;
 		int noCopy = argc >= 2 && strcmp(argv[1], "nocopy") == 0;
+		int withEvents = argc >= 2 && strcmp(argv[1], "events") == 0;
 		if (argc < 2 ||
 		    (strcmp(argv[1], "copy") != 0 && strcmp(argv[1], "hold") != 0 && !handler && !big &&
-		     !churning && !everyKind && !sharedHeap && !autoHeap && !noCopy) ||
+		     !churning && !everyKind && !sharedHeap && !autoHeap && !noCopy && !withEvents) ||
 		    (strcmp(argv[1], "copy") != 0 && argc < 3)) {
 			fprintf(stderr,
 			        "usage: tex_probe copy | hold N | handler N | big N | churn N | kinds N | "
-			        "sharedheap N | autoheap N | nocopy N\n");
+			        "sharedheap N | autoheap N | nocopy N | events N\n");
 			return 2;
 		}
 		id<MTLDevice> device = MTLCreateSystemDefaultDevice();
@@ -964,13 +1109,14 @@ int main(int argc, char **argv)
 			if ((long)held.count < n && held.count > 0)
 				[held removeLastObject];
 		}
-		if (big || churning || everyKind || sharedHeap || autoHeap || noCopy) {
+		if (big || churning || everyKind || sharedHeap || autoHeap || noCopy || withEvents) {
 			long n = strtol(argv[2], NULL, 10);
 			int r = big          ? one_big_buffer(device, queue, n)
 			        : churning   ? churn(device, queue, n)
 			        : sharedHeap ? shared_heap(device, queue, n)
 			        : autoHeap   ? auto_heap(device, queue, n)
 			        : noCopy     ? no_copy(device, queue, n)
+			        : withEvents ? events(device, queue, n)
 			                     : kinds(device, n);
 			if (r != 0)
 				return r;

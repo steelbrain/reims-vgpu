@@ -177,6 +177,22 @@ void RgfxEncoder::endEncoder()
 	appendOp(RGFX_OP_ENCODER_END);
 }
 
+void RgfxEncoder::signalEvent(RgfxObjId event, uint64_t value)
+{
+	RgfxOpEvent b = {};
+	b.event_obj_id = event;
+	b.value = value;
+	appendOp(RGFX_OP_SIGNAL_EVENT, &b, sizeof(b));
+}
+
+void RgfxEncoder::waitEvent(RgfxObjId event, uint64_t value)
+{
+	RgfxOpEvent b = {};
+	b.event_obj_id = event;
+	b.value = value;
+	appendOp(RGFX_OP_WAIT_EVENT, &b, sizeof(b));
+}
+
 // --- render ops -------------------------------------------------------------
 
 void RgfxEncoder::renderSetRenderPipelineState(RgfxObjId pipeline)

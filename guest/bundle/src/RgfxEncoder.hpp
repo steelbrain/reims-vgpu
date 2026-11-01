@@ -10,7 +10,9 @@
  * buffer) pair, then the guest appends encoder passes and, inside each, the
  * encoder's commands, and finally posts it:
  *   - `beginRenderPass`/`beginComputePass`/`beginBlitPass` and `endEncoder`
- *     write the framing ops (`RGFX_OP_ENCODER_*`);
+ *     write the framing ops (`RGFX_OP_ENCODER_*`), and `signalEvent`/`waitEvent`
+ *     the buffer's own event ops between encoders (`RGFX_OP_SIGNAL_EVENT`,
+ *     `RGFX_OP_WAIT_EVENT`);
  *   - one method per render (`render*`), compute (`compute*`) and blit (`blit*`)
  *     op writes an `RgfxOpHeader` then that op's body, 8-byte aligned, exactly as
  *     the host reads it; array-tailed ops take a count and an element array and
@@ -74,6 +76,12 @@ public:
 	void beginBlitPass();
 	/// Ends the open encoder (`endEncoding`).
 	void endEncoder();
+	/// The buffer signals `event` (an event or a shared event) to `value`
+	/// (`encodeSignalEvent:value:`), between encoders.
+	void signalEvent(RgfxObjId event, uint64_t value);
+	/// The buffer's later work waits until `event` reaches `value`
+	/// (`encodeWaitForEvent:value:`), between encoders.
+	void waitEvent(RgfxObjId event, uint64_t value);
 
 	// --- render ops (RGFX_OP_RENDER_*, group 1) --------------------------------
 

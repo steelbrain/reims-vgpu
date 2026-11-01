@@ -314,7 +314,9 @@ void test_fence_routing()
 }
 
 // A shared-event wrapper's create routes one RGFX_CMD_SHARED_EVENT_CREATE carrying
-// the initial value, and the wrapper's signaledValue mirror starts there.
+// the initial value, and its signaledValue starts there. A CPU set goes to the host
+// (RGFX_CMD_SHARED_EVENT_SET_VALUE) and raises the value; one to a lower value goes too,
+// and leaves it, as Metal's does.
 void test_shared_event_routing()
 {
 	Fixture fx;
@@ -332,25 +334,20 @@ void test_shared_event_routing()
 	CHECK(msg.obj_id == ev.rgfxObjId);
 	CHECK(msg.initial_value == initial);
 
-	// The local value mirror starts at the initial value, and a CPU-side set
-	// updates the mirror (no wire op for a set in this slice).
 	CHECK(ev.signaledValue == initial);
 	ev.signaledValue = initial + 7;
 	CHECK(ev.signaledValue == initial + 7);
+	auto set = expectMessage<RgfxSharedEventSetValue>(fx.ring, RGFX_CMD_SHARED_EVENT_SET_VALUE);
+	CHECK(set.obj_id == ev.rgfxObjId && set.value == initial + 7);
+	ev.signaledValue = 1;
+	CHECK(ev.signaledValue == initial + 7);
+	auto lower = expectMessage<RgfxSharedEventSetValue>(fx.ring, RGFX_CMD_SHARED_EVENT_SET_VALUE);
+	CHECK(lower.value == 1);
 
-	// The set posts nothing on the ring (documented follow-up, no wire op yet), and
-	// the listener/handle stubs are safe no-ops.
 	RgfxMsgHeader extra = {};
 	std::vector<uint8_t> extraBytes;
 	CHECK(!fx.ring.next(&extra, &extraBytes));
 	CHECK([ev newSharedEventHandle] == nil);
-	MTLSharedEventListener *listener = [[MTLSharedEventListener alloc] init];
-	[ev notifyListener:listener
-	           atValue:initial + 7
-	             block:^(id<MTLSharedEvent> e, uint64_t v) {
-		             (void)e;
-		             (void)v;
-	             }]; // stub: must not fault
 
 	CHECK([RgfxSharedEvent sharedEventWithInitialValue:0 device:nil serializer:nullptr] == nil);
 }
@@ -2689,15 +2686,20 @@ void test_reply_reader_reflection()
 	CHECK([refusedPs rgfxRefused]);
 }
 
-// A host event-signalled message the reader dispatches updates the shared-event value
-// mirror and fires the notifyListener blocks that have been reached.
+// A host event-signalled message raises the shared event's value and fires the
+// notifyListener blocks it reached, on their listener's queue, with the value each was
+// registered at, as Metal's do (measured on the M3 Max). The host posts it on the queue's
+// completion ring, whose reader hands it to the device's, where the event listens. A lower
+// value leaves the value; a block registered at a value reached fires at once, on its queue.
 void test_reply_reader_event()
 {
-	// The reader is declared before the inner pool so it outlives the autoreleased
-	// event, whose dealloc deregisters its listener from the reader (as the device's
-	// reader outlives its events in the guest).
+	// The readers are declared before the inner pool so they outlive the autoreleased
+	// event, whose dealloc deregisters its listener from the device's reader (as the
+	// device's reader outlives its events in the guest).
+	RgfxReplyReader device;
 	TestRing completion(0x8000);
-	RgfxReplyReader reader(completion.base(), completion.dataSize);
+	RgfxReplyReader queue(completion.base(), completion.dataSize);
+	queue.setEventsTo(&device);
 	@autoreleasepool {
 	Fixture fx;
 
@@ -2708,42 +2710,82 @@ void test_reply_reader_event()
 	CHECK(ev != nil);
 	(void)expectMessage<RgfxSharedEventCreate>(fx.ring, RGFX_CMD_SHARED_EVENT_CREATE);
 
-	[ev rgfxRegisterWithReplyReader:&reader];
+	[ev rgfxRegisterWithReplyReader:&device];
 	CHECK(ev.signaledValue == initial);
 
-	// A listener that fires only once the value reaches 50.
+	// A listener on a queue of its own, which fires once the value reaches 45.
+	dispatch_queue_t lq = dispatch_queue_create("rgfx.test.listener", DISPATCH_QUEUE_SERIAL);
+	static char onListener;
+	dispatch_queue_set_specific(lq, &onListener, &onListener, nullptr);
+	MTLSharedEventListener *listener = [[MTLSharedEventListener alloc] initWithDispatchQueue:lq];
+	dispatch_semaphore_t fired = dispatch_semaphore_create(0);
 	__block uint64_t notified = 0;
-	MTLSharedEventListener *listener = [[MTLSharedEventListener alloc] init];
+	__block bool onItsQueue = false;
 	[ev notifyListener:listener
-	           atValue:50
+	           atValue:45
 	             block:^(id<MTLSharedEvent> e, uint64_t v) {
 		             (void)e;
 		             notified = v;
+		             onItsQueue = dispatch_get_specific(&onListener) == &onListener;
+		             dispatch_semaphore_signal(fired);
 	             }];
 
-	// The host raises the event to 42: the mirror updates, the 50-listener holds.
-	RgfxEventSignalled sig = {};
-	sig.header.type = RGFX_EVT_EVENT_SIGNALLED;
-	sig.header.size = sizeof(sig);
-	sig.header.seqno = 0;
-	sig.obj_id = ev.rgfxObjId;
-	sig.value = 42;
-	CHECK(completion.postFromHost(&sig, sizeof(sig)));
-	CHECK(reader.pump() == 1);
+	auto signal = [&](uint64_t value) {
+		RgfxEventSignalled sig = {};
+		sig.header.type = RGFX_EVT_EVENT_SIGNALLED;
+		sig.header.size = sizeof(sig);
+		sig.obj_id = ev.rgfxObjId;
+		sig.value = value;
+		CHECK(completion.postFromHost(&sig, sizeof(sig)));
+		CHECK(queue.pump() == 1);
+	};
+	// The host raises the event to 42: the value rises, the 45-listener holds.
+	signal(42);
 	CHECK(ev.signaledValue == 42);
+	dispatch_sync(lq, ^{
+	});
 	CHECK(notified == 0);
 
-	// The host raises it to 50: the mirror updates and the listener fires.
-	RgfxEventSignalled sig2 = {};
-	sig2.header.type = RGFX_EVT_EVENT_SIGNALLED;
-	sig2.header.size = sizeof(sig2);
-	sig2.obj_id = ev.rgfxObjId;
-	sig2.value = 50;
-	CHECK(completion.postFromHost(&sig2, sizeof(sig2)));
-	CHECK(reader.pump() == 1);
+	// The host raises it to 50: the value rises and the listener fires on its queue, with 45.
+	signal(50);
 	CHECK(ev.signaledValue == 50);
-	CHECK(notified == 50);
-	} // @autoreleasepool: ev drains here, while reader still lives
+	CHECK(dispatch_semaphore_wait(fired, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC)) == 0);
+	CHECK(notified == 45);
+	CHECK(onItsQueue);
+
+	// A lower value leaves it.
+	signal(30);
+	CHECK(ev.signaledValue == 50);
+
+	// One registered at a value reached fires at once, on its queue, with its value.
+	onItsQueue = false;
+	[ev notifyListener:listener
+	           atValue:10
+	             block:^(id<MTLSharedEvent> e, uint64_t v) {
+		             (void)e;
+		             notified = v;
+		             onItsQueue = dispatch_get_specific(&onListener) == &onListener;
+		             dispatch_semaphore_signal(fired);
+	             }];
+	CHECK(dispatch_semaphore_wait(fired, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC)) == 0);
+	CHECK(notified == 10);
+	CHECK(onItsQueue);
+
+	// A CPU set reaches a listener too.
+	[ev notifyListener:listener
+	           atValue:60
+	             block:^(id<MTLSharedEvent> e, uint64_t v) {
+		             (void)e;
+		             notified = v;
+		             dispatch_semaphore_signal(fired);
+	             }];
+	ev.signaledValue = 61;
+	CHECK(dispatch_semaphore_wait(fired, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC)) == 0);
+	CHECK(notified == 60);
+	(void)expectMessage<RgfxSharedEventSetValue>(fx.ring, RGFX_CMD_SHARED_EVENT_SET_VALUE);
+	dispatch_sync(lq, ^{
+	});
+	} // @autoreleasepool: ev drains here, while the readers still live
 }
 
 // --- the completion thread ---------------------------------------------------
@@ -2876,6 +2918,72 @@ struct QueueFixture {
 		return h.seqno;
 	}
 };
+
+// A command buffer's event ops go in its stream between its encoders, in order, each naming
+// its event and value, an event and a shared event alike; one naming an event no device of
+// ours made is not carried.
+void test_command_buffer_event_ops()
+{
+	QueueFixture f;
+	@autoreleasepool {
+		RgfxEvent *ev = [RgfxEvent eventWithDevice:nil serializer:&f.ser];
+		RgfxSharedEvent *sev = [RgfxSharedEvent sharedEventWithInitialValue:0
+		                                                             device:nil
+		                                                         serializer:&f.ser];
+		CHECK(ev != nil && sev != nil);
+		id<MTLCommandBuffer> cb = [f.queue commandBuffer];
+		[cb encodeWaitForEvent:sev value:3];
+		id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+		[blit endEncoding];
+		[cb encodeSignalEvent:ev value:4];
+		[cb encodeSignalEvent:(id<MTLEvent>)[NSObject new] value:9];
+		[cb encodeSignalEvent:sev value:5];
+		[cb commit];
+
+		RgfxMsgHeader h = {};
+		std::vector<uint8_t> bytes;
+		CHECK(f.submit.next(&h, &bytes));
+		CHECK(h.type == RGFX_CMD_COMMAND_BUFFER);
+		RgfxCommandBuffer cbh = {};
+		std::memcpy(&cbh, bytes.data(), sizeof(cbh));
+		struct Want {
+			uint16_t tag;
+			uint64_t event;
+			uint64_t value;
+		};
+		const Want want[] = {
+			{ RGFX_OP_WAIT_EVENT, sev.rgfxObjId, 3 },
+			{ RGFX_OP_ENCODER_BEGIN_BLIT, 0, 0 },
+			{ RGFX_OP_ENCODER_END, 0, 0 },
+			{ RGFX_OP_SIGNAL_EVENT, ev.rgfxObjId, 4 },
+			{ RGFX_OP_SIGNAL_EVENT, sev.rgfxObjId, 5 },
+		};
+		size_t i = 0;
+		OpWalk walk(bytes.data() + RGFX_COMMAND_BUFFER_OPS_OFFSET, cbh.op_bytes);
+		while (!walk.done()) {
+			uint16_t tag = 0;
+			uint32_t len = 0;
+			const uint8_t *body = nullptr;
+			size_t bodyLen = 0;
+			CHECK(walk.next(&tag, &len, &body, &bodyLen));
+			if (opGroup(tag) != RGFX_OP_GROUP_FRAMING)
+				continue; // the queue's barrier fence
+			CHECK(i < sizeof(want) / sizeof(want[0]));
+			CHECK(tag == want[i].tag);
+			if (tag == RGFX_OP_SIGNAL_EVENT || tag == RGFX_OP_WAIT_EVENT) {
+				RgfxOpEvent op = {};
+				CHECK(bodyLen == sizeof(op));
+				std::memcpy(&op, body, sizeof(op));
+				CHECK(op.event_obj_id == want[i].event && op.value == want[i].value);
+			}
+			i++;
+		}
+		CHECK(i == sizeof(want) / sizeof(want[0]));
+		RgfxCbComplete done = cbComplete(h.seqno, ((RgfxResource *)cb).rgfxObjId);
+		CHECK(f.completion.postFromHost(&done, sizeof(done)));
+		[cb waitUntilCompleted];
+	}
+}
 
 // armAndCheck sets the ring's `armed` and says whether records wait; a ringless reader
 // has nothing to arm.
@@ -5350,6 +5458,7 @@ int main()
 		test_reply_reader_completion();
 		test_reply_reader_reflection();
 		test_reply_reader_event();
+		test_command_buffer_event_ops();
 		test_reply_reader_arm();
 		test_completion_thread_runs_handlers();
 		test_wait_with_the_completion_thread();

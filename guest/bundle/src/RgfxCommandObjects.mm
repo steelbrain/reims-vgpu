@@ -41,7 +41,9 @@
 
 #import "RgfxCommandObjects.h"
 #import "RgfxBuffer.h"
+#import "RgfxEvent.h"
 #import "RgfxFence.h"
+#import "RgfxSharedEvent.h"
 #import "RgfxIOSurface.h"
 #import "RgfxInterop.h"
 #import "RgfxUnsupported.h"
@@ -101,16 +103,15 @@ namespace {
 /// otherwise deliver may be this one.
 thread_local int t_delivering = 0;
 
-/// Whether the `n`th (from 0) unhonoured command-buffer event op is logged: the first 16,
-/// then every power of two, so a frame loop's ops stay visible without flooding the log.
+/// Whether the `n`th (from 0) occurrence of a repeated log line is logged: the first 16, then
+/// every power of two, so a frame loop's stays visible without flooding the log.
 bool logEventOp(std::atomic<uint64_t> &count, uint64_t *n)
 {
 	*n = count.fetch_add(1, std::memory_order_relaxed);
 	return *n < 16 || (*n & (*n - 1)) == 0;
 }
 
-std::atomic<uint64_t> g_eventWaits{0};
-std::atomic<uint64_t> g_eventSignals{0};
+std::atomic<uint64_t> g_foreignEvents{0};
 std::atomic<uint64_t> g_bytesDropped{0};
 
 /// Puts an encoder's inline bytes (set*Bytes:length:atIndex:) in its command buffer's upload
@@ -1308,32 +1309,40 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 		dispatch_group_wait(_done, DISPATCH_TIME_FOREVER);
 }
 
+// The event of a command buffer's event op, which the buffer keeps while it runs: its id, or 0
+// for an event no device of ours made (said in the log; the op is not carried).
+- (uint64_t)rgfxEventOf:(id<MTLEvent>)event op:(const char *)op value:(uint64_t)value
+{
+	if ([(id)event isKindOfClass:[RgfxEvent class]] ||
+	    [(id)event isKindOfClass:[RgfxSharedEvent class]])
+		return rgfxNamed(_encoder, event);
+	uint64_t n = 0;
+	if (logEventOp(g_foreignEvents, &n)) {
+		NSLog(@"RGFX: command buffer 0x%llx: %s an event %@ that no device of ours made, value "
+		      @"%llu: not carried (so far: %llu)",
+		      (unsigned long long)[self rgfxObjId], op, event, (unsigned long long)value,
+		      (unsigned long long)(n + 1));
+	}
+	return 0;
+}
+
 - (void)encodeWaitForEvent:(id<MTLEvent>)event value:(uint64_t)value
 {
-	// Command-buffer-scope event waits are not carried yet: no op names one, and no
-	// command buffer signals an event (encodeSignalEvent: below), so the buffer runs
-	// without waiting. Said in the log, so work that relied on the wait is seen.
-	uint64_t n = 0;
-	if (logEventOp(g_eventWaits, &n)) {
-		NSLog(@"RGFX: command buffer 0x%llx: encodeWaitForEvent 0x%llx value %llu is not "
-		      @"carried (no command-buffer event op yet); the buffer runs without the wait "
-		      @"(unhonoured waits so far: %llu)",
-		      (unsigned long long)[self rgfxObjId], (unsigned long long)rgfxId(event),
-		      (unsigned long long)value, (unsigned long long)(n + 1));
-	}
+	// The work encoded after this waits, on the host's GPU, until the event reaches `value`:
+	// signalled by another command buffer, or, for a shared event, set by the CPU.
+	uint64_t obj = [self rgfxEventOf:event op:"encodeWaitForEvent" value:value];
+	if (obj != 0 && _encoder != nullptr)
+		_encoder->waitEvent(obj, value);
 }
 
 - (void)encodeSignalEvent:(id<MTLEvent>)event value:(uint64_t)value
 {
-	// Not carried yet either: a listener or a wait for this value never fires. Logged.
-	uint64_t n = 0;
-	if (logEventOp(g_eventSignals, &n)) {
-		NSLog(@"RGFX: command buffer 0x%llx: encodeSignalEvent 0x%llx value %llu is not "
-		      @"carried (no command-buffer event op yet); nothing waiting for it wakes "
-		      @"(unhonoured signals so far: %llu)",
-		      (unsigned long long)[self rgfxObjId], (unsigned long long)rgfxId(event),
-		      (unsigned long long)value, (unsigned long long)(n + 1));
-	}
+	// The host signals it once the work encoded before this is done; a shared event's value
+	// reaches this process once the buffer finishes, ahead of its completion
+	// (RGFX_EVT_EVENT_SIGNALLED, which its queue's reader hands to the device's).
+	uint64_t obj = [self rgfxEventOf:event op:"encodeSignalEvent" value:value];
+	if (obj != 0 && _encoder != nullptr)
+		_encoder->signalEvent(obj, value);
 }
 
 - (void)presentDrawable:(id<MTLDrawable>)drawable

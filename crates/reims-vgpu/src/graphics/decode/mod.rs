@@ -46,9 +46,9 @@ use reims_graphics::wire::{
     RGFX_CMD_HEAP_CREATE, RGFX_CMD_HEAP_OVER_HOST_MEMORY, RGFX_CMD_LIBRARY_CREATE,
     RGFX_CMD_LIBRARY_FROM_REGION, RGFX_CMD_MANAGED_TEXTURE_CREATE, RGFX_CMD_OBJECT_DESTROY,
     RGFX_CMD_QUEUE_CREATE, RGFX_CMD_RENDER_PIPELINE_CREATE, RGFX_CMD_RESOURCE_ID_CHUNK,
-    RGFX_CMD_SAMPLER_CREATE, RGFX_CMD_SHARED_EVENT_CREATE, RGFX_CMD_TEXTURE_CREATE,
-    RGFX_CMD_TEXTURE_FROM_BUFFER, RGFX_CMD_TEXTURE_FROM_IOSURFACE, RGFX_CMD_TEXTURE_REPLACE_REGION,
-    RGFX_CMD_TEXTURE_VIEW, RGFX_COMPUTE_PIPELINE_SUPPORT_ICB,
+    RGFX_CMD_SAMPLER_CREATE, RGFX_CMD_SHARED_EVENT_CREATE, RGFX_CMD_SHARED_EVENT_SET_VALUE,
+    RGFX_CMD_TEXTURE_CREATE, RGFX_CMD_TEXTURE_FROM_BUFFER, RGFX_CMD_TEXTURE_FROM_IOSURFACE,
+    RGFX_CMD_TEXTURE_REPLACE_REGION, RGFX_CMD_TEXTURE_VIEW, RGFX_COMPUTE_PIPELINE_SUPPORT_ICB,
     RGFX_COMPUTE_PIPELINE_TG_MULTIPLE_OF_EXEC_WIDTH, RGFX_CONTEXT_ALLOCATIONS_OFFSET,
     RGFX_CONTEXT_OBJ_ID_SHIFT, RGFX_CURSOR_SPAN, RGFX_EVT_PIPELINE_REFLECTION,
     RGFX_EVT_SAMPLER_STATE, RGFX_EVT_SIZE_AND_ALIGN, RGFX_LINKED_BINARY_FUNCTIONS,
@@ -61,15 +61,17 @@ use reims_graphics::wire::{
     RGFX_RESOURCE_ID_LIMIT, RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK, RGFX_STATUS_REFUSED,
     RGFX_SURFACE_NO_WRITERS, RgfxBufferAtOffset, RgfxBufferCreate, RgfxBufferOverHostMemory,
     RgfxCbComplete, RgfxColorAttachmentDesc, RgfxComputePipelineCreate, RgfxDepthStencilCreate,
-    RgfxFunctionConstant, RgfxHeapCreate, RgfxHeapOverHostMemory, RgfxHeapTextureSizeAndAlign,
-    RgfxLinkedFunction, RgfxMsgHeader, RgfxObjectCreate, RgfxObjectDestroy, RgfxPipelineReflection,
-    RgfxQueueCreate, RgfxRenderPipelineCreate, RgfxResourceIdChunk, RgfxSamplerCreate,
-    RgfxSamplerState, RgfxSharedEventCreate, RgfxSizeAndAlign, RgfxStencilDescriptor,
-    RgfxSurfaceWriter, RgfxSurfaceWriters, RgfxTextureCreate, RgfxTextureDescriptor,
-    RgfxTextureFromBuffer, RgfxTextureFromIOSurface, RgfxVertexAttribute, RgfxVertexBufferLayout,
+    RgfxEventSignalled, RgfxFunctionConstant, RgfxHeapCreate, RgfxHeapOverHostMemory,
+    RgfxHeapTextureSizeAndAlign, RgfxLinkedFunction, RgfxMsgHeader, RgfxObjectCreate,
+    RgfxObjectDestroy, RgfxPipelineReflection, RgfxQueueCreate, RgfxRenderPipelineCreate,
+    RgfxResourceIdChunk, RgfxSamplerCreate, RgfxSamplerState, RgfxSharedEventCreate,
+    RgfxSharedEventSetValue, RgfxSizeAndAlign, RgfxStencilDescriptor, RgfxSurfaceWriter,
+    RgfxSurfaceWriters, RgfxTextureCreate, RgfxTextureDescriptor, RgfxTextureFromBuffer,
+    RgfxTextureFromIOSurface, RgfxVertexAttribute, RgfxVertexBufferLayout,
 };
 use reims_vgpu_core::host::HostPtr;
 use reims_vgpu_core::platform::device::GpuDevice;
+use reims_vgpu_core::platform::event::SharedEvent;
 use reims_vgpu_core::platform::resource::{
     Buffer, ComputePipeline, FunctionConstant, Heap, Library, RenderPipeline, SamplerState,
 };
@@ -96,6 +98,7 @@ mod library;
 mod managed;
 mod render;
 mod view;
+mod waits;
 
 #[cfg(test)]
 pub(crate) use library::tests::{metallib as test_metallib, sha as test_sha};
@@ -112,6 +115,12 @@ use managed::{ManagedCopy, STORAGE_MODE_MANAGED, storage_mode};
 /// one that writes the record to the queue's completion ring; until it is set, a
 /// completion is built and dropped.
 pub(crate) type CompletionSink = Arc<dyn Fn(RgfxCbComplete) + Send + Sync>;
+
+/// A sink the decoder calls with each shared event a command buffer signalled
+/// (`encodeSignalEvent:value:`), once the buffer's work finishes and before its completion record
+/// goes to the [`CompletionSink`]. The ring loop sets one that writes it to the queue's completion
+/// ring; until it is set, it is built and dropped.
+pub(crate) type SignalSink = Arc<dyn Fn(RgfxEventSignalled) + Send + Sync>;
 
 /// A sink the decoder calls with a pipeline create's reflection reply once the
 /// pipeline is made (or refused). The ring loop sets one that writes the reply to
@@ -244,6 +253,12 @@ pub struct GraphicsDecoder<P: Platform> {
     /// Where a command buffer's completion record goes once its work finishes;
     /// `None` builds and drops it (the ring loop sets a sink later).
     completion_sink: Option<CompletionSink>,
+    /// Where the shared events a command buffer signalled go once its work finishes; `None`
+    /// builds and drops them (the ring loop sets a sink later).
+    signal_sink: Option<SignalSink>,
+    /// The watch over command buffers that wait on events, which logs the ones that wait long
+    /// (diagnostics only: [`waits`]).
+    waits: waits::WaitWatch<P>,
     /// Where a pipeline create's reflection reply goes; `None` builds and drops
     /// it (the ring loop sets a sink later).
     reflection_sink: Option<ReflectionSink>,
@@ -275,6 +290,7 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// A new decoder for `platform` over its `region`, with no objects.
     pub fn new(platform: Arc<P>, region: Arc<Region>) -> Self {
         GraphicsDecoder {
+            waits: waits::WaitWatch::new(Arc::clone(&platform)),
             platform,
             objects: HashMap::new(),
             surfaces: HashMap::new(),
@@ -285,6 +301,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             cached_libraries: HashMap::new(),
             id_chunks: vec![None; RGFX_RESOURCE_ID_CHUNKS as usize].into_boxed_slice(),
             completion_sink: None,
+            signal_sink: None,
             reflection_sink: None,
             context: None,
             spans: HashMap::new(),
@@ -301,6 +318,12 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// ring).
     pub(crate) fn set_completion_sink(&mut self, sink: CompletionSink) {
         self.completion_sink = Some(sink);
+    }
+
+    /// Sets the sink the decoder hands each shared event a command buffer signalled to, once the
+    /// buffer's work finishes (the ring loop's, writing the queue's completion ring).
+    pub(crate) fn set_signal_sink(&mut self, sink: SignalSink) {
+        self.signal_sink = Some(sink);
     }
 
     /// Sets the sink the decoder hands each pipeline create's reflection reply to
@@ -696,12 +719,26 @@ impl<P: Platform> GraphicsDecoder<P> {
                 let Some(m) = read::<RgfxSharedEventCreate>(message) else {
                     return Ok(Err(DecodeError::Malformed));
                 };
-                // `initial_value` is honoured once a shared event's value can be
-                // set from the host; a new shared event starts at 0 today.
-                match device.new_shared_event() {
-                    Some(event) => self.insert(m.obj_id, ObjHandle::SharedEvent(event)),
-                    None => Ok(Err(DecodeError::Refused)),
+                // A new shared event's value is 0: one made at another starts there.
+                let Some(event) = device.new_shared_event() else {
+                    return Ok(Err(DecodeError::Refused));
+                };
+                if m.initial_value != 0 {
+                    event.set_signaled_value(m.initial_value)?;
                 }
+                self.insert(m.obj_id, ObjHandle::SharedEvent(event))
+            }
+            RGFX_CMD_SHARED_EVENT_SET_VALUE => {
+                let Some(m) = read::<RgfxSharedEventSetValue>(message) else {
+                    return Ok(Err(DecodeError::Malformed));
+                };
+                // `setSignaledValue:` from the guest's CPU; the platform's value only rises, as
+                // Metal's does.
+                let Some(ObjHandle::SharedEvent(event)) = self.named(m.obj_id) else {
+                    return Ok(Err(DecodeError::BadReference));
+                };
+                event.set_signaled_value(m.value)?;
+                Ok(Ok(()))
             }
             RGFX_CMD_QUEUE_CREATE => {
                 let Some(m) = read::<RgfxQueueCreate>(message) else {

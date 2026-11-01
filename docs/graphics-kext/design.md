@@ -722,10 +722,12 @@ opens the `Platform` command buffer and walks the ops:
   wait fence, `useResource`/`useHeap`. The op set is the trait's encoder
   methods; the first slice is the subset WindowServer and simple Metal apps
   issue.
-- `CB_SIGNAL` / `CB_WAIT` (event `ObjId`, value) → `encode_signal` /
-  `encode_wait`; `CB_PRESENT` ties a drawable to the scanout (the present path,
-  outside the trait); `CB_COMMIT` closes the message — the host commits and
-  registers an `add_completed_handler` that writes the completion record.
+- `SIGNAL_EVENT` / `WAIT_EVENT` (event `ObjId`, value), between encoders, as
+  Metal's `encodeSignalEvent:value:` and `encodeWaitForEvent:value:` are →
+  `encode_signal` / `encode_wait`, for an `MTLEvent` and an `MTLSharedEvent`
+  alike (an event op with an encoder open, or naming no event, faults the
+  buffer). The end of the message closes it: the host commits and registers an
+  `add_completed_handler` that writes the completion record.
 
 A command buffer too large for half its queue's submission ring goes out of
 line: the bundle writes the whole `COMMAND_BUFFER` message into a block of the
@@ -748,8 +750,40 @@ granularity. The host preserves it so IOGPU error reporting lines up.
 command-buffer `ObjId`, status, GPU start/end time, and on error the
 `CommandBufferError` the host maps 1:1 from the IOGPU code the runtime returns
 (page fault, hang/timeout, recovery victim, access revoked, invalid resource —
-the map m2v gave). A shared event posts `EVENT_SIGNALLED` (`ObjId`, value) as it
-fires. The ring's armed/interrupt handshake is the stage-2 one.
+the map m2v gave). The ring's armed/interrupt handshake is the stage-2 one.
+
+**Shared events.** The host's event is the one command buffers wait on and
+signal; the bundle keeps the value as the process knows it. It only rises, as
+Metal's does (measured on the M3 Max: a CPU set or a GPU signal to a lower value
+leaves it). A CPU `setSignaledValue:` posts `SHARED_EVENT_SET_VALUE` on the
+control ring, which sets the host's (so its GPU waits are released), and raises
+the bundle's value. A command buffer's signal of a shared event reaches the
+process as `EVENT_SIGNALLED` (`ObjId`, value), which the host posts on the
+buffer's queue completion ring once the buffer finishes, ahead of its
+`CB_COMPLETE`, whatever its outcome. The queue's reader hands it to the
+device's, where the process's shared events listen. `notifyListener:` blocks
+run on their listener's queue with the value they were registered at, at once
+where the value has reached it, as Metal's do (measured). A shared event made at
+another value is set to it on the host after its create.
+
+The difference from Metal: Metal's signal lands where the GPU reaches it in the
+buffer, and its CPU value and listeners move then; here the process sees it only
+once the whole buffer has finished. GPU waits are not affected: another buffer's
+`WAIT_EVENT` waits on the host's event, which the host's GPU signals at the
+point Metal's would. A guest thread that waits on the CPU for a signal from the
+middle of a command buffer (`waitUntilSignaledValue:`, a listener) sees it as
+late as the buffer's end. That is never a hang, since the buffer's end comes,
+but it is later where the buffer runs on after its signal: work it would have
+overlapped with the rest of the buffer starts after it instead. A wait for a
+signal that only comes after the waiting thread does something else is the case
+it changes: a thread that waits for a mid-buffer signal before it sets a value
+the same buffer waits for later deadlocks here, where Metal's would not.
+
+A command buffer that waits on an event is watched: one not finished 5 s after
+its commit is named in the log at WARN, with each event and value it waits for,
+and again at INFO once it finishes (at most 32 per device). It is diagnostics
+only: Metal waits without end for a value nothing reaches (measured: the buffer
+stays `Committed`), and so does the host.
 
 **Who takes the completions.** Every queue raises the device's one vector,
 the control ring's. The accelerator kext maps each queue's completion-ring

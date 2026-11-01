@@ -97,6 +97,8 @@ constexpr uint32_t kQueueCompleteDataSize = 32768;
 	// device's control completion ring; it owns the reader for the queue's lifetime.
 	RgfxReplyReader *reader =
 	    new RgfxReplyReader(region->base() + rings.complete_offset, rings.complete_data_size);
+	// The shared events its command buffers signal are the device's, which they listen on.
+	reader->setEventsTo([self replyReader]);
 	[queue adoptReplyReader:reader];
 	// A command buffer too large for the ring puts its message in a block of the region.
 	queue.region = region;

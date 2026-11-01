@@ -761,6 +761,15 @@ RgfxCreated RgfxSerializer::createSharedEvent(uint64_t initial_value)
 	return out;
 }
 
+bool RgfxSerializer::setSharedEventValue(RgfxObjId event, uint64_t value)
+{
+	RgfxSharedEventSetValue msg = {};
+	msg.obj_id = event;
+	msg.value = value;
+	uint64_t seqno = 0;
+	return m_control.tryPost(RGFX_CMD_SHARED_EVENT_SET_VALUE, &msg, sizeof(msg), &seqno);
+}
+
 bool RgfxSerializer::destroy(RgfxObjId obj_id)
 {
 	RgfxObjectDestroy msg = {};

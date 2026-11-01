@@ -313,6 +313,9 @@ pub const RGFX_CMD_HEAP_TEXTURE_SIZE_AND_ALIGN: u32 = 0x218;
 /// of the sender's as [`RgfxArgumentLayoutReply`] says, then answered by [`RGFX_EVT_COMPLETE`].
 /// Nothing is made: the guest's encoder writes the arguments where the layout puts them.
 pub const RGFX_CMD_ARGUMENT_LAYOUT: u32 = 0x219;
+/// Command `SHARED_EVENT_SET_VALUE` ([`RgfxSharedEventSetValue`]): the CPU sets a shared event's
+/// value (`setSignaledValue:`), which only rises, as Metal's does. Not answered.
+pub const RGFX_CMD_SHARED_EVENT_SET_VALUE: u32 = 0x21a;
 
 /// `CONTEXT_CLOSE` ([`RgfxContextClose`]), on ring 0 from the accelerator kext: the process that
 /// held context `context` closed the device or died. The host ends the context's command queues
@@ -714,6 +717,20 @@ pub struct RgfxSharedEventCreate {
     pub initial_value: u64,
 }
 
+/// `SHARED_EVENT_SET_VALUE`: the shared event `obj_id` set to `value` from the CPU.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxSharedEventSetValue {
+    /// [`RGFX_CMD_SHARED_EVENT_SET_VALUE`].
+    pub header: RgfxMsgHeader,
+    /// The shared event.
+    pub obj_id: u64,
+    /// The value `setSignaledValue:` was given.
+    pub value: u64,
+}
+
 /// `QUEUE_CREATE`: a command queue and its submission+completion ring pair, each
 /// a [`RgfxRingHeader`] followed by a byte ring of the given data size (a power
 /// of two) at the given region offset. The completion ring raises `vector`.
@@ -964,7 +981,9 @@ pub struct RgfxCbComplete {
     pub error_code: u32,
 }
 
-/// `EVENT_SIGNALLED`: the shared event `obj_id` reached `value`.
+/// `EVENT_SIGNALLED`, on the completion ring of the queue whose command buffer signalled it, ahead
+/// of that buffer's [`RgfxCbComplete`]: the shared event `obj_id` was signalled to `value`
+/// (`encodeSignalEvent:value:`) by the buffer, now finished.
 #[repr(C)]
 #[derive(
     Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
@@ -974,7 +993,7 @@ pub struct RgfxEventSignalled {
     pub header: RgfxMsgHeader,
     /// The shared event that fired.
     pub obj_id: u64,
-    /// The value it reached.
+    /// The value the buffer signalled it to.
     pub value: u64,
 }
 
@@ -2199,6 +2218,7 @@ const _: () = {
     assert!(size_of::<RgfxObjectDestroy>() == 24);
     assert!(size_of::<RgfxObjectCreate>() == 24);
     assert!(size_of::<RgfxSharedEventCreate>() == 32);
+    assert!(size_of::<RgfxSharedEventSetValue>() == 32);
     assert!(size_of::<RgfxQueueCreate>() == 56);
     assert!(size_of::<RgfxHeapCreate>() == 48);
     assert!(size_of::<RgfxHeapOverHostMemory>() == 56);

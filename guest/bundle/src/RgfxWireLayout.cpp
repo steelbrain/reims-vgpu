@@ -23,6 +23,7 @@ static_assert(sizeof(RgfxMsgHeader) == 16, "RgfxMsgHeader");
 static_assert(sizeof(RgfxObjectDestroy) == 24, "RgfxObjectDestroy");
 static_assert(sizeof(RgfxObjectCreate) == 24, "RgfxObjectCreate");
 static_assert(sizeof(RgfxSharedEventCreate) == 32, "RgfxSharedEventCreate");
+static_assert(sizeof(RgfxSharedEventSetValue) == 32, "RgfxSharedEventSetValue");
 static_assert(sizeof(RgfxQueueCreate) == 56, "RgfxQueueCreate");
 static_assert(sizeof(RgfxHeapCreate) == 48, "RgfxHeapCreate");
 static_assert(sizeof(RgfxHeapOverHostMemory) == 56, "RgfxHeapOverHostMemory");
@@ -81,6 +82,7 @@ static_assert(RGFX_COMMAND_BUFFER_OPS_OFFSET == 40, "command-buffer ops offset")
 static_assert(RGFX_COMMAND_BUFFER_OPS_OFFSET == sizeof(RgfxCommandBuffer),
               "ops start right after the command-buffer header");
 static_assert(sizeof(RgfxComputePassDesc) == 8, "RgfxComputePassDesc");
+static_assert(sizeof(RgfxOpEvent) == 16, "RgfxOpEvent");
 
 // The render-pass head and its records (ENCODER_BEGIN_RENDER body).
 static_assert(sizeof(RgfxRenderPassDesc) == 152, "RgfxRenderPassDesc");

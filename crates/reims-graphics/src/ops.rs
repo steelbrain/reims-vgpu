@@ -51,7 +51,8 @@ pub const fn op_group(tag: u16) -> u16 {
     tag >> 12
 }
 
-/// The framing / command-buffer group (`tag >> 12`): encoder begin and end.
+/// The framing / command-buffer group (`tag >> 12`): encoder begin and end, and the command
+/// buffer's own event signals and waits.
 pub const RGFX_OP_GROUP_FRAMING: u16 = 0x0;
 /// The render-encoder group (`tag >> 12`): [`render`].
 pub const RGFX_OP_GROUP_RENDER: u16 = 0x1;
@@ -72,6 +73,25 @@ pub const RGFX_OP_ENCODER_BEGIN_COMPUTE: u16 = 0x0002;
 pub const RGFX_OP_ENCODER_BEGIN_BLIT: u16 = 0x0003;
 /// Op `ENCODER_END`: end the open encoder (`endEncoding`) and drop it (no body).
 pub const RGFX_OP_ENCODER_END: u16 = 0x0004;
+/// Op `SIGNAL_EVENT` ([`RgfxOpEvent`]): `encodeSignalEvent:value:`, between encoders. The event is
+/// an `id<MTLEvent>` or an `id<MTLSharedEvent>`; a shared one's signal is posted to the guest as
+/// [`RgfxEventSignalled`](crate::wire::RgfxEventSignalled) once the buffer finishes.
+pub const RGFX_OP_SIGNAL_EVENT: u16 = 0x0005;
+/// Op `WAIT_EVENT` ([`RgfxOpEvent`]): `encodeWaitForEvent:value:`, between encoders: the work
+/// after it waits until the event reaches `value`.
+pub const RGFX_OP_WAIT_EVENT: u16 = 0x0006;
+
+/// The body of [`RGFX_OP_SIGNAL_EVENT`] and [`RGFX_OP_WAIT_EVENT`].
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxOpEvent {
+    /// The event (`EVENT_CREATE`'s or `SHARED_EVENT_CREATE`'s object).
+    pub event_obj_id: u64,
+    /// The value signalled, or waited for.
+    pub value: u64,
+}
 
 /// Every op's header: its tag, its flags and its total byte count.
 #[repr(C)]
@@ -333,9 +353,11 @@ const _: () = {
     assert!(RGFX_RENDER_PASS_COLOR_OFFSET as usize == size_of::<RgfxRenderPassDesc>());
     assert!(size_of::<RgfxRenderPassSamplePositions>() == 136);
     assert!(size_of::<RgfxComputePassDesc>() == 8);
+    assert!(size_of::<RgfxOpEvent>() == 16);
     // Each group's tag range maps to its own `op_group`.
     assert!(op_group(RGFX_OP_ENCODER_BEGIN_RENDER) == RGFX_OP_GROUP_FRAMING);
     assert!(op_group(RGFX_OP_ENCODER_END) == RGFX_OP_GROUP_FRAMING);
+    assert!(op_group(RGFX_OP_WAIT_EVENT) == RGFX_OP_GROUP_FRAMING);
     assert!(op_group(render::RGFX_OP_RENDER_DRAW_PRIMITIVES) == RGFX_OP_GROUP_RENDER);
 };
 

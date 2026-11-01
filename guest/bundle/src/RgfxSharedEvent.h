@@ -10,13 +10,13 @@
  * and wraps the result. The device category `newSharedEvent` (RgfxMetalDevice+Sync)
  * forwards to it with an initial value of 0.
  *
- * THE VALUE LIVES HOST-SIDE. The authoritative counter is on the host, raised by
- * GPU signal ops and reported back by RGFX_EVT_EVENT_SIGNALLED. Until the region/
- * reply-ring transport lands, this wrapper keeps a LOCAL MIRROR of the value so the
- * `signaledValue` getter/setter and the listener API have defined behaviour; the
- * host->guest value sync (reading EVENT_SIGNALLED, firing listeners) is a later
- * transport piece. The CPU-set path has no wire op of its own (see the setter), so
- * a set updates only the mirror for now.
+ * THE VALUE LIVES HOST-SIDE. The host's event is the one command buffers wait on and
+ * signal (RGFX_OP_WAIT_EVENT / RGFX_OP_SIGNAL_EVENT). This process keeps the value as it
+ * knows it: a CPU set goes to the host (RGFX_CMD_SHARED_EVENT_SET_VALUE) and raises it
+ * here, and a command buffer's signal raises it once the host posts RGFX_EVT_EVENT_SIGNALLED,
+ * when the buffer finishes, ahead of its completion. It only rises, as Metal's does. The
+ * notifyListener blocks fire on their listener's queue with the value they were registered
+ * at, as Metal's do.
  *
  * Our own ObjC++: it conforms to the real MTLSharedEvent protocol but subclasses
  * only NSObject (via RgfxResource), so it instantiates and is unit-tested on the
@@ -41,16 +41,15 @@ NS_ASSUME_NONNULL_BEGIN
 
 /// Creates a shared event starting at `initialValue`, serialising an
 /// RGFX_CMD_SHARED_EVENT_CREATE through `serializer` (which picks the objId) and
-/// seeding the local value mirror. `device` is the owning shell (nil in a unit
+/// seeding the value. `device` is the owning shell (nil in a unit
 /// test). Returns nil if `serializer` is null (a shared event must have a route).
 + (nullable instancetype)sharedEventWithInitialValue:(uint64_t)initialValue
                                              device:(nullable id<MTLDevice>)device
                                          serializer:(nullable RgfxSerializer *)serializer;
 
 /// Registers with `reader` for the host's RGFX_EVT_EVENT_SIGNALLED for this event's
-/// obj_id: each one updates the value mirror (so `signaledValue` reflects the host's
-/// counter) and fires the notifyListener blocks that have been reached. The listener
-/// is removed on dealloc. The Sync device slice calls this after the create; a unit
+/// obj_id: each one raises the value and fires the notifyListener blocks it reached.
+/// The listener is removed on dealloc. The Sync device slice calls this after the create; a unit
 /// test calls it directly before feeding the signal.
 - (void)rgfxRegisterWithReplyReader:(RgfxReplyReader *)reader;
 

@@ -8,9 +8,16 @@
 //! **The op walk.** Each op is an [`RgfxOpHeader`] then its body. The walk reads
 //! the header, checks its `len` (at least a header, a multiple of 8, and within
 //! the remaining bytes), and dispatches by the op's group ([`op_group`]): the
-//! framing group (encoder begin/end) it handles here; the render, compute and
-//! blit groups it hands to [`super::render`], [`super::compute`] and
-//! [`super::blit`], one encoder held open at a time.
+//! framing group (encoder begin/end, and the buffer's event signals and waits) it
+//! handles here; the render, compute and blit groups it hands to [`super::render`],
+//! [`super::compute`] and [`super::blit`], one encoder held open at a time.
+//!
+//! **Events.** `SIGNAL_EVENT` and `WAIT_EVENT` come between encoders, as Metal's
+//! `encodeSignalEvent:value:` and `encodeWaitForEvent:value:` do, and name an event
+//! or a shared event. The value a buffer signals a shared event to goes to the guest
+//! once the buffer finishes, ahead of its completion record
+//! ([`RgfxEventSignalled`](reims_graphics::wire::RgfxEventSignalled)); a buffer that
+//! waits is watched, and named in the log where it waits long ([`super::waits`]).
 //!
 //! **Two kinds of failure.** A message or op that will not parse structurally — a
 //! short message, a bad `len`, an op body too short for a header — is a protocol
@@ -27,12 +34,14 @@ use reims_graphics::ops::{
     RGFX_COMMAND_BUFFER_OPS_OFFSET, RGFX_COMPUTE_PASS_FLAG_DISPATCH_TYPE, RGFX_OP_BODY_OFFSET,
     RGFX_OP_ENCODER_BEGIN_BLIT, RGFX_OP_ENCODER_BEGIN_COMPUTE, RGFX_OP_ENCODER_BEGIN_RENDER,
     RGFX_OP_ENCODER_END, RGFX_OP_GROUP_BLIT, RGFX_OP_GROUP_COMPUTE, RGFX_OP_GROUP_FRAMING,
-    RGFX_OP_GROUP_RENDER, RGFX_PASS_FLAG_DEFAULT_RASTER_SAMPLE_COUNT,
-    RGFX_PASS_FLAG_RT_ARRAY_LENGTH, RGFX_PASS_FLAG_RT_SIZE, RGFX_PASS_FLAG_SAMPLE_POSITIONS,
-    RGFX_PASS_MAX_SAMPLE_POSITIONS, RGFX_RENDER_PASS_COLOR_OFFSET, RgfxCommandBuffer,
-    RgfxComputePassDesc, RgfxOpHeader, RgfxRenderPassColorAttachment, RgfxRenderPassDesc,
-    RgfxRenderPassSamplePositions, op_group,
+    RGFX_OP_GROUP_RENDER, RGFX_OP_SIGNAL_EVENT, RGFX_OP_WAIT_EVENT,
+    RGFX_PASS_FLAG_DEFAULT_RASTER_SAMPLE_COUNT, RGFX_PASS_FLAG_RT_ARRAY_LENGTH,
+    RGFX_PASS_FLAG_RT_SIZE, RGFX_PASS_FLAG_SAMPLE_POSITIONS, RGFX_PASS_MAX_SAMPLE_POSITIONS,
+    RGFX_RENDER_PASS_COLOR_OFFSET, RgfxCommandBuffer, RgfxComputePassDesc, RgfxOpEvent,
+    RgfxOpHeader, RgfxRenderPassColorAttachment, RgfxRenderPassDesc, RgfxRenderPassSamplePositions,
+    op_group,
 };
+use reims_graphics::wire::{RGFX_EVT_EVENT_SIGNALLED, RgfxEventSignalled, RgfxMsgHeader};
 use reims_vgpu_core::platform::Platform;
 use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder};
 use reims_vgpu_core::platform::caps::{DeviceCaps, SAMPLE_COUNTS};
@@ -40,6 +49,7 @@ use reims_vgpu_core::platform::command::{CommandBuffer, CommandQueue, CompletedI
 use reims_vgpu_core::platform::compute::{ComputeCmd, ComputeEncoder};
 use reims_vgpu_core::platform::descriptor::RenderPassDescriptor;
 use reims_vgpu_core::platform::device::GpuDevice;
+use reims_vgpu_core::platform::event::EventRef;
 use reims_vgpu_core::platform::render::{RenderCmd, RenderEncoder};
 use reims_vgpu_core::platform::types::{ClearColor, MtlSamplePosition};
 use reims_vgpu_core::platform::values::{
@@ -56,6 +66,16 @@ use super::{
 /// The op stream runs under a live raise handler (the ring loop's), so an encode's
 /// raise returns for the handler to catch.
 const ON: OnFault = OnFault::Return;
+
+/// What a command buffer's op stream does with events: the shared events it signals, whose values
+/// go to the guest once it finishes, and the events it waits for.
+#[derive(Default)]
+struct EventOps {
+    /// Each (shared event, value) the buffer signals, in stream order.
+    signals: Vec<(u64, u64)>,
+    /// Each (event, value) the buffer waits for, in stream order.
+    waits: Vec<(u64, u64)>,
+}
 
 /// The encoder the walk currently holds open, one at a time, between an
 /// `ENCODER_BEGIN_*` and the matching `ENCODER_END`.
@@ -124,7 +144,8 @@ impl<P: Platform> GraphicsDecoder<P> {
         };
         // A structural malformation in the stream stops the walk and is reported;
         // everything else faults the exec and propagates.
-        if let Err(e) = self.walk_ops(ops, &cb)? {
+        let mut events = EventOps::default();
+        if let Err(e) = self.walk_ops(ops, &cb, &mut events)? {
             return Ok(Err(e));
         }
         // Register the completion path and commit. The GPU start and end times are
@@ -133,7 +154,11 @@ impl<P: Platform> GraphicsDecoder<P> {
         let cb_obj_id = m.cb_obj_id;
         let seqno = m.header.seqno;
         let sink = self.completion_sink.clone();
+        let signal_sink = self.signal_sink.clone();
         let (failed, context) = (Arc::clone(&self.failed), self.context);
+        let signals = events.signals;
+        let watched = (!events.waits.is_empty())
+            .then(|| self.waits.watch(cb_obj_id, seqno, context, events.waits));
         cb.add_completed_handler(
             ON,
             Box::new(move |info: CompletedInfo| {
@@ -149,6 +174,18 @@ impl<P: Platform> GraphicsDecoder<P> {
                         "context {context}'s command buffer {cb_obj_id:#x} (seqno {seqno}) failed \
                          off its op's thread: the context's later work is refused until its close"
                     );
+                }
+                if let Some(waiting) = &watched {
+                    waiting.finished();
+                }
+                // The shared events the buffer signalled, ahead of its completion, so the guest
+                // has each value before the buffer's handlers run. A buffer that failed may have
+                // signalled them before its fault, and a guest waiting for one would wait for
+                // good: each is posted whatever the outcome.
+                if let Some(signal_sink) = &signal_sink {
+                    for &(obj_id, value) in &signals {
+                        signal_sink(event_signalled(obj_id, value));
+                    }
                 }
                 let record = cb_complete(cb_obj_id, seqno, 0, 0, info.error.as_ref());
                 if let Some(sink) = &sink {
@@ -168,9 +205,14 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// the lane's refusal scope takes ([`refusing`]). A walk that stops with an
     /// encoder open ends it before the command buffer goes, uncommitted, as Metal
     /// asserts on an encoder released without its end.
-    fn walk_ops(&self, ops: &[u8], cb: &P::CommandBuffer) -> RaiseResult<Result<(), DecodeError>> {
+    fn walk_ops(
+        &self,
+        ops: &[u8],
+        cb: &P::CommandBuffer,
+        events: &mut EventOps,
+    ) -> RaiseResult<Result<(), DecodeError>> {
         let mut encoder: Option<OpenEncoder<P>> = None;
-        let walked = refusing(|| self.walk(ops, cb, &mut encoder));
+        let walked = refusing(|| self.walk(ops, cb, &mut encoder, events));
         if let Some(open) = encoder.take() {
             end_abandoned(open);
         }
@@ -183,6 +225,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         mut ops: &[u8],
         cb: &P::CommandBuffer,
         encoder: &mut Option<OpenEncoder<P>>,
+        events: &mut EventOps,
     ) -> RaiseResult<Result<(), DecodeError>> {
         while !ops.is_empty() {
             let Some(h) = read::<RgfxOpHeader>(ops) else {
@@ -194,7 +237,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             }
             let body = &ops[RGFX_OP_BODY_OFFSET as usize..len];
             match op_group(h.tag) {
-                RGFX_OP_GROUP_FRAMING => self.framing_op(h.tag, body, cb, encoder)?,
+                RGFX_OP_GROUP_FRAMING => self.framing_op(h.tag, body, cb, encoder, events)?,
                 RGFX_OP_GROUP_RENDER => {
                     let Some(OpenEncoder::Render(enc)) = encoder.as_ref() else {
                         return Err(no_encoder(h.tag, "render"));
@@ -229,15 +272,16 @@ impl<P: Platform> GraphicsDecoder<P> {
         Ok(Ok(()))
     }
 
-    /// A framing op: open the encoder its `ENCODER_BEGIN_*` names, or end the open
-    /// one. An already-open encoder at a begin, or no open encoder at an end,
-    /// faults.
+    /// A framing op: open the encoder its `ENCODER_BEGIN_*` names, end the open
+    /// one, or signal or wait for an event between encoders. An already-open
+    /// encoder at a begin or at an event op, or no open encoder at an end, faults.
     fn framing_op(
         &self,
         tag: u16,
         body: &[u8],
         cb: &P::CommandBuffer,
         encoder: &mut Option<OpenEncoder<P>>,
+        events: &mut EventOps,
     ) -> RaiseResult<()> {
         match tag {
             RGFX_OP_ENCODER_BEGIN_RENDER => {
@@ -272,6 +316,29 @@ impl<P: Platform> GraphicsDecoder<P> {
                 Some(OpenEncoder::Blit(enc)) => enc.encode(ON, BlitCmd::EndEncoding)?,
                 None => return Err(op_fault("ENCODER_END with no open encoder")),
             },
+            RGFX_OP_SIGNAL_EVENT | RGFX_OP_WAIT_EVENT => {
+                let signal = tag == RGFX_OP_SIGNAL_EVENT;
+                let name = if signal { "SIGNAL_EVENT" } else { "WAIT_EVENT" };
+                // Metal's command buffer takes them between encoders alone.
+                already_open(encoder, name)?;
+                let op = RgfxOpEvent::read_from_prefix(body)
+                    .map(|(op, _)| op)
+                    .map_err(|_| op_fault(format!("{name}: body too short")))?;
+                let (event, shared) = match self.named(op.event_obj_id) {
+                    Some(ObjHandle::Event(e)) => (EventRef::Event(e), false),
+                    Some(ObjHandle::SharedEvent(e)) => (EventRef::Shared(e), true),
+                    _ => return Err(super::bad_reference()),
+                };
+                if signal {
+                    cb.encode_signal(Some(event), op.value)?;
+                    if shared {
+                        events.signals.push((op.event_obj_id, op.value));
+                    }
+                } else {
+                    cb.encode_wait(Some(event), op.value)?;
+                    events.waits.push((op.event_obj_id, op.value));
+                }
+            }
             _ => return Err(unknown_op(tag)),
         }
         Ok(())
@@ -414,6 +481,20 @@ impl<P: Platform> GraphicsDecoder<P> {
 
 /// Ends `open`, an encoder a walk left open as it stopped, in a refusal scope of its own: its
 /// command buffer is never committed, and what the end answers is not the guest's.
+/// The `EVENT_SIGNALLED` for the shared event `obj_id`, which a finished command buffer signalled
+/// to `value`.
+fn event_signalled(obj_id: u64, value: u64) -> RgfxEventSignalled {
+    RgfxEventSignalled {
+        header: RgfxMsgHeader {
+            r#type: RGFX_EVT_EVENT_SIGNALLED,
+            size: size_of::<RgfxEventSignalled>() as u32,
+            seqno: 0,
+        },
+        obj_id,
+        value,
+    }
+}
+
 fn end_abandoned<P: Platform>(open: OpenEncoder<P>) {
     let _ = refusing(|| match open {
         OpenEncoder::Render(enc) => enc.encode(ON, RenderCmd::EndEncoding),
@@ -479,8 +560,10 @@ mod tests {
         RgfxOpSetVertexBuffer, RgfxOpSetViewport,
     };
     use reims_graphics::wire::{
-        RGFX_CB_OK, RGFX_CMD_BUFFER_CREATE, RGFX_CMD_COMMAND_BUFFER, RGFX_CMD_QUEUE_CREATE,
-        RGFX_CMD_TEXTURE_CREATE, RgfxBufferCreate, RgfxCbComplete, RgfxMsgHeader, RgfxQueueCreate,
+        RGFX_CB_OK, RGFX_CMD_BUFFER_CREATE, RGFX_CMD_COMMAND_BUFFER, RGFX_CMD_EVENT_CREATE,
+        RGFX_CMD_QUEUE_CREATE, RGFX_CMD_SHARED_EVENT_CREATE, RGFX_CMD_SHARED_EVENT_SET_VALUE,
+        RGFX_CMD_TEXTURE_CREATE, RGFX_EVT_CB_COMPLETE, RgfxBufferCreate, RgfxCbComplete,
+        RgfxObjectCreate, RgfxQueueCreate, RgfxSharedEventCreate, RgfxSharedEventSetValue,
         RgfxTextureCreate, RgfxTextureDescriptor,
     };
     use reims_vgpu_core::platform::descriptor::RenderPassDescriptor;
@@ -879,5 +962,167 @@ mod tests {
             dec.decode(&device, &m).unwrap(),
             Err(DecodeError::Malformed)
         );
+    }
+
+    /// Creates the event 6 and the shared event 7, which starts at `initial`.
+    fn create_events(p: &FakePlatform, dec: &mut GraphicsDecoder<FakePlatform>, initial: u64) {
+        let device = p.device();
+        let event = RgfxObjectCreate {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_EVENT_CREATE,
+                size: size_of::<RgfxObjectCreate>() as u32,
+                seqno: 0,
+            },
+            obj_id: 6,
+        };
+        assert_eq!(dec.decode(&device, event.as_bytes()).unwrap(), Ok(()));
+        let shared = RgfxSharedEventCreate {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_SHARED_EVENT_CREATE,
+                size: size_of::<RgfxSharedEventCreate>() as u32,
+                seqno: 0,
+            },
+            obj_id: 7,
+            initial_value: initial,
+        };
+        assert_eq!(dec.decode(&device, shared.as_bytes()).unwrap(), Ok(()));
+    }
+
+    /// An event op's body: the event and the value.
+    fn event_op(tag: u16, event_obj_id: u64, value: u64) -> Vec<u8> {
+        op(
+            tag,
+            RgfxOpEvent {
+                event_obj_id,
+                value,
+            }
+            .as_bytes(),
+        )
+    }
+
+    /// A shared event made at a value other than 0 is set to it, after its create.
+    #[test]
+    fn a_shared_event_starts_at_its_initial_value() {
+        let (p, mut dec) = setup();
+        let mark = p.call_log().mark();
+        create_events(&p, &mut dec, 3);
+        let sels = p.call_log().sels_since(mark);
+        let made = sels.iter().position(|s| *s == "newSharedEvent").unwrap();
+        let set = sels.iter().position(|s| *s == "setSignaledValue:").unwrap();
+        assert!(made < set);
+
+        // At 0 nothing is set.
+        let (p, mut dec) = setup();
+        let mark = p.call_log().mark();
+        create_events(&p, &mut dec, 0);
+        assert!(!p.call_log().sels_since(mark).contains(&"setSignaledValue:"));
+    }
+
+    /// The buffer's event ops are carried between its encoders, in stream order. Once it
+    /// finishes, the value it signalled the shared event to goes to the guest ahead of its
+    /// completion record; the plain event's signal has no value the guest reads, and is not
+    /// posted.
+    #[test]
+    fn a_command_buffer_signals_and_waits_between_encoders() {
+        let (p, mut dec) = setup();
+        let device = p.device();
+        create_events(&p, &mut dec, 0);
+
+        let posted = Arc::new(Mutex::new(Vec::<(u32, u64, u64)>::new()));
+        let signals = Arc::clone(&posted);
+        dec.set_signal_sink(Arc::new(move |m| {
+            signals.lock().push((m.header.r#type, m.obj_id, m.value));
+        }));
+        let completions = Arc::clone(&posted);
+        dec.set_completion_sink(Arc::new(move |m| {
+            completions.lock().push((m.header.r#type, m.cb_obj_id, 0));
+        }));
+
+        let mut ops = event_op(RGFX_OP_WAIT_EVENT, 6, 1);
+        ops.extend(op(RGFX_OP_ENCODER_BEGIN_BLIT, &[]));
+        ops.extend(op(RGFX_OP_ENCODER_END, &[]));
+        ops.extend(event_op(RGFX_OP_SIGNAL_EVENT, 7, 9));
+        ops.extend(event_op(RGFX_OP_SIGNAL_EVENT, 6, 2));
+        let mark = p.call_log().mark();
+        let message = command_buffer_message(110, 56, &ops);
+        assert_eq!(dec.decode(&device, &message).unwrap(), Ok(()));
+        let want = [
+            "commandBuffer",
+            "encodeWaitForEvent:value:",
+            "blitCommandEncoder",
+            "endEncoding",
+            "encodeSignalEvent:value:",
+            "encodeSignalEvent:value:",
+            "addCompletedHandler:",
+            "commit",
+        ];
+        let got: Vec<&str> = p
+            .call_log()
+            .sels_since(mark)
+            .into_iter()
+            .filter(|s| want.contains(s))
+            .collect();
+        assert_eq!(got, want);
+        assert!(posted.lock().is_empty());
+
+        p.world().complete_all(CompleteOn::Caller);
+        assert_eq!(
+            *posted.lock(),
+            [
+                (RGFX_EVT_EVENT_SIGNALLED, 7, 9),
+                (RGFX_EVT_CB_COMPLETE, 110, 0)
+            ]
+        );
+    }
+
+    /// An event op with an encoder open faults the exec, as does one naming no event.
+    #[test]
+    fn an_event_op_inside_an_encoder_or_naming_no_event_faults() {
+        let (p, mut dec) = setup();
+        let device = p.device();
+        create_events(&p, &mut dec, 0);
+        let mut ops = op(RGFX_OP_ENCODER_BEGIN_BLIT, &[]);
+        ops.extend(event_op(RGFX_OP_SIGNAL_EVENT, 7, 1));
+        ops.extend(op(RGFX_OP_ENCODER_END, &[]));
+        assert!(
+            dec.decode(&device, &command_buffer_message(111, 1, &ops))
+                .is_err()
+        );
+
+        // The buffer 2 is no event; 99 is nothing.
+        for named in [2, 99] {
+            let ops = event_op(RGFX_OP_WAIT_EVENT, named, 1);
+            assert!(
+                dec.decode(&device, &command_buffer_message(112, 1, &ops))
+                    .is_err()
+            );
+        }
+    }
+
+    /// `SHARED_EVENT_SET_VALUE` sets the shared event it names; naming anything else is a bad
+    /// reference.
+    #[test]
+    fn a_cpu_set_reaches_the_shared_event() {
+        let (p, mut dec) = setup();
+        let device = p.device();
+        create_events(&p, &mut dec, 0);
+        let set = |obj_id| RgfxSharedEventSetValue {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_SHARED_EVENT_SET_VALUE,
+                size: size_of::<RgfxSharedEventSetValue>() as u32,
+                seqno: 0,
+            },
+            obj_id,
+            value: 12,
+        };
+        let mark = p.call_log().mark();
+        assert_eq!(dec.decode(&device, set(7).as_bytes()).unwrap(), Ok(()));
+        assert!(p.call_log().sels_since(mark).contains(&"setSignaledValue:"));
+        for named in [6, 2, 99] {
+            assert_eq!(
+                dec.decode(&device, set(named).as_bytes()).unwrap(),
+                Err(DecodeError::BadReference)
+            );
+        }
     }
 }

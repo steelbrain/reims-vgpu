@@ -9,6 +9,8 @@
 
 #include "RgfxReplyReader.hpp"
 
+#include <algorithm>
+
 #include <cstring>
 
 namespace {
@@ -113,6 +115,39 @@ void RgfxReplyReader::removeEventListener(uint64_t token)
 	m_eventListeners.erase(token);
 }
 
+void RgfxReplyReader::setEventsTo(RgfxReplyReader *events)
+{
+	std::lock_guard<std::mutex> guard(m_lock);
+	m_eventsTo = events;
+}
+
+std::vector<RgfxReplyReader::EventHandler> RgfxReplyReader::listenersOf(uint64_t obj_id)
+{
+	// In registration order: the tokens rise with each registration.
+	std::vector<std::pair<uint64_t, EventHandler>> found;
+	for (const auto &entry : m_eventListeners) {
+		if (entry.second.obj_id == obj_id)
+			found.emplace_back(entry.first, entry.second.handler);
+	}
+	std::sort(found.begin(), found.end(),
+	          [](const auto &a, const auto &b) { return a.first < b.first; });
+	std::vector<EventHandler> handlers;
+	for (auto &f : found)
+		handlers.push_back(std::move(f.second));
+	return handlers;
+}
+
+void RgfxReplyReader::signalled(const RgfxEventSignalled &msg)
+{
+	std::vector<EventHandler> handlers;
+	{
+		std::lock_guard<std::mutex> guard(m_lock);
+		handlers = listenersOf(msg.obj_id);
+	}
+	for (EventHandler &handler : handlers)
+		handler(msg);
+}
+
 bool RgfxReplyReader::armAndCheck()
 {
 	if (m_header == nullptr)
@@ -215,11 +250,12 @@ uint32_t RgfxReplyReader::pump()
 				RgfxEventSignalled msg = {};
 				if (size >= sizeof(msg)) {
 					readBytes(m_data, offset, &msg, sizeof(msg));
-					for (const auto &entry : m_eventListeners) {
-						if (entry.second.obj_id == msg.obj_id) {
-							EventHandler handler = entry.second.handler;
+					if (m_eventsTo != nullptr) {
+						RgfxReplyReader *to = m_eventsTo;
+						calls.emplace_back([to, msg]() { to->signalled(msg); });
+					} else {
+						for (EventHandler &handler : listenersOf(msg.obj_id))
 							calls.emplace_back([handler, msg]() { handler(msg); });
-						}
 					}
 				}
 				break;
