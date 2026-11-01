@@ -4141,7 +4141,8 @@ typedef struct {
   uint32_t height;
   // Bytes from one row's start to the next's: a multiple of 4, at least `width * 4`.
   uint32_t stride;
-  // Where the first row starts in the region: a multiple of 4, in the guest's allocations.
+  // Where the first row starts in the region: a multiple of 4, the whole scanout in the
+  // scanout's room ([`RGFX_SCANOUT_SPAN`] bytes at [`RGFX_ALLOCATIONS_OFFSET`]).
   uint64_t offset;
 } RgfxSetScanout;
 

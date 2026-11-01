@@ -6,8 +6,9 @@
 //! screen's rate. When the screen's mode changes (the window resized), the device tells the guest
 //! with `DISPLAY_CHANGED`, and the guest asks `GET_DISPLAYS` again (`refresh`).
 //!
-//! **Scanout.** `SET_SCANOUT` names the pixels the display shows, in the region; the screen reads
-//! them in place. It shows them again at a refresh of its host screen only where the guest wrote
+//! **Scanout.** `SET_SCANOUT` names the pixels the display shows, in the scanout's room of the
+//! region (`RGFX_SCANOUT_SPAN` bytes at `RGFX_ALLOCATIONS_OFFSET`, before the processes' blocks,
+//! so the display never shows a process's memory); the screen reads them in place. It shows them again at a refresh of its host screen only where the guest wrote
 //! them since ([`Screen::present`], which `refresh` calls on the host's dirty log).
 //!
 //! **Cursor.** `SET_CURSOR` copies the guest's image, premultiplied BGRA8, out of the region,

@@ -454,6 +454,37 @@ fn set_scanout_checks_its_range() {
     assert_eq!(rig.told(), [Told::Scanout(None)]);
 }
 
+/// `SET_SCANOUT` keeps to the scanout's room, the `RGFX_SCANOUT_SPAN` bytes before the processes'
+/// blocks: a scanout that ends at the room's end is shown, and one that reaches past it, or lies
+/// in the blocks, is refused, changing nothing
+#[test]
+fn set_scanout_keeps_to_the_scanout_s_room() {
+    let mut rig = Rig::new();
+    rig.start();
+    let span = 2560 * 479 + 2560;
+    let end = RGFX_CONTEXT_ALLOCATIONS_OFFSET;
+    let s = rig.send(scanout(640, 480, 2560, end - span));
+    assert_eq!(rig.complete(), (s, RGFX_STATUS_OK));
+    let shown = Scanout {
+        width: 640,
+        height: 480,
+        stride: 2560,
+        offset: end - span,
+    };
+    assert_eq!(rig.told(), [Told::Scanout(Some(shown))]);
+    for bytes in [
+        scanout(640, 480, 2560, end - span + 4),
+        scanout(640, 480, 2560, end),
+        scanout(640, 480, 2560, end + 0x10_0000),
+        scanout(7680, 4400, 30720, RGFX_ALLOCATIONS_OFFSET),
+    ] {
+        let s = rig.send(bytes);
+        assert_eq!(rig.complete(), (s, RGFX_STATUS_INVALID_ARGUMENT));
+    }
+    assert_eq!(rig.told(), []);
+    assert_eq!(rig.device.shared.display.lock().scanout, Some(shown));
+}
+
 /// `SET_CURSOR` hands the screen the guest's image as straight RGBA, and `MOVE_CURSOR` its
 /// position, unanswered; an image past the largest, or a hot spot outside it, is refused
 #[test]

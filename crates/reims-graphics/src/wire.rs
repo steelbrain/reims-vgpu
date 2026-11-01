@@ -444,7 +444,8 @@ pub struct RgfxSetScanout {
     pub height: u32,
     /// Bytes from one row's start to the next's: a multiple of 4, at least `width * 4`.
     pub stride: u32,
-    /// Where the first row starts in the region: a multiple of 4, in the guest's allocations.
+    /// Where the first row starts in the region: a multiple of 4, the whole scanout in the
+    /// scanout's room ([`RGFX_SCANOUT_SPAN`] bytes at [`RGFX_ALLOCATIONS_OFFSET`]).
     pub offset: u64,
 }
 

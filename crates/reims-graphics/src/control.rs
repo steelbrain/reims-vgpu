@@ -185,7 +185,19 @@ fn in_allocations(shared: &Shared, offset: u64, len: u64) -> bool {
         && shared.region.contains(offset, len)
 }
 
-/// `SET_SCANOUT`.
+/// Whether `len` bytes at `offset` lie in the scanout's room: the [`RGFX_SCANOUT_SPAN`] bytes at
+/// [`RGFX_ALLOCATIONS_OFFSET`], before the accelerator kext's blocks
+/// ([`RGFX_CONTEXT_ALLOCATIONS_OFFSET`]), `offset` a multiple of 4. A scanout past the room would
+/// show the processes' blocks on the display.
+fn in_scanout_room(shared: &Shared, offset: u64, len: u64) -> bool {
+    offset.is_multiple_of(4)
+        && offset >= RGFX_ALLOCATIONS_OFFSET
+        && len <= RGFX_SCANOUT_SPAN
+        && offset - RGFX_ALLOCATIONS_OFFSET <= RGFX_SCANOUT_SPAN - len
+        && shared.region.contains(offset, len)
+}
+
+/// `SET_SCANOUT`: the scanout lies in its room ([`in_scanout_room`]).
 fn set_scanout(shared: &Shared, command: &RgfxSetScanout) -> u32 {
     if command.display != 0 {
         return RGFX_STATUS_NO_DISPLAY;
@@ -205,7 +217,7 @@ fn set_scanout(shared: &Shared, command: &RgfxSetScanout) -> u32 {
         stride: command.stride,
         offset: command.offset,
     };
-    if !in_allocations(shared, scanout.offset, scanout.span()) {
+    if !in_scanout_room(shared, scanout.offset, scanout.span()) {
         return RGFX_STATUS_INVALID_ARGUMENT;
     }
     shared.display.lock().scanout = Some(scanout);

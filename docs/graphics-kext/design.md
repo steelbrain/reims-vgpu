@@ -430,7 +430,7 @@ named.
 | type | name | payload | answer |
 |---|---|---|---|
 | 1 | `GET_DISPLAYS` | none | `DISPLAYS` |
-| 2 | `SET_SCANOUT` | display u32, width u32, height u32, stride u32, offset u64 into BAR2; width 0 blanks the display | `COMPLETE` |
+| 2 | `SET_SCANOUT` | display u32, width u32, height u32, stride u32, offset u64 into BAR2, the scanout inside `RGFX_SCANOUT_SPAN`'s room; width 0 blanks the display | `COMPLETE` |
 | 3 | `SET_CURSOR` | display u32, width u32, height u32, hot_x u32, hot_y u32, offset u64 of a BGRA8 premultiplied image; width 0 removes the image | `COMPLETE` |
 | 4 | `MOVE_CURSOR` | display u32, x i32, y i32, visible u32 | none |
 | 5 | `SET_VBLANK` | display u32, enabled u32 | `COMPLETE` |
