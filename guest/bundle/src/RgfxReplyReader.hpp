@@ -126,6 +126,8 @@ public:
 	/// Whether the completion thread drives this reader (it is then the only consumer).
 	void setDriven(bool driven) { m_driven.store(driven, std::memory_order_release); }
 	bool driven() const { return m_driven.load(std::memory_order_acquire); }
+	/// Whether the reader reads a ring (the device's lifecycle reader reads none).
+	bool hasRing() const { return m_header != nullptr; }
 
 	/// Whether a completion / reflection is still awaited for `seqno` (tests).
 	bool awaitingCompletion(uint64_t seqno);

@@ -136,8 +136,10 @@ RGFX_LOG_UNRECOGNIZED
 }
 
 // Blocks until the value reaches `value` (YES) or `milliseconds` pass (NO), as Metal's does. The
-// value moves on the host's EVENT_SIGNALLED and on the CPU's set; where no thread drives the
-// reader the event is registered with (a unit test), the wait takes it meanwhile.
+// value moves on the host's EVENT_SIGNALLED and on the CPU's set, and the wait sleeps until one
+// moves it. Where the event is registered with a reader over a ring that no thread drives (a
+// unit test), the wait takes the ring meanwhile; the device's reader reads none, its signals
+// coming from the queues' readers, which the completion thread drives.
 - (BOOL)waitUntilSignaledValue:(uint64_t)value timeoutMS:(uint64_t)milliseconds
 {
 	NSDate *deadline =
@@ -145,7 +147,7 @@ RGFX_LOG_UNRECOGNIZED
 	for (;;) {
 		[_valueChanged lock];
 		BOOL reached = _signaledValue >= value;
-		BOOL pumps = _reader != nullptr && !_reader->driven();
+		BOOL pumps = _reader != nullptr && _reader->hasRing() && !_reader->driven();
 		if (!reached && !pumps) {
 			[_valueChanged waitUntilDate:deadline];
 		}
